@@ -13,7 +13,7 @@ import java.util.concurrent.CountDownLatch;
  * 连续失败满限时 native 的 s2a_android_dguard_prompt 经 JNI 调进来，游戏线程阻塞
  * 在这里，玩家选「仍然启动」才返回——同 iOS 提示页只有一个出口。
  * 标题与按钮文案与 runtime/include/s2a_dguard.h 对齐（提示语是安卓版路径，
- * 共用头里那条是 Mac/iPhone 的安装口径）；spec 检查只认 S2A_DPROMPT_*/S2A_DGUARD_*
+ * 共用头里那条是 Mac/iPhone 的安装口径）；spec 检查只认 S2A_DPROMPT_* / S2A_DGUARD_*
  * 宏，平台差异文案不进共用头。
  */
 final class DguardNotice {
