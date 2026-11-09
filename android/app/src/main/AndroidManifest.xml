@@ -14,6 +14,9 @@
         android:icon="${appIcon}" android:allowBackup="false" android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules" android:supportsRtl="true"
         android:pageSizeCompat="disabled">
+        <!-- #48 A4：两个 supports 都 false = 不接管 Game Mode 优化，保留 OEM 厂商干预；
+             系统省电档由应用内轮询 getGameMode() 读到后限直连 present 周期。 -->
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
         <!-- Rotation / resize reach surfaceChanged (swapchain rebuild) instead of recreating the activity.
              screenOrientation (app/build.gradle): a per-game app runs landscape either way up, as the
              first version's screen configuration assumes (implementation plan §7.4); the diagnostic app
