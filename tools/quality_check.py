@@ -346,14 +346,17 @@ def fs_layer(o, hl, ask=True):
 
 def check_android(o, name, ai=True):
     """安卓局目录（安卓线 K3）：android.json（机型 / 包名 / 屏幕 / 窗口秒数 / 启动命令）、shots_ap/NN_SSSs.png（整屏截图，含虚拟手柄覆盖层与系统黑边）、
-    frames.tsv（frame / present_ns / disp_us / wall_us，SurfaceFlinger 真实上屏间隔）、power.tsv（t / plugged / mv / current_raw / level / temp_c）、
+    frames.tsv（frame / present_ns / disp_us / wall_us，direct-present 帧日志的上屏间隔，采集窗口内）、power.tsv（t + android_power.FIELDS + level）、
     logcat.txt、gfx_mode.txt。没有自动玩家：开窗即已在可玩画面（android.json mark），整窗口就是读数窗口。五项：
       画面 / 到游戏画面：同 iPhone，AI 看截图（题面说明覆盖层不算错）
       帧率：disp_us 窗口 ≥ 55 秒、平均 ≥ 目标 × 99%、慢帧（> 1.5 倍预算）≤ 1%；目标取 tools/fps_truth.tsv（程序号从包名 org.s2arm.game.t<程序号> 取），没有按 60
       满屏：截图就是整屏，直接数左右纯黑列（同 bars()；只看 AI 判为游戏画面的，没有判官时看全部）
       直连默认启动：启动命令带了 --es s2arm.graphics_mode 就不算默认启动（没数据）；直连 / 通用认 logcat「direct provider prepared」/「Gpu LoadShaders」，
         其次 gfx_mode.txt 首行；直连且有游戏画面 → 过，通用 → 不过
-      能耗：整窗口都没接电（plugged 全 0）才算：均值 |电压 mV × 电流 µA| / 1e9 瓦，门槛同 iPhone（60 帧 4.8 W / 其余 3.7 W，读数注「按 iPhone 门槛」）；接过电 → 没数据"""
+      能耗：power.tsv = t + android_power.FIELDS + level（run_game.py 写）。整窗口每行 status=Discharging
+        且供电旗标无 true 才算；放电符号由本机放电样本推出（非零全同号），不一致 → 没数据；
+        电池侧梯形积分（boot_us 同窗，tools/android_power.battery_window）算出瓦数 → 「未证」
+        （诊断读数，无设备校准，不套 iPhone 整机门槛）；接过电 / 状态未证 / 窗口不齐 → 没数据"""
     import json as _json
     meta = _json.load(open(os.path.join(o, 'android.json'), encoding='utf-8')) if os.path.exists(os.path.join(o, 'android.json')) else {}
     ps = shots(o); out = {'款': name, '局目录': o, '截图': ' '.join(os.path.relpath(x, o) for x in ps)}; read = []
@@ -397,16 +400,39 @@ def check_android(o, name, ai=True):
     elif gm == 'generic': out['直连默认启动'] = '不过'
     elif gm == 'direct': out['直连默认启动'] = '过' if game else '没数据' if ans is None else '不过'
     else: out['直连默认启动'] = '没数据'; read.append('直连默认启动 logcat / gfx_mode.txt 认不出图形模式（日志要取 <包名>:game 子进程）')
-    # 能耗
+    # 能耗：电池侧梯形积分（tools/android_power.py 同口径，列 = FIELDS）。整窗口每行都要能证
+    #   「在放电」（status=Discharging 且供电旗标无 true）：Charging/Full/供电 true → 接过电不算；
+    #   Unknown / 空 / 别的状态 → 证不了未接电，不算。放电符号由本机放电样本推出（电流非零且全同号），
+    #   不一致 / 全零 → 放电方向未校准，不算。积出来的瓦数是电池侧诊断、未经设备校准 → 记「未证」，
+    #   不套 iPhone 整机门槛（旧版 abs(mV×µA) 会把充电/未知当放电假绿）。
     pw = list(csv.DictReader(open(os.path.join(o, 'power.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'power.tsv')) else []
+    powered = lambda r: r.get('status') in ('Charging', 'Full') or 'true' in (
+        r.get('ac_powered'), r.get('usb_powered'), r.get('wireless_powered'), r.get('dock_powered'))
     if not pw: out['能耗'] = '没数据'
-    elif any(r.get('plugged') not in ('0', '', None) for r in pw): out['能耗'] = '没数据'; read.append('能耗 窗口内接过电（充放差不是整机功耗），不算')
+    elif any(powered(r) for r in pw): out['能耗'] = '没数据'; read.append('能耗 窗口内接过电（充放差不是整机功耗），不算')
+    elif any(r.get('status') != 'Discharging' for r in pw):
+        bad = next(r for r in pw if r.get('status') != 'Discharging')
+        out['能耗'] = '没数据'; read.append(f"能耗 有 {sum(1 for r in pw if r.get('status') != 'Discharging')} 行充电状态未证"
+                                          f"（status={bad.get('status') or '空'} source={bad.get('source') or '空'}），不能当未接电")
     else:
-        try:
-            w = sum(abs(float(r['mv']) * float(r['current_raw'])) for r in pw) / len(pw) / 1e9; lim = w_max(fps)
-            out['能耗'] = '过' if w <= lim and out['帧率'] == '过' else '不过' if out['帧率'] in ('过', '不过') else '没数据'
-            read.append(f'能耗 {w:.2f} W（按 iPhone 门槛 ≤ {lim}）')
-        except (KeyError, ValueError): out['能耗'] = '没数据'
+        def _i(r, k):
+            try: return int(str(r.get(k, '')).strip())
+            except ValueError: return None
+        signs = {1 if _i(r, 'current_ua') > 0 else -1 for r in pw
+                 if _i(r, 'current_ua') not in (None, 0)}
+        if len(signs) != 1:
+            out['能耗'] = '没数据'; read.append('能耗 放电方向未校准：电流全零或符号不一致，不猜符号')
+        else:
+            import android_power
+            boots = [_i(r, 'boot_us') for r in pw]
+            res = android_power.battery_window(pw, boots[0], boots[-1], signs.pop()) if all(
+                b is not None for b in boots) else {'reason': 'boot_us 缺行，窗口对不齐'}
+            if res.get('averageW') is None:
+                out['能耗'] = '没数据'; read.append(f"能耗 {res.get('reason', '窗口不成立')}")
+            else:
+                out['能耗'] = '未证'
+                read.append(f"能耗 电池侧均值 {res['averageW']:.2f} W × {res['durationSeconds']:.0f}s"
+                            f"（诊断读数，未经设备校准，不套整机门槛）")
     read.append(f'安卓 {meta.get("serial_model", "")} {meta.get("soc", "")} Android {meta.get("android", "")}，模式 {gm or "—"}，游戏画面 {len(game)}/{len(ps)} 张')
     out['读数'] = '｜'.join(read)
     return out
