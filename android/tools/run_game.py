@@ -9,18 +9,23 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
                 [--mode auto|generic|direct]      # s2arm.graphics_mode 冷启动 intent extra
                 [--extra s2arm.KEY[=VALUE] ...]   # 其他 intent extra（true/false 走 --ez）
                 [--adb "adb"] [--ready-timeout 180] [--wait 0] [--allow-data-loss]
-                [--lock-root DIR] [--holder NAME] [--note TXT]
+                [--backup-dir DIR] [--lock-root DIR] [--holder NAME] [--note TXT]
 
 锁：取 device_lock.py 的持久内核锁后才动设备，收局按持锁令牌 release；
 崩溃 / 强杀 / adb 掉线 = 未正常收局，设备留置不放行（不自动放）。
 
 还原范围（保证不了的一律拒跑，不返回成功兜底）：
 - 原 APK：设备已装该包且构建不同 → adb pull 备份、收局 install -r 装回并 sha256 复核；
-  分包（split APK）装回不可靠 → 入局即拒。
-- 应用私有数据 / 已并入的资源：局内会被游戏改写，adb 层不能备份还原 → 设备已装该包时拒跑；
-  显式 --allow-data-loss 才放行，且只还原 APK 字节（私有数据、已并入资源不还原，manifest 写明）。
-- 导入的资源 / 卸载应清的目录：落在 /sdcard/Android/data|obb/<pkg>，卸载随删，收局逐项验不存在；
-  有残留即还原失败。
+  分包（split APK）装回不可靠 → 入局即拒。原包 versionCode 低于新包时装回是降级：
+  装新包前先验设备 pm 支持 install -d（usage 里的「-d: allow version code downgrade」），
+  不支持就拒跑而不是装了回不来；原包高于新包时装测试包本身也带 -d。
+- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
+  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
+  tar + manifest.json 逐文件 sha256 清单）；收局装回原包后 pm clear、回灌、逐文件核 sha。
+  已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
+  （私有数据、已并入资源不还原，manifest 写明）。
+- 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
+  收局逐项验不存在；debuggable 已装路径随数据备份还原。
 - 调试属性 debug.s2a.*：起局前置 1，收局恢复原值并逐项读回核对（release 机不让改 → 只记注）。
 
 收局：任何结果（含 SIGTERM / SIGHUP / Ctrl+C / 未捕获异常）都走 finally 还原；
@@ -68,16 +73,99 @@ def sha256(path):
 
 
 def install_state(d, pkg):
-    """pm path → {installed, split, base, sha256}。split 包无法忠实还原，调用方拒。"""
+    """pm path + dumpsys package → {installed, split, base, sha256, versionCode, debuggable}。
+    split 包无法忠实还原，调用方拒；versionCode/debuggable 供降级与 run-as 备份判断。"""
     out = d.shell(f"pm path {pkg}").strip()
     paths = [ln[len("package:"):] for ln in out.splitlines() if ln.startswith("package:")]
     if not paths:
         return {"installed": False}
+    info = d.shell(f"dumpsys package {pkg}", allowed=(0, 1))
+    m = re.search(r"versionCode=(\d+)", info)
+    meta = {"versionCode": int(m.group(1)) if m else None,
+            "debuggable": "DEBUGGABLE" in info}
     base = [p for p in paths if p.endswith("/base.apk")]
     if len(paths) != 1 or len(base) != 1:
-        return {"installed": True, "split": True, "paths": paths}
+        return {"installed": True, "split": True, "paths": paths, **meta}
     return {"installed": True, "base": base[0],
-            "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0]}
+            "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
+
+
+def device_allows_downgrade(d):
+    """设备 pm 是否支持 install -d（降级）。pm usage 里有『-d: allow version code downgrade』。"""
+    usage = d.shell("pm install --help 2>&1 || pm 2>&1", allowed=(0, 1, 255))
+    return bool(re.search(r"-d[^\n]*downgrade", usage, re.I))
+
+
+DATA_DIRS = (("private", "/data/data/{pkg}"),
+             ("extdata", "/sdcard/Android/data/{pkg}"),
+             ("obb", "/sdcard/Android/obb/{pkg}"))
+SHA_LINE = re.compile(r"^([0-9a-f]{64})\s+\.?/?(.+)$")
+
+
+def _sha_listing(text):
+    """『<sha>  ./relpath』行 → {relpath: sha}（find -exec sha256sum 的输出口径）。"""
+    files = {}
+    for ln in text.splitlines():
+        m = SHA_LINE.match(ln.strip())
+        if m:
+            files[m.group(2)] = m.group(1)
+    return files
+
+
+def backup_data(d, pkg, dest):
+    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + find sha256sum 清单。
+    任一目录备份失败即 Refuse（保证不了还原就不入局）。"""
+    dest.mkdir(parents=True)
+    manifest = {"schema": 1, "package": pkg, "dirs": {}}
+    for tag, tpl in DATA_DIRS:
+        dir_ = tpl.format(pkg=pkg)
+        present = d.run_as(pkg, f"[ -d {shlex.quote(dir_)} ] && echo yes || true").strip()
+        if "yes" not in present:
+            continue
+        tar = dest / f"{tag}.tar"
+        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
+        r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
+                            f"tar -cf - -C {shlex.quote(dir_)} ."],
+                           capture_output=True, timeout=600)
+        if r.returncode or not r.stdout:
+            raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
+        tar.write_bytes(r.stdout)
+        listing = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
+                           timeout=300)
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name,
+                                 "tar_sha256": sha256(tar), "files": _sha_listing(listing)}
+    (dest / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
+    return manifest
+
+
+def restore_data(d, pkg, manifest, backup_dir):
+    """先清空再按清单回灌、逐文件 sha 核。返回失败说明串列表（空=成功）。"""
+    fails = []
+    try:
+        d.shell(f"pm clear {pkg}", allowed=(0, 1))
+    except (RuntimeError, subprocess.SubprocessError) as error:
+        fails.append(f"pm clear 异常：{error}")
+    for tag, info in manifest["dirs"].items():
+        dir_ = info["dir"]
+        try:
+            d.run_as(pkg, f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
+                     timeout=120)
+            tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
+            d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
+            d.run_as(pkg, f"tar -xf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            d.shell(f"rm -f {tmp}", allowed=(0, 1))
+            got = _sha_listing(d.run_as(
+                pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +", timeout=300))
+            want = info["files"]
+            bad = [rel for rel, sha in want.items() if got.get(rel) != sha]
+            extra = sorted(set(got) - set(want))
+            if bad:
+                fails.append(f"{dir_} 还原后 {len(bad)} 个文件 sha 与备份清单不符：{bad[:3]}")
+            if extra:
+                fails.append(f"{dir_} 还原后多出 {len(extra)} 个未备份文件：{extra[:3]}")
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            fails.append(f"{dir_} 数据还原 adb 异常：{error}")
+    return fails
 
 
 def uptime_us(d):
@@ -178,8 +266,10 @@ def external_dirs_gone(d, pkg):
     return fails
 
 
-def restore_state(d, pkg, state0, orig_apk):
-    """还原原安装状态（范围见 docstring）。返回失败说明串列表（空=成功）。"""
+def restore_state(d, pkg, state0, orig_apk, downgrade=False, data_backup=None, backup_dir=None):
+    """还原原安装状态（范围见 docstring）。返回失败说明串列表（空=成功）。
+    downgrade=原包 versionCode 低于测试包 → install -r -d；data_backup=入局前的
+    run-as 备份清单（debuggable 路径），给时先装回原 APK 再逐文件 sha 核还原数据。"""
     fails = []
     now = install_state(d, pkg)
     if not state0["installed"]:
@@ -195,17 +285,21 @@ def restore_state(d, pkg, state0, orig_apk):
         return fails
     if state0.get("split"):
         return []  # 入局前已拒，走不到这里；防御性返回
-    # 已安装（--allow-data-loss）：只还原 APK 字节；私有数据与已并入资源不还原（manifest 写明）
     if now["installed"] and now.get("sha256") == state0["sha256"]:
-        return []
-    try:
-        d.run("install", "-r", str(orig_apk), timeout=600)
-    except RuntimeError as error:
-        return [f"装回原包失败：{error}"]
-    now = install_state(d, pkg)
-    if not now["installed"] or now.get("sha256") != state0["sha256"]:
-        return ["装回原包后 sha256 与入局前记录不符"]
-    return []
+        pass  # 原包字节已在；只还可能要还原数据
+    elif orig_apk is None:
+        return ["设备上的包与入局前记录不符，且没有原包备份可装回"]
+    else:
+        try:
+            d.run("install", "-r", *(["-d"] if downgrade else []), str(orig_apk), timeout=600)
+        except RuntimeError as error:
+            return [f"装回原包失败：{error}"]
+        now = install_state(d, pkg)
+        if not now["installed"] or now.get("sha256") != state0["sha256"]:
+            return ["装回原包后 sha256 与入局前记录不符"]
+    if data_backup is not None:
+        fails += restore_data(d, pkg, data_backup, backup_dir)
+    return fails
 
 
 def verify_stopped(d, pkg, seconds=5):
@@ -242,6 +336,9 @@ def main(argv=None):
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
     p.add_argument("--allow-data-loss", action="store_true",
                    help="设备已装该包也照跑：只还原 APK 字节，私有数据与已并入资源不还原（显式接受数据丢失）")
+    p.add_argument("--backup-dir",
+                   help="已装 debuggable 包的私有/外部数据备份落点（默认 <out>/data-backup）；"
+                        "tar + manifest.json（逐文件 sha256 清单），收局按它回灌核对")
     p.add_argument("--adb", default="adb")
     p.add_argument("--ready-timeout", type=int, default=180)
     p.add_argument("--wait", type=float, default=0)
@@ -290,6 +387,7 @@ def main(argv=None):
                 "started_utc": t0.isoformat(), "holder": args.holder,
                 "lock": {"pid": os.getpid(), "dir": str(lock / args.serial)}}
     state0, orig_tmp, launched = None, None, False
+    data_backup, backup_dir, downgrade_back = None, None, False
     props_prev = {}
     logcat_proc, log_file = None, None
     result, reason = "red", "未跑完"
@@ -323,25 +421,58 @@ def main(argv=None):
         manifest["prior_install"] = state0
         if state0.get("split"):
             raise Refuse(f"{pkg} 是分包安装（{state0['paths']}），无法忠实还原；不动这台设备")
-        if state0["installed"] and not args.allow_data_loss:
-            raise Refuse(f"{pkg} 设备上已安装：局内私有数据与已并入资源会被改写且 adb 层无法还原；"
+        backup_dir = Path(args.backup_dir) if args.backup_dir else out / "data-backup"
+        if state0["installed"] and not args.allow_data_loss and not state0["debuggable"]:
+            raise Refuse(f"{pkg} 设备上已安装但不是 debuggable：run-as 备份私有数据做不了，"
+                         f"局内私有数据与已并入资源会被改写且 adb 层无法还原；"
                          f"先手动卸了它再跑，或显式 --allow-data-loss（只还原 APK 字节）")
-        manifest["restore_scope"] = {
-            "apk": "已装不同构建→备份后 install -r 装回并 sha256 复核（分包拒跑）" if state0["installed"]
-                   else "未安装→收局卸载并复核 pm path 已清",
-            "private_data": "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
-                          else "卸载随 /data/data 清",
-            "resources": "落在 /sdcard/Android/data|obb/<pkg>，卸载随删并逐项验不存在"
-                        if not state0["installed"] else "不还原（已并入原应用数据）",
-        }
+        # ---- versionCode / 降级：装新包与装回原包两边都可能是 downgrade，任一要向 -d 而 ----
+        # ---- 设备不支持就连装都不装（拒跑而不是装上去装不回来，manifest 记决策依据）----
+        downgrade_fwd = downgrade_back = False
         if state0["installed"] and state0["sha256"] != our_sha:
+            import game_apk  # 延迟导入：只在这条路径要读新包 versionCode
+            apk_pkg, new_vc, _dbg = game_apk.apk_identity(args.apk)
+            if apk_pkg != pkg:
+                raise Refuse(f"--apk 的包名 {apk_pkg} 与 --package {pkg} 不符，装错了会丢数据")
+            orig_vc = state0.get("versionCode")
+            manifest["versions"] = {"orig_versionCode": orig_vc, "new_versionCode": new_vc}
+            if orig_vc is None:
+                raise Refuse("原包 versionCode 读不到：装回方向判不了降级，不动这台设备")
+            downgrade_fwd = orig_vc > new_vc   # 装低 versionCode 测试包
+            downgrade_back = orig_vc < new_vc  # 收局装回低 versionCode 原包
+            if (downgrade_fwd or downgrade_back) and not device_allows_downgrade(d):
+                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级但设备 pm 不支持 "
+                             f"install -d，装了原包装不回来；不动这台设备")
             orig_tmp = Path(tempfile.mkdtemp(prefix="s2a-orig-")) / "orig.apk"
             d.run("pull", state0["base"], str(orig_tmp), timeout=300)
             if sha256(orig_tmp) != state0["sha256"]:
                 raise Refuse("备份原包 sha256 与设备上读到的不符，放弃起局")
-            log(f"已备份原包 sha256={state0['sha256'][:12]}")
+            log(f"已备份原包 sha256={state0['sha256'][:12]}"
+                + ("；还原装回要走 install -d 降级" if downgrade_back else ""))
         else:
             log(f"原安装状态：{'未安装' if not state0['installed'] else '与本包同 sha256'}")
+        # ---- debuggable 原包：run-as tar 全量备份私有/外部数据（装新包之前；任一目录失败即拒）----
+        data_backup = None
+        if state0["installed"] and state0["debuggable"] and not args.allow_data_loss:
+            data_backup = backup_data(d, pkg, backup_dir)
+            nfiles = sum(len(v["files"]) for v in data_backup["dirs"].values())
+            manifest["data_backup"] = {"dir": str(backup_dir), "dirs": len(data_backup["dirs"]),
+                                       "files": nfiles,
+                                       "tars": {k: v["tar_sha256"] for k, v in data_backup["dirs"].items()}}
+            log(f"已备份原包数据 {len(data_backup['dirs'])} 处目录 / {nfiles} 文件 → {backup_dir}")
+        manifest["restore_scope"] = {
+            "apk": ("已装不同构建→备份后 install -r" + (" -d" if downgrade_back else "")
+                    + " 装回并 sha256 复核（分包拒跑）") if state0["installed"]
+                   else "未安装→收局卸载并复核 pm path 已清",
+            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局 pm clear+回灌+逐文件 sha 核"
+                             if data_backup is not None
+                             else "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
+                                  else "卸载随 /data/data 清"),
+            "resources": "落在 /sdcard/Android/data|obb/<pkg>，卸载随删并逐项验不存在"
+                        if not state0["installed"]
+                        else "随外部数据备份还原（extdata/obb 目录在清单内）" if data_backup is not None
+                             else "不还原（已并入原应用数据）",
+        }
 
         # ---- 安装（资源走 deploy_game.deploy_resources，不启动）----
         if args.pack or args.resources:
@@ -357,12 +488,15 @@ def main(argv=None):
                 game_apk.resources(str(args.pack), str(frozen), str(res))
             else:
                 frozen, res = args.apk, Path(args.resources)
+            if downgrade_fwd:  # deploy_resources 内部装不了降级：先自己把包降上去
+                d.run("install", "-r", "-d", str(frozen), timeout=600)
+                log("已降级安装测试包（install -r -d）")
             deploy_game.deploy_resources(str(frozen), str(res), adb, str(deploy_work),
                                          mode="auto", timeout=300, start=False)
             log("资源与包已部署（deploy_resources，未启动）")
         elif not state0["installed"] or state0["sha256"] != our_sha:
-            d.run("install", "-r", str(args.apk), timeout=600)
-            log("已安装测试包")
+            d.run("install", "-r", *(["-d"] if downgrade_fwd else []), str(args.apk), timeout=600)
+            log("已安装测试包" + ("（install -d 降级）" if downgrade_fwd else ""))
         cur = install_state(d, pkg)
         if not cur["installed"] or cur.get("sha256") != our_sha:
             raise Refuse("安装后 sha256 校验不过")
@@ -555,7 +689,8 @@ def main(argv=None):
         if state0 is not None:
             try:
                 fails += restore_state(d, manifest.get("package", args.package or ""), state0,
-                                       orig_tmp)
+                                       orig_tmp, downgrade=downgrade_back,
+                                       data_backup=data_backup, backup_dir=backup_dir)
             except (RuntimeError, subprocess.SubprocessError) as error:
                 fails.append(f"还原过程 adb 异常：{error}")
         if logcat_proc:

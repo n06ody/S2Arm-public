@@ -10,6 +10,11 @@
   ⑦ 调试属性恢复读回不符 → 留置；游戏收局后仍存活 → 留置；卸载后 data/obb 有残留 → 留置
   ⑧ 能耗：放电状态/符号/覆盖按 android_power 口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
+  ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据 → 收局装回原包再逐文件 sha 核还原；
+    非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
+  ⑩ 降级：原包 versionCode < 新包 → 还原 install -r -d；原包 > 新包 → 装测试包就带 -d；
+    设备 pm 不支持 -d → 装新包前就拒跑
+  ⑪ 还原后数据 sha 与备份清单不符 → 留置
 """
 import base64, hashlib, importlib.util, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
@@ -26,7 +31,7 @@ FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge
           "temp_tenths_c", "source", "ac_powered", "usb_powered", "wireless_powered", "dock_powered")
 
 FAKE_ADB = '''#!/usr/bin/env python3
-import hashlib, json, shlex, sys, time
+import hashlib, io, json, shlex, sys, tarfile, time
 state_path, argv = sys.argv[1], sys.argv[2:]
 if argv and argv[0] == "-s":
     argv = argv[2:]
@@ -37,15 +42,69 @@ def out(s):
     sys.stdout.write(s)
 def fail(msg):
     sys.stderr.write(msg + "\\n"); sys.exit(1)
+
+DATA_DIRS = st.setdefault("data_dirs", {})          # dir -> {relpath: 内容 hex}
+PUSHED = st.setdefault("pushed", {})                # 设备路径 -> 本机路径（adb push）
+
+def file_sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+def sha_listing(dir_):
+    # find . -type f -exec sha256sum {} + 的输出口径
+    lines = []
+    for rel, hx in sorted(DATA_DIRS.get(dir_, {}).items()):
+        lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
+    return "\\n".join(lines) + ("\\n" if lines else "")
+
+def run_as(cmdline):
+    # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录（shell 与 exec-out 两路进来）
+    import re as _re
+    m = _re.match(r"^\\[ -d (\\S+) \\] && echo yes \\|\\| true$", cmdline)
+    if m:
+        out("yes\\n" if m.group(1) in DATA_DIRS else ""); return
+    m = _re.match(r"^cd (\\S+) && find \\. -type f -exec sha256sum \\{\\} \\+$", cmdline)
+    if m:
+        out(sha_listing(m.group(1))); return
+    m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
+    if m:
+        if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
+        DATA_DIRS[m.group(2)] = {}; save(); return
+    m = _re.match(r"^tar -xf (\\S+) -C (\\S+)$", cmdline)
+    if m:
+        src = PUSHED.get(m.group(1))
+        if not src: fail("run-as: tar 源没 push 过 " + m.group(1))
+        DATA_DIRS.setdefault(m.group(2), {})
+        with tarfile.open(src) as tf:
+            for mem in tf.getmembers():
+                if not mem.isfile(): continue
+                rel = mem.name[2:] if mem.name.startswith("./") else mem.name
+                blob = tf.extractfile(mem).read()
+                if st.get("corrupt_restore") and len(DATA_DIRS[m.group(2)]) == 0:
+                    blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
+                DATA_DIRS[m.group(2)][rel] = blob.hex()
+        save(); return
+    m = _re.match(r"^tar -cf - -C (\\S+) \\.$", cmdline)
+    if m:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for rel, hx in sorted(DATA_DIRS.get(m.group(1), {}).items()):
+                blob = bytes.fromhex(hx)
+                info = tarfile.TarInfo("./" + rel)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        sys.stdout.buffer.write(buf.getvalue()); return
+    fail("fake adb: unhandled run-as " + cmdline)
+
 cmd = argv[0]
 if cmd == "get-state":
     out("device"); sys.exit(0)
 if cmd == "install":
     apk = argv[-1]
     if st.get("fail_install"): fail("Failure [INSTALL_FAILED]")
+    if st.get("pm_no_downgrade") and "-d" in argv: fail("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]")
     st["installed"] = True
     st["installed_sha"] = hashlib.sha256(open(apk, "rb").read()).hexdigest()
-    st.setdefault("installs", []).append(apk)
+    st.setdefault("installs", []).append({"apk": apk, "flags": [a for a in argv[1:-1] if a.startswith("-")]})
     save(); out("Success"); sys.exit(0)
 if cmd == "uninstall":
     if st.get("fail_uninstall"): fail("Failure [DELETE_FAILED_INTERNAL]")
@@ -53,7 +112,11 @@ if cmd == "uninstall":
 if cmd == "pull":
     open(argv[-1], "wb").write(bytes.fromhex(st["orig_apk_hex"]))
     out(f"{argv[1]}: 1 file pulled, 0 skipped\\n"); sys.exit(0)
+if cmd == "push":
+    PUSHED[argv[2]] = argv[1]; save(); sys.exit(0)
 if cmd == "exec-out":
+    if len(argv) > 2 and argv[1] == "run-as":
+        run_as(argv[-1]); sys.exit(0)
     sys.stdout.buffer.write(open(st["png"], "rb").read()); sys.exit(0)
 if cmd == "logcat":
     if "-d" in argv:
@@ -79,13 +142,21 @@ if cmd == "shell":
         if st.get("props_jam") and sh[1].startswith("debug.s2a.") and (len(sh) <= 2 or not sh[2]):
             sys.exit(0)
         st["props"][sh[1]] = sh[2] if len(sh) > 2 else ""; save(); sys.exit(0)
-    if c == "pm" and len(sh) > 1:
-        if sh[1] == "path":
+    if c == "pm":
+        if len(sh) == 1 or (len(sh) > 1 and sh[1] == "install" and "--help" in sh):
+            usage = "usage: pm install [-l] [-r] [-t] [-i INSTALLER_PACKAGE_NAME] \\\\n"
+            usage += "       [-d: allow version code downgrade]\\n" if not st.get("pm_no_downgrade") else ""
+            out(usage); sys.exit(255)
+        if len(sh) > 1 and sh[1] == "path":
             out(("package:" + st["base_path"] + "\\n") if st["installed"] else ""); sys.exit(0)
-        if sh[1] == "uninstall":
+        if len(sh) > 1 and sh[1] == "clear":
+            for k in list(DATA_DIRS):
+                DATA_DIRS[k] = {}
+            save(); out("Success"); sys.exit(0)
+        if len(sh) > 1 and sh[1] == "uninstall":
             if st.get("fail_uninstall"): fail("Failure [DELETE_FAILED_INTERNAL]")
             st["installed"] = False; save(); out("Success"); sys.exit(0)
-        if sh[1] == "list":
+        if len(sh) > 1 and sh[1] == "list":
             out("package:" + st["package"] + "\\n" if st["installed"] else ""); sys.exit(0)
     if c == "sha256sum":
         out((st["installed_sha"] or "0" * 64) + "  " + sh[-1] + "\\n"); sys.exit(0)
@@ -104,6 +175,11 @@ if cmd == "shell":
             else:
                 st["running"] = True
                 st["launch_cmd"] = text
+                # 游戏起局即改写自己的数据（存档/新文件）——还原不还原从这里才分得出来
+                for dir_ in list(DATA_DIRS):
+                    if DATA_DIRS[dir_]:
+                        DATA_DIRS[dir_]["files/save.dat"] = b"SAVE-RUN-MODIFIED".hex()
+                        DATA_DIRS[dir_]["files/run-scratch.tmp"] = b"scratch".hex()
             save(); out("Status: ok\\nLaunchState: COLD\\nTotalTime: 200\\nWaitTime: 210\\n"); sys.exit(0)
         if "force-stop" in sh:
             if not st.get("unstoppable"): st["running"] = False
@@ -114,7 +190,14 @@ if cmd == "shell":
     if c == "dumpsys":
         if len(sh) > 1 and sh[1] == "battery": out(st["dumpsys_battery"]); sys.exit(0)
         if len(sh) > 1 and sh[1] == "thermalservice": out(st["dumpsys_thermal"]); sys.exit(0)
+        if len(sh) > 1 and sh[1] == "package":
+            if st["installed"]:
+                flags = "pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA" + (" DEBUGGABLE" if st.get("debuggable") else "") + " ]"
+                out(f"versionCode={st['orig_vc']}\\n    {flags}\\n"); sys.exit(0)
+            out(""); sys.exit(0)
         out(""); sys.exit(0)
+    if c == "run-as" and len(sh) > 4 and sh[2] == "sh" and sh[3] == "-c":
+        run_as(sh[4]); sys.exit(0)
     if c == "logcat":
         if "-c" in sh: sys.exit(0)
         if "-d" in sh: out(open(st["logcat_dump"]).read()); sys.exit(0)
@@ -135,6 +218,7 @@ def make_state(root, **kw):
         "package": PKG, "installed": False, "installed_sha": "", "running": False,
         "pid": "4242", "base_path": f"/data/app/{PKG}-Ab12/base.apk",
         "orig_apk_hex": "aabbccdd", "uptime_us": 10_000_000,
+        "debuggable": False, "orig_vc": 200, "data_dirs": {}, "pushed": {},
         "props": {
             "ro.product.model": "PixelTest", "ro.soc.model": "TEST_SOC",
             "ro.build.version.release": "15",
@@ -208,17 +292,34 @@ class RunGameTest(unittest.TestCase):
             return base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
-    def run_tool(self, state=None, argv=None, seconds=3):
+    def _aapt2(self, version_code=200):
+        """aapt2 替身：apk_identity 只读 badging 的 package/versionCode 行。"""
+        tool = self.tmp / "sdk" / "build-tools" / "36.0.0" / "aapt2"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text("#!/bin/sh\necho \"package: name='" + PKG + "' versionCode='" +
+                        str(version_code) + "' versionName='1.0'\"\n")
+        tool.chmod(0o755)
+        return self.tmp / "sdk"
+
+    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200):
         state = make_state(self.tmp, **(state or {}))
         out = self.tmp / "out_1"
         fake = self.tmp / "fake_adb.py"
         fake.write_text(FAKE_ADB)
+        old_home = os.environ.get("ANDROID_HOME")
+        os.environ["ANDROID_HOME"] = str(self._aapt2(new_vc))
         args = ["--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
                 "--out", str(out), "--seconds", str(seconds),
                 "--adb", f"{sys.executable} {fake} {state}",
                 "--lock-root", str(self.lock_root), "--ready-timeout", "5"]
         args += argv or []
-        rc = run_game.main(args)
+        try:
+            rc = run_game.main(args)
+        finally:
+            if old_home is None:
+                os.environ.pop("ANDROID_HOME", None)
+            else:
+                os.environ["ANDROID_HOME"] = old_home
         return rc, out, state
 
     def _qc(self, out):
@@ -271,16 +372,16 @@ class RunGameTest(unittest.TestCase):
         self.assertFalse(st["held"], st)
         self.assertFalse((self.lock_root / SERIAL / "detained.json").exists())
 
-    def test_refuses_when_already_installed(self):
-        """③ 已装该包 = 私有数据保证不了还原 → 直接拒跑（装/启动都不该发生）。"""
-        orig_sha = hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()
-        rc, out, state = self.run_tool(state={"installed": True, "installed_sha": orig_sha})
+    def test_refuses_when_installed_not_debuggable(self):
+        """③⑨ 已装但非 debuggable：run-as 备份做不了，私有数据保证不了还原 → 拒跑。"""
+        rc, out, state = self.run_tool(state=self._installed_state(debuggable=False))
         self.assertNotEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("installs", st, "拒跑不该有任何安装动作")
         self.assertFalse(st["running"], "拒跑不该启动游戏")
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("私有数据", man["reason"])
+        self.assertIn("debuggable", man["reason"])
 
     def test_restores_original_apk_with_data_loss_flag(self):
         """③ --allow-data-loss 放行：只还原 APK 字节（装回原包复核 sha）。"""
@@ -294,6 +395,89 @@ class RunGameTest(unittest.TestCase):
         self.assertGreaterEqual(len(st["installs"]), 2, "应装过测试包再装回原包")
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("不还原", man["restore_scope"]["private_data"])
+
+    def _installed_state(self, **kw):
+        orig_sha = hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()
+        base = {"installed": True, "installed_sha": orig_sha}
+        base.update(kw)
+        return base
+
+    def _data_dirs(self):
+        priv = f"/data/data/{PKG}"
+        ext = f"/sdcard/Android/data/{PKG}"
+        obb = f"/sdcard/Android/obb/{PKG}"
+        return {priv: {"shared_prefs/settings.xml": b"<prefs/>".hex(),
+                       "files/save.dat": b"SAVE-V1".hex()},
+                ext: {"files/import/index.tsv": b"idx".hex()},
+                obb: {"main.obb": b"OBB".hex()}}
+
+    def test_debuggable_installed_backs_up_and_restores_data(self):
+        """⑨ 已装 debuggable：备份私有+外部数据 → 收局装回原包后逐文件 sha 核还原。"""
+        dirs = self._data_dirs()
+        rc, out, state = self.run_tool(state=self._installed_state(debuggable=True, data_dirs=dict(dirs)))
+        self.assertEqual(0, rc, "debuggable 已装应能跑并全还原")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(dirs, st["data_dirs"], "还原后设备数据应与入局前逐字节一致")
+        orig_sha = hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()
+        self.assertEqual(orig_sha, st["installed_sha"], "还原后设备上应是原包")
+        backup = out / "data-backup"
+        self.assertTrue((backup / "manifest.json").is_file(), "备份清单没落盘")
+        man = json.loads((backup / "manifest.json").read_text())
+        self.assertEqual(3, len(man["dirs"]), "三处数据目录都该备份")
+        self.assertEqual(2, len(man["dirs"]["private"]["files"]))
+        for tag in man["dirs"]:
+            self.assertTrue((backup / man["dirs"][tag]["tar"]).is_file())
+        run_man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("data-backup", run_man.get("data_backup", {}).get("dir", ""))
+
+    def test_downgrade_restore_installs_with_dash_d(self):
+        """⑩ 原包 versionCode < 新包：收局装回原包是降级，必须 install -r -d。"""
+        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100),
+                                     argv=["--allow-data-loss"], new_vc=300)
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertGreaterEqual(len(st["installs"]), 2)
+        self.assertNotIn("-d", st["installs"][0]["flags"], "装新包（升级）不该带 -d")
+        self.assertIn("-d", st["installs"][-1]["flags"], "装回旧版原包是降级，必须带 -d")
+
+    def test_downgrade_unsupported_refuses_before_install(self):
+        """⑩ 原包 < 新包且设备 pm 不支持 -d：装新包前就拒跑。"""
+        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100, pm_no_downgrade=True),
+                                     argv=["--allow-data-loss"], new_vc=300)
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "降级装不回去就不该先装新包")
+        self.assertFalse(st["running"])
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("降级", man["reason"])
+
+    def test_forward_downgrade_installs_with_dash_d(self):
+        """⑩ 原包 versionCode > 新包：装测试包本身就是降级要带 -d；还原是升级不带。"""
+        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=500),
+                                       argv=["--allow-data-loss"], new_vc=100)
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("-d", st["installs"][0]["flags"], "装低 versionCode 测试包要 -d")
+        self.assertNotIn("-d", st["installs"][-1]["flags"], "装回高 versionCode 原包不需要 -d")
+
+    def test_forward_downgrade_unsupported_refuses(self):
+        """⑩ 原包 > 新包且不支持 -d：连装新包都不行，拒跑。"""
+        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=500, pm_no_downgrade=True),
+                                     argv=["--allow-data-loss"], new_vc=100)
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_restore_sha_mismatch_detains(self):
+        """⑪ 数据还原后 sha 与备份清单不符（还原被改写）→ 留置。"""
+        dirs = self._data_dirs()
+        rc, out, state = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(dirs), corrupt_restore=True))
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "数据还原 sha 不符应留置")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("sha", man["reason"])
 
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
