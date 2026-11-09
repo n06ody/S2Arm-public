@@ -161,3 +161,34 @@ The prior script included the entire dispatcher SHA in both Opus and VPX keys.
 Adding libavc therefore invalidated unrelated artifacts, and its temporary-only
 fetch path retried the network during the formal build. This is covered by
 independent-key, missing-source, corrupt-source and forbidden-network fixtures.
+
+## VP9 / AMediaCodec contract (#44)
+
+`s2a_mc.c` is the AMediaCodec boundary for hardware video decode, registered
+through `AndroidVp9Decoder` (`android/cs/video/`) and gated by
+`debug.s2a.video_hw` (`v[0]=='1'`; read inside `s2a_mc_probe`/`s2a_mc_create`,
+matching the `debug.s2a.buffer_geometry` convention). It carries no pinned
+third-party source — pure NDK `libmediandk`, compiled directly into
+`libs2arm_android.so` (`s2a_android_host_sources`), so `build.sh` source
+preparation does not cover it.
+
+The decode contract differs from `s2a_avc`: output is written into caller-owned
+Y/U/V planes (`s2a_mc_plane`: data/capacity/stride) passed to `s2a_mc_decode`,
+not a borrowed native view. `McSurface` allocates the planes unmanaged so the
+managed fallback decoder can write through the same `ISurface` pointers after a
+capability-boundary fallback. The shim deinterleaves the codec's actual output
+format reported by `AMediaCodec_getOutputFormat` (`color-format`/`stride`/
+`slice-height`/`crop-*`): YUV420 planar copies rows, semiplanar/NV12 (and
+FLEXIBLE/QCOM semiplanar, de-facto NV12) splits interleaved UV into separate U/V
+planes because `ISurface` exposes three independent planes. Unknown color
+formats fail as contract errors rather than guessing a layout.
+
+`AMediaFormat_set*` returns `void` (NDK 29): only `getInt32` signals presence.
+`AMEDIACODEC_INFO_*` dequeue results are normal flow control and retried with a
+bounded budget (input 20×10 ms, output 100×10 ms); a stall is `S2A_MC_LIMIT`,
+not a hang. Frame-size changes surface as `S2A_MC_RECONFIG` before input
+queueing — `McVp9Decoder` destroys and recreates the codec at the new
+dimensions. After any decode-stage failure the shim marks the context failed;
+the C# boundary decides managed fallback (before the first confirmed frame)
+versus persistent failure (after), and zero-fills the VP9 metadata hardware
+cannot produce (`mvsOut`, `BackwardUpdateCounts`) rather than fabricating it.

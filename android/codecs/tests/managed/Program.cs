@@ -140,6 +140,41 @@ static class Program
             }
         }
     }
+    static unsafe void Vp9Mc()
+    {
+        // S2A_MC_FAKE_MODE 驱动 fixture dylib 的演出路径；只验选择边界与出图写入，
+        // 不验像素正确性（fixture 不是解码器）。
+        string mode=Environment.GetEnvironmentVariable("S2A_MC_FAKE_MODE") ?? "ok";
+        using var decoder=new AndroidVp9Decoder();
+        using var surface=decoder.CreateSurface(32,16);
+        var info=new Vp9PictureInfo();
+        byte[] au={0x12,0x34,0x56,0x78};
+        Span<Vp9MvRef> mvs=stackalloc Vp9MvRef[8];
+        MemoryMarshal.Cast<Vp9MvRef,byte>(mvs).Fill(0xAA);
+        if(mode=="ok"||mode=="latefail")
+        {
+            Check(decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"vp9 hw decode");
+            Check(decoder.IsHardwareAccelerated,"wrapper reports hw after confirmed frame");
+            Check(MemoryMarshal.Cast<Vp9MvRef,byte>(mvs).IndexOfAnyExcept((byte)0)<0,"mvsOut zero-filled");
+            Check(info.BackwardUpdateCounts.Equals(new Vp9BackwardUpdates()),"backward update counts zeroed");
+            byte* y=(byte*)surface.YPlane.Pointer,u=(byte*)surface.UPlane.Pointer,v=(byte*)surface.VPlane.Pointer;
+            Check(y[0]==0x55&&y[8*surface.Stride+5]==0x55,"fixture Y pattern in caller plane");
+            Check(u[0]==0x66&&v[0]==0x77,"fixture UV pattern in caller planes");
+        }
+        if(mode=="latefail")
+        {
+            Check(!decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"confirmed hw mid-stream fail");
+            Check(!decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"confirmed hw fail is sticky");
+            Check(decoder.IsHardwareAccelerated,"sticky failure keeps hw backend");
+        }
+        if(mode is "noprobe" or "createfail" or "decodefail")
+        {
+            // 能力边界回托管：托管对垃圾 AU 的行为不在此断言（可抛可拒），只钉后端已换。
+            try { decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs); } catch(Exception) { }
+            Check(!decoder.IsHardwareAccelerated,"capability boundary falls back to managed");
+        }
+        Console.WriteLine("PASS vp9 selection boundary mode="+mode);
+    }
     static void Reconfiguration(string directory)
     {
         using var small=JsonDocument.Parse(File.ReadAllText(Path.Combine(directory,"b-refs4.json")));
@@ -163,14 +198,16 @@ static class Program
         try
         {
             string library=Environment.GetEnvironmentVariable("S2A_AVC_LIBRARY") ?? "";
+            string mclibrary=Environment.GetEnvironmentVariable("S2A_MC_LIBRARY") ?? "";
             NativeLibrary.SetDllImportResolver(typeof(AvcH264Decoder).Assembly,(name,assembly,path)=>
-                name=="s2arm_android" ? library.Length!=0 ? NativeLibrary.Load(library) : throw new DllNotFoundException("fixture: absent native backend") : 0);
+                name=="s2arm_android" ? (mclibrary.Length!=0 ? mclibrary : library).Length!=0 ? NativeLibrary.Load(mclibrary.Length!=0 ? mclibrary : library) : throw new DllNotFoundException("fixture: absent native backend") : 0);
             if(args.Length>0 && args[0]=="baseline-ffmpeg")
             {
                 using var baseline=new Ryujinx.Graphics.Nvdec.FFmpeg.H264.Decoder();
                 throw new Exception("baseline unexpectedly found FFmpeg");
             }
-            if(args.Length==0) Contracts(); else { Vectors(args[0],args.Length>1?args[1]:""); if(args.Length==1) Reconfiguration(args[0]); }
+            if(args.Length>0 && args[0]=="vp9") Vp9Mc();
+            else if(args.Length==0) Contracts(); else { Vectors(args[0],args.Length>1?args[1]:""); if(args.Length==1) Reconfiguration(args[0]); }
             return 0;
         }
         catch(Exception error) { Console.Error.WriteLine(error); return 1; }

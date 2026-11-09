@@ -11,6 +11,8 @@ namespace S2A.Android.Video
         {
             S2AVideoDecoders.H264 = static () => new AvcH264Decoder();
             S2AVideoDecoders.Vp8 = static () => new AndroidVp8Decoder();
+            // VP9（#44）：选 AMediaCodec 硬件（debug.s2a.video_hw）或回树内托管，由包装器选。
+            S2AVideoDecoders.Vp9 = static () => new AndroidVp9Decoder();
         }
     }
 }

@@ -17,6 +17,8 @@ function(s2a_android_host_sources output)
         native/wsi_lease.c native/input.c native/tsd.c native/module.c native/selftest.c native/selftest_gate.S
         native/guest_signal.c native/redlog.c native/redzone.S native/pcm_ring.c native/aaudio_sink.c native/hostapi.c native/screen_metrics.c
         native/host_android.c native/host_ui.c native/host_ui_android.c native/host_ui_jni.cpp native/plat_android.c
+        # AMediaCodec 视频解码边界（#44 第二刀）：纯 NDK API，无钉版源码，直接进单库。
+        codecs/s2a_mc.c
         native/direct_vk.c native/direct_session.c native/direct_choice.c native/direct_callback.c native/direct_callback.S)
     if(S2A_ANDROID_EXPERIMENTAL_TOUCH)
         list(APPEND sources native/touch_input.c)

@@ -142,13 +142,21 @@ internal static class VideoDecoderFactoryContractTests
         Check(registration != null, "AndroidVideo.Register entry must exist in platform assembly");
         registration!.GetMethod("Register", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, null);
         using var context = new Context();
-        var h = context.H264(); var v = context.Vp8();
+        var h = context.H264(); var v = context.Vp8(); var n = context.Vp9();
         Check(h.GetType().FullName == "Ryujinx.Graphics.Nvdec.Android.AvcH264Decoder", "H264 registered to migrated AvcH264Decoder");
         Check(v.GetType().FullName == "Ryujinx.Graphics.Nvdec.Android.AndroidVp8Decoder", "VP8 registered to migrated AndroidVp8Decoder");
-        Check(h.GetType().Assembly == platform && v.GetType().Assembly == platform, "both decoders live in platform assembly");
+        Check(n.GetType().FullName == "Ryujinx.Graphics.Nvdec.Android.AndroidVp9Decoder", "VP9 registered to AndroidVp9Decoder selection boundary");
+        Check(h.GetType().Assembly == platform && v.GetType().Assembly == platform && n.GetType().Assembly == platform,
+            "all decoders live in platform assembly");
         Check(h.GetType().Assembly != typeof(S2AVideoDecoders).Assembly, "decoders are outside shared Nvdec assembly");
-        Check(ReferenceEquals(h, context.H264()) && ReferenceEquals(v, context.Vp8()), "registered decoders cached per context");
-        Vp9Managed(context);   // 安卓尚未登记 VP9 工厂：同一兜底，行为与接槽前一致
+        Check(ReferenceEquals(h, context.H264()) && ReferenceEquals(v, context.Vp8()) && ReferenceEquals(n, context.Vp9()),
+            "registered decoders cached per context");
+        // 宿主机没有 libs2arm_android：probe 抛 DllNotFound → 选不到硬件 → 报非硬件加速。
+        // 选托管发生在首次 Decode，出图面本身（McSurface）在宿主可建。
+        Check(!n.IsHardwareAccelerated, "host: no native library → VP9 wrapper reports no hw");
+        using var surface = n.CreateSurface(17, 11);
+        Check(surface.Width == 17 && surface.Height == 11 && surface.UvWidth == 9 && surface.UvHeight == 6,
+            "VP9 surface preserves chroma dimensions");
         Check(Errors.Count == 0, "android-registered path has no red log");
     }
 

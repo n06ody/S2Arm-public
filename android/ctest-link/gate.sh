@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 门禁路由：runtime/src/ runtime/include/ graphics/track/ platform/plat.h platform/plat_asm.h runtime/tests/t_crash_android_fatal.c
-# 门禁路由：android/CMakeLists.txt android/native/ android/tests/ android/w4-tests/ android/core-link/ android/ctest-link/ android/cs/savecommit/tests/native_host_test.c android/cs/savecommit/tests/open_read_host_test.c
+# 门禁路由：android/CMakeLists.txt android/native/ android/tests/ android/w4-tests/ android/core-link/ android/ctest-link/ android/codecs/ android/cs/savecommit/tests/native_host_test.c android/cs/savecommit/tests/open_read_host_test.c
 # 门禁路由：graphics/nvn/gfx/nvn/ graphics/nvn/gfx/tex/ graphics/nvn/host/ graphics/nvn/third_party/vulkan-headers/
 # 门禁本机：* 要 cmake + ninja + NDK 29：gate-host 的 /opt/homebrew/bin 没有 cmake / ninja（10-30 实测），本机都有；秒级
 # 安卓链接符号核对（合入前层）：NDK 交叉真链接 android/CMakeLists.txt 在 Linux aarch64 配置下的全部 CTest 可执行目标，
