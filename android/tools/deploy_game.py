@@ -24,13 +24,14 @@ IMPORT_EXTRA = 'org.s2arm.android.IMPORT_STAGING'
 
 
 class Adb:
-    def __init__(self, serial):
+    def __init__(self, serial, adb='adb'):
         if not re.fullmatch(r'[A-Za-z0-9_.:-]+', serial):
             raise ValueError('设备序列号无效。')
         self.serial = serial
+        self.argv = [*shlex.split(adb), '-s', serial]
 
     def call(self, *args, timeout=600):
-        result = subprocess.run(['adb', '-s', self.serial, *map(str, args)],
+        result = subprocess.run([*self.argv, *map(str, args)],
                                 capture_output=True, text=True, timeout=timeout)
         if result.returncode:
             raise RuntimeError(f'adb {args[0]} failed: {result.stdout.strip()} {result.stderr.strip()}')
@@ -41,7 +42,7 @@ class Adb:
 
     def running(self, package):
         for name in (package, package + ':game'):
-            result = subprocess.run(['adb', '-s', self.serial, 'shell', 'pidof', name],
+            result = subprocess.run([*self.argv, 'shell', 'pidof', name],
                                     capture_output=True, text=True, timeout=120)
             if result.returncode not in (0, 1) or result.stderr.strip():
                 raise RuntimeError('无法确认设备游戏进程状态：' + result.stderr.strip())
