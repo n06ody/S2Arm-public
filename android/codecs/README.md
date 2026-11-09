@@ -229,8 +229,15 @@ non-key-frame size changes (a recreated codec has no reference state).
 `mvsOut` and `countsOut` are metadata hardware cannot produce, so the
 backend writes nothing (the guest buffers keep their upstream content;
 the path's counts stay all-zero, which is the faithful value for a
-`refresh_frame_context=0` frame) — nothing fabricated. Every 300 jobs
-and at Dispose the backend logs a one-line outcome distribution
+`refresh_frame_context=0` frame) — nothing fabricated. The unwritten
+MV field has a caller-side consequence: `ProducesGuestMetadata=false`
+makes `Vp9NativePath` mark the guest MV buffer stale after each native
+`Decoded`, and `Vp9Decoder.Decode` refuses to run a managed job with
+`use_prev_frame_mvs` while stale — the segment drops to the next key
+frame rather than let managed decode from values the backend never
+wrote (a managed decode or a key frame re-establishes real MVs and
+clears it). Every 300 jobs and at Dispose the backend logs a one-line
+outcome distribution
 (`mc-vp9 outcome:` decoded/hidden/header/prevMv/probs/size/starved/error)
 for real-device coverage measurement. After any decode-stage failure
 the shim marks the context failed; the backend maps that to `Error`

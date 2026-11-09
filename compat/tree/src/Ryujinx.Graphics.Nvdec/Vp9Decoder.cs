@@ -17,6 +17,7 @@ namespace Ryujinx.Graphics.Nvdec
     {
         private static bool _s2aLogged;   // S2Arm: one line on the first decoded frame, so runs show which games take this (managed) VP9 path
         private static int _s2aNativeBroken;  // S2Arm: the native backend's library is missing or broken in this process
+        private static int _s2aMvBlockedLogged;  // S2Arm: one line on the first managed job refused for stale guest MVs
 
         public unsafe static void Decode(NvdecDecoderContext context, ResourceManager rm, ref NvdecRegisters state)
         {
@@ -94,9 +95,25 @@ namespace Ryujinx.Graphics.Nvdec
             uint lumaOffset = state.SetPictureLumaOffset[3];
             uint chromaOffset = state.SetPictureChromaOffset[3];
 
-            if (decoder.Decode(ref info, currentSurface, bitstream, mvsIn, mvsOut))
+            // S2Arm: a native backend that cannot produce the NVDEC MV field leaves the guest MV buffer stale;
+            // a managed job with use_prev_frame_mvs would decode from it. Refuse the job until a managed decode
+            // (or a key frame) re-establishes real MVs — the segment drops to the next key frame rather than
+            // handing the managed decoder fabricated state.
+            bool mvBlocked = native is { GuestMvStale: true } && info.UsePrevInFindMvRefs;
+
+            if (mvBlocked)
+            {
+                if (Interlocked.Exchange(ref _s2aMvBlockedLogged, 1) == 0)
+                {
+                    Ryujinx.Common.Logging.Logger.Info?.Print(Ryujinx.Common.Logging.LogClass.Nvdec, "VP9 原生段 use_prev_frame_mvs 作业到关键帧前不交托管：客体 MV 缓冲里是原生后端产不出的陈旧字段");
+                }
+
+                decoder.TrackSegmentMap(info.IsKeyFrame || info.IntraOnly, pictureInfo.CurrentFrameSize.Width, pictureInfo.CurrentFrameSize.Height);
+            }
+            else if (decoder.Decode(ref info, currentSurface, bitstream, mvsIn, mvsOut))
             {
                 SurfaceWriter.Write(rm.MemoryManager, currentSurface, lumaOffset, chromaOffset);
+                native?.NoteManagedDecoded();
 
                 if (!_s2aLogged)
                 {

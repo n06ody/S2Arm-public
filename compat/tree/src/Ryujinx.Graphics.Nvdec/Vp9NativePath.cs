@@ -20,12 +20,26 @@ namespace Ryujinx.Graphics.Nvdec
     {
         private const int MaxErrors = 3;
 
+        // Guest MV freshness: a backend that cannot produce the NVDEC MV field (ProducesGuestMetadata=false)
+        // leaves the guest MV write buffer untouched on Decoded, so the read buffer a later managed job would
+        // consume is stale. Stale clears when a managed decode writes real MVs again, or a key frame job passes
+        // through (keyframes reset the field — a use_prev job cannot directly follow one anyway). The caller
+        // refuses to run a managed job with use_prev_frame_mvs while stale.
+        internal struct Vp9GuestMvState
+        {
+            public bool Stale;
+            public void NoteKeyFrame() => Stale = false;
+            public void NoteNativeDecoded(bool produced) { if (!produced) Stale = true; }
+            public void NoteManagedDecoded() => Stale = false;
+        }
+
         private readonly IVp9NativeBackend _backend;
         private readonly Vp9SlotMap _slots = new();
         private readonly VpxSurface _surface = new(0, 0);
         private readonly HashSet<string> _loggedReasons = [];
         private byte[] _frame = new byte[1 << 20];
         private readonly byte[] _counts = new byte[VpxVp9Backend.CountsSize];
+        private Vp9GuestMvState _mvState;
         private bool _active;
         private int _errors;
         private bool _loggedFirst;
@@ -97,6 +111,11 @@ namespace Ryujinx.Graphics.Nvdec
             }
 
             Vp9NativeInput input = Input(ref pictureInfo, ref state);
+
+            if (input.KeyFrame)
+            {
+                _mvState.NoteKeyFrame();
+            }
 
             if (!_active)
             {
@@ -177,6 +196,7 @@ namespace Ryujinx.Graphics.Nvdec
                 return false;
             }
 
+            _mvState.NoteNativeDecoded(_backend.ProducesGuestMetadata);
             _slots.Commit(input, input.KeyFrame ? -1 : target);
             _surface.Attach((byte*)picture.Y, (byte*)picture.U, (byte*)picture.V, picture.YStride, picture.UvStride, picture.Width, picture.Height);
             SurfaceWriter.Write(rm.MemoryManager, _surface, input.OutLuma, input.OutChroma);
@@ -191,6 +211,13 @@ namespace Ryujinx.Graphics.Nvdec
 
             return true;
         }
+
+        // True when the guest MV read buffer does not hold the previous frame's real MV field: a backend that
+        // produces no guest metadata decoded since the last managed decode or key frame. The caller must not run
+        // a managed job with use_prev_frame_mvs while this holds — it would consume stale values.
+        public bool GuestMvStale => _mvState.Stale;
+
+        public void NoteManagedDecoded() => _mvState.NoteManagedDecoded();
 
         public void Dispose()
         {

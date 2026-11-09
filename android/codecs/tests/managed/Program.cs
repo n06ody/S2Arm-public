@@ -208,6 +208,26 @@ static class Program
             resize.IntraFrame=1;
             Check(R(resize,out var pic2,out _)==Vp9NativeResult.Decoded,"keyframe resize reconfigures");
             Check(pic2.Width==64&&pic2.Height==32,"picture follows new size");
+            // 客体 MV 陈旧度状态机（Vp9Decoder.Decode 据此拦 use_prev 托管作业）：
+            // MC 产不出 MV 字段 → Decoded 后客体读缓冲陈旧；托管再解一帧（写真值）
+            // 或关键帧经过才恢复。
+            Check(!backend.ProducesGuestMetadata,"mc declares no guest metadata");
+            var mst=new Vp9NativePath.Vp9GuestMvState();
+            Check(!mst.Stale,"fresh state not stale");
+            mst.NoteNativeDecoded(false);
+            Check(mst.Stale,"mc-era decoded leaves guest MV stale");
+            mst.NoteNativeDecoded(false);
+            Check(mst.Stale,"stale persists across further mc decodes");
+            mst.NoteManagedDecoded();
+            Check(!mst.Stale,"managed decode re-establishes real MVs");
+            mst.NoteNativeDecoded(false);
+            mst.NoteKeyFrame();
+            Check(!mst.Stale,"key frame re-establishes (field resets)");
+            // 对拍基线：同样事件序列，vpx 语义（产真值）永不陈旧 → 托管照常接手。
+            var vst=new Vp9NativePath.Vp9GuestMvState();
+            vst.NoteNativeDecoded(true);
+            vst.NoteNativeDecoded(true);
+            Check(!vst.Stale,"vpx-era decodes leave guest MV real (baseline)");
         }
         if(mode=="pending")
         {

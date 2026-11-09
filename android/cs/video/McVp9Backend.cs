@@ -69,6 +69,10 @@ namespace Ryujinx.Graphics.Nvdec.Android
         private void Report() => Logger.Info?.Print(LogClass.Nvdec,
             $"mc-vp9 outcome: jobs={_jobs} decoded={_decoded} hidden={_nrHidden} header={_nrHeader} prevMv={_nrMv} probs={_nrProbs} size/key={_nrSize} starved={_starved} error={_errors}");
 
+        // AMediaCodec 交不出 MV 字段 / 反向更新计数：Decoded 不写 mvsOut/countsOut，
+        // 客体 MV 缓冲保持上游内容；调用方据此拦下会读陈旧 MV 的托管作业。
+        public bool ProducesGuestMetadata => false;
+
         public static McVp9Backend TryCreate() => McVp9Decoder.Available() ? new McVp9Backend() : null;
 
         private static ReadOnlySpan<byte> DefaultProbs()

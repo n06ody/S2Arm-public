@@ -1,0 +1,141 @@
+diff --git a/src/Ryujinx.Graphics.Nvdec/Vp9Decoder.cs b/src/Ryujinx.Graphics.Nvdec/Vp9Decoder.cs
+index 9c5424414fe9b25b4e29fe030935a54c3a46f998..8f0dce187b4addb8b620e1bf0f2d9d2303ee6dfb 100644
+--- a/src/Ryujinx.Graphics.Nvdec/Vp9Decoder.cs
++++ b/src/Ryujinx.Graphics.Nvdec/Vp9Decoder.cs
+@@ -17,6 +17,7 @@ namespace Ryujinx.Graphics.Nvdec
+     {
+         private static bool _s2aLogged;   // S2Arm: one line on the first decoded frame, so runs show which games take this (managed) VP9 path
+         private static int _s2aNativeBroken;  // S2Arm: the native backend's library is missing or broken in this process
++        private static int _s2aMvBlockedLogged;  // S2Arm: one line on the first managed job refused for stale guest MVs
+ 
+         public unsafe static void Decode(NvdecDecoderContext context, ResourceManager rm, ref NvdecRegisters state)
+         {
+@@ -94,9 +95,25 @@ namespace Ryujinx.Graphics.Nvdec
+             uint lumaOffset = state.SetPictureLumaOffset[3];
+             uint chromaOffset = state.SetPictureChromaOffset[3];
+ 
+-            if (decoder.Decode(ref info, currentSurface, bitstream, mvsIn, mvsOut))
++            // S2Arm: a native backend that cannot produce the NVDEC MV field leaves the guest MV buffer stale;
++            // a managed job with use_prev_frame_mvs would decode from it. Refuse the job until a managed decode
++            // (or a key frame) re-establishes real MVs — the segment drops to the next key frame rather than
++            // handing the managed decoder fabricated state.
++            bool mvBlocked = native is { GuestMvStale: true } && info.UsePrevInFindMvRefs;
++
++            if (mvBlocked)
++            {
++                if (Interlocked.Exchange(ref _s2aMvBlockedLogged, 1) == 0)
++                {
++                    Ryujinx.Common.Logging.Logger.Info?.Print(Ryujinx.Common.Logging.LogClass.Nvdec, "VP9 原生段 use_prev_frame_mvs 作业到关键帧前不交托管：客体 MV 缓冲里是原生后端产不出的陈旧字段");
++                }
++
++                decoder.TrackSegmentMap(info.IsKeyFrame || info.IntraOnly, pictureInfo.CurrentFrameSize.Width, pictureInfo.CurrentFrameSize.Height);
++            }
++            else if (decoder.Decode(ref info, currentSurface, bitstream, mvsIn, mvsOut))
+             {
+                 SurfaceWriter.Write(rm.MemoryManager, currentSurface, lumaOffset, chromaOffset);
++                native?.NoteManagedDecoded();
+ 
+                 if (!_s2aLogged)
+                 {
+diff --git a/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs b/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
+index 949abcc7a3cf920987ee25cda7cad981fbf02858..c5e33960f77cd6f49fbf83260f2e14c8e00a89a0 100644
+--- a/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
++++ b/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
+@@ -20,12 +20,26 @@ namespace Ryujinx.Graphics.Nvdec
+     {
+         private const int MaxErrors = 3;
+ 
++        // Guest MV freshness: a backend that cannot produce the NVDEC MV field (ProducesGuestMetadata=false)
++        // leaves the guest MV write buffer untouched on Decoded, so the read buffer a later managed job would
++        // consume is stale. Stale clears when a managed decode writes real MVs again, or a key frame job passes
++        // through (keyframes reset the field — a use_prev job cannot directly follow one anyway). The caller
++        // refuses to run a managed job with use_prev_frame_mvs while stale.
++        internal struct Vp9GuestMvState
++        {
++            public bool Stale;
++            public void NoteKeyFrame() => Stale = false;
++            public void NoteNativeDecoded(bool produced) { if (!produced) Stale = true; }
++            public void NoteManagedDecoded() => Stale = false;
++        }
++
+         private readonly IVp9NativeBackend _backend;
+         private readonly Vp9SlotMap _slots = new();
+         private readonly VpxSurface _surface = new(0, 0);
+         private readonly HashSet<string> _loggedReasons = [];
+         private byte[] _frame = new byte[1 << 20];
+         private readonly byte[] _counts = new byte[VpxVp9Backend.CountsSize];
++        private Vp9GuestMvState _mvState;
+         private bool _active;
+         private int _errors;
+         private bool _loggedFirst;
+@@ -98,6 +112,11 @@ namespace Ryujinx.Graphics.Nvdec
+ 
+             Vp9NativeInput input = Input(ref pictureInfo, ref state);
+ 
++            if (input.KeyFrame)
++            {
++                _mvState.NoteKeyFrame();
++            }
++
+             if (!_active)
+             {
+                 if (!input.KeyFrame)
+@@ -177,6 +196,7 @@ namespace Ryujinx.Graphics.Nvdec
+                 return false;
+             }
+ 
++            _mvState.NoteNativeDecoded(_backend.ProducesGuestMetadata);
+             _slots.Commit(input, input.KeyFrame ? -1 : target);
+             _surface.Attach((byte*)picture.Y, (byte*)picture.U, (byte*)picture.V, picture.YStride, picture.UvStride, picture.Width, picture.Height);
+             SurfaceWriter.Write(rm.MemoryManager, _surface, input.OutLuma, input.OutChroma);
+@@ -192,6 +212,13 @@ namespace Ryujinx.Graphics.Nvdec
+             return true;
+         }
+ 
++        // True when the guest MV read buffer does not hold the previous frame's real MV field: a backend that
++        // produces no guest metadata decoded since the last managed decode or key frame. The caller must not run
++        // a managed job with use_prev_frame_mvs while this holds — it would consume stale values.
++        public bool GuestMvStale => _mvState.Stale;
++
++        public void NoteManagedDecoded() => _mvState.NoteManagedDecoded();
++
+         public void Dispose()
+         {
+             _backend.Dispose();
+diff --git a/src/Ryujinx.Graphics.Nvdec/Vpx/VpxVp9Backend.cs b/src/Ryujinx.Graphics.Nvdec/Vpx/VpxVp9Backend.cs
+index cb480f5a071ffc95a1e49b4392c4c16b28f6597f..5b4e1178418d086aeb6af1fa9fcd19a65030d80f 100644
+--- a/src/Ryujinx.Graphics.Nvdec/Vpx/VpxVp9Backend.cs
++++ b/src/Ryujinx.Graphics.Nvdec/Vpx/VpxVp9Backend.cs
+@@ -40,6 +40,9 @@ namespace Ryujinx.Graphics.Nvdec.Vpx
+ 
+         private nint _handle;
+ 
++        // The libvpx hook fills the guest MV write buffer and the backward-update counts with real values.
++        public bool ProducesGuestMetadata => true;
++
+         public Vp9NativeResult Decode(
+             ReadOnlySpan<byte> frame,
+             ReadOnlySpan<byte> probs,
+diff --git a/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs b/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
+index f2357901d78792c7ca8b8a90863a2f052ac598d8..e53223a15b31d98bdca84f0caeaf425df4ea9b51 100644
+--- a/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
++++ b/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
+@@ -50,10 +50,16 @@ namespace Ryujinx.Graphics.Video
+ 
+     public interface IVp9NativeBackend : IDisposable
+     {
++        // Whether Decoded writes real MV/count state into the guest-visible NVDEC layouts (mvsOut / countsOut).
++        // libvpx's hook produces them; a hardware path (AMediaCodec) cannot, and the caller must then refuse a
++        // managed job that would read the stale guest MV buffer (use_prev_frame_mvs) until a managed decode or
++        // a key frame re-establishes it.
++        bool ProducesGuestMetadata { get; }
++
+         // frame: uncompressed header + 1 byte + tile data. probs: Vp9EntropyProbs bytes (3087). prevMvs: the guest's MV
+         // read buffer (empty when UsePrevFrameMvs is 0). mvsOut: the guest's MV write buffer (16 bytes per 8x8), written
+-        // on Decoded. countsOut: Vp9BackwardUpdates bytes (13208), written on Decoded. The picture stays valid until the
+-        // next call.
++        // on Decoded when ProducesGuestMetadata — otherwise left untouched (guest content is kept; nothing fabricated).
++        // countsOut: Vp9BackwardUpdates bytes (13208), same rule. The picture stays valid until the next call.
+         Vp9NativeResult Decode(
+             ReadOnlySpan<byte> frame,
+             ReadOnlySpan<byte> probs,

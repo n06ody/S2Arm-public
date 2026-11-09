@@ -40,6 +40,9 @@ namespace Ryujinx.Graphics.Nvdec.Vpx
 
         private nint _handle;
 
+        // The libvpx hook fills the guest MV write buffer and the backward-update counts with real values.
+        public bool ProducesGuestMetadata => true;
+
         public Vp9NativeResult Decode(
             ReadOnlySpan<byte> frame,
             ReadOnlySpan<byte> probs,

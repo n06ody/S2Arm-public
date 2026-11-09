@@ -50,10 +50,16 @@ namespace Ryujinx.Graphics.Video
 
     public interface IVp9NativeBackend : IDisposable
     {
+        // Whether Decoded writes real MV/count state into the guest-visible NVDEC layouts (mvsOut / countsOut).
+        // libvpx's hook produces them; a hardware path (AMediaCodec) cannot, and the caller must then refuse a
+        // managed job that would read the stale guest MV buffer (use_prev_frame_mvs) until a managed decode or
+        // a key frame re-establishes it.
+        bool ProducesGuestMetadata { get; }
+
         // frame: uncompressed header + 1 byte + tile data. probs: Vp9EntropyProbs bytes (3087). prevMvs: the guest's MV
         // read buffer (empty when UsePrevFrameMvs is 0). mvsOut: the guest's MV write buffer (16 bytes per 8x8), written
-        // on Decoded. countsOut: Vp9BackwardUpdates bytes (13208), written on Decoded. The picture stays valid until the
-        // next call.
+        // on Decoded when ProducesGuestMetadata — otherwise left untouched (guest content is kept; nothing fabricated).
+        // countsOut: Vp9BackwardUpdates bytes (13208), same rule. The picture stays valid until the next call.
         Vp9NativeResult Decode(
             ReadOnlySpan<byte> frame,
             ReadOnlySpan<byte> probs,
