@@ -10,13 +10,17 @@
   ⑦ 调试属性恢复读回不符 → 留置；游戏收局后仍存活 → 留置；卸载后 data/obb 有残留 → 留置
   ⑧ 能耗：放电状态/符号/覆盖按 android_power 口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
-  ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据 → 收局装回原包再逐文件 sha 核还原；
-    非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
+  ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
+    → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
   ⑩ 降级：原包 versionCode < 新包 → 还原 install -r -d；原包 > 新包 → 装测试包就带 -d；
-    设备 pm 不支持 -d → 装新包前就拒跑
+    降级能力不看 usage 文本——装测试包方向真降级由 install -r -d 实测（失败不卸旧包）；
+    装回方向备份后同版原包做 flag 探针（只证 -d 被解析层收），真降级收局见分晓
   ⑪ 还原后数据 sha 与备份清单不符 → 留置
+  ㉕ 数据保护硬门：目录三态探针（存在但进不去 = 报错拒跑，不当不存在）；备份/回灌两处
+    tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后；
+    推回途中篡改 → 设备端复核逮住 → 留置；卸载后外部目录读不进 → 留置
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -32,7 +36,7 @@ FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge
           "dock_powered", "plugged", "interactive", "power_save", "thermal_status")
 
 FAKE_ADB = '''#!/usr/bin/env python3
-import hashlib, io, json, os, shlex, sys, tarfile, time
+import hashlib, io, json, os, re, shlex, sys, tarfile, time
 state_path, argv = sys.argv[1], sys.argv[2:]
 if argv and argv[0] == "-s":
     argv = argv[2:]
@@ -45,6 +49,30 @@ def fail(msg):
     sys.stderr.write(msg + "\\n"); sys.exit(1)
 
 DATA_DIRS = st.setdefault("data_dirs", {})          # dir -> {relpath: 内容 hex}
+DATA_LINKS = st.setdefault("data_links", {})        # dir -> {relpath: 软链目标}
+DATA_SUBDIRS = st.setdefault("data_subdirs", {})    # dir -> [relpath,...] 显式目录（含空目录）
+DATA_MODES = st.setdefault("data_modes", {})        # dir -> {relpath: 八进制串} 权限覆盖
+DATA_DENIED = st.setdefault("data_denied", {})      # dir -> True：存在但 run-as 进不去
+
+
+def dir_entries(dir_):
+    """目录全量成员：文件 + 显式目录 + 文件/软链隐含的父目录 + 软链。"""
+    files = DATA_DIRS.get(dir_, {})
+    links = DATA_LINKS.get(dir_, {})
+    dirs = set(DATA_SUBDIRS.get(dir_, []))
+    for rel in list(files) + list(links):
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            dirs.add("/".join(parts[:i]))
+    modes = DATA_MODES.get(dir_, {})
+    out_e = {}
+    for rel in dirs:
+        out_e[rel] = (modes.get(rel, "775"), "directory")
+    for rel in files:
+        out_e[rel] = (modes.get(rel, "664"), "regular file")
+    for rel in links:
+        out_e[rel] = (modes.get(rel, "777"), "symbolic link")
+    return out_e
 PUSHED = st.setdefault("pushed", {})                # 设备路径 -> 本机路径（adb push 单文件）
 DEV_FS = st.setdefault("dev_fs", {})                # 设备绝对路径 -> 内容 hex（push 目录/tar 解开/mv/rm 都动它）
 
@@ -129,37 +157,95 @@ def run_as(cmdline):
                     blob = bytes.fromhex(files_[rel])
                     out(f"{file_sha(blob)}  {p}\\n{len(blob)}\\n"); return
         fail("sha256sum: " + p + ": No such file or directory")
-    m = _re.match(r"^\\[ -d (\\S+) \\] && echo yes \\|\\| true$", cmdline)
+    m = _re.match(r"^if \\[ -e (\\S+) \\]; then echo ok; else echo absent; fi$", cmdline)
     if m:
-        out("yes\\n" if m.group(1) in DATA_DIRS else ""); return
+        # [ -e ] 真义：父目录不可搜索时同样返回假——和「不存在」分不开（负对照用）
+        dir_ = m.group(1)
+        if dir_ in st.get("data_parent_denied", {}) or dir_ in DATA_DENIED:
+            out("absent\\n"); return
+        out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS else "absent") + "\\n"); return
+    m = _re.match(r"^e=\\$\\(stat -c %F (\\S+) 2>&1\\); if", cmdline)
+    if m:
+        # 三态探针（stat 接 stderr 分 EACCES/ENOENT）：父目录不可搜索 → stat 拒 → denied；
+        # 自身进不去 → denied；真没有 → absent
+        dir_ = m.group(1)
+        if dir_ in st.get("data_parent_denied", {}):
+            out("denied\\n"); return
+        if dir_ in DATA_DENIED:
+            out("denied\\n"); return
+        out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS or dir_ in DATA_LINKS
+             or dir_ in DATA_SUBDIRS else "absent") + "\\n"); return
     m = _re.match(r"^cd (\\S+) && find \\. -type f -exec sha256sum \\{\\} \\+$", cmdline)
     if m:
         out(sha_listing(m.group(1))); return
+    m = _re.match(r"^cd (\\S+) && find \\. -mindepth 1 -exec stat -c '%a\\|%F\\|%n' \\{\\} \\+$",
+                  cmdline)
+    if m:
+        lines = []
+        for rel, (mode, ftype) in sorted(dir_entries(m.group(1)).items()):
+            lines.append(f"{mode}|{ftype}|./{rel}")
+        out("\\n".join(lines) + ("\\n" if lines else "")); return
+    m = _re.match(r"^cd (\\S+) && find \\. -type l -exec sh -c 'for p do ", cmdline)
+    if m:
+        lines = [f"./{rel}\\t{tgt}" for rel, tgt in sorted(DATA_LINKS.get(m.group(1), {}).items())]
+        out("\\n".join(lines) + ("\\n" if lines else "")); return
     m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
     if m:
         if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
-        DATA_DIRS[m.group(2)] = {}; save(); return
-    m = _re.match(r"^tar -xf (\\S+) -C (\\S+)$", cmdline)
+        for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
+            tab[m.group(2)] = {} if tab is not DATA_SUBDIRS else []
+        save(); return
+    m = _re.match(r"^tar -xpf (\\S+) -C (\\S+)$", cmdline)
     if m:
         src = PUSHED.get(m.group(1))
         if not src: fail("run-as: tar 源没 push 过 " + m.group(1))
-        DATA_DIRS.setdefault(m.group(2), {})
+        dir_ = m.group(2)
+        DATA_DIRS.setdefault(dir_, {})
+        DATA_LINKS.setdefault(dir_, {})
+        DATA_SUBDIRS.setdefault(dir_, [])
         with tarfile.open(src) as tf:
             for mem in tf.getmembers():
-                if not mem.isfile(): continue
                 rel = mem.name[2:] if mem.name.startswith("./") else mem.name
-                blob = tf.extractfile(mem).read()
-                if st.get("corrupt_restore") and len(DATA_DIRS[m.group(2)]) == 0:
-                    blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
-                DATA_DIRS[m.group(2)][rel] = blob.hex()
+                DATA_MODES.setdefault(dir_, {})[rel] = format(mem.mode & 0o7777, "o")
+                if mem.isfile():
+                    blob = tf.extractfile(mem).read()
+                    if st.get("corrupt_restore") and len(DATA_DIRS[dir_]) == 0:
+                        blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
+                    DATA_DIRS[dir_][rel] = blob.hex()
+                elif mem.issym():
+                    DATA_LINKS[dir_][rel] = mem.linkname
+                elif mem.isdir() and rel not in DATA_SUBDIRS[dir_]:
+                    DATA_SUBDIRS[dir_].append(rel)
         save(); return
-    m = _re.match(r"^tar -cf - -C (\\S+) \\.$", cmdline)
+    m = _re.match(r"^tar -cpf - -C (\\S+) \\.$", cmdline)
     if m:
+        dir_ = m.group(1)
+        if dir_ in DATA_DENIED:
+            fail("run-as: tar: " + dir_ + ": Permission denied")
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tf:
-            for rel, hx in sorted(DATA_DIRS.get(m.group(1), {}).items()):
-                blob = bytes.fromhex(hx)
+            # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
+            root_ = tarfile.TarInfo("./")
+            root_.type, root_.mode = tarfile.DIRTYPE, 0o775
+            tf.addfile(root_)
+            for rel, (mode, ftype) in sorted(dir_entries(dir_).items()):
                 info = tarfile.TarInfo("./" + rel)
+                info.mode = int(mode, 8)
+                if ftype == "regular file":
+                    blob = bytes.fromhex(DATA_DIRS[dir_][rel])
+                    info.size = len(blob)
+                    tf.addfile(info, io.BytesIO(blob))
+                elif ftype == "directory":
+                    info.type = tarfile.DIRTYPE
+                    tf.addfile(info)
+                elif ftype == "symbolic link":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = DATA_LINKS[dir_][rel]
+                    tf.addfile(info)
+            if st.get("corrupt_backup_tar"):
+                # 备份核对门负控：归档比源清单多出成员 → 解包核对不过 → 拒跑
+                blob = b"planted"
+                info = tarfile.TarInfo("./planted.evil")
                 info.size = len(blob)
                 tf.addfile(info, io.BytesIO(blob))
         sys.stdout.buffer.write(buf.getvalue()); return
@@ -188,6 +274,13 @@ if cmd == "push":
     PUSHED[argv[2]] = argv[1]
     if argv[1].endswith(".tar"):
         st["tar_pushed"] = argv[2]
+        if st.get("corrupt_backup_before_restore"):
+            # 归档核对门负控：备份时完好、回灌前宿主机归档被塞了异物 → 检出才许 pm clear
+            with tarfile.open(argv[1], "a") as tf:
+                blob = b"planted"
+                info = tarfile.TarInfo("./planted.evil")
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
     save(); sys.exit(0)
 if cmd == "exec-out":
     if len(argv) > 2 and argv[1] == "run-as":
@@ -258,8 +351,10 @@ if cmd == "shell":
                 out("package:" + st["base_path"] + "\\n"); sys.exit(0)
             sys.exit(1)
         if len(sh) > 1 and sh[1] == "clear":
-            for k in list(DATA_DIRS):
-                DATA_DIRS[k] = {}
+            st["pm_cleared"] = st.get("pm_cleared", 0) + 1    # 记账：pm clear 跑没跑过
+            for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
+                for k in list(tab):
+                    tab[k] = {} if tab is not DATA_SUBDIRS else []
             save(); out("Success"); sys.exit(0)
         if len(sh) > 1 and sh[1] == "uninstall":
             if st.get("fail_uninstall"): fail("Failure [DELETE_FAILED_INTERNAL]")
@@ -416,6 +511,16 @@ if cmd == "shell":
                 dump = "\\n".join(ln for ln in dump.splitlines()
                                  if "Game startup accepted:" not in ln) + "\\n"
             out(dump); sys.exit(0)
+        sys.exit(0)
+    if text.startswith("e=$(stat -c %F"):
+        # external_dirs_gone 探针：存在+可读 → ls 内容；读不进/父目录不可搜索 → __denied__
+        m = re.search(r"stat -c %F (\\S+)", text)
+        p = m.group(1).strip("'")
+        mine = p.endswith("/" + st["package"])
+        if mine and (st.get("ext_denied") or st.get("ext_parent_denied")):
+            out("__denied__\\n"); sys.exit(0)
+        if st.get("data_residue") and ("Android/data" in p or "Android/obb" in p):
+            out("files\\n"); sys.exit(0)
         sys.exit(0)
     if c == "ls":
         if st.get("data_residue") and ("Android/data" in text or "Android/obb" in text):
@@ -704,37 +809,166 @@ class RunGameTest(unittest.TestCase):
         ext = f"/sdcard/Android/data/{PKG}"
         obb = f"/sdcard/Android/obb/{PKG}"
         return {priv: {"shared_prefs/settings.xml": b"<prefs/>".hex(),
-                       "files/save.dat": b"SAVE-V1".hex()},
+                       "files/save.dat": b"SAVE-V1".hex(),
+                       "files/profiles/active.bin": b"PROFILE".hex()},
                 ext: {"files/import/index.tsv": b"idx".hex()},
                 obb: {"main.obb": b"OBB".hex()}}
 
+    def _data_state(self):
+        """_data_dirs + 软链/空目录/权限覆盖：全量清单（非仅文件）的还原对象。"""
+        priv = f"/data/data/{PKG}"
+        return {"data_dirs": self._data_dirs(),
+                "data_links": {priv: {"files/profile.bin": "files/profiles/active.bin"}},
+                "data_subdirs": {priv: ["files/empty_cache", "files/empty_cache/deep"]},
+                "data_modes": {priv: {"files/save.dat": "600"}}}
+
     def test_debuggable_installed_backs_up_and_restores_data(self):
-        """⑨ 已装 debuggable：备份私有+外部数据 → 收局装回原包后逐文件 sha 核还原。"""
-        dirs = self._data_dirs()
-        rc, out, state = self.run_tool(state=self._installed_state(debuggable=True, data_dirs=dict(dirs)))
+        """⑨ 已装 debuggable：备份私有+外部数据（文件/软链/空目录/权限全量清单）
+        → 收局装回原包后逐项核还原。"""
+        want = self._data_state()
+        dirs = want["data_dirs"]
+        rc, out, state = self.run_tool(state=self._installed_state(debuggable=True, **want))
         self.assertEqual(0, rc, "debuggable 已装应能跑并全还原")
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertEqual(dirs, st["data_dirs"], "还原后设备数据应与入局前逐字节一致")
+        self.assertEqual(want["data_links"][f"/data/data/{PKG}"],
+                         st["data_links"][f"/data/data/{PKG}"], "软链目标应还原")
+        self.assertTrue(set(want["data_subdirs"][f"/data/data/{PKG}"])
+                        <= set(st["data_subdirs"][f"/data/data/{PKG}"]),
+                        "显式空目录应还原（解开的 tar 会顺带重建隐式父目录）")
         orig_sha = hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()
         self.assertEqual(orig_sha, st["installed_sha"], "还原后设备上应是原包")
         backup = out / "data-backup"
         self.assertTrue((backup / "manifest.json").is_file(), "备份清单没落盘")
         man = json.loads((backup / "manifest.json").read_text())
         self.assertEqual(3, len(man["dirs"]), "三处数据目录都该备份")
-        self.assertEqual(2, len(man["dirs"]["private"]["files"]))
+        self.assertEqual(3, len(man["dirs"]["private"]["files"]))
+        ent = man["dirs"]["private"]["entries"]
+        self.assertEqual("l", ent["files/profile.bin"]["t"])
+        self.assertEqual("files/profiles/active.bin", ent["files/profile.bin"]["target"])
+        self.assertEqual("d", ent["files/empty_cache"]["t"])
+        self.assertEqual(0o600, ent["files/save.dat"]["mode"])
         for tag in man["dirs"]:
             self.assertTrue((backup / man["dirs"][tag]["tar"]).is_file())
         run_man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("data-backup", run_man.get("data_backup", {}).get("dir", ""))
 
+    def test_denied_dir_refuses_before_backup(self):
+        """㉕ 数据目录存在但 run-as 进不去：报错拒跑而不是当不存在悄悄跳过。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_denied"] = {priv: True}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("进不去", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "备不了原数据就不该装新包")
+
+    def test_parent_denied_dir_refuses_before_backup(self):
+        """㉕ 父目录不可搜索：[ -e ] 假三态会报 absent 静默跳过（qa-fone 受限
+        父目录实测）——stat 接 stderr 后此类一律 denied → 拒跑。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_parent_denied"] = {priv: True}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("进不去", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_backup_archive_mismatch_refuses(self):
+        """㉕ 备份归档解包核对不过（tar 比源清单多成员）→ 拒跑，不入局。"""
+        state = self._data_state()
+        state["corrupt_backup_tar"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("对不上", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_pushed_tamper_caught_by_post_verify(self):
+        """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →
+        设备端全量复核仍逮住 → 留置。"""
+        state = self._data_state()
+        state["corrupt_backup_before_restore"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("不符", man["reason"], man["reason"])
+
+    def test_verify_gate_blocks_pm_clear_unit(self):
+        """㉕ 归档核对是 pm clear 的硬门（单测直验顺序）：tar 与清单一致 →
+        塞异物 → restore_data 返回失败且 pm clear 一次都没被调。"""
+        bdir = self.tmp / "bk"
+        bdir.mkdir()
+        tar = bdir / "private.tar"
+        blob = b"SAVE-V1"
+        with tarfile.open(tar, "w") as tf:
+            dmem = tarfile.TarInfo("./files")
+            dmem.type, dmem.mode = tarfile.DIRTYPE, 0o775
+            tf.addfile(dmem)
+            info = tarfile.TarInfo("./files/save.dat")
+            info.size, info.mode = len(blob), 0o600
+            tf.addfile(info, io.BytesIO(blob))
+        entries = {"files": {"t": "d", "mode": 0o775},
+                   "files/save.dat": {"t": "f", "mode": 0o600,
+                                      "sha": hashlib.sha256(blob).hexdigest()}}
+        man = {"dirs": {"private": {"dir": "/data/data/x", "tar": "private.tar",
+                                    "entries": entries}}}
+        # 干净时核对应过（正向锚：门不是无脑拒）
+        self.assertEqual([], run_game._verify_tar(man, bdir, "private"))
+        with tarfile.open(tar, "a") as tf:
+            evil = tarfile.TarInfo("./planted.evil")
+            blob2 = b"x"
+            evil.size = len(blob2)
+            tf.addfile(evil, io.BytesIO(blob2))
+        calls = []
+
+        class Dev:
+            argv = []
+
+            def shell(self, cmd, **kw):
+                calls.append(cmd); return ""
+
+            def run_as(self, pkg, cmd, **kw):
+                calls.append(cmd); return ""
+
+            def run(self, *a, **kw):
+                calls.append(" ".join(a))
+
+        fails = run_game.restore_data(Dev(), PKG, man, bdir)
+        self.assertTrue(fails)
+        self.assertTrue(any("归档核对未过" in f for f in fails), fails)
+        self.assertFalse(any("pm clear" in c for c in calls),
+                         "核对未过 pm clear 一次都不许跑")
+
+    def test_ext_dir_denied_detains(self):
+        """㉕ 卸载后外部目录存在但读不进：报不可访问 ≠ 已清 → 留置。"""
+        rc, out, _ = self.run_tool(state={"ext_denied": True})
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("读不进", man["reason"], man["reason"])
+
     def test_downgrade_restore_installs_with_dash_d(self):
-        """⑩ 原包 versionCode < 新包：收局装回原包是降级，必须 install -r -d。"""
+        """⑩ 原包 versionCode < 新包：备份后同版原包做 install -r -d flag 探针
+        收局装回原包必须带 -d。"""
         rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100),
                                      argv=["--allow-data-loss"], new_vc=300)
         self.assertEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
-        self.assertGreaterEqual(len(st["installs"]), 2)
-        self.assertNotIn("-d", st["installs"][0]["flags"], "装新包（升级）不该带 -d")
+        self.assertGreaterEqual(len(st["installs"]), 3)
+        probe = st["installs"][0]
+        self.assertTrue(probe["apk"].endswith("orig.apk"), "装回方向备份后同版原包做 flag 探针")
+        self.assertIn("-d", probe["flags"], "探针本身就是 install -r -d")
+        test_install = next(i for i in st["installs"] if i["apk"].endswith("game.apk")
+                            and "s2a-orig" not in i["apk"])
+        self.assertNotIn("-d", test_install["flags"], "装新包（升级）不该带 -d")
         self.assertIn("-d", st["installs"][-1]["flags"], "装回旧版原包是降级，必须带 -d")
 
     def test_downgrade_unsupported_refuses_before_install(self):
@@ -754,7 +988,9 @@ class RunGameTest(unittest.TestCase):
                                        argv=["--allow-data-loss"], new_vc=100)
         self.assertEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
-        self.assertIn("-d", st["installs"][0]["flags"], "装低 versionCode 测试包要 -d")
+        test_install = st["installs"][0]
+        self.assertTrue(test_install["apk"].endswith("game.apk"), "fwd 方向真降级=装测试包本身")
+        self.assertIn("-d", test_install["flags"], "装低 versionCode 测试包要 -d")
         self.assertNotIn("-d", st["installs"][-1]["flags"], "装回高 versionCode 原包不需要 -d")
 
     def test_forward_downgrade_unsupported_refuses(self):
@@ -1048,6 +1284,18 @@ class RunGameTest(unittest.TestCase):
         self.assertTrue(all(r["verified"] for r in man["private_logs"]),
                         "传输完整性照样核实——归属未证 ≠ 字节没对上")
         self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_no_birth_attribution_unproven(self):
+        """㉔ qa-fone 负控：墙钟正常但 /proc/<pid>/stat 读拒 → 进程 birth 证不了，
+        起局墙钟不充数 → 证据照拉但一律 unproven + 注记，绝不升 bound。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"no_proc_stat": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"], "birth 缺不该挡证据拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("birth" in n and "归属未证" in n for n in man["notes"]),
+                        man["notes"])
 
     def test_private_logs_no_timebase_attribution_unproven(self):
         """㉓ qa-fone 负控：birth(/proc/stat 拒）与墙钟（date +%s 拒）两头都缺 →

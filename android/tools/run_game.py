@@ -18,11 +18,14 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 还原范围（保证不了的一律拒跑，不返回成功兜底）：
 - 原 APK：设备已装该包且构建不同 → adb pull 备份、收局 install -r 装回并 sha256 复核；
   分包（split APK）装回不可靠 → 入局即拒。原包 versionCode 低于新包时装回是降级：
-  装新包前先验设备 pm 支持 install -d（usage 里的「-d: allow version code downgrade」），
-  不支持就拒跑而不是装了回不来；原包高于新包时装测试包本身也带 -d。
+  降级能力不看 usage 文本——装测试包方向的降级由真 `install -r -d` 实测（失败即拒，
+  装失败不卸旧包）；装回方向备份后拿同版原包做 install -r -d 探针，只证 flag 被
+  解析层收（真降级收局见分晓，装不回 → 留置）。原包高于新包时装测试包本身也带 -d。
 - 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
   /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
-  tar + manifest.json 逐文件 sha256 清单）；收局装回原包后 pm clear、回灌、逐文件核 sha。
+  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）；归档先解包
+  与源清单逐项核对，对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端
+  全量复核。存在但 run-as 进不去的目录报错拒跑，不当不存在。
   已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
   （私有数据、已并入资源不还原，manifest 写明）。
 - 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
@@ -38,7 +41,7 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
-import argparse, datetime, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time
+import argparse, datetime, hashlib, json, os, posixpath, re, shlex, signal, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -113,10 +116,99 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-def device_allows_downgrade(d):
-    """设备 pm 是否支持 install -d（降级）。pm usage 里有『-d: allow version code downgrade』。"""
-    usage = d.shell("pm install --help 2>&1 || pm 2>&1", allowed=(0, 1, 255))
-    return bool(re.search(r"-d[^\n]*downgrade", usage, re.I))
+def probe_dash_d(d, apk):
+    """`install -d` flag 是否被 pm 解析层接受：同版原包重灌一遍（qa-fone 语义：
+    同 versionCode 不触发真降级，证的是 flag 语法被收——usage 文本写了 -d 但
+    实际 unknown option 的设备在这步现形；真降级与否收局 install -r -d 才见
+    分晓，装不回 → 还原失败 → 留置）。返回 None=flag 被收，否则失败说明。"""
+    try:
+        d.run("install", "-r", "-d", str(apk), timeout=600)
+        return None
+    except RuntimeError as error:
+        return str(error)
+
+
+STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
+LINK_MAP_CMD = ("cd {q} && find . -type l -exec sh -c "
+                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _ {{}} +")
+
+
+def _entry_map(sha_text, stat_text, link_text):
+    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}。rel 去掉 ./ 前缀。"""
+    entries = {}
+    for ln in stat_text.splitlines():
+        ln = ln.strip()
+        if not ln or "|" not in ln:
+            continue
+        mode, ftype, name = ln.split("|", 2)
+        rel = posixpath.normpath(name)
+        if rel in ("", "."):
+            continue
+        t = {"regular file": "f", "directory": "d", "symbolic link": "l"}.get(ftype, ftype)
+        entries[rel] = {"t": t, "mode": int(mode, 8)}
+    for rel, sha in _sha_listing(sha_text).items():
+        if rel in entries:
+            entries[rel]["sha"] = sha
+    for ln in link_text.splitlines():
+        if "\t" not in ln:
+            continue
+        name, target = ln.split("\t", 1)
+        rel = posixpath.normpath(name.strip())
+        if rel in entries:
+            entries[rel]["target"] = target
+    return entries
+
+
+def device_entries(d, pkg, dir_):
+    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。"""
+    sha_text = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
+                        timeout=300)
+    stat_text = d.run_as(pkg, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    link_text = d.run_as(pkg, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    return _entry_map(sha_text, stat_text, link_text)
+
+
+def tar_entries(tar_path):
+    """宿主机把归档解开核对：tar 成员 → 与 device_entries 同形的 {rel: entry}。"""
+    entries = {}
+    with tarfile.open(tar_path) as tf:
+        for mem in tf.getmembers():
+            # toybox `tar -cf - -C dir .` 首成员是 ./（tarfile 读出名归一成 .）：
+            # 根目录不进清单（设备端 find -mindepth 1 也不含根），归一后跳过
+            rel = posixpath.normpath(mem.name)
+            if rel in ("", "."):
+                continue
+            if mem.isfile():
+                data = tf.extractfile(mem).read()
+                entries[rel] = {"t": "f", "mode": mem.mode & 0o7777,
+                                "sha": hashlib.sha256(data).hexdigest()}
+            elif mem.isdir():
+                entries[rel] = {"t": "d", "mode": mem.mode & 0o7777}
+            elif mem.issym():
+                entries[rel] = {"t": "l", "mode": mem.mode & 0o7777, "target": mem.linkname}
+            else:
+                entries[rel] = {"t": "other", "mode": mem.mode & 0o7777}
+    return entries
+
+
+def entries_diff(want, got):
+    """逐项对清单：缺/多/类型/ sha/权限/软链目标。返回人类可读差异列表。"""
+    diffs = []
+    for rel in sorted(set(want) - set(got)):
+        diffs.append(f"缺 {rel}")
+    for rel in sorted(set(got) - set(want)):
+        diffs.append(f"多 {rel}")
+    for rel in sorted(set(want) & set(got)):
+        w, g = want[rel], got[rel]
+        if w["t"] != g["t"]:
+            diffs.append(f"{rel} 类型 {w['t']}≠{g['t']}")
+        elif w["t"] == "f" and w.get("sha") != g.get("sha"):
+            diffs.append(f"{rel} sha 不符")
+        elif w["t"] == "l" and w.get("target") != g.get("target"):
+            diffs.append(f"{rel} 软链目标 {w.get('target')!r}≠{g.get('target')!r}")
+        elif w.get("mode") is not None and g.get("mode") is not None and w["mode"] != g["mode"]:
+            diffs.append(f"{rel} 权限 {oct(w['mode'])}≠{oct(g['mode'])}")
+    return diffs
 
 
 DATA_DIRS = (("private", "/data/data/{pkg}"),
@@ -135,35 +227,77 @@ def _sha_listing(text):
     return files
 
 
+def _dir_probe(d, pkg, dir_):
+    """三态探针：ok=可访问 / absent=不存在 / denied=证不了（进不去或父目录
+    不可搜索）。`[ -e ]` 是假三态——父目录不可搜索时它和「不存在」一样返回
+    假（qa-fone 受限父目录实测）：必须用 stat 接 stderr 分 EACCES/ENOENT，
+    分辨不了的一律 denied，绝不静默跳过。"""
+    q = shlex.quote(dir_)
+    out = d.run_as(pkg, f"e=$(stat -c %F {q} 2>&1); "
+                        f"if [ $? -eq 0 ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
+                        f"then echo ok; else echo denied; fi; else "
+                        f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo denied;; "
+                        f"*\"No such\"*|*ENOENT*) echo absent;; *) echo denied;; esac; fi",
+                   timeout=30).strip().splitlines()
+    return out[-1].strip() if out else "denied"
+
+
+def _verify_tar(manifest, backup_dir, tag):
+    """归档先解包核对：tar 成员逐项（文件 sha/软链目标/目录/权限）对源清单。
+    返回差异列表（空=归档可信）——任何破坏性操作前必过此门。"""
+    info = manifest["dirs"][tag]
+    try:
+        return entries_diff(info["entries"], tar_entries(Path(backup_dir) / info["tar"]))
+    except (OSError, tarfile.TarError, KeyError) as error:
+        return [f"归档解不开：{error}"]
+
+
 def backup_data(d, pkg, dest):
-    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + find sha256sum 清单。
-    任一目录备份失败即 Refuse（保证不了还原就不入局）。"""
+    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + 全量清单
+    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。归档落盘后先解包与源清单
+    逐项核对——对不上即 Refuse（保证不了还原就不入局）；存在但不可访问的目录
+    报错而不是当不存在。"""
     dest.mkdir(parents=True)
-    manifest = {"schema": 1, "package": pkg, "dirs": {}}
+    manifest = {"schema": 2, "package": pkg, "dirs": {}}
     for tag, tpl in DATA_DIRS:
         dir_ = tpl.format(pkg=pkg)
-        present = d.run_as(pkg, f"[ -d {shlex.quote(dir_)} ] && echo yes || true").strip()
-        if "yes" not in present:
+        state = _dir_probe(d, pkg, dir_)
+        if state == "absent":
             continue
+        if state != "ok":
+            raise Refuse(f"{dir_} 目录状态证不了（存在但进不去或父目录不可搜索）："
+                         f"证不了也备不了，不动这台设备")
         tar = dest / f"{tag}.tar"
         # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
         r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
-                            f"tar -cf - -C {shlex.quote(dir_)} ."],
+                            f"tar -cpf - -C {shlex.quote(dir_)} ."],
                            capture_output=True, timeout=600)
         if r.returncode or not r.stdout:
             raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
         tar.write_bytes(r.stdout)
-        listing = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
-                           timeout=300)
-        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name,
-                                 "tar_sha256": sha256(tar), "files": _sha_listing(listing)}
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": sha256(tar),
+                                 "entries": device_entries(d, pkg, dir_)}
+        bad = _verify_tar(manifest, dest, tag)
+        if bad:
+            raise Refuse(f"{dir_} 备份归档与源清单对不上（{bad[:3]}）：回灌不可信，不动这台设备")
+    for tag in manifest["dirs"]:
+        manifest["dirs"][tag]["files"] = {
+            rel: e["sha"] for rel, e in manifest["dirs"][tag]["entries"].items()
+            if e["t"] == "f" and "sha" in e}
     (dest / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
     return manifest
 
 
 def restore_data(d, pkg, manifest, backup_dir):
-    """先清空再按清单回灌、逐文件 sha 核。返回失败说明串列表（空=成功）。"""
+    """顺序是硬门：归档先解包核对（与源清单逐项一致）→ pm clear → 回灌 →
+    设备端全量复核。核对不过一个字符都不许清。返回失败说明串列表（空=成功）。"""
     fails = []
+    for tag in manifest["dirs"]:
+        bad = _verify_tar(manifest, backup_dir, tag)
+        if bad:
+            fails.append(f"{manifest['dirs'][tag]['dir']} 归档核对未过：{bad[:3]}")
+    if fails:
+        return fails + ["归档核对未过：pm clear 未执行，设备数据未动"]
     try:
         d.shell(f"pm clear {pkg}", allowed=(0, 1))
     except (RuntimeError, subprocess.SubprocessError) as error:
@@ -175,17 +309,11 @@ def restore_data(d, pkg, manifest, backup_dir):
                      timeout=120)
             tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
             d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
-            d.run_as(pkg, f"tar -xf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
             d.shell(f"rm -f {tmp}", allowed=(0, 1))
-            got = _sha_listing(d.run_as(
-                pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +", timeout=300))
-            want = info["files"]
-            bad = [rel for rel, sha in want.items() if got.get(rel) != sha]
-            extra = sorted(set(got) - set(want))
+            bad = entries_diff(info["entries"], device_entries(d, pkg, dir_))
             if bad:
-                fails.append(f"{dir_} 还原后 {len(bad)} 个文件 sha 与备份清单不符：{bad[:3]}")
-            if extra:
-                fails.append(f"{dir_} 还原后多出 {len(extra)} 个未备份文件：{extra[:3]}")
+                fails.append(f"{dir_} 还原后与备份清单不符 {len(bad)} 项：{bad[:3]}")
         except (RuntimeError, subprocess.SubprocessError) as error:
             fails.append(f"{dir_} 数据还原 adb 异常：{error}")
     return fails
@@ -325,7 +453,7 @@ PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\
 PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
 
 
-def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None,
+def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
                          ready_timebase=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
@@ -333,9 +461,10 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
 
     归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
     - bound 要实证，fail closed：PID 在 session_pids 且 stat mtime 实读、且
-      mtime ≥ 该 PID 的 birth_wall_s（折不出 birth 退起局设备墙钟当 session 窗）；
+      mtime ≥ 该 PID 的 birth_wall_s（/proc/<pid>/stat 折墙钟，唯一归属锚——
+      birth 拿不到一律 unproven，起局墙钟不充数）；
       host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名逐段对上；
-      birth/墙钟两头都缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
+      birth 缺、时基缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
       + 注记写明哪一环证不了（同 PID 旧文件绝不升 bound）；
     - mtime 早于归属窗 → 同 PID 旧局文件，跳过不拉（记注）；
     - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
@@ -390,11 +519,9 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
         if pids:
             if clock_ok is False:
                 attr = "墙钟跳变或 READY 时基不全，mtime 归属不可靠"
-            bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟优先
-            if bound_s is None:
-                bound_s = launch_wall_s            # birth 缺 → 起局窗兜底（弱一级）
+            bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟：唯一归属锚
             if attr is None and bound_s is None:
-                attr = "没有进程 birth/起局墙钟可比"
+                attr = "进程 birth 拿不到（/proc/<pid>/stat 缺/读拒），起局窗不充数"
             elif attr is None:
                 try:
                     mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}",
@@ -452,11 +579,20 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
 
 
 def external_dirs_gone(d, pkg):
-    """卸载后 /sdcard/Android/data|obb/<pkg> 应随删；逐项验不存在。"""
+    """卸载后 /sdcard/Android/data|obb/<pkg> 应随删；逐项验不存在。
+    stat 分辨三态（EACCES=读不进、ENOENT=真没有），读不进 ≠ 已清。"""
     fails = []
     for base in ("/sdcard/Android/data", "/sdcard/Android/obb"):
-        out = d.shell(f"ls {base}/{pkg} 2>/dev/null", allowed=(0, 1)).strip()
-        if out:
+        q = shlex.quote(f"{base}/{pkg}")
+        out = d.shell(f"e=$(stat -c %F {q} 2>&1); "
+                      f"if [ $? -eq 0 ]; then if [ -r {q} ] && [ -x {q} ]; then ls {q}; "
+                      f"else echo __denied__; fi; else "
+                      f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo __denied__;; "
+                      f"*\"No such\"*|*ENOENT*) :;; *) echo __denied__;; esac; fi",
+                      allowed=(0, 1)).strip()
+        if "__denied__" in out:
+            fails.append(f"{base}/{pkg} 存在但读不进：证不了卸载已清")
+        elif out:
             fails.append(f"{base}/{pkg} 卸载后仍有内容：{out.splitlines()[0][:80]}")
     return fails
 
@@ -651,7 +787,7 @@ def main(argv=None):
     props_prev = {}
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
-    pids, priv_done, launch_wall_s, birth_walls = {}, False, None, {}
+    pids, priv_done, birth_walls = {}, False, {}
     wall_now = uptime_now = None   # READY 时基锚点对；READY 前异常保持 None → 跳变复核 fail closed
     result, reason = "red", "未跑完"
 
@@ -701,11 +837,8 @@ def main(argv=None):
             manifest["versions"] = {"orig_versionCode": orig_vc, "new_versionCode": new_vc}
             if orig_vc is None:
                 raise Refuse("原包 versionCode 读不到：装回方向判不了降级，不动这台设备")
-            downgrade_fwd = orig_vc > new_vc   # 装低 versionCode 测试包
+            downgrade_fwd = orig_vc > new_vc   # 装低 versionCode 测试包（真降级=装它本身）
             downgrade_back = orig_vc < new_vc  # 收局装回低 versionCode 原包
-            if (downgrade_fwd or downgrade_back) and not device_allows_downgrade(d):
-                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级但设备 pm 不支持 "
-                             f"install -d，装了原包装不回来；不动这台设备")
             orig_tmp = Path(tempfile.mkdtemp(prefix="s2a-orig-")) / "orig.apk"
             d.run("pull", state0["base"], str(orig_tmp), timeout=300)
             if sha256(orig_tmp) != state0["sha256"]:
@@ -723,11 +856,20 @@ def main(argv=None):
                                        "files": nfiles,
                                        "tars": {k: v["tar_sha256"] for k, v in data_backup["dirs"].items()}}
             log(f"已备份原包数据 {len(data_backup['dirs'])} 处目录 / {nfiles} 文件 → {backup_dir}")
+        if downgrade_back:
+            # 装回方向要降级：探针只证 install -d flag 被 pm 解析层收（同版重灌
+            # 不触发真降级）——挪到备份之后：就算重灌改了包状态数据也已安全。
+            # 真降级与否收局 install -r -d 见分晓，装不回 → 还原失败 → 留置。
+            why = probe_dash_d(d, orig_tmp)
+            if why is not None:
+                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级，"
+                             f"install -d flag 实测不被收（{why}）：装了原包装不回来，不动这台设备")
         manifest["restore_scope"] = {
             "apk": ("已装不同构建→备份后 install -r" + (" -d" if downgrade_back else "")
                     + " 装回并 sha256 复核（分包拒跑）") if state0["installed"]
                    else "未安装→收局卸载并复核 pm path 已清",
-            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局 pm clear+回灌+逐文件 sha 核"
+            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局归档核对过才 "
+                             "pm clear+回灌+设备端全量复核"
                              if data_backup is not None
                              else "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
                                   else "卸载随 /data/data 清"),
@@ -792,10 +934,6 @@ def main(argv=None):
             launch += (["--ez", name, value or "true"] if value in ("", "true", "false")
                        else ["--es", name, value])
         launch_str = " ".join(shlex.quote(a) for a in launch)
-        try:  # 起局设备墙钟：私有日志 mtime 归属判定的基准（取不到就跳过该判据）
-            launch_wall_s = int(d.shell("date +%s").strip())
-        except (RuntimeError, subprocess.SubprocessError, ValueError):
-            launch_wall_s = None
         started = d.shell(launch_str, timeout=120)
         if re.search(r"Error|Exception", started):  # am start 组件不存在也 rc=0，只看退出码会漏
             raise Refuse(f"am start 报错：{started.strip()[:200]}")
@@ -927,7 +1065,7 @@ def main(argv=None):
         # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
         priv_records, priv_frames = collect_private_logs(
-            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls,
+            d, pkg, pids, out, notes, birth_walls=birth_walls,
             ready_timebase=(wall_now, uptime_now))
         manifest["private_logs"] = priv_records
         priv_done = True
@@ -1034,7 +1172,7 @@ def main(argv=None):
         if launched and not priv_done:
             try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
                 manifest["private_logs"], _ = collect_private_logs(
-                    d, pkg, pids, out, notes, launch_wall_s=launch_wall_s,
+                    d, pkg, pids, out, notes,
                     birth_walls=birth_walls,
                     ready_timebase=(wall_now, uptime_now))
                 priv_done = True
