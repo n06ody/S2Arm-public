@@ -89,6 +89,8 @@ s2a_gate_step bash "$android_dir/tools/nvn_vk_timeline_test.sh"
 # 直连逐帧帧时间（宿主，确定性）：环形语义、丢弃/计数可见、分片转储字节级核回。
 s2a_gate_step bash "$android_dir/tools/nvn_vk_frame_log_test.sh"
 s2a_gate_step bash "$android_dir/tools/generic_frame_trace_test.sh"
+# #48 A5（宿主，确定性）：BatteryManager 净放电换算与不可用状态、采样器停采/迟到回调/读数开关。
+s2a_gate_step bash "$android_dir/tools/system_power_test.sh"
 # 转储解析器（宿主，确定性）：分片拼回/完整性拒绝、全窗统计、与 16 帧聚合行对拍、C→python 对拍。
 s2a_gate_step "$PY" "$android_dir/tests/direct_framelog_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_refresh_test.py"
