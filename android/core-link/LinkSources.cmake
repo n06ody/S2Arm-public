@@ -12,7 +12,7 @@ endif()
 
 function(s2a_android_host_sources output)
     set(sources
-        native/s2a_savecommit.c native/capacity_affinity.cpp native/adpf_hint.c
+        native/s2a_savecommit.c native/system_tuning.c native/capacity_affinity.cpp native/adpf_hint.c
         native/bridge.cpp native/lan_discovery.cpp ../runtime/src/lan_elect.c native/capture_jpeg.cpp native/touch_jni.cpp native/game_touch.c native/window.cpp native/presenter.cpp
         native/wsi_lease.c native/input.c native/tsd.c native/module.c native/selftest.c native/selftest_gate.S
         native/guest_signal.c native/redlog.c native/redzone.S native/pcm_ring.c native/aaudio_sink.c native/hostapi.c native/screen_metrics.c
