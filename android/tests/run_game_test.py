@@ -152,6 +152,10 @@ if cmd == "logcat":
 if cmd == "shell":
     text = argv[1]
     sh = shlex.split(text)
+    if len(sh) == 1 and " " in sh[0]:
+        # adb.shell('整条带管道的命令')：shlex.join 把它包成单个引号串，真机上
+        # device shell 会再解析一遍（管道照常）；替身照做再切一刀
+        text = sh[0]; sh = shlex.split(text)
     c = sh[0] if sh else ""
     if "power_supply" in text:
         st["uptime_us"] += 1000000; save()
@@ -203,15 +207,26 @@ if cmd == "shell":
         out("0" * 64 + "  " + p + "\\n"); sys.exit(0)
     if c == "find":
         dir_ = sh[1].rstrip("/")
+        entries = sorted(p for p in DEV_FS if p == dir_ or p.startswith(dir_ + "/"))
+        if "|" in sh:
+            # 有界分批核验：find ... -print0 | xargs -0 -n 256 <sha256sum|chmod>
+            if "chmod" in sh: sys.exit(0)
+            fail_batch = st.get("sha_batch_fail_at")      # 第 N 批（256/批）挂：截断输出 + 短 stderr + rc=126
+            for i, p in enumerate(entries):
+                if fail_batch is not None and i >= int(fail_batch) * 256:
+                    sys.stderr.write("xargs: sha256sum: " + p + ": 中途批次失败\\n"); sys.exit(126)
+                out(file_sha(bytes.fromhex(DEV_FS[p])) + "  " + p + "\\n")
+            sys.exit(0)
         if "-exec" in sh:
+            # toybox E2BIG：-exec {} + 把全部路径摊进一次 exec，超上限就 Argument list too long
+            if len(entries) > int(st.get("find_exec_max", 512)):
+                sys.stderr.write("find: -exec: Argument list too long\\n"); sys.exit(126)
             if "sha256sum" in sh:
-                lines = [file_sha(bytes.fromhex(hx)) + "  " + p
-                         for p, hx in sorted(DEV_FS.items()) if p == dir_ or p.startswith(dir_ + "/")]
-                out("".join(ln + "\\n" for ln in lines)); sys.exit(0)
+                out("".join(file_sha(bytes.fromhex(DEV_FS[p])) + "  " + p + "\\n"
+                            for p in entries)); sys.exit(0)
             sys.exit(0)     # -type d -exec chmod o=x 之类：无副作用
         if "-type" in sh:
-            out("".join(p + "\\n" for p in sorted(DEV_FS)
-                        if p == dir_ or p.startswith(dir_ + "/"))); sys.exit(0)
+            out("".join(p + "\\n" for p in entries)); sys.exit(0)
         sys.exit(0)
     if c == "du":
         dir_ = sh[-1].rstrip("/")
@@ -797,6 +812,30 @@ class RunGameTest(unittest.TestCase):
         self.assertNotEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("SHA 核对失败", man["reason"])
+
+    def test_resources_tar_verify_uses_bounded_batches(self):
+        """⑭ 大资源树（>find -exec 参数上限）：设备端 SHA 核验走 print0|xargs 有界分批。
+        替身对 -exec {} + 超 512 文件报 Argument list too long（8E r4 真机 toybox E2BIG）——
+        实现退回 -exec 就会红。"""
+        res, artifact = self._resources_dir(npayload=600)   # 609 文件 > find_exec_max 512
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            argv=["--resources", str(res), "--push-tar", "always"])
+        self.assertEqual(0, rc)
+        self.assertIn("SHA 核对通过", (out / "run.log").read_text())
+
+    def test_resources_tar_verify_mid_batch_failure_is_short(self):
+        """⑭ 核验中途某批挂：报错只带短 stderr 尾，不把几千条文件清单灌进 manifest。"""
+        res, artifact = self._resources_dir(npayload=600)
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            state={"sha_batch_fail_at": 1},
+            argv=["--resources", str(res), "--push-tar", "always"])
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("SHA 核验失败", man["reason"])
+        self.assertLess(len(man["reason"]), 600,
+                        "只留短 stderr 尾，不能把核验输出整份灌进 reason")
 
 
 if __name__ == "__main__":
