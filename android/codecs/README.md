@@ -194,11 +194,15 @@ bounded budget (input 20×10 ms, output 10×10 ms per call). Hardware decoders
 have pipeline latency: an accepted input with no output yet returns `0` with
 `diag.output==0` — recoverable, the next call keeps draining and earlier frames
 are delivered in order (`show_frame=0` frames take the same path). Only two
-bounds mark a dead codec: input-slot starvation and more than
-`S2A_MC_MAX_IN_FLIGHT` (32) queued-but-unproduced inputs, both `S2A_MC_LIMIT`
-sticky. The tail of a stream may stay in the pipeline (no EOS is signalled —
-the Nvdec contract has no flush call); this costs at most the pipeline depth of
-final frames. Frame-size changes surface as `S2A_MC_RECONFIG` before input
+bounds mark a dead codec: input-slot starvation and a run of more than
+`S2A_MC_MAX_EMPTY` (32) consecutive no-output calls — the count resets on any
+produced frame, so sparse hidden frames cannot accumulate into a false
+positive. Pipeline delay also shifts presentation: surfaces written during the
+first ~k calls carry stale content, every subsequent surface shows the frame
+from k calls back, and the tail of a stream may stay in the pipeline (no EOS is
+signalled — the Nvdec contract has no flush call), costing at most the pipeline
+depth of final frames. `diag.output_token` records the current call's input
+token, not the produced frame's. Frame-size changes surface as `S2A_MC_RECONFIG` before input
 queueing — `McVp9Decoder` destroys and recreates the codec at the new
 dimensions, so RECONFIG is only observable through the raw C ABI. After any
 decode-stage failure the shim marks the context failed; the C# boundary decides

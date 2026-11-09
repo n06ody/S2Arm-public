@@ -47,8 +47,10 @@ int32_t s2a_mc_create(const s2a_mc_config *, s2a_mc **, s2a_mc_diag *);
 /* 每次调用：排队一个 AU → 有界排空输出 → 最多出一帧写进 dst[3]（Y,U,V）。
  * 硬解有管线延迟：返回 0 且 diag->output==0 表示「输入已收、帧未到」，
  * 属可恢复态——下一调用继续排，早前输入的帧会在后续调用里按序交付；
- * 已入队未出图超过 S2A_MC_MAX_IN_FLIGHT 才回 LIMIT 判死。show_frame=0 的
- * 隐藏帧天然走 output==0 路径，不判败。真错误（<0）置粘性失败。
+ * show_frame=0 的隐藏帧天然走 output==0 路径，不判败。判死盯「连续零
+ * 输出调用数」：任何一次出图清零，连续超过 S2A_MC_MAX_EMPTY 才回 LIMIT
+ * （隐藏帧只可能抬高连续值，不可能累计误判）。真错误（<0）置粘性失败。
+ * diag->output_token 记的是本次调用的输入 token，不是出图那帧的输入。
  * width/height 与配置不符回 RECONFIG：C ABI 只报告，由调用方（托管封装的
  * Ensure）销毁重建——经 C# 包装层调用时 RECONFIG 实际不可达。 */
 int32_t s2a_mc_decode(s2a_mc *, const uint8_t *au, uint32_t au_len,

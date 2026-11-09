@@ -42,7 +42,7 @@ void AMediaFormat_setString(AMediaFormat *f, const char *k, const char *v)
 }
 
 /* ---- 假 AMediaCodec：脚本化输出队列 ---- */
-#define MC_MAX_OUT 40
+#define MC_MAX_OUT 1024
 struct out_event {
     ssize_t kind;          /* <0 用 AMEDIACODEC_INFO_*；>=0 是缓冲下标 */
     const uint8_t *data;   /* 输出负载 */
@@ -61,6 +61,12 @@ struct AMediaCodec {
     int queue_calls, dequeue_out_calls, released;
     struct out_event ev[MC_MAX_OUT];
     int nev, evi;
+    int consume_inputs;              /* 假 codec 每次 dequeue 消化一个排队 AU（活 codec 模型） */
+    /* pattern 模式：每第 pattern_mod 个 AU 模拟隐藏帧不出图，其余各产一帧 */
+    int pattern_mod;
+    const uint8_t *pattern_frame;
+    uint32_t pattern_size;
+    int32_t pattern_w, pattern_h, pattern_stride, pattern_slice;
 };
 
 static int g_create_null, g_configure_fail, g_start_fail;
@@ -70,7 +76,7 @@ AMediaCodec* AMediaCodec_createDecoderByType(const char *mime)
 {
     if (g_create_null || strcmp(mime, "video/x-vnd.on2.vp9") != 0) return NULL;
     g_last = calloc(1, sizeof(AMediaCodec));
-    if (g_last) g_last->input_slots = 4;
+    if (g_last) { g_last->input_slots = 4; g_last->consume_inputs = 1; }
     return g_last;
 }
 media_status_t AMediaCodec_delete(AMediaCodec *c) { if (c) c->deleted = 1; free(c); return AMEDIA_OK; }
@@ -105,12 +111,22 @@ media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *c, size_t idx, off_t of
 {
     (void)idx; (void)off; (void)fl;
     c->queue_calls++; c->input_len = (uint32_t)size; c->input_used++; c->input_time = t;
+    if (c->pattern_mod && (c->queue_calls % c->pattern_mod) != 0 && c->nev < MC_MAX_OUT) {
+        struct out_event *e = &c->ev[c->nev++];
+        memset(e, 0, sizeof(*e));
+        e->kind = c->nev - 1;
+        e->data = c->pattern_frame; e->size = c->pattern_size;
+        e->color = 0x15; e->stride = c->pattern_stride; e->slice_h = c->pattern_slice;
+        e->cr = c->pattern_w - 1; e->cb = c->pattern_h - 1;
+    }
     return AMEDIA_OK;
 }
 ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c, AMediaCodecBufferInfo *info, int64_t us)
 {
     (void)us;
     c->dequeue_out_calls++;
+    /* 活 codec 持续消化压缩输入：输入缓冲还槽与出图解耦——隐藏帧不出图也还槽 */
+    if (c->consume_inputs && c->input_used) c->input_used--;
     if (c->evi >= c->nev) return AMEDIACODEC_INFO_TRY_AGAIN_LATER;
     const struct out_event *e = &c->ev[c->evi++];
     if (e->kind >= 0) {
@@ -118,7 +134,6 @@ ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c, AMediaCodecBufferInfo *i
         info->size = (int32_t)e->size;
         info->flags = e->flags;
         info->presentationTimeUs = 0;
-        if (c->input_used) c->input_used--;
     }
     return e->kind;
 }
@@ -376,12 +391,13 @@ int main(void)
         free(frame);
     }
 
-    /* ⑧ 输出暂不就绪 ≠ 失败：输入收下、output=0 返回，输入槽耗尽才 LIMIT 粘性 */
+    /* ⑧ 死 codec 占着输入缓冲不还：输入槽耗尽 → LIMIT@INPUT 粘性 */
     fake_reset(); s2a_mc_test_set_hw(1);
     {
         cfg.width = 64; cfg.height = 64;
         d = diag();
         CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "stall create");
+        g_last->consume_inputs = 0;   /* 死 codec：占着输入缓冲不消化 */
         s2a_mc_plane dst[3];
         static uint8_t y[64 * 64], u[32 * 32], v[32 * 32];
         planes(y, u, v, 64, 64, 64, dst);
@@ -547,7 +563,7 @@ int main(void)
         free(frame);
     }
 
-    /* ⑮ 输入槽给足也救不了死 codec：in_flight 上界（32）→ LIMIT 粘性 */
+    /* ⑮ 输入槽给足也救不了死 codec：连续零输出上界（32）→ LIMIT 粘性 */
     fake_reset(); s2a_mc_test_set_hw(1);
     {
         cfg.width = 64; cfg.height = 64;
@@ -558,18 +574,53 @@ int main(void)
         static uint8_t y[64 * 64], u[32 * 32], v[32 * 32];
         planes(y, u, v, 64, 64, 64, dst);
         uint8_t au[2] = {3, 3};
-        int first_fail = -1;
+        int first_fail = -1, fail_stage = -1;
         for (int i = 0; i < 34; i++) {
             s2a_mc_diag pd = diag();
             int32_t rc = s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, (uint32_t)i, &pd);
-            if (first_fail < 0 && rc == S2A_MC_LIMIT) { first_fail = i; break; }
+            if (first_fail < 0 && rc == S2A_MC_LIMIT) { first_fail = i; fail_stage = pd.stage; break; }
             if (first_fail < 0) CHECK(rc == 0 && pd.output == 0, "in-flight pending ok");
         }
-        CHECK(first_fail == 32, "in-flight LIMIT at 33rd input");
+        CHECK(first_fail == 32, "empty-streak LIMIT at 33rd silent call");
+        CHECK(fail_stage == S2A_MC_STAGE_DEQUEUE, "empty-streak LIMIT at dequeue stage");
         s2a_mc_destroy(m, &d);
     }
 
-    /* ⑯ provenance / ABI 守卫 */
+    /* ⑯ 零星隐藏帧不累计误判：每第 8 个 AU 不出图（show_frame=0 模型），
+     * 300 个 AU 全程无失败、非隐藏帧照常出图——「已入队未出图」计数会在
+     * 第 33 个隐藏帧（AU 264）把活 codec 误判 LIMIT。 */
+    fake_reset(); s2a_mc_test_set_hw(1);
+    {
+        uint32_t w = 64, h = 32, stride = 80, slice_h = 32;
+        uint64_t fsz;
+        uint8_t *frame = make_nv12(w, h, stride, slice_h, &fsz, 0);
+        cfg.width = w; cfg.height = h;
+        d = diag();
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "sparse-hidden create");
+        AMediaCodec *c = g_last;
+        c->pattern_mod = 8;
+        c->pattern_frame = frame; c->pattern_size = (uint32_t)fsz;
+        c->pattern_w = (int32_t)w; c->pattern_h = (int32_t)h;
+        c->pattern_stride = (int32_t)stride; c->pattern_slice = (int32_t)slice_h;
+        s2a_mc_plane dst[3];
+        static uint8_t y[80 * 32], u[40 * 16], v[40 * 16];
+        planes(y, u, v, 80, w, h, dst);
+        uint8_t au[4] = {4, 4, 4, 4};
+        int fails = 0, produced = 0;
+        for (int i = 0; i < 300; i++) {
+            s2a_mc_diag pd = diag();
+            int32_t rc = s2a_mc_decode(m, au, sizeof(au), w, h, dst, (uint32_t)i, &pd);
+            if (rc != 0) fails++;
+            else if (pd.output) produced++;
+        }
+        CHECK(fails == 0, "sparse hidden frames: no failure across 300 AUs");
+        CHECK(produced == 263, "sparse hidden: 300-37 frames produced");
+        CHECK(g_last->queue_calls == 300, "all AUs queued");
+        s2a_mc_destroy(m, &d);
+        free(frame);
+    }
+
+    /* ⑰ provenance / ABI 守卫 */
     CHECK(strcmp(s2a_mc_provenance(), S2A_MC_PROVENANCE) == 0, "provenance marker");
     s2a_mc_config bad = {0, sizeof(bad), S2A_MC_CODEC_VP9, 64, 64, 0};
     CHECK(s2a_mc_create(&bad, &m, fresh()) == S2A_MC_ARGUMENT, "bad abi rejected");
@@ -577,6 +628,6 @@ int main(void)
           "unknown codec rejected");
 
     if (g_failures) { printf("mc_host_test: %d failures\n", g_failures); return 1; }
-    printf("mc_host_test: ok (prop gate, nv12 deinterleave, planar copy, crop, reconfig, pending output, qcom yvu, flexible gate, in-flight bound, eos, sticky fail)\n");
+    printf("mc_host_test: ok (prop gate, nv12 deinterleave, planar copy, crop, reconfig, pending output, qcom yvu, flexible gate, input-starve bound, empty-streak bound, sparse hidden frames, eos, sticky fail)\n");
     return 0;
 }

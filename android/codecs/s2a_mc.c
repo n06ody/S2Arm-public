@@ -15,9 +15,10 @@
 #define S2A_MC_IN_US 10000
 #define S2A_MC_OUT_TRIES 10u
 #define S2A_MC_OUT_US 10000
-/* 硬解器有管线延迟：收下输入几帧后才出首帧。暂无输出按可恢复处理；
- * 已入队未出图超过这个上界才当死掉的 codec 判 LIMIT。 */
-#define S2A_MC_MAX_IN_FLIGHT 32u
+/* 硬解器有管线延迟：收下输入几帧后才出首帧；show_frame=0 的隐藏帧天然
+ * 不出图——「已入队未出图」计数会把活 codec 误判死，所以盯的是「连续零
+ * 输出调用数」：任何一次出图清零，连续超过这个上界才当死 codec 判 LIMIT。 */
+#define S2A_MC_MAX_EMPTY 32u
 
 /* CodecCapabilities 的 COLOR_Format* 是 Java 侧常量，NDK 头不导出；
  * 这里钉 ByteBuffer 模式实际会遇到的值。
@@ -34,7 +35,7 @@ enum {
 struct s2a_mc {
     AMediaCodec *codec;
     uint32_t codec_kind, width, height;
-    uint32_t generation, in_flight;
+    uint32_t generation, empty_streak;
     int failed;
 };
 
@@ -186,7 +187,7 @@ static int32_t mc_drain(s2a_mc *m, const s2a_mc_plane *dst, s2a_mc_diag *diag, i
         }
         AMediaCodec_releaseOutputBuffer(m->codec, (size_t)idx, false);
         if (rc) return rc;
-        if (m->in_flight) m->in_flight--;
+        m->empty_streak = 0;
         *produced = 1;
         return 0;
     }
@@ -345,18 +346,17 @@ int32_t s2a_mc_decode(s2a_mc *m, const uint8_t *au, uint32_t len,
         }
     }
     diag->consumed = len;
-    m->in_flight++;
-    if (m->in_flight > S2A_MC_MAX_IN_FLIGHT) {
-        result = S2A_MC_LIMIT;
-        diag_set(diag, S2A_MC_STAGE_INPUT, result, 0);
-        goto fail;
-    }
     int produced = 0;
     result = mc_drain(m, dst, diag, &produced);
     if (result) goto fail;
+    if (!produced && ++m->empty_streak > S2A_MC_MAX_EMPTY) {
+        result = S2A_MC_LIMIT;
+        diag_set(diag, S2A_MC_STAGE_DEQUEUE, result, 0);
+        goto fail;
+    }
     diag->decoded = 1;
     diag->output = (uint32_t)produced;
-    if (produced) diag->output_token = token;
+    if (produced) diag->output_token = token;   /* token 记的是本次调用的输入，不是出图那帧的 */
     diag->width = m->width;
     diag->height = m->height;
     return 0;
