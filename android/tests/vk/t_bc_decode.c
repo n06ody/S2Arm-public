@@ -9,7 +9,7 @@
 #include <vulkan/vulkan.h>
 #include "vk_device.h"
 #include "nvn_vk_bcdec.h"
-#include "graphics/tex/nvn_bcdec.h"
+#include "gfx/tex/nvn_bcdec.h"
 
 static struct s2a_vk_device g_dev;
 static struct nvn_vk_bcdec *g_bc;
