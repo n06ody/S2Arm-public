@@ -72,6 +72,8 @@ function(s2a_android_direct_sources output)
         native/nvn/nvn_vk_compile_events.c
         native/direct/vk_clear.c
         native/nvn/nvn_vk_swapchain.c native/nvn/nvn_vk_surface.c native/nvn/nvn_vk_session.c
+        # 显示节拍源：AChoreographer（nvn_vsync.h 契约 + nvn_be_link_* 助手，debug.s2a.vsync 门）
+        native/nvn/nvn_vsync_android.c
         native/nvn/nvn_vk_lifecycle.c native/nvn/nvn_vk_pipeline.c native/nvn/nvn_vk_texcache.c
         native/nvn/nvn_vk_bcdec.c
         # NVN ReadTexels：纯几何换算（宿主单测同源）+ guest 内存路径 + GPU 图像路径。

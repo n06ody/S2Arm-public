@@ -278,6 +278,43 @@ else()
     target_compile_options(host_ui_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(host_ui_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     add_test(NAME android_host_ui COMMAND host_ui_test)
+    # 显示节拍源（#48 B1）：替身 ALooper/AChoreographer 测契约与 link 助手——
+    # 节拍到达、60Hz 槽位等拍、丢拍超时、后台停、重启、门（debug.s2a.vsync）、不可用回退。
+    # NDK 真头不 vendored 进仓库（AOSP Apache-2.0 入库要按 NOTICE 登记）：
+    # -idirafter 本机 NDK sysroot/usr/include——<android/*.h> 取自真头，
+    # 宿主 libc / 编译器内建头照旧（idirafter 排在 -I 与系统目录之后，只兜底 <android/*.h>）。
+    # NDK 候选序列与 core-link/link_symbols.py 一致（固定 29.0.14206865）。
+    set(_vs_ndk_cands
+        "$ENV{ANDROID_NDK_HOME}" "$ENV{ANDROID_NDK_ROOT}"
+        "$ENV{ANDROID_HOME}/ndk/29.0.14206865" "$ENV{ANDROID_SDK_ROOT}/ndk/29.0.14206865"
+        "$ENV{HOME}/Library/Android/sdk/ndk/29.0.14206865" "$ENV{HOME}/Android/Sdk/ndk/29.0.14206865"
+        "/opt/homebrew/share/android-ndk" "/usr/local/share/android-ndk" "/opt/android-ndk")
+    set(_vs_inc "")
+    foreach(_ndk IN LISTS _vs_ndk_cands)
+        foreach(_tag darwin-arm64 darwin-x86_64 linux-x86_64 windows-x86_64)
+            if(EXISTS "${_ndk}/toolchains/llvm/prebuilt/${_tag}/sysroot/usr/include/android/choreographer.h")
+                set(_vs_inc "${_ndk}/toolchains/llvm/prebuilt/${_tag}/sysroot/usr/include")
+            endif()
+        endforeach()
+        if(NOT _vs_inc AND EXISTS "${_ndk}/sysroot/usr/include/android/choreographer.h")
+            set(_vs_inc "${_ndk}/sysroot/usr/include")
+        endif()
+        if(_vs_inc)
+            break()
+        endif()
+    endforeach()
+    if(_vs_inc)
+        add_executable(nvn_vsync_test tests/nvn_vsync_test.c native/nvn/nvn_vsync_android.c)
+        target_include_directories(nvn_vsync_test PRIVATE native ../runtime/include)
+        target_compile_options(nvn_vsync_test PRIVATE -Wall -Wextra -Werror -DS2A_VSYNC_TEST "-idirafter" "${_vs_inc}")
+        target_link_libraries(nvn_vsync_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        add_test(NAME android_nvn_vsync COMMAND nvn_vsync_test)
+    else()
+        # 缺 NDK：显式登记跳过（CTest 报 Skipped），不假绿；设 ANDROID_NDK_HOME 后重配即恢复。
+        message(WARNING "android_nvn_vsync 跳过：找不到 NDK android/choreographer.h（ANDROID_NDK_HOME / SDK ndk/<ver>）")
+        add_test(NAME android_nvn_vsync COMMAND "${CMAKE_COMMAND}" -E echo "SKIP: 缺 Android NDK sysroot，设 ANDROID_NDK_HOME 后重配")
+        set_tests_properties(android_nvn_vsync PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP:")
+    endif()
     add_executable(keyboard_owner_test w4-tests/keyboard_owner_test.c native/host_ui.c native/host_ui_android.c)
     target_include_directories(keyboard_owner_test PRIVATE native ../runtime/include)
     target_compile_options(keyboard_owner_test PRIVATE -Wall -Wextra -Werror)
