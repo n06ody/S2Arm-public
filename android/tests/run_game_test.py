@@ -1049,6 +1049,18 @@ class RunGameTest(unittest.TestCase):
                         "传输完整性照样核实——归属未证 ≠ 字节没对上")
         self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
 
+    def test_private_logs_no_birth_attribution_unproven(self):
+        """㉔ qa-fone 负控：墙钟正常但 /proc/<pid>/stat 读拒 → 进程 birth 证不了，
+        起局墙钟不充数 → 证据照拉但一律 unproven + 注记，绝不升 bound。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"no_proc_stat": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"], "birth 缺不该挡证据拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("birth" in n and "归属未证" in n for n in man["notes"]),
+                        man["notes"])
+
     def test_private_logs_no_timebase_attribution_unproven(self):
         """㉓ qa-fone 负控：birth(/proc/stat 拒）与墙钟（date +%s 拒）两头都缺 →
         没有可比窗 → unproven + 注记，不空放 bound。"""

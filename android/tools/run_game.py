@@ -325,7 +325,7 @@ PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\
 PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
 
 
-def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None,
+def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
                          ready_timebase=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
@@ -333,9 +333,10 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
 
     归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
     - bound 要实证，fail closed：PID 在 session_pids 且 stat mtime 实读、且
-      mtime ≥ 该 PID 的 birth_wall_s（折不出 birth 退起局设备墙钟当 session 窗）；
+      mtime ≥ 该 PID 的 birth_wall_s（/proc/<pid>/stat 折墙钟，唯一归属锚——
+      birth 拿不到一律 unproven，起局墙钟不充数）；
       host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名逐段对上；
-      birth/墙钟两头都缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
+      birth 缺、时基缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
       + 注记写明哪一环证不了（同 PID 旧文件绝不升 bound）；
     - mtime 早于归属窗 → 同 PID 旧局文件，跳过不拉（记注）；
     - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
@@ -390,11 +391,9 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
         if pids:
             if clock_ok is False:
                 attr = "墙钟跳变或 READY 时基不全，mtime 归属不可靠"
-            bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟优先
-            if bound_s is None:
-                bound_s = launch_wall_s            # birth 缺 → 起局窗兜底（弱一级）
+            bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟：唯一归属锚
             if attr is None and bound_s is None:
-                attr = "没有进程 birth/起局墙钟可比"
+                attr = "进程 birth 拿不到（/proc/<pid>/stat 缺/读拒），起局窗不充数"
             elif attr is None:
                 try:
                     mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}",
@@ -651,7 +650,7 @@ def main(argv=None):
     props_prev = {}
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
-    pids, priv_done, launch_wall_s, birth_walls = {}, False, None, {}
+    pids, priv_done, birth_walls = {}, False, {}
     wall_now = uptime_now = None   # READY 时基锚点对；READY 前异常保持 None → 跳变复核 fail closed
     result, reason = "red", "未跑完"
 
@@ -792,10 +791,6 @@ def main(argv=None):
             launch += (["--ez", name, value or "true"] if value in ("", "true", "false")
                        else ["--es", name, value])
         launch_str = " ".join(shlex.quote(a) for a in launch)
-        try:  # 起局设备墙钟：私有日志 mtime 归属判定的基准（取不到就跳过该判据）
-            launch_wall_s = int(d.shell("date +%s").strip())
-        except (RuntimeError, subprocess.SubprocessError, ValueError):
-            launch_wall_s = None
         started = d.shell(launch_str, timeout=120)
         if re.search(r"Error|Exception", started):  # am start 组件不存在也 rc=0，只看退出码会漏
             raise Refuse(f"am start 报错：{started.strip()[:200]}")
@@ -927,7 +922,7 @@ def main(argv=None):
         # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
         priv_records, priv_frames = collect_private_logs(
-            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls,
+            d, pkg, pids, out, notes, birth_walls=birth_walls,
             ready_timebase=(wall_now, uptime_now))
         manifest["private_logs"] = priv_records
         priv_done = True
@@ -1034,7 +1029,7 @@ def main(argv=None):
         if launched and not priv_done:
             try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
                 manifest["private_logs"], _ = collect_private_logs(
-                    d, pkg, pids, out, notes, launch_wall_s=launch_wall_s,
+                    d, pkg, pids, out, notes,
                     birth_walls=birth_walls,
                     ready_timebase=(wall_now, uptime_now))
                 priv_done = True
