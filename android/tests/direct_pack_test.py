@@ -218,6 +218,14 @@ class DirectPackTest(unittest.TestCase):
             pack.write_pack(str(self.out), [('modules', str(empty))])
         self.assertEqual({p.name: p.read_bytes() for p in self.out.iterdir()}, before)
 
+    def test_artifact_modules_survive_glob_metachars_in_out_path(self):
+        """出包目录名带 [ ] 等 glob 元字符时，工件 modules 不许静默落空：
+        glob.glob(join(out, …)) 会把目录名当字符类（qa-169163 惊奇包 8E 导入前红）。"""
+        self.out = self.base / '[meta] out' / 'package'
+        self.build()
+        artifact = self.artifact()
+        self.assertEqual([m['name'] for m in artifact['modules']], ['main'])
+
     def test_cli_refuses_a_root_that_already_has_the_descriptor(self):
         (self.root / pack.GRAPHICS_MANIFEST).parent.mkdir(parents=True)
         (self.root / pack.GRAPHICS_MANIFEST).write_text('{}')
