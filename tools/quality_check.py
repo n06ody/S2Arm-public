@@ -419,39 +419,37 @@ def check_android(o, name, ai=True):
     elif gm == 'generic': out['直连默认启动'] = '不过'
     elif gm == 'direct': out['直连默认启动'] = '过' if game else '没数据' if ans is None else '不过'
     else: out['直连默认启动'] = '没数据'; read.append('直连默认启动 logcat / gfx_mode.txt 认不出图形模式（日志要取 <包名>:game 子进程）')
-    # 能耗：电池侧梯形积分（tools/android_power.py 同口径，列 = FIELDS）。整窗口每行都要能证
-    #   「在放电」（status=Discharging 且供电旗标无 true）：Charging/Full/供电 true → 接过电不算；
-    #   Unknown / 空 / 别的状态 → 证不了未接电，不算。放电符号由本机放电样本推出（电流非零且全同号），
-    #   不一致 / 全零 → 放电方向未校准，不算。积出来的瓦数是电池侧诊断、未经设备校准 → 记「未证」，
-    #   不套 iPhone 整机门槛（旧版 abs(mV×µA) 会把充电/未知当放电假绿）。
+    # 能耗（兄弟项目 power-comparison 口径）：块边界 = frame_window_us，分析窗剔首 15s /
+    #   尾 5s；窗内每行须物理放电（status=Discharging 且 plugged=0）、屏幕交互、非省电、
+    #   thermal_status<3、电流/电压/电量计读数合法、符号一致、采样间隔 ≤3s、边界全覆盖——
+    #   任一门不过整块作废；再跑整局电量计交叉核对，不互证 → 积分不采信。积出来的瓦数是
+    #   电池侧估计、未经外部表计校准 → 记「未证」，不套整机门槛。
     pw = list(csv.DictReader(open(os.path.join(o, 'power.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'power.tsv')) else []
-    powered = lambda r: r.get('status') in ('Charging', 'Full') or 'true' in (
-        r.get('ac_powered'), r.get('usb_powered'), r.get('wireless_powered'), r.get('dock_powered'))
     if not pw: out['能耗'] = '没数据'
-    elif any(powered(r) for r in pw): out['能耗'] = '没数据'; read.append('能耗 窗口内接过电（充放差不是整机功耗），不算')
-    elif any(r.get('status') != 'Discharging' for r in pw):
-        bad = next(r for r in pw if r.get('status') != 'Discharging')
-        out['能耗'] = '没数据'; read.append(f"能耗 有 {sum(1 for r in pw if r.get('status') != 'Discharging')} 行充电状态未证"
-                                          f"（status={bad.get('status') or '空'} source={bad.get('source') or '空'}），不能当未接电")
     else:
+        import android_power
         def _i(r, k):
             try: return int(str(r.get(k, '')).strip())
             except ValueError: return None
-        signs = {1 if _i(r, 'current_ua') > 0 else -1 for r in pw
-                 if _i(r, 'current_ua') not in (None, 0)}
-        if len(signs) != 1:
-            out['能耗'] = '没数据'; read.append('能耗 放电方向未校准：电流全零或符号不一致，不猜符号')
+        boots = [_i(r, 'boot_us') for r in pw]
+        fw2 = meta.get('frame_window_us')
+        begin, end = (fw2[0], fw2[1]) if isinstance(fw2, list) and len(fw2) == 2 else (
+            (boots[0], boots[-1]) if boots and all(b is not None for b in boots) else (None, None))
+        res = android_power.battery_window(pw, begin, end)
+        if res.get('averageW') is None:
+            out['能耗'] = '没数据'; read.append(f"能耗 {res.get('reason', '窗口不成立')}")
         else:
-            import android_power
-            boots = [_i(r, 'boot_us') for r in pw]
-            res = android_power.battery_window(pw, boots[0], boots[-1], signs.pop()) if all(
-                b is not None for b in boots) else {'reason': 'boot_us 缺行，窗口对不齐'}
-            if res.get('averageW') is None:
-                out['能耗'] = '没数据'; read.append(f"能耗 {res.get('reason', '窗口不成立')}")
-            else:
+            co = android_power.charge_corroboration(pw)
+            line = (f"能耗 电池侧均值 {res['averageW']:.2f} W × {res['durationSeconds']:.0f}s"
+                    f"（电流符号 {res.get('rawCurrentSign')}、{res.get('samples')} 采样"
+                    + (f"、电量计 {res['chargeCounterW']:.2f} W 比值 {res['chargeToCurrentRatio']:.2f}"
+                       if res.get('chargeCounterW') is not None else "") + "）")
+            if co.get('corroborated'):
                 out['能耗'] = '未证'
-                read.append(f"能耗 电池侧均值 {res['averageW']:.2f} W × {res['durationSeconds']:.0f}s"
-                            f"（诊断读数，未经设备校准，不套整机门槛）")
+                read.append(line + f"；电量计交叉核对过（{co.get('method', '')}），仍非外部校准")
+            else:
+                out['能耗'] = '没数据'
+                read.append(line + f"；电量计交叉核对不成立（{co.get('error') or co.get('method', '')}），积分不采信")
     read.append(f'安卓 {meta.get("serial_model", "")} {meta.get("soc", "")} Android {meta.get("android", "")}，模式 {gm or "—"}，游戏画面 {len(game)}/{len(ps)} 张')
     out['读数'] = '｜'.join(read)
     return out

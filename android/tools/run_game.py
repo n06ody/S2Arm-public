@@ -9,18 +9,24 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
                 [--mode auto|generic|direct]      # s2arm.graphics_mode 冷启动 intent extra
                 [--extra s2arm.KEY[=VALUE] ...]   # 其他 intent extra（true/false 走 --ez）
                 [--adb "adb"] [--ready-timeout 180] [--wait 0] [--allow-data-loss]
-                [--lock-root DIR] [--holder NAME] [--note TXT]
+                [--backup-dir DIR] [--lock-root DIR] [--holder NAME] [--note TXT]
+                [--push-timeout S] [--push-tar auto|always|never]
 
 锁：取 device_lock.py 的持久内核锁后才动设备，收局按持锁令牌 release；
 崩溃 / 强杀 / adb 掉线 = 未正常收局，设备留置不放行（不自动放）。
 
 还原范围（保证不了的一律拒跑，不返回成功兜底）：
 - 原 APK：设备已装该包且构建不同 → adb pull 备份、收局 install -r 装回并 sha256 复核；
-  分包（split APK）装回不可靠 → 入局即拒。
-- 应用私有数据 / 已并入的资源：局内会被游戏改写，adb 层不能备份还原 → 设备已装该包时拒跑；
-  显式 --allow-data-loss 才放行，且只还原 APK 字节（私有数据、已并入资源不还原，manifest 写明）。
-- 导入的资源 / 卸载应清的目录：落在 /sdcard/Android/data|obb/<pkg>，卸载随删，收局逐项验不存在；
-  有残留即还原失败。
+  分包（split APK）装回不可靠 → 入局即拒。原包 versionCode 低于新包时装回是降级：
+  装新包前先验设备 pm 支持 install -d（usage 里的「-d: allow version code downgrade」），
+  不支持就拒跑而不是装了回不来；原包高于新包时装测试包本身也带 -d。
+- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
+  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
+  tar + manifest.json 逐文件 sha256 清单）；收局装回原包后 pm clear、回灌、逐文件核 sha。
+  已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
+  （私有数据、已并入资源不还原，manifest 写明）。
+- 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
+  收局逐项验不存在；debuggable 已装路径随数据备份还原。
 - 调试属性 debug.s2a.*：起局前置 1，收局恢复原值并逐项读回核对（release 机不让改 → 只记注）。
 
 收局：任何结果（含 SIGTERM / SIGHUP / Ctrl+C / 未捕获异常）都走 finally 还原；
@@ -28,6 +34,8 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 安全边界：只经 adb 做 安装/启动/采集/截图——不重启、不刷机、不 root、不改系统设置。
 帧表：只写采集窗口 [起, 止) 内的 direct-present 帧——帧记录是 CLOCK_BOOTTIME，窗口边界取设备
 /proc/uptime 同一时钟；帧日志块按 logcat 行 PID 绑定当局游戏进程，别的进程的块不进表。
+私有证据：收局后、还原清私有目录前 run-as 拉回 host-*-<pid>-*.log 与原生直写
+frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
 import argparse, datetime, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time
@@ -89,15 +97,98 @@ def pm_path_list(d, pkg):
 
 
 def install_state(d, pkg):
-    """pm path → {installed, split, base, sha256}。split 包无法忠实还原，调用方拒。"""
+    """pm path + dumpsys package → {installed, split, base, sha256, versionCode, debuggable}。
+    split 包无法忠实还原，调用方拒；versionCode/debuggable 供降级与 run-as 备份判断。"""
     paths = pm_path_list(d, pkg)
     if not paths:
         return {"installed": False}
+    info = d.shell(f"dumpsys package {pkg}", allowed=(0, 1))
+    m = re.search(r"versionCode=(\d+)", info)
+    meta = {"versionCode": int(m.group(1)) if m else None,
+            "debuggable": "DEBUGGABLE" in info}
     base = [p for p in paths if p.endswith("/base.apk")]
     if len(paths) != 1 or len(base) != 1:
-        return {"installed": True, "split": True, "paths": paths}
+        return {"installed": True, "split": True, "paths": paths, **meta}
     return {"installed": True, "base": base[0],
-            "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0]}
+            "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
+
+
+def device_allows_downgrade(d):
+    """设备 pm 是否支持 install -d（降级）。pm usage 里有『-d: allow version code downgrade』。"""
+    usage = d.shell("pm install --help 2>&1 || pm 2>&1", allowed=(0, 1, 255))
+    return bool(re.search(r"-d[^\n]*downgrade", usage, re.I))
+
+
+DATA_DIRS = (("private", "/data/data/{pkg}"),
+             ("extdata", "/sdcard/Android/data/{pkg}"),
+             ("obb", "/sdcard/Android/obb/{pkg}"))
+SHA_LINE = re.compile(r"^([0-9a-f]{64})\s+\.?/?(.+)$")
+
+
+def _sha_listing(text):
+    """『<sha>  ./relpath』行 → {relpath: sha}（find -exec sha256sum 的输出口径）。"""
+    files = {}
+    for ln in text.splitlines():
+        m = SHA_LINE.match(ln.strip())
+        if m:
+            files[m.group(2)] = m.group(1)
+    return files
+
+
+def backup_data(d, pkg, dest):
+    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + find sha256sum 清单。
+    任一目录备份失败即 Refuse（保证不了还原就不入局）。"""
+    dest.mkdir(parents=True)
+    manifest = {"schema": 1, "package": pkg, "dirs": {}}
+    for tag, tpl in DATA_DIRS:
+        dir_ = tpl.format(pkg=pkg)
+        present = d.run_as(pkg, f"[ -d {shlex.quote(dir_)} ] && echo yes || true").strip()
+        if "yes" not in present:
+            continue
+        tar = dest / f"{tag}.tar"
+        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
+        r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
+                            f"tar -cf - -C {shlex.quote(dir_)} ."],
+                           capture_output=True, timeout=600)
+        if r.returncode or not r.stdout:
+            raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
+        tar.write_bytes(r.stdout)
+        listing = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
+                           timeout=300)
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name,
+                                 "tar_sha256": sha256(tar), "files": _sha_listing(listing)}
+    (dest / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
+    return manifest
+
+
+def restore_data(d, pkg, manifest, backup_dir):
+    """先清空再按清单回灌、逐文件 sha 核。返回失败说明串列表（空=成功）。"""
+    fails = []
+    try:
+        d.shell(f"pm clear {pkg}", allowed=(0, 1))
+    except (RuntimeError, subprocess.SubprocessError) as error:
+        fails.append(f"pm clear 异常：{error}")
+    for tag, info in manifest["dirs"].items():
+        dir_ = info["dir"]
+        try:
+            d.run_as(pkg, f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
+                     timeout=120)
+            tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
+            d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
+            d.run_as(pkg, f"tar -xf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            d.shell(f"rm -f {tmp}", allowed=(0, 1))
+            got = _sha_listing(d.run_as(
+                pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +", timeout=300))
+            want = info["files"]
+            bad = [rel for rel, sha in want.items() if got.get(rel) != sha]
+            extra = sorted(set(got) - set(want))
+            if bad:
+                fails.append(f"{dir_} 还原后 {len(bad)} 个文件 sha 与备份清单不符：{bad[:3]}")
+            if extra:
+                fails.append(f"{dir_} 还原后多出 {len(extra)} 个未备份文件：{extra[:3]}")
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            fails.append(f"{dir_} 数据还原 adb 异常：{error}")
+    return fails
 
 
 def uptime_us(d):
@@ -125,6 +216,21 @@ def pid_birth(d, pid):
         return int(tail[19]) if len(tail) > 19 else None
     except (IndexError, RuntimeError, ValueError):
         return None
+
+
+USER_HZ = 100     # Android 内核 jiffies 用户态口径恒 100
+
+
+def device_timebase(d):
+    """设备墙钟（date +%s）+ 开机秒（/proc/uptime）一对：把 birth_ticks 折成墙钟
+    （birth_wall_s = wall_now -（uptime_now - ticks/USER_HZ）），与文件 mtime 同一
+    CLOCK_REALTIME 可比。取不到返回 (None, None)。"""
+    try:
+        wall_s = int(d.shell("date +%s", timeout=10).strip())
+        uptime_s = float(d.shell("cat /proc/uptime", timeout=10).split()[0])
+        return wall_s, uptime_s
+    except (RuntimeError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
 
 
 def frame_log_blocks(text, pids=None):
@@ -215,25 +321,68 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
 PRIV_LOG_NAME = re.compile(r"^(?:host-\d+-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
 
 
-def collect_private_logs(d, pkg, pids, out, notes):
+def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
-    文件名绑当局 PID，别局/别进程的不拉；run-as 只给 debuggable 包——拉不到记注
-    （证据缺 ≠ 还原失败）。必须在收局还原（pm clear/卸载清私有目录）前调用。
-    返回（落盘文件名列表, frame-log 原文列表）。"""
-    names, frame_texts = [], []
+
+    归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
+    - 三绑定：文件名 PID 须在 session_pids 里，且 stat mtime ≥ 该 PID 的 birth_wall_s
+      （birth_ticks 折墙钟——同 PID 旧局文件/旧进程写的文件不证归属，跳过记注）；
+      birth 折不出就退回起局设备墙钟当 session 窗；
+    - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
+      exec-out 拉回后逐字节核对；不符或拉回空数据标 verified=False
+      （rc=0 空读不能当成功）；
+    - pids 为空（READY 前异常：进程死了没绑到当局 PID）→ 退化成按起局时间窗
+      + 文件名 PID 收证、session=unproven 如实标——死前宿主日志正是失败现场证据；
+      连候选都没有也写明未证；
+    - run-as 只给 debuggable 包——进不去记注（证据缺 ≠ 还原失败）。
+    必须在收局还原（pm clear/卸载清私有目录）前调用。
+    返回（manifest 记录列表, frame-log 原文列表）。"""
+    records, frame_texts = [], []
     try:
         found = d.run_as(pkg, f"find /data/data/{pkg} -type f -name '*.log'", timeout=60)
     except (RuntimeError, subprocess.SubprocessError) as error:
         notes.append(f"私有日志目录进不去（非 debuggable/包已卸）就没拉：{str(error)[:200]}")
-        return names, frame_texts
-    dest = out / "host_logs"
+        return records, frame_texts
+    candidates = []
     for path in sorted(ln.strip() for ln in found.splitlines() if ln.strip()):
         m = PRIV_LOG_NAME.match(path.rsplit("/", 1)[-1])
-        pid = m and int(m.group(1) or m.group(2))
-        if not pid or pid not in pids:
-            continue
+        if m:
+            candidates.append((path, int(m.group(1) or m.group(2))))
+    if pids:
+        candidates = [c for c in candidates if c[1] in pids]
+        if not candidates:
+            notes.append("私有目录下没有匹配当局 PID 的日志文件（零匹配如实记）")
+    elif candidates:
+        notes.append("没有当局进程绑定（READY 前异常）：私有日志退化按起局时间窗"
+                     "+文件名 PID 收证，归属未证（session=unproven）")
+    else:
+        notes.append("READY 前异常且私有目录下没有任何日志可收：失败现场证据未证")
+    dest = out / "host_logs"
+    for path, pid in candidates:
+        name = path.rsplit("/", 1)[-1]
+        session = "bound" if pids else "unproven"
+        bound_s = (birth_walls or {}).get(pid, launch_wall_s)  # 进程出生墙钟优先
+        if bound_s is not None:
+            try:
+                mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}", timeout=30).strip())
+            except (RuntimeError, subprocess.SubprocessError, ValueError):
+                mtime = None
+            if mtime is not None and mtime < bound_s - 2:    # 折墙钟留 2s 量化余量
+                notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生/起局窗，"
+                             f"同 PID 旧局文件不证归属，不拉")
+                continue
+        # 源端字节/SHA 先记账：exec-out rc=0 空读/截断传输出核对不上就标未证
+        want_sha = want_bytes = None
+        try:
+            meta_out = d.run_as(pkg, f"sha256sum {shlex.quote(path)}; wc -c < {shlex.quote(path)}",
+                                timeout=60)
+            lines = [ln.strip() for ln in meta_out.splitlines() if ln.strip()]
+            if len(lines) >= 2 and re.fullmatch(r"[0-9a-f]{64}", lines[0].split()[0]):
+                want_sha, want_bytes = lines[0].split()[0], int(lines[-1].split()[0])
+        except (RuntimeError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
         # exec-out 不经 pty：host 日志含 NUL，原始字节不被 \r\n 改写（同 run-as 备份）
         r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
                             f"cat {shlex.quote(path)}"], capture_output=True, timeout=300)
@@ -241,13 +390,20 @@ def collect_private_logs(d, pkg, pids, out, notes):
             notes.append(f"私有日志 {path} 拉取失败 rc={r.returncode}："
                          f"{r.stderr.decode(errors='replace')[:160]}")
             continue
+        got_sha, got_bytes = hashlib.sha256(r.stdout).hexdigest(), len(r.stdout)
+        verified = bool(got_bytes) and want_sha == got_sha and want_bytes == got_bytes
+        if not verified:
+            why = "拉回空数据" if not got_bytes else \
+                  f"源 {want_bytes}B/{str(want_sha)[:12]} ≠ 拉回 {got_bytes}B/{got_sha[:12]}"
+            notes.append(f"私有日志 {name} 拉取校验不符（{why}）：标未证")
         dest.mkdir(exist_ok=True)
-        name = path.rsplit("/", 1)[-1]
         (dest / name).write_bytes(r.stdout)
-        names.append(name)
-        if name.startswith("frame-log-"):
+        records.append({"name": name, "pid": pid, "bytes": got_bytes, "sha256": got_sha,
+                        "device_bytes": want_bytes, "device_sha256": want_sha,
+                        "verified": verified, "session": session})
+        if name.startswith("frame-log-") and verified and session == "bound":
             frame_texts.append(r.stdout.decode(errors="replace"))
-    return names, frame_texts
+    return records, frame_texts
 
 
 def external_dirs_gone(d, pkg):
@@ -260,8 +416,10 @@ def external_dirs_gone(d, pkg):
     return fails
 
 
-def restore_state(d, pkg, state0, orig_apk):
-    """还原原安装状态（范围见 docstring）。返回失败说明串列表（空=成功）。"""
+def restore_state(d, pkg, state0, orig_apk, downgrade=False, data_backup=None, backup_dir=None):
+    """还原原安装状态（范围见 docstring）。返回失败说明串列表（空=成功）。
+    downgrade=原包 versionCode 低于测试包 → install -r -d；data_backup=入局前的
+    run-as 备份清单（debuggable 路径），给时先装回原 APK 再逐文件 sha 核还原数据。"""
     fails = []
     now = install_state(d, pkg)
     if not state0["installed"]:
@@ -277,17 +435,21 @@ def restore_state(d, pkg, state0, orig_apk):
         return fails
     if state0.get("split"):
         return []  # 入局前已拒，走不到这里；防御性返回
-    # 已安装（--allow-data-loss）：只还原 APK 字节；私有数据与已并入资源不还原（manifest 写明）
     if now["installed"] and now.get("sha256") == state0["sha256"]:
-        return []
-    try:
-        d.run("install", "-r", str(orig_apk), timeout=600)
-    except RuntimeError as error:
-        return [f"装回原包失败：{error}"]
-    now = install_state(d, pkg)
-    if not now["installed"] or now.get("sha256") != state0["sha256"]:
-        return ["装回原包后 sha256 与入局前记录不符"]
-    return []
+        pass  # 原包字节已在；只还可能要还原数据
+    elif orig_apk is None:
+        return ["设备上的包与入局前记录不符，且没有原包备份可装回"]
+    else:
+        try:
+            d.run("install", "-r", *(["-d"] if downgrade else []), str(orig_apk), timeout=600)
+        except RuntimeError as error:
+            return [f"装回原包失败：{error}"]
+        now = install_state(d, pkg)
+        if not now["installed"] or now.get("sha256") != state0["sha256"]:
+            return ["装回原包后 sha256 与入局前记录不符"]
+    if data_backup is not None:
+        fails += restore_data(d, pkg, data_backup, backup_dir)
+    return fails
 
 
 def verify_stopped(d, pkg, seconds=5):
@@ -309,6 +471,44 @@ def frame_dump_done(d, pkg, since):
         return not session_pids(d, pkg)
     except (RuntimeError, subprocess.SubprocessError):
         return True
+
+
+POWER_LOG = "/data/local/tmp/s2a-power-samples.log"
+
+
+def start_power_sampler(d, supply):
+    """设备侧采样守护：mksh 后台 while 循环 1Hz 写 `===` 分隔的采样块到
+    /data/local/tmp——adb 掉线只断拉取、不断设备上的采样（兄弟项目
+    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。"""
+    dest = POWER_LOG
+    inner = (f"rm -f {dest}; ( while :; do {android_power.sample_command(supply)}; "
+             f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+             f"printf '{android_power.BLOCK_SEP}\\n'; sleep 1; done )"
+             f" >{dest} 2>/dev/null </dev/null & echo $!")
+    out = d.shell("sh -c " + shlex.quote(inner), timeout=15).strip()
+    return dest, out.splitlines()[-1].strip()
+
+
+def power_rows(d, dest):
+    """cat 设备采样文件 → [(row, level)]；末段未封闭的尾巴不算（下轮再收）。"""
+    out = []
+    text = d.shell(f"cat {dest}", allowed=(0, 1), timeout=20)
+    for block in android_power.power_log_blocks(text):
+        try:
+            row = android_power.parse_sample(block + "\n")
+        except (RuntimeError, ValueError):
+            continue  # 坏块跳过（设备文件原样留着，不丢证据）
+        level = (re.search(r"^capacity=(\d+)$", block, re.M) or [None, ""])[1]
+        out.append((row, level))
+    return out
+
+
+def stop_power_sampler(d, dest, pid):
+    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。"""
+    d.shell(f"kill {pid}", allowed=(0, 1), timeout=10)
+    rows = power_rows(d, dest)
+    d.shell(f"rm -f {dest}", allowed=(0, 1), timeout=10)
+    return rows
 
 
 def shot(adb_argv, dest):
@@ -336,12 +536,21 @@ def main(argv=None):
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
     p.add_argument("--allow-data-loss", action="store_true",
                    help="设备已装该包也照跑：只还原 APK 字节，私有数据与已并入资源不还原（显式接受数据丢失）")
+    p.add_argument("--backup-dir",
+                   help="已装 debuggable 包的私有/外部数据备份落点（默认 <out>/data-backup）；"
+                        "tar + manifest.json（逐文件 sha256 清单），收局按它回灌核对")
     p.add_argument("--adb", default="adb")
     p.add_argument("--push-timeout", type=int, default=None,
                    help="资源推送超时秒数；缺省按资源字节+文件数估（约 30MB/s + 20ms/文件、2 倍余量）")
     p.add_argument("--push-tar", choices=["auto", "always", "never"], default="auto",
                    help="资源推送方式：auto 小文件密集自动 tar 单推解开；always 强制；never 整树推")
     p.add_argument("--ready-timeout", type=int, default=180)
+    p.add_argument("--discharge-settle", type=int, default=30,
+                   help="采集窗开始前要连续物理放电的秒数（能耗口径；0=不等）")
+    p.add_argument("--discharge-timeout", type=int, default=300,
+                   help="放电稳定门的等待上限秒数（0=等到够为止；超时照常采集、能耗记没数据）")
+    p.add_argument("--power-interval", type=float, default=1.0,
+                   help="拉取设备侧电池采样文件的间隔秒")
     p.add_argument("--wait", type=float, default=0)
     p.add_argument("--lock-root", default=str(device_lock.lock_root()))
     p.add_argument("--holder", default=os.environ.get("USER", "?"))
@@ -393,9 +602,11 @@ def main(argv=None):
                 "started_utc": t0.isoformat(), "holder": args.holder,
                 "lock": {"pid": os.getpid(), "dir": str(lock / args.serial)}}
     state0, orig_tmp, launched = None, None, False
+    data_backup, backup_dir, downgrade_back = None, None, False
     props_prev = {}
     logcat_proc, log_file = None, None
-    pids, priv_done = {}, False
+    sampler, seen_boots, power_f = None, set(), None
+    pids, priv_done, launch_wall_s, birth_walls = {}, False, None, {}
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -427,25 +638,58 @@ def main(argv=None):
         manifest["prior_install"] = state0
         if state0.get("split"):
             raise Refuse(f"{pkg} 是分包安装（{state0['paths']}），无法忠实还原；不动这台设备")
-        if state0["installed"] and not args.allow_data_loss:
-            raise Refuse(f"{pkg} 设备上已安装：局内私有数据与已并入资源会被改写且 adb 层无法还原；"
+        backup_dir = Path(args.backup_dir) if args.backup_dir else out / "data-backup"
+        if state0["installed"] and not args.allow_data_loss and not state0["debuggable"]:
+            raise Refuse(f"{pkg} 设备上已安装但不是 debuggable：run-as 备份私有数据做不了，"
+                         f"局内私有数据与已并入资源会被改写且 adb 层无法还原；"
                          f"先手动卸了它再跑，或显式 --allow-data-loss（只还原 APK 字节）")
-        manifest["restore_scope"] = {
-            "apk": "已装不同构建→备份后 install -r 装回并 sha256 复核（分包拒跑）" if state0["installed"]
-                   else "未安装→收局卸载并复核 pm path 已清",
-            "private_data": "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
-                          else "卸载随 /data/data 清",
-            "resources": "落在 /sdcard/Android/data|obb/<pkg>，卸载随删并逐项验不存在"
-                        if not state0["installed"] else "不还原（已并入原应用数据）",
-        }
+        # ---- versionCode / 降级：装新包与装回原包两边都可能是 downgrade，任一要向 -d 而 ----
+        # ---- 设备不支持就连装都不装（拒跑而不是装上去装不回来，manifest 记决策依据）----
+        downgrade_fwd = downgrade_back = False
         if state0["installed"] and state0["sha256"] != our_sha:
+            import game_apk  # 延迟导入：只在这条路径要读新包 versionCode
+            apk_pkg, new_vc, _dbg = game_apk.apk_identity(args.apk)
+            if apk_pkg != pkg:
+                raise Refuse(f"--apk 的包名 {apk_pkg} 与 --package {pkg} 不符，装错了会丢数据")
+            orig_vc = state0.get("versionCode")
+            manifest["versions"] = {"orig_versionCode": orig_vc, "new_versionCode": new_vc}
+            if orig_vc is None:
+                raise Refuse("原包 versionCode 读不到：装回方向判不了降级，不动这台设备")
+            downgrade_fwd = orig_vc > new_vc   # 装低 versionCode 测试包
+            downgrade_back = orig_vc < new_vc  # 收局装回低 versionCode 原包
+            if (downgrade_fwd or downgrade_back) and not device_allows_downgrade(d):
+                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级但设备 pm 不支持 "
+                             f"install -d，装了原包装不回来；不动这台设备")
             orig_tmp = Path(tempfile.mkdtemp(prefix="s2a-orig-")) / "orig.apk"
             d.run("pull", state0["base"], str(orig_tmp), timeout=300)
             if sha256(orig_tmp) != state0["sha256"]:
                 raise Refuse("备份原包 sha256 与设备上读到的不符，放弃起局")
-            log(f"已备份原包 sha256={state0['sha256'][:12]}")
+            log(f"已备份原包 sha256={state0['sha256'][:12]}"
+                + ("；还原装回要走 install -d 降级" if downgrade_back else ""))
         else:
             log(f"原安装状态：{'未安装' if not state0['installed'] else '与本包同 sha256'}")
+        # ---- debuggable 原包：run-as tar 全量备份私有/外部数据（装新包之前；任一目录失败即拒）----
+        data_backup = None
+        if state0["installed"] and state0["debuggable"] and not args.allow_data_loss:
+            data_backup = backup_data(d, pkg, backup_dir)
+            nfiles = sum(len(v["files"]) for v in data_backup["dirs"].values())
+            manifest["data_backup"] = {"dir": str(backup_dir), "dirs": len(data_backup["dirs"]),
+                                       "files": nfiles,
+                                       "tars": {k: v["tar_sha256"] for k, v in data_backup["dirs"].items()}}
+            log(f"已备份原包数据 {len(data_backup['dirs'])} 处目录 / {nfiles} 文件 → {backup_dir}")
+        manifest["restore_scope"] = {
+            "apk": ("已装不同构建→备份后 install -r" + (" -d" if downgrade_back else "")
+                    + " 装回并 sha256 复核（分包拒跑）") if state0["installed"]
+                   else "未安装→收局卸载并复核 pm path 已清",
+            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局 pm clear+回灌+逐文件 sha 核"
+                             if data_backup is not None
+                             else "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
+                                  else "卸载随 /data/data 清"),
+            "resources": "落在 /sdcard/Android/data|obb/<pkg>，卸载随删并逐项验不存在"
+                        if not state0["installed"]
+                        else "随外部数据备份还原（extdata/obb 目录在清单内）" if data_backup is not None
+                             else "不还原（已并入原应用数据）",
+        }
 
         # ---- 安装（资源走 deploy_game.deploy_resources，不启动）----
         if args.pack or args.resources:
@@ -461,6 +705,9 @@ def main(argv=None):
                 game_apk.resources(str(args.pack), str(frozen), str(res))
             else:
                 frozen, res = args.apk, Path(args.resources)
+            if downgrade_fwd:  # deploy_resources 内部装不了降级：先自己把包降上去
+                d.run("install", "-r", "-d", str(frozen), timeout=600)
+                log("已降级安装测试包（install -r -d）")
             deploy_game.deploy_resources(str(frozen), str(res), adb, str(deploy_work),
                                          mode="auto", timeout=300, start=False,
                                          push_timeout=args.push_timeout,
@@ -469,8 +716,8 @@ def main(argv=None):
                                          log=log)
             log("资源与包已部署（deploy_resources，未启动）")
         elif not state0["installed"] or state0["sha256"] != our_sha:
-            d.run("install", "-r", str(args.apk), timeout=600)
-            log("已安装测试包")
+            d.run("install", "-r", *(["-d"] if downgrade_fwd else []), str(args.apk), timeout=600)
+            log("已安装测试包" + ("（install -d 降级）" if downgrade_fwd else ""))
         cur = install_state(d, pkg)
         if not cur["installed"] or cur.get("sha256") != our_sha:
             raise Refuse("安装后 sha256 校验不过")
@@ -499,6 +746,10 @@ def main(argv=None):
             launch += (["--ez", name, value or "true"] if value in ("", "true", "false")
                        else ["--es", name, value])
         launch_str = " ".join(shlex.quote(a) for a in launch)
+        try:  # 起局设备墙钟：私有日志 mtime 归属判定的基准（取不到就跳过该判据）
+            launch_wall_s = int(d.shell("date +%s").strip())
+        except (RuntimeError, subprocess.SubprocessError, ValueError):
+            launch_wall_s = None
         started = d.shell(launch_str, timeout=120)
         if re.search(r"Error|Exception", started):  # am start 组件不存在也 rc=0，只看退出码会漏
             raise Refuse(f"am start 报错：{started.strip()[:200]}")
@@ -526,37 +777,87 @@ def main(argv=None):
         log("READY")
 
         # ---- 当局绑定：游戏进程（pkg / pkg:*）+ 出生证，帧日志块只收这些 PID 的行 ----
+        # ---- birth_ticks 折成墙钟：私有日志按 mtime ≥ birth_wall 绑到本次进程出生 ----
         pids = session_pids(d, pkg)
-        manifest["session"] = {"pids": {str(pid): {"name": name, "birth_ticks": pid_birth(d, pid)}
+        births = {pid: pid_birth(d, pid) for pid in pids}
+        wall_now, uptime_now = device_timebase(d)
+        birth_walls = {pid: wall_now - max(0.0, uptime_now - ticks / USER_HZ)
+                       for pid, ticks in births.items()
+                       if ticks is not None and wall_now is not None and uptime_now is not None}
+        manifest["session"] = {"pids": {str(pid): {"name": name,
+                                                 "birth_ticks": births[pid],
+                                                 "birth_wall_s": birth_walls.get(pid)}
                                         for pid, name in pids.items()},
                                "ready_line": READY}
         if not pids:
             notes.append("ps 里没找到当局游戏进程，帧日志无法按 PID 绑定（帧表只留表头）")
 
         # ---- 按时长采集：窗口边界取设备 /proc/uptime（与帧记录同一 CLOCK_BOOTTIME）----
+        # 电池采样走设备侧守护：1Hz 写 /data/local/tmp 私有文件（=== 分块），host 按
+        # --power-interval 拉回——adb 中途掉线只断拉取不断设备上的采样，收局/中断照样
+        # 把已落的行拉回来（兄弟项目「私存不丢」同语义）。
+        supply = "battery"
+        dest, sampler_pid = start_power_sampler(d, supply)
+        sampler = (dest, sampler_pid)
+        manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
+                                     "settle_required_s": args.discharge_settle}
+        power_f = (out / "power.tsv").open("w")
+        power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+
+        def flush_power(rows):
+            for row, level in rows:
+                boot = row.get("boot_us")
+                if boot is None or boot in seen_boots:
+                    continue
+                seen_boots.add(boot)
+                power_f.write("\t".join([str(len(seen_boots) - 1)]
+                                        + [str(row[k]) for k in android_power.FIELDS]
+                                        + [level]) + "\n")
+            power_f.flush()
+
+        def pull_rows(tag):
+            try:
+                rows = power_rows(d, dest)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                notes.append(f"{tag} 拉取设备采样文件失败（行留在设备上，重连后可拉）：{error}")
+                return []
+            flush_power(rows)
+            return [row for row, _ in rows]
+
+        # 放电稳定门（兄弟项目口径）：尾部一串「连续物理放电」采样满
+        # --discharge-settle 秒才进采集窗；上限 --discharge-timeout（0=不限）。
+        # settle=0 就是「不等」：不做任何预拉取，窗口边界直接从 col0 起。
+        settle_us = args.discharge_settle * 1_000_000
+        wait0 = time.monotonic()
+        settled = True
+        if settle_us > 0:
+            rows = pull_rows("放电稳定门")
+            settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
+            while not settled:
+                if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
+                    notes.append(f"放电未稳满 {args.discharge_settle}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
+                    break
+                time.sleep(args.power_interval)
+                rows = pull_rows("放电稳定门")
+                settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
+        manifest["power_sampler"]["settle_ok"] = settled
+        manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
+
         col0_us = uptime_us(d)
         shot(adb_argv, out / "shots_ap" / "01_000s.png")
-        supply = "battery"
-        sample_cmd = (android_power.sample_command(supply) +
-                      "; printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/" + supply +
-                      "/capacity 2>/dev/null)\"")
-        # power.tsv：android_power.FIELDS 全字段原样落盘（status/source/供电旗标不丢）+ level
-        with (out / "power.tsv").open("w") as f:
-            f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
-            for i in range(args.seconds):
-                tick = time.monotonic()
-                try:
-                    text = d.shell(sample_cmd, timeout=20)
-                    row = android_power.parse_sample(text)
-                    level = (re.search(r"^capacity=(\d+)$", text, re.M) or [None, ""])[1]
-                    f.write("\t".join([str(i)] + [str(row[k]) for k in android_power.FIELDS]
-                                      + [level]) + "\n")
-                except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    notes.append(f"第 {i}s 电池采样失败：{error}")
-                    f.write(f"{i}\t" + "\t" * (len(android_power.FIELDS) + 1) + "\n")
-                f.flush()
-                time.sleep(max(0, 1 - (time.monotonic() - tick)))
+        for i in range(args.seconds):
+            tick = time.monotonic()
+            pull_rows(f"第 {i}s")
+            time.sleep(max(0, args.power_interval - (time.monotonic() - tick)))
         col1_us = uptime_us(d)
+        try:
+            rows = stop_power_sampler(d, dest, sampler_pid)
+            sampler = None
+            flush_power(rows)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
+        power_f.close()
+        power_f = None
         shot(adb_argv, out / "shots_ap" / f"02_{args.seconds:03d}s.png")
         manifest["frame_window_us"] = [col0_us, col1_us]
         log(f"采集 {args.seconds}s 完成（窗口 boot_us {col0_us}..{col1_us}）")
@@ -579,8 +880,9 @@ def main(argv=None):
 
         # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
-        priv_names, priv_frames = collect_private_logs(d, pkg, pids, out, notes)
-        manifest["private_logs"] = priv_names
+        priv_records, priv_frames = collect_private_logs(
+            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls)
+        manifest["private_logs"] = priv_records
         priv_done = True
 
         # ---- 归置产物 ----
@@ -658,6 +960,20 @@ def main(argv=None):
         # ---- 还原（任何结果都跑：SIGTERM / 未捕获异常也走到）----
         fails = []
         pkg = manifest.get("package", args.package or "")
+        if sampler:
+            try:  # 中断路径同样收采样守护：杀循环 → 拉回设备上已落的行 → 清理文件
+                for row, level in stop_power_sampler(d, sampler[0], sampler[1]):
+                    boot = row.get("boot_us")
+                    if boot is None or boot in seen_boots or power_f is None:
+                        continue
+                    seen_boots.add(boot)
+                    power_f.write("\t".join([str(len(seen_boots) - 1)]
+                                            + [str(row[k]) for k in android_power.FIELDS]
+                                            + [level]) + "\n")
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                fails.append(f"收电池采样守护异常：{error}")
+        if power_f is not None:
+            power_f.close()
         if launched:
             try:  # 中断路径同样先收局（优雅 s2arm.finish → force-stop 兜底），再验死
                 dev_runtime.stop(d, pkg, wait_done=lambda: frame_dump_done(d, pkg, since))
@@ -670,7 +986,9 @@ def main(argv=None):
                 fails.append(f"收局确认 adb 异常：{error}")
         if launched and not priv_done:
             try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
-                manifest["private_logs"], _ = collect_private_logs(d, pkg, pids, out, notes)
+                manifest["private_logs"], _ = collect_private_logs(
+                    d, pkg, pids, out, notes, launch_wall_s=launch_wall_s,
+                    birth_walls=birth_walls)
                 priv_done = True
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
@@ -685,7 +1003,8 @@ def main(argv=None):
         if state0 is not None:
             try:
                 fails += restore_state(d, manifest.get("package", args.package or ""), state0,
-                                       orig_tmp)
+                                       orig_tmp, downgrade=downgrade_back,
+                                       data_backup=data_backup, backup_dir=backup_dir)
             except (RuntimeError, subprocess.SubprocessError) as error:
                 fails.append(f"还原过程 adb 异常：{error}")
         if logcat_proc:
