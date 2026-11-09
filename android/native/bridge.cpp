@@ -1152,6 +1152,7 @@ extern "C" int  s2a_focus_suspend(void);                           // runtime/sr
 extern "C" void s2a_host_sleep_set(int sleeping);                  // runtime/src/os.c
 extern "C" void guest_clock_freeze_for(int reason, int on);        // runtime/src/os.c
 extern "C" void s2a_guest_freeze(int on) __attribute__((weak));    // runtime/src/thread.c：诊断目标不链它
+extern "C" void s2a_android_link_stop(void) __attribute__((weak)); // nvn/nvn_vsync_android.c：只在直连源里，诊断目标不链
 static bool s_foreground_frozen;
 static void foreground_unfreeze(void) {
     if (!s_foreground_frozen) return;
@@ -1277,6 +1278,8 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
     s2a_aaudio_set_foreground(foreground != JNI_FALSE);
     s2a_capacity_foreground(foreground != JNI_FALSE);
     s2a_adpf_set_foreground(foreground != JNI_FALSE);
+    // 退后台停显示节拍源（直连 vsync 拍；前台回时由 acquire 路径按需懒重启）
+    if (!foreground && s2a_android_link_stop) s2a_android_link_stop();
     host->window.set_foreground(foreground);
     if (foreground) { s2a_host_sleep_set(0); s2a_host_focus_set(1); }
     else            { s2a_host_focus_set(0); s2a_host_sleep_set(1); }

@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "mtl_vk_adapter.h"
+#include "nvn_vsync_android.h"   // nvn_be_link_* 节拍源：debug.s2a.vsync 门内的 AChoreographer 拍
 #include "nvn_obj.h"
 #include "redlog.h"
 #pragma weak nvn_ga2ca
@@ -371,6 +372,7 @@ static void shim_async_stop(void) {
 
 // 供 provider stop 调用：先把队列跑空，再唤醒并 join 翻译线程。
 void s2a_mtl_async_stop(void) {
+    s2a_android_link_stop();   // 显示节拍源同步退（节拍独立于异步档，先停）
     if (shim_async_mode() == SHIM_ASYNC_OFF || !g_gfx_tid_valid) return;
     shim_drain();
     shim_async_stop();
@@ -1148,8 +1150,10 @@ void mtl_set_origin_lower_left(int on) { g_origin_lower_left = on; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_set_frame(uint64_t f) { g_frame = f; g_frame_set = 1; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
-int mtl_link_active(void) { return 0; }
-int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }
+// nvn_be_link_*：显示节拍。debug.s2a.vsync 默认关（等设备 A/B）——关着或未起节拍源时
+// active=0、wait_tick 回 0，hle_nvn 回退自己的 60Hz 时钟，行为与改动前一致。
+int mtl_link_active(void) { return s2a_android_link_active() && mtl_has_window(); }
+int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { return s2a_android_link_wait_tick(vsyncs, timeout_ns); }
 int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 0; }
 void mtl_bad_draw_feat(const char *why) { red("mtl_bad_draw_feat: %s", why ? why : "unsupported draw feature"); }
 int mtl_ui_ghost_rect(float r[4]) { (void)r; return 0; }
