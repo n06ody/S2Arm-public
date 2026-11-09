@@ -12,10 +12,9 @@
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
   ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
     → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
-  ⑩ 降级：原包 versionCode < 新包 → 还原 install -r -d；原包 > 新包 → 装测试包就带 -d；
-    降级能力不看 usage 文本也不拿同版 -d 充数——入局前不动包；装测试包方向真降级
-    由 install -r -d 实测（失败不卸旧包）；装回方向收局 install -r -d 实际结果裁决，
-    装不回 → 留置+报红+不回灌数据；替身按 versionCode 排序区分同版/真降级
+  ⑩ 降级：原包 > 新包 → 装测试包本身是真降级由 install -r -d 实测（失败不卸旧包）；
+    原包 < 新包 → 装回方向是降级，入局前证不了能装回就拒跑（不拉不装不动数据）；
+    替身按 versionCode 排序区分同版/真降级
   ⑪ 还原后数据 sha 与备份清单不符 → 留置
   ㉕ 数据保护硬门：目录三态探针（存在但进不去 = 报错拒跑，不当不存在）；备份/回灌两处
     tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后且
@@ -287,6 +286,7 @@ if cmd == "push":
     PUSHED[argv[2]] = argv[1]
     if argv[1].endswith(".tar"):
         st["tar_pushed"] = argv[2]
+        st["tar_pushed_src"] = argv[1]          # 宿主侧 tar 源：钉「中间产物在 out 下」
         if st.get("corrupt_backup_before_restore"):
             # 归档核对门负控：备份时完好、回灌前宿主机归档被塞了异物 → 检出才许 pm clear
             with tarfile.open(argv[1], "a") as tf:
@@ -878,6 +878,8 @@ class RunGameTest(unittest.TestCase):
             self.assertTrue((backup / man["dirs"][tag]["tar"]).is_file())
         run_man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("data-backup", run_man.get("data_backup", {}).get("dir", ""))
+        self.assertFalse((out / "orig-backup" / "orig.apk").exists(),
+                         "还原全过：原包备份按保留策略清掉（再生材料不留 out）")
 
     def test_denied_dir_refuses_before_backup(self):
         """㉕ 数据目录存在但 run-as 进不去：报错拒跑而不是当不存在悄悄跳过。"""
@@ -981,39 +983,21 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("读不进", man["reason"], man["reason"])
 
-    def test_downgrade_restore_installs_with_dash_d(self):
-        """⑩ 原包 versionCode < 新包：入局前不探针（同版 -d 证不了真降级），
-        收局装回原包是真 `install -r -d` 降级。"""
-        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100),
-                                     argv=["--allow-data-loss"], new_vc=300)
-        self.assertEqual(0, rc)
-        st = json.loads((self.tmp / "state.json").read_text())
-        self.assertEqual(2, len(st["installs"]), "入局前不动包：只有装新包 + 装回两笔")
-        self.assertTrue(st["installs"][0]["apk"].endswith("game.apk"))
-        self.assertNotIn("-d", st["installs"][0]["flags"], "装新包（升级）不该带 -d")
-        restore = st["installs"][-1]
-        self.assertTrue(restore["apk"].endswith("orig.apk"), "装回的是备份的原包")
-        self.assertIn("-d", restore["flags"], "装回旧版原包是真降级，必须带 -d")
-
-    def test_downgrade_restore_failure_detains_no_wipe(self):
-        """⑩ qa-fone：装回方向真降级被设备拒（pm_no_downgrade）→ 入局前不动包、
-        局照跑，收局 install -r -d 实测失败 → 留置 + 报红，数据回灌不执行。"""
+    def test_backward_downgrade_refuses_before_mutation(self):
+        """⑩ qa-fone：原包 versionCode < 新包——装回方向是降级，先升级收局才试
+        降级 = 装了赌能降回去。入局前证不了能装回 → 直接拒跑，设备原样。"""
         dirs = self._data_dirs()
         rc, out, state = self.run_tool(state=self._installed_state(
-            debuggable=True, orig_vc=100, pm_no_downgrade=True,
-            data_dirs=dict(dirs)), new_vc=300)
+            debuggable=True, orig_vc=100, data_dirs=dict(dirs)), new_vc=300)
         self.assertNotEqual(0, rc)
-        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
-                        "装不回原包要留置")
-        man = json.loads((out / "run-manifest.json").read_text())
-        self.assertIn("装回原包失败", man["reason"], man["reason"])
         st = json.loads((self.tmp / "state.json").read_text())
-        self.assertTrue(st["installs"][0]["apk"].endswith("game.apk"),
-                        "入局前没有任何装包探针")
-        self.assertIn("files/profiles/active.bin",
-                      st["data_dirs"].get(f"/data/data/{PKG}", {}),
-                      "装回失败不清数据：设备数据原样留着可人工救")
-        self.assertEqual(0, st.get("pm_cleared", 0), "装回失败根本轮不到 pm clear")
+        self.assertNotIn("installs", st, "证不了能装回就一笔都不许装")
+        self.assertFalse(st["running"], "拒在冷启动之前")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("降级", man["reason"], man["reason"])
+        self.assertEqual(dirs, st["data_dirs"], "拒跑不该碰设备数据")
+        self.assertFalse((out / "orig-backup" / "orig.apk").exists(),
+                         "连拉都没拉：拒在动包之前")
 
     def test_pm_clear_failure_detains_and_keeps_data(self):
         """㉕ qa-fone：pm clear 必须 rc=0 且输出 Success 才往下走；clear 失败
@@ -1095,6 +1079,10 @@ class RunGameTest(unittest.TestCase):
                         "数据还原 sha 不符应留置")
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("sha", man["reason"])
+        self.assertTrue((out / "orig-backup" / "orig.apk").exists(),
+                        "还原失败：原包备份留 out 供人工救")
+        self.assertIn("orig-backup", man.get("orig_apk_backup", ""),
+                      "manifest 记原包备份路径")
 
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
@@ -1369,6 +1357,22 @@ class RunGameTest(unittest.TestCase):
                         "传输完整性照样核实——归属未证 ≠ 字节没对上")
         self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
 
+    def test_private_logs_mtime_just_below_birth_skipped(self):
+        """㉗ qa-fone 边界负控：同 PID 文件 mtime 仅早 birth 1s（旧 -2s 容忍窗内
+        会被判 bound）→ 严格 ≥ birth 判定，旧文件照样不拉。"""
+        stale = "/data/data/" + PKG + "/files/ryujinx-android/host-7-4242-Zz00.log"
+        wall = 1_700_000_000
+        state = {"data_dirs": {"/data/data/" + PKG: {
+                     "files/ryujinx-android/host-7-4242-Zz00.log": b"old run\n".hex()}},
+                 "data_mtime": {stale: wall - 3}}   # 替身 birth=wall-2：差 1s 在旧容忍窗内
+        rc, out, _ = self.run_tool(seconds=30, state=state)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotIn("host-7-4242-Zz00.log",
+                         [r["name"] for r in man["private_logs"]],
+                         "mtime 早于 birth 的同 PID 文件不许进证据（容忍窗已去）")
+        self.assertTrue(any("旧局" in n for n in man["notes"]), man["notes"])
+
     def test_private_logs_marker_missing_unproven(self):
         """㉖ qa-fone 本局锚：state_dir 没有 runtime-library.json（Java 起局写的
         {pid, sessionId}）→ 文件名/首行/PID/birth 全自洽也只能 unproven——
@@ -1583,6 +1587,10 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertTrue(st.get("tar_pushed", "").endswith(".tar"), "应推的是 tar 归档")
+        pushed_src = Path(st["tar_pushed_src"])
+        self.assertEqual(out / "deploy", pushed_src.parent,
+                         "推送 tar 中间产物必须落本次 out/deploy 下，不进系统临时目录")
+        self.assertFalse(pushed_src.exists(), "核对过后 tar 中间产物清掉（再生材料）")
         runlog = (out / "run.log").read_text()
         self.assertIn("tar 单推", runlog)
         self.assertIn("SHA 核对通过", runlog)
