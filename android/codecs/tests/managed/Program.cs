@@ -167,6 +167,16 @@ static class Program
             Check(!decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"confirmed hw fail is sticky");
             Check(decoder.IsHardwareAccelerated,"sticky failure keeps hw backend");
         }
+        if(mode=="pending")
+        {
+            // 输入已收、帧在管线：Decode 报 false 但不回退托管，下一调用按序拿到帧。
+            Check(!decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"pending input reports no frame");
+            byte* y=(byte*)surface.YPlane.Pointer;
+            Check(y[0]!=0x55,"pending input wrote nothing to caller plane");
+            Check(decoder.Decode(ref info,surface,au,ReadOnlySpan<Vp9MvRef>.Empty,mvs),"pending resolves on next call");
+            Check(y[0]==0x55,"still the hw fixture backend, no managed fallback");
+            Check(decoder.IsHardwareAccelerated,"pending path stays hw");
+        }
         if(mode is "noprobe" or "createfail" or "decodefail")
         {
             // 能力边界回托管：托管对垃圾 AU 的行为不在此断言（可抛可拒），只钉后端已换。

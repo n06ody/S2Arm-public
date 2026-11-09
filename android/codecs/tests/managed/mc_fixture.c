@@ -11,6 +11,8 @@ typedef struct {
     int32_t code, media_status;
     uint32_t consumed, decoded, output, input_token, output_token;
     uint32_t width, height, generation;
+    int32_t color_format;
+    uint32_t out_stride, out_slice_h;
 } mc_diag;
 
 static int mode_is(const char *want)
@@ -43,6 +45,11 @@ int32_t s2a_mc_decode(void *h, const uint8_t *au, uint32_t len, uint32_t w, uint
     if (mode_is("decodefail") || (mode_is("latefail") && calls > 1)) {
         if (d) { d->stage = 6; d->code = -8; d->input_token = token; }
         return -8;
+    }
+    if (mode_is("pending") && calls == 1) {
+        /* 输入已收、帧在管线：rc=0 但 output=0，可恢复 */
+        if (d) { d->consumed = len; d->decoded = 1; d->output = 0; d->input_token = token; }
+        return 0;
     }
     for (uint32_t r = 0; r < h2; r++)
         memset(dst[0].data + (uint64_t)r * dst[0].stride, 0x55, w);

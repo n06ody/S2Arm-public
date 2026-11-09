@@ -46,6 +46,8 @@ namespace Ryujinx.Graphics.Nvdec.Android
                 if (decoder is McVp9Decoder) _hwConfirmed = true;
                 return true;
             }
+            // 输入已入队、帧还在硬件管线里：可恢复态，不判败不换后端，本帧不写表面。
+            if (decoder is McVp9Decoder mc && mc.PendingOutput) return false;
             if (decoder is not McVp9Decoder || _hwConfirmed)
             {
                 // 托管失败或已确认硬件的半途失败：维持失败语义，不换后端。

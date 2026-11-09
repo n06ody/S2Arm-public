@@ -178,17 +178,30 @@ not a borrowed native view. `McSurface` allocates the planes unmanaged so the
 managed fallback decoder can write through the same `ISurface` pointers after a
 capability-boundary fallback. The shim deinterleaves the codec's actual output
 format reported by `AMediaCodec_getOutputFormat` (`color-format`/`stride`/
-`slice-height`/`crop-*`): YUV420 planar copies rows, semiplanar/NV12 (and
-FLEXIBLE/QCOM semiplanar, de-facto NV12) splits interleaved UV into separate U/V
-planes because `ISurface` exposes three independent planes. Unknown color
-formats fail as contract errors rather than guessing a layout.
+`slice-height`/`crop-*`): YUV420 planar copies rows, semiplanar splits
+interleaved UV into separate U/V planes because `ISurface` exposes three
+independent planes. Byte order differs by format: NV12 (0x15) is U-first while
+QCOM semiplanar 0x7FA30C00 is `OMX_QCOM_COLOR_FormatYVU420SemiPlanar` — V-first
+(NV21), so the deinterleave swaps U/V destinations for it. FLEXIBLE
+(0x7F420888) is only accepted as semiplanar when the codec actually reports
+`stride` and `slice-height`; missing keys or unknown color formats fail as
+unsupported rather than guessing a layout. Reported color/stride/slice-height
+ride in `s2a_mc_diag` on failures for per-device comparison.
 
 `AMediaFormat_set*` returns `void` (NDK 29): only `getInt32` signals presence.
 `AMEDIACODEC_INFO_*` dequeue results are normal flow control and retried with a
-bounded budget (input 20×10 ms, output 100×10 ms); a stall is `S2A_MC_LIMIT`,
-not a hang. Frame-size changes surface as `S2A_MC_RECONFIG` before input
+bounded budget (input 20×10 ms, output 10×10 ms per call). Hardware decoders
+have pipeline latency: an accepted input with no output yet returns `0` with
+`diag.output==0` — recoverable, the next call keeps draining and earlier frames
+are delivered in order (`show_frame=0` frames take the same path). Only two
+bounds mark a dead codec: input-slot starvation and more than
+`S2A_MC_MAX_IN_FLIGHT` (32) queued-but-unproduced inputs, both `S2A_MC_LIMIT`
+sticky. The tail of a stream may stay in the pipeline (no EOS is signalled —
+the Nvdec contract has no flush call); this costs at most the pipeline depth of
+final frames. Frame-size changes surface as `S2A_MC_RECONFIG` before input
 queueing — `McVp9Decoder` destroys and recreates the codec at the new
-dimensions. After any decode-stage failure the shim marks the context failed;
-the C# boundary decides managed fallback (before the first confirmed frame)
-versus persistent failure (after), and zero-fills the VP9 metadata hardware
-cannot produce (`mvsOut`, `BackwardUpdateCounts`) rather than fabricating it.
+dimensions, so RECONFIG is only observable through the raw C ABI. After any
+decode-stage failure the shim marks the context failed; the C# boundary decides
+managed fallback (before the first confirmed frame) versus persistent failure
+(after), and zero-fills the VP9 metadata hardware cannot produce (`mvsOut`,
+`BackwardUpdateCounts`) rather than fabricating it.

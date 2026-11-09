@@ -22,6 +22,8 @@ namespace Ryujinx.Graphics.Nvdec.Android
             public uint Abi, Size, Stage;
             public int Code, MediaStatus;
             public uint Consumed, Decoded, Output, InputToken, OutputToken, Width, Height, Generation;
+            public int ColorFormat;
+            public uint OutStride, OutSliceH;
             public static Diagnostic New() => new() { Abi = 1, Size = (uint)sizeof(Diagnostic) };
         }
         [StructLayout(LayoutKind.Sequential)]
@@ -37,11 +39,14 @@ namespace Ryujinx.Graphics.Nvdec.Android
         [LibraryImport(Lib)] private static partial int s2a_mc_destroy(nint handle, ref Diagnostic diagnostic);
         [LibraryImport(Lib)] private static partial nint s2a_mc_provenance();
 
-        private static readonly bool AbiLayoutValid = sizeof(Config) == 24 && sizeof(Diagnostic) == 52 &&
+        private static readonly bool AbiLayoutValid = sizeof(Config) == 24 && sizeof(Diagnostic) == 64 &&
             sizeof(DstPlane) == 24 && Marshal.OffsetOf<DstPlane>(nameof(DstPlane.Capacity)) == 8;
         private nint _handle;
         private uint _token, _width, _height;
         private bool _failed, _disposed;
+        // 上次 Decode 是「输入已收、帧在管线里」的可恢复态：对调用方报 false（不写表面），
+        // 但对 AndroidVp9Decoder 不算失败、不换后端——硬解输出延迟与 show_frame=0 都走这条路。
+        internal bool PendingOutput { get; private set; }
         public bool IsHardwareAccelerated => true;
         public ISurface CreateSurface(int width, int height) => new McSurface(width, height);
 
@@ -63,7 +68,7 @@ namespace Ryujinx.Graphics.Nvdec.Android
         {
             if (!_failed)
             {
-                Logger.Error?.Print(LogClass.Nvdec, $"【红】Nvdec VP9 backend=mediacodec stage={diagnostic.Stage} reason={reason} rid={RuntimeInformation.RuntimeIdentifier} code={diagnostic.Code} status={diagnostic.MediaStatus} token={diagnostic.InputToken}/{diagnostic.OutputToken} size={diagnostic.Width}x{diagnostic.Height}");
+                Logger.Error?.Print(LogClass.Nvdec, $"【红】Nvdec VP9 backend=mediacodec stage={diagnostic.Stage} reason={reason} rid={RuntimeInformation.RuntimeIdentifier} code={diagnostic.Code} status={diagnostic.MediaStatus} token={diagnostic.InputToken}/{diagnostic.OutputToken} size={diagnostic.Width}x{diagnostic.Height} color=0x{diagnostic.ColorFormat:x} stride={diagnostic.OutStride} slice={diagnostic.OutSliceH}");
             }
             _failed = true;
             return false;
@@ -96,6 +101,7 @@ namespace Ryujinx.Graphics.Nvdec.Android
             // 硬件产不出的两个 VP9 元数据面显式清零（不伪造）：colMV 与熵更新计数。
             mvsOut.Clear();
             info.BackwardUpdateCounts = default;
+            PendingOutput = false;
             if (_failed) return false;
             if (_disposed || output is not McSurface surface || surface.Disposed || bitstream.IsEmpty)
             {
@@ -112,15 +118,16 @@ namespace Ryujinx.Graphics.Nvdec.Android
                     new() { Data = surface.UPlane.Pointer, Capacity = (ulong)surface.UPlane.Length, Stride = (uint)surface.UvStride },
                     new() { Data = surface.VPlane.Pointer, Capacity = (ulong)surface.VPlane.Length, Stride = (uint)surface.UvStride },
                 };
+                int rc;
                 fixed (byte* data = bitstream)
                 {
-                    if (s2a_mc_decode(_handle, data, checked((uint)bitstream.Length),
-                        (uint)surface.Width, (uint)surface.Height, dst, ++_token, ref diagnostic) != 0)
-                    {
-                        return Fail("decode", diagnostic);
-                    }
+                    rc = s2a_mc_decode(_handle, data, checked((uint)bitstream.Length),
+                        (uint)surface.Width, (uint)surface.Height, dst, ++_token, ref diagnostic);
                 }
-                return true;
+                if (rc != 0) return Fail("decode", diagnostic);
+                // 输入已入队但本调用没等到帧：可恢复（管线延迟 / show_frame=0），返回 false 不写表面。
+                PendingOutput = diagnostic.Output == 0;
+                return diagnostic.Output != 0;
             }
             catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or OverflowException or OutOfMemoryException or IndexOutOfRangeException)
             {

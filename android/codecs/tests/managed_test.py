@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='s2a-avc-managed-') as temporary:
     subprocess.run(['cc','-fPIC','-shared',str(source),'-o',str(missing)],check=True)
     mc=out/('mc.dylib' if platform.system()=='Darwin' else 'mc.so')
     subprocess.run(['cc','-fPIC','-shared',str(here/'managed/mc_fixture.c'),'-o',str(mc)],check=True)
-    for mode in ('ok','latefail','noprobe','createfail','decodefail'):
+    for mode in ('ok','latefail','pending','noprobe','createfail','decodefail'):
         mc_env=dict(env,S2A_MC_LIBRARY=str(mc),S2A_MC_FAKE_MODE=mode)
         run=subprocess.run(['dotnet',str(binary),'vp9'],env=mc_env,capture_output=True,text=True)
         (out/f'vp9-{mode}.log').write_text(run.stdout+run.stderr)

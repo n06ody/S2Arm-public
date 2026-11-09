@@ -42,19 +42,21 @@ void AMediaFormat_setString(AMediaFormat *f, const char *k, const char *v)
 }
 
 /* ---- 假 AMediaCodec：脚本化输出队列 ---- */
-#define MC_MAX_OUT 8
+#define MC_MAX_OUT 40
 struct out_event {
     ssize_t kind;          /* <0 用 AMEDIACODEC_INFO_*；>=0 是缓冲下标 */
     const uint8_t *data;   /* 输出负载 */
     uint32_t size, offset;
     int32_t color, stride, slice_h, cl, cr, ct, cb;
     uint32_t flags;
+    uint32_t fmask;        /* getOutputFormat 实际写哪些键：1=color 2=stride 4=slice 8=crop */
 };
 struct AMediaCodec {
     int deleted, configured, started, stopped;
     uint32_t width, height;
     uint8_t input[1 << 20];
     uint32_t input_len, input_used;
+    int input_slots;
     uint64_t input_time;
     int queue_calls, dequeue_out_calls, released;
     struct out_event ev[MC_MAX_OUT];
@@ -67,7 +69,9 @@ static AMediaCodec *g_last;
 AMediaCodec* AMediaCodec_createDecoderByType(const char *mime)
 {
     if (g_create_null || strcmp(mime, "video/x-vnd.on2.vp9") != 0) return NULL;
-    return g_last = calloc(1, sizeof(AMediaCodec));
+    g_last = calloc(1, sizeof(AMediaCodec));
+    if (g_last) g_last->input_slots = 4;
+    return g_last;
 }
 media_status_t AMediaCodec_delete(AMediaCodec *c) { if (c) c->deleted = 1; free(c); return AMEDIA_OK; }
 media_status_t AMediaCodec_configure(AMediaCodec *c, const AMediaFormat *f, ANativeWindow *s, AMediaCrypto *cr, uint32_t fl)
@@ -94,13 +98,13 @@ uint8_t* AMediaCodec_getOutputBuffer(AMediaCodec *c, size_t idx, size_t *sz)
 ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *c, int64_t us)
 {
     (void)us;
-    if (c->input_used) return AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+    if (c->input_used >= (uint32_t)c->input_slots) return AMEDIACODEC_INFO_TRY_AGAIN_LATER;
     return 0;
 }
 media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *c, size_t idx, off_t off, size_t size, uint64_t t, uint32_t fl)
 {
     (void)idx; (void)off; (void)fl;
-    c->queue_calls++; c->input_len = (uint32_t)size; c->input_used = 1; c->input_time = t;
+    c->queue_calls++; c->input_len = (uint32_t)size; c->input_used++; c->input_time = t;
     return AMEDIA_OK;
 }
 ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c, AMediaCodecBufferInfo *info, int64_t us)
@@ -114,7 +118,7 @@ ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c, AMediaCodecBufferInfo *i
         info->size = (int32_t)e->size;
         info->flags = e->flags;
         info->presentationTimeUs = 0;
-        c->input_used = 0;
+        if (c->input_used) c->input_used--;
     }
     return e->kind;
 }
@@ -124,13 +128,16 @@ AMediaFormat* AMediaCodec_getOutputFormat(AMediaCodec *c)
     for (int i = c->evi - 1; i >= 0 && i < c->nev; i = -1) {
         const struct out_event *e = &c->ev[i];
         if (e->kind < 0) continue;
-        AMediaFormat_setInt32(f, "color-format", e->color);
-        AMediaFormat_setInt32(f, "stride", e->stride);
-        AMediaFormat_setInt32(f, "slice-height", e->slice_h);
-        AMediaFormat_setInt32(f, "crop-left", e->cl);
-        AMediaFormat_setInt32(f, "crop-right", e->cr);
-        AMediaFormat_setInt32(f, "crop-top", e->ct);
-        AMediaFormat_setInt32(f, "crop-bottom", e->cb);
+        uint32_t fm = e->fmask ? e->fmask : 0xfu;
+        if (fm & 1) AMediaFormat_setInt32(f, "color-format", e->color);
+        if (fm & 2) AMediaFormat_setInt32(f, "stride", e->stride);
+        if (fm & 4) AMediaFormat_setInt32(f, "slice-height", e->slice_h);
+        if (fm & 8) {
+            AMediaFormat_setInt32(f, "crop-left", e->cl);
+            AMediaFormat_setInt32(f, "crop-right", e->cr);
+            AMediaFormat_setInt32(f, "crop-top", e->ct);
+            AMediaFormat_setInt32(f, "crop-bottom", e->cb);
+        }
     }
     return f;
 }
@@ -157,6 +164,23 @@ static uint8_t *make_nv12(uint32_t w, uint32_t h, uint32_t stride, uint32_t slic
             uv[r * stride + 2 * x + 1] = (uint8_t)(0x40 + r * 4 + x);
         }
     *out_size = total - pad;
+    return b;
+}
+/* V 在前的半平面（OMX_QCOM_COLOR_FormatYVU420SemiPlanar = 0x7FA30C00，NV21 排布）。 */
+static uint8_t *make_yvu(uint32_t w, uint32_t h, uint32_t stride, uint32_t slice_h, uint64_t *out_size)
+{
+    uint64_t total = (uint64_t)stride * slice_h * 3 / 2;
+    uint8_t *b = malloc(total);
+    memset(b, 0, total);
+    for (uint32_t r = 0; r < h; r++)
+        for (uint32_t x = 0; x < w; x++) b[r * stride + x] = (uint8_t)(0x20 + r * 16 + x / 16);
+    uint8_t *vu = b + (uint64_t)stride * slice_h;
+    for (uint32_t r = 0; r < h / 2; r++)
+        for (uint32_t x = 0; x < w / 2; x++) {
+            vu[r * stride + 2 * x] = (uint8_t)(0x40 + r * 4 + x);      /* V 在偶数字节 */
+            vu[r * stride + 2 * x + 1] = (uint8_t)(0x80 + r * 4 + x);  /* U 在奇数字节 */
+        }
+    *out_size = total;
     return b;
 }
 static uint8_t *make_i420(uint32_t w, uint32_t h, uint32_t stride, uint32_t slice_h, uint64_t *out_size)
@@ -240,8 +264,8 @@ int main(void)
         d = diag();
         CHECK(s2a_mc_create(&cfg, &m, &d) == 0 && g_last->configured && g_last->started, "create ok");
         AMediaCodec *c = g_last;
-        c->ev[c->nev++] = (struct out_event){AMEDIACODEC_INFO_TRY_AGAIN_LATER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        c->ev[c->nev++] = (struct out_event){AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        c->ev[c->nev++] = (struct out_event){AMEDIACODEC_INFO_TRY_AGAIN_LATER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        c->ev[c->nev++] = (struct out_event){AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         push_nv12(c, frame, (uint32_t)fsz, stride, slice_h, w, h);
         static uint8_t y[80 * 32], u[40 * 16], v[40 * 16];
         memset(y, 0xee, sizeof(y)); memset(u, 0xee, sizeof(u)); memset(v, 0xee, sizeof(v));
@@ -352,7 +376,7 @@ int main(void)
         free(frame);
     }
 
-    /* ⑧ 输出永不就绪 → 有界等待 LIMIT，随后粘性失败 */
+    /* ⑧ 输出暂不就绪 ≠ 失败：输入收下、output=0 返回，输入槽耗尽才 LIMIT 粘性 */
     fake_reset(); s2a_mc_test_set_hw(1);
     {
         cfg.width = 64; cfg.height = 64;
@@ -362,10 +386,18 @@ int main(void)
         static uint8_t y[64 * 64], u[32 * 32], v[32 * 32];
         planes(y, u, v, 64, 64, 64, dst);
         uint8_t au[4] = {1, 2, 3, 4};
-        CHECK(s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, 3, fresh()) == S2A_MC_LIMIT,
-              "no output → bounded LIMIT");
-        CHECK(g_last->dequeue_out_calls == 100, "bounded dequeue count");
-        CHECK(s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, 4, fresh()) == S2A_MC_STATE,
+        s2a_mc_diag pd = diag();
+        for (int i = 0; i < 4; i++) {
+            pd = diag();
+            CHECK(s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, (uint32_t)i, &pd) == 0 &&
+                  pd.output == 0, "pending input: accepted, no output");
+        }
+        CHECK(g_last->queue_calls == 4, "pending inputs all queued");
+        pd = diag();
+        CHECK(s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, 4, &pd) == S2A_MC_LIMIT,
+              "input slots exhausted → LIMIT");
+        CHECK(pd.stage == S2A_MC_STAGE_INPUT, "limit at input stage");
+        CHECK(s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, 5, fresh()) == S2A_MC_STATE,
               "failed context stays failed");
         s2a_mc_destroy(m, &d);
     }
@@ -412,7 +444,132 @@ int main(void)
         s2a_mc_destroy(m, &d);
     }
 
-    /* ⑪ provenance / ABI 守卫 */
+    /* ⑫ QCOM 半平面 0x7FA30C00 是 V 在前（YVU/NV21）：U/V 不得对调 */
+    fake_reset(); s2a_mc_test_set_hw(1);
+    {
+        uint32_t w = 64, h = 32, stride = 80, slice_h = 32;
+        uint64_t fsz;
+        uint8_t *frame = make_yvu(w, h, stride, slice_h, &fsz);
+        cfg.width = w; cfg.height = h;
+        d = diag();
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "yvu create");
+        AMediaCodec *c = g_last;
+        struct out_event *e = &c->ev[c->nev++];
+        memset(e, 0, sizeof(*e));
+        e->kind = 0; e->data = frame; e->size = (uint32_t)fsz;
+        e->color = 0x7FA30C00; e->stride = (int32_t)stride; e->slice_h = (int32_t)slice_h;
+        e->cr = (int32_t)w - 1; e->cb = (int32_t)h - 1;
+        static uint8_t y[80 * 32], u[40 * 16], v[40 * 16];
+        memset(u, 0xee, sizeof(u)); memset(v, 0xee, sizeof(v));
+        s2a_mc_plane dst[3];
+        planes(y, u, v, 80, w, h, dst);
+        uint8_t au[3] = {7, 7, 7};
+        CHECK(s2a_mc_decode(m, au, sizeof(au), w, h, dst, 11, fresh()) == 0, "yvu decode ok");
+        int ok = 1;
+        for (uint32_t r = 0; r < h / 2 && ok; r++)
+            for (uint32_t x = 0; x < w / 2; x++)
+                if (u[r * 40 + x] != (uint8_t)(0x80 + r * 4 + x) ||
+                    v[r * 40 + x] != (uint8_t)(0x40 + r * 4 + x)) ok = 0;
+        CHECK(ok, "yvu deinterleave: u/v not swapped");
+        s2a_mc_destroy(m, &d);
+        free(frame);
+    }
+
+    /* ⑬ 管线延迟：首个输入收下、本次无输出（rc=0, output=0），下一调用取到排队的帧 */
+    fake_reset(); s2a_mc_test_set_hw(1);
+    {
+        uint32_t w = 64, h = 32, stride = 80, slice_h = 32;
+        uint64_t fsz;
+        uint8_t *frame = make_nv12(w, h, stride, slice_h, &fsz, 0);
+        cfg.width = w; cfg.height = h;
+        d = diag();
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "latency create");
+        AMediaCodec *c = g_last;
+        /* 12 个 TRY_AGAIN 事件排在一个出图前面：输出队列横跨多次 decode 调用 */
+        for (int i = 0; i < 12; i++) {
+            struct out_event *e = &c->ev[c->nev++];
+            memset(e, 0, sizeof(*e));
+            e->kind = AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+        }
+        push_nv12(c, frame, (uint32_t)fsz, stride, slice_h, w, h);
+        s2a_mc_plane dst[3];
+        static uint8_t y[80 * 32], u[40 * 16], v[40 * 16];
+        planes(y, u, v, 80, w, h, dst);
+        uint8_t au[3] = {1, 1, 1};
+        s2a_mc_diag pd = diag();
+        CHECK(s2a_mc_decode(m, au, sizeof(au), w, h, dst, 1, &pd) == 0 && pd.output == 0,
+              "call 1: input accepted, output pending");
+        pd = diag();
+        CHECK(s2a_mc_decode(m, au, sizeof(au), w, h, dst, 2, &pd) == 0 && pd.output == 1,
+              "call 2: earlier frame delivered");
+        CHECK(g_last->queue_calls == 2 && y[0] != 0, "second call queued + surface written");
+        s2a_mc_destroy(m, &d);
+        free(frame);
+    }
+
+    /* ⑭ FLEXIBLE(0x7F420888)：stride/slice-height 缺键不接受；键齐全按半平面处理 */
+    fake_reset(); s2a_mc_test_set_hw(1);
+    {
+        uint32_t w = 64, h = 32, stride = 80, slice_h = 32;
+        uint64_t fsz;
+        uint8_t *frame = make_nv12(w, h, stride, slice_h, &fsz, 0);
+        cfg.width = w; cfg.height = h;
+        d = diag();
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "flex create");
+        AMediaCodec *c = g_last;
+        struct out_event *e = &c->ev[c->nev++];
+        memset(e, 0, sizeof(*e));
+        e->kind = 0; e->data = frame; e->size = (uint32_t)fsz;
+        e->color = 0x7F420888; e->fmask = 1 | 8;   /* 有 color/crop，无 stride/slice-height */
+        e->cr = (int32_t)w - 1; e->cb = (int32_t)h - 1;
+        s2a_mc_plane dst[3];
+        static uint8_t y[80 * 32], u[40 * 16], v[40 * 16];
+        planes(y, u, v, 80, w, h, dst);
+        uint8_t au[3] = {2, 2, 2};
+        s2a_mc_diag fd = diag();
+        CHECK(s2a_mc_decode(m, au, sizeof(au), w, h, dst, 12, &fd) == S2A_MC_UNSUPPORTED,
+              "flexible w/o stride+slice → unsupported");
+        s2a_mc_destroy(m, &d);
+        /* 键齐全：同一格式按半平面正常解 */
+        fake_reset(); s2a_mc_test_set_hw(1);
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "flex create 2");
+        c = g_last;
+        e = &c->ev[c->nev++];
+        memset(e, 0, sizeof(*e));
+        e->kind = 0; e->data = frame; e->size = (uint32_t)fsz;
+        e->color = 0x7F420888; e->fmask = 0xf;
+        e->stride = (int32_t)stride; e->slice_h = (int32_t)slice_h;
+        e->cr = (int32_t)w - 1; e->cb = (int32_t)h - 1;
+        CHECK(s2a_mc_decode(m, au, sizeof(au), w, h, dst, 13, fresh()) == 0,
+              "flexible w/ keys → semiplanar decode");
+        CHECK(u[0] == 0x80 && v[0] == 0x40, "flexible deinterleaved");
+        s2a_mc_destroy(m, &d);
+        free(frame);
+    }
+
+    /* ⑮ 输入槽给足也救不了死 codec：in_flight 上界（32）→ LIMIT 粘性 */
+    fake_reset(); s2a_mc_test_set_hw(1);
+    {
+        cfg.width = 64; cfg.height = 64;
+        d = diag();
+        CHECK(s2a_mc_create(&cfg, &m, &d) == 0, "inflight create");
+        g_last->input_slots = 40;
+        s2a_mc_plane dst[3];
+        static uint8_t y[64 * 64], u[32 * 32], v[32 * 32];
+        planes(y, u, v, 64, 64, 64, dst);
+        uint8_t au[2] = {3, 3};
+        int first_fail = -1;
+        for (int i = 0; i < 34; i++) {
+            s2a_mc_diag pd = diag();
+            int32_t rc = s2a_mc_decode(m, au, sizeof(au), 64, 64, dst, (uint32_t)i, &pd);
+            if (first_fail < 0 && rc == S2A_MC_LIMIT) { first_fail = i; break; }
+            if (first_fail < 0) CHECK(rc == 0 && pd.output == 0, "in-flight pending ok");
+        }
+        CHECK(first_fail == 32, "in-flight LIMIT at 33rd input");
+        s2a_mc_destroy(m, &d);
+    }
+
+    /* ⑯ provenance / ABI 守卫 */
     CHECK(strcmp(s2a_mc_provenance(), S2A_MC_PROVENANCE) == 0, "provenance marker");
     s2a_mc_config bad = {0, sizeof(bad), S2A_MC_CODEC_VP9, 64, 64, 0};
     CHECK(s2a_mc_create(&bad, &m, fresh()) == S2A_MC_ARGUMENT, "bad abi rejected");
@@ -420,6 +577,6 @@ int main(void)
           "unknown codec rejected");
 
     if (g_failures) { printf("mc_host_test: %d failures\n", g_failures); return 1; }
-    printf("mc_host_test: ok (prop gate, nv12 deinterleave, planar copy, crop, reconfig, bounded stall, eos, sticky fail)\n");
+    printf("mc_host_test: ok (prop gate, nv12 deinterleave, planar copy, crop, reconfig, pending output, qcom yvu, flexible gate, in-flight bound, eos, sticky fail)\n");
     return 0;
 }

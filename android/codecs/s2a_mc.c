@@ -13,11 +13,16 @@
 
 #define S2A_MC_IN_TRIES 20u
 #define S2A_MC_IN_US 10000
-#define S2A_MC_OUT_TRIES 100u
+#define S2A_MC_OUT_TRIES 10u
 #define S2A_MC_OUT_US 10000
+/* 硬解器有管线延迟：收下输入几帧后才出首帧。暂无输出按可恢复处理；
+ * 已入队未出图超过这个上界才当死掉的 codec 判 LIMIT。 */
+#define S2A_MC_MAX_IN_FLIGHT 32u
 
 /* CodecCapabilities 的 COLOR_Format* 是 Java 侧常量，NDK 头不导出；
- * 这里钉 ByteBuffer 模式实际会遇到的值。FLEXIBLE 按平台事实上的 NV12 处理。 */
+ * 这里钉 ByteBuffer 模式实际会遇到的值。
+ * 0x7FA30C00 按 AOSP OMX_IVCommon.h 是 OMX_QCOM_COLOR_FormatYVU420SemiPlanar：
+ * V 在偶数字节（NV21 排布），与 NV12 的 U 在前相反，解交织时目的平面对调。 */
 enum {
     MC_COLOR_YUV420_PLANAR = 0x13,
     MC_COLOR_YUV420_PACKED_PLANAR = 0x14,
@@ -29,7 +34,7 @@ enum {
 struct s2a_mc {
     AMediaCodec *codec;
     uint32_t codec_kind, width, height;
-    uint32_t generation;
+    uint32_t generation, in_flight;
     int failed;
 };
 
@@ -129,16 +134,20 @@ static void mc_split_uv(const uint8_t *src, uint32_t src_stride, uint8_t *du,
     }
 }
 
+/* AMEDIAFORMAT_KEY_SLICE_HEIGHT 自 API 28 才有，minSdk 29 满足。 */
 static int32_t mc_read_format(s2a_mc *m, s2a_mc_diag *diag,
                               int32_t *color, int32_t *stride, int32_t *slice_h,
-                              int32_t *crop_l, int32_t *crop_r, int32_t *crop_t, int32_t *crop_b)
+                              int32_t *crop_l, int32_t *crop_r, int32_t *crop_t, int32_t *crop_b,
+                              int *have_stride, int *have_slice)
 {
     AMediaFormat *fmt = AMediaCodec_getOutputFormat(m->codec);
     if (!fmt) { diag_set(diag, S2A_MC_STAGE_DEQUEUE, S2A_MC_BACKEND, 0); return S2A_MC_BACKEND; }
     int32_t v = 0;
     *color = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, &v) ? v : MC_COLOR_YUV420_SEMIPLANAR;
-    *stride = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_STRIDE, &v) ? v : (int32_t)m->width;
-    *slice_h = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_SLICE_HEIGHT, &v) ? v : (int32_t)m->height;
+    *have_stride = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_STRIDE, &v);
+    *stride = *have_stride ? v : (int32_t)m->width;
+    *have_slice = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_SLICE_HEIGHT, &v);
+    *slice_h = *have_slice ? v : (int32_t)m->height;
     *crop_l = AMediaFormat_getInt32(fmt, "crop-left", &v) ? v : 0;
     *crop_r = AMediaFormat_getInt32(fmt, "crop-right", &v) ? v : (int32_t)m->width - 1;
     *crop_t = AMediaFormat_getInt32(fmt, "crop-top", &v) ? v : 0;
@@ -147,8 +156,12 @@ static int32_t mc_read_format(s2a_mc *m, s2a_mc_diag *diag,
     return 0;
 }
 
-static int32_t mc_drain(s2a_mc *m, const s2a_mc_plane *dst, s2a_mc_diag *diag)
+/* 有界排空输出：拿到一帧即返回（多余输出留在 codec 队列里给下次调用）。
+ * 预算内没拿到不是错误——硬解管线延迟下「输入已收、帧未到」是可恢复态，
+ * *produced 记 0 返回 0；真错误照常返回 <0。 */
+static int32_t mc_drain(s2a_mc *m, const s2a_mc_plane *dst, s2a_mc_diag *diag, int *produced)
 {
+    *produced = 0;
     for (uint32_t tries = 0; tries < S2A_MC_OUT_TRIES; tries++) {
         AMediaCodecBufferInfo info;
         ssize_t idx = AMediaCodec_dequeueOutputBuffer(m->codec, &info, S2A_MC_OUT_US);
@@ -173,18 +186,27 @@ static int32_t mc_drain(s2a_mc *m, const s2a_mc_plane *dst, s2a_mc_diag *diag)
         }
         AMediaCodec_releaseOutputBuffer(m->codec, (size_t)idx, false);
         if (rc) return rc;
+        if (m->in_flight) m->in_flight--;
+        *produced = 1;
         return 0;
     }
-    diag_set(diag, S2A_MC_STAGE_DEQUEUE, S2A_MC_LIMIT, 0);
-    return S2A_MC_LIMIT;
+    return 0;
 }
 
 static int32_t mc_convert(s2a_mc *m, const uint8_t *buf, uint32_t size,
                           const s2a_mc_plane *dst, s2a_mc_diag *diag)
 {
     int32_t color, stride, slice_h, cl, cr, ct, cb;
-    int32_t rc = mc_read_format(m, diag, &color, &stride, &slice_h, &cl, &cr, &ct, &cb);
+    int have_stride, have_slice;
+    int32_t rc = mc_read_format(m, diag, &color, &stride, &slice_h, &cl, &cr, &ct, &cb,
+                                &have_stride, &have_slice);
     if (rc) return rc;
+    /* 失败 diag 带出厂商实际报的色彩/几何，真机对照各机型 MediaCodec 行为用。 */
+    if (diag) {
+        diag->color_format = color;
+        diag->out_stride = (uint32_t)stride;
+        diag->out_slice_h = (uint32_t)slice_h;
+    }
     uint32_t w = (uint32_t)(cr - cl + 1), h = (uint32_t)(cb - ct + 1);
     if (cr < cl || cb < ct || w != m->width || h != m->height || stride < (int32_t)w ||
         slice_h < (int32_t)m->height) {
@@ -198,9 +220,14 @@ static int32_t mc_convert(s2a_mc *m, const uint8_t *buf, uint32_t size,
     }
     /* 布局按 MediaCodec ByteBuffer 约定：Y = stride*slice_h，chroma 紧随其后。
      * crop-left/right/top/bottom 是 MediaCodec 内置字符串键（NDK 头不导出常量），
-     * 输出格式里以 int 键出现；缺省=全幅。chroma 裁剪偏移按各自平面行宽算。 */
-    int semi = (color == MC_COLOR_YUV420_SEMIPLANAR || color == MC_COLOR_YUV420_FLEXIBLE ||
-                color == MC_COLOR_QCOM_SEMIPLANAR);
+     * 输出格式里以 int 键出现；缺省=全幅。chroma 裁剪偏移按各自平面行宽算；
+     * 奇数 crop 左/上偏移按偶对齐（cl/2、ct/2），丢半像素色度相位——VP9 输出
+     * crop 常见偶数，不补相位。
+     * FLEXIBLE(0x7F420888) 语义是「布局只能经 Image 平面+pixelStride 查」，
+     * ByteBuffer 里不保证半平面：只在 codec 明确报出 stride 和 slice-height
+     * 时才按半平面解，缺键宁可 UNSUPPORTED 也不猜布局。 */
+    int semi = (color == MC_COLOR_YUV420_SEMIPLANAR || color == MC_COLOR_QCOM_SEMIPLANAR ||
+                (color == MC_COLOR_YUV420_FLEXIBLE && have_stride && have_slice));
     int planar = (color == MC_COLOR_YUV420_PLANAR || color == MC_COLOR_YUV420_PACKED_PLANAR);
     uint64_t y_off = (uint64_t)ct * stride + cl;
     uint64_t c_off = semi ? (uint64_t)stride * slice_h + (uint64_t)(ct / 2) * stride + (uint64_t)(cl / 2) * 2
@@ -215,7 +242,10 @@ static int32_t mc_convert(s2a_mc *m, const uint8_t *buf, uint32_t size,
             return S2A_MC_CONTRACT;
         }
         mc_copy_rows(yp, (uint32_t)stride, dst[0].data, dst[0].stride, w, h);
-        mc_split_uv(cp, (uint32_t)stride, dst[1].data, dst[2].data, dst[1].stride, uw, uh);
+        if (color == MC_COLOR_QCOM_SEMIPLANAR)
+            mc_split_uv(cp, (uint32_t)stride, dst[2].data, dst[1].data, dst[1].stride, uw, uh);
+        else
+            mc_split_uv(cp, (uint32_t)stride, dst[1].data, dst[2].data, dst[1].stride, uw, uh);
         return 0;
     }
     if (planar) {
@@ -315,11 +345,18 @@ int32_t s2a_mc_decode(s2a_mc *m, const uint8_t *au, uint32_t len,
         }
     }
     diag->consumed = len;
-    result = mc_drain(m, dst, diag);
+    m->in_flight++;
+    if (m->in_flight > S2A_MC_MAX_IN_FLIGHT) {
+        result = S2A_MC_LIMIT;
+        diag_set(diag, S2A_MC_STAGE_INPUT, result, 0);
+        goto fail;
+    }
+    int produced = 0;
+    result = mc_drain(m, dst, diag, &produced);
     if (result) goto fail;
     diag->decoded = 1;
-    diag->output = 1;
-    diag->output_token = token;
+    diag->output = (uint32_t)produced;
+    if (produced) diag->output_token = token;
     diag->width = m->width;
     diag->height = m->height;
     return 0;
