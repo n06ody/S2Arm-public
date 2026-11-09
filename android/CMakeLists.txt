@@ -278,6 +278,13 @@ else()
     target_compile_options(host_ui_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(host_ui_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     add_test(NAME android_host_ui COMMAND host_ui_test)
+    # 显示节拍源（#48 B1）：替身 ALooper/AChoreographer 测契约与 link 助手——
+    # 节拍到达、60Hz 槽位等拍、丢拍超时、后台停、重启、门（debug.s2a.vsync）、不可用回退。
+    add_executable(nvn_vsync_test tests/nvn_vsync_test.c native/nvn/nvn_vsync_android.c)
+    target_include_directories(nvn_vsync_test PRIVATE native ../runtime/include)
+    target_compile_options(nvn_vsync_test PRIVATE -Wall -Wextra -Werror -DS2A_VSYNC_TEST)
+    target_link_libraries(nvn_vsync_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME android_nvn_vsync COMMAND nvn_vsync_test)
     add_executable(keyboard_owner_test w4-tests/keyboard_owner_test.c native/host_ui.c native/host_ui_android.c)
     target_include_directories(keyboard_owner_test PRIVATE native ../runtime/include)
     target_compile_options(keyboard_owner_test PRIVATE -Wall -Wextra -Werror)
