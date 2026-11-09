@@ -13,7 +13,8 @@ from android_power import battery_window, parse_sample, sample_command
 class BatteryTest(unittest.TestCase):
     def rows(self):
         return [{"boot_us": i * 1_000_000, "current_ua": -1_000_000, "voltage_uv": 4_000_000,
-                 "status": "Discharging"} for i in range(66)]
+                 "status": "Discharging", "ac_powered": "false", "usb_powered": "false",
+                 "wireless_powered": "false", "dock_powered": "false"} for i in range(66)]
 
     def test_known_power(self):
         result = battery_window(self.rows(), 2_500_000, 62_500_000, -1)
@@ -23,7 +24,9 @@ class BatteryTest(unittest.TestCase):
 
     def test_interpolation_uses_mark_through_actual_stop_not_last_frame(self):
         rows = [{"boot_us": i * 1_000_000, "current_ua": -(i + 1) * 500_000,
-                 "voltage_uv": 4_000_000, "status": "Discharging"} for i in range(4)]
+                 "voltage_uv": 4_000_000, "status": "Discharging", "ac_powered": "false",
+                 "usb_powered": "false", "wireless_powered": "false",
+                 "dock_powered": "false"} for i in range(4)]
         # Linear 2/4/6/8 W: MARK=.5 s -> stop=2.5 s is 3..7 W, 10 J / 2 s.
         result = battery_window(rows, 500_000, 2_500_000, -1)
         self.assertEqual((result["averageW"], result["energyJ"], result["durationSeconds"]), (5.0, 10.0, 2.0))
@@ -65,9 +68,10 @@ class BatteryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sample_command("battery;id")
 
-    def service(self, current="327000", voltage="4389", status="3", usb="false"):
+    def service(self, current="327000", voltage="4389", status="3", usb="false", ac="false"):
         return ("boot_us=1000000\ncurrent_now=?\nvoltage_now=?\nservice_current_now=" + current
-                + "\nservice_dump_begin\nCurrent Battery Service state:\n  AC powered: false\n  USB powered: " + usb
+                + "\nservice_dump_begin\nCurrent Battery Service state:\n  AC powered: " + ac
+                + "\n  USB powered: " + usb
                 + "\n  Wireless powered: false\n  Dock powered: false\n  status: " + status
                 + "\n  voltage: " + voltage + "\n  temperature: 329\n"
                 + " The last voltage value sent via the battery changed broadcast: 9999\nservice_dump_end\n")
@@ -81,20 +85,27 @@ class BatteryTest(unittest.TestCase):
         self.assertIsNone(battery_window([row, other], 1000000, 2000000)["averageW"])
 
     def test_service_status_kept_flags_not_collapsed(self):
-        # status 码照实映射、旗标留原列不坍缩（8E 首局 status=4+usb=true 曾被映成 Charging）：
+        # status 码照实映射、旗标留原列不坍缩（8E 首局 status=4+AC=true 曾被映成 Charging）：
         # 非放电状态不积分；「接过电」由判读者看旗标列（quality_check.powered()），解析层不猜。
         for status, want in (("1", "Unknown"), ("4", "Not charging"), ("5", "Full"),
                              ("2", "Charging"), ("7", "Unknown")):
-            row = parse_sample(self.service(status=status, usb="true"))
-            self.assertEqual((row["status"], row["usb_powered"]), (want, "true"), status)
+            row = parse_sample(self.service(status=status, ac="true"))
+            self.assertEqual((row["status"], row["ac_powered"]), (want, "true"), status)
             self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}],
                                              1000000, 2000000, 1)["averageW"], status)
-        # 矛盾行（status=Discharging 但 USB 供电 true）：两边都留原文，坍缩成 Charging 才丢真值
-        row = parse_sample(self.service(usb="true"))
-        self.assertEqual((row["status"], row["usb_powered"]), ("Discharging", "true"))
-        # 缺旗标行：status 权威照映射，缺的旗标留空不补
+        # 矛盾行（status=Discharging 但 AC 供电 true，8E 二局实况）：两边都留原文，
+        # 坍缩成 Charging 才丢真值；但 battery_window 必须 fail closed 不积分
+        row = parse_sample(self.service(ac="true"))
+        self.assertEqual((row["status"], row["ac_powered"]), ("Discharging", "true"))
+        self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}],
+                                         1000000, 2000000, 1)["averageW"],
+                          "Discharging 但 AC=true：fail closed，不能照积 4.0W")
+        # 旗标未知（缺行）同样 fail closed：不能拿空旗标当「未接电」
         row = parse_sample(self.service().replace("  Dock powered: false\n", ""))
         self.assertEqual((row["status"], row["dock_powered"]), ("Discharging", ""))
+        self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}],
+                                         1000000, 2000000, 1)["averageW"],
+                          "旗标缺失/未知：fail closed，不能照积")
 
     def test_service_failure_never_zero_or_partial_mix(self):
         for value in ("", "Permission denied", "0\n327000"):
@@ -109,15 +120,22 @@ class BatteryTest(unittest.TestCase):
         self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}], 1000000, 2000000, 1)["averageW"])
         self.assertEqual((row["current_ua"], row["voltage_uv"]), (1000000, 4000000))
         self.assertEqual((row["status"], row["source"]), ("Unknown", "battery-service-frozen"))
-        # An unused frozen service dump does not invalidate actual sysfs readings.
+        # An unused frozen service dump does not invalidate actual sysfs readings —
+        # 但冻结态下旗标不可证：四路 powered 留空，battery_window fail closed 不积分。
         row = parse_sample(text.replace("current_now=?", "current_now=-500000").replace("voltage_now=?", "voltage_now=4000000"))
-        self.assertEqual(row["source"], "sysfs")
+        self.assertEqual((row["source"], row["ac_powered"], row["dock_powered"]), ("sysfs", "", ""))
+        self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}], 1000000, 2000000, -1)["averageW"])
 
     def test_sysfs_preferred(self):
-        row = parse_sample(self.service().replace("current_now=?", "current_now=-500000")
-                           .replace("voltage_now=?", "voltage_now=4000000"))
+        text = self.service().replace("current_now=?", "current_now=-500000\nstatus=Discharging")
+        row = parse_sample(text.replace("voltage_now=?", "voltage_now=4000000"))
         self.assertEqual(row["source"], "sysfs")
         self.assertEqual(row["current_ua"], -500000)
+        # sysfs 主路也填四路旗标（采样命令每行都带 dumpsys 旗标段）：未接电可证才积分。
+        self.assertEqual((row["ac_powered"], row["usb_powered"], row["wireless_powered"], row["dock_powered"]),
+                         ("false", "false", "false", "false"))
+        self.assertAlmostEqual(battery_window([row, {**row, "boot_us": 2000000}],
+                                              1000000, 2000000, -1)["averageW"], 2.0)
 
 
 if __name__ == "__main__":
