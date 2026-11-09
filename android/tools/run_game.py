@@ -18,9 +18,9 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 还原范围（保证不了的一律拒跑，不返回成功兜底）：
 - 原 APK：设备已装该包且构建不同 → adb pull 备份、收局 install -r 装回并 sha256 复核；
   分包（split APK）装回不可靠 → 入局即拒。原包 versionCode 低于新包时装回是降级：
-  降级能力不看 usage 文本——装测试包方向的降级由真 `install -r -d` 实测（失败即拒，
-  装失败不卸旧包）；装回方向备份后拿同版原包做 install -r -d 探针，只证 flag 被
-  解析层收（真降级收局见分晓，装不回 → 留置）。原包高于新包时装测试包本身也带 -d。
+  降级能力不看 usage 文本也不拿同版重灌充数——入局前不动包；装测试包方向的降级
+  （原包 > 新包）由 `install -r -d` 实测（失败即拒，装失败不卸旧包）；装回方向
+  由收局 `install -r -d` 实际结果裁决，装不回 → 留置，数据回灌不执行。
 - 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
   /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
   tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）；归档先解包
@@ -114,18 +114,6 @@ def install_state(d, pkg):
         return {"installed": True, "split": True, "paths": paths, **meta}
     return {"installed": True, "base": base[0],
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
-
-
-def probe_dash_d(d, apk):
-    """`install -d` flag 是否被 pm 解析层接受：同版原包重灌一遍（qa-fone 语义：
-    同 versionCode 不触发真降级，证的是 flag 语法被收——usage 文本写了 -d 但
-    实际 unknown option 的设备在这步现形；真降级与否收局 install -r -d 才见
-    分晓，装不回 → 还原失败 → 留置）。返回 None=flag 被收，否则失败说明。"""
-    try:
-        d.run("install", "-r", "-d", str(apk), timeout=600)
-        return None
-    except RuntimeError as error:
-        return str(error)
 
 
 STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
@@ -299,9 +287,15 @@ def restore_data(d, pkg, manifest, backup_dir):
     if fails:
         return fails + ["归档核对未过：pm clear 未执行，设备数据未动"]
     try:
-        d.shell(f"pm clear {pkg}", allowed=(0, 1))
+        # rc=0 且输出 Success 才算清掉；清不掉不回灌不删目录——设备数据原样留置
+        out_ = d.shell(f"pm clear {pkg}", timeout=120)
+        if "Success" not in out_:
+            fails.append(f"pm clear 未返回 Success（{out_.strip()[:120] or '无输出'}）："
+                         f"数据回灌不执行")
     except (RuntimeError, subprocess.SubprocessError) as error:
         fails.append(f"pm clear 异常：{error}")
+    if fails:
+        return fails
     for tag, info in manifest["dirs"].items():
         dir_ = info["dir"]
         try:
@@ -454,7 +448,7 @@ PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
 
 
 def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
-                         ready_timebase=None):
+                         ready_timebase=None, ready_uuid=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
@@ -464,6 +458,10 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
       mtime ≥ 该 PID 的 birth_wall_s（/proc/<pid>/stat 折墙钟，唯一归属锚——
       birth 拿不到一律 unproven，起局墙钟不充数）；
       host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名逐段对上；
+      本局锚：runtime-library.json（Java 起局写进 state_dir 的
+      {pid, sessionId}）的 sessionId 必须等于 READY 行 `session <uuid>`——
+      文件名 seg 只是 services session_id(uint64)名实互核，真正的「本局」
+      身份由 pid ↔ READY-uuid 这条链绑；锚缺、uuid 缺、对不上 → unproven；
       birth 缺、时基缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
       + 注记写明哪一环证不了（同 PID 旧文件绝不升 bound）；
     - mtime 早于归属窗 → 同 PID 旧局文件，跳过不拉（记注）；
@@ -500,6 +498,23 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
     # wall2 应 ≈ wall0 + (uptime2 - uptime0)。墙钟被人改/NTP 大步跳变、READY 时基
     # 不全、复核再读失败 → mtime 归属整域不可靠，一律 unproven（fail closed）。
     clock_ok = None
+    # 本局锚：state_dir 的 runtime-library.json（起局时 Java 写的 {pid, sessionId}）。
+    # sessionId 必须等于 READY logcat 行的 session <uuid>——这是「文件属本局」的
+    # 设备端旁证，不是文件自述。拉不到/对不上的一律不给 bound。
+    markers = {}
+    try:
+        found_markers = d.run_as(pkg, f"find /data/data/{pkg} -type f "
+                                      f"-name 'runtime-library.json'", timeout=60)
+        for mpath in (ln.strip() for ln in found_markers.splitlines() if ln.strip()):
+            try:
+                meta = json.loads(d.run_as(pkg, f"cat {shlex.quote(mpath)}", timeout=30))
+                if meta.get("pid") and meta.get("sessionId"):
+                    markers[int(meta["pid"])] = str(meta["sessionId"])
+            except (RuntimeError, subprocess.SubprocessError, ValueError,
+                    AttributeError, TypeError):
+                continue
+    except (RuntimeError, subprocess.SubprocessError):
+        pass
     if pids:
         w0, u0 = (ready_timebase or (None, None))
         if w0 is None or u0 is None:
@@ -534,6 +549,11 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
                     notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生/起局窗，"
                                  f"同 PID 旧局文件不证归属，不拉")
                     continue
+                elif ready_uuid is None:
+                    attr = "READY 行没取到本局 session：runtime-library.json 无对照"
+                elif markers.get(pid) != ready_uuid:
+                    attr = ("runtime-library.json 锚缺或 sessionId 与 READY session "
+                            "对不上：本局身份未证")
                 else:
                     session = "bound"
         # 源端字节/SHA 先记账：exec-out rc=0 空读/截断传输出核对不上就标未证
@@ -789,6 +809,7 @@ def main(argv=None):
     sampler, seen_boots, power_f = None, set(), None
     pids, priv_done, birth_walls = {}, False, {}
     wall_now = uptime_now = None   # READY 时基锚点对；READY 前异常保持 None → 跳变复核 fail closed
+    ready_uuid = None              # READY 行里的本局 session（设备端生成）；READY 前异常保持 None
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -856,14 +877,10 @@ def main(argv=None):
                                        "files": nfiles,
                                        "tars": {k: v["tar_sha256"] for k, v in data_backup["dirs"].items()}}
             log(f"已备份原包数据 {len(data_backup['dirs'])} 处目录 / {nfiles} 文件 → {backup_dir}")
-        if downgrade_back:
-            # 装回方向要降级：探针只证 install -d flag 被 pm 解析层收（同版重灌
-            # 不触发真降级）——挪到备份之后：就算重灌改了包状态数据也已安全。
-            # 真降级与否收局 install -r -d 见分晓，装不回 → 还原失败 → 留置。
-            why = probe_dash_d(d, orig_tmp)
-            if why is not None:
-                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级，"
-                             f"install -d flag 实测不被收（{why}）：装了原包装不回来，不动这台设备")
+        # 装回方向（原包 versionCode < 新包）是降级：入局前不做任何装包探针——
+        # 同版 `install -r -d` 不触发版本排序证不了真降级（qa-fone），在备份前动包
+        # 更是顺序错。能否装回由收局 `install -r -d` 实际结果裁决：装不回 → 还原
+        # 失败 → 留置 + 报红，数据回灌不执行（数据保持可人工救）。
         manifest["restore_scope"] = {
             "apk": ("已装不同构建→备份后 install -r" + (" -d" if downgrade_back else "")
                     + " 装回并 sha256 复核（分包拒跑）") if state0["installed"]
@@ -943,10 +960,15 @@ def main(argv=None):
         # ---- 等 READY ----
         deadline = time.monotonic() + args.ready_timeout
         ready, seen_running = False, False
+        ready_uuid = None
         while time.monotonic() < deadline:
             text = d.shell(f"logcat -d -v brief -T {shlex.quote(since)} -s S2Arm:I")
             if READY in text:
                 ready = True
+                for ln in text.splitlines():
+                    if READY in ln:  # 「… session <UUID> …」= 本局设备生成的会话号
+                        m_ = re.search(r"\bsession (\S+)", ln)
+                        ready_uuid = m_.group(1) if m_ else None
                 break
             fail = FAIL_RE.search(text)
             if fail:
@@ -972,7 +994,7 @@ def main(argv=None):
                                                  "birth_ticks": births[pid],
                                                  "birth_wall_s": birth_walls.get(pid)}
                                         for pid, name in pids.items()},
-                               "ready_line": READY}
+                               "ready_line": READY, "uuid": ready_uuid}
         if not pids:
             notes.append("ps 里没找到当局游戏进程，帧日志无法按 PID 绑定（帧表只留表头）")
 
@@ -1066,7 +1088,7 @@ def main(argv=None):
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
         priv_records, priv_frames = collect_private_logs(
             d, pkg, pids, out, notes, birth_walls=birth_walls,
-            ready_timebase=(wall_now, uptime_now))
+            ready_timebase=(wall_now, uptime_now), ready_uuid=ready_uuid)
         manifest["private_logs"] = priv_records
         priv_done = True
 
@@ -1174,7 +1196,8 @@ def main(argv=None):
                 manifest["private_logs"], _ = collect_private_logs(
                     d, pkg, pids, out, notes,
                     birth_walls=birth_walls,
-                    ready_timebase=(wall_now, uptime_now))
+                    ready_timebase=(wall_now, uptime_now),
+                    ready_uuid=ready_uuid)
                 priv_done = True
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
