@@ -173,8 +173,8 @@ static class Program
         {
             Check(R(key,out var pic,out var err)==Vp9NativeResult.Decoded,$"keyframe decodes: {err}");
             Check(pic.Y!=0&&pic.Width==32&&pic.Height==16,"picture view populated");
-            Check(mvs.All(x=>x==0),"mvsOut zero-filled, not fabricated");
-            Check(counts.All(x=>x==0),"countsOut zero-filled, not fabricated");
+            Check(mvs.All(x=>x==0xAA),"mvsOut untouched — hardware produces none, nothing fabricated");
+            Check(counts.All(x=>x==0xAA),"countsOut untouched — hardware produces none, nothing fabricated");
             var inter=key; inter.IntraFrame=0;
             Check(R(inter,out _,out _)==Vp9NativeResult.Decoded,"inter frame decodes");
             // 隐藏帧 / 供给表≠默认表 / 越界尺寸：如实回退，不产出图。
@@ -186,6 +186,22 @@ static class Program
             int segTree=(int)Marshal.OffsetOf<Vp9EntropyProbs>(nameof(Vp9EntropyProbs.SegTreeProb));
             bad=(byte[])probs.Clone(); bad[segTree]^=0xFF; bad[segTree+8]^=0xFF;
             Check(RP(bad,key,out _,out _)==Vp9NativeResult.Decoded,"seg fields excluded from compare");
+            // 占位压缩头（1 字节 0x00）强解出 tx_mode=ONLY_4X4、reference_mode=SINGLE、
+            // use_prev_frame_mvs=0：真实字段超出占位语义就回退，不然位流失步花屏。
+            var txsel=inter; txsel.TxMode=4;
+            Check(R(txsel,out _,out _)==Vp9NativeResult.NotRepresentable,"tx_mode_select not representable");
+            var txsel2=inter; txsel2.TxMode=1;
+            Check(R(txsel2,out _,out _)==Vp9NativeResult.NotRepresentable,"allow_8x8 not representable");
+            var refsel=inter; refsel.ReferenceMode=2;
+            Check(R(refsel,out _,out _)==Vp9NativeResult.NotRepresentable,"reference_mode_select not representable");
+            var refcmp=inter; refcmp.ReferenceMode=1;
+            Check(R(refcmp,out _,out _)==Vp9NativeResult.NotRepresentable,"compound ref not representable");
+            var keytx=key; keytx.TxMode=4; keytx.ReferenceMode=2; // intra 规范强制两值，不算违例
+            Check(R(keytx,out _,out _)==Vp9NativeResult.Decoded,"intra tx/ref fields spec-forced, still decodes");
+            var prevmv=inter; prevmv.UsePrevFrameMvs=1;
+            Check(R(prevmv,out _,out _)==Vp9NativeResult.NeedsKeyFrame,"prev-mv job after decoded needs keyframe");
+            byte[] prevMvBuf=new byte[16];
+            Check(backend.Decode(au,probs,in prevmv,prevMvBuf,mvs,counts,out _,out _)==Vp9NativeResult.NeedsKeyFrame,"non-empty prevMvs same rule");
             // 尺寸变化的非关键帧 → NeedsKeyFrame；关键帧则重建后照常解。
             var resize=key; resize.IntraFrame=0; resize.Width=64; resize.Height=32;
             Check(R(resize,out _,out _)==Vp9NativeResult.NeedsKeyFrame,"non-key resize needs keyframe");

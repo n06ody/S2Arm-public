@@ -207,15 +207,32 @@ surface as `S2A_MC_RECONFIG` before input queueing — `McVp9Decoder` destroys
 and recreates the codec at the new dimensions, so RECONFIG is only observable
 through the raw C ABI.
 
-Under the `IVp9NativeBackend` contract the backend reports honestly what
-AMediaCodec cannot represent, and `Vp9NativePath` hands that job to the
-managed decoder until the next key frame: `show_frame=0` jobs (intra-only
-hidden frames — the hook surfaces the previous picture, hardware cannot),
-supplied entropy-probability tables that differ from the spec defaults the
-codec's context always carries, and non-key-frame size changes (a recreated
-codec has no reference state) return `NotRepresentable`/`NeedsKeyFrame`.
-`mvsOut` and `countsOut` are metadata only the managed decoder produces;
-on `Decoded` they are explicitly zero-filled rather than fabricated. After
-any decode-stage failure the shim marks the context failed; the backend maps
-that to `Error` once, and sustained starvation escalates to the same result
-so the native path disables itself instead of spinning.
+The repacked frame's compressed header is a single `0x00` stand-in byte
+(`Vp9NativeHeader.Write` ends with it): `tx_mode`, `reference_mode`,
+per-job probability deltas and the `use_prev_frame_mvs` bit were all
+injected out-of-band into libvpx by the hook — AMediaCodec has no such
+channel and decodes the placeholder literally (tx_mode=ONLY_4X4,
+reference_mode=SINGLE, no updates). Under the `IVp9NativeBackend`
+contract the backend therefore reports honestly what the placeholder
+cannot represent, and `Vp9NativePath` hands that job to the managed
+decoder until the next key frame: `show_frame=0` jobs (intra-only hidden
+frames — the hook surfaces the previous picture, hardware cannot),
+inter jobs whose `TxMode`/`ReferenceMode` exceed the placeholder
+semantics (intra frames are spec-forced to ONLY_4X4+SINGLE and need no
+check), `use_prev_frame_mvs` jobs (the placeholder's first bit is the
+flag and it is always 0 — the guest MV buffer also cannot hold this
+frame's real MV field, so a managed takeover would only find a stale
+value; `NeedsKeyFrame` marks the key frame as the point the dependency
+edge safely closes), supplied entropy-probability tables that differ
+from the spec defaults the codec's context always carries, and
+non-key-frame size changes (a recreated codec has no reference state).
+`mvsOut` and `countsOut` are metadata hardware cannot produce, so the
+backend writes nothing (the guest buffers keep their upstream content;
+the path's counts stay all-zero, which is the faithful value for a
+`refresh_frame_context=0` frame) — nothing fabricated. Every 300 jobs
+and at Dispose the backend logs a one-line outcome distribution
+(`mc-vp9 outcome:` decoded/hidden/header/prevMv/probs/size/starved/error)
+for real-device coverage measurement. After any decode-stage failure
+the shim marks the context failed; the backend maps that to `Error`
+once, and sustained starvation escalates to the same result so the
+native path disables itself instead of spinning.

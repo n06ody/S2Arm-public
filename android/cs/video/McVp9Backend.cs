@@ -9,6 +9,12 @@ namespace Ryujinx.Graphics.Nvdec.Android
     // AMediaCodec 版的 IVp9NativeBackend（#44）：同一契约（一作业一图、
     // NotRepresentable 作业交给托管解码器直到下个关键帧）下接 s2a_mc shim。
     //
+    // 重打包帧的压缩头只是 1 个占位字节 0x00（Vp9NativeHeader.Write 末尾）：
+    // 硬件照它解出 tx_mode=ONLY_4X4、reference_mode=SINGLE、全部概率增量=无
+    // （use_prev_frame_mvs 位也落在占位字节首位=0）。tx_mode / ref_mode /
+    // 逐作业概率表本由 hook 带外注入 libvpx——MediaCodec 没有这条通道，
+    // 超出占位语义的真实字段一律如实回退，不然硬件按错语义解 tile 出花屏。
+    //
     // 表示不了的作业如实回退，不伪造：
     //   · ShowFrame=0（intra-only 隐藏帧）：隐藏帧的像素只进参考槽不出图，MediaCodec 拿不到——
     //     hook 经 frame_to_show 交得出，这里交不出，回 NotRepresentable。
@@ -16,13 +22,22 @@ namespace Ryujinx.Graphics.Nvdec.Android
     //     规范默认值，逐作业供给表注不进——逐字节对不上就回 NotRepresentable，不出错图。
     //     （SegTreeProb/SegPredProb 不参与比较：segmentation 作业在 header Check 已拒，
     //     这两段不进解码。）
+    //   · inter 作业 TxMode≠ONLY_4X4 / ReferenceMode≠SINGLE：占位头解不出这些
+    //     语义（intra 帧规范本就强制 ONLY_4X4+SINGLE，不算违例），回 NotRepresentable。
+    //   · UsePrevFrameMvs≠0 / prevMvs 非空：重打包头从不发 prev-MV 位（硬件只能
+    //     按不复用解，tile 数据按复用编的→错），且客体 MV 缓冲里装不下本帧真实
+    //     MV 字段——托管接手只会拿到陈旧值。回 NeedsKeyFrame：关键帧重置 MV
+    //     字段，是这条依赖边能安全闭合的唯一点。
     //   · 尺寸变化的非关键帧：codec 重建丢参考状态，回 NeedsKeyFrame。
-    //   · mvsOut / countsOut 是托管解码器才能产出的量，Decoded 时显式清零（与 vpx 的真值不同，
-    //     是「全零+文档声明」；宿主观测面，不回读进解码状态）。
+    //   · mvsOut / countsOut 是硬件产不出的量：一概不写（客体缓冲保持上游真值；
+    //     路径的 _counts 维持全零，恰是重打包帧 refresh_frame_context=0 的忠实值——
+    //     不产生反向更新），不写「全零」这种具体假值。
     //
     // 管线延迟按「已喂 shown AU − 已出图」记账（_pending）：本作业出图即 Decoded，
     // 有界预算补不齐就 NotRepresentable——这是同步契约下唯一诚实的映射；
     // 连续补齐失败升级 Error 计入路径的禁用阈值。
+    //
+    // 结局记账（真机验证用）：每 300 作业与 Dispose 各打一行各结局分布。
     internal sealed class McVp9Backend : IVp9NativeBackend
     {
         internal const int ProbsSize = 3087;    // Vp9EntropyProbs
@@ -40,6 +55,19 @@ namespace Ryujinx.Graphics.Nvdec.Android
         private int _timeouts;         // 连续预算内没补齐的次数
         private bool _failed;
         private static byte[] _defaultProbs;   // 懒取，进程一份
+
+        // 结局记账（真机覆盖率验证，B 项）：每 300 作业与 Dispose 各打一行分布。
+        private int _jobs, _decoded, _nrHidden, _nrHeader, _nrMv, _nrProbs, _nrSize, _starved, _errors;
+
+        private Vp9NativeResult Done(Vp9NativeResult r, ref int bucket)
+        {
+            bucket++;
+            if (++_jobs % 300 == 0) Report();
+            return r;
+        }
+
+        private void Report() => Logger.Info?.Print(LogClass.Nvdec,
+            $"mc-vp9 outcome: jobs={_jobs} decoded={_decoded} hidden={_nrHidden} header={_nrHeader} prevMv={_nrMv} probs={_nrProbs} size/key={_nrSize} starved={_starved} error={_errors}");
 
         public static McVp9Backend TryCreate() => McVp9Decoder.Available() ? new McVp9Backend() : null;
 
@@ -78,23 +106,38 @@ namespace Ryujinx.Graphics.Nvdec.Android
             if (_failed)
             {
                 error = "mediacodec sticky failure";
-                return Vp9NativeResult.Error;
+                return Done(Vp9NativeResult.Error, ref _errors);
             }
             // 隐藏帧的像素 MediaCodec 拿不到——如实回退，本作业走托管。
             if (p.ShowFrame == 0)
             {
-                return Vp9NativeResult.NotRepresentable;
+                return Done(Vp9NativeResult.NotRepresentable, ref _nrHidden);
+            }
+            if (p.IntraFrame == 0)
+            {
+                // 占位压缩头解不出 tx_mode / reference_mode / prev-MV 的真实语义
+                // （intra 帧规范强制 ONLY_4X4+SINGLE 不查）；超出的作业回托管。
+                if (p.TxMode != 0 || p.ReferenceMode != 0)
+                {
+                    return Done(Vp9NativeResult.NotRepresentable, ref _nrHeader);
+                }
+                if (p.UsePrevFrameMvs != 0 || !prevMvs.IsEmpty)
+                {
+                    // 客体 MV 缓冲写不出本帧真 MV 字段：托管接手只会拿到陈旧值。
+                    // NeedsKeyFrame——关键帧重置 MV 字段，依赖边在那里闭合。
+                    return Done(Vp9NativeResult.NeedsKeyFrame, ref _nrMv);
+                }
             }
             if (p.Width < 1 || p.Height < 1 || p.Width > MaxDimension || p.Height > MaxDimension ||
                 probs.Length != ProbsSize || countsOut.Length != CountsSize ||
                 mvsOut.Length == 0 || mvsOut.Length % MvRefSize != 0)
             {
-                return Vp9NativeResult.NotRepresentable;
+                return Done(Vp9NativeResult.NotRepresentable, ref _nrHeader);
             }
             // 供给表必须恰好是规范默认值——AMediaCodec 注不进逐作业概率表。
             if (!ProbsAtDefaults(probs))
             {
-                return Vp9NativeResult.NotRepresentable;
+                return Done(Vp9NativeResult.NotRepresentable, ref _nrProbs);
             }
             // 尺寸变化：codec 重建丢参考状态，非关键帧如实回 NeedsKeyFrame。
             if (_decoder != null && (p.Width != _width || p.Height != _height))
@@ -106,7 +149,7 @@ namespace Ryujinx.Graphics.Nvdec.Android
                 _surface = null;
                 if (p.IntraFrame == 0)
                 {
-                    return Vp9NativeResult.NeedsKeyFrame;
+                    return Done(Vp9NativeResult.NeedsKeyFrame, ref _nrSize);
                 }
             }
             _surface ??= new McSurface(p.Width, p.Height);
@@ -147,31 +190,30 @@ namespace Ryujinx.Graphics.Nvdec.Android
                 {
                     _failed = true;
                     error = $"mediacodec output starved {_timeouts} jobs in a row ({McVp9Decoder.Diag(in diagnostic)})";
-                    return Vp9NativeResult.Error;
+                    return Done(Vp9NativeResult.Error, ref _errors);
                 }
-                return Vp9NativeResult.NotRepresentable;
+                return Done(Vp9NativeResult.NotRepresentable, ref _starved);
             }
             _timeouts = 0;
-            // 硬件给不出的两个元数据面显式清零（不伪造）。
-            mvsOut.Clear();
-            countsOut.Clear();
+            // mvsOut / countsOut 是硬件产不出的量：不写（客体缓冲保持上游真值），不伪造。
             _width = p.Width;
             _height = p.Height;
             picture = new Vp9NativePicture(
                 _surface.YPlane.Pointer, _surface.UPlane.Pointer, _surface.VPlane.Pointer,
                 _surface.Stride, _surface.UvStride, p.Width, p.Height);
-            return Vp9NativeResult.Decoded;
+            return Done(Vp9NativeResult.Decoded, ref _decoded);
         }
 
         private Vp9NativeResult Sticky(string stage, in McVp9Decoder.Diagnostic diagnostic, out string error)
         {
             _failed = true;
             error = $"mediacodec {stage} {McVp9Decoder.Diag(in diagnostic)}";
-            return Vp9NativeResult.Error;
+            return Done(Vp9NativeResult.Error, ref _errors);
         }
 
         public void Dispose()
         {
+            Report();
             _decoder?.Dispose();
             _decoder = null;
             _surface?.Dispose();
