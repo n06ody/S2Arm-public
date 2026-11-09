@@ -263,7 +263,12 @@ def main(argv=None):
     if not args.package and not (args.resources or args.pack):
         p.error("apk 直装需要 --package（带 --resources/--pack 时按 artifact 取包名）")
     for e in args.extra:
-        if not dev_runtime.EXTRA.fullmatch(e):
+        # s2arm.debug_env 的值是 S2A_KEY=VALUE 形式（本身带 =），按调试环境批次口径单验；
+        # 其余 extra 照旧 dev_runtime.EXTRA 的值字符集
+        if e.startswith("s2arm.debug_env="):
+            if not re.fullmatch(r"s2arm\.debug_env=S2A_[A-Za-z0-9_]+=[^\x00]{1,8192}", e):
+                p.error(f"s2arm.debug_env 只收 S2A_KEY=VALUE：{e!r}")
+        elif not dev_runtime.EXTRA.fullmatch(e):
             p.error(f"--extra 只收 s2arm.KEY[=VALUE]：{e!r}")
 
     d = dev_runtime.Device(args.adb, args.serial)
