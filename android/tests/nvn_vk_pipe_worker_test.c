@@ -322,6 +322,77 @@ int main(void) {
     CHECK(take_one(&res, 3000) && res.ok == 1, "worker creates after the cache lock is released");
     nvn_vk_pipe_worker_release(&res);
 
+    // 5b) 配方键控等待（C4b）：按配方取结果/在途超时/无证据/代际过滤/环内抽取。
+    {
+        // 无证据：从未提交的配方立即 -1，不让 owner 空等。
+        struct nvk_pipe_job_result wres;
+        struct nvk_pipe_recipe never;
+        make_spec(&spec, gen, 40);
+        never = spec.recipe;
+        CHECK(nvn_vk_pipe_worker_wait(&never, gen, 50, &wres) == -1,
+              "wait on a recipe with no evidence returns -1");
+        CHECK(nvn_vk_pipe_worker_wait(NULL, gen, 0, &wres) == -1, "null recipe is refused");
+
+        // 在途超时：job 被 fake 卡住时 wait 到点返回 0，不取别人的结果。
+        set_blocking(1);
+        make_spec(&spec, gen, 41);
+        CHECK(nvn_vk_pipe_worker_submit(&spec, &job_id, why, sizeof why) == 0, "wait-target job accepted");
+        CHECK(wait_flag(&g_create_entered, 3000), "wait-target create entered");
+        CHECK(nvn_vk_pipe_worker_wait(&spec.recipe, gen, 60, &wres) == 0,
+              "in-flight recipe wait times out with 0");
+        // 别的配方（无证据）即使在同一 worker 下也 -1。
+        struct nvk_pipe_job_spec other;
+        make_spec(&other, gen, 42);
+        CHECK(nvn_vk_pipe_worker_wait(&other.recipe, gen, 0, &wres) == -1,
+              "a different recipe still has no evidence");
+        release_block();
+        pthread_mutex_lock(&g_fmu);
+        g_block_create = 0;
+        pthread_mutex_unlock(&g_fmu);
+        CHECK(nvn_vk_pipe_worker_wait(&spec.recipe, gen, 3000, &wres) == 1,
+              "completed recipe is taken by its own wait");
+        CHECK(wres.ok == 1 && wres.pipeline != VK_NULL_HANDLE &&
+              nvk_pipe_recipe_match(&wres.recipe, &spec.recipe),
+              "wait result carries the matching recipe");
+        nvn_vk_pipe_worker_release(&wres);
+
+        // 环内抽取：两条不同配方完成后，wait 第二条只取走它（FIFO 里另一条留下）。
+        make_spec(&spec, gen, 43);
+        struct nvk_pipe_job_spec spec2;
+        make_spec(&spec2, gen, 44);
+        CHECK(nvn_vk_pipe_worker_submit(&spec, &job_id, why, sizeof why) == 0, "ring job A accepted");
+        CHECK(nvn_vk_pipe_worker_submit(&spec2, &job_id, why, sizeof why) == 0, "ring job B accepted");
+        CHECK(nvn_vk_pipe_worker_wait(&spec2.recipe, gen, 3000, &wres) == 1,
+              "wait extracts the matching result out of the ring");
+        CHECK(nvk_pipe_recipe_match(&wres.recipe, &spec2.recipe), "extracted result is recipe B");
+        nvn_vk_pipe_worker_release(&wres);
+        CHECK(take_one(&res, 3000) && nvk_pipe_recipe_match(&res.recipe, &spec.recipe),
+              "the other result stays in FIFO order for take()");
+        nvn_vk_pipe_worker_release(&res);
+
+        // 代际过滤：环里只有旧代际结果时，本代际 wait 看不到它（-1，不误取）。
+        nvn_vk_pipe_worker_set_generation(gen + 1);
+        make_spec(&spec, gen + 1, 45);
+        CHECK(nvn_vk_pipe_worker_submit(&spec, &job_id, why, sizeof why) == 0, "next-gen job accepted");
+        CHECK(nvn_vk_pipe_worker_wait(&spec.recipe, gen, 3000, &wres) == -1,
+              "old-generation wait does not match a next-generation result");
+        CHECK(nvn_vk_pipe_worker_wait(&spec.recipe, gen + 1, 3000, &wres) == 1,
+              "same-generation wait takes the result");
+        nvn_vk_pipe_worker_release(&wres);
+
+        // 失败结果也按配方转交（ok=0 带 why），不让 owner 把失败当在途。
+        pthread_mutex_lock(&g_fmu);
+        g_fail_next = 1;
+        pthread_mutex_unlock(&g_fmu);
+        make_spec(&spec, gen + 1, 46);
+        CHECK(nvn_vk_pipe_worker_submit(&spec, &job_id, why, sizeof why) == 0, "failing wait job accepted");
+        CHECK(nvn_vk_pipe_worker_wait(&spec.recipe, gen + 1, 3000, &wres) == 1 &&
+              wres.ok == 0 && wres.why[0],
+              "a failed create reaches the recipe wait with its reason");
+        nvn_vk_pipe_worker_release(&wres);
+        nvn_vk_pipe_worker_set_generation(gen);
+    }
+
     // 6) 有界 Stop：创建中返回 1；迟到结果销毁；未退出前拒绝重启；退出后回收并可再启动。
     set_blocking(1);
     pthread_mutex_lock(&g_fmu);

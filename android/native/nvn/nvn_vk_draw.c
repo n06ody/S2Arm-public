@@ -741,9 +741,10 @@ static uint32_t nvk_fu_prop_ms(const char *name, uint32_t dflt, uint32_t *cache)
     }
     return *cache == UINT32_MAX ? 0 : *cache;
 }
-static uint32_t nvk_fu_item_ms(void)   { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_item_ms", 2000, &v); }
-static uint32_t nvk_fu_frame_ms(void)  { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_frame_ms", 100, &v); }
-static uint32_t nvk_fu_unsafe_ms(void) { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_unsafe_ms", 10000, &v); }
+/* 非 static：C4b 管线异步路径（nvn_vk_first_draw.c）复用同一组预算/上限读数。 */
+uint32_t nvk_fu_item_ms(void)   { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_item_ms", 2000, &v); }
+uint32_t nvk_fu_frame_ms(void)  { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_frame_ms", 100, &v); }
+uint32_t nvk_fu_unsafe_ms(void) { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_unsafe_ms", 10000, &v); }
 static uint64_t nvk_fu_frame(void) { return nvn_vk_first_draw_frame_id ? nvn_vk_first_draw_frame_id() : 0; }
 
 /* 首用等待的计时器：必须是真实单调钟。pf_now 受 draw_pf 统计开关门控（关时返 0），
@@ -754,6 +755,9 @@ static uint64_t nvk_fu_now(void) {
 }
 
 static struct s2a_fu_budget g_fu_budget;
+/* C4b：管线创建等待与着色器编译等待共用同一帧预算（iOS pso_budget 是整个
+   首用系统的单帧总账，不是每个阶段各一份）。 */
+struct s2a_fu_budget *nvk_fu_budget_state(void) { return &g_fu_budget; }
 
 /* 在途请求的 late/stuck 终局标记：iOS 写在 pending 项上，跨笔/跨帧都挡。
    request_sha 是完整请求身份；64 项直线表，挤最久未触的（满证据按保守走）。 */
@@ -821,7 +825,8 @@ static void nvk_fu_rt_drawn(const struct s2a_record_draw_state *state, uint64_t 
    安卓侧的 storage 写证据：draw 快照里真实绑定的 SSBO（ssbo_bound）与 transform
    feedback。图形管线 storage image 绑定不进 draw 快照（保守口径，见交付限制）；
    片元输出写目标本身不是 storage 写——fresh/steady 两项覆盖它能不能安全丢。 */
-static int nvk_fu_skip_safe(const struct s2a_record_draw_state *state, uint64_t frame) {
+/* 非 static：C4b 管线等待用同一个「本笔能不能安全丢」判定（着色器/管线两阶段口径一致）。 */
+int nvk_fu_skip_safe(const struct s2a_record_draw_state *state, uint64_t frame) {
     if (state->tf_enabled) return 0;
     for (unsigned st = 0; st < 6; st++)
         if (state->ssbo_bound[st]) return 0;
@@ -1831,6 +1836,14 @@ static int nvk_draw_builder_impl(struct s2a_vk_device *device, const struct s2a_
                                    why, sizeof why);
         const uint64_t dbg_rel0 = tail_on ? nvk_tail_now() : 0;   // release 起点（draw_tail）
         nvk_program_release(prog);   // 结果字节在 pin 期间不会被淘汰
+        if (rc == 2) {
+            // C4b：管线首用等待按判定跳过了这一笔（debug.s2a.pipe_async）。跳过是有意的、
+            // 可恢复的——与 shader 编译跳过同口径记 OK，不记 unsupported，也不标 rt_drawn
+            // （没画过的目标不算「本帧又画过」）；pipe 侧自己的跳/等计数在 first_draw.c。
+            result->code = S2A_RECORD_OK;
+            snprintf(result->why, sizeof result->why, "%s", why);
+            return S2A_RECORD_OK;
+        }
         if (rc) {
             result->code = S2A_RECORD_UNSUPPORTED;
             snprintf(result->why, sizeof result->why, "draw: 真实绘制未完成：%s", why);

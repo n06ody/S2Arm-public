@@ -34,6 +34,8 @@ void nvn_vk_query_stats(struct nvn_vk_query_stats *s){memset(s,0,sizeof *s);}
 void nvn_vk_query_release_device(void){}
 void nvn_vk_sampler_cache_destroy(struct nvn_vk_sampler_cache*c){(void)c;}
 void nvn_vk_program_free(struct fd_program*p){(void)p;}
+// C4b：release_device 先停管线 worker（本夹具里 worker 从未启动，如实返回 0）。
+int nvn_vk_pipe_worker_stop(uint32_t b, char*w, size_t n){(void)b;(void)w;(void)n;return 0;}
 static void scenario(int dir, int uuid) {
     static struct s2a_vk_device dev;
     memset(destroyed,0,sizeof destroyed); memset(order,0,sizeof order); serial=0; writes=cache_gets=unmaps=unmap_order=0;

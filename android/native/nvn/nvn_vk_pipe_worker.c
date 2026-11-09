@@ -498,6 +498,55 @@ int nvn_vk_pipe_worker_take(struct nvk_pipe_job_result *out) {
     return 1;
 }
 
+int nvn_vk_pipe_worker_wait(const struct nvk_pipe_recipe *recipe, uint64_t device_generation,
+                            uint32_t deadline_ms, struct nvk_pipe_job_result *out) {
+    if (!recipe || !out) return -1;
+    memset(out, 0, sizeof *out);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += deadline_ms / 1000;
+    dl.tv_nsec += (long)(deadline_ms % 1000) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_mu);
+    for (;;) {
+        // 结果环里找本配方的同代际结果：命中即从环中取出，其余结果保持 FIFO 不动。
+        for (int i = 0; i < g_pw.rcount; i++) {
+            int idx = (g_pw.rhead + i) % NVK_PW_RESULTS;
+            struct nvk_pipe_job_result *r = &g_pw.results[idx];
+            if (r->device_generation == device_generation &&
+                nvk_pipe_recipe_match(&r->recipe, recipe)) {
+                *out = *r;
+                for (int k = i; k + 1 < g_pw.rcount; k++) {
+                    int from = (g_pw.rhead + k + 1) % NVK_PW_RESULTS;
+                    int to = (g_pw.rhead + k) % NVK_PW_RESULTS;
+                    g_pw.results[to] = g_pw.results[from];
+                    memset(&g_pw.results[from], 0, sizeof g_pw.results[from]);
+                }
+                g_pw.rcount--;
+                g_pw.stats.taken++;
+                pthread_mutex_unlock(&g_mu);
+                return 1;
+            }
+        }
+        // 证据检查：本配方还在队列或在途才算“在等的东西存在”，否则返回 -1 让 owner
+        // 不空等（提交被拒/结果环挤出/stop 清场都会造成无证据）。
+        int evidence = 0;
+        for (int i = 0; i < g_pw.qcount; i++) {
+            const struct nvk_queued_job *q = &g_pw.queue[(g_pw.qhead + i) % NVK_PW_QUEUE];
+            if (q->spec.device_generation == device_generation &&
+                nvk_pipe_recipe_match(&q->spec.recipe, recipe)) { evidence = 1; break; }
+        }
+        if (!evidence && g_pw.have_running && g_pw.running_generation == device_generation &&
+            nvk_pipe_recipe_match(&g_pw.running_recipe, recipe)) evidence = 1;
+        if (!evidence) { pthread_mutex_unlock(&g_mu); return -1; }
+        if (deadline_ms == 0 ||
+            pthread_cond_timedwait(&g_done_cv, &g_mu, &dl) == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_mu);
+            return 0;
+        }
+    }
+}
+
 void nvn_vk_pipe_worker_release(struct nvk_pipe_job_result *out) {
     if (!out) return;
     if (out->pipeline && out->device) vkDestroyPipeline(out->device, out->pipeline, NULL);

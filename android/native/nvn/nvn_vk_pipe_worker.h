@@ -119,6 +119,12 @@ int nvn_vk_pipe_worker_submit(const struct nvk_pipe_job_spec *spec, uint64_t *jo
 // owner 取结果：1 = 有结果（out->ok 可能为 0）；0 = 暂无；-1 = 参数错误。
 // 结果里的代际/配方仍须 owner 复核；不匹配时调 release 丢弃，不能装进自己的缓存。
 int nvn_vk_pipe_worker_take(struct nvk_pipe_job_result *out);
+// 按配方等待：1 = 取到该配方结果（同代际才转交；out->ok 可能为 0，why 写明原因）；
+// 0 = 该配方仍在队列/在途且 deadline 到；-1 = 该配方在队列/在途/结果环都没有任何证据
+// （提交被拒/结果已被挤掉/stop 清场：owner 不能空等，回同步创建或如实失败）。
+// 命中时把该条从结果环中取出（其余结果保持 FIFO 不动）。
+int nvn_vk_pipe_worker_wait(const struct nvk_pipe_recipe *recipe, uint64_t device_generation,
+                            uint32_t deadline_ms, struct nvk_pipe_job_result *out);
 // 丢弃/释放 owner 尚未安装的结果：销毁 pipeline 并清零。已安装的结果由 owner 自己管理。
 void nvn_vk_pipe_worker_release(struct nvk_pipe_job_result *out);
 // 有界 Stop：0 = worker 已退出并回收；1 = 仍在创建（未 join；迟到结果丢弃，下一次 Stop 回收）。
