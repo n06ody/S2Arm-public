@@ -13,7 +13,8 @@
   ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
     → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
   ⑩ 降级：原包 versionCode < 新包 → 还原 install -r -d；原包 > 新包 → 装测试包就带 -d；
-    降级能力不看 usage 文本——同版原包真走一遍 install -r -d，实测不可用 → 装新包前就拒跑
+    降级能力不看 usage 文本——装测试包方向真降级由 install -r -d 实测（失败不卸旧包）；
+    装回方向备份后同版原包做 flag 探针（只证 -d 被解析层收），真降级收局见分晓
   ⑪ 还原后数据 sha 与备份清单不符 → 留置
   ㉕ 数据保护硬门：目录三态探针（存在但进不去 = 报错拒跑，不当不存在）；备份/回灌两处
     tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后；
@@ -156,10 +157,20 @@ def run_as(cmdline):
                     blob = bytes.fromhex(files_[rel])
                     out(f"{file_sha(blob)}  {p}\\n{len(blob)}\\n"); return
         fail("sha256sum: " + p + ": No such file or directory")
-    m = _re.match(r"^if \\[ -e (\\S+) \\]; then", cmdline)
+    m = _re.match(r"^if \\[ -e (\\S+) \\]; then echo ok; else echo absent; fi$", cmdline)
     if m:
-        # 三态探针：存在但进不去 → denied（不能当不存在）
+        # [ -e ] 真义：父目录不可搜索时同样返回假——和「不存在」分不开（负对照用）
         dir_ = m.group(1)
+        if dir_ in st.get("data_parent_denied", {}) or dir_ in DATA_DENIED:
+            out("absent\\n"); return
+        out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS else "absent") + "\\n"); return
+    m = _re.match(r"^e=\\$\\(stat -c %F (\\S+) 2>&1\\); if", cmdline)
+    if m:
+        # 三态探针（stat 接 stderr 分 EACCES/ENOENT）：父目录不可搜索 → stat 拒 → denied；
+        # 自身进不去 → denied；真没有 → absent
+        dir_ = m.group(1)
+        if dir_ in st.get("data_parent_denied", {}):
+            out("denied\\n"); return
         if dir_ in DATA_DENIED:
             out("denied\\n"); return
         out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS or dir_ in DATA_LINKS
@@ -213,6 +224,10 @@ def run_as(cmdline):
             fail("run-as: tar: " + dir_ + ": Permission denied")
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tf:
+            # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
+            root_ = tarfile.TarInfo("./")
+            root_.type, root_.mode = tarfile.DIRTYPE, 0o775
+            tf.addfile(root_)
             for rel, (mode, ftype) in sorted(dir_entries(dir_).items()):
                 info = tarfile.TarInfo("./" + rel)
                 info.mode = int(mode, 8)
@@ -497,11 +512,12 @@ if cmd == "shell":
                                  if "Game startup accepted:" not in ln) + "\\n"
             out(dump); sys.exit(0)
         sys.exit(0)
-    if c == "if" and "[ -e" in text:
-        # external_dirs_gone 探针：存在+可读 → ls 内容；存在读不进 → __denied__
-        m = re.search(r"if \\[ -e (\\S+) \\]", text)
+    if text.startswith("e=$(stat -c %F"):
+        # external_dirs_gone 探针：存在+可读 → ls 内容；读不进/父目录不可搜索 → __denied__
+        m = re.search(r"stat -c %F (\\S+)", text)
         p = m.group(1).strip("'")
-        if st.get("ext_denied") and (p.endswith("/" + st["package"]) or st["package"] in p):
+        mine = p.endswith("/" + st["package"])
+        if mine and (st.get("ext_denied") or st.get("ext_parent_denied")):
             out("__denied__\\n"); sys.exit(0)
         if st.get("data_residue") and ("Android/data" in p or "Android/obb" in p):
             out("files\\n"); sys.exit(0)
@@ -849,6 +865,19 @@ class RunGameTest(unittest.TestCase):
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("installs", st, "备不了原数据就不该装新包")
 
+    def test_parent_denied_dir_refuses_before_backup(self):
+        """㉕ 父目录不可搜索：[ -e ] 假三态会报 absent 静默跳过（qa-fone 受限
+        父目录实测）——stat 接 stderr 后此类一律 denied → 拒跑。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_parent_denied"] = {priv: True}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("进不去", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
     def test_backup_archive_mismatch_refuses(self):
         """㉕ 备份归档解包核对不过（tar 比源清单多成员）→ 拒跑，不入局。"""
         state = self._data_state()
@@ -927,7 +956,7 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("读不进", man["reason"], man["reason"])
 
     def test_downgrade_restore_installs_with_dash_d(self):
-        """⑩ 原包 versionCode < 新包：装前实测 install -r -d（同版原包探针），
+        """⑩ 原包 versionCode < 新包：备份后同版原包做 install -r -d flag 探针
         收局装回原包必须带 -d。"""
         rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100),
                                      argv=["--allow-data-loss"], new_vc=300)
@@ -935,7 +964,7 @@ class RunGameTest(unittest.TestCase):
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertGreaterEqual(len(st["installs"]), 3)
         probe = st["installs"][0]
-        self.assertTrue(probe["apk"].endswith("orig.apk"), "降级能力用真 install -r -d 实测")
+        self.assertTrue(probe["apk"].endswith("orig.apk"), "装回方向备份后同版原包做 flag 探针")
         self.assertIn("-d", probe["flags"], "探针本身就是 install -r -d")
         test_install = next(i for i in st["installs"] if i["apk"].endswith("game.apk")
                             and "s2a-orig" not in i["apk"])
@@ -959,11 +988,8 @@ class RunGameTest(unittest.TestCase):
                                        argv=["--allow-data-loss"], new_vc=100)
         self.assertEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
-        probe = st["installs"][0]
-        self.assertTrue(probe["apk"].endswith("orig.apk"), "降级能力用真 install -r -d 实测")
-        self.assertIn("-d", probe["flags"])
-        test_install = next(i for i in st["installs"] if i["apk"].endswith("game.apk")
-                            and "s2a-orig" not in i["apk"])
+        test_install = st["installs"][0]
+        self.assertTrue(test_install["apk"].endswith("game.apk"), "fwd 方向真降级=装测试包本身")
         self.assertIn("-d", test_install["flags"], "装低 versionCode 测试包要 -d")
         self.assertNotIn("-d", st["installs"][-1]["flags"], "装回高 versionCode 原包不需要 -d")
 
