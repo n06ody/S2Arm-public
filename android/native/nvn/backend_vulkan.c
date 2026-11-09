@@ -522,8 +522,11 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     // #1199：BC 不再按 textureCompressionBC 一刀切——原生全有或缺的格式能走 compute 解码就算支持。
     if (f.textureCompressionBC || vk->dev->bc_decode_mask) c->caps |= NVN_GPU_CAP_TEX_BC;
     if (f.textureCompressionASTC_LDR) c->caps |= NVN_GPU_CAP_TEX_ASTC;
+    // B2：设备 advertise VK_GOOGLE_display_timing 才能报每帧实际上屏时刻；debug.s2a.display_timing=0
+    // 是计量门，不报「没有能力」——能力位如实反映设备，时刻取不到时按契约报 UNKNOWN。
+    if (vk->dev->has_display_timing) c->caps |= NVN_GPU_CAP_SHOWN_TIME;
     // HOST_IMPORT / GPU_VA / TILE_MEMORY / SAMP_MINMAX / LOD_BIAS / DEPTH_CLIP_CTL / GEOMETRY / TESSELLATION /
-    // XFB / INDIRECT_COUNT / LINKED_PIPE / GPU_DURATION / GPU_TIME_HOST / SHOWN_TIME / DYN_* / DESWIZZLE：
+    // XFB / INDIRECT_COUNT / LINKED_PIPE / GPU_DURATION / GPU_TIME_HOST / DYN_* / DESWIZZLE：
     // 本段没有实现或没实测生效，一律不置位（契约：后端不做近似）。
 
     if (d->caps_record && d->caps_record_bytes) {

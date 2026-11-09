@@ -49,6 +49,8 @@ struct s2a_vk_device {
     int has_ahb_import;
     int has_queue_family_foreign;   // 导入外部内存时当前队列族要能用，按规范与 AHB 成对启用
     int ahb_import_enabled;
+    // B2：VK_GOOGLE_display_timing——present 带 presentID、回读每帧实际上屏时刻。
+    int has_display_timing;
 };
 
 // 创建 instance/physical/device/queue/command pool。why 写 ASCII 原因。

@@ -256,6 +256,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     out->index_type_uint8_enabled = has_device_extension(out->physical, "VK_EXT_index_type_uint8") &&
                                     index_u8.indexTypeUint8 == VK_TRUE;
     if (out->index_type_uint8_enabled) device_ext[device_ext_count++] = "VK_EXT_index_type_uint8";
+    // B2：display_timing 只在驱动 advertise 时启用；是否挂 presentID 由 nvn_vk_display_timing 的门控。
+    out->has_display_timing = has_device_extension(out->physical, "VK_GOOGLE_display_timing");
+    if (out->has_display_timing) device_ext[device_ext_count++] = "VK_GOOGLE_display_timing";
     // 零拷贝可行性探测（只读，不改行为）：VK_EXT_external_memory_host 允许把一个 host 指针导入成 VkBuffer
     // 内存——这是把 guest 内存直接交给 GPU、免掉每笔 memcpy 的唯一合法路径（Metal 侧靠
     // newBufferWithBytesNoCopy 就做到了）。这里只查 advertise + 对齐要求；是否启用由调用方按属性决定。
