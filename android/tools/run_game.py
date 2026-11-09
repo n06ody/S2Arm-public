@@ -34,6 +34,8 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 安全边界：只经 adb 做 安装/启动/采集/截图——不重启、不刷机、不 root、不改系统设置。
 帧表：只写采集窗口 [起, 止) 内的 direct-present 帧——帧记录是 CLOCK_BOOTTIME，窗口边界取设备
 /proc/uptime 同一时钟；帧日志块按 logcat 行 PID 绑定当局游戏进程，别的进程的块不进表。
+私有证据：收局后、还原清私有目录前 run-as 拉回 host-*-<pid>-*.log 与原生直写
+frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
 import argparse, datetime, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time
@@ -301,6 +303,44 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
             "cover": cover, "rows": rows, "captures": len(caps)}
 
 
+PRIV_LOG_NAME = re.compile(r"^(?:host-\d+-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
+
+
+def collect_private_logs(d, pkg, pids, out, notes):
+    """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
+    （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
+    与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
+    文件名绑当局 PID，别局/别进程的不拉；run-as 只给 debuggable 包——拉不到记注
+    （证据缺 ≠ 还原失败）。必须在收局还原（pm clear/卸载清私有目录）前调用。
+    返回（落盘文件名列表, frame-log 原文列表）。"""
+    names, frame_texts = [], []
+    try:
+        found = d.run_as(pkg, f"find /data/data/{pkg} -type f -name '*.log'", timeout=60)
+    except (RuntimeError, subprocess.SubprocessError) as error:
+        notes.append(f"私有日志目录进不去（非 debuggable/包已卸）就没拉：{str(error)[:200]}")
+        return names, frame_texts
+    dest = out / "host_logs"
+    for path in sorted(ln.strip() for ln in found.splitlines() if ln.strip()):
+        m = PRIV_LOG_NAME.match(path.rsplit("/", 1)[-1])
+        pid = m and int(m.group(1) or m.group(2))
+        if not pid or pid not in pids:
+            continue
+        # exec-out 不经 pty：host 日志含 NUL，原始字节不被 \r\n 改写（同 run-as 备份）
+        r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
+                            f"cat {shlex.quote(path)}"], capture_output=True, timeout=300)
+        if r.returncode:
+            notes.append(f"私有日志 {path} 拉取失败 rc={r.returncode}："
+                         f"{r.stderr.decode(errors='replace')[:160]}")
+            continue
+        dest.mkdir(exist_ok=True)
+        name = path.rsplit("/", 1)[-1]
+        (dest / name).write_bytes(r.stdout)
+        names.append(name)
+        if name.startswith("frame-log-"):
+            frame_texts.append(r.stdout.decode(errors="replace"))
+    return names, frame_texts
+
+
 def external_dirs_gone(d, pkg):
     """卸载后 /sdcard/Android/data|obb/<pkg> 应随删；逐项验不存在。"""
     fails = []
@@ -496,6 +536,7 @@ def main(argv=None):
     props_prev = {}
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
+    pids, priv_done = {}, False
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -755,6 +796,12 @@ def main(argv=None):
                 break
             time.sleep(0.5)
 
+        # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
+        # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
+        priv_names, priv_frames = collect_private_logs(d, pkg, pids, out, notes)
+        manifest["private_logs"] = priv_names
+        priv_done = True
+
         # ---- 归置产物 ----
         if logcat_proc:
             logcat_proc.terminate()
@@ -772,17 +819,23 @@ def main(argv=None):
 
         direct = "direct provider prepared" in (logcat + dump)
         caps, seen = [], set()
+
+        def collect_caps(text, **kw):
+            for block in frame_log_blocks(text, **kw):
+                try:
+                    for cap in direct_framelog.parse(block):
+                        key = (cap["meta"]["first"], cap["meta"]["recorded"], len(cap["ts"]))
+                        if key not in seen:
+                            seen.add(key)
+                            caps.append(cap)
+                except direct_framelog.FrameLogError as error:
+                    notes.append(f"帧日志块截断/不完整被弃（整段未证）：{str(error)[:500]}")
+
         if pids:
             for text in (logcat, dump):
-                for block in frame_log_blocks(text, pids=pids):
-                    try:
-                        for cap in direct_framelog.parse(block):
-                            key = (cap["meta"]["first"], cap["meta"]["recorded"], len(cap["ts"]))
-                            if key not in seen:
-                                seen.add(key)
-                                caps.append(cap)
-                    except direct_framelog.FrameLogError as error:
-                        notes.append(f"帧日志块截断/不完整被弃（整段未证）：{str(error)[:500]}")
+                collect_caps(text, pids=pids)
+            for text in priv_frames:  # 私有帧文件按文件名绑 PID（行无 logcat 前缀）
+                collect_caps(text)
         if not direct:
             notes.append("logcat 没有「direct provider prepared」：非直连 provider（SurfaceFlinger 路），"
                          "帧表不写帧（direct present 与 SF 时序不混算）")
@@ -848,6 +901,12 @@ def main(argv=None):
                     fails.append("游戏进程在收局后仍存活")
             except (RuntimeError, subprocess.SubprocessError) as error:
                 fails.append(f"收局确认 adb 异常：{error}")
+        if launched and not priv_done:
+            try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
+                manifest["private_logs"], _ = collect_private_logs(d, pkg, pids, out, notes)
+                priv_done = True
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
         try:
             for key, prev in props_prev.items():
                 d.shell(f"setprop {key} {shlex.quote(prev)}", allowed=(0, 1))
