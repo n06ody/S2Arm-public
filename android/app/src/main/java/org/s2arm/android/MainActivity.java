@@ -120,9 +120,20 @@ public class MainActivity extends Activity
                 getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, gameBackCallback);
             }
-            // A5 读数落 logcat（采集的 logcat.txt）：有效净放电报 W，其余每秒一行 unavailable。
-            powerSampler = new SystemPowerSampler(this, lifecycleProbe, watts -> Log.i("S2Arm",
-                "battery-discharge-watts=" + (Double.isNaN(watts) ? "unavailable" : String.format(java.util.Locale.ROOT, "%.3f", watts))));
+            // A5/#163 读数落 logcat（采集的 logcat.txt）：有效净放电报 W，其余每秒一行
+            // unavailable；rails 是 Android 15+ 的 CPU/GPU 轨功耗（插电也可读），event 是
+            // 低频原始值行（保留电流原号，供真机对账）。
+            powerSampler = new SystemPowerSampler(this, lifecycleProbe, new SystemPowerSampler.Sink() {
+                @Override public void battery(double watts) {
+                    Log.i("S2Arm", "battery-discharge-watts=" + (Double.isNaN(watts)
+                        ? "unavailable" : String.format(java.util.Locale.ROOT, "%.3f", watts)));
+                }
+                @Override public void rails(double watts) {
+                    Log.i("S2Arm", "power-rails-watts=" + (Double.isNaN(watts)
+                        ? "unavailable" : String.format(java.util.Locale.ROOT, "%.3f", watts)));
+                }
+                @Override public void event(String line) { Log.i("S2Arm", line); }
+            });
         }
         if (!gameMode) {
             String packageTitle;
