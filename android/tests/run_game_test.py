@@ -11,7 +11,7 @@
   ⑧ 能耗：放电状态/符号/覆盖按 android_power 口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
 """
-import base64, hashlib, importlib.util, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -362,6 +362,21 @@ class RunGameTest(unittest.TestCase):
         self.run_tool(argv=["--mode", "direct"], state={})
         meta = json.loads((self.tmp / "out_1" / "android.json").read_text())
         self.assertIn("--es s2arm.graphics_mode direct", meta["launch"])
+
+    def test_debug_env_extra_reaches_launch(self):
+        """s2arm.debug_env 的值自带 =（S2A_KEY=VALUE）：放行并进启动行；非法值拒绝。"""
+        self.run_tool(argv=["--extra", "s2arm.debug_env=S2A_DEBUG_CAPACITY_AFFINITY=0"], state={})
+        meta = json.loads((self.tmp / "out_1" / "android.json").read_text())
+        self.assertIn("--es s2arm.debug_env S2A_DEBUG_CAPACITY_AFFINITY=0", meta["launch"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("s2arm.debug_env S2A_DEBUG_CAPACITY_AFFINITY=0", st["launch_cmd"])
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            run_game.main(["--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
+                           "--out", str(self.tmp / "bad_out"), "--seconds", "1",
+                           "--adb", "adb", "--lock-root", str(self.lock_root),
+                           "--extra", "s2arm.debug_env=not-s2a-key=0"])
+        self.assertIn("S2A_KEY=VALUE", err.getvalue())
 
     def _qc_energy(self, tsv):
         """最小局目录只给 power.tsv / android.json，单独验能耗判据。"""
