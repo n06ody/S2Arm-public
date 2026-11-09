@@ -185,9 +185,12 @@ def verify_pushed_tree(adb, dev_dir, local_root, log):
     log(f'设备端资源逐文件 SHA 核对通过（{len(actual)} 文件）')
 
 
-def push_via_tar(adb, resources, dst, timeout, log):
-    """小文件密集路径：本地打 tar → 单文件 adb push → 设备端解开 → 逐文件 SHA 核对。"""
-    tmp = Path(tempfile.mkdtemp(prefix='s2a-res-')) / 'resources.tar'
+def push_via_tar(adb, resources, dst, timeout, log, work):
+    """小文件密集路径：本地打 tar → 单文件 adb push → 设备端解开 → 逐文件 SHA 核对。
+    tar 落 work（本次 out/deploy 下）——不进系统临时目录（qa-fone：原包/打包
+    中间产物都归 out 保留策略管）。"""
+    work.mkdir(parents=True, exist_ok=True)
+    tmp = Path(work) / 'resources.tar'
     # macOS bsdtar 会把 ._*/.DS_Store AppleDouble 合成进归档；设备解开后对不上清单
     env = dict(os.environ, COPYFILE_DISABLE='1')
     subprocess.run(['tar', '-cf', str(tmp), '--exclude', '._*', '--exclude', '.DS_Store',
@@ -198,6 +201,7 @@ def push_via_tar(adb, resources, dst, timeout, log):
     adb.shell('tar', '-xf', dst + '.tar', '-C', dst)
     adb.shell('rm', '-f', dst + '.tar')
     verify_pushed_tree(adb, dst, resources, log)
+    tmp.unlink()                                  # 核对过：推送 tar 是再生材料
 
 
 def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_timeout=None,
@@ -235,7 +239,7 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
             why = '强制 --push-tar' if push_tar else f'文件数 ≥{PUSH_TAR_MIN_FILES}'
             log(f'资源树 {nfiles} 文件（{why}）：走 tar 单推 + 设备端解开'
                 f'（超时 {est}s，按字节+文件数估）')
-            push_via_tar(adb, resources, pending, est, log)
+            push_via_tar(adb, resources, pending, est, log, work)
         else:
             log(f'资源树 {nfiles} 文件整树推送（超时 {est}s，按字节+文件数估）')
             push_tree(adb, resources, pending, est, log)
