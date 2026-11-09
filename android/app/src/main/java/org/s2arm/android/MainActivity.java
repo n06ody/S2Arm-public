@@ -2,6 +2,7 @@ package org.s2arm.android;
 
 import android.app.Activity;
 import java.io.File;
+import android.content.ComponentCallbacks2;
 import android.graphics.Color;
 import android.hardware.input.InputManager;
 import android.os.Build;
@@ -38,6 +39,7 @@ public class MainActivity extends Activity
     private GameLibrary library;   // installed game packages (import + verification)
     private HostKeyboard hostKeyboard;
     private LegacyTextInput legacyTextInput;
+    private DguardNotice dguardNotice;
     private FrameRateOverlay frameRate;
     private TextView games;
     private boolean gameMode;
@@ -72,6 +74,19 @@ public class MainActivity extends Activity
     private long lastLifecyclePresent;
     private final Runnable lifecycleSample = this::sampleLifecyclePresent;
     private SystemPowerSampler powerSampler;   // #48 A5：应用内电池净放电读数（仅游戏局）
+    // 存档不能原子提交的提示（与 iOS dprompt 每秒轮询同一判定，文案口径同 S2A_DPROMPT_SAVE_ATOMIC_*；
+    // spec 检查只认共用头里的宏，安卓的展示件是 Toast 不是提示条）
+    private static final String SAVE_ATOMIC_NOTICE =
+        "存档提醒：当前存储不能安全保存：保存过程中强退，可能留下写了一半的存档。请等游戏存完再退出。";
+    private final android.os.Handler saveAtomicProbe = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable saveAtomicSample = new Runnable() {
+        @Override public void run() {
+            if (!gameMode || gameStopping || !runtimeLoaded) return;
+            if (NativeBridge.pollSaveAtomic() != 0)
+                android.widget.Toast.makeText(MainActivity.this, SAVE_ATOMIC_NOTICE, android.widget.Toast.LENGTH_LONG).show();
+            saveAtomicProbe.postDelayed(this, 1000);
+        }
+    };
     private android.window.OnBackInvokedCallback gameBackCallback;
     /** #48 A3+A4：直连刷新率投票 + 省电档限帧；只有 :game 会话（gameMode）才起轮询。 */
     private SystemTuning systemTuning;
@@ -213,6 +228,7 @@ public class MainActivity extends Activity
         if (gameMode) gameAudioFocus = new GameAudioFocus(this, NativeBridge::setAudioOutputAllowed);
         hostKeyboard = new HostKeyboard(this);
         legacyTextInput = new LegacyTextInput(this);
+        dguardNotice = new DguardNotice(this);
         applyGameWindow();
         library = new GameLibrary(getApplicationContext(), new GameLibrary.Listener() {
             @Override public void onStatus(String text) { runOnUiThread(() -> {
@@ -514,6 +530,8 @@ public class MainActivity extends Activity
                 gates[i] = module.gates; widen[i] = module.widen;
             }
             configureCapProbe();
+            // 直连安全网的宿主标识：dguard 记录按（程序号、出包指纹、宿主版本）认包，换宿主从 0 数
+            NativeBridge.setHostBuild(BuildConfig.VERSION_NAME);
             int rc = NativeBridge.startGame(host, getAssets(), frozen.assetRoot,
                 names, images, fixups, gates, widen, frozen.npdmPath,
                 frozen.revisionDir, frozen.stateDir, frozen.programId,
@@ -526,6 +544,7 @@ public class MainActivity extends Activity
                 Log.d("S2ArmBootTiming", "phase=ready_to_accepted ns="
                     + (System.nanoTime() - gameSession.bootTiming.readyNanos));
             gameLifecycle("started");
+            saveAtomicProbe.postDelayed(saveAtomicSample, 1000);   // 存档原子提交判定（共用 direct_prompt.c）
             panel.setVisibility(android.view.View.GONE);
         } catch (java.io.IOException | RuntimeException | LinkageError error) {
             Log.e("S2Arm", "Game startup failed", error);
@@ -540,6 +559,7 @@ public class MainActivity extends Activity
     private void stopGame(String why, boolean normal) {
         if (!gameMode || gameStopping) return;
         gameStopping = true;
+        saveAtomicProbe.removeCallbacks(saveAtomicSample);
         if (gameAudioFocus != null) gameAudioFocus.pause();
         try { GameResume.clear(getCacheDir()); }
         catch (java.io.IOException error) { Log.e("S2Arm", "Cannot retire active session receipt", error); }
@@ -579,6 +599,7 @@ public class MainActivity extends Activity
         if (gameMode && !gameStopping && gameAudioFocus != null) gameAudioFocus.resume();
         hostKeyboard.resume();
         legacyTextInput.resume();
+        dguardNotice.resume();
         frameRate.setResumed(true);
         current = this;
         applyGameWindow();
@@ -607,6 +628,7 @@ public class MainActivity extends Activity
         resumed = false;
         if (gameAudioFocus != null) gameAudioFocus.pause();
         if (legacyTextInput != null) legacyTextInput.pause();
+        if (dguardNotice != null) dguardNotice.pause();
         lifecycleProbe.removeCallbacks(lifecycleSample);
         if (runtimeLoaded) {
             clearInput();
@@ -618,6 +640,20 @@ public class MainActivity extends Activity
         if (systemTuning != null) systemTuning.stop();
         if (powerSampler != null) powerSampler.stop();
         super.onPause();
+    }
+    // 直连安全网（共用 dguard.c）：游戏前台跑时收到内存告警记一次失败证据（后台被杀不算崩；
+    // 进后台停表在 setForeground 那侧）。RUNNING_LOW/CRITICAL = 前台可见压力，MODERATE 太常见不计。
+    private void dguardMemoryWarning() {
+        if (gameMode && gameSession != null && runtimeLoaded) NativeBridge.memoryWarning();
+    }
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+                || level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) dguardMemoryWarning();
+    }
+    @Override public void onLowMemory() {
+        super.onLowMemory();
+        dguardMemoryWarning();   // 旧接口仍可能派到前台告警，同一条证据
     }
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
         super.onActivityResult(request, result, data);
@@ -859,6 +895,7 @@ public class MainActivity extends Activity
         if (frameRate != null) frameRate.setResumed(false);
         if (hostKeyboard != null) hostKeyboard.pause();
         if (legacyTextInput != null) legacyTextInput.pause();
+        if (dguardNotice != null) dguardNotice.pause();
         if (host != 0) touchPad.setGameTouchEnabled(false);
         NativeBridge.clearStopListener(this);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(this);
@@ -1135,5 +1172,17 @@ public class MainActivity extends Activity
         String result = activity.legacyTextInput.request(title, initial, maxChars);
         Log.i("S2Arm", "Legacy keyboard completed elapsed_ms=" + (System.nanoTime() - started) / 1_000_000 + " accepted=" + (result != null));
         return result;
+    }
+
+    /**
+     * 直连安全网提示（native s2a_android_dguard_prompt 经 JNI 进这里）：游戏线程阻塞，
+     * DguardNotice 弹页等到玩家选「仍然启动」。没有前台 Activity / 主线程被调时直接返回
+     * ——同 iOS 提示出口拿不到窗口时记日志照走的口径（提示是提醒不是闸门）。
+     */
+    static void dguardPrompt(String diag) {
+        final MainActivity activity = current;
+        if (activity == null || activity.dguardNotice == null) { Log.i("S2Arm", "dguard prompt dropped: no foreground activity"); return; }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return;
+        activity.dguardNotice.show(diag);
     }
 }

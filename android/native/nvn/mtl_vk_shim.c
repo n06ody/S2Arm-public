@@ -783,6 +783,13 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     uint64_t present_ns = shim_now_ns() - t_present;
     uint64_t n = ++g_present_n;
+    // 每上一帧调一次共用 ap_host 的上屏出口：内部一次带上 dguard 帧证据、停住看门、HUD
+    // 与帧计数全套（同 iOS dm_guest_frame_tick 的口径）。ap_host.c 只在游戏目标里，
+    // 独立直连探针没链就跳过。
+    {
+        extern void s2a_frame_presented(void) __attribute__((weak));
+        if (s2a_frame_presented) s2a_frame_presented();
+    }
     if (n == 1) info("mtl_present: first frame presented (nvn_vk backend, tex %ux%u)",
                      t ? (unsigned)t->d.width : 0u, t ? (unsigned)t->d.height : 0u);
     struct timespec ts;

@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "host_android.h"
+#include "../dguard_android.h"
 #include "../direct/graphics.h"
 #include "../direct/json.h"
 #include "../direct/selection.h"
@@ -182,6 +183,12 @@ static int run_common(const struct s2a_android_runtime_request *r,
             services_v2->graphics = &frozen->table;
             services_v2->graphics_mode = 1;
             frozen_direct = 1;
+            // 直连安全网（共用 dguard.c，接口 dguard_android.h）：NVN 直连已提交、客体代码
+            // 还没跑——武装点与 iOS host_main 的 begin/arm 时机一致。满限 + 无人值守收局，
+            // 有人局提示后照常武装继续；debug.s2a.dguard=0 整局不武装（launch 里判）。
+            int dg = s2a_android_dguard_launch(r->program_id, r->services.game_data_dir, frozen->table.version);
+            if (dg) return failed(S2A_RUNTIME_DIRECT, dg,
+                "direct safety guard stopped unattended launch (consecutive failures at limit)");
         } else {
             services_v2->graphics = NULL;
             services_v2->graphics_mode = 0;
