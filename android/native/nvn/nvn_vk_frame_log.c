@@ -101,9 +101,17 @@ void s2a_fl_dump(const struct s2a_frame_log *fl, void (*emit)(void *ctx, const c
     const uint64_t b64len = ((bytes + 2) / 3) * 4;
     const unsigned chunks = (unsigned)((b64len + S2A_FL_CHUNK - 1) / S2A_FL_CHUNK);
     char line[800];
+    // Android：本局身份同 host 首行——运行器 setprop debug.s2a.session_uuid，写进 meta
+    // 行尾（v=3 向后兼容：解析器非锚定，尾部字段可缺）。没置上 → uuid=-（取证端 unproven）。
+    char uuid_tail[128] = "";
+#if defined(__ANDROID__)
+    char uuid[PROP_VALUE_MAX];
+    if (__system_property_get("debug.s2a.session_uuid", uuid) <= 0) strcpy(uuid, "-");
+    snprintf(uuid_tail, sizeof uuid_tail, " uuid=%s", uuid);
+#endif
     snprintf(line, sizeof line,
              "direct frame-log meta: v=3 clock=%s unit=us endian=le rec=%u cap=%u recorded=%llu "
-             "presents=%llu dropped=%llu first=%llu bytes=%llu chunks=%u",
+             "presents=%llu dropped=%llu first=%llu bytes=%llu chunks=%u%s",
 #if defined(CLOCK_BOOTTIME)
              "CLOCK_BOOTTIME",
 #else
@@ -111,7 +119,7 @@ void s2a_fl_dump(const struct s2a_frame_log *fl, void (*emit)(void *ctx, const c
 #endif
              S2A_FL_REC_BYTES, S2A_FL_CAP, (unsigned long long)kept, (unsigned long long)fl->seq,
              (unsigned long long)fl->dropped, (unsigned long long)(fl->seq - kept),
-             (unsigned long long)bytes, chunks);
+             (unsigned long long)bytes, chunks, uuid_tail);
     emit(ctx, line);
 
     // 流式编码：逻辑载荷按 4 KB 分块取出（不堆整段），同一块喂 sha256 与 base64；
