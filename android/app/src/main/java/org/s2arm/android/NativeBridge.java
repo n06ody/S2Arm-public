@@ -185,6 +185,16 @@ final class NativeBridge {
     /** 运行中切掌机 / 主机（接口 v2.15，会话在跑才调）：0=已应用；<0=宿主拒绝。 */
     static native int setConsoleMode(long host, int mode);
     /**
+     * #48 A4：系统省电档限帧开关写进原生直连 present 路径（native/system_tuning.c）。
+     * Java 轮询 GameManager.getGameMode() 后调用；任意线程，不等待。
+     */
+    static native void setBatteryCap(boolean enabled);
+    /**
+     * #48 A3：直连 present_period 最近一次登记的最终周期（纳秒，含省电档上限）；
+     * 0 = 还没上过屏或无上限路径。刷新率投票的真实来源，不是测得的 FPS。任意线程。
+     */
+    static native long presentPeriodNs();
+    /**
      * surfaceDestroyed only: returns once the render thread no longer uses the surface. Bounded:
      * if the render thread misses the deadline the process aborts instead of returning.
      */

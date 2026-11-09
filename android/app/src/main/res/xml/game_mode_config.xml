@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- #48 A4：声明不支持 Game Mode 自管优化——OEM 厂商干预保留生效（声明支持会让平台重置厂商干预）。
+     系统省电档仍经 GameManager.getGameMode() 读到（AOSP：模式存取不看 supports 标记），
+     直连侧据此对 present 周期取 max(原周期, 33.3 ms)。厂商 SDK 未实现。 -->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsBatteryGameMode="false"
+    android:supportsPerformanceGameMode="false" />

@@ -9,6 +9,7 @@
 #include "capture_jpeg.h"
 #include "debug_environment.h"
 #include "debug_gate.h"
+#include "system_tuning.h"
 #include "capacity_affinity.h"
 #include "adpf_hint.h"
 #include "aaudio_sink.h"
@@ -1323,6 +1324,15 @@ Java_org_s2arm_android_NativeBridge_setConsoleMode(JNIEnv *, jclass, jlong handl
     const s2a_host_api_v1 *api = s2a_host_get();
     if (!api || !api->display || !api->display->set_console_mode) return -1;
     return api->display->set_console_mode(api->host, static_cast<uint32_t>(mode));
+}
+// #48 A4/A3（system_tuning.c）：省电档开关与直连 present 周期登记值，都不需宿主句柄。
+extern "C" JNIEXPORT void JNICALL
+Java_org_s2arm_android_NativeBridge_setBatteryCap(JNIEnv *, jclass, jboolean enabled) {
+    s2a_android_set_battery_limit(enabled != JNI_FALSE);
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_s2arm_android_NativeBridge_presentPeriodNs(JNIEnv *, jclass) {
+    return static_cast<jlong>(s2a_android_present_ns());
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_s2arm_android_NativeBridge_releaseSurface(JNIEnv *env, jclass, jlong handle) {
