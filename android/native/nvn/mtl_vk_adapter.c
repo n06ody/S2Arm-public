@@ -669,7 +669,7 @@ int s2a_vk_adapter_attach_window_budget(ANativeWindow *window, uint64_t generati
 int s2a_vk_adapter_buffer_geometry(uint32_t *w, uint32_t *h) {
     pthread_mutex_lock(&g_mu);
     int on = g_ready && g_session.has_window && g_session.swapchain.buf_geometry &&
-             g_session.swapchain.ready;
+             !g_session.swapchain.geometry_failed && g_session.swapchain.ready;
     uint32_t ew = on ? g_session.swapchain.extent.width : 0;
     uint32_t eh = on ? g_session.swapchain.extent.height : 0;
     pthread_mutex_unlock(&g_mu);

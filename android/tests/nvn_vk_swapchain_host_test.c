@@ -29,12 +29,14 @@ static int32_t g_window_w = 100, g_window_h = 50;
 int32_t ANativeWindow_getWidth(ANativeWindow *window) { (void)window; return g_window_w; }
 int32_t ANativeWindow_getHeight(ANativeWindow *window) { (void)window; return g_window_h; }
 // B3：记录每次缓冲尺寸请求；真实语义——之后 getWidth/getHeight 报告缓冲尺寸。
+// g_geo_apply=0 模拟平台不兑现：调用返回 0 但缓冲尺寸不变。
 static int g_geo_calls;
+static int g_geo_apply = 1;
 static int32_t g_geo_w, g_geo_h, g_geo_fmt;
 int32_t ANativeWindow_setBuffersGeometry(ANativeWindow *window, int32_t w, int32_t h, int32_t format) {
     (void)window;
     g_geo_calls++; g_geo_w = w; g_geo_h = h; g_geo_fmt = format;
-    g_window_w = w; g_window_h = h;
+    if (g_geo_apply) { g_window_w = w; g_window_h = h; }
     return 0;
 }
 
@@ -118,7 +120,7 @@ static void fake_reset(void) {
     g_revoke_on_present = 0;
     memset(&g_last_blit, 0, sizeof g_last_blit);
     g_window_w = 100; g_window_h = 50;
-    g_geo_calls = 0; g_geo_w = g_geo_h = g_geo_fmt = 0;
+    g_geo_calls = 0; g_geo_apply = 1; g_geo_w = g_geo_h = g_geo_fmt = 0;
     g_prop_count = 0;
 }
 
@@ -705,6 +707,36 @@ int main(void) {
               "a different crop rebuilds the buffer to the new output size");
         CHECK(g_sc.extent.width == 80 && g_sc.extent.height == 45, "extent follows the crop");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == 0, "geometry fixture cleanly retires");
+    }
+    s2a_android_game_touch_revoke();
+
+    // B3 降级：setBuffersGeometry 返回 0 但缓冲尺寸没动（平台不兑现）→ 不付销毁重建的代价、
+    //     不重试，extent 留在窗口尺寸，之后按普通等比 blit 出图；触摸按缓冲像素发布。
+    s2a_android_game_touch_revoke();
+    fake_reset();
+    fake_set_property("debug.s2a.buffer_geometry", "1");
+    if (create_swapchain_keep(1) == 0) {
+        g_present_fence_signal_on_present = 1;
+        g_geo_apply = 0;
+        g_sc.touch_generation = 61; s2a_android_game_touch_offer(61);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        CHECK(rc == 0, "unhonored geometry still presents rc=%d (%s)", rc, why);
+        CHECK(g_geo_calls == 1 && g_destroyed_swapchains == 0,
+              "unhonored geometry: one request, no swapchain churn");
+        CHECK(g_sc.extent.width == 100 && g_sc.extent.height == 50,
+              "unhonored geometry keeps the frame-size extent");
+        CHECK(g_sc.buf_geometry && g_sc.geometry_failed, "degrade is marked, not retried silently");
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        CHECK(rc == 0 && g_geo_calls == 1 && g_destroyed_swapchains == 0,
+              "unhonored geometry does not retry rebuild per frame");
+        CHECK(g_last_blit.dstOffsets[0].x == 5 && g_last_blit.dstOffsets[0].y == 0 &&
+              g_last_blit.dstOffsets[1].x == 94 && g_last_blit.dstOffsets[1].y == 50,
+              "unhonored geometry falls back to the aspect-fit blit");
+        int64_t vp[8] = {0};
+        CHECK(s2a_android_game_touch_viewport_read(vp) == 0 && vp[0] == 61 &&
+              vp[2] == 5 && vp[3] == 0 && vp[4] == 89 && vp[5] == 50 && vp[6] == 100 && vp[7] == 50,
+              "degraded touch viewport publishes the blit rect in buffer pixels");
+        CHECK(nvn_vk_swapchain_destroy(&g_sc) == 0, "degraded fixture cleanly retires");
     }
     s2a_android_game_touch_revoke();
 

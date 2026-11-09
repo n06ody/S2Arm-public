@@ -585,10 +585,11 @@ static void publish_touch(const struct nvn_vk_swapchain *sc, uint64_t epoch,
     uint64_t diff = a > b ? a - b : b - a;
     int standard = diff * 1000 < (uint64_t)crop_h * 9;
     int bw = (int)sc->extent.width, bh = (int)sc->extent.height;
-    if (sc->buf_geometry && sc->frame_width && sc->frame_height) {
+    if (sc->buf_geometry && !sc->geometry_failed && sc->frame_width && sc->frame_height) {
         // B3：缓冲=游戏输出尺寸，整幅被合成器放大到 view frame；Java 把 view 布成同比例
         // 居中矩形，画面区 = 整个 view。触摸矩形与 buffer 尺寸都按 view frame 像素发布
-        // （TouchPadView 被布成同一个矩形，两侧像素空间一致）。
+        // （TouchPadView 被布成同一个矩形，两侧像素空间一致）。缓冲尺寸没兑现的降级
+        // 交换链走下面缓冲像素路径，与 blit 同一坐标系。
         x = 0; y = 0;
         width = sc->frame_width; height = sc->frame_height;
         bw = (int)sc->frame_width; bh = (int)sc->frame_height;
@@ -598,6 +599,8 @@ static void publish_touch(const struct nvn_vk_swapchain *sc, uint64_t epoch,
 }
 
 // B3：把窗口缓冲改成游戏输出尺寸，SurfaceFlinger/显示硬件把它放大到 view frame。
+// 先改缓冲尺寸并核对 getWidth/getHeight 真变了再付销毁+重建的代价：返回 0 但缓冲尺寸没动
+// （平台没兑现）时记 geometry_failed 退回普通等比 blit，不能每帧销毁重建。
 // 旧交换链按正常退休合同销毁（present fence 未证明就失败），新交换链建在改过的缓冲上，
 // extent=输出尺寸，present 里的等比 blit 退化成 1:1 拷贝。
 static int geometry_resize(struct nvn_vk_swapchain *sc, uint32_t w, uint32_t h, char *why, size_t why_size) {
@@ -605,15 +608,33 @@ static int geometry_resize(struct nvn_vk_swapchain *sc, uint32_t w, uint32_t h, 
     struct s2a_vk_device *d = sc->d;
     uint32_t fw = sc->frame_width, fh = sc->frame_height;
     uint64_t tg = sc->touch_generation;
-    if (nvn_vk_swapchain_destroy(sc))
-        return fail(why, why_size, "buffer geometry resize: previous swapchain has no retirement proof");
-    // format=0 保留现有像素格式；这之后 ANativeWindow_getWidth/getHeight 报告的是缓冲尺寸。
+    // format=0 保留现有像素格式；兑现后 ANativeWindow_getWidth/getHeight 报告的是缓冲尺寸。
     if (ANativeWindow_setBuffersGeometry(window, (int32_t)w, (int32_t)h, 0) != 0)
         return fail(why, why_size, "ANativeWindow_setBuffersGeometry failed");
+    if (ANativeWindow_getWidth(window) != (int32_t)w || ANativeWindow_getHeight(window) != (int32_t)h) {
+        sc->geometry_failed = 1;
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm",
+            "buffer geometry: setBuffersGeometry accepted but buffer size is %dx%d, not %ux%u — "
+            "platform did not honor it; staying on the aspect-fit blit for this swapchain",
+            (int)ANativeWindow_getWidth(window), (int)ANativeWindow_getHeight(window), w, h);
+        return 0;
+    }
+    if (nvn_vk_swapchain_destroy(sc))
+        return fail(why, why_size, "buffer geometry resize: previous swapchain has no retirement proof");
     if (nvn_vk_swapchain_create(sc, d, window, why, why_size)) return -1;
     // create 重新 memset：窗口像素与 WSI generation 不属于某一条交换链，交还原值。
     sc->frame_width = fw; sc->frame_height = fh;
     sc->touch_generation = tg;
+    if (sc->extent.width != w || sc->extent.height != h) {
+        // 驱动按 surface min/max 夹取后 extent 不等于缓冲尺寸：缓冲已改但交换链到不了输出尺寸，
+        // 同样降级（继续按 extent 等比 blit，不再重试）。
+        sc->geometry_failed = 1;
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm",
+            "buffer geometry: swapchain extent clamped to %ux%u, not %ux%u — "
+            "staying on the aspect-fit blit for this swapchain",
+            sc->extent.width, sc->extent.height, w, h);
+        return 0;
+    }
     __android_log_print(ANDROID_LOG_INFO, "S2Arm",
         "buffer geometry: buffer=%ux%u (game output) frame=%ux%u — compositor/display upscales",
         sc->extent.width, sc->extent.height, fw, fh);
@@ -644,7 +665,7 @@ int nvn_vk_swapchain_present_image(struct nvn_vk_swapchain *sc, VkImage src, VkF
         crop_x = (uint32_t)crop[0]; crop_y = (uint32_t)crop[1];
         crop_w = (uint32_t)crop[2]; crop_h = (uint32_t)crop[3];
     }
-    if (sc->buf_geometry && sc->window &&
+    if (sc->buf_geometry && !sc->geometry_failed && sc->window &&
         (sc->extent.width != crop_w || sc->extent.height != crop_h)) {
         int gr = geometry_resize(sc, crop_w, crop_h, why, why_size);
         if (gr) return gr;

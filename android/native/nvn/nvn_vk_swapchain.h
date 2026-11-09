@@ -31,6 +31,9 @@ struct nvn_vk_swapchain {
     // 不能再拿它当窗口像素用——view 尺寸由 Java 布成同比例居中，窗口像素只在这里记一次。
     ANativeWindow *window;
     int buf_geometry;
+    // setBuffersGeometry 没被兑现（调用成功但缓冲尺寸/夹取后的 extent 不是游戏输出尺寸）：
+    // 停止按输出尺寸重建，本交换链退回普通等比 blit；create 的 memset 清零，下条交换链重试一次。
+    int geometry_failed;
     uint32_t frame_width, frame_height;
     uint32_t image_count;
     VkImage images[8];
