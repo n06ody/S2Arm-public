@@ -20,7 +20,7 @@ pack/pack.py writes the same format but clones files with macOS clonefile; this 
 Rewriting uses the shared host C CLI (pack/rewriter.py); the Python rewriter was removed 10-31.
 Game files, keys and firmware never go into the repository: packages are built from the
 player's own dumps (pack/nx_unpack) and stay outside it."""
-import argparse, datetime, glob, hashlib, importlib.util, json, os, re, shutil, struct, subprocess, sys, tempfile
+import argparse, datetime, hashlib, importlib.util, json, os, re, shutil, struct, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -468,8 +468,10 @@ def write_artifact(out, index_sha, files, total, graphics=None):
     # modules 顺序 = 装载顺序（BootContract → load_modules_from_source → loader.c 全局符号解析），按 Horizon 序写：
     # main → subsdk0..N（数字序）→ sdk；字母序会让 subsdk 里和 sdk 重名的符号错绑到 sdk。
     modules = []
-    for name in load_order(os.path.basename(p)[:-len('.patched.bin')]
-                           for p in glob.glob(os.path.join(out, 'modules', '*.patched.bin'))):
+    # Path.glob 只把 pattern 段当模式、基路径按字面量走：out 带 [ ] 等元字符时
+    # glob.glob(join(out, …)) 会把目录名当字符类 → 静默零匹配 → modules:[] 出包（qa-169163 实测）。
+    for name in load_order(p.name[:-len('.patched.bin')]
+                           for p in Path(out, 'modules').glob('*.patched.bin')):
         h = validate_module(os.path.join(out, 'modules'), name)
         m = {'name': name, 'source': 'revision', 'image': f'modules/{name}.patched.bin',
              'fixups': f'modules/{name}.fixups.tsv', 'gates': f'modules/{name}.gates.tsv', 'target': 'android'}

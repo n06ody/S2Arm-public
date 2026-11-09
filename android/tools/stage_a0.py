@@ -16,12 +16,12 @@ transaction, per-game APK and rollback; this adapter exists so the runtime side
 """
 import argparse
 import datetime as _dt
-import glob
 import hashlib
 import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
 from module_order import load_order   # noqa: E402  Horizon 装载序（main → subsdk0..N → sdk）：排序规则只有这一份
@@ -83,8 +83,8 @@ def headers(path):
 def module_list(root):
     # artifact 的 modules 顺序 = 装载顺序（经 BootContract → load_modules_from_source 到 loader.c 全局符号解析），
     # 必须按 Horizon 序：main → subsdk0..N（数字序）→ sdk；字母序会让 subsdk 里和 sdk 重名的符号错绑到 sdk。
-    names = load_order(os.path.basename(p)[: -len(".patched.bin")]
-                       for p in glob.glob(os.path.join(root, "modules", "*.patched.bin")))
+    names = load_order(p.name[: -len(".patched.bin")]
+                       for p in Path(root, "modules").glob("*.patched.bin"))
     modules = []
     for name in names:
         fixups = os.path.join(root, "modules", name + ".fixups.tsv")
