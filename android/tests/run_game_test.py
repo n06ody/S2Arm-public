@@ -13,12 +13,16 @@
   ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
     → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
   ⑩ 降级：原包 versionCode < 新包 → 还原 install -r -d；原包 > 新包 → 装测试包就带 -d；
-    降级能力不看 usage 文本——装测试包方向真降级由 install -r -d 实测（失败不卸旧包）；
-    装回方向备份后同版原包做 flag 探针（只证 -d 被解析层收），真降级收局见分晓
+    降级能力不看 usage 文本也不拿同版 -d 充数——入局前不动包；装测试包方向真降级
+    由 install -r -d 实测（失败不卸旧包）；装回方向收局 install -r -d 实际结果裁决，
+    装不回 → 留置+报红+不回灌数据；替身按 versionCode 排序区分同版/真降级
   ⑪ 还原后数据 sha 与备份清单不符 → 留置
   ㉕ 数据保护硬门：目录三态探针（存在但进不去 = 报错拒跑，不当不存在）；备份/回灌两处
-    tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后；
-    推回途中篡改 → 设备端复核逮住 → 留置；卸载后外部目录读不进 → 留置
+    tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后且
+    必须 rc=0+Success；推回途中篡改 → 设备端复核逮住 → 留置；卸载后外部目录读不进 → 留置
+  ㉖ 私有证据本局锚：state_dir 的 runtime-library.json（Java 起局写的 {pid, sessionId}）
+    sessionId 须等于 READY 行 session 段——锚缺/对不上 → unproven，文件名 seg 只做
+    与首行名实互核（services session_id uint64，不冒充本局身份）
 """
 import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
@@ -111,12 +115,12 @@ def run_as(cmdline):
     import re as _re, fnmatch as _fm
     if not st.get("apk_debuggable", True):
         fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
-    m = _re.match(r"^find (\\S+) -type f -name '\\*\\.log'$", cmdline)
+    m = _re.match(r"^find (\\S+) -type f -name '([\\w.*-]+)'$", cmdline)
     if m:
-        # 私有证据收集：列 <root> 下 basename *.log（含子目录 rel 路径）
-        root_ = m.group(1).rstrip("/")
+        # 私有证据收集：列 <root> 下 basename 匹配（含子目录 rel 路径）
+        root_, pat_ = m.group(1).rstrip("/"), m.group(2)
         for rel in sorted(DATA_DIRS.get(root_, {})):
-            if _fm.fnmatch(rel.rsplit("/", 1)[-1], "*.log"):
+            if _fm.fnmatch(rel.rsplit("/", 1)[-1], pat_):
                 out(root_ + "/" + rel + "\\n")
         return
     m = _re.match(r"^cat (\\S+)$", cmdline)
@@ -257,9 +261,18 @@ if cmd == "get-state":
 if cmd == "install":
     apk = argv[-1]
     if st.get("fail_install"): fail("Failure [INSTALL_FAILED]")
-    if st.get("pm_no_downgrade") and "-d" in argv: fail("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]")
+    # 真 Android versionCode 语义（qa-fone #14 替身对齐）：apk_vc < 已装 vc 是
+    # 真降级——不带 -d 直接拒；带 -d 才放行，pm_no_downgrade = 设备连 -d 都不放。
+    # 同版/升级装与 -d 无关（同版 install -r -d 成功证不了降级能力）。
+    blob = open(apk, "rb").read()
+    apk_vc = st["orig_vc"] if blob == bytes.fromhex(st["orig_apk_hex"]) \
+        else st.get("test_apk_vc", st["orig_vc"])
+    if st["installed"] and apk_vc < st.get("installed_vc", st["orig_vc"]):
+        if "-d" not in argv or st.get("pm_no_downgrade"):
+            fail("Failure [INSTALL_FAILED_VERSION_DOWNGRADE]")
     st["installed"] = True
-    st["installed_sha"] = hashlib.sha256(open(apk, "rb").read()).hexdigest()
+    st["installed_vc"] = apk_vc
+    st["installed_sha"] = hashlib.sha256(blob).hexdigest()
     st.setdefault("installs", []).append({"apk": apk, "flags": [a for a in argv[1:-1] if a.startswith("-")]})
     save(); out("Success"); sys.exit(0)
 if cmd == "uninstall":
@@ -352,6 +365,10 @@ if cmd == "shell":
             sys.exit(1)
         if len(sh) > 1 and sh[1] == "clear":
             st["pm_cleared"] = st.get("pm_cleared", 0) + 1    # 记账：pm clear 跑没跑过
+            if st.get("pm_clear_fails"):
+                save(); sys.stderr.write("Failed\\n"); sys.exit(1)
+            if st.get("pm_clear_silent"):
+                save(); sys.exit(0)                  # rc=0 但无 Success：照样算失败
             for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
                 for k in list(tab):
                     tab[k] = {} if tab is not DATA_SUBDIRS else []
@@ -472,6 +489,13 @@ if cmd == "shell":
                            f"file=/data/data/{st['package']}/files/ryujinx-android/{hn}\\n")
                     dd[f"files/ryujinx-android/{hn}"] = \
                         (hdr + st.get("host_log", "host log run\\n")).encode().hex()
+                    # Java 起局写 state_dir/runtime-library.json（{pid, sessionId}）：
+                    # 本局锚——sessionId 对得上 READY 行 session 段才证文件属本局
+                    if not st.get("no_runtime_marker"):
+                        dd["files/ryujinx-android/runtime-library.json"] = json.dumps(
+                            {"pid": 4242,
+                             "sessionId": st.get("marker_uuid", "t1"),
+                             "runtimeLibrary": {"fake": True}}).encode().hex()
                 # 游戏起局即改写自己的数据（存档/新文件）——还原不还原从这里才分得出来
                 for dir_ in list(DATA_DIRS):
                     if DATA_DIRS[dir_]:
@@ -498,7 +522,7 @@ if cmd == "shell":
         if len(sh) > 1 and sh[1] == "package":
             if st["installed"]:
                 flags = "pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA" + (" DEBUGGABLE" if st.get("debuggable") else "") + " ]"
-                out(f"versionCode={st['orig_vc']}\\n    {flags}\\n"); sys.exit(0)
+                out(f"versionCode={st.get('installed_vc', st['orig_vc'])}\\n    {flags}\\n"); sys.exit(0)
             out(""); sys.exit(0)
         out(""); sys.exit(0)
     if c == "run-as" and len(sh) > 4 and sh[2] == "sh" and sh[3] == "-c":
@@ -656,7 +680,9 @@ class RunGameTest(unittest.TestCase):
         return self.tmp / "sdk"
 
     def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1"):
-        state = make_state(self.tmp, **(state or {}))
+        st_kw = {"test_apk_vc": new_vc}
+        st_kw.update(state or {})
+        state = make_state(self.tmp, **st_kw)
         out = self.tmp / out_name
         fake = self.tmp / "fake_adb.py"
         fake.write_text(FAKE_ADB)
@@ -956,31 +982,89 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("读不进", man["reason"], man["reason"])
 
     def test_downgrade_restore_installs_with_dash_d(self):
-        """⑩ 原包 versionCode < 新包：备份后同版原包做 install -r -d flag 探针
-        收局装回原包必须带 -d。"""
+        """⑩ 原包 versionCode < 新包：入局前不探针（同版 -d 证不了真降级），
+        收局装回原包是真 `install -r -d` 降级。"""
         rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100),
                                      argv=["--allow-data-loss"], new_vc=300)
         self.assertEqual(0, rc)
         st = json.loads((self.tmp / "state.json").read_text())
-        self.assertGreaterEqual(len(st["installs"]), 3)
-        probe = st["installs"][0]
-        self.assertTrue(probe["apk"].endswith("orig.apk"), "装回方向备份后同版原包做 flag 探针")
-        self.assertIn("-d", probe["flags"], "探针本身就是 install -r -d")
-        test_install = next(i for i in st["installs"] if i["apk"].endswith("game.apk")
-                            and "s2a-orig" not in i["apk"])
-        self.assertNotIn("-d", test_install["flags"], "装新包（升级）不该带 -d")
-        self.assertIn("-d", st["installs"][-1]["flags"], "装回旧版原包是降级，必须带 -d")
+        self.assertEqual(2, len(st["installs"]), "入局前不动包：只有装新包 + 装回两笔")
+        self.assertTrue(st["installs"][0]["apk"].endswith("game.apk"))
+        self.assertNotIn("-d", st["installs"][0]["flags"], "装新包（升级）不该带 -d")
+        restore = st["installs"][-1]
+        self.assertTrue(restore["apk"].endswith("orig.apk"), "装回的是备份的原包")
+        self.assertIn("-d", restore["flags"], "装回旧版原包是真降级，必须带 -d")
 
-    def test_downgrade_unsupported_refuses_before_install(self):
-        """⑩ 原包 < 新包且设备 pm 不支持 -d：装新包前就拒跑。"""
-        rc, out, state = self.run_tool(state=self._installed_state(orig_vc=100, pm_no_downgrade=True),
-                                     argv=["--allow-data-loss"], new_vc=300)
+    def test_downgrade_restore_failure_detains_no_wipe(self):
+        """⑩ qa-fone：装回方向真降级被设备拒（pm_no_downgrade）→ 入局前不动包、
+        局照跑，收局 install -r -d 实测失败 → 留置 + 报红，数据回灌不执行。"""
+        dirs = self._data_dirs()
+        rc, out, state = self.run_tool(state=self._installed_state(
+            debuggable=True, orig_vc=100, pm_no_downgrade=True,
+            data_dirs=dict(dirs)), new_vc=300)
         self.assertNotEqual(0, rc)
-        st = json.loads((self.tmp / "state.json").read_text())
-        self.assertNotIn("installs", st, "降级装不回去就不该先装新包")
-        self.assertFalse(st["running"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "装不回原包要留置")
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertIn("降级", man["reason"])
+        self.assertIn("装回原包失败", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st["installs"][0]["apk"].endswith("game.apk"),
+                        "入局前没有任何装包探针")
+        self.assertIn("files/profiles/active.bin",
+                      st["data_dirs"].get(f"/data/data/{PKG}", {}),
+                      "装回失败不清数据：设备数据原样留着可人工救")
+        self.assertEqual(0, st.get("pm_cleared", 0), "装回失败根本轮不到 pm clear")
+
+    def test_pm_clear_failure_detains_and_keeps_data(self):
+        """㉕ qa-fone：pm clear 必须 rc=0 且输出 Success 才往下走；clear 失败
+        → 留置报红，find -delete/回灌都不执行，设备数据原样。"""
+        dirs = self._data_dirs()
+        rc, out, state = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(dirs), pm_clear_fails=True))
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("pm clear", man["reason"], man["reason"])
+        self.assertIn("files/profiles/active.bin",
+                      json.loads((self.tmp / "state.json").read_text())
+                      ["data_dirs"].get(f"/data/data/{PKG}", {}),
+                      "pm clear 失败不回灌：目录内容原样")
+
+    def test_pm_clear_no_success_output_detains(self):
+        """㉕ rc=0 但没有 Success（老设备沉默失败形态）→ 同样算失败、留置。"""
+        dirs = self._data_dirs()
+        rc, out, state = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(dirs), pm_clear_silent=True))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("pm clear", man["reason"], man["reason"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
+
+    def test_fake_install_dash_d_same_version_ok_downgrade_refused(self):
+        """③-5 替身语义直验：同版 `install -r -d` 成功（同 versionCode 不触发
+        版本排序，证不了降级能力）；apk_vc < 已装 vc 才是真降级——pm_no_downgrade
+        时连 -d 都拒。"""
+        state = make_state(self.tmp, **self._installed_state(orig_vc=200,
+                                                             pm_no_downgrade=True))
+        fake = self.tmp / "fake_adb.py"
+        fake.write_text(FAKE_ADB)
+        orig = self.tmp / "orig.apk"
+        orig.write_bytes(bytes.fromhex("aabbccdd"))   # 与 orig_apk_hex 同文 = 同版
+        same = subprocess.run([sys.executable, str(fake), str(state),
+                               "install", "-r", "-d", str(orig)],
+                              capture_output=True, text=True)
+        self.assertEqual(0, same.returncode, "同版 -d 要被收（flag 解析层）")
+        (self.tmp / "orig.apk").unlink()
+        st = json.loads(state.read_text())
+        st["orig_apk_hex"] = "ccdd"                    # 另一个字节包 = 低 vc 版
+        state.write_text(json.dumps({**st, "orig_vc": 100}))
+        old = self.tmp / "old.apk"
+        old.write_bytes(bytes.fromhex("ccdd"))
+        down = subprocess.run([sys.executable, str(fake), str(state),
+                               "install", "-r", "-d", str(old)],
+                              capture_output=True, text=True)
+        self.assertNotEqual(0, down.returncode,
+                            "真降级在 pm_no_downgrade 下必须拒（装不回的形态）")
 
     def test_forward_downgrade_installs_with_dash_d(self):
         """⑩ 原包 versionCode > 新包：装测试包本身就是降级要带 -d；还原是升级不带。"""
@@ -1284,6 +1368,30 @@ class RunGameTest(unittest.TestCase):
         self.assertTrue(all(r["verified"] for r in man["private_logs"]),
                         "传输完整性照样核实——归属未证 ≠ 字节没对上")
         self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_marker_missing_unproven(self):
+        """㉖ qa-fone 本局锚：state_dir 没有 runtime-library.json（Java 起局写的
+        {pid, sessionId}）→ 文件名/首行/PID/birth 全自洽也只能 unproven——
+        「属本局」要设备端旁证，不是文件自述。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"no_runtime_marker": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"], "锚缺不该挡证据拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("runtime-library.json" in n for n in man["notes"]),
+                        man["notes"])
+
+    def test_private_logs_marker_uuid_mismatch_unproven(self):
+        """㉖ runtime-library.json 的 sessionId 与 READY 行 session 段对不上
+        （别的局写的标记/标记被换）→ 本局身份未证 → unproven。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"marker_uuid": "other-uuid"})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("runtime-library.json" in n for n in man["notes"]),
+                        man["notes"])
 
     def test_private_logs_no_birth_attribution_unproven(self):
         """㉔ qa-fone 负控：墙钟正常但 /proc/<pid>/stat 读拒 → 进程 birth 证不了，
