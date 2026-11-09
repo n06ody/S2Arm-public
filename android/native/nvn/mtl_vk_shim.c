@@ -184,6 +184,17 @@ static void shim_note_completed(uint64_t through) {
 static int shim_on_gfx_thread(void) {
     return g_gfx_tid_valid && pthread_equal(pthread_self(), g_gfx_tid);
 }
+// ADPF 帧跨距：排队作业按执行时所在的帧序号记账（序号只在 shim_frame_settle 翻转，
+// 即每条 present 出口的末尾；所以「两次 settle 之间执行的作业」就是这一帧的工作）。
+// 独立 NVN 探针可能不链接宿主提示模块，弱符号缺失时整块不启用。
+extern void s2a_adpf_work_begin(uint64_t seq) __attribute__((weak));
+extern void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
+extern void s2a_adpf_discard(void) __attribute__((weak));
+extern void s2a_adpf_invisible(void) __attribute__((weak));
+static _Atomic uint64_t g_frame_seq;
+static void adpf_work_tick(void) {
+    if (s2a_adpf_work_begin) s2a_adpf_work_begin(atomic_load(&g_frame_seq) + 1);
+}
 static void *shim_gfx_main(void *arg) {
     (void)arg;
     pthread_setname_np(pthread_self(), "s2a-gfx");
@@ -198,6 +209,7 @@ static void *shim_gfx_main(void *arg) {
         g_busy = 1;
         pthread_cond_broadcast(&g_idle_cv);   // 腾出槽位，阻塞的入队方可以继续
         pthread_mutex_unlock(&g_job_mu);
+        adpf_work_tick();
         job.fn(job.arg);
         pthread_mutex_lock(&g_job_mu);
         g_busy = 0;
@@ -279,9 +291,9 @@ static void job_reset_state(void *arg) { (void)arg; s2a_record_reset_state(); }
 
 // 入队：有界；队列满时有界等待（等到有空位或超时），绝不无界增长。
 static int shim_enqueue(void (*fn)(void *), void *arg) {
-    if (shim_async_mode() == SHIM_ASYNC_OFF || shim_on_gfx_thread()) { fn(arg); return 0; }
+    if (shim_async_mode() == SHIM_ASYNC_OFF || shim_on_gfx_thread()) { adpf_work_tick(); fn(arg); return 0; }
     shim_async_start();
-    if (shim_async_mode() == SHIM_ASYNC_OFF) { fn(arg); return 0; }
+    if (shim_async_mode() == SHIM_ASYNC_OFF) { adpf_work_tick(); fn(arg); return 0; }
     const uint64_t t0 = shim_now_ns();
     pthread_mutex_lock(&g_job_mu);
     while (g_job_n == SHIM_JOB_MAX && !g_gfx_stop) {
@@ -341,6 +353,10 @@ static void shim_frame_settle(void) {
     g_frame_first_draw_marked = 0;
     g_frame_exec_ns = 0;
     g_frame_cmds = 0;
+    // 帧边界：drain 之后的作业记到下一帧。必须在 drain 之后翻，否则在 drain 里执行完
+    // 的本帧作业会拿错序号；也不清 pending——晚于 end 登记的作业带旧序号，下一帧的
+    // end 按序号对不上自然丢弃。
+    atomic_fetch_add(&g_frame_seq, 1);
 }
 static void shim_async_stop(void) {
     if (!g_gfx_tid_valid) return;
@@ -671,8 +687,8 @@ __attribute__((weak)) int s2a_direct_vk_try_attach_window(void);
 
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     nvk_require();
-    (void)period_s;
     if (g_lost_from_fence) {
+        if (s2a_adpf_discard) s2a_adpf_discard();   // 本帧不完整：挂着的跨距不上报
         static int noted;
         if (noted++ < 8)
             red("mtl_present: an earlier submit (%llu) lost its command chain; refusing to present incomplete content",
@@ -688,6 +704,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         s2a_direct_vk_try_attach_window();
     }
     if (!mtl_has_window()) {
+        if (s2a_adpf_invisible) s2a_adpf_invisible();   // 不可见即关会话，下一可见帧重建
         // 窗口已被 surfaceDestroyed 撤销、新 generation 还没到：这帧没有可上屏的 surface，
         // 跳过 present（不是“丢命令继续跑”，也不需要 abort）。真机从后台返回/旋转后由
         // 晚挂路径拿到新 generation 再继续；之前这里会 red("no game window attached") 把进程打崩。
@@ -712,6 +729,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     // 激进度：只在 present 前 drain。此时本帧所有提交都已入队，翻译线程可与游戏线程
     // “录制本帧”并行；代价是依赖“游戏不会在本帧内改写上一帧的动态缓冲”这个前提（需真机验画面）。
     shim_drain();
+    // ADPF：报「本帧第一批翻译工作 → drain 完成」这段真实关键路径墙钟；目标用共用前端
+    // 给的生效上屏间隔。drain 之后的 acquire/上屏等待是 pacing，不是工时；序号只对
+    // 本帧 pending，跳帧/丢帧留下的记录在这里自然丢弃。
+    if (s2a_adpf_frame_end) {
+        double ns = period_s * 1e9;
+        s2a_adpf_frame_end(ns > 0 && ns < 9.223372036854776e18 ? (int64_t)ns : 0,
+                           atomic_load(&g_frame_seq) + 1);
+    }
     char why[192] = "";
     uint64_t t_present = shim_now_ns();
     {
@@ -727,6 +752,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         // present 会报 no game window attached。这是正常的 BACK/HOME/旋转竞态，
         // 按“本帧无窗口、完成证明收尾、跳过上屏”处理，不能当成致命错误 abort。
         if (!mtl_has_window()) {
+            if (s2a_adpf_invisible) s2a_adpf_invisible();
             static int noted;
             if (noted++ < 8) info("mtl_present: window revoked during present (%s); frame drained, present skipped",
                                   why[0] ? why : "no window");
