@@ -17,6 +17,12 @@ function(s2a_android_host_sources output)
         native/wsi_lease.c native/input.c native/tsd.c native/module.c native/selftest.c native/selftest_gate.S
         native/guest_signal.c native/redlog.c native/redzone.S native/pcm_ring.c native/aaudio_sink.c native/hostapi.c native/screen_metrics.c
         native/host_android.c native/host_ui.c native/host_ui_android.c native/host_ui_jni.cpp native/plat_android.c
+        # 直连安全网安卓接线（共用 runtime/src/dguard.c 的武装 / 生命周期出口；游戏目标由
+        # Runtime.cmake 提供 dguard.c，诊断目标见 s2a_android_diagnostic_sources）
+        native/dguard_android.c
+        # 安卓侧共用文档根绑定：runtime.c 起局把 S2A_DOCS 指到本局 state 目录（iOS/Mac 由
+        # launchctx 提供，安卓无此环节；dguard 的 wire/direct_guard 等消费者才得以落盘）
+        native/docs_android.c
         native/direct_vk.c native/direct_session.c native/direct_choice.c native/direct_callback.c native/direct_callback.S)
     if(S2A_ANDROID_EXPERIMENTAL_TOUCH)
         list(APPEND sources native/touch_input.c)
@@ -38,7 +44,10 @@ function(s2a_android_diagnostic_sources output)
         native/runtime/tracking/registry.c
         # #1456 capprobe：诊断单库同样链 bridge.cpp / vk_device.c 引用的探测符号；
         # 探测本体 capprobe.c 只编成独立可执行件（packaged helper），不进单库。
-        native/capprobe/capprobe_host.c)
+        native/capprobe/capprobe_host.c
+        # dguard_android.c / bridge.cpp 引用的共用出口：诊断目标编入同一实现（无武装点，
+        # 只靠弱回退的日志与 stub 的 s2a_host_session_state 空转），行为与游戏目标一致。
+        ../runtime/src/dguard.c ../runtime/src/direct_prompt.c)
     set(${output} "${sources}" PARENT_SCOPE)
 endfunction()
 

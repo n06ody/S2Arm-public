@@ -14,6 +14,8 @@
 #include "wsi_qa.h"
 #include "redlog.h"
 #include "direct/diag.h"
+#include "dguard_android.h"
+#include "s2a_direct_prompt.h"
 static s2a::DebugEnvironment g_debug_environment;
 
 // The release binary cannot enable this diagnostic capability, even via a forged environment.
@@ -1293,6 +1295,55 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
     default:
         break;
     }
+    // 直连安全网（共用 dguard.c）：进后台停表、内存告警证据撤回待定；回前台接着计时。
+    // 未武装 / 已清零时内部空转。同 iOS app.m 前后台通知的口径。
+    s2a_android_dguard_foreground(foreground != JNI_FALSE);
+}
+// 直连安全网 JNI 出口（dguard_android.c 包装共用 dguard.c，未武装 / 已清零时空转）：
+// onTrimMemory 前台内存告警记失败证据；setHostBuild 在起局前传一次宿主版本号
+// （BuildConfig.VERSION_NAME，dguard 用它区分「另一个包」）；pollSaveAtomic 由 Java 侧
+// 每秒轮询，服务层报出不能原子提交的原因位时提示一次（判定在共用 direct_prompt.c）。
+extern "C" JNIEXPORT void JNICALL
+Java_org_s2arm_android_NativeBridge_memoryWarning(JNIEnv *, jclass) {
+    s2a_android_dguard_memory_warning();
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_s2arm_android_NativeBridge_setHostBuild(JNIEnv *env, jclass, jstring build) {
+    if (!build) return;
+    const char *text = env->GetStringUTFChars(build, nullptr);
+    if (text) { s2a_android_host_build_set(text); env->ReleaseStringUTFChars(build, text); }
+}
+extern "C" JNIEXPORT jint JNICALL
+Java_org_s2arm_android_NativeBridge_pollSaveAtomic(JNIEnv *, jclass) {
+    return s2a_save_atomic_poll();
+}
+// 直连安全网提示出口（dguard_android.c 弱引用，这里是强实现）：在游戏线程上被调，
+// 经 JNI 上叫 NativeBridge.dguardPrompt 弹阻塞对话框；玩家选「仍然启动」才返回
+// （同 iOS s2a_ios_dguard_prompt 的等待语义）。没有 JavaVM / 桥接类（探针、宿主测试）时
+// 只记日志照走——那类构建本就不该走到这里。
+extern "C" void s2a_android_dguard_prompt(const char *diag) {
+    JavaVM *vm = g_vm;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (!vm) return;
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    }
+    if (g_bridge) {
+        jmethodID method = env->GetStaticMethodID(g_bridge, "dguardPrompt", "([B)V");
+        if (method) {
+            jsize len = static_cast<jsize>(strlen(diag ? diag : ""));
+            jbyteArray bytes = env->NewByteArray(len);
+            if (bytes) {
+                env->SetByteArrayRegion(bytes, 0, len, reinterpret_cast<const jbyte *>(diag));
+                env->CallStaticVoidMethod(g_bridge, method, bytes);
+                env->DeleteLocalRef(bytes);
+            }
+        } else __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "dguardPrompt: NativeBridge.dguardPrompt missing");
+    } else __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "dguardPrompt: bridge class unavailable");
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    if (attached) vm->DetachCurrentThread();
 }
 // 接口 v2.15（#1228）：运行中切掌机 / 主机走宿主 display->set_console_mode（其内部转
 //   s2a_console_mode_set，服务层再转 ChangeDockedModeState）。与 os.c 其它符号同一强引用

@@ -210,6 +210,13 @@ else()
     target_compile_options(game_touch_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(game_touch_test PRIVATE pthread)
     add_test(NAME android_game_touch COMMAND game_touch_test)
+    # 直连安全网安卓接线：共用 runtime/src/dguard.c 真跑，只替换属性开关与提示出口
+    add_executable(dguard_android_test tests/dguard_android_test.c native/dguard_android.c native/docs_android.c ../runtime/src/dguard.c)
+    target_include_directories(dguard_android_test PRIVATE native ../runtime/include ../runtime/src)
+    target_compile_definitions(dguard_android_test PRIVATE S2A_DGUARD_TEST=1)
+    target_compile_options(dguard_android_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(dguard_android_test PRIVATE pthread)
+    add_test(NAME android_dguard_android COMMAND dguard_android_test)
     find_package(Threads REQUIRED)
     # Linux errno/fd/filesystem contracts; reached by linux_ctest.sh, including
     # Darwin's Linux VM route. These are not Android device durability evidence.
