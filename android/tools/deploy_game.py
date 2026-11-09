@@ -41,6 +41,10 @@ class Adb:
     def shell(self, *args):
         return self.call('shell', shlex.join(map(str, args)))
 
+    def popen(self, *args):
+        return subprocess.Popen([*self.argv, *map(str, args)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
     def running(self, package):
         for name in (package, package + ':game'):
             result = subprocess.run([*self.argv, 'shell', 'pidof', name],
@@ -130,8 +134,7 @@ def push_tree(adb, resources, dst, timeout, log):
     """单条 adb push 整树，推送中按 PUSH_PROGRESS_S 轮询设备端目录打进度；
     超时杀进程并把最后的进度写进错误（能看出卡在哪）。"""
     t0 = time.monotonic()
-    proc = subprocess.Popen([*adb.argv, 'push', str(resources), dst],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = adb.popen('push', str(resources), dst)
     nf = nb = 0
     while proc.poll() is None:
         try:

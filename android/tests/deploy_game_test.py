@@ -4,6 +4,7 @@
 签名解析在这些合成 ZIP 用例中替身为证书摘要；真实签名由 adb install 校验。
 """
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
@@ -20,6 +21,19 @@ import game_apk
 TITLE = '0100000000ABCDEF'
 
 
+class _FakeProc:
+    """push_tree 的 Popen 替身：即时完成、空输出。"""
+    def __init__(self):
+        self.returncode = 0
+        self.stdout = io.StringIO('')
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
 class FakeAdb:
     serial = 'test-device'
 
@@ -29,12 +43,16 @@ class FakeAdb:
         self.started = False
         self.receipt = None   # (contentRoot, artifactSha256)：App 导入成功时在 logcat 打的回执（正式包读不了 current.json）
 
-    def call(self, *args, timeout=600):   # 与 deploy_game.Adb.call 同签名：push 单独传 --push-timeout
+    def call(self, *args, timeout=600):   # 与 deploy_game.Adb.call 同签名：tar 推送单独传超时
         self.calls.append(args)
         if args[0] == 'push': self.push_timeout = timeout
         if args[0] == 'install':
             self.digest = game_apk.sha256(args[-1])
         return 'Success'
+
+    def popen(self, *args):   # 整树推送走 adb.popen（轮询进度+到点杀进程）；记进 calls 供断言
+        self.calls.append(args)
+        return _FakeProc()
 
     def running(self, package):
         return False
@@ -194,24 +212,24 @@ class DeployTest(unittest.TestCase):
 
     def test_push_timeout_scales_with_resource_size(self):
         # 期望按 30 MB/s、2 倍余量手算：21 GB → 21e9 / 30e6 × 2 = 1400 秒（+1 取整）；小包取下限 120；显式 --push-timeout 照用
+        # （超时现在在 push_tree 轮询里执行，截获它的 timeout 入参核对估值管线）
         for size, want in ((21_000_000_000, 1401), (1_000_000, 120)):
-            with self.subTest(size=size), patch.object(deploy_game, 'tree_bytes', return_value=size):
+            with self.subTest(size=size), patch.object(deploy_game, 'tree_bytes', return_value=size), \
+                    patch.object(deploy_game, 'push_tree') as pt:
                 adb = FakeAdb(); self.deploy(adb)
-                self.assertEqual(adb.push_timeout, want)
-        with patch.object(deploy_game, 'tree_bytes', return_value=21_000_000_000):
+                self.assertEqual(pt.call_args[0][3], want)
+        with patch.object(deploy_game, 'tree_bytes', return_value=21_000_000_000), \
+                patch.object(deploy_game, 'push_tree') as pt:
             adb = FakeAdb(); self.deploy(adb, push_timeout=50)
-            self.assertEqual(adb.push_timeout, 50)
+            self.assertEqual(pt.call_args[0][3], 50)
 
     def test_failed_or_interrupted_push_cleans_own_paths(self):
         for failure in (RuntimeError('push failed'), InterruptedError('cancelled')):
             with self.subTest(failure=failure):
                 adb = FakeAdb()
-                original = adb.call
-                def call(*args, **kwargs):
-                    if args[0] == 'push':
-                        raise failure
-                    return original(*args, **kwargs)
-                adb.call = call
+                def popen(*args, **kwargs):
+                    raise failure
+                adb.popen = popen
                 with self.assertRaises(type(failure)):
                     self.deploy(adb)
                 clean = next(x for x in adb.calls if x[:2] == ('rm', '-rf'))
@@ -291,7 +309,8 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(list((self.root / 'out').glob('*/deployment.json')), [])
 
     def test_startup_before_this_import_is_not_success(self):
-        with patch.object(deploy_game.time, 'monotonic', side_effect=[0, 0, 0, 0, 2]), \
+        # push_tree 计时也走 time.monotonic，给足返回值：前段都回 0，启动轮询处跳到超过 deadline
+        with patch.object(deploy_game.time, 'monotonic', side_effect=[0] * 8 + [5]), \
                 patch.object(deploy_game.time, 'sleep'):
             with self.assertRaisesRegex(RuntimeError, '超时'):
                 self.deploy(FakeAdb(stale_start=True), timeout=1)
