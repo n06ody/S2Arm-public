@@ -93,7 +93,7 @@ if (!(nativeMode in ['diagnostic', 'game'])) throw new GradleException('s2arm.na
 def gameDir = null
 def game = new Properties()
 if (gameDirName) {
-    gameDir = new File(gameDirName).isAbsolute() ? file(gameDirName) : file("${rootDir}/../../${gameDirName}")
+    gameDir = new File(gameDirName).isAbsolute() ? file(gameDirName) : file("${rootDir}/../${gameDirName}")
     file("${gameDir}/game.properties").withInputStream { game.load(it) }
     if (!(game.titleId ==~ /[0-9A-F]{16}/)) throw new GradleException("${gameDir}/game.properties: titleId is not 16 hex digits")
 }
