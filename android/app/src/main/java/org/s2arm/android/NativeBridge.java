@@ -204,6 +204,16 @@ final class NativeBridge {
     static String requestText(String title, String initial, int maxChars) {
         return MainActivity.requestText(title, initial, maxChars);
     }
+    /** 直连安全网：UTF-8 诊断字节进阻塞提示页（游戏线程等到玩家选「仍然启动」）。 */
+    static void dguardPrompt(byte[] diag) {
+        MainActivity.dguardPrompt(diag == null ? "" : new String(diag, java.nio.charset.StandardCharsets.UTF_8));
+    }
+    /** 直连安全网：onTrimMemory/onLowMemory 前台内存告警，记一次失败证据（未武装时空转）。 */
+    static native void memoryWarning();
+    /** 直连安全网：宿主版本号（BuildConfig.VERSION_NAME），起局前传一次，dguard 用它区分「另一个包」。 */
+    static native void setHostBuild(String build);
+    /** 存档原子提交判定（共用 direct_prompt.c）：每秒轮询，非 0 = 服务层报出原因位（只报一次）。 */
+    static native int pollSaveAtomic();
 
     static native String checkModules(String modulesDir);
     /** Maps exactly these rewritten module images (load check; nothing runs). Any thread. */
