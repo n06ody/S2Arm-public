@@ -97,9 +97,13 @@ if cmd == "shell":
     text = argv[1]
     sh = shlex.split(text)
     if len(sh) == 1 and " " in sh[0]:
-        # adb.shell('整条带管道的命令')：shlex.join 把它包成单个引号串，真机上
-        # device shell 会再解析一遍（管道照常）；替身照做再切一刀
-        text = sh[0]; sh = shlex.split(text)
+        # 真实语义：adb.shell('整串') 经 shlex.join 单引号包成一个词，
+        # 设备 shell 把它当文件名 exec → rc=127（8E r5 qa-fone 实测）
+        sys.stderr.write("sh: " + sh[0] + ": command not found\\n"); sys.exit(127)
+    piped = False
+    if sh[:2] == ["sh", "-c"] and len(sh) > 2:
+        text = sh[2]; sh = shlex.split(text)
+        piped = " | " in text                 # 脚本里裸 | 才是真管道；'|' 词只是参数
     c = sh[0] if sh else ""
     if "power_supply" in text:
         st["uptime_us"] += 1000000; save()
@@ -144,8 +148,8 @@ if cmd == "shell":
     if c == "find":
         dir_ = sh[1].rstrip("/")
         entries = sorted(p for p in DEV_FS if p == dir_ or p.startswith(dir_ + "/"))
-        if "|" in sh:
-            # 有界分批核验：find ... -print0 | xargs -0 -n 256 <sha256sum|chmod>
+        if piped:
+            # 有界分批核验：sh -c 'find ... -print0 | xargs -0 -n 256 <sha256sum|chmod>'
             if "chmod" in sh: sys.exit(0)
             fail_batch = st.get("sha_batch_fail_at")      # 第 N 批（256/批）挂：截断输出 + 短 stderr + rc=126
             for i, p in enumerate(entries):
@@ -680,6 +684,21 @@ class RunGameTest(unittest.TestCase):
             argv=["--resources", str(res), "--push-tar", "always"])
         self.assertEqual(0, rc)
         self.assertIn("SHA 核对通过", (out / "run.log").read_text())
+
+    def test_fake_adb_shell_single_word_is_127(self):
+        """⑮ 替身忠实性负控：adb.shell('整串') 经 shlex.join 单引号包成一个词，
+        设备 shell 当文件名 exec → rc=127（8E r5 qa-fone 实测）。替身若放宽解包，
+        大树分批用例会假绿——这里钉死。"""
+        state = make_state(self.tmp)
+        fake = self.tmp / "fake_adb.py"; fake.write_text(FAKE_ADB)
+        adb = [sys.executable, str(fake), str(state), "-s", SERIAL]
+        bad = subprocess.run(adb + ["shell", "'find /x -type f -print0 | xargs -0 sha256sum'"],
+                             capture_output=True, text=True)
+        self.assertEqual(127, bad.returncode,
+                         "单引号整串是一个词：设备当文件名 exec，替身必须 127")
+        good = subprocess.run(adb + ["shell", "sh -c 'getprop s2a.anything'"],
+                              capture_output=True, text=True)
+        self.assertEqual(0, good.returncode, "sh -c <脚本> 必须解包执行到 getprop")
 
     def test_resources_tar_verify_mid_batch_failure_is_short(self):
         """⑭ 核验中途某批挂：报错只带短 stderr 尾，不把几千条文件清单灌进 manifest。"""
