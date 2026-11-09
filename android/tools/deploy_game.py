@@ -7,6 +7,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -91,11 +92,16 @@ def start_activity(adb, *args):
         raise RuntimeError('Activity 启动失败：' + output)
 
 
-# 资源包推送超时按大小算（11-01：写死 600 秒，21 GB 的暗黑3 资源包必超时；vivo 10AF4N00TA002NC 实测 21 GB 推 715 秒 ≈ 30 MB/s，留 2 倍余量）。
+# 资源包推送超时按「字节 + 文件数」算（11-01：写死 600 秒，21 GB 的暗黑3 资源包必超时；
+# vivo 10AF4N00TA002NC 实测 21 GB 推 715 秒 ≈ 30 MB/s；小文件密集时 adb 每文件还有
+# 协议开销，8E 资源树 19,756 文件、84% <64KB，纯字节估的 251s 推不完）。留 2 倍余量。
 #   下限只覆盖 adb 握手 / 建目录这类固定开销；命令行 --push-timeout 显式给了照用
 PUSH_BYTES_PER_S = 30e6
+PUSH_FILE_S = 0.02          # adb push 每文件协议开销估 20ms
 PUSH_MARGIN = 2
 PUSH_FLOOR_S = 120
+PUSH_PROGRESS_S = 5         # 推送进度轮询间隔（设备侧 find/du）
+PUSH_TAR_MIN_FILES = 5000   # 文件数超此线默认走 tar 单推 + 设备端解开（--push-tar 可改）
 
 
 def tree_bytes(path):
@@ -103,12 +109,89 @@ def tree_bytes(path):
     return path.stat().st_size if path.is_file() else sum(p.stat().st_size for p in path.rglob('*') if p.is_file())
 
 
+def tree_files(path):
+    path = Path(path)
+    return sum(1 for p in path.rglob('*') if p.is_file()) if path.is_dir() else 1
+
+
 def push_timeout_for(resources):
-    return max(PUSH_FLOOR_S, int(tree_bytes(resources) / PUSH_BYTES_PER_S * PUSH_MARGIN) + 1)
+    est = tree_bytes(resources) / PUSH_BYTES_PER_S + tree_files(resources) * PUSH_FILE_S
+    return max(PUSH_FLOOR_S, int(est * PUSH_MARGIN) + 1)
+
+
+def dev_tree_stat(adb, dev_dir):
+    """设备端目录的 (文件数, 字节)：find + du。取不到按 (0,0)，进度条容错。"""
+    files = adb.shell('find', dev_dir, '-type', 'f').splitlines()
+    du = adb.shell('du', '-sk', dev_dir).split()
+    return len([ln for ln in files if ln.strip()]), (int(du[0]) * 1024 if du else 0)
+
+
+def push_tree(adb, resources, dst, timeout, log):
+    """单条 adb push 整树，推送中按 PUSH_PROGRESS_S 轮询设备端目录打进度；
+    超时杀进程并把最后的进度写进错误（能看出卡在哪）。"""
+    t0 = time.monotonic()
+    proc = subprocess.Popen([*adb.argv, 'push', str(resources), dst],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    nf = nb = 0
+    while proc.poll() is None:
+        try:
+            nf, nb = dev_tree_stat(adb, dst)
+        except (RuntimeError, ValueError, subprocess.SubprocessError):
+            pass
+        if time.monotonic() - t0 > timeout:
+            proc.kill()
+            raise RuntimeError(f'资源推送超时（>{timeout}s）：最后进度 {nf} 文件 / '
+                               f'{nb / 1e6:.0f} MB；小文件密集可 --push-tar 单推解开')
+        log(f'推送中：{nf} 文件 / {nb / 1e6:.0f} MB'
+            f'（{nb / 1e6 / max(1, time.monotonic() - t0):.0f} MB/s）')
+        time.sleep(PUSH_PROGRESS_S)
+    out = proc.stdout.read()
+    if proc.returncode != 0:
+        raise RuntimeError(f'adb push 失败 rc={proc.returncode}: {out.strip()[:300]}')
+    nf, nb = dev_tree_stat(adb, dst)
+    log(f'推送完成：{nf} 文件 / {nb / 1e6:.0f} MB / {time.monotonic() - t0:.0f}s')
+
+
+def verify_pushed_tree(adb, dev_dir, local_root, log):
+    """设备端目录逐文件 SHA 与本地资源树清单一致（相对路径 → sha256 映射全等）。"""
+    expected = {str(p.relative_to(local_root)): digest(p)
+                for p in Path(local_root).rglob('*') if p.is_file()}
+    actual = {}
+    for ln in adb.shell('find', dev_dir, '-type', 'f', '-exec', 'sha256sum', '{}', '+').splitlines():
+        m = re.match(r'^([0-9a-f]{64})\s+(.+)$', ln.strip())
+        if m:
+            sha, dev = m.groups()
+            actual[dev[len(dev_dir) + 1:] if dev.startswith(dev_dir + '/') else dev] = sha
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        bad = sorted(k for k in expected.keys() & actual.keys() if expected[k] != actual[k])
+        raise RuntimeError(f'设备端资源 SHA 核对失败：缺 {len(missing)} {missing[:3]}；'
+                           f'多 {len(extra)} {extra[:3]}；sha 不符 {len(bad)} {bad[:3]}')
+    log(f'设备端资源逐文件 SHA 核对通过（{len(actual)} 文件）')
+
+
+def push_via_tar(adb, resources, dst, timeout, log):
+    """小文件密集路径：本地打 tar → 单文件 adb push → 设备端解开 → 逐文件 SHA 核对。"""
+    tmp = Path(tempfile.mkdtemp(prefix='s2a-res-')) / 'resources.tar'
+    # macOS bsdtar 会把 ._*/.DS_Store AppleDouble 合成进归档；设备解开后对不上清单
+    env = dict(os.environ, COPYFILE_DISABLE='1')
+    subprocess.run(['tar', '-cf', str(tmp), '--exclude', '._*', '--exclude', '.DS_Store',
+                    '-C', str(resources), '.'], check=True, env=env)
+    log(f'资源打 tar {tmp.stat().st_size / 1e6:.0f} MB（{tree_files(resources)} 文件）→ 单文件推送')
+    adb.call('push', tmp, dst + '.tar', timeout=timeout)
+    adb.shell('mkdir', '-p', dst)
+    adb.shell('tar', '-xf', dst + '.tar', '-C', dst)
+    adb.shell('rm', '-f', dst + '.tar')
+    verify_pushed_tree(adb, dst, resources, log)
 
 
 def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_timeout=None,
-                     start=True, refresh_existing=False, require_current=True):
+                     start=True, refresh_existing=False, require_current=True,
+                     push_tar=None, log=None):
+    """push_tar：None=按文件数自动（≥PUSH_TAR_MIN_FILES 走 tar 单推解开）；
+    True/False 强制走 / 不走。log：进度回调（推送中/完成/SHA 核对都打进去）。"""
+    log = log or (lambda *a, **k: None)
     apk, resources, work = Path(apk), Path(resources), Path(work)
     artifact, artifact_hash = validate(apk, resources)
     title, package = artifact['titleId'], artifact['apk']['packageName']
@@ -131,7 +214,17 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
         start_activity(adb, '-n', library)
         adb.shell('am', 'force-stop', package)
         library_active = False
-        adb.call('push', resources, pending, timeout=push_timeout or push_timeout_for(resources))
+        nfiles = tree_files(resources)
+        use_tar = push_tar if push_tar is not None else nfiles >= PUSH_TAR_MIN_FILES
+        est = push_timeout or push_timeout_for(resources)
+        if use_tar:
+            why = '强制 --push-tar' if push_tar else f'文件数 ≥{PUSH_TAR_MIN_FILES}'
+            log(f'资源树 {nfiles} 文件（{why}）：走 tar 单推 + 设备端解开'
+                f'（超时 {est}s，按字节+文件数估）')
+            push_via_tar(adb, resources, pending, est, log)
+        else:
+            log(f'资源树 {nfiles} 文件整树推送（超时 {est}s，按字节+文件数估）')
+            push_tree(adb, resources, pending, est, log)
         adb.shell('chmod', '-R', 'u=rwX,g=rX,o=r', pending)
         adb.shell('find', pending, '-type', 'd', '-exec', 'chmod', 'o=x', '{}', '+')
         adb.shell('mv', pending, imported)
@@ -199,7 +292,7 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
 
 
 def deploy(pack, apk, adb, output_root, mode='auto', refresh_existing=False, timeout=180, push_timeout=None,
-           start=True):
+           start=True, push_tar=None):
     pack, apk = Path(pack).resolve(), Path(apk).resolve()
     title, _, _ = game_apk.nacp_info(pack / 'ctl/control.nacp')
     output_root = Path(output_root).resolve()
@@ -213,7 +306,7 @@ def deploy(pack, apk, adb, output_root, mode='auto', refresh_existing=False, tim
     resources = work / 'resources'
     game_apk.resources(pack, frozen, resources, refresh_existing=refresh_existing)
     deploy_resources(frozen, resources, adb, work, mode, timeout, push_timeout, start, refresh_existing,
-                     require_current=False)
+                     require_current=False, push_tar=push_tar, log=print)
     return work
 
 
@@ -227,7 +320,9 @@ def main():
     parser.add_argument('--mode', choices=('auto', 'direct', 'generic'), default='auto')
     parser.add_argument('--refresh-existing', action='store_true')
     parser.add_argument('--timeout', type=int, default=180)
-    parser.add_argument('--push-timeout', type=int, default=None, help='资源包推送超时秒数；缺省按资源包大小算（约 30 MB/s、2 倍余量）')
+    parser.add_argument('--push-timeout', type=int, default=None, help='资源包推送超时秒数；缺省按资源包字节+文件数算（约 30 MB/s + 20ms/文件、2 倍余量）')
+    parser.add_argument('--push-tar', choices=('auto', 'always', 'never'), default='auto',
+                        help='资源推送方式：auto 文件数≥%d 走 tar 单推解开（默认）；always 强制；never 永远整树推' % PUSH_TAR_MIN_FILES)
     start = parser.add_mutually_exclusive_group()
     start.add_argument('--start', dest='start', action='store_true')
     start.add_argument('--no-start', dest='start', action='store_false')
@@ -235,6 +330,7 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0 or (args.push_timeout is not None and args.push_timeout <= 0) or (args.resources and args.refresh_existing):
         parser.error('超时必须大于零；--refresh-existing 只用于 --pack')
+    push_tar = {'auto': None, 'always': True, 'never': False}[args.push_tar]
     def interrupt(_signal, _frame):
         raise InterruptedError('部署已取消。')
     signal.signal(signal.SIGTERM, interrupt)
@@ -243,13 +339,15 @@ def main():
         adb = Adb(args.serial)
         if args.pack:
             work = deploy(args.pack, args.apk, adb, REPO / 'build/android-deploy', args.mode,
-                          args.refresh_existing, args.timeout, args.push_timeout, args.start)
+                          args.refresh_existing, args.timeout, args.push_timeout, args.start,
+                          push_tar=push_tar)
             receipt = json.loads((work / 'deployment.json').read_text())
         else:
             root = REPO / 'build/android-deploy'; root.mkdir(parents=True, exist_ok=True)
             work = Path(tempfile.mkdtemp(prefix='resources-', dir=root))
             receipt = deploy_resources(args.apk.resolve(strict=True), args.resources.resolve(strict=True), adb,
-                                       work, args.mode, args.timeout, args.push_timeout, args.start)
+                                       work, args.mode, args.timeout, args.push_timeout, args.start,
+                                       push_tar=push_tar, log=print)
         print(json.dumps(receipt, ensure_ascii=False))
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print('【红】部署失败：' + str(error), file=sys.stderr)
