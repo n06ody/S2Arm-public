@@ -1079,7 +1079,16 @@ void mtl_present_wait(uint64_t ticket) {
 
 void mtl_present_flush(void) { nvk_require(); }
 void mtl_present_test_stall(uint64_t ns) { (void)ns; }
-double mtl_presented_time(uint64_t n) { return n && n <= g_present_n && g_present_n - n < 256 ? g_present_at[n % 256] : 0; }
+double mtl_presented_time(uint64_t n) {
+    if (!n || n > g_present_n || g_present_n - n >= 256) return 0;
+    // B2：display_timing 计量中 → 只报实际上屏时刻，取不到就是 UNKNOWN（0），
+    // 不拿 CPU present 返回时刻冒充（定稿 A6）；扩展缺席的设备维持原口径。
+    extern int nvn_vk_dt_active(void) __attribute__((weak));
+    extern double nvn_vk_dt_shown(uint64_t) __attribute__((weak));
+    if (nvn_vk_dt_active && nvn_vk_dt_shown && nvn_vk_dt_active())
+        return nvn_vk_dt_shown(n);
+    return g_present_at[n % 256];
+}
 uint64_t mtl_present_count(void) { return g_present_n; }
 
 void *mtl_device(void) { return NULL; }   // 没有共享 Metal device：本后端是 Vulkan

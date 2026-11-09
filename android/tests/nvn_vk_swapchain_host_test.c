@@ -438,7 +438,7 @@ int main(void) {
         g_sc.touch_generation = 42;
         s2a_android_game_touch_offer(42);
         g_present_fence_signal_on_present = 1;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, 0, why, sizeof why);
         int64_t vp[8] = {0};
         CHECK(rc == 0, "touch fixture present rc=%d", rc);
         CHECK(g_last_blit.dstOffsets[0].x == 5 && g_last_blit.dstOffsets[0].y == 0 &&
@@ -453,14 +453,14 @@ int main(void) {
     if (create_swapchain(1) == 0) {
         g_sc.touch_generation = 43; s2a_android_game_touch_offer(43);
         g_present_result = VK_ERROR_DEVICE_LOST;
-        (void)nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        (void)nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, 0, why, sizeof why);
         int64_t vp[8] = {0};
         CHECK(s2a_android_game_touch_viewport_read(vp) != 0, "failed present does not publish touch");
     }
     if (create_swapchain(1) == 0) {
         g_sc.touch_generation = 44; s2a_android_game_touch_offer(44);
         g_present_fence_signal_on_present = 1; g_revoke_on_present = 1;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, 0, why, sizeof why);
         int64_t vp[8] = {0};
         CHECK(rc == 0 && s2a_android_game_touch_viewport_read(vp) != 0,
               "first frame finishing after generation retirement must not publish");
@@ -470,7 +470,7 @@ int main(void) {
         g_sc.touch_generation = 45; s2a_android_game_touch_offer(45);
         s2a_android_game_touch_viewport(45, 0, 0, 100, 50, 100, 50);
         g_present_fence_signal_on_present = 1;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 100, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 100, NULL, 0, why, sizeof why);
         int64_t vp[8] = {0};
         CHECK(rc == 0 && s2a_android_game_touch_viewport_read(vp) != 0,
               "non-16:9 source revokes an earlier touch viewport");
@@ -484,7 +484,7 @@ int main(void) {
 
     // 1/2. present 成功 ≠ 呈现退休；两把 fence 必须不同。
     if (create_swapchain(1) == 0) {
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 0, "present success rc=%d (%s)", rc, why);
         CHECK(g_present_calls == 1, "present called once");
         CHECK(g_present_fence_info_seen, "present carries VkSwapchainPresentFenceInfoEXT");
@@ -525,12 +525,12 @@ int main(void) {
     if (create_swapchain(1) == 0) {
         g_present_fence_signal_on_present = 1;
         g_acquire_index = 0;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 0 && g_last_submit_signal == g_last_present_wait,
               "present waits the same per-image release semaphore it submitted");
         VkSemaphore rel0 = g_last_submit_signal;
         g_acquire_index = 1;
-        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 0 && g_last_submit_signal != rel0,
               "a different swapchain image uses a different release semaphore");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == 0, "destroy after per-image semaphore presents");
@@ -541,7 +541,7 @@ int main(void) {
     // 2d. acquire 成功但提交前失败：没有提交去消费 acquire 信号量 → 不能销毁；Stop 保留。
     if (create_swapchain(1) == 0) {
         g_alloc_cmd_result = VK_ERROR_OUT_OF_HOST_MEMORY;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc < 0, "command buffer failure after acquire is reported");
         CHECK(g_present_calls == 0, "no present was submitted");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == -1,
@@ -560,7 +560,7 @@ int main(void) {
         CHECK(g_acquire_calls == 1, "one acquire happened");
         rc = nvn_vk_swapchain_clear_present(&g_sc, 0.0f, 0.0f, 0.0f, 1.0f, why, sizeof why);
         CHECK(rc < 0 && g_acquire_calls == 1, "retry does not acquire again with an unconsumed semaphore");
-        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc < 0 && g_acquire_calls == 1, "present image also refuses while acquire is unconsumed");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == -1, "destroy refuses with unconsumed acquire");
         g_alloc_cmd_result = VK_SUCCESS;
@@ -568,7 +568,7 @@ int main(void) {
 
     // 3. 无后续帧 Stop：present fence 未 signal 时 destroy 保留全部对象；观察到后第二次才销毁。
     if (create_swapchain(1) == 0) {
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 0, "present before stop rc=%d", rc);
         F(g_captured_present_fence)->never_signal = 1;
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == -1, "destroy without present retirement proof fails");
@@ -587,7 +587,7 @@ int main(void) {
     // 4. 提交成功后 present 失败：命令/两把 fence 保留，不调 present_done。
     if (create_swapchain(1) == 0) {
         g_present_result = VK_ERROR_DEVICE_LOST;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc != 0, "present failure is reported");
         CHECK(g_present_done_calls == 0, "failed present does not release texture pins");
         struct nvn_vk_swapchain_present_stats st;
@@ -597,7 +597,7 @@ int main(void) {
         CHECK(g_captured_present_fence == VK_NULL_HANDLE || !F(g_captured_present_fence)->destroyed,
               "present fence retained when present failed after submit");
         int before = g_acquire_calls;
-        CHECK(nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why) != 0,
+        CHECK(nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why) != 0,
               "failed present path refuses new presents");
         CHECK(g_acquire_calls == before, "no new acquire on the failed swapchain");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == -1, "failed present path cannot claim retirement at destroy");
@@ -606,7 +606,7 @@ int main(void) {
     // 5. 渲染 fence 超时：即使 present 成功也不宣称呈现退休、不解锁 pin。
     if (create_swapchain(1) == 0) {
         g_render_fence_signal_on_submit = 0;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc != 0, "draw-completion timeout fails present");
         CHECK(g_present_done_calls == 0, "no pin release without GPU completion proof");
         struct nvn_vk_swapchain_present_stats st;
@@ -618,7 +618,7 @@ int main(void) {
     // 9. acquire 有界超时：本帧绘制完成但没拿到图像 → 跳过上屏、pin 释放、不是失败终态。
     if (create_swapchain(1) == 0) {
         g_acquire_result = VK_TIMEOUT;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 1, "acquire timeout reports frame-completed/present-skipped rc=%d", rc);
         CHECK(g_present_calls == 0, "acquire timeout does not call present");
         CHECK(g_present_done_calls == 1, "acquire timeout releases this frame\'s pins");
@@ -626,14 +626,14 @@ int main(void) {
         nvn_vk_swapchain_present_stats(&st);
         CHECK(st.acquire_timeout == 1 && st.present_failed_flag == 0, "acquire timeout is not a terminal failure");
         g_acquire_result = VK_ERROR_SURFACE_LOST_KHR;
-        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc < 0, "surface-lost acquire is a real failure");
     }
 
     // 10. acquire 直接 DEVICE_LOST：真实失败，不能当 acquire timeout 跳过。
     if (create_swapchain(1) == 0) {
         g_acquire_result = VK_ERROR_DEVICE_LOST;
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc < 0, "device-lost acquire is a real failure");
         CHECK(g_present_done_calls == 0, "device-lost acquire does not release texture pins");
         struct nvn_vk_swapchain_present_stats st;
@@ -645,7 +645,7 @@ int main(void) {
     // 7. 诊断注入 2：present 成功但没有 present fence → 退休永远不能证明，Stop 保留。
     if (create_swapchain(1) == 0) {
         fake_set_property("debug.s2a.fail_present", "2");
-        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, why, sizeof why);
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 100, 50, NULL, 0, why, sizeof why);
         CHECK(rc == 0, "present without injected fence succeeds at submit level rc=%d", rc);
         CHECK(!g_present_fence_info_seen, "fault mode 2 deliberately omits the present fence");
         struct nvn_vk_swapchain_present_stats st;

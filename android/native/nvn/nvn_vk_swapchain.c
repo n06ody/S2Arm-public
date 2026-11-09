@@ -12,6 +12,7 @@
 #include "nvn_vk_pipeline.h"
 #include "nvn_vk_first_draw.h"
 #include "nvn_vk_lifecycle.h"
+#include "nvn_vk_display_timing.h"
 
 static PFN_vkCreateAndroidSurfaceKHR pCreateSurface;
 static PFN_vkGetPhysicalDeviceSurfaceSupportKHR pSupport;
@@ -23,6 +24,8 @@ static PFN_vkDestroySwapchainKHR pDestroySwapchain;
 static PFN_vkGetSwapchainImagesKHR pGetImages;
 static PFN_vkAcquireNextImageKHR pAcquire;
 static PFN_vkQueuePresentKHR pPresent;
+static PFN_vkGetPastPresentationTimingGOOGLE pPastTiming;
+static PFN_vkGetRefreshCycleDurationGOOGLE pRefreshCycle;
 
 static int load(struct nvn_vk_swapchain *sc) {
     struct s2a_vk_device *d = sc->d;
@@ -36,6 +39,9 @@ static int load(struct nvn_vk_swapchain *sc) {
     pGetImages = (PFN_vkGetSwapchainImagesKHR)vkGetDeviceProcAddr(d->device, "vkGetSwapchainImagesKHR");
     pAcquire = (PFN_vkAcquireNextImageKHR)vkGetDeviceProcAddr(d->device, "vkAcquireNextImageKHR");
     pPresent = (PFN_vkQueuePresentKHR)vkGetDeviceProcAddr(d->device, "vkQueuePresentKHR");
+    // B2：display_timing 入口为可选扩展函数，拿不到时 nvn_vk_dt_attach 自己报 unsupported。
+    pPastTiming = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(d->device, "vkGetPastPresentationTimingGOOGLE");
+    pRefreshCycle = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(d->device, "vkGetRefreshCycleDurationGOOGLE");
     return pCreateSurface && pSupport && pCaps && pFormats && pModes && pCreateSwapchain && pDestroySwapchain && pGetImages && pAcquire && pPresent;
 }
 
@@ -79,14 +85,22 @@ static void present_account_tick(struct nvn_vk_swapchain *sc) {
         "present account: submitted=%llu draw_completed_sync=%llu presentation_retired=%llu "
         "pending=%d retained=%d deferred_retired=%llu | "
         "fail(submit=%llu present=%llu fence_timeout=%llu retire_timeout=%llu acquire_timeout=%llu) | "
-        "gpu=%s",
+        "gpu=%s dt=%s",
         (unsigned long long)sc->submitted, (unsigned long long)sc->completed,
         (unsigned long long)sc->retired, sc->npresent_pending, sc->nretained,
         (unsigned long long)nvn_vk_first_draw_deferred_retired(),
         (unsigned long long)sc->submit_failed, (unsigned long long)sc->present_failed_count,
         (unsigned long long)sc->fence_timeout, (unsigned long long)sc->retire_timeout,
         (unsigned long long)sc->acquire_timeout,
-        gpu_ok ? "valid" : "unavailable");
+        gpu_ok ? "valid" : "unavailable", nvn_vk_dt_state());
+    // B2：计量中时报真实上屏间隔（actualPresentTime 相邻帧差），QA 直接量真实帧率。
+    if (nvn_vk_dt_active()) {
+        uint64_t tg = 0, rv = 0, pd = 0; double p50 = 0, p95 = 0, mx = 0, rf = 0;
+        nvn_vk_dt_stats(&tg, &rv, &pd, &p50, &p95, &mx, &rf);
+        __android_log_print(ANDROID_LOG_INFO, "S2Arm",
+            "display timing: tagged=%llu received=%llu pending=%llu | shown gap p50=%.2fms p95=%.2fms max=%.2fms | refresh=%.3fms",
+            (unsigned long long)tg, (unsigned long long)rv, (unsigned long long)pd, p50, p95, mx, rf / 1e6);
+    }
     if (gpu_ok)
         __android_log_print(ANDROID_LOG_INFO, "S2Arm",
             "present account gpu: last=%.2f ms frame=%llu passes=%d (read after completion)",
@@ -250,6 +264,8 @@ int nvn_vk_swapchain_create(struct nvn_vk_swapchain *sc, struct s2a_vk_device *d
     sc->format = chosen.format; sc->extent = (VkExtent2D){w, h};
     sc->window_width = ww ? ww : w;
     sc->window_height = wh ? wh : h;
+    // B2：swapchain 就绪即绑定 display_timing；不支持/被关时 attach 内部报原因，present 路径零改动。
+    nvn_vk_dt_attach(d->device, d->has_display_timing, pPastTiming, pRefreshCycle);
     sc->ready = 1;
     return 0;
 }
@@ -580,7 +596,8 @@ static void publish_touch(const struct nvn_vk_swapchain *sc, uint64_t epoch,
 }
 
 int nvn_vk_swapchain_present_image(struct nvn_vk_swapchain *sc, VkImage src, VkFormat src_format,
-                                   uint32_t src_w, uint32_t src_h, const int crop[4], char *why, size_t why_size) {
+                                   uint32_t src_w, uint32_t src_h, const int crop[4], uint64_t frame,
+                                   char *why, size_t why_size) {
     const uint64_t sw0 = sw_now_ns();
     uint64_t touch_epoch = s2a_android_game_touch_epoch ? s2a_android_game_touch_epoch() : 0;
     // 先完成本帧挂起的 draw（一条 submit + 一次 fence），present 才能读 RT。
@@ -596,6 +613,8 @@ int nvn_vk_swapchain_present_image(struct nvn_vk_swapchain *sc, VkImage src, VkF
     if (sc->present_failed)
         return fail(why, why_size, "present image: swapchain present path already failed (window retirement required)");
     g_present_sc = sc;
+    // B2：每帧机会式排干已到上屏时刻（回报通常滞后 1-2 帧，不阻塞）。
+    nvn_vk_dt_poll(sc->d->device, sc->swapchain);
     // 先机会式回收上一帧已 signal 的 present fence；仍在途不是错误（FIFO 可能等下一个 vsync）。
     if (sc->npresent_pending && nvn_vk_swapchain_retire_present(sc, 0) < 0)
         return present_fail_state(sc, why, why_size, "present-retirement fence status is unusable");
@@ -765,6 +784,10 @@ int nvn_vk_swapchain_present_image(struct nvn_vk_swapchain *sc, VkImage src, VkF
     if (present_fence) pi.pNext = &fence_info;   // fault=2：故意不带 present fence，验证“退休未证明”保留
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &sc->release[index];
     pi.swapchainCount = 1; pi.pSwapchains = &sc->swapchain; pi.pImageIndices = &index;
+    // B2：display_timing 计量时给 present 挂 presentID（frame 由调用方给，0 = 不挂）。
+    VkPresentTimesInfoGOOGLE dt_info;
+    VkPresentTimeGOOGLE dt_time;
+    nvn_vk_dt_chain(&pi, &dt_info, &dt_time, frame);
     VkResult pr = pPresent(sc->d->queue, &pi);
     if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
         // 提交成功后 present 报错：渲染命令可能仍在执行，命令缓冲/fence 都不能释放/复用。
@@ -953,6 +976,7 @@ int nvn_vk_swapchain_destroy(struct nvn_vk_swapchain *sc) {
     for (uint32_t i = 0; i < sc->image_count && i < 8; i++)
         if (sc->release[i]) vkDestroySemaphore(sc->d->device, sc->release[i], NULL);
     if (sc->fence) vkDestroyFence(sc->d->device, sc->fence, NULL);
+    nvn_vk_dt_detach();   // B2：presentID/时刻账随本 swapchain 一并作古
     if (sc->swapchain && pDestroySwapchain) pDestroySwapchain(sc->d->device, sc->swapchain, NULL);
     if (sc->surface) vkDestroySurfaceKHR(sc->d->instance, sc->surface, NULL);
     if (g_present_sc == sc) g_present_sc = NULL;

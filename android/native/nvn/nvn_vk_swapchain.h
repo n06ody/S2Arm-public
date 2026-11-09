@@ -71,8 +71,10 @@ int nvn_vk_swapchain_draw_present(struct nvn_vk_swapchain *sc, struct nvn_vk_pip
 // 返回 0 = 已 present 且本帧绘制完成；1 = 本帧绘制已完成但 acquire 在有限超时内没拿到图像
 // （present 跳过、pin 已释放，下一帧重试；不能让 acquire 无界阻塞窗口撤销）；<0 = 失败。
 // GPU 绘制完成由渲染 fence、呈现退休由 present fence 分别记账；present fence 交给 retire 路径。
+// frame = 本帧序号（与 mtl_present_count()+1 同口径，B2 presentID 对号用；0 = 非帧路径/未知 → 不挂 id）。
 int nvn_vk_swapchain_present_image(struct nvn_vk_swapchain *sc, VkImage src, VkFormat src_format,
-                                   uint32_t src_w, uint32_t src_h, const int crop[4], char *why, size_t why_size);
+                                   uint32_t src_w, uint32_t src_h, const int crop[4], uint64_t frame,
+                                   char *why, size_t why_size);
 // 观察已成功 present 的 present fence。0 = 全部退休；1 = 仍有在途（未失败，保留 fence）；
 // -1 = fence 状态不可用（驱动错误；调用方按失败保留对象）。
 int nvn_vk_swapchain_retire_present(struct nvn_vk_swapchain *sc, int64_t budget_ns);

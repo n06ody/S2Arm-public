@@ -568,7 +568,8 @@ else()
     # acquire 超时跳过、maintenance1 准入；旋转/换代判定在 nvn_vk_lifecycle_test。
     # 真机驱动行为仍需设备验证。
     add_executable(nvn_vk_swapchain_host_test tests/nvn_vk_swapchain_host_test.c
-        native/nvn/nvn_vk_swapchain.c native/nvn/nvn_vk_surface.c native/game_touch.c)
+        native/nvn/nvn_vk_swapchain.c native/nvn/nvn_vk_surface.c native/game_touch.c
+        native/nvn/nvn_vk_display_timing.c)
     target_include_directories(nvn_vk_swapchain_host_test PRIVATE
         native native/nvn native/direct ../runtime/include tests/hostvk tests/vkhost
         ../graphics/nvn/third_party/vulkan-headers/include
@@ -578,6 +579,13 @@ else()
     target_compile_definitions(nvn_vk_swapchain_host_test PRIVATE VK_USE_PLATFORM_ANDROID_KHR=1)
     target_compile_options(nvn_vk_swapchain_host_test PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers)
     add_test(NAME android_nvn_vk_swapchain_host COMMAND nvn_vk_swapchain_host_test)
+    # B2：display_timing 计量的宿主回归（扩展替身：支持/不支持/乱序回报/丢帧 UNKNOWN）。
+    add_executable(nvn_vk_dt_test tests/nvn_vk_dt_test.c native/nvn/nvn_vk_display_timing.c)
+    target_include_directories(nvn_vk_dt_test PRIVATE
+        native/nvn tests/vkhost ../graphics/nvn/third_party/vulkan-headers/include)
+    target_compile_definitions(nvn_vk_dt_test PRIVATE S2A_DT_TEST)
+    target_compile_options(nvn_vk_dt_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME android_nvn_vk_dt COMMAND nvn_vk_dt_test)
     # F4.4：执行包 owner 控制（单包/挂起/恢复/Stop/换代/协议错误）。纯状态机，生产 adapter 共用。
     add_executable(nvn_vk_exec_owner_test tests/nvn_vk_exec_owner_test.c native/nvn/nvn_vk_exec_owner.c)
     target_include_directories(nvn_vk_exec_owner_test PRIVATE native/nvn)

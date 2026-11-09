@@ -221,7 +221,8 @@ int nvn_vk_session_present_tex(struct nvn_vk_session *s, const tex_t *t, const i
         if (nvn_vk_frame_stats_tl_mark && t_present0)
             nvn_vk_frame_stats_tl_mark(tl_fid, 3 /* PRESENT_BEGIN */, (double)t_present0 / 1e9);
     }
-    int rc = nvn_vk_swapchain_present_image(&s->swapchain, tex->image, fmt, tex->width, tex->height, crop, why, why_size);
+    int rc = nvn_vk_swapchain_present_image(&s->swapchain, tex->image, fmt, tex->width, tex->height, crop,
+                                          tl_fid, why, why_size);
     {
         struct timespec ts;
         if (t_present0 && clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
