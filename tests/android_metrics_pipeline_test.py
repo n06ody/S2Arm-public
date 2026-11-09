@@ -59,7 +59,9 @@ def main():
         report = battery_window(samples, runtime["markBootUs"], runtime["endBootUs"])
         assert report["averageW"] == 4.0
         assert report["comparableToIosWholeSystem"] is False
-        assert report["durationSeconds"] == (runtime["endBootUs"] - runtime["markBootUs"]) / 1e6 - 20
+        # 剔首尾 15s+5s 后的覆盖时长；两边同值但浮点舍入路径不同，按容差比
+        assert abs(report["durationSeconds"]
+                   - ((runtime["endBootUs"] - runtime["markBootUs"]) / 1e6 - 20)) < 1e-6
         assert runtime["endBootUs"] > runtime["lastFrameBootUs"], "tail stall is part of the window"
         assert runtime["markFrame"] == 2
         assert runtime["frames"] == 1904
