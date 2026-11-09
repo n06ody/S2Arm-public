@@ -28,7 +28,8 @@ spec.loader.exec_module(run_game)
 PKG = "org.s2arm.game.t0123456789abcdef"
 SERIAL = "TESTSERIAL01"
 FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge_uah",
-          "temp_tenths_c", "source", "ac_powered", "usb_powered", "wireless_powered", "dock_powered")
+          "temp_tenths_c", "source", "ac_powered", "usb_powered", "wireless_powered",
+          "dock_powered", "plugged", "interactive", "power_save", "thermal_status")
 
 FAKE_ADB = '''#!/usr/bin/env python3
 import hashlib, io, json, os, shlex, sys, tarfile, time
@@ -161,9 +162,20 @@ if cmd == "shell":
         text = sh[2]; sh = shlex.split(text)
         piped = " | " in text                 # 脚本里裸 | 才是真管道；'|' 词只是参数
     c = sh[0] if sh else ""
+    if "s2a-power-samples.log" in text and "echo $!" in text:
+        # 采样守护（sh -c 'rm -f 日志; ( while :; do 采样; sleep 1; done ) >日志 & echo $!'）：
+        # 替身不真跑循环——记 sampler_on，之后每次 cat 日志推进一拍（1s/块）；
+        # kill 停、rm 清（adb 掉线不丢采样的替身对应物：块已落在 DEV_FS 里）
+        st["sampler_on"] = True; st["sampler_ticks"] = 0
+        DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
+        save(); out("7777\\n"); sys.exit(0)
     if "power_supply" in text:
-        st["uptime_us"] += 1000000; save()
-        out(st["power_sample"] + f"boot_us={st['uptime_us']}\\n" + "capacity=80\\n"); sys.exit(0)
+        st["uptime_us"] += 1000000
+        st["sampler_ticks"] = st.get("sampler_ticks", 0) + 1
+        charge = st["charge_uah"] - st["sampler_ticks"] * st["charge_step"]
+        save()
+        out(st["power_sample"].replace("charge_counter=", f"charge_counter={charge}")
+            + f"boot_us={st['uptime_us']}\\n" + "capacity=80\\n"); sys.exit(0)
     if "/proc/uptime" in text:
         out(f"{st['uptime_us'] / 1e6:.2f} 20.00\\n"); sys.exit(0)
     if "/stat" in text and "/proc/" in text:
@@ -309,6 +321,21 @@ if cmd == "shell":
         if st.get("data_residue") and ("Android/data" in text or "Android/obb" in text):
             out("files\\n"); sys.exit(0)
         out(""); sys.exit(0)
+    if c == "cat" and len(sh) > 1:
+        p = sh[1]
+        if p == "/data/local/tmp/s2a-power-samples.log" and st.get("sampler_on"):
+            # 每拉一次守护多产一拍（替身按拉取节奏推进，不按墙钟）
+            st["uptime_us"] += 1_000_000; st["sampler_ticks"] += 1
+            charge = st["charge_uah"] - st["sampler_ticks"] * st["charge_step"]
+            DEV_FS[p] = DEV_FS.get(p, "") + (
+                st["power_sample"].replace("charge_counter=", f"charge_counter={charge}")
+                + f"boot_us={st['uptime_us']}\\ncapacity=80\\n===\\n").encode().hex()
+            save()
+        if p in DEV_FS:
+            out(bytes.fromhex(DEV_FS[p]).decode()); sys.exit(0)
+        sys.exit(1)
+    if c == "kill":
+        st["sampler_on"] = False; save(); sys.exit(0)
     if c in ("wm", "input", "id", "cat", "mkdir"):
         out(""); sys.exit(0)
     fail("fake adb: unhandled shell " + text)
@@ -332,13 +359,15 @@ def make_state(root, **kw):
                             "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"),
         "dumpsys_thermal": "Current Status:0\nType{Name,Forecast}:CPU{CPU,0.5}\n",
         # sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
-        # 没有它 battery_window 证不出「未接电」，能耗永远没数据。
+        # 没有它 battery_window 证不出「未接电」，能耗永远没数据；交互/省电/热档同理。
+        # charge_counter 由替身每拍按 charge_step 递减（800mA ≈ 222µAh/s）。
+        "charge_uah": 5_000_000, "charge_step": 222,
         "power_sample": ("status=Discharging\ncurrent_now=-800000\nvoltage_now=4000000\n"
                          "energy_now=\ncharge_counter=\ntemp=350\n"
                          "service_dump_begin\nCurrent Battery Service state:\n  AC powered: false\n"
                          "  USB powered: false\n  Wireless powered: false\n  Dock powered: false\n"
                          "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"
-                         "\nservice_dump_end\n"),
+                         "\nservice_dump_end\ninteractive=true\npower_save=false\nthermal_status=0\n"),
         "png": str(root / "shot.png"),
         "logcat_dump": str(root / "logcat_dump.txt"),
         "logcat_stream": str(root / "logcat_stream.txt"),
@@ -372,13 +401,20 @@ LOG_HEAD = """11-09 12:00:00.100  4242  4242 I S2Arm: direct provider prepared: 
 """
 
 
-def power_tsv(status="Discharging", currents=(-800000,), boots=(11e6, 12e6, 13e6), powered="false"):
-    """按 run_game 写出的列序拼 power.tsv（t + FIELDS + level）。"""
+def power_tsv(status="Discharging", currents=(-800000,), boots=None, powered="false",
+              plugged=None, interactive="1", power_save="0", thermal_status="0",
+              charge0=5_000_000, charge_step=222, charges=None):
+    """按 run_game 写出的列序拼 power.tsv（t + FIELDS + level）。
+    默认 30 行 ×1s：剔首尾 15s/5s 后分析窗还有 8s；电量计每拍 -222µAh（800mA 口径）。"""
     rows = ["t\t" + "\t".join(FIELDS) + "\tlevel"]
+    boots = boots if boots is not None else tuple(11e6 + i * 1e6 for i in range(30))
     for i, b in enumerate(boots):
         cur = currents[i % len(currents)]
-        rows.append("\t".join([str(i), str(int(b)), status, str(cur), "4000000", "", "",
-                               "350", "sysfs", powered, powered, powered, powered, "80"]))
+        charge = charges[i] if charges is not None else charge0 - i * charge_step
+        pl = plugged if plugged is not None else ("1" if powered == "true" else "0")
+        rows.append("\t".join([str(i), str(int(b)), status, str(cur), "4000000", "",
+                               str(charge), "350", "sysfs", powered, powered, powered, powered,
+                               pl, interactive, power_save, thermal_status, "80"]))
     return "\n".join(rows) + "\n"
 
 
@@ -413,9 +449,9 @@ class RunGameTest(unittest.TestCase):
         tool.chmod(0o755)
         return self.tmp / "sdk"
 
-    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200):
+    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1"):
         state = make_state(self.tmp, **(state or {}))
-        out = self.tmp / "out_1"
+        out = self.tmp / out_name
         fake = self.tmp / "fake_adb.py"
         fake.write_text(FAKE_ADB)
         old_home = os.environ.get("ANDROID_HOME")
@@ -423,7 +459,8 @@ class RunGameTest(unittest.TestCase):
         args = ["--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
                 "--out", str(out), "--seconds", str(seconds),
                 "--adb", f"{sys.executable} {fake} {state}",
-                "--lock-root", str(self.lock_root), "--ready-timeout", "5"]
+                "--lock-root", str(self.lock_root), "--ready-timeout", "5",
+                "--power-interval", "0", "--discharge-settle", "0"]
         args += argv or []
         try:
             rc = run_game.main(args)
@@ -444,7 +481,7 @@ class RunGameTest(unittest.TestCase):
             self.skipTest("Pillow 不在，跑不了 quality_check 判读")
 
     def test_clean_install_run_and_qc_accepts_dir(self):
-        rc, out, _ = self.run_tool()
+        rc, out, _ = self.run_tool(seconds=30)
         self.assertEqual(0, rc)
         for name in ("android.json", "logcat.txt", "frames.tsv", "power.tsv",
                      "battery.txt", "thermal.txt", "gfx_mode.txt", "frame_log.txt",
@@ -455,13 +492,13 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(PKG, meta["package"])
         self.assertEqual("PixelTest", meta["serial_model"])
         self.assertEqual("direct-presenter（非 SurfaceFlinger 合成时序）", meta["frame_log"]["source"])
-        # ② 帧表 = 采集窗口内的帧：窗口 [10M, 13M) us（uptime 起步 10M、3 次采样各 +1s），
-        #   帧记录 10.5M 起 16667us 步长 → 只收窗口内 150 条 → 149 行间隔；别进程（9999）的块不进来
+        # ② 帧表 = 采集窗口内的帧：窗口 [10M, 40M) us（uptime 起步 10M、30 次拉取各 +1s），
+        #   帧记录 10.5M 起 16667us 步长 ×200 → 全部落在窗口内 → 199 行间隔；别进程（9999）的块不进来
         rows = (out / "frames.tsv").read_text().splitlines()
         self.assertEqual("frame\tpresent_ns\tdisp_us\twall_us", rows[0])
-        self.assertEqual(149, len(rows) - 1)
+        self.assertEqual(199, len(rows) - 1)
         pres = [int(r.split("\t")[1]) for r in rows[1:]]
-        self.assertTrue(all(10_000_000_000 <= p < 13_000_000_000 for p in pres),
+        self.assertTrue(all(10_000_000_000 <= p < 40_000_000_000 for p in pres),
                         "窗口外的帧进了 frames.tsv")
         disp = [int(r.split("\t")[2]) for r in rows[1:]]
         self.assertTrue(all(d == 16667 for d in disp))
@@ -683,7 +720,7 @@ class RunGameTest(unittest.TestCase):
         proc = subprocess.Popen(
             [sys.executable, str(ANDROID / "tools" / "run_game.py"),
              "--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
-             "--out", str(out), "--seconds", "30",
+             "--out", str(out), "--seconds", "30", "--discharge-settle", "0",
              "--adb", f"{sys.executable} {fake} {state}",
              "--lock-root", str(self.lock_root), "--ready-timeout", "5"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -753,19 +790,70 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual("过", self._qc(d)["帧率"])
 
     def test_power_energy_verdicts(self):
-        """⑧ 能耗口径：合法放电 → 未证；未知 / 接电 / 符号不一致 / 时钟不齐 → 没数据。"""
+        """⑧ 能耗口径（兄弟项目判读门）：物理放电+交互屏+非省电+热档<3+电量计互证 → 未证；
+        接电 / 未知态 / 符号翻转 / 时钟倒退 / plugged 未知 / 熄屏 / 省电 / 热档 ≥3 /
+        电量计缺行或不互证 → 没数据。"""
         self.assertEqual("未证", self._qc_energy(power_tsv()),
-                         "整窗放电且符号一致：诊断积分应记未证")
+                         "整窗放电+电量计互证：诊断积分应记未证")
         self.assertEqual("没数据", self._qc_energy(power_tsv(status="Unknown")),
                          "未知充电状态不能当未接电")
         self.assertEqual("没数据", self._qc_energy(power_tsv(status="Charging")),
                          "窗口内接过电不算")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(powered="true")),
+                         "plugged=1：状态写放电但旗标证接电，整块作废")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(plugged="")),
+                         "plugged 读不出 = 证不了未接电，fail closed")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(interactive="0")),
+                         "熄屏/不交互：状态变了整块作废")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(power_save="1")),
+                         "省电模式开启：功率态变了整块作废")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(thermal_status="3")),
+                         "thermal_status≥3 严重降频：整块作废")
         self.assertEqual("没数据", self._qc_energy(power_tsv(currents=(-800000, 800000))),
-                         "电流符号不一致 = 放电方向未校准")
+                         "电流符号翻转 = 放电方向不自洽")
         self.assertEqual("没数据", self._qc_energy(power_tsv(currents=(0,))),
-                         "电流全零推不出放电方向")
+                         "电流全零不是合法放电读数")
         self.assertEqual("没数据", self._qc_energy(power_tsv(boots=(11e6, 12e6, 11e6))),
                          "采样时钟倒退，窗口不成立")
+        self.assertEqual("没数据", self._qc_energy(power_tsv(charges=[None] * 30)),
+                         "电量计缺列/缺行：证不出交叉核对")
+        # 电量计整局不互证：断崖放在被剔掉的首 15s（rows 0-3 狂掉）——窗内斜率照常过，
+        # 但整局掉电 275,550µAh ≫ 电流积分 6,444µAh → 交叉核对不成立，积分不采信
+        cliff_head = [5_000_000 - i * 90_000 for i in range(4)] + \
+                     [4_730_000 - (i - 4) * 222 for i in range(4, 30)]
+        self.assertEqual("没数据", self._qc_energy(power_tsv(charges=cliff_head)),
+                         "电量计跳变与电流积分不互证：积分不采信")
+        # 采样空洞 >3s：中间删 5 拍
+        boots_gap = tuple(11e6 + (i if i < 15 else i + 5) * 1e6 for i in range(25))
+        self.assertEqual("没数据", self._qc_energy(power_tsv(boots=boots_gap)),
+                         "超过 3 秒采样空洞（掉线）整块作废")
+
+    def test_discharge_settle_gate(self):
+        """⑳ 放电稳定门 + 设备侧采样守护：settle 段采样（boot<窗）也落 power.tsv；
+        manifest.power_sampler 记 dest/settle_ok；接电设备等不到连续放电 →
+        超时照采、settle_ok=False + notes 留痕。"""
+        rc, out, _ = self.run_tool(seconds=3, argv=["--discharge-settle", "3",
+                                                    "--discharge-timeout", "10"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual("/data/local/tmp/s2a-power-samples.log",
+                         man["power_sampler"]["dest"])
+        self.assertTrue(man["power_sampler"]["settle_ok"])
+        pw = (out / "power.tsv").read_text().splitlines()
+        self.assertGreater(len(pw) - 1, 3, "settle 段的采样行（boot<窗）也该落盘")
+        # 替身守护日志已清理：设备侧不留采样文件（收局收净）
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        # 接电设备（AC powered=true → plugged=1）：放电永不稳定 → 超时照采
+        plugged_sample = json.loads(make_state(self.tmp).read_text())["power_sample"].replace(
+            "AC powered: false", "AC powered: true")
+        rc, out, _ = self.run_tool(state={"power_sample": plugged_sample}, out_name="out_2",
+                                   argv=["--discharge-settle", "3",
+                                         "--discharge-timeout", "1"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertFalse(man["power_sampler"]["settle_ok"])
+        self.assertTrue(any("放电未稳" in n for n in man["notes"]), man["notes"])
 
     def _resources_dir(self, npayload=6):
         """能过 deploy_game.validate() 的最小资源目录：artifact/index/manifest 身份自洽。"""

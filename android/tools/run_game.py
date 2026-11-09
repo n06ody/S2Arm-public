@@ -368,6 +368,44 @@ def frame_dump_done(d, pkg, since):
         return True
 
 
+POWER_LOG = "/data/local/tmp/s2a-power-samples.log"
+
+
+def start_power_sampler(d, supply):
+    """设备侧采样守护：mksh 后台 while 循环 1Hz 写 `===` 分隔的采样块到
+    /data/local/tmp——adb 掉线只断拉取、不断设备上的采样（兄弟项目
+    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。"""
+    dest = POWER_LOG
+    inner = (f"rm -f {dest}; ( while :; do {android_power.sample_command(supply)}; "
+             f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+             f"printf '{android_power.BLOCK_SEP}\\n'; sleep 1; done )"
+             f" >{dest} 2>/dev/null </dev/null & echo $!")
+    out = d.shell("sh -c " + shlex.quote(inner), timeout=15).strip()
+    return dest, out.splitlines()[-1].strip()
+
+
+def power_rows(d, dest):
+    """cat 设备采样文件 → [(row, level)]；末段未封闭的尾巴不算（下轮再收）。"""
+    out = []
+    text = d.shell(f"cat {dest}", allowed=(0, 1), timeout=20)
+    for block in android_power.power_log_blocks(text):
+        try:
+            row = android_power.parse_sample(block + "\n")
+        except (RuntimeError, ValueError):
+            continue  # 坏块跳过（设备文件原样留着，不丢证据）
+        level = (re.search(r"^capacity=(\d+)$", block, re.M) or [None, ""])[1]
+        out.append((row, level))
+    return out
+
+
+def stop_power_sampler(d, dest, pid):
+    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。"""
+    d.shell(f"kill {pid}", allowed=(0, 1), timeout=10)
+    rows = power_rows(d, dest)
+    d.shell(f"rm -f {dest}", allowed=(0, 1), timeout=10)
+    return rows
+
+
 def shot(adb_argv, dest):
     r = subprocess.run([*adb_argv, "exec-out", "screencap", "-p"],
                        capture_output=True, timeout=30)
@@ -402,6 +440,12 @@ def main(argv=None):
     p.add_argument("--push-tar", choices=["auto", "always", "never"], default="auto",
                    help="资源推送方式：auto 小文件密集自动 tar 单推解开；always 强制；never 整树推")
     p.add_argument("--ready-timeout", type=int, default=180)
+    p.add_argument("--discharge-settle", type=int, default=30,
+                   help="采集窗开始前要连续物理放电的秒数（能耗口径；0=不等）")
+    p.add_argument("--discharge-timeout", type=int, default=300,
+                   help="放电稳定门的等待上限秒数（0=等到够为止；超时照常采集、能耗记没数据）")
+    p.add_argument("--power-interval", type=float, default=1.0,
+                   help="拉取设备侧电池采样文件的间隔秒")
     p.add_argument("--wait", type=float, default=0)
     p.add_argument("--lock-root", default=str(device_lock.lock_root()))
     p.add_argument("--holder", default=os.environ.get("USER", "?"))
@@ -451,6 +495,7 @@ def main(argv=None):
     data_backup, backup_dir, downgrade_back = None, None, False
     props_prev = {}
     logcat_proc, log_file = None, None
+    sampler, seen_boots, power_f = None, set(), None
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -625,29 +670,71 @@ def main(argv=None):
             notes.append("ps 里没找到当局游戏进程，帧日志无法按 PID 绑定（帧表只留表头）")
 
         # ---- 按时长采集：窗口边界取设备 /proc/uptime（与帧记录同一 CLOCK_BOOTTIME）----
+        # 电池采样走设备侧守护：1Hz 写 /data/local/tmp 私有文件（=== 分块），host 按
+        # --power-interval 拉回——adb 中途掉线只断拉取不断设备上的采样，收局/中断照样
+        # 把已落的行拉回来（兄弟项目「私存不丢」同语义）。
+        supply = "battery"
+        dest, sampler_pid = start_power_sampler(d, supply)
+        sampler = (dest, sampler_pid)
+        manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
+                                     "settle_required_s": args.discharge_settle}
+        power_f = (out / "power.tsv").open("w")
+        power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+
+        def flush_power(rows):
+            for row, level in rows:
+                boot = row.get("boot_us")
+                if boot is None or boot in seen_boots:
+                    continue
+                seen_boots.add(boot)
+                power_f.write("\t".join([str(len(seen_boots) - 1)]
+                                        + [str(row[k]) for k in android_power.FIELDS]
+                                        + [level]) + "\n")
+            power_f.flush()
+
+        def pull_rows(tag):
+            try:
+                rows = power_rows(d, dest)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                notes.append(f"{tag} 拉取设备采样文件失败（行留在设备上，重连后可拉）：{error}")
+                return []
+            flush_power(rows)
+            return [row for row, _ in rows]
+
+        # 放电稳定门（兄弟项目口径）：尾部一串「连续物理放电」采样满
+        # --discharge-settle 秒才进采集窗；上限 --discharge-timeout（0=不限）。
+        # settle=0 就是「不等」：不做任何预拉取，窗口边界直接从 col0 起。
+        settle_us = args.discharge_settle * 1_000_000
+        wait0 = time.monotonic()
+        settled = True
+        if settle_us > 0:
+            rows = pull_rows("放电稳定门")
+            settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
+            while not settled:
+                if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
+                    notes.append(f"放电未稳满 {args.discharge_settle}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
+                    break
+                time.sleep(args.power_interval)
+                rows = pull_rows("放电稳定门")
+                settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
+        manifest["power_sampler"]["settle_ok"] = settled
+        manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
+
         col0_us = uptime_us(d)
         shot(adb_argv, out / "shots_ap" / "01_000s.png")
-        supply = "battery"
-        sample_cmd = (android_power.sample_command(supply) +
-                      "; printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/" + supply +
-                      "/capacity 2>/dev/null)\"")
-        # power.tsv：android_power.FIELDS 全字段原样落盘（status/source/供电旗标不丢）+ level
-        with (out / "power.tsv").open("w") as f:
-            f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
-            for i in range(args.seconds):
-                tick = time.monotonic()
-                try:
-                    text = d.shell(sample_cmd, timeout=20)
-                    row = android_power.parse_sample(text)
-                    level = (re.search(r"^capacity=(\d+)$", text, re.M) or [None, ""])[1]
-                    f.write("\t".join([str(i)] + [str(row[k]) for k in android_power.FIELDS]
-                                      + [level]) + "\n")
-                except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    notes.append(f"第 {i}s 电池采样失败：{error}")
-                    f.write(f"{i}\t" + "\t" * (len(android_power.FIELDS) + 1) + "\n")
-                f.flush()
-                time.sleep(max(0, 1 - (time.monotonic() - tick)))
+        for i in range(args.seconds):
+            tick = time.monotonic()
+            pull_rows(f"第 {i}s")
+            time.sleep(max(0, args.power_interval - (time.monotonic() - tick)))
         col1_us = uptime_us(d)
+        try:
+            rows = stop_power_sampler(d, dest, sampler_pid)
+            sampler = None
+            flush_power(rows)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
+        power_f.close()
+        power_f = None
         shot(adb_argv, out / "shots_ap" / f"02_{args.seconds:03d}s.png")
         manifest["frame_window_us"] = [col0_us, col1_us]
         log(f"采集 {args.seconds}s 完成（窗口 boot_us {col0_us}..{col1_us}）")
@@ -737,6 +824,20 @@ def main(argv=None):
         # ---- 还原（任何结果都跑：SIGTERM / 未捕获异常也走到）----
         fails = []
         pkg = manifest.get("package", args.package or "")
+        if sampler:
+            try:  # 中断路径同样收采样守护：杀循环 → 拉回设备上已落的行 → 清理文件
+                for row, level in stop_power_sampler(d, sampler[0], sampler[1]):
+                    boot = row.get("boot_us")
+                    if boot is None or boot in seen_boots or power_f is None:
+                        continue
+                    seen_boots.add(boot)
+                    power_f.write("\t".join([str(len(seen_boots) - 1)]
+                                            + [str(row[k]) for k in android_power.FIELDS]
+                                            + [level]) + "\n")
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                fails.append(f"收电池采样守护异常：{error}")
+        if power_f is not None:
+            power_f.close()
         if launched:
             try:  # 中断路径同样先收局（优雅 s2arm.finish → force-stop 兜底），再验死
                 dev_runtime.stop(d, pkg, wait_done=lambda: frame_dump_done(d, pkg, since))
