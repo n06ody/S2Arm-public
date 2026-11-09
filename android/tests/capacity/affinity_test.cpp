@@ -46,8 +46,13 @@ int main() {
  capacity(root,1,512); mask=1; before=sets;
  setenv("S2A_DEBUG_CAPACITY_AFFINITY","split",1);s2a_capacity_test_reset_mode();
  s2a_capacity_enter(0);assert(mask==1 && sets==before);s2a_capacity_leave(0);s2a_capacity_test_reset_mode();
- // Split, top-two groups, and stop prevent late foreground reapply.
+ // A unique highest-capacity CPU leaves both roles on their original masks.
  capacity(root,0,256);capacity(root,1,512);capacity(root,2,1024);mask=7;
+ setenv("S2A_DEBUG_CAPACITY_AFFINITY","split",1);s2a_capacity_test_reset_mode();
+ before=sets;s2a_capacity_enter(0);assert(mask==7 && sets==before);
+ s2a_capacity_leave(0);s2a_capacity_test_reset_mode();
+ // Split, top-two groups, and stop prevent late foreground reapply.
+ capacity(root,1,1024);
  // Second role sees only the first role's CPU: revert the first role too.
  setenv("S2A_DEBUG_CAPACITY_AFFINITY","split",1);s2a_capacity_test_reset_mode();
  s2a_capacity_enter(0); assert(mask==4); s2a_capacity_enter(1); assert(mask==7);
@@ -55,6 +60,7 @@ int main() {
  s2a_capacity_leave(1);s2a_capacity_leave(0);s2a_capacity_test_reset_mode();
  setenv("S2A_DEBUG_CAPACITY_AFFINITY","split",1);s2a_capacity_test_reset_mode();s2a_capacity_enter(0);assert(mask==4);s2a_capacity_leave(0);assert(mask==7);
  s2a_capacity_enter(1);assert(mask==2);s2a_capacity_leave(1);assert(mask==7);
+ capacity(root,1,512);
  setenv("S2A_DEBUG_CAPACITY_AFFINITY","top2grp",1);s2a_capacity_test_reset_mode();s2a_capacity_enter(0);assert(mask==6);
  s2a_capacity_check();s2a_capacity_stop();assert(mask==7);before=sets;
  s2a_capacity_foreground(1);assert(mask==7 && sets==before);s2a_capacity_leave(0);

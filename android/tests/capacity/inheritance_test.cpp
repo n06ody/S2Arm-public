@@ -35,14 +35,14 @@ static void *inspect(void *arg) {
 }
 int main() {
     CPU_ZERO(&full); assert(!sched_getaffinity(0,sizeof(full),&full));
-    if(CPU_COUNT(&full)<2) { std::fprintf(stderr,"need at least two allowed CPUs\n"); return 77; }
+    if(CPU_COUNT(&full)<3) { std::fprintf(stderr,"need three allowed CPUs for two maximum cores and one lower core\n"); return 77; }
     long conf=sysconf(_SC_NPROCESSORS_CONF); assert(conf>0 && conf<=CPU_SETSIZE);
     char root[]="/tmp/s2a-inheritance-XXXXXX"; assert(mkdtemp(root));
-    int top=-1; for(int i=0;i<conf;++i)if(CPU_ISSET(i,&full))top=i;
+    int top=-1, second=-1; for(int i=0;i<conf;++i)if(CPU_ISSET(i,&full)){second=top;top=i;}
     for(int i=0;i<conf;++i) if(CPU_ISSET(i,&full)) {
         char dir[512],path[512]; std::snprintf(dir,sizeof(dir),"%s/cpu%d",root,i); assert(!mkdir(dir,0700));
         std::snprintf(path,sizeof(path),"%s/cpu%d/cpu_capacity",root,i); FILE *f=std::fopen(path,"w"); assert(f);
-        std::fprintf(f,"%d\n",i==top?1024:512); std::fclose(f);
+        std::fprintf(f,"%d\n",i==top || i==second ? 1024:512); std::fclose(f);
     }
     setenv("S2A_TEST_CPU_ROOT",root,1);
     // A native thread may be created before debug_env arrives: it must not freeze the mode.

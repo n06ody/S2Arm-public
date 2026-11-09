@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
+#include <functional>
 #include <vector>
 namespace s2a {
 struct CpuCapacity { unsigned id, capacity; };
@@ -25,8 +26,10 @@ inline std::vector<unsigned> capacity_cpus(const std::vector<CpuCapacity>& cpus,
     });
     if (std::strcmp(mode, "1") == 0) return highest_capacity_cpus(cpus);
     if ((std::strcmp(mode, "split") == 0 || std::strcmp(mode, "split2") == 0)) {
-        if (sorted.size() < 2 || sorted.front().capacity == sorted.back().capacity) return {};
-        return {sorted[static_cast<size_t>(role)].id};
+        auto top = highest_capacity_cpus(cpus);
+        if (top.size() < 2) return {};
+        std::sort(top.begin(), top.end(), std::greater<unsigned>());
+        return {top[static_cast<size_t>(role)]};
     }
     if (std::strcmp(mode, "top2grp") == 0) {
         unsigned first = sorted.front().capacity, second = 0;

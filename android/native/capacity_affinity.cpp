@@ -125,7 +125,12 @@ void apply(Slot &s,int role) {
     }
     const char *mode=capacity_mode();
     const auto selected=s2a::capacity_cpus(cap,mode,role);
-    if(selected.empty()) { fallback_to_mode0(role,s.tid,cap.size()<2 ? "insufficient-cpus" : "homogeneous",0); return; }
+    if(selected.empty()) {
+        const char *reason = cap.size()<2 ? "insufficient-cpus" : "homogeneous";
+        if ((!std::strcmp(mode,"split") || !std::strcmp(mode,"split2")) &&
+            s2a::highest_capacity_cpus(cap).size() == 1) reason = "highest-group-single";
+        fallback_to_mode0(role,s.tid,reason,0); return;
+    }
     for(unsigned i:selected) CPU_SET_S(i,s.bytes,s.preferred);
     Slot &other=slots[1-role];
     if ((!std::strcmp(mode,"split") || !std::strcmp(mode,"split2")) && other.applied && other.bytes==s.bytes && CPU_EQUAL_S(s.bytes,other.preferred,s.preferred)) {
