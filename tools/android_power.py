@@ -37,15 +37,15 @@ def parse_sample(text):
         if re.fullmatch(r"-?[0-9]+", current) and re.fullmatch(r"[0-9]+", voltage):
             row["current_ua"], row["voltage_uv"] = int(current), int(voltage) * 1000
             row["source"] = "battery-service"
-            row["status"] = "Unknown"
             for source, key in (("AC powered", "ac_powered"), ("USB powered", "usb_powered"),
                                 ("Wireless powered", "wireless_powered"), ("Dock powered", "dock_powered")):
                 value = fields.get(source, "").strip()
                 row[key] = value if value in ("true", "false") else ""
-            if fields.get("status", "").strip() == "3" and all(row[key] == "false" for key in FIELDS[-4:]):
-                row["status"] = "Discharging"
-            elif fields.get("status", "").strip() == "2" or any(row[key] == "true" for key in FIELDS[-4:]):
-                row["status"] = "Charging"
+            # BatteryManager status 码照实映射、供电旗标留原列，不坍缩（8E 首局
+            # status=4 NOT_CHARGING + usb_powered=true 曾被映成 Charging 丢真值）；
+            # 状态与旗标矛盾时两边都留原文，接没接电由判读者看旗标列，这里不猜。
+            row["status"] = {"2": "Charging", "3": "Discharging", "4": "Not charging",
+                             "5": "Full"}.get(fields.get("status", "").strip(), "Unknown")
             temp = fields.get("temperature", "").strip()
             if re.fullmatch(r"-?[0-9]+", temp): row["temp_tenths_c"] = int(temp)
             # AOSP BatteryService.dumpInternal marks set/unplug simulation with

@@ -147,15 +147,23 @@ def frame_log_blocks(text, pids=None):
                 seg = None
 
 
+def _clock_norm(name):
+    """帧块 clock 标签规范名：设备写 CLOCK_BOOTTIME，旧替身写 boottime——
+    剥 CLOCK_ 前缀、大小写无关后判同一时钟域；别的值照旧拒（对不上窗口时钟）。"""
+    name = str(name or "").upper()
+    return name[len("CLOCK_"):] if name.startswith("CLOCK_") else name
+
+
 def write_frames(out, caps, notes, raw_text, window_us=None):
     """frames.tsv：只写采集窗口 [w0,w1) 内的 direct-present 帧。
     帧记录 CLOCK_BOOTTIME，窗口边界同样取设备 /proc/uptime —— 同一时钟裁窗；
-    不拿「最大完整块」当有效窗：块里窗口外的帧（启动期 / 收局后）不进表。"""
+    不拿「最大完整块」当有效窗：块里窗口外的帧（启动期 / 收局后）不进表；
+    覆盖事实（span / 首尾空档 / 占比）写进返回值，覆盖不足由判读者如实判。"""
     header = "frame\tpresent_ns\tdisp_us\twall_us\n"
     (out / "frames.tsv").write_text(header)
     kept = []
     for cap in caps:
-        if cap["meta"].get("clock") not in ("boottime",):
+        if _clock_norm(cap["meta"].get("clock")) != "BOOTTIME":
             notes.append(f"块@line{cap['meta']['line']} clock={cap['meta'].get('clock')} 不是 "
                          f"boottime，对不上窗口时钟，整段未证")
             continue
@@ -163,7 +171,7 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
                if window_us is None or window_us[0] <= t < window_us[1]]
         if rec:
             kept.append((cap, rec))
-    rows = 0
+    rows, cover = 0, None
     if kept:
         cap, rec = max(kept, key=lambda k: len(k[1]))
         first = int(cap["meta"]["first"])
@@ -174,6 +182,16 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
                 # stats() 同一口径：帧号 = 1 基 present 序号；disp_us = 相邻上屏间隔
                 f.write(f"{first + i1 + 1}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}\n")
                 rows += 1
+        if window_us:
+            w0, w1 = window_us
+            t_first, t_last = rec[0][1], rec[-1][1]
+            cover = {"span_us": t_last - t_first,
+                     "head_gap_us": t_first - w0, "tail_gap_us": w1 - t_last,
+                     "ratio": round((t_last - t_first) / (w1 - w0), 4) if w1 > w0 else None}
+            if cover["ratio"] is not None and cover["ratio"] < 0.95:
+                notes.append(f"帧表只覆盖采集窗口的 {cover['ratio']:.0%}：窗口 {w1 - w0}us，"
+                             f"帧覆盖 {t_last - t_first}us（首部空 {t_first - w0}us、"
+                             f"尾部空 {w1 - t_last}us）——按窗口覆盖不足如实判")
     else:
         notes.append("采集窗口内没有 direct-present 帧（正式构建无 debug 门 / 非直连 provider 时为预期）")
     reports = []
@@ -185,7 +203,7 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
     (out / "frame_log.txt").write_text("\n".join(reports) + "\n")
     return {"source": "direct-presenter（非 SurfaceFlinger 合成时序）",
             "window_boot_us": list(window_us) if window_us else None,
-            "rows": rows, "captures": len(caps)}
+            "cover": cover, "rows": rows, "captures": len(caps)}
 
 
 def external_dirs_gone(d, pkg):
