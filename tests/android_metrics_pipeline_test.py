@@ -28,10 +28,16 @@ def main():
         temporary = Path(temporary)
         battery = temporary / "battery.tsv"
         with battery.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, ["boot_us", "status", "current_ua", "voltage_uv"], delimiter="\t")
+            writer = csv.DictWriter(stream, ["boot_us", "status", "current_ua", "voltage_uv",
+                                             "ac_powered", "usb_powered", "wireless_powered",
+                                             "dock_powered"], delimiter="\t")
             writer.writeheader()
             for timestamp in range(0, runtime["endBootUs"] + 2_000_000, 1_000_000):
-                writer.writerow({"boot_us": timestamp, "status": "Discharging", "current_ua": -1_000_000, "voltage_uv": 4_000_000})
+                # 供电旗标必须显式 false——battery_window fail closed：缺列/未知不证未接电
+                writer.writerow({"boot_us": timestamp, "status": "Discharging",
+                                 "current_ua": -1_000_000, "voltage_uv": 4_000_000,
+                                 "ac_powered": "false", "usb_powered": "false",
+                                 "wireless_powered": "false", "dock_powered": "false"})
         source_info = temporary / "battery-source.json"
         source_info.write_text(json.dumps({"clock": "CLOCK_BOOTTIME", "scope": "battery", "units": {"current_ua": "uA", "voltage_uv": "uV"}}), encoding="utf-8")
         files.update({"battery.tsv": battery, "battery-source.json": source_info})

@@ -251,10 +251,17 @@ def make_state(root, **kw):
             "debug.s2a.debug_env": "", "debug.s2a.frame_log": "",
         },
         "dumpsys_battery": ("Current Battery Service state:\n  AC powered: false\n  USB powered: false\n"
+                            "  Wireless powered: false\n  Dock powered: false\n"
                             "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"),
         "dumpsys_thermal": "Current Status:0\nType{Name,Forecast}:CPU{CPU,0.5}\n",
+        # sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
+        # 没有它 battery_window 证不出「未接电」，能耗永远没数据。
         "power_sample": ("status=Discharging\ncurrent_now=-800000\nvoltage_now=4000000\n"
-                         "energy_now=\ncharge_counter=\ntemp=350\n"),
+                         "energy_now=\ncharge_counter=\ntemp=350\n"
+                         "service_dump_begin\nCurrent Battery Service state:\n  AC powered: false\n"
+                         "  USB powered: false\n  Wireless powered: false\n  Dock powered: false\n"
+                         "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"
+                         "\nservice_dump_end\n"),
         "png": str(root / "shot.png"),
         "logcat_dump": str(root / "logcat_dump.txt"),
         "logcat_stream": str(root / "logcat_stream.txt"),
@@ -580,6 +587,59 @@ class RunGameTest(unittest.TestCase):
             for i in range(1, 3601):
                 fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t{(w0 + i * 16667) * 1000}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
+
+    def test_truncated_frame_block_reports_missing_chunks(self):
+        """⑱ 转储截断如实报：meta 声明 N 片只收到 N-2 片且无 end（镜像 8E 二局
+        meta chunks=225 只到 1–201 的断法）——manifest notes 必须写「截断」+
+        缺了哪些片，不能静默丢成「没有 direct-present 帧」。"""
+        lines = frame_log_text().splitlines(keepends=True)
+        truncated = "".join(lines[:-3])          # 丢末 2 个分片行 + end 行
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + truncated)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + truncated)
+        rc, out, _ = self.run_tool()
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(1, len(rows), "截断块一帧都不该进表")
+        man = json.loads((out / "run-manifest.json").read_text())
+        trunc = [n for n in man["notes"] if "截断" in n]
+        self.assertTrue(trunc, f"notes 没有截断报告：{man['notes']}")
+        self.assertIn("缺分片", trunc[0])
+
+    def test_stop_waits_dump_end_before_force_stop(self):
+        """⑲ 收局时序：wait_done 没见 end 前不得 force-stop（有上限照走）；
+        见 end 后进程还赖着才强杀；进程在转储窗口内先退 → 不强杀。"""
+        calls = []
+        class StubD:
+            def __init__(self, alive_polls):
+                self.pid_calls = 0
+                self.alive_polls = alive_polls
+            def shell(self, cmd, allowed=(0,), timeout=None):
+                calls.append(cmd)
+                if cmd.startswith("pidof"):
+                    self.pid_calls += 1
+                    return "4242\n" if self.pid_calls <= self.alive_polls else ""
+                return ""
+        # A：wait_done 第 3 次轮询才报定——force-stop 只能在它之后发出
+        d = StubD(alive_polls=10**9)
+        polls = [0]
+        def done():
+            polls[0] += 1
+            return polls[0] >= 3
+        res = run_game.dev_runtime.stop(d, PKG, wait_done=done, wait_seconds=30)
+        self.assertEqual(3, polls[0], "没见 end 就该继续等，不能提前往下走")
+        self.assertTrue(res["forced_stop"], "转储落定后进程还赖着 → 才强杀")
+        self.assertTrue(res["dump_done"])
+        self.assertEqual("am force-stop " + PKG, calls[-1])
+        # B：wait_done 到点不报 → 照常往下走；进程在窗口内先退 → 不强杀
+        d = StubD(alive_polls=2)
+        res = run_game.dev_runtime.stop(d, PKG, wait_done=lambda: False, wait_seconds=0)
+        self.assertFalse(res["dump_done"])
+        self.assertFalse(res["forced_stop"])
+        # C：不给 wait_done → 旧行为：pidof 一空即回
+        d = StubD(alive_polls=1)
+        res = run_game.dev_runtime.stop(d, PKG)
+        self.assertFalse(res["forced_stop"])
+        self.assertNotIn("dump_done", res)
 
     def test_wrong_clock_block_rejected_not_windowed(self):
         """⑰ clock 非 boottime 的块（墙钟/CLOCK_REALTIME）与窗口时钟对不上：

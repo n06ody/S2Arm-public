@@ -129,7 +129,9 @@ def pid_birth(d, pid):
 
 def frame_log_blocks(text, pids=None):
     """meta→end 切帧日志块；给 pids 时只收这些 PID 的行（logcat 行前缀 PID 绑定当局进程）。
-    没前缀 / 别的 PID 的帧日志行一律不进块；末尾被截断的块只坏自己。"""
+    没前缀 / 别的 PID 的帧日志行一律不进块；末尾被截断的块只坏自己。
+    截断块（没等到 end：被新 meta 顶断 / 文末就断了）同样交出——缺了哪些片、
+    缺 end/SHA 由 parser 如实报「转储被截断 / 整段未证」，不静默丢。"""
     seg = None
     for line in text.splitlines():
         if "direct frame-log" not in line:
@@ -139,12 +141,16 @@ def frame_log_blocks(text, pids=None):
             if not m or int(m.group(1)) not in pids:
                 continue
         if "direct frame-log meta:" in line:
+            if seg is not None:
+                yield "\n".join(seg)
             seg = []
         if seg is not None:
             seg.append(line)
             if "direct frame-log end:" in line:
                 yield "\n".join(seg)
                 seg = None
+    if seg is not None:
+        yield "\n".join(seg)
 
 
 def _clock_norm(name):
@@ -253,6 +259,18 @@ def verify_stopped(d, pkg, seconds=5):
             return True
         time.sleep(0.5)
     return False
+
+
+def frame_dump_done(d, pkg, since):
+    """优雅收局触发的帧日志转储落定判据：logcat 见到 end 行，或当局进程
+    （pkg / pkg:*）全退——都退了转储不会再长，截断由帧块解析如实报；
+    adb 坏了也当落定，不能在这里等死。"""
+    try:
+        if FRAMELOG_END in d.shell(f"logcat -d -v brief -T {shlex.quote(since)} -s S2Arm:I"):
+            return True
+        return not session_pids(d, pkg)
+    except (RuntimeError, subprocess.SubprocessError):
+        return True
 
 
 def shot(adb_argv, dest):
@@ -505,7 +523,11 @@ def main(argv=None):
         log(f"采集 {args.seconds}s 完成（窗口 boot_us {col0_us}..{col1_us}）")
 
         # ---- 收局 ----
-        manifest["stop"] = dev_runtime.stop(d, pkg)
+        # 优雅收局触发适配器 shutdown 帧日志转储（meta→分片→end+sha）：先等
+        # end 落进 logcat（有上限）再验死/强杀——8E 二局 meta 声明 225 片只收到
+        # 1–201（:game 在转储写完前就死了）。等不到也照常停，截断如实报。
+        manifest["stop"] = dev_runtime.stop(d, pkg,
+                                           wait_done=lambda: frame_dump_done(d, pkg, since))
         manifest["stop_verified"] = verify_stopped(d, pkg)
         if not manifest["stop_verified"]:
             notes.append("收局后游戏进程仍存活（收局确认未过，按还原失败路径处理）")
@@ -543,7 +565,7 @@ def main(argv=None):
                                 seen.add(key)
                                 caps.append(cap)
                     except direct_framelog.FrameLogError as error:
-                        notes.append(f"帧日志块不完整被弃：{error}")
+                        notes.append(f"帧日志块截断/不完整被弃（整段未证）：{str(error)[:500]}")
         if not direct:
             notes.append("logcat 没有「direct provider prepared」：非直连 provider（SurfaceFlinger 路），"
                          "帧表不写帧（direct present 与 SF 时序不混算）")
@@ -587,7 +609,7 @@ def main(argv=None):
         pkg = manifest.get("package", args.package or "")
         if launched:
             try:  # 中断路径同样先收局（优雅 s2arm.finish → force-stop 兜底），再验死
-                dev_runtime.stop(d, pkg)
+                dev_runtime.stop(d, pkg, wait_done=lambda: frame_dump_done(d, pkg, since))
             except (RuntimeError, subprocess.SubprocessError) as error:
                 fails.append(f"收局 adb 异常：{error}")
             try:
