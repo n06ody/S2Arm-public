@@ -218,6 +218,21 @@ def pid_birth(d, pid):
         return None
 
 
+USER_HZ = 100     # Android 内核 jiffies 用户态口径恒 100
+
+
+def device_timebase(d):
+    """设备墙钟（date +%s）+ 开机秒（/proc/uptime）一对：把 birth_ticks 折成墙钟
+    （birth_wall_s = wall_now -（uptime_now - ticks/USER_HZ）），与文件 mtime 同一
+    CLOCK_REALTIME 可比。取不到返回 (None, None)。"""
+    try:
+        wall_s = int(d.shell("date +%s", timeout=10).strip())
+        uptime_s = float(d.shell("cat /proc/uptime", timeout=10).split()[0])
+        return wall_s, uptime_s
+    except (RuntimeError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
+
+
 def frame_log_blocks(text, pids=None):
     """meta→end 切帧日志块；给 pids 时只收这些 PID 的行（logcat 行前缀 PID 绑定当局进程）。
     没前缀 / 别的 PID 的帧日志行一律不进块；末尾被截断的块只坏自己。
@@ -306,25 +321,68 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
 PRIV_LOG_NAME = re.compile(r"^(?:host-\d+-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
 
 
-def collect_private_logs(d, pkg, pids, out, notes):
+def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
-    文件名绑当局 PID，别局/别进程的不拉；run-as 只给 debuggable 包——拉不到记注
-    （证据缺 ≠ 还原失败）。必须在收局还原（pm clear/卸载清私有目录）前调用。
-    返回（落盘文件名列表, frame-log 原文列表）。"""
-    names, frame_texts = [], []
+
+    归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
+    - 三绑定：文件名 PID 须在 session_pids 里，且 stat mtime ≥ 该 PID 的 birth_wall_s
+      （birth_ticks 折墙钟——同 PID 旧局文件/旧进程写的文件不证归属，跳过记注）；
+      birth 折不出就退回起局设备墙钟当 session 窗；
+    - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
+      exec-out 拉回后逐字节核对；不符或拉回空数据标 verified=False
+      （rc=0 空读不能当成功）；
+    - pids 为空（READY 前异常：进程死了没绑到当局 PID）→ 退化成按起局时间窗
+      + 文件名 PID 收证、session=unproven 如实标——死前宿主日志正是失败现场证据；
+      连候选都没有也写明未证；
+    - run-as 只给 debuggable 包——进不去记注（证据缺 ≠ 还原失败）。
+    必须在收局还原（pm clear/卸载清私有目录）前调用。
+    返回（manifest 记录列表, frame-log 原文列表）。"""
+    records, frame_texts = [], []
     try:
         found = d.run_as(pkg, f"find /data/data/{pkg} -type f -name '*.log'", timeout=60)
     except (RuntimeError, subprocess.SubprocessError) as error:
         notes.append(f"私有日志目录进不去（非 debuggable/包已卸）就没拉：{str(error)[:200]}")
-        return names, frame_texts
-    dest = out / "host_logs"
+        return records, frame_texts
+    candidates = []
     for path in sorted(ln.strip() for ln in found.splitlines() if ln.strip()):
         m = PRIV_LOG_NAME.match(path.rsplit("/", 1)[-1])
-        pid = m and int(m.group(1) or m.group(2))
-        if not pid or pid not in pids:
-            continue
+        if m:
+            candidates.append((path, int(m.group(1) or m.group(2))))
+    if pids:
+        candidates = [c for c in candidates if c[1] in pids]
+        if not candidates:
+            notes.append("私有目录下没有匹配当局 PID 的日志文件（零匹配如实记）")
+    elif candidates:
+        notes.append("没有当局进程绑定（READY 前异常）：私有日志退化按起局时间窗"
+                     "+文件名 PID 收证，归属未证（session=unproven）")
+    else:
+        notes.append("READY 前异常且私有目录下没有任何日志可收：失败现场证据未证")
+    dest = out / "host_logs"
+    for path, pid in candidates:
+        name = path.rsplit("/", 1)[-1]
+        session = "bound" if pids else "unproven"
+        bound_s = (birth_walls or {}).get(pid, launch_wall_s)  # 进程出生墙钟优先
+        if bound_s is not None:
+            try:
+                mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}", timeout=30).strip())
+            except (RuntimeError, subprocess.SubprocessError, ValueError):
+                mtime = None
+            if mtime is not None and mtime < bound_s - 2:    # 折墙钟留 2s 量化余量
+                notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生/起局窗，"
+                             f"同 PID 旧局文件不证归属，不拉")
+                continue
+        # 源端字节/SHA 先记账：exec-out rc=0 空读/截断传输出核对不上就标未证
+        want_sha = want_bytes = None
+        try:
+            meta_out = d.run_as(pkg, f"sha256sum {shlex.quote(path)}; wc -c < {shlex.quote(path)}",
+                                timeout=60)
+            lines = [ln.strip() for ln in meta_out.splitlines() if ln.strip()]
+            if len(lines) >= 2 and re.fullmatch(r"[0-9a-f]{64}", lines[0].split()[0]):
+                want_sha, want_bytes = lines[0].split()[0], int(lines[-1].split()[0])
+        except (RuntimeError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
         # exec-out 不经 pty：host 日志含 NUL，原始字节不被 \r\n 改写（同 run-as 备份）
         r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
                             f"cat {shlex.quote(path)}"], capture_output=True, timeout=300)
@@ -332,13 +390,20 @@ def collect_private_logs(d, pkg, pids, out, notes):
             notes.append(f"私有日志 {path} 拉取失败 rc={r.returncode}："
                          f"{r.stderr.decode(errors='replace')[:160]}")
             continue
+        got_sha, got_bytes = hashlib.sha256(r.stdout).hexdigest(), len(r.stdout)
+        verified = bool(got_bytes) and want_sha == got_sha and want_bytes == got_bytes
+        if not verified:
+            why = "拉回空数据" if not got_bytes else \
+                  f"源 {want_bytes}B/{str(want_sha)[:12]} ≠ 拉回 {got_bytes}B/{got_sha[:12]}"
+            notes.append(f"私有日志 {name} 拉取校验不符（{why}）：标未证")
         dest.mkdir(exist_ok=True)
-        name = path.rsplit("/", 1)[-1]
         (dest / name).write_bytes(r.stdout)
-        names.append(name)
-        if name.startswith("frame-log-"):
+        records.append({"name": name, "pid": pid, "bytes": got_bytes, "sha256": got_sha,
+                        "device_bytes": want_bytes, "device_sha256": want_sha,
+                        "verified": verified, "session": session})
+        if name.startswith("frame-log-") and verified and session == "bound":
             frame_texts.append(r.stdout.decode(errors="replace"))
-    return names, frame_texts
+    return records, frame_texts
 
 
 def external_dirs_gone(d, pkg):
@@ -505,7 +570,12 @@ def main(argv=None):
     if not args.package and not (args.resources or args.pack):
         p.error("apk 直装需要 --package（带 --resources/--pack 时按 artifact 取包名）")
     for e in args.extra:
-        if not dev_runtime.EXTRA.fullmatch(e):
+        # s2arm.debug_env 的值是 S2A_KEY=VALUE 形式（本身带 =），按调试环境批次口径单验；
+        # 其余 extra 照旧 dev_runtime.EXTRA 的值字符集
+        if e.startswith("s2arm.debug_env="):
+            if not re.fullmatch(r"s2arm\.debug_env=S2A_[A-Za-z0-9_]+=[^\x00]{1,8192}", e):
+                p.error(f"s2arm.debug_env 只收 S2A_KEY=VALUE：{e!r}")
+        elif not dev_runtime.EXTRA.fullmatch(e):
             p.error(f"--extra 只收 s2arm.KEY[=VALUE]：{e!r}")
 
     d = dev_runtime.Device(args.adb, args.serial)
@@ -536,7 +606,7 @@ def main(argv=None):
     props_prev = {}
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
-    pids, priv_done = {}, False
+    pids, priv_done, launch_wall_s, birth_walls = {}, False, None, {}
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -676,6 +746,10 @@ def main(argv=None):
             launch += (["--ez", name, value or "true"] if value in ("", "true", "false")
                        else ["--es", name, value])
         launch_str = " ".join(shlex.quote(a) for a in launch)
+        try:  # 起局设备墙钟：私有日志 mtime 归属判定的基准（取不到就跳过该判据）
+            launch_wall_s = int(d.shell("date +%s").strip())
+        except (RuntimeError, subprocess.SubprocessError, ValueError):
+            launch_wall_s = None
         started = d.shell(launch_str, timeout=120)
         if re.search(r"Error|Exception", started):  # am start 组件不存在也 rc=0，只看退出码会漏
             raise Refuse(f"am start 报错：{started.strip()[:200]}")
@@ -703,8 +777,16 @@ def main(argv=None):
         log("READY")
 
         # ---- 当局绑定：游戏进程（pkg / pkg:*）+ 出生证，帧日志块只收这些 PID 的行 ----
+        # ---- birth_ticks 折成墙钟：私有日志按 mtime ≥ birth_wall 绑到本次进程出生 ----
         pids = session_pids(d, pkg)
-        manifest["session"] = {"pids": {str(pid): {"name": name, "birth_ticks": pid_birth(d, pid)}
+        births = {pid: pid_birth(d, pid) for pid in pids}
+        wall_now, uptime_now = device_timebase(d)
+        birth_walls = {pid: wall_now - max(0.0, uptime_now - ticks / USER_HZ)
+                       for pid, ticks in births.items()
+                       if ticks is not None and wall_now is not None and uptime_now is not None}
+        manifest["session"] = {"pids": {str(pid): {"name": name,
+                                                 "birth_ticks": births[pid],
+                                                 "birth_wall_s": birth_walls.get(pid)}
                                         for pid, name in pids.items()},
                                "ready_line": READY}
         if not pids:
@@ -798,8 +880,9 @@ def main(argv=None):
 
         # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
-        priv_names, priv_frames = collect_private_logs(d, pkg, pids, out, notes)
-        manifest["private_logs"] = priv_names
+        priv_records, priv_frames = collect_private_logs(
+            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls)
+        manifest["private_logs"] = priv_records
         priv_done = True
 
         # ---- 归置产物 ----
@@ -903,7 +986,9 @@ def main(argv=None):
                 fails.append(f"收局确认 adb 异常：{error}")
         if launched and not priv_done:
             try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
-                manifest["private_logs"], _ = collect_private_logs(d, pkg, pids, out, notes)
+                manifest["private_logs"], _ = collect_private_logs(
+                    d, pkg, pids, out, notes, launch_wall_s=launch_wall_s,
+                    birth_walls=birth_walls)
                 priv_done = True
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")

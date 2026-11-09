@@ -16,7 +16,7 @@
     设备 pm 不支持 -d → 装新包前就拒跑
   ⑪ 还原后数据 sha 与备份清单不符 → 留置
 """
-import base64, hashlib, importlib.util, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -98,8 +98,31 @@ def run_as(cmdline):
             if p.startswith(root_.rstrip("/") + "/"):
                 rel = p[len(root_.rstrip("/")) + 1:]
                 if rel in files_:
-                    sys.stdout.buffer.write(bytes.fromhex(files_[rel])); return
+                    data = bytes.fromhex(files_[rel])
+                    if st.get("priv_empty"):
+                        data = b""                             # 空传输：rc=0 但零字节
+                    elif st.get("priv_truncate"):
+                        data = data[:max(0, len(data) // 2)]   # 截断传输：rc=0 但短读
+                    sys.stdout.buffer.write(data); return
         fail("cat: " + p + ": No such file or directory")
+    m = _re.match(r"^stat -c %Y (\\S+)$", cmdline)
+    if m:
+        p = m.group(1)          # 文件 mtime（秒）：data_mtime 旋钮可给旧局文件配老时间
+        for root_, files_ in DATA_DIRS.items():
+            if p.startswith(root_.rstrip("/") + "/") and \
+                    p[len(root_.rstrip("/")) + 1:] in files_:
+                out(str(st.get("data_mtime", {}).get(p, st["wall_s"])) + "\\n"); return
+        fail("stat: " + p + ": No such file or directory")
+    m = _re.match(r"^sha256sum (\\S+); wc -c < (\\S+)$", cmdline)
+    if m:
+        p = m.group(1)          # 源端字节/SHA 记账：拉取校验的对照值
+        for root_, files_ in DATA_DIRS.items():
+            if p.startswith(root_.rstrip("/") + "/"):
+                rel = p[len(root_.rstrip("/")) + 1:]
+                if rel in files_:
+                    blob = bytes.fromhex(files_[rel])
+                    out(f"{file_sha(blob)}  {p}\\n{len(blob)}\\n"); return
+        fail("sha256sum: " + p + ": No such file or directory")
     m = _re.match(r"^\\[ -d (\\S+) \\] && echo yes \\|\\| true$", cmdline)
     if m:
         out("yes\\n" if m.group(1) in DATA_DIRS else ""); return
@@ -198,7 +221,9 @@ if cmd == "shell":
     if "/proc/uptime" in text:
         out(f"{st['uptime_us'] / 1e6:.2f} 20.00\\n"); sys.exit(0)
     if "/stat" in text and "/proc/" in text:
-        out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + " 55555\\n"); sys.exit(0)
+        # starttime（开机 jiffies）：出生 = 当前 uptime - birth_lag（缺省 2s 前起）
+        ticks = int(st["uptime_us"] / 1e6 * 100) - st.get("birth_lag_ticks", 200)
+        out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
         key = " ".join(sh[1:])
         out(st["props"].get(key, "") + "\\n"); sys.exit(0)
@@ -295,6 +320,11 @@ if cmd == "shell":
             PUSHED.pop(p, None)
         save(); sys.exit(0)
     if c == "pidof":
+        if st.get("die_before_ready") and st.get("running") and not st.get("_die_seen"):
+            st["_die_seen"] = True; save()                       # 起过 → 下一拍就死
+            out(st.get("pid", "4242") + "\\n"); sys.exit(0)
+        if st.get("die_before_ready") and st.get("_die_seen"):
+            st["running"] = False; save(); out(""); sys.exit(0)
         out((st.get("pid", "4242") + "\\n") if st.get("running") else ""); sys.exit(0)
     if c == "ps":
         if st.get("running"):
@@ -312,7 +342,9 @@ if cmd == "shell":
                     # logcat_dump 剥行前缀派生；priv_frame_log 旋钮给显式文件内容
                     # （比如 logcat 分片被截断但文件完整的救场局）。
                     dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
-                    if st.get("priv_frame_log") is not None:
+                    if st.get("no_priv_seed"):
+                        pass    # 零匹配负控：finish 不落 frame-log
+                    elif st.get("priv_frame_log") is not None:
                         dd["files/frame-log-4242.log"] = st["priv_frame_log"].encode().hex()
                     else:
                         segs = {}
@@ -328,9 +360,10 @@ if cmd == "shell":
                 st["running"] = True
                 st["launch_cmd"] = text
                 # 游戏起局：宿主日志落 files/ryujinx-android/host-<uptime>-<pid>-<hex>.log
-                dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
-                dd[f"files/ryujinx-android/host-{st['uptime_us'] // 1000000}-4242-Ab12.log"] = \
-                    st.get("host_log", "host log run\\n").encode().hex()
+                if not st.get("no_priv_seed"):
+                    dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
+                    dd[f"files/ryujinx-android/host-{st['uptime_us'] // 1000000}-4242-Ab12.log"] = \
+                        st.get("host_log", "host log run\\n").encode().hex()
                 # 游戏起局即改写自己的数据（存档/新文件）——还原不还原从这里才分得出来
                 for dir_ in list(DATA_DIRS):
                     if DATA_DIRS[dir_]:
@@ -342,7 +375,8 @@ if cmd == "shell":
             save(); sys.exit(0)
         sys.exit(0)
     if c == "date":
-        out("11-09 12:00:00.000\\n"); sys.exit(0)
+        out((str(st["wall_s"]) if "+%s" in text else "11-09 12:00:00.000") + "\\n")
+        sys.exit(0)
     if c == "dumpsys":
         if len(sh) > 1 and sh[1] == "battery": out(st["dumpsys_battery"]); sys.exit(0)
         if len(sh) > 1 and sh[1] == "thermalservice": out(st["dumpsys_thermal"]); sys.exit(0)
@@ -356,7 +390,12 @@ if cmd == "shell":
         run_as(sh[4]); sys.exit(0)
     if c == "logcat":
         if "-c" in sh: sys.exit(0)
-        if "-d" in sh: out(open(st["logcat_dump"]).read()); sys.exit(0)
+        if "-d" in sh:
+            dump = open(st["logcat_dump"]).read()
+            if st.get("die_before_ready"):   # READY 前死：logcat 里不会有 READY 行
+                dump = "\\n".join(ln for ln in dump.splitlines()
+                                 if "Game startup accepted:" not in ln) + "\\n"
+            out(dump); sys.exit(0)
         sys.exit(0)
     if c == "ls":
         if st.get("data_residue") and ("Android/data" in text or "Android/obb" in text):
@@ -388,7 +427,7 @@ def make_state(root, **kw):
     state = {
         "package": PKG, "installed": False, "installed_sha": "", "running": False,
         "pid": "4242", "base_path": f"/data/app/{PKG}-Ab12/base.apk",
-        "orig_apk_hex": "aabbccdd", "uptime_us": 10_000_000,
+        "orig_apk_hex": "aabbccdd", "uptime_us": 10_000_000, "wall_s": 1_700_000_000,
         "debuggable": False, "orig_vc": 200, "data_dirs": {}, "pushed": {},
         "props": {
             "ro.product.model": "PixelTest", "ro.soc.model": "TEST_SOC",
@@ -915,7 +954,20 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(b"host log run\n",
                          (out / "host_logs/host-10-4242-Ab12.log").read_bytes())
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertEqual(logs, sorted(man["private_logs"]))
+        self.assertEqual(logs, sorted(r["name"] for r in man["private_logs"]))
+        host_rec = next(r for r in man["private_logs"] if r["name"].startswith("host-"))
+        want = b"host log run\n"
+        self.assertEqual({"name": "host-10-4242-Ab12.log", "pid": 4242,
+                          "bytes": len(want), "sha256": hashlib.sha256(want).hexdigest(),
+                          "device_bytes": len(want),
+                          "device_sha256": hashlib.sha256(want).hexdigest(),
+                          "verified": True, "session": "bound"}, host_rec,
+                         "manifest 记账要带上源端核对的字节/SHA/归属（双侧对拍）")
+        sess = man["session"]["pids"]["4242"]
+        wall = json.loads((self.tmp / "state.json").read_text())["wall_s"]
+        self.assertEqual(800, sess["birth_ticks"], "出生证 jiffies 要记账")
+        self.assertEqual(wall - 2, sess["birth_wall_s"],
+                         "birth_ticks 要折成墙钟（wall - (uptime - ticks/100)）")
         rows = (out / "frames.tsv").read_text().splitlines()
         self.assertEqual(199, len(rows) - 1, "私有帧块与 logcat 同文去重后帧数不变")
 
@@ -945,6 +997,91 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertEqual([], man["private_logs"])
         self.assertTrue(any("私有日志" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_stale_same_pid_not_attributed(self):
+        """㉒ 同 PID 旧局文件：mtime 早于本局起局设备墙钟 → 不证归属、跳过记注，
+        本局新落的同 PID 文件照拉。"""
+        stale = "/data/data/" + PKG + "/files/ryujinx-android/host-7-4242-Zz00.log"
+        state = {"data_dirs": {"/data/data/" + PKG: {
+                     "files/ryujinx-android/host-7-4242-Zz00.log": b"old run\n".hex()}},
+                 "data_mtime": {stale: 1_699_900_000}}   # wall_s=1700000000 之前 = 旧局
+        rc, out, _ = self.run_tool(seconds=30, state=state)
+        self.assertEqual(0, rc)
+        logs = sorted(p.name for p in (out / "host_logs").iterdir())
+        self.assertNotIn("host-7-4242-Zz00.log", logs, "同 PID 旧局文件不该被当本局证据拉回")
+        self.assertIn("host-10-4242-Ab12.log", logs)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotIn("host-7-4242-Zz00.log", [r["name"] for r in man["private_logs"]])
+        self.assertTrue(any("旧局" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_truncated_pull_marked_unverified(self):
+        """㉒ exec-out rc=0 但短读（截断传输）：源端 sha/wc 对不上 → verified=False
+        记注标未证，不拿半截字节冒充完整证据。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"priv_truncate": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"])
+        self.assertTrue(all(not r["verified"] for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("校验不符" in n for n in man["notes"]), man["notes"])
+        unv = man["private_logs"][0]
+        self.assertEqual(unv["bytes"], len((out / "host_logs" / unv["name"]).read_bytes()))
+
+    def test_private_logs_empty_pull_marked_unverified(self):
+        """㉒ exec-out rc=0 但拉回零字节：qa-fone 点名『空数据不能当成功』→
+        verified=False 记注标未证。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"priv_empty": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"])
+        self.assertTrue(all(not r["verified"] for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("空数据" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_zero_match_noted(self):
+        """㉒ 当局 PID 在私有目录下零匹配（设备没落任何相关文件）→ 显式记注，
+        不静默略过。"""
+        foreign = {"no_priv_seed": True, "data_dirs": {"/data/data/" + PKG: {
+            "files/ryujinx-android/host-9-9999-Xx99.log": b"foreign\n".hex()}}}
+        rc, out, _ = self.run_tool(seconds=30, state=foreign)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual([], man["private_logs"])
+        self.assertTrue(any("零匹配" in n for n in man["notes"]), man["notes"])
+
+    def test_ready_failure_still_collects_private_evidence(self):
+        """㉒ READY 前进程已退出（pids 空）：finally 仍按文件名+起局窗收证、session 标
+        unproven——死前宿主日志正是失败现场证据；连候选都没有写明未证。"""
+        rc, out, _ = self.run_tool(state={"die_before_ready": True})
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("READY 前进程已退出", man["reason"])
+        pulled = [r for r in man["private_logs"] if r["name"].startswith("host-")]
+        self.assertTrue(pulled, "READY 前失败也要把死前宿主日志拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in pulled))
+        self.assertTrue((out / "host_logs" / "host-10-4242-Ab12.log").is_file())
+        # 零候选变体：没落任何日志 → 失败现场证据明确记未证，不静默
+        rc2, out2, _ = self.run_tool(state={"die_before_ready": True, "no_priv_seed": True},
+                                     out_name="out_2")
+        self.assertNotEqual(0, rc2)
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertEqual([], man2["private_logs"])
+        self.assertTrue(any("未证" in n for n in man2["notes"]), man2["notes"])
+
+    def test_debug_env_extra_reaches_launch(self):
+        """s2arm.debug_env 的值自带 =（S2A_KEY=VALUE）：放行并进启动行；非法值拒绝。"""
+        self.run_tool(argv=["--extra", "s2arm.debug_env=S2A_DEBUG_CAPACITY_AFFINITY=0"], state={})
+        meta = json.loads((self.tmp / "out_1" / "android.json").read_text())
+        self.assertIn("--es s2arm.debug_env S2A_DEBUG_CAPACITY_AFFINITY=0", meta["launch"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("s2arm.debug_env S2A_DEBUG_CAPACITY_AFFINITY=0", st["launch_cmd"])
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            run_game.main(["--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
+                           "--out", str(self.tmp / "bad_out"), "--seconds", "1",
+                           "--adb", "adb", "--lock-root", str(self.lock_root),
+                           "--extra", "s2arm.debug_env=not-s2a-key=0"])
+        self.assertIn("S2A_KEY=VALUE", err.getvalue())
 
     def _resources_dir(self, npayload=6):
         """能过 deploy_game.validate() 的最小资源目录：artifact/index/manifest 身份自洽。"""
