@@ -10,6 +10,7 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
                 [--extra s2arm.KEY[=VALUE] ...]   # 其他 intent extra（true/false 走 --ez）
                 [--adb "adb"] [--ready-timeout 180] [--wait 0] [--allow-data-loss]
                 [--backup-dir DIR] [--lock-root DIR] [--holder NAME] [--note TXT]
+                [--push-timeout S] [--push-tar auto|always|never]
 
 锁：取 device_lock.py 的持久内核锁后才动设备，收局按持锁令牌 release；
 崩溃 / 强杀 / adb 掉线 = 未正常收局，设备留置不放行（不自动放）。
@@ -73,14 +74,20 @@ def sha256(path):
 
 
 def pm_path_list(d, pkg):
-    """pm path 三态。Android 16：未装包 rc=1、stdout/stderr 皆空；已装 rc=0 带 package: 行。
-    rc=1 且两路皆空 → 未装；其余非 0 / 带 stderr（adb 层错 / 断线）→ 查询失败抛 RuntimeError。
+    """pm path 三态（qa-fone 定口径）。已装 = rc=0 且有 package: 行且无 stderr；
+    未装 = Android 16 口径的 rc=1 且 stdout/stderr 皆空；其余一切（rc=0 无
+    package: 行、rc=0/1 带 stderr、其他 rc）= 查询失败抛 RuntimeError。
     不能用 d.shell：它只回 stdout，拿不到 stderr 区分『未装』与『查询失败』。"""
     r = subprocess.run([*d.argv, "shell", f"pm path {pkg}"],
                        capture_output=True, timeout=60)
     out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
     if r.returncode == 0:
-        return [ln[len("package:"):] for ln in out.splitlines() if ln.startswith("package:")]
+        paths = [ln[len("package:"):] for ln in out.splitlines() if ln.startswith("package:")]
+        if paths and not err.strip():
+            return paths
+        raise RuntimeError(f"pm path {pkg} 查询失败 rc=0 但"
+                           + (f"带 stderr: {err.strip()[:200]}" if err.strip()
+                              else "无 package: 行"))
     if r.returncode == 1 and not out.strip() and not err.strip():
         return []
     raise RuntimeError(f"pm path {pkg} 查询失败 rc={r.returncode}: "
@@ -354,6 +361,10 @@ def main(argv=None):
                    help="已装 debuggable 包的私有/外部数据备份落点（默认 <out>/data-backup）；"
                         "tar + manifest.json（逐文件 sha256 清单），收局按它回灌核对")
     p.add_argument("--adb", default="adb")
+    p.add_argument("--push-timeout", type=int, default=None,
+                   help="资源推送超时秒数；缺省按资源字节+文件数估（约 30MB/s + 20ms/文件、2 倍余量）")
+    p.add_argument("--push-tar", choices=["auto", "always", "never"], default="auto",
+                   help="资源推送方式：auto 小文件密集自动 tar 单推解开；always 强制；never 整树推")
     p.add_argument("--ready-timeout", type=int, default=180)
     p.add_argument("--wait", type=float, default=0)
     p.add_argument("--lock-root", default=str(device_lock.lock_root()))
@@ -506,7 +517,11 @@ def main(argv=None):
                 d.run("install", "-r", "-d", str(frozen), timeout=600)
                 log("已降级安装测试包（install -r -d）")
             deploy_game.deploy_resources(str(frozen), str(res), adb, str(deploy_work),
-                                         mode="auto", timeout=300, start=False)
+                                         mode="auto", timeout=300, start=False,
+                                         push_timeout=args.push_timeout,
+                                         push_tar={"auto": None, "always": True,
+                                                   "never": False}[args.push_tar],
+                                         log=log)
             log("资源与包已部署（deploy_resources，未启动）")
         elif not state0["installed"] or state0["sha256"] != our_sha:
             d.run("install", "-r", *(["-d"] if downgrade_fwd else []), str(args.apk), timeout=600)
