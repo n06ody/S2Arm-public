@@ -26,7 +26,7 @@ FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge
           "temp_tenths_c", "source", "ac_powered", "usb_powered", "wireless_powered", "dock_powered")
 
 FAKE_ADB = '''#!/usr/bin/env python3
-import hashlib, json, shlex, sys, time
+import hashlib, io, json, os, shlex, sys, tarfile, time
 state_path, argv = sys.argv[1], sys.argv[2:]
 if argv and argv[0] == "-s":
     argv = argv[2:]
@@ -37,6 +37,32 @@ def out(s):
     sys.stdout.write(s)
 def fail(msg):
     sys.stderr.write(msg + "\\n"); sys.exit(1)
+
+PUSHED = st.setdefault("pushed", {})                # 设备路径 -> 本机路径（adb push 单文件）
+DEV_FS = st.setdefault("dev_fs", {})                # 设备绝对路径 -> 内容 hex（push 目录/tar 解开/mv/rm 都动它）
+
+def file_sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+def dev_put_dir(local, dev):
+    # adb push <dir> <dev>：本地整树逐文件登记；push_slow_s 让进度轮询能看到中间态
+    items = []
+    for root_, _, files_ in os.walk(local):
+        for fn in files_:
+            lp = os.path.join(root_, fn)
+            rel = os.path.relpath(lp, local).replace(os.sep, "/")
+            items.append((rel, open(lp, "rb").read().hex()))
+    delay = float(st.get("push_slow_s") or 0)
+    half = len(items) // 2 if delay else len(items)
+    for rel, hx in items[:half]:
+        DEV_FS[dev.rstrip("/") + "/" + rel] = hx
+    save()
+    if delay:
+        time.sleep(delay)
+    for rel, hx in items[half:]:
+        DEV_FS[dev.rstrip("/") + "/" + rel] = hx
+    save()
+
 cmd = argv[0]
 if cmd == "get-state":
     out("device"); sys.exit(0)
@@ -53,6 +79,13 @@ if cmd == "uninstall":
 if cmd == "pull":
     open(argv[-1], "wb").write(bytes.fromhex(st["orig_apk_hex"]))
     out(f"{argv[1]}: 1 file pulled, 0 skipped\\n"); sys.exit(0)
+if cmd == "push":
+    if os.path.isdir(argv[1]):
+        dev_put_dir(argv[1], argv[2]); sys.exit(0)
+    PUSHED[argv[2]] = argv[1]
+    if argv[1].endswith(".tar"):
+        st["tar_pushed"] = argv[2]
+    save(); sys.exit(0)
 if cmd == "exec-out":
     sys.stdout.buffer.write(open(st["png"], "rb").read()); sys.exit(0)
 if cmd == "logcat":
@@ -85,6 +118,10 @@ if cmd == "shell":
             st["pm_path_calls"] = st.get("pm_path_calls", 0) + 1; save()
             if st.get("pm_path_fail_at") == st["pm_path_calls"]:
                 sys.stderr.write("error: device offline\\n"); sys.exit(st.get("pm_path_fail_rc", 255))
+            if st.get("pm_path_empty_at") == st["pm_path_calls"]:
+                sys.exit(0)                                        # 异常：rc=0 但无任何输出
+            if st.get("pm_path_warn_at") == st["pm_path_calls"]:
+                sys.stderr.write("warning: pm flush pending\\n")   # 异常：rc=0 但带 stderr
             if st["installed"]:
                 out("package:" + st["base_path"] + "\\n"); sys.exit(0)
             sys.exit(1)
@@ -94,7 +131,55 @@ if cmd == "shell":
         if sh[1] == "list":
             out("package:" + st["package"] + "\\n" if st["installed"] else ""); sys.exit(0)
     if c == "sha256sum":
-        out((st["installed_sha"] or "0" * 64) + "  " + sh[-1] + "\\n"); sys.exit(0)
+        p = sh[-1]
+        if p == st["base_path"]:
+            out(st["installed_sha"] + "  " + p + "\\n"); sys.exit(0)
+        if p in DEV_FS:
+            out(file_sha(bytes.fromhex(DEV_FS[p])) + "  " + p + "\\n"); sys.exit(0)
+        out("0" * 64 + "  " + p + "\\n"); sys.exit(0)
+    if c == "find":
+        dir_ = sh[1].rstrip("/")
+        if "-exec" in sh:
+            if "sha256sum" in sh:
+                lines = [file_sha(bytes.fromhex(hx)) + "  " + p
+                         for p, hx in sorted(DEV_FS.items()) if p == dir_ or p.startswith(dir_ + "/")]
+                out("".join(ln + "\\n" for ln in lines)); sys.exit(0)
+            sys.exit(0)
+        if "-type" in sh:
+            out("".join(p + "\\n" for p in sorted(DEV_FS)
+                        if p == dir_ or p.startswith(dir_ + "/"))); sys.exit(0)
+        sys.exit(0)
+    if c == "du":
+        dir_ = sh[-1].rstrip("/")
+        total = sum(len(bytes.fromhex(hx)) for p, hx in DEV_FS.items()
+                    if p == dir_ or p.startswith(dir_ + "/"))
+        out(str((total + 1023) // 1024) + "\\t" + dir_ + "\\n"); sys.exit(0)
+    if c == "mv":
+        src_, dst_ = sh[1].rstrip("/"), sh[2].rstrip("/")
+        for p in list(DEV_FS):
+            if p == src_ or p.startswith(src_ + "/"):
+                DEV_FS[dst_ + p[len(src_):]] = DEV_FS.pop(p)
+        save(); sys.exit(0)
+    if c == "chmod":
+        sys.exit(0)
+    if c == "tar":
+        src_ = PUSHED.get(sh[2]); dir_ = sh[4].rstrip("/")
+        if not src_: fail("tar 源没 push 过 " + sh[2])
+        with tarfile.open(src_) as tf:
+            for mem in tf.getmembers():
+                if mem.isfile():
+                    rel = mem.name[2:] if mem.name.startswith("./") else mem.name
+                    blob = tf.extractfile(mem).read()
+                    if st.get("corrupt_extract") and len(DEV_FS) == 0:
+                        blob = blob + b"x"
+                    DEV_FS[dir_ + "/" + rel] = blob.hex()
+        st["tar_extracted"] = len(DEV_FS); save(); sys.exit(0)
+    if c == "rm":
+        for p in [a for a in sh[1:] if not a.startswith("-")]:
+            for k in list(DEV_FS):
+                if k == p.rstrip("/") or k.startswith(p.rstrip("/") + "/"): del DEV_FS[k]
+            PUSHED.pop(p, None)
+        save(); sys.exit(0)
     if c == "pidof":
         out((st.get("pid", "4242") + "\\n") if st.get("running") else ""); sys.exit(0)
     if c == "ps":
@@ -129,7 +214,7 @@ if cmd == "shell":
         if st.get("data_residue") and ("Android/data" in text or "Android/obb" in text):
             out("files\\n"); sys.exit(0)
         out(""); sys.exit(0)
-    if c in ("wm", "input", "id", "cat", "mkdir", "rm"):
+    if c in ("wm", "input", "id", "cat", "mkdir"):
         out(""); sys.exit(0)
     fail("fake adb: unhandled shell " + text)
 fail("fake adb: unhandled " + " ".join(argv))
@@ -214,17 +299,34 @@ class RunGameTest(unittest.TestCase):
             return base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
-    def run_tool(self, state=None, argv=None, seconds=3):
+    def _aapt2(self, version_code=200):
+        """aapt2 替身：apk_identity 只读 badging 的 package/versionCode 行。"""
+        tool = self.tmp / "sdk" / "build-tools" / "36.0.0" / "aapt2"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text("#!/bin/sh\necho \"package: name='" + PKG + "' versionCode='" +
+                        str(version_code) + "' versionName='1.0'\"\n")
+        tool.chmod(0o755)
+        return self.tmp / "sdk"
+
+    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200):
         state = make_state(self.tmp, **(state or {}))
         out = self.tmp / "out_1"
         fake = self.tmp / "fake_adb.py"
         fake.write_text(FAKE_ADB)
+        old_home = os.environ.get("ANDROID_HOME")
+        os.environ["ANDROID_HOME"] = str(self._aapt2(new_vc))
         args = ["--apk", str(self.apk), "--package", PKG, "--serial", SERIAL,
                 "--out", str(out), "--seconds", str(seconds),
                 "--adb", f"{sys.executable} {fake} {state}",
                 "--lock-root", str(self.lock_root), "--ready-timeout", "5"]
         args += argv or []
-        rc = run_game.main(args)
+        try:
+            rc = run_game.main(args)
+        finally:
+            if old_home is None:
+                os.environ.pop("ANDROID_HOME", None)
+            else:
+                os.environ["ANDROID_HOME"] = old_home
         return rc, out, state
 
     def _qc(self, out):
@@ -449,6 +551,109 @@ class RunGameTest(unittest.TestCase):
                          "电流全零推不出放电方向")
         self.assertEqual("没数据", self._qc_energy(power_tsv(boots=(11e6, 12e6, 11e6))),
                          "采样时钟倒退，窗口不成立")
+
+    # ---- Android 16 pm path rc=0 收紧：rc=0 必须有 package: 行且无 stderr ----
+
+    def test_pm_path_rc0_empty_is_failure(self):
+        """rc=0 但无输出（设备异常应答）：必须判查询失败、不继续，不当未装放行。"""
+        rc, out, state = self.run_tool(state={"pm_path_empty_at": 1})
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "查询失败不该有任何安装动作")
+        self.assertFalse((self.lock_root / SERIAL / "detained.json").exists(),
+                         "设备还没被动过，不该留置")
+
+    def test_pm_path_rc0_stderr_is_failure(self):
+        """rc=0 有 package: 行但带 stderr（adb 警告/异常通道）：必须判查询失败、不继续。"""
+        rc, out, state = self.run_tool(
+            state={"installed": True, "installed_sha": "0" * 64, "pm_path_warn_at": 1})
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "带 stderr 的 rc=0 不能当已装/未装放行")
+
+    # ---- 资源部署：整树推送进度 / 超时 / tar 单推 + SHA 核对 ----
+
+    def _resources_dir(self, npayload=6):
+        """能过 deploy_game.validate() 的最小资源目录：artifact/index/manifest 身份自洽。"""
+        res = self.tmp / "resources"
+        res.mkdir()
+        for i in range(npayload):
+            sub = res / f"romfs/dir{i % 2}"
+            sub.mkdir(parents=True, exist_ok=True)
+            (sub / f"f{i}.bin").write_bytes(f"payload-{i}".encode() * (20 * (i + 1)))
+        index = res / "index.tsv"
+        index.write_text("rel\tsha256\n" + "".join(f"romfs/{i}\t{i:064x}\n" for i in range(npayload)))
+        idx_sha = hashlib.sha256(index.read_bytes()).hexdigest()
+        artifact = {"titleId": "0123456789ABCDEF",
+                    "apk": {"packageName": PKG, "versionCode": 200,
+                            "sha256": hashlib.sha256(self.apk.read_bytes()).hexdigest()},
+                    "contentRoot": "sha256-" + idx_sha}
+        (res / "game-build-artifact.json").write_text(json.dumps(artifact))
+        (res / "manifest.json").write_text(json.dumps({"index_sha256": idx_sha}))
+        return res, artifact
+
+    def _with_receipt(self, artifact):
+        """logcat -d 要含导入成功行 + require_current 回执（staging 名 = deploy-<work> = deploy-deploy）。"""
+        art_sha = hashlib.sha256(
+            (self.tmp / "resources" / "game-build-artifact.json").read_bytes()).hexdigest()
+        name = "deploy-deploy"
+        (self.tmp / "logcat_dump.txt").write_text(
+            LOG_HEAD
+            + f"11-09 12:00:02.000  4242  4242 I S2Arm: Game build artifact updated from import/{name}\n"
+            + f"11-09 12:00:02.100  4242  4242 I S2Arm: Game import receipt: {artifact['titleId']} "
+              f"contentRoot={artifact['contentRoot']} artifactSha256={art_sha} from import/{name}\n"
+            + frame_log_text())
+
+    def test_resources_tree_push_progress_logged(self):
+        """资源整树推送：文件数+字节+速率进度打进 run.log；--push-timeout 照传。"""
+        res, artifact = self._resources_dir()
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            state={"push_slow_s": 6},
+            argv=["--resources", str(res), "--push-timeout", "600"])
+        self.assertEqual(0, rc)
+        runlog = (out / "run.log").read_text()
+        self.assertIn("整树推送", runlog)
+        self.assertIn("推送中", runlog, "慢推送中段应有进度行（文件数/字节/速率）")
+        self.assertIn("推送完成", runlog)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("tar_pushed", st, "默认整树推送不该推 tar")
+
+    def test_resources_push_timeout_is_enforced(self):
+        """--push-timeout 真传到推送：推送卡住到点被杀，错误带最后进度。"""
+        res, artifact = self._resources_dir()
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            state={"push_slow_s": 30},
+            argv=["--resources", str(res), "--push-timeout", "2"])
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("推送超时", man["reason"])
+        self.assertIn("最后进度", man["reason"], "超时错误要留最后进度，看得出卡在哪")
+
+    def test_resources_push_tar_extracts_and_verifies(self):
+        """--push-tar always：打一个 tar 推一次、设备端解开、逐文件 SHA 核对写进 run.log。"""
+        res, artifact = self._resources_dir()
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            argv=["--resources", str(res), "--push-tar", "always"])
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("tar_pushed", "").endswith(".tar"), "应推的是 tar 归档")
+        runlog = (out / "run.log").read_text()
+        self.assertIn("tar 单推", runlog)
+        self.assertIn("SHA 核对通过", runlog)
+
+    def test_resources_push_tar_corrupt_extract_fails(self):
+        """tar 解开被改写 → 设备端逐文件 SHA 核对必须拦下（负对照：核对在起作用）。"""
+        res, artifact = self._resources_dir()
+        self._with_receipt(artifact)
+        rc, out, state = self.run_tool(
+            state={"corrupt_extract": True},
+            argv=["--resources", str(res), "--push-tar", "always"])
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("SHA 核对失败", man["reason"])
 
 
 if __name__ == "__main__":
