@@ -107,6 +107,8 @@ def run_as(cmdline):
         fail("cat: " + p + ": No such file or directory")
     m = _re.match(r"^stat -c %Y (\\S+)$", cmdline)
     if m:
+        if st.get("priv_stat_denied"):       # 归属证据读不了：stat 整条被拒
+            fail("stat: " + m.group(1) + ": Permission denied")
         p = m.group(1)          # 文件 mtime（秒）：data_mtime 旋钮可给旧局文件配老时间
         for root_, files_ in DATA_DIRS.items():
             if p.startswith(root_.rstrip("/") + "/") and \
@@ -221,6 +223,8 @@ if cmd == "shell":
     if "/proc/uptime" in text:
         out(f"{st['uptime_us'] / 1e6:.2f} 20.00\\n"); sys.exit(0)
     if "/stat" in text and "/proc/" in text:
+        if st.get("no_proc_stat"):          # 出生证拿不到：/proc/<pid>/stat 读拒
+            fail("cat: /proc/stat: Permission denied")
         # starttime（开机 jiffies）：出生 = 当前 uptime - birth_lag（缺省 2s 前起）
         ticks = int(st["uptime_us"] / 1e6 * 100) - st.get("birth_lag_ticks", 200)
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
@@ -360,10 +364,15 @@ if cmd == "shell":
                 st["running"] = True
                 st["launch_cmd"] = text
                 # 游戏起局：宿主日志落 files/ryujinx-android/host-<uptime>-<pid>-<hex>.log
+                # 首行 = os.c s2a_android_session_log_start 的会话标记（名实互核的锚点）
                 if not st.get("no_priv_seed"):
                     dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
-                    dd[f"files/ryujinx-android/host-{st['uptime_us'] // 1000000}-4242-Ab12.log"] = \
-                        st.get("host_log", "host log run\\n").encode().hex()
+                    seg = st["uptime_us"] // 1000000
+                    hn = f"host-{seg}-4242-Ab12.log"
+                    hdr = (f"[s2a] Android 会话日志：session={seg} pid=4242 "
+                           f"file=/data/data/{st['package']}/files/ryujinx-android/{hn}\\n")
+                    dd[f"files/ryujinx-android/{hn}"] = \
+                        (hdr + st.get("host_log", "host log run\\n")).encode().hex()
                 # 游戏起局即改写自己的数据（存档/新文件）——还原不还原从这里才分得出来
                 for dir_ in list(DATA_DIRS):
                     if DATA_DIRS[dir_]:
@@ -375,6 +384,8 @@ if cmd == "shell":
             save(); sys.exit(0)
         sys.exit(0)
     if c == "date":
+        if "+%s" in text and st.get("no_wall"):   # 墙钟拿不到：归属窗/birth 折算都缺
+            fail("date: command failed")
         out((str(st["wall_s"]) if "+%s" in text else "11-09 12:00:00.000") + "\\n")
         sys.exit(0)
     if c == "dumpsys":
@@ -951,12 +962,13 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("host-10-4242-Ab12.log", logs)      # am start 落的宿主日志
         self.assertIn("frame-log-4242.log", logs)         # finish 落的原生帧文件
         self.assertNotIn("host-9-9999-Xx99.log", logs)    # 别局/别进程的日志不拉
-        self.assertEqual(b"host log run\n",
-                         (out / "host_logs/host-10-4242-Ab12.log").read_bytes())
+        want = (f"[s2a] Android 会话日志：session=10 pid=4242 file=/data/data/{PKG}"
+                f"/files/ryujinx-android/host-10-4242-Ab12.log\n"
+                "host log run\n").encode()
+        self.assertEqual(want, (out / "host_logs/host-10-4242-Ab12.log").read_bytes())
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertEqual(logs, sorted(r["name"] for r in man["private_logs"]))
         host_rec = next(r for r in man["private_logs"] if r["name"].startswith("host-"))
-        want = b"host log run\n"
         self.assertEqual({"name": "host-10-4242-Ab12.log", "pid": 4242,
                           "bytes": len(want), "sha256": hashlib.sha256(want).hexdigest(),
                           "device_bytes": len(want),
@@ -1013,6 +1025,49 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertNotIn("host-7-4242-Zz00.log", [r["name"] for r in man["private_logs"]])
         self.assertTrue(any("旧局" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_stat_denied_attribution_unproven(self):
+        """㉓ qa-fone 负控：同 PID 文件、stat 被拒 → mtime 读不了，归属证不了 →
+        证据照拉但 session=unproven + 注记；绝不拿『pids 非空』冒充 bound。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"priv_stat_denied": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"], "stat 拒不该挡证据拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(all(r["verified"] for r in man["private_logs"]),
+                        "传输完整性照样核实——归属未证 ≠ 字节没对上")
+        self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_no_timebase_attribution_unproven(self):
+        """㉓ qa-fone 负控：birth(/proc/stat 拒）与墙钟（date +%s 拒）两头都缺 →
+        没有可比窗 → unproven + 注记，不空放 bound。"""
+        rc, out, _ = self.run_tool(seconds=30,
+                                   state={"no_wall": True, "no_proc_stat": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"])
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("birth/起局墙钟" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_header_mismatch_unproven(self):
+        """㉓ host-<seg>-<pid>-*.log 名实互核：文件首行 session/pid 与文件名对不上
+        （改名/拼接过的证据）→ 照拉但 unproven + 注记。"""
+        bad = (b"[s2a] Android \xe4\xbc\x9a\xe8\xaf\x9d\xe6\x97\xa5\xe5\xbf\x97"
+               b"\xef\xbc\x9asession=999 pid=4242 file=/x/host-5-4242-Cc33.log\n"
+               b"body\n")
+        state = {"data_dirs": {"/data/data/" + PKG: {
+            "files/ryujinx-android/host-5-4242-Cc33.log": bad.hex()}}}
+        rc, out, _ = self.run_tool(seconds=30, state=state)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        bad_rec = next(r for r in man["private_logs"] if r["name"] == "host-5-4242-Cc33.log")
+        self.assertEqual("unproven", bad_rec["session"], bad_rec)
+        self.assertTrue(any("名实" in n or "会话标记" in n for n in man["notes"]),
+                        man["notes"])
+        good = next(r for r in man["private_logs"] if r["name"] == "host-10-4242-Ab12.log")
+        self.assertEqual("bound", good["session"], "名实相符的当局文件照样 bound")
 
     def test_private_logs_truncated_pull_marked_unverified(self):
         """㉒ exec-out rc=0 但短读（截断传输）：源端 sha/wc 对不上 → verified=False

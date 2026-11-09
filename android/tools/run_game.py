@@ -318,7 +318,11 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
             "cover": cover, "rows": rows, "captures": len(caps)}
 
 
-PRIV_LOG_NAME = re.compile(r"^(?:host-\d+-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
+PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
+# host-*.log 首行（os.c s2a_android_session_log_start 的 dprintf）：
+#   [s2a] Android 会话日志：session=<seg> pid=<pid> file=<path>
+# 名实互核：文件名 <seg>/<pid> 与首行写明的对不上 = 改名/拼接过的文件，不证归属。
+PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
 
 
 def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None):
@@ -327,9 +331,12 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
 
     归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
-    - 三绑定：文件名 PID 须在 session_pids 里，且 stat mtime ≥ 该 PID 的 birth_wall_s
-      （birth_ticks 折墙钟——同 PID 旧局文件/旧进程写的文件不证归属，跳过记注）；
-      birth 折不出就退回起局设备墙钟当 session 窗；
+    - bound 要实证，fail closed：PID 在 session_pids 且 stat mtime 实读、且
+      mtime ≥ 该 PID 的 birth_wall_s（折不出 birth 退起局设备墙钟当 session 窗）；
+      host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名逐段对上；
+      birth/墙钟两头都缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
+      + 注记写明哪一环证不了（同 PID 旧文件绝不升 bound）；
+    - mtime 早于归属窗 → 同 PID 旧局文件，跳过不拉（记注）；
     - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
       exec-out 拉回后逐字节核对；不符或拉回空数据标 verified=False
       （rc=0 空读不能当成功）；
@@ -347,9 +354,9 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
         return records, frame_texts
     candidates = []
     for path in sorted(ln.strip() for ln in found.splitlines() if ln.strip()):
-        m = PRIV_LOG_NAME.match(path.rsplit("/", 1)[-1])
+        m = PRIV_LOG_NAME.match(path.rsplit("/", 1) [-1])
         if m:
-            candidates.append((path, int(m.group(1) or m.group(2))))
+            candidates.append((path, int(m.group(2) or m.group(3))))
     if pids:
         candidates = [c for c in candidates if c[1] in pids]
         if not candidates:
@@ -362,17 +369,28 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
     dest = out / "host_logs"
     for path, pid in candidates:
         name = path.rsplit("/", 1)[-1]
-        session = "bound" if pids else "unproven"
-        bound_s = (birth_walls or {}).get(pid, launch_wall_s)  # 进程出生墙钟优先
-        if bound_s is not None:
-            try:
-                mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}", timeout=30).strip())
-            except (RuntimeError, subprocess.SubprocessError, ValueError):
-                mtime = None
-            if mtime is not None and mtime < bound_s - 2:    # 折墙钟留 2s 量化余量
-                notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生/起局窗，"
-                             f"同 PID 旧局文件不证归属，不拉")
-                continue
+        # fail-closed 归属：每一环实证了才升 bound，证不了照拉但标 unproven
+        session, attr = "unproven", None
+        if pids:
+            bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟优先
+            if bound_s is None:
+                bound_s = launch_wall_s            # birth 缺 → 起局窗兜底（弱一级）
+            if bound_s is None:
+                attr = "没有进程 birth/起局墙钟可比"
+            else:
+                try:
+                    mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}",
+                                         timeout=30).strip())
+                except (RuntimeError, subprocess.SubprocessError, ValueError):
+                    mtime = None
+                if mtime is None:
+                    attr = "stat 拿不到 mtime"
+                elif mtime < bound_s - 2:          # 折墙钟留 2s 量化余量
+                    notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生/起局窗，"
+                                 f"同 PID 旧局文件不证归属，不拉")
+                    continue
+                else:
+                    session = "bound"
         # 源端字节/SHA 先记账：exec-out rc=0 空读/截断传输出核对不上就标未证
         want_sha = want_bytes = None
         try:
@@ -396,6 +414,15 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
             why = "拉回空数据" if not got_bytes else \
                   f"源 {want_bytes}B/{str(want_sha)[:12]} ≠ 拉回 {got_bytes}B/{got_sha[:12]}"
             notes.append(f"私有日志 {name} 拉取校验不符（{why}）：标未证")
+        if session == "bound" and name.startswith("host-"):
+            # host-<seg>-<pid>-*.log 名实互核：首行 session/pid 与文件名逐段对
+            m = PRIV_LOG_NAME.match(name)
+            head = PRIV_SESSION_LINE.search(r.stdout[:4096])
+            if m is None or head is None \
+                    or int(head.group(1)) != int(m.group(1)) or int(head.group(2)) != pid:
+                session, attr = "unproven", "首行会话标记与文件名 session/pid 对不上"
+        if attr:
+            notes.append(f"私有日志 {name} 归属未证（{attr}）：按 unproven 记账")
         dest.mkdir(exist_ok=True)
         (dest / name).write_bytes(r.stdout)
         records.append({"name": name, "pid": pid, "bytes": got_bytes, "sha256": got_sha,
