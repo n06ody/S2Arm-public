@@ -8,6 +8,10 @@ extern "C" void ANativeWindow_acquire(ANativeWindow *w) { ++w->refs; }
 extern "C" void ANativeWindow_release(ANativeWindow *w) { --w->refs; }
 extern "C" int32_t ANativeWindow_getWidth(ANativeWindow *w) { return w->width; }
 extern "C" int32_t ANativeWindow_getHeight(ANativeWindow *w) { return w->height; }
+// 真实语义：缓冲尺寸改写后 getWidth/getHeight 报告缓冲尺寸。
+extern "C" int32_t ANativeWindow_setBuffersGeometry(ANativeWindow *w, int32_t width, int32_t height, int32_t) {
+    w->width = width; w->height = height; return 0;
+}
 extern "C" void s2a_android_host_set_lease(s2a_wsi_lease *l) { published=l; }
 extern "C" void s2a_android_host_unset_lease(s2a_wsi_lease *l) { if(published==l)published=nullptr; }
 extern "C" int __android_log_print(int,const char*,const char*,...) { return 0; }
