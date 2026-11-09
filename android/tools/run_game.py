@@ -18,11 +18,13 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 还原范围（保证不了的一律拒跑，不返回成功兜底）：
 - 原 APK：设备已装该包且构建不同 → adb pull 备份、收局 install -r 装回并 sha256 复核；
   分包（split APK）装回不可靠 → 入局即拒。原包 versionCode 低于新包时装回是降级：
-  装新包前先验设备 pm 支持 install -d（usage 里的「-d: allow version code downgrade」），
-  不支持就拒跑而不是装了回不来；原包高于新包时装测试包本身也带 -d。
+  降级能力不看 usage 文本——拉回的原包先真走一遍 install -r -d（同版重灌，rc=0 才算
+  设备支持），实测不可用就拒跑而不是装了回不来；原包高于新包时装测试包本身也带 -d。
 - 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
   /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
-  tar + manifest.json 逐文件 sha256 清单）；收局装回原包后 pm clear、回灌、逐文件核 sha。
+  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）；归档先解包
+  与源清单逐项核对，对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端
+  全量复核。存在但 run-as 进不去的目录报错拒跑，不当不存在。
   已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
   （私有数据、已并入资源不还原，manifest 写明）。
 - 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
@@ -38,7 +40,7 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
-import argparse, datetime, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time
+import argparse, datetime, hashlib, json, os, re, shlex, signal, subprocess, sys, tarfile, tempfile, time
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -113,10 +115,95 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-def device_allows_downgrade(d):
-    """设备 pm 是否支持 install -d（降级）。pm usage 里有『-d: allow version code downgrade』。"""
-    usage = d.shell("pm install --help 2>&1 || pm 2>&1", allowed=(0, 1, 255))
-    return bool(re.search(r"-d[^\n]*downgrade", usage, re.I))
+def probe_downgrade(d, apk):
+    """降级能力不看 pm usage 文本：用真事判——`install -r -d` 同版原包装一遍，
+    rc=0 就是设备支持（usage 里写了 -d 不代表真让降）。返回 None=支持，否则失败说明。"""
+    try:
+        d.run("install", "-r", "-d", str(apk), timeout=600)
+        return None
+    except RuntimeError as error:
+        return str(error)
+
+
+STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
+LINK_MAP_CMD = ("cd {q} && find . -type l -exec sh -c "
+                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _ {{}} +")
+
+
+def _entry_map(sha_text, stat_text, link_text):
+    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}。rel 去掉 ./ 前缀。"""
+    entries = {}
+    for ln in stat_text.splitlines():
+        ln = ln.strip()
+        if not ln or "|" not in ln:
+            continue
+        mode, ftype, name = ln.split("|", 2)
+        rel = name[2:] if name.startswith("./") else name
+        if not rel:
+            continue
+        t = {"regular file": "f", "directory": "d", "symbolic link": "l"}.get(ftype, ftype)
+        entries[rel] = {"t": t, "mode": int(mode, 8)}
+    for rel, sha in _sha_listing(sha_text).items():
+        if rel in entries:
+            entries[rel]["sha"] = sha
+    for ln in link_text.splitlines():
+        if "\t" not in ln:
+            continue
+        name, target = ln.split("\t", 1)
+        rel = name.strip()[2:] if name.strip().startswith("./") else name.strip()
+        if rel in entries:
+            entries[rel]["target"] = target
+    return entries
+
+
+def device_entries(d, pkg, dir_):
+    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。"""
+    sha_text = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
+                        timeout=300)
+    stat_text = d.run_as(pkg, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    link_text = d.run_as(pkg, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    return _entry_map(sha_text, stat_text, link_text)
+
+
+def tar_entries(tar_path):
+    """宿主机把归档解开核对：tar 成员 → 与 device_entries 同形的 {rel: entry}。"""
+    entries = {}
+    with tarfile.open(tar_path) as tf:
+        for mem in tf.getmembers():
+            rel = mem.name[2:] if mem.name.startswith("./") else mem.name
+            if not rel:
+                continue
+            if mem.isfile():
+                data = tf.extractfile(mem).read()
+                entries[rel] = {"t": "f", "mode": mem.mode & 0o7777,
+                                "sha": hashlib.sha256(data).hexdigest()}
+            elif mem.isdir():
+                entries[rel] = {"t": "d", "mode": mem.mode & 0o7777}
+            elif mem.issym():
+                entries[rel] = {"t": "l", "mode": mem.mode & 0o7777, "target": mem.linkname}
+            else:
+                entries[rel] = {"t": "other", "mode": mem.mode & 0o7777}
+    return entries
+
+
+def entries_diff(want, got):
+    """逐项对清单：缺/多/类型/ sha/权限/软链目标。返回人类可读差异列表。"""
+    diffs = []
+    for rel in sorted(set(want) - set(got)):
+        diffs.append(f"缺 {rel}")
+    for rel in sorted(set(got) - set(want)):
+        diffs.append(f"多 {rel}")
+    for rel in sorted(set(want) & set(got)):
+        w, g = want[rel], got[rel]
+        if w["t"] != g["t"]:
+            diffs.append(f"{rel} 类型 {w['t']}≠{g['t']}")
+        elif w["t"] == "f" and w.get("sha") != g.get("sha"):
+            diffs.append(f"{rel} sha 不符")
+        elif w["t"] == "l" and w.get("target") != g.get("target"):
+            diffs.append(f"{rel} 软链目标 {w.get('target')!r}≠{g.get('target')!r}")
+        elif w.get("mode") is not None and g.get("mode") is not None and w["mode"] != g["mode"]:
+            diffs.append(f"{rel} 权限 {oct(w['mode'])}≠{oct(g['mode'])}")
+    return diffs
 
 
 DATA_DIRS = (("private", "/data/data/{pkg}"),
@@ -135,35 +222,71 @@ def _sha_listing(text):
     return files
 
 
+def _dir_probe(d, pkg, dir_):
+    """三态探针：ok=可访问 / absent=不存在 / denied=存在但进不去。
+    存在但不可访问绝不能当不存在——跳过了就是悄悄丢数据。"""
+    q = shlex.quote(dir_)
+    out = d.run_as(pkg, f"if [ -e {q} ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
+                        f"then echo ok; else echo denied; fi; else echo absent; fi",
+                   timeout=30).strip().splitlines()
+    return out[-1].strip() if out else "denied"
+
+
+def _verify_tar(manifest, backup_dir, tag):
+    """归档先解包核对：tar 成员逐项（文件 sha/软链目标/目录/权限）对源清单。
+    返回差异列表（空=归档可信）——任何破坏性操作前必过此门。"""
+    info = manifest["dirs"][tag]
+    try:
+        return entries_diff(info["entries"], tar_entries(Path(backup_dir) / info["tar"]))
+    except (OSError, tarfile.TarError, KeyError) as error:
+        return [f"归档解不开：{error}"]
+
+
 def backup_data(d, pkg, dest):
-    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + find sha256sum 清单。
-    任一目录备份失败即 Refuse（保证不了还原就不入局）。"""
+    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + 全量清单
+    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。归档落盘后先解包与源清单
+    逐项核对——对不上即 Refuse（保证不了还原就不入局）；存在但不可访问的目录
+    报错而不是当不存在。"""
     dest.mkdir(parents=True)
-    manifest = {"schema": 1, "package": pkg, "dirs": {}}
+    manifest = {"schema": 2, "package": pkg, "dirs": {}}
     for tag, tpl in DATA_DIRS:
         dir_ = tpl.format(pkg=pkg)
-        present = d.run_as(pkg, f"[ -d {shlex.quote(dir_)} ] && echo yes || true").strip()
-        if "yes" not in present:
+        state = _dir_probe(d, pkg, dir_)
+        if state == "absent":
             continue
+        if state != "ok":
+            raise Refuse(f"{dir_} 存在但 run-as 进不去：证不了也备不了，不动这台设备")
         tar = dest / f"{tag}.tar"
         # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
         r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
-                            f"tar -cf - -C {shlex.quote(dir_)} ."],
+                            f"tar -cpf - -C {shlex.quote(dir_)} ."],
                            capture_output=True, timeout=600)
         if r.returncode or not r.stdout:
             raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
         tar.write_bytes(r.stdout)
-        listing = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
-                           timeout=300)
-        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name,
-                                 "tar_sha256": sha256(tar), "files": _sha_listing(listing)}
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": sha256(tar),
+                                 "entries": device_entries(d, pkg, dir_)}
+        bad = _verify_tar(manifest, dest, tag)
+        if bad:
+            raise Refuse(f"{dir_} 备份归档与源清单对不上（{bad[:3]}）：回灌不可信，不动这台设备")
+    for tag in manifest["dirs"]:
+        manifest["dirs"][tag]["files"] = {
+            rel: e["sha"] for rel, e in manifest["dirs"][tag]["entries"].items()
+            if e["t"] == "f" and "sha" in e}
     (dest / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
     return manifest
 
 
 def restore_data(d, pkg, manifest, backup_dir):
-    """先清空再按清单回灌、逐文件 sha 核。返回失败说明串列表（空=成功）。"""
+    """顺序是硬门：归档先解包核对（与源清单逐项一致）→ pm clear → 回灌 →
+    设备端全量复核。核对不过一个字符都不许清。返回失败说明串列表（空=成功）。"""
     fails = []
+    for tag in manifest["dirs"]:
+        bad = _verify_tar(manifest, backup_dir, tag)
+        if bad:
+            fails.append(f"{manifest['dirs'][tag]['dir']} 归档核对未过：{bad[:3]}")
+    if fails:
+        return fails + ["归档核对未过：pm clear 未执行，设备数据未动"]
     try:
         d.shell(f"pm clear {pkg}", allowed=(0, 1))
     except (RuntimeError, subprocess.SubprocessError) as error:
@@ -175,17 +298,11 @@ def restore_data(d, pkg, manifest, backup_dir):
                      timeout=120)
             tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
             d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
-            d.run_as(pkg, f"tar -xf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
             d.shell(f"rm -f {tmp}", allowed=(0, 1))
-            got = _sha_listing(d.run_as(
-                pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +", timeout=300))
-            want = info["files"]
-            bad = [rel for rel, sha in want.items() if got.get(rel) != sha]
-            extra = sorted(set(got) - set(want))
+            bad = entries_diff(info["entries"], device_entries(d, pkg, dir_))
             if bad:
-                fails.append(f"{dir_} 还原后 {len(bad)} 个文件 sha 与备份清单不符：{bad[:3]}")
-            if extra:
-                fails.append(f"{dir_} 还原后多出 {len(extra)} 个未备份文件：{extra[:3]}")
+                fails.append(f"{dir_} 还原后与备份清单不符 {len(bad)} 项：{bad[:3]}")
         except (RuntimeError, subprocess.SubprocessError) as error:
             fails.append(f"{dir_} 数据还原 adb 异常：{error}")
     return fails
@@ -451,11 +568,16 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
 
 
 def external_dirs_gone(d, pkg):
-    """卸载后 /sdcard/Android/data|obb/<pkg> 应随删；逐项验不存在。"""
+    """卸载后 /sdcard/Android/data|obb/<pkg> 应随删；逐项验不存在。
+    存在但 ls 读不进 ≠ 已清：报不可访问，不静默放过。"""
     fails = []
     for base in ("/sdcard/Android/data", "/sdcard/Android/obb"):
-        out = d.shell(f"ls {base}/{pkg} 2>/dev/null", allowed=(0, 1)).strip()
-        if out:
+        q = shlex.quote(f"{base}/{pkg}")
+        out = d.shell(f"if [ -e {q} ]; then if [ -r {q} ] && [ -x {q} ]; then ls {q}; "
+                      f"else echo __denied__; fi; fi", allowed=(0, 1)).strip()
+        if "__denied__" in out:
+            fails.append(f"{base}/{pkg} 存在但读不进：证不了卸载已清")
+        elif out:
             fails.append(f"{base}/{pkg} 卸载后仍有内容：{out.splitlines()[0][:80]}")
     return fails
 
@@ -702,15 +824,18 @@ def main(argv=None):
                 raise Refuse("原包 versionCode 读不到：装回方向判不了降级，不动这台设备")
             downgrade_fwd = orig_vc > new_vc   # 装低 versionCode 测试包
             downgrade_back = orig_vc < new_vc  # 收局装回低 versionCode 原包
-            if (downgrade_fwd or downgrade_back) and not device_allows_downgrade(d):
-                raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级但设备 pm 不支持 "
-                             f"install -d，装了原包装不回来；不动这台设备")
             orig_tmp = Path(tempfile.mkdtemp(prefix="s2a-orig-")) / "orig.apk"
             d.run("pull", state0["base"], str(orig_tmp), timeout=300)
             if sha256(orig_tmp) != state0["sha256"]:
                 raise Refuse("备份原包 sha256 与设备上读到的不符，放弃起局")
+            if downgrade_fwd or downgrade_back:
+                # 降级能力不看 usage 文本：同版原包真走一遍 install -r -d，rc=0 才算支持
+                why = probe_downgrade(d, orig_tmp)
+                if why is not None:
+                    raise Refuse(f"versionCode 原 {orig_vc} vs 新 {new_vc}：装回方向要降级，"
+                                 f"实测 install -r -d 不可用（{why}）：装了原包装不回来，不动这台设备")
             log(f"已备份原包 sha256={state0['sha256'][:12]}"
-                + ("；还原装回要走 install -d 降级" if downgrade_back else ""))
+                + ("；还原装回要走 install -d 降级（已实测可用）" if downgrade_back else ""))
         else:
             log(f"原安装状态：{'未安装' if not state0['installed'] else '与本包同 sha256'}")
         # ---- debuggable 原包：run-as tar 全量备份私有/外部数据（装新包之前；任一目录失败即拒）----
@@ -726,7 +851,8 @@ def main(argv=None):
             "apk": ("已装不同构建→备份后 install -r" + (" -d" if downgrade_back else "")
                     + " 装回并 sha256 复核（分包拒跑）") if state0["installed"]
                    else "未安装→收局卸载并复核 pm path 已清",
-            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局 pm clear+回灌+逐文件 sha 核"
+            "private_data": ("debuggable→run-as tar 备份至 data-backup/，收局归档核对过才 "
+                             "pm clear+回灌+设备端全量复核"
                              if data_backup is not None
                              else "不还原（--allow-data-loss 已声明接受数据丢失）" if state0["installed"]
                                   else "卸载随 /data/data 清"),
