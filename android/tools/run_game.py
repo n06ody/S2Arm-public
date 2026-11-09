@@ -72,11 +72,25 @@ def sha256(path):
     return h.hexdigest()
 
 
+def pm_path_list(d, pkg):
+    """pm path 三态。Android 16：未装包 rc=1、stdout/stderr 皆空；已装 rc=0 带 package: 行。
+    rc=1 且两路皆空 → 未装；其余非 0 / 带 stderr（adb 层错 / 断线）→ 查询失败抛 RuntimeError。
+    不能用 d.shell：它只回 stdout，拿不到 stderr 区分『未装』与『查询失败』。"""
+    r = subprocess.run([*d.argv, "shell", f"pm path {pkg}"],
+                       capture_output=True, timeout=60)
+    out, err = r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
+    if r.returncode == 0:
+        return [ln[len("package:"):] for ln in out.splitlines() if ln.startswith("package:")]
+    if r.returncode == 1 and not out.strip() and not err.strip():
+        return []
+    raise RuntimeError(f"pm path {pkg} 查询失败 rc={r.returncode}: "
+                       f"{(err or out).strip()[:300]}")
+
+
 def install_state(d, pkg):
     """pm path + dumpsys package → {installed, split, base, sha256, versionCode, debuggable}。
     split 包无法忠实还原，调用方拒；versionCode/debuggable 供降级与 run-as 备份判断。"""
-    out = d.shell(f"pm path {pkg}").strip()
-    paths = [ln[len("package:"):] for ln in out.splitlines() if ln.startswith("package:")]
+    paths = pm_path_list(d, pkg)
     if not paths:
         return {"installed": False}
     info = d.shell(f"dumpsys package {pkg}", allowed=(0, 1))

@@ -148,7 +148,13 @@ if cmd == "shell":
             usage += "       [-d: allow version code downgrade]\\n" if not st.get("pm_no_downgrade") else ""
             out(usage); sys.exit(255)
         if len(sh) > 1 and sh[1] == "path":
-            out(("package:" + st["base_path"] + "\\n") if st["installed"] else ""); sys.exit(0)
+            # Android 16 真机语义：未装包 rc=1、stdout/stderr 皆空；已装 rc=0 带 package: 行
+            st["pm_path_calls"] = st.get("pm_path_calls", 0) + 1; save()
+            if st.get("pm_path_fail_at") == st["pm_path_calls"]:
+                sys.stderr.write("error: device offline\\n"); sys.exit(st.get("pm_path_fail_rc", 255))   # 查询失败：stderr + 非 0
+            if st["installed"]:
+                out("package:" + st["base_path"] + "\\n"); sys.exit(0)
+            sys.exit(1)
         if len(sh) > 1 and sh[1] == "clear":
             for k in list(DATA_DIRS):
                 DATA_DIRS[k] = {}
@@ -382,6 +388,34 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("私有数据", man["reason"])
         self.assertIn("debuggable", man["reason"])
+
+    def test_pm_path_query_failure_refuses_before_run(self):
+        """⑫ pm path 查询失败（stderr + 非 0）→ 红、起局前就停，不留置（还没动过设备）。"""
+        rc, out, state = self.run_tool(state={"pm_path_fail_at": 1})
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "查询失败不该有任何安装动作")
+        self.assertFalse(st["running"], "查询失败不该启动游戏")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("pm path", man["reason"])
+        self.assertFalse((self.lock_root / SERIAL / "detained.json").exists(),
+                         "设备还没被碰过，查询失败不该留置")
+
+    def test_pm_path_rc1_with_stderr_is_failure_not_uninstalled(self):
+        """⑫ rc=1 但带 stderr = adb 层查询失败，不能当『未安装』放行起局。"""
+        rc, out, state = self.run_tool(state={"pm_path_fail_at": 1, "pm_path_fail_rc": 1})
+        self.assertNotEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st, "rc=1 带 stderr 必须判查询失败")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("pm path", man["reason"])
+
+    def test_pm_path_failure_during_restore_recheck_detains(self):
+        """⑫ 收局卸载后复查 pm path 查询失败 → 卸载结果未证 → 还原失败留置。"""
+        # 未装路径 pm path 调用序：① 入局 install_state ② 收局 restore_state 入口 ③ 卸载后复查
+        rc, out, state = self.run_tool(state={"pm_path_fail_at": 3})
+        self.assertEqual(3, rc, "复查失败应留置（exit 3）")
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
 
     def test_restores_original_apk_with_data_loss_flag(self):
         """③ --allow-data-loss 放行：只还原 APK 字节（装回原包复核 sha）。"""
