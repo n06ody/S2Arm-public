@@ -160,11 +160,14 @@ def verify_pushed_tree(adb, dev_dir, local_root, log):
     find -exec sha256sum {} + 把全部路径摊进一次 exec：几万文件的资源树触发
     toybox E2BIG（Argument list too long，8E r4 真机实测）。改走有界分批
     find -print0 | xargs -0 -n 256 sha256sum（Android toybox xargs 提供
-    -0/-n、find 提供 -print0）；核验失败只回短 stderr 尾，不灌文件清单。"""
+    -0/-n、find 提供 -print0）；核验失败只回短 stderr 尾，不灌文件清单。
+    管道必须包在 sh -c 里传：Adb.shell 对参数做 shlex.join，直接传整串会被
+    单引号包成一个词，设备当文件名 exec → rc=127（8E r5 qa-fone 实测）。"""
     expected = {str(p.relative_to(local_root)): digest(p)
                 for p in Path(local_root).rglob('*') if p.is_file()}
     try:
-        out = adb.shell(f'find {dev_dir} -type f -print0 | xargs -0 -n 256 sha256sum')
+        out = adb.shell('sh', '-c',
+                        f'find {dev_dir} -type f -print0 | xargs -0 -n 256 sha256sum')
     except RuntimeError as error:
         raise RuntimeError('设备端资源 SHA 核验失败：' + str(error)[-200:]) from error
     actual = {}
@@ -237,7 +240,8 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
             log(f'资源树 {nfiles} 文件整树推送（超时 {est}s，按字节+文件数估）')
             push_tree(adb, resources, pending, est, log)
         adb.shell('chmod', '-R', 'u=rwX,g=rX,o=r', pending)
-        adb.shell(f'find {pending} -type d -print0 | xargs -0 -n 256 chmod o=x')
+        adb.shell('sh', '-c',
+                  f'find {pending} -type d -print0 | xargs -0 -n 256 chmod o=x')
         adb.shell('mv', pending, imported)
         since = adb.shell('date', '+%m-%d %H:%M:%S.000')
         library_active = True
