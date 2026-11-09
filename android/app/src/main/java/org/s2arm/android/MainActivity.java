@@ -71,6 +71,7 @@ public class MainActivity extends Activity
     private final android.os.Handler lifecycleProbe = new android.os.Handler(android.os.Looper.getMainLooper());
     private long lastLifecyclePresent;
     private final Runnable lifecycleSample = this::sampleLifecyclePresent;
+    private SystemPowerSampler powerSampler;   // #48 A5：应用内电池净放电读数（仅游戏局）
     private android.window.OnBackInvokedCallback gameBackCallback;
     /** #48 A3+A4：直连刷新率投票 + 省电档限帧；只有 :game 会话（gameMode）才起轮询。 */
     private SystemTuning systemTuning;
@@ -122,6 +123,9 @@ public class MainActivity extends Activity
                     android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, gameBackCallback);
             }
             systemTuning = new SystemTuning(this, lifecycleProbe);
+            // A5 读数落 logcat（采集的 logcat.txt）：有效净放电报 W，其余每秒一行 unavailable。
+            powerSampler = new SystemPowerSampler(this, lifecycleProbe, watts -> Log.i("S2Arm",
+                "battery-discharge-watts=" + (Double.isNaN(watts) ? "unavailable" : String.format(java.util.Locale.ROOT, "%.3f", watts))));
         }
         if (!gameMode) {
             String packageTitle;
@@ -581,6 +585,7 @@ public class MainActivity extends Activity
         library.scanImports();   // report the library; imports require an explicit staging target
         if (host != 0) NativeBridge.setForeground(host, true);   // the window, if any, is still the render thread's
         if (systemTuning != null) systemTuning.start();
+        if (powerSampler != null) powerSampler.start();
         tryStartGame();
         if (gameMode && host != 0 && !gameStopping && getIntent().getBooleanExtra(GameActivity.LIFECYCLE_TEST_EXTRA, false)
                 && (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
@@ -611,6 +616,7 @@ public class MainActivity extends Activity
             if (host != 0) NativeBridge.setForeground(host, false);
         }
         if (systemTuning != null) systemTuning.stop();
+        if (powerSampler != null) powerSampler.stop();
         super.onPause();
     }
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {

@@ -93,6 +93,9 @@ s2a_gate_step bash "$android_dir/tools/generic_frame_trace_test.sh"
 # 轮询接线（周期→票、省电档→cap、开关、停后迟到回调不采）、生产 present_period 的封顶与登记。
 s2a_gate_step bash "$android_dir/tools/frame_rate_vote_test.sh"
 s2a_gate_step bash "$android_dir/tools/system_tuning_test.sh"
+# #48 A5（宿主，确定性）：BatteryManager 净放电换算与不可用状态、采样器停采/迟到回调/读数开关。
+s2a_gate_step bash "$android_dir/tools/system_power_test.sh"
+
 # 转储解析器（宿主，确定性）：分片拼回/完整性拒绝、全窗统计、与 16 帧聚合行对拍、C→python 对拍。
 s2a_gate_step "$PY" "$android_dir/tests/direct_framelog_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_game_mode_test.py"
