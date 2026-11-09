@@ -1,0 +1,228 @@
+diff --git a/src/Ryujinx.Graphics.Nvdec.Vp9/Decoder.cs b/src/Ryujinx.Graphics.Nvdec.Vp9/Decoder.cs
+index 150e0006b3ad932cc35512d5e490b279ba317fb3..481277a41ef0ab9d537175efa03262ce366b60b0 100644
+--- a/src/Ryujinx.Graphics.Nvdec.Vp9/Decoder.cs
++++ b/src/Ryujinx.Graphics.Nvdec.Vp9/Decoder.cs
+@@ -10,6 +10,13 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
+     {
+         public bool IsHardwareAccelerated => false;
+ 
++        // S2Arm: the spec default probability table in Vp9EntropyProbs layout (what a job's supplied
++        // table looks like when its base context is the VP9 defaults — ctx-frozen streams and every
++        // key frame). Hardware backends that can only decode repacked frames with their built-in
++        // context (AMediaCodec; Vp9NativeHeader writes refresh_frame_context=0 so its ctx[0] stays at
++        // these defaults) compare a job's supplied table against this to decide representability.
++        public static Vp9EntropyProbs DefaultProbs() => EntropyMode.CreateDefaultProbs();
++
+         private readonly MemoryAllocator _allocator = new();
+         private byte[] _lastSegmentMap = [];
+         private int _lastSegmentMapMiRows;
+diff --git a/src/Ryujinx.Graphics.Nvdec.Vp9/EntropyMode.cs b/src/Ryujinx.Graphics.Nvdec.Vp9/EntropyMode.cs
+index 80e2f8c8d7de083975be1a1de1099665f28f46bd..c1d3b02b250943113db327424bf0a5748e17d7a6 100644
+--- a/src/Ryujinx.Graphics.Nvdec.Vp9/EntropyMode.cs
++++ b/src/Ryujinx.Graphics.Nvdec.Vp9/EntropyMode.cs
+@@ -286,6 +286,95 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
+ 
+         private static readonly byte[] _defaultSwitchableInterpProb = [235, 162, 36, 255, 34, 3, 149, 144];
+ 
++        internal static readonly byte[][] KfPartitionProbs =
++        [
++            // 8x8 . 4x4
++            [158, 97, 94], // a/l both not split
++            [93, 24, 99], // a split, l not split
++            [85, 119, 44], // l split, a not split
++            [62, 59, 67], // a/l both split
++
++            // 16x16 . 8x8
++            [149, 53, 53], // a/l both not split
++            [94, 20, 48], // a split, l not split
++            [83, 53, 24], // l split, a not split
++            [52, 18, 18], // a/l both split
++
++            // 32x32 . 16x16
++            [150, 40, 39], // a/l both not split
++            [78, 12, 26], // a split, l not split
++            [67, 33, 11], // l split, a not split
++            [24, 7, 5], // a/l both split
++
++            // 64x64 . 32x32
++            [174, 35, 49], // a/l both not split
++            [68, 11, 27], // a split, l not split
++            [57, 15, 9], // l split, a not split
++            [12, 3, 3] // a/l both split
++        ];
++
++        // 把规范关键帧表（kf_y_mode / kf_uv_mode / kf_partition）填进 fc。Vp9Decoder.Create 与
++        // CreateDefaultProbs 共用——这些字段在关键帧/帧内作业的供给表里就是这份常量。
++        internal static void FillKeyFrameProbs(ref Vp9EntropyProbs fc)
++        {
++            Span<Array10<Array9<byte>>> cKfYModeProbSpan1 = fc.KfYModeProb.AsSpan();
++
++            for (int i = 0; i < KfYModeProb.Length; i++)
++            {
++                Span<Array9<byte>> cKfYModeProbSpan2 = cKfYModeProbSpan1[i].AsSpan();
++
++                for (int j = 0; j < KfYModeProb[i].Length; j++)
++                {
++                    Span<byte> cKfYModeProbSpan3 = cKfYModeProbSpan2[j].AsSpan();
++
++                    for (int k = 0; k < KfYModeProb[i][j].Length; k++)
++                    {
++                        cKfYModeProbSpan3[k] = KfYModeProb[i][j][k];
++                    }
++                }
++            }
++
++            Span<Array9<byte>> cKfUvModeProbSpan1 = fc.KfUvModeProb.AsSpan();
++
++            for (int i = 0; i < KfUvModeProb.Length; i++)
++            {
++                Span<byte> cKfUvModeProbSpan2 = cKfUvModeProbSpan1[i].AsSpan();
++
++                for (int j = 0; j < KfUvModeProb[i].Length; j++)
++                {
++                    cKfUvModeProbSpan2[j] = KfUvModeProb[i][j];
++                }
++            }
++
++            Span<Array3<byte>> cKfPartitionProbSpan1 = fc.KfPartitionProb.AsSpan();
++
++            for (int i = 0; i < KfPartitionProbs.Length; i++)
++            {
++                Span<byte> cKfPartitionProbSpan2 = cKfPartitionProbSpan1[i].AsSpan();
++
++                for (int j = 0; j < KfPartitionProbs[i].Length; j++)
++                {
++                    cKfPartitionProbSpan2[j] = KfPartitionProbs[i][j];
++                }
++            }
++        }
++
++        // S2Arm：整份 VP9 规范默认概率表（Vp9EntropyProbs 布局，3087 字节）。驱动给逐作业供给表
++        // 等于这份默认值时，只能以内建 ctx 解码的硬解后端（AMediaCodec，重打包帧
++        // refresh_frame_context=0 → ctx[0] 恒为默认值）才能逐位等价复现 hook 的解码。
++        // SegTreeProb/SegPredProb 不在内：segmentation 作业在 header Check 就被拒，重打包帧
++        // segmentation_enabled=0，这两个字段不进解码，比较时也不该算。
++        internal static Vp9EntropyProbs CreateDefaultProbs()
++        {
++            using var allocator = new MemoryAllocator();
++            var cm = new Vp9Common { Fc = new Ptr<Vp9EntropyProbs>(ref allocator.Allocate<Vp9EntropyProbs>(1)[0]) };
++            FillKeyFrameProbs(ref cm.Fc.Value);
++            cm.DefaultCoefProbs();
++            InitModeProbs(ref cm.Fc.Value);
++            cm.InitMvProbs();
++            return cm.Fc.Value;
++        }
++
+         private static void InitModeProbs(ref Vp9EntropyProbs fc)
+         {
+             Entropy.CopyProbs(ref fc.UvModeProb, _defaultIfUvProbs);
+diff --git a/src/Ryujinx.Graphics.Nvdec.Vp9/Types/Vp9Decoder.cs b/src/Ryujinx.Graphics.Nvdec.Vp9/Types/Vp9Decoder.cs
+index 29315b286e02c903c15cd4957007e8149dbb500c..eb4dffaf21c1529cb3dcff0429c2dff56992c12d 100644
+--- a/src/Ryujinx.Graphics.Nvdec.Vp9/Types/Vp9Decoder.cs
++++ b/src/Ryujinx.Graphics.Nvdec.Vp9/Types/Vp9Decoder.cs
+@@ -44,73 +44,7 @@ namespace Ryujinx.Graphics.Nvdec.Vp9.Types
+             cm.CheckMemError(ref cm.FrameContexts,
+                 allocator.Allocate<Vp9EntropyProbs>(Constants.FrameContexts));
+ 
+-            Span<Array10<Array9<byte>>> cKfYModeProbSpan1 = cm.Fc.Value.KfYModeProb.AsSpan();
+-            
+-            for (int i = 0; i < EntropyMode.KfYModeProb.Length; i++)
+-            {
+-                Span<Array9<byte>> cKfYModeProbSpan2 = cKfYModeProbSpan1[i].AsSpan();
+-                
+-                for (int j = 0; j < EntropyMode.KfYModeProb[i].Length; j++)
+-                {
+-                    Span<byte> cKfYModeProbSpan3 = cKfYModeProbSpan2[j].AsSpan();
+-                    
+-                    for (int k = 0; k < EntropyMode.KfYModeProb[i][j].Length; k++)
+-                    {
+-                        cKfYModeProbSpan3[k] = EntropyMode.KfYModeProb[i][j][k];
+-                    }
+-                }
+-            }
+-            
+-            Span<Array9<byte>> cKfUvModeProbSpan1 = cm.Fc.Value.KfUvModeProb.AsSpan();
+-
+-            for (int i = 0; i < EntropyMode.KfUvModeProb.Length; i++)
+-            {
+-                Span<byte> cKfUvModeProbSpan2 = cKfUvModeProbSpan1[i].AsSpan();
+-                
+-                for (int j = 0; j < EntropyMode.KfUvModeProb[i].Length; j++)
+-                {
+-                    cKfUvModeProbSpan2[j] = EntropyMode.KfUvModeProb[i][j];
+-                }
+-            }
+-
+-            byte[][] kfPartitionProbs =
+-            [
+-                // 8x8 . 4x4
+-                [158, 97, 94], // a/l both not split
+-                [93, 24, 99], // a split, l not split
+-                [85, 119, 44], // l split, a not split
+-                [62, 59, 67], // a/l both split
+-
+-                // 16x16 . 8x8
+-                [149, 53, 53], // a/l both not split
+-                [94, 20, 48], // a split, l not split
+-                [83, 53, 24], // l split, a not split
+-                [52, 18, 18], // a/l both split
+-
+-                // 32x32 . 16x16
+-                [150, 40, 39], // a/l both not split
+-                [78, 12, 26], // a split, l not split
+-                [67, 33, 11], // l split, a not split
+-                [24, 7, 5], // a/l both split
+-
+-                // 64x64 . 32x32
+-                [174, 35, 49], // a/l both not split
+-                [68, 11, 27], // a split, l not split
+-                [57, 15, 9], // l split, a not split
+-                [12, 3, 3] // a/l both split
+-            ];
+-            
+-            Span<Array3<byte>> cKfPartitionProbSpan1 = cm.Fc.Value.KfPartitionProb.AsSpan();
+-
+-            for (int i = 0; i < kfPartitionProbs.Length; i++)
+-            {
+-                Span<byte> cKfPartitionProbSpan2 = cKfPartitionProbSpan1[i].AsSpan();
+-                
+-                for (int j = 0; j < kfPartitionProbs[i].Length; j++)
+-                {
+-                    cKfPartitionProbSpan2[j] = kfPartitionProbs[i][j];
+-                }
+-            }
++            EntropyMode.FillKeyFrameProbs(ref cm.Fc.Value);
+ 
+             cm.Counts = new Ptr<Vp9BackwardUpdates>(ref allocator.Allocate<Vp9BackwardUpdates>(1)[0]);
+ 
+diff --git a/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs b/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
+index bbf08bdf37611e15e38812ccffe819fe455068f5..949abcc7a3cf920987ee25cda7cad981fbf02858 100644
+--- a/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
++++ b/src/Ryujinx.Graphics.Nvdec/Vp9NativePath.cs
+@@ -140,6 +140,9 @@ namespace Ryujinx.Graphics.Nvdec
+                 CompVarRef0 = pictureInfo.CompVarRef[0],
+                 CompVarRef1 = pictureInfo.CompVarRef[1],
+                 UsePrevFrameMvs = info.UsePrevInFindMvRefs ? 1 : 0,
++                Width = input.Width,
++                Height = input.Height,
++                ShowFrame = input.IntraOnly ? 0 : 1,   // 与 Vp9NativeHeader.Write 的 show_frame 位同源
+             };
+ 
+             ReadOnlySpan<byte> prevMvs = info.UsePrevInFindMvRefs
+diff --git a/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs b/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
+index 5183fdca98a3957d08b786384cf8dbfa1695e6e9..f2357901d78792c7ca8b8a90863a2f052ac598d8 100644
+--- a/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
++++ b/src/Ryujinx.Graphics.Video/IVp9NativeBackend.cs
+@@ -23,6 +23,12 @@ namespace Ryujinx.Graphics.Video
+         public int CompVarRef0;
+         public int CompVarRef1;
+         public int UsePrevFrameMvs;
++        // Job display semantics for hardware-backed decoders that size a codec per decode: the repacked
++        // frame's coded dimensions and its show_frame bit (0 = intra-only hidden job — backend still feeds
++        // it for reference state but surfaces the previous picture, not a new frame).
++        public int Width;
++        public int Height;
++        public int ShowFrame;
+     }
+ 
+     public readonly struct Vp9NativePicture

@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='s2a-avc-managed-') as temporary:
     (out/'build.log').write_text(build.stdout+build.stderr)
     if build.returncode: sys.exit(build.stdout+build.stderr)
     binary=next((out/'artifacts/bin/Avc.Tests').rglob('Avc.Tests.dll'))
-    env=dict(os.environ); env.pop('S2A_AVC_LIBRARY',None)
+    env=dict(os.environ); env.pop('S2A_AVC_LIBRARY',None); env.pop('S2A_MC_LIBRARY',None)
     contracts=subprocess.run(['dotnet',str(binary)],env=env,capture_output=True,text=True)
     log=contracts.stdout+contracts.stderr
     (out/'contracts.log').write_text(log)
@@ -39,6 +39,13 @@ with tempfile.TemporaryDirectory(prefix='s2a-avc-managed-') as temporary:
     missing=out/('missing.dylib' if platform.system()=='Darwin' else 'missing.so')
     source=out/'missing.c';source.write_text('void fixture_missing_entry(void) {}\n')
     subprocess.run(['cc','-fPIC','-shared',str(source),'-o',str(missing)],check=True)
+    mc=out/('mc.dylib' if platform.system()=='Darwin' else 'mc.so')
+    subprocess.run(['cc','-fPIC','-shared',str(here/'managed/mc_fixture.c'),'-o',str(mc)],check=True)
+    for mode in ('ok','latefail','pending','starve','noprobe','createfail','decodefail'):
+        mc_env=dict(env,S2A_MC_LIBRARY=str(mc),S2A_MC_FAKE_MODE=mode)
+        run=subprocess.run(['dotnet',str(binary),'vp9'],env=mc_env,capture_output=True,text=True)
+        (out/f'vp9-{mode}.log').write_text(run.stdout+run.stderr)
+        assert run.returncode==0 and 'PASS vp9 selection boundary mode='+mode in run.stdout, run.stdout+run.stderr
     missing_env=dict(env,S2A_AVC_LIBRARY=str(missing))
     entry=subprocess.run(['dotnet',str(binary)],env=missing_env,capture_output=True,text=True)
     (out/'missing-entry.log').write_text(entry.stdout+entry.stderr)

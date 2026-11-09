@@ -23,6 +23,12 @@ namespace Ryujinx.Graphics.Video
         public int CompVarRef0;
         public int CompVarRef1;
         public int UsePrevFrameMvs;
+        // Job display semantics for hardware-backed decoders that size a codec per decode: the repacked
+        // frame's coded dimensions and its show_frame bit (0 = intra-only hidden job — backend still feeds
+        // it for reference state but surfaces the previous picture, not a new frame).
+        public int Width;
+        public int Height;
+        public int ShowFrame;
     }
 
     public readonly struct Vp9NativePicture

@@ -10,6 +10,13 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
     {
         public bool IsHardwareAccelerated => false;
 
+        // S2Arm: the spec default probability table in Vp9EntropyProbs layout (what a job's supplied
+        // table looks like when its base context is the VP9 defaults — ctx-frozen streams and every
+        // key frame). Hardware backends that can only decode repacked frames with their built-in
+        // context (AMediaCodec; Vp9NativeHeader writes refresh_frame_context=0 so its ctx[0] stays at
+        // these defaults) compare a job's supplied table against this to decide representability.
+        public static Vp9EntropyProbs DefaultProbs() => EntropyMode.CreateDefaultProbs();
+
         private readonly MemoryAllocator _allocator = new();
         private byte[] _lastSegmentMap = [];
         private int _lastSegmentMapMiRows;

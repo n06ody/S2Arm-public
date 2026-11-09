@@ -286,6 +286,95 @@ namespace Ryujinx.Graphics.Nvdec.Vp9
 
         private static readonly byte[] _defaultSwitchableInterpProb = [235, 162, 36, 255, 34, 3, 149, 144];
 
+        internal static readonly byte[][] KfPartitionProbs =
+        [
+            // 8x8 . 4x4
+            [158, 97, 94], // a/l both not split
+            [93, 24, 99], // a split, l not split
+            [85, 119, 44], // l split, a not split
+            [62, 59, 67], // a/l both split
+
+            // 16x16 . 8x8
+            [149, 53, 53], // a/l both not split
+            [94, 20, 48], // a split, l not split
+            [83, 53, 24], // l split, a not split
+            [52, 18, 18], // a/l both split
+
+            // 32x32 . 16x16
+            [150, 40, 39], // a/l both not split
+            [78, 12, 26], // a split, l not split
+            [67, 33, 11], // l split, a not split
+            [24, 7, 5], // a/l both split
+
+            // 64x64 . 32x32
+            [174, 35, 49], // a/l both not split
+            [68, 11, 27], // a split, l not split
+            [57, 15, 9], // l split, a not split
+            [12, 3, 3] // a/l both split
+        ];
+
+        // 把规范关键帧表（kf_y_mode / kf_uv_mode / kf_partition）填进 fc。Vp9Decoder.Create 与
+        // CreateDefaultProbs 共用——这些字段在关键帧/帧内作业的供给表里就是这份常量。
+        internal static void FillKeyFrameProbs(ref Vp9EntropyProbs fc)
+        {
+            Span<Array10<Array9<byte>>> cKfYModeProbSpan1 = fc.KfYModeProb.AsSpan();
+
+            for (int i = 0; i < KfYModeProb.Length; i++)
+            {
+                Span<Array9<byte>> cKfYModeProbSpan2 = cKfYModeProbSpan1[i].AsSpan();
+
+                for (int j = 0; j < KfYModeProb[i].Length; j++)
+                {
+                    Span<byte> cKfYModeProbSpan3 = cKfYModeProbSpan2[j].AsSpan();
+
+                    for (int k = 0; k < KfYModeProb[i][j].Length; k++)
+                    {
+                        cKfYModeProbSpan3[k] = KfYModeProb[i][j][k];
+                    }
+                }
+            }
+
+            Span<Array9<byte>> cKfUvModeProbSpan1 = fc.KfUvModeProb.AsSpan();
+
+            for (int i = 0; i < KfUvModeProb.Length; i++)
+            {
+                Span<byte> cKfUvModeProbSpan2 = cKfUvModeProbSpan1[i].AsSpan();
+
+                for (int j = 0; j < KfUvModeProb[i].Length; j++)
+                {
+                    cKfUvModeProbSpan2[j] = KfUvModeProb[i][j];
+                }
+            }
+
+            Span<Array3<byte>> cKfPartitionProbSpan1 = fc.KfPartitionProb.AsSpan();
+
+            for (int i = 0; i < KfPartitionProbs.Length; i++)
+            {
+                Span<byte> cKfPartitionProbSpan2 = cKfPartitionProbSpan1[i].AsSpan();
+
+                for (int j = 0; j < KfPartitionProbs[i].Length; j++)
+                {
+                    cKfPartitionProbSpan2[j] = KfPartitionProbs[i][j];
+                }
+            }
+        }
+
+        // S2Arm：整份 VP9 规范默认概率表（Vp9EntropyProbs 布局，3087 字节）。驱动给逐作业供给表
+        // 等于这份默认值时，只能以内建 ctx 解码的硬解后端（AMediaCodec，重打包帧
+        // refresh_frame_context=0 → ctx[0] 恒为默认值）才能逐位等价复现 hook 的解码。
+        // SegTreeProb/SegPredProb 不在内：segmentation 作业在 header Check 就被拒，重打包帧
+        // segmentation_enabled=0，这两个字段不进解码，比较时也不该算。
+        internal static Vp9EntropyProbs CreateDefaultProbs()
+        {
+            using var allocator = new MemoryAllocator();
+            var cm = new Vp9Common { Fc = new Ptr<Vp9EntropyProbs>(ref allocator.Allocate<Vp9EntropyProbs>(1)[0]) };
+            FillKeyFrameProbs(ref cm.Fc.Value);
+            cm.DefaultCoefProbs();
+            InitModeProbs(ref cm.Fc.Value);
+            cm.InitMvProbs();
+            return cm.Fc.Value;
+        }
+
         private static void InitModeProbs(ref Vp9EntropyProbs fc)
         {
             Entropy.CopyProbs(ref fc.UvModeProb, _defaultIfUvProbs);

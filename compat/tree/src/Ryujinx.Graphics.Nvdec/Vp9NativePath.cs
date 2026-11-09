@@ -140,6 +140,9 @@ namespace Ryujinx.Graphics.Nvdec
                 CompVarRef0 = pictureInfo.CompVarRef[0],
                 CompVarRef1 = pictureInfo.CompVarRef[1],
                 UsePrevFrameMvs = info.UsePrevInFindMvRefs ? 1 : 0,
+                Width = input.Width,
+                Height = input.Height,
+                ShowFrame = input.IntraOnly ? 0 : 1,   // 与 Vp9NativeHeader.Write 的 show_frame 位同源
             };
 
             ReadOnlySpan<byte> prevMvs = info.UsePrevInFindMvRefs

@@ -525,3 +525,4 @@
 20261109-0327-bsd-cmd36-config-log.patch
 20261109-0458-nvdec-vp9-native.patch
 20261109-0618-tamper-no-dynamic.patch
+20261110-0329-vp9-native-mc-params.patch

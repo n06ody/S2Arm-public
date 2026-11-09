@@ -161,3 +161,61 @@ The prior script included the entire dispatcher SHA in both Opus and VPX keys.
 Adding libavc therefore invalidated unrelated artifacts, and its temporary-only
 fetch path retried the network during the formal build. This is covered by
 independent-key, missing-source, corrupt-source and forbidden-network fixtures.
+
+## VP9 / AMediaCodec contract (#44)
+
+`s2a_mc.c` is the AMediaCodec boundary for hardware VP9 decode, reached through
+`McVp9Backend` (`android/cs/video/`), an `IVp9NativeBackend` implementation
+registered by `AndroidVideo` ahead of the libvpx backend and gated by
+`debug.s2a.video_hw` (`v[0]=='1'`; read inside `s2a_mc_probe`/`s2a_mc_create`,
+matching the `debug.s2a.buffer_geometry` convention). It carries no pinned
+third-party source — pure NDK `libmediandk`, compiled directly into
+`libs2arm_android.so` (`s2a_android_host_sources`), so `build.sh` source
+preparation does not cover it.
+
+The decode contract differs from `s2a_avc`: output is written into caller-owned
+Y/U/V planes (`s2a_mc_plane`: data/capacity/stride) passed to `s2a_mc_decode`,
+not a borrowed native view. `McSurface` allocates the planes unmanaged and the
+returned `Vp9NativePicture` borrows them, satisfying the backend contract that
+the picture stays valid until the next call. The shim deinterleaves the codec's
+actual output format reported by `AMediaCodec_getOutputFormat`
+(`color-format`/`stride`/`slice-height`/`crop-*`): YUV420 planar copies rows,
+semiplanar splits interleaved UV into separate U/V planes because
+`Vp9NativePicture` exposes three independent planes. Byte order differs by
+format: NV12 (0x15) is U-first while QCOM semiplanar 0x7FA30C00 is
+`OMX_QCOM_COLOR_FormatYVU420SemiPlanar` — V-first (NV21), so the deinterleave
+swaps U/V destinations for it. FLEXIBLE (0x7F420888) is only accepted as
+semiplanar when the codec actually reports `stride` and `slice-height`;
+missing keys or unknown color formats fail as unsupported rather than guessing
+a layout. Reported color/stride/slice-height ride in `s2a_mc_diag` on failures
+for per-device comparison.
+
+`AMediaFormat_set*` returns `void` (NDK 29): only `getInt32` signals presence.
+`AMEDIACODEC_INFO_*` dequeue results are normal flow control and retried with a
+bounded budget (input 20×10 ms, output 10×10 ms per call). Hardware decoders
+have pipeline latency: an accepted input with no output yet returns `0` with
+`diag.output==0` — recoverable. `s2a_mc_wait` drains queued output without a
+new AU; `McVp9Backend` feeds one job, then drains with a bounded total budget
+until the job's own picture arrives (VP9 has no reordering — the k-th produced
+frame answers the k-th shown AU), so one backend call still corresponds to the
+current job's picture. Only two bounds mark a dead codec: input-slot
+starvation and a run of more than `S2A_MC_MAX_EMPTY` (32) consecutive
+no-output calls — the count resets on any produced frame, so sparse hidden
+frames cannot accumulate into a false positive. `diag.output_token` records
+the current call's input token, not the produced frame's. Frame-size changes
+surface as `S2A_MC_RECONFIG` before input queueing — `McVp9Decoder` destroys
+and recreates the codec at the new dimensions, so RECONFIG is only observable
+through the raw C ABI.
+
+Under the `IVp9NativeBackend` contract the backend reports honestly what
+AMediaCodec cannot represent, and `Vp9NativePath` hands that job to the
+managed decoder until the next key frame: `show_frame=0` jobs (intra-only
+hidden frames — the hook surfaces the previous picture, hardware cannot),
+supplied entropy-probability tables that differ from the spec defaults the
+codec's context always carries, and non-key-frame size changes (a recreated
+codec has no reference state) return `NotRepresentable`/`NeedsKeyFrame`.
+`mvsOut` and `countsOut` are metadata only the managed decoder produces;
+on `Decoded` they are explicitly zero-filled rather than fabricated. After
+any decode-stage failure the shim marks the context failed; the backend maps
+that to `Error` once, and sustained starvation escalates to the same result
+so the native path disables itself instead of spinning.

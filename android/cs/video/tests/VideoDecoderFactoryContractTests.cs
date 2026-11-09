@@ -28,6 +28,8 @@ internal static class VideoDecoderFactoryContractTests
         private readonly object _value = Activator.CreateInstance(Type, nonPublic: true)!;
         public IH264Decoder H264() => (IH264Decoder)Type.GetMethod("GetH264Decoder")!.Invoke(_value, null)!;
         public IVp8Decoder Vp8() => (IVp8Decoder)Type.GetMethod("GetVp8Decoder")!.Invoke(_value, null)!;
+        public object ManagedVp9() => Type.GetMethod("GetManagedVp9")!.Invoke(_value, null)!;
+        public object? NativeVp9() => Type.GetMethod("GetVp9Native")!.Invoke(_value, null);
         public void Dispose() => ((IDisposable)_value).Dispose();
     }
 
@@ -101,14 +103,29 @@ internal static class VideoDecoderFactoryContractTests
         Check(Count("Nvdec VP8 backend=unavailable") == instances, "VP8 unavailable log once per decoder instance");
     }
 
+    private static void Vp9Managed(Context context, string reason)
+    {
+        // VP9 没接原生路径（没登记 / 工厂失败 / 模式 managed）时落到进程内托管解码器
+        // Ryujinx.Graphics.Nvdec.Vp9.Decoder——与接槽之前同一条路径，不产红日志。
+        var n = context.ManagedVp9();
+        Check(n != null && n.GetType().FullName == "Ryujinx.Graphics.Nvdec.Vp9.Decoder",
+            $"VP9 fallback is the managed decoder ({reason})");
+        Check(ReferenceEquals(n, context.ManagedVp9()), $"VP9 managed decoder cached per context ({reason})");
+        Check(context.NativeVp9() == null, $"native path stays null ({reason})");
+    }
+
     private static void Unregistered()
     {
         S2AVideoDecoders.H264 = null;
         S2AVideoDecoders.Vp8 = null;
+        S2AVideoDecoders.Vp9 = null;
+        S2AVideoDecoders.Vp9DefaultMode = "native"; // 原生模式开着也没后端：照样全走托管
         using var first = new Context();
         Fallback(first, 1);
+        Vp9Managed(first, "unregistered");
         using var second = new Context();
         Fallback(second, 2);
+        Vp9Managed(second, "unregistered");
         Check(Errors.Count == 4, "unregistered two contexts have four unavailable diagnostics");
     }
 
@@ -129,23 +146,34 @@ internal static class VideoDecoderFactoryContractTests
         // because creating it is free but decoding needs the native library, which this host test does not load.
         Check(S2AVideoDecoders.Vp9 != null, "VP9 native backend registered");
         Check(S2AVideoDecoders.Vp9DefaultMode == "native", "VP9 native by default on Android");
+        // debug.s2a.video_hw 在真机上开、probe 过才有 AMediaCodec；本宿主两者皆无，
+        // 工厂必须落到 libvpx 后端——创建本身免费（原生库只到解码才用）。
+        var backend = S2AVideoDecoders.Vp9!();
+        Check(backend?.GetType().FullName == "Ryujinx.Graphics.Nvdec.Vpx.VpxVp9Backend",
+            "host without hw prop/codec: factory falls back to libvpx backend");
+        backend?.Dispose();
         Check(Errors.Count == 0, "android-registered path has no red log");
     }
 
     private static void Throwing()
     {
-        int h = 0, v = 0;
+        int h = 0, v = 0, n = 0;
         S2AVideoDecoders.H264 = () => { h++; throw new InvalidOperationException("synthetic H264 factory failure"); };
         S2AVideoDecoders.Vp8 = () => { v++; throw new InvalidOperationException("synthetic VP8 factory failure"); };
+        S2AVideoDecoders.Vp9 = () => { n++; throw new InvalidOperationException("synthetic VP9 factory failure"); };
+        S2AVideoDecoders.Vp9DefaultMode = "native"; // 原生模式开着工厂才会被调用
         using var first = new Context();
         Fallback(first, 1);
-        Check(h == 1 && v == 1, "throwing factories invoked once in first context");
+        Vp9Managed(first, "throwing");
+        Check(h == 1 && v == 1 && n == 1, "throwing factories invoked once in first context");
         using var second = new Context();
         Fallback(second, 2);
-        Check(h == 2 && v == 2, "new context retries each factory once");
+        Vp9Managed(second, "throwing");
+        Check(h == 2 && v == 2 && n == 2, "new context retries each factory once");
         Check(Count("H.264 解码器工厂抛异常") == 1, "H264 factory diagnostic once per process");
         Check(Count("VP8 解码器工厂抛异常") == 1, "VP8 factory diagnostic once per process");
-        Check(Errors.Count == 6, "two factory errors plus four fallback diagnostics");
+        Check(Count("VP9 解码器工厂抛异常") == 1, "VP9 factory diagnostic once per process");
+        Check(Errors.Count == 7, "three factory errors plus four fallback diagnostics");
     }
 
     private static int Main(string[] args)
@@ -159,6 +187,8 @@ internal static class VideoDecoderFactoryContractTests
         }
         var oldH264 = S2AVideoDecoders.H264;
         var oldVp8 = S2AVideoDecoders.Vp8;
+        var oldVp9 = S2AVideoDecoders.Vp9;
+        var oldVp9Mode = S2AVideoDecoders.Vp9DefaultMode;
         EventHandler<LogEventArgs> capture = (_, e) => { if (e.Level == LogLevel.Error) Errors.Add(e.Message); };
         Logger.SetEnable(LogLevel.Error, true);
         Logger.SetEnable(LogClass.Nvdec, true);
@@ -187,6 +217,8 @@ internal static class VideoDecoderFactoryContractTests
         {
             S2AVideoDecoders.H264 = oldH264;
             S2AVideoDecoders.Vp8 = oldVp8;
+            S2AVideoDecoders.Vp9 = oldVp9;
+            S2AVideoDecoders.Vp9DefaultMode = oldVp9Mode;
             Logger.Updated -= capture;
         }
     }

@@ -140,6 +140,85 @@ static class Program
             }
         }
     }
+    static unsafe void Vp9Mc()
+    {
+        // S2A_MC_FAKE_MODE 驱动 fixture dylib 的演出路径；验的是 IVp9NativeBackend 契约下
+        // McVp9Backend 的裁决（gated/回退/记账），不验像素（fixture 不是解码器）。
+        string mode=Environment.GetEnvironmentVariable("S2A_MC_FAKE_MODE") ?? "ok";
+        byte[] probs;
+        {
+            Vp9EntropyProbs fc = Ryujinx.Graphics.Nvdec.Vp9.Decoder.DefaultProbs();
+            probs = MemoryMarshal.AsBytes(new[] { fc }.AsSpan()).ToArray();
+            Check(probs.Length == McVp9Backend.ProbsSize, "default probs blob is 3087 bytes");
+            Check(probs[0] != 0, "default probs blob is populated");
+        }
+        byte[] au={0x12,0x34,0x56,0x78};
+        byte[] mvs=Enumerable.Repeat((byte)0xAA,128).ToArray();
+        byte[] counts=Enumerable.Repeat((byte)0xAA,McVp9Backend.CountsSize).ToArray();
+        var key=new Vp9NativeParams{IntraFrame=1,ShowFrame=1,Width=32,Height=16};
+        using McVp9Backend backend=McVp9Backend.TryCreate();
+        if(mode=="noprobe")
+        {
+            Check(backend==null,"noprobe: TryCreate null → factory falls to vpx");
+            Console.WriteLine("PASS vp9 selection boundary mode="+mode);return;
+        }
+        Check(backend!=null,"probe ok: backend created");
+        Vp9NativeResult RP(ReadOnlySpan<byte> pb,Vp9NativeParams p,out Vp9NativePicture pic,out string err)
+        {
+            Array.Fill(mvs,(byte)0xAA); Array.Fill(counts,(byte)0xAA);
+            return backend.Decode(au,pb,in p,ReadOnlySpan<byte>.Empty,mvs,counts,out pic,out err);
+        }
+        Vp9NativeResult R(Vp9NativeParams p,out Vp9NativePicture pic,out string err) => RP(probs,p,out pic,out err);
+        if(mode=="ok")
+        {
+            Check(R(key,out var pic,out var err)==Vp9NativeResult.Decoded,$"keyframe decodes: {err}");
+            Check(pic.Y!=0&&pic.Width==32&&pic.Height==16,"picture view populated");
+            Check(mvs.All(x=>x==0),"mvsOut zero-filled, not fabricated");
+            Check(counts.All(x=>x==0),"countsOut zero-filled, not fabricated");
+            var inter=key; inter.IntraFrame=0;
+            Check(R(inter,out _,out _)==Vp9NativeResult.Decoded,"inter frame decodes");
+            // 隐藏帧 / 供给表≠默认表 / 越界尺寸：如实回退，不产出图。
+            var hidden=key; hidden.ShowFrame=0;
+            Check(R(hidden,out _,out _)==Vp9NativeResult.NotRepresentable,"hidden job not representable");
+            byte[] bad=(byte[])probs.Clone(); bad[2000]^=0xFF;
+            Check(RP(bad,key,out _,out _)==Vp9NativeResult.NotRepresentable,"non-default probs rejected");
+            // seg 字段不进解码：供给表仅 seg 段不同仍应通过（负对照）。
+            int segTree=(int)Marshal.OffsetOf<Vp9EntropyProbs>(nameof(Vp9EntropyProbs.SegTreeProb));
+            bad=(byte[])probs.Clone(); bad[segTree]^=0xFF; bad[segTree+8]^=0xFF;
+            Check(RP(bad,key,out _,out _)==Vp9NativeResult.Decoded,"seg fields excluded from compare");
+            // 尺寸变化的非关键帧 → NeedsKeyFrame；关键帧则重建后照常解。
+            var resize=key; resize.IntraFrame=0; resize.Width=64; resize.Height=32;
+            Check(R(resize,out _,out _)==Vp9NativeResult.NeedsKeyFrame,"non-key resize needs keyframe");
+            resize.IntraFrame=1;
+            Check(R(resize,out var pic2,out _)==Vp9NativeResult.Decoded,"keyframe resize reconfigures");
+            Check(pic2.Width==64&&pic2.Height==32,"picture follows new size");
+        }
+        if(mode=="pending")
+        {
+            // decode 不出图、wait 排空补齐：同一作业内 Decoded，不回退。
+            Check(R(key,out var pic,out var err)==Vp9NativeResult.Decoded,$"pending resolved via wait: {err}");
+            Check(pic.Y!=0,"pending resolved picture");
+        }
+        if(mode=="starve")
+        {
+            // 预算内补不齐：如实 NotRepresentable；连续三次升级 Error。
+            Check(R(key,out _,out _)==Vp9NativeResult.NotRepresentable,"starved job falls back");
+            Check(R(key,out _,out _)==Vp9NativeResult.NotRepresentable,"starved again");
+            Check(R(key,out _,out var err)==Vp9NativeResult.Error,"consecutive starvation escalates to Error");
+            Check(R(key,out _,out _)==Vp9NativeResult.Error,"starved backend stays sticky-failed");
+        }
+        if(mode=="createfail"||mode=="decodefail")
+        {
+            Check(R(key,out _,out var err)==Vp9NativeResult.Error,$"{mode} is Error: {err}");
+        }
+        if(mode=="latefail")
+        {
+            Check(R(key,out _,out var err)==Vp9NativeResult.Decoded,$"first frame ok: {err}");
+            Check(R(key,out _,out err)==Vp9NativeResult.Error,"mid-stream failure is Error");
+            Check(R(key,out _,out _)==Vp9NativeResult.Error,"failure is sticky");
+        }
+        Console.WriteLine("PASS vp9 selection boundary mode="+mode);
+    }
     static void Reconfiguration(string directory)
     {
         using var small=JsonDocument.Parse(File.ReadAllText(Path.Combine(directory,"b-refs4.json")));
@@ -163,14 +242,16 @@ static class Program
         try
         {
             string library=Environment.GetEnvironmentVariable("S2A_AVC_LIBRARY") ?? "";
+            string mclibrary=Environment.GetEnvironmentVariable("S2A_MC_LIBRARY") ?? "";
             NativeLibrary.SetDllImportResolver(typeof(AvcH264Decoder).Assembly,(name,assembly,path)=>
-                name=="s2arm_android" ? library.Length!=0 ? NativeLibrary.Load(library) : throw new DllNotFoundException("fixture: absent native backend") : 0);
+                name=="s2arm_android" ? (mclibrary.Length!=0 ? mclibrary : library).Length!=0 ? NativeLibrary.Load(mclibrary.Length!=0 ? mclibrary : library) : throw new DllNotFoundException("fixture: absent native backend") : 0);
             if(args.Length>0 && args[0]=="baseline-ffmpeg")
             {
                 using var baseline=new Ryujinx.Graphics.Nvdec.FFmpeg.H264.Decoder();
                 throw new Exception("baseline unexpectedly found FFmpeg");
             }
-            if(args.Length==0) Contracts(); else { Vectors(args[0],args.Length>1?args[1]:""); if(args.Length==1) Reconfiguration(args[0]); }
+            if(args.Length>0 && args[0]=="vp9") Vp9Mc();
+            else if(args.Length==0) Contracts(); else { Vectors(args[0],args.Length>1?args[1]:""); if(args.Length==1) Reconfiguration(args[0]); }
             return 0;
         }
         catch(Exception error) { Console.Error.WriteLine(error); return 1; }

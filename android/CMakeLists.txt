@@ -138,7 +138,7 @@ if(ANDROID)
     # 必须在 -Wall -Wextra 之后再关：-Wextra 会把组里的告警重新打开。语义不变。
     target_compile_options(s2arm_android PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-designated-field-initializers>")
-    target_link_libraries(s2arm_android PRIVATE s2arm_android_memory android log vulkan aaudio)
+    target_link_libraries(s2arm_android PRIVATE s2arm_android_memory android log vulkan aaudio mediandk)
     if(S2A_ANDROID_EXPERIMENTAL_TOUCH)
         target_compile_definitions(s2arm_android PRIVATE S2A_ANDROID_EXPERIMENTAL_TOUCH=1)
     endif()
@@ -578,6 +578,13 @@ else()
     target_compile_definitions(nvn_vk_swapchain_host_test PRIVATE VK_USE_PLATFORM_ANDROID_KHR=1)
     target_compile_options(nvn_vk_swapchain_host_test PRIVATE -Wall -Wextra -Werror -Wno-missing-field-initializers)
     add_test(NAME android_nvn_vk_swapchain_host COMMAND nvn_vk_swapchain_host_test)
+    # AMediaCodec 解码边界（#44 第二刀）：假 codec 状态机喂编排出图，
+    # 验证开关门 / NV12 解交织 / 平面拷贝 / 裁剪 / 有界等待 / 失败粘性。
+    add_executable(mc_host_test tests/mc_host_test.c codecs/s2a_mc.c)
+    target_include_directories(mc_host_test PRIVATE tests/hostmc codecs)
+    target_compile_definitions(mc_host_test PRIVATE S2A_MC_TESTING=1)
+    target_compile_options(mc_host_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME android_mc_host COMMAND mc_host_test)
     # F4.4：执行包 owner 控制（单包/挂起/恢复/Stop/换代/协议错误）。纯状态机，生产 adapter 共用。
     add_executable(nvn_vk_exec_owner_test tests/nvn_vk_exec_owner_test.c native/nvn/nvn_vk_exec_owner.c)
     target_include_directories(nvn_vk_exec_owner_test PRIVATE native/nvn)
