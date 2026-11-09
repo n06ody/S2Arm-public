@@ -58,6 +58,8 @@ int s2a_vk_adapter_attach_window(ANativeWindow *window, uint64_t generation, cha
 // 窗口撤销/换代：销毁交换链（有界观察最后一帧 present fence）。返回 0 = 可以归还租约；
 // -1 = 呈现退休没有证明：调用方必须保留 swapchain 与 WSI 租约，不得 ACK/released。
 int s2a_vk_adapter_detach_window(void);
+// B3：buffer_geometry 开启且交换链已按游戏输出尺寸建好时返回 1 并给出输出尺寸。
+int s2a_vk_adapter_buffer_geometry(uint32_t *w, uint32_t *h);
 // 没有 surface 的 present：把本帧命令提交掉，并且只在拿到 GPU 完成证明后释放纹理 pin
 // （等价 present 的收尾），不上屏、不销毁会话。返回 0 = 本帧已完成；-1 = 没有完成证明，
 // pin/队列资源保留，调用方按真实失败处理（后台几帧后 pin list 满正是漏了这一步）。

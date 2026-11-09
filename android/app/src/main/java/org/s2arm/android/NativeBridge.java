@@ -122,6 +122,11 @@ final class NativeBridge {
     /** Actual game queue-present count; -1 for the diagnostic renderer. */
     static native long gamePresentCount();
     /**
+     * B3 buffer_geometry: 交换链已按游戏输出尺寸出图时返回 1 并把输出尺寸写进 out[0]/out[1]
+     * （游戏像素）；否则返回 0、out 写 {0,0}。MainActivity 用它把 SurfaceView 布成同比例居中。
+     */
+    static native int bufferGeometry(int[] out);
+    /**
      * Registers the process's HostApi (runtime/include/s2a_hostapi.h) with the session's frozen
      * BootSpec user values; once per process (later calls keep the first values). Returns what the
      * core reads back through it.

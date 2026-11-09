@@ -25,6 +25,13 @@ struct nvn_vk_swapchain {
     // maxImageExtent 的合法夹取误判成尺寸变化而每帧重建。
     uint32_t window_width, window_height;
     uint64_t touch_generation;  // WSI generation for the frame currently being presented
+    // B3 按游戏输出尺寸出图（debug.s2a.buffer_geometry=1 在建链时捕获一次）：
+    // window 保留给按输出尺寸重建；frame_width/height 是建链时窗口的像素尺寸（view frame），
+    // buffer_geometry 把缓冲改成游戏输出尺寸后 getWidth/getHeight 只报告缓冲尺寸，
+    // 不能再拿它当窗口像素用——view 尺寸由 Java 布成同比例居中，窗口像素只在这里记一次。
+    ANativeWindow *window;
+    int buf_geometry;
+    uint32_t frame_width, frame_height;
     uint32_t image_count;
     VkImage images[8];
     // acquire 只有一把：提交会 wait 它，且同步调度在下一帧 acquire 前已等到渲染 fence，

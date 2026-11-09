@@ -288,14 +288,27 @@ static int sync_window_locked(struct provider_context *ctx, int64_t attach_budge
     int lease_has = trc == 0 && st.window != NULL;
     if (lease_has && lease->release_window) lease->release_window(lease->lease, st.window);
 
-    int32_t win_w = ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0;
-    int32_t win_h = ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0;
-    // 用建链时记录的“发布窗口尺寸”，不是被 surface min/max 夹取后的 extent：
-    // 夹取是合法的，不能因此每帧误判成 resize。
+    int32_t win_w, win_h, attached_w = 0, attached_h = 0;
+    if (session && session->swapchain.buf_geometry) {
+        // B3：缓冲已被改成游戏输出尺寸，getWidth/getHeight 只报告缓冲尺寸，窗口像素
+        // 从租约的 surfaceChanged frame 读；还没有 surfaceChanged 时回落 getWidth
+        // （几何覆盖没发生前 getWidth 仍是 frame 像素）。对比的是建链时记下的 frame。
+        win_w = st.width > 0 ? st.width
+                             : (ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0);
+        win_h = st.height > 0 ? st.height
+                              : (ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0);
+        attached_w = (int32_t)session->swapchain.frame_width;
+        attached_h = (int32_t)session->swapchain.frame_height;
+    } else {
+        win_w = ctx->lease_window ? ANativeWindow_getWidth((ANativeWindow *)ctx->lease_window) : 0;
+        win_h = ctx->lease_window ? ANativeWindow_getHeight((ANativeWindow *)ctx->lease_window) : 0;
+        // 用建链时记录的“发布窗口尺寸”，不是被 surface min/max 夹取后的 extent：
+        // 夹取是合法的，不能因此每帧误判成 resize。
+        attached_w = session ? (int32_t)session->swapchain.window_width : 0;
+        attached_h = session ? (int32_t)session->swapchain.window_height : 0;
+    }
     int action = nvn_vk_window_action(
-        1, ctx->lease_generation,
-        session ? (int32_t)session->swapchain.window_width : 0,
-        session ? (int32_t)session->swapchain.window_height : 0,
+        1, ctx->lease_generation, attached_w, attached_h,
         lease_has, st.generation, st.stopping, win_w, win_h);
     if (action == NVK_WINDOW_REVOKED) {
         char text[192];
@@ -315,6 +328,16 @@ static int sync_window_locked(struct provider_context *ctx, int64_t attach_budge
         return 1;
     }
     if (action == NVK_WINDOW_REBUILD) {
+        if (session && session->swapchain.buf_geometry) {
+            // B3：交换链 extent=缓冲尺寸（游戏输出），view frame 变化不碰交换链；
+            // 只刷新窗口像素，触摸/日志继续按新 frame 记。
+            session->swapchain.frame_width = (uint32_t)st.width;
+            session->swapchain.frame_height = (uint32_t)st.height;
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                                "direct present: buffer-geometry frame updated to %dx%d (gen %llu, no rebuild)",
+                                (int)st.width, (int)st.height, (unsigned long long)ctx->lease_generation);
+            return 0;
+        }
         // 同一代窗口的发布尺寸变了（旋转/resize/分屏）：extent/crop 不能继续用旧值。
         if (s2a_vk_adapter_detach_window()) {
             set_window_error(ctx, "window resized but the old swapchain has no presentation-retirement proof; "

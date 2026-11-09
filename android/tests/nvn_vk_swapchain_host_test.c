@@ -25,8 +25,18 @@
 #include "game_touch.h"
 
 // ---- 宿主 Android 桩 ----
-int32_t ANativeWindow_getWidth(ANativeWindow *window) { (void)window; return 100; }
-int32_t ANativeWindow_getHeight(ANativeWindow *window) { (void)window; return 50; }
+static int32_t g_window_w = 100, g_window_h = 50;
+int32_t ANativeWindow_getWidth(ANativeWindow *window) { (void)window; return g_window_w; }
+int32_t ANativeWindow_getHeight(ANativeWindow *window) { (void)window; return g_window_h; }
+// B3：记录每次缓冲尺寸请求；真实语义——之后 getWidth/getHeight 报告缓冲尺寸。
+static int g_geo_calls;
+static int32_t g_geo_w, g_geo_h, g_geo_fmt;
+int32_t ANativeWindow_setBuffersGeometry(ANativeWindow *window, int32_t w, int32_t h, int32_t format) {
+    (void)window;
+    g_geo_calls++; g_geo_w = w; g_geo_h = h; g_geo_fmt = format;
+    g_window_w = w; g_window_h = h;
+    return 0;
+}
 
 static struct { const char *name; const char *value; } g_props[16];
 static int g_prop_count;
@@ -107,6 +117,8 @@ static void fake_reset(void) {
     g_present_done_calls = 0;
     g_revoke_on_present = 0;
     memset(&g_last_blit, 0, sizeof g_last_blit);
+    g_window_w = 100; g_window_h = 50;
+    g_geo_calls = 0; g_geo_w = g_geo_h = g_geo_fmt = 0;
     g_prop_count = 0;
 }
 
@@ -412,8 +424,7 @@ static struct nvn_vk_swapchain g_sc;
 static ANativeWindow *g_window = (ANativeWindow *)(uintptr_t)0x1234;
 static char g_create_why[192];
 
-static int create_swapchain(int maintenance1) {
-    fake_reset();
+static int create_swapchain_keep(int maintenance1) {
     memset(&g_dev, 0, sizeof g_dev);
     memset(&g_sc, 0, sizeof g_sc);
     g_dev.instance = (VkInstance)(uintptr_t)0x1;
@@ -426,6 +437,10 @@ static int create_swapchain(int maintenance1) {
     int rc = nvn_vk_swapchain_create(&g_sc, &g_dev, g_window, g_create_why, sizeof g_create_why);
     if (rc) printf("create: %s\n", g_create_why);
     return rc;
+}
+static int create_swapchain(int maintenance1) {
+    fake_reset();
+    return create_swapchain_keep(maintenance1);
 }
 
 int main(void) {
@@ -653,6 +668,56 @@ int main(void) {
         CHECK(st.pending == 1 && st.retired == 0, "unproven retirement is pending, not retired");
         CHECK(nvn_vk_swapchain_destroy(&g_sc) == -1, "destroy cannot claim retirement without a present fence");
         CHECK(g_destroyed_swapchains == 0, "swapchain kept when retirement is unproven");
+    }
+
+    // B3：debug.s2a.buffer_geometry=1 → 首个 present 按游戏输出尺寸改缓冲并退休旧交换链重建；
+    //     之后 blit 退化成 1:1 拷贝；触摸按 view frame 像素发布整帧；同尺寸不重建；crop 变再重建。
+    s2a_android_game_touch_revoke();
+    fake_reset();
+    fake_set_property("debug.s2a.buffer_geometry", "1");
+    if (create_swapchain_keep(1) == 0) {
+        CHECK(g_geo_calls == 0, "no geometry request before the first output size");
+        CHECK(g_sc.extent.width == 100 && g_sc.extent.height == 50, "initial extent is the window size");
+        g_sc.touch_generation = 60; s2a_android_game_touch_offer(60);
+        g_present_fence_signal_on_present = 1;
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        CHECK(rc == 0, "geometry present rc=%d (%s)", rc, why);
+        CHECK(g_geo_calls == 1 && g_geo_w == 160 && g_geo_h == 90,
+              "first present resizes the buffer to the game output 160x90");
+        CHECK(g_destroyed_swapchains == 1 && g_destroyed_surfaces == 1,
+              "previous swapchain retired for the resize");
+        CHECK(g_sc.extent.width == 160 && g_sc.extent.height == 90, "new extent = game output size");
+        CHECK(g_sc.touch_generation == 60, "WSI generation kept across the rebuild");
+        CHECK(g_last_blit.dstOffsets[0].x == 0 && g_last_blit.dstOffsets[0].y == 0 &&
+              g_last_blit.dstOffsets[1].x == 160 && g_last_blit.dstOffsets[1].y == 90,
+              "blit degenerates to a 1:1 copy filling the whole game-size buffer");
+        int64_t vp[8] = {0};
+        CHECK(s2a_android_game_touch_viewport_read(vp) == 0 && vp[0] == 60 &&
+              vp[2] == 0 && vp[3] == 0 && vp[4] == 100 && vp[5] == 50 && vp[6] == 100 && vp[7] == 50,
+              "touch viewport publishes the whole view in frame pixels");
+        int before_destroy = g_destroyed_swapchains, before_geo = g_geo_calls;
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        CHECK(rc == 0 && g_destroyed_swapchains == before_destroy && g_geo_calls == before_geo,
+              "same output size does not rebuild");
+        int crop4[4] = {0, 0, 80, 45};
+        rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, crop4, why, sizeof why);
+        CHECK(rc == 0 && g_geo_calls == before_geo + 1 && g_geo_w == 80 && g_geo_h == 45,
+              "a different crop rebuilds the buffer to the new output size");
+        CHECK(g_sc.extent.width == 80 && g_sc.extent.height == 45, "extent follows the crop");
+        CHECK(nvn_vk_swapchain_destroy(&g_sc) == 0, "geometry fixture cleanly retires");
+    }
+    s2a_android_game_touch_revoke();
+
+    // B3 负控：开关关 → present 全程不调 setBuffersGeometry、不重建，等比居中沿用窗口尺寸缓冲。
+    if (create_swapchain(1) == 0) {
+        g_present_fence_signal_on_present = 1;
+        int rc = nvn_vk_swapchain_present_image(&g_sc, src, VK_FORMAT_R8G8B8A8_UNORM, 160, 90, NULL, why, sizeof why);
+        CHECK(rc == 0 && g_geo_calls == 0 && g_destroyed_swapchains == 0,
+              "flag off: no setBuffersGeometry call, no swapchain rebuild");
+        CHECK(g_last_blit.dstOffsets[0].x == 5 && g_last_blit.dstOffsets[0].y == 0 &&
+              g_last_blit.dstOffsets[1].x == 94 && g_last_blit.dstOffsets[1].y == 50,
+              "flag off keeps the aspect-fit blit inside the window-size buffer");
+        CHECK(nvn_vk_swapchain_destroy(&g_sc) == 0, "disabled fixture cleanly retires");
     }
 
     if (g_failures) {

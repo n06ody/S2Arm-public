@@ -143,6 +143,21 @@ Java_org_s2arm_android_NativeBridge_gamePresentCount(JNIEnv *, jclass) {
 #endif
 }
 
+// B3：直连交换链按游戏输出尺寸出图时的缓冲尺寸；只在游戏运行时（mtl_vk_adapter）里存在。
+extern "C" int s2a_vk_adapter_buffer_geometry(uint32_t *, uint32_t *) __attribute__((weak));
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_s2arm_android_NativeBridge_bufferGeometry(JNIEnv *env, jclass, jintArray out) {
+    int on = 0;
+    uint32_t w = 0, h = 0;
+    if (s2a_vk_adapter_buffer_geometry) on = s2a_vk_adapter_buffer_geometry(&w, &h);
+    if (out && env->GetArrayLength(out) >= 2) {
+        jint dims[2] = {(jint)w, (jint)h};
+        env->SetIntArrayRegion(out, 0, 2, dims);
+    }
+    return on;
+}
+
 #ifndef S2A_ANDROID_GAME_RUNTIME
 static long rss_kib() {
     FILE *f = fopen("/proc/self/status", "re");

@@ -192,6 +192,11 @@ s2a_gate_step javac -encoding UTF-8 -d "$out/java" \
     "$android_dir/app/src/main/java/org/s2arm/android/GamepadState.java" \
     "$android_dir/tests/GamepadStateTest.java"
 s2a_gate_step java -cp "$out/java" org.s2arm.android.GamepadStateTest
+# B3（#48）：buffer_geometry 下 SurfaceView 的同比例 frame 取整，与 native publish_touch 同口径
+s2a_gate_step javac -encoding UTF-8 -d "$out/java" \
+    "$android_dir/app/src/main/java/org/s2arm/android/BufferGeometry.java" \
+    "$android_dir/tests/BufferGeometryTest.java"
+s2a_gate_step java -cp "$out/java" org.s2arm.android.BufferGeometryTest
 # Vulkan 款直连三态（#274）：intent 取值、缺省不是手动直连、与 native direct_choice.h 同值
 s2a_gate_step javac -encoding UTF-8 -d "$out/java" \
     "$android_dir/app/src/main/java/org/s2arm/android/VulkanDirectChoice.java" \
