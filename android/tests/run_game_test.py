@@ -342,14 +342,16 @@ def make_state(root, **kw):
     return path
 
 
-def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid=4242):
-    """v3 帧日志块（镜像 nvn_vk_frame_log.c：24B 记录 = ts_us + fence + acquire + present）。"""
+def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid=4242,
+                   clock="CLOCK_BOOTTIME"):
+    """v3 帧日志块（镜像 nvn_vk_frame_log.c：24B 记录 = ts_us + fence + acquire + present；
+    meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。"""
     recs = [struct.pack("<QIIII", base_ts + i * step_us, 0, 0, 900, 1200) for i in range(recorded)]
     blob = b"".join(recs)
     b64 = base64.b64encode(blob).decode()
     parts = [b64[i:i + 700] for i in range(0, len(b64), 700)]
     pre = f"11-09 12:00:01.000  {pid}  {pid} I S2Arm: "
-    lines = [pre + f"direct frame-log meta: v=3 clock=boottime unit=us endian=le rec=24 "
+    lines = [pre + f"direct frame-log meta: v=3 clock={clock} unit=us endian=le rec=24 "
                    f"cap=32768 recorded={recorded} presents={first + recorded} dropped=0 "
                    f"first={first} bytes={len(blob)} chunks={len(parts)}"]
     lines += [pre + f"direct frame-log[{i + 1}/{len(parts)}]:{p}" for i, p in enumerate(parts)]
@@ -720,6 +722,29 @@ class RunGameTest(unittest.TestCase):
                 fh.write(f"{i + 1}\t{10_000_000_000 + i * 16_667_000}\t16667\t{10_000_000_000 + i * 16_667_000}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
 
+    def test_qc_window_coverage_insufficient_is_no_data(self):
+        """⑯ 8E 首局场景：61.1s 采集窗，块首帧晚 ~4.7s、窗内只覆盖 56.4s（92%）。
+        sum(disp_us)≥55s 的旧判据会放它进统计——要如实判「窗口覆盖不足」没数据。"""
+        d = self.tmp / "qc-cover"
+        d.mkdir()
+        w0, w1 = 10_000_000, 71_080_000                    # 61.08s 窗口
+        (d / "android.json").write_text(json.dumps({"frame_window_us": [w0, w1]}))
+        first = w0 + 4_720_000                             # 块首帧晚 4.72s
+        n = int(56_360_000 / 16667)                        # 窗内覆盖 56.36s
+        with open(d / "frames.tsv", "w") as fh:
+            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            for i in range(1, n + 1):
+                fh.write(f"{i}\t{(first + i * 16667) * 1000}\t16667\t{(first + i * 16667) * 1000}\n")
+        r = self._qc(d)
+        self.assertEqual("没数据", r["帧率"])
+        self.assertIn("窗口覆盖不足", r["读数"])
+        # 同一窗口贴边满覆盖（60s/61.08s ≈ 98%）→ 覆盖判据放行，走正常帧率统计
+        with open(d / "frames.tsv", "w") as fh:
+            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            for i in range(1, 3601):
+                fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t{(w0 + i * 16667) * 1000}\n")
+        self.assertEqual("过", self._qc(d)["帧率"])
+
     def test_power_energy_verdicts(self):
         """⑧ 能耗口径：合法放电 → 未证；未知 / 接电 / 符号不一致 / 时钟不齐 → 没数据。"""
         self.assertEqual("未证", self._qc_energy(power_tsv()),
@@ -827,6 +852,21 @@ class RunGameTest(unittest.TestCase):
             argv=["--resources", str(res), "--push-tar", "always"])
         self.assertEqual(0, rc)
         self.assertIn("SHA 核对通过", (out / "run.log").read_text())
+
+    def test_wrong_clock_block_rejected_not_windowed(self):
+        """⑰ clock 非 boottime 的块（墙钟/CLOCK_REALTIME）与窗口时钟对不上：
+        整块未证、frames.tsv 只留表头，不混进窗口统计。CLOCK_BOOTTIME 真机原文
+        被认下由全套件证（frame_log_text 缺省就发 CLOCK_BOOTTIME）。"""
+        stray = frame_log_text(400, base_ts=10_050_000, pid=9999)
+        wrong = frame_log_text(clock="CLOCK_REALTIME")
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + stray + wrong)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + wrong)
+        rc, out, state = self.run_tool()
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(1, len(rows), "错时钟块一帧都不该进表")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(any("CLOCK_REALTIME" in n and "整段未证" in n for n in man["notes"]))
 
     def test_fake_adb_shell_single_word_is_127(self):
         """⑮ 替身忠实性负控：adb.shell('整串') 经 shlex.join 单引号包成一个词，
