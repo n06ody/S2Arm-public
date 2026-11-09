@@ -349,7 +349,8 @@ def check_android(o, name, ai=True):
     frames.tsv（frame / present_ns / disp_us / wall_us，direct-present 帧日志的上屏间隔，采集窗口内）、power.tsv（t + android_power.FIELDS + level）、
     logcat.txt、gfx_mode.txt。没有自动玩家：开窗即已在可玩画面（android.json mark），整窗口就是读数窗口。五项：
       画面 / 到游戏画面：同 iPhone，AI 看截图（题面说明覆盖层不算错）
-      帧率：disp_us 窗口 ≥ 55 秒、平均 ≥ 目标 × 99%、慢帧（> 1.5 倍预算）≤ 1%；目标取 tools/fps_truth.tsv（程序号从包名 org.s2arm.game.t<程序号> 取），没有按 60
+      帧率：先判采集窗口覆盖——frame_window_us 窗口内帧 span 覆盖 <95% → 「窗口覆盖不足」没数据；
+        再要 disp_us 窗口 ≥ 55 秒、平均 ≥ 目标 × 99%、慢帧（> 1.5 倍预算）≤ 1%；目标取 tools/fps_truth.tsv（程序号从包名 org.s2arm.game.t<程序号> 取），没有按 60
       满屏：截图就是整屏，直接数左右纯黑列（同 bars()；只看 AI 判为游戏画面的，没有判官时看全部）
       直连默认启动：启动命令带了 --es s2arm.graphics_mode 就不算默认启动（没数据）；直连 / 通用认 logcat「direct provider prepared」/「Gpu LoadShaders」，
         其次 gfx_mode.txt 首行；直连且有游戏画面 → 过，通用 → 不过
@@ -375,12 +376,30 @@ def check_android(o, name, ai=True):
         read.append('画面 ' + ('异常 ' + '；'.join(bad) if bad else '拿不准 ' + '；'.join(unsure) if unsure else f'{len(ps)} 张都正常'))
         game = [x for x, a in zip(ps, ans) if a.get('游戏画面') == '是']
     else: out['画面'] = '没数据'
-    # 帧率
+    # 帧率：先算采集窗口覆盖——帧表只装窗口内帧，但块首帧晚到 / 尾帧早停都会留空档；
+    # 覆盖 <95% 不能拿手里这段冒充整窗统计（8E 首局：61.1s 窗内只覆盖 56.4s 曾误判窗口成立）
     rows = list(csv.DictReader(open(os.path.join(o, 'frames.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'frames.tsv')) else []
     win = [int(r['disp_us']) / 1000 for r in rows if (r.get('disp_us') or '').isdigit() and int(r['disp_us']) > 0]
     import fps_truth
     t = fps_truth.load().get(pid.lower()) if pid else None; fps = float(t['目标帧率']) if t else 60.0; bud = 1000.0 / fps
-    if sum(win) < 55000: out['帧率'] = '没数据'; read.append(f'帧率 窗口不足 55 秒：{sum(win) / 1000:.0f} 秒、{len(win)} 帧')
+    short = None
+    fw = meta.get('frame_window_us')
+    if rows and isinstance(fw, list) and len(fw) == 2:
+        try:
+            w0, w1 = int(fw[0]), int(fw[1])
+            t_first = int(rows[0]['present_ns']) // 1000 - int(rows[0]['disp_us'])
+            t_last = int(rows[-1]['present_ns']) // 1000
+            if w1 > w0 and t_last > t_first:
+                span = t_last - t_first
+                if span / (w1 - w0) < 0.95:
+                    short = (f'帧率 窗口覆盖不足：{(w1 - w0) / 1e6:.1f}s 窗口帧覆盖 {span / 1e6:.1f}s'
+                             f'（{span / (w1 - w0):.0%}，首部空 {max(0, t_first - w0) / 1e6:.1f}s、'
+                             f'尾部空 {max(0, w1 - t_last) / 1e6:.1f}s）')
+        except (ValueError, KeyError):
+            pass
+    if short:
+        out['帧率'] = '没数据'; read.append(short)
+    elif sum(win) < 55000: out['帧率'] = '没数据'; read.append(f'帧率 窗口不足 55 秒：{sum(win) / 1000:.0f} 秒、{len(win)} 帧')
     else:
         avg = len(win) * 1000 / sum(win); slow = sum(w > 1.5 * bud for w in win) / len(win) * 100; med = sorted(win)[len(win) // 2]
         out['帧率'] = '过' if avg >= fps * 0.99 and slow <= 1 else '不过'

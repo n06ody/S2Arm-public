@@ -80,12 +80,21 @@ class BatteryTest(unittest.TestCase):
         self.assertAlmostEqual(battery_window([row, other], 1000000, 2000000, 1)["averageW"], 1.435203)
         self.assertIsNone(battery_window([row, other], 1000000, 2000000)["averageW"])
 
-    def test_service_charging_or_unknown_sources_rejected(self):
-        for raw in (self.service(usb="true"), self.service(status="1"),
-                    self.service().replace("  Dock powered: false\n", "")):
-            row = parse_sample(raw)
-            self.assertNotEqual(row["status"], "Discharging")
-            self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}], 1000000, 2000000, 1)["averageW"])
+    def test_service_status_kept_flags_not_collapsed(self):
+        # status 码照实映射、旗标留原列不坍缩（8E 首局 status=4+usb=true 曾被映成 Charging）：
+        # 非放电状态不积分；「接过电」由判读者看旗标列（quality_check.powered()），解析层不猜。
+        for status, want in (("1", "Unknown"), ("4", "Not charging"), ("5", "Full"),
+                             ("2", "Charging"), ("7", "Unknown")):
+            row = parse_sample(self.service(status=status, usb="true"))
+            self.assertEqual((row["status"], row["usb_powered"]), (want, "true"), status)
+            self.assertIsNone(battery_window([row, {**row, "boot_us": 2000000}],
+                                             1000000, 2000000, 1)["averageW"], status)
+        # 矛盾行（status=Discharging 但 USB 供电 true）：两边都留原文，坍缩成 Charging 才丢真值
+        row = parse_sample(self.service(usb="true"))
+        self.assertEqual((row["status"], row["usb_powered"]), ("Discharging", "true"))
+        # 缺旗标行：status 权威照映射，缺的旗标留空不补
+        row = parse_sample(self.service().replace("  Dock powered: false\n", ""))
+        self.assertEqual((row["status"], row["dock_powered"]), ("Discharging", ""))
 
     def test_service_failure_never_zero_or_partial_mix(self):
         for value in ("", "Permission denied", "0\n327000"):
