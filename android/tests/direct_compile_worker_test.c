@@ -413,8 +413,120 @@ int main(void) {
         g_delay_ms = 5;
     }
 
+    // 8) 异步提交：完成环取结果、可重复 poll、同 sha 去重、编译失败如实返回。
+    {
+        g_delay_ms = 60;
+        g_calls = 0;
+        uint8_t sha_a[32];
+        sha_of("async-a", sha_a);
+        uint8_t *ab = NULL; size_t alen = 0;
+        CHECK(s2a_compile_worker_submit_async(9, 1, "{\"a\":1}", 7, sha_a, why, sizeof why) == 0,
+              "async submit succeeds");
+        CHECK(s2a_compile_worker_poll(sha_a, &ab, &alen, why, sizeof why) == 1,
+              "poll reports in-flight while the compile is still running");
+        CHECK(s2a_compile_worker_submit_async(9, 1, "{\"a\":1}", 7, sha_a, why, sizeof why) == 0,
+              "same-sha async submit dedupes instead of compiling twice");
+        CHECK(s2a_compile_worker_wait_async(sha_a, 3000, &ab, &alen, why, sizeof why) == 0,
+              "wait_async returns the finished result");
+        CHECK(ab && alen == 7 && !memcmp(ab, "{\"a\":1}", 7), "async result carries the compile bytes");
+        free(ab); ab = NULL;
+        CHECK(s2a_compile_worker_poll(sha_a, &ab, &alen, why, sizeof why) == 0 && ab,
+              "poll does not consume the ring entry");
+        free(ab); ab = NULL;
+        CHECK(s2a_compile_worker_submit_async(9, 1, "{\"a\":1}", 7, sha_a, why, sizeof why) == 2,
+              "resubmitting a sha with a ring result reports it without recompiling");
+        CHECK(g_calls == 1, "three async touches of one sha compile exactly once");
+    }
+
+    // 9) 队列：槽占满后 FIFO 排队，短队满返回 1（调用方回落同步通道）。
+    {
+        g_delay_ms = 80;
+        g_calls = 0;
+        uint8_t sha[6][32];
+        char name[32];
+        int rc[6] = {0};
+        for (int i = 0; i < 6; i++) {
+            snprintf(name, sizeof name, "fifo-%d", i);
+            sha_of(name, sha[i]);
+            snprintf(name, sizeof name, "{\"q\":%d}", i);
+            rc[i] = s2a_compile_worker_submit_async(10, 1, name, strlen(name), sha[i], why, sizeof why);
+        }
+        CHECK(rc[0] == 0, "first async takes the slot");
+        for (int i = 1; i <= 4; i++) CHECK(rc[i] == 0, "next four async fill the queue");
+        CHECK(rc[5] == 1, "queue full reports backpressure for the sync fallback");
+        uint8_t *qb = NULL; size_t qlen = 0;
+        for (int i = 0; i < 5; i++) {
+            int wrc = s2a_compile_worker_wait_async(sha[i], 5000, &qb, &qlen, why, sizeof why);
+            CHECK(wrc == 0, "queued async completes in FIFO order");
+            free(qb); qb = NULL;
+        }
+        CHECK(g_calls == 5, "every distinct queued sha compiles once");
+        struct s2a_compile_worker_stats qs;
+        s2a_compile_worker_stats(&qs);
+        CHECK(qs.queue_full >= 1 && qs.queued >= 4 && qs.done_pushed >= 5,
+              "stats count queue fill and ring pushes");
+    }
+
+    // 10) 异步失败与挤环：失败带原因返回 2；环满挤最老后查询 fail-closed 返回 3。
+    {
+        g_delay_ms = 5;
+        uint8_t sha_f[32];
+        sha_of("async-fail", sha_f);
+        g_fail_next = 1;
+        uint8_t *fb = NULL; size_t flen = 0;
+        CHECK(s2a_compile_worker_submit_async(11, 1, "{\"f\":1}", 7, sha_f, why, sizeof why) == 0,
+              "async submit of a failing compile succeeds");
+        CHECK(s2a_compile_worker_wait_async(sha_f, 3000, &fb, &flen, why, sizeof why) == 2,
+              "async compile failure reports through the ring");
+        CHECK(strstr(why, "compile failed") != NULL, "the failure carries the compiler reason");
+        CHECK(!fb, "a failed ring entry returns no bytes");
+        // 挤环：9 个完成把 sha_f 挤出容量 8 的环。串行提交，避开队列背压干扰断言。
+        uint8_t sha_e[9][32];
+        char name[32];
+        uint8_t *eb = NULL; size_t elen = 0;
+        for (int i = 0; i < 9; i++) {
+            snprintf(name, sizeof name, "evict-%d", i);
+            sha_of(name, sha_e[i]);
+            snprintf(name, sizeof name, "{\"e\":%d}", i);
+            CHECK(s2a_compile_worker_submit_async(11, 1, name, strlen(name), sha_e[i], why, sizeof why) == 0,
+                  "eviction batch submits");
+            CHECK(s2a_compile_worker_wait_async(sha_e[i], 5000, &eb, &elen, why, sizeof why) == 0,
+                  "eviction batch completes");
+            free(eb); eb = NULL;
+        }
+        CHECK(s2a_compile_worker_poll(sha_f, &fb, &flen, why, sizeof why) == 3,
+              "an evicted ring entry fails closed as unknown");
+        struct s2a_compile_worker_stats es;
+        s2a_compile_worker_stats(&es);
+        CHECK(es.done_evicted >= 1, "stats count ring evictions");
+    }
+
+    // 11) stop 清场：在槽/在队/已完成全部作废，之后查询一律 fail-closed。
+    {
+        g_delay_ms = 150;
+        uint8_t sha_s[3][32];
+        char name[32];
+        for (int i = 0; i < 3; i++) {
+            snprintf(name, sizeof name, "stop-%d", i);
+            sha_of(name, sha_s[i]);
+            snprintf(name, sizeof name, "{\"s\":%d}", i);
+            s2a_compile_worker_submit_async(12, 1, name, strlen(name), sha_s[i], why, sizeof why);
+        }
+        usleep(50 * 1000);
+        s2a_compile_worker_stop();
+        uint8_t *sb = NULL; size_t slen = 0;
+        for (int i = 0; i < 3; i++)
+            CHECK(s2a_compile_worker_poll(sha_s[i], &sb, &slen, why, sizeof why) == 3,
+                  "stop clears in-flight, queued and finished evidence");
+        CHECK(s2a_compile_worker_submit_async(12, 1, "{\"s\":9}", 7, sha_s[0], why, sizeof why) == -1,
+              "submit against a stopped worker fails accurately");
+        CHECK(s2a_compile_worker_start(compile_fn, NULL, why, sizeof why) == 0,
+              "worker restarts after the clearing stop");
+        g_delay_ms = 5;
+    }
+
     s2a_compile_worker_stop();
     if (fails) { printf("direct compile worker: %d FAILURES\n", fails); return 1; }
-    printf("direct compile worker: %d checks ok (dedupe, capacity 1, pause contract, stop, timeout, bounded stop, pump, restart)\n", checks);
+    printf("direct compile worker: %d checks ok (dedupe, capacity 1, pause contract, stop, timeout, bounded stop, pump, restart, async queue/ring)\n", checks);
     return 0;
 }

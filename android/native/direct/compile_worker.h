@@ -29,6 +29,9 @@ int s2a_compile_worker_stop_bounded(uint32_t budget_ms, char *why, size_t why_si
 // late_discarded 是 Stop/放弃后丢弃的迟到结果。容量只有 1，这些数直接说明背压与合并。
 struct s2a_compile_worker_stats {
     uint64_t runs, compiles, dedup, busy_timeouts, failures, late_discarded;
+    // C4a 异步侧：queued = 进短队列次数，queue_full = 队列满拒绝（调用方应退回 run()），
+    // done_pushed = 完成环入项，done_evicted = 完成环满挤出（fail-closed 的证据计数）。
+    uint64_t queued, queue_full, done_pushed, done_evicted;
 };
 void s2a_compile_worker_stats(struct s2a_compile_worker_stats *out);
 
@@ -51,6 +54,28 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
                            const uint8_t sha[32], int deadline_ms,
                            int (*pause)(void *), void (*resume)(void *), void *pause_ctx,
                            uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size);
+
+/* C4a：非阻塞提交 + 短队列 + 完成环。与 run() 同一编译槽、同一 sha 去重；提交者不等待，
+   结果不进槽位等待者计数，而是按 sha 放进有界完成环（S2A_CW_DONE_MAX）由 poll 取走。
+   返回 0 = 已入队/已在途（同 sha 去重，不重复编译）；2 = 同 sha 结果已在完成环
+   （条目被淘汰后重提同身份不必再编）；1 = 短队列已满（调用方退回 run() 同步路径，
+   与关闭异步时的行为一致）；-1 = worker 未运行/参数错（why 写明）。
+   stop 清空队列与完成环：在途请求按「丢失」处理，poll/wait 之后如实返回 unknown。 */
+#define S2A_CW_QUEUE_MAX 4
+#define S2A_CW_DONE_MAX 8
+int s2a_compile_worker_submit_async(uint64_t session, uint64_t generation,
+                                    const char *json, size_t len, const uint8_t sha[32],
+                                    char *why, size_t why_size);
+/* 按内容身份查结果；返回 0 = 编译成功（bytes 由调用方 free，poll 不消费：同 sha 的
+   其它条目也能取到）；1 = 在途（排队/在编译）；2 = 编译失败（why 为编译器原因）；
+   3 = 不在册（未提交/完成环已挤出/stop 清场——fail-closed，调用方按编译失败处理）。 */
+int s2a_compile_worker_poll(const uint8_t sha[32], uint8_t **bytes, size_t *bytes_len,
+                            char *why, size_t why_size);
+/* poll 的限时版：最多等 deadline_ms 让该 sha 出结果（完成环入项/在途消失都会唤醒）。
+   0 就绪/1 仍在途（超时）/2 编译失败/3 不在册——与 poll 同码。bytes 语义同 poll。 */
+int s2a_compile_worker_wait_async(const uint8_t sha[32], uint32_t deadline_ms,
+                                  uint8_t **bytes, size_t *bytes_len,
+                                  char *why, size_t why_size);
 
 #ifdef __cplusplus
 }

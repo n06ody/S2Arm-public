@@ -35,6 +35,7 @@
 #include "direct/sha256.h"
 #include "nvn_vk_first_draw.h"
 #include "nvn_vk_format.h"
+#include "nvn_first_use.h"   // C4a：iOS pso_pend 语义共用件（graphics/nvn/gfx/nvn）
 
 // SetShaders 期的源快照（direct/source_store.c）。编译请求必须从这里取 code/control，
 // 不能用绑定后可能已被游戏复用的内存。非 Android 构建没有这个实现。
@@ -697,13 +698,237 @@ static int nvk_worker_compile(uint64_t session, uint64_t generation, const char 
                                   NULL, bytes, bytes_len, why, why_size);
 }
 
+/* ---------------- C4a/C3a 首用等待（debug.s2a.fu_wait，默认 0 = 旧同步路径） ----------------
+   开关开：编译需求非阻塞投进 worker（submit_async + 短队列 + 完成环），本笔绘制按
+   iOS pso_pend 语义决定等多久——可安全跳过的绘制只在帧预算内等，超预算/超单项上限
+   跳过本笔并单独入账（不记入 unsupported，也不写失败缓存条目：下一笔绘制同一
+   请求会再查询在途结果）。不可安全跳过的绘制按 unsafe 上限等，过限记 stuck 终局。
+
+   帧与渲染目标证据：
+   - frame id 取 first_draw 的当前录制帧序号（nvn_vk_first_draw_frame_id）；
+   - rt_seen 在真实绘制成功时记（跳过的绘制不算画过）；
+   - rt_fresh 由记录层在 ClearColor/ClearDepthStencil 执行点弱调用 nvn_vk_fu_rt_fresh；
+   - fresh 表逐帧自清，seen 证据只留最近两帧（见 nvn_first_use.c）。 */
+
+extern uint64_t nvn_vk_first_draw_frame_id(void) __attribute__((weak));
+
+/* 弱链接[androiddraw]：s2a_compile_worker_submit_async（宿主单测桩化 worker 时不链
+   compile_worker.c；缺实现 = 队列不可用，回落旧同步通道，与关闭异步同义） */
+/* 弱链接[androiddraw]：s2a_compile_worker_poll */
+/* 弱链接[androiddraw]：s2a_compile_worker_wait_async */
+int s2a_compile_worker_submit_async(uint64_t, uint64_t, const char *, size_t,
+                                    const uint8_t[32], char *, size_t) __attribute__((weak));
+int s2a_compile_worker_poll(const uint8_t[32], uint8_t **, size_t *, char *, size_t) __attribute__((weak));
+int s2a_compile_worker_wait_async(const uint8_t[32], uint32_t, uint8_t **, size_t *,
+                                  char *, size_t) __attribute__((weak));
+
+static int nvk_fu_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        char b[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.s2a.fu_wait", b);
+        v = b[0] && atoi(b);
+    }
+    return v;
+}
+/* 三档预算与 iOS 默认值同（DM_NVN_PSO_*）；0 = 该项不设限（iOS 语义）。 */
+static uint32_t nvk_fu_prop_ms(const char *name, uint32_t dflt, uint32_t *cache) {
+    if (!*cache) {
+        char b[PROP_VALUE_MAX] = {0};
+        __system_property_get(name, b);
+        *cache = b[0] ? (uint32_t)strtoul(b, NULL, 10) : dflt;
+        if (!*cache) *cache = UINT32_MAX;   /* 0 也代表“显式不设限”：用哨兵分开“未读” */
+    }
+    return *cache == UINT32_MAX ? 0 : *cache;
+}
+static uint32_t nvk_fu_item_ms(void)   { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_item_ms", 2000, &v); }
+static uint32_t nvk_fu_frame_ms(void)  { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_frame_ms", 100, &v); }
+static uint32_t nvk_fu_unsafe_ms(void) { static uint32_t v; return nvk_fu_prop_ms("debug.s2a.fu_unsafe_ms", 10000, &v); }
+static uint64_t nvk_fu_frame(void) { return nvn_vk_first_draw_frame_id ? nvn_vk_first_draw_frame_id() : 0; }
+
+/* 首用等待的计时器：必须是真实单调钟。pf_now 受 draw_pf 统计开关门控（关时返 0），
+   借它记账会让帧预算在统计关时永远不耗。 */
+static uint64_t nvk_fu_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static struct s2a_fu_budget g_fu_budget;
+
+/* 在途请求的 late/stuck 终局标记：iOS 写在 pending 项上，跨笔/跨帧都挡。
+   request_sha 是完整请求身份；64 项直线表，挤最久未触的（满证据按保守走）。 */
+#define NVK_FU_PEND 64
+static struct { uint8_t sha[32]; uint8_t late, stuck; uint64_t last; } g_fu_pend[NVK_FU_PEND];
+static uint64_t g_fu_pend_seq;
+
+static int nvk_fu_pend_marks(const uint8_t sha[32], int *late, int *stuck) {
+    for (unsigned i = 0; i < NVK_FU_PEND; i++)
+        if (!memcmp(g_fu_pend[i].sha, sha, 32)) { *late = g_fu_pend[i].late; *stuck = g_fu_pend[i].stuck; return 1; }
+    *late = *stuck = 0;
+    return 0;
+}
+static void nvk_fu_pend_mark(const uint8_t sha[32], int timeout) {
+    if (timeout != S2A_FU_T_LATE && timeout != S2A_FU_T_STUCK) return;   // BUDGET 不打项标（iOS 同义）
+    unsigned slot = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (unsigned i = 0; i < NVK_FU_PEND; i++) {
+        if (!memcmp(g_fu_pend[i].sha, sha, 32)) { slot = i; break; }
+        if (!g_fu_pend[i].last || g_fu_pend[i].last < oldest) { oldest = g_fu_pend[i].last; slot = i; }
+    }
+    memcpy(g_fu_pend[slot].sha, sha, 32);
+    if (timeout == S2A_FU_T_LATE) g_fu_pend[slot].late = 1; else g_fu_pend[slot].stuck = 1;
+    g_fu_pend[slot].last = ++g_fu_pend_seq;
+}
+
+/* 跳过计数与 unsupported 分账：跳过是有意的、可恢复的（下一笔可能已就绪）；
+   stuck 是放弃一个已经证明等不出来的请求——两者都如实分类，不静默。 */
+static _Atomic uint64_t g_fu_submit, g_fu_ready_n, g_fu_wait_n, g_fu_wait_ns;
+static _Atomic uint64_t g_fu_skip_budget, g_fu_skip_late, g_fu_skip_stuck, g_fu_fallback;
+
+static void nvk_fu_stats_log(void) {
+    static _Atomic uint64_t n;
+    uint64_t c = atomic_fetch_add(&n, 1) + 1;
+    if (c != 1 && c % 256) return;
+    draw_log("first-use: submit=%llu ready=%llu waits=%llu wait=%.1fms "
+             "skip{budget=%llu late=%llu stuck=%llu} sync_fallback=%llu",
+             (unsigned long long)atomic_load(&g_fu_submit),
+             (unsigned long long)atomic_load(&g_fu_ready_n),
+             (unsigned long long)atomic_load(&g_fu_wait_n),
+             (double)atomic_load(&g_fu_wait_ns) / 1e6,
+             (unsigned long long)atomic_load(&g_fu_skip_budget),
+             (unsigned long long)atomic_load(&g_fu_skip_late),
+             (unsigned long long)atomic_load(&g_fu_skip_stuck),
+             (unsigned long long)atomic_load(&g_fu_fallback));
+}
+
+/* ClearColor/ClearDepthStencil 执行点（vk_record.c 弱调用）：目标内容本帧重新起过。 */
+void nvn_vk_fu_rt_fresh(uint64_t serial) {
+    if (nvk_fu_on()) s2a_fu_rt_mark_fresh(serial, nvk_fu_frame());
+}
+
+/* 真实绘制成功后调用：目标本帧又被画过（iOS rt_seen_put；跳过的绘制不记）。 */
+static void nvk_fu_rt_drawn(const struct s2a_record_draw_state *state, uint64_t frame) {
+    if (!nvk_fu_on()) return;
+    for (uint32_t i = 0; i < state->rt_count && i < 8; i++)
+        s2a_fu_rt_mark_seen(state->rt[i].obj_serial, state->rt[i].storage,
+                            state->rt[i].nvn_format, frame);
+    if (state->has_depth)
+        s2a_fu_rt_mark_seen(state->depth_serial, state->depth_storage,
+                            state->depth_nvn_format, frame);
+}
+
+/* iOS skip_safe：无 storage 写 + 每个目标本帧 fresh + 近 2 帧都画过。
+   安卓侧的 storage 写证据：draw 快照里真实绑定的 SSBO（ssbo_bound）与 transform
+   feedback。图形管线 storage image 绑定不进 draw 快照（保守口径，见交付限制）；
+   片元输出写目标本身不是 storage 写——fresh/steady 两项覆盖它能不能安全丢。 */
+static int nvk_fu_skip_safe(const struct s2a_record_draw_state *state, uint64_t frame) {
+    if (state->tf_enabled) return 0;
+    for (unsigned st = 0; st < 6; st++)
+        if (state->ssbo_bound[st]) return 0;
+    int targets = 0;
+    for (uint32_t i = 0; i < state->rt_count && i < 8; i++) {
+        targets++;
+        if (!s2a_fu_rt_fresh_now(state->rt[i].obj_serial, frame)) return 0;
+        if (!s2a_fu_rt_seen_steady(state->rt[i].obj_serial, state->rt[i].storage,
+                                  (uint64_t)state->rt[i].nvn_format, frame)) return 0;
+    }
+    if (state->has_depth) {
+        targets++;
+        if (!s2a_fu_rt_fresh_now(state->depth_serial, frame)) return 0;
+        if (!s2a_fu_rt_seen_steady(state->depth_serial, state->depth_storage,
+                                  (uint64_t)state->depth_nvn_format, frame)) return 0;
+    }
+    return targets > 0;
+}
+
+static const char *nvk_fu_class(int t) {
+    return t == S2A_FU_T_LATE ? "late" : t == S2A_FU_T_BUDGET ? "budget" : t == S2A_FU_T_STUCK ? "stuck" : "?";
+}
+
+/* 首用路径的编译等待：提交进 worker 在途，然后按判定环等/跳。
+   返回 0 = 结果就绪（bytes）或已按类跳过（*skipped = S2A_FU_T_*）；
+   非 0 = 真实失败（why 带原因，调用方照旧写失败条目）。
+   等片期间的实际耗时计入本帧预算（iOS pso_budget_spend 同义）。 */
+static int nvk_fu_compile(const struct s2a_record_draw_state *state,
+                          uint64_t session, uint64_t generation,
+                          const char *json, size_t len, const uint8_t sha[32],
+                          uint8_t **bytes, size_t *bytes_len,
+                          char *why, size_t why_size, int *skipped) {
+    *skipped = 0;
+    atomic_fetch_add(&g_fu_submit, 1);
+    /* 弱引用场合缺异步实现 = 队列不可用：直接回落同步通道，与开关关闭同义。 */
+    int src = (s2a_compile_worker_submit_async && s2a_compile_worker_poll && s2a_compile_worker_wait_async)
+        ? s2a_compile_worker_submit_async(session, generation, json, len, sha, why, why_size) : 1;
+    if (src == 1) {
+        /* 短队列满：回落同步通道（等价旧路径），不算在途首用。 */
+        atomic_fetch_add(&g_fu_fallback, 1);
+        static _Atomic int nf;
+        if (atomic_fetch_add(&nf, 1) < 8)
+            draw_log("first-use: async queue full, falling back to synchronous compile");
+        return nvk_worker_compile(session, generation, json, len, sha, bytes, bytes_len, why, why_size);
+    }
+    if (src < 0) return -1;   // worker 未起/参数问题：why 已写明
+    const uint64_t frame = nvk_fu_frame();
+    const uint32_t item_ms = nvk_fu_item_ms(), frame_ms = nvk_fu_frame_ms(), unsafe_ms = nvk_fu_unsafe_ms();
+    const int may_skip = nvk_fu_skip_safe(state, frame);
+    int late = 0, stuck = 0;
+    nvk_fu_pend_marks(sha, &late, &stuck);
+    for (;;) {
+        uint8_t *rb = NULL;
+        size_t rlen = 0;
+        int prc = s2a_compile_worker_poll(sha, &rb, &rlen, why, why_size);
+        if (prc == 0) {
+            atomic_fetch_add(&g_fu_ready_n, 1);
+            *bytes = rb; *bytes_len = rlen;
+            return 0;
+        }
+        if (prc == 2) return -1;                    // 编译失败：why 已带编译器原因
+        if (prc == 3) {                             // stop 清场/环挤掉：结果按丢失定性
+            snprintf(why, why_size, "compile worker: first-use result lost (stopped or evicted)");
+            return -1;
+        }
+        /* 在途：取一次判定（iOS pso_pend_take 同义）。 */
+        int64_t left = s2a_fu_budget_left_ms(&g_fu_budget, frame, frame_ms);
+        struct s2a_fu_verdict v = s2a_fu_wait_decide(0, late, stuck, may_skip,
+                                                   item_ms, frame_ms, left, unsafe_ms);
+        if (v.action == S2A_FU_SKIP) {
+            nvk_fu_pend_mark(sha, v.timeout);
+            *skipped = v.timeout;
+            return 0;
+        }
+        /* v.wait_ms == 0 = iOS 语义上的无界等待：用分片轮询表达（切片不耗帧预算上限，
+           实际等待仍全额记账）。 */
+        const uint32_t slice = v.wait_ms ? v.wait_ms : 250;
+        const uint64_t t0 = nvk_fu_now();
+        int wrc = s2a_compile_worker_wait_async(sha, slice, &rb, &rlen, why, why_size);
+        const uint64_t waited = nvk_fu_now() - t0;
+        if (may_skip) s2a_fu_budget_spend(&g_fu_budget, frame, waited);
+        atomic_fetch_add(&g_fu_wait_n, 1);
+        atomic_fetch_add(&g_fu_wait_ns, waited);
+        if (wrc == 0) {
+            atomic_fetch_add(&g_fu_ready_n, 1);
+            *bytes = rb; *bytes_len = rlen;
+            return 0;
+        }
+        if (wrc == 2) return -1;
+        if (wrc == 3) {
+            snprintf(why, why_size, "compile worker: first-use result lost while waiting");
+            return -1;
+        }
+        /* wrc 1 = 本片超时仍无结果：按判定表给的终局定性，打项标并跳过本笔。 */
+        nvk_fu_pend_mark(sha, v.timeout);
+        *skipped = v.timeout;
+        return 0;
+    }
+}
+
 // views 是调用方按 key 取得、并在整个编译期间 pin 住的快照（与 keys 同序）。
 // 不再按 key 二次查找：那会把“编的这份”和“身份证明的那份”分开，源一换就编译到别的内容。
 static _Atomic uint64_t g_vertex_feature_compile_rejects;
 static void nvk_program_compile_inner(struct s2a_vk_device *device, struct nvk_cached_program *entry, const struct s2a_record_draw_state *state,
                                       const char *dir, const struct s2a_direct_compile_context *pc,
                                       const struct nvk_texture_set *tex,
-                                      const struct s2a_source_entry_view *views) {
+                                      const struct s2a_source_entry_view *views, int *skipped) {
     (void)dir;   // 编译只读源快照/内存结果；诊断写 S2A_DIRECT_DIAG_DIR（F4.1），不写 shader 目录
     if (!views) {
         entry->failed = 1;
@@ -848,8 +1073,15 @@ static void nvk_program_compile_inner(struct s2a_vk_device *device, struct nvk_c
         uint8_t *wbytes = NULL;
         size_t wlen = 0;
         char wwhy[512] = "";
-        ran = nvk_worker_compile(in.session, in.generation, json, json_len, entry->request_sha,
-                                 &wbytes, &wlen, wwhy, sizeof wwhy);
+        if (nvk_fu_on()) {
+            /* C4a：在途提交 + 首用判定。*skipped>0 = 本笔安全跳过（entry 保持未失败、不入缓存）。 */
+            ran = nvk_fu_compile(state, in.session, in.generation, json, json_len, entry->request_sha,
+                                 &wbytes, &wlen, wwhy, sizeof wwhy, skipped);
+        } else {
+            ran = nvk_worker_compile(in.session, in.generation, json, json_len, entry->request_sha,
+                                     &wbytes, &wlen, wwhy, sizeof wwhy);
+        }
+        if (*skipped) { free(json); free(wbytes); return; }   // 跳过的绘制：结果/失败都不落地
         if (!ran) {
             outcome.bytes = wbytes;
             outcome.bytes_len = wlen;
@@ -968,7 +1200,7 @@ static void nvk_program_adopt_cached(struct nvk_cached_program *entry, uint64_t 
 
 static void nvk_program_compile(struct s2a_vk_device *device, struct nvk_cached_program *entry, const struct s2a_record_draw_state *state,
                                 const char *dir, const struct s2a_direct_compile_context *pc,
-                                const struct nvk_texture_set *tex, const struct nvk_src_ids *ids) {
+                                const struct nvk_texture_set *tex, const struct nvk_src_ids *ids, int *skipped) {
     struct s2a_source_entry_view views[6];
     uint64_t refs[6];
     int npins = 0;
@@ -997,7 +1229,7 @@ static void nvk_program_compile(struct s2a_vk_device *device, struct nvk_cached_
         entry->failed = 1;
         snprintf(entry->why, sizeof entry->why, "%s（stages=0x%x）", fail, state->stages);
     } else {
-        nvk_program_compile_inner(device, entry, state, dir, pc, tex, views);
+        nvk_program_compile_inner(device, entry, state, dir, pc, tex, views, skipped);
     }
     for (int i = 0; i < npins; i++)
         if (s2a_source_release) s2a_source_release(refs[i]);
@@ -1023,13 +1255,13 @@ static __attribute__((noinline)) int nvk_id_verify_hit(const struct s2a_record_d
     return 0;
 }
 
-static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir);
+static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir, int *skipped);
 
-static struct nvk_cached_program *nvk_program_for_draw_timed(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir) {
-    if (!pf_stats_on()) return nvk_program_for_draw(device, state, dir);
+static struct nvk_cached_program *nvk_program_for_draw_timed(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir, int *skipped) {
+    if (!pf_stats_on()) return nvk_program_for_draw(device, state, dir, skipped);
     struct timespec a, b;
     clock_gettime(CLOCK_MONOTONIC, &a);
-    struct nvk_cached_program *r = nvk_program_for_draw(device, state, dir);
+    struct nvk_cached_program *r = nvk_program_for_draw(device, state, dir, skipped);
     clock_gettime(CLOCK_MONOTONIC, &b);
     uint64_t d = (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
     atomic_fetch_add_explicit(&g_pf_calls, 1, memory_order_relaxed);
@@ -1037,7 +1269,7 @@ static struct nvk_cached_program *nvk_program_for_draw_timed(struct s2a_vk_devic
     return r;
 }
 
-static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir) {
+static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *device, const struct s2a_record_draw_state *state, const char *dir, int *skipped) {
     struct s2a_direct_compile_context pc;
     memset(&pc, 0, sizeof pc);
     // engine 后端/诊断只编 WSI 探针时没有 provider；没有编译器就不产生 compile context，
@@ -1310,7 +1542,12 @@ static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *dev
                      clen, key, insha[0], insha[1], insha[2], insha[3]);
         } else if (!offline_used) {
             observation_source = S2A_W2_LIVE;
-            nvk_program_compile(device, &tmp, state, dir, &pc, &tex, &srcids);
+            nvk_program_compile(device, &tmp, state, dir, &pc, &tex, &srcids, skipped);
+            if (skipped && *skipped) {
+                /* 首用安全跳过：条目不落缓存（没有失败，也没有结果），本次绘制由调用方分流。 */
+                free(tmp.bytes);
+                return NULL;
+            }
             if (tmp.failed) g_program_compile_failures++;
             else g_program_compile_success++;
             // 方案 §5.5.2 第 5 条：当前绘制不等磁盘。写失败只记缓存问题，不影响已可用的内存结果。
@@ -1506,8 +1743,24 @@ static int nvk_draw_builder_impl(struct s2a_vk_device *device, const struct s2a_
     // cache_key 只被下面那条（当前走不到的）旧加载路径消费：不再逐笔拼，放到用它的地方算。
     const uint64_t dbg_t1 = pf_now();
     atomic_fetch_add_explicit(&g_dbg_pre_ns, dbg_t1 - dbg_t0, memory_order_relaxed);
-    struct nvk_cached_program *prog = nvk_program_for_draw_timed(device, state, dir);
+    int fu_skipped = 0;
+    struct nvk_cached_program *prog = nvk_program_for_draw_timed(device, state, dir, &fu_skipped);
     const uint64_t dbg_t2 = pf_now();
+    if (!prog && fu_skipped) {
+        /* C4a 安全跳过：本笔不画，但记录继续（返回 0 = 本 op 已处理，不是失败）。
+           与 UNSUPPORTED 分账：跳过类别如实入 first-use 计数与日志，不静默兜底。 */
+        if (fu_skipped == S2A_FU_T_BUDGET) atomic_fetch_add(&g_fu_skip_budget, 1);
+        else if (fu_skipped == S2A_FU_T_LATE) atomic_fetch_add(&g_fu_skip_late, 1);
+        else if (fu_skipped == S2A_FU_T_STUCK) atomic_fetch_add(&g_fu_skip_stuck, 1);
+        static _Atomic int nf;
+        if (atomic_fetch_add(&nf, 1) < 16 || (atomic_load(&nf) & 0xFF) == 0)
+            draw_log("first-use draw skipped (%s): program still compiling in flight; "
+                     "draw not recorded as unsupported", nvk_fu_class(fu_skipped));
+        nvk_fu_stats_log();
+        result->code = S2A_RECORD_OK;
+        snprintf(result->why, sizeof result->why, "first-use skip (%s)", nvk_fu_class(fu_skipped));
+        return S2A_RECORD_OK;
+    }
     if (!prog) {
         result->code = S2A_RECORD_LIMIT;
         snprintf(result->why, sizeof result->why, "draw: program cache unavailable");
@@ -1596,6 +1849,7 @@ static int nvk_draw_builder_impl(struct s2a_vk_device *device, const struct s2a_
         }
         result->code = S2A_RECORD_OK;
         snprintf(result->why, sizeof result->why, "%s", why);
+        nvk_fu_rt_drawn(state, nvk_fu_frame());   // C4a：目标本帧又画过（iOS rt_seen_put）
         g_loaded++;
         if (g_loaded == 1) nvk_source_pin_log("draw");
         if (why[0]) draw_log("draw: %s", why);   // 正常模式不逐笔打空摘要

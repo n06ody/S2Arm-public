@@ -45,6 +45,7 @@ struct job {
     int state;              // 0 空闲 / 1 运行中 / 2 已完成待取
     int refs;               // 已附着、会取走结果的等待者
     int abandoned;          // 最后一个等待者放弃（Stop/超时）
+    int async;              // C4a：完成时把结果副本（失败含原因）也投进完成环（refs 不计在途提交）
     uint64_t session, generation;
     uint8_t sha[32];
     char *json;
@@ -60,6 +61,7 @@ struct job {
 };
 
 static struct job g_job;
+static struct s2a_compile_worker_stats g_stats;
 static pthread_mutex_t g_wmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_work_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
@@ -71,8 +73,116 @@ static uint64_t g_start_epoch; // distinguishes stop/restart while a caller paus
 static int g_thread_running, g_thread_done;
 static s2a_compile_worker_fn g_fn;
 static void *g_ctx;
-// W2.6：背压/合并/迟到结果的计数（都在 g_wmu 下读写）。
-static struct s2a_compile_worker_stats g_stats;
+
+/* C4a 非阻塞提交侧：槽位被别的身份占用时落进短队列（FIFO 提升进槽）；完成环按 sha 持有
+   结果副本，poll/wait_async 按 sha 取（不消费），满时挤掉最老的（fail-closed：查不到 = 丢失）。 */
+struct qi {
+    uint64_t session, generation;
+    uint8_t sha[32];
+    char *json;
+    size_t len;
+    struct s2a_compile_diag_attempt *diagnostic;   /* 与 run() 同一诊断生命周期 */
+};
+static struct qi g_queue[S2A_CW_QUEUE_MAX];
+static unsigned g_q_len;                            /* 头=0，FIFO 提升 */
+
+struct done_item {
+    uint8_t sha[32];
+    uint8_t *bytes;
+    size_t bytes_len;
+    int failed;
+    char why[512];
+};
+static struct done_item g_done[S2A_CW_DONE_MAX];
+static unsigned g_done_n;                           /* ring：挤最老 */
+
+static void queue_clear_locked(void) {
+    while (g_q_len) {
+        struct qi *q = &g_queue[--g_q_len];
+        diag_cancel(q->diagnostic, 4);
+        /* 诊断释放不持锁：先记账，出锁由调用方统一 drop（与 worker 主路径同规矩）。 */
+        q->diagnostic = NULL;
+        free(q->json); q->json = NULL;
+    }
+}
+static void done_clear_locked(void) {
+    for (unsigned i = 0; i < g_done_n; i++) { free(g_done[i].bytes); g_done[i].bytes = NULL; }
+    g_done_n = 0;
+}
+/* 槽位空出时提升队头进槽（worker 主循环靠 g_work_cv 接着编）。仅 state==0 且非 stop 时做。 */
+static void queue_promote_locked(void) {
+    if (g_stop || g_job.state != 0 || !g_q_len) return;
+    struct qi *q = &g_queue[0];
+    g_job.session = q->session;
+    g_job.generation = q->generation;
+    memcpy(g_job.sha, q->sha, sizeof g_job.sha);
+    g_job.json = q->json; q->json = NULL;
+    g_job.len = q->len;
+    g_job.diagnostic = q->diagnostic; q->diagnostic = NULL;
+    g_job.refs = 0;
+    g_job.abandoned = 0;
+    g_job.failed = 0;
+    g_job.why[0] = 0;
+    g_job.async = 1;
+    g_job.state = 1;
+    memmove(&g_queue[0], &g_queue[1], (g_q_len - 1) * sizeof g_queue[0]);
+    g_q_len--;
+    pthread_cond_signal(&g_work_cv);
+}
+/* 完成环入项：同 sha 覆盖；满则挤最老。bytes 是复制（worker 的结果仍归槽位原通道）。 */
+static void done_push_locked(const uint8_t sha[32], const uint8_t *bytes, size_t len,
+                             int failed, const char *why) {
+    struct done_item *d = NULL;
+    for (unsigned i = 0; i < g_done_n; i++)
+        if (!memcmp(g_done[i].sha, sha, 32)) { d = &g_done[i]; break; }
+    if (!d) {
+        if (g_done_n == S2A_CW_DONE_MAX) {
+            free(g_done[0].bytes);
+            memmove(&g_done[0], &g_done[1], (g_done_n - 1) * sizeof g_done[0]);
+            g_done_n--;
+            g_stats.done_evicted++;
+        }
+        d = &g_done[g_done_n++];
+        memset(d, 0, sizeof *d);
+    }
+    free(d->bytes); d->bytes = NULL;
+    d->bytes_len = 0;
+    if (bytes && len) {
+        d->bytes = (uint8_t *)malloc(len);
+        if (d->bytes) { memcpy(d->bytes, bytes, len); d->bytes_len = len; }
+    }
+    memcpy(d->sha, sha, 32);
+    d->failed = failed;
+    snprintf(d->why, sizeof d->why, "%s", why ? why : "");
+    pthread_cond_broadcast(&g_done_cv);
+}
+/* 环内按 sha 查：0 成功命中（拷出 bytes 副本）/ 2 失败命中（拷 why）/ -1 不在环。 */
+static int done_take_locked(const uint8_t sha[32], uint8_t **bytes, size_t *bytes_len,
+                            char *why, size_t why_size) {
+    for (unsigned i = 0; i < g_done_n; i++) {
+        struct done_item *d = &g_done[i];
+        if (memcmp(d->sha, sha, 32)) continue;
+        if (d->failed) {
+            /* 与 run() 同一兜底：编译器没写原因时给出 worker 自己的失败定性。 */
+            if (why && why_size)
+                snprintf(why, why_size, "%s", d->why[0] ? d->why : "compile worker: compile failed");
+            return 2;
+        }
+        if (bytes) {
+            *bytes = (uint8_t *)malloc(d->bytes_len ? d->bytes_len : 1u);
+            if (*bytes) { memcpy(*bytes, d->bytes, d->bytes_len); if (bytes_len) *bytes_len = d->bytes_len; }
+        }
+        return 0;
+    }
+    return -1;
+}
+/* 在途证据：槽位在编译同 sha（1）或队列里有同 sha（2）；0 = 不在途。 */
+static int inflight_locked(const uint8_t sha[32]) {
+    if (g_job.state == 1 && !memcmp(g_job.sha, sha, 32)) return 1;
+    for (unsigned i = 0; i < g_q_len; i++)
+        if (!memcmp(g_queue[i].sha, sha, 32)) return 2;
+    return 0;
+}
 
 void s2a_compile_worker_stats(struct s2a_compile_worker_stats *out) {
     if (!out) return;
@@ -128,9 +238,16 @@ static void *worker_main(void *arg) {
         }
         if (g_stop || g_job.abandoned) {
             g_stats.late_discarded++;
+            if (g_job.async && !g_stop) {
+                /* 等待者全弃但 worker 还活着：完成环如实记一条终局失败，poll 侧拿到答案
+                   而不是干等；stop 清场后环已被清空——迟到结果不再留痕（在途按丢失论）。 */
+                done_push_locked(g_job.sha, NULL, 0, 1, "compile worker: late result discarded");
+                g_stats.done_pushed++;
+            }
             diag_cancel(g_job.diagnostic, 4);
             free(bytes);
             struct s2a_compile_diag_attempt *retired = job_free(&g_job);
+            queue_promote_locked();
             pthread_cond_broadcast(&g_done_cv);
             pthread_mutex_unlock(&g_wmu);
             diag_drop(retired);
@@ -142,6 +259,21 @@ static void *worker_main(void *arg) {
         g_job.bytes_len = bytes_len;
         g_job.failed = rc != 0;
         snprintf(g_job.why, sizeof g_job.why, "%s", why);
+        if (g_job.async) {
+            /* 先投进完成环（poll 通道），再按等待者语义处理槽位：
+               refs>0 = 有 run() 附着者等 state==2；refs==0 = 纯在途，释放槽位提升队头。 */
+            done_push_locked(g_job.sha, g_job.bytes, g_job.bytes_len, g_job.failed, g_job.why);
+            g_stats.done_pushed++;
+            if (g_job.refs <= 0) {
+                struct s2a_compile_diag_attempt *retired = job_free(&g_job);
+                queue_promote_locked();
+                pthread_cond_broadcast(&g_done_cv);
+                pthread_mutex_unlock(&g_wmu);
+                diag_drop(retired);
+                pthread_mutex_lock(&g_wmu);
+                continue;
+            }
+        }
         g_job.state = 2;
         pthread_cond_broadcast(&g_done_cv);
     }
@@ -210,6 +342,8 @@ static int worker_stop_locked(int budget_ms, char *why, size_t why_size,
                               struct s2a_compile_diag_attempt **retired) {
     if (!g_started && !g_thread_running) return 0;
     g_stop = 1;
+    queue_clear_locked();   // C4a：stop 清空短队列与完成环——在途按「丢失」由 poll 如实返回
+    done_clear_locked();
     diag_cancel(g_job.diagnostic, 4);
     g_started = 0;   // 不再接收新任务；run 会准确报 "not running"
     pthread_cond_signal(&g_work_cv);
@@ -344,6 +478,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
             diag_cancel(g_job.diagnostic, 2); diag_cancel(diagnostic, 2);
             g_job.refs++; mine = 2; break;
         }
+        queue_promote_locked();   // C4a：异步短队列优先于新同步发布（同一互斥下，不会插队）
         if (g_job.state == 0) {
             g_job.session = session;
             g_job.generation = generation;
@@ -359,6 +494,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
             g_job.abandoned = 0;
             g_job.failed = 0;
             g_job.why[0] = 0;
+            g_job.async = 0;
             mine = 1;
             pthread_cond_signal(&g_work_cv);
             break;
@@ -392,7 +528,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
             return_failure = mine == 1 && g_job.failed && diagnostic == g_job.diagnostic;
         }
         g_job.refs--;
-        if (g_job.refs <= 0) { retired = job_free(&g_job); pthread_cond_broadcast(&g_done_cv); }
+        if (g_job.refs <= 0) { retired = job_free(&g_job); queue_promote_locked(); pthread_cond_broadcast(&g_done_cv); }
     } else {
         // Stop 或超时：放弃本次等待，worker 完成时按 abandoned 丢弃结果。
         if (g_job.state == 1) {
@@ -411,5 +547,142 @@ out:
     diag_drop(diagnostic);
     diag_drop(retired);
     if (rc != 0) { free(*bytes); *bytes = NULL; *bytes_len = 0; }
+    return rc;
+}
+
+int s2a_compile_worker_submit_async(uint64_t session, uint64_t generation,
+                                    const char *json, size_t len, const uint8_t sha[32],
+                                    char *why, size_t why_size) {
+    /* 与 run() 同一诊断契约：提交这一刻就绑好本调用的尝试引用。 */
+    struct s2a_compile_diag_attempt *diagnostic = diag_hooks() ? s2a_compile_diag_take(session, generation, json, len) : NULL;
+    if (!json || !len || !sha) {
+        if (why && why_size) snprintf(why, why_size, "compile worker: bad arguments");
+        diag_cancel(diagnostic, 1); diag_drop(diagnostic);
+        return -1;
+    }
+    pthread_mutex_lock(&g_wmu);
+    if (!g_started || g_stop) {
+        pthread_mutex_unlock(&g_wmu);
+        if (why && why_size) snprintf(why, why_size, "compile worker: not running");
+        diag_cancel(diagnostic, 4); diag_drop(diagnostic);
+        return -1;
+    }
+    /* 完成环命中 = 结果已在册：不重复编译，也不重复提交。 */
+    if (done_take_locked(sha, NULL, NULL, NULL, 0) >= 0) {
+        pthread_mutex_unlock(&g_wmu);
+        diag_cancel(diagnostic, 2); diag_drop(diagnostic);
+        return 2;
+    }
+    /* 同 sha 在途（在槽或在队）：去重附着——不补等待者计数，结果仍会进完成环。 */
+    if (inflight_locked(sha)) {
+        if (g_job.state == 1 && !memcmp(g_job.sha, sha, 32)) g_job.async = 1;
+        g_stats.dedup++;
+        pthread_mutex_unlock(&g_wmu);
+        diag_cancel(diagnostic, 2); diag_drop(diagnostic);
+        return 0;
+    }
+    if (g_job.state == 0) {
+        /* 槽位空：直接发布（队列已空——promote 在本函数之前必然已做过）。 */
+        g_job.session = session;
+        g_job.generation = generation;
+        memcpy(g_job.sha, sha, sizeof g_job.sha);
+        g_job.len = len;
+        g_job.json = (char *)malloc(len);
+        if (!g_job.json) {
+            pthread_mutex_unlock(&g_wmu);
+            if (why && why_size) snprintf(why, why_size, "compile worker: out of memory");
+            diag_cancel(diagnostic, 1); diag_drop(diagnostic);
+            return -1;
+        }
+        memcpy(g_job.json, json, len);
+        g_job.diagnostic = diagnostic;
+        if (diagnostic) s2a_compile_diag_retain(diagnostic);
+        g_job.state = 1;
+        g_job.refs = 0;
+        g_job.abandoned = 0;
+        g_job.failed = 0;
+        g_job.why[0] = 0;
+        g_job.async = 1;
+        pthread_cond_signal(&g_work_cv);
+        pthread_mutex_unlock(&g_wmu);
+        return 0;
+    }
+    if (g_q_len >= S2A_CW_QUEUE_MAX) {
+        g_stats.queue_full++;
+        pthread_mutex_unlock(&g_wmu);
+        if (why && why_size) snprintf(why, why_size, "compile worker: async queue full (%u)", S2A_CW_QUEUE_MAX);
+        diag_cancel(diagnostic, 3); diag_drop(diagnostic);
+        return 1;
+    }
+    struct qi *q = &g_queue[g_q_len++];
+    memset(q, 0, sizeof *q);
+    q->session = session;
+    q->generation = generation;
+    memcpy(q->sha, sha, 32);
+    q->json = (char *)malloc(len);
+    if (!q->json) {
+        g_q_len--;
+        pthread_mutex_unlock(&g_wmu);
+        if (why && why_size) snprintf(why, why_size, "compile worker: out of memory");
+        diag_cancel(diagnostic, 1); diag_drop(diagnostic);
+        return -1;
+    }
+    memcpy(q->json, json, len);
+    q->len = len;
+    q->diagnostic = diagnostic;
+    if (diagnostic) s2a_compile_diag_retain(diagnostic);
+    g_stats.queued++;
+    pthread_mutex_unlock(&g_wmu);
+    return 0;
+}
+
+/* poll/wait_async 共用的状态查询（持 g_wmu 调用）：
+   0 = 完成环成功命中；2 = 完成环失败命中；1 = 在途；3 = 不在册。 */
+static int query_locked(const uint8_t sha[32], uint8_t **bytes, size_t *bytes_len,
+                        char *why, size_t why_size) {
+    int rc = done_take_locked(sha, bytes, bytes_len, why, why_size);
+    if (rc >= 0) return rc;
+    if (inflight_locked(sha)) return 1;
+    /* 槽位 state==2 同 sha：等待者正在取——异步通道的结果副本已在环里（先投环再发布），
+       done_take 上面已经命中；走到这里就是不在册。 */
+    return 3;
+}
+
+int s2a_compile_worker_poll(const uint8_t sha[32], uint8_t **bytes, size_t *bytes_len,
+                            char *why, size_t why_size) {
+    if (!sha || !bytes || !bytes_len) {
+        if (why && why_size) snprintf(why, why_size, "compile worker: bad arguments");
+        return -1;
+    }
+    *bytes = NULL; *bytes_len = 0;
+    pthread_mutex_lock(&g_wmu);
+    int rc = query_locked(sha, bytes, bytes_len, why, why_size);
+    pthread_mutex_unlock(&g_wmu);
+    return rc;
+}
+
+int s2a_compile_worker_wait_async(const uint8_t sha[32], uint32_t deadline_ms,
+                                  uint8_t **bytes, size_t *bytes_len,
+                                  char *why, size_t why_size) {
+    if (!sha || !bytes || !bytes_len) {
+        if (why && why_size) snprintf(why, why_size, "compile worker: bad arguments");
+        return -1;
+    }
+    *bytes = NULL; *bytes_len = 0;
+    struct timespec deadline;
+    deadline_at(&deadline, (int)(deadline_ms > 0x7fffffffu ? 0x7fffffff : deadline_ms));
+    pthread_mutex_lock(&g_wmu);
+    int rc;
+    for (;;) {
+        rc = query_locked(sha, bytes, bytes_len, why, why_size);
+        if (rc != 1 || g_stop) break;
+        if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &deadline) == ETIMEDOUT) {
+            /* 超时：结果可能恰在醒来前入环——以最后一次查询为准。 */
+            rc = query_locked(sha, bytes, bytes_len, why, why_size);
+            break;
+        }
+    }
+    if (g_stop && rc == 1) rc = 3;   // stop 清场后在途证据即「丢失」
+    pthread_mutex_unlock(&g_wmu);
     return rc;
 }

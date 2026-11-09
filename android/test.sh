@@ -307,6 +307,8 @@ s2a_gate_step "$PY" "$android_dir/tests/w2_adapter_capture_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_observation_core_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_observation_compute_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_observation_draw_test.py"
+# C4a 首用判定环：真 nvn_vk_draw.c + 真 compile_worker/nvn_first_use，可控假编译器。
+s2a_gate_step "$PY" "$android_dir/tests/nvk_fu_decision_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_observation_lifecycle_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_observation_adapter_test.py"
 # vk_record host regression links the real Linux Vulkan loader; the dispatch itself is mocked.

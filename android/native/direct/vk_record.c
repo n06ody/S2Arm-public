@@ -1729,6 +1729,13 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             }
             extern void s2a_vk_adapter_mark_written(VkImage image) __attribute__((weak));
             if (s2a_vk_adapter_mark_written) s2a_vk_adapter_mark_written(texture->image);
+            {
+                /* C4a 首用证据：这个颜色目标的内容在本帧重新起过（iOS rt_fresh）。
+                   弱绑定：后端实现挂在 nvn_vk_draw.c，无实现时啥都不发生。 */
+                extern void nvn_vk_fu_rt_fresh(uint64_t serial) __attribute__((weak));
+                if (nvn_vk_fu_rt_fresh && S->rt_snap_ok[clear.index])
+                    nvn_vk_fu_rt_fresh(S->rt_snap[clear.index].serial);
+            }
             if (clear_st) {
                 atomic_fetch_add(&g_clear_ns, rec_now_ns() - clear_t0);
                 atomic_fetch_add(&g_clear_n, 1);
@@ -1869,6 +1876,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                     if (S->rt_snap_ok[i]) {
                         ds.rt[i].obj_magic = S->rt_snap[i].magic;
                         ds.rt[i].obj_serial = S->rt_snap[i].serial;
+                        ds.rt[i].storage = (uint64_t)(uintptr_t)S->rt_snap[i].mem;
                     }
                     if (S->rt_has_view[i] && S->rt_view[i].set_format) ds.rt[i].view_format = S->rt_view[i].format;
                     // 编译请求只缺 VkFormat 时还有权威的 NVN 格式：优先视图覆盖格式，否则对象格式。
@@ -1886,6 +1894,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                 }
                 if (S->rt_depth_snap_ok) {
                     ds.depth_key = (uint64_t)(uintptr_t)&S->rt_depth_snap;
+                    ds.depth_storage = (uint64_t)(uintptr_t)S->rt_depth_snap.mem;
                     ds.has_depth = 1;
                     ds.has_dview = S->rt_has_dview;
                     if (S->rt_has_dview) ds.dview = S->rt_dview;
@@ -2799,6 +2808,11 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             }
             extern void s2a_vk_adapter_mark_written(VkImage image) __attribute__((weak));
             if (s2a_vk_adapter_mark_written) s2a_vk_adapter_mark_written(texture->image);
+            {
+                /* C4a 首用证据：深度目标的内容在本帧重新起过（同 OP_CLEAR_COLOR 的 fresh 标记）。 */
+                extern void nvn_vk_fu_rt_fresh(uint64_t serial) __attribute__((weak));
+                if (nvn_vk_fu_rt_fresh) nvn_vk_fu_rt_fresh(S->rt_depth_snap.serial);
+            }
             break;
         }
         case OP_TF_BIND: {
