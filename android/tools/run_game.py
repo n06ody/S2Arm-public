@@ -42,7 +42,7 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
-import argparse, datetime, hashlib, json, os, posixpath, re, shlex, shutil, signal, subprocess, sys, tarfile, time
+import argparse, datetime, hashlib, json, os, posixpath, re, shlex, shutil, signal, subprocess, sys, tarfile, time, uuid
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -56,6 +56,9 @@ import direct_framelog        # noqa: E402  帧日志解析与百分位
 
 ACTIVITY = dev_runtime.ACTIVITY
 DEBUG_PROPS = ("debug.s2a.debug_env", "debug.s2a.frame_log")
+# 本局身份：每局一个 uuid，起局前 setprop 给游戏——os.c 会话日志首行与
+# nvn_vk_frame_log meta 行都写它，取证按文件内容绑本局（不拿 mtime 判）。
+SESSION_PROP = "debug.s2a.session_uuid"
 READY = "Game startup accepted:"
 FAIL_RE = re.compile(r"Game startup refused|startup rejected|FATAL EXCEPTION|AndroidRuntime: FATAL")
 FRAMELOG_END = "direct frame-log end:"
@@ -445,32 +448,32 @@ PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\
 # host-*.log 首行（os.c s2a_android_session_log_start 的 dprintf）：
 #   [s2a] Android 会话日志：session=<seg> pid=<pid> file=<path>
 # 名实互核：文件名 <seg>/<pid> 与首行写明的对不上 = 改名/拼接过的文件，不证归属。
-PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
+PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)(?: uuid=(\S+))?")
+PRIV_FRAME_UUID = re.compile(rb"direct frame-log meta:[^\n]*? uuid=(\S+)")
 
 
 def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
-                         ready_timebase=None, ready_uuid=None):
+                         ready_timebase=None, session_uuid=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
 
-    归属与完整性（qa-fone 复审口径，与 SessionLogEvidence.capture 同模型）：
-    - bound 要实证，fail closed：PID 在 session_pids 且 stat mtime 实读、且
-      mtime ≥ 该 PID 的 birth_wall_s（/proc/<pid>/stat 折墙钟，唯一归属锚——
-      birth 拿不到一律 unproven，起局墙钟不充数）；
-      host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名逐段对上；
-      本局锚：runtime-library.json（Java 起局写进 state_dir 的
-      {pid, sessionId}）的 sessionId 必须等于 READY 行 `session <uuid>`——
-      文件名 seg 只是 services session_id(uint64)名实互核，真正的「本局」
-      身份由 pid ↔ READY-uuid 这条链绑；锚缺、uuid 缺、对不上 → unproven；
-      birth 缺、时基缺、stat 读不了、名实对不上 → 证据照拉但 session=unproven
-      + 注记写明哪一环证不了（同 PID 旧文件绝不升 bound）；
-    - mtime 早于归属窗 → 同 PID 旧局文件，跳过不拉（记注）；
+    归属与完整性（qa-fone 复审口径）：
+    - bound 要实证，fail closed：PID 在 session_pids、stat mtime 实读、
+      进程 birth 实读（/proc/<pid>/stat 折墙钟；拿不到一律 unproven）、
+      墙钟跳变复核过；host-*.log 另要首行 `session=<seg> pid=<pid>` 与文件名
+      逐段对上；**本局锚 = 文件内容里的 session_uuid**：运行器起局前
+      setprop debug.s2a.session_uuid，os.c 会话日志首行 uuid= 与帧日志 meta
+      行尾 uuid= 都写它——等于本局才 bound；字段缺（旧构建/属性没置上）、
+      值不符（别局文件）→ unproven。mtime 只记注不裁决：stat 整秒 vs birth
+      浮点判不了先后，判不了先后时收证标 unproven（uuid 在才证先后）；
+      birth 缺、时基缺、stat 读不了、名实对不上 → 证据照拉但
+      session=unproven + 注记写明哪一环证不了；
     - 完整性：先 run-as sha256sum + wc -c 记源端字节/哈希（manifest 记双侧对拍），
       exec-out 拉回后逐字节核对；不符或拉回空数据标 verified=False
       （rc=0 空读不能当成功）；
-    - pids 为空（READY 前异常：进程死了没绑到当局 PID）→ 退化成按起局时间窗
-      + 文件名 PID 收证、session=unproven 如实标——死前宿主日志正是失败现场证据；
+    - pids 为空（READY 前异常：进程死了没绑到当局 PID）→ 退化按文件名 PID 收证、
+      session=unproven 如实标——死前宿主日志正是失败现场证据；
       连候选都没有也写明未证；
     - run-as 只给 debuggable 包——进不去记注（证据缺 ≠ 还原失败）。
     必须在收局还原（pm clear/卸载清私有目录）前调用。
@@ -499,23 +502,6 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
     # wall2 应 ≈ wall0 + (uptime2 - uptime0)。墙钟被人改/NTP 大步跳变、READY 时基
     # 不全、复核再读失败 → mtime 归属整域不可靠，一律 unproven（fail closed）。
     clock_ok = None
-    # 本局锚：state_dir 的 runtime-library.json（起局时 Java 写的 {pid, sessionId}）。
-    # sessionId 必须等于 READY logcat 行的 session <uuid>——这是「文件属本局」的
-    # 设备端旁证，不是文件自述。拉不到/对不上的一律不给 bound。
-    markers = {}
-    try:
-        found_markers = d.run_as(pkg, f"find /data/data/{pkg} -type f "
-                                      f"-name 'runtime-library.json'", timeout=60)
-        for mpath in (ln.strip() for ln in found_markers.splitlines() if ln.strip()):
-            try:
-                meta = json.loads(d.run_as(pkg, f"cat {shlex.quote(mpath)}", timeout=30))
-                if meta.get("pid") and meta.get("sessionId"):
-                    markers[int(meta["pid"])] = str(meta["sessionId"])
-            except (RuntimeError, subprocess.SubprocessError, ValueError,
-                    AttributeError, TypeError):
-                continue
-    except (RuntimeError, subprocess.SubprocessError):
-        pass
     if pids:
         w0, u0 = (ready_timebase or (None, None))
         if w0 is None or u0 is None:
@@ -546,17 +532,9 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
                     mtime = None
                 if mtime is None:
                     attr = "stat 拿不到 mtime"
-                elif mtime < bound_s:              # 严格 ≥ birth：容忍窗内旧文件也会
-                    notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生，"   # 被判 bound（qa-fone 负控）
-                                 f"同 PID 旧局文件不证归属，不拉")
-                    continue
-                elif ready_uuid is None:
-                    attr = "READY 行没取到本局 session：runtime-library.json 无对照"
-                elif markers.get(pid) != ready_uuid:
-                    attr = ("runtime-library.json 锚缺或 sessionId 与 READY session "
-                            "对不上：本局身份未证")
-                else:
-                    session = "bound"
+                elif mtime < int(bound_s):         # mtime 早于进程出生（stat 整秒
+                    notes.append(f"私有日志 {name}（PID {pid}）mtime 早于进程出生："  # 判得旧）/同秒
+                                 f"照拉收证——先后由文件内容的本局 uuid 裁决")          # 判不了先后：不跳过不判 bound
         # 源端字节/SHA 先记账：exec-out rc=0 空读/截断传输出核对不上就标未证
         want_sha = want_bytes = None
         try:
@@ -580,13 +558,28 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
             why = "拉回空数据" if not got_bytes else \
                   f"源 {want_bytes}B/{str(want_sha)[:12]} ≠ 拉回 {got_bytes}B/{got_sha[:12]}"
             notes.append(f"私有日志 {name} 拉取校验不符（{why}）：标未证")
-        if session == "bound" and name.startswith("host-"):
-            # host-<seg>-<pid>-*.log 名实互核：首行 session/pid 与文件名逐段对
-            m = PRIV_LOG_NAME.match(name)
-            head = PRIV_SESSION_LINE.search(r.stdout[:4096])
-            if m is None or head is None \
-                    or int(head.group(1)) != int(m.group(1)) or int(head.group(2)) != pid:
-                session, attr = "unproven", "首行会话标记与文件名 session/pid 对不上"
+        # 本局锚：文件内容里的 session_uuid（运行器 setprop 的本局号，os.c 首行 /
+        # 帧日志 meta 都写）——等于本局且前置佐证全过才 bound。旧文件造不出
+        # 本局随机号，uuid 是「属这局」的内容级实证。
+        file_uuid = None
+        if attr is None and pids:
+            if name.startswith("host-"):
+                m = PRIV_LOG_NAME.match(name)
+                head = PRIV_SESSION_LINE.search(r.stdout[:4096])
+                if m is None or head is None \
+                        or int(head.group(1)) != int(m.group(1)) or int(head.group(2)) != pid:
+                    attr = "首行会话标记与文件名 session/pid 对不上"
+                elif head.group(3):
+                    file_uuid = head.group(3).decode(errors="replace")
+            elif name.startswith("frame-log-"):
+                um = PRIV_FRAME_UUID.search(r.stdout[:8192])
+                file_uuid = um.group(1).decode(errors="replace") if um else None
+            if attr is None and file_uuid != session_uuid:
+                attr = ("文件内容没有 session_uuid 字段（旧构建/属性没置上）：本局身份未证"
+                        if file_uuid is None else
+                        f"文件 uuid={file_uuid} 与本局 session_uuid 不符：别局文件不冒充本局")
+            elif attr is None:
+                session = "bound"
         if attr:
             notes.append(f"私有日志 {name} 归属未证（{attr}）：按 unproven 记账")
         dest.mkdir(exist_ok=True)
@@ -812,6 +805,7 @@ def main(argv=None):
     pids, priv_done, birth_walls = {}, False, {}
     wall_now = uptime_now = None   # READY 时基锚点对；READY 前异常保持 None → 跳变复核 fail closed
     ready_uuid = None              # READY 行里的本局 session（设备端生成）；READY 前异常保持 None
+    run_uuid = None                # 本局 session_uuid（运行器生成、setprop 下发）；起局前异常保持 None
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -925,7 +919,10 @@ def main(argv=None):
                                          log=log)
             log("资源与包已部署（deploy_resources，未启动）")
             if args.pack:
-                shutil.rmtree(tmp, ignore_errors=True)  # pack 中间产物是再生材料，部署完即清
+                try:
+                    shutil.rmtree(tmp)      # pack 中间产物是再生材料，部署完即清
+                except OSError as error:    # 清不掉照走：留证记注，不当中断
+                    notes.append(f"pack 中间产物 {tmp} 清理失败：{error}")
         elif not state0["installed"] or state0["sha256"] != our_sha:
             d.run("install", "-r", *(["-d"] if downgrade_fwd else []), str(args.apk), timeout=600)
             log("已安装测试包" + ("（install -d 降级）" if downgrade_fwd else ""))
@@ -934,9 +931,14 @@ def main(argv=None):
             raise Refuse("安装后 sha256 校验不过")
 
         # ---- 调试门 + 帧日志开关（记原值，收局恢复并逐项读回；release 机不让改只记注）----
+        run_uuid = uuid.uuid4().hex   # 本局号：os.c 首行/帧 meta 都写它——内容级归属锚
         for key in DEBUG_PROPS:
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
             d.shell(f"setprop {key} 1", allowed=(0, 1))
+        props_prev[SESSION_PROP] = d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip()
+        d.shell(f"setprop {SESSION_PROP} {run_uuid}", allowed=(0, 1))
+        if d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip() != run_uuid:
+            notes.append(f"{SESSION_PROP} 没置上：私有证据本局锚缺，归属一律 unproven")
         if any(d.shell(f"getprop {k}", allowed=(0, 1)).strip() != "1" for k in DEBUG_PROPS):
             notes.append("debug.s2a.* 没置上（release 设备/构建不让改调试属性）：帧日志不会有，frames.tsv 只有表头")
             log("debug.s2a.* 没置上，帧日志不会有")
@@ -1000,7 +1002,7 @@ def main(argv=None):
                                                  "birth_ticks": births[pid],
                                                  "birth_wall_s": birth_walls.get(pid)}
                                         for pid, name in pids.items()},
-                               "ready_line": READY, "uuid": ready_uuid}
+                               "ready_line": READY, "uuid": ready_uuid, "run_uuid": run_uuid}
         if not pids:
             notes.append("ps 里没找到当局游戏进程，帧日志无法按 PID 绑定（帧表只留表头）")
 
@@ -1094,7 +1096,7 @@ def main(argv=None):
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
         priv_records, priv_frames = collect_private_logs(
             d, pkg, pids, out, notes, birth_walls=birth_walls,
-            ready_timebase=(wall_now, uptime_now), ready_uuid=ready_uuid)
+            ready_timebase=(wall_now, uptime_now), session_uuid=run_uuid)
         manifest["private_logs"] = priv_records
         priv_done = True
 
@@ -1203,7 +1205,7 @@ def main(argv=None):
                     d, pkg, pids, out, notes,
                     birth_walls=birth_walls,
                     ready_timebase=(wall_now, uptime_now),
-                    ready_uuid=ready_uuid)
+                    session_uuid=run_uuid)
                 priv_done = True
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
@@ -1221,17 +1223,6 @@ def main(argv=None):
                                        orig_tmp, data_backup=data_backup, backup_dir=backup_dir)
             except (RuntimeError, subprocess.SubprocessError) as error:
                 fails.append(f"还原过程 adb 异常：{error}")
-            if orig_tmp is not None:
-                if fails:
-                    # 还原没全过：原包备份留下供人工救（manifest 记账）
-                    manifest["orig_apk_backup"] = str(orig_tmp)
-                    notes.append(f"还原未全过：原包备份留 {orig_tmp} 供人工恢复")
-                elif orig_tmp.exists():
-                    orig_tmp.unlink()          # 还原全过：备份是再生材料，清掉
-                    try:
-                        orig_tmp.parent.rmdir()
-                    except OSError:
-                        pass
         if logcat_proc:
             logcat_proc.terminate()
             try:
@@ -1242,6 +1233,19 @@ def main(argv=None):
                 fails.append("logcat 采集进程没能停掉")
         if log_file:
             log_file.close()
+        # 原包备份：所有还原核验（进程停验/属性恢复/APK+数据还原/采集进程停）全过
+        # 才算可弃——任一环节没收好都留下供人工救；清理失败记账不中断后续收尾
+        if orig_tmp is not None and orig_tmp.exists():
+            if fails:
+                manifest["orig_apk_backup"] = str(orig_tmp)
+                notes.append(f"还原未全过：原包备份留 {orig_tmp} 供人工恢复")
+            else:
+                try:
+                    orig_tmp.unlink()
+                    orig_tmp.parent.rmdir()
+                except OSError as error:
+                    manifest["orig_apk_backup"] = str(orig_tmp)
+                    notes.append(f"原包备份清理失败：{error}（{orig_tmp} 留在 out）")
         if fails:
             reason = (reason + "；" if reason and reason != "未跑完" else "") + "；".join(fails)
             device_lock.detain(lock, args.serial, reason, holder=args.holder, out=str(out))

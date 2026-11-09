@@ -19,9 +19,10 @@
   ㉕ 数据保护硬门：目录三态探针（存在但进不去 = 报错拒跑，不当不存在）；备份/回灌两处
     tar 解包逐项核对（文件 sha/软链目标/目录/权限），pm clear 排在归档核对之后且
     必须 rc=0+Success；推回途中篡改 → 设备端复核逮住 → 留置；卸载后外部目录读不进 → 留置
-  ㉖ 私有证据本局锚：state_dir 的 runtime-library.json（Java 起局写的 {pid, sessionId}）
-    sessionId 须等于 READY 行 session 段——锚缺/对不上 → unproven，文件名 seg 只做
-    与首行名实互核（services session_id uint64，不冒充本局身份）
+  ㉖ 私有证据本局锚：文件内容里的 session_uuid——运行器起局前 setprop
+    debug.s2a.session_uuid，os.c 会话日志首行 uuid= 与帧日志 meta 行尾 uuid= 都写它；
+    等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
+    stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
 import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
@@ -278,7 +279,10 @@ if cmd == "uninstall":
     if st.get("fail_uninstall"): fail("Failure [DELETE_FAILED_INTERNAL]")
     st["installed"] = False; st["installed_sha"] = ""; save(); out("Success"); sys.exit(0)
 if cmd == "pull":
-    open(argv[-1], "wb").write(bytes.fromhex(st["orig_apk_hex"]))
+    if st.get("pull_dir"):
+        os.makedirs(argv[-1], exist_ok=True)   # 负控：备份路径落成目录 → 收局 unlink 必抛 OSError
+    else:
+        open(argv[-1], "wb").write(bytes.fromhex(st["orig_apk_hex"]))
     out(f"{argv[1]}: 1 file pulled, 0 skipped\\n"); sys.exit(0)
 if cmd == "push":
     if os.path.isdir(argv[1]):
@@ -465,7 +469,12 @@ if cmd == "shell":
                     if st.get("no_priv_seed"):
                         pass    # 零匹配负控：finish 不落 frame-log
                     elif st.get("priv_frame_log") is not None:
-                        dd["files/frame-log-4242.log"] = st["priv_frame_log"].encode().hex()
+                        # 显式文件内容：<SESSION_UUID> 占位符按 setprop 本局号替换
+                        u = ("-" if st.get("no_log_uuid") else
+                             st.get("log_uuid") or
+                             st["props"].get("debug.s2a.session_uuid") or "-")
+                        dd["files/frame-log-4242.log"] = \
+                            st["priv_frame_log"].replace("<SESSION_UUID>", u).encode().hex()
                     else:
                         segs = {}
                         for ln in open(st["logcat_dump"]).read().splitlines():
@@ -474,8 +483,14 @@ if cmd == "shell":
                             if len(f_) < 4 or f_[2] not in ("4242", "4243"): continue
                             segs.setdefault(f_[2], []).append(ln.split("S2Arm: ", 1)[1])
                         for pid_, lines_ in segs.items():
-                            dd["files/frame-log-" + pid_ + ".log"] = \
-                                ("\\n".join(lines_) + "\\n").encode().hex()
+                            text_ = "\\n".join(lines_) + "\\n"
+                            # 真机：meta 行尾带 setprop 的本局 session_uuid（同 host 首行）
+                            if not st.get("no_log_uuid"):
+                                u = st.get("log_uuid") or \
+                                    st["props"].get("debug.s2a.session_uuid") or "-"
+                                text_ = re.sub(r"(direct frame-log meta:[^\\n]*)",
+                                               r"\\1 uuid=" + u, text_)
+                            dd["files/frame-log-" + pid_ + ".log"] = text_.encode().hex()
             else:
                 st["running"] = True
                 st["launch_cmd"] = text
@@ -485,12 +500,19 @@ if cmd == "shell":
                     dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
                     seg = st["uptime_us"] // 1000000
                     hn = f"host-{seg}-4242-Ab12.log"
-                    hdr = (f"[s2a] Android 会话日志：session={seg} pid=4242 "
+                    # 真机：os.c 首行写 setprop 的本局 session_uuid（没置上 → uuid=-）；
+                    # no_log_uuid=旧构建没这字段；log_uuid=显式覆盖（别局号负控）
+                    uuid_tok = ""
+                    if not st.get("no_log_uuid"):
+                        u = st.get("log_uuid") or \
+                            st["props"].get("debug.s2a.session_uuid") or "-"
+                        uuid_tok = " uuid=" + u
+                    hdr = (f"[s2a] Android 会话日志：session={seg} pid=4242{uuid_tok} "
                            f"file=/data/data/{st['package']}/files/ryujinx-android/{hn}\\n")
                     dd[f"files/ryujinx-android/{hn}"] = \
                         (hdr + st.get("host_log", "host log run\\n")).encode().hex()
-                    # Java 起局写 state_dir/runtime-library.json（{pid, sessionId}）：
-                    # 本局锚——sessionId 对得上 READY 行 session 段才证文件属本局
+                    # Java 起局写的 runtime-library.json：真机照样在，但 r20 起
+                    # 本局锚已是文件内容 session_uuid——它只是背景噪声，不参判
                     if not st.get("no_runtime_marker"):
                         dd["files/ryujinx-android/runtime-library.json"] = json.dumps(
                             {"pid": 4242,
@@ -1084,6 +1106,31 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("orig-backup", man.get("orig_apk_backup", ""),
                       "manifest 记原包备份路径")
 
+    def test_orig_backup_kept_when_verify_fails(self):
+        """⑪ qa-fone ②：备份清理必须排在所有还原核验之后——属性恢复读回
+        不符（props_jam）→ 留置报红，orig.apk 不许已删。"""
+        rc, out, state = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(self._data_dirs()), props_jam=True))
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists())
+        self.assertTrue((out / "orig-backup" / "orig.apk").exists(),
+                        "核验未过时备份已被删 = 人工救不回来")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("orig-backup", man.get("orig_apk_backup", ""))
+
+    def test_orig_backup_unlink_failure_still_finishes(self):
+        """⑪ qa-fone ③：orig_tmp.unlink() 抛 OSError 不许吞掉后续收尾——
+        注记记账、manifest 照写、logcat/锁照常收。"""
+        rc, out, _ = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(self._data_dirs()), pull_dir=True))
+        # pull 把备份路径落成目录 → sha 比对不过（拒跑）且收局 unlink 必抛 OSError
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(any("清理失败" in n for n in man["notes"]), man["notes"])
+        self.assertIn("orig-backup", man.get("orig_apk_backup", ""),
+                      "清理失败的路径要记进 manifest")
+        self.assertTrue((out / "run-manifest.json").exists(), "manifest 必须落盘")
+
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
         self.assertNotEqual(0, rc)
@@ -1280,11 +1327,12 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("host-10-4242-Ab12.log", logs)      # am start 落的宿主日志
         self.assertIn("frame-log-4242.log", logs)         # finish 落的原生帧文件
         self.assertNotIn("host-9-9999-Xx99.log", logs)    # 别局/别进程的日志不拉
-        want = (f"[s2a] Android 会话日志：session=10 pid=4242 file=/data/data/{PKG}"
-                f"/files/ryujinx-android/host-10-4242-Ab12.log\n"
+        man = json.loads((out / "run-manifest.json").read_text())
+        ru = man["session"]["run_uuid"]
+        want = (f"[s2a] Android 会话日志：session=10 pid=4242 uuid={ru} "
+                f"file=/data/data/{PKG}/files/ryujinx-android/host-10-4242-Ab12.log\n"
                 "host log run\n").encode()
         self.assertEqual(want, (out / "host_logs/host-10-4242-Ab12.log").read_bytes())
-        man = json.loads((out / "run-manifest.json").read_text())
         self.assertEqual(logs, sorted(r["name"] for r in man["private_logs"]))
         host_rec = next(r for r in man["private_logs"] if r["name"].startswith("host-"))
         self.assertEqual({"name": "host-10-4242-Ab12.log", "pid": 4242,
@@ -1306,6 +1354,7 @@ class RunGameTest(unittest.TestCase):
         的 frame-log-<pid>.log 完整同文块把帧救回来：帧表有帧、截断注记仍如实留。"""
         full = frame_log_text(200, base_ts=10_500_000)
         priv = "".join(ln.split("S2Arm: ", 1)[1] + "\n" for ln in full.splitlines())
+        priv = priv.replace(" chunks=10\n", " chunks=10 uuid=<SESSION_UUID>\n", 1)
         stray = frame_log_text(400, base_ts=10_050_000, pid=9999)  # end 行让转储等待不空转
         trunc = "\n".join(full.splitlines()[:-2]) + "\n"           # 4242 块砍尾 = 截断
         (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + stray + trunc)
@@ -1317,7 +1366,8 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertTrue(any("截断" in n for n in man["notes"]),
                         "logcat 侧截断要如实留注记（救回 ≠ 掩盖）")
-        self.assertEqual(priv, (out / "host_logs/frame-log-4242.log").read_text())
+        want = priv.replace("<SESSION_UUID>", man["session"]["run_uuid"])
+        self.assertEqual(want, (out / "host_logs/frame-log-4242.log").read_text())
 
     def test_private_logs_not_debuggable_is_note_not_failure(self):
         """㉑ 已装包非 debuggable：run-as 进不去私有目录 → 记注不拉，跑局照常过
@@ -1328,9 +1378,9 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual([], man["private_logs"])
         self.assertTrue(any("私有日志" in n for n in man["notes"]), man["notes"])
 
-    def test_private_logs_stale_same_pid_not_attributed(self):
-        """㉒ 同 PID 旧局文件：mtime 早于本局起局设备墙钟 → 不证归属、跳过记注，
-        本局新落的同 PID 文件照拉。"""
+    def test_private_logs_stale_same_pid_not_bound(self):
+        """㉒ 同 PID 旧局文件：mtime 早于进程出生 → 照拉收证但本局身份未证
+        （无本局 uuid → unproven），本局新落的同 PID 文件 bound。"""
         stale = "/data/data/" + PKG + "/files/ryujinx-android/host-7-4242-Zz00.log"
         state = {"data_dirs": {"/data/data/" + PKG: {
                      "files/ryujinx-android/host-7-4242-Zz00.log": b"old run\n".hex()}},
@@ -1338,11 +1388,12 @@ class RunGameTest(unittest.TestCase):
         rc, out, _ = self.run_tool(seconds=30, state=state)
         self.assertEqual(0, rc)
         logs = sorted(p.name for p in (out / "host_logs").iterdir())
-        self.assertNotIn("host-7-4242-Zz00.log", logs, "同 PID 旧局文件不该被当本局证据拉回")
-        self.assertIn("host-10-4242-Ab12.log", logs)
+        self.assertIn("host-7-4242-Zz00.log", logs,
+                      "判不了先后照收证——漏证据比标 unproven 更糟")
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertNotIn("host-7-4242-Zz00.log", [r["name"] for r in man["private_logs"]])
-        self.assertTrue(any("旧局" in n for n in man["notes"]), man["notes"])
+        rec = next(r for r in man["private_logs"] if r["name"] == "host-7-4242-Zz00.log")
+        self.assertEqual("unproven", rec["session"], "旧局文件不冒充本局 bound")
+        self.assertTrue(any("早于进程出生" in n for n in man["notes"]), man["notes"])
 
     def test_private_logs_stat_denied_attribution_unproven(self):
         """㉓ qa-fone 负控：同 PID 文件、stat 被拒 → mtime 读不了，归属证不了 →
@@ -1357,45 +1408,60 @@ class RunGameTest(unittest.TestCase):
                         "传输完整性照样核实——归属未证 ≠ 字节没对上")
         self.assertTrue(any("stat 拿不到 mtime" in n for n in man["notes"]), man["notes"])
 
-    def test_private_logs_mtime_just_below_birth_skipped(self):
-        """㉗ qa-fone 边界负控：同 PID 文件 mtime 仅早 birth 1s（旧 -2s 容忍窗内
-        会被判 bound）→ 严格 ≥ birth 判定，旧文件照样不拉。"""
+    def test_private_logs_mtime_below_birth_collected_unproven(self):
+        """㉗ qa-fone 边界：stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过、
+        不判 bound：照拉收证，本局身份交给文件内容 uuid 裁决。"""
         stale = "/data/data/" + PKG + "/files/ryujinx-android/host-7-4242-Zz00.log"
         wall = 1_700_000_000
         state = {"data_dirs": {"/data/data/" + PKG: {
                      "files/ryujinx-android/host-7-4242-Zz00.log": b"old run\n".hex()}},
-                 "data_mtime": {stale: wall - 3}}   # 替身 birth=wall-2：差 1s 在旧容忍窗内
+                 "data_mtime": {stale: wall - 3}}   # 替身 birth=wall-2：早于出生
         rc, out, _ = self.run_tool(seconds=30, state=state)
         self.assertEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertNotIn("host-7-4242-Zz00.log",
-                         [r["name"] for r in man["private_logs"]],
-                         "mtime 早于 birth 的同 PID 文件不许进证据（容忍窗已去）")
-        self.assertTrue(any("旧局" in n for n in man["notes"]), man["notes"])
+        rec = next(r for r in man["private_logs"] if r["name"] == "host-7-4242-Zz00.log")
+        self.assertEqual("unproven", rec["session"],
+                         "判不了先后照收但标 unproven——不许判 bound 也不许漏证")
+        self.assertTrue(any("早于进程出生" in n for n in man["notes"]), man["notes"])
 
-    def test_private_logs_marker_missing_unproven(self):
-        """㉖ qa-fone 本局锚：state_dir 没有 runtime-library.json（Java 起局写的
-        {pid, sessionId}）→ 文件名/首行/PID/birth 全自洽也只能 unproven——
-        「属本局」要设备端旁证，不是文件自述。"""
-        rc, out, _ = self.run_tool(seconds=30, state={"no_runtime_marker": True})
+    def test_private_logs_uuid_missing_unproven(self):
+        """㉖ qa-fone 本局锚：文件内容没有 session_uuid 字段（旧构建没写/属性
+        没置上）→ 文件名/首行/PID/birth 全自洽也只能 unproven——「属本局」
+        要文件自述本局号，不是文件年龄看着像。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"no_log_uuid": True})
         self.assertEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertTrue(man["private_logs"], "锚缺不该挡证据拉回")
-        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
-                        man["private_logs"])
-        self.assertTrue(any("runtime-library.json" in n for n in man["notes"]),
-                        man["notes"])
+        self.assertEqual({"frame-log-4242.log", "host-10-4242-Ab12.log"},
+                         {r["name"] for r in man["private_logs"]},
+                         "证据照样收——归属未证不等于文件没拉回")
+        for rec in man["private_logs"]:
+            self.assertEqual("unproven", rec["session"], f"{rec['name']} 无 uuid 不许 bound")
+            self.assertTrue(rec["verified"], "传输完整性照样核实")
+        self.assertTrue(any("session_uuid" in n for n in man["notes"]), man["notes"])
 
-    def test_private_logs_marker_uuid_mismatch_unproven(self):
-        """㉖ runtime-library.json 的 sessionId 与 READY 行 session 段对不上
-        （别的局写的标记/标记被换）→ 本局身份未证 → unproven。"""
-        rc, out, _ = self.run_tool(seconds=30, state={"marker_uuid": "other-uuid"})
+    def test_private_logs_uuid_mismatch_unproven(self):
+        """㉖ qa-fone 反例钉死：同 PID、名实自洽、mtime 够新的文件，内容 uuid
+        与本局号不符 → unproven——别局文件造不出本局随机号。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"log_uuid": "OTHER-SESSION"})
         self.assertEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
-                        man["private_logs"])
-        self.assertTrue(any("runtime-library.json" in n for n in man["notes"]),
-                        man["notes"])
+        for rec in man["private_logs"]:
+            self.assertEqual("unproven", rec["session"], f"{rec['name']} uuid 不符不许 bound")
+        self.assertTrue(any("不符" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_bound_content_uuid(self):
+        """㉖ 正对照：本局 run_uuid 写进 host 首行 / 帧 meta → bound；manifest
+        记 run_uuid，bound 记录的内容里必须真含本局号（判据没被绕过）。"""
+        rc, out, _ = self.run_tool(seconds=30)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        bound = [r for r in man["private_logs"] if r["session"] == "bound"]
+        self.assertEqual({"frame-log-4242.log", "host-10-4242-Ab12.log"},
+                         {r["name"] for r in bound})
+        ru = man["session"]["run_uuid"].encode()
+        for rec in bound:
+            body = (out / "host_logs" / rec["name"]).read_bytes()
+            self.assertIn(ru, body, f"{rec['name']} bound 但内容没有本局 uuid：判据被绕过")
 
     def test_private_logs_no_birth_attribution_unproven(self):
         """㉔ qa-fone 负控：墙钟正常但 /proc/<pid>/stat 读拒 → 进程 birth 证不了，
