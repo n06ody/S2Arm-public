@@ -113,7 +113,11 @@ def run_as(cmdline):
         for root_, files_ in DATA_DIRS.items():
             if p.startswith(root_.rstrip("/") + "/") and \
                     p[len(root_.rstrip("/")) + 1:] in files_:
-                out(str(st.get("data_mtime", {}).get(p, st["wall_s"])) + "\\n"); return
+                # mtime 缺省 = 当前墙钟（随 uptime 推进，与 date +%s 同式）
+                wall = st["wall_s"] + (st["uptime_us"] - st["wall_ref_us"]) // 1_000_000
+                if st.get("wall_jump") and st["uptime_us"] > 20_000_000:
+                    wall += st["wall_jump"]
+                out(str(st.get("data_mtime", {}).get(p, wall)) + "\\n"); return
         fail("stat: " + p + ": No such file or directory")
     m = _re.match(r"^sha256sum (\\S+); wc -c < (\\S+)$", cmdline)
     if m:
@@ -386,8 +390,13 @@ if cmd == "shell":
     if c == "date":
         if "+%s" in text and st.get("no_wall"):   # 墙钟拿不到：归属窗/birth 折算都缺
             fail("date: command failed")
-        out((str(st["wall_s"]) if "+%s" in text else "11-09 12:00:00.000") + "\\n")
-        sys.exit(0)
+        if "+%s" in text:
+            # 墙钟随开机钟推进（真机同律）；wall_jump 旋钮 = 局中墙钟跳变
+            wall = st["wall_s"] + (st["uptime_us"] - st["wall_ref_us"]) // 1_000_000
+            if st.get("wall_jump") and st["uptime_us"] > 20_000_000:
+                wall += st["wall_jump"]
+            out(str(wall) + "\\n"); sys.exit(0)
+        out("11-09 12:00:00.000\\n"); sys.exit(0)
     if c == "dumpsys":
         if len(sh) > 1 and sh[1] == "battery": out(st["dumpsys_battery"]); sys.exit(0)
         if len(sh) > 1 and sh[1] == "thermalservice": out(st["dumpsys_thermal"]); sys.exit(0)
@@ -464,6 +473,7 @@ def make_state(root, **kw):
         "logcat_stream": str(root / "logcat_stream.txt"),
     }
     state.update(kw)
+    state.setdefault("wall_ref_us", state["uptime_us"])   # 墙钟随开机钟推进的锚点
     path = root / "state.json"
     path.write_text(json.dumps(state))
     return path
@@ -1049,7 +1059,19 @@ class RunGameTest(unittest.TestCase):
         self.assertTrue(man["private_logs"])
         self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
                         man["private_logs"])
-        self.assertTrue(any("birth/起局墙钟" in n for n in man["notes"]), man["notes"])
+        self.assertTrue(any("归属未证" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_wall_clock_jump_unproven(self):
+        """㉔ 局中墙钟跳变（人改钟/NTP 大步）：READY 锚点对与收证复核对不上 →
+        mtime 归属整域不可靠 → 一律 unproven + 注记（fail closed）。"""
+        rc, out, _ = self.run_tool(seconds=30, state={"wall_jump": 600})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(man["private_logs"], "跳变不该挡证据拉回")
+        self.assertTrue(all(r["session"] == "unproven" for r in man["private_logs"]),
+                        man["private_logs"])
+        self.assertTrue(any("墙钟" in n and "对不上" in n for n in man["notes"]),
+                        man["notes"])
 
     def test_private_logs_header_mismatch_unproven(self):
         """㉓ host-<seg>-<pid>-*.log 名实互核：文件首行 session/pid 与文件名对不上

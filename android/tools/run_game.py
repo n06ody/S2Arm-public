@@ -325,7 +325,8 @@ PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\
 PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)")
 
 
-def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None):
+def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_walls=None,
+                         ready_timebase=None):
     """当局进程留在应用私有目录的证据：native 直写的 frame-log-<pid>.log
     （nvn_vk_frame_log.c 与 logcat 同文双写——logcat 分片被截断时它是完整源）
     与 saveRoot/ryujinx-android/host-*-<pid>-*.log（进程宿主日志，含 NUL 原始字节）。
@@ -366,18 +367,35 @@ def collect_private_logs(d, pkg, pids, out, notes, launch_wall_s=None, birth_wal
                      "+文件名 PID 收证，归属未证（session=unproven）")
     else:
         notes.append("READY 前异常且私有目录下没有任何日志可收：失败现场证据未证")
+    # 时钟跳变复核：READY 记下的 (wall0, uptime0) 锚点对与收证时再读的对得上——
+    # wall2 应 ≈ wall0 + (uptime2 - uptime0)。墙钟被人改/NTP 大步跳变、READY 时基
+    # 不全、复核再读失败 → mtime 归属整域不可靠，一律 unproven（fail closed）。
+    clock_ok = None
+    if pids:
+        w0, u0 = (ready_timebase or (None, None))
+        if w0 is None or u0 is None:
+            clock_ok = False
+        else:
+            w2, u2 = device_timebase(d)
+            clock_ok = (w2 is not None and u2 is not None
+                        and abs(w2 - (w0 + (u2 - u0))) <= 5)
+        if clock_ok is False:
+            notes.append("设备墙钟与开机钟对不上（跳变/READY 时基不全/复核读不了）："
+                         "mtime 归属不可靠，私有证据一律按 unproven 记账")
     dest = out / "host_logs"
     for path, pid in candidates:
         name = path.rsplit("/", 1)[-1]
         # fail-closed 归属：每一环实证了才升 bound，证不了照拉但标 unproven
         session, attr = "unproven", None
         if pids:
+            if clock_ok is False:
+                attr = "墙钟跳变或 READY 时基不全，mtime 归属不可靠"
             bound_s = (birth_walls or {}).get(pid)  # 进程出生墙钟优先
             if bound_s is None:
                 bound_s = launch_wall_s            # birth 缺 → 起局窗兜底（弱一级）
-            if bound_s is None:
+            if attr is None and bound_s is None:
                 attr = "没有进程 birth/起局墙钟可比"
-            else:
+            elif attr is None:
                 try:
                     mtime = int(d.run_as(pkg, f"stat -c %Y {shlex.quote(path)}",
                                          timeout=30).strip())
@@ -634,6 +652,7 @@ def main(argv=None):
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
     pids, priv_done, launch_wall_s, birth_walls = {}, False, None, {}
+    wall_now = uptime_now = None   # READY 时基锚点对；READY 前异常保持 None → 跳变复核 fail closed
     result, reason = "red", "未跑完"
 
     def log(line):
@@ -908,7 +927,8 @@ def main(argv=None):
         # ---- 私有证据（还原清私有目录之前拉回）：native 直写 frame-log-<pid>.log ----
         # ---- 是 logcat 转储被截断时的完整源；host-*-<pid>-*.log 是当局宿主日志 ----
         priv_records, priv_frames = collect_private_logs(
-            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls)
+            d, pkg, pids, out, notes, launch_wall_s=launch_wall_s, birth_walls=birth_walls,
+            ready_timebase=(wall_now, uptime_now))
         manifest["private_logs"] = priv_records
         priv_done = True
 
@@ -1015,7 +1035,8 @@ def main(argv=None):
             try:  # 中断路径同样在还原（pm clear/卸载清私有目录）前把私有证据拉回
                 manifest["private_logs"], _ = collect_private_logs(
                     d, pkg, pids, out, notes, launch_wall_s=launch_wall_s,
-                    birth_walls=birth_walls)
+                    birth_walls=birth_walls,
+                    ready_timebase=(wall_now, uptime_now))
                 priv_done = True
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
