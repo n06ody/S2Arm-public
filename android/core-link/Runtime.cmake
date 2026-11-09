@@ -3,7 +3,7 @@ get_filename_component(S2A_ANDROID_RUNTIME_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..
 function(s2a_android_game_sources output)
     set(repo "${S2A_ANDROID_RUNTIME_ROOT}")
     # Apple 专用触页优化与诊断不用于 Android；Android 使用实际 fault dispatcher。
-    set(core alt ap_host boot caps cpatch crash det dguard direct_host gate layout libc lifecycle loader loadprog logcap logcon lowva nrodefer
+    set(core alt ap_host boot caps cpatch crash det dguard direct_host direct_prompt gate layout libc lifecycle loader loadprog logcap logcon lowva nrodefer
         glslc_tool oodle_tool os pack_apply pad patch patch_data selfcheck session svc_mem text_input thread traps vawin widen xstack)
     set(sources)
     foreach(name IN LISTS core)
