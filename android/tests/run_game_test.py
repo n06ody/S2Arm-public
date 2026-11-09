@@ -80,7 +80,26 @@ def sha_listing(dir_):
 
 def run_as(cmdline):
     # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录（shell 与 exec-out 两路进来）
-    import re as _re
+    import re as _re, fnmatch as _fm
+    if not st.get("apk_debuggable", True):
+        fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
+    m = _re.match(r"^find (\\S+) -type f -name '\\*\\.log'$", cmdline)
+    if m:
+        # 私有证据收集：列 <root> 下 basename *.log（含子目录 rel 路径）
+        root_ = m.group(1).rstrip("/")
+        for rel in sorted(DATA_DIRS.get(root_, {})):
+            if _fm.fnmatch(rel.rsplit("/", 1)[-1], "*.log"):
+                out(root_ + "/" + rel + "\\n")
+        return
+    m = _re.match(r"^cat (\\S+)$", cmdline)
+    if m:
+        p = m.group(1)          # exec-out 收私有日志：DATA_DIRS 原样吐字节（含 NUL）
+        for root_, files_ in DATA_DIRS.items():
+            if p.startswith(root_.rstrip("/") + "/"):
+                rel = p[len(root_.rstrip("/")) + 1:]
+                if rel in files_:
+                    sys.stdout.buffer.write(bytes.fromhex(files_[rel])); return
+        fail("cat: " + p + ": No such file or directory")
     m = _re.match(r"^\\[ -d (\\S+) \\] && echo yes \\|\\| true$", cmdline)
     if m:
         out("yes\\n" if m.group(1) in DATA_DIRS else ""); return
@@ -286,10 +305,32 @@ if cmd == "shell":
     if c == "am":
         if "start" in sh:
             if "s2arm.finish" in text:
-                if not st.get("unstoppable"): st["running"] = False
+                if not st.get("unstoppable"):
+                    st["running"] = False
+                    # 适配器 shutdown 帧日志转储：native 同文双写 filesDir/frame-log-<pid>.log
+                    # （emit 同时 fprintf + logcat，nvn_vk_frame_log.c）。替身缺省从
+                    # logcat_dump 剥行前缀派生；priv_frame_log 旋钮给显式文件内容
+                    # （比如 logcat 分片被截断但文件完整的救场局）。
+                    dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
+                    if st.get("priv_frame_log") is not None:
+                        dd["files/frame-log-4242.log"] = st["priv_frame_log"].encode().hex()
+                    else:
+                        segs = {}
+                        for ln in open(st["logcat_dump"]).read().splitlines():
+                            if "direct frame-log" not in ln: continue
+                            f_ = ln.split(None, 3)
+                            if len(f_) < 4 or f_[2] not in ("4242", "4243"): continue
+                            segs.setdefault(f_[2], []).append(ln.split("S2Arm: ", 1)[1])
+                        for pid_, lines_ in segs.items():
+                            dd["files/frame-log-" + pid_ + ".log"] = \
+                                ("\\n".join(lines_) + "\\n").encode().hex()
             else:
                 st["running"] = True
                 st["launch_cmd"] = text
+                # 游戏起局：宿主日志落 files/ryujinx-android/host-<uptime>-<pid>-<hex>.log
+                dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
+                dd[f"files/ryujinx-android/host-{st['uptime_us'] // 1000000}-4242-Ab12.log"] = \
+                    st.get("host_log", "host log run\\n").encode().hex()
                 # 游戏起局即改写自己的数据（存档/新文件）——还原不还原从这里才分得出来
                 for dir_ in list(DATA_DIRS):
                     if DATA_DIRS[dir_]:
@@ -735,6 +776,9 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(2, proc.returncode, "SIGTERM 应退 2（中断但已还原）")
         st = json.loads(state.read_text())
         self.assertFalse(st["installed"], "SIGTERM 后测试包应被卸载还原")
+        # ㉑ 中断路径同样在还原前拉回私有证据（pm clear/卸载会清掉它）
+        self.assertTrue((out / "host_logs" / "host-10-4242-Ab12.log").is_file(),
+                        "中断路径 host-*-<pid>-*.log 也该拉回")
         self.assertFalse((self.lock_root / SERIAL / "detained.json").exists(),
                          "还原成功不该留置")
 
@@ -854,6 +898,53 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertFalse(man["power_sampler"]["settle_ok"])
         self.assertTrue(any("放电未稳" in n for n in man["notes"]), man["notes"])
+
+    def test_private_logs_pulled_before_restore(self):
+        """㉑ 私有证据收证：收局后、还原（pm clear/卸载清私有目录）前把当局进程的
+        host-*-<pid>-*.log 与原生直写 frame-log-<pid>.log 拉回 out/host_logs/；
+        异 PID 的 host 日志不拉；manifest.private_logs 记账；与 logcat 同文的
+        私有帧块归并去重、不重复计帧。"""
+        foreign = {"data_dirs": {"/data/data/" + PKG: {
+            "files/ryujinx-android/host-9-9999-Xx99.log": b"foreign\n".hex()}}}
+        rc, out, _ = self.run_tool(seconds=30, state=foreign)
+        self.assertEqual(0, rc)
+        logs = sorted(p.name for p in (out / "host_logs").iterdir())
+        self.assertIn("host-10-4242-Ab12.log", logs)      # am start 落的宿主日志
+        self.assertIn("frame-log-4242.log", logs)         # finish 落的原生帧文件
+        self.assertNotIn("host-9-9999-Xx99.log", logs)    # 别局/别进程的日志不拉
+        self.assertEqual(b"host log run\n",
+                         (out / "host_logs/host-10-4242-Ab12.log").read_bytes())
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(logs, sorted(man["private_logs"]))
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(199, len(rows) - 1, "私有帧块与 logcat 同文去重后帧数不变")
+
+    def test_private_frame_log_rescues_logcat_truncation(self):
+        """㉑ logcat 转储块被截断（8E 二局形态：meta 声明的分片没传完）→ filesDir
+        的 frame-log-<pid>.log 完整同文块把帧救回来：帧表有帧、截断注记仍如实留。"""
+        full = frame_log_text(200, base_ts=10_500_000)
+        priv = "".join(ln.split("S2Arm: ", 1)[1] + "\n" for ln in full.splitlines())
+        stray = frame_log_text(400, base_ts=10_050_000, pid=9999)  # end 行让转储等待不空转
+        trunc = "\n".join(full.splitlines()[:-2]) + "\n"           # 4242 块砍尾 = 截断
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + stray + trunc)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + stray + trunc)
+        rc, out, _ = self.run_tool(seconds=30, state={"priv_frame_log": priv})
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(199, len(rows) - 1, "私有帧文件应把 logcat 截断掉的帧救回来")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertTrue(any("截断" in n for n in man["notes"]),
+                        "logcat 侧截断要如实留注记（救回 ≠ 掩盖）")
+        self.assertEqual(priv, (out / "host_logs/frame-log-4242.log").read_text())
+
+    def test_private_logs_not_debuggable_is_note_not_failure(self):
+        """㉑ 已装包非 debuggable：run-as 进不去私有目录 → 记注不拉，跑局照常过
+        （证据缺 ≠ 还原失败）。"""
+        rc, out, _ = self.run_tool(seconds=3, state={"apk_debuggable": False})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual([], man["private_logs"])
+        self.assertTrue(any("私有日志" in n for n in man["notes"]), man["notes"])
 
     def _resources_dir(self, npayload=6):
         """能过 deploy_game.validate() 的最小资源目录：artifact/index/manifest 身份自洽。"""
