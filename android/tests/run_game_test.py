@@ -74,7 +74,11 @@ def dir_entries(dir_):
     for rel in dirs:
         out_e[rel] = (modes.get(rel, "775"), "directory")
     for rel in files:
-        out_e[rel] = (modes.get(rel, "664"), "regular file")
+        # toybox stat %F 真口径：0 字节出 "regular empty file"（8E 实测）；
+        # dev_stat_types 旋钮可把某路径报成 fifo/socket 等非普通类型（负对照）
+        ftype = "regular empty file" if not files[rel] else "regular file"
+        ftype = st.get("dev_stat_types", {}).get(dir_, {}).get(rel, ftype)
+        out_e[rel] = (modes.get(rel, "664"), ftype)
     for rel in links:
         out_e[rel] = (modes.get(rel, "777"), "symbolic link")
     return out_e
@@ -1519,6 +1523,8 @@ class RunGameTest(unittest.TestCase):
     _CK_TID = "0123456789ABCDEF"          # PKG 尾 16 位十六进制大写
     _CK_FILES = {
         "bis/user/save/0000000000000001/1/game_data.sav": b"SAVE-DATA",
+        # 0 字节 .lock：toybox stat %F 报 "regular empty file"（8E 预演真红根因）
+        "bis/user/save/0000000000000001/1/.lock": b"",
         "bis/system/save/8000000000000000/1/lastPublishedId": b"12345678",
     }
 
@@ -1564,7 +1570,7 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual("ok", ck["verify"], ck)
         self.assertEqual("w1-node", ck["name"])
         self.assertEqual(self._CK_TID, ck["title_id"])
-        self.assertEqual(2, ck["files"])
+        self.assertEqual(3, ck["files"])
         self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", ck["source_sha256"]))
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertIn("am start", st.get("launch_cmd", ""))
@@ -1580,6 +1586,8 @@ class RunGameTest(unittest.TestCase):
         cp = self._checkpoint(meta_extra={
             "files": {"bis/user/save/0000000000000001/1/game_data.sav":
                       [9, "0" * 64],
+                      "bis/user/save/0000000000000001/1/.lock":
+                      [0, hashlib.sha256(b"").hexdigest()],
                       "bis/system/save/8000000000000000/1/lastPublishedId":
                       [8, hashlib.sha256(b"12345678").hexdigest()]}})
         _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_bad")
@@ -1606,6 +1614,8 @@ class RunGameTest(unittest.TestCase):
         cp2 = self._checkpoint(name="w2", meta_extra={
             "files": {"bis/user/save/0000000000000001/1/game_data.sav":
                       [999, hashlib.sha256(b"SAVE-DATA").hexdigest()],
+                      "bis/user/save/0000000000000001/1/.lock":
+                      [0, hashlib.sha256(b"").hexdigest()],
                       "bis/system/save/8000000000000000/1/lastPublishedId":
                       [8, hashlib.sha256(b"12345678").hexdigest()]}})
         _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_sz")
@@ -1682,6 +1692,30 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("tmp_left", man["checkpoint"], man["checkpoint"])
         self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
                         "临时文件删不掉要留置")
+
+    def test_checkpoint_nonregular_rejected_raw_dump(self):
+        """负对照：设备端报非普通文件（fifo）→ 仍拒不起局；verify=fail 时设备原始
+        stat/sha/软链清单落 out/checkpoint-device/ 供归因（8E 空文件红那次就是
+        靠 stat 类型名才定到根因）。"""
+        state_dir = ("/data/data/" + PKG + "/files/user/0/saves/"
+                     + self._CK_TID + "/ryujinx-android")
+        rc, out, _ = self.run_tool(
+            state={"dev_stat_types": {state_dir: {
+                "bis/user/save/0000000000000001/1/game_data.sav": "fifo"}}},
+            argv=["--checkpoint", str(self._checkpoint())], out_name="out_fifo")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        self.assertIn("核对不符", man["reason"], man["reason"])
+        self.assertEqual("checkpoint-device/",
+                         man["checkpoint"].get("device_listing"))
+        stat_txt = (out / "checkpoint-device" / "stat.txt").read_text()
+        self.assertIn("fifo", stat_txt)
+        self.assertIn("game_data.sav", stat_txt)
+        self.assertTrue((out / "checkpoint-device" / "sha256sum.txt").exists())
+        self.assertTrue((out / "checkpoint-device" / "links.txt").exists())
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "非普通文件不许起局")
 
     def test_checkpoint_path_traversal(self):
         """路径越界：tar 成员含 .. 段 → 宿主门拒（push 都没发生），不起局。"""
