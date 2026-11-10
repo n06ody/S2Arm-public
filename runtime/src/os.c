@@ -17,6 +17,13 @@
 #if defined(__ANDROID__)
 #include <limits.h>
 #include <time.h>
+#include <string.h>
+#if __has_include(<sys/system_properties.h>)
+#include <sys/system_properties.h>
+#define S2A_SESSION_UUID_PROP 1
+#else
+#define PROP_VALUE_MAX 92   /* 替身头缺失的同长缓冲；bionic 恒 92（svc_mem.c 同款 has_include 模式） */
+#endif
 #endif
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -148,8 +155,16 @@ __attribute__((visibility("hidden"))) int s2a_android_session_log_start(const ch
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 || fcntl(fd, F_SETFL, O_APPEND) < 0) {
         error = errno; goto done;
     }
-    if (dprintf(fd, "[s2a] Android 会话日志：session=%llu pid=%d file=%s\n",
-        (unsigned long long)session, (int)getpid(), path) < 0) { error = errno; goto done; }
+    // 本局身份：运行器起局前 setprop debug.s2a.session_uuid <uuid>，写进首行供取证
+    // 按内容绑本局（文件名/PID/mtime 都证明不了「这局」——同 PID 旧文件全靠它区分）。
+    // 属性没置上/读到空 → uuid=-（取证端判 unproven，不冒充 bound）。
+    char uuid[PROP_VALUE_MAX];
+#ifdef S2A_SESSION_UUID_PROP
+    if (__system_property_get("debug.s2a.session_uuid", uuid) <= 0)
+#endif
+        strcpy(uuid, "-");
+    if (dprintf(fd, "[s2a] Android 会话日志：session=%llu pid=%d uuid=%s file=%s\n",
+        (unsigned long long)session, (int)getpid(), uuid, path) < 0) { error = errno; goto done; }
     // stdout 收 Ryujinx ConsoleLogTarget；stderr 收 Console.Error；native fd 保留原始行。
     for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
         if (dup2(fd, targets[i]) < 0) { error = errno; goto done; }

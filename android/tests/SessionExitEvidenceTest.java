@@ -34,6 +34,9 @@ public final class SessionExitEvidenceTest {
         String log="[s2a] Android 会话日志：session=1 pid=42 file=/private/host.log\n[s2a] GPU Run 退出：cancel=True\n"
             + "[WSI] destroyed serial=10 gen=5 rev=3 mode=EnabledPresentFence poolCollected=True\n[s2a] 优雅退出完成（0.164 秒）\n";
         SessionExitEvidence.requireClean(BIRTH,fresh,PROCESS,log,5); check(true,"current exit plus final generation retirement passes");
+        String logUuid = log.replace("pid=42 file=","pid=42 uuid=9f3e-run file=");
+        SessionExitEvidence.requireClean(BIRTH,fresh,PROCESS,logUuid,5); check(true,"uuid 字段的新首行同样认");
+        rejected(fresh,logUuid.replace("pid=42 ","pid=43 "),5,"uuid 首行错 PID 照样拒");
         SessionExitEvidence.requireClean(BIRTH,fresh,PROCESS,log.replace("GPU Run 退出：","GPU Run 退出（拆线程）：")
             + "[s2a] GPU Run 退出后：排空 FIFO\n",5); check(true,"threaded exit marker accepted without confusing later timing summary");
         rejected(old,log,5,"old failure cannot be mistaken for current exit");
