@@ -5,6 +5,7 @@
 #include "nvn_vk_format.h"
 #include "nvn_vk_texcache.h"
 #include "nvn_vk_readback.h"
+#include "nvn_vk_compute.h"
 #include "vk_record.h"
 #include "vk_clear.h"
 
@@ -18,6 +19,7 @@ int nvn_vk_session_create(struct nvn_vk_session *s, char *why, size_t why_size) 
     if (s2a_vk_device_create(&s->device, why, why_size)) return -1;
     // #1199：有要 compute 解码的 BC 格式而解码模块建不起来 → why 写族名、整局不进直连；设备回收。
     if (nvn_vk_texcache_init(&s->textures, &s->device, why, why_size)) {
+        nvn_vk_compute_pso_cache_release(&s->device);
         (void)s2a_vk_device_destroy(&s->device, 0);
         return -1;
     }
@@ -282,6 +284,8 @@ int nvn_vk_session_destroy_with_callback(struct nvn_vk_session *s, void (*releas
     nvn_vk_sampler_cache_destroy(&s->samplers);
     // 读回 staging 缓存也在设备收尾里释放：等不到完成证明的缓冲由它自己保留并记日志。
     nvn_vk_session_read_texels_release(s);
+    // compute PSO 进程内缓存同点释放：对象属于本设备，先于 vkDestroyDevice。
+    nvn_vk_compute_pso_cache_release(&s->device);
     // 此间不再提交工作；消费上面的同一次 VK_SUCCESS，不再 WaitIdle。
     if (s2a_vk_device_destroy(&s->device, 1)) return -1;
     s->ready = 0;

@@ -57,6 +57,8 @@ class ComputePipeline(unittest.TestCase):
               'negative_tex_wrong_view':source.replace('ii[i].imageView = tb->view;', 'ii[i].imageView = (VkImageView)0xdead;'),
               'negative_tex_wrong_sampler':source.replace('ii[i].sampler = tb->sampler;', 'ii[i].sampler = (VkSampler)0x33;'),
               'negative_tex_no_general':source.replace('ii[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;', 'ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;'),
+              # PSO 缓存负对照：永不命中（= 修前行为）→ 门开断言 pipe_calls==1 变红
+              'negative_pso_never_hit':source.replace('        if (hit) {', '        if (0) {'),
               'drop-c1-binding':source.replace('} else if (r->kind == 0 && r->slot == 1) {', '} else if (0) {'),
               'c1-from-guest-read':source.replace('memcpy(b->mapped, source->c1, NVK_COMPUTE_C1_BYTES);', 'memcpy(b->mapped, b->mapped, 0);')}
             for name,code in variants.items():

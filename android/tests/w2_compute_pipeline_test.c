@@ -9,6 +9,7 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #include <assert.h>
 #include <stdarg.h>
 static int live, step, fail_at, reads, writes, write_fail, read_fail, unknown_type, low_limit;
+static int pipe_calls, plc_calls;
 static unsigned handle=1;
 static unsigned descriptors;
 static struct nvk_compute_lookup_result accepted;
@@ -40,8 +41,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice d,const VkDe
 VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorSetLayout(VkDevice d,VkDescriptorSetLayout s,const VkAllocationCallbacks*a){(void)d;(void)s;(void)a;live--;}
 VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineLayout(VkDevice d,const VkPipelineLayoutCreateInfo*c,const VkAllocationCallbacks*a,VkPipelineLayout*out){(void)d;(void)c;(void)a;CREATE(VkPipelineLayout,out);}
 VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineLayout(VkDevice d,VkPipelineLayout p,const VkAllocationCallbacks*a){(void)d;(void)p;(void)a;live--;}
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkComputePipelineCreateInfo*c,const VkAllocationCallbacks*a,VkPipeline*out){(void)d;(void)cache;(void)a;assert(n==1&&c->stage.stage==VK_SHADER_STAGE_COMPUTE_BIT&&!strcmp(c->stage.pName,"main"));CREATE(VkPipeline,out);}
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkComputePipelineCreateInfo*c,const VkAllocationCallbacks*a,VkPipeline*out){(void)d;(void)a;pipe_calls++;assert(cache==VK_NULL_HANDLE||cache!=(VkPipelineCache)0);assert(n==1&&c->stage.stage==VK_SHADER_STAGE_COMPUTE_BIT&&!strcmp(c->stage.pName,"main"));CREATE(VkPipeline,out);}
 VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice d,VkPipeline p,const VkAllocationCallbacks*a){(void)d;(void)p;(void)a;live--;}
+VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice d,const VkPipelineCacheCreateInfo*c,const VkAllocationCallbacks*a,VkPipelineCache*out){(void)d;(void)c;(void)a;plc_calls++;CREATE(VkPipelineCache,out);}
+VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice d,VkPipelineCache p,const VkAllocationCallbacks*a){(void)d;(void)p;(void)a;live--;}
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice d,const VkDescriptorPoolCreateInfo*c,const VkAllocationCallbacks*a,VkDescriptorPool*out){(void)d;(void)c;(void)a;CREATE(VkDescriptorPool,out);}
 VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice d,VkDescriptorPool p,const VkAllocationCallbacks*a){(void)d;(void)p;(void)a;live--;}
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice d,const VkDescriptorSetAllocateInfo*c,VkDescriptorSet*out){(void)d;if(next())return VK_ERROR_OUT_OF_POOL_MEMORY;for(uint32_t i=0;i<c->descriptorSetCount;i++)out[i]=HANDLE(VkDescriptorSet);return VK_SUCCESS;}
@@ -50,7 +53,7 @@ static int unpin_calls, tex_writes;
 static VkImageView expected_view;
 static struct nvn_vk_tex mock_tex;
 static struct nvk_compute_tex_snapshot snapshot;
-VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice d,uint32_t n,const VkWriteDescriptorSet*w,uint32_t copies,const VkCopyDescriptorSet*c){(void)d;(void)copies;(void)c;descriptors=n;assert((n==2&&w[0].dstBinding==3&&w[1].dstBinding==9)||(n==1&&w[0].dstBinding==9));assert(w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice d,uint32_t n,const VkWriteDescriptorSet*w,uint32_t copies,const VkCopyDescriptorSet*c){(void)d;(void)copies;(void)c;descriptors=n;assert(n<=(uint32_t)fixture.binding_count);for(uint32_t i=0;i<n;i++){int infix=0;for(int j=0;j<fixture.binding_count;j++)if(w[i].dstBinding==(uint32_t)fixture.bindings[j].binding)infix=1;assert(infix);}assert(w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     // 纹理描述符必须写成快照里的真实 view + sampler + GENERAL；空句柄等于“绑了占位资源”。
     for(uint32_t i=0;i<n;i++) if(w[i].descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER){assert(w[i].pImageInfo&&w[i].pImageInfo->imageView==expected_view&&w[i].pImageInfo->sampler==(VkSampler)0x22&&w[i].pImageInfo->imageLayout==VK_IMAGE_LAYOUT_GENERAL);tex_writes++;}
     else assert(w[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[i].descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);}
@@ -97,6 +100,7 @@ void nvn_vk_program_free_compute(struct nvn_vk_compute_program*p){memset(p,0,siz
 static int rd(void*opaque,uint64_t addr,void*out,size_t n){(void)opaque;reads++;if(read_fail)return -1;assert(addr>=0x1000&&addr+n<=0x1000+sizeof guest);memcpy(out,guest+addr-0x1000,n);return 0;}
 static int wr(void*opaque,uint64_t addr,const void*in,size_t n){(void)opaque;writes++;if(write_fail)return -1;assert(addr>=0x1000&&addr+n<=0x1000+sizeof guest);memcpy(guest+addr-0x1000,in,n);return 0;}
 static uint32_t spv[5]={0x07230203,0x10000,0,1,0};
+static uint32_t spv2[5]={0x07230203,0x10000,0,2,0};
 static struct s2a_vk_device device={.device=(VkDevice)1,.physical=(VkPhysicalDevice)1};
 static struct s2a_record_memory memory={.read=rd,.write=wr};
 static struct s2a_record_dispatch_state state;
@@ -110,13 +114,14 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
     return 0;
 }
 
-static void reset(void){assert(live==0);accepted=(struct nvk_compute_lookup_result){.bytes=(uint8_t*)"x",.length=1,.profile={.storage_alignment=16}};step=0;fail_at=0;descriptors=0;reads=writes=write_fail=read_fail=unknown_type=low_limit=0;unpin_calls=tex_writes=0;expected_view=VK_NULL_HANDLE;memset(&snapshot,0,sizeof snapshot);memset(&mock_tex,0,sizeof mock_tex);pool_missing=log_calls=0;log_line[0]=0;guest_extent=0;guest_extent_exact=0;g_indirect_trunc_n=0;memset(g_indirect_trunc,0,sizeof g_indirect_trunc);memset(&fixture,0,sizeof fixture);memset(&state,0,sizeof state);memset(&src,0,sizeof src);src.c1=c1_bytes;src.c1_bytes=sizeof c1_bytes;for(unsigned i=0;i<sizeof c1_bytes;i++)c1_bytes[i]=(uint8_t)(0x40+i);memset(guest,0x34,sizeof guest);fixture.stage.spirv=(uint8_t*)spv;fixture.stage.spirv_bytes=sizeof spv;fixture.binding_count=2;fixture.bindings[0]=(struct fd_binding){.set=0,.binding=3,.kind=0,.slot=3,.ubo_slot=0};fixture.bindings[1]=(struct fd_binding){.set=2,.binding=9,.kind=1,.slot=-1};fixture.storage[1]=(struct nvn_vk_compute_storage){.writable=1,.mapping=NVK_STORAGE_NVN,.index=7,.cb_slot=0,.cb_offset=0x380};state.stages=32;state.groups[0]=state.groups[1]=state.groups[2]=1;state.ubo_seen=1;state.ssbo_seen=1<<7;state.ubo[0].addr=0x1000;state.ubo[0].size=32;state.ssbo[7].addr=0x1100;state.ssbo[7].size=32;}
+static void reset(void){assert(live==0);accepted=(struct nvk_compute_lookup_result){.bytes=(uint8_t*)"x",.length=1,.profile={.storage_alignment=16}};step=0;fail_at=0;descriptors=0;reads=writes=write_fail=read_fail=unknown_type=low_limit=0;unpin_calls=tex_writes=0;expected_view=VK_NULL_HANDLE;memset(&snapshot,0,sizeof snapshot);memset(&mock_tex,0,sizeof mock_tex);pool_missing=log_calls=0;log_line[0]=0;guest_extent=0;guest_extent_exact=0;g_indirect_trunc_n=0;pipe_calls=plc_calls=0;g_cpso_gate=-1;memset(g_indirect_trunc,0,sizeof g_indirect_trunc);memset(&fixture,0,sizeof fixture);memset(&state,0,sizeof state);memset(&src,0,sizeof src);src.c1=c1_bytes;src.c1_bytes=sizeof c1_bytes;for(unsigned i=0;i<sizeof c1_bytes;i++)c1_bytes[i]=(uint8_t)(0x40+i);memset(guest,0x34,sizeof guest);fixture.stage.spirv=(uint8_t*)spv;fixture.stage.spirv_bytes=sizeof spv;fixture.binding_count=2;fixture.bindings[0]=(struct fd_binding){.set=0,.binding=3,.kind=0,.slot=3,.ubo_slot=0};fixture.bindings[1]=(struct fd_binding){.set=2,.binding=9,.kind=1,.slot=-1};fixture.storage[1]=(struct nvn_vk_compute_storage){.writable=1,.mapping=NVK_STORAGE_NVN,.index=7,.cb_slot=0,.cb_offset=0x380};state.stages=32;state.groups[0]=state.groups[1]=state.groups[2]=1;state.ubo_seen=1;state.ssbo_seen=1<<7;state.ubo[0].addr=0x1000;state.ubo[0].size=32;state.ssbo[7].addr=0x1100;state.ssbo[7].size=32;}
 static int build(struct s2a_record_dispatch_output*out){return nvn_vk_compute_pipeline_build(&device,&state,&memory,&snapshot,&src,&accepted,out,why,sizeof why);}
 
 #ifdef S2A_TEST_NO_POOL_FIND
 // 池查询缝缺席：这个构建故意不提供 strong s2a_vk_adapter_pool_find（weak 符号为 NULL），
 // 生产必须走 "pool lookup is unavailable" 的准确拒绝，不拿编造区间继续。
 static int seam_absent_main(void) {
+    (void)spv2;
     struct s2a_record_dispatch_output out;
     reset();
     fixture.storage[1].mapping = NVK_STORAGE_UBO_ADDRESS;
@@ -237,6 +242,45 @@ reset();fixture.bindings[0].slot=0;fixture.c0_read_count=1;fixture.c0_reads[0]=(
 reset();fixture.bindings[0].slot=0;fixture.c0_read_count=1;fixture.c0_reads[0]=(struct nvn_vk_c0_read){0x210,12};state.ubo[0].size=(uint64_t)UINT32_MAX+1;assert(build(&out)!=0&&step==0);cases++;
 
 reset();fixture.has_unaligned_storage_buffer=1;fixture.bindings[0].kind=1;fixture.storage[0]=(struct nvn_vk_compute_storage){.mapping=NVK_STORAGE_NVN,.index=6};state.ssbo_seen|=1<<6;state.ssbo[6].addr=4;state.ssbo[6].size=4;state.ssbo[7].addr=8;state.ssbo[7].size=4;assert(build(&out)!=0&&step==0&&strstr(why,"[0x0,0x8) [0x0,0xc)"));cases++;
+// ── compute PSO 缓存（debug.s2a.compute_pso_cache / 宿主 S2A_COMPUTE_PSO_CACHE，默认关）──
+// 门关基线：同一 shader 连续 3 次 dispatch = 3 次 vkCreateComputePipelines（修前行为）。
+reset();g_cpso_gate=0;
+uint64_t cn0;nvn_vk_compute_cpso_totals(&cn0,NULL);
+for(int i=0;i<3;i++){assert(build(&out)==0);assert(out.finish(&device,out.owner,-1)==0&&live==0);}
+assert(pipe_calls==3&&plc_calls==0);
+uint64_t cn1;nvn_vk_compute_cpso_totals(&cn1,NULL);assert(cn1-cn0==3);cases++;
+// 门开：同 shader 3 次 dispatch = 1 次创建；命中路径 finish/回写/-2 保活语义不变。
+reset();g_cpso_gate=1;
+assert(build(&out)==0);assert(pipe_calls==1&&plc_calls==1);VkPipeline p1=out.pipeline;
+assert(out.finish(&device,out.owner,-1)==0);
+assert(build(&out)==0);assert(pipe_calls==1&&out.pipeline==p1);o=out.owner;
+memset(o->buffers[1].mapped,0x77,32);assert(out.finish(&device,out.owner,0)==0&&writes==1&&guest[256]==0x77);
+assert(build(&out)==0);assert(pipe_calls==1);
+assert(out.finish(&device,out.owner,-2)==0);   // 完成未知→owner 保活→entry refs>1 不可逐出
+assert(out.finish(&device,out.owner,-1)==0);   // owner 引用归零→对象仍留表
+assert(live>0);
+nvn_vk_compute_pso_cache_release(&device);assert(live==0);cases++;
+// 负控 A：布局签名相同、SPIR-V 不同 → 不同键另建管线；换回同内容即命中。
+reset();g_cpso_gate=1;
+assert(build(&out)==0);assert(out.finish(&device,out.owner,-1)==0);assert(pipe_calls==1);VkPipeline q1=out.pipeline;
+fixture.stage.spirv=(uint8_t*)spv2;
+assert(build(&out)==0);assert(pipe_calls==2&&out.pipeline!=q1);assert(out.finish(&device,out.owner,-1)==0);
+fixture.stage.spirv=(uint8_t*)spv;
+assert(build(&out)==0);assert(pipe_calls==2&&out.pipeline==q1);assert(out.finish(&device,out.owner,-1)==0);
+nvn_vk_compute_pso_cache_release(&device);assert(live==0);cases++;
+// 负控 B：SPIR-V 相同、布局签名不同（binding 号变）→ 不同键另建管线。
+reset();g_cpso_gate=1;
+assert(build(&out)==0);assert(out.finish(&device,out.owner,-1)==0);assert(pipe_calls==1);VkPipeline r1=out.pipeline;
+fixture.bindings[0].binding=4;
+assert(build(&out)==0);assert(pipe_calls==2&&out.pipeline!=r1);assert(out.finish(&device,out.owner,-1)==0);
+nvn_vk_compute_pso_cache_release(&device);assert(live==0);cases++;
+// 有界 LRU + 在途引用：超表逐出 refs==1 最旧项；在途 owner 的 entry 不被逐出；全量释放归零。
+reset();g_cpso_gate=1;
+struct s2a_record_dispatch_output held;assert(build(&held)==0&&pipe_calls==1);
+for(int i=0;i<(int)CPSO_CAP+6;i++){spv[3]=(uint32_t)(0x1000+i);assert(build(&out)==0);assert(out.finish(&device,out.owner,-1)==0);assert(g_cpso_n<=CPSO_CAP);}
+assert(pipe_calls==CPSO_CAP+7&&g_cpso_n==CPSO_CAP);
+assert(held.finish(&device,held.owner,-1)==0);
+nvn_vk_compute_pso_cache_release(&device);assert(live==0);cases++;
 printf("compute pipeline host mock: %d scenarios, %d Vulkan failure points PASS\n",cases,max_step);return 0;
 #endif
 }

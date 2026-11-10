@@ -14,6 +14,7 @@
 #endif
 #include <stdio.h>
 #include <inttypes.h>
+#include <time.h>
 
 #define COMPUTE_MAX_BYTES (64u * 1024u * 1024u)
 /* 间接 storage 的两条宿主缝（来自 main 7afe4bfa1，合并时保留）：游戏写在 UBO 里的裸指针需要
@@ -55,6 +56,7 @@ static void indirect_trunc_diag(const struct s2a_record_dispatch_state *s,
 }
 // c1 常量段长度：图形侧同样按 0x100 字节绑定（nvn_vk_first_draw.c 的 c1 UBO）。
 #define NVK_COMPUTE_C1_BYTES 0x100u
+struct cpso;
 struct compute_buffer {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -70,6 +72,9 @@ struct compute_owner {
     VkPipeline pipeline;
     VkPipelineLayout layout;
     VkDescriptorSetLayout sets[4];
+    /* 非 NULL = 上面四个对象归 PSO 缓存表所有（owner 持引用，destroy 只减引用不销毁）。
+     * 空 = 按笔自有对象，destroy 逐个销毁（未缓存语义，与缓存前一致）。 */
+    struct cpso *pso;
     VkDescriptorPool pool;
     struct compute_buffer buffers[FD_MAX_BINDINGS];
     // 这次 dispatch 在消费点拿全的纹理快照（含已 pin 的对象/视图）。成功构建时由 owner 接管，
@@ -93,14 +98,186 @@ static VkDescriptorType binding_type(int kind) {
         default: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
 }
+/* ======== compute PSO 进程内缓存（debug.s2a.compute_pso_cache=1 才启用，默认关） ========
+ * 直连每笔 dispatch 都重建 shader module / set layouts / pipeline layout / pipeline，
+ * 驱动对每次 vkCreateComputePipelines 重跑后端编译（8E 实测 nx-* 单核 58% 在 libllvm-qgl
+ * + scudo 里）。键 = SPIR-V 字节 + 描述符布局签名（set/binding/kind 三元组序列）+ 特化
+ * 常量记号；命中比对是 hash 快筛 + 全字节 memcmp——hash 不当身份。当前 stage 没有
+ * pSpecializationInfo：将来给 stage 加 spec 常量必须并进这个键。
+ * descriptor pool/set 与影子缓冲仍按笔 owner 管理：它们带每笔 dispatch 的数据。
+ * 有界 LRU：表引用 + 在途 owner 引用计数（refs）。逐出只动 refs==1 的最旧项；满表且
+ * 全部在途 → 该笔不入表、按 owner 自有对象收尾（未缓存语义），不超界、不装死。
+ * 线程安全：表操作收在一把 test-and-set 自旋锁下；命中临界区是 hash+memcmp+句柄拷贝，
+ * miss 的驱动对象创建放在锁外——不拿锁等编译。并发 miss 同键：先插者胜，后插者保留
+ * 自己刚建的对象按笔收尾（内容等价，无正确性问题）。
+ * 设备生命周期：nvn_vk_compute_pso_cache_release 由 session 在 device_destroy 前调
+ * （幂等）；惰性守卫是 build 发现设备句柄变了先冲表再入表。
+ * 同一设备的 VkPipelineCache 只有一份（门开时懒建）：表内逐出的项，驱动 blob 仍可能复用。 */
+#define CPSO_CAP 64u
+struct cpso {
+    uint8_t *spv, *sig;
+    size_t spv_len, sig_len;
+    uint64_t h;
+    VkDevice dev;
+    VkShaderModule module;
+    VkDescriptorSetLayout sets[4];
+    uint32_t set_count;
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+    int refs;          /* 表引用 1 + 每个在途 owner 1；0 = 销毁 */
+    int in_table;
+    uint64_t tick;
+};
+static _Atomic int g_cpso_gate = -1;   // 宿主替身可直接复位（与 g_indirect_trunc_n 同缝口径）
+/* vkCreateComputePipelines 调用次数/耗时的进程累计（与缓存门无关：A/B 两边都如实计，
+ * 逐帧 TSV 的 cpso_n/cpso_us 差分取数；计时只发生在创建路径，命中路径零开销）。 */
+static _Atomic uint64_t g_cpso_creates, g_cpso_create_ns;
+void nvn_vk_compute_cpso_totals(uint64_t *creates, uint64_t *ns) {
+    if (creates) *creates = atomic_load(&g_cpso_creates);
+    if (ns) *ns = atomic_load(&g_cpso_create_ns);
+}
+static _Atomic int g_cpso_lock;
+static struct cpso g_cpso_tab[CPSO_CAP];
+static unsigned g_cpso_n;
+static uint64_t g_cpso_tick;
+static VkDevice g_cpso_dev;
+static VkPipelineCache g_cpso_pipe;
+static int cpso_on(void) {
+    int v = atomic_load(&g_cpso_gate);
+    if (v < 0) {
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {0};
+        v = __system_property_get("debug.s2a.compute_pso_cache", b) > 0 && b[0] == '1';
+#else
+        const char *e = getenv("S2A_COMPUTE_PSO_CACHE");
+        v = e && e[0] == '1';
+#endif
+        atomic_store(&g_cpso_gate, v);
+    }
+    return v;
+}
+static void cpso_lock(void) { while (atomic_exchange_explicit(&g_cpso_lock, 1, memory_order_acquire)) {} }
+static void cpso_unlock(void) { atomic_store_explicit(&g_cpso_lock, 0, memory_order_release); }
+static uint64_t cpso_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+static void cpso_objects_destroy(struct cpso *e) {
+    if (e->pipeline) vkDestroyPipeline(e->dev, e->pipeline, NULL);
+    if (e->layout) vkDestroyPipelineLayout(e->dev, e->layout, NULL);
+    for (uint32_t i = 0; i < e->set_count; ++i)
+        if (e->sets[i]) vkDestroyDescriptorSetLayout(e->dev, e->sets[i], NULL);
+    if (e->module) vkDestroyShaderModule(e->dev, e->module, NULL);
+    e->pipeline = VK_NULL_HANDLE; e->layout = VK_NULL_HANDLE; e->module = VK_NULL_HANDLE;
+    memset(e->sets, 0, sizeof e->sets);
+}
+/* 减一个引用（表/owner 通用），归零销毁对象并释放键副本。持锁调用。 */
+static void cpso_release_locked(struct cpso *e) {
+    if (--e->refs == 0) {
+        cpso_objects_destroy(e);
+        free(e->spv); free(e->sig);
+        e->spv = e->sig = NULL;
+    }
+}
+/* 命中：entry 持 owner 引用返回（refs 已 +1）；miss 返回 NULL。持锁调用。 */
+static struct cpso *cpso_lookup_locked(uint64_t h, const uint8_t *spv, size_t spv_len,
+                                       const uint8_t *sig, size_t sig_len) {
+    for (unsigned i = 0; i < CPSO_CAP; ++i) {
+        struct cpso *e = &g_cpso_tab[i];
+        if (!e->in_table || e->h != h || e->spv_len != spv_len || e->sig_len != sig_len) continue;
+        if (memcmp(e->spv, spv, spv_len) || memcmp(e->sig, sig, sig_len)) continue;
+        e->refs++; e->tick = ++g_cpso_tick;
+        return e;
+    }
+    return NULL;
+}
+static int cpso_slot_locked(void) {
+    for (unsigned i = 0; i < CPSO_CAP; ++i)
+        if (!g_cpso_tab[i].in_table && !g_cpso_tab[i].refs) return (int)i;
+    return -1;
+}
+/* 逐出 refs==1 的最旧项（无在途 dispatch 引用）。返回 0 = 腾出空位。持锁调用。 */
+static int cpso_evict_locked(void) {
+    struct cpso *v = NULL;
+    for (unsigned i = 0; i < CPSO_CAP; ++i) {
+        struct cpso *e = &g_cpso_tab[i];
+        if (e->in_table && e->refs == 1 && (!v || e->tick < v->tick)) v = e;
+    }
+    if (!v) return -1;
+    v->in_table = 0; g_cpso_n--;
+    cpso_release_locked(v);
+    return 0;
+}
+/* 入表：键副本 + 对象句柄进表，refs=2（表引用 + 本笔 owner 引用）。同键已在表 /
+ * 无空位且无可逐出项 / 内存失败 → NULL（调用方对象保持按笔自有）。持锁调用。 */
+static struct cpso *cpso_insert_locked(VkDevice dev, uint64_t h,
+    const uint8_t *spv, size_t spv_len, const uint8_t *sig, size_t sig_len,
+    VkShaderModule module, const VkDescriptorSetLayout *sets, uint32_t set_count,
+    VkPipelineLayout layout, VkPipeline pipeline) {
+    for (unsigned i = 0; i < CPSO_CAP; ++i) {
+        struct cpso *e = &g_cpso_tab[i];
+        if (e->in_table && e->h == h && e->spv_len == spv_len && e->sig_len == sig_len &&
+            !memcmp(e->spv, spv, spv_len) && !memcmp(e->sig, sig, sig_len)) return NULL;
+    }
+    int slot = cpso_slot_locked();
+    if (slot < 0 && (cpso_evict_locked() || (slot = cpso_slot_locked()) < 0)) return NULL;
+    struct cpso *e = &g_cpso_tab[slot];
+    e->spv = malloc(spv_len); e->sig = malloc(sig_len);
+    if (!e->spv || !e->sig) { free(e->spv); free(e->sig); e->spv = e->sig = NULL; return NULL; }
+    memcpy(e->spv, spv, spv_len); memcpy(e->sig, sig, sig_len);
+    e->spv_len = spv_len; e->sig_len = sig_len; e->h = h; e->dev = dev;
+    e->module = module; memcpy(e->sets, sets, set_count * sizeof e->sets[0]); e->set_count = set_count;
+    e->layout = layout; e->pipeline = pipeline;
+    e->refs = 2; e->in_table = 1; e->tick = ++g_cpso_tick; g_cpso_n++;
+    return e;
+}
+/* 设备句柄切换：整表冲掉 + pipeline cache 销毁（在途 owner 引用仍保活其对象）。
+ * 持锁调用；new_dev 作为下一笔入表的设备。 */
+static void cpso_flush_locked(VkDevice new_dev) {
+    for (unsigned i = 0; i < CPSO_CAP; ++i)
+        if (g_cpso_tab[i].in_table) {
+            g_cpso_tab[i].in_table = 0;
+            cpso_release_locked(&g_cpso_tab[i]);
+        }
+    g_cpso_n = 0;
+    if (g_cpso_pipe) {
+        vkDestroyPipelineCache(g_cpso_dev, g_cpso_pipe, NULL);
+        g_cpso_pipe = VK_NULL_HANDLE;
+    }
+    g_cpso_dev = new_dev;
+}
+/* session 在 device_destroy 前调（幂等）：释放该设备在表的全部对象与 pipeline cache。 */
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d) {
+    if (!d || !d->device) return;
+    cpso_lock();
+    for (unsigned i = 0; i < CPSO_CAP; ++i)
+        if (g_cpso_tab[i].in_table && g_cpso_tab[i].dev == d->device) {
+            g_cpso_tab[i].in_table = 0; g_cpso_n--;
+            cpso_release_locked(&g_cpso_tab[i]);
+        }
+    if (g_cpso_pipe && g_cpso_dev == d->device) {
+        vkDestroyPipelineCache(d->device, g_cpso_pipe, NULL);
+        g_cpso_pipe = VK_NULL_HANDLE;
+    }
+    if (g_cpso_dev == d->device) g_cpso_dev = VK_NULL_HANDLE;
+    cpso_unlock();
+}
 static void destroy(struct compute_owner *o) {
     if (!o) return;
-    if (o->pipeline) vkDestroyPipeline(o->device, o->pipeline, NULL);
+    if (o->pso) {
+        /* pipeline/layout/sets/module 归 PSO 缓存表：这里只减本笔 owner 引用。 */
+        cpso_lock();
+        cpso_release_locked(o->pso);
+        cpso_unlock();
+    } else {
+        if (o->pipeline) vkDestroyPipeline(o->device, o->pipeline, NULL);
+        if (o->layout) vkDestroyPipelineLayout(o->device, o->layout, NULL);
+        for (int i = 0; i < 4; ++i)
+            if (o->sets[i]) vkDestroyDescriptorSetLayout(o->device, o->sets[i], NULL);
+        if (o->module) vkDestroyShaderModule(o->device, o->module, NULL);
+    }
     if (o->pool) vkDestroyDescriptorPool(o->device, o->pool, NULL);
-    if (o->layout) vkDestroyPipelineLayout(o->device, o->layout, NULL);
-    for (int i = 0; i < 4; ++i)
-        if (o->sets[i]) vkDestroyDescriptorSetLayout(o->device, o->sets[i], NULL);
-    if (o->module) vkDestroyShaderModule(o->device, o->module, NULL);
     // 纹理保活只在命令完成/证明性的未提交之后解除；完成未知（-2）时 destroy 不会被调用。
     nvk_compute_texture_snapshot_release(&o->snapshot);
     for (int i = 0; i < o->count; ++i) {
@@ -556,6 +733,37 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
             failure = "compute guest buffer read failed"; goto bad;
         }
     }
+    /* PSO 缓存键在绑定过滤完成后取最终 p.bindings 算签名；门关则完全不算（零开销）。 */
+    uint8_t pso_sig[FD_MAX_BINDINGS * 12 + 4]; size_t pso_sig_len = 0;
+    uint64_t pso_h = 0; VkPipelineCache pso_plc = VK_NULL_HANDLE;
+    const int pso_cache = cpso_on();
+    if (pso_cache) {
+        for (int i = 0; i < p.binding_count; ++i) {
+            const uint32_t t[3] = { (uint32_t)p.bindings[i].set, (uint32_t)p.bindings[i].binding,
+                                    (uint32_t)p.bindings[i].kind };
+            memcpy(pso_sig + pso_sig_len, t, sizeof t); pso_sig_len += sizeof t;
+        }
+        pso_sig[pso_sig_len++] = 0;   // 特化常量记号位：当前无 spec；将来加 pSpecializationInfo 必须并进键
+        pso_h = cpso_hash(p.stage.spirv, p.stage.spirv_bytes)
+              ^ cpso_hash(pso_sig, pso_sig_len) * 0x9e3779b97f4a7c15ull;
+        cpso_lock();
+        if (g_cpso_dev != d->device) cpso_flush_locked(d->device);
+        if (!g_cpso_pipe) {
+            VkPipelineCacheCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+            if (vkCreatePipelineCache(d->device, &pc, NULL, &g_cpso_pipe) != VK_SUCCESS)
+                g_cpso_pipe = VK_NULL_HANDLE;   /* 驱动 blob 缓存建不起来不致命：本层表仍工作 */
+        }
+        pso_plc = g_cpso_pipe;
+        struct cpso *hit = cpso_lookup_locked(pso_h, p.stage.spirv, p.stage.spirv_bytes,
+                                              pso_sig, pso_sig_len);
+        if (hit) {
+            o->module = hit->module; o->layout = hit->layout; o->pipeline = hit->pipeline;
+            for (uint32_t i = 0; i < hit->set_count; ++i) o->sets[i] = hit->sets[i];
+            o->pso = hit;
+        }
+        cpso_unlock();
+    }
+    if (o->pipeline) goto pso_ready;
     VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = p.stage.spirv_bytes, .pCode = (const uint32_t *)p.stage.spirv };
     if (vkCreateShaderModule(d->device, &sm, NULL, &o->module) != VK_SUCCESS) goto bad;
@@ -576,7 +784,25 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
     VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = o->module, .pName = "main" }, .layout = o->layout };
-    if (vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, NULL, &o->pipeline) != VK_SUCCESS) goto bad;
+    {
+        /* 创建耗时如实累计：缓存开 → 每帧应降到 0；关 → 与修前一致（逐帧 TSV cpso_us 的数）。 */
+        struct timespec cpso_t0, cpso_t1;
+        clock_gettime(CLOCK_MONOTONIC, &cpso_t0);
+        VkResult pso_rc = vkCreateComputePipelines(d->device, pso_plc, 1, &ci, NULL, &o->pipeline);
+        clock_gettime(CLOCK_MONOTONIC, &cpso_t1);
+        atomic_fetch_add(&g_cpso_creates, 1);
+        atomic_fetch_add(&g_cpso_create_ns,
+            (uint64_t)(cpso_t1.tv_sec - cpso_t0.tv_sec) * 1000000000ull + (uint64_t)(cpso_t1.tv_nsec - cpso_t0.tv_nsec));
+        if (pso_rc != VK_SUCCESS) goto bad;
+    }
+    if (pso_cache) {
+        cpso_lock();
+        o->pso = cpso_insert_locked(d->device, pso_h, p.stage.spirv, p.stage.spirv_bytes,
+            pso_sig, pso_sig_len, o->module, o->sets, set_count, o->layout, o->pipeline);
+        cpso_unlock();
+        /* 入表失败（表满且在途/同键先至/内存失败）：o->pso 保持空，对象按笔自有收尾。 */
+    }
+pso_ready:
     if (set_count) {
         // 池按实际出现的四类描述符给额度；kind 2 是 COMBINED_IMAGE_SAMPLER（纹理+采样器成对）。
         VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0},
