@@ -404,7 +404,7 @@ def _exec_out_stream(d, cmd_args, dest, timeout=600):
     return nbytes, h.hexdigest(), rc, err
 
 
-def backup_data(d, pkg, dest):
+def backup_data(d, pkg, dest, left=None):
     """debuggable 原包的私有 / 外部数据 → exec-out tar 流式拉回 + 全量清单
     （文件 sha + 软链目标 + 目录含空目录 + 权限位）。通道按目录归属：私有树
     run-as（应用 uid），外部目录 shell（9000 实测 run-as 碰 /sdcard/Android/*
@@ -424,29 +424,48 @@ def backup_data(d, pkg, dest):
         # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给私有树 debuggable 包。
         # exec-out 会把设备 stderr 混进归档字节流（9000 实证 ext.tar 尾部带
         # "tar: … Permission denied / tar: had errors"，宿主 stderr 反而是空的）——
-        # stderr/rc 单独落设备侧本局凭据文件（run-as 树下 .s2a-tar-*，tar 用
-        # --exclude 排出自身），归档流只走 stdout；拉完读回再核删，rc≠0 或
-        # stderr 非白名单行 = 备份未证（不拿未证归档动设备）。
-        en, rn = ".s2a-tar-err", ".s2a-tar-rc"
-        q = shlex.quote(dir_)
-        cmd_ = (f"cd {q} && rm -f {en} {rn}; "
-                f"tar -cpf - --exclude=./{en} --exclude=./{rn} . 2> {en}; echo $? > {rn}")
-        args_ = (["run-as", pkg, "sh", "-c", cmd_] if _is_private_tree(pkg, dir_)
-                 else ["sh", "-c", cmd_])
-        nbytes, digest, rc, _err = _exec_out_stream(d, args_, tar, timeout=600)
+        # stderr/rc 落设备侧本局唯一凭据：/data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}
+        # （被备份树之外——树里放凭据会删到用户同名文件还得靠 tar --exclude 排除，
+        #   qa-fone #329620；/data/local/tmp 是 shell 域，预建 0666 让 run-as
+        #   应用 uid 也能 2>/> 写）。预建先证不存在，存在即停不覆盖；拉完读回
+        # 再核删；创建即登记待清——流传输异常/超时的任何路径都先核凭据删除
+        # （qa-fone #329632），删不净 = 备份未证且凭据登记保留 → 收局并入留置。
+        aux = f"/data/local/tmp/s2a-tar-{tag}-{uuid.uuid4().hex[:12]}"
+        en, rn = aux + "-err", aux + "-rc"
         try:
-            dev_rc = _owner_sh(d, pkg, dir_, f"cd {q} && cat {rn}", timeout=30).strip()
-            dev_err = _owner_sh(d, pkg, dir_, f"cd {q} && cat {en}", timeout=30)
-            _owner_sh(d, pkg, dir_,
-                      f"cd {q} && rm -f {en} {rn} && test ! -e {en} && test ! -e {rn}",
-                      timeout=30)
+            d.shell(f"[ ! -e {en} ] && [ ! -e {rn} ] && : > {en} && : > {rn} "
+                    f"&& chmod 0666 {en} {rn} && test -w {en} && test -w {rn}",
+                    timeout=30)
         except (RuntimeError, subprocess.SubprocessError) as error:
-            raise Refuse(f"{dir_} 备份 tar 的 rc/err 凭据读不回或删不净（{error}）：备份未证") \
-                from error
-        bad_err = [l for l in dev_err.splitlines() if l not in TAR_STDERR_OK]
-        if rc or dev_rc != "0" or not nbytes or bad_err:
-            raise Refuse(f"{dir_} 备份未证（exec-out rc={rc}，tar rc={dev_rc!r}，"
-                         f"stderr={bad_err[:3]!r}）：不拿未证的归档动这台设备")
+            raise Refuse(f"备份凭据 {aux}-* 预建失败或路径已存在（{error}）："
+                         f"不覆盖既有文件，不动这台设备") from error
+        if left is not None:
+            left.append((en, rn))
+        q = shlex.quote(dir_)
+        try:
+            cmd_ = f"cd {q} && tar -cpf - . 2> {en}; echo $? > {rn}"
+            args_ = (["run-as", pkg, "sh", "-c", cmd_] if _is_private_tree(pkg, dir_)
+                     else ["sh", "-c", cmd_])
+            nbytes, digest, rc, _err = _exec_out_stream(d, args_, tar, timeout=600)
+            try:
+                dev_rc = d.shell(f"cat {rn}", timeout=30).strip()
+                dev_err = d.shell(f"cat {en}", timeout=30)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                raise Refuse(f"{dir_} 备份 tar 的 rc/err 凭据读不回（{error}）：备份未证") \
+                    from error
+            bad_err = [l for l in dev_err.splitlines() if l not in TAR_STDERR_OK]
+            if rc or dev_rc != "0" or not nbytes or bad_err:
+                raise Refuse(f"{dir_} 备份未证（exec-out rc={rc}，tar rc={dev_rc!r}，"
+                             f"stderr={bad_err[:3]!r}）：不拿未证的归档动这台设备")
+        finally:
+            # 凭据核删：流传输/取证任何出口都走到；删不净登记保留 → 收局留置
+            try:
+                d.shell(f"rm -f {en} {rn} && test ! -e {en} && test ! -e {rn}",
+                        timeout=30)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                raise Refuse(f"{dir_} 备份 tar 凭据删不净（{error}）：备份未证") from error
+            if left is not None:
+                left.remove((en, rn))
         manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": digest,
                                  "entries": device_entries(d, pkg, dir_)}
         bad = _verify_tar(manifest, dest, tag)
@@ -1175,6 +1194,7 @@ def main(argv=None):
                 "lock": {"pid": os.getpid(), "dir": str(lock / args.serial)}}
     state0, orig_tmp, launched = None, None, False
     data_backup, backup_dir = None, None
+    backup_left, backup_started = [], False   # 备份凭据登记/中途失败标（qa-fone #329632）
     props_prev = {}
     ab_strict = set()              # --ab-prop 已读到原值、即将 / 已经 setprop 的键：恢复时一律只认 rc=0
     logcat_proc, log_file = None, None
@@ -1256,7 +1276,8 @@ def main(argv=None):
         # ---- debuggable 原包：run-as tar 全量备份私有/外部数据（装新包之前；任一目录失败即拒）----
         data_backup = None
         if state0["installed"] and state0["debuggable"] and not args.allow_data_loss:
-            data_backup = backup_data(d, pkg, backup_dir)
+            backup_started = True            # 备份没返回 = 还原链未证 → 收局必留置
+            data_backup = backup_data(d, pkg, backup_dir, left=backup_left)
             nfiles = sum(len(v["files"]) for v in data_backup["dirs"].values())
             manifest["data_backup"] = {"dir": str(backup_dir), "dirs": len(data_backup["dirs"]),
                                        "files": nfiles,
@@ -1661,6 +1682,11 @@ def main(argv=None):
             fails.append(f"检查点临时文件没删掉：{ck_tmp}"
                          f"（{manifest['checkpoint'].get('tmp_cleanup_error', '')}）——"
                          f"/data/local/tmp 有残留，设备状态未证")
+        for aux in backup_left:
+            fails.append(f"备份凭据 {aux} 残留没核删干净：/data/local/tmp 有本局改动，"
+                         f"设备状态未证")
+        if backup_started and data_backup is None:
+            fails.append("数据备份中途失败：还原链未证，不得正常放锁")
         if sampler:
             try:  # 中断路径同样收采样守护：杀循环 → 拉回设备上已落的行 → 清理文件
                 for row, level in stop_power_sampler(d, sampler[0], sampler[1]):
