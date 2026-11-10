@@ -73,7 +73,7 @@ s2a_gate_step bash "$android_dir/tools/nvn_vk_readback_plan_test.sh"
 # 的两次 draw 各看各的版本；子资源状态、读回不写回 guest、账本不可用时 fail-closed、1 MiB 保护块不是写粒度。
 # （nvn_vk_texcache_content_test.sh 要 lavapipe，挪到 android/linux_ctest.sh 末段在 Linux 跑，11-06）
 # 反馈采样快照的子资源拷贝（真 Vulkan / lavapipe）：3D 深度切片（含 mip≠0）、2D 数组层、
-# pass/快照交集；旧实现把 3D 切片当 array layer 选 → 越界/读错片。
+# pass/快照交集、多级×多层同构快照逐子资源拷贝；旧实现把 3D 切片当 array layer 选 → 越界/读错片。
 # （nvn_vk_feedback_snapshot_test.sh 要 lavapipe，挪到 android/linux_ctest.sh 末段在 Linux 跑，11-06）
 # 压缩纹理作为渲染目标（块=像素影子）的字节往返（真 Vulkan / lavapipe）：BC4 3D 深度切片、
 # 2D 数组 mip/层、影子直写；Vulkan 不能把压缩格式当颜色附件，也不能建压缩↔无压缩视图。

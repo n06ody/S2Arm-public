@@ -388,16 +388,16 @@ static void test_feedback_bind_plan(void) {
     b.fb_level = 0; b.fb_layer = 0; b.tex_levels = 1; b.tex_layers = 1; b.tex_depth = 1;
     CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_SUBSTITUTE,
           "single-layer 2D default view substitutes the snapshot");
-    // 3D 默认视图：单层 2D 快照表达不了（sampler3D 类型不匹配）→ 保持原绑定。
+    // 3D 默认视图：单层 2D 快照表达不了（sampler3D 类型不匹配）→ 同构 3D 快照。
     memset(&b, 0, sizeof b);
     b.fb_is_3d = 1; b.fb_level = 1; b.fb_layer = 2; b.tex_levels = 4; b.tex_layers = 1; b.tex_depth = 4;
-    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
-          "3D default view is left as is");
-    // 多层 2D 数组默认视图：同理（换错其它层）。
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "3D default view takes the isomorphic snapshot");
+    // 多层 2D 数组默认视图：同理（单层快照会换错其它层）→ 同构快照。
     memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
     b.tex_levels = 1; b.tex_layers = 12; b.tex_depth = 1;
-    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
-          "multi-layer default view is left as is");
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "multi-layer default view takes the isomorphic snapshot");
     // 注册视图恰好是附件那个子资源（2D 单级单层）→ 换快照（0100F2C0115B6000 的 3D 切片采样形态）。
     memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
     b.view_override = 1; b.view_ok = 1; b.override_ok = 1;
@@ -413,17 +413,193 @@ static void test_feedback_bind_plan(void) {
     b.fb_layer = 1; b.fb_level = 3;
     CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_NONE,
           "other mip level is not feedback");
-    // 视图表达不了 / 带格式重写 → 保持原绑定（记原因，不静默换）。
+    // 视图表达不了 / 带格式重写 → 保持原绑定（记原因，不静默换）。覆盖附件的多级注册视图
+    // 走同构快照（同 bind_plan_iso 用例）；不含附件子资源的才算“非本资源反馈”。
     memset(why, 0, sizeof why);
     b.fb_level = 2; b.view_nlevels = 2;
-    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
-          "multi-level sampled view is left as is");
-    CHECK_STR(why, "single-level single-layer 2D", "multi-level view reason");
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "multi-level view covering the attachment takes iso");
     memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
     b.view_override = 1; b.view_ok = 1; b.override_ok = 0;
     b.view_type = VK_IMAGE_VIEW_TYPE_2D; b.view_nlevels = 1; b.view_nlayers = 1;
     CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
           "format/swizzle override is left as is");
+}
+
+// 同构快照（ISO）：默认整幅视图落在多级/多层/3D 底图上的自采样——Wonder 8E 的
+// serial=5386（128x128 R11G11B10F、12 层 2-cubemap、全 mip 链逐级自采样）实测形态。
+// 修前多层默认视图 LEAVE 活绑定直通 → Adreno 同图读写 tile 杂斑烧进环境贴图。
+static void test_feedback_bind_plan_iso(void) {
+    struct nvn_vk_feedback_bind b;
+    char why[224];
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    // 默认视图 + 12 层多级底图（serial=5386 形态）：整幅视图覆盖 8 级 × 12 层，
+    // 单层 2D 快照表达不了 → 同构快照。
+    b.fb_level = 1; b.fb_layer = 7; b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "multi-layer default view takes the isomorphic snapshot");
+    // 默认视图 + 单层多级底图（泛光 mip 链）：采样整幅视图读的是前级，单层快照只含附件级
+    // → 同构快照（修前 SUBSTITUTE 绑的是只有附件一级的快照，mip>0 采样钳到错级）。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.fb_level = 2; b.fb_layer = 0; b.tex_levels = 5; b.tex_layers = 1; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "multi-level default view takes the isomorphic snapshot");
+    // 默认视图 + 3D 底图：单层 2D 快照对 sampler3D 类型不符 → 同构 3D 快照。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.fb_is_3d = 1; b.fb_level = 1; b.fb_layer = 2; b.tex_levels = 2; b.tex_layers = 1; b.tex_depth = 4;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "3D default view takes the isomorphic snapshot");
+    // 负控①：默认视图 + 单级单层底图 → 仍走单层 2D 快照（同构快照不抢单子资源的活）。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.fb_level = 0; b.fb_layer = 0; b.tex_levels = 1; b.tex_layers = 1; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_SUBSTITUTE,
+          "single-subresource default view still substitutes");
+    // 负控②：注册视图只覆盖同图其它子资源（附件 level 3、采样视图只含 level 0-1）
+    // → 不是本子资源的反馈，NONE（修前按“多子资源视图”一律 LEAVE）。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.view_override = 1; b.view_ok = 1; b.override_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D; b.view_base_level = 0; b.view_nlevels = 2;
+    b.view_base_layer = 0; b.view_nlayers = 1;
+    b.fb_level = 3; b.fb_layer = 0; b.tex_levels = 5; b.tex_layers = 1; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_NONE,
+          "view covering only earlier mips is not feedback");
+    // 注册视图多层且包含附件子资源 → 同构快照也能代表（ISO，带注册视图形状）。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.view_override = 1; b.view_ok = 1; b.override_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; b.view_base_level = 0; b.view_nlevels = 1;
+    b.view_base_layer = 0; b.view_nlayers = 6;
+    b.fb_level = 0; b.fb_layer = 3; b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_ISO,
+          "multi-layer registered view containing the attachment takes iso");
+    // 但建不出视图 / 带格式重写的注册视图仍只能保持原绑定（快照表达不了重写）。
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.view_override = 1; b.view_ok = 0; b.override_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; b.view_nlevels = 1; b.view_nlayers = 6;
+    b.fb_level = 0; b.fb_layer = 3; b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
+          "uncreatable registered view is left as is");
+    memset(&b, 0, sizeof b); memset(why, 0, sizeof why);
+    b.view_override = 1; b.view_ok = 1; b.override_ok = 0;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; b.view_nlevels = 1; b.view_nlayers = 6;
+    b.fb_level = 0; b.fb_layer = 3; b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_bind_plan(&b, why, sizeof why) == NVN_VK_FB_BIND_LEAVE,
+          "format-override registered view is left as is");
+}
+
+// 负控粒度：no_fb_iso=1 时「多子资源视图不建快照纯直通」。与 bind_plan 的 ISO 判定同族
+// （差别：不看附件覆盖关系——快照创建时附件 mip/层还没定）。覆盖=0 的视图直通无碍
+// （本来就不是反馈），单子资源视图照旧单层快照。
+static void test_feedback_view_multi(void) {
+    struct nvn_vk_feedback_bind b;
+    memset(&b, 0, sizeof b);
+    CHECK(nvn_vk_feedback_view_multi(NULL) == 0, "null input is not multi");
+    // 默认视图：单级单层 2D → 0（no_fb_iso 下仍走单层快照）。
+    b.tex_levels = 1; b.tex_layers = 1; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 0, "single-subresource default view is not multi");
+    // 默认视图 + 12 层多级底图（serial=5386/5385 形态）→ 1 = 纯直通不建快照。
+    memset(&b, 0, sizeof b);
+    b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "multi-layer default view is multi (passthrough)");
+    // 默认视图 + 单层多级底图 → 1。
+    memset(&b, 0, sizeof b);
+    b.tex_levels = 5; b.tex_layers = 1; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "multi-level default view is multi");
+    // 默认视图 + 3D 底图 → 1；depth>1 的 2D-array-like 也 → 1。
+    memset(&b, 0, sizeof b);
+    b.fb_is_3d = 1; b.tex_levels = 2; b.tex_layers = 1; b.tex_depth = 4;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "3D default view is multi");
+    memset(&b, 0, sizeof b);
+    b.tex_levels = 1; b.tex_layers = 1; b.tex_depth = 8;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "depth>1 default view is multi");
+    // 注册视图恰好单子资源（mip 链逐级的单层视图形态——serial=5385 的 32 笔）→ 0 照旧快照。
+    memset(&b, 0, sizeof b);
+    b.view_override = 1; b.view_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D; b.view_nlevels = 1; b.view_nlayers = 1;
+    b.tex_levels = 8; b.tex_layers = 12; b.tex_depth = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 0,
+          "single-subresource registered view keeps the snapshot path");
+    // 注册视图多级/多层/非 2D → 1 纯直通。
+    b.view_nlevels = 2;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "multi-level registered view is multi");
+    memset(&b, 0, sizeof b);
+    b.view_override = 1; b.view_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; b.view_nlevels = 1; b.view_nlayers = 6;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "multi-layer registered view is multi");
+    memset(&b, 0, sizeof b);
+    b.view_override = 1; b.view_ok = 1;
+    b.view_type = VK_IMAGE_VIEW_TYPE_3D; b.view_nlevels = 1; b.view_nlayers = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "3D registered view is multi");
+    // 注册视图建不出 → 按多算（快照替不了，直通与旧 LEAVE 同结果）。
+    memset(&b, 0, sizeof b);
+    b.view_override = 1; b.view_ok = 0;
+    b.view_type = VK_IMAGE_VIEW_TYPE_2D; b.view_nlevels = 1; b.view_nlayers = 1;
+    CHECK(nvn_vk_feedback_view_multi(&b) == 1, "uncreatable registered view is multi");
+}
+
+// 同构快照计划与逐子资源拷贝区域（纯逻辑）。
+static void test_feedback_iso(void) {
+    struct nvn_vk_feedback_iso iso;
+    char why[224];
+    memset(&iso, 0, sizeof iso); memset(why, 0, sizeof why);
+    // serial=5386 形态：128x128 R11G11B10F（4B/px）、8 级 × 12 层。
+    CHECK(nvn_vk_feedback_iso_plan(0, 128, 128, 1, 8, 12, 4, 64ull << 20,
+                                   &iso, why, sizeof why) == 0,
+          "128x128x12x8L iso plan accepted");
+    CHECK(!iso.is_3d && iso.w == 128 && iso.h == 128 && iso.depth == 1,
+          "iso keeps the level-0 extent");
+    CHECK(iso.levels == 8 && iso.layers == 12 && iso.n_copies == 96,
+          "iso copies every level x layer (96)");
+    // est_bytes = Σ mip_extent(128,l)^2 × 12 × 4 = 21845 × 48 = 1048560。
+    CHECK(iso.est_bytes == 1048560, "iso est_bytes matches the mip-sum");
+    VkImageCopy c;
+    memset(&c, 0, sizeof c);
+    CHECK(nvn_vk_feedback_iso_copy(&iso, 0, &c, why, sizeof why) == 0, "iso copy 0 accepted");
+    CHECK(c.srcSubresource.mipLevel == 0 && c.srcSubresource.baseArrayLayer == 0 &&
+          c.srcSubresource.layerCount == 1 && c.extent.width == 128 &&
+          c.extent.height == 128 && c.extent.depth == 1 &&
+          c.dstSubresource.mipLevel == 0 && c.dstSubresource.baseArrayLayer == 0,
+          "copy 0 = level0 layer0 full extent");
+    memset(&c, 0, sizeof c);
+    CHECK(nvn_vk_feedback_iso_copy(&iso, 12, &c, why, sizeof why) == 0, "iso copy 12 accepted");
+    CHECK(c.srcSubresource.mipLevel == 1 && c.srcSubresource.baseArrayLayer == 0 &&
+          c.extent.width == 64 && c.extent.height == 64 &&
+          c.dstSubresource.mipLevel == 1,
+          "copy 12 = level1 layer0 half extent");
+    memset(&c, 0, sizeof c);
+    CHECK(nvn_vk_feedback_iso_copy(&iso, 95, &c, why, sizeof why) == 0, "iso copy 95 accepted");
+    CHECK(c.srcSubresource.mipLevel == 7 && c.srcSubresource.baseArrayLayer == 11 &&
+          c.extent.width == 1 && c.extent.height == 1,
+          "copy 95 = level7 layer11 1x1");
+    memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_copy(&iso, 96, &c, why, sizeof why) != 0,
+          "copy index past n_copies refused");
+    // 3D：每级一份拷贝、深度进 extent.depth（Vulkan 3D 子资源 layerCount 恒 1）。
+    memset(&iso, 0, sizeof iso); memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_plan(1, 32, 32, 4, 2, 1, 4, 64ull << 20,
+                                   &iso, why, sizeof why) == 0, "3D iso plan accepted");
+    CHECK(iso.is_3d && iso.n_copies == 2 && iso.layers == 1 && iso.depth == 4,
+          "3D iso: one copy per level");
+    memset(&c, 0, sizeof c);
+    CHECK(nvn_vk_feedback_iso_copy(&iso, 1, &c, why, sizeof why) == 0, "3D copy level1 accepted");
+    CHECK(c.srcSubresource.mipLevel == 1 && c.srcSubresource.baseArrayLayer == 0 &&
+          c.extent.width == 16 && c.extent.height == 16 && c.extent.depth == 2 &&
+          c.srcOffset.z == 0 && c.dstOffset.z == 0,
+          "3D copy level1 covers mip depth");
+    // 上限：cap 低于 est_bytes 必须拒绝（与苹果 ④ 的“视图太大不拷”同思路）。
+    memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_plan(0, 128, 128, 1, 8, 12, 4, 1024,
+                                   &iso, why, sizeof why) != 0,
+          "iso plan over the byte cap refused");
+    // 参数不全必须拒绝。
+    memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_plan(0, 128, 128, 1, 8, 0, 4, 64ull << 20,
+                                   &iso, why, sizeof why) != 0, "zero layers refused");
+    memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_plan(0, 128, 128, 1, 0, 12, 4, 64ull << 20,
+                                   &iso, why, sizeof why) != 0, "zero levels refused");
+    memset(why, 0, sizeof why);
+    CHECK(nvn_vk_feedback_iso_plan(0, 128, 128, 1, 8, 12, 0, 64ull << 20,
+                                   &iso, why, sizeof why) != 0, "zero bpp refused");
 }
 
 // 块编码渲染目标（压缩底图经“块=像素”的无压缩视图）：计划与往返拷贝区域。
@@ -578,6 +754,9 @@ int main(void) {
     test_feedback_src_plan();
     test_feedback_copy_make();
     test_feedback_bind_plan();
+    test_feedback_bind_plan_iso();
+    test_feedback_view_multi();
+    test_feedback_iso();
     test_bcrt_plan();
     test_bcrt_copy_regions();
     test_driver_c0();

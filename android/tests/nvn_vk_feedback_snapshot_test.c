@@ -12,6 +12,7 @@
 //   ② 3D + mip≠0：level=1、切 1，必须读到 mip1 的第 1 片。
 //   ③ 2D 数组层：layer=2，必须读到第 2 层。
 //   ④ 交集：pass 小于快照，只拷左上交集，其余保持原色（不是整幅覆盖）。
+//   ⑤ 同构快照：多级×多层 2D 数组，nvn_vk_feedback_iso_copy 逐子资源拷贝，逐子资源读回比对。
 // 打桩：只建 device/queue/命令池；不建 session、不链帧队列（与内容用例同一口径）。
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,15 +166,17 @@ static int copy_snapshot(VkImage src, VkImage snap, const struct nvn_vk_feedback
     return ok;
 }
 
-static int read_pixels(VkImage snap, uint8_t *out) {
-    const VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
+// 读 (level, layer) 子资源整幅（w×h 是该级实际尺寸）。
+static int read_pixels_sub(VkImage snap, uint32_t level, uint32_t layer,
+                           uint32_t w, uint32_t h, uint8_t *out) {
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
     VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; void *map = NULL;
     if (make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf, &mem, &map)) return -1;
     VkCommandBuffer cmd = begin_cb();
     if (!cmd) return -1;
     VkBufferImageCopy bc = {0};
-    bc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    bc.imageExtent = (VkExtent3D){ W, H, 1 };
+    bc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+    bc.imageExtent = (VkExtent3D){ w, h, 1 };
     vkCmdCopyImageToBuffer(cmd, snap, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &bc);
     VkBufferMemoryBarrier bb = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
     bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -187,6 +190,10 @@ static int read_pixels(VkImage snap, uint8_t *out) {
     vkDestroyBuffer(D.device, buf, NULL);
     vkFreeMemory(D.device, mem, NULL);
     return rc;
+}
+
+static int read_pixels(VkImage snap, uint8_t *out) {
+    return read_pixels_sub(snap, 0, 0, W, H, out);
 }
 
 static int expect_px(const uint8_t *px, uint32_t w, uint32_t x, uint32_t y, rgba want, const char *what) {
@@ -336,9 +343,87 @@ int main(void) {
         if (sm) vkFreeMemory(D.device, sm, NULL);
     }
 
+    // ===== ⑤ 同构快照：32x32 三级 × 三层 2D 数组，逐子资源异色 → 逐子资源拷贝 → 逐子资源读回 =====
+    // 多层/多级默认视图自采样的快照形态（8E 上 serial=5386 型缺陷的覆盖用例）：
+    // 修前 bind_plan LEAVE 活绑定；修后 ISO 走整图同构拷贝——本用例按字节证明拷贝区域全对。
+    {
+        const uint32_t il = 3, ic = 3;   // levels × layers
+        VkImage src = VK_NULL_HANDLE, snap = VK_NULL_HANDLE;
+        VkDeviceMemory sm = VK_NULL_HANDLE, mm = VK_NULL_HANDLE;
+        CK(make_image(VK_IMAGE_TYPE_2D, W, H, 1, il, ic,
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      &src, &sm) == 0, "⑤ 建多级多层源图失败");
+        CK(make_image(VK_IMAGE_TYPE_2D, W, H, 1, il, ic,
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      &snap, &mm) == 0, "⑤ 建同构快照失败");
+        if (src && snap) {
+            VkCommandBuffer cmd = begin_cb();
+            barrier(cmd, src, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    0, VK_REMAINING_MIP_LEVELS, ic);
+            barrier(cmd, snap, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                    0, VK_REMAINING_MIP_LEVELS, ic);
+            CK(vkEndCommandBuffer(cmd) == VK_SUCCESS && run_cb(cmd) == 0, "⑤ 初始屏障失败");
+            vkFreeCommandBuffers(D.device, D.command_pool, 1, &cmd);
+            clear_img(snap, BLACK);
+            // 每个 (level, layer) 一个可区分颜色。
+            const rgba cs[3] = { RED, GREEN, BLUE };
+            for (uint32_t l = 0; l < il; l++) {
+                const uint32_t mw = W >> l, mh = H >> l;
+                for (uint32_t a = 0; a < ic; a++) {
+                    rgba c = cs[(l + a) % 3];
+                    c.a = (uint8_t)(16 + l * 32 + a);   // alpha 里编码 (level,layer)，查错一目了然
+                    CK(fill_slice(src, 0, l, mw, mh, a, c) == 0, "⑤ 填 l%u a%u 失败", l, a);
+                }
+            }
+            // 生产 iso 计划 + 逐份拷贝（与 first_draw 的 precopy 循环同口径）。
+            struct nvn_vk_feedback_iso iso; memset(&iso, 0, sizeof iso);
+            char cwhy[192] = "";
+            CK(nvn_vk_feedback_iso_plan(0, W, H, 1, il, ic, 4, 64ull << 20,
+                                        &iso, cwhy, sizeof cwhy) == 0, "⑤ iso 计划失败：%s", cwhy);
+            CK(iso.n_copies == il * ic, "⑤ iso 份数应 = 级数×层数");
+            cmd = begin_cb();
+            for (uint32_t n = 0; cmd && n < iso.n_copies; n++) {
+                VkImageCopy rc = {0};
+                CK(nvn_vk_feedback_iso_copy(&iso, n, &rc, cwhy, sizeof cwhy) == 0,
+                   "⑤ iso 拷贝 %u 出区失败：%s", n, cwhy);
+                vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, snap, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
+            }
+            if (cmd) {
+                CK(vkEndCommandBuffer(cmd) == VK_SUCCESS && run_cb(cmd) == 0, "⑤ 同构拷贝执行失败");
+                vkFreeCommandBuffers(D.device, D.command_pool, 1, &cmd);
+            }
+            // 逐子资源读回验证：快照的每个 (level,layer) 必须与源同色。
+            uint8_t *sub = malloc((size_t)W * H * 4);
+            CK(sub != NULL, "⑤ 读回缓冲分配失败");
+            if (sub) {
+                for (uint32_t l = 0; l < il; l++) {
+                    const uint32_t mw = W >> l, mh = H >> l;
+                    for (uint32_t a = 0; a < ic; a++) {
+                        rgba want = cs[(l + a) % 3];
+                        want.a = (uint8_t)(16 + l * 32 + a);
+                        memset(sub, 0, (size_t)W * H * 4);
+                        CK(read_pixels_sub(snap, l, a, mw, mh, sub) == 0,
+                           "⑤ 读回 l%u a%u 失败", l, a);
+                        char what[64];
+                        snprintf(what, sizeof what, "⑤l%ua%u", l, a);
+                        CK(expect_px(sub, mw, 0, 0, want, what) == 0,
+                           "⑤ 快照 l%u a%u 内容必须是源子资源颜色", l, a);
+                        CK(expect_px(sub, mw, mw - 1, mh - 1, want, what) == 0,
+                           "⑤ 快照 l%u a%u 右下也必须是源子资源颜色", l, a);
+                    }
+                }
+                free(sub);
+            }
+        }
+        if (snap) vkDestroyImage(D.device, snap, NULL);
+        if (src) vkDestroyImage(D.device, src, NULL);
+        if (mm) vkFreeMemory(D.device, mm, NULL);
+        if (sm) vkFreeMemory(D.device, sm, NULL);
+    }
+
     free(px);
     s2a_vk_device_destroy(&D, 1);
     if (fails) { printf("✗ nvn_vk_feedback_snapshot: %d 处不符\n", fails); return 1; }
-    printf("✓ nvn_vk_feedback_snapshot: 3D 切片 / 3D+mip / 2D 数组层 / 交集 全部通过（真 Vulkan）\n");
+    printf("✓ nvn_vk_feedback_snapshot: 3D 切片 / 3D+mip / 2D 数组层 / 交集 / 同构快照 全部通过（真 Vulkan）\n");
     return 0;
 }

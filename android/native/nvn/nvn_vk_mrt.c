@@ -376,23 +376,16 @@ int nvn_vk_feedback_copy_make(const struct nvn_vk_feedback_src *src, uint32_t pa
     return 0;
 }
 
-// 采样绑定替换判定。返回 NONE（不是本子资源的反馈：不替换、不报）、SUBSTITUTE（换快照视图）、
-// LEAVE（是反馈但单层 2D 快照表达不了：保持原绑定，调用方记一次原因，不静默假装成功）。
+// 采样绑定替换判定。返回 NONE（不是本子资源的反馈：不替换、不报）、SUBSTITUTE（换单层快照）、
+// ISO（换同构快照的等形视图：默认视图落在多级/多层/3D 底图，或注册视图覆盖多个子资源）、
+// LEAVE（是反馈但快照路表达不了：保持原绑定，调用方记一次原因，不静默假装成功）。
 int nvn_vk_feedback_bind_plan(const struct nvn_vk_feedback_bind *in, char *why, size_t why_size) {
     if (!in) return NVN_VK_FB_BIND_NONE;
     if (!in->view_override) {
-        // 默认整幅视图：单层 2D 图才能用单层 2D 快照代表。3D 默认视图是 3D 视图（快照是 2D，
-        // 换成它会让 sampler3D 类型不匹配）；多层默认视图会连“其它层”的采样一起换错。
-        if (in->fb_is_3d || in->tex_depth > 1) {
-            fail_why(why, why_size, "feedback snapshot: the sampled default view is a 3D view; a single-layer 2D snapshot cannot represent it");
-            return NVN_VK_FB_BIND_LEAVE;
-        }
-        if (in->tex_layers > 1) {
-            char msg[192];
-            snprintf(msg, sizeof msg, "feedback snapshot: the sampled default view covers %u layers; a single-layer 2D snapshot cannot represent it", in->tex_layers);
-            fail_why(why, why_size, msg);
-            return NVN_VK_FB_BIND_LEAVE;
-        }
+        // 默认整幅视图覆盖底图全部子资源。单层 2D 快照只能代表“单级单层 2D 底图”；
+        // 多级/多层/3D 走同构快照（换一张同形图 + 等形视图，不是换错视图形状）。
+        if (in->fb_is_3d || in->tex_depth > 1 || in->tex_layers > 1 || in->tex_levels > 1)
+            return NVN_VK_FB_BIND_ISO;
         return NVN_VK_FB_BIND_SUBSTITUTE;
     }
     if (!in->view_ok) {
@@ -403,17 +396,85 @@ int nvn_vk_feedback_bind_plan(const struct nvn_vk_feedback_bind *in, char *why, 
         fail_why(why, why_size, "feedback snapshot: the sampled view has a format/swizzle/depth-stencil override; the snapshot default view does not express it");
         return NVN_VK_FB_BIND_LEAVE;
     }
-    if (in->view_type != VK_IMAGE_VIEW_TYPE_2D || in->view_nlevels != 1 || in->view_nlayers != 1) {
-        char msg[224];
-        snprintf(msg, sizeof msg, "feedback snapshot: the sampled view is type %u levels %u layers %u; only a single-level single-layer 2D view can bind the snapshot directly",
-                 in->view_type, in->view_nlevels, in->view_nlayers);
-        fail_why(why, why_size, msg);
-        return NVN_VK_FB_BIND_LEAVE;
+    // 采样视图不含附件那个子资源（只读更早的 mip / 其它层/切片）：不是本子资源的反馈，
+    // 合法，保持原绑定也不报。3D 视图类型覆盖全部深度切片；2D 类视图（含 3D 底图上的
+    // 单切片形态）按层号范围查。
+    const int covers_level = in->view_base_level <= in->fb_level &&
+                             in->fb_level < in->view_base_level + in->view_nlevels;
+    const int covers_layer = in->view_type == VK_IMAGE_VIEW_TYPE_3D ||
+                             (in->view_base_layer <= in->fb_layer &&
+                              in->fb_layer < in->view_base_layer + in->view_nlayers);
+    if (!covers_level || !covers_layer) return NVN_VK_FB_BIND_NONE;
+    // 视图恰好是附件那一个子资源：单层 2D 快照就能代表。
+    if (in->view_type == VK_IMAGE_VIEW_TYPE_2D && in->view_nlevels == 1 && in->view_nlayers == 1)
+        return NVN_VK_FB_BIND_SUBSTITUTE;
+    // 覆盖更多子资源（多级/多层/非 2D 形）：同构快照按同一视图参数等形替换。
+    return NVN_VK_FB_BIND_ISO;
+}
+
+int nvn_vk_feedback_view_multi(const struct nvn_vk_feedback_bind *in) {
+    if (!in) return 0;
+    if (!in->view_override)
+        return in->fb_is_3d || in->tex_depth > 1 || in->tex_layers > 1 || in->tex_levels > 1;
+    // 注册视图：建不出或覆盖非单子资源都按多算——快照替不了它，直通与旧 LEAVE 同结果。
+    if (!in->view_ok) return 1;
+    return !(in->view_type == VK_IMAGE_VIEW_TYPE_2D && in->view_nlevels == 1 && in->view_nlayers == 1);
+}
+
+static uint32_t iso_mip_extent(uint32_t v, uint32_t level) {
+    uint32_t e = v >> level;
+    return e ? e : 1;
+}
+
+int nvn_vk_feedback_iso_plan(uint32_t is_3d, uint32_t w, uint32_t h, uint32_t depth,
+                             uint32_t levels, uint32_t layers, uint32_t bytes_per_texel,
+                             uint64_t cap_bytes,
+                             struct nvn_vk_feedback_iso *out, char *why, size_t why_size) {
+    if (!out || !w || !h || !levels || !bytes_per_texel || (!is_3d && !layers) || (is_3d && !depth)) {
+        fail_why(why, why_size, "iso snapshot plan: incomplete shape");
+        return -1;
     }
-    // 采样视图选的是同图另一个 mip/层/切片：不是本子资源的反馈，合法，不替换也不报。
-    if (in->view_base_level != in->fb_level) return NVN_VK_FB_BIND_NONE;
-    if (in->view_base_layer != in->fb_layer) return NVN_VK_FB_BIND_NONE;
-    return NVN_VK_FB_BIND_SUBSTITUTE;
+    memset(out, 0, sizeof *out);
+    out->is_3d = (uint8_t)(is_3d ? 1 : 0);
+    out->w = w; out->h = h; out->depth = is_3d ? depth : 1;
+    out->levels = levels; out->layers = is_3d ? 1 : layers;
+    uint64_t bytes = 0;
+    for (uint32_t l = 0; l < levels; l++) {
+        uint64_t a = (uint64_t)iso_mip_extent(w, l) * iso_mip_extent(h, l) *
+                     (is_3d ? iso_mip_extent(depth, l) : 1);
+        bytes += a * out->layers * bytes_per_texel;
+    }
+    out->est_bytes = bytes;
+    out->n_copies = levels * (is_3d ? 1 : layers);
+    if (cap_bytes && bytes > cap_bytes) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "feedback iso snapshot: sampled view is too large to copy whole (%.1f MB > %.1f MB)",
+                 (double)bytes / 1048576.0, (double)cap_bytes / 1048576.0);
+        fail_why(why, why_size, msg);
+        return -1;
+    }
+    return 0;
+}
+
+int nvn_vk_feedback_iso_copy(const struct nvn_vk_feedback_iso *iso, uint32_t n,
+                             VkImageCopy *out, char *why, size_t why_size) {
+    if (!iso || !out || n >= iso->n_copies) {
+        fail_why(why, why_size, "iso snapshot copy: bad index");
+        return -1;
+    }
+    memset(out, 0, sizeof *out);
+    const uint32_t level = iso->is_3d ? n : n / (iso->layers ? iso->layers : 1);
+    const uint32_t layer = iso->is_3d ? 0 : n % (iso->layers ? iso->layers : 1);
+    if (level >= iso->levels) {
+        fail_why(why, why_size, "iso snapshot copy: level out of range");
+        return -1;
+    }
+    out->srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+    out->dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
+    out->extent = (VkExtent3D){ iso_mip_extent(iso->w, level), iso_mip_extent(iso->h, level),
+                                iso->is_3d ? iso_mip_extent(iso->depth, level) : 1 };
+    return 0;
 }
 
 // ---- BC/块压缩纹理作为渲染目标（块=像素的 UI 视图）的判定与拷贝区域 ----

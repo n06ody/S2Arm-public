@@ -115,9 +115,11 @@ int nvn_vk_feedback_copy_make(const struct nvn_vk_feedback_src *src, uint32_t pa
                               char *why, size_t why_size);
 
 // 采样绑定替换判定：附件被同一张图采样时，能不能/该不该把绑定换成快照视图。
-// 只有“采样视图正好是附件那个子资源、且形状是单层 2D”才替换；同图其它子资源不替换（合法，
-// 采样别的 mip/层不是反馈）；单层 2D 快照表达不了的反馈（默认 3D 视图、多层视图、带格式/通道
-// 重写）返回 LEAVE：保持原绑定并记一次原因（表达不了就不静默换错）。
+//   NONE       采样视图不含附件那个子资源：不是本子资源的反馈，保持原绑定（合法）。
+//   SUBSTITUTE 采样视图正好是附件子资源、形状是单层 2D：换单层 2D 快照。
+//   ISO        采样视图覆盖多个子资源（默认整幅视图落在多级/多层/3D 底图上）：单层 2D 快照
+//              代表不了整幅视图，换“底图同形”的同构快照（nvn_vk_feedback_iso）的等形视图。
+//   LEAVE      反馈存在但两条快照路都表达不了（视图建不出、格式/通道重写等）：保持原绑定并记原因。
 struct nvn_vk_feedback_bind {
     uint8_t fb_is_3d;              // 附件底图是 3D（fb_layer 是深度切片）
     uint32_t fb_level, fb_layer;   // 附件子资源
@@ -128,8 +130,38 @@ struct nvn_vk_feedback_bind {
     uint32_t view_type;            // 采样视图的 VkImageViewType
     uint32_t view_base_level, view_nlevels, view_base_layer, view_nlayers;
 };
-enum { NVN_VK_FB_BIND_NONE = 0, NVN_VK_FB_BIND_SUBSTITUTE = 1, NVN_VK_FB_BIND_LEAVE = 2 };
+enum { NVN_VK_FB_BIND_NONE = 0, NVN_VK_FB_BIND_SUBSTITUTE = 1, NVN_VK_FB_BIND_LEAVE = 2,
+       NVN_VK_FB_BIND_ISO = 3 };
 int nvn_vk_feedback_bind_plan(const struct nvn_vk_feedback_bind *in, char *why, size_t why_size);
+// 被采样视图是否覆盖多个子资源（与 bind_plan 的 ISO 分支同族判定，但不看附件覆盖关系——
+// 快照创建时附件的 mip/层还没定）。负控 debug.s2a.no_fb_iso=1 用它做粒度：多子资源视图
+// 连快照都不建、不预拷、不加屏障，纯直通活绑定——注意这比修复前路径更严（旧路径仍
+// 建单层快照+预拷+屏障、只是不绑定），是验证「多层视图活绑定 UB」机制的最强负控；
+// 单子资源视图照旧单层快照（修复前那部分本来就是正确路径）。
+int nvn_vk_feedback_view_multi(const struct nvn_vk_feedback_bind *in);
+
+// 同构反馈快照计划：快照照被采样底图的形状建（同 level×layer/depth、同格式），开遍前把
+// 每个子资源的开遍前内容逐份拷进快照，绑定视图与采样视图同形——着色器读到的就是
+// “本笔开始前的附件内容”，与苹果路线 fb_prepare ④ 的整视图快照同口径（Metal 的①视图收窄
+// 在 Vulkan 不可移植：同图任一子资源是附件时采样仍属未定义，只能靠换一张图）。
+struct nvn_vk_feedback_iso {
+    uint8_t is_3d;               // 1 = 底图 3D：快照是 3D 图像，拷贝按 level 整深度走
+    uint32_t w, h, depth;        // level 0 尺寸
+    uint32_t levels, layers;     // 子资源覆盖（3D 时 layers 恒 1，切片数 = depth）
+    uint32_t n_copies;           // 拷贝份数：levels ×（is_3d ? 1 : layers）
+    uint64_t est_bytes;          // 全部子资源字节和（含 bpp），预算/上限判定用
+};
+// 计划：输出快照形状与拷贝份数；bytes_per_texel 由调用方按 VkFormat 查表给（本层不藏格式表）。
+// cap_bytes 是单张快照的拷贝成本上限（超了拒绝，与苹果 ④ 的 64MB 上限同思路）。返回 0 成立。
+int nvn_vk_feedback_iso_plan(uint32_t is_3d, uint32_t w, uint32_t h, uint32_t depth,
+                             uint32_t levels, uint32_t layers, uint32_t bytes_per_texel,
+                             uint64_t cap_bytes,
+                             struct nvn_vk_feedback_iso *out, char *why, size_t why_size);
+// 第 n 份拷贝的 VkImageCopy（纯构造）：dst 与 src 同形，(level, layer) 一一映射；
+// 3D 一个 level 一份拷贝，深度进 extent.depth（Vulkan 的 3D 子资源 layerCount 恒 1）。
+// n 按 (level * layers + layer) 展开；3D 时 n 就是 level。
+int nvn_vk_feedback_iso_copy(const struct nvn_vk_feedback_iso *iso, uint32_t n,
+                             VkImageCopy *out, char *why, size_t why_size);
 
 // BC/块压缩纹理作为渲染目标（经“块=像素”的无压缩 UI 视图）：
 //   0100F2C0115B6000 把一张 32x32x32 的 RGTC1(BC4) 3D 纹理每笔画一个深度切片，附件视图用 RGBA16UI 之类

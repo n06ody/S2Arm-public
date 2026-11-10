@@ -370,6 +370,8 @@ static uint64_t g_arena_bytes; static int g_arena_chunk_n;   // 定义在后面�
 // 分配，驱动侧 mmap 逐渐失败（errno 12），最后连 5.6 MB 都申请不到而 abort。
 // 槽数要盖住世界里出现的快照规格数：实测 32 槽时命中不了，分配一路涨到撞 4096 上限。
 #define FD_SNAP_POOL 256
+// 同构快照视图上限：一个槽内按（type/base/n 级层）去重缓存的视图数；超出新形态 LEAVE 记因。
+#define FD_ISO_VIEWS 8
 struct fd_snap_slot {
     VkImage img; VkDeviceMemory mem; VkImageView view;
     uint32_t w, h; VkFormat fmt;
@@ -378,6 +380,12 @@ struct fd_snap_slot {
     uint64_t owner_frame;
     uint64_t bytes;        // 本槽占用的设备内存字节（预算记账）
     int used;
+    // 同构快照（is_iso）：与底图同形（全 level×layer/depth），视图按被采样视图的形态现建缓存；
+    // 单层 2D 路径只用 .view。is_3d 时图像为 3D（layers=1，深度切片走 extent.depth）。
+    int is_iso, is_3d;
+    uint32_t depth3d, levels, layers;
+    struct fd_iso_view { VkImageView v; uint32_t type, bl, nl, ba, na; } iv[FD_ISO_VIEWS];
+    int iv_n;
 };
 static struct fd_snap_slot g_snap_pool[FD_SNAP_POOL];
 static int g_snap_pool_n;
@@ -2029,6 +2037,7 @@ static _Atomic uint32_t g_draws_this_frame;
 static uint64_t g_frame_ref_seq;   // 本帧的池后备提交序号（帧首笔 draw 时分配）
 static int g_fb_logged;   // feedback 快照日志只打一次（逐帧重复没有新信息）
 static _Atomic uint64_t g_fb_leave_n;   // 反馈采样“是反馈但单层 2D 快照表达不了”的绑定数（诊断）
+static _Atomic uint64_t g_fb_passthrough_n;  // no_fb_iso 负控：多子资源视图不建快照纯直通的笔数
 static int g_pass_merges, g_pass_flushes;
 // 本帧仍在 GPU 命令/描述符里的纹理：flush 拿到 fence 后才能 unpin，之后缓存才可淘汰/销毁。
 #define FD_PIN_MAX 16384
@@ -2918,14 +2927,29 @@ static struct {
     VkRect2D sc;
     int vp_valid, sc_valid;
 } g_cmd_state;
-static VkImage g_precopy_src, g_precopy_dst;
-// 快照按被采样纹理的尺寸建；拷贝区域必须取两侧交集，否则 1600x900 的 pass 去拷 1280x720 的快照
-// 会越界（= 采样到未初始化内容：进世界淡入的整屏彩虹/竖条纹）。这里记下快照尺寸。
-// 源子资源：附件可以是多 mip / 多层的纹理，但 SetRenderTargets 的 cview 选中的是其中一个
-// mip + 一层（2D 切片）。反馈快照必须从该子资源拷，不能假设 level=0/layer=0。
-static uint32_t g_precopy_w, g_precopy_h;
-// 反馈快照源的完整子资源描述（3D 底图用 slice，拷贝走 srcOffset.z；见 nvn_vk_mrt.h）。
-static struct nvn_vk_feedback_src g_precopy_src_desc;
+// 开遍前反馈拷贝：单层路径拷一个子资源；同构路径（is_iso）逐 level×layer 拷整图。
+struct fd_precopy_op {
+    VkImage src, dst;
+    uint32_t dst_levels, dst_layers;     // dst 屏障覆盖的子资源范围（单层路径 1x1）
+    // 快照按被采样纹理的尺寸建；拷贝区域必须取两侧交集，否则 1600x900 的 pass 去拷 1280x720
+    // 的快照会越界（= 采样到未初始化内容：进世界淡入的整屏彩虹/竖条纹）。
+    uint32_t w, h;
+    // 源子资源：附件可以是多 mip / 多层的纹理，但 SetRenderTargets 的 cview 选中的是其中一个
+    // mip + 一层（2D 切片）。单层反馈快照必须从该子资源拷，不能假设 level=0/layer=0。
+    struct nvn_vk_feedback_src src_desc;
+    struct nvn_vk_feedback_iso iso;
+    int is_iso;
+};
+static struct fd_precopy_op g_precopy[2];
+static int g_precopy_n;
+static struct fd_precopy_op *fd_precopy_push(VkImage src, VkImage dst) {
+    if (g_precopy_n >= 2) return NULL;   // 一笔 draw 最多一路反馈快照
+    struct fd_precopy_op *op = &g_precopy[g_precopy_n];
+    memset(op, 0, sizeof *op);
+    op->src = src; op->dst = dst;
+    g_precopy_n++;
+    return op;
+}
 // 诊断：debug.s2a.fb_mark=1 时把快照整幅染红。若画面里背景/淡入层变红，就证明它采样的正是这张
 // 快照（用于把“花屏那一笔的输入”定位到反馈快照本身）。
 // 诊断：debug.s2a.dump_pass=<帧内序号> 时，把该序号 pass 的颜色目标整幅回读落盘
@@ -3001,6 +3025,34 @@ static int fd_fb_mark(void) {
     }
     return v;
 }
+// 快照槽销毁：视图 + 同构视图缓存 + 图像 + 记账内内存（FD_MEM_SNAP 记账由 fd_devmem_release 摘）。
+static void fd_snap_slot_free(struct s2a_vk_device *d, struct fd_snap_slot *sl) {
+    for (int i = 0; i < sl->iv_n; i++) if (sl->iv[i].v) vkDestroyImageView(d->device, sl->iv[i].v, NULL);
+    if (sl->view) vkDestroyImageView(d->device, sl->view, NULL);
+    if (sl->img) vkDestroyImage(d->device, sl->img, NULL);
+    if (sl->mem) fd_devmem_release(d, sl->mem);
+    g_snap_pool_bytes -= sl->bytes;
+}
+// 淘汰一个“所属提交已完成”的最旧槽（销毁后空位给本次规格）；没有可淘汰的返回 -1。
+static int fd_snap_evict_oldest(struct s2a_vk_device *d) {
+    int victim = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < g_snap_pool_n; i++) {
+        struct fd_snap_slot *sl = &g_snap_pool[i];
+        if (!nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) continue;   // 在途帧的槽不动
+        if (sl->owner_frame < oldest) { oldest = sl->owner_frame; victim = i; }
+    }
+    if (victim < 0) return -1;
+    struct fd_snap_slot *sl = &g_snap_pool[victim];
+    fd_snap_slot_free(d, sl);
+    g_snap_evicted++;
+    memset(sl, 0, sizeof *sl);
+    g_snap_pool_n--;   // 末尾槽挪到空位，保持前 n 项连续
+    if (victim != g_snap_pool_n) g_snap_pool[victim] = g_snap_pool[g_snap_pool_n];
+    memset(&g_snap_pool[g_snap_pool_n], 0, sizeof g_snap_pool[g_snap_pool_n]);
+    return 0;
+}
+
 static VkImageView fd_feedback_snapshot(struct s2a_vk_device *d, struct nvn_vk_tex *rt,
                                         VkFormat format, uint32_t w, uint32_t h,
                                         uint32_t level, uint32_t layer, uint32_t layers,
@@ -3032,7 +3084,7 @@ static VkImageView fd_feedback_snapshot(struct s2a_vk_device *d, struct nvn_vk_t
     struct fd_snap_slot *pooled = NULL;
     for (int i = 0; i < g_snap_pool_n; i++) {
         struct fd_snap_slot *sl = &g_snap_pool[i];
-        if (sl->w == w && sl->h == h && sl->fmt == format && nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) {
+        if (!sl->is_iso && sl->w == w && sl->h == h && sl->fmt == format && nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) {
             pooled = sl;
             break;
         }
@@ -3040,8 +3092,10 @@ static VkImageView fd_feedback_snapshot(struct s2a_vk_device *d, struct nvn_vk_t
     if (pooled) {
         pooled->owner_frame = g_frame_id;
         img = pooled->img;
-        g_precopy_src = rt->image; g_precopy_dst = img; g_precopy_w = w; g_precopy_h = h;
-        g_precopy_src_desc = src;
+        struct fd_precopy_op *op = fd_precopy_push(rt->image, img);
+        // 预拷表满时快照里是没有拷贝保证的旧内容，绑定它等于采样陈旧字节：跟登记表满一样算失败。
+        if (!op) { snprintf(why, why_size, "反馈预拷表满，快照不能绑定"); return VK_NULL_HANDLE; }
+        op->w = w; op->h = h; op->src_desc = src; op->dst_levels = 1; op->dst_layers = 1;
         return pooled->view;
     }
     if (vkCreateImage(d->device, &ii, NULL, &img) != VK_SUCCESS) { snprintf(why, why_size, "反馈快照 vkCreateImage 失败"); return VK_NULL_HANDLE; }
@@ -3083,46 +3137,11 @@ static VkImageView fd_feedback_snapshot(struct s2a_vk_device *d, struct nvn_vk_t
     }
     // 池满且没有可复用的同规格槽：淘汰一个「所属提交已完成」的最旧槽（销毁后重建为本次规格）。
     // 这是快照内存的硬上限来源：池容量 × 单张大小，不再随 draw 数无限增长。
-    if (!pooled && g_snap_pool_n >= FD_SNAP_POOL) {
-        int victim = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < g_snap_pool_n; i++) {
-            struct fd_snap_slot *sl = &g_snap_pool[i];
-            if (!nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) continue;   // 在途帧的槽不动
-            if (sl->owner_frame < oldest) { oldest = sl->owner_frame; victim = i; }
-        }
-        if (victim >= 0) {
-            struct fd_snap_slot *sl = &g_snap_pool[victim];
-            if (sl->view) vkDestroyImageView(d->device, sl->view, NULL);
-            if (sl->img) vkDestroyImage(d->device, sl->img, NULL);
-            if (sl->mem) fd_devmem_release(d, sl->mem);
-            g_snap_evicted++;
-            g_snap_pool_bytes -= sl->bytes;
-            memset(sl, 0, sizeof *sl);
-            g_snap_pool_n--;   // 末尾槽挪到空位，保持前 n 项连续
-            if (victim != g_snap_pool_n) g_snap_pool[victim] = g_snap_pool[g_snap_pool_n];
-            memset(&g_snap_pool[g_snap_pool_n], 0, sizeof g_snap_pool[g_snap_pool_n]);
-        }
-    }
+    if (!pooled && g_snap_pool_n >= FD_SNAP_POOL)
+        fd_snap_evict_oldest(d);
     // 字节预算：池内占用 + 本次 > 预算时，先淘汰已完成的旧槽。
     while (g_snap_pool_bytes + (uint64_t)mr.size > fd_snap_budget_bytes()) {
-        int victim = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int i = 0; i < g_snap_pool_n; i++) {
-            struct fd_snap_slot *sl = &g_snap_pool[i];
-            if (!nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) continue;
-            if (sl->owner_frame < oldest) { oldest = sl->owner_frame; victim = i; }
-        }
-        if (victim < 0) break;
-        struct fd_snap_slot *sl = &g_snap_pool[victim];
-        if (sl->view) vkDestroyImageView(d->device, sl->view, NULL);
-        if (sl->img) vkDestroyImage(d->device, sl->img, NULL);
-        if (sl->mem) fd_devmem_release(d, sl->mem);
-        g_snap_evicted++;
-        g_snap_pool_bytes -= sl->bytes;
-        g_snap_pool_n--;
-        if (victim != g_snap_pool_n) g_snap_pool[victim] = g_snap_pool[g_snap_pool_n];
-        memset(&g_snap_pool[g_snap_pool_n], 0, sizeof g_snap_pool[g_snap_pool_n]);
+        if (fd_snap_evict_oldest(d) != 0) break;
     }
     const int over_budget = g_snap_pool_bytes + (uint64_t)mr.size > fd_snap_budget_bytes();
     if (!over_budget && g_snap_pool_n < FD_SNAP_POOL) {
@@ -3135,8 +3154,10 @@ static VkImageView fd_feedback_snapshot(struct s2a_vk_device *d, struct nvn_vk_t
         snprintf(why, why_size, "反馈快照登记失败");
         goto fail;
     }
-    g_precopy_src = rt->image; g_precopy_dst = img; g_precopy_w = w; g_precopy_h = h;
-    g_precopy_src_desc = src;
+    struct fd_precopy_op *op = fd_precopy_push(rt->image, img);
+    // 槽已入池/登记：预拷表满返回 NULL 即可（槽留池里无害，绑定方按快照失败处理）。
+    if (!op) { snprintf(why, why_size, "反馈预拷表满，快照不能绑定"); return VK_NULL_HANDLE; }
+    op->w = w; op->h = h; op->src_desc = src; op->dst_levels = 1; op->dst_layers = 1;
     if (fd_verbose())
         FD_LOG("feedback snapshot: src serial=%llu level=%u layer=%u %ux%u -> snapshot %ux%u",
                (unsigned long long)rt->serial, level, layer, w, h, w, h);
@@ -3146,6 +3167,164 @@ fail:
     if (img) vkDestroyImage(d->device, img, NULL);
     if (mem) fd_devmem_release_dev(d->device, mem);
     return VK_NULL_HANDLE;
+}
+
+static uint32_t vk_bpp(VkFormat f);
+// 同构快照单张上限（与苹果 fb_prepare ④ 的整视图快照上限同口径）：防一张超大底图把预算一次吃空。
+#define FD_ISO_CAP_BYTES (64ull << 20)
+// 诊断开关：debug.s2a.no_fb_iso=1 时多子资源底图的反馈不做同构快照（回到保留活绑定的
+// 旧行为），只用于 A/B 对照证明缺陷同因；默认 0。
+static int fd_no_fb_iso(void) {
+    static int v = -1;
+    if (v < 0) {
+        char b[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.s2a.no_fb_iso", b);
+        v = (b[0] && atoi(b) != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+// 同构快照：照被采样底图整幅形状（全 level×layer/depth、同格式）建图，开遍前逐子资源拷贝，
+// 绑定视图与采样视图同形——对应苹果 fb_prepare ④ 的整视图快照。Metal 的①视图收窄在
+// Vulkan 不可移植：同图任一子资源是附件时采样仍属未定义，只能换一张图。
+// 只进池（视图按 iv[] 随槽销毁）；池/预算放不下时失败，调用方按 LEAVE 记因，不静默直通。
+static struct fd_snap_slot *fd_feedback_iso_snapshot(struct s2a_vk_device *d, struct nvn_vk_tex *rt,
+                                                     VkFormat format, char *why, size_t why_size) {
+    if (!rt || !rt->image || format == VK_FORMAT_UNDEFINED) {
+        snprintf(why, why_size, "反馈同构快照参数不完整");
+        return NULL;
+    }
+    if (nvn_vk_format(rt->nvn_format) != format) {
+        snprintf(why, why_size, "采样纹理格式 %d 与附件格式 %d 不一致，同构快照替代不了采样视图",
+                 (int)nvn_vk_format(rt->nvn_format), (int)format);
+        return NULL;
+    }
+    // 底图图像类型按 target 判（depth=1 的 3D 图仍是 3D 图：同形快照也必须是 3D，否则
+    // 3D→2D 拷贝非法、视图类型也对不上）；fb_is3d 的 depth>1 口径只用于附件切片寻址。
+    const int is3d = (rt->nvn_target == NVN_TEXTURE_TARGET_3D);
+    const uint32_t bpp = vk_bpp(format);
+    if (!bpp) { snprintf(why, why_size, "反馈同构快照：格式 %d 无每像素字节数", (int)format); return NULL; }
+    struct nvn_vk_feedback_iso iso;
+    if (nvn_vk_feedback_iso_plan(is3d, rt->width, rt->height, rt->depth,
+                                 rt->levels, rt->layers, bpp, FD_ISO_CAP_BYTES,
+                                 &iso, why, why_size) != 0)
+        return NULL;
+    // 池里同形（同构 + 全形状字段一致）且所属提交已完成的槽直接复用。
+    for (int i = 0; i < g_snap_pool_n; i++) {
+        struct fd_snap_slot *sl = &g_snap_pool[i];
+        if (sl->is_iso && sl->is_3d == (int)iso.is_3d && sl->w == iso.w && sl->h == iso.h &&
+            sl->depth3d == iso.depth && sl->levels == iso.levels && sl->layers == iso.layers &&
+            sl->fmt == format &&
+            nvn_vk_snap_slot_reusable(sl->used, sl->owner_frame, g_snap_retired_frame)) {
+            sl->owner_frame = g_frame_id;
+            struct fd_precopy_op *op = fd_precopy_push(rt->image, sl->img);
+            // 预拷表满则池内快照是没有本次拷贝保证的陈旧内容：不能绑，按快照失败处理。
+            if (!op) { snprintf(why, why_size, "反馈预拷表满，同构快照不能绑定"); return NULL; }
+            op->iso = iso; op->is_iso = 1;
+            op->dst_levels = iso.levels; op->dst_layers = iso.layers;
+            return sl;
+        }
+    }
+    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ii.imageType = iso.is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    ii.format = format;
+    ii.extent = (VkExtent3D){ iso.w, iso.h, iso.is_3d ? iso.depth : 1 };
+    ii.mipLevels = iso.levels;
+    ii.arrayLayers = iso.layers;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // 视图形态要与采样侧一致：cube/cube-array 视图要求底图带 CUBE_COMPATIBLE；
+    // 3D 底图的单切片采样视图（2D_ARRAY 形态）要求 2D_ARRAY_COMPATIBLE。
+    ii.flags = iso.is_3d ? (d->has_2d_array_compatible ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0)
+                         : VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    VkImage img = VK_NULL_HANDLE;
+    if (vkCreateImage(d->device, &ii, NULL, &img) != VK_SUCCESS) {
+        snprintf(why, why_size, "反馈同构快照 vkCreateImage 失败");
+        return NULL;
+    }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(d->device, img, &mr);
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = s2a_vk_memory_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult arc = fd_devmem_alloc(d->device, &ai, &mem, FD_MEM_SNAP);
+    if (arc != VK_SUCCESS) {
+        atomic_fetch_add(&g_devmem_fails, 1);
+        vkDestroyImage(d->device, img, NULL);
+        snprintf(why, why_size, "反馈同构快照内存分配失败(vkAllocateMemory rc=%d size=%llu)",
+                 (int)arc, (unsigned long long)ai.allocationSize);
+        return NULL;
+    }
+    if (vkBindImageMemory(d->device, img, mem, 0) != VK_SUCCESS) {
+        fd_devmem_release_dev(d->device, mem);
+        vkDestroyImage(d->device, img, NULL);
+        snprintf(why, why_size, "反馈同构快照绑定失败");
+        return NULL;
+    }
+    if (g_snap_pool_n >= FD_SNAP_POOL)
+        fd_snap_evict_oldest(d);
+    while (g_snap_pool_bytes + (uint64_t)mr.size > fd_snap_budget_bytes()) {
+        if (fd_snap_evict_oldest(d) != 0) break;
+    }
+    if (g_snap_pool_bytes + (uint64_t)mr.size > fd_snap_budget_bytes() ||
+        g_snap_pool_n >= FD_SNAP_POOL) {
+        fd_devmem_release_dev(d->device, mem);
+        vkDestroyImage(d->device, img, NULL);
+        snprintf(why, why_size, "反馈同构快照超出池预算(%lluB)，无法登记保活",
+                 (unsigned long long)mr.size);
+        return NULL;
+    }
+    g_snap_pool_bytes += (uint64_t)mr.size;
+    struct fd_snap_slot *sl = &g_snap_pool[g_snap_pool_n++];
+    memset(sl, 0, sizeof *sl);
+    sl->img = img; sl->mem = mem; sl->view = VK_NULL_HANDLE;
+    sl->w = iso.w; sl->h = iso.h; sl->fmt = format;
+    sl->owner_frame = g_frame_id; sl->used = 1; sl->bytes = (uint64_t)mr.size;
+    sl->is_iso = 1; sl->is_3d = (int)iso.is_3d;
+    sl->depth3d = iso.depth; sl->levels = iso.levels; sl->layers = iso.layers;
+    struct fd_precopy_op *op = fd_precopy_push(rt->image, img);
+    // 槽已入池：预拷表满返回 NULL（绑定方按快照失败处理），槽留池里等下次复用即可。
+    if (!op) { snprintf(why, why_size, "反馈预拷表满，同构快照不能绑定"); return NULL; }
+    op->iso = iso; op->is_iso = 1;
+    op->dst_levels = iso.levels; op->dst_layers = iso.layers;
+    if (fd_verbose())
+        FD_LOG("feedback iso snapshot: src serial=%llu %ux%u%s lev=%u lay=%u -> iso %lluB %u copies",
+               (unsigned long long)rt->serial, iso.w, iso.h, iso.is_3d ? " 3d" : "",
+               iso.levels, iso.layers, (unsigned long long)iso.est_bytes, iso.n_copies);
+    return sl;
+}
+
+// 取/建同构槽上 (type, base/n level, base/n layer) 形态的视图；缓存命中直接返回。
+static VkImageView fd_iso_view(struct s2a_vk_device *d, struct fd_snap_slot *sl, VkFormat fmt,
+                              VkImageViewType type, uint32_t bl, uint32_t nl,
+                              uint32_t ba, uint32_t na) {
+    for (int i = 0; i < sl->iv_n; i++) {
+        const struct fd_iso_view *e = &sl->iv[i];
+        if (e->type == (uint32_t)type && e->bl == bl && e->nl == nl && e->ba == ba && e->na == na)
+            return e->v;
+    }
+    if (sl->iv_n >= FD_ISO_VIEWS) return VK_NULL_HANDLE;
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vi.image = sl->img; vi.viewType = type; vi.format = fmt;
+    vi.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, bl, nl, ba, na };
+    VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(d->device, &vi, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
+    sl->iv[sl->iv_n] = (struct fd_iso_view){ v, (uint32_t)type, bl, nl, ba, na };
+    sl->iv_n++;
+    return v;
+}
+
+// 本笔生效的同构槽（快照在 framebuffer 建立时创建，绑定解析时按视图形态取视图）。
+static struct fd_snap_slot *g_fb_iso_slot;
+// 判定视图是否属于本笔的同构槽（保活走槽的 owner_frame，不在纹理的视图表里）。
+static int fd_fb_iso_own(VkImageView v) {
+    if (!g_fb_iso_slot) return 0;
+    for (int i = 0; i < g_fb_iso_slot->iv_n; i++)
+        if (g_fb_iso_slot->iv[i].v == v) return 1;
+    return 0;
 }
 
 // 命令缓冲复用：每个 pass 一次 vkAllocateCommandBuffers/vkFreeCommandBuffers，世界一帧 24 次。
@@ -3331,18 +3510,27 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
         }
     }
     int64_t tr_query = fd_stamp();
-    if (g_precopy_src && g_precopy_dst) {
+    for (int pco = 0; pco < g_precopy_n; pco++) {
+        struct fd_precopy_op *op = &g_precopy[pco];
+        if (!op->src || !op->dst) continue;
         VkImageMemoryBarrier pb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         pb.srcQueueFamilyIndex = pb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        pb.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        pb.image = g_precopy_dst;
+        pb.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                                       op->dst_levels ? op->dst_levels : 1, 0,
+                                                       op->dst_layers ? op->dst_layers : 1 };
+        pb.image = op->dst;
         pb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; pb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         pb.srcAccessMask = 0; pb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, NULL, 0, NULL, 1, &pb);
         {
             VkImageMemoryBarrier rb = pb;
-            rb.image = g_precopy_src;
+            rb.image = op->src;
+            // 源屏障要盖到实际被拷的源子资源：iso 是全图；单层路径精确到 src_desc 那一个
+            // （原来固定 {0,1,0,1}，非 0 mip/层的附件反馈会让屏障盖不到实际读的子资源）。
+            if (!op->is_iso)
+                rb.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT,
+                    op->src_desc.level, 1, op->src_desc.is_3d ? 0u : op->src_desc.layer, 1 };
             rb.oldLayout = rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             rb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
             rb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -3350,23 +3538,38 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &rb);
         }
-        {
-            uint32_t cw = w < g_precopy_w ? w : g_precopy_w;
-            uint32_t ch = h < g_precopy_h ? h : g_precopy_h;
+        if (op->is_iso) {
+            // 同构快照：底图整幅形状的每个子资源一份拷贝（level×layer；3D 按 level 整深度）。
+            // 与单层路径不同，这里不做与 pass 尺寸的交集收窄——同构快照本身就是底图同形，
+            // 逐子资源拷满是它的语义。
+            for (uint32_t n = 0; n < op->iso.n_copies; n++) {
+                VkImageCopy rc = {0};
+                char cwhy[192] = "";
+                if (nvn_vk_feedback_iso_copy(&op->iso, n, &rc, cwhy, sizeof cwhy) != 0) {
+                    static int noted_ic;
+                    if (!noted_ic++) FD_LOG("feedback iso snapshot: copy %u refused: %s", n, cwhy);
+                    continue;
+                }
+                vkCmdCopyImage(cmd, op->src, VK_IMAGE_LAYOUT_GENERAL,
+                               op->dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
+            }
+        } else {
+            uint32_t cw = w < op->w ? w : op->w;
+            uint32_t ch = h < op->h ? h : op->h;
             if (cw && ch) {
                 static int noted;
                 if (!noted++ && (cw != w || ch != h))
                     FD_LOG("feedback snapshot: pass=%ux%u snapshot=%ux%u; copying the %ux%u intersection "
-                           "(the rest of the snapshot stays uninitialised)", w, h, g_precopy_w, g_precopy_h, cw, ch);
+                           "(the rest of the snapshot stays uninitialised)", w, h, op->w, op->h, cw, ch);
                 VkImageCopy rc = {0};
                 char cwhy[192] = "";
-                if (nvn_vk_feedback_copy_make(&g_precopy_src_desc, w, h, g_precopy_w, g_precopy_h,
+                if (nvn_vk_feedback_copy_make(&op->src_desc, w, h, op->w, op->h,
                                               &rc, cwhy, sizeof cwhy) != 0) {
                     static int noted_mk;
                     if (!noted_mk++) FD_LOG("feedback snapshot: copy region refused: %s", cwhy);
                 } else {
-                    vkCmdCopyImage(cmd, g_precopy_src, VK_IMAGE_LAYOUT_GENERAL,
-                                   g_precopy_dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
+                    vkCmdCopyImage(cmd, op->src, VK_IMAGE_LAYOUT_GENERAL,
+                                   op->dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rc);
                 }
                 // 只抓 1600x900 的画布快照：一帧里可能有 1280x720 与 1600x900 两种反馈快照，
                 // 共用一个回读缓冲时后写的会覆盖前面的；画布那种才是“淡入/背景”的输入。
@@ -3374,29 +3577,28 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
                     VkBufferImageCopy bc = {0};
                     bc.imageSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
                     bc.imageExtent = (VkExtent3D){ cw, ch, 1 };
-                    vkCmdCopyImageToBuffer(cmd, g_precopy_dst, VK_IMAGE_LAYOUT_GENERAL, g_snap_dbg_buf, 1, &bc);
+                    vkCmdCopyImageToBuffer(cmd, op->dst, VK_IMAGE_LAYOUT_GENERAL, g_snap_dbg_buf, 1, &bc);
                     g_snap_dbg_w = cw; g_snap_dbg_h = ch; g_snap_dbg_pending = 1;
                 }
                 if (fd_fb_mark()) {
                     VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
                     VkClearColorValue red; memset(&red, 0, sizeof red);
                     red.float32[0] = 1.0f; red.float32[3] = 1.0f;
-                    vkCmdClearColorImage(cmd, g_precopy_dst, VK_IMAGE_LAYOUT_GENERAL, &red, 1, &rr);
+                    vkCmdClearColorImage(cmd, op->dst, VK_IMAGE_LAYOUT_GENERAL, &red, 1, &rr);
                 }
             }
         }
         {
             VkImageMemoryBarrier sb = pb;
-            sb.image = g_precopy_dst;
+            sb.image = op->dst;
             sb.oldLayout = sb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             sb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  0, 0, NULL, 0, NULL, 1, &sb);
         }
-        g_precopy_src = g_precopy_dst = VK_NULL_HANDLE; g_precopy_w = g_precopy_h = 0;
-        memset(&g_precopy_src_desc, 0, sizeof g_precopy_src_desc);
     }
+    g_precopy_n = 0;
     int64_t tr_precopy = fd_stamp();
     VkImageMemoryBarrier bar = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     bar.oldLayout = bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3404,7 +3606,10 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
     for (uint32_t s = 0; s < color_count && s < NVN_VK_MRT_MAX_COLOR; s++) {
         if (!color_img[s]) continue;
         bar.image = color_img[s];
-        bar.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        // 范围覆盖整图：附件可能是非 0 的 mip/层，{0,1,0,1} 盖不住时反馈预拷的 TRANSFER_READ
+        // 与附件写之间就没有顺序保证；布局本就 GENERAL，全范围只多一个执行依赖。
+        bar.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,
+            VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
         bar.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3414,7 +3619,8 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
         VkImageMemoryBarrier dbar = bar;
         dbar.image = depth;
         dbar.subresourceRange = (VkImageSubresourceRange){ nvn_vk_format_has_stencil(dfmt)
-            ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+            ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT, 0,
+            VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
         dbar.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
         dbar.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -4297,12 +4503,8 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
     }
     g_rp_cache_n = 0;
     // 反馈快照池也可能早于驱动缓存初始化；使用 session 给出的真实设备。
-    for (int i = 0; i < g_snap_pool_n; i++) {
-        struct fd_snap_slot *sl = &g_snap_pool[i];
-        if (sl->view) vkDestroyImageView(d->device, sl->view, NULL);
-        if (sl->img) vkDestroyImage(d->device, sl->img, NULL);
-        if (sl->mem) fd_devmem_release_dev(d->device, sl->mem);
-    }
+    for (int i = 0; i < g_snap_pool_n; i++)
+        fd_snap_slot_free(d, &g_snap_pool[i]);
     memset(g_snap_pool, 0, sizeof g_snap_pool);
     g_snap_pool_n = 0;
     g_snap_pool_bytes = 0;
@@ -4444,6 +4646,7 @@ static uint32_t vk_bpp(VkFormat f) {
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_SNORM:
         case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_UNORM:
         case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_R16G16_SFLOAT:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
         case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: return 4;
         case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: return 8;
         case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: return 8;
@@ -5069,7 +5272,8 @@ static int fd_feedback_fix(void) {
 // 这一笔是否把当前渲染目标当纹理采样（NVN 的反馈采样）；返回第一张命中的纹理。
 static struct nvn_vk_tex *fd_feedback_tex(const struct fd_program *prog,
                                           const struct s2a_record_draw_state *state,
-                                          struct nvn_vk_tex *rt) {
+                                          struct nvn_vk_tex *rt, struct s2a_vk_device *d,
+                                          int *out_multi) {
     if (!rt || !rt->image) return NULL;
     for (int i = 0; i < prog->binding_count; i++) {
         const struct fd_binding *b = &prog->bindings[i];
@@ -5087,7 +5291,31 @@ static struct nvn_vk_tex *fd_feedback_tex(const struct fd_program *prog,
             g_tex_lookup[slot].id = (int)tid;
             g_tex_lookup[slot].tex = tex;
         }
-        if (tex->image == rt->image) return tex;
+        if (tex->image != rt->image) continue;
+        if (out_multi) {
+            // 被采样视图的形状：默认视图按底图，注册视图按它的 plan——与绑定循环同口径，
+            // 供负控判定「多子资源视图就不建快照纯直通」。
+            extern int s2a_vk_adapter_tex_view_by_id(int id, view_t *out) __attribute__((weak));
+            view_t rv; memset(&rv, 0, sizeof rv);
+            const int hv = s2a_vk_adapter_tex_view_by_id
+                               ? s2a_vk_adapter_tex_view_by_id((int)tid, &rv) : -1;
+            struct nvn_vk_feedback_bind fbp;
+            memset(&fbp, 0, sizeof fbp);
+            fbp.fb_is_3d = (tex->nvn_target == NVN_TEXTURE_TARGET_3D && tex->depth > 1);
+            fbp.tex_levels = tex->levels; fbp.tex_layers = tex->layers; fbp.tex_depth = tex->depth;
+            fbp.view_override = (uint8_t)(hv == 1 && (rv.set_format || rv.set_levels || rv.set_layers ||
+                                                    rv.set_target || rv.set_dsmode));
+            if (fbp.view_override) {
+                struct nvn_vk_texview_plan vp;
+                nvn_vk_texview_plan_make(tex->nvn_target, tex->depth, tex->layers, tex->levels, &rv,
+                                         0, d->has_2d_array_compatible, &vp);
+                fbp.view_ok = (uint8_t)vp.ok;
+                fbp.view_type = (uint32_t)vp.type;
+                fbp.view_nlevels = vp.nlevels; fbp.view_nlayers = vp.nlayers;
+            }
+            *out_multi = nvn_vk_feedback_view_multi(&fbp);
+        }
+        return tex;
     }
     return NULL;
 }
@@ -5773,6 +6001,7 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
     struct fd_trace tr = {0};   // done also handles attachment failures before trace allocation.
     struct nvn_vk_tex *rt = NULL;
     VkImageView fb_view = VK_NULL_HANDLE;   // 反馈采样：本笔绑定用的预录快照视图
+    g_fb_iso_slot = NULL;                   // 多子资源底图的反馈走同构快照槽；每笔复位
     // 快照源子资源（绑定替换判定用）：3D 底图的 fb_layer 是深度切片，fb_is3d=1。
     VkFormat fb_fmt = VK_FORMAT_UNDEFINED;
     uint32_t fb_level = 0, fb_layer = 0;
@@ -6204,7 +6433,9 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
         atomic_fetch_add(&g_bcrt_passes, 1);
     }
     if (no_attach) merge_draw = 0;   // 零附件 pass 没有可共享的附件，逐笔独占（也避免与前一 pass 混录）
-    struct nvn_vk_tex *fb_tex = (merge_draw && fd_feedback_fix()) ? fd_feedback_tex(&prog, state, rt) : NULL;
+    int fb_multi = 0;
+    struct nvn_vk_tex *fb_tex = (merge_draw && fd_feedback_fix())
+                                    ? fd_feedback_tex(&prog, state, rt, d, &fb_multi) : NULL;
     int64_t t_fb1 = fd_stamp();
     if (fd_dbg_fade(prog_sha)) {
         static _Atomic int n;
@@ -6315,17 +6546,35 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                 fb_layer = mrt_slots[mrt_plan.first_slot].layer;
                 fb_is3d = (rt->nvn_target == NVN_TEXTURE_TARGET_3D && rt->depth > 1);
                 fb_fmt = rt_format;
-                fb_view = fd_feedback_snapshot(d, rt, rt_format, fw, fh,
-                                               fb_level, fb_layer,
-                                               (fv && fv->set_layers) ? fv->nlayers : 1,
-                                               why, why_size);
+                // 多子资源底图（多级/多层/3D）做单层快照代表不了默认整幅视图：同构快照按
+                // 底图形状建，绑定阶段按被采样视图的参数建等形视图（Apple fb_prepare ④ 同口径）。
+                // 负控（debug.s2a.no_fb_iso=1）：被采样视图覆盖多个子资源时连快照都不建——
+                // 不预拷、不加屏障，纯直通活绑定；单子资源视图照旧单层快照。
+                const int fb_passthrough = fd_no_fb_iso() && fb_multi;
+                const int fb_iso = !fd_no_fb_iso() &&
+                    (fb_is3d || rt->depth > 1 || rt->layers > 1 || rt->levels > 1);
+                if (fb_passthrough) {
+                    atomic_fetch_add(&g_fb_passthrough_n, 1);
+                    static _Atomic int fb_pt_log;
+                    if (atomic_fetch_add(&fb_pt_log, 1) < 16)
+                        FD_LOG("feedback: passthrough (no_fb_iso) live binding for rt serial=%llu "
+                               "(multi-subresource view); no snapshot taken",
+                               (unsigned long long)rt->serial);
+                } else if (fb_iso)
+                    g_fb_iso_slot = fd_feedback_iso_snapshot(d, rt, rt_format, why, why_size);
+                else
+                    fb_view = fd_feedback_snapshot(d, rt, rt_format, fw, fh,
+                                                   fb_level, fb_layer,
+                                                   (fv && fv->set_layers) ? fv->nlayers : 1,
+                                                   why, why_size);
                 if (fd_dbg_fade(prog_sha)) {
                     static _Atomic int n;
                     if (atomic_fetch_add(&n, 1) < 8)
-                        FD_LOG("dbg fade: snapshot view=%p (%s)", (void *)fb_view, fb_view ? "ok" : "failed");
+                        FD_LOG("dbg fade: snapshot view=%p iso=%p (%s)", (void *)fb_view,
+                               (void *)g_fb_iso_slot, (fb_view || g_fb_iso_slot) ? "ok" : "failed");
                 }
-                if (!fb_view) {
-                    // 保留 fd_feedback_snapshot 写回的具体原因：旧实现用通用文案直接覆盖，
+                if (!fb_passthrough && !fb_view && !g_fb_iso_slot) {
+                    // 保留快照函数写回的具体原因：旧实现用通用文案直接覆盖，
                     // 日志只剩“快照创建失败”，无法区分格式/尺寸/分配/视图/登记哪一步。
                     char detail[192];
                     snprintf(detail, sizeof detail, "%s",
@@ -6336,10 +6585,11 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                     goto done;
                 }
                 static _Atomic int fb_draw_log;
-                if (atomic_fetch_add(&fb_draw_log, 1) < 32)
+                if (atomic_fetch_add(&fb_draw_log, 1) < 32 && !fb_passthrough)
                     FD_LOG("feedback: request=%.16s samples its own %ux%u render target (tex serial=%llu); "
-                           "binding a pre-pass snapshot instead of the attachment",
-                           request_id ? request_id : "?", fw, fh, (unsigned long long)rt->serial);
+                           "binding a pre-pass %ssnapshot instead of the attachment",
+                           request_id ? request_id : "?", fw, fh, (unsigned long long)rt->serial,
+                           g_fb_iso_slot ? "iso " : "");
             }
             t_pass_b = fd_stamp();  // framebuffer 取得（命中或新建）到此为止，剩下是真正开 pass
             int64_t t_open0 = fd_stamp();
@@ -6351,13 +6601,11 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
             { int64_t t_open1 = fd_stamp();
               if (t_open0 && t_open1) { atomic_fetch_add(&g_ns_open_call, (uint64_t)(t_open1 - t_open0)); atomic_fetch_add(&g_ns_open_call_n, 1); } }
             if (fd_pb_rc) {
-                g_precopy_src = g_precopy_dst = VK_NULL_HANDLE;
-                memset(&g_precopy_src_desc, 0, sizeof g_precopy_src_desc);
+                g_precopy_n = 0;
                 fail(why, why_size, "open render pass begin failed");
                 goto done;
             }
-            g_precopy_src = g_precopy_dst = VK_NULL_HANDLE;   // fd_pass_begin 成功时已消费；失败/提前返回也不外溢
-    memset(&g_precopy_src_desc, 0, sizeof g_precopy_src_desc);
+            g_precopy_n = 0;   // fd_pass_begin 成功时已消费；失败/提前返回也不外溢
             cmd = g_op.cmd;
         }
     }
@@ -7192,9 +7440,10 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                 if (atomic_fetch_add(&n, 1) < 8)
                     FD_LOG("dbg fade bind: i=%d tid=%u view_override=%d fb_view=%p", i, tid, view_override, (void *)fb_view);
             }
-            if (fb_view && tex->image == rt->image) {
-                // 单层 2D 快照只能代表“采样视图正好是附件那个子资源”；同图其它 mip/层不是反馈，
-                // 默认 3D/多层视图表达不了（保持原绑定并记一次，与苹果路线 ④ 同口径）。
+            if ((fb_view || g_fb_iso_slot) && tex->image == rt->image) {
+                // 单层 2D 快照只能代表“采样视图正好是附件那个子资源”；同图其它 mip/层/切片的
+                // 自采样用同构快照的等形视图（苹果 fb_prepare ④；Metal 的视图收窄在 Vulkan 不可移植，
+                // 同图任一子资源是附件时采样仍属未定义）。两者都表达不了才 LEAVE 记因。
                 struct nvn_vk_feedback_bind fbp;
                 memset(&fbp, 0, sizeof fbp);
                 fbp.fb_is_3d = (uint8_t)fb_is3d;
@@ -7215,12 +7464,41 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                 }
                 char bwhy[192] = "";
                 const int act = nvn_vk_feedback_bind_plan(&fbp, bwhy, sizeof bwhy);
-                if (act == NVN_VK_FB_BIND_SUBSTITUTE) {
-                    res_view[i] = fb_view;   // 采样本笔开始前的附件快照，而不是正在写入的附件
-                    if (!g_fb_logged) {
-                        g_fb_logged = 1;
-                        FD_LOG("feedback: binding pre-pass snapshot for tex id=%u (serial=%llu) request=%.16s",
-                               tid, (unsigned long long)tex->serial, request_id ? request_id : "?");
+                if (act == NVN_VK_FB_BIND_SUBSTITUTE || act == NVN_VK_FB_BIND_ISO) {
+                    VkImageView nv = VK_NULL_HANDLE;
+                    if (g_fb_iso_slot) {
+                        // 等形视图：注册视图按它的计划参数；默认视图按底图整幅（与 tex->view 同口径）。
+                        if (view_override && fbp.view_ok) {
+                            nv = fd_iso_view(d, g_fb_iso_slot, fb_fmt, (VkImageViewType)fbp.view_type,
+                                             fbp.view_base_level, fbp.view_nlevels,
+                                             fbp.view_base_layer, fbp.view_nlayers);
+                        } else if (!view_override) {
+                            nv = fd_iso_view(d, g_fb_iso_slot, fb_fmt, tex->view_type,
+                                             0, tex->levels, 0,
+                                             g_fb_iso_slot->is_3d ? 1 : tex->layers);
+                        } else {
+                            // 注册视图建不出（fbp.view_ok=0 在 bind_plan 已判 LEAVE，到不了这）
+                            nv = VK_NULL_HANDLE;
+                        }
+                    } else if (act == NVN_VK_FB_BIND_SUBSTITUTE) {
+                        nv = fb_view;   // 单子资源底图：单层 2D 快照视图正好等形
+                    }
+                    if (nv) {
+                        res_view[i] = nv;   // 采样本笔开始前的附件快照，而不是正在写入的附件
+                        if (!g_fb_logged) {
+                            g_fb_logged = 1;
+                            FD_LOG("feedback: binding pre-pass %ssnapshot for tex id=%u (serial=%llu) request=%.16s",
+                                   act == NVN_VK_FB_BIND_ISO ? "iso " : "",
+                                   tid, (unsigned long long)tex->serial, request_id ? request_id : "?");
+                        }
+                    } else {
+                        static _Atomic int fb_noview_log;
+                        int n = atomic_fetch_add(&fb_noview_log, 1);
+                        if (n < 16)
+                            FD_LOG("feedback: iso snapshot view for tex id=%u (serial=%llu) cannot be created; "
+                                   "keeps live binding (type=%u)", tid, (unsigned long long)tex->serial,
+                                   (unsigned)fbp.view_type);
+                        if (n == 0) atomic_fetch_add(&g_fb_leave_n, 1);
                     }
                 } else if (act == NVN_VK_FB_BIND_LEAVE) {
                     static _Atomic int fb_leave_log;
@@ -7238,7 +7516,8 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                     fail(why, why_size, "texture pin list is full; the sampled texture cannot be kept for this draw");
                     goto done;
                 }
-                if (res_view[i] != fb_view && fd_pin_view(tex, res_view[i]) != 0) {
+                if (res_view[i] != fb_view && !fd_fb_iso_own(res_view[i]) &&
+                    fd_pin_view(tex, res_view[i]) != 0) {
                     fail(why, why_size,
                          "sampled texture view is not registered for keeping; refusing this draw");
                     goto done;
