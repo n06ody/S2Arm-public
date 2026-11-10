@@ -38,7 +38,7 @@ g_incr() { grp incr   # 增量装包 / 推送：同一台假设备上依次跑
 run; ck "首局 → done" '[[ $RES == RESULT=done* ]]'
 ck "首局装包 1 次" '[ "$(wc -l < $DV/installs.log)" -eq 1 ]'
 ck "首局推 3 个资源文件" 'grep -q "资源包：推 3 个文件" $OUT/run.log'
-[ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "首局进统一账本：本局目录一行、设备列写设备名「测试设备1」（不是 CoreDevice 标识）、结果 done、窗口 MARK，run.log 记「统一账本」摘要（tools/device_ledger.py）" 'awk -F"\t" -v o=$OUT "\$NF==o && \$4==\"测试设备1\" && \$6==\"done\" && \$7==\"MARK\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER && grep -q "统一账本（MARK）" $OUT/run.log'
+[ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "首局进统一账本：本局目录一行、设备列写设备名「测试设备1」（不是 CoreDevice 标识）、结果 done、窗口 MARK，run.log 记「统一账本」摘要（tools/device_ledger.py）" 'LC_ALL=C awk -F"\t" -v o=$OUT "\$NF==o && \$4==\"测试设备1\" && \$6==\"done\" && \$7==\"MARK\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER && grep -q "统一账本（MARK）" $OUT/run.log'
 ck "首局 run.log 出五问帧率格（按 frames.tsv 同记分板口径；局只有几秒 → 未测）" 'grep -q "五问帧率格：未测（" $OUT/run.log'
 ck "首局机上解包、.applied 对上" '[ "$(cat $DV/apps/com.s2arm.test/Documents/资源包/.applied)" = "$(python3 -c "import json;print(json.load(open(\"$J/pack/manifest.json\"))[\"index_sha256\"])")" ] && [ -f $DV/apps/com.s2arm.test/Documents/资源包/romfs/f2.bin ]'
 ck "存档推到每局独立目录、起局带 S2A_SAVE_DIR 与 S2A_SYSTEM_TIME" 'ls -d $DV/apps/com.s2arm.test/Documents/sv_*/device/s.dat > /dev/null && tail -1 $DV/launches.log | grep -q "\"S2A_SAVE_DIR\": \"sv_" && tail -1 $DV/launches.log | grep -q "\"S2A_SYSTEM_TIME\": \"1600000000\"" && tail -1 $DV/launches.log | grep -q "\"S2A_SYSTEM_LANGUAGE\": \"Japanese\""'
@@ -151,9 +151,9 @@ g_restart() { grp restart   # 进程内重启（11-04 维护者转 Windows 出�
   # 手算：MARK 第 60 帧开窗，第 63 帧重启归零；采 2 秒（30 帧/秒）收局时机上帧号约 50–60 < 开窗帧号 → 旧判据红。分段累计：重启前末个心跳 60 + 重启后帧号 > 60 → 绿
   echo ACT_S=2 >> $J/job.env; FAKE_SCENE=restart MARK_AT=60 run
   ck "MARK 后进程内重启、帧号归零 → done（按重启分段累计帧号，不判「窗口内没出新帧」）" '[[ $RES == RESULT=done* ]] && grep -q "收局：窗口" $OUT/run.log && ! grep -q "没出新帧" $OUT/run.log'
-  [ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "重启局进统一账本：窗口列「重启后段」（MARK 在重启前，读数取重启后那段）" 'awk -F"\t" -v o=$OUT "\$NF==o && \$7==\"重启后段\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER'; }
+  [ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "重启局进统一账本：窗口列「重启后段」（MARK 在重启前，读数取重启后那段）" 'LC_ALL=C awk -F"\t" -v o=$OUT "\$NF==o && \$7==\"重启后段\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER'; }
 g_nomark() { grp nomark; sed_edit 's/^ARRIVE_S=30$/ARRIVE_S=3/' $J/job.env; FAKE_SCENE=nomark run; ck "没 MARK → 红（没到达代表场景）" '[[ $RES == RESULT=red*没到达* ]]'
-[ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "没 MARK 的红局也进统一账本：本局目录一行、结果 red、窗口「整局」（tools/device_ledger.py）" 'awk -F"\t" -v o=$OUT "\$NF==o && \$6==\"red\" && \$7==\"整局\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER'; }
+[ -z "${S2A_PRIVATE_TOOLS:-}" ] || ck "没 MARK 的红局也进统一账本：本局目录一行、结果 red、窗口「整局」（tools/device_ledger.py）" 'LC_ALL=C awk -F"\t" -v o=$OUT "\$NF==o && \$6==\"red\" && \$7==\"整局\"{f=1} END{exit !f}" $S2A_DEVICE_LEDGER'; }
 g_guard() { grp guard   # 起局前的拦截：都不该起局
 mkdir -p $DV; : >> $DV/launches.log; n0=$(wc -l < $DV/launches.log)
 mkipa $T/wrong.ipa com.other; mv $J/app.ipa $T/right.ipa; cp $T/wrong.ipa $J/app.ipa

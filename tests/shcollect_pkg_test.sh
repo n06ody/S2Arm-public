@@ -24,7 +24,7 @@ job j4 $T/pk/gone4; mkc $T/sched/jobs/j4/out_1/shcache_rt a b f; mkc $T/sched/jo
 job j5 $T/pk/gone5; mkc $T/sched/jobs/j5/out_1/shcache_rt a b y g; mkc $T/sched/jobs/j5/out_1/pkg_shcache a b y
 export S2A_SCHED_DIR=$T/sched S2A_SHBAKE=$T/sb S2A_SHCOLLECT_BASE=$T/base S2A_SHCOLLECT=$T/col
 # 按输出的「收回…来自」行判收了哪些局（桩靠 progs 文件认程序，收进目录只拷四个缓存文件，已收份在桩眼里是空的，去重会把先收的删掉，不能看目录残留）
-o=$(bash $H/graphics/tools/shbake/shcollect.sh g 2>&1); got=$(sed -n 's/.* 收回 .*来自 \(.*\)）$/\1/p' <<< "$o" | sort | tr '\n' ' ')
+o=$(bash $H/graphics/tools/shbake/shcollect.sh g 2>&1); got=$(sed -n 's/.* 收回 .*来自 \(.*\)）$/\1/p' <<< "$o" | LC_ALL=C sort | tr '\n' ' ')
 ck "只收局 1、局 4（干净包跑出新代码）：$(echo $got | sed "s#$T/##g")" '[ "$got" = "$T/sched/jobs/j1/out_1/shcache_rt $T/sched/jobs/j4/out_1/shcache_rt " ]'
 ck "局 2（受污染包 {a b x}）不收、说明原因" 'grep -q "不收 $T/sched/jobs/j2/out_1/shcache_rt：这局装的包里有现行包与已收各份之外的程序" <<< "$o"'
 ck "核包用 --code（只比代码）：桩记到 4 次带 --code 的调用（局 1、2、4、5 的包）" '[ "$(wc -l < $T/code_calls | tr -d " ")" = 4 ]'

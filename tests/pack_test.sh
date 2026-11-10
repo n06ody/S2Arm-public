@@ -37,7 +37,7 @@ ck "资源输入键算不出（没有 exefs/main）→ 失败并报红，不拿�
   # 出包目标对（10-29 起进键，pack/jobs/archs.py pairs 推导，推导本身由 pack/jobs/tests/test_archs.py 测）：这里用桩，只测键怎么拼——
   #   不设架构 = 跑局机清单两对；显式架构按给的出（与 archs.py 显式分支同形：架构 × 系统大版本 27）；桩答不出 = 推导失败
   fake_py() { [ "$2" = pairs ] || return 2; [ "${FAKE_PAIRS_FAIL:-0}" = 0 ] || return 2
-    if [ -n "${S2A_PSO_ARCHS:-}" ]; then for a in $S2A_PSO_ARCHS; do printf '%s\t27\t4\n' "$a"; done | sort -t. -k1,1
+    if [ -n "${S2A_PSO_ARCHS:-}" ]; then for a in $S2A_PSO_ARCHS; do printf '%s\t27\t4\n' "$a"; done | LC_ALL=C sort -t. -k1,1
     else printf 'applegpu_g18p\t27\t4\napplegpu_g19p\t27\t4\n'; fi; }
   PY=fake_py
   printf '%s\n' input-list-fixture main-content-fixture 'cs compiler-fixture' 'xc gal-fixture' 'extrap off' \
@@ -205,7 +205,7 @@ ck "三段真并发提交（提交锁串行）→ 三份产物都在现行里" '
 ln -s /etc $(root_cur acnh)/link; ck "现行里有软链 → 拒绝开新版" '! root_begin acnh c10 2>/dev/null && [ ! -e $T/roots/acnh@c10.tmp ]'
 # 一包通用（10-30）：ipa.sh 逐项带直连库、不带按机型的死目录 link/（直连链接版已删，旧根残留 dl.<架构>.ios<版本> / pso.<架构>.*.bin）
 W=$T/adw; mkdir -p $W/shaders/direct/b-x $W/shaders/direct/link && echo k > $W/shaders/direct/keys.tsv && echo m > $W/shaders/direct/shader_map.tsv && : > $W/shaders/direct/link/dl.applegpu_g18p.ios27
-got=$(S2A_DUAL=1 ipa_pkg_srcs $W | grep '^shaders/' | sed "s#=.*##" | sort | tr '\n' ' ')   # 源清单只有一份（pack/ipa_key.sh ipa_pkg_srcs，ipa.sh 打包与包键共用）
+got=$(S2A_DUAL=1 ipa_pkg_srcs $W | grep '^shaders/' | sed "s#=.*##" | LC_ALL=C sort | tr '\n' ' ')   # 源清单只有一份（pack/ipa_key.sh ipa_pkg_srcs，ipa.sh 打包与包键共用）
 ck "直连库进包逐项带、跳过 link/（实得：${got}）" '[ "$got" = "shaders/direct/b-x shaders/direct/keys.tsv shaders/direct/shader_map.tsv " ]'
 # 补丁随包（部署方案 v2，满屏补丁线 11-04）：产物根有 patch.tsv → 进资源包源清单；verified_builds 含本构建号才随包（段内同名键不算）
 : > $W/patch.tsv; got=$(ipa_pkg_srcs $W | grep '^patch.tsv=' | sed "s#=.*##"); rm $W/patch.tsv

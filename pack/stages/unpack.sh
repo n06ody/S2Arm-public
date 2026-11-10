@@ -108,7 +108,7 @@ fi
 #   缓存键只看内容、不看路径（中段同长度的位翻转认不出：原件只读，坏件都是截断 / 大小不同；上面的阶段键 K 含路径：普查把原件拷到暂存目录、出包队列软链原件，同一份原件 K 不同）：每个选中包「程序号 字节数 头 1 MB 哈希 尾 1 MB 哈希」+ nx_unpack 内容
 UC=${S2A_UNPACK_CACHE:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/unpack}; UCE=
 if [ "$UC" != off ] && [ -z "$NUPF" ]; then
-  UK=$( { while IFS=$'\t' read -r f sz _ id; do [ -n "$f" ] || continue; printf '%s %s %s %s\n' "$id" "$sz" "$(head -c 1048576 "$f" | shasum -a 256 | cut -c1-16)" "$(tail -c 1048576 "$f" | shasum -a 256 | cut -c1-16)"; done <<< "$SEL" | sort
+  UK=$( { while IFS=$'\t' read -r f sz _ id; do [ -n "$f" ] || continue; printf '%s %s %s %s\n' "$id" "$sz" "$(head -c 1048576 "$f" | shasum -a 256 | cut -c1-16)" "$(tail -c 1048576 "$f" | shasum -a 256 | cut -c1-16)"; done <<< "$SEL" | LC_ALL=C sort
           for t in "$SRC_N" "$SRC_N.dll"; do [ -f "$t" ] && shasum -a 256 < "$t"; done; } | shasum -a 256 | cut -c1-16) && UCE=$UC/$TID-$UK
 fi
 if [ -e "$OUT" ] && [ "$FORCE" != 1 ]; then

@@ -65,11 +65,11 @@ o=$(OCA); ck "⑤e Android 直连单轨" 'grep -q "① 画面：直连单轨" <<
 mkdir -p "$T/real/subreal" "$T/g7"; head -c 2048 /dev/zero > "$T/real/base.nsp"; head -c 2048 /dev/zero > "$T/real/subreal/upd1.nsp"; head -c 2048 /dev/zero > "$T/real/subreal/upd2.nsp"
 ln -s "$T/real/base.nsp" "$T/g7/base.nsp"; ln -s "$T/real/subreal" "$T/g7/sub"; o=$(OC "$T/g7")
 ck "⑭ 软链原件：认出 Game A（1.1.1）、用 3 个包（实得：$(grep -E '①|🔴' <<< "$o" | cut -c1-160 | tr '\n' ' ')）" 'grep -q "认出：Game A（1.1.1，程序号 0100A3501946E000" <<< "$o" && grep -q "用 3 个包" <<< "$o"'
-s7=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | sort | uniq -c | awk '{print $1 "x" $2}')
+s7=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | LC_ALL=C sort | uniq -c | awk '{print $1 "x" $2}')
 ck "⑭ src_ids 列出软链原件：「${s7}」（3 个、每个 2048 字节）" '[ "$s7" = 3x2048 ]'
 # ⑭b 系统 / 隐藏目录里的 .xci / .nsp 不当原件（11-02：回收站 $RECYCLE.BIN 的 $I*.xci 被探测）：源目录里另放回收站、System Volume Information、.Trashes 各一个，src_ids 仍只列那 3 个
 mkdir -p "$T/g7/\$RECYCLE.BIN" "$T/g7/System Volume Information" "$T/g7/.Trashes"; for d in '$RECYCLE.BIN' 'System Volume Information' '.Trashes'; do head -c 1024 /dev/zero > "$T/g7/$d/\$IJUNK.xci"; done
-s7b=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7b.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | sort | uniq -c | awk '{print $1 "x" $2}')
+s7b=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7b.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | LC_ALL=C sort | uniq -c | awk '{print $1 "x" $2}')
 ck "⑭b src_ids 跳过回收站 / 系统 / 隐藏目录：「${s7b}」（仍是 3 个、每个 2048 字节）" '[ "$s7b" = 3x2048 ]'
 # ⑥ 自签
 mkdir -p "$T/A.app/Frameworks"; printf 'int main(void){return 0;}\n' > "$T/m.c"; printf 'int f(void){return 1;}\n' > "$T/l.c"

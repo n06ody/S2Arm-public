@@ -33,7 +33,7 @@ ck "① A：合入的提交 = c1、main 合并提交 = M1" '[ "$(F "$o" merged)"
 o=$(R 1002 "$h1002" --main $M)
 ck "② B：之后还有提交没合 → partial（实得 $(F "$o" state)）" '[ "$(F "$o" state)" = partial ]'
 ck "② B：合入的提交 = d1" '[ "$(F "$o" merged)" = "$d1" ]'
-want=$(printf '%s\n' "$d2" "$d3" | sort | tr '\n' ' ' | sed 's/ $//')
+want=$(printf '%s\n' "$d2" "$d3" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
 ck "② B：没合的恰好是 d2 d3" '[ "$(F "$o" outstanding)" = "$want" ]'
 
 # 反证：两支合入之前的 main，都判「没合过」
