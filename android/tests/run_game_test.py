@@ -2,7 +2,8 @@
 """android/tools/run_game.py 宿主单测（adb 替身，不碰真机；模拟真实平台行为）：
   ① 空机起局：记录原状（未安装）→ 安装 → 冷启动 → READY → 按时长采集 → 收局 → 卸载还原；
     局目录有 tools/quality_check.py 安卓分支要的 android.json / shots_ap / frames.tsv / power.tsv / logcat.txt
-  ② 帧日志 → frames.tsv：只写采集窗口内的帧（boot_us 同时钟裁窗），块按 PID 绑定当局进程
+  ② 帧日志 → frames.tsv：只写采集窗口内的帧（boot_us 同时钟裁窗），块先按 logcat 行 PID
+    圈进程、再按 meta uuid= 硬绑本局（缺/不符整段不收），manifest.frame_log.binding 记账
   ③ 设备已装该包：拒跑（私有数据保证不了还原）；--allow-data-loss 才放行且只还原 APK 字节
   ④ 还原失败：uninstall 失败 → RESULT=red、设备被留置
   ⑤ --mode direct：launch 行带 --es s2arm.graphics_mode direct
@@ -283,6 +284,8 @@ if cmd == "pull":
         os.makedirs(argv[-1], exist_ok=True)   # 负控：备份路径落成目录 → 收局 unlink 必抛 OSError
     else:
         open(argv[-1], "wb").write(bytes.fromhex(st["orig_apk_hex"]))
+    if st.get("pull_stray"):
+        open(argv[-1] + ".stray", "w").write("x")   # 负控：orig.apk 能删、父目录非空 rmdir 必抛
     out(f"{argv[1]}: 1 file pulled, 0 skipped\\n"); sys.exit(0)
 if cmd == "push":
     if os.path.isdir(argv[1]):
@@ -491,6 +494,16 @@ if cmd == "shell":
                                 text_ = re.sub(r"(direct frame-log meta:[^\\n]*)",
                                                r"\\1 uuid=" + u, text_)
                             dd["files/frame-log-" + pid_ + ".log"] = text_.encode().hex()
+                    # emit 同文双写：logcat 侧的 meta 行尾同样带本局 uuid——回填进
+                    # dump/stream 文件（no_log_uuid=旧构建不带字段；与私有文件同源）
+                    if not st.get("no_log_uuid"):
+                        u2 = st.get("log_uuid") or \
+                            st["props"].get("debug.s2a.session_uuid") or "-"
+                        for f2 in ("logcat_dump", "logcat_stream"):
+                            t2 = open(st[f2]).read()
+                            t2 = re.sub(r"(direct frame-log meta:[^\\n]*)",
+                                        r"\\1 uuid=" + u2, t2)
+                            open(st[f2], "w").write(t2)
             else:
                 st["running"] = True
                 st["launch_cmd"] = text
@@ -1130,6 +1143,43 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("orig-backup", man.get("orig_apk_backup", ""),
                       "清理失败的路径要记进 manifest")
         self.assertTrue((out / "run-manifest.json").exists(), "manifest 必须落盘")
+
+    def test_orig_backup_dir_kept_when_rmdir_fails(self):
+        """qa-fone ③：orig.apk 删成、orig-backup 目录非空 rmdir 抛——文件与目录
+        分开记账：orig_backup_dir 记目录、orig_apk_backup 不记（文件已清），
+        结果照绿不冤枉文件还在。"""
+        rc, out, _ = self.run_tool(state=self._installed_state(
+            debuggable=True, data_dirs=dict(self._data_dirs()), pull_stray=True))
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotIn("orig_apk_backup", man, "文件已清就不能再记它留存")
+        self.assertIn("orig_backup_dir", man)
+        self.assertFalse((out / "orig-backup" / "orig.apk").exists())
+        self.assertTrue((out / "orig-backup" / "orig.apk.stray").exists())
+        self.assertTrue(any("目录清理失败" in n for n in man["notes"]), man["notes"])
+
+    def test_frame_block_uuid_missing_dropped(self):
+        """qa-fone ②：logcat 帧块 meta 无 uuid 字段（旧构建/属性没置上）→
+        PID+时间窗单独证不了本局，整段不收；manifest.binding 如实记证据链。"""
+        rc, out, _ = self.run_tool(state={"no_log_uuid": True})
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(1, len(rows), "无 uuid 的块一帧都不进表")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, man["frame_log"]["captures"])
+        self.assertIn("uuid", man["frame_log"]["binding"])
+        self.assertTrue(any("uuid" in n and "不收" in n for n in man["notes"]), man["notes"])
+
+    def test_frame_block_uuid_mismatch_dropped(self):
+        """qa-fone ②：帧块 meta uuid 是别局号（同 PID 旧局转储）→ 整段不收，
+        不凭 PID 把它误并本局帧表。"""
+        rc, out, _ = self.run_tool(state={"log_uuid": "OTHER-SESSION"})
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(1, len(rows), "别局 uuid 的块一帧都不进表")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, man["frame_log"]["captures"])
+        self.assertTrue(any("OTHER-SESSION" in n for n in man["notes"]), man["notes"])
 
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
