@@ -464,6 +464,8 @@ if cmd == "shell":
                     DEV_FS[dir_ + "/" + rel] = blob.hex()
         st["tar_extracted"] = len(DEV_FS); save(); sys.exit(0)
     if c == "rm":
+        if st.get("checkpoint_rm_fail") and any("s2a-checkpoint" in a for a in sh[1:]):
+            sys.stderr.write("rm: Permission denied\\n"); save(); sys.exit(1)
         for p in [a for a in sh[1:] if not a.startswith("-")]:
             for k in list(DEV_FS):
                 if k == p.rstrip("/") or k.startswith(p.rstrip("/") + "/"): del DEV_FS[k]
@@ -1590,9 +1592,96 @@ class RunGameTest(unittest.TestCase):
             name="w2", meta_extra={"files": {"bis/user/save/nope": [1, "0" * 64]}})
         _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_miss")
         man2 = json.loads((out2 / "run-manifest.json").read_text())
-        self.assertIn("不在 tar", man2["reason"])
+        self.assertIn("不一致", man2["reason"])
         st2 = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("launch_cmd", st2)
+
+    def test_checkpoint_strict_member_match(self):
+        """成员↔清单严格一致（两向）：tar 多出未声明成员 → 拒；声明长度与成员
+        实际长度不符 → 拒；meta.files 重复声明同一路径 → 拒（JSON 重复键不静默）。"""
+        cp = self._checkpoint(tar_members={"bis/user/save/extra.und": b"x"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_extra")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("多", man["reason"], man["reason"])
+        cp2 = self._checkpoint(name="w2", meta_extra={
+            "files": {"bis/user/save/0000000000000001/1/game_data.sav":
+                      [999, hashlib.sha256(b"SAVE-DATA").hexdigest()],
+                      "bis/system/save/8000000000000000/1/lastPublishedId":
+                      [8, hashlib.sha256(b"12345678").hexdigest()]}})
+        _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_sz")
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("长度", man2["reason"], man2["reason"])
+        cp3 = self._checkpoint(name="w3dup")
+        (cp3 / "meta.json").write_text(
+            '{"schema":"s2a-checkpoint/1","title_id":"' + self._CK_TID + '",'
+            '"package":"' + PKG + '","files":{'
+            '"bis/user/save/0000000000000001/1/game_data.sav":[9,"'
+            + hashlib.sha256(b"SAVE-DATA").hexdigest() + '"],'
+            '"bis/user/save/0000000000000001/1/game_data.sav":[9,"'
+            + hashlib.sha256(b"SAVE-DATA").hexdigest() + '"]}}')
+        _, out3, _ = self.run_tool(argv=["--checkpoint", str(cp3)], out_name="out_dup")
+        man3 = json.loads((out3 / "run-manifest.json").read_text())
+        self.assertIn("重复声明", man3["reason"], man3["reason"])
+        buf = io.BytesIO()                                  # tar 内重复成员名同拒
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for blob in (b"A", b"B"):
+                info = tarfile.TarInfo("bis/user/save/dup")
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        cp4 = self.tmp / "w4dup"
+        cp4.mkdir()
+        (cp4 / "saves.tar").write_bytes(buf.getvalue())
+        (cp4 / "saves.tar.sha256").write_text(
+            hashlib.sha256(buf.getvalue()).hexdigest() + "  saves.tar\n")
+        (cp4 / "meta.json").write_text(json.dumps({
+            "schema": "s2a-checkpoint/1", "title_id": self._CK_TID, "package": PKG,
+            "files": {"bis/user/save/dup": [1, hashlib.sha256(b"A").hexdigest()]}}))
+        _, out4, _ = self.run_tool(argv=["--checkpoint", str(cp4)], out_name="out_dup2")
+        man4 = json.loads((out4 / "run-manifest.json").read_text())
+        self.assertIn("成员重复", man4["reason"], man4["reason"])
+
+    def test_checkpoint_title_id_canonical(self):
+        """titleId 规范：meta.title_id 必须 16 位大写十六进制（BootContract 口径），
+        小写/缺/非十六进制都拒——写设备前的畸形 meta 门。"""
+        for bad, tag in (("0123456789abcdef", "low"), ("", "empty"), ("0123456789ABCDEG", "bad")):
+            cp = self._checkpoint(name="w-" + tag,
+                                  meta_extra={"title_id": bad} if bad else {"title_id": ""})
+            _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)],
+                                      out_name="out_tid_" + tag)
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertIn("大写十六进制", man["reason"], f"{tag}: {man['reason']}")
+            self.assertEqual("fail", man["checkpoint"]["verify"])
+
+    def test_checkpoint_refuses_installed(self):
+        """已装即拒：设备已装该包时 --checkpoint 直接拒（不清已有数据、不动包），
+        连安装步骤都不进；manifest 记 verify=fail。"""
+        orig = self._installed_state(
+            debuggable=True, orig_vc=200,
+            data_dirs={"/data/data/" + PKG: {"files/save.dat": b"ORIG".hex()}})
+        _, out, _ = self.run_tool(state=orig, argv=["--checkpoint",
+                                                  str(self._checkpoint())],
+                                  out_name="out_inst")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("已装", man["reason"], man["reason"])
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+        self.assertEqual(b"ORIG".hex(),
+                         st["data_dirs"]["/data/data/" + PKG]["files/save.dat"],
+                         "已装数据不许被检查点动")
+
+    def test_checkpoint_tmp_cleanup_failure_detains(self):
+        """临时 tar 删除失败 → 收局并入还原失败：RESULT=red + 留置（设备有残留未证）。
+        rm 在 push/解包两路 finally 都跑；失败记 checkpoint.tmp_left。"""
+        rc, out, _ = self.run_tool(state={"checkpoint_rm_fail": True},
+                                   argv=["--checkpoint", str(self._checkpoint())],
+                                   out_name="out_rmfail")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertIn("没删掉", man["reason"], man["reason"])
+        self.assertIn("tmp_left", man["checkpoint"], man["checkpoint"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "临时文件删不掉要留置")
 
     def test_checkpoint_path_traversal(self):
         """路径越界：tar 成员含 .. 段 → 宿主门拒（push 都没发生），不起局。"""
