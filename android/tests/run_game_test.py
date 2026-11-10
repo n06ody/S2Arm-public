@@ -1593,7 +1593,8 @@ class RunGameTest(unittest.TestCase):
         _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_bad")
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertEqual("fail", man["checkpoint"]["verify"])
-        self.assertIn("核对不符", man["reason"])
+        # 声明 sha 与成员内容不符现在在宿主写设备前就拒（不再等解入后核）
+        self.assertIn("内容 sha", man["reason"])
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("launch_cmd", st, "核对不过不许起局")
         cp2 = self._checkpoint(
@@ -1603,6 +1604,23 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("不一致", man2["reason"])
         st2 = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("launch_cmd", st2)
+
+    def test_checkpoint_member_content_sha_checked_before_push(self):
+        """同长异内容：tar 成员长度与 meta 声明相同、内容 sha 不同 → 写设备前就拒，
+        不 push、不起局（只核长度会放过它）。"""
+        files = dict(self._CK_FILES)
+        rel = "bis/user/save/0000000000000001/1/game_data.sav"
+        cp = self._checkpoint(name="w-samelen", meta_extra={"files": {
+            r: [len(b), hashlib.sha256(b if r != rel else b"X" * len(b)).hexdigest()]
+            for r, b in files.items()}})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_samelen")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("内容 sha", man["reason"], man["reason"])
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "内容 sha 不符不许起局")
+        self.assertNotIn("s2a-checkpoint", st.get("tar_pushed", ""),
+                         "宿主内容核对不过不许 push 到设备")
 
     def test_checkpoint_strict_member_match(self):
         """成员↔清单严格一致（两向）：tar 多出未声明成员 → 拒；声明长度与成员

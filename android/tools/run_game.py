@@ -389,9 +389,16 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
     if got_tar_sha != want_tar_sha:
         deny(f"saves.tar sha256 与 .sha256 不符（{got_tar_sha[:12]}≠{want_tar_sha[:12]}）")
     block["source_sha256"] = want_tar_sha
+    tar_shas = {}
     try:
         with tarfile.open(tar_p) as tf:
             members = tf.getmembers()
+            # 写设备前逐文件算 tar 内容 sha：只核长度会放过同长异内容的成员
+            for mem in members:
+                if mem.isfile():
+                    fh = tf.extractfile(mem)
+                    tar_shas[posixpath.normpath(mem.name)] = hashlib.sha256(
+                        fh.read() if fh else b"").hexdigest()
     except (tarfile.TarError, OSError, EOFError) as error:
         deny(f"saves.tar 打不开/截断：{error}")
     tar_files, tar_sizes, seen = {}, {}, set()
@@ -416,18 +423,27 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
                       if tar_sizes[rel] != want[0])
     if bad_size:
         deny(f"声明长度与 tar 成员不符 {len(bad_size)} 项：{bad_size[:3]}")
+    bad_sha = sorted(rel for rel, want in files_map.items()
+                     if tar_shas.get(rel) != want[1])
+    if bad_sha:
+        deny(f"tar 成员内容 sha 与 meta.files 不符 {len(bad_sha)} 项：{bad_sha[:3]}")
     state_dir = f"/data/data/{pkg}/files/user/0/saves/{title_id}/ryujinx-android"
     tmp = f"/data/local/tmp/s2a-checkpoint-{uuid.uuid4().hex[:12]}.tar"
+    # 先登记待清，确认设备上已删除才撤销：push 中途失败、rm 失败或被中断
+    # （SIGTERM / KeyboardInterrupt）都留下登记，收局并入还原失败 → 留置
+    block["tmp_left"] = tmp
     try:
         d.run("push", str(tar_p), tmp, timeout=300)
         d.run_as(pkg, f"mkdir -p {shlex.quote(state_dir)}", timeout=60)
         d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(state_dir)}", timeout=600)
     finally:
         try:
-            d.shell(f"rm -f {tmp}")
+            d.shell(f"rm -f {tmp}")          # rc≠0 抛错；rc=0（rm -f）即已不在
+            block.pop("tmp_left", None)
         except (RuntimeError, subprocess.SubprocessError) as error:
-            block["tmp_left"] = tmp
             block["tmp_cleanup_error"] = str(error)[:160]
+    if block.get("tmp_left"):
+        deny(f"临时归档 {tmp} 清不掉或未证已删，停起局并留置")
     raw = {}
     entries = device_entries(d, pkg, state_dir, raw=raw)
     bad = [rel for rel, want in files_map.items()
@@ -443,7 +459,10 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
              f"（设备原始清单已存 {dump.name}/）")
     block.update(scene=meta.get("scene"), title_id=title_id,
                  files=len(files_map),
-                 extra_files=sum(1 for rel in entries if rel not in files_map),
+                 extra_files=sum(1 for rel, e in entries.items()
+                                 if rel not in files_map and e.get("t") != "d"),
+                 extra_dirs=sum(1 for rel, e in entries.items()
+                                if rel not in files_map and e.get("t") == "d"),
                  verify="ok")
     log(f"检查点 {cp_dir.name} 已解入 saves/{title_id}/ryujinx-android（{len(files_map)} 文件 sha 复核过）")
 
