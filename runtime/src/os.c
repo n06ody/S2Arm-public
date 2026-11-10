@@ -18,7 +18,12 @@
 #include <limits.h>
 #include <time.h>
 #include <string.h>
+#if __has_include(<sys/system_properties.h>)
 #include <sys/system_properties.h>
+#define S2A_SESSION_UUID_PROP 1
+#else
+#define PROP_VALUE_MAX 92   /* 替身头缺失的同长缓冲；bionic 恒 92（svc_mem.c 同款 has_include 模式） */
+#endif
 #endif
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -154,7 +159,10 @@ __attribute__((visibility("hidden"))) int s2a_android_session_log_start(const ch
     // 按内容绑本局（文件名/PID/mtime 都证明不了「这局」——同 PID 旧文件全靠它区分）。
     // 属性没置上/读到空 → uuid=-（取证端判 unproven，不冒充 bound）。
     char uuid[PROP_VALUE_MAX];
-    if (__system_property_get("debug.s2a.session_uuid", uuid) <= 0) strcpy(uuid, "-");
+#ifdef S2A_SESSION_UUID_PROP
+    if (__system_property_get("debug.s2a.session_uuid", uuid) <= 0)
+#endif
+        strcpy(uuid, "-");
     if (dprintf(fd, "[s2a] Android 会话日志：session=%llu pid=%d uuid=%s file=%s\n",
         (unsigned long long)session, (int)getpid(), uuid, path) < 0) { error = errno; goto done; }
     // stdout 收 Ryujinx ConsoleLogTarget；stderr 收 Console.Error；native fd 保留原始行。
