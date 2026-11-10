@@ -13,8 +13,8 @@ import android.os.Handler;
  *   A4 档位限帧：GameManager.getGameMode() == GAME_MODE_BATTERY 时 NativeBridge.setBatteryCap(true)，
  *     直连 present 周期取 max(原周期, 33.3 ms)；游戏模式配置声明两个 supports 为 false，
  *     OEM 厂商干预保留、不由本应用代管（厂商 SDK 未实现）。
- * debug.s2a.frame_vote / debug.s2a.battery_cap 运行时开关，默认开（属性值 "0" 才关）；
- * 关 A3 时清掉已投的票，关 A4 时把 cap 退回 false。
+ * debug.s2a.frame_vote / debug.s2a.battery_cap 运行时开关，默认关（属性值 "1" 才开，
+ * 与原生 fd_prop_is_on 同口径）；关 A3 时清掉已投的票，关 A4 时把 cap 退回 false。
  */
 final class SystemTuning implements Runnable {
     private static final long TICK_MS = 500;
@@ -75,9 +75,9 @@ final class SystemTuning implements Runnable {
         try {
             Class<?> properties = Class.forName("android.os.SystemProperties");
             Object value = properties.getMethod("get", String.class, String.class).invoke(null, property, "");
-            return !"0".equals(value);   // 读不到 / 未设 = 默认开；只有显式 "0" 关
+            return "1".equals(value);   // 默认关：显式 "1" 才开（与 native fd_prop_is_on 同口径）
         } catch (ReflectiveOperationException unavailable) {
-            return true;
+            return false;
         }
     }
 }

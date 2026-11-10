@@ -26,19 +26,26 @@ public final class SystemTuningTest {
         Surface surface = new Surface();
         attach.invoke(tuning, surface);
 
-        // A3：登记的直连最终周期 → fps 投票；0 = 清票；去重不重复投
+        // 合成包口径：默认关——开关未设（空值/未写）时不投票、不下 cap
         NativeBridge.periodNs = 16666666;
         start.invoke(tuning);
         handler.runPending();
-        check(surface.calls == 1 && Math.abs(surface.value - 60f) < 0.01f, "present period votes 60");
+        check(surface.calls <= 1 && surface.value == 0f, "switch unset: default off votes nothing positive");
+        android.os.SystemProperties.values.put("debug.s2a.frame_vote", "1");
+        android.os.SystemProperties.values.put("debug.s2a.battery_cap", "1");
+        int votes0 = surface.calls;
+
+        // A3：登记的直连最终周期 → fps 投票；0 = 清票；去重不重复投
         handler.runPending();
-        check(surface.calls == 1, "same period does not revote");
+        check(surface.calls == votes0 + 1 && Math.abs(surface.value - 60f) < 0.01f, "present period votes 60");
+        handler.runPending();
+        check(surface.calls == votes0 + 1, "same period does not revote");
         NativeBridge.periodNs = 33333334;
         handler.runPending();
-        check(surface.calls == 2 && Math.abs(surface.value - 30f) < 0.01f, "capped period votes 30");
+        check(surface.calls == votes0 + 2 && Math.abs(surface.value - 30f) < 0.01f, "capped period votes 30");
         NativeBridge.periodNs = 0;
         handler.runPending();
-        check(surface.calls == 3 && surface.value == 0f, "no presents clears vote");
+        check(surface.calls == votes0 + 3 && surface.value == 0f, "no presents clears vote");
 
         // A4：省电档 → cap true 一次；不变不重复下 JNI；回到标准档退回 false
         int calls0 = NativeBridge.capCalls;
@@ -65,6 +72,8 @@ public final class SystemTuningTest {
         handler.runPending();
         check(!NativeBridge.cap && NativeBridge.capCalls == calls1 + 2, "battery_cap=0 forces cap off");
         android.os.SystemProperties.values.clear();
+        // 默认关口径：清空后只剩 frame_vote 开（后段要投票）；battery_cap 保持关，cap 恒 false
+        android.os.SystemProperties.values.put("debug.s2a.frame_vote", "1");
 
         // API<31 不读 GameManager：省电档不可见 → cap 保持 false
         Build.VERSION.SDK_INT = 30;
