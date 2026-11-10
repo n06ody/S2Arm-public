@@ -1022,7 +1022,10 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
             f.write(header)
             for j in range(1, len(rec)):
                 (i0, t0), (i1, t1) = rec[j - 1], rec[j]
-                # stats() 同一口径：帧号 = 1 基 present 序号；disp_us = 相邻上屏间隔
+                # stats() 同一口径：帧号 = 1 基 present 序号；
+                # disp_us 列 = 相邻 present 间隔（宿主算）——与 v5 记录的 disp_us
+                # 字段同名不同义：记录里是 displayTiming 设备侧确认间隔（可无值
+                # 0xffffffff），本列恒为相邻上屏差，供帧时/FPS 判读。
                 f.write(f"{first + i1 + 1}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}\n")
                 rows += 1
         if window_us:

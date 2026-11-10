@@ -814,14 +814,17 @@ def make_state(root, **kw):
 
 def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid=4242,
                    clock="CLOCK_BOOTTIME"):
-    """v3 帧日志块（镜像 nvn_vk_frame_log.c：24B 记录 = ts_us + fence + acquire + present；
+    """v5 帧日志块（镜像 nvn_vk_frame_log.c：40B 记录 = ts_us + fence + acquire + present
+    + gpu_us/gpu_seq + disp_us/disp_seq——后四个无确认写 0xffffffff，照真机编码；
     meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。"""
-    recs = [struct.pack("<QIIII", base_ts + i * step_us, 0, 0, 900, 1200) for i in range(recorded)]
+    recs = [struct.pack("<QIIIIIIII", base_ts + i * step_us, 0, 0, 900, 1200,
+                        0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff)
+            for i in range(recorded)]
     blob = b"".join(recs)
     b64 = base64.b64encode(blob).decode()
     parts = [b64[i:i + 700] for i in range(0, len(b64), 700)]
     pre = f"11-09 12:00:01.000  {pid}  {pid} I S2Arm: "
-    lines = [pre + f"direct frame-log meta: v=3 clock={clock} unit=us endian=le rec=24 "
+    lines = [pre + f"direct frame-log meta: v=5 clock={clock} unit=us endian=le rec=40 "
                    f"cap=32768 recorded={recorded} presents={first + recorded} dropped=0 "
                    f"first={first} bytes={len(blob)} chunks={len(parts)}"]
     lines += [pre + f"direct frame-log[{i + 1}/{len(parts)}]:{p}" for i, p in enumerate(parts)]
@@ -2314,7 +2317,8 @@ class RunGameTest(unittest.TestCase):
         的 frame-log-<pid>.log 完整同文块把帧救回来：帧表有帧、截断注记仍如实留。"""
         full = frame_log_text(200, base_ts=10_500_000)
         priv = "".join(ln.split("S2Arm: ", 1)[1] + "\n" for ln in full.splitlines())
-        priv = priv.replace(" chunks=10\n", " chunks=10 uuid=<SESSION_UUID>\n", 1)
+        priv = re.sub(r" chunks=\d+\n", lambda m: m.group(0)[:-1] + " uuid=<SESSION_UUID>\n",
+                      priv, count=1)
         stray = frame_log_text(400, base_ts=10_050_000, pid=9999)  # end 行让转储等待不空转
         trunc = "\n".join(full.splitlines()[:-2]) + "\n"           # 4242 块砍尾 = 截断
         (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + stray + trunc)
