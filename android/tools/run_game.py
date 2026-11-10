@@ -362,14 +362,13 @@ def device_timebase(d):
 
 def frame_log_blocks(text, pids=None):
     """meta→end 切帧日志块；给 pids 时只收这些 PID 的行（logcat 行前缀 PID 绑定当局进程）。
-    没前缀 / 别的 PID 的帧日志行一律不进块；同一块成员必须同属 meta 行那个 PID——
-    当局是多进程（pkg / pkg:*）时两进程的转储会在 logcat 里交错，跨 PID 拼出来的
-    「块」是拼接物不是转储（meta 说 recorded=N、分片来自另一进程、SHA 对不上也能骗过
-    完整性判读），异 PID 行一律不进本块。末尾被截断的块只坏自己。
-    截断块（没等到 end：被新 meta 顶断 / 文末就断了）同样交出——缺了哪些片、
-    缺 end/SHA 由 parser 如实报「转储被截断 / 整段未证」，不静默丢。"""
-    seg = None
-    seg_pid = None
+    没前缀 / 别的 PID 的帧日志行一律不进块；块按行前缀 PID 各自维护——当局是
+    多进程（pkg / pkg:*）时两进程的转储在 logcat 里逐行交错也各成各的完整块，
+    只有同 PID 的新 meta 才截断同 PID 的旧块（异 PID 行插进来不算顶断、不拼块）。
+    没前缀时（私有文件整文）单块照旧。末尾被截断的块只坏自己。
+    截断块（没等到 end：被同 PID 新 meta 顶断 / 文末就断了）同样交出——缺了
+    哪些片、缺 end/SHA 由 parser 如实报「转储被截断 / 整段未证」，不静默丢。"""
+    segs = {}
     for line in text.splitlines():
         if "direct frame-log" not in line:
             continue
@@ -380,17 +379,14 @@ def frame_log_blocks(text, pids=None):
                 continue
             lp = int(m.group(1))
         if "direct frame-log meta:" in line:
-            if seg is not None:
-                yield "\n".join(seg)
-            seg, seg_pid = [], lp
-        if seg is not None:
-            if pids is not None and lp != seg_pid:
-                continue    # 异 PID 行不进本块：交错转储各归各，不拼块
-            seg.append(line)
+            if segs.get(lp):
+                yield "\n".join(segs[lp])
+            segs[lp] = []
+        if lp in segs:
+            segs[lp].append(line)
             if "direct frame-log end:" in line:
-                yield "\n".join(seg)
-                seg = seg_pid = None
-    if seg is not None:
+                yield "\n".join(segs.pop(lp))
+    for seg in segs.values():
         yield "\n".join(seg)
 
 
@@ -602,7 +598,7 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
                         "device_bytes": want_bytes, "device_sha256": want_sha,
                         "verified": verified, "session": session})
         if name.startswith("frame-log-") and verified and session == "bound":
-            frame_texts.append(r.stdout.decode(errors="replace"))
+            frame_texts.append((pid, r.stdout.decode(errors="replace")))
     return records, frame_texts
 
 
@@ -1132,16 +1128,26 @@ def main(argv=None):
         direct = "direct provider prepared" in (logcat + dump)
         caps, seen = [], set()
 
-        def collect_caps(text, **kw):
+        def collect_caps(text, src_pid=None, **kw):
             for block in frame_log_blocks(text, **kw):
+                bpid = src_pid
+                if bpid is None:
+                    m = THREADTIME_PID.match(block)
+                    bpid = int(m.group(1)) if m else None
                 mu = FRAME_UUID.search(block)
                 if not mu or not run_uuid or mu.group(1) != run_uuid:
                     notes.append(f"帧日志块本局 uuid 对不上（{mu.group(1) if mu else '字段缺'} "
                                  f"≠ {run_uuid or '本局未生成'}）：不证属本局，整段不收")
                     continue
+                # end 行的载荷 sha（parser 已验过与分片实算一致）做去重内容键：
+                # logcat / dump / 私有文件是同一进程同一转储的同文复制才算重复——
+                # 同计数不同载荷（另一进程重转 / 别局改过的块）两份都保留
+                sm = re.search(r"sha256=([0-9a-fA-F]+)", block)
+                sha = sm.group(1).lower() if sm else None
                 try:
                     for cap in direct_framelog.parse(block):
-                        key = (cap["meta"]["first"], cap["meta"]["recorded"], len(cap["ts"]))
+                        key = (bpid, cap["meta"]["first"], cap["meta"]["recorded"],
+                               len(cap["ts"]), sha)
                         if key not in seen:
                             seen.add(key)
                             caps.append(cap)
@@ -1151,8 +1157,8 @@ def main(argv=None):
         if pids:
             for text in (logcat, dump):
                 collect_caps(text, pids=pids)
-            for text in priv_frames:  # 私有帧文件按文件名绑 PID（行无 logcat 前缀）
-                collect_caps(text)
+            for fpid, text in priv_frames:  # 私有帧文件按文件名绑 PID（行无 logcat 前缀）
+                collect_caps(text, src_pid=fpid)
         if not direct:
             notes.append("logcat 没有「direct provider prepared」：非直连 provider（SurfaceFlinger 路），"
                          "帧表不写帧（direct present 与 SF 时序不混算）")
