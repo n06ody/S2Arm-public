@@ -425,7 +425,10 @@ def check_android(o, name, ai=True):
     #   任一门不过整块作废；再跑整局电量计交叉核对，不互证 → 积分不采信。积出来的瓦数是
     #   电池侧估计、未经外部表计校准 → 记「未证」，不套整机门槛。
     pw = list(csv.DictReader(open(os.path.join(o, 'power.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'power.tsv')) else []
-    if not pw: out['能耗'] = '没数据'
+    if not pw:
+        out['能耗'] = '没数据'
+        psd = meta.get('power_sampler') or {}
+        if psd.get('disabled'): read.append(f"能耗 本局未开采样（{psd.get('reason') or '--no-power-sampler'}），不报瓦数")
     else:
         import android_power
         def _i(r, k):
