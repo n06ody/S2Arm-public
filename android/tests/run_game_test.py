@@ -124,12 +124,16 @@ def file_sha(b):
     return hashlib.sha256(b).hexdigest()
 
 def sha_listing(dir_):
-    # find . -type f -exec sha256sum {} + 的输出口径
+    # find . -type f 的输出口径：只收普通文件——dev_stat_types 报成
+    # fifo/socket 的不出（真机 -type f 同口径）
+    types = st.get("dev_stat_types", {}).get(dir_, {})
     lines = []
     for rel, hx in sorted(DATA_DIRS.get(dir_, {}).items()):
-        lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
+        if types.get(rel, "regular file").startswith("regular"):
+            lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
     for rel, n in sorted(DATA_PAD.get(dir_, {}).items()):
-        lines.append(f"{zeros_sha(n)}  ./{rel}")
+        if types.get(rel, "regular file").startswith("regular"):
+            lines.append(f"{zeros_sha(n)}  ./{rel}")
     return "\\n".join(lines) + ("\\n" if lines else "")
 
 def run_as(cmdline, via_shell=False):
@@ -206,20 +210,35 @@ def run_as(cmdline, via_shell=False):
             out("denied\\n"); return
         out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS or dir_ in DATA_LINKS
              or dir_ in DATA_SUBDIRS else "absent") + "\\n"); return
-    m = _re.match(r"^cd (\\S+) && find \\. -type f -exec sha256sum \\{\\} \\+$", cmdline)
-    if m:
-        out(sha_listing(m.group(1))); return
-    m = _re.match(r"^cd (\\S+) && find \\. -mindepth 1 -exec stat -c '%a\\|%F\\|%n' \\{\\} \\+$",
+    def _emit_batched(dir_, lines, want):
+        # 分批清单收尾（find -print0 | xargs -0 -n 256 …; echo S2A_RC; echo S2A_N）
+        n = int(st.get("data_listing_short", {}).get(dir_, 0))
+        if n: lines = lines[:-n]              # xargs rc=0 但某批输出丢了 → 条数不符
+        rc_ = "0"
+        if st.get("data_xargs_fail"):
+            lines, rc_ = lines[:len(lines) // 2], "126"   # 中途批次挂：半截 + 非零 rc
+        out("\\n".join(lines) + ("\\n" if lines else ""))
+        out(f"S2A_RC={rc_}\\nS2A_N={want}\\n"); return
+    m = _re.match(r"^cd (\\S+) && \\{ find \\. -type f -print0 \\| xargs -0 -n 256 sha256sum;",
                   cmdline)
     if m:
-        lines = []
-        for rel, (mode, ftype) in sorted(dir_entries(m.group(1)).items()):
-            lines.append(f"{mode}|{ftype}|./{rel}")
-        out("\\n".join(lines) + ("\\n" if lines else "")); return
-    m = _re.match(r"^cd (\\S+) && find \\. -type l -exec sh -c 'for p do ", cmdline)
+        dir_ = m.group(1)
+        want = sum(1 for ft in (e[1] for e in dir_entries(dir_).values())
+                   if ft.startswith("regular"))
+        _emit_batched(dir_, sha_listing(dir_).splitlines(), want); return
+    m = _re.match(r"^cd (\\S+) && \\{ find \\. -mindepth 1 -print0 \\| xargs -0 -n 256 stat ",
+                  cmdline)
     if m:
-        lines = [f"./{rel}\\t{tgt}" for rel, tgt in sorted(DATA_LINKS.get(m.group(1), {}).items())]
-        out("\\n".join(lines) + ("\\n" if lines else "")); return
+        dir_ = m.group(1)
+        lines = [f"{mode}|{ftype}|./{rel}"
+                 for rel, (mode, ftype) in sorted(dir_entries(dir_).items())]
+        _emit_batched(dir_, lines, len(lines)); return
+    m = _re.match(r"^cd (\\S+) && \\{ find \\. -type l -print0 \\| xargs -0 -n 256 sh -c ",
+                  cmdline)
+    if m:
+        dir_ = m.group(1)
+        lines = [f"./{rel}\\t{tgt}" for rel, tgt in sorted(DATA_LINKS.get(dir_, {}).items())]
+        _emit_batched(dir_, lines, len(lines)); return
     m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
     if m:
         if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
@@ -240,6 +259,8 @@ def run_as(cmdline, via_shell=False):
         with tarfile.open(src) as tf:
             for mem in tf.getmembers():
                 rel = mem.name[2:] if mem.name.startswith("./") else mem.name
+                if rel in ("", "."):  # ./ 根成员：find -mindepth 1 不出它，不登记
+                    continue
                 DATA_MODES.setdefault(dir_, {})[rel] = format(mem.mode & 0o7777, "o")
                 if mem.isfile():
                     if mem.size >= (1 << 20):
@@ -300,7 +321,7 @@ def shell_data_cmd(text):
     探针按 "echo ok" 圈 _dir_probe 形（__denied__/ls 残留探针不接管）。"""
     if re.match(r"^e=\\$\\(stat ", text):
         return "echo ok" in text
-    m = re.match(r"^cd (\\S+) && find ", text) or \
+    m = re.match(r"^cd (\\S+) && ", text) or \
         re.match(r"^tar -xpf \\S+ -C (\\S+)$", text) or \
         re.match(r"^(?:mkdir -p \\S+; )?find (\\S+) -mindepth 1 -delete$", text)
     return bool(m) and m.group(1).rstrip("/") in DATA_DIRS
@@ -1071,6 +1092,40 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(0, rc, "run-as 被拒不该挡外部目录备份（应走 shell 通道）")
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertEqual(state["data_dirs"], st["data_dirs"], "还原后数据逐字节一致")
+
+    def test_data_listing_batches_and_counts(self):
+        """㊹ device_entries 分批清单（find -print0 | xargs -0 -n 256 替代
+        -exec {} +——4 万文件私有树 toybox E2BIG，9000 实测）：>256 文件多批走通，
+        条目数与 find 计数一致才算完整。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][priv].update({f"bulk/f{i:04d}.bin": "aa" for i in range(600)})
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc)
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        self.assertIn("bulk/f0599.bin", man["dirs"]["private"]["entries"])
+        self.assertEqual(600 + 3, len(man["dirs"]["private"]["files"]))
+
+    def test_data_listing_truncated_fails(self):
+        """㊹ 半截清单（xargs rc=0 但某批输出丢了）：条目数≠find 计数 → 拒，
+        不拿半截当全量（失败签名=清单不完整，唯计数门所出）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_listing_short"] = {priv: 1}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("清单不完整", man["reason"])
+
+    def test_data_xargs_batch_fail_refuses(self):
+        """㊹ xargs 中途批次挂（rc=126）：S2A_RC≠0 → 清单不完整拒跑
+        （失败签名=未完整返回，唯 rc 门所出）。"""
+        state = self._data_state()
+        state["data_xargs_fail"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("未完整返回", man["reason"])
 
     def test_pushed_tamper_caught_by_post_verify(self):
         """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →

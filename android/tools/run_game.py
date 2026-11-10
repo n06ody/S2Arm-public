@@ -124,13 +124,23 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
-LINK_MAP_CMD = ("cd {q} && find . -type l -exec sh -c "
-                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _ {{}} +")
+# 目录清单三件套：find -exec {} + 会把全部路径摊进一次 exec——4 万文件的私有树
+# 触发 toybox E2BIG（Argument list too long，9000 实测；与 deploy_game 核验同病
+# 同治）：改 find -print0 | xargs -0 -n 256 分批。收尾 S2A_RC=xargs rc +
+# S2A_N=find 计数——xargs 任何一批失败（rc=123/126）或清单条数与计数不符都
+# 算半截清单，不当完整用。
+SHA_MAP_CMD = ("cd {q} && {{ find . -type f -print0 | xargs -0 -n 256 sha256sum; "
+               "echo S2A_RC=$?; echo S2A_N=$(find . -type f | wc -l); }}")
+STAT_MAP_CMD = ("cd {q} && {{ find . -mindepth 1 -print0 | xargs -0 -n 256 "
+                "stat -c '%a|%F|%n'; echo S2A_RC=$?; "
+                "echo S2A_N=$(find . -mindepth 1 | wc -l); }}")
+LINK_MAP_CMD = ("cd {q} && {{ find . -type l -print0 | xargs -0 -n 256 sh -c "
+                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _; "
+                "echo S2A_RC=$?; echo S2A_N=$(find . -type l | wc -l); }}")
 
 
-def _entry_map(sha_text, stat_text, link_text):
-    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}。rel 去掉 ./ 前缀。"""
+def _stat_map(stat_text):
+    """stat -c '%a|%F|%n' 清单 → {rel: {t, mode}}。rel 去掉 ./ 前缀。"""
     entries = {}
     for ln in stat_text.splitlines():
         ln = ln.strip()
@@ -148,30 +158,74 @@ def _entry_map(sha_text, stat_text, link_text):
              "character special file": "c",
              "block special file": "b"}.get(ftype, ftype)
         entries[rel] = {"t": t, "mode": int(mode, 8)}
-    for rel, sha in _sha_listing(sha_text).items():
-        if rel in entries:
-            entries[rel]["sha"] = sha
+    return entries
+
+
+def _link_map(link_text):
+    """软链清单（path<TAB>target 行）→ {rel: target}。"""
+    links = {}
     for ln in link_text.splitlines():
         if "\t" not in ln:
             continue
         name, target = ln.split("\t", 1)
         rel = posixpath.normpath(name.strip())
+        if rel in ("", "."):
+            continue
+        links[rel] = target
+    return links
+
+
+def _entry_map(sha_map, stat_map, link_map):
+    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}（stat 为主集）。"""
+    entries = {rel: dict(e) for rel, e in stat_map.items()}
+    for rel, sha in sha_map.items():
+        if rel in entries:
+            entries[rel]["sha"] = sha
+    for rel, target in link_map.items():
         if rel in entries:
             entries[rel]["target"] = target
     return entries
 
 
+def _listing_parts(text, what):
+    """分批清单输出 → (清单文本, find 计数)。收尾 S2A_RC/S2A_N 缺一或
+    xargs rc≠0 → RuntimeError（半截清单不当完整）。"""
+    lines, rc, want = [], None, None
+    for ln in text.splitlines():
+        if ln.startswith("S2A_RC="):
+            rc = ln[7:]
+        elif ln.startswith("S2A_N="):
+            want = ln[6:]
+        else:
+            lines.append(ln)
+    if rc != "0" or want is None:
+        raise RuntimeError(f"{what}清单未完整返回（xargs rc={rc}，find 计数={want}）："
+                           "半截不当全量")
+    return "\n".join(lines), int(want)
+
+
 def device_entries(d, pkg, dir_, raw=None):
     """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。
-    raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
-    sha_text = _owner_sh(d, pkg, dir_,
-                         f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
-                         timeout=300)
-    stat_text = _owner_sh(d, pkg, dir_, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
-    link_text = _owner_sh(d, pkg, dir_, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    三份清单各走 -print0|xargs -n 256 分批（E2BIG），每批 rc=0 且解析条目数与
+    find 计数一致才算完整。raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
+    q = shlex.quote(dir_)
+    sha_text = _owner_sh(d, pkg, dir_, SHA_MAP_CMD.format(q=q), timeout=300)
+    stat_text = _owner_sh(d, pkg, dir_, STAT_MAP_CMD.format(q=q), timeout=300)
+    link_text = _owner_sh(d, pkg, dir_, LINK_MAP_CMD.format(q=q), timeout=300)
     if raw is not None:
         raw.update(sha256sum=sha_text, stat=stat_text, links=link_text)
-    return _entry_map(sha_text, stat_text, link_text)
+    sha_text, sha_want = _listing_parts(sha_text, "文件 sha ")
+    stat_text, stat_want = _listing_parts(stat_text, "stat ")
+    link_text, link_want = _listing_parts(link_text, "软链 ")
+    sha_map, stat_map, link_map = (_sha_listing(sha_text),
+                                   _stat_map(stat_text), _link_map(link_text))
+    bad = [f"{w}{have}≠{want}" for w, have, want in
+           (("文件 sha ", len(sha_map), sha_want),
+            ("stat ", len(stat_map), stat_want),
+            ("软链 ", len(link_map), link_want)) if have != want]
+    if bad:
+        raise RuntimeError(f"{dir_} 目录清单不完整（{'；'.join(bad)}）：半截不当全量")
+    return _entry_map(sha_map, stat_map, link_map)
 
 
 def tar_entries(tar_path):
