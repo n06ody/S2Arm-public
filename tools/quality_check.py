@@ -346,14 +346,18 @@ def fs_layer(o, hl, ask=True):
 
 def check_android(o, name, ai=True):
     """安卓局目录（安卓线 K3）：android.json（机型 / 包名 / 屏幕 / 窗口秒数 / 启动命令）、shots_ap/NN_SSSs.png（整屏截图，含虚拟手柄覆盖层与系统黑边）、
-    frames.tsv（frame / present_ns / disp_us / wall_us，SurfaceFlinger 真实上屏间隔）、power.tsv（t / plugged / mv / current_raw / level / temp_c）、
+    frames.tsv（frame / present_ns / disp_us / wall_us，direct-present 帧日志的上屏间隔，采集窗口内）、power.tsv（t + android_power.FIELDS + level）、
     logcat.txt、gfx_mode.txt。没有自动玩家：开窗即已在可玩画面（android.json mark），整窗口就是读数窗口。五项：
       画面 / 到游戏画面：同 iPhone，AI 看截图（题面说明覆盖层不算错）
-      帧率：disp_us 窗口 ≥ 55 秒、平均 ≥ 目标 × 99%、慢帧（> 1.5 倍预算）≤ 1%；目标取 tools/fps_truth.tsv（程序号从包名 org.s2arm.game.t<程序号> 取），没有按 60
+      帧率：先判采集窗口覆盖——frame_window_us 窗口内帧 span 覆盖 <95% → 「窗口覆盖不足」没数据；
+        再要 disp_us 窗口 ≥ 55 秒、平均 ≥ 目标 × 99%、慢帧（> 1.5 倍预算）≤ 1%；目标取 tools/fps_truth.tsv（程序号从包名 org.s2arm.game.t<程序号> 取），没有按 60
       满屏：截图就是整屏，直接数左右纯黑列（同 bars()；只看 AI 判为游戏画面的，没有判官时看全部）
       直连默认启动：启动命令带了 --es s2arm.graphics_mode 就不算默认启动（没数据）；直连 / 通用认 logcat「direct provider prepared」/「Gpu LoadShaders」，
         其次 gfx_mode.txt 首行；直连且有游戏画面 → 过，通用 → 不过
-      能耗：整窗口都没接电（plugged 全 0）才算：均值 |电压 mV × 电流 µA| / 1e9 瓦，门槛同 iPhone（60 帧 4.8 W / 其余 3.7 W，读数注「按 iPhone 门槛」）；接过电 → 没数据"""
+      能耗：power.tsv = t + android_power.FIELDS + level（run_game.py 写）。整窗口每行 status=Discharging
+        且供电旗标无 true 才算；放电符号由本机放电样本推出（非零全同号），不一致 → 没数据；
+        电池侧梯形积分（boot_us 同窗，tools/android_power.battery_window）算出瓦数 → 「未证」
+        （诊断读数，无设备校准，不套 iPhone 整机门槛）；接过电 / 状态未证 / 窗口不齐 → 没数据"""
     import json as _json
     meta = _json.load(open(os.path.join(o, 'android.json'), encoding='utf-8')) if os.path.exists(os.path.join(o, 'android.json')) else {}
     ps = shots(o); out = {'款': name, '局目录': o, '截图': ' '.join(os.path.relpath(x, o) for x in ps)}; read = []
@@ -372,12 +376,30 @@ def check_android(o, name, ai=True):
         read.append('画面 ' + ('异常 ' + '；'.join(bad) if bad else '拿不准 ' + '；'.join(unsure) if unsure else f'{len(ps)} 张都正常'))
         game = [x for x, a in zip(ps, ans) if a.get('游戏画面') == '是']
     else: out['画面'] = '没数据'
-    # 帧率
+    # 帧率：先算采集窗口覆盖——帧表只装窗口内帧，但块首帧晚到 / 尾帧早停都会留空档；
+    # 覆盖 <95% 不能拿手里这段冒充整窗统计（8E 首局：61.1s 窗内只覆盖 56.4s 曾误判窗口成立）
     rows = list(csv.DictReader(open(os.path.join(o, 'frames.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'frames.tsv')) else []
     win = [int(r['disp_us']) / 1000 for r in rows if (r.get('disp_us') or '').isdigit() and int(r['disp_us']) > 0]
     import fps_truth
     t = fps_truth.load().get(pid.lower()) if pid else None; fps = float(t['目标帧率']) if t else 60.0; bud = 1000.0 / fps
-    if sum(win) < 55000: out['帧率'] = '没数据'; read.append(f'帧率 窗口不足 55 秒：{sum(win) / 1000:.0f} 秒、{len(win)} 帧')
+    short = None
+    fw = meta.get('frame_window_us')
+    if rows and isinstance(fw, list) and len(fw) == 2:
+        try:
+            w0, w1 = int(fw[0]), int(fw[1])
+            t_first = int(rows[0]['present_ns']) // 1000 - int(rows[0]['disp_us'])
+            t_last = int(rows[-1]['present_ns']) // 1000
+            if w1 > w0 and t_last > t_first:
+                span = t_last - t_first
+                if span / (w1 - w0) < 0.95:
+                    short = (f'帧率 窗口覆盖不足：{(w1 - w0) / 1e6:.1f}s 窗口帧覆盖 {span / 1e6:.1f}s'
+                             f'（{span / (w1 - w0):.0%}，首部空 {max(0, t_first - w0) / 1e6:.1f}s、'
+                             f'尾部空 {max(0, w1 - t_last) / 1e6:.1f}s）')
+        except (ValueError, KeyError):
+            pass
+    if short:
+        out['帧率'] = '没数据'; read.append(short)
+    elif sum(win) < 55000: out['帧率'] = '没数据'; read.append(f'帧率 窗口不足 55 秒：{sum(win) / 1000:.0f} 秒、{len(win)} 帧')
     else:
         avg = len(win) * 1000 / sum(win); slow = sum(w > 1.5 * bud for w in win) / len(win) * 100; med = sorted(win)[len(win) // 2]
         out['帧率'] = '过' if avg >= fps * 0.99 and slow <= 1 else '不过'
@@ -397,16 +419,37 @@ def check_android(o, name, ai=True):
     elif gm == 'generic': out['直连默认启动'] = '不过'
     elif gm == 'direct': out['直连默认启动'] = '过' if game else '没数据' if ans is None else '不过'
     else: out['直连默认启动'] = '没数据'; read.append('直连默认启动 logcat / gfx_mode.txt 认不出图形模式（日志要取 <包名>:game 子进程）')
-    # 能耗
+    # 能耗（兄弟项目 power-comparison 口径）：块边界 = frame_window_us，分析窗剔首 15s /
+    #   尾 5s；窗内每行须物理放电（status=Discharging 且 plugged=0）、屏幕交互、非省电、
+    #   thermal_status<3、电流/电压/电量计读数合法、符号一致、采样间隔 ≤3s、边界全覆盖——
+    #   任一门不过整块作废；再跑整局电量计交叉核对，不互证 → 积分不采信。积出来的瓦数是
+    #   电池侧估计、未经外部表计校准 → 记「未证」，不套整机门槛。
     pw = list(csv.DictReader(open(os.path.join(o, 'power.tsv'), encoding='utf-8', errors='replace'), delimiter='\t')) if os.path.exists(os.path.join(o, 'power.tsv')) else []
     if not pw: out['能耗'] = '没数据'
-    elif any(r.get('plugged') not in ('0', '', None) for r in pw): out['能耗'] = '没数据'; read.append('能耗 窗口内接过电（充放差不是整机功耗），不算')
     else:
-        try:
-            w = sum(abs(float(r['mv']) * float(r['current_raw'])) for r in pw) / len(pw) / 1e9; lim = w_max(fps)
-            out['能耗'] = '过' if w <= lim and out['帧率'] == '过' else '不过' if out['帧率'] in ('过', '不过') else '没数据'
-            read.append(f'能耗 {w:.2f} W（按 iPhone 门槛 ≤ {lim}）')
-        except (KeyError, ValueError): out['能耗'] = '没数据'
+        import android_power
+        def _i(r, k):
+            try: return int(str(r.get(k, '')).strip())
+            except ValueError: return None
+        boots = [_i(r, 'boot_us') for r in pw]
+        fw2 = meta.get('frame_window_us')
+        begin, end = (fw2[0], fw2[1]) if isinstance(fw2, list) and len(fw2) == 2 else (
+            (boots[0], boots[-1]) if boots and all(b is not None for b in boots) else (None, None))
+        res = android_power.battery_window(pw, begin, end)
+        if res.get('averageW') is None:
+            out['能耗'] = '没数据'; read.append(f"能耗 {res.get('reason', '窗口不成立')}")
+        else:
+            co = android_power.charge_corroboration(pw)
+            line = (f"能耗 电池侧均值 {res['averageW']:.2f} W × {res['durationSeconds']:.0f}s"
+                    f"（电流符号 {res.get('rawCurrentSign')}、{res.get('samples')} 采样"
+                    + (f"、电量计 {res['chargeCounterW']:.2f} W 比值 {res['chargeToCurrentRatio']:.2f}"
+                       if res.get('chargeCounterW') is not None else "") + "）")
+            if co.get('corroborated'):
+                out['能耗'] = '未证'
+                read.append(line + f"；电量计交叉核对过（{co.get('method', '')}），仍非外部校准")
+            else:
+                out['能耗'] = '没数据'
+                read.append(line + f"；电量计交叉核对不成立（{co.get('error') or co.get('method', '')}），积分不采信")
     read.append(f'安卓 {meta.get("serial_model", "")} {meta.get("soc", "")} Android {meta.get("android", "")}，模式 {gm or "—"}，游戏画面 {len(game)}/{len(ps)} 张')
     out['读数'] = '｜'.join(read)
     return out
