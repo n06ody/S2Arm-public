@@ -1199,8 +1199,9 @@ class RunGameTest(unittest.TestCase):
         self.assertTrue(any("截断" in n or "不完整" in n for n in man["notes"]), man["notes"])
 
     def test_frame_block_interleaved_pids_split(self):
-        """qa-fone ① 正对照：两进程完整转储逐行交错——按各自 meta 的 PID 分流，
-        后到的 4243 块完整成块进表，4242 被顶断的残块如实报截断不污染。"""
+        """qa-fone ① 正对照+负控：两进程完整转储逐行交错——块按各自行前缀
+        PID 分开维护，只有同 PID 的新 meta 才截断旧块；no_priv_seed 关掉
+        私有文件回退，纯 logcat 两块都必须完整（旧单 seg 版丢 4242 一块）。"""
         a = frame_log_text(recorded=200, pid=4242, first=0, base_ts=10_500_000)
         b = frame_log_text(recorded=150, pid=4243, first=0, base_ts=11_000_000)
         la, lb = a.splitlines(), b.splitlines()
@@ -1208,16 +1209,27 @@ class RunGameTest(unittest.TestCase):
                           for x in la[i:i + 1] + lb[i:i + 1]) + "\n"
         (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + inter)
         (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + inter)
-        rc, out, _ = self.run_tool()
+        rc, out, _ = self.run_tool(state={"no_priv_seed": True})
         self.assertEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
-        # logcat 侧：4242 被顶断（meta+残片如实报截断）、4243 完整成块；
-        # 私有文件同文：4242 的 frame-log-<pid>.log 按自己 PID 行完整成块——
-        # 两进程各成一块都进解析，跨 PID 拼接的畸形块不再出现
-        self.assertEqual(2, man["frame_log"]["captures"])
+        self.assertEqual(2, man["frame_log"]["captures"],
+                         "交错转储两 PID 各成完整块，谁也不顶断谁")
         rows = (out / "frames.tsv").read_text().splitlines()
         self.assertEqual(149, len(rows) - 1, "覆盖最大块（4242 窗内 150 帧）出 149 行")
-        self.assertTrue(any("截断" in n or "不完整" in n for n in man["notes"]), man["notes"])
+
+    def test_frame_block_dedup_same_count_diff_payload_kept(self):
+        """qa-fone ②：去重键含 PID+载荷 SHA——同 PID 两块 first/recorded/ts 数
+        全同但载荷不同（重转内容变了）不是重复，两份都保留；旧键当重复吞。"""
+        a = frame_log_text(recorded=200, pid=4242, first=0, base_ts=10_500_000)
+        c = frame_log_text(recorded=200, pid=4242, first=0, base_ts=11_200_000,
+                           step_us=16668)
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + a + c)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + a + c)
+        rc, out, _ = self.run_tool(state={"no_priv_seed": True})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, man["frame_log"]["captures"],
+                         "同计数不同载荷的两块都是证据，一份不吞")
 
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
