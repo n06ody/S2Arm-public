@@ -137,7 +137,13 @@ def _entry_map(sha_text, stat_text, link_text):
         rel = posixpath.normpath(name)
         if rel in ("", "."):
             continue
-        t = {"regular file": "f", "directory": "d", "symbolic link": "l"}.get(ftype, ftype)
+        # toybox stat %F 类型名（8E 实测：0 字节文件出 "regular empty file"，
+        # 不是 "regular file"）；fifo/socket/字符/块设备映各自码，仍被 != f 拒
+        t = {"regular file": "f", "regular empty file": "f",
+             "directory": "d", "symbolic link": "l",
+             "fifo": "p", "socket": "s",
+             "character special file": "c",
+             "block special file": "b"}.get(ftype, ftype)
         entries[rel] = {"t": t, "mode": int(mode, 8)}
     for rel, sha in _sha_listing(sha_text).items():
         if rel in entries:
@@ -152,12 +158,15 @@ def _entry_map(sha_text, stat_text, link_text):
     return entries
 
 
-def device_entries(d, pkg, dir_):
-    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。"""
+def device_entries(d, pkg, dir_, raw=None):
+    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。
+    raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
     sha_text = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
                         timeout=300)
     stat_text = d.run_as(pkg, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
     link_text = d.run_as(pkg, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    if raw is not None:
+        raw.update(sha256sum=sha_text, stat=stat_text, links=link_text)
     return _entry_map(sha_text, stat_text, link_text)
 
 
@@ -318,7 +327,7 @@ def restore_data(d, pkg, manifest, backup_dir):
     return fails
 
 
-def apply_checkpoint(d, pkg, cp_dir, manifest, log):
+def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
     """s2a-checkpoint/1 → 部署后、首启前解进存档根（BootSpec 冻结：
     files/user/0/saves/<titleId>/ryujinx-android；S2A_SAVE_DIR 在 typed BootSpec 下不生效）。
     写设备前宿主全验：schema/包名/titleId（规范 16 位大写十六进制）/meta.files 每项
@@ -419,11 +428,19 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log):
         except (RuntimeError, subprocess.SubprocessError) as error:
             block["tmp_left"] = tmp
             block["tmp_cleanup_error"] = str(error)[:160]
-    entries = device_entries(d, pkg, state_dir)
+    raw = {}
+    entries = device_entries(d, pkg, state_dir, raw=raw)
     bad = [rel for rel, want in files_map.items()
            if entries.get(rel, {}).get("t") != "f" or entries[rel].get("sha") != want[1]]
     if bad:
-        deny(f"解入后核对不符 {len(bad)} 项：{bad[:3]}")
+        # verify=fail 归因：设备端原始 stat/sha/软链清单落 out/checkpoint-device/
+        dump = out / "checkpoint-device"
+        dump.mkdir(parents=True, exist_ok=True)
+        for name, text in raw.items():
+            (dump / f"{name}.txt").write_text(text)
+        block["device_listing"] = "checkpoint-device/"
+        deny(f"解入后核对不符 {len(bad)} 项：{bad[:3]}"
+             f"（设备原始清单已存 {dump.name}/）")
     block.update(scene=meta.get("scene"), title_id=title_id,
                  files=len(files_map),
                  extra_files=sum(1 for rel in entries if rel not in files_map),
@@ -1083,7 +1100,7 @@ def main(argv=None):
 
         # ---- 检查点：部署后、首启前解进存档根，核对不过不起局 ----
         if args.checkpoint:
-            apply_checkpoint(d, pkg, args.checkpoint, manifest, log)
+            apply_checkpoint(d, pkg, args.checkpoint, manifest, log, out)
 
         # ---- 调试门 + 帧日志开关（记原值，收局恢复并逐项读回；release 机不让改只记注）----
         run_uuid = uuid.uuid4().hex   # 本局号：os.c 首行/帧 meta 都写它——内容级归属锚
