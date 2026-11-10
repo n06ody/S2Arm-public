@@ -12,7 +12,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "android"))
-from android_power import battery_window
+sys.path.insert(0, str(ROOT / "android" / "tools"))
+from run_game import power_battery_window as battery_window
 from collect_run import collect, runtime_files
 
 

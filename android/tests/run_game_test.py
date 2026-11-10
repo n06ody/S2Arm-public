@@ -9,7 +9,7 @@
   ⑤ --mode direct：launch 行带 --es s2arm.graphics_mode direct
   ⑥ SIGTERM：采集中途被 TERM → finally 照常收局还原（卸载），不留置
   ⑦ 调试属性恢复读回不符 → 留置；游戏收局后仍存活 → 留置；卸载后 data/obb 有残留 → 留置
-  ⑧ 能耗：放电状态/符号/覆盖按 android_power 口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
+  ⑧ 能耗：放电状态/符号/覆盖按 run_game 功耗段口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
   ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
     → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
@@ -791,7 +791,7 @@ def make_state(root, **kw):
                             "  Wireless powered: false\n  Dock powered: false\n"
                             "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"),
         "dumpsys_thermal": "Current Status:0\nType{Name,Forecast}:CPU{CPU,0.5}\n",
-        # sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
+        # power_sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
         # 没有它 battery_window 证不出「未接电」，能耗永远没数据；交互/省电/热档同理。
         # charge_counter 由替身每拍按 charge_step 递减（800mA ≈ 222µAh/s）。
         "charge_uah": 5_000_000, "charge_step": 222,
@@ -1872,12 +1872,12 @@ class RunGameTest(unittest.TestCase):
         # r25 真串逐字重建（run_game.py @ bd2082cc）：( while …; done ) >log
         # 2>/dev/null </dev/null & echo $! —— fd 引齐了但守护还挂控制终端
         supply = "battery"
-        ap = run_game.android_power
+        ap = run_game
         legacy_inner = (
             f"rm -f /data/local/tmp/s2a-power-samples.log; "
-            f"( while :; do {ap.sample_command(supply)}; "
+            f"( while :; do {ap.power_sample_command(supply)}; "
             f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
-            f"printf '{ap.BLOCK_SEP}\\n'; sleep 1; done )"
+            f"printf '{ap.POWER_BLOCK_SEP}\\n'; sleep 1; done )"
             f" >/data/local/tmp/s2a-power-samples.log 2>/dev/null </dev/null & echo $!")
         legacy = "sh -c " + shlex.quote(legacy_inner)
         with self.assertRaises(subprocess.TimeoutExpired):

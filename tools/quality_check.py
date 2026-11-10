@@ -346,7 +346,7 @@ def fs_layer(o, hl, ask=True):
 
 def check_android(o, name, ai=True):
     """安卓局目录（安卓线 K3）：android.json（机型 / 包名 / 屏幕 / 窗口秒数 / 启动命令）、shots_ap/NN_SSSs.png（整屏截图，含虚拟手柄覆盖层与系统黑边）、
-    frames.tsv（frame / present_ns / disp_us / wall_us，direct-present 帧日志的上屏间隔，采集窗口内）、power.tsv（t + android_power.FIELDS + level）、
+    frames.tsv（frame / present_ns / disp_us / wall_us，direct-present 帧日志的上屏间隔，采集窗口内）、power.tsv（t + run_game.POWER_FIELDS + level）、
     logcat.txt、gfx_mode.txt。没有自动玩家：开窗即已在可玩画面（android.json mark），整窗口就是读数窗口。五项：
       画面 / 到游戏画面：同 iPhone，AI 看截图（题面说明覆盖层不算错）
       帧率：先判采集窗口覆盖——frame_window_us 窗口内帧 span 覆盖 <95% → 「窗口覆盖不足」没数据；
@@ -354,9 +354,9 @@ def check_android(o, name, ai=True):
       满屏：截图就是整屏，直接数左右纯黑列（同 bars()；只看 AI 判为游戏画面的，没有判官时看全部）
       直连默认启动：启动命令带了 --es s2arm.graphics_mode 就不算默认启动（没数据）；直连 / 通用认 logcat「direct provider prepared」/「Gpu LoadShaders」，
         其次 gfx_mode.txt 首行；直连且有游戏画面 → 过，通用 → 不过
-      能耗：power.tsv = t + android_power.FIELDS + level（run_game.py 写）。整窗口每行 status=Discharging
+      能耗：power.tsv = t + run_game.POWER_FIELDS + level（run_game.py 写）。整窗口每行 status=Discharging
         且供电旗标无 true 才算；放电符号由本机放电样本推出（非零全同号），不一致 → 没数据；
-        电池侧梯形积分（boot_us 同窗，tools/android_power.battery_window）算出瓦数 → 「未证」
+        电池侧梯形积分（boot_us 同窗，run_game.power_battery_window）算出瓦数 → 「未证」
         （诊断读数，无设备校准，不套 iPhone 整机门槛）；接过电 / 状态未证 / 窗口不齐 → 没数据"""
     import json as _json
     meta = _json.load(open(os.path.join(o, 'android.json'), encoding='utf-8')) if os.path.exists(os.path.join(o, 'android.json')) else {}
@@ -430,7 +430,10 @@ def check_android(o, name, ai=True):
         psd = meta.get('power_sampler') or {}
         if psd.get('disabled'): read.append(f"能耗 本局未开采样（{psd.get('reason') or '--no-power-sampler'}），不报瓦数")
     else:
-        import android_power
+        for _p in ('android', os.path.join('android', 'tools')):
+            _ap = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), _p)
+            if _ap not in sys.path: sys.path.insert(0, _ap)
+        import run_game  # android/tools：设备侧功耗判读与运行器同源（#163 后 tools/android_power.py 是 host 采集）
         def _i(r, k):
             try: return int(str(r.get(k, '')).strip())
             except ValueError: return None
@@ -438,11 +441,11 @@ def check_android(o, name, ai=True):
         fw2 = meta.get('frame_window_us')
         begin, end = (fw2[0], fw2[1]) if isinstance(fw2, list) and len(fw2) == 2 else (
             (boots[0], boots[-1]) if boots and all(b is not None for b in boots) else (None, None))
-        res = android_power.battery_window(pw, begin, end)
+        res = run_game.power_battery_window(pw, begin, end)
         if res.get('averageW') is None:
             out['能耗'] = '没数据'; read.append(f"能耗 {res.get('reason', '窗口不成立')}")
         else:
-            co = android_power.charge_corroboration(pw)
+            co = run_game.power_charge_corroboration(pw)
             line = (f"能耗 电池侧均值 {res['averageW']:.2f} W × {res['durationSeconds']:.0f}s"
                     f"（电流符号 {res.get('rawCurrentSign')}、{res.get('samples')} 采样"
                     + (f"、电量计 {res['chargeCounterW']:.2f} W 比值 {res['chargeToCurrentRatio']:.2f}"
