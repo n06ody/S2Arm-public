@@ -53,6 +53,7 @@ class android {
                 ExitOrderFixture.check(delay == 10000, "fallback must wait ten seconds");
                 ExitOrderFixture.deferred.add(action); ParentActivity.events.add("fallback_queued");
             }
+            void removeCallbacks(Runnable action) { ExitOrderFixture.deferred.remove(action); }
         }
     }
     static class view { static class View { static final int VISIBLE=0; } }
@@ -97,8 +98,12 @@ public class ExitOrderFixture extends ParentActivity {
     Object gameBackCallback;
     Surface surface=new Surface(), panel=new Surface();
     Probe lifecycleProbe=new Probe(); Runnable lifecycleSample=() -> {};
+    android.os.Handler saveAtomicProbe=new android.os.Handler(android.os.Looper.getMainLooper());
+    Runnable saveAtomicSample=() -> {};   // 存档原子提交采样（dguard 合入 933390a2 新加，stopGame 里 removeCallbacks）
     FrameRate frameRate=new FrameRate(); Keyboard hostKeyboard=new Keyboard(); Keyboard legacyTextInput=new Keyboard();   // #1611 onPause 新加 legacyTextInput.pause()（11-06 main 安卓钩子红，合入运维线补桩）
     GameAudioFocus gameAudioFocus=null;   // #1658 onPause/onResume 新加 gameAudioFocus.pause()/resume()（11-07 main 安卓钩子红，合入运维线补桩）
+    DguardNotice dguardNotice=null;   // dguard 合入（933390a2）onDestroy 新加 if(dguardNotice!=null)dguardNotice.pause()（main 安卓钩子红，补桩同 #1658 口径：null 走空判分支）
+    static class DguardNotice { void pause() { } }
     Library library=new Library();
     static class Surface { void setKeepScreenOn(boolean value) { } void setVisibility(int value) { } }
     static class Probe { void removeCallbacks(Runnable r) { } }

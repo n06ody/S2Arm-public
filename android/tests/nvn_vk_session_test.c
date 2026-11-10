@@ -6,6 +6,9 @@
 // 只提供链接符号。retirement 由 vk_record.c / vk_clear.c 的真实实现参与。
 int nvn_vk_first_draw_flush(void) { return 0; }
 void nvn_vk_first_draw_present_done(void) {}
+// #473 给 session 收尾加了 compute PSO 缓存释放；本探针不编 nvn_vk_compute.c
+// （会拖入 program 依赖链），空表语义下同桩——只提供链接符号。
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d) { (void)d; }
 
 int main(void) {
     struct nvn_vk_session s = {0}; char why[192] = "";

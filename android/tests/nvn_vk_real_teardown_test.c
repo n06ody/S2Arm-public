@@ -9,6 +9,10 @@ int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(vo
 int __system_property_get(const char*n,char*v){(void)n;*v=0;return 0;}
 int32_t ANativeWindow_getWidth(ANativeWindow*w){(void)w;return 0;}
 int32_t ANativeWindow_getHeight(ANativeWindow*w){(void)w;return 0;}
+// #473 给 session 收尾加了 compute PSO 缓存释放；本探针不编 nvn_vk_compute.c
+// （其 pipeline_build 段会拖入 program/desc 依赖链，且该 TU 宿主编译有 log 缝），
+// 空表语义下同桩——只提供链接符号，缓存实现由 w2_compute_pipeline_test 真链验收。
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d){(void)d;}
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"failed: %s at %d\n",#x,__LINE__); return 2; } } while(0)
 static uint8_t *read_file(const char *p,size_t *n){FILE*f=fopen(p,"rb");if(!f)return NULL;if(fseek(f,0,SEEK_END))return NULL;long z=ftell(f);if(z<=0)return NULL;rewind(f);uint8_t*b=malloc((size_t)z);if(!b)return NULL;if(fread(b,1,(size_t)z,f)!=(size_t)z)return NULL;fclose(f);*n=(size_t)z;return b;}
 int main(int argc,char **argv){

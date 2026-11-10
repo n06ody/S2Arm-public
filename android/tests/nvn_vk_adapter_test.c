@@ -25,6 +25,9 @@ int nvn_vk_query_terminal_ready(void) { return 1; }
 void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) { (void)d; }
 int nvn_vk_first_draw_pass_break(int sync) { (void)sync; return 0; }
 const char *nvn_vk_first_draw_first_error(void) { return ""; }
+// #473 给 session 收尾加了 compute PSO 缓存释放；本探针不编 nvn_vk_compute.c，
+// 空表语义下同桩——只提供链接符号（与上面 first_draw 各桩同口径）。
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d) { (void)d; }
 
 static uint8_t g_mem[256];
 static int a_rd(void *o, uint64_t a, void *b, size_t n) { (void)o; if (a + n > sizeof g_mem) return -1; memcpy(b, g_mem + a, n); return 0; }

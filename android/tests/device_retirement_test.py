@@ -45,6 +45,10 @@ create = function(session, "int nvn_vk_session_create(")
 # 缓存释放（真实实现 nvn/nvn_vk_readback.c:233 → nvn_vk_readback_gpu_release）。旧 ref
 # 没有这一步；用检测结果决定是否给夹具加这条 seam 的断言。
 has_read_texels_release = "nvn_vk_session_read_texels_release(s);" in destroy
+# #473 在退休体与 create 的 texcache_init 失败路径都调用 compute PSO 缓存释放
+# （真实实现 nvn_vk_compute.c，原型 nvn_vk_compute.h）。旧 ref 没有这一缝；
+# 替身常驻（非 static 不吃 unused 告警），顺序断言按检测结果开关。
+has_pso_cache_release = "nvn_vk_compute_pso_cache_release(" in destroy
 new_session = function(source("android/native/nvn/mtl_vk_adapter.c"), "void s2a_vk_adapter_new_session(")
 provider_source = source("android/native/direct/provider_vk.c")
 # The metadata observer wraps, but does not alter, this retirement body. Its
@@ -112,6 +116,15 @@ void nvn_vk_session_read_texels_release(struct nvn_vk_session *s){(void)s;
  read_texels_release_after_idle = wait_called == 1 && idle_proven;
  read_texels_release_before_destroy = device_destroyed == 0;}
 
+// compute PSO 进程内缓存的设备收尾（#473 引入；真实实现见 native/nvn/nvn_vk_compute.c）。
+// 生产顺序是“读回缓存释放之后、s2a_vk_device_destroy 之前”（nvn_vk_session.c），与上面
+// 同口径记录这两个前置条件；断言按 -DHAVE_PSO_CACHE_RELEASE 编译开关保留。
+static int pso_release_calls, pso_release_after_idle, pso_release_before_destroy;
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d){(void)d;
+ pso_release_calls++;
+ pso_release_after_idle = wait_called == 1 && idle_proven;
+ pso_release_before_destroy = device_destroyed == 0;}
+
 '''
 main=r'''
 int main(int argc,char**argv){
@@ -150,6 +163,9 @@ int main(int argc,char**argv){
 #ifdef HAVE_READ_TEXELS_RELEASE
    &&read_texels_release_calls==1&&read_texels_release_after_idle&&read_texels_release_before_destroy
 #endif
+#ifdef HAVE_PSO_CACHE_RELEASE
+   &&pso_release_calls==1&&pso_release_after_idle&&pso_release_before_destroy
+#endif
    );
  }
  if(!strcmp(argv[1],"session-lost")){
@@ -187,6 +203,9 @@ int main(int argc,char**argv){
 #ifdef HAVE_READ_TEXELS_RELEASE
    &&read_texels_release_calls==1&&read_texels_release_before_destroy
 #endif
+#ifdef HAVE_PSO_CACHE_RELEASE
+   &&pso_release_calls==1&&pso_release_before_destroy
+#endif
    );
  }
  if(!strcmp(argv[1],"fresh-create")){
@@ -209,6 +228,7 @@ with tempfile.TemporaryDirectory(prefix="s2a-retirement-") as tmp:
     c.write_text(preamble + call + wait + "\n" + dev + "\n" + destroy + "\n" + create + "\n#define free mock_free\n" + provider + "\n#undef free\n" + new_session + "\n" + main)
     # -DHAVE_READ_TEXELS_RELEASE：新收尾调用的顺序断言开关；macOS 弱引用放行由 host_link 按目标文件实算
     define = ["-DHAVE_READ_TEXELS_RELEASE"] if has_read_texels_release else []
+    define += ["-DHAVE_PSO_CACHE_RELEASE"] if has_pso_cache_release else []
     host_link.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", *define, str(c)] + ["-o", str(exe)], check=True)
     failed = 0
     for case in cases:

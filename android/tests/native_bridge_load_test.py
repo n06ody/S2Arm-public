@@ -21,7 +21,8 @@ STUBS = {
     'org/s2arm/android/Stubs.java': '''package org.s2arm.android;
         class TouchInputBridge {}
         class GameSession { static boolean verifyNativeBytes(String a, java.nio.ByteBuffer b) { return true; } static int nativeFileAdmission(String p) { return 1; } }
-        class MainActivity { static String requestText(String a, String b, int c) { return null; } }
+        class MainActivity { static String requestText(String a, String b, int c) { return null; }
+            static void dguardPrompt(String s) {} }
     ''',
     'org/s2arm/android/RuntimeLibrary.java': '''package org.s2arm.android;
         import java.io.File;
