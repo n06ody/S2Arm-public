@@ -24,6 +24,13 @@ extern int s2a_direct_provider_compile_context(struct s2a_direct_compile_context
 extern int s2a_vk_adapter_exec_pause(void) __attribute__((weak));
 extern void s2a_vk_adapter_exec_resume(void) __attribute__((weak));
 extern int s2a_vk_adapter_stop_requested(void) __attribute__((weak));
+#include "nvn_vk_compute_phase.h"   // OP_DISPATCH 九段仪器枚举；函数按弱符号引用，缺了自动归零
+// 弱链接[androiddraw]：nvk_compute_phase_on
+// 弱链接[androiddraw]：nvk_compute_phase_now
+// 弱链接[androiddraw]：nvk_compute_phase_add
+extern int nvk_compute_phase_on(void) __attribute__((weak));
+extern uint64_t nvk_compute_phase_now(void) __attribute__((weak));
+extern void nvk_compute_phase_add(int seg, uint64_t ns) __attribute__((weak));
 static int pause_exec(void *opaque) { (void)opaque; return s2a_vk_adapter_exec_pause(); }
 static void resume_exec(void *opaque) { (void)opaque; s2a_vk_adapter_exec_resume(); }
 /* 诊断按事实记录、不改判定：这里唯一要“红”的是唯一请求集发布失败——门开了却
@@ -90,6 +97,8 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
     out->diagnostic.session = context.session;
     out->diagnostic.generation = context.generation;
     char why[512] = {0};
+    const int ph = nvk_compute_phase_on && nvk_compute_phase_on();
+    uint64_t ph_t = ph ? nvk_compute_phase_now() : 0;
     struct nvk_compute_profile_facts profile;
     if (nvk_compute_profile_parse(&context, &profile, why, sizeof why)) return rejected(result, why);
     // Owner contract: all observed valid direct CS slots, including shader-unused
@@ -137,6 +146,7 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
                 request.json, request.json_bytes) != 0)
             diag_note("【红】唯一请求集发布失败");
     }
+    if (ph) nvk_compute_phase_add(NVK_PHASE_PREPARE, nvk_compute_phase_now() - ph_t);
     struct nvk_compute_lookup_options options = {0};
     const char *revision = getenv("S2A_SHADER_REVISION_ROOT");
     const char *cache = getenv("S2A_DIRECT_CACHE_DIR");
@@ -159,7 +169,9 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
     options.pause = pause_exec; options.resume = resume_exec;
     struct nvk_compute_lookup_result program = {0};
     // Exactly one immutable REQUEST/identity and one lookup; no alternate bool.
+    if (ph) ph_t = nvk_compute_phase_now();
     int rc = nvk_compute_lookup(&request, &context, &options, &program, why, sizeof why);
+    if (ph) nvk_compute_phase_add(NVK_PHASE_LOOKUP, nvk_compute_phase_now() - ph_t);
     s2a_w2_shader_lookup(&context, request.identity,
         program.origin == NVK_COMPUTE_OFFLINE ? S2A_W2_OFFLINE :
         program.origin == NVK_COMPUTE_PRIVATE ? S2A_W2_PRIVATE :

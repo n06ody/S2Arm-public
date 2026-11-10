@@ -15,6 +15,7 @@
 #include <string.h>
 #include <pthread.h>
 #include "integration_vk_mock.h"
+#include "nvn/nvn_vk_compute_phase.h"   // compute_phase 分段：真实链上断言各段有账/拒后为零
 extern int nvn_vk_compute_build(struct s2a_vk_device *,const struct s2a_record_dispatch_state *,
     const struct s2a_record_memory *,struct s2a_record_dispatch_output *,struct s2a_record_result *,void *);
 static int acquired, released;
@@ -103,6 +104,7 @@ int main(int argc,char **argv) {
     assert(argc==4);mode=atoi(argv[1]);good=argv[2];bad=argv[3];
     setenv("S2A_SHADER_REVISION_ROOT",mode==16?"relative":"/revision",1);
     setenv("S2A_DIRECT_CACHE_DIR",mode==16?"":"/private",1);
+    setenv("S2A_COMPUTE_PHASE","1",1);   // 打开九段仪器：构建期一次缓存，须早于首笔 build
     const char *hash="sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const char *profile="{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
     pc=(struct s2a_direct_compile_context){.session=11,.generation=22,.direct_abi=1,
@@ -142,6 +144,27 @@ int main(int argc,char **argv) {
         assert(!out.finish(&device,out.owner,0)&&live==0&&writes==1&&guest[256]==0x78);
     }
     else {assert(rc!=0&&result.code==rc&&result.why[0]&&result.opcode==OP_DISPATCH&&result.executed==123);assert(!out.owner&&!out.pipeline);}
+    {
+        // compute_phase 分段断言（真实链）：判「段是否走到」用 hits——微段在粗粒度钟下可合法记 0ns。
+        // 成功模式七段全走过（record/submit 两段不在本夹具范围）；被拒模式在拒点之后一律未走——
+        // 8/14 在 lookup 内拒（前后段各自对账），17-20 早于 prepare 拒，15 在 build 内 profile 校验拒（parse 已过）。
+        uint64_t seg[NVK_PHASE_SEGS], hits[NVK_PHASE_SEGS], samples, lines;
+        nvk_compute_phase_stats(seg, hits, &samples, &lines);
+        if (success) {
+            assert(hits[NVK_PHASE_PREPARE] && hits[NVK_PHASE_LOOKUP] && hits[NVK_PHASE_PARSE]);
+            assert(hits[NVK_PHASE_ALLOC_COPY] && hits[NVK_PHASE_DESCRIPTOR]);
+            assert(hits[NVK_PHASE_WRITEBACK] && hits[NVK_PHASE_DESTROY]);
+        } else {
+            assert(!hits[NVK_PHASE_ALLOC_COPY] && !hits[NVK_PHASE_DESCRIPTOR]
+                   && !hits[NVK_PHASE_WRITEBACK] && !hits[NVK_PHASE_DESTROY]);
+            if (mode==15) assert(hits[NVK_PHASE_PARSE]);
+            else assert(!hits[NVK_PHASE_PARSE]);
+            if (mode==17||mode==18||mode==19||mode==20)
+                assert(!hits[NVK_PHASE_PREPARE] && !hits[NVK_PHASE_LOOKUP]);
+            if (mode==8||mode==11||mode==12||mode==14)
+                assert(hits[NVK_PHASE_PREPARE] && hits[NVK_PHASE_LOOKUP]);
+        }
+    }
     // 6/7：独立图像/独立采样器“存在”不是查询证明，不再整笔拒绝；真使用者由编译器反射与 pipeline
     // 的 descriptor 分支明确失败。5：真实纹理绑定必须走完请求→编译→管线（事实表非空）。
     if(mode==5)assert(offline==1&&worker==1&&pipeline==1);

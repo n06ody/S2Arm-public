@@ -13,6 +13,15 @@ extern int nvn_vk_texcache_serial_state(uint64_t serial, struct nvn_tex_tombston
 #include "nvn_vk_format.h"
 #include "nvn_vk_query.h"
 #include "vk_clear.h"
+#include "nvn_vk_compute_phase.h"   // OP_DISPATCH 九段仪器枚举；函数按弱符号引用，缺了自动归零
+// 弱链接[androiddraw]：nvk_compute_phase_on
+// 弱链接[androiddraw]：nvk_compute_phase_now
+// 弱链接[androiddraw]：nvk_compute_phase_begin
+// 弱链接[androiddraw]：nvk_compute_phase_add
+extern int nvk_compute_phase_on(void) __attribute__((weak));
+extern uint64_t nvk_compute_phase_now(void) __attribute__((weak));
+extern void nvk_compute_phase_begin(void) __attribute__((weak));
+extern void nvk_compute_phase_add(int seg, uint64_t ns) __attribute__((weak));
 
 #include <android/log.h>
 #include <sys/system_properties.h>
@@ -1442,6 +1451,11 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             int sync = header.op == OP_CLEAR_TEX || header.op == OP_CLEAR_BUF ||
                        header.op == OP_COPY_B2B || header.op == OP_COPY_T2B || header.op == OP_COPY_B2T ||
                        header.op == OP_COPY_T2T || header.op == OP_DISPATCH || header.op == OP_FENCE_SYNC;
+            // compute_phase：本笔 dispatch 的等待账从这里起算——pass_break 排空（其内
+            // vkQueueSubmit 返回耗时与逐批 vkWaitForFences）归入 SUBMIT_WAIT 段。
+            const int ph_d = header.op == OP_DISPATCH && nvk_compute_phase_on && nvk_compute_phase_on();
+            if (ph_d) nvk_compute_phase_begin();
+            const uint64_t ph_pb = ph_d ? nvk_compute_phase_now() : 0;
             if (nvn_vk_first_draw_pass_break(sync) != 0) {
                 // 帧队列没有拿到完成证明：命令顺序不再成立，这条 opcode 及其后的 clear/copy/fence/event
                 // 都不能执行。首错留在帧队列里，这里只转述，不覆盖。
@@ -1453,6 +1467,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                          first && first[0] ? first : "frame queue failed (no first error recorded)");
                 return fail(result, S2A_RECORD_GPU, header.op, msg);
             }
+            if (ph_d) nvk_compute_phase_add(NVK_PHASE_SUBMIT_WAIT, nvk_compute_phase_now() - ph_pb);
         }
         switch (header.op) {
         case OP_END:
@@ -2198,6 +2213,8 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             break;
         }
         case OP_DISPATCH: {
+            const int ph = nvk_compute_phase_on && nvk_compute_phase_on();
+            uint64_t ph_t = 0;
             p_dispatch dispatch;
             if (header.size < sizeof(op_hdr) + sizeof dispatch) {
                 s2a_record_compute_note(NULL, S2A_COMPUTE_BUILD_FAILED, "dispatch payload too small");
@@ -2282,6 +2299,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                         return fail(result, S2A_RECORD_INVALID, header.op, "missing compute descriptor set");
                     }
                 }
+                if (ph) ph_t = nvk_compute_phase_now();
                 VkCommandBuffer cmd = begin_command(device);
                 if (!cmd) {
                     if (out.finish) out.finish(device, out.owner, -1);
@@ -2301,11 +2319,14 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                 };
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read, 0, NULL, 0, NULL);
+                if (ph) nvk_compute_phase_add(NVK_PHASE_RECORD, nvk_compute_phase_now() - ph_t);
                 struct rec_keep keep;
                 memset(&keep, 0, sizeof keep);
                 keep.compute_owner = out.owner;
                 keep.compute_finish = out.finish;
+                if (ph) ph_t = nvk_compute_phase_now();
                 int sr = submit(device, cmd, &keep);
+                if (ph) nvk_compute_phase_add(NVK_PHASE_SUBMIT_WAIT, nvk_compute_phase_now() - ph_t);
                 int cleanup = out.finish ? out.finish(device, out.owner, sr) : 0;
                 const char *compute_why = sr == REC_SUBMIT_INCOMPLETE ? "compute completion unknown; resources retained" :
                     sr == REC_SUBMIT_UNSUBMITTED ? "compute never submitted" : cleanup ? "compute completion copyback failed" : "";
@@ -2325,6 +2346,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             if (!entry || !entry->pipeline || !entry->layout)
                 return fail(result, S2A_RECORD_UNSUPPORTED, header.op,
                             "dispatch has no registered Vulkan compute pipeline");
+            if (ph) ph_t = nvk_compute_phase_now();
             VkCommandBuffer cmd = begin_command(device);
             if (!cmd) return fail(result, S2A_RECORD_GPU, header.op, "command buffer allocation failed");
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, entry->pipeline);
@@ -2332,8 +2354,11 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, entry->layout, 0, 1,
                                         &entry->descriptor, 0, NULL);
             vkCmdDispatch(cmd, (uint32_t)dispatch.x, (uint32_t)dispatch.y, (uint32_t)dispatch.z);
+            if (ph) nvk_compute_phase_add(NVK_PHASE_RECORD, nvk_compute_phase_now() - ph_t);
             {
+                if (ph) ph_t = nvk_compute_phase_now();
                 int sr = submit(device, cmd, NULL);
+                if (ph) nvk_compute_phase_add(NVK_PHASE_SUBMIT_WAIT, nvk_compute_phase_now() - ph_t);
                 if (sr != REC_SUBMIT_COMPLETED)
                     return fail(result, S2A_RECORD_GPU, header.op,
                                 sr == REC_SUBMIT_INCOMPLETE

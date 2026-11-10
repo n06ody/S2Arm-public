@@ -432,6 +432,12 @@ static int exec_chain(const uint8_t *pc, int depth) {
         uint64_t dt = shim_ticks() - t0;
         g_frame_exec_ns += dt; g_frame_cmds++;
         if (h.op < 256) { g_op_ns[h.op] += dt; g_op_n[h.op]++; }
+        if (h.op == OP_DISPATCH) {
+            // compute_phase 结算点：dt 与 win_stats g_op_ns[27] 同口径——段和与它对账，
+            // 差额即未归属（pass_break 非等部分、状态填充、执行层出入、PSO 块、计时盲区）。
+            extern void nvk_compute_phase_wall(uint64_t) __attribute__((weak));
+            if (nvk_compute_phase_wall) nvk_compute_phase_wall(dt);
+        }
         g_commands++;
         if (rc != S2A_RECORD_OK) {
             const char *kinds[] = { "ok", "argument", "invalid", "unsupported", "gpu", "memory", "depth", "limit" };

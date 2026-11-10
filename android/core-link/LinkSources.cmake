@@ -99,6 +99,7 @@ function(s2a_android_direct_sources output)
         native/nvn/nvn_vk_first_draw.c native/nvn/nvn_vk_draw_diag.c native/nvn/nvn_vk_program_result.c native/nvn/nvn_vk_query.c
         native/nvn/nvn_vk_compute.c native/nvn/nvn_vk_compute_texture.c native/nvn/nvn_vk_compute_request.c
         native/nvn/nvn_vk_compute_lookup.c native/nvn/nvn_vk_compute_bridge.c
+        native/nvn/nvn_vk_compute_phase.c
         native/nvn/nvn_vk_pipe_manifest.c native/nvn/nvn_vk_pcprof.c
         native/nvn/nvn_vk_exec_owner.c native/nvn/nvn_vk_pipe_worker.c
         # 批次 1/D：提交完成事实与批次持有（纯状态机，不碰 Vulkan；批次 2/3 接入消费）。

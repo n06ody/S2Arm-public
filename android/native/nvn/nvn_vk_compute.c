@@ -22,6 +22,13 @@
 extern uint64_t nvn_ga2ca(uint64_t a) __attribute__((weak));
 // 弱链接[androiddraw]：s2a_vk_adapter_pool_find（mtl_vk_adapter.c 提供；宿主单测不链适配器）
 extern int s2a_vk_adapter_pool_find(uint64_t addr, uint64_t len, uint64_t *base, uint64_t *size) __attribute__((weak));
+#include "nvn_vk_compute_phase.h"   // OP_DISPATCH 九段仪器枚举；函数按弱符号引用，缺了自动归零
+// 弱链接[androiddraw]：nvk_compute_phase_on
+// 弱链接[androiddraw]：nvk_compute_phase_now
+// 弱链接[androiddraw]：nvk_compute_phase_add
+extern int nvk_compute_phase_on(void) __attribute__((weak));
+extern uint64_t nvk_compute_phase_now(void) __attribute__((weak));
+extern void nvk_compute_phase_add(int seg, uint64_t ns) __attribute__((weak));
 
 /* 上游 MaxUnknownStorageSize（Ryujinx Constants）：只能证明“UBO 里 8 字节裸指针”的 storage，
  * 绑已注册池的映射余量、封顶这个上界。截断不静默：每个 shader key 首次截断打一条结构化诊断。 */
@@ -297,6 +304,8 @@ static int finish(struct s2a_vk_device *d, void *owner, int completion) {
     if (!o || !d || d->device != o->device) return -1;
     if (completion == -2) return 0; /* No completion proof: preserve all handles. */
     if (completion != 0 && completion != -1) return -1;
+    const int ph = nvk_compute_phase_on && nvk_compute_phase_on();
+    uint64_t ph_t = ph ? nvk_compute_phase_now() : 0;
     int rc = 0;
     if (completion == 0) {
         for (int i = 0; i < o->count; ++i) {
@@ -320,7 +329,9 @@ static int finish(struct s2a_vk_device *d, void *owner, int completion) {
                 o->guest.write(o->guest.opaque, o->window.base, o->window.mapped, (size_t)o->window.size)) rc = -1;
         }
     }
+    if (ph && completion == 0) { nvk_compute_phase_add(NVK_PHASE_WRITEBACK, nvk_compute_phase_now() - ph_t); ph_t = nvk_compute_phase_now(); }
     destroy(o);
+    if (ph) nvk_compute_phase_add(NVK_PHASE_DESTROY, nvk_compute_phase_now() - ph_t);
     return rc;
 }
 static int allocate(struct s2a_vk_device *d, struct compute_buffer *b, VkBufferUsageFlags usage) {
@@ -353,8 +364,13 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
     if (!program || !program->bytes || !program->length)
         return error(why, why_bytes, "compute accepted lookup result is missing");
     uint64_t profile_storage_alignment = program->profile.storage_alignment;
+    const int ph = nvk_compute_phase_on && nvk_compute_phase_on();
+    uint64_t ph_t = 0;
     struct nvn_vk_compute_program p;
-    if (nvn_vk_program_parse_compute(program->bytes, program->length, &p, why, why_bytes)) return -1;
+    if (ph) ph_t = nvk_compute_phase_now();
+    const int parse_rc = nvn_vk_program_parse_compute(program->bytes, program->length, &p, why, why_bytes);
+    if (ph) nvk_compute_phase_add(NVK_PHASE_PARSE, nvk_compute_phase_now() - ph_t);
+    if (parse_rc) return -1;
     /* An unused declaration is not a runtime descriptor requirement. Remove it
      * from every subsequent allocation/layout/write path, preserving other indices. */
     if (!p.support_read_count && !p.support_reads_unknown) {
@@ -644,6 +660,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
     // size=0（长度未声明）的 storage 绑定：0100F2C0115B6000 相邻缓冲的精确长度可互相覆盖（实测 4 MiB 缓冲只差
     // 0x200），若各建一份影子，GPU 写会分叉、回写互相覆盖。这里按“本次 dispatch 所有无界 storage 的
     // 并集”建一份影子，所有无界绑定按偏移绑进同一份字节，帧尾只回写一次。
+    if (ph) ph_t = nvk_compute_phase_now();
     {
         uint64_t win_base = UINT64_MAX, win_end = 0;
         int win_n = 0, win_writable = 0;
@@ -733,6 +750,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
             failure = "compute guest buffer read failed"; goto bad;
         }
     }
+    if (ph) nvk_compute_phase_add(NVK_PHASE_ALLOC_COPY, nvk_compute_phase_now() - ph_t);
     /* PSO 缓存键在绑定过滤完成后取最终 p.bindings 算签名；门关则完全不算（零开销）。 */
     uint8_t pso_sig[FD_MAX_BINDINGS * 12 + 4]; size_t pso_sig_len = 0;
     uint64_t pso_h = 0; VkPipelineCache pso_plc = VK_NULL_HANDLE;
@@ -803,6 +821,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
         /* 入表失败（表满且在途/同键先至/内存失败）：o->pso 保持空，对象按笔自有收尾。 */
     }
 pso_ready:
+    if (ph) ph_t = nvk_compute_phase_now();
     if (set_count) {
         // 池按实际出现的四类描述符给额度；kind 2 是 COMBINED_IMAGE_SAMPLER（纹理+采样器成对）。
         VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0},
@@ -845,6 +864,7 @@ pso_ready:
         }
         vkUpdateDescriptorSets(d->device, (uint32_t)p.binding_count, writes, 0, NULL);
     }
+    if (ph) nvk_compute_phase_add(NVK_PHASE_DESCRIPTOR, nvk_compute_phase_now() - ph_t);
     // 成功才转移保活所有权：owner 在 finish 里解除；失败路径快照原样留给调用方释放。
     if (snapshot) {
         o->snapshot = *snapshot;

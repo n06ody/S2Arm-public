@@ -2,6 +2,7 @@
 // Copyright 2026 S2Arm contributors
 // Keep the real record API declaration before renaming the component-only stub.
 #include "direct/vk_record.h"
+#include "nvn/nvn_vk_compute_phase.h"   // compute_phase 分段：真实记录链上断言各段有账/拒后为零
 // Reuse compiler/cache/Vulkan boundary fixtures, not their direct-bridge main.
 static void *mapped_storage;
 static int freed;
@@ -102,6 +103,7 @@ static void metrics_contract(void) {
 int main(int argc,char **argv) {
     assert(argc==4);int scenario=atoi(argv[1]);mode=scenario;good=argv[2];bad=argv[3];
     setenv("S2A_SHADER_REVISION_ROOT","/revision",1);setenv("S2A_DIRECT_CACHE_DIR","/private",1);
+    setenv("S2A_COMPUTE_PHASE","1",1);   // 打开九段仪器：构建期一次缓存，须早于首笔 dispatch
     const char *profile="{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
     pc=(struct s2a_direct_compile_context){.session=11,.generation=22,.direct_abi=1,.translator_closure="closure",.profile_hash="sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",.profile_json=profile,.profile_bytes=strlen(profile),.offline_profile_available=1};
     uint8_t ctl[0x760]={0},code[16]={1,2,3,4},key[32],graphics_key[8]={0xdd};
@@ -144,6 +146,37 @@ int main(int argc,char **argv) {
             assert(s2a_record_release_retained(&record_device,1000000000,&left)==1&&left==0&&!live&&writes==1&&freed==1&&guest[256]==0x78);
             assert(s2a_record_release_retained(&record_device,1000000000,&left)==0&&left==0&&writes==1&&freed==1);
         } else if(scenario==23){assert(rc==S2A_RECORD_GPU&&submitted==1&&!live&&writes==1&&freed==1&&guest[256]==0x34);assert(strstr(record_result.why,"copyback failed"));} else assert(rc==0&&submitted==1&&!live&&writes==1&&freed==1&&guest[256]==0x78);
+    }
+    {
+        // compute_phase 分段断言（真实记录链，宿主 vk 替身边界——不主张设备行为）：
+        // 判「段是否走到」用 hits——微段在粗粒度钟下可合法记 0ns。
+        // 0/2 成功场景九段全走过；11/12 在 lookup 内拒（record/submit 未走），20 在进 bridge 前拒
+        // （九段全未走），21/22/23 走完 build+record+submit。
+        uint64_t pseg[NVK_PHASE_SEGS], phits[NVK_PHASE_SEGS], psamp, plines;
+        nvk_compute_phase_stats(pseg, phits, &psamp, &plines);
+        if (scenario == 0 || scenario == 2) {
+            for (int s = 0; s < NVK_PHASE_SEGS; s++) assert(phits[s]);
+        } else if (scenario == 20) {
+            for (int s = 0; s < NVK_PHASE_SEGS; s++) assert(!phits[s]);
+        } else if (scenario == 11 || scenario == 12) {
+            assert(phits[NVK_PHASE_PREPARE] && phits[NVK_PHASE_LOOKUP] && !phits[NVK_PHASE_PARSE]);
+            assert(!phits[NVK_PHASE_RECORD] && !phits[NVK_PHASE_SUBMIT_WAIT]);
+        } else {
+            assert(phits[NVK_PHASE_PARSE] && phits[NVK_PHASE_RECORD] && phits[NVK_PHASE_SUBMIT_WAIT]);
+            if (scenario == 21) assert(phits[NVK_PHASE_DESTROY] && !phits[NVK_PHASE_WRITEBACK]); // finish(-1)：只毁不写
+            else assert(phits[NVK_PHASE_WRITEBACK] && phits[NVK_PHASE_DESTROY]);               // 22 靠 release_retained 补的 finish(0)，23 回写失败仍记时
+        }
+        // 宿主无 shim 挂点：先 begin 再 wall，无论本笔是否 armed 都确定结算 +1；
+        // 再打满 64 样本验 emit 窗口（log 替身 strong 提供）。
+        nvk_compute_phase_begin(); nvk_compute_phase_wall(999999);
+        for (int i = 0; i < 64; i++) {
+            nvk_compute_phase_begin(); nvk_compute_phase_add(NVK_PHASE_RECORD, 100); nvk_compute_phase_wall(200);
+        }
+        uint64_t seg2[NVK_PHASE_SEGS], hits2[NVK_PHASE_SEGS], samp2, lines2;
+        nvk_compute_phase_stats(seg2, hits2, &samp2, &lines2);
+        int was_armed = 0;
+        for (int s = 0; s < NVK_PHASE_SEGS; s++) was_armed |= phits[s] != 0;
+        assert(samp2 == psamp + 65 + (was_armed ? 1 : 0) && lines2 == plines + 1);
     }
     struct s2a_record_compute_stats csstats;
     s2a_record_compute_snapshot(&csstats);
