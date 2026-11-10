@@ -1118,6 +1118,7 @@ def main(argv=None):
     state0, orig_tmp, launched = None, None, False
     data_backup, backup_dir = None, None
     props_prev = {}
+    ab_strict = set()              # --ab-prop 已读到原值、即将 / 已经 setprop 的键：恢复时一律只认 rc=0
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
     pids, priv_done, birth_walls = {}, False, {}
@@ -1272,6 +1273,7 @@ def main(argv=None):
                 raise Refuse(f"--ab-prop 与运行器自管属性重名：{key}")
             # 原值 / 置位 / 读回都要 rc=0：读不到原值就无法证明能恢复，直接拒跑
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0,)).strip()
+            ab_strict.add(key)     # 先登记、再 setprop：setprop 生效后读回失败，恢复也按严格口径
             d.shell(f"setprop {key} {shlex.quote(val)}", allowed=(0,))
             got = d.shell(f"getprop {key}", allowed=(0,)).strip()
             if got != val:
@@ -1636,7 +1638,7 @@ def main(argv=None):
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
         try:
-            ab_keys = set(manifest.get("ab_props", {}))
+            ab_keys = ab_strict | set(manifest.get("ab_props", {}))
             for key, prev in props_prev.items():
                 # --ab-prop 的属性：setprop 与读回都必须 rc=0（权限拒绝 rc=1 会读成空串，
                 # 原值恰为空时会被误认已恢复）；逐项单独 try，一项失败不跳过其余项

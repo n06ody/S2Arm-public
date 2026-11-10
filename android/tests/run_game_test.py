@@ -452,13 +452,17 @@ if cmd == "shell":
         key = " ".join(sh[1:])
         # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
         # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
-        if key in st.get("getprop_deny", []) or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None):
+        # getprop_deny_after_set：该属性被 setprop 过之后读一律被拒（setprop 生效、紧接着的读回失败）
+        if (key in st.get("getprop_deny", [])
+                or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None)
+                or (key in st.get("getprop_deny_after_set", []) and key in st.get("props_set_once", []))):
             sys.stderr.write("getprop: permission denied\\n"); save(); sys.exit(1)
         out(st["props"].get(key, "") + "\\n"); sys.exit(0)
     if c == "setprop":
         # props_jam：写空值的 setprop 被设备静默拒（有的构建不让清 debug 属性）→ 旧值还在
         if st.get("props_jam") and sh[1].startswith("debug.s2a.") and (len(sh) <= 2 or not sh[2]):
             sys.exit(0)
+        st.setdefault("props_set_once", []).append(sh[1])
         st["props"][sh[1]] = sh[2] if len(sh) > 2 else ""; save(); sys.exit(0)
     if c == "pm":
         if len(sh) == 1 or (len(sh) > 1 and sh[1] == "install" and "--help" in sh):
@@ -1790,6 +1794,16 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out2 / "run-manifest.json").read_text())
         self.assertIn("debug.s2a.vsync", man["reason"], man["reason"])
         self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(), "恢复读回失败要留置")
+
+    def test_ab_prop_readback_fail_after_set_still_strict(self):
+        """setprop 已生效、紧接着读回被拒：manifest.ab_props 还没写，恢复仍必须按严格 rc=0 口径，
+        原值为空时不得因 rc=1 的空串假绿 → 还原失败、留置、不起局。"""
+        rc, out, _ = self.run_tool(state={"getprop_deny_after_set": ["debug.s2a.vsync"]},
+                                   argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_mid")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "读回失败不许起局")
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(), "严格恢复读回失败要留置")
 
     def test_checkpoint_apply_and_verify(self):
         """检查点正路：宿主核过 → push → run-as tar 解进 saves/<tid>/ryujinx-android
