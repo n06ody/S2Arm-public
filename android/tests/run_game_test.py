@@ -61,7 +61,7 @@ DATA_DENIED = st.setdefault("data_denied", {})      # dir -> True：存在但 ru
 DATA_PAD = st.setdefault("data_pad", {})            # dir -> {relpath: 字节数} 合成大文件
                                                     #（全零填充：tar 备份按声明长度真流出来，
                                                     #  测宿主是否整流驻内存；清单/sha 按合成算）
-DEV_TMP = st.setdefault("dev_tmp", {})              # 数据目录内凭据文件 dir/.s2a-tar-{err,rc}
+DEV_TMP = st.setdefault("dev_tmp", {})              # 树外凭据 /data/local/tmp/s2a-tar-*-{err,rc}
                                                     #（exec-out 混流后设备侧 stderr/rc 的取证通道）
 
 def zeros_sha(n):
@@ -259,20 +259,52 @@ def run_as(cmdline, via_shell=False):
             lines = [f"./{rel}\\t{tgt}"
                      for rel, tgt in sorted(DATA_LINKS.get(dir_, {}).items())]
             _emit_batched(dir_, lines, len(lines)); return
-    m = _re.match(r"^cd (\\S+) && cat (\\.s2a-tar-err|\\.s2a-tar-rc)$", cmdline)
+    m = _re.match(r"^cd (\\S+) && tar -cpf - \\. 2> (\\S+); echo \\$\\? > (\\S+)$", cmdline)
     if m:
-        key = m.group(1) + "/" + m.group(2)
-        if key not in DEV_TMP: fail(f"cat: {m.group(2)}: No such file or directory")
-        out(DEV_TMP[key]); return
-    m = _re.match(r"^cd (\\S+) && rm -f \\.s2a-tar-err \\.s2a-tar-rc && "
-                  r"test ! -e \\.s2a-tar-err && test ! -e \\.s2a-tar-rc$", cmdline)
-    if m:
-        dir_ = m.group(1)
-        if st.get("data_tar_aux_left", {}).get(dir_):
-            fail("test: .s2a-tar-err: File exists")     # 删不净 → 凭据核删不过
-        DEV_TMP.pop(dir_ + "/.s2a-tar-err", None)
-        DEV_TMP.pop(dir_ + "/.s2a-tar-rc", None)
-        save(); return
+        dir_, en, rn = m.group(1), m.group(2), m.group(3)
+        if dir_ in DATA_DENIED:
+            # run-as 拒权：归档零字节流出，stderr/rc 落凭据文件由宿主另行取证
+            DEV_TMP[en] = "tar: .: Permission denied\\n"
+            DEV_TMP[rn] = "1\\n"
+            save(); return
+        if st.get("data_stream_hang"):
+            time.sleep(int(st.get("data_stream_hang_s", 30)))   # 流中途挂：宿主超时杀
+            return
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
+            root_ = tarfile.TarInfo("./")
+            root_.type, root_.mode = tarfile.DIRTYPE, 0o775
+            tf.addfile(root_)
+            for rel, (mode, ftype) in sorted(dir_entries(dir_).items()):
+                info = tarfile.TarInfo("./" + rel)
+                info.mode = int(mode, 8)
+                if ftype == "regular file":
+                    if rel in DATA_PAD.get(dir_, {}):
+                        info.size = DATA_PAD[dir_][rel]
+                        tf.addfile(info, io.BytesIO(b"\\0" * info.size))
+                    else:
+                        blob = bytes.fromhex(DATA_DIRS[dir_][rel])
+                        info.size = len(blob)
+                        tf.addfile(info, io.BytesIO(blob))
+                elif ftype == "directory":
+                    info.type = tarfile.DIRTYPE
+                    tf.addfile(info)
+                elif ftype == "symbolic link":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = DATA_LINKS[dir_][rel]
+                    tf.addfile(info)
+            if st.get("corrupt_backup_tar"):
+                # 备份核对门负控：归档比源清单多出成员 → 解包核对不过 → 拒跑
+                blob = b"planted"
+                info = tarfile.TarInfo("./planted.evil")
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        # 设备侧 stderr/rc 凭据：exec-out 把 tar stderr 混进 stdout 归档流，
+        # 凭据落 /data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}（被备份树之外）
+        DEV_TMP[en] = st.get("data_tar_err", {}).get(dir_, "")
+        DEV_TMP[rn] = st.get("data_tar_rc", {}).get(dir_, "0") + "\\n"
+        sys.stdout.buffer.write(buf.getvalue()); save(); return
     m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
     if m:
         if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
@@ -310,51 +342,6 @@ def run_as(cmdline, via_shell=False):
                 elif mem.isdir() and rel not in DATA_SUBDIRS[dir_]:
                     DATA_SUBDIRS[dir_].append(rel)
         save(); return
-    m = _re.match(r"^cd (\\S+) && rm -f \\.s2a-tar-err \\.s2a-tar-rc; "
-                  r"tar -cpf - --exclude=\\./\\.s2a-tar-err --exclude=\\./\\.s2a-tar-rc \\. "
-                  r"2> \\.s2a-tar-err; echo \\$\\? > \\.s2a-tar-rc$", cmdline)
-    if m:
-        dir_ = m.group(1)
-        if dir_ in DATA_DENIED:
-            # run-as 拒权：归档零字节流出，stderr/rc 落凭据文件由宿主另行取证
-            DEV_TMP[dir_ + "/.s2a-tar-err"] = "tar: .: Permission denied\\n"
-            DEV_TMP[dir_ + "/.s2a-tar-rc"] = "1\\n"
-            save(); return
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tf:
-            # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
-            root_ = tarfile.TarInfo("./")
-            root_.type, root_.mode = tarfile.DIRTYPE, 0o775
-            tf.addfile(root_)
-            for rel, (mode, ftype) in sorted(dir_entries(dir_).items()):
-                info = tarfile.TarInfo("./" + rel)
-                info.mode = int(mode, 8)
-                if ftype == "regular file":
-                    if rel in DATA_PAD.get(dir_, {}):
-                        info.size = DATA_PAD[dir_][rel]
-                        tf.addfile(info, io.BytesIO(b"\\0" * info.size))
-                    else:
-                        blob = bytes.fromhex(DATA_DIRS[dir_][rel])
-                        info.size = len(blob)
-                        tf.addfile(info, io.BytesIO(blob))
-                elif ftype == "directory":
-                    info.type = tarfile.DIRTYPE
-                    tf.addfile(info)
-                elif ftype == "symbolic link":
-                    info.type = tarfile.SYMTYPE
-                    info.linkname = DATA_LINKS[dir_][rel]
-                    tf.addfile(info)
-            if st.get("corrupt_backup_tar"):
-                # 备份核对门负控：归档比源清单多出成员 → 解包核对不过 → 拒跑
-                blob = b"planted"
-                info = tarfile.TarInfo("./planted.evil")
-                info.size = len(blob)
-                tf.addfile(info, io.BytesIO(blob))
-        # 设备侧 stderr/rc 凭据：exec-out 把 tar stderr 混进 stdout 归档流，
-        # 必须落 .s2a-tar-{err,rc} 供宿主另行取证（qa-fone #329000）
-        DEV_TMP[dir_ + "/.s2a-tar-err"] = st.get("data_tar_err", {}).get(dir_, "")
-        DEV_TMP[dir_ + "/.s2a-tar-rc"] = st.get("data_tar_rc", {}).get(dir_, "0") + "\\n"
-        sys.stdout.buffer.write(buf.getvalue()); save(); return
     fail("fake adb: unhandled run-as " + cmdline)
 
 def shell_data_cmd(text):
@@ -441,6 +428,27 @@ if cmd == "shell":
     if shell_data_cmd(text):
         # 外部数据目录 shell 通道：赶在 c=="tar"/"mkdir" 等按首词分发前接管
         run_as(text, via_shell=True); sys.exit(0)
+    # 备份 tar 树外凭据（/data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}，qa-fone
+    # #329620/#329632）：预建先证不存在、cat 取证、rm+test 核删——全走 shell 通道
+    m = re.match(r"^\\[ ! -e (\\S+) \\] && \\[ ! -e (\\S+) \\] && : > \\S+ && : > \\S+ "
+                 r"&& chmod 0666 \\S+ \\S+ && test -w \\S+ && test -w \\S+$", text)
+    if m:
+        en, rn = m.group(1), m.group(2)
+        if st.get("data_aux_preexist") or en in DEV_TMP or rn in DEV_TMP:
+            sys.stderr.write("[ ! -e ] : File exists\\n"); save(); sys.exit(1)
+        DEV_TMP[en] = ""; DEV_TMP[rn] = ""; save(); sys.exit(0)
+    m = re.match(r"^cat (/data/local/tmp/s2a-tar-\\S+)$", text)
+    if m:
+        if m.group(1) not in DEV_TMP:
+            fail("cat: " + m.group(1) + ": No such file or directory")
+        out(DEV_TMP[m.group(1)]); sys.exit(0)
+    m = re.match(r"^rm -f (/data/local/tmp/s2a-tar-\\S+) (/data/local/tmp/s2a-tar-\\S+) "
+                 r"&& test ! -e \\S+ && test ! -e \\S+$", text)
+    if m:
+        if st.get("data_tar_aux_left"):
+            sys.stderr.write("test: File exists\\n"); save(); sys.exit(1)  # 删不净
+        DEV_TMP.pop(m.group(1), None); DEV_TMP.pop(m.group(2), None)
+        save(); sys.exit(0)
     c = sh[0] if sh else ""
     if "s2a-power-samples.log" in text and "echo $!" in text:
         # 采样守护 spawn（setsid sh -c '循环' >日志 2>&1 </dev/null & echo $!）。
@@ -1186,6 +1194,7 @@ class RunGameTest(unittest.TestCase):
         管道 rc、stderr 前缀行三门各自逮住 → 清单未证拒跑。"""
         priv = f"/data/data/{PKG}"
         for i, masked in enumerate((False, True)):
+            self.lock_root = self.tmp / f"locks_ff{i}"   # 每变体全新锁根：上局已留置
             state = self._data_state()
             state["data_find_fail"] = {priv: {"rc": 1, "masked": masked,
                                              "err": "find: ./x: Permission denied"}}
@@ -1241,7 +1250,7 @@ class RunGameTest(unittest.TestCase):
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("installs", st)
         state = self._data_state()
-        state["data_tar_aux_left"] = {priv: True}
+        state["data_tar_aux_left"] = True
         self.lock_root = self.tmp / "locks_aux"
         rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state),
                                    out_name="out_aux")
@@ -1311,6 +1320,85 @@ class RunGameTest(unittest.TestCase):
         self.assertNotEqual(0, rc, "幻影清单行必须被计数门逮住")
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("不完整", man["reason"], man["reason"])
+
+    def test_backup_aux_outside_tree_user_names_kept(self):
+        """㊿ #329620：用户树里同名 .s2a-tar-err/.s2a-tar-rc 是普通数据——
+        凭据已移到树外 /data/local/tmp/s2a-tar-<tag>-<uuid>-*，备份不带
+        --exclude、开头不 rm：两文件照进清单/归档、回灌逐字节还原。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][priv][".s2a-tar-err"] = b"user-err".hex()
+        state["data_dirs"][priv][".s2a-tar-rc"] = b"user-rc".hex()
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(b"user-err".hex(), st["data_dirs"][priv][".s2a-tar-err"],
+                         "同名用户文件回灌后逐字节一致")
+        self.assertEqual(b"user-rc".hex(), st["data_dirs"][priv][".s2a-tar-rc"])
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        self.assertIn(".s2a-tar-err", man["dirs"]["private"]["entries"])
+        self.assertIn(".s2a-tar-rc", man["dirs"]["private"]["entries"])
+        self.assertEqual({}, st["dev_tmp"], "树外凭据跑完全清干净")
+
+    def test_backup_aux_preexist_refuses_and_detains(self):
+        """㊿ #329620：凭据路径被占（本局 uuid 名仍撞/残留）→ [ ! -e ] 预建
+        失败即拒、不覆盖既有文件；备份中途失败 → 还原链未证 → 留置。"""
+        state = self._data_state()
+        state["data_aux_preexist"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("预建", man["reason"], man["reason"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "备份中途失败必须留置")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_backup_stream_timeout_detains_and_cleans(self):
+        """㊿ #329632：exec-out 流中途超时（设备 tar 挂了）——凭据已建即
+        登记待清，超时出口照走核删；备份没返回 = 还原链未证 → 留置，
+        data_backup=None 不许正常放锁。"""
+        state = self._data_state()
+        state["data_stream_hang"] = True
+        state["data_stream_hang_s"] = 30
+        orig = run_game._exec_out_stream
+        def fast_timeout(d, args_, dest, timeout=600):
+            return orig(d, args_, dest, timeout=0.5)   # 压短宿主超时免真等 600s
+        run_game._exec_out_stream = fast_timeout
+        try:
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state))
+        finally:
+            run_game._exec_out_stream = orig
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "流超时后必须留置（还原链未证）")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("中途失败", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["dev_tmp"], "超时出口凭据已核删干净")
+        self.assertNotIn("installs", st)
+
+    def test_backup_stream_writefail_detains_and_cleans(self):
+        """㊿ #329632：归档写盘失败（磁盘满/IO 错）——流函数抛错出口同样
+        走凭据核删；备份没返回 → 留置不放锁。"""
+        state = self._data_state()
+        orig = run_game._exec_out_stream
+        def write_fail(d, args_, dest, timeout=600):
+            raise OSError("No space left on device")      # 模拟写盘失败
+        run_game._exec_out_stream = write_fail
+        try:
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state))
+        finally:
+            run_game._exec_out_stream = orig
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "写盘失败后必须留置（还原链未证）")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("中途失败", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["dev_tmp"], "异常出口凭据已核删干净")
 
     def test_pushed_tamper_caught_by_post_verify(self):
         """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →
