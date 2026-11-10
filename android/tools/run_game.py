@@ -321,10 +321,13 @@ def restore_data(d, pkg, manifest, backup_dir):
 def apply_checkpoint(d, pkg, cp_dir, manifest, log):
     """s2a-checkpoint/1 → 部署后、首启前解进存档根（BootSpec 冻结：
     files/user/0/saves/<titleId>/ryujinx-android；S2A_SAVE_DIR 在 typed BootSpec 下不生效）。
-    宿主核（schema/包名/titleId、tar sha、成员白名单、清单⊆tar）→ push → run-as tar 解
-    → 逐文件 sha 复核。任一门不过记 manifest.checkpoint.verify=fail 后抛 Refuse（不起局）。"""
-    block = {"name": cp_dir.name}
-    manifest["checkpoint"] = block
+    写设备前宿主全验：schema/包名/titleId（规范 16 位大写十六进制）/meta.files 每项
+    [长度, sha256] 对（含重复键、64-hex 校验）/tar sha/成员白名单（绝对路径、..、
+    软链硬链、设备节点、重复成员名拒）/成员↔清单严格一致（含声明长度↔成员长度）。
+    过门 push → run-as tar 解 → 逐文件 sha 复核。任一门不过记 verify=fail 抛 Refuse；
+    临时 tar 删除失败记 tmp_left，收局并入还原失败 → 留置。"""
+    block = manifest.setdefault("checkpoint", {"name": cp_dir.name})
+    block.setdefault("name", cp_dir.name)
 
     def deny(reason):
         block["verify"] = "fail"
@@ -332,24 +335,42 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log):
         raise Refuse(f"检查点 {cp_dir.name} 不可用：{reason}")
 
     try:
-        meta = json.loads((cp_dir / "meta.json").read_text())
+        raw = json.loads((cp_dir / "meta.json").read_text(),
+                         object_pairs_hook=lambda p: p)
     except (OSError, json.JSONDecodeError) as error:
         deny(f"meta.json 读不了：{error}")
+    try:
+        meta = dict(raw)
+    except (TypeError, ValueError):
+        deny("meta.json 顶层不是对象表")
     if meta.get("schema") != "s2a-checkpoint/1":
         deny(f"schema 不是 s2a-checkpoint/1（{meta.get('schema')}）")
-    files_map = meta.get("files")
-    if not isinstance(files_map, dict) or not files_map:
-        deny("meta.files 空或不是清单表")
-    if meta.get("package") and meta["package"] != pkg:
-        deny(f"meta.package={meta['package']} 与本局 {pkg} 不符")
-    mtid = re.search(r"\.t([0-9a-fA-F]{16})$", pkg)
+    if meta.get("package") != pkg:
+        deny(f"meta.package={meta.get('package')} 与本局 {pkg} 不符")
     title_id = str(meta.get("title_id") or "")
-    if title_id and mtid and title_id.lower() != mtid.group(1).lower():
+    if not re.fullmatch(r"[0-9A-F]{16}", title_id):
+        deny(f"meta.title_id={title_id!r} 不是规范 16 位大写十六进制")
+    mtid = re.search(r"\.t([0-9a-fA-F]{16})$", pkg)
+    if mtid and title_id.lower() != mtid.group(1).lower():
         deny(f"meta.title_id={title_id} 与包名 {pkg} 的 titleId 不符")
-    if not title_id:
-        if not mtid:
-            deny("meta 无 title_id 且包名推不出 titleId")
-        title_id = mtid.group(1).upper()
+    pairs = meta.get("files")
+    if not isinstance(pairs, list) or not pairs:
+        deny("meta.files 空或不是清单表")
+    files_map = {}
+    for item in pairs:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2
+                and isinstance(item[0], str)):
+            deny("meta.files 不是 {路径: [长度, sha256]} 清单表")
+        rel, want = item[0], item[1]
+        rel = posixpath.normpath(rel)
+        if rel in files_map:
+            deny(f"meta.files 重复声明 {rel}")
+        if not (isinstance(want, list) and len(want) == 2
+                and isinstance(want[0], int) and want[0] >= 0
+                and isinstance(want[1], str)
+                and re.fullmatch(r"[0-9a-f]{64}", want[1])):
+            deny(f"meta.files[{rel}] 不是 [长度≥0, sha256(64hex)] 对")
+        files_map[posixpath.normpath(rel)] = want
     tar_p = cp_dir / "saves.tar"
     try:
         want_tar_sha = (cp_dir / "saves.tar.sha256").read_text().split()[0]
@@ -364,35 +385,48 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log):
             members = tf.getmembers()
     except (tarfile.TarError, OSError, EOFError) as error:
         deny(f"saves.tar 打不开/截断：{error}")
-    tar_files = set()
+    tar_files, tar_sizes, seen = {}, {}, set()
     for mem in members:
         if (mem.name.startswith("/") or posixpath.isabs(mem.name)
                 or ".." in mem.name.split("/")):
             deny(f"tar 成员越界：{mem.name}")
+        rel = posixpath.normpath(mem.name)
+        if rel in seen:
+            deny(f"tar 成员重复：{rel}")
+        seen.add(rel)
         if mem.isfile():
-            tar_files.add(posixpath.normpath(mem.name))
+            tar_files[rel] = True
+            tar_sizes[rel] = mem.size
         elif not mem.isdir():
             deny(f"tar 成员类型不收（{mem.name}）：只收普通文件与目录")
-    missing = sorted(rel for rel in files_map if posixpath.normpath(rel) not in tar_files)
-    if missing:
-        deny(f"meta.files 有 {len(missing)} 项不在 tar 里：{missing[:3]}")
+    extra = sorted(rel for rel in tar_files if rel not in files_map)
+    missing = sorted(rel for rel in files_map if rel not in tar_files)
+    if extra or missing:
+        deny(f"tar 成员与 meta.files 不一致：多 {extra[:3] or '无'} 缺 {missing[:3] or '无'}")
+    bad_size = sorted(rel for rel, want in files_map.items()
+                      if tar_sizes[rel] != want[0])
+    if bad_size:
+        deny(f"声明长度与 tar 成员不符 {len(bad_size)} 项：{bad_size[:3]}")
     state_dir = f"/data/data/{pkg}/files/user/0/saves/{title_id}/ryujinx-android"
     tmp = f"/data/local/tmp/s2a-checkpoint-{uuid.uuid4().hex[:12]}.tar"
-    d.run("push", str(tar_p), tmp, timeout=300)
     try:
+        d.run("push", str(tar_p), tmp, timeout=300)
         d.run_as(pkg, f"mkdir -p {shlex.quote(state_dir)}", timeout=60)
         d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(state_dir)}", timeout=600)
     finally:
-        d.shell(f"rm -f {tmp}", allowed=(0, 1))
+        try:
+            d.shell(f"rm -f {tmp}")
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            block["tmp_left"] = tmp
+            block["tmp_cleanup_error"] = str(error)[:160]
     entries = device_entries(d, pkg, state_dir)
-    want = {posixpath.normpath(rel): v[1] for rel, v in files_map.items()}
-    bad = [rel for rel, sha in want.items()
-           if entries.get(rel, {}).get("t") != "f" or entries[rel].get("sha") != sha]
+    bad = [rel for rel, want in files_map.items()
+           if entries.get(rel, {}).get("t") != "f" or entries[rel].get("sha") != want[1]]
     if bad:
         deny(f"解入后核对不符 {len(bad)} 项：{bad[:3]}")
     block.update(scene=meta.get("scene"), title_id=title_id,
                  files=len(files_map),
-                 extra_files=sum(1 for rel in entries if rel not in want),
+                 extra_files=sum(1 for rel in entries if rel not in files_map),
                  verify="ok")
     log(f"检查点 {cp_dir.name} 已解入 saves/{title_id}/ryujinx-android（{len(files_map)} 文件 sha 复核过）")
 
@@ -952,6 +986,13 @@ def main(argv=None):
             raise Refuse(f"{pkg} 设备上已安装但不是 debuggable：run-as 备份私有数据做不了，"
                          f"局内私有数据与已并入资源会被改写且 adb 层无法还原；"
                          f"先手动卸了它再跑，或显式 --allow-data-loss（只还原 APK 字节）")
+        if args.checkpoint:
+            manifest["checkpoint"] = {"name": args.checkpoint.name}
+            if state0["installed"]:
+                manifest["checkpoint"].update(
+                    verify="fail", fail="设备已装该包：检查点会清/盖已有数据")
+                raise Refuse("检查点只收原未安装的局：设备已装该包，解入会动已有数据——"
+                             "先人工卸了再跑，或拿掉 --checkpoint")
         # ---- versionCode / 降级：装新包方向（原>新）由 install -r -d 实测；装回方向 ----
         # ---- （原<新）证不了能装回 → 入局前直接拒跑（manifest 记决策依据）----
         downgrade_fwd = False
@@ -1339,6 +1380,11 @@ def main(argv=None):
         # ---- 还原（任何结果都跑：SIGTERM / 未捕获异常也走到）----
         fails = []
         pkg = manifest.get("package", args.package or "")
+        ck_tmp = manifest.get("checkpoint", {}).get("tmp_left")
+        if ck_tmp:
+            fails.append(f"检查点临时文件没删掉：{ck_tmp}"
+                         f"（{manifest['checkpoint'].get('tmp_cleanup_error', '')}）——"
+                         f"/data/local/tmp 有残留，设备状态未证")
         if sampler:
             try:  # 中断路径同样收采样守护：杀循环 → 拉回设备上已落的行 → 清理文件
                 for row, level in stop_power_sampler(d, sampler[0], sampler[1]):
