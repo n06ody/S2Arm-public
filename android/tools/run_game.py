@@ -362,26 +362,34 @@ def device_timebase(d):
 
 def frame_log_blocks(text, pids=None):
     """meta→end 切帧日志块；给 pids 时只收这些 PID 的行（logcat 行前缀 PID 绑定当局进程）。
-    没前缀 / 别的 PID 的帧日志行一律不进块；末尾被截断的块只坏自己。
+    没前缀 / 别的 PID 的帧日志行一律不进块；同一块成员必须同属 meta 行那个 PID——
+    当局是多进程（pkg / pkg:*）时两进程的转储会在 logcat 里交错，跨 PID 拼出来的
+    「块」是拼接物不是转储（meta 说 recorded=N、分片来自另一进程、SHA 对不上也能骗过
+    完整性判读），异 PID 行一律不进本块。末尾被截断的块只坏自己。
     截断块（没等到 end：被新 meta 顶断 / 文末就断了）同样交出——缺了哪些片、
     缺 end/SHA 由 parser 如实报「转储被截断 / 整段未证」，不静默丢。"""
     seg = None
+    seg_pid = None
     for line in text.splitlines():
         if "direct frame-log" not in line:
             continue
+        lp = None
         if pids is not None:
             m = THREADTIME_PID.match(line)
             if not m or int(m.group(1)) not in pids:
                 continue
+            lp = int(m.group(1))
         if "direct frame-log meta:" in line:
             if seg is not None:
                 yield "\n".join(seg)
-            seg = []
+            seg, seg_pid = [], lp
         if seg is not None:
+            if pids is not None and lp != seg_pid:
+                continue    # 异 PID 行不进本块：交错转储各归各，不拼块
             seg.append(line)
             if "direct frame-log end:" in line:
                 yield "\n".join(seg)
-                seg = None
+                seg = seg_pid = None
     if seg is not None:
         yield "\n".join(seg)
 
@@ -1261,8 +1269,7 @@ def main(argv=None):
                         orig_tmp.parent.rmdir()
                     except OSError as error:
                         manifest["orig_backup_dir"] = str(orig_tmp.parent)
-                        notes.append(f"orig.apk 已清，orig-backup 目录清理失败：{error}"
-                                     f"（空壳目录留在 out）")
+                        notes.append(f"orig.apk 已清，orig-backup 目录留存（{error}）")
         if fails:
             reason = (reason + "；" if reason and reason != "未跑完" else "") + "；".join(fails)
             device_lock.detain(lock, args.serial, reason, holder=args.holder, out=str(out))

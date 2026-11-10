@@ -1156,7 +1156,7 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("orig_backup_dir", man)
         self.assertFalse((out / "orig-backup" / "orig.apk").exists())
         self.assertTrue((out / "orig-backup" / "orig.apk.stray").exists())
-        self.assertTrue(any("目录清理失败" in n for n in man["notes"]), man["notes"])
+        self.assertTrue(any("目录留存" in n for n in man["notes"]), man["notes"])
 
     def test_frame_block_uuid_missing_dropped(self):
         """qa-fone ②：logcat 帧块 meta 无 uuid 字段（旧构建/属性没置上）→
@@ -1180,6 +1180,44 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertEqual(0, man["frame_log"]["captures"])
         self.assertTrue(any("OTHER-SESSION" in n for n in man["notes"]), man["notes"])
+
+    def test_frame_block_cross_pid_splice_rejected(self):
+        """qa-fone ①：meta 来自 4242（uuid 本局）、分片+end 全来自 4243——
+        同 session 两进程的行不许拼成一块：4242 只剩 meta 按截断如实报，
+        4243 的残体无 meta 不成块，captures=0。"""
+        a = frame_log_text(recorded=200, pid=4242, first=0, base_ts=10_500_000)
+        b = frame_log_text(recorded=200, pid=4243, first=0, base_ts=10_500_000)
+        splice = a.splitlines()[0] + "\n" + "\n".join(b.splitlines()[1:]) + "\n"
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + splice)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + splice)
+        rc, out, _ = self.run_tool()
+        self.assertEqual(0, rc)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(1, len(rows), "跨 PID 拼出的块一帧都不进表")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, man["frame_log"]["captures"])
+        self.assertTrue(any("截断" in n or "不完整" in n for n in man["notes"]), man["notes"])
+
+    def test_frame_block_interleaved_pids_split(self):
+        """qa-fone ① 正对照：两进程完整转储逐行交错——按各自 meta 的 PID 分流，
+        后到的 4243 块完整成块进表，4242 被顶断的残块如实报截断不污染。"""
+        a = frame_log_text(recorded=200, pid=4242, first=0, base_ts=10_500_000)
+        b = frame_log_text(recorded=150, pid=4243, first=0, base_ts=11_000_000)
+        la, lb = a.splitlines(), b.splitlines()
+        inter = "\n".join(x for i in range(max(len(la), len(lb)))
+                          for x in la[i:i + 1] + lb[i:i + 1]) + "\n"
+        (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + inter)
+        (self.tmp / "logcat_stream.txt").write_text(LOG_HEAD + inter)
+        rc, out, _ = self.run_tool()
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        # logcat 侧：4242 被顶断（meta+残片如实报截断）、4243 完整成块；
+        # 私有文件同文：4242 的 frame-log-<pid>.log 按自己 PID 行完整成块——
+        # 两进程各成一块都进解析，跨 PID 拼接的畸形块不再出现
+        self.assertEqual(2, man["frame_log"]["captures"])
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual(149, len(rows) - 1, "覆盖最大块（4242 窗内 150 帧）出 149 行")
+        self.assertTrue(any("截断" in n or "不完整" in n for n in man["notes"]), man["notes"])
 
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
