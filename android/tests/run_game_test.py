@@ -25,7 +25,7 @@
     等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
     stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -200,6 +200,9 @@ def run_as(cmdline):
         for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
             tab[m.group(2)] = {} if tab is not DATA_SUBDIRS else []
         save(); return
+    m = _re.match(r"^mkdir -p (\\S+)$", cmdline)      # 检查点：建存档根（含父链）
+    if m:
+        DATA_DIRS.setdefault(m.group(1), {}); save(); return
     m = _re.match(r"^tar -xpf (\\S+) -C (\\S+)$", cmdline)
     if m:
         src = PUSHED.get(m.group(1))
@@ -1509,6 +1512,117 @@ class RunGameTest(unittest.TestCase):
         qrow = self._qc(out)
         self.assertEqual("没数据", qrow["能耗"])
         self.assertIn("帧时性能局不接功耗", qrow["读数"], qrow["读数"])
+
+    # ---- 检查点（s2a-checkpoint/1）：部署后首启前 run-as 解进存档根 + 逐文件 sha 核对 ----
+    _CK_TID = "0123456789ABCDEF"          # PKG 尾 16 位十六进制大写
+    _CK_FILES = {
+        "bis/user/save/0000000000000001/1/game_data.sav": b"SAVE-DATA",
+        "bis/system/save/8000000000000000/1/lastPublishedId": b"12345678",
+    }
+
+    def _checkpoint(self, name="w1-node", files=None, meta_extra=None,
+                    tar_members=None, trunc=False):
+        """造检查点目录：saves.tar + meta.json + saves.tar.sha256。
+        files={rel: bytes} 与 meta.files 一一对应；tar_members 可加声明外成员；
+        trunc=截断 tar（sha 按截后实算——过 sha 门、倒在 tarfile 读）。"""
+        cp = self.tmp / name
+        cp.mkdir()
+        files = dict(files if files is not None else self._CK_FILES)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for rel, blob in files.items():
+                info = tarfile.TarInfo(rel)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+            for rel, blob in (tar_members or {}).items():
+                info = tarfile.TarInfo(rel)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        data = buf.getvalue()
+        (cp / "saves.tar").write_bytes(data[:60] if trunc else data)
+        blob = (cp / "saves.tar").read_bytes()
+        (cp / "saves.tar.sha256").write_text(
+            hashlib.sha256(blob).hexdigest() + "  saves.tar\n")
+        meta = {"schema": "s2a-checkpoint/1", "game": "wonder",
+                "title_id": self._CK_TID, "package": PKG, "scene": name,
+                "files": {rel: [len(b), hashlib.sha256(b).hexdigest()]
+                          for rel, b in files.items()}}
+        meta.update(meta_extra or {})
+        (cp / "meta.json").write_text(json.dumps(meta))
+        return cp
+
+    def test_checkpoint_apply_and_verify(self):
+        """检查点正路：宿主核过 → push → run-as tar 解进 saves/<tid>/ryujinx-android
+        → 逐文件 sha 复核 → 照起局；manifest.checkpoint 记名/源 sha/核对 ok。"""
+        cp = self._checkpoint()
+        rc, out, _ = self.run_tool(argv=["--checkpoint", str(cp)])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        ck = man["checkpoint"]
+        self.assertEqual("ok", ck["verify"], ck)
+        self.assertEqual("w1-node", ck["name"])
+        self.assertEqual(self._CK_TID, ck["title_id"])
+        self.assertEqual(2, ck["files"])
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", ck["source_sha256"]))
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("am start", st.get("launch_cmd", ""))
+        state_dir = ("/data/data/" + PKG + "/files/user/0/saves/"
+                     + self._CK_TID + "/ryujinx-android")
+        dd = st["data_dirs"].get(state_dir, {})
+        for rel, blob in self._CK_FILES.items():
+            self.assertEqual(blob.hex(), dd.get(rel), rel)
+
+    def test_checkpoint_files_sha_mismatch(self):
+        """清单不符：meta.files 声明 sha 与实解文件不符 → 不起局（Refuse→red），
+        manifest 记 verify=fail；另路：meta 声明的文件 tar 里没有同样拒。"""
+        cp = self._checkpoint(meta_extra={
+            "files": {"bis/user/save/0000000000000001/1/game_data.sav":
+                      [9, "0" * 64],
+                      "bis/system/save/8000000000000000/1/lastPublishedId":
+                      [8, hashlib.sha256(b"12345678").hexdigest()]}})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_bad")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        self.assertIn("核对不符", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "核对不过不许起局")
+        cp2 = self._checkpoint(
+            name="w2", meta_extra={"files": {"bis/user/save/nope": [1, "0" * 64]}})
+        _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_miss")
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("不在 tar", man2["reason"])
+        st2 = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st2)
+
+    def test_checkpoint_path_traversal(self):
+        """路径越界：tar 成员含 .. 段 → 宿主门拒（push 都没发生），不起局。"""
+        cp = self._checkpoint(tar_members={"bis/../../evil": b"x"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_trav")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        self.assertIn("越界", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+        self.assertFalse(any("s2a-checkpoint" in k for k in st.get("pushed", {})),
+                         "越界成员不许 push 到设备")
+
+    def test_checkpoint_truncated_tar(self):
+        """tar 截断：sha 按截后实算（过 sha 门）→ tarfile 读不出 → 拒，不起局。"""
+        cp = self._checkpoint(trunc=True)
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_trunc")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("截断", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+
+    def test_checkpoint_wrong_package(self):
+        """包名不符：meta.package 与本局包不同 → 拒（装错检查点比不装更糟）。"""
+        cp = self._checkpoint(meta_extra={"package": "org.s2arm.game.t9999999999999999"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_wpkg")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("与本局", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
 
     def test_private_logs_pulled_before_restore(self):
         """㉑ 私有证据收证：收局后、还原（pm clear/卸载清私有目录）前把当局进程的
