@@ -5,6 +5,7 @@
 #include <android/log.h>
 #endif
 #include "nvn_vk_program_result.h"
+#include "nvn_vk_compute_phase.h"
 #include "direct/offline_library.h"
 #include "direct/program_cache.h"
 #include "direct/compile_worker.h"
@@ -56,12 +57,20 @@ static int number_is(const s2a_json_object *o, const char *key, uint64_t value) 
  * requestId}}); a missing object or any field drift rejects here, before
  * content is trusted. requestId 是“这份结果是不是回答这份 REQUEST”的唯一
  * 关联字段——只比 session/generation 会在同会话多笔请求时把 A 结果当 B 用。 */
-static int accept(const uint8_t *bytes, size_t length, const struct expected *e, int fresh,
+/* compute_phase 子项计时包装：门关 = 多一次函数调用，不取钟。 */
+static int sub_parse(s2a_json_object *j, const uint8_t *raw, size_t n, int ph,
+                     char *why, size_t cap) {
+    const uint64_t t0 = ph ? nvk_compute_phase_now() : 0;
+    const int rc = s2a_json_parse_object(raw, n, j, why, cap);
+    if (ph) nvk_compute_phase_sub(NVK_SUB_JSON, nvk_compute_phase_now() - t0);
+    return rc;
+}
+static int accept(const uint8_t *bytes, size_t length, const struct expected *e, int fresh, int ph,
                   char *why, size_t cap) {
     s2a_json_object *j = malloc(sizeof *j);
     if (!j) return error(why, cap, "compute identity allocation failed");
     int rc = -1;
-    if (s2a_json_parse_object(bytes, length, j, why, cap)) goto done;
+    if (sub_parse(j, bytes, length, ph, why, cap)) goto done;
     // 结果的 transport（session/generation/requestId）在嵌套对象 transport 里（编译器
     // DirectShaderCompiler.cs:536 写的是 {"transport":{"session":…,"generation":…,"requestId":…}}），
     // 不在顶层；顶层只有 schema/contentHash/content/identity。先把 content 的裸视图取出来，
@@ -75,7 +84,7 @@ static int accept(const uint8_t *bytes, size_t length, const struct expected *e,
         // 不在顶层。fresh 结果必须三项全等价回显；持久化结果只校验内容身份（下面 fresh=0 路径不变）。
         const s2a_json_field *ft = s2a_json_get(j, "transport");
         if (!ft || ft->kind != S2A_JSON_OBJECT) { error(why, cap, "compute result transport missing"); goto done; }
-        if (s2a_json_parse_object(ft->raw, ft->raw_bytes, j, why, cap)) goto done;
+        if (sub_parse(j, ft->raw, ft->raw_bytes, ph, why, cap)) goto done;
         if (!number_is(j, "session", e->session) || !number_is(j, "generation", e->generation) ||
             !string_is(j, "requestId", e->request_id)) {
             // 诊断要能直接定位是哪一项漂移（got/want），不能只剩一句 mismatch——
@@ -102,16 +111,20 @@ static int accept(const uint8_t *bytes, size_t length, const struct expected *e,
             error(why, cap, message); goto done;
         }
     }
-    if (s2a_json_parse_object(content_raw, content_len, j, why, cap)) goto done;
+    if (sub_parse(j, content_raw, content_len, ph, why, cap)) goto done;
     const s2a_json_field *fi = s2a_json_get(j, "identity");
     if (!fi || fi->kind != S2A_JSON_OBJECT) { error(why, cap, "compute identity missing"); goto done; }
-    if (s2a_json_parse_object(fi->raw, fi->raw_bytes, j, why, cap)) goto done;
+    if (sub_parse(j, fi->raw, fi->raw_bytes, ph, why, cap)) goto done;
     if (!number_is(j, "directABI", e->abi) || !string_is(j, "translatorClosure", e->closure) ||
         !string_is(j, "profileHash", e->profile) || !string_is(j, "runtimeCompilerABI", "s2a-direct-compile-v1")) {
         error(why, cap, "compute result identity mismatch"); goto done;
     }
     struct nvn_vk_compute_program p = {0};
-    rc = nvn_vk_program_parse_compute(bytes, length, &p, why, cap);
+    {
+        const uint64_t t0 = ph ? nvk_compute_phase_now() : 0;
+        rc = nvn_vk_program_parse_compute(bytes, length, &p, why, cap);
+        if (ph) nvk_compute_phase_sub(NVK_SUB_REFL, nvk_compute_phase_now() - t0);
+    }
     if (!rc && p.has_unaligned_storage_buffer != e->unaligned)
         rc = error(why, cap, "compute reflection/request alignment mismatch");
     nvn_vk_program_free_compute(&p);
@@ -169,7 +182,12 @@ int nvk_compute_lookup(const struct nvk_compute_request *r,
     if (!s2a_direct_provider_compile_context)
         return error(why, cap, "compute provider context unavailable");
     struct expected e = {.session=c->session, .generation=c->generation, .abi=c->direct_abi};
-    if (request_facts(r, &e.unaligned, e.request_id, sizeof e.request_id, why, cap)) return -1;
+    const int ph = nvk_compute_phase_on();
+    uint64_t t0;
+    t0 = ph ? nvk_compute_phase_now() : 0;
+    const int frc = request_facts(r, &e.unaligned, e.request_id, sizeof e.request_id, why, cap);
+    if (ph) nvk_compute_phase_sub(NVK_SUB_JSON, nvk_compute_phase_now() - t0);
+    if (frc) return -1;
     snprintf(e.closure, sizeof e.closure, "%s", c->translator_closure);
     snprintf(e.profile, sizeof e.profile, "%s", c->profile_hash);
     if (!same_context(&e)) return error(why, cap, "compute provider is stale or stopped");
@@ -179,16 +197,21 @@ int nvk_compute_lookup(const struct nvk_compute_request *r,
             .profile_declared=c->offline_profile_available};
         memcpy(q.identity, r->identity, 32);
         struct s2a_offline_program p = {0};
+        t0 = ph ? nvk_compute_phase_now() : 0;
         int rc = s2a_offline_library_fetch(options->revision_root, &q, &p, out->offline_reason, sizeof out->offline_reason);
-        if (rc == S2A_OFFLINE_HIT && !accept(p.bytes, p.len, &e, 0, out->offline_reason, sizeof out->offline_reason)) {
+        if (ph) nvk_compute_phase_sub(NVK_SUB_IO, nvk_compute_phase_now() - t0);
+        if (rc == S2A_OFFLINE_HIT && !accept(p.bytes, p.len, &e, 0, ph, out->offline_reason, sizeof out->offline_reason)) {
             bytes=p.bytes; length=p.len; out->origin=NVK_COMPUTE_OFFLINE;
         } else free(p.bytes);
     }
     if (!bytes && options->private_cache_root) {
         uint8_t digest[32];
-        if (!s2a_program_cache_load(options->private_cache_root, r->identity, &bytes, &length, digest,
-                out->private_reason, sizeof out->private_reason)) {
-            if (accept(bytes, length, &e, 0, out->private_reason, sizeof out->private_reason)) {
+        t0 = ph ? nvk_compute_phase_now() : 0;
+        const int hit = !s2a_program_cache_load(options->private_cache_root, r->identity, &bytes, &length, digest,
+                out->private_reason, sizeof out->private_reason);
+        if (ph) nvk_compute_phase_sub(NVK_SUB_IO, nvk_compute_phase_now() - t0);
+        if (hit) {
+            if (accept(bytes, length, &e, 0, ph, out->private_reason, sizeof out->private_reason)) {
                 free(bytes); bytes=NULL; length=0;
             } else out->origin=NVK_COMPUTE_PRIVATE;
         }
@@ -197,8 +220,10 @@ int nvk_compute_lookup(const struct nvk_compute_request *r,
     if (!bytes && options->no_live_compile)
         return error(why, cap, "compute miss: live compilation disabled");
     if (!bytes) {
+        t0 = ph ? nvk_compute_phase_now() : 0;
         int rc = s2a_compile_worker_run(e.session, e.generation, r->json, r->json_bytes, r->identity, 10000,
             options->pause, options->resume, options->pause_context, &bytes, &length, why, cap);
+        if (ph) nvk_compute_phase_sub(NVK_SUB_LIVE, nvk_compute_phase_now() - t0);
         if (rc) { free(bytes); return -1; } /* cancellation/timeout is terminal, no sync retry */
         /* F4.1：现编结果封套与请求同名配对写本局私有诊断目录，且在 accept 之前——
          * transport/反射/校验拒掉的封套正是现场实据。文件名合同 <requestId>-<身份
@@ -224,10 +249,13 @@ int nvk_compute_lookup(const struct nvk_compute_request *r,
             }
         }
         if (!same_context(&e)) { free(bytes); return error(why, cap, "compute provider changed during compilation"); }
-        if (accept(bytes, length, &e, 1, why, cap)) { free(bytes); return -1; }
+        if (accept(bytes, length, &e, 1, ph, why, cap)) { free(bytes); return -1; }
         out->origin=NVK_COMPUTE_COMPILED;
-        if (options->private_cache_root)
+        if (options->private_cache_root) {
+            t0 = ph ? nvk_compute_phase_now() : 0;
             out->cache_store_failed = s2a_program_cache_store_async(options->private_cache_root, r->identity, bytes, length) != 0;
+            if (ph) nvk_compute_phase_sub(NVK_SUB_IO, nvk_compute_phase_now() - t0);
+        }
     }
     out->profile=r->profile;
     out->bytes=bytes; out->length=length;

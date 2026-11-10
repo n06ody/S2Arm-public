@@ -200,6 +200,28 @@ int main(int argc,char **argv) {
             const uint64_t w2 = nvk_compute_phase_wall_total();
             assert(w2 - w1 < el);   // tick 喂入使 wall 列 ~52 倍偏小 → 检测口径照出
         }
+        // lookup 子项分账：sub() 计入当前在途样本，同项多次相加、未用项为 0；随结算进窗口。
+        // hits 判「子项走到」：真实 lookup 链上 request_facts 必先走 → JSON hits ≥1；
+        // scenario 20 进 bridge 前已拒 → 全子项 0。
+        {
+            uint64_t su0[NVK_SUB_COUNT], sh0[NVK_SUB_COUNT], su1[NVK_SUB_COUNT], sh1[NVK_SUB_COUNT];
+            nvk_compute_phase_sub_stats(su0, sh0);
+            nvk_compute_phase_begin();
+            nvk_compute_phase_sub(NVK_SUB_JSON, 700); nvk_compute_phase_sub(NVK_SUB_JSON, 300);
+            nvk_compute_phase_sub(NVK_SUB_IO, 4000); nvk_compute_phase_sub(NVK_SUB_REFL, 900);
+            nvk_compute_phase_wall(6000);
+            nvk_compute_phase_sub_stats(su1, sh1);
+            assert(su1[NVK_SUB_JSON] - su0[NVK_SUB_JSON] == 1000 &&
+                   su1[NVK_SUB_IO] - su0[NVK_SUB_IO] == 4000 &&
+                   su1[NVK_SUB_REFL] - su0[NVK_SUB_REFL] == 900 &&
+                   su1[NVK_SUB_LIVE] == su0[NVK_SUB_LIVE]);
+            assert(sh1[NVK_SUB_JSON] - sh0[NVK_SUB_JSON] == 2 &&
+                   sh1[NVK_SUB_IO] - sh0[NVK_SUB_IO] == 1 &&
+                   sh1[NVK_SUB_REFL] - sh0[NVK_SUB_REFL] == 1);
+            if (scenario == 20) for (int s = 0; s < NVK_SUB_COUNT; s++) assert(!sh0[s]);
+            else if (scenario == 11 || scenario == 12) assert(sh0[NVK_SUB_JSON]);   // lookup 内拒点不定：facts 已过
+            else assert(sh0[NVK_SUB_JSON] && sh0[NVK_SUB_LIVE] && sh0[NVK_SUB_REFL]); // 完整 live 链
+        }
     }
     struct s2a_record_compute_stats csstats;
     s2a_record_compute_snapshot(&csstats);

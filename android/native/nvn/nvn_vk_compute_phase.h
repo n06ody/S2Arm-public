@@ -52,4 +52,17 @@ uint64_t nvk_compute_phase_wall_total(void);        // wall 累计 ns（宿主�
 // 时长在粗粒度钟下可合法为 0（<1 tick），不能用 ns>0 断言覆盖。
 void nvk_compute_phase_stats(uint64_t seg_sum[NVK_PHASE_SEGS], uint64_t seg_hits[NVK_PHASE_SEGS],
                              uint64_t *samples, uint64_t *lines);
+// lookup 段内部子项（同一门、同一 64 笔窗口、同行附印 sub-us:）：
+//   json = request_facts 整遍（REQUEST JSON 三遍解析）+ accept 的封套 JSON 解析
+//   io   = 离线库取件 + 磁盘程序缓存读（s2a_program_cache_load）与写（store_async）
+//   live = 现编 worker 往返等待（s2a_compile_worker_run）
+//   refl = accept 内第一遍 SPIR-V 反射解析（nvn_vk_program_parse_compute）
+// lookup − Σsub = 封套字段核对、上下文校验、私有存储之外的小项残差。
+enum nvk_compute_phase_sub {
+    NVK_SUB_JSON = 0, NVK_SUB_IO, NVK_SUB_LIVE, NVK_SUB_REFL, NVK_SUB_COUNT
+};
+void nvk_compute_phase_sub(int part, uint64_t ns);               // 计入当笔样本（可多次累加、不重叠口径）
+// out_sum = 子项累计 ns；out_hits = 子项被计时次数——「子项是否走到」用 hits 判，
+// 时长在粗粒度钟下可合法为 0（与段同口径）。
+void nvk_compute_phase_sub_stats(uint64_t out_sum[NVK_SUB_COUNT], uint64_t out_hits[NVK_SUB_COUNT]);
 #endif

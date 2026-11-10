@@ -46,9 +46,28 @@ static uint64_t g_samp[NVK_PHASE_SEGS + 2][PHASE_CAP], g_wsum[NVK_PHASE_SEGS + 2
 static unsigned g_n;
 static uint64_t g_wall_t0, g_wall_cum;
 static uint64_t g_cum[NVK_PHASE_SEGS], g_hits[NVK_PHASE_SEGS], g_samples, g_lines;
+// lookup 子项：g_sub 在途累计（随结算并入窗口样本）、g_scum/g_shits 全程累计（宿主断言）。
+static uint64_t g_sub[NVK_SUB_COUNT], g_scum[NVK_SUB_COUNT], g_shits[NVK_SUB_COUNT];
+static uint64_t g_ssum[NVK_SUB_COUNT], g_ssamp[NVK_SUB_COUNT][PHASE_CAP];
 static const char *const g_name[NVK_PHASE_SEGS + 2] = {
     "prep", "lookup", "parse", "alloc", "desc", "record", "submit", "wb", "dtor", "wall", "unattr"
 };
+static const char *const g_sname[NVK_SUB_COUNT] = { "json", "io", "live", "refl" };
+
+static void p95of(const uint64_t *src, uint64_t sum, unsigned n, double *avg_us, double *p95_us) {
+    uint64_t tmp[PHASE_CAP];
+    memcpy(tmp, src, n * sizeof tmp[0]);
+    for (unsigned i = 1; i < n; i++) {
+        uint64_t v = tmp[i];
+        unsigned j = i;
+        while (j && tmp[j - 1] > v) { tmp[j] = tmp[j - 1]; j--; }
+        tmp[j] = v;
+    }
+    unsigned p95 = (n * 95 + 99) / 100;
+    if (!p95 || p95 > n) p95 = n;
+    *avg_us = sum / 1e3 / n;
+    *p95_us = tmp[p95 - 1] / 1e3;
+}
 
 static void emit(void) {
     if (!g_n) return;
@@ -58,23 +77,21 @@ static void emit(void) {
     char line[1024];
     int n = snprintf(line, sizeof line, "compute phase n=%u avg-us/p95-us:", g_n);
     for (int s = 0; s < NVK_PHASE_SEGS + 2 && n > 0 && (size_t)n < sizeof line - 48; s++) {
-        uint64_t tmp[PHASE_CAP];
-        memcpy(tmp, g_samp[s], g_n * sizeof tmp[0]);
-        for (unsigned i = 1; i < g_n; i++) {
-            uint64_t v = tmp[i];
-            unsigned j = i;
-            while (j && tmp[j - 1] > v) { tmp[j] = tmp[j - 1]; j--; }
-            tmp[j] = v;
-        }
-        unsigned p95 = (g_n * 95 + 99) / 100;
-        if (!p95 || p95 > g_n) p95 = g_n;
-        n += snprintf(line + n, sizeof line - (size_t)n, " %s=%.1f/%.1f", g_name[s],
-                      g_wsum[s] / 1e3 / g_n, tmp[p95 - 1] / 1e3);
+        double avg, p95;
+        p95of(g_samp[s], g_wsum[s], g_n, &avg, &p95);
+        n += snprintf(line + n, sizeof line - (size_t)n, " %s=%.1f/%.1f", g_name[s], avg, p95);
+    }
+    n += snprintf(line + n, sizeof line - (size_t)n, " sub-us:");
+    for (int s = 0; s < NVK_SUB_COUNT && n > 0 && (size_t)n < sizeof line - 40; s++) {
+        double avg, p95;
+        p95of(g_ssamp[s], g_ssum[s], g_n, &avg, &p95);
+        n += snprintf(line + n, sizeof line - (size_t)n, " %s=%.1f/%.1f", g_sname[s], avg, p95);
     }
     __android_log_print(4 /* ANDROID_LOG_INFO */, "S2Arm", "%s", line);
     g_lines++;
     g_n = 0;
     memset(g_wsum, 0, sizeof g_wsum);
+    memset(g_ssum, 0, sizeof g_ssum);
 }
 
 static void settle(uint64_t wall_ns) {
@@ -91,11 +108,16 @@ static void settle(uint64_t wall_ns) {
         const uint64_t unattr = wall_ns > sum ? wall_ns - sum : 0;
         g_wsum[NVK_PHASE_SEGS + 1] += unattr;
         g_samp[NVK_PHASE_SEGS + 1][g_n] = unattr;
+        for (int p = 0; p < NVK_SUB_COUNT; p++) {
+            g_ssum[p] += g_sub[p];
+            g_ssamp[p][g_n] = g_sub[p];
+        }
         g_n++;
     }
     g_samples++;
     g_armed = 0;
     memset(g_seg, 0, sizeof g_seg);
+    memset(g_sub, 0, sizeof g_sub);
     if (g_n >= PHASE_PRINT_N) emit();
 }
 
@@ -111,6 +133,17 @@ void nvk_compute_phase_add(int seg, uint64_t ns) {
     g_seg[seg] += ns;
     g_cum[seg] += ns;   // 累计随 add 即走：宿主测试不依赖结算点也能断言分段
     g_hits[seg]++;
+}
+void nvk_compute_phase_sub(int part, uint64_t ns) {
+    if (!nvk_compute_phase_on() || part < 0 || part >= NVK_SUB_COUNT) return;
+    if (!g_armed) { g_armed = 1; g_t0 = nvk_compute_phase_now(); }
+    g_sub[part] += ns;
+    g_scum[part] += ns;
+    g_shits[part]++;
+}
+void nvk_compute_phase_sub_stats(uint64_t out_sum[NVK_SUB_COUNT], uint64_t out_hits[NVK_SUB_COUNT]) {
+    if (out_sum) memcpy(out_sum, g_scum, sizeof g_scum);
+    if (out_hits) memcpy(out_hits, g_shits, sizeof g_shits);
 }
 void nvk_compute_phase_flush(void) {
     if (!nvk_compute_phase_on() || !g_armed) return;
