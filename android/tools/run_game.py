@@ -771,6 +771,11 @@ def main(argv=None):
                    help="放电稳定门的等待上限秒数（0=等到够为止；超时照常采集、能耗记没数据）")
     p.add_argument("--power-interval", type=float, default=1.0,
                    help="拉取设备侧电池采样文件的间隔秒")
+    p.add_argument("--no-power-sampler", nargs="?", const="", default=None,
+                   metavar="原因",
+                   help="不起设备端电池采样守护（接电功能局/帧时性能局不需要能耗"
+                        "数据；可附原因记账）。run-manifest 记 power_sampler="
+                        "disabled+原因，quality_check 能耗报「没数据」")
     p.add_argument("--wait", type=float, default=0)
     p.add_argument("--lock-root", default=str(device_lock.lock_root()))
     p.add_argument("--holder", default=os.environ.get("USER", "?"))
@@ -1037,22 +1042,29 @@ def main(argv=None):
         supply = "battery"
         dest = POWER_LOG
         settle_s = 30 if args.discharge_settle is None else args.discharge_settle
-        try:
-            dest, sampler_pid = start_power_sampler(d, supply)
-            sampler = (dest, sampler_pid)
-            manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
-                                         "settle_required_s": settle_s}
-            power_f = (out / "power.tsv").open("w")
-            power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
-        except (RuntimeError, subprocess.SubprocessError) as error:
-            # 起守护失败/超时（adb shell 卡到超时才炸）：设备端可能已有孤儿
-            # 循环在写日志——sampler 变量还没赋值，按 PID 文件/进程标记扫掉。
+        if args.no_power_sampler is not None:
+            # --no-power-sampler：接电功能局/帧时性能局不要能耗读数——连守护都
+            # 不起（也就没有孤儿可留）；门没跑不写 settle_ok，能耗如实没数据。
+            manifest["power_sampler"] = {
+                "disabled": True,
+                "reason": args.no_power_sampler or "调用方声明本局不需要能耗数据"}
+        else:
             try:
-                stop_power_sampler(d, dest, None)
-            except (RuntimeError, subprocess.SubprocessError) as sweep_error:
-                notes.append(f"采样守护起失败后的孤儿清理也没走通：{sweep_error}")
-            notes.append(f"电池采样守护起不来（{str(error)[:160]}）：本局能耗按没数据处理")
-            manifest["power_sampler"] = {"spawn_error": str(error)[:200]}
+                dest, sampler_pid = start_power_sampler(d, supply)
+                sampler = (dest, sampler_pid)
+                manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
+                                             "settle_required_s": settle_s}
+                power_f = (out / "power.tsv").open("w")
+                power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                # 起守护失败/超时（adb shell 卡到超时才炸）：设备端可能已有孤儿
+                # 循环在写日志——sampler 变量还没赋值，按 PID 文件/进程标记扫掉。
+                try:
+                    stop_power_sampler(d, dest, None)
+                except (RuntimeError, subprocess.SubprocessError) as sweep_error:
+                    notes.append(f"采样守护起失败后的孤儿清理也没走通：{sweep_error}")
+                notes.append(f"电池采样守护起不来（{str(error)[:160]}）：本局能耗按没数据处理")
+                manifest["power_sampler"] = {"spawn_error": str(error)[:200]}
 
         def flush_power(rows):
             for row, level in rows:
@@ -1100,7 +1112,9 @@ def main(argv=None):
                     time.sleep(args.power_interval)
                     rows = pull_rows("放电稳定门")
                     settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
-        if "power_sampler" in manifest and "spawn_error" not in manifest["power_sampler"]:
+        if ("power_sampler" in manifest
+                and "spawn_error" not in manifest["power_sampler"]
+                and "disabled" not in manifest["power_sampler"]):
             manifest["power_sampler"]["settle_ok"] = settled
             manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
 
@@ -1223,6 +1237,7 @@ def main(argv=None):
             "apk_sha256": our_sha, "graphics_mode": args.mode, "extras": args.extra,
             "frame_log": manifest["frame_log"], "session": manifest["session"],
             "frame_window_us": manifest["frame_window_us"], "ready": ready,
+            "power_sampler": manifest.get("power_sampler"),
             "restore_scope": manifest["restore_scope"],
         }, ensure_ascii=False, indent=1) + "\n")
         if not manifest["stop_verified"]:

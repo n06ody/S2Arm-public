@@ -1486,6 +1486,30 @@ class RunGameTest(unittest.TestCase):
         self.assertLess(man["power_sampler"]["waited_s"], 30,
                         "接电下不许先等 30s 放电才进窗")
 
+    def test_no_power_sampler_disabled(self):
+        """④ --no-power-sampler：接电功能局/帧时性能局不需要能耗数据——
+        不起设备端采样守护（sampler_spawn_hang 下也照过，证明真没起）、
+        manifest 记 power_sampler.disabled + 原因、不写 settle_ok（门没跑）、
+        power.tsv 不落；quality_check 能耗报「没数据」读数写明未开采样。"""
+        rc, out, _ = self.run_tool(
+            state={"sampler_spawn_hang": True, "sampler_hang_s": 20},
+            argv=["--no-power-sampler", "帧时性能局不接功耗"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        ps = man["power_sampler"]
+        self.assertTrue(ps.get("disabled"), ps)
+        self.assertEqual("帧时性能局不接功耗", ps["reason"])
+        self.assertNotIn("settle_ok", ps, "门没跑不许记 settle_ok")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertFalse(st.get("sampler_on"), "flag 局不许起采样守护")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertFalse((out / "power.tsv").exists())
+        meta = json.loads((out / "android.json").read_text())
+        self.assertTrue(meta["power_sampler"]["disabled"], "android.json 要带供判读")
+        qrow = self._qc(out)
+        self.assertEqual("没数据", qrow["能耗"])
+        self.assertIn("帧时性能局不接功耗", qrow["读数"], qrow["读数"])
+
     def test_private_logs_pulled_before_restore(self):
         """㉑ 私有证据收证：收局后、还原（pm clear/卸载清私有目录）前把当局进程的
         host-*-<pid>-*.log 与原生直写 frame-log-<pid>.log 拉回 out/host_logs/；
