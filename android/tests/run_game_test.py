@@ -565,6 +565,8 @@ if cmd == "shell":
             out("    1 init\\n")
         sys.exit(0)
     if c == "am":
+        if "start" in sh and "s2arm.finish" not in text:
+            st["props_at_launch"] = dict(st["props"])   # 起局那一刻的属性快照（--ab-prop 必须先于游戏出生）
         if "start" in sh:
             if "s2arm.finish" in text:
                 if not st.get("unstoppable"):
@@ -1751,6 +1753,25 @@ class RunGameTest(unittest.TestCase):
         meta.update(meta_extra or {})
         (cp / "meta.json").write_text(json.dumps(meta))
         return cp
+
+    def test_ab_prop_set_before_launch_and_restored(self):
+        """--ab-prop：起局前锁内置位（am start 那一刻已是新值），manifest 记值与原值，
+        收局恢复成原值；格式不对 / 与运行器自管属性重名 → 拒跑、不起局。"""
+        st0 = {"props": {"debug.s2a.vsync": "orig"}}
+        rc, out, _ = self.run_tool(state=st0, argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab")
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual("1", st["props_at_launch"].get("debug.s2a.vsync"), "起局时必须已是新值")
+        self.assertEqual("orig", st["props"].get("debug.s2a.vsync"), "收局必须恢复原值")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual({"value": "1", "prev": "orig"}, man["ab_props"]["debug.s2a.vsync"])
+        for bad, tag in (("debug.s2a.vsync", "noeq"), ("persist.sys.x=1", "ns"),
+                         ("debug.s2a.vsync=1;reboot", "inj"), ("debug.s2a.session_uuid=x", "dup")):
+            _, outb, _ = self.run_tool(argv=["--ab-prop", bad], out_name="out_ab_" + tag)
+            manb = json.loads((outb / "run-manifest.json").read_text())
+            self.assertIn("--ab-prop", manb["reason"], f"{tag}: {manb['reason']}")
+            stb = json.loads((self.tmp / "state.json").read_text())
+            self.assertNotIn("launch_cmd", stb, f"{tag}: 格式不对不许起局")
 
     def test_checkpoint_apply_and_verify(self):
         """检查点正路：宿主核过 → push → run-as tar 解进 saves/<tid>/ryujinx-android

@@ -1040,6 +1040,8 @@ def main(argv=None):
                    help="s2a-checkpoint/1 检查点目录：部署后、首启前 run-as 解进存档根并逐文件 sha 核对")
     p.add_argument("--mode", choices=["auto", "generic", "direct"], default="auto")
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
+    p.add_argument("--ab-prop", action="append", default=[], metavar="debug.s2a.KEY=VALUE",
+                   help="A/B 局用：起局前在锁内置位一个 debug.s2a.* 属性（记原值、读回核对、收局与运行器自管属性同一条恢复链），可多次")
     p.add_argument("--allow-data-loss", action="store_true",
                    help="设备已装该包也照跑：只还原 APK 字节，私有数据与已并入资源不还原（显式接受数据丢失）")
     p.add_argument("--backup-dir",
@@ -1262,6 +1264,18 @@ def main(argv=None):
         for key in DEBUG_PROPS:
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
             d.shell(f"setprop {key} 1", allowed=(0, 1))
+        for spec in args.ab_prop:
+            key, sep, val = spec.partition("=")
+            if not sep or not re.fullmatch(r"debug\.s2a\.[a-z0-9_]+", key) or not re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", val):
+                raise Refuse(f"--ab-prop 格式不对（只收 debug.s2a.<名>=<值>）：{spec}")
+            if key in props_prev or key == SESSION_PROP or key in DEBUG_PROPS:
+                raise Refuse(f"--ab-prop 与运行器自管属性重名：{key}")
+            props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
+            d.shell(f"setprop {key} {shlex.quote(val)}", allowed=(0, 1))
+            got = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
+            if got != val:
+                raise Refuse(f"--ab-prop {key} 没置上（读回 {got!r}）")
+            manifest.setdefault("ab_props", {})[key] = {"value": val, "prev": props_prev[key]}
         props_prev[SESSION_PROP] = d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip()
         d.shell(f"setprop {SESSION_PROP} {run_uuid}", allowed=(0, 1))
         if d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip() != run_uuid:
