@@ -58,14 +58,26 @@ DATA_LINKS = st.setdefault("data_links", {})        # dir -> {relpath: 软链目
 DATA_SUBDIRS = st.setdefault("data_subdirs", {})    # dir -> [relpath,...] 显式目录（含空目录）
 DATA_MODES = st.setdefault("data_modes", {})        # dir -> {relpath: 八进制串} 权限覆盖
 DATA_DENIED = st.setdefault("data_denied", {})      # dir -> True：存在但 run-as 进不去
+DATA_PAD = st.setdefault("data_pad", {})            # dir -> {relpath: 字节数} 合成大文件
+                                                    #（全零填充：tar 备份按声明长度真流出来，
+                                                    #  测宿主是否整流驻内存；清单/sha 按合成算）
+
+def zeros_sha(n):
+    # sha256(N 个零字节)：分块算不整驻内存（替身侧也守同一规矩）
+    h = hashlib.sha256()
+    blk = b"\\0" * (1 << 20)
+    for off in range(0, n, len(blk)):
+        h.update(blk[:min(len(blk), n - off)])
+    return h.hexdigest()
 
 
 def dir_entries(dir_):
     """目录全量成员：文件 + 显式目录 + 文件/软链隐含的父目录 + 软链。"""
     files = DATA_DIRS.get(dir_, {})
     links = DATA_LINKS.get(dir_, {})
+    pads = DATA_PAD.get(dir_, {})
     dirs = set(DATA_SUBDIRS.get(dir_, []))
-    for rel in list(files) + list(links):
+    for rel in list(files) + list(links) + list(pads):
         parts = rel.split("/")[:-1]
         for i in range(1, len(parts) + 1):
             dirs.add("/".join(parts[:i]))
@@ -78,6 +90,9 @@ def dir_entries(dir_):
         # dev_stat_types 旋钮可把某路径报成 fifo/socket 等非普通类型（负对照）
         ftype = "regular empty file" if not files[rel] else "regular file"
         ftype = st.get("dev_stat_types", {}).get(dir_, {}).get(rel, ftype)
+        out_e[rel] = (modes.get(rel, "664"), ftype)
+    for rel in pads:
+        ftype = st.get("dev_stat_types", {}).get(dir_, {}).get(rel, "regular file")
         out_e[rel] = (modes.get(rel, "664"), ftype)
     for rel in links:
         out_e[rel] = (modes.get(rel, "777"), "symbolic link")
@@ -113,13 +128,20 @@ def sha_listing(dir_):
     lines = []
     for rel, hx in sorted(DATA_DIRS.get(dir_, {}).items()):
         lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
+    for rel, n in sorted(DATA_PAD.get(dir_, {}).items()):
+        lines.append(f"{zeros_sha(n)}  ./{rel}")
     return "\\n".join(lines) + ("\\n" if lines else "")
 
-def run_as(cmdline):
-    # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录（shell 与 exec-out 两路进来）
+def run_as(cmdline, via_shell=False):
+    # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录；
+    # via_shell=True = 同一组命令但走 shell 通道（外部数据目录：9000 实测
+    # run-as 摸 /sdcard/Android/* 被 SELinux 拒，shell 有外部存储全权）
     import re as _re, fnmatch as _fm
-    if not st.get("apk_debuggable", True):
-        fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
+    if not via_shell:
+        if not st.get("apk_debuggable", True):
+            fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
+        if st.get("run_as_ext_denied") and "/sdcard/" in cmdline:
+            fail("run-as: " + cmdline + ": Permission denied")   # 9000 SELinux 拒
     m = _re.match(r"^find (\\S+) -type f -name '([\\w.*-]+)'$", cmdline)
     if m:
         # 私有证据收集：列 <root> 下 basename 匹配（含子目录 rel 路径）
@@ -201,7 +223,7 @@ def run_as(cmdline):
     m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
     if m:
         if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
-        for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
+        for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES, DATA_PAD):
             tab[m.group(2)] = {} if tab is not DATA_SUBDIRS else []
         save(); return
     m = _re.match(r"^mkdir -p (\\S+)$", cmdline)      # 检查点：建存档根（含父链）
@@ -220,6 +242,10 @@ def run_as(cmdline):
                 rel = mem.name[2:] if mem.name.startswith("./") else mem.name
                 DATA_MODES.setdefault(dir_, {})[rel] = format(mem.mode & 0o7777, "o")
                 if mem.isfile():
+                    if mem.size >= (1 << 20):
+                        # 大成员按合成档登记（与 data_pad 同口径：不驻 hex）
+                        DATA_PAD.setdefault(dir_, {})[rel] = mem.size
+                        continue
                     blob = tf.extractfile(mem).read()
                     if st.get("corrupt_restore") and len(DATA_DIRS[dir_]) == 0:
                         blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
@@ -244,9 +270,13 @@ def run_as(cmdline):
                 info = tarfile.TarInfo("./" + rel)
                 info.mode = int(mode, 8)
                 if ftype == "regular file":
-                    blob = bytes.fromhex(DATA_DIRS[dir_][rel])
-                    info.size = len(blob)
-                    tf.addfile(info, io.BytesIO(blob))
+                    if rel in DATA_PAD.get(dir_, {}):
+                        info.size = DATA_PAD[dir_][rel]
+                        tf.addfile(info, io.BytesIO(b"\\0" * info.size))
+                    else:
+                        blob = bytes.fromhex(DATA_DIRS[dir_][rel])
+                        info.size = len(blob)
+                        tf.addfile(info, io.BytesIO(blob))
                 elif ftype == "directory":
                     info.type = tarfile.DIRTYPE
                     tf.addfile(info)
@@ -262,6 +292,18 @@ def run_as(cmdline):
                 tf.addfile(info, io.BytesIO(blob))
         sys.stdout.buffer.write(buf.getvalue()); return
     fail("fake adb: unhandled run-as " + cmdline)
+
+def shell_data_cmd(text):
+    """外部数据目录 shell 通道分流（9000 SELinux 拒 run-as 摸 /sdcard）：
+    命中才接管给 run_as 同组处理器——tar -xpf/find -delete/cd&&find 只认
+    「目标目录已注册进 data_dirs」的（deploy 的 tar/find 落 DEV_FS，不接管）；
+    探针按 "echo ok" 圈 _dir_probe 形（__denied__/ls 残留探针不接管）。"""
+    if re.match(r"^e=\\$\\(stat ", text):
+        return "echo ok" in text
+    m = re.match(r"^cd (\\S+) && find ", text) or \
+        re.match(r"^tar -xpf \\S+ -C (\\S+)$", text) or \
+        re.match(r"^(?:mkdir -p \\S+; )?find (\\S+) -mindepth 1 -delete$", text)
+    return bool(m) and m.group(1).rstrip("/") in DATA_DIRS
 
 cmd = argv[0]
 if cmd == "get-state":
@@ -312,6 +354,9 @@ if cmd == "push":
 if cmd == "exec-out":
     if len(argv) > 2 and argv[1] == "run-as":
         run_as(argv[-1]); sys.exit(0)
+    if len(argv) > 3 and argv[1] == "sh" and argv[2] == "-c":
+        # shell 通道 exec-out（外部数据目录 tar 流：不经 run-as）
+        run_as(argv[3], via_shell=True); sys.exit(0)
     sys.stdout.buffer.write(open(st["png"], "rb").read()); sys.exit(0)
 if cmd == "logcat":
     if "-d" in argv:
@@ -329,6 +374,9 @@ if cmd == "shell":
     if sh[:2] == ["sh", "-c"] and len(sh) > 2:
         text = sh[2]; sh = shlex.split(text)
         piped = " | " in text                 # 脚本里裸 | 才是真管道；'|' 词只是参数
+    if shell_data_cmd(text):
+        # 外部数据目录 shell 通道：赶在 c=="tar"/"mkdir" 等按首词分发前接管
+        run_as(text, via_shell=True); sys.exit(0)
     c = sh[0] if sh else ""
     if "s2a-power-samples.log" in text and "echo $!" in text:
         # 采样守护 spawn（setsid sh -c '循环' >日志 2>&1 </dev/null & echo $!）。
@@ -410,7 +458,7 @@ if cmd == "shell":
                 save(); sys.stderr.write("Failed\\n"); sys.exit(1)
             if st.get("pm_clear_silent"):
                 save(); sys.exit(0)                  # rc=0 但无 Success：照样算失败
-            for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
+            for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES, DATA_PAD):
                 for k in list(tab):
                     tab[k] = {} if tab is not DATA_SUBDIRS else []
             save(); out("Success"); sys.exit(0)
@@ -993,6 +1041,36 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("对不上", man["reason"], man["reason"])
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("installs", st)
+
+    def test_backup_tar_streams_without_memory_balloon(self):
+        """㊶ 备份 tar 流式落盘边算 sha——>阈值流不整进宿主内存（9000 私有树
+        实测 ~7.3GB，capture_output 会把宿主内存吃爆）。tracemalloc 峰值断言。"""
+        priv = f"/data/data/{PKG}"
+        want = self._data_state()
+        want["data_pad"] = {priv: {"files/blob.bin": 24 << 20}}
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **want))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(0, rc)
+        self.assertLess(peak, 12 << 20,
+                        f"24MB 备份流应分块落盘，宿主峰值 {peak >> 20}MB 超阈")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(24 << 20, st["data_pad"][priv]["files/blob.bin"],
+                         "大文件备份-回灌应保持（替身按合成档登记）")
+
+    def test_backup_external_dirs_use_shell_channel(self):
+        """㊷ 9000 实测 run-as 摸 /sdcard/Android/* 被 SELinux 拒——外部目录走
+        shell 可读通道（探测/清单/tar/回灌同命令，仅通道换），run-as 只留私有树。"""
+        state = self._data_state()
+        state["run_as_ext_denied"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc, "run-as 被拒不该挡外部目录备份（应走 shell 通道）")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(state["data_dirs"], st["data_dirs"], "还原后数据逐字节一致")
 
     def test_pushed_tamper_caught_by_post_verify(self):
         """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →
