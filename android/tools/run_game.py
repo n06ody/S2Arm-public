@@ -37,7 +37,8 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 先确认游戏进程与采集进程都停了，再逐项验还原。还原失败 → RESULT=red + 留置标。
 安全边界：只经 adb 做 安装/启动/采集/截图——不重启、不刷机、不 root、不改系统设置。
 帧表：只写采集窗口 [起, 止) 内的 direct-present 帧——帧记录是 CLOCK_BOOTTIME，窗口边界取设备
-/proc/uptime 同一时钟；帧日志块按 logcat 行 PID 绑定当局游戏进程，别的进程的块不进表。
+/proc/uptime 同一时钟；帧日志块先按 logcat 行 PID 圈当局进程，再按 meta uuid= 硬绑本局
+（运行器起局前 setprop debug.s2a.session_uuid，缺/不符的块不收），manifest.frame_log.binding 记账。
 私有证据：收局后、还原清私有目录前 run-as 拉回 host-*-<pid>-*.log 与原生直写
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
@@ -440,6 +441,7 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
             reports.append(f"capture {i + 1}: 统计失败 {error}")
     (out / "frame_log.txt").write_text("\n".join(reports) + "\n")
     return {"source": "direct-presenter（非 SurfaceFlinger 合成时序）",
+            "binding": "meta uuid=本局 setprop + logcat 行 PID",
             "window_boot_us": list(window_us) if window_us else None,
             "cover": cover, "rows": rows, "captures": len(caps)}
 
@@ -450,6 +452,10 @@ PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\
 # 名实互核：文件名 <seg>/<pid> 与首行写明的对不上 = 改名/拼接过的文件，不证归属。
 PRIV_SESSION_LINE = re.compile(rb"session=(\d+) pid=(\d+)(?: uuid=(\S+))?")
 PRIV_FRAME_UUID = re.compile(rb"direct frame-log meta:[^\n]*? uuid=(\S+)")
+# 帧块同源绑：logcat 行 / 私有文件里的 meta 行都是 nvn_vk_frame_log.c 同文——
+# uuid=<本局 setprop> 才进帧表；字段缺（旧构建/属性没置上）或值不符（别局
+# 转储/拼接）整段不收，PID+时间窗单独不足以证本局（同 PID 旧局会撞）。
+FRAME_UUID = re.compile(r"direct frame-log meta:[^\n]*? uuid=(\S+)")
 
 
 def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
@@ -1120,6 +1126,11 @@ def main(argv=None):
 
         def collect_caps(text, **kw):
             for block in frame_log_blocks(text, **kw):
+                mu = FRAME_UUID.search(block)
+                if not mu or not run_uuid or mu.group(1) != run_uuid:
+                    notes.append(f"帧日志块本局 uuid 对不上（{mu.group(1) if mu else '字段缺'} "
+                                 f"≠ {run_uuid or '本局未生成'}）：不证属本局，整段不收")
+                    continue
                 try:
                     for cap in direct_framelog.parse(block):
                         key = (cap["meta"]["first"], cap["meta"]["recorded"], len(cap["ts"]))
@@ -1242,10 +1253,16 @@ def main(argv=None):
             else:
                 try:
                     orig_tmp.unlink()
-                    orig_tmp.parent.rmdir()
                 except OSError as error:
                     manifest["orig_apk_backup"] = str(orig_tmp)
                     notes.append(f"原包备份清理失败：{error}（{orig_tmp} 留在 out）")
+                else:
+                    try:
+                        orig_tmp.parent.rmdir()
+                    except OSError as error:
+                        manifest["orig_backup_dir"] = str(orig_tmp.parent)
+                        notes.append(f"orig.apk 已清，orig-backup 目录清理失败：{error}"
+                                     f"（空壳目录留在 out）")
         if fails:
             reason = (reason + "；" if reason and reason != "未跑完" else "") + "；".join(fails)
             device_lock.detain(lock, args.serial, reason, holder=args.holder, out=str(out))

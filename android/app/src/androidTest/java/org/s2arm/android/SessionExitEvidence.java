@@ -34,7 +34,7 @@ final class SessionExitEvidence {
             throw new AssertionError("current process exit is not EXIT_SELF/status0: " + birth.json()
                 + (exit == null ? " no matching record" : " reason=" + exit.reason + " status=" + exit.status + " timestamp=" + exit.timestamp));
         if (generation <= 0) throw new AssertionError("no final surface generation");
-        Pattern header = Pattern.compile("(?m)^\\[s2a\\] Android 会话日志：session=[0-9]+ pid=" + birth.pid + " file=");
+        Pattern header = Pattern.compile("(?m)^\\[s2a\\] Android 会话日志：session=[0-9]+ pid=" + birth.pid + "(?: uuid=\\S+)? file=");
         if (!header.matcher(log).find()) throw new AssertionError("host log PID mismatch");
         Matcher gpuExit = Pattern.compile("(?m)^\\[s2a\\] GPU Run 退出(?:（拆线程）)?：").matcher(log);
         int gpu = -1;
