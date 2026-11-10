@@ -25,7 +25,7 @@
     等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
     stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, re, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -335,7 +335,8 @@ if cmd == "shell":
         # 真 adbd 语义：后台进程只要还有 fd 挂在传输通道上 adb shell 就不退——
         # stdin </dev/null + stderr 2>&1/2>/dev/null + stdout >日志 三个都得引走，
         # 缺一个（哪怕守护其实起了、还在写日志）通道就一直开着（8E 实测 15s 超时）。
-        detached = ("</dev/null" in text
+        # 三 fd 全引但没有 setsid 也照挂：守护继承控制终端（r25 真串实证）。
+        detached = ("setsid" in text and "</dev/null" in text
                     and ("2>&1" in text or "2>/dev/null" in text))
         if not detached or st.get("sampler_spawn_hang"):
             st["sampler_on"] = True; st["sampler_ticks"] = 0   # 守护其实起了（孤儿在写）
@@ -348,14 +349,20 @@ if cmd == "shell":
         st["sampler_on"] = True; st["sampler_ticks"] = 0
         DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
         DEV_FS["/data/local/tmp/s2a-power-samples.log.pid"] = "7777".encode().hex()
+        if st.get("sampler_spawn_silent"):
+            # 空回执：守护起了但 adb 回包是空——spawn 未证，宿主侧要按失败扫孤儿
+            save(); sys.exit(0)
         save(); out("7777\\n"); sys.exit(0)
     if "s2a-power-samples.log" in text and ("pgrep" in text or ".pid" in text) \
             and "echo $!" not in text:
         # 孤儿清理（for p in $! $(cat 日志.pid) $(pgrep -f s2a-power-sampler); do kill $p;
         # done）：守护在 → 杀掉记账（orphan_swept）；日志.pid 一并清。
         st["orphan_swept"] = st.get("sampler_on", False)
-        st["sampler_on"] = False
         DEV_FS.pop("/data/local/tmp/s2a-power-samples.log.pid", None)
+        if st.get("sampler_linger"):
+            # 杀不掉：守护还活着，.pid 照脚本已清，回 LINGER 给宿主退场复验
+            save(); out("LINGER:7777\\n"); sys.exit(0)
+        st["sampler_on"] = False
         save(); sys.exit(0)
     if "power_supply" in text:
         st["uptime_us"] += 1000000
@@ -617,6 +624,9 @@ if cmd == "shell":
     if c == "cat" and len(sh) > 1:
         p = sh[1]
         if p == "/data/local/tmp/s2a-power-samples.log" and st.get("sampler_on"):
+            if st.get("sampler_empty_reads", 0) > 0:
+                # 首读竞态：守护刚起、首块未落盘——文件已被 > 建出但 cat 回空
+                st["sampler_empty_reads"] -= 1; save(); out(""); sys.exit(0)
             # 每拉一次守护多产一拍（替身按拉取节奏推进，不按墙钟）
             st["uptime_us"] += 1_000_000; st["sampler_ticks"] += 1
             charge = st["charge_uah"] - st["sampler_ticks"] * st["charge_step"]
@@ -1447,14 +1457,23 @@ class RunGameTest(unittest.TestCase):
         self.assertTrue(any("放电未稳" in n for n in man["notes"]), man["notes"])
 
     def test_sampler_spawn_requires_full_detach(self):
-        """① 受控负控（8E 红根因）：后台守护 fd 没全脱离时 adbd 不退——
-        只重定向 stdout 的 spawn 卡死；setsid + 三 fd 全脱离立即回 PID。"""
+        """① 受控负控（8E 红根因）：后台守护没真脱离时 adbd 不退——
+        r25 真实旧命令串（三 fd 全引但没有 setsid，bd2082cc）卡死；
+        setsid + 三 fd 全脱离立即回 PID。"""
         st = make_state(self.tmp)
         fake = self.tmp / "fake_adb.py"; fake.write_text(FAKE_ADB)
         adb = [sys.executable, str(fake), str(st)]
-        legacy = ("sh -c 'rm -f /data/local/tmp/s2a-power-samples.log; "
-                  "( while :; do cat /proc/uptime; sleep 1; done ) "
-                  ">/data/local/tmp/s2a-power-samples.log & echo $!'")
+        # r25 真串逐字重建（run_game.py @ bd2082cc）：( while …; done ) >log
+        # 2>/dev/null </dev/null & echo $! —— fd 引齐了但守护还挂控制终端
+        supply = "battery"
+        ap = run_game.android_power
+        legacy_inner = (
+            f"rm -f /data/local/tmp/s2a-power-samples.log; "
+            f"( while :; do {ap.sample_command(supply)}; "
+            f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+            f"printf '{ap.BLOCK_SEP}\\n'; sleep 1; done )"
+            f" >/data/local/tmp/s2a-power-samples.log 2>/dev/null </dev/null & echo $!")
+        legacy = "sh -c " + shlex.quote(legacy_inner)
         with self.assertRaises(subprocess.TimeoutExpired):
             subprocess.run([*adb, "shell", legacy], capture_output=True, timeout=4)
         fixed = ("sh -c 'rm -f /data/local/tmp/s2a-power-samples.log "
@@ -1465,6 +1484,47 @@ class RunGameTest(unittest.TestCase):
         r = subprocess.run([*adb, "shell", fixed], capture_output=True, timeout=5)
         self.assertEqual(0, r.returncode)
         self.assertEqual(b"7777\n", r.stdout)
+
+    def test_sampler_spawn_empty_output_sweeps(self):
+        """①b 启动空回执也算 spawn 未证：守护可能已起在写——脏输出不充 PID，
+        照样按 PID 文件/标记扫孤儿；manifest 记 spawn_error。"""
+        rc, out, _ = self.run_tool(state={"sampler_spawn_silent": True})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("spawn_error", man["power_sampler"], man["power_sampler"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("orphan_swept"), "空回执也要扫孤儿")
+        self.assertFalse(st.get("sampler_on"), "孤儿循环不许活着")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log.pid", st.get("dev_fs", {}))
+
+    def test_sampler_linger_files_kept(self):
+        """② 退场复验：kill 后 /proc/<pid> 还在 → 回 LINGER 记 notes，
+        设备文件不清（留证），杀不掉的守护记还在。"""
+        rc, out, _ = self.run_tool(state={"sampler_linger": True})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertTrue(any("仍存活" in n or "收采样守护失败" in n
+                            for n in man["notes"]), man["notes"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "杀不掉的守护 = 设备有残留未证 → 留置")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("sampler_on"), "杀不掉的守护还在")
+        self.assertIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}),
+                      "杀不掉时日志文件不许删，留证")
+
+    def test_settle_first_read_race_probe(self):
+        """③ 接电首读竞态：守护刚起首块未落盘——补拉几轮仍空就用同口径
+        dumpsys 现态判接电；接电局不许被首读空拖进放电等待。"""
+        plugged = json.loads(make_state(self.tmp).read_text())["power_sample"].replace(
+            "AC powered: false", "AC powered: true")
+        rc, out, _ = self.run_tool(
+            state={"power_sample": plugged, "sampler_empty_reads": 3},
+            discharge_settle=None, argv=["--discharge-timeout", "5"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("settle_na", man["power_sampler"], man["power_sampler"])
+        self.assertLess(man["power_sampler"]["waited_s"], 15,
+                        "接电首读空不许拖进放电等待")
 
     def test_sampler_spawn_timeout_sweeps_orphan(self):
         """② spawn 超时：sampler 变量没赋值前炸也要扫孤儿——按 PID 文件/进程
