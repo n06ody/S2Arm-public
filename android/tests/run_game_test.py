@@ -324,12 +324,32 @@ if cmd == "shell":
         piped = " | " in text                 # 脚本里裸 | 才是真管道；'|' 词只是参数
     c = sh[0] if sh else ""
     if "s2a-power-samples.log" in text and "echo $!" in text:
-        # 采样守护（sh -c 'rm -f 日志; ( while :; do 采样; sleep 1; done ) >日志 & echo $!'）：
+        # 采样守护 spawn（setsid sh -c '循环' >日志 2>&1 </dev/null & echo $!）。
+        # 真 adbd 语义：后台进程只要还有 fd 挂在传输通道上 adb shell 就不退——
+        # stdin </dev/null + stderr 2>&1/2>/dev/null + stdout >日志 三个都得引走，
+        # 缺一个（哪怕守护其实起了、还在写日志）通道就一直开着（8E 实测 15s 超时）。
+        detached = ("</dev/null" in text
+                    and ("2>&1" in text or "2>/dev/null" in text))
+        if not detached or st.get("sampler_spawn_hang"):
+            st["sampler_on"] = True; st["sampler_ticks"] = 0   # 守护其实起了（孤儿在写）
+            DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
+            DEV_FS["/data/local/tmp/s2a-power-samples.log.pid"] = "7777".encode().hex()
+            save()
+            time.sleep(int(st.get("sampler_hang_s", 30))); sys.exit(0)
         # 替身不真跑循环——记 sampler_on，之后每次 cat 日志推进一拍（1s/块）；
         # kill 停、rm 清（adb 掉线不丢采样的替身对应物：块已落在 DEV_FS 里）
         st["sampler_on"] = True; st["sampler_ticks"] = 0
         DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
+        DEV_FS["/data/local/tmp/s2a-power-samples.log.pid"] = "7777".encode().hex()
         save(); out("7777\\n"); sys.exit(0)
+    if "s2a-power-samples.log" in text and ("pgrep" in text or ".pid" in text) \
+            and "echo $!" not in text:
+        # 孤儿清理（for p in $! $(cat 日志.pid) $(pgrep -f s2a-power-sampler); do kill $p;
+        # done）：守护在 → 杀掉记账（orphan_swept）；日志.pid 一并清。
+        st["orphan_swept"] = st.get("sampler_on", False)
+        st["sampler_on"] = False
+        DEV_FS.pop("/data/local/tmp/s2a-power-samples.log.pid", None)
+        save(); sys.exit(0)
     if "power_supply" in text:
         st["uptime_us"] += 1000000
         st["sampler_ticks"] = st.get("sampler_ticks", 0) + 1
@@ -714,7 +734,8 @@ class RunGameTest(unittest.TestCase):
         tool.chmod(0o755)
         return self.tmp / "sdk"
 
-    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1"):
+    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1",
+                 discharge_settle="0"):
         st_kw = {"test_apk_vc": new_vc}
         st_kw.update(state or {})
         state = make_state(self.tmp, **st_kw)
@@ -727,7 +748,9 @@ class RunGameTest(unittest.TestCase):
                 "--out", str(out), "--seconds", str(seconds),
                 "--adb", f"{sys.executable} {fake} {state}",
                 "--lock-root", str(self.lock_root), "--ready-timeout", "5",
-                "--power-interval", "0", "--discharge-settle", "0"]
+                "--power-interval", "0"]
+        if discharge_settle is not None:   # None = 命令行不带旗标（跑默认口径）
+            args += ["--discharge-settle", str(discharge_settle)]
         args += argv or []
         try:
             rc = run_game.main(args)
@@ -1413,6 +1436,55 @@ class RunGameTest(unittest.TestCase):
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertFalse(man["power_sampler"]["settle_ok"])
         self.assertTrue(any("放电未稳" in n for n in man["notes"]), man["notes"])
+
+    def test_sampler_spawn_requires_full_detach(self):
+        """① 受控负控（8E 红根因）：后台守护 fd 没全脱离时 adbd 不退——
+        只重定向 stdout 的 spawn 卡死；setsid + 三 fd 全脱离立即回 PID。"""
+        st = make_state(self.tmp)
+        fake = self.tmp / "fake_adb.py"; fake.write_text(FAKE_ADB)
+        adb = [sys.executable, str(fake), str(st)]
+        legacy = ("sh -c 'rm -f /data/local/tmp/s2a-power-samples.log; "
+                  "( while :; do cat /proc/uptime; sleep 1; done ) "
+                  ">/data/local/tmp/s2a-power-samples.log & echo $!'")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subprocess.run([*adb, "shell", legacy], capture_output=True, timeout=4)
+        fixed = ("sh -c 'rm -f /data/local/tmp/s2a-power-samples.log "
+                 "/data/local/tmp/s2a-power-samples.log.pid; setsid sh -c "
+                 "\"echo $$ >/data/local/tmp/s2a-power-samples.log.pid; while :; do "
+                 ": s2a-power-sampler; sleep 1; done\" "
+                 ">/data/local/tmp/s2a-power-samples.log 2>&1 </dev/null & echo $!'")
+        r = subprocess.run([*adb, "shell", fixed], capture_output=True, timeout=5)
+        self.assertEqual(0, r.returncode)
+        self.assertEqual(b"7777\n", r.stdout)
+
+    def test_sampler_spawn_timeout_sweeps_orphan(self):
+        """② spawn 超时：sampler 变量没赋值前炸也要扫孤儿——按 PID 文件/进程
+        标记杀掉设备端守护、清日志文件；本局能耗按没数据处理。"""
+        rc, out, _ = self.run_tool(
+            state={"sampler_spawn_hang": True, "sampler_hang_s": 20})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("spawn_error", man["power_sampler"])
+        self.assertTrue(any("守护起不来" in n or "采样守护" in n
+                            for n in man["notes"]), man["notes"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("orphan_swept"), "孤儿守护要按 pid 文件/标记扫掉")
+        self.assertFalse(st.get("sampler_on"), "孤儿循环不许活着")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log.pid", st.get("dev_fs", {}))
+
+    def test_charging_discharge_settle_na(self):
+        """③ 接电功能局默认不等放电：未显式给 --discharge-settle 且最新采样
+        证在接电 → 门判不适用直接进窗（settle_na 记明原因）；显式给了照等。"""
+        plugged = json.loads(make_state(self.tmp).read_text())["power_sample"].replace(
+            "AC powered: false", "AC powered: true")
+        rc, out, _ = self.run_tool(state={"power_sample": plugged},
+                                   discharge_settle=None)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("settle_na", man["power_sampler"], man["power_sampler"])
+        self.assertTrue(man["power_sampler"]["settle_ok"])
+        self.assertLess(man["power_sampler"]["waited_s"], 30,
+                        "接电下不许先等 30s 放电才进窗")
 
     def test_private_logs_pulled_before_restore(self):
         """㉑ 私有证据收证：收局后、还原（pm clear/卸载清私有目录）前把当局进程的
