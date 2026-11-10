@@ -60,7 +60,7 @@ _ma_total10() {
 }
 _ma_find() { [ -f "$1" ] || return 0; awk -F'\t' -v c="$2" -v k="$3" '/^#/{next} $1==c&&$2==k{print $3, $4; exit}' "$1"; }
 # 实测表里本类别「实」行：样本数 ≥ S2A_MEM_CLASS_MIN_N（缺省 10）→ 「最大值 × S2A_MEM_CLASS_X（缺省 1.5） 同类实测最大×1.5」；样本不够 → 空
-_ma_cmax() { [ -f "$1" ] || return 0; awk -F'\t' -v c="$2" -v n0="${S2A_MEM_CLASS_MIN_N:-10}" -v x="${S2A_MEM_CLASS_X:-1.5}" '/^#/{next} $1==c&&$4=="实"{n++; if ($3+0>m) m=$3+0} END{if (n >= n0 && m > 0) printf "%.1f 同类实测最大×%s\n", m*x, x}' "$1"; }
+_ma_cmax() { [ -f "$1" ] || return 0; LC_ALL=C awk -F'\t' -v c="$2" -v n0="${S2A_MEM_CLASS_MIN_N:-10}" -v x="${S2A_MEM_CLASS_X:-1.5}" '/^#/{next} $1==c&&$4=="实"{n++; if ($3+0>m) m=$3+0} END{if (n >= n0 && m > 0) printf "%.1f 同类实测最大×%s\n", m*x, x}' "$1"; }
 _ma_need() {   # 类别 键 → 「十分之一GB 来源」（实 / 估 / 生键·同类实测最大×1.5 / 生键·核数比例…；实测表、估值表都没有本键 = 生键）；要先有 MA_TOTAL10 / MA_NCORES / MA_CORES
   local v src c n p10 f
   v=$(_ma_find "$MA_TAB" "$1" "$2"); [ -n "$v" ] || v=$(_ma_find "$MA_SEED" "$1" "$2")

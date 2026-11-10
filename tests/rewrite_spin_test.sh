@@ -42,7 +42,7 @@ r0=$(rew off); r1=$(rew on S2A_REWRITE_SPIN=1)
 w104() { $PY -c "import struct,sys;print(hex(struct.unpack_from('<I',open(sys.argv[1],'rb').read(),0x104)[0]))" "$T/$1/main.patched.bin"; }
 s0=$(grep -c $'\tS\t' "$T/off/main.sites.tsv"); g0=$(grep -c $'\tspin\t' "$T/off/main.gates.tsv"); o0=$(w104 off)
 ck "① 缺省：退出码 ${r0}、S 行 ${s0}、spin 门 ${g0}、0x104 原字 ${o0}" '[ "${r0}" = 0 ] && [ "${s0}" = 0 ] && [ "${g0}" = 0 ] && [ "${o0}" = 0x34ffffe8 ]'
-sx=$(grep $'\tS\t' "$T/on/main.sites.tsv" | tr '\t' ' ' | tr '\n' ';'); gx=$(awk -F'\t' '$2=="spin"{print $4}' "$T/on/main.gates.tsv" | sort | tr '\n' ' ')
+sx=$(grep $'\tS\t' "$T/on/main.sites.tsv" | tr '\t' ' ' | tr '\n' ';'); gx=$(awk -F'\t' '$2=="spin"{print $4}' "$T/on/main.gates.tsv" | LC_ALL=C sort | tr '\n' ' ')
 ck "② 开：退出码 ${r1}、S 行「${sx}」、spin 门原址「${gx}」" '[ "${r1}" = 0 ] && [ "${sx}" = "0x100 S 0x104;0x11c S 0x124;" ] && [ "${gx}" = "0x100 0x11c " ]'
 shape=$($PY - "$T/on/main.patched.bin" <<'PY'
 import struct, sys

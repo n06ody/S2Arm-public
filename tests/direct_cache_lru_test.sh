@@ -14,7 +14,7 @@ mk() {   # 重建夹具
     d=$T/c/$g/store/dshb/0$([ $g = A ] && echo 0 || echo 1); head -c 1048576 /dev/zero > "$d/$g$i.e"; touch -t "$ts" "$d/$g$i.e"; done
   head -c 1048576 /dev/zero > "$T/c/A/ios/b-x/lib.metallib"; head -c 1048576 /dev/zero > "$T/c/B/logs/build.log"; }
 L() { python3 "$H/tools/direct_cache_lru.py" "$T/c" "$@"; }
-left() { (cd "$T/c" && find . -type f | sed 's|.*/||' | sort | tr '\n' ' '); }
+left() { (cd "$T/c" && find . -type f | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' '); }
 mk; o=$(L --budget-gb 0.009765625); ck "① 不超预算 → 不删（${o}）" '[ "$(left)" = "A1.e A2.e B1.e B2.e build.log lib.metallib " ]'
 mk; o=$(L --budget-gb 0.00439453125); ck "② 超 1.5 MiB → 删最旧 A1 A2（剩 $(left)）" '[ "$(left)" = "B1.e B2.e build.log lib.metallib " ] && grep -q "删 2 条" <<< "$o"'
 mk; o=$(L --budget-gb 0.00146484375 --in-use A); ck "③ A 在用 → A 不动、删 B1 B2、仍超打【黄】（剩 $(left)）" '[ "$(left)" = "A1.e A2.e build.log lib.metallib " ] && grep -q "【黄】" <<< "$o"'

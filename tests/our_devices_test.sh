@@ -4,7 +4,7 @@
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; bad=0
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 if [ -f "$H/pack/our_devices.tsv" ]; then   # 真清单是维护方私有文件，公开仓没有
-want=$(awk -F'\t' '!/^#/ && NF >= 6 && $4 == "ios" && $6 == "是" {print $3 "\t" $5}' "$H/pack/our_devices.tsv" | sort -u)
+want=$(LC_ALL=C awk -F'\t' '!/^#/ && NF >= 6 && $4 == "ios" && $6 == "是" {print $3 "\t" $5}' "$H/pack/our_devices.tsv" | sort -u)
 got=$(env -u S2A_PSO_ARCHS -u S2A_PSO_ARCHS_ALL -u S2A_PACK_PURPOSE python3 "$H/pack/jobs/archs.py" pairs ios pso 2> /dev/null | cut -f1,2 | sort -u)
 ck "真清单：iOS 对「$(echo $got)」= 表里在用的「$(echo $want)」" '[ -n "$want" ] && [ "$got" = "$want" ]'
 fi

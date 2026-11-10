@@ -28,7 +28,7 @@ miss() {   # miss <仓库> <阶段> → 闭包里有、声明表里没有的文�
   local r=$1 st=$2 e; e=ENT_$st
   # shellcheck disable=SC2086
   # 起点 = 头部入口 + 表里「入」的文件：手写进表的输入（S2A.Dsh 的 *.cs 等，静态扫描从入口走不到）自己的依赖也要归类（审计 #1565 P1-115：SpvCross.cs 调 nxgal_dmsh_xc_tess，gal_tessxc.m（11-08 起 graphics/dsx/gal_tessxc.c）漏登记）
-  comm -23 <(cd "$r" && python3 tools/stage_inputs.py --table "pack/stage_inputs/$st.tsv" ${!e} $(awk -F'\t' '$1 == "入" { print $2 }' "$r/pack/stage_inputs/$st.tsv") | sort) <(awk -F'\t' '!/^#/ && NF >= 2 { print $2 }' "$r/pack/stage_inputs/$st.tsv" | sort)
+  LC_ALL=C comm -23 <(cd "$r" && python3 tools/stage_inputs.py --table "pack/stage_inputs/$st.tsv" ${!e} $(LC_ALL=C awk -F'\t' '$1 == "入" { print $2 }' "$r/pack/stage_inputs/$st.tsv") | LC_ALL=C sort) <(awk -F'\t' '!/^#/ && NF >= 2 { print $2 }' "$r/pack/stage_inputs/$st.tsv" | LC_ALL=C sort)
 }
 key() { bash -c 'source "$1/pack/stage_keyfiles.sh"; stage_files_key "$2" "$1"' _ "$1" "$2"; }
 # ①

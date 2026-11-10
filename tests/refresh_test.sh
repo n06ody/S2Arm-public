@@ -94,14 +94,14 @@ ATE() { cat > $T/repo/pack/targets/android/target.json <<EOF
 EOF
 }
 ATE false
-o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
+o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
 ck "⑫ Android enabled=false：跑系统数据 / 追加内容 / 能力清单 / 索引，抽取与直连库 skipped、不跑，rc=${r}，阶段 ${ran}，进度 ${pg}" \
   '[ $r = 0 ] && [ "$ran" = "aoc caps romfsidx sysdata " ] && [ "$pg" = "2/6 3/6 4/6 5/6 6/6 " ] && grep -q "^extract skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o" && grep -q "^direct skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o" && ! grep -q "^extract " $T/log && ! grep -q "^direct " $T/log'
 ck "⑫ Android enabled=false：末行带 skipped 黄项（一键出包的 result warnings 从这行取，rc=${r}）" \
   'grep -q "^🟢 acnh Android 共享资源已刷新：.*；🟡 1 项：离线 Vulkan 直连库 skipped（安卓运行时未读 LibPack，#1434 接上后恢复）$" <<< "$o"'
 ck "⑫ Android enabled=false：⏱ 分阶段用时里 extract / direct 记 0 秒" '[[ "$(grep "^⏱" <<< "$o")" =~ extract\ 0\ .*direct\ 0 ]]'
 ATE true
-o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
+o=$(rm -f $T/android-prog; S2A_PACK_PLAT=android S2A_PROGRESS=$T/android-prog R); r=$?; ran=$(grep ' 起 ' $T/log | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' '); pg=$(cut -f3,4 $T/android-prog 2> /dev/null | tr '\t\n' '/ ')
 ck "⑪ Android enabled=true：系统数据、追加内容、能力清单、索引、抽取、直连库，rc=${r}，阶段 ${ran}，进度 ${pg}" '[ $r = 0 ] && [ "$ran" = "aoc caps direct extract romfsidx sysdata " ] && [ "$pg" = "2/6 3/6 4/6 5/6 6/6 " ]'
 ck "⑪ Android 抽取在 RomFS 索引之后、直连库在抽取之后，各跑一次" 'python3 -c "import sys; e,i,d,x=map(float,sys.argv[1:]); sys.exit(0 if e >= i and d >= x else 1)" $(t extract 起) $(t romfsidx 止) $(t direct 起) $(t extract 止) && [ "$(grep -c "^extract 起" $T/log)" = 1 ] && [ "$(grep -c "^direct 起" $T/log)" = 1 ]'
 for stage in sysdata aoc caps romfsidx; do

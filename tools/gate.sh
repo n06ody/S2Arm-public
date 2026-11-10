@@ -78,12 +78,12 @@ TCON=${GATE_TEST_CACHE:-1}; TCD=${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/cache/te
 OTHER=()   # 分到另一层、本次不跑的步
 inlayer() {   # inlayer <步名>：本次 GATE_LAYER 要不要这一步
   [ -n "$LAYER" ] || return 0
-  local post=pre pf=; awk -F'	' -v n="$1" '$1 == n && $2 == "合入后" { f = 1 } END { exit !f }' < <(printf '%s\n' "$GLY") && post=post
+  local post=pre pf=; LC_ALL=C awk -F'	' -v n="$1" '$1 == n && $2 == "合入后" { f = 1 } END { exit !f }' < <(printf '%s\n' "$GLY") && post=post
   [ "$post" = "$LAYER" ] && return 0
   # 「合入后（路由命中时合入前也跑）」：合入前层里只要按改动路由（RT=1）选中了它就跑——钩子 / iOS 编译只在路由命中时才 add 进来，
   #   路由表就是各自文件头「# 门禁路由」与 gate_route.py，不另列前缀（11-10：安卓支、ios 头改动合入前不跑对应钩子，一天叠多处 main 红）
   [ "$LAYER" = pre ] && [ "$post" = post ] && [ "${RT:-0}" = 1 ] || return 1
-  pf=$(awk -F'	' -v n="$1" '$1 == n && $2 == "合入后" { print $3 }' < <(printf '%s\n' "$GLY")); [ "$pf" = 路由 ]; }
+  pf=$(LC_ALL=C awk -F'	' -v n="$1" '$1 == n && $2 == "合入后" { print $3 }' < <(printf '%s\n' "$GLY")); [ "$pf" = 路由 ]; }
 if [ "$TIER" != doc ] && [ -f "$R/tools/toolchain.env" ]; then
   if [ -n "$LINUX_LOCAL" ]; then
     # source 必须在当前 shell，保留 PATH；stderr 原文逐行加前缀，不伪装成步骤红。
@@ -426,7 +426,7 @@ macsum
 # 宿主项汇总：机读行原样（去重）；有待证项 → 末行写「本机绿、待<类别>证」，不许被当成整份门禁绿（列车另核证明）
 HPL=; if [ -s "$L/hostlines" ]; then sort -u "$L/hostlines" > "$L/hostlines.u"; cat "$L/hostlines.u"
   while IFS=$'\t' read -r k c it st; do [ "$k" = 待宿主证 ] && echo "⏭ ${it}（${st}）：本机不是${c}，待${c}证"; done < "$L/hostlines.u"
-  HPL=$(awk -F'\t' '$1 == "待宿主证" { n[$2]++ } END { for (c in n) printf "；待%s证 %d 项", c, n[c] }' "$L/hostlines.u"); fi
+  HPL=$(LC_ALL=C awk -F'\t' '$1 == "待宿主证" { n[$2]++ } END { for (c in n) printf "；待%s证 %d 项", c, n[c] }' "$L/hostlines.u"); fi
 if [ -n "$HPL" ] && [ "$MACN" = 0 ]; then echo "门禁 $([ $red = 0 ] && echo "本机绿、待宿主证" || echo 红)：$TIER 档，本机已证：跑了 $ran 步 / 应跑 $N 步${RWARN}${HPL}$where"
 elif [ "$MACN" -gt 0 ]; then echo "门禁 $([ $red = 0 ] && echo 本机绿、待 Mac 证 || echo 红)：$TIER 档，本机已证：跑了 $ran 步 / 应跑 $N 步${MACL}${HPL}"
 else echo "门禁 $([ $red = 0 ] && echo 绿 || echo 红)：$TIER 档，跑了 $ran 步 / 应跑 $N 步${RWARN}$where"; fi

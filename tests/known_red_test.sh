@@ -22,7 +22,7 @@ ck "③ 超基线算失败、没超不算" 'grep -q "直连 MTL4 出现处 227�
 ck "④ 临时目录只换随机那一级，链号目录保留" 'grep -qF "甲项：KeyError: ('"'"'<tmp>/a/mac/b-9347db8fda99'"'"', '"'"'k.metallib'"'"')（退出 1）" <<< "$s"'
 ck "⑤ 父步绿、子项红 → 归父步 g/gate.sh" 'grep -q "^钩子 g/gate.sh	" <<< "$s"'
 grep "^钩子 h/gate.sh" <<< "$s" | awk -F'\t' '{ print $1 "\t" $2 "\tc\t0\to\t\t0\t0" }' > "$T/kr.tsv"
-u=$($K uncovered "$T/kr.tsv" "$T/a.log" | sort | tr '\n' ' ')
+u=$($K uncovered "$T/kr.tsv" "$T/a.log" | LC_ALL=C sort | tr '\n' ' ')
 ck "⑥ h 步全是已知红 → 不在未覆盖里；g 步有未知项、z_test 取不出明细 → 都在（${u}）" '[ "$u" = "单测 z_test 钩子 g/gate.sh " ]'
 sed 's/KeyError: (/KeyError: [/' "$T/a.log" > "$T/b.log"
 ck "⑥ 同一项错误原文差一个字 → 不算已知红" '$K uncovered "$T/kr.tsv" "$T/b.log" | grep -qx "钩子 h/gate.sh"'

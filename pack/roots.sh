@@ -317,7 +317,7 @@ root_tmp_live() {
 root_abort() { local w; w=$(_root_dir "${1:?款}" "${2:?提交}"); _root_rm "$w.tmp"; }
 # 追加内容阶段记下的没解出的原始包（pack/stages/aoc.sh 写进 aoc.log 的「追加内容缺<TAB>文件名<TAB>原因」行）：
 #   root_aoc_missing <产物根> → 文件名一行一个；root_aoc_note <产物根> → 出包完成行 / 登记说明后缀「；🟡 追加内容 <文件名> 未能解出，包内不含」（有几份写几份，没有则空）
-root_aoc_missing() { awk -F'\t' '$1 == "追加内容缺" && $2 != "" {print $2}' "${1:?产物根}/aoc.log" 2> /dev/null; }
+root_aoc_missing() { LC_ALL=C awk -F'\t' '$1 == "追加内容缺" && $2 != "" {print $2}' "${1:?产物根}/aoc.log" 2> /dev/null; }
 root_aoc_note() { root_aoc_missing "$1" | while IFS= read -r f; do printf '；🟡 追加内容 %s 未能解出，包内不含' "$f"; done; }
 root_tag() { local t=${2:?标签} n=1 c; c=$t; while [ -e "$(_root_dir "${1:?款}" "$c")" ] || [ -e "$(_root_dir "$1" "$c").tmp" ]; do n=$((n + 1)); c=$t-$n; done; echo "$c"; }
 root_stage_done() {   # S2A_STAGE_KEYS=<文件>：只算键模式——记「阶段<TAB>键」后当作已是该键（阶段脚本随即退出，不出任何产物）

@@ -49,12 +49,12 @@ PRISTINE=$(git mktree < "$TMP/root.mk")
 # 2. 补丁序列与清单的一致性
 rd compat/patches/series | sed 's/#.*//; s/[[:space:]]*$//' | grep -v '^$' > "$TMP/series" || true
 rd compat/改动清单.md > "$TMP/list" || : > "$TMP/list"
-ls_patches | sort > "$TMP/files"
-sort "$TMP/series" > "$TMP/series.sorted"
+ls_patches | LC_ALL=C sort > "$TMP/files"
+LC_ALL=C sort "$TMP/series" > "$TMP/series.sorted"
 err=0
 if [ "$(uniq -d "$TMP/series.sorted")" != "" ]; then echo "series 里有重复条目：$(uniq -d "$TMP/series.sorted" | tr '\n' ' ')"; err=1; fi
-for f in $(comm -23 "$TMP/files" "$TMP/series.sorted"); do echo "补丁文件不在 series 里：$f"; err=1; done
-for f in $(comm -13 "$TMP/files" "$TMP/series.sorted"); do echo "series 列了但没有文件：$f"; err=1; done
+for f in $(LC_ALL=C comm -23 "$TMP/files" "$TMP/series.sorted"); do echo "补丁文件不在 series 里：$f"; err=1; done
+for f in $(LC_ALL=C comm -13 "$TMP/files" "$TMP/series.sorted"); do echo "series 列了但没有文件：$f"; err=1; done
 while read -r f; do grep -qF "$f" "$TMP/list" || { echo "改动清单缺这一条：$f"; err=1; }; done < "$TMP/series"
 
 # 3. 上游 + 补丁

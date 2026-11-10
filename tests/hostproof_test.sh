@@ -6,6 +6,7 @@
 #   ② 钩子打「已证宿主项<TAB>安卓宿主<TAB>apk」→ 原样出机读行「已证宿主项<TAB>安卓宿主<TAB>apk<TAB>钩子 hp/gate.sh」、末行「门禁 绿」
 #   ③ 钩子打待证行但自身红（退 1）→ 门禁照红（退 1）：待证不掩盖红
 #   ④ 宿主行不当成该步的结论末行（🟢 行末尾仍是钩子自己的最后一句）
+#   ⑤ 负控：LANG=en_US.UTF-8 下跑 ② 的已证场景——BSD awk 在 UTF-8 下 $1 == "待宿主证" 对「已证宿主项」判真（strcoll 塌缩），旧代码这条红、修后绿
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; bad=0
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 mk() { rm -rf "$T/r"; mkdir -p "$T/r/tools" "$T/r/hp"; cp "$H/tools/gate.sh" "$H/tools/gate_plan.sh" "$T/r/tools/"; printf '%s\n' "$1" > "$T/r/hp/gate.sh"
@@ -20,4 +21,7 @@ mk 'printf "已证宿主项\t安卓宿主\tapk\n"'; o=$(run); r=$?
 ck "② 已证：退 0、机读行原样、末行门禁 绿" '[ $r = 0 ] && grep -qx "$(printf "已证宿主项\t安卓宿主\tapk\t钩子 hp/gate.sh")" <<< "$o" && [[ "$(tail -1 <<< "$o")" == "门禁 绿："* ]]'
 mk 'printf "待宿主证\t安卓宿主\tapk\n"; exit 1'; o=$(run); r=$?
 ck "③ 待证 + 自身红 → 门禁红（rc=${r}）" '[ $r = 1 ] && [[ "$(tail -1 <<< "$o")" == "门禁 红："* ]]'
+# ⑤ 负控：钉 UTF-8 locale——BSD awk 在 en_US.UTF-8 下 $1 == "待宿主证" 对「已证宿主项」判真（strcoll 塌缩），旧代码这条红
+mk 'printf "已证宿主项\t安卓宿主\tapk\n"'; o=$(LANG=en_US.UTF-8 LC_ALL= run); r=$?
+ck "⑤ UTF-8 下已证不误计待证（旧代码红）" '[ $r = 0 ] && [[ "$(tail -1 <<< "$o")" == "门禁 绿："* ]]'
 [ $bad = 0 ] && echo "hostproof 单测全过"; exit $bad

@@ -121,7 +121,7 @@ rew() { local r=$1 o=$2 tsv=$3; shift 3; mkdir -p "$T/$o"; env "$@" $PY "$H/test
 ra=$(rew "$REW" apple "$T/pos.tsv" S2A_TARGET=apple); rn=$(rew "$REW" android "$T/pos.tsv" S2A_TARGET=android)
 for o in apple android; do
   r=$([ $o = apple ] && echo "$ra" || echo "$rn"); [ "$r" = 0 ] || tail -5 "$T/$o.log"
-  ng=$(grep -c '^GAP' "$T/$o.log"); st=$(grep -oE "'(br_tab_open|widen_asp)': [0-9]+" "$T/$o.log" | sort | tr '\n' ' ')
+  ng=$(grep -c '^GAP' "$T/$o.log"); st=$(grep -oE "'(br_tab_open|widen_asp)': [0-9]+" "$T/$o.log" | LC_ALL=C sort | tr '\n' ' ')
   wt=$(tr '\t\n' ' ,' < "$T/$o/main.widen.tsv" 2>/dev/null)
   ck "① ${o}：退出码 ${r}、缺口 ${ng}、${st}、widen.tsv「${wt}」" '[ "$r" = 0 ] && [ "$ng" = 0 ] && [ "$st" = "'"'"'br_tab_open'"'"': 4 '"'"'widen_asp'"'"': 1 " ] && [ "$wt" = "0 0x1a0 asp 0xd291c72c," ]'
 done

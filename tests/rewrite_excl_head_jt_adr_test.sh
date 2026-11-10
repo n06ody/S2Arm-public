@@ -113,7 +113,7 @@ rew() { local r=$1 o=$2; shift 2; mkdir -p "$T/$o"; env "$@" $PY "$H/tests/rewri
 ra=$(rew "$REW" apple S2A_TARGET=apple); rn=$(rew "$REW" android S2A_TARGET=android)
 for o in apple android; do
   r=$([ $o = apple ] && echo "$ra" || echo "$rn"); [ "$r" = 0 ] || tail -5 "$T/$o.log"
-  ng=$(grep -c '^GAP' "$T/$o.log"); st=$(grep -oE "'(window_head|br_tab_open|br)': [0-9]+" "$T/$o.log" | sort | tr '\n' ' ')
+  ng=$(grep -c '^GAP' "$T/$o.log"); st=$(grep -oE "'(window_head|br_tab_open|br)': [0-9]+" "$T/$o.log" | LC_ALL=C sort | tr '\n' ' ')
   ck "① ${o}：退出码 ${r}、缺口 ${ng}、${st}" '[ "$r" = 0 ] && [ "$ng" = 0 ] && [ "$st" = "'"'"'br'"'"': 1 '"'"'br_tab_open'"'"': 1 '"'"'window_head'"'"': 1 " ]'
 done
 chk() { $PY - "$T/apple/main.patched.bin" <<'EOF'

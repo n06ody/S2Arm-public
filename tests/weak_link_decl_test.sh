@@ -10,8 +10,8 @@ trap 'rm -rf "$T"' EXIT
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 o=$(cd "$H" && python3 tools/weak_link_decl.py check 2>&1); r=$?
 ck "本仓库：runtime/src 的 weak_import 全部登记（rc=${r}：$(echo "$o" | tail -1)）" '[ $r = 0 ]'
-py=$(cd "$H" && python3 tools/weak_link_decl.py flags host | tr ' ' '\n' | sort)
-mkv=$(cd "$H" && make -s --no-print-directory -f - BUILD=$T/b s2a_print_weak <<'EOF' 2>/dev/null | tr ' ' '\n' | sort
+py=$(cd "$H" && python3 tools/weak_link_decl.py flags host | tr ' ' '\n' | LC_ALL=C sort)
+mkv=$(cd "$H" && make -s --no-print-directory -f - BUILD=$T/b s2a_print_weak <<'EOF' 2>/dev/null | tr ' ' '\n' | LC_ALL=C sort
 include runtime/build.mk
 s2a_print_weak:; @echo $(call S2A_WEAK_U,host)
 EOF
