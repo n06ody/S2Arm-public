@@ -28,10 +28,23 @@ def main():
         temporary = Path(temporary)
         battery = temporary / "battery.tsv"
         with battery.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, ["boot_us", "status", "current_ua", "voltage_uv"], delimiter="\t")
+            writer = csv.DictWriter(stream, ["boot_us", "status", "current_ua", "voltage_uv",
+                                             "charge_uah", "plugged", "interactive",
+                                             "power_save", "thermal_status",
+                                             "ac_powered", "usb_powered", "wireless_powered",
+                                             "dock_powered"], delimiter="\t")
             writer.writeheader()
             for timestamp in range(0, runtime["endBootUs"] + 2_000_000, 1_000_000):
-                writer.writerow({"boot_us": timestamp, "status": "Discharging", "current_ua": -1_000_000, "voltage_uv": 4_000_000})
+                # 判读门全字段：plugged=0 要四路 powered 显式 false 合出来、交互屏、非省电、
+                # 热档 0；电量计按 1A ≈ 278µAh/s 递减（新判读门缺任一列 fail closed）
+                tick = timestamp // 1_000_000
+                writer.writerow({"boot_us": timestamp, "status": "Discharging",
+                                 "current_ua": -1_000_000, "voltage_uv": 4_000_000,
+                                 "charge_uah": 5_000_000 - tick * 278,
+                                 "plugged": "0", "interactive": "1",
+                                 "power_save": "0", "thermal_status": 0,
+                                 "ac_powered": "false", "usb_powered": "false",
+                                 "wireless_powered": "false", "dock_powered": "false"})
         source_info = temporary / "battery-source.json"
         source_info.write_text(json.dumps({"clock": "CLOCK_BOOTTIME", "scope": "battery", "units": {"current_ua": "uA", "voltage_uv": "uV"}}), encoding="utf-8")
         files.update({"battery.tsv": battery, "battery-source.json": source_info})
@@ -42,10 +55,13 @@ def main():
             assert (directory / name).read_bytes() == original.read_bytes(), name
         with battery.open(encoding="utf-8", newline="") as stream:
             samples = list(csv.DictReader(stream, delimiter="\t"))
-        report = battery_window(samples, runtime["markBootUs"], runtime["endBootUs"], -1)
+        # 兄弟项目口径：分析窗剔首 15s/尾 5s；尾停那 20s 不进积分窗，其余均匀功率仍是 4W
+        report = battery_window(samples, runtime["markBootUs"], runtime["endBootUs"])
         assert report["averageW"] == 4.0
         assert report["comparableToIosWholeSystem"] is False
-        assert report["durationSeconds"] == (runtime["endBootUs"] - runtime["markBootUs"]) / 1e6
+        # 剔首尾 15s+5s 后的覆盖时长；两边同值但浮点舍入路径不同，按容差比
+        assert abs(report["durationSeconds"]
+                   - ((runtime["endBootUs"] - runtime["markBootUs"]) / 1e6 - 20)) < 1e-6
         assert runtime["endBootUs"] > runtime["lastFrameBootUs"], "tail stall is part of the window"
         assert runtime["markFrame"] == 2
         assert runtime["frames"] == 1904

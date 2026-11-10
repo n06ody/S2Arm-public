@@ -7,7 +7,7 @@
   ④ 供数表：# 注释、表头跳过，字节截断的中文列不报错
   ⑤ 报告模式：证据脱敏、功耗 plist 只留四字段、指纹可复算、复跑证据目录结论不变（不调看图判官）
   ⑧ 演练补修：会话临时目录 / -Users-<名>- / var/folders 哈希脱敏；claude-cli 只报末行并脱敏；--help 退 0、局目录不存在退 2
-  ⑨ 安卓局目录：帧率按 disp_us、整屏截图数黑列判满屏、没接电才算瓦数、显式指定图形模式不算默认启动、logcat 认直连 / 通用
+  ⑨ 安卓局目录：帧率按 disp_us、整屏截图数黑列判满屏、能耗只在整窗证了放电才电池侧积分记「未证」（接过电 / 未知态记「没数据」）、显式指定图形模式不算默认启动、logcat 认直连 / 通用
   ⑩ 首遇现建行：最长 > 16.7 ms 标「首遇卡」，≤ 16.7 不标，没有这行空串（取最后一行）
   ⑬ Mac 局目录有空的 shots/：截图仍取顶层 ap_*.png（判有没有图，不判有没有目录）
   ⑭ 直连默认启动只看模式行 + 出图帧数（不调看图判官、没截图也判）：直连 1000 帧过、999 帧不过、S2A_GFX 指定没数据、没有 frames.tsv 没数据
@@ -122,16 +122,24 @@ chk('⑧ 局目录不存在：一行中文报错、退出 2、没有 Traceback',
 # ⑨ 安卓局目录（安卓线 K3）：有 android.json 走安卓分支，不调 AI
 import json as _json
 A = os.path.join(T, 'android'); os.makedirs(os.path.join(A, 'shots_ap'))
+PWR_F = ('boot_us', 'status', 'current_ua', 'voltage_uv', 'energy_uwh', 'charge_uah', 'temp_tenths_c',
+         'source', 'ac_powered', 'usb_powered', 'wireless_powered', 'dock_powered',
+         'plugged', 'interactive', 'power_save', 'thermal_status')
 def adir(launch, logcat, plugged, frame_ms=16.6, secs=60):
     _json.dump({'package': 'org.s2arm.game.t01001b300b9be000', 'serial_model': 'X', 'soc': 'S', 'android': '16', 'launch': launch}, open(f'{A}/android.json', 'w'))
     n = int(secs * 1000 / frame_ms); open(f'{A}/frames.tsv', 'w').write('frame\tpresent_ns\tdisp_us\twall_us\n' + ''.join(f'{i}\t0\t{int(frame_ms * 1000)}\t{int(frame_ms * 1000)}\n' for i in range(1, n + 1)))
-    open(f'{A}/power.tsv', 'w').write('t\tplugged\tmv\tcurrent_raw\tlevel\ttemp_c\n' + ''.join(f'{i}\t{plugged}\t4000\t-800000\t80\t35\n' for i in range(60)))
+    # power.tsv = t + android_power.FIELDS + level：plugged=1 → Charging + 供电旗标 true（接过电）；
+    #   放电行四路旗标 false→plugged=0、交互屏、非省电、热档 0、电量计每拍 -222µAh（800mA 口径）
+    st, pw, pl = ('Charging', 'true', '1') if plugged else ('Discharging', 'false', '0')
+    rows = ''.join(f'{i}\t{10_000_000 + i * 1_000_000}\t{st}\t-800000\t4000000\t\t{5_000_000 - i * 222}\t350\tsysfs\t{pw}\t{pw}\t{pw}\t{pw}\t{pl}\t1\t0\t0\t80\n' for i in range(60))
+    open(f'{A}/power.tsv', 'w').write('t\t' + '\t'.join(PWR_F) + '\tlevel\n' + rows)
     open(f'{A}/logcat.txt', 'w').write(logcat)
     Image.new('RGB', (1000, 460), (90, 120, 60)).save(f'{A}/shots_ap/00_000s.png')
 adir('am start -n x/y', 'direct provider prepared: driver=x\n', 0)
 r9 = q.check(A, 'android', ai=False)
 chk('⑨ 安卓：帧率按 disp_us 判过、满屏整屏截图无黑边判过', ('过', '过'), (r9['帧率'], r9['满屏']))
-chk('⑨ 安卓：没接电 → 4000 mV × 0.8 A = 3.20 W ≤ 4.8 判过', (True, '过'), ('3.20 W' in r9['读数'], r9['能耗']))
+chk('⑨ 安卓：整窗放电 → 4000 mV × 0.8 A = 3.20 W 电池侧积分记「未证」（未经设备校准，不套 iPhone 门槛）',
+    (True, '未证'), ('3.20 W' in r9['读数'], r9['能耗']))
 adir('am start -n x/y --es s2arm.graphics_mode direct', '', 1, frame_ms=20)
 r9 = q.check(A, 'android', ai=False)
 chk('⑨ 安卓：显式指定图形模式 → 直连默认启动没数据；接过电 → 能耗没数据；50 帧 → 帧率不过', ('没数据', '没数据', '不过'), (r9['直连默认启动'], r9['能耗'], r9['帧率']))
