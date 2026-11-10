@@ -61,6 +61,8 @@ DATA_DENIED = st.setdefault("data_denied", {})      # dir -> True：存在但 ru
 DATA_PAD = st.setdefault("data_pad", {})            # dir -> {relpath: 字节数} 合成大文件
                                                     #（全零填充：tar 备份按声明长度真流出来，
                                                     #  测宿主是否整流驻内存；清单/sha 按合成算）
+DEV_TMP = st.setdefault("dev_tmp", {})              # 数据目录内凭据文件 dir/.s2a-tar-{err,rc}
+                                                    #（exec-out 混流后设备侧 stderr/rc 的取证通道）
 
 def zeros_sha(n):
     # sha256(N 个零字节)：分块算不整驻内存（替身侧也守同一规矩）
@@ -211,34 +213,66 @@ def run_as(cmdline, via_shell=False):
         out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS or dir_ in DATA_LINKS
              or dir_ in DATA_SUBDIRS else "absent") + "\\n"); return
     def _emit_batched(dir_, lines, want):
-        # 分批清单收尾（find -print0 | xargs -0 -n 256 …; echo S2A_RC; echo S2A_N）
+        # 分批清单收尾凭据：S2A_N/S2A_CRC 计数与计数管道 rc、S2A_FRC find 自报 rc、
+        # S2A_RC 管道 rc、S2A_ERR: 前缀 stderr 行——旋钮逐门复现设备残缺态
         n = int(st.get("data_listing_short", {}).get(dir_, 0))
         if n: lines = lines[:-n]              # xargs rc=0 但某批输出丢了 → 条数不符
-        rc_ = "0"
+        frc = rc = crc = "0"
         if st.get("data_xargs_fail"):
-            lines, rc_ = lines[:len(lines) // 2], "126"   # 中途批次挂：半截 + 非零 rc
+            lines, rc = lines[:len(lines) // 2], "126"   # 中途批次挂：半截 + 非零 rc
+        err_lines = list(st.get("data_listing_err", {}).get(dir_, []))
+        fs = st.get("data_find_fail", {}).get(dir_)
+        if fs:
+            # find 中途被拒：pipefail 下管道 rc 传 find rc；masked 变体模拟
+            # 管道 rc 仍是 0（xargs 吞了上游失败）——那时只有 S2A_FRC 一门能逮
+            frc = str(fs.get("rc", 1))
+            if not fs.get("masked"): rc = crc = frc
+            lines = lines[:1]
+            err_lines += [fs.get("err", "find: Permission denied")]
+        mangle = st.get("data_listing_mangle", {}).get(dir_) if st.get("pm_cleared") else None
+        n_str = str(want)
+        if mangle == "empty_n": n_str = ""
+        if mangle == "bad_n": n_str = "abc"
+        if mangle == "bad_mode":
+            lines = [("zzz" + l[l.index("|"):]) if "|" in l else l for l in lines]
+        if st.get("data_xargs_phantom", {}).get(dir_):
+            # xargs 无 -r 空输入仍跑一次：sha256sum 空参读 stdin 出幻影行
+            lines += ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -"]
         out("\\n".join(lines) + ("\\n" if lines else ""))
-        out(f"S2A_RC={rc_}\\nS2A_N={want}\\n"); return
-    m = _re.match(r"^cd (\\S+) && \\{ find \\. -type f -print0 \\| xargs -0 -n 256 sha256sum;",
-                  cmdline)
+        out(f"S2A_N={n_str} S2A_CRC={crc}\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
+        for l_ in err_lines: out(f"S2A_ERR: {l_}\\n")
+        return
+    m = _re.match(r"^cd (\\S+) && \\{ set -o pipefail; exec 3>&1; err=", cmdline)
     if m:
         dir_ = m.group(1)
-        want = sum(1 for ft in (e[1] for e in dir_entries(dir_).values())
-                   if ft.startswith("regular"))
-        _emit_batched(dir_, sha_listing(dir_).splitlines(), want); return
-    m = _re.match(r"^cd (\\S+) && \\{ find \\. -mindepth 1 -print0 \\| xargs -0 -n 256 stat ",
-                  cmdline)
+        if "find . -type f -print0" in cmdline:
+            want = sum(1 for ft in (e[1] for e in dir_entries(dir_).values())
+                       if ft.startswith("regular"))
+            _emit_batched(dir_, sha_listing(dir_).splitlines(), want); return
+        if "find . -mindepth 0 -print0" in cmdline:
+            root_mode = st.get("data_root_mode", {}).get(dir_, "775")
+            lines = [f"{root_mode}|directory|."] + [
+                f"{mode}|{ftype}|./{rel}"
+                for rel, (mode, ftype) in sorted(dir_entries(dir_).items())]
+            _emit_batched(dir_, lines, len(dir_entries(dir_)) + 1); return
+        if "find . -type l -print0" in cmdline:
+            lines = [f"./{rel}\\t{tgt}"
+                     for rel, tgt in sorted(DATA_LINKS.get(dir_, {}).items())]
+            _emit_batched(dir_, lines, len(lines)); return
+    m = _re.match(r"^cd (\\S+) && cat (\\.s2a-tar-err|\\.s2a-tar-rc)$", cmdline)
+    if m:
+        key = m.group(1) + "/" + m.group(2)
+        if key not in DEV_TMP: fail(f"cat: {m.group(2)}: No such file or directory")
+        out(DEV_TMP[key]); return
+    m = _re.match(r"^cd (\\S+) && rm -f \\.s2a-tar-err \\.s2a-tar-rc && "
+                  r"test ! -e \\.s2a-tar-err && test ! -e \\.s2a-tar-rc$", cmdline)
     if m:
         dir_ = m.group(1)
-        lines = [f"{mode}|{ftype}|./{rel}"
-                 for rel, (mode, ftype) in sorted(dir_entries(dir_).items())]
-        _emit_batched(dir_, lines, len(lines)); return
-    m = _re.match(r"^cd (\\S+) && \\{ find \\. -type l -print0 \\| xargs -0 -n 256 sh -c ",
-                  cmdline)
-    if m:
-        dir_ = m.group(1)
-        lines = [f"./{rel}\\t{tgt}" for rel, tgt in sorted(DATA_LINKS.get(dir_, {}).items())]
-        _emit_batched(dir_, lines, len(lines)); return
+        if st.get("data_tar_aux_left", {}).get(dir_):
+            fail("test: .s2a-tar-err: File exists")     # 删不净 → 凭据核删不过
+        DEV_TMP.pop(dir_ + "/.s2a-tar-err", None)
+        DEV_TMP.pop(dir_ + "/.s2a-tar-rc", None)
+        save(); return
     m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
     if m:
         if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
@@ -276,11 +310,16 @@ def run_as(cmdline, via_shell=False):
                 elif mem.isdir() and rel not in DATA_SUBDIRS[dir_]:
                     DATA_SUBDIRS[dir_].append(rel)
         save(); return
-    m = _re.match(r"^tar -cpf - -C (\\S+) \\.$", cmdline)
+    m = _re.match(r"^cd (\\S+) && rm -f \\.s2a-tar-err \\.s2a-tar-rc; "
+                  r"tar -cpf - --exclude=\\./\\.s2a-tar-err --exclude=\\./\\.s2a-tar-rc \\. "
+                  r"2> \\.s2a-tar-err; echo \\$\\? > \\.s2a-tar-rc$", cmdline)
     if m:
         dir_ = m.group(1)
         if dir_ in DATA_DENIED:
-            fail("run-as: tar: " + dir_ + ": Permission denied")
+            # run-as 拒权：归档零字节流出，stderr/rc 落凭据文件由宿主另行取证
+            DEV_TMP[dir_ + "/.s2a-tar-err"] = "tar: .: Permission denied\\n"
+            DEV_TMP[dir_ + "/.s2a-tar-rc"] = "1\\n"
+            save(); return
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tf:
             # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
@@ -311,7 +350,11 @@ def run_as(cmdline, via_shell=False):
                 info = tarfile.TarInfo("./planted.evil")
                 info.size = len(blob)
                 tf.addfile(info, io.BytesIO(blob))
-        sys.stdout.buffer.write(buf.getvalue()); return
+        # 设备侧 stderr/rc 凭据：exec-out 把 tar stderr 混进 stdout 归档流，
+        # 必须落 .s2a-tar-{err,rc} 供宿主另行取证（qa-fone #329000）
+        DEV_TMP[dir_ + "/.s2a-tar-err"] = st.get("data_tar_err", {}).get(dir_, "")
+        DEV_TMP[dir_ + "/.s2a-tar-rc"] = st.get("data_tar_rc", {}).get(dir_, "0") + "\\n"
+        sys.stdout.buffer.write(buf.getvalue()); save(); return
     fail("fake adb: unhandled run-as " + cmdline)
 
 def shell_data_cmd(text):
@@ -1128,14 +1171,146 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("清单不完整", man["reason"])
 
     def test_data_xargs_batch_fail_refuses(self):
-        """㊹ xargs 中途批次挂（rc=126）：S2A_RC≠0 → 清单不完整拒跑
-        （失败签名=未完整返回，唯 rc 门所出）。"""
+        """㊹ xargs 中途批次挂（rc=126）：S2A_RC≠0 → 清单未证拒跑
+        （失败签名=清单未证，唯 rc 门所出）。"""
         state = self._data_state()
         state["data_xargs_fail"] = True
         rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
         self.assertNotEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
-        self.assertIn("未完整返回", man["reason"])
+        self.assertIn("清单未证", man["reason"])
+
+    def test_listing_find_fail_and_stderr_refuses(self):
+        """㊾ find 中途被拒：出一行就挂 + Permission denied + find rc=1——
+        旧管线 xargs rc=0 会把它吞成全量清单（9000 复现签名）；find 自报 rc、
+        管道 rc、stderr 前缀行三门各自逮住 → 清单未证拒跑。"""
+        priv = f"/data/data/{PKG}"
+        for i, masked in enumerate((False, True)):
+            state = self._data_state()
+            state["data_find_fail"] = {priv: {"rc": 1, "masked": masked,
+                                             "err": "find: ./x: Permission denied"}}
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state),
+                out_name=f"out_ff{i}")
+            self.assertNotEqual(0, rc, f"masked={masked}")
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertIn("清单未证", man["reason"], man["reason"])
+            self.assertIn("Permission denied", man["reason"], "设备 stderr 要进 reason 归因")
+            if masked:
+                # xargs rc=0 吞了上游失败——只剩 find 自报 rc 一门独逮
+                self.assertIn("'find': '1'", man["reason"], man["reason"])
+                self.assertIn("'xargs': '0'", man["reason"], man["reason"])
+
+    def test_listing_stderr_refuses(self):
+        """㊾ 清单 stderr 非白名单（白名单现为空：有 stderr 即未证）→ 拒。
+        设备 stderr 经 S2A_ERR: 前缀行取回——adb 会把设备 stderr 混进 stdout，
+        靠宿主侧 stderr 判不了。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_listing_err"] = {priv: ["xargs: sha256sum: exited with status 126"]}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("清单未证", man["reason"], man["reason"])
+
+    def test_backup_tar_remote_err_refuses(self):
+        """㊾ #329000：exec-out 把设备 tar stderr 混进归档字节流、宿主 stderr
+        是空的——stderr/rc 落设备侧 .s2a-tar-{err,rc} 凭据另行取证；
+        tar stderr 非白名单 → 备份未证拒跑（不拿未证归档动设备）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_tar_err"] = {priv: "tar: ./x: Permission denied\ntar: had errors\n"}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("备份未证", man["reason"], man["reason"])
+        self.assertIn("Permission denied", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_backup_tar_remote_rc_and_aux_cleanup(self):
+        """㊾ tar rc 凭据非 0 → 备份未证；凭据文件删不净 → 同门拒
+        （读不回/删不净都是未证，不拿未证归档动设备）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_tar_rc"] = {priv: "1"}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("备份未证", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+        state = self._data_state()
+        state["data_tar_aux_left"] = {priv: True}
+        self.lock_root = self.tmp / "locks_aux"
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state),
+                                   out_name="out_aux")
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("未证", man["reason"], man["reason"])
+
+    def test_restore_mangled_listing_detains(self):
+        """㊾ #328940：pm clear 之后清单坏值——S2A_N 空 / 非数字 / stat mode
+        非八进制——必须受控进 fails → manifest 落盘 + 留置；不许 ValueError
+        类异常逸出、跳过还原收尾与锁释放链。"""
+        priv = f"/data/data/{PKG}"
+        for i, mangle in enumerate(("empty_n", "bad_n", "bad_mode")):
+            with self.subTest(mangle=mangle):
+                self.lock_root = self.tmp / f"locks_m{i}"    # 每个子用例全新锁根
+                state = self._data_state()
+                state["data_listing_mangle"] = {priv: mangle}
+                rc, out, _ = self.run_tool(
+                    state=self._installed_state(debuggable=True, **state),
+                    out_name=f"out_m{i}")
+                self.assertNotEqual(0, rc, mangle)
+                self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                                f"{mangle}：坏值必须进留置链")
+                man = json.loads((out / "run-manifest.json").read_text())
+                self.assertIn("未证", man["reason"], f"{mangle}: {man['reason']}")
+
+    def test_root_dir_mode_compared(self):
+        """㊾ 根目录自身权限进对拍：设备 stat 清单含 "."（find -mindepth 0）、
+        归档 ./ 根成员进 tar_entries——两归档仅根权限不同对拍必非空。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_root_mode"] = {priv: "777"}      # 设备根 777 ≠ 归档根 ./ 775
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc, "根权限不符必须逮住")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("权限", man["reason"], man["reason"])
+        # 正路：根 mode 一致时 "." 条目在 manifest 里、对拍过
+        self.lock_root = self.tmp / "locks_rootok"
+        rc, out, _ = self.run_tool(state=self._installed_state(
+            debuggable=True, **self._data_state()), out_name="out_rootok")
+        self.assertEqual(0, rc)
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        ent = man["dirs"]["private"]["entries"]
+        self.assertEqual(0o775, ent["."]["mode"], "根目录自身权限要记进清单")
+
+    def test_empty_data_dir_passes_and_phantom_refuses(self):
+        """㊾ 空输入 xargs（toybox 无 -r 默认空输入仍跑一次）：计数先行、
+        n=0 跳过 find|xargs——纯空数据目录不误拒、照样备份/回灌/复核；
+        幻影行（sha256sum 空参读 stdin 的 <空 sha>  -）若真出现 →
+        条目数≠计数 → 计数门逮住不误当全量。"""
+        ext = f"/sdcard/Android/data/{PKG}"
+        obb = f"/sdcard/Android/obb/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][ext] = {}                 # 目录在、里面空
+        state["data_dirs"][obb] = {}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc, "纯空数据目录不该被拒")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["data_dirs"].get(ext) or {}, "空目录还原后仍空")
+        # 负控：替身强行吐幻影行（空输入却跑了一次 xargs）→ 拒
+        self.lock_root = self.tmp / "locks_ph"
+        state = self._data_state()
+        state["data_dirs"][obb] = {}
+        state["data_xargs_phantom"] = {obb: True}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state),
+                                   out_name="out_ph")
+        self.assertNotEqual(0, rc, "幻影清单行必须被计数门逮住")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("不完整", man["reason"], man["reason"])
 
     def test_pushed_tamper_caught_by_post_verify(self):
         """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →

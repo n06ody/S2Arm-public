@@ -126,17 +126,30 @@ def install_state(d, pkg):
 
 # 目录清单三件套：find -exec {} + 会把全部路径摊进一次 exec——4 万文件的私有树
 # 触发 toybox E2BIG（Argument list too long，9000 实测；与 deploy_game 核验同病
-# 同治）：改 find -print0 | xargs -0 -n 256 分批。收尾 S2A_RC=xargs rc +
-# S2A_N=find 计数——xargs 任何一批失败（rc=123/126）或清单条数与计数不符都
-# 算半截清单，不当完整用。
-SHA_MAP_CMD = ("cd {q} && {{ find . -type f -print0 | xargs -0 -n 256 sha256sum; "
-               "echo S2A_RC=$?; echo S2A_N=$(find . -type f | wc -l); }}")
-STAT_MAP_CMD = ("cd {q} && {{ find . -mindepth 1 -print0 | xargs -0 -n 256 "
-                "stat -c '%a|%F|%n'; echo S2A_RC=$?; "
-                "echo S2A_N=$(find . -mindepth 1 | wc -l); }}")
-LINK_MAP_CMD = ("cd {q} && {{ find . -type l -print0 | xargs -0 -n 256 sh -c "
-                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _; "
-                "echo S2A_RC=$?; echo S2A_N=$(find . -type l | wc -l); }}")
+# 同治）：改 find -print0 | xargs -0 -n 256 分批。三道凭据缺一不可：① mksh
+# `set -o pipefail` + 左组 `echo S2A_FRC` 报 find 自己的 rc（mksh 无 PIPESTATUS，
+# 管道 rc 单独记 S2A_RC）——没有它 find 中途被拒（stderr Permission denied）
+# 管道照样 rc=0 吞掉失败（9000 实证复现）；② S2A_N=find 计数（连计数管道自己的
+# rc S2A_CRC）；③ stderr 全捕进变量、逐行 S2A_ERR: 前缀回投——adb 会把设备
+# stderr 混进 stdout 流，靠前缀区分，不靠宿主 stderr。任一 rc≠0、计数非数字、
+# stderr 非白名单 = 清单未证，半截不当全量。
+LISTING_STDERR_OK = ()          # 明确无害的 stderr 行白名单（目前为空：有 stderr 即未证）
+TAR_STDERR_OK = ()              # 备份 tar 的 stderr 白名单（同上：有 stderr 即备份未证）
+
+
+def _listing_cmd(dir_, find_, xargs_, count_):
+    """分批清单命令：fd3 旁路把清单与标记送 stdout，stderr 全捕 err 变量
+    逐行 S2A_ERR: 前缀回投（mksh 无 PIPESTATUS/process-sub 的兼容写法）。
+    计数先行，计数=0 不跑 find|xargs——toybox xargs 无 -r 时默认空输入也
+    跑一次命令（sha256sum 空参读 stdin 出幻影行，空树会误拒）。"""
+    return (f"cd {shlex.quote(dir_)} && {{ set -o pipefail; exec 3>&1; err=$( {{ "
+            f"n=$({count_} | wc -l); echo \"S2A_N=${{n##* }} S2A_CRC=$?\" >&3; "
+            f"if [ \"${{n##* }}\" -gt 0 ] 2>/dev/null; then "
+            f"{{ {find_}; echo \"S2A_FRC=$?\" >&3; }} | {xargs_} >&3; "
+            "echo \"S2A_RC=$?\" >&3; "
+            "else echo \"S2A_FRC=0\" >&3; echo \"S2A_RC=0\" >&3; fi; "
+            "} 2>&1 ); exec 3>&-; "
+            "[ -z \"$err\" ] || printf '%s\\n' \"$err\" | sed 's/^/S2A_ERR: /'; }}")
 
 
 def _stat_map(stat_text):
@@ -147,9 +160,9 @@ def _stat_map(stat_text):
         if not ln or "|" not in ln:
             continue
         mode, ftype, name = ln.split("|", 2)
-        rel = posixpath.normpath(name)
-        if rel in ("", "."):
-            continue
+        if not name.strip():
+            continue                       # 空名行不成条目（normpath("") 会归一成 "."）
+        rel = posixpath.normpath(name)     # "." = 根自身：收进清单核根权限（P2）
         # toybox stat %F 类型名（8E 实测：0 字节文件出 "regular empty file"，
         # 不是 "regular file"）；fifo/socket/字符/块设备映各自码，仍被 != f 拒
         t = {"regular file": "f", "regular empty file": "f",
@@ -157,7 +170,11 @@ def _stat_map(stat_text):
              "fifo": "p", "socket": "s",
              "character special file": "c",
              "block special file": "b"}.get(ftype, ftype)
-        entries[rel] = {"t": t, "mode": int(mode, 8)}
+        try:
+            mode_i = int(mode, 8)
+        except ValueError:
+            raise RuntimeError(f"stat 清单未证：mode={mode!r} 非八进制")
+        entries[rel] = {"t": t, "mode": mode_i}
     return entries
 
 
@@ -188,30 +205,50 @@ def _entry_map(sha_map, stat_map, link_map):
 
 
 def _listing_parts(text, what):
-    """分批清单输出 → (清单文本, find 计数)。收尾 S2A_RC/S2A_N 缺一或
-    xargs rc≠0 → RuntimeError（半截清单不当完整）。"""
-    lines, rc, want = [], None, None
+    """分批清单输出 → (清单文本, find 计数)。凭据：S2A_FRC=find rc、
+    S2A_RC=管道 rc（pipefail）、S2A_N=find 计数、S2A_CRC=计数管道 rc、
+    S2A_ERR:=stderr 行。任一 rc 非零/缺失、计数非数字、stderr 非白名单
+    → RuntimeError 清单未证（半截/未证清单不当全量，fail closed）。"""
+    lines, rcs, want, err = [], {}, None, []
     for ln in text.splitlines():
-        if ln.startswith("S2A_RC="):
-            rc = ln[7:]
+        if ln.startswith("S2A_ERR: "):
+            err.append(ln[9:])
+        elif ln.startswith("S2A_FRC="):
+            rcs["find"] = ln[8:]
+        elif ln.startswith("S2A_RC="):
+            rcs["xargs"] = ln[7:]
         elif ln.startswith("S2A_N="):
-            want = ln[6:]
+            m = re.match(r"^S2A_N=(\S+) S2A_CRC=(\S+)$", ln)
+            if m:
+                want, rcs["count"] = m.groups()
         else:
             lines.append(ln)
-    if rc != "0" or want is None:
-        raise RuntimeError(f"{what}清单未完整返回（xargs rc={rc}，find 计数={want}）："
-                           "半截不当全量")
-    return "\n".join(lines), int(want)
+    try:
+        want_n = int(want) if want is not None else None
+    except (TypeError, ValueError):
+        want_n = None
+    bad_err = [l for l in err if l not in LISTING_STDERR_OK]
+    if (want_n is None or len(rcs) != 3 or any(v != "0" for v in rcs.values())
+            or bad_err):
+        raise RuntimeError(f"{what}清单未证（rc={rcs}，计数={want!r}，"
+                           f"stderr={err[:3]!r}）：半截不当全量")
+    return "\n".join(lines), want_n
 
 
 def device_entries(d, pkg, dir_, raw=None):
     """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。
     三份清单各走 -print0|xargs -n 256 分批（E2BIG），每批 rc=0 且解析条目数与
     find 计数一致才算完整。raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
-    q = shlex.quote(dir_)
-    sha_text = _owner_sh(d, pkg, dir_, SHA_MAP_CMD.format(q=q), timeout=300)
-    stat_text = _owner_sh(d, pkg, dir_, STAT_MAP_CMD.format(q=q), timeout=300)
-    link_text = _owner_sh(d, pkg, dir_, LINK_MAP_CMD.format(q=q), timeout=300)
+    sha_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -type f -print0",
+        "xargs -0 -n 256 sha256sum", "find . -type f"), timeout=300)
+    stat_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -mindepth 0 -print0",      # mindepth 0 含根目录自身：
+        "xargs -0 -n 256 stat -c '%a|%F|%n'", "find . -mindepth 0"), timeout=300)
+    link_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -type l -print0",
+        "xargs -0 -n 256 sh -c 'for p do printf \"%s\\t%s\\n\" \"$p\" "
+        "\"$(readlink \"$p\")\"; done' _", "find . -type l"), timeout=300)
     if raw is not None:
         raw.update(sha256sum=sha_text, stat=stat_text, links=link_text)
     sha_text, sha_want = _listing_parts(sha_text, "文件 sha ")
@@ -234,10 +271,9 @@ def tar_entries(tar_path):
     with tarfile.open(tar_path) as tf:
         for mem in tf.getmembers():
             # toybox `tar -cf - -C dir .` 首成员是 ./（tarfile 读出名归一成 .）：
-            # 根目录不进清单（设备端 find -mindepth 1 也不含根），归一后跳过
+            # 根目录也进清单（rel="."），与设备端 stat mindepth 0 同口径——
+            # 根权限还原核验靠这条对拍，双侧原来都跳过是漏洞
             rel = posixpath.normpath(mem.name)
-            if rel in ("", "."):
-                continue
             if mem.isfile():
                 h = hashlib.sha256()
                 with tf.extractfile(mem) as ef:
@@ -385,14 +421,32 @@ def backup_data(d, pkg, dest):
             raise Refuse(f"{dir_} 目录状态证不了（存在但进不去或父目录不可搜索）："
                          f"证不了也备不了，不动这台设备")
         tar = dest / f"{tag}.tar"
-        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给私有树 debuggable 包
-        cmd_ = f"tar -cpf - -C {shlex.quote(dir_)} ."
+        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给私有树 debuggable 包。
+        # exec-out 会把设备 stderr 混进归档字节流（9000 实证 ext.tar 尾部带
+        # "tar: … Permission denied / tar: had errors"，宿主 stderr 反而是空的）——
+        # stderr/rc 单独落设备侧本局凭据文件（run-as 树下 .s2a-tar-*，tar 用
+        # --exclude 排出自身），归档流只走 stdout；拉完读回再核删，rc≠0 或
+        # stderr 非白名单行 = 备份未证（不拿未证归档动设备）。
+        en, rn = ".s2a-tar-err", ".s2a-tar-rc"
+        q = shlex.quote(dir_)
+        cmd_ = (f"cd {q} && rm -f {en} {rn}; "
+                f"tar -cpf - --exclude=./{en} --exclude=./{rn} . 2> {en}; echo $? > {rn}")
         args_ = (["run-as", pkg, "sh", "-c", cmd_] if _is_private_tree(pkg, dir_)
                  else ["sh", "-c", cmd_])
-        nbytes, digest, rc, err = _exec_out_stream(d, args_, tar, timeout=600)
-        if rc or not nbytes:
-            raise Refuse(f"{dir_} 备份失败 rc={rc}（run-as/tar 不可用就当非 debuggable 拒跑）"
-                         + (f"：{err[:160]}" if err else ""))
+        nbytes, digest, rc, _err = _exec_out_stream(d, args_, tar, timeout=600)
+        try:
+            dev_rc = _owner_sh(d, pkg, dir_, f"cd {q} && cat {rn}", timeout=30).strip()
+            dev_err = _owner_sh(d, pkg, dir_, f"cd {q} && cat {en}", timeout=30)
+            _owner_sh(d, pkg, dir_,
+                      f"cd {q} && rm -f {en} {rn} && test ! -e {en} && test ! -e {rn}",
+                      timeout=30)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            raise Refuse(f"{dir_} 备份 tar 的 rc/err 凭据读不回或删不净（{error}）：备份未证") \
+                from error
+        bad_err = [l for l in dev_err.splitlines() if l not in TAR_STDERR_OK]
+        if rc or dev_rc != "0" or not nbytes or bad_err:
+            raise Refuse(f"{dir_} 备份未证（exec-out rc={rc}，tar rc={dev_rc!r}，"
+                         f"stderr={bad_err[:3]!r}）：不拿未证的归档动这台设备")
         manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": digest,
                                  "entries": device_entries(d, pkg, dir_)}
         bad = _verify_tar(manifest, dest, tag)
@@ -422,7 +476,7 @@ def restore_data(d, pkg, manifest, backup_dir):
         if "Success" not in out_:
             fails.append(f"pm clear 未返回 Success（{out_.strip()[:120] or '无输出'}）："
                          f"数据回灌不执行")
-    except (RuntimeError, subprocess.SubprocessError) as error:
+    except Exception as error:
         fails.append(f"pm clear 异常：{error}")
     if fails:
         return fails
@@ -439,7 +493,9 @@ def restore_data(d, pkg, manifest, backup_dir):
             bad = entries_diff(info["entries"], device_entries(d, pkg, dir_))
             if bad:
                 fails.append(f"{dir_} 还原后与备份清单不符 {len(bad)} 项：{bad[:3]}")
-        except (RuntimeError, subprocess.SubprocessError) as error:
+        except Exception as error:
+            # 回灌后核验链上任何异常（含清单解析错误）都进 fails → 留置，
+            # 不许逸出跳过 manifest/release 收尾（qa-fone P1：ValueError 曾越过）
             fails.append(f"{dir_} 数据还原 adb 异常：{error}")
     return fails
 
@@ -577,9 +633,11 @@ def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
     block.update(scene=meta.get("scene"), title_id=title_id,
                  files=len(files_map),
                  extra_files=sum(1 for rel, e in entries.items()
-                                 if rel not in files_map and e.get("t") != "d"),
+                                 if rel != "." and rel not in files_map
+                                 and e.get("t") != "d"),
                  extra_dirs=sum(1 for rel, e in entries.items()
-                                if rel not in files_map and e.get("t") == "d"),
+                                if rel != "." and rel not in files_map
+                                and e.get("t") == "d"),
                  verify="ok")
     log(f"检查点 {cp_dir.name} 已解入 saves/{title_id}/ryujinx-android（{len(files_map)} 文件 sha 复核过）")
 
