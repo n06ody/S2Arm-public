@@ -850,7 +850,12 @@ def start_power_sampler(d, supply):
     inner = (f"rm -f {dest} {dest}.pid; "
              f"setsid sh -c {shlex.quote(loop)} >{dest} 2>&1 </dev/null & echo $!")
     out = d.shell("sh -c " + shlex.quote(inner), timeout=15).strip()
-    return dest, out.splitlines()[-1].strip()
+    pid = out.splitlines()[-1].strip() if out.splitlines() else ""
+    if not re.fullmatch(r"[0-9]+", pid):
+        # 空回/半截回执（sh 报错文本、通道被掐后的残缺输出）= spawn 未证：
+        # 守护可能已起在写——按启动失败交调用方扫孤儿，不拿脏串当 PID。
+        raise RuntimeError(f"采样守护启动回执不可信：{out[-120:]!r}")
+    return dest, pid
 
 
 def power_rows(d, dest):
@@ -868,13 +873,27 @@ def power_rows(d, dest):
 
 
 def stop_power_sampler(d, dest, pid=None):
-    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。
+    """杀守护 → 退场复验 → 拉回全量 → 清设备文件；返回 [(row, level)]。
     pid 拿不到（起守护超时 / 中断在赋值前）也照扫：PID 文件与 SAMPLER_TAG
-    进程标记两路兜底，设备上不留孤儿循环。"""
-    d.shell(f"for p in {pid or ''} $(cat {dest}.pid 2>/dev/null) "
-            f"$(pgrep -f {SAMPLER_TAG} 2>/dev/null); do kill $p 2>/dev/null; done; "
-            f"rm -f {dest}.pid", allowed=(0, 1), timeout=10)
+    进程标记两路兜底，设备上不留孤儿循环。杀后仍有守护存活 → 抛错留证
+    （日志已拉回、设备文件不清）。"""
+    # kill 前按 /proc/<pid>/cmdline 核标记——PID 被回收成别家进程不许误杀；
+    # 只等真杀过的 pid 退场（/proc/<pid> 没了才算死），杀不死的报 LINGER。
+    out = d.shell(
+        f"pids=\"{pid or ''} $(cat {dest}.pid 2>/dev/null) "
+        f"$(pgrep -f {SAMPLER_TAG} 2>/dev/null)\"; killed=; "
+        f"for p in $pids; do grep -aqs {SAMPLER_TAG} /proc/$p/cmdline 2>/dev/null "
+        f"&& kill $p 2>/dev/null && killed=\"$killed $p\"; done; "
+        f"for p in $killed; do i=0; "
+        f"while [ -d /proc/$p ] && [ $i -lt 10 ]; do sleep 0.2; i=$((i+1)); done; "
+        f"[ -d /proc/$p ] && echo LINGER:$p; done; "
+        f"rm -f {dest}.pid",
+        allowed=(0, 1), timeout=15)
     rows = power_rows(d, dest)
+    linger = [w.split(":", 1)[1] for w in out.split() if w.startswith("LINGER:")]
+    if linger:
+        raise RuntimeError(
+            f"采样守护 {','.join(linger)} 杀掉后仍存活，设备文件留 {dest} 未清")
     d.shell(f"rm -f {dest}", allowed=(0, 1), timeout=10)
     return rows
 
@@ -1227,6 +1246,14 @@ def main(argv=None):
                     notes.append(f"采样守护起失败后的孤儿清理也没走通：{sweep_error}")
                 notes.append(f"电池采样守护起不来（{str(error)[:160]}）：本局能耗按没数据处理")
                 manifest["power_sampler"] = {"spawn_error": str(error)[:200]}
+            except BaseException:
+                # 启动中断（SIGINT/KeyboardInterrupt 等在 d.shell 里炸的异常）：
+                # 守护可能已起——也照扫孤儿再放行，不能只靠收局兜底
+                try:
+                    stop_power_sampler(d, dest, None)
+                except Exception:
+                    pass
+                raise
 
         def flush_power(rows):
             for row, level in rows:
@@ -1260,9 +1287,30 @@ def main(argv=None):
         settled = True
         if settle_us > 0 and sampler is not None:
             rows = pull_rows("放电稳定门")
-            charging = bool(rows) and (str(rows[-1].get("plugged")) == "1"
-                                       or rows[-1].get("status") in ("Charging", "Full"))
-            if charging and args.discharge_settle is None:
+            if args.discharge_settle is None:
+                # 首读竞态（8E：setsid 即回但守护首块还没落盘）——先补拉几轮，
+                # 仍无样本就用同口径 dumpsys 现态判接电；接电局不许被首读空
+                # 拖进整条放电等待。
+                first = rows[-1] if rows else None
+                for _ in range(3):
+                    if first is not None:
+                        break
+                    time.sleep(args.power_interval)
+                    rows = pull_rows("放电稳定门")
+                    first = rows[-1] if rows else None
+                if first is None:
+                    try:
+                        first = android_power.parse_sample(
+                            d.shell(android_power.sample_command(supply),
+                                    timeout=20) + "\n")
+                    except (RuntimeError, subprocess.SubprocessError) as error:
+                        notes.append(f"放电稳定门首读无样本、dumpsys 现态判读也没走通：{error}")
+                charging = bool(first) and (
+                    str(first.get("plugged")) == "1"
+                    or first.get("status") in ("Charging", "Full"))
+            else:
+                charging = False
+            if charging:
                 manifest["power_sampler"]["settle_na"] = \
                     "设备在接电/充电：放电稳定门不适用，直接进窗"
             else:
