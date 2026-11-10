@@ -318,6 +318,85 @@ def restore_data(d, pkg, manifest, backup_dir):
     return fails
 
 
+def apply_checkpoint(d, pkg, cp_dir, manifest, log):
+    """s2a-checkpoint/1 → 部署后、首启前解进存档根（BootSpec 冻结：
+    files/user/0/saves/<titleId>/ryujinx-android；S2A_SAVE_DIR 在 typed BootSpec 下不生效）。
+    宿主核（schema/包名/titleId、tar sha、成员白名单、清单⊆tar）→ push → run-as tar 解
+    → 逐文件 sha 复核。任一门不过记 manifest.checkpoint.verify=fail 后抛 Refuse（不起局）。"""
+    block = {"name": cp_dir.name}
+    manifest["checkpoint"] = block
+
+    def deny(reason):
+        block["verify"] = "fail"
+        block["fail"] = reason
+        raise Refuse(f"检查点 {cp_dir.name} 不可用：{reason}")
+
+    try:
+        meta = json.loads((cp_dir / "meta.json").read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        deny(f"meta.json 读不了：{error}")
+    if meta.get("schema") != "s2a-checkpoint/1":
+        deny(f"schema 不是 s2a-checkpoint/1（{meta.get('schema')}）")
+    files_map = meta.get("files")
+    if not isinstance(files_map, dict) or not files_map:
+        deny("meta.files 空或不是清单表")
+    if meta.get("package") and meta["package"] != pkg:
+        deny(f"meta.package={meta['package']} 与本局 {pkg} 不符")
+    mtid = re.search(r"\.t([0-9a-fA-F]{16})$", pkg)
+    title_id = str(meta.get("title_id") or "")
+    if title_id and mtid and title_id.lower() != mtid.group(1).lower():
+        deny(f"meta.title_id={title_id} 与包名 {pkg} 的 titleId 不符")
+    if not title_id:
+        if not mtid:
+            deny("meta 无 title_id 且包名推不出 titleId")
+        title_id = mtid.group(1).upper()
+    tar_p = cp_dir / "saves.tar"
+    try:
+        want_tar_sha = (cp_dir / "saves.tar.sha256").read_text().split()[0]
+    except (OSError, IndexError) as error:
+        deny(f"saves.tar.sha256 读不了：{error}")
+    got_tar_sha = sha256(tar_p)
+    if got_tar_sha != want_tar_sha:
+        deny(f"saves.tar sha256 与 .sha256 不符（{got_tar_sha[:12]}≠{want_tar_sha[:12]}）")
+    block["source_sha256"] = want_tar_sha
+    try:
+        with tarfile.open(tar_p) as tf:
+            members = tf.getmembers()
+    except (tarfile.TarError, OSError, EOFError) as error:
+        deny(f"saves.tar 打不开/截断：{error}")
+    tar_files = set()
+    for mem in members:
+        if (mem.name.startswith("/") or posixpath.isabs(mem.name)
+                or ".." in mem.name.split("/")):
+            deny(f"tar 成员越界：{mem.name}")
+        if mem.isfile():
+            tar_files.add(posixpath.normpath(mem.name))
+        elif not mem.isdir():
+            deny(f"tar 成员类型不收（{mem.name}）：只收普通文件与目录")
+    missing = sorted(rel for rel in files_map if posixpath.normpath(rel) not in tar_files)
+    if missing:
+        deny(f"meta.files 有 {len(missing)} 项不在 tar 里：{missing[:3]}")
+    state_dir = f"/data/data/{pkg}/files/user/0/saves/{title_id}/ryujinx-android"
+    tmp = f"/data/local/tmp/s2a-checkpoint-{uuid.uuid4().hex[:12]}.tar"
+    d.run("push", str(tar_p), tmp, timeout=300)
+    try:
+        d.run_as(pkg, f"mkdir -p {shlex.quote(state_dir)}", timeout=60)
+        d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(state_dir)}", timeout=600)
+    finally:
+        d.shell(f"rm -f {tmp}", allowed=(0, 1))
+    entries = device_entries(d, pkg, state_dir)
+    want = {posixpath.normpath(rel): v[1] for rel, v in files_map.items()}
+    bad = [rel for rel, sha in want.items()
+           if entries.get(rel, {}).get("t") != "f" or entries[rel].get("sha") != sha]
+    if bad:
+        deny(f"解入后核对不符 {len(bad)} 项：{bad[:3]}")
+    block.update(scene=meta.get("scene"), title_id=title_id,
+                 files=len(files_map),
+                 extra_files=sum(1 for rel in entries if rel not in want),
+                 verify="ok")
+    log(f"检查点 {cp_dir.name} 已解入 saves/{title_id}/ryujinx-android（{len(files_map)} 文件 sha 复核过）")
+
+
 def uptime_us(d):
     """设备 CLOCK_BOOTTIME 微秒（/proc/uptime 第一项）——与帧记录 ts 同一时钟域。"""
     fields = d.shell("cat /proc/uptime", timeout=10).split()
@@ -751,6 +830,8 @@ def main(argv=None):
     src = p.add_mutually_exclusive_group()
     src.add_argument("--resources")
     src.add_argument("--pack")
+    p.add_argument("--checkpoint", type=Path, default=None, metavar="DIR",
+                   help="s2a-checkpoint/1 检查点目录：部署后、首启前 run-as 解进存档根并逐文件 sha 核对")
     p.add_argument("--mode", choices=["auto", "generic", "direct"], default="auto")
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
     p.add_argument("--allow-data-loss", action="store_true",
@@ -958,6 +1039,10 @@ def main(argv=None):
         cur = install_state(d, pkg)
         if not cur["installed"] or cur.get("sha256") != our_sha:
             raise Refuse("安装后 sha256 校验不过")
+
+        # ---- 检查点：部署后、首启前解进存档根，核对不过不起局 ----
+        if args.checkpoint:
+            apply_checkpoint(d, pkg, args.checkpoint, manifest, log)
 
         # ---- 调试门 + 帧日志开关（记原值，收局恢复并逐项读回；release 机不让改只记注）----
         run_uuid = uuid.uuid4().hex   # 本局号：os.c 首行/帧 meta 都写它——内容级归属锚
