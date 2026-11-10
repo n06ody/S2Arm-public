@@ -804,6 +804,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     {
         extern void nvn_vk_frame_log_present(void) __attribute__((weak));
         if (nvn_vk_frame_log_present) nvn_vk_frame_log_present();
+        // 逐帧 TSV（iOS frames.tsv 同义）：同一 present 成功点写行；函数内自查开关。
+        extern void nvn_vk_frame_tsv_present(uint64_t, double) __attribute__((weak));
+        if (nvn_vk_frame_tsv_present) nvn_vk_frame_tsv_present(n, now);
     }
     // 出账依赖（维护方审 11-04）：w6_account.py 解析 `draw window: draws=` 与
     // `render pass window: hit=...` 两行，这两行不随 debug.s2a.win_stats 开关；

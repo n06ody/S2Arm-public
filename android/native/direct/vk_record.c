@@ -657,10 +657,14 @@ static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec
         // 模块不在或开关关都跳过一次分支判断，不计时也不记账（量的成本不默认付）。
         extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
         extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+        extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
+        extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
         const int fl = nvn_vk_frame_log_on && nvn_vk_frame_log_on();
-        uint64_t wt0 = fl ? rec_now_ns() : 0;
+        const int ft = nvn_vk_frame_tsv_on && nvn_vk_frame_tsv_on();
+        uint64_t wt0 = (fl || ft) ? rec_now_ns() : 0;
         rc = vkWaitForFences(d->device, 1, &fence, VK_TRUE, 5000000000ull);
         if (fl) nvn_vk_frame_log_fence_wait(rec_now_ns() - wt0);
+        if (ft) nvn_vk_frame_tsv_fence_wait(rec_now_ns() - wt0);
     }
     if (rc != VK_SUCCESS) {
         // 提交成功但没拿到完成证明：fence/命令缓冲/辅助资源都不能释放或复用。

@@ -69,6 +69,9 @@ function(s2a_android_direct_sources output)
         # 逐帧上屏间隔 + 每帧 fence 等待（诊断默认关）：direct/generic 同一份环形缓冲与
         # 转储格式（t-direct-frametimes），generic 经 DllImport 调 s2a_frame_log_present/dump，必须随直连核心编入。
         native/nvn/nvn_vk_frame_log.c
+        # 逐帧 TSV（iOS frames.tsv 同义；诊断默认关）：present 成功点取各累计源差分写行，
+        # 拿不到的列整列不进表头。
+        native/nvn/nvn_vk_frame_tsv.c
         native/nvn/nvn_vk_compile_events.c
         native/direct/vk_clear.c
         native/nvn/nvn_vk_swapchain.c native/nvn/nvn_vk_surface.c native/nvn/nvn_vk_session.c

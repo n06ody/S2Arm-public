@@ -2252,6 +2252,9 @@ static void fd_fb_cache_clear(VkDevice dev) {
 // 其余（barrier + fb + begin render pass）。不拆开就不知道 5.5 ms/帧 花在哪一步。
 static uint64_t g_rp_t_cget, g_rp_t_bcb, g_rp_t_rest, g_rp_t_npass;
 static _Atomic uint64_t g_rp_n_cget, g_rp_n_bcb;   // 实际 reset/begin 次数（批次复用后每次开 pass 不一定发生）
+// 逐帧 TSV 的不清零累计：记站点分别与 g_draws_since_report / g_rp_t_npass 对齐
+//   （窗口账读即清零，不能复用；逐帧差分由读方拿相邻两帧快照自己算）。
+static _Atomic uint64_t g_draws_total, g_passes_total;
 
 // 返回 pass；*queued=0 表示缓存所有（设备销毁时清），1 表示本次新建、调用方要交给帧队列销毁。
 // 失败返回 VK_NULL_HANDLE 并写 why。
@@ -3081,6 +3084,7 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
     int64_t tp3 = fd_now_ns();
     __atomic_fetch_add(&g_rp_t_rest, (uint64_t)(tp3 - tp2), __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_rp_t_npass, 1, __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(&g_passes_total, 1, memory_order_relaxed);
     // rest 细分：父项是 tp2..tp3，下面六段首尾相接、同属这批调用（分母一致）
     if (tr_gpuarm && tr_query && tr_precopy && tr_barrier && tp3) {   // 只在诊断开启时累加
         atomic_fetch_add(&g_rest_gpuarm_ns, (uint64_t)(tr_gpuarm - tp2));
@@ -4581,6 +4585,12 @@ void nvn_vk_first_draw_take_counts(uint64_t *draws, uint64_t *depth_only) {
     if (depth_only) *depth_only = atomic_exchange(&g_depth_only_since_report, 0);
 }
 
+// 逐帧 TSV 用：窗口账读即清零不能复用，差分由读方自己算（声明点见文件前部）。
+void nvn_vk_first_draw_draw_pass_totals(uint64_t *draws, uint64_t *passes) {
+    if (draws) *draws = atomic_load(&g_draws_total);
+    if (passes) *passes = atomic_load(&g_passes_total);
+}
+
 // 观察窗口读数：render pass 缓存命中/新建，以及建 pass/framebuffer 的耗时。命中率和对象的
 // 创建耗时必须分开看，不能把“缓存命中多”当成“pass 成本已经降下来”。读取即清零。
 void nvn_vk_first_draw_pipe_create_stats(uint64_t *n, uint64_t *ns) {
@@ -5200,6 +5210,7 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
     // perf_timing 下的纹理槽比较、程序对象解析、帧队列腾位检查），原先没有归属。
     const int64_t t_tail_entry = fd_tail_stamp();
     atomic_fetch_add_explicit(&g_draws_since_report, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_draws_total, 1, memory_order_relaxed);
     if (atomic_fetch_add_explicit(&g_draws_this_frame, 1, memory_order_relaxed) == 0)
         g_frame_ref_seq = s2a_poolahb_begin_seq();   // 本帧所有保活记在这个单调序号下
     fd_samp_cache_ensure(d);

@@ -227,6 +227,13 @@ void nvk_program_long_totals(uint64_t *compiles, uint64_t *compile_ns,
     if (pipes) *pipes = attempts;
     if (pipe_ns) *pipe_ns = ns;
 }
+// 逐帧 TSV 的 shader_miss 源：离线库命中/未命中/拒绝的不清零累计（与 long_totals 同口径，
+//   present 侧差分；静态量不外露所以走这个出口）。
+void nvk_program_offline_totals(uint64_t *hits, uint64_t *misses, uint64_t *rejects) {
+    if (hits) *hits = g_program_offline_hits;
+    if (misses) *misses = g_program_offline_misses;
+    if (rejects) *rejects = g_program_offline_rejects;
+}
 // 程序查找（含身份编码、纹理事实、缓存扫描）本身的耗时：它在 draw 内部计时之外，
 // 属于 op=26 与 draw timing 之间那段没有归属的时间。
 static _Atomic uint64_t g_pf_calls, g_pf_ns;

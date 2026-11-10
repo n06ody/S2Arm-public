@@ -10,8 +10,10 @@
 #include "nvn_vk_readback.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <android/log.h>
 
 #include "nvn_vk_format.h"
@@ -29,6 +31,13 @@ static struct {
     int coherent;
     int poisoned;
 } g_rb;
+
+// 逐帧 TSV 的 rb_us 源：本路径 5 s 有界等待的实际耗时累计（不清零；只在 frame_tsv 开关
+//   打开时计时，关态不付取钟成本）。读回是罕见路径，差分由读方自己算。
+static _Atomic uint64_t g_rb_wait_ns_total;
+uint64_t nvn_vk_readback_wait_ns_total(void) {
+    return atomic_load_explicit(&g_rb_wait_ns_total, memory_order_relaxed);
+}
 
 static int gpu_fail(char *why, size_t why_size, const char *fmt, ...) {
     if (why && why_size) {
@@ -223,7 +232,19 @@ int nvn_vk_readback_gpu(struct s2a_vk_device *d, const struct nvn_vk_tex *tex,
         return gpu_fail(why, why_size, "vkQueueSubmit for the readback copy failed: %d", (int)vr);
     }
     // 5 s 有界等待：读回是 CPU 可见操作，没有完成证明就不能把字节交出去。
+    // 逐帧 TSV：frame_tsv 开关开时记本次等待实测耗时（先判 on()，关态不取钟）。
+    extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
+    const int ft = nvn_vk_frame_tsv_on && nvn_vk_frame_tsv_on();
+    struct timespec wt;
+    uint64_t wt0 = 0;
+    if (ft) { clock_gettime(CLOCK_MONOTONIC, &wt); wt0 = (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec; }
     vr = vkWaitForFences(d->device, 1, &fence, VK_TRUE, 5000000000ull);
+    if (ft) {
+        clock_gettime(CLOCK_MONOTONIC, &wt);
+        atomic_fetch_add_explicit(&g_rb_wait_ns_total,
+            (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec - wt0,
+            memory_order_relaxed);
+    }
     if (vr != VK_SUCCESS) {
         // 已经提交且可能仍在读 staging/图像：缓冲进 poisoned，不复用不释放；fence 与命令缓冲
         // 同理留给进程退出回收（销毁仍被提交引用的 fence/命令缓冲是非法用法）。

@@ -42,6 +42,9 @@ int nvn_vk_readback_gpu(struct s2a_vk_device *d, const struct nvn_vk_tex *tex,
 // 会话销毁前释放读回 staging 缓存（设备空闲证明之后；等不到完成证明的缓冲会保留）。
 void nvn_vk_readback_gpu_release(struct s2a_vk_device *d);
 
+// 读回路径 fence 等待的不清零累计 ns（逐帧 TSV 的 rb_us 源；只在 frame_tsv 开关开时计时）。
+uint64_t nvn_vk_readback_wait_ns_total(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -430,17 +430,22 @@ static int clr_submit(struct s2a_vk_device *d, VkCommandBuffer cmd, VkFramebuffe
         // 模块不在或开关关都跳过一次分支判断，不计时也不记账（量的成本不默认付）。
         extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
         extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+        extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
+        extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
         const int fl = nvn_vk_frame_log_on && nvn_vk_frame_log_on();
+        const int ft = nvn_vk_frame_tsv_on && nvn_vk_frame_tsv_on();
         struct timespec wt;
         uint64_t wt0 = 0;
-        if (fl) {
+        if (fl || ft) {
             clock_gettime(CLOCK_MONOTONIC, &wt);
             wt0 = (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec;
         }
         rc = vkWaitForFences(d->device, 1, &fence, VK_TRUE, 5000000000ull);
-        if (fl) {
+        if (fl || ft) {
             clock_gettime(CLOCK_MONOTONIC, &wt);
-            nvn_vk_frame_log_fence_wait((uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec - wt0);
+            uint64_t wt_ns = (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec - wt0;
+            if (fl) nvn_vk_frame_log_fence_wait(wt_ns);
+            if (ft) nvn_vk_frame_tsv_fence_wait(wt_ns);
         }
     }
     if (rc != VK_SUCCESS) {
