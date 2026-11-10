@@ -682,15 +682,24 @@ def frame_dump_done(d, pkg, since):
 POWER_LOG = "/data/local/tmp/s2a-power-samples.log"
 
 
+SAMPLER_TAG = "s2a-power-sampler"
+
+
 def start_power_sampler(d, supply):
     """设备侧采样守护：mksh 后台 while 循环 1Hz 写 `===` 分隔的采样块到
     /data/local/tmp——adb 掉线只断拉取、不断设备上的采样（兄弟项目
-    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。"""
+    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。
+    后台进程必须三 fd 全脱离（adbd 语义：有任何 fd 挂着传输通道，adb shell
+    就不退，8E 实测 15s 超时、孤儿守护继续写）——setsid 另开会话脱控制终端，
+    </dev/null + 输出进日志文件 + stderr 并入；PID 文件由守护自己写（setsid
+    可能 fork，$! 不一定就是守护号），并留 SAMPLER_TAG 供 pgrep 兜底。"""
     dest = POWER_LOG
-    inner = (f"rm -f {dest}; ( while :; do {android_power.sample_command(supply)}; "
-             f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
-             f"printf '{android_power.BLOCK_SEP}\\n'; sleep 1; done )"
-             f" >{dest} 2>/dev/null </dev/null & echo $!")
+    loop = (f"echo $$ >{dest}.pid; while :; do : {SAMPLER_TAG}; "
+            f"{android_power.sample_command(supply)}; "
+            f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+            f"printf '{android_power.BLOCK_SEP}\\n'; sleep 1; done")
+    inner = (f"rm -f {dest} {dest}.pid; "
+             f"setsid sh -c {shlex.quote(loop)} >{dest} 2>&1 </dev/null & echo $!")
     out = d.shell("sh -c " + shlex.quote(inner), timeout=15).strip()
     return dest, out.splitlines()[-1].strip()
 
@@ -709,9 +718,13 @@ def power_rows(d, dest):
     return out
 
 
-def stop_power_sampler(d, dest, pid):
-    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。"""
-    d.shell(f"kill {pid}", allowed=(0, 1), timeout=10)
+def stop_power_sampler(d, dest, pid=None):
+    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。
+    pid 拿不到（起守护超时 / 中断在赋值前）也照扫：PID 文件与 SAMPLER_TAG
+    进程标记两路兜底，设备上不留孤儿循环。"""
+    d.shell(f"for p in {pid or ''} $(cat {dest}.pid 2>/dev/null) "
+            f"$(pgrep -f {SAMPLER_TAG} 2>/dev/null); do kill $p 2>/dev/null; done; "
+            f"rm -f {dest}.pid", allowed=(0, 1), timeout=10)
     rows = power_rows(d, dest)
     d.shell(f"rm -f {dest}", allowed=(0, 1), timeout=10)
     return rows
@@ -751,8 +764,9 @@ def main(argv=None):
     p.add_argument("--push-tar", choices=["auto", "always", "never"], default="auto",
                    help="资源推送方式：auto 小文件密集自动 tar 单推解开；always 强制；never 整树推")
     p.add_argument("--ready-timeout", type=int, default=180)
-    p.add_argument("--discharge-settle", type=int, default=30,
-                   help="采集窗开始前要连续物理放电的秒数（能耗口径；0=不等）")
+    p.add_argument("--discharge-settle", type=int, default=None,
+                   help="采集窗开始前要连续物理放电的秒数（能耗口径；缺省 30，"
+                        "接电/充电下自动判不适用不等；显式给了照等，0=不等）")
     p.add_argument("--discharge-timeout", type=int, default=300,
                    help="放电稳定门的等待上限秒数（0=等到够为止；超时照常采集、能耗记没数据）")
     p.add_argument("--power-interval", type=float, default=1.0,
@@ -1021,12 +1035,24 @@ def main(argv=None):
         # --power-interval 拉回——adb 中途掉线只断拉取不断设备上的采样，收局/中断照样
         # 把已落的行拉回来（兄弟项目「私存不丢」同语义）。
         supply = "battery"
-        dest, sampler_pid = start_power_sampler(d, supply)
-        sampler = (dest, sampler_pid)
-        manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
-                                     "settle_required_s": args.discharge_settle}
-        power_f = (out / "power.tsv").open("w")
-        power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+        dest = POWER_LOG
+        settle_s = 30 if args.discharge_settle is None else args.discharge_settle
+        try:
+            dest, sampler_pid = start_power_sampler(d, supply)
+            sampler = (dest, sampler_pid)
+            manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
+                                         "settle_required_s": settle_s}
+            power_f = (out / "power.tsv").open("w")
+            power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            # 起守护失败/超时（adb shell 卡到超时才炸）：设备端可能已有孤儿
+            # 循环在写日志——sampler 变量还没赋值，按 PID 文件/进程标记扫掉。
+            try:
+                stop_power_sampler(d, dest, None)
+            except (RuntimeError, subprocess.SubprocessError) as sweep_error:
+                notes.append(f"采样守护起失败后的孤儿清理也没走通：{sweep_error}")
+            notes.append(f"电池采样守护起不来（{str(error)[:160]}）：本局能耗按没数据处理")
+            manifest["power_sampler"] = {"spawn_error": str(error)[:200]}
 
         def flush_power(rows):
             for row, level in rows:
@@ -1040,6 +1066,8 @@ def main(argv=None):
             power_f.flush()
 
         def pull_rows(tag):
+            if sampler is None:
+                return []
             try:
                 rows = power_rows(d, dest)
             except (RuntimeError, subprocess.SubprocessError) as error:
@@ -1051,21 +1079,30 @@ def main(argv=None):
         # 放电稳定门（兄弟项目口径）：尾部一串「连续物理放电」采样满
         # --discharge-settle 秒才进采集窗；上限 --discharge-timeout（0=不限）。
         # settle=0 就是「不等」：不做任何预拉取，窗口边界直接从 col0 起。
-        settle_us = args.discharge_settle * 1_000_000
+        # 接电功能局默认不该先等放电：未显式给 --discharge-settle 且最新采样
+        # 证在接电/充电 → 门判不适用直接进窗（显式给了照等，能耗局要真放电）。
+        settle_us = settle_s * 1_000_000
         wait0 = time.monotonic()
         settled = True
-        if settle_us > 0:
+        if settle_us > 0 and sampler is not None:
             rows = pull_rows("放电稳定门")
-            settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
-            while not settled:
-                if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
-                    notes.append(f"放电未稳满 {args.discharge_settle}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
-                    break
-                time.sleep(args.power_interval)
-                rows = pull_rows("放电稳定门")
+            charging = bool(rows) and (str(rows[-1].get("plugged")) == "1"
+                                       or rows[-1].get("status") in ("Charging", "Full"))
+            if charging and args.discharge_settle is None:
+                manifest["power_sampler"]["settle_na"] = \
+                    "设备在接电/充电：放电稳定门不适用，直接进窗"
+            else:
                 settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
-        manifest["power_sampler"]["settle_ok"] = settled
-        manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
+                while not settled:
+                    if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
+                        notes.append(f"放电未稳满 {settle_s}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
+                        break
+                    time.sleep(args.power_interval)
+                    rows = pull_rows("放电稳定门")
+                    settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
+        if "power_sampler" in manifest and "spawn_error" not in manifest["power_sampler"]:
+            manifest["power_sampler"]["settle_ok"] = settled
+            manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
 
         col0_us = uptime_us(d)
         shot(adb_argv, out / "shots_ap" / "01_000s.png")
@@ -1074,14 +1111,16 @@ def main(argv=None):
             pull_rows(f"第 {i}s")
             time.sleep(max(0, args.power_interval - (time.monotonic() - tick)))
         col1_us = uptime_us(d)
-        try:
-            rows = stop_power_sampler(d, dest, sampler_pid)
-            sampler = None
-            flush_power(rows)
-        except (RuntimeError, subprocess.SubprocessError) as error:
-            notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
-        power_f.close()
-        power_f = None
+        if sampler is not None:
+            try:
+                rows = stop_power_sampler(d, dest, sampler[1])
+                sampler = None
+                flush_power(rows)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
+        if power_f is not None:
+            power_f.close()
+            power_f = None
         shot(adb_argv, out / "shots_ap" / f"02_{args.seconds:03d}s.png")
         manifest["frame_window_us"] = [col0_us, col1_us]
         log(f"采集 {args.seconds}s 完成（窗口 boot_us {col0_us}..{col1_us}）")
