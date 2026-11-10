@@ -1270,9 +1270,10 @@ def main(argv=None):
                 raise Refuse(f"--ab-prop 格式不对（只收 debug.s2a.<名>=<值>）：{spec}")
             if key in props_prev or key == SESSION_PROP or key in DEBUG_PROPS:
                 raise Refuse(f"--ab-prop 与运行器自管属性重名：{key}")
-            props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
-            d.shell(f"setprop {key} {shlex.quote(val)}", allowed=(0, 1))
-            got = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
+            # 原值 / 置位 / 读回都要 rc=0：读不到原值就无法证明能恢复，直接拒跑
+            props_prev[key] = d.shell(f"getprop {key}", allowed=(0,)).strip()
+            d.shell(f"setprop {key} {shlex.quote(val)}", allowed=(0,))
+            got = d.shell(f"getprop {key}", allowed=(0,)).strip()
             if got != val:
                 raise Refuse(f"--ab-prop {key} 没置上（读回 {got!r}）")
             manifest.setdefault("ab_props", {})[key] = {"value": val, "prev": props_prev[key]}
@@ -1635,9 +1636,17 @@ def main(argv=None):
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
         try:
+            ab_keys = set(manifest.get("ab_props", {}))
             for key, prev in props_prev.items():
-                d.shell(f"setprop {key} {shlex.quote(prev)}", allowed=(0, 1))
-                back = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
+                # --ab-prop 的属性：setprop 与读回都必须 rc=0（权限拒绝 rc=1 会读成空串，
+                # 原值恰为空时会被误认已恢复）；逐项单独 try，一项失败不跳过其余项
+                ok_rc = (0,) if key in ab_keys else (0, 1)
+                try:
+                    d.shell(f"setprop {key} {shlex.quote(prev)}", allowed=ok_rc)
+                    back = d.shell(f"getprop {key}", allowed=ok_rc).strip()
+                except (RuntimeError, subprocess.SubprocessError) as error:
+                    fails.append(f"调试属性 {key} 恢复 adb 异常：{error}")
+                    continue
                 if back != prev:
                     fails.append(f"调试属性 {key} 恢复失败：期望 {prev!r} 实得 {back!r}")
         except (RuntimeError, subprocess.SubprocessError) as error:

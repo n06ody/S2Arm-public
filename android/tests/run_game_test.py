@@ -450,6 +450,10 @@ if cmd == "shell":
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
         key = " ".join(sh[1:])
+        # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
+        # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
+        if key in st.get("getprop_deny", []) or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None):
+            sys.stderr.write("getprop: permission denied\\n"); save(); sys.exit(1)
         out(st["props"].get(key, "") + "\\n"); sys.exit(0)
     if c == "setprop":
         # props_jam：写空值的 setprop 被设备静默拒（有的构建不让清 debug 属性）→ 旧值还在
@@ -1772,6 +1776,20 @@ class RunGameTest(unittest.TestCase):
             self.assertIn("--ab-prop", manb["reason"], f"{tag}: {manb['reason']}")
             stb = json.loads((self.tmp / "state.json").read_text())
             self.assertNotIn("launch_cmd", stb, f"{tag}: 格式不对不许起局")
+
+    def test_ab_prop_getprop_denied_fails_closed(self):
+        """--ab-prop 属性读被拒（rc=1、空输出）：起局前 → 拒跑不起局；收局读回被拒 → 不得当成已恢复，
+        还原失败、设备留置（原值为空时 rc=1 的空串恰与原值相等，最容易假绿）。"""
+        _, out, _ = self.run_tool(state={"getprop_deny": ["debug.s2a.vsync"]},
+                                  argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_deny")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "读不到原值不许起局")
+        rc, out2, _ = self.run_tool(state={"getprop_deny_after_launch": ["debug.s2a.vsync"]},
+                                    argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_deny2")
+        self.assertNotEqual(0, rc)
+        man = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("debug.s2a.vsync", man["reason"], man["reason"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(), "恢复读回失败要留置")
 
     def test_checkpoint_apply_and_verify(self):
         """检查点正路：宿主核过 → push → run-as tar 解进 saves/<tid>/ryujinx-android
