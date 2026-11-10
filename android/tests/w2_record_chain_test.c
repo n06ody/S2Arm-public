@@ -177,6 +177,29 @@ int main(int argc,char **argv) {
         int was_armed = 0;
         for (int s = 0; s < NVK_PHASE_SEGS; s++) was_armed |= phits[s] != 0;
         assert(samp2 == psamp + 65 + (was_armed ? 1 : 0) && lines2 == plines + 1);
+        // wall 与段同单位（CLOCK_MONOTONIC ns）：shim 挂点成对 wall_begin/wall_end，wall
+        // 由模块自取与段同一个钟——同一 span 的 wall 与按 ns 喂的段必须同量级。
+        // 负控注入「假 CNTVCT 频率」：同一 span 按 19.2MHz tick 数喂 _wall（修复前形态，
+        // 8E 实测曾把 wall 列喂小 ~52 倍），断言累计 wall 增量掉到同量级之下——
+        // 即「wall≪段和」这条检测口径确实能把单位混喂照出来。
+        {
+            const uint64_t w0 = nvk_compute_phase_wall_total();
+            nvk_compute_phase_wall_begin();
+            nvk_compute_phase_begin();
+            const uint64_t spin0 = nvk_compute_phase_now();
+            uint64_t el = 0;
+            while (el < 3000000) el = nvk_compute_phase_now() - spin0;   // ~3ms 自旋
+            nvk_compute_phase_add(NVK_PHASE_RECORD, el);
+            nvk_compute_phase_wall_end();
+            const uint64_t w1 = nvk_compute_phase_wall_total();
+            assert(w1 - w0 >= el && w1 - w0 < el * 4 + 20000000);
+            const uint64_t fake_ticks = el * 19200000ull / 1000000000ull;   // 19.2MHz CNTVCT 同 span 的 tick 数
+            nvk_compute_phase_begin();
+            nvk_compute_phase_add(NVK_PHASE_RECORD, el);
+            nvk_compute_phase_wall(fake_ticks);
+            const uint64_t w2 = nvk_compute_phase_wall_total();
+            assert(w2 - w1 < el);   // tick 喂入使 wall 列 ~52 倍偏小 → 检测口径照出
+        }
     }
     struct s2a_record_compute_stats csstats;
     s2a_record_compute_snapshot(&csstats);

@@ -42,7 +42,12 @@ uint64_t nvk_compute_phase_now(void);
 void nvk_compute_phase_begin(void);                 // 新一笔起点；在途旧向量先按内部窗宽结算
 void nvk_compute_phase_add(int seg, uint64_t ns);   // 未起笔自动起（pass_break 缺席路径兜底）
 void nvk_compute_phase_flush(void);                 // 按内部窗宽结算当前笔（无 shim 挂点的路径）
-void nvk_compute_phase_wall(uint64_t op_wall_ns);   // opcode 墙钟结算（shim 挂点，unattr = wall-Σ）
+void nvk_compute_phase_wall(uint64_t op_wall_ns);   // opcode 墙钟结算（无 wall_begin/end 挂点的路径）
+// shim 挂点成对用：wall 由模块自取 CLOCK_MONOTONIC 与九段同钟同单位，span 与挂点的
+// opcode 墙钟同一区间。调用方不再喂计数值——历史上喂过 CNTVCT 原始 tick（差 ~52 倍）。
+void nvk_compute_phase_wall_begin(void);
+void nvk_compute_phase_wall_end(void);
+uint64_t nvk_compute_phase_wall_total(void);        // wall 累计 ns（宿主同单位断言用）
 // seg_sum = 每段累计 ns；seg_hits = 每段被计时的次数——「段是否走到」用 hits 判，
 // 时长在粗粒度钟下可合法为 0（<1 tick），不能用 ns>0 断言覆盖。
 void nvk_compute_phase_stats(uint64_t seg_sum[NVK_PHASE_SEGS], uint64_t seg_hits[NVK_PHASE_SEGS],

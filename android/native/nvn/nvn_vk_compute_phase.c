@@ -44,6 +44,7 @@ static int g_armed;
 // 窗口样本：0..8 = 九段，9 = wall（opcode 墙钟或内部窗宽），10 = unattr（wall-Σseg）。
 static uint64_t g_samp[NVK_PHASE_SEGS + 2][PHASE_CAP], g_wsum[NVK_PHASE_SEGS + 2];
 static unsigned g_n;
+static uint64_t g_wall_t0, g_wall_cum;
 static uint64_t g_cum[NVK_PHASE_SEGS], g_hits[NVK_PHASE_SEGS], g_samples, g_lines;
 static const char *const g_name[NVK_PHASE_SEGS + 2] = {
     "prep", "lookup", "parse", "alloc", "desc", "record", "submit", "wb", "dtor", "wall", "unattr"
@@ -86,6 +87,7 @@ static void settle(uint64_t wall_ns) {
         }
         g_wsum[NVK_PHASE_SEGS] += wall_ns;
         g_samp[NVK_PHASE_SEGS][g_n] = wall_ns;
+        g_wall_cum += wall_ns;
         const uint64_t unattr = wall_ns > sum ? wall_ns - sum : 0;
         g_wsum[NVK_PHASE_SEGS + 1] += unattr;
         g_samp[NVK_PHASE_SEGS + 1][g_n] = unattr;
@@ -118,6 +120,17 @@ void nvk_compute_phase_wall(uint64_t op_wall_ns) {
     if (!nvk_compute_phase_on() || !g_armed) return;
     settle(op_wall_ns);
 }
+void nvk_compute_phase_wall_begin(void) {
+    if (!nvk_compute_phase_on()) return;
+    g_wall_t0 = nvk_compute_phase_now();
+}
+void nvk_compute_phase_wall_end(void) {
+    if (!nvk_compute_phase_on() || !g_armed) return;
+    const uint64_t t0 = g_wall_t0;
+    g_wall_t0 = 0;
+    settle(nvk_compute_phase_now() - (t0 ? t0 : g_t0));
+}
+uint64_t nvk_compute_phase_wall_total(void) { return g_wall_cum; }
 void nvk_compute_phase_stats(uint64_t seg_sum[NVK_PHASE_SEGS], uint64_t seg_hits[NVK_PHASE_SEGS],
                              uint64_t *samples, uint64_t *lines) {
     if (seg_sum) memcpy(seg_sum, g_cum, sizeof g_cum);

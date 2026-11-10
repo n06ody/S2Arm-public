@@ -427,16 +427,21 @@ static int exec_chain(const uint8_t *pc, int depth) {
                 }
             }
         }
+        extern void nvk_compute_phase_wall_begin(void) __attribute__((weak));
+        extern void nvk_compute_phase_wall_end(void) __attribute__((weak));
+        const int phw = h.op == OP_DISPATCH && nvk_compute_phase_wall_begin && nvk_compute_phase_wall_end;
+        if (phw) nvk_compute_phase_wall_begin();
         uint64_t t0 = shim_ticks();
         int rc = s2a_vk_adapter_exec_guest(pc, h.size, &r);
         uint64_t dt = shim_ticks() - t0;
         g_frame_exec_ns += dt; g_frame_cmds++;
         if (h.op < 256) { g_op_ns[h.op] += dt; g_op_n[h.op]++; }
-        if (h.op == OP_DISPATCH) {
-            // compute_phase 结算点：dt 与 win_stats g_op_ns[27] 同口径——段和与它对账，
-            // 差额即未归属（pass_break 非等部分、状态填充、执行层出入、PSO 块、计时盲区）。
-            extern void nvk_compute_phase_wall(uint64_t) __attribute__((weak));
-            if (nvk_compute_phase_wall) nvk_compute_phase_wall(dt);
+        if (phw) {
+            // compute_phase 结算点：span 与 dt（win_stats g_op_ns[27]）同一区间，但 wall
+            // 由模块自取 CLOCK_MONOTONIC——与九段同钟同单位，段和与它对账，差额即未归属
+            // （pass_break 非等部分、状态填充、执行层出入、PSO 块、计时盲区）。
+            // 不喂 dt：dt 在 aarch64 上是 CNTVCT 原始 tick，曾把 wall 列喂错 ~52 倍。
+            nvk_compute_phase_wall_end();
         }
         g_commands++;
         if (rc != S2A_RECORD_OK) {
