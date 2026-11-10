@@ -1043,7 +1043,7 @@ static void fd_fence_put_back(VkDevice dev, VkFence fence);
 // GPU 逐 pass 计时（诊断，debug.s2a.gpu_time=1）：定义在 pass 缓存之后，pass 收尾更早用到。
 static int64_t fd_stamp(void);   // 关诊断时返回 0（定义在后）
 static void fd_gpu_pass_begin(struct s2a_vk_device *d, VkCommandBuffer cmd, uint32_t w, uint32_t h,
-                              VkFormat cfmt, VkFormat dfmt, int depth_only);
+                              VkFormat cfmt, VkFormat dfmt, int depth_only, uint64_t cser, uint64_t dser);
 static void fd_gpu_pass_end(VkCommandBuffer cmd);
 // 可写 graphics storage buffer 的帧内影子：同帧复用、帧退休回写。Vulkan 没有“把 GPU 写直接
 // 映射回 guest 内存”的借用语义，所以影子在 host-visible coherent 的 arena 上，fence 信号后
@@ -2354,7 +2354,7 @@ static int g_gpu_last_valid;
 // 逐 pass 计时：每帧固定槽位（2 个时间戳/pass），present 等到完成证明后一次性读回。
 // 只记 top（按耗时）与总量，不在这里做任何调度决策。
 #define FD_GPU_PASSES 96
-struct fd_gpu_pass { uint32_t w, h; int32_t cfmt, dfmt; uint32_t draws, blended, zdepth_off, blend_noop; uint64_t verts; uint8_t depth_only; char req[20]; };
+struct fd_gpu_pass { uint32_t w, h; int32_t cfmt, dfmt; uint32_t draws, blended, zdepth_off, blend_noop; uint64_t verts; uint8_t depth_only; char req[20]; uint64_t cser, dser; };
 static struct fd_gpu_pass g_gpu_meta[2][FD_GPU_PASSES];
 // 当前录制中 pass 的元数据（按 arm 奇偶取对应那一份）
 #define GPU_META_CUR (g_gpu_meta[(g_gpu_arm_parity >= 0 && g_gpu_arm_parity <= 1) ? g_gpu_arm_parity : 0][g_gpu_cur])
@@ -2366,6 +2366,17 @@ static int fd_gpu_enabled(void) {
         g_gpu_on = (b[0] && atoi(b) != 0) ? 1 : 0;
     }
     return g_gpu_on;
+}
+// 逐 pass 行补附件 serial（诊断，debug.s2a.gpu_pass_serial=1，默认关）：serial 在 pass 录制时
+// 免费拿到，只有打印时按开关拼进 ser/dser 两列；关时逐 pass 行与之前逐字节一致。
+static int fd_gpu_pass_serial_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        char b[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.s2a.gpu_pass_serial", b);
+        v = (b[0] && atoi(b)) ? 1 : 0;
+    }
+    return v;
 }
 static void fd_gpu_arm(struct s2a_vk_device *d, VkCommandBuffer cmd) {
     if (!fd_gpu_enabled() || g_gpu_armed || !d || !d->device || !cmd) return;
@@ -2397,7 +2408,7 @@ static void fd_gpu_arm(struct s2a_vk_device *d, VkCommandBuffer cmd) {
 // pass 开始：在 begin 之前写 t0（槽 g_gpu_npass*2-1 已用于帧起点，pass 用 2..）。
 static void fd_gpu_pass_begin(struct s2a_vk_device *d, VkCommandBuffer cmd,
                               uint32_t w, uint32_t h, VkFormat cfmt, VkFormat dfmt,
-                              int depth_only) {
+                              int depth_only, uint64_t cser, uint64_t dser) {
     (void)d;
     int p = g_gpu_arm_parity;
     if (!fd_gpu_enabled() || !g_gpu_armed || !cmd || p < 0 || p > 1 || !g_gpu_pool[p]) return;
@@ -2407,6 +2418,7 @@ static void fd_gpu_pass_begin(struct s2a_vk_device *d, VkCommandBuffer cmd,
     if (g_gpu_frame_parity >= 0) g_gpu_frame_passes[g_gpu_frame_parity]++;
     g_gpu_meta[p][idx].w = w; g_gpu_meta[p][idx].h = h;
     g_gpu_meta[p][idx].cfmt = (int32_t)cfmt; g_gpu_meta[p][idx].dfmt = (int32_t)dfmt;
+    g_gpu_meta[p][idx].cser = cser; g_gpu_meta[p][idx].dser = dser;
     g_gpu_meta[p][idx].depth_only = (uint8_t)depth_only; g_gpu_meta[p][idx].draws = 0;
     g_gpu_meta[p][idx].blended = 0; g_gpu_meta[p][idx].zdepth_off = 0; g_gpu_meta[p][idx].blend_noop = 0;
     g_gpu_meta[p][idx].verts = 0; g_gpu_meta[p][idx].req[0] = 0;
@@ -2469,13 +2481,19 @@ int nvn_vk_first_draw_gpu_read_frame(struct s2a_vk_device *d, int parity, const 
                 int best = -1; double bv = 0;
                 for (int i = 1; i < np; i++) if (dur[i] > bv) { bv = dur[i]; best = i; }
                 if (best < 0 || bv < 0.05) break;
-                FD_LOG("gpu pass #%d %.2f ms %ux%u cfmt=%d dfmt=%d depth_only=%d draws=%u blended=%u zdepth_off=%u blend_noop=%u verts=%llu req=%.12s",
+                char ser[64] = "";
+                if (fd_gpu_pass_serial_on())
+                    snprintf(ser, sizeof ser, " ser=%llu dser=%llu",
+                             (unsigned long long)g_gpu_meta[parity][best].cser,
+                             (unsigned long long)g_gpu_meta[parity][best].dser);
+                FD_LOG("gpu pass #%d %.2f ms %ux%u cfmt=%d dfmt=%d depth_only=%d draws=%u blended=%u zdepth_off=%u blend_noop=%u verts=%llu req=%.12s%s",
                        best, bv, g_gpu_meta[parity][best].w, g_gpu_meta[parity][best].h,
                        (int)g_gpu_meta[parity][best].cfmt, (int)g_gpu_meta[parity][best].dfmt,
                        (int)g_gpu_meta[parity][best].depth_only, g_gpu_meta[parity][best].draws,
                        g_gpu_meta[parity][best].blended, g_gpu_meta[parity][best].zdepth_off,
                        g_gpu_meta[parity][best].blend_noop,
-                       (unsigned long long)g_gpu_meta[parity][best].verts, g_gpu_meta[parity][best].req);
+                       (unsigned long long)g_gpu_meta[parity][best].verts, g_gpu_meta[parity][best].req,
+                       ser);
                 dur[best] = 0;
             }
         }
@@ -2523,11 +2541,16 @@ void nvn_vk_first_draw_gpu_read(struct s2a_vk_device *d, const char *where) {
                 int best = -1; double bv = 0;
                 for (int i = 1; i < g_gpu_npass[pp]; i++) if (dur[i] > bv) { bv = dur[i]; best = i; }
                 if (best < 0 || bv < 0.05) break;
-                FD_LOG("gpu pass #%d %.2f ms %ux%u cfmt=%d dfmt=%d depth_only=%d draws=%u blended=%u zdepth_off=%u blend_noop=%u verts=%llu req=%.12s", best, bv,
+                char ser[64] = "";
+                if (fd_gpu_pass_serial_on())
+                    snprintf(ser, sizeof ser, " ser=%llu dser=%llu",
+                             (unsigned long long)g_gpu_meta[pp][best].cser,
+                             (unsigned long long)g_gpu_meta[pp][best].dser);
+                FD_LOG("gpu pass #%d %.2f ms %ux%u cfmt=%d dfmt=%d depth_only=%d draws=%u blended=%u zdepth_off=%u blend_noop=%u verts=%llu req=%.12s%s", best, bv,
                        g_gpu_meta[pp][best].w, g_gpu_meta[pp][best].h, (int)g_gpu_meta[pp][best].cfmt,
                        (int)g_gpu_meta[pp][best].dfmt, (int)g_gpu_meta[pp][best].depth_only, g_gpu_meta[pp][best].draws,
                        g_gpu_meta[pp][best].blended, g_gpu_meta[pp][best].zdepth_off, g_gpu_meta[pp][best].blend_noop,
-                       (unsigned long long)g_gpu_meta[pp][best].verts, g_gpu_meta[pp][best].req);
+                       (unsigned long long)g_gpu_meta[pp][best].verts, g_gpu_meta[pp][best].req, ser);
                 dur[best] = 0;
             }
         }
@@ -2916,7 +2939,8 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
                          const VkFormat *color_fmts, uint32_t color_count, uint32_t color_attachment_count,
                          VkImage depth, VkImageView depth_view, VkFormat dfmt,
                          uint32_t w, uint32_t h, int depth_only, uint32_t clear_mask,
-                         float depth_clear_value, float stencil_clear_value) {
+                         float depth_clear_value, float stencil_clear_value,
+                         uint64_t cser, uint64_t dser) {
     // 查询页选择/回收会 flush 帧队列（封口并提交当前批次命令缓冲）：必须在取命令缓冲之前做，
     // 否则会把本 pass 正要录制的那条缓冲提交掉，再往上录命令 = 驱动崩溃。
     {
@@ -3076,7 +3100,7 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
     nvn_vk_callring_add("begin rp=%p fb=%p cv=%p dv=%p %ux%u clear=%u do=%d",
                         (void *)pass, (void *)fb, (void *)first_view, (void *)depth_view,
                         w, h, rpbi.clearValueCount, depth_only);
-    fd_gpu_pass_begin(d, cmd, w, h, first_fmt, dfmt, depth_only);   // 诊断：本 pass 的 GPU 起始时间戳
+    fd_gpu_pass_begin(d, cmd, w, h, first_fmt, dfmt, depth_only, cser, dser);   // 诊断：本 pass 的 GPU 起始时间戳
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     int64_t tp3 = fd_now_ns();
     __atomic_fetch_add(&g_rp_t_rest, (uint64_t)(tp3 - tp2), __ATOMIC_RELAXED);
@@ -5893,7 +5917,9 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
                               mrt_plan.color_count, color_attachment_count,
                               depth_tex ? depth_tex->image : VK_NULL_HANDLE,
                               depth_att, depth_fmt, fw, fh,
-                              depth_only, clear_mask, state->depth_clear, state->stencil_clear);
+                              depth_only, clear_mask, state->depth_clear, state->stencil_clear,
+                              mrt_plan.first_slot != UINT32_MAX ? rt_serials[mrt_plan.first_slot] : 0,
+                              depth_tex ? depth_tex->serial : 0);
             { int64_t t_open1 = fd_stamp();
               if (t_open0 && t_open1) { atomic_fetch_add(&g_ns_open_call, (uint64_t)(t_open1 - t_open0)); atomic_fetch_add(&g_ns_open_call_n, 1); } }
             if (fd_pb_rc) {
