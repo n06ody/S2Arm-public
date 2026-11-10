@@ -22,11 +22,14 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
   降级（原包 > 新包）由 `install -r -d` 实测（失败即拒，装失败不卸旧包）；装回方向
   的降级（原包 < 新包）入局前证不了能装回 → 连拉/装都不做，直接拒跑（qa-fone：
   先升级入局、收局再试降级 = 装了赌能降回去）。
-- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
-  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
-  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）；归档先解包
-  与源清单逐项核对，对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端
-  全量复核。存在但 run-as 进不去的目录报错拒跑，不当不存在。
+- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 tar 流式拉回
+  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 到 --backup-dir（默认 <out>/data-backup，
+  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）。访问通道
+  按目录归属：私有树 run-as（应用 uid 才够权），外部目录 shell（9000 实测 run-as
+  碰 /sdcard/Android/* 被 SELinux 拒）；流式分块落盘边算 sha，不整进宿主内存
+  （9000 私有树 ~7.3GB，capture_output 会爆）。归档先解包与源清单逐项核对，
+  对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端全量复核。
+  存在但进不去的目录报错拒跑，不当不存在。
   已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
   （私有数据、已并入资源不还原，manifest 写明）。
 - 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
@@ -43,7 +46,7 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
-import argparse, datetime, hashlib, json, os, posixpath, re, shlex, shutil, signal, subprocess, sys, tarfile, time, uuid
+import argparse, datetime, hashlib, json, os, posixpath, re, selectors, shlex, shutil, signal, subprocess, sys, tarfile, tempfile, time, uuid
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -121,13 +124,23 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
-LINK_MAP_CMD = ("cd {q} && find . -type l -exec sh -c "
-                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _ {{}} +")
+# 目录清单三件套：find -exec {} + 会把全部路径摊进一次 exec——4 万文件的私有树
+# 触发 toybox E2BIG（Argument list too long，9000 实测；与 deploy_game 核验同病
+# 同治）：改 find -print0 | xargs -0 -n 256 分批。收尾 S2A_RC=xargs rc +
+# S2A_N=find 计数——xargs 任何一批失败（rc=123/126）或清单条数与计数不符都
+# 算半截清单，不当完整用。
+SHA_MAP_CMD = ("cd {q} && {{ find . -type f -print0 | xargs -0 -n 256 sha256sum; "
+               "echo S2A_RC=$?; echo S2A_N=$(find . -type f | wc -l); }}")
+STAT_MAP_CMD = ("cd {q} && {{ find . -mindepth 1 -print0 | xargs -0 -n 256 "
+                "stat -c '%a|%F|%n'; echo S2A_RC=$?; "
+                "echo S2A_N=$(find . -mindepth 1 | wc -l); }}")
+LINK_MAP_CMD = ("cd {q} && {{ find . -type l -print0 | xargs -0 -n 256 sh -c "
+                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _; "
+                "echo S2A_RC=$?; echo S2A_N=$(find . -type l | wc -l); }}")
 
 
-def _entry_map(sha_text, stat_text, link_text):
-    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}。rel 去掉 ./ 前缀。"""
+def _stat_map(stat_text):
+    """stat -c '%a|%F|%n' 清单 → {rel: {t, mode}}。rel 去掉 ./ 前缀。"""
     entries = {}
     for ln in stat_text.splitlines():
         ln = ln.strip()
@@ -145,29 +158,74 @@ def _entry_map(sha_text, stat_text, link_text):
              "character special file": "c",
              "block special file": "b"}.get(ftype, ftype)
         entries[rel] = {"t": t, "mode": int(mode, 8)}
-    for rel, sha in _sha_listing(sha_text).items():
-        if rel in entries:
-            entries[rel]["sha"] = sha
+    return entries
+
+
+def _link_map(link_text):
+    """软链清单（path<TAB>target 行）→ {rel: target}。"""
+    links = {}
     for ln in link_text.splitlines():
         if "\t" not in ln:
             continue
         name, target = ln.split("\t", 1)
         rel = posixpath.normpath(name.strip())
+        if rel in ("", "."):
+            continue
+        links[rel] = target
+    return links
+
+
+def _entry_map(sha_map, stat_map, link_map):
+    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}（stat 为主集）。"""
+    entries = {rel: dict(e) for rel, e in stat_map.items()}
+    for rel, sha in sha_map.items():
+        if rel in entries:
+            entries[rel]["sha"] = sha
+    for rel, target in link_map.items():
         if rel in entries:
             entries[rel]["target"] = target
     return entries
 
 
+def _listing_parts(text, what):
+    """分批清单输出 → (清单文本, find 计数)。收尾 S2A_RC/S2A_N 缺一或
+    xargs rc≠0 → RuntimeError（半截清单不当完整）。"""
+    lines, rc, want = [], None, None
+    for ln in text.splitlines():
+        if ln.startswith("S2A_RC="):
+            rc = ln[7:]
+        elif ln.startswith("S2A_N="):
+            want = ln[6:]
+        else:
+            lines.append(ln)
+    if rc != "0" or want is None:
+        raise RuntimeError(f"{what}清单未完整返回（xargs rc={rc}，find 计数={want}）："
+                           "半截不当全量")
+    return "\n".join(lines), int(want)
+
+
 def device_entries(d, pkg, dir_, raw=None):
     """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。
-    raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
-    sha_text = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
-                        timeout=300)
-    stat_text = d.run_as(pkg, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
-    link_text = d.run_as(pkg, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
+    三份清单各走 -print0|xargs -n 256 分批（E2BIG），每批 rc=0 且解析条目数与
+    find 计数一致才算完整。raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
+    q = shlex.quote(dir_)
+    sha_text = _owner_sh(d, pkg, dir_, SHA_MAP_CMD.format(q=q), timeout=300)
+    stat_text = _owner_sh(d, pkg, dir_, STAT_MAP_CMD.format(q=q), timeout=300)
+    link_text = _owner_sh(d, pkg, dir_, LINK_MAP_CMD.format(q=q), timeout=300)
     if raw is not None:
         raw.update(sha256sum=sha_text, stat=stat_text, links=link_text)
-    return _entry_map(sha_text, stat_text, link_text)
+    sha_text, sha_want = _listing_parts(sha_text, "文件 sha ")
+    stat_text, stat_want = _listing_parts(stat_text, "stat ")
+    link_text, link_want = _listing_parts(link_text, "软链 ")
+    sha_map, stat_map, link_map = (_sha_listing(sha_text),
+                                   _stat_map(stat_text), _link_map(link_text))
+    bad = [f"{w}{have}≠{want}" for w, have, want in
+           (("文件 sha ", len(sha_map), sha_want),
+            ("stat ", len(stat_map), stat_want),
+            ("软链 ", len(link_map), link_want)) if have != want]
+    if bad:
+        raise RuntimeError(f"{dir_} 目录清单不完整（{'；'.join(bad)}）：半截不当全量")
+    return _entry_map(sha_map, stat_map, link_map)
 
 
 def tar_entries(tar_path):
@@ -181,9 +239,12 @@ def tar_entries(tar_path):
             if rel in ("", "."):
                 continue
             if mem.isfile():
-                data = tf.extractfile(mem).read()
+                h = hashlib.sha256()
+                with tf.extractfile(mem) as ef:
+                    for block in iter(lambda: ef.read(1 << 20), b""):
+                        h.update(block)          # 大成员分块算，不整驻宿主内存
                 entries[rel] = {"t": "f", "mode": mem.mode & 0o7777,
-                                "sha": hashlib.sha256(data).hexdigest()}
+                                "sha": h.hexdigest()}
             elif mem.isdir():
                 entries[rel] = {"t": "d", "mode": mem.mode & 0o7777}
             elif mem.issym():
@@ -229,18 +290,33 @@ def _sha_listing(text):
     return files
 
 
+def _is_private_tree(pkg, dir_):
+    """应用私有树 = /data/data/<pkg> 及其子路径——只有它走 run-as。"""
+    root = f"/data/data/{pkg}"
+    return dir_ == root or dir_.startswith(root + "/")
+
+
+def _owner_sh(d, pkg, dir_, cmd, timeout=120):
+    """数据目录访问通道：私有树走 run-as（应用 uid 才够权）；
+    其余目录（/sdcard/Android/* 外部数据）走 shell——9000 实测 run-as 碰外部
+    目录被 SELinux 拒，而 shell 有外部存储全权。命令本体与判读口径不变。"""
+    if _is_private_tree(pkg, dir_):
+        return d.run_as(pkg, cmd, timeout=timeout)
+    return d.shell(cmd, timeout=timeout)
+
+
 def _dir_probe(d, pkg, dir_):
     """三态探针：ok=可访问 / absent=不存在 / denied=证不了（进不去或父目录
     不可搜索）。`[ -e ]` 是假三态——父目录不可搜索时它和「不存在」一样返回
     假（qa-fone 受限父目录实测）：必须用 stat 接 stderr 分 EACCES/ENOENT，
     分辨不了的一律 denied，绝不静默跳过。"""
     q = shlex.quote(dir_)
-    out = d.run_as(pkg, f"e=$(stat -c %F {q} 2>&1); "
-                        f"if [ $? -eq 0 ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
-                        f"then echo ok; else echo denied; fi; else "
-                        f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo denied;; "
-                        f"*\"No such\"*|*ENOENT*) echo absent;; *) echo denied;; esac; fi",
-                   timeout=30).strip().splitlines()
+    out = _owner_sh(d, pkg, dir_, f"e=$(stat -c %F {q} 2>&1); "
+                    f"if [ $? -eq 0 ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
+                    f"then echo ok; else echo denied; fi; else "
+                    f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo denied;; "
+                    f"*\"No such\"*|*ENOENT*) echo absent;; *) echo denied;; esac; fi",
+                    timeout=30).strip().splitlines()
     return out[-1].strip() if out else "denied"
 
 
@@ -254,11 +330,50 @@ def _verify_tar(manifest, backup_dir, tag):
         return [f"归档解不开：{error}"]
 
 
+def _exec_out_stream(d, cmd_args, dest, timeout=600):
+    """exec-out 字节流分块落盘、边写边算 sha——不把整份备份读进宿主内存
+    （9000 私有树实测 ~7.3GB，capture_output 直接爆内存）。stderr 落临时文件，
+    防设备端报错输出填满管道互锁。超时/异常杀子进程、删半截归档再抛。
+    返回 (字节数, sha256, rc, stderr 文本)。"""
+    sel = selectors.DefaultSelector()
+    err_f = tempfile.TemporaryFile()
+    p = subprocess.Popen([*d.argv, "exec-out", *cmd_args],
+                         stdout=subprocess.PIPE, stderr=err_f)
+    h, nbytes = hashlib.sha256(), 0
+    deadline = time.monotonic() + timeout
+    try:
+        sel.register(p.stdout, selectors.EVENT_READ)
+        with open(dest, "wb") as fh:
+            while True:
+                if not sel.select(max(0.0, deadline - time.monotonic())):
+                    raise subprocess.TimeoutExpired(cmd_args, timeout)
+                chunk = p.stdout.read1(1 << 22)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                h.update(chunk)
+                nbytes += len(chunk)
+        rc = p.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except BaseException:
+        p.kill()
+        p.wait()
+        dest.unlink(missing_ok=True)
+        raise
+    finally:
+        sel.close()
+        p.stdout.close()
+    err_f.seek(0)
+    err = err_f.read().decode(errors="replace").strip()
+    err_f.close()
+    return nbytes, h.hexdigest(), rc, err
+
+
 def backup_data(d, pkg, dest):
-    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + 全量清单
-    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。归档落盘后先解包与源清单
-    逐项核对——对不上即 Refuse（保证不了还原就不入局）；存在但不可访问的目录
-    报错而不是当不存在。"""
+    """debuggable 原包的私有 / 外部数据 → exec-out tar 流式拉回 + 全量清单
+    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。通道按目录归属：私有树
+    run-as（应用 uid），外部目录 shell（9000 实测 run-as 碰 /sdcard/Android/*
+    被 SELinux 拒）。归档落盘后先解包与源清单逐项核对——对不上即 Refuse
+    （保证不了还原就不入局）；存在但不可访问的目录报错而不是当不存在。"""
     dest.mkdir(parents=True)
     manifest = {"schema": 2, "package": pkg, "dirs": {}}
     for tag, tpl in DATA_DIRS:
@@ -270,14 +385,15 @@ def backup_data(d, pkg, dest):
             raise Refuse(f"{dir_} 目录状态证不了（存在但进不去或父目录不可搜索）："
                          f"证不了也备不了，不动这台设备")
         tar = dest / f"{tag}.tar"
-        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
-        r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
-                            f"tar -cpf - -C {shlex.quote(dir_)} ."],
-                           capture_output=True, timeout=600)
-        if r.returncode or not r.stdout:
-            raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
-        tar.write_bytes(r.stdout)
-        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": sha256(tar),
+        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给私有树 debuggable 包
+        cmd_ = f"tar -cpf - -C {shlex.quote(dir_)} ."
+        args_ = (["run-as", pkg, "sh", "-c", cmd_] if _is_private_tree(pkg, dir_)
+                 else ["sh", "-c", cmd_])
+        nbytes, digest, rc, err = _exec_out_stream(d, args_, tar, timeout=600)
+        if rc or not nbytes:
+            raise Refuse(f"{dir_} 备份失败 rc={rc}（run-as/tar 不可用就当非 debuggable 拒跑）"
+                         + (f"：{err[:160]}" if err else ""))
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": digest,
                                  "entries": device_entries(d, pkg, dir_)}
         bad = _verify_tar(manifest, dest, tag)
         if bad:
@@ -313,11 +429,12 @@ def restore_data(d, pkg, manifest, backup_dir):
     for tag, info in manifest["dirs"].items():
         dir_ = info["dir"]
         try:
-            d.run_as(pkg, f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
-                     timeout=120)
+            _owner_sh(d, pkg, dir_,
+                      f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
+                      timeout=120)
             tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
             d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
-            d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            _owner_sh(d, pkg, dir_, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
             d.shell(f"rm -f {tmp}", allowed=(0, 1))
             bad = entries_diff(info["entries"], device_entries(d, pkg, dir_))
             if bad:
