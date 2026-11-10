@@ -57,7 +57,9 @@ if [[ ${PRESENT_SETTINGS_BUILD_ONLY:-0} == 1 ]]; then
     exit 0
 fi
 
-bad=0
+# 各格 edge 图跨跑残留：格没跑成时旧图会让 distinctions 假绿——先清
+rm -f "$out"/mtl?-*/edge-*.bgra
+bad=0; unproven=0; unpr=' '
 for backend in mtl3 mtl4; do
     for aa in None SmaaMedium SmaaHigh; do
         for filter in Nearest Bilinear MetalFX; do
@@ -79,6 +81,8 @@ for backend in mtl3 mtl4; do
                 echo "说明 ${name}：macOS $(sw_vers -productVersion) 的 Metal 调试层不支持 Metal 4 + MetalFX，本格不开调试层（macOS 27 起照开）"; fi
             status=0
             "${run_env[@]}" "$out/t_present_settings" "$runtime" > "$runtime/run.log" 2>&1 || status=$?
+            # 77 = 宿主显示环境未证（屏睡/非活动 Space）：记未证不计红，见 t_present_settings.m 探针
+            if [[ "$status" == 77 ]]; then unpr+="$name "; unproven=$((unproven+1)); printf 'UNPROVEN %s（宿主显示环境未证）\n' "$name"; continue; fi
             ok=1
             [[ "$status" == 0 ]] || ok=0
             if [[ "$backend" == mtl3 ]]; then expected='direct backend: Metal 3 (forced by NXGAL_BE=mtl3)'
@@ -101,25 +105,30 @@ for backend in mtl3 mtl4; do
         done
     done
 done
-distinctions=0
+distinctions=0; dskip=0
 for backend in mtl3 mtl4; do
     modes=(None SmaaMedium SmaaHigh)
     for ((i=0;i<3;i++)); do
         for ((j=i+1;j<3;j++)); do
             a="$out/$backend-${modes[i]}-Nearest/edge-native.bgra"
             b="$out/$backend-${modes[j]}-Nearest/edge-native.bgra"
-            if [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
+            if [[ "$unpr" == *" $backend-${modes[i]}-Nearest "* || "$unpr" == *" $backend-${modes[j]}-Nearest "* ]]; then dskip=$((dskip+1))
+            elif [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
             else printf 'FAIL %s AA outputs not distinct: %s / %s\n' "$backend" "${modes[i]}" "${modes[j]}" >&2; fi
         done
         a="$out/$backend-${modes[i]}-Nearest/edge-scaled.bgra"
         b="$out/$backend-${modes[i]}-Bilinear/edge-scaled.bgra"
-        if [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
+        if [[ "$unpr" == *" $backend-${modes[i]}-Nearest "* || "$unpr" == *" $backend-${modes[i]}-Bilinear "* ]]; then dskip=$((dskip+1))
+        elif [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
         else printf 'FAIL %s %s filters produce identical pixels\n' "$backend" "${modes[i]}" >&2; fi
         a="$out/$backend-${modes[i]}-MetalFX/edge-scaled.bgra"
-        if [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
+        b="$out/$backend-${modes[i]}-Bilinear/edge-scaled.bgra"
+        if [[ "$unpr" == *" $backend-${modes[i]}-MetalFX "* || "$unpr" == *" $backend-${modes[i]}-Bilinear "* ]]; then dskip=$((dskip+1))
+        elif [[ -s "$a" && -s "$b" ]] && ! cmp -s "$a" "$b"; then distinctions=$((distinctions+1))
         else printf 'FAIL %s %s MetalFX and Bilinear produce identical pixels\n' "$backend" "${modes[i]}" >&2; fi
     done
 done
-printf 'present settings matrix: %d/18 passed (logs/images: %s)\n' "$((18-bad))" "$out"
-printf 'present settings output distinctions: %d/18 passed\n' "$distinctions"
-[[ "$bad" == 0 && "$distinctions" == 18 ]]   # 每个后端：3 种模式两两 3 对 + 每模式最近邻对双线性 3 次 + MetalFX 对双线性 3 次 = 9，两个后端 18（10-30 去掉 FXAA 前 4 种模式是 28）
+printf 'present settings matrix: %d/18 passed, %d unproven (logs/images: %s)\n' "$((18-bad-unproven))" "$unproven" "$out"
+printf 'present settings output distinctions: %d/18 passed, %d skipped\n' "$distinctions" "$dskip"
+if ((unproven)); then printf 'present settings: %d cells 未证（宿主显示环境不给真上屏位）\n' "$unproven"; fi
+[[ "$bad" == 0 && $((distinctions+dskip)) == 18 ]]   # 每个后端：3 种模式两两 3 对 + 每模式最近邻对双线性 3 次 + MetalFX 对双线性 3 次 = 9，两个后端 18；未证格的对子计 skip 不判（10-30 去掉 FXAA 前 4 种模式是 28）

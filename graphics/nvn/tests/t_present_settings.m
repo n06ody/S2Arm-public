@@ -448,8 +448,22 @@ static void run(void) {
             "final independent platform/ring table: mismatches=%d confirmed sync=%d async=%d unconfirmed=%d",
             mismatches,finalSync,finalAsync,unconfirmed);
         printf("present settings: %d/%d passed; AA=%s filter=%s; pixels=actual CAMetalLayer drawable + production grab\n",checked-failed,checked,aa,filter);
+        printf("%s t_present_settings\n", failed ? "✗" : "✓");   // 门禁结论行（t_result_lint）
         exit(failed?1:0);
     }
+}
+
+// 宿主显示环境探针：屏睡/无活动屏时 WindowServer 撤掉所有窗口的
+// NSWindowOcclusionStateVisible 位（与焦点无关——无人值守跑门禁必中）。此时
+// 「真 drawable 到达可见显示」本就不成立，格记「未证」退 77 而非红。
+// S2A_PS_ENV 是测试缝：sleep=模拟屏睡（早探针、不建窗口），offspace=模拟窗口
+// 不在活动 Space（走 500ms 晚探针），awake=钉醒（配 S2A_PS_WINDOW 验红路仍通）。
+static int displayEnvUnproven(void) {
+    const char *sim = getenv("S2A_PS_ENV");
+    if (sim) return !strcmp(sim, "sleep");
+    uint32_t count = 0;
+    CGGetActiveDisplayList(0, NULL, &count);
+    return count == 0 || CGDisplayIsAsleep(CGMainDisplayID());
 }
 
 int main(int argc, const char **argv) {
@@ -461,6 +475,7 @@ int main(int argc, const char **argv) {
     if(!presentationLog) { perror("presentation observations"); return 1; }
     fprintf(presentationLog,"event\tsequence\tticket\tdrawable_id\tdrawable_address\tcallbacks\tacquired_at\tcallback_at\tplatform_time\tsampled_time\tproduction_time\tnow\n");
     if(setenv("S2A_GFX","direct",1) || s2a_gfx_mode()!=S2A_GFX_DIRECT) return 1;
+    if(displayEnvUnproven()) { printf("未证：宿主显示休眠（无活动屏或主屏睡眠），本格不给真上屏结论\n"); exit(77); }
     dispatch_async(dispatch_get_main_queue(), ^{
         layer=(__bridge CAMetalLayer *)s2a_mac_front_layer();
         CHECK(layer && front_metal_layer()==(__bridge void *)layer,"production Mac CAMetalLayer");
@@ -475,8 +490,16 @@ int main(int argc, const char **argv) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,500*NSEC_PER_MSEC),dispatch_get_main_queue(), ^{
             NSWindow *window=nil;
             for(NSWindow *candidate in NSApp.windows) if(candidate.contentView.layer==layer) { window=candidate; break; }
-            CHECK(window && (window.occlusionState & NSWindowOcclusionStateVisible),"production window is visible");
-            if(!window || !(window.occlusionState & NSWindowOcclusionStateVisible)) exit(1);
+            const char *sim=getenv("S2A_PS_ENV");
+            BOOL offSpace = sim ? !strcmp(sim,"offspace") : (window && ![window isOnActiveSpace]);
+            if(displayEnvUnproven() || offSpace) {
+                printf("未证：宿主显示休眠或窗口不在活动 Space\n"); exit(77);
+            }
+            BOOL visible=window && (window.occlusionState & NSWindowOcclusionStateVisible);
+            const char *simw=getenv("S2A_PS_WINDOW");      // 测试缝：occluded=钉真不可见，验原检查红路仍通
+            if(simw && !strcmp(simw,"occluded")) visible=NO;
+            CHECK(window && visible,"production window is visible");
+            if(!window || !visible) exit(1);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{ run(); });
         });
     });
