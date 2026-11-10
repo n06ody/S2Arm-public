@@ -17,6 +17,8 @@ manifest generator and the pusher. A development run is no reading and no formal
          baseApkSha256 (Java changed: reinstall that APK first).
       3. stop: --activity-single-top --ez s2arm.finish true (graceful: the shader cache is exported),
          wait for the process to exit; force-stop only after 5 s (recorded as forced_stop).
+         With wait_done= the graceful-shutdown dump (frame-log chunks) is awaited first
+         (bounded) — force-stopping mid-dump truncates the block.
       4. push to /data/local/tmp, run-as copy into files/dev-runtime/<sha>/ (.tmp then mv), chmod 0444
          the files and 0555 the directory, check the SHA on the device, remove the /data/local/tmp copies.
          --clean first removes the other files/dev-runtime/* (chmod -R u+w, then rm: 0555 directories
@@ -233,18 +235,36 @@ def push(args):
     return rc
 
 
-def stop(d, pkg):
+def stop(d, pkg, wait_done=None, wait_seconds=20):
     pid = d.shell(f"pidof {pkg}", allowed=(0, 1)).strip()
     if not pid:
         return {"was_running": False}
     d.shell(f"am start --activity-single-top -n {pkg}/{ACTIVITY} --ez s2arm.finish true")
+    seen = None
+    if wait_done is not None:
+        # 优雅退出触发适配器 shutdown 转储（帧日志分片）：写完前 force-stop /
+        # 进程组随收局退出都会截断块。等 wait_done()（wait_seconds 上限）再验死
+        # 强杀；谓词自身负责把「当局进程全退」也当落定（都死了转储不会再长）。
+        seen = False
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            if wait_done():
+                seen = True
+                break
+            time.sleep(0.5)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if not d.shell(f"pidof {pkg}", allowed=(0, 1)).strip():
-            return {"was_running": True, "pid": pid, "forced_stop": False}
+            result = {"was_running": True, "pid": pid, "forced_stop": False}
+            if seen is not None:
+                result["dump_done"] = seen
+            return result
         time.sleep(0.25)
     d.shell(f"am force-stop {pkg}")
-    return {"was_running": True, "pid": pid, "forced_stop": True}
+    result = {"was_running": True, "pid": pid, "forced_stop": True}
+    if seen is not None:
+        result["dump_done"] = seen
+    return result
 
 
 def verdict(d, sha, seconds=20):

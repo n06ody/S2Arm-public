@@ -91,6 +91,10 @@ s2a_gate_step bash "$android_dir/tools/nvn_vk_frame_log_test.sh"
 s2a_gate_step bash "$android_dir/tools/generic_frame_trace_test.sh"
 # 转储解析器（宿主，确定性）：分片拼回/完整性拒绝、全窗统计、与 16 帧聚合行对拍、C→python 对拍。
 s2a_gate_step "$PY" "$android_dir/tests/direct_framelog_test.py"
+# 设备锁与起局最小闭环（宿主，确定性；adb 替身不起真机）：锁并发/失效/留置、还原失败保留锁、
+# 局目录被 tools/quality_check.py 安卓分支判读。
+s2a_gate_step "$PY" "$android_dir/tests/device_lock_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/run_game_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_refresh_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_touch_generation_test.py"
 # 通用模式编译事件：原生文件生成、丢弃负控及读取器完整性校验。

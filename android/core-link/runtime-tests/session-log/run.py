@@ -3,6 +3,7 @@
 """真实 os.c/runtime 启动 sink：Linux host 描述符测试，不代表 Android/NativeAOT 真机验收。"""
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 
@@ -15,7 +16,8 @@ root = pathlib.Path(__file__).resolve().parents[4]
 out = a.out.resolve()
 out.mkdir(parents=True, exist_ok=True)
 flags = [a.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread'] + a.cflag
-for d in ['runtime/include', 'runtime/src', 'android/native', 'android/native/runtime']:
+for d in ['runtime/include', 'runtime/src', 'android/native', 'android/native/runtime',
+          'android/core-link/runtime-tests/session-log/hoststub']:
     flags += ['-I', str(root / d)]
 objects = []
 for source, extra in [
@@ -29,6 +31,9 @@ for source, extra in [
     ('android/native/direct/json.c', []),
     ('android/native/direct/sha256.c', []),
     ('android/native/direct/s2a_direct_abi.c', []),
+    # 系统属性替身：os.c 的 debug.s2a.session_uuid 读取——语义同真 bionic
+    #（缺→0、有→拷值返回长度），取值来自用例注入的同名环境变量。
+    ('android/core-link/runtime-tests/session-log/hoststub/system_properties_stub.c', []),
 ]:
     obj = out / (pathlib.Path(source).stem + '.o')
     subprocess.run(flags + extra + ['-c', str(root / source), '-o', str(obj)], check=True)
@@ -36,19 +41,28 @@ for source, extra in [
 exe = out / 'session-log'
 subprocess.run(flags + objects + ['-o', str(exe)], check=True)
 results = []
-for case in ['success', 'missing-dir', 'partial-bind', 'invalid']:
+for case in ['success', 'missing-dir', 'partial-bind', 'invalid', 'uuid']:
     directory = out / case
     if case != 'missing-dir':
         directory.mkdir()
         (directory / 'host-old.log').write_text('previous session must survive\n')
-    r = subprocess.run([str(exe), case, str(directory)], capture_output=True, text=True, timeout=10)
+    env = dict(os.environ)
+    if case == 'uuid':
+        env['debug.s2a.session_uuid'] = 'TEST-UUID-9f'
+    r = subprocess.run([str(exe), 'success' if case == 'uuid' else case, str(directory)],
+                       capture_output=True, text=True, timeout=10, env=env)
     files = list(directory.glob('host-37-*.log'))
     text = files[0].read_text() if files else ''
     passed = r.returncode == 0
     if case == 'success':
         markers = ['Android 会话日志', 'FIRST_CORE_WINDOW', '[s2a] NATIVE_LOG', 'C_STDERR', 'C_STDOUT',
                    'SIGNAL_RAW_WRITE', 'NATIVE_AFTER_STDERR_REPLACED']
-        passed &= len(files) == 1 and all(x in text for x in markers) and '\npipe\n' not in text
+        # 属性没置上：首行 uuid=-（取证端据此判 unproven，不冒充本局）
+        passed &= len(files) == 1 and all(x in text for x in markers) and '\npipe\n' not in text \
+            and 'uuid=-' in text
+    elif case == 'uuid':
+        # 属性替身置上：首行 uuid 字段带本局号（与真机 setprop 同路径）
+        passed &= len(files) == 1 and 'uuid=TEST-UUID-9f' in text
     elif case == 'partial-bind':
         passed &= len(files) == 1 and 'FIRST_CORE_WINDOW' not in text
     else:
