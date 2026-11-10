@@ -1002,7 +1002,7 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
     帧记录 CLOCK_BOOTTIME，窗口边界同样取设备 /proc/uptime —— 同一时钟裁窗；
     不拿「最大完整块」当有效窗：块里窗口外的帧（启动期 / 收局后）不进表；
     覆盖事实（span / 首尾空档 / 占比）写进返回值，覆盖不足由判读者如实判。"""
-    header = "frame\tpresent_ns\tdisp_us\twall_us\n"
+    header = "frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n"
     (out / "frames.tsv").write_text(header)
     kept = []
     for cap in caps:
@@ -1018,15 +1018,25 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
     if kept:
         cap, rec = max(kept, key=lambda k: len(k[1]))
         first = int(cap["meta"]["first"])
+        # v5 记录的 disp_us/disp_seq：displayTiming 已确认的相邻帧上屏间隔，disp_seq
+        # 标明间隔属于哪个较新帧（与帧号同域 = first+i+1 基 present 序号）；读数比所属
+        # 帧晚到（落在当时正在写的记录上），按 seq 对号不按行序；未确认/旧版本（v2–v4）
+        # 留空——CPU present 间隔不冒充确认读数。
+        disp_by_seq = {}
+        if cap.get("disp_us") and cap.get("disp_seq"):
+            for i, (us, seq) in enumerate(zip(cap["disp_us"], cap["disp_seq"])):
+                if us is not None and seq is not None:
+                    disp_by_seq[seq] = us
         with (out / "frames.tsv").open("w") as f:
             f.write(header)
             for j in range(1, len(rec)):
                 (i0, t0), (i1, t1) = rec[j - 1], rec[j]
-                # stats() 同一口径：帧号 = 1 基 present 序号；
-                # disp_us 列 = 相邻 present 间隔（宿主算）——与 v5 记录的 disp_us
-                # 字段同名不同义：记录里是 displayTiming 设备侧确认间隔（可无值
-                # 0xffffffff），本列恒为相邻上屏差，供帧时/FPS 判读。
-                f.write(f"{first + i1 + 1}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}\n")
+                # stats() 同一口径：帧号 = 1 基 present 序号；present_us/wall_us =
+                # 相邻 present 间隔（宿主算，CPU 口径）；disp_us/disp_seq 只写实测确认值。
+                n = first + i1 + 1
+                du = disp_by_seq.get(n)
+                f.write(f"{n}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}"
+                        + (f"\t{du}\t{n}\n" if du is not None else "\t\t\n"))
                 rows += 1
         if window_us:
             w0, w1 = window_us

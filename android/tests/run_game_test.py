@@ -813,13 +813,18 @@ def make_state(root, **kw):
 
 
 def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid=4242,
-                   clock="CLOCK_BOOTTIME"):
+                   clock="CLOCK_BOOTTIME", disp=None):
     """v5 帧日志块（镜像 nvn_vk_frame_log.c：40B 记录 = ts_us + fence + acquire + present
-    + gpu_us/gpu_seq + disp_us/disp_seq——后四个无确认写 0xffffffff，照真机编码；
-    meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。"""
-    recs = [struct.pack("<QIIIIIIII", base_ts + i * step_us, 0, 0, 900, 1200,
-                        0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff)
-            for i in range(recorded)]
+    + gpu_us/gpu_seq + disp_us/disp_seq——无确认写 0xffffffff，照真机编码；
+    meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。
+    disp=((记录下标, 帧号, 间隔us), …)：真机 disp 读数落在「确认到达时正在写的」记录上，
+    可晚于所属帧、可乱序——宿主按 disp_seq 对号。"""
+    marks = {i: (us, seq) for i, seq, us in (disp or ())}
+    recs = []
+    for i in range(recorded):
+        us, seq = marks.get(i, (0xffffffff, 0xffffffff))
+        recs.append(struct.pack("<QIIIIIIII", base_ts + i * step_us, 0, 0, 900, 1200,
+                                0xffffffff, 0xffffffff, us, seq))
     blob = b"".join(recs)
     b64 = base64.b64encode(blob).decode()
     parts = [b64[i:i + 700] for i in range(0, len(b64), 700)]
@@ -937,7 +942,7 @@ class RunGameTest(unittest.TestCase):
         # ② 帧表 = 采集窗口内的帧：窗口 [10M, 40M) us（uptime 起步 10M、30 次拉取各 +1s），
         #   帧记录 10.5M 起 16667us 步长 ×200 → 全部落在窗口内 → 199 行间隔；别进程（9999）的块不进来
         rows = (out / "frames.tsv").read_text().splitlines()
-        self.assertEqual("frame\tpresent_ns\tdisp_us\twall_us", rows[0])
+        self.assertEqual("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq", rows[0])
         self.assertEqual(199, len(rows) - 1)
         pres = [int(r.split("\t")[1]) for r in rows[1:]]
         self.assertTrue(all(10_000_000_000 <= p < 40_000_000_000 for p in pres),
@@ -1682,6 +1687,45 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(2, man["frame_log"]["captures"],
                          "同计数不同载荷的两块都是证据，一份不吞")
 
+    def test_frames_tsv_disp_seq_joined_by_sequence(self):
+        """v5 disp_us/disp_seq 按帧号对号：真机确认读数落在「到达时正在写的」记录
+        上（可晚于所属帧、到达序可乱序）——宿主按 disp_seq 归帧，不按记录行序；
+        未确认记录与 v<5（无 disp 域）disp 列留空，CPU present 间隔只在
+        present_us/wall_us，不冒充确认读数。"""
+        out = self.tmp / "frames-out"
+        out.mkdir()
+        # seq45/70/55 的确认分别落在记录 90/120/150 上：到达序与帧号序不一致（乱序迟到）
+        caps = run_game.direct_framelog.parse(frame_log_text(
+            recorded=200, first=0, base_ts=10_500_000,
+            disp=((90, 45, 33200), (120, 70, 16500), (150, 55, 16800))))
+        notes = []
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq", rows[0])
+        by_frame = {int(r.split("\t")[0]): r.split("\t") for r in rows[1:]}
+        self.assertEqual(("33200", "45"), (by_frame[45][4], by_frame[45][5]),
+                         "记录 90 携带的 seq45 确认必须归到帧 45 行")
+        self.assertEqual(("16500", "70"), (by_frame[70][4], by_frame[70][5]))
+        self.assertEqual(("16800", "55"), (by_frame[55][4], by_frame[55][5]))
+        self.assertEqual(("", ""), (by_frame[46][4], by_frame[46][5]),
+                         "无确认帧 disp 列留空，不拿 0 或 CPU 间隔冒充")
+        # 全未确认（disp 全 0xffffffff）→ disp 列整列空
+        caps = run_game.direct_framelog.parse(frame_log_text(recorded=60, first=0, base_ts=10_500_000))
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertTrue(all(r.split("\t")[4] == "" and r.split("\t")[5] == ""
+                            for r in rows[1:]), "v5 未确认 → disp_us/disp_seq 全空")
+        # v<5 记录（disp 域缺席 = None）→ 同样全空，旧版证据不造确认读数
+        caps = [{"meta": {"first": 0, "line": 1, "clock": "CLOCK_BOOTTIME"},
+                 "ts": [10_500_000 + i * 16667 for i in range(30)],
+                 "disp_us": None, "disp_seq": None}]
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertTrue(all(r.split("\t")[4] == "" and r.split("\t")[5] == ""
+                            for r in rows[1:]), "v<5 → disp 列整列空")
+        self.assertEqual("16667", rows[1].split("\t")[2],
+                         "present_us 列恒为 CPU 相邻 present 间隔")
+
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
         self.assertNotEqual(0, rc)
@@ -1771,9 +1815,9 @@ class RunGameTest(unittest.TestCase):
         d.mkdir()
         (d / "android.json").write_text("{}")
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(4000):
-                fh.write(f"{i + 1}\t{10_000_000_000 + i * 16_667_000}\t16667\t{10_000_000_000 + i * 16_667_000}\n")
+                fh.write(f"{i + 1}\t{10_000_000_000 + i * 16_667_000}\t16667\t16667\t16667\t{i + 1}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
 
     def test_qc_window_coverage_insufficient_is_no_data(self):
@@ -1786,17 +1830,17 @@ class RunGameTest(unittest.TestCase):
         first = w0 + 4_720_000                             # 块首帧晚 4.72s
         n = int(56_360_000 / 16667)                        # 窗内覆盖 56.36s
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(1, n + 1):
-                fh.write(f"{i}\t{(first + i * 16667) * 1000}\t16667\t{(first + i * 16667) * 1000}\n")
+                fh.write(f"{i}\t{(first + i * 16667) * 1000}\t16667\t16667\t16667\t{i}\n")
         r = self._qc(d)
         self.assertEqual("没数据", r["帧率"])
         self.assertIn("窗口覆盖不足", r["读数"])
         # 同一窗口贴边满覆盖（60s/61.08s ≈ 98%）→ 覆盖判据放行，走正常帧率统计
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(1, 3601):
-                fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t{(w0 + i * 16667) * 1000}\n")
+                fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t16667\t16667\t{i}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
 
     def test_power_energy_verdicts(self):
