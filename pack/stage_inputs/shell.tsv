@@ -85,6 +85,7 @@
 入	graphics/nvn/host
 入	graphics/nvn/host_adapt.m
 入	graphics/nvn/lib_pack.inc
+入	graphics/nvn/lib_pack_core.inc
 入	graphics/nvn/texture_extent.inc
 入	graphics/nvn/third_party/bcdec/bcdec.h
 入	graphics/nvn/third_party/vulkan-headers

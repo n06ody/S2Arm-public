@@ -84,7 +84,7 @@ def compile_draw(td, flags, label, source):
                  # nvn_vk_mrt.c）；清单漏了它 = undefined reference，与本用例断言的图形请求身份无关。
                  'nvn_vk_mrt')]
     sources += [NATIVE / 'direct' / (p + '.c') for p in
-                ('source_store', 'input_identity', 'compile_request', 'texture_facts', 'control', 'sha256', 'json', 'diag', 'compile_export', 'compile_export_w2', 'w2_single_query')]
+                ('source_store', 'input_identity', 'compile_request', 'texture_facts', 'control', 'sha256', 'jv', 'json', 'diag', 'compile_export', 'compile_export_w2', 'w2_single_query')]
     strip = '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections'
     run(flags + ['-DGRAPHICS_DRAW_SOURCE="' + str(path) + '"'] + list(map(str, sources)) +
         [strip] + ['-lm', '-o', str(exe)], runner=host_link.run)

@@ -186,7 +186,8 @@ int main(int n,char**v){if(n!=3)return 2;FILE*f=fopen(v[1],"rb");if(!f)return 3;
             cmd += [str(HERE / 'storage_stage_chain_test.c'),
                     str(HERE.parent / 'native/nvn/nvn_vk_first_draw.c'),
                     str(HERE.parent / 'native/nvn/nvn_vk_program_result.c'),
-                    str(HERE.parent / 'native/direct/graphics.c'), str(HERE.parent / 'native/direct/json.c'),
+                    str(HERE.parent / 'native/direct/graphics.c'), str(HERE.parent / 'native/direct/jv.c'),
+                    str(HERE.parent / 'native/direct/json.c'),
                     str(HERE.parent / 'native/direct/sha256.c'),
                     '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections', '-o', str(binary)]
             subprocess.run(cmd, check=True)

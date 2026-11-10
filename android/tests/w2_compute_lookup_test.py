@@ -76,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix='w2-lookup-') as folder:
         (td/'lookup.c').write_text(src);exe=td/name
         cmd=[os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
           '-I'+str(inc),'-I'+str(NATIVE),'-I'+str(NATIVE/'nvn'),'-I'+str(ROOT/'graphics/nvn/gfx/nvn'),'-I'+str(ROOT/'graphics/nvn/gfx/nvn/include'),str(Path(__file__).with_suffix('.c')),str(td/'lookup.c'),
-          str(NATIVE/'nvn/nvn_vk_program_result.c'),str(NATIVE/'direct/json.c'),
+          str(NATIVE/'nvn/nvn_vk_program_result.c'),str(NATIVE/'direct/jv.c'),str(NATIVE/'direct/json.c'),
           str(NATIVE/'direct/diag.c'),str(NATIVE/'direct/sha256.c'),'-lm','-o',str(exe)]
         subprocess.run(cmd,check=True)
         failures=[]
@@ -175,7 +175,7 @@ with tempfile.TemporaryDirectory(prefix='w2-lookup-') as folder:
          '-I'+str(inc),'-I'+str(NATIVE),'-I'+str(NATIVE/'nvn'),'-I'+str(ROOT/'graphics/nvn/gfx/nvn'),'-I'+str(ROOT/'graphics/nvn/gfx/nvn/include'),
          str(Path(__file__).with_name('w2_compute_exact_lookup_test.c')),
          str(NATIVE/'nvn/nvn_vk_compute_lookup.c'),str(NATIVE/'nvn/nvn_vk_program_result.c'),
-         str(NATIVE/'direct/json.c'),str(NATIVE/'direct/offline_library.c'),str(NATIVE/'direct/sha256.c'),
+         str(NATIVE/'direct/jv.c'),str(NATIVE/'direct/json.c'),str(NATIVE/'direct/offline_library.c'),str(NATIVE/'direct/sha256.c'),
          str(NATIVE/'direct/diag.c'),'-lm','-o',str(exact)]
     subprocess.run(cmd,check=True)
     revision=td/'revision';profile=good['content']['identity']['profileHash'];closure='closure'
