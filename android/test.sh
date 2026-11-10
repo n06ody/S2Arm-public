@@ -110,8 +110,12 @@ s2a_gate_step "$PY" "$android_dir/tests/compile_events_reader_test.py"
 s2a_gate_step bash "$android_dir/tools/nvn_vk_threadbuf_test.sh"
 # CMake 挑选规则的宿主单测（假 cmake，可移植，始终跑）
 s2a_gate_step bash "$android_dir/tools/cmake_pick_test.sh"
-# S2A_TEST_NO_NATIVE 只跳过 Linux runtime CTest 阶段（native/memory.c 使用
-# Linux mremap / MREMAP_MAYMOVE，macOS 编不了）；可移植改写器矩阵始终执行。
+# S2A_TEST_NO_NATIVE 只跳过宿主 ctest 阶段；可移植改写器矩阵始终执行。
+# 非 Linux 宿主：CMakeLists 按 CMAKE_SYSTEM_NAME 门掉 Linux 专属 API 的目标
+# （memory.c 的 mremap；guest_signal.c 的 SIGRTMIN/sigcontext.h/ucontext；
+# host_android.c 的 eventfd；wsi_lease.c 的 pthread_condattr_setclock；
+# direct/selection.c 的 getrandom；tsd.c 与 module_test.c 的 /proc/self/maps），
+# 这里显式登记未测项，不静默当绿。
 if [ -z "${S2A_TEST_NO_NATIVE:-}" ]; then
     s2a_cmake_pick || { s2a_gate_note "【红】安卓宿主测试找不到 CMake（见上一行）"; exit 1; }
     echo "CMake：${S2A_CMAKE}（${S2A_CMAKE_FROM}）；ctest：$S2A_CTEST"
@@ -123,6 +127,8 @@ if [ -z "${S2A_TEST_NO_NATIVE:-}" ]; then
     s2a_gate_step "${cmake_env[@]}" "$cmake_bin" -S "$android_dir" -B "$out" -DCMAKE_BUILD_TYPE=Debug
     s2a_gate_step "${cmake_env[@]}" "$cmake_bin" --build "$out" --parallel 2
     s2a_gate_step "${cmake_env[@]}" "$cmake_bin" -E chdir "$out" "$S2A_CTEST" --output-on-failure --timeout 30
+    [ "$(uname -s)" = Linux ] ||
+        s2a_gate_note "未测：android_memory / android_plat（mremap）、android_guest_signal（SIGRTMIN）、android_host_android（eventfd）、android_wsi_lease（pthread_condattr_setclock）、android_direct_selection（getrandom）、android_tsd / android_module（/proc/self/maps）需 Linux"
 fi
 s2a_gate_step "$PY" "$android_dir/tests/debug_environment_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/debug_gate_test.py"

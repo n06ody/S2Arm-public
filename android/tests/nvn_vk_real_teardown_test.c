@@ -7,6 +7,9 @@
 #include <assert.h>
 int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
 int __system_property_get(const char*n,char*v){(void)n;*v=0;return 0;}
+// fd_lookup_clear/ensure 记 s2a_vk_adapter_registry_generation（mtl_vk_adapter.c 提供）：
+// 本探针不碰真适配器注册表，代数以恒定非零值即可（运行期间注册表不变）。
+uint64_t s2a_vk_adapter_registry_generation(void){return 1;}
 int32_t ANativeWindow_getWidth(ANativeWindow*w){(void)w;return 0;}
 int32_t ANativeWindow_getHeight(ANativeWindow*w){(void)w;return 0;}
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"failed: %s at %d\n",#x,__LINE__); return 2; } } while(0)

@@ -8,9 +8,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+// bad: 事实行无条件调 __android_log_print。三种消费面各自成立：
+//   Android：真头（__system_property_get 只在 __ANDROID__ 段用，system_properties.h 留门内）；
+//   宿主自带缝 TU：w2 组件/整合测试前缀先 #define ANDROID_LOG_INFO 再给 __android_log_print
+//     声明（w2_compute_pipeline_test.c 第 3-7 行）——已带常量则不引头，否则宏与桩头 enum 撞名；
+//   宿主独立 TU：nvn_vk_real_teardown_test 链 hostvk 桩头——__has_include 命中才引。
 #ifdef __ANDROID__
 #include <android/log.h>
 #include <sys/system_properties.h>
+#elif !defined(ANDROID_LOG_INFO)
+#ifdef __has_include
+#if __has_include(<android/log.h>)
+#include <android/log.h>
+#endif
+#endif
 #endif
 #include <stdio.h>
 #include <inttypes.h>

@@ -119,7 +119,11 @@ int main(int argc, char **argv) {
     save("canonical.bin", canonical, canonical_len);
     memcpy(expected_identity, entry.input_sha, sizeof expected_identity);
     if (getenv("GRAPHICS_EXPECT_PROVIDER")) s2a_compile_export_w2_set_provider(graphics_provider, NULL);
-    nvk_program_compile_inner(&device, &entry, &state, "unused", &context, NULL, views);
+    // 首遇后台提交给 nvk_program_compile_inner 加了 int *skipped 出参（>0 = 本笔安全跳过、
+    // 结果不入缓存）。本夹具走同步编译、必须编译到位：断言不被跳过。
+    int skipped = 0;
+    nvk_program_compile_inner(&device, &entry, &state, "unused", &context, NULL, views, &skipped);
+    assert(skipped == 0);
     assert(compiler_calls == 1 && entry.failed == compiler_failure);
     if (getenv("GRAPHICS_EXPECT_UNWIRED")) assert(unwired_reports == 1);
     if (getenv("GRAPHICS_EXPECT_PROVIDER")) assert(provider_calls == 1 && unwired_reports == 0);

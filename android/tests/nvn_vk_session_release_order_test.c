@@ -20,6 +20,8 @@ int s2a_vk_device_destroy(struct s2a_vk_device*d,int proof){(void)d;assert(proof
 // 读回 staging 缓存的收尾（真实实现见 nvn/nvn_vk_readback.c）：本用例把所有“设备子对象释放”
 // 都换成确定性替身，这里同样不碰设备；顺序断言只关心 swap/first_draw/device 三者。
 void nvn_vk_session_read_texels_release(struct nvn_vk_session *s){(void)s;}
+// compute PSO 进程内缓存同点释放（nvn_vk_session.c:288，292b8a24 新增）：同口径确定性替身。
+void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d){(void)d;}
 int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
 static int pos(int e){for(int i=0;i<n;i++) if(events[i]==e) return i; return -1;}
 static void test(int mode) {

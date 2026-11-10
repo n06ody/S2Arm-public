@@ -53,6 +53,7 @@ class android {
                 ExitOrderFixture.check(delay == 10000, "fallback must wait ten seconds");
                 ExitOrderFixture.deferred.add(action); ParentActivity.events.add("fallback_queued");
             }
+            void removeCallbacks(Runnable action) { }
         }
     }
     static class view { static class View { static final int VISIBLE=0; } }
@@ -99,12 +100,16 @@ public class ExitOrderFixture extends ParentActivity {
     Probe lifecycleProbe=new Probe(); Runnable lifecycleSample=() -> {};
     FrameRate frameRate=new FrameRate(); Keyboard hostKeyboard=new Keyboard(); Keyboard legacyTextInput=new Keyboard();   // #1611 onPause 新加 legacyTextInput.pause()（11-06 main 安卓钩子红，合入运维线补桩）
     GameAudioFocus gameAudioFocus=null;   // #1658 onPause/onResume 新加 gameAudioFocus.pause()/resume()（11-07 main 安卓钩子红，合入运维线补桩）
+    android.os.Handler saveAtomicProbe=new android.os.Handler(android.os.Looper.getMainLooper());
+    Runnable saveAtomicSample=() -> {};   // 存档原子提交判定：onStop 前 removeCallbacks（#473 补桩）
+    DguardNotice dguardNotice=null;       // #473 onDestroy 新加 dguardNotice.pause()（安全网提示桩）
     Library library=new Library();
     static class Surface { void setKeepScreenOn(boolean value) { } void setVisibility(int value) { } }
     static class Probe { void removeCallbacks(Runnable r) { } }
     static class FrameRate { void setResumed(boolean value) { } }
     static class Keyboard { void pause() { } }
     static class GameAudioFocus { void pause() { } void resume() { } }
+    static class DguardNotice { void pause() { } void resume() { } void show(String d) { } }
     static class Library { void close() { events.add("library_close"); } }
     static class Build { static class VERSION { static final int SDK_INT=33; } }
     static class Dispatcher { void unregisterOnBackInvokedCallback(Object cb) { } }

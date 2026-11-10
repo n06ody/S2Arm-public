@@ -30,7 +30,11 @@ glslc=${GLSLC:-$(command -v glslc || true)}
 out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
 inc=("$repo/android/tests/vkhost" "$repo/android/tests/hostvk" "$repo/android/native" "$repo/android/native/direct" "$repo/android/native/nvn" "$repo/runtime/include" "$repo/graphics/nvn/gfx/nvn" "$repo/graphics/nvn/gfx/nvn/include" "$repo/graphics/nvn/gfx/tex" "$repo/graphics/nvn/third_party/vulkan-headers/include")
 args=(); for dir in "${inc[@]}"; do args+=(-I "$dir"); done
-sources=("$repo"/android/native/nvn/{nvn_vk_program_result,nvn_vk_draw_diag,nvn_vk_pipe_manifest,nvn_vk_pipe_recipe,nvn_vk_driver_cache,nvn_vk_query,nvn_vk_session,nvn_vk_lifecycle,nvn_vk_exec_owner,nvn_vk_pipeline,nvn_vk_swapchain,nvn_vk_surface,nvn_vk_texcache,nvn_vk_sampler_cache,nvn_vk_sampler,nvn_vk_format,nvn_vk_mrt,nvn_vk_readback,nvn_vk_readback_gpu,nvn_vk_bcdec,nvn_vk_poolahb,poolahb_cover,poolahb_policy,poolahb_alias,nvn_vk_timeline,nvn_vk_threadbuf}.c "$repo"/android/native/direct/{vk_record,vk_clear,vk_device,gs_path,vk_membuf,vk_resid,program_cache,compile_request,compile_worker,compiler_bind,s2a_direct_abi,sha256,json}.c "$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/nvn/nvn_dirty.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
+# nvn_vk_compute.c：292b8a24 给 session 收尾加了 nvn_vk_compute_pso_cache_release；
+# 链进生产实现（空表即返回），未引用的管线构建面由 --gc-sections 剪掉。
+# nvn_vk_display_timing.c：#489 B2 给 swapchain_destroy 加了 nvn_vk_dt_detach——
+# presentID/时刻账随 swapchain 作古，同链生产实现（单文件自洽）。
+sources=("$repo"/android/native/nvn/{nvn_vk_program_result,nvn_vk_draw_diag,nvn_vk_pipe_manifest,nvn_vk_pipe_recipe,nvn_vk_driver_cache,nvn_vk_query,nvn_vk_session,nvn_vk_lifecycle,nvn_vk_exec_owner,nvn_vk_pipeline,nvn_vk_swapchain,nvn_vk_surface,nvn_vk_texcache,nvn_vk_sampler_cache,nvn_vk_sampler,nvn_vk_format,nvn_vk_mrt,nvn_vk_readback,nvn_vk_readback_gpu,nvn_vk_bcdec,nvn_vk_poolahb,poolahb_cover,poolahb_policy,poolahb_alias,nvn_vk_timeline,nvn_vk_threadbuf,nvn_vk_compute,nvn_vk_display_timing}.c "$repo"/android/native/direct/{vk_record,vk_clear,vk_device,gs_path,vk_membuf,vk_resid,program_cache,compile_request,compile_worker,compiler_bind,s2a_direct_abi,sha256,json}.c "$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/nvn/nvn_dirty.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
 compile() {
   cc -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-missing-field-initializers -ffunction-sections -fdata-sections "${args[@]}" "$@" "${sources[@]}" -Wl,--gc-sections -l:libvulkan.so.1 -lpthread -lm -ldl
 }
