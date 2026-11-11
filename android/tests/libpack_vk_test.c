@@ -2,8 +2,8 @@
 //
 // 反例基线（任一成立，运行时就会把不属于本键/已被破坏的字节当命中采纳）：
 //   * 把“lib.idx 在/记录在”当命中，不核 dm_ctl、stage、SPIR-V 头；
-//   * _b.json 的 bindings 逐字段不核对（arg_id→binding=arg×6+阶段号、tex reg→句柄表字偏移、
-//     Smplr/samp* 半边不出行、cbuf→slot+3、sbuf→nvnSlot、宿主辅助无 guest 槽）；
+//   * 不核 SPIR-V 描述符存在性 / 类型 / binding，以及 JSON 中可用的槽位与来源事实；
+//     Metal 专有辅助项不生成 Vulkan 绑定，未知映射显式拒绝；
 //   * 缺段/坏段/段越界静默当缺席——miss 与 reject 必须分清，reject 不许冒充命中；
 //   * 缺 v1 必填字段（storage rw、uniform slot）的合成字节能被 first_draw 判据接受。
 // 夹具在 mkdtemp 里现写 lib.idx + lib.000.pak（与 iOS 同一种容器），记录按 (key,kind) 升序。
@@ -18,6 +18,7 @@
 
 #include "direct/libpack_vk.h"
 #include "nvn/nvn_vk_program_result.h"
+#include "../../graphics/third_party/spirv_cross/spirv.h"
 
 static int fails;
 #define CHECK(cond, what) do { if (!(cond)) { printf("FAIL: %s\n", (what)); fails++; } } while (0)
@@ -67,7 +68,74 @@ static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], siz
     return 0;
 }
 
-static const uint8_t SPV[20] = { 0x03, 0x02, 0x23, 0x07, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0 };
+// Minimal synthetic descriptor declarations; the real-producer test separately
+// exercises fully compiled and validated SPIR-V from both shader pipelines.
+static void spv_inst(uint32_t *w, size_t *n, SpvOp op, const uint32_t *args, size_t count) {
+    w[(*n)++] = (uint32_t)((count+1) << 16) | (uint32_t)op;
+    memcpy(w + *n, args, count * sizeof *args); *n += count;
+}
+#define INS(w,n,op,...) do { const uint32_t a[] = {__VA_ARGS__}; spv_inst(w,n,op,a,sizeof a/sizeof a[0]); } while (0)
+static void spv_name(uint32_t *w, size_t *n, uint32_t id, const char *name) {
+    size_t words = (strlen(name)+1+3)/4;
+    w[(*n)++] = (uint32_t)((words+2)<<16) | SpvOpName;
+    w[(*n)++] = id;
+    memset(w+*n, 0, words*4); memcpy(w+*n, name, strlen(name)); *n += words;
+}
+static void spv_var(uint32_t *w, size_t *n, uint32_t id, uint32_t ptr, uint32_t storage,
+                    const char *name, uint32_t binding) {
+    spv_name(w,n,id,name);
+    INS(w,n,SpvOpDecorate,id,SpvDecorationDescriptorSet,0);
+    INS(w,n,SpvOpDecorate,id,SpvDecorationBinding,binding);
+    INS(w,n,SpvOpVariable,ptr,id,storage);
+}
+static size_t fixture_spv(uint32_t *w, int vs) {
+    size_t n = 0;
+    w[n++] = SpvMagicNumber; w[n++] = 0x00010300; w[n++] = 0; w[n++] = 32; w[n++] = 0;
+    INS(w,&n,SpvOpTypeInt,1,32,0);
+    INS(w,&n,SpvOpTypeStruct,2,1);
+    INS(w,&n,SpvOpDecorate,2,SpvDecorationBlock);
+    INS(w,&n,SpvOpTypePointer,3,SpvStorageClassUniform,2);
+    INS(w,&n,SpvOpTypeStruct,4,1);
+    INS(w,&n,SpvOpTypePointer,5,SpvStorageClassStorageBuffer,4);
+    INS(w,&n,SpvOpTypeImage,6,1,SpvDim2D,0,0,0,1,SpvImageFormatUnknown);
+    INS(w,&n,SpvOpTypeSampledImage,7,6);
+    INS(w,&n,SpvOpTypePointer,8,SpvStorageClassUniformConstant,7);
+    // Distinct stage sizes prove that the program uses the larger extent.
+    INS(w,&n,SpvOpConstant,1,16,vs ? 200 : 236);
+    INS(w,&n,SpvOpTypeArray,17,1,16);
+    INS(w,&n,SpvOpDecorate,17,SpvDecorationArrayStride,16);
+    INS(w,&n,SpvOpTypeStruct,18,17);
+    INS(w,&n,SpvOpDecorate,18,SpvDecorationBlock);
+    INS(w,&n,SpvOpMemberDecorate,18,0,SpvDecorationOffset,0);
+    INS(w,&n,SpvOpTypePointer,19,SpvStorageClassUniform,18);
+    if (vs) {
+        spv_var(w,&n,10,3,SpvStorageClassUniform,"vp_c3",0);
+        spv_var(w,&n,11,5,SpvStorageClassStorageBuffer,"vp_s0",6);
+        spv_var(w,&n,12,8,SpvStorageClassUniformConstant,"vp_t_tcb_8",12);
+        spv_var(w,&n,13,3,SpvStorageClassUniform,"vp_c1",30);
+        spv_var(w,&n,14,3,SpvStorageClassUniform,"vp_c0",36);
+        spv_var(w,&n,20,19,SpvStorageClassUniform,"support_buffer",42);
+    } else {
+        spv_var(w,&n,10,3,SpvStorageClassUniform,"fp_c3",4);
+        spv_var(w,&n,20,19,SpvStorageClassUniform,"support_buffer",22);
+    }
+    return n * sizeof *w;
+}
+
+static int remove_layout_decoration(uint32_t *w, size_t bytes, SpvOp op, uint32_t decoration) {
+    for (size_t at = 5; at < bytes / sizeof *w;) {
+        uint32_t count = w[at] >> 16;
+        if (!count || count > bytes / sizeof *w - at) return 0;
+        if ((w[at] & 0xffff) == (uint32_t)op && count >= 4 &&
+            w[at + (op == SpvOpMemberDecorate ? 3 : 2)] == decoration) {
+            // Preserve the instruction length while making it irrelevant to layout.
+            w[at + (op == SpvOpMemberDecorate ? 3 : 2)] = SpvDecorationRelaxedPrecision;
+            return 1;
+        }
+        at += count;
+    }
+    return 0;
+}
 
 static const char *VS_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
@@ -75,7 +143,9 @@ static const char *VS_JSON =
     "{\"msl_name\":\"vp_s0\",\"kind\":\"sbuf\",\"index\":0,\"reg\":7,\"rw\":true,\"arg_id\":1},"
     "{\"msl_name\":\"vp_t_tcb_8\",\"kind\":\"tex\",\"reg\":5,\"arg_id\":2},"
     "{\"msl_name\":\"vp_t_tcb_8Smplr\",\"kind\":\"samp_tex\",\"reg\":5,\"arg_id\":3},"
-    "{\"msl_name\":\"gal_ubo_len\",\"kind\":\"ubolen\",\"arg_id\":4}],"
+    "{\"msl_name\":\"gal_ubo_len\",\"kind\":\"ubolen\",\"arg_id\":4},"
+    "{\"msl_name\":\"vp_c1\",\"kind\":\"c1\",\"bank\":1,\"arg_id\":5},"
+    "{\"msl_name\":\"vp_c0\",\"kind\":\"drvcb\",\"bank\":0,\"arg_id\":6}],"
     "\"vertex_inputs\":[{\"location\":1},{\"location\":3}]}";
 
 static const char *PS_JSON =
@@ -87,14 +157,20 @@ static const char *PS_JSON =
 static int has(const uint8_t *j, const char *sub) { return j && strstr((const char *)j, sub) != NULL; }
 
 int main(void) {
-    char tmpl[] = "/tmp/libpack_vk_test.XXXXXX";
+    uint32_t spv_vs[256] = {0}, spv_ps[256] = {0};
+    size_t vs_n = fixture_spv(spv_vs, 1), ps_n = fixture_spv(spv_ps, 0);
+    char tmpl[320];
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    if (snprintf(tmpl, sizeof tmpl, "%s/libpack_vk_test.XXXXXX", tmp) >= (int)sizeof tmpl) return 2;
     CHECK(mkdtemp(tmpl) != NULL, "mkdtemp");
     snprintf(g_dir, sizeof g_dir, "%s", tmpl);
 
     // ---- 缺席目录 / 坏 lib.idx ----
     {
         struct s2a_libpack *lp = (void *)1;
-        CHECK(s2a_libpack_open(&lp, "/tmp/definitely-no-such-libpack-dir") == 0, "absent dir → open 0 (none)");
+        char absent[400]; snprintf(absent, sizeof absent, "%s/absent", tmpl);
+        CHECK(s2a_libpack_open(&lp, absent) == 0, "absent dir → open 0 (none)");
         snprintf(g_dir, sizeof g_dir, "%s/bad", tmpl);
         mkdir(g_dir, 0700);
         char p[400]; snprintf(p, sizeof p, "%s/lib.idx", g_dir);
@@ -108,13 +184,13 @@ int main(void) {
         "{\"key\":\"aabbccddeeff0011_b\",\"stage\":\"vs\",\"dm_ctl\":\"aabbccddeeff0011\",\"bindings\":[]}";
     struct trec recs[5] = {
         { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-        { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+        { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)vs_n },
         { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(PS_JSON) },
-        { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof SPV },
+        { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)ps_n },
         { .key = 0xaabbccddeeff0011, .kind = 1,  .len = (uint32_t)strlen(ORPHAN_JSON) },
     };
-    const uint8_t *pl[5] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)PS_JSON, SPV, (const uint8_t *)ORPHAN_JSON };
-    size_t pln[5] = { strlen(VS_JSON), sizeof SPV, strlen(PS_JSON), sizeof SPV, strlen(ORPHAN_JSON) };
+    const uint8_t *pl[5] = { (const uint8_t *)VS_JSON, (const uint8_t *)spv_vs, (const uint8_t *)PS_JSON, (const uint8_t *)spv_ps, (const uint8_t *)ORPHAN_JSON };
+    size_t pln[5] = { strlen(VS_JSON), vs_n, strlen(PS_JSON), ps_n, strlen(ORPHAN_JSON) };
     CHECK(mk_pack(recs, 5, pl, pln, 1) == 0, "fixture pack written");
 
     struct s2a_libpack *lp = NULL;
@@ -127,7 +203,7 @@ int main(void) {
         CHECK(s2a_libpack_get(lp, k, 1, &b, &n, w, sizeof w) == 0 && n == strlen(VS_JSON) && !memcmp(b, VS_JSON, n),
               "get kind1 → bytes identical");
         free(b); b = NULL;
-        CHECK(s2a_libpack_get(lp, k, 52, &b, &n, w, sizeof w) == 0 && n == sizeof SPV && !memcmp(b, SPV, n),
+        CHECK(s2a_libpack_get(lp, k, 52, &b, &n, w, sizeof w) == 0 && n == vs_n && !memcmp(b, spv_vs, n),
               "get kind52 → spv bytes identical");
         free(b); b = NULL;
         CHECK(s2a_libpack_get(lp, k, 0, &b, &n, w, sizeof w) == 1 && !b, "absent kind → MISS");
@@ -155,23 +231,22 @@ int main(void) {
         CHECK(has(j, "\"spirv\":\""), "base64 spirv present");
         CHECK(has(j, "\"kind\":\"uniform\",\"stage\":\"vs\",\"set\":0,\"binding\":0,\"slot\":3"),
               "cbuf reg0 → uniform binding=0 slot=3");
-        CHECK(has(j, "\"kind\":\"storage\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"nvnSlot\":7,\"rw\":true"),
+        CHECK(has(j, "\"kind\":\"storage\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"cbSlot\":0,\"cbOffset\":384,\"nvnSlot\":7,\"rw\":true"),
               "sbuf reg7 → storage binding=6 nvnSlot=7 rw=true");
         CHECK(has(j, "\"kind\":\"texture\",\"stage\":\"vs\",\"set\":0,\"binding\":12,\"slot\":18"),
               "tex reg5 → texture binding=12 slot=8+5*2=18");
         CHECK(!has(j, "\"slot\":10") && !has(j, "\"slot\":5,") && !has(j, "\"slot\":5}"),
               "负控：不是 reg*2(=10) 也不是 reg 原值(=5)");
-        CHECK(has(j, "\"binding\":24}") && !has(j, "\"binding\":24,\"slot\""),
-              "ubolen → uniform binding=24 无 guest 槽");
+        CHECK(!has(j, "\"binding\":24}"), "Metal-only ubolen must not be emitted");
+        CHECK(has(j, "\"binding\":30,\"slot\":1"), "c1 → slot 1");
+        CHECK(has(j, "\"binding\":36,\"slot\":0"), "driver c0 → slot 0");
         CHECK(!has(j, "Smplr") && !has(j, "samp_tex"), "Smplr 采样器半边不出行");
         // ps→fs 改名、阶段号 4、sep-tex/img 槽（同一程序里的 fs 键）
         CHECK(has(j, "\"stage\":\"fs\""), "ps → v1 fs 改名");
         CHECK(has(j, "\"kind\":\"uniform\",\"stage\":\"fs\",\"set\":0,\"binding\":4,\"slot\":3"),
               "fs cbuf → binding=0*6+4=4");
-        CHECK(has(j, "\"kind\":\"texture\",\"stage\":\"fs\",\"set\":0,\"binding\":10,\"slot\":90"),
-              "sep-tex reg128 → binding=6+4=10 slot=0x5A=90");
-        CHECK(has(j, "\"kind\":\"image\",\"stage\":\"fs\",\"set\":0,\"binding\":16,\"slot\":76"),
-              "img reg2 → binding=12+4=16 slot=0x48+2*2=76");
+        CHECK(!has(j, "\"binding\":10") && !has(j, "\"binding\":16"),
+              "Metal-only texture/image entries absent from SPIR-V are not emitted");
         // 采纳门：合成字节必须过与现编结果同一套 s2a-direct-program-v1 解析
         {
             struct fd_program p; char pw[192] = "";
@@ -179,17 +254,17 @@ int main(void) {
             CHECK(nvn_vk_program_parse_graphics(j, jl, &p, pw, sizeof pw) == 0,
                   "合成 v1 过 nvn_vk_program_parse_graphics");
             CHECK(p.stage[0].present && p.stage[1].present &&
-                  p.stage[0].spirv_bytes == 20 && p.stage[0].attr_mask == 10,
+                  p.stage[0].spirv_bytes == vs_n && p.stage[0].attr_mask == 10,
                   "fd vs+fs present + spirv + attr_mask=10");
-            CHECK(p.binding_count == 7, "5+3 条反射 -1 采样器半边 = 7 条 v1 绑定");
-            struct fd_binding *b0 = NULL, *b6 = NULL, *b12 = NULL, *b24 = NULL, *b10 = NULL, *b16 = NULL;
+            CHECK(p.binding_count == 8, "six VS and two FS actual SPIR-V descriptors");
+            CHECK(p.support_bytes == 3776, "support size is max of VS 3200 and FS 3776");
+            struct fd_binding *b0 = NULL, *b6 = NULL, *b12 = NULL, *b30 = NULL, *b36 = NULL;
             for (int i = 0; i < p.binding_count; i++) {
                 if (p.bindings[i].binding == 0) b0 = &p.bindings[i];
                 if (p.bindings[i].binding == 6) b6 = &p.bindings[i];
                 if (p.bindings[i].binding == 12) b12 = &p.bindings[i];
-                if (p.bindings[i].binding == 24) b24 = &p.bindings[i];
-                if (p.bindings[i].binding == 10) b10 = &p.bindings[i];
-                if (p.bindings[i].binding == 16) b16 = &p.bindings[i];
+                if (p.bindings[i].binding == 30) b30 = &p.bindings[i];
+                if (p.bindings[i].binding == 36) b36 = &p.bindings[i];
             }
             CHECK(b0 && b0->kind == 0 && b0->slot == 3 && b0->ubo_slot == 0 && b0->stage_idx == 0,
                   "fd cbuf → uniform slot3 ubo0 vs");
@@ -197,13 +272,8 @@ int main(void) {
                   "fd sbuf → storage_kind1 slot7 writable");
             CHECK(b12 && b12->kind == 2 && b12->tex_slot == 5,
                   "fd tex → texture tex_slot=5（slot18→byte0x48→(0x48-0x20)/8 回环）");
-            CHECK(b24 && b24->kind == 0 && b24->slot == -1, "fd ubolen → uniform 无槽（slot=-1）");
-            // sep-tex 回环：slot90→byte0x168→int8 128 溢出负值 → tex_slot<0（独立纹理不属
-            //   组合槽映射，如实不挂槽，不是静默错绑）
-            CHECK(b10 && b10->kind == 2 && b10->tex_slot < 0 && b10->stage_idx == 1,
-                  "fd sep-tex → tex_slot<0 不挂组合槽、stage_idx=fs");
-            CHECK(b16 && b16->kind == 3 && b16->slot == 76 && b16->stage_idx == 1,
-                  "fd img → kind3 slot76 原样、stage_idx=fs");
+            CHECK(b30 && b30->kind == 0 && b30->slot == 1, "fd c1 → uniform slot1");
+            CHECK(b36 && b36->kind == 0 && b36->slot == 0, "fd driver c0 → uniform slot0");
             nvn_vk_program_free(&p);
         }
         free(j);
@@ -243,12 +313,12 @@ int main(void) {
         const char *bad = "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"ffffffffffffffff\",\"bindings\":[]}";
         struct trec r2[4] = {
             { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)vs_n },
             { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(bad) },
-            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof SPV },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)ps_n },
         };
-        const uint8_t *p2[4] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)bad, SPV };
-        size_t n2[4] = { strlen(VS_JSON), sizeof SPV, strlen(bad), sizeof SPV };
+        const uint8_t *p2[4] = { (const uint8_t *)VS_JSON, (const uint8_t *)spv_vs, (const uint8_t *)bad, (const uint8_t *)spv_ps };
+        size_t n2[4] = { strlen(VS_JSON), vs_n, strlen(bad), ps_n };
         CHECK(mk_pack(r2, 4, p2, n2, 1) == 0, "dm_ctl-mismatch pack written");
         struct s2a_libpack *l2 = NULL;
         CHECK(s2a_libpack_open(&l2, g_dir) == 1, "open mismatch pack");
@@ -256,16 +326,41 @@ int main(void) {
               "fs 段 dm_ctl 不符 → 程序 REJECT 不采纳");
         s2a_libpack_close(l2);
 
+        // Unknown support layout must reject instead of using the parser default.
+        for (int which = 0; which < 2; ++which) {
+            uint32_t broken[256]; memcpy(broken, spv_ps, ps_n);
+            CHECK(remove_layout_decoration(broken, ps_n,
+                      which ? SpvOpDecorate : SpvOpMemberDecorate,
+                      which ? SpvDecorationArrayStride : SpvDecorationOffset),
+                  "support layout mutation applied");
+            struct trec rr[4] = {
+                { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(VS_JSON) },
+                { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)vs_n },
+                { .key = 0x1032547698badcfe, .kind = 1, .len = (uint32_t)strlen(PS_JSON) },
+                { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)ps_n },
+            };
+            const uint8_t *pp[4] = { (const uint8_t *)VS_JSON, (const uint8_t *)spv_vs,
+                                     (const uint8_t *)PS_JSON, (const uint8_t *)broken };
+            size_t nn[4] = { strlen(VS_JSON), vs_n, strlen(PS_JSON), ps_n };
+            CHECK(mk_pack(rr, 4, pp, nn, 1) == 0, "broken support layout pack written");
+            l2 = NULL; memset(w, 0, sizeof w);
+            CHECK(s2a_libpack_open(&l2, g_dir) == 1, "open broken support layout pack");
+            CHECK(s2a_libpack_program_v1(l2, keys, 0x3, 1, "h", "c", &j, &jl, w, sizeof w) == -1 &&
+                  !j && strstr(w, "support block extent unavailable"),
+                  "missing support offset/stride → REJECT at extent");
+            s2a_libpack_close(l2);
+        }
+
         // fs 键的 spv 头坏（magic 不对）
-        uint8_t badspv[20]; memcpy(badspv, SPV, sizeof SPV); badspv[0] = 0xAA;
+        uint32_t badspv[256]; memcpy(badspv, spv_ps, ps_n); ((uint8_t *)badspv)[0] = 0xAA;
         struct trec r3[4] = {
             { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)vs_n },
             { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(PS_JSON) },
-            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof badspv },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)ps_n },
         };
-        const uint8_t *p3[4] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)PS_JSON, badspv };
-        size_t n3[4] = { strlen(VS_JSON), sizeof SPV, strlen(PS_JSON), sizeof badspv };
+        const uint8_t *p3[4] = { (const uint8_t *)VS_JSON, (const uint8_t *)spv_vs, (const uint8_t *)PS_JSON, (const uint8_t *)badspv };
+        size_t n3[4] = { strlen(VS_JSON), vs_n, strlen(PS_JSON), ps_n };
         CHECK(mk_pack(r3, 4, p3, n3, 1) == 0, "bad-spv pack written");
         l2 = NULL;
         CHECK(s2a_libpack_open(&l2, g_dir) == 1, "open bad-spv pack");
@@ -289,7 +384,12 @@ int main(void) {
     }
 
     s2a_libpack_close(lp);
-    char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmpl); (void)system(cmd);
+    char path[400];
+    snprintf(path, sizeof path, "%s/bad/lib.idx", tmpl); unlink(path);
+    snprintf(path, sizeof path, "%s/bad", tmpl); rmdir(path);
+    snprintf(path, sizeof path, "%s/lib.idx", tmpl); unlink(path);
+    snprintf(path, sizeof path, "%s/lib.000.pak", tmpl); unlink(path);
+    rmdir(tmpl);
     if (fails) { printf("libpack_vk_test: %d FAIL\n", fails); return 1; }
     printf("libpack_vk_test: all checks passed\n");
     return 0;

@@ -298,6 +298,8 @@ s2a_gate_step "$PY" "$android_dir/tests/dev_runtime_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_batch_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_prepare_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链接闭包：自动补链 / 弱引用放行 / 无提供方点名红 / 替身优先
+# LibPack graphics descriptor presence, provenance, and support-layout fail-closed checks.
+s2a_gate_step "$PY" "$android_dir/tests/libpack_graphics_unit_test.py"
 # Graphics REQUEST: real producer/canonical identity/writer -> unchanged importer, synthetic host only.
 s2a_gate_step "$PY" "$android_dir/tests/graphics_request_name_test.py"
 # W2 compute: real C components with synthetic input / Vulkan mocks, never GPU or device evidence.
