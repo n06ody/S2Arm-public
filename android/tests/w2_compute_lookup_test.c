@@ -2,6 +2,7 @@
 // Copyright 2026 S2Arm contributors
 #include "nvn/nvn_vk_compute_lookup.h"
 #include "direct/offline_library.h"
+#include "direct/libpack_vk.h"
 #include "direct/program_cache.h"
 #include "direct/compile_worker.h"
 #include <stdio.h>
@@ -37,7 +38,7 @@ int s2a_offline_library_fetch(const char *root,const struct s2a_offline_request 
 int s2a_program_cache_load(const char *root,const uint8_t id[32],uint8_t **b,size_t *n,
     uint8_t sha[32],char *why,size_t cap) {
     (void)root;(void)id;(void)sha;disk++;
-    if(mode==30 || mode==2 || mode==3 || mode==4 || mode==11 || mode==12)
+    if(mode==30 || mode==2 || mode==3 || mode==4 || mode==11 || mode==12 || mode==41)
         return read_bytes(mode==4?bad:good,b,n);
     snprintf(why,cap,"private missing");return -1;
 }
@@ -46,10 +47,22 @@ int s2a_compile_worker_run(uint64_t s,uint64_t g,const char *j,size_t n,const ui
     (void)s;(void)g;(void)j;(void)n;(void)id;(void)deadline;(void)pause;(void)resume;(void)ctx;compile++;
     if(mode==5){snprintf(why,cap,"cancelled");return -1;}
     if(mode==6)changed=1;
-    return read_bytes(mode==10||mode==13||mode==18||(mode>=31&&mode!=34&&mode!=38&&mode!=39)?bad:good,b,len);
+    return read_bytes(mode==10||mode==13||mode==18||(mode>=31&&mode!=34&&mode!=38&&mode!=39&&mode!=42)?bad:good,b,len);
 }
 int s2a_program_cache_store_async(const char *root,const uint8_t id[32],const uint8_t *b,size_t n) {
     (void)root;(void)id;(void)b;(void)n;stores++;return mode==9?-1:0;
+}
+static int libpack_calls;
+// #1434 第二笔 LibPack 桩：mode40 hit 回 good、41 miss、42 reject——
+// 插序验收（离线库 miss 后、私有缓存前）由 libpack_calls/offline/disk 计数对照读出。
+int s2a_libpack_compute_v1(const struct s2a_libpack *lp,const uint8_t cs_key[8],
+    int unaligned,uint32_t sreq,uint32_t abi,const char *ph,const char *tc,
+    uint8_t **j,size_t *jl,char *why,size_t cap) {
+    (void)lp;(void)cs_key;(void)unaligned;(void)sreq;(void)abi;(void)ph;(void)tc;
+    libpack_calls++;
+    if(mode==41){snprintf(why,cap,"absent");return S2A_LIBPACK_MISS;}
+    if(mode==42){snprintf(why,cap,"container broke");return S2A_LIBPACK_REJECT;}
+    return read_bytes(good,j,jl)?S2A_LIBPACK_REJECT:S2A_LIBPACK_HIT;
 }
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"FAIL mode%d line%d: %s\n",mode,__LINE__,#c);return 1;}}while(0)
 int main(int argc,char **argv){
@@ -71,7 +84,7 @@ int main(int argc,char **argv){
     r.profile.storage_alignment=16;snprintf(r.profile.hash,sizeof r.profile.hash,"%s",pc.profile_hash);
     // Producer-contract modes feed the real CLI envelope through the fresh path;
     // request/context fields come from the emitted request+profile, never literals.
-    if(mode>=34&&mode!=39){
+    if(mode>=34&&mode<=38){
         const char *req=getenv("W2_REQ"),*clo=getenv("W2_CLOSURE"),*pro=getenv("W2_PROFILE"),
                    *al=getenv("W2_ALIGN"),*ws=getenv("W2_S"),*wg=getenv("W2_G");
         CHECK(req&&clo&&pro&&al&&ws&&wg);
@@ -92,6 +105,13 @@ int main(int argc,char **argv){
     if(mode==15)r.generation++;
     if(mode==16)o.revision_root=o.private_cache_root=NULL;
     if(mode>=28&&mode<=30)o.no_live_compile=1;
+    // LibPack 门：options 双非空才查；profile_json 是 supportLayout.requiredSize 真值源
+    if(mode>=40&&mode<=42){
+        static const uint8_t k8[8]={0x40,0x0a,0x08,0xfc,0xa2,0x96,0x79,0xef};
+        o.libpack=(const struct s2a_libpack *)(const void *)0x1;o.libpack_key=k8;
+        pc.profile_json="{\"supportLayout\":{\"requiredSize\":2608}}";
+        pc.profile_bytes=strlen(pc.profile_json);
+    }
     int rc=nvk_compute_lookup(&r,&pc,&o,&result,why,sizeof why);
     if(mode==28) {
         CHECK(rc!=0 && !result.bytes && !compile && !stores);
@@ -102,6 +122,18 @@ int main(int argc,char **argv){
     } else if(mode==29 || mode==30) {
         CHECK(!rc && result.bytes && !compile && !stores);
         CHECK(result.origin==(mode==29?1:2)); free(result.bytes);
+    } else if(mode>=40&&mode<=42) {
+        // #1434 第二笔插序验收：离线库 miss→LibPack→私有/现编。
+        // 40 hit：origin=OFFLINE、私有缓存与现编都没碰过、不写回——「首遇现编 0」。
+        // 41 miss：落到私有缓存命中。42 reject：落到现编并写回。三态不混。
+        CHECK(libpack_calls==1&&offline==1);
+        if(mode==40){CHECK(!rc&&result.origin==1&&!disk&&!compile&&!stores);
+            CHECK(!result.private_reason[0]);}   // 私有缓存没进过
+        if(mode==41){CHECK(!rc&&result.origin==2&&disk==1&&!compile&&!stores);
+            CHECK(strstr(result.offline_reason,"libpack:"));}   // 追加在离线库原因后
+        if(mode==42){CHECK(!rc&&result.origin==3&&compile==1&&stores==1);
+            CHECK(strstr(result.offline_reason,"libpack: container broke"));}
+        free(result.bytes);
     } else if(mode==5||mode==6||mode==7||mode==8||mode==10||mode==13||mode==15||mode==18||mode==20||(mode>=22&&mode!=34&&mode!=38)){
         CHECK(rc!=0);CHECK(!result.bytes);CHECK(!stores);
         if(mode==8||mode==15||mode==20||(mode>=22&&mode<=30))CHECK(!offline&&!disk&&!compile);

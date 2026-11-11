@@ -7,9 +7,12 @@
 #include "direct/w2_observation.h"
 #include "direct/diag.h"
 #include "direct/compile_export.h"
+#include "direct/libpack_vk.h"
+#include "../../../graphics/nvn/gfx/nvn/dmsh_chain.h"   // #1434：b-<DMSH_CHAIN>-vk 库目录名
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #include <android/log.h>
@@ -177,6 +180,44 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
     // 结果封套与请求侧同一道门、同一个目录：两侧文件名只有后缀不同（请求 .compile-request.json，
     // 结果 .compile-result.json），现场按 requestId + 身份后缀直接配对。
     options.diag_open = diag_open;
+#ifdef __ANDROID__
+    // #1434 第二笔：compute 段 LibPack——与 draw 同门（debug.s2a.libpack_vk=1 才开）、
+    // 同容器（<revision>/shaders/direct/b-<链>-vk）、同序（lookup 内离线库 miss 后、
+    // 私有缓存前查）。no_offline 把 revision 置 NULL 时本门同关。键是 dispatch 快照
+    // keys[0] 的 packed CS 键（vk_record.c 绑定时灌入），容器句柄按 revision_root 缓存。
+    if (options.revision_root) {
+        static int libpack_on = -1;
+        if (libpack_on < 0) {
+            char b[PROP_VALUE_MAX] = {0};
+            __system_property_get("debug.s2a.libpack_vk", b);
+            libpack_on = (b[0] == '1');
+        }
+        if (libpack_on) {
+            static struct s2a_libpack *lp_pack;
+            static char lp_root[1100];
+            char lp_dir[1200];
+            snprintf(lp_dir, sizeof lp_dir, "%s/shaders/direct/b-%s-vk", options.revision_root, DMSH_CHAIN);
+            if (!lp_pack || strcmp(lp_root, options.revision_root)) {
+                struct s2a_libpack *np = NULL;
+                int orc = s2a_libpack_open(&np, lp_dir);
+                if (orc == 1) {
+                    s2a_libpack_close(lp_pack);
+                    lp_pack = np;
+                    snprintf(lp_root, sizeof lp_root, "%s", options.revision_root);
+                } else {
+                    if (orc < 0) {
+                        static _Atomic int nl;
+                        if (atomic_fetch_add(&nl, 1) < 4)
+                            __android_log_print(ANDROID_LOG_INFO, "S2Arm",
+                                                "compute: libpack container at %s rejected", lp_dir);
+                    }
+                    lp_pack = NULL; lp_root[0] = 0;
+                }
+            }
+            if (lp_pack) { options.libpack = lp_pack; options.libpack_key = state->keys[0]; }
+        }
+    }
+#endif
     options.pause = pause_exec; options.resume = resume_exec;
     struct nvk_compute_lookup_result program = {0};
     // Exactly one immutable REQUEST/identity and one lookup; no alternate bool.

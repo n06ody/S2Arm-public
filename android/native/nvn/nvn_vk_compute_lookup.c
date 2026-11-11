@@ -8,6 +8,7 @@
 #include "direct/offline_library.h"
 #include "direct/program_cache.h"
 #include "direct/compile_worker.h"
+#include "direct/libpack_vk.h"
 #include "direct/json.h"
 #include "direct/diag.h"
 #include <stdlib.h>
@@ -150,6 +151,25 @@ missing:
 done:
     free(j); return rc;
 }
+/* #1434 第二笔：live profile 的 supportLayout.requiredSize —— LibPack compute 结果
+ * 里该字段的唯一合法真值源（_b.json 不带 profile 级量，不写死常量）。 */
+static int profile_support_required(const struct s2a_direct_compile_context *c, uint32_t *out) {
+    if (!c->profile_json || !c->profile_bytes) return -1;
+    s2a_json_object *j = malloc(sizeof *j);
+    if (!j) return -1;
+    const s2a_json_field *f; int rc = -1;
+    if (!s2a_json_parse_object((const uint8_t *)c->profile_json, c->profile_bytes, j, NULL, 0)) {
+        f = s2a_json_get(j, "supportLayout");
+        if (f && f->kind == S2A_JSON_OBJECT &&
+            !s2a_json_parse_object(f->raw, f->raw_bytes, j, NULL, 0)) {
+            f = s2a_json_get(j, "requiredSize");
+            if (f && f->kind == S2A_JSON_NUMBER && f->number >= 1 && f->number <= 0xffffffff) {
+                *out = (uint32_t)f->number; rc = 0;
+            }
+        }
+    }
+    free(j); return rc;
+}
 int nvk_compute_lookup(const struct nvk_compute_request *r,
     const struct s2a_direct_compile_context *c, const struct nvk_compute_lookup_options *options,
     struct nvk_compute_lookup_result *out, char *why, size_t cap) {
@@ -183,6 +203,30 @@ int nvk_compute_lookup(const struct nvk_compute_request *r,
         if (rc == S2A_OFFLINE_HIT && !accept(p.bytes, p.len, &e, 0, out->offline_reason, sizeof out->offline_reason)) {
             bytes=p.bytes; length=p.len; out->origin=NVK_COMPUTE_OFFLINE;
         } else free(p.bytes);
+    }
+    /* #1434 第二笔：离线库 miss 后、私有缓存前插 LibPack compute 查询（draw 侧同序）。
+     * 8 字节 packed CS 键域独立于 32 字节 identity 键域——两条键域不互查。
+     * 命中按已合成 v1 走同一 accept 复核，归 origin=OFFLINE，不写私有缓存；
+     * miss/reject 如实落 offline_reason（与离线库原因并存取先写者）。 */
+    if (!bytes && options->libpack && options->libpack_key) {
+        uint32_t sreq = 0;
+        char lwhy[160] = "";
+        int lrc = profile_support_required(c, &sreq)
+            ? (snprintf(lwhy, sizeof lwhy, "profile supportLayout.requiredSize unavailable"),
+               S2A_LIBPACK_REJECT)
+            : s2a_libpack_compute_v1(options->libpack, options->libpack_key,
+                e.unaligned, sreq, e.abi, e.profile, e.closure, &bytes, &length, lwhy, sizeof lwhy);
+        if (lrc == S2A_LIBPACK_HIT &&
+            !accept(bytes, length, &e, 0, out->offline_reason, sizeof out->offline_reason)) {
+            out->origin = NVK_COMPUTE_OFFLINE;
+        } else {
+            free(bytes); bytes = NULL; length = 0;
+            if (lwhy[0]) {
+                size_t used = strlen(out->offline_reason);
+                snprintf(out->offline_reason + used, sizeof out->offline_reason - used,
+                         "%slibpack: %s", used ? "; " : "", lwhy);
+            }
+        }
     }
     if (!bytes && options->private_cache_root) {
         uint8_t digest[32];

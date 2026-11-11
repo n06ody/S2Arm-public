@@ -372,3 +372,221 @@ out:
     else atomic_fetch_add(&g_rejects, 1);
     return worst;
 }
+
+// ---------------- compute：_b.json + .spv 声明扫描 → s2a-direct-program-v1 ----------------
+
+// .spv 里被声明（Binding+DescriptorSet 装饰）的描述符：OpName ↔ _b.json msl_name 联接的真值侧。
+#define LP_CS_MAX_DESCS 64
+struct lp_cs_desc { uint32_t binding; char name[80]; };
+
+// SPIR-V 词流扫描：OpDecorate(71) 收 Binding(33)/DescriptorSet(34)，OpName(5) 收变量名。
+// 只登记 set==0 且带名字的描述符；返回条数，0 = 没有声明（空表如实照出），负 = .spv 词流坏/表满。
+static int lp_spv_descs(const uint8_t *spv, size_t sn, struct lp_cs_desc *out, int cap) {
+    const uint32_t *w = (const uint32_t *)spv;
+    size_t nw = sn / 4;
+    uint32_t maxid = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t word = w[i], wc = word >> 16;
+        unsigned op = word & 0xffff;
+        if (!wc || i + wc > nw) return -1;
+        if ((op == 71 || op == 5) && wc >= 2 && w[i + 1] > maxid) maxid = w[i + 1];
+        i += wc;
+    }
+    if (!maxid) return 0;
+    int32_t *bind = malloc((maxid + 1) * sizeof *bind), *dset = malloc((maxid + 1) * sizeof *dset);
+    char **names = calloc(maxid + 1, sizeof *names);
+    if (!bind || !dset || !names) { free(bind); free(dset); free(names); return -1; }
+    for (uint32_t i = 0; i <= maxid; ++i) { bind[i] = -1; dset[i] = -1; }
+    int n = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t word = w[i], wc = word >> 16;
+        unsigned op = word & 0xffff;
+        if (op == 71 && wc >= 4) {
+            uint32_t t = w[i + 1];
+            if (w[i + 2] == 33) bind[t] = (int32_t)w[i + 3];
+            else if (w[i + 2] == 34) dset[t] = (int32_t)w[i + 3];
+        } else if (op == 5 && wc >= 3 && !names[w[i + 1]]) {
+            size_t nb = (wc - 2) * 4;
+            char *s = malloc(nb + 1);
+            if (s) { memcpy(s, w + i + 2, nb); s[nb] = 0; names[w[i + 1]] = s; }
+        }
+        i += wc;
+    }
+    int rc = n;
+    for (uint32_t i = 0; i <= maxid; ++i) {
+        if (bind[i] < 0 || dset[i] != 0 || !names[i]) continue;
+        if (n == cap) { rc = -1; break; }
+        out[n].binding = (uint32_t)bind[i];
+        snprintf(out[n].name, sizeof out[n].name, "%s", names[i]);
+        rc = ++n;
+    }
+    for (uint32_t i = 0; i <= maxid; ++i) free(names[i]);
+    free(names); free(bind); free(dset);
+    return rc;
+}
+
+// _b.json bindings[] 的取用面：emit 只按名字命中后读 kind/reg/off/bank/rw/arg_id。
+#define LP_CS_MAX_JBINDS 64
+struct lp_jb { char name[80], kind[24]; uint32_t arg_id, reg, off, bank, rw; int has_reg, has_off, has_bank, has_rw; };
+
+// `_c\d+` 名字 → c bank 号（cp_c0=0、vp_c3=3）；不是该形 → -1。
+static int lp_cbank(const char *name) {
+    size_t n = strlen(name);
+    if (n < 4 || name[0] < 'a' || name[0] > 'z') return -1;
+    const char *p = name + n;
+    while (p > name && p[-1] >= '0' && p[-1] <= '9') --p;
+    if (p == name + n || p - name < 2 || p[-1] != 'c' || p[-2] != '_') return -1;
+    uint32_t bank = 0;
+    for (const char *q = p; *q; ++q) { bank = bank * 10 + (uint32_t)(*q - '0'); if (bank > 1000) return -1; }
+    return (int)bank;
+}
+
+int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t cs_key[8],
+                           int unaligned, uint32_t support_required,
+                           uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size) {
+    if (!lp || !lp->p.idx || !cs_key || !json || !json_len || !support_required)
+        return S2A_LIBPACK_INVALID;
+    *json = NULL; *json_len = 0;
+    int rc = S2A_LIBPACK_REJECT;
+    char khex[17];
+    for (int i = 0; i < 8; i++) snprintf(khex + 2 * i, 3, "%02x", cs_key[i]);
+    uint8_t *jb = NULL, *spv = NULL; size_t jn = 0, sn = 0;
+    struct jw binds = {0}, doc = {0};
+    rc = s2a_libpack_get(lp, cs_key, LP_K_BJSON, &jb, &jn, why, why_size);
+    if (rc != S2A_LIBPACK_HIT) goto out_free;
+    rc = s2a_libpack_get(lp, cs_key, LP_K_BSPV, &spv, &sn, why, why_size);
+    if (rc != S2A_LIBPACK_HIT) goto out_free;
+    rc = S2A_LIBPACK_REJECT;
+    {
+        struct s2a_jv top = { (const char *)jb, jn };
+        const char *jend = NULL;
+        if (!s2a_jv_is_object(top) || s2a_jv_scan((const char *)jb, (const char *)jb + jn, &jend)
+            || jend != (const char *)jb + jn) {
+            lp_fail(why, why_size, "%s _b.json: not a complete JSON object", khex); goto out_free;
+        }
+        char ctl[20] = "", st[8] = "";
+        if (jf_str(top, "dm_ctl", ctl, sizeof ctl) || strcmp(ctl, khex))
+            { lp_fail(why, why_size, "%s _b.json dm_ctl mismatch", khex); goto out_free; }
+        if (jf_str(top, "stage", st, sizeof st) || strcmp(st, "cs"))
+            { lp_fail(why, why_size, "%s _b.json stage is '%s' not 'cs'", khex, st); goto out_free; }
+        if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
+            { lp_fail(why, why_size, "%s _b.spv is not a SPIR-V module", khex); goto out_free; }
+        struct s2a_jv ts;
+        if (!s2a_jv_obj_find(top, "tex_scales", &ts) && s2a_jv_is_array(ts) && s2a_jv_arr_count(ts) > 0)
+            { lp_fail(why, why_size, "%s has tex_scales entries (scaled-access bindings not mapped)", khex); goto out_free; }
+        // _b.json bindings → 名索引表
+        struct lp_jb jbs[LP_CS_MAX_JBINDS]; int nj = 0;
+        {
+            struct s2a_jv arr;
+            if (s2a_jv_obj_find(top, "bindings", &arr) || !s2a_jv_is_array(arr))
+                { lp_fail(why, why_size, "%s: no bindings array", khex); goto out_free; }
+            nj = s2a_jv_arr_count(arr);
+            if (nj < 0 || nj > LP_CS_MAX_JBINDS)
+                { lp_fail(why, why_size, "%s: bindings array count %d", khex, nj); goto out_free; }
+            for (int i = 0; i < nj; ++i) {
+                struct s2a_jv b;
+                struct lp_jb *e = &jbs[i];
+                if (s2a_jv_arr_item(arr, i, &b) ||
+                    jf_str(b, "msl_name", e->name, sizeof e->name) ||
+                    jf_str(b, "kind", e->kind, sizeof e->kind) ||
+                    jf_u32(b, "arg_id", &e->arg_id))
+                    { lp_fail(why, why_size, "%s bindings[%d] missing msl_name/kind/arg_id", khex, i); goto out_free; }
+                e->has_reg = !jf_u32(b, "reg", &e->reg);
+                e->has_off = !jf_u32(b, "off", &e->off);
+                e->has_bank = !jf_u32(b, "bank", &e->bank);
+                e->has_rw = !jf_bool(b, "rw", &e->rw);
+            }
+        }
+        // .spv 声明扫描：只照它实际声明的描述符出行
+        struct lp_cs_desc descs[LP_CS_MAX_DESCS];
+        int nd = lp_spv_descs(spv, sn, descs, LP_CS_MAX_DESCS);
+        if (nd < 0) { lp_fail(why, why_size, "%s _b.spv descriptor scan failed", khex); goto out_free; }
+        int sep = 0;
+        for (int i = 0; i < nd; ++i) {
+            const struct lp_cs_desc *d = &descs[i];
+            if (d->binding % 6 != 5)
+                { lp_fail(why, why_size, "%s descriptor '%s' binding %u is not arg*6+5", khex, d->name, d->binding); goto out_free; }
+            uint32_t arg = d->binding / 6;
+            size_t ml = strlen(d->name);
+            if (ml > 5 && !strcmp(d->name + ml - 5, "Smplr")) continue;   // 合并纹理采样器半边
+            const struct lp_jb *e = NULL;
+            for (int j = 0; j < nj; ++j) if (!strcmp(jbs[j].name, d->name)) { e = &jbs[j]; break; }
+            const char *kind = e ? e->kind : NULL;
+            if (!strcmp(d->name, "support_buffer") || (kind && !strcmp(kind, "support"))) {
+                jw_fmt(&binds, "%s{\"kind\":\"support\",\"stage\":\"program\",\"set\":0,\"binding\":%u,\"count\":1}",
+                       sep ? "," : "", d->binding); sep = 1; continue;
+            }
+            if (e && e->arg_id != arg)
+                { lp_fail(why, why_size, "%s '%s' arg_id %u != .spv arg %u", khex, d->name, e->arg_id, arg); goto out_free; }
+            const char *v1kind = NULL;
+            char prov[160] = ""; uint32_t slot = 0; int has_slot = 0; uint32_t rw = 0;
+            if (!e) {
+                // .spv 声明了但 _b.json 没有名字：只有 c bank 名可解（support_buffer 上面已截）
+                int bank = lp_cbank(d->name);
+                if (bank < 0)
+                    { lp_fail(why, why_size, "%s descriptor '%s' has no _b.json entry and no decodable name", khex, d->name); goto out_free; }
+                if (bank == 2 || bank > 18)
+                    { lp_fail(why, why_size, "%s c%d bank used as uniform is unsupported", khex, bank); goto out_free; }
+                v1kind = "uniform"; slot = (uint32_t)bank; has_slot = 1;
+            } else if (!strcmp(kind, "cbuf")) {
+                if (!e->has_reg) { lp_fail(why, why_size, "%s '%s' cbuf without reg", khex, d->name); goto out_free; }
+                v1kind = "uniform"; slot = e->reg + 3; has_slot = 1;
+            } else if (!strcmp(kind, "c1")) {
+                v1kind = "uniform"; slot = 1; has_slot = 1;
+            } else if (!strcmp(kind, "drvcb")) {
+                if (!e->has_bank || e->bank == 2 || e->bank > 18)
+                    { lp_fail(why, why_size, "%s '%s' drvcb bank %u unsupported", khex, d->name, e->has_bank ? e->bank : 999u); goto out_free; }
+                v1kind = "uniform"; slot = e->bank; has_slot = 1;
+            } else if (!strcmp(kind, "tex") || !strcmp(kind, "tbuf")) {
+                if (!e->has_reg || e->reg >= 32)
+                    { lp_fail(why, why_size, "%s '%s' texture reg outside combined slots", khex, d->name); goto out_free; }
+                v1kind = "texture"; slot = 8 + e->reg * 2; has_slot = 1;
+            } else if (!strcmp(kind, "sbuf") || !strcmp(kind, "ubo_ptr") || !strcmp(kind, "sbuf_ubo")) {
+                v1kind = "storage";
+                if (!e->has_rw) { lp_fail(why, why_size, "%s '%s' storage missing rw", khex, d->name); goto out_free; }
+                rw = e->rw;
+                if (!strcmp(kind, "sbuf")) {
+                    if (!e->has_reg || e->reg >= 16)
+                        { lp_fail(why, why_size, "%s '%s' sbuf outside c0 storage table", khex, d->name); goto out_free; }
+                    snprintf(prov, sizeof prov, ",\"cbSlot\":0,\"cbOffset\":%u,\"nvnSlot\":%u", 0x310 + e->reg * 16, e->reg);
+                } else if (!strcmp(kind, "ubo_ptr")) {
+                    if (!e->has_reg || e->reg >= 16)
+                        { lp_fail(why, why_size, "%s '%s' ubo_ptr outside c0 UBO table", khex, d->name); goto out_free; }
+                    snprintf(prov, sizeof prov, ",\"cbSlot\":0,\"cbOffset\":%u,\"uboPtr\":%u", 0x210 + e->reg * 16, e->reg);
+                } else {
+                    if (!e->has_reg || e->reg >= 16 || !e->has_off)
+                        { lp_fail(why, why_size, "%s '%s' sbuf_ubo mapping incomplete", khex, d->name); goto out_free; }
+                    snprintf(prov, sizeof prov, ",\"cbSlot\":%u,\"cbOffset\":%u,\"uboSlot\":%u,\"uboOffset\":%u",
+                             e->reg + 3, e->off, e->reg, e->off);
+                }
+            } else {
+                lp_fail(why, why_size, "%s '%s' kind '%s' not mappable for compute", khex, d->name, kind); goto out_free;
+            }
+            jw_fmt(&binds, "%s{\"kind\":\"%s\",\"stage\":\"cs\",\"set\":0,\"binding\":%u,\"count\":1",
+                   sep ? "," : "", v1kind, d->binding); sep = 1;
+            if (has_slot) jw_fmt(&binds, ",\"slot\":%u", slot);
+            if (prov[0]) jw_str(&binds, prov);
+            if (!strcmp(v1kind, "storage")) jw_fmt(&binds, ",\"rw\":%s", rw ? "true" : "false");
+            jw_str(&binds, "}");
+        }
+        jw_fmt(&doc, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"contract\":\"s2a-direct-program-content-v1\",\"identity\":{\"directABI\":%u,\"translatorClosure\":\"%s\",\"profileHash\":\"%s\",\"runtimeCompilerABI\":\"s2a-direct-compile-v1\"},\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":%s,\"c0Reads\":null,\"stages\":[{\"stage\":\"cs\",\"spirv\":\"",
+               direct_abi, translator_closure ? translator_closure : "", profile_hash ? profile_hash : "",
+               unaligned ? "true" : "false");
+        jw_b64(&doc, spv, sn);
+        jw_fmt(&doc, "\",\"attributeReadMask\":0}],\"bindings\":[");
+        jw_put(&doc, binds.b ? (char *)binds.b : "", binds.n);
+        jw_fmt(&doc, "],\"supportLayout\":{\"requiredSize\":%u},\"supportReads\":null}}", support_required);
+        if (doc.oom || binds.oom) { lp_fail(why, why_size, "compute v1 synthesis out of memory"); goto out_free; }
+        *json = doc.b; *json_len = doc.n;
+        rc = S2A_LIBPACK_HIT;
+    }
+out_free:
+    free(binds.b);
+    if (rc != S2A_LIBPACK_HIT) { free(doc.b); }
+    free(jb); free(spv);
+    if (rc == S2A_LIBPACK_HIT) atomic_fetch_add(&g_hits, 1);
+    else if (rc == S2A_LIBPACK_MISS) atomic_fetch_add(&g_misses, 1);
+    else atomic_fetch_add(&g_rejects, 1);
+    return rc;
+}
