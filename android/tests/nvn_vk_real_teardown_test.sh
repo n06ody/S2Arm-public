@@ -27,7 +27,8 @@ icd=$(find_icd || true); layer=$(find_layer || true)
 [ -f "$layer/VkLayer_khronos_validation.json" ] || { echo 'missing Khronos validation layer; NOT RUN' >&2; exit 2; }
 glslc=${GLSLC:-$(command -v glslc || true)}
 [ -x "$glslc" ] || { echo 'missing glslc; NOT RUN' >&2; exit 2; }
-out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+mkdir -p "$repo/build"
+out=$(mktemp -d "$repo/build/clear-fv-vvl.XXXXXXXX"); trap 'rm -rf "$out"' EXIT
 inc=("$repo/android/tests/vkhost" "$repo/android/tests/hostvk" "$repo/android/native" "$repo/android/native/direct" "$repo/android/native/nvn" "$repo/runtime/include" "$repo/graphics/nvn/gfx/nvn" "$repo/graphics/nvn/gfx/nvn/include" "$repo/graphics/nvn/gfx/tex" "$repo/graphics/nvn/third_party/vulkan-headers/include")
 args=(); for dir in "${inc[@]}"; do args+=(-I "$dir"); done
 # nvn_vk_compute.c：292b8a24 给 session 收尾加了 nvn_vk_compute_pso_cache_release；
@@ -61,6 +62,11 @@ if [ "$mode" != --neg ]; then
     "$out/probe" "$out/program.json" "$out/cache" >"$out/normal.log" 2>&1 || { cat "$out/normal.log" >&2; exit 1; }
     if grep -qiE 'validation error|VUID-|UNASSIGNED-|SYNC-HAZARD|ERROR.*VALIDATION' "$out/normal.log"; then cat "$out/normal.log" >&2; exit 1; fi
     cat "$out/normal.log"
+    # 同一真实 Vulkan / 同步校验环境覆盖清除缓存满、临时对象退休及逐图读回。
+    compile "$repo/android/tests/nvn_vk_clear_fv_vvl_test.c" -o "$out/clear-fv-probe"
+    "$out/clear-fv-probe" >"$out/clear-fv.log" 2>&1 || { cat "$out/clear-fv.log" >&2; exit 1; }
+    if grep -qiE 'validation error|VUID-|UNASSIGNED-|SYNC-HAZARD|ERROR.*VALIDATION' "$out/clear-fv.log"; then cat "$out/clear-fv.log" >&2; exit 1; fi
+    cat "$out/clear-fv.log"
     exit 0
 fi
 # Mutation is generated only under $out. Remove the #1472 production destroy

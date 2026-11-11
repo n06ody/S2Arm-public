@@ -340,9 +340,10 @@ s2a_gate_step "$PY" "$android_dir/tests/w2_observation_adapter_test.py"
 case "$(uname -s)" in
   Linux)
     s2a_gate_step "$PY" "$android_dir/tests/nvn_vk_clear_enqueue_ownership_test.py"
+    s2a_gate_step "$PY" "$android_dir/tests/nvn_vk_clear_fv_test.py"
     s2a_gate_step "$PY" "$android_dir/tests/w2_dispatch_snapshot_test.py"
     s2a_gate_step "$PY" "$android_dir/tests/w2_record_chain_test.py" ;;
-  *) s2a_gate_note "clear queue ownership / W2 dispatch snapshot / record chain：未运行（仅 Linux 主机 libvulkan.so.1 组件测试）" ;;
+  *) s2a_gate_note "clear queue ownership / clear FV lifetime / W2 dispatch snapshot / record chain：未运行（仅 Linux 主机 libvulkan.so.1 组件测试）" ;;
 esac
 # vk_record 生产入口探针（P0-0b DrawTexture 准确拒绝 / P0-0b' Deferred 句柄执行时读取）：只链生产
 # vk_record.c 与其直接依赖，vk* 导入由宿主 Vulkan loader 解析（不建 device、不开 ICD）。只在

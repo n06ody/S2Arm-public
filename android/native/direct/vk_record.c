@@ -1706,7 +1706,11 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                         texture->image, clear_format, VK_IMAGE_ASPECT_COLOR_BIT,
                         base_level + lv, base_layer + ly,
                         rec_mipdim(texture->width, base_level + lv), rec_mipdim(texture->height, base_level + lv),
+                        NULL,
                     };
+                    extern void *s2a_vk_adapter_clear_tex(uint64_t, VkImage) __attribute__((weak));
+                    if (s2a_vk_clear_fv_enabled() && s2a_vk_adapter_clear_tex)
+                        t.native_tex = s2a_vk_adapter_clear_tex(texture->serial, texture->image);
                     char cwhy[192] = "";
                     // C1：整幅、无掩码的清除录进帧队列，不 submit 不等 fence；不能表达才走同步路径。
                     int crc = s2a_vk_clear_color_queued(device, &t, &color, (uint32_t)clear.mask & 0xfu,
@@ -2841,7 +2845,11 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                         texture->image, texture->format, aspect,
                         base_level + lv, base_layer + ly,
                         rec_mipdim(texture->width, base_level + lv), rec_mipdim(texture->height, base_level + lv),
+                        NULL,
                     };
+                    extern void *s2a_vk_adapter_clear_tex(uint64_t, VkImage) __attribute__((weak));
+                    if (s2a_vk_clear_fv_enabled() && s2a_vk_adapter_clear_tex)
+                        t.native_tex = s2a_vk_adapter_clear_tex(texture->serial, texture->image);
                     char cwhy[192] = "";
                     // C1：同 ClearColor。逐位模板掩码、部分 rect 等表达不了的仍走同步路径。
                     int crc = s2a_vk_clear_ds_queued(device, &t, v.depth, (uint32_t)v.stencil & 0xffu, dmask, smask,
