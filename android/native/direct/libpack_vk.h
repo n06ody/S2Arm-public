@@ -51,6 +51,24 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
 
+// compute 变体：dispatch 快照的 packed CS 键（s2a_record_dispatch_state.keys[0]，
+//   vk_record.c 在绑定时灌入）→ 单 cs 阶段的 s2a-direct-program-v1 字节。
+//   unaligned 必须是本次请求的 computeState.hasUnalignedStorageBuffer 实值
+//   （accept 端把它跟请求交叉核，代造会拒）；support_required 必须是本局 profile 的
+//   supportLayout.requiredSize 实值（live profile 是唯一真值来源，不从库文件猜）。
+//   绑定映射以 .spv 实际声明的描述符为准（OpName ↔ _b.json msl_name 联接）：
+//   cbuf→uniform(slot=reg+3)、c1→uniform(slot=1)、drvcb→uniform(slot=bank)、
+//   support_buffer→support(stage="program")、sbuf→storage(nvnSlot, cbSlot=0/cbOffset=0x310+16r)、
+//   ubo_ptr→storage(uboPtr, cbSlot=0/cbOffset=0x210+16r)、sbuf_ubo→storage(uboSlot+uboOffset,
+//   cbSlot=reg+3)、tex/tbuf→texture(slot=8+2·reg, reg<32)；…Smplr 行是合并纹理的采样器半边不出行。
+//   _b.json 有而 .spv 未声明的成员（ubolen/sbsize 等宿主表）不出行；.spv 声明了但 v1 表达不了的
+//   （image/gmem_*/UBO 内句柄纹理/宿主表描述符/来源缺失的 storage）如实 REJECT。
+//   c0Reads/supportReads 写 null——如实走 unknown 兜底（运行时按完整 c0 布局/恒等 support 填）。
+int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t cs_key[8],
+                           int unaligned, uint32_t support_required,
+                           uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size);
+
 uint64_t s2a_libpack_hits(void);
 uint64_t s2a_libpack_misses(void);
 uint64_t s2a_libpack_rejects(void);
