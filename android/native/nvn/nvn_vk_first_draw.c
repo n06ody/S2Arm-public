@@ -1064,6 +1064,7 @@ struct fd_frame_q {
     VkSampler samps[FD_FRAME_SAMPS]; int nsamp;
     VkDescriptorPool pools[FD_FRAME_POOLS]; int npool;
     VkFramebuffer fbs[FD_FRAME_FBS]; int nfb;
+    VkFramebuffer clear_fbs[FD_FRAME_FBS]; VkImageView clear_views[FD_FRAME_FBS]; int nclear;
     // feedback 采样快照：本帧内“附件同时当采样源”的 draw 用；等这批命令有完成证明后再销毁。
     VkImage fbimg[FD_FRAME_FBS]; VkDeviceMemory fbmem[FD_FRAME_FBS]; VkImageView fbview[FD_FRAME_FBS];
     int nfbimg;
@@ -1237,6 +1238,7 @@ static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {
     for (int i = 0; i < q->nsamp; i++) vkDestroySampler(d->device, q->samps[i], NULL);
     for (int i = 0; i < q->npool; i++) vkDestroyDescriptorPool(d->device, q->pools[i], NULL);
     for (int i = 0; i < q->nfb; i++) vkDestroyFramebuffer(d->device, q->fbs[i], NULL);
+    for (int i = 0; i < q->nclear; i++) { vkDestroyFramebuffer(d->device, q->clear_fbs[i], NULL); vkDestroyImageView(d->device, q->clear_views[i], NULL); }
     for (int i = 0; i < q->npass; i++) vkDestroyRenderPass(d->device, q->passes[i], NULL);
     for (int i = 0; i < q->nfbimg; i++) {
         if (q->fbview[i]) vkDestroyImageView(d->device, q->fbview[i], NULL);
@@ -1385,7 +1387,7 @@ static VkDevice g_fq_fence_dev;
 
 static void fd_fq_reset(void) {
     g_fq.ncmd = 0; g_fq.nbuf = 0; g_fq.nsamp = 0; g_fq.npool = 0; g_fq.nfb = 0; g_fq.npass = 0; g_fq.npend = 0;
-    g_fq.nfbimg = 0;
+    g_fq.nfbimg = 0; g_fq.nclear = 0;
     g_fq.submitted_n = 0; g_fq.nbatch_fence = 0; g_fq.fence = VK_NULL_HANDLE;
     memset(g_fq.batch_qid, 0, sizeof g_fq.batch_qid); g_fq.suffix_qid = 0;
     g_fq.state = FD_FQ_IDLE;
@@ -2457,6 +2459,34 @@ int nvn_vk_first_draw_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) {
     // 否则这笔 clear 的命令缓冲会排到那些 draw 前面（画面重排）。
     if (fd_batch_seal(d) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
     if (g_fq.ncmd >= fd_fq_cmd_capacity()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    g_fq.cmds[g_fq.ncmd] = cmd;
+    g_fq.pmap[g_fq.ncmd] = NULL;
+    g_fq.pid[g_fq.ncmd][0] = 0;
+    g_fq.ncmd++;
+    if (g_fq.ncmd - g_fq.submitted_n >= fd_batch_passes() && fd_submit_batch() != 0)
+        return S2A_FQ_ENQUEUE_FAILED_OWNED;
+    return S2A_FQ_ENQUEUE_ACCEPTED;
+}
+
+// 按同一个三态契约接手清除命令及其底图/临时对象：所有失败点在转移前，
+// 唯一转移点之后若 submit 失败，命令和对象仍留在终态帧队列中。
+int nvn_vk_first_draw_enqueue_clear(struct s2a_vk_device *d, VkCommandBuffer cmd,
+                                    void *native_tex, VkImage image, uint64_t generation,
+                                    VkFramebuffer fb, VkImageView view, int temporary) {
+    struct nvn_vk_tex *tex = native_tex;
+    if (!d || !cmd || !tex || !tex->valid || tex->retired || tex->image != image ||
+        !generation || tex->generation != generation || !g_fq.dev || g_fq.dev->device != d->device || fd_fq_poisoned())
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (g_op.open && fd_pass_close(g_op.dev ? g_op.dev : g_fq.dev, FD_PCR_CLEAR) != 0)
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (fd_batch_seal(d) != 0 || g_fq.ncmd >= fd_fq_cmd_capacity()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (temporary && (!fb || !view || g_fq.nclear >= FD_FRAME_FBS))
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (fd_pin_tex(tex) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (temporary) {
+        g_fq.clear_fbs[g_fq.nclear] = fb;
+        g_fq.clear_views[g_fq.nclear++] = view;
+    }
     g_fq.cmds[g_fq.ncmd] = cmd;
     g_fq.pmap[g_fq.ncmd] = NULL;
     g_fq.pid[g_fq.ncmd][0] = 0;
@@ -4171,6 +4201,7 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
     for (int i = 0; i < g_fq.nsamp; i++) vkDestroySampler(d->device, g_fq.samps[i], NULL);
     for (int i = 0; i < g_fq.npool; i++) vkDestroyDescriptorPool(d->device, g_fq.pools[i], NULL);
     for (int i = 0; i < g_fq.nfb; i++) vkDestroyFramebuffer(d->device, g_fq.fbs[i], NULL);
+    for (int i = 0; i < g_fq.nclear; i++) { vkDestroyFramebuffer(d->device, g_fq.clear_fbs[i], NULL); vkDestroyImageView(d->device, g_fq.clear_views[i], NULL); }
     for (int i = 0; i < g_fq.npass; i++) vkDestroyRenderPass(d->device, g_fq.passes[i], NULL);
     // 到这里本周期所有提交都已有完成证明（fence 已等到）；快照池的“最后已退休帧号”已在上面的完成点推进。
     for (int i = 0; i < g_fq.nfbimg; i++) {
@@ -4424,6 +4455,12 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
         if (c->buf) vkDestroyBuffer(d->device, c->buf, NULL);
         if (c->mem) fd_devmem_release_dev(d->device, c->mem);
     }
+    // 此入口仅在 device idle 已证后调用。清理可能在终态队列中保留的临时 clear 对象；
+    // 失败/超时且 idle 未证时 session 不会到这里。
+    for (int i = 0; i < g_fq.nclear; i++) {
+        vkDestroyFramebuffer(d->device, g_fq.clear_fbs[i], NULL);
+        vkDestroyImageView(d->device, g_fq.clear_views[i], NULL);
+    }
     memset(&g_op, 0, sizeof g_op);   // 旧设备的 pass/cmd 随设备回收，不再调用 vkDestroy*
     memset(&g_fq, 0, sizeof g_fq);
     g_fq_fence_dev = VK_NULL_HANDLE;
@@ -4442,7 +4479,13 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
     memset(g_pipe_cache, 0, sizeof g_pipe_cache);
     fd_pipe_index_reset();
     g_pipe_clock = 0;
-    g_pin_n = 0;   // 旧设备的纹理随设备回收；不要再 unpin
+#if defined(__APPLE__)
+    extern int s2a_vk_clear_fv_enabled(void) __attribute__((weak_import));
+#else
+    extern int s2a_vk_clear_fv_enabled(void) __attribute__((weak));
+#endif
+    if (s2a_vk_clear_fv_enabled && s2a_vk_clear_fv_enabled()) fd_unpin_all();
+    else g_pin_n = 0;   // 门关保留原有收尾
     // 采样器与程序对象归旧设备；设备销毁前先释放采样器，再清账本。
     if (g_samp_cache_ready) { nvn_vk_sampler_cache_destroy(&g_samp_cache); g_samp_cache_ready = 0; }
     for (int i = 0; i < FD_PROG_OBJ; i++)

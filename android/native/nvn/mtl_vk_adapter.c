@@ -1032,6 +1032,13 @@ static int record_resolve_tex(void *opaque, const void *key, struct s2a_replay_t
     return fmt != VK_FORMAT_UNDEFINED;
 }
 
+// 仅在回放执行持有 adapter 的互斥锁时调用；不建纹理、不上传，身份与 image 双重核对。
+void *s2a_vk_adapter_clear_tex(uint64_t serial, VkImage image) {
+    if (!g_ready || !serial || !image) return NULL;
+    struct nvn_vk_tex *tex = nvn_vk_texcache_find_serial(&g_session.textures, serial);
+    return tex && tex->image == image ? tex : NULL;
+}
+
 // 诊断口径：逐命令的等锁统计默认关（每条命令两次 clock_gettime 只服务这一行日志）。
 static int adapter_cmd_stats(void) {
     static int v = -1;
