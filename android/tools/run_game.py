@@ -1389,28 +1389,37 @@ def shot(adb_argv, dest):
 
 
 def read_debug_props(device):
-    """按 Android getprop 无参输出读取全量快照；不完整或无法判读就拒跑。"""
-    r = subprocess.run([*device.argv, "shell", "getprop"], capture_output=True, timeout=60)
-    if r.returncode or r.stderr:
-        detail = (r.stderr or r.stdout).decode("utf-8", errors="replace")[:300]
-        raise Refuse(f"getprop 全量读取失败（rc={r.returncode}）：{detail}")
-    try:
-        data = r.stdout.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise Refuse(f"getprop 全量输出不是 UTF-8：{error}") from error
-    if not data or not data.endswith("\n"):
-        raise Refuse("getprop 全量输出为空或不完整")
-    props = {}
+    """getprop -T 列现有属性名，再逐键读值，避免无关多行值伪装记录边界。"""
+    def getprop(command):
+        r = subprocess.run([*device.argv, "shell", command], capture_output=True, timeout=60)
+        if r.returncode or r.stderr:
+            detail = (r.stderr or r.stdout).decode("utf-8", errors="replace")[:300]
+            raise Refuse(f"{command} 读取失败（rc={r.returncode}）：{detail}")
+        try:
+            data = r.stdout.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refuse(f"{command} 输出不是 UTF-8：{error}") from error
+        if not data or not data.endswith("\n"):
+            raise Refuse(f"{command} 输出为空或不完整")
+        return data
+
+    # Android getprop -T 按属性列类型，不输出属性值（8E 实测 1220 条）。
+    names = getprop("getprop -T")
     seen = set()
-    for line in data.splitlines():
-        match = re.fullmatch(r"\[([^]\r\n]+)\]: \[(.*)\]", line)
+    keys = []
+    for line in names.splitlines():
+        match = re.fullmatch(r"\[([^]\r\n]+)\]: \[([a-z0-9_]+)\]", line)
         if not match or match.group(1) in seen:
-            raise Refuse(f"getprop 全量输出格式错误或键重复：{line!r}")
-        key, value = match.groups()
+            raise Refuse(f"getprop -T 输出格式错误或键重复：{line!r}")
+        key = match.group(1)
         seen.add(key)
         if key.startswith("debug.s2a."):
-            props[key] = value
-    return props
+            # adb shell 会将参数拼回命令字符串；非合法属性名不能安全交给 shell。
+            if not re.fullmatch(r"debug\.s2a\.[A-Za-z0-9_.-]+", key):
+                raise Refuse(f"getprop -T 发现非法属性名：{key!r}")
+            keys.append(key)
+    # 每条 getprop 输出的最后一个换行是工具追加的，保留属性值自身的换行/空格。
+    return {key: getprop(f"getprop {key}")[:-1] for key in keys}
 
 
 def main(argv=None):

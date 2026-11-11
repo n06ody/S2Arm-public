@@ -521,7 +521,7 @@ if cmd == "shell":
         ticks = int(st["uptime_us"] / 1e6 * 100) - st.get("birth_lag_ticks", 200)
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
-        if len(sh) == 1:
+        if len(sh) == 1 or sh[1:] == ["-T"]:
             import fcntl
             lock_file = st.get("probe_lock_file")
             if lock_file:
@@ -538,8 +538,10 @@ if cmd == "shell":
                 fail("getprop: permission denied")
             if st.get("getprop_all_stderr"):
                 sys.stderr.write("getprop: partial listing\\n")
+            # AOSP getprop -T 返回已存在属性的类型，值本身不会出现在类型清单里。
+            typed = sh[1:] == ["-T"]
             out(st.get("getprop_all_raw", "".join(
-                f"[{k}]: [{v}]\\n" for k, v in sorted(st["props"].items())))); sys.exit(0)
+                f"[{k}]: [{('string' if typed else v)}]\\n" for k, v in sorted(st["props"].items())))); sys.exit(0)
         key = " ".join(sh[1:])
         # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
         # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
@@ -548,7 +550,9 @@ if cmd == "shell":
                 or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None)
                 or (key in st.get("getprop_deny_after_set", []) and key in st.get("props_set_once", []))):
             sys.stderr.write("getprop: permission denied\\n"); save(); sys.exit(1)
-        out(st["props"].get(key, "") + "\\n"); sys.exit(0)
+        if key in st.get("getprop_individual_stderr", []):
+            sys.stderr.write("getprop: partial value\\n")
+        out(st.get("getprop_individual_raw", {}).get(key, st["props"].get(key, "") + "\\n")); sys.exit(0)
     if c == "setprop":
         # props_jam：写空值的 setprop 被设备静默拒（有的构建不让清 debug 属性）→ 旧值还在
         if st.get("props_jam") and sh[1].startswith("debug.s2a.") and (len(sh) <= 2 or not sh[2]):
@@ -2230,6 +2234,36 @@ class RunGameTest(unittest.TestCase):
         self.assertNotIn("launch_cmd", st)
         self.assertFalse(st["installed"])
 
+    def test_debug_prop_preflight_unrelated_multiline(self):
+        # 8E 实测 getprop 的真实换行/边界；内容用无敏感信息的占位符。
+        props = {"persist.sys.boot.reason": "", "persist.sys.boot.reason.history":
+                 "reboot,<时间1>\nreboot,<时间2>\nreboot,userrequested,<时间3>\nreboot,ota,<时间4>",
+                 "persist.sys.brightness_rate": "0", "debug.s2a.clear_log": ""}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, rc, man)
+        self.assertEqual({"debug.s2a.clear_log": ""}, man["debug_props_snapshot"])
+
+    def test_debug_prop_preflight_unrelated_value_cannot_forge_key(self):
+        props = {"persist.sys.boot.reason.history": "reboot\n[debug.s2a.fake]: [1]\nend",
+                 "debug.s2a.query_wait": "1"}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline_forged")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual({"debug.s2a.query_wait": "1"}, man["debug_props_snapshot"])
+        self.assertIn("debug.s2a.query_wait", man["reason"])
+
+    def test_debug_prop_preflight_multiline_residue_refused(self):
+        props = {"persist.sys.boot.reason.history": "reboot,<时间1>\nreboot,<时间2>",
+                 "debug.s2a.query_wait": "1\nextra"}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline_dirty")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual("1\nextra", man["debug_props_snapshot"]["debug.s2a.query_wait"])
+        self.assertIn("debug.s2a.query_wait", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+
     def test_debug_prop_preflight_clean_is_locked(self):
         props = {"ro.product.model": "PixelTest", "debug.s2a.debug_env": "1",
                  "debug.s2a.frame_log": "1", "debug.s2a.session_uuid": "old",
@@ -2271,6 +2305,8 @@ class RunGameTest(unittest.TestCase):
                             ("stderr", {"getprop_all_stderr": True}),
                             ("malformed", {"getprop_all_raw": "[ro.x]: [ok]\n[debug.s2a.bad]: [1\n"}),
                             ("duplicate", {"getprop_all_raw": "[ro.x]: [a]\n[ro.x]: [b]\n"}),
+                            ("badtype", {"getprop_all_raw": "[ro.x]: [two types]\n"}),
+                            ("badkey", {"getprop_all_raw": "[debug.s2a.bad;echo]: [string]\n"}),
                             ("truncated", {"getprop_all_raw": "[ro.x]: [ok]"}),
                             ("empty", {"getprop_all_raw": ""})):
             with self.subTest(kind=kind):
@@ -2281,6 +2317,18 @@ class RunGameTest(unittest.TestCase):
                 self.assertIn("getprop", man["reason"])
                 self.assertNotIn("launch_cmd", st)
                 self.assertFalse(st["installed"])
+
+    def test_debug_prop_preflight_individual_read_failure(self):
+        for fault in ({"getprop_deny": ["debug.s2a.query_wait"]},
+                      {"getprop_individual_stderr": ["debug.s2a.query_wait"]},
+                      {"getprop_individual_raw": {"debug.s2a.query_wait": "1"}}):
+            fault["props"] = {"debug.s2a.query_wait": "1"}
+            rc, out, _ = self.run_tool(state=fault, out_name="out_individual_" + str(len(list(self.tmp.glob("out_individual_*")))))
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertEqual(2, rc, man)
+            self.assertIn("getprop", man["reason"])
+            st = json.loads((self.tmp / "state.json").read_text())
+            self.assertNotIn("launch_cmd", st)
 
     def test_debug_prop_preflight_allow_requires_exact_key(self):
         rc, out, _ = self.run_tool(state={"props": {"debug.s2a.query_wait": "1"}},
