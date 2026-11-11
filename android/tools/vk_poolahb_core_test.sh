@@ -14,13 +14,15 @@ android="$repo/android"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 cc_bin="${CC:-cc}"
+# 独立池夹具不链接记录器；按源码登记放行 macOS 宿主可空导入。
+weak_u=(); [ "$(uname -s)" = Darwin ] && read -r -a weak_u <<< "$(python3 "$repo/tools/weak_link_decl.py" flags poolahb_test)"
 "$cc_bin" -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-parameter -D__ANDROID__ \
   -I "$android/native" -I "$android/native/direct" -I "$android/native/nvn" \
   -I "$android/tests/vkhost" -I "$android/tests/hostvk" \
   -I "$repo/graphics/nvn/third_party/vulkan-headers/include" \
   -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" \
   -I "$repo/graphics/nvn" -I "$repo/graphics/nvn/host" \
-  -o "$tmp/vk_poolahb_core_test" \
+  -o "$tmp/vk_poolahb_core_test" ${weak_u[@]+"${weak_u[@]}"} \
   "$android/tests/vk_poolahb_core_test.c" \
   "$android/native/nvn/nvn_vk_poolahb.c" \
   "$android/native/direct/vk_resid.c" \
@@ -29,7 +31,6 @@ cc_bin="${CC:-cc}"
   "$android/native/nvn/poolahb_alias.c"
 # “quiesce 入口不存在”只可能出现在链接层面，所以单独出一份二进制模拟（弱符号解析为 NULL）。
 # Mach-O 不许留未定义的弱符号：macOS 门禁机上的放行参数按源码「弱链接[poolahb_test]」登记生成（不手写）
-weak_u=(); [ "$(uname -s)" = Darwin ] && read -r -a weak_u <<< "$(python3 "$repo/tools/weak_link_decl.py" flags poolahb_test)"
 "$cc_bin" -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-parameter -D__ANDROID__ \
   -DVK_POOLAHB_TEST_NO_QUIESCE_ENTRY \
   -I "$android/native" -I "$android/native/direct" -I "$android/native/nvn" \

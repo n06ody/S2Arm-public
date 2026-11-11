@@ -39,6 +39,10 @@
 #define PA_LOG(...) do { fputs("[poolahb] ", stderr); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
 #endif
 
+// 记录器在独立宿主夹具中可缺席；macOS 链接参数从此登记生成。
+// 弱链接[poolahb_test]：s2a_record_dispatch_fq_enabled
+extern int s2a_record_dispatch_fq_enabled(void) __attribute__((weak));
+
 #define PA_WINDOW (1ull << 20)          // 单个窗口 1 MiB：VB/IB 段通常只有几十~几百 KB，窗口越小利用率越高
 // AHB 总预算：实测整池累计 576 MB 会 ART abort（进程直接没了），所以不能只写死一个常数。
 // 取 min(320 MiB, 设备内存/16)：小内存机型自动降档，8 GB 以上才用满 320 MiB。
@@ -75,6 +79,7 @@ struct pa_live {           // 已迁移窗口
     int retired;           // 池已删除：等完成证明后才能销毁
     VkBuffer buf;
     struct s2a_gpu_buf gb;
+    VkBufferUsageFlags usage;   // 后备创建时的 usage（compute 直绑按它判 UNIFORM/STORAGE 可绑）
     int live;
 };
 
@@ -330,15 +335,29 @@ static int pa_prepare(void *ctx, uint64_t len, uint64_t *out_backing) {
     if (!pa_vma_budget_ok(len)) return -1;   // 预算不足：不迁移，调用方保留原后备
     char why[160] = "";
     memset(&g_pa_pending, 0, sizeof g_pa_pending);
-    if (s2a_gpu_buf_create(g_pa_dev, len,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            S2A_GPU_MEM_AHB, &g_pa_pending.gb, why, sizeof why) != 0) {
-        PA_LOG("poolahb: AHB create/import failed: %s", why);
-        g_fail_ahb++;
-        return -1;
+    // 默认关时保持原有创建掩码；开门后只试一次带 STORAGE 的后备，失败再按旧掩码创建。
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (s2a_record_dispatch_fq_enabled && s2a_record_dispatch_fq_enabled())
+        usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (s2a_gpu_buf_create(g_pa_dev, len, usage, S2A_GPU_MEM_AHB, &g_pa_pending.gb,
+                           why, sizeof why) != 0) {
+        if (!(usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+            PA_LOG("poolahb: AHB create/import failed: %s", why);
+            g_fail_ahb++;
+            return -1;
+        }
+        PA_LOG("poolahb: AHB create/import with storage usage failed, retrying legacy mask: %s", why);
+        why[0] = 0;
+        usage &= ~VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (s2a_gpu_buf_create(g_pa_dev, len, usage, S2A_GPU_MEM_AHB, &g_pa_pending.gb,
+                               why, sizeof why) != 0) {
+            PA_LOG("poolahb: AHB create/import failed: %s", why);
+            g_fail_ahb++;
+            return -1;
+        }
     }
+    g_pa_pending.usage = usage;
     g_pa_pending.backing_id = g_pa_next_backing++;
     g_pa_pending.buf = g_pa_pending.gb.buf;
     g_pa_pending.live = 1;
@@ -568,7 +587,8 @@ static int pa_migrate_window(uint64_t addr, uint64_t len) {
     return 0;
 }
 
-int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
+static int pa_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                     VkBufferUsageFlags *usage) {
     PA_GUARD();
     if (!s2a_poolahb_enabled() || !buf || !off || !len) return -1;
     struct pa_live *e = pa_live_find(addr, len);
@@ -581,6 +601,7 @@ int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off
         }
         *buf = e->buf;
         *off = addr - e->addr;
+        if (usage) *usage = e->usage;
         g_pa_stats.lookups++;
         g_pa_stats.hit_bytes += len;
         return 0;
@@ -609,6 +630,17 @@ int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off
     ps->refs++;
     g_pa_stats.miss_cold++;
     return -1;
+}
+
+int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
+    return pa_lookup(addr, len, buf, off, NULL);
+}
+int s2a_poolahb_lookup_usage(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                             VkBufferUsageFlags *usage) {
+    if (usage) *usage = 0;
+    // 诊断禁用 remap 时 guest 和 AHB 不共享字节，不能用作 compute 直绑。
+    if (pa_no_remap()) return -1;
+    return pa_lookup(addr, len, buf, off, usage);
 }
 
 // 迁移服务：只在**本帧 fence 已全部等到**的完成点调用（GPU 已空闲、我们没有任何在途提交）。

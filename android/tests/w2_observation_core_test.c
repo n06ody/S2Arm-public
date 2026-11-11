@@ -118,6 +118,26 @@ static void test_positive_sources_and_full_identity(void) {
     CHECK(!strstr(sink.text, "payload") && !strstr(sink.text, "canonical"));
     s2a_w2_release(w); ++cases;
 }
+// 一笔 dispatch 为等待先前 GPU 工作而内部重试：观察事实只计最终构建，不伪造失败或成功。
+static void test_compute_sync_retry(void) {
+    struct s2a_w2_window *w=open_window();struct s2a_w2_scope scope;struct s2a_w2_shader shader;
+    s2a_w2_scope_enter(&scope);s2a_w2_scope_expect_shader(&scope);
+    s2a_w2_shader_begin(&shader,S2A_W2_COMPUTE);
+    s2a_w2_shader_lookup(&context,identity,S2A_W2_MEMO,1);
+    s2a_w2_shader_end(&shader,-1); // 内部重试，不是构建完成
+    one_shader(&context,identity,S2A_W2_COMPUTE,S2A_W2_MEMO,1,1);
+    s2a_w2_scope_leave(&scope,1);finish(w);struct s2a_w2_snapshot d=snap(w);
+    CHECK(d.shaders==1 && d.observations==1 && d.accepted_builds==1 && d.build_failures==0);
+    CHECK(d.metadata_complete && d.entry_count==1 && d.entries[0].source_counts[S2A_W2_MEMO]==1);
+    s2a_w2_release(w);++cases;
+    // 真实被拒的 lookup 即便被错误标记成 retry，也不能抹掉拒绝与 gap。
+    w=open_window();s2a_w2_scope_enter(&scope);s2a_w2_scope_expect_shader(&scope);
+    s2a_w2_shader_begin(&shader,S2A_W2_COMPUTE);
+    s2a_w2_shader_lookup(&context,identity,S2A_W2_MEMO,0);
+    s2a_w2_shader_end(&shader,-1);s2a_w2_scope_leave(&scope,0);
+    d=snap(w);CHECK(d.rejects>0 && d.gaps>0 && d.build_failures==1);
+    expect_incomplete(w);
+}
 static void test_zero_and_ordinary_packets(void) {
     struct s2a_w2_window *w = open_window(); expect_incomplete(w);
     w = open_window(); struct s2a_w2_scope scope;
@@ -391,7 +411,7 @@ static void test_tiny_export(void) {
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "repeat-seal")) { test_repeat_seal(); return 0; }
     if (argc == 2 && !strcmp(argv[1], "tiny-export")) { test_tiny_export(); return 0; }
-    test_disabled(); test_positive_sources_and_full_identity(); test_zero_and_ordinary_packets();
+    test_disabled(); test_positive_sources_and_full_identity(); test_compute_sync_retry(); test_zero_and_ordinary_packets();
     test_zero_hash(); test_close_and_lease(); test_early_nested_and_unbound(); test_cohort_missing_rejected_and_failed();
     test_overflow_and_stop_failure(); test_receipts_and_output();
     test_ineligible_snapshot_progress(); test_serialization_bounds(); test_null_sink();

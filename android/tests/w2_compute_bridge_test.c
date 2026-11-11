@@ -34,7 +34,7 @@ int real_source_acquire(const uint8_t key[8], struct s2a_source_entry_view *out)
 void real_source_release(uint64_t ref);
 int s2a_source_acquire(const uint8_t key[8], struct s2a_source_entry_view *out) { acquired++; return real_source_acquire(key,out); }
 void s2a_source_release(uint64_t ref) { released++; real_source_release(ref); }
-static int provider_calls, offline, disk, worker, pipeline, pauses, resumes, stopped, finished, src_seen;
+static int provider_calls, offline, disk, worker, pipeline, pauses, resumes, stopped, finished, src_seen, cached_attempts;
 // 宿主替身：纹理注册表事实（真实 NVN 格式/目标枚举），mode 21 = id 未注册，mode 22 = 目标未映射。
 int s2a_vk_adapter_tex_facts(int id, struct s2a_vk_tex_facts *out, char *why, size_t cap) {
     if (id == 99 || mode == 21) { snprintf(why, cap, "texture id %d is not registered", id); return -1; }
@@ -178,7 +178,7 @@ int nvn_vk_compute_pipeline_build_prog(struct s2a_vk_device *device,const struct
 }
 /* 程序级缓存缝：本测试不链 compute.c，桩成「永不命中」——命中路径由 pipeline 测试验收。 */
 struct cpso *nvn_vk_compute_prog_lookup(struct s2a_vk_device *d,const uint8_t identity[32]) {
-    (void)d;(void)identity;return NULL;
+    (void)d;(void)identity;return mode==31 ? (struct cpso *)(uintptr_t)1 : NULL;
 }
 void nvn_vk_compute_prog_release(struct cpso *entry) { (void)entry; }
 int nvn_vk_compute_pipeline_build_cached(struct s2a_vk_device *d,const struct s2a_record_dispatch_state *s,
@@ -186,6 +186,11 @@ int nvn_vk_compute_pipeline_build_cached(struct s2a_vk_device *d,const struct s2
     const struct s2a_source_entry_view *source,struct cpso *entry,
     struct s2a_record_dispatch_output *out,char *why,size_t cap) {
     (void)d;(void)s;(void)memory;(void)snapshot;(void)source;(void)entry;(void)out;
+    if(mode==31){
+        pipeline++;src_seen=source!=NULL;
+        if(++cached_attempts==1)return S2A_RECORD_DISPATCH_RETRY_SYNC;
+        out->pipeline=(VkPipeline)1;out->layout=(VkPipelineLayout)2;out->owner=(void*)42;out->finish=finish;return 0;
+    }
     snprintf(why,cap,"cached stub never reached");return -1;
 }
 static void wr(uint8_t *p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
@@ -233,6 +238,7 @@ int main(int argc,char **argv) {
     struct s2a_record_dispatch_state state={.stages=32,.tex_pool_seen=1,.samp_pool_seen=1,.tex_pool_n=7,.samp_pool_n=9};
     memcpy(state.keys[0],digest,8);assert(!s2a_source_keep(state.keys[0],5,code,sizeof code,ctl,sizeof ctl));
     state.ssbo_seen=1u<<7;state.ssbo[7].addr=0x1100;state.ssbo[7].size=16;
+    if(mode==31)state.fq_pool=1;
     if(mode==1)state.ssbo[7].addr++;
     if(mode==2){state.ssbo_seen|=1u<<15;state.ssbo[15].addr=0x2001;state.ssbo[15].size=4;}
     if(mode==3){state.ssbo[15].addr=0x2001;state.ssbo[15].size=4;}
@@ -256,8 +262,10 @@ int main(int argc,char **argv) {
     struct s2a_vk_device device={0};struct s2a_record_memory memory={0};
     struct s2a_record_dispatch_output out={0};struct s2a_record_result result={.executed=123};
     int rc=nvn_vk_compute_build(&device,&state,&memory,&out,&result,NULL);
-    int success=mode<=7||mode==13||mode==16||mode==23||mode==26||mode==27||mode==29||mode==30;
-    if(success){assert(rc==0&&pipeline==1&&out.finish&&finished==0);out.finish(&device,out.owner,-1);assert(finished==1);}
+    if(mode==31 && cached_attempts==1){assert(rc==S2A_RECORD_DISPATCH_RETRY_SYNC && pipeline==1 && acquired==1 && released==1);
+        assert(!out.owner&&!out.pipeline);puts("cached retry: exact sync-required status and source release PASS");return 0;}
+    int success=mode<=7||mode==13||mode==16||mode==23||mode==26||mode==27||mode==29||mode==30||mode==31;
+    if(success){assert(rc==0&&pipeline==(mode==31?2:1)&&out.finish&&finished==0);out.finish(&device,out.owner,-1);assert(finished==1);}
     else {assert(rc!=0&&result.code==rc&&result.why[0]&&result.opcode==OP_DISPATCH&&result.executed==123);assert(!out.owner&&!out.pipeline);}
     // 6/7：独立图像/独立采样器“存在”不是 shader 查询它们的证明——不拦，交给编译器反射与
     // pipeline 的 descriptor 分支明确失败；这里只证明不再因为“绑过”就整笔拒绝。
@@ -276,9 +284,9 @@ int main(int argc,char **argv) {
     if(mode==13)assert(offline==1&&disk==0&&worker==0&&pauses==0);
     if(mode==16)assert(!offline&&!disk&&worker==1);
     if((mode>=17&&mode<=20)||mode==9||mode==10||mode==21||mode==22||mode==24||mode==25||mode==28)assert(!worker&&!pipeline);
-    assert(offline<=1&&disk<=1&&worker<=1&&acquired<=1&&released<=1);
+    assert(offline<=1&&disk<=1&&worker<=1&&acquired<=(mode==31?2:1)&&released<=(mode==31?2:1));
     if(pipeline)assert(src_seen);   // c1 由消费点源快照提供，pipeline 必须收到它
-    if(success||worker||mode==10||mode==15)assert(acquired==1&&released==1);
+    if(success||worker||mode==10||mode==15)assert(acquired==(mode==31?2:1)&&released==(mode==31?2:1));
     if(mode==5){
         assert(bind_calls==1&&captured_count==1&&captured_view==(VkImageView)(uintptr_t)0x1000&&release_calls==1);
         printf("snapshot: count=1 view=0x%llx sampler=0x22 handle=0x%llx; request carries handleIndex 14; pin released after finish\n",
