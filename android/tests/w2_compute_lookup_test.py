@@ -34,6 +34,8 @@ x=copy.deepcopy(good);x['transport']['requestId']='other';variants['bad-requesti
 cases=[(i,'bad-stage') for i in range(18)]
 cases += [(18,'true-alignment'),(19,'true-alignment'),(20,'bad-stage'),(21,'bad-stage'),(22,'bad-stage'),(23,'bad-stage'),(24,'bad-stage'),(25,'bad-stage'),(26,'bad-stage')]
 cases += [(28,'bad-stage'),(29,'bad-stage'),(30,'bad-stage'),(31,'no-transport'),(32,'bad-requestid'),(39,'bad-stage')]
+# #1434 第二笔：LibPack 插序——40 hit(origin=OFFLINE 不碰私有/现编)、41 miss(落私有)、42 reject(落现编)
+cases += [(40,'bad-stage'),(41,'bad-stage'),(42,'bad-stage')]
 cases[11]=(11,'bad-profile');cases[12]=(12,'bad-closure');cases[13]=(13,'old-generation');cases[17]=(17,'old-generation')
 source=(NATIVE/'nvn/nvn_vk_compute_lookup.c').read_text()
 mutations={'positive':source,
@@ -176,6 +178,7 @@ with tempfile.TemporaryDirectory(prefix='w2-lookup-') as folder:
          str(Path(__file__).with_name('w2_compute_exact_lookup_test.c')),
          str(NATIVE/'nvn/nvn_vk_compute_lookup.c'),str(NATIVE/'nvn/nvn_vk_program_result.c'),
          str(NATIVE/'direct/jv.c'),str(NATIVE/'direct/json.c'),str(NATIVE/'direct/offline_library.c'),str(NATIVE/'direct/sha256.c'),
+         str(NATIVE/'direct/libpack_vk.c'),
          str(NATIVE/'direct/diag.c'),'-lm','-o',str(exact)]
     subprocess.run(cmd,check=True)
     revision=td/'revision';profile=good['content']['identity']['profileHash'];closure='closure'
