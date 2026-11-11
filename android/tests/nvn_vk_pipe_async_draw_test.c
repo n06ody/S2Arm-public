@@ -162,7 +162,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice d,uint32_t n,const VkFen
 // fd_fence_wait 的弱账钩在本夹具里缺席（Mach-O 下 extern weak 声明不产生可空引用，
 // 不给桩就链接红；给了桩即「门恒关」，不记账）：
 int nvn_vk_frame_log_on(void){return 0;}
-void nvn_vk_frame_log_fence_wait(uint64_t ns){(void)ns;}
+void nvn_vk_frame_log_fence_site(uint64_t ns, unsigned site){(void)ns;(void)site;}
+void nvn_vk_frame_log_fence_context(uint64_t ns, unsigned site, unsigned kind, unsigned reason) { (void)site; (void)kind; (void)reason; (void)ns; }
 int nvn_vk_frame_tsv_on(void){return 0;}
 void nvn_vk_frame_tsv_fence_wait(uint64_t ns){(void)ns;}
 

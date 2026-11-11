@@ -428,7 +428,16 @@ static int exec_chain(const uint8_t *pc, int depth) {
             }
         }
         uint64_t t0 = shim_ticks();
+        extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+#if defined(__APPLE__)
+        extern unsigned nvn_vk_frame_log_opcode(unsigned) __attribute__((weak_import));
+#else
+        extern unsigned nvn_vk_frame_log_opcode(unsigned) __attribute__((weak));
+#endif
+        int fl_diag = nvn_vk_frame_log_on && nvn_vk_frame_log_opcode && nvn_vk_frame_log_on();
+        unsigned old_op = fl_diag ? nvn_vk_frame_log_opcode((unsigned)h.op + 1u) : 0;
         int rc = s2a_vk_adapter_exec_guest(pc, h.size, &r);
+        if (fl_diag) nvn_vk_frame_log_opcode(old_op);
         uint64_t dt = shim_ticks() - t0;
         g_frame_exec_ns += dt; g_frame_cmds++;
         if (h.op < 256) { g_op_ns[h.op] += dt; g_op_n[h.op]++; }

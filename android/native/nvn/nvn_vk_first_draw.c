@@ -1203,9 +1203,14 @@ int nvn_vk_first_draw_present_deferred(void) { return fd_present_defer(); }
 // vk_clear.c 相同的 frame_log + frame_tsv 双账（fence_n = 每帧排空次数、fence_wait_us =
 // 累计等待时长）。门开才计时记账，关着只剩一次空指针分支；等待超时也照记——CPU 被阻塞
 // 的时长是事实，不挑结果。
-static VkResult fd_fence_wait(struct s2a_vk_device *d, VkFence fence, uint64_t timeout_ns) {
+static VkResult fd_fence_wait_at(struct s2a_vk_device *d, VkFence fence, uint64_t timeout_ns, unsigned line, unsigned origin) {
     extern int nvn_vk_frame_log_on(void) __attribute__((weak));
-    extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
+    extern void nvn_vk_frame_log_fence_site(uint64_t, unsigned) __attribute__((weak));
+#if defined(__APPLE__)
+    extern void nvn_vk_frame_log_fence_context(uint64_t, unsigned, unsigned, unsigned) __attribute__((weak_import));
+#else
+    extern void nvn_vk_frame_log_fence_context(uint64_t, unsigned, unsigned, unsigned) __attribute__((weak));
+#endif
     extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
     extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
     const int fl = nvn_vk_frame_log_on && nvn_vk_frame_log_on();
@@ -1214,11 +1219,16 @@ static VkResult fd_fence_wait(struct s2a_vk_device *d, VkFence fence, uint64_t t
     VkResult r = vkWaitForFences(d->device, 1, &fence, VK_TRUE, timeout_ns);
     if (fl || ft) {
         const uint64_t wt_ns = (uint64_t)(fd_now_ns() - t0);
-        if (fl) nvn_vk_frame_log_fence_wait(wt_ns);
+        if (fl) {
+            if (origin && nvn_vk_frame_log_fence_context) nvn_vk_frame_log_fence_context(wt_ns, 10000u + line, 3, origin);
+            else nvn_vk_frame_log_fence_site(wt_ns, 10000u + line);
+        }
         if (ft) nvn_vk_frame_tsv_fence_wait(wt_ns);
     }
     return r;
 }
+
+#define fd_fence_wait(d, fence, timeout) fd_fence_wait_at((d), (fence), (timeout), __LINE__, 0)
 
 // 释放快照队列持有的 Vulkan 对象（不碰 arena/pool/pin：那些归帧边界处理）。
 static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {
@@ -3516,6 +3526,7 @@ static int fd_pass_begin(struct s2a_vk_device *d, VkRenderPass pass, VkFramebuff
 // 才记一次触发源，避免把「本来就没开 pass」的 opcode 边界也算进关闭次数。
 int nvn_vk_first_draw_pass_is_open(void) { return g_op.open; }
 
+static _Thread_local int fd_diag_pass_break;
 int nvn_vk_first_draw_pass_break(int sync) {
     if (g_op.open && fd_pass_close(g_op.dev ? g_op.dev : g_fq.dev,
                                    sync ? FD_PCR_GPU_OP : FD_PCR_STATE_BREAK) != 0) {
@@ -3545,7 +3556,13 @@ int nvn_vk_first_draw_pass_break(int sync) {
     if (sync && fd_fq_has_inflight()) {
         // 带预算的 guest 等待可能留下“已提交但未完成”的后缀 fence（ncmd==submitted_n、
         // nbatch_fence==0）；这里必须把它也算作在途，否则会把在途 GPU 工作当成已完成。
-        if (nvn_vk_first_draw_flush() != 0) {
+        extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+        int trace = nvn_vk_frame_log_on && nvn_vk_frame_log_on();
+        int old_diag = trace ? fd_diag_pass_break : 0;
+        if (trace) fd_diag_pass_break = 1;
+        int flush_rc = nvn_vk_first_draw_flush();
+        if (trace) fd_diag_pass_break = old_diag;
+        if (flush_rc != 0) {
             FD_LOG("pass break: pending draws did not complete (%s); the following GPU operation must fail",
                    g_fq.fail[0] ? g_fq.fail : "unknown");
             return -1;
@@ -3869,7 +3886,7 @@ static VkDescriptorPool fd_pool_rotate(struct s2a_vk_device *d, VkDescriptorPool
 //   budget_ns < 0  = 旧语义：内部上限 5 s，等不到就是终态（提交失败/超时进保留账本）；
 //   budget_ns >= 0 = 最多等这么久（0 = 只提交 + 非阻塞查状态）。返回 0 = 全部完成；
 //                    1 = 已提交但仍有批次未完成（不判失败、资源/fence/命令全部保留）；-1 = 终态失败。
-static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, int frame_end) {
+static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, int frame_end, unsigned origin) {
     if (fd_fq_poisoned()) return -1;   // 终态：不再提交、不再释放（资源可能在 GPU 上）
     // 顺序必须是：结束查询段与 render pass（fd_pass_close）→ 封口批次（vkEndCommandBuffer）→ 提交/等待。
     // 反过来会在 render pass 仍打开时 vkEndCommandBuffer，违反有效使用条件。
@@ -4015,7 +4032,7 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
             if (s2a_qret_slot(&g_fq.batch_qid[i], fd_query_retire_cb, NULL) != 0) return -1;
             continue;
         }
-        VkResult wr = fd_fence_wait(d, g_fq.batch_fence[i], (uint64_t)left);
+        VkResult wr = fd_fence_wait_at(d, g_fq.batch_fence[i], (uint64_t)left, __LINE__, origin);
         if (wr == VK_TIMEOUT) { incomplete = 1; break; }
         if (wr != VK_SUCCESS) {
             FD_LOG("frame flush: batch fence %d/%d wait result=%d", i + 1, g_fq.nbatch_fence, (int)wr);
@@ -4227,19 +4244,19 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
 // 同步边界：先把延迟帧收口（查询结果/资源不能晚到），再按原语义 flush 本帧。
 int nvn_vk_first_draw_flush(void) {
     if (fd_present_defer() && nvn_vk_first_draw_retire_all() != 0) return -1;
-    return fd_fq_flush_impl(-1, 1, 0, 0);
+    return fd_fq_flush_impl(-1, 1, 0, 0, fd_diag_pass_break ? 1 : 2);
 }
 
 int nvn_vk_first_draw_flush_ready(int64_t budget_ns) {
     if (fd_present_defer() && nvn_vk_first_draw_retire_all() != 0) return -1;
-    return fd_fq_flush_impl(budget_ns, 0, 0, 0);
+    return fd_fq_flush_impl(budget_ns, 0, 0, 0, 3);
 }
 
 // present 专用：提交本帧后缀但不等完成（debug.s2a.present_defer=1 时生效）。
 int nvn_vk_first_draw_flush_defer(void) {
     if (!fd_present_defer()) return nvn_vk_first_draw_flush();
     if (nvn_vk_first_draw_retire_all() != 0) return -1;
-    return fd_fq_flush_impl(-1, 1, 1, 1);
+    return fd_fq_flush_impl(-1, 1, 1, 1, 4);
 }
 
 // swapchain 把 present blit 的渲染 fence/命令缓冲交给最近一个延迟槽，退休点统一等/释放。

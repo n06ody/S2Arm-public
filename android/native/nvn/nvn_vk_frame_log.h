@@ -31,6 +31,12 @@
 extern "C" {
 #endif
 
+#define S2A_FL_SITE_CAP 32u
+#define S2A_FL_SITE_WINDOW 120u
+#define S2A_FL_DETAIL_CAP 256u
+struct s2a_fl_detail { unsigned kind, op, reason; uint64_t ns, count; };
+struct s2a_fl_site { unsigned id; uint64_t ns, count; };
+
 #define S2A_FL_CAP 32768u   /* 保留最近 32768 帧 */
 
 // v5 记录 = 40B：u64 ts，u32 fence_wait_us/fence_n/acquire_us/present_us/gpu_us/gpu_seq/
@@ -56,6 +62,12 @@ struct s2a_frame_log {
     uint64_t dropped;           /* 被环形覆盖的最旧帧数；到 UINT64_MAX 封顶不回绕 */
     uint32_t w;                 /* 下一次写入的槽位（独立游标，不依赖 seq % CAP） */
     uint32_t kept;              /* 环内现存帧数 ≤ S2A_FL_CAP */
+    struct s2a_fl_site sites[S2A_FL_SITE_CAP];
+    struct s2a_fl_site sites_ready[S2A_FL_SITE_CAP];
+    struct s2a_fl_detail detail[S2A_FL_DETAIL_CAP], detail_ready[S2A_FL_DETAIL_CAP];
+    uint64_t detail_frame;
+    unsigned site_frames;
+    int sites_pending;
     _Atomic int snapshot_lock;
     _Atomic uint64_t fence_ns_acc;  /* 距上一条 present 累计的 fence 等待 ns */
     _Atomic uint64_t fence_n_acc;   /* 距上一条 present 累计的 fence 等待次数 */
@@ -98,6 +110,13 @@ int nvn_vk_frame_log_on(void);
 void nvn_vk_frame_log_present(void);
 void nvn_vk_frame_log_dump(void);
 void nvn_vk_frame_log_fence_wait(uint64_t wait_ns);
+// site: 0=其他, 1=vk_record submit, 2=vk_clear, 10000+first_draw 源码行号。
+void nvn_vk_frame_log_fence_site(uint64_t wait_ns, unsigned site);
+void nvn_vk_frame_log_fence_context(uint64_t wait_ns, unsigned site, unsigned kind, unsigned reason);
+unsigned nvn_vk_frame_log_opcode(unsigned op);
+unsigned nvn_vk_frame_log_break_reason(unsigned reason);
+void nvn_vk_frame_log_clear_reason(unsigned reason);
+void nvn_vk_frame_log_clear_fv(unsigned event);
 
 // 托管层入口（generic AndroidWindow.Present / AndroidGameRuntime.Cleanup 经
 // DllImport("s2a_native") 直调）：与 direct 同一个环形缓冲、同一份转储格式。

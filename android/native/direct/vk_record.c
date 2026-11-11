@@ -81,6 +81,19 @@ void vk_record_take_rt_sem_stats(uint64_t *same, uint64_t *diff) {
 // 返回 0 = 边界已落地；非 0 = 帧队列没有完成证明（资源已保留），后续 opcode 必须停止执行，
 // 不能按“之前的 GPU 工作已经完成”继续消费。
 extern int nvn_vk_first_draw_pass_break(int sync) __attribute__((weak));
+extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+#if defined(__APPLE__)
+extern unsigned nvn_vk_frame_log_break_reason(unsigned) __attribute__((weak_import));
+#else
+extern unsigned nvn_vk_frame_log_break_reason(unsigned) __attribute__((weak));
+#endif
+static int rec_pass_break(int sync, unsigned line) {
+    int on = nvn_vk_frame_log_on && nvn_vk_frame_log_break_reason && nvn_vk_frame_log_on();
+    unsigned prev = on ? nvn_vk_frame_log_break_reason(line) : 0;
+    int rc = nvn_vk_first_draw_pass_break(sync);
+    if (on) nvn_vk_frame_log_break_reason(prev);
+    return rc;
+}
 // 帧队列时间戳入口（弱绑定）：生产链接时把时间戳录进当前帧命令缓冲；微例/同步路径没有它。
 extern int nvn_vk_first_draw_timestamp_top(struct s2a_vk_device *d, VkQueryPool pool, uint32_t slot,
                                            char *why, size_t why_size) __attribute__((weak));
@@ -656,7 +669,7 @@ static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec
     } else {
         // t-direct-frametimes：本次 fence 等待计入逐帧帧时间记录。先判 on()——
         // 模块不在或开关关都跳过一次分支判断，不计时也不记账（量的成本不默认付）。
-        extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
+        extern void nvn_vk_frame_log_fence_site(uint64_t, unsigned) __attribute__((weak));
         extern int nvn_vk_frame_log_on(void) __attribute__((weak));
         extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
         extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
@@ -664,7 +677,7 @@ static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec
         const int ft = nvn_vk_frame_tsv_on && nvn_vk_frame_tsv_on();
         uint64_t wt0 = (fl || ft) ? rec_now_ns() : 0;
         rc = vkWaitForFences(d->device, 1, &fence, VK_TRUE, 5000000000ull);
-        if (fl) nvn_vk_frame_log_fence_wait(rec_now_ns() - wt0);
+        if (fl) nvn_vk_frame_log_fence_site(rec_now_ns() - wt0, 1);
         if (ft) nvn_vk_frame_tsv_fence_wait(rec_now_ns() - wt0);
     }
     if (rc != VK_SUCCESS) {
@@ -1447,7 +1460,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             int sync = header.op == OP_CLEAR_TEX || header.op == OP_CLEAR_BUF ||
                        header.op == OP_COPY_B2B || header.op == OP_COPY_T2B || header.op == OP_COPY_B2T ||
                        header.op == OP_COPY_T2T || header.op == OP_DISPATCH || header.op == OP_FENCE_SYNC;
-            if (nvn_vk_first_draw_pass_break(sync) != 0) {
+            if (rec_pass_break(sync, __LINE__) != 0) {
                 // 帧队列没有拿到完成证明：命令顺序不再成立，这条 opcode 及其后的 clear/copy/fence/event
                 // 都不能执行。首错留在帧队列里，这里只转述，不覆盖。
                 const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
@@ -1693,7 +1706,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                         clear_fallback = 1;
                         // 退回“立即清除”前必须先把帧队列交出去并等完成，否则这笔清除会跑到前面
                         // 已录制但未提交的 draw 之前（旧实现靠 sync pass_break 保证这一点）。
-                        if (nvn_vk_first_draw_pass_break && nvn_vk_first_draw_pass_break(1) != 0) {
+                        if (nvn_vk_first_draw_pass_break && rec_pass_break(1, __LINE__) != 0) {
                             const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                             char fmsg[420];
                             snprintf(fmsg, sizeof fmsg,
@@ -2774,7 +2787,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                     int crc = s2a_vk_clear_ds_queued(device, &t, v.depth, (uint32_t)v.stencil & 0xffu, dmask, smask,
                                                      have_rect ? &rect : NULL, cwhy, sizeof cwhy);
                     if (crc == S2A_VK_CLEAR_UNHANDLED) {
-                        if (nvn_vk_first_draw_pass_break && nvn_vk_first_draw_pass_break(1) != 0) {
+                        if (nvn_vk_first_draw_pass_break && rec_pass_break(1, __LINE__) != 0) {
                             const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                             char fmsg[420];
                             snprintf(fmsg, sizeof fmsg,
@@ -2891,7 +2904,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                 // 依据是 d2r-mobile 在同一台 Redmi K50 Ultra 上的实测：游戏从不在帧完成前读计数器。
                 // 需要旧行为时用 debug.s2a.query_wait=1 做 A/B。
                 if (nvn_vk_query_immediate_mode()) {
-                    if (nvn_vk_first_draw_pass_break && nvn_vk_first_draw_pass_break(1) != 0) {
+                    if (nvn_vk_first_draw_pass_break && rec_pass_break(1, __LINE__) != 0) {
                         const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                         char msg[420];
                         snprintf(msg, sizeof msg,
@@ -2921,7 +2934,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                     trc = nvn_vk_ts_top_enqueue(device, memory, addr, twhy, sizeof twhy);
                 } else {
                     // 同步路径：先让帧队列里已录制但未提交的绘制拿到完成证明，时间戳才会排在它们后面。
-                    if (nvn_vk_first_draw_pass_break && nvn_vk_first_draw_pass_break(1) != 0) {
+                    if (nvn_vk_first_draw_pass_break && rec_pass_break(1, __LINE__) != 0) {
                         const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                         char msg[420];
                         snprintf(msg, sizeof msg,
@@ -2977,7 +2990,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                     return fail(result, qrc == NVN_VK_QUERY_UNSUPPORTED ? S2A_RECORD_UNSUPPORTED : S2A_RECORD_GPU,
                                 header.op, qwhy);
                 if (qrc == NVN_VK_QUERY_NEED_PASS && nvn_vk_first_draw_pass_break &&
-                    nvn_vk_first_draw_pass_break(0) != 0) {
+                    rec_pass_break(0, __LINE__) != 0) {
                     const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                     char msg[420];
                     snprintf(msg, sizeof msg,

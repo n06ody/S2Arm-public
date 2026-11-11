@@ -338,11 +338,79 @@ int main(void) {
     CHECK(fl.seq == UINT64_MAX && fl.dropped == UINT64_MAX);   // 双计数都封顶不回绕
     printf("ok\n");
 
+    printf("  case %-32s", "site_window_split_and_reset");
+    s2a_fl_reset(&fl);
+    s2a_fl_fence_site(&fl, 2000000, 11262);
+    s2a_fl_fence_site(&fl, 3000000, 11262);
+    s2a_fl_fence_site(&fl, 9000000, 1);
+    for (unsigned i = 0; i < S2A_FL_SITE_WINDOW - 1; i++) s2a_fl_note(&fl, i);
+    CHECK(!fl.sites_pending && s2a_fl_fence_n(&fl, 0) == 3 && s2a_fl_fence_us(&fl, 0) == 14000);
+    s2a_fl_note(&fl, 119);
+    CHECK(fl.sites_pending && fl.site_frames == 0);
+    CHECK(fl.sites_ready[0].id == 11262 && fl.sites_ready[0].count == 2 && fl.sites_ready[0].ns == 5000000);
+    CHECK(fl.sites_ready[1].id == 1 && fl.sites_ready[1].count == 1 && fl.sites_ready[1].ns == 9000000);
+    CHECK(fl.sites[0].count == 0 && fl.sites[1].count == 0);
+    s2a_fl_fence_site(&fl, 1000, 2);
+    CHECK(fl.sites[0].id == 2 && fl.sites[0].count == 1 && fl.sites[0].ns == 1000);
+    printf("ok\n");
+
+    printf("  case %-32s", "detail_sum_matches_site_account");
+    s2a_fl_reset(&fl);
+    s2a_fl_fence_context(&fl, 1100, 1, 1, 21, 0);
+    s2a_fl_fence_context(&fl, 2300, 1, 1, 22, 0);
+    s2a_fl_fence_context(&fl, 3100, 2, 2, 23, 12);
+    s2a_fl_fence_context(&fl, 4700, 2, 2, 0, 0);
+    s2a_fl_fence_context(&fl, 5200, 14020, 3, 21, 11450);
+    s2a_fl_fence_context(&fl, 6700, 14020, 3, 0, 2);
+    s2a_fl_note(&fl, 1);
+    CHECK(s2a_fl_fence_n(&fl, 0) == 6 && s2a_fl_fence_us(&fl, 0) == 23);
+    for (unsigned i = 1; i < S2A_FL_SITE_WINDOW; i++) s2a_fl_note(&fl, i + 1);
+    CHECK(fl.sites_pending && fl.detail_frame == S2A_FL_SITE_WINDOW);
+    for (unsigned kind = 1; kind <= 3; kind++) {
+        uint64_t n = 0, ns = 0, expected_n = 0, expected_ns = 0;
+        unsigned site = kind == 1 ? 1 : kind == 2 ? 2 : 14020;
+        for (unsigned i = 0; i < S2A_FL_DETAIL_CAP; i++)
+            if (fl.detail_ready[i].kind == kind) { n += fl.detail_ready[i].count; ns += fl.detail_ready[i].ns; }
+        for (unsigned i = 0; i < S2A_FL_SITE_CAP; i++)
+            if (fl.sites_ready[i].id == site) { expected_n += fl.sites_ready[i].count; expected_ns += fl.sites_ready[i].ns; }
+        CHECK(n == expected_n && ns == expected_ns && n == 2);
+    }
+    s2a_fl_reset(&fl);
+    s2a_fl_fence_context(&fl, 1, 1, 1, 0, 0);
+    for (unsigned i = 1; i < S2A_FL_DETAIL_CAP + 8; i++) s2a_fl_fence_context(&fl, 1, 1, 1, i, 0);
+    for (unsigned i = 0; i < S2A_FL_SITE_WINDOW; i++) s2a_fl_note(&fl, i);
+    { uint64_t n = 0; for (unsigned i = 0; i < S2A_FL_DETAIL_CAP; i++) n += fl.detail_ready[i].count;
+      CHECK(n == S2A_FL_DETAIL_CAP + 8 && fl.detail_ready[S2A_FL_DETAIL_CAP - 4].op == UINT32_MAX); }
+    printf("ok\n");
+
+    printf("  case %-32s", "production_context_and_gate");
+    s2a_fl_reset(&g_fl); g_fl_on = 0;
+    nvn_vk_frame_log_opcode(25);
+    nvn_vk_frame_log_clear_reason(12);
+    nvn_vk_frame_log_fence_site(777, 2);
+    nvn_vk_frame_log_clear_fv(2);
+    CHECK(g_fl.fence_n_acc == 0 && g_fl.detail[0].count == 0);
+    g_fl_on = 1;
+    nvn_vk_frame_log_clear_reason(12);
+    nvn_vk_frame_log_fence_site(1000, 1);
+    nvn_vk_frame_log_fence_site(2000, 2);
+    nvn_vk_frame_log_break_reason(1450);
+    nvn_vk_frame_log_fence_context(3000, 14020, 3, 1);
+    nvn_vk_frame_log_clear_fv(2);
+    CHECK(g_fl.detail[0].kind == 1 && g_fl.detail[0].op == 25);
+    CHECK(g_fl.detail[1].kind == 2 && g_fl.detail[1].reason == 12);
+    CHECK(g_fl.detail[2].kind == 3 && g_fl.detail[2].reason == 11450);
+    CHECK(g_fl.detail[3].kind == 4 && g_fl.detail[3].reason == 2);
+    CHECK(g_fl.fence_n_acc == 3 && g_fl.fence_ns_acc == 6000);
+    nvn_vk_frame_log_opcode(0); nvn_vk_frame_log_break_reason(0);
+    printf("ok\n");
+
     printf("  case %-32s", "enable_gate_default_off");
     unsetenv("debug.s2a.frame_log");
     g_fl_on = -1;   // unity：复位开关缓存再验（生产里属性一次性读入缓存）
     s2a_fl_reset(&g_fl);
     nvn_vk_frame_log_present();
+    nvn_vk_frame_log_fence_site(200000, 2);
     nvn_vk_frame_log_fence_wait(99999);   // 关态：fence 账也不动
     CHECK(g_fl.seq == 0 && g_fl.fence_n_acc == 0);
     printf("ok\n");

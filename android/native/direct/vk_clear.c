@@ -428,7 +428,7 @@ static int clr_submit(struct s2a_vk_device *d, VkCommandBuffer cmd, VkFramebuffe
     } else {
         // t-direct-frametimes：本次 fence 等待计入逐帧帧时间记录。先判 on()——
         // 模块不在或开关关都跳过一次分支判断，不计时也不记账（量的成本不默认付）。
-        extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
+        extern void nvn_vk_frame_log_fence_site(uint64_t, unsigned) __attribute__((weak));
         extern int nvn_vk_frame_log_on(void) __attribute__((weak));
         extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
         extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
@@ -444,7 +444,7 @@ static int clr_submit(struct s2a_vk_device *d, VkCommandBuffer cmd, VkFramebuffe
         if (fl || ft) {
             clock_gettime(CLOCK_MONOTONIC, &wt);
             uint64_t wt_ns = (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec - wt0;
-            if (fl) nvn_vk_frame_log_fence_wait(wt_ns);
+            if (fl) nvn_vk_frame_log_fence_site(wt_ns, 2);
             if (ft) nvn_vk_frame_tsv_fence_wait(wt_ns);
         }
     }
@@ -555,11 +555,32 @@ static int clr_abort_unsubmitted(struct s2a_vk_device *d, VkCommandBuffer cmd, V
     vkDestroyImageView(d->device, view, NULL); g_view_freed++;
     return fail(why, why_size, msg);
 }
+extern int nvn_vk_frame_log_on(void) __attribute__((weak));
+#if defined(__APPLE__)
+extern void nvn_vk_frame_log_clear_reason(unsigned) __attribute__((weak_import));
+#else
+extern void nvn_vk_frame_log_clear_reason(unsigned) __attribute__((weak));
+#endif
+#if defined(__APPLE__)
+extern void nvn_vk_frame_log_clear_fv(unsigned) __attribute__((weak_import));
+#else
+extern void nvn_vk_frame_log_clear_fv(unsigned) __attribute__((weak));
+#endif
+static void clr_diag_reason(unsigned reason) {
+    if (nvn_vk_frame_log_on && nvn_vk_frame_log_clear_reason && nvn_vk_frame_log_on())
+        nvn_vk_frame_log_clear_reason(reason);
+}
+static void clr_diag_fv(unsigned event) {
+    if (nvn_vk_frame_log_on && nvn_vk_frame_log_clear_fv && nvn_vk_frame_log_on())
+        nvn_vk_frame_log_clear_fv(event);
+}
+
 // C1 诊断：为什么这笔清除没走队列。每个原因只打一次，避免每帧刷屏。
 enum { CLR_Q_NO_HOOK, CLR_Q_BAD_TARGET, CLR_Q_MASK, CLR_Q_ASPECT, CLR_Q_RECT,
        CLR_Q_FV, CLR_Q_PASS, CLR_Q_ALLOC, CLR_Q_ENQUEUE, CLR_Q_STENCIL, CLR_Q_REASONS };
 static void clr_q_note(int reason, const char *what) {
     static unsigned char noted[CLR_Q_REASONS];
+    clr_diag_reason((unsigned)reason + 1u);
     if (reason < 0 || reason >= CLR_Q_REASONS || noted[reason]) return;
     noted[reason] = 1;
     fprintf(stderr, "[s2a] clear queue: %s -> 同步路径\n", what);
@@ -597,7 +618,8 @@ static void clr_fv_check_device(VkDevice dev) {
 
 static int clr_fv_get(struct s2a_vk_device *d, const s2a_clear_target *t, int do_clear,
                       VkImageAspectFlags clear_aspect, VkFramebuffer *fb_out, VkImageView *view_out,
-                      char *why, size_t why_size) {
+                      char *why, size_t why_size, unsigned *fv_status) {
+    *fv_status = 0;
     clr_fv_check_device(d->device);
     struct clr_fv *slot = NULL;
     for (int i = 0; i < CLR_FV_MAX; i++) {
@@ -608,14 +630,14 @@ static int clr_fv_get(struct s2a_vk_device *d, const s2a_clear_target *t, int do
             e->w == t->width && e->h == t->height && e->do_clear == do_clear &&
             e->clear_aspect == clear_aspect) {
             *fb_out = e->fb; *view_out = e->view;
-            return 0;
+            *fv_status = 1; clr_diag_fv(1); return 0;
         }
     }
-    if (!slot) return fail(why, why_size, "clear: 队列化目标缓存已满"), -1;
+    if (!slot) { *fv_status = 2; clr_diag_fv(2); return fail(why, why_size, "clear: 队列化目标缓存已满"), -1; }
     VkImageView view = clr_view(d, t, why, why_size);
-    if (!view) return -1;
+    if (!view) { *fv_status = 3; clr_diag_fv(3); return -1; }
     VkRenderPass pass = clr_pass(d, t->format, t->aspect, clear_aspect, do_clear, why, why_size);
-    if (!pass) { vkDestroyImageView(d->device, view, NULL); g_view_freed++; return -1; }
+    if (!pass) { *fv_status = 4; clr_diag_fv(4); vkDestroyImageView(d->device, view, NULL); g_view_freed++; return -1; }
     VkFramebufferCreateInfo fbi = {0};
     fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbi.renderPass = pass; fbi.attachmentCount = 1; fbi.pAttachments = &view;
@@ -623,7 +645,7 @@ static int clr_fv_get(struct s2a_vk_device *d, const s2a_clear_target *t, int do
     VkFramebuffer fb = VK_NULL_HANDLE;
     if (vkCreateFramebuffer(d->device, &fbi, NULL, &fb) != VK_SUCCESS) {
         vkDestroyImageView(d->device, view, NULL); g_view_freed++;
-        return fail(why, why_size, "clear: 队列化 framebuffer 创建失败"), -1;
+        *fv_status = 5; clr_diag_fv(5); return fail(why, why_size, "clear: 队列化 framebuffer 创建失败"), -1;
     }
     g_fb_created++; g_view_created++;
     slot->used = 1; slot->image = t->image; slot->fmt = t->format; slot->aspect = t->aspect;
@@ -631,7 +653,7 @@ static int clr_fv_get(struct s2a_vk_device *d, const s2a_clear_target *t, int do
     slot->do_clear = do_clear; slot->clear_aspect = clear_aspect;
     slot->fb = fb; slot->view = view;
     *fb_out = fb; *view_out = view;
-    return 0;
+    *fv_status = 6; clr_diag_fv(6); return 0;
 }
 
 // 录一段“只含这笔清除”的 render pass 并交给帧队列。整段在录制失败时从未提交，可直接回收。
@@ -644,9 +666,11 @@ static int clr_record_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
     clr_reset_device(d);
     VkFramebuffer fb = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    if (clr_fv_get(d, t, do_clear, att ? att->aspectMask : 0, &fb, &view, why, why_size) != 0) {
+    unsigned fv_status = 0;
+    if (clr_fv_get(d, t, do_clear, att ? att->aspectMask : 0, &fb, &view, why, why_size, &fv_status) != 0) {
         why[0] = 0;   // 缓存满/建失败不是清除错误：退回同步路径，不报错
         clr_q_note(CLR_Q_FV, "framebuffer/view 缓存不可用或已满");
+        clr_diag_reason(10u + fv_status);
         return S2A_VK_CLEAR_UNHANDLED;
     }
     VkRenderPass pass = clr_pass(d, t->format, t->aspect, att ? att->aspectMask : 0, do_clear, why, why_size);
@@ -665,7 +689,7 @@ static int clr_record_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
         vkFreeCommandBuffers(d->device, d->command_pool, 1, &cmd);
-        why[0] = 0;
+        why[0] = 0; clr_diag_reason(16);
         return S2A_VK_CLEAR_UNHANDLED;
     }
     VkRenderPassBeginInfo rbi = {0};
@@ -682,7 +706,7 @@ static int clr_record_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
     vkCmdEndRenderPass(cmd);
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
         vkFreeCommandBuffers(d->device, d->command_pool, 1, &cmd);
-        why[0] = 0;
+        why[0] = 0; clr_diag_reason(17);
         return S2A_VK_CLEAR_UNHANDLED;
     }
     if (nvn_vk_first_draw_clear_enqueue(d, cmd) != 0) {
@@ -718,6 +742,7 @@ static int clr_full_rect(const s2a_clear_target *t, const VkRect2D *scissor, VkR
 int s2a_vk_clear_color_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
                               const VkClearColorValue *value, uint32_t color_mask,
                               const VkRect2D *scissor, char *why, size_t why_size) {
+    clr_diag_reason(0);
     (void)why; (void)why_size;
     if (!value || !t) return S2A_VK_CLEAR_UNHANDLED;
     color_mask &= 0xfu;
@@ -740,6 +765,7 @@ int s2a_vk_clear_color_queued(struct s2a_vk_device *d, const s2a_clear_target *t
 int s2a_vk_clear_ds_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
                            float depth, uint32_t stencil, int depth_mask, uint32_t stencil_bit_mask,
                            const VkRect2D *scissor, char *why, size_t why_size) {
+    clr_diag_reason(0);
     (void)why; (void)why_size;
     if (!t) return S2A_VK_CLEAR_UNHANDLED;
     if (!depth_mask && !stencil_bit_mask) return S2A_VK_CLEAR_NOOP;
