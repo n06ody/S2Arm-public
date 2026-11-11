@@ -19,6 +19,7 @@
 
 #include "direct/program_cache.h"
 #include "direct/offline_library.h"
+#include "direct/libpack_vk.h"
 #include "nvn_vk_program.h"
 #include "nvn_obj.h"
 #include "vk_record.h"
@@ -36,6 +37,7 @@
 #include "nvn_vk_first_draw.h"
 #include "nvn_vk_format.h"
 #include "nvn_first_use.h"   // C4a：iOS pso_pend 语义共用件（graphics/nvn/gfx/nvn）
+#include "../../../graphics/nvn/gfx/nvn/dmsh_chain.h"   // #1434：b-<DMSH_CHAIN>-vk 库目录名
 
 // SetShaders 期的源快照（direct/source_store.c）。编译请求必须从这里取 code/control，
 // 不能用绑定后可能已被游戏复用的内存。非 Android 构建没有这个实现。
@@ -1542,6 +1544,87 @@ static struct nvk_cached_program *nvk_program_for_draw(struct s2a_vk_device *dev
                     draw_log("offline library: miss root=%s abi=%u profile=%s identity=%02x%02x%02x%02x (%s)",
                              rev_root, pc.direct_abi, pc.profile_hash,
                              insha[0], insha[1], insha[2], insha[3], owhy);
+            }
+        }
+        // #1434 离线 Vulkan 直连库（LibPack）：默认关——debug.s2a.libpack_vk=1 才查，
+        // 默认路径不 open 容器、不查键、不合成。与离线库同属只读包内来源但键派生不同：
+        // 用每阶段 8 字节控制键（state->keys，与 iOS lib_pack 同键）而非内容身份。
+        // 命中判据与离线库同口径：合成字节先过 nvn_vk_first_draw_program_valid 再采纳。
+        {
+            static int libpack_on = -1;
+            if (libpack_on < 0) {
+                char b[PROP_VALUE_MAX] = {0};
+                __system_property_get("debug.s2a.libpack_vk", b);
+                libpack_on = (b[0] == '1');
+            }
+            // no_offline 同样拦本库：它与离线库同属"包内只读来源"，跳离线库就要连它一起跳
+            if (!offline_used && !no_offline && libpack_on && rev_root && rev_root[0] == '/') {
+                static struct s2a_libpack *lp_pack;
+                static char lp_root[1100];
+                char lp_dir[1200];
+                snprintf(lp_dir, sizeof lp_dir, "%s/shaders/direct/b-%s-vk", rev_root, DMSH_CHAIN);
+                if (!lp_pack || strcmp(lp_root, rev_root)) {
+                    struct s2a_libpack *np = NULL;
+                    int orc = s2a_libpack_open(&np, lp_dir);
+                    if (orc == 1) {
+                        s2a_libpack_close(lp_pack);
+                        lp_pack = np;
+                        snprintf(lp_root, sizeof lp_root, "%s", rev_root);
+                    } else {
+                        if (orc < 0) {
+                            static _Atomic int nl;
+                            if (atomic_fetch_add(&nl, 1) < 4)
+                                __android_log_print(ANDROID_LOG_INFO, "S2Arm",
+                                                    "first draw: libpack container at %s rejected", lp_dir);
+                        }
+                        lp_pack = NULL;
+                        lp_root[0] = 0;
+                    }
+                }
+                if (lp_pack) {
+                    uint8_t *lbytes = NULL;
+                    size_t llen = 0;
+                    char lwhy[192] = "";
+                    int lrc = s2a_libpack_program_v1(lp_pack, state->keys, state->stages,
+                                                     pc.direct_abi, pc.profile_hash, pc.translator_closure,
+                                                     &lbytes, &llen, lwhy, sizeof lwhy);
+                    if (lrc == S2A_LIBPACK_HIT) {
+                        char vwhy[192] = "";
+                        if (!nvn_vk_first_draw_program_valid(lbytes, llen, vwhy, sizeof vwhy)) {
+                            free(lbytes);
+                            lbytes = NULL;
+                            lrc = S2A_LIBPACK_REJECT;
+                            snprintf(lwhy, sizeof lwhy, "libpack v1 不可解析：%s", vwhy);
+                        }
+                    }
+                    if (lrc == S2A_LIBPACK_HIT) {
+                        uint8_t lsha[32];
+                        nvk_sha256_bytes(lbytes, llen, lsha);
+                        nvk_program_adopt_cached(&tmp, pc.session, pc.generation, insha,
+                                                 lbytes, llen, lsha);
+                        tmp.from_disk = 3;   // 3 = LibPack 直连库命中（不写回私有缓存）
+                        snprintf(tmp.request_id, sizeof tmp.request_id, "%s", "libpack-vk");
+                        nvk_program_capture_c1(&tmp, state);
+                        offline_used = 1;
+                        observation_source = S2A_W2_OFFLINE;
+                        draw_log("program cache: libpack hit %zu B keys=%02x%02x… stages=0x%x profile=%s",
+                                 llen, state->keys[0][0], state->keys[0][1], state->stages, pc.profile_hash);
+                    } else if (lrc == S2A_LIBPACK_REJECT) {
+                        static _Atomic int nr2;
+                        int n = atomic_fetch_add(&nr2, 1);
+                        if (n < 4)
+                            __android_log_print(ANDROID_LOG_INFO, "S2Arm",
+                                                "first draw: libpack rejected stages=0x%x root=%s (%s); "
+                                                "falling back to compile", state->stages, lp_dir, lwhy);
+                        else
+                            draw_log("libpack: rejected stages=0x%x (%s); falling back to compile",
+                                     state->stages, lwhy);
+                    } else {
+                        static _Atomic int nm2;
+                        if (atomic_fetch_add(&nm2, 1) < 4)
+                            draw_log("libpack: miss stages=0x%x root=%s (%s)", state->stages, lp_dir, lwhy);
+                    }
+                }
             }
         }
         if (!offline_used && !no_disk && cdir && *cdir &&

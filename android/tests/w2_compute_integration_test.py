@@ -87,7 +87,7 @@ def main():
         base+=['-I'+str(p) for p in (td,inc,NATIVE,NATIVE/'direct',NATIVE/'nvn',ROOT/'graphics/nvn/gfx/nvn',ROOT/'graphics/nvn/gfx/nvn/include')]
         base+=[str(Path(__file__).with_suffix('.c')),str(td/'bridge.c'),str(td/'source-store.c'),str(td/'worker.c')]
         base+=[str(NATIVE/'nvn'/p) for p in ('nvn_vk_compute_request.c','nvn_vk_compute_lookup.c','nvn_vk_program_result.c','nvn_vk_compute_texture.c')]
-        base+=[str(NATIVE/'direct'/p) for p in ('control.c','diag.c','compile_export.c','compile_export_w2.c','w2_single_query.c','input_identity.c','texture_facts.c','sha256.c','json.c')]
+        base+=[str(NATIVE/'direct'/p) for p in ('control.c','diag.c','compile_export.c','compile_export_w2.c','w2_single_query.c','input_identity.c','texture_facts.c','sha256.c','jv.c','json.c')]
         for name,(worker_text,text) in variants.items():
             if name!='positive':assert (worker_text,text)!=(source,bridge),name
             (td/'bridge.c').write_text(text);(td/'worker.c').write_text(worker_text);exe=td/name

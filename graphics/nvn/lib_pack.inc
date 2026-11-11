@@ -1,8 +1,5 @@
-// S2Arm 直连库打包容器的读法（10-25 合库，格式见共享笔记「画面着色器线_直连库合库草案_1025.md」§1，出库 graphics/tools/direct/lib_pack.py）。
-//   b-<链版本>/lib.idx：头 48 字节（偏移 0 "S2ALIB\0\0"、8 u32 ver = 1、12 u32 n、16 u32 nshard、20 u32 0、24 char chain[12]、36–47 为 0）+ nshard × 16 字节分片表（u64 size、u64 0）
-//   + n × 24 字节记录 {u64 key; u8 kind; u8 shard; u16 0; u32 len; u64 off;}，按 (key, kind) 升序；b-<链版本>/lib.NNN.pak：各段原样字节。
-//   kind：0 _b.metallib、1 _b.json、2 _bf.metallib、3 _bv.metallib、4+d _b_t<d>.metallib（曲面外壳的另外几种域，d = 0–2）、16+i _bg<i>.metallib、32+i _bg<i>.json、48 _bgv.metallib、49 _bgv.json、50 _ft.metallib（片元输出类型变体，入口 main0_t<u>_<s>）、
-//   64+i _bgs<i>.metallib、80+i _bgs<i>.json、96 _bgc.metallib、97 _bgc.json（直通几何快路，Dsh.cs GeometryFinish）。
+// S2Arm 直连库打包容器的 Apple 段读法（10-25 合库，格式见 lib_pack_core.inc 与共享笔记「画面着色器线_直连库合库草案_1025.md」§1，出库 graphics/tools/direct/lib_pack.py）。
+//   容器头/记录结构、lib.idx 打开核头、按键二分在 lib_pack_core.inc（#1434 拆出共用，安卓侧 POSIX 段在 android/native/direct/libpack_vk.c 复用同一份）。
 // 运行时：lib.idx 整份 mmap、二分查；一段 = 分片文件里这一段的只读文件映射（按页对齐只映射这一段，dispatch_data 放掉时 munmap），
 //   给 newLibraryWithData（库）或 NSJSONSerialization（json；dispatch_data 与 NSData 免费桥接）。
 //   分片不整片映射：10-26 巫师3 测试设备2 两局，整片映射且常驻，21 片 1343 MB 全落在低区（4 GB 到游戏窗口底，占满窗口的款只剩 1.1–1.4 GB），
@@ -15,55 +12,20 @@
 //   现在每段带地址提示映射进宿主高位区（runtime/src/vawin.c s2a_host_hi_range：窗口下方的宿主保留段，或窗口之上），核落点；放不下 / 没有高位区报红一次、退回 mmap(NULL)
 // 由 nvn_mtl.m 与单测各自 #include；包含方先定义 LP_LOG(fmt, ...)（一行日志，红行自带 【红】）与 LP_HI_RANGE(&lo, &hi)
 //   （1 = 宿主高位区 [lo, hi)；0 = 有原生层但没有高位区，报红一次、退回低区；-1 = 没链原生层（图形单测），照旧 mmap(NULL)、不报红）。线程：库在提交线程、预热线程、预载线程上都会取，每次取各开各读（无共享可变状态）
+#include "lib_pack_core.inc"
 #include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <stdatomic.h>
 #include "../../runtime/include/s2a_qos.h"   // 线程调度档一张表（IO_BG）；要在第一次用 s2a_qos_global 之前（11-06 原放在第 112 行，t_lib_pack 编不过、gfx 钩子红）
 
-enum { LP_K_B = 0, LP_K_BJSON = 1, LP_K_BF = 2, LP_K_BV = 3, LP_K_BT = 4, LP_K_BG = 16, LP_K_BGJSON = 32, LP_K_BGV = 48, LP_K_BGVJSON = 49, LP_K_FT = 50, LP_K_SE = 51,
-       LP_K_BGS = 64, LP_K_BGSJSON = 80, LP_K_BGC = 96, LP_K_BGCJSON = 97, LP_SHARD_MAX = 256 };   // 64+i / 80+i / 96 / 97: the passthrough-geometry fast path's <key>_bgs<i> (side-effect-only kernel) and <key>_bgc (capture reader)   // 51: a shader's sampler-emulation variant <key>_se, precompiled by the package (nvn_mtl.m se_packed)
-typedef struct { uint64_t key; uint8_t kind, shard; uint16_t z; uint32_t len; uint64_t off; } lp_rec;
-_Static_assert(sizeof(lp_rec) == 24, "lib.idx record is 24 bytes");
-typedef struct {
-    const uint8_t *idx; size_t idx_len; uint32_t n, nshard; const lp_rec *rec; const uint64_t *ssize;
-    char dir[1024];
-} lp_pack;
-
-// 打开 <dir>/lib.idx 并核头：魔数、版本、链版本（chain 与 want_chain 同为 12 字符）、长度。成功返回 1；没有 lib.idx 返回 0（不报红，由调用方决定）；格式不对报红返回 -1
-static int lp_open(lp_pack *p, const char *dir, const char *want_chain) {
-    memset(p, 0, sizeof *p); strlcpy(p->dir, dir, sizeof p->dir);
-    char path[1100]; snprintf(path, sizeof path, "%s/lib.idx", dir);
-    int fd = open(path, O_RDONLY); if (fd < 0) return 0;
-    struct stat st; if (fstat(fd, &st) || st.st_size < 48) { close(fd); LP_LOG("【红】 direct library container: %s is %lld bytes, shorter than its 48-byte header", path, (long long)st.st_size); return -1; }
-    void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
-    if (m == MAP_FAILED) { LP_LOG("【红】 direct library container: cannot map %s", path); return -1; }
-    const uint8_t *h = m; uint32_t ver, n, ns; memcpy(&ver, h + 8, 4); memcpy(&n, h + 12, 4); memcpy(&ns, h + 16, 4);
-    char chain[13] = {0}; memcpy(chain, h + 24, 12);
-    const char *why = memcmp(h, "S2ALIB\0\0", 8) ? "magic is not S2ALIB" : ver != 1 ? "format version is not 1" : ns > LP_SHARD_MAX ? "too many shards"
-                    : (size_t)st.st_size != 48 + 16 * (size_t)ns + 24 * (size_t)n ? "length does not match the record count" : want_chain && strcmp(chain, want_chain) ? "translation chain differs" : NULL;
-    if (why) { LP_LOG("【红】 direct library container %s: %s (version %u, %u records, %u shards, chain %s, this host expects %s)", path, why, ver, n, ns, chain, want_chain ? want_chain : "-");
-               munmap(m, (size_t)st.st_size); return -1; }
-    p->idx = h; p->idx_len = (size_t)st.st_size; p->n = n; p->nshard = ns;
-    p->ssize = (const uint64_t *)(h + 48); p->rec = (const lp_rec *)(h + 48 + 16 * (size_t)ns);   // the header and the shard table are 16-byte multiples: records stay 8-byte aligned
-    return 1;
-}
-// 16 位十六进制键（库文件名的前 16 字符，比如 "0123456789abcdef_b"）→ 数值；不是就返回 0 并置 *ok = 0
+// 16 位十六进制键（库文件名的前 16 字符，比如 "0123456789abcdef_b"）→ 数值；不是就返回 0 并置 *ok = 0。
+//   Apple 段按文件名取段用；安卓段键是 8 字节控制键原件，不走文件名（libpack_vk.c lp_key8）。
 static uint64_t lp_key(const char *s, int *ok) {
     uint64_t k = 0; *ok = 1;
     for (int i = 0; i < 16; i++) { char c = s[i]; int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
         if (v < 0) { *ok = 0; return 0; } k = k << 4 | (uint64_t)v; }
     return k;
 }
-static const lp_rec *lp_find(const lp_pack *p, uint64_t key, unsigned kind) {
-    size_t lo = 0, hi = p->n;
-    while (lo < hi) { size_t mid = (lo + hi) / 2; const lp_rec *r = &p->rec[mid];
-        if (r->key < key || (r->key == key && r->kind < kind)) lo = mid + 1; else if (r->key == key && r->kind == kind) return r; else hi = mid; }
-    return NULL;
-}
+
 // 映射一段（只读文件页）：先带提示放宿主高位区，落点不在区里（区满：内核往上找到了区外）就放掉、报红一次、退回 mmap(NULL)。*hi = 1 放进了高位区。
 //   释放照旧 munmap（普通文件映射，不是自己占的保留）。读数：高位区段数 / 在用字节、退回低区的段数 / 字节（nvn_mtl.m shader_load_stats 打）
 static _Atomic uint64_t g_lp_hi_n, g_lp_hi_live, g_lp_low_n, g_lp_low_bytes;

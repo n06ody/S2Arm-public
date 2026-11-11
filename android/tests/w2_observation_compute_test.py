@@ -133,7 +133,7 @@ def main():
         files += [str(NATIVE / "nvn" / p) for p in ("nvn_vk_compute_bridge.c", "nvn_vk_compute_request.c",
             "nvn_vk_compute_lookup.c", "nvn_vk_program_result.c", "nvn_vk_compile_facts.c",
             "nvn_vk_compute_texture.c", "nvn_vk_format.c", "nvn_vk_mrt.c")]
-        files += [str(NATIVE / "direct" / p) for p in ("control.c", "diag.c", "compile_export.c", "compile_export_w2.c", "w2_single_query.c", "input_identity.c", "texture_facts.c", "sha256.c", "json.c")]
+        files += [str(NATIVE / "direct" / p) for p in ("control.c", "diag.c", "compile_export.c", "compile_export_w2.c", "w2_single_query.c", "input_identity.c", "texture_facts.c", "sha256.c", "jv.c", "json.c")]
         executable = td / "compute"
         host_link.run(flags + files + ["-lm", "-o", str(executable)], check=True, timeout=60)
         bridge_file = str(NATIVE / "nvn/nvn_vk_compute_bridge.c")

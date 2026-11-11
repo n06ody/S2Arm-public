@@ -550,6 +550,13 @@ else()
     target_compile_options(direct_offline_library_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(direct_offline_library_test PRIVATE pthread)
     add_test(NAME android_direct_offline_library COMMAND direct_offline_library_test)
+    # #1434：LibPack（iOS 同容器）POSIX 段读器 + _b.json→s2a-direct-program-v1 适配。
+    add_executable(libpack_vk_test tests/libpack_vk_test.c
+        native/direct/libpack_vk.c native/direct/json.c native/direct/jv.c native/nvn/nvn_vk_program_result.c)
+    target_include_directories(libpack_vk_test PRIVATE native native/direct native/nvn ../runtime/include)
+    target_compile_definitions(libpack_vk_test PRIVATE _GNU_SOURCE)
+    target_compile_options(libpack_vk_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME android_libpack_vk COMMAND libpack_vk_test)
     # W2.6：编译 provider 的登记身份——同指针幂等、换指针拒绝、Activate 冻结、销毁解绑、表满不覆盖。
     add_executable(direct_compiler_bind_test tests/direct_compiler_bind_test.c native/direct/compiler_bind.c)
     target_include_directories(direct_compiler_bind_test PRIVATE native ../runtime/include)
@@ -593,13 +600,13 @@ else()
     # 与负控；原样链接生产 parser，不另写模型。
     # compute storage 地址来源解析（NVN / UBO_PTR / UBO_ADDRESS + 来源反例 + supportReads/c0Reads null）
     add_executable(direct_nvn_compute_storage_test tests/direct_nvn_compute_storage_test.c
-        native/nvn/nvn_vk_program_result.c native/direct/json.c)
+        native/nvn/nvn_vk_program_result.c native/direct/json.c native/direct/jv.c)
     target_include_directories(direct_nvn_compute_storage_test PRIVATE native native/direct native/nvn
         ../graphics/nvn/gfx/nvn)
     target_compile_options(direct_nvn_compute_storage_test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME android_direct_nvn_compute_storage COMMAND direct_nvn_compute_storage_test)
     add_executable(direct_nvn_program_result_test tests/direct_nvn_program_result_test.c
-        native/nvn/nvn_vk_program_result.c native/direct/json.c)
+        native/nvn/nvn_vk_program_result.c native/direct/json.c native/direct/jv.c)
     target_include_directories(direct_nvn_program_result_test PRIVATE native native/direct native/nvn)
     target_compile_options(direct_nvn_program_result_test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME android_direct_nvn_program_result COMMAND direct_nvn_program_result_test)

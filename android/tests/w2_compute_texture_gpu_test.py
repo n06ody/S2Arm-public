@@ -41,11 +41,12 @@ def main():
         exe = tmp / 'w2_compute_texture_gpu_test'
         cmd = [os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-o', str(exe)]
         cmd += ['-I' + str(p) for p in (inc, NATIVE, NATIVE / 'nvn', NATIVE / 'direct',
+                                        ROOT / 'android/tests/hostvk',   # nvn_vk_compute.c 宿主独立 TU 面：__has_include 命中 android/log.h 桩才引
                                         ROOT / 'graphics/nvn/gfx/nvn', ROOT / 'graphics/nvn/gfx/nvn/include')]
         cmd += [str(Path(__file__).with_suffix('.c'))]
         cmd += [str(NATIVE / 'nvn' / p) for p in
                 ('nvn_vk_compute.c', 'nvn_vk_compute_texture.c', 'nvn_vk_program_result.c')]
-        cmd += [str(NATIVE / 'direct' / p) for p in ('texture_facts.c', 'json.c')]
+        cmd += [str(NATIVE / 'direct' / p) for p in ('texture_facts.c', 'jv.c', 'json.c')]
         cmd += ['-lvulkan', '-lm']
         subprocess.run(cmd, check=True, timeout=120)
         result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
