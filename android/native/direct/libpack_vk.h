@@ -5,7 +5,7 @@
 //   _b.json 是逐键单阶段的反射（dsh 批翻链，Metal/Vulkan 共用同一份），_b.spv 是同键 Vulkan 产物
 //   （绑定号已按 arg_id×6+阶段号烘焙：vs 0 / ps 4 / cs 5，DshVk.BindToArgIds）。
 // 命中判据：键的 _b.json 与 _b.spv 都在、_b.json 的 dm_ctl == 键 hex、stage 是本段阶段、
-//   _b.spv 是合法 SPIR-V 头；合成的 s2a-direct-program-v1 字节再走 nvn_vk_first_draw 的
+//   _b.spv 的描述符和支撑缓冲布局可映射；合成的 s2a-direct-program-v1 字节再走 nvn_vk_first_draw 的
 //   parse_program 同一套接受——命中不等于可绘制（与 offline_library.h 同一口径）。
 // 计数口径：hit = 全部阶段都拿到并合成通过；miss = 包不在/键不在/缺 json 或 spv/
 //   程序含 vk 库不出的阶段（gs/tcs/tes）；reject = 容器坏/段越界/json 损坏/
@@ -41,10 +41,11 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
                     uint8_t **bytes, size_t *len, char *why, size_t why_size);
 
 // 程序命中：keys[6][8] + stages 位图 → 合成的 s2a-direct-program-v1 字节（malloc，调用方 free）。
-//   每阶段取 _b.json + _b.spv：绑定号 = arg_id×6+阶段号（与 .spv 内烘焙的一致），kind 桶照
-//   _b.json 的语义种类译：cbuf→uniform、tex/samp_tex→texture、img→image、sbuf 系→storage、
-//   support→support(stage="program")；…Smplr / samp* 是组合纹理的采样器半边，v1 不出行；
-//   宿主辅助（uvx/lb/ubolen/sbsize/geometry/drvcb/c1）→ uniform/storage 无 guest 槽。
+//   每阶段以 _b.spv 的 OpVariable/类型/描述符装饰为准，按名字联 _b.json 的来源事实，
+//   只输出真实 Vulkan 描述符；Metal 独有的 uvx/lb/ubolen/sbsize 不凭空生成绑定。
+//   support → program support、c0/c1/c3..c18 → 对应 uniform slot、已知 sbuf / 合并纹理
+//   取实际来源；不认识的描述符或不支持的槽位明确 REJECT。supportLayout.requiredSize
+//   由各阶段 SPIR-V 支撑缓冲的显式偏移/步长计算并取最大，不可计算时拒绝。
 //   任一键缺段/坏段 → 整个程序 MISS/REJECT（半程序不命中）。identity 段由调用方给
 //   （direct_abi/profile_hash/translator_closure——与现编 request 同源）。
 int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8], uint32_t stages,

@@ -119,10 +119,6 @@ static const char *lp_v1_stage_name(const char *lib_stage) {
 static uint32_t lp_tex_slot_word(uint32_t reg) {
     return reg < 32 ? 8 + reg * 2 : 0x5A + (reg - 128) * 2;
 }
-static uint32_t lp_img_slot_word(uint32_t reg) {
-    return 0x48 + reg * 2;   // IMG_BASE 0x120 / 4
-}
-
 // 增长缓冲（v1 字节是 snprintf 合成的 JSON；段都不长，失败即拒不算半份）
 struct jw { uint8_t *b; size_t n, cap; int oom; };
 static void jw_put(struct jw *j, const char *s, size_t n) {
@@ -177,84 +173,255 @@ static int lp_fail(char *why, size_t why_size, const char *fmt, ...) {
     return -1;
 }
 
-// 一个键的 _b.json bindings[] → v1 content.bindings[]（追加进 jw；sep 管逗号）
-// stage_no = 本段 StageNo（绑定号换算用它），v1_stage = v1 阶段名标签
+// Enumerate descriptor variables from the Vulkan module, not the Metal reflection.
+// The producer gives the two backends separate descriptor lists. A name without
+// an OpVariable is not a Vulkan binding; a Vulkan variable without a usable name
+// or supported type must be rejected rather than invented from a Metal entry.
+#define LP_GFX_MAX_IDS 262144u
+#define LP_GFX_MAX_DESCS 256u
+struct lp_gfx_id {
+    uint32_t set, binding, type, target, storage, aux, stride, pos, words;
+    uint16_t type_op;
+    uint8_t variable, named, name_long, block, constant, sampled, dim;
+    char name[80];
+};
+struct lp_gfx_desc { uint32_t binding; int kind; char name[80]; };
+
+// Compute the declared support block extent from explicit SPIR-V member offsets
+// and array strides. Unsupported types/layouts fail closed; never guess a size.
+static int lp_gfx_extent(const struct lp_gfx_id *ids, uint32_t bound, const uint32_t *w, size_t n,
+                         uint32_t id, unsigned depth, uint32_t *extent) {
+    if (id >= bound || depth > 32) return -1;
+    const struct lp_gfx_id *t = &ids[id];
+    uint32_t sub = 0;
+    uint64_t size = 0;
+    if (t->type_op == 21 || t->type_op == 22) { // integer / float
+        if (!t->aux || t->aux > 64 || (t->aux & 7)) return -1;
+        size = t->aux / 8;
+    } else if (t->type_op == 23) { // vector
+        if (!t->aux || t->aux > 4 || lp_gfx_extent(ids, bound, w, n, t->target, depth+1, &sub)) return -1;
+        size = (uint64_t)sub * t->aux;
+    } else if (t->type_op == 28) { // fixed array with explicit ArrayStride
+        if (!t->stride || t->aux >= bound || !ids[t->aux].constant || !ids[t->aux].aux ||
+            ids[t->aux].type >= bound || ids[ids[t->aux].type].type_op != 21 ||
+            ids[ids[t->aux].type].aux != 32 ||
+            lp_gfx_extent(ids, bound, w, n, t->target, depth+1, &sub) || sub > t->stride) return -1;
+        size = (uint64_t)t->stride * ids[t->aux].aux;
+    } else if (t->type_op == 30) { // struct: every member must have an explicit offset
+        if (t->words < 2 || (size_t)t->pos + t->words > n) return -1;
+        for (uint32_t member = 0; member < t->words-2; ++member) {
+            uint32_t offset = UINT32_MAX;
+            for (size_t at = 5; at < n;) {
+                uint32_t op = w[at] & 0xffffu, wc = w[at] >> 16;
+                if (!wc || wc > n-at) return -1;
+                if (op == 72 && wc >= 5 && w[at+1] == id && w[at+2] == member && w[at+3] == 35) {
+                    if (offset != UINT32_MAX) return -1;
+                    offset = w[at+4];
+                }
+                at += wc;
+            }
+            if (offset == UINT32_MAX || lp_gfx_extent(ids, bound, w, n, w[t->pos+2+member], depth+1, &sub)) return -1;
+            uint64_t end = (uint64_t)offset + sub;
+            if (end > size) size = end;
+        }
+    } else return -1;
+    if (!size || size > UINT32_MAX) return -1;
+    *extent = (uint32_t)size;
+    return 0;
+}
+
+static int lp_gfx_descriptors(const uint8_t *spv, size_t bytes, int stage_no,
+                              struct lp_gfx_desc *out, size_t cap, uint32_t *support_max,
+                              char *why, size_t why_size) {
+    if (bytes < 20 || (bytes & 3)) return lp_fail(why, why_size, "SPIR-V size invalid");
+    const uint32_t *w = (const uint32_t *)spv;
+    const size_t n = bytes / 4;
+    uint32_t bound = w[3];
+    if (!bound || bound > LP_GFX_MAX_IDS) return lp_fail(why, why_size, "SPIR-V id bound invalid");
+    struct lp_gfx_id *ids = calloc(bound, sizeof *ids);
+    if (!ids) return lp_fail(why, why_size, "SPIR-V descriptor scan out of memory");
+    for (uint32_t i = 0; i < bound; ++i) ids[i].set = ids[i].binding = UINT32_MAX;
+    int rc = -1;
+    for (size_t at = 5; at < n;) {
+        uint32_t op = w[at] & 0xffffu, wc = w[at] >> 16;
+        if (!wc || wc > n - at) { lp_fail(why, why_size, "invalid SPIR-V instruction length"); goto done; }
+        if (op == 5 && wc >= 3) { // OpName
+            uint32_t id = w[at+1];
+            if (id >= bound) { lp_fail(why, why_size, "SPIR-V name id outside bound"); goto done; }
+            size_t available = (wc-2u)*4u;
+            const char *s = (const char *)&w[at+2], *end = memchr(s, 0, available);
+            if (!end || ids[id].named) { lp_fail(why, why_size, "invalid SPIR-V descriptor name"); goto done; }
+            size_t len = (size_t)(end-s); ids[id].named = 1;
+            if (len >= sizeof ids[id].name) ids[id].name_long = 1;
+            else memcpy(ids[id].name, s, len+1);
+        } else if (op == 71 && wc >= 3) { // OpDecorate
+            uint32_t id = w[at+1], decoration = w[at+2];
+            if (id >= bound) { lp_fail(why, why_size, "SPIR-V decoration id outside bound"); goto done; }
+            if (decoration == 2 || decoration == 3) ids[id].block = (uint8_t)decoration;
+            if (decoration == 6) {
+                if (wc < 4 || !w[at+3] || ids[id].stride) { lp_fail(why, why_size, "invalid SPIR-V array stride"); goto done; }
+                ids[id].stride = w[at+3];
+            }
+            if (decoration == 33 || decoration == 34) {
+                if (wc < 4) { lp_fail(why, why_size, "SPIR-V descriptor decoration missing value"); goto done; }
+                uint32_t *field = decoration == 33 ? &ids[id].binding : &ids[id].set;
+                if (*field != UINT32_MAX) { lp_fail(why, why_size, "duplicate SPIR-V descriptor decoration"); goto done; }
+                *field = w[at+3];
+            }
+        } else if (op == 59 && wc >= 4) { // OpVariable
+            uint32_t id = w[at+2];
+            if (id >= bound || w[at+1] >= bound || ids[id].variable) { lp_fail(why, why_size, "invalid SPIR-V variable"); goto done; }
+            ids[id].variable = 1; ids[id].type = w[at+1]; ids[id].storage = w[at+3];
+        } else if (op == 43 && wc == 4) { // 32-bit OpConstant for array lengths
+            uint32_t id = w[at+2];
+            if (id >= bound || ids[id].constant) { lp_fail(why, why_size, "invalid SPIR-V constant"); goto done; }
+            ids[id].constant = 1; ids[id].type = w[at+1]; ids[id].aux = w[at+3];
+        } else if ((op == 32 && wc >= 4) || (op == 27 && wc >= 3) ||
+                   (op == 25 && wc >= 9) || (op == 28 && wc >= 4) || (op == 29 && wc >= 3) ||
+                   (op == 21 && wc >= 4) || (op == 22 && wc >= 3) ||
+                   (op == 23 && wc >= 4) || (op == 30 && wc >= 2)) {
+            uint32_t id = w[at+1];
+            if (id >= bound || ids[id].type_op) { lp_fail(why, why_size, "invalid SPIR-V type id"); goto done; }
+            ids[id].type_op = (uint16_t)op;
+            if (op == 32) { ids[id].storage = w[at+2]; ids[id].target = w[at+3]; }
+            else if (op == 25) {
+                if (w[at+3] > UINT8_MAX || w[at+7] > UINT8_MAX) { lp_fail(why, why_size, "invalid SPIR-V image type"); goto done; }
+                ids[id].dim = (uint8_t)w[at+3]; ids[id].sampled = (uint8_t)w[at+7];
+            }
+            else if (op == 21 || op == 22) ids[id].aux = w[at+2];
+            else if (op == 23 || op == 28) { ids[id].target = w[at+2]; ids[id].aux = w[at+3]; }
+            else if (op == 30) { ids[id].pos = (uint32_t)at; ids[id].words = wc; }
+            else ids[id].target = w[at+2];
+        }
+        at += wc;
+    }
+    rc = 0;
+    for (uint32_t id = 0; id < bound; ++id) {
+        struct lp_gfx_id *v = &ids[id];
+        if (!v->variable || (v->storage != 0 && v->storage != 2 && v->storage != 12)) continue;
+        if (v->set == UINT32_MAX && v->binding == UINT32_MAX) {
+            lp_fail(why, why_size, "SPIR-V descriptor lacks set and binding"); rc = -1; goto done;
+        }
+        if (v->set != 0 || v->binding == UINT32_MAX || v->binding % 6u != (unsigned)stage_no ||
+            !v->named || v->name_long || !v->name[0] || v->type >= bound ||
+            ids[v->type].type_op != 32 || ids[v->type].storage != v->storage || ids[v->type].target >= bound) {
+            lp_fail(why, why_size, "unsupported or incomplete SPIR-V descriptor"); rc = -1; goto done;
+        }
+        uint32_t target = ids[v->type].target;
+        int kind = -1; // 0 uniform, 1 storage, 2 combined texture, 3 image
+        if (v->storage == 2) kind = ids[target].block == 3 ? 1 : ids[target].block == 2 ? 0 : -1;
+        else if (v->storage == 12) kind = 1;
+        else if (ids[target].type_op == 27 && ids[target].target < bound) {
+            struct lp_gfx_id *image = &ids[ids[target].target];
+            if (image->type_op == 25 && image->sampled == 1 && image->dim != 5) kind = 2;
+        } else if (ids[target].type_op == 25 && ids[target].sampled == 2 && ids[target].dim != 5) kind = 3;
+        if (kind < 0 || (size_t)rc >= cap) { lp_fail(why, why_size, "unsupported SPIR-V descriptor type/count"); rc = -1; goto done; }
+        if (!strcmp(v->name, "support_buffer")) {
+            uint32_t required = 0;
+            if (kind != 0 || lp_gfx_extent(ids, bound, w, n, target, 0, &required)) {
+                lp_fail(why, why_size, "SPIR-V support block extent unavailable"); rc = -1; goto done;
+            }
+            if (required > *support_max) *support_max = required;
+        }
+        for (int j = 0; j < rc; ++j) if (out[j].binding == v->binding) {
+            lp_fail(why, why_size, "duplicate SPIR-V binding"); rc = -1; goto done;
+        }
+        out[rc].binding = v->binding; out[rc].kind = kind;
+        memcpy(out[rc].name, v->name, sizeof out[rc].name); ++rc;
+    }
+done:
+    free(ids); return rc;
+}
+
+static int lp_gfx_bank(const char *name) {
+    const char *p = strrchr(name, '_');
+    if (!p || p[1] != 'c' || p[2] < '0' || p[2] > '9') return -1;
+    unsigned bank = 0;
+    for (p += 2; *p; ++p) {
+        if (*p < '0' || *p > '9') return -1;
+        bank = bank * 10u + (unsigned)(*p - '0');
+        if (bank > 18) return -1;
+    }
+    return (int)bank;
+}
+
+// Emit exactly the Vulkan module's descriptors. JSON is used only to recover
+// source facts for descriptors that actually exist; Metal-only members never
+// become Vulkan bindings.
 static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_stage,
-                            int stage_no, const char *v1_stage, int *sep, char *why, size_t why_size) {
+                            int stage_no, const char *v1_stage, const uint8_t *spv, size_t spv_len,
+                            int *sep, uint32_t *support_max, char *why, size_t why_size) {
     struct s2a_jv arr;
     if (s2a_jv_obj_find(top, "bindings", &arr) || !s2a_jv_is_array(arr))
         return lp_fail(why, why_size, "%s: no bindings array", lib_stage);
-    int n = s2a_jv_arr_count(arr);
-    if (n < 0) return lp_fail(why, why_size, "%s: bindings array syntax", lib_stage);
-    for (int i = 0; i < n; i++) {
-        struct s2a_jv b;
-        if (s2a_jv_arr_item(arr, i, &b)) return lp_fail(why, why_size, "%s bindings[%u] span", lib_stage, i);
-        char msl[64] = "", kind[24] = "";
-        uint32_t arg_id = 0;
-        if (jf_str(b, "msl_name", msl, sizeof msl) || jf_str(b, "kind", kind, sizeof kind) || jf_u32(b, "arg_id", &arg_id))
-            return lp_fail(why, why_size, "%s bindings[%u] missing msl_name/kind/arg_id", lib_stage, i);
-        uint32_t binding = arg_id * 6 + (uint32_t)stage_no;
-        // 采样器半边：组合纹理在 .spv 只留一个合并变量、吃 texture 成员的号（dsh_vk ②）——v1 不出行
-        size_t ml = strlen(msl);
-        int sampler_half = (ml > 5 && !strcmp(msl + ml - 5, "Smplr"));
-        const char *v1kind = NULL; uint32_t slot = 0; int has_slot = 0;
-        char provenance[96] = "";   // storage 三元出处（nvnSlot / uboSlot+uboOffset / uboPtr）
-        if (sampler_half) continue;
-        if (!strcmp(kind, "tex") || !strcmp(kind, "tbuf") || !strcmp(kind, "tex_pool")) {
-            uint32_t reg = 0; int has_reg = !jf_u32(b, "reg", &reg);
-            v1kind = "texture";
-            if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = 1; }
-        } else if (!strcmp(kind, "tex_ubo") || !strcmp(kind, "tbuf_ubo") || !strcmp(kind, "tex_c2a")) {
-            v1kind = "texture";   // 句柄在游戏 UBO 里：v1 无对应字段，出绑定不挂槽（按缺席槽位如实）
-        } else if (!strcmp(kind, "samp") || !strcmp(kind, "samp_id") || !strcmp(kind, "samp_ubo")
-                   || !strcmp(kind, "samp_c2a") || !strcmp(kind, "samp_pool") || !strcmp(kind, "samp_tex")) {
-            continue;   // 采样器半边/独立采样器句柄：v1 是合并纹理模型，不出行
-        } else if (!strcmp(kind, "img") || !strcmp(kind, "img_ubo")) {
-            uint32_t reg = 0;
-            v1kind = "image";
-            if (!strcmp(kind, "img") && !jf_u32(b, "reg", &reg)) { slot = lp_img_slot_word(reg); has_slot = 1; }
-        } else if (!strcmp(kind, "cbuf")) {
-            uint32_t reg = 0;
-            if (jf_u32(b, "reg", &reg)) return lp_fail(why, why_size, "%s bindings[%u] cbuf without reg", lib_stage, i);
-            v1kind = "uniform"; slot = reg + 3; has_slot = 1;   // v1：驱动槽号，消费端 ubo_slot = slot-3
-        } else if (!strcmp(kind, "c1") || !strcmp(kind, "drvcb") || !strcmp(kind, "ubolen")
-                   || !strcmp(kind, "sbsize") || !strcmp(kind, "uvx") || !strcmp(kind, "lb")) {
-            v1kind = "uniform";   // 宿主常量/表：真实 UBO 描述符、无 guest 槽
-        } else if (!strcmp(kind, "geometry") || !strcmp(kind, "sbuf") || !strcmp(kind, "sbuf_ubo")
-                   || !strcmp(kind, "ubo_ptr") || !strcmp(kind, "gmem_map") || !strcmp(kind, "gmem_log")) {
-            v1kind = "storage";
-            uint32_t v = 0;
-            if (!strcmp(kind, "sbuf")) {
-                if (!jf_u32(b, "reg", &v)) snprintf(provenance, sizeof provenance, ",\"nvnSlot\":%u", v);
-            } else if (!strcmp(kind, "sbuf_ubo")) {
-                uint32_t off = 0;
-                if (!jf_u32(b, "reg", &v) && !jf_u32(b, "off", &off))
-                    snprintf(provenance, sizeof provenance, ",\"uboSlot\":%u,\"uboOffset\":%u", v, off);
-            } else if (!strcmp(kind, "ubo_ptr")) {
-                if (!jf_u32(b, "reg", &v)) snprintf(provenance, sizeof provenance, ",\"uboPtr\":%u", v);
+    int count = s2a_jv_arr_count(arr);
+    if (count < 0 || count > 512) return lp_fail(why, why_size, "%s: invalid binding count", lib_stage);
+    struct lp_gfx_desc desc[LP_GFX_MAX_DESCS];
+    int nd = lp_gfx_descriptors(spv, spv_len, stage_no, desc, LP_GFX_MAX_DESCS, support_max, why, why_size);
+    if (nd < 0) return -1;
+    for (int di = 0; di < nd; ++di) {
+        const struct lp_gfx_desc *d = &desc[di];
+        struct s2a_jv found = {0};
+        char kind[24] = "";
+        uint32_t arg = 0;
+        int have = 0;
+        for (int i = 0; i < count; ++i) {
+            struct s2a_jv b; char name[80] = "";
+            if (s2a_jv_arr_item(arr, i, &b) || jf_str(b, "msl_name", name, sizeof name))
+                return lp_fail(why, why_size, "%s bindings[%d] missing name", lib_stage, i);
+            if (strcmp(name, d->name)) continue;
+            if (have || jf_str(b, "kind", kind, sizeof kind) || jf_u32(b, "arg_id", &arg))
+                return lp_fail(why, why_size, "%s descriptor %s has invalid metadata", lib_stage, d->name);
+            found = b; have = 1;
+        }
+        if (have && (arg > UINT32_MAX / 6 || arg * 6u + (unsigned)stage_no != d->binding))
+            return lp_fail(why, why_size, "%s descriptor %s binding mismatch", lib_stage, d->name);
+        if (!strcmp(d->name, "support_buffer")) {
+            if (d->kind != 0 || (have && strcmp(kind, "support")))
+                return lp_fail(why, why_size, "%s support descriptor type mismatch", lib_stage);
+            jw_fmt(j, "%s{\"kind\":\"support\",\"stage\":\"program\",\"set\":0,\"binding\":%u}", *sep ? "," : "", d->binding);
+            *sep = 1; continue;
+        }
+        uint32_t slot = 0, rw = 0; char prov[160] = "";
+        const char *out_kind = NULL;
+        int bank = lp_gfx_bank(d->name);
+        if (d->kind == 0 && bank >= 0) {
+            if ((stage_no == 0 && strncmp(d->name, "vp_", 3)) ||
+                (stage_no == 4 && strncmp(d->name, "fp_", 3)) || bank == 2)
+                return lp_fail(why, why_size, "%s unsupported cbuf descriptor %s", lib_stage, d->name);
+            if (have) {
+                uint32_t v = 0;
+                if (!strcmp(kind, "cbuf")) {
+                    if (bank < 3 || jf_u32(found, "reg", &v) || v != (unsigned)bank-3u)
+                        return lp_fail(why, why_size, "%s cbuf metadata mismatch", lib_stage);
+                } else if (!strcmp(kind, "c1")) {
+                    if (bank != 1) return lp_fail(why, why_size, "%s c1 metadata mismatch", lib_stage);
+                } else if (!strcmp(kind, "drvcb")) {
+                    if (jf_u32(found, "bank", &v) || v != (unsigned)bank)
+                        return lp_fail(why, why_size, "%s driver bank metadata mismatch", lib_stage);
+                } else return lp_fail(why, why_size, "%s uniform metadata kind mismatch", lib_stage);
             }
-            // gmem_map/gmem_log/geometry：宿主哨兵槽，无 guest 映射——storage_kind 留 0，消费端如实报不支持
-        } else if (!strcmp(kind, "support")) {
-            // v1：程序级支撑缓冲。set/binding 仍是本段的 arg_id 换算号；stage 标签 "program"
-            jw_fmt(j, "%s{\"kind\":\"support\",\"stage\":\"program\",\"set\":0,\"binding\":%u}", *sep ? "," : "", binding);
-            *sep = 1;
-            continue;
+            out_kind = "uniform"; slot = (uint32_t)bank;
+        } else if (d->kind == 1 && have && !strcmp(kind, "sbuf")) {
+            uint32_t reg = 0;
+            if (jf_u32(found, "reg", &reg) || reg >= 16 || jf_bool(found, "rw", &rw))
+                return lp_fail(why, why_size, "%s storage descriptor facts missing", lib_stage);
+            out_kind = "storage";
+            snprintf(prov, sizeof prov, ",\"cbSlot\":0,\"cbOffset\":%u,\"nvnSlot\":%u,\"rw\":%s",
+                     (stage_no == 0 ? 0x110u : 0x510u) + 16u*reg, reg, rw ? "true" : "false");
+        } else if (d->kind == 2 && have && !strcmp(kind, "tex")) {
+            uint32_t reg = 0;
+            if (jf_u32(found, "reg", &reg) || reg >= 32)
+                return lp_fail(why, why_size, "%s texture slot is unsupported", lib_stage);
+            out_kind = "texture"; slot = lp_tex_slot_word(reg);
         } else {
-            return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' not mappable", lib_stage, i, msl, kind);
+            return lp_fail(why, why_size, "%s descriptor %s kind %d not mappable", lib_stage, d->name, d->kind);
         }
-        uint32_t rw = 0; int has_rw = !jf_bool(b, "rw", &rw);
-        // storage 的 rw 是 v1 必填事实：geometry 是着色器写目标的宿主辅助缓冲（vb/ib/trb/vb_info），
-        //   可写是它的定义事实，_b.json 不落 rw 字段；其余 storage 类 _b.json 缺 rw 就如实拒绝，
-        //   不能代造 false（把可写缓冲按只读绑是静默错绘，比拒收更糟）
-        if (!strcmp(v1kind, "storage") && !has_rw) {
-            if (!strcmp(kind, "geometry")) { rw = 1; has_rw = 1; }
-            else return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' missing rw", lib_stage, i, msl, kind);
-        }
-        jw_fmt(j, "%s{\"kind\":\"%s\",\"stage\":\"%s\",\"set\":0,\"binding\":%u", *sep ? "," : "", v1kind, v1_stage, binding);
+        jw_fmt(j, "%s{\"kind\":\"%s\",\"stage\":\"%s\",\"set\":0,\"binding\":%u",
+               *sep ? "," : "", out_kind, v1_stage, d->binding);
         *sep = 1;
-        if (has_slot) jw_fmt(j, ",\"slot\":%u", slot);
-        if (provenance[0]) jw_str(j, provenance);
-        if (!strcmp(v1kind, "storage")) jw_fmt(j, ",\"rw\":%s", rw ? "true" : "false");
+        if (d->kind == 0 || d->kind == 2) jw_fmt(j, ",\"slot\":%u", slot);
+        if (prov[0]) jw_str(j, prov);
         jw_str(j, "}");
     }
     return 0;
@@ -264,7 +431,7 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
 // 返回 0 成功 / 1 miss / -1 reject
 static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
-                         char *why, size_t why_size) {
+                         uint32_t *support_max, char *why, size_t why_size) {
     const char *lib_stage = lp_nvn_stage_name(nvn);
     if (!lib_stage) return 1;   // gs/tcs/tes：vk 库不出此阶段，整个程序按 miss
     char khex[17];
@@ -309,7 +476,7 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         if (!s2a_jv_obj_find(top, "tex_scales", &ts) && s2a_jv_is_array(ts) && s2a_jv_arr_count(ts) > 0)
             { lp_fail(why, why_size, "%s has tex_scales entries (scaled-access bindings not mapped)", khex); goto done; }
         const char *v1_stage = lp_v1_stage_name(st);
-        if (lp_emit_bindings(binds, top, st, stage_no, v1_stage, bind_sep, why, why_size)) goto done;
+        if (lp_emit_bindings(binds, top, st, stage_no, v1_stage, spv, sn, bind_sep, support_max, why, why_size)) goto done;
         jw_fmt(stages, "%s{\"stage\":\"%s\",\"spirv\":\"", *stage_mask ? "," : "", v1_stage);
         jw_b64(stages, spv, sn);
         if (mask) jw_fmt(stages, "\",\"attributeReadMask\":%u}", mask);
@@ -337,11 +504,11 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     }
     int worst = S2A_LIBPACK_HIT;
     struct jw st = {0}, bd = {0};
-    int sep = 0; uint32_t got = 0;
+    int sep = 0; uint32_t got = 0, support_max = 0;
     for (unsigned nvn = 0, idx = 0; nvn < 6 && idx < 6; nvn++) {
         if (!(stages & (1u << nvn))) continue;
         char sw[192] = "";
-        int rc = lp_stage_emit(lp, keys[idx], nvn, &st, &bd, &sep, &got, sw, sizeof sw);
+        int rc = lp_stage_emit(lp, keys[idx], nvn, &st, &bd, &sep, &got, &support_max, sw, sizeof sw);
         idx++;
         if (rc == 0) continue;
         // 半程序不命中：任一所需阶段拿不到，整个程序按该段的 miss/reject 计
@@ -360,7 +527,9 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
         jw_put(&j, st.b ? (char *)st.b : "", st.n);
         jw_str(&j, "],\"bindings\":[");
         jw_put(&j, bd.b ? (char *)bd.b : "", bd.n);
-        jw_str(&j, "]}}");
+        jw_str(&j, "]");
+        if (support_max) jw_fmt(&j, ",\"supportLayout\":{\"requiredSize\":%u}", support_max);
+        jw_str(&j, "}}");
         if (j.oom) { free(j.b); lp_fail(why, why_size, "v1 synthesis out of memory"); worst = S2A_LIBPACK_REJECT; goto out; }
         *json = j.b; *json_len = j.n;
         worst = S2A_LIBPACK_HIT;
