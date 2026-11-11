@@ -55,11 +55,12 @@ def main():
         cmd = [os.environ.get('CC', 'cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
                '-Wall', '-Wextra', '-Werror', '-O1', '-include', str(seams_h), '-o', str(exe)]
         cmd += ['-I' + str(p) for p in (inc, NATIVE, NATIVE / 'nvn', NATIVE / 'direct',
+                                        ROOT / 'android/tests/hostvk',   # nvn_vk_compute.c 宿主独立 TU 面：__has_include 命中 android/log.h 桩才引
                                         ROOT / 'graphics/nvn/gfx/nvn', ROOT / 'graphics/nvn/gfx/nvn/include')]
         cmd += [str(Path(__file__).with_suffix('.c'))]
         cmd += [str(NATIVE / 'nvn' / p) for p in
                 ('nvn_vk_compute.c', 'nvn_vk_compute_texture.c', 'nvn_vk_program_result.c')]
-        cmd += [str(NATIVE / 'direct' / p) for p in ('texture_facts.c', 'json.c')]
+        cmd += [str(NATIVE / 'direct' / p) for p in ('texture_facts.c', 'jv.c', 'json.c')]
         cmd += [str(seams_c)]
         cmd += ['-lvulkan', '-lm']
         host_link.run(cmd, check=True, timeout=120)

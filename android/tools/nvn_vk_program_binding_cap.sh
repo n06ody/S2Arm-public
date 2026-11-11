@@ -8,7 +8,7 @@ py=${S2A_PY:-${PY:-python3}}
 out=$(mktemp -d "${TMPDIR:-/tmp}/s2a-progbindcap.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 inc=(-I "$repo/android/native" -I "$repo/android/native/nvn" -I "$repo/android/native/direct")
-src=("$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/direct/json.c")
+src=("$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c")
 "$cc" -std=c11 -O1 -Wall -Wextra -Werror -Wno-missing-field-initializers "${inc[@]}" \
     -o "$out/t" "$repo/android/tests/nvn_vk_program_binding_cap_test.c" "${src[@]}"
 fail=0
@@ -21,7 +21,7 @@ mut="$out/mut.c"
     "$repo/android/native/nvn/nvn_vk_program_result.c" "$mut"
 "$cc" -std=c11 -O1 -Wall -Wextra -Werror -Wno-missing-field-initializers "${inc[@]}" \
     -o "$out/mut" "$repo/android/tests/nvn_vk_program_binding_cap_test.c" "$mut" \
-    "$repo/android/native/direct/json.c"
+    "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c"
 printf '== truncate（反例说明）==\n'
 "$out/mut" truncate || fail=1
 [ "$fail" = 0 ] && echo "nvn-vk-program-binding-cap: 通过" || { echo "nvn-vk-program-binding-cap: 失败"; exit 1; }

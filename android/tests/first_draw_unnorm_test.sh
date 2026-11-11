@@ -40,7 +40,7 @@ HEADER
 "$GLSLC" android/tests/first_draw_unnorm.frag -o "$E/frag.spv"
 sources=(android/tests/first_draw_unnorm_test.c
 android/native/nvn/{mtl_vk_adapter,nvn_vk_program_result,nvn_vk_draw_diag,nvn_vk_pipe_manifest,nvn_vk_pipe_recipe,nvn_vk_driver_cache,nvn_vk_query,nvn_vk_session,nvn_vk_lifecycle,nvn_vk_exec_owner,nvn_vk_pipeline,nvn_vk_swapchain,nvn_vk_surface,nvn_vk_texcache,nvn_vk_sampler_cache,nvn_vk_sampler,nvn_vk_format,nvn_vk_mrt,nvn_vk_bcdec}.c "${FIRST_DRAW_SOURCE:-android/native/nvn/nvn_vk_first_draw.c}"
-android/native/direct/{vk_record,vk_clear,vk_device,gs_path,vk_membuf,vk_resid,program_cache,compile_request,compile_worker,compiler_bind,s2a_direct_abi,sha256,json}.c
+android/native/direct/{vk_record,vk_clear,vk_device,gs_path,vk_membuf,vk_resid,program_cache,compile_request,compile_worker,compiler_bind,s2a_direct_abi,sha256,jv,json}.c
 graphics/nvn/gfx/nvn/nvn_tex.c graphics/nvn/gfx/nvn/nvn_dirty.c graphics/nvn/gfx/tex/nvn_deswizzle.c)
 objects=()
 for src in "${sources[@]}"; do

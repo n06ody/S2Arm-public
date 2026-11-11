@@ -121,6 +121,7 @@ function(s2a_android_direct_sources output)
         native/direct/texture_facts.c native/direct/compile_worker.c
         native/direct/bind_defer.c
         native/direct/program_cache.c native/direct/offline_library.c
+        native/direct/jv.c native/direct/libpack_vk.c
         # Pure texture helpers are needed by the core even without the game frontend.
         ../graphics/nvn/gfx/nvn/nvn_tex.c ../graphics/nvn/gfx/tex/nvn_deswizzle.c
         # C4a 首用等待语义（iOS pso_pend 对齐）：rt 历史 + 帧预算 + 判定表，纯 C 无锁。

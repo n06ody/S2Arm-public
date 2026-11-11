@@ -96,7 +96,7 @@ def main():
         # 快照），main 在这条链上没有加 wrapper 依赖；main 侧新增的 compile_export_w2.c /
         # w2_single_query.c 是 compile_export 拆分后的新生产依赖，必须保留（缺则 undefined）。
         base+=[str(NATIVE/'nvn'/p) for p in ('nvn_vk_compute_request.c','nvn_vk_program_result.c','nvn_vk_compute_texture.c')]
-        base+=[str(NATIVE/'direct'/p) for p in ('control.c','diag.c','compile_export.c','compile_export_w2.c','w2_single_query.c','input_identity.c','texture_facts.c','sha256.c','json.c')]
+        base+=[str(NATIVE/'direct'/p) for p in ('control.c','diag.c','compile_export.c','compile_export_w2.c','w2_single_query.c','input_identity.c','texture_facts.c','sha256.c','jv.c','json.c')]
         for name,(btext,ltext) in mutations.items():
             if name!='positive':assert btext!=source or ltext!=lsource,name
             (td/'bridge.c').write_text(btext);(td/'lookup.c').write_text(ltext);exe=td/name
