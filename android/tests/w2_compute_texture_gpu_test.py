@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / 'android/native'
 sys.path.insert(0, str(ROOT / 'android/core-link'))
 import link_symbols
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_link   # 链接清单按符号闭包推导、弱引用自动放行（见 host_link.py）
 
 
 def main():
@@ -39,15 +41,28 @@ def main():
         if (vulkan.parent / 'vk_video').exists():
             (inc / 'vk_video').symlink_to(vulkan.parent / 'vk_video')
         exe = tmp / 'w2_compute_texture_gpu_test'
-        cmd = [os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-o', str(exe)]
+        # 宿主编译缝（同 w2_compute_pipeline_test.c 的缝口径，但这里是分 TU 编译，只能 -include 注入）：
+        #   nvn_vk_compute.c 的 __android_log_print/CLOCK_MONOTONIC 在 Linux 宿主无声明，给声明+桩。
+        seams_h = tmp / 'host_seams.h'
+        seams_h.write_text('#define ANDROID_LOG_INFO 4\n'
+                           'int __android_log_print(int prio, const char *tag, const char *fmt, ...);\n')
+        seams_c = tmp / 'host_seams.c'
+        seams_c.write_text('#include <stdarg.h>\n#include <stdio.h>\n'
+                           'int __android_log_print(int prio, const char *tag, const char *fmt, ...) {\n'
+                           '    (void)prio; (void)tag;\n'
+                           '    va_list ap; va_start(ap, fmt);\n'
+                           '    int n = vfprintf(stderr, fmt, ap); va_end(ap); fputc(10, stderr); return n;\n}\n')
+        cmd = [os.environ.get('CC', 'cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
+               '-Wall', '-Wextra', '-Werror', '-O1', '-include', str(seams_h), '-o', str(exe)]
         cmd += ['-I' + str(p) for p in (inc, NATIVE, NATIVE / 'nvn', NATIVE / 'direct',
                                         ROOT / 'graphics/nvn/gfx/nvn', ROOT / 'graphics/nvn/gfx/nvn/include')]
         cmd += [str(Path(__file__).with_suffix('.c'))]
         cmd += [str(NATIVE / 'nvn' / p) for p in
                 ('nvn_vk_compute.c', 'nvn_vk_compute_texture.c', 'nvn_vk_program_result.c')]
         cmd += [str(NATIVE / 'direct' / p) for p in ('texture_facts.c', 'json.c')]
+        cmd += [str(seams_c)]
         cmd += ['-lvulkan', '-lm']
-        subprocess.run(cmd, check=True, timeout=120)
+        host_link.run(cmd, check=True, timeout=120)
         result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
         sys.stderr.write(result.stderr)
         sys.stdout.write(result.stdout)

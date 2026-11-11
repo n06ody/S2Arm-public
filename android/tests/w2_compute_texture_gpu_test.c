@@ -348,11 +348,15 @@ int main(void) {
     VkSampler sampler = VK_NULL_HANDLE;
     CHECK(vkCreateSampler(g_dev, &sci, NULL, &sampler) == VK_SUCCESS, "sampler create");
 
-    uint8_t guest[64];
+    // 生产按设备 minStorageBufferOffsetAlignment 拒非对齐 guest 缓冲：栈数组不保证 16B 对齐，按设备限值分配。
+    uint8_t *guest = NULL;
+    size_t guest_align = (size_t)g_props.limits.minStorageBufferOffsetAlignment;
+    if (guest_align < sizeof(void *)) guest_align = sizeof(void *);
+    CHECK(posix_memalign((void **)&guest, guest_align, 64) == 0, "guest alloc");
     char why[256] = "";
 
     // 1) 白色纹理 → SSBO 必须是 4 个 float 1.0（0x3f800000），字节级核对。
-    memset(guest, 0xa5, sizeof guest);
+    memset(guest, 0xa5, 64);
     g_guest_addr = (uint64_t)(uintptr_t)guest;
     CHECK(run_dispatch(white.view, sampler, guest, 16, why, sizeof why) == 0, why[0] ? why : "white dispatch");
     dump("white -> ssbo", guest, 16);
@@ -362,7 +366,7 @@ int main(void) {
     CHECK(g_reads == 1 && g_writes == 1, "guest read/copyback exactly once");
 
     // 2) 同一条管线换成黑色纹理 → 字节必须变成 0（证明描述符真的指向被采样的那张纹理）。
-    memset(guest, 0xa5, sizeof guest);
+    memset(guest, 0xa5, 64);
     g_reads = g_writes = 0;
     CHECK(run_dispatch(black.view, sampler, guest, 16, why, sizeof why) == 0, why[0] ? why : "black dispatch");
     dump("black -> ssbo", guest, 16);
@@ -398,6 +402,9 @@ int main(void) {
         vkFreeMemory(g_dev, im->mem, NULL);
     }
     vkDestroyCommandPool(g_dev, g_pool, NULL);
+    free(guest);
+    struct s2a_vk_device dev_rel; memset(&dev_rel, 0, sizeof dev_rel); dev_rel.device = g_dev;
+    nvn_vk_compute_pso_cache_release(&dev_rel);   // 表内可能留存对象，同 session 序先放表再毁设备
     vkDestroyDevice(g_dev, NULL);
     vkDestroyInstance(g_inst, NULL);
     if (failures) { fprintf(stderr, "FAILED: %d checks\n", failures); return 1; }

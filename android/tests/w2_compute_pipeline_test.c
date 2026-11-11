@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
+#define _POSIX_C_SOURCE 200809L   // nvn_vk_compute.c 的 clock_gettime(CLOCK_MONOTONIC)：-std=c11 下 Linux 宿主头文件不声明
 // 宿主编译缝：生产 compute.c 的 bad: 事实行直接调 __android_log_print(ANDROID_LOG_INFO,...)，
 // main 7afe4bfa1 用的是 weak extern + 数字级别，本分支没有为宿主编译留声明。这里在包含生产 TU
 // 之前补宏/原型，并在下面给 strong 捕获替身（Android 构建仍走真实 <android/log.h>）。
