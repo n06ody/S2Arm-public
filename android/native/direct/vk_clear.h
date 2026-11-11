@@ -25,6 +25,7 @@ enum {
     S2A_VK_CLEAR_NOOP = 1,        // 区域为空（scissor 与目标不相交），无需清除
     S2A_VK_CLEAR_UNSUBMITTED = -1,// 没有提交成功（含参数/对象创建失败）：命令从未执行，对象已回收
     S2A_VK_CLEAR_UNCOMPLETED = -2,// 已提交但没有完成证明：命令缓冲/fence/framebuffer/view 全部保留
+    S2A_VK_CLEAR_FQ_FAILED = -3,  // 帧队列接手命令后提交失败：队列持有，不能释放或回退
 };
 // C1：帧队列化清屏。命中的清除只录进一段命令缓冲并交给帧队列（由 nvn_vk_first_draw 提供），
 // 不 submit、不等 fence——原来每笔清除都 vkQueueSubmit + vkWaitForFences(5s)，等的其实是

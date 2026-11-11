@@ -10,6 +10,7 @@
 #include <time.h>
 #include <string.h>
 #include "nvn_vk_format.h"
+#include "nvn_vk_first_draw.h"
 #include "maskclear_spv.h"
 #include "colorclear_spv.h"
 
@@ -565,9 +566,9 @@ static void clr_q_note(int reason, const char *what) {
     fprintf(stderr, "[s2a] clear queue: %s -> 同步路径\n", what);
 }
 
-// C1：帧队列入口由 nvn_vk_first_draw 提供（弱符号）。返回 0 = 已接手，命令缓冲所有权移交；
-// 非 0 = 没接手，调用方必须自己回收那段“从未提交”的命令缓冲。
-extern int nvn_vk_first_draw_clear_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) __attribute__((weak));
+// 弱绑定：没有帧队列的构建走原同步路径。
+extern int nvn_vk_first_draw_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) __attribute__((weak));
+extern const char *nvn_vk_first_draw_first_error(void) __attribute__((weak));
 
 // 队列化清除要复用 framebuffer/view：同步路径在拿到完成证明后才销毁它们（Vulkan 禁止更早），
 // 而队列化没有“立刻完成”这个时点。这里按目标子资源缓存，活到设备切换为止；缓存满就退回同步路径，
@@ -639,7 +640,7 @@ static int clr_record_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
                              const VkClearAttachment *att, const VkRect2D *rect,
                              int do_clear, const VkClearValue *clear_values,
                              char *why, size_t why_size) {
-    if (!nvn_vk_first_draw_clear_enqueue) { clr_q_note(CLR_Q_NO_HOOK, "没有帧队列入口"); return S2A_VK_CLEAR_UNHANDLED; }
+    if (!nvn_vk_first_draw_enqueue) { clr_q_note(CLR_Q_NO_HOOK, "没有帧队列入口"); return S2A_VK_CLEAR_UNHANDLED; }
     if (!d || !d->device || !t || !t->image || !rect) { clr_q_note(CLR_Q_BAD_TARGET, "目标参数不完整"); return S2A_VK_CLEAR_UNHANDLED; }
     clr_reset_device(d);
     VkFramebuffer fb = VK_NULL_HANDLE;
@@ -685,12 +686,20 @@ static int clr_record_queued(struct s2a_vk_device *d, const s2a_clear_target *t,
         why[0] = 0;
         return S2A_VK_CLEAR_UNHANDLED;
     }
-    if (nvn_vk_first_draw_clear_enqueue(d, cmd) != 0) {
-        // 帧队列没接手：命令从未提交，可安全释放，退回同步路径。
+    int enqueued = nvn_vk_first_draw_enqueue(d, cmd);
+    if (enqueued == S2A_FQ_ENQUEUE_NOT_TAKEN) {
+        // 从未移交，可回收；上层同步回退前仍会核验队列是否失败。
         vkFreeCommandBuffers(d->device, d->command_pool, 1, &cmd);
         why[0] = 0;
         clr_q_note(CLR_Q_ENQUEUE, "帧队列没接手（已满/未就绪/已毒化）");
         return S2A_VK_CLEAR_UNHANDLED;
+    }
+    if (enqueued != S2A_FQ_ENQUEUE_ACCEPTED) {
+        // 已移交（包括无法识别的返回值），保留命令、报告失败，绝不自提。
+        const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
+        if (why && why_size) snprintf(why, why_size, "clear: frame queue failed after taking command: %s",
+                                      first && first[0] ? first : "unknown queue failure");
+        return S2A_VK_CLEAR_FQ_FAILED;
     }
     return S2A_VK_CLEAR_QUEUED;
 }

@@ -2446,24 +2446,24 @@ static int fd_pass_close(struct s2a_vk_device *d, int reason) {
     return fd_fq_poisoned() ? -1 : 0;
 }
 
-// C1：清屏走帧队列。vk_clear.c 录好一段“只含这笔清除”的命令缓冲后调这里，
-// 与 pass 一样并入队列一起提交，完成/失败后由队列统一释放；不 submit、不等 fence。
-// 返回 0 = 已接手（命令缓冲所有权归帧队列）；非 0 = 没接手，调用方自己回收。
+// 已结束录制的外部命令按位置并入帧队列；所有权转移发生在追加到 g_fq 时。
+// 批次提交可能同步失败：返回 FAILED_OWNED 表示已转移，调用方不可释放/重试。
 // 顺序要求：先把当前 open pass 收尾，清除才能排在前面那些 draw 之后。
-int nvn_vk_first_draw_clear_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) {
-    if (!d || !cmd) return -1;
-    if (!g_fq.dev || fd_fq_poisoned()) return -1;
-    if (g_op.open && fd_pass_close(g_op.dev ? g_op.dev : g_fq.dev, FD_PCR_CLEAR) != 0) return -1;
+int nvn_vk_first_draw_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) {
+    if (!d || !cmd) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (!g_fq.dev || fd_fq_poisoned()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (g_op.open && fd_pass_close(g_op.dev ? g_op.dev : g_fq.dev, FD_PCR_CLEAR) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
     // 顺序：当前批次里可能还有已录制未封口的 pass，必须先封口入队，
     // 否则这笔 clear 的命令缓冲会排到那些 draw 前面（画面重排）。
-    if (fd_batch_seal(d) != 0) return -1;
-    if (g_fq.ncmd >= fd_fq_cmd_capacity()) return -1;
+    if (fd_batch_seal(d) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (g_fq.ncmd >= fd_fq_cmd_capacity()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
     g_fq.cmds[g_fq.ncmd] = cmd;
     g_fq.pmap[g_fq.ncmd] = NULL;
     g_fq.pid[g_fq.ncmd][0] = 0;
     g_fq.ncmd++;
-    if (g_fq.ncmd - g_fq.submitted_n >= fd_batch_passes() && fd_submit_batch() != 0) return -1;
-    return 0;
+    if (g_fq.ncmd - g_fq.submitted_n >= fd_batch_passes() && fd_submit_batch() != 0)
+        return S2A_FQ_ENQUEUE_FAILED_OWNED;
+    return S2A_FQ_ENQUEUE_ACCEPTED;
 }
 
 // 返回 1 = 这个 draw 已并入现有 pass；0 = 需要新 pass。
