@@ -23,15 +23,30 @@ void s2a_fl_reset(struct s2a_frame_log *fl) {
     fl->dropped = 0;
     fl->w = 0;
     fl->kept = 0;
+    memset(fl->sites, 0, sizeof fl->sites);
+    memset(fl->sites_ready, 0, sizeof fl->sites_ready);
+    fl->site_frames = 0; fl->sites_pending = 0;
     atomic_store(&fl->fence_ns_acc, 0);
     atomic_store(&fl->fence_n_acc, 0);
 }
 
-void s2a_fl_fence(struct s2a_frame_log *fl, uint64_t wait_ns) {
+static void s2a_fl_fence_site(struct s2a_frame_log *fl, uint64_t wait_ns, unsigned site) {
     while (atomic_exchange_explicit(&fl->snapshot_lock, 1, memory_order_acquire)) {}
     atomic_fetch_add(&fl->fence_ns_acc, wait_ns);
     atomic_fetch_add(&fl->fence_n_acc, 1);
+    // 最后一格汇总溢出的站点；count=0 表示空槽，site=0 仍可记账。
+    unsigned i;
+    for (i = 0; i < S2A_FL_SITE_CAP - 1; i++)
+        if (!fl->sites[i].count || fl->sites[i].id == site) break;
+    if (i == S2A_FL_SITE_CAP - 1) site = UINT32_MAX;
+    fl->sites[i].id = site;
+    fl->sites[i].ns += wait_ns;
+    fl->sites[i].count++;
     atomic_store_explicit(&fl->snapshot_lock, 0, memory_order_release);
+}
+
+void s2a_fl_fence(struct s2a_frame_log *fl, uint64_t wait_ns) {
+    s2a_fl_fence_site(fl, wait_ns, 0);
 }
 
 uint64_t s2a_fl_note_timed(struct s2a_frame_log *fl, uint64_t boot_us, uint64_t acquire_ns, uint64_t present_ns) {
@@ -86,6 +101,12 @@ uint64_t s2a_fl_note_timed(struct s2a_frame_log *fl, uint64_t boot_us, uint64_t 
     if (fl->kept < S2A_FL_CAP) fl->kept++;
     else if (fl->dropped < UINT64_MAX) fl->dropped++;
     if (fl->seq < UINT64_MAX) fl->seq++;
+    if (++fl->site_frames == S2A_FL_SITE_WINDOW) {
+        memcpy(fl->sites_ready, fl->sites, sizeof fl->sites);
+        memset(fl->sites, 0, sizeof fl->sites);
+        fl->site_frames = 0;
+        fl->sites_pending = 1;
+    }
     uint64_t dropped = fl->dropped;
     atomic_store_explicit(&fl->snapshot_lock, 0, memory_order_release);
     return dropped;
@@ -233,6 +254,8 @@ static int s2a_fl_enabled(void) {
 // 开关缓存标志（弱符号调用点先判它再计时/记账）：0=关 1=开。
 int nvn_vk_frame_log_on(void) { return s2a_fl_enabled(); }
 
+static void s2a_fl_report_sites(struct s2a_frame_log *fl);
+
 void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) {
     if (!s2a_fl_enabled()) return;
     struct timespec ts;
@@ -242,8 +265,13 @@ void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) {
     clock_gettime(CLOCK_MONOTONIC, &ts);   // 宿主无 CLOCK_BOOTTIME（如 macOS 探针）：同一单调族
 #endif
     s2a_fl_note_timed(&g_fl, (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull, acquire_ns, present_ns);
+    s2a_fl_report_sites(&g_fl);
 }
 void nvn_vk_frame_log_present(void) { s2a_frame_log_present_timed(UINT64_MAX, UINT64_MAX); }
+
+void nvn_vk_frame_log_fence_site(uint64_t wait_ns, unsigned site) {
+    if (s2a_fl_enabled()) s2a_fl_fence_site(&g_fl, wait_ns, site);
+}
 
 void nvn_vk_frame_log_fence_wait(uint64_t wait_ns) {
     if (!s2a_fl_enabled()) return;
@@ -258,6 +286,33 @@ static void s2a_fl_platform_emit(void *ctx, const char *line) {
 #else
     fprintf(stderr, "%s\n", line);   // 宿主探针/单测：走与 shim_log 相同的宿主 stderr 通道
 #endif
+}
+
+// 与逐帧账在同一把锁下切窗；行内依总等待时间降序，余项单列，单位 µs。
+static void s2a_fl_report_sites(struct s2a_frame_log *fl) {
+    struct s2a_fl_site v[S2A_FL_SITE_CAP];
+    while (atomic_exchange_explicit(&fl->snapshot_lock, 1, memory_order_acquire)) {}
+    int pending = fl->sites_pending;
+    if (pending) { memcpy(v, fl->sites_ready, sizeof v); fl->sites_pending = 0; }
+    atomic_store_explicit(&fl->snapshot_lock, 0, memory_order_release);
+    if (!pending) return;
+    for (unsigned i = 0; i < S2A_FL_SITE_CAP; i++)
+        for (unsigned j = i + 1; j < S2A_FL_SITE_CAP; j++)
+            if (v[j].ns > v[i].ns || (v[j].ns == v[i].ns && v[j].count > v[i].count)) { struct s2a_fl_site t = v[i]; v[i] = v[j]; v[j] = t; }
+    char line[1000];
+    int used = snprintf(line, sizeof line, "fence-sites frames=%u site=count/us", S2A_FL_SITE_WINDOW);
+    uint64_t other_n = 0, other_ns = 0;
+    for (unsigned i = 0; i < S2A_FL_SITE_CAP; i++) {
+        if (!v[i].count) continue;
+        if (i >= 10) { other_n += v[i].count; other_ns += v[i].ns; continue; }
+        int n = snprintf(line + used, sizeof line - (size_t)used, " %u=%llu/%llu", v[i].id,
+                         (unsigned long long)v[i].count, (unsigned long long)(v[i].ns / 1000));
+        if (n < 0 || (size_t)n >= sizeof line - (size_t)used) break;
+        used += n;
+    }
+    snprintf(line + used, sizeof line - (size_t)used, " rest=%llu/%llu",
+             (unsigned long long)other_n, (unsigned long long)(other_ns / 1000));
+    s2a_fl_platform_emit(NULL, line);
 }
 
 void nvn_vk_frame_log_dump(void) {

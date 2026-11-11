@@ -428,7 +428,7 @@ static int clr_submit(struct s2a_vk_device *d, VkCommandBuffer cmd, VkFramebuffe
     } else {
         // t-direct-frametimes：本次 fence 等待计入逐帧帧时间记录。先判 on()——
         // 模块不在或开关关都跳过一次分支判断，不计时也不记账（量的成本不默认付）。
-        extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
+        extern void nvn_vk_frame_log_fence_site(uint64_t, unsigned) __attribute__((weak));
         extern int nvn_vk_frame_log_on(void) __attribute__((weak));
         extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
         extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
@@ -444,7 +444,7 @@ static int clr_submit(struct s2a_vk_device *d, VkCommandBuffer cmd, VkFramebuffe
         if (fl || ft) {
             clock_gettime(CLOCK_MONOTONIC, &wt);
             uint64_t wt_ns = (uint64_t)wt.tv_sec * 1000000000ull + (uint64_t)wt.tv_nsec - wt0;
-            if (fl) nvn_vk_frame_log_fence_wait(wt_ns);
+            if (fl) nvn_vk_frame_log_fence_site(wt_ns, 2);
             if (ft) nvn_vk_frame_tsv_fence_wait(wt_ns);
         }
     }

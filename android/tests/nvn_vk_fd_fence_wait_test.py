@@ -44,8 +44,8 @@ class FdFenceWaitTest(unittest.TestCase):
         src=(HERE/'nvn_vk_fd_fence_wait_test.c').read_text()
         prod=(HERE.parent/'native/nvn/nvn_vk_first_draw.c').read_text()
         mutations={
-            'drop_ledger': ('if (fl) nvn_vk_frame_log_fence_wait(wt_ns);',
-                            'if (0) nvn_vk_frame_log_fence_wait(wt_ns);'),
+            'drop_ledger': ('if (fl) nvn_vk_frame_log_fence_site(wt_ns, 10000u + line);',
+                            'if (0) nvn_vk_frame_log_fence_site(wt_ns, 10000u + line);'),
             'success_only': ('if (fl || ft) {',
                              'if ((fl || ft) && r == VK_SUCCESS) {'),
         }

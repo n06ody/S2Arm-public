@@ -1203,9 +1203,9 @@ int nvn_vk_first_draw_present_deferred(void) { return fd_present_defer(); }
 // vk_clear.c 相同的 frame_log + frame_tsv 双账（fence_n = 每帧排空次数、fence_wait_us =
 // 累计等待时长）。门开才计时记账，关着只剩一次空指针分支；等待超时也照记——CPU 被阻塞
 // 的时长是事实，不挑结果。
-static VkResult fd_fence_wait(struct s2a_vk_device *d, VkFence fence, uint64_t timeout_ns) {
+static VkResult fd_fence_wait_at(struct s2a_vk_device *d, VkFence fence, uint64_t timeout_ns, unsigned line) {
     extern int nvn_vk_frame_log_on(void) __attribute__((weak));
-    extern void nvn_vk_frame_log_fence_wait(uint64_t) __attribute__((weak));
+    extern void nvn_vk_frame_log_fence_site(uint64_t, unsigned) __attribute__((weak));
     extern int nvn_vk_frame_tsv_on(void) __attribute__((weak));
     extern void nvn_vk_frame_tsv_fence_wait(uint64_t) __attribute__((weak));
     const int fl = nvn_vk_frame_log_on && nvn_vk_frame_log_on();
@@ -1214,11 +1214,13 @@ static VkResult fd_fence_wait(struct s2a_vk_device *d, VkFence fence, uint64_t t
     VkResult r = vkWaitForFences(d->device, 1, &fence, VK_TRUE, timeout_ns);
     if (fl || ft) {
         const uint64_t wt_ns = (uint64_t)(fd_now_ns() - t0);
-        if (fl) nvn_vk_frame_log_fence_wait(wt_ns);
+        if (fl) nvn_vk_frame_log_fence_site(wt_ns, 10000u + line);
         if (ft) nvn_vk_frame_tsv_fence_wait(wt_ns);
     }
     return r;
 }
+
+#define fd_fence_wait(d, fence, timeout) fd_fence_wait_at((d), (fence), (timeout), __LINE__)
 
 // 释放快照队列持有的 Vulkan 对象（不碰 arena/pool/pin：那些归帧边界处理）。
 static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {

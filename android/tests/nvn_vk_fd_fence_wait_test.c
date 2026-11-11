@@ -17,7 +17,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice d, uint32_t n, const VkF
 }
 #ifndef NO_HOOK_STUBS
 int nvn_vk_frame_log_on(void) { return gate_log; }
-void nvn_vk_frame_log_fence_wait(uint64_t ns) { log_n++; log_ns += ns; }
+void nvn_vk_frame_log_fence_site(uint64_t ns, unsigned site) { (void)site; log_n++; log_ns += ns; }
 int nvn_vk_frame_tsv_on(void) { return gate_tsv; }
 void nvn_vk_frame_tsv_fence_wait(uint64_t ns) { tsv_n++; tsv_ns += ns; }
 #endif

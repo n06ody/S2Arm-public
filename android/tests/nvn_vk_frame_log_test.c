@@ -338,11 +338,28 @@ int main(void) {
     CHECK(fl.seq == UINT64_MAX && fl.dropped == UINT64_MAX);   // 双计数都封顶不回绕
     printf("ok\n");
 
+    printf("  case %-32s", "site_window_split_and_reset");
+    s2a_fl_reset(&fl);
+    s2a_fl_fence_site(&fl, 2000000, 11262);
+    s2a_fl_fence_site(&fl, 3000000, 11262);
+    s2a_fl_fence_site(&fl, 9000000, 1);
+    for (unsigned i = 0; i < S2A_FL_SITE_WINDOW - 1; i++) s2a_fl_note(&fl, i);
+    CHECK(!fl.sites_pending && s2a_fl_fence_n(&fl, 0) == 3 && s2a_fl_fence_us(&fl, 0) == 14000);
+    s2a_fl_note(&fl, 119);
+    CHECK(fl.sites_pending && fl.site_frames == 0);
+    CHECK(fl.sites_ready[0].id == 11262 && fl.sites_ready[0].count == 2 && fl.sites_ready[0].ns == 5000000);
+    CHECK(fl.sites_ready[1].id == 1 && fl.sites_ready[1].count == 1 && fl.sites_ready[1].ns == 9000000);
+    CHECK(fl.sites[0].count == 0 && fl.sites[1].count == 0);
+    s2a_fl_fence_site(&fl, 1000, 2);
+    CHECK(fl.sites[0].id == 2 && fl.sites[0].count == 1 && fl.sites[0].ns == 1000);
+    printf("ok\n");
+
     printf("  case %-32s", "enable_gate_default_off");
     unsetenv("debug.s2a.frame_log");
     g_fl_on = -1;   // unity：复位开关缓存再验（生产里属性一次性读入缓存）
     s2a_fl_reset(&g_fl);
     nvn_vk_frame_log_present();
+    nvn_vk_frame_log_fence_site(200000, 2);
     nvn_vk_frame_log_fence_wait(99999);   // 关态：fence 账也不动
     CHECK(g_fl.seq == 0 && g_fl.fence_n_acc == 0);
     printf("ok\n");
