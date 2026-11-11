@@ -88,6 +88,7 @@ def main():
     source = (ROOT / DIRECT / "w2_observation.inc").read_text()
     controls = [
         ("zero-observation-complete", "d->shaders > 0", "1", "test_zero_and_ordinary_packets"),
+        ("retry-misclassified", "if (retry) {", "if (0 && retry) {", "test_compute_sync_retry"),
         ("short-identity-alias", "!memcmp(w->data.entries[i].identity, identity, 32)",
          "!memcmp(w->data.entries[i].identity, identity, 8)", "test_positive_sources_and_full_identity"),
         ("memo-relabelled-memory", "++w->data.entries[i].source_counts[source]",
@@ -120,6 +121,7 @@ def main():
     for name, old, _, _ in controls:
         if source.count(old) != 1:
             raise SystemExit(name + ": mutation anchor changed; review the control")
+    build=ROOT/"build/w2-observation-core";build.mkdir(parents=True,exist_ok=True);tempfile.tempdir=str(build)
     with tempfile.TemporaryDirectory(prefix="s2a-w2-core-") as directory:
         root = Path(directory)
         (root / DIRECT).mkdir(parents=True)
@@ -192,7 +194,7 @@ int main(void) {
         subprocess.run(cc + ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
                              str(off), "-o", str(root / "engine-off")], check=True, timeout=30)
         subprocess.run([str(root / "engine-off")], check=True, timeout=5)
-        print("PASS: 44 metadata/lifetime/serialization cases, tiny exporter, 14 assertion-based negative controls, engine-off link; "
+        print("PASS: 46 metadata/lifetime/serialization cases, tiny exporter, 15 assertion-based negative controls, engine-off link; "
               "no device, GPU, request-set, strict or W2 acceptance claim")
 
 

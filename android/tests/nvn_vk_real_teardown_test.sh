@@ -61,6 +61,8 @@ if [ "$mode" != --neg ]; then
     "$out/probe" "$out/program.json" "$out/cache" >"$out/normal.log" 2>&1 || { cat "$out/normal.log" >&2; exit 1; }
     if grep -qiE 'validation error|VUID-|UNASSIGNED-|SYNC-HAZARD|ERROR.*VALIDATION' "$out/normal.log"; then cat "$out/normal.log" >&2; exit 1; fi
     cat "$out/normal.log"
+    # 同一校验层/驱动下验证实际 dispatch 帧队列路径；GPU 自检以宿主结果标识。
+    bash "$repo/android/tests/nvn_vk_dispatch_fq_vvl_test.sh"
     exit 0
 fi
 # Mutation is generated only under $out. Remove the #1472 production destroy
