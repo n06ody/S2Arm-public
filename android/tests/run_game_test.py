@@ -839,6 +839,7 @@ def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid
 
 
 LOG_HEAD = """11-09 12:00:00.100  4242  4242 I S2Arm: direct provider prepared: code=2334 gpu=MaliTest sym=251 apis=0x3
+11-09 12:00:00.200  4242  4242 I S2Arm: [s2a] graphics selection: direct (graphics.v1.json admitted), devices=1 queues=1 workers=1 consumers=2
 11-09 12:00:00.500  4242  4242 I S2Arm: Game startup accepted: 0123456789ABCDEF session t1
 """
 
@@ -1796,6 +1797,53 @@ class RunGameTest(unittest.TestCase):
         self.run_tool(argv=["--mode", "direct"], state={})
         meta = json.loads((self.tmp / "out_1" / "android.json").read_text())
         self.assertIn("--es s2arm.graphics_mode direct", meta["launch"])
+
+    def test_graphics_selection_asserts_actual_path(self):
+        """--mode 断言本局实际路径：本局 PID 的「graphics selection:」行为准。
+        符合→done+actual 记账；不符→RESULT=red；缺行（含别 PID 行顶包）→red；
+        auto→不比值只如实记。"""
+        log_sel = [ln for ln in LOG_HEAD.splitlines() if "graphics selection:" in ln]
+        self.assertEqual(1, len(log_sel), "夹具应恰含一条选择行")
+
+        # ① 符合：--mode direct + 夹具 actual=direct → 绿，manifest/android.json 记原文
+        rc, out, _ = self.run_tool(argv=["--mode", "direct"], state={})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        sel = man["graphics_selection"]
+        self.assertEqual("direct", sel["requested"])
+        self.assertEqual("direct", sel["actual"])
+        self.assertEqual(log_sel, sel["lines"])
+        meta = json.loads((out / "android.json").read_text())
+        self.assertEqual(sel, meta["graphics_selection"])
+
+        # ② 不符：--mode generic + actual=direct → 红，原因写清请求 vs 实际
+        rc, out2, _ = self.run_tool(argv=["--mode", "generic"], state={}, out_name="out_2")
+        self.assertEqual(2, rc)
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("graphics selection 与 --mode 不符", man2["reason"])
+        self.assertIn("请求 generic、本局实际 direct", man2["reason"])
+
+        # ③ 缺行：本局 PID 没有选择行（9999 的别进程行不顶包）→ 红
+        stray = ("11-09 12:00:00.200  9999  9999 I S2Arm: "
+                 "[s2a] graphics selection: direct (stale), devices=1 queues=1\n")
+        no_sel_dump = (self.tmp / "logcat_nosel_dump.txt")
+        no_sel_stream = (self.tmp / "logcat_nosel_stream.txt")
+        for src, dst in ((self.tmp / "logcat_dump.txt", no_sel_dump),
+                         (self.tmp / "logcat_stream.txt", no_sel_stream)):
+            dst.write_text(src.read_text().replace(log_sel[0] + "\n", stray))
+        rc, out3, _ = self.run_tool(state={"logcat_dump": str(no_sel_dump),
+                                           "logcat_stream": str(no_sel_stream)},
+                                    out_name="out_3")
+        self.assertEqual(2, rc)
+        man3 = json.loads((out3 / "run-manifest.json").read_text())
+        self.assertIn("没有「graphics selection:」行", man3["reason"])
+
+        # ④ auto：不比值、如实记实际
+        rc, out4, _ = self.run_tool(state={}, out_name="out_4")
+        self.assertEqual(0, rc)
+        man4 = json.loads((out4 / "run-manifest.json").read_text())
+        self.assertEqual({"requested": "auto", "actual": "direct", "lines": log_sel},
+                         man4["graphics_selection"])
 
     def _qc_energy(self, tsv):
         """最小局目录只给 power.tsv / android.json，单独验能耗判据。"""

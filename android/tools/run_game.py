@@ -6,7 +6,10 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 
     run_game.py --apk game.apk --package org.s2arm.game.t<TITLE> --serial S --out DIR --seconds 60
                 [--resources DIR | --pack DIR]     # 资源：走 deploy_game.deploy_resources（不启动）
-                [--mode auto|generic|direct]      # s2arm.graphics_mode 冷启动 intent extra
+                [--mode auto|generic|direct]      # s2arm.graphics_mode 冷启动 intent extra；
+                                                  # 起局后按本局 PID 的「graphics selection:」行
+                                                  # 断言实际路径——缺行/解析不出/与 --mode 不符都
+                                                  # RESULT=red，auto 只把实际值记进 manifest
                 [--extra s2arm.KEY[=VALUE] ...]   # 其他 intent extra（true/false 走 --ez）
                 [--adb "adb"] [--ready-timeout 180] [--wait 0] [--allow-data-loss]
                 [--backup-dir DIR] [--lock-root DIR] [--holder NAME] [--note TXT]
@@ -990,6 +993,25 @@ def frame_log_blocks(text, pids=None):
         yield "\n".join(seg)
 
 
+GFX_SEL = "graphics selection:"
+# runtime.c 起局唯一一次选择后打「graphics selection: direct|generic (原因), devices=…」——
+# fprintf(stderr) 经 StdErrAdapter 泵进 logcat（tag S2Arm、PID=当局进程）；v1 会话不打此行。
+GFX_SEL_MODE = re.compile(r"graphics selection: (direct|generic)\s*\(")
+
+
+def graphics_selection_lines(text, pids):
+    """本局 PID 行里的 graphics selection 行原文（logcat 行前缀 PID 绑当局）。"""
+    lines = []
+    for ln in text.splitlines():
+        if GFX_SEL not in ln:
+            continue
+        m = THREADTIME_PID.match(ln)
+        if not m or int(m.group(1)) not in pids:
+            continue
+        lines.append(ln)
+    return lines
+
+
 def _clock_norm(name):
     """帧块 clock 标签规范名：设备写 CLOCK_BOOTTIME，旧替身写 boottime——
     剥 CLOCK_ 前缀、大小写无关后判同一时钟域；别的值照旧拒（对不上窗口时钟）。"""
@@ -1871,6 +1893,21 @@ def main(argv=None):
                               capture_output=True, timeout=120).stdout.decode(errors="replace")
         (out / "logcat_d.txt").write_text(dump)
 
+        # 本局实际走的图形路径：只认本局 PID 的「graphics selection:」行——
+        # --mode 传的只是 intent，intent 下去后哪条路真跑了要拿运行器自己的行对。
+        # stream 与 dump 是同一事件的两份副本：按行文本去重后并集。
+        sel_lines, sel_seen = [], set()
+        for ln in graphics_selection_lines(logcat, pids) + graphics_selection_lines(dump, pids):
+            if ln not in sel_seen:
+                sel_seen.add(ln)
+                sel_lines.append(ln)
+        sel_modes = {sm.group(1) for ln in sel_lines
+                     for sm in [GFX_SEL_MODE.search(ln)] if sm}
+        manifest["graphics_selection"] = {
+            "requested": args.mode,
+            "actual": sel_modes.pop() if len(sel_modes) == 1 else None,
+            "lines": sel_lines}
+
         direct = "direct provider prepared" in (logcat + dump)
         caps, seen = [], set()
 
@@ -1927,12 +1964,25 @@ def main(argv=None):
             "launch": launch_str, "seconds": args.seconds, "mark": 0,
             "mark_note": "安卓没有自动巡线 MARK；整窗计开局",
             "started_utc": t0.isoformat(), "ended_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "apk_sha256": our_sha, "graphics_mode": args.mode, "extras": args.extra,
+            "apk_sha256": our_sha, "graphics_mode": args.mode,
+            "graphics_selection": manifest["graphics_selection"], "extras": args.extra,
             "frame_log": manifest["frame_log"], "session": manifest["session"],
             "frame_window_us": manifest["frame_window_us"], "ready": ready,
             "power_sampler": manifest.get("power_sampler"),
             "restore_scope": manifest["restore_scope"],
         }, ensure_ascii=False, indent=1) + "\n")
+        # 断言本局实际图形路径（迟到处：产物都落盘后再判，红局也留完整证据）：
+        # 缺行（v1 会话不打选择行 / stderr 没进 logcat）、解析不出唯一模式、
+        # 与 --mode 不符——都是 RESULT=red；auto 只记账不比值。
+        sel = manifest["graphics_selection"]
+        if not sel["lines"]:
+            raise Refuse("本局 PID 的 logcat 没有「graphics selection:」行：实际走的图形路径未证")
+        if sel["actual"] is None:
+            raise Refuse("「graphics selection:」行解析不出唯一模式："
+                         f"{sel['lines'][0].strip()[:160]}")
+        if args.mode != "auto" and sel["actual"] != args.mode:
+            raise Refuse(f"graphics selection 与 --mode 不符：请求 {args.mode}、"
+                         f"本局实际 {sel['actual']}（{sel['lines'][0].strip()[:160]}）")
         if not manifest["stop_verified"]:
             raise Refuse("收局后游戏进程仍存活（收局确认未过）")
         result, reason = "done", ""
