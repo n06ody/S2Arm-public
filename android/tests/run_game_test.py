@@ -516,6 +516,25 @@ if cmd == "shell":
         ticks = int(st["uptime_us"] / 1e6 * 100) - st.get("birth_lag_ticks", 200)
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
+        if len(sh) == 1:
+            import fcntl
+            lock_file = st.get("probe_lock_file")
+            if lock_file:
+                with open(lock_file, "r") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        st["getprop_lock_held"] = False
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    except BlockingIOError:
+                        st["getprop_lock_held"] = True
+            st["getprop_before_install"] = not st["installed"] and not st.get("props_set_once")
+            save()
+            if st.get("getprop_all_fail"):
+                fail("getprop: permission denied")
+            if st.get("getprop_all_stderr"):
+                sys.stderr.write("getprop: partial listing\\n")
+            out(st.get("getprop_all_raw", "".join(
+                f"[{k}]: [{v}]\\n" for k, v in sorted(st["props"].items())))); sys.exit(0)
         key = " ".join(sh[1:])
         # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
         # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
@@ -2138,6 +2157,85 @@ class RunGameTest(unittest.TestCase):
         meta.update(meta_extra or {})
         (cp / "meta.json").write_text(json.dumps(meta))
         return cp
+
+    def test_debug_prop_preflight_rejects_residue(self):
+        props = {"ro.product.model": "PixelTest", "debug.s2a.query_wait": "1",
+                 "debug.s2a.mem_shared": "1", "debug.s2a.fixmask": "31",
+                 "debug.s2a.empty": ""}
+        rc, out, _ = self.run_tool(state={"props": props})
+        man = json.loads((out / "run-manifest.json").read_text())
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual({k: v for k, v in props.items() if k.startswith("debug.s2a.")},
+                         man["debug_props_snapshot"])
+        for key in ("debug.s2a.query_wait", "debug.s2a.mem_shared", "debug.s2a.fixmask"):
+            self.assertIn(key, man["reason"])
+            self.assertIn(repr(props[key]), man["reason"])
+        self.assertTrue(st["getprop_before_install"])
+        self.assertNotIn("launch_cmd", st)
+        self.assertFalse(st["installed"])
+
+    def test_debug_prop_preflight_clean_is_locked(self):
+        props = {"ro.product.model": "PixelTest", "debug.s2a.debug_env": "1",
+                 "debug.s2a.frame_log": "1", "debug.s2a.session_uuid": "old",
+                 "debug.s2a.empty": ""}
+        lock_file = str(self.lock_root / SERIAL / "device.lock")
+        rc, out, _ = self.run_tool(state={"props": props, "probe_lock_file": lock_file})
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual({k: v for k, v in props.items() if k.startswith("debug.s2a.")},
+                         man["debug_props_snapshot"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st["getprop_lock_held"])
+        self.assertTrue(st["getprop_before_install"])
+
+    def test_debug_prop_preflight_ab_override(self):
+        props = {"debug.s2a.query_wait": "1"}
+        rc, out, _ = self.run_tool(state={"props": props},
+                                   argv=["--ab-prop", "debug.s2a.query_wait=0"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(props, man["debug_props_snapshot"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual("0", st["props_at_launch"]["debug.s2a.query_wait"])
+        self.assertEqual("1", st["props"]["debug.s2a.query_wait"])
+
+    def test_debug_prop_preflight_explicit_allow(self):
+        rc, out, _ = self.run_tool(state={"props": {"debug.s2a.mem_shared": "1", "debug.s2a.Trace-mode.sub": "yes"}},
+                                   argv=["--allow-prop", "debug.s2a.mem_shared",
+                                         "--allow-prop", "debug.s2a.Trace-mode.sub"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual({"debug.s2a.mem_shared": "1", "debug.s2a.Trace-mode.sub": "yes"},
+                         man["debug_props_snapshot"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual("1", st["props_at_launch"]["debug.s2a.mem_shared"])
+
+    def test_debug_prop_preflight_getprop_failure(self):
+        for kind, fault in (("rc", {"getprop_all_fail": True}),
+                            ("stderr", {"getprop_all_stderr": True}),
+                            ("malformed", {"getprop_all_raw": "[ro.x]: [ok]\n[debug.s2a.bad]: [1\n"}),
+                            ("duplicate", {"getprop_all_raw": "[ro.x]: [a]\n[ro.x]: [b]\n"}),
+                            ("truncated", {"getprop_all_raw": "[ro.x]: [ok]"}),
+                            ("empty", {"getprop_all_raw": ""})):
+            with self.subTest(kind=kind):
+                rc, out, _ = self.run_tool(state=fault, out_name="out_prop_" + kind)
+                man = json.loads((out / "run-manifest.json").read_text())
+                st = json.loads((self.tmp / "state.json").read_text())
+                self.assertEqual(2, rc, man)
+                self.assertIn("getprop", man["reason"])
+                self.assertNotIn("launch_cmd", st)
+                self.assertFalse(st["installed"])
+
+    def test_debug_prop_preflight_allow_requires_exact_key(self):
+        rc, out, _ = self.run_tool(state={"props": {"debug.s2a.query_wait": "1"}},
+                                   argv=["--allow-prop", "debug.s2a.*"])
+        self.assertEqual(2, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("--allow-prop", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+        self.assertFalse(st["installed"])
 
     def test_ab_prop_set_before_launch_and_restored(self):
         """--ab-prop：起局前锁内置位（am start 那一刻已是新值），manifest 记值与原值，

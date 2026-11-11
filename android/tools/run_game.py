@@ -1395,6 +1395,31 @@ def shot(adb_argv, dest):
     dest.write_bytes(data)
 
 
+def read_debug_props(device):
+    """按 Android getprop 无参输出读取全量快照；不完整或无法判读就拒跑。"""
+    r = subprocess.run([*device.argv, "shell", "getprop"], capture_output=True, timeout=60)
+    if r.returncode or r.stderr:
+        detail = (r.stderr or r.stdout).decode("utf-8", errors="replace")[:300]
+        raise Refuse(f"getprop 全量读取失败（rc={r.returncode}）：{detail}")
+    try:
+        data = r.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Refuse(f"getprop 全量输出不是 UTF-8：{error}") from error
+    if not data or not data.endswith("\n"):
+        raise Refuse("getprop 全量输出为空或不完整")
+    props = {}
+    seen = set()
+    for line in data.splitlines():
+        match = re.fullmatch(r"\[([^]\r\n]+)\]: \[(.*)\]", line)
+        if not match or match.group(1) in seen:
+            raise Refuse(f"getprop 全量输出格式错误或键重复：{line!r}")
+        key, value = match.groups()
+        seen.add(key)
+        if key.startswith("debug.s2a."):
+            props[key] = value
+    return props
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--apk", required=True, type=Path)
@@ -1411,6 +1436,8 @@ def main(argv=None):
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
     p.add_argument("--ab-prop", action="append", default=[], metavar="debug.s2a.KEY=VALUE",
                    help="A/B 局用：起局前在锁内置位一个 debug.s2a.* 属性（记原值、读回核对、收局与运行器自管属性同一条恢复链），可多次")
+    p.add_argument("--allow-prop", action="append", default=[], metavar="debug.s2a.KEY",
+                   help="显式允许一个已有的非空 debug.s2a.* 属性（不修改其值），可多次")
     p.add_argument("--allow-data-loss", action="store_true",
                    help="设备已装该包也照跑：只还原 APK 字节，私有数据与已并入资源不还原（显式接受数据丢失）")
     p.add_argument("--backup-dir",
@@ -1512,6 +1539,30 @@ def main(argv=None):
         (out / "shots_ap").mkdir()
         if d.run("get-state").strip() != "device":
             raise Refuse(f"adb 设备 {args.serial} 不在线")
+
+        # 全量读取必须发生在设备锁内、安装或任何属性写入前；只把本项目命名空间记入 manifest。
+        ab_values = []
+        ab_keys = set()
+        for spec in args.ab_prop:
+            key, sep, val = spec.partition("=")
+            if not sep or not re.fullmatch(r"debug\.s2a\.[a-z0-9_]+", key) or not re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", val):
+                raise Refuse(f"--ab-prop 格式不对（只收 debug.s2a.<名>=<值>）：{spec}")
+            if key in ab_keys or key == SESSION_PROP or key in DEBUG_PROPS:
+                raise Refuse(f"--ab-prop 与运行器自管属性或其他 --ab-prop 重名：{key}")
+            ab_keys.add(key)
+            ab_values.append((key, val))
+        for key in args.allow_prop:
+            if not re.fullmatch(r"debug\.s2a\.[A-Za-z0-9_.-]+", key):
+                raise Refuse(f"--allow-prop 只收完整 debug.s2a.<名>：{key}")
+        manifest["debug_props_allow"] = sorted(set(args.allow_prop))
+        manifest["debug_props_ab_keys"] = sorted(ab_keys)
+        manifest["debug_props_snapshot"] = read_debug_props(d)
+        allowed = set(DEBUG_PROPS) | {SESSION_PROP} | ab_keys | set(args.allow_prop)
+        residual = {k: v for k, v in manifest["debug_props_snapshot"].items()
+                    if v and k not in allowed}
+        if residual:
+            raise Refuse("发现未许可的 debug.s2a.* 残留属性：" +
+                         ", ".join(f"{k}={v!r}" for k, v in sorted(residual.items())))
 
         pkg = args.package
         if not pkg:
@@ -1636,12 +1687,7 @@ def main(argv=None):
         for key in DEBUG_PROPS:
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
             d.shell(f"setprop {key} 1", allowed=(0, 1))
-        for spec in args.ab_prop:
-            key, sep, val = spec.partition("=")
-            if not sep or not re.fullmatch(r"debug\.s2a\.[a-z0-9_]+", key) or not re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", val):
-                raise Refuse(f"--ab-prop 格式不对（只收 debug.s2a.<名>=<值>）：{spec}")
-            if key in props_prev or key == SESSION_PROP or key in DEBUG_PROPS:
-                raise Refuse(f"--ab-prop 与运行器自管属性重名：{key}")
+        for key, val in ab_values:
             # 原值 / 置位 / 读回都要 rc=0：读不到原值就无法证明能恢复，直接拒跑
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0,)).strip()
             ab_strict.add(key)     # 先登记、再 setprop：setprop 生效后读回失败，恢复也按严格口径
