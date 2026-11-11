@@ -188,6 +188,8 @@ int nvn_vk_texcache_release_retained(struct s2a_vk_device *d, uint64_t timeout_n
 // 诊断/测试注入：1 = 真实提交后按“完成未知”处理；2 = 假装提交失败；0 = 正常语义。
 void nvn_vk_texcache_set_upload_fault(int mode);
 // 帧内引用计数：命令缓冲/描述符仍引用该图像时禁止淘汰/销毁；flush 完成后再 unpin。
+// 只查已有活纹理；调用者持有会话锁，失效或未命中返回 NULL。
+struct nvn_vk_tex *nvn_vk_texcache_find_serial(struct nvn_vk_texcache *c, uint64_t serial);
 void nvn_vk_texcache_pin(struct nvn_vk_tex *t);
 void nvn_vk_texcache_unpin(struct nvn_vk_tex *t);
 void nvn_vk_texcache_destroy(struct nvn_vk_texcache *c);
