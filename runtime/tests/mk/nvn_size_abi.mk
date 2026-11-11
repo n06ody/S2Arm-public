@@ -20,7 +20,7 @@ $(NVN_SIZE_ASSETS)/manifest.json: $(NVN_SIZE_TOOL)
 	dotnet $(NVN_SIZE_TOOL) $(NVN_SIZE_ASSETS)
 $(NVN_SIZE_BINARY): graphics/nvn/tests/t_nvn_size_abi.m $(NVN_MTL_DEPS) \
     $(wildcard graphics/nvn/gfx/nvn/*.h graphics/nvn/gfx/nvn/*.inc graphics/nvn/gfx/tex/*.h graphics/nvn/host/*.h graphics/nvn/host/*.inc) \
-    graphics/nvn/texture_extent.inc graphics/nvn/widen_glue.inc graphics/nvn/widen_fallback.inc graphics/nvn/lib_pack.inc \
+    graphics/nvn/texture_extent.inc graphics/nvn/widen_glue.inc graphics/nvn/widen_fallback.inc graphics/nvn/lib_pack.inc graphics/nvn/lib_pack_core.inc \
     graphics/metal/gal_samp_caps.h graphics/metal/fit_judge.h \
     $(NVN_TEST_HOST_OBJS) $(NVN_TEST_LIB) $(NVN_TEST_WIDEN) $(NVN_SIZE_ASSETS)/manifest.json
 	@mkdir -p $(dir $@)

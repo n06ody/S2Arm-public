@@ -81,7 +81,7 @@ def main():
         base+=['-I'+str(p) for p in (td,inc,NATIVE,NATIVE/'direct',NATIVE/'nvn',ROOT/'graphics/nvn/gfx/nvn',ROOT/'graphics/nvn/gfx/nvn/include')]
         base+=[str(Path(__file__).with_suffix('.c')),str(td/'record.c'),str(td/'source-store.c'),str(NATIVE/'direct/compile_worker.c'),str(NATIVE/'nvn/nvn_vk_compute_bridge.c')]
         base+=[str(NATIVE/'nvn'/p) for p in ('nvn_vk_compute_request.c','nvn_vk_compute_lookup.c','nvn_vk_program_result.c','nvn_vk_compile_facts.c','nvn_vk_compute_texture.c')]
-        base+=[str(NATIVE/'direct'/p) for p in ('bind_defer.c','control.c','diag.c','compile_export.c','input_identity.c','texture_facts.c','sha256.c','json.c','t2t_plan.c','vk_clear.c','vk_device.c','gs_path.c')]
+        base+=[str(NATIVE/'direct'/p) for p in ('bind_defer.c','control.c','diag.c','compile_export.c','input_identity.c','texture_facts.c','sha256.c','jv.c','json.c','t2t_plan.c','vk_clear.c','vk_device.c','gs_path.c')]
         base += [str(NATIVE/'nvn'/p) for p in ('nvn_vk_format.c','nvn_vk_query.c','nvn_vk_mrt.c')]
         for name,text in variants.items():
             if name!='positive':assert text!=source,name

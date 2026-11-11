@@ -18,8 +18,8 @@ def check(cond, msg):
 def pack(src, out, chain): return subprocess.run([*CMD, '--libpack', 'pack', src, out, chain], capture_output=True, text=True)
 
 K1, K2, CHAIN = '0000000000000abc', 'fedcba9876543210', '0a7dae3c1e7b'
-_inc = open(os.path.join(HERE, '../../../nvn/lib_pack.inc'), encoding='utf-8').read()
-check('LP_K_SE = 51' in _inc, '宿主 graphics/nvn/lib_pack.inc 的 LP_K_SE = 51（下面打包用同号）')
+_inc = open(os.path.join(HERE, '../../../nvn/lib_pack_core.inc'), encoding='utf-8').read()
+check('LP_K_SE = 51' in _inc, '宿主 graphics/nvn/lib_pack_core.inc 的 LP_K_SE = 51（下面打包用同号）')
 MSL = '#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0() { return float4(%s); }\n'
 
 def build(t):

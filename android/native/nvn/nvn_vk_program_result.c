@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
 #include "nvn_vk_program_result.h"
+#include "../direct/jv.h"   // #1434 共用跨度 JSON（原内嵌实现）
 #include "../direct/spirv_storage.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,140 +42,6 @@ static int b64_decode(const char *text, size_t length, uint8_t **out, size_t *ou
 // ---- 结果 JSON 的跨度扫描器 ----
 // 结果里的 SPIR-V base64 单条就有 7–15 KB；通用 s2a_json 解析器把每个字符串解码进 256 B，
 // 会拒绝这种合法结果。这里只做跨度扫描（字符串不复制），长字符串按原样交给 base64 解码。
-struct jv { const char *p; size_t n; };
-
-static const char *jv_ws(const char *p, const char *end) {
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
-    return p;
-}
-
-static int jv_scan(const char *p, const char *end, const char **out_end) {
-    p = jv_ws(p, end);
-    if (p >= end) return -1;
-    if (*p == '"') {
-        p++;
-        while (p < end) {
-            if (*p == '\\') { p += 2; continue; }
-            if (*p == '"') { *out_end = p + 1; return 0; }
-            p++;
-        }
-        return -1;
-    }
-    if (*p == '{' || *p == '[') {
-        char open = *p, close = open == '{' ? '}' : ']';
-        int depth = 0;
-        while (p < end) {
-            if (*p == '"') {
-                p++;
-                while (p < end && *p != '"') { if (*p == '\\') p++; p++; }
-                if (p < end) p++;
-                continue;
-            }
-            if (*p == open) depth++;
-            else if (*p == close) { depth--; if (!depth) { *out_end = p + 1; return 0; } }
-            p++;
-        }
-        return -1;
-    }
-    while (p < end && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
-    *out_end = p;
-    return 0;
-}
-
-static int jv_is_object(struct jv v) { return v.n >= 2 && v.p[0] == '{' && v.p[v.n - 1] == '}'; }
-static int jv_is_array(struct jv v) { return v.n >= 2 && v.p[0] == '[' && v.p[v.n - 1] == ']'; }
-static int jv_is_null(struct jv v) { return v.n == 4 && !memcmp(v.p, "null", 4); }
-static int jv_is_string(struct jv v) { return v.n >= 2 && v.p[0] == '"'; }
-
-static int jv_str(struct jv v, char *out, size_t cap) {
-    if (!jv_is_string(v) || cap == 0) return -1;
-    size_t n = 0;
-    for (size_t i = 1; i + 1 < v.n; i++) {
-        char c = v.p[i];
-        if (c == '\\' && i + 2 < v.n) {
-            char e = v.p[++i];
-            c = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
-        }
-        if (n + 1 >= cap) return -1;
-        out[n++] = c;
-    }
-    out[n] = 0;
-    return 0;
-}
-
-static int jv_u32(struct jv v, uint32_t *out) {
-    char buf[24];
-    if (v.n == 0 || v.n >= sizeof buf) return -1;
-    memcpy(buf, v.p, v.n); buf[v.n] = 0;
-    char *end = NULL;
-    unsigned long value = strtoul(buf, &end, 10);
-    if (!end || *end || end == buf) return -1;
-    *out = (uint32_t)value;
-    return 0;
-}
-
-static int jv_bool(struct jv v, int *out) {
-    if (v.n == 4 && !memcmp(v.p, "true", 4)) { *out = 1; return 0; }
-    if (v.n == 5 && !memcmp(v.p, "false", 5)) { *out = 0; return 0; }
-    return -1;
-}
-
-static int obj_find(struct jv obj, const char *key, struct jv *out) {
-    if (!jv_is_object(obj)) return -1;
-    const char *p = obj.p + 1, *end = obj.p + obj.n - 1;
-    while (p < end) {
-        p = jv_ws(p, end);
-        if (p >= end || *p == '}') break;
-        struct jv k;
-        const char *kend = NULL;
-        if (*p != '"' || jv_scan(p, end, &kend)) return -1;
-        k.p = p; k.n = (size_t)(kend - p);
-        char name[64];
-        if (jv_str(k, name, sizeof name)) return -1;
-        p = jv_ws(kend, end);
-        if (p >= end || *p != ':') return -1;
-        const char *vstart = NULL, *vend = NULL;
-        if (jv_scan(p + 1, end, &vend)) return -1;
-        vstart = jv_ws(p + 1, end);
-        if (!strcmp(name, key)) { out->p = vstart; out->n = (size_t)(vend - vstart); return 0; }
-        p = jv_ws(vend, end);
-        if (p < end && *p == ',') p++;
-    }
-    return -1;
-}
-
-static int arr_count(struct jv arr) {
-    if (!jv_is_array(arr)) return -1;
-    const char *p = arr.p + 1, *end = arr.p + arr.n - 1;
-    int n = 0;
-    while (p < end) {
-        p = jv_ws(p, end);
-        if (p >= end || *p == ']') break;
-        const char *vend = NULL;
-        if (jv_scan(p, end, &vend)) return -1;
-        n++;
-        p = jv_ws(vend, end);
-        if (p < end && *p == ',') p++;
-    }
-    return n;
-}
-
-static int arr_item(struct jv arr, int index, struct jv *out) {
-    if (!jv_is_array(arr) || index < 0) return -1;
-    const char *p = arr.p + 1, *end = arr.p + arr.n - 1;
-    int n = 0;
-    while (p < end) {
-        p = jv_ws(p, end);
-        if (p >= end || *p == ']') break;
-        const char *vend = NULL;
-        if (jv_scan(p, end, &vend)) return -1;
-        if (n++ == index) { out->p = p; out->n = (size_t)(vend - p); return 0; }
-        p = jv_ws(vend, end);
-        if (p < end && *p == ',') p++;
-    }
-    return -1;
-}
-
 int nvn_vk_program_graphics_stage_index(const char *name) {
     if (!name) return -1;
     if (!strcmp(name, "vs")) return 0;
@@ -187,32 +54,32 @@ int nvn_vk_program_graphics_stage_index(const char *name) {
 }
 
 int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size) {
-    struct jv top = { (const char *)bytes, length };
-    if (!jv_is_object(top)) return fail(why, why_size, "program result is not a JSON object");
-    struct jv schema;
-    if (obj_find(top, "schema", &schema)) return fail(why, why_size, "result has no schema");
+    struct s2a_jv top = { (const char *)bytes, length };
+    if (!s2a_jv_is_object(top)) return fail(why, why_size, "program result is not a JSON object");
+    struct s2a_jv schema;
+    if (s2a_jv_obj_find(top, "schema", &schema)) return fail(why, why_size, "result has no schema");
     char schema_text[32];
-    if (jv_str(schema, schema_text, sizeof schema_text) || strcmp(schema_text, "s2a-direct-program-v1"))
+    if (s2a_jv_str(schema, schema_text, sizeof schema_text) || strcmp(schema_text, "s2a-direct-program-v1"))
         return fail(why, why_size, "not a s2a-direct-program-v1 result");
-    struct jv content;
-    if (obj_find(top, "content", &content) || !jv_is_object(content))
+    struct s2a_jv content;
+    if (s2a_jv_obj_find(top, "content", &content) || !s2a_jv_is_object(content))
         return fail(why, why_size, "result has no content object");
 
-    struct jv stages;
-    if (obj_find(content, "stages", &stages) || !jv_is_array(stages))
+    struct s2a_jv stages;
+    if (s2a_jv_obj_find(content, "stages", &stages) || !s2a_jv_is_array(stages))
         return fail(why, why_size, "result has no stages array");
-    int count = arr_count(stages);
+    int count = s2a_jv_arr_count(stages);
     if (count <= 0 || count > FD_MAX_STAGES) return fail(why, why_size, "result stage count outside 1..2");
     for (int i = 0; i < count; i++) {
-        struct jv st;
-        if (arr_item(stages, i, &st)) return fail(why, why_size, "stage element span failed");
-        struct jv name, spirv;
+        struct s2a_jv st;
+        if (s2a_jv_arr_item(stages, i, &st)) return fail(why, why_size, "stage element span failed");
+        struct s2a_jv name, spirv;
         char name_text[8];
-        if (obj_find(st, "stage", &name) || jv_str(name, name_text, sizeof name_text))
+        if (s2a_jv_obj_find(st, "stage", &name) || s2a_jv_str(name, name_text, sizeof name_text))
             return fail(why, why_size, "stage has no name");
         int idx = nvn_vk_program_graphics_stage_index(name_text);
         if (idx < 0) return fail(why, why_size, "stage name is not a supported NVN stage");
-        if (obj_find(st, "spirv", &spirv) || !jv_is_string(spirv))
+        if (s2a_jv_obj_find(st, "spirv", &spirv) || !s2a_jv_is_string(spirv))
             return fail(why, why_size, "stage has no spirv");
         uint8_t *words = NULL; size_t word_bytes = 0;
         if (b64_decode(spirv.p + 1, spirv.n - 2, &words, &word_bytes))
@@ -224,33 +91,33 @@ int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd
         out->stage[idx].present = 1;
         out->stage[idx].spirv = words;
         out->stage[idx].spirv_bytes = word_bytes;
-        struct jv mask;
+        struct s2a_jv mask;
         uint32_t mask_value = 0;
-        if (!obj_find(st, "attributeReadMask", &mask) && !jv_u32(mask, &mask_value))
+        if (!s2a_jv_obj_find(st, "attributeReadMask", &mask) && !s2a_jv_u32(mask, &mask_value))
             out->stage[idx].attr_mask = mask_value;
     }
 
-    struct jv bindings;
-    if (!obj_find(content, "bindings", &bindings) && jv_is_array(bindings)) {
-        int n = arr_count(bindings);
+    struct s2a_jv bindings;
+    if (!s2a_jv_obj_find(content, "bindings", &bindings) && s2a_jv_is_array(bindings)) {
+        int n = s2a_jv_arr_count(bindings);
         for (int i = 0; i < n; i++) {
-            struct jv b;
-            if (arr_item(bindings, i, &b)) return fail(why, why_size, "binding element span failed");
-            // 所有跨度先初始化：查找失败时绝不读未初始化的 p/n（旧代码对 "slot" 忽略了 obj_find
+            struct s2a_jv b;
+            if (s2a_jv_arr_item(bindings, i, &b)) return fail(why, why_size, "binding element span failed");
+            // 所有跨度先初始化：查找失败时绝不读未初始化的 p/n（旧代码对 "slot" 忽略了 s2a_jv_obj_find
             // 的结果，没 slot 的 support binding 会拿栈垃圾当跨度，是可疑的 SIGSEGV 来源）。
-            struct jv kind = { NULL, 0 }, stage = { NULL, 0 }, set = { NULL, 0 }, binding = { NULL, 0 },
+            struct s2a_jv kind = { NULL, 0 }, stage = { NULL, 0 }, set = { NULL, 0 }, binding = { NULL, 0 },
                       slot = { NULL, 0 };
             char kind_text[16], stage_text[8];
-            if (obj_find(b, "kind", &kind) || jv_str(kind, kind_text, sizeof kind_text)) continue;
+            if (s2a_jv_obj_find(b, "kind", &kind) || s2a_jv_str(kind, kind_text, sizeof kind_text)) continue;
             uint32_t set_v = 0, binding_v = 0, slot_v = 0;
-            if (obj_find(b, "set", &set) || jv_u32(set, &set_v)) return fail(why, why_size, "binding without set");
-            if (obj_find(b, "binding", &binding) || jv_u32(binding, &binding_v))
+            if (s2a_jv_obj_find(b, "set", &set) || s2a_jv_u32(set, &set_v)) return fail(why, why_size, "binding without set");
+            if (s2a_jv_obj_find(b, "binding", &binding) || s2a_jv_u32(binding, &binding_v))
                 return fail(why, why_size, "binding without binding");
             // slot 可以合法省略（support/storage 等没有 guest 槽位）；省略是“没有”，不是槽 0。
             // 写了但不是无符号整数则明确拒绝，不静默当省略。
             int has_slot = 0;
-            if (!obj_find(b, "slot", &slot)) {
-                if (jv_u32(slot, &slot_v)) return fail(why, why_size, "binding slot is not an unsigned integer");
+            if (!s2a_jv_obj_find(b, "slot", &slot)) {
+                if (s2a_jv_u32(slot, &slot_v)) return fail(why, why_size, "binding slot is not an unsigned integer");
                 has_slot = 1;
             }
             if (out->binding_count >= FD_MAX_BINDINGS) {
@@ -278,7 +145,7 @@ int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd
             else if (!strcmp(kind_text, "texture")) dst->kind = 2;
             else if (!strcmp(kind_text, "image")) dst->kind = 3;
             else continue;
-            if (!obj_find(b, "stage", &stage) && !jv_str(stage, stage_text, sizeof stage_text))
+            if (!s2a_jv_obj_find(b, "stage", &stage) && !s2a_jv_str(stage, stage_text, sizeof stage_text))
                 snprintf(dst->stage, sizeof dst->stage, "%s", stage_text);
             // 一次算好逐笔要用的派生值（原来每笔都要重做 strcmp 和槽位换算）。
             dst->stage_idx = (int8_t)nvn_vk_program_graphics_stage_index(dst->stage);
@@ -295,36 +162,36 @@ int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd
                 // Storage buffer address provenance. These fields are optional for
                 // older results; a missing mapping stays explicit and the runtime
                 // reports the unsupported combination instead of guessing a slot.
-                struct jv f = { NULL, 0 };
+                struct s2a_jv f = { NULL, 0 };
                 uint32_t cb_slot = 0, cb_off = 0, nvn = 0, ubo_ptr = 0, ubo_slot = 0, ubo_off = 0;
                 int has_cb_slot = 0, has_cb_off = 0, has_nvn = 0, has_ubo_ptr = 0;
                 int has_ubo_slot = 0, has_ubo_off = 0, rw = 0, has_rw = 0;
-                if (!obj_find(b, "cbSlot", &f)) {
-                    if (jv_u32(f, &cb_slot)) return fail(why, why_size, "storage cbSlot is not an unsigned integer");
+                if (!s2a_jv_obj_find(b, "cbSlot", &f)) {
+                    if (s2a_jv_u32(f, &cb_slot)) return fail(why, why_size, "storage cbSlot is not an unsigned integer");
                     has_cb_slot = 1;
                 }
-                if (!obj_find(b, "cbOffset", &f)) {
-                    if (jv_u32(f, &cb_off)) return fail(why, why_size, "storage cbOffset is not an unsigned integer");
+                if (!s2a_jv_obj_find(b, "cbOffset", &f)) {
+                    if (s2a_jv_u32(f, &cb_off)) return fail(why, why_size, "storage cbOffset is not an unsigned integer");
                     has_cb_off = 1;
                 }
-                if (!obj_find(b, "nvnSlot", &f)) {
-                    if (jv_u32(f, &nvn) || nvn >= 16) return fail(why, why_size, "storage nvnSlot is outside 0..15");
+                if (!s2a_jv_obj_find(b, "nvnSlot", &f)) {
+                    if (s2a_jv_u32(f, &nvn) || nvn >= 16) return fail(why, why_size, "storage nvnSlot is outside 0..15");
                     has_nvn = 1;
                 }
-                if (!obj_find(b, "uboPtr", &f)) {
-                    if (jv_u32(f, &ubo_ptr)) return fail(why, why_size, "storage uboPtr is not an unsigned integer");
+                if (!s2a_jv_obj_find(b, "uboPtr", &f)) {
+                    if (s2a_jv_u32(f, &ubo_ptr)) return fail(why, why_size, "storage uboPtr is not an unsigned integer");
                     has_ubo_ptr = 1;
                 }
-                if (!obj_find(b, "uboSlot", &f)) {
-                    if (jv_u32(f, &ubo_slot)) return fail(why, why_size, "storage uboSlot is not an unsigned integer");
+                if (!s2a_jv_obj_find(b, "uboSlot", &f)) {
+                    if (s2a_jv_u32(f, &ubo_slot)) return fail(why, why_size, "storage uboSlot is not an unsigned integer");
                     has_ubo_slot = 1;
                 }
-                if (!obj_find(b, "uboOffset", &f)) {
-                    if (jv_u32(f, &ubo_off)) return fail(why, why_size, "storage uboOffset is not an unsigned integer");
+                if (!s2a_jv_obj_find(b, "uboOffset", &f)) {
+                    if (s2a_jv_u32(f, &ubo_off)) return fail(why, why_size, "storage uboOffset is not an unsigned integer");
                     has_ubo_off = 1;
                 }
-                if (!obj_find(b, "rw", &f)) {
-                    if (jv_bool(f, &rw)) return fail(why, why_size, "storage rw is not a boolean");
+                if (!s2a_jv_obj_find(b, "rw", &f)) {
+                    if (s2a_jv_bool(f, &rw)) return fail(why, why_size, "storage rw is not a boolean");
                     has_rw = 1;
                 }
                 if (!has_rw) return fail(why, why_size, "storage rw fact is missing");
@@ -350,11 +217,11 @@ int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd
     }
 
     out->support_bytes = SUPPORT_DEFAULT_BYTES;
-    struct jv support;
-    if (!obj_find(content, "supportLayout", &support) && jv_is_object(support)) {
-        struct jv required;
+    struct s2a_jv support;
+    if (!s2a_jv_obj_find(content, "supportLayout", &support) && s2a_jv_is_object(support)) {
+        struct s2a_jv required;
         uint32_t required_v = 0;
-        if (!obj_find(support, "requiredSize", &required) && !jv_u32(required, &required_v) && required_v)
+        if (!s2a_jv_obj_find(support, "requiredSize", &required) && !s2a_jv_u32(required, &required_v) && required_v)
             out->support_bytes = required_v;
     }
     if (out->support_bytes < SUPPORT_DEFAULT_BYTES) return fail(why, why_size, "support layout is smaller than the compiler layout");
@@ -372,29 +239,29 @@ void nvn_vk_program_free(struct fd_program *p) {
 #include "direct/json.h"
 #include <limits.h>
 
-static int compute_unique_fields(struct jv object) {
-    if (!jv_is_object(object)) return -1;
+static int compute_unique_fields(struct s2a_jv object) {
+    if (!s2a_jv_is_object(object)) return -1;
     char keys[S2A_JSON_MAX_FIELDS][64];
     int count = 0;
     const char *p = object.p + 1, *end = object.p + object.n - 1;
-    while ((p = jv_ws(p, end)) < end) {
+    while ((p = s2a_jv_ws(p, end)) < end) {
         const char *key_end, *value_end;
-        if (count == S2A_JSON_MAX_FIELDS || jv_scan(p, end, &key_end)) return -1;
-        struct jv key = {p, (size_t)(key_end - p)};
-        if (jv_str(key, keys[count], sizeof keys[count])) return -1;
+        if (count == S2A_JSON_MAX_FIELDS || s2a_jv_scan(p, end, &key_end)) return -1;
+        struct s2a_jv key = {p, (size_t)(key_end - p)};
+        if (s2a_jv_str(key, keys[count], sizeof keys[count])) return -1;
         /* Escaped field names are not emitted by the compiler. Reject rather
          * than compare a partially decoded Unicode spelling as another key. */
         if (memchr(key.p, '\\', key.n)) return -1;
         for (int i = 0; i < count; ++i) if (!strcmp(keys[i], keys[count])) return -1;
         count++;
-        p = jv_ws(key_end, end);
-        if (p >= end || *p != ':' || jv_scan(p + 1, end, &value_end)) return -1;
-        p = jv_ws(value_end, end);
+        p = s2a_jv_ws(key_end, end);
+        if (p >= end || *p != ':' || s2a_jv_scan(p + 1, end, &value_end)) return -1;
+        p = s2a_jv_ws(value_end, end);
         if (p < end && *p == ',') p++;
     }
     return 0;
 }
-static int compute_u32(struct jv v, uint32_t *out) {
+static int compute_u32(struct s2a_jv v, uint32_t *out) {
     if (!v.n || (v.n > 1 && v.p[0] == '0')) return -1;
     uint64_t value = 0;
     for (size_t i = 0; i < v.n; ++i) {
@@ -405,13 +272,13 @@ static int compute_u32(struct jv v, uint32_t *out) {
     *out = (uint32_t)value;
     return 0;
 }
-static int compute_string_is(struct jv object, const char *key, const char *expected) {
-    struct jv v;
+static int compute_string_is(struct s2a_jv object, const char *key, const char *expected) {
+    struct s2a_jv v;
     char text[64];
-    return !obj_find(object, key, &v) && !jv_str(v, text, sizeof text) && !strcmp(text, expected);
+    return !s2a_jv_obj_find(object, key, &v) && !s2a_jv_str(v, text, sizeof text) && !strcmp(text, expected);
 }
-static int compute_spirv(struct jv v, struct fd_stage *stage) {
-    if (!jv_is_string(v) || v.n < 6) return -1;
+static int compute_spirv(struct s2a_jv v, struct fd_stage *stage) {
+    if (!s2a_jv_is_string(v) || v.n < 6) return -1;
     const char *p = v.p + 1;
     size_t n = v.n - 2, pad = 0;
     if (n % 4) return -1;
@@ -434,19 +301,19 @@ void nvn_vk_program_free_compute(struct nvn_vk_compute_program *p) {
     memset(p, 0, sizeof *p);
 }
 /* Compute-only source mapping. Do not interpret translator allocation order as an NVN slot. */
-static int compute_storage(struct jv b, struct nvn_vk_compute_storage *s) {
-    struct jv v;
+static int compute_storage(struct s2a_jv b, struct nvn_vk_compute_storage *s) {
+    struct s2a_jv v;
     uint32_t nvn = 0, ptr = 0, ubo = 0, off = 0;
-    if (obj_find(b, "rw", &v)) return -1;
+    if (s2a_jv_obj_find(b, "rw", &v)) return -1;
     if (v.n == 4 && !memcmp(v.p, "true", 4)) s->writable = 1;
     else if (v.n != 5 || memcmp(v.p, "false", 5)) return -1;
-    if (obj_find(b, "cbSlot", &v) || compute_u32(v, &s->cb_slot) || s->cb_slot > 255 ||
-        obj_find(b, "cbOffset", &v) || compute_u32(v, &s->cb_offset) || s->cb_offset > 65535u * 4u)
+    if (s2a_jv_obj_find(b, "cbSlot", &v) || compute_u32(v, &s->cb_slot) || s->cb_slot > 255 ||
+        s2a_jv_obj_find(b, "cbOffset", &v) || compute_u32(v, &s->cb_offset) || s->cb_offset > 65535u * 4u)
         return -1;
-    int hn = !obj_find(b, "nvnSlot", &v); if (hn && compute_u32(v, &nvn)) return -1;
-    int hp = !obj_find(b, "uboPtr", &v); if (hp && compute_u32(v, &ptr)) return -1;
-    int hu = !obj_find(b, "uboSlot", &v); if (hu && compute_u32(v, &ubo)) return -1;
-    int ho = !obj_find(b, "uboOffset", &v); if (ho && compute_u32(v, &off)) return -1;
+    int hn = !s2a_jv_obj_find(b, "nvnSlot", &v); if (hn && compute_u32(v, &nvn)) return -1;
+    int hp = !s2a_jv_obj_find(b, "uboPtr", &v); if (hp && compute_u32(v, &ptr)) return -1;
+    int hu = !s2a_jv_obj_find(b, "uboSlot", &v); if (hu && compute_u32(v, &ubo)) return -1;
+    int ho = !s2a_jv_obj_find(b, "uboOffset", &v); if (ho && compute_u32(v, &off)) return -1;
     if (hn + hp + hu != 1 || hu != ho || (s->cb_offset & 3u)) return -1;
     if (hn && s->cb_slot == 0 && s->cb_offset >= 0x310 && s->cb_offset < 0x410 &&
         !(s->cb_offset & 15u) && nvn == (s->cb_offset - 0x310) / 16u) {
@@ -470,34 +337,34 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
     int rc = s2a_json_parse_object(bytes, length, syntax, why, why_size);
     free(syntax);
     if (rc) return -1;
-    struct jv top = {(const char *)bytes, length}, content, stages, st, spirv, bindings, support;
+    struct s2a_jv top = {(const char *)bytes, length}, content, stages, st, spirv, bindings, support;
 #define CS_FAIL(text) do { nvn_vk_program_free_compute(out); return fail(why, why_size, text); } while (0)
     if (!compute_string_is(top, "schema", "s2a-direct-program-v1")) CS_FAIL("compute result schema mismatch");
-    if (obj_find(top, "content", &content) || compute_unique_fields(content)) CS_FAIL("compute content fields invalid");
+    if (s2a_jv_obj_find(top, "content", &content) || compute_unique_fields(content)) CS_FAIL("compute content fields invalid");
     if (!compute_string_is(content, "contract", "s2a-direct-program-content-v1") ||
         !compute_string_is(content, "kind", "compute")) CS_FAIL("result is not compute content");
-    struct jv alignment;
-    if (obj_find(content, "hasUnalignedStorageBuffer", &alignment)) CS_FAIL("compute storage alignment fact missing");
+    struct s2a_jv alignment;
+    if (s2a_jv_obj_find(content, "hasUnalignedStorageBuffer", &alignment)) CS_FAIL("compute storage alignment fact missing");
     if (alignment.n == 4 && !memcmp(alignment.p, "true", 4)) out->has_unaligned_storage_buffer = 1;
     else if (alignment.n != 5 || memcmp(alignment.p, "false", 5)) CS_FAIL("compute storage alignment fact must be boolean");
-    struct jv reads;
-    if (obj_find(content, "c0Reads", &reads)) CS_FAIL("compute c0 reads are missing");
+    struct s2a_jv reads;
+    if (s2a_jv_obj_find(content, "c0Reads", &reads)) CS_FAIL("compute c0 reads are missing");
     int read_count;
-    if (jv_is_null(reads)) {
+    if (s2a_jv_is_null(reads)) {
         // 分析器给不出读集：运行时按完整驱动 c0 布局填（dispatch 尺寸 + UBO 表 + storage 表），
         // 这些表的值全都来自本次 dispatch 的真实状态，不需要“猜”。
         out->c0_reads_unknown = 1;
         read_count = 0;
     } else {
-        read_count = arr_count(reads);
+        read_count = s2a_jv_arr_count(reads);
         if (read_count < 0 || read_count > NVK_COMPUTE_C0_MAX_READS)
             CS_FAIL("compute c0 reads are unknown or excessive");
     }
     for (int i = 0; i < read_count; ++i) {
-        struct jv pair, off, size;
+        struct s2a_jv pair, off, size;
         struct nvn_vk_c0_read *r = &out->c0_reads[i];
-        if (arr_item(reads, i, &pair) || arr_count(pair) != 2 ||
-            arr_item(pair, 0, &off) || arr_item(pair, 1, &size) ||
+        if (s2a_jv_arr_item(reads, i, &pair) || s2a_jv_arr_count(pair) != 2 ||
+            s2a_jv_arr_item(pair, 0, &off) || s2a_jv_arr_item(pair, 1, &size) ||
             compute_u32(off, &r->offset) || compute_u32(size, &r->size) || !r->size)
             CS_FAIL("compute c0 read range is invalid");
         uint32_t begin = 0;
@@ -510,26 +377,26 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         }
     }
     out->c0_read_count = (uint32_t)read_count;
-    if (obj_find(content, "stages", &stages) || arr_count(stages) != 1 ||
-        arr_item(stages, 0, &st) || compute_unique_fields(st) ||
+    if (s2a_jv_obj_find(content, "stages", &stages) || s2a_jv_arr_count(stages) != 1 ||
+        s2a_jv_arr_item(stages, 0, &st) || compute_unique_fields(st) ||
         !compute_string_is(st, "stage", "cs")) CS_FAIL("compute requires exactly one CS stage");
-    if (obj_find(st, "spirv", &spirv) || compute_spirv(spirv, &out->stage)) CS_FAIL("compute SPIR-V is invalid");
-    struct jv mask;
-    if (!obj_find(st, "attributeReadMask", &mask) &&
+    if (s2a_jv_obj_find(st, "spirv", &spirv) || compute_spirv(spirv, &out->stage)) CS_FAIL("compute SPIR-V is invalid");
+    struct s2a_jv mask;
+    if (!s2a_jv_obj_find(st, "attributeReadMask", &mask) &&
         (compute_u32(mask, &out->stage.attr_mask) || out->stage.attr_mask)) CS_FAIL("compute vertex attribute mask is invalid");
-    if (obj_find(content, "bindings", &bindings)) CS_FAIL("compute bindings are missing");
-    int count = arr_count(bindings);
+    if (s2a_jv_obj_find(content, "bindings", &bindings)) CS_FAIL("compute bindings are missing");
+    int count = s2a_jv_arr_count(bindings);
     if (count < 0 || count > FD_MAX_BINDINGS) CS_FAIL("compute binding count exceeds limit");
     for (int i = 0; i < count; ++i) {
-        struct jv b, value;
-        if (arr_item(bindings, i, &b) || compute_unique_fields(b)) CS_FAIL("compute binding fields invalid");
+        struct s2a_jv b, value;
+        if (s2a_jv_arr_item(bindings, i, &b) || compute_unique_fields(b)) CS_FAIL("compute binding fields invalid");
         struct fd_binding *dst = &out->bindings[i];
         uint32_t u;
-        if (obj_find(b, "set", &value) || compute_u32(value, &u) || u > 3) CS_FAIL("compute descriptor set invalid");
+        if (s2a_jv_obj_find(b, "set", &value) || compute_u32(value, &u) || u > 3) CS_FAIL("compute descriptor set invalid");
         dst->set = (int)u;
-        if (obj_find(b, "binding", &value) || compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute binding number invalid");
+        if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute binding number invalid");
         dst->binding = (int)u;
-        if (obj_find(b, "count", &value) || compute_u32(value, &u) || u != 1) CS_FAIL("compute descriptor arrays are unsupported");
+        if (s2a_jv_obj_find(b, "count", &value) || compute_u32(value, &u) || u != 1) CS_FAIL("compute descriptor arrays are unsupported");
         for (int j = 0; j < i; ++j)
             if (out->bindings[j].set == dst->set && out->bindings[j].binding == dst->binding) CS_FAIL("duplicate compute binding");
         dst->is_support = (uint8_t)compute_string_is(b, "kind", "support");
@@ -547,8 +414,8 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             static const char *const storage_only[] = {
                 "rw", "cbSlot", "cbOffset", "nvnSlot", "uboPtr", "uboSlot", "uboOffset" };
             for (unsigned k = 0; k < sizeof storage_only / sizeof storage_only[0]; ++k) {
-                struct jv extra;
-                if (!obj_find(b, storage_only[k], &extra))
+                struct s2a_jv extra;
+                if (!s2a_jv_obj_find(b, storage_only[k], &extra))
                     CS_FAIL("compute non-storage binding carries a storage mapping field");
             }
         }
@@ -557,7 +424,7 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         snprintf(dst->stage, sizeof dst->stage, "%s", stage);
         dst->stage_idx = dst->is_support ? -1 : 5; /* NVN CS index, not identity texture enum. */
         dst->slot = -1;
-        if (!obj_find(b, "slot", &value)) {
+        if (!s2a_jv_obj_find(b, "slot", &value)) {
             if (compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute guest slot invalid");
             dst->slot = (int)u;
         }
@@ -599,39 +466,39 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         }
         out->binding_count++;
     }
-    if (obj_find(content, "supportLayout", &support) || compute_unique_fields(support)) CS_FAIL("compute support layout is missing");
-    struct jv required;
-    if (obj_find(support, "requiredSize", &required) || compute_u32(required, &out->support_bytes) ||
+    if (s2a_jv_obj_find(content, "supportLayout", &support) || compute_unique_fields(support)) CS_FAIL("compute support layout is missing");
+    struct s2a_jv required;
+    if (s2a_jv_obj_find(support, "requiredSize", &required) || compute_u32(required, &out->support_bytes) ||
         !out->support_bytes) CS_FAIL("compute support layout is empty");
-    if (obj_find(content, "supportReads", &reads)) CS_FAIL("compute support reads missing");
+    if (s2a_jv_obj_find(content, "supportReads", &reads)) CS_FAIL("compute support reads missing");
     // null = 编译器静态分析给不出读集（SPIR-V 模式超出分析器能力）。这不是“没有读”，
     // 运行时按恒等值填满整个 SupportBuffer（所有 render scale = 1.0，flags 位为 0），
     // 并把这个事实记进程序对象；不是数组也不是 null 仍然拒绝。
-    if (jv_is_null(reads)) {
+    if (s2a_jv_is_null(reads)) {
         out->support_reads_unknown = 1;
         read_count = 0;
     } else {
-        read_count = arr_count(reads);
+        read_count = s2a_jv_arr_count(reads);
         if (read_count < 0 || read_count > NVK_COMPUTE_C0_MAX_READS)
             CS_FAIL("compute support reads unknown or excessive");
     }
     if (!read_count) return 0; /* proven no actual load: no layout fact is needed */
-    struct jv scales;
-    if (obj_find(content, "supportScaleRanges", &scales) || arr_count(scales) != 2)
+    struct s2a_jv scales;
+    if (s2a_jv_obj_find(content, "supportScaleRanges", &scales) || s2a_jv_arr_count(scales) != 2)
         CS_FAIL("compute support scale ranges are missing or invalid");
     unsigned scale_seen = 0;
     for (int i = 0; i < 2; ++i) {
-        struct jv item, v;
-        if (arr_item(scales, i, &item) || compute_unique_fields(item)) CS_FAIL("compute support scale fields invalid");
+        struct s2a_jv item, v;
+        if (s2a_jv_arr_item(scales, i, &item) || compute_unique_fields(item)) CS_FAIL("compute support scale fields invalid");
         int index = compute_string_is(item, "name", "render_scale") ? 0 :
                     compute_string_is(item, "name", "render_scale_y") ? 1 : -1;
         if (index < 0 || (scale_seen & (1u << index))) CS_FAIL("compute support scale name unknown or duplicate");
         scale_seen |= 1u << index;
         struct nvn_vk_support_scale *r = &out->support_scales[index];
-        if (obj_find(item, "offset", &v) || compute_u32(v, &r->offset) ||
-            obj_find(item, "stride", &v) || compute_u32(v, &r->stride) || r->stride < 4 ||
-            obj_find(item, "count", &v) || compute_u32(v, &r->count) || !r->count ||
-            obj_find(item, "elementBytes", &v) || compute_u32(v, &r->element_bytes) || r->element_bytes != 4 ||
+        if (s2a_jv_obj_find(item, "offset", &v) || compute_u32(v, &r->offset) ||
+            s2a_jv_obj_find(item, "stride", &v) || compute_u32(v, &r->stride) || r->stride < 4 ||
+            s2a_jv_obj_find(item, "count", &v) || compute_u32(v, &r->count) || !r->count ||
+            s2a_jv_obj_find(item, "elementBytes", &v) || compute_u32(v, &r->element_bytes) || r->element_bytes != 4 ||
             (r->offset & 3u) || (r->stride & 3u) ||
             (uint64_t)r->offset + (uint64_t)(r->count - 1) * r->stride + r->element_bytes > out->support_bytes)
             CS_FAIL("compute support scale extent invalid");
@@ -641,9 +508,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
     uint64_t b_end = (uint64_t)b->offset + (uint64_t)(b->count - 1) * b->stride + b->element_bytes;
     if (a->offset < b_end && b->offset < a_end) CS_FAIL("compute support scale ranges overlap");
     for (int i = 0; i < read_count; ++i) {
-        struct jv pair, off, size;
+        struct s2a_jv pair, off, size;
         struct nvn_vk_c0_read *r = &out->support_reads[i];
-        if (arr_item(reads, i, &pair) || arr_count(pair) != 2 || arr_item(pair, 0, &off) || arr_item(pair, 1, &size) ||
+        if (s2a_jv_arr_item(reads, i, &pair) || s2a_jv_arr_count(pair) != 2 || s2a_jv_arr_item(pair, 0, &off) || s2a_jv_arr_item(pair, 1, &size) ||
             compute_u32(off, &r->offset) || compute_u32(size, &r->size) || !r->size)
             CS_FAIL("compute support read range invalid");
         int known = 0;

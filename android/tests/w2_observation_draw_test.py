@@ -77,7 +77,7 @@ def prepare(td):
     sources += [NATIVE / 'nvn' / (p + '.c') for p in
                 ('nvn_vk_compile_facts', 'nvn_vk_format', 'nvn_vk_mrt', 'nvn_vk_threadbuf', 'nvn_vk_program_result')]
     sources += [NATIVE / 'direct' / (p + '.c') for p in
-                ('source_store', 'input_identity', 'compile_request', 'texture_facts', 'control', 'sha256', 'json',
+                ('source_store', 'input_identity', 'compile_request', 'texture_facts', 'control', 'sha256', 'jv', 'json',
                  'compile_export', 'compile_export_w2', 'w2_single_query')]   # nvn_vk_draw.c 直接调导出门（#1596）与 W2 诊断（moongrant W2），链真实现
     return base, list(map(str, sources))
 
