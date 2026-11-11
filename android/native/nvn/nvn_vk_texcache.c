@@ -3,6 +3,11 @@
 #include <time.h>
 #include "nvn_vk_texcache.h"
 #include "nvn_vk_texview.h"
+#if defined(__APPLE__)
+extern void s2a_vk_clear_forget_image(struct s2a_vk_device *, VkImage, uint64_t) __attribute__((weak_import));
+#else
+extern void s2a_vk_clear_forget_image(struct s2a_vk_device *, VkImage, uint64_t) __attribute__((weak));
+#endif
 // first_draw.c：跨帧 framebuffer 缓存按 view 失效；视图销毁前必须调用。
 void nvn_vk_first_draw_forget_view(VkImageView view);
 
@@ -304,6 +309,7 @@ static void release(struct s2a_vk_device *d, struct nvn_vk_tex *t) {
         t->owner = owner;
         return;
     }
+    if (s2a_vk_clear_forget_image) s2a_vk_clear_forget_image(d, t->image, t->generation);
     for (int i = 0; i < t->views_cap; i++)
         if (t->views[i].valid && t->views[i].view) { nvn_vk_first_draw_forget_view(t->views[i].view); vkDestroyImageView(d->device, t->views[i].view, NULL); }
     if (t->view_att && t->view_att != t->view) { nvn_vk_first_draw_forget_view(t->view_att); vkDestroyImageView(d->device, t->view_att, NULL); }
@@ -1036,6 +1042,10 @@ static struct nvn_vk_tex *tex_find_serial(struct nvn_vk_texcache *c, uint64_t se
         return s;
     }
     return NULL;
+}
+
+struct nvn_vk_tex *nvn_vk_texcache_find_serial(struct nvn_vk_texcache *c, uint64_t serial) {
+    return tex_find_serial(c, serial, NULL);
 }
 
 // 真实“这张纹理的当前内容归 GPU”查询：按 serial 找活条目，返回其 gpu_written。

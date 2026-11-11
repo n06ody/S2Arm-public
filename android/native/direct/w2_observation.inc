@@ -306,8 +306,11 @@ void s2a_w2_shader_lookup(const struct s2a_direct_compile_context *c,
             }
             if (source >= S2A_W2_MEMO && source <= S2A_W2_LIVE) {
                 if (i < S2A_W2_ENTRY_CAPACITY) {
-                    if (accepted) ++w->data.entries[i].source_counts[source];
-                    else ++w->data.entries[i].rejected_source_counts[source];
+                    if (accepted) {
+                        ++w->data.entries[i].source_counts[source];
+                        t->lookup_slot = i + 1;
+                        t->lookup_source = (unsigned)source + 1;
+                    } else ++w->data.entries[i].rejected_source_counts[source];
                 }
             } else {
                 if (i < S2A_W2_ENTRY_CAPACITY) ++w->data.entries[i].unknown_rejects;
@@ -329,13 +332,28 @@ void s2a_w2_shader_end(struct s2a_w2_shader *t, int success) {
         struct s2a_w2_window *w = t->window;
         if (w) {
             if (w2_shader != t) w2_protocol(w);
-            if (!t->lookup_seen) { ++w->data.missing_identity; w2_gap(w); }
-            if (!success) { ++w->data.build_failures; w2_gap(w); }
-            if ((t->blocked || !t->lookup_seen || !success) && !t->rejected)
-                ++w->data.rejects;
-            if (success && t->lookup_seen && t->lookup_accepted && !t->blocked)
-                ++w->data.accepted_builds;
-            ++w->data.finished_shaders;
+            int retry = success < 0 && w2_shader == t && t->scope && !t->blocked && !t->rejected &&
+                t->lookup_seen && t->lookup_accepted && t->lookup_slot && t->lookup_source &&
+                t->lookup_slot <= w->data.entry_count && t->lookup_source <= S2A_W2_SOURCE_COUNT &&
+                w->data.shaders && w->data.observations && t->scope->begun_shaders &&
+                w->data.entries[t->lookup_slot-1].source_counts[t->lookup_source-1];
+            if (retry) {
+                // 只是将同一 dispatch 推迟到同步后重建：撤销本次有效尝试的计数，
+                // 真正的重建另记一次。已经出现的 reject/gap 绝不撤销。
+                --w->data.shaders;
+                --w->data.observations;
+                --w->data.entries[t->lookup_slot-1].source_counts[t->lookup_source-1];
+                --t->scope->begun_shaders;
+            } else {
+                if (success < 0) success = 0;
+                if (!t->lookup_seen) { ++w->data.missing_identity; w2_gap(w); }
+                if (!success) { ++w->data.build_failures; w2_gap(w); }
+                if ((t->blocked || !t->lookup_seen || !success) && !t->rejected)
+                    ++w->data.rejects;
+                if (success && t->lookup_seen && t->lookup_accepted && !t->blocked)
+                    ++w->data.accepted_builds;
+                ++w->data.finished_shaders;
+            }
             --w->data.inflight_shaders;
             if (t->scope) --t->scope->active_shaders;
             w2_changed(w);

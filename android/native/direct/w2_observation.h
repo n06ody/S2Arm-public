@@ -31,6 +31,7 @@ struct s2a_w2_shader {
     struct s2a_w2_scope *scope;
     struct s2a_w2_shader *previous;
     unsigned entered, blocked, lookup_seen, lookup_accepted, rejected, kind;
+    unsigned lookup_slot, lookup_source; // 已计的有效 lookup（1 起，用于撤销内部同步重试）
 };
 struct s2a_w2_entry {
     uint8_t identity[32];
@@ -69,6 +70,7 @@ void s2a_w2_shader_begin(struct s2a_w2_shader *shader, enum s2a_w2_kind kind);
 void s2a_w2_shader_lookup(const struct s2a_direct_compile_context *context,
                          const uint8_t identity[32], enum s2a_w2_source source, int accepted);
 // success is a boolean derived from the unchanged runtime return code, not GPU proof.
+// success: 1 = 构建完成，0 = 失败，-1 = 内部同步后重试（有效查找才撤销本次尝试）。
 void s2a_w2_shader_end(struct s2a_w2_shader *shader, int success);
 int s2a_w2_snapshot(struct s2a_w2_window *window, struct s2a_w2_snapshot *snapshot);
 // Ack accepts only the same live instance/revision and an actually successful output.

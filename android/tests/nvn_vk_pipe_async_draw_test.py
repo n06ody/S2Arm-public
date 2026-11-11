@@ -16,6 +16,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
+sys.path.insert(0, str(HERE))
+import host_link
 
 
 class PipeAsyncDrawTest(unittest.TestCase):
@@ -38,7 +40,7 @@ class PipeAsyncDrawTest(unittest.TestCase):
                       str(ROOT / 'graphics/nvn/gfx/nvn/nvn_first_use.c'),
                       '-Wl,--gc-sections' if sys.platform != 'darwin' else '-Wl,-dead_strip',
                       '-o', str(binary)])
-            subprocess.run(cmd, check=True)
+            host_link.run(cmd, check=True)
             for arg in ([], ['off']):
                 with self.subTest(arg=arg):
                     result = subprocess.run([str(binary)] + arg, capture_output=True, text=True)

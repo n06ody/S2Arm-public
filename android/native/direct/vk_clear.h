@@ -17,6 +17,7 @@ typedef struct s2a_clear_target {
     VkImageAspectFlags aspect;   // COLOR / DEPTH / (DEPTH|STENCIL)
     uint32_t base_level, base_layer;
     uint32_t width, height;
+    void *native_tex;         // 缓存实际持有者；缺失时异步优化不接手
 } s2a_clear_target;
 
 // 清除的提交结果（与一次性提交的三类收尾一致）：调用方必须分开消费。
@@ -54,6 +55,12 @@ int s2a_vk_clear_color(struct s2a_vk_device *d, const s2a_clear_target *t,
 int s2a_vk_clear_depth_stencil(struct s2a_vk_device *d, const s2a_clear_target *t,
                                float depth, uint32_t stencil, int depth_mask, uint32_t stencil_bit_mask,
                                const VkRect2D *scissor, char *why, size_t why_size);
+// 底图已无在途引用且即将销毁时，失效其持久 framebuffer / view。
+void s2a_vk_clear_forget_image(struct s2a_vk_device *d, VkImage image, uint64_t generation);
+void s2a_vk_clear_fv_present(void);
+int s2a_vk_clear_fv_enabled(void);
+// 仅在设备已空闲、帧队列已释放后调用。
+void s2a_vk_clear_fv_release_device(struct s2a_vk_device *d);
 // 最近一次清除失败的 vk 层细节（首错保留），供上层日志使用。
 const char *s2a_vk_clear_first_error(void);
 // 对象/提交记账（诊断与验收用）：正常完成后创建/销毁逐类相等；UNCOMPLETED 的条目在账本里。

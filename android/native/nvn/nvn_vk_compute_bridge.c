@@ -155,6 +155,7 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
         nvk_compute_request_release(&request);
         // 成功时 cached build 已接管快照（入参清零），这里是 no-op；失败/未走到时解除全部保活。
         nvk_compute_texture_snapshot_release(&snapshot);
+        if (rc == S2A_RECORD_DISPATCH_RETRY_SYNC) return rc;
         if (rc) return rejected(result, why[0] ? why : "compute build failed");
         return 0;
     }
@@ -197,6 +198,7 @@ static int nvn_vk_compute_build_impl(struct s2a_vk_device *device,
     nvk_compute_request_release(&request);
     // 成功时 pipeline 已接管快照（入参清零），这里是 no-op；失败/未走到 pipeline 时解除全部保活。
     nvk_compute_texture_snapshot_release(&snapshot);
+    if (rc == S2A_RECORD_DISPATCH_RETRY_SYNC) return rc;
     if (rc) return rejected(result, why[0] ? why : "compute build failed");
     return 0;
 }
@@ -208,6 +210,6 @@ int nvn_vk_compute_build(struct s2a_vk_device *device,
     struct s2a_w2_shader observation = {0};
     s2a_w2_shader_begin(&observation, S2A_W2_COMPUTE);
     int rc = nvn_vk_compute_build_impl(device, state, memory, out, result, opaque);
-    s2a_w2_shader_end(&observation, rc == 0);
+    s2a_w2_shader_end(&observation, rc == S2A_RECORD_DISPATCH_RETRY_SYNC ? -1 : rc == 0);
     return rc;
 }

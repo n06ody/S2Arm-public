@@ -38,13 +38,14 @@ def main():
     # 落盘合同（F4.1）的负控：请求侧门/落盘、结果侧门/落盘/文件名配对、唯一请求集发布失败红行，
     # 每条都必须让 mode 0/29/30 的对应断言变红；注意变异体必须仍能编译（-Werror 下用 (void) 保活）。
     mutations={'positive':(source,lsource),
+       'cached-retry-becomes-error':(source.replace('if (rc == S2A_RECORD_DISPATCH_RETRY_SYNC) return rc;', '/* mutation: cached retry becomes failure */', 1),lsource),
        'ignore-unused-ssbo':(source.replace('slot < 16','slot < 8'),lsource),
        'ignore-seen-mask':(source.replace('(state->ssbo_seen & (1u << slot))','1'),lsource),
        'constant-aligned':(source.replace('unaligned = 1;', 'unaligned = 0;'),lsource),
        'accept-unresolved-snapshot':(source.replace('if (nvk_compute_texture_snapshot_acquire(device, state, &snapshot, why, sizeof why))','if ((nvk_compute_texture_snapshot_acquire(device, state, &snapshot, why, sizeof why), 0))'),lsource),
        'drop-texture-fact':(source.replace('    nvk_compute_texture_facts(&snapshot, &texture_set);','    /* mutation: facts dropped */'),lsource),
        'claim-empty-complete':(source.replace('.count = texture_set.count, .complete = 1 };','.count = 0, .complete = 1 };'),lsource),
-       'leak-snapshot':(source.replace('    nvk_compute_texture_snapshot_release(&snapshot);\n    if (rc) return rejected','    /* mutation: keep-alive leaked */\n    if (rc) return rejected'),lsource),
+       'leak-snapshot':(source.replace('    nvk_compute_texture_snapshot_release(&snapshot);\n    if (rc == S2A_RECORD_DISPATCH_RETRY_SYNC) return rc;','    /* mutation: keep-alive leaked */\n    if (rc == S2A_RECORD_DISPATCH_RETRY_SYNC) return rc;'),lsource),
        'omit-opcode':(source.replace('result->opcode = OP_DISPATCH;', ''),lsource),
        'ignore-stop':(source.replace('if (s2a_vk_adapter_stop_requested())','if (0)'),lsource),
        'leak-source-pin':(source.replace('nvk_compute_request_release(&request);','/* leaked pin */'),lsource),
@@ -81,6 +82,7 @@ def main():
                 snprintf(request_id, id_cap, "%s", idf->text);''',
           '''            /* mutation: requestId never captured */ (void)id_cap;''')),
     }
+    build=ROOT/'build/w2-compute-bridge';build.mkdir(parents=True,exist_ok=True);tempfile.tempdir=str(build)
     with tempfile.TemporaryDirectory(prefix='w2-bridge-') as d:
         td=Path(d);inc=td/'include';inc.mkdir();(inc/'vulkan').symlink_to(vulkan)
         if (vulkan.parent/'vk_video').exists():(inc/'vk_video').symlink_to(vulkan.parent/'vk_video')
@@ -106,7 +108,7 @@ def main():
                 print(f'【红】w2 bridge {name} 编译失败 rc={cc.returncode}（负数 = 被信号杀）：\n{cc.stdout[-2000:]}{cc.stderr[-6000:]}',file=sys.stderr,flush=True)
                 raise SystemExit(1)
             failures=[]
-            for mode in range(31):
+            for mode in range(32):
                 diag_dir = td/'blocked'/'diag' if mode==30 else td/(name+'-diag'+str(mode))
                 p=subprocess.run([str(exe),str(mode),str(td/('unaligned.json' if mode in (1,2) else 'good.json')),
                     str(td/'texture.json'),str(diag_dir)],
@@ -140,5 +142,5 @@ def main():
         for source_name in ('nvn_vk_compute_bridge.c','nvn_vk_compute_request.c','nvn_vk_compute_lookup.c','nvn_vk_compute_texture.c'):
             assert links.count('native/nvn/'+source_name)==1
         assert 'w2_compute_bridge_test.py' in (ROOT/'android/test.sh').read_text()
-        print('PASS: 31 bridge cases, %d effective negative controls, request/result diag pairing, import/gate registration'%(len(mutations)-1))
+        print('PASS: 32 bridge cases, %d effective negative controls, request/result diag pairing, import/gate registration'%(len(mutations)-1))
 if __name__=='__main__':main()

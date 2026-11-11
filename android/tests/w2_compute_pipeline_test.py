@@ -25,6 +25,7 @@ class ComputePipeline(unittest.TestCase):
         if not (vulkan / 'vulkan.h').is_file():
             raise RuntimeError('NDK Vulkan headers missing: ' + str(vulkan))
         native=ROOT/'android/native'
+        build=ROOT/'build/w2-compute-pipeline';build.mkdir(parents=True,exist_ok=True);tempfile.tempdir=str(build)
         with tempfile.TemporaryDirectory(prefix='compute-pipeline-') as temp:
             out=Path(temp); (out/'vulkan').symlink_to(vulkan)
             (out/'vk_video').symlink_to(vulkan.parent/'vk_video')
@@ -64,7 +65,22 @@ class ComputePipeline(unittest.TestCase):
               'negative_prog_any_identity':source.replace('!e->by_identity || memcmp(e->identity, identity, 32)', 'memcmp(identity, identity, 32)'),
               'negative_prog_never_insert':source.replace('    } else if (prog && identity && o->pipeline) {', '    } else if (0 && prog && identity && o->pipeline) {'),
               'drop-c1-binding':source.replace('} else if (r->kind == 0 && r->slot == 1) {', '} else if (0) {'),
-              'c1-from-guest-read':source.replace('memcpy(b->mapped, source->c1, NVK_COMPUTE_C1_BYTES);', 'memcpy(b->mapped, b->mapped, 0);')}
+              'c1-from-guest-read':source.replace('memcpy(b->mapped, source->c1, NVK_COMPUTE_C1_BYTES);', 'memcpy(b->mapped, b->mapped, 0);'),
+              # dispatch-fq 池直绑负对照：错池内偏移/不查 usage 强绑/销毁池后备/回写池后备/
+              # 部分命中不回滚/不标 pooled（影子会覆盖池 buffer）→ 门开用例必须红。
+              'negative_pool_wrong_offset':source.replace('b->buffer = pb; b->window_off = po; b->pooled = 1;',
+                                                          'b->buffer = pb; b->window_off = po + 16; b->pooled = 1;'),
+              'negative_pool_skip_usage':source.replace('!(pu & need)', '!(need & need)'),
+              'negative_pool_offset_alignment':source.replace('|| po % align)', ')'),
+              'negative_pool_destroy':source.replace('if (b->shared || b->pooled) continue;',
+                                                     'if (b->shared) continue;', 1),
+              'negative_pool_writeback':source.replace('if (b->shared || b->pooled || !b->writable) continue;',
+                                                       'if (b->shared || (!b->pooled && !b->writable)) continue;'),
+              'negative_pool_partial':source.replace('if (!all_hit) goto retry_sync;', 'if (0) goto retry_sync;'),
+              'negative_writable_without_visibility_proof':source.replace('if (r->kind == 1 && b->writable) goto retry_sync;', 'if (0) goto retry_sync;'),
+              'negative_indirect_before_sync':source.replace('if (indirect && s->fq_pool) goto retry_sync;', 'if (0) goto retry_sync;'),
+              'negative_pool_mark':source.replace('b->buffer = pb; b->window_off = po; b->pooled = 1;',
+                                                  'b->buffer = pb; b->window_off = po; b->pooled = 0;')}
             for name,code in variants.items():
                 self.assertTrue(name=='positive' or code!=source)
                 (out/'nvn').mkdir(exist_ok=True)

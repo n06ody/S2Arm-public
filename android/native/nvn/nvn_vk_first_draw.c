@@ -1064,6 +1064,7 @@ struct fd_frame_q {
     VkSampler samps[FD_FRAME_SAMPS]; int nsamp;
     VkDescriptorPool pools[FD_FRAME_POOLS]; int npool;
     VkFramebuffer fbs[FD_FRAME_FBS]; int nfb;
+    VkFramebuffer clear_fbs[FD_FRAME_FBS]; VkImageView clear_views[FD_FRAME_FBS]; int nclear;
     // feedback 采样快照：本帧内“附件同时当采样源”的 draw 用；等这批命令有完成证明后再销毁。
     VkImage fbimg[FD_FRAME_FBS]; VkDeviceMemory fbmem[FD_FRAME_FBS]; VkImageView fbview[FD_FRAME_FBS];
     int nfbimg;
@@ -1237,6 +1238,7 @@ static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {
     for (int i = 0; i < q->nsamp; i++) vkDestroySampler(d->device, q->samps[i], NULL);
     for (int i = 0; i < q->npool; i++) vkDestroyDescriptorPool(d->device, q->pools[i], NULL);
     for (int i = 0; i < q->nfb; i++) vkDestroyFramebuffer(d->device, q->fbs[i], NULL);
+    for (int i = 0; i < q->nclear; i++) { vkDestroyFramebuffer(d->device, q->clear_fbs[i], NULL); vkDestroyImageView(d->device, q->clear_views[i], NULL); }
     for (int i = 0; i < q->npass; i++) vkDestroyRenderPass(d->device, q->passes[i], NULL);
     for (int i = 0; i < q->nfbimg; i++) {
         if (q->fbview[i]) vkDestroyImageView(d->device, q->fbview[i], NULL);
@@ -1253,6 +1255,10 @@ static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {
     if (q->fence) { fd_fence_put_back(d->device, q->fence); q->fence = VK_NULL_HANDLE; }
     memset(q, 0, sizeof *q);
 }
+// dispatch 帧队列收编的通知（弱绑定，vk_record.c 提供）：失败报告完成未知；
+// 成功只按给出的已完成帧号结算。未链接记录层的构建符号为空。
+extern void s2a_record_fq_drain(int ok) __attribute__((weak));
+extern void s2a_record_fq_retire(uint64_t completed_frame) __attribute__((weak));
 // 等并释放一个延迟槽。返回 0 = 已回收；-1 = 完成证明失败（资源保留，会话按失败处理）。
 static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     if (!s || !s->used) return 0;
@@ -1268,6 +1274,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
         if (s2a_qret_prefix(q->batch_qid, q->nbatch_fence, fd_query_retire_cb, NULL) != 0 ||
             s2a_qret_slot(&q->suffix_qid, fd_query_retire_cb, NULL) != 0) {
             g_slot_fail = 1;
+            if (s2a_record_fq_drain) s2a_record_fq_drain(0);
             return -1;
         }
         fd_ssbo_wb_writeback(q);   // 完成证明在手：可写 storage buffer 的影子拷回 guest
@@ -1277,6 +1284,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     if (bad) {
         FD_LOG("present defer: the previous frame has no completion proof; resources retained");
         g_slot_fail = 1;
+        if (s2a_record_fq_drain) s2a_record_fq_drain(0);
         return -1;
     }
     // 完成证明已在手：此刻读该帧奇偶的 GPU 起止时间戳，不能等下一帧 arm reset 覆盖。
@@ -1298,6 +1306,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
             if (nvn_vk_ts_top_resolve(d, s->frame_id, 0, twhy, sizeof twhy) != 0) {
                 FD_LOG("present defer: timestamp-top writeback at retirement failed: %s", twhy);
                 g_slot_fail = 1;
+                if (s2a_record_fq_drain) s2a_record_fq_drain(0);
                 return -1;
             }
         }
@@ -1324,6 +1333,8 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     // 用单调序号而不是帧槽奇偶：延迟上屏时 N-1 与 N+1 同槽，同号会把另一帧仍在读的引用一起清掉。
     s2a_poolahb_complete_seq(s->ref_seq);
     s->ref_seq = 0;
+    // 槽退休 = 此槽帧的完成证明：只结算归属该帧的 dispatch owner。
+    if (s2a_record_fq_retire) s2a_record_fq_retire(s->frame_id);
     return 0;
 }
 // 同步边界（guest 等待/收尾）必须把在途的延迟帧先收口，查询结果与资源都不能晚到。
@@ -1385,7 +1396,7 @@ static VkDevice g_fq_fence_dev;
 
 static void fd_fq_reset(void) {
     g_fq.ncmd = 0; g_fq.nbuf = 0; g_fq.nsamp = 0; g_fq.npool = 0; g_fq.nfb = 0; g_fq.npass = 0; g_fq.npend = 0;
-    g_fq.nfbimg = 0;
+    g_fq.nfbimg = 0; g_fq.nclear = 0;
     g_fq.submitted_n = 0; g_fq.nbatch_fence = 0; g_fq.fence = VK_NULL_HANDLE;
     memset(g_fq.batch_qid, 0, sizeof g_fq.batch_qid); g_fq.suffix_qid = 0;
     g_fq.state = FD_FQ_IDLE;
@@ -2047,7 +2058,8 @@ static struct fd_open_pass g_op;
 // 本帧已录制的 draw 数（诊断用）：载入屏 ~几十/帧，世界帧数千/帧；trace 用它区分
 // “载入屏反复使用同一合成程序”和“世界首帧”。
 static _Atomic uint32_t g_draws_this_frame;
-static uint64_t g_frame_ref_seq;   // 本帧的池后备提交序号（帧首笔 draw 时分配）
+static uint64_t g_frame_ref_seq;   // 当前批次的池后备提交序号
+static int g_frame_ref_refresh;   // 已移交旧序号，下一笔 draw 须重新获取
 static int g_fb_logged;   // feedback 快照日志只打一次（逐帧重复没有新信息）
 static _Atomic uint64_t g_fb_leave_n;   // 反馈采样“是反馈但单层 2D 快照表达不了”的绑定数（诊断）
 static int g_pass_merges, g_pass_flushes;
@@ -2457,6 +2469,34 @@ int nvn_vk_first_draw_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) {
     // 否则这笔 clear 的命令缓冲会排到那些 draw 前面（画面重排）。
     if (fd_batch_seal(d) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
     if (g_fq.ncmd >= fd_fq_cmd_capacity()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    g_fq.cmds[g_fq.ncmd] = cmd;
+    g_fq.pmap[g_fq.ncmd] = NULL;
+    g_fq.pid[g_fq.ncmd][0] = 0;
+    g_fq.ncmd++;
+    if (g_fq.ncmd - g_fq.submitted_n >= fd_batch_passes() && fd_submit_batch() != 0)
+        return S2A_FQ_ENQUEUE_FAILED_OWNED;
+    return S2A_FQ_ENQUEUE_ACCEPTED;
+}
+
+// 按同一个三态契约接手清除命令及其底图/临时对象：所有失败点在转移前，
+// 唯一转移点之后若 submit 失败，命令和对象仍留在终态帧队列中。
+int nvn_vk_first_draw_enqueue_clear(struct s2a_vk_device *d, VkCommandBuffer cmd,
+                                    void *native_tex, VkImage image, uint64_t generation,
+                                    VkFramebuffer fb, VkImageView view, int temporary) {
+    struct nvn_vk_tex *tex = native_tex;
+    if (!d || !cmd || !tex || !tex->valid || tex->retired || tex->image != image ||
+        !generation || tex->generation != generation || !g_fq.dev || g_fq.dev->device != d->device || fd_fq_poisoned())
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (g_op.open && fd_pass_close(g_op.dev ? g_op.dev : g_fq.dev, FD_PCR_CLEAR) != 0)
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (fd_batch_seal(d) != 0 || g_fq.ncmd >= fd_fq_cmd_capacity()) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (temporary && (!fb || !view || g_fq.nclear >= FD_FRAME_FBS))
+        return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (fd_pin_tex(tex) != 0) return S2A_FQ_ENQUEUE_NOT_TAKEN;
+    if (temporary) {
+        g_fq.clear_fbs[g_fq.nclear] = fb;
+        g_fq.clear_views[g_fq.nclear++] = view;
+    }
     g_fq.cmds[g_fq.ncmd] = cmd;
     g_fq.pmap[g_fq.ncmd] = NULL;
     g_fq.pid[g_fq.ncmd][0] = 0;
@@ -3231,6 +3271,20 @@ static void fd_cmd_put(struct s2a_vk_device *d, VkCommandBuffer cmd) {
 
 // 当前录制帧序号：时间戳待写项按它归属到帧，退休只结算已拿到完成证明的帧。
 uint64_t nvn_vk_first_draw_frame_id(void) { return g_frame_id; }
+// 本帧池后备保活序号（懒分配）：compute 收编的池 lookup 可能早于本帧首笔 draw，
+// 不能拿上一帧已移交槽位的序号登记（ref 会挂进别人/已退休的账本）。本帧第一次
+// 用到才分配；帧快照进槽位时随槽退休，同步路径在帧完成点退休。
+uint64_t nvn_vk_first_draw_submit_seq(void) {
+    if (!g_frame_ref_seq) g_frame_ref_seq = s2a_poolahb_begin_seq();
+    g_frame_ref_refresh = 0;
+    return g_frame_ref_seq;
+}
+uint64_t nvn_vk_first_draw_detach_submit_seq(void) {
+    uint64_t seq = g_frame_ref_seq;
+    g_frame_ref_seq = 0;
+    if (seq) g_frame_ref_refresh = 1;
+    return seq;
+}
 
 // OP_REPORT_COUNTER(TIMESTAMP_TOP)：录一段只含 reset+时间戳的命令缓冲，按顺序并入当前帧队列。
 // 不 submit、不等 fence；完成证明由帧队列统一拿，写回由查询模块在帧完成点做。
@@ -3979,6 +4033,8 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
         if (g_slot[idx].used && fd_slot_retire(d, &g_slot[idx]) != 0) return -1;
         memcpy(&g_slot[idx].q, &g_fq, sizeof g_fq);
         g_slot[idx].ref_seq = g_frame_ref_seq;   // 该槽只退休自己这一帧的引用
+        if (g_frame_ref_seq) g_frame_ref_refresh = 1;
+        g_frame_ref_seq = 0;                     // 序号所有权已移交槽位；下一帧要用时重新懒分配
         g_slot[idx].pin_n = g_pin_n;
         g_slot[idx].parity = g_arena_parity & 1;
         g_slot[idx].frame_id = g_frame_id;
@@ -4171,6 +4227,7 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
     for (int i = 0; i < g_fq.nsamp; i++) vkDestroySampler(d->device, g_fq.samps[i], NULL);
     for (int i = 0; i < g_fq.npool; i++) vkDestroyDescriptorPool(d->device, g_fq.pools[i], NULL);
     for (int i = 0; i < g_fq.nfb; i++) vkDestroyFramebuffer(d->device, g_fq.fbs[i], NULL);
+    for (int i = 0; i < g_fq.nclear; i++) { vkDestroyFramebuffer(d->device, g_fq.clear_fbs[i], NULL); vkDestroyImageView(d->device, g_fq.clear_views[i], NULL); }
     for (int i = 0; i < g_fq.npass; i++) vkDestroyRenderPass(d->device, g_fq.passes[i], NULL);
     // 到这里本周期所有提交都已有完成证明（fence 已等到）；快照池的“最后已退休帧号”已在上面的完成点推进。
     for (int i = 0; i < g_fq.nfbimg; i++) {
@@ -4219,6 +4276,12 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
     fd_pass_reason_tick();   // 同步 flush 的帧完成点：与延迟 present 用同一个 16 帧窗口
     g_frame_id++;    // 下一批时间戳归属新帧；本帧的待写项已在上面的 resolve 结算
     if (frame_end) g_arena_parity ^= 1;   // 下一帧用另一套 arena/池（延迟 present 时旧一套还在 GPU 上）
+    // 本帧全部在途已有完成证明：池后备引用随本帧序号退休（延迟路径由槽退休做同一动作），
+    // pending_fq 只结算这次同步 flush 所属的帧；其他延迟槽各自退休。
+    s2a_poolahb_complete_seq(g_frame_ref_seq);
+    if (g_frame_ref_seq) g_frame_ref_refresh = 1;
+    g_frame_ref_seq = 0;
+    if (s2a_record_fq_retire) s2a_record_fq_retire(g_frame_id - 1);
     fd_fq_reset();
     g_fq.state = FD_FQ_COMPLETED;
     return 0;
@@ -4424,6 +4487,12 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
         if (c->buf) vkDestroyBuffer(d->device, c->buf, NULL);
         if (c->mem) fd_devmem_release_dev(d->device, c->mem);
     }
+    // 此入口仅在 device idle 已证后调用。清理可能在终态队列中保留的临时 clear 对象；
+    // 失败/超时且 idle 未证时 session 不会到这里。
+    for (int i = 0; i < g_fq.nclear; i++) {
+        vkDestroyFramebuffer(d->device, g_fq.clear_fbs[i], NULL);
+        vkDestroyImageView(d->device, g_fq.clear_views[i], NULL);
+    }
     memset(&g_op, 0, sizeof g_op);   // 旧设备的 pass/cmd 随设备回收，不再调用 vkDestroy*
     memset(&g_fq, 0, sizeof g_fq);
     g_fq_fence_dev = VK_NULL_HANDLE;
@@ -4442,7 +4511,13 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
     memset(g_pipe_cache, 0, sizeof g_pipe_cache);
     fd_pipe_index_reset();
     g_pipe_clock = 0;
-    g_pin_n = 0;   // 旧设备的纹理随设备回收；不要再 unpin
+#if defined(__APPLE__)
+    extern int s2a_vk_clear_fv_enabled(void) __attribute__((weak_import));
+#else
+    extern int s2a_vk_clear_fv_enabled(void) __attribute__((weak));
+#endif
+    if (s2a_vk_clear_fv_enabled && s2a_vk_clear_fv_enabled()) fd_unpin_all();
+    else g_pin_n = 0;   // 门关保留原有收尾
     // 采样器与程序对象归旧设备；设备销毁前先释放采样器，再清账本。
     if (g_samp_cache_ready) { nvn_vk_sampler_cache_destroy(&g_samp_cache); g_samp_cache_ready = 0; }
     for (int i = 0; i < FD_PROG_OBJ; i++)
@@ -4450,6 +4525,8 @@ void nvn_vk_first_draw_release_device(struct s2a_vk_device *d) {
     memset(g_prog_obj, 0, sizeof g_prog_obj);
     atomic_store(&g_prog_owned_bytes, 0);
     g_frame_seq = 0;
+    g_frame_ref_seq = 0;  // 旧设备引用随设备退出，不把旧序号带入新会话。
+    g_frame_ref_refresh = 0;
     g_frame_id = 1;
     g_pipeline_cache = VK_NULL_HANDLE;
     g_arena_chunk_n = 0;
@@ -5674,6 +5751,13 @@ static void fd_preheat_tick(struct s2a_vk_device *d) {
     fd_preheat_one(d);
 }
 
+// 每笔 draw 消费的池保活归本批序号；统计与序号维护共用入口。
+static void fd_draw_begin_refs(void) {
+    int first = atomic_fetch_add_explicit(&g_draws_this_frame, 1, memory_order_relaxed) == 0;
+    // 只在帧首或旧序号被移交后申请；池关闭时不在每笔 draw 重复取池锁。
+    if (first || g_frame_ref_refresh) (void)nvn_vk_first_draw_submit_seq();
+}
+
 int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_state *state,
                       const uint8_t *program, size_t program_bytes, const uint8_t program_sha[32],
                       const uint8_t program_input_sha[32],
@@ -5690,8 +5774,7 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
     const int64_t t_tail_entry = fd_tail_stamp();
     atomic_fetch_add_explicit(&g_draws_since_report, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_draws_total, 1, memory_order_relaxed);
-    if (atomic_fetch_add_explicit(&g_draws_this_frame, 1, memory_order_relaxed) == 0)
-        g_frame_ref_seq = s2a_poolahb_begin_seq();   // 本帧所有保活记在这个单调序号下
+    fd_draw_begin_refs();
     fd_samp_cache_ensure(d);
     fd_lookup_ensure();
     if (fd_perf_timing_enabled()) {

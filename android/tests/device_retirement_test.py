@@ -46,6 +46,7 @@ create = function(session, "int nvn_vk_session_create(")
 # 没有这一步；用检测结果决定是否给夹具加这条 seam 的断言。
 has_read_texels_release = "nvn_vk_session_read_texels_release(s);" in destroy
 has_pso_cache_release = "nvn_vk_compute_pso_cache_release(&s->device);" in destroy + create
+has_clear_fv_release = "s2a_vk_clear_fv_release_device(&s->device);" in destroy
 new_session = function(source("android/native/nvn/mtl_vk_adapter.c"), "void s2a_vk_adapter_new_session(")
 provider_source = source("android/native/direct/provider_vk.c")
 # The metadata observer wraps, but does not alter, this retirement body. Its
@@ -75,7 +76,8 @@ static void vkDestroyInstance(uintptr_t d,void*a){(void)d;(void)a;}
 static int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
 static int nvn_vk_swapchain_destroy(int*s){(void)s;if(swap_error)return -1;children_destroyed++;return 0;}
 static void nvn_vk_pipeline_destroy(int*s){(void)s;children_destroyed++;}
-static void nvn_vk_texcache_destroy(int*s){(void)s;children_destroyed++;}
+static int texcache_destroyed;
+static void nvn_vk_texcache_destroy(int*s){(void)s;children_destroyed++;texcache_destroyed++;}
 static void nvn_vk_sampler_cache_destroy(int*s){(void)s;children_destroyed++;}
 static int s2a_record_release_retained(struct s2a_vk_device*d,uint64_t t,uint32_t*l){(void)d;(void)t;release_calls++;if(idle_proven && !sticky && t>0)left=0;*l=left;return release_error;}
 static int s2a_vk_clear_release_retained(struct s2a_vk_device*d,uint64_t t,uint32_t*l){(void)d;(void)t;*l=clear_left;return 0;}
@@ -121,6 +123,14 @@ void nvn_vk_compute_pso_cache_release(struct s2a_vk_device *d){(void)d;
  pso_release_calls++;
  pso_release_before_destroy = device_destroyed == 0;}
 
+#ifdef HAVE_CLEAR_FV_RELEASE
+// 缓存引用纹理底图，必须在设备空闲后、纹理缓存和设备销毁前释放。
+static int clear_fv_release_calls, clear_fv_release_ordered;
+void s2a_vk_clear_fv_release_device(struct s2a_vk_device *d){(void)d;
+ clear_fv_release_calls++;
+ clear_fv_release_ordered = idle_proven && texcache_destroyed == 0 && device_destroyed == 0;}
+#endif
+
 '''
 main=r'''
 int main(int argc,char**argv){
@@ -150,7 +160,11 @@ int main(int argc,char**argv){
  if(!strcmp(argv[1],"session-error")){
   idle_rc=VK_ERROR_OUT_OF_HOST_MEMORY;int r=nvn_vk_session_destroy(&s);
   printf("rc=%d ready=%d device=%lu destroys=%d children=%d left=%d\n",r,s.ready,(unsigned long)s.device.device,device_destroyed,children_destroyed,left);
-  return !(r==-1&&s.ready==1&&s.device.device==2&&device_destroyed==0&&children_destroyed==0&&wait_called==1);
+  return !(r==-1&&s.ready==1&&s.device.device==2&&device_destroyed==0&&children_destroyed==0&&wait_called==1
+#ifdef HAVE_CLEAR_FV_RELEASE
+   &&clear_fv_release_calls==0
+#endif
+   );
  }
  if(!strcmp(argv[1],"session-success")){
   idle_rc=VK_SUCCESS;int r=nvn_vk_session_destroy(&s);
@@ -161,6 +175,9 @@ int main(int argc,char**argv){
 #endif
 #ifdef HAVE_PSO_CACHE_RELEASE
    &&pso_release_calls==1&&pso_release_before_destroy
+#endif
+#ifdef HAVE_CLEAR_FV_RELEASE
+   &&clear_fv_release_calls==1&&clear_fv_release_ordered
 #endif
    );
  }
@@ -202,6 +219,9 @@ int main(int argc,char**argv){
 #ifdef HAVE_PSO_CACHE_RELEASE
    &&pso_release_calls==1&&pso_release_before_destroy
 #endif
+#ifdef HAVE_CLEAR_FV_RELEASE
+   &&clear_fv_release_calls==1&&clear_fv_release_ordered
+#endif
    );
  }
  if(!strcmp(argv[1],"fresh-create")){
@@ -225,7 +245,8 @@ with tempfile.TemporaryDirectory(prefix="s2a-retirement-") as tmp:
     # -DHAVE_READ_TEXELS_RELEASE / -DHAVE_PSO_CACHE_RELEASE：新收尾调用的顺序断言开关；
     # macOS 弱引用放行由 host_link 按目标文件实算
     define = (["-DHAVE_READ_TEXELS_RELEASE"] if has_read_texels_release else []) + \
-             (["-DHAVE_PSO_CACHE_RELEASE"] if has_pso_cache_release else [])
+             (["-DHAVE_PSO_CACHE_RELEASE"] if has_pso_cache_release else []) + \
+             (["-DHAVE_CLEAR_FV_RELEASE"] if has_clear_fv_release else [])
     host_link.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", *define, str(c)] + ["-o", str(exe)], check=True)
     failed = 0
     for case in cases:

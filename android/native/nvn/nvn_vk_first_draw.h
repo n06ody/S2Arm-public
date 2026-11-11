@@ -43,6 +43,10 @@ enum s2a_fq_enqueue_result {
     S2A_FQ_ENQUEUE_FAILED_OWNED = 1,
 };
 int nvn_vk_first_draw_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd);
+// 接手时原子登记底图 pin；临时 framebuffer/view 同归队列，完成证据后销毁。
+int nvn_vk_first_draw_enqueue_clear(struct s2a_vk_device *d, VkCommandBuffer cmd,
+                                    void *native_tex, VkImage image, uint64_t generation,
+                                    VkFramebuffer fb, VkImageView view, int temporary);
 // pass 边界（记录回放在附件变化/非绘制 GPU 操作前调用）：关闭当前 open pass；sync != 0 时
 // 还把已录制但尚未提交的前缀按队列顺序交出去并等完成，之后的 GPU 操作才有顺序保证。
 // 返回 0 = 边界已落地（sync 时有完成证明）；非 0 = 没有完成证明（帧队列进入终态并保留在途资源），
@@ -124,6 +128,11 @@ int nvn_vk_first_draw_retire_all(void);
 // 当前录制帧的序号（从 1 开始，每帧/每次完整 flush 递增）：时间戳待写项按它归属到帧，
 // 退休只结算已拿到完成证明的帧。
 uint64_t nvn_vk_first_draw_frame_id(void);
+// 本帧池后备保活序号（懒分配）：池 lookup 登记在途引用前先调，保证拿到的是本帧自己的
+// 序号而不是上一帧已移交槽位的序号；dispatch 早于首笔 draw 时也必须有效。
+uint64_t nvn_vk_first_draw_submit_seq(void);
+// 将当前帧的池保活序号移交给未入队命令；调用方负责在真实完成后退休。
+uint64_t nvn_vk_first_draw_detach_submit_seq(void);
 // OP_REPORT_COUNTER(TIMESTAMP_TOP)：把 reset + TOP_OF_PIPE 时间戳录进当前帧队列的命令缓冲，
 // 不 submit、不等 fence；地址与槽位的写回由 nvn_vk_query.c 在帧完成点统一处理。
 int nvn_vk_first_draw_timestamp_top(struct s2a_vk_device *d, VkQueryPool pool, uint32_t slot,

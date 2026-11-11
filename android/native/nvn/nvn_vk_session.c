@@ -280,6 +280,7 @@ int nvn_vk_session_destroy_with_callback(struct nvn_vk_session *s, void (*releas
         s->has_window = 0;
     }
     if (release) release(&s->device);
+    s2a_vk_clear_fv_release_device(&s->device);
     nvn_vk_pipeline_destroy(&s->pipelines);
     nvn_vk_texcache_destroy(&s->textures);
     nvn_vk_sampler_cache_destroy(&s->samplers);

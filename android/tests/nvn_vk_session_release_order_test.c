@@ -5,7 +5,7 @@ int nvn_vk_session_destroy_with_callback(struct nvn_vk_session *s, void (*releas
 #include <string.h>
 static int idle_rc, settle_failure, swap_rc, calls, events[32], n;
 static struct s2a_vk_device *expected_device;
-enum { RECORD=1,CLEAR,TEX,IDLE,SWAP,FIRST,PIPE,TEX_DESTROY,SAMPLER,DEVICE };
+enum { RECORD=1,CLEAR,TEX,IDLE,SWAP,FIRST,CLEAR_FV,PIPE,TEX_DESTROY,SAMPLER,DEVICE };
 static void event(int x) { events[n++]=x; }
 int s2a_record_release_retained(struct s2a_vk_device*d,uint64_t t,uint32_t*l) {(void)d;(void)t; event(RECORD); *l=settle_failure && ++calls==2 ? 1:0; return 0;}
 int s2a_vk_clear_release_retained(struct s2a_vk_device*d,uint64_t t,uint32_t*l) {(void)d;(void)t;event(CLEAR);*l=0;return 0;}
@@ -13,6 +13,7 @@ int nvn_vk_texcache_release_retained(struct s2a_vk_device*d,uint64_t t,uint32_t*
 int s2a_vk_device_wait_idle(struct s2a_vk_device*d){(void)d;event(IDLE);return idle_rc;}
 int nvn_vk_swapchain_destroy(struct nvn_vk_swapchain*s){(void)s;event(SWAP);return swap_rc;}
 void nvn_vk_first_draw_release_device(struct s2a_vk_device *d){assert(d==expected_device);event(FIRST);}
+void s2a_vk_clear_fv_release_device(struct s2a_vk_device *d){assert(d==expected_device);event(CLEAR_FV);}
 void nvn_vk_pipeline_destroy(struct nvn_vk_pipeline_cache*c){(void)c;event(PIPE);}
 void nvn_vk_texcache_destroy(struct nvn_vk_texcache*c){(void)c;event(TEX_DESTROY);}
 void nvn_vk_sampler_cache_destroy(struct nvn_vk_sampler_cache*c){(void)c;event(SAMPLER);}
@@ -28,7 +29,7 @@ static void test(int mode) {
  struct nvn_vk_session s={0}; s.ready=1; s.has_window=1;
  expected_device=&s.device; n=calls=0; idle_rc=mode==1 ? VK_ERROR_DEVICE_LOST : VK_SUCCESS; settle_failure=mode==2; swap_rc=mode==3 ? -1 : 0;
  int rc=nvn_vk_session_destroy_with_callback(&s, nvn_vk_first_draw_release_device);
- if(mode) { assert(rc!=0); assert(s.ready); assert(pos(FIRST)<0 && pos(PIPE)<0 && pos(TEX_DESTROY)<0 && pos(SAMPLER)<0 && pos(DEVICE)<0); }
- else { assert(rc==0 && !s.ready); assert(pos(SWAP)>=0 && pos(FIRST)>pos(SWAP) && pos(DEVICE)>pos(FIRST)); }
+ if(mode) { assert(rc!=0); assert(s.ready); assert(pos(FIRST)<0 && pos(CLEAR_FV)<0 && pos(PIPE)<0 && pos(TEX_DESTROY)<0 && pos(SAMPLER)<0 && pos(DEVICE)<0); }
+ else { assert(rc==0 && !s.ready); assert(pos(SWAP)>=0 && pos(FIRST)>pos(SWAP) && pos(CLEAR_FV)>pos(FIRST) && pos(TEX_DESTROY)>pos(CLEAR_FV) && pos(DEVICE)>pos(TEX_DESTROY)); }
 }
 int main(void){for(int i=1;i<4;i++) test(i); puts("failure retention passed"); fflush(stdout); test(0); puts("session release ordering passed"); return 0;}

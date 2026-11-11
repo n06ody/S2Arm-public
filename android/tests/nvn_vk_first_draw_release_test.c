@@ -5,6 +5,18 @@
 static int destroyed[64], order[64], serial, writes, cache_gets, unmaps, unmap_order;
 #define H(T,n) ((T)(uintptr_t)(n))
 static void seen(uintptr_t h) { assert(h < 64 && h); destroyed[h]++; order[h]=++serial; }
+static int clear_fv_on, texture_unpins, view_unpins;
+static struct nvn_vk_tex *expected_pin;
+int s2a_vk_clear_fv_enabled(void) { return clear_fv_on; }
+uint64_t s2a_vk_adapter_registry_generation(void) { return 1; }
+void nvn_vk_texcache_unpin(struct nvn_vk_tex *t) {
+    assert(t == expected_pin && view_unpins == 1 && destroyed[21] == 1 && destroyed[22] == 1);
+    texture_unpins++;
+}
+void nvn_vk_texcache_unpin_view(struct nvn_vk_tex *t, VkImageView v) {
+    assert(t == expected_pin && v == H(VkImageView,23));
+    view_unpins++;
+}
 VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice d,VkPipeline h,const VkAllocationCallbacks*a){(void)d;(void)a;seen((uintptr_t)h);}
 VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice d,VkPipelineCache h,const VkAllocationCallbacks*a){(void)d;(void)a;seen((uintptr_t)h);}
 VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice d,VkShaderModule h,const VkAllocationCallbacks*a){(void)d;(void)a;seen((uintptr_t)h);}
@@ -149,4 +161,18 @@ static void gpu_ts_cap_test(void) {
     assert(fd_gpu_ts_capable(&dev) == 0);
     g_gpu_ts_cap = -1; g_gpu_valid_bits = 0;
 }
-int main(int argc, char **argv){ assert(argc == 3); scenario(atoi(argv[1]), atoi(argv[2])); gpu_ts_cap_test(); puts("release lifecycle passed"); }
+static void clear_fv_release_test(void) {
+    struct s2a_vk_device dev = {.device=H(VkDevice,1)};
+    struct nvn_vk_tex texture = {0};
+    expected_pin = &texture;
+    clear_fv_on = 1;
+    g_pin_n = 1; g_pin[0] = &texture; g_pin_view[0] = H(VkImageView,23);
+    g_fq.nclear = 1; g_fq.clear_fbs[0] = H(VkFramebuffer,21); g_fq.clear_views[0] = H(VkImageView,22);
+    nvn_vk_first_draw_release_device(&dev);
+    assert(destroyed[21] == 1 && destroyed[22] == 1 && order[21] < order[22]);
+    assert(view_unpins == 1 && texture_unpins == 1 && g_pin_n == 0 && g_fq.nclear == 0);
+    nvn_vk_first_draw_release_device(&dev);
+    assert(destroyed[21] == 1 && destroyed[22] == 1 && view_unpins == 1 && texture_unpins == 1);
+    clear_fv_on = 0;
+}
+int main(int argc, char **argv){ assert(argc == 3); scenario(atoi(argv[1]), atoi(argv[2])); gpu_ts_cap_test(); clear_fv_release_test(); puts("release lifecycle passed"); }
