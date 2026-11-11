@@ -134,6 +134,33 @@ class DirectPackTest(unittest.TestCase):
         self.assertNotIn('extensions', artifact)
         self.assertFalse((self.out / pack.GRAPHICS_MANIFEST).exists())
 
+    def test_android_skip_apple_preserves_vulkan_libpack(self):
+        root = self.root / 'shaders' / 'direct'
+        vk = root / 'b-0123456789ab-vk'
+        vk2 = root / 'b-fedcba987654-vk'
+        apple = root / 'b-0123456789ab'
+        other = root / 'b-0123456789ab-vk-extra'
+        for directory in (vk, vk2, apple, other):
+            directory.mkdir(parents=True)
+            (directory / 'lib.idx').write_bytes(directory.name.encode())
+        (vk / 'lib.000.pak').write_bytes(b'vulkan fixture')
+        (root / 'b-aaa-vk').write_bytes(b'not a directory')
+        legacy = self.root / 'shaders/vulkan/direct'
+        legacy.mkdir(parents=True)
+        (legacy / 'graphics.v1.json').write_bytes(b'legacy fixture')
+        with patch.dict(os.environ, {'S2A_ANDROID_SKIP_APPLE_ARTIFACTS': '1'}):
+            self.build()
+        self.assertEqual((self.out / 'shaders/direct/b-0123456789ab-vk/lib.idx').read_bytes(), vk.name.encode())
+        self.assertEqual((self.out / 'shaders/direct/b-0123456789ab-vk/lib.000.pak').read_bytes(), b'vulkan fixture')
+        self.assertEqual((self.out / 'shaders/direct/b-fedcba987654-vk/lib.idx').read_bytes(), vk2.name.encode())
+        self.assertEqual((self.out / 'shaders/vulkan/direct/graphics.v1.json').read_bytes(), b'legacy fixture')
+        self.assertFalse((self.out / 'shaders/direct/b-0123456789ab').exists())
+        self.assertFalse((self.out / 'shaders/direct/b-0123456789ab-vk-extra').exists())
+        self.assertFalse((self.out / 'shaders/direct/b-aaa-vk').exists())
+        index = (self.out / 'index.tsv').read_text()
+        self.assertIn('shaders/direct/b-0123456789ab-vk/lib.idx\t', index)
+        self.assertIn('shaders/direct/b-0123456789ab-vk/lib.000.pak\t', index)
+
     def test_direct_pack_declares_feature_and_packs_descriptor(self):
         path = self.write_descriptor()
         self.build(path)

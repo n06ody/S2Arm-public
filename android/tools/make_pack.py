@@ -258,9 +258,12 @@ def entries_from_root(root, staging, sysdata=None, direct_vulkan=False):
     shaders = os.path.join(root, 'shaders')
     if os.path.isdir(shaders):
         if os.environ.get('S2A_ANDROID_SKIP_APPLE_ARTIFACTS') == '1':
-            # Preserve the Android direct offline library only; do not bundle Metal outputs.
+            # Preserve both Android Vulkan offline-library layouts, without Metal outputs.
             direct = os.path.join(shaders, 'vulkan', 'direct')
             if os.path.isdir(direct): out.append(('shaders/vulkan/direct', direct))
+            for library in sorted((Path(shaders) / 'direct').glob('b-*-vk')):
+                if library.is_dir():
+                    out.append((f'shaders/direct/{library.name}', str(library)))
         else:
             out += [(f'shaders/{n}', os.path.join(shaders, n)) for n in sorted(os.listdir(shaders)) if n != 'work']
     rewrite(os.path.join(root, 'exefs'), staging)
