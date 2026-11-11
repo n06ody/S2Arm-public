@@ -25,7 +25,7 @@
     等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
     stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
@@ -41,7 +41,7 @@ FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge
           "dock_powered", "plugged", "interactive", "power_save", "thermal_status")
 
 FAKE_ADB = '''#!/usr/bin/env python3
-import hashlib, io, json, os, re, shlex, sys, tarfile, time
+import hashlib, io, json, os, re, shlex, subprocess, sys, tarfile, time
 state_path, argv = sys.argv[1], sys.argv[2:]
 if argv and argv[0] == "-s":
     argv = argv[2:]
@@ -239,10 +239,15 @@ def run_as(cmdline, via_shell=False):
             # xargs 无 -r 空输入仍跑一次：sha256sum 空参读 stdin 出幻影行
             lines += ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -"]
         out("\\n".join(lines) + ("\\n" if lines else ""))
-        out(f"S2A_N={n_str} S2A_CRC={crc}\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
+        out(f"S2A_CRC={crc}\\nS2A_N={n_str} S2A_WRC=0\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
         for l_ in err_lines: out(f"S2A_ERR: {l_}\\n")
         return
-    m = _re.match(r"^cd (\\S+) && \\{ set -o pipefail; exec 3>&1; err=", cmdline)
+    if "S2A_FRC=" in cmdline and "S2A_N=" in cmdline:
+        # 先按真实 shell 解析完整命令，不能只靠字符串形状把语法错误模拟成成功。
+        syntax = subprocess.run(["/bin/sh", "-n", "-c", cmdline], capture_output=True)
+        if syntax.returncode:
+            fail("sh: syntax error: unmatched '{'")  # 9000 原始 stderr
+    m = _re.match(r"^cd (\\S+) \\|\\| exit 1; exec 3>&1; err=", cmdline)
     if m:
         dir_ = m.group(1)
         if "find . -type f -print0" in cmdline:
@@ -351,7 +356,7 @@ def shell_data_cmd(text):
     探针按 "echo ok" 圈 _dir_probe 形（__denied__/ls 残留探针不接管）。"""
     if re.match(r"^e=\\$\\(stat ", text):
         return "echo ok" in text
-    m = re.match(r"^cd (\\S+) && ", text) or \
+    m = re.match(r"^cd (\\S+) (?:&& |\\|\\| exit 1; )", text) or \
         re.match(r"^tar -xpf \\S+ -C (\\S+)$", text) or \
         re.match(r"^(?:mkdir -p \\S+; )?find (\\S+) -mindepth 1 -delete$", text)
     return bool(m) and m.group(1).rstrip("/") in DATA_DIRS
@@ -1215,6 +1220,56 @@ class RunGameTest(unittest.TestCase):
         self.assertNotEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("清单未证", man["reason"])
+
+    def test_checkpoint_listing_real_shell_syntax(self):
+        # 9000 的原始 stderr：sh: syntax error: unmatched '{'；验证完整生成命令。
+        cmd = run_game._listing_cmd("/data/data/test/files/saves", "find . -type f -print0",
+                                    "xargs -0 -n 256 sha256sum", "find . -type f")
+        shells = [shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", shutil.which("mksh"))
+                  if shell and Path(shell).is_file()]
+        self.assertTrue(shells)
+        for shell in shells:
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, "-n", "-c", cmd], capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, f"{shell}: {result.stderr}; 9000: sh: syntax error: unmatched '{{'")
+        # 负控：重现多余右花括号，真实 shell 必须拒绝。
+        neg = subprocess.run([shells[0], "-n", "-c", cmd + "; }"], capture_output=True)
+        self.assertNotEqual(0, neg.returncode)
+
+    def test_checkpoint_listing_real_shell_status_and_empty(self):
+        directory = self.tmp / "real directory"
+        directory.mkdir()
+        for shell in ("/bin/sh", "/bin/dash"):
+            if not Path(shell).is_file():
+                continue
+            def execute(find_, xargs_, count_, environment=None):
+                cmd = run_game._listing_cmd(str(directory), find_, xargs_, count_)
+                r = subprocess.run([shell, "-c", cmd], capture_output=True, text=True, env=environment)
+                self.assertEqual(0, r.returncode, r.stderr)
+                return r.stdout
+            empty = execute("find . -type f -print0", "sh -c 'echo forbidden >&2; exit 23'", "find . -type f")
+            self.assertEqual(("", 0), run_game._listing_parts(empty, "empty"))
+            (directory / "one file").write_text("ok")
+            good = execute("find . -type f -print0", "xargs -0 -n 256 sha256sum", "find . -type f")
+            lines, n = run_game._listing_parts(good, "good")
+            self.assertEqual(1, n)
+            self.assertIn(hashlib.sha256(b"ok").hexdigest(), lines)
+            for find_, xargs_, count_ in (("false", "xargs -0 -n 256 sha256sum", "find . -type f"),
+                                          ("find . -type f -print0", "sh -c 'exit 23'", "find . -type f"),
+                                          ("find . -type f -print0", "xargs -0 -n 256 sha256sum", "false"),
+                                          ("find . -type f -print0", "sh -c 'cat >/dev/null; echo fault >&2'", "find . -type f")):
+                with self.assertRaisesRegex(RuntimeError, "清单未证"):
+                    run_game._listing_parts(execute(find_, xargs_, count_), "fault")
+            fake_bin = self.tmp / ("wc-" + Path(shell).name)
+            fake_bin.mkdir()
+            fake_wc = fake_bin / "wc"
+            fake_wc.write_text("#!/bin/sh\nprintf '0\\n'\nexit 17\n")
+            fake_wc.chmod(0o755)
+            fake_env = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
+            with self.assertRaisesRegex(RuntimeError, "清单未证"):
+                run_game._listing_parts(execute("find . -type f -print0", "xargs -0 -n 256 sha256sum",
+                                                "find . -type f", fake_env), "wc failure")
+            (directory / "one file").unlink()
 
     def test_listing_find_fail_and_stderr_refuses(self):
         """㊾ find 中途被拒：出一行就挂 + Permission denied + find rc=1——
