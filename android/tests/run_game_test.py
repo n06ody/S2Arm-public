@@ -9,7 +9,7 @@
   ⑤ --mode direct：launch 行带 --es s2arm.graphics_mode direct
   ⑥ SIGTERM：采集中途被 TERM → finally 照常收局还原（卸载），不留置
   ⑦ 调试属性恢复读回不符 → 留置；游戏收局后仍存活 → 留置；卸载后 data/obb 有残留 → 留置
-  ⑧ 能耗：放电状态/符号/覆盖按 android_power 口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
+  ⑧ 能耗：放电状态/符号/覆盖按 run_game 功耗段口径——合法放电 →「未证」（不套 iPhone 门槛假绿），
     接电 / 未知 / 符号不一致 / 窗口不齐 →「没数据」
   ⑨ 已装 debuggable 包：run-as tar 全量备份私有/外部数据（文件 sha/软链/空目录/权限清单）
     → 收局装回原包再逐项核还原；非 debuggable 已装 → 拒跑（--allow-data-loss 才放行）
@@ -25,7 +25,7 @@
     等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
     stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, re, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -74,14 +74,28 @@ DATA_LINKS = st.setdefault("data_links", {})        # dir -> {relpath: 软链目
 DATA_SUBDIRS = st.setdefault("data_subdirs", {})    # dir -> [relpath,...] 显式目录（含空目录）
 DATA_MODES = st.setdefault("data_modes", {})        # dir -> {relpath: 八进制串} 权限覆盖
 DATA_DENIED = st.setdefault("data_denied", {})      # dir -> True：存在但 run-as 进不去
+DATA_PAD = st.setdefault("data_pad", {})            # dir -> {relpath: 字节数} 合成大文件
+                                                    #（全零填充：tar 备份按声明长度真流出来，
+                                                    #  测宿主是否整流驻内存；清单/sha 按合成算）
+DEV_TMP = st.setdefault("dev_tmp", {})              # 树外凭据 /data/local/tmp/s2a-tar-*-{err,rc}
+                                                    #（exec-out 混流后设备侧 stderr/rc 的取证通道）
+
+def zeros_sha(n):
+    # sha256(N 个零字节)：分块算不整驻内存（替身侧也守同一规矩）
+    h = hashlib.sha256()
+    blk = b"\\0" * (1 << 20)
+    for off in range(0, n, len(blk)):
+        h.update(blk[:min(len(blk), n - off)])
+    return h.hexdigest()
 
 
 def dir_entries(dir_):
     """目录全量成员：文件 + 显式目录 + 文件/软链隐含的父目录 + 软链。"""
     files = DATA_DIRS.get(dir_, {})
     links = DATA_LINKS.get(dir_, {})
+    pads = DATA_PAD.get(dir_, {})
     dirs = set(DATA_SUBDIRS.get(dir_, []))
-    for rel in list(files) + list(links):
+    for rel in list(files) + list(links) + list(pads):
         parts = rel.split("/")[:-1]
         for i in range(1, len(parts) + 1):
             dirs.add("/".join(parts[:i]))
@@ -90,7 +104,14 @@ def dir_entries(dir_):
     for rel in dirs:
         out_e[rel] = (modes.get(rel, "775"), "directory")
     for rel in files:
-        out_e[rel] = (modes.get(rel, "664"), "regular file")
+        # toybox stat %F 真口径：0 字节出 "regular empty file"（8E 实测）；
+        # dev_stat_types 旋钮可把某路径报成 fifo/socket 等非普通类型（负对照）
+        ftype = "regular empty file" if not files[rel] else "regular file"
+        ftype = st.get("dev_stat_types", {}).get(dir_, {}).get(rel, ftype)
+        out_e[rel] = (modes.get(rel, "664"), ftype)
+    for rel in pads:
+        ftype = st.get("dev_stat_types", {}).get(dir_, {}).get(rel, "regular file")
+        out_e[rel] = (modes.get(rel, "664"), ftype)
     for rel in links:
         out_e[rel] = (modes.get(rel, "777"), "symbolic link")
     return out_e
@@ -121,17 +142,28 @@ def file_sha(b):
     return hashlib.sha256(b).hexdigest()
 
 def sha_listing(dir_):
-    # find . -type f -exec sha256sum {} + 的输出口径
+    # find . -type f 的输出口径：只收普通文件——dev_stat_types 报成
+    # fifo/socket 的不出（真机 -type f 同口径）
+    types = st.get("dev_stat_types", {}).get(dir_, {})
     lines = []
     for rel, hx in sorted(DATA_DIRS.get(dir_, {}).items()):
-        lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
+        if types.get(rel, "regular file").startswith("regular"):
+            lines.append(f"{file_sha(bytes.fromhex(hx))}  ./{rel}")
+    for rel, n in sorted(DATA_PAD.get(dir_, {}).items()):
+        if types.get(rel, "regular file").startswith("regular"):
+            lines.append(f"{zeros_sha(n)}  ./{rel}")
     return "\\n".join(lines) + ("\\n" if lines else "")
 
-def run_as(cmdline):
-    # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录（shell 与 exec-out 两路进来）
+def run_as(cmdline, via_shell=False):
+    # run-as <pkg> sh -c '<cmdline>'：应用 uid 访问自己的数据目录；
+    # via_shell=True = 同一组命令但走 shell 通道（外部数据目录：9000 实测
+    # run-as 摸 /sdcard/Android/* 被 SELinux 拒，shell 有外部存储全权）
     import re as _re, fnmatch as _fm
-    if not st.get("apk_debuggable", True):
-        fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
+    if not via_shell:
+        if not st.get("apk_debuggable", True):
+            fail("run-as: package not debuggable")    # 已装包非 debuggable：run-as 直接拒
+        if st.get("run_as_ext_denied") and "/sdcard/" in cmdline:
+            fail("run-as: " + cmdline + ": Permission denied")   # 9000 SELinux 拒
     m = _re.match(r"^find (\\S+) -type f -name '([\\w.*-]+)'$", cmdline)
     if m:
         # 私有证据收集：列 <root> 下 basename 匹配（含子目录 rel 路径）
@@ -196,53 +228,64 @@ def run_as(cmdline):
             out("denied\\n"); return
         out(("ok" if dir_entries(dir_) or dir_ in DATA_DIRS or dir_ in DATA_LINKS
              or dir_ in DATA_SUBDIRS else "absent") + "\\n"); return
-    m = _re.match(r"^cd (\\S+) && find \\. -type f -exec sha256sum \\{\\} \\+$", cmdline)
-    if m:
-        out(sha_listing(m.group(1))); return
-    m = _re.match(r"^cd (\\S+) && find \\. -mindepth 1 -exec stat -c '%a\\|%F\\|%n' \\{\\} \\+$",
-                  cmdline)
-    if m:
-        lines = []
-        for rel, (mode, ftype) in sorted(dir_entries(m.group(1)).items()):
-            lines.append(f"{mode}|{ftype}|./{rel}")
-        out("\\n".join(lines) + ("\\n" if lines else "")); return
-    m = _re.match(r"^cd (\\S+) && find \\. -type l -exec sh -c 'for p do ", cmdline)
-    if m:
-        lines = [f"./{rel}\\t{tgt}" for rel, tgt in sorted(DATA_LINKS.get(m.group(1), {}).items())]
-        out("\\n".join(lines) + ("\\n" if lines else "")); return
-    m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
-    if m:
-        if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
-        for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
-            tab[m.group(2)] = {} if tab is not DATA_SUBDIRS else []
-        save(); return
-    m = _re.match(r"^tar -xpf (\\S+) -C (\\S+)$", cmdline)
-    if m:
-        src = PUSHED.get(m.group(1))
-        if not src: fail("run-as: tar 源没 push 过 " + m.group(1))
-        dir_ = m.group(2)
-        DATA_DIRS.setdefault(dir_, {})
-        DATA_LINKS.setdefault(dir_, {})
-        DATA_SUBDIRS.setdefault(dir_, [])
-        with tarfile.open(src) as tf:
-            for mem in tf.getmembers():
-                rel = mem.name[2:] if mem.name.startswith("./") else mem.name
-                DATA_MODES.setdefault(dir_, {})[rel] = format(mem.mode & 0o7777, "o")
-                if mem.isfile():
-                    blob = tf.extractfile(mem).read()
-                    if st.get("corrupt_restore") and len(DATA_DIRS[dir_]) == 0:
-                        blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
-                    DATA_DIRS[dir_][rel] = blob.hex()
-                elif mem.issym():
-                    DATA_LINKS[dir_][rel] = mem.linkname
-                elif mem.isdir() and rel not in DATA_SUBDIRS[dir_]:
-                    DATA_SUBDIRS[dir_].append(rel)
-        save(); return
-    m = _re.match(r"^tar -cpf - -C (\\S+) \\.$", cmdline)
+    def _emit_batched(dir_, lines, want):
+        # 分批清单收尾凭据：S2A_N/S2A_CRC 计数与计数管道 rc、S2A_FRC find 自报 rc、
+        # S2A_RC 管道 rc、S2A_ERR: 前缀 stderr 行——旋钮逐门复现设备残缺态
+        n = int(st.get("data_listing_short", {}).get(dir_, 0))
+        if n: lines = lines[:-n]              # xargs rc=0 但某批输出丢了 → 条数不符
+        frc = rc = crc = "0"
+        if st.get("data_xargs_fail"):
+            lines, rc = lines[:len(lines) // 2], "126"   # 中途批次挂：半截 + 非零 rc
+        err_lines = list(st.get("data_listing_err", {}).get(dir_, []))
+        fs = st.get("data_find_fail", {}).get(dir_)
+        if fs:
+            # find 中途被拒：pipefail 下管道 rc 传 find rc；masked 变体模拟
+            # 管道 rc 仍是 0（xargs 吞了上游失败）——那时只有 S2A_FRC 一门能逮
+            frc = str(fs.get("rc", 1))
+            if not fs.get("masked"): rc = crc = frc
+            lines = lines[:1]
+            err_lines += [fs.get("err", "find: Permission denied")]
+        mangle = st.get("data_listing_mangle", {}).get(dir_) if st.get("pm_cleared") else None
+        n_str = str(want)
+        if mangle == "empty_n": n_str = ""
+        if mangle == "bad_n": n_str = "abc"
+        if mangle == "bad_mode":
+            lines = [("zzz" + l[l.index("|"):]) if "|" in l else l for l in lines]
+        if st.get("data_xargs_phantom", {}).get(dir_):
+            # xargs 无 -r 空输入仍跑一次：sha256sum 空参读 stdin 出幻影行
+            lines += ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -"]
+        out("\\n".join(lines) + ("\\n" if lines else ""))
+        out(f"S2A_N={n_str} S2A_CRC={crc}\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
+        for l_ in err_lines: out(f"S2A_ERR: {l_}\\n")
+        return
+    m = _re.match(r"^cd (\\S+) && \\{ set -o pipefail; exec 3>&1; err=", cmdline)
     if m:
         dir_ = m.group(1)
+        if "find . -type f -print0" in cmdline:
+            want = sum(1 for ft in (e[1] for e in dir_entries(dir_).values())
+                       if ft.startswith("regular"))
+            _emit_batched(dir_, sha_listing(dir_).splitlines(), want); return
+        if "find . -mindepth 0 -print0" in cmdline:
+            root_mode = st.get("data_root_mode", {}).get(dir_, "775")
+            lines = [f"{root_mode}|directory|."] + [
+                f"{mode}|{ftype}|./{rel}"
+                for rel, (mode, ftype) in sorted(dir_entries(dir_).items())]
+            _emit_batched(dir_, lines, len(dir_entries(dir_)) + 1); return
+        if "find . -type l -print0" in cmdline:
+            lines = [f"./{rel}\\t{tgt}"
+                     for rel, tgt in sorted(DATA_LINKS.get(dir_, {}).items())]
+            _emit_batched(dir_, lines, len(lines)); return
+    m = _re.match(r"^cd (\\S+) && tar -cpf - \\. 2> (\\S+); echo \\$\\? > (\\S+)$", cmdline)
+    if m:
+        dir_, en, rn = m.group(1), m.group(2), m.group(3)
         if dir_ in DATA_DENIED:
-            fail("run-as: tar: " + dir_ + ": Permission denied")
+            # run-as 拒权：归档零字节流出，stderr/rc 落凭据文件由宿主另行取证
+            DEV_TMP[en] = "tar: .: Permission denied\\n"
+            DEV_TMP[rn] = "1\\n"
+            save(); return
+        if st.get("data_stream_hang"):
+            time.sleep(int(st.get("data_stream_hang_s", 30)))   # 流中途挂：宿主超时杀
+            return
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tf:
             # 真机 toybox `tar -cf - -C dir .` 首成员是 ./（8E 实测）——替身同款
@@ -253,9 +296,13 @@ def run_as(cmdline):
                 info = tarfile.TarInfo("./" + rel)
                 info.mode = int(mode, 8)
                 if ftype == "regular file":
-                    blob = bytes.fromhex(DATA_DIRS[dir_][rel])
-                    info.size = len(blob)
-                    tf.addfile(info, io.BytesIO(blob))
+                    if rel in DATA_PAD.get(dir_, {}):
+                        info.size = DATA_PAD[dir_][rel]
+                        tf.addfile(info, io.BytesIO(b"\\0" * info.size))
+                    else:
+                        blob = bytes.fromhex(DATA_DIRS[dir_][rel])
+                        info.size = len(blob)
+                        tf.addfile(info, io.BytesIO(blob))
                 elif ftype == "directory":
                     info.type = tarfile.DIRTYPE
                     tf.addfile(info)
@@ -269,8 +316,61 @@ def run_as(cmdline):
                 info = tarfile.TarInfo("./planted.evil")
                 info.size = len(blob)
                 tf.addfile(info, io.BytesIO(blob))
-        sys.stdout.buffer.write(buf.getvalue()); return
+        # 设备侧 stderr/rc 凭据：exec-out 把 tar stderr 混进 stdout 归档流，
+        # 凭据落 /data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}（被备份树之外）
+        DEV_TMP[en] = st.get("data_tar_err", {}).get(dir_, "")
+        DEV_TMP[rn] = st.get("data_tar_rc", {}).get(dir_, "0") + "\\n"
+        sys.stdout.buffer.write(buf.getvalue()); save(); return
+    m = _re.match(r"^(?:mkdir -p (\\S+); )?find (\\S+) -mindepth 1 -delete$", cmdline)
+    if m:
+        if m.group(1): DATA_DIRS.setdefault(m.group(1), {})
+        for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES, DATA_PAD):
+            tab[m.group(2)] = {} if tab is not DATA_SUBDIRS else []
+        save(); return
+    m = _re.match(r"^mkdir -p (\\S+)$", cmdline)      # 检查点：建存档根（含父链）
+    if m:
+        DATA_DIRS.setdefault(m.group(1), {}); save(); return
+    m = _re.match(r"^tar -xpf (\\S+) -C (\\S+)$", cmdline)
+    if m:
+        src = PUSHED.get(m.group(1))
+        if not src: fail("run-as: tar 源没 push 过 " + m.group(1))
+        dir_ = m.group(2)
+        DATA_DIRS.setdefault(dir_, {})
+        DATA_LINKS.setdefault(dir_, {})
+        DATA_SUBDIRS.setdefault(dir_, [])
+        with tarfile.open(src) as tf:
+            for mem in tf.getmembers():
+                rel = mem.name[2:] if mem.name.startswith("./") else mem.name
+                if rel in ("", "."):  # ./ 根成员：find -mindepth 1 不出它，不登记
+                    continue
+                DATA_MODES.setdefault(dir_, {})[rel] = format(mem.mode & 0o7777, "o")
+                if mem.isfile():
+                    if mem.size >= (1 << 20):
+                        # 大成员按合成档登记（与 data_pad 同口径：不驻 hex）
+                        DATA_PAD.setdefault(dir_, {})[rel] = mem.size
+                        continue
+                    blob = tf.extractfile(mem).read()
+                    if st.get("corrupt_restore") and len(DATA_DIRS[dir_]) == 0:
+                        blob = blob + b"x"    # 还原第一个文件就被改写 → sha 对不上
+                    DATA_DIRS[dir_][rel] = blob.hex()
+                elif mem.issym():
+                    DATA_LINKS[dir_][rel] = mem.linkname
+                elif mem.isdir() and rel not in DATA_SUBDIRS[dir_]:
+                    DATA_SUBDIRS[dir_].append(rel)
+        save(); return
     fail("fake adb: unhandled run-as " + cmdline)
+
+def shell_data_cmd(text):
+    """外部数据目录 shell 通道分流（9000 SELinux 拒 run-as 摸 /sdcard）：
+    命中才接管给 run_as 同组处理器——tar -xpf/find -delete/cd&&find 只认
+    「目标目录已注册进 data_dirs」的（deploy 的 tar/find 落 DEV_FS，不接管）；
+    探针按 "echo ok" 圈 _dir_probe 形（__denied__/ls 残留探针不接管）。"""
+    if re.match(r"^e=\\$\\(stat ", text):
+        return "echo ok" in text
+    m = re.match(r"^cd (\\S+) && ", text) or \
+        re.match(r"^tar -xpf \\S+ -C (\\S+)$", text) or \
+        re.match(r"^(?:mkdir -p \\S+; )?find (\\S+) -mindepth 1 -delete$", text)
+    return bool(m) and m.group(1).rstrip("/") in DATA_DIRS
 
 cmd = argv[0]
 if cmd == "get-state":
@@ -321,6 +421,9 @@ if cmd == "push":
 if cmd == "exec-out":
     if len(argv) > 2 and argv[1] == "run-as":
         run_as(argv[-1]); sys.exit(0)
+    if len(argv) > 3 and argv[1] == "sh" and argv[2] == "-c":
+        # shell 通道 exec-out（外部数据目录 tar 流：不经 run-as）
+        run_as(argv[3], via_shell=True); sys.exit(0)
     sys.stdout.buffer.write(open(st["png"], "rb").read()); sys.exit(0)
 if cmd == "logcat":
     if "-d" in argv:
@@ -338,14 +441,65 @@ if cmd == "shell":
     if sh[:2] == ["sh", "-c"] and len(sh) > 2:
         text = sh[2]; sh = shlex.split(text)
         piped = " | " in text                 # 脚本里裸 | 才是真管道；'|' 词只是参数
+    if shell_data_cmd(text):
+        # 外部数据目录 shell 通道：赶在 c=="tar"/"mkdir" 等按首词分发前接管
+        run_as(text, via_shell=True); sys.exit(0)
+    # 备份 tar 树外凭据（/data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}，qa-fone
+    # #329620/#329632）：预建先证不存在、cat 取证、rm+test 核删——全走 shell 通道
+    m = re.match(r"^\\[ ! -e (\\S+) \\] && \\[ ! -e (\\S+) \\] && : > \\S+ && : > \\S+ "
+                 r"&& chmod 0666 \\S+ \\S+ && test -w \\S+ && test -w \\S+$", text)
+    if m:
+        en, rn = m.group(1), m.group(2)
+        if st.get("data_aux_preexist") or en in DEV_TMP or rn in DEV_TMP:
+            sys.stderr.write("[ ! -e ] : File exists\\n"); save(); sys.exit(1)
+        DEV_TMP[en] = ""; DEV_TMP[rn] = ""; save(); sys.exit(0)
+    m = re.match(r"^cat (/data/local/tmp/s2a-tar-\\S+)$", text)
+    if m:
+        if m.group(1) not in DEV_TMP:
+            fail("cat: " + m.group(1) + ": No such file or directory")
+        out(DEV_TMP[m.group(1)]); sys.exit(0)
+    m = re.match(r"^rm -f (/data/local/tmp/s2a-tar-\\S+) (/data/local/tmp/s2a-tar-\\S+) "
+                 r"&& test ! -e \\S+ && test ! -e \\S+$", text)
+    if m:
+        if st.get("data_tar_aux_left"):
+            sys.stderr.write("test: File exists\\n"); save(); sys.exit(1)  # 删不净
+        DEV_TMP.pop(m.group(1), None); DEV_TMP.pop(m.group(2), None)
+        save(); sys.exit(0)
     c = sh[0] if sh else ""
     if "s2a-power-samples.log" in text and "echo $!" in text:
-        # 采样守护（sh -c 'rm -f 日志; ( while :; do 采样; sleep 1; done ) >日志 & echo $!'）：
+        # 采样守护 spawn（setsid sh -c '循环' >日志 2>&1 </dev/null & echo $!）。
+        # 真 adbd 语义：后台进程只要还有 fd 挂在传输通道上 adb shell 就不退——
+        # stdin </dev/null + stderr 2>&1/2>/dev/null + stdout >日志 三个都得引走，
+        # 缺一个（哪怕守护其实起了、还在写日志）通道就一直开着（8E 实测 15s 超时）。
+        # 三 fd 全引但没有 setsid 也照挂：守护继承控制终端（r25 真串实证）。
+        detached = ("setsid" in text and "</dev/null" in text
+                    and ("2>&1" in text or "2>/dev/null" in text))
+        if not detached or st.get("sampler_spawn_hang"):
+            st["sampler_on"] = True; st["sampler_ticks"] = 0   # 守护其实起了（孤儿在写）
+            DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
+            DEV_FS["/data/local/tmp/s2a-power-samples.log.pid"] = "7777".encode().hex()
+            save()
+            time.sleep(int(st.get("sampler_hang_s", 30))); sys.exit(0)
         # 替身不真跑循环——记 sampler_on，之后每次 cat 日志推进一拍（1s/块）；
         # kill 停、rm 清（adb 掉线不丢采样的替身对应物：块已落在 DEV_FS 里）
         st["sampler_on"] = True; st["sampler_ticks"] = 0
         DEV_FS.pop("/data/local/tmp/s2a-power-samples.log", None)
+        DEV_FS["/data/local/tmp/s2a-power-samples.log.pid"] = "7777".encode().hex()
+        if st.get("sampler_spawn_silent"):
+            # 空回执：守护起了但 adb 回包是空——spawn 未证，宿主侧要按失败扫孤儿
+            save(); sys.exit(0)
         save(); out("7777\\n"); sys.exit(0)
+    if "s2a-power-samples.log" in text and ("pgrep" in text or ".pid" in text) \
+            and "echo $!" not in text:
+        # 孤儿清理（for p in $! $(cat 日志.pid) $(pgrep -f s2a-power-sampler); do kill $p;
+        # done）：守护在 → 杀掉记账（orphan_swept）；日志.pid 一并清。
+        st["orphan_swept"] = st.get("sampler_on", False)
+        DEV_FS.pop("/data/local/tmp/s2a-power-samples.log.pid", None)
+        if st.get("sampler_linger"):
+            # 杀不掉：守护还活着，.pid 照脚本已清，回 LINGER 给宿主退场复验
+            save(); out("LINGER:7777\\n"); sys.exit(0)
+        st["sampler_on"] = False
+        save(); sys.exit(0)
     if "power_supply" in text:
         st["uptime_us"] += 1000000
         st["sampler_ticks"] = st.get("sampler_ticks", 0) + 1
@@ -363,11 +517,19 @@ if cmd == "shell":
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
         key = " ".join(sh[1:])
+        # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
+        # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
+        # getprop_deny_after_set：该属性被 setprop 过之后读一律被拒（setprop 生效、紧接着的读回失败）
+        if (key in st.get("getprop_deny", [])
+                or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None)
+                or (key in st.get("getprop_deny_after_set", []) and key in st.get("props_set_once", []))):
+            sys.stderr.write("getprop: permission denied\\n"); save(); sys.exit(1)
         out(st["props"].get(key, "") + "\\n"); sys.exit(0)
     if c == "setprop":
         # props_jam：写空值的 setprop 被设备静默拒（有的构建不让清 debug 属性）→ 旧值还在
         if st.get("props_jam") and sh[1].startswith("debug.s2a.") and (len(sh) <= 2 or not sh[2]):
             sys.exit(0)
+        st.setdefault("props_set_once", []).append(sh[1])
         st["props"][sh[1]] = sh[2] if len(sh) > 2 else ""; save(); sys.exit(0)
     if c == "pm":
         if len(sh) == 1 or (len(sh) > 1 and sh[1] == "install" and "--help" in sh):
@@ -392,7 +554,7 @@ if cmd == "shell":
                 save(); sys.stderr.write("Failed\\n"); sys.exit(1)
             if st.get("pm_clear_silent"):
                 save(); sys.exit(0)                  # rc=0 但无 Success：照样算失败
-            for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES):
+            for tab in (DATA_DIRS, DATA_LINKS, DATA_SUBDIRS, DATA_MODES, DATA_PAD):
                 for k in list(tab):
                     tab[k] = {} if tab is not DATA_SUBDIRS else []
             save(); out("Success"); sys.exit(0)
@@ -457,6 +619,8 @@ if cmd == "shell":
                     DEV_FS[dir_ + "/" + rel] = blob.hex()
         st["tar_extracted"] = len(DEV_FS); save(); sys.exit(0)
     if c == "rm":
+        if st.get("checkpoint_rm_fail") and any("s2a-checkpoint" in a for a in sh[1:]):
+            sys.stderr.write("rm: Permission denied\\n"); save(); sys.exit(1)
         for p in [a for a in sh[1:] if not a.startswith("-")]:
             for k in list(DEV_FS):
                 if k == p.rstrip("/") or k.startswith(p.rstrip("/") + "/"): del DEV_FS[k]
@@ -476,6 +640,8 @@ if cmd == "shell":
             out("    1 init\\n")
         sys.exit(0)
     if c == "am":
+        if "start" in sh and "s2arm.finish" not in text:
+            st["props_at_launch"] = dict(st["props"])   # 起局那一刻的属性快照（--ab-prop 必须先于游戏出生）
         if "start" in sh:
             if "s2arm.finish" in text:
                 if not st.get("unstoppable"):
@@ -604,6 +770,9 @@ if cmd == "shell":
     if c == "cat" and len(sh) > 1:
         p = sh[1]
         if p == "/data/local/tmp/s2a-power-samples.log" and st.get("sampler_on"):
+            if st.get("sampler_empty_reads", 0) > 0:
+                # 首读竞态：守护刚起、首块未落盘——文件已被 > 建出但 cat 回空
+                st["sampler_empty_reads"] -= 1; save(); out(""); sys.exit(0)
             # 每拉一次守护多产一拍（替身按拉取节奏推进，不按墙钟）
             st["uptime_us"] += 1_000_000; st["sampler_ticks"] += 1
             charge = st["charge_uah"] - st["sampler_ticks"] * st["charge_step"]
@@ -638,7 +807,7 @@ def make_state(root, **kw):
                             "  Wireless powered: false\n  Dock powered: false\n"
                             "  status: 3\n  health: 2\n  level: 80\n  voltage: 4000\n  temperature: 350\n"),
         "dumpsys_thermal": "Current Status:0\nType{Name,Forecast}:CPU{CPU,0.5}\n",
-        # sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
+        # power_sample_command 每次采样都附 dumpsys 旗标段（Android 16 四路 powered 全发）——
         # 没有它 battery_window 证不出「未接电」，能耗永远没数据；交互/省电/热档同理。
         # charge_counter 由替身每拍按 charge_step 递减（800mA ≈ 222µAh/s）。
         "charge_uah": 5_000_000, "charge_step": 222,
@@ -660,15 +829,23 @@ def make_state(root, **kw):
 
 
 def frame_log_text(recorded=200, step_us=16667, first=0, base_ts=10_500_000, pid=4242,
-                   clock="CLOCK_BOOTTIME"):
-    """v3 帧日志块（镜像 nvn_vk_frame_log.c：24B 记录 = ts_us + fence + acquire + present；
-    meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。"""
-    recs = [struct.pack("<QIIII", base_ts + i * step_us, 0, 0, 900, 1200) for i in range(recorded)]
+                   clock="CLOCK_BOOTTIME", disp=None):
+    """v5 帧日志块（镜像 nvn_vk_frame_log.c：40B 记录 = ts_us + fence + acquire + present
+    + gpu_us/gpu_seq + disp_us/disp_seq——无确认写 0xffffffff，照真机编码；
+    meta 行 clock=CLOCK_BOOTTIME 照真机原文——此前写小写 boottime 是替身比真机松的假样）。
+    disp=((记录下标, 帧号, 间隔us), …)：真机 disp 读数落在「确认到达时正在写的」记录上，
+    可晚于所属帧、可乱序——宿主按 disp_seq 对号。"""
+    marks = {i: (us, seq) for i, seq, us in (disp or ())}
+    recs = []
+    for i in range(recorded):
+        us, seq = marks.get(i, (0xffffffff, 0xffffffff))
+        recs.append(struct.pack("<QIIIIIIII", base_ts + i * step_us, 0, 0, 900, 1200,
+                                0xffffffff, 0xffffffff, us, seq))
     blob = b"".join(recs)
     b64 = base64.b64encode(blob).decode()
     parts = [b64[i:i + 700] for i in range(0, len(b64), 700)]
     pre = f"11-09 12:00:01.000  {pid}  {pid} I S2Arm: "
-    lines = [pre + f"direct frame-log meta: v=3 clock={clock} unit=us endian=le rec=24 "
+    lines = [pre + f"direct frame-log meta: v=5 clock={clock} unit=us endian=le rec=40 "
                    f"cap=32768 recorded={recorded} presents={first + recorded} dropped=0 "
                    f"first={first} bytes={len(blob)} chunks={len(parts)}"]
     lines += [pre + f"direct frame-log[{i + 1}/{len(parts)}]:{p}" for i, p in enumerate(parts)]
@@ -731,7 +908,8 @@ class RunGameTest(unittest.TestCase):
         tool.chmod(0o755)
         return self.tmp / "sdk"
 
-    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1"):
+    def run_tool(self, state=None, argv=None, seconds=3, new_vc=200, out_name="out_1",
+                 discharge_settle="0"):
         st_kw = {"test_apk_vc": new_vc}
         st_kw.update(state or {})
         state = make_state(self.tmp, **st_kw)
@@ -744,7 +922,9 @@ class RunGameTest(unittest.TestCase):
                 "--out", str(out), "--seconds", str(seconds),
                 "--adb", f"{sys.executable} {fake} {state}",
                 "--lock-root", str(self.lock_root), "--ready-timeout", "5",
-                "--power-interval", "0", "--discharge-settle", "0"]
+                "--power-interval", "0"]
+        if discharge_settle is not None:   # None = 命令行不带旗标（跑默认口径）
+            args += ["--discharge-settle", str(discharge_settle)]
         args += argv or []
         try:
             clock = FixtureClock()
@@ -782,7 +962,7 @@ class RunGameTest(unittest.TestCase):
         # ② 帧表 = 采集窗口内的帧：窗口 [10M, 40M) us（uptime 起步 10M、30 次拉取各 +1s），
         #   帧记录 10.5M 起 16667us 步长 ×200 → 全部落在窗口内 → 199 行间隔；别进程（9999）的块不进来
         rows = (out / "frames.tsv").read_text().splitlines()
-        self.assertEqual("frame\tpresent_ns\tdisp_us\twall_us", rows[0])
+        self.assertEqual("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq", rows[0])
         self.assertEqual(199, len(rows) - 1)
         pres = [int(r.split("\t")[1]) for r in rows[1:]]
         self.assertTrue(all(10_000_000_000 <= p < 40_000_000_000 for p in pres),
@@ -971,6 +1151,282 @@ class RunGameTest(unittest.TestCase):
         self.assertIn("对不上", man["reason"], man["reason"])
         st = json.loads((self.tmp / "state.json").read_text())
         self.assertNotIn("installs", st)
+
+    def test_backup_tar_streams_without_memory_balloon(self):
+        """㊶ 备份 tar 流式落盘边算 sha——>阈值流不整进宿主内存（9000 私有树
+        实测 ~7.3GB，capture_output 会把宿主内存吃爆）。tracemalloc 峰值断言。"""
+        priv = f"/data/data/{PKG}"
+        want = self._data_state()
+        want["data_pad"] = {priv: {"files/blob.bin": 24 << 20}}
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **want))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(0, rc)
+        self.assertLess(peak, 12 << 20,
+                        f"24MB 备份流应分块落盘，宿主峰值 {peak >> 20}MB 超阈")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(24 << 20, st["data_pad"][priv]["files/blob.bin"],
+                         "大文件备份-回灌应保持（替身按合成档登记）")
+
+    def test_backup_external_dirs_use_shell_channel(self):
+        """㊷ 9000 实测 run-as 摸 /sdcard/Android/* 被 SELinux 拒——外部目录走
+        shell 可读通道（探测/清单/tar/回灌同命令，仅通道换），run-as 只留私有树。"""
+        state = self._data_state()
+        state["run_as_ext_denied"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc, "run-as 被拒不该挡外部目录备份（应走 shell 通道）")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(state["data_dirs"], st["data_dirs"], "还原后数据逐字节一致")
+
+    def test_data_listing_batches_and_counts(self):
+        """㊹ device_entries 分批清单（find -print0 | xargs -0 -n 256 替代
+        -exec {} +——4 万文件私有树 toybox E2BIG，9000 实测）：>256 文件多批走通，
+        条目数与 find 计数一致才算完整。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][priv].update({f"bulk/f{i:04d}.bin": "aa" for i in range(600)})
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc)
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        self.assertIn("bulk/f0599.bin", man["dirs"]["private"]["entries"])
+        self.assertEqual(600 + 3, len(man["dirs"]["private"]["files"]))
+
+    def test_data_listing_truncated_fails(self):
+        """㊹ 半截清单（xargs rc=0 但某批输出丢了）：条目数≠find 计数 → 拒，
+        不拿半截当全量（失败签名=清单不完整，唯计数门所出）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_listing_short"] = {priv: 1}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("清单不完整", man["reason"])
+
+    def test_data_xargs_batch_fail_refuses(self):
+        """㊹ xargs 中途批次挂（rc=126）：S2A_RC≠0 → 清单未证拒跑
+        （失败签名=清单未证，唯 rc 门所出）。"""
+        state = self._data_state()
+        state["data_xargs_fail"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("清单未证", man["reason"])
+
+    def test_listing_find_fail_and_stderr_refuses(self):
+        """㊾ find 中途被拒：出一行就挂 + Permission denied + find rc=1——
+        旧管线 xargs rc=0 会把它吞成全量清单（9000 复现签名）；find 自报 rc、
+        管道 rc、stderr 前缀行三门各自逮住 → 清单未证拒跑。"""
+        priv = f"/data/data/{PKG}"
+        for i, masked in enumerate((False, True)):
+            self.lock_root = self.tmp / f"locks_ff{i}"   # 每变体全新锁根：上局已留置
+            state = self._data_state()
+            state["data_find_fail"] = {priv: {"rc": 1, "masked": masked,
+                                             "err": "find: ./x: Permission denied"}}
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state),
+                out_name=f"out_ff{i}")
+            self.assertNotEqual(0, rc, f"masked={masked}")
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertIn("清单未证", man["reason"], man["reason"])
+            self.assertIn("Permission denied", man["reason"], "设备 stderr 要进 reason 归因")
+            if masked:
+                # xargs rc=0 吞了上游失败——只剩 find 自报 rc 一门独逮
+                self.assertIn("'find': '1'", man["reason"], man["reason"])
+                self.assertIn("'xargs': '0'", man["reason"], man["reason"])
+
+    def test_listing_stderr_refuses(self):
+        """㊾ 清单 stderr 非白名单（白名单现为空：有 stderr 即未证）→ 拒。
+        设备 stderr 经 S2A_ERR: 前缀行取回——adb 会把设备 stderr 混进 stdout，
+        靠宿主侧 stderr 判不了。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_listing_err"] = {priv: ["xargs: sha256sum: exited with status 126"]}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("清单未证", man["reason"], man["reason"])
+
+    def test_backup_tar_remote_err_refuses(self):
+        """㊾ #329000：exec-out 把设备 tar stderr 混进归档字节流、宿主 stderr
+        是空的——stderr/rc 落设备侧 .s2a-tar-{err,rc} 凭据另行取证；
+        tar stderr 非白名单 → 备份未证拒跑（不拿未证归档动设备）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_tar_err"] = {priv: "tar: ./x: Permission denied\ntar: had errors\n"}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("备份未证", man["reason"], man["reason"])
+        self.assertIn("Permission denied", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_backup_tar_remote_rc_and_aux_cleanup(self):
+        """㊾ tar rc 凭据非 0 → 备份未证；凭据文件删不净 → 同门拒
+        （读不回/删不净都是未证，不拿未证归档动设备）。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_tar_rc"] = {priv: "1"}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("备份未证", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+        state = self._data_state()
+        state["data_tar_aux_left"] = True
+        self.lock_root = self.tmp / "locks_aux"
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state),
+                                   out_name="out_aux")
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("未证", man["reason"], man["reason"])
+
+    def test_restore_mangled_listing_detains(self):
+        """㊾ #328940：pm clear 之后清单坏值——S2A_N 空 / 非数字 / stat mode
+        非八进制——必须受控进 fails → manifest 落盘 + 留置；不许 ValueError
+        类异常逸出、跳过还原收尾与锁释放链。"""
+        priv = f"/data/data/{PKG}"
+        for i, mangle in enumerate(("empty_n", "bad_n", "bad_mode")):
+            with self.subTest(mangle=mangle):
+                self.lock_root = self.tmp / f"locks_m{i}"    # 每个子用例全新锁根
+                state = self._data_state()
+                state["data_listing_mangle"] = {priv: mangle}
+                rc, out, _ = self.run_tool(
+                    state=self._installed_state(debuggable=True, **state),
+                    out_name=f"out_m{i}")
+                self.assertNotEqual(0, rc, mangle)
+                self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                                f"{mangle}：坏值必须进留置链")
+                man = json.loads((out / "run-manifest.json").read_text())
+                self.assertIn("未证", man["reason"], f"{mangle}: {man['reason']}")
+
+    def test_root_dir_mode_compared(self):
+        """㊾ 根目录自身权限进对拍：设备 stat 清单含 "."（find -mindepth 0）、
+        归档 ./ 根成员进 tar_entries——两归档仅根权限不同对拍必非空。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_root_mode"] = {priv: "777"}      # 设备根 777 ≠ 归档根 ./ 775
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc, "根权限不符必须逮住")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("权限", man["reason"], man["reason"])
+        # 正路：根 mode 一致时 "." 条目在 manifest 里、对拍过
+        self.lock_root = self.tmp / "locks_rootok"
+        rc, out, _ = self.run_tool(state=self._installed_state(
+            debuggable=True, **self._data_state()), out_name="out_rootok")
+        self.assertEqual(0, rc)
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        ent = man["dirs"]["private"]["entries"]
+        self.assertEqual(0o775, ent["."]["mode"], "根目录自身权限要记进清单")
+
+    def test_empty_data_dir_passes_and_phantom_refuses(self):
+        """㊾ 空输入 xargs（toybox 无 -r 默认空输入仍跑一次）：计数先行、
+        n=0 跳过 find|xargs——纯空数据目录不误拒、照样备份/回灌/复核；
+        幻影行（sha256sum 空参读 stdin 的 <空 sha>  -）若真出现 →
+        条目数≠计数 → 计数门逮住不误当全量。"""
+        ext = f"/sdcard/Android/data/{PKG}"
+        obb = f"/sdcard/Android/obb/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][ext] = {}                 # 目录在、里面空
+        state["data_dirs"][obb] = {}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc, "纯空数据目录不该被拒")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["data_dirs"].get(ext) or {}, "空目录还原后仍空")
+        # 负控：替身强行吐幻影行（空输入却跑了一次 xargs）→ 拒
+        self.lock_root = self.tmp / "locks_ph"
+        state = self._data_state()
+        state["data_dirs"][obb] = {}
+        state["data_xargs_phantom"] = {obb: True}
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state),
+                                   out_name="out_ph")
+        self.assertNotEqual(0, rc, "幻影清单行必须被计数门逮住")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("不完整", man["reason"], man["reason"])
+
+    def test_backup_aux_outside_tree_user_names_kept(self):
+        """㊿ #329620：用户树里同名 .s2a-tar-err/.s2a-tar-rc 是普通数据——
+        凭据已移到树外 /data/local/tmp/s2a-tar-<tag>-<uuid>-*，备份不带
+        --exclude、开头不 rm：两文件照进清单/归档、回灌逐字节还原。"""
+        priv = f"/data/data/{PKG}"
+        state = self._data_state()
+        state["data_dirs"][priv][".s2a-tar-err"] = b"user-err".hex()
+        state["data_dirs"][priv][".s2a-tar-rc"] = b"user-rc".hex()
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual(b"user-err".hex(), st["data_dirs"][priv][".s2a-tar-err"],
+                         "同名用户文件回灌后逐字节一致")
+        self.assertEqual(b"user-rc".hex(), st["data_dirs"][priv][".s2a-tar-rc"])
+        man = json.loads((out / "data-backup" / "manifest.json").read_text())
+        self.assertIn(".s2a-tar-err", man["dirs"]["private"]["entries"])
+        self.assertIn(".s2a-tar-rc", man["dirs"]["private"]["entries"])
+        self.assertEqual({}, st["dev_tmp"], "树外凭据跑完全清干净")
+
+    def test_backup_aux_preexist_refuses_and_detains(self):
+        """㊿ #329620：凭据路径被占（本局 uuid 名仍撞/残留）→ [ ! -e ] 预建
+        失败即拒、不覆盖既有文件；备份中途失败 → 还原链未证 → 留置。"""
+        state = self._data_state()
+        state["data_aux_preexist"] = True
+        rc, out, _ = self.run_tool(state=self._installed_state(debuggable=True, **state))
+        self.assertNotEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("预建", man["reason"], man["reason"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "备份中途失败必须留置")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("installs", st)
+
+    def test_backup_stream_timeout_detains_and_cleans(self):
+        """㊿ #329632：exec-out 流中途超时（设备 tar 挂了）——凭据已建即
+        登记待清，超时出口照走核删；备份没返回 = 还原链未证 → 留置，
+        data_backup=None 不许正常放锁。"""
+        state = self._data_state()
+        state["data_stream_hang"] = True
+        state["data_stream_hang_s"] = 30
+        orig = run_game._exec_out_stream
+        def fast_timeout(d, args_, dest, timeout=600):
+            return orig(d, args_, dest, timeout=0.5)   # 压短宿主超时免真等 600s
+        run_game._exec_out_stream = fast_timeout
+        try:
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state))
+        finally:
+            run_game._exec_out_stream = orig
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "流超时后必须留置（还原链未证）")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("中途失败", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["dev_tmp"], "超时出口凭据已核删干净")
+        self.assertNotIn("installs", st)
+
+    def test_backup_stream_writefail_detains_and_cleans(self):
+        """㊿ #329632：归档写盘失败（磁盘满/IO 错）——流函数抛错出口同样
+        走凭据核删；备份没返回 → 留置不放锁。"""
+        state = self._data_state()
+        orig = run_game._exec_out_stream
+        def write_fail(d, args_, dest, timeout=600):
+            raise OSError("No space left on device")      # 模拟写盘失败
+        run_game._exec_out_stream = write_fail
+        try:
+            rc, out, _ = self.run_tool(
+                state=self._installed_state(debuggable=True, **state))
+        finally:
+            run_game._exec_out_stream = orig
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "写盘失败后必须留置（还原链未证）")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("中途失败", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual({}, st["dev_tmp"], "异常出口凭据已核删干净")
 
     def test_pushed_tamper_caught_by_post_verify(self):
         """㉕ 推回途中归档被塞异物：本地核对过时还干净 → 设备解开多成员 →
@@ -1251,6 +1707,45 @@ class RunGameTest(unittest.TestCase):
         self.assertEqual(2, man["frame_log"]["captures"],
                          "同计数不同载荷的两块都是证据，一份不吞")
 
+    def test_frames_tsv_disp_seq_joined_by_sequence(self):
+        """v5 disp_us/disp_seq 按帧号对号：真机确认读数落在「到达时正在写的」记录
+        上（可晚于所属帧、到达序可乱序）——宿主按 disp_seq 归帧，不按记录行序；
+        未确认记录与 v<5（无 disp 域）disp 列留空，CPU present 间隔只在
+        present_us/wall_us，不冒充确认读数。"""
+        out = self.tmp / "frames-out"
+        out.mkdir()
+        # seq45/70/55 的确认分别落在记录 90/120/150 上：到达序与帧号序不一致（乱序迟到）
+        caps = run_game.direct_framelog.parse(frame_log_text(
+            recorded=200, first=0, base_ts=10_500_000,
+            disp=((90, 45, 33200), (120, 70, 16500), (150, 55, 16800))))
+        notes = []
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertEqual("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq", rows[0])
+        by_frame = {int(r.split("\t")[0]): r.split("\t") for r in rows[1:]}
+        self.assertEqual(("33200", "45"), (by_frame[45][4], by_frame[45][5]),
+                         "记录 90 携带的 seq45 确认必须归到帧 45 行")
+        self.assertEqual(("16500", "70"), (by_frame[70][4], by_frame[70][5]))
+        self.assertEqual(("16800", "55"), (by_frame[55][4], by_frame[55][5]))
+        self.assertEqual(("", ""), (by_frame[46][4], by_frame[46][5]),
+                         "无确认帧 disp 列留空，不拿 0 或 CPU 间隔冒充")
+        # 全未确认（disp 全 0xffffffff）→ disp 列整列空
+        caps = run_game.direct_framelog.parse(frame_log_text(recorded=60, first=0, base_ts=10_500_000))
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertTrue(all(r.split("\t")[4] == "" and r.split("\t")[5] == ""
+                            for r in rows[1:]), "v5 未确认 → disp_us/disp_seq 全空")
+        # v<5 记录（disp 域缺席 = None）→ 同样全空，旧版证据不造确认读数
+        caps = [{"meta": {"first": 0, "line": 1, "clock": "CLOCK_BOOTTIME"},
+                 "ts": [10_500_000 + i * 16667 for i in range(30)],
+                 "disp_us": None, "disp_seq": None}]
+        run_game.write_frames(out, caps, notes, "", window_us=None)
+        rows = (out / "frames.tsv").read_text().splitlines()
+        self.assertTrue(all(r.split("\t")[4] == "" and r.split("\t")[5] == ""
+                            for r in rows[1:]), "v<5 → disp 列整列空")
+        self.assertEqual("16667", rows[1].split("\t")[2],
+                         "present_us 列恒为 CPU 相邻 present 间隔")
+
     def test_restore_failure_detains_device(self):
         rc, out, _ = self.run_tool(state={"fail_uninstall": True})
         self.assertNotEqual(0, rc)
@@ -1387,9 +1882,9 @@ class RunGameTest(unittest.TestCase):
         d.mkdir()
         (d / "android.json").write_text("{}")
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(4000):
-                fh.write(f"{i + 1}\t{10_000_000_000 + i * 16_667_000}\t16667\t{10_000_000_000 + i * 16_667_000}\n")
+                fh.write(f"{i + 1}\t{10_000_000_000 + i * 16_667_000}\t16667\t16667\t16667\t{i + 1}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
 
     def test_qc_window_coverage_insufficient_is_no_data(self):
@@ -1402,17 +1897,17 @@ class RunGameTest(unittest.TestCase):
         first = w0 + 4_720_000                             # 块首帧晚 4.72s
         n = int(56_360_000 / 16667)                        # 窗内覆盖 56.36s
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(1, n + 1):
-                fh.write(f"{i}\t{(first + i * 16667) * 1000}\t16667\t{(first + i * 16667) * 1000}\n")
+                fh.write(f"{i}\t{(first + i * 16667) * 1000}\t16667\t16667\t16667\t{i}\n")
         r = self._qc(d)
         self.assertEqual("没数据", r["帧率"])
         self.assertIn("窗口覆盖不足", r["读数"])
         # 同一窗口贴边满覆盖（60s/61.08s ≈ 98%）→ 覆盖判据放行，走正常帧率统计
         with open(d / "frames.tsv", "w") as fh:
-            fh.write("frame\tpresent_ns\tdisp_us\twall_us\n")
+            fh.write("frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n")
             for i in range(1, 3601):
-                fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t{(w0 + i * 16667) * 1000}\n")
+                fh.write(f"{i}\t{(w0 + i * 16667) * 1000}\t16667\t16667\t16667\t{i}\n")
         self.assertEqual("过", self._qc(d)["帧率"])
 
     def test_power_energy_verdicts(self):
@@ -1481,6 +1976,418 @@ class RunGameTest(unittest.TestCase):
         self.assertFalse(man["power_sampler"]["settle_ok"])
         self.assertTrue(any("放电未稳" in n for n in man["notes"]), man["notes"])
 
+    def test_sampler_spawn_requires_full_detach(self):
+        """① 受控负控（8E 红根因）：后台守护没真脱离时 adbd 不退——
+        r25 真实旧命令串（三 fd 全引但没有 setsid，bd2082cc）卡死；
+        setsid + 三 fd 全脱离立即回 PID。"""
+        st = make_state(self.tmp)
+        fake = self.tmp / "fake_adb.py"; fake.write_text(FAKE_ADB)
+        adb = [sys.executable, str(fake), str(st)]
+        # r25 真串逐字重建（run_game.py @ bd2082cc）：( while …; done ) >log
+        # 2>/dev/null </dev/null & echo $! —— fd 引齐了但守护还挂控制终端
+        supply = "battery"
+        ap = run_game
+        legacy_inner = (
+            f"rm -f /data/local/tmp/s2a-power-samples.log; "
+            f"( while :; do {ap.power_sample_command(supply)}; "
+            f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+            f"printf '{ap.POWER_BLOCK_SEP}\\n'; sleep 1; done )"
+            f" >/data/local/tmp/s2a-power-samples.log 2>/dev/null </dev/null & echo $!")
+        legacy = "sh -c " + shlex.quote(legacy_inner)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subprocess.run([*adb, "shell", legacy], capture_output=True, timeout=4)
+        fixed = ("sh -c 'rm -f /data/local/tmp/s2a-power-samples.log "
+                 "/data/local/tmp/s2a-power-samples.log.pid; setsid sh -c "
+                 "\"echo $$ >/data/local/tmp/s2a-power-samples.log.pid; while :; do "
+                 ": s2a-power-sampler; sleep 1; done\" "
+                 ">/data/local/tmp/s2a-power-samples.log 2>&1 </dev/null & echo $!'")
+        r = subprocess.run([*adb, "shell", fixed], capture_output=True, timeout=5)
+        self.assertEqual(0, r.returncode)
+        self.assertEqual(b"7777\n", r.stdout)
+
+    def test_sampler_spawn_empty_output_sweeps(self):
+        """①b 启动空回执也算 spawn 未证：守护可能已起在写——脏输出不充 PID，
+        照样按 PID 文件/标记扫孤儿；manifest 记 spawn_error。"""
+        rc, out, _ = self.run_tool(state={"sampler_spawn_silent": True})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("spawn_error", man["power_sampler"], man["power_sampler"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("orphan_swept"), "空回执也要扫孤儿")
+        self.assertFalse(st.get("sampler_on"), "孤儿循环不许活着")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log.pid", st.get("dev_fs", {}))
+
+    def test_sampler_linger_files_kept(self):
+        """② 退场复验：kill 后 /proc/<pid> 还在 → 回 LINGER 记 notes，
+        设备文件不清（留证），杀不掉的守护记还在。"""
+        rc, out, _ = self.run_tool(state={"sampler_linger": True})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertTrue(any("仍存活" in n or "收采样守护失败" in n
+                            for n in man["notes"]), man["notes"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "杀不掉的守护 = 设备有残留未证 → 留置")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("sampler_on"), "杀不掉的守护还在")
+        self.assertIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}),
+                      "杀不掉时日志文件不许删，留证")
+
+    def test_settle_first_read_race_probe(self):
+        """③ 接电首读竞态：守护刚起首块未落盘——补拉几轮仍空就用同口径
+        dumpsys 现态判接电；接电局不许被首读空拖进放电等待。"""
+        plugged = json.loads(make_state(self.tmp).read_text())["power_sample"].replace(
+            "AC powered: false", "AC powered: true")
+        rc, out, _ = self.run_tool(
+            state={"power_sample": plugged, "sampler_empty_reads": 3},
+            discharge_settle=None, argv=["--discharge-timeout", "5"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("settle_na", man["power_sampler"], man["power_sampler"])
+        self.assertLess(man["power_sampler"]["waited_s"], 15,
+                        "接电首读空不许拖进放电等待")
+
+    def test_sampler_spawn_timeout_sweeps_orphan(self):
+        """② spawn 超时：sampler 变量没赋值前炸也要扫孤儿——按 PID 文件/进程
+        标记杀掉设备端守护、清日志文件；本局能耗按没数据处理。"""
+        rc, out, _ = self.run_tool(
+            state={"sampler_spawn_hang": True, "sampler_hang_s": 20})
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("spawn_error", man["power_sampler"])
+        self.assertTrue(any("守护起不来" in n or "采样守护" in n
+                            for n in man["notes"]), man["notes"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertTrue(st.get("orphan_swept"), "孤儿守护要按 pid 文件/标记扫掉")
+        self.assertFalse(st.get("sampler_on"), "孤儿循环不许活着")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log.pid", st.get("dev_fs", {}))
+
+    def test_charging_discharge_settle_na(self):
+        """③ 接电功能局默认不等放电：未显式给 --discharge-settle 且最新采样
+        证在接电 → 门判不适用直接进窗（settle_na 记明原因）；显式给了照等。"""
+        plugged = json.loads(make_state(self.tmp).read_text())["power_sample"].replace(
+            "AC powered: false", "AC powered: true")
+        rc, out, _ = self.run_tool(state={"power_sample": plugged},
+                                   discharge_settle=None)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("settle_na", man["power_sampler"], man["power_sampler"])
+        self.assertTrue(man["power_sampler"]["settle_ok"])
+        self.assertLess(man["power_sampler"]["waited_s"], 30,
+                        "接电下不许先等 30s 放电才进窗")
+
+    def test_no_power_sampler_disabled(self):
+        """④ --no-power-sampler：接电功能局/帧时性能局不需要能耗数据——
+        不起设备端采样守护（sampler_spawn_hang 下也照过，证明真没起）、
+        manifest 记 power_sampler.disabled + 原因、不写 settle_ok（门没跑）、
+        power.tsv 不落；quality_check 能耗报「没数据」读数写明未开采样。"""
+        rc, out, _ = self.run_tool(
+            state={"sampler_spawn_hang": True, "sampler_hang_s": 20},
+            argv=["--no-power-sampler", "帧时性能局不接功耗"])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        ps = man["power_sampler"]
+        self.assertTrue(ps.get("disabled"), ps)
+        self.assertEqual("帧时性能局不接功耗", ps["reason"])
+        self.assertNotIn("settle_ok", ps, "门没跑不许记 settle_ok")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertFalse(st.get("sampler_on"), "flag 局不许起采样守护")
+        self.assertNotIn("/data/local/tmp/s2a-power-samples.log", st.get("dev_fs", {}))
+        self.assertFalse((out / "power.tsv").exists())
+        meta = json.loads((out / "android.json").read_text())
+        self.assertTrue(meta["power_sampler"]["disabled"], "android.json 要带供判读")
+        qrow = self._qc(out)
+        self.assertEqual("没数据", qrow["能耗"])
+        self.assertIn("帧时性能局不接功耗", qrow["读数"], qrow["读数"])
+
+    # ---- 检查点（s2a-checkpoint/1）：部署后首启前 run-as 解进存档根 + 逐文件 sha 核对 ----
+    _CK_TID = "0123456789ABCDEF"          # PKG 尾 16 位十六进制大写
+    _CK_FILES = {
+        "bis/user/save/0000000000000001/1/game_data.sav": b"SAVE-DATA",
+        # 0 字节 .lock：toybox stat %F 报 "regular empty file"（8E 预演真红根因）
+        "bis/user/save/0000000000000001/1/.lock": b"",
+        "bis/system/save/8000000000000000/1/lastPublishedId": b"12345678",
+    }
+
+    def _checkpoint(self, name="w1-node", files=None, meta_extra=None,
+                    tar_members=None, trunc=False):
+        """造检查点目录：saves.tar + meta.json + saves.tar.sha256。
+        files={rel: bytes} 与 meta.files 一一对应；tar_members 可加声明外成员；
+        trunc=截断 tar（sha 按截后实算——过 sha 门、倒在 tarfile 读）。"""
+        cp = self.tmp / name
+        cp.mkdir()
+        files = dict(files if files is not None else self._CK_FILES)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for rel, blob in files.items():
+                info = tarfile.TarInfo(rel)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+            for rel, blob in (tar_members or {}).items():
+                info = tarfile.TarInfo(rel)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        data = buf.getvalue()
+        (cp / "saves.tar").write_bytes(data[:60] if trunc else data)
+        blob = (cp / "saves.tar").read_bytes()
+        (cp / "saves.tar.sha256").write_text(
+            hashlib.sha256(blob).hexdigest() + "  saves.tar\n")
+        meta = {"schema": "s2a-checkpoint/1", "game": "wonder",
+                "title_id": self._CK_TID, "package": PKG, "scene": name,
+                "files": {rel: [len(b), hashlib.sha256(b).hexdigest()]
+                          for rel, b in files.items()}}
+        meta.update(meta_extra or {})
+        (cp / "meta.json").write_text(json.dumps(meta))
+        return cp
+
+    def test_ab_prop_set_before_launch_and_restored(self):
+        """--ab-prop：起局前锁内置位（am start 那一刻已是新值），manifest 记值与原值，
+        收局恢复成原值；格式不对 / 与运行器自管属性重名 → 拒跑、不起局。"""
+        st0 = {"props": {"debug.s2a.vsync": "orig"}}
+        rc, out, _ = self.run_tool(state=st0, argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab")
+        self.assertEqual(0, rc)
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertEqual("1", st["props_at_launch"].get("debug.s2a.vsync"), "起局时必须已是新值")
+        self.assertEqual("orig", st["props"].get("debug.s2a.vsync"), "收局必须恢复原值")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual({"value": "1", "prev": "orig"}, man["ab_props"]["debug.s2a.vsync"])
+        for bad, tag in (("debug.s2a.vsync", "noeq"), ("persist.sys.x=1", "ns"),
+                         ("debug.s2a.vsync=1;reboot", "inj"), ("debug.s2a.session_uuid=x", "dup")):
+            _, outb, _ = self.run_tool(argv=["--ab-prop", bad], out_name="out_ab_" + tag)
+            manb = json.loads((outb / "run-manifest.json").read_text())
+            self.assertIn("--ab-prop", manb["reason"], f"{tag}: {manb['reason']}")
+            stb = json.loads((self.tmp / "state.json").read_text())
+            self.assertNotIn("launch_cmd", stb, f"{tag}: 格式不对不许起局")
+
+    def test_ab_prop_getprop_denied_fails_closed(self):
+        """--ab-prop 属性读被拒（rc=1、空输出）：起局前 → 拒跑不起局；收局读回被拒 → 不得当成已恢复，
+        还原失败、设备留置（原值为空时 rc=1 的空串恰与原值相等，最容易假绿）。"""
+        _, out, _ = self.run_tool(state={"getprop_deny": ["debug.s2a.vsync"]},
+                                  argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_deny")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "读不到原值不许起局")
+        rc, out2, _ = self.run_tool(state={"getprop_deny_after_launch": ["debug.s2a.vsync"]},
+                                    argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_deny2")
+        self.assertNotEqual(0, rc)
+        man = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("debug.s2a.vsync", man["reason"], man["reason"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(), "恢复读回失败要留置")
+
+    def test_ab_prop_readback_fail_after_set_still_strict(self):
+        """setprop 已生效、紧接着读回被拒：manifest.ab_props 还没写，恢复仍必须按严格 rc=0 口径，
+        原值为空时不得因 rc=1 的空串假绿 → 还原失败、留置、不起局。"""
+        rc, out, _ = self.run_tool(state={"getprop_deny_after_set": ["debug.s2a.vsync"]},
+                                   argv=["--ab-prop", "debug.s2a.vsync=1"], out_name="out_ab_mid")
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "读回失败不许起局")
+        self.assertNotEqual(0, rc)
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(), "严格恢复读回失败要留置")
+
+    def test_checkpoint_apply_and_verify(self):
+        """检查点正路：宿主核过 → push → run-as tar 解进 saves/<tid>/ryujinx-android
+        → 逐文件 sha 复核 → 照起局；manifest.checkpoint 记名/源 sha/核对 ok。"""
+        cp = self._checkpoint()
+        rc, out, _ = self.run_tool(argv=["--checkpoint", str(cp)])
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        ck = man["checkpoint"]
+        self.assertEqual("ok", ck["verify"], ck)
+        self.assertEqual("w1-node", ck["name"])
+        self.assertEqual(self._CK_TID, ck["title_id"])
+        self.assertEqual(3, ck["files"])
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", ck["source_sha256"]))
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("am start", st.get("launch_cmd", ""))
+        state_dir = ("/data/data/" + PKG + "/files/user/0/saves/"
+                     + self._CK_TID + "/ryujinx-android")
+        dd = st["data_dirs"].get(state_dir, {})
+        for rel, blob in self._CK_FILES.items():
+            self.assertEqual(blob.hex(), dd.get(rel), rel)
+
+    def test_checkpoint_files_sha_mismatch(self):
+        """清单不符：meta.files 声明 sha 与实解文件不符 → 不起局（Refuse→red），
+        manifest 记 verify=fail；另路：meta 声明的文件 tar 里没有同样拒。"""
+        cp = self._checkpoint(meta_extra={
+            "files": {"bis/user/save/0000000000000001/1/game_data.sav":
+                      [9, "0" * 64],
+                      "bis/user/save/0000000000000001/1/.lock":
+                      [0, hashlib.sha256(b"").hexdigest()],
+                      "bis/system/save/8000000000000000/1/lastPublishedId":
+                      [8, hashlib.sha256(b"12345678").hexdigest()]}})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_bad")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        # 声明 sha 与成员内容不符现在在宿主写设备前就拒（不再等解入后核）
+        self.assertIn("内容 sha", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "核对不过不许起局")
+        cp2 = self._checkpoint(
+            name="w2", meta_extra={"files": {"bis/user/save/nope": [1, "0" * 64]}})
+        _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_miss")
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("不一致", man2["reason"])
+        st2 = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st2)
+
+    def test_checkpoint_member_content_sha_checked_before_push(self):
+        """同长异内容：tar 成员长度与 meta 声明相同、内容 sha 不同 → 写设备前就拒，
+        不 push、不起局（只核长度会放过它）。"""
+        files = dict(self._CK_FILES)
+        rel = "bis/user/save/0000000000000001/1/game_data.sav"
+        cp = self._checkpoint(name="w-samelen", meta_extra={"files": {
+            r: [len(b), hashlib.sha256(b if r != rel else b"X" * len(b)).hexdigest()]
+            for r, b in files.items()}})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_samelen")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("内容 sha", man["reason"], man["reason"])
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "内容 sha 不符不许起局")
+        self.assertNotIn("s2a-checkpoint", st.get("tar_pushed", ""),
+                         "宿主内容核对不过不许 push 到设备")
+
+    def test_checkpoint_strict_member_match(self):
+        """成员↔清单严格一致（两向）：tar 多出未声明成员 → 拒；声明长度与成员
+        实际长度不符 → 拒；meta.files 重复声明同一路径 → 拒（JSON 重复键不静默）。"""
+        cp = self._checkpoint(tar_members={"bis/user/save/extra.und": b"x"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_extra")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("多", man["reason"], man["reason"])
+        cp2 = self._checkpoint(name="w2", meta_extra={
+            "files": {"bis/user/save/0000000000000001/1/game_data.sav":
+                      [999, hashlib.sha256(b"SAVE-DATA").hexdigest()],
+                      "bis/user/save/0000000000000001/1/.lock":
+                      [0, hashlib.sha256(b"").hexdigest()],
+                      "bis/system/save/8000000000000000/1/lastPublishedId":
+                      [8, hashlib.sha256(b"12345678").hexdigest()]}})
+        _, out2, _ = self.run_tool(argv=["--checkpoint", str(cp2)], out_name="out_sz")
+        man2 = json.loads((out2 / "run-manifest.json").read_text())
+        self.assertIn("长度", man2["reason"], man2["reason"])
+        cp3 = self._checkpoint(name="w3dup")
+        (cp3 / "meta.json").write_text(
+            '{"schema":"s2a-checkpoint/1","title_id":"' + self._CK_TID + '",'
+            '"package":"' + PKG + '","files":{'
+            '"bis/user/save/0000000000000001/1/game_data.sav":[9,"'
+            + hashlib.sha256(b"SAVE-DATA").hexdigest() + '"],'
+            '"bis/user/save/0000000000000001/1/game_data.sav":[9,"'
+            + hashlib.sha256(b"SAVE-DATA").hexdigest() + '"]}}')
+        _, out3, _ = self.run_tool(argv=["--checkpoint", str(cp3)], out_name="out_dup")
+        man3 = json.loads((out3 / "run-manifest.json").read_text())
+        self.assertIn("重复声明", man3["reason"], man3["reason"])
+        buf = io.BytesIO()                                  # tar 内重复成员名同拒
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for blob in (b"A", b"B"):
+                info = tarfile.TarInfo("bis/user/save/dup")
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+        cp4 = self.tmp / "w4dup"
+        cp4.mkdir()
+        (cp4 / "saves.tar").write_bytes(buf.getvalue())
+        (cp4 / "saves.tar.sha256").write_text(
+            hashlib.sha256(buf.getvalue()).hexdigest() + "  saves.tar\n")
+        (cp4 / "meta.json").write_text(json.dumps({
+            "schema": "s2a-checkpoint/1", "title_id": self._CK_TID, "package": PKG,
+            "files": {"bis/user/save/dup": [1, hashlib.sha256(b"A").hexdigest()]}}))
+        _, out4, _ = self.run_tool(argv=["--checkpoint", str(cp4)], out_name="out_dup2")
+        man4 = json.loads((out4 / "run-manifest.json").read_text())
+        self.assertIn("成员重复", man4["reason"], man4["reason"])
+
+    def test_checkpoint_title_id_canonical(self):
+        """titleId 规范：meta.title_id 必须 16 位大写十六进制（BootContract 口径），
+        小写/缺/非十六进制都拒——写设备前的畸形 meta 门。"""
+        for bad, tag in (("0123456789abcdef", "low"), ("", "empty"), ("0123456789ABCDEG", "bad")):
+            cp = self._checkpoint(name="w-" + tag,
+                                  meta_extra={"title_id": bad} if bad else {"title_id": ""})
+            _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)],
+                                      out_name="out_tid_" + tag)
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertIn("大写十六进制", man["reason"], f"{tag}: {man['reason']}")
+            self.assertEqual("fail", man["checkpoint"]["verify"])
+
+    def test_checkpoint_refuses_installed(self):
+        """已装即拒：设备已装该包时 --checkpoint 直接拒（不清已有数据、不动包），
+        连安装步骤都不进；manifest 记 verify=fail。"""
+        orig = self._installed_state(
+            debuggable=True, orig_vc=200,
+            data_dirs={"/data/data/" + PKG: {"files/save.dat": b"ORIG".hex()}})
+        _, out, _ = self.run_tool(state=orig, argv=["--checkpoint",
+                                                  str(self._checkpoint())],
+                                  out_name="out_inst")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("已装", man["reason"], man["reason"])
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+        self.assertEqual(b"ORIG".hex(),
+                         st["data_dirs"]["/data/data/" + PKG]["files/save.dat"],
+                         "已装数据不许被检查点动")
+
+    def test_checkpoint_tmp_cleanup_failure_detains(self):
+        """临时 tar 删除失败 → 收局并入还原失败：RESULT=red + 留置（设备有残留未证）。
+        rm 在 push/解包两路 finally 都跑；失败记 checkpoint.tmp_left。"""
+        rc, out, _ = self.run_tool(state={"checkpoint_rm_fail": True},
+                                   argv=["--checkpoint", str(self._checkpoint())],
+                                   out_name="out_rmfail")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertIn("没删掉", man["reason"], man["reason"])
+        self.assertIn("tmp_left", man["checkpoint"], man["checkpoint"])
+        self.assertTrue((self.lock_root / SERIAL / "detained.json").exists(),
+                        "临时文件删不掉要留置")
+
+    def test_checkpoint_nonregular_rejected_raw_dump(self):
+        """负对照：设备端报非普通文件（fifo）→ 仍拒不起局；verify=fail 时设备原始
+        stat/sha/软链清单落 out/checkpoint-device/ 供归因（8E 空文件红那次就是
+        靠 stat 类型名才定到根因）。"""
+        state_dir = ("/data/data/" + PKG + "/files/user/0/saves/"
+                     + self._CK_TID + "/ryujinx-android")
+        rc, out, _ = self.run_tool(
+            state={"dev_stat_types": {state_dir: {
+                "bis/user/save/0000000000000001/1/game_data.sav": "fifo"}}},
+            argv=["--checkpoint", str(self._checkpoint())], out_name="out_fifo")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertNotEqual(0, rc)
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        self.assertIn("核对不符", man["reason"], man["reason"])
+        self.assertEqual("checkpoint-device/",
+                         man["checkpoint"].get("device_listing"))
+        stat_txt = (out / "checkpoint-device" / "stat.txt").read_text()
+        self.assertIn("fifo", stat_txt)
+        self.assertIn("game_data.sav", stat_txt)
+        self.assertTrue((out / "checkpoint-device" / "sha256sum.txt").exists())
+        self.assertTrue((out / "checkpoint-device" / "links.txt").exists())
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st, "非普通文件不许起局")
+
+    def test_checkpoint_path_traversal(self):
+        """路径越界：tar 成员含 .. 段 → 宿主门拒（push 都没发生），不起局。"""
+        cp = self._checkpoint(tar_members={"bis/../../evil": b"x"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_trav")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual("fail", man["checkpoint"]["verify"])
+        self.assertIn("越界", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+        self.assertFalse(any("s2a-checkpoint" in k for k in st.get("pushed", {})),
+                         "越界成员不许 push 到设备")
+
+    def test_checkpoint_truncated_tar(self):
+        """tar 截断：sha 按截后实算（过 sha 门）→ tarfile 读不出 → 拒，不起局。"""
+        cp = self._checkpoint(trunc=True)
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_trunc")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("截断", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+
+    def test_checkpoint_wrong_package(self):
+        """包名不符：meta.package 与本局包不同 → 拒（装错检查点比不装更糟）。"""
+        cp = self._checkpoint(meta_extra={"package": "org.s2arm.game.t9999999999999999"})
+        _, out, _ = self.run_tool(argv=["--checkpoint", str(cp)], out_name="out_wpkg")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertIn("与本局", man["reason"], man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+
     def test_private_logs_pulled_before_restore(self):
         """㉑ 私有证据收证：收局后、还原（pm clear/卸载清私有目录）前把当局进程的
         host-*-<pid>-*.log 与原生直写 frame-log-<pid>.log 拉回 out/host_logs/；
@@ -1521,7 +2428,8 @@ class RunGameTest(unittest.TestCase):
         的 frame-log-<pid>.log 完整同文块把帧救回来：帧表有帧、截断注记仍如实留。"""
         full = frame_log_text(200, base_ts=10_500_000)
         priv = "".join(ln.split("S2Arm: ", 1)[1] + "\n" for ln in full.splitlines())
-        priv = priv.replace(" chunks=10\n", " chunks=10 uuid=<SESSION_UUID>\n", 1)
+        priv = re.sub(r" chunks=\d+\n", lambda m: m.group(0)[:-1] + " uuid=<SESSION_UUID>\n",
+                      priv, count=1)
         stray = frame_log_text(400, base_ts=10_050_000, pid=9999)  # end 行让转储等待不空转
         trunc = "\n".join(full.splitlines()[:-2]) + "\n"           # 4242 块砍尾 = 截断
         (self.tmp / "logcat_dump.txt").write_text(LOG_HEAD + stray + trunc)

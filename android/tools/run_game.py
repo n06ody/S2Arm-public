@@ -25,11 +25,14 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
   降级（原包 > 新包）由 `install -r -d` 实测（失败即拒，装失败不卸旧包）；装回方向
   的降级（原包 < 新包）入局前证不了能装回 → 连拉/装都不做，直接拒跑（qa-fone：
   先升级入局、收局再试降级 = 装了赌能降回去）。
-- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 run-as tar 把
-  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 拉到 --backup-dir（默认 <out>/data-backup，
-  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）；归档先解包
-  与源清单逐项核对，对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端
-  全量复核。存在但 run-as 进不去的目录报错拒跑，不当不存在。
+- 应用私有数据 / 已并入资源：已装包是 debuggable → 装新包前 tar 流式拉回
+  /data/data/<pkg>、/sdcard/Android/data|obb/<pkg> 到 --backup-dir（默认 <out>/data-backup，
+  tar + manifest.json 全量清单：文件 sha/软链目标/目录含空目录/权限位）。访问通道
+  按目录归属：私有树 run-as（应用 uid 才够权），外部目录 shell（9000 实测 run-as
+  碰 /sdcard/Android/* 被 SELinux 拒）；流式分块落盘边算 sha，不整进宿主内存
+  （9000 私有树 ~7.3GB，capture_output 会爆）。归档先解包与源清单逐项核对，
+  对不上拒跑；收局装回原包后归档复核过才 pm clear、回灌、设备端全量复核。
+  存在但进不去的目录报错拒跑，不当不存在。
   已装包不是 debuggable → 拒跑；显式 --allow-data-loss 才放行且只还原 APK 字节
   （私有数据、已并入资源不还原，manifest 写明）。
 - 导入的资源 / 卸载应清的目录：未安装路径落在 /sdcard/Android/data|obb/<pkg>，卸载随删，
@@ -46,14 +49,13 @@ power.tsv / logcat.txt / gfx_mode.txt / battery.txt / thermal.txt / frame_log.tx
 frame-log-<pid>.log（与 logcat 同文双写，logcat 分片被截断时它是完整源）→ out/host_logs/。
 退出码：0 完成且还原成功；2 参数 / 设备 / 起局 / 中断（设备已尽量还原）；3 还原失败（已留置）。
 """
-import argparse, datetime, hashlib, json, os, posixpath, re, shlex, shutil, signal, subprocess, sys, tarfile, time, uuid
+import argparse, datetime, hashlib, json, os, posixpath, re, selectors, shlex, shutil, signal, subprocess, sys, tarfile, tempfile, time, uuid
 from pathlib import Path
 
 ANDROID = Path(__file__).resolve().parents[1]
 REPO = ANDROID.parent
 for _p in (ANDROID, ANDROID / "tools", REPO / "tools"):
     sys.path.insert(0, str(_p))
-import android_power          # noqa: E402  采样命令与解析：tools/android_power.py
 import device_lock            # noqa: E402  本目录设备锁
 import dev_runtime            # noqa: E402  Device/stop 复用
 import direct_framelog        # noqa: E402  帧日志解析与百分位
@@ -68,6 +70,264 @@ FAIL_RE = re.compile(r"Game startup refused|startup rejected|FATAL EXCEPTION|And
 FRAMELOG_END = "direct frame-log end:"
 PKG_RE = re.compile(r"[A-Za-z0-9_.]+")
 THREADTIME_PID = re.compile(r"^\d\d-\d\d\s+\d\d:\d\d:\d\d\.\d+\s+(\d+)\s+\d+\s+\w")
+
+
+# ---- 真机功耗：设备侧采样协议与判读 -------------------------------------
+# #163 把 tools/android_power.py 换成 host 逐点采样后，运行器自有的「设备侧
+# 循环采样 + === 分块日志 + 放电门判读」协议归入本文件（quality_check.py
+# 的能耗判读同源引用）。判读口径照搬 switch-gpu-mapper 的
+# docs/power-comparison.md + scripts/analyze_power.py：
+# - 电流取幅值积分（abs(current)×voltage 梯形），原始符号留在 rawCurrentSign——
+#   部分 OEM 放电为正；窗口内符号翻转即作废。
+# - 分析窗对每块剔首 15s / 尾 5s（trim_start_us / trim_end_us）。
+# - 窗内每个采样点都必须物理放电（plugged==0 且 status=Discharging）、屏幕交互、
+#   非省电、thermal_status<3、电流/电压/电量计读数合法、采样间隔 ≤3s、
+#   窗口边界有覆盖——充电 / 掉线 / 降频即整块作废（fail closed 无数据）。
+# - charge counter 整局交叉核对：等差递减量子 q → 端点差 ±q 区间；细粒计数走
+#   0.5–1.5 比值门；向下跳变 <2 次 → 不证。核对不过 = 功耗判读未证，不是绝对标定。
+
+POWER_FIELDS = ("boot_us", "status", "current_ua", "voltage_uv", "energy_uwh", "charge_uah",
+                "temp_tenths_c", "source", "ac_powered", "usb_powered", "wireless_powered",
+                "dock_powered", "plugged", "interactive", "power_save", "thermal_status")
+POWER_SYSFS = {"current_now": "current_ua", "voltage_now": "voltage_uv", "energy_now": "energy_uwh",
+               "charge_counter": "charge_uah", "temp": "temp_tenths_c", "status": "status"}
+POWERED_FLAGS = ("ac_powered", "usb_powered", "wireless_powered", "dock_powered")
+POWER_BLOCK_SEP = "==="
+
+
+def power_parse_sample(text):
+    raw = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    row = {key: "" for key in POWER_FIELDS}
+    for source, key in {"boot_us": "boot_us", **POWER_SYSFS}.items():
+        value = raw.get(source, "").strip()
+        if key == "status":
+            row[key] = value if value in ("Charging", "Discharging", "Full", "Not charging", "Unknown") else ""
+        elif re.fullmatch(r"-?[0-9]+", value):
+            row[key] = int(value)
+    row["source"] = "sysfs"
+    # 屏幕交互 / 省电 / 热档（dumpsys power / thermalservice）：整块作废门的证据。
+    for key in ("interactive", "power_save"):
+        value = raw.get(key, "").strip()
+        row[key] = "1" if value == "true" else "0" if value == "false" else ""
+    value = raw.get("thermal_status", "").strip()
+    row["thermal_status"] = int(value) if re.fullmatch(r"[0-9]+", value) else ""
+    # 每次采样都带 dumpsys 旗标段：sysfs 行也只有拿到四路 powered 旗标，
+    # power_battery_window 才能证「未接电」（旗标缺失/未知 fail closed）。
+    # UPDATES STOPPED 是模拟置/拔电的冻结态：旗标不可证，留空。
+    dump = text.partition("service_dump_begin\n")[2].partition("service_dump_end")[0]
+    fields = dict(re.findall(r"^[ \t]*([A-Za-z ]+):[ \t]*([^\r\n]+)$", dump, re.M))
+    if "UPDATES STOPPED" not in dump:
+        for source, key in (("AC powered", "ac_powered"), ("USB powered", "usb_powered"),
+                            ("Wireless powered", "wireless_powered"), ("Dock powered", "dock_powered")):
+            value = fields.get(source, "").strip()
+            row[key] = value if value in ("true", "false") else ""
+    if row["current_ua"] == "" or row["voltage_uv"] == "":
+        # BatteryService current_now is uA; dumpsys battery voltage is mV.
+        # Parse only exact field lines, never the historical broadcast voltage.
+        current = text.partition("service_current_now=")[2].partition("\nservice_dump_begin")[0].strip()
+        voltage = fields.get("voltage", "").strip()
+        if re.fullmatch(r"-?[0-9]+", current) and re.fullmatch(r"[0-9]+", voltage):
+            row["current_ua"], row["voltage_uv"] = int(current), int(voltage) * 1000
+            row["source"] = "battery-service"
+            # BatteryManager status 码照实映射、供电旗标留原列，不坍缩（8E 首局
+            # status=4 NOT_CHARGING + AC powered=true 曾被映成 Charging 丢真值）；
+            # 状态与旗标矛盾时两边都留原文，接没接电由判读者看旗标列，这里不猜。
+            row["status"] = {"2": "Charging", "3": "Discharging", "4": "Not charging",
+                             "5": "Full"}.get(fields.get("status", "").strip(), "Unknown")
+            temp = fields.get("temperature", "").strip()
+            if re.fullmatch(r"-?[0-9]+", temp): row["temp_tenths_c"] = int(temp)
+            # AOSP BatteryService.dumpInternal marks set/unplug simulation with
+            # UPDATES STOPPED. Keep the numbers as raw evidence, never integrate
+            # that frozen service state as a measured discharge sample.
+            if "UPDATES STOPPED" in dump:
+                row["status"] = "Unknown"
+                row["source"] = "battery-service-frozen"
+        else:
+            row["source"] = "unavailable"
+    flags = [row[key] for key in POWERED_FLAGS]
+    row["plugged"] = ("1" if "true" in flags else
+                      "0" if all(value == "false" for value in flags) else "")
+    return row
+
+
+def power_sample_command(supply):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", supply):
+        raise ValueError("非法 power_supply 名称")
+    return ("good=1; for n in status current_now voltage_now energy_now charge_counter temp; do "
+            "v=$(cat /sys/class/power_supply/" + supply + "/\"$n\" 2>/dev/null); "
+            "printf '%s=%s\\n' \"$n\" \"$v\"; "
+            "if [ \"$n\" = current_now ] || [ \"$n\" = voltage_now ]; then "
+            "case \"$v\" in ''|*[!0-9-]*) good=0;; esac; fi; done; "
+            "if [ \"$good\" = 0 ]; then printf 'service_current_now='; "
+            "cmd battery get -f current_now 2>/dev/null; printf '\\n'; fi; "
+            "printf 'service_dump_begin\\n'; dumpsys battery 2>/dev/null; printf '\\nservice_dump_end\\n'; "
+            "dp=$(dumpsys power 2>/dev/null); "
+            "printf 'interactive=%s\\n' \"$(printf '%s' \"$dp\" | sed -n 's/.*mInteractive=\\([a-z]*\\).*/\\1/p' | head -1)\"; "
+            "printf 'power_save=%s\\n' \"$(printf '%s' \"$dp\" | sed -n 's/.*mPowerSaveMode=\\([a-z]*\\).*/\\1/p' | head -1)\"; "
+            "printf 'thermal_status=%s\\n' \"$(dumpsys thermalservice 2>/dev/null | "
+            "sed -n 's/.*Current Status:[ ]*\\([0-9]*\\).*/\\1/p' | head -1)\"; "
+            "printf 'boot_us='; awk '{printf \"%.0f\\n\", $1*1000000}' /proc/uptime")
+
+
+def _power_num(row, key):
+    try:
+        return int(str(row.get(key, "")).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def power_discharging(row):
+    """物理放电证据行：BatteryService 放电状态 + 四路供电旗标全证 false（plugged==0）。"""
+    return row.get("status") == "Discharging" and str(row.get("plugged")) == "0"
+
+
+def discharge_streak_us(rows, end_us=None):
+    """截至 end_us（缺省=最后一条观测）尾部那一串「连续物理放电」采样覆盖的时长。
+    尾部末行须在 end_us 的 3s 内且行间隔 ≤3s、行序单调；断链即只计尾段。"""
+    obs = sorted((_power_num(r, "boot_us"), r) for r in rows if _power_num(r, "boot_us") is not None)
+    if not obs:
+        return 0
+    if end_us is None:
+        end_us = obs[-1][0]
+    pre = [(b, r) for b, r in obs if b <= end_us]
+    if not pre or end_us - pre[-1][0] > 3_000_000 or not power_discharging(pre[-1][1]):
+        return 0
+    span, prev = 0, pre[-1]
+    for b, r in reversed(pre[:-1]):
+        if not power_discharging(r) or prev[0] - b > 3_000_000:
+            break
+        span += prev[0] - b
+        prev = (b, r)
+    return span
+
+
+def _power_slope(points):
+    """最小二乘斜率（x 单位 µs → 每 µs 值变化）。"""
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    xm, ym = sum(xs) / len(xs), sum(ys) / len(ys)
+    denom = sum((x - xm) ** 2 for x in xs)
+    return sum((x - xm) * (y - ym) for x, y in points) / denom if denom else 0.0
+
+
+def power_battery_window(rows, begin_us, end_us, check_charge=True,
+                         trim_start_us=15_000_000, trim_end_us=5_000_000):
+    """电池侧梯形积分：分析窗 = [begin+trim_start, end-trim_end]（每块剔首 15s/尾 5s）。
+    返回 dict：averageW/energyJ/durationSeconds + rawCurrentSign + chargeCounterW/
+    chargeToCurrentRatio + samples + tempRangeC + reason；任一作废门不过 → averageW=None。"""
+    result = {"scope": "battery", "comparableToIosWholeSystem": False, "averageW": None,
+              "rawCurrentSign": None, "reason": ""}
+
+    def fail(reason):
+        result["reason"] = reason
+        return result
+
+    if begin_us is None or end_us is None:
+        return fail("缺少窗口边界时钟")
+    begin, end = begin_us + trim_start_us, end_us - trim_end_us
+    if end <= begin:
+        return fail("剔首尾后分析窗为空（块太短）")
+    obs = [{"boot": _power_num(r, "boot_us"), "current": _power_num(r, "current_ua"),
+            "voltage": _power_num(r, "voltage_uv"), "charge": _power_num(r, "charge_uah"),
+            "status": r.get("status"), "plugged": str(r.get("plugged") or ""),
+            "interactive": str(r.get("interactive") or ""), "power_save": str(r.get("power_save") or ""),
+            "thermal": _power_num(r, "thermal_status"), "temp": _power_num(r, "temp_tenths_c"),
+            "raw": r} for r in rows]
+    if len(obs) < 2 or any(o["boot"] is None for o in obs):
+        return fail("boot_us 缺行/不可读")
+    if any(b["boot"] <= a["boot"] for a, b in zip(obs, obs[1:])):
+        return fail("电池采样时间重复或倒退")
+    pairs = [(a, b) for a, b in zip(obs, obs[1:]) if a["boot"] < end and b["boot"] > begin]
+    if not pairs or pairs[0][0]["boot"] > begin or pairs[-1][1]["boot"] < end:
+        return fail("窗口边界无采样覆盖")
+    points = [pairs[0][0]] + [b for a, b in pairs]
+    signs = set()
+    for o in points:
+        if not (o["plugged"] == "0" and o["status"] == "Discharging"):
+            return fail("窗口内存在接电/非放电行（plugged 或 status 证不出放电，整块作废）")
+        if o["interactive"] != "1" or o["power_save"] != "0":
+            return fail("屏幕交互/省电态在窗口内变化或读不出（整块作废）")
+        if o["thermal"] is None or o["thermal"] >= 3:
+            return fail("热档严重降频或读不出（thermal_status≥3，整块作废）")
+        if o["current"] is None or not 0 < abs(o["current"]) <= 30_000_000:
+            return fail("电流读数缺失或为 0 或越界（整块作废）")
+        if o["voltage"] is None or not 2_500_000 <= o["voltage"] <= 10_000_000:
+            return fail("电压读数缺失或越界 2.5–10V（整块作废）")
+        if o["charge"] is None or o["charge"] <= 0:
+            return fail("电量计读数缺失（charge_counter≤0，整块作废）")
+        signs.add(1 if o["current"] > 0 else -1)
+    if len(signs) != 1:
+        return fail("窗口内电流符号翻转（放电方向不自洽，整块作废）")
+    energy_ws, covered = 0.0, 0
+    for a, b in pairs:
+        if b["boot"] - a["boot"] > 3_000_000:
+            return fail("超过3秒采样空洞（掉线，整块作废）")
+        lo, hi = max(begin, a["boot"]), min(end, b["boot"])
+        wa, wb = abs(a["current"]) * a["voltage"] / 1e12, abs(b["current"]) * b["voltage"] / 1e12
+        wl = wa + (wb - wa) * (lo - a["boot"]) / (b["boot"] - a["boot"])
+        wr = wa + (wb - wa) * (hi - a["boot"]) / (b["boot"] - a["boot"])
+        energy_ws += (wl + wr) / 2 * (hi - lo) / 1e6
+        covered += hi - lo
+    if covered != end - begin:
+        return fail("采样未覆盖完整分析窗")
+    watts = energy_ws / (covered / 1e6)
+    charge_slope = _power_slope([(o["boot"], o["charge"]) for o in points])
+    charge_w = -charge_slope * sum(o["voltage"] for o in points) / len(points) * 3.6e-3
+    ratio = charge_w / watts if watts else None
+    if check_charge and not (ratio is not None and 0.5 <= ratio <= 1.5):
+        return fail(f"电流积分与电量计斜率趋势不合（ratio={ratio}，要 0.5–1.5）")
+    temps = [o["temp"] for o in points if o["temp"] is not None]
+    result.update(averageW=watts, energyJ=energy_ws, durationSeconds=covered / 1e6,
+                  rawCurrentSign=next(iter(signs)), samples=len(points),
+                  chargeCounterW=charge_w, chargeToCurrentRatio=ratio,
+                  tempRangeC=[min(temps) / 10, max(temps) / 10] if temps else None,
+                  reason="电池侧电流幅值×电压梯形积分（剔首尾），未经外部校准")
+    return result
+
+
+def power_charge_corroboration(rows):
+    """整局电量计交叉核对（兄弟项目 charge_corroboration 同式移植）：
+    电量计须单调下降；≥2 次等差递减 → 量子 q，端点差 ±q 区间收电流积分；
+    否则走整局 0.5–1.5 比值门（也要 ≥2 次向下跳变）。这是趋势一致性核对，
+    不是绝对功率标定；不 corroborate → 功耗判读未证。"""
+    obs = [{"boot": _power_num(r, "boot_us"), "current": _power_num(r, "current_ua"),
+            "charge": _power_num(r, "charge_uah"), "row": r} for r in rows]
+    base = {"corroborated": False, "precise_calibration": False}
+    if len(obs) < 3:
+        return {**base, "error": "电量观测不足 3 行"}
+    if any(o["boot"] is None or o["charge"] is None or o["current"] is None for o in obs):
+        return {**base, "error": "电量/电流/时钟读数缺行"}
+    if any(b["boot"] <= a["boot"] for a, b in zip(obs, obs[1:])):
+        return {**base, "error": "电量计观测时钟非单调"}
+    deltas = [a["charge"] - b["charge"] for a, b in zip(obs, obs[1:])]
+    nonzero = [v for v in deltas if v != 0]
+    if not nonzero or not all(v > 0 for v in nonzero):
+        return {**base, "error": "电量计无单调放电趋势"}
+    consumed = obs[0]["charge"] - obs[-1]["charge"]
+    integrated = 0.0
+    for a, b in zip(obs, obs[1:]):
+        seconds = (b["boot"] - a["boot"]) / 1e6
+        if not 0 < seconds <= 3:
+            return {**base, "error": "电量计观测采样间隔 >3s（掉线）"}
+        if not (power_discharging(a["row"]) and power_discharging(b["row"])):
+            return {**base, "error": "电量计核对要求整段物理放电（有接电/非放电行）"}
+        integrated += (abs(a["current"]) + abs(b["current"])) / 2 * seconds / 3600
+    out = {**base, "transitions": len(nonzero), "consumed_uah": consumed,
+           "integrated_current_uah": integrated}
+    if len(nonzero) >= 2 and len(set(nonzero)) == 1:
+        quantum = nonzero[0]
+        low, high = max(0, consumed - quantum), consumed + quantum
+        return {**out, "method": "observed_constant_quantum_endpoint_interval",
+                "quantum_uah": quantum, "counter_interval_uah": [low, high],
+                "corroborated": low <= integrated <= high}
+    ratio = consumed / integrated if integrated else None
+    return {**out, "method": "whole_run_charge_change", "charge_to_current_ratio": ratio,
+            "corroborated": len(nonzero) >= 2 and ratio is not None and 0.5 <= ratio <= 1.5}
+
+
+def power_log_blocks(text):
+    """设备侧采样文件 → 完整采样块列表（=== 分隔；末段未封闭的尾巴不算）。"""
+    return [block for block in text.split("\n" + POWER_BLOCK_SEP + "\n")[:-1]]
 
 
 class Refuse(Exception):
@@ -124,44 +384,145 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-STAT_MAP_CMD = ("cd {q} && find . -mindepth 1 -exec stat -c '%a|%F|%n' {{}} +")
-LINK_MAP_CMD = ("cd {q} && find . -type l -exec sh -c "
-                "'for p do printf \"%s\\t%s\\n\" \"$p\" \"$(readlink \"$p\")\"; done' _ {{}} +")
+# 目录清单三件套：find -exec {} + 会把全部路径摊进一次 exec——4 万文件的私有树
+# 触发 toybox E2BIG（Argument list too long，9000 实测；与 deploy_game 核验同病
+# 同治）：改 find -print0 | xargs -0 -n 256 分批。三道凭据缺一不可：① mksh
+# `set -o pipefail` + 左组 `echo S2A_FRC` 报 find 自己的 rc（mksh 无 PIPESTATUS，
+# 管道 rc 单独记 S2A_RC）——没有它 find 中途被拒（stderr Permission denied）
+# 管道照样 rc=0 吞掉失败（9000 实证复现）；② S2A_N=find 计数（连计数管道自己的
+# rc S2A_CRC）；③ stderr 全捕进变量、逐行 S2A_ERR: 前缀回投——adb 会把设备
+# stderr 混进 stdout 流，靠前缀区分，不靠宿主 stderr。任一 rc≠0、计数非数字、
+# stderr 非白名单 = 清单未证，半截不当全量。
+LISTING_STDERR_OK = ()          # 明确无害的 stderr 行白名单（目前为空：有 stderr 即未证）
+TAR_STDERR_OK = ()              # 备份 tar 的 stderr 白名单（同上：有 stderr 即备份未证）
 
 
-def _entry_map(sha_text, stat_text, link_text):
-    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}。rel 去掉 ./ 前缀。"""
+def _listing_cmd(dir_, find_, xargs_, count_):
+    """分批清单命令：fd3 旁路把清单与标记送 stdout，stderr 全捕 err 变量
+    逐行 S2A_ERR: 前缀回投（mksh 无 PIPESTATUS/process-sub 的兼容写法）。
+    计数先行，计数=0 不跑 find|xargs——toybox xargs 无 -r 时默认空输入也
+    跑一次命令（sha256sum 空参读 stdin 出幻影行，空树会误拒）。"""
+    return (f"cd {shlex.quote(dir_)} && {{ set -o pipefail; exec 3>&1; err=$( {{ "
+            f"n=$({count_} | wc -l); echo \"S2A_N=${{n##* }} S2A_CRC=$?\" >&3; "
+            f"if [ \"${{n##* }}\" -gt 0 ] 2>/dev/null; then "
+            f"{{ {find_}; echo \"S2A_FRC=$?\" >&3; }} | {xargs_} >&3; "
+            "echo \"S2A_RC=$?\" >&3; "
+            "else echo \"S2A_FRC=0\" >&3; echo \"S2A_RC=0\" >&3; fi; "
+            "} 2>&1 ); exec 3>&-; "
+            "[ -z \"$err\" ] || printf '%s\\n' \"$err\" | sed 's/^/S2A_ERR: /'; }}")
+
+
+def _stat_map(stat_text):
+    """stat -c '%a|%F|%n' 清单 → {rel: {t, mode}}。rel 去掉 ./ 前缀。"""
     entries = {}
     for ln in stat_text.splitlines():
         ln = ln.strip()
         if not ln or "|" not in ln:
             continue
         mode, ftype, name = ln.split("|", 2)
-        rel = posixpath.normpath(name)
-        if rel in ("", "."):
-            continue
-        t = {"regular file": "f", "directory": "d", "symbolic link": "l"}.get(ftype, ftype)
-        entries[rel] = {"t": t, "mode": int(mode, 8)}
-    for rel, sha in _sha_listing(sha_text).items():
-        if rel in entries:
-            entries[rel]["sha"] = sha
+        if not name.strip():
+            continue                       # 空名行不成条目（normpath("") 会归一成 "."）
+        rel = posixpath.normpath(name)     # "." = 根自身：收进清单核根权限（P2）
+        # toybox stat %F 类型名（8E 实测：0 字节文件出 "regular empty file"，
+        # 不是 "regular file"）；fifo/socket/字符/块设备映各自码，仍被 != f 拒
+        t = {"regular file": "f", "regular empty file": "f",
+             "directory": "d", "symbolic link": "l",
+             "fifo": "p", "socket": "s",
+             "character special file": "c",
+             "block special file": "b"}.get(ftype, ftype)
+        try:
+            mode_i = int(mode, 8)
+        except ValueError:
+            raise RuntimeError(f"stat 清单未证：mode={mode!r} 非八进制")
+        entries[rel] = {"t": t, "mode": mode_i}
+    return entries
+
+
+def _link_map(link_text):
+    """软链清单（path<TAB>target 行）→ {rel: target}。"""
+    links = {}
     for ln in link_text.splitlines():
         if "\t" not in ln:
             continue
         name, target = ln.split("\t", 1)
         rel = posixpath.normpath(name.strip())
+        if rel in ("", "."):
+            continue
+        links[rel] = target
+    return links
+
+
+def _entry_map(sha_map, stat_map, link_map):
+    """三份设备清单 → {rel: {t: f/d/l, sha?, mode, target?}}（stat 为主集）。"""
+    entries = {rel: dict(e) for rel, e in stat_map.items()}
+    for rel, sha in sha_map.items():
+        if rel in entries:
+            entries[rel]["sha"] = sha
+    for rel, target in link_map.items():
         if rel in entries:
             entries[rel]["target"] = target
     return entries
 
 
-def device_entries(d, pkg, dir_):
-    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。"""
-    sha_text = d.run_as(pkg, f"cd {shlex.quote(dir_)} && find . -type f -exec sha256sum {{}} +",
-                        timeout=300)
-    stat_text = d.run_as(pkg, STAT_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
-    link_text = d.run_as(pkg, LINK_MAP_CMD.format(q=shlex.quote(dir_)), timeout=300)
-    return _entry_map(sha_text, stat_text, link_text)
+def _listing_parts(text, what):
+    """分批清单输出 → (清单文本, find 计数)。凭据：S2A_FRC=find rc、
+    S2A_RC=管道 rc（pipefail）、S2A_N=find 计数、S2A_CRC=计数管道 rc、
+    S2A_ERR:=stderr 行。任一 rc 非零/缺失、计数非数字、stderr 非白名单
+    → RuntimeError 清单未证（半截/未证清单不当全量，fail closed）。"""
+    lines, rcs, want, err = [], {}, None, []
+    for ln in text.splitlines():
+        if ln.startswith("S2A_ERR: "):
+            err.append(ln[9:])
+        elif ln.startswith("S2A_FRC="):
+            rcs["find"] = ln[8:]
+        elif ln.startswith("S2A_RC="):
+            rcs["xargs"] = ln[7:]
+        elif ln.startswith("S2A_N="):
+            m = re.match(r"^S2A_N=(\S+) S2A_CRC=(\S+)$", ln)
+            if m:
+                want, rcs["count"] = m.groups()
+        else:
+            lines.append(ln)
+    try:
+        want_n = int(want) if want is not None else None
+    except (TypeError, ValueError):
+        want_n = None
+    bad_err = [l for l in err if l not in LISTING_STDERR_OK]
+    if (want_n is None or len(rcs) != 3 or any(v != "0" for v in rcs.values())
+            or bad_err):
+        raise RuntimeError(f"{what}清单未证（rc={rcs}，计数={want!r}，"
+                           f"stderr={err[:3]!r}）：半截不当全量")
+    return "\n".join(lines), want_n
+
+
+def device_entries(d, pkg, dir_, raw=None):
+    """设备目录全量清单：文件 sha + 类型 + 权限位 + 软链目标（解包核对与还原复核共用）。
+    三份清单各走 -print0|xargs -n 256 分批（E2BIG），每批 rc=0 且解析条目数与
+    find 计数一致才算完整。raw 传 dict 时回填三份设备端原始输出（核对失败落盘归因用）。"""
+    sha_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -type f -print0",
+        "xargs -0 -n 256 sha256sum", "find . -type f"), timeout=300)
+    stat_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -mindepth 0 -print0",      # mindepth 0 含根目录自身：
+        "xargs -0 -n 256 stat -c '%a|%F|%n'", "find . -mindepth 0"), timeout=300)
+    link_text = _owner_sh(d, pkg, dir_, _listing_cmd(
+        dir_, "find . -type l -print0",
+        "xargs -0 -n 256 sh -c 'for p do printf \"%s\\t%s\\n\" \"$p\" "
+        "\"$(readlink \"$p\")\"; done' _", "find . -type l"), timeout=300)
+    if raw is not None:
+        raw.update(sha256sum=sha_text, stat=stat_text, links=link_text)
+    sha_text, sha_want = _listing_parts(sha_text, "文件 sha ")
+    stat_text, stat_want = _listing_parts(stat_text, "stat ")
+    link_text, link_want = _listing_parts(link_text, "软链 ")
+    sha_map, stat_map, link_map = (_sha_listing(sha_text),
+                                   _stat_map(stat_text), _link_map(link_text))
+    bad = [f"{w}{have}≠{want}" for w, have, want in
+           (("文件 sha ", len(sha_map), sha_want),
+            ("stat ", len(stat_map), stat_want),
+            ("软链 ", len(link_map), link_want)) if have != want]
+    if bad:
+        raise RuntimeError(f"{dir_} 目录清单不完整（{'；'.join(bad)}）：半截不当全量")
+    return _entry_map(sha_map, stat_map, link_map)
 
 
 def tar_entries(tar_path):
@@ -170,14 +531,16 @@ def tar_entries(tar_path):
     with tarfile.open(tar_path) as tf:
         for mem in tf.getmembers():
             # toybox `tar -cf - -C dir .` 首成员是 ./（tarfile 读出名归一成 .）：
-            # 根目录不进清单（设备端 find -mindepth 1 也不含根），归一后跳过
+            # 根目录也进清单（rel="."），与设备端 stat mindepth 0 同口径——
+            # 根权限还原核验靠这条对拍，双侧原来都跳过是漏洞
             rel = posixpath.normpath(mem.name)
-            if rel in ("", "."):
-                continue
             if mem.isfile():
-                data = tf.extractfile(mem).read()
+                h = hashlib.sha256()
+                with tf.extractfile(mem) as ef:
+                    for block in iter(lambda: ef.read(1 << 20), b""):
+                        h.update(block)          # 大成员分块算，不整驻宿主内存
                 entries[rel] = {"t": "f", "mode": mem.mode & 0o7777,
-                                "sha": hashlib.sha256(data).hexdigest()}
+                                "sha": h.hexdigest()}
             elif mem.isdir():
                 entries[rel] = {"t": "d", "mode": mem.mode & 0o7777}
             elif mem.issym():
@@ -223,18 +586,33 @@ def _sha_listing(text):
     return files
 
 
+def _is_private_tree(pkg, dir_):
+    """应用私有树 = /data/data/<pkg> 及其子路径——只有它走 run-as。"""
+    root = f"/data/data/{pkg}"
+    return dir_ == root or dir_.startswith(root + "/")
+
+
+def _owner_sh(d, pkg, dir_, cmd, timeout=120):
+    """数据目录访问通道：私有树走 run-as（应用 uid 才够权）；
+    其余目录（/sdcard/Android/* 外部数据）走 shell——9000 实测 run-as 碰外部
+    目录被 SELinux 拒，而 shell 有外部存储全权。命令本体与判读口径不变。"""
+    if _is_private_tree(pkg, dir_):
+        return d.run_as(pkg, cmd, timeout=timeout)
+    return d.shell(cmd, timeout=timeout)
+
+
 def _dir_probe(d, pkg, dir_):
     """三态探针：ok=可访问 / absent=不存在 / denied=证不了（进不去或父目录
     不可搜索）。`[ -e ]` 是假三态——父目录不可搜索时它和「不存在」一样返回
     假（qa-fone 受限父目录实测）：必须用 stat 接 stderr 分 EACCES/ENOENT，
     分辨不了的一律 denied，绝不静默跳过。"""
     q = shlex.quote(dir_)
-    out = d.run_as(pkg, f"e=$(stat -c %F {q} 2>&1); "
-                        f"if [ $? -eq 0 ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
-                        f"then echo ok; else echo denied; fi; else "
-                        f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo denied;; "
-                        f"*\"No such\"*|*ENOENT*) echo absent;; *) echo denied;; esac; fi",
-                   timeout=30).strip().splitlines()
+    out = _owner_sh(d, pkg, dir_, f"e=$(stat -c %F {q} 2>&1); "
+                    f"if [ $? -eq 0 ]; then if [ -d {q} ] && [ -r {q} ] && [ -x {q} ]; "
+                    f"then echo ok; else echo denied; fi; else "
+                    f"case \"$e\" in *[Pp]ermission*|*EACCES*) echo denied;; "
+                    f"*\"No such\"*|*ENOENT*) echo absent;; *) echo denied;; esac; fi",
+                    timeout=30).strip().splitlines()
     return out[-1].strip() if out else "denied"
 
 
@@ -248,11 +626,50 @@ def _verify_tar(manifest, backup_dir, tag):
         return [f"归档解不开：{error}"]
 
 
-def backup_data(d, pkg, dest):
-    """debuggable 原包的私有 / 外部数据 → exec-out run-as tar 拉回 + 全量清单
-    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。归档落盘后先解包与源清单
-    逐项核对——对不上即 Refuse（保证不了还原就不入局）；存在但不可访问的目录
-    报错而不是当不存在。"""
+def _exec_out_stream(d, cmd_args, dest, timeout=600):
+    """exec-out 字节流分块落盘、边写边算 sha——不把整份备份读进宿主内存
+    （9000 私有树实测 ~7.3GB，capture_output 直接爆内存）。stderr 落临时文件，
+    防设备端报错输出填满管道互锁。超时/异常杀子进程、删半截归档再抛。
+    返回 (字节数, sha256, rc, stderr 文本)。"""
+    sel = selectors.DefaultSelector()
+    err_f = tempfile.TemporaryFile()
+    p = subprocess.Popen([*d.argv, "exec-out", *cmd_args],
+                         stdout=subprocess.PIPE, stderr=err_f)
+    h, nbytes = hashlib.sha256(), 0
+    deadline = time.monotonic() + timeout
+    try:
+        sel.register(p.stdout, selectors.EVENT_READ)
+        with open(dest, "wb") as fh:
+            while True:
+                if not sel.select(max(0.0, deadline - time.monotonic())):
+                    raise subprocess.TimeoutExpired(cmd_args, timeout)
+                chunk = p.stdout.read1(1 << 22)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                h.update(chunk)
+                nbytes += len(chunk)
+        rc = p.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except BaseException:
+        p.kill()
+        p.wait()
+        dest.unlink(missing_ok=True)
+        raise
+    finally:
+        sel.close()
+        p.stdout.close()
+    err_f.seek(0)
+    err = err_f.read().decode(errors="replace").strip()
+    err_f.close()
+    return nbytes, h.hexdigest(), rc, err
+
+
+def backup_data(d, pkg, dest, left=None):
+    """debuggable 原包的私有 / 外部数据 → exec-out tar 流式拉回 + 全量清单
+    （文件 sha + 软链目标 + 目录含空目录 + 权限位）。通道按目录归属：私有树
+    run-as（应用 uid），外部目录 shell（9000 实测 run-as 碰 /sdcard/Android/*
+    被 SELinux 拒）。归档落盘后先解包与源清单逐项核对——对不上即 Refuse
+    （保证不了还原就不入局）；存在但不可访问的目录报错而不是当不存在。"""
     dest.mkdir(parents=True)
     manifest = {"schema": 2, "package": pkg, "dirs": {}}
     for tag, tpl in DATA_DIRS:
@@ -264,14 +681,52 @@ def backup_data(d, pkg, dest):
             raise Refuse(f"{dir_} 目录状态证不了（存在但进不去或父目录不可搜索）："
                          f"证不了也备不了，不动这台设备")
         tar = dest / f"{tag}.tar"
-        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给 debuggable 包
-        r = subprocess.run([*d.argv, "exec-out", "run-as", pkg, "sh", "-c",
-                            f"tar -cpf - -C {shlex.quote(dir_)} ."],
-                           capture_output=True, timeout=600)
-        if r.returncode or not r.stdout:
-            raise Refuse(f"{dir_} 备份失败 rc={r.returncode}（run-as/tar 不可用就当非 debuggable 拒跑）")
-        tar.write_bytes(r.stdout)
-        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": sha256(tar),
+        # exec-out 不经 pty：二进制流不被 \r\n 改写；run-as 只给私有树 debuggable 包。
+        # exec-out 会把设备 stderr 混进归档字节流（9000 实证 ext.tar 尾部带
+        # "tar: … Permission denied / tar: had errors"，宿主 stderr 反而是空的）——
+        # stderr/rc 落设备侧本局唯一凭据：/data/local/tmp/s2a-tar-<tag>-<uuid>-{err,rc}
+        # （被备份树之外——树里放凭据会删到用户同名文件还得靠 tar --exclude 排除，
+        #   qa-fone #329620；/data/local/tmp 是 shell 域，预建 0666 让 run-as
+        #   应用 uid 也能 2>/> 写）。预建先证不存在，存在即停不覆盖；拉完读回
+        # 再核删；创建即登记待清——流传输异常/超时的任何路径都先核凭据删除
+        # （qa-fone #329632），删不净 = 备份未证且凭据登记保留 → 收局并入留置。
+        aux = f"/data/local/tmp/s2a-tar-{tag}-{uuid.uuid4().hex[:12]}"
+        en, rn = aux + "-err", aux + "-rc"
+        try:
+            d.shell(f"[ ! -e {en} ] && [ ! -e {rn} ] && : > {en} && : > {rn} "
+                    f"&& chmod 0666 {en} {rn} && test -w {en} && test -w {rn}",
+                    timeout=30)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            raise Refuse(f"备份凭据 {aux}-* 预建失败或路径已存在（{error}）："
+                         f"不覆盖既有文件，不动这台设备") from error
+        if left is not None:
+            left.append((en, rn))
+        q = shlex.quote(dir_)
+        try:
+            cmd_ = f"cd {q} && tar -cpf - . 2> {en}; echo $? > {rn}"
+            args_ = (["run-as", pkg, "sh", "-c", cmd_] if _is_private_tree(pkg, dir_)
+                     else ["sh", "-c", cmd_])
+            nbytes, digest, rc, _err = _exec_out_stream(d, args_, tar, timeout=600)
+            try:
+                dev_rc = d.shell(f"cat {rn}", timeout=30).strip()
+                dev_err = d.shell(f"cat {en}", timeout=30)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                raise Refuse(f"{dir_} 备份 tar 的 rc/err 凭据读不回（{error}）：备份未证") \
+                    from error
+            bad_err = [l for l in dev_err.splitlines() if l not in TAR_STDERR_OK]
+            if rc or dev_rc != "0" or not nbytes or bad_err:
+                raise Refuse(f"{dir_} 备份未证（exec-out rc={rc}，tar rc={dev_rc!r}，"
+                             f"stderr={bad_err[:3]!r}）：不拿未证的归档动这台设备")
+        finally:
+            # 凭据核删：流传输/取证任何出口都走到；删不净登记保留 → 收局留置
+            try:
+                d.shell(f"rm -f {en} {rn} && test ! -e {en} && test ! -e {rn}",
+                        timeout=30)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                raise Refuse(f"{dir_} 备份 tar 凭据删不净（{error}）：备份未证") from error
+            if left is not None:
+                left.remove((en, rn))
+        manifest["dirs"][tag] = {"dir": dir_, "tar": tar.name, "tar_sha256": digest,
                                  "entries": device_entries(d, pkg, dir_)}
         bad = _verify_tar(manifest, dest, tag)
         if bad:
@@ -300,25 +755,170 @@ def restore_data(d, pkg, manifest, backup_dir):
         if "Success" not in out_:
             fails.append(f"pm clear 未返回 Success（{out_.strip()[:120] or '无输出'}）："
                          f"数据回灌不执行")
-    except (RuntimeError, subprocess.SubprocessError) as error:
+    except Exception as error:
         fails.append(f"pm clear 异常：{error}")
     if fails:
         return fails
     for tag, info in manifest["dirs"].items():
         dir_ = info["dir"]
         try:
-            d.run_as(pkg, f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
-                     timeout=120)
+            _owner_sh(d, pkg, dir_,
+                      f"mkdir -p {shlex.quote(dir_)}; find {shlex.quote(dir_)} -mindepth 1 -delete",
+                      timeout=120)
             tmp = f"/data/local/tmp/s2a-restore-{tag}.tar"
             d.run("push", str(Path(backup_dir) / info["tar"]), tmp, timeout=300)
-            d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
+            _owner_sh(d, pkg, dir_, f"tar -xpf {tmp} -C {shlex.quote(dir_)}", timeout=600)
             d.shell(f"rm -f {tmp}", allowed=(0, 1))
             bad = entries_diff(info["entries"], device_entries(d, pkg, dir_))
             if bad:
                 fails.append(f"{dir_} 还原后与备份清单不符 {len(bad)} 项：{bad[:3]}")
-        except (RuntimeError, subprocess.SubprocessError) as error:
+        except Exception as error:
+            # 回灌后核验链上任何异常（含清单解析错误）都进 fails → 留置，
+            # 不许逸出跳过 manifest/release 收尾（qa-fone P1：ValueError 曾越过）
             fails.append(f"{dir_} 数据还原 adb 异常：{error}")
     return fails
+
+
+def apply_checkpoint(d, pkg, cp_dir, manifest, log, out):
+    """s2a-checkpoint/1 → 部署后、首启前解进存档根（BootSpec 冻结：
+    files/user/0/saves/<titleId>/ryujinx-android；S2A_SAVE_DIR 在 typed BootSpec 下不生效）。
+    写设备前宿主全验：schema/包名/titleId（规范 16 位大写十六进制）/meta.files 每项
+    [长度, sha256] 对（含重复键、64-hex 校验）/tar sha/成员白名单（绝对路径、..、
+    软链硬链、设备节点、重复成员名拒）/成员↔清单严格一致（含声明长度↔成员长度）。
+    过门 push → run-as tar 解 → 逐文件 sha 复核。任一门不过记 verify=fail 抛 Refuse；
+    临时 tar 删除失败记 tmp_left，收局并入还原失败 → 留置。"""
+    block = manifest.setdefault("checkpoint", {"name": cp_dir.name})
+    block.setdefault("name", cp_dir.name)
+
+    def deny(reason):
+        block["verify"] = "fail"
+        block["fail"] = reason
+        raise Refuse(f"检查点 {cp_dir.name} 不可用：{reason}")
+
+    try:
+        raw = json.loads((cp_dir / "meta.json").read_text(),
+                         object_pairs_hook=lambda p: p)
+    except (OSError, json.JSONDecodeError) as error:
+        deny(f"meta.json 读不了：{error}")
+    try:
+        meta = dict(raw)
+    except (TypeError, ValueError):
+        deny("meta.json 顶层不是对象表")
+    if meta.get("schema") != "s2a-checkpoint/1":
+        deny(f"schema 不是 s2a-checkpoint/1（{meta.get('schema')}）")
+    if meta.get("package") != pkg:
+        deny(f"meta.package={meta.get('package')} 与本局 {pkg} 不符")
+    title_id = str(meta.get("title_id") or "")
+    if not re.fullmatch(r"[0-9A-F]{16}", title_id):
+        deny(f"meta.title_id={title_id!r} 不是规范 16 位大写十六进制")
+    mtid = re.search(r"\.t([0-9a-fA-F]{16})$", pkg)
+    if mtid and title_id.lower() != mtid.group(1).lower():
+        deny(f"meta.title_id={title_id} 与包名 {pkg} 的 titleId 不符")
+    pairs = meta.get("files")
+    if not isinstance(pairs, list) or not pairs:
+        deny("meta.files 空或不是清单表")
+    files_map = {}
+    for item in pairs:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2
+                and isinstance(item[0], str)):
+            deny("meta.files 不是 {路径: [长度, sha256]} 清单表")
+        rel, want = item[0], item[1]
+        rel = posixpath.normpath(rel)
+        if rel in files_map:
+            deny(f"meta.files 重复声明 {rel}")
+        if not (isinstance(want, list) and len(want) == 2
+                and isinstance(want[0], int) and want[0] >= 0
+                and isinstance(want[1], str)
+                and re.fullmatch(r"[0-9a-f]{64}", want[1])):
+            deny(f"meta.files[{rel}] 不是 [长度≥0, sha256(64hex)] 对")
+        files_map[posixpath.normpath(rel)] = want
+    tar_p = cp_dir / "saves.tar"
+    try:
+        want_tar_sha = (cp_dir / "saves.tar.sha256").read_text().split()[0]
+    except (OSError, IndexError) as error:
+        deny(f"saves.tar.sha256 读不了：{error}")
+    got_tar_sha = sha256(tar_p)
+    if got_tar_sha != want_tar_sha:
+        deny(f"saves.tar sha256 与 .sha256 不符（{got_tar_sha[:12]}≠{want_tar_sha[:12]}）")
+    block["source_sha256"] = want_tar_sha
+    tar_shas = {}
+    try:
+        with tarfile.open(tar_p) as tf:
+            members = tf.getmembers()
+            # 写设备前逐文件算 tar 内容 sha：只核长度会放过同长异内容的成员
+            for mem in members:
+                if mem.isfile():
+                    fh = tf.extractfile(mem)
+                    tar_shas[posixpath.normpath(mem.name)] = hashlib.sha256(
+                        fh.read() if fh else b"").hexdigest()
+    except (tarfile.TarError, OSError, EOFError) as error:
+        deny(f"saves.tar 打不开/截断：{error}")
+    tar_files, tar_sizes, seen = {}, {}, set()
+    for mem in members:
+        if (mem.name.startswith("/") or posixpath.isabs(mem.name)
+                or ".." in mem.name.split("/")):
+            deny(f"tar 成员越界：{mem.name}")
+        rel = posixpath.normpath(mem.name)
+        if rel in seen:
+            deny(f"tar 成员重复：{rel}")
+        seen.add(rel)
+        if mem.isfile():
+            tar_files[rel] = True
+            tar_sizes[rel] = mem.size
+        elif not mem.isdir():
+            deny(f"tar 成员类型不收（{mem.name}）：只收普通文件与目录")
+    extra = sorted(rel for rel in tar_files if rel not in files_map)
+    missing = sorted(rel for rel in files_map if rel not in tar_files)
+    if extra or missing:
+        deny(f"tar 成员与 meta.files 不一致：多 {extra[:3] or '无'} 缺 {missing[:3] or '无'}")
+    bad_size = sorted(rel for rel, want in files_map.items()
+                      if tar_sizes[rel] != want[0])
+    if bad_size:
+        deny(f"声明长度与 tar 成员不符 {len(bad_size)} 项：{bad_size[:3]}")
+    bad_sha = sorted(rel for rel, want in files_map.items()
+                     if tar_shas.get(rel) != want[1])
+    if bad_sha:
+        deny(f"tar 成员内容 sha 与 meta.files 不符 {len(bad_sha)} 项：{bad_sha[:3]}")
+    state_dir = f"/data/data/{pkg}/files/user/0/saves/{title_id}/ryujinx-android"
+    tmp = f"/data/local/tmp/s2a-checkpoint-{uuid.uuid4().hex[:12]}.tar"
+    # 先登记待清，确认设备上已删除才撤销：push 中途失败、rm 失败或被中断
+    # （SIGTERM / KeyboardInterrupt）都留下登记，收局并入还原失败 → 留置
+    block["tmp_left"] = tmp
+    try:
+        d.run("push", str(tar_p), tmp, timeout=300)
+        d.run_as(pkg, f"mkdir -p {shlex.quote(state_dir)}", timeout=60)
+        d.run_as(pkg, f"tar -xpf {tmp} -C {shlex.quote(state_dir)}", timeout=600)
+    finally:
+        try:
+            d.shell(f"rm -f {tmp}")          # rc≠0 抛错；rc=0（rm -f）即已不在
+            block.pop("tmp_left", None)
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            block["tmp_cleanup_error"] = str(error)[:160]
+    if block.get("tmp_left"):
+        deny(f"临时归档 {tmp} 清不掉或未证已删，停起局并留置")
+    raw = {}
+    entries = device_entries(d, pkg, state_dir, raw=raw)
+    bad = [rel for rel, want in files_map.items()
+           if entries.get(rel, {}).get("t") != "f" or entries[rel].get("sha") != want[1]]
+    if bad:
+        # verify=fail 归因：设备端原始 stat/sha/软链清单落 out/checkpoint-device/
+        dump = out / "checkpoint-device"
+        dump.mkdir(parents=True, exist_ok=True)
+        for name, text in raw.items():
+            (dump / f"{name}.txt").write_text(text)
+        block["device_listing"] = "checkpoint-device/"
+        deny(f"解入后核对不符 {len(bad)} 项：{bad[:3]}"
+             f"（设备原始清单已存 {dump.name}/）")
+    block.update(scene=meta.get("scene"), title_id=title_id,
+                 files=len(files_map),
+                 extra_files=sum(1 for rel, e in entries.items()
+                                 if rel != "." and rel not in files_map
+                                 and e.get("t") != "d"),
+                 extra_dirs=sum(1 for rel, e in entries.items()
+                                if rel != "." and rel not in files_map
+                                and e.get("t") == "d"),
+                 verify="ok")
+    log(f"检查点 {cp_dir.name} 已解入 saves/{title_id}/ryujinx-android（{len(files_map)} 文件 sha 复核过）")
 
 
 def uptime_us(d):
@@ -424,7 +1024,7 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
     帧记录 CLOCK_BOOTTIME，窗口边界同样取设备 /proc/uptime —— 同一时钟裁窗；
     不拿「最大完整块」当有效窗：块里窗口外的帧（启动期 / 收局后）不进表；
     覆盖事实（span / 首尾空档 / 占比）写进返回值，覆盖不足由判读者如实判。"""
-    header = "frame\tpresent_ns\tdisp_us\twall_us\n"
+    header = "frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n"
     (out / "frames.tsv").write_text(header)
     kept = []
     for cap in caps:
@@ -440,12 +1040,25 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
     if kept:
         cap, rec = max(kept, key=lambda k: len(k[1]))
         first = int(cap["meta"]["first"])
+        # v5 记录的 disp_us/disp_seq：displayTiming 已确认的相邻帧上屏间隔，disp_seq
+        # 标明间隔属于哪个较新帧（与帧号同域 = first+i+1 基 present 序号）；读数比所属
+        # 帧晚到（落在当时正在写的记录上），按 seq 对号不按行序；未确认/旧版本（v2–v4）
+        # 留空——CPU present 间隔不冒充确认读数。
+        disp_by_seq = {}
+        if cap.get("disp_us") and cap.get("disp_seq"):
+            for i, (us, seq) in enumerate(zip(cap["disp_us"], cap["disp_seq"])):
+                if us is not None and seq is not None:
+                    disp_by_seq[seq] = us
         with (out / "frames.tsv").open("w") as f:
             f.write(header)
             for j in range(1, len(rec)):
                 (i0, t0), (i1, t1) = rec[j - 1], rec[j]
-                # stats() 同一口径：帧号 = 1 基 present 序号；disp_us = 相邻上屏间隔
-                f.write(f"{first + i1 + 1}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}\n")
+                # stats() 同一口径：帧号 = 1 基 present 序号；present_us/wall_us =
+                # 相邻 present 间隔（宿主算，CPU 口径）；disp_us/disp_seq 只写实测确认值。
+                n = first + i1 + 1
+                du = disp_by_seq.get(n)
+                f.write(f"{n}\t{t1 * 1000}\t{t1 - t0}\t{t1 - t0}"
+                        + (f"\t{du}\t{n}\n" if du is not None else "\t\t\n"))
                 rows += 1
         if window_us:
             w0, w1 = window_us
@@ -704,26 +1317,40 @@ def frame_dump_done(d, pkg, since):
 POWER_LOG = "/data/local/tmp/s2a-power-samples.log"
 
 
+SAMPLER_TAG = "s2a-power-sampler"
+
+
 def start_power_sampler(d, supply):
     """设备侧采样守护：mksh 后台 while 循环 1Hz 写 `===` 分隔的采样块到
     /data/local/tmp——adb 掉线只断拉取、不断设备上的采样（兄弟项目
-    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。"""
+    「应用私存数据、拔电期间 adb 断开也不丢」同语义）。整串必须走 sh -c。
+    后台进程必须三 fd 全脱离（adbd 语义：有任何 fd 挂着传输通道，adb shell
+    就不退，8E 实测 15s 超时、孤儿守护继续写）——setsid 另开会话脱控制终端，
+    </dev/null + 输出进日志文件 + stderr 并入；PID 文件由守护自己写（setsid
+    可能 fork，$! 不一定就是守护号），并留 SAMPLER_TAG 供 pgrep 兜底。"""
     dest = POWER_LOG
-    inner = (f"rm -f {dest}; ( while :; do {android_power.sample_command(supply)}; "
-             f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
-             f"printf '{android_power.BLOCK_SEP}\\n'; sleep 1; done )"
-             f" >{dest} 2>/dev/null </dev/null & echo $!")
+    loop = (f"echo $$ >{dest}.pid; while :; do : {SAMPLER_TAG}; "
+            f"{power_sample_command(supply)}; "
+            f"printf 'capacity=%s\\n' \"$(cat /sys/class/power_supply/{supply}/capacity 2>/dev/null)\"; "
+            f"printf '{POWER_BLOCK_SEP}\\n'; sleep 1; done")
+    inner = (f"rm -f {dest} {dest}.pid; "
+             f"setsid sh -c {shlex.quote(loop)} >{dest} 2>&1 </dev/null & echo $!")
     out = d.shell("sh -c " + shlex.quote(inner), timeout=15).strip()
-    return dest, out.splitlines()[-1].strip()
+    pid = out.splitlines()[-1].strip() if out.splitlines() else ""
+    if not re.fullmatch(r"[0-9]+", pid):
+        # 空回/半截回执（sh 报错文本、通道被掐后的残缺输出）= spawn 未证：
+        # 守护可能已起在写——按启动失败交调用方扫孤儿，不拿脏串当 PID。
+        raise RuntimeError(f"采样守护启动回执不可信：{out[-120:]!r}")
+    return dest, pid
 
 
 def power_rows(d, dest):
     """cat 设备采样文件 → [(row, level)]；末段未封闭的尾巴不算（下轮再收）。"""
     out = []
     text = d.shell(f"cat {dest}", allowed=(0, 1), timeout=20)
-    for block in android_power.power_log_blocks(text):
+    for block in power_log_blocks(text):
         try:
-            row = android_power.parse_sample(block + "\n")
+            row = power_parse_sample(block + "\n")
         except (RuntimeError, ValueError):
             continue  # 坏块跳过（设备文件原样留着，不丢证据）
         level = (re.search(r"^capacity=(\d+)$", block, re.M) or [None, ""])[1]
@@ -731,10 +1358,28 @@ def power_rows(d, dest):
     return out
 
 
-def stop_power_sampler(d, dest, pid):
-    """杀守护 → 拉回全量 → 清设备文件；返回 [(row, level)]。"""
-    d.shell(f"kill {pid}", allowed=(0, 1), timeout=10)
+def stop_power_sampler(d, dest, pid=None):
+    """杀守护 → 退场复验 → 拉回全量 → 清设备文件；返回 [(row, level)]。
+    pid 拿不到（起守护超时 / 中断在赋值前）也照扫：PID 文件与 SAMPLER_TAG
+    进程标记两路兜底，设备上不留孤儿循环。杀后仍有守护存活 → 抛错留证
+    （日志已拉回、设备文件不清）。"""
+    # kill 前按 /proc/<pid>/cmdline 核标记——PID 被回收成别家进程不许误杀；
+    # 只等真杀过的 pid 退场（/proc/<pid> 没了才算死），杀不死的报 LINGER。
+    out = d.shell(
+        f"pids=\"{pid or ''} $(cat {dest}.pid 2>/dev/null) "
+        f"$(pgrep -f {SAMPLER_TAG} 2>/dev/null)\"; killed=; "
+        f"for p in $pids; do grep -aqs {SAMPLER_TAG} /proc/$p/cmdline 2>/dev/null "
+        f"&& kill $p 2>/dev/null && killed=\"$killed $p\"; done; "
+        f"for p in $killed; do i=0; "
+        f"while [ -d /proc/$p ] && [ $i -lt 10 ]; do sleep 0.2; i=$((i+1)); done; "
+        f"[ -d /proc/$p ] && echo LINGER:$p; done; "
+        f"rm -f {dest}.pid",
+        allowed=(0, 1), timeout=15)
     rows = power_rows(d, dest)
+    linger = [w.split(":", 1)[1] for w in out.split() if w.startswith("LINGER:")]
+    if linger:
+        raise RuntimeError(
+            f"采样守护 {','.join(linger)} 杀掉后仍存活，设备文件留 {dest} 未清")
     d.shell(f"rm -f {dest}", allowed=(0, 1), timeout=10)
     return rows
 
@@ -760,8 +1405,12 @@ def main(argv=None):
     src = p.add_mutually_exclusive_group()
     src.add_argument("--resources")
     src.add_argument("--pack")
+    p.add_argument("--checkpoint", type=Path, default=None, metavar="DIR",
+                   help="s2a-checkpoint/1 检查点目录：部署后、首启前 run-as 解进存档根并逐文件 sha 核对")
     p.add_argument("--mode", choices=["auto", "generic", "direct"], default="auto")
     p.add_argument("--extra", action="append", default=[], help="s2arm.KEY[=VALUE]，可多次")
+    p.add_argument("--ab-prop", action="append", default=[], metavar="debug.s2a.KEY=VALUE",
+                   help="A/B 局用：起局前在锁内置位一个 debug.s2a.* 属性（记原值、读回核对、收局与运行器自管属性同一条恢复链），可多次")
     p.add_argument("--allow-data-loss", action="store_true",
                    help="设备已装该包也照跑：只还原 APK 字节，私有数据与已并入资源不还原（显式接受数据丢失）")
     p.add_argument("--backup-dir",
@@ -773,12 +1422,18 @@ def main(argv=None):
     p.add_argument("--push-tar", choices=["auto", "always", "never"], default="auto",
                    help="资源推送方式：auto 小文件密集自动 tar 单推解开；always 强制；never 整树推")
     p.add_argument("--ready-timeout", type=int, default=180)
-    p.add_argument("--discharge-settle", type=int, default=30,
-                   help="采集窗开始前要连续物理放电的秒数（能耗口径；0=不等）")
+    p.add_argument("--discharge-settle", type=int, default=None,
+                   help="采集窗开始前要连续物理放电的秒数（能耗口径；缺省 30，"
+                        "接电/充电下自动判不适用不等；显式给了照等，0=不等）")
     p.add_argument("--discharge-timeout", type=int, default=300,
                    help="放电稳定门的等待上限秒数（0=等到够为止；超时照常采集、能耗记没数据）")
     p.add_argument("--power-interval", type=float, default=1.0,
                    help="拉取设备侧电池采样文件的间隔秒")
+    p.add_argument("--no-power-sampler", nargs="?", const="", default=None,
+                   metavar="原因",
+                   help="不起设备端电池采样守护（接电功能局/帧时性能局不需要能耗"
+                        "数据；可附原因记账）。run-manifest 记 power_sampler="
+                        "disabled+原因，quality_check 能耗报「没数据」")
     p.add_argument("--wait", type=float, default=0)
     p.add_argument("--lock-root", default=str(device_lock.lock_root()))
     p.add_argument("--holder", default=os.environ.get("USER", "?"))
@@ -831,7 +1486,9 @@ def main(argv=None):
                 "lock": {"pid": os.getpid(), "dir": str(lock / args.serial)}}
     state0, orig_tmp, launched = None, None, False
     data_backup, backup_dir = None, None
+    backup_left, backup_started = [], False   # 备份凭据登记/中途失败标（qa-fone #329632）
     props_prev = {}
+    ab_strict = set()              # --ab-prop 已读到原值、即将 / 已经 setprop 的键：恢复时一律只认 rc=0
     logcat_proc, log_file = None, None
     sampler, seen_boots, power_f = None, set(), None
     pids, priv_done, birth_walls = {}, False, {}
@@ -874,6 +1531,13 @@ def main(argv=None):
             raise Refuse(f"{pkg} 设备上已安装但不是 debuggable：run-as 备份私有数据做不了，"
                          f"局内私有数据与已并入资源会被改写且 adb 层无法还原；"
                          f"先手动卸了它再跑，或显式 --allow-data-loss（只还原 APK 字节）")
+        if args.checkpoint:
+            manifest["checkpoint"] = {"name": args.checkpoint.name}
+            if state0["installed"]:
+                manifest["checkpoint"].update(
+                    verify="fail", fail="设备已装该包：检查点会清/盖已有数据")
+                raise Refuse("检查点只收原未安装的局：设备已装该包，解入会动已有数据——"
+                             "先人工卸了再跑，或拿掉 --checkpoint")
         # ---- versionCode / 降级：装新包方向（原>新）由 install -r -d 实测；装回方向 ----
         # ---- （原<新）证不了能装回 → 入局前直接拒跑（manifest 记决策依据）----
         downgrade_fwd = False
@@ -904,7 +1568,8 @@ def main(argv=None):
         # ---- debuggable 原包：run-as tar 全量备份私有/外部数据（装新包之前；任一目录失败即拒）----
         data_backup = None
         if state0["installed"] and state0["debuggable"] and not args.allow_data_loss:
-            data_backup = backup_data(d, pkg, backup_dir)
+            backup_started = True            # 备份没返回 = 还原链未证 → 收局必留置
+            data_backup = backup_data(d, pkg, backup_dir, left=backup_left)
             nfiles = sum(len(v["files"]) for v in data_backup["dirs"].values())
             manifest["data_backup"] = {"dir": str(backup_dir), "dirs": len(data_backup["dirs"]),
                                        "files": nfiles,
@@ -962,11 +1627,29 @@ def main(argv=None):
         if not cur["installed"] or cur.get("sha256") != our_sha:
             raise Refuse("安装后 sha256 校验不过")
 
+        # ---- 检查点：部署后、首启前解进存档根，核对不过不起局 ----
+        if args.checkpoint:
+            apply_checkpoint(d, pkg, args.checkpoint, manifest, log, out)
+
         # ---- 调试门 + 帧日志开关（记原值，收局恢复并逐项读回；release 机不让改只记注）----
         run_uuid = uuid.uuid4().hex   # 本局号：os.c 首行/帧 meta 都写它——内容级归属锚
         for key in DEBUG_PROPS:
             props_prev[key] = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
             d.shell(f"setprop {key} 1", allowed=(0, 1))
+        for spec in args.ab_prop:
+            key, sep, val = spec.partition("=")
+            if not sep or not re.fullmatch(r"debug\.s2a\.[a-z0-9_]+", key) or not re.fullmatch(r"[A-Za-z0-9_.-]{0,64}", val):
+                raise Refuse(f"--ab-prop 格式不对（只收 debug.s2a.<名>=<值>）：{spec}")
+            if key in props_prev or key == SESSION_PROP or key in DEBUG_PROPS:
+                raise Refuse(f"--ab-prop 与运行器自管属性重名：{key}")
+            # 原值 / 置位 / 读回都要 rc=0：读不到原值就无法证明能恢复，直接拒跑
+            props_prev[key] = d.shell(f"getprop {key}", allowed=(0,)).strip()
+            ab_strict.add(key)     # 先登记、再 setprop：setprop 生效后读回失败，恢复也按严格口径
+            d.shell(f"setprop {key} {shlex.quote(val)}", allowed=(0,))
+            got = d.shell(f"getprop {key}", allowed=(0,)).strip()
+            if got != val:
+                raise Refuse(f"--ab-prop {key} 没置上（读回 {got!r}）")
+            manifest.setdefault("ab_props", {})[key] = {"value": val, "prev": props_prev[key]}
         props_prev[SESSION_PROP] = d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip()
         d.shell(f"setprop {SESSION_PROP} {run_uuid}", allowed=(0, 1))
         if d.shell(f"getprop {SESSION_PROP}", allowed=(0, 1)).strip() != run_uuid:
@@ -1043,12 +1726,39 @@ def main(argv=None):
         # --power-interval 拉回——adb 中途掉线只断拉取不断设备上的采样，收局/中断照样
         # 把已落的行拉回来（兄弟项目「私存不丢」同语义）。
         supply = "battery"
-        dest, sampler_pid = start_power_sampler(d, supply)
-        sampler = (dest, sampler_pid)
-        manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
-                                     "settle_required_s": args.discharge_settle}
-        power_f = (out / "power.tsv").open("w")
-        power_f.write("t\t" + "\t".join(android_power.FIELDS) + "\tlevel\n")
+        dest = POWER_LOG
+        settle_s = 30 if args.discharge_settle is None else args.discharge_settle
+        if args.no_power_sampler is not None:
+            # --no-power-sampler：接电功能局/帧时性能局不要能耗读数——连守护都
+            # 不起（也就没有孤儿可留）；门没跑不写 settle_ok，能耗如实没数据。
+            manifest["power_sampler"] = {
+                "disabled": True,
+                "reason": args.no_power_sampler or "调用方声明本局不需要能耗数据"}
+        else:
+            try:
+                dest, sampler_pid = start_power_sampler(d, supply)
+                sampler = (dest, sampler_pid)
+                manifest["power_sampler"] = {"dest": dest, "pid": sampler_pid,
+                                             "settle_required_s": settle_s}
+                power_f = (out / "power.tsv").open("w")
+                power_f.write("t\t" + "\t".join(POWER_FIELDS) + "\tlevel\n")
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                # 起守护失败/超时（adb shell 卡到超时才炸）：设备端可能已有孤儿
+                # 循环在写日志——sampler 变量还没赋值，按 PID 文件/进程标记扫掉。
+                try:
+                    stop_power_sampler(d, dest, None)
+                except (RuntimeError, subprocess.SubprocessError) as sweep_error:
+                    notes.append(f"采样守护起失败后的孤儿清理也没走通：{sweep_error}")
+                notes.append(f"电池采样守护起不来（{str(error)[:160]}）：本局能耗按没数据处理")
+                manifest["power_sampler"] = {"spawn_error": str(error)[:200]}
+            except BaseException:
+                # 启动中断（SIGINT/KeyboardInterrupt 等在 d.shell 里炸的异常）：
+                # 守护可能已起——也照扫孤儿再放行，不能只靠收局兜底
+                try:
+                    stop_power_sampler(d, dest, None)
+                except Exception:
+                    pass
+                raise
 
         def flush_power(rows):
             for row, level in rows:
@@ -1057,11 +1767,13 @@ def main(argv=None):
                     continue
                 seen_boots.add(boot)
                 power_f.write("\t".join([str(len(seen_boots) - 1)]
-                                        + [str(row[k]) for k in android_power.FIELDS]
+                                        + [str(row[k]) for k in POWER_FIELDS]
                                         + [level]) + "\n")
             power_f.flush()
 
         def pull_rows(tag):
+            if sampler is None:
+                return []
             try:
                 rows = power_rows(d, dest)
             except (RuntimeError, subprocess.SubprocessError) as error:
@@ -1073,21 +1785,53 @@ def main(argv=None):
         # 放电稳定门（兄弟项目口径）：尾部一串「连续物理放电」采样满
         # --discharge-settle 秒才进采集窗；上限 --discharge-timeout（0=不限）。
         # settle=0 就是「不等」：不做任何预拉取，窗口边界直接从 col0 起。
-        settle_us = args.discharge_settle * 1_000_000
+        # 接电功能局默认不该先等放电：未显式给 --discharge-settle 且最新采样
+        # 证在接电/充电 → 门判不适用直接进窗（显式给了照等，能耗局要真放电）。
+        settle_us = settle_s * 1_000_000
         wait0 = time.monotonic()
         settled = True
-        if settle_us > 0:
+        if settle_us > 0 and sampler is not None:
             rows = pull_rows("放电稳定门")
-            settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
-            while not settled:
-                if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
-                    notes.append(f"放电未稳满 {args.discharge_settle}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
-                    break
-                time.sleep(args.power_interval)
-                rows = pull_rows("放电稳定门")
-                settled = bool(rows) and android_power.discharge_streak_us(rows) >= settle_us
-        manifest["power_sampler"]["settle_ok"] = settled
-        manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
+            if args.discharge_settle is None:
+                # 首读竞态（8E：setsid 即回但守护首块还没落盘）——先补拉几轮，
+                # 仍无样本就用同口径 dumpsys 现态判接电；接电局不许被首读空
+                # 拖进整条放电等待。
+                first = rows[-1] if rows else None
+                for _ in range(3):
+                    if first is not None:
+                        break
+                    time.sleep(args.power_interval)
+                    rows = pull_rows("放电稳定门")
+                    first = rows[-1] if rows else None
+                if first is None:
+                    try:
+                        first = power_parse_sample(
+                            d.shell(power_sample_command(supply),
+                                    timeout=20) + "\n")
+                    except (RuntimeError, subprocess.SubprocessError) as error:
+                        notes.append(f"放电稳定门首读无样本、dumpsys 现态判读也没走通：{error}")
+                charging = bool(first) and (
+                    str(first.get("plugged")) == "1"
+                    or first.get("status") in ("Charging", "Full"))
+            else:
+                charging = False
+            if charging:
+                manifest["power_sampler"]["settle_na"] = \
+                    "设备在接电/充电：放电稳定门不适用，直接进窗"
+            else:
+                settled = bool(rows) and discharge_streak_us(rows) >= settle_us
+                while not settled:
+                    if args.discharge_timeout and time.monotonic() - wait0 > args.discharge_timeout:
+                        notes.append(f"放电未稳满 {settle_s}s 就开采（{args.discharge_timeout}s 内没等到，能耗按没数据处理）")
+                        break
+                    time.sleep(args.power_interval)
+                    rows = pull_rows("放电稳定门")
+                    settled = bool(rows) and discharge_streak_us(rows) >= settle_us
+        if ("power_sampler" in manifest
+                and "spawn_error" not in manifest["power_sampler"]
+                and "disabled" not in manifest["power_sampler"]):
+            manifest["power_sampler"]["settle_ok"] = settled
+            manifest["power_sampler"]["waited_s"] = round(time.monotonic() - wait0, 1)
 
         col0_us = uptime_us(d)
         shot(adb_argv, out / "shots_ap" / "01_000s.png")
@@ -1096,14 +1840,16 @@ def main(argv=None):
             pull_rows(f"第 {i}s")
             time.sleep(max(0, args.power_interval - (time.monotonic() - tick)))
         col1_us = uptime_us(d)
-        try:
-            rows = stop_power_sampler(d, dest, sampler_pid)
-            sampler = None
-            flush_power(rows)
-        except (RuntimeError, subprocess.SubprocessError) as error:
-            notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
-        power_f.close()
-        power_f = None
+        if sampler is not None:
+            try:
+                rows = stop_power_sampler(d, dest, sampler[1])
+                sampler = None
+                flush_power(rows)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                notes.append(f"收采样守护失败（杀/拉/清理）：{error}")
+        if power_f is not None:
+            power_f.close()
+            power_f = None
         shot(adb_argv, out / "shots_ap" / f"02_{args.seconds:03d}s.png")
         manifest["frame_window_us"] = [col0_us, col1_us]
         log(f"采集 {args.seconds}s 完成（窗口 boot_us {col0_us}..{col1_us}）")
@@ -1222,6 +1968,7 @@ def main(argv=None):
             "graphics_selection": manifest["graphics_selection"], "extras": args.extra,
             "frame_log": manifest["frame_log"], "session": manifest["session"],
             "frame_window_us": manifest["frame_window_us"], "ready": ready,
+            "power_sampler": manifest.get("power_sampler"),
             "restore_scope": manifest["restore_scope"],
         }, ensure_ascii=False, indent=1) + "\n")
         # 断言本局实际图形路径（迟到处：产物都落盘后再判，红局也留完整证据）：
@@ -1250,6 +1997,16 @@ def main(argv=None):
         # ---- 还原（任何结果都跑：SIGTERM / 未捕获异常也走到）----
         fails = []
         pkg = manifest.get("package", args.package or "")
+        ck_tmp = manifest.get("checkpoint", {}).get("tmp_left")
+        if ck_tmp:
+            fails.append(f"检查点临时文件没删掉：{ck_tmp}"
+                         f"（{manifest['checkpoint'].get('tmp_cleanup_error', '')}）——"
+                         f"/data/local/tmp 有残留，设备状态未证")
+        for aux in backup_left:
+            fails.append(f"备份凭据 {aux} 残留没核删干净：/data/local/tmp 有本局改动，"
+                         f"设备状态未证")
+        if backup_started and data_backup is None:
+            fails.append("数据备份中途失败：还原链未证，不得正常放锁")
         if sampler:
             try:  # 中断路径同样收采样守护：杀循环 → 拉回设备上已落的行 → 清理文件
                 for row, level in stop_power_sampler(d, sampler[0], sampler[1]):
@@ -1258,7 +2015,7 @@ def main(argv=None):
                         continue
                     seen_boots.add(boot)
                     power_f.write("\t".join([str(len(seen_boots) - 1)]
-                                            + [str(row[k]) for k in android_power.FIELDS]
+                                            + [str(row[k]) for k in POWER_FIELDS]
                                             + [level]) + "\n")
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 fails.append(f"收电池采样守护异常：{error}")
@@ -1285,9 +2042,17 @@ def main(argv=None):
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 notes.append(f"私有日志拉取异常（证据缺不算还原失败）：{error}")
         try:
+            ab_keys = ab_strict | set(manifest.get("ab_props", {}))
             for key, prev in props_prev.items():
-                d.shell(f"setprop {key} {shlex.quote(prev)}", allowed=(0, 1))
-                back = d.shell(f"getprop {key}", allowed=(0, 1)).strip()
+                # --ab-prop 的属性：setprop 与读回都必须 rc=0（权限拒绝 rc=1 会读成空串，
+                # 原值恰为空时会被误认已恢复）；逐项单独 try，一项失败不跳过其余项
+                ok_rc = (0,) if key in ab_keys else (0, 1)
+                try:
+                    d.shell(f"setprop {key} {shlex.quote(prev)}", allowed=ok_rc)
+                    back = d.shell(f"getprop {key}", allowed=ok_rc).strip()
+                except (RuntimeError, subprocess.SubprocessError) as error:
+                    fails.append(f"调试属性 {key} 恢复 adb 异常：{error}")
+                    continue
                 if back != prev:
                     fails.append(f"调试属性 {key} 恢复失败：期望 {prev!r} 实得 {back!r}")
         except (RuntimeError, subprocess.SubprocessError) as error:

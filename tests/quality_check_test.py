@@ -127,8 +127,8 @@ PWR_F = ('boot_us', 'status', 'current_ua', 'voltage_uv', 'energy_uwh', 'charge_
          'plugged', 'interactive', 'power_save', 'thermal_status')
 def adir(launch, logcat, plugged, frame_ms=16.6, secs=60):
     _json.dump({'package': 'org.s2arm.game.t01001b300b9be000', 'serial_model': 'X', 'soc': 'S', 'android': '16', 'launch': launch}, open(f'{A}/android.json', 'w'))
-    n = int(secs * 1000 / frame_ms); open(f'{A}/frames.tsv', 'w').write('frame\tpresent_ns\tdisp_us\twall_us\n' + ''.join(f'{i}\t0\t{int(frame_ms * 1000)}\t{int(frame_ms * 1000)}\n' for i in range(1, n + 1)))
-    # power.tsv = t + android_power.FIELDS + level：plugged=1 → Charging + 供电旗标 true（接过电）；
+    n = int(secs * 1000 / frame_ms); open(f'{A}/frames.tsv', 'w').write('frame\tpresent_ns\tpresent_us\twall_us\tdisp_us\tdisp_seq\n' + ''.join(f'{i}\t0\t{int(frame_ms * 1000)}\t{int(frame_ms * 1000)}\t{int(frame_ms * 1000)}\t{i}\n' for i in range(1, n + 1)))
+    # power.tsv = t + run_game.POWER_FIELDS + level：plugged=1 → Charging + 供电旗标 true（接过电）；
     #   放电行四路旗标 false→plugged=0、交互屏、非省电、热档 0、电量计每拍 -222µAh（800mA 口径）
     st, pw, pl = ('Charging', 'true', '1') if plugged else ('Discharging', 'false', '0')
     rows = ''.join(f'{i}\t{10_000_000 + i * 1_000_000}\t{st}\t-800000\t4000000\t\t{5_000_000 - i * 222}\t350\tsysfs\t{pw}\t{pw}\t{pw}\t{pw}\t{pl}\t1\t0\t0\t80\n' for i in range(60))
