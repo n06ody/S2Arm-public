@@ -75,6 +75,7 @@ struct pa_live {           // 已迁移窗口
     int retired;           // 池已删除：等完成证明后才能销毁
     VkBuffer buf;
     struct s2a_gpu_buf gb;
+    VkBufferUsageFlags usage;   // 后备创建时的 usage（compute 直绑按它判 UNIFORM/STORAGE 可绑）
     int live;
 };
 
@@ -330,15 +331,26 @@ static int pa_prepare(void *ctx, uint64_t len, uint64_t *out_backing) {
     if (!pa_vma_budget_ok(len)) return -1;   // 预算不足：不迁移，调用方保留原后备
     char why[160] = "";
     memset(&g_pa_pending, 0, sizeof g_pa_pending);
-    if (s2a_gpu_buf_create(g_pa_dev, len,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            S2A_GPU_MEM_AHB, &g_pa_pending.gb, why, sizeof why) != 0) {
-        PA_LOG("poolahb: AHB create/import failed: %s", why);
-        g_fail_ahb++;
-        return -1;
+    // 带 STORAGE 后备让 compute 也能直绑池页（OP_DISPATCH 帧队列收编用）；个别驱动若对
+    // 含 STORAGE 的外部导入说不，退回不含 STORAGE 的旧掩码再试一次——池照常迁移
+    // （绘制零拷贝不受损），compute 侧按返回的 usage 记 miss 走 staging。
+    VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (s2a_gpu_buf_create(g_pa_dev, len, usage, S2A_GPU_MEM_AHB, &g_pa_pending.gb,
+                           why, sizeof why) != 0) {
+        PA_LOG("poolahb: AHB create/import with storage usage failed, retrying legacy mask: %s", why);
+        why[0] = 0;
+        usage &= ~VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (s2a_gpu_buf_create(g_pa_dev, len, usage, S2A_GPU_MEM_AHB, &g_pa_pending.gb,
+                               why, sizeof why) != 0) {
+            PA_LOG("poolahb: AHB create/import failed: %s", why);
+            g_fail_ahb++;
+            return -1;
+        }
     }
+    g_pa_pending.usage = usage;
     g_pa_pending.backing_id = g_pa_next_backing++;
     g_pa_pending.buf = g_pa_pending.gb.buf;
     g_pa_pending.live = 1;
@@ -568,7 +580,8 @@ static int pa_migrate_window(uint64_t addr, uint64_t len) {
     return 0;
 }
 
-int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
+static int pa_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                     VkBufferUsageFlags *usage) {
     PA_GUARD();
     if (!s2a_poolahb_enabled() || !buf || !off || !len) return -1;
     struct pa_live *e = pa_live_find(addr, len);
@@ -581,6 +594,7 @@ int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off
         }
         *buf = e->buf;
         *off = addr - e->addr;
+        if (usage) *usage = e->usage;
         g_pa_stats.lookups++;
         g_pa_stats.hit_bytes += len;
         return 0;
@@ -609,6 +623,15 @@ int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off
     ps->refs++;
     g_pa_stats.miss_cold++;
     return -1;
+}
+
+int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
+    return pa_lookup(addr, len, buf, off, NULL);
+}
+int s2a_poolahb_lookup_usage(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                             VkBufferUsageFlags *usage) {
+    if (usage) *usage = 0;
+    return pa_lookup(addr, len, buf, off, usage);
 }
 
 // 迁移服务：只在**本帧 fence 已全部等到**的完成点调用（GPU 已空闲、我们没有任何在途提交）。

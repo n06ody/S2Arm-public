@@ -26,6 +26,10 @@ int s2a_poolahb_enabled(void);
 int s2a_poolahb_establish(uint64_t addr, uint64_t len);
 // 绘制层查找：命中返回 0 并给出 (VkBuffer, offset)；同时按当前帧提交序号登记在途引用。
 int s2a_poolahb_lookup(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
+// 同 s2a_poolahb_lookup 的命中/保话语义，额外回传该后备创建时的 usage：
+// compute 直绑要先核 usage（UBO 需要 UNIFORM、SSBO 需要 STORAGE），不足按 miss 处理，不硬绑。
+int s2a_poolahb_lookup_usage(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                             VkBufferUsageFlags *usage);
 // owner 证明：VM/thread owner 在“guest writers 已停稳”后才能置 stopped=1；没有证明时 service 拒绝迁移。
 void s2a_poolahb_owner_note_writers_stopped(int stopped);
 // svc_mem 的“内存 SVC owner 窗口”入口：给出停稳证明并消费一次迁移（每次窗口最多迁一个池）。

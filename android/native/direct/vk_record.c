@@ -85,6 +85,9 @@ extern int nvn_vk_first_draw_pass_break(int sync) __attribute__((weak));
 extern int nvn_vk_first_draw_timestamp_top(struct s2a_vk_device *d, VkQueryPool pool, uint32_t slot,
                                            char *why, size_t why_size) __attribute__((weak));
 extern uint64_t nvn_vk_first_draw_frame_id(void) __attribute__((weak));
+// C1 收编缝（弱绑定）：把一段已录完的命令缓冲插进帧队列统一提交/退休。
+// 返回 0 = 队列接管命令缓冲所有权；非 0 = 没接手，调用方自己回收或自提。
+extern int nvn_vk_first_draw_clear_enqueue(struct s2a_vk_device *d, VkCommandBuffer cmd) __attribute__((weak));
 // 帧队列首错（弱绑定）：失败传播时带上真实原因，不覆盖首错。
 extern const char *nvn_vk_first_draw_first_error(void) __attribute__((weak));
 // ReportCounter 只在 pass 内切查询段（vkCmdEndQuery/BeginQuery 在 pass 内合法），不再关整个 render pass。
@@ -509,6 +512,87 @@ static void recount_device(struct s2a_vk_device *d) {
 static int g_submit_fault;   // 诊断注入：1 = 提交后按完成未知；2 = 假装提交失败
 void s2a_record_set_submit_fault(int mode) { g_submit_fault = mode; }
 
+// ---- OP_DISPATCH 帧队列收编（issue #48；默认关：debug.s2a.dispatch_fq / 宿主 S2A_DISPATCH_FQ）----
+// 门开且全部 guest-backed 绑定命中 AHB 池后备（builder 置 out.fq=1）时，把 dispatch 录进一段
+// 独立命令缓冲交帧队列统一提交/退休，省掉“每笔 dispatch 一次独立 submit + 立刻等 fence”的
+// 同步开销。门关时整条路径逐字节不变。
+static _Atomic int g_dispatch_fq_gate = -1;
+static int dispatch_fq_on(void) {
+    int v = atomic_load(&g_dispatch_fq_gate);
+    if (v < 0) {
+        char b[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.s2a.dispatch_fq", b);
+        v = b[0] == '1';
+        if (!v) {
+            const char *e = getenv("S2A_DISPATCH_FQ");
+            v = e && e[0] == '1';
+        }
+        atomic_store(&g_dispatch_fq_gate, v);
+    }
+    return v;
+}
+static _Atomic uint64_t g_dispatch_fq_enq, g_dispatch_fq_fallback;
+
+// pending_fq：帧队列收编的在途 dispatch owner 表。与 g_retained 的区别：命令缓冲所有权在
+// 帧队列（不在本执行器），所以这里不记 fence/cmd，只记“等完成证明再 finish”的 owner。
+// frame_id = 入队时的录制帧号：槽退休（s2a_record_fq_drain(1)）只能证明「入队帧号 <
+// 当前录制帧号」的项——同帧入队的命令还在活队列里（已录未提交/已提交未完成），不能提前放。
+#define REC_FQ_PENDING_MAX 64
+struct rec_fq_pending {
+    struct s2a_vk_device *d;
+    void *owner;
+    int (*finish)(struct s2a_vk_device *, void *, int);
+    uint64_t frame_id;
+    struct s2a_compute_diagnostic diag;
+};
+static struct rec_fq_pending g_fq_pend[REC_FQ_PENDING_MAX];
+static int g_fq_pend_n;
+static VkDevice g_fq_pend_dev;
+void s2a_record_dispatch_fq_stats(uint64_t *enqueued, uint64_t *fallback, uint64_t *pending) {
+    if (enqueued) *enqueued = atomic_load(&g_dispatch_fq_enq);
+    if (fallback) *fallback = atomic_load(&g_dispatch_fq_fallback);
+    if (pending) *pending = (uint64_t)g_fq_pend_n;
+}
+// 与 g_retained 同口径：旧设备上的在途项随设备消失，只清账、不在新设备上 finish。
+static void fq_pend_check_device(struct s2a_vk_device *d) {
+    if (g_fq_pend_dev && d && g_fq_pend_dev != d->device && g_fq_pend_n) {
+        fprintf(stderr, "[vk-record] %d queued dispatch owner(s) belong to a previous device; "
+                        "gone with it (no explicit finish)\n", g_fq_pend_n);
+        memset(g_fq_pend, 0, sizeof g_fq_pend);
+        g_fq_pend_n = 0;
+    }
+    if (d) g_fq_pend_dev = d->device;
+}
+// 完成证明到达：逐项 finish(0) 并摘表。
+//   all_proven=1：帧队列全部在途工作已有完成证明（pass_break(1) 成功）→ 所有项都结算。
+//   all_proven=0：一个延迟槽退休（s2a_record_fq_drain(1)）→ 只结算入队帧号 < 当前录制帧号的项。
+static void fq_pend_drain(int all_proven) {
+    const uint64_t cur = all_proven ? UINT64_MAX
+        : (nvn_vk_first_draw_frame_id ? nvn_vk_first_draw_frame_id() : 0);
+    int left = 0;
+    for (int i = 0; i < g_fq_pend_n; ++i) {
+        struct rec_fq_pending e = g_fq_pend[i];
+        if (e.frame_id >= cur || !e.d || !e.d->device) { g_fq_pend[left++] = e; continue; }
+        int rc = e.finish ? e.finish(e.d, e.owner, 0) : 0;
+        s2a_record_compute_note(&e.diag,
+            rc ? S2A_COMPUTE_COPYBACK_FAILED : S2A_COMPUTE_COMPLETED,
+            rc ? "compute completion copyback failed" : "");
+    }
+    memset(g_fq_pend + left, 0, (size_t)(g_fq_pend_n - left) * sizeof g_fq_pend[0]);
+    g_fq_pend_n = left;
+}
+// 完成未知（槽退休失败 / pass_break 返回非 0）：逐项 finish(-2)——按契约一个对象都不释放，
+// 全部留在表里等后面的完成证明（或随设备销毁）。
+static void fq_pend_unknown(void) {
+    for (int i = 0; i < g_fq_pend_n; ++i)
+        if (g_fq_pend[i].d && g_fq_pend[i].d->device && g_fq_pend[i].finish)
+            (void)g_fq_pend[i].finish(g_fq_pend[i].d, g_fq_pend[i].owner, -2);
+}
+void s2a_record_fq_drain(int ok) {
+    if (!ok) { fq_pend_unknown(); return; }
+    fq_pend_drain(0);
+}
+
 void s2a_record_gpu_stats(struct s2a_record_gpu_stats *out) {
     if (!out) return;
     memset(out, 0, sizeof *out);
@@ -605,19 +689,14 @@ static int rec_retain(struct s2a_vk_device *d, VkFence fence, VkCommandBuffer cm
     return 0;
 }
 
-// 一次性提交并等完成。返回 REC_SUBMIT_*：
+// 一次性提交并等完成（命令缓冲已结束录制——供 dispatch 帧队列收编的“入队被拒后自提”路径）。
+// 返回 REC_SUBMIT_*：
 //   COMPLETED   —— 已提交且有完成证明；fence 已销毁，命令缓冲已回收（辅助资源仍归调用方）。
 //   UNSUBMITTED —— 没有提交成功，命令从未执行；fence/命令缓冲已回收（辅助资源仍归调用方）。
 //   INCOMPLETE  —— 已提交但没有完成证明；fence/命令缓冲/keep 里的资源全部转入保留账本，调用方不得释放/复用。
-static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec_keep *keep) {
+static int submit_recorded(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec_keep *keep) {
     ++g_submit_seq;
-    VkResult rc = vkEndCommandBuffer(cmd);
-    if (rc != VK_SUCCESS) {
-        note_gpu_error("vkEndCommandBuffer", rc, NULL);
-        rec_free_command(d, cmd);
-        g_submit_unsubmitted++;
-        return REC_SUBMIT_UNSUBMITTED;
-    }
+    VkResult rc;
     VkFenceCreateInfo info = {0};
     info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;
@@ -678,6 +757,18 @@ static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec
     rec_free_command(d, cmd);
     g_submit_completed++;
     return REC_SUBMIT_COMPLETED;
+}
+
+// 常规一次性提交：先结束录制，再走 submit_recorded 的提交/等待/退休流程。
+static int submit(struct s2a_vk_device *d, VkCommandBuffer cmd, const struct rec_keep *keep) {
+    VkResult rc = vkEndCommandBuffer(cmd);
+    if (rc != VK_SUCCESS) {
+        note_gpu_error("vkEndCommandBuffer", rc, NULL);
+        rec_free_command(d, cmd);
+        g_submit_unsubmitted++;
+        return REC_SUBMIT_UNSUBMITTED;
+    }
+    return submit_recorded(d, cmd, keep);
 }
 
 static VkCommandBuffer begin_command(struct s2a_vk_device *d) {
@@ -1443,12 +1534,16 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             // 不需要先 flush+等完成。这笔清除若表达不了（部分通道掩码、逐位模板掩码等）会退回同步
             // 路径，退回点在下面自己补一次 sync pass_break，顺序仍然成立。
             // 实测（Adreno 730）：旧逻辑每笔 clear 前等一次，8 笔颜色 + 4 笔深度合计 8.8–28 ms/帧。
+            // dispatch_fq 门开时 OP_DISPATCH 只关 pass（sync=0）：命令由帧队列统一提交，
+            // 不需要先排空；门关照旧 sync=1 排空后独立提交，逐字节不变。
             int sync = header.op == OP_CLEAR_TEX || header.op == OP_CLEAR_BUF ||
                        header.op == OP_COPY_B2B || header.op == OP_COPY_T2B || header.op == OP_COPY_B2T ||
-                       header.op == OP_COPY_T2T || header.op == OP_DISPATCH || header.op == OP_FENCE_SYNC;
+                       header.op == OP_COPY_T2T || header.op == OP_FENCE_SYNC ||
+                       (header.op == OP_DISPATCH && !dispatch_fq_on());
             if (nvn_vk_first_draw_pass_break(sync) != 0) {
                 // 帧队列没有拿到完成证明：命令顺序不再成立，这条 opcode 及其后的 clear/copy/fence/event
                 // 都不能执行。首错留在帧队列里，这里只转述，不覆盖。
+                fq_pend_unknown();   // 在途 dispatch owner 完成未知：finish(-2) 全保留在表
                 const char *first = nvn_vk_first_draw_first_error ? nvn_vk_first_draw_first_error() : NULL;
                 char msg[420];
                 snprintf(msg, sizeof msg,
@@ -1457,6 +1552,8 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                          first && first[0] ? first : "frame queue failed (no first error recorded)");
                 return fail(result, S2A_RECORD_GPU, header.op, msg);
             }
+            // sync=1 排空成功 = 帧队列全部在途工作有完成证明：pending_fq 的 dispatch owner 可结算摘表。
+            if (sync && g_fq_pend_n) fq_pend_drain(1);
         }
         switch (header.op) {
         case OP_END:
@@ -2265,6 +2362,8 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                 memcpy(ds.samp_present, S->st.samp_present[5], sizeof ds.samp_present);
                 memcpy(ds.image_handle, S->cs_image_handle, sizeof ds.image_handle);
                 memcpy(ds.image_present, S->cs_image_present, sizeof ds.image_present);
+                // 帧队列收编门：门开才允许 builder 试 AHB 池直绑；门关 builder 不做任何池查找。
+                ds.fq_pool = dispatch_fq_on() ? 1 : 0;
                 // local memory is not a binding opcode fact; the compute source parser must prove it.
                 struct s2a_record_dispatch_output out;
                 memset(&out, 0, sizeof out);
@@ -2292,33 +2391,111 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
                     s2a_record_compute_note(&out.diagnostic, S2A_COMPUTE_UNSUBMITTED, "compute command allocation failed");
                     return fail(result, S2A_RECORD_GPU, header.op, "compute command allocation failed");
                 }
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, out.pipeline);
-                if (out.set_count) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    out.layout, 0, out.set_count, out.sets, 0, NULL);
-                vkCmdDispatch(cmd, ds.groups[0], ds.groups[1], ds.groups[2]);
-                // Fence completion alone does not make shader writes visible to the host.
-                // Compute owners may copy coherent mapped SSBOs back after submit completes.
-                VkMemoryBarrier host_read = {
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-                };
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read, 0, NULL, 0, NULL);
-                struct rec_keep keep;
-                memset(&keep, 0, sizeof keep);
-                keep.compute_owner = out.owner;
-                keep.compute_finish = out.finish;
-                int sr = submit(device, cmd, &keep);
-                int cleanup = out.finish ? out.finish(device, out.owner, sr) : 0;
-                const char *compute_why = sr == REC_SUBMIT_INCOMPLETE ? "compute completion unknown; resources retained" :
-                    sr == REC_SUBMIT_UNSUBMITTED ? "compute never submitted" : cleanup ? "compute completion copyback failed" : "";
-                s2a_record_compute_note(&out.diagnostic,
-                    sr == REC_SUBMIT_INCOMPLETE ? S2A_COMPUTE_COMPLETION_UNKNOWN :
-                    sr == REC_SUBMIT_UNSUBMITTED ? S2A_COMPUTE_UNSUBMITTED :
-                    cleanup ? S2A_COMPUTE_COPYBACK_FAILED : S2A_COMPUTE_COMPLETED, compute_why);
-                if (sr != REC_SUBMIT_COMPLETED || cleanup)
-                    return fail(result, S2A_RECORD_GPU, header.op, compute_why);
+                // 帧队列收编：门开 + builder 全命中池后备(out.fq) + 入队缝在 + pending 表有位
+                // → 录独立命令缓冲交帧队列（不 submit 不等），owner 进 pending_fq 等完成证明。
+                // 其余情况照旧同步提交，但先按旧语义排空——门开时上面的 pass_break 只关 pass
+                // （sync=0），队列可能还有已录制工作，直接单独提交会排到它们前面、打乱顺序。
+                int queued = 0;
+                if (dispatch_fq_on() && out.fq && nvn_vk_first_draw_clear_enqueue &&
+                    g_fq_pend_n < REC_FQ_PENDING_MAX) {
+                    // 头屏障：此前所有 GPU 写（draw/copy/upload）对 CS 读写可见；
+                    // 尾屏障：CS 写对之后所有 GPU 工作可见（不再要 HOST_READ——不立刻回拷）。
+                    // 两端取保守值（ALL_COMMANDS + MEMORY_*）。
+                    VkMemoryBarrier head = {
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &head, 0, NULL, 0, NULL);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, out.pipeline);
+                    if (out.set_count) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        out.layout, 0, out.set_count, out.sets, 0, NULL);
+                    vkCmdDispatch(cmd, ds.groups[0], ds.groups[1], ds.groups[2]);
+                    VkMemoryBarrier tail = {
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &tail, 0, NULL, 0, NULL);
+                    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+                        rec_free_command(device, cmd);
+                        if (out.finish) out.finish(device, out.owner, -1);
+                        s2a_record_compute_note(&out.diagnostic, S2A_COMPUTE_UNSUBMITTED,
+                                                "compute queued command end failed");
+                        return fail(result, S2A_RECORD_GPU, header.op,
+                                    "compute queued command end failed");
+                    }
+                    if (nvn_vk_first_draw_clear_enqueue(device, cmd) == 0) {
+                        fq_pend_check_device(device);
+                        struct rec_fq_pending *e = &g_fq_pend[g_fq_pend_n++];
+                        e->d = device;
+                        e->owner = out.owner;
+                        e->finish = out.finish;
+                        e->frame_id = nvn_vk_first_draw_frame_id ? nvn_vk_first_draw_frame_id() : 0;
+                        e->diag = out.diagnostic;
+                        atomic_fetch_add(&g_dispatch_fq_enq, 1);
+                        queued = 1;
+                    } else {
+                        // 帧队列没接手：命令已录完未提交，所有权仍在自己手里，下面自提走旧路径。
+                        queued = -1;
+                    }
+                }
+                if (!queued) {
+                    if (dispatch_fq_on()) {
+                        atomic_fetch_add(&g_dispatch_fq_fallback, 1);
+                        // 门开时 pass_break(0) 没排空：先按旧 sync=1 语义排空再单独提交。
+                        if (nvn_vk_first_draw_pass_break(1) != 0) {
+                            fq_pend_unknown();
+                            rec_free_command(device, cmd);
+                            if (out.finish) out.finish(device, out.owner, -1);
+                            const char *first = nvn_vk_first_draw_first_error
+                                ? nvn_vk_first_draw_first_error() : NULL;
+                            char msg[420];
+                            snprintf(msg, sizeof msg,
+                                     "pass break before queued dispatch fallback has no completion proof: %s",
+                                     first && first[0] ? first
+                                                       : "frame queue failed (no first error recorded)");
+                            s2a_record_compute_note(&out.diagnostic, S2A_COMPUTE_UNSUBMITTED,
+                                                    "compute fallback pass break failed");
+                            return fail(result, S2A_RECORD_GPU, header.op, msg);
+                        }
+                        fq_pend_drain(1);   // 排空成功：在途项也有完成证明
+                    }
+                    if (queued == 0) {
+                        // 旧路径录制（或回退）：bind + dispatch + shader→host 屏障。
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, out.pipeline);
+                        if (out.set_count) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            out.layout, 0, out.set_count, out.sets, 0, NULL);
+                        vkCmdDispatch(cmd, ds.groups[0], ds.groups[1], ds.groups[2]);
+                        // Fence completion alone does not make shader writes visible to the host.
+                        // Compute owners may copy coherent mapped SSBOs back after submit completes.
+                        VkMemoryBarrier host_read = {
+                            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                        };
+                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_read, 0, NULL, 0, NULL);
+                    }
+                    // (queued==-1：命令已录完帧队列版屏障，直接自提提交)
+                    struct rec_keep keep;
+                    memset(&keep, 0, sizeof keep);
+                    keep.compute_owner = out.owner;
+                    keep.compute_finish = out.finish;
+                    int sr = queued == -1 ? submit_recorded(device, cmd, &keep)
+                                          : submit(device, cmd, &keep);
+                    int cleanup = out.finish ? out.finish(device, out.owner, sr) : 0;
+                    const char *compute_why = sr == REC_SUBMIT_INCOMPLETE ? "compute completion unknown; resources retained" :
+                        sr == REC_SUBMIT_UNSUBMITTED ? "compute never submitted" : cleanup ? "compute completion copyback failed" : "";
+                    s2a_record_compute_note(&out.diagnostic,
+                        sr == REC_SUBMIT_INCOMPLETE ? S2A_COMPUTE_COMPLETION_UNKNOWN :
+                        sr == REC_SUBMIT_UNSUBMITTED ? S2A_COMPUTE_UNSUBMITTED :
+                        cleanup ? S2A_COMPUTE_COPYBACK_FAILED : S2A_COMPUTE_COMPLETED, compute_why);
+                    if (sr != REC_SUBMIT_COMPLETED || cleanup)
+                        return fail(result, S2A_RECORD_GPU, header.op, compute_why);
+                }
                 break;
             }
             if (dispatch.x < 0 || dispatch.y < 0 || dispatch.z < 0 || !S->bound_program)

@@ -53,10 +53,19 @@ static int unpin_calls, tex_writes;
 static VkImageView expected_view;
 static struct nvn_vk_tex mock_tex;
 static struct nvk_compute_tex_snapshot snapshot;
+// dispatch-fq 池后备缝（生产 nvn_vk_poolahb 提供）：脚本命中返回 (pool_buf, addr-pool_addr,
+// pool_usage)，其余 miss；lookup 次数记账，供“门关不得 lookup”断言。usage 是否够用由生产侧判。
+static VkBuffer pool_buf;
+static uint64_t pool_addr, pool_len;
+static VkBufferUsageFlags pool_usage;
+static int pool_lookups, pool_lookup_fail, pool_expect;
+static VkDeviceSize pool_exp_off[8];
 VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice d,uint32_t n,const VkWriteDescriptorSet*w,uint32_t copies,const VkCopyDescriptorSet*c){(void)d;(void)copies;(void)c;descriptors=n;assert(n<=(uint32_t)fixture.binding_count);for(uint32_t i=0;i<n;i++){int infix=0;for(int j=0;j<fixture.binding_count;j++)if(w[i].dstBinding==(uint32_t)fixture.bindings[j].binding)infix=1;assert(infix);}assert(w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[n-1].descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     // 纹理描述符必须写成快照里的真实 view + sampler + GENERAL；空句柄等于“绑了占位资源”。
     for(uint32_t i=0;i<n;i++) if(w[i].descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER){assert(w[i].pImageInfo&&w[i].pImageInfo->imageView==expected_view&&w[i].pImageInfo->sampler==(VkSampler)0x22&&w[i].pImageInfo->imageLayout==VK_IMAGE_LAYOUT_GENERAL);tex_writes++;}
-    else assert(w[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[i].descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);}
+    else {assert(w[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||w[i].descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    // 池直绑负控：命中后描述符必须写池后备 + 池内偏移；绑影子 buffer/错开偏移都立刻红。
+    if(pool_expect){assert(i<8);assert(w[i].pBufferInfo&&w[i].pBufferInfo->buffer==pool_buf&&w[i].pBufferInfo->offset==pool_exp_off[i]);}}}
 void s2a_vk_nvn_texture_release_for_compute(struct nvn_vk_tex *t, VkImageView v){(void)t;(void)v;unpin_calls++;}
 // 快照的解析入口在 first_draw.c（宿主不链），这里给空实现：本测试直接构造快照喂给 pipeline。
 int s2a_vk_nvn_texture_bind_for_compute(struct s2a_vk_device *d, uint64_t handle,
@@ -95,6 +104,22 @@ uint64_t nvn_vk_guest_buffer_extent(uint64_t addr, uint64_t cap, int *exact) {
     if (exact) *exact = guest_extent_exact;
     return guest_extent;
 }
+// dispatch-fq 池后备缝替身（strong 定义满足生产的 weak extern）：命中窗口返回池后备 +
+// 池内偏移 + 创建时 usage；lookup_fail/越窗返回 miss。
+int s2a_poolahb_lookup_usage(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off,
+                             VkBufferUsageFlags *usage) {
+    pool_lookups++;
+    if (pool_lookup_fail || !len) return -1;
+    if (addr >= pool_addr && addr + len <= pool_addr + pool_len) {
+        *buf = pool_buf;
+        *off = addr - pool_addr;
+        if (usage) *usage = pool_usage;
+        return 0;
+    }
+    return -1;
+}
+// 池后备保活序号缝（生产 nvn_vk_first_draw 提供）：dispatch 可能早于本帧首笔 draw，懒分配。
+uint64_t nvn_vk_first_draw_submit_seq(void) { return 7; }
 int nvn_vk_program_parse_compute(const uint8_t*b,size_t n,struct nvn_vk_compute_program*out,char*why,size_t cap){(void)b;(void)n;(void)why;(void)cap;*out=fixture;return 0;}
 void nvn_vk_program_free_compute(struct nvn_vk_compute_program*p){memset(p,0,sizeof *p);}
 static int rd(void*opaque,uint64_t addr,void*out,size_t n){(void)opaque;reads++;if(read_fail)return -1;assert(addr>=0x1000&&addr+n<=0x1000+sizeof guest);memcpy(out,guest+addr-0x1000,n);return 0;}
@@ -114,7 +139,7 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
     return 0;
 }
 
-static void reset(void){assert(live==0);accepted=(struct nvk_compute_lookup_result){.bytes=(uint8_t*)"x",.length=1,.profile={.storage_alignment=16}};step=0;fail_at=0;descriptors=0;reads=writes=write_fail=read_fail=unknown_type=low_limit=0;unpin_calls=tex_writes=0;expected_view=VK_NULL_HANDLE;memset(&snapshot,0,sizeof snapshot);memset(&mock_tex,0,sizeof mock_tex);pool_missing=log_calls=0;log_line[0]=0;guest_extent=0;guest_extent_exact=0;g_indirect_trunc_n=0;pipe_calls=plc_calls=0;g_cpso_gate=-1;memset(g_indirect_trunc,0,sizeof g_indirect_trunc);memset(&fixture,0,sizeof fixture);memset(&state,0,sizeof state);memset(&src,0,sizeof src);src.c1=c1_bytes;src.c1_bytes=sizeof c1_bytes;for(unsigned i=0;i<sizeof c1_bytes;i++)c1_bytes[i]=(uint8_t)(0x40+i);memset(guest,0x34,sizeof guest);fixture.stage.spirv=(uint8_t*)spv;fixture.stage.spirv_bytes=sizeof spv;fixture.binding_count=2;fixture.bindings[0]=(struct fd_binding){.set=0,.binding=3,.kind=0,.slot=3,.ubo_slot=0};fixture.bindings[1]=(struct fd_binding){.set=2,.binding=9,.kind=1,.slot=-1};fixture.storage[1]=(struct nvn_vk_compute_storage){.writable=1,.mapping=NVK_STORAGE_NVN,.index=7,.cb_slot=0,.cb_offset=0x380};state.stages=32;state.groups[0]=state.groups[1]=state.groups[2]=1;state.ubo_seen=1;state.ssbo_seen=1<<7;state.ubo[0].addr=0x1000;state.ubo[0].size=32;state.ssbo[7].addr=0x1100;state.ssbo[7].size=32;}
+static void reset(void){assert(live==0);accepted=(struct nvk_compute_lookup_result){.bytes=(uint8_t*)"x",.length=1,.profile={.storage_alignment=16}};step=0;fail_at=0;descriptors=0;reads=writes=write_fail=read_fail=unknown_type=low_limit=0;unpin_calls=tex_writes=0;expected_view=VK_NULL_HANDLE;memset(&snapshot,0,sizeof snapshot);memset(&mock_tex,0,sizeof mock_tex);pool_missing=log_calls=0;log_line[0]=0;guest_extent=0;guest_extent_exact=0;g_indirect_trunc_n=0;pipe_calls=plc_calls=0;g_cpso_gate=-1;pool_buf=VK_NULL_HANDLE;pool_addr=pool_len=0;pool_usage=0;pool_lookups=pool_lookup_fail=pool_expect=0;memset(pool_exp_off,0,sizeof pool_exp_off);memset(g_indirect_trunc,0,sizeof g_indirect_trunc);memset(&fixture,0,sizeof fixture);memset(&state,0,sizeof state);memset(&src,0,sizeof src);src.c1=c1_bytes;src.c1_bytes=sizeof c1_bytes;for(unsigned i=0;i<sizeof c1_bytes;i++)c1_bytes[i]=(uint8_t)(0x40+i);memset(guest,0x34,sizeof guest);fixture.stage.spirv=(uint8_t*)spv;fixture.stage.spirv_bytes=sizeof spv;fixture.binding_count=2;fixture.bindings[0]=(struct fd_binding){.set=0,.binding=3,.kind=0,.slot=3,.ubo_slot=0};fixture.bindings[1]=(struct fd_binding){.set=2,.binding=9,.kind=1,.slot=-1};fixture.storage[1]=(struct nvn_vk_compute_storage){.writable=1,.mapping=NVK_STORAGE_NVN,.index=7,.cb_slot=0,.cb_offset=0x380};state.stages=32;state.groups[0]=state.groups[1]=state.groups[2]=1;state.ubo_seen=1;state.ssbo_seen=1<<7;state.ubo[0].addr=0x1000;state.ubo[0].size=32;state.ssbo[7].addr=0x1100;state.ssbo[7].size=32;}
 static int build(struct s2a_record_dispatch_output*out){return nvn_vk_compute_pipeline_build(&device,&state,&memory,&snapshot,&src,&accepted,out,why,sizeof why);}
 
 #ifdef S2A_TEST_NO_POOL_FIND
@@ -281,6 +306,54 @@ for(int i=0;i<(int)CPSO_CAP+6;i++){spv[3]=(uint32_t)(0x1000+i);assert(build(&out
 assert(pipe_calls==CPSO_CAP+7&&g_cpso_n==CPSO_CAP);
 assert(held.finish(&device,held.owner,-1)==0);
 nvn_vk_compute_pso_cache_release(&device);assert(live==0);cases++;
+// ── OP_DISPATCH 帧队列收编（s->fq_pool + s2a_poolahb_lookup_usage）──
+// 门开 + 全命中：两条 guest-backed 直绑池后备（buffer=池后备、offset=池内偏移），
+// 不 allocate、不读 guest；out.fq=1 交记录层走帧队列。
+reset();state.fq_pool=1;
+pool_addr=0x1000;pool_len=0x2000;pool_buf=(VkBuffer)0x77;
+pool_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+pool_expect=1;pool_exp_off[0]=0;pool_exp_off[1]=0x100;
+assert(build(&out)==0);
+assert(out.fq==1&&pool_lookups==2&&reads==0&&writes==0);
+{struct compute_owner*co=out.owner;
+ assert(co->buffers[0].pooled&&co->buffers[0].buffer==pool_buf&&co->buffers[0].window_off==0&&!co->buffers[0].mapped);
+ assert(co->buffers[1].pooled&&co->buffers[1].buffer==pool_buf&&co->buffers[1].window_off==0x100&&!co->buffers[1].mapped);}
+// pooled 可写 storage 不回写 guest（GPU 写直达共享页）；destroy 不碰池后备。
+assert(out.finish(&device,out.owner,0)==0&&writes==0&&live==0);cases++;
+// 一条 miss → 整笔退回 staging：fq=0、正常读 guest、pooled 全清。
+reset();state.fq_pool=1;
+pool_addr=0x1000;pool_len=0x2000;pool_buf=(VkBuffer)0x77;
+pool_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+pool_lookup_fail=1;
+assert(build(&out)==0);
+assert(out.fq==0&&reads==2);
+{struct compute_owner*co=out.owner;assert(!co->buffers[0].pooled&&!co->buffers[1].pooled);}
+assert(out.finish(&device,out.owner,-1)==0&&live==0);cases++;
+// usage 不足按 miss 处理：池后备只有 UNIFORM，SSBO 需要 STORAGE → 整笔 staging。
+reset();state.fq_pool=1;
+pool_addr=0x1000;pool_len=0x2000;pool_buf=(VkBuffer)0x77;
+pool_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+assert(build(&out)==0);
+assert(out.fq==0&&reads==2&&pool_lookups==2);
+{struct compute_owner*co=out.owner;assert(!co->buffers[0].pooled&&!co->buffers[1].pooled&&co->buffers[1].mapped);}
+assert(out.finish(&device,out.owner,-1)==0&&live==0);cases++;
+// 无界 storage 命中池：不需要并集影子——直绑池页、不建 window、finish 也无回写。
+reset();state.fq_pool=1;
+pool_addr=0x1000;pool_len=0x2000;pool_buf=(VkBuffer)0x77;
+pool_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+state.ssbo[7].size=0;guest_extent=0x800;guest_extent_exact=1;
+assert(build(&out)==0);
+assert(out.fq==1);
+{struct compute_owner*co=out.owner;
+ assert(co->buffers[1].pooled&&!co->buffers[1].shared&&co->buffers[1].window_off==0x100&&!co->window.buffer);}
+assert(out.finish(&device,out.owner,0)==0&&writes==0&&live==0);cases++;
+// 门关：不做任何 lookup，staging 逐字节不变。
+reset();state.fq_pool=0;
+pool_addr=0x1000;pool_len=0x2000;pool_buf=(VkBuffer)0x77;
+pool_usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+assert(build(&out)==0);
+assert(out.fq==0&&pool_lookups==0&&reads==2);
+assert(out.finish(&device,out.owner,-1)==0&&live==0);cases++;
 printf("compute pipeline host mock: %d scenarios, %d Vulkan failure points PASS\n",cases,max_step);return 0;
 #endif
 }

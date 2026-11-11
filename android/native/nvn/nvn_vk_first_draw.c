@@ -1232,6 +1232,10 @@ static void fd_slot_release(struct s2a_vk_device *d, struct fd_frame_q *q) {
     if (q->fence) { fd_fence_put_back(d->device, q->fence); q->fence = VK_NULL_HANDLE; }
     memset(q, 0, sizeof *q);
 }
+// dispatch 帧队列收编的排空钩（弱绑定，vk_record.c 提供）：槽退休是本层唯一的完成证明点，
+// ok=1 = 该槽全部 fence 等到（严格旧帧的 pending owner 可结算）；ok=0 = 完成证明失败，
+// pending owner 完成未知、全部保留（finish(-2)）。不链记录层的构建该符号为 NULL。
+extern void s2a_record_fq_drain(int ok) __attribute__((weak));
 // 等并释放一个延迟槽。返回 0 = 已回收；-1 = 完成证明失败（资源保留，会话按失败处理）。
 static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     if (!s || !s->used) return 0;
@@ -1247,6 +1251,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
         if (s2a_qret_prefix(q->batch_qid, q->nbatch_fence, fd_query_retire_cb, NULL) != 0 ||
             s2a_qret_slot(&q->suffix_qid, fd_query_retire_cb, NULL) != 0) {
             g_slot_fail = 1;
+            if (s2a_record_fq_drain) s2a_record_fq_drain(0);
             return -1;
         }
         fd_ssbo_wb_writeback(q);   // 完成证明在手：可写 storage buffer 的影子拷回 guest
@@ -1256,6 +1261,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     if (bad) {
         FD_LOG("present defer: the previous frame has no completion proof; resources retained");
         g_slot_fail = 1;
+        if (s2a_record_fq_drain) s2a_record_fq_drain(0);
         return -1;
     }
     // 完成证明已在手：此刻读该帧奇偶的 GPU 起止时间戳，不能等下一帧 arm reset 覆盖。
@@ -1277,6 +1283,7 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
             if (nvn_vk_ts_top_resolve(d, s->frame_id, 0, twhy, sizeof twhy) != 0) {
                 FD_LOG("present defer: timestamp-top writeback at retirement failed: %s", twhy);
                 g_slot_fail = 1;
+                if (s2a_record_fq_drain) s2a_record_fq_drain(0);
                 return -1;
             }
         }
@@ -1303,6 +1310,8 @@ static int fd_slot_retire(struct s2a_vk_device *d, struct fd_slot *s) {
     // 用单调序号而不是帧槽奇偶：延迟上屏时 N-1 与 N+1 同槽，同号会把另一帧仍在读的引用一起清掉。
     s2a_poolahb_complete_seq(s->ref_seq);
     s->ref_seq = 0;
+    // 槽退休 = 该帧全部在途的完成证明：pending_fq 里严格旧帧的 dispatch owner 可结算。
+    if (s2a_record_fq_drain) s2a_record_fq_drain(1);
     return 0;
 }
 // 同步边界（guest 等待/收尾）必须把在途的延迟帧先收口，查询结果与资源都不能晚到。
@@ -3210,6 +3219,13 @@ static void fd_cmd_put(struct s2a_vk_device *d, VkCommandBuffer cmd) {
 
 // 当前录制帧序号：时间戳待写项按它归属到帧，退休只结算已拿到完成证明的帧。
 uint64_t nvn_vk_first_draw_frame_id(void) { return g_frame_id; }
+// 本帧池后备保活序号（懒分配）：compute 收编的池 lookup 可能早于本帧首笔 draw，
+// 不能拿上一帧已移交槽位的序号登记（ref 会挂进别人/已退休的账本）。本帧第一次
+// 用到才分配；帧快照进槽位时随槽退休，同步路径在帧完成点退休。
+uint64_t nvn_vk_first_draw_submit_seq(void) {
+    if (!g_frame_ref_seq) g_frame_ref_seq = s2a_poolahb_begin_seq();
+    return g_frame_ref_seq;
+}
 
 // OP_REPORT_COUNTER(TIMESTAMP_TOP)：录一段只含 reset+时间戳的命令缓冲，按顺序并入当前帧队列。
 // 不 submit、不等 fence；完成证明由帧队列统一拿，写回由查询模块在帧完成点做。
@@ -3958,6 +3974,7 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
         if (g_slot[idx].used && fd_slot_retire(d, &g_slot[idx]) != 0) return -1;
         memcpy(&g_slot[idx].q, &g_fq, sizeof g_fq);
         g_slot[idx].ref_seq = g_frame_ref_seq;   // 该槽只退休自己这一帧的引用
+        g_frame_ref_seq = 0;                     // 序号所有权已移交槽位；下一帧要用时重新懒分配
         g_slot[idx].pin_n = g_pin_n;
         g_slot[idx].parity = g_arena_parity & 1;
         g_slot[idx].frame_id = g_frame_id;
@@ -4198,6 +4215,12 @@ static int fd_fq_flush_impl(int64_t budget_ns, int terminal_timeout, int defer, 
     fd_pass_reason_tick();   // 同步 flush 的帧完成点：与延迟 present 用同一个 16 帧窗口
     g_frame_id++;    // 下一批时间戳归属新帧；本帧的待写项已在上面的 resolve 结算
     if (frame_end) g_arena_parity ^= 1;   // 下一帧用另一套 arena/池（延迟 present 时旧一套还在 GPU 上）
+    // 本帧全部在途已有完成证明：池后备引用随本帧序号退休（延迟路径由槽退休做同一动作），
+    // pending_fq 里的 dispatch owner 同样拿到完成证明（g_frame_id 已 ++，本帧入队项满足
+    // 「严格旧帧」口径，可结算摘表）。
+    s2a_poolahb_complete_seq(g_frame_ref_seq);
+    g_frame_ref_seq = 0;
+    if (s2a_record_fq_drain) s2a_record_fq_drain(1);
     fd_fq_reset();
     g_fq.state = FD_FQ_COMPLETED;
     return 0;
@@ -5670,7 +5693,7 @@ int nvn_vk_first_draw(struct s2a_vk_device *d, const struct s2a_record_draw_stat
     atomic_fetch_add_explicit(&g_draws_since_report, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_draws_total, 1, memory_order_relaxed);
     if (atomic_fetch_add_explicit(&g_draws_this_frame, 1, memory_order_relaxed) == 0)
-        g_frame_ref_seq = s2a_poolahb_begin_seq();   // 本帧所有保活记在这个单调序号下
+        (void)nvn_vk_first_draw_submit_seq();   // 本帧所有保活记在这个单调序号下（懒分配，dispatch 可能已先拿）
     fd_samp_cache_ensure(d);
     fd_lookup_ensure();
     if (fd_perf_timing_enabled()) {

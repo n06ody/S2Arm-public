@@ -60,7 +60,19 @@ class ComputePipeline(unittest.TestCase):
               # PSO 缓存负对照：永不命中（= 修前行为）→ 门开断言 pipe_calls==1 变红
               'negative_pso_never_hit':source.replace('        if (hit) {', '        if (0) {'),
               'drop-c1-binding':source.replace('} else if (r->kind == 0 && r->slot == 1) {', '} else if (0) {'),
-              'c1-from-guest-read':source.replace('memcpy(b->mapped, source->c1, NVK_COMPUTE_C1_BYTES);', 'memcpy(b->mapped, b->mapped, 0);')}
+              'c1-from-guest-read':source.replace('memcpy(b->mapped, source->c1, NVK_COMPUTE_C1_BYTES);', 'memcpy(b->mapped, b->mapped, 0);'),
+              # dispatch-fq 池直绑负对照：错池内偏移/不查 usage 强绑/销毁池后备/回写池后备/
+              # 部分命中不回滚/不标 pooled（影子会覆盖池 buffer）→ 门开用例必须红。
+              'negative_pool_wrong_offset':source.replace('b->buffer = pb; b->window_off = po; b->pooled = 1;',
+                                                          'b->buffer = pb; b->window_off = po + 16; b->pooled = 1;'),
+              'negative_pool_skip_usage':source.replace('!(pu & need)', '!(need & need)'),
+              'negative_pool_destroy':source.replace('if (b->shared || b->pooled) continue;',
+                                                     'if (b->shared) continue;'),
+              'negative_pool_writeback':source.replace('if (b->shared || b->pooled || !b->writable) continue;',
+                                                       'if (b->shared || !b->writable) continue;'),
+              'negative_pool_partial':source.replace('if (!all_hit) {', 'if (0) {'),
+              'negative_pool_mark':source.replace('b->buffer = pb; b->window_off = po; b->pooled = 1;',
+                                                  'b->buffer = pb; b->window_off = po; b->pooled = 0;')}
             for name,code in variants.items():
                 self.assertTrue(name=='positive' or code!=source)
                 (out/'nvn').mkdir(exist_ok=True)

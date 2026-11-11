@@ -172,6 +172,10 @@ struct s2a_record_dispatch_state {
     uint8_t tex_present[32], samp_present[32], image_present[32];
     uint32_t local_memory_bytes;
     uint8_t local_memory_seen;
+    // OP_DISPATCH 帧队列收编门（记录层 debug.s2a.dispatch_fq / 宿主 S2A_DISPATCH_FQ）：
+    // =1 时 builder 可以对 guest-backed 绑定试 AHB 池后备直绑（全命中才置 output.fq=1）；
+    // =0 时 builder 不做任何池查找，逐字节走 staging 旧路径。
+    int fq_pool;
 };
 #define S2A_RECORD_DISPATCH_MAX_SETS 8u
 // Callback gets 0 = proven completed after COMPUTE_SHADER/SHADER_WRITE -> HOST/HOST_READ,
@@ -216,6 +220,10 @@ struct s2a_record_dispatch_output {
     // 反射出来的采样纹理绑定数；>0 时派发前必须把此前所有 GPU 写发布给 CS 采样读
     // （图形路径的 pass/上传屏障 dstStage 不含 COMPUTE_SHADER，覆盖不到这里）。
     uint32_t sampled_images;
+    // =1 仅当所有 guest-backed 绑定都命中 AHB 池后备（描述符已绑池 buffer/offset、不再建影子）：
+    // 记录层可把这笔记进帧队列，owner/finish 等完成证明再结算；=0 = 有 miss 或走了 staging，
+    // 照旧同步提交。门关时恒为 0。
+    int fq;
     void *owner;
     int (*finish)(struct s2a_vk_device *device, void *owner, int completion);
 };
@@ -223,6 +231,15 @@ typedef int (*s2a_record_dispatch_fn)(struct s2a_vk_device *device,
     const struct s2a_record_dispatch_state *state, const struct s2a_record_memory *memory,
     struct s2a_record_dispatch_output *output, struct s2a_record_result *result, void *opaque);
 void s2a_record_set_dispatch_builder(s2a_record_dispatch_fn dispatch, void *opaque);
+
+// OP_DISPATCH 帧队列收编的计数（诊断/宿主验收用，不改执行语义）：
+//   enqueued = 命令缓冲已交帧队列的笔数；fallback = 门开但走了同步旧路径的笔数；
+//   pending  = 还在 pending_fq 表里的 owner 数（等完成证明）。
+void s2a_record_dispatch_fq_stats(uint64_t *enqueued, uint64_t *fallback, uint64_t *pending);
+// 帧队列给回放层的完成证明通知（nvn_vk_first_draw 的 fd_slot_retire 经弱符号调用）：
+//   ok=1 = 一个延迟槽的全部 fence 已等到，该槽覆盖的 dispatch owner 可 finish(0) 摘表；
+//   ok=0 = 槽退休没拿到完成证明，所有在途项 finish(-2) 留在表内（一个对象都不释放）。
+void s2a_record_fq_drain(int ok);
 
 // 复位跨包保留的 GPU 绑定状态（一次提交开始时调用）。
 void s2a_record_reset_state(void);

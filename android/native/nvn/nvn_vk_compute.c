@@ -33,6 +33,13 @@
 extern uint64_t nvn_ga2ca(uint64_t a) __attribute__((weak));
 // 弱链接[androiddraw]：s2a_vk_adapter_pool_find（mtl_vk_adapter.c 提供；宿主单测不链适配器）
 extern int s2a_vk_adapter_pool_find(uint64_t addr, uint64_t len, uint64_t *base, uint64_t *size) __attribute__((weak));
+// dispatch-fq 收编的两条宿主缝（生产 nvn_vk_poolahb / nvn_vk_first_draw 提供）：
+// lookup_usage 命中 = 该 guest 范围已迁进 AHB 后备，返回池 buffer + 池内偏移 + 后备 usage；
+// submit_seq 返回本帧池保活序号（懒分配，dispatch 早于首笔 draw 也能拿到有效序号）。
+// 任一缝缺席/序号为 0 都按 miss 处理，整笔退回 staging——不拿编造的句柄继续。
+extern int s2a_poolahb_lookup_usage(uint64_t addr, uint64_t len, VkBuffer *buf,
+                                    uint64_t *off, VkBufferUsageFlags *usage) __attribute__((weak));
+extern uint64_t nvn_vk_first_draw_submit_seq(void) __attribute__((weak));
 
 /* 上游 MaxUnknownStorageSize（Ryujinx Constants）：只能证明“UBO 里 8 字节裸指针”的 storage，
  * 绑已注册池的映射余量、封顶这个上界。截断不静默：每个 shader key 首次截断打一条结构化诊断。 */
@@ -75,7 +82,8 @@ struct compute_buffer {
     uint64_t guest, size;
     int writable, guest_backed, unbounded;
     int shared;              // 绑定到 dispatch 级“无界并集影子”而不是自己的影子
-    uint64_t window_off;     // shared 时在并集影子里的字节偏移
+    int pooled;              // buffer 是借来的 AHB 池后备：不 allocate/上传/回写/销毁
+    uint64_t window_off;     // shared 时在并集影子里的字节偏移；pooled 时是池后备内偏移
 };
 struct compute_owner {
     VkDevice device;
@@ -293,7 +301,8 @@ static void destroy(struct compute_owner *o) {
     nvk_compute_texture_snapshot_release(&o->snapshot);
     for (int i = 0; i < o->count; ++i) {
         struct compute_buffer *b = &o->buffers[i];
-        if (b->shared) continue;   // 句柄属于 o->window，统一在下面释放一次
+        // shared 句柄属于 o->window 统一释放；pooled 句柄是借来的 AHB 池后备，归池账本，不能碰。
+        if (b->shared || b->pooled) continue;
         if (b->mapped) vkUnmapMemory(o->device, b->memory);
         if (b->buffer) vkDestroyBuffer(o->device, b->buffer, NULL);
         if (b->memory) vkFreeMemory(o->device, b->memory, NULL);
@@ -312,7 +321,8 @@ static int finish(struct s2a_vk_device *d, void *owner, int completion) {
     if (completion == 0) {
         for (int i = 0; i < o->count; ++i) {
             struct compute_buffer *b = &o->buffers[i];
-            if (b->shared || !b->writable) continue;
+            // shared 归并集影子统一回写；pooled 的 GPU 写直达共享页，guest 侧不需要拷贝。
+            if (b->shared || b->pooled || !b->writable) continue;
             if (o->guest.write(o->guest.opaque, b->guest, b->mapped, (size_t)b->size)) rc = -1;
         }
         {
@@ -652,6 +662,37 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
         uniforms + storage + sampled > props.limits.maxPerStageResources) {
         failure = "compute descriptors exceed device limits"; goto bad;
     }
+    // OP_DISPATCH 帧队列收编（s->fq_pool 门；门关以下整块不执行、不做任何池查找，逐字节不变）：
+    // 每条 guest-backed 绑定试一次 AHB 池直绑——命中就不再建影子/上传/回写，描述符写池后备 +
+    // 池内偏移。一条 miss（地址没迁/usage 不够/引用表满/缝缺席/序号为 0）整笔退回 staging：
+    // 已标 pooled 的全部清回，out.fq 只在「每条 guest-backed 都命中」时置 1。
+    if (s->fq_pool) {
+        int all_hit = s2a_poolahb_lookup_usage && nvn_vk_first_draw_submit_seq &&
+                      nvn_vk_first_draw_submit_seq() != 0;
+        for (int i = 0; all_hit && i < p.binding_count; ++i) {
+            struct compute_buffer *b = &o->buffers[i];
+            const struct fd_binding *r = &p.bindings[i];
+            if (r->kind == 2 || !b->guest_backed) continue;
+            VkBuffer pb = VK_NULL_HANDLE; uint64_t po = 0; VkBufferUsageFlags pu = 0;
+            const VkBufferUsageFlags need = r->kind == 0 ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                                                       : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (s2a_poolahb_lookup_usage(b->guest, b->size, &pb, &po, &pu) != 0 ||
+                !(pu & need)) { all_hit = 0; break; }
+            b->buffer = pb; b->window_off = po; b->pooled = 1;
+        }
+        if (!all_hit) {
+            // 整笔退回：清掉已标记的 pooled，让影子路径照原样分配/上传/回写。
+            // 已登记的池引用留在池账本里随本帧序号退休——登记是幂等保活、不追加命令，
+            // 退回 staging 不需要也不能“撤销”它。
+            for (int i = 0; i < p.binding_count; ++i) {
+                struct compute_buffer *b = &o->buffers[i];
+                if (!b->pooled) continue;
+                b->buffer = VK_NULL_HANDLE; b->window_off = 0; b->pooled = 0;
+            }
+        } else {
+            out->fq = 1;
+        }
+    }
     // size=0（长度未声明）的 storage 绑定：0100F2C0115B6000 相邻缓冲的精确长度可互相覆盖（实测 4 MiB 缓冲只差
     // 0x200），若各建一份影子，GPU 写会分叉、回写互相覆盖。这里按“本次 dispatch 所有无界 storage 的
     // 并集”建一份影子，所有无界绑定按偏移绑进同一份字节，帧尾只回写一次。
@@ -660,7 +701,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
         int win_n = 0, win_writable = 0;
         for (int i = 0; i < p.binding_count; ++i) {
             struct compute_buffer *b = &o->buffers[i];
-            if (p.bindings[i].kind != 1 || !b->unbounded) continue;
+            if (p.bindings[i].kind != 1 || !b->unbounded || b->pooled) continue;   // pooled 直绑池页，不进影子
             if (b->guest < win_base) win_base = b->guest;
             if (b->guest + b->size > win_end) win_end = b->guest + b->size;
             if (b->writable) win_writable = 1;
@@ -702,7 +743,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
 #endif
             for (int i = 0; i < p.binding_count; ++i) {
                 struct compute_buffer *b = &o->buffers[i];
-                if (p.bindings[i].kind != 1 || !b->unbounded) continue;
+                if (p.bindings[i].kind != 1 || !b->unbounded || b->pooled) continue;
                 b->shared = 1; b->window_off = b->guest - win_base;
                 b->buffer = o->window.buffer; b->memory = o->window.memory; b->mapped = o->window.mapped;
             }
@@ -711,7 +752,7 @@ int nvn_vk_compute_pipeline_build(struct s2a_vk_device *d,
     for (int i = 0; i < p.binding_count; ++i) {
         struct compute_buffer *b = &o->buffers[i];
         if (p.bindings[i].kind == 2) continue;   // 纹理条目没有 guest 缓冲
-        if (b->shared) continue;                 // 已经绑进并集影子，上传/分配都不再做
+        if (b->shared || b->pooled) continue;    // 已绑进并集影子或直绑池后备：不建影子、不分配、不读 guest
         if (allocate(d, b, p.bindings[i].kind == 0 ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) goto bad;
         if (p.bindings[i].is_support) {
             static const uint8_t one[4] = {0, 0, 0x80, 0x3f}; /* IEEE754 float1.0, little endian. */
