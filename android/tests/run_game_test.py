@@ -25,7 +25,7 @@
     等于本局才 bound，字段缺/值不符 → unproven。文件名 seg 只做与首行名实互核；
     stat -c %Y 整秒 vs birth 浮点判不了先后——不跳过照收证，先后由内容 uuid 裁决
 """
-import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
+import base64, contextlib, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, struct, subprocess, sys, tarfile, tempfile, time, unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -57,7 +57,7 @@ class FixtureClock:
         self.offset += seconds
 
 FAKE_ADB = '''#!/usr/bin/env python3
-import hashlib, io, json, os, re, shlex, sys, tarfile, time
+import hashlib, io, json, os, re, shlex, subprocess, sys, tarfile, time
 state_path, argv = sys.argv[1], sys.argv[2:]
 if argv and argv[0] == "-s":
     argv = argv[2:]
@@ -255,10 +255,15 @@ def run_as(cmdline, via_shell=False):
             # xargs 无 -r 空输入仍跑一次：sha256sum 空参读 stdin 出幻影行
             lines += ["e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -"]
         out("\\n".join(lines) + ("\\n" if lines else ""))
-        out(f"S2A_N={n_str} S2A_CRC={crc}\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
+        out(f"S2A_CRC={crc}\\nS2A_N={n_str} S2A_WRC=0\\nS2A_FRC={frc}\\nS2A_RC={rc}\\n")
         for l_ in err_lines: out(f"S2A_ERR: {l_}\\n")
         return
-    m = _re.match(r"^cd (\\S+) && \\{ set -o pipefail; exec 3>&1; err=", cmdline)
+    if "S2A_FRC=" in cmdline and "S2A_N=" in cmdline:
+        # 先按真实 shell 解析完整命令，不能只靠字符串形状把语法错误模拟成成功。
+        syntax = subprocess.run(["/bin/sh", "-n", "-c", cmdline], capture_output=True)
+        if syntax.returncode:
+            fail("sh: syntax error: unmatched '{'")  # 9000 原始 stderr
+    m = _re.match(r"^cd (\\S+) \\|\\| exit 1; exec 3>&1; err=", cmdline)
     if m:
         dir_ = m.group(1)
         if "find . -type f -print0" in cmdline:
@@ -367,7 +372,7 @@ def shell_data_cmd(text):
     探针按 "echo ok" 圈 _dir_probe 形（__denied__/ls 残留探针不接管）。"""
     if re.match(r"^e=\\$\\(stat ", text):
         return "echo ok" in text
-    m = re.match(r"^cd (\\S+) && ", text) or \
+    m = re.match(r"^cd (\\S+) (?:&& |\\|\\| exit 1; )", text) or \
         re.match(r"^tar -xpf \\S+ -C (\\S+)$", text) or \
         re.match(r"^(?:mkdir -p \\S+; )?find (\\S+) -mindepth 1 -delete$", text)
     return bool(m) and m.group(1).rstrip("/") in DATA_DIRS
@@ -516,7 +521,7 @@ if cmd == "shell":
         ticks = int(st["uptime_us"] / 1e6 * 100) - st.get("birth_lag_ticks", 200)
         out("4242 (org.s2arm.game) S " + " ".join(["0"] * 18) + f" {ticks}\\n"); sys.exit(0)
     if c == "getprop":
-        if len(sh) == 1:
+        if len(sh) == 1 or sh[1:] == ["-T"]:
             import fcntl
             lock_file = st.get("probe_lock_file")
             if lock_file:
@@ -533,8 +538,10 @@ if cmd == "shell":
                 fail("getprop: permission denied")
             if st.get("getprop_all_stderr"):
                 sys.stderr.write("getprop: partial listing\\n")
+            # AOSP getprop -T 返回已存在属性的类型，值本身不会出现在类型清单里。
+            typed = sh[1:] == ["-T"]
             out(st.get("getprop_all_raw", "".join(
-                f"[{k}]: [{v}]\\n" for k, v in sorted(st["props"].items())))); sys.exit(0)
+                f"[{k}]: [{('string' if typed else v)}]\\n" for k, v in sorted(st["props"].items())))); sys.exit(0)
         key = " ".join(sh[1:])
         # getprop_deny：指定属性读被拒（rc=1、stderr permission denied、stdout 空）；
         # getprop_deny_after_launch：只在起局之后拒（模拟收局读回失败）
@@ -543,7 +550,9 @@ if cmd == "shell":
                 or (key in st.get("getprop_deny_after_launch", []) and st.get("props_at_launch") is not None)
                 or (key in st.get("getprop_deny_after_set", []) and key in st.get("props_set_once", []))):
             sys.stderr.write("getprop: permission denied\\n"); save(); sys.exit(1)
-        out(st["props"].get(key, "") + "\\n"); sys.exit(0)
+        if key in st.get("getprop_individual_stderr", []):
+            sys.stderr.write("getprop: partial value\\n")
+        out(st.get("getprop_individual_raw", {}).get(key, st["props"].get(key, "") + "\\n")); sys.exit(0)
     if c == "setprop":
         # props_jam：写空值的 setprop 被设备静默拒（有的构建不让清 debug 属性）→ 旧值还在
         if st.get("props_jam") and sh[1].startswith("debug.s2a.") and (len(sh) <= 2 or not sh[2]):
@@ -1234,6 +1243,56 @@ class RunGameTest(unittest.TestCase):
         self.assertNotEqual(0, rc)
         man = json.loads((out / "run-manifest.json").read_text())
         self.assertIn("清单未证", man["reason"])
+
+    def test_checkpoint_listing_real_shell_syntax(self):
+        # 9000 的原始 stderr：sh: syntax error: unmatched '{'；验证完整生成命令。
+        cmd = run_game._listing_cmd("/data/data/test/files/saves", "find . -type f -print0",
+                                    "xargs -0 -n 256 sha256sum", "find . -type f")
+        shells = [shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", shutil.which("mksh"))
+                  if shell and Path(shell).is_file()]
+        self.assertTrue(shells)
+        for shell in shells:
+            with self.subTest(shell=shell):
+                result = subprocess.run([shell, "-n", "-c", cmd], capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, f"{shell}: {result.stderr}; 9000: sh: syntax error: unmatched '{{'")
+        # 负控：重现多余右花括号，真实 shell 必须拒绝。
+        neg = subprocess.run([shells[0], "-n", "-c", cmd + "; }"], capture_output=True)
+        self.assertNotEqual(0, neg.returncode)
+
+    def test_checkpoint_listing_real_shell_status_and_empty(self):
+        directory = self.tmp / "real directory"
+        directory.mkdir()
+        for shell in ("/bin/sh", "/bin/dash"):
+            if not Path(shell).is_file():
+                continue
+            def execute(find_, xargs_, count_, environment=None):
+                cmd = run_game._listing_cmd(str(directory), find_, xargs_, count_)
+                r = subprocess.run([shell, "-c", cmd], capture_output=True, text=True, env=environment)
+                self.assertEqual(0, r.returncode, r.stderr)
+                return r.stdout
+            empty = execute("find . -type f -print0", "sh -c 'echo forbidden >&2; exit 23'", "find . -type f")
+            self.assertEqual(("", 0), run_game._listing_parts(empty, "empty"))
+            (directory / "one file").write_text("ok")
+            good = execute("find . -type f -print0", "xargs -0 -n 256 sha256sum", "find . -type f")
+            lines, n = run_game._listing_parts(good, "good")
+            self.assertEqual(1, n)
+            self.assertIn(hashlib.sha256(b"ok").hexdigest(), lines)
+            for find_, xargs_, count_ in (("false", "xargs -0 -n 256 sha256sum", "find . -type f"),
+                                          ("find . -type f -print0", "sh -c 'exit 23'", "find . -type f"),
+                                          ("find . -type f -print0", "xargs -0 -n 256 sha256sum", "false"),
+                                          ("find . -type f -print0", "sh -c 'cat >/dev/null; echo fault >&2'", "find . -type f")):
+                with self.assertRaisesRegex(RuntimeError, "清单未证"):
+                    run_game._listing_parts(execute(find_, xargs_, count_), "fault")
+            fake_bin = self.tmp / ("wc-" + Path(shell).name)
+            fake_bin.mkdir()
+            fake_wc = fake_bin / "wc"
+            fake_wc.write_text("#!/bin/sh\nprintf '0\\n'\nexit 17\n")
+            fake_wc.chmod(0o755)
+            fake_env = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
+            with self.assertRaisesRegex(RuntimeError, "清单未证"):
+                run_game._listing_parts(execute("find . -type f -print0", "xargs -0 -n 256 sha256sum",
+                                                "find . -type f", fake_env), "wc failure")
+            (directory / "one file").unlink()
 
     def test_listing_find_fail_and_stderr_refuses(self):
         """㊾ find 中途被拒：出一行就挂 + Permission denied + find rc=1——
@@ -2175,6 +2234,58 @@ class RunGameTest(unittest.TestCase):
         self.assertNotIn("launch_cmd", st)
         self.assertFalse(st["installed"])
 
+    def test_debug_prop_preflight_real_enum_type_list(self):
+        # 9000 实测 -T 类型：枚举值可有空格、大小写、下划线和连字符。
+        types = ("[debug.s2a.query_wait]: [bool]\n"
+                 "[kcmdline.binder]: [enum c rust]\n"
+                 "[ro.surface_flinger.primary_display_orientation]: [enum ORIENTATION_0 ORIENTATION_180 ORIENTATION_270 ORIENTATION_90]\n"
+                 "[ro.telephony.iwlan_operation_mode]: [enum default legacy AP-assisted]\n")
+        rc, out, _ = self.run_tool(state={"getprop_all_raw": types,
+                                         "props": {"debug.s2a.query_wait": ""}}, out_name="out_enum_clean")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, rc, man)
+        self.assertEqual({"debug.s2a.query_wait": ""}, man["debug_props_snapshot"])
+
+    def test_debug_prop_preflight_enum_list_still_blocks_residue(self):
+        types = "[debug.s2a.query_wait]: [bool]\n[kcmdline.binder]: [enum c rust]\n"
+        rc, out, _ = self.run_tool(state={"getprop_all_raw": types,
+                                         "props": {"debug.s2a.query_wait": "1"}}, out_name="out_enum_dirty")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual({"debug.s2a.query_wait": "1"}, man["debug_props_snapshot"])
+        self.assertIn("debug.s2a.query_wait", man["reason"])
+        self.assertNotIn("launch_cmd", json.loads((self.tmp / "state.json").read_text()))
+
+    def test_debug_prop_preflight_unrelated_multiline(self):
+        # 8E 实测 getprop 的真实换行/边界；内容用无敏感信息的占位符。
+        props = {"persist.sys.boot.reason": "", "persist.sys.boot.reason.history":
+                 "reboot,<时间1>\nreboot,<时间2>\nreboot,userrequested,<时间3>\nreboot,ota,<时间4>",
+                 "persist.sys.brightness_rate": "0", "debug.s2a.clear_log": ""}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(0, rc, man)
+        self.assertEqual({"debug.s2a.clear_log": ""}, man["debug_props_snapshot"])
+
+    def test_debug_prop_preflight_unrelated_value_cannot_forge_key(self):
+        props = {"persist.sys.boot.reason.history": "reboot\n[debug.s2a.fake]: [1]\nend",
+                 "debug.s2a.query_wait": "1"}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline_forged")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual({"debug.s2a.query_wait": "1"}, man["debug_props_snapshot"])
+        self.assertIn("debug.s2a.query_wait", man["reason"])
+
+    def test_debug_prop_preflight_multiline_residue_refused(self):
+        props = {"persist.sys.boot.reason.history": "reboot,<时间1>\nreboot,<时间2>",
+                 "debug.s2a.query_wait": "1\nextra"}
+        rc, out, _ = self.run_tool(state={"props": props}, out_name="out_multiline_dirty")
+        man = json.loads((out / "run-manifest.json").read_text())
+        self.assertEqual(2, rc, man)
+        self.assertEqual("1\nextra", man["debug_props_snapshot"]["debug.s2a.query_wait"])
+        self.assertIn("debug.s2a.query_wait", man["reason"])
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertNotIn("launch_cmd", st)
+
     def test_debug_prop_preflight_clean_is_locked(self):
         props = {"ro.product.model": "PixelTest", "debug.s2a.debug_env": "1",
                  "debug.s2a.frame_log": "1", "debug.s2a.session_uuid": "old",
@@ -2216,6 +2327,10 @@ class RunGameTest(unittest.TestCase):
                             ("stderr", {"getprop_all_stderr": True}),
                             ("malformed", {"getprop_all_raw": "[ro.x]: [ok]\n[debug.s2a.bad]: [1\n"}),
                             ("duplicate", {"getprop_all_raw": "[ro.x]: [a]\n[ro.x]: [b]\n"}),
+                            ("badtype", {"getprop_all_raw": "[ro.x]: [two types]\n"}),
+                            ("enumempty", {"getprop_all_raw": "[ro.x]: [enum]\n"}),
+                            ("enumbadspace", {"getprop_all_raw": "[ro.x]: [enum a  b]\n"}),
+                            ("badkey", {"getprop_all_raw": "[debug.s2a.bad;echo]: [string]\n"}),
                             ("truncated", {"getprop_all_raw": "[ro.x]: [ok]"}),
                             ("empty", {"getprop_all_raw": ""})):
             with self.subTest(kind=kind):
@@ -2226,6 +2341,18 @@ class RunGameTest(unittest.TestCase):
                 self.assertIn("getprop", man["reason"])
                 self.assertNotIn("launch_cmd", st)
                 self.assertFalse(st["installed"])
+
+    def test_debug_prop_preflight_individual_read_failure(self):
+        for fault in ({"getprop_deny": ["debug.s2a.query_wait"]},
+                      {"getprop_individual_stderr": ["debug.s2a.query_wait"]},
+                      {"getprop_individual_raw": {"debug.s2a.query_wait": "1"}}):
+            fault["props"] = {"debug.s2a.query_wait": "1"}
+            rc, out, _ = self.run_tool(state=fault, out_name="out_individual_" + str(len(list(self.tmp.glob("out_individual_*")))))
+            man = json.loads((out / "run-manifest.json").read_text())
+            self.assertEqual(2, rc, man)
+            self.assertIn("getprop", man["reason"])
+            st = json.loads((self.tmp / "state.json").read_text())
+            self.assertNotIn("launch_cmd", st)
 
     def test_debug_prop_preflight_allow_requires_exact_key(self):
         rc, out, _ = self.run_tool(state={"props": {"debug.s2a.query_wait": "1"}},

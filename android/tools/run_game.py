@@ -384,32 +384,23 @@ def install_state(d, pkg):
             "sha256": d.shell(f"sha256sum {shlex.quote(base[0])}").split()[0], **meta}
 
 
-# 目录清单三件套：find -exec {} + 会把全部路径摊进一次 exec——4 万文件的私有树
-# 触发 toybox E2BIG（Argument list too long，9000 实测；与 deploy_game 核验同病
-# 同治）：改 find -print0 | xargs -0 -n 256 分批。三道凭据缺一不可：① mksh
-# `set -o pipefail` + 左组 `echo S2A_FRC` 报 find 自己的 rc（mksh 无 PIPESTATUS，
-# 管道 rc 单独记 S2A_RC）——没有它 find 中途被拒（stderr Permission denied）
-# 管道照样 rc=0 吞掉失败（9000 实证复现）；② S2A_N=find 计数（连计数管道自己的
-# rc S2A_CRC）；③ stderr 全捕进变量、逐行 S2A_ERR: 前缀回投——adb 会把设备
-# stderr 混进 stdout 流，靠前缀区分，不靠宿主 stderr。任一 rc≠0、计数非数字、
-# stderr 非白名单 = 清单未证，半截不当全量。
-LISTING_STDERR_OK = ()          # 明确无害的 stderr 行白名单（目前为空：有 stderr 即未证）
-TAR_STDERR_OK = ()              # 备份 tar 的 stderr 白名单（同上：有 stderr 即备份未证）
+# 目录清单三件套分批执行，分别记录 count-find、wc、find、xargs 的状态。
+# 仅使用 POSIX shell 子进程与 fd3；不依赖 pipefail 或花括号组，stderr 转成有前缀的证据。
+LISTING_STDERR_OK = ()
+TAR_STDERR_OK = ()
 
 
 def _listing_cmd(dir_, find_, xargs_, count_):
-    """分批清单命令：fd3 旁路把清单与标记送 stdout，stderr 全捕 err 变量
-    逐行 S2A_ERR: 前缀回投（mksh 无 PIPESTATUS/process-sub 的兼容写法）。
-    计数先行，计数=0 不跑 find|xargs——toybox xargs 无 -r 时默认空输入也
-    跑一次命令（sha256sum 空参读 stdin 出幻影行，空树会误拒）。"""
-    return (f"cd {shlex.quote(dir_)} && {{ set -o pipefail; exec 3>&1; err=$( {{ "
-            f"n=$({count_} | wc -l); echo \"S2A_N=${{n##* }} S2A_CRC=$?\" >&3; "
-            f"if [ \"${{n##* }}\" -gt 0 ] 2>/dev/null; then "
-            f"{{ {find_}; echo \"S2A_FRC=$?\" >&3; }} | {xargs_} >&3; "
-            "echo \"S2A_RC=$?\" >&3; "
-            "else echo \"S2A_FRC=0\" >&3; echo \"S2A_RC=0\" >&3; fi; "
-            "} 2>&1 ); exec 3>&-; "
-            "[ -z \"$err\" ] || printf '%s\\n' \"$err\" | sed 's/^/S2A_ERR: /'; }}")
+    """fd3 传清单与状态，捕获 stderr；空目录不运行会空输入执行一次的 toybox xargs。"""
+    return (f"cd {shlex.quote(dir_)} || exit 1; exec 3>&1; err=$( ( "
+            f"n=$( ( {count_}; printf 'S2A_CRC=%s\\n' \"$?\" >&3 ) | wc -l ); "
+            "printf 'S2A_N=%s S2A_WRC=%s\\n' \"${n##* }\" \"$?\" >&3; "
+            "if [ \"${n##* }\" -gt 0 ] 2>/dev/null; then "
+            f"( {find_}; printf 'S2A_FRC=%s\\n' \"$?\" >&3 ) | {xargs_} >&3; "
+            "printf 'S2A_RC=%s\\n' \"$?\" >&3; "
+            "else printf 'S2A_FRC=0\\nS2A_RC=0\\n' >&3; fi "
+            ") 2>&1 ); exec 3>&-; "
+            "[ -z \"$err\" ] || printf '%s\\n' \"$err\" | sed 's/^/S2A_ERR: /'")
 
 
 def _stat_map(stat_text):
@@ -466,7 +457,7 @@ def _entry_map(sha_map, stat_map, link_map):
 
 def _listing_parts(text, what):
     """分批清单输出 → (清单文本, find 计数)。凭据：S2A_FRC=find rc、
-    S2A_RC=管道 rc（pipefail）、S2A_N=find 计数、S2A_CRC=计数管道 rc、
+    S2A_RC=xargs rc、S2A_N=find 计数、S2A_CRC=计数 find rc、S2A_WRC=wc rc、
     S2A_ERR:=stderr 行。任一 rc 非零/缺失、计数非数字、stderr 非白名单
     → RuntimeError 清单未证（半截/未证清单不当全量，fail closed）。"""
     lines, rcs, want, err = [], {}, None, []
@@ -477,10 +468,12 @@ def _listing_parts(text, what):
             rcs["find"] = ln[8:]
         elif ln.startswith("S2A_RC="):
             rcs["xargs"] = ln[7:]
+        elif ln.startswith("S2A_CRC="):
+            rcs["count"] = ln[8:]
         elif ln.startswith("S2A_N="):
-            m = re.match(r"^S2A_N=(\S+) S2A_CRC=(\S+)$", ln)
+            m = re.match(r"^S2A_N=(\S+) S2A_WRC=(\S+)$", ln)
             if m:
-                want, rcs["count"] = m.groups()
+                want, rcs["wc"] = m.groups()
         else:
             lines.append(ln)
     try:
@@ -488,7 +481,7 @@ def _listing_parts(text, what):
     except (TypeError, ValueError):
         want_n = None
     bad_err = [l for l in err if l not in LISTING_STDERR_OK]
-    if (want_n is None or len(rcs) != 3 or any(v != "0" for v in rcs.values())
+    if (want_n is None or len(rcs) != 4 or any(v != "0" for v in rcs.values())
             or bad_err):
         raise RuntimeError(f"{what}清单未证（rc={rcs}，计数={want!r}，"
                            f"stderr={err[:3]!r}）：半截不当全量")
@@ -1397,28 +1390,39 @@ def shot(adb_argv, dest):
 
 
 def read_debug_props(device):
-    """按 Android getprop 无参输出读取全量快照；不完整或无法判读就拒跑。"""
-    r = subprocess.run([*device.argv, "shell", "getprop"], capture_output=True, timeout=60)
-    if r.returncode or r.stderr:
-        detail = (r.stderr or r.stdout).decode("utf-8", errors="replace")[:300]
-        raise Refuse(f"getprop 全量读取失败（rc={r.returncode}）：{detail}")
-    try:
-        data = r.stdout.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise Refuse(f"getprop 全量输出不是 UTF-8：{error}") from error
-    if not data or not data.endswith("\n"):
-        raise Refuse("getprop 全量输出为空或不完整")
-    props = {}
+    """getprop -T 列现有属性名，再逐键读值，避免无关多行值伪装记录边界。"""
+    def getprop(command):
+        r = subprocess.run([*device.argv, "shell", command], capture_output=True, timeout=60)
+        if r.returncode or r.stderr:
+            detail = (r.stderr or r.stdout).decode("utf-8", errors="replace")[:300]
+            raise Refuse(f"{command} 读取失败（rc={r.returncode}）：{detail}")
+        try:
+            data = r.stdout.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refuse(f"{command} 输出不是 UTF-8：{error}") from error
+        if not data or not data.endswith("\n"):
+            raise Refuse(f"{command} 输出为空或不完整")
+        return data
+
+    # Android getprop -T 按属性列类型，不输出属性值（8E 实测 1220 条）。
+    names = getprop("getprop -T")
     seen = set()
-    for line in data.splitlines():
-        match = re.fullmatch(r"\[([^]\r\n]+)\]: \[(.*)\]", line)
+    keys = []
+    for line in names.splitlines():
+        # AOSP property_info 的 enum 类型后有一个或多个空格分隔的候选值，
+        # 值不用于 shell，因此保留原样；单值类型仍按原来的窄格式校验。
+        match = re.fullmatch(r"\[([^]\r\n]+)\]: \[((?!enum\])[a-z0-9_]+|enum [^\s]+(?: [^\s]+)*)\]", line)
         if not match or match.group(1) in seen:
-            raise Refuse(f"getprop 全量输出格式错误或键重复：{line!r}")
-        key, value = match.groups()
+            raise Refuse(f"getprop -T 输出格式错误或键重复：{line!r}")
+        key = match.group(1)
         seen.add(key)
         if key.startswith("debug.s2a."):
-            props[key] = value
-    return props
+            # adb shell 会将参数拼回命令字符串；非合法属性名不能安全交给 shell。
+            if not re.fullmatch(r"debug\.s2a\.[A-Za-z0-9_.-]+", key):
+                raise Refuse(f"getprop -T 发现非法属性名：{key!r}")
+            keys.append(key)
+    # 每条 getprop 输出的最后一个换行是工具追加的，保留属性值自身的换行/空格。
+    return {key: getprop(f"getprop {key}")[:-1] for key in keys}
 
 
 def main(argv=None):
