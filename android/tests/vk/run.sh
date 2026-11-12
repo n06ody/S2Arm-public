@@ -51,7 +51,9 @@ if [ -z "$glslc" ]; then
     exit 2
 fi
 
-out=$(mktemp -d "${TMPDIR:-/tmp}/s2a-nvn-vk.XXXXXX")
+mkdir -p "$repo/build/vk-tests"
+export TMPDIR="$repo/build/vk-tests"
+out=$(mktemp -d "$TMPDIR/s2a-nvn-vk.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 mkdir -p "$out/shaders"
 for s in tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert point.vert quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag; do
@@ -110,6 +112,8 @@ if [ -n "${S2A_VK_PROFILE_LAYER_DIR:-}" ]; then
     export VK_LAYER_PATH=${VK_LAYER_PATH:+$VK_LAYER_PATH:}$S2A_VK_PROFILE_LAYER_DIR
     export VK_INSTANCE_LAYERS=${VK_INSTANCE_LAYERS:+$VK_INSTANCE_LAYERS:}VK_LAYER_KHRONOS_profiles
 fi
+
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_clear_tex.sh"; fi
 
 set +e
 timeout 180 "$out/t_backend_vk" "$out/shaders" 2>&1 | tee "$out/log"

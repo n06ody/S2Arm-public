@@ -36,7 +36,7 @@
 34	OP_BIND_IMG	状态（绘制时生效）	14630	state_op:10428	状态已记；图像绑定未接	无	否
 35	OP_COPY_T2T	拷贝 / 填充	14641	copy_t2t	未接	无	否
 36	OP_RESET_COUNTER	同步 / 查询	14548	（就地：遮挡计数开）	未接	无	否
-37	OP_CLEAR_TEX	拷贝 / 填充	14644	clear_tex	未接	无	否
+37	OP_CLEAR_TEX	拷贝 / 填充	14644	clear_tex	部分：单采样 2D / 数组色彩清除；换格式视图、压缩及深度模板等未接	t_nvn_clear_tex	否
 38	OP_CLEAR_BUF	拷贝 / 填充	14558	mtl_sub_fill	已接（同上，32 位样式）	t_buf_ops	否
 39	OP_DEPTH_CLAMP	状态（绘制时生效）	14631	state_op:10438	已接（rp_draw 在绘制时取用）	t_draw	否
 40	OP_RENDER_COND	同步 / 查询	14536	（就地：g_rc_skip）	未接	无	否

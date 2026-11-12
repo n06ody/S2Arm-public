@@ -22,6 +22,7 @@ void rp_op_copy_b2b(const void *a, const void *rec);
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec);
 void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec);
+void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec);
 
 // 会话四件套（前端按名字调，上沿头文件里没有声明）
 void nvn_be_begin_session(void);

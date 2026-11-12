@@ -90,7 +90,7 @@ function(s2a_android_nvk_sources output)
         native/nvn/backend_vulkan.c native/nvn/nvn_vk_format.c native/nvn/nvn_vk_bcdec.c
         ../graphics/nvn/gfx/nvn/nvn_fmt_expand.c
         # 回放核心（安卓 / 鸿蒙共用）
-        ../graphics/nvn/replay/rp_exec.c ../graphics/nvn/replay/rp_state.c ../graphics/nvn/replay/rp_entry.c
+        ../graphics/nvn/replay/rp_exec.c ../graphics/nvn/replay/rp_clear_tex.c ../graphics/nvn/replay/rp_state.c ../graphics/nvn/replay/rp_entry.c
         ../graphics/nvn/replay/rp_res.c ../graphics/nvn/replay/rp_buf.c ../graphics/nvn/replay/rp_pass.c
         ../graphics/nvn/replay/rp_present.c ../graphics/nvn/replay/rp_draw.c
         ../graphics/nvn/replay/nvn_unimpl.c
