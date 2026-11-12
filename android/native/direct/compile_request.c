@@ -743,7 +743,7 @@ int s2a_compile_request_execute(uint64_t session, uint64_t generation, const cha
     if (out->rc != 0 || !capture.bytes || !capture.len) {
         // 编译失败时，C# 侧会用同一个 emit 通道回一段 s2a-direct-error-v1（ABI 只有状态码）。
         // 有就把 code/message 落进摘要：否则日志里只剩 rc=-1，无法判断是校验拦截还是翻译器问题。
-        char reason[320] = "";
+        char reason[1800] = "";
         if (out->rc != 0 && capture.bytes && capture.len) {
             const char *txt = (const char *)capture.bytes;
             size_t n = capture.len < sizeof reason - 1 ? capture.len : sizeof reason - 1;

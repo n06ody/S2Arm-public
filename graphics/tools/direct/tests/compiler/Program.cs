@@ -1276,6 +1276,10 @@ internal static unsafe class Program
             Check(accessor.QueryTextureFormat(3, 2) == TextureFormat.R8G8B8A8Unorm, "texture format fact");
             Check(accessor.QueryTextureCoordNormalized(3, 2) && !accessor.QueryTextureIsBuffer(3, 2), "normalized/non-buffer fact");
             Throws("MISSING_FACT", () => accessor.QuerySamplerType(4, 2), "unbound texture is a missing fact");
+            try { accessor.QuerySamplerType(4, 2); Check(false, "probe missing fact throws"); }
+            catch (DirectCompileException error) {
+                Check(error.Code == "MISSING_FACT" && error.Message.Contains("stage=fs,handle=4,cbufSlot=2") && error.Message.Contains("available=[3,10]"), "probe reports same-stage facts on missing query");
+            }
             Check(accessor.QueryTextureCoordNormalized(10, -1) && accessor.QuerySamplerType(10, -1) == SamplerType.Texture2D, "sampled-only texture (format Unknown) answers sampler type and normalization");
             Throws("MISSING_FACT", () => accessor.QueryTextureFormat(10, -1), "format Unknown has no image format");
             Throws("MISSING_FACT", () => accessor.GetCode(1u << 20, 8), "GetCode out of range");

@@ -73,6 +73,14 @@ def main():
              'else if (0 && !strcmp(code, "MISSING_FACT")) {', 1, 'compiler reason counted accurately'),
             ('drop-request-count', 'g_pool_request_rejected++;',
              '(void)g_pool_request_rejected;', 1, 'request failure is counted separately'),
+            ('drop-probe-report', 'fact_probe_error(oc.summary, sha);',
+             '(void)sha;', 1, 'probe preserves compiler coordinates and handle list'),
+            ('drop-probe-omission', 'fact_probe_omit(st, slot, target, fmt);',
+             '(void)st;', 1, 'probe reports count and exact omitted registered slot'),
+            ('drop-probe-dedup', 'if (!strcmp(g_fact_seen[i].method, method) && !strcmp(g_fact_seen[i].stage, stage) &&',
+             'if (0 && !strcmp(g_fact_seen[i].method, method) && !strcmp(g_fact_seen[i].stage, stage) &&', 1, 'probe deduplicates identical query across programs'),
+            ('drop-probe-cap', 'g_fact_seen_n >= 200',
+             'g_fact_seen_n >= 199', 1, 'probe hard cap is 200 distinct coordinates'),
         ]
         for name, before, after, count, expected in changes:
             assert text.count(before) == count, (name, 'mutation anchor')
@@ -81,7 +89,7 @@ def main():
             result = run(name, path)
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 10 negative controls')
+        print('PASS: 14 negative controls')
         return 0
     if sys.argv[1:]:
         raise ValueError('usage: nvk_shader_pool_test.py [--withdraw]')

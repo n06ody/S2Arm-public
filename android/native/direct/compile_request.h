@@ -109,7 +109,7 @@ struct s2a_compile_outcome {
     int32_t rc;                     // 0 = 编译器成功且 emit 已复制；负码 = s2a_direct_result
     uint8_t *bytes;                 // malloc 的后端自有内存；调用方负责 free
     size_t bytes_len;
-    char summary[512];              // 结果身份/内容摘要（失败时写编译器的返回事实）
+    char summary[2048];              // 结果身份/内容摘要（失败时写编译器的返回事实）
 };
 
 // 生成请求 JSON。成功返回 0 并把 malloc 的 JSON 写进 *json。字段缺真实来源时**不写**该字段，

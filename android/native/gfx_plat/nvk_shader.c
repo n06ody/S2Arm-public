@@ -38,6 +38,55 @@ static unsigned g_pool_reason_count;
 
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
 static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
+// One-off probe; render/compile runs synchronously on the submission thread.
+// Keep the first example for each query coordinate, with a hard 200-line cap.
+struct probe_omission { int stage, slot; unsigned target, format; };
+static struct { int enabled, count[3], omitted; struct probe_omission item[64]; } g_fact_probe;
+static struct { char method[64], stage[8]; int handle, cbuf; } g_fact_seen[200];
+static unsigned g_fact_seen_n;
+static void fact_probe_begin(void) {
+    memset(&g_fact_probe, 0, sizeof g_fact_probe);
+    g_fact_probe.enabled = nvn_plat_flag("nvk_fact_probe", 0);
+}
+static void fact_probe_omit(int stage, int slot, unsigned target, unsigned format) {
+    if (!g_fact_probe.enabled || g_fact_probe.omitted >= 64) return;
+    struct probe_omission *p = &g_fact_probe.item[g_fact_probe.omitted++];
+    p->stage = stage; p->slot = slot; p->target = target; p->format = format;
+}
+static void fact_probe_error(const char *summary, const uint8_t program[32]) {
+    if (!g_fact_probe.enabled || g_fact_seen_n >= 200) return;
+    const char *p = strstr(summary, " 原因=");
+    if (!p) return;
+    p += strlen(" 原因=");
+    struct s2a_jv doc = {p, strlen(p)}, v;
+    char code[64] = "", message[1500] = "", method[64] = "", stage[8] = "";
+    int handle, cbuf;
+    if (!s2a_jv_is_object(doc) || s2a_jv_obj_find(doc, "code", &v) || s2a_jv_str(v, code, sizeof code) || strcmp(code, "MISSING_FACT") ||
+        s2a_jv_obj_find(doc, "message", &v) || s2a_jv_str(v, message, sizeof message) ||
+        sscanf(message, "%63s has no source (stage=%7[^,],handle=%d,cbufSlot=%d", method, stage, &handle, &cbuf) != 4 ||
+        !strstr(message, ",available=[")) return;
+    for (unsigned i = 0; i < g_fact_seen_n; i++)
+        if (!strcmp(g_fact_seen[i].method, method) && !strcmp(g_fact_seen[i].stage, stage) &&
+            g_fact_seen[i].handle == handle && g_fact_seen[i].cbuf == cbuf) return;
+    unsigned ix = g_fact_seen_n++;
+    snprintf(g_fact_seen[ix].method, sizeof g_fact_seen[ix].method, "%s", method);
+    snprintf(g_fact_seen[ix].stage, sizeof g_fact_seen[ix].stage, "%s", stage);
+    g_fact_seen[ix].handle = handle; g_fact_seen[ix].cbuf = cbuf;
+    char line[4000];
+    int n = snprintf(line, sizeof line, "probe_missing_fact index=%u/200 program=%02x%02x%02x%02x%02x%02x%02x%02x %s counts=vs=%d,fs=%d,cs=%d omitted=%d", ix + 1,
+        program[0], program[1], program[2], program[3], program[4], program[5], program[6], program[7], message,
+        g_fact_probe.count[0], g_fact_probe.count[1], g_fact_probe.count[2], g_fact_probe.omitted);
+    size_t used = n > 0 && (size_t)n < sizeof line ? (size_t)n : sizeof line - 1;
+    for (int i = 0; i < g_fact_probe.omitted; i++) {
+        const struct probe_omission *o = &g_fact_probe.item[i];
+        n = snprintf(line + used, sizeof line - used, " [%s:slot=%d,registered=1,target=%#x,format=%#x]",
+                     o->stage == 0 ? "vs" : o->stage == 1 ? "fs" : "cs", o->slot, o->target, o->format);
+        if (n < 0 || (size_t)n >= sizeof line - used) { snprintf(line + sizeof line - 16, 16, " ...truncated"); break; }
+        used += (size_t)n;
+    }
+    nvn_plat_log(NVN_PLAT_LOG_RED, "shader", line);
+}
+
 static void pool_stats(const char *phase) {
     if (!g_texpool_diag) return;
     char line[320];
@@ -69,7 +118,7 @@ static void pool_final_summary(int normal) {
  * truncated or malformed errors stay explicitly unclassified. */
 static void compiler_rejected(const char *summary) {
     if (!g_texpool_diag) return;
-    char code[64] = "", message[256] = "", schema[48] = "", reason[80] = "unclassified";
+    char code[64] = "", message[1500] = "", schema[48] = "", reason[80] = "unclassified";
     const char *p = strstr(summary, " 原因=");
     if (p) {
         p += strlen(" 原因=");
@@ -182,6 +231,7 @@ struct facts {
 
 static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
     memset(f, 0, sizeof *f);
+    fact_probe_begin();
     struct s2a_compile_graphics_src *g = &f->gfx;
     g->topology = topology(q->prim);
     g->rt_count = q->rt_count;
@@ -209,13 +259,15 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) {
             // 格式、目标都取绑定视图的（视图自己设了就用它的）：声明的采样数值型要和绑上去的视图一致，坐标归一与否只看有效目标
-            if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;   // 表达不了的格式 / 目标：不出事实，编译器按缺项准确失败
+            unsigned fmt = (uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), target = (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target);
+            if (s2a_nvn_texture_fact(fmt, target, t.d.depth, &nf, why, sizeof why)) { fact_probe_omit(st, slot, target, fmt); continue; }
         } else {
             int in_pool = id >= rp_S.tex_base && (uint64_t)(id - rp_S.tex_base) < (uint64_t)rp_S.tex_pool_n;
             memset(&nf, 0, sizeof nf); snprintf(nf.format, sizeof nf.format, "Unknown");
             snprintf(nf.sampler_type, sizeof nf.sampler_type, "%s", in_pool ? "1d" : "2d"); nf.normalized = !in_pool; nf.array_length = 1;
         }
         int n = f->ntex++;
+        if (g_fact_probe.enabled) g_fact_probe.count[st]++;
         memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
         f->tex[n] = (struct s2a_compile_texture_src){st ? "fs" : "vs", (uint32_t)(8 + 2 * slot), -1, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 0, nf.array_length};
     }
@@ -480,7 +532,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
             int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
             free(json);
             if (ran || !oc.bytes || !oc.bytes_len) {
-                g_n_failed++; red1("compile_failed", oc.summary); compiler_rejected(oc.summary);
+                g_n_failed++; red1("compile_failed", oc.summary); compiler_rejected(oc.summary); fact_probe_error(oc.summary, sha);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e); e->failed = 1; nvn_hm_put(&g_progs, sha, e);   // 同一份输入不再反复编
                 return -1;
@@ -565,13 +617,15 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
     memcpy(st.keys[0], rp_S.skey[5], 8); st.stages = 32;
     { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; st.ubo_use[5] = m << 3; }   // 用户常量缓冲从 c3 起
     st.tex_pool_n = (uint32_t)rp_S.tex_pool_n; st.samp_pool_n = (uint32_t)rp_S.samp_pool_n; st.tex_pool_seen = rp_S.tex_pool_n > 0; st.samp_pool_seen = rp_S.samp_pool_n > 0; st.tex_pool_base = rp_S.tex_base;
+    fact_probe_begin();
     // 贴图事实：计算阶段的 32 个组合槽，取法同图形（没绑过的槽读作池里的第 0 项）
     static struct s2a_compile_texture_src tex[32]; static char tfmt[32][S2A_TEX_FORMAT_MAX], tsmp[32][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
     for (int slot = 0; slot < 32; slot++) {
         uint64_t h = rp_S.tex[5][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) {
-            if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+            unsigned fmt = (uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), target = (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target);
+            if (s2a_nvn_texture_fact(fmt, target, t.d.depth, &nf, why, sizeof why)) { fact_probe_omit(2, slot, target, fmt); continue; }
         } else {
             int in_pool = id >= rp_S.tex_base && (uint64_t)(id - rp_S.tex_base) < (uint64_t)rp_S.tex_pool_n;
             memset(&nf, 0, sizeof nf); snprintf(nf.format, sizeof nf.format, "Unknown");
@@ -580,6 +634,7 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
         memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
         tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(8 + 2 * slot), -1, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 0, nf.array_length};
         ntex++;
+        if (g_fact_probe.enabled) g_fact_probe.count[2]++;
     }
     struct nvk_compute_texture_facts tf = {tex, ntex, 1};
     int unaligned = 0;
@@ -612,7 +667,7 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
             if (g_texpool_diag) g_pool_attempts++;
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
-                g_n_failed++; red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
+                g_n_failed++; red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary); fact_probe_error(oc.summary, rq.identity);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e); e->failed = 1; nvn_hm_put(&g_progs, rq.identity, e);
                 nvk_compute_request_release(&rq);
@@ -643,4 +698,5 @@ void rp_shader_reset(void) {
     g_pool_programs = g_pool_attempts = g_pool_compiled = g_pool_rejected = g_pool_unsupported = 0;
     g_pool_request_rejected = g_pool_request_facts = g_pool_request_other = 0;
     g_pool_reason_count = 0; memset(g_pool_reasons, 0, sizeof g_pool_reasons);
+    g_fact_seen_n = 0;
 }

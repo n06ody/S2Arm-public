@@ -276,7 +276,10 @@ namespace S2A.DirectCompiler
             DirectTextureFact fact = FindTexture(handle, cbufSlot);
             if (fact == null && cbufSlot >= 0)
                 fact = FindTexture(handle, -1);
-            return fact ?? throw Missing(method, $"stage={_stage.Stage},handle={handle},cbufSlot={cbufSlot}");
+            if (fact != null) return fact;
+            // Temporary probe: carry the actual same-stage handles over the existing error ABI.
+            string available = string.Join(",", _program.Textures.Where(t => t.Stage == _stage.Stage).Select(t => t.Handle).Distinct().OrderBy(h => h));
+            throw Missing(method, $"stage={_stage.Stage},handle={handle},cbufSlot={cbufSlot},available=[{available}]");
         }
 
         public bool HasDirectTextureFact(int handle) =>

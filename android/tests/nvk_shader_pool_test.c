@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn.h"
 #include "rp_shader.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -18,6 +19,8 @@
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
 static unsigned fake_array_count;
+static int probe_enabled, probe_lines, probe_fake_texture;
+static char probe_log[4096];
 int g_s2a_logfd = 2;
 static const char *fake_compile_error;
 static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512], last_request_reason[512];
@@ -27,10 +30,12 @@ static const char phash[] = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_fact_probe")) return probe_enabled;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     return dflt;
 }
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (level == NVN_PLAT_LOG_RED && strstr(text, "probe_missing_fact")) { probe_lines++; snprintf(probe_log, sizeof probe_log, "%s", text); }
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_capacity=")) {
         diag_lines++; snprintf(last_diag, sizeof last_diag, "%s", text);
@@ -50,7 +55,7 @@ int rp_origin_lower_left(void) { return 0; }
 // 此夹具只登记一个起点为 0 的池；空池也按真实 nvn_dpool_base 返回 0。
 int nvn_dpool_base(const void *pool, int tex) { (void)pool; (void)tex; return 0; }
 uint64_t nvn_ga2ca(uint64_t address) { return address; }
-int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) { (void)id; (void)t; (void)v; (void)h; return 0; }
+int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) { (void)v; if (probe_fake_texture && id == 3) { memset(t, 0, sizeof *t); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_BUFFER; t->d.depth = 1; *h = 0; return 1; } return 0; }
 uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) { (void)h; (void)n; (void)b; return (uint64_t)count; }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
@@ -229,6 +234,32 @@ int main(void) {
               "request failure is counted separately from compiler rejection: %s", last_stats);
         CHECK(strstr(last_request_reason, "descriptor_pool_facts") && strstr(last_request_reason, "count=1"),
               "request failure names descriptor-pool facts: %s", last_request_reason);
+    }
+    {
+        rp_shader_reset(); nvn_unimpl_reset(); probe_enabled = 1; probe_lines = 0; probe_fake_texture = 1; probe_log[0] = 0;
+        fake_compile_error = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=vs,handle=4,cbufSlot=2,available=[10,12])\"}";
+        rp_S.tex[0][0] = 3; bind_pools(7); rp_shader_resolve(&q, &p);
+        CHECK(probe_lines == 1 && strstr(probe_log, "QuerySamplerType") && strstr(probe_log, "stage=vs,handle=4,cbufSlot=2") && strstr(probe_log, "available=[10,12]"), "probe preserves compiler coordinates and handle list: %s", probe_log);
+        char omitted[120]; snprintf(omitted, sizeof omitted, "slot=0,registered=1,target=%#x,format=%#x", NVN_TEXTURE_TARGET_BUFFER, NVN_FORMAT_RGBA8);
+        CHECK(strstr(probe_log, "vs=31,fs=0,cs=0") && strstr(probe_log, omitted), "probe reports count and exact omitted registered slot: %s", probe_log);
+        bind_pools(8); rp_shader_resolve(&q, &p);
+        CHECK(probe_lines == 1, "probe deduplicates identical query across programs");
+        char long_error[1000];
+        int pos = snprintf(long_error, sizeof long_error, "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=vs,handle=7,cbufSlot=2,available=[");
+        for (int i = 0; i < 32; i++) pos += snprintf(long_error + pos, sizeof long_error - (size_t)pos, "%s%d", i ? "," : "", 100000000 + i);
+        snprintf(long_error + pos, sizeof long_error - (size_t)pos, "])\"}");
+        fake_compile_error = long_error; bind_pools(9); rp_shader_resolve(&q, &p);
+        CHECK(probe_lines == 2 && strstr(probe_log, "100000000,100000001") && strstr(probe_log, "100000031]"), "probe transports complete 32-handle list beyond 320 bytes: %s", probe_log);
+        for (int i = 0; i < 205; i++) {
+            char error[512]; snprintf(error, sizeof error, "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=vs,handle=%d,cbufSlot=2,available=[10,12])\"}", i + 100);
+            fake_compile_error = error; bind_pools(i + 20); rp_shader_resolve(&q, &p);
+        }
+        CHECK(probe_lines == 200, "probe hard cap is 200 distinct coordinates, got %d", probe_lines);
+        rp_shader_reset(); probe_lines = 0;
+        fake_compile_error = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QueryTextureCoordNormalized has no source (stage=cs,handle=4,cbufSlot=-1,available=[10,12])\"}";
+        rp_S.tex[5][0] = 3; bind_pools(7); rp_shader_resolve_compute(&p);
+        CHECK(probe_lines == 1 && strstr(probe_log, "vs=0,fs=0,cs=31") && strstr(probe_log, omitted), "compute probe records its own snapshot: %s", probe_log);
+        probe_enabled = 0; fake_compile_error = NULL; probe_fake_texture = 0; rp_S.tex[0][0] = rp_S.tex[5][0] = 0;
     }
     rp_shader_reset(); s2a_source_clear();
     fprintf(stderr, "nvk shader pool: %d checks, %d failures\n", checks, failures);
