@@ -28,9 +28,39 @@ struct entry { struct rp_prog prog; int failed; };
 static nvn_hmap g_progs = {.klen = 32};   // 内容身份（SHA-256）→ struct entry *
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 static uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
+static int g_texpool_logged, g_texpool_last_over_limit;
 
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
 static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
+
+// 编译器 DirectProgram 的 program.textureArrayLength 合同：1..65536。
+// 不修改池值；零/负数是没有有效绑定，超限的真实值必须留在错误里。
+static int shader_texture_pool_ready(void) {
+    const int n = rp_S.tex_pool_n;
+    if (n > 0 && !g_texpool_logged) {
+        g_texpool_logged = 1;
+        if (nvn_plat_flag("nvk_texpool_log", 0)) {
+            char line[160];
+            snprintf(line, sizeof line, "texture_pool_capacity=%d sampler_pool_capacity=%d", n, rp_S.samp_pool_n);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+        }
+    }
+    if (n <= 0) {
+        char why[96]; snprintf(why, sizeof why, "贴图池未绑定或容量无效：%d", n);
+        red1("texture_pool_missing", why);
+        return 0;
+    }
+    if (n > 65536) {
+        uint64_t count = nvn_unimpl("shader", "texture_pool_over_limit", NULL);
+        if (count == 1 || g_texpool_last_over_limit != n) {
+            char why[128]; snprintf(why, sizeof why, "贴图池容量 %d 超过编译器上限 65536", n);
+            nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why);
+            g_texpool_last_over_limit = n;
+        }
+        return 0;
+    }
+    return 1;
+}
 
 // ---- 事实换算（同 nvn_vk_compile_facts.c）----
 static const char *topology(uint32_t prim) {
@@ -200,6 +230,7 @@ int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out)
     if (stages != 3u && stages != 1u) { char nm[32]; snprintf(nm, sizeof nm, "stages_%#x_not_vs_fs", stages); nvn_unimpl("shader", nm, NULL); return -1; }
     const int nst = stages == 3u ? 2 : 1;
     for (uint32_t st2 = 0; st2 < 5; st2++) if ((stages >> st2 & 1) && !rp_shader_stage_key(st2, NULL)) { nvn_unimpl("shader", "stage_key_missing", NULL); return -1; }
+    if (!shader_texture_pool_ready()) return -1;
     struct s2a_direct_compile_context pc; memset(&pc, 0, sizeof pc);
     if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) { nvn_unimpl("shader", "no_compile_context", NULL); return -1; }
     uint64_t key = input_sig(q, &pc, stages);
@@ -337,6 +368,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
 int rp_shader_resolve_compute(const struct rp_prog **out) {
     *out = NULL;
     if (!(rp_S.skey_ok >> 5 & 1)) { nvn_unimpl("shader", "compute_stage_key_missing", NULL); return -1; }
+    if (!shader_texture_pool_ready()) return -1;
     struct s2a_direct_compile_context pc; memset(&pc, 0, sizeof pc);
     if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) { nvn_unimpl("shader", "no_compile_context", NULL); return -1; }
     static struct s2a_record_dispatch_state st; memset(&st, 0, sizeof st);
@@ -404,4 +436,5 @@ void rp_shader_reset(void) {
         free(e); }
     free(g_progs.keys); free(g_progs.vals); nvn_hm_init(&g_progs, 32);
     g_profile.ok = 0; memset(g_lasts, 0, sizeof g_lasts);
+    g_texpool_logged = g_texpool_last_over_limit = 0;
 }
