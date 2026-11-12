@@ -8,9 +8,10 @@
 #include "../native/nvn/nvn_vk_first_draw.c"
 #include "../native/direct/vk_clear.h"
 static unsigned freed, submitted, allocated;
+static unsigned test_end_passes;
 static const char *mode;
 int __system_property_get(const char *name,char *value){
- const char *s = !strcmp(name,"debug.s2a.fail_submit") && !strcmp(mode,"injected") ? "1" : !strcmp(name,"debug.s2a.batch_passes") ? (!strcmp(mode,"queued") ? "2" : "1") : "";
+ const char *s = !strcmp(name,"debug.s2a.counter_q") && !strcmp(mode,"counter-on") ? "1" : !strcmp(name,"debug.s2a.fail_submit") && !strcmp(mode,"injected") ? "1" : !strcmp(name,"debug.s2a.batch_passes") ? (!strcmp(mode,"queued") ? "2" : "1") : "";
  strcpy(value,s);return (int)strlen(s);
 }
 int __android_log_print(int p,const char*t,const char*f,...){(void)p;(void)t;(void)f;return 0;}
@@ -24,7 +25,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice d,const VkComma
 VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo*i){(void)c;(void)i;return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer c){(void)c;return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo*i,VkSubpassContents s){(void)c;(void)i;(void)s;}
-VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer c){(void)c;}
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer c){(void)c;test_end_passes++;}
 VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer c,uint32_t a,const VkClearAttachment*b,uint32_t n,const VkClearRect*r){(void)c;(void)a;(void)b;(void)n;(void)r;}
 VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(VkDevice d,VkCommandPool p,uint32_t n,const VkCommandBuffer*c){(void)d;(void)p;assert(n==1);freed++;
  for(int i=0;i<g_fq.ncmd;i++)assert(g_fq.cmds[i]!=*c && "freed command remains owned by frame queue");
