@@ -311,6 +311,9 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_prepare_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链接闭包：自动补链 / 弱引用放行 / 无提供方点名红 / 替身优先
 # Graphics REQUEST: real producer/canonical identity/writer -> unchanged importer, synthetic host only.
 s2a_gate_step "$PY" "$android_dir/tests/graphics_request_name_test.py"
+# 新回放层：真实图形/计算请求生产入口的贴图池容量、超限与调试读数。
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # W2 compute: real C components with synthetic input / Vulkan mocks, never GPU or device evidence.
 s2a_gate_step "$PY" "$android_dir/tests/direct_compute_identity_test.py"
 # P0-3：constantBufferUse 宽掩码的 S2AI1 v3/v4 分叉现由计算与图形共用——正例 + 两处撤改必红（纯宿主 C 编译，秒级）。
