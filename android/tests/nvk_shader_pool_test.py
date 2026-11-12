@@ -61,6 +61,9 @@ def main():
              'id.texture_array_length = 1;', 1, 'rebind changes request and identity'),
             ('drop-debug-log', 'nvn_plat_flag("nvk_texpool_log", 0)',
              '(0 && nvn_plat_flag("nvk_texpool_log", 0))', 1, 'debug one line records first bound value'),
+            ('wrong-array-red', 'nvn_unimpl("shader", "texture_pool_array_unsupported", NULL);',
+             'nvn_unimpl("shader", "texture_pool_array_wrong", NULL);', 1,
+             'reports the dedicated unimplemented'),
         ]
         for name, before, after, count, expected in changes:
             assert text.count(before) == count, (name, 'mutation anchor')
@@ -69,7 +72,7 @@ def main():
             result = run(name, path)
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 5 negative controls')
+        print('PASS: 6 negative controls')
         return 0
     if sys.argv[1:]:
         raise ValueError('usage: nvk_shader_pool_test.py [--withdraw]')

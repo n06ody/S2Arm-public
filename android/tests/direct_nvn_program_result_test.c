@@ -55,6 +55,28 @@ int main(void) {
     }
     nvn_vk_program_free(&p);
 
+    why[0] = 0;
+    CHECK(parse_json("{\"stage\":\"fs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":524288}",
+                     &p, why, sizeof why) != 0, "large texture array is rejected before narrowing");
+    CHECK(strstr(why, "524288") && strstr(why, "fs"), "large texture array reports exact count and stage");
+    nvn_vk_program_free(&p);
+    {
+        const unsigned lengths[] = {1, 64, 65, 65535, 65536, 1048576};
+        for (unsigned i = 0; i < sizeof lengths / sizeof lengths[0]; ++i) {
+            char binding[192], number[24];
+            snprintf(binding, sizeof binding, "{\"stage\":\"vs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":%u}", lengths[i]);
+            snprintf(number, sizeof number, "%u", lengths[i]); why[0] = 0;
+            int parsed = parse_json(binding, &p, why, sizeof why);
+            if (lengths[i] <= 64) CHECK(parsed == 0 && p.bindings[0].count == lengths[i], "array at or below limit retains count");
+            else CHECK(parsed != 0 && strstr(why, number) && strstr(why, "vs"), "oversized array retains count and stage in rejection");
+            nvn_vk_program_free(&p);
+        }
+        why[0] = 0;
+        CHECK(parse_json("{\"stage\":\"vs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"count\":0}", &p, why, sizeof why) != 0,
+              "zero count is not silently treated as one");
+        nvn_vk_program_free(&p);
+    }
+
     // 负控 1：NVN 槽位越界必须拒绝，不能截断成 0 绑到别的缓冲。
     why[0] = 0;
     CHECK(parse_json("{\"stage\":\"vs\",\"kind\":\"storage\",\"set\":1,\"binding\":0,"

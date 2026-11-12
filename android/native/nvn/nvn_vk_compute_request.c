@@ -198,7 +198,7 @@ int nvk_compute_request_prepare(const struct s2a_record_dispatch_state *s,
         REJECT(message);
     }
     if (!s->tex_pool_seen || !s->samp_pool_seen || !s->tex_pool_n || !s->samp_pool_n ||
-        s->tex_pool_n > 65536 || s->samp_pool_n > 65536)
+        s->tex_pool_n > 1048576 || s->samp_pool_n > 1048576)
         { REJECT("missing or out-of-range descriptor-pool facts"); }
     if (!textures->complete || textures->count < 0 || textures->count > 64 ||
         (textures->count && !textures->items)) { REJECT("missing complete CS texture facts"); }

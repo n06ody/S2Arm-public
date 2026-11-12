@@ -3012,7 +3012,7 @@ int s2a_record_replay(struct s2a_vk_device *device, const uint8_t *begin, const 
             // 记录里的 pool 是前端写的宿主 dpool_t；与 Metal 回放同一信任边界。指针可疑时不采信容量。
             if (v.pool && ((uintptr_t)v.pool & 7u) == 0 && (uintptr_t)v.pool >= 0x1000) {
                 int32_t n = v.pool->n;
-                if (n > 0 && n <= 65536) capacity = (uint32_t)n;
+                if (n > 0 && n <= 1048576) capacity = (uint32_t)n;
             }
             if (header.op == OP_SET_TEX_POOL) S->st.tex_pool_n = capacity;
             else S->st.samp_pool_n = capacity;

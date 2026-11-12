@@ -52,8 +52,11 @@ class DispatchSnapshot(unittest.TestCase):
                     'vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,',
                     'if (0) vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,'),
                 'negative_host_access':source.replace(
-                    '.dstAccessMask = VK_ACCESS_HOST_READ_BIT,\n                };',
-                    '.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,\n                };'),
+                    '.dstAccessMask = VK_ACCESS_HOST_READ_BIT,\n                        };',
+                    '.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,\n                        };'),
+                'negative_pool_narrowing':source.replace(
+                    'if (n > 0 && n <= 1048576) capacity = (uint32_t)n;',
+                    'if (n > 0 && n <= 65536) capacity = (uint32_t)n;'),
                 # 间接绘制变异：不解析间接参数 → 记录里补 0 的 count/first 走到 builder（静默空画），正例必须红。
                 'negative_drop_indirect_resolve':source.replace('if (ind || mdi_cnt || mdi_i) {', 'if (0) {'),
                 # 多重绘制变异：不看 GPU 计数，过了计数的子绘制也画。

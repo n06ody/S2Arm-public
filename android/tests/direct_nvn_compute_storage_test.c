@@ -467,6 +467,12 @@ int main(void) {
     case_reject_storage();
     case_reads_null();
     case_reads_reject_non_array();
+    {
+        struct nvn_vk_compute_program p; char why[192] = "";
+        int rc = parse_case("{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":524288}", "[]", "[]", &p, why, sizeof why);
+        ck_true("large compute array rejected with exact stage/count", rc == NVK_PROGRAM_ARRAY_UNSUPPORTED && strstr(why, "524288") && strstr(why, "cs"), why);
+        nvn_vk_program_free_compute(&p);
+    }
 
     if (fails) {
         printf("✗ direct_nvn_compute_storage: %d 处不符（共 %d 项检查）\n", fails, checks);

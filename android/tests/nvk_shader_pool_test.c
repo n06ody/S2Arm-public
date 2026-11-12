@@ -16,7 +16,9 @@
 #include "direct/s2a_direct.h"
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
-static char captured[262144], last_red[512], last_diag[512];
+static unsigned fake_array_count;
+static const char *fake_compile_error;
+static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512];
 static const char profile[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
 static const char phash[] = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -30,6 +32,10 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_capacity=")) {
         diag_lines++; snprintf(last_diag, sizeof last_diag, "%s", text);
     }
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_program_stats"))
+        snprintf(last_stats, sizeof last_stats, "%s", text);
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_compile_reject"))
+        snprintf(last_reason, sizeof last_reason, "%s", text);
 }
 int rp_depth_zero(void) { return 0; }
 int rp_origin_lower_left(void) { return 0; }
@@ -44,15 +50,29 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     c->translator_closure = "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
-    (void)emit; (void)sink; CHECK(session == 4 && gen == 6, "compile session");
+    CHECK(session == 4 && gen == 6, "compile session");
     CHECK(req.bytes < sizeof captured, "request fits capture");
     if (req.bytes >= sizeof captured) return -1;
     memcpy(captured, req.data, (size_t)req.bytes); captured[req.bytes] = 0; compiler_calls++;
+    if (fake_compile_error) {
+        s2a_direct_bytes payload = {(const uint8_t *)fake_compile_error, (uint64_t)strlen(fake_compile_error)};
+        (void)emit(sink, payload); return -1;
+    }
+    if (fake_array_count) {
+        char result[1024];
+        int n = snprintf(result, sizeof result,
+            "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],"
+            "\"bindings\":[{\"stage\":\"vs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":%u}]}}", fake_array_count);
+        s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
+        return emit(sink, payload);
+    }
     return -27; // deliberately no result: capture input only
 }
 s2a_direct_compile_fn s2a_direct_bound_compile_any(void) { return fake_compile; }
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, nvn_gpu_err *e) {
-    (void)s; (void)o; (void)e; CHECK(0, "unexpected shader load"); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
+    (void)s; (void)e;
+    if (fake_array_count) { *o = (nvn_gpu_shader)(uintptr_t)1; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    CHECK(0, "unexpected shader load"); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
 }
 void nvn_gpu_shader_release(nvn_gpu_shader s) { (void)s; }
 static void wr(uint8_t *p, unsigned x) { p[0]=x; p[1]=x>>8; p[2]=x>>16; p[3]=x>>24; }
@@ -85,9 +105,9 @@ static void run_case(int compute, int pool, int want_called, const char *expecte
         CHECK(strstr(captured, "\"samplerArrayLength\":9") != NULL, "%s n=%d sampler stays 9", compute ? "cs" : "gfx", pool);
     } else {
         CHECK(nvn_unimpl_count("shader", expected_account) == 1, "%s n=%d expected accounting=%s red=%s", compute ? "cs" : "gfx", pool, expected_account, last_red);
-        if (pool > 65536) {
+        if (pool > 1048576) {
             char num[32]; snprintf(num, sizeof num, "%d", pool);
-            CHECK(strstr(last_red, num) && strstr(last_red, "65536"), "%s n=%d error states actual and limit: %s", compute ? "cs" : "gfx", pool, last_red);
+            CHECK(strstr(last_red, num) && strstr(last_red, "1048576"), "%s n=%d error states actual and limit: %s", compute ? "cs" : "gfx", pool, last_red);
         }
     }
 }
@@ -98,8 +118,8 @@ int main(void) {
         run_case(cs, -1, 0, "texture_pool_missing");
         run_case(cs, 1, 1, ""); run_case(cs, 7, 1, "");
         run_case(cs, 65535, 1, ""); run_case(cs, 65536, 1, "");
-        run_case(cs, 65537, 0, "texture_pool_over_limit");
-        run_case(cs, 524288, 0, "texture_pool_over_limit");
+        run_case(cs, 65537, 1, ""); run_case(cs, 524288, 1, "");
+        run_case(cs, 1048576, 1, ""); run_case(cs, 1048577, 0, "texture_pool_over_limit");
     }
     rp_shader_reset(); nvn_unimpl_reset(); diag_enabled = 1; diag_lines = diag_queries = 0; last_diag[0] = 0;
     bind_pools(7); compiler_calls = 0;
@@ -111,10 +131,10 @@ int main(void) {
     bind_pools(7); rp_shader_resolve(&q, &p);
     CHECK(compiler_calls == 2, "return to prior pool reuses prior identity");
     CHECK(diag_lines == 1 && strstr(last_diag, "texture_pool_capacity=7"), "debug one line records first bound value: count=%d line=%s", diag_lines, last_diag);
-    bind_pools(65537); rp_shader_resolve(&q, &p);
-    CHECK(strstr(last_red, "65537") && strstr(last_red, "65536"), "after normal pool, overflow reports real value");
-    bind_pools(524288); rp_shader_resolve(&q, &p);
-    CHECK(strstr(last_red, "524288") && strstr(last_red, "65536"), "changed overflow reports new real value");
+    bind_pools(1048577); rp_shader_resolve(&q, &p);
+    CHECK(strstr(last_red, "1048577") && strstr(last_red, "1048576"), "after normal pool, overflow reports real value");
+    bind_pools(1048578); rp_shader_resolve(&q, &p);
+    CHECK(strstr(last_red, "1048578") && strstr(last_red, "1048576"), "changed overflow reports new real value");
     CHECK(diag_lines == 1, "over-limit logging does not duplicate one-time debug line");
     CHECK(diag_queries == 1, "debug property is read once per session, got %d", diag_queries);
     rp_shader_reset(); diag_lines = 0; bind_pools(0); rp_shader_resolve(&q, &p);
@@ -124,6 +144,46 @@ int main(void) {
     rp_shader_reset(); diag_enabled = 0; diag_lines = diag_queries = 0; bind_pools(7); rp_shader_resolve(&q, &p); rp_shader_resolve(&q, &p);
     CHECK(diag_lines == 0, "disabled diagnostic emits no line");
     CHECK(diag_queries == 1, "disabled debug property read only once, got %d", diag_queries);
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned lengths[] = {64, 65, 524288};
+        rp_shader_reset(); nvn_unimpl_reset(); last_red[0] = 0; compiler_calls = 0;
+        fake_array_count = lengths[i]; bind_pools((int)fake_array_count);
+        int rc = rp_shader_resolve(&q, &p);
+        CHECK(compiler_calls == 1, "array length %u reaches compiler", fake_array_count);
+        if (fake_array_count == 64) CHECK(rc == 0 && p, "array at limit still loads");
+        else {
+            char number[32]; snprintf(number, sizeof number, "%u", fake_array_count);
+            CHECK(rc != 0 && !p, "array length %u refuses program", fake_array_count);
+            CHECK(nvn_unimpl_count("shader", "texture_pool_array_unsupported") == 1, "array length %u reports the dedicated unimplemented", fake_array_count);
+            CHECK(strstr(last_red, number) && strstr(last_red, "vs"), "array red reports exact length %u and vs: %s", fake_array_count, last_red);
+        }
+    }
+    rp_shader_reset(); diag_enabled = 1; last_stats[0] = 0; fake_array_count = 65; bind_pools(65);
+    rp_shader_resolve(&q, &p); rp_shader_resolve(&q, &p); rp_shader_reset();
+    CHECK(strstr(last_stats, "programs=1") && strstr(last_stats, "compile_attempts=1") &&
+          strstr(last_stats, "compile_successes=1") && strstr(last_stats, "array_unsupported=1"),
+          "session stats count unique failed program once: %s", last_stats);
+    fake_array_count = 0;
+    {
+        const char *errors[] = {
+            "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"UNSUPPORTED_PROGRAM\",\"message\":\"fs: texture handle from cbuf slot 0 is not implemented\"}",
+            "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"UNSUPPORTED_PROGRAM\",\"message\":\"fs: separate sampler slot is not implemented\"}",
+            "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"missing fact\"}",
+            "invalid error"};
+        const char *reasons[] = {"cbuf_handle_unsupported", "separate_sampler_unsupported", "MISSING_FACT", "unclassified"};
+        for (unsigned i = 0; i < sizeof errors / sizeof errors[0]; i++) {
+            rp_shader_reset(); nvn_unimpl_reset(); last_stats[0] = last_reason[0] = 0;
+            fake_compile_error = errors[i]; bind_pools(524288); compiler_calls = 0;
+            CHECK(rp_shader_resolve(&q, &p) != 0 && rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1,
+                  "compiler failure cached once for %s", reasons[i]);
+            rp_shader_reset();
+            CHECK(strstr(last_stats, "compile_rejected=1") && strstr(last_stats, "array_unsupported=0"),
+                  "compiler error stays distinct from layout rejection: %s", last_stats);
+            CHECK(strstr(last_reason, reasons[i]) && strstr(last_reason, "count=1"),
+                  "compiler reason counted accurately: %s", last_reason);
+        }
+        fake_compile_error = NULL;
+    }
     rp_shader_reset(); s2a_source_clear();
     fprintf(stderr, "nvk shader pool: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

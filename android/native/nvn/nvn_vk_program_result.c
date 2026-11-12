@@ -152,9 +152,6 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             memset(dst, 0, sizeof *dst);
             dst->set = (int)set_v; dst->binding = (int)binding_v;
             dst->slot = has_slot ? (int)slot_v : -1;   // -1：反射没有 guest 槽位
-            dst->count = 1;
-            { struct s2a_jv cnt = { NULL, 0 }; uint32_t cnt_v = 0;   // 描述符数组的长度；省略或 1 = 不是数组
-              if (!s2a_jv_obj_find(b, "count", &cnt) && !s2a_jv_u32(cnt, &cnt_v) && cnt_v > 1 && cnt_v <= 0xffff) dst->count = (uint16_t)cnt_v; }
             if (!strcmp(kind_text, "support") || !strcmp(kind_text, "uniform")) dst->kind = 0;
             else if (!strcmp(kind_text, "storage")) dst->kind = 1;
             else if (!strcmp(kind_text, "texture")) dst->kind = 2;
@@ -162,6 +159,16 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             else continue;
             if (!s2a_jv_obj_find(b, "stage", &stage) && !s2a_jv_str(stage, stage_text, sizeof stage_text))
                 snprintf(dst->stage, sizeof dst->stage, "%s", stage_text);
+            dst->count = 1;
+            { struct s2a_jv cnt = { NULL, 0 }; uint32_t cnt_v = 0;
+              if (!s2a_jv_obj_find(b, "count", &cnt)) {
+                  if (s2a_jv_u32(cnt, &cnt_v) || !cnt_v) return fail(why, why_size, "binding count is not a positive unsigned integer");
+                  if (cnt_v > FD_MAX_ARRAY_ELEMENTS) {
+                      if (why && why_size) snprintf(why, why_size, "stage %s descriptor array length=%u exceeds %u", dst->stage[0] ? dst->stage : "unknown", cnt_v, FD_MAX_ARRAY_ELEMENTS);
+                      return NVK_PROGRAM_ARRAY_UNSUPPORTED;
+                  }
+                  dst->count = (uint16_t)cnt_v;
+              } }
             // 一次算好逐笔要用的派生值（原来每笔都要重做 strcmp 和槽位换算）。
             dst->stage_idx = (int8_t)nvn_vk_program_graphics_stage_index(dst->stage);
             dst->is_support = (uint8_t)(dst->kind == 0 && !strcmp(dst->stage, "program"));
@@ -412,7 +419,14 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         dst->set = (int)u;
         if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute binding number invalid");
         dst->binding = (int)u;
-        if (s2a_jv_obj_find(b, "count", &value) || compute_u32(value, &u) || u != 1) CS_FAIL("compute descriptor arrays are unsupported");
+        if (s2a_jv_obj_find(b, "count", &value) || compute_u32(value, &u) || !u) CS_FAIL("compute binding count is invalid");
+        if (u > FD_MAX_ARRAY_ELEMENTS) {
+            char message[128]; snprintf(message, sizeof message, "stage cs descriptor array length=%u exceeds %u", u, FD_MAX_ARRAY_ELEMENTS);
+            nvn_vk_program_free_compute(out);
+            fail(why, why_size, message);
+            return NVK_PROGRAM_ARRAY_UNSUPPORTED;
+        }
+        if (u != 1) CS_FAIL("compute descriptor arrays are unsupported");
         for (int j = 0; j < i; ++j)
             if (out->bindings[j].set == dst->set && out->bindings[j].binding == dst->binding) CS_FAIL("duplicate compute binding");
         dst->is_support = (uint8_t)compute_string_is(b, "kind", "support");

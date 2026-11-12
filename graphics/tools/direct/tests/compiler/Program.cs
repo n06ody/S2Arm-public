@@ -59,6 +59,10 @@ internal static unsafe class Program
     private static ulong Tex2D(int dest, int coord, int tid = 0) =>
         0xC000000000000000UL | (7UL << 16) | (2UL << 28) | (0xFUL << 31) |
         ((ulong)tid << 36) | ((ulong)coord << 8) | (uint)dest;
+    // TEX.B: SrcB supplies a runtime texture/sampler handle (InstTexB decoder).
+    private static ulong TexBindless2D(int dest, int coord, int handle) =>
+        0xDE80000000000000UL | (7UL << 16) | (2UL << 28) | (0xFUL << 31) |
+        ((ulong)handle << 20) | ((ulong)coord << 8) | (uint)dest;
     private static ulong Ast4Pos(int reg) =>
         0xEFF0000000000000UL | (0xFFUL << 39) | (3UL << 47) | (0x70UL << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
     private static byte[] Guest(bool fragment, ulong[] ops, int[] reads = null)
@@ -573,6 +577,46 @@ internal static unsafe class Program
             File.WriteAllBytes(Path.Combine(directory, "caps.json"), CapsJson());
             Console.WriteLine("wrote synthetic device caps to " + directory);
             return;
+        }
+
+        // A large pool must not prevent a program with constant texture handles from compiling.
+        {
+            byte[] fsConstant = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2) });
+            const string texFact = "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            string raw = Encoding.UTF8.GetString(RequestJson(profile, "graphics", 1, 1, "large-pool", vs, fsConstant, textureFacts: texFact));
+            foreach (int length in new[] { 524288, 1048576 })
+            {
+                string request = raw.Replace("\"textureArrayLength\":64", "\"textureArrayLength\":" + length)
+                                    .Replace("\"samplerArrayLength\":8", "\"samplerArrayLength\":" + length);
+                try
+                {
+                    using JsonDocument largeResult = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(request)));
+                    var textures = largeResult.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").ToArray();
+                    Check(textures.Length == 1 && textures[0].GetProperty("count").GetInt32() == 1,
+                        "large pool " + length + " compiles constant handle as one descriptor");
+                }
+                catch (Exception error) { Check(false, "large pool " + length + " constant handle: " + error.Message); }
+            }
+            string tooLarge = raw.Replace("\"textureArrayLength\":64", "\"textureArrayLength\":1048577");
+            Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(tooLarge)), "texture pool above cap rejected");
+            tooLarge = raw.Replace("\"samplerArrayLength\":8", "\"samplerArrayLength\":1048577");
+            Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(tooLarge)), "sampler pool above cap rejected");
+
+            // The real translator produces a runtime pool array, but this input currently hits
+            // the independent cbuf-slot limitation before a program result is emitted.
+            byte[] fsDynamic = Guest(true, new[] { Ald(1, 0, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) }, new[] { 1 });
+            string dynamicRequest = Encoding.UTF8.GetString(RequestJson(profile, "graphics", 1, 1, "runtime-pool", vs, fsDynamic, textureFacts: texFact))
+                .Replace("\"textureArrayLength\":64", "\"textureArrayLength\":524288");
+            try
+            {
+                DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(dynamicRequest));
+                Check(false, "runtime handle must not claim an unsupported cbuf layout is usable");
+            }
+            catch (DirectCompileException error) {
+                Check(error.Code == "UNSUPPORTED_PROGRAM" && error.Message.Contains("texture handle from cbuf slot 0"),
+                    "runtime handle reports its actual upstream cbuf limitation: " + error.Message);
+            }
         }
 
         // 1) 接口全覆盖（接口新增方法时这里先红）。

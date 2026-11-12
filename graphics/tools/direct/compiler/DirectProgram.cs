@@ -268,8 +268,8 @@ namespace S2A.DirectCompiler
                     bufferLengths[slot] = length;
                 }
             }
-            int samplerLength = JsonStrict.Int(e, "samplerArrayLength", where, 1, 65536);
-            int textureLength = JsonStrict.Int(e, "textureArrayLength", where, 1, 65536);
+            int samplerLength = JsonStrict.Int(e, "samplerArrayLength", where, 1, 1048576);
+            int textureLength = JsonStrict.Int(e, "textureArrayLength", where, 1, 1048576);
             return new DirectProgram(kind, stages.ToArray(), graphics, compute, textures.ToArray(),
                 bufferLengths, samplerLength, textureLength, tf);
         }

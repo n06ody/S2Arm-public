@@ -148,6 +148,15 @@ int main(void){
  assert(got.tex_present[2] && got.tex_handle[2]==0x800007);
  assert(got.samp_present[3] && got.samp_handle[3]==9);
  assert(got.tex_pool_seen && got.samp_pool_seen && got.tex_pool_n==17 && got.samp_pool_n==23);
+ // Descriptor-pool facts are counts, not 16-bit values; preserve both through the recorder.
+ pool.n=524288;assert(packet(OP_SET_TEX_POOL,&pp,sizeof pp)==0);
+ pool.n=1048576;assert(packet(OP_SET_SAMP_POOL,&pp,sizeof pp)==0);
+ assert(packet(OP_DISPATCH,&dp,sizeof dp)==-77);
+ assert(got.tex_pool_n==524288 && got.samp_pool_n==1048576);
+ pool.n=1048577;assert(packet(OP_SET_TEX_POOL,&pp,sizeof pp)==0);
+ assert(packet(OP_DISPATCH,&dp,sizeof dp)==-77);assert(got.tex_pool_n==0);
+ pool.n=17;assert(packet(OP_SET_TEX_POOL,&pp,sizeof pp)==0);
+ pool.n=23;assert(packet(OP_SET_SAMP_POOL,&pp,sizeof pp)==0);
  // Interleaved NVN VS=0, fragment=4, compute=5 keep every slot independently.
  p_bind_buf other={.stage=0,.index=7,.addr=0x1000,.size=32};
  assert(packet(OP_BIND_SSBO,&other,sizeof other)==0);

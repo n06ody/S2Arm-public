@@ -19,6 +19,10 @@
 #define FD_STAGE_MAX_STORAGE 16
 #define FD_STAGE_MAX_TEXTURES 64
 #define FD_STAGE_MAX_IMAGES 16
+/* Replay's RP_TEXARR_MAX; validate before the 16-bit backend layout count. */
+#define FD_MAX_ARRAY_ELEMENTS 64
+/* Parsed layout needs more descriptors than the replay layer can bind per array. */
+#define NVK_PROGRAM_ARRAY_UNSUPPORTED (-2)
 #define FD_GRAPHICS_STAGE_COUNT 2
 #define FD_MAX_BINDINGS (1 + FD_GRAPHICS_STAGE_COUNT * \
     (FD_STAGE_MAX_UNIFORMS + FD_STAGE_MAX_STORAGE + FD_STAGE_MAX_TEXTURES + FD_STAGE_MAX_IMAGES))
