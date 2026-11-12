@@ -2,6 +2,7 @@
 // 只覆盖控制流 + CLEAR_BUF/COPY_B2B/UPDATE_UB；其它 opcode 必须显式报不支持。
 #include "../native/direct/vk_record.h"
 #include "../native/direct/vk_clear.h"
+#include "nvn_vk_query.h"
 #include "nvn_obj.h"
 
 #include <math.h>
@@ -35,11 +36,26 @@ static int failures;
 // 由 record 在该 opcode 位置准确失败并停止后续 clear/copy/fence/event。
 static int g_break_sync_calls;
 static int g_break_fail;
+static struct s2a_vk_device *g_fixture_device;
+static uint64_t g_fixture_query_batch;
 static const char g_break_first_error[] = "frame queue: injected submit failure (test)";
 int nvn_vk_first_draw_pass_break(int sync);
 int nvn_vk_first_draw_pass_break(int sync) {
     if (sync) g_break_sync_calls++;
-    return (sync && g_break_fail) ? -1 : 0;
+    if (sync && g_break_fail) return -1;
+    if (sync && g_fixture_device) {
+        // The standalone decoder submits draws itself. Mirror the production
+        // frame queue's query ownership callbacks only after real queue idle.
+        if (vkQueueWaitIdle(g_fixture_device->queue) != VK_SUCCESS) return -1;
+        uint64_t batch = ++g_fixture_query_batch;
+        nvn_vk_query_batch_submitted(batch);
+        char why[200] = "";
+        if (nvn_vk_query_batch_completed(batch, why, sizeof why) != 0) {
+            fprintf(stderr, "fixture query retirement failed: %s\n", why);
+            return -1;
+        }
+    }
+    return 0;
 }
 const char *nvn_vk_first_draw_first_error(void);
 const char *nvn_vk_first_draw_first_error(void) { return g_break_fail ? g_break_first_error : ""; }
@@ -52,8 +68,11 @@ static uint32_t put_copy_b2t(uint8_t *buf, size_t *at, uint32_t op, const p_copy
     const size_t off = (sizeof(p_copy_b2t) + 7) & ~(size_t)7;
     uint32_t size = (uint32_t)((sizeof(op_hdr) + off + sizeof(tex_t) + 7) & ~7u);
     put(buf, at, op, size);
-    memcpy(buf + *at - size + sizeof(op_hdr), cp, sizeof *cp);
-    memcpy(buf + *at - size + sizeof(op_hdr) + off, snap, sizeof *snap);
+    uint8_t *payload = buf + *at - size + sizeof(op_hdr);
+    p_copy_b2t record = *cp;
+    record.tex = (const tex_t *)(payload + off);
+    memcpy(payload, &record, sizeof record);
+    memcpy(payload + off, snap, sizeof *snap);
     return size;
 }
 static tex_t rgba8_snap(uint32_t w, uint32_t h, uint32_t levels, int target, uint32_t layers) {
@@ -61,6 +80,33 @@ static tex_t rgba8_snap(uint32_t w, uint32_t h, uint32_t levels, int target, uin
     t.magic = 0x00584554; t.d.format = NVN_FORMAT_RGBA8; t.d.target = target;
     t.d.width = w; t.d.height = h; t.d.depth = layers; t.d.levels = levels;
     return t;
+}
+
+// Match REC_SNAP: the record points at the embedded copy, not a synthetic
+// numeric key or the API object that may have been reused before replay.
+static void put_clear_tex(uint8_t *buf, size_t *at, const p_clear_tex *clear, const tex_t *snap) {
+    const size_t off = (sizeof(p_clear_tex) + 7) & ~(size_t)7;
+    uint32_t size = (uint32_t)(sizeof(op_hdr) + off + sizeof *snap);
+    put(buf, at, OP_CLEAR_TEX, size);
+    uint8_t *payload = buf + *at - size + sizeof(op_hdr);
+    p_clear_tex record = *clear;
+    record.tex = (const tex_t *)(payload + off);
+    memcpy(payload, &record, sizeof record);
+    memcpy(payload + off, snap, sizeof *snap);
+}
+
+static void put_copy_t2t(uint8_t *buf, size_t *at, const p_copy_t2t *copy,
+                         const tex_t *src, const tex_t *dst) {
+    const size_t off = (sizeof(p_copy_t2t) + 7) & ~(size_t)7;
+    uint32_t size = (uint32_t)(sizeof(op_hdr) + off + 2 * sizeof *src);
+    put(buf, at, OP_COPY_T2T, size);
+    uint8_t *payload = buf + *at - size + sizeof(op_hdr);
+    p_copy_t2t record = *copy;
+    record.src = (const tex_t *)(payload + off);
+    record.dst = (const tex_t *)(payload + off + sizeof *src);
+    memcpy(payload, &record, sizeof record);
+    memcpy(payload + off, src, sizeof *src);
+    memcpy(payload + off + sizeof *src, dst, sizeof *dst);
 }
 
 // SET_RT 按紧凑记录写（nvn_obj.h p_set_rt_c）：头 + 指针 + 视图 + 快照区；快照区留零，指针直接指向测试的对象
@@ -126,6 +172,70 @@ static int write_guest(void *opaque, uint64_t address, const void *src, size_t b
     memcpy(g->bytes + address, src, bytes);
     return 0;
 }
+struct test_image_info { VkImage image; VkImageAspectFlags aspects; };
+static struct test_image_info g_test_images[256];
+static size_t g_test_image_count;
+
+static VkImageAspectFlags test_image_aspects(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D16_UNORM:
+        return VK_IMAGE_ASPECT_DEPTH_BIT;
+    default:
+        return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+}
+
+// Production texture creation gives replay a GENERAL image. Establish the same
+// starting contract for every mip/layer rather than handing it UNDEFINED images.
+static int prepare_test_image(struct s2a_vk_device *d, VkImage image, VkFormat format,
+                              uint32_t levels, uint32_t layers) {
+    if (g_test_image_count == sizeof g_test_images / sizeof g_test_images[0]) return -1;
+    VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = d->command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(d->device, &ai, &cmd) != VK_SUCCESS) return -1;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    int ok = vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS;
+    VkImageAspectFlags aspects = test_image_aspects(format);
+    if (ok) {
+        VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image, .subresourceRange = { aspects, 0, levels, 0, layers } };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &b);
+        ok = vkEndCommandBuffer(cmd) == VK_SUCCESS;
+    }
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    int submitted = 0;
+    if (ok) ok = vkCreateFence(d->device, &fi, NULL, &fence) == VK_SUCCESS;
+    if (ok) {
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+        submitted = vkQueueSubmit(d->queue, 1, &si, fence) == VK_SUCCESS;
+        ok = submitted && vkWaitForFences(d->device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    }
+    if (submitted && !ok) return -1; // No completion proof: do not recycle live objects.
+    if (fence) vkDestroyFence(d->device, fence, NULL);
+    vkFreeCommandBuffers(d->device, d->command_pool, 1, &cmd);
+    if (!ok) return -1;
+    g_test_images[g_test_image_count++] = (struct test_image_info){ image, aspects };
+    return 0;
+}
+
+static VkImageAspectFlags test_image_barrier_aspects(VkImage image, VkImageAspectFlags aspect) {
+    (void)aspect;
+    for (size_t i = g_test_image_count; i > 0; i--)
+        if (g_test_images[i - 1].image == image) return g_test_images[i - 1].aspects;
+    return 0;
+}
+
 static VkImage make_image_usage(struct s2a_vk_device *d, VkFormat format, VkImageUsageFlags usage, VkDeviceMemory *memory) {
     VkImageCreateInfo info = {0};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -147,6 +257,7 @@ static VkImage make_image_usage(struct s2a_vk_device *d, VkFormat format, VkImag
     alloc.memoryTypeIndex = s2a_vk_memory_type(d, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
     if (alloc.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(d->device, &alloc, NULL, memory) != VK_SUCCESS ||
         vkBindImageMemory(d->device, image, *memory, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (prepare_test_image(d, image, format, 1, 1)) return VK_NULL_HANDLE;
     return image;
 }
 static VkImage make_image_layers(struct s2a_vk_device *d, VkFormat format, uint32_t levels, uint32_t layers,
@@ -171,6 +282,7 @@ static VkImage make_image_layers(struct s2a_vk_device *d, VkFormat format, uint3
     alloc.memoryTypeIndex = s2a_vk_memory_type(d, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
     if (alloc.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(d->device, &alloc, NULL, memory) != VK_SUCCESS ||
         vkBindImageMemory(d->device, image, *memory, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (prepare_test_image(d, image, format, levels, layers)) return VK_NULL_HANDLE;
     return image;
 }
 
@@ -183,6 +295,8 @@ static VkImage make_image(struct s2a_vk_device *d, VkFormat format, VkDeviceMemo
 static int readback_aspect(struct s2a_vk_device *d, VkImage image, VkImageAspectFlags aspect,
                            uint32_t base_level, uint32_t base_layer,
                            uint32_t w, uint32_t h, uint32_t bpp, uint8_t *out, size_t bytes) {
+    VkImageAspectFlags barrier_aspects = test_image_barrier_aspects(image, aspect);
+    if (!barrier_aspects || !(barrier_aspects & aspect) || bytes < (uint64_t)w * h * bpp) return -1;
     VkBufferCreateInfo bi = {0};
     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
@@ -211,18 +325,18 @@ static int readback_aspect(struct s2a_vk_device *d, VkImage image, VkImageAspect
     cb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cb);
-    // 清除/绘制把深度图留在 DEPTH_STENCIL_ATTACHMENT_OPTIMAL。直接按 GENERAL 读回既没有
-    // 布局转换也没有 barrier，Adreno 上读到 0（旧失败根因）；这里显式转到 TRANSFER_SRC。
+    // The clear recorder returns attachments to GENERAL. Keep both aspects of
+    // a combined depth/stencil image together when separate layouts are off.
     VkImageMemoryBarrier to_src = {0};
     to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_src.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    to_src.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    to_src.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     to_src.srcQueueFamilyIndex = to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_src.image = image;
-    to_src.subresourceRange = (VkImageSubresourceRange){aspect, base_level, 1, base_layer, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+    to_src.subresourceRange = (VkImageSubresourceRange){barrier_aspects, base_level, 1, base_layer, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
     VkBufferImageCopy region = {0};
     region.imageSubresource.aspectMask = aspect;
@@ -231,6 +345,13 @@ static int readback_aspect(struct s2a_vk_device *d, VkImage image, VkImageAspect
     region.imageSubresource.layerCount = 1;
     region.imageExtent.width = w; region.imageExtent.height = h; region.imageExtent.depth = 1;
     vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+    VkImageMemoryBarrier restore = to_src;
+    restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    restore.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    restore.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, NULL, 0, NULL, 1, &restore);
     VkBufferMemoryBarrier barrier = {0};
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -259,7 +380,6 @@ done:
     if (mapped) vkUnmapMemory(d->device, memory);
     vkDestroyBuffer(d->device, buffer, NULL);
     if (memory) vkFreeMemory(d->device, memory, NULL);
-    (void)bpp;
     return rc;
 }
 
@@ -433,7 +553,8 @@ static VkShaderModule module_from_file(struct s2a_vk_device *d, const char *path
 }
 
 static int make_compute(struct s2a_vk_device *d, const char *path, VkBuffer buffer,
-                        VkPipeline *pipeline_out, VkPipelineLayout *layout_out, VkDescriptorSet *set_out) {
+                        VkPipeline *pipeline_out, VkPipelineLayout *layout_out, VkDescriptorSet *set_out,
+                        VkDescriptorPool *pool_out, VkDescriptorSetLayout *set_layout_out) {
     VkShaderModule module = module_from_file(d, path);
     VkDescriptorSetLayoutBinding binding = {0};
     binding.binding = 0; binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -473,8 +594,15 @@ static int make_compute(struct s2a_vk_device *d, const char *path, VkBuffer buff
     w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
     vkUpdateDescriptorSets(d->device, 1, &w, 0, NULL);
     vkDestroyShaderModule(d->device, module, NULL);
-    if (pr != VK_SUCCESS || !layout || !set) return -1;
+    if (pr != VK_SUCCESS || !layout || !set) {
+        if (pipeline) vkDestroyPipeline(d->device, pipeline, NULL);
+        if (pool) vkDestroyDescriptorPool(d->device, pool, NULL);
+        if (layout) vkDestroyPipelineLayout(d->device, layout, NULL);
+        if (set_layout) vkDestroyDescriptorSetLayout(d->device, set_layout, NULL);
+        return -1;
+    }
     *pipeline_out = pipeline; *layout_out = layout; *set_out = set;
+    *pool_out = pool; *set_layout_out = set_layout;
     return 0;
 }
 
@@ -519,6 +647,7 @@ int main(int argc, char **argv) {
     struct s2a_vk_device device;
     char why[192] = "";
     if (s2a_vk_device_create(&device, why, sizeof why)) { printf("FAIL device: %s\n", why); return 1; }
+    g_fixture_device = &device;
     printf("INFO device: shaderDrawParameters=%d maintenance1=%d timeline=%d\n",
            device.shader_draw_parameters_enabled, device.swapchain_maintenance1_enabled,
            device.timeline_semaphore_enabled);
@@ -605,30 +734,29 @@ int main(int argc, char **argv) {
     VkImage sint = make_image(&device, VK_FORMAT_R8G8B8A8_SINT, &sint_memory);
     if (!unorm || !sint) { failures++; printf("FAIL clear-texture image creation\n"); }
     else {
-        uint8_t texture_stream[512];
+        _Alignas(tex_t) uint8_t texture_stream[1024];
         memset(texture_stream, 0, sizeof texture_stream);
         size_t tat = 0;
-        uint32_t tex_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-        put(texture_stream, &tat, OP_CLEAR_TEX, tex_size);
+        tex_t unorm_snap = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+        tex_t sint_snap = unorm_snap;
+        unorm_snap.serial = 101;
+        sint_snap.serial = 102; sint_snap.d.format = NVN_FORMAT_RGBA8I;
         p_clear_tex fc;
         memset(&fc, 0, sizeof fc);
-        fc.tex = (const tex_t *)(uintptr_t)0x1;
         fc.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
         fc.mask = 0xF; fc.value_type = CLEAR_TEX_FLOAT;
         fc.c.f[0] = 0.25f; fc.c.f[1] = 0.5f; fc.c.f[2] = 0.75f; fc.c.f[3] = 1.0f;
-        memcpy(texture_stream + 8, &fc, sizeof fc);
-        put(texture_stream, &tat, OP_CLEAR_TEX, tex_size);
+        put_clear_tex(texture_stream, &tat, &fc, &unorm_snap);
         p_clear_tex ic;
         memset(&ic, 0, sizeof ic);
-        ic.tex = (const tex_t *)(uintptr_t)0x2;
         ic.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
         ic.mask = 0xF; ic.value_type = CLEAR_TEX_INT;
         ic.c.i[0] = -128; ic.c.i[1] = -1; ic.c.i[2] = 0; ic.c.i[3] = 127;
-        memcpy(texture_stream + tex_size + 8, &ic, sizeof ic);
+        put_clear_tex(texture_stream, &tat, &ic, &sint_snap);
         put(texture_stream, &tat, OP_END, 8);
         struct s2a_replay_texture textures[2] = {
-            {(const void *)(uintptr_t)0x1, unorm, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0},
-            {(const void *)(uintptr_t)0x2, sint, VK_FORMAT_R8G8B8A8_SINT, 8, 8, 1, 0, 0, 0},
+            {&unorm_snap, unorm, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 101, 0, 0},
+            {&sint_snap, sint, VK_FORMAT_R8G8B8A8_SINT, 8, 8, 1, 102, 0, 0},
         };
         rc = s2a_record_replay(&device, texture_stream, texture_stream + tat, &memory, textures, 2, NULL, 0, NULL, 0, &result);
         if (rc) { failures++; printf("FAIL clear-texture replay: %d %s\n", rc, result.why); }
@@ -680,11 +808,11 @@ int main(int argc, char **argv) {
         p_clear_color cc;
         memset(&cc, 0, sizeof cc);
         cc.index = 0; cc.mask = 0xF;
-        cc.rgba[0] = 0.1f; cc.rgba[1] = 0.2f; cc.rgba[2] = 0.3f; cc.rgba[3] = 1.0f;
+        cc.rgba[0] = 0.125f; cc.rgba[1] = 0.375f; cc.rgba[2] = 0.625f; cc.rgba[3] = 1.0f;
         memcpy(rt_stream + rat - clear_size + 8, &cc, sizeof cc);
         put(rt_stream, &rat, OP_CLEAR_COLOR, clear_size);
         cc.index = 1;
-        cc.rgba[0] = 0.4f; cc.rgba[1] = 0.5f; cc.rgba[2] = 0.6f; cc.rgba[3] = 1.0f;
+        cc.rgba[0] = 0.25f; cc.rgba[1] = 0.625f; cc.rgba[2] = 0.875f; cc.rgba[3] = 1.0f;
         memcpy(rt_stream + rat - clear_size + 8, &cc, sizeof cc);
         put(rt_stream, &rat, OP_END, 8);
         struct s2a_replay_texture rt_textures[2] = {
@@ -698,7 +826,7 @@ int main(int argc, char **argv) {
             if (readback_image(&device, rt0, VK_IMAGE_LAYOUT_GENERAL, p0, sizeof p0) || readback_image(&device, rt1, VK_IMAGE_LAYOUT_GENERAL, p1, sizeof p1)) {
                 failures++; printf("FAIL clear-color readback\n");
             } else {
-                const uint8_t w0[4] = {26, 51, 77, 255}, w1[4] = {102, 128, 153, 255};
+                const uint8_t w0[4] = {32, 96, 159, 255}, w1[4] = {64, 159, 223, 255};
                 if (memcmp(p0, w0, 4) || memcmp(p1, w1, 4)) {
                     failures++; printf("FAIL clear-color pixels %u,%u,%u,%u / %u,%u,%u,%u\n",
                         p0[0], p0[1], p0[2], p0[3], p1[0], p1[1], p1[2], p1[3]);
@@ -797,7 +925,7 @@ int main(int argc, char **argv) {
         color.format = VK_FORMAT_R8G8B8A8_UNORM; color.samples = VK_SAMPLE_COUNT_1_BIT;
         color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; color.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; color.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkSubpassDescription sub = {0};
         sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
@@ -862,7 +990,7 @@ int main(int argc, char **argv) {
             if (rc) { failures++; printf("FAIL draw-record replay: %d %s\n", rc, result.why); }
             else {
                 uint8_t pixels[256];
-                if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pixels, sizeof pixels)) { failures++; printf("FAIL draw-record readback\n"); }
+                if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_GENERAL, pixels, sizeof pixels)) { failures++; printf("FAIL draw-record readback\n"); }
                 else {
                     const uint8_t *center = pixels + (4 * 8 + 4) * 4;
                     if (abs(center[0] - 143) > 3 || abs(center[1] - 143) > 3 || center[2] != 0 || center[3] != 255) {
@@ -906,7 +1034,7 @@ int main(int argc, char **argv) {
             rc = s2a_record_replay(&device, joint, joint + jat, &memory, jtexs, 1, jdraws, 1, NULL, 0, &result);
             uint8_t px[256];
             if (rc) { failures++; printf("FAIL order draw->clear replay: %d %s\n", rc, result.why); }
-            else if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, px, sizeof px)) {
+            else if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_GENERAL, px, sizeof px)) {
                 failures++; printf("FAIL order draw->clear readback\n");
             } else {
                 const uint8_t *c = px + (4 * 8 + 4) * 4;
@@ -953,8 +1081,8 @@ int main(int argc, char **argv) {
                 rc = s2a_record_replay(&device, st, st + sat, &memory, ste, 2, NULL, 0, NULL, 0, &result);
                 uint8_t pa[256], pb[256];
                 if (rc) { failures++; printf("FAIL order clear-A/B replay: %d %s\n", rc, result.why); }
-                else if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pa, sizeof pa) ||
-                         readback_image(&device, bimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pb, sizeof pb)) {
+                else if (readback_image(&device, draw_image, VK_IMAGE_LAYOUT_GENERAL, pa, sizeof pa) ||
+                         readback_image(&device, bimg, VK_IMAGE_LAYOUT_GENERAL, pb, sizeof pb)) {
                     failures++; printf("FAIL order clear-A/B readback\n");
                 } else {
                     const uint8_t *ca = pa + (4 * 8 + 4) * 4, *cb = pb + (4 * 8 + 4) * 4;
@@ -1160,7 +1288,8 @@ int main(int argc, char **argv) {
         char compute_path[512];
         snprintf(compute_path, sizeof compute_path, "%s/fill.comp.spv", argv[1]);
         VkPipeline cp = VK_NULL_HANDLE; VkPipelineLayout cl = VK_NULL_HANDLE; VkDescriptorSet cs = VK_NULL_HANDLE;
-        if (make_compute(&device, compute_path, buffer, &cp, &cl, &cs)) { failures++; printf("FAIL dispatch compute pipeline\n"); }
+        VkDescriptorPool cp_pool = VK_NULL_HANDLE; VkDescriptorSetLayout cp_set_layout = VK_NULL_HANDLE;
+        if (make_compute(&device, compute_path, buffer, &cp, &cl, &cs, &cp_pool, &cp_set_layout)) { failures++; printf("FAIL dispatch compute pipeline\n"); }
         else {
             uint8_t dispatch_stream[1024]; memset(dispatch_stream, 0, sizeof dispatch_stream); size_t dat = 0;
             uint32_t bp_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_bind_program_id) + 7) & ~7u);
@@ -1207,7 +1336,9 @@ int main(int argc, char **argv) {
             }
         }
         vkDestroyPipeline(device.device, cp, NULL);
+        vkDestroyDescriptorPool(device.device, cp_pool, NULL);
         vkDestroyPipelineLayout(device.device, cl, NULL);
+        vkDestroyDescriptorSetLayout(device.device, cp_set_layout, NULL);
         vkUnmapMemory(device.device, memory_dev);
         vkDestroyBuffer(device.device, buffer, NULL);
         vkFreeMemory(device.device, memory_dev, NULL);
@@ -1222,27 +1353,22 @@ int main(int argc, char **argv) {
         VkImage dst_img = make_image(&device, VK_FORMAT_R8G8B8A8_UNORM, &dst_mem);
         if (!src_img || !dst_img) { failures++; printf("FAIL copy-t2t image creation\n"); }
         else {
-            uint8_t copy_stream[1024]; memset(copy_stream, 0, sizeof copy_stream); size_t cat = 0;
-            uint32_t tex_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(copy_stream, &cat, OP_CLEAR_TEX, tex_size);
+            _Alignas(tex_t) uint8_t copy_stream[1024]; memset(copy_stream, 0, sizeof copy_stream); size_t cat = 0;
+            tex_t src_snap = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1), dst_snap = src_snap;
+            src_snap.serial = 107; dst_snap.serial = 108;
             p_clear_tex clear; memset(&clear, 0, sizeof clear);
-            clear.tex = (const tex_t *)(uintptr_t)0x7;
             clear.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             clear.mask = 0xF; clear.value_type = CLEAR_TEX_FLOAT;
             clear.c.f[0] = 1.0f; clear.c.f[1] = 0.0f; clear.c.f[2] = 0.0f; clear.c.f[3] = 1.0f;
-            memcpy(copy_stream + 8, &clear, sizeof clear);
-            uint32_t copy_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_copy_t2t) + 7) & ~7u);
-            put(copy_stream, &cat, OP_COPY_T2T, copy_size);
+            put_clear_tex(copy_stream, &cat, &clear, &src_snap);
             p_copy_t2t copy; memset(&copy, 0, sizeof copy);
-            copy.src = (const tex_t *)(uintptr_t)0x7;
-            copy.dst = (const tex_t *)(uintptr_t)0x8;
             copy.sr = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             copy.dr = copy.sr;
-            memcpy(copy_stream + cat - copy_size + 8, &copy, sizeof copy);
+            put_copy_t2t(copy_stream, &cat, &copy, &src_snap, &dst_snap);
             put(copy_stream, &cat, OP_END, 8);
             struct s2a_replay_texture textures[2] = {
-                {(const void *)(uintptr_t)0x7, src_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0},
-                {(const void *)(uintptr_t)0x8, dst_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0},
+                {&src_snap, src_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 107, 0, 0},
+                {&dst_snap, dst_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 108, 0, 0},
             };
             rc = s2a_record_replay(&device, copy_stream, copy_stream + cat, &memory,
                                    textures, 2, NULL, 0, NULL, 0, &result);
@@ -1266,23 +1392,21 @@ int main(int argc, char **argv) {
         VkImage t_img = make_image(&device, VK_FORMAT_R8G8B8A8_UNORM, &t_mem);
         if (!t_img) { failures++; printf("FAIL T2B image\n"); }
         else {
-            uint8_t stream[1024]; memset(stream, 0, sizeof stream); size_t at2 = 0;
-            uint32_t tex_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(stream, &at2, OP_CLEAR_TEX, tex_size);
+            _Alignas(tex_t) uint8_t stream[1024]; memset(stream, 0, sizeof stream); size_t at2 = 0;
+            tex_t snap9 = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+            snap9.serial = 109;
             p_clear_tex clear; memset(&clear, 0, sizeof clear);
-            clear.tex = (const tex_t *)(uintptr_t)0x9;
             clear.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             clear.mask = 0xF; clear.value_type = CLEAR_TEX_FLOAT;
             clear.c.f[0] = 1.0f; clear.c.f[1] = 0.0f; clear.c.f[2] = 0.0f; clear.c.f[3] = 1.0f;
-            memcpy(stream + 8, &clear, sizeof clear);
+            put_clear_tex(stream, &at2, &clear, &snap9);
             p_copy_b2t cp; memset(&cp, 0, sizeof cp);
-            cp.src = 0x800; cp.tex = (const tex_t *)(uintptr_t)0x9;
+            cp.src = 0x800;
             cp.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             cp.row_stride = 64; cp.image_stride = 512;
-            const tex_t snap9 = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
             put_copy_b2t(stream, &at2, OP_COPY_T2B, &cp, &snap9);
             put(stream, &at2, OP_END, 8);
-            struct s2a_replay_texture ttab[1] = {{(const void *)(uintptr_t)0x9, t_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0}};
+            struct s2a_replay_texture ttab[1] = {{&snap9, t_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 109, 0, 0}};
             rc = s2a_record_replay(&device, stream, stream + at2, &memory, ttab, 1, NULL, 0, NULL, 0, &result);
             if (rc) { failures++; printf("FAIL T2B replay: %d %s\n", rc, result.why); }
             else {
@@ -1317,23 +1441,21 @@ int main(int argc, char **argv) {
         VkImage im = make_image(&device, VK_FORMAT_R8G8B8A8_UNORM, &im_mem);
         if (!im) { failures++; printf("FAIL int T2B image\n"); }
         else {
-            uint8_t stream[1024]; memset(stream, 0, sizeof stream); size_t at4 = 0;
-            uint32_t tex_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(stream, &at4, OP_CLEAR_TEX, tex_size);
+            _Alignas(tex_t) uint8_t stream[1024]; memset(stream, 0, sizeof stream); size_t at4 = 0;
+            tex_t snapA = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+            snapA.serial = 110;
             p_clear_tex clear; memset(&clear, 0, sizeof clear);
-            clear.tex = (const tex_t *)(uintptr_t)0xA;
             clear.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             clear.mask = 0xF; clear.value_type = CLEAR_TEX_FLOAT;
             clear.c.f[0] = 1.0f; clear.c.f[1] = 0.0f; clear.c.f[2] = 0.0f; clear.c.f[3] = 1.0f;
-            memcpy(stream + 8, &clear, sizeof clear);
+            put_clear_tex(stream, &at4, &clear, &snapA);
             p_copy_b2t cp; memset(&cp, 0, sizeof cp);
-            cp.src = 0xC00; cp.tex = (const tex_t *)(uintptr_t)0xA;
+            cp.src = 0xC00;
             cp.r = (NVNcopyRegion){0, 0, 0, 8, 8, 1};
             cp.row_stride = 64; cp.image_stride = 512;
-            const tex_t snapA = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
             put_copy_b2t(stream, &at4, OP_COPY_T2B, &cp, &snapA);
             put(stream, &at4, OP_END, 8);
-            struct s2a_replay_texture tab[1] = {{(const void *)(uintptr_t)0xA, im, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0}};
+            struct s2a_replay_texture tab[1] = {{&snapA, im, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 110, 0, 0}};
             rc = s2a_record_replay(&device, stream, stream + at4, &memory, tab, 1, NULL, 0, NULL, 0, &result);
             if (rc) { failures++; printf("FAIL int T2B replay: %d %s\n", rc, result.why); }
             else {
@@ -1357,19 +1479,18 @@ int main(int argc, char **argv) {
         VkImage p_img = make_image(&device, VK_FORMAT_R8G8B8A8_SINT, &p_mem);
         if (!p_img) { failures++; printf("FAIL partial image\n"); }
         else {
-            uint8_t stream[1024]; size_t at5 = 0; memset(stream, 0, sizeof stream);
-            uint32_t sz = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(stream, &at5, OP_CLEAR_TEX, sz);
-            p_clear_tex c; memset(&c, 0, sizeof c); c.tex = (const tex_t *)(uintptr_t)0xB;
+            _Alignas(tex_t) uint8_t stream[1024]; size_t at5 = 0; memset(stream, 0, sizeof stream);
+            tex_t snap = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+            snap.serial = 111; snap.d.format = NVN_FORMAT_RGBA8I;
+            p_clear_tex c; memset(&c, 0, sizeof c);
             c.r = (NVNcopyRegion){0,0,0,8,8,1}; c.mask = 0xF; c.value_type = CLEAR_TEX_INT;
             c.c.i[0] = c.c.i[1] = c.c.i[2] = c.c.i[3] = 0;
-            memcpy(stream + 8, &c, sizeof c);
-            put(stream, &at5, OP_CLEAR_TEX, sz);
+            put_clear_tex(stream, &at5, &c, &snap);
             c.r = (NVNcopyRegion){2,2,0,4,4,1};
             c.c.i[0] = -128; c.c.i[1] = -1; c.c.i[2] = 0; c.c.i[3] = 127;
-            memcpy(stream + at5 - sz + 8, &c, sizeof c);
+            put_clear_tex(stream, &at5, &c, &snap);
             put(stream, &at5, OP_END, 8);
-            struct s2a_replay_texture tab[1] = {{(const void *)(uintptr_t)0xB, p_img, VK_FORMAT_R8G8B8A8_SINT, 8, 8, 1, 0, 0, 0}};
+            struct s2a_replay_texture tab[1] = {{&snap, p_img, VK_FORMAT_R8G8B8A8_SINT, 8, 8, 1, 111, 0, 0}};
             rc = s2a_record_replay(&device, stream, stream + at5, &memory, tab, 1, NULL, 0, NULL, 0, &result);
             uint8_t px[256];
             if (rc || readback_image(&device, p_img, VK_IMAGE_LAYOUT_GENERAL, px, sizeof px)) {
@@ -1394,18 +1515,17 @@ int main(int argc, char **argv) {
         VkImage c_img = make_image(&device, VK_FORMAT_R8G8B8A8_UNORM, &c_mem);
         if (!c_img) { failures++; printf("FAIL mask image\n"); }
         else {
-            uint8_t stream[1024]; size_t at6 = 0; memset(stream, 0, sizeof stream);
-            uint32_t sz = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(stream, &at6, OP_CLEAR_TEX, sz);
-            p_clear_tex c; memset(&c, 0, sizeof c); c.tex = (const tex_t *)(uintptr_t)0xC;
+            _Alignas(tex_t) uint8_t stream[1024]; size_t at6 = 0; memset(stream, 0, sizeof stream);
+            tex_t snap = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+            snap.serial = 112;
+            p_clear_tex c; memset(&c, 0, sizeof c);
             c.r = (NVNcopyRegion){0,0,0,8,8,1}; c.mask = 0xF; c.value_type = CLEAR_TEX_FLOAT;
             c.c.f[0] = 1; c.c.f[1] = 0; c.c.f[2] = 0; c.c.f[3] = 1;
-            memcpy(stream + 8, &c, sizeof c);
-            put(stream, &at6, OP_CLEAR_TEX, sz);
+            put_clear_tex(stream, &at6, &c, &snap);
             c.mask = 0x2; c.c.f[1] = 1;
-            memcpy(stream + at6 - sz + 8, &c, sizeof c);
+            put_clear_tex(stream, &at6, &c, &snap);
             put(stream, &at6, OP_END, 8);
-            struct s2a_replay_texture tab[1] = {{(const void *)(uintptr_t)0xC, c_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 0, 0, 0}};
+            struct s2a_replay_texture tab[1] = {{&snap, c_img, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 112, 0, 0}};
             rc = s2a_record_replay(&device, stream, stream + at6, &memory, tab, 1, NULL, 0, NULL, 0, &result);
             uint8_t px[256];
             if (rc || readback_image(&device, c_img, VK_IMAGE_LAYOUT_GENERAL, px, sizeof px)) {
@@ -1425,20 +1545,19 @@ int main(int argc, char **argv) {
         VkImage q_img = make_image(&device, VK_FORMAT_R32G32B32A32_SINT, &q_mem);
         if (!q_img) { failures++; printf("FAIL int32 image\n"); }
         else {
-            uint8_t stream[1024]; size_t at7 = 0; memset(stream, 0, sizeof stream);
-            uint32_t sz = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_tex) + 7) & ~7u);
-            put(stream, &at7, OP_CLEAR_TEX, sz);
-            p_clear_tex c; memset(&c, 0, sizeof c); c.tex = (const tex_t *)(uintptr_t)0xD;
+            _Alignas(tex_t) uint8_t stream[1024]; size_t at7 = 0; memset(stream, 0, sizeof stream);
+            tex_t snap = rgba8_snap(8, 8, 1, NVN_TEXTURE_TARGET_2D, 1);
+            snap.serial = 113; snap.d.format = NVN_FORMAT_RGBA32I;
+            p_clear_tex c; memset(&c, 0, sizeof c);
             c.r = (NVNcopyRegion){0,0,0,8,8,1}; c.mask = 0xF; c.value_type = CLEAR_TEX_INT;
             c.c.i[0] = 1; c.c.i[1] = 2; c.c.i[2] = 3; c.c.i[3] = 4;
-            memcpy(stream + 8, &c, sizeof c);
-            put(stream, &at7, OP_CLEAR_TEX, sz);
+            put_clear_tex(stream, &at7, &c, &snap);
             c.r = (NVNcopyRegion){2,2,0,4,4,1};
             c.c.i[0] = INT32_MIN; c.c.i[1] = INT32_MAX;
             c.c.i[2] = 16777217; c.c.i[3] = -16777217;
-            memcpy(stream + at7 - sz + 8, &c, sizeof c);
+            put_clear_tex(stream, &at7, &c, &snap);
             put(stream, &at7, OP_END, 8);
-            struct s2a_replay_texture tab[1] = {{(const void *)(uintptr_t)0xD, q_img, VK_FORMAT_R32G32B32A32_SINT, 8, 8, 1, 0, 0, 0}};
+            struct s2a_replay_texture tab[1] = {{&snap, q_img, VK_FORMAT_R32G32B32A32_SINT, 8, 8, 1, 113, 0, 0}};
             rc = s2a_record_replay(&device, stream, stream + at7, &memory, tab, 1, NULL, 0, NULL, 0, &result);
             uint8_t px[256 * 4];
             if (rc || readback_image(&device, q_img, VK_IMAGE_LAYOUT_GENERAL, px, sizeof px)) {
@@ -1808,7 +1927,10 @@ int main(int argc, char **argv) {
             ai.allocationSize = req.size;
             ai.memoryTypeIndex = s2a_vk_memory_type(&device, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
             if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device.device, &ai, NULL, &mem) != VK_SUCCESS ||
-                vkBindImageMemory(device.device, img, mem, 0) != VK_SUCCESS) { failures++; printf("FAIL override image memory\n"); }
+                vkBindImageMemory(device.device, img, mem, 0) != VK_SUCCESS ||
+                prepare_test_image(&device, img, VK_FORMAT_R8G8B8A8_SRGB, 1, 1) != 0) {
+                failures++; printf("FAIL override image memory/layout\n");
+            }
         }
         tex_t ot;
         memset(&ot, 0, sizeof ot);
@@ -1863,7 +1985,8 @@ int main(int argc, char **argv) {
         if (!vimg) { failures++; printf("FAIL colour view image creation\n"); }
         else {
             struct s2a_replay_texture vtex[1] = { {&vt, vimg, VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 95, 2, 2} };
-            uint8_t stream[4096], p0[256], p1[64];
+            _Alignas(tex_t) uint8_t stream[4096];
+            uint8_t p0[256], p1[64];
             size_t at = 0;
             uint32_t clear_size = (uint32_t)((sizeof(op_hdr) + sizeof(p_clear_color) + 7) & ~7u);
             p_set_rt rt; memset(&rt, 0, sizeof rt); rt.n = 1; rt.color[0] = &vt;
@@ -2105,7 +2228,7 @@ int main(int argc, char **argv) {
             struct s2a_replay_texture ctex[1] = { {&ct, cimg, VK_FORMAT_D32_SFLOAT, 8, 8, 1, 77, 0, 0} };
             uint8_t cs[1024];
             size_t ca;
-            float got = 0.0f;
+            float got[64] = {0};
             struct s2a_vk_clear_stats c0, c1;
 
             // 正常清除（基线 0.25）。
@@ -2172,12 +2295,12 @@ int main(int argc, char **argv) {
             put(cs, &ca, OP_END, 8);
             rc = s2a_record_replay(&device, cs, cs + ca, &memory, ctex, 1, NULL, 0, NULL, 0, &result);
             if (rc) { failures++; printf("FAIL clear-retire recovery rc=%d %s\n", rc, result.why); }
-            else if (readback_aspect(&device, cimg, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 8, 8, 4, (uint8_t *)&got, sizeof got)) {
+            else if (readback_aspect(&device, cimg, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 8, 8, 4, (uint8_t *)got, sizeof got)) {
                 failures++; printf("FAIL clear-retire depth readback\n");
-            } else if (fabsf(got - 0.25f) > 0.002f) {
-                failures++; printf("FAIL clear-retire recovery depth=%.4f want 0.25\n", got);
+            } else if (fabsf(got[0] - 0.25f) > 0.002f) {
+                failures++; printf("FAIL clear-retire recovery depth=%.4f want 0.25\n", got[0]);
             } else {
-                printf("INFO clear-retire recovery: depth=%.4f after injected failures\n", got);
+                printf("INFO clear-retire recovery: depth=%.4f after injected failures\n", got[0]);
             }
 
             // 设备销毁前结算 clear 保留账本：真实提交的清除应能拿到完成证明并逐项回收。
@@ -2444,6 +2567,13 @@ int main(int argc, char **argv) {
         printf("INFO unsupported: op=%u %s\n", result.opcode, result.why);
     }
 
+    if (s2a_vk_device_wait_idle(&device) != VK_SUCCESS) {
+        failures++; printf("FAIL device idle before query cleanup\n");
+    } else {
+        nvn_vk_query_release_device();
+        s2a_vk_clear_fv_release_device(&device);
+        s2a_vk_clear_fv_release_device(&device); // repeat must not destroy handles twice
+    }
     s2a_vk_device_destroy(&device, 0);
     if (failures) { printf("vk-record: %d FAILURES\n", failures); return 1; }
     printf("vk-record: ok\n");

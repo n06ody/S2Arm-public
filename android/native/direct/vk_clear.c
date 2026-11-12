@@ -628,7 +628,7 @@ void s2a_vk_clear_forget_image(struct s2a_vk_device *d, VkImage image, uint64_t 
 static void clr_fv_diag_reset(void);
 // session 已取得 device idle 后调用：先丢 framebuffer/view，再清其引用的 render pass。
 void s2a_vk_clear_fv_release_device(struct s2a_vk_device *d) {
-    if (!clr_fv_q_on() || !d || !d->device) return;
+    if (!d || !d->device) return;
     if (g_fv_dev == d->device) {
         for (int i = 0; i < CLR_FV_MAX; i++) {
             if (g_fv[i].fb) vkDestroyFramebuffer(d->device, g_fv[i].fb, NULL);

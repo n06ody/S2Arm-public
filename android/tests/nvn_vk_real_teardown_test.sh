@@ -57,6 +57,10 @@ program={'schema':'s2a-direct-program-v1','content':{'stages':[{'stage':'vs','sp
 PYJSON
 export VK_DRIVER_FILES="$icd" VK_LAYER_PATH="$layer" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 XDG_CACHE_HOME="$out"
 if [ "$mode" != --neg ]; then
+    # Exercise the record fixture with the same real Vulkan and validation setup.
+    bash "$repo/android/tests/vk_record_vvl_test.sh"
+    bash "$repo/android/tests/vk_record_vvl_test.sh" --release-negative
+    bash "$repo/android/tests/vk_record_vvl_test.sh" --legacy-negative
     mkdir "$out/cache"
     compile "$repo/android/tests/nvn_vk_real_teardown_test.c" -o "$out/probe"
     "$out/probe" "$out/program.json" "$out/cache" >"$out/normal.log" 2>&1 || { cat "$out/normal.log" >&2; exit 1; }
