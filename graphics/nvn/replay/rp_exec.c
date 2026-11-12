@@ -328,6 +328,14 @@ void nvn_be_exec(const uint8_t *p) {
             case OP_UPDATE_UB: rp_op_update_ub(a, p); break;
             case OP_COPY_B2B: rp_op_copy_b2b(a, p); break;
             case OP_CLEAR_BUF: rp_op_clear_buf(a, p); break;
+            case OP_WAIT_SYNC: {
+                const sync_t *s; void *ev; uint64_t v;
+                memcpy(&s, a, sizeof s);
+                if (!s || !sync_published(s, NULL)) nvn_unimpl("sync", "wait_sync_unpublished", p);
+                else if (sync_ext(s, &ev, &v)) nvn_unimpl("sync", "wait_sync_external", p);
+                // 已发布的 NVN 栅栏在同一后端队列上，之前的工作按提交顺序执行；无需 CPU 等待。
+                break;
+            }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); if (s) sync_publish(s, g_fence + SUB_STEP); break; }   // 本次提交主段的栅栏值
             case OP_DISPATCH: {
                 const p_dispatch *dp = a; static int said;   // 调试开关 nvk_drawlog：头几次把它的输入列出来

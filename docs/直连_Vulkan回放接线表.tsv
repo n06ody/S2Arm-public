@@ -49,7 +49,7 @@
 47	OP_PRIM_RESTART	状态（绘制时生效）	14636	state_op:10444	已接（rp_draw 在绘制时取用）	t_draw	否
 48	OP_SET_PATCH_SIZE	状态（绘制时生效）	14637	state_op:10446	已接（rp_draw 在绘制时取用）	t_jump_call	否
 49	OP_DRAW_TEX	绘制	14627	draw_tex	未接	无	否
-50	OP_WAIT_SYNC	同步 / 查询	14542	queue_wait_event	未接	无	否
+50	OP_WAIT_SYNC	同步 / 查询	14542	queue_wait_event	部分：同后端队列已发布栅栏按序；未发布及外部事件记未接	t_nvn_wait_sync.c	否
 51	OP_ALPHA_REF	状态（绘制时生效）	14637	state_op:10445	状态已记；绘制侧未接	t_unimpl_names	否
 52	OP_PUSH_CONST	状态（绘制时生效）	14643	state_op:10382	状态已记；绘制侧未接	无	否
 53	OP_DLSS	计算	14642	dlss_eval	未接	无	否
