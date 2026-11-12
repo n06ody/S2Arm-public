@@ -31,8 +31,18 @@ VkResult nvn_plat_vk_surface_create(VkInstance instance, void *native, VkSurface
     return vkCreateHeadlessSurfaceEXT(instance, &ci, NULL, out);
 }
 int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native; *w = 320; *h = 180; return 1; }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)level; printf("[%s] %s\n", cls ? cls : "", text ? text : ""); }
+static int g_test_viewlog;
+static int g_test_viewlog_count;
+static char g_test_viewlog_lines[8][512];
+int nvn_plat_flag(const char *name, int dflt) { return name && !strcmp(name, "nvk_viewlog") ? g_test_viewlog : dflt; }
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    (void)level;
+    if (cls && !strcmp(cls, "view")) {
+        if (g_test_viewlog_count < 8) snprintf(g_test_viewlog_lines[g_test_viewlog_count], sizeof g_test_viewlog_lines[0], "%s", text ? text : "");
+        g_test_viewlog_count++;
+    }
+    printf("[%s] %s\n", cls ? cls : "", text ? text : "");
+}
 static int g_tri_origin_ul;   // 1 = 按 NVN 窗口原点在左上画（视口翻转）：期望上下对调。缺省 0 = 原点在左下（Vulkan 的自然方向）
 
 // C66 only: model a strict driver enforcing maxSets=64; all other calls
@@ -1488,6 +1498,56 @@ static void attach_swizzle_case(const char *dir, int explicit_view) {
         }
     }
     nvn_gpu_buf_release(raw, NULL, NULL); nvn_gpu_buf_release(sampled, NULL, NULL);
+}
+
+static void viewlog_case(void) {
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D; td.d.format = NVN_FORMAT_RGBA8;
+    td.d.width = 8; td.d.height = 8; td.d.depth = 1; td.d.levels = 1;
+    td.usage = NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_VIEW_FMT;
+    td.swz = 4 | 3 << 3 | 2 << 6 | 1 << 9;
+    nvn_gpu_tex t = NULL; nvn_gpu_view v = NULL; nvn_gpu_err e = {0};
+    g_test_viewlog_count = 0; g_test_viewlog = 0;
+    nvn_gpu_rc r = nvn_gpu_tex_create(&td, &t, &e);
+    CHECK(OK(r), "viewlog off tex: %d %s", r.code, e.why);
+    if (!OK(r)) return;
+    r = nvn_gpu_view_create(t, NULL, &v, &e);
+    CHECK(OK(r), "viewlog off view: %d %s", r.code, e.why);
+    if (v) nvn_gpu_view_release(v);
+    nvn_gpu_tex_release(t);
+    CHECK(g_test_viewlog_count == 0, "viewlog disabled emitted %d lines", g_test_viewlog_count);
+
+    t = NULL; v = NULL; g_test_viewlog = 1; g_test_viewlog_count = 0;
+    r = nvn_gpu_tex_create(&td, &t, &e);
+    CHECK(OK(r), "viewlog tex: %d %s", r.code, e.why);
+    if (!OK(r)) { g_test_viewlog = 0; return; }
+    r = nvn_gpu_view_create(t, NULL, &v, &e);
+    CHECK(OK(r), "viewlog view: %d %s", r.code, e.why);
+    if (!OK(r)) { nvn_gpu_tex_release(t); g_test_viewlog = 0; return; }
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc p = {0};
+    p.ncolor = 1; p.color[0].view = v; p.color[0].load = NVN_GPU_LOAD_CLEAR;
+    p.color[0].store = NVN_GPU_STORE_STORE; p.w = 8; p.h = 8; p.layers = 1;
+    nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c);
+    nvn_gpu_view_release(v); nvn_gpu_tex_release(t);
+    r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r), "viewlog commit: %d %s", r.code, e.why);
+    if (OK(r)) CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "viewlog wait: %s", e.why);
+    g_test_viewlog = 0;
+    CHECK(g_test_viewlog_count == 3, "viewlog expected 3 create lines, got %d", g_test_viewlog_count);
+    if (g_test_viewlog_count == 3) {
+        const char *sources[] = {"source=texture-default", "source=sample-storage", "source=attachment"};
+        char image[192];
+        snprintf(image, sizeof image, "image_type=%u image_format=%u image_flags=0x%x mutable=1 cube=0 array2d=0 image_mips=1 image_layers=1 image_extent=8x8x1 image_usage=0x%x",
+                 (unsigned)VK_IMAGE_TYPE_2D, (unsigned)VK_FORMAT_R8G8B8A8_UNORM, (unsigned)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                 (unsigned)(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
+        for (int i = 0; i < 3; i++) {
+            CHECK(strstr(g_test_viewlog_lines[i], sources[i]) != NULL, "viewlog source %d: %s", i, g_test_viewlog_lines[i]);
+            CHECK(strstr(g_test_viewlog_lines[i], image) != NULL, "viewlog image %d: %s", i, g_test_viewlog_lines[i]);
+            CHECK(strstr(g_test_viewlog_lines[i], "view_type=1 view_format=37") != NULL, "viewlog view %d: %s", i, g_test_viewlog_lines[i]);
+            CHECK(strstr(g_test_viewlog_lines[i], "range=0x1,0,1,0,1") != NULL, "viewlog range %d: %s", i, g_test_viewlog_lines[i]);
+        }
+        CHECK(strstr(g_test_viewlog_lines[1], "components=5,4,3,2") != NULL, "viewlog swizzle: %s", g_test_viewlog_lines[1]);
+        CHECK(strstr(g_test_viewlog_lines[2], "components=0,0,0,0") != NULL, "viewlog attachment identity: %s", g_test_viewlog_lines[2]);
+    }
 }
 
 // 数组第 1 层、多 mip 视图与 sRGB 重解释均保留精确的附件子资源与格式。
@@ -4225,6 +4285,10 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;
     c69_dual_src_blend(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C69 close：%d %s", e18.rc.code, e18.why);
+
+    if (!open_backend()) return 1;
+    viewlog_case();
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "viewlog close：%d %s", e18.rc.code, e18.why);
 
     for (int sw = 0; sw < 2; sw++) {
         if (!open_backend()) return 1;

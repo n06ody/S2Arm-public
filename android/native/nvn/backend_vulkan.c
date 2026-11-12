@@ -67,6 +67,10 @@ struct nvn_gpu_tex_s {
     VkDeviceMemory memory;
     VkImageView view;
     VkFormat format;
+    VkImageType image_type;
+    VkImageCreateFlags image_flags;
+    VkImageUsageFlags image_usage;
+    VkExtent3D image_extent;
     VkImageAspectFlags aspect;
     VkImageLayout layout;
     uint32_t w, h, depth, levels, layers, samples, nvn_format, target;
@@ -95,6 +99,25 @@ struct nvn_gpu_view_s {
     VkImageView att;             // 附件形态（一级一层的 2D 视图），第一次当附件时建（view_attachment）
     struct nvn_gpu_view_s *all_next;
 };
+
+// 一次性崩溃探针：必须在进入驱动前写出一整行；无次数上限，默认关闭。
+static void viewlog(const char *source, const struct nvn_gpu_tex_s *t, const VkImageViewCreateInfo *v) {
+    if (!nvn_plat_flag("nvk_viewlog", 0)) return;
+    const VkImageSubresourceRange *r = &v->subresourceRange;
+    char line[512];
+    snprintf(line, sizeof line,
+             "source=%s image=0x%llx image_type=%u image_format=%u image_flags=0x%x mutable=%d cube=%d array2d=%d "
+             "image_mips=%u image_layers=%u image_extent=%ux%ux%u image_usage=0x%x "
+             "view_type=%u view_format=%u components=%u,%u,%u,%u range=0x%x,%u,%u,%u,%u",
+             source, (unsigned long long)(uintptr_t)v->image, (unsigned)t->image_type, (unsigned)t->format,
+             (unsigned)t->image_flags, !!(t->image_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
+             !!(t->image_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT), !!(t->image_flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT),
+             t->levels, t->layers, t->image_extent.width, t->image_extent.height, t->image_extent.depth, (unsigned)t->image_usage,
+             (unsigned)v->viewType, (unsigned)v->format, (unsigned)v->components.r, (unsigned)v->components.g,
+             (unsigned)v->components.b, (unsigned)v->components.a, (unsigned)r->aspectMask, r->baseMipLevel,
+             r->levelCount, r->baseArrayLayer, r->layerCount);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "view", line);
+}
 
 struct nvn_gpu_shader_s {
     VkShaderModule mod;
@@ -2225,6 +2248,7 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v) {
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         ci.format = v->format ? v->format : t->format;
         ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, 1};
+        viewlog("attachment", t, &ci);
         if (vkCreateImageView(g.d, &ci, NULL, &v->att) != VK_SUCCESS) v->att = VK_NULL_HANDLE;
     }
     VkImageView r = v->att;
@@ -3075,6 +3099,8 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (t->view_fmt) ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    t->image_type = ci.imageType; t->image_flags = ci.flags;
+    t->image_usage = ci.usage; t->image_extent = ci.extent;
     if (vkCreateImage(g.d, &ci, NULL, &t->image) != VK_SUCCESS) {
         free(t);
         return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateImage 拒绝（格式 0x%x / usage 0x%x / %ux%u）", d->d.format, usage, d->d.width, d->d.height);
@@ -3102,6 +3128,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     vi.viewType = vtype;
     vi.format = fmt;
     vi.subresourceRange = (VkImageSubresourceRange){(t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : t->aspect, 0, levels, 0, itype == VK_IMAGE_TYPE_3D ? 1 : layers};   // 深度模板格式：采样只取深度面
+    viewlog("texture-default", t, &vi);
     if (vkCreateImageView(g.d, &vi, NULL, &t->view) != VK_SUCCESS) {
         vkFreeMemory(g.d, t->memory, NULL);
         vkDestroyImage(g.d, t->image, NULL);
@@ -3208,6 +3235,7 @@ nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex th, const view_t *v, nvn_gpu_view *ou
         }
         if (!o->swizzled) memset(&ci.components, 0, sizeof ci.components);   // 恒等：留 IDENTITY，附件可用
     }
+    viewlog("sample-storage", t, &ci);
     if (vkCreateImageView(g.d, &ci, NULL, &o->view) != VK_SUCCESS) {
         free(o);
         return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateImageView 拒绝（格式 / 范围）");
