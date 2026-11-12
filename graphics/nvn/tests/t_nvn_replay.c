@@ -22,8 +22,12 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
+static int g_copydiag_on, g_copydiag_n; static char g_copydiag_lines[4][1024];
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); }
+    if (cls && !strcmp(cls, "copydiag")) { if (g_copydiag_n < 4) snprintf(g_copydiag_lines[g_copydiag_n], sizeof g_copydiag_lines[0], "%s", text); g_copydiag_n++; }
+}
+int nvn_plat_flag(const char *name, int dflt) { return name && !strcmp(name, "nvk_copydiag") ? g_copydiag_on : dflt; }
 const char *nvn_plat_dir(int which) { (void)which; return NULL; }
 
 // ---------- 前端替身 ----------
@@ -1335,8 +1339,9 @@ static void t_compute_image(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); pass_fresh();
 }
 
-static void t_copy_t2t(void) {
+static void t_copy_t2t(int diag) {
     pass_fresh(); g_nct = 0; g_nbl = 0;
+    g_copydiag_on = diag; g_copydiag_n = 0; memset(g_copydiag_lines, 0, sizeof g_copydiag_lines);
     tex_t a = mk_tex(71, 0, NVN_FORMAT_RGBA8, 64, 32, 3, 0), b = mk_tex(72, 0x8000, NVN_FORMAT_RGBA8, 32, 16, 1, 0), f = mk_tex(73, 0xC000, NVN_FORMAT_R11G11B10F, 32, 16, 1, 0);
     a.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; a.d.depth = 4; nvn_tex_layout(&a.d, &a.L);
     stream s = {0};
@@ -1370,6 +1375,16 @@ static void t_copy_t2t(void) {
     CHECK(nvn_unimpl_count("tex", "t2t_format_change") == 1 && nvn_unimpl_count("tex", "t2t_mirror") == 1 && nvn_unimpl_kinds() == 4);
     CHECK(nvn_unimpl_count("tex", "t2t_multisample_resolve") == 3 && nvn_unimpl_count("tex", "t2t_downsample_case") == 1);
     CHECK(nvn_be_tex_gpu_owned(72) == 1 && nvn_be_tex_gpu_owned(73) == 1 && nvn_be_tex_gpu_owned(71) == 0);
+    CHECK(g_copydiag_n == (diag ? 3 : 0));
+    if (diag) {
+        CHECK(strstr(g_copydiag_lines[0], "attempt flags=0 src_serial=71") != NULL);
+        CHECK(strstr(g_copydiag_lines[0], "src_mip=1 src_layer=2 src_region=4,2,0,16,8,1") != NULL);
+        CHECK(strstr(g_copydiag_lines[0], "dst_serial=72") != NULL);
+        CHECK(strstr(g_copydiag_lines[0], "dst_mip=0 dst_layer=0 dst_region=8,4,0,16,8,1") != NULL);
+        CHECK(strstr(g_copydiag_lines[0], "original_src=4,2,1,16,8,2 original_dst=8,4,0,16,8,2") != NULL);
+        CHECK(strstr(g_copydiag_lines[1], "src_mip=1 src_layer=3") != NULL);
+    }
+    g_copydiag_on = 0;
     pass_fresh();
 }
 
@@ -1689,7 +1704,7 @@ int main(int argc, char **argv) {
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
-    t_copy_t2t();
+    t_copy_t2t(0); t_copy_t2t(1);
     t_draw();
     t_present();
     t_view_pin();

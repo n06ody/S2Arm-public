@@ -215,6 +215,24 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
 
 // 贴图 → 贴图的拷贝（nvn_mtl.m copy_t2t_ @14049）。源 / 目标各按自己视图的级与起始层；同尺寸、同格式、不镜像的逐层直接拷（三维的一次拷若干片）；
 // 降采样记录（DM_COPY_RESOLVE）在两边采样数、格式、尺寸都相同时就是整张拷贝。缩放、换格式、镜像、多重采样解析：iOS 是画出来 / 解析出来的，这里还没接，分开记账。
+static void copydiag_attempt(const p_copy_t2t *o, const tex_t *s, const tex_t *d, int sfmt, int dfmt,
+                             uint32_t sl, uint32_t sy, const NVNcopyRegion *sr,
+                             uint32_t dl, uint32_t dy, const NVNcopyRegion *dr) {
+    if (!nvn_plat_flag("nvk_copydiag", 0)) return;
+    char line[1024];
+    snprintf(line, sizeof line,
+             "attempt flags=%#x src_serial=%llu src_nvn=%#x src_view_nvn=%#x src_mip=%u src_layer=%u src_region=%d,%d,%d,%d,%d,%d "
+             "dst_serial=%llu dst_nvn=%#x dst_view_nvn=%#x dst_mip=%u dst_layer=%u dst_region=%d,%d,%d,%d,%d,%d "
+             "original_src=%d,%d,%d,%d,%d,%d original_dst=%d,%d,%d,%d,%d,%d",
+             (unsigned)o->flags, (unsigned long long)s->serial, (unsigned)s->d.format, (unsigned)sfmt, sl, sy,
+             sr->xoffset, sr->yoffset, sr->zoffset, sr->width, sr->height, sr->depth,
+             (unsigned long long)d->serial, (unsigned)d->d.format, (unsigned)dfmt, dl, dy,
+             dr->xoffset, dr->yoffset, dr->zoffset, dr->width, dr->height, dr->depth,
+             o->sr.xoffset, o->sr.yoffset, o->sr.zoffset, o->sr.width, o->sr.height, o->sr.depth,
+             o->dr.xoffset, o->dr.yoffset, o->dr.zoffset, o->dr.width, o->dr.height, o->dr.depth);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "copydiag", line);
+}
+
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
     const tex_t *s = o->src, *d = o->dst; if (!s || !d || !c) return;
     uint32_t sl = o->has_sv && o->sv.set_levels ? o->sv.base_level : 0, dl = o->has_dv && o->dv.set_levels ? o->dv.base_level : 0;
@@ -281,9 +299,14 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
     nvn_gpu_tex gs = rp_tex_resolve(s, c), gd = rp_tex_resolve(d, c);
     if (!gs || !gd) return;
     int nz = sr.depth > 0 ? sr.depth : 1;
-    if (s3) nvn_gpu_copy_tex(c, gs, sl, 0, &sr, gd, dl, 0, &dr);   // 三维：片在区域的深度方向上，一次拷完
+    if (s3) {
+        copydiag_attempt(o, s, d, sfmt, dfmt, sl, 0, &sr, dl, 0, &dr);
+        nvn_gpu_copy_tex(c, gs, sl, 0, &sr, gd, dl, 0, &dr);   // 三维：片在区域的深度方向上，一次拷完
+    }
     else for (int z = 0; z < nz; z++) {
         NVNcopyRegion a = sr, b = dr; a.zoffset = b.zoffset = 0; a.depth = b.depth = 1;
+        copydiag_attempt(o, s, d, sfmt, dfmt, sl, sz0 + (uint32_t)sr.zoffset + (uint32_t)z,
+                         &a, dl, dz0 + (uint32_t)dr.zoffset + (uint32_t)z, &b);
         nvn_gpu_copy_tex(c, gs, sl, sz0 + (uint32_t)sr.zoffset + (uint32_t)z, &a, gd, dl, dz0 + (uint32_t)dr.zoffset + (uint32_t)z, &b);
     }
     rp_tex_mark_gpu_written(d);   // 目标的内容从此以 GPU 为准

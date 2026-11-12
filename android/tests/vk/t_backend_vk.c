@@ -32,8 +32,13 @@ VkResult nvn_plat_vk_surface_create(VkInstance instance, void *native, VkSurface
     return vkCreateHeadlessSurfaceEXT(instance, &ci, NULL, out);
 }
 int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native; *w = 320; *h = 180; return 1; }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)level; printf("[%s] %s\n", cls ? cls : "", text ? text : ""); }
+static int g_copydiag_on, g_copydiag_count; static char g_copydiag_last[1024];
+int nvn_plat_flag(const char *name, int dflt) { return name && !strcmp(name, "nvk_copydiag") ? g_copydiag_on : dflt; }
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    (void)level;
+    if (cls && !strcmp(cls, "copydiag")) { g_copydiag_count++; snprintf(g_copydiag_last, sizeof g_copydiag_last, "%s", text); }
+    printf("[%s] %s\n", cls ? cls : "", text ? text : "");
+}
 static int g_tri_origin_ul;   // 1 = 按 NVN 窗口原点在左上画（视口翻转）：期望上下对调。缺省 0 = 原点在左下（Vulkan 的自然方向）
 
 // C66 only: model a strict driver enforcing maxSets=64; all other calls
@@ -223,6 +228,31 @@ static nvn_gpu_tex make_tex(uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage
     nvn_gpu_rc r = nvn_gpu_tex_create(&td, &t, &e);
     CHECK(OK(r), "tex_create 失败：%d %s", r.code, e.why);
     return t;
+}
+
+static nvn_gpu_cmd begin_cmd(void);
+// 同一个非法拷贝开关关 / 开都必须返回 E_ARG；空句柄验证原先的短路求值没有被日志破坏。
+static void copydiag_reject_test(int enabled, int null_handles) {
+    g_copydiag_on = enabled; g_copydiag_count = 0; g_copydiag_last[0] = 0;
+    nvn_gpu_tex s = NULL, d = NULL;
+    if (!null_handles) {
+        s = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+        d = make_tex(8, 8, NVN_FORMAT_R8, NVN_GPU_TEX_SAMPLED);
+    }
+    NVNcopyRegion sr = {1, 2, 0, 2, 2, 1}, dr = {3, 4, 0, 2, 2, 1};
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_copy_tex(c, s, 0, 0, &sr, d, 0, 0, &dr);
+    nvn_gpu_err e = {0}; nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(r.code == NVN_GPU_E_ARG, "copydiag %d 原始错误应 E_ARG，得到 %d", enabled, r.code);
+    CHECK(g_copydiag_count == enabled, "copydiag %d 日志数 %d", enabled, g_copydiag_count);
+    if (enabled) {
+        CHECK(strstr(g_copydiag_last, "reject fmt_ok=0") != NULL, "copydiag reject 缺 fmt_ok");
+        CHECK(strstr(g_copydiag_last, "src_region=1,1,2,0,2,2,1") != NULL, "copydiag src region 错误");
+        CHECK(strstr(g_copydiag_last, "dst_region=1,3,4,0,2,2,1") != NULL, "copydiag dst region 错误");
+        CHECK(strstr(g_copydiag_last, null_handles ? "src_present=0" : "src_present=1") != NULL, "copydiag src 句柄状态错误");
+        if (!null_handles) CHECK(strstr(g_copydiag_last, "src_size=4x4x1 src_levels=1 src_layers=1") != NULL, "copydiag src 尺寸错误");
+    }
+    nvn_gpu_tex_release(s); nvn_gpu_tex_release(d); g_copydiag_on = 0;
 }
 
 static nvn_gpu_tex make_tex_target(uint32_t w, uint32_t h, uint32_t depth, uint32_t target, uint32_t fmt, uint32_t usage) {
@@ -4629,6 +4659,12 @@ int main(int argc, char **argv) {
     memset(&g_desc, 0, sizeof g_desc);
     g_desc.host_device = &g_dev;
     g_desc.app_label = "nvn-backend-vk-test";
+    for (int k = 0; k < 3; k++) {
+        if (!open_backend()) return 1;
+        copydiag_reject_test(k != 0, k == 1);
+        nvn_gpu_err e = {0};
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "copydiag close：%d %s", e.rc.code, e.why);
+    }
     if (!open_backend()) return 1;
 
     nvn_gpu_caps caps;

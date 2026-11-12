@@ -3687,6 +3687,20 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     if (!fmt_ok || slayer >= s->layers ||
         dlayer >= d->layers || copy_region(s, slevel, sr, &so, &se) || copy_region(d, dlevel, dr, &dof, &de) ||
         se.width != de.width || se.height != de.height || se.depth != de.depth) {
+        if (nvn_plat_flag("nvk_copydiag", 0)) {
+            const NVNcopyRegion zero = {0}; const NVNcopyRegion *a = sr ? sr : &zero, *b = dr ? dr : &zero;
+            char line[1024];
+            snprintf(line, sizeof line,
+                     "reject fmt_ok=%d src_present=%d src_nvn=%#x src_vk=%u src_bpp=%u src_depthfmt=%d src_size=%ux%ux%u src_levels=%u src_layers=%u src_target=%u src_samples=%u src_mip=%u src_layer=%u src_region=%d,%d,%d,%d,%d,%d,%d "
+                     "dst_present=%d dst_nvn=%#x dst_vk=%u dst_bpp=%u dst_depthfmt=%d dst_size=%ux%ux%u dst_levels=%u dst_layers=%u dst_target=%u dst_samples=%u dst_mip=%u dst_layer=%u dst_region=%d,%d,%d,%d,%d,%d,%d",
+                     fmt_ok, !!s, s ? s->nvn_format : 0, s ? (unsigned)s->format : 0, s ? fmt_bpp(s->format) : 0, s ? nvn_vk_format_is_depth(s->format) : 0,
+                     s ? s->w : 0, s ? s->h : 0, s ? s->depth : 0, s ? s->levels : 0, s ? s->layers : 0, s ? s->target : 0, s ? s->samples : 0, slevel, slayer,
+                     !!sr, a->xoffset, a->yoffset, a->zoffset, a->width, a->height, a->depth,
+                     !!d, d ? d->nvn_format : 0, d ? (unsigned)d->format : 0, d ? fmt_bpp(d->format) : 0, d ? nvn_vk_format_is_depth(d->format) : 0,
+                     d ? d->w : 0, d ? d->h : 0, d ? d->depth : 0, d ? d->levels : 0, d ? d->layers : 0, d ? d->target : 0, d ? d->samples : 0, dlevel, dlayer,
+                     !!dr, b->xoffset, b->yoffset, b->zoffset, b->width, b->height, b->depth);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "copydiag", line);
+        }
         set_sticky(c, NVN_GPU_E_ARG, "copy_tex 参数非法（格式 / 尺寸 / 范围）");
         return;
     }
