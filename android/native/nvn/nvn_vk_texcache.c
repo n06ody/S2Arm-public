@@ -2402,13 +2402,13 @@ struct nvn_vk_tex *nvn_vk_texcache_get_tex(struct nvn_vk_texcache *c, const tex_
                        : cube ? VK_IMAGE_VIEW_TYPE_CUBE
                        : cube_array ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
                        : layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-    // 采样格式/aspect：深度只带 DEPTH；stencil 模式采样 stencil 面（S8_UINT + STENCIL），
+    // 采样视图沿用深度模板底图格式；stencil 模式只选 STENCIL 面，
     // 与附件视图（DEPTH|STENCIL）分开——Vulkan 不允许采样 DEPTH|STENCIL 合成视图。
     const int stencil_mode = t->stencil != 0;
     // 通道映射要在建视图之前就写进槽：tex_view_components 读的是槽上的 set_swz/swz（字形图集 a=R 等）。
     o->set_swz = t->set_swz; o->swz = (uint16_t)t->swz;
     o->nvn_target = target; o->view_type = vt;
-    const VkFormat sample_fmt = (nvn_vk_format_is_depth(fmt) && stencil_mode) ? VK_FORMAT_S8_UINT : fmt;
+    const VkFormat sample_fmt = fmt;
     const VkImageAspectFlags sample_aspect = nvn_vk_format_is_depth(fmt)
         ? (stencil_mode ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
     VkComponentMapping comps;
@@ -2682,7 +2682,7 @@ static VkImageView tex_view_core(struct nvn_vk_texcache *c, struct nvn_vk_tex *t
     } else {
         int stencil_face = t->stencil_mode ? 1 : 0;
         if (v && v->set_dsmode) stencil_face = (v->dsmode == 1);
-        fmt = stencil_face ? VK_FORMAT_S8_UINT : t->views[0].format;
+        fmt = stencil_face ? image_fmt : t->views[0].format;
         if (stencil_face) {
             if (!depth_format || !nvn_vk_format_has_stencil(image_fmt)) {
                 if (why && why_size) snprintf(why, why_size, "stencil-mode view of a texture without stencil bits");

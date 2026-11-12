@@ -46,8 +46,16 @@ cat >"$out/fragment.frag" <<'SHADER'
 #version 450
 layout(location=0) out vec4 color; void main() { color=vec4(1.0); }
 SHADER
+cat >"$out/stencil.comp" <<'SHADER'
+#version 450
+layout(local_size_x=1) in;
+layout(set=0,binding=0) uniform usampler2D tex;
+layout(set=0,binding=1,std430) buffer Out { uvec4 value; } outbuf;
+void main() { outbuf.value=texelFetch(tex,ivec2(0),0); }
+SHADER
 "$glslc" --target-env=vulkan1.1 "$out/vertex.vert" -o "$out/vertex.spv"
 "$glslc" --target-env=vulkan1.1 "$out/fragment.frag" -o "$out/fragment.spv"
+"$glslc" --target-env=vulkan1.1 "$out/stencil.comp" -o "$out/stencil.spv"
 python3 - "$out" <<'PYJSON'
 import base64,json,pathlib,sys
 p=pathlib.Path(sys.argv[1]); enc=lambda x:base64.b64encode((p/x).read_bytes()).decode()
@@ -61,6 +69,11 @@ if [ "$mode" != --neg ]; then
     "$out/probe" "$out/program.json" "$out/cache" >"$out/normal.log" 2>&1 || { cat "$out/normal.log" >&2; exit 1; }
     if grep -qiE 'validation error|VUID-|UNASSIGNED-|SYNC-HAZARD|ERROR.*VALIDATION' "$out/normal.log"; then cat "$out/normal.log" >&2; exit 1; fi
     cat "$out/normal.log"
+    # 深度模板采样视图：拦截生产路径的建图与建视图，同时交真实驱动及校验层。
+    compile "$repo/android/tests/nvn_vk_stencil_view_test.c" -Wl,--wrap=vkCreateImage -Wl,--wrap=vkCreateImageView -o "$out/stencil-probe"
+    "$out/stencil-probe" "$out/stencil.spv" >"$out/stencil.log" 2>&1 || { cat "$out/stencil.log" >&2; exit 1; }
+    if grep -qiE 'validation error|VUID-|UNASSIGNED-|SYNC-HAZARD|ERROR.*VALIDATION' "$out/stencil.log"; then cat "$out/stencil.log" >&2; exit 1; fi
+    cat "$out/stencil.log"
     exit 0
 fi
 # Mutation is generated only under $out. Remove the #1472 production destroy
