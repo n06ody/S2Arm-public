@@ -37,12 +37,21 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native;
 // S2A_TEST_NVK_DQ=1：整套用例在「两级回放开」下再跑一遍；S2A_TEST_DESC_MEMO=1：在「描述符组备忘开」下再跑一遍
 // （备忘开着时内容相同的组不再分配，按「分配了几组」写的那几条期望在这一遍里不比，像素期望照比）。
 static int g_memo_on;
+static unsigned g_pipeprobe_seen;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_pipeprobe")) return 1;
     if (!strcmp(name, "nvk_dq") && getenv("S2A_TEST_NVK_DQ")) return 1;
     if (!strcmp(name, "nvk_desc_memo") && getenv("S2A_TEST_DESC_MEMO")) { g_memo_on = 1; return 1; }
     return dflt;
 }
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)level; printf("[%s] %s\n", cls ? cls : "", text ? text : ""); }
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    (void)level;
+    if (text && strstr(text, "pipeprobe event=hit")) g_pipeprobe_seen |= 1;
+    if (text && strstr(text, "pipeprobe event=miss")) g_pipeprobe_seen |= 2;
+    if (text && strstr(text, "pipeprobe event=create")) g_pipeprobe_seen |= 4;
+    if (text && strstr(text, "same_shaders=1 fields=poly")) g_pipeprobe_seen |= 8;
+    printf("[%s] %s\n", cls ? cls : "", text ? text : "");
+}
 static int g_tri_origin_ul;   // 1 = 按 NVN 窗口原点在左上画（视口翻转）：期望上下对调。缺省 0 = 原点在左下（Vulkan 的自然方向）
 
 // C66 only: model a strict driver enforcing maxSets=64; all other calls
@@ -5084,6 +5093,25 @@ static void c86c_bc_3d_slice_copy(void) {
     nvn_gpu_buf_release(ib, NULL, NULL); nvn_gpu_buf_release(rb, NULL, NULL);
 }
 
+// 用同一组真实着色器先建、再命中、再只改剔除模式；探针应指出 poly，而不是猜测其他字段。
+static void pipeprobe_nearest_test(const char *dir) {
+    nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
+    if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) {
+        CHECK(0, "pipeprobe 加载测试着色器"); free(vm); free(fm); return;
+    }
+    nvn_gpu_pipe_desc pd; nvn_gpu_pipe a = NULL, b = NULL, other = NULL; nvn_gpu_err e = {0};
+    fill_gpipe_desc(&pd, vs, fs, 0);
+    nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &a, &e);
+    CHECK(OK(r) && a, "pipeprobe 首次创建：%d %s", r.code, e.why);
+    r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &b, &e);
+    CHECK(OK(r) && a == b, "pipeprobe 同一描述应命中：%d %s", r.code, e.why);
+    sleep_ms(5100);   // 跨过 5 秒采样间隔，再只变一个已知键字段
+    pd.poly.cull = 1;
+    r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &other, &e);
+    CHECK(OK(r) && other && other != a, "pipeprobe 改剔除模式应 miss：%d %s", r.code, e.why);
+    nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs); free(vm); free(fm);
+}
+
 int main(int argc, char **argv) {
     t29_format_expand();
     char why[256] = {0};
@@ -5383,6 +5411,10 @@ int main(int argc, char **argv) {
         CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "attachment subresource close：%d %s", e18.rc.code, e18.why);
     }
 
+    if (!open_backend()) return 1;
+    pipeprobe_nearest_test(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "pipeprobe close：%d %s", e18.rc.code, e18.why);
+    CHECK(g_pipeprobe_seen == 15, "管线探针应见真实 hit/miss/create 与 poly 差异，位图应为 15，实际 %u", g_pipeprobe_seen);
     printf("nvn_gpu Vulkan 后端 C01–C08/C23/C25/C26/C27–C55/C56–C69/C74–C75 + 清屏/复制/深度/纹理三角形用例：%s（%d 处不符，done %d 次，retired %d 次）\n",
            g_fail ? "红" : "绿", g_fail, atomic_load(&g_ndone), atomic_load(&g_retired));
     s2a_vk_device_destroy(&g_dev, 1);   // 最后一个会话已在 t20 close 里证明空闲

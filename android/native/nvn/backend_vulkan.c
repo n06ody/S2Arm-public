@@ -1953,6 +1953,93 @@ static int same_pipe_desc(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b
            memcmp(&a->poly, &b->poly, sizeof a->poly) == 0 && a->origin_ll == b->origin_ll && a->depth_clamp == b->depth_clamp;
 }
 
+// 一次性诊断：只在 debug.s2a.nvk_pipeprobe=1 时计；时间按调用完成所在窗口记账。
+enum { PP_CALL, PP_HIT, PP_MISS, PP_OTHER, PP_TOTAL_NS, PP_HIT_NS, PP_MISS_NS,
+       PP_LOCK_N, PP_LOCK_NS, PP_CREATE, PP_CREATE_FAIL, PP_CREATE_NS, PP_SCAN_NS, PP_N };
+static uint64_t g_pp[PP_N], g_pp_last, g_pp_sample, g_pp_events;
+static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER;
+struct pp_local { uint64_t v[PP_N]; int kind, have_near; char near[320]; };
+static int pipe_probe_on(void) {
+    static _Atomic int enabled = -1;
+    int on = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (on < 0) { on = nvn_plat_flag("nvk_pipeprobe", 0) != 0; atomic_store_explicit(&enabled, on, memory_order_relaxed); }
+    return on;
+}
+static void pp_lock(int on, struct pp_local *p) {
+    uint64_t t = on ? now_ns() : 0;
+    pthread_mutex_lock(&g_mu);
+    if (on) { p->v[PP_LOCK_N]++; p->v[PP_LOCK_NS] += now_ns() - t; }
+}
+static void pp_event(uint64_t bit, const char *name) {
+    if (!(__atomic_fetch_or(&g_pp_events, bit, __ATOMIC_RELAXED) & bit)) {
+        char b[96]; snprintf(b, sizeof b, "pipeprobe event=%s", name);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+    }
+}
+static void pp_report(uint64_t now, const struct pp_local *p) {
+    uint64_t v[PP_N], last;
+    pthread_mutex_lock(&g_pp_mu);
+    for (int i = 0; i < PP_N; i++) g_pp[i] += p->v[i];
+    if (!g_pp_last) g_pp_last = now;
+    last = g_pp_last;
+    if (now <= last || now - last < 5000000000ull) { pthread_mutex_unlock(&g_pp_mu); return; }
+    memcpy(v, g_pp, sizeof v); memset(g_pp, 0, sizeof g_pp); g_pp_last = now;
+    pthread_mutex_unlock(&g_pp_mu);
+    char b[400]; snprintf(b, sizeof b, "pipeprobe backend %.3fs calls=%llu hit=%llu miss=%llu other=%llu total_ms=%.3f hit_ms=%.3f miss_ms=%.3f lock_n=%llu lock_wait_ms=%.3f create=%llu create_fail=%llu create_ms=%.3f diff_scan_ms=%.3f",
+        (double)(now - last) / 1e9, (unsigned long long)v[PP_CALL], (unsigned long long)v[PP_HIT], (unsigned long long)v[PP_MISS],
+        (unsigned long long)v[PP_OTHER], v[PP_TOTAL_NS] / 1e6, v[PP_HIT_NS] / 1e6, v[PP_MISS_NS] / 1e6,
+        (unsigned long long)v[PP_LOCK_N], v[PP_LOCK_NS] / 1e6, (unsigned long long)v[PP_CREATE],
+        (unsigned long long)v[PP_CREATE_FAIL], v[PP_CREATE_NS] / 1e6, v[PP_SCAN_NS] / 1e6);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+}
+
+// 差异只描述扫描到的近邻，不能当作唯一因果；分类与 same_pipe_desc 的比较项逐一对应。
+static uint32_t pp_diff(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b) {
+    uint32_t m = 0;
+#define DIFF(bit, expr) do { if (expr) m |= 1u << (bit); } while (0)
+    DIFF(0, a->prim != b->prim); DIFF(1, a->patch_size != b->patch_size);
+    DIFF(2, a->dfmt != b->dfmt || a->sfmt != b->sfmt); DIFF(3, a->samples != b->samples);
+    DIFF(4, a->rast_discard != b->rast_discard); DIFF(5, a->clip_neg1 != b->clip_neg1);
+    for (int i = 0; i < 5; i++) DIFF(6 + i, !same_spec(&a->st[i], &b->st[i]));
+    DIFF(11, memcmp(a->cfmt, b->cfmt, sizeof a->cfmt)); DIFF(12, memcmp(a->lmap, b->lmap, sizeof a->lmap));
+    DIFF(13, memcmp(a->blend, b->blend, sizeof a->blend)); DIFF(14, memcmp(&a->color, &b->color, sizeof a->color));
+    DIFF(15, memcmp(&a->chmask, &b->chmask, sizeof a->chmask)); DIFF(16, memcmp(&a->ms, &b->ms, sizeof a->ms));
+    DIFF(17, memcmp(a->attr, b->attr, sizeof a->attr)); DIFF(18, memcmp(a->stream, b->stream, sizeof a->stream));
+    DIFF(19, memcmp(&a->ds, &b->ds, sizeof a->ds)); DIFF(20, memcmp(&a->poly, &b->poly, sizeof a->poly));
+    DIFF(21, a->origin_ll != b->origin_ll); DIFF(22, a->depth_clamp != b->depth_clamp);
+#undef DIFF
+    return m;
+}
+// 持 g_mu，最多看缓存链的前 256 项；只采样每 5 秒首个 miss。
+static int pp_sample_diff(const nvn_gpu_pipe_desc *d, char *out, size_t cap, struct pp_local *p) {
+    uint64_t t = now_ns(), last = __atomic_load_n(&g_pp_sample, __ATOMIC_RELAXED);
+    if (last && (t <= last || t - last < 5000000000ull)) return 0;
+    if (!__atomic_compare_exchange_n(&g_pp_sample, &last, t, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 0;
+    static const char *const names[] = {"prim", "patch_size", "depth_fmt", "samples", "discard", "clip_neg1",
+        "stage_vs", "stage_fs", "stage_gs", "stage_tcs", "stage_tes", "color_fmt", "lmap", "blend", "color", "chmask", "ms", "attr", "stream", "ds", "poly", "origin", "depth_clamp"};
+    uint32_t best = 0, seen = 0, score = UINT32_MAX; int best_shaders = 0;
+    const nvn_gpu_pipe_desc *candidate = NULL;
+    for (struct nvn_gpu_pipe_s *q = g.pipes; q && seen < 256; q = q->all_next) {
+        uint32_t mask = pp_diff(&q->key, d), n = (uint32_t)__builtin_popcount(mask); int same_shaders = 1; seen++;
+        for (int i = 0; i < 5; i++) if (q->key.st[i].sh != d->st[i].sh) same_shaders = 0;
+        if ((same_shaders && !best_shaders) || (same_shaders == best_shaders && n < score)) {
+            best = mask; score = n; best_shaders = same_shaders; candidate = &q->key; if (!n) break;
+        }
+    }
+    int n = snprintf(out, cap, "pipeprobe miss-near scanned=%u cap=256 same_shaders=%d fields=", seen, best_shaders);
+    if (!seen) snprintf(out + n, cap - (size_t)n, "none");
+    else if (!best) snprintf(out + n, cap - (size_t)n, "equal-but-bucket-missed");
+    else for (unsigned i = 0; i < sizeof names / sizeof names[0] && n > 0 && (size_t)n < cap; i++) if (best & (1u << i)) n += snprintf(out + n, cap - (size_t)n, "%s%s", out[n - 1] == '=' ? "" : ",", names[i]);
+    if (candidate && (best & (1u << 20)) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - (size_t)n, " poly(old>new cull=%u>%u front=%u>%u mode=%u>%u offset=%u>%u)",
+            candidate->poly.cull, d->poly.cull, candidate->poly.front, d->poly.front, candidate->poly.mode, d->poly.mode,
+            candidate->poly.offset_en, d->poly.offset_en);
+    if (candidate && (best & (1u << 15)) && n > 0 && (size_t)n < cap)
+        n += snprintf(out + n, cap - (size_t)n, " chmask=%#x>%#x", candidate->chmask.mask, d->chmask.mask);
+    p->v[PP_SCAN_NS] += now_ns() - t;
+    return 1;
+}
+
 static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
     if (!p) return;
     if (p->pipe) vkDestroyPipeline(g.d, p->pipe, NULL);
@@ -1964,8 +2051,12 @@ static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
     free(p);
 }
 
-nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
-    if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+static nvn_gpu_rc pp_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err, int on, struct pp_local *probe) {
+    if (on) {
+        if (!g_open) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+        pp_lock(1, probe); int ok = !g.closing; pthread_mutex_unlock(&g_mu);
+        if (!ok) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    } else if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
     (void)mode;
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
@@ -1984,13 +2075,14 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
         if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "几何 / 细分阶段：本段未实现");
 
     const uint32_t hb = pipe_hash(d) % PIPE_HT_N;
-    pthread_mutex_lock(&g_mu);
+    pp_lock(on, probe);
     static int scan = -1; static uint32_t scan_n;   // 诊断开关 nvk_pipe_scan=1：走原来的整表逐条比（同一局里对比用），每 256 次取管线读一次
     if (scan < 0 || !(++scan_n & 255)) scan = nvn_plat_flag("nvk_pipe_scan", 0) != 0;
     struct timespec lk0; clock_gettime(CLOCK_MONOTONIC, &lk0); uint32_t steps = 0;
     for (struct nvn_gpu_pipe_s *q = scan ? g.pipes : g_pipe_ht[hb]; q; q = scan ? q->all_next : q->hnext) {
         steps++;
         if (same_pipe_desc(&q->key, d)) {
+            probe->kind = 1;
             { struct timespec lk1; clock_gettime(CLOCK_MONOTONIC, &lk1);   // 诊断读数：查找这一段用了多久、比了多少条（随对象读数那几行打）
               __atomic_fetch_add(&g_pl_ns, (uint64_t)(lk1.tv_sec - lk0.tv_sec) * 1000000000ull + (uint64_t)lk1.tv_nsec - (uint64_t)lk0.tv_nsec, __ATOMIC_RELAXED);
               __atomic_fetch_add(&g_pl_n, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_pl_steps, steps, __ATOMIC_RELAXED); }
@@ -1999,6 +2091,8 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
             return rc(NVN_GPU_OK);
         }
     }
+    probe->kind = 2;
+    probe->have_near = on && pp_sample_diff(d, probe->near, sizeof probe->near, probe);
     pthread_mutex_unlock(&g_mu);
 
     struct merged { uint8_t set, binding, cls; uint16_t count; uint32_t stages; } m[64];
@@ -2286,7 +2380,10 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     gp.layout = p->layout;
     gp.renderPass = p->pass;
     gp.subpass = 0;
-    if (vkCreateGraphicsPipelines(g.d, VK_NULL_HANDLE, 1, &gp, NULL, &p->pipe) != VK_SUCCESS) {
+    uint64_t create0 = on ? now_ns() : 0;
+    VkResult create_rc = vkCreateGraphicsPipelines(g.d, VK_NULL_HANDLE, 1, &gp, NULL, &p->pipe);
+    if (on) { probe->v[PP_CREATE]++; probe->v[PP_CREATE_NS] += now_ns() - create0; if (create_rc != VK_SUCCESS) probe->v[PP_CREATE_FAIL]++; }
+    if (create_rc != VK_SUCCESS) {
         nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateGraphicsPipelines 失败");
         destroy_pipe_objects(p);
         return bad;
@@ -2314,18 +2411,34 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
             }
         }
     }
-    pthread_mutex_lock(&g_mu);
+    pp_lock(on, probe);
     for (int st = 0; st < 5; st++)
         if (d->st[st].sh) d->st[st].sh->refs++; // 管线持有
     pthread_mutex_unlock(&g_mu);
     p->key = *d;
-    pthread_mutex_lock(&g_mu);
+    pp_lock(on, probe);
     p->all_next = g.pipes;
     g.pipes = p;
     p->hnext = g_pipe_ht[hb]; g_pipe_ht[hb] = p;
     pthread_mutex_unlock(&g_mu);
     *out = p;
     return rc(NVN_GPU_OK);
+}
+
+nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
+    int on = pipe_probe_on(); struct pp_local probe = {0}; uint64_t t = on ? now_ns() : 0;
+    nvn_gpu_rc r = pp_pipe_get(d, mode, out, err, on, &probe);
+    if (on) {
+        uint64_t end = now_ns(), elapsed = end - t;
+        probe.v[PP_CALL] = 1; probe.v[PP_TOTAL_NS] = elapsed;
+        if (probe.kind == 1) { probe.v[PP_HIT] = 1; probe.v[PP_HIT_NS] = elapsed; pp_event(1, "hit"); }
+        else if (probe.kind == 2) { probe.v[PP_MISS] = 1; probe.v[PP_MISS_NS] = elapsed; pp_event(2, "miss"); }
+        else probe.v[PP_OTHER] = 1;
+        if (probe.v[PP_CREATE]) pp_event(4, "create");
+        if (probe.have_near) nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", probe.near);
+        pp_report(end, &probe);
+    }
+    return r;
 }
 
 nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {

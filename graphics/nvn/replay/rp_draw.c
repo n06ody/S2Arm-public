@@ -292,6 +292,16 @@ static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
 // OP_DRAW / OP_DRAW_IDX 共用。di 非空 = 带索引
 // 分时：一笔绘制里各步各花多久（累计到 rp_perf，上屏那边每 5 秒报一次）
 static uint64_t dt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+static void pipe_probe_replay(uint64_t start, uint64_t got, uint64_t end, unsigned attempts, int success) {
+    static uint64_t last, calls, gets, failed, get_ns, set_ns;
+    calls++; gets += attempts; failed += !success; get_ns += got - start; set_ns += end - got;
+    if (!last) { last = end; return; }
+    if (end - last < 5000000000ull) return;
+    char b[240]; snprintf(b, sizeof b, "pipeprobe replay %.3fs calls=%llu attempts=%llu failed=%llu get_ms=%.3f set_ms=%.3f",
+        (double)(end - last) / 1e9, (unsigned long long)calls, (unsigned long long)gets, (unsigned long long)failed, get_ns / 1e6, set_ns / 1e6);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b);
+    last = end; calls = gets = failed = get_ns = set_ns = 0;
+}
 #define DT(step) do { uint64_t n_ = dt_now(); rp_perf_add(step, n_ - dt_); dt_ = n_; } while (0)
 void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec) {
     if (!c) return;
@@ -422,15 +432,20 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         pd.depth_clamp = (uint8_t)(rp_S.depth_clamp != 0);
         nvn_gpu_pipe np = NULL; nvn_gpu_err err = {0};
         const uint64_t pg0_ = dt_now();
+        static int pp_on = -1; if (pp_on < 0) pp_on = nvn_plat_flag("nvk_pipeprobe", 0) != 0;
+        unsigned pp_attempts = 1;
         nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &np, &err);
         if (r.code == NVN_GPU_E_UNSUPPORTED && rp_S.poly.mode != NVN_POLYGON_MODE_FILL) {   // 设备没有点 / 线填充模式：记一笔，照旧按填充画（不让这笔绘制消失）
             nvn_unimpl("gpu", "polygon_mode_not_fill", rec);
             pd.poly.mode = NVN_POLYGON_MODE_FILL; memset(&err, 0, sizeof err);
+            pp_attempts++;
             r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &np, &err);
         }
-        if (!nvn_gpu_ok(r)) { if (nvn_unimpl("gpu", "pipe_get", rec) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why); g_skips++; g_pipe = NULL; goto draw_done; }
+        uint64_t pp_got = pp_on ? dt_now() : 0;
+        if (!nvn_gpu_ok(r)) { if (pp_on) pipe_probe_replay(pg0_, pp_got, pp_got, pp_attempts, 0); if (nvn_unimpl("gpu", "pipe_get", rec) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why); g_skips++; g_pipe = NULL; goto draw_done; }
         g_pipe = np; g_pipe_cmd = c;
         nvn_gpu_set_pipe(c, g_pipe); g_pipe_set = 1;
+        if (pp_on) pipe_probe_replay(pg0_, pp_got, dt_now(), pp_attempts, 1);
         rp_perf_add(RP_PERF_D_PGET, dt_now() - pg0_);   // 后端取管线 + 设管线（含在取管线那一项里）
         rp_args_dirty[0] = rp_args_dirty[1] = 1;   // 换了管线：两个阶段的绑定都重发
     }
