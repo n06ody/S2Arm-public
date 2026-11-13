@@ -1011,7 +1011,12 @@ static void nvk_program_compile_inner(struct s2a_vk_device *device, struct nvk_c
         return;
     }
     if (tex && tex->count) {
-        memcpy(in.textures, tex->items, sizeof in.textures);
+        if (tex->count < 0 || tex->count > NVK_TEXTURE_SET_MAX) {
+            entry->failed = 1;
+            snprintf(entry->why, sizeof entry->why, "texture facts exceed source capacity");
+            return;
+        }
+        memcpy(in.textures, tex->items, (size_t)tex->count * sizeof tex->items[0]);
         in.texture_count = tex->count;
     }
     in.request_id = ident;
