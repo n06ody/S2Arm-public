@@ -43,14 +43,16 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native;
 // S2A_TEST_NVK_DQ=1：整套用例在「两级回放开」下再跑一遍（run.sh 第二遍）
 // S2A_TEST_NVK_DQ=1：整套用例在「两级回放开」下再跑一遍；S2A_TEST_DESC_MEMO=1：在「描述符组备忘开」下再跑一遍
 // （备忘开着时内容相同的组不再分配，按「分配了几组」写的那几条期望在这一遍里不比，像素期望照比）。
-static int g_memo_on;
 static int g_shown_timing_test;
+static int g_memo_on, g_fbtrace_on = 1, g_fbtrace_logs, g_fbtrace_match_log, g_fbtrace_gap_log, g_fbtrace_cache_off;
 void nvn_plat_safepoint(void) {}
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C89（局中补写）：-1 = 用后端缺省；>= 0 = 把对应的调试开关读成这个值（后端在开会话时读一次，所以要在 open 之前设、open 之后撤）。
 static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
+    if (!strcmp(name, "nvk_fbtrace")) return g_fbtrace_on;
+    if (!strcmp(name, "nvk_pass_cache") && g_fbtrace_cache_off) return 0;
     if (!strcmp(name, "nvk_pipe_cache") && g_plc_flag_off) return 0;
     if (!strcmp(name, "nvk_plc_new") && g_plc_thr_new >= 0) return g_plc_thr_new;
     if (!strcmp(name, "nvk_plc_first_ms") && g_plc_thr_first_ms >= 0) return g_plc_thr_first_ms;
@@ -63,6 +65,9 @@ static int g_shown_empty_logged;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
     if (text && strstr(text, "分时（实际上屏）") && strstr(text, "帧率= ") && strstr(text, "扩展未启用或不支持")) g_shown_empty_logged++;
+    if (text && strstr(text, "fbtrace ")) g_fbtrace_logs++;
+    if (text && strstr(text, "fbtrace match win=1 ") && strstr(text, "finalize=1")) g_fbtrace_match_log++;
+    if (text && strstr(text, "fbtrace gap win=1 ") && strstr(text, "1=1")) g_fbtrace_gap_log++;
     printf("[%s] %s\n", cls ? cls : "", text ? text : "");
 }
 static int g_tri_origin_ul;   // 1 = 按 NVN 窗口原点在左上画（视口翻转）：期望上下对调。缺省 0 = 原点在左下（Vulkan 的自然方向）
@@ -3459,6 +3464,66 @@ static nvn_gpu_buf full_vb(void) {
     return make_buf(sizeof verts, NVN_GPU_MEM_SHARED, verts);
 }
 
+// 一次性探针测试缝；缺席时基线在“探针接入”断言红，不把链接失败当红。
+extern void nvn_gpu_fbtrace_release(nvn_gpu_view, unsigned) __attribute__((weak));
+extern void nvn_gpu_fbtrace_test_frame(void) __attribute__((weak));
+extern void nvn_gpu_fbtrace_test_snapshot(uint64_t out[16]) __attribute__((weak));
+extern void nvn_gpu_fbtrace_test_report(void) __attribute__((weak));
+extern void nvn_gpu_fbtrace_test_saturate(void) __attribute__((weak));
+
+static void fbtrace_run(int enabled) {
+    int wired = nvn_gpu_fbtrace_release && nvn_gpu_fbtrace_test_frame && nvn_gpu_fbtrace_test_snapshot && nvn_gpu_fbtrace_test_report && nvn_gpu_fbtrace_test_saturate;
+    CHECK(wired, "fbtrace 实际视图释放与 framebuffer 配对探针未接");
+    if (!wired) return;
+    nvn_gpu_tex tex = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view v = make_view(tex);
+    nvn_gpu_pass_desc p = {0}; p.ncolor = 1; p.color[0].view = v; p.color[0].store = NVN_GPU_STORE_STORE; p.w = p.h = 8; p.layers = 1;
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    nvn_gpu_fbtrace_release(v, 3);   // Finalize：图仍活着，附件只是换视图。
+    nvn_gpu_fbtrace_test_frame();
+    v = make_view(tex); p.color[0].view = v;
+    c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    uint64_t s[16] = {0}; nvn_gpu_fbtrace_test_snapshot(s);
+    CHECK(s[0] == (uint64_t)(enabled ? 2 : 0) && s[1] == (uint64_t)enabled && s[2] == (uint64_t)enabled &&
+          s[3] == (uint64_t)enabled && s[4] == (uint64_t)enabled,
+          "fbtrace 同图同附件一帧复建期望 create/drop/match/finalize/gap1=%d/%d/%d/%d/%d，实际 %llu/%llu/%llu/%llu/%llu",
+          enabled ? 2 : 0, enabled, enabled, enabled, enabled,
+          (unsigned long long)s[0], (unsigned long long)s[1], (unsigned long long)s[2], (unsigned long long)s[3], (unsigned long long)s[4]);
+    nvn_gpu_fbtrace_release(v, 1);
+    v = make_view(tex); p.color[0].view = v; p.w = 4;   // 尺寸不同，不是同键。
+    c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    nvn_gpu_fbtrace_release(v, 1);
+    for (int i = 0; i < 9; i++) nvn_gpu_fbtrace_test_frame();
+    v = make_view(tex); p.color[0].view = v;
+    c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    nvn_gpu_fbtrace_test_snapshot(s);
+    CHECK(s[2] == (uint64_t)enabled, "fbtrace 不同尺寸及超过 8 帧不能算复建，实际 %llu", (unsigned long long)s[2]);
+    nvn_gpu_fbtrace_release(v, 3); nvn_gpu_tex_release(tex);
+    tex = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); v = make_view(tex); p.color[0].view = v;
+    c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    nvn_gpu_fbtrace_test_snapshot(s);
+    CHECK(s[2] == (uint64_t)enabled, "fbtrace 不同图像代际不能算复建，实际 %llu", (unsigned long long)s[2]);
+    g_fbtrace_logs = g_fbtrace_match_log = g_fbtrace_gap_log = 0;
+    nvn_gpu_fbtrace_test_report();
+    CHECK(g_fbtrace_logs == 5 * enabled && g_fbtrace_match_log == enabled && g_fbtrace_gap_log == enabled,
+          "fbtrace 窗口原因与间隔输出不符：%d/%d/%d", g_fbtrace_logs, g_fbtrace_match_log, g_fbtrace_gap_log);
+    nvn_gpu_fbtrace_test_saturate(); nvn_gpu_fbtrace_test_snapshot(s);
+    CHECK(enabled ? s[5] > 0 : s[5] == 0, "fbtrace 历史满必须标截断，实际 %llu", (unsigned long long)s[5]);
+    nvn_gpu_fbtrace_release(v, 1); nvn_gpu_tex_release(tex);
+}
+
+// 通道缓存每 128 次重读开关；关缓存后的未缓存对象随 abort 同步销毁，也必须留键。
+static void fbtrace_uncached(void) {
+    if (!nvn_gpu_fbtrace_test_snapshot) { CHECK(0, "fbtrace uncached 缝缺席"); return; }
+    nvn_gpu_tex tex = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); nvn_gpu_view v = make_view(tex);
+    nvn_gpu_pass_desc p = {0}; p.ncolor = 1; p.color[0].view = v; p.color[0].store = NVN_GPU_STORE_STORE; p.w = p.h = 8; p.layers = 1;
+    for (int i = 0; i < 140; i++) { nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c); }
+    uint64_t s[16]; nvn_gpu_fbtrace_test_snapshot(s);
+    CHECK(s[6] > 0 && s[7] > 0 && s[8] > 0 && s[9] == 0, "fbtrace 关缓存后的退休/新建/复建/溢出=%llu/%llu/%llu/%llu",
+          (unsigned long long)s[6], (unsigned long long)s[7], (unsigned long long)s[8], (unsigned long long)s[9]);
+    nvn_gpu_fbtrace_release(v, 3); nvn_gpu_tex_release(tex);
+}
+
 // C56：FS push 常量。两次 push 两个颜色，两笔各画一半屏。
 // 手算：RGBA8 的 UNORM 量化 0.25*255=63.75→64、0.5*255=127.5→128、0.75*255=191.25→191。
 static void c56_push_fs(const char *dir) {
@@ -6519,6 +6584,13 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    fbtrace_run(1);
+    nvn_gpu_err trace_close = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &trace_close)), "fbtrace enabled close: %s", trace_close.why);
+    g_fbtrace_on = 0;
+    if (!open_backend()) return 1;
+    fbtrace_run(0);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &trace_close)), "fbtrace disabled close: %s", trace_close.why);
+    if (!open_backend()) return 1;
     poly_key_padding(argv[1]);
     c697_swapchain_images();
     c690_native_bc_image_copy(NVN_FORMAT_RGB_DXT1_SRGB, 8, 1);
@@ -6817,6 +6889,10 @@ int main(int argc, char **argv) {
 
     c88_pipe_cache(argv[1]);   // 每个会话自己开 / 关（带不同的 cache_dir）
     c89_midrun_save(argv[1]);  // 同上；还会起子进程（被 SIGKILL 的那一局）
+    g_fbtrace_on = 1; g_fbtrace_cache_off = 1;
+    if (!open_backend()) return 1;
+    fbtrace_uncached();
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "fbtrace uncached close：%s", e18.why);
 
     printf("nvn_gpu Vulkan 后端 C01–C08/C23/C25/C26/C27–C55/C56–C69/C74–C75/C88/C89 + 清屏/复制/深度/纹理三角形用例：%s（%d 处不符，done %d 次，retired %d 次）\n",
            g_fail ? "红" : "绿", g_fail, atomic_load(&g_ndone), atomic_load(&g_retired));

@@ -1,4 +1,5 @@
 #include "rp_res.h"
+#include "rp_fbtrace.h"
 #include "rp_exec.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -57,7 +58,7 @@ static struct { nvn_gpu_tex tex; nvn_gpu_view view; } g_zero[NVN_TEXTURE_TARGET_
 static int g_zero_cube_logged;
 
 // ---------- 登记 ----------
-static void treg_drop_view(treg_t *r) { if (r->view) { nvn_gpu_view_release(r->view); r->view = NULL; } r->of = NULL; }
+static void treg_drop_view(treg_t *r, unsigned why) { if (r->view) { rp_fbtrace_release(r->view, why); r->view = NULL; } r->of = NULL; }
 void nvn_be_set_tex_pool_n(int n) { pthread_mutex_lock(&g_rmu); g_tpool_n = n; pthread_mutex_unlock(&g_rmu); }
 void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20) || !t) return;
@@ -66,14 +67,14 @@ void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v) {
         memset(nr + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *nr); g_treg = nr; g_ntreg = n; }
     treg_t *r = &g_treg[id];
     int same = r->ok && r->t.serial == t->serial && r->has_v == (v != NULL) && (!v || !memcmp(&r->v, v, sizeof *v));
-    if (!same) treg_drop_view(r);
+    if (!same) treg_drop_view(r, FT_REGISTER);
     r->t = *t; r->has_v = v != NULL; if (v) r->v = *v; else memset(&r->v, 0, sizeof r->v); r->ok = 1;   // 只存快照：不建图、不建视图
     __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_rmu);
 }
 void nvn_be_unreg_tex_range(int base, int n) {
     pthread_mutex_lock(&g_rmu);
-    for (int i = base < 0 ? 0 : base; i < base + n && i < g_ntreg; i++) { treg_drop_view(&g_treg[i]); g_treg[i].ok = 0; }
+    for (int i = base < 0 ? 0 : base; i < base + n && i < g_ntreg; i++) { treg_drop_view(&g_treg[i], FT_REGISTER); g_treg[i].ok = 0; }
     __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_rmu);
 }
@@ -334,7 +335,7 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
             }
             nvn_hm_del(&g_alias, &k);   // 删除会挪动别的格：从头再扫
             vf_drop_of(x);
-            for (int r = 0; r < g_ntreg; r++) if (g_treg[r].of == x) treg_drop_view(&g_treg[r]);
+            for (int r = 0; r < g_ntreg; r++) if (g_treg[r].of == x) treg_drop_view(&g_treg[r], FT_ALIAS);
             nvn_gpu_tex_release(x->g); g_built--; free(x); g_ser_gen++; g_alias_taken++;
             again = 1; break;
         }
@@ -417,7 +418,7 @@ void rp_view_pin_end(void) {
     pthread_mutex_lock(&g_rmu);
     if (g_pin_depth > 0 && --g_pin_depth == 0) {
         g_pin_token++;
-        for (int i = 0; i < g_npin_tmp; i++) if (g_pin_tmp[i].view) nvn_gpu_view_release(g_pin_tmp[i].view);
+        for (int i = 0; i < g_npin_tmp; i++) if (g_pin_tmp[i].view) rp_fbtrace_release(g_pin_tmp[i].view, FT_TEMP);
         g_npin_tmp = 0;
         while (g_pinned_samps) {
             struct pinned_samp *pin = g_pinned_samps; g_pinned_samps = pin->next;
@@ -426,9 +427,9 @@ void rp_view_pin_end(void) {
     }
     pthread_mutex_unlock(&g_rmu);
 }
-static void vf_drop_of(const struct rp_tex *x) { for (int i = 0; i < VF_N; i++) if (g_vf[i].view && g_vf[i].of == x) { nvn_gpu_view_release(g_vf[i].view); memset(&g_vf[i], 0, sizeof g_vf[i]); } }   // 持 g_rmu
+static void vf_drop_of(const struct rp_tex *x) { for (int i = 0; i < VF_N; i++) if (g_vf[i].view && g_vf[i].of == x) { rp_fbtrace_release(g_vf[i].view, FT_ALIAS); memset(&g_vf[i], 0, sizeof g_vf[i]); } }   // 持 g_rmu
 static void vf_drop_serial(uint64_t serial) {   // 持 g_rmu
-    for (int i = 0; i < VF_N; i++) if (g_vf[i].view && (!serial || g_vf[i].serial == serial)) { nvn_gpu_view_release(g_vf[i].view); memset(&g_vf[i], 0, sizeof g_vf[i]); }
+    for (int i = 0; i < VF_N; i++) if (g_vf[i].view && (!serial || g_vf[i].serial == serial)) { rp_fbtrace_release(g_vf[i].view, serial ? FT_FINALIZE : FT_RESET); memset(&g_vf[i], 0, sizeof g_vf[i]); }
 }
 nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c) { g_attach_intent = 1; nvn_gpu_view o = rp_view_for(t, v, c); g_attach_intent = 0; return o; }
 int rp_tex_take_zero(const tex_t *t) {
@@ -466,9 +467,9 @@ nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c) {
         if (!ring) {
             nvn_gpu_view tv = NULL;
             if (nvn_gpu_ok(nvn_gpu_view_create(x->g, v, &tv, &err)) && g_npin_tmp < (int)(sizeof g_pin_tmp / sizeof g_pin_tmp[0])) { g_pin_tmp[g_npin_tmp++].view = tv; out = tv; }
-            else { if (tv) nvn_gpu_view_release(tv); if (nvn_unimpl("gpu", "view_pin_overflow", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why); }
+            else { if (tv) rp_fbtrace_release(tv, FT_TEMP); if (nvn_unimpl("gpu", "view_pin_overflow", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why); }
         } else {
-        if (g_vf[slot].view) nvn_gpu_view_release(g_vf[slot].view);
+        if (g_vf[slot].view) rp_fbtrace_release(g_vf[slot].view, hit >= 0 ? FT_STORAGE : FT_EVICT);
         memset(&g_vf[slot], 0, sizeof g_vf[slot]);
         rp_perf_add(RP_PERF_RES_VIEWMAKE, 1);
         if (nvn_gpu_ok(nvn_gpu_view_create(x->g, v, &g_vf[slot].view, &err))) { g_vf[slot].serial = t->serial; g_vf[slot].has_v = v != NULL; if (v) g_vf[slot].v = *v; g_vf[slot].of = x; out = g_vf[slot].view; if (g_pin_depth > 0) g_vf_seen[slot] = g_pin_token; }
@@ -527,7 +528,7 @@ nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t_out) {
     if (id < g_ntreg && g_treg[id].ok && g_treg[id].t.serial == t.serial) {
         treg_t *r = &g_treg[id];
         struct rp_tex *x = nvn_hm_get(&g_by_serial, &t.serial);
-        if (r->view && (r->gen != g_ser_gen) && r->of != x) treg_drop_view(r);   // 序号换了存储：旧视图作废
+        if (r->view && (r->gen != g_ser_gen) && r->of != x) treg_drop_view(r, FT_STORAGE);   // 序号换了存储：旧视图作废
         if (!r->view && x) {
             nvn_gpu_err err = {0};
             if (nvn_gpu_ok(nvn_gpu_view_create(x->g, has_v ? &v : NULL, &r->view, &err))) r->of = x;
@@ -672,10 +673,10 @@ nvn_gpu_samp rp_samp_by_id(int id) {
 
 void rp_res_reset(void) {
     pthread_mutex_lock(&g_rmu);
-    for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i]);
+    for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i], FT_RESET);
     vf_drop_serial(0);
     for (int target = 0; target <= NVN_TEXTURE_TARGET_BUFFER; target++) for (int cls = 0; cls < 4; cls++) {
-        if (g_zero[target][cls].view) nvn_gpu_view_release(g_zero[target][cls].view);
+        if (g_zero[target][cls].view) rp_fbtrace_release(g_zero[target][cls].view, FT_RESET);
         if (g_zero[target][cls].tex) nvn_gpu_tex_release(g_zero[target][cls].tex);
     }
     memset(g_zero, 0, sizeof g_zero); g_zero_cube_logged = 0;

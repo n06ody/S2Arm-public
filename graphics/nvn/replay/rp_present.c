@@ -4,6 +4,7 @@
 #include <time.h>
 #include "rp_exec.h"
 #include "rp_res.h"
+#include "rp_fbtrace.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_dirty.h"
@@ -82,7 +83,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     { struct timespec p0, p1; clock_gettime(CLOCK_MONOTONIC, &p0);
       r = nvn_gpu_present(g_surf, &dr, &d, ticket, on_shown, NULL, &err);
       clock_gettime(CLOCK_MONOTONIC, &p1); rp_perf_add(RP_PERF_PRESENT_NS, (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec); }
-    nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
+    rp_fbtrace_release(v, FT_PRESENT);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
