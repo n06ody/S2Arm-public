@@ -128,13 +128,14 @@ static void parse_dynamic(module_t *m) {
     m->nsym = (unsigned)(((const uint8_t *)m->strtab - (const uint8_t *)m->symtab) / sizeof(Elf64_Sym));
     build_symhash(m);
 }
-void *module_sym(module_t *m, const char *name) {
+static const Elf64_Sym *module_sym_ent(const module_t *m, const char *name) {   // 符号表条目（要 st_size 的地方用）；找不到回 NULL
     for (unsigned j = sym_hash(name) & m->symh_mask; m->symh[j]; j = (j + 1) & m->symh_mask) {
         const Elf64_Sym *s = &m->symtab[m->symh[j]];
-        if (!strcmp(m->strtab + s->st_name, name)) return m->base + s->st_value;
+        if (!strcmp(m->strtab + s->st_name, name)) return s;
     }
     return NULL;
 }
+void *module_sym(module_t *m, const char *name) { const Elf64_Sym *s = module_sym_ent(m, name); return s ? m->base + s->st_value : NULL; }
 void *guest_sym(const char *name) { for (int i = 0; i < g_nmod; i++) { void *p = module_sym(&g_mod[i], name); if (p) return p; } return NULL; }
 module_t *module_of(const void *p) {
     for (int i = 0; i < g_nmod; i++) {
@@ -899,15 +900,30 @@ static void *ro_local_init(void) {
 //   它把指向被卸模块的函数槽写回这个字段：ldr Xt, [x0, #偏移] 紧跟 str Xt, [Xn, Xm]。本机 11 份 SDK（10.x–20.x）都是 0xc8；读不出回 -1。
 //   老 SDK（11-13 一款第一方游戏）函数名是单数 RoModule::RestoreFunction、字段在 +0xb0，同样两条指令；
 //   更新的 SDK（11-13 两款 Switch 2 游戏）多一个回调参数 RestoreFunctions(RoModule*, void (*)(const char*))、开头先有一条 retab 早退，字段仍在 +0xc8：三个名字都认
+//   扫描范围按导出符号的 st_size 圈定 [入口, 入口 + st_size)：新 SDK 还有一种块布局把「表为空直接返回」的早退 ret（不是 retab）放在开头、那两条在后面
+//   （11-14 本机 6 款 sdk 里 4 款如此，原先遇第一条 ret 就停、回 -1，懒绑定入口没交接：卸 NRO 后主程序调它的函数跳 0）。
+//   st_size 为 0（符号没带大小）才退回遇 ret 即停；范围越出映像、或认出两个不同偏移就报红回 -1，不猜
 static long ro_stub_off(void) {
-    const uint32_t *f = guest_sym("_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_");
-    if (!f) f = guest_sym("_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_PFvPKcE");
-    if (!f) f = guest_sym("_ZN2nn2ro6detail8RoModule15RestoreFunctionEPS2_");
-    for (int i = 1; f && i < 0x100 && f[i - 1] != 0xd65f03c0; i++) {
+    static const char *const names[3] = {"_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_", "_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_PFvPKcE",
+                                         "_ZN2nn2ro6detail8RoModule15RestoreFunctionEPS2_"};
+    const module_t *m = NULL; const Elf64_Sym *e = NULL;
+    for (int k = 0; k < 3 && !e; k++) for (int i = 0; i < g_nmod && !e; i++) if ((e = module_sym_ent(&g_mod[i], names[k]))) m = &g_mod[i];
+    if (!e) return -1;
+    uint64_t n = e->st_size / 4, lim = n ? n : 0x100;
+    uint64_t end = m->patch_off < 0 ? m->image_size : m->key_page_off;   // 映像末（同 ro_handoff 的模块对象边界）
+    if (e->st_value + lim * 4 > end) { LOG("【红】nn::ro 交接：%s 的 RestoreFunctions（+%#llx，%llu 字节）越出模块映像，不读", m->name, (unsigned long long)e->st_value, (unsigned long long)e->st_size); return -1; }
+    const uint32_t *f = (const uint32_t *)(m->base + e->st_value);
+    long found = -1;
+    for (uint64_t i = 1; i < lim; i++) {
+        if (!n && f[i - 1] == 0xd65f03c0) break;
         uint32_t s = f[i], l = f[i - 1];
-        if ((s & 0xffe00c00) == 0xf8200800 && (l & 0xffc00000) == 0xf9400000 && ((l >> 5) & 31) == 0 && (l & 31) == (s & 31)) return (long)((l >> 10) & 0xfff) * 8;
+        if ((s & 0xffe00c00) == 0xf8200800 && (l & 0xffc00000) == 0xf9400000 && ((l >> 5) & 31) == 0 && (l & 31) == (s & 31)) {
+            long off = (long)((l >> 10) & 0xfff) * 8;
+            if (found >= 0 && off != found) { LOG("【红】nn::ro 交接：%s 的 RestoreFunctions 里认出两个懒绑定入口偏移（+%#lx / +%#lx），不猜", m->name, (unsigned long)found, (unsigned long)off); return -1; }
+            found = off;
+        }
     }
-    return -1;
+    return found;
 }
 static void ro_handoff(void) {
     g_nauto = g_nmod;
