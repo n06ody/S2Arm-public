@@ -234,7 +234,13 @@ namespace Ryujinx.Graphics.Shader.Translation
         /// 这时记录里有本体算出的值或多出的图元，抓顶点读取器给不出，不能走快路（不出 _bgs / _bgc）</summary>
         public bool S2APassthroughBodyOutputs { get; private set; }
 
-        public void SetNextStage(TranslatorContext nextStage)
+        public void SetNextStage(TranslatorContext nextStage) => SetNextStage(nextStage, false);
+
+        // 配对编译已持有真实下游阶段时，可按其实际输入建立输出接口，
+        // 避免独立缓存策略把原生 GS 输出扩到全部 32 个 location。
+        public void S2ASetNextStageActual(TranslatorContext nextStage) => SetNextStage(nextStage, true);
+
+        private void SetNextStage(TranslatorContext nextStage, bool actualNextStage)
         {
             bool linked = AttributeUsage.RequiresLinkedVaryingInterface;
             if (linked != nextStage.AttributeUsage.RequiresLinkedVaryingInterface)
@@ -242,7 +248,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 throw new InvalidOperationException("Linked shader stages must use the same effective varying policy.");
             }
 
-            if (!linked && S2AStageIndep && nextStage.Definitions.Stage == ShaderStage.Fragment && !nextStage._program.UsedFeatures.HasFlag(FeatureFlags.FixedFuncAttr))
+            if (!actualNextStage && !linked && S2AStageIndep && nextStage.Definitions.Stage == ShaderStage.Fragment && !nextStage._program.UsedFeatures.HasFlag(FeatureFlags.FixedFuncAttr))
             {
                 AttributeUsage.MergeAllGenericInputsForFragment(Definitions.GpPassthrough);   // S2A：顶点输出接口不看片元实际读哪些（见 AttributeUsage）
             }

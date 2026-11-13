@@ -105,7 +105,11 @@ namespace S2A.DirectCompiler
                         accessors.Add(accessor);
                         contexts.Add((stage, accessor, ShaderCache.DecodeGraphicsShader(accessor, TargetApi.Vulkan, ShaderCache.DefaultFlags, 0)));
                     }
-                    for (int i = contexts.Count - 2; i >= 0; i--) contexts[i].context.SetNextStage(contexts[i + 1].context);
+                    for (int i = contexts.Count - 2; i >= 0; i--)
+                    {
+                        if (contexts[i].stage.Stage == "gs") contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
+                        else contexts[i].context.SetNextStage(contexts[i + 1].context);
+                    }
                     foreach (var item in contexts) translated.Add((item.stage, item.context.Translate(), item.accessor));
                 }
             }

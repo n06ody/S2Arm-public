@@ -949,6 +949,8 @@ internal static unsafe class Program
                     var gsIn = ShaderInterface(stages[1], 1, stripVertexArray: true);
                     var gsOut = ShaderInterface(stages[1], 3);
                     var fsIn = ShaderInterface(stages[2], 1);
+                    Check(gsOut.Count == 1 && gsOut.ContainsKey(0),
+                        "native GS output follows actual FS inputs instead of all 32 independent-stage varyings");
                     Check(vsOut.TryGetValue(0, out string vsType) && gsIn.TryGetValue(0, out string gsInType) && vsType == gsInType,
                         "VS output matches GS input location 0 and type");
                     Check(gsOut.TryGetValue(0, out string gsOutType) && fsIn.TryGetValue(0, out string fsType) && gsOutType == fsType,
