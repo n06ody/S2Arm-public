@@ -792,7 +792,14 @@ static int32_t pool_nvmap(pool_t *p) {
     int32_t h = __atomic_load_n(&p->nvmap, __ATOMIC_ACQUIRE);
     if (h) return h;
     static int (*mk)(uint64_t, uint32_t); static int looked;
+#if defined(__ANDROID__)
+    // 安卓：服务层 NativeAOT 与本文件静态并入同一个 libs2arm_android.so，链接带 --exclude-libs,ALL，导出不进动态表，
+    //   dlsym(RTLD_DEFAULT) 恒为 NULL（010045B018EC2000：每局句柄 0，影片播放器 NvBlit 已释放的缓冲崩在 sdk 内）。
+    //   改成链接期弱引用：出包的单库里由归档解析（core-link 审计：归档定义的导出在库里仍未解析就失败）；不带服务层的门禁链接（gfx_plat/gate.sh，-z defs）里为空，走下面的报红
+    { extern int S2A_NvMapFromGuest(uint64_t address, uint32_t size) __attribute__((weak)); if (!looked) { mk = S2A_NvMapFromGuest; looked = 1; } }
+#else
     if (!looked) { mk = (int (*)(uint64_t, uint32_t))dlsym(RTLD_DEFAULT, "S2A_NvMapFromGuest"); looked = 1; }
+#endif
     if (!mk || p->size > UINT32_MAX) { static int once; if (!once++) LOG("【红】 nvnTextureGetNvRmSurfaceNVX: no nvmap handle for pool %p size %#llx (%s)", (void *)p, (unsigned long long)p->size, mk ? "pool over 4 GB" : "no service layer: S2A_NvMapFromGuest missing"); return 0; }
     h = mk((uint64_t)(uintptr_t)p->mem, (uint32_t)p->size);
     int32_t z = 0;

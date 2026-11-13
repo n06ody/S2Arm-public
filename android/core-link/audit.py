@@ -76,6 +76,51 @@ def symbols(nm, path, *, dynamic=False, include_local=False, include_all=False,
     return defined, undefined
 
 
+def elf_data_strings(library):
+    """NUL-delimited strings of the allocated, non-executable data sections of an ELF64 LE library.
+
+    Symbol tables (.dynstr / .dynsym / hash / version) are left out: a name there is a symbol, not a
+    literal the code can pass to dlsym. .symtab / .strtab are not allocated and are never read."""
+    data = Path(library).read_bytes()
+    if data[:4] != b"\x7fELF" or data[4:6] != b"\x02\x01":
+        raise AuditError("hidden-lookup scan needs an ELF64 little-endian library")
+    shoff = int.from_bytes(data[0x28:0x30], "little")
+    shentsize = int.from_bytes(data[0x3A:0x3C], "little")
+    shnum = int.from_bytes(data[0x3C:0x3E], "little")
+    shstrndx = int.from_bytes(data[0x3E:0x40], "little")
+    if not shoff or shentsize < 0x40 or shstrndx >= shnum:
+        raise AuditError("ELF library has no usable section header table")
+    def header(i):
+        h = data[shoff + i * shentsize: shoff + (i + 1) * shentsize]
+        return (int.from_bytes(h[0:4], "little"), int.from_bytes(h[4:8], "little"),
+                int.from_bytes(h[8:16], "little"), int.from_bytes(h[24:32], "little"),
+                int.from_bytes(h[32:40], "little"))
+    _, _, _, names_off, names_size = header(shstrndx)
+    names = data[names_off:names_off + names_size]
+    skip = {".dynstr", ".dynsym", ".gnu.hash", ".hash", ".gnu.version", ".gnu.version_r", ".gnu.version_d"}
+    strings = set()
+    for i in range(shnum):
+        name_off, kind, flags, offset, size = header(i)
+        name = names[name_off:names.index(b"\0", name_off)].decode("latin-1")
+        # SHF_ALLOC without SHF_EXECINSTR, and not SHT_NOBITS (.bss has no bytes in the file)
+        if not flags & 0x2 or flags & 0x4 or kind == 8 or name in skip:
+            continue
+        strings.update(part.decode("latin-1") for part in data[offset:offset + size].split(b"\0") if part)
+    return strings
+
+
+def hidden_runtime_lookups(library, managed_defined, local_defined, exported):
+    """Managed exports defined only as hidden symbols of this library whose exact name is also a data string.
+
+    The single Android library links the NativeAOT archive with --exclude-libs,ALL: its exports satisfy
+    direct references but are not in the dynamic table, so dlsym(RTLD_DEFAULT, "<name>") from native code
+    in the same library returns NULL (010045B018EC2000: hle_nvn.c looked up S2A_NvMapFromGuest that way,
+    got NULL on every Android run, gave the video player nvmap handle 0 and the game crashed in NvBlit).
+    Such a literal can only feed a lookup that cannot succeed; a direct reference is the working form."""
+    hidden = (managed_defined & local_defined) - exported
+    return sorted(hidden & elf_data_strings(library))
+
+
 def runtime_lookups(consumer_root):
     # This is an inventory of literal names, not a C# reachability/ABI proof.
     # A new nonliteral lookup must be reviewed; it is included as an unchecked
@@ -247,11 +292,17 @@ def audit(*, archive, library, source_list, source_root, consumer_root, nm, andr
     lookups, unchecked = runtime_lookups(consumer_root)
     missing = required - local_defined
     unresolved = required & local_undefined
+    hidden_lookups = []
+    if android_elf:
+        managed_all, _ = symbols(nm, archive, include_all=True)
+        hidden_lookups = hidden_runtime_lookups(library, managed_all, local_defined, exported)
+        # 原生对托管导出的弱引用（同库服务层的正确取法）必须在最终库里解析掉：归档定义了、库里还是 w / U，就是没链上
+        hidden_lookups += sorted(f"{name} (unresolved reference)" for name in managed_all & local_undefined)
     startup = startup_roots(nm, readelf, link_input_list, library, local_defined, local_undefined)
     native_identity = identity(library)
     if android_elf:
         native_identity["build_id"] = android_build_id(readelf, library)
-    link_complete = not missing and not unresolved and not startup["failures"]
+    link_complete = not missing and not unresolved and not startup["failures"] and not hidden_lookups
     return {
         "schema_version": 1,
         "scope": f"{provider_role}-link-only",
@@ -270,6 +321,7 @@ def audit(*, archive, library, source_list, source_root, consumer_root, nm, andr
                             for name, sites in sorted(lookups.items())],
         "unchecked_runtime_lookups": unchecked,
         "missing_runtime_exports": sorted(name for name in lookups if not export_visible(name)),
+        "hidden_runtime_lookups": hidden_lookups,
         "nativeaot_startup": startup,
         "service_entrypoints": {"S2A_Init": {"defined": ("_S2A_Init" if is_macho else "S2A_Init") in local_defined,
                                              "exported": export_visible("S2A_Init"),
@@ -314,6 +366,12 @@ def main():
                                  | set(report["unresolved_direct_symbols"]))))
         for failure in report["nativeaot_startup"]["failures"]:
             print(f"  {failure}")
+        for name in report["hidden_runtime_lookups"]:
+            if name.endswith(" (unresolved reference)"):
+                print(f"  【红】 native reference to a managed export left unresolved in the final library: {name}")
+            else:
+                print(f"  【红】 native runtime lookup of a hidden in-library managed export: {name} "
+                      f"(--exclude-libs,ALL keeps it out of the dynamic table; dlsym gets NULL — reference it directly)")
         return 1
     print(f"Android {report['provider_role']} link complete ({len(report['required_direct_symbols'])} imports); "
           f"game_ready=false; report: {report_path}")
