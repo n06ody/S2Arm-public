@@ -101,14 +101,14 @@ class ComputeProgram(unittest.TestCase):
         bad('unknown_kind',lambda c:c['bindings'][1].update(kind='future'))
         bad('wrong_binding_stage',lambda c:c['bindings'][1].update(stage='vs'))
         bad('duplicate_binding',lambda c:c['bindings'][1].update(set=0))
-        # FD_MAX_BINDINGS 按 producer 合同推导：1 + 2×(18 uniform + 16 storage + 64 texture + 16 image)
-        # = 229（图形程序固定 vs+fs 两阶段，再加 1 条全程序共享 support；compute 只 cs 一阶段
-        # 1+18+16=35，被同一上限覆盖）。17 条是 0100F2C0115B6000 实测的下限证据，不是上限；65/229 必须接受，
-        # 230 越过合同才准确失败——与 nvn_vk_program_binding_cap_test.c 的 cap=229 断言同源。
+        # FD_MAX_BINDINGS 按 producer 合同推导：1 + 3×(18 uniform + 16 storage + 64 texture + 16 image)
+        # = 343（图形程序固定 vs+fs+gs 三阶段，再加 1 条全程序共享 support；compute 只 cs 一阶段
+        # 1+18+16=35，被同一上限覆盖）。17 条是 0100F2C0115B6000 实测的下限证据，不是上限；65/343 必须接受，
+        # 344 越过合同才准确失败——与 nvn_vk_program_binding_cap_test.c 的 cap=343 断言同源。
         obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(17)];cases.append(('seventeen_bindings',obj,0))
         obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(65)];cases.append(('sixty_five_bindings',obj,0))
-        obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(229)];cases.append(('contract_max_bindings',obj,0))
-        obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(230)];cases.append(('over_contract_bindings',obj,1))
+        obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(343)];cases.append(('contract_max_bindings',obj,0))
+        obj=fixture();obj['content']['bindings']=[{'stage':'program','kind':'support','set':0,'binding':i,'count':1} for i in range(344)];cases.append(('over_contract_bindings',obj,1))
         bad('missing_mapping',lambda c:c['bindings'][1].pop('nvnSlot'))
         bad('wrong_guest_slot',lambda c:c['bindings'][1].update(nvnSlot=16))
         bad('legacy_translator_slot',lambda c:c['bindings'][1].update(slot=7))
@@ -170,7 +170,7 @@ class ComputeProgram(unittest.TestCase):
                     if label=='positive' and name=='uniform_c2_texture_bank':
                         self.assertIn('compute c2 texture-handle bank used as a uniform buffer is not implemented: set=0 binding=3',run.stdout)
                     if label=='positive' and name=='over_contract_bindings':
-                        # 230 条必须准确报“超出上限”，不是静默截断到 229（与 cap 测试同一判据）。
+                        # 344 条必须准确报“超出上限”，不是静默截断到 343（与 cap 测试同一判据）。
                         self.assertIn('compute binding count exceeds limit',run.stdout)
                     if label=='positive' and name in ('nvn0','nvn1','uboPtr1','sbufUbo'):
                         self.assertEqual(run.stdout.strip().split(' / ')[1], {'nvn0':'0,784,1,0,0','nvn1':'0,800,1,1,0','uboPtr1':'0,544,2,1,0','sbufUbo':'3,56,3,0,56'}[name])

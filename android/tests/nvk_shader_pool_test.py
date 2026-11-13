@@ -43,15 +43,31 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source):
+    def run(name, source, args=()):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *libs]
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
-        return subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+        return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30)
+
+    if len(sys.argv) == 6 and sys.argv[1] == '--emit-real':
+        result = run('emit-real', original, sys.argv[1:])
+        sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
 
     if sys.argv[1:] == ['--withdraw']:
         text = original.read_text(encoding='utf-8')
         changes = [
+            ('gs-source-epoch', 'MIX(s2a_source_epoch());', '(void)s2a_source_epoch();', 1, 'poisoned GS source cannot hit fast cache'),
+            ('gs-slot', '(const char *const[]){"vs", "fs", "gs"}[st]',
+             '(const char *const[]){"vs", "fs", "fs"}[st]', 2, 'GS production request reaches compiler'),
+            ('gs-wrong-stage', 'src.stage = (nvn_gpu_stage)st;',
+             'src.stage = st == 2 ? NVN_GPU_SH_FS : (nvn_gpu_stage)st;', 1, 'result loads VS FS and GS'),
+            ('gs-key-omitted', '((stages & 4u) ? 3 : 2)',
+             '((stages & 4u) ? 2 : 2)', 1, 'changed GS key recompiles'),
+            ('gs-texture-omitted', 'if (stages & 4u) MIX(rp_tex_fact_sig(rp_S.tex[2], 32, rp_S.tex_base, rp_S.tex_pool_n));',
+             'if (0) MIX(rp_tex_fact_sig(rp_S.tex[2], 32, rp_S.tex_base, rp_S.tex_pool_n));', 1, 'changed GS texture fact recompiles'),
+            ('gs-cap-ignored', 'if (!(caps.caps & NVN_GPU_CAP_GEOMETRY))',
+             'if (0 && !(caps.caps & NVN_GPU_CAP_GEOMETRY))', 1, 'disabled GS fails before compiler'),
             ('withdraw-guard', 'if (!shader_texture_pool_ready()) return -1;',
              'if (0 && !shader_texture_pool_ready()) return -1;', 2, 'expected accounting=texture_pool_over_limit'),
             ('wrong-gfx-length', 'in.texture_array_length = (uint32_t)rp_S.tex_pool_n;',
@@ -81,7 +97,7 @@ def main():
             result = run(name, path)
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 10 negative controls')
+        print('PASS: 16 negative controls')
         return 0
     if sys.argv[1:]:
         raise ValueError('usage: nvk_shader_pool_test.py [--withdraw]')

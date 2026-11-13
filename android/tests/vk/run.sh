@@ -13,10 +13,15 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
+mode=${1:-}
 if [ "$(uname -s)" = Darwin ]; then
+    export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
+    if [ -z "$mode" ]; then python3 "$repo/android/tests/gs_compiler_chain_test.py"; fi
     exec bash "$repo/tests/vulkan/run.sh" android/tests/vk/run.sh "$@"
 fi
-mode=${1:-}
+if [ -z "$mode" ] && [ ! -f "$repo/build/696-real-compiler/compiled/program.json" ]; then
+    python3 "$repo/android/tests/gs_compiler_chain_test.py"
+fi
 
 find_icd() {
     if [ -n "${S2A_LAVAPIPE_ICD:-}" ]; then printf '%s\n' "$S2A_LAVAPIPE_ICD"; return; fi
@@ -56,7 +61,7 @@ export TMPDIR="$repo/build/vk-tests"
 out=$(mktemp -d "$TMPDIR/s2a-nvn-vk.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 mkdir -p "$out/shaders"
-for s in tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert point.vert quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag; do
+for s in gs_probe.vert gs_probe.geom gs_probe.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert point.vert quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
 
@@ -68,11 +73,13 @@ inc=(-I "$repo/android/tests/vkhost"
      -I "$repo/graphics/nvn/gfx/nvn/include"
      -I "$repo/android/native"
      -I "$repo/android/native/nvn"
-     -I "$repo/android/native/direct")
+     -I "$repo/android/native/direct"
+     -I "$repo/runtime/include")
 src=("$repo/android/tests/vk/t_backend_vk.c"
      "$repo/android/native/nvn/backend_vulkan.c"
      "$repo/android/native/direct/vk_device.c"
      "$repo/android/native/direct/gs_path.c"
+     "$repo/android/native/capprobe/capprobe_host.c"
      "$repo/android/native/nvn/nvn_vk_format.c"
      "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c"
      "$repo/android/native/nvn/nvn_vk_bcdec.c")
@@ -82,17 +89,45 @@ bc_src=("$repo/android/tests/vk/t_bc_decode.c"
      "$repo/android/native/direct/gs_path.c"
      "$repo/graphics/nvn/gfx/tex/nvn_bcdec.c")
 # 与发行 APK 同一组建设备规则（android/CMakeLists.txt 的 nvn_vk 后端定义此宏）。
-cflags=(-std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
+cflags=(-D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
-    "") ;;
+    ""|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 
 echo "lavapipe: $icd"
 echo "validation: $layer"
-cc "${cflags[@]}" "${inc[@]}" "${src[@]}" -Wl,--wrap=vkAllocateDescriptorSets -Wl,--wrap=vkGetPhysicalDeviceFormatProperties -lvulkan -lpthread -lm -o "$out/t_backend_vk"
+if [ "$mode" = "--gs-core" ]; then
+    src=("$repo/android/tests/vk/t_replay_gs.c" "$repo/graphics/nvn/replay/rp_draw.c" "$repo/graphics/nvn/replay/rp_state.c" "$repo/graphics/nvn/replay/nvn_unimpl.c" "$repo/android/native/gfx_plat/nvk_shader.c"
+         "$repo/android/native/nvn/backend_vulkan.c" "$repo/android/native/direct/vk_device.c" "$repo/android/native/direct/gs_path.c" "$repo/android/native/capprobe/capprobe_host.c"
+         "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
+         "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c"
+         "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
+    cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
+fi
+# 负控只修改临时源副本，不关闭 validation，也不改设备特性。
+case "$mode" in
+    --gs-neg-stage|--gs-neg-flags|--gs-neg-cap)
+        python3 - "$mode" "${src[1]}" "$out/backend_mutant.c" <<'PYMUT'
+import pathlib, sys
+mode, source, target = sys.argv[1:]
+s = pathlib.Path(source).read_text()
+changes = {
+    '--gs-neg-stage': ('if (!d->st[st].sh) continue;', 'if (!d->st[st].sh || st == NVN_GPU_SH_GS) continue;'),
+    '--gs-neg-flags': ('if (m[i].stages & (1u << st)) b[nb].stageFlags |= vk_shader_stage((nvn_gpu_stage)st);', 'if (st != NVN_GPU_SH_GS && (m[i].stages & (1u << st))) b[nb].stageFlags |= vk_shader_stage((nvn_gpu_stage)st);'),
+    '--gs-neg-cap': ('if (s->stage == NVN_GPU_SH_GS && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))', 'if (0 && s->stage == NVN_GPU_SH_GS && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))'),
+}
+a, b = changes[mode]
+if s.count(a) != 1: raise SystemExit('mutation anchor changed: ' + mode)
+pathlib.Path(target).write_text(s.replace(a, b))
+PYMUT
+        src[1]="$out/backend_mutant.c" ;;
+esac
+cc "${cflags[@]}" "${inc[@]}" "${src[@]}" -Wl,--wrap=vkAllocateDescriptorSets -Wl,--wrap=vkGetPhysicalDeviceFormatProperties -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/t_backend_vk"
 
 export VK_DRIVER_FILES=$icd
 export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
@@ -113,6 +148,75 @@ if [ -n "${S2A_VK_PROFILE_LAYER_DIR:-}" ]; then
     export VK_INSTANCE_LAYERS=${VK_INSTANCE_LAYERS:+$VK_INSTANCE_LAYERS:}VK_LAYER_KHRONOS_profiles
 fi
 
+# 真实探测：独立进程执行控制、GS 单独和两个 GS+遮挡臂；只有四臂全 ok
+# 才生成供生产 gs_path 读取的结果。此判定是生产 verdict 的严格子集。
+cc -std=c11 -D_DEFAULT_SOURCE -DS2A_CAPPROBE_STANDALONE "${inc[@]}" \
+    "$repo/android/native/capprobe/capprobe.c" -lvulkan -o "$out/capprobe"
+timeout 90 "$out/capprobe" all --badlist "$repo/android/native/capprobe/known-bad.txt" > "$out/probe.jsonl"
+python3 - "$out/probe.jsonl" "$out/probe-result.json" <<'PYPROBE'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip().startswith('{')]
+fp = [r for r in rows if r.get('type') == 'fingerprint' and 'vendorID' in r and 'driverVersion' in r]
+arms = {r.get('arm'): r.get('outcome') for r in rows if r.get('type') == 'arm'}
+required = ('nogsocc', 'noq', 'occ', 'occimp')
+if len(fp) != 1 or any(arms.get(a) != 'ok' for a in required) or any(r.get('type') == 'blocked' for r in rows):
+    raise SystemExit('真实 GS 探测未通过: ' + repr(rows))
+print('真实 GS 探测：' + ', '.join(a + '=' + arms[a] for a in required))
+with open(sys.argv[2], 'w') as f:
+    json.dump({'source': 'probe', 'gs_occlusion': 'supported'}, f, separators=(',', ':'))
+PYPROBE
+export S2A_CAPPROBE_RESULT="$out/probe-result.json"
+
+if [ "$mode" = "--gs-core" ]; then
+    rm -rf "$repo/build/696-real-compiler/core-compiler"
+    set +e
+    timeout 60 "$out/t_backend_vk" "$repo/build/696-real-compiler" 2>&1 | tee "$out/gs-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gs-log"; then echo "【红】GS 核心整链 rc=$rc" >&2; exit 1; fi
+    echo '【绿】GS 核心整链 validation 0 条'; exit 0
+fi
+if [ "$mode" = "--gs-no-cap" ] || [ "$mode" = "--gs-neg-cap" ]; then
+    set +e
+    env -u S2A_CAPPROBE_RESULT timeout 60 "$out/t_backend_vk" "$out/shaders" --gs-no-cap 2>&1 | tee "$out/gs-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$mode" = "--gs-neg-cap" ]; then
+        if [ "$rc" -eq 0 ] || ! grep -q 'no capability refuses GS shader before Vulkan' "$out/gs-log"; then echo '【红】无能力负控未击中' >&2; exit 1; fi
+        echo 'PASS: 忽略无能力时目标断言红'; exit 0
+    fi
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gs-log"; then echo '【红】无探测拒绝失败' >&2; exit 1; fi
+    echo 'PASS: 无探测时 GS 未启用且 shader 拒绝'; exit 0
+fi
+if [ "$mode" = "--gs-neg-stage" ] || [ "$mode" = "--gs-neg-flags" ]; then
+    set +e
+    timeout 60 "$out/t_backend_vk" "$out/shaders" --gs-only > "$out/gs-log" 2>&1
+    rc=$?
+    set -e
+    mkdir -p "$repo/build/696-tests"
+    cp "$out/gs-log" "$repo/build/696-tests/${mode#--}.log"
+    if [ "$mode" = "--gs-neg-stage" ]; then expected='GS pass'; else expected='VUID-'; fi
+    if ! grep -q "$expected" "$out/gs-log" || { [ "$rc" -eq 0 ] && ! grep -qE 'Validation Error|VUID-' "$out/gs-log"; }; then
+        echo "【红】$mode 负控未击中预期" >&2; exit 1
+    fi
+    echo "PASS: $mode 命中预期红"; exit 0
+fi
+if [ "$mode" = "--gs-only" ] || [ "$mode" = "--gs-compiler" ]; then
+    shader_dir="$out/shaders"
+    if [ "$mode" = "--gs-compiler" ]; then shader_dir="$repo/build/696-real-compiler"; fi
+    set +e
+    timeout 60 "$out/t_backend_vk" "$shader_dir" "$mode" 2>&1 | tee "$out/gs-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    bad=$(grep -cE "Validation Error|VUID-" "$out/gs-log" || true)
+    if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ]; then
+        echo "【红】GS 用例 rc=$rc validation=$bad" >&2; exit 1
+    fi
+    echo "【绿】GS 用例：validation 0 条"
+    exit 0
+fi
+
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --gs-core; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_copy_t2b.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_clear_tex.sh"; fi
 

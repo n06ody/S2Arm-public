@@ -105,7 +105,7 @@ static int case_cap(void) {
 
     rc = parse_graphics(FD_MAX_BINDINGS + 1, &count, why, sizeof why);
     printf("  graphics %d bindings（上限+1）: rc=%d count=%d why=%s\n", FD_MAX_BINDINGS + 1, rc, count, rc ? why : "-");
-    if (rc == 0 || !strstr(why, "refusing to drop bindings") || !strstr(why, "cap is 229")) bad = 1;
+    if (rc == 0 || !strstr(why, "refusing to drop bindings") || !strstr(why, "cap is 343")) bad = 1;
 
     rc = parse_compute(65, &count, why, sizeof why);
     printf("  compute 65 bindings（旧常量 64 已不是判据）: rc=%d count=%d why=%s\n", rc, count, rc ? why : "-");

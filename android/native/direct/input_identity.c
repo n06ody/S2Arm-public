@@ -40,7 +40,7 @@ static void wflag(struct w *w, int v) { wu8(w, v ? 1 : 0); }
 
 int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf, size_t cap, size_t *len) {
     if (!in || !in->gfx || !in->translator_closure || !buf || !len) return -1;
-    if (in->texture_count < 0 || in->texture_count > 64) return -1;
+    if (in->texture_count < 0 || in->texture_count > 96) return -1;
     if (in->texture_count && !in->textures) return -1;
     // 阶段掩码只有 6 个 NVN 阶段位；每个已置位阶段都必须带完整源摘要与真实长度。
     if (!in->stage_mask || (in->stage_mask & ~0x3Fu)) return -1;
@@ -128,6 +128,7 @@ int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf,
         if (t->stage && !strcmp(t->stage, "vs")) stage_idx = 0;
         else if (t->stage && !strcmp(t->stage, "fs")) stage_idx = 1;
         else if (t->stage && !strcmp(t->stage, "cs")) stage_idx = 2;
+        else if (t->stage && !strcmp(t->stage, "gs")) stage_idx = 3;
         else return -1;   // 缺 stage 不等同 vs：NULL 与 "vs" 不能编成同一个输入
         uint8_t target_idx = 0;
         uint16_t format_idx = 0;

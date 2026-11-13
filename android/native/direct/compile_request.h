@@ -92,10 +92,10 @@ struct s2a_compile_request_input {
     size_t profile_bytes;
     int direct_abi;
     const char *translator_closure;
-    struct s2a_compile_stage_src stages[2];
+    struct s2a_compile_stage_src stages[3];
     int stage_count;
     struct s2a_compile_graphics_src gfx;
-    struct s2a_compile_texture_src textures[64];   // 真实绑定的纹理事实；0 条 = 没有可用来源
+    struct s2a_compile_texture_src textures[96];   // 真实绑定的纹理事实；0 条 = 没有可用来源
     int texture_count;
     uint32_t texture_array_length;  // 真实纹理描述符池容量；0 = 未知
     uint32_t sampler_array_length;  // 真实采样器描述符池容量；0 = 未知

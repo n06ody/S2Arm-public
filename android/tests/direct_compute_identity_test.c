@@ -74,7 +74,7 @@ int main(void) {
     in.compute_has_unaligned_ssbo = 1; in.compute_unaligned_ssbo = 2;
     CHECK(s2a_input_identity_encode(&in, out, sizeof out, &n) == -1, "invalid CS alignment rejected");
     in.compute_unaligned_ssbo = 1;
-    static const char *bad[] = {NULL, "", "unknown", "CS", "cs ", "gs"};
+    static const char *bad[] = {NULL, "", "unknown", "CS", "cs ", "tcs"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
         tex.stage = bad[i];
         n = 777;

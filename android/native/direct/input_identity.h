@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-// 容量按“最大内容”定，不是按常见内容定：64 条纹理事实 × 17 字节定长
-// + 32 条 attributeTypes / 8 条 fragmentOutputTypes 的最长名字 + 固定段 ≈ 2.3 KB。
+// 容量按“最大内容”定，不是按常见内容定：96 条纹理事实 × 17 字节定长
+// + 32 条 attributeTypes / 8 条 fragmentOutputTypes 的最长名字 + 固定段 加实际字符串长度。
 // 4096 留了余量；仍然溢出就是调用方给了超规格输入，编码返回 -1 由调用方明确失败。
 #define S2A_INPUT_IDENTITY_MAX 4096
 
