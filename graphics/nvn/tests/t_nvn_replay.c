@@ -24,9 +24,15 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static int g_slot_diag, g_slot_lines; static char g_slot_log[202][400];
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (cls && !strcmp(cls, "slotprobe") && g_slot_lines < 202) snprintf(g_slot_log[g_slot_lines++], sizeof g_slot_log[0], "%s", text);
+    if (level == NVN_PLAT_LOG_RED && strstr(text, "后续不同原因详情省略（最多8）")) g_arena_truncated_lines++;
+    if (level == NVN_PLAT_LOG_RED && strstr(text, "arena_alloc_failed rc=")) { if (g_arena_detail_lines < 32) snprintf(g_arena697_lines[g_arena_detail_lines], 256, "%s", text); g_arena_detail_lines++; snprintf(g_arena_detail, sizeof g_arena_detail, "%s", text); }
+    if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); }
+}
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
-int nvn_plat_flag(const char *name, int dflt) { if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag; return dflt; }
+int nvn_plat_flag(const char *name, int dflt) { if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag; if (!strcmp(name, "nvk_slot_probe")) return g_slot_diag; return dflt; }
 const char *nvn_plat_dir(int which) { (void)which; return NULL; }
 static int g_safepoints; void nvn_plat_safepoint(void) { g_safepoints++; }   // 平台安全点：数回放循环过了几次
 
@@ -76,7 +82,7 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn do
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
 // 贴图 / 视图 / 采样器 / 上传：只记账
 struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; }; struct nvn_gpu_samp_s { int x; };
-static int g_tex_creates, g_tex_releases, g_view_creates, g_view_releases, g_samp_creates, g_samp_releases, g_tex_create_fail;
+static int g_tex_creates, g_tex_releases, g_view_creates, g_view_releases, g_samp_creates, g_samp_releases, g_tex_create_fail, g_samp_create_fail;
 static int g_vid; static int g_released_id[8192]; static int g_nrel;   // 视图生命周期取证：每个视图一个递增 id，release 记下 id
 static int was_view_released(int rid) { for (int i = 0; i < g_nrel; i++) if (g_released_id[i] == rid) return 1; return 0; }
 static uint32_t g_last_usage; static uint16_t g_last_swz;
@@ -88,7 +94,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
 void nvn_gpu_tex_release(nvn_gpu_tex t) { g_tex_releases++; free(t); }
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err) { (void)err; g_view_creates++; g_vw_last_has = v != NULL; if (v) g_vw_last = *v; *out = calloc(1, sizeof **out); (*out)->of = t; (*out)->has_v = v != NULL; (*out)->rid = ++g_vid; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_view_release(nvn_gpu_view v) { g_view_releases++; if (v && g_nrel < 8192) g_released_id[g_nrel++] = v->rid; free(v); }
-nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) { (void)p; (void)err; g_samp_creates++; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
+nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) { (void)p; (void)err; g_samp_creates++; if (g_samp_create_fail) { *out = NULL; return (nvn_gpu_rc){NVN_GPU_E_OOM}; } *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
@@ -2510,6 +2516,50 @@ static void t_decl_sampling(void) {
 }
 
 // Two independent slots feed one sampled descriptor; slot 0 is a valid sampler handle.
+static void t_slot_probe(void) {
+    pass_fresh(); g_resolve_rc = 0; g_gdraws = 0; g_slot_lines = 0; g_slot_diag = 0;
+    stream init = {0}; q_env(&init);
+    tex_t t = mk_tex(7032, 0x4000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
+    nvn_be_reg_tex(7, &t, NULL);
+    g_fprog.nent[1] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[1][0];
+    e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = 0; e->src_reg2 = UINT16_MAX; e->count = 1;
+    p_bind_handles *b = put(&init, OP_BIND_TEX, sizeof *b); b->stage = 1; b->first = 0; b->n = 1; b->h[0] = 7 | (uint64_t)3 << 20;
+    q_draw(&init); end(&init); submit1(&init); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_slot_lines == 0 && g_gdraws == 0);
+    g_slot_diag = 1; rp_draw_reset();  // 会话开始时读取一次开关
+    stream again = {0}; q_draw(&again); q_draw(&again); end(&again); submit1(&again); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_slot_lines == 1);
+    CHECK(strstr(g_slot_log[0], "call=draw") && strstr(g_slot_log[0], "stage=1") && strstr(g_slot_log[0], "kind=sampler") && strstr(g_slot_log[0], "id=3"));
+    CHECK(strstr(g_slot_log[0], "shape=single") && strstr(g_slot_log[0], "table_limit=0") && strstr(g_slot_log[0], "registered=0") && strstr(g_slot_log[0], "create_failed=0"));
+    p_draw d = {.prim = 4, .count = 3, .instances = 1};
+    samp_par sp = {0}; nvn_be_reg_samp(3, &sp); g_samp_create_fail = 1;
+    rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_slot_lines == 2 && strstr(g_slot_log[1], "registered=1") && strstr(g_slot_log[1], "create_failed=1"));
+    g_samp_create_fail = 0;
+    rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_gdraws == 1 && g_slot_lines == 2);
+    rp_S.tex[1][0] = 99 | (uint64_t)3 << 20; rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_slot_lines == 3 && strstr(g_slot_log[2], "kind=texture") && strstr(g_slot_log[2], "id=99") && strstr(g_slot_log[2], "registered=0"));
+    e->count = 2; e->src_reg = 4; rp_S.tex[1][0] = 7 | (uint64_t)9 << 20; rp_S.tex[1][1] = 7 | (uint64_t)9 << 20;
+    rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_slot_lines == 4 && strstr(g_slot_log[3], "shape=array") && strstr(g_slot_log[3], "elem=0") && strstr(g_slot_log[3], "id=9"));
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+    g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_TEX_SAMP; g_cprog.ent[0][0].src_kind = NVN_RB_TEX;
+    g_cprog.ent[0][0].src_reg2 = UINT16_MAX; g_cprog.ent[0][0].count = 1; rp_S.tex[5][0] = 7 | (uint64_t)9 << 20;
+    p_dispatch dp = {.x = 1, .y = 1, .z = 1}; rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_slot_lines == 5 && strstr(g_slot_log[4], "call=compute") && strstr(g_slot_log[4], "stage=5") && strstr(g_slot_log[4], "id=9"));
+    e->count = 1; e->src_reg = 0; e->src_reg2 = 4; rp_S.tex[1][0] = 7;
+    rp_S.samp_bound[1][4] = 0; rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_slot_lines == 6 && strstr(g_slot_log[5], "separate=1") && strstr(g_slot_log[5], "sampler_bound=0") && strstr(g_slot_log[5], "registered=-1"));
+    rp_S.samp_bound[1][4] = 1; rp_S.samp[1][4] = (uint64_t)9 << 20; rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_slot_lines == 7 && strstr(g_slot_log[6], "sampler_bound=1") && strstr(g_slot_log[6], "id=9") && strstr(g_slot_log[6], "registered=0"));
+    e->src_reg2 = UINT16_MAX;
+    rp_draw_reset(); g_slot_lines = 0; e->count = 1; e->src_reg = 0;
+    for (int j = 0; j < 203; j++) { rp_S.tex[1][0] = 7 | (uint64_t)(100 + j) << 20; rp_draw(&g_fake_cmd, &d, NULL, NULL); }
+    CHECK(g_slot_lines == 201 && strstr(g_slot_log[200], "truncated=1 limit=200"));
+    nvn_be_tex_release(&t); g_slot_diag = 0; pass_fresh();
+}
+
 static void t_separate_sampler(void) {
     pass_fresh(); g_resolve_rc = 0; g_gdraws = 0; nvn_unimpl_reset();
     stream init = {0}; q_env(&init);
@@ -2607,6 +2657,7 @@ int main(int argc, char **argv) {
     t_gs_dirty_and_topology();
     t_gs_bind(); t_storage_sync_before_pass(); t_stage_dropped_clears_binds();
     t_decl_sampling();
+    t_slot_probe();
     t_separate_sampler();
     t_present();
     t_view_pin();
