@@ -52,6 +52,8 @@ static const struct { uint32_t target; const char *name; int layers_kind; } g_ta
     // RECTANGLE：上游 TextureTarget.Texture2DRect → ConvertSamplerType = Texture2D。
     // rect 的坐标空间就是纹素单位（不归一化），normalized 位按 0 出事实。
     { NVN_TEXTURE_TARGET_RECTANGLE, "2d", LAYERS_ONE },
+    // Append only: the table index is part of the persisted S2AI1 identity.
+    { NVN_TEXTURE_TARGET_BUFFER, "buffer", LAYERS_ONE },
 };
 
 // 身份编码用：名字 → 稳定小整数。未知名字返回 -1（编码方必须明确失败，不截断、不猜）。
@@ -106,6 +108,9 @@ static struct {
 int s2a_nvn_texture_fact(uint32_t nvn_format, uint32_t nvn_target, uint32_t layers,
                          struct s2a_nvn_texture_fact *out, char *why, size_t why_size) {
     if (!out) return -1;
+    // Existing producers cannot bind a texel-buffer view yet. Preserve their
+    // missing-fact rejection until the result and replay paths are connected.
+    if (nvn_target == NVN_TEXTURE_TARGET_BUFFER) { setwhy(why, why_size, "buffer texture execution is not implemented"); return -1; }
     {
         uint32_t h = (nvn_format * 2654435761u) ^ (nvn_target * 40503u) ^ (layers * 2246822519u);
         unsigned k = h % FACT_MEMO;
@@ -151,9 +156,20 @@ static int s2a_nvn_texture_fact_compute(uint32_t nvn_format, uint32_t nvn_target
     snprintf(out->format, sizeof out->format, "%s", fmt);
     snprintf(out->sampler_type, sizeof out->sampler_type, "%s", base);
     out->array_length = array_length;
-    out->is_buffer = 0;
+    out->is_buffer = nvn_target == NVN_TEXTURE_TARGET_BUFFER;
     // 坐标归一不归一只看有效目标（视图设了目标取视图的，否则取贴图的）：RECTANGLE 不归一，其余一律归一，与格式无关。
     // 依据同 graphics/nvn/gfx/nvn/nvn_unnorm.inc（从游戏自带的 NVN 驱动核出来的）。整数格式的二维贴图照样用归一化坐标采样。
     out->normalized = nvn_target != NVN_TEXTURE_TARGET_RECTANGLE;
     return 0;
+}
+
+int s2a_nvn_texture_buffer_fact(uint32_t nvn_format, struct s2a_nvn_texture_fact *out,
+                                char *why, size_t why_size) {
+    // This fact-only entry point is not used by production request producers:
+    // a BUFFER resource must not reach execution until its binding is supported.
+    if (nvn_format == S2A_NVN_FORMAT_UNKNOWN || !format_name(nvn_format)) {
+        setwhy(why, why_size, "buffer texture format is not mapped");
+        return -1;
+    }
+    return s2a_nvn_texture_fact_compute(nvn_format, NVN_TEXTURE_TARGET_BUFFER, 1, out, why, why_size);
 }
