@@ -326,6 +326,9 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_compute_identity_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_input_identity_mutation_test.py"
 # GS 扩容前后 VS / VS+FS / CS 规范身份逐字节一致，96 条事实不截断。
 s2a_gate_step "$PY" "$android_dir/tests/direct_input_identity_compat_test.py"
+# BUFFER 事实与规范身份；运行时绑定未接通前旧入口仍须拒绝。
+s2a_gate_step "$PY" "$android_dir/tests/tbuf_facts_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/tbuf_facts_test.py" --withdraw
 s2a_gate_step "$PY" "$android_dir/tests/w2_compute_program_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_compute_lookup_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_compute_request_test.py"
