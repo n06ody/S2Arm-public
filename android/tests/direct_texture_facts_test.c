@@ -73,7 +73,28 @@ int main(void) {
           "depth-stencil: format Unknown");
     { uint16_t ix = 0; CHECK(s2a_nvn_texture_format_index("Unknown", &ix) == 0 && ix == (uint16_t)(n - 1), "Unknown has an identity index, last in the table (earlier indices unchanged)"); }
     CHECK(s2a_nvn_texture_fact(NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_BUFFER, 1, &f, why, sizeof why) != 0,
-          "buffer textures are not mapped without a length fact");
+          "existing runtime producer rejects buffer until execution is connected");
+    {
+        const struct { uint32_t format; const char *name; } buffer_formats[] = {
+            { NVN_FORMAT_RGBA32F, "R32G32B32A32Float" }, { NVN_FORMAT_R32UI, "R32Uint" },
+            { NVN_FORMAT_RG32F, "R32G32Float" }, { NVN_FORMAT_RG16F, "R16G16Float" },
+        };
+        for (unsigned i = 0; i < sizeof buffer_formats / sizeof buffer_formats[0]; i++) {
+            memset(&f, 0, sizeof f);
+            CHECK(!s2a_nvn_texture_buffer_fact(buffer_formats[i].format, &f, why, sizeof why) &&
+                  !strcmp(f.sampler_type, "buffer") && !strcmp(f.format, buffer_formats[i].name) &&
+                  f.is_buffer == 1 && f.normalized == 1 && f.array_length == 1,
+                  "buffer fact retains target, format, normalization and one descriptor");
+        }
+        CHECK(s2a_nvn_texture_buffer_fact(NVN_FORMAT_RGBA8_UI2F, &f, why, sizeof why) != 0,
+              "buffer UI2F does not invent integer sampler semantics");
+        CHECK(s2a_nvn_texture_buffer_fact(S2A_NVN_FORMAT_UNKNOWN, &f, why, sizeof why) != 0,
+              "buffer texture format must have a real mapping");
+        CHECK(s2a_nvn_texture_buffer_fact(0x7fffffffu, &f, why, sizeof why) != 0,
+              "unsupported buffer texture format is rejected");
+        CHECK(s2a_nvn_texture_buffer_fact(NVN_FORMAT_R32UI, NULL, why, sizeof why) != 0,
+              "buffer fact rejects missing output");
+    }
     CHECK(s2a_nvn_texture_fact(NVN_FORMAT_RGBA8_UI2F, NVN_TEXTURE_TARGET_2D, 1, &f, why, sizeof why) != 0,
           "UI2F is not silently treated as Uint");
     CHECK(why[0] != 0, "rejections explain why");
