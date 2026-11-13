@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
     in.profile_json = pc.profile_json; in.profile_bytes = pc.profile_bytes;
     in.direct_abi = (int)pc.direct_abi; in.translator_closure = pc.translator_closure;
     in.stage_count = 2; in.gfx = gfx; in.texture_count = textures.count;
-    memcpy(in.textures, textures.items, sizeof in.textures);
+    memcpy(in.textures, textures.items, sizeof textures.items);
     in.texture_array_length = state.tex_pool_n; in.sampler_array_length = state.samp_pool_n;
     for (unsigned i = 0; i < 2; i++) {
         in.stages[i].stage = i ? "fs" : "vs";
