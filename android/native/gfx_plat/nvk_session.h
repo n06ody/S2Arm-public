@@ -9,6 +9,16 @@ extern "C" {
 #endif
 
 struct s2a_vk_device;
+// One budget for compile admission/retirement and device retirement, strictly below
+// the process watchdog. A caller may already have used part of that watchdog.
+#define NVK_SHUTDOWN_BUDGET_NS 700000000ull
+int nvk_session_prepare(void);
+void nvk_session_request_stop(void);
+int nvk_session_wait_compiles(void);
+uint64_t nvk_session_stop_deadline(void);
+void nvk_shader_stop(void);
+unsigned nvk_shader_inflight(void);
+int nvk_shader_open(void);
 // 打开：后端接管 dev（不另建、不拥有其寿命）。cache_dir 可为 NULL。0 = 成功；失败 why 写原因。
 int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why, size_t why_size);
 int nvk_session_ready(void);

@@ -7,12 +7,46 @@
 #include <android/log.h>
 #include <android/native_window.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define TAG "S2Arm"
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_ready;
+static _Atomic uint64_t g_stop_started;
+static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+void nvk_session_request_stop(void) {
+    uint64_t expected = 0, now = mono_ns();
+    atomic_compare_exchange_strong_explicit(&g_stop_started, &expected, now, memory_order_acq_rel, memory_order_acquire);
+    nvk_shader_stop();
+}
+uint64_t nvk_session_stop_deadline(void) {
+    uint64_t start = atomic_load_explicit(&g_stop_started, memory_order_acquire);
+    return start ? start + NVK_SHUTDOWN_BUDGET_NS : 0;
+}
+// Called while preparing an unpublished context, never concurrently with Stop.
+int nvk_session_prepare(void) {
+    if (nvk_shader_open()) return -1;
+    atomic_store_explicit(&g_stop_started, 0, memory_order_release);
+    return 0;
+}
+int nvk_session_wait_compiles(void) {
+    uint64_t deadline = nvk_session_stop_deadline();
+    uint64_t start = deadline - NVK_SHUTDOWN_BUDGET_NS;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop enter shader wait: elapsed=%llums in_flight=%u", (unsigned long long)((mono_ns() - start) / 1000000ull), nvk_shader_inflight());
+    while (nvk_shader_inflight()) {
+        uint64_t n = mono_ns();
+        if (n >= deadline) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk stop shader wait timeout: elapsed=%llums in_flight=%u (session retained)", (unsigned long long)((n - start) / 1000000ull), nvk_shader_inflight());
+            return -1;
+        }
+        struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop exit shader wait: elapsed=%llums in_flight=0", (unsigned long long)((mono_ns() - start) / 1000000ull));
+    return 0;
+}
 static void *g_window; static uint64_t g_window_gen; static int32_t g_win_w, g_win_h;
 static char g_cache_dir[512];
 static nvn_gpu_surface g_surface;
