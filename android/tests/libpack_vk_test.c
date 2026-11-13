@@ -18,6 +18,7 @@
 
 #include "direct/libpack_vk.h"
 #include "nvn/nvn_vk_program_result.h"
+#include "libpack_texture_spirv.h"
 
 static int fails;
 #define CHECK(cond, what) do { if (!(cond)) { printf("FAIL: %s\n", (what)); fails++; } } while (0)
@@ -67,8 +68,6 @@ static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], siz
     return 0;
 }
 
-static const uint8_t SPV[20] = { 0x03, 0x02, 0x23, 0x07, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0 };
-
 static const char *VS_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
     "{\"msl_name\":\"vp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
@@ -84,17 +83,28 @@ static const char *PS_JSON =
     "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
     "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
 
+static const char *VS_BUFFER_JSON =
+    "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
+    "{\"msl_name\":\"vp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+    "{\"msl_name\":\"vp_s0\",\"kind\":\"sbuf\",\"index\":0,\"reg\":7,\"rw\":true,\"arg_id\":1},"
+    "{\"msl_name\":\"vp_t_tcb_8\",\"kind\":\"tbuf\",\"reg\":5,\"arg_id\":2},"
+    "{\"msl_name\":\"vp_t_tcb_8Smplr\",\"kind\":\"samp_tex\",\"reg\":5,\"arg_id\":3},"
+    "{\"msl_name\":\"gal_ubo_len\",\"kind\":\"ubolen\",\"arg_id\":4}],"
+    "\"vertex_inputs\":[{\"location\":1},{\"location\":3}]}";
+
 static int has(const uint8_t *j, const char *sub) { return j && strstr((const char *)j, sub) != NULL; }
 
 int main(void) {
-    char tmpl[] = "/tmp/libpack_vk_test.XXXXXX";
-    CHECK(mkdtemp(tmpl) != NULL, "mkdtemp");
+    const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
+    char tmpl[320];
+    if (snprintf(tmpl, sizeof tmpl, "%s/libpack_vk_test.XXXXXX", tmp) >= (int)sizeof tmpl || !mkdtemp(tmpl)) return 1;
     snprintf(g_dir, sizeof g_dir, "%s", tmpl);
 
     // ---- 缺席目录 / 坏 lib.idx ----
     {
         struct s2a_libpack *lp = (void *)1;
-        CHECK(s2a_libpack_open(&lp, "/tmp/definitely-no-such-libpack-dir") == 0, "absent dir → open 0 (none)");
+        char absent[400]; snprintf(absent, sizeof absent, "%s/absent", tmpl);
+        CHECK(s2a_libpack_open(&lp, absent) == 0, "absent dir → open 0 (none)");
         snprintf(g_dir, sizeof g_dir, "%s/bad", tmpl);
         mkdir(g_dir, 0700);
         char p[400]; snprintf(p, sizeof p, "%s/lib.idx", g_dir);
@@ -108,13 +118,13 @@ int main(void) {
         "{\"key\":\"aabbccddeeff0011_b\",\"stage\":\"vs\",\"dm_ctl\":\"aabbccddeeff0011\",\"bindings\":[]}";
     struct trec recs[5] = {
         { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-        { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+        { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
         { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(PS_JSON) },
-        { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof SPV },
+        { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
         { .key = 0xaabbccddeeff0011, .kind = 1,  .len = (uint32_t)strlen(ORPHAN_JSON) },
     };
-    const uint8_t *pl[5] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)PS_JSON, SPV, (const uint8_t *)ORPHAN_JSON };
-    size_t pln[5] = { strlen(VS_JSON), sizeof SPV, strlen(PS_JSON), sizeof SPV, strlen(ORPHAN_JSON) };
+    const uint8_t *pl[5] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)PS_JSON, libpack_frag_spv, (const uint8_t *)ORPHAN_JSON };
+    size_t pln[5] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(PS_JSON), sizeof libpack_frag_spv, strlen(ORPHAN_JSON) };
     CHECK(mk_pack(recs, 5, pl, pln, 1) == 0, "fixture pack written");
 
     struct s2a_libpack *lp = NULL;
@@ -127,7 +137,7 @@ int main(void) {
         CHECK(s2a_libpack_get(lp, k, 1, &b, &n, w, sizeof w) == 0 && n == strlen(VS_JSON) && !memcmp(b, VS_JSON, n),
               "get kind1 → bytes identical");
         free(b); b = NULL;
-        CHECK(s2a_libpack_get(lp, k, 52, &b, &n, w, sizeof w) == 0 && n == sizeof SPV && !memcmp(b, SPV, n),
+        CHECK(s2a_libpack_get(lp, k, 52, &b, &n, w, sizeof w) == 0 && n == sizeof libpack_vert_spv && !memcmp(b, libpack_vert_spv, n),
               "get kind52 → spv bytes identical");
         free(b); b = NULL;
         CHECK(s2a_libpack_get(lp, k, 0, &b, &n, w, sizeof w) == 1 && !b, "absent kind → MISS");
@@ -179,7 +189,7 @@ int main(void) {
             CHECK(nvn_vk_program_parse_graphics(j, jl, &p, pw, sizeof pw) == 0,
                   "合成 v1 过 nvn_vk_program_parse_graphics");
             CHECK(p.stage[0].present && p.stage[1].present &&
-                  p.stage[0].spirv_bytes == 20 && p.stage[0].attr_mask == 10,
+                  p.stage[0].spirv_bytes == sizeof libpack_vert_spv && p.stage[0].attr_mask == 10,
                   "fd vs+fs present + spirv + attr_mask=10");
             CHECK(p.binding_count == 7, "5+3 条反射 -1 采样器半边 = 7 条 v1 绑定");
             struct fd_binding *b0 = NULL, *b6 = NULL, *b12 = NULL, *b24 = NULL, *b10 = NULL, *b16 = NULL;
@@ -195,7 +205,7 @@ int main(void) {
                   "fd cbuf → uniform slot3 ubo0 vs");
             CHECK(b6 && b6->kind == 1 && b6->storage_kind == 1 && b6->storage_slot == 7 && b6->storage_writable == 1,
                   "fd sbuf → storage_kind1 slot7 writable");
-            CHECK(b12 && b12->kind == 2 && b12->tex_slot == 5,
+            CHECK(b12 && b12->kind == 2 && b12->tex_slot == 5 && !b12->texel_buffer,
                   "fd tex → texture tex_slot=5（slot18→byte0x48→(0x48-0x20)/8 回环）");
             CHECK(b24 && b24->kind == 0 && b24->slot == -1, "fd ubolen → uniform 无槽（slot=-1）");
             // sep-tex 回环：slot90→byte0x168→int8 128 溢出负值 → tex_slot<0（独立纹理不属
@@ -207,6 +217,45 @@ int main(void) {
             nvn_vk_program_free(&p);
         }
         free(j);
+    }
+
+    // The offline adapter emits kind=texture for both tex and tbuf, with no
+    // source field. A real Buffer SPIR-V descriptor must still classify as TBUF.
+    {
+        snprintf(g_dir, sizeof g_dir, "%s/buffer", tmpl);
+        CHECK(mkdir(g_dir, 0700) == 0, "create separate buffer pack directory");
+        struct trec rb[4] = {
+            { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(VS_BUFFER_JSON) },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_buffer_vert_spv },
+            { .key = 0x1032547698badcfe, .kind = 1, .len = (uint32_t)strlen(PS_JSON) },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
+        };
+        const uint8_t *pb[4] = { (const uint8_t *)VS_BUFFER_JSON, libpack_buffer_vert_spv,
+                                 (const uint8_t *)PS_JSON, libpack_frag_spv };
+        size_t nb[4] = { strlen(VS_BUFFER_JSON), sizeof libpack_buffer_vert_spv,
+                         strlen(PS_JSON), sizeof libpack_frag_spv };
+        CHECK(mk_pack(rb, 4, pb, nb, 1) == 0, "buffer pack written");
+        struct s2a_libpack *buflp = NULL; uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
+        uint8_t keys[6][8] = {{0}};
+        const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+        const uint8_t kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
+        memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
+        CHECK(s2a_libpack_open(&buflp, g_dir) == 1 && buflp, "open buffer pack");
+        int rc = buflp ? s2a_libpack_program_v1(buflp, keys, 3, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
+        CHECK(rc == 0 && j && !has(j, "\"source\":"), "buffer reflection becomes source-free v1 program");
+        struct fd_program parsed = {0}; char why[192] = "";
+        int parsed_rc = j ? nvn_vk_program_parse_graphics(j, jl, &parsed, why, sizeof why) : -1;
+        CHECK(parsed_rc == 0, "real source-free libpack buffer parses");
+        const struct fd_binding *buffer = NULL;
+        for (int i = 0; i < parsed.binding_count; i++)
+            if (!strcmp(parsed.bindings[i].stage, "vs") && parsed.bindings[i].set == 0 && parsed.bindings[i].binding == 12)
+                buffer = &parsed.bindings[i];
+        CHECK(buffer && buffer->kind == 2 && buffer->texel_buffer && buffer->tex_slot == 5 && buffer->count == 1,
+              "real offline TBUF preserved at VS combined texture slot 5");
+        nvn_vk_program_free(&parsed); free(j); s2a_libpack_close(buflp);
+        char path[400]; snprintf(path, sizeof path, "%s/lib.idx", g_dir); unlink(path);
+        snprintf(path, sizeof path, "%s/lib.000.pak", g_dir); unlink(path); rmdir(g_dir);
+        snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     }
 
     // ---- miss：缺席键 / 非 vs+fs 形状 / 缺 spv 的键 ----
@@ -243,12 +292,12 @@ int main(void) {
         const char *bad = "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"ffffffffffffffff\",\"bindings\":[]}";
         struct trec r2[4] = {
             { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
             { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(bad) },
-            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof SPV },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
         };
-        const uint8_t *p2[4] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)bad, SPV };
-        size_t n2[4] = { strlen(VS_JSON), sizeof SPV, strlen(bad), sizeof SPV };
+        const uint8_t *p2[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)bad, libpack_frag_spv };
+        size_t n2[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(bad), sizeof libpack_frag_spv };
         CHECK(mk_pack(r2, 4, p2, n2, 1) == 0, "dm_ctl-mismatch pack written");
         struct s2a_libpack *l2 = NULL;
         CHECK(s2a_libpack_open(&l2, g_dir) == 1, "open mismatch pack");
@@ -257,15 +306,15 @@ int main(void) {
         s2a_libpack_close(l2);
 
         // fs 键的 spv 头坏（magic 不对）
-        uint8_t badspv[20]; memcpy(badspv, SPV, sizeof SPV); badspv[0] = 0xAA;
+        uint8_t badspv[20]; memcpy(badspv, libpack_frag_spv, sizeof badspv); badspv[0] = 0xAA;
         struct trec r3[4] = {
             { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(VS_JSON) },
-            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof SPV },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
             { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(PS_JSON) },
             { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof badspv },
         };
-        const uint8_t *p3[4] = { (const uint8_t *)VS_JSON, SPV, (const uint8_t *)PS_JSON, badspv };
-        size_t n3[4] = { strlen(VS_JSON), sizeof SPV, strlen(PS_JSON), sizeof badspv };
+        const uint8_t *p3[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)PS_JSON, badspv };
+        size_t n3[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(PS_JSON), sizeof badspv };
         CHECK(mk_pack(r3, 4, p3, n3, 1) == 0, "bad-spv pack written");
         l2 = NULL;
         CHECK(s2a_libpack_open(&l2, g_dir) == 1, "open bad-spv pack");
@@ -289,7 +338,12 @@ int main(void) {
     }
 
     s2a_libpack_close(lp);
-    char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmpl); (void)system(cmd);
+    char cleanup[400];
+    snprintf(cleanup, sizeof cleanup, "%s/lib.idx", tmpl); unlink(cleanup);
+    snprintf(cleanup, sizeof cleanup, "%s/lib.000.pak", tmpl); unlink(cleanup);
+    snprintf(cleanup, sizeof cleanup, "%s/bad/lib.idx", tmpl); unlink(cleanup);
+    snprintf(cleanup, sizeof cleanup, "%s/bad", tmpl); rmdir(cleanup);
+    rmdir(tmpl);
     if (fails) { printf("libpack_vk_test: %d FAIL\n", fails); return 1; }
     printf("libpack_vk_test: all checks passed\n");
     return 0;

@@ -45,6 +45,7 @@ struct fd_binding {
     int8_t stage_idx;         // 0=vs 1=fs 2=gs 3=tcs 4=tes 5=cs，-1 = 其它/未知
     int16_t tex_slot;         // 组合槽 0..31 或分离贴图槽 128..255；-1 = 未解析
     int16_t samp_slot;        // -1 = 组合句柄；0..127 = 分离采样器来源槽
+    uint8_t texel_buffer;     // 真实 SPIR-V 证明该 texture 是只读 Buffer；不是普通采样图像
     int16_t ubo_slot;         // kind==0 的 NVN 用户槽（cbuf - 3，clamp 到 0）
     uint8_t is_support;       // kind==0 且 stage=="program"（SupportBuffer）
     // kind==1 的地址来源（编译期从 ShaderProgramInfo.SBuffers 解析）：
