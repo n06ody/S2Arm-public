@@ -9,5 +9,7 @@ native-test-ro_lazy: $(BUILD)/tests/t_ro_lazy
 	$(BUILD)/tests/t_ro_lazy $(BUILD)/tests/ro_lazy
 	python3 runtime/tests/ro_lazy/prepare.py $(BUILD)/tests/ro_lazy_old old   # 老 SDK 形态（单数 RestoreFunction、+0xb0）
 	$(BUILD)/tests/t_ro_lazy $(BUILD)/tests/ro_lazy_old
+	python3 runtime/tests/ro_lazy/prepare.py $(BUILD)/tests/ro_lazy_early early   # 新 SDK 早退在前的块布局（RestoreFunctions 第 2 条就是 ret）
+	$(BUILD)/tests/t_ro_lazy $(BUILD)/tests/ro_lazy_early
 TEST_TARGETS += native-test-ro_lazy
 endif

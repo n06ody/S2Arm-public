@@ -8,8 +8,11 @@
   只读 0x1000 MOD0（+0x18 = 模块对象相对 MOD0 的偏移 → 数据 0x2100）、0x1300 动态段（DT_JMPREL / DT_PLTRELSZ / DT_PLTGOT = 0x2000）、
        0x1500 一条 JUMP_SLOT（槽 0x2018 = GOT[3] → target）、0x1600 符号表、紧跟字符串表
   数据 0x2000 GOT（GOT[3] 文件原值 0x200 = PLT 表头）、0x2100 模块对象（0xd0 字节）、0x2200 起五个交接全局
-用法：prepare.py <输出目录> [old]；输出目录写 main.* 改写产物，另写 layout.tsv（单测读的期望偏移）
-  old：老 SDK 的形态（11-13 一款第一方游戏的 SDK）——函数名单数 RoModule::RestoreFunction、懒绑定入口字段在 +0xb0（新 SDK 复数名、+0xc8）"""
+用法：prepare.py <输出目录> [old|early]；输出目录写 main.* 改写产物，另写 layout.tsv（单测读的期望偏移）
+  old：老 SDK 的形态（11-13 一款第一方游戏的 SDK）——函数名单数 RoModule::RestoreFunction、懒绑定入口字段在 +0xb0（新 SDK 复数名、+0xc8）
+  early：新 SDK 另一种块布局（11-14 本机 6 款里 4 款的 sdk 如此）——RestoreFunctions 开头先是「表为空直接返回」的早退 ret，
+         ldr / str 在它后面：cbnz x1, +8; ret; ldr x8,[x0,#0xc8]; str x8,[x12,x13]; ret
+  各函数符号的 st_size 写真实长度（SDK 导出的函数符号带真实大小，交接按它圈定扫描范围）"""
 import os
 from pathlib import Path
 import shutil
@@ -19,7 +22,9 @@ import sys
 
 root = Path(__file__).resolve().parents[3]
 out = Path(sys.argv[1]).resolve()
-OLD = len(sys.argv) > 2 and sys.argv[2] == 'old'
+MODE = sys.argv[2] if len(sys.argv) > 2 else ''
+assert MODE in ('', 'old', 'early'), MODE
+OLD = MODE == 'old'
 STUB = 0xb0 if OLD else 0xc8   # 模块对象里懒绑定入口字段的偏移
 shutil.rmtree(out, ignore_errors=True); out.mkdir(parents=True)
 RET = 0xd65f03c0
@@ -29,13 +34,16 @@ GOT, OBJ, GLOBALS = DATA, DATA + 0x100, DATA + 0x200
 SLOT = GOT + 0x18
 
 text = bytearray(0x1000)
+code_size = {}   # 函数入口 → 真实字节数（写进符号的 st_size）
 struct.pack_into('<II', text, 0, 0x14000040, RO)   # 入口跳过表头；text[4] = MOD0 偏移
 for off, code in ((TARGET, [0x528000e0, RET]),                          # mov w0, #7
                   (PLT0, [0xa9bf7bf0, RET]),                            # stp x16, x30, [sp, #-16]!
                   (INIT, [0xf9000801, 0xf9000c03, 0xf900001f | (STUB // 8) << 10, RET]),   # str x1,[x0,#0x10]; str x3,[x0,#0x18]; str xzr,[x0,#STUB]
-                  (RESTORE, [0xf9400008 | (STUB // 8) << 10, 0xf82d6988, RET]),         # ldr x8,[x0,#STUB]; str x8,[x12,x13]
+                  (RESTORE, ([0xb5000041, RET] if MODE == 'early' else [])   # early：cbnz x1, +8; ret（早退路径在前）
+                            + [0xf9400008 | (STUB // 8) << 10, 0xf82d6988, RET]),         # ldr x8,[x0,#STUB]; str x8,[x12,x13]
                   (BIND, [RET])):
     struct.pack_into('<%dI' % len(code), text, off, *code)
+    code_size[off] = 4 * len(code)
 
 ro = bytearray(0x1000)
 EH, EF, DYN, RELA, SYM = 0x100, 0x200, 0x300, 0x500, 0x600
@@ -57,7 +65,7 @@ names = [('target', 0x12, 1, TARGET),
          ('_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE', 0x11, 3, GLOBALS + 0x20)]
 strings = bytearray(b'\0'); syms = [bytes(24)]
 for name, info, shndx, value in names:
-    syms.append(struct.pack('<IBBHQQ', len(strings), info, 0, shndx, value, 8)); strings += name.encode() + b'\0'
+    syms.append(struct.pack('<IBBHQQ', len(strings), info, 0, shndx, value, code_size[value] if shndx == 1 else 8)); strings += name.encode() + b'\0'
 symtab = b''.join(syms); STR = SYM + len(symtab)
 assert STR + len(strings) <= 0x1000
 ro[SYM:STR] = symtab; ro[STR:STR + len(strings)] = strings
