@@ -49,6 +49,23 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30)
 
+    if sys.argv[1:] == ['--probe-withdraw']:
+        text = original.read_text(encoding='utf-8')
+        changes = [
+            ('probe-written', 'rp_S.tex_diag_written[st][slot], id,', '0, id,', 'zero handle explicitly written remains distinguishable'),
+            ('probe-request', 'req = fact_probe_request(json, len, stage, (unsigned)word);', 'req = 0; (void)fact_probe_request(json, len, stage, (unsigned)word);', 'probe tests serialized request fact'),
+            ('probe-cap', 'g_fact_truncated = 1; nvn_plat_log', 'g_fact_truncated = 1; if (0) nvn_plat_log', 'probe caps distinct coordinates and marks truncation'),
+        ]
+        for name, before, after, expected in changes:
+            assert text.count(before) == 1, (name, 'mutation anchor')
+            path = out/(name+'.c')
+            path.write_text(text.replace(before, after), encoding='utf-8')
+            result = run(name, path)
+            assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print(f'PASS: {len(changes)} probe negative controls')
+        return 0
+
     if sys.argv[1:] == ['--legacy-compare']:
         # Compare actual unchanged legacy REQUEST and S2AI1 bytes against merge-base.
         base_sha = subprocess.check_output(['git', 'merge-base', 'HEAD', 'origin/main'], cwd=ROOT, text=True).strip()

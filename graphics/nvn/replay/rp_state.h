@@ -17,6 +17,8 @@ struct rp_state {
     NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][16], ssbo[6][16];
     uint64_t tex[6][RP_NTEX], samp[6][128], img[6][32];
+    uint8_t tex_diag_written[6][128]; // 一次性探针：分离贴图槽曾收到绑定，零句柄也算
+    uint8_t tex_diag_enabled;         // 会话启动时读取一次诊断开关
     uint8_t samp_bound[6][128]; // 显式绑定过，句柄 0 本身也是合法池项
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; uint8_t vp_sw[16][4];

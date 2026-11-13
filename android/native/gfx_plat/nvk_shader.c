@@ -36,6 +36,74 @@ static uint64_t g_pool_request_rejected, g_pool_request_facts, g_pool_request_ot
 static struct { char name[80]; uint64_t count; } g_pool_reasons[64];
 static unsigned g_pool_reason_count;
 
+// One-off diagnostic, only emits for missing facts when debug.s2a.nvk_fact_probe=1.
+// Capture producer outcomes as they happen; a later lookup could observe a different registry.
+struct fact_probe_slot { int written, id, base, count, registered, converted; unsigned target, format; };
+static struct fact_probe_slot g_fact_slots[6][128];
+static struct { int stage; unsigned handle; } g_fact_seen[200];
+static unsigned g_fact_seen_n;
+static int g_fact_truncated;
+static int g_fact_probe_enabled;
+static void fact_probe_capture(int st, int slot, int id, int registered, int converted, unsigned target, unsigned format) {
+    if (!g_fact_probe_enabled) return;
+    g_fact_slots[st][slot] = (struct fact_probe_slot){rp_S.tex_diag_written[st][slot], id,
+        rp_S.tex_base, rp_S.tex_pool_n, registered, converted, target, format};
+}
+
+// Check the actual serialized request, not just the producer's input array. -1 = unreadable.
+static int fact_probe_request(const char *json, size_t len, const char *stage, unsigned word) {
+    struct s2a_jv root = {json, len}, program, arr, item, v;
+    if (s2a_jv_obj_find(root, "program", &program) || s2a_jv_obj_find(program, "textures", &arr)) return -1;
+    int n = s2a_jv_arr_count(arr);
+    if (n < 0 || n > S2A_COMPILE_TEXTURE_MAX) return -1;
+    for (int i = 0; i < n; i++) {
+        char name[8]; uint32_t h, cb; int separate;
+        if (s2a_jv_arr_item(arr, i, &item) || s2a_jv_obj_find(item, "stage", &v) || s2a_jv_str(v, name, sizeof name) ||
+            s2a_jv_obj_find(item, "handle", &v) || s2a_jv_u32(v, &h)) return -1;
+        if (strcmp(name, stage) || h != word) continue;
+        if (s2a_jv_obj_find(item, "cbufSlot", &v)) return -1;
+        if (v.n == 2 && !memcmp(v.p, "-1", 2)) continue;
+        if (s2a_jv_u32(v, &cb) || s2a_jv_obj_find(item, "separate", &v) || s2a_jv_bool(v, &separate)) return -1;
+        if (cb == 2 && separate) return 1;
+    }
+    return 0;
+}
+
+static void fact_probe_error(const char *summary, const uint8_t identity[32], const char *json, size_t len) {
+    if (!g_fact_probe_enabled) return;
+    const char *p = strstr(summary, " 原因=");
+    if (!p) return;
+    p += strlen(" 原因=");
+    struct s2a_jv doc = {p, strlen(p)}, v;
+    char code[64], message[256], method[64], stage[8];
+    unsigned handle; int cbuf;
+    if (s2a_jv_obj_find(doc, "code", &v) || s2a_jv_str(v, code, sizeof code) || strcmp(code, "MISSING_FACT") ||
+        s2a_jv_obj_find(doc, "message", &v) || s2a_jv_str(v, message, sizeof message) ||
+        sscanf(message, "%63s has no source (stage=%7[^,],handle=%u,cbufSlot=%d", method, stage, &handle, &cbuf) != 4) return;
+    int st = !strcmp(stage, "vs") ? 0 : !strcmp(stage, "fs") ? 1 : !strcmp(stage, "gs") ? 2 : !strcmp(stage, "cs") ? 5 : -1;
+    if (st < 0) return;
+    for (unsigned i = 0; i < g_fact_seen_n; i++) if (g_fact_seen[i].stage == st && g_fact_seen[i].handle == handle) return;
+    if (g_fact_seen_n == 200) {
+        if (!g_fact_truncated) { g_fact_truncated = 1; nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", "fact_probe truncated=1 limit=200"); }
+        return;
+    }
+    g_fact_seen[g_fact_seen_n].stage = st; g_fact_seen[g_fact_seen_n++].handle = handle;
+    unsigned a = handle & 0x3fff, b = (handle >> 14) & 0x3fff, type = handle >> 28;
+    int ca = a >= 90 && a < 346 && !(a & 1), cb = b >= 90 && b < 346 && !(b & 1);
+    int sa = a >= 346 && a < 602 && !(a & 1), sb = b >= 346 && b < 602 && !(b & 1);
+    int word = cbuf == 196610 && type == 1 && ((ca && sb) || (cb && sa)) ? (int)(ca ? a : b) : -1;
+    struct fact_probe_slot s = {0}; int req = -1, slot = -1;
+    if (word >= 0) { slot = (word - 90) / 2; s = g_fact_slots[st][slot]; req = fact_probe_request(json, len, stage, (unsigned)word); }
+    char id[65], line[512];
+    for (int i = 0; i < 32; i++) snprintf(id + 2*i, 3, "%02x", identity[i]);
+    snprintf(line, sizeof line, "fact_probe index=%u/200 identity=%s method=%s stage=%s handle=%u cbuf=%d slot=%d written=%d pool_local_id=%d pool_base=%d pool_count=%d in_pool=%d registered=%d conversion=%d target=%u format=%u request_separate=%d truncated=0",
+        g_fact_seen_n, id, method, stage, handle, cbuf, slot, word < 0 ? -1 : s.written,
+        word < 0 ? -1 : s.id - s.base, s.base, s.count,
+        word < 0 ? -1 : (s.base >= 0 && s.id >= s.base && (uint64_t)(s.id - s.base) < (uint64_t)s.count),
+        word < 0 ? -1 : s.registered, word < 0 ? -1 : s.converted, s.target, s.format, req);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
+
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
 static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
 static void pool_stats(const char *phase) {
@@ -182,6 +250,7 @@ struct facts {
 
 static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
     memset(f, 0, sizeof *f);
+    g_fact_probe_enabled = rp_S.tex_diag_enabled;
     struct s2a_compile_graphics_src *g = &f->gfx;
     g->topology = topology(q->prim);
     g->rt_count = q->rt_count;
@@ -226,9 +295,12 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
         uint64_t h = rp_S.tex[st][128 + slot];
         long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
-        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
-        if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
-                (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) { fact_probe_capture(st, slot, (int)id, 0, -1, 0, 0); continue; }
+        unsigned fmt = (uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format);
+        unsigned target = (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target);
+        int converted = !s2a_nvn_texture_fact(fmt, target, t.d.depth, &nf, why, sizeof why);
+        fact_probe_capture(st, slot, (int)id, 1, converted, target, fmt);
+        if (!converted) continue;
         int n = f->ntex++;
         memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
         f->tex[n] = (struct s2a_compile_texture_src){(const char *const[]){"vs", "fs", "gs"}[st], (uint32_t)(90 + 2 * slot), 2, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 1, nf.array_length};
@@ -522,13 +594,15 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             if (g_texpool_diag) g_pool_attempts++;
             int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
-            free(json);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 g_n_failed++; red1("compile_failed", oc.summary); compiler_rejected(oc.summary);
+                fact_probe_error(oc.summary, sha, json, jl);
+                free(json);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e); e->failed = 1; nvn_hm_put(&g_progs, sha, e);   // 同一份输入不再反复编
                 return -1;
             }
+            free(json);
             bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL; s2a_compile_outcome_free(&oc); g_n_compiled++;
             if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
             if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, sha, bytes, len);
@@ -601,6 +675,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
 
 int rp_shader_resolve_compute(const struct rp_prog **out) {
     *out = NULL;
+    g_fact_probe_enabled = rp_S.tex_diag_enabled;
     if (!(rp_S.skey_ok >> 5 & 1)) { nvn_unimpl("shader", "compute_stage_key_missing", NULL); return -1; }
     if (!shader_texture_pool_ready()) return -1;
     struct s2a_direct_compile_context pc; memset(&pc, 0, sizeof pc);
@@ -628,9 +703,12 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
     for (int slot = 0; slot < 128; slot++) {
         uint64_t h = rp_S.tex[5][128 + slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
-        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
-        if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
-                (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) { fact_probe_capture(5, slot, (int)id, 0, -1, 0, 0); continue; }
+        unsigned fmt = (uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format);
+        unsigned target = (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target);
+        int converted = !s2a_nvn_texture_fact(fmt, target, t.d.depth, &nf, why, sizeof why);
+        fact_probe_capture(5, slot, (int)id, 1, converted, target, fmt);
+        if (!converted) continue;
         memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
         tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(90 + 2 * slot), 2, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 1, nf.array_length};
         ntex++;
@@ -667,6 +745,7 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 g_n_failed++; red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
+                fact_probe_error(oc.summary, rq.identity, rq.json, rq.json_bytes);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e); e->failed = 1; nvn_hm_put(&g_progs, rq.identity, e);
                 nvk_compute_request_release(&rq);
@@ -697,4 +776,5 @@ void rp_shader_reset(void) {
     g_pool_programs = g_pool_attempts = g_pool_compiled = g_pool_rejected = g_pool_unsupported = 0;
     g_pool_request_rejected = g_pool_request_facts = g_pool_request_other = 0;
     g_pool_reason_count = 0; memset(g_pool_reasons, 0, sizeof g_pool_reasons);
+    g_fact_seen_n = 0; g_fact_truncated = 0;
 }

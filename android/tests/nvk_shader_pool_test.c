@@ -20,6 +20,8 @@
 #include "direct/jv.h"
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
+static int fact_probe_enabled, fact_probe_lines, fact_probe_truncated;
+static char last_fact_probe[512];
 static unsigned fake_array_count;
 static int separate_fixture;
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1;
@@ -37,9 +39,14 @@ static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
+    if (!strcmp(name, "nvk_fact_probe")) return fact_probe_enabled;
     return dflt;
 }
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && !strncmp(text, "fact_probe index=", 17)) {
+        fact_probe_lines++; snprintf(last_fact_probe, sizeof last_fact_probe, "%s", text);
+    }
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "fact_probe truncated=1")) fact_probe_truncated++;
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_capacity=")) {
         diag_lines++; snprintf(last_diag, sizeof last_diag, "%s", text);
@@ -67,8 +74,9 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
 }
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->caps = fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0; }
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
-    if (!separate_fixture || (id != 77 && id != 78 && !(separate_fixture == 2 && id == 0))) return 0;
+    if (!separate_fixture || (id != 77 && id != 78 && id != 79 && !(separate_fixture == 2 && id == 0))) return 0;
     memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
+    if (id == 79) t->d.target = 0x7fffffff;
     *h = id == 77; if (*h) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; } return 1;
 }
 static uint64_t fake_reg_generation;
@@ -495,6 +503,41 @@ int main(int argc, char **argv) {
         separate_fixture = 0;
     }
     fake_array_count = 0; fake_compile_error = NULL;
+    {
+        // Synthetic error boundary; the producer and serialized request are real.
+        const char *vs = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=vs,handle=274104410,cbufSlot=196610)\"}";
+        const char *cs = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=cs,handle=274104412,cbufSlot=196610)\"}";
+        fact_probe_enabled = 1; fact_probe_lines = fact_probe_truncated = 0;
+        rp_shader_reset(); rp_state_reset(); s2a_source_clear(); source(); bind_pools(100);
+        fake_compile_error = vs; separate_fixture = 0; rp_shader_resolve(&q, &p);
+        CHECK(fact_probe_lines == 1 && strstr(last_fact_probe, "stage=vs") && strstr(last_fact_probe, "slot=0 written=0") &&
+              strstr(last_fact_probe, "pool_local_id=0") && strstr(last_fact_probe, "registered=0 conversion=-1") &&
+              strstr(last_fact_probe, "request_separate=0"), "probe records an unwritten missing descriptor: %s", last_fact_probe);
+        bind_pools(101); rp_shader_resolve(&q, &p);
+        CHECK(fact_probe_lines == 1, "same stage and handle logged only once across identities");
+        bind_separate(5, 1, 1, 0); fake_compile_error = cs; rp_shader_resolve_compute(&p);
+        CHECK(fact_probe_lines == 2 && strstr(last_fact_probe, "stage=cs") && strstr(last_fact_probe, "slot=1 written=1") &&
+              strstr(last_fact_probe, "pool_local_id=0") && strstr(last_fact_probe, "registered=0 conversion=-1"),
+              "zero handle explicitly written remains distinguishable: %s", last_fact_probe);
+        rp_shader_reset(); separate_fixture = 1; bind_separate(5, 1, 1, 78); rp_shader_resolve_compute(&p);
+        CHECK(fact_probe_lines == 3 && strstr(last_fact_probe, "registered=1 conversion=1") && strstr(last_fact_probe, "request_separate=1"),
+              "probe tests serialized request fact rather than inferring it: %s", last_fact_probe);
+        rp_shader_reset(); bind_separate(5, 1, 1, 79); rp_shader_resolve_compute(&p);
+        CHECK(fact_probe_lines == 4 && strstr(last_fact_probe, "registered=1 conversion=0") && strstr(last_fact_probe, "request_separate=0"),
+              "probe records unsupported target without fabricating fact: %s", last_fact_probe);
+        rp_shader_reset(); separate_fixture = 0; fact_probe_lines = fact_probe_truncated = 0;
+        char error[256];
+        for (unsigned i = 0; i < 201; i++) {
+            unsigned handle = (1u << 28) | ((346u + 2u * (i / 128)) << 14) | (90u + 2u * (i % 128));
+            snprintf(error, sizeof error, "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=vs,handle=%u,cbufSlot=196610)\"}", handle);
+            fake_compile_error = error; bind_pools((int)i + 200); rp_shader_resolve(&q, &p);
+        }
+        CHECK(fact_probe_lines == 200 && fact_probe_truncated == 1, "probe caps distinct coordinates and marks truncation: lines=%d markers=%d", fact_probe_lines, fact_probe_truncated);
+        fact_probe_enabled = 0; rp_shader_reset(); rp_state_reset(); s2a_source_clear(); source(); bind_pools(100);
+        fact_probe_lines = 0; fake_compile_error = vs; rp_shader_resolve(&q, &p);
+        CHECK(fact_probe_lines == 0, "disabled probe emits no lines");
+        fake_compile_error = NULL;
+    }
     gs_request_test();
     rp_shader_reset(); s2a_source_clear();
     fprintf(stderr, "nvk shader pool: %d checks, %d failures\n", checks, failures);

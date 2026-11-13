@@ -2,6 +2,7 @@
 #include "rp_state.h"
 #include "rp_shader.h"
 #include "nvn_unimpl.h"
+#include "nvn_plat.h"
 #include <string.h>
 
 struct rp_state rp_S;
@@ -29,6 +30,7 @@ int rp_shader_stage_key(unsigned st, uint8_t key[8]) {
 
 void rp_state_reset(void) {
     memset(&rp_S, 0, sizeof rp_S); memset(&rp_R, 0, sizeof rp_R); for (int i = 0; i < 6; i++) rp_tex_sep_gen[i]++;
+    rp_S.tex_diag_enabled = !!nvn_plat_flag("nvk_fact_probe", 0);
     for (int i = 0; i < 8; i++) rp_S.blend[i] = (blend_st){.target = (unsigned)i, .src_rgb = NVN_BLEND_FUNC_ONE, .dst_rgb = NVN_BLEND_FUNC_ZERO, .src_a = NVN_BLEND_FUNC_ONE, .dst_a = NVN_BLEND_FUNC_ZERO, .eq_rgb = NVN_BLEND_EQUATION_ADD, .eq_a = NVN_BLEND_EQUATION_ADD};
     rp_S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; rp_S.chmask.mask = 0xffffffffu;
     rp_S.ms.enable = 1;
@@ -150,6 +152,9 @@ int rp_state_op(uint32_t op, const void *a, uint32_t size) {
         case OP_BIND_TEX: case OP_BIND_TEX1: { p_bind_handles t1; const p_bind_handles *b = bind_rec(op, a, &t1);
             if (b->n < 0 || b->n > 32) { nvn_unimpl("rec", "bind_tex_count_overwritten", a); return 1; }
             bh_fresh(b, op == OP_BIND_SAMP);
+            if (rp_S.tex_diag_enabled && b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= RP_NTEX)
+                for (int i = 0; i < b->n; i++) if (b->first + i >= 128)
+                    rp_S.tex_diag_written[b->stage][b->first + i - 128] = 1;
             if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= RP_NTEX && memcmp(&rp_S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n)) {
                 memcpy(&rp_S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n); rp_args_dirty[b->stage] = 1;
                 if (b->first + b->n > 128) rp_tex_sep_gen[b->stage]++; }   // 分离贴图槽（128 起）变了
