@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "direct/input_identity.h"
+#include "direct/texture_facts.h"
 static int bad;
 #define CHECK(c, what) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", what); bad++; } } while (0)
 int main(int argc, char **argv) {
@@ -54,6 +55,21 @@ int main(int argc, char **argv) {
         CHECK(!!(a[off + 12] & 4) == (i % 160 >= 32), "480 facts retain separate flag");
     }
     in.texture_count = S2A_COMPILE_TEXTURE_MAX + 1; CHECK(s2a_input_identity_encode(&in, b, sizeof b, &nb) != 0, "481 facts explicitly rejected");
+    {
+        // The stable identity index is appended, not inserted before existing targets.
+        uint8_t idx = 255;
+        CHECK(!s2a_nvn_texture_target_index("2d", &idx) && idx == 1, "existing 2d identity index stays 1");
+        CHECK(!s2a_nvn_texture_target_index("buffer", &idx) && idx == 10, "buffer identity index is appended at 10");
+        in.stage_mask = 1; in.source_present = 1; in.texture_count = 1;
+        tex[0] = (struct s2a_compile_texture_src){"vs", 90, 2, "buffer", "R32Uint", 1, 1, 1, 1};
+        na = 0;
+        CHECK(!s2a_input_identity_encode(&in, a, sizeof a, &na), "buffer texture fact has a canonical identity");
+        if (na >= 17) CHECK(a[na - 17 + 9] == 10 && a[na - 17 + 12] == 7, "buffer identity retains target and flags");
+        tex[0].sampler_type = "2d"; tex[0].is_buffer = 0;
+        nb = 0;
+        CHECK(!s2a_input_identity_encode(&in, b, sizeof b, &nb), "2d control identity encodes");
+        if (na && nb == na) CHECK(memcmp(a, b, na) != 0, "buffer identity cannot collide with 2d");
+    }
     if (!bad) puts("identity: baseline VS/VS+FS/CS byte-identical; 96, 97 and 480 facts, 481 rejection passed");
     return bad != 0;
 }
