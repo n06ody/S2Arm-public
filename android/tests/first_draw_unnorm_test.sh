@@ -37,7 +37,6 @@ cat > "$E/include/sys/system_properties.h" <<'HEADER'
 static inline int __system_property_get(const char*k,char*v){(void)k;v[0]=0;return 0;}
 HEADER
 "$GLSLC" android/tests/first_draw_unnorm.vert -o "$E/vert.spv"
-"$GLSLC" android/tests/first_draw_unnorm.frag -o "$E/frag.spv"
 sources=(android/tests/first_draw_unnorm_test.c
 android/native/nvn/{mtl_vk_adapter,nvn_vk_program_result,nvn_vk_draw_diag,nvn_vk_pipe_manifest,nvn_vk_pipe_recipe,nvn_vk_driver_cache,nvn_vk_query,nvn_vk_session,nvn_vk_lifecycle,nvn_vk_exec_owner,nvn_vk_pipeline,nvn_vk_swapchain,nvn_vk_surface,nvn_vk_texcache,nvn_vk_sampler_cache,nvn_vk_sampler,nvn_vk_format,nvn_vk_mrt,nvn_vk_bcdec}.c "${FIRST_DRAW_SOURCE:-android/native/nvn/nvn_vk_first_draw.c}"
 android/native/direct/{vk_record,vk_clear,vk_device,gs_path,vk_membuf,vk_resid,program_cache,compile_request,compile_worker,compiler_bind,s2a_direct_abi,sha256,jv,json}.c
@@ -60,6 +59,7 @@ done
   -Wl,--wrap=vkDestroyImage -Wl,--wrap=vkDestroyImageView -Wl,--wrap=vkFreeMemory -Wl,-l:libvulkan.so.1 -lm -pthread -o "$E/draw"
 run() { if [[ -n ${VULKAN_RUNNER:-} ]]; then "$VULKAN_RUNNER" "$E/draw" "$E/program.json"; else "$E/draw" "$E/program.json"; fi; }
 make_program() {
+  "$GLSLC" -DBINDING0="$1" -DBINDING1="${3:-$2}" android/tests/first_draw_unnorm.frag -o "$E/frag.spv"
   python3 - "$E" "$1" "$2" <<'PY'
 import base64,json,pathlib,sys
 p=pathlib.Path(sys.argv[1]); b0,b1=map(int,sys.argv[2:]); encode=lambda f:base64.b64encode((p/f).read_bytes()).decode()
@@ -67,6 +67,19 @@ content={'stages':[{'stage':'vs','spirv':encode('vert.spv'),'attributeReadMask':
 (p/'program.json').write_text(json.dumps({'schema':'s2a-direct-program-v1','content':content}))
 PY
 }
+# A mismatched shader binding must fail in the production parser, not at compile/link.
+if [[ ${1:-} == --neg-descriptor ]]; then
+  make_program 0 1 2
+  set +e
+  BIND=1 LANE=0 M0=1 M1=2 run > "$E/negative.log" 2>&1
+  rc=$?
+  set -e
+  cat "$E/negative.log"
+  [[ $rc -ne 0 ]] && grep -q 'texture SPIR-V descriptor type unproven' "$E/negative.log" || exit 1
+  echo 'PASS: descriptor mismatch rejected by production parser'
+  exit 0
+fi
+[[ $# == 0 ]] || { echo "unknown argument: $1" >&2; exit 2; }
 # Each row is binding0 binding1 lane, and manually calculated draw1/draw2 masks.
 while read -r b0 b1 lane m0 m1; do
   make_program "$b0" "$b1"

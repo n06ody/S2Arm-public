@@ -159,6 +159,42 @@ static int skip(const char *why, const void *rec) {
 }
 void rp_draw_log_arm(int lines) { g_log_left = lines; }
 
+// Resolve the exact backing bytes before the pass. The view is temporary: the
+// backend retains it at bind, and the caller releases it after encoding.
+static int tbuf_prepare(nvn_gpu_cmd c, const nvn_gpu_layout_ent *e, int st,
+                        uint8_t dtt, uint8_t dcls, nvn_gpu_view *out, const void *rec) {
+    *out = NULL;
+    if (e->cls != NVN_GPU_RES_TBUF || e->count != 1 || e->src_reg >= RP_NTEX ||
+        e->src_reg2 != UINT16_MAX || e->access != NVN_GPU_ACC_R)
+        return skip("tbuf_binding_shape", rec);
+    uint64_t h = rp_S.tex[st][e->src_reg];
+    int id = h ? (int)(h & 0xfffff) : rp_S.tex_base;
+    tex_t t; view_t v; int hv = 0;
+    if (!rp_tex_snap_by_id(id, &t, &v, &hv)) return skip("tbuf_texture_unresolved", rec);
+    if (t.d.target != NVN_TEXTURE_TARGET_BUFFER || (hv && v.set_target && v.target != NVN_TEXTURE_TARGET_BUFFER) ||
+        !t.mem || !t.pool || !t.d.width || t.d.levels > 1 || t.d.samples > 1 ||
+        (hv && v.set_levels && (v.base_level || v.nlevels > 1)) ||
+        (hv && v.set_layers && (v.min_layer || v.nlayers > 1))) return skip("tbuf_texture_shape", rec);
+    for (int i = 0; i < 4; i++) {
+        unsigned sw = hv && v.set_swizzle ? v.swz[i] : t.set_swz ? (t.swz >> (3 * i) & 7) : (unsigned)(2 + i);
+        if (sw != (unsigned)(2 + i)) return skip("tbuf_swizzle_unsupported", rec);
+    }
+    uint32_t fmt = hv && v.set_format ? v.format : (uint32_t)t.d.format;
+    nvn_fmt_info base, view;
+    if (!nvn_fmt_info_of((uint32_t)t.d.format, &base) || !nvn_fmt_info_of(fmt, &view) ||
+        !base.bytes || base.bw != 1 || base.bh != 1 || base.depth || base.stencil ||
+        view.bw != 1 || view.bh != 1 || view.bytes != base.bytes || view.depth || view.stencil)
+        return skip("tbuf_format_unsupported", rec);
+    unsigned cls = view.kind == NVN_FMT_UINT ? 1u : view.kind == NVN_FMT_SINT ? 2u : 0u;
+    if (dtt != NVN_TEXTURE_TARGET_BUFFER + 1 || dcls != cls) return skip("tbuf_format_mismatch", rec);
+    uint64_t bytes = (uint64_t)t.d.width * base.bytes;
+    nvn_gpu_buf buf = NULL; uint64_t off = 0;
+    if (!rp_buf_resolve(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off)) return skip("tbuf_buffer_unresolved", rec);
+    nvn_gpu_err err = {0}; nvn_gpu_rc rc = nvn_gpu_view_create_buf(buf, off, bytes, fmt, out, &err);
+    if (!nvn_gpu_ok(rc) || !*out) return skip("tbuf_view_create_failed", rec);
+    return 1;
+}
+
 // 一个阶段的全部绑定。0 = 有取不到的资源（已记账），这笔不画
 // pi：程序里的阶段下标（0 顶点 / 计算，1 片元）；st：NVN 阶段号（回放状态按它取：0 顶点、1 片元、5 计算）
 static nvn_gpu_buf g_disp_ind; static uint64_t g_disp_ind_off;
@@ -170,6 +206,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
 static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec); }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) {
     nvn_gpu_binding b[RP_PROG_ENT_MAX]; uint32_t n = 0;
+    int has_tbuf = 0;
     // 沿用上一笔：只限图形两个阶段；存储缓冲（要同步镜像、登记 GPU 写）和贴图（视图会轮转）每笔照取
     const int keep = st < RP_PROG_STAGES && g_bind_keep[pi] && g_lb[pi].ok && g_lb[pi].c == c && g_lb[pi].seg == rp_seg_serial() && g_lb[pi].gen == rp_cpu_write_gen && g_lb[pi].reg_gen == rp_tex_reg_gen() && g_lb[pi].pg == pg && g_lb[pi].base_instance == base_instance;
     if (st < RP_PROG_STAGES) g_lb[pi].ok = 0;
@@ -177,7 +214,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
         const nvn_gpu_layout_ent *e = &pg->ent[pi][i];
         nvn_gpu_binding *o = &b[n]; memset(o, 0, sizeof *o); o->ent = (uint16_t)i; o->cls = e->cls;
         nvn_gpu_slice sl;
-        if (keep && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_IMG) { *o = g_lb[pi].b[n]; n++; continue; }
+        if (keep && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_IMG && e->src_kind != NVN_RB_TBUF) { *o = g_lb[pi].b[n]; n++; continue; }
         switch (e->src_kind) {
             case NVN_RB_SBUFP: case NVN_RB_UBOP: {   // 存储缓冲：取地址、绑池镜像里的那一段；可写的登记一次 GPU 写（完成后回写游戏内存）。两种来源只差在哪张表给地址：
                 // SBUFP 按 NVN 存储缓冲槽（rp_S.ssbo）；UBOP 按计算阶段的用户 UBO 槽（rp_S.ubo；反射映射 NVK_STORAGE_UBO_PTR），段的范围就是这个 UBO 绑定的地址与大小
@@ -262,6 +299,9 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (st != 5 || e->cls != NVN_GPU_RES_IMAGE || e->count > 1) return skip("compute_image_shape", rec);
                 if (!tv[i]) return skip("compute_image_unresolved", rec);
                 o->u.view = tv[i]; break; }
+            case NVN_RB_TBUF: {
+                if (e->cls != NVN_GPU_RES_TBUF || !tv[i]) return skip("tbuf_view_unresolved", rec);
+                has_tbuf = 1; o->u.view = tv[i]; break; }
             case NVN_RB_TEX: {
                 if (e->count > 1) {   // 贴图数组：逐项绑（视图与采样器已在开通道前取好，放在 g_av / g_as）
                     if (n + e->count > RP_PROG_ENT_MAX) return skip("too_many_bindings", rec);
@@ -283,8 +323,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
     }
     if (st < RP_PROG_STAGES) {
         // 和上一笔逐项相同、管线也没重设：后端手里的就是这一组，不用再发
-        const int same = keep && !g_pipe_set && g_lb[pi].n == n && !memcmp(g_lb[pi].b, b, (size_t)n * sizeof *b);
-        g_lb[pi].c = c; g_lb[pi].seg = rp_seg_serial(); g_lb[pi].gen = rp_cpu_write_gen; g_lb[pi].reg_gen = rp_tex_reg_gen(); g_lb[pi].pg = pg; g_lb[pi].base_instance = base_instance; g_lb[pi].n = n; g_lb[pi].ok = 1;
+        const int same = keep && !has_tbuf && !g_pipe_set && g_lb[pi].n == n && !memcmp(g_lb[pi].b, b, (size_t)n * sizeof *b);
+        g_lb[pi].c = c; g_lb[pi].seg = rp_seg_serial(); g_lb[pi].gen = rp_cpu_write_gen; g_lb[pi].reg_gen = rp_tex_reg_gen(); g_lb[pi].pg = pg; g_lb[pi].base_instance = base_instance; g_lb[pi].n = n; g_lb[pi].ok = !has_tbuf;
         if (same) { rp_perf_add(RP_PERF_BIND_SKIP, 1); return 1; }
         memcpy(g_lb[pi].b, b, (size_t)n * sizeof *b);
     }
@@ -403,12 +443,17 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         a.itype = (uint32_t)di->itype; a.base_vertex = di->base_vertex;
     } else a.first = (uint32_t)dr->first;
     static nvn_gpu_view tv[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_STAGES][RP_PROG_ENT_MAX];
+    memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts);
     char tl[520]; size_t tn = 0; tl[0] = 0;   // 逐笔日志用：这笔采样的贴图
     int narr[RP_PROG_STAGES] = {0};
     DT(RP_PERF_D_PREP);
     rp_view_pin_begin();
     for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
-        const nvn_gpu_layout_ent *e = &g_prog->ent[st][i]; tv[st][i] = NULL; ts[st][i] = NULL;
+        const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
+        if (e->src_kind == NVN_RB_TBUF) {
+            if (!tbuf_prepare(c, e, st, g_prog->dtt[st][i], g_prog->dcls[st][i], &tv[st][i], rec)) goto draw_done;
+            continue;
+        }
         if (e->src_kind != NVN_RB_TEX) continue;
         if (e->src_reg >= RP_NTEX || (e->src_reg2 != UINT16_MAX && (e->count != 1 || e->src_reg2 >= 128))) {
             skip("separate_texture_shape", rec); goto draw_done;
@@ -550,6 +595,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     g_draws++;
     DT(RP_PERF_D_TAIL);
 draw_done:
+    for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++)
+        if (g_prog->ent[st][i].src_kind == NVN_RB_TBUF && tv[st][i]) nvn_gpu_view_release(tv[st][i]);
     rp_view_pin_end();
 }
 
@@ -612,9 +659,15 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     int sr = rp_shader_resolve_compute(&pg);
     if (sr) { skip(sr > 0 ? "compute_program_not_ready" : "compute_program_unresolved", rec); return; }
     static nvn_gpu_view tv[RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_ENT_MAX];
+    memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts);
     const tex_t *images[RP_PROG_ENT_MAX] = {0};
     rp_view_pin_begin();
-    for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i]; tv[i] = NULL; ts[i] = NULL;
+    for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
+        if (e->src_kind == NVN_RB_TBUF) {
+            rp_pass_flush(c);
+            if (!tbuf_prepare(c, e, 5, pg->dtt[0][i], pg->dcls[0][i], &tv[i], rec)) goto done;
+            continue;
+        }
         if (e->src_kind == NVN_RB_IMG) {
             if (e->cls != NVN_GPU_RES_IMAGE || e->count > 1 || e->src_reg >= 32) { skip("compute_image_shape", rec); goto done; }
             uint64_t h = rp_S.img[5][e->src_reg];
@@ -661,6 +714,8 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     g_dispatches++;
 done:
+    for (uint32_t i = 0; i < pg->nent[0]; i++)
+        if (pg->ent[0][i].src_kind == NVN_RB_TBUF && tv[i]) nvn_gpu_view_release(tv[i]);
     rp_view_pin_end();
 }
 

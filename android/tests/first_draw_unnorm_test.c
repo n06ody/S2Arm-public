@@ -241,6 +241,7 @@ int main(int argc, char **argv) {
     }
   }
   int r = nvn_vk_first_draw(&d, &s, (void *)p, n, NULL, NULL, 2, 2, "synthetic", why, sizeof why);
+  if (r) printf("first rc=%d why=%s\n", r, why);
   int ok = 0;
   if (getenv("BIND")) {
     d.shader_draw_parameters_enabled = 0;

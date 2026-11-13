@@ -105,14 +105,14 @@ def main():
             result = subprocess.run([str(exe), path, *extra], capture_output=True, text=True, timeout=30)
             assert result.returncode == 1 and 'FAIL: BUFFER layout must be TBUF' in result.stderr, result.stderr
         print('NEGATIVE CONTROL PASS: removing TBUF layout fails graphics and compute assertions')
-        guard = 'if (le->cls == NVN_GPU_RES_TBUF) { red1("texture_buffer_replay_unsupported",'
-        assert code.count(guard) == 2
-        mutated = out/'tbuf-withdraw-replay.c'
-        mutated.write_text(code.replace(guard, guard.replace('le->cls ==', '0 && le->cls ==')))
+        type_anchor = 'else if (dim == 5 && !arrayed && !ms) target = NVN_TEXTURE_TARGET_BUFFER;'
+        assert code.count(type_anchor) == 1
+        mutated = out/'tbuf-withdraw-type.c'
+        mutated.write_text(code.replace(type_anchor, type_anchor.replace('dim == 5', '0 && dim == 5')))
         for mode, path in [('--execute-tbuf', gfx_result), ('--execute-compute-tbuf', cs_result)]:
-            result = run('tbuf-withdraw-replay', mutated, args=(mode, profile, closure, src_dir, path))
-            assert result.returncode == 1 and 'FAIL: real' in result.stderr and 'refuses unsupported replay' in result.stderr, result.stderr
-        print('NEGATIVE CONTROL PASS: removing TBUF replay guards fails graphics and compute assertions')
+            result = run('tbuf-withdraw-type', mutated, args=(mode, profile, closure, src_dir, path))
+            assert result.returncode == 1 and 'FAIL: real' in result.stderr and 'declared TBUF layout' in result.stderr, result.stderr
+        print('NEGATIVE CONTROL PASS: unproven TBUF shader type rejects graphics and compute')
         return 0
 
     if sys.argv[1:] == ['--withdraw']:
