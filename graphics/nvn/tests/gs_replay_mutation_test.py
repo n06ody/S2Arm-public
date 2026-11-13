@@ -14,8 +14,8 @@ mutations = [
      'st == 5 ? NVN_GPU_SH_CS : st == 2 ? NVN_GPU_SH_FS : (nvn_gpu_stage)st', 'g_bind_calls[NVN_GPU_SH_GS] == 2'),
     ('gs-pipeline', 'for (int st = 0; st < RP_PROG_STAGES; st++) pd.st[st].sh = g_prog->sh[st];',
      'for (int st = 0; st < 2; st++) pd.st[st].sh = g_prog->sh[st];', 'g_last_pdesc.st[NVN_GPU_SH_GS].sh'),
-    ('gs-bind-omitted', 'for (int st = 0; st < RP_PROG_STAGES; st++) if (g_prog->sh[st] && !bind_stage',
-     'for (int st = 0; st < 2; st++) if (g_prog->sh[st] && !bind_stage', 'g_bind_calls[NVN_GPU_SH_GS] == 2'),
+    ('gs-bind-omitted', 'for (int st = 0; st < RP_PROG_STAGES; st++) if (!bind_stage',
+     'for (int st = 0; st < 2; st++) if (!bind_stage', 'g_bind_calls[NVN_GPU_SH_GS] == 2'),
     ('gs-topology', 'if ((rp_shader_graphics_stages() & 4u) && prim != 0 && prim != 1 && prim != 4)',
      'if (0 && (rp_shader_graphics_stages() & 4u) && prim != 0 && prim != 1 && prim != 4)', 'geometry_topology_unimplemented'),
 ]
