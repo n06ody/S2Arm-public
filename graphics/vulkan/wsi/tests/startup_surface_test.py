@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 HERE = Path(__file__).resolve().parent
@@ -25,6 +26,9 @@ def method(source, marker):
 
 
 def main():
+    withdraw_native = sys.argv[1:] == ['--withdraw-native']
+    if sys.argv[1:] and not withdraw_native:
+        raise SystemExit('usage: startup_surface_test.py [--withdraw-native]')
     surface = HERE.parent/'AndroidVulkanSurface.cs'
     runtime = REPO/'graphics/vulkan/runtime/AndroidVulkanRuntime.cs'
     native = REPO/'android/native/host_android.c'
@@ -59,6 +63,10 @@ def main():
         subprocess.run([str(out/'stop')], check=True, timeout=20)
         bridge = (native.parent/'bridge.cpp').read_text()
         getter = 'jlong ' + method(bridge, 'Java_org_s2arm_android_NativeBridge_gamePresentCount(')
+        if withdraw_native:
+            original = 'if (uint64_t native = s2a_android_nvn_present_count())'
+            assert getter.count(original) == 1, 'native present counter mutation anchor'
+            getter = getter.replace(original, 'if (uint64_t native = 0)')
         (out/'present.cpp').write_text((HERE/'StartupPresentFixture.cpp.in').read_text().replace('PRODUCTION_METHODS', getter))
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-I'+str(native.parent), '-I'+str(REPO/'runtime/include'), str(out/'present.cpp'), '-o', str(out/'present')], check=True)

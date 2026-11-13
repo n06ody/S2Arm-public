@@ -52,7 +52,6 @@ Java_org_s2arm_android_NativeBridge_configureDebugEnvironment(JNIEnv *env, jclas
 #include "loader.h"
 extern "C" void s2a_host_shutdown(const char *why);
 extern "C" int64_t s2a_android_services_present_count(void);
-extern "C" uint64_t s2a_android_nvn_present_count(void);   // native/direct_session.c：新回放层 / 旧层的上屏计数
 extern "C" int s2a_android_readonly_configure_bounded(int enabled);
 extern "C" int s2a_android_services_request_applet_exit(uint64_t session);
 extern "C" int s2a_gfx_mode(void);
