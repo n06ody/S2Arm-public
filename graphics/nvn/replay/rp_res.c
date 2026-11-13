@@ -659,16 +659,24 @@ int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *has_v) {
     return ok;
 }
 
-nvn_gpu_samp rp_samp_by_id(int id) {
+void rp_tex_slot_info(int id, rp_slot_info *info) {
+    pthread_mutex_lock(&g_rmu);
+    info->limit = g_ntreg; info->registered = id >= 0 && id < g_ntreg && g_treg[id].ok; info->create_failed = -1;
+    pthread_mutex_unlock(&g_rmu);
+}
+
+nvn_gpu_samp rp_samp_by_id_info(int id, rp_slot_info *info) {
     pthread_mutex_lock(&g_rmu);
     nvn_gpu_samp s = NULL;
+    if (info) { info->limit = g_nsreg; info->registered = id >= 0 && id < g_nsreg && g_sreg[id].ok; info->create_failed = 0; }
     if (id >= 0 && id < g_nsreg && g_sreg[id].ok) {
-        if (!g_sreg[id].s) { nvn_gpu_err err = {0}; if (!nvn_gpu_ok(nvn_gpu_samp_create(&g_sreg[id].p, &g_sreg[id].s, &err))) { g_sreg[id].s = NULL; nvn_unimpl("gpu", "samp_create", &g_sreg[id]); } }
+        if (!g_sreg[id].s) { nvn_gpu_err err = {0}; if (!nvn_gpu_ok(nvn_gpu_samp_create(&g_sreg[id].p, &g_sreg[id].s, &err))) { g_sreg[id].s = NULL; if (info) info->create_failed = 1; nvn_unimpl("gpu", "samp_create", &g_sreg[id]); } }
         s = g_sreg[id].s;
     }
     pthread_mutex_unlock(&g_rmu);
     return s;
 }
+nvn_gpu_samp rp_samp_by_id(int id) { return rp_samp_by_id_info(id, NULL); }
 
 void rp_res_reset(void) {
     pthread_mutex_lock(&g_rmu);

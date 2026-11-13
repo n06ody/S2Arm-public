@@ -90,6 +90,36 @@ static uint32_t qstrip_expand(const uint8_t *src, uint32_t isz, uint32_t count, 
 // 数组第 k 项 = 驱动句柄表的第 k 个 8 字节项；贴图槽 s 的句柄在第 4 + s 项，前 4 项与没绑的槽读作池里的第 0 项（同单个贴图槽没绑时的口径）
 enum { RP_TEXARR_MAX = 64, RP_HANDLE_TABLE_FIRST_SLOT = 4 };
 static nvn_gpu_view g_av[RP_PROG_STAGES][RP_TEXARR_MAX]; static nvn_gpu_samp g_as[RP_PROG_STAGES][RP_TEXARR_MAX];
+static rp_slot_info g_slot_scalar[RP_PROG_STAGES][RP_PROG_ENT_MAX], g_slot_array[RP_PROG_STAGES][RP_TEXARR_MAX];
+
+// 临时探针：只在显式调试开关下记录未解析资源，完整字段去重，最多 200 组。
+typedef struct { int st, ent, elem, count, texslot, sampslot, zero, tex_base, tex_capacity, samp_base, samp_capacity, id, limit, registered, create_failed, kind, bound, separate; } slot_key;
+static slot_key g_slot_seen[200]; static int g_slot_n, g_slot_truncated, g_slot_enabled = -1;
+static void slot_probe(int st, int ent, int elem, const nvn_gpu_layout_ent *e, int sampler, const rp_slot_info *sinfo) {
+    if (!g_slot_enabled) return;
+    int slot = e->count > 1 ? (int)e->src_reg + elem - RP_HANDLE_TABLE_FIRST_SLOT : e->src_reg;
+    uint64_t h = slot >= 0 && slot < RP_NTEX && (e->count <= 1 || slot < 32) ? rp_S.tex[st][slot] : 0;
+    int separate = e->src_reg2 != UINT16_MAX;
+    uint64_t sh = separate ? rp_S.samp[st][e->src_reg2] : h;
+    int id = sampler ? (separate ? (int)(sh >> 20) : h ? (int)(h >> 20) : rp_S.samp_base)
+                     : h ? (int)(h & 0xfffff) : rp_S.tex_base;
+    rp_slot_info inf = {0}; if (sampler && sinfo) inf = *sinfo; else rp_tex_slot_info(id, &inf);
+    slot_key key = {0}; key.st = st; key.ent = ent; key.elem = elem; key.count = e->count; key.texslot = slot;
+    key.sampslot = separate ? e->src_reg2 : slot; key.zero = sampler ? !sh : !h;
+    key.tex_base = rp_S.tex_base; key.tex_capacity = rp_S.tex_pool_n; key.samp_base = rp_S.samp_base; key.samp_capacity = rp_S.samp_pool_n;
+    key.id = id; key.limit = inf.limit; key.registered = inf.registered; key.create_failed = inf.create_failed; key.kind = sampler;
+    key.separate = separate;
+    key.bound = separate ? rp_S.samp_bound[st][e->src_reg2] : -1;
+    for (int i = 0; i < g_slot_n; i++) if (!memcmp(&key, &g_slot_seen[i], sizeof key)) return;
+    if (g_slot_n == 200) { if (!g_slot_truncated) { g_slot_truncated = 1; nvn_plat_log(NVN_PLAT_LOG_WARN, "slotprobe", "truncated=1 limit=200"); } return; }
+    g_slot_seen[g_slot_n++] = key;
+    char line[400]; snprintf(line, sizeof line,
+        "call=%s stage=%d ent=%d shape=%s elem=%d count=%d kind=%s tex_slot=%d sampler_slot=%d separate=%d sampler_bound=%d handle_zero=%d tex_base=%d tex_capacity=%d samp_base=%d samp_capacity=%d id=%d table_limit=%d registered=%d create_failed=%d snapshot=%s",
+        st == 5 ? "compute" : "draw", st, ent, e->count > 1 ? "array" : "single", elem, e->count,
+        sampler ? "sampler" : "texture", slot, key.sampslot, separate, key.bound, key.zero, rp_S.tex_base, rp_S.tex_pool_n,
+        rp_S.samp_base, rp_S.samp_pool_n, id, inf.limit, inf.registered, inf.create_failed, sampler ? "lookup" : "after_lookup");
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "slotprobe", line);
+}
 
 static int alloc_copy(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice *sl) {
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
@@ -241,16 +271,16 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (e->count > 1) {   // 贴图数组：逐项绑（视图与采样器已在开通道前取好，放在 g_av / g_as）
                     if (n + e->count > RP_PROG_ENT_MAX) return skip("too_many_bindings", rec);
                     for (uint32_t k = 0; k < e->count; k++) {
-                        if (!g_av[pi][k]) return skip("texture_slot_unresolved", rec);
-                        if (!g_as[pi][k]) return skip("sampler_slot_unresolved", rec);
+                        if (!g_av[pi][k]) { slot_probe(st, (int)i, (int)k, e, 0, NULL); return skip("texture_slot_unresolved", rec); }
+                        if (!g_as[pi][k]) { slot_probe(st, (int)i, (int)k, e, 1, &g_slot_array[pi][k]); return skip("sampler_slot_unresolved", rec); }
                         nvn_gpu_binding *ok = &b[n + k]; memset(ok, 0, sizeof *ok); ok->ent = (uint16_t)i; ok->cls = e->cls; ok->elem = k;
                         ok->u.ts.view = g_av[pi][k]; ok->u.ts.samp = g_as[pi][k];
                     }
                     n += e->count - 1;   // 循环末尾再加 1
                     break;
                 }
-                if (!tv[i]) return skip("texture_slot_unresolved", rec);
-                if (!ts[i]) return skip("sampler_slot_unresolved", rec);
+                if (!tv[i]) { slot_probe(st, (int)i, 0, e, 0, NULL); return skip("texture_slot_unresolved", rec); }
+                if (!ts[i]) { slot_probe(st, (int)i, 0, e, 1, &g_slot_scalar[pi][i]); return skip("sampler_slot_unresolved", rec); }
                 o->u.ts.view = tv[i]; o->u.ts.samp = ts[i]; break; }
             default: return skip("binding_source_unknown", rec);
         }
@@ -299,6 +329,7 @@ static uint64_t dt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC
 #define DT(step) do { uint64_t n_ = dt_now(); rp_perf_add(step, n_ - dt_); dt_ = n_; } while (0)
 void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec) {
     if (!c) return;
+    if (g_slot_enabled < 0) g_slot_enabled = nvn_plat_flag("nvk_slot_probe", 0);
     uint64_t dt_ = dt_now();
     uint32_t prim = (uint32_t)(di ? di->prim : dr->prim);
     if ((di && (di->ind || di->mdi_cnt)) || (dr && (dr->ind || dr->mdi_cnt))) { skip("indirect", rec); return; }
@@ -393,7 +424,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                 int slot = (int)(e->src_reg + k) - RP_HANDLE_TABLE_FIRST_SLOT;
                 uint64_t hk = slot >= 0 && slot < 32 ? rp_S.tex[st][slot] : 0;
                 g_av[st][k] = rp_view_by_id_decl(hk ? (int)(hk & 0xFFFFF) : rp_S.tex_base, g_prog->dtt[st][i], g_prog->dcls[st][i], 1, c, NULL);
-                g_as[st][k] = rp_samp_by_id(hk ? (int)(hk >> 20) : rp_S.samp_base);
+                g_as[st][k] = rp_samp_by_id_info(hk ? (int)(hk >> 20) : rp_S.samp_base,
+                    g_slot_enabled ? &g_slot_array[st][k] : NULL);
             }
             // 已知声明的空元素直接取同类型零贴图；未知声明沿用首个有效视图。采样器仍共用首个有效项。
             { nvn_gpu_view fv = NULL; nvn_gpu_samp fs = NULL;
@@ -411,11 +443,11 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             else tn += (size_t)snprintf(tl + tn, sizeof tl - tn, " t%d.%u=#%d(无)", st, (unsigned)e->src_reg, id);
         }
         if (e->src_reg2 != UINT16_MAX) {
-            if (!rp_S.samp_bound[st][e->src_reg2]) { skip("separate_sampler_unbound", rec); goto draw_done; }
+            if (!rp_S.samp_bound[st][e->src_reg2]) { rp_slot_info missing = {-1, -1, -1}; slot_probe(st, (int)i, 0, e, 1, &missing); skip("separate_sampler_unbound", rec); goto draw_done; }
             uint64_t sh = rp_S.samp[st][e->src_reg2];
-            ts[st][i] = rp_samp_by_id((int)(sh >> 20));
-            if (!ts[st][i]) { skip("separate_sampler_unresolved", rec); goto draw_done; }
-        } else ts[st][i] = rp_samp_by_id(h ? (int)(h >> 20) : rp_S.samp_base);
+            ts[st][i] = rp_samp_by_id_info((int)(sh >> 20), g_slot_enabled ? &g_slot_scalar[st][i] : NULL);
+            if (!ts[st][i]) { slot_probe(st, (int)i, 0, e, 1, &g_slot_scalar[st][i]); skip("separate_sampler_unresolved", rec); goto draw_done; }
+        } else ts[st][i] = rp_samp_by_id_info(h ? (int)(h >> 20) : rp_S.samp_base, g_slot_enabled ? &g_slot_scalar[st][i] : NULL);
     }
     DT(RP_PERF_D_TEX);
     if (!rp_pass_begin(c)) { skip("pass_begin_failed", rec); goto draw_done; }
@@ -581,6 +613,7 @@ static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence)
 static nvn_hmap g_cpipes = {.klen = 8};   // 计算程序 → 计算管线
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!c) return;
+    if (g_slot_enabled < 0) g_slot_enabled = nvn_plat_flag("nvk_slot_probe", 0);
     if (!dp->ind && (dp->x <= 0 || dp->y <= 0 || dp->z <= 0)) return;   // 0 组：空操作
     const struct rp_prog *pg = NULL;
     int sr = rp_shader_resolve_compute(&pg);
@@ -612,10 +645,10 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
         uint64_t h = rp_S.tex[5][e->src_reg];
         tv[i] = rp_view_by_id_decl(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, pg->dtt[0][i], pg->dcls[0][i], 0, c, NULL);
         if (e->src_reg2 != UINT16_MAX) {
-            if (!rp_S.samp_bound[5][e->src_reg2]) { skip("separate_sampler_unbound", rec); goto done; }
-            ts[i] = rp_samp_by_id((int)(rp_S.samp[5][e->src_reg2] >> 20));
-            if (!ts[i]) { skip("separate_sampler_unresolved", rec); goto done; }
-        } else ts[i] = rp_samp_by_id(h ? (int)(h >> 20) : rp_S.samp_base);
+            if (!rp_S.samp_bound[5][e->src_reg2]) { rp_slot_info missing = {-1, -1, -1}; slot_probe(5, (int)i, 0, e, 1, &missing); skip("separate_sampler_unbound", rec); goto done; }
+            ts[i] = rp_samp_by_id_info((int)(rp_S.samp[5][e->src_reg2] >> 20), g_slot_enabled ? &g_slot_scalar[0][i] : NULL);
+            if (!ts[i]) { slot_probe(5, (int)i, 0, e, 1, &g_slot_scalar[0][i]); skip("separate_sampler_unresolved", rec); goto done; }
+        } else ts[i] = rp_samp_by_id_info(h ? (int)(h >> 20) : rp_S.samp_base, g_slot_enabled ? &g_slot_scalar[0][i] : NULL);
     }
     rp_pass_flush(c);
     g_disp_ind = NULL; g_disp_ind_off = 0;
@@ -639,4 +672,4 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; }
+void rp_draw_reset(void) { free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_slot_n = g_slot_truncated = 0; g_slot_enabled = -1; }
