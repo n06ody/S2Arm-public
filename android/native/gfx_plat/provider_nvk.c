@@ -67,7 +67,11 @@ double s2a_direct_vk_display_refresh(void) {
 
 struct provider_context {
     struct s2a_vk_device device;
-    int device_ok;
+    int device_ok, activation_started; // activation_started is protected by g_window_mu
+    pthread_t idle_thread;
+    int idle_started, idle_result;
+    uint64_t idle_deadline;
+    _Atomic int idle_done, idle_phase, destroying;
     uint64_t session;
     uint32_t state;      // s2a_direct_state
     uint32_t blockers;
@@ -141,6 +145,27 @@ static struct provider_context *g_retained_context;
 // 窗口生命周期串行化：game 线程的 present/attach 与 UI 线程的 surfaceDestroyed/Stop 不能同时
 // 改 ctx->has_window/lease_window。锁顺序固定 window -> adapter(g_mu)，adapter 侧不回调 provider。
 static pthread_mutex_t g_window_mu = PTHREAD_MUTEX_INITIALIZER;
+// Stop poll checks the published atomic itself; when this mutex is busy the
+// 10 ms control slice supplies the wakeup without an unbounded shutdown lock.
+static void ctl_wake_stop(void) {
+    if (!pthread_mutex_trylock(&g_ctl_mu)) { g_ctl_epoch++; pthread_cond_broadcast(&g_ctl_cv); pthread_mutex_unlock(&g_ctl_mu); }
+}
+static int stop_window_lock(void) {
+    uint64_t deadline = nvk_session_stop_deadline();
+    uint64_t start = deadline - NVK_SHUTDOWN_BUDGET_NS;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop enter window lock: elapsed=%llums", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull));
+    for (;;) {
+        int e = pthread_mutex_trylock(&g_window_mu);
+        if (!e) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop exit window lock: elapsed=%llums", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull));
+            return 0;
+        }
+        if (e != EBUSY || !deadline || (uint64_t)ctl_now_ns() >= deadline) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk stop window lock deadline/error: elapsed=%llums rc=%d (context retained)", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull), e); return -1;
+        }
+        struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+}
 // owner 控制片对账：适配层执行包挂起切片 / 窗口推进次数。
 static _Atomic unsigned long long g_owner_suspended_slices, g_owner_window_actions;
 
@@ -449,7 +474,7 @@ static void diag_log_manifest(const char *label, const char *dir) {
 // Debug build + existing adb gate + explicit observer opt-in. No environment override.
 static int available(void) { return 1; }
 
-static int32_t activate(void *context) {
+static int32_t activate_impl(void *context) {
     struct provider_context *ctx = (struct provider_context *)context;
     if (!ctx) return S2A_DIRECT_RES_ARGUMENT;
     if (ctx->state != S2A_DIRECT_PREPARED) return S2A_DIRECT_RES_STOPPED;
@@ -513,7 +538,7 @@ static int32_t activate(void *context) {
     // mtl_present 的 sync 路径会继续要；租约持有到窗口撤销或 Stop，由同一套归还路径收尾。
     {
         pthread_mutex_lock(&g_window_mu);
-        int wrc = take_and_attach_window_locked(ctx, -1);
+        int wrc = atomic_load(&g_stop_published) ? 1 : take_and_attach_window_locked(ctx, -1);
         pthread_mutex_unlock(&g_window_mu);
         if (wrc > 0)
             __android_log_print(ANDROID_LOG_WARN, TAG, "direct activate: no window offered by the WSI lease yet");
@@ -521,12 +546,7 @@ static int32_t activate(void *context) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "direct activate: %s; present will retry the lease",
                                 ctx->window_error[0] ? ctx->window_error : "window attach failed");
     }
-    ctx->engine_ok = 1;
-    ctx->state = S2A_DIRECT_ACTIVE;
-    ctx->blockers = 0;
-    atomic_store(&g_stop_published, 0);
-    atomic_store(&g_session_active, 1);
-    ctl_wake();
+    // Published by activate() under the same lock as Stop.
     // Activate 之后冻结登记：本局用哪个编译器从此不能再被换掉（W2.6 的身份前提）。
     // 没有登记时只告警：诊断构建（无 managed 服务）本来就绑不上，不能因此拒绝激活。
     {
@@ -544,70 +564,83 @@ static int32_t activate(void *context) {
     return S2A_DIRECT_RES_OK;
 }
 
-static int32_t request_stop_impl(void *context) {
-    struct provider_context *ctx = (struct provider_context *)context;
+
+// Publish activation ownership before touching the device. Stop can retain it
+// without waiting for a blocked activation or mistaking it for an idle device.
+static int32_t activate(void *context) {
+    struct provider_context *ctx = context;
     if (!ctx) return S2A_DIRECT_RES_ARGUMENT;
-    // Stop 发布是幂等且线程安全的：先置 STOPPING 并唤醒 owner poll，再拆后端会话。
-    // poll 看到 STOPPED 后不再驱动需求 worker，避免与下面的有界收尾抢同一份会话。
-    if (ctx->state == S2A_DIRECT_ACTIVE) ctx->state = S2A_DIRECT_STOPPING;
-    atomic_store(&g_stop_published, 1);
-    ctl_wake();
-    // Failed 是持久终态：但“上一次 Stop 因 worker 未退出而保留 session”时 engine_ok 仍为 1，
-    // 允许重复 Stop 先回收 worker，成功后才进入 STOPPED；否则返回首个根因。
-    if (ctx->state == S2A_DIRECT_FAILED && !ctx->engine_ok)
-        return ctx->error ? ctx->error : S2A_DIRECT_RES_INTERNAL;
-    switch (ctx->state) {
-        case S2A_DIRECT_PREPARED:
-        case S2A_DIRECT_STOPPING:
-        case S2A_DIRECT_FAILED:   // 只有 engine_ok=1 的“收尾未完成”会走到这里
-            if (ctx->engine_ok) {
-                // 先发布撤销，然后**不持窗口锁**做长收尾：shutdown 可能等 worker/退休数秒，
-                // 持锁会把 UI 线程的 release/revoke 一起拖过 1 s。release 用 stopping_engine
-                // 识别这个窗口，不会并发 detach。
-                pthread_mutex_lock(&g_window_mu);
-                ctx->revoking = 1;
-                ctx->stopping_engine = 1;
-                atomic_store(&g_session_active, 0);
-                pthread_mutex_unlock(&g_window_mu);
-                int src = nvk_session_close();
-                pthread_mutex_lock(&g_window_mu);
-                ctx->stopping_engine = 0;
-                // 收尾没证明完成时不能把 engine_ok 清掉：会话/device/上下文要留到进程退出或下一次
-                // Stop 回收；清掉会让 destroy 跳过唯一一次真正的退休证明。
-                if (!src) ctx->engine_ok = 0;
-                {
-                    // provider 侧 owner 控制片对账。执行包挂起/恢复的统计由 adapter shutdown 在
-                    // nvk_exec_owner_init 清状态之前单独打印（这里读会在收尾后归零）。
-                    __android_log_print(ANDROID_LOG_INFO, TAG,
-                                        "direct stop: owner poll slices=%llu suspended=%llu windowActions=%llu "
-                                        "stopSeen=%llu",
-                                        (unsigned long long)atomic_load(&g_owner_slices),
-                                        (unsigned long long)atomic_load(&g_owner_suspended_slices),
-                                        (unsigned long long)atomic_load(&g_owner_window_actions),
-                                        (unsigned long long)atomic_load(&g_owner_stop_seen));
-                }
-                if (src) {
-                    // 帧队列/最后一帧呈现退休没有证明：保留已持有窗口的 WSI 租约（不 ACK），
-                    // 状态如实进 Failed + Retirement；不能写 Stopped/清 blockers。
-                    snprintf(ctx->reason, sizeof ctx->reason,
-                             "direct stop did not prove frame/presentation retirement; window lease kept (no ACK)");
-                    set_window_error(ctx, ctx->reason);
-                    ctx->state = S2A_DIRECT_FAILED;
-                    ctx->error = S2A_DIRECT_RES_RETIREMENT;
-                    ctx->blockers = S2A_DIRECT_BLOCK_PRESENT;
-                    __android_log_print(ANDROID_LOG_ERROR, TAG, "direct stop: %s", ctx->reason);
-                    pthread_mutex_unlock(&g_window_mu);
-                    return S2A_DIRECT_RES_RETIREMENT;
-                }
-                release_lease_window(ctx);
-                pthread_mutex_unlock(&g_window_mu);
-            }
-            ctx->state = S2A_DIRECT_STOPPED;
-            ctx->blockers = 0;
-            return S2A_DIRECT_RES_OK;
-        default:
-            return S2A_DIRECT_RES_STOPPED;
+    pthread_mutex_lock(&g_window_mu);
+    if (atomic_load(&g_stop_published) || ctx->activation_started || ctx->state != S2A_DIRECT_PREPARED) {
+        pthread_mutex_unlock(&g_window_mu); return S2A_DIRECT_RES_STOPPED;
     }
+    ctx->activation_started = 1;
+    pthread_mutex_unlock(&g_window_mu);
+    int32_t rc = activate_impl(context);
+    pthread_mutex_lock(&g_window_mu);
+    ctx->activation_started = 0;
+    if (rc == S2A_DIRECT_RES_OK) ctx->engine_ok = 1;
+    if (atomic_load(&g_stop_published)) {
+        ctx->revoking = ctx->stopping_engine = 1;
+        ctx->state = S2A_DIRECT_FAILED;
+        ctx->error = S2A_DIRECT_RES_RETIREMENT;
+        ctx->blockers = S2A_DIRECT_BLOCK_PRESENT;
+        g_retained_context = ctx;
+        pthread_mutex_unlock(&g_window_mu);
+        return S2A_DIRECT_RES_RETIREMENT;
+    }
+    if (rc == S2A_DIRECT_RES_OK) {
+        ctx->state = S2A_DIRECT_ACTIVE;
+        ctx->blockers = 0;
+        atomic_store(&g_session_active, 1);
+    }
+    pthread_mutex_unlock(&g_window_mu);
+    ctl_wake();
+    return rc;
+}
+
+static int32_t request_stop_impl(void *context) {
+    struct provider_context *ctx = context;
+    if (!ctx) return S2A_DIRECT_RES_ARGUMENT;
+    // Close shader admission first; a resolver already admitted stays counted.
+    nvk_session_request_stop();
+    atomic_store(&g_stop_published, 1);
+    atomic_store(&g_session_active, 0);
+    ctl_wake_stop();
+    if (stop_window_lock()) return S2A_DIRECT_RES_RETIREMENT;
+    if (ctx->activation_started) {
+        g_retained_context = ctx;
+        pthread_mutex_unlock(&g_window_mu);
+        (void)nvk_session_wait_compiles();
+        __android_log_print(ANDROID_LOG_INFO, TAG, "direct stop: activation in flight; session/device retained");
+        return S2A_DIRECT_RES_RETIREMENT;
+    }
+    if (ctx->engine_ok) {
+        // No frontend/guest quiescence proof exists here. Keep the entire
+        // session, command buffers, WSI lease and device alive until exit.
+        ctx->revoking = 1;
+        ctx->stopping_engine = 1;
+        ctx->state = S2A_DIRECT_FAILED;
+        ctx->error = S2A_DIRECT_RES_RETIREMENT;
+        ctx->blockers = S2A_DIRECT_BLOCK_PRESENT;
+        snprintf(ctx->reason, sizeof ctx->reason,
+                 "frontend retirement unproven; session and window lease retained until process exit");
+        set_window_error(ctx, ctx->reason);
+        g_retained_context = ctx;
+        pthread_mutex_unlock(&g_window_mu);
+        (void)nvk_session_wait_compiles();
+        __android_log_print(ANDROID_LOG_INFO, TAG, "direct stop: %s", ctx->reason);
+        return S2A_DIRECT_RES_RETIREMENT;
+    }
+    if (ctx->state == S2A_DIRECT_FAILED) {
+        int32_t error = ctx->error ? ctx->error : S2A_DIRECT_RES_INTERNAL;
+        pthread_mutex_unlock(&g_window_mu);
+        return error;
+    }
+    ctx->state = S2A_DIRECT_STOPPED;
+    ctx->blockers = 0;
+    pthread_mutex_unlock(&g_window_mu);
+    return S2A_DIRECT_RES_OK;
 }
 
 static int32_t request_stop(void *context) {
@@ -683,51 +716,99 @@ static int32_t poll(void *context, uint32_t budget_ms) {
     return pending ? S2A_DIRECT_RES_PENDING : S2A_DIRECT_RES_OK;
 }
 
+// vkDeviceWaitIdle has no timeout parameter. The worker owns its device/context
+// until it returns; the caller never frees either on deadline. No cancellation.
+static void *device_idle_worker(void *arg) {
+    struct provider_context *ctx = arg;
+    // The binding registry also has a mutex; do not block the stop caller on it.
+    uint64_t start = ctx->idle_deadline - NVK_SHUTDOWN_BUDGET_NS;
+    atomic_store_explicit(&ctx->idle_phase, 1, memory_order_release);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close enter compiler unbind: elapsed=%llums", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull));
+    int unbind = s2a_direct_unbind_compiler_v1(ctx);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close exit compiler unbind: elapsed=%llums rc=%d", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull), unbind);
+    atomic_store_explicit(&ctx->idle_phase, 2, memory_order_release);
+    if (unbind != S2A_DIRECT_RES_OK) ctx->idle_result = VK_ERROR_UNKNOWN;
+    else if ((uint64_t)ctl_now_ns() >= ctx->idle_deadline) ctx->idle_result = VK_TIMEOUT;
+    else if (!ctx->device_ok) ctx->idle_result = VK_SUCCESS;
+    else {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close enter device idle: elapsed=%llums", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull));
+        ctx->idle_result = s2a_vk_device_wait_idle(&ctx->device);
+        __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close exit device idle: elapsed=%llums rc=%d", (unsigned long long)(((uint64_t)ctl_now_ns() - start) / 1000000ull), ctx->idle_result);
+    }
+    atomic_store_explicit(&ctx->idle_done, 1, memory_order_release);
+    return NULL;
+}
+static int device_idle_bounded(struct provider_context *ctx, uint64_t deadline) {
+    uint64_t start = deadline - NVK_SHUTDOWN_BUDGET_NS;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close enter device retirement: elapsed=%llums", (unsigned long long)((ctl_now_ns() - (int64_t)start) / 1000000ll));
+    if (!ctx->idle_started) {
+        if ((uint64_t)ctl_now_ns() >= deadline) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk close device idle: deadline before start (device retained)"); return -1;
+        }
+        ctx->idle_deadline = deadline;
+        atomic_store_explicit(&ctx->idle_done, 0, memory_order_relaxed);
+        pthread_attr_t attr;
+        int e = pthread_attr_init(&attr);
+        if (e) { __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk close device idle: thread attr %d (device retained)", e); return -1; }
+        e = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (!e) e = pthread_create(&ctx->idle_thread, &attr, device_idle_worker, ctx);
+        pthread_attr_destroy(&attr);
+        if (e) { __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk close device idle: thread create %d (device retained)", e); return -1; }
+        ctx->idle_started = 1;
+    }
+    while (!atomic_load_explicit(&ctx->idle_done, memory_order_acquire)) {
+        int64_t n = ctl_now_ns();
+        if ((uint64_t)n >= deadline) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk close device retirement timeout: elapsed=%llums stage=%s (thread/device retained)", (unsigned long long)((n - (int64_t)start) / 1000000ll), atomic_load_explicit(&ctx->idle_phase, memory_order_acquire) == 0 ? "worker start" : atomic_load_explicit(&ctx->idle_phase, memory_order_acquire) == 1 ? "compiler unbind" : "device idle");
+            return -1;
+        }
+        struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+    if ((uint64_t)ctl_now_ns() >= deadline) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk close device idle: completion after deadline (device retained)"); return -1;
+    }
+    // The detached worker performs no context access after publishing idle_done.
+    ctx->idle_started = 0;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "nvk close exit device retirement: elapsed=%llums rc=%d", (unsigned long long)((ctl_now_ns() - (int64_t)start) / 1000000ll), ctx->idle_result);
+    return ctx->idle_result == VK_SUCCESS ? 0 : -1;
+}
+
 static int32_t destroy_impl(void *context) {
     struct provider_context *ctx = (struct provider_context *)context;
     if (!ctx) return S2A_DIRECT_RES_ARGUMENT;
-    diag_log_manifest("destroy", ctx->shader_dir);
-    // 会话结束就释放编译登记：表只有 4 项，不释放会让下一次会话无处登记。
-    s2a_direct_unbind_compiler_v1(ctx);
+    nvk_session_request_stop();
     // Destroy 之后 context 释放：任何迟到的 owner poll 必须立刻看到 STOPPED，不能再碰 ctx。
     atomic_store(&g_stop_published, 1);
     atomic_store(&g_session_active, 0);
-    ctl_wake();
-    int retire_ok = 0;
-    pthread_mutex_lock(&g_window_mu);
+    ctl_wake_stop();
+    if (stop_window_lock()) return S2A_DIRECT_RES_RETIREMENT;
+    if (ctx->activation_started) {
+        g_retained_context = ctx;
+        pthread_mutex_unlock(&g_window_mu);
+        (void)nvk_session_wait_compiles();
+        __android_log_print(ANDROID_LOG_INFO, TAG, "direct destroy: activation in flight; session/device retained");
+        return S2A_DIRECT_RES_RETIREMENT;
+    }
     ctx->revoking = 1;
     if (ctx->engine_ok) {
-        // 适配层会话在 device 之前关：它自己持有 swapchain/图像/池。首次报出的
-        // “呈现退休没有证明”留着不覆盖，租约也不归还（不能 ACK）。
-        retire_ok = nvk_session_close();
-        if (!retire_ok) ctx->engine_ok = 0;
-        if (retire_ok) {
-            __android_log_print(ANDROID_LOG_ERROR, TAG,
-                                "direct destroy: session has unretired frame/presentation obligations; "
-                                "window lease kept (not ACKed), no normal-stop claim");
-        } else {
-            release_lease_window(ctx);
-        }
-    }
-    if (retire_ok) {
+        ctx->stopping_engine = 1;
         g_retained_context = ctx;
-        // 退休没有证明：保留上下文/device/WSI 租约（不 free），让 tombstone 仍能读到首错；
-        // 进程退出回收。下一次 Stop 先回收 worker，成功后才允许正常 destroy。
-        __android_log_print(ANDROID_LOG_ERROR, TAG,
-                            "direct destroy: retirement incomplete (%s); context/device retained for process teardown",
-                            ctx->window_error[0] ? ctx->window_error : (ctx->reason[0] ? ctx->reason : "no proof"));
         pthread_mutex_unlock(&g_window_mu);
+        (void)nvk_session_wait_compiles();
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "direct destroy: frontend retirement unproven; session/device retained until process exit");
         return S2A_DIRECT_RES_RETIREMENT;
     }
+    // No active engine: no replay can still reference the compiler binding.
     g_retained_context = ctx; // 等待期间也不允许新 prepare 覆盖 owner。
     pthread_mutex_unlock(&g_window_mu);
-    if (ctx->device_ok && s2a_vk_device_destroy(&ctx->device, 0)) {
-        pthread_mutex_lock(&g_window_mu);
-        g_retained_context = ctx;
-        pthread_mutex_unlock(&g_window_mu);
-        return S2A_DIRECT_RES_RETIREMENT;
+    uint64_t deadline = nvk_session_stop_deadline();
+    if (!deadline || device_idle_bounded(ctx, deadline)) return S2A_DIRECT_RES_RETIREMENT;
+    if (ctx->device_ok) {
+        if (s2a_vk_device_destroy(&ctx->device, 1)) return S2A_DIRECT_RES_RETIREMENT;
+        ctx->device_ok = 0;
     }
-    pthread_mutex_lock(&g_window_mu);
+    if (stop_window_lock()) return S2A_DIRECT_RES_RETIREMENT;
     if (g_active_context == ctx) g_active_context = NULL;
     if (g_retained_context == ctx) g_retained_context = NULL;
     pthread_mutex_unlock(&g_window_mu);
@@ -735,7 +816,15 @@ static int32_t destroy_impl(void *context) {
     return S2A_DIRECT_RES_OK;
 }
 
-static int32_t destroy(void *context) { return destroy_impl(context); }
+static int32_t destroy(void *context) {
+    struct provider_context *ctx = context;
+    if (!ctx) return S2A_DIRECT_RES_ARGUMENT;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&ctx->destroying, &expected, 1)) return S2A_DIRECT_RES_RETIREMENT;
+    int32_t rc = destroy_impl(ctx);
+    if (rc != S2A_DIRECT_RES_OK) atomic_store(&ctx->destroying, 0); // successful destroy already freed ctx
+    return rc;
+}
 
 static int32_t prepare(const struct s2a_graphics_descriptor_v1 *descriptor, uint64_t session,
                        const char *state_dir, void *user, struct s2a_direct_api_v1 *table,
@@ -794,6 +883,15 @@ static int32_t prepare(const struct s2a_graphics_descriptor_v1 *descriptor, uint
                         descriptor->storage_write_stages,
                         descriptor->storage_coverage_complete ? "complete" : "unknown");
     ctx->session = session;
+    // No provider table has been published yet; Stop cannot race this reset.
+    if (nvk_session_prepare()) {
+        snprintf(why, why_size, "previous shader resolution is still in flight");
+        if (s2a_vk_device_destroy(&ctx->device, 0)) {
+            pthread_mutex_lock(&g_window_mu); g_retained_context = ctx; pthread_mutex_unlock(&g_window_mu);
+            return S2A_DIRECT_RES_RETIREMENT;
+        }
+        free(ctx); return S2A_DIRECT_RES_RETIREMENT;
+    }
     // 新会话：清零 owner 控制统计，Stop 标记回到未发布（activate 后才允许 poll 工作）。
     atomic_store(&g_stop_published, 0);
     atomic_store(&g_session_active, 0);

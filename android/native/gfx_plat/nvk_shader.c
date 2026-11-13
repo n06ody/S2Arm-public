@@ -22,9 +22,40 @@
 #include "s2a_direct_host.h"
 #include "nvn/nvn_vk_program_result.h"
 #include "nvn/nvn_vk_compute_request.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// One atomic linearizes session stop with shader admission. The low bits
+// retain every active resolver until it has finished using the session, not
+// merely until the managed compiler returns.
+#define NVK_SHADER_STOP_BIT (1u << 31)
+static _Atomic unsigned g_shader_admission;
+void nvk_shader_stop(void) { atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel); }
+unsigned nvk_shader_inflight(void) { return atomic_load_explicit(&g_shader_admission, memory_order_acquire) & ~NVK_SHADER_STOP_BIT; }
+int nvk_shader_open(void) {
+    unsigned expected = NVK_SHADER_STOP_BIT;
+    if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire)) return 0;
+    return expected == 0 ? 0 : -1;
+}
+static int shader_enter(void) {
+    unsigned s = atomic_load_explicit(&g_shader_admission, memory_order_acquire);
+    for (;;) {
+        if ((s & NVK_SHADER_STOP_BIT) || (s & ~NVK_SHADER_STOP_BIT) == NVK_SHADER_STOP_BIT - 1) return -1;
+        if (atomic_compare_exchange_weak_explicit(&g_shader_admission, &s, s + 1, memory_order_acq_rel, memory_order_acquire)) return 0;
+    }
+}
+static void shader_leave(void) { atomic_fetch_sub_explicit(&g_shader_admission, 1, memory_order_release); }
+// The successful compare/exchange is the compile-admission linearization point.
+// Stop after that point sees the resolver in flight and retains its resources.
+static int shader_compile_admit(void) {
+    unsigned s = atomic_load_explicit(&g_shader_admission, memory_order_acquire);
+    for (;;) {
+        if (s & NVK_SHADER_STOP_BIT) return 0;
+        if (atomic_compare_exchange_weak_explicit(&g_shader_admission, &s, s, memory_order_acq_rel, memory_order_acquire)) return 1;
+    }
+}
 
 struct entry { struct rp_prog prog; int failed; };
 static nvn_hmap g_progs = {.klen = 32};   // 内容身份（SHA-256）→ struct entry *
@@ -437,7 +468,7 @@ static uint64_t input_sig(const struct rp_shader_req *q, const struct s2a_direct
 }
 static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pcp, uint32_t stages, int nst);
 
-int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) {
+static int shader_resolve_graphics(const struct rp_shader_req *q, const struct rp_prog **out) {
     *out = NULL;
     uint32_t stages = rp_shader_graphics_stages();
     // 认两种：顶点 + 片元；只有顶点（只写深度的绘制：深度预通道、阴影图）。几何 / 细分阶段还没接
@@ -521,6 +552,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
             if (s2a_compile_request_build(&in, &json, &jl, gaps, sizeof gaps)) { red1("request_build_failed", gaps); return -1; }
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             if (g_texpool_diag) g_pool_attempts++;
+            if (!shader_compile_admit()) { free(json); nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
             int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
             free(json);
             if (ran || !oc.bytes || !oc.bytes_len) {
@@ -599,7 +631,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     return e;
 }
 
-int rp_shader_resolve_compute(const struct rp_prog **out) {
+static int shader_resolve_compute(const struct rp_prog **out) {
     *out = NULL;
     if (!(rp_S.skey_ok >> 5 & 1)) { nvn_unimpl("shader", "compute_stage_key_missing", NULL); return -1; }
     if (!shader_texture_pool_ready()) return -1;
@@ -664,6 +696,7 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
         if (!bytes) {
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             if (g_texpool_diag) g_pool_attempts++;
+            if (!shader_compile_admit()) { nvk_compute_request_release(&rq); nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 g_n_failed++; red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
@@ -684,6 +717,15 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
     if (e->failed) return -1;
     *out = &e->prog;
     return 0;
+}
+
+int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) {
+    if (shader_enter()) { *out = NULL; nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
+    int rc = shader_resolve_graphics(q, out); shader_leave(); return rc;
+}
+int rp_shader_resolve_compute(const struct rp_prog **out) {
+    if (shader_enter()) { *out = NULL; nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
+    int rc = shader_resolve_compute(out); shader_leave(); return rc;
 }
 
 void rp_shader_reset(void) {
