@@ -672,6 +672,15 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     c->max_sets = l->maxBoundDescriptorSets;
 
     VkPhysicalDeviceFeatures f = vk->dev->core_features;   // 已启用记录，不是「设备支持」
+    // debug 强制设备特性不能绕开 GS+遮挡探测门；缺记录或未通过保持未接。
+    const char *gs_probe = s2a_capprobe_gs_occ_state ? s2a_capprobe_gs_occ_state() : NULL;
+    const char *gs_verdict = gs_probe ? strrchr(gs_probe, ':') : NULL;
+    int gs_enabled = f.geometryShader && gs_verdict && !strcmp(gs_verdict + 1, "supported");
+    if (gs_enabled) c->caps |= NVN_GPU_CAP_GEOMETRY;
+    if (gs_enabled && f.vertexPipelineStoresAndAtomics) {
+        c->storage_stages |= 1u << NVN_GPU_SH_GS;
+        c->atomic_stages |= 1u << NVN_GPU_SH_GS;
+    }
     if (f.vertexPipelineStoresAndAtomics) c->storage_stages |= 1u << NVN_GPU_SH_VS;
     if (f.fragmentStoresAndAtomics) c->storage_stages |= 1u << NVN_GPU_SH_FS;
     c->storage_stages |= 1u << NVN_GPU_SH_CS;
@@ -1412,6 +1421,7 @@ static VkShaderStageFlagBits vk_shader_stage(nvn_gpu_stage st) {
     switch (st) {
     case NVN_GPU_SH_VS: return VK_SHADER_STAGE_VERTEX_BIT;
     case NVN_GPU_SH_FS: return VK_SHADER_STAGE_FRAGMENT_BIT;
+    case NVN_GPU_SH_GS: return VK_SHADER_STAGE_GEOMETRY_BIT;
     case NVN_GPU_SH_CS: return VK_SHADER_STAGE_COMPUTE_BIT;
     default: return 0;
     }
@@ -1703,6 +1713,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!s || !s->blob || !s->bytes) return fail(err, NVN_GPU_E_ARG, "着色器 blob 为空");
+    if (s->stage == NVN_GPU_SH_GS && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
     if (s->kind != NVN_GPU_BLOB_SPIRV) return fail(err, NVN_GPU_E_UNSUPPORTED, "只收 SPIR-V blob（kind=%d）", s->kind);
     if (s->bytes & 3) return fail(err, NVN_GPU_E_ARG, "SPIR-V 字节数不是 4 的倍数");
     struct nvn_gpu_shader_s *sh = calloc(1, sizeof *sh);
@@ -1919,8 +1931,12 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     for (int st = 0; st < 5; st++)
         if (d->st[st].sh && d->st[st].sh->missing_storage_format_feature)
             return fail(err, NVN_GPU_E_UNSUPPORTED, "设备未启用无格式存储图像所需特性");
-    for (int i = 2; i < 5; i++)
-        if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "几何 / 细分阶段：本段未实现");
+    if (d->st[NVN_GPU_SH_GS].sh && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
+    if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4)
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 非原生图元未实现");
+    for (int i = NVN_GPU_SH_TCS; i < 5; i++)
+        if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "细分阶段：本段未实现");
 
     const uint32_t hb = pipe_hash(d) % PIPE_HT_N;
     pthread_mutex_lock(&g_mu);

@@ -1580,6 +1580,105 @@ static int load_shader_pair(const char *dir, const char *vs_name, const char *fs
     return 1;
 }
 
+// GS 专属：同一图形管线的三个阶段各读自己的 UBO；输出两张 4x4 手算图。
+static void t_gs_pixels(const char *dir) {
+    static const char *names[3] = {"gs_probe.vert", "gs_probe.frag", "gs_probe.geom"};
+    nvn_gpu_shader sh[3] = {0}; void *mem[3] = {0};
+    nvn_gpu_layout_ent ent[3]; nvn_gpu_layout layout[3]; nvn_gpu_err e = {0};
+    memset(ent, 0, sizeof ent); memset(layout, 0, sizeof layout);
+    for (int st = 0; st < 3; st++) {
+        char path[512]; size_t len = 0; snprintf(path, sizeof path, "%s/%s.spv", dir, names[st]); mem[st] = read_file(path, &len);
+        CHECK(mem[st] != NULL, "GS fixture shader %d exists", st); if (!mem[st]) goto cleanup;
+        ent[st].set = 0; ent[st].binding = st == 0 ? 0 : st == 1 ? 2 : 1;
+        ent[st].cls = NVN_GPU_RES_UBO; ent[st].access = NVN_GPU_ACC_R; ent[st].count = 1; ent[st].stages = 1u << st;
+        layout[st].ent = &ent[st]; layout[st].nent = 1;
+        nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
+        src.blob = mem[st]; src.bytes = len; src.entry = "main"; src.layout = &layout[st];
+        nvn_gpu_rc r = nvn_gpu_shader_load(&src, &sh[st], &e);
+        CHECK(OK(r), "GS fixture stage %d load: %d %s", st, r.code, e.why); if (!OK(r)) goto cleanup;
+    }
+    nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.color.logic_op = 3;
+    for (int st = 0; st < 3; st++) pd.st[st].sh = sh[st];
+    pd.cfmt[0] = NVN_FORMAT_RGBA8; pd.samples = 1; pd.prim = 0; pd.chmask.mask = 15;
+    nvn_gpu_pipe pipe = NULL; nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e);
+    CHECK(OK(r), "GS point to triangle pipeline: %d %s", r.code, e.why); if (!OK(r)) goto cleanup;
+    const float values[4][4] = {{0,.25f,0,0}, {0,.5f,0,1}, {0,.25f,0,0}, {0,0,.25f,0}};
+    nvn_gpu_buf ub[4] = {0}; for (int i = 0; i < 4; i++) ub[i] = make_buf(16, NVN_GPU_MEM_SHARED, values[i]);
+    nvn_gpu_tex tex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex); nvn_gpu_buf rb = make_buf(128, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_cmd cmd = begin_cmd();
+    for (int passno = 0; passno < 2; passno++) {
+        nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.color[0].view = view;
+        pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+        pass.w = 4; pass.h = 4; pass.layers = 1; nvn_gpu_pass_begin(cmd, &pass);
+        nvn_gpu_set_pipe(cmd, pipe);
+        nvn_gpu_dyn dyn = {0}; dyn.nvp = 1; dyn.vp[0][2] = dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
+        dyn.has_sc = 1; dyn.sc[2] = dyn.sc[3] = 4; nvn_gpu_set_dyn(cmd, &dyn);
+        for (int st = 0; st < 3; st++) { nvn_gpu_binding b = {0}; b.cls = NVN_GPU_RES_UBO; b.u.b.buf = ub[st]; b.u.b.len = 16; nvn_gpu_bind(cmd, (nvn_gpu_stage)st, &b, 1); }
+        nvn_gpu_draw_args draw = {0}; draw.prim = 0; draw.count = draw.instances = 1; nvn_gpu_draw(cmd, &draw);
+        if (passno) {
+            nvn_gpu_binding b = {0}; b.cls = NVN_GPU_RES_UBO; b.u.b.buf = ub[3]; b.u.b.len = 16;
+            nvn_gpu_bind(cmd, NVN_GPU_SH_GS, &b, 1); dyn.sc[0] = 2; dyn.sc[2] = 2; nvn_gpu_set_dyn(cmd, &dyn); nvn_gpu_draw(cmd, &draw);
+        }
+        nvn_gpu_pass_end(cmd); nvn_gpu_copy_tex_buf(cmd, tex, 0, 0, NULL, rb, passno * 64, 16, 64);
+    }
+    r = nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &e); CHECK(OK(r), "GS commit %d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(1, 5000000000ull, &e); CHECK(OK(r), "GS wait %d %s", r.code, e.why);
+    for (int passno = 0; passno < 2; passno++) for (int i = 0; i < 16; i++) {
+        const uint8_t *v = buf_cpu(rb) + passno * 64 + i * 4;
+        const uint8_t green[4] = {0,255,0,255}, changed[4] = {0,191,64,255};
+        const uint8_t *want = passno && i % 4 >= 2 ? changed : green;
+        CHECK(!memcmp(v, want, 4), "GS pass %d pixel %d got %u,%u,%u,%u want %u,%u,%u,%u", passno, i, v[0],v[1],v[2],v[3],want[0],want[1],want[2],want[3]);
+    }
+    nvn_gpu_buf_release(rb, NULL, NULL); nvn_gpu_view_release(view); nvn_gpu_tex_release(tex);
+    for (int i = 0; i < 4; i++) nvn_gpu_buf_release(ub[i], NULL, NULL);
+cleanup:
+    for (int st = 0; st < 3; st++) { if (sh[st]) nvn_gpu_shader_release(sh[st]); free(mem[st]); }
+}
+
+// 使用生产请求经真实编译器和生产 parser 导出的同一组 Maxwell 模块。
+static void t_gs_compiler_pixels(const char *dir) {
+    const char *names[3] = {"vs", "fs", "gs"}; nvn_gpu_shader sh[3] = {0}; void *mem[3] = {0};
+    nvn_gpu_layout_ent ent = {0}; ent.set = 0; ent.binding = 0; ent.cls = NVN_GPU_RES_UBO;
+    ent.access = NVN_GPU_ACC_R; ent.count = 1; ent.stages = 7; ent.src_kind = NVN_RB_SUPPORT;
+    nvn_gpu_layout layout = {0}; layout.ent = &ent; layout.nent = 1; layout.support_bytes = 2608;
+    nvn_gpu_err e = {0};
+    for (int st = 0; st < 3; st++) {
+        char path[512]; size_t len = 0; snprintf(path, sizeof path, "%s/%s.spv", dir, names[st]); mem[st] = read_file(path, &len);
+        CHECK(mem[st] != NULL, "compiled Maxwell %s module exists", names[st]); if (!mem[st]) goto cleanup;
+        nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
+        src.blob = mem[st]; src.bytes = len; src.entry = "main"; src.layout = &layout;
+        nvn_gpu_rc r = nvn_gpu_shader_load(&src, &sh[st], &e);
+        CHECK(OK(r), "compiled Maxwell %s load: %d %s", names[st], r.code, e.why); if (!OK(r)) goto cleanup;
+    }
+    nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.color.logic_op = 3;
+    for (int st = 0; st < 3; st++) pd.st[st].sh = sh[st];
+    pd.cfmt[0] = NVN_FORMAT_RGBA8; pd.samples = 1; pd.prim = 0; pd.chmask.mask = 15;
+    nvn_gpu_pipe pipe = NULL; nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e);
+    CHECK(OK(r), "compiled Maxwell GS pipeline: %d %s", r.code, e.why); if (!OK(r)) goto cleanup;
+    uint8_t support[2608] = {0}; uint32_t flags = 3; memcpy(support + 1392, &flags, 4);
+    float one = 1; memcpy(support + 1408, &one, 4);
+    for (unsigned i = 0; i < 73; i++) { memcpy(support + 192 + i * 16, &one, 4); memcpy(support + 1440 + i * 16, &one, 4); }
+    nvn_gpu_buf ub = make_buf(sizeof support, NVN_GPU_MEM_SHARED, support);
+    nvn_gpu_tex tex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex); nvn_gpu_buf rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_cmd cmd = begin_cmd(); nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.color[0].view = view;
+    pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE; pass.w = 4; pass.h = 4; pass.layers = 1;
+    nvn_gpu_pass_begin(cmd, &pass); nvn_gpu_set_pipe(cmd, pipe);
+    nvn_gpu_dyn dyn = {0}; dyn.nvp = 1; dyn.vp[0][2] = dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
+    dyn.has_sc = 1; dyn.sc[2] = dyn.sc[3] = 4; nvn_gpu_set_dyn(cmd, &dyn);
+    for (int st = 0; st < 3; st++) { nvn_gpu_binding b = {0}; b.cls = NVN_GPU_RES_UBO; b.u.b.buf = ub; b.u.b.len = sizeof support; nvn_gpu_bind(cmd, (nvn_gpu_stage)st, &b, 1); }
+    nvn_gpu_draw_args draw = {0}; draw.prim = 0; draw.count = draw.instances = 1; nvn_gpu_draw(cmd, &draw);
+    nvn_gpu_pass_end(cmd); nvn_gpu_copy_tex_buf(cmd, tex, 0, 0, NULL, rb, 0, 16, 64);
+    r = nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &e); CHECK(OK(r), "Maxwell GS commit %d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(1, 5000000000ull, &e); CHECK(OK(r), "Maxwell GS wait %d %s", r.code, e.why);
+    for (int i = 0; i < 16; i++) { const uint8_t green[4] = {0,255,0,255}; const uint8_t *v = buf_cpu(rb) + i * 4;
+        CHECK(!memcmp(v, green, 4), "Maxwell GS pixel %d got %u,%u,%u,%u expected 0,255,0,255", i, v[0],v[1],v[2],v[3]); }
+    nvn_gpu_buf_release(rb, NULL, NULL); nvn_gpu_view_release(view); nvn_gpu_tex_release(tex); nvn_gpu_buf_release(ub, NULL, NULL);
+cleanup:
+    for (int st = 0; st < 3; st++) { if (sh[st]) nvn_gpu_shader_release(sh[st]); free(mem[st]); }
+}
+
 static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp, const char *dir, const char *frag) {
     nvn_gpu_layout_ent ents[2];
     memset(ents, 0, sizeof ents);
@@ -4959,6 +5058,21 @@ int main(int argc, char **argv) {
         return 2;   // 不静默跳过：run.sh 把 2 当红
     }
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (argc > 2 && !strcmp(argv[2], "--gs-no-cap")) {
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gs-no-cap";
+        if (!open_backend()) return 1;
+        nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
+        CHECK(g_dev.core_features.geometryShader == VK_FALSE && !(cp.caps & NVN_GPU_CAP_GEOMETRY), "no probe leaves GS disabled");
+        char path[512]; size_t len = 0; snprintf(path, sizeof path, "%s/gs_probe.geom.spv", argv[1]); void *blob = read_file(path, &len);
+        CHECK(blob != NULL, "GS no-cap shader exists");
+        nvn_gpu_shader_src ss = {0}; ss.stage = NVN_GPU_SH_GS; ss.kind = NVN_GPU_BLOB_SPIRV; ss.blob = blob; ss.bytes = len; ss.entry = "main";
+        nvn_gpu_shader sh = NULL; nvn_gpu_err e = {0}; nvn_gpu_rc sr = nvn_gpu_shader_load(&ss, &sh, &e);
+        CHECK(sr.code == NVN_GPU_E_UNSUPPORTED && !sh, "no capability refuses GS shader before Vulkan");
+        if (sh) nvn_gpu_shader_release(sh);
+        free(blob);
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "GS no-cap close"); s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     bc_timeout_lifetime();
     // 机型模拟档（android/tests/vk/sim_tiers.sh）按这行核对模拟层确实藏掉了对应能力。
     printf("sim caps: vertexPipelineStoresAndAtomics=%u dualSrcBlend=%u calibrated_timestamps=%d（0 = 无校准扩展，走完成点兜底）\n",
@@ -4985,10 +5099,26 @@ int main(int argc, char **argv) {
 
     nvn_gpu_caps caps;
     nvn_gpu_caps_get(&caps);
+    if (getenv("S2A_CAPPROBE_RESULT")) {
+        CHECK(g_dev.core_features.geometryShader == VK_TRUE, "探测通过后设备须真实启用 geometryShader");
+        CHECK((caps.caps & NVN_GPU_CAP_GEOMETRY) != 0, "已启用 GS 应报告后端能力");
+    } else {
+        CHECK(g_dev.core_features.geometryShader == VK_FALSE && !(caps.caps & NVN_GPU_CAP_GEOMETRY),
+              "无探测时设备和后端都不启用 GS");
+    }
     CHECK(caps.api == NVN_GPU_API_VULKAN, "caps.api 应为 VULKAN");
     CHECK(caps.max_sets > 0 && caps.max_buf_bytes > 0, "caps 限值没有填");
     CHECK(caps.caps_id[0] | caps.caps_id[1] | caps.caps_id[15], "caps_id 全 0");
     CHECK(nvn_gpu_format_caps(0x1) != 0, "format_caps 对 R8 无能力位");   // NVN_FORMAT_R8
+    if (argc > 2 && !strcmp(argv[2], "--gs-compiler")) t_gs_compiler_pixels(argv[1]);
+    else t_gs_pixels(argv[1]);
+    { nvn_gpu_err eg; CHECK(OK(nvn_gpu_close(5000000000ull, &eg)), "GS fixture close: %d %s", eg.rc.code, eg.why); }
+    if (argc > 2 && (!strcmp(argv[2], "--gs-only") || !strcmp(argv[2], "--gs-compiler"))) {
+        s2a_vk_device_destroy(&g_dev, 1);
+        printf("GS 专属像素与资源：%d 处不符\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (!open_backend()) return 1;
     t76_buf_create_alloc_cap();
 
     t01_fill32();

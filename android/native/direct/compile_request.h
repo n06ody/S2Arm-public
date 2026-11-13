@@ -95,7 +95,7 @@ struct s2a_compile_request_input {
     size_t profile_bytes;
     int direct_abi;
     const char *translator_closure;
-    struct s2a_compile_stage_src stages[2];
+    struct s2a_compile_stage_src stages[3];
     int stage_count;
     struct s2a_compile_graphics_src gfx;
     struct s2a_compile_texture_src textures[S2A_COMPILE_TEXTURE_MAX];   // 真实绑定的纹理事实；0 条 = 没有可用来源

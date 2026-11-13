@@ -86,6 +86,7 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             return fail(why, why_size, "stage has no name");
         int idx = nvn_vk_program_graphics_stage_index(name_text);
         if (idx < 0) return fail(why, why_size, "stage name is not a supported NVN stage");
+        if (out->stage[idx].present) return fail(why, why_size, "duplicate result stage");
         if (s2a_jv_obj_find(st, "spirv", &spirv) || !s2a_jv_is_string(spirv))
             return fail(why, why_size, "stage has no spirv");
         uint8_t *words = NULL; size_t word_bytes = 0;
@@ -138,12 +139,12 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
                 // 少绑一个资源（错阴影 / 缺贴图），没有红行，是这类问题里最难查的一种。
                 // 守卫必须放在取 dst 之前——`dst = &out->bindings[count]` 在 count==cap 时已经越界，
                 // 紧随其后的 memset 会改写结构体里 binding_count 本身（复现过：17 条 → count 变 1）。
-                // FD_MAX_BINDINGS 现在是 producer 合同上限（support 1 + vs/fs 各 18+16+64+16 = 229）：
+                // FD_MAX_BINDINGS 现在是 producer 合同上限（support 1 + vs/fs/gs 各 18+16+64+16 = 343）：
                 // 越过它就是结果损坏/合同被违反，不是“再把数组调大”能掩盖的事。
                 char msg[224];
                 snprintf(msg, sizeof msg,
                          "program declares %d bindings, cap is %d: refusing to drop bindings "
-                         "(cap is the contract maximum: support 1 + 2x(18+16+64+16); more means a corrupt result)",
+                         "(cap is the contract maximum: support 1 + 3x(18+16+64+16); more means a corrupt result)",
                          n, FD_MAX_BINDINGS);
                 return fail(why, why_size, msg);
             }

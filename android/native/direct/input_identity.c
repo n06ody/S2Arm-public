@@ -128,6 +128,7 @@ int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf,
         if (t->stage && !strcmp(t->stage, "vs")) stage_idx = 0;
         else if (t->stage && !strcmp(t->stage, "fs")) stage_idx = 1;
         else if (t->stage && !strcmp(t->stage, "cs")) stage_idx = 2;
+        else if (t->stage && !strcmp(t->stage, "gs")) stage_idx = 3;
         else return -1;   // 缺 stage 不等同 vs：NULL 与 "vs" 不能编成同一个输入
         uint8_t target_idx = 0;
         uint16_t format_idx = 0;

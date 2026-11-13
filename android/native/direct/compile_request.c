@@ -396,7 +396,11 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
     if (!in->profile_json || in->profile_bytes < 2 || in->profile_json[0] != '{' ||
         in->profile_json[in->profile_bytes - 1] != '}') return -1;
     if (!in->request_id || !*in->request_id || !in->translator_closure) return -1;
-    if (in->stage_count < 1 || in->stage_count > 2) return -1;
+    if (in->stage_count < 1 || in->stage_count > 3) return -1;
+    int v2 = in->stage_count == 3;
+    if (v2 && (!in->stages[0].stage || strcmp(in->stages[0].stage, "vs") ||
+               !in->stages[1].stage || strcmp(in->stages[1].stage, "fs") ||
+               !in->stages[2].stage || strcmp(in->stages[2].stage, "gs"))) return -1;
     for (int i = 0; i < in->stage_count; i++) {
         const struct s2a_compile_stage_src *s = &in->stages[i];
         if (!s->stage || !s->code || !s->code_bytes || !s->control || !s->control_bytes) return -1;
@@ -405,7 +409,7 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
     struct sb b;
     memset(&b, 0, sizeof b);
     sb_puts(&b, "{");
-    sb_key_string(&b, "schema", "s2a-direct-compile-v1");
+    sb_key_string(&b, "schema", v2 ? "s2a-direct-compile-v2" : "s2a-direct-compile-v1");
     sb_puts(&b, ",");
     sb_key_u64(&b, "session", in->session);
     sb_puts(&b, ",");
@@ -456,6 +460,7 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
         sb_key_u32(&b, "constantBufferUse", s->constant_buffer_use);
         sb_puts(&b, "}");
     }
+    if (v2) sb_puts(&b, ",null,null");
     sb_puts(&b, "],");
 
     // graphicsState：只写有真实来源的字段；缺失的组逐项记进 gaps（编译器会按同一契约报 MISSING_FIELD）。
