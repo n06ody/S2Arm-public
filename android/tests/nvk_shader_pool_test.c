@@ -358,10 +358,13 @@ static int emit_real_request(const char *profile_path, const char *closure, cons
     struct rp_shader_req q = {0}; q.prim = 0; q.rt_count = 1; q.rt_format[0] = NVN_FORMAT_RGBA8;
     const struct rp_prog *prog = NULL; int rc = rp_shader_resolve(&q, &prog);
     if (tbuf == 2) {
-        int rejected = rc == -1 && !prog && compiler_calls == 1 &&
-            nvn_unimpl_count("shader", "texture_buffer_replay_unsupported") == 1 && gs_loads[1] == 0;
-        fprintf(stderr, "%s: real BUFFER result refuses unsupported replay before FS shader load\n", rejected ? "PASS" : "FAIL");
-        return !rejected;
+        int found = 0;
+        if (prog) for (uint32_t i = 0; i < prog->nent[1]; i++)
+            if (prog->ent[1][i].cls == NVN_GPU_RES_TBUF && prog->ent[1][i].src_reg == 128 &&
+                prog->dtt[1][i] == NVN_TEXTURE_TARGET_BUFFER + 1 && prog->dcls[1][i] == 0) found++;
+        int accepted = rc == 0 && prog && compiler_calls == 1 && gs_loads[1] == 1 && found == 1;
+        fprintf(stderr, "%s: real BUFFER result loads FS with declared TBUF layout\n", accepted ? "PASS" : "FAIL");
+        return !accepted;
     }
     printf("production Maxwell request: rc=%d captured=%d failures=%d\n", rc, compiler_calls, failures);
     return !(rc == -1 && compiler_calls == 1 && failures == 0);
@@ -390,10 +393,13 @@ static int emit_compute_request(const char *profile_path, const char *closure, c
     else capture_output = output;
     compiler_calls = 0; const struct rp_prog *prog = NULL; int rc = rp_shader_resolve_compute(&prog);
     if (replay) {
-        int rejected = rc == -1 && !prog && compiler_calls == 1 &&
-            nvn_unimpl_count("shader", "texture_buffer_replay_unsupported") == 1 && gs_loads[NVN_GPU_SH_CS] == 0;
-        fprintf(stderr, "%s: real compute BUFFER result refuses unsupported replay before CS shader load\n", rejected ? "PASS" : "FAIL");
-        return !rejected;
+        int found = 0;
+        if (prog) for (uint32_t i = 0; i < prog->nent[0]; i++)
+            if (prog->ent[0][i].cls == NVN_GPU_RES_TBUF && prog->ent[0][i].src_reg == 0 &&
+                prog->dtt[0][i] == NVN_TEXTURE_TARGET_BUFFER + 1 && prog->dcls[0][i] == 0) found++;
+        int accepted = rc == 0 && prog && compiler_calls == 1 && gs_loads[NVN_GPU_SH_CS] == 1 && found == 1;
+        fprintf(stderr, "%s: real compute BUFFER result loads CS with declared TBUF layout\n", accepted ? "PASS" : "FAIL");
+        return !accepted;
     }
     printf("production compute Maxwell request: rc=%d captured=%d failures=%d red=%s\n", rc, compiler_calls, failures, last_red);
     return !(rc == -1 && compiler_calls == 1 && failures == 0);
