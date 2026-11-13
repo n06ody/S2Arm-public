@@ -43,11 +43,33 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source):
+    def run(name, source, extra_libs=None, args=()):
         exe = out/name
-        src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *libs]
+        src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
-        return subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+        return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30)
+
+    if sys.argv[1:] == ['--legacy-compare']:
+        # Compare actual unchanged legacy REQUEST and S2AI1 bytes against merge-base.
+        base_sha = subprocess.check_output(['git', 'merge-base', 'HEAD', 'origin/main'], cwd=ROOT, text=True).strip()
+        paths = [original, native/'direct/input_identity.c', native/'direct/compile_request.c', native/'nvn/nvn_vk_compute_request.c']
+        replacements = {}
+        for path in paths:
+            relative = path.relative_to(ROOT).as_posix()
+            old = subprocess.check_output(['git', 'show', base_sha + ':' + relative], cwd=ROOT, text=True)
+            dest = out/('legacy-' + path.name)
+            dest.write_text(old)
+            replacements[path] = dest
+        baseline_libs = [replacements.get(path, path) for path in libs]
+        before = run('legacy-before', replacements[original], baseline_libs, ('--legacy-bytes',))
+        after = run('legacy-after', original, args=('--legacy-bytes',))
+        assert before.returncode == after.returncode == 0, (before.stderr, after.stderr)
+        before_lines, after_lines = before.stdout.splitlines(), after.stdout.splitlines()
+        assert len(before_lines) == len(after_lines) == 2
+        assert before_lines[0] == after_lines[0], 'legacy REQUEST bytes changed'
+        assert before_lines[1] == after_lines[1], 'legacy S2AI1 bytes changed'
+        print(f'legacy request and canonical identity byte-for-byte unchanged versus {base_sha}')
+        return 0
 
     if sys.argv[1:] == ['--withdraw']:
         text = original.read_text(encoding='utf-8')
@@ -73,6 +95,12 @@ def main():
              'else if (0 && !strcmp(code, "MISSING_FACT")) {', 1, 'compiler reason counted accurately'),
             ('drop-request-count', 'g_pool_request_rejected++;',
              '(void)g_pool_request_rejected;', 1, 'request failure is counted separately'),
+            ('drop-separate-vs', 'for (int st = 0; st < nst; st++) for (int slot = 0; slot < 128; slot++) {',
+             'for (int st = 0; st < nst; st++) for (int slot = 0; slot < 0; slot++) {', 1, 'separate VS registered view fact is sent'),
+            ('drop-separate-cs', 'for (int slot = 0; slot < 128; slot++) {\n        uint64_t h = rp_S.tex[5][128 + slot];',
+             'for (int slot = 0; slot < 0; slot++) {\n        uint64_t h = rp_S.tex[5][128 + slot];', 1, 'separate CS registered texture fact is sent'),
+            ('drop-separate-fast-identity', 'MIX(rp_tex_fact_sig(&rp_S.tex[0][128], 128, rp_S.tex_base, rp_S.tex_pool_n));',
+             '(void)rp_S.tex[0][128];', 1, 'separate texture rebind invalidates fast identity'),
         ]
         for name, before, after, count, expected in changes:
             assert text.count(before) == count, (name, 'mutation anchor')
@@ -81,7 +109,7 @@ def main():
             result = run(name, path)
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 10 negative controls')
+        print('PASS: 13 negative controls')
         return 0
     if sys.argv[1:]:
         raise ValueError('usage: nvk_shader_pool_test.py [--withdraw]')

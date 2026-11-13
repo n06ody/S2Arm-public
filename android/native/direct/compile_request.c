@@ -599,7 +599,7 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
 #undef GS_STR
     sb_puts(&b, "},");
     sb_puts(&b, "\"textures\":[");
-    if (in->texture_count < 0 || in->texture_count > 64) { free(b.p); return -1; }
+    if (in->texture_count < 0 || in->texture_count > S2A_COMPILE_TEXTURE_MAX) { free(b.p); return -1; }
     for (int i = 0; i < in->texture_count; i++) {
         const struct s2a_compile_texture_src *t = &in->textures[i];
         if (!t->stage || !t->format || !t->sampler_type || !t->array_length || t->cbuf_slot < -1) {

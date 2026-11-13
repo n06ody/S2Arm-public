@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn.h"
 #include "rp_shader.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -11,6 +12,7 @@
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "direct/compile_request.h"
+#include "direct/input_identity.h"
 #include "direct/source_store.h"
 #include "direct/sha256.h"
 #include "direct/s2a_direct.h"
@@ -18,6 +20,7 @@
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
 static unsigned fake_array_count;
+static int separate_fixture;
 int g_s2a_logfd = 2;
 static const char *fake_compile_error;
 static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512], last_request_reason[512];
@@ -50,8 +53,24 @@ int rp_origin_lower_left(void) { return 0; }
 // 此夹具只登记一个起点为 0 的池；空池也按真实 nvn_dpool_base 返回 0。
 int nvn_dpool_base(const void *pool, int tex) { (void)pool; (void)tex; return 0; }
 uint64_t nvn_ga2ca(uint64_t address) { return address; }
-int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) { (void)id; (void)t; (void)v; (void)h; return 0; }
-uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) { (void)h; (void)n; (void)b; return (uint64_t)count; }
+int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
+    if (!separate_fixture || (id != 77 && id != 78 && !(separate_fixture == 2 && id == 0))) return 0;
+    memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
+    *h = id == 77; if (*h) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; } return 1;
+}
+uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) {
+    uint64_t hash = 1469598103934665603ull;
+    for (int i = 0; i < n; i++) {
+        int id = h[i] ? (int)(h[i] & 0xfffff) : b; tex_t t; view_t v; int has = 0;
+        if (rp_tex_snap_by_id(id, &t, &v, &has)) {
+            hash = (hash ^ 1) * 1099511628211ull;
+            hash = (hash ^ (uint64_t)(has && v.set_format ? v.format : t.d.format)) * 1099511628211ull;
+            hash = (hash ^ (uint64_t)(has && v.set_target ? v.target : t.d.target)) * 1099511628211ull;
+            hash = (hash ^ (uint64_t)t.d.depth) * 1099511628211ull;
+        } else { hash = (hash ^ 2) * 1099511628211ull; hash = (hash ^ (id >= b && (uint64_t)(id - b) < (uint64_t)count)) * 1099511628211ull; }
+    }
+    return hash;
+}
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
     c->profile_json = profile; c->profile_bytes = strlen(profile); c->profile_hash = phash;
@@ -100,6 +119,26 @@ static void bind_pools(int n) {
     CHECK(rp_state_op(OP_SET_SAMP_POOL, &s, sizeof s), "sampler pool bind handled");
     CHECK(rp_S.tex_pool_n == n && rp_S.samp_pool_n == 9, "bound state retains pool sizes %d/9", n);
 }
+static void bind_separate(int stage, int first, int count, uint64_t handle) {
+    while (count) {
+        p_bind_handles b = {0}; b.stage = stage; b.first = 128 + first; b.n = count > 32 ? 32 : count;
+        for (int i = 0; i < b.n; i++) b.h[i] = handle;
+        CHECK(rp_state_op(OP_BIND_TEX, &b, sizeof b), "separate bind is recorded");
+        first += b.n; count -= b.n;
+    }
+}
+static int count_substr(const char *s, const char *needle) {
+    int n = 0; size_t len = strlen(needle); while ((s = strstr(s, needle))) { n++; s += len; } return n;
+}
+static int fact_matches(const char *stage, int handle, const char *sampler, int normalized) {
+    char key[96], norm[32], type[96];
+    snprintf(key, sizeof key, "\"stage\":\"%s\",\"handle\":%d,\"cbufSlot\":2", stage, handle);
+    snprintf(norm, sizeof norm, "\"normalized\":%s", normalized ? "true" : "false");
+    snprintf(type, sizeof type, "\"samplerType\":\"%s\"", sampler);
+    const char *p = strstr(captured, key), *end = p ? strchr(p, '}') : NULL;
+    const char *n = p ? strstr(p, norm) : NULL, *t = p ? strstr(p, type) : NULL;
+    return end && n && n < end && t && t < end;
+}
 static void run_case(int compute, int pool, int want_called, const char *expected_account) {
     const struct rp_prog *prog = NULL; struct rp_shader_req q = {0}; q.prim = 4;
     rp_shader_reset(); nvn_unimpl_reset(); captured[0] = last_red[0] = 0; compiler_calls = 0;
@@ -119,7 +158,24 @@ static void run_case(int compute, int pool, int want_called, const char *expecte
         }
     }
 }
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--legacy-bytes")) {
+        // A baseline-vs-change comparison of the actual legacy REQUEST and canonical bytes.
+        unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR");
+        rp_state_reset(); source(); bind_pools(7); struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+        rp_shader_resolve(&q, &p); if (compiler_calls != 1 || failures) return 1;
+        fputs(captured, stdout); putchar('\n');
+        struct s2a_compile_graphics_src gfx = {0};
+        struct s2a_compile_texture_src tex[] = {{"vs",8,-1,"2d","Unknown",0,1,0,1}};
+        struct s2a_input_identity id = {0}; id.gfx = &gfx; id.direct_abi = 1; id.translator_closure = "fixture";
+        id.stage_mask = 1; id.source_present = 1; id.source_code_bytes[0] = 16; id.source_control_bytes[0] = 32;
+        id.texture_array_length = 7; id.sampler_array_length = 9; id.textures = tex; id.texture_count = 1;
+        uint8_t bytes[S2A_INPUT_IDENTITY_MAX]; size_t n = 0;
+        if (s2a_input_identity_encode(&id, bytes, sizeof bytes, &n)) return 1;
+        for (size_t i = 0; i < n; i++) printf("%02x", bytes[i]);
+        putchar('\n'); return 0;
+    }
+    if (argc != 1) return 2;
     unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR"); rp_state_reset(); source();
     for (int cs = 0; cs < 2; cs++) {
         run_case(cs, 0, 0, "texture_pool_missing");
@@ -229,6 +285,32 @@ int main(void) {
               "request failure is counted separately from compiler rejection: %s", last_stats);
         CHECK(strstr(last_request_reason, "descriptor_pool_facts") && strstr(last_request_reason, "count=1"),
               "request failure names descriptor-pool facts: %s", last_request_reason);
+    }
+    {
+        // Synthetic registrations model two real descriptor snapshots, not GPU objects.
+        rp_shader_reset(); separate_fixture = 1; fake_compile_error = NULL; fake_array_count = 0;
+        bind_separate(0, 0, 1, 77); bind_separate(5, 1, 1, 78); bind_pools(100); compiler_calls = 0;
+        CHECK(rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1, "separate VS reaches compiler");
+        CHECK(fact_matches("vs", 90, "2d", 0), "separate VS registered view fact is sent");
+        CHECK(rp_shader_resolve_compute(&p) != 0 && compiler_calls == 2, "separate CS reaches compiler");
+        CHECK(fact_matches("cs", 92, "2d", 1), "separate CS registered texture fact is sent");
+        CHECK(!fact_matches("cs", 90, "2d", 1), "unregistered separate slot is not invented");
+        rp_shader_reset(); fake_array_count = 64; compiler_calls = 0; bind_pools(100);
+        CHECK(rp_shader_resolve(&q, &p) == 0 && compiler_calls == 1, "separate facts first program succeeds");
+        bind_separate(0, 0, 1, 78);
+        CHECK(rp_shader_resolve(&q, &p) == 0 && compiler_calls == 2 && fact_matches("vs", 90, "2d", 1), "separate texture rebind invalidates fast identity");
+        fake_array_count = 0;
+        rp_shader_reset(); bind_separate(0, 0, 128, 77); bind_separate(5, 0, 128, 78); bind_pools(100); compiler_calls = 0;
+        CHECK(rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1 && count_substr(captured, "\"stage\":\"vs\",\"handle\":") == 160 && fact_matches("vs", 344, "2d", 0), "all 128 VS separate slots survive request and identity capacity");
+        CHECK(rp_shader_resolve_compute(&p) != 0 && compiler_calls == 2 && count_substr(captured, "\"stage\":\"cs\",\"handle\":") == 160 && fact_matches("cs", 344, "2d", 1), "all 128 CS separate slots survive request and identity capacity");
+        rp_shader_reset(); bind_separate(1, 0, 128, 78); memcpy(rp_S.skey[1], rp_S.skey[0], 8); rp_S.skey_ok |= 2; rp_S.bser[1] = 1; compiler_calls = 0;
+        int dual_rc = rp_shader_resolve(&q, &p);
+        int vs_count = count_substr(captured, "\"stage\":\"vs\",\"handle\":"), fs_count = count_substr(captured, "\"stage\":\"fs\",\"handle\":");
+        CHECK(dual_rc != 0 && compiler_calls == 1 && vs_count == 160 && fs_count == 160 && fact_matches("fs", 344, "2d", 1), "320 VS+FS texture facts fit without truncation rc=%d calls=%d vs=%d fs=%d last_red=%s", dual_rc, compiler_calls, vs_count, fs_count, last_red);
+        rp_S.skey_ok &= ~2; rp_S.bser[1] = 0; bind_separate(1, 0, 128, 0);
+        rp_shader_reset(); bind_separate(0, 0, 128, 0); bind_separate(5, 0, 128, 0); separate_fixture = 2; bind_pools(100); compiler_calls = 0;
+        CHECK(rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1 && fact_matches("vs", 90, "2d", 1), "zero handle uses the registered pool-zero descriptor");
+        separate_fixture = 0;
     }
     rp_shader_reset(); s2a_source_clear();
     fprintf(stderr, "nvk shader pool: %d checks, %d failures\n", checks, failures);

@@ -276,6 +276,22 @@ namespace S2A.DirectCompiler
             DirectTextureFact fact = FindTexture(handle, cbufSlot);
             if (fact == null && cbufSlot >= 0)
                 fact = FindTexture(handle, -1);
+            if (fact == null && cbufSlot >= 0)
+            {
+                // c2's separate texture and sampler words are ORed; either may be first.
+                // Only accept one word from each exact NVN table, never a guessed slot.
+                (int texBuffer, int sampBuffer) = TextureHandle.UnpackSlots(cbufSlot, -1);
+                (int a, int b, TextureHandleType type) = TextureHandle.UnpackOffsets(handle);
+                const int textureStart = 0x168 / 4, samplerStart = 0x568 / 4, samplerEnd = 0x968 / 4;
+                bool IsTextureWord(int w) => w >= textureStart && w < samplerStart && (w & 1) == 0;
+                bool IsSamplerWord(int w) => w >= samplerStart && w < samplerEnd && (w & 1) == 0;
+                if (texBuffer == 2 && sampBuffer == 2 && type == TextureHandleType.SeparateSamplerHandle)
+                {
+                    if (IsTextureWord(a) && IsSamplerWord(b)) fact = FindTexture(a, 2);
+                    else if (IsSamplerWord(a) && IsTextureWord(b)) fact = FindTexture(b, 2);
+                    if (fact != null && !fact.Separate) fact = null;
+                }
+            }
             return fact ?? throw Missing(method, $"stage={_stage.Stage},handle={handle},cbufSlot={cbufSlot}");
         }
 

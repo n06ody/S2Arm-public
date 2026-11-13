@@ -75,14 +75,17 @@ struct s2a_compile_graphics_src {
 struct s2a_compile_texture_src {
     const char *stage;          // "vs" / "fs"
     uint32_t handle;            // cbuf 表里的 HandleIndex
-    int cbuf_slot;              // -1 = 组合纹理（本契约唯一支持）
+    int cbuf_slot;              // -1 = 组合纹理；2 = c2 的分离纹理来源
     const char *sampler_type;   // "2d" / "2d-array" / "cube" ...
     const char *format;         // 编译器 TextureFormat 名
     int is_buffer;
     int normalized;
-    int separate;
+    int separate;               // 事实来自分离纹理槽，而非组合槽
     uint32_t array_length;
 };
+
+// Three graphics stages, each with 32 combined and 128 separate texture slots.
+#define S2A_COMPILE_TEXTURE_MAX 480
 
 struct s2a_compile_request_input {
     uint64_t session;
@@ -95,7 +98,7 @@ struct s2a_compile_request_input {
     struct s2a_compile_stage_src stages[2];
     int stage_count;
     struct s2a_compile_graphics_src gfx;
-    struct s2a_compile_texture_src textures[64];   // 真实绑定的纹理事实；0 条 = 没有可用来源
+    struct s2a_compile_texture_src textures[S2A_COMPILE_TEXTURE_MAX];   // 真实绑定的纹理事实；0 条 = 没有可用来源
     int texture_count;
     uint32_t texture_array_length;  // 真实纹理描述符池容量；0 = 未知
     uint32_t sampler_array_length;  // 真实采样器描述符池容量；0 = 未知

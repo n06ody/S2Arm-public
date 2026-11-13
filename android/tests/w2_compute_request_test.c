@@ -118,7 +118,7 @@ int main(void) {
     s.tex_pool_seen=0;BAD("unknown pool");s.tex_pool_seen=1;
     s.tex_pool_n=0;BAD("zero pool");s.tex_pool_n=7;
     tex.complete=0;BAD("unknown texture facts");tex.complete=1;
-    tex.count=65;BAD("texture limit");tex.count=0;
+    tex.count=S2A_COMPILE_TEXTURE_MAX+1;BAD("texture limit");tex.count=0;
     c.profile_json="{}junk";c.profile_bytes=6;BAD("malformed profile");
     c.profile_json=profile_json;c.profile_hash=profile_hash;c.profile_bytes=strlen(c.profile_json);
     c.profile_hash="sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";BAD("provider profile mismatch");c.profile_hash=profile_hash;

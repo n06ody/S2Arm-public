@@ -294,17 +294,17 @@ int main(void) {
               "missing texture stage differs from vs and is rejected");
     }
 
-    // A2 容量：64 条最长的纹理事实 + 满额 attribute/fragment 名字必须仍能编码。
+    // A2 容量：最大数量的纹理事实 + 满额 attribute/fragment 名字必须仍能编码。
     // 这是 S2A_INPUT_IDENTITY_MAX 存在的理由；编不下就必须失败，不能靠降级掩盖。
     {
-        static struct s2a_compile_texture_src many[64];
+        static struct s2a_compile_texture_src many[S2A_COMPILE_TEXTURE_MAX];
         static struct s2a_compile_graphics_src bg;
         struct s2a_input_identity m = in;
         bg = g;
         for (int i = 0; i < 32; i++) bg.attribute_types[i] = "R16G16B16A16Unorm";   // 18 字节
         for (int i = 0; i < 8; i++) bg.fragment_output_types[i] = "R16G16B16A16Unorm";
         m.gfx = &bg;
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < S2A_COMPILE_TEXTURE_MAX; i++) {
             many[i] = texts[i & 1];
             many[i].stage = (i & 1) ? "fs" : "vs";
             many[i].handle = (uint32_t)(8 + 2 * (i % 32));
@@ -313,11 +313,11 @@ int main(void) {
             many[i].array_length = 2048;
         }
         m.textures = many;
-        m.texture_count = 64;
+        m.texture_count = S2A_COMPILE_TEXTURE_MAX;
         uint8_t big[S2A_INPUT_IDENTITY_MAX];
         size_t bn = 0;
         CHECK(s2a_input_identity_encode(&m, big, sizeof big, &bn) == 0,
-              "64 worst-case texture facts + full attribute names fit the identity cap");
+              "maximum texture facts + full attribute names fit the identity cap");
         CHECK(bn < S2A_INPUT_IDENTITY_MAX, "worst-case identity leaves headroom");
         if (bn >= S2A_INPUT_IDENTITY_MAX)
             printf("  identity worst case = %zu B (cap %d)\n", bn, S2A_INPUT_IDENTITY_MAX);

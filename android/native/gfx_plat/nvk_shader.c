@@ -175,8 +175,8 @@ static int src1(unsigned f) { return f >= 0x10 && f <= 0x13; }
 
 struct facts {
     struct s2a_compile_graphics_src gfx;
-    struct s2a_compile_texture_src tex[64]; int ntex;
-    char tfmt[64][S2A_TEX_FORMAT_MAX], tsmp[64][S2A_TEX_SAMPLER_MAX];
+    struct s2a_compile_texture_src tex[S2A_COMPILE_TEXTURE_MAX]; int ntex;
+    char tfmt[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_FORMAT_MAX], tsmp[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_SAMPLER_MAX];
     uint32_t ubo_use[6];
 };
 
@@ -218,6 +218,20 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
         int n = f->ntex++;
         memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
         f->tex[n] = (struct s2a_compile_texture_src){st ? "fs" : "vs", (uint32_t)(8 + 2 * slot), -1, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 0, nf.array_length};
+    }
+    // Separate texture table c2: 0x168 + 8*slot, mapped to replay slot 128+slot.
+    // Only registered descriptors are facts. A zero handle names pool entry zero,
+    // just like the existing combined-table producer; no descriptor means no fact.
+    for (int st = 0; st < nst; st++) for (int slot = 0; slot < 128; slot++) {
+        uint64_t h = rp_S.tex[st][128 + slot];
+        long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
+        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
+        if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
+                (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+        int n = f->ntex++;
+        memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
+        f->tex[n] = (struct s2a_compile_texture_src){st ? "fs" : "vs", (uint32_t)(90 + 2 * slot), 2, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 1, nf.array_length};
     }
 }
 
@@ -393,6 +407,7 @@ static uint64_t input_sig(const struct rp_shader_req *q, const struct s2a_direct
     for (int st = 0; st < 6; st++) { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[st][i].size) m |= 1u << i; MIX(m); }
     MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tf_on); MIX(rp_S.tex_base);
     MIX(rp_tex_fact_sig(rp_S.tex[0], 32, rp_S.tex_base, rp_S.tex_pool_n)); MIX(rp_tex_fact_sig(rp_S.tex[1], 32, rp_S.tex_base, rp_S.tex_pool_n));
+    MIX(rp_tex_fact_sig(&rp_S.tex[0][128], 128, rp_S.tex_base, rp_S.tex_pool_n)); MIX(rp_tex_fact_sig(&rp_S.tex[1][128], 128, rp_S.tex_base, rp_S.tex_pool_n));
     #undef MIX
     return h;
 }
@@ -456,7 +471,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
         }
         if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0) && s2a_program_cache_load(cdir, sha, &bytes, &len, NULL, why, sizeof why) == 0) g_n_cache++;
         if (!bytes) {
-            struct s2a_compile_request_input in; memset(&in, 0, sizeof in);
+            static struct s2a_compile_request_input in; memset(&in, 0, sizeof in);
             in.session = pc.session; in.generation = pc.generation; in.profile_json = pc.profile_json; in.profile_bytes = pc.profile_bytes;
             in.direct_abi = (int)pc.direct_abi; in.translator_closure = pc.translator_closure;
             in.texture_array_length = (uint32_t)rp_S.tex_pool_n; in.sampler_array_length = (uint32_t)rp_S.samp_pool_n; in.transform_feedback_enabled = rp_S.tf_on;
@@ -566,7 +581,7 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
     { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; st.ubo_use[5] = m << 3; }   // 用户常量缓冲从 c3 起
     st.tex_pool_n = (uint32_t)rp_S.tex_pool_n; st.samp_pool_n = (uint32_t)rp_S.samp_pool_n; st.tex_pool_seen = rp_S.tex_pool_n > 0; st.samp_pool_seen = rp_S.samp_pool_n > 0; st.tex_pool_base = rp_S.tex_base;
     // 贴图事实：计算阶段的 32 个组合槽，取法同图形（没绑过的槽读作池里的第 0 项）
-    static struct s2a_compile_texture_src tex[32]; static char tfmt[32][S2A_TEX_FORMAT_MAX], tsmp[32][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
+    static struct s2a_compile_texture_src tex[160]; static char tfmt[160][S2A_TEX_FORMAT_MAX], tsmp[160][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
     for (int slot = 0; slot < 32; slot++) {
         uint64_t h = rp_S.tex[5][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
@@ -579,6 +594,16 @@ int rp_shader_resolve_compute(const struct rp_prog **out) {
         }
         memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
         tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(8 + 2 * slot), -1, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 0, nf.array_length};
+        ntex++;
+    }
+    for (int slot = 0; slot < 128; slot++) {
+        uint64_t h = rp_S.tex[5][128 + slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
+        if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
+        if (s2a_nvn_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
+                (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+        memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
+        tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(90 + 2 * slot), 2, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 1, nf.array_length};
         ntex++;
     }
     struct nvk_compute_texture_facts tf = {tex, ntex, 1};

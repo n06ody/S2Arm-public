@@ -621,6 +621,13 @@ internal static unsafe class Program
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
 
+        if (args.Length == 1 && args[0] == "--legacy-artifact")
+        {
+            byte[] request = RequestJson(profile, "graphics", 1, 1, "legacy-artifact", vs, FsTwoTextures(), textureFacts: TwoTextureFacts);
+            Console.WriteLine(Encoding.UTF8.GetString(DirectShaderCompiler.Compile(request)));
+            return;
+        }
+
         if (args.Length == 2 && args[0] == "--emit-requests")
         {
             string directory = Path.GetFullPath(args[1]);
@@ -1559,6 +1566,26 @@ internal static unsafe class Program
                 cbufRejected = error.InnerException is DirectCompileException compile && compile.Code == "UNSUPPORTED_PROGRAM";
             }
             Check(cbufRejected, "cbuf handle without a direct fact is rejected");
+            // Facts alone do not implement separate binding; the production resolver must still refuse it.
+            var separateAllocator = new DirectAllocator(matrixProfile);
+            separateAllocator.Bindings.Add(new DirectBinding("fs", "texture", "test", 2, 0, 1));
+            ShaderProgram separateProgram = new(
+                new ShaderProgramInfo(Array.Empty<BufferDescriptor>(), Array.Empty<BufferDescriptor>(),
+                    new[] { new TextureDescriptor(2, 0, SamplerType.Texture2D, TextureFormat.R8G8B8A8Unorm,
+                        cbufSlot: 4, handleIndex: 0, arrayLength: 1, separate: true, TextureUsageFlags.None) },
+                    Array.Empty<TextureDescriptor>(), ShaderStage.Fragment, 0, 0, 0,
+                    usesFragCoord: false, usesInstanceId: false, usesDrawParameters: false, usesRtLayer: false,
+                    clipDistancesWritten: 0, fragmentOutputMap: 0),
+                Ryujinx.Graphics.Shader.Translation.TargetLanguage.Spirv, Array.Empty<byte>());
+            var separateTranslated = new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>
+                { (program.StageOf("fs"), separateProgram, matrixAccessor) };
+            bool separateRejected = false;
+            try { resolvePoolSlots.Invoke(null, new object[] { separateTranslated, separateAllocator }); }
+            catch (System.Reflection.TargetInvocationException error)
+            {
+                separateRejected = error.InnerException is DirectCompileException compile && compile.Code == "UNSUPPORTED_PROGRAM" && compile.Message.Contains("separate sampler");
+            }
+            Check(separateRejected, "separate binding stays unsupported when its texture fact exists");
 
             // 解析期拒绝：未知格式、未知 sampler 分量、越界 arrayLength。
             Throws("MISSING_FACT", () => DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "x", vs, fs,
@@ -1570,6 +1597,36 @@ internal static unsafe class Program
             Throws(null, () => DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "x", vs, fs,
                 textureFacts: "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":0}]")),
                 "zero array length rejected");
+        }
+
+        // NVN c2 separate texture/sampler handle facts: the OR operands may arrive reversed.
+        {
+            using JsonDocument profileDoc = JsonDocument.Parse(profile);
+            DirectProfile p = DirectProfile.Parse(profileDoc.RootElement, "profile");
+            string facts = "[{\"stage\":\"vs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"cube\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}," +
+                "{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1}]";
+            using JsonDocument d = JsonDocument.Parse(RequestJson(profile, "graphics", 1, 1, "sep", vs, fs, textureFacts: facts));
+            DirectProgram prog = DirectProgram.Parse(d.RootElement.GetProperty("program"), "program", p);
+            var va = new DirectGpuAccessor(p, prog, prog.StageOf("vs"), 1, new DirectAllocator(p), new List<DirectQuery>());
+            var fa = new DirectGpuAccessor(p, prog, prog.StageOf("fs"), 5, new DirectAllocator(p), new List<DirectQuery>());
+            int slots = TextureHandle.PackSlots(2, 2);
+            int forward = TextureHandle.PackOffsets(90, 346, TextureHandleType.SeparateSamplerHandle);
+            int reversed = TextureHandle.PackOffsets(346, 90, TextureHandleType.SeparateSamplerHandle);
+            try {
+                Check(va.QuerySamplerType(forward, slots) == SamplerType.TextureCube && va.QueryTextureCoordNormalized(reversed, slots), "separate facts VS forward/reversed use its texture view");
+                Check(fa.QuerySamplerType(reversed, slots) == SamplerType.Texture2D && !fa.QueryTextureCoordNormalized(forward, slots), "separate facts FS forward/reversed use its texture view");
+            } catch (DirectCompileException e) { Check(false, "separate facts query should resolve: " + e.Code + " " + e.Message); }
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(forward, TextureHandle.PackSlots(3, 2)), "separate facts cannot use another cbuf");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 92, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject ambiguous texture operands");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(92, 346, TextureHandleType.SeparateSamplerHandle), slots), "separate facts do not borrow another texture slot");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 602, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject sampler outside c2 table");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(91, 346, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject unaligned texture word");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 346, TextureHandleType.SeparateSamplerId), slots), "separate facts reject unsupported handle kind");
+            using JsonDocument combinedDoc = JsonDocument.Parse(RequestJson(profile, "graphics", 1, 1, "wrong-kind", vs, fs,
+                textureFacts: facts.Replace("\"separate\":true", "\"separate\":false")));
+            DirectProgram combinedProgram = DirectProgram.Parse(combinedDoc.RootElement.GetProperty("program"), "program", p);
+            var combined = new DirectGpuAccessor(p, combinedProgram, combinedProgram.StageOf("fs"), 5, new DirectAllocator(p), new List<DirectQuery>());
+            Throws("MISSING_FACT", () => combined.QuerySamplerType(forward, slots), "separate query cannot borrow a combined texture fact");
         }
 
         // 7c) guest UBO：c[0] 的 LDC 必须变成 set0 binding1 的 uniform binding、槽位 0，

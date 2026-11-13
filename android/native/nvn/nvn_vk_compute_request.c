@@ -200,7 +200,7 @@ int nvk_compute_request_prepare(const struct s2a_record_dispatch_state *s,
     if (!s->tex_pool_seen || !s->samp_pool_seen || !s->tex_pool_n || !s->samp_pool_n ||
         s->tex_pool_n > 1048576 || s->samp_pool_n > 1048576)
         { REJECT("missing or out-of-range descriptor-pool facts"); }
-    if (!textures->complete || textures->count < 0 || textures->count > 64 ||
+    if (!textures->complete || textures->count < 0 || textures->count > S2A_COMPILE_TEXTURE_MAX ||
         (textures->count && !textures->items)) { REJECT("missing complete CS texture facts"); }
     for (int i = 0; i < textures->count; i++) {
         const struct s2a_compile_texture_src *t = &textures->items[i];
