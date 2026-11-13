@@ -7,6 +7,7 @@
 #include "../replay/rp_state.h"
 #include "../replay/rp_exec.h"
 #include "../replay/rp_res.h"
+#include "../replay/rp_fbtrace.h"
 #include "../replay/rp_shader.h"
 #include "nvn_refl.h"
 #include "nvn_dirty.h"
@@ -86,6 +87,8 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
 void nvn_gpu_tex_release(nvn_gpu_tex t) { g_tex_releases++; free(t); }
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err) { (void)err; g_view_creates++; g_vw_last_has = v != NULL; if (v) g_vw_last = *v; *out = calloc(1, sizeof **out); (*out)->of = t; (*out)->has_v = v != NULL; (*out)->rid = ++g_vid; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_view_release(nvn_gpu_view v) { g_view_releases++; if (v && g_nrel < 8192) g_released_id[g_nrel++] = v->rid; free(v); }
+static unsigned g_fb_reason[FT_REASONS];
+void nvn_gpu_fbtrace_release(nvn_gpu_view v, unsigned reason) { if (reason < FT_REASONS) g_fb_reason[reason]++; nvn_gpu_view_release(v); }
 nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) { (void)p; (void)err; g_samp_creates++; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
@@ -369,6 +372,7 @@ static void res_fresh(void);   // 定义在本文件后面
 // 窗口一结束它就该能按轮转淘汰（证明窗口只在窗口内起作用，不是永久驻留）。
 static void t_view_pin(void) {
     res_fresh();
+    unsigned evicted = g_fb_reason[FT_EVICT], temporary = g_fb_reason[FT_TEMP];
     // 视图表是 128 组 x 8 路（按贴图序号散列）：窗口里取 3000 个不同贴图，平均每组 23 个——first 那一组的 8 格必然被本轮钉满、
     // 多出来的走溢出表；窗口结束后再取 3000 个，first 那一格必然被换掉。数量由表的形状推出，不依赖具体散列到哪一组。
     enum { N = 6000, NWIN = 3000 };
@@ -383,8 +387,10 @@ static void t_view_pin(void) {
     for (int i = 1; i < NWIN; i++) (void)rp_view_for(&tp[i], NULL, &g_fake_cmd);   // 每组都被挤满：钉住时不能放掉 first
     CHECK(first && !was_view_released(first_id));                                  // 修前：轮转把 first 放掉 → 红
     rp_view_pin_end();
+    CHECK(g_fb_reason[FT_TEMP] > temporary);
     for (int i = NWIN; i < N; i++) (void)rp_view_for(&tp[i], NULL, &g_fake_cmd);
     CHECK(first && was_view_released(first_id));                                   // 窗口结束：它可以被淘汰
+    CHECK(g_fb_reason[FT_EVICT] > evicted);
     res_fresh();
     // 一帧里轮着用 300 个目标（真机一款 3D 游戏每帧一百多个通道）：第二遍取到的必须是第一遍那些视图，一个都不重建。
     // 300 个散进 128 组、每组 8 格；数量远小于 1024 格，但会不会有一组超过 8 个取决于散列，所以只要求「重建的不超过 300 个里的 5%」
@@ -396,6 +402,10 @@ static void t_view_pin(void) {
       if (rebuilt > M / 20) fprintf(stderr, "视图表：300 个目标取第二遍，重建了 %d 个（期望 ≤ %d）\n", rebuilt, M / 20);
       CHECK(rebuilt <= M / 20); }
     res_fresh();   // 本用例建的存储不留给后面的用例（它们按 live 计数做断言）
+    { tex_t fin = mk_tex(99999, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0); unsigned f = g_fb_reason[FT_FINALIZE];
+      nvn_be_tex_init(&fin); CHECK(rp_view_for(&fin, NULL, &g_fake_cmd) != NULL); nvn_be_tex_release(&fin);
+      CHECK(g_fb_reason[FT_FINALIZE] == f + 1); }
+    res_fresh();
 }
 
 // 程序按阶段绑定：只绑程序实际有 shader 的阶段；VS/FS 不能被关（保留原绑定）；GS/TCS/TES 程序没有就解绑。
@@ -575,6 +585,7 @@ static void t_alias_take_over(void) {
     nvn_be_sub_begin();
     tex_t p = mk_tex(300, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0);
     nvn_gpu_tex gp = rp_tex_resolve(&p, &g_fake_cmd); CHECK(gp != NULL);
+    CHECK(rp_view_for(&p, NULL, &g_fake_cmd) != NULL); unsigned alias_releases = g_fb_reason[FT_ALIAS];
     rp_tex_mark_gpu_written(&p);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     subs_pass(20);
@@ -589,6 +600,7 @@ static void t_alias_take_over(void) {
     rp_tex_mark_gpu_written(&q);                                      // q 一直在用
     tex_t r = mk_tex(302, 0, NVN_FORMAT_RGBA8, 56, 56, 1, 0);
     CHECK(rp_tex_resolve(&r, &g_fake_cmd) != NULL);
+    CHECK(g_fb_reason[FT_ALIAS] == alias_releases + 1);
     CHECK(rp_res_tex_built() == 2 && g_tex_releases - r0 == 1);      // p 放了（q、r 在）
     CHECK(rp_res_tex_serials() == 2);                                 // p 的序号也出表了
     nvn_gpu_tex gp2 = rp_tex_resolve(&p, &g_fake_cmd);                // p 的对象还活着：再用就重建
@@ -895,6 +907,7 @@ static void t_linear_reject(void) {
 static void t_registry(void) {
     nvn_be_sub_begin();
     res_fresh(); nvn_unimpl_reset(); int v0 = g_view_creates, vr0 = g_view_releases, s0 = g_samp_creates, sr0 = g_samp_releases;
+    unsigned reg_releases = g_fb_reason[FT_REGISTER];
     tex_t a = mk_tex(31, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0), b = mk_tex(32, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
     view_t vw; memset(&vw, 0, sizeof vw); vw.set_levels = 1; vw.nlevels = 1;
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == NULL);             // 没登记
@@ -905,11 +918,13 @@ static void t_registry(void) {
     nvn_be_reg_tex(3, &a, NULL);
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == v1 && g_view_creates - v0 == 1);   // 同内容重登记：视图还在
     nvn_be_reg_tex(3, &b, &vw);
+    CHECK(g_fb_reason[FT_REGISTER] == reg_releases + 1);
     nvn_gpu_view v2 = rp_view_by_id(3, &g_fake_cmd, &tt);
     CHECK(v2 && tt->serial == 32 && v2->has_v == 1 && g_view_creates - v0 == 2 && g_view_releases - vr0 == 1);   // 换了内容：旧视图放掉
     nvn_be_reg_tex(9, &a, NULL);
     CHECK(rp_view_by_id(9, &g_fake_cmd, NULL) == NULL);             // 池容量 8：号 9 在池外，当空槽
     nvn_be_unreg_tex_range(0, 8);
+    CHECK(g_fb_reason[FT_REGISTER] == reg_releases + 2);
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == NULL && g_view_releases - vr0 == 2);
     samp_par sp; memset(&sp, 0, sizeof sp);
     CHECK(rp_samp_by_id(4) == NULL);
@@ -921,6 +936,11 @@ static void t_registry(void) {
     g_tex_create_fail = 1; tex_t f = mk_tex(40, 0x8000, 0x38, 16, 16, 1, 0); nvn_be_set_tex_pool_n(0); nvn_be_reg_tex(5, &f, NULL);
     CHECK(rp_view_by_id(5, &g_fake_cmd, NULL) == NULL && nvn_unimpl_count("gpu", "tex_create_fmt_0x38_target_1") == 1);   // 后端不支持：按格式号记账，不给假图
     g_tex_create_fail = 0;
+    { tex_t old = mk_tex(41, 0x10000, NVN_FORMAT_RGBA8, 16, 16, 1, 0), replacement = mk_tex(41, 0x14000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
+      nvn_be_reg_tex(4, &old, NULL); CHECK(rp_view_by_id(4, &g_fake_cmd, NULL) != NULL);
+      nvn_be_tex_release(&old); unsigned storage_releases = g_fb_reason[FT_STORAGE];
+      nvn_be_reg_tex(4, &replacement, NULL); CHECK(rp_view_by_id(4, &g_fake_cmd, NULL) != NULL);
+      CHECK(g_fb_reason[FT_STORAGE] == storage_releases + 1); }
     res_fresh();
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
@@ -1420,6 +1440,11 @@ static void t_pass_depth_shadow(void) {
     CHECK(g_gdraws == 1 && g_npd == 2 && g_pd[1].color[0].load == NVN_GPU_LOAD_LOAD && g_pd[1].color[0].view && g_pd[1].color[0].view->of == sh && g_tex_creates == tc2);
     CHECK(g_ntb == 6 && g_tb[2].to_tex == 0 && g_tb[2].t == base && g_tb[2].begun == 1 && g_tb[3].to_tex == 1 && g_tb[3].t == sh && g_tb[3].begun == 1);
     CHECK(g_tb[4].to_tex == 0 && g_tb[4].t == sh && g_tb[4].ended == 2 && g_tb[5].to_tex == 1 && g_tb[5].t == base);
+    { unsigned shadow_releases = g_fb_reason[FT_SHADOW];
+      tex_t z2 = mk_tex(660, 0, NVN_FORMAT_DEPTH16, 32, 32, 1, 0);
+      stream resize = {0}; put_set_rt_v(&resize, &z2, &v);
+      p_clear_color *clr = put(&resize, OP_CLEAR_COLOR, sizeof *clr); clr->index = 0; clr->mask = 0xf; end(&resize);
+      submit1(&resize); fake_complete(NVN_GPU_DONE_OK); CHECK(g_fb_reason[FT_SHADOW] == shadow_releases + 1); }
     // 走不了影子的（D24S8：存储字节不是游戏的字节；没有换格式的视图）：当空槽并记账；通道里一个附件都没有 → 不开通道
     pass_fresh(); g_ntb = 0;
     tex_t d24 = mk_tex(67, 0, NVN_FORMAT_DEPTH24_STENCIL8, 16, 16, 1, 0);
@@ -2402,6 +2427,7 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
 
 static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口时取图、按比例贴合、呈现；交换链过期先重建
     pass_fresh(); rp_present_reset(); memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = g_rebuilds = g_presents = 0;
+    unsigned presents_released = g_fb_reason[FT_PRESENT];
     tex_t t = mk_tex(71, 0, NVN_FORMAT_RGBA8, 640, 360, 1, 0);
     CHECK(nvn_be_has_window() == 0 && nvn_be_display_hz() == 0);
     uint64_t k1 = nvn_be_present(&t, 0, NULL);
@@ -2410,6 +2436,7 @@ static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口
     rp_present_set_surface(&g_fake_surf, 120);
     CHECK(nvn_be_has_window() == 1 && nvn_be_display_hz() == 120);
     CHECK(nvn_be_present(&t, 0, NULL) == 2 && g_presents == 1);
+    CHECK(g_fb_reason[FT_PRESENT] == presents_released + 1);
     CHECK(g_last_pd.src != NULL && g_last_pd.crop[2] == 0 && g_last_pd.dst[0] == 0 && g_last_pd.dst[1] == 0 && g_last_pd.dst[2] == 1280 && g_last_pd.dst[3] == 720);   // 16:9 贴满 16:9
     CHECK(nvn_be_presented_time(2) == 5.0);                         // 后端没给上屏时刻：按交给呈现引擎的时刻记
     int crop[4] = {0, 0, 320, 300};                                 // 16:15 的裁剪放进 1280x720：高贴满，宽 768，左右各 256 黑边

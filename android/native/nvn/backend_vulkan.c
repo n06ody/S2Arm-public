@@ -30,6 +30,8 @@
 #include <time.h>
 
 #include "nvn_backend.h"
+#define S2A_FBTRACE_IMPLEMENT 1
+#include "rp_fbtrace.h"
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
 #include "nvn_vk_format.h"
 #include "nvn_vk_texview.h"
@@ -67,6 +69,7 @@ struct nvn_gpu_buf_s {
 };
 
 struct nvn_gpu_tex_s {
+    uint64_t trace_id;        // 会话内递增，不复用地址或 Vulkan 句柄当代际
     VkImage image;
     VkDeviceMemory memory;
     VkDeviceSize mem_size; uint32_t mem_type;   // 这块显存向驱动要的大小和内存类型（还回 texmem 池时用）
@@ -82,6 +85,7 @@ struct nvn_gpu_tex_s {
 };
 
 struct nvn_gpu_view_s {
+    unsigned trace_reason;
     VkImageView view;
     struct nvn_gpu_tex_s *tex;
     VkBufferView buffer_view;
@@ -247,6 +251,7 @@ struct nvn_gpu_vk {
     int worker_started;
     int closing;
     int closed;
+    int fbtrace_on;
     _Atomic int stop;
     int busy;
     int commit_active;   // 正在 commit 的线程数：close 要等它归零才拆资源
@@ -276,6 +281,23 @@ struct nvn_gpu_vk {
 static struct nvn_gpu_vk g;
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_pc_mu = PTHREAD_MUTEX_INITIALIZER;
+enum { FT_FB_CAP = 2048, FT_HISTORY = 2048, FT_FRAMES = 8 };
+struct ft_attachment { uint64_t image; uint32_t format, level, layer, aspect; };
+struct ft_key {
+    uint32_t natt, ncol, w, h, layers, has_depth;
+    VkAttachmentDescription att[9]; VkAttachmentReference col[8], depth;
+    struct ft_attachment image[9];
+};
+struct ft_hist { struct ft_key key; uint64_t hash, frame; unsigned reason; int valid; };
+static struct ft_key g_ft_fb[FT_FB_CAP];
+static struct ft_hist g_ft_hist[FT_HISTORY];
+static struct { VkFramebuffer fb; struct ft_key key; } g_ft_uncached[FT_FB_CAP];
+static struct {
+    uint64_t frame, last_ns, next_image, hist_next, window;
+    uint64_t create, drop, match, overflow, expired, create_unkeyed, drop_unkeyed, cache_off, full_probe, match_off, match_full, uncached_overflow;
+    uint64_t release[FT_REASONS], drop_reason[FT_REASONS], match_reason[FT_REASONS], gap[FT_FRAMES + 1];
+} g_ft;   // 与 framebuffer 表共用 g_pc_mu，next_image 用原子递增
 // 诊断读数（nvk_gputime 开着时每 300 次上屏打一行）：每帧新建了多少个驱动对象、写了多少次描述符、开了多少个查询。
 enum { OC_RP, OC_FB, OC_CPOOL, OC_DPOOL, OC_DALLOC, OC_DWRITE, OC_QUERY, OC_VIEW, OC_N };
 static uint64_t g_oc[OC_N], g_oc_total[OC_N];
@@ -288,7 +310,8 @@ uint64_t nvn_vk_dbg_created(int which) { return which >= 0 && which < OC_N ? __a
 // 帧缓冲按「渲染通道 + 各附件视图 + 尺寸」记，直到其中任何一个视图销毁。视图要等引用它的段都做完才会销毁（cmd_ref 保活），
 // 所以那时用到这个帧缓冲的命令也都做完了，可以当场销毁。表满了的那一个照旧路走（记在段上、段做完销毁）。
 // 调试开关 nvk_pass_cache=0 关掉（缺省开）。
-static void pc_drop_view(VkImageView v);
+static void pc_drop_view(VkImageView v, unsigned reason);
+static void ft_uncached_drop(VkFramebuffer fb);
 static void pc_destroy_all(void);
 enum { PIPE_HT_N = 1024 };
 static uint64_t g_desc_ns[4], g_desc_nw, g_desc_sets, g_desc_hit;   // 描述符四步：分配 / 构造写入项 / 写入 / 绑定；写入的描述符条数；重写的组数
@@ -577,7 +600,7 @@ static void destroy_tex_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t) {
     while (*pp && *pp != t) pp = &(*pp)->all_next;
     if (*pp) *pp = t->all_next;
     LIFE_T0;
-    pc_drop_view(t->view); LIFE_ADD(6);
+    pc_drop_view(t->view, FT_OTHER); LIFE_ADD(6);
     if (t->view) vkDestroyImageView(vk->d, t->view, NULL);
     if (t->image) vkDestroyImage(vk->d, t->image, NULL);
     texmem_give(vk->d, t->memory, t->mem_size, t->mem_type);
@@ -590,7 +613,7 @@ static void destroy_view_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_view_s *v)
     while (*pp && *pp != v) pp = &(*pp)->all_next;
     if (*pp) *pp = v->all_next;
     LIFE_T0;
-    pc_drop_view(v->att); pc_drop_view(v->view); LIFE_ADD(6);
+    pc_drop_view(v->att, v->trace_reason); pc_drop_view(v->view, v->trace_reason); LIFE_ADD(6);
     if (v->att) vkDestroyImageView(vk->d, v->att, NULL);
     if (v->view) vkDestroyImageView(vk->d, v->view, NULL);
     LIFE_ADD(5);
@@ -886,7 +909,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         free(b);
     }
     for (uint32_t i = 0; i < c->npasses; i++) {
-        if (c->passes[i].fb) vkDestroyFramebuffer(g.d, c->passes[i].fb, NULL);
+        if (c->passes[i].fb) { if (g.fbtrace_on) ft_uncached_drop(c->passes[i].fb); vkDestroyFramebuffer(g.d, c->passes[i].fb, NULL); }
         if (c->passes[i].rp) vkDestroyRenderPass(g.d, c->passes[i].rp, NULL);
     }
     free(c->passes);
@@ -1188,6 +1211,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.fbtrace_on = nvn_plat_flag("nvk_fbtrace", 0) != 0;
+    if (g.fbtrace_on) { memset(&g_ft, 0, sizeof g_ft); memset(g_ft_fb, 0, sizeof g_ft_fb); memset(g_ft_hist, 0, sizeof g_ft_hist); memset(g_ft_uncached, 0, sizeof g_ft_uncached); }
     g.d = dev->device;
     vk_dq_init(g.d);
     g.phys = dev->physical;
@@ -2715,7 +2740,6 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v) {
     return r;
 }
 
-static pthread_mutex_t g_pc_mu = PTHREAD_MUTEX_INITIALIZER;
 // 开关每 128 个通道重读一次（真机上同一局里来回切着比）；一个通道从头到尾用开头读到的那个值（g_pc_use，只在回放线程上动）
 static int g_pc_use = 1;
 static int pc_on(void) { static int on = -1; static uint32_t n; if (on < 0 || !(++n & 127)) on = nvn_plat_flag("nvk_pass_cache", 1) != 0; return on; }
@@ -2724,6 +2748,113 @@ static struct pc_rp *g_pc_rp; static uint32_t g_pc_nrp, g_pc_rpcap;
 enum { PC_FB_N = 2048, PC_FB_PROBE = 24 };
 struct pc_fb { VkRenderPass rp; uint32_t natt, w, h, layers; VkImageView v[9]; VkFramebuffer fb; int tomb; };
 static struct pc_fb g_pc_fb[PC_FB_N];
+_Static_assert((int)PC_FB_N == (int)FT_FB_CAP, "diagnostic framebuffer slots");
+static uint64_t ft_hash(const struct ft_key *key) {
+    const unsigned char *p = (const unsigned char *)key; uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof *key; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+// 调用方持 g_pc_mu；同键最多消费一条历史，不能把一次新建算成多次复建。
+static void ft_created(const struct ft_key *key, int mode) {
+    g_ft.create++;
+    if (mode == 1) g_ft.cache_off++; else if (mode == 2) g_ft.full_probe++;
+    if (!key || !key->natt) { g_ft.create_unkeyed++; return; }
+    uint64_t h = ft_hash(key); int best = -1; uint64_t best_frame = 0;
+    for (int i = 0; i < FT_HISTORY; i++) {
+        struct ft_hist *x = &g_ft_hist[i];
+        if (!x->valid) continue;
+        if (g_ft.frame - x->frame > FT_FRAMES) { x->valid = 0; g_ft.expired++; continue; }
+        if (x->hash == h && !memcmp(&x->key, key, sizeof *key) && (best < 0 || x->frame > best_frame)) { best = i; best_frame = x->frame; }
+    }
+    if (best >= 0) {
+        struct ft_hist *x = &g_ft_hist[best]; uint64_t gap = g_ft.frame - x->frame;
+        g_ft.match++; g_ft.match_reason[x->reason]++; g_ft.gap[gap]++;
+        if (mode == 1) g_ft.match_off++; else if (mode == 2) g_ft.match_full++;
+        x->valid = 0;
+    }
+}
+static void ft_dropped(const struct ft_key *key, unsigned reason) {
+    if (reason >= FT_REASONS) reason = FT_OTHER;
+    g_ft.drop++; g_ft.drop_reason[reason]++;
+    if (!key->natt) { g_ft.drop_unkeyed++; return; }
+    struct ft_hist *x = &g_ft_hist[g_ft.hist_next++ % FT_HISTORY];
+    if (x->valid) {
+        if (g_ft.frame - x->frame <= FT_FRAMES) g_ft.overflow++;
+        else g_ft.expired++;
+    }
+    memcpy(&x->key, key, sizeof *key); x->hash = ft_hash(key); x->frame = g_ft.frame; x->reason = reason; x->valid = 1;
+}
+// 未进入缓存的 framebuffer 随命令段退休，另用有界表记它的键。
+static void ft_uncached_add(VkFramebuffer fb, const struct ft_key *key) {
+    for (unsigned i = 0; i < FT_FB_CAP; i++) if (!g_ft_uncached[i].fb) {
+        g_ft_uncached[i].fb = fb;
+        if (key) memcpy(&g_ft_uncached[i].key, key, sizeof *key); else memset(&g_ft_uncached[i].key, 0, sizeof g_ft_uncached[i].key);
+        return;
+    }
+    g_ft.uncached_overflow++;
+}
+static void ft_uncached_drop(VkFramebuffer fb) {
+    pthread_mutex_lock(&g_pc_mu);
+    for (unsigned i = 0; i < FT_FB_CAP; i++) if (g_ft_uncached[i].fb == fb) {
+        ft_dropped(&g_ft_uncached[i].key, FT_UNCACHED); g_ft_uncached[i].fb = VK_NULL_HANDLE;
+        pthread_mutex_unlock(&g_pc_mu); return;
+    }
+    g_ft.drop++; g_ft.drop_reason[FT_UNCACHED]++; g_ft.drop_unkeyed++; pthread_mutex_unlock(&g_pc_mu);
+}
+void nvn_gpu_fbtrace_test_snapshot(uint64_t out[16]) {
+    memset(out, 0, 16 * sizeof *out);
+    if (!g.fbtrace_on) return;
+    pthread_mutex_lock(&g_pc_mu);
+    out[0] = g_ft.create; out[1] = g_ft.drop; out[2] = g_ft.match; out[3] = g_ft.match_reason[FT_FINALIZE]; out[4] = g_ft.gap[1]; out[5] = g_ft.overflow;
+    out[6] = g_ft.drop_reason[FT_UNCACHED]; out[7] = g_ft.cache_off; out[8] = g_ft.match_reason[FT_UNCACHED]; out[9] = g_ft.uncached_overflow;
+    pthread_mutex_unlock(&g_pc_mu);
+}
+void nvn_gpu_fbtrace_test_frame(void) {
+    if (!g.fbtrace_on) return;
+    pthread_mutex_lock(&g_pc_mu); g_ft.frame++; pthread_mutex_unlock(&g_pc_mu);
+}
+// 成功交呈现才推进序号；这是应用帧边界，不代表物理显示完成。
+static void ft_present(void) {
+    if (!g.fbtrace_on) return;
+    char line[5][512]; int emit = 0;
+    pthread_mutex_lock(&g_pc_mu);
+    uint64_t now = now_ns(); g_ft.frame++;
+    if (!g_ft.last_ns) g_ft.last_ns = now;
+    if (now - g_ft.last_ns >= 5000000000ull) {
+        unsigned pending = 0;
+        for (int i = 0; i < FT_HISTORY; i++) if (g_ft_hist[i].valid) pending++;
+#define Q(x) ((unsigned long long)(x))
+        g_ft.window++;
+#define REASON_LINE(dst, label, a) snprintf(dst, sizeof line[0], "fbtrace %s win=%llu other=%llu evict=%llu storage=%llu finalize=%llu alias=%llu register=%llu present=%llu shadow=%llu temp=%llu reset=%llu uncached=%llu", label, Q(g_ft.window), Q(a[0]), Q(a[1]), Q(a[2]), Q(a[3]), Q(a[4]), Q(a[5]), Q(a[6]), Q(a[7]), Q(a[8]), Q(a[9]), Q(a[10]))
+        snprintf(line[0], sizeof line[0], "fbtrace window win=%llu frame=%llu seconds=%.3f create=%llu drop=%llu match=%llu cache_off=%llu full_probe=%llu match_off=%llu match_full=%llu create_unkeyed=%llu drop_unkeyed=%llu overflow=%llu uncached_overflow=%llu expired=%llu pending=%u history=%u max_gap=%u", Q(g_ft.window), Q(g_ft.frame), (double)(now - g_ft.last_ns) / 1e9, Q(g_ft.create), Q(g_ft.drop), Q(g_ft.match), Q(g_ft.cache_off), Q(g_ft.full_probe), Q(g_ft.match_off), Q(g_ft.match_full), Q(g_ft.create_unkeyed), Q(g_ft.drop_unkeyed), Q(g_ft.overflow), Q(g_ft.uncached_overflow), Q(g_ft.expired), pending, FT_HISTORY, FT_FRAMES);
+        REASON_LINE(line[1], "release", g_ft.release);
+        REASON_LINE(line[2], "drop", g_ft.drop_reason);
+        REASON_LINE(line[3], "match", g_ft.match_reason);
+        snprintf(line[4], sizeof line[4], "fbtrace gap win=%llu 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu 5=%llu 6=%llu 7=%llu 8=%llu", Q(g_ft.window), Q(g_ft.gap[0]), Q(g_ft.gap[1]), Q(g_ft.gap[2]), Q(g_ft.gap[3]), Q(g_ft.gap[4]), Q(g_ft.gap[5]), Q(g_ft.gap[6]), Q(g_ft.gap[7]), Q(g_ft.gap[8]));
+#undef REASON_LINE
+#undef Q
+        g_ft.create = g_ft.drop = g_ft.match = g_ft.overflow = g_ft.expired = g_ft.create_unkeyed = g_ft.drop_unkeyed = 0;
+        g_ft.cache_off = g_ft.full_probe = g_ft.match_off = g_ft.match_full = 0;
+        g_ft.uncached_overflow = 0;
+        memset(g_ft.release, 0, sizeof g_ft.release); memset(g_ft.drop_reason, 0, sizeof g_ft.drop_reason);
+        memset(g_ft.match_reason, 0, sizeof g_ft.match_reason); memset(g_ft.gap, 0, sizeof g_ft.gap);
+        g_ft.last_ns = now; emit = 1;
+    }
+    pthread_mutex_unlock(&g_pc_mu);
+    if (emit) for (int i = 0; i < 5; i++) nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line[i]);
+}
+void nvn_gpu_fbtrace_test_report(void) {
+    if (!g.fbtrace_on) return;
+    pthread_mutex_lock(&g_pc_mu); uint64_t now = now_ns(); g_ft.last_ns = now > 5000000000ull ? now - 5000000000ull : 1; pthread_mutex_unlock(&g_pc_mu);
+    ft_present();
+}
+void nvn_gpu_fbtrace_test_saturate(void) {
+    if (!g.fbtrace_on) return;
+    struct ft_key key; memset(&key, 0, sizeof key); key.natt = 1;
+    pthread_mutex_lock(&g_pc_mu);
+    for (unsigned i = 0; i <= FT_HISTORY; i++) { key.image[0].image = i + 1; ft_dropped(&key, FT_OTHER); }
+    pthread_mutex_unlock(&g_pc_mu);
+}
 static VkRenderPass pc_pass(const VkRenderPassCreateInfo *ci, const VkAttachmentDescription *att, uint32_t natt, const VkAttachmentReference *col, uint32_t ncol, const VkAttachmentReference *dref) {
     VkRenderPass pass = VK_NULL_HANDLE;
     if (!g_pc_use || natt > 9 || ncol > 8) { OC(OC_RP); return vkCreateRenderPass(g.d, ci, NULL, &pass) == VK_SUCCESS ? pass : VK_NULL_HANDLE; }
@@ -2738,9 +2869,14 @@ static VkRenderPass pc_pass(const VkRenderPassCreateInfo *ci, const VkAttachment
     pthread_mutex_unlock(&g_pc_mu);
     return pass;
 }
-static VkFramebuffer pc_fb(const VkFramebufferCreateInfo *fi, int *cached) {
+static VkFramebuffer pc_fb(const VkFramebufferCreateInfo *fi, int *cached, const struct ft_key *trace_key) {
     VkFramebuffer fb = VK_NULL_HANDLE; *cached = 0;
-    if (!g_pc_use || fi->attachmentCount > 9) { OC(OC_FB); return vkCreateFramebuffer(g.d, fi, NULL, &fb) == VK_SUCCESS ? fb : VK_NULL_HANDLE; }
+    if (!g_pc_use || fi->attachmentCount > 9) {
+        OC(OC_FB);
+        if (vkCreateFramebuffer(g.d, fi, NULL, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
+        if (g.fbtrace_on) { pthread_mutex_lock(&g_pc_mu); ft_created(trace_key, 1); ft_uncached_add(fb, trace_key); pthread_mutex_unlock(&g_pc_mu); }
+        return fb;
+    }
     uint64_t h = (uint64_t)(uintptr_t)fi->renderPass * 0x9E3779B97F4A7C15ull ^ ((uint64_t)fi->width << 40 | (uint64_t)fi->height << 16 | fi->layers);
     for (uint32_t i = 0; i < fi->attachmentCount; i++) h = (h ^ (uint64_t)(uintptr_t)fi->pAttachments[i]) * 0x100000001B3ull;
     pthread_mutex_lock(&g_pc_mu);
@@ -2753,21 +2889,25 @@ static VkFramebuffer pc_fb(const VkFramebufferCreateInfo *fi, int *cached) {
     }
     OC(OC_FB);
     { LIFE_T0; VkResult fr_ = vkCreateFramebuffer(g.d, fi, NULL, &fb); LIFE_ADD(3); if (fr_ != VK_SUCCESS) { pthread_mutex_unlock(&g_pc_mu); return VK_NULL_HANDLE; } }
+    if (g.fbtrace_on) { ft_created(trace_key, slot < 0 ? 2 : 0); if (slot < 0) ft_uncached_add(fb, trace_key); }
     if (slot >= 0) { struct pc_fb *e = &g_pc_fb[slot]; memset(e, 0, sizeof *e); e->rp = fi->renderPass; e->natt = fi->attachmentCount; e->w = fi->width; e->h = fi->height; e->layers = fi->layers;
-        memcpy(e->v, fi->pAttachments, fi->attachmentCount * sizeof(VkImageView)); e->fb = fb; *cached = 1; }
+        memcpy(e->v, fi->pAttachments, fi->attachmentCount * sizeof(VkImageView)); e->fb = fb; *cached = 1;
+        if (g.fbtrace_on) { if (trace_key) memcpy(&g_ft_fb[slot], trace_key, sizeof *trace_key); else memset(&g_ft_fb[slot], 0, sizeof g_ft_fb[slot]); } }
     pthread_mutex_unlock(&g_pc_mu);
     return fb;
 }
-static void pc_drop_view(VkImageView v) {
+static void pc_drop_view(VkImageView v, unsigned reason) {
     if (!v) return;
     pthread_mutex_lock(&g_pc_mu);
     for (uint32_t i = 0; i < PC_FB_N; i++) { struct pc_fb *e = &g_pc_fb[i]; if (!e->fb) continue;
-        for (uint32_t k = 0; k < e->natt; k++) if (e->v[k] == v) { vkDestroyFramebuffer(g.d, e->fb, NULL); memset(e, 0, sizeof *e); e->tomb = 1; break; } }
+        for (uint32_t k = 0; k < e->natt; k++) if (e->v[k] == v) {
+            if (g.fbtrace_on) ft_dropped(&g_ft_fb[i], reason);
+            vkDestroyFramebuffer(g.d, e->fb, NULL); memset(e, 0, sizeof *e); e->tomb = 1; break; } }
     pthread_mutex_unlock(&g_pc_mu);
 }
 static void pc_destroy_all(void) {
     pthread_mutex_lock(&g_pc_mu);
-    for (uint32_t i = 0; i < PC_FB_N; i++) if (g_pc_fb[i].fb) vkDestroyFramebuffer(g.d, g_pc_fb[i].fb, NULL);
+    for (uint32_t i = 0; i < PC_FB_N; i++) if (g_pc_fb[i].fb) { if (g.fbtrace_on) ft_dropped(&g_ft_fb[i], FT_RESET); vkDestroyFramebuffer(g.d, g_pc_fb[i].fb, NULL); }
     memset(g_pc_fb, 0, sizeof g_pc_fb);
     for (uint32_t i = 0; i < g_pc_nrp; i++) vkDestroyRenderPass(g.d, g_pc_rp[i].rp, NULL);
     free(g_pc_rp); g_pc_rp = NULL; g_pc_nrp = g_pc_rpcap = 0;
@@ -2860,6 +3000,27 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
 
 static void image_barrier(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout to);
 
+static void ft_attachment(struct ft_attachment *out, const struct nvn_gpu_view_s *v) {
+    const struct nvn_gpu_tex_s *t = v->tex;
+    out->image = t->trace_id; out->format = v->format ? v->format : t->format;
+    out->level = v->base_level; out->layer = t->target == NVN_TEXTURE_TARGET_3D && t->depth > 1 ? v->att_layer : v->base_layer;
+    out->aspect = t->aspect;
+}
+static void ft_key_make(struct ft_key *key, const nvn_gpu_pass_desc *d,
+                        const VkAttachmentDescription *att, const VkAttachmentReference *col,
+                        const VkAttachmentReference *depth, uint32_t natt, int has_depth) {
+    memset(key, 0, sizeof *key);
+    if (!natt || natt > 9 || d->ncolor > 8) return;
+    key->natt = natt; key->ncol = d->ncolor; key->w = d->w; key->h = d->h; key->layers = d->layers ? d->layers : 1; key->has_depth = has_depth != 0;
+    memcpy(key->att, att, natt * sizeof *att); memcpy(key->col, col, d->ncolor * sizeof *col);
+    if (has_depth) key->depth = *depth;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < d->ncolor; i++) if (d->color[i].view) ft_attachment(&key->image[k++], d->color[i].view);
+    if (has_depth) ft_attachment(&key->image[k++], d->depth.view ? d->depth.view : d->stencil.view);
+    if (k != natt) { key->natt = 0; return; }
+    for (uint32_t i = 0; i < natt; i++) if (!key->image[i].image) { key->natt = 0; return; }
+}
+
 void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -2885,8 +3046,9 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     fi.width = d->w;
     fi.height = d->h;
     fi.layers = d->layers ? d->layers : 1;
-    int fb_cached = 0;
-    VkFramebuffer fb = pc_fb(&fi, &fb_cached);
+    int fb_cached = 0; struct ft_key trace_key;
+    if (g.fbtrace_on) ft_key_make(&trace_key, d, att, col, &dref, natt, has_depth);
+    VkFramebuffer fb = pc_fb(&fi, &fb_cached, g.fbtrace_on ? &trace_key : NULL);
     if (!fb) {
         if (!g_pc_use) vkDestroyRenderPass(g.d, pass, NULL);
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "vkCreateFramebuffer 失败");
@@ -2935,7 +3097,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     if (c->npasses == c->passcap) {
         uint32_t cap = c->passcap ? c->passcap * 2 : 8;
         struct pass_rec *np = realloc(c->passes, cap * sizeof *np);
-        if (!np) { if (!fb_cached) vkDestroyFramebuffer(g.d, fb, NULL); if (!g_pc_use) vkDestroyRenderPass(g.d, pass, NULL); set_sticky(c, NVN_GPU_E_OOM, "通道列表分配失败"); return; }
+        if (!np) { if (!fb_cached) { if (g.fbtrace_on) ft_uncached_drop(fb); vkDestroyFramebuffer(g.d, fb, NULL); } if (!g_pc_use) vkDestroyRenderPass(g.d, pass, NULL); set_sticky(c, NVN_GPU_E_OOM, "通道列表分配失败"); return; }
         c->passes = np;
         c->passcap = cap;
     }
@@ -3752,6 +3914,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
 
     struct nvn_gpu_tex_s *t = calloc(1, sizeof *t);
     if (!t) return fail(err, NVN_GPU_E_OOM, "贴图结构分配失败");
+    if (g.fbtrace_on) t->trace_id = __atomic_add_fetch(&g_ft.next_image, 1, __ATOMIC_RELAXED);
     t->format = fmt;
     t->sample_format = sample_fmt;
     t->bc_decoded = bc_decoded;
@@ -3826,7 +3989,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     pthread_mutex_lock(&g_mu);
     if (!newimg_add_locked(t)) {
         pthread_mutex_unlock(&g_mu);
-        pc_drop_view(t->view);
+        pc_drop_view(t->view, FT_OTHER);
         vkDestroyImageView(g.d, t->view, NULL);
         vkFreeMemory(g.d, t->memory, NULL);
         vkDestroyImage(g.d, t->image, NULL);
@@ -3997,16 +4160,21 @@ nvn_gpu_rc nvn_gpu_view_create_buf(nvn_gpu_buf b, uint64_t off, uint64_t bytes, 
     return rc(NVN_GPU_OK);
 }
 
-void nvn_gpu_view_release(nvn_gpu_view vh) {
+void nvn_gpu_fbtrace_release(nvn_gpu_view vh, unsigned reason) {
     struct nvn_gpu_view_s *v = vh;
     if (!v) return;
     pthread_mutex_lock(&g_mu);
     if (!v->released) {
+        if (g.fbtrace_on) {
+            v->trace_reason = reason < FT_REASONS ? reason : FT_OTHER;
+            pthread_mutex_lock(&g_pc_mu); g_ft.release[v->trace_reason]++; pthread_mutex_unlock(&g_pc_mu);
+        }
         v->released = 1;
         if (v->refs == 0) destroy_view_locked(&g, v);
     }
     pthread_mutex_unlock(&g_mu);
 }
+void nvn_gpu_view_release(nvn_gpu_view vh) { nvn_gpu_fbtrace_release(vh, FT_OTHER); }
 
 static VkSamplerAddressMode samp_wrap(uint8_t w) {
     switch (w) {

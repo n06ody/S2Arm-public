@@ -10,6 +10,7 @@
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
+#include "rp_fbtrace.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_fmt_info.h"
@@ -132,7 +133,7 @@ static nvn_gpu_view shadow_attach(nvn_gpu_cmd c, int i, const tex_t *t, uint32_t
     uint32_t w, h, fmt = P.rt.cview[i].format; level_size(t, &P.rt.cview[i], 1, &w, &h);
     shadow_t *s = &g_sh[i];
     if (!s->g || s->fmt != fmt || s->w != w || s->h != h) {
-        if (s->v) nvn_gpu_view_release(s->v);
+        if (s->v) rp_fbtrace_release(s->v, FT_SHADOW);
         if (s->g) nvn_gpu_tex_release(s->g);
         memset(s, 0, sizeof *s);
         nvn_gpu_tex_desc d; memset(&d, 0, sizeof d);
@@ -304,7 +305,7 @@ void rp_pass_barrier(uint32_t bits) { P.barrier_bits |= bits; }
 
 void rp_pass_reset(void) {
     memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu);
-    for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }
+    for (int i = 0; i < 8; i++) { if (g_sh[i].v) rp_fbtrace_release(g_sh[i].v, FT_RESET); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }
     memset(g_sh, 0, sizeof g_sh);
 }
 int rp_pass_is_open(void) { return P.open; }
