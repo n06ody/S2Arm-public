@@ -144,6 +144,10 @@ enum { DESC_MEMO_N = 2048 };
 struct desc_memo { uint64_t h1, h2; VkDescriptorSetLayout dsl; VkDescriptorSet set; };
 struct bc_temp { VkImage image; VkDeviceMemory memory; struct bc_temp *next; };
 enum { TS_PASS_MAX = 250 };   // 调试读数：一段里逐个计时的通道数上限
+struct pass_probe_rec {
+    uint32_t draws, rects, load_clear;
+    uint32_t load[3][3], store[3][2];   // 颜色 / 深度 / 模板，各面分别统计
+};
 
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
 enum { ES_PIPE, ES_VP, ES_SC, ES_BC, ES_ST, ES_DB, ES_VB, ES_IB, ES_PUSH, ES_KINDS };
@@ -152,6 +156,7 @@ struct nvn_gpu_cmd_s {
     struct bc_temp *bc_temps;
     int recording;
     int in_pass;
+    struct pass_probe_rec pass_probe;
     nvn_gpu_rc sticky;
     char why[192];
     struct vk_ref *refs;
@@ -244,6 +249,7 @@ struct nvn_gpu_vk {
     int worker_started;
     int closing;
     int closed;
+    int pass_probe_on;
     _Atomic int stop;
     int busy;
     int commit_active;   // 正在 commit 的线程数：close 要等它归零才拆资源
@@ -273,6 +279,9 @@ struct nvn_gpu_vk {
 static struct nvn_gpu_vk g;
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t passes, zero, one, many, zero_load_clear, zero_rect, zero_both, zero_plain, load[3][3], store[3][2]; } g_pp;
+static uint64_t g_pp_drop_calls, g_pp_drop_matched, g_pp_drop_scan_ns, g_pp_drop_destroy_ns, g_pp_drop_lock_ns;
 // 诊断读数（nvk_gputime 开着时每 300 次上屏打一行）：每帧新建了多少个驱动对象、写了多少次描述符、开了多少个查询。
 enum { OC_RP, OC_FB, OC_CPOOL, OC_DPOOL, OC_DALLOC, OC_DWRITE, OC_QUERY, OC_VIEW, OC_N };
 static uint64_t g_oc[OC_N], g_oc_total[OC_N];
@@ -1043,6 +1052,9 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.pass_probe_on = nvn_plat_flag("nvk_pass_probe", 0) != 0;
+    memset(&g_pp, 0, sizeof g_pp);
+    g_pp_drop_calls = g_pp_drop_matched = g_pp_drop_scan_ns = g_pp_drop_destroy_ns = g_pp_drop_lock_ns = 0;
     g.d = dev->device;
     vk_dq_init(g.d);
     g.phys = dev->physical;
@@ -2570,10 +2582,23 @@ static VkFramebuffer pc_fb(const VkFramebufferCreateInfo *fi, int *cached) {
 }
 static void pc_drop_view(VkImageView v) {
     if (!v) return;
+    uint64_t t0 = g.pass_probe_on ? now_ns() : 0, td = 0, n = 0;
     pthread_mutex_lock(&g_pc_mu);
+    uint64_t t1 = g.pass_probe_on ? now_ns() : 0;
     for (uint32_t i = 0; i < PC_FB_N; i++) { struct pc_fb *e = &g_pc_fb[i]; if (!e->fb) continue;
-        for (uint32_t k = 0; k < e->natt; k++) if (e->v[k] == v) { vkDestroyFramebuffer(g.d, e->fb, NULL); memset(e, 0, sizeof *e); e->tomb = 1; break; } }
+        for (uint32_t k = 0; k < e->natt; k++) if (e->v[k] == v) {
+            uint64_t t = g.pass_probe_on ? now_ns() : 0;
+            vkDestroyFramebuffer(g.d, e->fb, NULL);
+            if (g.pass_probe_on) { td += now_ns() - t; n++; }
+            memset(e, 0, sizeof *e); e->tomb = 1; break; } }
+    uint64_t t2 = g.pass_probe_on ? now_ns() : 0;
     pthread_mutex_unlock(&g_pc_mu);
+    if (g.pass_probe_on) {
+        pthread_mutex_lock(&g_pp_mu);
+        g_pp_drop_calls++; g_pp_drop_matched += n; g_pp_drop_lock_ns += t1 - t0;
+        g_pp_drop_scan_ns += t2 - t1 - td; g_pp_drop_destroy_ns += td;
+        pthread_mutex_unlock(&g_pp_mu);
+    }
 }
 static void pc_destroy_all(void) {
     pthread_mutex_lock(&g_pc_mu);
@@ -2670,6 +2695,47 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
 
 static void image_barrier(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout to);
 
+static void pass_probe_attach(struct pass_probe_rec *p, int kind, VkAttachmentLoadOp load, VkAttachmentStoreOp store) {
+    unsigned l = load == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1 : load == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? 2 : 0;
+    unsigned s = store == VK_ATTACHMENT_STORE_OP_DONT_CARE ? 1 : 0;
+    p->load[kind][l]++; p->store[kind][s]++;
+    if (l == 1) p->load_clear = 1;
+}
+
+// 以已录制的 256 个通道为窗；drop 在别的线程发生，只提供同一时段的近似增量。
+static void pass_probe_finish(const struct pass_probe_rec *p) {
+    char line[1024]; int emit = 0;
+    pthread_mutex_lock(&g_pp_mu);
+    g_pp.passes++;
+    if (!p->draws) {
+        g_pp.zero++;
+        if (p->load_clear) g_pp.zero_load_clear++;
+        if (p->rects) g_pp.zero_rect++;
+        if (p->load_clear && p->rects) g_pp.zero_both++;
+        if (!p->load_clear && !p->rects) g_pp.zero_plain++;
+    } else if (p->draws == 1) g_pp.one++; else g_pp.many++;
+    for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < 3; i++) g_pp.load[k][i] += p->load[k][i];
+        for (int i = 0; i < 2; i++) g_pp.store[k][i] += p->store[k][i];
+    }
+    if (g_pp.passes == 256) {
+        uint64_t drop = g_pp_drop_calls, matched = g_pp_drop_matched, lock = g_pp_drop_lock_ns;
+        uint64_t scan = g_pp_drop_scan_ns, destroy = g_pp_drop_destroy_ns;
+        g_pp_drop_calls = g_pp_drop_matched = g_pp_drop_lock_ns = g_pp_drop_scan_ns = g_pp_drop_destroy_ns = 0;
+#define PP(x) ((unsigned long long)(x))
+        snprintf(line, sizeof line, "passprobe passes=%llu zero=%llu one=%llu many=%llu zero_load_clear=%llu zero_rect=%llu zero_plain=%llu color_load=%llu color_clear=%llu color_dontcare=%llu color_store=%llu color_discard=%llu depth_load=%llu depth_clear=%llu depth_dontcare=%llu depth_store=%llu depth_discard=%llu stencil_load=%llu stencil_clear=%llu stencil_dontcare=%llu stencil_store=%llu stencil_discard=%llu zero_both=%llu drop=%llu drop_fb=%llu drop_lock_ms=%.3f drop_scan_ms=%.3f drop_destroy_ms=%.3f",
+            PP(g_pp.passes), PP(g_pp.zero), PP(g_pp.one), PP(g_pp.many), PP(g_pp.zero_load_clear), PP(g_pp.zero_rect), PP(g_pp.zero_plain),
+            PP(g_pp.load[0][0]), PP(g_pp.load[0][1]), PP(g_pp.load[0][2]), PP(g_pp.store[0][0]), PP(g_pp.store[0][1]),
+            PP(g_pp.load[1][0]), PP(g_pp.load[1][1]), PP(g_pp.load[1][2]), PP(g_pp.store[1][0]), PP(g_pp.store[1][1]),
+            PP(g_pp.load[2][0]), PP(g_pp.load[2][1]), PP(g_pp.load[2][2]), PP(g_pp.store[2][0]), PP(g_pp.store[2][1]),
+            PP(g_pp.zero_both), PP(drop), PP(matched), lock / 1e6, scan / 1e6, destroy / 1e6);
+#undef PP
+        memset(&g_pp, 0, sizeof g_pp); emit = 1;
+    }
+    pthread_mutex_unlock(&g_pp_mu);
+    if (emit) nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+}
+
 void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -2723,6 +2789,14 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_pass = 1;
+    if (g.pass_probe_on) {
+        memset(&c->pass_probe, 0, sizeof c->pass_probe);
+        for (uint32_t i = 0, k = 0; i < d->ncolor && i < 8; i++) if (d->color[i].view) {
+            pass_probe_attach(&c->pass_probe, 0, att[k].loadOp, att[k].storeOp); k++;
+        }
+        if (has_depth && d->depth.view) pass_probe_attach(&c->pass_probe, 1, att[natt - 1].loadOp, att[natt - 1].storeOp);
+        if (has_depth && d->stencil.view) pass_probe_attach(&c->pass_probe, 2, att[natt - 1].stencilLoadOp, att[natt - 1].stencilStoreOp);
+    }
     c->pass_occl = d->occlusion;
     c->pass_w = d->w;
     c->pass_h = d->h;
@@ -2760,6 +2834,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->qpool, (uint32_t)c->q_active); c->q_active = -1; }   // 查询不跨通道
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
+    if (g.pass_probe_on) pass_probe_finish(&c->pass_probe);
     c->in_pass = 0;
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     // 附件全程 GENERAL，不用转布局；写对后续采样 / 拷贝 / 再当附件可见由通道的出边依赖（make_pass dep[1]）保证
@@ -3321,6 +3396,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance);
     }
+    if (g.pass_probe_on) c->pass_probe.draws++;
     if (dtm) { const uint64_t dt3 = now_ns(); __atomic_fetch_add(&g_draw_ns[0], dt1 - dt0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[1], dt2 - dt1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[2], dt3 - dt2, __ATOMIC_RELAXED); }
 }
 
@@ -4292,6 +4368,7 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     if (!cm || !sm) { set_sticky(c, NVN_GPU_E_ARG, "clear_rect 写掩码为 0（颜色 %#x 模板 %#x）", (unsigned)d->color_mask, (unsigned)d->stencil_mask); return; }
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
+    if (g.pass_probe_on && rc_is(c->sticky, NVN_GPU_OK)) c->pass_probe.rects++;
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
 }
 

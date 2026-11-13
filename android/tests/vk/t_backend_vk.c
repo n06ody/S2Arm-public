@@ -36,14 +36,20 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native;
 // S2A_TEST_NVK_DQ=1：整套用例在「两级回放开」下再跑一遍（run.sh 第二遍）
 // S2A_TEST_NVK_DQ=1：整套用例在「两级回放开」下再跑一遍；S2A_TEST_DESC_MEMO=1：在「描述符组备忘开」下再跑一遍
 // （备忘开着时内容相同的组不再分配，按「分配了几组」写的那几条期望在这一遍里不比，像素期望照比）。
-static int g_memo_on;
+static int g_memo_on, g_pass_probe_on = 1, g_pass_probe_seen, g_pass_probe_drop_seen;
 void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_pass_probe")) return g_pass_probe_on;
     if (!strcmp(name, "nvk_dq") && getenv("S2A_TEST_NVK_DQ")) return 1;
     if (!strcmp(name, "nvk_desc_memo") && getenv("S2A_TEST_DESC_MEMO")) { g_memo_on = 1; return 1; }
     return dflt;
 }
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)level; printf("[%s] %s\n", cls ? cls : "", text ? text : ""); }
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    (void)level;
+    if (text && strstr(text, "passprobe passes=256 zero=192 one=64 many=0 zero_load_clear=64 zero_rect=64 zero_plain=64 color_load=192 color_clear=64 color_dontcare=0 color_store=256 color_discard=0 depth_load=128 depth_clear=64 depth_dontcare=64 depth_store=192 depth_discard=64 stencil_load=128 stencil_clear=64 stencil_dontcare=64 stencil_store=192 stencil_discard=64")) g_pass_probe_seen++;
+    if (text && strstr(text, "passprobe passes=256 zero=256") && strstr(text, "drop=2 drop_fb=1")) g_pass_probe_drop_seen++;
+    printf("[%s] %s\n", cls ? cls : "", text ? text : "");
+}
 static int g_tri_origin_ul;   // 1 = 按 NVN 窗口原点在左上画（视口翻转）：期望上下对调。缺省 0 = 原点在左下（Vulkan 的自然方向）
 
 // C66 only: model a strict driver enforcing maxSets=64; all other calls
@@ -3179,6 +3185,46 @@ static nvn_gpu_buf full_vb(void) {
     return make_buf(sizeof verts, NVN_GPU_MEM_SHARED, verts);
 }
 
+// 四类各 64 次：只载入、只 load 清除、只矩形清除、一笔游戏 draw。
+static void pass_probe_counts(const char *dir, int enabled) {
+    g_pass_probe_seen = g_pass_probe_drop_seen = 0;
+    nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
+    if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) { CHECK(0, "passprobe shader"); return; }
+    nvn_gpu_pipe_desc pd; fill_gpipe_desc(&pd, vs, fs, NVN_FORMAT_DEPTH24_STENCIL8); pd.sfmt = NVN_FORMAT_DEPTH24_STENCIL8;
+    nvn_gpu_pipe pipe = NULL; nvn_gpu_err e = {0};
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "passprobe pipe: %s", e.why);
+    nvn_gpu_tex tex = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex); nvn_gpu_buf vb = full_vb();
+    nvn_gpu_tex ds = make_tex(8, 8, NVN_FORMAT_DEPTH24_STENCIL8, NVN_GPU_TEX_RENDER); nvn_gpu_view dv = make_view(ds);
+    nvn_gpu_pass_desc p = {0}; p.ncolor = 1; p.color[0].view = view; p.color[0].store = NVN_GPU_STORE_STORE; p.depth.view = p.stencil.view = dv; p.w = p.h = 8; p.layers = 1;
+    nvn_gpu_cmd c = begin_cmd();
+    for (int i = 0; i < 256; i++) {
+        int kind = i / 64; p.color[0].load = kind == 1 ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD;
+        p.depth.load = p.stencil.load = kind == 1 ? NVN_GPU_LOAD_CLEAR : kind == 2 ? NVN_GPU_LOAD_DONTCARE : NVN_GPU_LOAD_LOAD;
+        p.depth.store = p.stencil.store = kind == 2 ? NVN_GPU_STORE_DONTCARE : NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(c, &p);
+        if (kind == 2) { nvn_gpu_clear cl = {0}; cl.color = 0; cl.color_mask = 15; cl.stencil_mask = 255; cl.w = cl.h = 1; nvn_gpu_clear_rect(c, &cl); }
+        if (kind == 3) { nvn_gpu_dyn dyn; full_dyn(&dyn); dyn.vp[0][2] = dyn.vp[0][3] = 8; dyn.sc[2] = dyn.sc[3] = 8;
+            nvn_gpu_set_pipe(c, pipe); nvn_gpu_set_dyn(c, &dyn); nvn_gpu_set_vbuf(c, 0, vb, 0);
+            nvn_gpu_draw_args da = {0}; da.prim = 4; da.count = 3; da.instances = 1; nvn_gpu_draw(c, &da); }
+        nvn_gpu_pass_end(c);
+    }
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 196, on_done, NULL, &e); CHECK(OK(r), "passprobe commit: %s", e.why);
+    r = nvn_gpu_fence_wait(196, 5000000000ull, &e); CHECK(OK(r), "passprobe wait: %s", e.why);
+    CHECK(g_pass_probe_seen == enabled, "passprobe 四类手算分布：期望 %d 条匹配，实际 %d", enabled, g_pass_probe_seen);
+    // 另建一个目标录一通道后同步 abort，再释放：一张缓存帧缓冲被摘除，贴图默认视图无匹配。
+    nvn_gpu_tex x = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); nvn_gpu_view xv = make_view(x);
+    nvn_gpu_pass_desc xp = {0}; xp.ncolor = 1; xp.color[0].view = xv; xp.color[0].store = NVN_GPU_STORE_STORE; xp.w = xp.h = 8; xp.layers = 1;
+    c = begin_cmd(); nvn_gpu_pass_begin(c, &xp); nvn_gpu_pass_end(c); nvn_gpu_cmd_abort(c);
+    nvn_gpu_view_release(xv); nvn_gpu_tex_release(x);
+    c = begin_cmd();
+    for (int i = 0; i < 255; i++) { nvn_gpu_pass_begin(c, &p); nvn_gpu_pass_end(c); }
+    nvn_gpu_cmd_abort(c);
+    CHECK(g_pass_probe_drop_seen == enabled, "passprobe 摘表期望 %d 条匹配，实际 %d", enabled, g_pass_probe_drop_seen);
+    nvn_gpu_view_release(dv); nvn_gpu_tex_release(ds); nvn_gpu_view_release(view); nvn_gpu_tex_release(tex); nvn_gpu_buf_release(vb, NULL, NULL);
+    nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs); free(vm); free(fm);
+}
+
 // C56：FS push 常量。两次 push 两个颜色，两笔各画一半屏。
 // 手算：RGBA8 的 UNORM 量化 0.25*255=63.75→64、0.5*255=127.5→128、0.75*255=191.25→191。
 static void c56_push_fs(const char *dir) {
@@ -5228,6 +5274,14 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    pass_probe_counts(argv[1], 1);
+    nvn_gpu_err probe_close = {0};
+    CHECK(OK(nvn_gpu_close(5000000000ull, &probe_close)), "passprobe close: %s", probe_close.why);
+    g_pass_probe_on = 0;
+    if (!open_backend()) return 1;
+    pass_probe_counts(argv[1], 0);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &probe_close)), "passprobe disabled close: %s", probe_close.why);
+    if (!open_backend()) return 1;
     c697_swapchain_images();
     c690_native_bc_image_copy(NVN_FORMAT_RGB_DXT1_SRGB, 8, 1);
     c690_native_bc_image_copy(NVN_FORMAT_RGBA_DXT5, 16, 2);
