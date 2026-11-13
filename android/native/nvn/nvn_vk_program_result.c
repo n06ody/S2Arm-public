@@ -54,6 +54,89 @@ int nvn_vk_program_graphics_stage_index(const char *name) {
 }
 
 static int compute_unique_fields(struct s2a_jv object);
+
+// Return 1 for a proven sampled Buffer, 0 for another proven sampled image,
+// -1 when the set/binding and its type chain cannot be proved. Op/Dim values
+// correspond to the repository's SPIR-V headers (spirv_cross/spirv.h).
+static int texture_buffer_kind(const void *bytes, size_t size, uint32_t set, uint32_t binding) {
+    const uint8_t *p = bytes;
+    if (!p || size < 20 || (size & 3u) || s2a_spv_word(p) != 0x07230203u) return -1;
+    uint32_t bound = s2a_spv_word(p + 12);
+    if (!bound || bound > (1u << 20)) return -1;
+    struct item { size_t pos; uint32_t set, binding; unsigned has_set:1, has_binding:1; };
+    struct item *ids = calloc(bound, sizeof *ids);
+    if (!ids) return -1;
+    size_t words = size / 4;
+    int result = -1, found = 0;
+    for (size_t pos = 5; pos < words;) {
+        uint32_t opword = s2a_spv_word(p + 4*pos), count = opword >> 16, op = opword & 65535u;
+        if (!count || count > words - pos) goto done;
+        uint32_t id = 0;
+        if ((op == 25 && count >= 9) || (op == 27 && count >= 3) ||
+            ((op == 28 || op == 29) && count >= 3) || (op == 32 && count >= 4))
+            id = s2a_spv_word(p + 4*(pos + 1));
+        else if (op == 59 && count >= 4) id = s2a_spv_word(p + 4*(pos + 2));
+        else if (op == 71 && count >= 4) {
+            id = s2a_spv_word(p + 4*(pos + 1));
+            uint32_t dec = s2a_spv_word(p + 4*(pos + 2)), value = s2a_spv_word(p + 4*(pos + 3));
+            if (!id || id >= bound) goto done;
+            if (dec == 34) { if (ids[id].has_set) goto done; ids[id].has_set = 1; ids[id].set = value; }
+            if (dec == 33) { if (ids[id].has_binding) goto done; ids[id].has_binding = 1; ids[id].binding = value; }
+            id = 0;
+        }
+        if (id) { if (id >= bound || ids[id].pos) goto done; ids[id].pos = pos; }
+        pos += count;
+    }
+    for (uint32_t v = 1; v < bound; v++) {
+        if (!ids[v].has_set || !ids[v].has_binding || ids[v].set != set || ids[v].binding != binding) continue;
+        if (++found != 1 || !ids[v].pos) goto done;
+        size_t pos = ids[v].pos;
+        if ((s2a_spv_word(p + 4*pos) & 65535u) != 59 || s2a_spv_word(p + 4*(pos + 3)) != 0) goto done;
+        uint32_t id = s2a_spv_word(p + 4*(pos + 1));
+        if (!id || id >= bound || !ids[id].pos) goto done;
+        pos = ids[id].pos;
+        if ((s2a_spv_word(p + 4*pos) & 65535u) != 32 || s2a_spv_word(p + 4*(pos + 2)) != 0) goto done;
+        id = s2a_spv_word(p + 4*(pos + 3));
+        for (uint32_t steps = 0; steps < bound; steps++) {
+            if (!id || id >= bound || !ids[id].pos) goto done;
+            pos = ids[id].pos;
+            uint32_t op = s2a_spv_word(p + 4*pos) & 65535u;
+            if (op == 27 || op == 28 || op == 29) { id = s2a_spv_word(p + 4*(pos + 2)); continue; }
+            if (op != 25) goto done;
+            uint32_t dim = s2a_spv_word(p + 4*(pos + 3));
+            uint32_t arrayed = s2a_spv_word(p + 4*(pos + 5)), ms = s2a_spv_word(p + 4*(pos + 6));
+            uint32_t sampled = s2a_spv_word(p + 4*(pos + 7));
+            if (dim > 6 || arrayed > 1 || ms > 1 || sampled > 1) goto done;
+            if (dim == 5 && (arrayed || ms)) goto done;
+            result = dim == 5;
+            break;
+        }
+    }
+done:
+    free(ids);
+    return found == 1 ? result : -1;
+}
+
+static int texture_classify(struct s2a_jv binding, const struct fd_stage *stage,
+                            struct fd_binding *out, char *why, size_t why_size) {
+    struct s2a_jv source;
+    char kind[32] = "";
+    int has_source = !s2a_jv_obj_find(binding, "source", &source);
+    if (has_source && s2a_jv_str(source, kind, sizeof kind)) return fail(why, why_size, "texture source invalid");
+    if (has_source && strcmp(kind, "texture") && strcmp(kind, "buffer-texture"))
+        return fail(why, why_size, "unknown texture source");
+    int actual = stage && stage->present ? texture_buffer_kind(stage->spirv, stage->spirv_bytes, (uint32_t)out->set, (uint32_t)out->binding) : -1;
+    if (actual < 0)
+        return fail(why, why_size, "texture SPIR-V descriptor type unproven");
+    if (has_source && !strcmp(kind, "buffer-texture") && actual != 1)
+        return fail(why, why_size, "buffer-texture source disagrees with SPIR-V");
+    if (has_source && !strcmp(kind, "texture") && actual == 1)
+        return fail(why, why_size, "texture source disagrees with SPIR-V buffer");
+    out->texel_buffer = actual == 1;
+    if (out->texel_buffer && out->count != 1) return fail(why, why_size, "buffer texture arrays are unsupported");
+    return 0;
+}
+
 static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size);
 int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size) {
     return parse_graphics(bytes, length, out, 0, why, why_size);
@@ -200,6 +283,9 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             } else if (v2 && dst->kind == 2 && !(dst->count > 1 && dst->slot == 0)) {
                 return fail(why, why_size, "invalid texture source");
             }
+            if (dst->kind == 2 && texture_classify(b,
+                    dst->stage_idx >= 0 && dst->stage_idx < FD_MAX_STAGES ? &out->stage[dst->stage_idx] : NULL,
+                    dst, why, why_size)) return -1;
             if (dst->kind == 1) {
                 // Storage buffer address provenance. These fields are optional for
                 // older results; a missing mapping stays explicit and the runtime
@@ -448,6 +534,7 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             return NVK_PROGRAM_ARRAY_UNSUPPORTED;
         }
         if (u != 1) CS_FAIL("compute descriptor arrays are unsupported");
+        dst->count = 1;
         for (int j = 0; j < i; ++j)
             if (out->bindings[j].set == dst->set && out->bindings[j].binding == dst->binding) CS_FAIL("duplicate compute binding");
         dst->is_support = (uint8_t)compute_string_is(b, "kind", "support");
@@ -524,6 +611,10 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             else {
                 if (dst->slot < 8 || dst->slot >= 72 || (dst->slot & 1)) CS_FAIL("compute texture slot outside recorded range");
                 dst->tex_slot = (int16_t)((dst->slot - 8) / 2);
+            }
+            if (texture_classify(b, &out->stage, dst, why, why_size)) {
+                nvn_vk_program_free_compute(out);
+                return -1;
             }
         }
         out->binding_count++;

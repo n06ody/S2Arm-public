@@ -55,6 +55,14 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30)
 
+    if len(sys.argv) in (3, 4) and sys.argv[1] == '--tbuf-layout':
+        exe = out/'tbuf-layout'
+        src = [ROOT/'android/tests/tbuf_layout_test.c', *libs]
+        host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        result = subprocess.run([str(exe), *sys.argv[2:]], capture_output=True, text=True, timeout=30)
+        sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
+
     if sys.argv[1:] == ['--legacy-compare']:
         # Compare actual unchanged legacy REQUEST and S2AI1 bytes against merge-base.
         base_sha = subprocess.check_output(['git', 'merge-base', 'HEAD', 'origin/main'], cwd=ROOT, text=True).strip()
@@ -76,10 +84,36 @@ def main():
         assert before_lines[1] == after_lines[1], 'legacy S2AI1 bytes changed'
         print(f'legacy request and canonical identity byte-for-byte unchanged versus {base_sha}')
         return 0
-    if len(sys.argv) == 6 and sys.argv[1] == '--emit-real':
+    if len(sys.argv) == 6 and sys.argv[1] in ('--emit-real', '--emit-real-tbuf', '--execute-tbuf', '--emit-compute-tbuf', '--execute-compute-tbuf'):
         result = run('emit-real', original, args=sys.argv[1:])
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
         return result.returncode
+
+    if len(sys.argv) == 7 and sys.argv[1] == '--tbuf-withdraw':
+        profile, closure, src_dir, gfx_result, cs_result = sys.argv[2:]
+        code = original.read_text(encoding='utf-8')
+        layout_anchor = 'if (b->kind == 2 && b->texel_buffer && b->count == 1 && b->tex_slot >= 0)'
+        assert code.count(layout_anchor) == 1
+        mutated = out/'tbuf-withdraw-layout.c'
+        mutated.write_text(code.replace(layout_anchor, layout_anchor.replace('&& b->texel_buffer', '&& 0 && b->texel_buffer')))
+        fixture = out/'tbuf-withdraw-layout-test.c'
+        fixture.write_text((ROOT/'android/tests/tbuf_layout_test.c').read_text().replace(
+            '#include "../native/gfx_plat/nvk_shader.c"', '#include "' + str(mutated) + '"'))
+        exe = out/'tbuf-withdraw-layout-test'
+        host_link.run(base + [str(p) for p in [fixture, *libs]] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        for path, extra in [(gfx_result, ()), (cs_result, ('--compute',))]:
+            result = subprocess.run([str(exe), path, *extra], capture_output=True, text=True, timeout=30)
+            assert result.returncode == 1 and 'FAIL: BUFFER layout must be TBUF' in result.stderr, result.stderr
+        print('NEGATIVE CONTROL PASS: removing TBUF layout fails graphics and compute assertions')
+        guard = 'if (le->cls == NVN_GPU_RES_TBUF) { red1("texture_buffer_replay_unsupported",'
+        assert code.count(guard) == 2
+        mutated = out/'tbuf-withdraw-replay.c'
+        mutated.write_text(code.replace(guard, guard.replace('le->cls ==', '0 && le->cls ==')))
+        for mode, path in [('--execute-tbuf', gfx_result), ('--execute-compute-tbuf', cs_result)]:
+            result = run('tbuf-withdraw-replay', mutated, args=(mode, profile, closure, src_dir, path))
+            assert result.returncode == 1 and 'FAIL: real' in result.stderr and 'refuses unsupported replay' in result.stderr, result.stderr
+        print('NEGATIVE CONTROL PASS: removing TBUF replay guards fails graphics and compute assertions')
+        return 0
 
     if sys.argv[1:] == ['--withdraw']:
         text = original.read_text(encoding='utf-8')

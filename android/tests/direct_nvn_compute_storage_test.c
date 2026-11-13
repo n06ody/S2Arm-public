@@ -40,6 +40,7 @@
 #include <string.h>
 
 #include "nvn/nvn_vk_program_result.h"
+#include "tbuf_spirv_fixtures.h"
 
 // 最小合法 SPIR-V：5 个头部 word（magic=0x07230203、version 1.3、generator 0、bound 1、schema 0）。
 // 生产 compute 解析只要求 base64 解码后 >=20 字节、4 字节对齐、magic 正确。
@@ -482,7 +483,7 @@ int main(void) {
             "\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
             "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"%s\"}],"
             "\"bindings\":[{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":344,\"samp_slot\":127,\"count\":1}],"
-            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}", k_spirv);
+            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}", S2A_TEST_COMP_1);
         int rc = nvn_vk_program_parse_compute((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
         ck_true("compute v2 separate maximum slots", rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == 255 && p.bindings[0].samp_slot == 127, why);
         nvn_vk_program_free_compute(&p);

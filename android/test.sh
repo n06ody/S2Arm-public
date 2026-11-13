@@ -324,6 +324,9 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
 # 原创 Maxwell 经生产请求、真实编译器与生产结果解析；GPU 像素由 Vulkan 门禁另验。
 s2a_gate_step "$PY" "$android_dir/tests/gs_compiler_chain_test.py"
+# BUFFER texture: real producer, Maxwell compiler, SPIR-V parser and replay rejection.
+s2a_gate_step "$PY" "$android_dir/tests/tbuf_compiler_chain_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/libpack_tbuf_withdraw_test.py"
 # W2 compute: real C components with synthetic input / Vulkan mocks, never GPU or device evidence.
 s2a_gate_step "$PY" "$android_dir/tests/direct_compute_identity_test.py"
 # P0-3：constantBufferUse 宽掩码的 S2AI1 v3/v4 分叉现由计算与图形共用——正例 + 两处撤改必红（纯宿主 C 编译，秒级）。
