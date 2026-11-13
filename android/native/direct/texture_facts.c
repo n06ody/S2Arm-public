@@ -165,8 +165,8 @@ static int s2a_nvn_texture_fact_compute(uint32_t nvn_format, uint32_t nvn_target
 
 int s2a_nvn_texture_buffer_fact(uint32_t nvn_format, struct s2a_nvn_texture_fact *out,
                                 char *why, size_t why_size) {
-    // This fact-only entry point is not used by production request producers:
-    // a BUFFER resource must not reach execution until its binding is supported.
+    // Producers may supply this fact; replay must still reject a BUFFER
+    // resource until its binding is supported.
     if (nvn_format == S2A_NVN_FORMAT_UNKNOWN || !format_name(nvn_format)) {
         setwhy(why, why_size, "buffer texture format is not mapped");
         return -1;

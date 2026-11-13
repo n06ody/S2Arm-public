@@ -18,6 +18,7 @@
 #include "direct/s2a_direct.h"
 #include "../../runtime/include/s2a_direct_host.h"
 #include "direct/jv.h"
+#include "tbuf_spirv_fixtures.h"
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
 static unsigned fake_array_count;
@@ -25,10 +26,12 @@ static int separate_fixture;
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1;
 int g_s2a_logfd = 2;
 static const char *fake_compile_error;
+static const char *fake_compile_file;
 static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512], last_request_reason[512];
 static char reason_history[8192];
 static const char profile[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
 static char external_profile[65536], external_closure[128];
+static char external_profile_hash[80];
 static const char *capture_output;
 static const char phash[] = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static prog_t gs_program;
@@ -70,7 +73,8 @@ void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->cap
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     if (!separate_fixture || (id != 77 && id != 78 && !(separate_fixture == 2 && id == 0))) return 0;
     memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
-    *h = id == 77; if (*h) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; } return 1;
+    if (separate_fixture == 3) t->d.target = NVN_TEXTURE_TARGET_BUFFER;
+    *h = id == 77 && separate_fixture != 3; if (*h) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; } return 1;
 }
 static uint64_t fake_reg_generation;
 static int fake_reg_changes = 1, gs_sep_hash_calls;
@@ -91,7 +95,7 @@ uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) {
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
-    c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = phash;
+    c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = external_profile_hash[0] ? external_profile_hash : phash;
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
@@ -104,6 +108,17 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
         CHECK(f != NULL, "real compiler request output opens");
         if (f) { CHECK(fwrite(captured, 1, (size_t)req.bytes, f) == (size_t)req.bytes, "real compiler request output complete"); fclose(f); }
         return -27;
+    }
+    if (fake_compile_file) {
+        FILE *f = fopen(fake_compile_file, "rb");
+        if (!f || fseek(f, 0, SEEK_END)) return -1;
+        long n = ftell(f);
+        if (n <= 0 || fseek(f, 0, SEEK_SET)) { fclose(f); return -1; }
+        uint8_t *bytes = malloc((size_t)n);
+        if (!bytes || fread(bytes, 1, (size_t)n, f) != (size_t)n) { free(bytes); fclose(f); return -1; }
+        fclose(f);
+        s2a_direct_bytes payload = {bytes, (uint64_t)n};
+        int32_t rc = emit(sink, payload); free(bytes); return rc;
     }
     if (fake_gs_success) {
         char result[1024];
@@ -121,10 +136,10 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
         (void)emit(sink, payload); return -1;
     }
     if (fake_array_count) {
-        char result[1024];
+        char result[4096];
         int n = snprintf(result, sizeof result,
-            "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],"
-            "\"bindings\":[{\"stage\":\"vs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":%u}]}}", fake_array_count);
+            "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"}],"
+            "\"bindings\":[{\"stage\":\"vs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":0,\"count\":%u}]}}", S2A_TEST_VERT_64, fake_array_count);
         s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
         return emit(sink, payload);
     }
@@ -311,11 +326,13 @@ static void run_case(int compute, int pool, int want_called, const char *expecte
         }
     }
 }
-static int emit_real_request(const char *profile_path, const char *closure, const char *dir, const char *output) {
+static int emit_real_request(const char *profile_path, const char *closure, const char *dir, const char *output, int tbuf) {
     FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
     size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
     int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
     external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
+    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
+    if (s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) || s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash)) return 1;
     rp_state_reset(); rp_shader_reset(); s2a_source_clear();
     uint8_t keys[3][8];
     for (unsigned st = 0; st < 3; st++) {
@@ -333,10 +350,52 @@ static int emit_real_request(const char *profile_path, const char *closure, cons
     for (unsigned st = 0; st < 3; st++) { gs_stages[st] = (uint8_t)st; memcpy(gs_keys[st], keys[st], 8); }
     gs_keys_ok = 7; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
     if (!rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8)) return 1;
-    bind_pools(7); capture_output = output; compiler_calls = 0;
+    bind_pools(tbuf ? 100 : 7);
+    if (tbuf) { separate_fixture = 3; bind_separate(1, 0, 1, 77); }
+    if (tbuf == 2) { fake_compile_file = output; fake_gs_success = 1; nvn_unimpl_reset(); memset(gs_loads, 0, sizeof gs_loads); }
+    else capture_output = output;
+    compiler_calls = 0;
     struct rp_shader_req q = {0}; q.prim = 0; q.rt_count = 1; q.rt_format[0] = NVN_FORMAT_RGBA8;
     const struct rp_prog *prog = NULL; int rc = rp_shader_resolve(&q, &prog);
+    if (tbuf == 2) {
+        int rejected = rc == -1 && !prog && compiler_calls == 1 &&
+            nvn_unimpl_count("shader", "texture_buffer_replay_unsupported") == 1 && gs_loads[1] == 0;
+        fprintf(stderr, "%s: real BUFFER result refuses unsupported replay before FS shader load\n", rejected ? "PASS" : "FAIL");
+        return !rejected;
+    }
     printf("production Maxwell request: rc=%d captured=%d failures=%d\n", rc, compiler_calls, failures);
+    return !(rc == -1 && compiler_calls == 1 && failures == 0);
+}
+
+static int emit_compute_request(const char *profile_path, const char *closure, const char *dir, const char *output, int replay) {
+    FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
+    size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
+    int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
+    external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
+    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
+    if (s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) || s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash)) return 1;
+    rp_state_reset(); rp_shader_reset(); s2a_source_clear();
+    char path[1024]; snprintf(path, sizeof path, "%s/cs.bin", dir);
+    FILE *f = fopen(path, "rb"); if (!f) return 1;
+    uint8_t code[4096], ctl[0x760] = {0}, digest[32]; size_t n = fread(code, 1, sizeof code, f);
+    extra = fgetc(f); fclose(f); if (!n || extra != EOF) return 1;
+    wr(ctl + 0x20, sizeof ctl); wr(ctl + 0x748, 1); wr(ctl + 0x74c, 1); wr(ctl + 0x750, 1);
+    s2a_sha256 h; s2a_sha256_init(&h); s2a_sha256_update(&h, ctl, sizeof ctl); s2a_sha256_update(&h, code, n); s2a_sha256_final(&h, digest);
+    if (s2a_source_keep(digest, 0, code, (uint32_t)n, ctl, sizeof ctl)) return 1;
+    memcpy(rp_S.skey[5], digest, 8); rp_S.skey_ok = 1 << 5;
+    bind_pools(100); separate_fixture = 3;
+    p_bind_handles handle = {0}; handle.stage = 5; handle.first = 0; handle.n = 1; handle.h[0] = 77;
+    if (!rp_state_op(OP_BIND_TEX, &handle, sizeof handle)) return 1;
+    if (replay) { fake_compile_file = output; fake_gs_success = 1; nvn_unimpl_reset(); memset(gs_loads, 0, sizeof gs_loads); }
+    else capture_output = output;
+    compiler_calls = 0; const struct rp_prog *prog = NULL; int rc = rp_shader_resolve_compute(&prog);
+    if (replay) {
+        int rejected = rc == -1 && !prog && compiler_calls == 1 &&
+            nvn_unimpl_count("shader", "texture_buffer_replay_unsupported") == 1 && gs_loads[NVN_GPU_SH_CS] == 0;
+        fprintf(stderr, "%s: real compute BUFFER result refuses unsupported replay before CS shader load\n", rejected ? "PASS" : "FAIL");
+        return !rejected;
+    }
+    printf("production compute Maxwell request: rc=%d captured=%d failures=%d red=%s\n", rc, compiler_calls, failures, last_red);
     return !(rc == -1 && compiler_calls == 1 && failures == 0);
 }
 
@@ -357,7 +416,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < n; i++) printf("%02x", bytes[i]);
         putchar('\n'); return 0;
     }
-    if (argc == 6 && !strcmp(argv[1], "--emit-real")) return emit_real_request(argv[2], argv[3], argv[4], argv[5]);
+    if (argc == 6 && (!strcmp(argv[1], "--emit-real") || !strcmp(argv[1], "--emit-real-tbuf") || !strcmp(argv[1], "--execute-tbuf")))
+        return emit_real_request(argv[2], argv[3], argv[4], argv[5], !strcmp(argv[1], "--execute-tbuf") ? 2 : !strcmp(argv[1], "--emit-real-tbuf"));
+    if (argc == 6 && (!strcmp(argv[1], "--emit-compute-tbuf") || !strcmp(argv[1], "--execute-compute-tbuf")))
+        return emit_compute_request(argv[2], argv[3], argv[4], argv[5], !strcmp(argv[1], "--execute-compute-tbuf"));
     if (argc != 1) return 2;
     unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR"); rp_state_reset(); source();
     for (int cs = 0; cs < 2; cs++) {

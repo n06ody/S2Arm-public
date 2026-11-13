@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "nvn/nvn_vk_program_result.h"
+#include "tbuf_spirv_fixtures.h"
 
 static int fails;
 #define CHECK(cond, what) do { if (!(cond)) { printf("FAIL: %s\n", what); fails++; } } while (0)
@@ -16,10 +17,13 @@ static const char *k_spirv = "AwIjBwABAwAAAAAAAQAAAAAAAAA=";
 
 static int parse_json(const char *bindings, struct fd_program *p, char *why, size_t cap) {
     char json[4096];
+    int texture = strstr(bindings, "\"kind\":\"texture\"") != NULL;
+    const char *vs = texture ? (strstr(bindings, "\"count\":64") ? S2A_TEST_VERT_64 : S2A_TEST_VERT_1) : k_spirv;
+    const char *fs = texture ? S2A_TEST_FRAG_1 : k_spirv;
     int n = snprintf(json, sizeof json,
         "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
         "\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"},{\"stage\":\"fs\",\"spirv\":\"%s\"}],"
-        "\"bindings\":[%s]}}", k_spirv, k_spirv, bindings);
+        "\"bindings\":[%s]}}", vs, fs, bindings);
     if (n <= 0 || (size_t)n >= sizeof json) return -2;
     memset(p, 0, sizeof *p);
     return nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, p, why, cap);
@@ -27,10 +31,11 @@ static int parse_json(const char *bindings, struct fd_program *p, char *why, siz
 
 static int parse_v2(const char *bindings, struct fd_program *p, char *why, size_t cap) {
     char json[4096];
+    int texture = strstr(bindings, "\"kind\":\"texture\"") != NULL;
     int n = snprintf(json, sizeof json,
         "{\"schema\":\"s2a-direct-program-v2\",\"content\":{\"contract\":\"s2a-direct-program-content-v2\","
         "\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"},{\"stage\":\"fs\",\"spirv\":\"%s\"}],"
-        "\"bindings\":[%s]}}", k_spirv, k_spirv, bindings);
+        "\"bindings\":[%s]}}", texture ? S2A_TEST_VERT_1 : k_spirv, texture ? S2A_TEST_FRAG_1 : k_spirv, bindings);
     if (n <= 0 || (size_t)n >= sizeof json) return -2;
     memset(p, 0, sizeof *p);
     return nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, p, why, cap);

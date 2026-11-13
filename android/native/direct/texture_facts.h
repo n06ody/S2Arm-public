@@ -1,7 +1,7 @@
 // F4.2B：NVN 纹理描述 → 统一编译器 program.textures[] 事实。
 // 只输出能证明语义的组合：颜色格式 + 非 buffer 目标（rect 按上游 Texture2DRect 出 2d/不归一化）；
-// 现行运行时入口对 buffer、UI2F/I2F 与表外不可表达目标一律不输出（编译器按 MISSING_FACT 准确失败）。
-// 单独的 buffer 事实入口用于分步开发；在结果与绑定路径接通前不交给运行时生产者。
+// 通用入口对 buffer、UI2F/I2F 与表外不可表达目标一律不输出；buffer 由专用事实入口表达。
+// 运行时生产者可提供 buffer 事实，但在绑定路径接通前必须拒绝执行相应结果。
 // handle 坐标：NVN 组合纹理表从 cbuf word 8（byte 0x20）起，每槽 8 字节 → handle = 8 + 2 * slot。
 #pragma once
 #include <stddef.h>
@@ -35,8 +35,8 @@ struct s2a_nvn_texture_fact {
 int s2a_nvn_texture_fact(uint32_t nvn_format, uint32_t nvn_target, uint32_t layers,
                          struct s2a_nvn_texture_fact *out, char *why, size_t why_size);
 
-// BUFFER facts for the staged implementation. Existing runtime producers must
-// retain s2a_nvn_texture_fact's rejection until texel views can be bound.
+// BUFFER facts for the staged implementation. Producers must reject replay of
+// the resulting buffer binding until texel views can be bound.
 // array_length is descriptor count 1, not the texture's element count.
 int s2a_nvn_texture_buffer_fact(uint32_t nvn_format, struct s2a_nvn_texture_fact *out,
                                 char *why, size_t why_size);
