@@ -781,6 +781,7 @@ static uint64_t nvrm_color_game(int f) {
         else LOG("【红】 nvnTextureGetNvRmSurfaceNVX: the game's driver's NvColorFormat encoding not recognised, the host table's 6.4–10.9 encoding is used"); }
     return nvn_drv_nvrm_recode(nvrm_color(f), drv);
 }
+static void nvrm_probe_vpool(const pool_t *p, uint64_t off, uint64_t size);   // 探针，定义在 vpt_get 之后
 static int32_t pool_nvmap(pool_t *p) {
     if (!p || !p->mem || (p->flags & 0x200)) return 0;   // a virtual pool's storage belongs to a physical pool
     int32_t h = __atomic_load_n(&p->nvmap, __ATOMIC_ACQUIRE);
@@ -802,6 +803,13 @@ NVN_NOPROTO(nvnTextureGetNvRmSurfaceNVX, void, const NVNtexture *t, const void *
     if (o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) { lay = 1; pitch = o->d.stride; size = (uint64_t)pitch * ((h + 3) & ~3u); }
     else { lay = 3; kind = 0xFE; bh = o->L.tileH; pitch = (row + 63) & ~63u; uint32_t rh = 8u << bh; size = (uint64_t)pitch * ((h + rh - 1) / rh * rh); }
     hm = (uint32_t)pool_nvmap(o->pool);
+    if (!hm) {   // 一次性探针（010045B018EC2000 8E 13 秒 SIGSEGV）：句柄 0 走的是哪一支
+        const pool_t *pp = o->pool;
+        LOG("【红】 nvnTextureGetNvRmSurfaceNVX 探针: nvmap 句柄 0（%s）pool %p mem %p flags %#x 池尺寸 %#llx；纹理 偏移 %#x 尺寸 %#llx %ux%u 格式 %#x 标志 %#x 布局 %u",
+            !pp ? "无池" : !pp->mem ? "池无存储" : (pp->flags & 0x200) ? "虚拟池" : "服务层开句柄失败", (const void *)pp, pp ? (const void *)pp->mem : NULL, pp ? pp->flags : 0,
+            pp ? (unsigned long long)pp->size : 0ull, off, (unsigned long long)size, w, h, o->d.format, o->d.flags, lay);
+        if (pp && (pp->flags & 0x200)) nvrm_probe_vpool(pp, off, size);
+    }
     memcpy(s, &w, 4); memcpy(s + 4, &h, 4); memcpy(s + 8, &cf, 8); memcpy(s + 16, &lay, 4); memcpy(s + 20, &pitch, 4); memcpy(s + 24, &hm, 4); memcpy(s + 28, &off, 4);
     memcpy(s + 32, &kind, 4); memcpy(s + 36, &bh, 4); memcpy(s + 56, &size, 8);
     if (!cf) { static int once; if (!once++) LOG("【红】 nvnTextureGetNvRmSurfaceNVX: format %#x has no NvColorFormat (the driver reports 0 too)", o->d.format); }
@@ -3983,6 +3991,25 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
 }
 // Page table of a sparse pool (see above). Caller holds g_vp_mu
 static const vpte *vpt_get(const struct vpool *v, uint64_t o) { const vpte *l = v->pt[o >> 21]; return l ? &l[(o >> 12) & (VPT_LEAF - 1)] : NULL; }
+// 探针：虚拟池里纹理那段的背板（映了几页、物理上连成几段、首页物理地址、首页所在物理池）
+static void nvrm_probe_vpool(const pool_t *p, uint64_t off, uint64_t size) {
+    vp_lock();
+    const struct vpool *v = vpool_of(p);
+    if (!v) { vp_unlock(); LOG("【红】 nvnTextureGetNvRmSurfaceNVX 探针: 虚拟池 %p 没有页表", (const void *)p); return; }
+    uint64_t pages = 0, mapped = 0; int runs = 0; const uint8_t *first = NULL, *re = NULL;
+    for (uint64_t q = off & ~0xFFFull; q < off + size; q += 0x1000) {
+        pages++;
+        const vpte *e = q < v->size ? vpt_get(v, q) : NULL;
+        if (!e || !e->phys) { re = NULL; continue; }
+        mapped++; if (!first) first = e->phys;
+        if (e->phys != re) runs++;
+        re = e->phys + 0x1000;
+    }
+    const uint8_t *base = v->base;
+    vp_unlock();
+    LOG("【红】 nvnTextureGetNvRmSurfaceNVX 探针: 虚拟池 %p 预留 %p；纹理段 %llu 页里映了 %llu 页，物理上 %d 段，首页物理 %p（偏移 %#llx 起）",
+        (const void *)p, (const void *)base, (unsigned long long)pages, (unsigned long long)mapped, runs, (const void *)first, (unsigned long long)(off & ~0xFFFull));
+}
 static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t *phys) {
     uint64_t gen = atomic_fetch_add(&g_vp_gen, 1) + 1;
     for (uint64_t o = 0; o < size; o += 0x1000) {
