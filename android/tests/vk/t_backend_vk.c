@@ -5487,6 +5487,76 @@ out:
     free(vsm); free(fsm);
 }
 
+// C977b（#977）：实例除数。4 个实例各占 16 像素一列，颜色来自除数 2 的第 1 条流（每实例颜色 红 绿 蓝 红）：
+// 期望列色 {红, 红, 绿, 绿}；除数被丢成每实例一次时是 {红, 绿, 蓝, 红}。
+// 设备没有 VK_EXT_vertex_attribute_divisor（sim_tiers no_vertex_divisor 档）时，除数 2 的管线必须具名 UNSUPPORTED，不能静默退回。
+static int c977_dev_has_ext(const char *name) {
+    uint32_t n = 0; vkEnumerateDeviceExtensionProperties(g_dev.physical, NULL, &n, NULL);
+    VkExtensionProperties *x = calloc(n ? n : 1, sizeof *x); if (!x) return 0;
+    vkEnumerateDeviceExtensionProperties(g_dev.physical, NULL, &n, x);
+    int found = 0; for (uint32_t i = 0; i < n; i++) if (!strcmp(x[i].extensionName, name)) found = 1;
+    free(x); return found;
+}
+static void c977_divisor(const char *dir) {
+    void *vsm = NULL, *fsm = NULL; nvn_gpu_shader vs = NULL, fs = NULL; nvn_gpu_err e;
+    CHECK(load_shader_pair(dir, "div.vert", "quad.frag", NULL, NULL, &vs, &fs, &vsm, &fsm), "C977b shader");
+    if (!vs || !fs) { free(vsm); free(fsm); return; }
+    nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.origin_ll = (uint8_t)!g_tri_origin_ul;
+    pd.color.logic_op = 3; pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs;
+    pd.cfmt[0] = NVN_FORMAT_RGBA8; pd.samples = 1; pd.prim = 5; pd.chmask.mask = 0xf;
+    pd.attr[0].fmt = NVN_FORMAT_RGBA32F; pd.attr[0].stream = 0;
+    pd.attr[1].fmt = NVN_FORMAT_RGBA32F; pd.attr[1].stream = 1;
+    pd.stream[0].stride = 16; pd.stream[1].stride = 16; pd.stream[1].divisor = 2;
+    nvn_gpu_pipe pipe = NULL;
+    nvn_gpu_rc pr = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e);
+    if (!c977_dev_has_ext("VK_EXT_vertex_attribute_divisor")) {
+        CHECK(pr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "实例除数 2"), "C977b 无除数扩展：期望具名 UNSUPPORTED，真结果 %d %s", pr.code, OK(pr) ? "" : e.why);
+        if (pr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "实例除数 2"))
+            printf("C977b 实例除数：本设备没有 VK_EXT_vertex_attribute_divisor，除数 2 具名 UNSUPPORTED（%s）\n", e.why);
+        goto out;
+    }
+    CHECK(OK(pr), "C977b 除数 2 管线：%d %s", pr.code, e.why);
+    if (!pipe) goto out;
+    {
+        static const float pos[4][4] = {{-1, -1, 0, 1}, {-1, 1, 0, 1}, {-0.5f, -1, 0, 1}, {-0.5f, 1, 0, 1}};
+        static const float col[4][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {1, 0, 0, 1}};
+        nvn_gpu_buf pb = make_buf(sizeof pos, NVN_GPU_MEM_SHARED, pos), cb = make_buf(sizeof col, NVN_GPU_MEM_SHARED, col);
+        nvn_gpu_tex out = make_tex(64, 64, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+        nvn_gpu_view ov = make_view(out);
+        nvn_gpu_buf rb = make_buf(64 * 64 * 4, NVN_GPU_MEM_SHARED, NULL);
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc p = {0};
+        p.ncolor = 1; p.color[0].view = ov; p.color[0].load = NVN_GPU_LOAD_CLEAR; p.color[0].store = NVN_GPU_STORE_STORE;
+        p.color[0].clear.f[3] = 1.0f; p.w = 64; p.h = 64; p.layers = 1;
+        nvn_gpu_pass_begin(c, &p); nvn_gpu_set_pipe(c, pipe);
+        nvn_gpu_dyn dyn = {0}; dyn.origin_ll = pd.origin_ll; dyn.nvp = 1; dyn.vp[0][2] = 64; dyn.vp[0][3] = 64; dyn.vp[0][5] = 1;
+        dyn.has_sc = 1; dyn.sc[2] = 64; dyn.sc[3] = 64; nvn_gpu_set_dyn(c, &dyn);
+        nvn_gpu_set_vbuf(c, 0, pb, 0); nvn_gpu_set_vbuf(c, 1, cb, 0);
+        nvn_gpu_draw_args da = {0}; da.prim = 5; da.count = 4; da.instances = 4; nvn_gpu_draw(c, &da);
+        nvn_gpu_pass_end(c);
+        nvn_gpu_copy_tex_buf(c, out, 0, 0, NULL, rb, 0, 64 * 4, 64 * 64 * 4);
+        nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        CHECK(OK(rc), "C977b commit：%d %s", rc.code, e.why);
+        if (OK(rc)) {
+            CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C977b wait：%s", e.why);
+            const uint8_t *px = buf_cpu(rb);
+            static const char *nm[4] = {"红", "红", "绿", "绿"};
+            static const uint8_t want[4][3] = {{255, 0, 0}, {255, 0, 0}, {0, 255, 0}, {0, 255, 0}};
+            char got[128] = {0}; int bad = 0;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *q = px + (32 * 64 + 16 * k + 8) * 4;
+                size_t l = strlen(got); snprintf(got + l, sizeof got - l, "%s%02x%02x%02x", k ? " " : "", q[0], q[1], q[2]);
+                if (q[0] != want[k][0] || q[1] != want[k][1] || q[2] != want[k][2]) bad++;
+            }
+            CHECK(!bad, "C977b 除数 2、实例 4：期望列色 {%s,%s,%s,%s}=ff0000 ff0000 00ff00 00ff00，真结果 %s", nm[0], nm[1], nm[2], nm[3], got);
+            if (!bad) printf("C977b 实例除数 2、实例 4：列色 %s = 期望 {c0,c0,c1,c1}\n", got);
+        }
+        nvn_gpu_view_release(ov); nvn_gpu_tex_release(out);
+        nvn_gpu_buf_release(rb, NULL, NULL); nvn_gpu_buf_release(pb, NULL, NULL); nvn_gpu_buf_release(cb, NULL, NULL);
+    }
+out:
+    nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs); free(vsm); free(fsm);
+}
+
 // 每个拒绝用例独占会话；必须在发 Vulkan 命令前拒绝。
 static void c87_resolve_reject(int k) {
     nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D;
@@ -7444,6 +7514,9 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;
     c977_a2c(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C977a close：%s", e18.why);
+    if (!open_backend()) return 1;
+    c977_divisor(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C977b close：%s", e18.why);
     if (!open_backend()) return 1;
     c74b_clear_rect_oob();
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C74b close：%d %s", e18.rc.code, e18.why);
