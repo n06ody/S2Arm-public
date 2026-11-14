@@ -19,7 +19,7 @@ tiers_json="$repo/android/tests/vk/profiles/s2a_sim_tiers.json"
 profiles_sha=b502e9b0d7508e06e6300af272548cf0ee32f380
 profiles_url=https://github.com/KhronosGroup/Vulkan-Profiles.git
 
-all=(no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_exact16 no_depth_clamp)
+all=(no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_exact16 no_depth_clamp no_vertex_divisor)
 want=("$@"); [ ${#want[@]} -gt 0 ] || want=("${all[@]}")
 for t in "${want[@]}"; do
     case " ${all[*]} " in *" $t "*) ;; *) echo "未知档：${t}（可用：${all[*]}）" >&2; exit 64 ;; esac
@@ -138,6 +138,11 @@ check_tier() {
                 grep -qE "C975 ${f}：设备 路由 vk=[0-9]+ 通道补偿=1" "$log" || red no_exact16 "C975 ${f} 没在设备路由上走退回格式"
                 has "$log" "C975 ${f} 渲染目标：退回格式具名拒绝" || red no_exact16 "C975 ${f} 当渲染目标没具名报红"
             done ;;
+        no_vertex_divisor)
+            run_tier no_vertex_divisor "$log" VK_KHRONOS_PROFILES_EXCLUDE_DEVICE_EXTENSIONS=VK_EXT_vertex_attribute_divisor || rc=$?
+            [ "$rc" -eq 0 ] || red no_vertex_divisor "run.sh rc=$rc"
+            has "$log" "vk vertex divisor: enabled=0" || red no_vertex_divisor "层没去掉 VK_EXT_vertex_attribute_divisor"
+            has "$log" "C977b 实例除数：本设备没有 VK_EXT_vertex_attribute_divisor，除数 2 具名 UNSUPPORTED" || red no_vertex_divisor "C977b 没在缺除数扩展的设备上具名报 UNSUPPORTED（不能静默退回每实例一次）" ;;
         no_depth_clamp)
             run_tier no_depth_clamp "$log" || rc=$?
             [ "$rc" -ne 0 ] || red no_depth_clamp "负对照竟然绿了：缺硬门槛 depthClamp 应建设备失败"
