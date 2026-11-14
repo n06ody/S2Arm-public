@@ -1,0 +1,7 @@
+#version 450
+// #976 采样器用例：每个调用按给定坐标在第 0 级采样一次，结果原样写出（期望在 t_backend_vk.c 里按 Vulkan 规范的纹素选取手算）。
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D t;
+layout(set = 0, binding = 1) readonly buffer C { vec2 uv[]; } c;
+layout(set = 0, binding = 2) writeonly buffer O { vec4 v[]; } o;
+void main() { uint i = gl_GlobalInvocationID.x; o.v[i] = textureLod(t, c.uv[i], 0.0); }

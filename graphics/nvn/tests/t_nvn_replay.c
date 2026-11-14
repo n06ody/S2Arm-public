@@ -102,7 +102,17 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
 void nvn_gpu_tex_release(nvn_gpu_tex t) { g_tex_releases++; free(t); }
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err) { (void)err; g_view_creates++; g_vw_last_has = v != NULL; if (v) g_vw_last = *v; *out = calloc(1, sizeof **out); (*out)->of = t; (*out)->has_v = v != NULL; (*out)->rid = ++g_vid; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_view_release(nvn_gpu_view v) { g_view_releases++; if (v && g_nrel < 8192) g_released_id[g_nrel++] = v->rid; free(v); }
-nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) { (void)p; (void)err; g_samp_creates++; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
+// 环绕的替身语义同真后端（#976）：MIRROR_CLAMP / MIRROR_CLAMP_TO_BORDER 永远具名 UNSUPPORTED；g_samp_no_mce = 设备没有镜像夹到边的扩展。
+static int g_samp_no_mce, g_samp_tries; static samp_par g_samp_last;
+nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) {
+    g_samp_tries++; *out = NULL;
+    const uint32_t w[3] = {p->ws, p->wt, p->wr};
+    for (int i = 0; i < 3; i++) {
+        const char *why = w[i] == NVN_WRAP_MODE_MIRROR_CLAMP ? "sampler_wrap_mirror_clamp：替身" : w[i] == NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER ? "sampler_wrap_mirror_clamp_to_border：替身"
+                        : w[i] == NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE && g_samp_no_mce ? "sampler_mirror_clamp_to_edge：替身设备没有扩展" : NULL;
+        if (why) { snprintf(err->why, sizeof err->why, "%s", why); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED}; }
+    }
+    g_samp_creates++; g_samp_last = *p; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
@@ -1039,6 +1049,32 @@ static void t_linear_reject(void) {
       CHECK(rp_tex_resolve(&d, &g_fake_cmd) != NULL && g_nup == n0 + 1 && g_up[n0].first[0] == 0x5A);
       nvn_be_tex_release(&d); }
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// #976：后端没有的两种镜像夹取 → 核心记具名近似、按 MIRROR_CLAMP_TO_EDGE 重建；扩展也没有 → 不给采样器，按后端的名字记未接、红行带原文。
+static void t_samp_mirror_clamp(void) {
+    res_fresh(); nvn_unimpl_reset();
+    samp_par sp; memset(&sp, 0, sizeof sp);
+    sp.ws = NVN_WRAP_MODE_MIRROR_CLAMP; sp.wt = NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER; sp.wr = NVN_WRAP_MODE_REPEAT; sp.border[1] = 0.5f;
+    nvn_be_reg_samp(2, &sp);
+    int c0 = g_samp_creates, t0 = g_samp_tries;
+    nvn_gpu_samp q = rp_samp_by_id(2);
+    CHECK(q && g_samp_creates - c0 == 1 && g_samp_tries - t0 == 2);   // 先按原样问一次（后端拒），再按近似建成
+    CHECK(g_samp_last.ws == NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE && g_samp_last.wt == NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE && g_samp_last.wr == NVN_WRAP_MODE_REPEAT);
+    CHECK(g_samp_last.border[1] == 0.5f);                              // 其余参数原样
+    CHECK(nvn_unimpl_count("gpu", "samp_wrap_mirror_clamp_approx") == 1 && nvn_unimpl_kinds() == 1);
+    CHECK(rp_samp_by_id(2) == q && g_samp_tries - t0 == 2);            // 建成后不再重问，近似只记一次
+    sp.ws = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE; sp.wt = NVN_WRAP_MODE_CLAMP_TO_EDGE; nvn_be_reg_samp(3, &sp);
+    CHECK(rp_samp_by_id(3) && g_samp_last.ws == NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE && nvn_unimpl_count("gpu", "samp_wrap_mirror_clamp_approx") == 1);   // 原生有的不算近似
+    g_samp_no_mce = 1; int red0 = g_red_lines;
+    sp.ws = NVN_WRAP_MODE_MIRROR_CLAMP; nvn_be_reg_samp(4, &sp);
+    CHECK(rp_samp_by_id(4) == NULL);                                   // 近似也建不了：不给采样器（这笔绘制按槽位未解析跳过），不画别的
+    CHECK(nvn_unimpl_count("gpu", "samp_wrap_mirror_clamp_approx") == 2 && nvn_unimpl_count("gpu", "sampler_mirror_clamp_to_edge") == 1);
+    CHECK(g_red_lines - red0 == 2 && strstr(g_last_red, "sampler_mirror_clamp_to_edge：替身设备没有扩展"));   // 未接首行 + 后端原文
+    sp.ws = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE; nvn_be_reg_samp(5, &sp);
+    CHECK(rp_samp_by_id(5) == NULL && nvn_unimpl_count("gpu", "sampler_mirror_clamp_to_edge") == 2 && nvn_unimpl_count("gpu", "samp_create") == 0);
+    g_samp_no_mce = 0;
+    res_fresh(); nvn_unimpl_reset();
 }
 
 static void t_registry(void) {
@@ -3090,6 +3126,7 @@ int main(int argc, char **argv) {
     t_linear_upload();
     t_linear_reject();
     t_registry();
+    t_samp_mirror_clamp();
     t_decl_view();
     t_buf_mirror();
     t_buf_mirror_fail_once();

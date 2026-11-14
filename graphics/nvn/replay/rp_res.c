@@ -729,11 +729,40 @@ int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *has_v) {
     return ok;
 }
 
+// 后端建采样器失败的 why 以「sampler_」打头的 ASCII 名字开始时（#976），按这个名字记未接，普查能分出是哪一项；
+// 否则记笼统的 samp_create。两种都在首次把后端原文打进红行。
+static void samp_red(const nvn_gpu_err *err, const void *site) {
+    char name[40]; size_t n = 0;
+    if (!strncmp(err->why, "sampler_", 8))
+        while (n + 1 < sizeof name && ((err->why[n] >= 'a' && err->why[n] <= 'z') || (err->why[n] >= '0' && err->why[n] <= '9') || err->why[n] == '_')) { name[n] = err->why[n]; n++; }
+    name[n] = 0;
+    if (nvn_unimpl("gpu", n ? name : "samp_create", site) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err->why[0] ? err->why : "samp_create（后端没写原因）");
+}
+
+static int samp_wrap_no_vk(uint32_t w) { return w == NVN_WRAP_MODE_MIRROR_CLAMP || w == NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER; }
+
 nvn_gpu_samp rp_samp_by_id(int id) {
     pthread_mutex_lock(&g_rmu);
     nvn_gpu_samp s = NULL;
     if (id >= 0 && id < g_nsreg && g_sreg[id].ok) {
-        if (!g_sreg[id].s) { nvn_gpu_err err = {0}; if (!nvn_gpu_ok(nvn_gpu_samp_create(&g_sreg[id].p, &g_sreg[id].s, &err))) { g_sreg[id].s = NULL; nvn_unimpl("gpu", "samp_create", &g_sreg[id]); } }
+        if (!g_sreg[id].s) {
+            nvn_gpu_err err = {0};
+            const samp_par *p = &g_sreg[id].p;
+            nvn_gpu_rc r = nvn_gpu_samp_create(p, &g_sreg[id].s, &err);
+            if (r.code == NVN_GPU_E_UNSUPPORTED && (samp_wrap_no_vk(p->ws) || samp_wrap_no_vk(p->wt) || samp_wrap_no_vk(p->wr))) {
+                // #976：Vulkan 没有 MIRROR_CLAMP / MIRROR_CLAMP_TO_BORDER，后端按契约不近似。这里记一笔具名近似，换成 MIRROR_CLAMP_TO_EDGE 照画
+                // （同 iOS nvn_red.h、Ryujinx EnumConversion）。差别：最近点过滤下 MIRROR_CLAMP 逐纹素相同，线性过滤在 |u| 近 1 处少了与边框色的混合；
+                // MIRROR_CLAMP_TO_BORDER 在 |u| > 1 处本该是边框色。后端连 MIRROR_CLAMP_TO_EDGE 也建不了时照样报红、不画。
+                nvn_unimpl("gpu", "samp_wrap_mirror_clamp_approx", &g_sreg[id]);
+                samp_par q = *p;
+                if (samp_wrap_no_vk(q.ws)) q.ws = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+                if (samp_wrap_no_vk(q.wt)) q.wt = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+                if (samp_wrap_no_vk(q.wr)) q.wr = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+                memset(&err, 0, sizeof err);
+                r = nvn_gpu_samp_create(&q, &g_sreg[id].s, &err);
+            }
+            if (!nvn_gpu_ok(r)) { g_sreg[id].s = NULL; samp_red(&err, &g_sreg[id]); }
+        }
         s = g_sreg[id].s;
     }
     pthread_mutex_unlock(&g_rmu);

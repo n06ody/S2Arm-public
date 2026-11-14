@@ -4855,15 +4855,20 @@ void nvn_gpu_view_release(nvn_gpu_view vh) {
     pthread_mutex_unlock(&g_mu);
 }
 
-static VkSamplerAddressMode samp_wrap(uint8_t w) {
+// 环绕模式。镜像夹取三种（#976）：MIRROR_CLAMP_TO_EDGE 是镜像一次再夹到边，要 VK_KHR_sampler_mirror_clamp_to_edge；
+// MIRROR_CLAMP / MIRROR_CLAMP_TO_BORDER 在 Vulkan 里没有对应模式，按契约不近似，回具名 UNSUPPORTED，由核心决定怎么记、怎么退。
+// 返回 NULL = 已写 *out；否则是不支持的原因（ASCII 名字打头，核心与普查按它归类）。
+static const char *samp_wrap(uint8_t w, VkSamplerAddressMode *out) {
     switch (w) {
-    case NVN_WRAP_MODE_REPEAT: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    case NVN_WRAP_MODE_MIRROR_CLAMP:
+    case NVN_WRAP_MODE_REPEAT: *out = VK_SAMPLER_ADDRESS_MODE_REPEAT; return NULL;
+    case NVN_WRAP_MODE_MIRRORED_REPEAT: *out = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT; return NULL;
     case NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE:
-    case NVN_WRAP_MODE_MIRRORED_REPEAT: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-    case NVN_WRAP_MODE_CLAMP_TO_BORDER:
-    case NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (!g.dev->sampler_mirror_clamp_enabled) return "sampler_mirror_clamp_to_edge：设备没有启用 VK_KHR_sampler_mirror_clamp_to_edge";
+        *out = VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE; return NULL;
+    case NVN_WRAP_MODE_MIRROR_CLAMP: return "sampler_wrap_mirror_clamp：Vulkan 没有镜像后按 CLAMP 夹取的模式";
+    case NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER: return "sampler_wrap_mirror_clamp_to_border：Vulkan 没有镜像后夹到边框色的模式";
+    case NVN_WRAP_MODE_CLAMP_TO_BORDER: *out = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER; return NULL;
+    default: *out = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; return NULL;
     }
 }
 
@@ -4900,9 +4905,14 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
     case NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR: ci.minFilter = VK_FILTER_LINEAR; ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR; break;
     default: free(s); return fail(err, NVN_GPU_E_ARG, "NVN 最小过滤 %u 无映射", p->minf);
     }
-    ci.addressModeU = samp_wrap(p->ws);
-    ci.addressModeV = samp_wrap(p->wt);
-    ci.addressModeW = samp_wrap(p->wr);
+    {
+        const uint8_t wrap[3] = {(uint8_t)p->ws, (uint8_t)p->wt, (uint8_t)p->wr};
+        VkSamplerAddressMode *mode[3] = {&ci.addressModeU, &ci.addressModeV, &ci.addressModeW};
+        for (int i = 0; i < 3; i++) {
+            const char *bad = samp_wrap(wrap[i], mode[i]);
+            if (bad) { free(s); return fail(err, NVN_GPU_E_UNSUPPORTED, "%s（%c 向环绕 %u）", bad, "STR"[i], wrap[i]); }
+        }
+    }
     ci.mipLodBias = p->lod_bias;
     ci.minLod = p->lod_min;
     ci.maxLod = p->lod_max;
