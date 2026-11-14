@@ -36,6 +36,10 @@ struct s2a_vk_device {
     int timeline_semaphore_enabled;
     int index_type_uint8_enabled;
     int draw_indirect_count_enabled; // KHR extension actually enabled, both entry points present
+    // #977：VK_EXT_vertex_attribute_divisor 的 vertexAttributeInstanceRateDivisor 已启用（实例除数大于 1 要它）；
+    // max_vertex_attrib_divisor 是设备上限（未启用时为 0）。
+    int vertex_divisor_enabled;
+    uint32_t max_vertex_attrib_divisor;
     PFN_vkCmdDrawIndirectCountKHR draw_indirect_count;
     PFN_vkCmdDrawIndexedIndirectCountKHR draw_indexed_indirect_count;
     int shader_draw_parameters_enabled;

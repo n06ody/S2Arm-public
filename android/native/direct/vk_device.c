@@ -346,9 +346,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     if (!out->shader_draw_parameters_enabled)
         return fail(why, why_size, "required feature missing: shaderDrawParameters");
 
-    // 容量取两边并集：main 的 index_type_uint8 + 本 PR 的 host import / AHB（其余是 swapchain /
-    // maintenance1 / 校准扩展），新增可选 indirect count 后留 11 项，避免扩展数组越界。
-    const char *device_ext[11];
+    // 容量 = 下面可选扩展同时启用时的最多项数：swapchain / maintenance1 / 校准（KHR 与 EXT 二选一）/ index_type_uint8 /
+    // display_timing / host import / AHB + queue_family_foreign / indirect count / 4444 / vertex attribute divisor = 11，留一项余量。
+    const char *device_ext[12];
     uint32_t device_ext_count = 0;
     if (out->has_swapchain) device_ext[device_ext_count++] = "VK_KHR_swapchain";
     if (out->swapchain_maintenance1_enabled) device_ext[device_ext_count++] = "VK_EXT_swapchain_maintenance1";
@@ -418,6 +418,25 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     int indirect_count_ext = has_device_extension(out->physical, "VK_KHR_draw_indirect_count");
     if (indirect_count_ext) device_ext[device_ext_count++] = "VK_KHR_draw_indirect_count";
     if (out->formats_4444_enabled) device_ext[device_ext_count++] = "VK_EXT_4444_formats";
+    // #977：NVN 顶点流的实例除数大于 1 要 VK_EXT_vertex_attribute_divisor（可选；没有时除数大于 1 的管线建不出来、具名报红）。
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vdiv = {0};
+    vdiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
+    if (has_device_extension(out->physical, "VK_EXT_vertex_attribute_divisor")) {
+        VkPhysicalDeviceFeatures2 q = {0};
+        q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        q.pNext = &vdiv;
+        vkGetPhysicalDeviceFeatures2(out->physical, &q);
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vdp = {0};
+        vdp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 p2 = {0};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &vdp;
+        vkGetPhysicalDeviceProperties2(out->physical, &p2);
+        out->vertex_divisor_enabled = vdiv.vertexAttributeInstanceRateDivisor == VK_TRUE && vdp.maxVertexAttribDivisor > 1;
+        out->max_vertex_attrib_divisor = out->vertex_divisor_enabled ? vdp.maxVertexAttribDivisor : 0;
+    }
+    if (out->vertex_divisor_enabled) device_ext[device_ext_count++] = "VK_EXT_vertex_attribute_divisor";
+    fprintf(stderr, "[s2a] vk vertex divisor: enabled=%d max=%u\n", out->vertex_divisor_enabled, out->max_vertex_attrib_divisor);
     out->device_extension_count = device_ext_count;
 
     // #975：NVN 16 位打包格式的路由（格式表在 nvn_vk_format.c 的 k_p16，弱引用同 #398 深度替换）。
@@ -473,6 +492,14 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         VkBaseOutStructure *tail = (VkBaseOutStructure *)device_info.pNext;
         while (tail->pNext) tail = tail->pNext;
         tail->pNext = (VkBaseOutStructure *)&f4444;
+    }
+    if (out->vertex_divisor_enabled) {   // 接在链尾：只开实例除数（零除数用不到：NVN 除数 0 = 逐顶点）
+        vdiv.vertexAttributeInstanceRateDivisor = VK_TRUE;
+        vdiv.vertexAttributeInstanceRateZeroDivisor = VK_FALSE;
+        vdiv.pNext = NULL;
+        VkBaseOutStructure *tail = (VkBaseOutStructure *)&device_info;
+        while (tail->pNext) tail = tail->pNext;
+        tail->pNext = (VkBaseOutStructure *)&vdiv;
     }
     if (vkCreateDevice(out->physical, &device_info, NULL, &out->device) != VK_SUCCESS)
         return fail(why, why_size, "vkCreateDevice failed");
