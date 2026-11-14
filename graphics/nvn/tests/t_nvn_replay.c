@@ -68,7 +68,7 @@ struct nvn_gpu_cmd_s { int live, is_pre; };
 static struct nvn_gpu_cmd_s g_fake_cmd, g_fake_pre;   // 主段 / 前置段各一个替身
 static int g_aborts;
 static int g_begins, g_commits;
-static struct { nvn_gpu_done_fn fn; void *user; uint64_t signal; } g_pend[8]; static int g_npend, g_main_commits;   // g_main_commits：不算前置段
+static struct { nvn_gpu_done_fn fn; void *user; uint64_t signal; } g_pend[72]; static int g_npend, g_main_commits;   // g_pend：一次提交最多 64 个中间值 + 主段；g_main_commits：不算前置段
 static uint64_t g_fdone;
 static uint32_t g_occ_slots_decl; static int g_occ_log[32], g_nocc_log; static int g_rcond;
 int s2a_nvn_render_cond(void) { return g_rcond; }
@@ -1896,11 +1896,18 @@ static void t_begin_fail(void) {
 static void t_occlusion(void) {
     pass_fresh(); g_rcond = 0; g_gdraws = 0; g_nocc_log = 0; g_tick = 5;
     uint64_t ra[2] = {~0ull, ~0ull}, rb[2] = {~0ull, ~0ull}, rcx[2] = {~0ull, ~0ull};
-    // 段 1：游戏第一次碰这个计数器。开段时还不知道，没声明槽：这一段里不计
-    stream s1 = {0}; q_env(&s1); q_counter(&s1, OP_RESET_COUNTER, NVN_COUNTER_TYPE_SAMPLES_PASSED, NULL); q_draw(&s1); end(&s1);
+    // 段 1：游戏第一次碰这个计数器。开段时还不知道、没声明槽：复位时就地交段，后半段带槽（#1015）。
+    // 复位前那笔在前半段、不计；复位后那笔在后半段的槽 0，报告 R0 = 槽 0 的值。
+    uint64_t r0[2] = {~0ull, ~0ull}; int mc0 = g_main_commits;
+    stream s1 = {0}; q_env(&s1); q_draw(&s1); q_counter(&s1, OP_RESET_COUNTER, NVN_COUNTER_TYPE_SAMPLES_PASSED, NULL); q_draw(&s1);
+    q_counter(&s1, OP_REPORT_COUNTER, NVN_COUNTER_TYPE_SAMPLES_PASSED, r0); end(&s1);
     submit1(&s1);
-    CHECK(g_occ_slots_decl == 0 && g_nocc_log == 0 && g_gdraws == 1 && g_pd[0].occlusion == 0);
-    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_occ_slots_decl > 0 && g_main_commits == mc0 + 2 && g_gdraws == 2 && g_npd == 2 && g_pd[0].occlusion == 0 && g_pd[1].occlusion == 1);
+    { static const int want[2] = {0, -1}; CHECK(g_nocc_log == 2 && !memcmp(g_occ_log, want, sizeof want)); }
+    CHECK(nvn_unimpl_count("occl", "first_reset_not_counted") == 0);
+    { static const uint64_t occ[1] = {9}; g_fake_occ = occ; g_fake_nocc = 1; fake_complete(NVN_GPU_DONE_OK); }
+    CHECK(r0[0] == 9);
+    g_nocc_log = 0;
     // 段 2：画（槽 0）、报告 A、画（槽 1）、带裁剪的清除（清除不计：先停）、画（槽 2）、复位、画（槽 3）、报告 B
     int npd0 = g_npd;
     stream s2 = {0}; q_draw(&s2); q_counter(&s2, OP_REPORT_COUNTER, NVN_COUNTER_TYPE_SAMPLES_PASSED, ra); q_draw(&s2);
@@ -1912,7 +1919,7 @@ static void t_occlusion(void) {
     { static const int want[8] = {0, -1, 1, -1, 2, -1, 3, -1}; CHECK(g_nocc_log == 8 && !memcmp(g_occ_log, want, sizeof want)); }
     CHECK(ra[0] == ~0ull);   // 没完成：没写
     { static const uint64_t occ[4] = {10, 20, 30, 7}; g_fake_occ = occ; g_fake_nocc = 4; g_tick = 600; fake_complete(NVN_GPU_DONE_OK); }
-    CHECK(ra[0] == 10 && ra[1] == 600);   // 复位在段 1；报告 A 之前只开过槽 0
+    CHECK(ra[0] == 19 && ra[1] == 600);   // 复位在段 1（段 1 复位后那笔 9）；本段报告 A 之前只开过槽 0（10）
     CHECK(rb[0] == 7 && rb[1] == 600);    // 段内又复位过：只算槽 3
     // 段 3：接着画（这一段的槽 0）再报告：跨段累计 7 + 5
     g_nocc_log = 0;
@@ -1926,6 +1933,20 @@ static void t_occlusion(void) {
     submit1(&s3); { static const uint64_t occ[1] = {1}; g_fake_occ = occ; g_fake_nocc = 1; fake_complete(NVN_GPU_DONE_OK); }
     CHECK(rcx[0] == 13 && nvn_unimpl_kinds() == 0);
     pass_fresh();
+}
+
+// #1015：第一次复位要就地交段，但这次提交的中间值已经用完（每段 1 笔、换 61 次渲染目标先交满）：交不了，具名记 first_reset_not_counted，不静默。
+static void t_occl_first_reset_cap(void) {
+    pass_fresh(); g_gdraws = 0; g_npend = 0; int keep = rp_split_draws; rp_split_draws = 1;
+    tex_t A = mk_tex(131, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0), B = mk_tex(132, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0); const tex_t *a_[1] = {&A}, *b_[1] = {&B};
+    static stream t; memset(&t, 0, sizeof t); q_env(&t); end(&t);
+    nvn_be_sub_begin(); nvn_be_exec(t.b);   // 同一次提交里分块回放（一个流装不下 61 次换目标）
+    for (int i = 0; i < 61; i++) { memset(&t, 0, sizeof t); put_set_rt_n(&t, (i & 1) ? b_ : a_, 1, NULL); q_draw(&t); end(&t); nvn_be_exec(t.b); }
+    memset(&t, 0, sizeof t); q_counter(&t, OP_RESET_COUNTER, NVN_COUNTER_TYPE_SAMPLES_PASSED, NULL); q_draw(&t); end(&t); nvn_be_exec(t.b);
+    nvn_be_sub_commit();
+    CHECK(g_gdraws == 62 && g_occ_slots_decl == 0 && nvn_unimpl_count("occl", "first_reset_not_counted") == 1);
+    fake_complete(NVN_GPU_DONE_OK);
+    rp_split_draws = keep; pass_fresh();
 }
 
 // 计算派发：取计算程序 → 结束通道 → 绑 NVN 阶段 5 的资源（驱动段里有组数与两张表）→ 派发；
@@ -2831,6 +2852,7 @@ int main(int argc, char **argv) {
     t_clear_rect();
     t_report_counter();
     t_occlusion();
+    t_occl_first_reset_cap();
     t_render_cond();
     t_dispatch();
     t_dispatch_indirect_gpu();
