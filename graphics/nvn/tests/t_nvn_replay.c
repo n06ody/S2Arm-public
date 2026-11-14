@@ -1893,6 +1893,25 @@ static void t_begin_fail(void) {
     rp_split_draws = keep; pass_fresh();
 }
 
+// #1015：多重采样目标上游戏关了多重采样（ms.enable = 0）：安卓照多重采样画，但要具名记 draw / multisample_off_on_ms_target，不静默。
+// 负对照：单样本目标上关、多重采样目标上开，都不记。
+static void t_msoff(void) {
+    pass_fresh(); g_gdraws = 0;
+    tex_t M = mk_tex(141, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0); M.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE; M.d.samples = 4; nvn_tex_layout(&M.d, &M.L); M.has_layout = 1;
+    tex_t S1 = mk_tex(142, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0); const tex_t *m_[1] = {&M}, *s_[1] = {&S1};
+    ms_st on = {0}, off = {0}; on.enable = 1; on.samples = 4; off.enable = 0; off.samples = 4;
+    static const struct { int ms_target; int enable; unsigned want; } k[3] = {{1, 0, 1}, {0, 0, 0}, {1, 1, 0}};
+    for (int i = 0; i < 3; i++) {
+        stream q = {0}; q_env(&q); put_set_rt_n(&q, k[i].ms_target ? m_ : s_, 1, NULL);
+        p_bind_state *by = put(&q, OP_BIND_STATE, sizeof *by); by->kind = 3; memcpy(by->bytes, k[i].enable ? &on : &off, sizeof on);
+        q_draw(&q); end(&q);
+        int g0 = g_gdraws; unsigned n0 = nvn_unimpl_count("draw", "multisample_off_on_ms_target");
+        submit1(&q); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_gdraws == g0 + 1 && nvn_unimpl_count("draw", "multisample_off_on_ms_target") == n0 + k[i].want);
+    }
+    pass_fresh();
+}
+
 static void t_occlusion(void) {
     pass_fresh(); g_rcond = 0; g_gdraws = 0; g_nocc_log = 0; g_tick = 5;
     uint64_t ra[2] = {~0ull, ~0ull}, rb[2] = {~0ull, ~0ull}, rcx[2] = {~0ull, ~0ull};
@@ -2831,6 +2850,7 @@ int main(int argc, char **argv) {
     t_clear_rect();
     t_report_counter();
     t_occlusion();
+    t_msoff();
     t_render_cond();
     t_dispatch();
     t_dispatch_indirect_gpu();
