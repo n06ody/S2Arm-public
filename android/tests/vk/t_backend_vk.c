@@ -799,6 +799,7 @@ static int tri_alpha_reads_one(uint32_t f) {
            (f >= NVN_FORMAT_RGBX32F && f <= NVN_FORMAT_RGBX32I);
 }
 static const uint8_t *g_tri_expect;   // 非空：整张图期望都是这 4 个字节（压缩格式用，纹素不是按像素摆的）
+static const uint8_t *g_tri_px;       // 非空：2x2 各纹素的期望 RGBA8（16 字节，按纹素顺序；打包格式用，存储字节不是 RGBA8）
 static int g_tri_tol;
 static uint64_t g_tri_signal = 5;
 static void tri_impl(const char *shader_dir, uint32_t tex_fmt, const uint8_t *texels, int tbpp, int trow, int want_a) {
@@ -933,18 +934,18 @@ static void tri_impl(const char *shader_dir, uint32_t tex_fmt, const uint8_t *te
             int tx = (int)(u * 2.0f); if (tx > 1) tx = 1;
             int ty = (int)(v * 2.0f); if (ty > 1) ty = 1;
             if (g_tri_origin_ul) ty = 1 - ty;   // 原点在左上：同一个裁剪空间 y 落到相反的行
-            const uint8_t *src = g_tri_expect ? g_tri_expect : texels + (ty * 2 + tx) * tbpp;
+            const uint8_t *src = g_tri_expect ? g_tri_expect : g_tri_px ? g_tri_px + (ty * 2 + tx) * 4 : texels + (ty * 2 + tx) * tbpp;
             // 期望：先取纹素（没有 alpha 的格式按 want_a），再按生效的通道映射手算（视图设了用视图的，否则用存储的）
             // 没有 alpha 的 NVN 格式（RGBX / BGRX / RGB5 / BGR5 / RGB_DXT1）：硬件把 a 读作 1，与存储的第 4 个字节无关；
             // 判定按「视图的有效格式」——视图换格式时以视图格式为准（与硬件一致）
             int noalpha = tri_alpha_reads_one(g_tri_view_fmt ? g_tri_view_fmt : tex_fmt);
-            uint8_t px[4] = {src[0], src[1], src[2], (uint8_t)(tbpp == 4 && !noalpha ? src[3] : want_a)}, mapped[4], sw[4] = {2, 3, 4, 5};
+            uint8_t px[4] = {src[0], src[1], src[2], (uint8_t)((tbpp == 4 && !noalpha) || g_tri_px ? src[3] : want_a)}, mapped[4], sw[4] = {2, 3, 4, 5};
             if (g_tri_vsw_on) memcpy(sw, g_tri_vsw, 4);
             else if (g_tri_swz) for (int ch = 0; ch < 4; ch++) sw[ch] = (uint8_t)(g_tri_swz >> (3 * ch) & 7);
             for (int ch = 0; ch < 4; ch++) mapped[ch] = sw[ch] == 0 ? 0 : sw[ch] == 1 ? 255 : px[sw[ch] - 2];
             const uint8_t *want = mapped;
             const uint8_t *got = buf_cpu(rb) + (y * 64 + x) * 4;
-            if (abs(got[0] - want[0]) > g_tri_tol || abs(got[1] - want[1]) > g_tri_tol || abs(got[2] - want[2]) > g_tri_tol || abs(got[3] - (g_tri_vsw_on || g_tri_swz ? want[3] : want_a)) > g_tri_tol) {
+            if (abs(got[0] - want[0]) > g_tri_tol || abs(got[1] - want[1]) > g_tri_tol || abs(got[2] - want[2]) > g_tri_tol || abs(got[3] - (g_tri_vsw_on || g_tri_swz || g_tri_px ? want[3] : want_a)) > g_tri_tol) {
                 g_fail++;
                 printf("FAIL %s:%d: 三角像素 (%d,%d) = %02x%02x%02x%02x，期望 %02x%02x%02x%02x\n",
                        __FILE__, __LINE__, x, y, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
@@ -981,6 +982,35 @@ static void c200_alpha_reads_one(const char *dir, int k) {
     case 2: g_tri_view_fmt = NVN_FORMAT_RGBA8; tri_impl(dir, NVN_FORMAT_RGBX8, t4, 4, 8, 0); g_tri_view_fmt = 0; break;   // 视图有 alpha：按视图格式照读存储的第 4 字节
     default: g_tri_view_fmt = NVN_FORMAT_RGBX8; tri_impl(dir, NVN_FORMAT_RGBA8, t4, 4, 8, 255); g_tri_view_fmt = 0; break; // 视图没有 alpha：a 读作 1
     }
+}
+
+// C975（#975）：16 位打包格式按 NVN 的位序采样。NVN 从最低位起给分量命名：
+//   RGBA4 = r 0–3、g 4–7、b 8–11、a 12–15；RGB565 = r 0–4、g 5–10、b 11–15；BGR565 = b 0–4、g 5–10、r 11–15（没有 alpha，读作 1）。
+//   依据：iOS 11-03 真机实测（graphics/nvn/gfx/tex/nvn_fmt_mtl.c:54–60）；Ryujinx Vulkan 同口径（FormatTable.cs：R4G4B4A4Unorm → A4B4G4R4UnormPack16；
+//   TextureView.cs：R5G6B5Unorm 配 R5G6B5UnormPack16 时把 r / b 对调，即 r 在低位）。
+// 纹素由各分量的字段值按上面的位移拼成 16 位、小端存；期望 = 字段值 × 255 / 字段最大值（只取 0、满值和 4 位的 17 倍数，转 8 位无舍入），
+//   完全按规则手算，不经被测的格式映射。四个纹素各分量互不对称：哪一处位序反了都读得出来。
+static void c975_fmt16_order(const char *dir, int k) {
+    static const struct { uint32_t fmt; const char *name; int lo[4], bits[4]; int fld[4][4]; } cs[3] = {
+        {NVN_FORMAT_RGBA4,  "RGBA4",  {0, 4, 8, 12}, {4, 4, 4, 4}, {{15, 0, 0, 5}, {0, 15, 0, 10}, {0, 0, 15, 15}, {3, 6, 9, 12}}},
+        {NVN_FORMAT_RGB565, "RGB565", {0, 5, 11, 0}, {5, 6, 5, 0}, {{31, 0, 0, 0}, {0, 63, 0, 0}, {0, 0, 31, 0}, {31, 63, 0, 0}}},
+        {NVN_FORMAT_BGR565, "BGR565", {11, 5, 0, 0}, {5, 6, 5, 0}, {{31, 0, 0, 0}, {0, 63, 0, 0}, {0, 0, 31, 0}, {31, 63, 0, 0}}},
+    };
+    uint8_t texels[8], want[16];
+    for (int t = 0; t < 4; t++) {
+        uint32_t v = 0;
+        for (int ch = 0; ch < 4; ch++) {
+            int max = cs[k].bits[ch] ? (1 << cs[k].bits[ch]) - 1 : 0;
+            if (max) v |= (uint32_t)cs[k].fld[t][ch] << cs[k].lo[ch];
+            want[t * 4 + ch] = (uint8_t)(max ? cs[k].fld[t][ch] * 255 / max : ch == 3 ? 255 : 0);
+        }
+        texels[t * 2] = (uint8_t)(v & 0xff); texels[t * 2 + 1] = (uint8_t)(v >> 8);
+    }
+    printf("C975 执行：%s（纹素 %02x%02x %02x%02x %02x%02x %02x%02x，小端）\n", cs[k].name,
+           texels[1], texels[0], texels[3], texels[2], texels[5], texels[4], texels[7], texels[6]);
+    g_tri_px = want;
+    tri_impl(dir, cs[k].fmt, texels, 2, 4, 255);
+    g_tri_px = NULL;
 }
 
 static void c70_swizzle(const char *dir, int view_overrides) {
@@ -6998,6 +7028,12 @@ int main(int argc, char **argv) {
         c200_alpha_reads_one(argv[1], k);
         nvn_gpu_err e200;
         CHECK(OK(nvn_gpu_close(5000000000ull, &e200)), "C200 close：%d %s", e200.rc.code, e200.why);
+    }
+    for (int k = 0; k < 3; k++) {   // C975：16 位打包格式的位序，三种各一个会话（tri_impl 的提交序号固定）
+        if (!open_backend()) return 1;
+        c975_fmt16_order(argv[1], k);
+        nvn_gpu_err e975;
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e975)), "C975 close：%d %s", e975.rc.code, e975.why);
     }
     if (!open_backend()) return 1;
     t31_vertex_formats(argv[1]);
