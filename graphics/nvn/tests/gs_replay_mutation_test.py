@@ -16,8 +16,13 @@ mutations = [
      'for (int st = 0; st < 2; st++) pd.st[st].sh = g_prog->sh[st];', 'g_last_pdesc.st[NVN_GPU_SH_GS].sh'),
     ('gs-bind-omitted', 'for (int st = 0; st < RP_PROG_STAGES; st++) if (!bind_stage',
      'for (int st = 0; st < 2; st++) if (!bind_stage', 'g_bind_calls[NVN_GPU_SH_GS] == 2'),
-    ('gs-topology', 'if ((rp_shader_graphics_stages() & 4u) && prim != 0 && prim != 1 && prim != 4)',
-     'if (0 && (rp_shader_graphics_stages() & 4u) && prim != 0 && prim != 1 && prim != 4)', 'geometry_topology_unimplemented'),
+    ('gs-topology', 'if (gs && prim != 0 && prim != 1 && prim != 4 && !(prim == 5 && !di && !ind))',
+     'if (0 && gs && prim != 0 && prim != 1 && prim != 4 && !(prim == 5 && !di && !ind))', 'geometry_topology_unimplemented'),
+    # #696：GS 的三角带按 GL 序展开；换成 Vulkan 原生序（奇三角形 (i, i+2, i+1)）必须红在展开序上
+    ('gs-tstrip-order', 'd[o++] = i + (i & 1); d[o++] = i + 1 - (i & 1); d[o++] = i + 2;',
+     'd[o++] = i; d[o++] = i + 1 + (i & 1); d[o++] = i + 2 - (i & 1);', 'g_last_da.count == 6 && !memcmp'),
+    # 带索引的三角带不在读数里：放行后必须红在「仍报未接」上
+    ('gs-tstrip-indexed', '!(prim == 5 && !di && !ind)', '!(prim == 5 && !ind)', 'geometry_topology_unimplemented") == 2'),
 ]
 sources = ['graphics/nvn/tests/t_nvn_replay.c','graphics/nvn/tests/nvn_clear_view_unused.c',
            *('graphics/nvn/replay/'+x for x in ('rp_exec.c','rp_copy_t2b.c','rp_clear_tex.c','rp_state.c','rp_entry.c','rp_res.c','rp_buf.c','rp_pass.c','rp_present.c','nvn_unimpl.c')),
@@ -37,4 +42,4 @@ for name, old, new, want in mutations:
     r = run(name, source.replace(old,new))
     if r.returncode == 0 or want not in r.stdout: raise SystemExit(name + ': wrong failure: ' + r.stdout + r.stderr)
     print(name + ': expected assertion ' + want, flush=True)
-print('PASS: GS replay 5 independent behavior controls')
+print('PASS: GS replay %d independent behavior controls' % len(mutations))
