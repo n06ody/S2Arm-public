@@ -158,7 +158,7 @@ static void sub_orphan(struct sub *s) {
 // ---------- 遮挡计数（NVN_COUNTER_TYPE_SAMPLES_PASSED；nvn_mtl.m @950 一带） ----------
 // NVN 语义：通过的样本数是队列上的累计值——ResetCounter 清零，之后每笔绘制往上加，ReportCounter 在 GPU 做到那里时把当时的累计值写出去。
 // 做法同 iOS：计数期间每个通道用一个新槽（不指望跨通道累加），报告之后换新槽；各槽的值在段完成时按顺序加起来（sub_done）。
-// 游戏第一次碰这个计数器的那一段没有声明槽（开段时还不知道）：那一段里复位之后的绘制不计，只这一次。
+// 游戏第一次碰这个计数器的那一段没有声明槽（开段时还不知道）：复位时就地交段，后半段带槽，复位之后的绘制照计（occ_first_reset_cut）。
 enum { OCC_SLOTS = 2048 };
 static int g_occ_used, g_occ_counting, g_occ_seg, g_occ_cur = -1, g_occ_pass; static uint32_t g_occ_next, g_occ_base;   // g_occ_base：当前这一段的第一个槽号（中途交段之后不是 0）
 static void occ_event(int report, uint64_t addr) {
@@ -176,7 +176,17 @@ void rp_occl_draw(nvn_gpu_cmd c) {                                              
     if (g_occ_next >= OCC_SLOTS) { nvn_unimpl("occl", "slots_exhausted", NULL); return; }
     g_occ_cur = (int)g_occ_next++; nvn_gpu_occlusion(c, g_occ_cur - (int)g_occ_base);
 }
-static void occ_reset(nvn_gpu_cmd c) { g_occ_used = 1; occ_stop(c); g_occ_counting = 1; occ_event(0, 0); }
+static void seg_cut(int next_occ);
+// 第一次复位落在没声明槽的段里（开段时还不知道游戏用这个计数器）：就地交段，后半段开成带槽的新段，复位之后的绘制照计
+// （同 iOS nvn_mtl.m 第一次复位就地拆通道）。前半段没有槽，不进 mids。中间值用完交不了时具名记账，这一段复位后不计。
+static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
+    if (g_occ_seg || !g_sub || !c || c != g_cmd) return c;
+    if (g_mid >= SUB_STEP - 4) { nvn_unimpl("occl", "first_reset_not_counted", NULL); return c; }
+    rp_pass_flush(c);
+    seg_cut(1);
+    return g_cmd;
+}
+static void occ_reset(nvn_gpu_cmd c) { g_occ_used = 1; c = occ_first_reset_cut(c); occ_stop(c); g_occ_counting = 1; occ_event(0, 0); }
 static void occ_report(nvn_gpu_cmd c, uint64_t addr) { g_occ_used = 1; occ_stop(c); occ_event(1, addr); }
 
 // ---------- 条件渲染（nvn_mtl.m @893–@945 rc_*） ----------
@@ -264,6 +274,11 @@ static void sub_split(void) {
     uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns);
     if (nd - g_split_base < (uint64_t)thr) return;
     g_split_base = nd;
+    seg_cut(g_occ_seg);
+}
+// 中途交段本体（sub_split 与第一次遮挡复位共用）：先交当前段，再开新段。交出去的这一段进不进 mids 看它自己声明没声明槽（g_occ_seg），
+// next_occ 是新段要不要声明槽。调用方保证 g_cmd / g_sub 在、通道已收、中间值没用完。
+static void seg_cut(int next_occ) {
     nvn_gpu_err err = {0};
     if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
@@ -273,6 +288,7 @@ static void sub_split(void) {
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, g_fence + ++g_mid, mid_done, m, &err))) red("中途交段失败：%s", err.why);
     pf_add(RP_PERF_SUBS, 1);
     g_occ_base = g_occ_next; g_occ_cur = -1; g_seg_serial++;
+    g_occ_seg = next_occ;
     nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
     if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_cmd, &err))) { g_cmd = NULL; red("中途交段后开新段失败：%s", err.why); }
     rp_dirty_all();
