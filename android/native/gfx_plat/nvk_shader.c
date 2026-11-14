@@ -17,6 +17,7 @@
 #include "direct/texture_facts.h"
 #include "direct/offline_library.h"
 #include "direct/program_cache.h"
+#include "spv_samp_use.h"
 #include "direct/sha256.h"
 #include "direct/jv.h"
 #include "s2a_direct_host.h"
@@ -372,6 +373,22 @@ done:
     free(ids);
 }
 
+// 一次性诊断（不进 PR）：nvk_samp_use_probe=1 时，装载时给每个组合采样项做取样用法分类、记下实际装载 SPIR-V 的摘要（见 spv_samp_use.h）。
+//   开关进程内只读一次；关着时 rp_prog 的诊断字段全 0（「没跑」），不改任何绑定与装载结果
+static int suse_on(void) { static int on = -1; if (on < 0) on = nvn_plat_flag("nvk_samp_use_probe", 0) != 0; return on; }
+static void suse_item(struct rp_prog *p, int st, const void *spv, size_t bytes, uint32_t set, uint32_t binding, uint32_t idx) {
+    if (!suse_on()) return;
+    struct spv_su r; spv_su_classify(spv, bytes, set, binding, &r);
+    p->suse_cls[st][idx] = r.cls; p->suse_why[st][idx] = r.why; p->suse_op[st][idx] = r.op;
+    p->suse_n[st][idx][0] = r.fetch; p->suse_n[st][idx][1] = r.query; p->suse_n[st][idx][2] = r.sample; p->suse_n[st][idx][3] = r.next;
+}
+static void suse_stage(struct rp_prog *p, int st, const void *spv, size_t bytes) {
+    if (!suse_on()) return;
+    uint64_t h = 1469598103934665603ull; const uint8_t *b = spv;
+    for (size_t i = 0; b && i < bytes; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    p->spv_hash[st] = h; p->spv_bytes[st] = (uint32_t)bytes;
+}
+
 // 驱动的贴图句柄表：贴图槽 s 的句柄在第 8 + 2s 个 32 位字，即第 4 + s 个 8 字节项；32 个槽 → 36 项
 enum { HANDLE_TABLE_ENTRIES = 4 + 32 };
 
@@ -404,9 +421,11 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             le->stages = b->is_support ? (1u << nst) - 1u : 1u << st;
             if (b->kind == 2) sampled_decl(fp.stage[st].spirv, fp.stage[st].spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
                 &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]]);
+            if (b->kind == 2) suse_item(&e->prog, st, fp.stage[st].spirv, fp.stage[st].spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding, e->prog.nent[st]);
             e->prog.nent[st]++;
         }
         if (e->failed) break;
+        suse_stage(&e->prog, st, fp.stage[st].spirv, fp.stage[st].spirv_bytes);
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[st]; L.nent = e->prog.nent[st]; L.support_bytes = fp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
         src.blob = fp.stage[st].spirv; src.bytes = fp.stage[st].spirv_bytes; src.entry = "main"; src.layout = &L;
@@ -678,10 +697,12 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
         le->stages = 1u << NVN_GPU_SH_CS;
         if (b->kind == 2) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
             &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]]);
+        if (b->kind == 2) suse_item(&e->prog, 0, cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding, e->prog.nent[0]);
         e->prog.nent[0]++;
     }
     if (!e->failed && !cp.stage.present) { red1("stage_missing_in_result", "cs"); e->failed = 1; }
     if (!e->failed) {
+        suse_stage(&e->prog, 0, cp.stage.spirv, cp.stage.spirv_bytes);
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[0]; L.nent = e->prog.nent[0]; L.support_bytes = cp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src ss = {0}; ss.stage = NVN_GPU_SH_CS; ss.kind = NVN_GPU_BLOB_SPIRV; ss.blob = cp.stage.spirv; ss.bytes = cp.stage.spirv_bytes; ss.entry = "main"; ss.layout = &L;
         nvn_gpu_err err = {0};

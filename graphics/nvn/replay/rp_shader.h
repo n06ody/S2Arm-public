@@ -16,6 +16,11 @@ struct rp_prog {
     uint32_t color_out_mask;                                  // 片元着色器写了哪些输出分量：每个颜色目标 4 位（RGBA）。没有片元阶段 / 不知道 = 全 1
     uint8_t c1[RP_PROG_STAGES][0x100]; uint8_t c1_ok;         // NVN_RB_C1：着色器自带的常量段（位 i = 阶段 i 有）
     uint8_t is_compute;                                       // 计算程序：只有 sh[0] / ent[0]，绑定取 NVN 阶段 5 的状态
+    // 一次性诊断（nvk_samp_use_probe=1，默认关；不进 PR）：组合采样项在 SPIR-V 里的取样用法分类（android/native/gfx_plat/spv_samp_use.h 的 SPV_SU_*，0 = 没跑）
+    //   与各阶段实际装载的 SPIR-V 摘要（FNV-1a 64 + 字节数）；回放在 sampler / texture_slot_unresolved 失败例旁打出来
+    uint8_t suse_cls[RP_PROG_STAGES][RP_PROG_ENT_MAX], suse_why[RP_PROG_STAGES][RP_PROG_ENT_MAX];
+    uint16_t suse_op[RP_PROG_STAGES][RP_PROG_ENT_MAX], suse_n[RP_PROG_STAGES][RP_PROG_ENT_MAX][4];   // fetch / query / sample / 扩展数
+    uint64_t spv_hash[RP_PROG_STAGES]; uint32_t spv_bytes[RP_PROG_STAGES];
 };
 struct rp_shader_req {
     uint32_t prim;              // NVNdrawPrimitive

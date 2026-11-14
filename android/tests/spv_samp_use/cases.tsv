@@ -1,0 +1,21 @@
+# 文件	set	binding	期望分类	期望原因 / 操作码（- = 不核）
+fetch.frag	0	1	none	-
+sample.frag	0	1	need	-
+mixed.frag	0	1	need	-
+query.frag	0	1	none	-
+querylod.frag	0	1	need	op=105
+fetchsize.frag	0	1	none	-
+func.frag	0	1	unknown	op=57
+arr_const.frag	0	1	none	-
+arr_dyn.frag	0	1	unknown	why=dynamic_index
+unused.frag	0	1	unused	-
+unused.frag	0	2	none	-
+separate.frag	0	1	unknown	why=not_combined
+fetch.frag	0	9	unknown	why=no_var
+asmfetch.spvasm	0	1	none	-
+copy.spvasm	0	1	unknown	op=83
+select.spvasm	0	1	unknown	op=169
+phi.spvasm	0	1	unknown	op=245
+direct.spvasm	0	1	unknown	op=95
+@header	0	1	unknown	why=header
+@truncated	0	1	unknown	why=parse

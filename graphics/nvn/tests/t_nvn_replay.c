@@ -24,11 +24,13 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static int g_suse_diag, g_suse_lines; static char g_suse_log[204][480];   // 一次性诊断 nvk_samp_use_probe 的日志行
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (!strncmp(text, "nvk sampuse:", 12) && g_suse_lines < 204) snprintf(g_suse_log[g_suse_lines++], sizeof g_suse_log[0], "%s", text); if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
+    if (!strcmp(name, "nvk_samp_use_probe")) return g_suse_diag;
     if (!strcmp(name, "nvk_state_keep")) return g_flag_state_keep;
     if (!strcmp(name, "nvk_rt_cont")) return g_flag_rt_cont;
     if (!strcmp(name, "nvk_clear_park")) return g_flag_clear_park;
@@ -2692,6 +2694,49 @@ static void t_decl_sampling(void) {
 }
 
 // Two independent slots feed one sampled descriptor; slot 0 is a valid sampler handle.
+// 一次性诊断 nvk_samp_use_probe（不进 PR）：sampler / texture_slot_unresolved 失败例旁打出程序身份 + 装载时的取样用法分类。
+//   关着不打、打不打都不改跳过与否；去重键含 SPIR-V 摘要（同槽不同程序不被吞）；200 组封顶另打 truncated；分类字段照 rp_prog 原样出
+static void t_samp_use_probe(void) {
+    pass_fresh(); g_resolve_rc = 0; g_gdraws = 0; g_suse_lines = 0; g_suse_diag = 0; nvn_unimpl_reset();
+    stream init = {0}; q_env(&init);
+    tex_t t = mk_tex(7033, 0x4000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
+    nvn_be_reg_tex(7, &t, NULL);
+    g_fprog.nent[1] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[1][0];
+    e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = 0; e->src_reg2 = UINT16_MAX; e->count = 1; e->set = 2; e->binding = 5;
+    g_fprog.suse_cls[1][0] = 2; g_fprog.suse_n[1][0][0] = 1; g_fprog.spv_hash[1] = 0x1234; g_fprog.spv_bytes[1] = 40;   // 2 = SPV_SU_NONE：只 fetch
+    p_bind_handles *b = put(&init, OP_BIND_TEX, sizeof *b); b->stage = 1; b->first = 0; b->n = 1; b->h[0] = 7;   // 贴图 7 | 采样器 0（同 GetTexelFetchHandle）
+    q_draw(&init); end(&init); submit1(&init); fake_complete(NVN_GPU_DONE_OK);
+    uint64_t off_skips = nvn_unimpl_count("draw", "sampler_slot_unresolved");
+    CHECK(g_suse_lines == 0 && g_gdraws == 0 && off_skips == 1);   // 关：不打，照旧跳过
+    g_suse_diag = 1; rp_draw_reset();
+    stream again = {0}; q_draw(&again); q_draw(&again); end(&again); submit1(&again); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == 0 && nvn_unimpl_count("draw", "sampler_slot_unresolved") == off_skips + 2);   // 开：跳过照旧
+    CHECK(g_suse_lines == 1);   // 同组合去重
+    CHECK(g_suse_lines >= 1 && strstr(g_suse_log[0], "call=draw stage=1 ent=0 elem=0 count=1 kind=sampler set=2 binding=5 src_reg=0 handle=0x7 tex_id=7 samp_id=0 "));
+    CHECK(g_suse_lines >= 1 && strstr(g_suse_log[0], "skey=none:") && strstr(g_suse_log[0], "spv=0000000000001234/40 class=none why=- op=0 fetch=1 query=0 sample=0 ext=0"));
+    p_draw d = {.prim = 4, .count = 3, .instances = 1};
+    g_fprog.spv_hash[1] = 0x5678; rp_draw(&g_fake_cmd, &d, NULL, NULL);   // 同槽换了一份 SPIR-V：另起一组
+    CHECK(g_suse_lines == 2 && strstr(g_suse_log[1], "spv=0000000000005678/40"));
+    g_fprog.suse_cls[1][0] = 3; g_fprog.suse_op[1][0] = 87; rp_draw(&g_fake_cmd, &d, NULL, NULL);   // 分类不同：另起一组
+    CHECK(g_suse_lines == 3 && strstr(g_suse_log[2], "class=need") && strstr(g_suse_log[2], "op=87"));
+    uint8_t k8[8] = {1, 2, 3, 4, 5, 6, 7, 0xab}; memcpy(rp_S.skey[1], k8, 8); rp_S.skey_ok |= 2; uint64_t bs = rp_S.bser[1]; rp_S.bser[1] = 1;
+    rp_draw(&g_fake_cmd, &d, NULL, NULL);   // 阶段键进日志与去重
+    rp_S.bser[1] = bs; rp_S.skey_ok &= ~2u;
+    CHECK(g_suse_lines == 4 && strstr(g_suse_log[3], "skey=01020304050607ab"));
+    rp_S.tex[1][0] = 99; rp_draw(&g_fake_cmd, &d, NULL, NULL);   // 贴图没登记：kind=texture
+    CHECK(g_suse_lines == 5 && strstr(g_suse_log[4], "kind=texture") && strstr(g_suse_log[4], "tex_id=99"));
+    e->count = 2; e->src_reg = 4;   /* rp_draw.c RP_HANDLE_TABLE_FIRST_SLOT */ rp_S.tex[1][0] = 7; rp_S.tex[1][1] = 7;   // 数组：元素逐个
+    rp_draw(&g_fake_cmd, &d, NULL, NULL);
+    CHECK(g_suse_lines == 6 && strstr(g_suse_log[5], "elem=0 count=2 kind=sampler"));
+    e->count = 1; e->src_reg = 0;
+    rp_draw_reset(); g_suse_lines = 0;
+    for (int j = 0; j < 203; j++) { g_fprog.spv_hash[1] = 0x10000u + (unsigned)j; rp_draw(&g_fake_cmd, &d, NULL, NULL); }
+    CHECK(g_suse_lines == 201 && strstr(g_suse_log[200], "truncated=1 limit=200"));
+    g_suse_diag = 0; rp_draw_reset(); memset(g_fprog.suse_cls, 0, sizeof g_fprog.suse_cls); memset(g_fprog.suse_op, 0, sizeof g_fprog.suse_op);
+    memset(g_fprog.suse_n, 0, sizeof g_fprog.suse_n); memset(g_fprog.spv_hash, 0, sizeof g_fprog.spv_hash); memset(g_fprog.spv_bytes, 0, sizeof g_fprog.spv_bytes);
+    e->set = 0; e->binding = 0; nvn_be_tex_release(&t); pass_fresh();
+}
+
 static void t_separate_sampler(void) {
     pass_fresh(); g_resolve_rc = 0; g_gdraws = 0; nvn_unimpl_reset();
     stream init = {0}; q_env(&init);
@@ -2794,6 +2839,7 @@ int main(int argc, char **argv) {
     t_gs_dirty_and_topology();
     t_gs_bind(); t_storage_sync_before_pass(); t_stage_dropped_clears_binds();
     t_decl_sampling();
+    t_samp_use_probe();
     t_separate_sampler();
     t_present();
     t_view_pin();

@@ -322,6 +322,39 @@ static int prog_layout_same(const struct rp_prog *a, const struct rp_prog *b, in
     return 1;
 }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec);
+// 一次性诊断（nvk_samp_use_probe=1，默认关；不进 PR）：sampler / texture_slot_unresolved 失败例旁打出当时绑定的程序身份
+//   （本阶段的着色器键 + 实际装载 SPIR-V 的摘要与字节数）和该项的取样用法分类（装载时 nvk_shader.c 算好放在 rp_prog）。
+//   按「调用类别、阶段、键、SPIR-V 摘要、set / binding、项、数量、来源槽、元素、种类、分类」去重，最多 200 组，超了另打一条 truncated。
+//   只打日志，不改返回值与跳过与否；开关每会话首次用到时读一次（rp_draw_reset 清），去重表也按会话清
+struct suse_key { uint64_t skey, spv; uint32_t spv_bytes; uint16_t ent, elem, binding, count, src_reg; uint8_t set, call, st, kind, cls, kok; };
+static int g_suse_on = -1, g_suse_n, g_suse_trunc; static struct suse_key g_suse_seen[200];
+static void suse_note(const struct rp_prog *pg, int pi, int st, uint32_t i, int is_samp, uint32_t elem, uint64_t h) {
+    if (g_suse_on < 0) g_suse_on = nvn_plat_flag("nvk_samp_use_probe", 0) != 0;
+    if (!g_suse_on) return;
+    struct suse_key *seen = g_suse_seen; int nseen = g_suse_n;
+    const nvn_gpu_layout_ent *e = &pg->ent[pi][i];
+    uint8_t key[8] = {0}; int kok = st >= 0 && st <= 4 && rp_shader_stage_key((unsigned)st, key);
+    struct suse_key d; memset(&d, 0, sizeof d);
+    memcpy(&d.skey, key, 8); d.spv = pg->spv_hash[pi]; d.spv_bytes = pg->spv_bytes[pi]; d.ent = (uint16_t)i; d.elem = (uint16_t)elem; d.binding = e->binding; d.count = e->count; d.src_reg = e->src_reg;
+    d.set = e->set; d.call = (uint8_t)pg->is_compute; d.st = (uint8_t)st; d.kind = (uint8_t)is_samp; d.cls = pg->suse_cls[pi][i]; d.kok = (uint8_t)kok;
+    for (int j = 0; j < nseen; j++) if (!memcmp(&seen[j], &d, sizeof d)) return;
+    if (nseen == 200) { if (!g_suse_trunc) { g_suse_trunc = 1; nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", "nvk sampuse: truncated=1 limit=200"); } return; }
+    seen[g_suse_n++] = d;
+    static const char *const why[] = {"-", "header", "parse", "no_var", "multi_var", "not_combined", "dynamic_index", "oom", "passes"};
+    static const char *const cls[] = {"notrun", "unknown", "none", "need", "unused"};
+    char m[480];
+    int n = snprintf(m, sizeof m, "nvk sampuse: call=%s stage=%d ent=%u elem=%u count=%u kind=%s set=%u binding=%u src_reg=%u handle=%#llx tex_id=%u samp_id=%u "
+                     "skey=%s%02x%02x%02x%02x%02x%02x%02x%02x spv=%016llx/%u class=%s why=%s op=%u fetch=%u query=%u sample=%u ext=%u",
+                     pg->is_compute ? "compute" : "draw", st, (unsigned)i, (unsigned)elem, (unsigned)e->count, is_samp ? "sampler" : "texture",
+                     (unsigned)e->set, (unsigned)e->binding, (unsigned)e->src_reg, (unsigned long long)h, (unsigned)(h & 0xFFFFF), (unsigned)(h >> 20),
+                     kok ? "" : "none:", key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                     (unsigned long long)pg->spv_hash[pi], (unsigned)pg->spv_bytes[pi],
+                     d.cls < 5 ? cls[d.cls] : "?", pg->suse_why[pi][i] < 9 ? why[pg->suse_why[pi][i]] : "?", (unsigned)pg->suse_op[pi][i],
+                     (unsigned)pg->suse_n[pi][i][0], (unsigned)pg->suse_n[pi][i][1], (unsigned)pg->suse_n[pi][i][2], (unsigned)pg->suse_n[pi][i][3]);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof m) memcpy(m + sizeof m - 16, " truncated_line", 16);   // 超长明确截断（含结尾 0）
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", m);
+}
 static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec); }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) {
     nvn_gpu_binding b[RP_PROG_ENT_MAX]; uint32_t n = 0;
@@ -477,6 +510,10 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (e->count > 1) {   // 贴图数组：逐项绑（视图与采样器已在开通道前取好，放在 g_av / g_as）
                     if (n + e->count > RP_PROG_ENT_MAX) return skip("too_many_bindings", rec);
                     for (uint32_t k = 0; k < e->count; k++) {
+                        if (!g_av[pi][k] || !g_as[pi][k]) {
+                            int slot = (int)(e->src_reg + k) - RP_HANDLE_TABLE_FIRST_SLOT;
+                            suse_note(pg, pi, st, i, g_av[pi][k] != NULL, k, slot >= 0 && slot < 32 ? rp_S.tex[st][slot] : 0);
+                        }
                         if (!g_av[pi][k]) return skip("texture_slot_unresolved", rec);
                         if (!g_as[pi][k]) return skip("sampler_slot_unresolved", rec);
                         nvn_gpu_binding *ok = &b[n + k]; memset(ok, 0, sizeof *ok); ok->ent = (uint16_t)i; ok->cls = e->cls; ok->elem = k;
@@ -485,6 +522,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                     n += e->count - 1;   // 循环末尾再加 1
                     break;
                 }
+                if (!tv[i] || !ts[i]) suse_note(pg, pi, st, i, tv[i] != NULL, 0, e->src_reg < RP_NTEX ? rp_S.tex[st][e->src_reg] : 0);
                 if (!tv[i]) return skip("texture_slot_unresolved", rec);
                 if (!ts[i]) return skip("sampler_slot_unresolved", rec);
                 o->u.ts.view = tv[i]; o->u.ts.samp = ts[i]; break; }
@@ -955,5 +993,6 @@ done:
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+    g_suse_on = -1; g_suse_n = 0; g_suse_trunc = 0;   // 一次性诊断 nvk_samp_use_probe：开关与去重表按会话
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; }
