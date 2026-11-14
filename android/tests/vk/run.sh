@@ -185,8 +185,8 @@ if [ "$mode" = "--separate-neg-sampler" ]; then
     python3 - "$repo/graphics/nvn/replay/rp_draw.c" "$out/rp_draw_mutant.c" <<'PYMUT'
 import pathlib, sys
 s = pathlib.Path(sys.argv[1]).read_text()
-a = 'ts[st][i] = rp_samp_by_id((int)(sh >> 20));'
-b = 'ts[st][i] = rp_samp_by_id((int)(h >> 20)); (void)sh;'
+a = 'ts[st][i] = rp_samp_for_tex((int)(sh >> 20), h ? (int)(h & 0xFFFFF) : rp_S.tex_base);'
+b = 'ts[st][i] = rp_samp_for_tex((int)(h >> 20), h ? (int)(h & 0xFFFFF) : rp_S.tex_base); (void)sh;'
 if s.count(a) != 1: raise SystemExit('sampler negative control anchor changed')
 pathlib.Path(sys.argv[2]).write_text(s.replace(a, b))
 PYMUT

@@ -19,7 +19,7 @@ tiers_json="$repo/android/tests/vk/profiles/s2a_sim_tiers.json"
 profiles_sha=b502e9b0d7508e06e6300af272548cf0ee32f380
 profiles_url=https://github.com/KhronosGroup/Vulkan-Profiles.git
 
-all=(no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_depth_clamp)
+all=(no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_depth_clamp no_fmt_filter_blend)
 want=("$@"); [ ${#want[@]} -gt 0 ] || want=("${all[@]}")
 for t in "${want[@]}"; do
     case " ${all[*]} " in *" $t "*) ;; *) echo "未知档：${t}（可用：${all[*]}）" >&2; exit 64 ;; esac
@@ -130,11 +130,15 @@ check_tier() {
                 VK_KHRONOS_PROFILES_EXCLUDE_DEVICE_EXTENSIONS=VK_KHR_calibrated_timestamps,VK_EXT_calibrated_timestamps || rc=$?
             [ "$rc" -eq 0 ] || red no_calibrated_timestamps "run.sh rc=$rc"
             has "$log" "calibrated_timestamps=0" || red no_calibrated_timestamps "层没去掉校准时间戳扩展（期望走完成点兜底）" ;;
+        no_fmt_filter_blend)
+            run_tier no_fmt_filter_blend "$log" || rc=$?
+            [ "$rc" -eq 0 ] || red no_fmt_filter_blend "run.sh rc=$rc"
+            has "$log" "sim fmt caps: RGBA16 filter=0 R32F blend=0" || red no_fmt_filter_blend "后端没如实报 RGBA16 不能过滤 / R32F 不能混合（核心据此退最近点 / 关混合）" ;;
         no_depth_clamp)
             run_tier no_depth_clamp "$log" || rc=$?
             [ "$rc" -ne 0 ] || red no_depth_clamp "负对照竟然绿了：缺硬门槛 depthClamp 应建设备失败"
             has "$log" "required feature missing: depthClamp" || red no_depth_clamp "没看到拒绝原因 required feature missing: depthClamp" ;;
-        *) echo "未知档：${tier}（可用：no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_depth_clamp）" >&2; exit 64 ;;
+        *) echo "未知档：${tier}（可用：${all[*]}）" >&2; exit 64 ;;
     esac
     local t=$((SECONDS - start))
     if [ "$fails" -eq "$before" ]; then echo "【绿】${tier}（${t}s）"; else echo "  日志：${log}（失败时末尾 40 行如下）" >&2; tail -40 "$log" >&2; fi

@@ -7,7 +7,8 @@ profiles 层一旦模拟格式（SIMULATE_FORMATS_BIT），档里没列的格式
   - 宿主有的格式原样抄 v1 位，另补 VkFormatProperties3（v1 位改名 + 按宿主
     shaderStorageImage{Read,Write}WithoutFormat 补 *_WITHOUT_FORMAT 位；只给 v1 位时层会把这两位丢掉，
     validation 因此误报 VUID-*-OpTypeImage-07029/07030）；
-  - 手写档里列出的格式，按手写的值（一般是全空 = 不支持）覆盖。
+  - 手写档里列出的格式，按手写的值（一般是全空 = 不支持）覆盖；
+  - 手写成 "VkFormatPropertiesRemove" 的格式，从宿主的位里去掉列出的几位（只藏某个特性，比如线性过滤 / 混合，#1072）。
 不碰特性 / 扩展；没有 formats 的档原样输出。
 
 用法：python3 sim_profile.py 宿主.json 手写档.json 输出.json
@@ -52,7 +53,13 @@ def main(argv):
             continue
         full = dict(base)
         for f, p in hide.items():
-            full[f] = entry(p.get("VkFormatProperties", {}), read_wo, write_wo)
+            if "VkFormatPropertiesRemove" in p:
+                host_v1 = hcap.get("formats", {}).get(f, {}).get("VkFormatProperties", {})
+                rm = p["VkFormatPropertiesRemove"]
+                kept = {k: [b for b in host_v1.get(k, []) if b not in rm.get(k, [])] for k in host_v1}
+                full[f] = entry(kept, read_wo, write_wo)
+            else:
+                full[f] = entry(p.get("VkFormatProperties", {}), read_wo, write_wo)
         cap["formats"] = full
     with open(argv[3], "w", encoding="utf-8") as fh:
         json.dump(tiers, fh, ensure_ascii=False, indent=1)
