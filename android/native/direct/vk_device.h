@@ -41,6 +41,12 @@ struct s2a_vk_device {
     int shader_draw_parameters_enabled;
     // VK_KHR_sampler_mirror_clamp_to_edge 已启用：采样器可用 MIRROR_CLAMP_TO_EDGE（实例按 1.1 建，用不到 1.2 核心里的同名特性）。
     int sampler_mirror_clamp_enabled;
+    // VK_EXT_custom_border_color 已启用且 customBorderColors 特性开着：CLAMP_TO_BORDER 的采样器可用任意边框色（#976）。
+    // custom_border_without_format：customBorderColorWithoutFormat 也开着，建采样器时可以不给视图格式。
+    // custom_border_max：maxCustomBorderColorSamplers，同时存活的自定义边框色 VkSampler 个数上限。
+    int custom_border_enabled;
+    int custom_border_without_format;
+    uint32_t custom_border_max;
     // 0 = 没有校准扩展；1 = VK_KHR_calibrated_timestamps；2 = VK_EXT_calibrated_timestamps。
     // GPU 时间戳换算到游戏时钟需要用它求 GPU 域与 CLOCK_MONOTONIC 的偏移。
     int calibrated_timestamps;

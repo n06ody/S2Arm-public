@@ -324,6 +324,8 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     VkPhysicalDevice4444FormatsFeaturesEXT f4444 = {0};
     f4444.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT;
     const int has_4444 = has_device_extension(out->physical, "VK_EXT_4444_formats");
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {0};
+    border.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
     {
         VkPhysicalDeviceFeatures2 query = {0};
         query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -334,6 +336,10 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         if (out->has_swapchain_maintenance1) {
             maintenance.pNext = &draw_parameters;
             query.pNext = &maintenance;
+        }
+        if (has_device_extension(out->physical, "VK_EXT_custom_border_color")) {   // 只在 advertise 时挂查询结构
+            border.pNext = query.pNext;
+            query.pNext = &border;
         }
         vkGetPhysicalDeviceFeatures2(out->physical, &query);
         out->swapchain_maintenance1_enabled = out->has_swapchain_maintenance1 && maintenance.swapchainMaintenance1 == VK_TRUE;
@@ -347,8 +353,8 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         return fail(why, why_size, "required feature missing: shaderDrawParameters");
 
     // 容量 = 下面所有可选扩展同时启用时的项数（swapchain / maintenance1 / 校准 / index_type_uint8 / display_timing /
-    // host import / AHB + queue_family_foreign / indirect count / 4444 / 镜像夹取 = 11），留一项余量。
-    const char *device_ext[12];
+    // host import / AHB + queue_family_foreign / indirect count / 4444 / 镜像夹取 / 自定义边框色 = 12），留一项余量。
+    const char *device_ext[13];
     uint32_t device_ext_count = 0;
     if (out->has_swapchain) device_ext[device_ext_count++] = "VK_KHR_swapchain";
     if (out->swapchain_maintenance1_enabled) device_ext[device_ext_count++] = "VK_EXT_swapchain_maintenance1";
@@ -421,6 +427,20 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // #976：NVN 的 MIRROR_CLAMP_TO_EDGE 环绕。扩展没有特性结构，advertise 即可启用；没有时建这种采样器报 UNSUPPORTED。
     out->sampler_mirror_clamp_enabled = has_device_extension(out->physical, "VK_KHR_sampler_mirror_clamp_to_edge");
     if (out->sampler_mirror_clamp_enabled) device_ext[device_ext_count++] = "VK_KHR_sampler_mirror_clamp_to_edge";
+    // #976：NVN 的任意边框色。要 customBorderColors 特性；customBorderColorWithoutFormat 按设备如实开（没有时后端建这种采样器报 UNSUPPORTED）。
+    out->custom_border_enabled = border.customBorderColors == VK_TRUE;
+    out->custom_border_without_format = out->custom_border_enabled && border.customBorderColorWithoutFormat == VK_TRUE;
+    out->custom_border_max = 0;
+    if (out->custom_border_enabled) {
+        device_ext[device_ext_count++] = "VK_EXT_custom_border_color";
+        VkPhysicalDeviceCustomBorderColorPropertiesEXT bp = {0};
+        bp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 p2 = {0};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &bp;
+        vkGetPhysicalDeviceProperties2(out->physical, &p2);
+        out->custom_border_max = bp.maxCustomBorderColorSamplers;
+    }
     out->device_extension_count = device_ext_count;
 
     // #975：NVN 16 位打包格式的路由（格式表在 nvn_vk_format.c 的 k_p16，弱引用同 #398 深度替换）。
@@ -476,6 +496,12 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         VkBaseOutStructure *tail = (VkBaseOutStructure *)device_info.pNext;
         while (tail->pNext) tail = tail->pNext;
         tail->pNext = (VkBaseOutStructure *)&f4444;
+    }
+    if (out->custom_border_enabled) {
+        border.customBorderColors = VK_TRUE;
+        border.customBorderColorWithoutFormat = out->custom_border_without_format ? VK_TRUE : VK_FALSE;
+        border.pNext = (void *)device_info.pNext;
+        device_info.pNext = &border;
     }
     if (vkCreateDevice(out->physical, &device_info, NULL, &out->device) != VK_SUCCESS)
         return fail(why, why_size, "vkCreateDevice failed");
