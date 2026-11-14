@@ -49,7 +49,10 @@ extern "C" {
 #define S2A_DPROMPT_HOME_QUIT_DECLINE_EN "Back to game"
 // 存档不能原子提交（审计 P2-13 界面半边、P2-45 iPhone 半边；Mac 与 iOS 共用这一个判定）：服务层导出 S2A_SaveAtomicState（services SaveTransferExports.cs，
 //   可写存档退回逐字节复制的原因位：1 没登记原语 / 2 卷不能克隆或原子交换 / 4 工作目录准备失败）。前端主线程每秒调一次；
-//   游戏会话跑起来之前不问服务层（iOS 的提示定时器早于宿主线程起）；第一次读到非 0 返回原因位，只返回一次，之后恒 0。没链服务层恒 0
+//   游戏会话跑起来之前不问服务层（iOS 的提示定时器早于宿主线程起）；第一次读到非 0 返回原因位，只返回一次，之后恒 0。
+//   没有这条导出：安卓（链接期弱引用）在会话跑起来后返回 S2A_SAVE_ATOMIC_UNKNOWN（负数，每次都返回，红行只打一次），
+//   它是「状态未知」，既不是已确认安全的 0，也不是原因位；Apple（dlsym）缺席仍恒 0
+#define S2A_SAVE_ATOMIC_UNKNOWN (-1)
 int s2a_save_atomic_poll(void);
 #ifdef __cplusplus
 }

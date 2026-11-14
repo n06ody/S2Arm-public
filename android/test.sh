@@ -236,6 +236,9 @@ s2a_gate_step javac -encoding UTF-8 -d "$out/java" \
     "$android_dir/tests/VulkanDirectChoiceTest.java"
 s2a_gate_step java -cp "$out/java" org.s2arm.android.VulkanDirectChoiceTest "$android_dir/native/direct_choice.h"
 s2a_gate_step bash "$android_dir/tests/exit_order_test.sh"
+# 存档原子态（#961）：缺服务层出口时轮询答「未知」（负数、红一次），Java 不当原因位提示；各带一个回退负对照。
+s2a_gate_step bash "$android_dir/tests/save_atomic_poll_test.sh" "$out/save-atomic-poll"
+s2a_gate_step "$PY" "$android_dir/tests/save_atomic_probe_test.py" --out "$out/save-atomic-probe"
 # A0 端到端（合成包 → 改写器 → stage_a0 → current.json → 契约校验 → BootContract）：要 lz4 / capstone（用门禁同一个 ${PY}）+ JDK
 PY="$PY" s2a_gate_step bash "$android_dir/tests/stage_a0_test.sh"
 s2a_gate_step javac -encoding UTF-8 -d "$out/java" \

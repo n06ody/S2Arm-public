@@ -93,7 +93,10 @@ public class MainActivity extends Activity
     private final Runnable saveAtomicSample = new Runnable() {
         @Override public void run() {
             if (!gameMode || gameStopping || !runtimeLoaded) return;
-            if (NativeBridge.pollSaveAtomic() != 0)
+            int bits = NativeBridge.pollSaveAtomic();
+            // 负数 = 状态未知（服务层缺导出，native 已报红）：不当原因位、不提示，本局不再轮询
+            if (bits < 0) { Log.e("S2Arm", "存档原子提交状态未知（pollSaveAtomic=" + bits + "），本局不提示"); return; }
+            if (bits != 0)
                 android.widget.Toast.makeText(MainActivity.this, SAVE_ATOMIC_NOTICE, android.widget.Toast.LENGTH_LONG).show();
             saveAtomicProbe.postDelayed(this, 1000);
         }

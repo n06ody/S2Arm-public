@@ -1331,7 +1331,7 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
 // 直连安全网 JNI 出口（dguard_android.c 包装共用 dguard.c，未武装 / 已清零时空转）：
 // onTrimMemory 前台内存告警记失败证据；setHostBuild 在起局前传一次宿主版本号
 // （BuildConfig.VERSION_NAME，dguard 用它区分「另一个包」）；pollSaveAtomic 由 Java 侧
-// 每秒轮询，服务层报出不能原子提交的原因位时提示一次（判定在共用 direct_prompt.c）。
+// 每秒轮询，服务层报出不能原子提交的原因位时提示一次；负数是状态未知（服务层缺导出），不提示（判定在共用 direct_prompt.c）。
 extern "C" JNIEXPORT void JNICALL
 Java_org_s2arm_android_NativeBridge_memoryWarning(JNIEnv *, jclass) {
     s2a_android_dguard_memory_warning();

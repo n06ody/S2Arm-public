@@ -219,7 +219,7 @@ final class NativeBridge {
     static native void setPowerState(int thermalStatus, boolean powerSave);
     /** 直连安全网：宿主版本号（BuildConfig.VERSION_NAME），起局前传一次，dguard 用它区分「另一个包」。 */
     static native void setHostBuild(String build);
-    /** 存档原子提交判定（共用 direct_prompt.c）：每秒轮询，非 0 = 服务层报出原因位（只报一次）。 */
+    /** 存档原子提交判定（共用 direct_prompt.c）：每秒轮询，正数 = 服务层报出原因位（只报一次），负数 = 状态未知（服务层缺导出，不提示）。 */
     static native int pollSaveAtomic();
 
     static native String checkModules(String modulesDir);
