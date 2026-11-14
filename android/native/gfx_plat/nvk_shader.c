@@ -363,10 +363,11 @@ static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t 
             q = w + ids[id].off;
             uint32_t op = q[0] & 0xffffu;
             if (op == 28 || op == 29) { id = q[2]; continue; }
-            if (op != 27) break;
-            id = q[2];
-            if (id >= bound || !ids[id].off) break;
-            q = w + ids[id].off;
+            if (op == 27) {
+                id = q[2];
+                if (id >= bound || !ids[id].off) break;
+                q = w + ids[id].off;
+            } else if (op != 25) break;
             if ((q[0] & 0xffffu) != 25) break;
             uint32_t type = q[2], dim = q[3], depth = q[4], arrayed = q[5], ms = q[6];
             if (arrayed > 1 || ms > 1 || depth > 2 || type >= bound || !ids[type].off) break;
@@ -377,6 +378,7 @@ static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t 
                 (arrayed ? NVN_TEXTURE_TARGET_2D_ARRAY : NVN_TEXTURE_TARGET_2D);
             else if (dim == 2 && !arrayed && !ms) target = NVN_TEXTURE_TARGET_3D;
             else if (dim == 3 && !ms) target = arrayed ? NVN_TEXTURE_TARGET_CUBEMAP_ARRAY : NVN_TEXTURE_TARGET_CUBEMAP;
+            else if (dim == 5 && !arrayed && !ms) target = NVN_TEXTURE_TARGET_BUFFER;
             if (target < 0) break;
             const uint32_t *sample = w + ids[type].off;
             uint32_t op_type = sample[0] & 0xffffu;
@@ -419,10 +421,12 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             if (e->prog.nent[st] == RP_PROG_ENT_MAX) { red1("too_many_bindings", ""); e->failed = 1; break; }
             nvn_gpu_layout_ent *le = &e->prog.ent[st][e->prog.nent[st]];
             if (!layout_ent(b, le)) { char nm[40]; snprintf(nm, sizeof nm, "binding_kind_%d_slot_%d", b->kind, b->slot); red1(nm, b->stage); e->failed = 1; break; }
-            if (le->cls == NVN_GPU_RES_TBUF) { red1("texture_buffer_replay_unsupported", b->stage); e->failed = 1; break; }
             le->stages = b->is_support ? (1u << nst) - 1u : 1u << st;
             if (b->kind == 2) sampled_decl(fp.stage[st].spirv, fp.stage[st].spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
                 &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]]);
+            if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[st][e->prog.nent[st]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
+                red1("tbuf_shader_type_unproven", b->stage); e->failed = 1; break;
+            }
             e->prog.nent[st]++;
         }
         if (e->failed) break;
@@ -710,10 +714,12 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
             }
         } else ok = layout_ent(b, le);
         if (!ok) { char nm[56]; snprintf(nm, sizeof nm, "compute_binding_kind_%d_slot_%d_map_%d", b->kind, b->slot, b->kind == 1 ? (int)cp.storage[i].mapping : 0); red1(nm, "cs"); e->failed = 1; break; }
-        if (le->cls == NVN_GPU_RES_TBUF) { red1("texture_buffer_replay_unsupported", "cs"); e->failed = 1; break; }
         le->stages = 1u << NVN_GPU_SH_CS;
         if (b->kind == 2) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
             &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]]);
+        if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[0][e->prog.nent[0]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
+            red1("tbuf_shader_type_unproven", "cs"); e->failed = 1; break;
+        }
         e->prog.nent[0]++;
     }
     if (!e->failed && !cp.stage.present) { red1("stage_missing_in_result", "cs"); e->failed = 1; }

@@ -18,7 +18,10 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 mode=${1:-}
-if [ "$mode" = "--shown-only" ] && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+    python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
+fi
+if { [ "$mode" = "--shown-only" ] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -121,6 +124,7 @@ mkdir -p "$out/shaders"
 for s in count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag gs_probe.vert gs_probe.geom gs_probe.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert point.vert quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag separate.vert separate.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
+"$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/tbuf_replay.frag" -o "$out/shaders/tbuf_replay.frag.spv"
 
 inc=(-I "$repo/android/tests/vkhost"
      -I "$repo/graphics/nvn/third_party/vulkan-headers/include"
@@ -132,7 +136,7 @@ inc=(-I "$repo/android/tests/vkhost"
      -I "$repo/android/native/nvn"
      -I "$repo/android/native/direct"
      -I "$repo/runtime/include")
-if [ "$mode" = "--shown-only" ]; then
+if [ "$mode" = "--shown-only" ] || [[ "$mode" == --tbuf-* ]]; then
     [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 Vulkan headers not staged' >&2; exit 2; }
     inc=(-I "$repo/build/c883-ndk" "${inc[@]}")
 fi
@@ -157,7 +161,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--separate-core|--separate-neg-sampler|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 
@@ -180,6 +184,38 @@ if [ "$mode" = "--separate-core" ] || [ "$mode" = "--separate-neg-sampler" ]; th
          "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
          "$repo/android/native/nvn/nvn_vk_driver_cache.c" "$repo/android/native/direct/sha256.c")   # 后端的管线缓存落盘（#856）
     cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
+fi
+if [[ "$mode" == --tbuf-* ]]; then
+    src=("$repo/android/tests/vk/t_replay_tbuf.c" "$repo/graphics/nvn/replay/rp_draw.c" "$repo/graphics/nvn/replay/rp_buf.c" "$repo/graphics/nvn/replay/rp_state.c" "$repo/graphics/nvn/replay/nvn_unimpl.c"
+         "$repo/android/native/nvn/backend_vulkan.c" "$repo/android/native/direct/vk_device.c" "$repo/android/native/direct/gs_path.c" "$repo/android/native/capprobe/capprobe_host.c"
+         "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
+         "$repo/android/native/nvn/nvn_vk_driver_cache.c" "$repo/android/native/direct/sha256.c")
+    cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
+fi
+if [ "$mode" = "--tbuf-compiler-core" ]; then
+    src=("$repo/android/tests/vk/t_replay_tbuf_compiler.c" "$repo/graphics/nvn/replay/rp_draw.c" "$repo/graphics/nvn/replay/rp_buf.c" "$repo/graphics/nvn/replay/rp_state.c" "$repo/graphics/nvn/replay/nvn_unimpl.c" "$repo/android/native/gfx_plat/nvk_shader.c"
+         "$repo/android/native/nvn/backend_vulkan.c" "$repo/android/native/direct/vk_device.c" "$repo/android/native/direct/gs_path.c" "$repo/android/native/capprobe/capprobe_host.c"
+         "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
+         "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c" "$repo/android/native/nvn/nvn_vk_driver_cache.c"
+         "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
+fi
+if [[ "$mode" == --tbuf-neg-* ]]; then
+    python3 - "$mode" "${src[1]}" "$out/tbuf_mutant.c" <<'PYTBUF'
+import pathlib, sys
+mode, source, target = sys.argv[1:]
+s = pathlib.Path(source).read_text()
+changes = {
+    '--tbuf-neg-resolve': ('if (!rp_buf_resolve(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off)) return skip("tbuf_buffer_unresolved", rec);', 'return skip("tbuf_buffer_unresolved", rec);'),
+    '--tbuf-neg-format': ('uint32_t fmt = hv && v.set_format ? v.format : (uint32_t)t.d.format;', 'uint32_t fmt = NVN_FORMAT_RGBA8UI;'),
+    '--tbuf-neg-elements': ('uint64_t bytes = (uint64_t)t.d.width * base.bytes;', 'uint64_t bytes = (uint64_t)t.d.width * base.bytes * 2;'),
+}
+a, b = changes[mode]
+if s.count(a) != 1: raise SystemExit('TBUF negative control anchor changed: ' + mode)
+pathlib.Path(target).write_text(s.replace(a, b))
+PYTBUF
+    src[1]="$out/tbuf_mutant.c"
 fi
 if [ "$mode" = "--separate-neg-sampler" ]; then
     python3 - "$repo/graphics/nvn/replay/rp_draw.c" "$out/rp_draw_mutant.c" <<'PYMUT'
@@ -214,7 +250,7 @@ esac
 pc_wrap=(-Wl,--wrap=vkCreatePipelineCache -Wl,--wrap=vkGetPipelineCacheData
          -Wl,--wrap=vkCreateGraphicsPipelines -Wl,--wrap=vkCreateComputePipelines)
 # --gs-core / --separate-* 档的测试源没有这四个 __wrap 定义（只有默认档的 t_backend_vk.c 有），带上会链接失败
-case "$mode" in --gs-core|--separate-core|--separate-neg-sampler) pc_wrap=() ;; esac
+case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) pc_wrap=() ;; esac
 if [ "$mode" = "--shown-only" ]; then pc_wrap+=(-Wl,--wrap=vkGetDeviceProcAddr); fi
 cc "${cflags[@]}" "${inc[@]}" "${src[@]}" -Wl,--wrap=vkAllocateDescriptorSets -Wl,--wrap=vkGetPhysicalDeviceFormatProperties \
     ${pc_wrap[@]+"${pc_wrap[@]}"} -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/t_backend_vk"
@@ -278,6 +314,35 @@ if [ "$mode" = "--separate-core" ]; then
     fi
     echo '【绿】分离来源回放采样：repeat 红、clamp 绿，validation 0 条'; exit 0
 fi
+if [ "$mode" = "--tbuf-compiler-core" ]; then
+    rm -rf "$repo/build/tbuf-real-red/core-compiler"
+    set +e
+    timeout 90 "$out/t_backend_vk" "$repo/build/tbuf-real-red" 2>&1 | tee "$out/tbuf-compiler-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || ! grep -q llvmpipe "$out/tbuf-compiler-log" ||
+       ! grep -q 'core Maxwell TBUF: expected 17,34,51,255 on 16 pixels, failures=0' "$out/tbuf-compiler-log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/tbuf-compiler-log"; then
+        echo "【红】真实 Maxwell TBUF 回放 rc=$rc 或 validation 有报错" >&2; exit 1
+    fi
+    echo 'PASS: 真实生产请求、Maxwell 编译、池镜像与 Vulkan 16 像素，validation 0 条'; exit 0
+fi
+if [[ "$mode" == --tbuf-* ]]; then
+    set +e
+    timeout 60 "$out/t_backend_vk" "$out/shaders" 2>&1 | tee "$out/tbuf-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if ! grep -q llvmpipe "$out/tbuf-log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/tbuf-log"; then
+        echo '【红】TBUF 回放设备非 lavapipe 或 validation 有报错' >&2; exit 1
+    fi
+    case "$mode" in
+        --tbuf-core) [ "$rc" -eq 0 ] && grep -q 'TBUF replay: expected 9,13,4,255 on 16 pixels, failures=0' "$out/tbuf-log" ;;
+        --tbuf-neg-resolve) [ "$rc" -ne 0 ] && grep -q 'two TBUF draws without skips' "$out/tbuf-log" ;;
+        --tbuf-neg-format) [ "$rc" -ne 0 ] && grep -q 'TBUF pixel 0: 0,0,4,255 expected 9,13,4,255' "$out/tbuf-log" ;;
+        --tbuf-neg-elements) [ "$rc" -ne 0 ] && grep -q 'TBUF pixel 0: 9,13,8,255 expected 9,13,4,255' "$out/tbuf-log" ;;
+    esac || { echo "【红】$mode 未命中预期" >&2; exit 1; }
+    echo "PASS: $mode 命中预期，validation 0 条"; exit 0
+fi
 if [ "$mode" = "--shown-only" ]; then
     for shown_mode in --shown-only --shown-unsupported; do
         set +e
@@ -340,6 +405,8 @@ fi
 
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --gs-core; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --separate-core; fi
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --tbuf-core; fi
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --tbuf-compiler-core; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_copy_t2b.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_clear_tex.sh"; fi
 
