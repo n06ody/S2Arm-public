@@ -5297,6 +5297,96 @@ static void c87_resolve(const char *dir) {
     nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs); free(vsm); free(fsm);
 }
 
+// C1072（#1072 第 8 项）：设备支持集合里没有游戏要的多重采样数时，贴图按「不超过所要的最大支持数（≥2），没有就取
+// 更大的最小支持数（≤16）」建（同 iOS nvn_mtl.m mtl_samples_supported 的降级，单采样不算），管线按同一规则换算，
+// 画进去再解析的像素与不降级时一样。期望由本用例按 Vulkan 规范自己从设备查询结果算，不读被测实现。
+static uint32_t c1072_expect(uint32_t want, VkSampleCountFlags have) {
+    if (have & want) return want;
+    for (uint32_t s = want / 2; s >= 2; s /= 2) if (have & s) return s;
+    for (uint32_t s = want * 2; s <= 16; s *= 2) if (have & s) return s;
+    return 0;
+}
+static void c1072_msaa_fallback(const char *dir) {
+    VkImageFormatProperties ip = {0};
+    VkResult ir = vkGetPhysicalDeviceImageFormatProperties(g_dev.physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, &ip);
+    CHECK(ir == VK_SUCCESS, "C1072 RGBA8 附件格式查询 %d", (int)ir);
+    if (ir != VK_SUCCESS) return;
+    VkSampleCountFlags have = ip.sampleCounts & g_dev.properties.limits.framebufferColorSampleCounts;
+    printf("C1072 设备 RGBA8 附件支持的样本数集合 %#x\n", (unsigned)have);
+    int exercised = 0; uint32_t got8 = 0;
+    const uint32_t wants[] = {2, 8, 16};
+    for (int k = 0; k < 3; k++) {
+        uint32_t want = wants[k], exp = c1072_expect(want, have);
+        if (have & want) continue;   // 设备本来就支持：不是本用例要的情形
+        nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE; td.d.format = NVN_FORMAT_RGBA8;
+        td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1; td.d.samples = (int)want; td.usage = NVN_GPU_TEX_RENDER;
+        nvn_gpu_tex t = NULL; nvn_gpu_err e = {0}; nvn_gpu_rc rc = nvn_gpu_tex_create(&td, &t, &e);
+        if (!exp) { CHECK(rc.code == NVN_GPU_E_UNSUPPORTED && !t, "C1072 %u×：设备没有可换的计数应 UNSUPPORTED", want); continue; }
+        CHECK(OK(rc) && t, "C1072 %u× 设备不支持，应改用 %u× 建：%s", want, exp, e.why);
+        if (!t) continue;
+        nvn_gpu_tex_info ti = {0}; nvn_gpu_tex_info_get(t, &ti);
+        CHECK(ti.samples == exp, "C1072 %u× 应改用 %u×，实际 %u×", want, exp, ti.samples);
+        printf("C1072 %u× → %u×\n", want, ti.samples);
+        exercised++;
+        if (want == 8) got8 = ti.samples;
+        nvn_gpu_tex_release(t);
+    }
+    if (!exercised) { printf("C1072 设备支持 2/8/16× 全部：本机不出降级情形，跳过\n"); return; }
+    if (!got8) return;
+    // 画：管线照游戏要的 8× 建，通道用降级后的贴图；全覆盖四边形解析成单采样后 16 像素都应是顶点色红
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE; td.d.format = NVN_FORMAT_RGBA8;
+    td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1; td.d.samples = 8; td.usage = NVN_GPU_TEX_RENDER;
+    nvn_gpu_tex a = NULL; nvn_gpu_err e = {0};
+    CHECK(OK(nvn_gpu_tex_create(&td, &a, &e)) && a, "C1072 8× 目标：%s", e.why);
+    if (!a) return;
+    void *vsm = NULL, *fsm = NULL; nvn_gpu_shader vs = NULL, fs = NULL;
+    CHECK(load_shader_pair(dir, "quad.vert", "quad.frag", NULL, NULL, &vs, &fs, &vsm, &fsm), "C1072 shader");
+    nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.origin_ll = (uint8_t)!g_tri_origin_ul;
+    pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+    pd.samples = 8; pd.prim = 5; pd.chmask.mask = 0xf; pd.color.logic_op = 3;
+    pd.attr[0].fmt = pd.attr[1].fmt = NVN_FORMAT_RGBA32F; pd.attr[1].offset = 16; pd.stream[0].stride = 32;
+    nvn_gpu_pipe pipe = NULL; CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)) && pipe, "C1072 8× 管线：%s", e.why);
+    float verts[4][8] = {{-1,-1,0,1,1,0,0,1},{-1,1,0,1,1,0,0,1},{1,-1,0,1,1,0,0,1},{1,1,0,1,1,0,0,1}};
+    nvn_gpu_buf vb = make_buf(sizeof verts, NVN_GPU_MEM_SHARED, verts);
+    nvn_gpu_tex b = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view av = make_view(a), bv = make_view(b); nvn_gpu_buf rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_dyn dyn = {0}; dyn.origin_ll = pd.origin_ll; dyn.nvp = 1; dyn.vp[0][2] = 4; dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
+    dyn.has_sc = 1; dyn.sc[2] = dyn.sc[3] = 4;
+    if (pipe) {
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc p = {0}; p.ncolor = 1; p.w = p.h = 4; p.layers = 1;
+        p.color[0].view = av; p.color[0].load = NVN_GPU_LOAD_CLEAR; p.color[0].store = NVN_GPU_STORE_STORE;
+        p.color[0].clear.f[2] = p.color[0].clear.f[3] = 1;
+        nvn_gpu_pass_begin(c, &p); nvn_gpu_set_pipe(c, pipe); nvn_gpu_set_dyn(c, &dyn); nvn_gpu_set_vbuf(c, 0, vb, 0);
+        nvn_gpu_draw_args da = {0}; da.prim = 5; da.count = 4; da.instances = 1; nvn_gpu_draw(c, &da); nvn_gpu_pass_end(c);
+        NVNcopyRegion rr = {0, 0, 0, 4, 4, 1}; nvn_gpu_blit(c, av, &rr, bv, &rr, 0);
+        nvn_gpu_copy_tex_buf(c, b, 0, 0, NULL, rb, 0, 16, 64);
+        nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 161, on_done, NULL, &e);
+        CHECK(OK(rc), "C1072 8×→%u× 绘制提交：%d %s", got8, rc.code, e.why);
+        if (OK(rc)) {
+            CHECK(OK(nvn_gpu_fence_wait(161, 5000000000ull, &e)), "C1072 wait：%s", e.why);
+            const uint8_t *px = buf_cpu(rb); int badpx = 0;
+            for (int i = 0; i < 16; i++) if (px[i*4] != 255 || px[i*4+1] || px[i*4+2] || px[i*4+3] != 255) badpx++;
+            CHECK(!badpx, "C1072 解析后 16 像素应全红，不符 %d，首像素 %u,%u,%u,%u", badpx, px[0], px[1], px[2], px[3]);
+        }
+    }
+    // 单采样管线进多重采样通道：后端具名拒绝，不送驱动（不然是校验层报错）
+    pd.samples = 1; nvn_gpu_pipe p1 = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &p1, &e)) && p1, "C1072 单采样管线：%s", e.why);
+    if (p1) {
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc p = {0}; p.ncolor = 1; p.w = p.h = 4; p.layers = 1;
+        p.color[0].view = av; p.color[0].load = NVN_GPU_LOAD_CLEAR; p.color[0].store = NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(c, &p); nvn_gpu_set_pipe(c, p1); nvn_gpu_set_dyn(c, &dyn); nvn_gpu_set_vbuf(c, 0, vb, 0);
+        nvn_gpu_draw_args da = {0}; da.prim = 5; da.count = 4; da.instances = 1; nvn_gpu_draw(c, &da); nvn_gpu_pass_end(c);
+        nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 162, on_done, NULL, &e);
+        CHECK(rc.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "不一致"), "C1072 单采样管线进 %u× 通道应具名拒绝：%d %s", got8, rc.code, e.why);
+        if (OK(rc)) nvn_gpu_fence_wait(162, 5000000000ull, &e);
+    }
+    nvn_gpu_view_release(av); nvn_gpu_view_release(bv); nvn_gpu_tex_release(a); nvn_gpu_tex_release(b);
+    nvn_gpu_buf_release(rb, NULL, NULL); nvn_gpu_buf_release(vb, NULL, NULL);
+    nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs); free(vsm); free(fsm);
+}
+
 // 每个拒绝用例独占会话；必须在发 Vulkan 命令前拒绝。
 static void c87_resolve_reject(int k) {
     nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D;
@@ -7236,6 +7326,7 @@ int main(int argc, char **argv) {
     c85_descriptor_reuse(argv[1]);
     c86_polygon_modes(argv[1]);
     c87_resolve(argv[1]);
+    c1072_msaa_fallback(argv[1]);   // #1072 第 8 项：设备没有所要的多重采样数时降级（信号 161 / 162，夹在 C87 与 C86b 之间）
     c86b_3d_slice_attach();
     c86c_bc_3d_slice_copy();
     nvn_gpu_err e18;

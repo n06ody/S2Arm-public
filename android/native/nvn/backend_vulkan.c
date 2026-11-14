@@ -878,6 +878,36 @@ static uint32_t sample_bits_max(VkSampleCountFlags f) {
     return n;
 }
 
+// NVN 的多重采样数只有 2 / 4 / 8 / 16（Ryujinx TextureMsaaMode.cs:26-29：Ms2x1 / Ms2x2 / Ms4x2 / Ms4x4）；其余计数是参数错，照旧报不支持。
+static int nvn_msaa_count_valid(uint32_t n) { return n == 2 || n == 4 || n == 8 || n == 16; }
+
+// 设备不支持游戏要的多重采样数时取哪个（#1072 第 8 项）。同 iOS nvn_mtl.m mtl_samples_supported：降到支持集合里
+// 不超过所要的最大计数。与 iOS 不同的一处：往下只剩 1 时不降成单采样（多重采样目标的着色器按多样本声明读，单采样图像
+// 与之不符），改取比所要大的最小支持计数（如 Mali G710 没有 2×、有 4×）。都没有返回 0，调用方报不支持。
+static uint32_t msaa_count_pick(uint32_t want, VkSampleCountFlags have) {
+    if (have & want) return want;
+    for (uint32_t s = want >> 1; s >= 2; s >>= 1) if (have & s) return s;
+    for (uint32_t s = want << 1; s <= 16; s <<= 1) if (have & s) return s;
+    return 0;
+}
+
+// 用途对应的设备级计数上限。规范上图像格式查询的 sampleCounts 本已不超过这些；取交集让模拟档只改上限时也生效。
+static VkSampleCountFlags msaa_limit_counts(const VkPhysicalDeviceLimits *l, VkImageUsageFlags usage, int depth, int stencil, int integer) {
+    VkSampleCountFlags f = ~(VkSampleCountFlags)0;
+    if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        if (depth) f &= l->framebufferDepthSampleCounts;
+        if (stencil) f &= l->framebufferStencilSampleCounts;
+        if (!depth && !stencil) f &= l->framebufferColorSampleCounts;
+    }
+    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
+        if (depth) f &= l->sampledImageDepthSampleCounts;
+        if (stencil) f &= l->sampledImageStencilSampleCounts;
+        if (!depth && !stencil) f &= integer ? l->sampledImageIntegerSampleCounts : l->sampledImageColorSampleCounts;
+    }
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT) f &= l->storageImageSampleCounts;
+    return f;
+}
+
 static void caps_digest(const void *p, size_t n, uint8_t out[16]) {
     uint64_t h1 = 1469598103934665603ull, h2 = 1099511628211ull;
     const uint8_t *b = p;
@@ -2410,6 +2440,33 @@ void nvn_gpu_shader_release(nvn_gpu_shader sh) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// 管线的多重采样数随附件贴图的实际样本数走（贴图建时可能已按 msaa_count_pick 换过，见 nvn_gpu_tex_create）：
+// 对各附件格式按「附件 + 采样 + 传输」用途查支持集合取交集，用同一规则换算。返回 0 = 设备没有可用的多重采样数。
+// 贴图另有存储用途时它的集合可能更小、换出的数不同：nvn_gpu_set_pipe 比对通道实际样本数，不一致具名拒绝、不送驱动。
+static uint32_t pipe_msaa_samples(const nvn_gpu_pipe_desc *d) {
+    if (d->samples <= 1 || !nvn_msaa_count_valid(d->samples)) return d->samples;
+    const VkPhysicalDeviceLimits *l = &g.dev->properties.limits;
+    VkSampleCountFlags have = ~(VkSampleCountFlags)0; int natt = 0;
+    uint32_t fm[10]; int nf = 0;
+    for (int i = 0; i < 8; i++) if (d->cfmt[i]) fm[nf++] = d->cfmt[i];
+    if (d->dfmt) fm[nf++] = d->dfmt;
+    if (d->sfmt && d->sfmt != d->dfmt) fm[nf++] = d->sfmt;
+    for (int i = 0; i < nf; i++) {
+        VkFormat vf = nvn_vk_tex_format(fm[i]);
+        if (vf == VK_FORMAT_UNDEFINED) continue;
+        int depth = nvn_vk_format_is_depth(vf);
+        VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                              (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        VkImageFormatProperties ip = {0};
+        if (vkGetPhysicalDeviceImageFormatProperties(g.phys, vf, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, u, 0, &ip) != VK_SUCCESS) continue;
+        nvn_fmt_info fi; int integer = nvn_fmt_info_of(fm[i], &fi) && (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT);
+        have &= ip.sampleCounts & msaa_limit_counts(l, u, depth && vf != VK_FORMAT_S8_UINT, nvn_vk_format_has_stencil(vf), integer);
+        natt++;
+    }
+    if (!natt) have &= l->framebufferNoAttachmentsSampleCounts;
+    return msaa_count_pick(d->samples, have);
+}
+
 static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     VkAttachmentDescription att[9];
     VkAttachmentReference col[8];
@@ -2565,6 +2622,11 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 非原生图元未实现");
     for (int i = NVN_GPU_SH_TCS; i < 5; i++)
         if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "细分阶段：本段未实现");
+    // 多重采样数按附件的设备支持集合换算（#1072 第 8 项），换算后的描述同时作缓存键
+    nvn_gpu_pipe_desc dn;
+    { uint32_t ms = pipe_msaa_samples(d);
+      if (!ms) return fail(err, NVN_GPU_E_UNSUPPORTED, "设备没有可用于这些附件格式的 %u 重采样（也没有可换的多重采样数）", d->samples);
+      if (ms != d->samples) { dn = *d; dn.samples = ms; d = &dn; } }
 
     const uint32_t hb = pipe_hash(d) % PIPE_HT_N;
     pthread_mutex_lock(&g_mu);
@@ -3579,6 +3641,8 @@ void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
     struct nvn_gpu_pipe_s *p = ph;
     if (!p) { set_sticky(c, NVN_GPU_E_ARG, "set_pipe 传了空管线"); return; }
     if (!c->in_pass && p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "图形管线在通道外 set_pipe"); return; }
+    if (p->pass && (p->key.samples > 1 ? p->key.samples : 1) != c->pass_samples) {   // 采样数不一致的管线与通道不兼容：具名拒绝，不送驱动
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "管线多重采样数 %u 与通道附件的实际样本数 %u 不一致", p->key.samples, c->pass_samples); return; }
     // Already allocated stage data survives pipe changes. Expand before the next push/dispatch.
     for (int st = 0; st <= NVN_GPU_SH_CS; st++) {
         uint64_t end = (uint64_t)p->stage_push_off[st] + p->stage_push_bytes[st];
@@ -4527,15 +4591,29 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     // 在 vkCreateImage 前按真实格式/usage 查询样本数；不把非法计数送到驱动或校验层。
     int ms_target = target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY;
     if (ms_target || samples > 1) {
-        if (d->d.samples <= 1 || samples > 64 || (samples & (samples - 1)) || levels != 1 || itype != VK_IMAGE_TYPE_2D ||
+        if (d->d.samples <= 1 || !nvn_msaa_count_valid(samples) || levels != 1 || itype != VK_IMAGE_TYPE_2D ||
             ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !g.dev->core_features.shaderStorageImageMultisample) ||
             (d->d.samples > 1 && (target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY)))
             return fail(err, NVN_GPU_E_UNSUPPORTED, "多重采样计数/级数/目标不支持");
         VkImageFormatProperties ip = {0};
         VkImageCreateFlags flags = iflags | ((d->usage & NVN_GPU_TEX_VIEW_FMT) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
         if (vkGetPhysicalDeviceImageFormatProperties(g.phys, fmt, itype, VK_IMAGE_TILING_OPTIMAL, usage, flags, &ip) != VK_SUCCESS ||
-            !(ip.sampleCounts & samples) || (uint32_t)d->d.width > ip.maxExtent.width || (uint32_t)d->d.height > ip.maxExtent.height || layers > ip.maxArrayLayers)
+            (uint32_t)d->d.width > ip.maxExtent.width || (uint32_t)d->d.height > ip.maxExtent.height || layers > ip.maxArrayLayers)
             return fail(err, NVN_GPU_E_UNSUPPORTED, "设备不支持该格式/usage 的 %u 重采样贴图", samples);
+        nvn_fmt_info fi; int integer = nvn_fmt_info_of((uint32_t)d->d.format, &fi) && (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT);
+        VkSampleCountFlags have = ip.sampleCounts & msaa_limit_counts(&g.dev->properties.limits, usage,
+            nvn_vk_format_is_depth(fmt) && fmt != VK_FORMAT_S8_UINT, nvn_vk_format_has_stencil(fmt), integer);
+        uint32_t pick = msaa_count_pick(samples, have);
+        if (!pick) return fail(err, NVN_GPU_E_UNSUPPORTED, "设备不支持该格式/usage 的 %u 重采样贴图（支持集合 %#x，没有可换的多重采样数）", samples, (unsigned)have);
+        if (pick != samples) {   // 换了样本数：具名记一次（同 iOS RED_ONCE 187）；通道与管线随贴图的实际样本数走（nvn_gpu_pipe_get 同一规则）
+            static _Atomic int said;
+            if (!atomic_exchange(&said, 1)) {
+                char m[200]; snprintf(m, sizeof m, "多重采样数 %u 设备不支持（格式 %#x 该用途的支持集合 %#x）：改用 %u 建（首例 %ux%u）",
+                                     samples, (unsigned)d->d.format, (unsigned)have, pick, d->d.width, d->d.height);
+                nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", m);
+            }
+            samples = pick;
+        }
     }
 
     struct nvn_gpu_tex_s *t = calloc(1, sizeof *t);
