@@ -4090,8 +4090,8 @@ static void c62_tsamp_cs(const char *dir) {
     nvn_gpu_shader_release(sh);
 }
 
-// #976 采样器用例的公共部分：samp_at.comp 按 uv[i] 在第 0 级采样，读回 n 个 vec4。成功返回 1。
-static int samp_at(const char *dir, nvn_gpu_tex t, nvn_gpu_samp samp, const float (*uv)[2], int n, float (*got)[4], uint64_t signal) {
+// #976 采样器用例的公共部分：shader（samp_at*.comp）按 uv[i] 在第 0 级采样，读回 n 个 16 字节结果（vec4 / ivec4 / uvec4）。成功返回 1。
+static int samp_at_sh(const char *dir, const char *shader, nvn_gpu_tex t, nvn_gpu_samp samp, const float (*uv)[2], int n, void *got, uint64_t signal) {
     nvn_gpu_layout_ent ents[3];
     memset(ents, 0, sizeof ents);
     ents[0].set = 0; ents[0].cls = NVN_GPU_RES_TEX_SAMP; ents[0].access = NVN_GPU_ACC_R; ents[0].binding = 0; ents[0].count = 1; ents[0].stages = 1u << NVN_GPU_SH_CS;
@@ -4099,7 +4099,7 @@ static int samp_at(const char *dir, nvn_gpu_tex t, nvn_gpu_samp samp, const floa
     ents[2].set = 0; ents[2].cls = NVN_GPU_RES_SSBO; ents[2].access = NVN_GPU_ACC_W; ents[2].binding = 2; ents[2].count = 1; ents[2].stages = 1u << NVN_GPU_SH_CS;
     nvn_gpu_layout cl; memset(&cl, 0, sizeof cl); cl.ent = ents; cl.nent = 3;
     nvn_gpu_shader sh = NULL;
-    nvn_gpu_pipe cp = mk_cpipe(dir, "samp_at.comp", &cl, &sh);
+    nvn_gpu_pipe cp = mk_cpipe(dir, shader, &cl, &sh);
     CHECK(cp != NULL, "samp_at cpipe 为空");
     if (!cp) return 0;
     nvn_gpu_view v = make_view(t);
@@ -4124,6 +4124,9 @@ static int samp_at(const char *dir, nvn_gpu_tex t, nvn_gpu_samp samp, const floa
     nvn_gpu_buf_release(in, NULL, NULL); nvn_gpu_buf_release(out, NULL, NULL);
     nvn_gpu_shader_release(sh);
     return ok;
+}
+static int samp_at(const char *dir, nvn_gpu_tex t, nvn_gpu_samp samp, const float (*uv)[2], int n, float (*got)[4], uint64_t signal) {
+    return samp_at_sh(dir, "samp_at.comp", t, samp, uv, n, got, signal);
 }
 
 // C976m：镜像夹取环绕（#976）。4x1 R32F 纹素 {0,1,2,3}、最近点，读到的 r 就是纹素下标。
@@ -4180,6 +4183,145 @@ static void c976m_mirror_clamp(const char *dir) {
         printf("C976m MIRROR_CLAMP_TO_EDGE：u=0.625/-0.375/-1.5/1.25/-2.25 期望 2 1 3 3 3 → 读到 %g %g %g %g %g\n", got[0][0], got[1][0], got[2][0], got[3][0], got[4][0]);
         nvn_gpu_tex_release(t);
         nvn_gpu_samp_release(samp);
+    }
+}
+
+// C976b：自定义边框色（#976）。最近点、U 向 CLAMP_TO_BORDER，在 u = -0.5 / 1.5 处读到的必须正好是边框色，u = 0.125 读纹素 0。
+// 不是内置三档的边框色要 VK_EXT_custom_border_color（且 customBorderColorWithoutFormat：建采样器时不知道视图格式）；
+// 缺哪样回哪个具名 UNSUPPORTED、不出句柄。修前一律映成不透明黑 (0,0,0,1)，红在读值上。
+// 整数视图走另一个采样器（int_sampler），边框色按数值取整成 INT_CUSTOM；无符号的大值按位存。
+// 内置三档、没有一向用到边框的采样器不需要扩展、不占配额。配额：sampler 与 int_sampler 各占一个，到上限回具名 UNSUPPORTED，释放后归还。
+// 先跑不绑定的部分（配额计数不受在途命令影响），再跑读值。围栏号 1..6。
+#define C976_CB_ENABLED g_dev.custom_border_enabled
+#define C976_CB_NOFMT g_dev.custom_border_without_format
+#define C976_CB_MAX g_dev.custom_border_max
+static nvn_gpu_samp c976b_samp(const float border[4], uint8_t ws, nvn_gpu_err *e, nvn_gpu_rc *r) {
+    samp_par sp; memset(&sp, 0, sizeof sp);   // 最近点
+    sp.ws = ws; sp.wt = NVN_WRAP_MODE_CLAMP_TO_EDGE; sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE;
+    memcpy(sp.border, border, sizeof sp.border);
+    nvn_gpu_samp s = NULL; memset(e, 0, sizeof *e);
+    *r = nvn_gpu_samp_create(&sp, &s, e);
+    return s;
+}
+static int c976b_why(const nvn_gpu_err *e, const char *want) { return !strncmp(e->why, want, strlen(want)); }
+static void c976b_border_color(const char *dir) {
+    printf("C976b 自定义边框色：设备 custom_border=%d without_format=%d max=%u\n", C976_CB_ENABLED, C976_CB_NOFMT, C976_CB_MAX);
+    static const float odd[4] = {0.2f, 0.4f, 0.6f, 0.8f};
+    nvn_gpu_err e; nvn_gpu_rc r;
+    const int had = C976_CB_ENABLED, had_nofmt = C976_CB_NOFMT;
+    const uint32_t had_max = C976_CB_MAX;
+    // 没有一向用到边框：不论有没有扩展都能建
+    C976_CB_ENABLED = 0; C976_CB_NOFMT = 0;
+    nvn_gpu_samp s = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_EDGE, &e, &r);
+    CHECK(OK(r) && s, "C976b 不用边框的采样器（清掉扩展位）：期望建成 → rc=%d why=%s", r.code, e.why);
+    if (s) nvn_gpu_samp_release(s);
+    // 内置三档：不要扩展
+    static const float fixed[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}};
+    for (int k = 0; k < 3; k++) {
+        s = c976b_samp(fixed[k], NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+        CHECK(OK(r) && s, "C976b 内置边框色 %g %g %g %g（清掉扩展位）：期望建成 → rc=%d why=%s",
+              fixed[k][0], fixed[k][1], fixed[k][2], fixed[k][3], r.code, e.why);
+        if (s) nvn_gpu_samp_release(s);
+    }
+    // 没有扩展
+    s = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+    CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !s && c976b_why(&e, "sampler_border_color_custom："),
+          "C976b 没有扩展：期望 UNSUPPORTED「sampler_border_color_custom：…」→ rc=%d 句柄=%p why=%s", r.code, (void *)s, e.why);
+    printf("C976b 没有扩展：自定义边框色建采样器 rc=%d（%s）\n", r.code, e.why);
+    if (s) nvn_gpu_samp_release(s);
+    C976_CB_ENABLED = had; C976_CB_NOFMT = had_nofmt;
+    if (!had) { printf("C976b 设备没有 VK_EXT_custom_border_color：其余部分跳过\n"); return; }
+    // 有扩展、没有 customBorderColorWithoutFormat
+    C976_CB_NOFMT = 0;
+    s = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+    C976_CB_NOFMT = had_nofmt;
+    CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !s && c976b_why(&e, "sampler_border_color_custom_format："),
+          "C976b 没有 WithoutFormat：期望 UNSUPPORTED「sampler_border_color_custom_format：…」→ rc=%d 句柄=%p why=%s", r.code, (void *)s, e.why);
+    if (s) nvn_gpu_samp_release(s);
+    if (!had_nofmt) { printf("C976b 设备没有 customBorderColorWithoutFormat：其余部分跳过\n"); return; }
+    // 配额：上限设成 4 = 两个自定义边框色采样器
+    C976_CB_MAX = 4;
+    nvn_gpu_samp q[3] = {NULL, NULL, NULL};
+    nvn_gpu_rc qr[3];
+    nvn_gpu_err qe[3];
+    for (int k = 0; k < 3; k++) q[k] = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_BORDER, &qe[k], &qr[k]);
+    CHECK(OK(qr[0]) && q[0] && OK(qr[1]) && q[1], "C976b 配额 4：前两个期望建成 → rc=%d/%d why=%s / %s", qr[0].code, qr[1].code, qe[0].why, qe[1].why);
+    CHECK(qr[2].code == NVN_GPU_E_UNSUPPORTED && !q[2] && c976b_why(&qe[2], "sampler_border_color_custom_quota："),
+          "C976b 配额 4：第三个期望 UNSUPPORTED「sampler_border_color_custom_quota：…」→ rc=%d why=%s", qr[2].code, qe[2].why);
+    s = c976b_samp(fixed[2], NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+    CHECK(OK(r) && s, "C976b 配额满时内置边框色：期望建成（不占配额）→ rc=%d why=%s", r.code, e.why);
+    if (s) nvn_gpu_samp_release(s);
+    if (q[0]) nvn_gpu_samp_release(q[0]);
+    q[0] = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+    CHECK(OK(r) && q[0], "C976b 配额：释放一个后期望能再建 → rc=%d why=%s", r.code, e.why);
+    for (int k = 0; k < 3; k++) if (q[k]) nvn_gpu_samp_release(q[k]);
+    C976_CB_MAX = had_max;
+    // 读值
+    static const float uv[3][2] = {{-0.5f, 0.5f}, {0.125f, 0.5f}, {1.5f, 0.5f}};
+    {   // 浮点：RGBA32F 纹素 i = (i, i+10, i+20, i+30)
+        static const float texels[4][4] = {{0, 10, 20, 30}, {1, 11, 21, 31}, {2, 12, 22, 32}, {3, 13, 23, 33}};
+        s = c976b_samp(odd, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+        CHECK(OK(r) && s, "C976b 浮点自定义边框色建采样器：%d %s", r.code, e.why);
+        nvn_gpu_tex t = make_tex(4, 1, NVN_FORMAT_RGBA32F, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_tex_upload(c, t, 0, 0, NULL, texels, 64, 64);
+        r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        CHECK(OK(r) && OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C976b 浮点上传：%s", e.why);
+        float got[3][4] = {{0}};
+        if (s && samp_at_sh(dir, "samp_at.comp", t, s, uv, 3, got, 2)) {
+            for (int i = 0; i < 3; i += 2)
+                CHECK(!memcmp(got[i], odd, 16), "C976b 浮点 u=%.3f：期望边框色 0.2 0.4 0.6 0.8 → 读到 %g %g %g %g",
+                      uv[i][0], got[i][0], got[i][1], got[i][2], got[i][3]);
+            CHECK(!memcmp(got[1], texels[0], 16), "C976b 浮点 u=0.125：期望纹素 0 → 读到 %g %g %g %g", got[1][0], got[1][1], got[1][2], got[1][3]);
+        }
+        printf("C976b 浮点 RGBA32F 边框色 (0.2,0.4,0.6,0.8)：u=-0.5 读到 (%g,%g,%g,%g)，u=1.5 读到 (%g,%g,%g,%g)\n",
+               got[0][0], got[0][1], got[0][2], got[0][3], got[2][0], got[2][1], got[2][2], got[2][3]);
+        nvn_gpu_tex_release(t);
+        if (s) nvn_gpu_samp_release(s);
+    }
+    {   // 有符号整数：RGBA32I，边框色 (-3, 7, 100000, 1)
+        static const float ib[4] = {-3.0f, 7.0f, 100000.0f, 1.0f};
+        static const int32_t want[4] = {-3, 7, 100000, 1};
+        static const int32_t texels[4][4] = {{0, -1, 2, 5}, {1, -2, 3, 5}, {2, -3, 4, 5}, {3, -4, 5, 5}};
+        s = c976b_samp(ib, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+        CHECK(OK(r) && s, "C976b 整数自定义边框色建采样器：%d %s", r.code, e.why);
+        nvn_gpu_tex t = make_tex(4, 1, NVN_FORMAT_RGBA32I, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_tex_upload(c, t, 0, 0, NULL, texels, 64, 64);
+        r = nvn_gpu_cmd_commit(c, 3, on_done, NULL, &e);
+        CHECK(OK(r) && OK(nvn_gpu_fence_wait(3, 5000000000ull, &e)), "C976b 整数上传：%s", e.why);
+        int32_t got[3][4] = {{0}};
+        if (s && samp_at_sh(dir, "samp_at_i.comp", t, s, uv, 3, got, 4)) {
+            for (int i = 0; i < 3; i += 2)
+                CHECK(!memcmp(got[i], want, 16), "C976b RGBA32I u=%.3f：期望边框色 -3 7 100000 1 → 读到 %d %d %d %d",
+                      uv[i][0], got[i][0], got[i][1], got[i][2], got[i][3]);
+            CHECK(!memcmp(got[1], texels[0], 16), "C976b RGBA32I u=0.125：期望纹素 0 → 读到 %d %d %d %d", got[1][0], got[1][1], got[1][2], got[1][3]);
+        }
+        printf("C976b RGBA32I 边框色 (-3,7,100000,1)：u=-0.5 读到 (%d,%d,%d,%d)\n", got[0][0], got[0][1], got[0][2], got[0][3]);
+        nvn_gpu_tex_release(t);
+        if (s) nvn_gpu_samp_release(s);
+    }
+    {   // 无符号整数：RGBA32UI，边框色 (3000000000, 2, 0, 9)（3e9 在 float 里正好可表示，超过 INT32_MAX）
+        static const float ub[4] = {3000000000.0f, 2.0f, 0.0f, 9.0f};
+        static const uint32_t want[4] = {3000000000u, 2, 0, 9};
+        static const uint32_t texels[4][4] = {{7, 0, 0, 1}, {8, 0, 0, 1}, {9, 0, 0, 1}, {10, 0, 0, 1}};
+        s = c976b_samp(ub, NVN_WRAP_MODE_CLAMP_TO_BORDER, &e, &r);
+        CHECK(OK(r) && s, "C976b 无符号自定义边框色建采样器：%d %s", r.code, e.why);
+        nvn_gpu_tex t = make_tex(4, 1, NVN_FORMAT_RGBA32UI, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_tex_upload(c, t, 0, 0, NULL, texels, 64, 64);
+        r = nvn_gpu_cmd_commit(c, 5, on_done, NULL, &e);
+        CHECK(OK(r) && OK(nvn_gpu_fence_wait(5, 5000000000ull, &e)), "C976b 无符号上传：%s", e.why);
+        uint32_t got[3][4] = {{0}};
+        if (s && samp_at_sh(dir, "samp_at_u.comp", t, s, uv, 3, got, 6)) {
+            for (int i = 0; i < 3; i += 2)
+                CHECK(!memcmp(got[i], want, 16), "C976b RGBA32UI u=%.3f：期望边框色 3000000000 2 0 9 → 读到 %u %u %u %u",
+                      uv[i][0], got[i][0], got[i][1], got[i][2], got[i][3]);
+            CHECK(!memcmp(got[1], texels[0], 16), "C976b RGBA32UI u=0.125：期望纹素 0 → 读到 %u %u %u %u", got[1][0], got[1][1], got[1][2], got[1][3]);
+        }
+        printf("C976b RGBA32UI 边框色 (3000000000,2,0,9)：u=-0.5 读到 (%u,%u,%u,%u)\n", got[0][0], got[0][1], got[0][2], got[0][3]);
+        nvn_gpu_tex_release(t);
+        if (s) nvn_gpu_samp_release(s);
     }
 }
 
@@ -7241,6 +7383,9 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;   // 自己一个会话：围栏号 1、2
     c976m_mirror_clamp(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976m close：%d %s", e18.rc.code, e18.why);
+    if (!open_backend()) return 1;   // 自己一个会话：围栏号 1..6，配额计数从 0 起
+    c976b_border_color(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976b close：%d %s", e18.rc.code, e18.why);
 
     if (!open_backend()) return 1;
     cube_array_one_face();

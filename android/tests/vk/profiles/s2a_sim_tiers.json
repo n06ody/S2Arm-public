@@ -289,6 +289,24 @@
             "capabilities": [
                 "unchanged"
             ]
+        },
+        "VP_S2A_SIM_no_custom_border": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "无自定义边框色",
+            "description": "能力不变，由 sim_tiers.sh 用 exclude_device_extensions 去掉 VK_EXT_custom_border_color。期望：契约绿，不是内置三档的边框色回具名 UNSUPPORTED（#976）。",
+            "contributors": {},
+            "history": [
+                {
+                    "revision": 1,
+                    "date": "2026-11-14",
+                    "author": "S2Arm",
+                    "comment": "首版（#976）：只按 Vulkan 规范扩展名手写，不含任何设备报告数据"
+                }
+            ],
+            "capabilities": [
+                "unchanged"
+            ]
         }
     }
 }

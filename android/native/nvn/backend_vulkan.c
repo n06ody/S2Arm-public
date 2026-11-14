@@ -141,6 +141,7 @@ struct nvn_gpu_samp_s {
     VkSampler sampler;
     VkSampler int_sampler;   // 给整数格式的视图用：最近点、不做各向异性、整数边界色（整数格式不能线性过滤）；参数本来就合规时与 sampler 是同一个
     int released, refs;
+    uint32_t border_slots;   // 占用的自定义边框色配额（sampler 与 int_sampler 各算一个；内置三档为 0）
     struct nvn_gpu_samp_s *all_next;
 };
 
@@ -282,6 +283,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_tex_s *texs;
     struct nvn_gpu_view_s *views;
     struct nvn_gpu_samp_s *samps;
+    uint32_t border_live;          // 存活的自定义边框色 VkSampler 个数，对照 dev->custom_border_max（g_mu 下改）
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
@@ -692,6 +694,7 @@ static void destroy_samp_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_samp_s *s)
     struct nvn_gpu_samp_s **pp = &vk->samps;
     while (*pp && *pp != s) pp = &(*pp)->all_next;
     if (*pp) *pp = s->all_next;
+    vk->border_live -= s->border_slots;
     if (s->int_sampler && s->int_sampler != s->sampler) vkDestroySampler(vk->d, s->int_sampler, NULL);
     if (s->sampler) vkDestroySampler(vk->d, s->sampler, NULL);
     free(s);
@@ -1645,6 +1648,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     }
     struct nvn_gpu_samp_s *sp = g.samps;
     g.samps = NULL;
+    g.border_live = 0;
     while (sp) {
         struct nvn_gpu_samp_s *sn = sp->all_next;
         if (sp->int_sampler && sp->int_sampler != sp->sampler) vkDestroySampler(g.d, sp->int_sampler, NULL);
@@ -4758,6 +4762,30 @@ static const char *samp_wrap(uint8_t w, VkSamplerAddressMode *out) {
     }
 }
 
+// 边框色（#976）。NVN 给的是任意 RGBA（整数 setter 也按数值存成浮点，hle_nvn.c）。正好是 Vulkan 内置三档之一时用内置值，
+// 不占自定义边框色配额；否则要 VK_EXT_custom_border_color。返回 0 透明黑、1 不透明黑、2 不透明白，-1 = 不是三档之一。
+static int samp_border_preset(const float b[4]) {
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0) return b[3] == 0 ? 0 : b[3] == 1 ? 1 : -1;
+    return b[0] == 1 && b[1] == 1 && b[2] == 1 && b[3] == 1 ? 2 : -1;
+}
+
+// 整数视图用的边框色：按数值取整。有符号视图读 int32；无符号视图读同一组 32 位，超过 INT32_MAX 的无符号值按位存。
+static int32_t samp_border_int(float f) {
+    const double d = (double)f;
+    const int64_t v = d <= (double)INT32_MIN ? INT32_MIN : d >= (double)UINT32_MAX ? (int64_t)UINT32_MAX : (int64_t)(d < 0 ? d - 0.5 : d + 0.5);
+    const uint32_t bits = (uint32_t)v;
+    int32_t out;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+
+static void samp_border_unreserve(const struct nvn_gpu_samp_s *s) {
+    if (!s->border_slots) return;
+    pthread_mutex_lock(&g_mu);
+    g.border_live -= s->border_slots;
+    pthread_mutex_unlock(&g_mu);
+}
+
 static VkCompareOp samp_compare(uint8_t m) {
     switch (m) {
     case NVN_COMPARE_FUNC_NEVER: return VK_COMPARE_OP_NEVER;
@@ -4814,11 +4842,47 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
         ci.compareEnable = VK_TRUE;
         ci.compareOp = samp_compare(p->cmp_func);
     }
-    int white = p->border[0] == 1 && p->border[1] == 1 && p->border[2] == 1 && p->border[3] == 1;
-    int transparent = p->border[0] == 0 && p->border[1] == 0 && p->border[2] == 0 && p->border[3] == 0;
-    ci.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
-                           : transparent ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    // 边框色只在有一向是 CLAMP_TO_BORDER 时用得到；用不到时不建自定义边框色（不要扩展、不占配额），不是三档的取不透明黑（与改前相同）。
+    const int preset = samp_border_preset(p->border);
+    const int custom = preset < 0 && (ci.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                                      ci.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                                      ci.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
+    if (custom && !g.dev->custom_border_enabled) {
+        free(s);
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "sampler_border_color_custom：设备没有启用 VK_EXT_custom_border_color（边框色 %g %g %g %g）",
+                    p->border[0], p->border[1], p->border[2], p->border[3]);
+    }
+    if (custom && !g.dev->custom_border_without_format) {
+        free(s);
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "sampler_border_color_custom_format：设备没有 customBorderColorWithoutFormat，建采样器时不知道视图格式");
+    }
+    static const VkBorderColor fixed[3] = {VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE};
+    static const VkBorderColor fixed_int[3] = {VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, VK_BORDER_COLOR_INT_OPAQUE_BLACK, VK_BORDER_COLOR_INT_OPAQUE_WHITE};
+    ci.borderColor = custom ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT : fixed[preset < 0 ? 1 : preset];
+    VkSamplerCustomBorderColorCreateInfoEXT cb, cbi;   // 浮点 / 整数两个采样器各一份；format 留 UNDEFINED（上面已要求 WithoutFormat）
+    memset(&cb, 0, sizeof cb);
+    memset(&cbi, 0, sizeof cbi);
+    if (custom) {
+        pthread_mutex_lock(&g_mu);   // 配额先占后建：两个 VkSampler 都带自定义边框色
+        const int room = g.border_live + 2 <= g.dev->custom_border_max;
+        if (room) g.border_live += 2;
+        pthread_mutex_unlock(&g_mu);
+        if (!room) {
+            free(s);
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "sampler_border_color_custom_quota：自定义边框色采样器已达设备上限 %u", g.dev->custom_border_max);
+        }
+        s->border_slots = 2;
+        cb.sType = cbi.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+        cb.format = cbi.format = VK_FORMAT_UNDEFINED;
+        for (int i = 0; i < 4; i++) {
+            cb.customBorderColor.float32[i] = p->border[i];
+            cbi.customBorderColor.int32[i] = samp_border_int(p->border[i]);
+        }
+        cb.pNext = ci.pNext;
+        ci.pNext = &cb;
+    }
     if (vkCreateSampler(g.d, &ci, NULL, &s->sampler) != VK_SUCCESS) {
+        samp_border_unreserve(s);
         free(s);
         return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateSampler 拒绝（可能缺少 samplerAnisotropy）");
     }
@@ -4826,9 +4890,13 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
         VkSamplerCreateInfo ii = ci;
         ii.magFilter = ii.minFilter = VK_FILTER_NEAREST; ii.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ii.anisotropyEnable = VK_FALSE; ii.maxAnisotropy = 1.0f;
-        ii.borderColor = white ? VK_BORDER_COLOR_INT_OPAQUE_WHITE : transparent ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        ii.borderColor = custom ? VK_BORDER_COLOR_INT_CUSTOM_EXT : fixed_int[preset < 0 ? 1 : preset];
+        if (custom) {
+            cbi.pNext = ii.pNext == &cb ? cb.pNext : ii.pNext;   // 换掉浮点那份，链上其余结构不动
+            ii.pNext = &cbi;
+        }
         if (vkCreateSampler(g.d, &ii, NULL, &s->int_sampler) != VK_SUCCESS) {
-            vkDestroySampler(g.d, s->sampler, NULL); free(s);
+            vkDestroySampler(g.d, s->sampler, NULL); samp_border_unreserve(s); free(s);
             return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateSampler 拒绝（整数格式用的最近点采样器）");
         }
     }
