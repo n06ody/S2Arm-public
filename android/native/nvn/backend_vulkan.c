@@ -96,6 +96,7 @@ struct nvn_gpu_view_s {
     uint32_t base_level, levels, base_layer, layers;
     int released, refs;
     int swizzled;   // 通道映射非恒等：只能采样，不能当附件
+    int r_swizzled; // #976：r 分量不是恒等映射（设备没有 filterMinmaxImageComponentMapping 时不能配 min / max 归约采样器）
     VkImageViewType type;
     VkImageAspectFlags aspect;   // 这个视图取的面（深度模板格式的采样视图只取一个面）
     uint32_t att_layer;          // 当附件时取的层 / 3D 深度切片（视图没设层范围 = 0）
@@ -140,6 +141,7 @@ struct nvn_gpu_pipe_s {
 struct nvn_gpu_samp_s {
     VkSampler sampler;
     VkSampler int_sampler;   // 给整数格式的视图用：最近点、不做各向异性、整数边界色（整数格式不能线性过滤）；参数本来就合规时与 sampler 是同一个
+    uint8_t reduction;       // #976：sampler 带 min / max 归约（NVN_SAMPLER_REDUCTION_MIN / MAX；0 = 平均）。int_sampler 是最近点，不带归约
     int released, refs;
     struct nvn_gpu_samp_s *all_next;
 };
@@ -3754,7 +3756,19 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
             memset(im, 0, sizeof *im);
             im->imageView = b->u.ts.view->view;
             { nvn_fmt_info vfi; int vint = nvn_fmt_info_of(b->u.ts.view->nvn_format, &vfi) && (vfi.kind == NVN_FMT_UINT || vfi.kind == NVN_FMT_SINT);
-              im->sampler = vint ? b->u.ts.samp->int_sampler : b->u.ts.samp->sampler; }
+              im->sampler = vint ? b->u.ts.samp->int_sampler : b->u.ts.samp->sampler;
+              if (!vint && b->u.ts.samp->reduction) {   // #976：做 min / max 归约的视图：格式要有 FILTER_MINMAX；没有通道映射能力时 r 必须恒等
+                  VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g.phys, b->u.ts.view->format, &fp);
+                  if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT)) {
+                      set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_view_format：视图格式 0x%x（Vulkan %d）没有 SAMPLED_IMAGE_FILTER_MINMAX，不能做 min / max 归约",
+                                 b->u.ts.view->nvn_format, (int)b->u.ts.view->format);
+                      return -1;
+                  }
+                  if (b->u.ts.view->r_swizzled && !g.dev->minmax_image_mapping) {
+                      set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_view_swizzle：设备没有 filterMinmaxImageComponentMapping，做 min / max 归约的视图 r 分量必须恒等");
+                      return -1;
+                  }
+              } }
             im->imageLayout = bind_image_layout(c, b->u.ts.view);
             w->pImageInfo = im;
             break;
@@ -4656,6 +4670,7 @@ nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex th, const view_t *v, nvn_gpu_view *ou
             *comp[ch] = sw[ch] == 0 ? VK_COMPONENT_SWIZZLE_ZERO : sw[ch] == 1 ? VK_COMPONENT_SWIZZLE_ONE : (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + (sw[ch] - 2));
             if (sw[ch] != 2 + ch) o->swizzled = 1;
         }
+        o->r_swizzled = sw[0] != 2;
         if (!o->swizzled) memset(&ci.components, 0, sizeof ci.components);   // 恒等：留 IDENTITY，附件可用
     }
     OC(OC_VIEW);
@@ -4818,12 +4833,29 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
     int transparent = p->border[0] == 0 && p->border[1] == 0 && p->border[2] == 0 && p->border[3] == 0;
     ci.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
                            : transparent ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    // #976：min / max 归约（VK_EXT_sampler_filter_minmax）。只在有线性过滤（放大 / 缩小 / 级间）时才有意义，全是最近点就不挂。
+    VkSamplerReductionModeCreateInfoEXT rm;
+    memset(&rm, 0, sizeof rm);
+    rm.sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT;
+    if (p->reduction != NVN_SAMPLER_REDUCTION_AVERAGE) {
+        const char *rn = p->reduction == NVN_SAMPLER_REDUCTION_MIN ? "min" : p->reduction == NVN_SAMPLER_REDUCTION_MAX ? "max" : NULL;
+        if (!rn) { free(s); return fail(err, NVN_GPU_E_ARG, "sampler_reduction_mode：NVN 归约模式 %u 无映射", p->reduction); }
+        int linear = ci.magFilter == VK_FILTER_LINEAR || ci.minFilter == VK_FILTER_LINEAR || ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (linear) {
+            if (!g.dev->sampler_minmax_enabled) { free(s); return fail(err, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_%s：设备没有 VK_EXT_sampler_filter_minmax", rn); }
+            if (ci.compareEnable) { free(s); return fail(err, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_%s：Vulkan 不允许比较采样同时做 %s 归约", rn, rn); }
+            rm.reductionMode = p->reduction == NVN_SAMPLER_REDUCTION_MIN ? VK_SAMPLER_REDUCTION_MODE_MIN_EXT : VK_SAMPLER_REDUCTION_MODE_MAX_EXT;
+            ci.pNext = &rm;
+            s->reduction = (uint8_t)p->reduction;
+        }
+    }
     if (vkCreateSampler(g.d, &ci, NULL, &s->sampler) != VK_SUCCESS) {
         free(s);
         return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateSampler 拒绝（可能缺少 samplerAnisotropy）");
     }
     {   // 整数格式视图用的那一个：过滤全改最近点、关各向异性、边界色换整数的同名值
         VkSamplerCreateInfo ii = ci;
+        ii.pNext = NULL;   // 全最近点：归约不起作用，也不要求视图格式有 FILTER_MINMAX
         ii.magFilter = ii.minFilter = VK_FILTER_NEAREST; ii.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ii.anisotropyEnable = VK_FALSE; ii.maxAnisotropy = 1.0f;
         ii.borderColor = white ? VK_BORDER_COLOR_INT_OPAQUE_WHITE : transparent ? VK_BORDER_COLOR_INT_TRANSPARENT_BLACK : VK_BORDER_COLOR_INT_OPAQUE_BLACK;

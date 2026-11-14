@@ -320,8 +320,8 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         return fail(why, why_size, "required feature missing: shaderDrawParameters");
 
     // 容量 = 下面所有可选扩展同时启用时的项数（swapchain / maintenance1 / 校准 / index_type_uint8 / display_timing /
-    // host import / AHB + queue_family_foreign / indirect count / 镜像夹取 = 10），留一项余量。
-    const char *device_ext[11];
+    // host import / AHB + queue_family_foreign / indirect count / 镜像夹取 / min-max 归约 = 11），留一项余量。
+    const char *device_ext[12];
     uint32_t device_ext_count = 0;
     if (out->has_swapchain) device_ext[device_ext_count++] = "VK_KHR_swapchain";
     if (out->swapchain_maintenance1_enabled) device_ext[device_ext_count++] = "VK_EXT_swapchain_maintenance1";
@@ -393,6 +393,19 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // #976：NVN 的 MIRROR_CLAMP_TO_EDGE 环绕。扩展没有特性结构，advertise 即可启用；没有时建这种采样器报 UNSUPPORTED。
     out->sampler_mirror_clamp_enabled = has_device_extension(out->physical, "VK_KHR_sampler_mirror_clamp_to_edge");
     if (out->sampler_mirror_clamp_enabled) device_ext[device_ext_count++] = "VK_KHR_sampler_mirror_clamp_to_edge";
+    // #976：NVN 采样器的 min / max 归约。扩展没有特性结构；属性里的 filterMinmaxImageComponentMapping 决定做归约的视图能不能换 r 分量。
+    out->sampler_minmax_enabled = has_device_extension(out->physical, "VK_EXT_sampler_filter_minmax");
+    if (out->sampler_minmax_enabled) {
+        VkPhysicalDeviceSamplerFilterMinmaxPropertiesEXT mp = {0};
+        mp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 p2 = {0};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &mp;
+        vkGetPhysicalDeviceProperties2(out->physical, &p2);
+        out->minmax_image_mapping = mp.filterMinmaxImageComponentMapping == VK_TRUE;
+        device_ext[device_ext_count++] = "VK_EXT_sampler_filter_minmax";
+    }
+    fprintf(stderr, "[s2a] vk sampler minmax: enabled=%d image_mapping=%d\n", out->sampler_minmax_enabled, out->minmax_image_mapping);
     out->device_extension_count = device_ext_count;
 
     float priority = 1.0f;

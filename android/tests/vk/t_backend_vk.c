@@ -4186,6 +4186,7 @@ static void c976m_mirror_clamp(const char *dir) {
 // C976r：min / max 归约（#976）。2x1 R32F 纹素 {0.25, 0.75}，线性过滤、夹到边，在两纹素中心的中点 u = 0.5 采样：
 // 两个纹素权重各一半。期望：平均 0.5、min 0.25、max 0.75。修前后端不读 reduction，三种都读到 0.5。
 static void c976r_reduction(const char *dir) {
+    printf("C976r 归约：设备 sampler_filter_minmax=%d image_mapping=%d\n", g_dev.sampler_minmax_enabled, g_dev.minmax_image_mapping);
     static const float texels[2] = {0.25f, 0.75f};
     static const float uv[1][2] = {{0.5f, 0.5f}};
     static const struct { uint32_t red; const char *name; float want; } k[3] = {
@@ -4201,6 +4202,19 @@ static void c976r_reduction(const char *dir) {
         sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR;
         sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE; sp.reduction = k[i].red;
         nvn_gpu_samp samp = NULL; memset(&e, 0, sizeof e);
+        if (i) {   // 没有扩展（模拟档 no_minmax；有扩展时本用例把启用位清零再问一次）：min / max 必须具名 UNSUPPORTED，不能静默退回平均
+            const int had = g_dev.sampler_minmax_enabled;
+            char want[48]; snprintf(want, sizeof want, "sampler_reduction_%s：", k[i].name);
+            g_dev.sampler_minmax_enabled = 0;
+            r = nvn_gpu_samp_create(&sp, &samp, &e);
+            g_dev.sampler_minmax_enabled = had;
+            CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !samp && !strncmp(e.why, want, strlen(want)),
+                  "C976r 没有扩展：%s 期望 UNSUPPORTED「%s…」→ rc=%d why=%s", k[i].name, want, r.code, e.why);
+            printf("C976r 没有扩展：%s 归约建采样器 rc=%d（%s）\n", k[i].name, r.code, e.why);
+            if (samp) { nvn_gpu_samp_release(samp); samp = NULL; }
+            if (!had) continue;
+            memset(&e, 0, sizeof e);
+        }
         r = nvn_gpu_samp_create(&sp, &samp, &e);
         CHECK(OK(r) && samp, "C976r %s 建采样器：%d %s", k[i].name, r.code, e.why);
         if (!samp) continue;

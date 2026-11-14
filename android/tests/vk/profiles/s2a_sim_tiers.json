@@ -289,6 +289,24 @@
             "capabilities": [
                 "unchanged"
             ]
+        },
+        "VP_S2A_SIM_no_minmax": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "无 min / max 归约",
+            "description": "能力不变，由 sim_tiers.sh 用 exclude_device_extensions 去掉 VK_EXT_sampler_filter_minmax。期望：契约绿，min / max 归约的采样器具名 UNSUPPORTED（C976r），不静默退回平均。",
+            "contributors": {},
+            "history": [
+                {
+                    "revision": 1,
+                    "date": "2026-11-14",
+                    "author": "S2Arm",
+                    "comment": "#976：只按 Vulkan 规范扩展名手写，不含任何设备报告数据"
+                }
+            ],
+            "capabilities": [
+                "unchanged"
+            ]
         }
     }
 }
