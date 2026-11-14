@@ -24,13 +24,15 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static int g_gtp_diag, g_gtp_lines; static char g_gtp_log[72][320];   // 一次性诊断 nvk_gs_topo_probe 的日志行
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (!strncmp(text, "nvk gstopo:", 11) && g_gtp_lines < 72) snprintf(g_gtp_log[g_gtp_lines++], sizeof g_gtp_log[0], "%s", text); if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
     if (!strcmp(name, "nvk_sync_lag")) return g_flag_sync_lag;
+    if (!strcmp(name, "nvk_gs_topo_probe")) return g_gtp_diag;
     if (!strcmp(name, "nvk_state_keep")) return g_flag_state_keep;
     if (!strcmp(name, "nvk_rt_cont")) return g_flag_rt_cont;
     if (!strcmp(name, "nvk_clear_park")) return g_flag_clear_park;
@@ -1507,6 +1509,42 @@ static void t_gs_dirty_and_topology(void) {
     CHECK(nvn_unimpl_count("draw", "geometry_topology_unimplemented") == 1);
     g_snap_prog = NULL; pass_fresh();
 }
+// 一次性诊断 nvk_gs_topo_probe（不进 PR）：GS 拓扑门拦下的绘制旁打首见组合（图元号、索引与宽度、重启、间接、数量、实例、阶段掩码、VS / GS 键）。
+//   关着不打；打不打都照旧跳过；按全部字段去重，64 组封顶另打一条 truncated
+static void t_gs_topo_probe(void) {
+    pass_fresh(); g_gdraws = g_resolves = g_resolve_rc = 0; g_gtp_lines = 0; g_gtp_diag = 0; nvn_unimpl_reset(); rp_draw_reset();
+    prog_t pg; memset(&pg, 0, sizeof pg); pg.magic = MAGIC('P','R','O','G'); pg.serial = 997; pg.nstage = 3;
+    g_snap_prog = &pg; g_snap_ok = 7; memset(g_snap_keys, 0, sizeof g_snap_keys);
+    memset(g_snap_stage, 0xff, sizeof g_snap_stage);
+    for (int i = 0; i < 3; i++) { g_snap_stage[i] = (uint8_t)i; for (int k = 0; k < 8; k++) g_snap_keys[i][k] = (uint8_t)(0x10 * (i + 1) + k); }
+    stream s = {0}; q_env(&s);
+    p_bind_program_id *id = put(&s, OP_BIND_PROGRAM, sizeof *id); id->prog = &pg; id->serial = pg.serial; id->stages = 0x7;
+    p_draw *d = put(&s, OP_DRAW, sizeof *d); d->prim = 5; d->first = 2; d->count = 4; d->instances = 3;   // 关：不打
+    end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == 0 && nvn_unimpl_count("draw", "geometry_topology_unimplemented") == 1 && g_gtp_lines == 0);
+    g_gtp_diag = 1; rp_draw_reset();
+    stream t = {0};
+    d = put(&t, OP_DRAW, sizeof *d); d->prim = 5; d->first = 2; d->count = 4; d->instances = 3;
+    d = put(&t, OP_DRAW, sizeof *d); d->prim = 5; d->first = 2; d->count = 4; d->instances = 3;   // 同组合：去重
+    p_prim_restart *pr = put(&t, OP_PRIM_RESTART, sizeof *pr); pr->on = 1; pr->index = 0xffff;
+    p_draw_idx *di = put(&t, OP_DRAW_IDX, sizeof *di); di->prim = 6; di->itype = 1; di->count = 9; di->instances = 0; di->ibuf = 0x1000;
+    di = put(&t, OP_DRAW_IDX, sizeof *di); di->prim = 3; di->itype = 2; di->count = 0; di->instances = 1; di->ibuf = 0x1000; di->ind = 0x2000;
+    d = put(&t, OP_DRAW, sizeof *d); d->prim = 4; d->count = 3; d->instances = 1;   // 原生三角：不过门、不打
+    end(&t); submit1(&t); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(nvn_unimpl_count("draw", "geometry_topology_unimplemented") == 5);   // 跳过照旧：关 1 + 开 4（间接的线带不在前一道间接门的名单里，到这道门才拦）
+    CHECK(g_gtp_lines == 3);   // 修前：0 行
+    CHECK(g_gtp_lines >= 1 && !strcmp(g_gtp_log[0], "nvk gstopo: prim=5 idx=0 isz=0 restart=0 rv=0 ind=0 count=4 inst=3 stages=0x7 vs=1011121314151617 gs=3031323334353637"));
+    CHECK(g_gtp_lines >= 2 && !strcmp(g_gtp_log[1], "nvk gstopo: prim=6 idx=1 isz=2 restart=1 rv=0xffff ind=0 count=9 inst=0 stages=0x7 vs=1011121314151617 gs=3031323334353637"));
+    CHECK(g_gtp_lines >= 3 && !strcmp(g_gtp_log[2], "nvk gstopo: prim=3 idx=1 isz=4 restart=1 rv=0xffff ind=1 count=0 inst=1 stages=0x7 vs=1011121314151617 gs=3031323334353637"));
+    rp_draw_reset(); g_gtp_lines = 0;
+    for (int h = 0; h < 2; h++) {   // 一个替身流 4 KiB 装不下 66 笔：分两次提交
+        stream u = {0};
+        for (int j = 0; j < 33; j++) { d = put(&u, OP_DRAW, sizeof *d); d->prim = 5; d->count = 4 + 33 * h + j; d->instances = 1; }
+        end(&u); submit1(&u); fake_complete(NVN_GPU_DONE_OK);
+    }
+    CHECK(g_gtp_lines == 65 && !strcmp(g_gtp_log[64], "nvk gstopo: truncated=1 limit=64"));
+    g_gtp_diag = 0; g_snap_prog = NULL; rp_draw_reset(); pass_fresh();
+}
 // 不同阶段同槽的三个 UBO 有不同哨兵；只重绑 GS 后检查对应阶段与管线。
 static void t_gs_bind(void) {
     pass_fresh(); g_gdraws = g_resolves = g_resolve_rc = 0; g_arena_used = 0;
@@ -2794,6 +2832,7 @@ int main(int argc, char **argv) {
     t_arena697_detail();
     t_logic_op_accounting();
     t_gs_dirty_and_topology();
+    t_gs_topo_probe();
     t_gs_bind(); t_storage_sync_before_pass(); t_stage_dropped_clears_binds();
     t_decl_sampling();
     t_separate_sampler();

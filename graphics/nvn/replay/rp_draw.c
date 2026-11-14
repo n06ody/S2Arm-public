@@ -539,6 +539,32 @@ static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
     return 1;
 }
 
+// 一次性诊断（nvk_gs_topo_probe=1，默认关；不进 PR）：GS 拓扑门拦下的绘制旁打首见组合——原始图元号、是否带索引与索引字节宽、
+//   重启开关与重启值（录制态原样，不带索引时不起作用）、是否间接（间接时 count 是录制里的旧字段，不是 GPU 实际数）、数量、实例数（0 = 1）、
+//   图形阶段掩码、VS / GS 的着色器键。按全部字段去重，最多 64 组，超了另打一条 truncated。只打日志，不改跳过；开关与去重表按会话（rp_draw_reset 清）
+struct gtp_key { uint8_t vs[8], gs[8]; uint32_t prim, count, inst, rv, stages; uint8_t idx, isz, restart, ind, vok, gok; };
+static int g_gtp_on = -1, g_gtp_n, g_gtp_trunc; static struct gtp_key g_gtp_seen[64];
+static void gtp_note(uint32_t prim, const p_draw *dr, const p_draw_idx *di) {
+    if (g_gtp_on < 0) g_gtp_on = nvn_plat_flag("nvk_gs_topo_probe", 0) != 0;
+    if (!g_gtp_on) return;
+    struct gtp_key k; memset(&k, 0, sizeof k);
+    k.prim = prim; k.idx = di != NULL; k.isz = di ? (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) : 0;
+    k.restart = rp_S.restart.on != 0; k.rv = rp_S.restart.index; k.ind = (di ? di->ind : dr->ind) != 0;
+    k.count = (uint32_t)(di ? di->count : dr->count); k.inst = (uint32_t)(di ? di->instances : dr->instances); k.stages = rp_shader_graphics_stages();
+    k.vok = (uint8_t)rp_shader_stage_key(0, k.vs); k.gok = (uint8_t)rp_shader_stage_key(2, k.gs);
+    if (!k.vok) memset(k.vs, 0, 8);
+    if (!k.gok) memset(k.gs, 0, 8);
+    for (int j = 0; j < g_gtp_n; j++) if (!memcmp(&g_gtp_seen[j], &k, sizeof k)) return;
+    if (g_gtp_n == 64) { if (!g_gtp_trunc) { g_gtp_trunc = 1; nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", "nvk gstopo: truncated=1 limit=64"); } return; }
+    g_gtp_seen[g_gtp_n++] = k;
+    char vs[24], gs[24];
+    snprintf(vs, sizeof vs, "%s%02x%02x%02x%02x%02x%02x%02x%02x", k.vok ? "" : "none:", k.vs[0], k.vs[1], k.vs[2], k.vs[3], k.vs[4], k.vs[5], k.vs[6], k.vs[7]);
+    snprintf(gs, sizeof gs, "%s%02x%02x%02x%02x%02x%02x%02x%02x", k.gok ? "" : "none:", k.gs[0], k.gs[1], k.gs[2], k.gs[3], k.gs[4], k.gs[5], k.gs[6], k.gs[7]);
+    char m[256];
+    snprintf(m, sizeof m, "nvk gstopo: prim=%u idx=%u isz=%u restart=%u rv=%#x ind=%u count=%u inst=%u stages=%#x vs=%s gs=%s",
+             (unsigned)k.prim, (unsigned)k.idx, (unsigned)k.isz, (unsigned)k.restart, (unsigned)k.rv, (unsigned)k.ind, (unsigned)k.count, (unsigned)k.inst, (unsigned)k.stages, vs, gs);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", m);
+}
 // OP_DRAW / OP_DRAW_IDX 共用。di 非空 = 带索引
 // 分时：一笔绘制里各步各花多久（累计到 rp_perf，上屏那边每 5 秒报一次）
 static uint64_t dt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -559,6 +585,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     if (!(prim <= 9)) { char nm[24]; snprintf(nm, sizeof nm, "prim_%u", prim); skip(nm, rec); return; }
     // 必须在图元展开前判原始输入，避免 GS 看到不同数量或顺序的图元。
     if ((rp_shader_graphics_stages() & 4u) && prim != 0 && prim != 1 && prim != 4) {
+        gtp_note(prim, dr, di);
         skip("geometry_topology_unimplemented", rec); return;
     }
     uint32_t count = (uint32_t)(di ? di->count : dr->count);
@@ -987,4 +1014,5 @@ done:
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
-    free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; }
+    free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1;
+    g_gtp_on = -1; g_gtp_n = 0; g_gtp_trunc = 0; }   // 一次性诊断 nvk_gs_topo_probe：开关与去重表按会话
