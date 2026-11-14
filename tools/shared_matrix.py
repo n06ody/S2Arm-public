@@ -453,6 +453,7 @@ DLSYM = re.compile(r"\bS2A_DLSYM__([A-Za-z_]\w*)")
 # 链接期弱引用：extern … 名字(…) __attribute__((weak))。安卓上服务层与 C 代码静态并进同一个库（--exclude-libs,ALL），
 #   dlsym 取不到隐藏导出，同库取服务层导出要这样写（hle_nvn.c S2A_NvMapFromGuest、nvn2.c S2A_CameraSessionOpen）——算接线，同 dlsym
 WEAKREF = re.compile(r"\bextern\b[^;{}]*?\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*__attribute__\s*\(\(\s*weak\s*\)\)")
+C_CALLER_SUFFIXES = (".c", ".cc", ".cpp", ".m", ".mm")   # 直接调 C# 导出算接线的调用方文件（C 系；.cs 另走使用形）
 USE = [re.compile(r"\bnew\s+([A-Za-z_]\w*)"),
        re.compile(r":\s*([A-Za-z_]\w*)\b"),
        re.compile(r"\b([A-Za-z_]\w*)\s*\."),
@@ -502,6 +503,8 @@ def wired_of(mod, syms, has_main, linked, prod_calls, prod_uses, test_calls):
                  if not_self(f) and (mod["kind"] not in ("service-cs", "gfx-csproj") or f.endswith(".cs"))]
         if mod["kind"] in ("service-cs", "gfx-csproj"):   # C# 导出被平台可调到的 C 代码按名字 dlsym 取、或链接期弱引用：算接线（不限 .cs）
             hits += [f"{f}:{n}" for f, n in prod_calls.get("dlsym:" + s, []) + prod_calls.get("weak:" + s, []) if not_self(f)]
+            # 平台可调到的 C 代码直接调这个导出（不经 dlsym、也不经弱引用声明，如 lifecycle.c 安卓下强引用调 S2A_CancelWaits()）：也算接线
+            hits += [f"{f}:{n}" for f, n in prod_calls.get(s, []) if not_self(f) and f.endswith(C_CALLER_SUFFIXES)]
         thits += [f for f, _n in test_calls.get(s, []) if not_self(f)]
     hits = sorted(set(hits))
     if hits:

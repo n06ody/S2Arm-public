@@ -141,6 +141,16 @@ sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"
 echo 'extern unsigned S2A_TestExportOpen(void) __attribute__((weak)); int z(void){ return S2A_TestExportOpen ? (int)S2A_TestExportOpen() : 0; }' >> "$R/android/native/caller.c"
 o=$(run --check); r=$?
 ck "安卓链上的 C 代码链接期弱引用导出名 → 算接线、不红" '! echo "$o" | grep "【红】" | grep -q Exported'
+sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"
+# 负对照：同样的弱引用调用只在苹果编的分支里 → 安卓侧不算，仍红
+printf '%s\n' '#if defined(__APPLE__)' 'extern unsigned S2A_TestExportOpen(void) __attribute__((weak));' 'int z(void){ return S2A_TestExportOpen ? (int)S2A_TestExportOpen() : 0; }' '#endif' >> "$R/android/native/caller.c"
+o=$(run --check); r=$?
+ck "负对照：弱引用调用只在苹果分支里 → 安卓仍红（rc=${r}）" '[ $r != 0 ] && echo "$o" | grep "【红】" | grep -q Exported'
+sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"; sed_edit '/^#if defined(__APPLE__)$/d' "$R/android/native/caller.c"; sed_edit '/^#endif$/d' "$R/android/native/caller.c"
+# 不带弱引用声明、直接调导出（强引用，如 lifecycle.c 安卓下调 S2A_CancelWaits()）→ 也算接线
+printf '%s\n' 'extern unsigned S2A_TestExportOpen(void);' 'int z(void){ return (int)S2A_TestExportOpen(); }' >> "$R/android/native/caller.c"
+o=$(run --check); r=$?
+ck "安卓链上的 C 代码直接调导出（强引用）→ 算接线、不再红" '! echo "$o" | grep "【红】" | grep -q Exported'
 rm "$R/services/S2A.Services/Exported.cs"; sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"
 
 # 把 oldgap 接上：进 core 名单 + 安卓调用方 → 缺口收窄 → 基线条目变旧 → 【黄】但绿
