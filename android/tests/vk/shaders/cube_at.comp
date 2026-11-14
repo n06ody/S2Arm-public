@@ -1,0 +1,7 @@
+#version 450
+// P0-6 立方体视图用例：每个调用按给定方向在第 0 级采样一次，结果原样写出（期望 = 面号，见 t_backend_vk.c）。
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform samplerCube t;
+layout(set = 0, binding = 1) readonly buffer C { vec4 dir[]; } c;
+layout(set = 0, binding = 2) writeonly buffer O { vec4 v[]; } o;
+void main() { uint i = gl_GlobalInvocationID.x; o.v[i] = textureLod(t, c.dir[i].xyz, 0.0); }

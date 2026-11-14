@@ -956,6 +956,9 @@ static void t_decl_view(void) {
         {NVN_TEXTURE_TARGET_CUBEMAP, 6, NVN_TEXTURE_TARGET_CUBEMAP_ARRAY + 1, 1, 9, 6},
         {NVN_TEXTURE_TARGET_CUBEMAP_ARRAY, 12, NVN_TEXTURE_TARGET_CUBEMAP + 1, 1, 8, 6},
         {NVN_TEXTURE_TARGET_2D_ARRAY, 12, 0, 0, 4, 12},
+        // P0-6：方形、≥6 层的二维数组当立方体 / 立方体数组读：照 iOS 建立方体视图（后端给这种图建立方体兼容），不再绑零贴图
+        {NVN_TEXTURE_TARGET_2D_ARRAY, 12, NVN_TEXTURE_TARGET_CUBEMAP + 1, 1, 8, 6},
+        {NVN_TEXTURE_TARGET_2D_ARRAY, 12, NVN_TEXTURE_TARGET_CUBEMAP_ARRAY + 1, 1, 9, 12},
     };
     rp_view_pin_begin();
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -970,6 +973,12 @@ static void t_decl_view(void) {
             g_vw_last.set_layers && g_vw_last.nlayers == cases[i].layers && g_vw_last.min_layer == 0);
         else CHECK(v == rp_view_by_id((int)i, &g_fake_cmd, NULL));
     }
+    CHECK(nvn_unimpl_count("tex", "cube_view_of_2d_array") == 0);
+    // 负对照：非方形（4x2）的 6 层二维数组不能立方体兼容，仍记 cube_view_of_2d_array、绑零贴图
+    { tex_t ns = mk_tex(7020, 0x30000, NVN_FORMAT_RGBA8, 4, 2, 1, 0); ns.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; ns.d.depth = 6; nvn_tex_layout(&ns.d, &ns.L);
+      nvn_be_reg_tex(20, &ns, NULL);
+      nvn_gpu_view zn = rp_view_by_id_decl(20, NVN_TEXTURE_TARGET_CUBEMAP + 1, 0, 0, &g_fake_cmd, NULL);
+      CHECK(zn && zn->of->d.d.width == 1 && nvn_unimpl_count("tex", "cube_view_of_2d_array") == 1); }
     // 从已有子视图继续适配：保留 mip、起始层、格式与通道映射。
     tex_t t = mk_tex(7010, 0x10000, NVN_FORMAT_RGBA8, 8, 8, 3, 0);
     t.d.target = NVN_TEXTURE_TARGET_CUBEMAP_ARRAY; t.d.depth = 12; nvn_tex_layout(&t.d, &t.L);
@@ -1012,12 +1021,14 @@ static void t_decl_view(void) {
     CHECK(za && za != orig3 && za->of->d.d.target == NVN_TEXTURE_TARGET_2D_ARRAY && za->of->d.d.depth == 1 && g_tex_creates == creates + 1);
     CHECK(rp_view_by_id_decl(14, NVN_TEXTURE_TARGET_2D_ARRAY + 1, 0, 0, &g_fake_cmd, NULL) == za && g_tex_creates == creates + 1);
     CHECK(nvn_unimpl_count("tex", "decl_type_mismatch") == 3);
-    // 12 层二维数组当立方体读：后端建图没带 CUBE_COMPATIBLE，必被拒绝的视图不交下去；记账并绑零贴图。
+    // 12 层方形二维数组当立方体读（P0-6）：后端给这种图建立方体兼容，照 iOS 建 6 层立方体视图，不绑零贴图。
+    // cube_view_of_2d_array 只有上面那个非方形负对照记过 1 次。
     t = mk_tex(7012, 0x18000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
     t.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t.d.depth = 12; nvn_tex_layout(&t.d, &t.L); nvn_be_reg_tex(12, &t, NULL);
     int vc = g_view_creates;
-    CHECK(rp_view_by_id_decl(12, NVN_TEXTURE_TARGET_CUBEMAP + 1, 1, 0, &g_fake_cmd, NULL) == z);
-    CHECK(g_view_creates == vc && nvn_unimpl_count("tex", "cube_view_of_2d_array") == 1);
+    nvn_gpu_view cv = rp_view_by_id_decl(12, NVN_TEXTURE_TARGET_CUBEMAP + 1, 1, 0, &g_fake_cmd, NULL);
+    CHECK(cv && cv != z && g_view_creates == vc + 1 && g_vw_last.set_target && g_vw_last.target == NVN_TEXTURE_TARGET_CUBEMAP && g_vw_last.nlayers == 6);
+    CHECK(nvn_unimpl_count("tex", "cube_view_of_2d_array") == 1);
     // 登记视图「层数 0 = 从起点取到底」：12 层立方体数组从第 6 层起，当二维数组读取 6 层
     t = mk_tex(7013, 0x1c000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
     t.d.target = NVN_TEXTURE_TARGET_CUBEMAP_ARRAY; t.d.depth = 12; nvn_tex_layout(&t.d, &t.L);
@@ -1028,9 +1039,9 @@ static void t_decl_view(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     int releases = g_tex_releases, view_releases = g_view_releases;
     rp_res_reset();
-    // 贴图：6 例 + 7010 + 7011 + 零立方体 + 零 3D + 7014 + 零二维数组 + 7013 = 13（7012 不建视图也不解析）；
-    // 视图：未改造 2 + 改造 4 + 7010 + 7011 原样 + 零立方体 + 零 3D + 7014 原样 + 零二维数组 + 7013 = 13
-    CHECK(g_tex_releases == releases + 13 && g_view_releases == view_releases + 13);
+    // 贴图：8 例 + 零浮点立方体（7020 负对照，7020 本身不建）+ 7010 + 7011 + 零 uint 立方体 + 零 3D + 7014 + 零二维数组 + 7012 + 7013 = 17；
+    // 视图：未改造 2 + 改造 6 + 零浮点立方体 + 7010 + 7011 原样 + 零 uint 立方体 + 零 3D + 7014 原样 + 零二维数组 + 7012 立方体 + 7013 = 17
+    CHECK(g_tex_releases == releases + 17 && g_view_releases == view_releases + 17);
 }
 
 static void t_buf_mirror(void) {   // 池镜像：首次使用建一份、按页同步；没写过的页不重传；按使用点的先后保证 GPU 顺序

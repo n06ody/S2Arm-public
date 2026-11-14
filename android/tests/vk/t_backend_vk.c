@@ -4094,6 +4094,63 @@ static void c62_tsamp_cs(const char *dir) {
     nvn_gpu_shader_release(sh);
 }
 
+// P0-6（差距表）：≥6 层的方形二维数组被着色器当立方体读。6 层 4x4 R32F，第 k 层每个纹素 = k；立方体视图（6 层），
+// 按 +X -X +Y -Y +Z -Z 六个方向在面中心采样，期望读到面号 0 1 2 3 4 5（Vulkan 面序 = 层序）。
+// 修前后端只给 CUBEMAP / CUBEMAP_ARRAY 目标建立方体兼容的图，这种视图被拒（「cube view requested for a non-cube-compatible image」）。
+// 负对照：非方形（4x2）6 层二维数组不能当立方体，视图仍须被拒、不出句柄。
+static void cp06_cube_of_array(const char *dir) {
+    nvn_gpu_err e;
+    nvn_gpu_tex t = make_tex_target(4, 4, 6, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_R32F, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex nsq = make_tex_target(4, 2, 6, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_R32F, NVN_GPU_TEX_SAMPLED);
+    if (!t || !nsq) { if (t) nvn_gpu_tex_release(t); if (nsq) nvn_gpu_tex_release(nsq); return; }
+    nvn_gpu_cmd c = begin_cmd();
+    for (uint32_t k = 0; k < 6; k++) { float px[16]; for (int i = 0; i < 16; i++) px[i] = (float)k; nvn_gpu_tex_upload(c, t, 0, k, NULL, px, 16, 64); }
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r) && OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "P0-6 上传：%s", e.why);
+    view_t vv; memset(&vv, 0, sizeof vv);
+    vv.set_target = 1; vv.target = NVN_TEXTURE_TARGET_CUBEMAP; vv.set_layers = 1; vv.min_layer = 0; vv.nlayers = 6;
+    nvn_gpu_view bad = NULL; memset(&e, 0, sizeof e);
+    r = nvn_gpu_view_create(nsq, &vv, &bad, &e);
+    CHECK(!OK(r) && !bad, "P0-6 非方形二维数组的立方体视图：期望被拒 → rc=%d 句柄=%p", r.code, (void *)bad);
+    if (bad) nvn_gpu_view_release(bad);
+    nvn_gpu_view v = NULL; memset(&e, 0, sizeof e);
+    r = nvn_gpu_view_create(t, &vv, &v, &e);
+    CHECK(OK(r) && v, "P0-6 6 层方形二维数组的立方体视图：期望建成 → rc=%d %s", r.code, e.why);
+    if (v) {
+        samp_par sp; memset(&sp, 0, sizeof sp); sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE;
+        nvn_gpu_samp samp = NULL; CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &e)), "P0-6 采样器：%s", e.why);
+        nvn_gpu_layout_ent ents[3]; memset(ents, 0, sizeof ents);
+        ents[0].cls = NVN_GPU_RES_TEX_SAMP; ents[0].access = NVN_GPU_ACC_R; ents[0].binding = 0; ents[0].count = 1; ents[0].stages = 1u << NVN_GPU_SH_CS;
+        ents[1].cls = NVN_GPU_RES_SSBO; ents[1].access = NVN_GPU_ACC_R; ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_CS;
+        ents[2].cls = NVN_GPU_RES_SSBO; ents[2].access = NVN_GPU_ACC_W; ents[2].binding = 2; ents[2].count = 1; ents[2].stages = 1u << NVN_GPU_SH_CS;
+        nvn_gpu_layout cl; memset(&cl, 0, sizeof cl); cl.ent = ents; cl.nent = 3;
+        nvn_gpu_shader sh = NULL; nvn_gpu_pipe cp = mk_cpipe(dir, "cube_at.comp", &cl, &sh);
+        static const float dirs[6][4] = {{1, 0, 0, 0}, {-1, 0, 0, 0}, {0, 1, 0, 0}, {0, -1, 0, 0}, {0, 0, 1, 0}, {0, 0, -1, 0}};
+        nvn_gpu_buf in = make_buf(sizeof dirs, NVN_GPU_MEM_SHARED, dirs), out = make_buf(6 * 16, NVN_GPU_MEM_SHARED, NULL);
+        if (cp && samp) {
+            c = begin_cmd(); nvn_gpu_set_pipe(c, cp);
+            nvn_gpu_binding bs[3]; memset(bs, 0, sizeof bs);
+            bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_TEX_SAMP; bs[0].u.ts.view = v; bs[0].u.ts.samp = samp;
+            bs[1].ent = 1; bs[1].cls = NVN_GPU_RES_SSBO; bs[1].u.b.buf = in; bs[1].u.b.len = sizeof dirs;
+            bs[2].ent = 2; bs[2].cls = NVN_GPU_RES_SSBO; bs[2].u.b.buf = out; bs[2].u.b.len = 6 * 16;
+            nvn_gpu_bind(c, NVN_GPU_SH_CS, bs, 3); nvn_gpu_dispatch(c, cp, 6, 1, 1, NULL, 0);
+            r = nvn_gpu_cmd_commit(c, 2, on_done, NULL, &e);
+            CHECK(OK(r) && OK(nvn_gpu_fence_wait(2, 5000000000ull, &e)), "P0-6 采样：%s", e.why);
+            if (OK(r)) {
+                const float (*got)[4] = (const float (*)[4])(const void *)buf_cpu(out); int badf = 0;
+                for (int f = 0; f < 6; f++) if (got[f][0] != (float)f) badf++;
+                CHECK(!badf, "P0-6 立方体视图 ±X ±Y ±Z：期望面号 0 1 2 3 4 5 → 读到 %g %g %g %g %g %g", got[0][0], got[1][0], got[2][0], got[3][0], got[4][0], got[5][0]);
+                printf("P0-6 二维数组当立方体读：±X ±Y ±Z 期望 0 1 2 3 4 5 → 读到 %g %g %g %g %g %g\n", got[0][0], got[1][0], got[2][0], got[3][0], got[4][0], got[5][0]);
+            }
+        }
+        nvn_gpu_buf_release(in, NULL, NULL); nvn_gpu_buf_release(out, NULL, NULL);
+        if (sh) nvn_gpu_shader_release(sh);
+        if (samp) nvn_gpu_samp_release(samp);
+        nvn_gpu_view_release(v);
+    }
+    nvn_gpu_tex_release(t); nvn_gpu_tex_release(nsq);
+}
+
 // C63：描述符数组元素位。t[2] 绑定 elem0=红、elem1=绿，着色器取 t[1] → 全绿。
 // 若后端把 elem 当 0 写，elem1 会盖到元素 0、t[1] 留空——本例必红。
 static void c63_desc_array_elem(const char *dir) {
@@ -7245,6 +7302,9 @@ int main(int argc, char **argv) {
         c87_resolve_reject(k);
         CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C87 拒绝 close：%s", e18.why);
     }
+    if (!open_backend()) return 1;   // 自己一个会话：围栏号 1、2
+    cp06_cube_of_array(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "P0-6 close：%s", e18.why);
     if (!open_backend()) return 1;
     c74b_clear_rect_oob();
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C74b close：%d %s", e18.rc.code, e18.why);
