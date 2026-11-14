@@ -662,9 +662,10 @@ static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_c
     if (!has_v) memset(&v, 0, sizeof v);
     v.set_target = 1; v.target = (uint8_t)want;
     v.set_layers = 1; v.nlayers = (uint16_t)n;
-    // 非立方体存储（≥6 层的二维数组）当立方体读：iOS 能桥，Vulkan 要建图时带 CUBE_COMPATIBLE，后端还没接。
-    // 不把必被后端拒绝的视图交下去：记账（不静默）并绑声明类型的零贴图
-    if (cube && t.d.target != NVN_TEXTURE_TARGET_CUBEMAP && t.d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) {
+    // 非立方体存储（≥6 层的二维数组）当立方体读：同 iOS tex_fit 直接建立方体视图。后端给方形、≥6 层、单采样的二维数组建图时
+    // 带立方体兼容（P0-6），这种照交下去；别的（非方形等）Vulkan 建不了立方体兼容的图，必被后端拒绝：记账（不静默）并绑声明类型的零贴图
+    int cube_compat_array = t.d.target == NVN_TEXTURE_TARGET_2D_ARRAY && t.d.width == t.d.height && t.d.samples <= 1 && t.d.depth >= 6;
+    if (cube && t.d.target != NVN_TEXTURE_TARGET_CUBEMAP && t.d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && !cube_compat_array) {
         nvn_unimpl("tex", "cube_view_of_2d_array", NULL);
         return decl_zero(dtt, dcls, c);
     }

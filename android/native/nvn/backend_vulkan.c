@@ -76,6 +76,7 @@ struct nvn_gpu_tex_s {
     VkImageLayout layout;
     uint32_t w, h, depth, levels, layers, samples, nvn_format, target;
     int array_compatible;
+    int cube_compatible;   // P0-6：二维数组建图时带了 CUBE_COMPATIBLE（方形、≥6 层、单采样、设备收这个格式 / 用途 / 标志），可以建立方体（数组）视图
     int view_fmt, released, refs, bc_decoded;
     VkBuffer bc_sbuf; VkDeviceMemory bc_smem;   // bc_decoded 贴图的压缩原数据影子（GPU 缓冲，按级、按层 / 3D 切片、行紧排；见 bc_shadow_layout）
     uint8_t fb_sample;   // 同一通道里既当附件又被采样过（反馈环）：这张图以后当附件一律 GENERAL（见「图像布局」）
@@ -4538,6 +4539,18 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
             return fail(err, NVN_GPU_E_UNSUPPORTED, "设备不支持该格式/usage 的 %u 重采样贴图", samples);
     }
 
+    // P0-6：方形、≥6 层的二维数组可能被着色器当立方体读（同 iOS tex_fit 对二维数组底图建立方体视图）。Vulkan 的立方体视图要求
+    // 建图时带 CUBE_COMPATIBLE（宽 = 高、≥6 层）；先问设备这个格式 / 用途收不收这个标志，不收就不加（立方体视图照旧被拒、核心记账）。
+    int cube_compat = 0;
+    if (target == NVN_TEXTURE_TARGET_2D_ARRAY && layers >= 6 && d->d.width == d->d.height && samples == 1 && !bc_decoded) {
+        VkImageFormatProperties ip = {0};
+        VkImageCreateFlags flags = iflags | VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | ((d->usage & NVN_GPU_TEX_VIEW_FMT) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+        if (vkGetPhysicalDeviceImageFormatProperties(g.phys, fmt, itype, VK_IMAGE_TILING_OPTIMAL, usage, flags, &ip) == VK_SUCCESS &&
+            layers <= ip.maxArrayLayers && (uint32_t)d->d.width <= ip.maxExtent.width && levels <= ip.maxMipLevels) {
+            iflags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; cube_compat = 1;
+        }
+    }
+
     struct nvn_gpu_tex_s *t = calloc(1, sizeof *t);
     if (!t) return fail(err, NVN_GPU_E_OOM, "贴图结构分配失败");
     t->format = fmt;
@@ -4551,6 +4564,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     t->depth = depth;
     t->target = target;
     t->array_compatible = array_compat;
+    t->cube_compatible = cube_compat;
     t->samples = samples;
     t->nvn_format = (uint32_t)d->d.format;
     t->view_fmt = (d->usage & NVN_GPU_TEX_VIEW_FMT) != 0;
@@ -4692,8 +4706,21 @@ nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex th, const view_t *v, nvn_gpu_view *ou
             fmt = of;
         }
     }
+    // P0-6：立方体兼容的二维数组按立方体（数组）读。视图决策（与旧层共用）只把立方体目标的图当立方体兼容，这里按立方体数组目标问它；
+    // 层数要正好 6（立方体）或 6 的倍数（立方体数组），立方体数组视图还要 imageCubeArray。
+    uint32_t plan_target = t->target;
+    if (v && v->set_target && (v->target == NVN_TEXTURE_TARGET_CUBEMAP || v->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) &&
+        t->target == NVN_TEXTURE_TARGET_2D_ARRAY && t->cube_compatible) {
+        uint32_t nl = v->set_layers ? (v->nlayers ? v->nlayers : 1) : t->layers;
+        if (v->target == NVN_TEXTURE_TARGET_CUBEMAP ? nl != 6 : (nl % 6 != 0))
+            return fail(err, NVN_GPU_E_ARG, "二维数组当立方体%s读：层数 %u 不是 %s", v->target == NVN_TEXTURE_TARGET_CUBEMAP ? "" : "数组", nl,
+                        v->target == NVN_TEXTURE_TARGET_CUBEMAP ? "6" : "6 的倍数");
+        if (v->target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && !g.dev->core_features.imageCubeArray)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "二维数组当立方体数组读需要 imageCubeArray 设备特性（未启用）");
+        plan_target = NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    }
     struct nvn_vk_texview_plan plan;
-    nvn_vk_texview_plan_make(t->target, t->depth, t->layers, t->levels, v, 0, t->array_compatible, &plan);
+    nvn_vk_texview_plan_make(plan_target, t->depth, t->layers, t->levels, v, 0, t->array_compatible, &plan);
     if (!plan.ok) return fail(err, NVN_GPU_E_ARG, "%s", plan.why);
     base_level = plan.base_level; levels = plan.nlevels;
     base_layer = plan.base_layer; layers = plan.nlayers; type = plan.type;
