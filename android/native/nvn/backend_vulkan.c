@@ -164,6 +164,9 @@ struct nvn_gpu_cmd_s {
     struct bc_temp *bc_temps;
     int recording;
     int in_pass;
+    // 上一道全屏障之后录过「缓冲作目标」的传输：传输只在开头带屏障，绘制有渲染通道开头的外部依赖兜着，
+    // 计算派发没有，所以派发前按它补一道（开段置 1：前置段 / 上一段的传输写，段末那道屏障只对主机可见）
+    int xfer_dirty;
     nvn_gpu_rc sticky;
     char why[192];
     struct vk_ref *refs;
@@ -1890,6 +1893,7 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    c->xfer_dirty = 0;
 }
 
 
@@ -1917,6 +1921,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     full_barrier(c);
     VkBufferCopy bc = {sl.off, off, bytes};
     vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, 1, &bc);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
@@ -1935,6 +1940,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     if (bytes == 0) return;
     full_barrier(c);
     vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
@@ -1953,6 +1959,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
     vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -4171,6 +4178,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
 // 本段未实现的区域：一律粘滞 UNSUPPORTED / 返回 UNSUPPORTED，不空实现。
 #define VK_NOT_YET(c, name) set_sticky((c), NVN_GPU_E_UNSUPPORTED, name "：D8 第一段未实现（随后接通道 / 管线）")
 
+static int g_test_no_xfer_bar;   // 测试钩子 nvn_gpu_vk_test_xfer_barrier 置（文件末）
 void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, uint32_t z, nvn_gpu_buf ind, uint64_t off) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -4190,6 +4198,9 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
                            p->stage_push_off[NVN_GPU_SH_CS], p->stage_push_bytes[NVN_GPU_SH_CS],
                            c->push_data[NVN_GPU_SH_CS] + p->stage_push_off[NVN_GPU_SH_CS]);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipe);
+    // 之前录过缓冲作目标的传输（核心的池镜像同步、缓冲写 / 填 / 拷贝、贴图→缓冲）：契约说之后的读看到新值（nvn_backend.h buf_write），
+    // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
+    if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
     if (ind) {
         vkCmdDispatchIndirect(c->cb, ind->buffer, off);
         cmd_ref(c, ind, REF_BUF);
@@ -4979,6 +4990,7 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageOffset = o;
     bc.imageExtent = e;
     vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
     cmd_ref(c, b, REF_BUF);
@@ -5141,6 +5153,7 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){src + y * rp, off + y * row_bytes, packed_row};
     full_barrier(c);
     vkCmdCopyBuffer(c->cb, t->bc_sbuf, b->buffer, (uint32_t)bh, rg);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
@@ -5165,6 +5178,7 @@ static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, ui
     t->bc_sbuf = buf; t->bc_smem = mem;
     full_barrier(c);
     vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0);   // 没上传过的区域回读为零，不留上一块显存的旧内容
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     return 1;
 }
 
@@ -5279,6 +5293,7 @@ static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t
             for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){ss.off + y * packed_row, dst + y * sh_rp, packed_row};
             full_barrier(c);
             vkCmdCopyBuffer(c->cb, ss.buf->buffer, t->bc_sbuf, (uint32_t)bh, rg);
+            c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
             free(rg);
         }
         tmp = bc_temp_image(t, ext);
@@ -5372,10 +5387,12 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
         full_barrier(c);   // 源缓冲此前在本段里的写（如回读）对拷贝可见
         for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){boff + (uint64_t)z * slice_stride + y * row_bytes, ss.off + y * packed_row, packed_row};
         vkCmdCopyBuffer(c->cb, b->buffer, ss.buf->buffer, (uint32_t)bh, rg);
+        c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
         full_barrier(c);
         uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
         for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){ss.off + y * packed_row, dst + y * sh_rp, packed_row};
         vkCmdCopyBuffer(c->cb, ss.buf->buffer, t->bc_sbuf, (uint32_t)bh, rg);
+        c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
         struct bc_temp *tmp = bc_temp_image(t, ext);
         if (!tmp) { set_sticky(c, NVN_GPU_E_OOM, "缓冲 → BC 贴图：临时图分配失败"); break; }
         if (nvn_vk_bcdec_prepare(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, &tmp->rec, why, sizeof why) != 0) {
@@ -5617,6 +5634,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         return fail(err, NVN_GPU_E_DEVICE, "vkBeginCommandBuffer 失败");
     }
     c->recording = 1;
+    c->xfer_dirty = 1;   // 前置段 / 上一段的传输写：段末屏障只对主机可见，本段第一次派发前补一道
     c->sticky = rc(NVN_GPU_OK);
     c->q_active = -1;
     c->opt = nvn_plat_flag("nvk_opt_layout", 0) != 0;   // 附件 / 采样用对齐语义的布局（缺省 0 = 全 GENERAL 的旧行为）
@@ -5987,6 +6005,9 @@ void nvn_gpu_vk_test_delay_segment(uint64_t signal, uint32_t ms) {
     g.test_delay_ms = ms;
     pthread_mutex_unlock(&g_mu);
 }
+
+// 测试钩子（同步校验的检测器负控）：on = 0 时派发前不再按传输写补屏障，用来证明用例测得出缺屏障。只给测试用。
+void nvn_gpu_vk_test_xfer_barrier(int on) { g_test_no_xfer_bar = !on; }
 
 // 测试钩子（与 vk_clear 的 s2a_vk_clear_set_submit_fault 同一口径）：下一段 commit 按提交失败处理。
 void nvn_gpu_vk_test_set_fault(int mode) {

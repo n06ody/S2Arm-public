@@ -132,32 +132,44 @@ inc=(-I "$repo/android/tests/vkhost"
      -I "$repo/android/native/nvn"
      -I "$repo/android/native/direct"
      -I "$repo/runtime/include")
-# #978 游戏屏障对通道外的计算派发生效（真 rp_dispatch / rp_buf / 后端，开同步校验）：
-#   --dispatch-barrier      传输写 → 游戏屏障 → 派发读：读回 i*6，同步校验 0 条；
-#   --dispatch-barrier-neg  检测器负控：不发游戏屏障，同步校验必须报写后读冒险（原始日志不回显、只报条数，留在 build/978-tests/）。
-if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ]; then
+# 计算派发前的屏障（#978 与其跟帖；真 rp_dispatch / rp_buf / 后端，开同步校验；臂的含义见 t_replay_dispatch_barrier.c 文件头）：
+#   --dispatch-barrier      传输写 → 游戏屏障 → 派发：读回 i*6，同步校验 0 条；
+#   --dispatch-barrier-neg  检测器负控：测试钩子关掉后端派发前那道屏障、也不发游戏屏障，同步校验必须报写后读冒险；
+#   --xfer-dispatch         不发游戏屏障的四臂（none / resync / xseg / dd）：同步校验 0 条、读回 i*6，派发前后端自己补了屏障、连续派发之间 0 道。
+# 原始日志不回显、只报条数（容器会把日志里的校验报错当成失败），留在 build/978-tests/。
+if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] || [ "$mode" = "--xfer-dispatch" ]; then
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/bar_double.comp" -o "$out/shaders/bar_double.comp.spv"
     src=("$repo/android/tests/vk/t_replay_dispatch_barrier.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
-    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/dispatch-barrier"
-    arm=barrier; if [ "$mode" = "--dispatch-barrier-neg" ]; then arm=none; fi
-    set +e
-    VK_DRIVER_FILES="$icd" VK_LAYER_PATH="$layer" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 \
-        timeout 120 "$out/dispatch-barrier" "$out/shaders" "$arm" > "$out/db-log" 2>&1
-    rc=$?
-    set -e
-    mkdir -p "$repo/build/978-tests"; cp "$out/db-log" "$repo/build/978-tests/${mode#--}.log"
-    raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/db-log" || true)
-    other=$(grep -E 'Validation Error|VUID-|SYNC-HAZARD-' "$out/db-log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
-    grep -E '^(device: |dispatch-barrier )' "$out/db-log" || true
-    echo "同步校验：写后读冒险 $raw 条，其余报错 $other 条；rc=$rc"
-    grep -q '^device: llvmpipe' "$out/db-log" || { echo '【红】不是 lavapipe 设备' >&2; exit 1; }
-    if [ "$arm" = barrier ]; then
-        if [ "$rc" -ne 0 ] || [ "$raw" -ne 0 ] || [ "$other" -ne 0 ]; then echo '【红】传输写 → 游戏屏障 → 派发读：读回或同步校验不对' >&2; exit 1; fi
-        echo '【绿】传输写 → 游戏屏障 → 派发读：读回 i*6，同步校验 0 条'; exit 0
-    fi
-    if [ "$raw" -lt 1 ] || [ "$other" -ne 0 ]; then echo '【红】负控未击中：不发游戏屏障时同步校验没报写后读冒险' >&2; exit 1; fi
-    echo 'PASS: 负控：不发游戏屏障时同步校验报写后读冒险'; exit 0
+    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=vkGetDeviceProcAddr -lvulkan -lpthread -lm -o "$out/dispatch-barrier"
+    mkdir -p "$repo/build/978-tests"
+    db_red=0
+    db_arm() {   # $1 臂；$2 期望的写后读冒险：0 或 hit（≥1）；$3 额外的屏障数判据（awk 表达式，变量 before / between），可空
+        local arm=$1 want=$2 cond=${3:-} rc raw other line before between
+        set +e
+        VK_DRIVER_FILES="$icd" VK_LAYER_PATH="$layer" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 \
+            timeout 120 "$out/dispatch-barrier" "$out/shaders" "$arm" > "$out/db-$arm.log" 2>&1
+        rc=$?
+        set -e
+        cp "$out/db-$arm.log" "$repo/build/978-tests/$arm.log"
+        raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/db-$arm.log" || true)
+        other=$(grep -E 'Validation Error|VUID-|SYNC-HAZARD-' "$out/db-$arm.log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
+        line=$(grep '^dispatch-barrier ' "$out/db-$arm.log" || true)
+        before=$(printf '%s\n' "$line" | sed -n 's/.*barriers_before_dispatch=\([0-9]*\).*/\1/p'); between=$(printf '%s\n' "$line" | sed -n 's/.*barriers_between_dispatches=\([0-9]*\).*/\1/p')
+        echo "臂 ${arm}：写后读冒险 $raw 条、其余报错 $other 条、rc=${rc}；${line#dispatch-barrier }"
+        grep -q '^device: llvmpipe' "$out/db-$arm.log" || { echo "  【红】臂 $arm 不是 lavapipe 设备" >&2; db_red=1; return; }
+        if [ "$other" -ne 0 ] || [ -z "$line" ]; then echo "  【红】臂 ${arm}：其余报错或没跑完" >&2; db_red=1; return; fi
+        if [ "$want" = hit ]; then [ "$raw" -ge 1 ] || { echo "  【红】臂 ${arm}：负控未击中（同步校验没报写后读冒险）" >&2; db_red=1; }; return; fi
+        if [ "$rc" -ne 0 ] || [ "$raw" -ne 0 ]; then echo "  【红】臂 ${arm}：读回或同步校验不对" >&2; db_red=1; return; fi
+        if [ -n "$cond" ] && ! awk -v before="${before:-x}" -v between="${between:-x}" "BEGIN{exit !($cond)}"; then echo "  【红】臂 ${arm}：屏障数不符（要 ${cond}）" >&2; db_red=1; fi
+    }
+    case "$mode" in
+        --dispatch-barrier) db_arm barrier 0 ;;
+        --dispatch-barrier-neg) db_arm none-nobar hit 'before == 0' ;;
+        --xfer-dispatch) db_arm none 0 'before == 1'; db_arm resync 0 'before >= 2'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0' ;;
+    esac
+    if [ "$db_red" -ne 0 ]; then echo "【红】$mode" >&2; exit 1; fi
+    echo "【绿】$mode"; exit 0
 fi
 if [ "$mode" = "--shown-only" ]; then
     [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 Vulkan headers not staged' >&2; exit 2; }
