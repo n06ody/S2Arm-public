@@ -450,6 +450,7 @@ CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 #   那份 C 代码进了哪个平台的链，导出就在哪个平台接了线；原先只认 .cs 里的使用，这类导出一律被判「找不到调用方」
 DLSYM_SRC = re.compile(r'(\bdlsym\s*\([^,()]*,\s*)"([A-Za-z_]\w*)"')   # 原文里的形态（corpus 在去掉字符串之前换成标记）
 DLSYM = re.compile(r"\bS2A_DLSYM__([A-Za-z_]\w*)")
+C_CALLER_SUFFIXES = (".c", ".cc", ".cpp", ".m", ".mm")   # 直接调 C# 导出算接线的调用方文件（C 系；.cs 另走使用形）
 USE = [re.compile(r"\bnew\s+([A-Za-z_]\w*)"),
        re.compile(r":\s*([A-Za-z_]\w*)\b"),
        re.compile(r"\b([A-Za-z_]\w*)\s*\."),
@@ -497,6 +498,9 @@ def wired_of(mod, syms, has_main, linked, prod_calls, prod_uses, test_calls):
                  if not_self(f) and (mod["kind"] not in ("service-cs", "gfx-csproj") or f.endswith(".cs"))]
         if mod["kind"] in ("service-cs", "gfx-csproj"):   # C# 导出被平台可调到的 C 代码按名字 dlsym 取：算接线（不限 .cs）
             hits += [f"{f}:{n}" for f, n in prod_calls.get("dlsym:" + s, []) if not_self(f)]
+            # 平台可调到的 C 代码直接（链接期弱引用）调这个导出：也算接线。安卓把服务层静态并入同一个库（--exclude-libs,ALL），
+            #   dlsym 恒为 NULL、core-link 审计拦按名取隐藏导出，那里唯一取得到的就是这种形态（nvn2.c 的 S2A_CameraSessionOpen）
+            hits += [f"{f}:{n}" for f, n in prod_calls.get(s, []) if not_self(f) and f.endswith(C_CALLER_SUFFIXES)]
         thits += [f for f, _n in test_calls.get(s, []) if not_self(f)]
     hits = sorted(set(hits))
     if hits:

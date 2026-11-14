@@ -136,6 +136,16 @@ ck "服务层只有导出名、没人取 → 红（rc=${r}）" '[ $r != 0 ] && e
 echo 'int y(void){ unsigned (*f)(void) = (unsigned (*)(void))dlsym(RTLD_DEFAULT, "S2A_TestExportOpen"); return f ? (int)f() : 0; }' >> "$R/android/native/caller.c"
 o=$(run --check); r=$?
 ck "安卓链上的 C 代码 dlsym 取导出名 → 算接线、不再红（前一场景的 late.c 还在，只看 Exported）" '! echo "$o" | grep "【红】" | grep -q Exported'
+sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"
+# 同一个导出，安卓链上的 C 代码按链接期弱引用直接调（安卓单库里唯一取得到的方式：--exclude-libs,ALL 下 dlsym 恒为 NULL，
+#   core-link 审计拦按名取隐藏导出）→ 也算接线；负对照：同样的调用放在只有苹果编的分支里 → 安卓侧不算，仍红
+printf '%s\n' '#if defined(__APPLE__)' 'extern unsigned S2A_TestExportOpen(void) __attribute__((weak));' 'int z(void){ return S2A_TestExportOpen ? (int)S2A_TestExportOpen() : 0; }' '#endif' >> "$R/android/native/caller.c"
+o=$(run --check); r=$?
+ck "负对照：直接调用只在苹果分支里 → 安卓仍红（rc=${r}）" '[ $r != 0 ] && echo "$o" | grep "【红】" | grep -q Exported'
+sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"; sed_edit '/^#if defined(__APPLE__)$/d' "$R/android/native/caller.c"; sed_edit '/^#endif$/d' "$R/android/native/caller.c"
+printf '%s\n' 'extern unsigned S2A_TestExportOpen(void) __attribute__((weak));' 'int z(void){ return S2A_TestExportOpen ? (int)S2A_TestExportOpen() : 0; }' >> "$R/android/native/caller.c"
+o=$(run --check); r=$?
+ck "安卓链上的 C 代码弱引用直接调导出 → 算接线、不再红" '! echo "$o" | grep "【红】" | grep -q Exported'
 rm "$R/services/S2A.Services/Exported.cs"; sed_edit '/S2A_TestExportOpen/d' "$R/android/native/caller.c"
 
 # 把 oldgap 接上：进 core 名单 + 安卓调用方 → 缺口收窄 → 基线条目变旧 → 【黄】但绿
