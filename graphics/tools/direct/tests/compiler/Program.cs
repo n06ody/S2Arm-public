@@ -732,6 +732,39 @@ internal static unsafe class Program
             }
         }
 
+        // 句柄在游戏自己的 UBO 里（认领 #999）：LDC Rh, c[4][off]; TEX.B Rd, Rcoord, Rh。真实编译器、真实 BindlessElimination。
+        //   A：字偏移 8（字节 0x20）正好等于组合槽 0 的句柄位置（8 + 2 × 槽）。请求只带运行时照常给的组合槽事实（handle 8 / cbufSlot −1）。
+        //      这个句柄来自 c4、不是 c2 句柄表，不许当成组合槽 0 绑——修前「同 handle 事实回退」放行，绑到组合槽 0，读错图还不报。
+        //   B：字节 0x400（字偏移 256，和组合区不重叠），请求带精确事实（handle 256 / cbufSlot 4）。修前在 ResolvePoolSlots 报
+        //      UNSUPPORTED_PROGRAM「texture handle from cbuf slot 4」；期望编出一个贴图绑定，来源写明 cbuf 4、字节 0x400
+        //      （字段名按方案暂用 uboSlot / uboOffset，同存储绑定的现有写法；以维护方定的合同为准）。
+        {
+            byte[] fsUboA = Guest(true, new[] { Ldc(4, 0x20, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            const string comboFact = "[{\"stage\":\"fs\",\"handle\":8,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            string misbind = "";
+            try
+            {
+                using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "ubo-handle-a", vs, fsUboA, textureFacts: comboFact, fsCbUse: 1u << 4)));
+                foreach (var b in r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray())
+                    if (b.GetProperty("kind").GetString() == "texture" && !b.TryGetProperty("uboSlot", out _)) misbind += b.GetRawText();
+            }
+            catch (DirectCompileException) { }
+            Check(misbind.Length == 0, "c4 handle at word 8 is not bound as combined texture slot 0: " + misbind);
+
+            byte[] fsUboB = Guest(true, new[] { Ldc(4, 0x400, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            const string uboFact = "[{\"stage\":\"fs\",\"handle\":256,\"cbufSlot\":4,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            string got;
+            try
+            {
+                using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "ubo-handle-b", vs, fsUboB, textureFacts: uboFact, fsCbUse: 1u << 4)));
+                var tex = r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray().Where(b => b.GetProperty("kind").GetString() == "texture").ToArray();
+                got = tex.Length == 1 && tex[0].TryGetProperty("uboSlot", out var us) && tex[0].TryGetProperty("uboOffset", out var uo) && us.GetInt32() == 4 && uo.GetInt32() == 0x400
+                    ? "ok" : "bindings " + string.Join(",", tex.Select(b => b.GetRawText()));
+            }
+            catch (DirectCompileException error) { got = error.Code + " " + error.Message; }
+            Check(got == "ok", "c4 handle at byte 0x400 compiles to one texture binding sourced from cbuf 4 offset 0x400: " + got);
+        }
+
         // 1) 接口全覆盖（接口新增方法时这里先红）。
         var interfaceMethods = typeof(IGpuAccessor).GetMethods().Where(m => m.DeclaringType == typeof(IGpuAccessor)).ToList();
         var classMethods = typeof(DirectGpuAccessor).GetMethods().Where(m => m.DeclaringType == typeof(DirectGpuAccessor))
