@@ -157,6 +157,11 @@ HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with
 
 #include "nvn_obj.h"
 #include "nvn_nvx.h"
+// 一次性探针（探针分支）：宿主写客体内存 / 虚拟池地址段与别名记进探针表（定义在 runtime/src/crash_android_fatal.inc；只安卓链进来，别处用下面的弱缺省空定义）
+__attribute__((weak)) void s2a_probe_gw_note(uint64_t addr, uint64_t len, unsigned src) { (void)addr; (void)len; (void)src; }   // 缺省空；安卓 crash.c 的强定义盖过它
+__attribute__((weak)) void s2a_probe_pool_note(uint64_t addr, uint64_t size, uint64_t src, unsigned kind, int on) { (void)addr; (void)size; (void)src; (void)kind; (void)on; }
+#define S2A_PROBE_GW(a, n, s) do { s2a_probe_gw_note((uint64_t)(uintptr_t)(a), (uint64_t)(n), (s)); } while (0)
+#define S2A_PROBE_POOL(a, n, src, k, on) do { s2a_probe_pool_note((uint64_t)(uintptr_t)(a), (uint64_t)(n), (uint64_t)(uintptr_t)(src), (k), (on)); } while (0)
 
 // ---------- Device ----------
 NVN(nvnDeviceBuilderSetDefaults, void, NVNdeviceBuilder *b) { memset(b, 0, sizeof(dev_builder_x)); }   // 连 NVX 预留区间一起清（nvn_nvx.h）
@@ -4007,12 +4012,14 @@ static uint8_t *vpool_reserve(const pool_t *o) {   // → the reserved range of 
         if (a != MAP_FAILED) LOG("[nvn] virtual pool %p: %#llx bytes of address space not available (errno %d), reserving %#llx instead", (const void *)o, (unsigned long long)want, er, (unsigned long long)len); }
     if (a == MAP_FAILED) { LOG("【红】 virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
     vpool_new(o, a, len); vp_lock(); size_t live = g_nvpa; vp_unlock();
+    S2A_PROBE_POOL(a, len, 0, 2, 1);
     static _Atomic uint64_t n; uint64_t k = atomic_fetch_add(&n, 1) + 1;   // a UE4 game makes one per streamed texture: the first ones and every 1000th
     if (k <= 8 || k % 1000 == 0) LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): own address range %p+%#llx, physical pages are remapped into it (%llu so far, %zu alive)", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len, (unsigned long long)k, live);
     return a;
 }
 static void vpool_release(const pool_t *o) {
     vp_lock(); struct vpool *v = vpool_of(o);
+    if (v) S2A_PROBE_POOL(v->base, v->len, 0, 2, 0);
     if (v) { vpool_unpublish(v);
         for (int k = 0; k < v->nrun; k++) nvn_be_pool_del(v->base + v->run[k].lo); vpool_unmap_range(v->base, v->len);
 #if defined(__ANDROID__)
@@ -4068,6 +4075,7 @@ static void vsh_fill(struct vpool *v, int i, uint64_t pg) {   // protect the phy
     for (uint64_t o = 0; o < pg; o += 0x1000) { const vpte *e = s->off + o < v->size ? vpt_get(v, s->off + o) : NULL; if (e && e->phys) nvn_dirty_protect(e->phys, 0x1000); }
     s->stamp = nvn_dirty_now();
     for (uint64_t o = 0; o < pg; o += 0x1000) { const vpte *e = s->off + o < v->size ? vpt_get(v, s->off + o) : NULL; if (e && e->phys) memcpy(d + o, e->phys, 0x1000); else memset(d + o, 0, 0x1000); }
+    S2A_PROBE_GW(d, pg, 7);
 }
 static int vsh_make(struct vpool *v, uint64_t off, uint64_t pg) {   // the host page at off becomes a copy (its run is the caller's: vrun_set)
     if (vsh_find(v, off) >= 0) return 1;
@@ -4192,6 +4200,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
         return 0;
     }
 #endif
+    S2A_PROBE_POOL(to, r->size, from, 3, 1);
     mprotect((void *)to, r->size, PROT_READ | PROT_WRITE);   // the source may be write-protected by the dirty tracker at this moment; the alias itself is plain memory
     vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 1);
     uint64_t end = (uint64_t)r->voff + r->size;

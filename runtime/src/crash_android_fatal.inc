@@ -159,6 +159,115 @@ static void s2a_w_dec(s2a_w_t *w, unsigned v) {
     do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v && n < (int)sizeof t);
     while (n) s2a_w_ch(w, t[--n]);
 }
+
+// ===== 一次性探针（只在探针分支，不进 PR）：宿主写客体内存的最近记录 + 已登记内存池 =====
+// 写入方（回放落地 / 缓冲命令 / 计数器与事件 / 虚拟池拷页 / 背板打洞）各调一次 s2a_probe_gw_note；内存池登记 / 撤销调 s2a_probe_pool_note。
+// 无锁环：下标原子递增，写完字段再写 seq（release）；致命信号里只读，seq 前后不一致的条目跳过。
+#include <stdatomic.h>
+#include <time.h>
+#define S2A_PGW_N 512u
+#define S2A_PPOOL_N 2048u
+typedef struct { _Atomic uint64_t seq; uint64_t addr, len, ms; uint32_t src, tid; } s2a_pgw_t;
+typedef struct { _Atomic uint64_t addr; uint64_t size, src; uint32_t kind; } s2a_ppool_t;
+static s2a_pgw_t s2a_pgw[S2A_PGW_N];
+static _Atomic uint64_t s2a_pgw_next;
+static s2a_ppool_t s2a_ppool[S2A_PPOOL_N];
+static const char *const s2a_pgw_src[] = {"?", "land", "update_ub", "copy_b2b", "clear_buf", "report", "event", "vpool_copy", "punch"};
+static const char *const s2a_ppool_kind[] = {"?", "pool", "vpool", "valias"};
+static uint32_t s2a_probe_tid(void) {
+#if defined(__linux__)
+    return (uint32_t)syscall(SYS_gettid);
+#else
+    return 0;
+#endif
+}
+void s2a_probe_gw_note(uint64_t addr, uint64_t len, unsigned src) {
+    uint64_t i = atomic_fetch_add_explicit(&s2a_pgw_next, 1, memory_order_relaxed);
+    s2a_pgw_t *e = &s2a_pgw[i % S2A_PGW_N];
+    atomic_store_explicit(&e->seq, 0, memory_order_relaxed);
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    e->addr = addr; e->len = len; e->src = src; e->tid = s2a_probe_tid();
+    e->ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    atomic_store_explicit(&e->seq, i + 1, memory_order_release);
+}
+// kind：1 = NVN 内存池，2 = 虚拟池自己的地址段，3 = 虚拟池别名（src = 映入的源地址）；on = 0 撤销同起点那项
+void s2a_probe_pool_note(uint64_t addr, uint64_t size, uint64_t src, unsigned kind, int on) {
+    if (!addr) return;
+    for (unsigned i = 0; i < S2A_PPOOL_N; i++) {
+        s2a_ppool_t *p = &s2a_ppool[i];
+        if (on) {
+            uint64_t z = 0;
+            if (!atomic_compare_exchange_strong(&p->addr, &z, addr)) continue;
+            p->size = size; p->src = src; p->kind = kind; return;
+        }
+        if (atomic_load(&p->addr) == addr && p->kind == kind) { p->size = 0; p->kind = 0; atomic_store(&p->addr, 0); return; }
+    }
+}
+static int s2a_probe_hit(uint64_t a0, uint64_t n0, uint64_t lo, uint64_t hi) { return a0 < hi && lo < a0 + n0; }
+static void s2a_probe_w_ent(s2a_w_t *w, const s2a_pgw_t *e, uint64_t seq, uint64_t next, uint64_t now) {
+    s2a_w_ch(w, ' '); s2a_w_raw(w, e->src < sizeof s2a_pgw_src / sizeof *s2a_pgw_src ? s2a_pgw_src[e->src] : "?");
+    s2a_w_ch(w, '@'); s2a_w_hex(w, e->addr); s2a_w_ch(w, '+'); s2a_w_hex(w, e->len);
+    s2a_w_raw(w, " -"); s2a_w_dec(w, (unsigned)(next - seq)); s2a_w_raw(w, "写 -"); s2a_w_dec(w, (unsigned)(now > e->ms ? now - e->ms : 0));
+    s2a_w_raw(w, "ms t"); s2a_w_dec(w, e->tid);
+}
+// 一行：每个关注地址 → 所在池 + 与 [r-0x200, r+0x200) 相交的写记录；再打最近 16 条写记录
+void s2a_probe_gw_line(int fd, const uint64_t *regs, const char *const *names, int nr) {
+    static char buf[8192];
+    s2a_w_t w = {buf, 0, sizeof buf};
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    uint64_t next = atomic_load_explicit(&s2a_pgw_next, memory_order_acquire);
+    s2a_w_raw(&w, "[s2a] probe gw: 写记录共 "); s2a_w_dec(&w, (unsigned)next);
+    for (int r = 0; r < nr; r++) {
+        uint64_t a = regs[r], lo = a > 0x200 ? a - 0x200 : 0, hi = a + 0x200;
+        s2a_w_raw(&w, " | "); s2a_w_raw(&w, names[r]); s2a_w_ch(&w, '='); s2a_w_hex(&w, a); s2a_w_raw(&w, " 池:");
+        int inpool = 0;
+        for (unsigned i = 0; i < S2A_PPOOL_N; i++) {
+            uint64_t pa = atomic_load(&s2a_ppool[i].addr), ps = s2a_ppool[i].size; unsigned k = s2a_ppool[i].kind;
+            if (!pa || !ps) continue;
+            int in = a >= pa && a < pa + ps, insrc = k == 3 && a >= s2a_ppool[i].src && a < s2a_ppool[i].src + ps;
+            if (!in && !insrc) continue;
+            inpool = 1; s2a_w_ch(&w, ' '); s2a_w_raw(&w, k < 4 ? s2a_ppool_kind[k] : "?"); s2a_w_raw(&w, insrc ? "源" : "");
+            s2a_w_ch(&w, '@'); s2a_w_hex(&w, pa); s2a_w_ch(&w, '+'); s2a_w_hex(&w, ps);
+        }
+        if (!inpool) s2a_w_raw(&w, " 无");
+        s2a_w_raw(&w, " 相交:");
+        int hits = 0;
+        uint64_t first = next > S2A_PGW_N ? next - S2A_PGW_N : 0;
+        for (uint64_t q = next; q > first && hits < 12; q--) {
+            const s2a_pgw_t *e = &s2a_pgw[(q - 1) % S2A_PGW_N];
+            uint64_t s1 = atomic_load_explicit(&e->seq, memory_order_acquire);
+            s2a_pgw_t c = {0}; c.addr = e->addr; c.len = e->len; c.ms = e->ms; c.src = e->src; c.tid = e->tid;
+            if (s1 != q || atomic_load_explicit(&e->seq, memory_order_acquire) != s1) continue;
+            if (!s2a_probe_hit(c.addr, c.len, lo, hi)) continue;
+            s2a_probe_w_ent(&w, &c, s1, next, now); hits++;
+        }
+        if (!hits) s2a_w_raw(&w, " 无");
+    }
+    s2a_w_raw(&w, " | 最近:");
+    for (uint64_t q = next, k = 0; q > 0 && k < 16; q--, k++) {
+        const s2a_pgw_t *e = &s2a_pgw[(q - 1) % S2A_PGW_N];
+        uint64_t s1 = atomic_load_explicit(&e->seq, memory_order_acquire);
+        s2a_pgw_t c = {0}; c.addr = e->addr; c.len = e->len; c.ms = e->ms; c.src = e->src; c.tid = e->tid;
+        if (s1 != q || atomic_load_explicit(&e->seq, memory_order_acquire) != s1) continue;
+        s2a_probe_w_ent(&w, &c, s1, next, now);
+    }
+    s2a_w_ch(&w, '\n');
+    ssize_t ignored = write(fd, buf, w.n); (void)ignored;
+}
+// 致命现场：这次崩溃里元素 x0、父对象 x20、链表头 x21、邻块 x24，外加 x19 / 故障地址
+static void s2a_probe_gw_fatal(int fd, const void *context, uintptr_t addr) {
+#if defined(__aarch64__) && !defined(__APPLE__)
+    if (!context) return;
+    const ucontext_t *u = context;
+    uint64_t regs[6] = {u->uc_mcontext.regs[0], u->uc_mcontext.regs[19], u->uc_mcontext.regs[20], u->uc_mcontext.regs[21], u->uc_mcontext.regs[24], (uint64_t)addr};
+    static const char *const names[6] = {"x0", "x19", "x20", "x21", "x24", "addr"};
+    s2a_probe_gw_line(fd, regs, names, 6);
+#else
+    (void)fd; (void)context; (void)addr;
+#endif
+}
+
 // 「模块名+库内偏移」：path 字段取最后 '/' 之后做模块名（addr2line -e lib.so 可直接用）。
 //   img = a 所在 ELF 映像的首段（s2a_maps_image）：偏移 = a - 首段 lo + (首段 off - 库在容器内
 //   的 data offset)。容器内嵌库（base.apk!/lib/… 这类 '!' 路径）的 data offset = 映像首段
@@ -357,6 +466,7 @@ static void s2a_android_fatal(int sig, const siginfo_t *si, uintptr_t pc, uintpt
     if (!s2a_android_fatal_dup(sig, addr, pc)) {
         size_t ml = s2a_maps_refresh();
         s2a_android_fatal_line(sig, addr, pc, sp, old != NULL, s2a_fatal_ctx_fp(context), s2a_maps_buf, ml);
+        s2a_probe_gw_fatal(g_s2a_logfd, context, addr);   // 一次性探针
     }
     if (old) { s2a_android_fatal_chain(sig, old, si, context); return; }
     // 没有可链回的处理器（旧处置缺省 / 忽略）：恢复旧处置重放 / 重投，与现行一致

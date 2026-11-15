@@ -21,6 +21,9 @@ void rp_shader_reset(void);            // 着色器来源（核心外）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+// 一次性探针（探针分支）：内存池登记 / 撤销记进探针池表（定义在 runtime/src/crash_android_fatal.inc）
+__attribute__((weak)) void s2a_probe_pool_note(uint64_t addr, uint64_t size, uint64_t src, unsigned kind, int on) { (void)addr; (void)size; (void)src; (void)kind; (void)on; }
+#define S2A_PROBE_POOL(a, n, src, k, on) do { s2a_probe_pool_note((uint64_t)(uintptr_t)(a), (uint64_t)(n), (uint64_t)(uintptr_t)(src), (k), (on)); } while (0)
 
 #define UN(name) nvn_unimpl("be", name, __builtin_return_address(0))
 
@@ -79,6 +82,7 @@ void nvn_be_pool_add(const void *mem, uint64_t size) {
         g_pool[at] = (__typeof__(g_pool[0])){mem, size};
         g_npool++;
         __atomic_add_fetch(&g_pool_epoch, 1, __ATOMIC_RELEASE);
+        S2A_PROBE_POOL(mem, size, 0, 1, 1);
     }
     else { pthread_mutex_unlock(&g_mu); nvn_unimpl("limit", "pool_table_full_4096", mem); return; }
     pthread_mutex_unlock(&g_mu);
@@ -89,6 +93,7 @@ void nvn_be_pool_del(const void *mem) {
         memmove(&g_pool[i], &g_pool[i + 1], (size_t)(g_npool - i - 1) * sizeof g_pool[0]);
         g_npool--;
         __atomic_add_fetch(&g_pool_epoch, 1, __ATOMIC_RELEASE);
+        S2A_PROBE_POOL(mem, 0, 0, 1, 0);
         break; }
     pthread_mutex_unlock(&g_mu);
     rp_buf_pool_gone(mem);

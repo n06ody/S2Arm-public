@@ -28,6 +28,8 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #endif
+// 一次性探针（探针分支）：缺省空；安卓 crash.c 的强定义盖过它（两个平台都要有声明）
+__attribute__((weak)) void s2a_probe_gw_note(uint64_t addr, uint64_t len, unsigned src) { (void)addr; (void)len; (void)src; }
 
 #define HPG 0x4000ull                 // 宿主页
 // HPG groups the 4K guest bitmap; protection syscalls use the real host page.
@@ -1118,6 +1120,7 @@ static int backing_punch_timed(int kind, uint64_t a, size_t n, int *deferred) {
     int error = plat_backing_punch(a, n, deferred);
     uint64_t elapsed = backing_punch_now_ns() - start;
     if (!error && !*deferred) {
+        s2a_probe_gw_note(a, n, 8);   // 一次性探针：打洞 = 宿主把这段清零
         atomic_fetch_add(&g_backing_punch_count[kind], 1);
         atomic_fetch_add(&g_backing_punch_ns[kind], elapsed);
     }

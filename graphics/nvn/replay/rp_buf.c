@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+// 一次性探针（探针分支）：宿主写客体内存记一笔，定义在 runtime/src/crash_android_fatal.inc（只安卓链进来；别处用下面的弱缺省空定义）
+__attribute__((weak)) void s2a_probe_gw_note(uint64_t addr, uint64_t len, unsigned src) { (void)addr; (void)len; (void)src; }   // 缺省空；安卓 crash.c 的强定义盖过它
+#define S2A_PROBE_GW(a, n, s) do { s2a_probe_gw_note((uint64_t)(uintptr_t)(a), (uint64_t)(n), (s)); } while (0)
 
 struct gpu_write { uint64_t off, len, id; uint8_t mi; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
@@ -145,7 +148,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
         break; }
     pthread_mutex_unlock(&g_bmu);
     if (!s) return;
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
+    if (src) { memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len); S2A_PROBE_GW(mem + off, len, 1); }   // 游戏内存是真值：GPU 的结果回到它那里
     pthread_mutex_lock(&g_bmu);
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
     s->landing--;
@@ -286,18 +289,18 @@ void rp_op_update_ub(const void *a, const void *rec) {
     uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
     if (!n) return;
     if (!in_pool(d, n)) { nvn_unimpl("buf", "update_outside_pools", rec); return; }
-    memcpy((void *)(uintptr_t)d, (const uint8_t *)a + 16, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
+    memcpy((void *)(uintptr_t)d, (const uint8_t *)a + 16, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n); S2A_PROBE_GW(d, n, 2);
 }
 void rp_op_copy_b2b(const void *a, const void *rec) {
     uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
     if (!n) return;
     if (!in_pool(s, n) || !in_pool(d, n)) { nvn_unimpl("buf", "copy_outside_pools", rec); return; }
-    memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
+    memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n); S2A_PROBE_GW(d, n, 3);
 }
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec) {   // 32 位样式填充（不是按字节）
     if (!cb->size) return;
     if (!in_pool(cb->addr, cb->size)) { nvn_unimpl("buf", "clear_outside_pools", rec); return; }
-    uint8_t *p = (uint8_t *)(uintptr_t)cb->addr; uint64_t n = cb->size, i = 0; rp_cpu_write_gen++; rp_write_note(cb->addr, cb->size);
+    uint8_t *p = (uint8_t *)(uintptr_t)cb->addr; uint64_t n = cb->size, i = 0; rp_cpu_write_gen++; rp_write_note(cb->addr, cb->size); S2A_PROBE_GW(cb->addr, cb->size, 4);
     for (; i + 4 <= n; i += 4) memcpy(p + i, &cb->value, 4);
     if (i < n) memcpy(p + i, &cb->value, (size_t)(n - i));
 }

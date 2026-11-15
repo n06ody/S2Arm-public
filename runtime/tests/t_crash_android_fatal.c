@@ -350,6 +350,34 @@ static void check_signal(int sig, int ws, const char *what) {
     eq(what, sig, WIFSIGNALED(ws) ? WTERMSIG(ws) : -1);
 }
 
+// 一次性探针（探针分支）：写记录与池表 → 致命现场一行；相交 / 不相交 / 池内 / 别名源 / 环绕
+static void probe_line(char *out, size_t cap, const uint64_t *regs, const char *const *names, int nr) {
+    int pf[2]; if (pipe(pf)) { out[0] = 0; return; }
+    s2a_probe_gw_line(pf[1], regs, names, nr); close(pf[1]);
+    ssize_t k = read(pf[0], out, cap - 1); out[k > 0 ? k : 0] = 0; close(pf[0]);
+}
+static void probe_case(char *out, size_t cap) {
+    s2a_probe_pool_note(0x10f7000000, 0x1000000, 0, 1, 1);           // 一个池
+    s2a_probe_pool_note(0x7398000000, 0x10000, 0x10ed720000, 3, 1);  // 虚拟池别名：源是游戏堆里的 0x10ed720000
+    s2a_probe_gw_note(0x10ed724960, 0x40, 2);                        // 压到元素
+    for (int i = 0; i < 600; i++) s2a_probe_gw_note(0x5000000 + (uint64_t)i * 0x1000, 0x10, 4);   // 远处，且转过一圈：最早的那条被冲掉
+    s2a_probe_gw_note(0x10f7233c00, 0x20, 1);                        // 压到父对象
+    uint64_t regs[3] = {0x10ed724970, 0x10f7233c40, 0x2000000000};
+    const char *const names[3] = {"x0", "x20", "x24"};
+    probe_line(out, cap, regs, names, 3);
+    eq("探针：总写数", 1, strstr(out, "写记录共 602") != NULL);
+    eq("探针：转过一圈后压到元素的那条已冲掉（x0 相交 无）", 1, strstr(out, "x0=00000010ed724970 池: valias源@0000007398000000+0000000000010000 相交: 无") != NULL);
+    eq("探针：父对象在池内且相交落地写", 1, strstr(out, "x20=00000010f7233c40 池: pool@00000010f7000000+0000000001000000 相交: land@00000010f7233c00+0000000000000020 -0写") != NULL);
+    eq("探针：远处地址不在池、不相交（负对照）", 1, strstr(out, "x24=0000002000000000 池: 无 相交: 无") != NULL);
+    eq("探针：最近 16 条", 16, count_str(strstr(out, "| 最近:") ? strstr(out, "| 最近:") : "", " clear_buf@") + count_str(strstr(out, "| 最近:") ? strstr(out, "| 最近:") : "", " land@"));
+    s2a_probe_gw_note(0x10ed724968, 0x10, 3);                        // 再压元素一次：这回在环里
+    probe_line(out, cap, regs, names, 3);
+    eq("探针：元素相交 copy_b2b", 1, strstr(out, "x0=00000010ed724970 池: valias源@0000007398000000+0000000000010000 相交: copy_b2b@00000010ed724968+0000000000000010 -0写") != NULL);
+    s2a_probe_pool_note(0x10f7000000, 0, 0, 1, 0);                   // 池撤销后不再算池内
+    probe_line(out, cap, regs, names, 3);
+    eq("探针：池撤销后父对象不在池", 1, strstr(out, "x20=00000010f7233c40 池: 无") != NULL);
+}
+
 int main(void) {
     static char out[8192];
     // ① SIGABRT：abort() 必须按 SIGABRT 终止，不是 exit(134)；无旧处置可链 → 行尾无 chained
@@ -514,6 +542,7 @@ int main(void) {
     emit_line(out, sizeof out, 0x7000023040, 0, (uint64_t)&g_chain[0], mapsbuf, ml);
     eq("㉒ inode 不同不合并：pc 按本段起算", 1, strstr(out, " mod=libgame.so+000000000000c040") != NULL);
     eq("㉒ inode 不同不合并：无映像口径偏移", 0, count_str(out, "+0000000000023040"));
+    probe_case(out, sizeof out);
     if (bad) { printf("✗ t_crash_android_fatal：%d/%d 项不符\n", bad, n); return 1; }
     printf("✓ t_crash_android_fatal：%d 项全符（fatal 行写出；abort / 空指针写 / 异步 raise / kill 按原信号终止；原处理器链回；链回后本库处置仍在位；同址重复行压制；pc 改写 / SIG_DFL 返回 / 单参 / 掩码替身全覆盖；先装本库 handler 不自环；帧链已知深度 / 坏 x29 / 未映射页 / 16 上限 / maps 读不到降级；裂映像合并回库内偏移 / offset 断与 inode 异不合并全覆盖）\n", n);
     return 0;

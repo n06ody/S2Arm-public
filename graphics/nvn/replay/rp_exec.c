@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+// 一次性探针（探针分支）：宿主写客体内存记一笔，定义在 runtime/src/crash_android_fatal.inc（只安卓链进来；别处用下面的弱缺省空定义）
+__attribute__((weak)) void s2a_probe_gw_note(uint64_t addr, uint64_t len, unsigned src) { (void)addr; (void)len; (void)src; }   // 缺省空；安卓 crash.c 的强定义盖过它
+#define S2A_PROBE_GW(a, n, s) do { s2a_probe_gw_note((uint64_t)(uintptr_t)(a), (uint64_t)(n), (s)); } while (0)
 
 void nvn_hle_queue_enter(void *q);   // hle_nvn.c
 void nvn_hle_piece_begun(void);
@@ -116,7 +119,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
                 // 其余管线统计类计数值写 0（同 nvn_mtl.m 提交完成回调里的写法）。同一段里的多条报告现在拿到同一个时间：按报告所在位置给 GPU 时间要后端出段内时间戳，没接。
                 // 条件渲染开着时时间戳类的计数值也写 0，同真机（游戏拿两条报告的计数值做条件，见 rc_value）
                 uint64_t t = s2a_guest_tick(), rec[2] = {(s->p[i].type == NVN_COUNTER_TYPE_TIMESTAMP || s->p[i].type == NVN_COUNTER_TYPE_TIMESTAMP_TOP) && !s2a_nvn_render_cond() ? t : 0, t};
-                memcpy((void *)(uintptr_t)s->p[i].report, rec, sizeof rec);
+                memcpy((void *)(uintptr_t)s->p[i].report, rec, sizeof rec); S2A_PROBE_GW(s->p[i].report, sizeof rec, 5);
                 continue;
             }
             if (s->p[i].mode & 1) __atomic_fetch_add((uint32_t *)s->p[i].val, s->p[i].v, __ATOMIC_SEQ_CST);
@@ -134,7 +137,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
       for (uint32_t i = 0; i <= n || e < s->noe; i++) {
           for (; e < s->noe && s->oe[e].pos <= i; e++) {
               if (!s->oe[e].report) acc = 0;
-              else if (d->status != NVN_GPU_DONE_FAILED) { uint64_t rec[2] = {acc, s2a_guest_tick()}; memcpy((void *)(uintptr_t)s->oe[e].addr, rec, sizeof rec); }
+              else if (d->status != NVN_GPU_DONE_FAILED) { uint64_t rec[2] = {acc, s2a_guest_tick()}; memcpy((void *)(uintptr_t)s->oe[e].addr, rec, sizeof rec); S2A_PROBE_GW(s->oe[e].addr, sizeof rec, 6); }
           }
           if (i < n) acc += occ[i];
           if (i >= n && e >= s->noe) break;
