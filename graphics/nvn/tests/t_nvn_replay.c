@@ -126,8 +126,13 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
     g_samp_creates++; g_samp_last = *p; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
+static uint32_t g_caps_nofilter = ~0u, g_caps_noblend = ~0u;   // #1072：这个格式在替身设备上不能线性过滤 / 不能混合（FMT_FILTER / FMT_BLEND 去掉）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
-    return f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE; }
+    uint32_t c = f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE | NVN_GPU_FMT_BLEND : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE;
+    c |= NVN_GPU_FMT_FILTER;
+    if (f == g_caps_nofilter) c &= ~(uint32_t)NVN_GPU_FMT_FILTER;
+    if (f == g_caps_noblend) c &= ~(uint32_t)NVN_GPU_FMT_BLEND;
+    return c; }
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     (void)t; if (g_nup == 16) return;
     g_up[g_nup].pre = c->is_pre; g_up[g_nup].level = level; g_up[g_nup].layer = layer; g_up[g_nup].pitch = row_bytes; g_up[g_nup].img = image_bytes; g_up[g_nup].w = r->width; g_up[g_nup].h = r->height;
@@ -1888,6 +1893,40 @@ static void t_pass_clear_park_tail(void) {   // 挂起到提交收尾：清 A �
     pass_fresh();
 }
 
+// #1072：格式不能线性过滤 / 不能混合时照常用是未定义行为（G710 的 RGBA16 不能过滤、R32F 不能混合等）。
+// 期望：线性采样器配这种格式时改用同参数的最近点采样器，记 tex / filter_unsupported_fmt_0x..；这种格式当颜色目标时关混合，记 draw / blend_unsupported_fmt_0x..。
+// 负对照：能过滤 / 能混合时不改；整数格式本来就走最近点，不记。
+static void t_fmt_filter_blend(void) {
+    pass_fresh(); g_resolve_rc = g_cresolve_rc = 0; int g0 = g_gdraws;
+    tex_t a = mk_tex(151, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0), b = mk_tex(152, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
+    samp_par sp; memset(&sp, 0, sizeof sp); sp.minf = NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR; sp.ws = NVN_WRAP_MODE_REPEAT; sp.aniso = 4;
+    nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
+    blend_st bl; memset(&bl, 0, sizeof bl); bl.target = 0;
+    for (int k = 0; k < 2; k++) {   // k = 0：替身设备说 RGBA8 不能过滤、不能混合；k = 1：负对照，能
+        g_caps_nofilter = g_caps_noblend = k ? ~0u : NVN_FORMAT_RGBA8;
+        stream s = {0}; q_env(&s); put_set_rt(&s, &b, NULL);
+        g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 5; g_fprog.ent[1][0].src_reg2 = UINT16_MAX;
+        g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1;
+        p_bind_state *by = put(&s, OP_BIND_STATE, sizeof *by); by->kind = 0; memcpy(by->bytes, &bl, sizeof bl);
+        color_st cs; memset(&cs, 0, sizeof cs); cs.blend_en = 1; cs.logic_op = NVN_LOGIC_OP_COPY;
+        by = put(&s, OP_BIND_STATE, sizeof *by); by->kind = 1; memcpy(by->bytes, &cs, sizeof cs);
+        p_bind_handles *bh = put(&s, OP_BIND_TEX, sizeof *bh); bh->stage = 1; bh->first = 5; bh->n = 1; bh->h[0] = 7 | 3 << 20;
+        q_draw(&s); end(&s);
+        submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_gdraws == g0 + 1 + k && g_nfb[1] == 1 && g_fb[1][0].u.ts.samp != NULL);
+        if (!k) {
+            CHECK((g_last_pdesc.color.blend_en & 1) == 0 && nvn_unimpl_count("draw", "blend_unsupported_fmt_0x25") == 1);
+            CHECK(g_samp_last.magf == NVN_MAG_FILTER_NEAREST && g_samp_last.minf == NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST && g_samp_last.ws == NVN_WRAP_MODE_REPEAT &&
+                  g_samp_last.aniso <= 1 && nvn_unimpl_count("tex", "filter_unsupported_fmt_0x25") == 1);
+        } else {
+            CHECK((g_last_pdesc.color.blend_en & 1) == 1 && nvn_unimpl_count("draw", "blend_unsupported_fmt_0x25") == 0 && nvn_unimpl_count("tex", "filter_unsupported_fmt_0x25") == 0);
+        }
+        pass_fresh(); nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
+    }
+    g_caps_nofilter = g_caps_noblend = ~0u; g_fprog.nent[1] = 0;
+    pass_fresh();
+}
+
 static void t_pass_clear_park_read(void) {   // 被读之前必须落地（正确性红线）：清 A 后把 A 当采样贴图用，绘制路径先落地再开通道
     pass_fresh(); g_flag_clear_park = 1; g_flag_rt_cont = 1; g_resolve_rc = g_cresolve_rc = 0;
     int g0 = g_gdraws;
@@ -3599,6 +3638,7 @@ int main(int argc, char **argv) {
     t_pass_clear_park();
     t_pass_clear_park_tail();
     t_pass_clear_park_read();
+    t_fmt_filter_blend();
     t_clear_rect();
     t_report_counter();
     t_occlusion();
