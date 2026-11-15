@@ -796,6 +796,7 @@ static uint64_t compute_input_sig(const struct s2a_direct_compile_context *pc) {
     { int un = 0; for (int i = 0; i < 16; i++) if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment && rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un); MIX(pc->storage_buffer_offset_alignment); }
     MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tex_base);
     MIX(combined_fact_sig(5)); MIX(sep_fact_sig(5));
+    { uint32_t m = 0; for (int i = 0; i < 8; i++) if (rp_S.img[5][i]) m |= 1u << i; MIX(m); MIX(rp_tex_fact_sig(rp_S.img[5], 8, rp_S.tex_base, rp_S.tex_pool_n)); }   // 图像事实（同请求：只出已绑的槽）
     #undef MIX
     return h;
 }
@@ -833,7 +834,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
     { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; st.ubo_use[5] = m << 3; }   // 用户常量缓冲从 c3 起
     st.tex_pool_n = (uint32_t)rp_S.tex_pool_n; st.samp_pool_n = (uint32_t)rp_S.samp_pool_n; st.tex_pool_seen = rp_S.tex_pool_n > 0; st.samp_pool_seen = rp_S.samp_pool_n > 0; st.tex_pool_base = rp_S.tex_base;
     // 贴图事实：计算阶段的 32 个组合槽，取法同图形（没绑过的槽读作池里的第 0 项）
-    static struct s2a_compile_texture_src tex[160]; static char tfmt[160][S2A_TEX_FORMAT_MAX], tsmp[160][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
+    static struct s2a_compile_texture_src tex[168]; static char tfmt[168][S2A_TEX_FORMAT_MAX], tsmp[168][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
     for (int slot = 0; slot < 32; slot++) {
         uint64_t h = rp_S.tex[5][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
@@ -856,6 +857,19 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
         memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
         tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(90 + 2 * slot), 2, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 1, nf.array_length};
+        ntex++;
+    }
+    // 图像事实：c2 图像句柄表 8 槽（字节 0x120 + 8k = 字 72 + 2k，同解析器的 72..86 与 iOS C2_IMG），句柄 = 贴图号（BindImages 已按池基址挪过）。
+    //   着色器用立即句柄（cbufSlot −1）或从 c2 读（cbufSlot 2，编译器回落到 −1 的同字事实）取图像时，编译器要这一格的类型与格式（空轨 2nd 9000：cs handle 72）。
+    //   没绑的槽、登记表里没有、格式表达不了的都不出事实：编译器如实报缺，不猜。
+    for (int slot = 0; slot < 8; slot++) {
+        uint64_t h = rp_S.img[5][slot];
+        tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
+        if (!h || !rp_tex_snap_by_id((int)(h & 0xFFFFF), &t, &tv, &has_tv)) continue;
+        if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
+                (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
+        memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
+        tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(72 + 2 * slot), -1, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 0, nf.array_length};
         ntex++;
     }
     struct nvk_compute_texture_facts tf = {tex, ntex, 1};
