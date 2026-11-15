@@ -271,6 +271,10 @@ namespace S2A.DirectCompiler
         // 里同一个字偏移只是巧合，不是那个组合槽：不借事实（#999：c4 字节 0x20 的句柄曾被当成组合槽 0 绑上）。
         // 没有同句柄直接事实仍然是缺事实，不猜槽位、也不跨句柄借事实。
         private const int HandleTableCbuf = 2;
+        // 立即句柄（cbufSlot −1 = 默认贴图缓冲 c2，Ryujinx TextureHandle.UnpackSlots(−1, TextureBufferIndex)）落在 c2 的分离贴图表
+        //   （0x168 + 8 槽，字 90..344 偶）：读的就是那个分离贴图槽的句柄字（采样器位为 0，取尺寸 / texelFetch 常见），
+        //   宿主按 (字, cbufSlot 2, separate) 给的事实就是它的事实（同 c2 查询回落到 −1 组合事实的对称规则）。空轨 2nd 9000：fs handle 90 / 92 / 124。
+        private static bool IsSeparateTextureWord(int word) => word >= 0x168 / 4 && word < 0x568 / 4 && (word & 1) == 0;
         private DirectTextureFact FindTexture(int handle, int cbufSlot) =>
             _program.Textures.FirstOrDefault(t =>
                 t.Stage == _stage.Stage && t.Handle == handle && t.CbufSlot == cbufSlot);
@@ -280,6 +284,8 @@ namespace S2A.DirectCompiler
             DirectTextureFact fact = FindTexture(handle, cbufSlot);
             if (fact == null && cbufSlot == HandleTableCbuf)
                 fact = FindTexture(handle, -1);
+            if (fact == null && cbufSlot == -1 && IsSeparateTextureWord(handle))
+                fact = FindTexture(handle, HandleTableCbuf) is DirectTextureFact sep && sep.Separate ? sep : null;
             if (fact == null && cbufSlot >= 0)
             {
                 if (TrySeparateC2(handle, cbufSlot, out int texWord, out _))
@@ -369,6 +375,8 @@ namespace S2A.DirectCompiler
             DirectTextureFact fact = FindTexture(handle, cbufSlot);
             if (fact == null && cbufSlot == HandleTableCbuf)
                 fact = FindTexture(handle, -1);
+            if (fact == null && cbufSlot == -1 && IsSeparateTextureWord(handle))
+                fact = FindTexture(handle, HandleTableCbuf) is DirectTextureFact sep && sep.Separate ? sep : null;
             Queries.Add(new DirectQuery("RegisterTexture", $"handle={handle},cbufSlot={cbufSlot}",
                 fact == null ? "unbound" : "bound", fact == null ? "unbound" : "texture-fact:" + _stage.Stage + ":" + handle + ":" + cbufSlot));
         }
