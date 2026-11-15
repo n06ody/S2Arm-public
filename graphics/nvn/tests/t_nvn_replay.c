@@ -1855,6 +1855,29 @@ static void t_pass_rt_continue(void) {   // 同目标续接：通道开着、没
     g_flag_rt_cont = 1; pass_fresh();
 }
 
+static p_copy_t2t *put_t2t(stream *s, const tex_t *src, const tex_t *dst);   // 定义在本文件后面
+// 收通道原因对账（空轨 2nd 9000：每帧 898 个通道里 886 个只有 0–1 笔，日志只列了换目标 37 次，其余收通道没有名字）：
+//   画一笔 → 通道外的贴图拷贝 → 再画一笔 → 交提交。期望两个通道：第一个被拷贝收掉、第二个被提交收尾收掉；各原因之和 = 收通道总数。
+static void t_pass_cut_reasons(void) {
+    pass_fresh(); g_resolve_rc = g_cresolve_rc = 0;
+    tex_t dst = mk_tex(93, 0x8000, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+    stream s = {0}; q_env(&s);
+    q_draw(&s);
+    put_t2t(&s, &g_qrt, &dst);
+    q_draw(&s);
+    end(&s);
+    uint64_t p0[RP_PERF_N]; rp_perf_take(p0);
+    submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    uint64_t p[RP_PERF_N]; rp_perf_take(p);
+    CHECK(p[RP_PERF_PASSES] == 2);
+    CHECK(p[RP_PERF_P_CUT_OP] == 1);        // 拷贝收掉第一个通道（修前这个计数从没加过）
+    CHECK(p[RP_PERF_P_CUT_SUBMIT] == 1);    // 提交收尾收掉第二个
+    uint64_t named = p[RP_PERF_P_CUT_RT] + p[RP_PERF_P_CUT_CLEAR] + p[RP_PERF_P_CUT_XFER] + p[RP_PERF_P_CUT_OP] + p[RP_PERF_P_CUT_IND] + p[RP_PERF_P_CUT_DISP] +
+                     p[RP_PERF_P_CUT_SUBMIT] + p[RP_PERF_P_CUT_LAND] + p[RP_PERF_P_CUT_OCC] + p[RP_PERF_P_CUT_AREA];
+    CHECK(named == p[RP_PERF_PASSEND_N]);   // 每次收通道都有名字
+    pass_fresh();
+}
+
 static void t_pass_state_keep(void) {   // 通道边界不再等于状态边界（开关 nvk_state_keep）：跨两个不同目标的通道，新通道第一笔不重发管线与绑定
     int second[2] = {-1, -1}, first = -1;
     for (int keep = 0; keep <= 1; keep++) {
@@ -3804,6 +3827,7 @@ int main(int argc, char **argv) {
     t_pass_target_persists();
     t_pass_switch_and_partial();
     t_pass_rt_continue();
+    t_pass_cut_reasons();
     t_pass_state_keep();
     t_pass_clear_park();
     t_pass_clear_park_tail();
