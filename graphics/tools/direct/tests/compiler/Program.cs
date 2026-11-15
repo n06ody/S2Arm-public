@@ -1784,6 +1784,38 @@ internal static unsafe class Program
             }
         }
 
+        // 立即句柄直接读 c2 分离贴图表（空轨 2nd 9000：fs「QuerySamplerType has no source (handle=90,cbufSlot=-1)」）：
+        //   TEX 的立即句柄 90 = c2 字节 0x168 = 分离贴图槽 0。宿主照真机只按 (90, cbufSlot 2, separate) 给事实；
+        //   期望编出贴图绑定 slot 90、无 samp_slot（采样器取同字）。负控：只有非分离事实、相邻字、采样器表的字都不借。
+        {
+            string Fact(int handle, int cbufSlot, bool separate) => "{\"stage\":\"fs\",\"handle\":" + handle + ",\"cbufSlot\":" + cbufSlot +
+                ",\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":" + (separate ? "true" : "false") + ",\"arrayLength\":1}";
+            string Direct(int tid, string facts)
+            {
+                byte[] shader = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, tid) });
+                try
+                {
+                    using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "direct-sep-" + tid, vs, shader, textureFacts: "[" + facts + "]")));
+                    string Field(JsonElement b, string name) => b.TryGetProperty(name, out JsonElement f) ? f.GetInt32().ToString() : "-";
+                    return string.Join(";", r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").Select(b => Field(b, "slot") + "/" + Field(b, "samp_slot")));
+                }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+            string got = Direct(90, Fact(90, 2, true));
+            Check(got == "90/-", "direct handle 90 (c2 separate texture slot 0) uses the (90, cbuf 2, separate) fact and binds slot 90: " + got);
+            got = Direct(124, Fact(124, 2, true));
+            Check(got == "124/-", "direct handle 124 (separate slot 17) binds slot 124: " + got);
+            got = Direct(90, Fact(90, 2, false));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=90,cbufSlot=-1"), "a non-separate (90, cbuf 2) fact is not borrowed: " + got);
+            got = Direct(92, Fact(90, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=92,cbufSlot=-1"), "another separate slot's fact is not borrowed: " + got);
+            got = Direct(346, Fact(346, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=346,cbufSlot=-1"), "a sampler-table word is not a separate texture: " + got);
+            got = Direct(8, Fact(8, -1, false));
+            Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
+        }
+
         // 7c) guest UBO：c[0] 的 LDC 必须变成 set0 binding1 的 uniform binding、槽位 0，
         //     并且 constantBufferUse 记录了用到的槽位（前端据此绑定 guest 常量缓冲）。
         {

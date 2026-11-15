@@ -336,6 +336,9 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
                 dst->samp_slot = (int16_t)samp_v;
             } else if (dst->kind == 2 && dst->slot >= 8 && dst->slot < 72 && !(dst->slot & 1)) {
                 dst->tex_slot = (int16_t)((dst->slot - 8) / 2);
+            } else if (dst->kind == 2 && dst->count == 1 && dst->slot >= 90 && dst->slot < 346 && !(dst->slot & 1)) {
+                // 立即句柄直接读 c2 分离贴图表的字（无分离采样器：取尺寸 / texelFetch，采样器取同字高位，同组合槽）：分离贴图槽 128 + k
+                dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);
             } else if (v2 && dst->kind == 2 && !dst->tex_ubo && !(dst->count > 1 && dst->slot == 0)) {
                 return fail(why, why_size, "invalid texture source");
             }
@@ -668,8 +671,10 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         if (dst->kind == 2) {
             if (has_samp) dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);
             else {
-                if (dst->slot < 8 || dst->slot >= 72 || (dst->slot & 1)) CS_FAIL("compute texture slot outside recorded range");
-                dst->tex_slot = (int16_t)((dst->slot - 8) / 2);
+                if (dst->slot >= 90 && dst->slot < 346 && !(dst->slot & 1))
+                    dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);   // 直接读 c2 分离贴图表的字（同图形）
+                else if (dst->slot < 8 || dst->slot >= 72 || (dst->slot & 1)) CS_FAIL("compute texture slot outside recorded range");
+                else dst->tex_slot = (int16_t)((dst->slot - 8) / 2);
             }
             if (texture_classify(b, &out->stage, dst, why, why_size)) {
                 nvn_vk_program_free_compute(out);

@@ -119,6 +119,22 @@ int main(void) {
     CHECK(parse_json("{\"stage\":\"fs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":8}", &p, why, sizeof why) == 0 && p.bindings[0].samp_slot == -1, "v1 keeps combined sampler sentinel");
     nvn_vk_program_free(&p);
 
+    // 立即句柄直接读 c2 分离贴图表的字（空轨 2nd 9000：fs handle 90 / 92 / 124，取尺寸 / texelFetch，无分离采样器）：
+    //   slot 90..344 偶、count 1、无 samp_slot → 分离贴图槽 128 + k、采样器取同字（samp_slot −1）；v1 / v2 同。奇字、表外、数组照旧不接。
+    for (int v = 1; v <= 2; ++v) {
+        int (*parse)(const char *, struct fd_program *, char *, size_t) = v == 1 ? parse_json : parse_v2;
+        static const struct { int slot, count, want; } sep[] = {{90, 1, 128}, {92, 1, 129}, {124, 1, 145}, {344, 1, 255}, {91, 1, -1}, {346, 1, -1}, {90, 2, -1}};
+        for (unsigned k = 0; k < sizeof sep / sizeof sep[0]; k++) {
+            char b[200]; why[0] = 0;
+            snprintf(b, sizeof b, "{\"stage\":\"fs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":%d,\"count\":%d}", sep[k].slot, sep[k].count);
+            int rc = parse(b, &p, why, sizeof why);
+            char what[160]; snprintf(what, sizeof what, "v%d direct separate texture slot %d count %d -> tex_slot %d", v, sep[k].slot, sep[k].count, sep[k].want);
+            if (sep[k].want >= 0) CHECK(rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == sep[k].want && p.bindings[0].samp_slot == -1, what);
+            else CHECK(v == 2 ? rc != 0 : (rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == -1), what);   // v2 拒；v1 保持无槽（layout 如实报红）
+            nvn_vk_program_free(&p);
+        }
+    }
+
     // #999 / #1189：现编结果的平铺写法 uboSlot（cbuf − 3）+ uboOffset（句柄字字节偏移），没有 slot。
     //   组合句柄一个字：贴图号低 20 位、采样器号高 12 位 → 贴图与采样器都取同一个字（FD_SAMP_UBO，采样器字 sid=0）。
     for (int v = 1; v <= 2; ++v) {
