@@ -114,9 +114,10 @@ void nvn_gpu_tex_release(nvn_gpu_tex t) { g_tex_releases++; free(t); }
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err) { (void)err; g_view_creates++; g_vw_last_has = v != NULL; if (v) g_vw_last = *v; *out = calloc(1, sizeof **out); (*out)->of = t; (*out)->has_v = v != NULL; if (v) (*out)->v = *v; (*out)->rid = ++g_vid; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_view_release(nvn_gpu_view v) { g_view_releases++; if (v && g_nrel < 8192) g_released_id[g_nrel++] = v->rid; free(v); }
 // 环绕的替身语义同真后端（#976）：MIRROR_CLAMP / MIRROR_CLAMP_TO_BORDER 永远具名 UNSUPPORTED；g_samp_no_mce = 设备没有镜像夹到边的扩展。
-static int g_samp_no_mce, g_samp_tries; static samp_par g_samp_last;
+static int g_samp_no_mce, g_samp_tries, g_samp_fail_nearest; static samp_par g_samp_last;
 nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err) {
     g_samp_tries++; *out = NULL;
+    if (g_samp_fail_nearest && p->magf == NVN_MAG_FILTER_NEAREST) { snprintf(err->why, sizeof err->why, "模拟内存不足"); return (nvn_gpu_rc){NVN_GPU_E_OOM}; }
     const uint32_t w[3] = {p->ws, p->wt, p->wr};
     for (int i = 0; i < 3; i++) {
         const char *why = w[i] == NVN_WRAP_MODE_MIRROR_CLAMP ? "sampler_wrap_mirror_clamp：替身" : w[i] == NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER ? "sampler_wrap_mirror_clamp_to_border：替身"
@@ -1923,7 +1924,17 @@ static void t_fmt_filter_blend(void) {
         }
         pass_fresh(); nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
     }
-    g_caps_nofilter = g_caps_noblend = ~0u; g_fprog.nent[1] = 0;
+    g_fprog.nent[1] = 0;
+    pass_fresh(); g_caps_nofilter = NVN_FORMAT_RGBA8;
+    nvn_be_reg_tex(7, &a, NULL);
+    sp.ws = NVN_WRAP_MODE_MIRROR_CLAMP; nvn_be_reg_samp(3, &sp);
+    nvn_gpu_samp near = rp_samp_for_tex(3, 7);
+    CHECK(near && g_samp_last.ws == NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE && g_samp_last.magf == NVN_MAG_FILTER_NEAREST);
+    pass_fresh(); g_caps_nofilter = NVN_FORMAT_RGBA8;
+    nvn_be_reg_tex(7, &a, NULL); sp.ws = NVN_WRAP_MODE_REPEAT; nvn_be_reg_samp(3, &sp);
+    g_samp_fail_nearest = 1;
+    CHECK(rp_samp_for_tex(3, 7) == NULL);  // 最近点采样器分配失败，不能交原来的线性采样器
+    g_samp_fail_nearest = 0; g_caps_nofilter = g_caps_noblend = ~0u;
     pass_fresh();
 }
 

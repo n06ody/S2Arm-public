@@ -31,6 +31,10 @@ void rp_view_pin_end(void);
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *has_v);
 // 采样器号 → 后端采样器（首次取用时建）。没登记 → NULL。线程：[提交]。
 nvn_gpu_samp rp_samp_by_id(int id);
+// #1072：同上，但贴图 tid 的有效格式不能线性过滤时给同参数的最近点采样器（具名记账）。
+nvn_gpu_samp rp_samp_for_tex(int sid, int tid);
+// 格式能力（nvn_gpu_format_caps）按格式缓存，会话重开时清。
+uint32_t rp_fmt_caps(uint32_t f);
 // 这张贴图的内容从此以 GPU 为准（当了渲染目标 / 被拷贝写 / 被着色器写）：不再从游戏内存重传。
 void rp_tex_mark_gpu_written(const tex_t *t);
 // 只读查询：这个序号被前端标过「CPU 写过」（nvn_be_tex_cpu_written：WriteTexels、刷新范围盖到、导出等）。同步读回判内容在不在游戏内存里用。线程：任意。

@@ -179,7 +179,25 @@
                 }
             }
         },
-        "unchanged": {}
+        "unchanged": {},
+        "no_fmt_filter_blend": {
+            "formats": {
+                "VK_FORMAT_R16G16B16A16_UNORM": {
+                    "VkFormatPropertiesRemove": {
+                        "optimalTilingFeatures": [
+                            "VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT"
+                        ]
+                    }
+                },
+                "VK_FORMAT_R32_SFLOAT": {
+                    "VkFormatPropertiesRemove": {
+                        "optimalTilingFeatures": [
+                            "VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT"
+                        ]
+                    }
+                }
+            }
+        }
     },
     "profiles": {
         "VP_S2A_SIM_no_bc": {
@@ -360,6 +378,24 @@
             ],
             "capabilities": [
                 "unchanged"
+            ]
+        },
+        "VP_S2A_SIM_no_fmt_filter_blend": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "格式不能过滤 / 不能混合",
+            "description": "RGBA16 UNORM 去掉 SAMPLED_IMAGE_FILTER_LINEAR、R32F 去掉 COLOR_ATTACHMENT_BLEND（同 Mali-G710 的报告）。期望：契约绿，后端如实报这两个格式没有 FMT_FILTER / FMT_BLEND（核心据此退最近点 / 关混合）。",
+            "contributors": {},
+            "history": [
+                {
+                    "revision": 1,
+                    "date": "2026-11-15",
+                    "author": "S2Arm",
+                    "comment": "#1072：只按 Vulkan 规范格式名 / 特性位手写，不含任何设备报告数据"
+                }
+            ],
+            "capabilities": [
+                "no_fmt_filter_blend"
             ]
         }
     }

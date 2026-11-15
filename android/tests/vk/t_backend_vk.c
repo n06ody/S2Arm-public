@@ -8263,6 +8263,8 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
     if (!open_backend()) return 1;
+    // #1072：核心按格式能力退最近点 / 关混合；模拟档 no_fmt_filter_blend 按这行核对后端如实报了「不能过滤 / 不能混合」。
+    printf("sim fmt caps: RGBA16 filter=%d R32F blend=%d\n", !!(nvn_gpu_format_caps(NVN_FORMAT_RGBA16) & NVN_GPU_FMT_FILTER), !!(nvn_gpu_format_caps(NVN_FORMAT_R32F) & NVN_GPU_FMT_BLEND));
     if (!getenv("S2A_TEST_WSI697_ONLY") && !c697_bc4_3d_run()) return 1;
     if (getenv("S2A_TEST_BC4_3D_ONLY")) {
         nvn_gpu_err e = {0};

@@ -45,7 +45,7 @@ static void alias_key_of(alias_key *k, const tex_t *t) { memset(k, 0, sizeof *k)
 // invalidated: pinning an already borrowed handle must never require allocation.
 struct registered_view { nvn_gpu_view view; struct registered_view *next; };
 typedef struct { tex_t t; view_t v; uint8_t ok, has_v; nvn_gpu_view view; struct registered_view *owned; struct rp_tex *of; uint64_t gen; } treg_t;
-typedef struct { samp_par p; uint8_t ok; nvn_gpu_samp s; } sreg_t;
+typedef struct { samp_par p; uint8_t ok; nvn_gpu_samp s, sn; } sreg_t;   // sn：同参数的最近点采样器（#1072，配不能线性过滤的格式时用），用到才建
 
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 static treg_t *g_treg; static int g_ntreg;
@@ -103,13 +103,14 @@ void nvn_be_reg_samp(int id, const samp_par *p) {
     if (id >= g_nsreg) { int n = id + 256; sreg_t *nr = realloc(g_sreg, (size_t)n * sizeof *nr); if (!nr) { pthread_mutex_unlock(&g_rmu); return; }
         memset(nr + g_nsreg, 0, (size_t)(n - g_nsreg) * sizeof *nr); g_sreg = nr; g_nsreg = n; }
     sreg_t *r = &g_sreg[id];
-    if (r->s) {
+    nvn_gpu_samp *old_s[2] = {&r->s, &r->sn};
+    for (int k = 0; k < 2; k++) if (*old_s[k]) {
         if (g_pin_depth) {
             struct pinned_samp *pin = malloc(sizeof *pin);
             if (!pin) { nvn_unimpl("gpu", "sampler_pin_allocation", p); pthread_mutex_unlock(&g_rmu); return; }
-            pin->samp = r->s; pin->next = g_pinned_samps; g_pinned_samps = pin;
-        } else nvn_gpu_samp_release(r->s);
-        r->s = NULL;
+            pin->samp = *old_s[k]; pin->next = g_pinned_samps; g_pinned_samps = pin;
+        } else nvn_gpu_samp_release(*old_s[k]);
+        *old_s[k] = NULL;
     }
     r->p = *p; r->ok = 1;
     __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE);
@@ -769,32 +770,75 @@ static void samp_red(const nvn_gpu_err *err, const void *site) {
 
 static int samp_wrap_no_vk(uint32_t w) { return w == NVN_WRAP_MODE_MIRROR_CLAMP || w == NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER; }
 
+// 两种采样器共享环绕近似与失败报红，不能在最近点变体失败后交回原线性采样器。
+static nvn_gpu_samp samp_create(const samp_par *p, const void *site) {
+    nvn_gpu_samp out = NULL; nvn_gpu_err err = {0};
+    nvn_gpu_rc rc = nvn_gpu_samp_create(p, &out, &err);
+    if (rc.code == NVN_GPU_E_UNSUPPORTED && (samp_wrap_no_vk(p->ws) || samp_wrap_no_vk(p->wt) || samp_wrap_no_vk(p->wr))) {
+        // #976：Vulkan 不提供这两种环绕，近似成 MIRROR_CLAMP_TO_EDGE 并记账。
+        nvn_unimpl("gpu", "samp_wrap_mirror_clamp_approx", site);
+        samp_par q = *p;
+        if (samp_wrap_no_vk(q.ws)) q.ws = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+        if (samp_wrap_no_vk(q.wt)) q.wt = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+        if (samp_wrap_no_vk(q.wr)) q.wr = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
+        memset(&err, 0, sizeof err);
+        rc = nvn_gpu_samp_create(&q, &out, &err);
+    }
+    if (!nvn_gpu_ok(rc)) { out = NULL; samp_red(&err, site); }
+    return out;
+}
+
 nvn_gpu_samp rp_samp_by_id(int id) {
     pthread_mutex_lock(&g_rmu);
     nvn_gpu_samp s = NULL;
     if (id >= 0 && id < g_nsreg && g_sreg[id].ok) {
-        if (!g_sreg[id].s) {
-            nvn_gpu_err err = {0};
-            const samp_par *p = &g_sreg[id].p;
-            nvn_gpu_rc r = nvn_gpu_samp_create(p, &g_sreg[id].s, &err);
-            if (r.code == NVN_GPU_E_UNSUPPORTED && (samp_wrap_no_vk(p->ws) || samp_wrap_no_vk(p->wt) || samp_wrap_no_vk(p->wr))) {
-                // #976：Vulkan 没有 MIRROR_CLAMP / MIRROR_CLAMP_TO_BORDER，后端按契约不近似。这里记一笔具名近似，换成 MIRROR_CLAMP_TO_EDGE 照画
-                // （同 iOS nvn_red.h、Ryujinx EnumConversion）。差别：最近点过滤下 MIRROR_CLAMP 逐纹素相同，线性过滤在 |u| 近 1 处少了与边框色的混合；
-                // MIRROR_CLAMP_TO_BORDER 在 |u| > 1 处本该是边框色。后端连 MIRROR_CLAMP_TO_EDGE 也建不了时照样报红、不画。
-                nvn_unimpl("gpu", "samp_wrap_mirror_clamp_approx", &g_sreg[id]);
-                samp_par q = *p;
-                if (samp_wrap_no_vk(q.ws)) q.ws = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
-                if (samp_wrap_no_vk(q.wt)) q.wt = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
-                if (samp_wrap_no_vk(q.wr)) q.wr = NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE;
-                memset(&err, 0, sizeof err);
-                r = nvn_gpu_samp_create(&q, &g_sreg[id].s, &err);
-            }
-            if (!nvn_gpu_ok(r)) { g_sreg[id].s = NULL; samp_red(&err, &g_sreg[id]); }
-        }
+        if (!g_sreg[id].s) g_sreg[id].s = samp_create(&g_sreg[id].p, &g_sreg[id]);
         s = g_sreg[id].s;
     }
     pthread_mutex_unlock(&g_rmu);
     return s;
+}
+
+// #1072：格式能力（FMT_FILTER / FMT_BLEND 等）按格式记住。后端每问一次都要查一遍格式特性，采样器配视图是每笔每个贴图都要判的。
+// 高位 1 = 已查过；会话重开（rp_res_reset）清掉。
+static uint32_t g_fmt_caps[512];
+uint32_t rp_fmt_caps(uint32_t f) {
+    if (f >= sizeof g_fmt_caps / sizeof g_fmt_caps[0]) return nvn_gpu_format_caps(f);
+    uint32_t c = __atomic_load_n(&g_fmt_caps[f], __ATOMIC_ACQUIRE);
+    if (!(c & 0x80000000u)) { c = nvn_gpu_format_caps(f) | 0x80000000u; __atomic_store_n(&g_fmt_caps[f], c, __ATOMIC_RELEASE); }
+    return c & 0x7fffffffu;
+}
+static int samp_linear(const samp_par *p) {
+    return p->magf == NVN_MAG_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST ||
+           p->minf == NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR || p->aniso > 1.0f;
+}
+// 采样器配上这张贴图：贴图的有效格式不能线性过滤（G710 的 RGBA16 UNORM、Adreno 830 的 D32S8 等）而采样器要线性过滤 / 级间插值 / 各向异性时，
+// 照常绑是未定义行为。改用同参数的最近点采样器（级间也取最近、关各向异性），按格式具名记 tex / filter_unsupported_fmt_0x..。整数格式本来就走最近点，不管。
+nvn_gpu_samp rp_samp_for_tex(int sid, int tid) {
+    nvn_gpu_samp s = rp_samp_by_id(sid);
+    if (!s) return s;
+    uint32_t fmt = 0; samp_par p; int have = 0;
+    pthread_mutex_lock(&g_rmu);
+    if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) fmt = (uint32_t)(g_treg[tid].has_v && g_treg[tid].v.set_format ? g_treg[tid].v.format : g_treg[tid].t.d.format);
+    if (sid >= 0 && sid < g_nsreg && g_sreg[sid].ok) { p = g_sreg[sid].p; have = 1; }
+    pthread_mutex_unlock(&g_rmu);
+    if (!fmt || !have || !samp_linear(&p)) return s;
+    nvn_fmt_info fi; if (nvn_fmt_info_of(fmt, &fi) && (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT)) return s;
+    if (rp_fmt_caps(fmt) & NVN_GPU_FMT_FILTER) return s;
+    { char nm[40]; snprintf(nm, sizeof nm, "filter_unsupported_fmt_0x%x", (unsigned)fmt); nvn_unimpl("tex", nm, NULL); }
+    nvn_gpu_samp out = NULL;
+    pthread_mutex_lock(&g_rmu);
+    if (sid < g_nsreg && g_sreg[sid].ok) {
+        sreg_t *r = &g_sreg[sid];
+        if (!r->sn) {
+            samp_par q = r->p;
+            q.magf = NVN_MAG_FILTER_NEAREST; q.minf = NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST; q.aniso = 1.0f;
+            r->sn = samp_create(&q, r);
+        }
+        if (r->sn) out = r->sn;
+    }
+    pthread_mutex_unlock(&g_rmu);
+    return out;
 }
 
 void rp_res_reset(void) {
@@ -806,7 +850,8 @@ void rp_res_reset(void) {
         if (g_zero[target][cls].tex) nvn_gpu_tex_release(g_zero[target][cls].tex);
     }
     memset(g_zero, 0, sizeof g_zero); g_zero_cube_logged = 0;
-    for (int i = 0; i < g_nsreg; i++) if (g_sreg[i].s) nvn_gpu_samp_release(g_sreg[i].s);
+    for (int i = 0; i < g_nsreg; i++) { if (g_sreg[i].s) nvn_gpu_samp_release(g_sreg[i].s); if (g_sreg[i].sn) nvn_gpu_samp_release(g_sreg[i].sn); }
+    memset(g_fmt_caps, 0, sizeof g_fmt_caps);
     free(g_treg); g_treg = NULL; g_ntreg = 0; __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE); free(g_sreg); g_sreg = NULL; g_nsreg = 0; g_tpool_n = 0;
     // 一份存储可能同时挂在序号表（多次）和共用表里：先收集去重再放
     struct rp_tex **all = NULL; int n = 0, cap = 0;
