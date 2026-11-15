@@ -281,6 +281,19 @@ static nvn_gpu_view g_av[RP_PROG_STAGES][RP_TEXARR_MAX]; static nvn_gpu_samp g_a
 // 每次取一遍能力表就是 3700 次加锁（和提交完成线程抢同一把锁）。这里取一次就记住，会话重开（rp_draw_reset）再取。
 static nvn_gpu_caps g_caps_c; static int g_caps_ok;
 static const nvn_gpu_caps *caps_cached(void) { if (!g_caps_ok) { nvn_gpu_caps_get(&g_caps_c); g_caps_ok = 1; } return &g_caps_c; }
+// 存储缓冲的宿主绑定窗口，同 Ryujinx BufferManager.Set*StorageBuffer 与 GlobalToStorage 的 AlignDown(基址, 宿主对齐)：
+// 基址不对齐时编译请求带 hasUnalignedStorageBuffer，着色器按「地址 − (基址 & −对齐)」取数，所以窗口从 基址 & −对齐 起、长度补上余数，
+// 描述符偏移也就满足 minStorageBufferOffsetAlignment。只对 NVN 存储缓冲槽（SBUFP）这么做：编译事实只看这张表；
+// UBOP（计算阶段用户 UBO 槽当存储缓冲）的着色器按基址本身取数，起点不动。
+// 长度再夹到 maxStorageBufferRange（着色器用 OpArrayLength 取实际绑定长度判越界，窗口外按越界处理）。返回 1 = 被夹短。
+static int sb_window(const p_bind_buf *sb, int align_down, uint64_t *wa, uint64_t *wl) {
+    const nvn_gpu_caps *cp = caps_cached();
+    uint64_t a = sb->addr, l = sb->size;
+    if (align_down && cp->min_ssbo_align > 1) { const uint64_t r = a & (uint64_t)(cp->min_ssbo_align - 1); a -= r; l += r; }
+    const int clamped = cp->max_ssbo_range && l > cp->max_ssbo_range;
+    if (clamped) l = cp->max_ssbo_range;
+    *wa = a; *wl = l; return clamped;
+}
 // Bounded per-session first-cause detail; bytes do not split one cause into repeated messages.
 enum { ARENA_REASON_MAX = 8 };
 static struct { int rc; char why[sizeof ((nvn_gpu_err *)0)->why]; } g_arena_reasons[ARENA_REASON_MAX];
@@ -600,11 +613,19 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                     o->u.b.off = 0; o->u.b.len = 0x10000; break;
                 }
                 if (!sb || !sb->addr || !sb->size) return skip("storage_buffer_unbound", rec);
+                const int sbufp = e->src_kind == NVN_RB_SBUFP;
+                uint64_t wa, wl; const int clamped = sb_window(sb, sbufp, &wa, &wl);
                 nvn_gpu_buf gb; uint64_t go;
-                if (st < RP_PROG_STAGES && i < RP_PROG_ENT_MAX && g_sb_ok[st][i]) { gb = g_sb_buf[st][i]; go = g_sb_off[st][i]; }   // 开通道前已同步（见 rp_draw 开头）
-                else if (!rp_buf_resolve(c, sb->addr, sb->size, &gb, &go)) return skip("storage_buffer_unresolved", rec);
-                if (e->access & NVN_GPU_ACC_W) rp_post_gpu_write(sb->addr, sb->size);
-                o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = sb->size; break; }
+                if (st < RP_PROG_STAGES && i < RP_PROG_ENT_MAX && g_sb_ok[st][i]) { gb = g_sb_buf[st][i]; go = g_sb_off[st][i]; }   // 开通道前已按同一窗口同步（见 rp_draw 开头）
+                else if (!rp_buf_resolve(c, wa, wl, &gb, &go)) return skip("storage_buffer_unresolved", rec);
+                // 镜像偏移必须对齐；UBOP 着色器按原基址取数，不能通过移动窗口补救。
+                const uint32_t al = caps_cached()->min_ssbo_align;
+                if (al > 1 && (go & (al - 1))) return skip("storage_buffer_offset_unaligned", rec);
+                if (clamped) nvn_unimpl("draw", "storage_buffer_window_clamped", rec);   // 超出 maxStorageBufferRange 的部分着色器访问不到：照画，具名记账
+                // 回写只登记游戏绑定的那一段（窗口前补的余数字节不是这个缓冲的，回写会盖掉相邻内容）
+                if (e->access & NVN_GPU_ACC_W) { const uint64_t reach = wa + wl - sb->addr;   // 窗口里属于这个缓冲的长度（余数 < 对齐 ≤ 256，上限 ≥ 128 MiB，不会为负）
+                    rp_post_gpu_write(sb->addr, reach < sb->size ? reach : sb->size); }
+                o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
                 // 指针字节必须当前：先按写的来源解析那 8 字节（池镜像里 GPU 写过的部分不会被旧 guest 字节盖掉），
                 // 再从镜像的 CPU 映射读数；目标长度按所在池的余量，并夹到 SSBO 描述符范围上限。
@@ -627,6 +648,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                   if (cp.max_ssbo_range && extent > cp.max_ssbo_range) extent = cp.max_ssbo_range; }
                 if (!extent) return skip("storage_buffer_indirect_empty", rec);
                 if (!rp_buf_resolve(c, target, extent, &gb, &go)) return skip("storage_buffer_unresolved", rec);
+                const uint32_t al = caps_cached()->min_ssbo_align;
+                if (al > 1 && (go & (al - 1))) return skip("storage_buffer_offset_unaligned", rec);
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = extent; break; }
             case NVN_RB_SUPPORT: {
                 uint32_t flags = (rp_depth_zero() ? 0u : 1u) | 2u;   // 位 0：深度 −1..1；位 1：base vertex / instance 取内建（后端基线要求 shaderDrawParameters）
@@ -953,8 +976,9 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             if (e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) continue;
             const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
             if (!sb || !sb->addr || !sb->size) continue;
-            if (nb < SB_BATCH) { bs[nb] = st; bi[nb] = (int)i; ba[nb] = sb->addr; bl[nb] = sb->size; nb++; }
-            else if (rp_buf_resolve(c, sb->addr, sb->size, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
+            uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);   // 与发绑定时同一个窗口（被夹短的记账在发绑定那边）
+            if (nb < SB_BATCH) { bs[nb] = st; bi[nb] = (int)i; ba[nb] = wa; bl[nb] = wl; nb++; }
+            else if (rp_buf_resolve(c, wa, wl, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
         }
         if (nb) {
             rp_buf_resolve_multi(nb, ba, bl, bb, bo, bok);

@@ -19,7 +19,7 @@ tiers_json="$repo/android/tests/vk/profiles/s2a_sim_tiers.json"
 profiles_sha=b502e9b0d7508e06e6300af272548cf0ee32f380
 profiles_url=https://github.com/KhronosGroup/Vulkan-Profiles.git
 
-all=(no_bc no_d24 no_vertex_stores no_clip_distance no_dual_src_blend no_calibrated_timestamps no_mirror_clamp no_exact16 no_depth_clamp no_vertex_divisor no_custom_border)
+all=(no_bc no_d24 no_vertex_stores no_clip_distance no_dual_src_blend no_calibrated_timestamps no_mirror_clamp no_exact16 no_depth_clamp no_vertex_divisor no_custom_border ssbo_align_256)
 want=("$@"); [ ${#want[@]} -gt 0 ] || want=("${all[@]}")
 for t in "${want[@]}"; do
     case " ${all[*]} " in *" $t "*) ;; *) echo "未知档：${t}（可用：${all[*]}）" >&2; exit 64 ;; esac
@@ -85,6 +85,8 @@ has() { grep -qF -- "$2" "$1"; }
 # $1 档名（空 = 基线，不挂层）$2 日志；其余参数是额外环境变量
 run_tier() {
     local tier=$1 log=$2; shift 2
+    local capabilities=SIMULATE_FEATURES_BIT,SIMULATE_FORMATS_BIT
+    [ "$tier" != ssbo_align_256 ] || capabilities+=,SIMULATE_PROPERTIES_BIT
     set +e
     if [ -z "$tier" ]; then
         (cd "$repo" && env "$@" bash android/tests/vk/run.sh) >"$log" 2>&1
@@ -92,7 +94,7 @@ run_tier() {
         (cd "$repo" && env S2A_VK_PROFILE_LAYER_DIR="$layer_dir" \
             VK_KHRONOS_PROFILES_PROFILE_DIRS="$prof_dir" \
             VK_KHRONOS_PROFILES_PROFILE_NAME="VP_S2A_SIM_$tier" \
-            VK_KHRONOS_PROFILES_SIMULATE_CAPABILITIES=SIMULATE_FEATURES_BIT,SIMULATE_FORMATS_BIT \
+            VK_KHRONOS_PROFILES_SIMULATE_CAPABILITIES="$capabilities" \
             VK_KHRONOS_PROFILES_DEBUG_REPORTS=DEBUG_REPORT_ERROR_BIT \
             "$@" bash android/tests/vk/run.sh) >"$log" 2>&1
     fi
@@ -109,6 +111,11 @@ run_tier() {
 check_tier() {
     local tier=$1 log="$out/$1.log" rc=0
     case "$tier" in
+        ssbo_align_256)
+            run_tier ssbo_align_256 "$log" || rc=$?
+            [ "$rc" -eq 0 ] || red ssbo_align_256 "run.sh rc=${rc}，期望回放与校验层通过"
+            has "$log" "minStorageBufferOffsetAlignment=256 " || red ssbo_align_256 "没有观察到模拟对齐 256"
+            has "$log" "PASS replay storage buffer window: align 256," || red ssbo_align_256 "256 对齐回放像素 / 范围检查未通过" ;;
         no_bc)
             run_tier no_bc "$log" || rc=$?
             [ "$rc" -eq 0 ] || red no_bc "run.sh rc=${rc}，期望契约绿"

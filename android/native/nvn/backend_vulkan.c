@@ -4678,13 +4678,11 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
                 set_sticky(c, NVN_GPU_E_ARG, "常量缓冲范围 %llu 超过 maxUniformBufferRange %llu", (unsigned long long)b->u.b.len, (unsigned long long)g.caps.max_ubo_range);
                 return -1; }
             if (e->cls == NVN_GPU_RES_SSBO && b->u.b.len > g.caps.max_ssbo_range) {
-                // Vulkan 的存储缓冲范围上限管的是「范围」而不是缓冲大小：超过上限的绑定用 VK_WHOLE_SIZE
-                // （规范只约束非 WHOLE_SIZE 的 range），有效范围变成 offset 到缓冲尾。这是平台分叉，报一次红行。
-                static int said; if (!said++) {
-                    char m[160]; snprintf(m, sizeof m, "存储缓冲范围 %llu 超过 maxStorageBufferRange %llu：按 VK_WHOLE_SIZE 绑定（Vulkan 无更大范围）",
-                                          (unsigned long long)b->u.b.len, (unsigned long long)g.caps.max_ssbo_range);
-                    nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", m); }
-                bf->range = VK_WHOLE_SIZE; }
+                // 存储缓冲同样只能准确拒绝：改绑 VK_WHOLE_SIZE 并不豁免，有效范围（缓冲尾 − offset）照样受 maxStorageBufferRange 约束
+                // （VUID-VkWriteDescriptorSet-descriptorType-00333，校验层原话「is VK_WHOLE_SIZE, but the effective range … is greater than
+                // maxStorageBufferRange」）。回放核心已按上限夹好窗口（rp_draw.c sb_window），走到这里是调用方没夹。
+                set_sticky(c, NVN_GPU_E_ARG, "存储缓冲范围 %llu 超过 maxStorageBufferRange %llu", (unsigned long long)b->u.b.len, (unsigned long long)g.caps.max_ssbo_range);
+                return -1; }
             w->pBufferInfo = bf;
             break;
         case NVN_GPU_RES_TBUF:

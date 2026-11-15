@@ -187,9 +187,27 @@
                 }
             }
         },
+        "ssbo_align_256": {
+            "properties": {
+                "VkPhysicalDeviceProperties": {
+                    "limits": {
+                        "minStorageBufferOffsetAlignment": 256
+                    }
+                }
+            }
+        },
         "unchanged": {}
     },
     "profiles": {
+        "VP_S2A_SIM_ssbo_align_256": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "存储缓冲偏移对齐 256",
+            "description": "模拟存储缓冲偏移对齐 256 字节，回放窗口及像素正确，校验层无错误。",
+            "contributors": {},
+            "history": [{"revision": 1, "date": "2026-11-16", "author": "S2Arm", "comment": "只模拟 Vulkan 的存储缓冲对齐上限"}],
+            "capabilities": ["ssbo_align_256"]
+        },
         "VP_S2A_SIM_no_bc": {
             "version": 1,
             "api-version": "1.1.0",
