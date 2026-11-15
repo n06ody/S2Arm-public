@@ -178,11 +178,13 @@ void rp_occl_draw(nvn_gpu_cmd c) {                                              
     g_occ_cur = (int)g_occ_next++; nvn_gpu_occlusion(c, g_occ_cur - (int)g_occ_base);
 }
 static void seg_cut(int next_occ);
+static void cut_op(void) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_OP, 1); }   // 拷贝 / 清贴图这类通道外命令收掉开着的通道（通道碎片化归因）
 // 第一次复位落在没声明槽的段里（开段时还不知道游戏用这个计数器）：就地交段，后半段开成带槽的新段，复位之后的绘制照计
 // （同 iOS nvn_mtl.m 第一次复位就地拆通道）。前半段没有槽，不进 mids。中间值用完交不了时具名记账，这一段复位后不计。
 static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
     if (g_occ_seg || !g_sub || !c || c != g_cmd) return c;
     if (g_mid >= SUB_STEP - 4) { nvn_unimpl("occl", "first_reset_not_counted", NULL); return c; }
+    if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_OCC, 1);
     rp_pass_flush(c);
     seg_cut(1);
     return g_cmd;
@@ -297,6 +299,7 @@ static void seg_cut(int next_occ) {
 
 uint64_t nvn_be_sub_commit(void) {
     struct sub *s = g_sub; g_sub = NULL;
+    if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_SUBMIT, 1);
     rp_pass_flush(g_cmd);   // 打开的通道与待折清除不跨提交
     if (!g_cmd) {   // 没有段（开段失败，或中途交段之后开新段失败）：副作用无处挂，按失败丢弃（不写假成功）
         if (s) sub_orphan(s);
@@ -510,10 +513,10 @@ void nvn_be_exec(const uint8_t *p) {
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); rp_pass_barrier((uint32_t)bits); break; }
-            case OP_COPY_T2B: rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
-            case OP_CLEAR_TEX: rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
-            case OP_COPY_B2T: rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
-            case OP_COPY_T2T: rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标
+            case OP_COPY_T2B: cut_op(); rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
+            case OP_CLEAR_TEX: cut_op(); rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
+            case OP_COPY_B2T: cut_op(); rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
+            case OP_COPY_T2T: cut_op(); rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标
             case OP_UPDATE_UB: rp_op_update_ub(a, p); break;
             case OP_COPY_B2B: rp_op_copy_b2b(a, p); break;
             case OP_CLEAR_BUF: rp_op_clear_buf(a, p); break;

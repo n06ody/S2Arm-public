@@ -844,7 +844,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) rp_pass_flush(c);
+            if (!copied) { if (rp_pass_is_open()) rp_perf_add(RP_PERF_P_CUT_IND, 1); rp_pass_flush(c); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1154,6 +1154,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     }
     { struct timespec tr1; clock_gettime(CLOCK_MONOTONIC, &tr1); rp_perf_add(RP_PERF_DISP_RESOLVE_NS, (uint64_t)tr1.tv_sec * 1000000000ull + (uint64_t)tr1.tv_nsec - r0); }
     { struct timespec tsb; clock_gettime(CLOCK_MONOTONIC, &tsb); uint64_t f0 = (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec;
+      if (rp_pass_is_open()) rp_perf_add(RP_PERF_P_CUT_DISP, 1);
       rp_pass_flush(c);
       clock_gettime(CLOCK_MONOTONIC, &tsb); rp_perf_add(RP_PERF_DISP_FLUSH_NS, (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec - f0); }
     g_disp_ind = NULL; g_disp_ind_off = 0;
