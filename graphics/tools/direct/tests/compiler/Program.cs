@@ -1560,7 +1560,8 @@ internal static unsafe class Program
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":0,\"samplerType\":\"2d-array\",\"format\":\"R16G16B16A16Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":8},"
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":4,\"samplerType\":\"cube-shadow\",\"format\":\"R32Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":6},"
                 + "{\"stage\":\"fs\",\"handle\":2,\"cbufSlot\":-1,\"samplerType\":\"buffer\",\"format\":\"R32Uint\",\"isBuffer\":true,\"normalized\":false,\"separate\":false,\"arrayLength\":1},"
-                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1}"
+                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1},"
+                + "{\"stage\":\"fs\",\"handle\":72,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":1}"
                 + "]";
             byte[] matrixRequest = RequestJson(profile, "graphics", 1, 1, "tex-matrix", vs, fs, textureFacts: facts,
                 textureBufferLengths: "{\"0\":8}");
@@ -1687,6 +1688,15 @@ internal static unsafe class Program
                 ("offset past 64 KiB", "offset outside 64 KiB", UboShape("texture", "texture", 1, 4, 0x4000, 1, false)) })
                 Check(outcome == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 4 is not implemented (" + shape + ")",
                     "user-UBO " + what + " handle stays unsupported: " + outcome);
+            // 图像句柄从 c2 图像句柄表读（字 72 + 2k，空轨 2nd 9000 计算「cbuf slot 2」）：有同字直接事实（宿主按图像槽出）→ 绑同号图像槽；
+            //   没有事实的槽、表外的字、数组照旧报未接
+            string c2Img = UboShape("image", "image", 1, 2, 72, 1, false);
+            Check(c2Img == "bound -1/-1/72", "c2 image-table word 72 with its direct fact binds image handle 72: " + c2Img);
+            foreach (var (what, handle, count, len) in new[] { ("without a fact", 74, 1, 1), ("outside the image table", 88, 1, 1), ("as an array", 72, 4, 4) })
+            {
+                string r = UboShape("image", "image", count, 2, handle, len, false);
+                Check(r == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 2 is not implemented", "c2 image word " + what + " stays unsupported: " + r);
+            }
             string c19 = UboShape("texture", "texture", 1, 19, 256, 1, false);
             Check(c19 == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 19 is not implemented", "cbuf 19 is outside the user UBO range: " + c19);
             // Facts alone do not implement separate binding; the production resolver must still refuse it.

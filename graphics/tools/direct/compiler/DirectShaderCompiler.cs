@@ -296,7 +296,12 @@ namespace S2A.DirectCompiler
                     // 数组的第 k 项就是句柄表的第 k 个 8 字节项，宿主按项逐个绑（slot = 0、count = 数组长度），不需要逐句柄的事实。
                     bool handleTableArray = binding.Kind == "texture" && resolved.CbufSlot == 2 && resolved.ArrayLength > 1 &&
                                             resolved.HandleIndex == 0 && binding.Count == resolved.ArrayLength;
-                    if (!handleTableArray && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
+                    // 图像句柄从 c2 图像句柄表读（字节 0x120 + 8k = 字 72 + 2k，空轨 2nd 9000 计算「cbuf slot 2」）：这个字就是 BindImages 第 k 槽的句柄，
+                    //   与立即句柄 72 + 2k 同一个图像槽（计算解析器按 72..86 换算，同 iOS C2_IMG）；要有同字直接事实（宿主按图像槽出），数组不接。
+                    bool c2Image = binding.Kind == "image" && resolved.CbufSlot == 2 && resolved.HandleIndex >= 72 && resolved.HandleIndex < 88 &&
+                                   (resolved.HandleIndex & 1) == 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
+                                   entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot);
+                    if (!handleTableArray && !c2Image && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
                         throw new DirectCompileException("UNSUPPORTED_PROGRAM",
                             binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot + " is not implemented");
                 }
