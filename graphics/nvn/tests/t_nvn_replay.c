@@ -3545,6 +3545,13 @@ static void t_ubo_texture(void) {
     stream again = {0}; q_draw(&again); end(&again); submit1(&again); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_gdraws == 2 && g_fb[1][0].u.ts.view && g_fb[1][0].u.ts.view->of->d.d.width == 2 && g_fb[1][0].u.ts.samp && g_fb[1][0].u.ts.samp->x == 5);
     CHECK(nvn_unimpl_kinds() == 0);
+    // 常量缓冲句柄走同一格式能力检查：RGBA8 无线性过滤时必须交最近点并具名记账。
+    g_caps_nofilter = NVN_FORMAT_RGBA8; sp.magf = NVN_MAG_FILTER_LINEAR; sp.minf = NVN_MIN_FILTER_LINEAR;
+    nvn_be_reg_samp(3, &sp);
+    stream filter = {0}; q_draw(&filter); end(&filter); submit1(&filter); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == 3 && g_samp_last.magf == NVN_MAG_FILTER_NEAREST && g_samp_last.minf == NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST &&
+          nvn_unimpl_count("tex", "filter_unsupported_fmt_0x25") == 1);
+    g_caps_nofilter = ~0u;
     nvn_be_tex_release(&t7); nvn_be_tex_release(&t8); pass_fresh();
 }
 
