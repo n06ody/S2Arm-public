@@ -38,6 +38,7 @@
 #include "nvn_fmt_info.h"
 #include "nvn_fmt_expand.h"
 #include "vk_device.h"
+#include "spirv_storage.h"   // 顶点阶段的存储写检查（与直连接纳同一份，按 Vulkan 规范的 NonWritable 判）
 #include "../capprobe/capprobe.h"
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省关）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
@@ -113,6 +114,7 @@ struct nvn_gpu_view_s {
 struct nvn_gpu_shader_s {
     VkShaderModule mod;
     int missing_storage_format_feature;
+    const char *missing_vertex_feature;   // #1072：顶点阶段写存储 / 写裁剪、剔除距离要的特性设备没启用（特性名）；NULL = 不缺
     nvn_gpu_stage stage;
     nvn_gpu_layout_ent *ents;
     VkFormat *tfmt;              // 与 ents 平行：TBUF / IMAGE_TBUF 项的 texel 视图格式（自 blob 反射）；非 texel 项 UNDEFINED
@@ -2334,6 +2336,30 @@ static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s
     free(sh);
 }
 
+// #1072 第 1 项：顶点前的阶段（VS / TCS / TES / GS）写存储要 vertexPipelineStoresAndAtomics（VUID-RuntimeSpirv-NonWritable-06341），
+// 用到 ClipDistance / CullDistance 能力要 shaderClipDistance / shaderCullDistance。设备没启用时不交给驱动（不合法的 SPIR-V），
+// 返回缺的特性名；建管线时按它报 UNSUPPORTED。存储写的判据（含解析不了按「要」算）与直连接纳是同一份 s2a_spirv_storage_need。
+static uint64_t g_vfeat_missing[3];   // 缺特性被拦下的着色器数：顶点存储写 / 裁剪距离 / 剔除距离
+static const char *spv_vertex_missing(const void *blob, size_t bytes, nvn_gpu_stage st) {
+    const VkPhysicalDeviceFeatures *f = &g.dev->core_features;
+    static const uint32_t model[5] = {0, 4, 3, 1, 2};   // NVN 阶段（VS / FS / GS / TCS / TES）→ SPIR-V ExecutionModel（Vertex 0 / Fragment 4 / Geometry 3 / TessControl 1 / TessEval 2）
+    if (st != NVN_GPU_SH_FS && (unsigned)st < 5 && !f->vertexPipelineStoresAndAtomics &&
+        s2a_spirv_storage_need(blob, bytes, model[st]) != 0) return "vertexPipelineStoresAndAtomics";
+    if (f->shaderClipDistance && f->shaderCullDistance) return NULL;
+    const unsigned char *b = blob; size_t n = bytes / 4;   // blob 不保证 4 字节对齐：逐字节取字
+    for (size_t i = 5; i < n;) {
+        uint32_t word = s2a_spv_word(b + i * 4), len = word >> 16, op = word & 0xffffu;
+        if (!len || len > n - i) break;
+        if (op == 17 && len >= 2) {   // OpCapability
+            uint32_t cap = s2a_spv_word(b + (i + 1) * 4);
+            if (cap == 32 && !f->shaderClipDistance) return "shaderClipDistance";
+            if (cap == 33 && !f->shaderCullDistance) return "shaderCullDistance";
+        } else if (op != 17 && op != 10 && op != 11 && op != 14 && op != 15 && op != 16) break;   // 能力只在模块开头（扩展 / 导入 / 寻址 / 入口 / 执行模式之前）
+        i += len;
+    }
+    return NULL;
+}
+
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err) {
     if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
@@ -2382,9 +2408,20 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
                 ((required & NVN_GPU_ACC_W) && !g.dev->core_features.shaderStorageImageWriteWithoutFormat);
         }
     }
+    sh->missing_vertex_feature = s->stage == NVN_GPU_SH_CS ? NULL : spv_vertex_missing(s->blob, s->bytes, s->stage);
+    if (sh->missing_vertex_feature) {   // 具名报红：每种缺的特性头一次点名，之后只计数（读数见 nvn_gpu_stats 的 shader_missing_*）
+        static int said[3];
+        int k = !strcmp(sh->missing_vertex_feature, "vertexPipelineStoresAndAtomics") ? 0 : !strcmp(sh->missing_vertex_feature, "shaderClipDistance") ? 1 : 2;
+        __atomic_fetch_add(&g_vfeat_missing[k], 1, __ATOMIC_RELAXED);
+        if (!__atomic_exchange_n(&said[k], 1, __ATOMIC_RELAXED)) {
+            char line[200];
+            snprintf(line, sizeof line, "【红】设备没启用 %s：用到它的着色器（首个是阶段 %d）不交给驱动，用它的管线报 UNSUPPORTED、绘制跳过", sh->missing_vertex_feature, (int)s->stage);
+            nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", line);
+        }
+    }
     // 没有启用能力时保留可查询的 shader 句柄，管线入口返回 UNSUPPORTED；
     // 不向驱动提交不合法 SPIR-V，以免 vkCreateShaderModule 先触发 validation。
-    if (!sh->missing_storage_format_feature) {
+    if (!sh->missing_storage_format_feature && !sh->missing_vertex_feature) {
         VkShaderModuleCreateInfo ci = {0};
         ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         ci.codeSize = s->bytes; ci.pCode = s->blob;
@@ -2563,6 +2600,9 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     for (int st = 0; st < 5; st++)
         if (d->st[st].sh && d->st[st].sh->missing_storage_format_feature)
             return fail(err, NVN_GPU_E_UNSUPPORTED, "设备未启用无格式存储图像所需特性");
+    for (int st = 0; st < 5; st++)
+        if (d->st[st].sh && d->st[st].sh->missing_vertex_feature)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "阶段 %d 的着色器要设备特性 %s，设备没启用（#1072）", st, d->st[st].sh->missing_vertex_feature);
     if (d->st[NVN_GPU_SH_GS].sh && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
     if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4)
@@ -6087,7 +6127,10 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "pipe_cache_saves", __atomic_load_n(&g_plcw_started, __ATOMIC_RELAXED));         // 交给后台写盘的次数
     fn(user, "pipe_cache_saves_ok", __atomic_load_n(&g_plcw_ok, __ATOMIC_RELAXED));           // 其中写成功的
     fn(user, "pipe_cache_saves_failed", __atomic_load_n(&g_plcw_fail, __ATOMIC_RELAXED));     // 其中写失败的（只记日志；收尾时会再试）
-    fn(user, "pipe_cache_saves_same", __atomic_load_n(&g_plcw_same, __ATOMIC_RELAXED));       // 触发了但数据大小与上次保存一致、没写的次数
+    fn(user, "pipe_cache_saves_same", __atomic_load_n(&g_plcw_same, __ATOMIC_RELAXED));
+    fn(user, "shader_missing_vertex_stores", __atomic_load_n(&g_vfeat_missing[0], __ATOMIC_RELAXED));   // 顶点前阶段写存储、设备没启用 vertexPipelineStoresAndAtomics 的着色器数
+    fn(user, "shader_missing_clip_distance", __atomic_load_n(&g_vfeat_missing[1], __ATOMIC_RELAXED));
+    fn(user, "shader_missing_cull_distance", __atomic_load_n(&g_vfeat_missing[2], __ATOMIC_RELAXED));       // 触发了但数据大小与上次保存一致、没写的次数
 }
 
 // 用例读：视图全局链与帧缓冲缓存的当前账。0 现存视图数；1 旧路径（nvk_ulist=0）摘链累计走过的节点数（缺省路径恒为 0）；

@@ -147,6 +147,14 @@
                 }
             }
         },
+        "no_clip_distance": {
+            "features": {
+                "VkPhysicalDeviceFeatures": {
+                    "shaderClipDistance": false,
+                    "shaderCullDistance": false
+                }
+            }
+        },
         "no_dual_src_blend": {
             "features": {
                 "VkPhysicalDeviceFeatures": {
@@ -222,7 +230,7 @@
             "version": 1,
             "api-version": "1.1.0",
             "label": "无顶点阶段存储写",
-            "description": "藏掉 vertexPipelineStoresAndAtomics（Mali 类）。期望：发行宏下仍能建设备，契约绿。",
+            "description": "藏掉 vertexPipelineStoresAndAtomics（Mali 类）。期望：发行宏下仍能建设备；顶点阶段写存储的着色器不交给驱动、管线报 UNSUPPORTED 并点名特性，只读存储照建（C1072a），validation 0 条，契约绿。",
             "contributors": {},
             "history": [
                 {
@@ -234,6 +242,24 @@
             ],
             "capabilities": [
                 "no_vertex_stores"
+            ]
+        },
+        "VP_S2A_SIM_no_clip_distance": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "无裁剪 / 剔除距离",
+            "description": "藏掉 shaderClipDistance 与 shaderCullDistance（Mali 类）。期望：写裁剪 / 剔除距离的顶点着色器不交给驱动，用它的管线按规定报 UNSUPPORTED 并点名特性（C1072a），validation 0 条，契约绿。",
+            "contributors": {},
+            "history": [
+                {
+                    "revision": 1,
+                    "date": "2026-11-15",
+                    "author": "S2Arm",
+                    "comment": "首版（#1072 第 1 项）：只按 Vulkan 规范特性名手写，不含任何设备报告数据"
+                }
+            ],
+            "capabilities": [
+                "no_clip_distance"
             ]
         },
         "VP_S2A_SIM_no_dual_src_blend": {

@@ -19,7 +19,7 @@ tiers_json="$repo/android/tests/vk/profiles/s2a_sim_tiers.json"
 profiles_sha=b502e9b0d7508e06e6300af272548cf0ee32f380
 profiles_url=https://github.com/KhronosGroup/Vulkan-Profiles.git
 
-all=(no_bc no_d24 no_vertex_stores no_dual_src_blend no_calibrated_timestamps no_exact16 no_depth_clamp)
+all=(no_bc no_d24 no_vertex_stores no_clip_distance no_dual_src_blend no_calibrated_timestamps no_exact16 no_depth_clamp)
 want=("$@"); [ ${#want[@]} -gt 0 ] || want=("${all[@]}")
 for t in "${want[@]}"; do
     case " ${all[*]} " in *" $t "*) ;; *) echo "未知档：${t}（可用：${all[*]}）" >&2; exit 64 ;; esac
@@ -120,7 +120,15 @@ check_tier() {
         no_vertex_stores)
             run_tier no_vertex_stores "$log" || rc=$?
             [ "$rc" -eq 0 ] || red no_vertex_stores "run.sh rc=${rc}，期望发行宏下仍建得了设备、契约绿"
-            has "$log" "vertexPipelineStoresAndAtomics=0" || red no_vertex_stores "层没藏住 vertexPipelineStoresAndAtomics" ;;
+            has "$log" "vertexPipelineStoresAndAtomics=0" || red no_vertex_stores "层没藏住 vertexPipelineStoresAndAtomics"
+            has "$log" "【红】设备没启用 vertexPipelineStoresAndAtomics" || red no_vertex_stores "没看到顶点阶段写存储按特性点名报红（#1072）"
+            has "$log" "C1072a 缺特性时 UNSUPPORTED 并点名特性" || red no_vertex_stores "C1072a 没跑完" ;;
+        no_clip_distance)
+            run_tier no_clip_distance "$log" || rc=$?
+            [ "$rc" -eq 0 ] || red no_clip_distance "run.sh rc=${rc}，期望契约绿、0 条 validation"
+            has "$log" "shaderClipDistance=0 shaderCullDistance=0" || red no_clip_distance "层没藏住 shaderClipDistance / shaderCullDistance"
+            has "$log" "【红】设备没启用 shaderClipDistance" || red no_clip_distance "没看到写裁剪距离按特性点名报红（#1072）"
+            has "$log" "C1072a 缺特性时 UNSUPPORTED 并点名特性" || red no_clip_distance "C1072a 没跑完" ;;
         no_dual_src_blend)
             run_tier no_dual_src_blend "$log" || rc=$?
             [ "$rc" -eq 0 ] || red no_dual_src_blend "run.sh rc=$rc"

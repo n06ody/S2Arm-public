@@ -4017,6 +4017,46 @@ static void c60_image_tbuf(const char *dir) {
     nvn_gpu_shader_release(sh);
 }
 
+// C1072a：顶点阶段写存储 / 写裁剪距离 / 写剔除距离按已启用的设备特性守门（#1072 第 1 项）。
+// 缺特性时 shader 照样装载（不向驱动交不合法 SPIR-V），建管线返回 UNSUPPORTED，原因里点名缺的特性；
+// 负控：只读存储缓冲（NonWritable）不要 vertexPipelineStoresAndAtomics，缺它时管线照建。
+// 设备真有这项特性：先把「已启用记录」清掉验拒绝，再恢复验正控；设备真没有（模拟机型档）：只验拒绝，且不该有 validation 报错。
+static nvn_gpu_rc c1072a_get(const char *dir, const char *vs_name, int storage, nvn_gpu_pipe *out, nvn_gpu_err *e) {
+    *out = NULL;
+    nvn_gpu_layout_ent ent = {0};
+    ent.cls = NVN_GPU_RES_SSBO; ent.access = storage == 2 ? NVN_GPU_ACC_R : NVN_GPU_ACC_W; ent.count = 1; ent.stages = 1u << NVN_GPU_SH_VS;
+    nvn_gpu_layout lay = {0}; lay.ent = &ent; lay.nent = 1;
+    nvn_gpu_shader vs = load_one_shader(dir, vs_name, NVN_GPU_SH_VS, storage ? &lay : NULL);
+    nvn_gpu_shader fs = load_one_shader(dir, "solid_green.frag", NVN_GPU_SH_FS, NULL);
+    nvn_gpu_rc r = {NVN_GPU_E_ARG};
+    if (vs && fs) { nvn_gpu_pipe_desc pd; fill_gpipe_desc(&pd, vs, fs, 0); memset(e, 0, sizeof *e); r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, out, e); }
+    if (vs) nvn_gpu_shader_release(vs);
+    if (fs) nvn_gpu_shader_release(fs);
+    return r;
+}
+static void c1072a_case(const char *dir, const char *vs_name, int storage, VkBool32 *feature, const char *fname, int need) {
+    const VkBool32 has = *feature;
+    nvn_gpu_err e; nvn_gpu_pipe p = NULL;
+    *feature = VK_FALSE;
+    nvn_gpu_rc r = c1072a_get(dir, vs_name, storage, &p, &e);
+    *feature = has;
+    if (need) CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !p && strstr(e.why, fname), "C1072a %s 缺 %s 时管线应 UNSUPPORTED 且点名，实 %d「%s」", vs_name, fname, r.code, e.why);
+    else CHECK(OK(r) && p, "C1072a 负控 %s 缺 %s 时管线照建：%d %s", vs_name, fname, r.code, e.why);
+    if (!has) return;
+    r = c1072a_get(dir, vs_name, storage, &p, &e);
+    CHECK(OK(r) && p, "C1072a %s 有 %s 时管线应建成：%d %s", vs_name, fname, r.code, e.why);
+}
+static void c1072a_vertex_caps(const char *dir) {
+    VkPhysicalDeviceFeatures *f = &g_dev.core_features;
+    printf("C1072a 顶点阶段写存储 / 裁剪距离：设备 vertexPipelineStoresAndAtomics=%u shaderClipDistance=%u shaderCullDistance=%u\n",
+           (unsigned)f->vertexPipelineStoresAndAtomics, (unsigned)f->shaderClipDistance, (unsigned)f->shaderCullDistance);
+    c1072a_case(dir, "vs_store.vert", 1, &f->vertexPipelineStoresAndAtomics, "vertexPipelineStoresAndAtomics", 1);
+    c1072a_case(dir, "vs_load.vert", 2, &f->vertexPipelineStoresAndAtomics, "vertexPipelineStoresAndAtomics", 0);
+    c1072a_case(dir, "vs_clip.vert", 0, &f->shaderClipDistance, "shaderClipDistance", 1);
+    c1072a_case(dir, "vs_cull.vert", 0, &f->shaderCullDistance, "shaderCullDistance", 1);
+    printf("C1072a 缺特性时 UNSUPPORTED 并点名特性，只读存储负控照建\n");
+}
+
 // C60b：Unknown 存储视图须按已启用的 without-format 写特性建管线。
 static void c60b_unknown_image_tbuf(const char *dir) {
     VkBool32 enabled = g_dev.core_features.shaderStorageImageWriteWithoutFormat;
@@ -7470,6 +7510,7 @@ int main(int argc, char **argv) {
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C66 close：%d %s", e18.rc.code, e18.why);
     if (!open_backend()) return 1;
     c60b_unknown_image_tbuf(argv[1]);
+    c1072a_vertex_caps(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C60b close：%d %s", e18.rc.code, e18.why);
     if (!open_backend()) return 1;
     c60c_unknown_image_tbuf_read(argv[1]);
