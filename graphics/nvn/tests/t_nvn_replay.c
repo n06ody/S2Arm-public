@@ -198,7 +198,7 @@ static int g_pipe_rc;
 static int g_pipe_gets, g_set_pipes, g_set_dyns, g_gdraws; static nvn_gpu_pipe_desc g_last_pdesc; static nvn_gpu_dyn g_last_dyn; static nvn_gpu_draw_args g_last_da;
 static struct { uint32_t stream; uint64_t off; } g_vb[4]; static int g_nvb;
 static nvn_gpu_binding g_fb[3][16]; static uint32_t g_nfb[3];
-static _Alignas(16) uint8_t g_arena[1 << 16]; static uint64_t g_arena_used; static struct nvn_gpu_buf_s g_arena_buf;
+static _Alignas(16) uint8_t g_arena[1 << 18]; static uint64_t g_arena_used; static struct nvn_gpu_buf_s g_arena_buf;   // 256 KiB：放得下超长常量缓冲用例修前的整段拷贝（越界由 arena_alloc 拦）
 nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) { (void)mode; g_pipe_gets++; g_last_pdesc = *d; *out = g_pipe_rc ? NULL : &g_fpipe; if (err) { memset(err, 0, sizeof *err); err->rc.code = g_pipe_rc; } return (nvn_gpu_rc){g_pipe_rc}; }
 void nvn_gpu_set_pipe(nvn_gpu_cmd c, nvn_gpu_pipe p) { (void)c; (void)p; g_set_pipes++; }
 static struct nvn_gpu_pipe_s g_fcpipe;
@@ -219,7 +219,8 @@ void nvn_gpu_bind(nvn_gpu_cmd c, nvn_gpu_stage st, const nvn_gpu_binding *b, uin
     int i = (int)st; g_bind_calls[i]++; g_nfb[i] = n; memcpy(g_fb[i], b, (n < 16 ? n : 16) * sizeof *b); }
 void nvn_gpu_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *a) { (void)c; g_gdraws++; g_last_da = *a; if (!g_pass_open) g_draw_outside++; }
 static uint32_t g_caps_extra;   // 用例临时打开的能力位（如间接计数多绘）
-void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ubo_align = 64; out->caps = NVN_GPU_CAP_BLIT_SCALED | g_caps_extra; }
+static uint64_t g_caps_max_ubo;   // 用例临时设的 maxUniformBufferRange（0 = 不报上限，其余用例的口径）
+void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ubo_align = 64; out->caps = NVN_GPU_CAP_BLIT_SCALED | g_caps_extra; out->max_ubo_range = g_caps_max_ubo; }
 static int g_arena697_fail;
 nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nvn_gpu_slice *out, nvn_gpu_err *err) { (void)c; (void)err;
     if(g_arena697_fail) { memset(out,0,sizeof *out);memset(err,0,sizeof *err);
@@ -228,7 +229,9 @@ nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nv
             memset(err->why,'X',sizeof err->why);char prefix[48];snprintf(prefix,sizeof prefix,"first-bind-outside-pass-%d ",g_arena697_fail);
             memcpy(err->why,prefix,strlen(prefix));err->why[sizeof err->why-1]=0; }
         return err->rc; }
-    g_arena_used = (g_arena_used + align - 1) / align * align; out->buf = &g_arena_buf; out->off = g_arena_used; out->cpu = g_arena + g_arena_used; out->va = 0; g_arena_used += bytes; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    g_arena_used = (g_arena_used + align - 1) / align * align;
+    if (g_arena_used > sizeof g_arena || bytes > sizeof g_arena - g_arena_used) { memset(out, 0, sizeof *out); if (err) { memset(err, 0, sizeof *err); err->rc.code = NVN_GPU_E_OOM; } return (nvn_gpu_rc){NVN_GPU_E_OOM}; }   // 替身暂存区用满：如实失败，不写穿
+    out->buf = &g_arena_buf; out->off = g_arena_used; out->cpu = g_arena + g_arena_used; out->va = 0; g_arena_used += bytes; return (nvn_gpu_rc){NVN_GPU_OK}; }
 
 static const uint64_t *g_fake_occ; static uint32_t g_fake_nocc;   // 下一次完成时交给回调的各槽样本数
 static void fake_complete(uint32_t status) {
@@ -1561,6 +1564,63 @@ static void t_stage_dropped_clears_binds(void) {
     g_fprog.sh[1] = &g_fsh[1];
     g_snap_prog = NULL; pass_fresh();
 }
+// 用户常量缓冲长于着色器的声明（64 KiB）：只绑前 64 KiB，内容是池里的前 64 KiB，照画、不报红；
+// 收窄后仍超过设备 maxUniformBufferRange：这一笔具名跳过，同一次提交里下一笔照画（真后端收到超长范围会置粘滞、整段作废）。
+// 不该收窄的不收窄；声明比池长但前 64 KiB 在池里的也能绑（拷的只是这一截）。计算阶段同一条路。
+static _Alignas(4096) uint8_t g_cbig[0x20000];
+static void t_cbuf_device_range(void) {
+    pass_fresh(); g_gdraws = g_resolves = g_resolve_rc = 0; g_arena_used = 0;
+    memset(g_bind_calls, 0, sizeof g_bind_calls); memset(g_nfb, 0, sizeof g_nfb);
+    for (unsigned i = 0; i < sizeof g_cbig; i++) g_cbig[i] = (uint8_t)(i * 7u + (i >> 12));
+    nvn_be_pool_add(g_cbig, sizeof g_cbig);
+    const uint64_t base = (uint64_t)(uintptr_t)g_cbig;
+    const uint64_t ex0 = nvn_unimpl_count("draw", "uniform_buffer_exceeds_device_range");
+    const uint64_t op0 = nvn_unimpl_count("draw", "uniform_buffer_outside_pools");
+    struct { uint64_t off, size, max_ubo, want; } cases[] = {
+        {0,       0x18000, 0x10000, 0x10000},   // 比声明长：只绑 64 KiB
+        {0x1000,  0x8000,  0x10000, 0x8000},    // 负对照：比声明短，原样
+        {0x2000,  0x10000, 0x10000, 0x10000},   // 负对照：正好 64 KiB，原样
+        {0x10000, 0x18000, 0x10000, 0x10000},   // 声明越过池尾，但前 64 KiB 在池里
+        {0x3000,  0x18000, 0,       0x10000},   // 设备没报上限：只按声明收窄
+    };
+    for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        g_caps_max_ubo = cases[k].max_ubo; rp_draw_reset(); g_arena_used = 0;   // 能力表是缓存的：改了替身上限就重开一次
+        stream s = {0}; q_env(&s);
+        g_fprog.nent[0] = 1; g_fprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][0].src_kind = NVN_RB_CBUF; g_fprog.ent[0][0].src_reg = 2;
+        p_bind_buf *ub = put(&s, OP_BIND_UBO, sizeof *ub); ub->stage = 0; ub->index = 2; ub->addr = base + cases[k].off; ub->size = cases[k].size;
+        q_draw(&s); end(&s);
+        int d0 = g_gdraws;
+        submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_gdraws == d0 + 1 && g_nfb[0] == 1 && g_fb[0][0].u.b.buf == &g_arena_buf);
+        CHECK(g_fb[0][0].u.b.len == cases[k].want && !memcmp(g_arena + g_fb[0][0].u.b.off, g_cbig + cases[k].off, (size_t)cases[k].want));
+    }
+    CHECK(nvn_unimpl_count("draw", "uniform_buffer_exceeds_device_range") == ex0);
+    CHECK(nvn_unimpl_count("draw", "uniform_buffer_outside_pools") == op0);
+    // 设备上限 16 KiB：收窄到 64 KiB 仍超 → 这笔具名跳过；同一次提交里下一笔绑 8 KiB 照画
+    g_caps_max_ubo = 0x4000; rp_draw_reset(); g_arena_used = 0;
+    { stream s = {0}; q_env(&s);
+      g_fprog.nent[0] = 1; g_fprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[0][0].src_kind = NVN_RB_CBUF; g_fprog.ent[0][0].src_reg = 2;
+      p_bind_buf *ub = put(&s, OP_BIND_UBO, sizeof *ub); ub->stage = 0; ub->index = 2; ub->addr = base + 0x4000; ub->size = 0x18000;
+      q_draw(&s);
+      ub = put(&s, OP_BIND_UBO, sizeof *ub); ub->stage = 0; ub->index = 2; ub->addr = base + 0x5000; ub->size = 0x2000;
+      q_draw(&s); end(&s);
+      int d0 = g_gdraws;
+      submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+      CHECK(nvn_unimpl_count("draw", "uniform_buffer_exceeds_device_range") == ex0 + 1);
+      CHECK(g_gdraws == d0 + 1 && g_fb[0][0].u.b.len == 0x2000 && !memcmp(g_arena + g_fb[0][0].u.b.off, g_cbig + 0x5000, 0x2000)); }
+    // 计算阶段：同一条绑定路
+    g_caps_max_ubo = 0x10000; rp_draw_reset(); g_arena_used = 0;
+    { g_cresolves = g_cresolve_rc = g_cpipe_gets = g_ndisp = g_cbinds = 0; g_ncb = 0;
+      memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+      g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_cprog.ent[0][0].src_kind = NVN_RB_CBUF; g_cprog.ent[0][0].src_reg = 1;
+      stream s = {0};
+      p_bind_buf *ub = put(&s, OP_BIND_UBO, sizeof *ub); ub->stage = 5; ub->index = 1; ub->addr = base + 0x6000; ub->size = 0x18000;
+      p_dispatch *dp = put(&s, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1;
+      end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+      CHECK(g_ndisp == 1 && g_cbinds == 1 && g_ncb == 1 && g_cb[0].u.b.buf == &g_arena_buf);
+      CHECK(g_cb[0].u.b.len == 0x10000 && !memcmp(g_arena + g_cb[0].u.b.off, g_cbig + 0x6000, 0x10000)); }
+    g_caps_max_ubo = 0; rp_draw_reset(); g_arena_used = 0; pass_fresh();
+}
 // 绘制要绑的存储缓冲，同一次提交里第二次同步时要录成传输、结束通道：必须发生在开通道之前，
 // 不能在设了管线之后、发绑定的途中把通道结束掉（真后端随后收到通道外的绑定，置粘滞、整段作废；#697 Mali 真机）。
 // 池不受写跟踪 → 每次用都整段同步；同一段里两笔都绑同一段存储缓冲，第二笔那次同步一定走传输。
@@ -2843,7 +2903,7 @@ int main(int argc, char **argv) {
     t_arena697_detail();
     t_logic_op_accounting();
     t_gs_dirty_and_topology();
-    t_gs_bind(); t_storage_sync_before_pass(); t_stage_dropped_clears_binds();
+    t_gs_bind(); t_storage_sync_before_pass(); t_stage_dropped_clears_binds(); t_cbuf_device_range();
     t_decl_sampling();
     t_separate_sampler();
     t_present();

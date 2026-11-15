@@ -24,6 +24,9 @@
 enum { SB_RENDER_SCALE = 192, SB_S2A_FLAGS = 1392, SB_S2A_POINT = 1408, SB_RENDER_SCALE_Y = 1440, SB_RENDER_SCALE_COUNT = 73 };
 // 驱动常量段 c0 的合成布局（着色器从它读存储缓冲描述符表、最大点径、base instance）
 enum { DRV0_BYTES = 0xA00 };
+// 用户常量缓冲在着色器里的声明长度：64 KiB（NVN 设备信息 MAX_UNIFORM_BUFFER_SIZE = 65536，见 hle_nvn.c 的设备信息表；
+// 翻译器同 Ryujinx Constants.ConstantBufferSize = 0x10000，声明成 vec4[4096]）。绑定只给这么长，多了着色器也读不到。
+enum { RP_CBUF_SHADER_BYTES = 0x10000 };
 static const int k_drv0_base[5] = {0x110, 0x510, 0x410, 0x210, 0x310};   // 各图形阶段的存储缓冲表起点
 
 int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *size);   // rp_entry.c
@@ -470,13 +473,18 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 const uint64_t cbuf_t0 = btm ? dt_now() : 0;
                 const p_bind_buf *ub = &rp_S.ubo[st][e->src_reg];
                 if (!ub->addr || !ub->size) return skip("uniform_buffer_unbound", rec);
+                // 着色器能读的只有前 RP_CBUF_SHADER_BYTES：游戏绑得更长，多出来的部分它读不到，只绑这一截（不报红）。
+                const uint64_t len = ub->size < RP_CBUF_SHADER_BYTES ? ub->size : RP_CBUF_SHADER_BYTES;
+                // 收窄后仍超过设备的 maxUniformBufferRange：钳到设备上限照画是越界读（后端没开 robustBufferAccess，
+                // 未定义行为），交给后端则整段作废——这一笔具名跳过，同段其余命令照常。上限取缓存的能力表（每帧几千次，不抢后端锁）。
+                { const uint64_t mr = caps_cached()->max_ubo_range;
+                  if (mr && len > mr) return skip("uniform_buffer_exceeds_device_range", rec); }
                 // 常量缓冲一律拷进本段的暂存区再绑：就是编码这一刻的内容（按序的 OP_UPDATE_UB 之后再用自然是新值），
-                // 不经池镜像，也就没有通道内的传输。地址必须在登记过的池里。
-                if (!rp_pool_find(ub->addr, ub->size, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
-                if (ub->size > 0xffffffffull) return skip("uniform_buffer_too_large", rec);
-                rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, ub->size >> 10);
-                if (!slc_get(c, ub->addr, ub->size, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
-                o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
+                // 不经池镜像，也就没有通道内的传输。要拷的这一截必须在登记过的池里。
+                if (!rp_pool_find(ub->addr, len, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
+                rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, len >> 10);
+                if (!slc_get(c, ub->addr, len, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
+                o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = len; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
             case NVN_RB_IMG: {
                 if (st != 5 || e->cls != NVN_GPU_RES_IMAGE || e->count > 1) return skip("compute_image_shape", rec);
                 if (!tv[i]) return skip("compute_image_unresolved", rec);
