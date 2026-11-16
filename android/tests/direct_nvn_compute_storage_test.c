@@ -37,6 +37,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nvn/nvn_vk_program_result.h"
@@ -460,7 +461,27 @@ static void case_reads_reject_non_array(void) {
     }
 }
 
+// 共享内存溢出缓冲（kind = spill，编译器 DirectSharedSpill）：每线程组字节数进程序对象；没有客体槽；形状不对如实拒
+static void case_spill(void) {
+    group("[S] 共享内存溢出缓冲 spill 绑定");
+    struct nvn_vk_compute_program p;
+    if (accept_case("[S1] spill 40960 字节 / 组", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":40960}", "[]", "[]", &p) == 0) {
+        ck_u32("[S1] spill_bytes", p.spill_bytes, 40960);
+        ck_u32("[S1] binding kind 4", (uint32_t)p.bindings[0].kind, 4);
+        nvn_vk_program_free_compute(&p);
+    }
+    if (accept_case("[S2] 没有 spill 绑定", "", "[]", "[]", &p) == 0) { ck_u32("[S2] spill_bytes 为 0", p.spill_bytes, 0); nvn_vk_program_free_compute(&p); }
+    reject_case("[S3] spill 缺 bytesPerGroup", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S4] spill bytesPerGroup 不是 4 的倍数", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":40962}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S5] spill 超过 64 KB", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":65540}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S6] 两个 spill", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":4},"
+                "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":1,\"count\":1,\"bytesPerGroup\":4}", "[]", "[]", "more than one spill");
+    reject_case("[S7] spill 带客体槽", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"slot\":0,\"bytesPerGroup\":4}", "[]", "[]", "guest slot");
+    reject_case("[S8] 非 spill 绑定带 bytesPerGroup", "{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":8,\"count\":1,\"bytesPerGroup\":4}", "[]", "[]", "bytesPerGroup");
+}
+
 int main(void) {
+    case_spill();
     case_accept_nvn();
     case_accept_ubo_ptr();
     case_accept_ubo_address();
@@ -487,6 +508,38 @@ int main(void) {
         int rc = nvn_vk_program_parse_compute((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
         ck_true("compute v2 separate maximum slots", rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == 255 && p.bindings[0].samp_slot == 127, why);
         nvn_vk_program_free_compute(&p);
+    }
+
+    // 计算结果是「程序」级文档：超过 1 MiB（描述文件上限）的合法结果要接；超过程序结果上限（64 MiB，同跨局缓存单条）的拒，原因带大小
+    {
+        static const uint8_t head[20] = {0x03, 0x02, 0x23, 0x07, 0x00, 0x01, 0x03, 0x00, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0};
+        const size_t spv_bytes = (size_t)3 << 19;   // 1.5 MiB 的 SPIR-V（头 + 0 字；解析器只核头与对齐）
+        uint8_t *spv = calloc(1, spv_bytes); memcpy(spv, head, sizeof head);
+        static const char t64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        size_t b64n = (spv_bytes + 2) / 3 * 4; char *b64 = malloc(b64n + 1), *q = b64;
+        for (size_t i = 0; i < spv_bytes; i += 3) {
+            uint32_t v = (uint32_t)spv[i] << 16 | (i + 1 < spv_bytes ? (uint32_t)spv[i + 1] << 8 : 0) | (i + 2 < spv_bytes ? spv[i + 2] : 0);
+            *q++ = t64[v >> 18 & 63]; *q++ = t64[v >> 12 & 63]; *q++ = i + 1 < spv_bytes ? t64[v >> 6 & 63] : '='; *q++ = i + 2 < spv_bytes ? t64[v & 63] : '=';
+        }
+        *q = 0;
+        size_t cap = b64n + 1024; char *json = malloc(cap), why[192] = ""; struct nvn_vk_compute_program p;
+        int n = snprintf(json, cap,
+            "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+            "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\","
+            "\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
+            "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"%s\"}],\"bindings\":[],"
+            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}", b64);
+        int rc = nvn_vk_program_parse_compute((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
+        ck_true("compute result larger than 1 MiB is accepted", n > (1 << 20) && rc == 0 && p.stage.spirv_bytes == spv_bytes, why);
+        if (rc == 0) nvn_vk_program_free_compute(&p);
+        free(json); free(b64); free(spv);
+        size_t over = (size_t)NVK_PROGRAM_RESULT_MAX_BYTES + 1;
+        char *big = malloc(over); memset(big, ' ', over); big[0] = '{'; big[over - 1] = '}';
+        why[0] = 0;
+        rc = nvn_vk_program_parse_compute((const uint8_t *)big, over, &p, why, sizeof why);
+        char want[64]; snprintf(want, sizeof want, "%zu bytes", over);
+        ck_true("compute result over the program limit is rejected with its size", rc != 0 && strstr(why, want) && strstr(why, "larger than"), why);
+        free(big);
     }
 
     // 立即句柄直接读 c2 分离贴图表的字（空轨 2nd 9000：cs 也有）：slot 90..344 偶、无 samp_slot → 分离贴图槽 128 + k；表外 / 奇字照旧拒

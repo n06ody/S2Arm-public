@@ -294,6 +294,10 @@ static int parse_value(parser *p, int depth, s2a_json_field *field) {
 
 int s2a_json_parse_object(const uint8_t *data, size_t bytes, s2a_json_object *out,
                           char *err, size_t err_size) {
+    return s2a_json_parse_object_max(data, bytes, S2A_JSON_MAX_BYTES, out, err, err_size);
+}
+int s2a_json_parse_object_max(const uint8_t *data, size_t bytes, size_t max_bytes, s2a_json_object *out,
+                              char *err, size_t err_size) {
     if (err && err_size) err[0] = 0;
     if (!data || !out) {
         if (err && err_size) snprintf(err, err_size, "null input");
@@ -303,8 +307,8 @@ int s2a_json_parse_object(const uint8_t *data, size_t bytes, s2a_json_object *ou
         if (err && err_size) snprintf(err, err_size, "empty input");
         return S2A_JSON_ERROR_EMPTY;
     }
-    if (bytes > S2A_JSON_MAX_BYTES) {
-        if (err && err_size) snprintf(err, err_size, "document larger than %u", S2A_JSON_MAX_BYTES);
+    if (bytes > max_bytes) {
+        if (err && err_size) snprintf(err, err_size, "document of %zu bytes larger than %zu", bytes, max_bytes);
         return S2A_JSON_ERROR_TOO_LARGE;
     }
     parser p = { data, bytes, 0, out, err, err_size, 0 };

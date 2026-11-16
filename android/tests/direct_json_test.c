@@ -2,6 +2,7 @@
 #include "../native/direct/json.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_failures;
@@ -102,6 +103,17 @@ int main(void) {
         char text[600];
         snprintf(text, sizeof text, "{\"%.300s\":1}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         rejects(text, "key too long");
+    }
+    // 文档上限：缺省 1 MiB（描述文件）不变；s2a_json_parse_object_max 按调用方给的上限，超了报出实际大小
+    {
+        size_t big = ((size_t)1 << 20) + 16; char *doc = malloc(big); s2a_json_object o2; char e2[128] = "";
+        memset(doc, ' ', big); doc[0] = '{'; doc[big - 1] = '}';
+        CHECK(s2a_json_parse_object((const uint8_t *)doc, big, &o2, e2, sizeof e2) == S2A_JSON_ERROR_TOO_LARGE, "default limit stays 1 MiB");
+        e2[0] = 0;
+        CHECK(s2a_json_parse_object_max((const uint8_t *)doc, big, (size_t)2 << 20, &o2, e2, sizeof e2) == 0 && o2.count == 0, "explicit 2 MiB limit accepts a 1 MiB + 16 document");
+        CHECK(s2a_json_parse_object_max((const uint8_t *)doc, big, (size_t)1 << 20, &o2, e2, sizeof e2) == S2A_JSON_ERROR_TOO_LARGE &&
+              strstr(e2, "1048592 bytes") && strstr(e2, "1048576"), "explicit limit reports actual size and limit");
+        free(doc);
     }
     if (g_failures) { printf("direct-json: %d FAILURES\n", g_failures); return 1; }
     printf("direct-json: ok\n");
