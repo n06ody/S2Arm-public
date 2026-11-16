@@ -267,6 +267,13 @@ def main():
         return 0
     if sys.argv[1:]:
         raise ValueError('usage: nvk_shader_pool_test.py [--withdraw]')
+    # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
+    exe = out/'image-decl'
+    host_link.run(base + [str(ROOT/'android/tests/image_decl_test.c'), *[str(p) for p in libs]] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+    decl = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    sys.stdout.write(decl.stdout); sys.stderr.write(decl.stderr)
+    if decl.returncode:
+        return decl.returncode
     result = run('test', original)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)

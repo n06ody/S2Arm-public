@@ -142,6 +142,23 @@ static unsigned g_pool_reason_count;
 
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
 static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
+// 程序级失败（编译拒收 / 结果解析失败）：计数同 red1，但每一条都带程序键与原因写一行（整局前 256 条），
+//   这样一局里几十个失败程序能逐个按程序归因（只记首条时，空轨 2nd 9000 局 19 个计算解析失败只看得到 1 个原因）。
+//   程序键 = 当前绑定的阶段控制键（计算 = NVN 阶段 5；图形 = 已绑的各阶段，斜杠分隔），同编译请求的 requestId 与普查的键。
+static void red_prog(const char *name, int compute, const char *why) {
+    nvn_unimpl("shader", name, NULL);
+    static _Atomic int said;
+    if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 256) return;
+    char key[96] = ""; int o = 0;
+    for (unsigned st = compute ? 5 : 0; st <= (compute ? 5u : 4u) && o < (int)sizeof key - 18; st++) {
+        uint8_t k[8];
+        if (compute) memcpy(k, rp_S.skey[5], 8); else if (!rp_shader_stage_key(st, k)) continue;
+        if (o) key[o++] = '/';
+        for (int b = 0; b < 8; b++) o += snprintf(key + o, sizeof key - (size_t)o, "%02x", k[b]);
+    }
+    char m[768]; snprintf(m, sizeof m, "%s（程序键 %s）：%s", name, o ? key : "未知", why ? why : "");
+    nvn_plat_log(NVN_PLAT_LOG_RED, "shader", m);
+}
 // 不需要 _GNU_SOURCE 的 strdup：快照要活过后台线程，profile 原文 / closure / profileHash 必须各存一份。
 static char *dup_str(const char *s) {
     if (!s) return NULL;
@@ -510,6 +527,8 @@ static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
         if (b->storage_writable) e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W;
         return 1;
     }
+    // 共享内存溢出缓冲（计算）：没有客体来源，回放按派发组数 × 程序的 spill_bytes 从暂存区分配（rp_draw.c rp_dispatch）
+    if (b->kind == 4 && b->count == 1) { e->cls = NVN_GPU_RES_SSBO; e->src_kind = NVN_RB_SPILL; e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W; return 1; }
     // 图像：只接计算阶段的单个存储图像（解析器给出 NVN 图像槽 0..7，放在 tex_slot）；回放按槽取 BindImage 的句柄建存储视图
     //   （rp_draw.c rp_dispatch NVN_RB_IMG）。图形阶段的图像回放还没接，绘制时按名跳过（compute_image_shape）。
     if (b->kind == 3 && b->count == 1 && b->tex_slot >= 0 && b->tex_slot < 8) {
@@ -536,8 +555,9 @@ static int usrc_put(struct rp_prog *pg, const struct fd_binding *b, nvn_gpu_layo
     return 1;
 }
 
-// 只读组合采样贴图的声明；无法识别时保留 0，不根据绑定对象猜类型。
-static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t binding, uint8_t *dtt, uint8_t *dcls) {
+// 组合采样贴图与存储图像的声明；无法识别时保留 0，不根据绑定对象猜类型。
+//   ifmt（可为 NULL）：存储图像 OpTypeImage 的 Image Format 操作数（SPIR-V 枚举，0 = Unknown），回放按它与数值类选视图格式
+static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t binding, uint8_t *dtt, uint8_t *dcls, uint8_t *ifmt) {
     const uint32_t *w = blob;
     if (!w || bytes < 20 || bytes % 4 || w[0] != 0x07230203u || !w[3] || w[3] > 0x100000u) return;
     uint32_t bound = w[3]; size_t words = bytes / 4;
@@ -606,6 +626,7 @@ static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t 
             if (op_type != 22 && (op_type != 21 || sample[3] > 1)) break;
             *dtt = (uint8_t)(target + 1);
             *dcls = depth == 1 ? 3 : op_type == 21 ? (sample[3] ? 2 : 1) : 0;
+            if (ifmt && q[8] < 256) *ifmt = (uint8_t)q[8];
             goto done;
         }
     }
@@ -627,7 +648,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     memset(&fp, 0, sizeof fp);
     int parsed = nvn_vk_program_parse_graphics_stages(bytes, len, &fp, nst == 1, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("program_parse_failed", 0, why);
         nvn_vk_program_free(&fp); e->failed = 1; return e;
     }
     for (int st = 0; st < FD_MAX_STAGES; st++) {
@@ -653,7 +674,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", b->stage); e->failed = 1; break; }
             le->stages = b->is_support ? (1u << nst) - 1u : 1u << st;
             if (b->kind == 2) sampled_decl(fp.stage[st].spirv, fp.stage[st].spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
-                &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]]);
+                &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]], NULL);
             if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[st][e->prog.nent[st]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
                 red1("tbuf_shader_type_unproven", b->stage); e->failed = 1; break;
             }
@@ -879,7 +900,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         free(json);
         if (ran || !oc.bytes || !oc.bytes_len) {
             atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
-            red1("compile_failed", oc.summary);
+            red_prog("compile_failed", 0, oc.summary);
             compiler_rejected(oc.summary);
             s2a_compile_outcome_free(&oc);
             struct entry *fe = (struct entry *)calloc(1, sizeof *fe);
@@ -1363,10 +1384,10 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     memset(&cp, 0, sizeof cp);
     int parsed = nvn_vk_program_parse_compute(bytes, len, &cp, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("compute_program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("compute_program_parse_failed", 1, why);
         e->failed = 1; return e;
     }
-    e->prog.support_bytes = cp.support_bytes;
+    e->prog.support_bytes = cp.support_bytes; e->prog.spill_bytes = cp.spill_bytes;
     for (int i = 0; i < cp.binding_count && !e->failed; i++) {
         const struct fd_binding *b = &cp.bindings[i];
         if (e->prog.nent[0] == RP_PROG_ENT_MAX) { red1("too_many_bindings", "cs"); e->failed = 1; break; }
@@ -1391,8 +1412,8 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
         if (!ok) { char nm[56]; snprintf(nm, sizeof nm, "compute_binding_kind_%d_slot_%d_map_%d", b->kind, b->slot, b->kind == 1 ? (int)cp.storage[i].mapping : 0); red1(nm, "cs"); e->failed = 1; break; }
         if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", "cs"); e->failed = 1; break; }
         le->stages = 1u << NVN_GPU_SH_CS;
-        if (b->kind == 2) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
-            &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]]);
+        if (b->kind == 2 || b->kind == 3) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,   // 3 = 存储图像：数值类与声明格式给回放选视图格式
+            &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]], &e->prog.difmt[0][e->prog.nent[0]]);
         if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[0][e->prog.nent[0]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
             red1("tbuf_shader_type_unproven", "cs"); e->failed = 1; break;
         }
@@ -1546,7 +1567,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
-                red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
+                red_prog("compute_compile_failed", 1, oc.summary); compiler_rejected(oc.summary);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e);
                 if (e) {

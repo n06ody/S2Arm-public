@@ -607,3 +607,4 @@
 20261116-1551-audio-dsp-mix-volume-round-nearest.patch
 20261116-1552-audio-dsp-biquad-and-mix-local-state.patch
 20261116-1552-audio-dsp-command-fault-isolation.patch
+20261116-2302-image-raw-load-formatless.patch

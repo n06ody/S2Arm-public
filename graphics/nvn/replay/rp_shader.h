@@ -18,11 +18,13 @@ struct rp_prog {
     nvn_gpu_layout_ent ent[RP_PROG_STAGES][RP_PROG_ENT_MAX];  // 与交给后端装载的布局同一份：核心按 src_kind / src_reg 逐项绑定
     uint8_t dtt[RP_PROG_STAGES][RP_PROG_ENT_MAX];             // 声明目标 + 1；0 = 未知，沿用登记视图
     uint8_t dcls[RP_PROG_STAGES][RP_PROG_ENT_MAX];            // 0 float，1 uint，2 sint，3 depth 比较
+    uint8_t difmt[RP_PROG_STAGES][RP_PROG_ENT_MAX];           // 存储图像声明的 SPIR-V Image Format（0 = Unknown；只计算阶段填，见 nvk_shader.c sampled_decl）
     uint32_t nent[RP_PROG_STAGES];
     uint32_t support_bytes;                                   // NVN_RB_SUPPORT 那一项的缓冲长度
     uint32_t attr_mask;                                       // 顶点着色器实际读的属性位
     uint32_t color_out_mask;                                  // 片元着色器写了哪些输出分量：每个颜色目标 4 位（RGBA）。没有片元阶段 / 不知道 = 全 1
     uint8_t c1[RP_PROG_STAGES][0x100]; uint8_t c1_ok;         // NVN_RB_C1：着色器自带的常量段（位 i = 阶段 i 有）
+    uint32_t spill_bytes;                                     // 计算：共享内存溢出缓冲每个线程组的字节数（NVN_RB_SPILL 项）；0 = 没有
     uint8_t is_compute;                                       // 计算程序：只有 sh[0] / ent[0]，绑定取 NVN 阶段 5 的状态
     uint8_t binst_unread;                                     // 位 i = 阶段 i 已证不读 c0 + 0x644（编译器 c0Reads）：间接绘制不用把 GPU 侧的 base instance 拷进它的驱动段。0 = 读或未知（照旧拷）
     uint8_t z_raw;                                            // 顶点出口 z 原样（不随深度模式改写，出包预编库的程序）：near = -w 时管线设裁剪深度 [-1, 1]
