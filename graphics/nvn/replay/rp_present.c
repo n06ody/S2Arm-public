@@ -261,8 +261,10 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(line, sizeof line, "未接计数：%s", u); nvn_plat_log(NVN_PLAT_LOG_INFO, "present", line);
             }
             if (nvn_plat_flag("nvk_drawlog", 0)) rp_draw_log_arm(nvn_plat_flag("nvk_drawlog", 0) > 1 ? nvn_plat_flag("nvk_drawlog", 0) : 160);
-            if (nvn_plat_flag("nvk_dump", 0)) rp_debug_dump_request(t->serial, g_n_shown);   // 调试开关：把这张图和它上游的贴图读回落盘   // 调试开关：接下来的 160 笔绘制逐笔出日志
         }
+        // 调试开关：把这张图和它上游的贴图读回（nvk_dump=1 落盘，=2 只打亮度摘要）；间隔 nvk_dump_every 帧（缺省 600，首帧也读）
+        if (nvn_plat_flag("nvk_dump", 0)) { int every = nvn_plat_flag("nvk_dump_every", 600); if (every < 1) every = 600;
+            if (g_n_shown == 1 || g_n_shown % (uint64_t)every == 0) rp_debug_dump_request(t->serial, g_n_shown); }
     } else g_n_dropped++;
     pthread_mutex_unlock(&g_pmu);
     if (!nvn_gpu_ok(r) && r.code != NVN_GPU_E_OUTDATED && nvn_unimpl("present", "present_failed", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "present", err.why);

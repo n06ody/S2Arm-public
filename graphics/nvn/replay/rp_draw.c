@@ -1410,7 +1410,8 @@ draw_done:
 // 每张读第 0 级第 0 层的原始字节，写到缓存目录（没有就写诊断目录）的 nvkdump_<帧>_<层>_<序号>_<宽>x<高>_<格式>.raw。
 struct dump_job { nvn_gpu_buf buf; uint64_t bytes; char path[300]; uint32_t w, h, fmt, summary; };
 // 诊断：nvk_dump=2 时不落盘，只打亮度摘要（各通道均值、最大值、NaN / 无穷计数），给 8E / 9000 同场景对比中间目标亮度。
-//   只认常见颜色格式：RGBA8 / RGBA8_SRGB / BGRA8(_SRGB)（按存储值 0..1，不做 sRGB 解码）、RGBA16F、RG16F、R16F、R11G11B10F、RGB10A2、R32F、RG32F、RGBA32F。
+//   认的格式：RGBA8 / RGBX8 / RGBA8_SRGB / BGRA8(_SRGB) / R8（按存储值 0..1，不做 sRGB 解码）、RGBA16F、RG16F、R16F、R11G11B10F、RGB10A2、R32F、RG32F、RGBA32F、
+//   DEPTH32F（深度值）；整数格式 RGBA8UI / RG16UI 打原始整数值（不归一）。
 static float dump_h2f(uint16_t h) { uint32_t s = (uint32_t)(h >> 15) << 31, e = h >> 10 & 31, m = h & 1023, f;
     if (!e) { float v = (float)m / 1024.0f / 16384.0f; return s ? -v : v; }
     if (e == 31) f = s | 0x7F800000u | m << 13; else f = s | (e + 112) << 23 | m << 13;
@@ -1421,7 +1422,7 @@ static float dump_uf(uint32_t v, int mbits) { uint32_t e = v >> mbits, m = v & (
     return ldexpf(1.0f + (float)m / (float)(1u << mbits), (int)e - 15); }
 static void dump_summary(const struct dump_job *j, const uint8_t *p) {
     int nc = 0, bpp = 0;
-    switch (j->fmt) { case 0x25: case 0x38: case 0x9A: case 0x9C: nc = 4; bpp = 4; break; case 0x29: nc = 4; bpp = 8; break; case 0x11: nc = 2; bpp = 4; break;
+    switch (j->fmt) { case 0x25: case 0x38: case 0x9A: case 0x9C: case 0x6D: case 0x27: nc = 4; bpp = 4; break; case 0x1: nc = 1; bpp = 1; break; case 0x14: nc = 2; bpp = 4; break; case 0x34: nc = 1; bpp = 4; break; case 0x29: nc = 4; bpp = 8; break; case 0x11: nc = 2; bpp = 4; break;
         case 0x5: nc = 1; bpp = 2; break; case 0x3F: nc = 3; bpp = 4; break; case 0x3D: nc = 4; bpp = 4; break; case 0xA: nc = 1; bpp = 4; break;
         case 0x16: nc = 2; bpp = 8; break; case 0x2E: nc = 4; bpp = 16; break; default: break; }
     char m[300];
@@ -1429,7 +1430,10 @@ static void dump_summary(const struct dump_job *j, const uint8_t *p) {
     double sum[4] = {0}; float mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}; uint64_t bad = 0, n = (uint64_t)j->w * j->h;
     for (uint64_t i = 0; i < n; i++) { const uint8_t *q = p + i * (uint64_t)bpp; float c[4] = {0};
         switch (j->fmt) {
-        case 0x25: case 0x38: case 0x9A: case 0x9C: for (int k = 0; k < 4; k++) c[k] = q[k] / 255.0f; break;
+        case 0x25: case 0x38: case 0x9A: case 0x9C: case 0x6D: for (int k = 0; k < 4; k++) c[k] = q[k] / 255.0f; break;
+        case 0x1: c[0] = q[0] / 255.0f; break;
+        case 0x27: for (int k = 0; k < 4; k++) c[k] = q[k]; break;
+        case 0x14: for (int k = 0; k < 2; k++) { uint16_t u; memcpy(&u, q + 2 * k, 2); c[k] = u; } break;
         case 0x29: case 0x11: case 0x5: for (int k = 0; k < nc; k++) { uint16_t h; memcpy(&h, q + 2 * k, 2); c[k] = dump_h2f(h); } break;
         case 0x3F: { uint32_t v; memcpy(&v, q, 4); c[0] = dump_uf(v & 2047, 6); c[1] = dump_uf(v >> 11 & 2047, 6); c[2] = dump_uf(v >> 22 & 1023, 5); } break;
         case 0x3D: { uint32_t v; memcpy(&v, q, 4); c[0] = (v & 1023) / 1023.0f; c[1] = (v >> 10 & 1023) / 1023.0f; c[2] = (v >> 20 & 1023) / 1023.0f; c[3] = (v >> 30) / 3.0f; } break;
