@@ -28,7 +28,7 @@ namespace S2A.DirectCompiler
             OpControlBarrier = 224, OpMemoryBarrier = 225, OpTypeBool = 20, OpULessThan = 176, OpSelect = 169,
             OpFunctionEnd = 56, OpLabel = 248, OpLine = 8, OpNoLine = 317;
         private const uint ScWorkgroup = 4, ScUniform = 2, ScInput = 1;
-        private const uint DecBufferBlock = 3, DecArrayStride = 6, DecBuiltIn = 11, DecBinding = 33, DecSet = 34, DecOffset = 35;
+        private const uint DecBufferBlock = 3, DecArrayStride = 6, DecBuiltIn = 11, DecCoherent = 23, DecBinding = 33, DecSet = 34, DecOffset = 35;
         private const uint BuiltInNumWorkgroups = 24, BuiltInWorkgroupId = 26;
         private const uint SemWorkgroupMemory = 0x100, SemUniformMemory = 0x40;
 
@@ -157,6 +157,10 @@ namespace S2A.DirectCompiler
             decorations.Add(Inst(OpDecorate, tRa, DecArrayStride, 4));
             decorations.Add(Inst(OpDecorate, tSt, DecBufferBlock));
             decorations.Add(Inst(OpMemberDecorate, tSt, 0, DecOffset, 0));
+            // Coherent：Workgroup 内存天然组内一致；挪到存储缓冲后，没有 Coherent 时按 GLSL / Vulkan 内存模型，
+            //   一个调用写的值经 barrier 后对同组其他调用不保证可见（驱动可以走不一致的缓存 / 把读提到 barrier 前）。
+            //   组内归约、前缀和一类（GPU 剔除核）靠的正是这种可见性，所以必须加（glslang 对 coherent 缓冲成员同样出 OpMemberDecorate Coherent）。
+            decorations.Add(Inst(OpMemberDecorate, tSt, 0, DecCoherent));
             decorations.Add(Inst(OpDecorate, vSb, DecSet, (uint)set));
             decorations.Add(Inst(OpDecorate, vSb, DecBinding, (uint)binding));
             var semantics = new Dictionary<uint, uint>();   // 旧语义常量 id → 补了 UniformMemory 的新常量 id
