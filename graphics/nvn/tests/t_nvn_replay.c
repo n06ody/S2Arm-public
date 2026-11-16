@@ -31,6 +31,7 @@ static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
 static int g_flag_cs_watch0;    // 用例设：开关 nvk_cs_watch0（诊断：按程序键前 28 位盯计算派发）
+static int g_flag_cs_watch1;    // 同上，第 1 号开关（每键各自计额度）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
@@ -39,6 +40,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_skip_cs0")) return g_flag_skip_cs0;
     if (!strcmp(name, "nvk_cs_watch0")) return g_flag_cs_watch0;
+    if (!strcmp(name, "nvk_cs_watch1")) return g_flag_cs_watch1;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -3095,18 +3097,27 @@ static void t_lost_ring_skip(void) {
     CHECK(g_ndisp == n + 2);
     g_flag_skip_cs0 = 0;
     // 盯计算：前缀命中时派发记一行；所在段之后过了 3 段，上屏轮询把可写存储的摘要打出来（这里一个可写存储、读游戏内存）
-    static uint32_t out[8] = {0, 7, 0, 3};
+    uint32_t *out = (uint32_t *)g_pmem; memset(g_pmem, 0, 64); out[1] = 7; out[3] = 3; nvn_be_pool_add(g_pmem, sizeof g_pmem);
     g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_SSBO; g_cprog.ent[0][0].src_kind = NVN_RB_SBUFP; g_cprog.ent[0][0].src_reg = 0; g_cprog.ent[0][0].access = NVN_GPU_ACC_RW;
-    rp_S.ssbo[5][0].addr = (uint64_t)(uintptr_t)out; rp_S.ssbo[5][0].size = sizeof out;
+    rp_S.ssbo[5][0].addr = (uint64_t)(uintptr_t)out; rp_S.ssbo[5][0].size = 32;
     int w0 = g_info_watch; g_flag_cs_watch0 = 0x37727c6;
     rp_dispatch(&g_fake_cmd, &dp, NULL);
     int noted = g_info_watch - w0; g_flag_cs_watch0 = 0;
     rp_cs_watch_poll(); int early = g_info_watch - w0 - noted;   // 同一段：还不读
-    CHECK(noted <= 1 && early == 0);
+    CHECK(noted == 1 && early == 0);
+    // 每键各自 32 次：0 号开关用满后，同一个键换到 1 号开关上照样记
+    g_flag_cs_watch0 = 0x37727c6; w0 = g_info_watch;
+    for (int i = 0; i < 40; i++) rp_dispatch(&g_fake_cmd, &dp, NULL);
+    int more0 = g_info_watch - w0; g_flag_cs_watch0 = 0;
+    g_flag_cs_watch1 = 0x37727c6; w0 = g_info_watch; rp_dispatch(&g_fake_cmd, &dp, NULL); int k1 = g_info_watch - w0; g_flag_cs_watch1 = 0;
+    CHECK(more0 == 31); CHECK(k1 == 1);
+    // 设备丢失倒出：两个键的「最近」环各一段（键 0：最近 32 次 / 共 41 次；键 1：1 次），每条派发行后跟可写存储的摘要
+    int wr0 = g_info_watch;
     rp_S.ssbo[5][0].addr = 0; rp_S.ssbo[5][0].size = 0; g_cprog.nent[0] = 0;
     int red0 = g_red_lines; rp_lost_ring_dump("test"); rp_lost_ring_dump("again");
-    CHECK(g_red_lines == red0 + 1 && strstr(g_last_red, "最近 2 次"));
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); pass_fresh();
+    CHECK(g_info_watch - wr0 == (1 + 32 * 2) + (1 + 1 * 2));   // 段头 + 每次（派发行 + 一条存储摘要）；第二次倒出不再出
+    CHECK(g_red_lines == red0 + 1 && strstr(g_last_red, "最近 44 次"));   // 2 次跳过对照 + 42 次盯计算
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
