@@ -460,7 +460,27 @@ static void case_reads_reject_non_array(void) {
     }
 }
 
+// 共享内存溢出缓冲（kind = spill，编译器 DirectSharedSpill）：每线程组字节数进程序对象；没有客体槽；形状不对如实拒
+static void case_spill(void) {
+    group("[S] 共享内存溢出缓冲 spill 绑定");
+    struct nvn_vk_compute_program p;
+    if (accept_case("[S1] spill 40960 字节 / 组", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":40960}", "[]", "[]", &p) == 0) {
+        ck_u32("[S1] spill_bytes", p.spill_bytes, 40960);
+        ck_u32("[S1] binding kind 4", (uint32_t)p.bindings[0].kind, 4);
+        nvn_vk_program_free_compute(&p);
+    }
+    if (accept_case("[S2] 没有 spill 绑定", "", "[]", "[]", &p) == 0) { ck_u32("[S2] spill_bytes 为 0", p.spill_bytes, 0); nvn_vk_program_free_compute(&p); }
+    reject_case("[S3] spill 缺 bytesPerGroup", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S4] spill bytesPerGroup 不是 4 的倍数", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":40962}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S5] spill 超过 64 KB", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":65540}", "[]", "[]", "bytesPerGroup");
+    reject_case("[S6] 两个 spill", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"bytesPerGroup\":4},"
+                "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":1,\"count\":1,\"bytesPerGroup\":4}", "[]", "[]", "more than one spill");
+    reject_case("[S7] spill 带客体槽", "{\"stage\":\"cs\",\"kind\":\"spill\",\"set\":1,\"binding\":0,\"count\":1,\"slot\":0,\"bytesPerGroup\":4}", "[]", "[]", "guest slot");
+    reject_case("[S8] 非 spill 绑定带 bytesPerGroup", "{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":8,\"count\":1,\"bytesPerGroup\":4}", "[]", "[]", "bytesPerGroup");
+}
+
 int main(void) {
+    case_spill();
     case_accept_nvn();
     case_accept_ubo_ptr();
     case_accept_ubo_address();
@@ -487,6 +507,22 @@ int main(void) {
         int rc = nvn_vk_program_parse_compute((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
         ck_true("compute v2 separate maximum slots", rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == 255 && p.bindings[0].samp_slot == 127, why);
         nvn_vk_program_free_compute(&p);
+    }
+
+    // 立即句柄直接读 c2 分离贴图表的字（空轨 2nd 9000：cs 也有）：slot 90..344 偶、无 samp_slot → 分离贴图槽 128 + k；表外 / 奇字照旧拒
+    {
+        static const struct { int slot, ok, want; } sep[] = {{90, 1, 128}, {344, 1, 255}, {92, 1, 129}, {91, 0, 0}, {346, 0, 0}, {88, 0, 0}};
+        for (unsigned k = 0; k < sizeof sep / sizeof sep[0]; k++) {
+            char b[160], why[192] = ""; struct nvn_vk_compute_program p;
+            snprintf(b, sizeof b, "{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":%d,\"count\":1}", sep[k].slot);
+            int rc = parse_case(b, "[]", "[]", &p, why, sizeof why);
+            checks++;
+            if (sep[k].ok && !(rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == sep[k].want && p.bindings[0].samp_slot == -1))
+                failf("compute direct separate texture", "slot %d 期望 接受、分离贴图槽 %d，真结果 rc=%d why=%s", sep[k].slot, sep[k].want, rc, why);
+            if (!sep[k].ok && !(rc != 0 && strstr(why, "compute texture slot outside recorded range")))
+                failf("compute direct separate texture", "slot %d 期望 拒绝，真结果 rc=%d why=%s", sep[k].slot, rc, why);
+            nvn_vk_program_free_compute(&p);
+        }
     }
 
     // 计算阶段的图像：handleIndex 72..86 偶数 = 驱动 c2 图像句柄表第 0..7 槽（同 iOS C2_IMG），槽号 = (handleIndex−72)/2；表外拒绝并报 handleIndex

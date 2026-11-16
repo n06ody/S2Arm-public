@@ -119,6 +119,22 @@ int main(void) {
     CHECK(parse_json("{\"stage\":\"fs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":8}", &p, why, sizeof why) == 0 && p.bindings[0].samp_slot == -1, "v1 keeps combined sampler sentinel");
     nvn_vk_program_free(&p);
 
+    // 立即句柄直接读 c2 分离贴图表的字（空轨 2nd 9000：fs handle 90 / 92 / 124，取尺寸 / texelFetch，无分离采样器）：
+    //   slot 90..344 偶、count 1、无 samp_slot → 分离贴图槽 128 + k、采样器取同字（samp_slot −1）；v1 / v2 同。奇字、表外、数组照旧不接。
+    for (int v = 1; v <= 2; ++v) {
+        int (*parse)(const char *, struct fd_program *, char *, size_t) = v == 1 ? parse_json : parse_v2;
+        static const struct { int slot, count, want; } sep[] = {{90, 1, 128}, {92, 1, 129}, {124, 1, 145}, {344, 1, 255}, {91, 1, -1}, {346, 1, -1}, {90, 2, -1}};
+        for (unsigned k = 0; k < sizeof sep / sizeof sep[0]; k++) {
+            char b[200]; why[0] = 0;
+            snprintf(b, sizeof b, "{\"stage\":\"fs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":%d,\"count\":%d}", sep[k].slot, sep[k].count);
+            int rc = parse(b, &p, why, sizeof why);
+            char what[160]; snprintf(what, sizeof what, "v%d direct separate texture slot %d count %d -> tex_slot %d", v, sep[k].slot, sep[k].count, sep[k].want);
+            if (sep[k].want >= 0) CHECK(rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == sep[k].want && p.bindings[0].samp_slot == -1, what);
+            else CHECK(v == 2 ? rc != 0 : (rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == -1), what);   // v2 拒；v1 保持无槽（layout 如实报红）
+            nvn_vk_program_free(&p);
+        }
+    }
+
     // #999 / #1189：现编结果的平铺写法 uboSlot（cbuf − 3）+ uboOffset（句柄字字节偏移），没有 slot。
     //   组合句柄一个字：贴图号低 20 位、采样器号高 12 位 → 贴图与采样器都取同一个字（FD_SAMP_UBO，采样器字 sid=0）。
     for (int v = 1; v <= 2; ++v) {
@@ -192,6 +208,36 @@ int main(void) {
         CHECK(0, "one unmapped storage binding parsed");
     }
     nvn_vk_program_free(&p);
+
+    // 图形阶段 c0Reads → binst_unread（回放据此决定间接绘制要不要拷 c0 + 0x644）。
+    //   缺字段 / null = 未知 = 0；数组且无一段碰 [0x644, 0x648) = 1；碰到 = 0；形状不对 = 拒。
+    {
+        static const struct { const char *vs_extra, *fs_extra; int rc, vs, fs; const char *what; } cases[] = {
+            { "", "", 0, 0, 0, "c0Reads missing: unknown, both stages keep the copy" },
+            { ",\"c0Reads\":null", ",\"c0Reads\":null", 0, 0, 0, "c0Reads null: unknown" },
+            { ",\"c0Reads\":[]", ",\"c0Reads\":[[0,4],[1552,4]]", 0, 1, 1, "empty and non-overlapping read sets prove no base-instance read" },
+            { ",\"c0Reads\":[[1604,4]]", ",\"c0Reads\":[]", 0, 0, 1, "exact 0x644 read keeps the vs copy, fs proven" },
+            { ",\"c0Reads\":[[1600,16]]", ",\"c0Reads\":[[1606,1]]", 0, 0, 0, "vec4 at 0x640 and a byte inside 0x644 both overlap" },
+            { ",\"c0Reads\":[[1602,4]]", ",\"c0Reads\":[[1596,8],[1608,4]]", 0, 0, 1, "range ending inside 0x644 overlaps; ending at 0x644 or starting at 0x648 does not" },
+            { ",\"c0Reads\":[[1601,4]]", ",\"c0Reads\":[[1600,4]]", 0, 0, 1, "4 bytes from 0x641 cover the first byte of 0x644; 0x640..0x643 does not" },
+            { ",\"c0Reads\":[[1600,4]]", ",\"c0Reads\":[[1604,0]]", -1, 0, 0, "zero-size range is rejected" },
+            { ",\"c0Reads\":7", "", -1, 0, 0, "non-array c0Reads is rejected" },
+            { ",\"c0Reads\":[[1604]]", "", -1, 0, 0, "single-element range is rejected" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char json[1024]; char msg[192];
+            int n = snprintf(json, sizeof json,
+                "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+                "\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"%s},{\"stage\":\"fs\",\"spirv\":\"%s\"%s}],"
+                "\"bindings\":[]}}", k_spirv, cases[i].vs_extra, k_spirv, cases[i].fs_extra);
+            memset(&p, 0, sizeof p); why[0] = 0;
+            int rc = nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
+            snprintf(msg, sizeof msg, "%s (rc=%d vs=%d fs=%d why=%s)", cases[i].what, rc, p.stage[0].binst_unread, p.stage[1].binst_unread, why);
+            if (cases[i].rc) CHECK(rc != 0 && strstr(why, "c0 read") != NULL, msg);
+            else CHECK(rc == 0 && p.stage[0].binst_unread == cases[i].vs && p.stage[1].binst_unread == cases[i].fs, msg);
+            nvn_vk_program_free(&p);
+        }
+    }
 
     if (fails) { printf("direct nvn program result test: %d FAILED\n", fails); return 1; }
     printf("direct nvn program result test: ok\n");
