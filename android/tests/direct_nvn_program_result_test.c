@@ -209,6 +209,36 @@ int main(void) {
     }
     nvn_vk_program_free(&p);
 
+    // 图形阶段 c0Reads → binst_unread（回放据此决定间接绘制要不要拷 c0 + 0x644）。
+    //   缺字段 / null = 未知 = 0；数组且无一段碰 [0x644, 0x648) = 1；碰到 = 0；形状不对 = 拒。
+    {
+        static const struct { const char *vs_extra, *fs_extra; int rc, vs, fs; const char *what; } cases[] = {
+            { "", "", 0, 0, 0, "c0Reads missing: unknown, both stages keep the copy" },
+            { ",\"c0Reads\":null", ",\"c0Reads\":null", 0, 0, 0, "c0Reads null: unknown" },
+            { ",\"c0Reads\":[]", ",\"c0Reads\":[[0,4],[1552,4]]", 0, 1, 1, "empty and non-overlapping read sets prove no base-instance read" },
+            { ",\"c0Reads\":[[1604,4]]", ",\"c0Reads\":[]", 0, 0, 1, "exact 0x644 read keeps the vs copy, fs proven" },
+            { ",\"c0Reads\":[[1600,16]]", ",\"c0Reads\":[[1606,1]]", 0, 0, 0, "vec4 at 0x640 and a byte inside 0x644 both overlap" },
+            { ",\"c0Reads\":[[1602,4]]", ",\"c0Reads\":[[1596,8],[1608,4]]", 0, 0, 1, "range ending inside 0x644 overlaps; ending at 0x644 or starting at 0x648 does not" },
+            { ",\"c0Reads\":[[1601,4]]", ",\"c0Reads\":[[1600,4]]", 0, 0, 1, "4 bytes from 0x641 cover the first byte of 0x644; 0x640..0x643 does not" },
+            { ",\"c0Reads\":[[1600,4]]", ",\"c0Reads\":[[1604,0]]", -1, 0, 0, "zero-size range is rejected" },
+            { ",\"c0Reads\":7", "", -1, 0, 0, "non-array c0Reads is rejected" },
+            { ",\"c0Reads\":[[1604]]", "", -1, 0, 0, "single-element range is rejected" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char json[1024]; char msg[192];
+            int n = snprintf(json, sizeof json,
+                "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+                "\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"%s},{\"stage\":\"fs\",\"spirv\":\"%s\"%s}],"
+                "\"bindings\":[]}}", k_spirv, cases[i].vs_extra, k_spirv, cases[i].fs_extra);
+            memset(&p, 0, sizeof p); why[0] = 0;
+            int rc = nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
+            snprintf(msg, sizeof msg, "%s (rc=%d vs=%d fs=%d why=%s)", cases[i].what, rc, p.stage[0].binst_unread, p.stage[1].binst_unread, why);
+            if (cases[i].rc) CHECK(rc != 0 && strstr(why, "c0 read") != NULL, msg);
+            else CHECK(rc == 0 && p.stage[0].binst_unread == cases[i].vs && p.stage[1].binst_unread == cases[i].fs, msg);
+            nvn_vk_program_free(&p);
+        }
+    }
+
     if (fails) { printf("direct nvn program result test: %d FAILED\n", fails); return 1; }
     printf("direct nvn program result test: ok\n");
     return 0;
