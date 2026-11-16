@@ -17,6 +17,8 @@ uint64_t nvn_unimpl_count(const char *cls, const char *name);
 size_t nvn_unimpl_dump(char *buf, size_t cap);
 // 出现过的项数。
 int nvn_unimpl_kinds(void);
+// 默认关闭的诊断快照：nvk_csd / nvk_csf 开启时零值也输出；退出回调不取账本锁。
+void nvn_unimpl_diag_summary(const char *phase, uint64_t frame);
 // 清零（会话收尾 / 单测）。
 void nvn_unimpl_reset(void);
 

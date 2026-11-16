@@ -47,13 +47,18 @@ void nvk_shader_stop(void) { atomic_fetch_or_explicit(&g_shader_admission, NVK_S
 unsigned nvk_shader_inflight(void) { return atomic_load_explicit(&g_shader_admission, memory_order_acquire) & ~NVK_SHADER_STOP_BIT; }
 // 会话级在途 / 静默 / 代际清场（定义在下面的状态变量之后：open 在文件前面，用前向声明）。
 static void shader_session_state_reset(void);
+static void pool_final_summary(int normal);
+// 弱链接[androiddraw]：nvn_unimpl_diag_summary
+extern void nvn_unimpl_diag_summary(const char *, uint64_t) __attribute__((weak));
 int nvk_shader_open(void) {
     unsigned expected = NVK_SHADER_STOP_BIT;
-    if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire)) {
-        shader_session_state_reset();   // 新会话：在途 / 静默位 / 代际清一遍（上一局的后台结果不得落进新会话）
-        return 0;
-    }
-    return expected == 0 ? 0 : -1;
+    if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire))
+        shader_session_state_reset();   // 新会话，旧后台结果不能落入
+    else if (expected != 0) return -1;
+    // Register even before any texture pool/program exists. Reuse the existing single owner:
+    // normal Android exit calls s2a_direct_summary(1), not nvk_session_close / atexit.
+    if (nvn_plat_flag("nvk_csd", 0) || nvn_plat_flag("nvk_csf", 0)) s2a_direct_summary_register(pool_final_summary);
+    return 0;
 }
 static int shader_enter(void) {
     unsigned s = atomic_load_explicit(&g_shader_admission, memory_order_acquire);
@@ -375,6 +380,7 @@ static void pool_stats(const char *phase) {
 /* The normal Android process exit calls this after services/GPU stop. It does
  * not pass through rp_shader_reset, which belongs to session retirement. */
 static void pool_final_summary(int normal) {
+    if (nvn_unimpl_diag_summary) nvn_unimpl_diag_summary(normal ? "normal_exit" : "exit_timeout", 0);
     if (normal && (g_pool_programs || g_pool_request_rejected)) pool_stats("final");
 }
 /* The producer's failure summary embeds its s2a-direct-error-v1 JSON. Missing,
@@ -1790,6 +1796,20 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             if (g_pool_request_rejected == 1 || !(g_pool_request_rejected % 50)) pool_stats("progress");
         }
         return -1;
+    }
+    // Private diagnostic input: exact compile request, including profile and shader facts.
+    // Runtime capture manifests use the same identity. Files never overwrite another run's inputs.
+    if (nvn_plat_flag("nvk_csc", 0)) {
+        uint32_t prefix = (uint32_t)rp_S.skey[5][0] << 24 | (uint32_t)rp_S.skey[5][1] << 16 | (uint32_t)rp_S.skey[5][2] << 8 | rp_S.skey[5][3];
+        const char *dir = nvn_plat_dir(NVN_PLAT_DIR_DIAG);
+        if (dir && prefix == (uint32_t)nvn_plat_flag("nvk_csf_a", 0)) {
+            char hex[65], path[1024]; for (int i = 0; i < 32; i++) snprintf(hex + 2*i, 3, "%02x", rq.identity[i]);
+            if (snprintf(path, sizeof path, "%s/csf-%s.request.json", dir, hex) < (int)sizeof path) {
+                FILE *f = fopen(path, "wx");
+                if (f) { int ok = fwrite(rq.json, 1, rq.json_bytes, f) == rq.json_bytes; if (fclose(f)) ok = 0;
+                    if (!ok) nvn_plat_log(NVN_PLAT_LOG_RED, "csf", "csf request_capture incomplete"); }
+            }
+        }
     }
     pthread_mutex_lock(&g_progs_mu);
     struct entry *e = progs_get_locked(rq.identity);

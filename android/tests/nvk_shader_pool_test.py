@@ -186,8 +186,9 @@ def main():
             ('wrong-array-red', 'nvn_unimpl("shader", "texture_pool_array_unsupported", NULL);',
              'nvn_unimpl("shader", "texture_pool_array_wrong", NULL);', 1,
              'reports the dedicated unimplemented'),
+            # 诊断打开时在 shader_open 提前注册；正常路径仍在 pool_admit 注册。撤销两处同一 owner。
             ('drop-final-summary', 's2a_direct_summary_register(pool_final_summary);',
-             '(void)pool_final_summary;', 1, 'normal process-exit callback emits final stats'),
+             '(void)pool_final_summary;', 2, 'normal process-exit callback emits final stats'),
             ('timeout-is-not-final', 'if (normal && (g_pool_programs || g_pool_request_rejected)) pool_stats("final");',
              'if (g_pool_programs || g_pool_request_rejected) pool_stats("final");', 1, 'timeout summary is never labelled final'),
             ('flatten-missing-fact', 'else if (!strcmp(code, "MISSING_FACT")) {',
