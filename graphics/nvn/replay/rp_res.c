@@ -229,7 +229,7 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
     if (track) { nvn_dirty_protect(t->mem, t->L.size); st = nvn_dirty_now(); x->span = nvn_dirty_span(t->mem, t->L.size); }   // 先保护、取代号、再读：取代号之后的写下次查得到
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
-    uint8_t *tmp = NULL; size_t cap = 0; int rc = 0;
+    uint8_t *tmp = NULL; size_t cap = 0; int rc = 0; uint8_t first[16] = {0}; uint32_t nfirst = 0;
     for (uint32_t l = 0; l < levels && !rc; l++) {
         uint32_t w = t->d.width >> l, h = t->d.height >> l, dp = is3d ? t->d.depth >> l : 1;
         if (!w) w = 1;
@@ -241,10 +241,12 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
             if (nvn_deswizzle(&t->d, l, y, t->mem, tmp, pitch)) { nvn_unimpl("tex", "deswizzle_failed", t); rc = -1; break; }
             NVNcopyRegion r = {0, 0, 0, (int)w, (int)h, (int)dp};
             nvn_gpu_tex_upload(c, x->g, l, y, &r, tmp, pitch, img);
+            if (!l && !y) { nfirst = img < 16 ? (uint32_t)img : 16; memcpy(first, tmp, nfirst); }
         }
     }
     free(tmp);
     if (!rc && track) { x->stamp = st; x->uploaded = 1; g_uploads++; }
+    if (!rc) rp_debug_tex_write(t->serial, RP_TW_UPLOAD, 0, t->L.size, first, nfirst);
     return rc;
 }
 
@@ -301,6 +303,7 @@ static void zero_fill(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
         for (uint32_t y = 0; y < layers; y++) nvn_gpu_tex_upload(c, x->g, l, y, &r, z, pitch, pitch * h * dp);
     }
     free(z);
+    rp_debug_tex_write(t->serial, RP_TW_ZERO, 0, 0, NULL, 0);
 }
 
 static uint32_t usage_of(const tex_t *t, int cpu) {
