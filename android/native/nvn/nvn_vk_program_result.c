@@ -673,15 +673,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         }
         if (dst->kind == 0 && !dst->is_support) {
             // NVN cbuf 语义（与图形侧 nvn_vk_first_draw.c 同一套）：0 = c0/support、1 = c1 常量段、
-            // 2 = 纹理句柄表（还没实现）、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
-            if (dst->slot == 2) {
-                char message[160];
-                snprintf(message, sizeof message,
-                    "compute c2 texture-handle bank used as a uniform buffer is not implemented: set=%d binding=%d",
-                    dst->set, dst->binding);
-                CS_FAIL(message);
-            }
-            if (dst->slot != 0 && dst->slot != 1 && (dst->slot < 3 || dst->slot > 18)) {
+            // 2 = 驱动句柄表、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
+            // slot 2 = 驱动句柄表 c2 被当常量缓冲读（同图形：layout_ent 映射成 NVN_RB_DRV2，回放按完整驱动表 0xA00 填）。
+            if (dst->slot != 0 && dst->slot != 1 && dst->slot != 2 && (dst->slot < 3 || dst->slot > 18)) {
                 // 越界必须能定位：槽号 + set/binding。
                 char message[160];
                 snprintf(message, sizeof message,

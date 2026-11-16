@@ -2830,6 +2830,52 @@ static void t_compute_tex_from_image(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_S.img[5][0] = 0; rp_S.tex[5][32] = 0; pass_fresh();
 }
 
+// 着色器把驱动句柄表 c2 当常量缓冲读（NVN_RB_DRV2）：按完整驱动表 0xA00 填（同 iOS nvn_mtl.m DRV2）——
+//   组合槽 r → 0x20 + 8r；r ≥ 32 与图像表同址，只在绑了该组合槽、同址图像槽没绑时写；图像槽 r → 0x120 + 8r；
+//   分离贴图槽 r → 0x168 + 8r；分离采样器槽 r → 0x568 + 8r；句柄只占每项低 4 字节，其余为 0。图形（片元）与计算各验一次。
+static void drv2_fill(int st) {
+    memset(rp_S.tex[st], 0, sizeof rp_S.tex[st]); memset(rp_S.img[st], 0, sizeof rp_S.img[st]); memset(rp_S.samp[st], 0, sizeof rp_S.samp[st]);
+    rp_S.tex[st][3] = 0x00300007; rp_S.tex[st][33] = 0x55; rp_S.tex[st][34] = 0x66; rp_S.img[st][2] = 0x77; rp_S.img[st][0] = 0x88;
+    rp_S.tex[st][128 + 5] = 0x99; rp_S.samp[st][4] = 6u << 20;
+}
+static int drv2_ok(const uint8_t *d, uint64_t len, char *why, size_t n) {
+    static const struct { uint32_t off, want; } w[] = {
+        {0x20 + 8 * 3, 0x00300007}, {0x20 + 8 * 33, 0x55}, {0x20 + 8 * 34, 0x77},   // 槽 34 与图像槽 2 同址：图像绑着 → 图像的句柄
+        {0x120, 0x88}, {0x168 + 8 * 5, 0x99}, {0x568 + 8 * 4, 6u << 20}, {0x24 + 8 * 3, 0}, {0x568 + 8 * 127, 0}, {0x9FC, 0} };
+    if (len != 0xA00) { snprintf(why, n, "len %llu", (unsigned long long)len); return 0; }
+    for (unsigned i = 0; i < sizeof w / sizeof w[0]; i++) { uint32_t v; memcpy(&v, d + w[i].off, 4); if (v != w[i].want) { snprintf(why, n, "0x%x = 0x%x, want 0x%x", w[i].off, v, w[i].want); return 0; } }
+    return 1;
+}
+static void t_drv2_table(void) {
+    char why[96] = "";
+    // 计算
+    pass_fresh(); res_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 1;
+    g_cprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_cprog.ent[0][0].src_kind = NVN_RB_DRV2; g_cprog.ent[0][0].src_reg2 = UINT16_MAX;
+    drv2_fill(5);
+    p_dispatch dp = {.x = 1, .y = 1, .z = 1}; int n = g_ndisp;
+    nvn_be_sub_begin(); rp_dispatch(&g_fake_cmd, &dp, NULL);
+    int cok = g_ndisp == n + 1 && g_ncb == 1 && g_cb[0].u.b.buf == &g_arena_buf && drv2_ok(g_arena + g_cb[0].u.b.off, g_cb[0].u.b.len, why, sizeof why);
+    if (!cok) printf("  compute DRV2: %s\n", why);
+    CHECK(cok);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 图形（片元阶段）
+    pass_fresh(); g_arena_used = 0; g_resolve_rc = 0;
+    stream s = {0}; q_env(&s);
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_UBO; g_fprog.ent[1][0].src_kind = NVN_RB_DRV2;
+    q_draw(&s); end(&s);
+    drv2_fill(1); memset(g_nfb, 0, sizeof g_nfb);
+    submit1(&s);
+    why[0] = 0;
+    int gok = g_nfb[1] == 1 && g_fb[1][0].u.b.buf == &g_arena_buf && drv2_ok(g_arena + g_fb[1][0].u.b.off, g_fb[1][0].u.b.len, why, sizeof why);
+    if (!gok) printf("  graphics DRV2: nfb=%u %s\n", g_nfb[1], why);
+    CHECK(gok);
+    fake_complete(NVN_GPU_DONE_OK);
+    memset(rp_S.tex[1], 0, sizeof rp_S.tex[1]); memset(rp_S.img[1], 0, sizeof rp_S.img[1]); memset(rp_S.samp[1], 0, sizeof rp_S.samp[1]);
+    memset(rp_S.tex[5], 0, sizeof rp_S.tex[5]); memset(rp_S.img[5], 0, sizeof rp_S.img[5]); memset(rp_S.samp[5], 0, sizeof rp_S.samp[5]);
+    pass_fresh();
+}
+
 // 贴图 → 贴图的拷贝：同尺寸同格式的逐层直接拷，各按自己视图的级与起始层；缩放 / 换格式 / 镜像 / 多重采样解析分开记账；目标从此以 GPU 为准。
 static p_copy_t2t *put_t2t(stream *s, const tex_t *src, const tex_t *dst) {
     p_copy_t2t *o = put(s, OP_COPY_T2T, sizeof *o + 2 * sizeof(tex_t)); tex_t *sn = (tex_t *)(o + 1); sn[0] = *src; sn[1] = *dst; o->src = &sn[0]; o->dst = &sn[1]; return o;
@@ -3709,6 +3755,7 @@ int main(int argc, char **argv) {
     t_dispatch_ubop_ro_skip();
     t_compute_image();
     t_compute_tex_from_image();
+    t_drv2_table();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
     t_draw();
