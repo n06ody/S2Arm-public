@@ -538,7 +538,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
     memset(out, 0, sizeof *out);
     s2a_json_object *syntax = malloc(sizeof *syntax);
     if (!syntax) return fail(why, why_size, "compute JSON allocation failed");
-    int rc = s2a_json_parse_object(bytes, length, syntax, why, why_size);
+    // 计算结果是「程序」级文档：大核（空轨 2nd 运行时那支约 9800 条指令的计算核）的 SPIR-V base64 加依赖列表超过 1 MiB 是正常体量。
+    //   上限取跨局程序缓存单条上限（program_cache.c PCACHE_MAX_PAYLOAD 64 MiB）：缓存装得下的结果就要解析得了。图形结果解析本来就不走这道校验。
+    int rc = s2a_json_parse_object_max(bytes, length, NVK_PROGRAM_RESULT_MAX_BYTES, syntax, why, why_size);
     free(syntax);
     if (rc) return -1;
     struct s2a_jv top = {(const char *)bytes, length}, content, stages, st, spirv, bindings, support;
@@ -617,7 +619,16 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         else if (compute_string_is(b, "kind", "storage")) dst->kind = 1;
         else if (compute_string_is(b, "kind", "texture")) dst->kind = 2;
         else if (compute_string_is(b, "kind", "image")) dst->kind = 3;
+        else if (compute_string_is(b, "kind", "spill")) dst->kind = 4;
         else CS_FAIL("unknown compute binding kind");
+        {   // 每线程组字节数只属于 spill；spill 必须带、且 4 字节对齐、不超过客体上限 64 KB；整个程序最多一个
+            struct s2a_jv per; int has_per = !s2a_jv_obj_find(b, "bytesPerGroup", &per);
+            if (dst->kind == 4) {
+                if (!has_per || compute_u32(per, &u) || !u || (u & 3) || u > 0x10000) CS_FAIL("compute spill bytesPerGroup is missing or invalid");
+                if (out->spill_bytes) CS_FAIL("compute program has more than one spill binding");
+                out->spill_bytes = u;
+            } else if (has_per) CS_FAIL("compute non-spill binding carries bytesPerGroup");
+        }
         // texture (kind 2) 是 compute 的一等资源：slot 就是 NVN c2 组合纹理表里的 handleIndex，
         // 下面按 8+2*slot 校验并换算出 NVN 纹理槽。存储图像（kind 3）还没接：显式拒绝并把
         // set/binding/handleIndex 写进原因（不绑定占位图像、不静默丢一条描述符）。
@@ -641,7 +652,8 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             if (compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute guest slot invalid");
             dst->slot = (int)u;
         }
-        if (!dst->is_support && dst->kind != 1 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
+        if (dst->kind == 4 && dst->slot >= 0) CS_FAIL("compute spill binding carries a guest slot");
+        if (!dst->is_support && dst->kind != 1 && dst->kind != 4 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
         // 图像（kind 3）：handleIndex 指驱动 c2 图像句柄表（字节 0x120 起 8 槽 × 8 字节 = 4 字节字下标 72..86 偶数，
         //   同 iOS nvn_mtl.m C2_IMG / tex_slot_h），NVN 图像槽 = (handleIndex − 72) / 2；回放按 BindImage 的槽取（rp_draw NVN_RB_IMG）
         if (dst->kind == 3 && (dst->slot < 72 || dst->slot >= 88 || (dst->slot & 1))) {
@@ -663,15 +675,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         }
         if (dst->kind == 0 && !dst->is_support) {
             // NVN cbuf 语义（与图形侧 nvn_vk_first_draw.c 同一套）：0 = c0/support、1 = c1 常量段、
-            // 2 = 纹理句柄表（还没实现）、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
-            if (dst->slot == 2) {
-                char message[160];
-                snprintf(message, sizeof message,
-                    "compute c2 texture-handle bank used as a uniform buffer is not implemented: set=%d binding=%d",
-                    dst->set, dst->binding);
-                CS_FAIL(message);
-            }
-            if (dst->slot != 0 && dst->slot != 1 && (dst->slot < 3 || dst->slot > 18)) {
+            // 2 = 驱动句柄表、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
+            // slot 2 = 驱动句柄表 c2 被当常量缓冲读（同图形：layout_ent 映射成 NVN_RB_DRV2，回放按完整驱动表 0xA00 填）。
+            if (dst->slot != 0 && dst->slot != 1 && dst->slot != 2 && (dst->slot < 3 || dst->slot > 18)) {
                 // 越界必须能定位：槽号 + set/binding。
                 char message[160];
                 snprintf(message, sizeof message,
