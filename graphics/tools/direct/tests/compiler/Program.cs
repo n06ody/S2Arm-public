@@ -1261,6 +1261,9 @@ internal static unsafe class Program
                 var consts = Insts(w).Where(x => (x[0] & 0xFFFF) == 43 && x.Length == 4).ToDictionary(x => x[2], x => x[3]);
                 var builtins = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11).Select(x => x[3]).ToHashSet();
                 Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
+                // 溢出缓冲的成员带 Coherent（组内调用经 barrier 互相看得见写，同 Workgroup 内存的语义）
+                Check(Insts(w).Any(x => (x[0] & 0xFFFF) == 72 && x.Length == 4 && x[2] == 0 && x[3] == 23),
+                      "spill buffer member is Coherent so writes are visible across the workgroup after barriers");
                 // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
                 var defs = new Dictionary<uint, uint[]>();
                 foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
