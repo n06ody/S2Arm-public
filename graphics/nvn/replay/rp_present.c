@@ -53,6 +53,34 @@ static uint64_t plc_save_ns_frame(void) {
 }
 static void frame_gap_note(void) {
     uint64_t now = plat_now_ns(), d = g_gap_last ? now - g_gap_last : 0; g_gap_last = now;
+    struct rp_buf_diag_row bd[RP_BUF_KIND_N];
+    if (rp_buf_diag_take(bd)) {
+        static const char *names[RP_BUF_KIND_N] = {"other", "vertex", "index", "constant", "storage"};
+        char line[2048]; size_t used = (size_t)snprintf(line, sizeof line, "缓冲慢路诊断 帧 %llu 格式=次数/页/已同步后变脏页/首次同步页/含首次/含代号变/映射变/未跟踪/池最大字节/页桶(1,16,256,4096,16384,更大)/池桶MiB(1,16,128,512,1024,更大)", (unsigned long long)rp_frame());
+        for (int i = 0; i < RP_BUF_KIND_N && used < sizeof line; i++) {
+            const struct rp_buf_diag_row *r = &bd[i];
+            int n = snprintf(line + used, sizeof line - used, " %s=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu,%llu,%llu,%llu,%llu,%llu/%llu,%llu,%llu,%llu,%llu,%llu", names[i],
+                (unsigned long long)r->slow, (unsigned long long)r->pages, (unsigned long long)r->dirty,
+                (unsigned long long)r->fresh_pages, (unsigned long long)r->first, (unsigned long long)r->stale, (unsigned long long)r->map,
+                (unsigned long long)r->untracked, (unsigned long long)r->pool_max,
+                (unsigned long long)r->hist[0], (unsigned long long)r->hist[1], (unsigned long long)r->hist[2],
+                (unsigned long long)r->hist[3], (unsigned long long)r->hist[4], (unsigned long long)r->hist[5],
+                (unsigned long long)r->pool_hist[0], (unsigned long long)r->pool_hist[1], (unsigned long long)r->pool_hist[2],
+                (unsigned long long)r->pool_hist[3], (unsigned long long)r->pool_hist[4], (unsigned long long)r->pool_hist[5]);
+            if (n < 0) break;
+            used += (size_t)n;
+        }
+        if (used < sizeof line) {
+            static const char *ix[] = {"direct", "ind_clear", "ind_pending", "ind_unknown", "cnt_clear", "cnt_pending", "cnt_unknown"};
+            const struct rp_buf_diag_row *r = &bd[RP_BUF_INDEX];
+            for (int i = 0; i < RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N && used < sizeof line; i++) {
+                int n = snprintf(line + used, sizeof line - used, " %s=%llu,%llu", ix[i], (unsigned long long)r->index_slow[i], (unsigned long long)r->index_pages[i]);
+                if (n < 0) break;
+                used += (size_t)n;
+            }
+        }
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", line);
+    }
     if (!d) return;
     int k = d < 29000000ull ? 0 : d < 37500000ull ? 1 : d < 46000000ull ? 2 : d < 54000000ull ? 3 : 4;
     __atomic_fetch_add(&g_gap_bucket[k], 1, __ATOMIC_RELAXED);

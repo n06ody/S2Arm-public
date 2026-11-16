@@ -567,7 +567,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (!sb || !sb->addr || !sb->size) return skip("storage_buffer_unbound", rec);
                 nvn_gpu_buf gb; uint64_t go;
                 if (st < RP_PROG_STAGES && i < RP_PROG_ENT_MAX && g_sb_ok[st][i]) { gb = g_sb_buf[st][i]; go = g_sb_off[st][i]; }   // 开通道前已同步（见 rp_draw 开头）
-                else if (!rp_buf_resolve(c, sb->addr, sb->size, &gb, &go)) return skip("storage_buffer_unresolved", rec);
+                else if (!rp_buf_resolve_tag(c, sb->addr, sb->size, &gb, &go, RP_BUF_STORAGE)) return skip("storage_buffer_unresolved", rec);
                 if (e->access & NVN_GPU_ACC_W) rp_post_gpu_write(sb->addr, sb->size);
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = sb->size; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
@@ -579,7 +579,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (e->access & NVN_GPU_ACC_W) return skip("compute_storage_indirect_writable_unknown", rec);   // 长度未知的可写绑定会把回写扩到相邻分配：准确拒绝
                 uint64_t paddr = ub->addr + e->src_off;
                 nvn_gpu_buf gb; uint64_t go;
-                if (!rp_buf_resolve(c, paddr, 8, &gb, &go)) return skip("uniform_buffer_unresolved", rec);
+                if (!rp_buf_resolve_tag(c, paddr, 8, &gb, &go, RP_BUF_CONSTANT)) return skip("uniform_buffer_unresolved", rec);
                 uint8_t *cpu = nvn_gpu_buf_cpu(gb);
                 if (!cpu) return skip("uniform_buffer_not_host_readable", rec);
                 uint64_t target = 0; memcpy(&target, cpu + go, 8);
@@ -591,7 +591,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);   // 本函数作用域里没有外层 caps：这里自己取一次
                   if (cp.max_ssbo_range && extent > cp.max_ssbo_range) extent = cp.max_ssbo_range; }
                 if (!extent) return skip("storage_buffer_indirect_empty", rec);
-                if (!rp_buf_resolve(c, target, extent, &gb, &go)) return skip("storage_buffer_unresolved", rec);
+                if (!rp_buf_resolve_tag(c, target, extent, &gb, &go, RP_BUF_STORAGE)) return skip("storage_buffer_unresolved", rec);
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = extent; break; }
             case NVN_RB_SUPPORT: {
                 uint32_t flags = (rp_depth_zero() ? 0u : 1u) | 2u;   // 位 0：深度 −1..1；位 1：base vertex / instance 取内建（后端基线要求 shaderDrawParameters）
@@ -895,7 +895,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         }
         if (nv) {
             nvn_gpu_buf vbuf[16];
-            rp_buf_resolve_multi(nv, vaddr, vlen, vbuf, voff, vok);
+            rp_buf_resolve_multi_tag(nv, vaddr, vlen, vbuf, voff, vok, RP_BUF_VERTEX);
             int k = 0;
             for (int i = 0; i < 16; i++) if (streams >> i & 1) {
                 if (!vok[k]) { skip("vertex_buffer_unresolved", rec); return; }
@@ -919,10 +919,10 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
             if (!sb || !sb->addr || !sb->size) continue;
             if (nb < SB_BATCH) { bs[nb] = st; bi[nb] = (int)i; ba[nb] = sb->addr; bl[nb] = sb->size; nb++; }
-            else if (rp_buf_resolve(c, sb->addr, sb->size, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
+            else if (rp_buf_resolve_tag(c, sb->addr, sb->size, &g_sb_buf[st][i], &g_sb_off[st][i], RP_BUF_STORAGE)) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
         }
         if (nb) {
-            rp_buf_resolve_multi(nb, ba, bl, bb, bo, bok);
+            rp_buf_resolve_multi_tag(nb, ba, bl, bb, bo, bok, RP_BUF_STORAGE);
             for (int k = 0; k < nb; k++) if (bok[k]) { g_sb_buf[bs[k]][bi[k]] = bb[k]; g_sb_off[bs[k]][bi[k]] = bo[k]; g_sb_ok[bs[k]][bi[k]] = 1; }
         }
     }
@@ -945,7 +945,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             // not a CPU-derived count, without reading index or argument bytes.
             if (!rp_pool_find(di->ibuf, isz, &mem, &bytes)) { skip("index_buffer_unresolved", rec); return; }
             uint64_t off = di->ibuf - (uint64_t)(uintptr_t)mem;
-            if (off > bytes || !rp_buf_resolve(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff) || (a.ioff & (isz - 1))) {
+            enum rp_buf_diag_kind tag = rp_buf_diag_indirect_tag(ind, ispan, mdi_n ? mcnt : 0);
+            if (off > bytes || !rp_buf_resolve_tag(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff, tag) || (a.ioff & (isz - 1))) {
                 skip("index_buffer_unresolved", rec); return;
             }
             a.itype = (uint32_t)di->itype;
@@ -976,7 +977,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         a.ibuf = sl.buf; a.ioff = sl.off; a.itype = 2; a.base_vertex = di->base_vertex;
     } else if (di) {
         uint32_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
-        if (!rp_buf_resolve(c, di->ibuf, (uint64_t)count * isz, &a.ibuf, &a.ioff)) { skip("index_buffer_unresolved", rec); return; }
+        if (!rp_buf_resolve_tag(c, di->ibuf, (uint64_t)count * isz, &a.ibuf, &a.ioff, RP_BUF_INDEX_DIRECT)) { skip("index_buffer_unresolved", rec); return; }
         a.itype = (uint32_t)di->itype; a.base_vertex = di->base_vertex;
     } else a.first = (uint32_t)dr->first;
     if (ind) {
