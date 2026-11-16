@@ -47,5 +47,6 @@ uint64_t rp_res_uploads(void);   // 累计上传次数（每张贴图每次同�
 void nvn_be_pool_gpu_written(const void *pool);                    // 这个池里录到了 GPU 写
 int nvn_be_tex_gpu_owned_since(uint64_t serial, uint64_t stamp);   // 脏页轮询：这张贴图的内容自 stamp 起是否归 GPU
 int rp_tex_debug_state(uint64_t serial);   // 调试取证（逐笔日志用）
+int rp_tex_debug_storage(uint64_t serial, uint64_t *uid, uint64_t *mem, uint64_t *size, int held);   // 调试：序号背后的存储（uid / 地址 / 字节数），转储链与写入日志用
 uint64_t rp_tex_reg_gen(void);   // 贴图登记表的代号：登记 / 注销 / 清空各加一
 uint64_t rp_tex_fact_sig(const uint64_t *handles, int n, int tex_base, int tex_pool_n);   // 一组贴图槽的编译事实摘要（着色器来源的快路径用）

@@ -361,13 +361,14 @@ static void park_land_group(nvn_gpu_cmd c, int g) {
     if (!g_pkg[g].used) return;
     int any = 0; for (int e = 0; e < PK_ENT; e++) if (g_pk[e].used && g_pk[e].grp == g) any = 1;
     if (c && any) {
+        if (P.open) rp_perf_add(RP_PERF_P_CUT_LAND, 1);
         rp_pass_end(c);
         p_set_rt save_rt = P.rt; tex_t save_kept[9]; memcpy(save_kept, P.kept, sizeof save_kept);
         int save_has = P.has_rt;
         uint32_t sc[8], sd, ss, sm; memcpy(sc, P.shape_c, sizeof sc); sd = P.shape_d; ss = P.shape_s; sm = P.shape_smp;
         int sok = P.shape_ok; uint8_t pso = rp_pso_dirty, dss = rp_dss_dirty;
         P.rt = g_pkg[g].rt; P.has_rt = 1;
-        if (rp_pass_begin(c)) rp_pass_end(c);
+        if (rp_pass_begin(c)) { rp_perf_add(RP_PERF_P_CUT_LAND, 1); rp_pass_end(c); }   // 落地用的只清除通道自己收掉，也记在落地名下（对账）
         P.rt = save_rt; memcpy(P.kept, save_kept, sizeof save_kept); P.has_rt = save_has;
         memcpy(P.shape_c, sc, sizeof sc); P.shape_d = sd; P.shape_s = ss; P.shape_smp = sm; P.shape_ok = sok;
         rp_pso_dirty = pso; rp_dss_dirty = dss;
@@ -426,7 +427,7 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c) {
     P.area_want = 0;
     if (P.open && P.na_w) {   // 无附件通道：帧缓冲按开通道时的视口定，这一笔的视口超出了就收通道，下面按新视口重开（同 Metal 旧路径 g_pass_targetless）
         uint32_t w = 0, h = 0;
-        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) rp_pass_end(c);
+        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) { rp_perf_add(RP_PERF_P_CUT_AREA, 1); rp_pass_end(c); }
     }
     if (!nvn_plat_flag("nvk_pass_area", 0)) return;
     int32_t x, y; uint32_t w, h;
@@ -437,6 +438,7 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c) {
     int32_t nx = x < P.ax ? x : P.ax, ny = y < P.ay ? y : P.ay;
     int32_t nx1 = ((int32_t)x + (int32_t)w) > ((int32_t)P.ax + (int32_t)P.aw) ? (int32_t)x + (int32_t)w : (int32_t)P.ax + (int32_t)P.aw;
     int32_t ny1 = ((int32_t)y + (int32_t)h) > ((int32_t)P.ay + (int32_t)P.ah) ? (int32_t)y + (int32_t)h : (int32_t)P.ay + (int32_t)P.ah;
+    rp_perf_add(RP_PERF_P_CUT_AREA, 1);
     rp_pass_end(c);
     P.area_want = 1; P.wx = nx; P.wy = ny; P.ww = (uint32_t)(nx1 - nx); P.wh = (uint32_t)(ny1 - ny);
 }
@@ -611,6 +613,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
     if (!P.has_rt || cc->index < 0 || cc->index >= P.rt.n || cc->index >= 8 || !P.rt.color[cc->index]) { nvn_unimpl("pass", "clear_color_no_target", rec); return; }
     if (!(cc->mask & 0xf)) return;
     int i = cc->index;
+    rp_debug_tex_write(P.rt.color[i]->serial, RP_TW_CLEAR_RT, 0, 0, cc->rgba, 16, 0);
     if ((cc->mask & 0xf) != 0xf || !scissor_full(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i])) {
         nvn_gpu_clear cl; memset(&cl, 0, sizeof cl); cl.color = i; cl.color_mask = (uint8_t)(cc->mask & 0xf); cl.stencil_mask = 0xff;
         if (!scissor_rect(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &cl)) return;
@@ -644,7 +647,7 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
         rp_dirty_all();
         return;
     }
-    if (P.open) rp_pass_end(c);
+    if (P.open) { rp_perf_add(RP_PERF_P_CUT_CLEAR, 1); rp_pass_end(c); }
     park_put_depth(c, do_d, depth_value(cd->depth), do_s, cd->stencil);   // 挂起：深度 / 模板两面合成一项
 }
 

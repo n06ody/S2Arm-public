@@ -134,6 +134,15 @@ void nvn_be_tex_cpu_written(const tex_t *t) {
     pthread_mutex_unlock(&g_rmu);
 }
 // 调试取证：这个序号的存储现在的归属（位 0 当 CPU 贴图、位 1 传过、位 2 GPU 写过、位 3 有存储），没建过 = 0
+// 调试：序号 → 它背后那份存储（创建序号 uid、内存地址、字节数）；共用一份存储的不同序号 uid 相同。没登记过返回 0
+//   held = 1：调用方已持有资源锁（上传 / 填零路径里登记写入时），不再上锁
+int rp_tex_debug_storage(uint64_t serial, uint64_t *uid, uint64_t *mem, uint64_t *size, int held) {
+    if (!held) pthread_mutex_lock(&g_rmu);
+    struct rp_tex *x = nvn_hm_get(&g_by_serial, &serial);
+    if (x) { *uid = x->uid; *mem = (uint64_t)(uintptr_t)x->mem; *size = x->size; }
+    if (!held) pthread_mutex_unlock(&g_rmu);
+    return x != NULL;
+}
 int rp_tex_debug_state(uint64_t serial) {
     pthread_mutex_lock(&g_rmu);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &serial); int r = x ? 8 | (x->cpu ? 1 : 0) | (x->uploaded ? 2 : 0) | (x->gpu_written ? 4 : 0) : 0;
@@ -229,7 +238,7 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
     if (track) { nvn_dirty_protect(t->mem, t->L.size); st = nvn_dirty_now(); x->span = nvn_dirty_span(t->mem, t->L.size); }   // 先保护、取代号、再读：取代号之后的写下次查得到
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
-    uint8_t *tmp = NULL; size_t cap = 0; int rc = 0;
+    uint8_t *tmp = NULL; size_t cap = 0; int rc = 0; uint8_t first[16] = {0}; uint32_t nfirst = 0;
     for (uint32_t l = 0; l < levels && !rc; l++) {
         uint32_t w = t->d.width >> l, h = t->d.height >> l, dp = is3d ? t->d.depth >> l : 1;
         if (!w) w = 1;
@@ -241,10 +250,12 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
             if (nvn_deswizzle(&t->d, l, y, t->mem, tmp, pitch)) { nvn_unimpl("tex", "deswizzle_failed", t); rc = -1; break; }
             NVNcopyRegion r = {0, 0, 0, (int)w, (int)h, (int)dp};
             nvn_gpu_tex_upload(c, x->g, l, y, &r, tmp, pitch, img);
+            if (!l && !y) { nfirst = img < 16 ? (uint32_t)img : 16; memcpy(first, tmp, nfirst); }
         }
     }
     free(tmp);
     if (!rc && track) { x->stamp = st; x->uploaded = 1; g_uploads++; }
+    if (!rc) rp_debug_tex_write(t->serial, RP_TW_UPLOAD, 0, t->L.size, first, nfirst, 1);   // 上传在资源锁里
     return rc;
 }
 
@@ -301,6 +312,7 @@ static void zero_fill(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
         for (uint32_t y = 0; y < layers; y++) nvn_gpu_tex_upload(c, x->g, l, y, &r, z, pitch, pitch * h * dp);
     }
     free(z);
+    rp_debug_tex_write(t->serial, RP_TW_ZERO, 0, 0, NULL, 0, 1);   // 填零在资源锁里
 }
 
 static uint32_t usage_of(const tex_t *t, int cpu) {
