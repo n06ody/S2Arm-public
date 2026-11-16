@@ -67,6 +67,6 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
             d.color[0].view = gpu; d.color[0].load = NVN_GPU_LOAD_LOAD; d.color[0].store = NVN_GPU_STORE_STORE;
             nvn_gpu_pass_begin(c, &d); nvn_gpu_clear_rect(c, &cl); nvn_gpu_pass_end(c); rp_dirty_all();
         }
-        rp_view_pin_end(); rp_tex_mark_gpu_written(t);
+        rp_view_pin_end(); rp_tex_mark_gpu_written(t); rp_debug_tex_write(t->serial, RP_TW_CLEAR_TEX, 0, 0, o->c.u, 16);
     }
 }

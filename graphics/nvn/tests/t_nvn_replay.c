@@ -24,10 +24,12 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200]; static int g_info_watch;   // 诊断第二版：「盯计算」行数
-static int g_info_chain; static char g_chain[4][700];   // 诊断：转储链行数与前 4 行
+static int g_info_chain; static char g_chain[4][900];
+static int g_info_wlog; static char g_wlog[4][700];   // 诊断：写入日志行数与最近 4 行（环）
+static int g_flag_tex_wlog0, g_flag_tex_wlog1;   // 调试开关 nvk_tex_wlog0/1：盯的贴图序号   // 诊断：转储链行数与前 4 行
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "写入日志")) { snprintf(g_wlog[g_info_wlog & 3], sizeof g_wlog[0], "%s", text); g_info_wlog++; } if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
@@ -44,6 +46,8 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_cs_watch0")) return g_flag_cs_watch0;
     if (!strcmp(name, "nvk_cs_watch1")) return g_flag_cs_watch1;
     if (!strcmp(name, "nvk_cs_watch_on_dump")) return g_flag_cs_watch_on_dump;
+    if (!strcmp(name, "nvk_tex_wlog0")) return g_flag_tex_wlog0;
+    if (!strcmp(name, "nvk_tex_wlog1")) return g_flag_tex_wlog1;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -2952,9 +2956,48 @@ static void t_dump_producer_compute(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     g_info_chain = 0; uint64_t fence = 0; rp_debug_dump_request(781, 9); rp_debug_dump_poll(&fence);
     CHECK(g_info_chain == 2);
-    CHECK(strstr(g_chain[0], "帧 9 #781 层 0：最近 1 次写入，生产者 [计算 37727c65c9440244 ×1") && strstr(g_chain[0], "源 #782"));
-    CHECK(strstr(g_chain[1], "#782 层 1（是 #781 的源）") && strstr(g_chain[1], "历史里没有写它"));
+    CHECK(strstr(g_chain[0], "帧 9 #781 层 0：") && strstr(g_chain[0], "[计算 37727c65c9440244 ×1") && strstr(g_chain[0], "源 #782") && strstr(g_chain[0], "最后一次写 计算 37727c65c9440244"));
+    CHECK(strstr(g_chain[1], "#782 层 1（是 #781 的源）") && !strstr(g_chain[1], "计算"));
     g_info_chain = 0; memset(rp_S.skey[5], 0, 8); rp_S.img[5][2] = 0; rp_S.tex[5][1] = 0; pass_fresh();
+}
+
+// 诊断：缓冲→贴图 / 贴图→贴图 / 清贴图也进转储历史；缓冲→贴图找到最近写过源缓冲的计算键；nvk_tex_wlog 盯的贴图每写一次打一行（带 CPU 侧知道的值）；
+//   最后一次写按序号另存，绘制历史冲掉之后转储链照样打得出
+static void t_tex_write_log(void) {
+    pass_fresh(); res_fresh(); g_arena_used = 0; g_cresolve_rc = 0; rp_draw_reset();
+    nvn_be_pool_add(g_pmem, sizeof g_pmem); memset(g_pmem, 0, sizeof g_pmem);
+    float val[2] = {1.5f, 0.25f}; memcpy(g_pmem + 256, val, 8);
+    tex_t a = mk_tex(791, 0, NVN_FORMAT_RG32F, 1, 1, 1, 0), b = mk_tex(792, 0x4000, NVN_FORMAT_RG32F, 1, 1, 1, 0);
+    // 计算核写 g_pmem+256 起 64 字节（可写存储），随后缓冲→贴图从这里拷进 #791
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 1;
+    g_cprog.ent[0][0].cls = NVN_GPU_RES_SSBO; g_cprog.ent[0][0].src_kind = NVN_RB_SBUFP; g_cprog.ent[0][0].src_reg = 0; g_cprog.ent[0][0].access = NVN_GPU_ACC_RW;
+    rp_S.ssbo[5][0].addr = (uint64_t)(uintptr_t)(g_pmem + 256); rp_S.ssbo[5][0].size = 64;
+    static const uint8_t key[8] = {0x37, 0x72, 0x7c, 0x65, 0xc9, 0x44, 0x02, 0x44}; memcpy(rp_S.skey[5], key, 8);
+    g_flag_tex_wlog0 = 791; g_flag_tex_wlog1 = 792; g_info_wlog = 0;
+    nvn_be_sub_begin(); p_dispatch dp = {.x = 1, .y = 1, .z = 1}; int n = g_ndisp; rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 1);
+    int w0 = g_info_wlog;
+    p_copy_b2t cb; memset(&cb, 0, sizeof cb); cb.src = (uint64_t)(uintptr_t)(g_pmem + 256); cb.tex = &a; cb.r = (NVNcopyRegion){0, 0, 0, 1, 1, 1};
+    rp_op_copy_b2t(&g_fake_cmd, &cb, NULL);
+    int wb = g_info_wlog - w0; const char *lb = g_wlog[(g_info_wlog - 1) & 3];
+    CHECK(wb >= 1 && strstr(lb, "写入日志 #791") && strstr(lb, "缓冲→贴图 源") && strstr(lb, "源最近由计算 37727c65c9440244") && strstr(lb, "= 1.5 0.25 "));
+    p_copy_t2t ct; memset(&ct, 0, sizeof ct); ct.src = &a; ct.dst = &b; ct.sr = ct.dr = (NVNcopyRegion){0, 0, 0, 1, 1, 1};
+    w0 = g_info_wlog; rp_op_copy_t2t(&g_fake_cmd, &ct, NULL);
+    CHECK(g_info_wlog > w0 && strstr(g_wlog[(g_info_wlog - 1) & 3], "写入日志 #792") && strstr(g_wlog[(g_info_wlog - 1) & 3], "贴图→贴图 源 #791"));
+    tex_t cc = mk_tex(794, 0xC000, NVN_FORMAT_RGBA8, 2, 2, 1, 0); g_flag_tex_wlog1 = 794;   // 局部清（替身后端只接局部清的通道路径）；首用先填零也是一次写，末行是清除
+    p_clear_tex cl; memset(&cl, 0, sizeof cl); cl.tex = &cc; cl.mask = 15; cl.r = (NVNcopyRegion){0, 0, 0, 1, 1, 1}; cl.c.f[0] = 2; cl.c.f[1] = 3;
+    w0 = g_info_wlog; rp_op_clear_tex(&g_fake_cmd, &cl, NULL);
+    CHECK(g_info_wlog > w0 && strstr(g_wlog[(g_info_wlog - 1) & 3], "清贴图") && strstr(g_wlog[(g_info_wlog - 1) & 3], "= 2 3 0 0"));
+    // 4096 条以上别的绘制历史把 #791 的写冲掉：转储链仍从「最后一次写」打出缓冲→贴图
+    { tex_t im = mk_tex(793, 0x8000, NVN_FORMAT_RGBA8, 8, 8, 1, NVN_TEXTURE_FLAGS_IMAGE); nvn_be_reg_tex(3, &im, NULL); nvn_be_set_tex_pool_n(8);
+      g_cprog.ent[0][0].cls = NVN_GPU_RES_IMAGE; g_cprog.ent[0][0].src_kind = NVN_RB_IMG; g_cprog.ent[0][0].src_reg = 2; g_cprog.ent[0][0].count = 1; g_cprog.ent[0][0].access = NVN_GPU_ACC_W;
+      rp_S.img[5][2] = 3; n = g_ndisp;
+      for (int i = 0; i < 4200; i++) rp_dispatch(&g_fake_cmd, &dp, NULL);   // 别的图像写 4200 次
+      CHECK(g_ndisp == n + 4200); rp_S.img[5][2] = 0; }
+    g_info_chain = 0; uint64_t fence = 0; rp_debug_dump_request(791, 3); rp_debug_dump_poll(&fence);
+    CHECK(g_info_chain == 1 && strstr(g_chain[0], "#791 层 0：历史里没有写它") && strstr(g_chain[0], "最后一次写 缓冲→贴图 源") && strstr(g_chain[0], "源最近由计算 37727c65c9440244"));
+    g_info_chain = 0; g_flag_tex_wlog0 = g_flag_tex_wlog1 = 0;
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    rp_S.ssbo[5][0].addr = 0; rp_S.ssbo[5][0].size = 0; memset(rp_S.skey[5], 0, 8); nvn_be_pool_del(g_pmem); rp_draw_reset(); pass_fresh();
 }
 
 // 计算核按贴图采样 c2 图像句柄表的字（贴图槽 32..39，同 iOS nvn_mtl.m tex_slot_h）：取图像槽 k 绑着的句柄，不读组合 / 分离贴图表的同号项。
@@ -3502,7 +3545,7 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
     { int c0 = g_info_chain; uint64_t fence = 0; rp_debug_dump_request(81, 5); rp_debug_dump_poll(&fence);
       CHECK(g_info_chain == c0 + 2);
       CHECK(strstr(g_chain[c0 & 3], "#81 层 0") && strstr(g_chain[c0 & 3], "[绘制 顶点 1122334455667788 片元 a1b2c3d4e5f60718 ×") && strstr(g_chain[c0 & 3], "源 #82"));
-      CHECK(strstr(g_chain[(c0 + 1) & 3], "#82 层 1（是 #81 的源）") && strstr(g_chain[(c0 + 1) & 3], "历史里没有写它")); g_info_chain = 0; }
+      CHECK(strstr(g_chain[(c0 + 1) & 3], "#82 层 1（是 #81 的源）") && strstr(g_chain[(c0 + 1) & 3], "[填零 ×1")); g_info_chain = 0; }   // 采样的贴图只有初始填零
     memset(rp_S.skey[0], 0, 8); memset(rp_S.skey[1], 0, 8);
     CHECK(g_gdraws == 3 && g_npd == 1 && pd_zero_clear(&g_pd[0]));   // 三笔画在同一个通道里；没有清除 → 不带清除值（刚建的目标载入时清成零）
     CHECK(nvn_unimpl_count("draw", "prim_10") == 1);
@@ -3970,6 +4013,7 @@ int main(int argc, char **argv) {
     t_compute_image();
     t_compute_tex_from_image();
     t_dump_producer_compute();
+    t_tex_write_log();
     t_drv2_table();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
