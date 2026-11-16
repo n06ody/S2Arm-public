@@ -41,6 +41,8 @@ static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static nvn_hmap g_shadow = {.klen = 8};   // 池起点 → struct shadow *
 static uint64_t g_sync_bytes, g_sync_runs;
 static nvn_gpu_buf g_null_storage;
+static int g_diag_on;
+static struct rp_buf_diag_row g_diag[RP_BUF_KIND_N];
 
 int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *size);   // rp_entry.c
 
@@ -163,7 +165,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
 // 大头是这把锁与完成线程（落地 GPU 写）互抢，所以另给批量入口，一笔绘制只抢一次。
 static int g_res_tm = -1; static unsigned g_res_tmk;
 static uint64_t res_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
-static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size) {
+static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, enum rp_buf_diag_kind kind) {
     if (g_res_tm < 0 || !(++g_res_tmk & 255)) g_res_tm = nvn_plat_flag("nvk_res_tm", 0) != 0;
     const uint64_t q0 = g_res_tm ? res_now() : 0;
     rp_perf_add(RP_PERF_RES_N, 1);
@@ -183,6 +185,22 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
     uint64_t stack[256], *gens = n <= 256 ? stack : malloc((size_t)n * sizeof *gens);
     long got = gens ? nvn_dirty_page_gens(nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)len), (const void *)(uintptr_t)addr, (size_t)len, gens, (size_t)n) : -1;
     int tracked = got == (long)n;   // 没被写跟踪的池：每次使用都整段同步
+    int tag = (int)kind - RP_BUF_KIND_N;
+    int row = tag >= 0 && kind < RP_BUF_INDEX_TAG_END ? RP_BUF_INDEX : (kind >= 0 && kind < RP_BUF_KIND_N ? kind : RP_BUF_OTHER);
+    struct rp_buf_diag_row *diag = __atomic_load_n(&g_diag_on, __ATOMIC_RELAXED) ? &g_diag[row] : NULL;
+    if (diag) {
+        int bucket = n == 1 ? 0 : n <= 16 ? 1 : n <= 256 ? 2 : n <= 4096 ? 3 : n <= 16384 ? 4 : 5;
+        diag->slow++; diag->pages += n; diag->hist[bucket]++;
+        if (row == RP_BUF_INDEX && tag >= 0 && kind < RP_BUF_INDEX_TAG_END) { diag->index_slow[tag]++; diag->index_pages[tag] += n; }
+        int pool_bucket = size <= (1ull << 20) ? 0 : size <= (16ull << 20) ? 1 : size <= (128ull << 20) ? 2 : size <= (512ull << 20) ? 3 : size <= (1ull << 30) ? 4 : 5;
+        diag->pool_hist[pool_bucket]++;
+        if (size > diag->pool_max) diag->pool_max = size;
+        if (!tracked) diag->untracked++;
+        if (m->seen_ok && m->seen_map != map0) diag->map++;
+        int first = 0, stale = 0;
+        for (uint64_t k = p; k <= q; k++) { if (!m->synced[k]) first = 1; else if (m->checked[k] != now0) stale = 1; }
+        diag->first += first; diag->stale += stale;
+    }
     if (tracked) { rp_perf_add(RP_PERF_BUF_SLOW_N, 1); rp_perf_add(RP_PERF_BUF_PAGES_N, n); } else rp_perf_add(RP_PERF_BUF_NOSPAN_N, 1);
     for (uint64_t i = p; i <= q;) {
         if (m->synced[i] && tracked && gens[i - p] <= m->synced[i]) { i++; continue; }
@@ -200,7 +218,10 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
         else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
-        for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
+        for (uint64_t k = i; k <= j; k++) {
+            if (diag) { if (!m->synced[k]) diag->fresh_pages++; else if (tracked) diag->dirty++; }
+            m->synced[k] = st; m->sub[k] = last;
+        }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
         i = j + 1;
     }
@@ -210,12 +231,12 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
     if (q0) rp_perf_add(RP_PERF_RES_LA_NS, res_now() - q0);
     return 1;
 }
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
+int rp_buf_resolve_tag(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off, enum rp_buf_diag_kind kind) {
     (void)c;
     const uint8_t *mem; uint64_t size;
     if (!len || !rp_pool_find(addr, len, &mem, &size)) { nvn_unimpl("buf", "address_outside_pools", (const void *)(uintptr_t)addr); return 0; }
     pthread_mutex_lock(&g_bmu);
-    int r = resolve_locked(addr, len, mem, size);
+    int r = resolve_locked(addr, len, mem, size, kind);
     if (r) {
         struct shadow *s = shadow_get(mem, size);
         if (s) {
@@ -228,7 +249,7 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
     return r;
 }
 // 批量：一次抢锁解析多段（顶点流 / 存储缓冲），成功写 1、失败写 0。
-int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
+int rp_buf_resolve_multi_tag(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, enum rp_buf_diag_kind kind) {
     const uint8_t *mem[16]; uint64_t size[16];
     if (n > 16) n = 16;
     for (int i = 0; i < n; i++) { mem[i] = NULL; size[i] = 0; ok[i] = 0; if (len[i]) rp_pool_find(addr[i], len[i], &mem[i], &size[i]); }
@@ -238,12 +259,48 @@ int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_g
     for (int i = 0; i < n; i++) {
         if (!mem[i]) continue;
         struct shadow *s = shadow_get(mem[i], size[i]);
-        if (!s || !resolve_locked(addr[i], len[i], mem[i], size[i])) continue;
+        if (!s || !resolve_locked(addr[i], len[i], mem[i], size[i], kind)) continue;
         struct mirror *m = mirror_pick(s, addr[i] - (uint64_t)(uintptr_t)mem[i], len[i], NULL);
         buf[i] = m->buf; off[i] = addr[i] - (uint64_t)(uintptr_t)mem[i]; ok[i] = 1;
     }
     pthread_mutex_unlock(&g_bmu);
     return 1;
+}
+
+int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
+    return rp_buf_resolve_tag(c, addr, len, buf, off, RP_BUF_OTHER);
+}
+int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
+    return rp_buf_resolve_multi_tag(n, addr, len, buf, off, ok, RP_BUF_OTHER);
+}
+int rp_buf_diag_take(struct rp_buf_diag_row out[RP_BUF_KIND_N]) {
+    int enabled = nvn_plat_flag("nvk_buf_diag", 0) != 0;
+    if (!enabled && !__atomic_load_n(&g_diag_on, __ATOMIC_RELAXED)) { memset(out, 0, sizeof g_diag); return 0; }
+    pthread_mutex_lock(&g_bmu); memcpy(out, g_diag, sizeof g_diag); memset(g_diag, 0, sizeof g_diag); __atomic_store_n(&g_diag_on, enabled, __ATOMIC_RELAXED); pthread_mutex_unlock(&g_bmu);
+    return enabled;
+}
+// 仅诊断：登记写和锁外落地仍未完成则返回 1；地址不可判返回 -1。
+// 0 只表示当前登记中未发现待落地写，不证明所有 GPU 写都成功登记。
+static int diag_gpu_pending(uint64_t addr, uint64_t len) {
+    const uint8_t *mem; uint64_t size;
+    if (!len || !rp_pool_find(addr, len, &mem, &size)) return -1;
+    const uint64_t off = addr - (uint64_t)(uintptr_t)mem, key = (uint64_t)(uintptr_t)mem;
+    int hit = 0;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &key);
+    if (s) {
+        for (int i = 0; i < s->ngw && !hit; i++) if (s->gw[i].off < off + len && off < s->gw[i].off + s->gw[i].len) hit = 1;
+        if (s->landing > s->nlr) hit = 1;
+        for (int i = 0; i < s->nlr && !hit; i++) if (s->lr[i].off < off + len && off < s->lr[i].off + s->lr[i].len) hit = 1;
+    }
+    pthread_mutex_unlock(&g_bmu);
+    return hit;
+}
+enum rp_buf_diag_kind rp_buf_diag_indirect_tag(uint64_t addr, uint64_t len, uint64_t count_addr) {
+    if (!__atomic_load_n(&g_diag_on, __ATOMIC_RELAXED)) return RP_BUF_INDEX;
+    int a = diag_gpu_pending(addr, len), b = count_addr ? diag_gpu_pending(count_addr, 4) : 0;
+    int status = (a > 0 || b > 0) ? 1 : (a < 0 || b < 0) ? 2 : 0;
+    return (enum rp_buf_diag_kind)((count_addr ? RP_BUF_INDEX_COUNT_CLEAR : RP_BUF_INDEX_INDIRECT_CLEAR) + status);
 }
 
 void rp_buf_pool_gone(const void *mem) {
@@ -275,6 +332,7 @@ void rp_buf_reset(void) {
     for (uint32_t i = 0; i < g_shadow.cap; i++) { struct shadow *s = g_shadow.vals[i]; if (s) shadow_free(s); }
     if (g_null_storage) nvn_gpu_buf_release(g_null_storage, NULL, NULL);
     g_null_storage = NULL;
+    memset(g_diag, 0, sizeof g_diag); __atomic_store_n(&g_diag_on, 0, __ATOMIC_RELAXED);
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
     pthread_mutex_unlock(&g_bmu);
 }

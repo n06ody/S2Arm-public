@@ -28,11 +28,13 @@ static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
 void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
+static int g_flag_buf_diag;
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_buf_diag")) return g_flag_buf_diag;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -1495,6 +1497,41 @@ static void t_buf_mirror(void) {   // 池镜像：首次使用建一份、按页
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
 
+static void t_buf_diag(void) {
+    nvn_be_shutdown_session(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; g_flag_buf_diag = 1;
+    nvn_be_sub_begin(); nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    struct rp_buf_diag_row d[RP_BUF_KIND_N]; rp_buf_diag_take(d);
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_VERTEX));
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_VERTEX)); // 快路不计慢路
+    g_dirty_now++;
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_VERTEX)); // 全局变了、区间无脏页
+    g_pg_gen[1] = ++g_dirty_now;
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_INDEX)); // 一页真的脏
+    g_dirty_map++;
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_STORAGE));
+    g_pg_tracked = 0; g_dirty_map++;
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base + 2 * PG, PG, NULL, NULL, RP_BUF_CONSTANT));
+    CHECK(rp_buf_diag_take(d));
+    CHECK(d[RP_BUF_VERTEX].slow == 2 && d[RP_BUF_VERTEX].pages == 4 && d[RP_BUF_VERTEX].dirty == 0 && d[RP_BUF_VERTEX].fresh_pages == 2 && d[RP_BUF_VERTEX].first == 1 && d[RP_BUF_VERTEX].stale == 1 && d[RP_BUF_VERTEX].hist[1] == 2);
+    CHECK(d[RP_BUF_INDEX].slow == 1 && d[RP_BUF_INDEX].dirty == 1 && d[RP_BUF_INDEX].stale == 1 && d[RP_BUF_INDEX].pool_max == sizeof g_pmem && d[RP_BUF_INDEX].pool_hist[0] == 1);
+    CHECK(d[RP_BUF_STORAGE].slow == 1 && d[RP_BUF_STORAGE].map == 1 && d[RP_BUF_STORAGE].dirty == 0);
+    CHECK(d[RP_BUF_CONSTANT].slow == 1 && d[RP_BUF_CONSTANT].untracked == 1 && d[RP_BUF_CONSTANT].dirty == 0);
+    CHECK(rp_buf_diag_take(d) && d[RP_BUF_VERTEX].slow == 0 && d[RP_BUF_INDEX].slow == 0);
+    CHECK(rp_buf_diag_indirect_tag(base, 20, 0) == RP_BUF_INDEX_INDIRECT_CLEAR);
+    CHECK(rp_buf_diag_indirect_tag(base, 20, base + PG) == RP_BUF_INDEX_COUNT_CLEAR);
+    CHECK(rp_buf_diag_indirect_tag(base + sizeof g_pmem, 20, 0) == RP_BUF_INDEX_INDIRECT_UNKNOWN);
+    uint64_t key = 0, id = rp_buf_gpu_write_note(base + PG, 32, &key); CHECK(id != 0);
+    CHECK(rp_buf_diag_indirect_tag(base + PG + 4, 20, 0) == RP_BUF_INDEX_INDIRECT_PENDING);
+    CHECK(rp_buf_diag_indirect_tag(base, 20, base + PG + 4) == RP_BUF_INDEX_COUNT_PENDING);
+    CHECK(rp_buf_diag_indirect_tag(base, 20, base + 2 * PG) == RP_BUF_INDEX_COUNT_CLEAR);
+    rp_buf_gpu_write_land(key, id, 0);
+    CHECK(rp_buf_diag_indirect_tag(base + PG, 20, 0) == RP_BUF_INDEX_INDIRECT_CLEAR);
+    CHECK(rp_buf_resolve_tag(&g_fake_cmd, base, 2 * PG, NULL, NULL, RP_BUF_INDEX_DIRECT));
+    CHECK(rp_buf_diag_take(d) && d[RP_BUF_INDEX].index_slow[0] == 1 && d[RP_BUF_INDEX].index_pages[0] == 2);
+    g_pg_tracked = 1; g_flag_buf_diag = 0; nvn_be_pool_del(g_pmem); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_shutdown_session();
+}
+
 static void t_buf_ops(void) {   // 缓冲类命令只改游戏内存；GPU 顺序由使用点同步保证：先用的看到旧内容，后用的看到新内容
     nvn_be_shutdown_session(); nvn_unimpl_reset(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_nbw = 0; g_dirty_now = 100; memset(g_pmem, 0, sizeof g_pmem);
     uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
@@ -1755,6 +1792,36 @@ static void q_env(stream *s) {
     p_viewports *vp = put(s, OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = 64; vp->v[0][3] = 36;
 }
 static void q_draw(stream *s) { p_draw *d = put(s, OP_DRAW, sizeof *d); d->prim = 4; d->count = 3; d->instances = 1; }
+static void t_buf_diag_draw_tags(void) {
+    pass_fresh(); g_pg_tracked = 0; g_flag_buf_diag = 1; nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    struct rp_buf_diag_row d[RP_BUF_KIND_N]; rp_buf_diag_take(d);
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    stream s = {0}; q_env(&s); g_fprog.attr_mask = 1;
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_SSBO; g_fprog.ent[1][0].src_kind = NVN_RB_SBUFP; g_fprog.ent[1][0].access = NVN_GPU_ACC_R;
+    p_bind_vattr *va = put(&s, OP_BIND_VATTR, sizeof *va); va->n = 1; va_st a = {.fmt = 0x2A, .stream = 0}; memcpy(&va->st[0], &a, 4);
+    p_bind_vstream *vs = put(&s, OP_BIND_VSTREAM, sizeof *vs); vs->n = 1; vs->st[0].stride = 16;
+    p_bind_vbuf_single *vb = put(&s, OP_BIND_VBUF, sizeof *vb); vb->first = 0; vb->size = 64; vb->addr = base - 0x1000;
+    p_bind_buf *sb = put(&s, OP_BIND_SSBO, sizeof *sb); sb->stage = 1; sb->index = 0; sb->addr = base + PG; sb->size = 64;
+    p_draw_idx *di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->count = 3; di->instances = 1; di->ibuf = base + 2 * PG;
+    end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_buf_diag_take(d));
+    CHECK(d[RP_BUF_VERTEX].slow == 1 && d[RP_BUF_STORAGE].slow == 1 && d[RP_BUF_INDEX].slow == 1 && d[RP_BUF_CONSTANT].slow == 0);
+    CHECK(d[RP_BUF_INDEX].index_slow[RP_BUF_INDEX_DIRECT - RP_BUF_KIND_N] == 1);
+    uint64_t key = 0, id = rp_buf_gpu_write_note(base + 3 * PG, 20, &key); CHECK(id);
+    stream t = {0}; q_env(&t);
+    p_draw_idx *ind = put(&t, OP_DRAW_IDX, sizeof *ind); ind->prim = 4; ind->itype = 1; ind->instances = 1; ind->ibuf = base + 2 * PG; ind->ind = base + 3 * PG;
+    end(&t); submit1(&t); fake_complete(NVN_GPU_DONE_OK); CHECK(rp_buf_diag_take(d));
+    CHECK(d[RP_BUF_INDEX].index_slow[RP_BUF_INDEX_INDIRECT_PENDING - RP_BUF_KIND_N] == 1);
+    rp_buf_gpu_write_land(key, id, 0);
+    key = 0; id = rp_buf_gpu_write_note(base + 4 * PG, 4, &key); CHECK(id);
+    g_caps_extra |= NVN_GPU_CAP_INDIRECT_COUNT; rp_draw_reset();
+    stream m = {0}; q_env(&m); p_multi_draw *md = put(&m, OP_MULTI_DRAW, sizeof *md);
+    md->ind = base + 3 * PG; md->cnt = base + 4 * PG; md->ibuf = base + 2 * PG; md->stride = 20; md->max = 1; md->prim = 4; md->itype = 1;
+    end(&m); submit1(&m); fake_complete(NVN_GPU_DONE_OK); CHECK(rp_buf_diag_take(d));
+    CHECK(d[RP_BUF_INDEX].index_slow[RP_BUF_INDEX_COUNT_PENDING - RP_BUF_KIND_N] == 1);
+    rp_buf_gpu_write_land(key, id, 0); g_caps_extra &= ~NVN_GPU_CAP_INDIRECT_COUNT; rp_draw_reset();
+    g_flag_buf_diag = 0; rp_buf_diag_take(d); g_pg_tracked = 1; pass_fresh();
+}
 
 // ---------- 通道边界（同目标续接 / 状态保持 / 待折清除）----------
 // 对齐 nvn_mtl.m:10955 rt_same 与 :15060 的续接：通道边界不再等于状态边界。这些用例都要真的画出东西，所以放在绘制替身之后。
@@ -3585,7 +3652,7 @@ int main(int argc, char **argv) {
     t_registry();
     t_samp_mirror_clamp();
     t_decl_view();
-    t_buf_mirror();
+    t_buf_mirror(); t_buf_diag(); t_buf_diag_draw_tags();
     t_buf_mirror_fail_once();
     t_buf_ops();
     t_copy_b2t();
