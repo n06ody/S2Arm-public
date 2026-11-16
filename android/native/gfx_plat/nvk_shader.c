@@ -152,6 +152,23 @@ static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", n
 static void red_load(nvn_gpu_rc rc, const nvn_gpu_shader_src *src, const char *fallback, const char *why) {
     red1(rc.code == NVN_GPU_E_UNSUPPORTED && s2a_spirv_declares_cap(src->blob, src->bytes, 22) == 1 ? "int16_not_supported" : fallback, why);
 }
+// 程序级失败（编译拒收 / 结果解析失败）：计数同 red1，但每一条都带程序键与原因写一行（整局前 256 条），
+//   这样一局里几十个失败程序能逐个按程序归因（只记首条时，空轨 2nd 9000 局 19 个计算解析失败只看得到 1 个原因）。
+//   程序键 = 当前绑定的阶段控制键（计算 = NVN 阶段 5；图形 = 已绑的各阶段，斜杠分隔），同编译请求的 requestId 与普查的键。
+static void red_prog(const char *name, int compute, const char *why) {
+    nvn_unimpl("shader", name, NULL);
+    static _Atomic int said;
+    if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 256) return;
+    char key[96] = ""; int o = 0;
+    for (unsigned st = compute ? 5 : 0; st <= (compute ? 5u : 4u) && o < (int)sizeof key - 18; st++) {
+        uint8_t k[8];
+        if (compute) memcpy(k, rp_S.skey[5], 8); else if (!rp_shader_stage_key(st, k)) continue;
+        if (o) key[o++] = '/';
+        for (int b = 0; b < 8; b++) o += snprintf(key + o, sizeof key - (size_t)o, "%02x", k[b]);
+    }
+    char m[768]; snprintf(m, sizeof m, "%s（程序键 %s）：%s", name, o ? key : "未知", why ? why : "");
+    nvn_plat_log(NVN_PLAT_LOG_RED, "shader", m);
+}
 // 不需要 _GNU_SOURCE 的 strdup：快照要活过后台线程，profile 原文 / closure / profileHash 必须各存一份。
 static char *dup_str(const char *s) {
     if (!s) return NULL;
@@ -670,6 +687,8 @@ static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
         if (b->storage_writable) e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W;
         return 1;
     }
+    // 共享内存溢出缓冲（计算）：没有客体来源，回放按派发组数 × 程序的 spill_bytes 从暂存区分配（rp_draw.c rp_dispatch）
+    if (b->kind == 4 && b->count == 1) { e->cls = NVN_GPU_RES_SSBO; e->src_kind = NVN_RB_SPILL; e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W; return 1; }
     // 图像：只接计算阶段的单个存储图像（解析器给出 NVN 图像槽 0..7，放在 tex_slot）；回放按槽取 BindImage 的句柄建存储视图
     //   （rp_draw.c rp_dispatch NVN_RB_IMG）。图形阶段的图像回放还没接，绘制时按名跳过（compute_image_shape）。
     if (b->kind == 3 && b->count == 1 && b->tex_slot >= 0 && b->tex_slot < 8) {
@@ -787,7 +806,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     memset(&fp, 0, sizeof fp);
     int parsed = nvn_vk_program_parse_graphics_stages(bytes, len, &fp, nst == 1, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("program_parse_failed", 0, why);
         nvn_vk_program_free(&fp); e->failed = 1; return e;
     }
     for (int st = 0; st < FD_MAX_STAGES; st++) {
@@ -1050,7 +1069,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         free(json);
         if (ran || !oc.bytes || !oc.bytes_len) {
             atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
-            red1("compile_failed", oc.summary);
+            red_prog("compile_failed", 0, oc.summary);
             compiler_rejected(oc.summary);
             if (ubo_need_learn(oc.summary, (const uint8_t (*)[8])s->keys, s->nst)) g_ubo_learned = 1;
             s2a_compile_outcome_free(&oc);
@@ -1599,10 +1618,10 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     memset(&cp, 0, sizeof cp);
     int parsed = nvn_vk_program_parse_compute(bytes, len, &cp, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("compute_program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("compute_program_parse_failed", 1, why);
         e->failed = 1; return e;
     }
-    e->prog.support_bytes = cp.support_bytes;
+    e->prog.support_bytes = cp.support_bytes; e->prog.spill_bytes = cp.spill_bytes;
     for (int i = 0; i < cp.binding_count && !e->failed; i++) {
         const struct fd_binding *b = &cp.bindings[i];
         if (e->prog.nent[0] == RP_PROG_ENT_MAX) { red1("too_many_bindings", "cs"); e->failed = 1; break; }
@@ -1783,7 +1802,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
-                red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
+                red_prog("compute_compile_failed", 1, oc.summary); compiler_rejected(oc.summary);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e);
                 if (e) {
