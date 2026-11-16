@@ -23,13 +23,14 @@ static int g_fail, g_checks;
 #define CHECK(c) do { g_checks++; if (!(c)) { g_fail++; printf("【红】 %s:%d  %s\n", __FILE__, __LINE__, #c); fflush(stdout); } } while (0)
 
 // ---------- 平台替身 ----------
-static int g_red_lines; static char g_last_red[200];
+static int g_red_lines; static char g_last_red[200]; static int g_info_watch;   // 诊断第二版：「盯计算」行数
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
+static int g_flag_cs_watch0;    // 用例设：开关 nvk_cs_watch0（诊断：按程序键前 28 位盯计算派发）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
@@ -37,6 +38,7 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_skip_cs0")) return g_flag_skip_cs0;
+    if (!strcmp(name, "nvk_cs_watch0")) return g_flag_cs_watch0;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -3092,6 +3094,16 @@ static void t_lost_ring_skip(void) {
     g_flag_skip_cs0 = 0x37727c7; rp_dispatch(&g_fake_cmd, &dp, NULL);   // 别的程序键前缀：照常派发
     CHECK(g_ndisp == n + 2);
     g_flag_skip_cs0 = 0;
+    // 盯计算：前缀命中时派发记一行；所在段之后过了 3 段，上屏轮询把可写存储的摘要打出来（这里一个可写存储、读游戏内存）
+    static uint32_t out[8] = {0, 7, 0, 3};
+    g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_SSBO; g_cprog.ent[0][0].src_kind = NVN_RB_SBUFP; g_cprog.ent[0][0].src_reg = 0; g_cprog.ent[0][0].access = NVN_GPU_ACC_RW;
+    rp_S.ssbo[5][0].addr = (uint64_t)(uintptr_t)out; rp_S.ssbo[5][0].size = sizeof out;
+    int w0 = g_info_watch; g_flag_cs_watch0 = 0x37727c6;
+    rp_dispatch(&g_fake_cmd, &dp, NULL);
+    int noted = g_info_watch - w0; g_flag_cs_watch0 = 0;
+    rp_cs_watch_poll(); int early = g_info_watch - w0 - noted;   // 同一段：还不读
+    CHECK(noted <= 1 && early == 0);
+    rp_S.ssbo[5][0].addr = 0; rp_S.ssbo[5][0].size = 0; g_cprog.nent[0] = 0;
     int red0 = g_red_lines; rp_lost_ring_dump("test"); rp_lost_ring_dump("again");
     CHECK(g_red_lines == red0 + 1 && strstr(g_last_red, "最近 2 次"));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); pass_fresh();
