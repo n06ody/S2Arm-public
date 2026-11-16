@@ -80,7 +80,7 @@ class ComputeProgram(unittest.TestCase):
         bad('missing_support_binding',lambda c:(c.update(supportReads=[[192,4]]),c['bindings'].pop(0)))
         # NVN cbuf 语义：0 = c0/support、1 = c1 常量段、2 = 纹理句柄表（未实现）、3..18 = 用户 uniform。
         obj=fixture();obj['content']['bindings'].append({'stage':'cs','kind':'uniform','set':0,'binding':3,'slot':1,'count':1});cases.append(('uniform_c1',obj,0))
-        obj=fixture();obj['content']['bindings'].append({'stage':'cs','kind':'uniform','set':0,'binding':3,'slot':2,'count':1});cases.append(('uniform_c2_texture_bank',obj,1))
+        obj=fixture();obj['content']['bindings'].append({'stage':'cs','kind':'uniform','set':0,'binding':3,'slot':2,'count':1});cases.append(('uniform_c2_texture_bank',obj,0))   # 驱动句柄表 c2 当常量缓冲读：同图形接成 NVN_RB_DRV2（回放填完整驱动表）
         obj=fixture();obj['content']['bindings'].append({'stage':'cs','kind':'uniform','set':0,'binding':3,'slot':19,'count':1});cases.append(('uniform_slot19',obj,1))
         bad('graphics_kind',lambda c:c.update(kind='graphics'))
         bad('graphics_stage',lambda c:c['stages'][0].update(stage='fs'))
@@ -152,7 +152,8 @@ class ComputeProgram(unittest.TestCase):
                 'negative_alignment_required':source.replace('CS_FAIL("compute storage alignment fact missing");','alignment=(struct s2a_jv){"false",5};'),
                 'negative_stage_check':source.replace('!compute_string_is(st, "stage", "cs")','0'),
                 'negative_unknown_kind':source.replace('else CS_FAIL("unknown compute binding kind");','else dst->kind = 1;'),
-                'negative_c1_slot':source.replace('if (dst->slot != 0 && dst->slot != 1 && (dst->slot < 3 || dst->slot > 18))','if ((dst->slot != 0 && dst->slot < 3) || dst->slot > 18)'),
+                'negative_c1_slot':source.replace('if (dst->slot != 0 && dst->slot != 1 && dst->slot != 2 && (dst->slot < 3 || dst->slot > 18))','if ((dst->slot != 0 && dst->slot < 3) || dst->slot > 18)'),
+                'negative_c2_bank_rejected':source.replace('dst->slot != 1 && dst->slot != 2 && (dst->slot < 3','dst->slot != 1 && (dst->slot < 3'),
                 'negative_duplicate_binding':source.replace('CS_FAIL("duplicate compute binding");','(void)0;'),
                 'negative_source_mapping':source.replace('nvn == (s->cb_offset - 0x310) / 16u', 'nvn < 16')}
             for label,code in variants.items():
@@ -168,8 +169,6 @@ class ComputeProgram(unittest.TestCase):
                         self.assertEqual(run.stdout.strip(),'1 20 2608 2 | 0,0,0,-1,-1,-1,-1 | 1,0,1,-1,5,-1,-1 / 0,896,1,7,0')
                     if label=='positive' and name=='uniform_slot19':
                         self.assertIn('compute uniform slot 19 outside NVN cbuf range (set=0 binding=3)',run.stdout)
-                    if label=='positive' and name=='uniform_c2_texture_bank':
-                        self.assertIn('compute c2 texture-handle bank used as a uniform buffer is not implemented: set=0 binding=3',run.stdout)
                     if label=='positive' and name=='over_contract_bindings':
                         # 344 条必须准确报“超出上限”，不是静默截断到 343（与 cap 测试同一判据）。
                         self.assertIn('compute binding count exceeds limit',run.stdout)

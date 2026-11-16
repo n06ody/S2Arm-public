@@ -57,6 +57,9 @@ enum s2a_json_error {
 };
 
 // 解析顶层对象。成功返回 S2A_JSON_OK；失败时 out 不可用、err 写入 ASCII 原因。
+// 同 s2a_json_parse_object，只是文档上限由调用方给（编译结果这种「程序」级文档，不是描述文件）。
+int s2a_json_parse_object_max(const uint8_t *data, size_t bytes, size_t max_bytes, s2a_json_object *out,
+                              char *err, size_t err_size);
 int s2a_json_parse_object(const uint8_t *data, size_t bytes, s2a_json_object *out,
                           char *err, size_t err_size);
 
