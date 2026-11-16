@@ -378,6 +378,19 @@ namespace S2A.DirectCompiler
             }
         }
 
+        private static void WriteRanges(Utf8JsonWriter writer, int[][] ranges)
+        {
+            if (ranges == null) { writer.WriteNullValue(); return; }
+            writer.WriteStartArray();
+            foreach (int[] range in ranges)
+            {
+                writer.WriteStartArray();
+                writer.WriteNumberValue(range[0]); writer.WriteNumberValue(range[1]);
+                writer.WriteEndArray();
+            }
+            writer.WriteEndArray();
+        }
+
         private static byte[] WriteContent(DirectProgram program, DirectProfile profile,
             List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)> translated,
             DirectAllocator allocator, List<DirectQuery> queries, bool v2)
@@ -463,6 +476,16 @@ namespace S2A.DirectCompiler
                     WriteInfo(writer, shader.Info);
                     writer.WriteNumber("stateReadFlags", accessor.StateReadFlags);
                     writer.WriteNumber("attributeReadMask", accessor.AttributeReadMask);
+                    if (program.Kind == "graphics")
+                    {
+                        // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
+                        int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0Reads");
+                        WriteRanges(writer, stageReads);
+                    }
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();

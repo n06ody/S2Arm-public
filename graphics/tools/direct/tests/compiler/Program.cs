@@ -1147,6 +1147,41 @@ internal static unsafe class Program
             Check(root.GetProperty("contentHash").GetString().StartsWith("sha256-"), "content hash");
         }
 
+        // 2b) 图形阶段的 c0Reads：回放按它决定间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+        //     真实翻译器（DrawParametersReplace）：cbdp 真时 VS 对 c0 + 0x644 / 0x640 的立即读换成内建，读集里不再有；
+        //     cbdp 假时照实列出；寄存器下标读 c0 分析不出 → null（未知，回放照旧拷）。
+        {
+            JsonElement[] C0Stages(ulong[] vsOps, bool cbdp, out string error)
+            {
+                error = null;
+                var node = System.Text.Json.Nodes.JsonNode.Parse(graphicsRequest);
+                node["program"]["stages"][0]["code"] = Convert.ToBase64String(Guest(false, vsOps));
+                node["program"]["stages"][0]["constantBufferUse"] = 1;
+                node["program"]["graphicsState"]["hasConstantBufferDrawParameters"] = cbdp;
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(node.ToJsonString())));
+                    return d.RootElement.GetProperty("content").GetProperty("stages").EnumerateArray().Select(x => x.Clone()).ToArray();
+                }
+                catch (Exception ex) { error = ex.Message; return null; }
+            }
+            JsonValueKind Kind(JsonElement stage) => stage.TryGetProperty("c0Reads", out var r) ? r.ValueKind : JsonValueKind.Undefined;
+            bool Covers(JsonElement stage, int offset) => stage.TryGetProperty("c0Reads", out var reads) && reads.ValueKind == JsonValueKind.Array &&
+                reads.EnumerateArray().Any(r => r[0].GetInt32() < offset + 4 && r[0].GetInt32() + r[1].GetInt32() > offset);
+            string Show(JsonElement[] st, string err) => err ?? string.Join(" / ", st.Select(x => x.GetProperty("stage").GetString() + "=" +
+                (x.TryGetProperty("c0Reads", out var r) ? r.GetRawText() : "(missing)")));
+            JsonElement[] binstOff = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, false, out string e1);
+            Check(binstOff != null && Covers(binstOff[0], 0x644) && Covers(binstOff[0], 0x610),
+                "cbdp false: VS c0Reads lists the base-instance word 0x644 and 0x610: " + Show(binstOff, e1));
+            JsonElement[] binstOn = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, true, out string e2);
+            Check(binstOn != null && Kind(binstOn[0]) == JsonValueKind.Array && !Covers(binstOn[0], 0x644) && Covers(binstOn[0], 0x610),
+                "cbdp true: VS base-instance read becomes the builtin, c0Reads keeps 0x610 and drops 0x644: " + Show(binstOn, e2));
+            JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
+            Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
+                "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+        }
+
         // 3) 同快照逐字节一致；transport 不进入内容键。
         byte[] again = DirectShaderCompiler.Compile(graphicsRequest);
         using (JsonDocument a = ParseResult(result)) using (JsonDocument b = ParseResult(again))
