@@ -226,6 +226,8 @@ void rp_occl_draw(nvn_gpu_cmd c) {                                              
     g_occ_cur = (int)g_occ_next++; nvn_gpu_occlusion(c, g_occ_cur - (int)g_occ_base);
 }
 static void seg_cut(int next_occ);
+static int g_diag_next; static uint64_t g_diag_seq; static int g_diag_armed, g_diag_stopped, g_diag_on = -1;
+static struct { uint64_t addr, len; } g_diag_sb[16];
 // 第一次复位落在没声明槽的段里（开段时还不知道游戏用这个计数器）：就地交段，后半段开成带槽的新段，复位之后的绘制照计
 // （同 iOS nvn_mtl.m 第一次复位就地拆通道）。前半段没有槽，不进 mids。中间值用完交不了时具名记账，这一段复位后不计。
 static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
@@ -284,6 +286,7 @@ static void rc_cond(const p_render_cond *rc) {
 
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
+    g_diag_next = 0; g_diag_armed = g_diag_stopped = 0; g_diag_on = -1; g_diag_seq = 0; memset(g_diag_sb, 0, sizeof g_diag_sb);
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
 
@@ -297,9 +300,14 @@ void nvn_be_sub_begin(void) {
     rp_dirty_all();   // 新段：已发给后端的状态全部重发；rp_S / rp_R 不动
 }
 
-struct mid { struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; };   // counted：这次中途段记进了 s->mids（完成回调里才减）；t_commit：提交时刻（算 GPU 忙）
+struct mid { struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; int diag; uint64_t diag_seq; };   // counted：这次中途段记进了 s->mids（完成回调里才减）；t_commit：提交时刻（算 GPU 忙）
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
     struct mid *m = user;
+    if (m && m->diag) { char b[256]; snprintf(b, sizeof b,
+        "csf done seq=%llu phase=%d fence=%llu status=%u rc=%d time_kind=%u gpu_ns=%llu",
+        (unsigned long long)m->diag_seq, m->diag, (unsigned long long)d->signal,
+        d->status, d->rc.code, d->time_kind, (unsigned long long)d->gpu_dur_ns);
+        nvn_plat_log(d->status == NVN_GPU_DONE_OK ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
     if (d->status == NVN_GPU_DONE_FAILED) red("中途交的段失败：%s", d->why ? d->why : "?");
     else { if (m) busy_done(m->t_commit, now_ns());
         if (m && m->s->oc && d->occlusion) { for (uint32_t i = 0; i < d->nocclusion && m->base + i < 2048; i++) m->s->oc[m->base + i] = d->occlusion[i];
@@ -332,7 +340,8 @@ static void seg_cut(int next_occ) {
     if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     struct mid *m = calloc(1, sizeof *m);   // 每个中途段都带一份提交时刻（算 GPU 忙用）；分配失败只是这一段不计，语义不变
-    if (m) { m->s = g_sub; m->base = g_occ_base; m->t_commit = now_ns(); }
+    if (m) { m->s = g_sub; m->base = g_occ_base; m->t_commit = now_ns(); m->diag = g_diag_next; m->diag_seq = g_diag_seq; }
+    else if (g_diag_next) g_diag_stopped = 1;
     if (g_occ_seg) { if (!g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc); if (m) { __atomic_add_fetch(&g_sub->mids, 1, __ATOMIC_ACQ_REL); m->counted = 1; } }
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, g_fence + ++g_mid, mid_done, m, &err))) red("中途交段失败：%s", err.why);
     pf_add(RP_PERF_SUBS, 1);
@@ -341,6 +350,49 @@ static void seg_cut(int next_occ) {
     nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
     if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_cmd, &err))) { g_cmd = NULL; red("中途交段后开新段失败：%s", err.why); }
     rp_dirty_all();
+}
+
+
+// Diagnostic only. One segment before and after each selected operation. Never treat a timeout,
+// an unsubmitted segment, or a failed timeline as permission to inspect host-visible bytes.
+static int diag_cut(int phase) {
+    if (!g_cmd || !g_sub || g_diag_stopped || g_mid >= SUB_STEP - 4) {
+        char b[128]; snprintf(b, sizeof b, "csf unavailable seq=%llu phase=%d mid=%u", (unsigned long long)g_diag_seq, phase, g_mid);
+        nvn_plat_log(NVN_PLAT_LOG_RED, "csf", b); return 0;
+    }
+    rp_pass_flush(g_cmd);
+    g_diag_next = phase;
+    seg_cut(g_occ_seg);
+    g_diag_next = 0;
+    uint64_t f = g_fence + g_mid;
+    nvn_gpu_err err = {0}; uint64_t t0 = now_ns();
+    nvn_gpu_rc r = nvn_gpu_fence_wait(f, 5000000000ull, &err);
+    char b[300]; snprintf(b, sizeof b, "csf wait seq=%llu phase=%d fence=%llu rc=%d wait_ns=%llu why=%s",
+        (unsigned long long)g_diag_seq, phase, (unsigned long long)f, r.code,
+        (unsigned long long)(now_ns()-t0), err.why);
+    nvn_plat_log(nvn_gpu_ok(r) && !g_diag_stopped ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b);
+    if (!nvn_gpu_ok(r) || g_diag_stopped || !g_cmd) { g_diag_stopped = 1; return 0; }
+    return 1;
+}
+static int diag_enabled(void) { if (g_diag_on < 0) g_diag_on = nvn_plat_flag("nvk_csf", 0) != 0; return !g_diag_stopped && g_diag_on; }
+static void diag_indirect(const char *kind, uint64_t addr, int words) {
+    uint32_t v[5] = {0}; int src = 0;
+    if (addr && words > 0 && words <= 5) src = rp_buf_diag_snapshot(addr, (uint64_t)words * 4, v);
+    int alias = -1; uint64_t n = (uint64_t)words * 4;
+    for (int i = 0; i < 16; i++) if (g_diag_sb[i].len && addr >= g_diag_sb[i].addr &&
+        n <= g_diag_sb[i].len && addr - g_diag_sb[i].addr <= g_diag_sb[i].len - n) { alias = i; break; }
+    char b[300]; snprintf(b, sizeof b, "csf indirect seq=%llu kind=%s source=%s prior_cs_bound_slot=%d words=%d values=%u,%u,%u,%u,%u",
+        (unsigned long long)g_diag_seq, kind, src == 1 ? "completed_mirror" : src == 2 ? "guest_no_pending" : "unavailable",
+        alias, words, v[0], v[1], v[2], v[3], v[4]);
+    nvn_plat_log(src ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b);
+}
+static int diag_draw_begin(uint64_t ind, int indexed) {
+    if (!diag_enabled() || !g_diag_armed) return 0;
+    ++g_diag_seq;
+    char b[160]; snprintf(b, sizeof b, "csf begin seq=%llu op=%s indirect=%d", (unsigned long long)g_diag_seq, indexed ? "draw_indexed" : "draw", ind != 0);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b);
+    int ok = diag_cut(1); if (ok && ind) diag_indirect(indexed ? "draw_indexed" : "draw", ind, indexed ? 5 : 4);
+    return ok;
 }
 
 uint64_t nvn_be_sub_commit(void) {
@@ -591,9 +643,9 @@ static uint64_t exec_list(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(g_cmd); break; }   // 其余计数器的报告值本来就写 0，复位无事可做
             case OP_RENDER_COND: rc_cond(a); break;
-            case OP_DRAW: { if (g_rc_skip) break; p_draw t; rp_draw(g_cmd, draw_rec(a, h.size, &t), NULL, p); break; }
-            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; rp_draw(g_cmd, NULL, draw_idx_rec(a, h.size, &t), p); break; }
-            case OP_MULTI_DRAW: { if (g_rc_skip) break; p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); rp_multi_draw(g_cmd, &m, p); break; }
+            case OP_DRAW: { if (g_rc_skip) break; p_draw t; const p_draw *v = draw_rec(a, h.size, &t); int d = diag_draw_begin(v->ind, 0); rp_draw(g_cmd, v, NULL, p); if (d) diag_cut(2); break; }
+            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; const p_draw_idx *v = draw_idx_rec(a, h.size, &t); int d = diag_draw_begin(v->ind, 1); rp_draw(g_cmd, NULL, v, p); if (d) diag_cut(2); break; }
+            case OP_MULTI_DRAW: { if (g_rc_skip) break; p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); int d = diag_draw_begin(m.ind, m.itype >= 0); if (d && m.cnt) diag_indirect("draw_count", m.cnt, 1); rp_multi_draw(g_cmd, &m, p); if (d) diag_cut(2); break; }
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
@@ -623,7 +675,22 @@ static uint64_t exec_list(const uint8_t *p) {
                     for (int i = 0; i < 32; i++) if (rp_S.img[5][i]) o += snprintf(b + o, sizeof b - (size_t)o, " 图像%d(#%llu)", i, (unsigned long long)(rp_S.img[5][i] & 0xFFFFF));
                     for (int i = 0; i < 32; i++) if (rp_S.tex[5][i]) o += snprintf(b + o, sizeof b - (size_t)o, " 贴图%d(#%llu)", i, (unsigned long long)(rp_S.tex[5][i] & 0xFFFFF));
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "dispatch", b); }
+                uint32_t key = (uint32_t)rp_S.skey[5][0] << 24 | (uint32_t)rp_S.skey[5][1] << 16 | (uint32_t)rp_S.skey[5][2] << 8 | rp_S.skey[5][3];
+                uint32_t akey = 0, bkey = 0;
+                if (diag_enabled()) { akey = (uint32_t)nvn_plat_flag("nvk_csf_a", 0); bkey = (uint32_t)nvn_plat_flag("nvk_csf_b", 0); }
+                int d = 0;
+                if (diag_enabled() && (rp_S.skey_ok & (1u << 5)) && key && (key == akey || key == bkey)) {
+                    ++g_diag_seq; if (key == akey) {
+                        g_diag_armed = 1;
+                        for (int i = 0; i < 16; i++) { g_diag_sb[i].addr = rp_S.ssbo[5][i].addr; g_diag_sb[i].len = rp_S.ssbo[5][i].size; }
+                    }
+                    char b[200]; snprintf(b, sizeof b, "csf begin seq=%llu op=dispatch key=%08x direct=%d dims=%d,%d,%d", (unsigned long long)g_diag_seq, key, dp->ind == 0, dp->x, dp->y, dp->z);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b);
+                    d = diag_cut(1); if (d && dp->ind) diag_indirect("dispatch", dp->ind, 3);
+                }
+                uint64_t dispatch_before = d ? rp_dispatch_count() : 0;
                 rp_dispatch(g_cmd, dp, p);
+                if (d) { char b[128]; snprintf(b, sizeof b, "csf encoded seq=%llu dispatch=%u", (unsigned long long)g_diag_seq, rp_dispatch_count() != dispatch_before); nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b); diag_cut(2); }
                 break; }
             default:
                 if (!rp_state_op(h.op, a, h.size)) nvn_unimpl("op", rp_op_name(h.op), p);

@@ -1302,6 +1302,17 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
 
 // ---------------------------------------------------------------- worker
 
+// The diagnostic uses only the actual queue family's timestamp valid bits; zero means no query.
+static uint32_t csf_timestamp_bits(void) {
+    uint32_t n = 0, bits = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &n, NULL);
+    if (!n || g.dev->queue_family >= n) return 0;
+    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
+    if (!q) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &n, q);
+    if (g.dev->queue_family < n) bits = q[g.dev->queue_family].timestampValidBits;
+    free(q); return bits <= 64 ? bits : 0;
+}
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     if (!s->done) return;
     nvn_gpu_done d;
@@ -1311,6 +1322,15 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
     d.rc = rc(code);
     d.why = why;
     d.time_kind = NVN_GPU_TIME_NONE;
+    if (status == NVN_GPU_DONE_OK && s->cmd && s->cmd->tsq && nvn_plat_flag("nvk_csf", 0)) {
+        uint32_t bits = csf_timestamp_bits(); uint64_t ts[2] = {0, 0};
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys, &pp);
+        if (bits && pp.limits.timestampPeriod > 0 &&
+            vkGetQueryPoolResults(g.d, s->cmd->tsq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            uint64_t delta = ts[1] - ts[0]; if (bits < 64) delta &= (1ull << bits) - 1;
+            d.time_kind = NVN_GPU_TIME_DURATION; d.gpu_dur_ns = (uint64_t)((double)delta * pp.limits.timestampPeriod);
+        }
+    }
     d.occlusion = NULL;
     d.nocclusion = 0;
     // 遮挡结果：段已完成，用过的槽都有结果；没用过的槽读作 0（不等待，取不到的项保持预置的 0）
@@ -1407,6 +1427,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             r = vkWaitForFences(vk->d, 1, &s->fence, VK_TRUE, 50ull * 1000ull * 1000ull);
             if (r != VK_TIMEOUT) break;
         }
+        if (nvn_plat_flag("nvk_csf", 0) && !s->internal) { char b[160]; snprintf(b, sizeof b, "csf VkWaitForFences fence=%llu VkResult=%d", (unsigned long long)s->signal, (int)r); nvn_plat_log(r == VK_SUCCESS ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
         // 测试钩子：真实栅栏必须先完成（否则 fence / command buffer 还在途，不能销毁），
         // 完成后再把它当成失败，走真实的失败终止路径。
         if (r == VK_SUCCESS && fail_sig && fail_sig == s->signal) r = (VkResult)VK_ERROR_UNKNOWN;
@@ -6689,9 +6710,11 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->opt = nvn_plat_flag("nvk_opt_layout", 0) != 0;   // 附件 / 采样用对齐语义的布局（缺省 0 = 全 GENERAL 的旧行为）
     {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
         static int on = -1; if (on < 0) on = nvn_plat_flag("nvk_gputime", 0);
+        int diag = nvn_plat_flag("nvk_csf", 0) != 0;
+        if (diag && !csf_timestamp_bits()) { static int said; if (!said++) nvn_plat_log(NVN_PLAT_LOG_RED, "csf", "GPU timestamp unsupported on queue; duration unavailable"); }
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
-        if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
+        if ((on || (diag && csf_timestamp_bits())) && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
             vkCmdResetQueryPool(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
@@ -6898,6 +6921,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             si.commandBufferCount = submit_cbs(c, cbs);
             si.pCommandBuffers = cbs;
             r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+            if (nvn_plat_flag("nvk_csf", 0)) { char b[160]; snprintf(b, sizeof b, "csf vkQueueSubmit fence=%llu VkResult=%d", (unsigned long long)signal, (int)r); nvn_plat_log(r == VK_SUCCESS ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
             if (r == VK_SUCCESS) {
                 s->fence = fence;
                 s->submitted = 1;
