@@ -228,6 +228,11 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
     if (d->swapchain_maintenance1_enabled) {
         if (!first) PUT(",");
         if (put_text(out, cap, &used, "VK_EXT_swapchain_maintenance1")) return -1;
+        first = 0;
+    }
+    if (d->descriptor_indexing_enabled) {
+        if (!first) PUT(",");
+        if (put_text(out, cap, &used, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) return -1;
     }
     PUT("],\"subgroupSize\":%u}", sg.subgroupSize);
     if (len) *len = used;

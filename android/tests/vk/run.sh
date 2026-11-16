@@ -44,7 +44,7 @@ fi
 if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -154,6 +154,29 @@ if [ -z "$glslc" ]; then
     exit 2
 fi
 
+
+# Descriptor indexing capability handshake: use real NDK 29 Vulkan core types,
+# a real device and validation; test wrappers only remove advertised capabilities.
+if [ "$mode" = "--descriptor-indexing" ]; then
+    out="$repo/build/vk-descriptor-indexing"; mkdir -p "$out"
+    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror \
+        -Wno-misleading-indentation -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 \
+        -I "$repo/android/tests/vkhost" -I "$repo/build/c883-ndk" -I "$repo/android/native/direct" \
+        "$repo/android/tests/vk/t_descriptor_indexing.c" "$repo/android/native/direct/vk_device.c" \
+        "$repo/android/native/direct/device_caps.c" -Wl,--gc-sections \
+        -Wl,--wrap=vkEnumerateDeviceExtensionProperties -Wl,--wrap=vkGetPhysicalDeviceFeatures2 \
+        -Wl,--wrap=vkCreateDevice -lvulkan -lpthread -lm -o "$out/test"
+    set +e
+    VK_ICD_FILENAMES="$icd" VK_DRIVER_FILES="$icd" VK_LAYER_PATH="$layer" \
+        VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation timeout 120 "$out/test" 2>&1 | tee "$out/run.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$out/run.log"; then
+        echo "【红】descriptor indexing: rc=$rc or Vulkan validation error" >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 # FSR1 EASU 专项（--fsr）：合成图 1280x720 → 2133x1200，compute 版 EASU 对照 CPU 双线性。
 # 与上屏路径（backend_vulkan_easu.inc 的片元版）各自独立；这里只验算法更锐且无错。
