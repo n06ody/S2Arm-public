@@ -143,7 +143,9 @@ namespace S2A.DirectCompiler
             if (x < 1 || y < 1 || z < 1 || x > 1024 || y > 1024 || z > 1024 || (long)x * y * z > 1024)
                 throw new DirectCompileException("UNSUPPORTED_PROGRAM", where + ".localSize is outside the 1024-invocation contract");
             int local = JsonStrict.Int(e, "localMemoryBytes", where, 0, 1 << 20);
-            int shared = JsonStrict.Int(e, "sharedMemoryBytes", where, 0, profile.Caps.MaximumComputeSharedMemorySize);
+            // 上限取客体口径（控制段 0x754 不超过 64 KB，同 ValidateComputeControl）。超过设备上限的不在这里拒：
+            //   编译后由 DirectSharedSpill 把最大的线程组数组挪到存储缓冲，挪完仍超才拒。
+            int shared = JsonStrict.Int(e, "sharedMemoryBytes", where, 0, 0x10000);
             return new DirectComputeFacts(x, y, z, local, shared, JsonStrict.Bool(e, "hasUnalignedStorageBuffer", where));
         }
     }
