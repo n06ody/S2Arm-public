@@ -25,11 +25,12 @@ static int g_fail, g_checks;
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200]; static int g_info_watch;   // 诊断第二版：「盯计算」行数
 static int g_info_chain; static char g_chain[4][900];
+static int g_info_full; static char g_full[700];   // 诊断：「存储全字」行数与最后一行
 static int g_info_wlog; static char g_wlog[4][700];   // 诊断：写入日志行数与最近 4 行（环）
 static int g_flag_tex_wlog0, g_flag_tex_wlog1;   // 调试开关 nvk_tex_wlog0/1：盯的贴图序号   // 诊断：转储链行数与前 4 行
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "写入日志")) { snprintf(g_wlog[g_info_wlog & 3], sizeof g_wlog[0], "%s", text); g_info_wlog++; } if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "存储全字")) { g_info_full++; snprintf(g_full, sizeof g_full, "%s", text); } if (strstr(text, "写入日志")) { snprintf(g_wlog[g_info_wlog & 3], sizeof g_wlog[0], "%s", text); g_info_wlog++; } if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
@@ -3180,10 +3181,11 @@ static void t_lost_ring_skip(void) {
     g_flag_cs_watch1 = 0x37727c6; w0 = g_info_watch; rp_dispatch(&g_fake_cmd, &dp, NULL); int k1 = g_info_watch - w0; g_flag_cs_watch1 = 0;
     CHECK(more0 == 31); CHECK(k1 == 1);
     // 设备丢失倒出：两个键的「最近」环各一段（键 0：最近 32 次 / 共 41 次；键 1：1 次），每条派发行后跟可写存储的摘要
-    int wr0 = g_info_watch;
+    int wr0 = g_info_watch, fu0 = g_info_full;
     rp_S.ssbo[5][0].addr = 0; rp_S.ssbo[5][0].size = 0; g_cprog.nent[0] = 0;
     int red0 = g_red_lines; rp_lost_ring_dump("test"); rp_lost_ring_dump("again");
     CHECK(g_info_watch - wr0 == (1 + 32 * 2) + (1 + 1 * 2));   // 段头 + 每次（派发行 + 一条存储摘要）；第二次倒出不再出
+    CHECK(g_info_full - fu0 == 32 + 1 && strstr(g_full, "字 0..7： 0 7 0 3 0 0 0 0"));   // 8 字的小存储逐字打全（每条摘要一行）
     CHECK(g_red_lines == red0 + 1 && strstr(g_last_red, "最近 44 次"));   // 2 次跳过对照 + 42 次盯计算
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); nvn_be_pool_del(g_pmem); pass_fresh();
 }

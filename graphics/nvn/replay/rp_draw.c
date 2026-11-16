@@ -660,11 +660,17 @@ static void watch_sum(const struct watch_ent *w, const char *tag, uint64_t now, 
     for (uint32_t k = 0; k < w->nst; k++) {
         const uint32_t *p = (const uint32_t *)(uintptr_t)w->st[k].addr; uint32_t n = w->st[k].len / 4, mx = 0, nz = 0;
         if (!p || !n) continue;
-        for (uint32_t j = 0; j < n; j++) { if (p[j] > mx) mx = p[j]; if (p[j]) nz++; }
-        char m[400]; int o = snprintf(m, sizeof m, "盯计算 键%u-#%u %s（段 %llu，读于段 %llu%s）：存储 %llx+%u 最大字 %u 非零字 %u/%u 前 16 字", w->slot, w->nth, tag, (unsigned long long)w->seg,
-                                      (unsigned long long)now, pend ? "，仍有未落地的 GPU 写，可能是旧值" : "", (unsigned long long)w->st[k].addr, w->st[k].len, mx, nz, n);
+        uint64_t sum = 0;
+        for (uint32_t j = 0; j < n; j++) { if (p[j] > mx) mx = p[j]; if (p[j]) nz++; sum += p[j]; }
+        char m[460]; int o = snprintf(m, sizeof m, "盯计算 键%u-#%u %s（段 %llu，读于段 %llu%s）：存储 %llx+%u 最大字 %u 非零字 %u/%u 全字和 %llu 前 16 字", w->slot, w->nth, tag, (unsigned long long)w->seg,
+                                      (unsigned long long)now, pend ? "，仍有未落地的 GPU 写，可能是旧值" : "", (unsigned long long)w->st[k].addr, w->st[k].len, mx, nz, n, (unsigned long long)sum);
         for (uint32_t j = 0; j < 16 && j < n && o > 0 && o < (int)sizeof m - 12; j++) o += snprintf(m + o, sizeof m - (size_t)o, " %u", p[j]);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+        // 不超过 256 字的小存储（直方图 bin、曝光参数一类）另外逐字打全：每行 32 字，行首「存储全字」不计入「盯计算」行数
+        for (uint32_t j0 = 0; n <= 256 && j0 < n; j0 += 32) {
+            char f[480]; int q = snprintf(f, sizeof f, "存储全字 键%u-#%u %s %llx 字 %u..%u：", w->slot, w->nth, tag, (unsigned long long)w->st[k].addr, j0, (j0 + 32 < n ? j0 + 32 : n) - 1);
+            for (uint32_t j = j0; j < j0 + 32 && j < n && q > 0 && q < (int)sizeof f - 12; j++) q += snprintf(f + q, sizeof f - (size_t)q, " %u", p[j]);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", f); }
     }
 }
 static int watch_pending(const struct watch_ent *w) {
