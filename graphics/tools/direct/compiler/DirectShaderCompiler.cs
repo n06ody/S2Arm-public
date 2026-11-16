@@ -90,6 +90,21 @@ namespace S2A.DirectCompiler
                     var accessor = new DirectGpuAccessor(profile, program, cs, 0, allocator, queries);
                     accessors.Add(accessor);
                     ShaderProgram shader = ShaderCache.DecodeComputeShader(accessor, TargetApi.Vulkan, 0).Translate();
+                    int limit = profile.Caps.MaximumComputeSharedMemorySize;
+                    if (shader.BinaryCode != null && program.Compute.SharedMemoryBytes > limit)
+                    {
+                        int shared = DirectSharedSpill.WorkgroupBytes(shader.BinaryCode);
+                        if (shared < 0 || shared > limit)
+                        {
+                            // 先量出要挪的字节数再占绑定号：Rewrite 用的就是这一号
+                            int spilled = shared < 0 ? 0 : shared;
+                            var pair = allocator.Spill("cs", 0);
+                            DirectSharedSpill.Result spill = DirectSharedSpill.Rewrite(shader.BinaryCode, limit, pair.SetIndex, pair.Binding)
+                                ?? throw new DirectCompileException("UNSUPPORTED_PROGRAM", "cs: shared memory " + spilled + " bytes could not be measured for spilling");
+                            allocator.Bindings[^1].SpillBytesPerGroup = spill.BytesPerGroup;
+                            shader = new ShaderProgram(shader.Info, shader.Language, spill.Spirv);
+                        }
+                    }
                     translated.Add((cs, shader, accessor));
                 }
                 else
@@ -383,6 +398,19 @@ namespace S2A.DirectCompiler
             }
         }
 
+        private static void WriteRanges(Utf8JsonWriter writer, int[][] ranges)
+        {
+            if (ranges == null) { writer.WriteNullValue(); return; }
+            writer.WriteStartArray();
+            foreach (int[] range in ranges)
+            {
+                writer.WriteStartArray();
+                writer.WriteNumberValue(range[0]); writer.WriteNumberValue(range[1]);
+                writer.WriteEndArray();
+            }
+            writer.WriteEndArray();
+        }
+
         private static byte[] WriteContent(DirectProgram program, DirectProfile profile,
             List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)> translated,
             DirectAllocator allocator, List<DirectQuery> queries, bool v2)
@@ -468,6 +496,16 @@ namespace S2A.DirectCompiler
                     WriteInfo(writer, shader.Info);
                     writer.WriteNumber("stateReadFlags", accessor.StateReadFlags);
                     writer.WriteNumber("attributeReadMask", accessor.AttributeReadMask);
+                    if (program.Kind == "graphics")
+                    {
+                        // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
+                        int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0Reads");
+                        WriteRanges(writer, stageReads);
+                    }
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
@@ -483,6 +521,7 @@ namespace S2A.DirectCompiler
                     writer.WriteNumber("count", binding.Count);
                     if (binding.Slot >= 0) writer.WriteNumber("slot", binding.Slot);
                     if (binding.SamplerSlot >= 0) writer.WriteNumber("samp_slot", binding.SamplerSlot);
+                    if (binding.Kind == "spill") writer.WriteNumber("bytesPerGroup", binding.SpillBytesPerGroup);
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段

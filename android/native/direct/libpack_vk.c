@@ -275,6 +275,15 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             uint32_t reg = 0; int has_reg = !jf_u32(b, "reg", &reg);
             v1kind = "texture";
             if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = 1; }
+            // 分离贴图（reg ≥ 128，c2 字 90 + 2k）：v1 只有贴图槽、没有分离采样器字段，消费端按「采样器取同字高位」取（同组合槽，
+            //   也是立即句柄读这张表时的硬件语义）。只有这一条成立时才给槽：采样器半边缺（不采样：取尺寸 / texelFetch）或是
+            //   samp_tex（Dsh.cs Reflect：句柄类型 0，采样器就是同一个字）。半边是 samp（分离采样器槽）/ samp_id / samp_ubo 时
+            //   v1 表达不了，照旧不给槽，消费端如实拒，不按同字高位绑错采样器。
+            if (has_slot && reg >= 128 && !strcmp(kind, "tex")) {
+                char sn[72]; struct s2a_jv sb; char sk[24] = "";
+                snprintf(sn, sizeof sn, "%sSmplr", msl);
+                if (!lp_find_member(arr, sn, &sb) && (jf_str(sb, "kind", sk, sizeof sk) || strcmp(sk, "samp_tex"))) has_slot = 0;
+            }
         } else if (!strcmp(kind, "tex_ubo") || !strcmp(kind, "tbuf_ubo")) {
             v1kind = "texture";
             // 句柄在游戏用户常量缓冲里（iOS NVN_RB_TEXU / TBUFU）：v1 带 uboHandle（句柄字来源 + 另一半），
