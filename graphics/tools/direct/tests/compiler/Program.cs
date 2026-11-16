@@ -86,6 +86,18 @@ internal static unsafe class Program
         }
         return b;
     }
+    // STS / LDS [RZ + imm], B32（InstSts / InstLds：Rd 0..7、Ra 8..15、Imm24 20..43、LsSize 48..50 = B32 4）；BAR.SYNC 0（InstBar，BarOp Sync = 0）
+    private static ulong Sts(int reg, int offset) => 0xEF58000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private static ulong Lds(int reg, int offset) => 0xEF48000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private const ulong BarSync = 0xF0A8000000000000UL | (7UL << 16) | (0xFFUL << 8);
+    // 计算核（没有着色器头）：每 3 条指令前一个调度字，末尾 EXIT 加自跳转
+    private static byte[] ComputeOps(params ulong[] ops)
+    {
+        var all = new List<ulong>(ops) { Exit, 0xE2400FFFFF07000FUL };
+        var words = new List<ulong>();
+        for (int i = 0; i < all.Count; i += 3) { words.Add(Sched); for (int j = 0; j < 3; j++) words.Add(i + j < all.Count ? all[i + j] : 0x50B0000000070F00UL); }
+        return MemoryMarshal.AsBytes(words.ToArray().AsSpan()).ToArray();
+    }
     private static byte[] ComputeGuest() => MemoryMarshal.AsBytes(new ulong[] { Sched, Exit, 0x50B0000000070F00UL, 0xE2400FFFFF07000FUL }.AsSpan()).ToArray();
 
     // 原创合成 Maxwell GS：普通（非 passthrough）几何阶段，读写 loc0，发出顶点并结束图元。
@@ -495,7 +507,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -525,7 +537,7 @@ internal static unsafe class Program
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x748), cx);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x74C), 1);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x750), 1);
-                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), 0);
+                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), sharedBytes);
                 // 让 controlX=0 明确产生非法控制段；其它情况如实填写。
                 WriteStage(w, "cs", overrideCode ?? cs, csCbUse, control);
             }
@@ -567,7 +579,7 @@ internal static unsafe class Program
                 w.WriteNumberValue(localSize); w.WriteNumberValue(1); w.WriteNumberValue(1);
                 w.WriteEndArray();
                 w.WriteNumber("localMemoryBytes", 0);
-                w.WriteNumber("sharedMemoryBytes", 0);
+                w.WriteNumber("sharedMemoryBytes", (sharedBytes + 15) / 16 * 16);
                 w.WriteBoolean("hasUnalignedStorageBuffer", false);
                 w.WriteEndObject();
             }
@@ -1147,6 +1159,41 @@ internal static unsafe class Program
             Check(root.GetProperty("contentHash").GetString().StartsWith("sha256-"), "content hash");
         }
 
+        // 2b) 图形阶段的 c0Reads：回放按它决定间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+        //     真实翻译器（DrawParametersReplace）：cbdp 真时 VS 对 c0 + 0x644 / 0x640 的立即读换成内建，读集里不再有；
+        //     cbdp 假时照实列出；寄存器下标读 c0 分析不出 → null（未知，回放照旧拷）。
+        {
+            JsonElement[] C0Stages(ulong[] vsOps, bool cbdp, out string error)
+            {
+                error = null;
+                var node = System.Text.Json.Nodes.JsonNode.Parse(graphicsRequest);
+                node["program"]["stages"][0]["code"] = Convert.ToBase64String(Guest(false, vsOps));
+                node["program"]["stages"][0]["constantBufferUse"] = 1;
+                node["program"]["graphicsState"]["hasConstantBufferDrawParameters"] = cbdp;
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(node.ToJsonString())));
+                    return d.RootElement.GetProperty("content").GetProperty("stages").EnumerateArray().Select(x => x.Clone()).ToArray();
+                }
+                catch (Exception ex) { error = ex.Message; return null; }
+            }
+            JsonValueKind Kind(JsonElement stage) => stage.TryGetProperty("c0Reads", out var r) ? r.ValueKind : JsonValueKind.Undefined;
+            bool Covers(JsonElement stage, int offset) => stage.TryGetProperty("c0Reads", out var reads) && reads.ValueKind == JsonValueKind.Array &&
+                reads.EnumerateArray().Any(r => r[0].GetInt32() < offset + 4 && r[0].GetInt32() + r[1].GetInt32() > offset);
+            string Show(JsonElement[] st, string err) => err ?? string.Join(" / ", st.Select(x => x.GetProperty("stage").GetString() + "=" +
+                (x.TryGetProperty("c0Reads", out var r) ? r.GetRawText() : "(missing)")));
+            JsonElement[] binstOff = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, false, out string e1);
+            Check(binstOff != null && Covers(binstOff[0], 0x644) && Covers(binstOff[0], 0x610),
+                "cbdp false: VS c0Reads lists the base-instance word 0x644 and 0x610: " + Show(binstOff, e1));
+            JsonElement[] binstOn = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, true, out string e2);
+            Check(binstOn != null && Kind(binstOn[0]) == JsonValueKind.Array && !Covers(binstOn[0], 0x644) && Covers(binstOn[0], 0x610),
+                "cbdp true: VS base-instance read becomes the builtin, c0Reads keeps 0x610 and drops 0x644: " + Show(binstOn, e2));
+            JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
+            Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
+                "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+        }
+
         // 3) 同快照逐字节一致；transport 不进入内容键。
         byte[] again = DirectShaderCompiler.Compile(graphicsRequest);
         using (JsonDocument a = ParseResult(result)) using (JsonDocument b = ParseResult(again))
@@ -1184,6 +1231,75 @@ internal static unsafe class Program
             Check(content.GetProperty("supportReads").GetArrayLength() == 0, "compute declared support but no actual loads");
             Check(content.GetProperty("stages").GetArrayLength() == 1 &&
                   content.GetProperty("stages")[0].GetProperty("stage").GetString() == "cs", "compute stage");
+        }
+
+        // 5b) 共享内存超过设备上限（profile 32 KB）：最大的线程组数组挪到存储缓冲（DirectSharedSpill，同 iOS SpillFix）。
+        //     真实 decoder / translator：STS 写到 0x9000（超出 32 KB）、BAR.SYNC、LDS 读回、再 STS 留住结果。
+        {
+            byte[] sharedCs = ComputeOps(Fadd32i(0, 1.0f), Sts(0, 0x9000), BarSync, Lds(1, 0x9000), Sts(1, 0x10));
+            (JsonElement content, string error) SharedCompile(uint bytes)
+            {
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "compute", 2, 1, "shared-" + bytes, cs: sharedCs, sharedBytes: bytes)));
+                    return (d.RootElement.GetProperty("content").Clone(), null);
+                }
+                catch (Exception ex) { return (default, ex.Message); }
+            }
+            uint[] Words(JsonElement content) => MemoryMarshal.Cast<byte, uint>(content.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64()).ToArray();
+            IEnumerable<uint[]> Insts(uint[] w) { for (int i = 5; i < w.Length; i += (int)(w[i] >> 16)) yield return w[i..(i + (int)(w[i] >> 16))]; }
+            bool HasWorkgroupVar(uint[] w) => Insts(w).Any(x => (x[0] & 0xFFFF) == 59 && x[3] == 4);
+            var (big, bigErr) = SharedCompile(40960);
+            if (bigErr != null) Check(false, "40 KB shared compute compiles with a spill: " + bigErr);
+            else
+            {
+                uint[] w = Words(big);
+                JsonElement[] spills = big.GetProperty("bindings").EnumerateArray().Where(b => b.GetProperty("kind").GetString() == "spill").ToArray();
+                Check(spills.Length == 1 && spills[0].GetProperty("set").GetInt32() == 1 && spills[0].GetProperty("bytesPerGroup").GetInt32() == 40960 &&
+                      spills[0].GetProperty("stage").GetString() == "cs", "40 KB shared: one spill binding in set 1, 40960 bytes per group");
+                Check(!HasWorkgroupVar(w), "40 KB shared: no workgroup variable left in the SPIR-V");
+                var consts = Insts(w).Where(x => (x[0] & 0xFFFF) == 43 && x.Length == 4).ToDictionary(x => x[2], x => x[3]);
+                var builtins = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11).Select(x => x[3]).ToHashSet();
+                Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
+                // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
+                var defs = new Dictionary<uint, uint[]>();
+                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
+                bool Decorated(uint id, uint dec, int value) => Insts(w).Any(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[1] == id && x[2] == dec && x[3] == (uint)value);
+                uint spillVar = Insts(w).Where(v => (v[0] & 0xFFFF) == 59 && v[3] == 2).Select(v => v[2]).FirstOrDefault(id =>
+                    Decorated(id, 34, spills[0].GetProperty("set").GetInt32()) && Decorated(id, 33, spills[0].GetProperty("binding").GetInt32()));
+                uint[][] spillChains = Insts(w).Where(x => (x[0] & 0xFFFF) is 65 or 66 && x.Length >= 5 && x[3] == spillVar).ToArray();
+                bool Scaled(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var mul) && (mul[0] & 0xFFFF) == 132 &&
+                        (consts.GetValueOrDefault(mul[3]) == 10240 || consts.GetValueOrDefault(mul[4]) == 10240));
+                Check(spillVar != 0 && spillChains.Length >= 3 && spillChains.All(x => Scaled(x[^1])),
+                      "every spill access indexes slice (flat group id x 10240 words) + original index: chains " + spillChains.Length);
+                // 下标夹在本组片内：加到基址上的那一项 = OpSelect(idx < 10240, idx, 10239)
+                bool Clamped(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var sel) && (sel[0] & 0xFFFF) == 169 && consts.GetValueOrDefault(sel[5]) == 10239);
+                Check(spillChains.All(x => Clamped(x[^1])), "every spill index is clamped to the group's slice (select idx < 10240 ? idx : 10239)");
+                // 组号基址每个函数算一次：读 WorkgroupId 的次数不随访问次数涨（3 处访问、1 个函数 → 1 次）
+                uint gidVar = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11 && x[3] == 26).Select(x => x[1]).First();
+                int gidLoads = Insts(w).Count(x => (x[0] & 0xFFFF) == 61 && x.Length >= 4 && x[3] == gidVar);
+                Check(gidLoads == 1, "the group base is computed once per function, not per access: WorkgroupId loads " + gidLoads);
+                var barriers = Insts(w).Where(x => (x[0] & 0xFFFF) == 224).ToArray();
+                Check(barriers.Length > 0 && barriers.All(x => (consts.GetValueOrDefault(x[3]) & 0x140) == 0x140),
+                      "workgroup barriers also order uniform (spill buffer) memory");
+                string spvPath = Path.Combine(Path.GetTempPath(), "s2a-spill-" + Environment.ProcessId + ".spv");
+                File.WriteAllBytes(spvPath, big.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64());
+                string val = Environment.GetEnvironmentVariable("SPIRV_VAL") ?? "spirv-val";
+                try
+                {
+                    using var proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(val, "--target-env vulkan1.1 \"" + spvPath + "\"")
+                        { RedirectStandardError = true, RedirectStandardOutput = true });
+                    string msg = proc.StandardError.ReadToEnd() + proc.StandardOutput.ReadToEnd(); proc.WaitForExit();
+                    Check(proc.ExitCode == 0, "spilled SPIR-V passes spirv-val (vulkan1.1): " + msg.Trim());
+                }
+                catch (System.ComponentModel.Win32Exception) { Console.WriteLine("NOTE spirv-val not found: spilled SPIR-V not validated by SPIRV-Tools (set SPIRV_VAL)"); }
+                finally { File.Delete(spvPath); }
+            }
+            var (small, smallErr) = SharedCompile(16384);
+            Check(smallErr == null && !small.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill") && HasWorkgroupVar(Words(small)),
+                  "16 KB shared stays in workgroup memory without a spill binding: " + smallErr);
         }
 
         // 真实 decoder -> translator -> Info.SBuffers -> JSON 反射，补足下方 mapper 单测。
@@ -1781,6 +1897,60 @@ internal static unsafe class Program
                 } catch (DirectCompileException error) {
                     Check(false, "real separate c2 shader " + (reverse ? "reversed" : "forward") + " must compile: " + error.Code + " " + error.Message);
                 }
+            }
+        }
+
+        // 立即句柄直接读 c2 分离贴图表（空轨 2nd 9000：fs「QuerySamplerType has no source (handle=90,cbufSlot=-1)」）：
+        //   TEX 的立即句柄 90 = c2 字节 0x168 = 分离贴图槽 0。宿主照真机只按 (90, cbufSlot 2, separate) 给事实；
+        //   期望编出贴图绑定 slot 90、无 samp_slot（采样器取同字）。负控：只有非分离事实、相邻字、采样器表的字都不借。
+        {
+            string Fact(int handle, int cbufSlot, bool separate) => "{\"stage\":\"fs\",\"handle\":" + handle + ",\"cbufSlot\":" + cbufSlot +
+                ",\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":" + (separate ? "true" : "false") + ",\"arrayLength\":1}";
+            string Direct(int tid, string facts)
+            {
+                byte[] shader = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, tid) });
+                try
+                {
+                    using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "direct-sep-" + tid, vs, shader, textureFacts: "[" + facts + "]")));
+                    string Field(JsonElement b, string name) => b.TryGetProperty(name, out JsonElement f) ? f.GetInt32().ToString() : "-";
+                    return string.Join(";", r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").Select(b => Field(b, "slot") + "/" + Field(b, "samp_slot")));
+                }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+            string got = Direct(90, Fact(90, 2, true));
+            Check(got == "90/-", "direct handle 90 (c2 separate texture slot 0) uses the (90, cbuf 2, separate) fact and binds slot 90: " + got);
+            got = Direct(124, Fact(124, 2, true));
+            Check(got == "124/-", "direct handle 124 (separate slot 17) binds slot 124: " + got);
+            got = Direct(90, Fact(90, 2, false));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=90,cbufSlot=-1"), "a non-separate (90, cbuf 2) fact is not borrowed: " + got);
+            got = Direct(92, Fact(90, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=92,cbufSlot=-1"), "another separate slot's fact is not borrowed: " + got);
+            got = Direct(346, Fact(346, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=346,cbufSlot=-1"), "a sampler-table word is not a separate texture: " + got);
+            got = Direct(8, Fact(8, -1, false));
+            Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
+        // 7b2) 同一对 c2 分离字在两条路径上各 OR 一次、汇合（phi）后才进 TEX.B（空轨 2nd compute_atmosphere_scatter 的形状）。
+        //      真实 decoder / translator：句柄要穿过 phi 按值比叶子才认得出（QueryBindlessPhiSeeThrough，同 iOS dmsh_xlate）。
+        //      循环里套分支，TEX 处的句柄 = phi(循环前算的 OR, phi(分支 A 的 OR, 分支 B 的 OR))：上游只比 phi 的直接输入（一个是 phi、一个是 OR）认不出。
+        //      R4 = R6|R7；L: TEX.B R0, R2, R4；@P0 BRA A；R4 = R6|R7；BRA J；A: R4 = R6|R7；J: @P0 BRA L。
+        {
+            const string separateFact = "[{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            // 槽位：Guest 每 3 条指令前插一个调度字，第 oi 条在第 (oi/3)*4 + oi%3 + 1 个 8 字节；BRA 目标 = 自身地址 + 8 + Imm24
+            static int Slot(int oi) => oi / 3 * 4 + oi % 3 + 1;
+            static ulong Bra(int from, int to, int pred) => 0xE240000000000000UL | ((ulong)((Slot(to) - Slot(from) - 1) * 8 & 0xFFFFFF) << 20) | ((ulong)pred << 16) | 0xFUL;
+            const ulong IsetpNeP0R1 = 0x3660000000000000UL | (5UL << 49) | (7UL << 39) | (7UL << 16) | (1UL << 8) | 7UL;   // ISETP.NE.AND P0, PT, R1, 0, PT
+            byte[] shader = Guest(true, new[] {
+                Ald(1, 0, 1), IsetpNeP0R1, Ldc(6, 0x168, 2), Ldc(7, 0x568, 2), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f),
+                LopOr(4, 6, 7), TexBindless2D(0, 2, 4), Bra(8, 11, 0), LopOr(4, 6, 7), Bra(10, 12, 7), LopOr(4, 6, 7), Bra(12, 7, 0) }, new[] { 1 });
+            try {
+                using JsonDocument phiResult = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "separate-c2-phi", vs, shader, textureFacts: separateFact, fsCbUse: 4)));
+                var binding = phiResult.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                    .Single(b => b.GetProperty("kind").GetString() == "texture");
+                Check(binding.GetProperty("slot").GetInt32() == 90 && binding.GetProperty("samp_slot").GetInt32() == 0,
+                      "phi-merged c2 separate handle resolves to texture word 90 and sampler slot 0");
+            } catch (DirectCompileException error) {
+                Check(false, "phi-merged c2 separate handle must compile: " + error.Code + " " + error.Message);
             }
         }
 

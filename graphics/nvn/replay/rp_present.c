@@ -53,6 +53,34 @@ static uint64_t plc_save_ns_frame(void) {
 }
 static void frame_gap_note(void) {
     uint64_t now = plat_now_ns(), d = g_gap_last ? now - g_gap_last : 0; g_gap_last = now;
+    struct rp_buf_diag_row bd[RP_BUF_KIND_N];
+    if (rp_buf_diag_take(bd)) {
+        static const char *names[RP_BUF_KIND_N] = {"other", "vertex", "index", "constant", "storage"};
+        char line[2048]; size_t used = (size_t)snprintf(line, sizeof line, "缓冲慢路诊断 帧 %llu 格式=次数/页/已同步后变脏页/首次同步页/含首次/含代号变/映射变/未跟踪/池最大字节/页桶(1,16,256,4096,16384,更大)/池桶MiB(1,16,128,512,1024,更大)", (unsigned long long)rp_frame());
+        for (int i = 0; i < RP_BUF_KIND_N && used < sizeof line; i++) {
+            const struct rp_buf_diag_row *r = &bd[i];
+            int n = snprintf(line + used, sizeof line - used, " %s=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu,%llu,%llu,%llu,%llu,%llu/%llu,%llu,%llu,%llu,%llu,%llu", names[i],
+                (unsigned long long)r->slow, (unsigned long long)r->pages, (unsigned long long)r->dirty,
+                (unsigned long long)r->fresh_pages, (unsigned long long)r->first, (unsigned long long)r->stale, (unsigned long long)r->map,
+                (unsigned long long)r->untracked, (unsigned long long)r->pool_max,
+                (unsigned long long)r->hist[0], (unsigned long long)r->hist[1], (unsigned long long)r->hist[2],
+                (unsigned long long)r->hist[3], (unsigned long long)r->hist[4], (unsigned long long)r->hist[5],
+                (unsigned long long)r->pool_hist[0], (unsigned long long)r->pool_hist[1], (unsigned long long)r->pool_hist[2],
+                (unsigned long long)r->pool_hist[3], (unsigned long long)r->pool_hist[4], (unsigned long long)r->pool_hist[5]);
+            if (n < 0) break;
+            used += (size_t)n;
+        }
+        if (used < sizeof line) {
+            static const char *ix[] = {"direct", "ind_clear", "ind_pending", "ind_unknown", "cnt_clear", "cnt_pending", "cnt_unknown"};
+            const struct rp_buf_diag_row *r = &bd[RP_BUF_INDEX];
+            for (int i = 0; i < RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N && used < sizeof line; i++) {
+                int n = snprintf(line + used, sizeof line - used, " %s=%llu,%llu", ix[i], (unsigned long long)r->index_slow[i], (unsigned long long)r->index_pages[i]);
+                if (n < 0) break;
+                used += (size_t)n;
+            }
+        }
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", line);
+    }
     if (!d) return;
     int k = d < 29000000ull ? 0 : d < 37500000ull ? 1 : d < 46000000ull ? 2 : d < 54000000ull ? 3 : 4;
     __atomic_fetch_add(&g_gap_bucket[k], 1, __ATOMIC_RELAXED);
@@ -188,6 +216,11 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                // 收通道的其余原因（每帧）：上一行只列了换目标 / 整屏清除 / 第二次同步，其余各处收通道在这里分开记，加起来与「收通道 N 次」对账
+                snprintf(b, sizeof b, "分时（收通道的其余原因，每帧）：拷贝与清贴图命令 %.1f、间接绘制取 base_instance %.1f、计算派发 %.1f、提交收尾 %.1f、落地挂起清除 %.1f、第一次遮挡复位 %.1f、区域扩大 %.1f；收通道共 %.1f",
+                         (double)pf[RP_PERF_P_CUT_OP] / f, (double)pf[RP_PERF_P_CUT_IND] / f, (double)pf[RP_PERF_P_CUT_DISP] / f, (double)pf[RP_PERF_P_CUT_SUBMIT] / f,
+                         (double)pf[RP_PERF_P_CUT_LAND] / f, (double)pf[RP_PERF_P_CUT_OCC] / f, (double)pf[RP_PERF_P_CUT_AREA] / f, (double)pf[RP_PERF_PASSEND_N] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,

@@ -86,6 +86,21 @@ static const char *PS_JSON =
     "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
     "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
 
+// 同一个片元键，分离贴图带采样器半边：samp_tex（Dsh.cs 句柄类型 0：采样器就是同一个字）给槽；
+//   samp（分离采样器槽 3）v1 表达不了，不给槽（消费端如实拒，不按同字高位绑错采样器）
+static const char *PS_SAMPTEX_JSON =
+    "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"1032547698badcfe\",\"bindings\":["
+    "{\"msl_name\":\"fp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+    "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+    "{\"msl_name\":\"fp_t_sepSmplr\",\"kind\":\"samp_tex\",\"reg\":128,\"arg_id\":3},"
+    "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
+static const char *PS_SEPSAMP_JSON =
+    "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"1032547698badcfe\",\"bindings\":["
+    "{\"msl_name\":\"fp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+    "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+    "{\"msl_name\":\"fp_t_sepSmplr\",\"kind\":\"samp\",\"reg\":3,\"arg_id\":3},"
+    "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
+
 static const char *VS_BUFFER_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
     "{\"msl_name\":\"vp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
@@ -265,10 +280,10 @@ int main(void) {
             CHECK(b12 && b12->kind == 2 && b12->tex_slot == 5 && !b12->texel_buffer,
                   "fd tex → texture tex_slot=5（slot18→byte0x48→(0x48-0x20)/8 回环）");
             CHECK(b24 && b24->kind == 0 && b24->slot == 4, "fd 绑定 24 = cbuf slot 4");
-            // sep-tex 回环：slot90→byte0x168→int8 128 溢出负值 → tex_slot<0（独立纹理不属
-            //   组合槽映射，如实不挂槽，不是静默错绑）
-            CHECK(b10 && b10->kind == 2 && b10->tex_slot < 0 && b10->stage_idx == 1,
-                  "fd sep-tex → tex_slot<0 不挂组合槽、stage_idx=fs");
+            // sep-tex：slot 90 = c2 分离贴图表第 0 项 → 分离贴图槽 128（nvn_vk_program_result.c 立即句柄读分离表的那条），
+            //   没有采样器半边：采样器取同字高位（samp_slot = -1，同组合槽；Dsh.cs 句柄类型 0 的语义）
+            CHECK(b10 && b10->kind == 2 && b10->tex_slot == 128 && b10->samp_slot == -1 && b10->stage_idx == 1,
+                  "fd sep-tex → 分离贴图槽 128、samp_slot=-1、stage_idx=fs");
             CHECK(b16 && b16->kind == 3 && b16->slot == 76 && b16->stage_idx == 1,
                   "fd img → kind3 slot76 原样、stage_idx=fs");
             nvn_vk_program_free(&p);
@@ -310,6 +325,42 @@ int main(void) {
         CHECK(buffer && buffer->kind == 2 && buffer->texel_buffer && buffer->tex_slot == 5 && buffer->count == 1,
               "real offline TBUF preserved at VS combined texture slot 5");
         nvn_vk_program_free(&parsed); free(j); s2a_libpack_close(buflp);
+        char path[400]; snprintf(path, sizeof path, "%s/lib.idx", g_dir); unlink(path);
+        snprintf(path, sizeof path, "%s/lib.000.pak", g_dir); unlink(path); rmdir(g_dir);
+        snprintf(g_dir, sizeof g_dir, "%s", tmpl);
+    }
+
+    // 分离贴图的采样器半边：samp_tex → 槽 90、分离贴图槽 128；samp（分离采样器）→ 不给槽、解析后不挂槽
+    for (int variant = 0; variant < 2; variant++) {
+        const char *ps = variant ? PS_SEPSAMP_JSON : PS_SAMPTEX_JSON;
+        snprintf(g_dir, sizeof g_dir, "%s/sepsamp%d", tmpl, variant);
+        CHECK(mkdir(g_dir, 0700) == 0, "create separate-sampler pack directory");
+        struct trec rs[4] = {
+            { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(VS_JSON) },
+            { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
+            { .key = 0x1032547698badcfe, .kind = 1, .len = (uint32_t)strlen(ps) },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
+        };
+        const uint8_t *pr[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)ps, libpack_frag_spv };
+        size_t nr[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(ps), sizeof libpack_frag_spv };
+        CHECK(mk_pack(rs, 4, pr, nr, 1) == 0, "separate-sampler pack written");
+        struct s2a_libpack *slp = NULL; uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
+        uint8_t keys[6][8] = {{0}};
+        const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+        const uint8_t kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
+        memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
+        CHECK(s2a_libpack_open(&slp, g_dir) == 1 && slp, "open separate-sampler pack");
+        int rc = slp ? s2a_libpack_program_v1(slp, keys, 3, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
+        CHECK(rc == 0 && j, "separate-sampler pack yields a v1 program");
+        int has90 = j && has(j, "\"kind\":\"texture\",\"stage\":\"fs\",\"set\":0,\"binding\":10,\"slot\":90");
+        CHECK(variant ? !has90 : has90, variant ? "sep-tex + samp（分离采样器）→ 不给槽 90" : "sep-tex + samp_tex（同字采样器）→ 槽 90");
+        struct fd_program parsed = {0}; char why[192] = "";
+        int parsed_rc = j ? nvn_vk_program_parse_graphics(j, jl, &parsed, why, sizeof why) : -1;
+        const struct fd_binding *t10 = NULL;
+        for (int i = 0; i < parsed.binding_count; i++) if (parsed.bindings[i].binding == 10) t10 = &parsed.bindings[i];
+        CHECK(parsed_rc == 0 && t10 && t10->kind == 2 && (variant ? t10->tex_slot < 0 : t10->tex_slot == 128 && t10->samp_slot == -1),
+              variant ? "sep-tex + samp：解析后不挂槽（消费端如实拒）" : "sep-tex + samp_tex：分离贴图槽 128、采样器取同字");
+        nvn_vk_program_free(&parsed); free(j); s2a_libpack_close(slp);
         char path[400]; snprintf(path, sizeof path, "%s/lib.idx", g_dir); unlink(path);
         snprintf(path, sizeof path, "%s/lib.000.pak", g_dir); unlink(path); rmdir(g_dir);
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);
