@@ -521,6 +521,10 @@ int main(void) {
                 failf("compute direct separate texture", "slot %d 期望 接受、分离贴图槽 %d，真结果 rc=%d why=%s", sep[k].slot, sep[k].want, rc, why);
             if (!sep[k].ok && !(rc != 0 && strstr(why, "compute texture slot outside recorded range")))
                 failf("compute direct separate texture", "slot %d 期望 拒绝，真结果 rc=%d why=%s", sep[k].slot, rc, why);
+            nvn_vk_program_free_compute(&p);
+        }
+    }
+
     // 按贴图采样 c2 图像句柄表的字（空轨 2nd compute_atmosphere_scatter：slot 72）：72..86 偶、无 samp_slot → 贴图槽 32 + k（同 iOS tex_slot_h）；奇字、表外照旧拒
     {
         static const struct { int slot, ok, want; } it[] = {{72, 1, 32}, {74, 1, 33}, {86, 1, 39}, {73, 0, 0}, {88, 0, 0}};

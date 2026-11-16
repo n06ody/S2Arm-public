@@ -1930,6 +1930,8 @@ internal static unsafe class Program
             Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=346,cbufSlot=-1"), "a sampler-table word is not a separate texture: " + got);
             got = Direct(8, Fact(8, -1, false));
             Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
+        }
+
         // 7b2) 同一对 c2 分离字在两条路径上各 OR 一次、汇合（phi）后才进 TEX.B（空轨 2nd compute_atmosphere_scatter 的形状）。
         //      真实 decoder / translator：句柄要穿过 phi 按值比叶子才认得出（QueryBindlessPhiSeeThrough，同 iOS dmsh_xlate）。
         //      循环里套分支，TEX 处的句柄 = phi(循环前算的 OR, phi(分支 A 的 OR, 分支 B 的 OR))：上游只比 phi 的直接输入（一个是 phi、一个是 OR）认不出。
