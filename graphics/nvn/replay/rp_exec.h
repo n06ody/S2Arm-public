@@ -19,6 +19,20 @@ nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
 int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+enum rp_buf_diag_kind { RP_BUF_OTHER, RP_BUF_VERTEX, RP_BUF_INDEX, RP_BUF_CONSTANT, RP_BUF_STORAGE, RP_BUF_KIND_N,
+    RP_BUF_INDEX_DIRECT = RP_BUF_KIND_N, RP_BUF_INDEX_INDIRECT_CLEAR, RP_BUF_INDEX_INDIRECT_PENDING, RP_BUF_INDEX_INDIRECT_UNKNOWN,
+    RP_BUF_INDEX_COUNT_CLEAR, RP_BUF_INDEX_COUNT_PENDING, RP_BUF_INDEX_COUNT_UNKNOWN, RP_BUF_INDEX_TAG_END };
+enum { RP_BUF_DIAG_BUCKETS = 6 };
+struct rp_buf_diag_row {
+    uint64_t slow, pages, dirty, fresh_pages, first, stale, map, untracked, pool_max;
+    uint64_t hist[RP_BUF_DIAG_BUCKETS];
+    uint64_t pool_hist[RP_BUF_DIAG_BUCKETS];
+    uint64_t index_slow[RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N], index_pages[RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N];
+};
+int rp_buf_resolve_tag(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off, enum rp_buf_diag_kind kind);
+int rp_buf_resolve_multi_tag(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, enum rp_buf_diag_kind kind);
+int rp_buf_diag_take(struct rp_buf_diag_row out[RP_BUF_KIND_N]);
+enum rp_buf_diag_kind rp_buf_diag_indirect_tag(uint64_t addr, uint64_t len, uint64_t count_addr);
 // 写入区间日志（rp_draw 的暂存片复用判定用）：记号 + 「记号之后有没有人写过这一段」
 uint64_t rp_write_mark(void);
 int rp_write_touched(uint64_t mark, uint64_t addr, uint64_t len);
@@ -70,7 +84,7 @@ void rp_draw_stats(uint64_t *draws, uint64_t *skips);
 enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_PERF_WAIT_N, RP_PERF_DONE_NS, RP_PERF_DONE_N, RP_PERF_PASSES, RP_PERF_PRESENT_NS,
        RP_PERF_D_PROG, RP_PERF_D_PREP, RP_PERF_D_TEX, RP_PERF_D_PIPE, RP_PERF_D_DYN, RP_PERF_D_BIND, RP_PERF_D_DRAW, RP_PERF_D_TAIL, RP_PERF_D_PASS, RP_PERF_D_PGET, RP_PERF_PB_VIEW, RP_PERF_PB_BAR, RP_PERF_PB_BE, RP_PERF_PB_MARK, RP_PERF_RES_LOCK, RP_PERF_RES_NEW, RP_PERF_RES_INIT, RP_PERF_RES_VIEWMAKE, RP_PERF_PB_SHADOW, RP_PERF_RES_SCAN, RP_PERF_RES_UP, RP_PERF_RES_UPN, RP_PERF_RES_ZERO, RP_PERF_RES_ZERON, RP_PERF_RES_MAKE, RP_PERF_RES_ZDEFER, RP_PERF_BIND_SLICE_HIT, RP_PERF_BIND_SKIP,   // 绑定：段内切片表命中的块数、整组沿用没发的阶段数
       
-       RP_PERF_P_DS, RP_PERF_P_DS_IDLE, RP_PERF_P_LOADC, RP_PERF_P_KPIX, RP_PERF_P_ONE, RP_PERF_P_CUT_XFER, RP_PERF_P_CUT_CLEAR, RP_PERF_P_CUT_RT, RP_PERF_P_CUT_OP, RP_PERF_TEX_UP_N, RP_PERF_TEX_UP_KB, RP_PERF_BUF_SYNC_KB, RP_PERF_BUF_SYNC_DIRECT_KB, RP_PERF_FX_SUBS, RP_PERF_FX_EVENT, RP_PERF_FX_REPORT, RP_PERF_FX_OCC, RP_PERF_FX_GW, RP_PERF_FIN_SKIP,
+       RP_PERF_P_DS, RP_PERF_P_DS_IDLE, RP_PERF_P_LOADC, RP_PERF_P_KPIX, RP_PERF_P_ONE, RP_PERF_P_CUT_XFER, RP_PERF_P_CUT_CLEAR, RP_PERF_P_CUT_RT, RP_PERF_P_CUT_OP, RP_PERF_P_CUT_IND, RP_PERF_P_CUT_DISP, RP_PERF_P_CUT_SUBMIT, RP_PERF_P_CUT_LAND, RP_PERF_P_CUT_OCC, RP_PERF_P_CUT_AREA, RP_PERF_TEX_UP_N, RP_PERF_TEX_UP_KB, RP_PERF_BUF_SYNC_KB, RP_PERF_BUF_SYNC_DIRECT_KB, RP_PERF_FX_SUBS, RP_PERF_FX_EVENT, RP_PERF_FX_REPORT, RP_PERF_FX_OCC, RP_PERF_FX_GW, RP_PERF_FIN_SKIP,
        RP_PERF_P_CONT, RP_PERF_P_CLEARONLY, RP_PERF_P_PARK, RP_PERF_BIND_FAST, RP_PERF_BIND_CONT, RP_PERF_TEX_EPOCH, RP_PERF_PC_HIT, RP_PERF_PC_MISS, RP_PERF_WAIT_FIN_N, RP_PERF_WAIT_FIN_NS, RP_PERF_WAIT_SYNC_N, RP_PERF_WAIT_SYNC_NS,
        RP_PERF_P_TINY_DS, RP_PERF_P_TINY_NODS, RP_PERF_P_TINY_KPIX,   // 0–1 笔通道里：挂深度模板的、不挂的、它们的百万像素和（看通道碎片化构成）
        RP_PERF_P_AREA, RP_PERF_P_AREA_KPIX,   // 用了缩小渲染区域的通道数、这些区域的千像素和（面积优化到底有没有真的缩下来）
@@ -141,6 +155,8 @@ void rp_occl_draw(nvn_gpu_cmd c);       // 每笔绘制之前
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec);   // 计算派发（rp_draw.c）
 int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登记单段；1 = 登记成功，段完成后回写
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
+// [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
+int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里
 void rp_pass_note_draw(int uses_ds);   // 一笔绘制进了当前通道（uses_ds：这笔开着深度测试 / 深度写 / 模板测试）

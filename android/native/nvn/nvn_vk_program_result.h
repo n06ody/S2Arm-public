@@ -34,7 +34,9 @@ struct fd_stage {
     size_t spirv_bytes;
     uint32_t attr_mask;
     uint32_t fragment_output_map;   // 片元阶段：每个颜色目标 4 位（RGBA）= 着色器写了哪些输出分量；读不到为全 1
+    int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知
 };
+#define FD_C0_BASE_INSTANCE 0x644u   // 驱动常量段里图形阶段的 base instance 字（nvn_vk_mrt.h、回放 fill_graphics_drv 同位）
 
 /* 句柄放在游戏用户常量缓冲里的一个 32 位字（v1 uboHandle / sampler.handle；iOS nvn_refl.h NVN_RB_TEXU / SAMPU / TBUFU 的 reg / off / sid / pair）：
  * 用户常量槽 slot 的字节 offset 处；sid = 这个字是采样器号（读出后左移 20）；pair = 同一句柄的另一半（pair_sid：那半是采样器号字，左移 20 后相或）。 */
@@ -42,7 +44,7 @@ struct fd_ubo_word { uint8_t slot, sid, pair, pair_slot, pair_sid; uint16_t offs
 enum { FD_SAMP_NONE = 0, FD_SAMP_UBO, FD_SAMP_ID, FD_SAMP_SLOT };   // fd_binding.samp_src
 
 struct fd_binding {
-    int set, binding, kind;   // kind: 0 uniform/support, 1 storage, 2 texture, 3 image
+    int set, binding, kind;   // kind: 0 uniform/support, 1 storage, 2 texture, 3 image, 4 计算共享内存溢出缓冲（spill）
     int slot;
     uint16_t count;           // 描述符数组长度（不是数组为 1）。kind==2 且 count>1 = 从句柄表第 slot 项起的贴图数组
     char stage[16];
@@ -96,6 +98,7 @@ struct nvn_vk_compute_storage {
     uint32_t index, offset; /* proven NVN slot / UBO slot and optional byte offset */
 };
 #define NVK_COMPUTE_C0_MAX_READS 256
+#define NVK_PROGRAM_RESULT_MAX_BYTES (64u * 1024u * 1024u)   // 编译结果文档上限：同跨局程序缓存单条（program_cache.c PCACHE_MAX_PAYLOAD）
 #define NVK_COMPUTE_C0_BYTES 0x410u
 struct nvn_vk_c0_read { uint32_t offset, size; };
 struct nvn_vk_support_scale { uint32_t offset, stride, count, element_bytes; };
@@ -116,6 +119,7 @@ struct nvn_vk_compute_program {
     struct fd_binding bindings[FD_MAX_BINDINGS];
     int binding_count;
     uint32_t support_bytes;
+    uint32_t spill_bytes;   // 共享内存溢出缓冲每个线程组的字节数（结果里 kind = spill 的绑定）；0 = 没有
 };
 #ifdef __cplusplus
 extern "C" {

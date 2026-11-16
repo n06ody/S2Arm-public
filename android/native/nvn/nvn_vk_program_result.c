@@ -54,6 +54,7 @@ int nvn_vk_program_graphics_stage_index(const char *name) {
 }
 
 static int compute_unique_fields(struct s2a_jv object);
+static int compute_u32(struct s2a_jv v, uint32_t *out);
 
 // Return 1 for a proven sampled Buffer, 0 for another proven sampled image,
 // -1 when the set/binding and its type chain cannot be proved. Op/Dim values
@@ -250,6 +251,21 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
         uint32_t mask_value = 0;
         if (!s2a_jv_obj_find(st, "attributeReadMask", &mask) && !s2a_jv_u32(mask, &mask_value))
             out->stage[idx].attr_mask = mask_value;
+        // c0Reads（可选）：编译器证得的本阶段 c0 读集。缺字段或 null = 未知（binst_unread 留 0，回放照旧拷 base instance）；
+        // 数组且没有一段与 c0 + 0x644 的 4 字节相交 = 已证不读。写了但形状不对如实拒，不当成未知。
+        { struct s2a_jv reads;
+          if (!s2a_jv_obj_find(st, "c0Reads", &reads) && !s2a_jv_is_null(reads)) {
+              int rn = s2a_jv_arr_count(reads); int hit = 0;
+              if (rn < 0) return fail(why, why_size, "stage c0 reads must be an array or null");
+              for (int r = 0; r < rn; r++) {
+                  struct s2a_jv pair, off, size; uint32_t o = 0, z = 0;
+                  if (s2a_jv_arr_item(reads, r, &pair) || s2a_jv_arr_count(pair) != 2 || s2a_jv_arr_item(pair, 0, &off) ||
+                      s2a_jv_arr_item(pair, 1, &size) || compute_u32(off, &o) || compute_u32(size, &z) || !z)
+                      return fail(why, why_size, "stage c0 read range is invalid");
+                  if ((uint64_t)o < FD_C0_BASE_INSTANCE + 4 && (uint64_t)o + z > FD_C0_BASE_INSTANCE) hit = 1;
+              }
+              out->stage[idx].binst_unread = !hit;
+          } }
         // 片元着色器的输出映射（每个颜色目标 4 位、RGBA 各 1 位）：在阶段的 info 里；读不到 = 全 1（不屏蔽）
         out->stage[idx].fragment_output_map = 0xffffffffu;
         { struct s2a_jv info = { NULL, 0 }, om = { NULL, 0 }; uint32_t om_v = 0;
@@ -522,7 +538,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
     memset(out, 0, sizeof *out);
     s2a_json_object *syntax = malloc(sizeof *syntax);
     if (!syntax) return fail(why, why_size, "compute JSON allocation failed");
-    int rc = s2a_json_parse_object(bytes, length, syntax, why, why_size);
+    // 计算结果是「程序」级文档：大核（空轨 2nd 运行时那支约 9800 条指令的计算核）的 SPIR-V base64 加依赖列表超过 1 MiB 是正常体量。
+    //   上限取跨局程序缓存单条上限（program_cache.c PCACHE_MAX_PAYLOAD 64 MiB）：缓存装得下的结果就要解析得了。图形结果解析本来就不走这道校验。
+    int rc = s2a_json_parse_object_max(bytes, length, NVK_PROGRAM_RESULT_MAX_BYTES, syntax, why, why_size);
     free(syntax);
     if (rc) return -1;
     struct s2a_jv top = {(const char *)bytes, length}, content, stages, st, spirv, bindings, support;
@@ -601,7 +619,16 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         else if (compute_string_is(b, "kind", "storage")) dst->kind = 1;
         else if (compute_string_is(b, "kind", "texture")) dst->kind = 2;
         else if (compute_string_is(b, "kind", "image")) dst->kind = 3;
+        else if (compute_string_is(b, "kind", "spill")) dst->kind = 4;
         else CS_FAIL("unknown compute binding kind");
+        {   // 每线程组字节数只属于 spill；spill 必须带、且 4 字节对齐、不超过客体上限 64 KB；整个程序最多一个
+            struct s2a_jv per; int has_per = !s2a_jv_obj_find(b, "bytesPerGroup", &per);
+            if (dst->kind == 4) {
+                if (!has_per || compute_u32(per, &u) || !u || (u & 3) || u > 0x10000) CS_FAIL("compute spill bytesPerGroup is missing or invalid");
+                if (out->spill_bytes) CS_FAIL("compute program has more than one spill binding");
+                out->spill_bytes = u;
+            } else if (has_per) CS_FAIL("compute non-spill binding carries bytesPerGroup");
+        }
         // texture (kind 2) 是 compute 的一等资源：slot 就是 NVN c2 组合纹理表里的 handleIndex，
         // 下面按 8+2*slot 校验并换算出 NVN 纹理槽。存储图像（kind 3）还没接：显式拒绝并把
         // set/binding/handleIndex 写进原因（不绑定占位图像、不静默丢一条描述符）。
@@ -625,7 +652,8 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             if (compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute guest slot invalid");
             dst->slot = (int)u;
         }
-        if (!dst->is_support && dst->kind != 1 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
+        if (dst->kind == 4 && dst->slot >= 0) CS_FAIL("compute spill binding carries a guest slot");
+        if (!dst->is_support && dst->kind != 1 && dst->kind != 4 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
         // 图像（kind 3）：handleIndex 指驱动 c2 图像句柄表（字节 0x120 起 8 槽 × 8 字节 = 4 字节字下标 72..86 偶数，
         //   同 iOS nvn_mtl.m C2_IMG / tex_slot_h），NVN 图像槽 = (handleIndex − 72) / 2；回放按 BindImage 的槽取（rp_draw NVN_RB_IMG）
         if (dst->kind == 3 && (dst->slot < 72 || dst->slot >= 88 || (dst->slot & 1))) {
@@ -647,15 +675,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         }
         if (dst->kind == 0 && !dst->is_support) {
             // NVN cbuf 语义（与图形侧 nvn_vk_first_draw.c 同一套）：0 = c0/support、1 = c1 常量段、
-            // 2 = 纹理句柄表（还没实现）、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
-            if (dst->slot == 2) {
-                char message[160];
-                snprintf(message, sizeof message,
-                    "compute c2 texture-handle bank used as a uniform buffer is not implemented: set=%d binding=%d",
-                    dst->set, dst->binding);
-                CS_FAIL(message);
-            }
-            if (dst->slot != 0 && dst->slot != 1 && (dst->slot < 3 || dst->slot > 18)) {
+            // 2 = 驱动句柄表、3..18 = 用户 uniform（NVN 槽 = cbuf−3）。
+            // slot 2 = 驱动句柄表 c2 被当常量缓冲读（同图形：layout_ent 映射成 NVN_RB_DRV2，回放按完整驱动表 0xA00 填）。
+            if (dst->slot != 0 && dst->slot != 1 && dst->slot != 2 && (dst->slot < 3 || dst->slot > 18)) {
                 // 越界必须能定位：槽号 + set/binding。
                 char message[160];
                 snprintf(message, sizeof message,
@@ -670,7 +692,11 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         if (dst->kind == 3) dst->tex_slot = (int16_t)((dst->slot - 72) / 2);   // 图像槽（复用 tex_slot 字段，见上）
         if (dst->kind == 2) {
             if (has_samp) dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);
-            else {
+            else if (dst->slot >= 72 && dst->slot < 88 && !(dst->slot & 1)) {
+                // 按贴图采样 c2 图像句柄表的字（字节 0x120 + 8k）：贴图槽 32 + k，回放取图像槽 k 绑着的句柄
+                //   （同 iOS nvn_mtl.m tex_slot_h：C2_TEX_SLOTS = 41，寄存器 32..39 落在图像表）
+                dst->tex_slot = (int16_t)(32 + (dst->slot - 72) / 2);
+            } else {
                 if (dst->slot >= 90 && dst->slot < 346 && !(dst->slot & 1))
                     dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);   // 直接读 c2 分离贴图表的字（同图形）
                 else if (dst->slot < 8 || dst->slot >= 72 || (dst->slot & 1)) CS_FAIL("compute texture slot outside recorded range");
