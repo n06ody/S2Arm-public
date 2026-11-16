@@ -142,8 +142,10 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
     }
     g_samp_creates++; g_samp_last = *p; *out = calloc(1, sizeof **out); (*out)->x = p->ws; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
+static uint32_t g_caps_stor[4];   // 用例：这些格式在替身设备上也能当存储图像（默认只有 RGBA8）
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
+    for (int k = 0; k < 4; k++) if (g_caps_stor[k] && f == g_caps_stor[k]) return NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_STORAGE;
     return f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE; }
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     (void)t; if (g_nup == 16) return;
@@ -2897,6 +2899,36 @@ static void t_dispatch_ubop_ro_skip(void) {
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
+// 计算存储图像按着色器声明选视图格式（对齐 Ryujinx 按绑定格式取视图、iOS img_fit）：
+//   ① 声明 Unknown + uint，贴图 RG32F → 同存储的 RG32UI 视图（SULD.B 按位读，原始位不变）；② 声明 Unknown + float → 贴图原格式；
+//   ③ 声明 R32ui、贴图 RG32F（字节数不同）→ 报名跳过；④ 声明 R32ui、贴图 R32F → R32UI 视图；⑤ 声明 Rg32f、贴图 RG32F → 原格式；
+//   ⑥ 声明没解析出来（dtt 0）→ 照旧原格式。
+static const struct nvn_gpu_view_s *img_class_view(int tex_id, uint8_t dcls, uint8_t difmt, uint8_t dtt, int *dispatched) {
+    g_cprog.dtt[0][0] = dtt; g_cprog.dcls[0][0] = dcls; g_cprog.difmt[0][0] = difmt; rp_S.img[5][2] = (uint64_t)tex_id;
+    int n = g_ndisp; g_ncb = 0; rp_dispatch(&g_fake_cmd, &(p_dispatch){.x = 1, .y = 1, .z = 1}, NULL);
+    *dispatched = g_ndisp == n + 1;
+    return *dispatched && g_ncb == 1 ? (const struct nvn_gpu_view_s *)g_cb[0].u.view : NULL;
+}
+static void t_compute_image_class(void) {
+    pass_fresh(); res_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
+    g_caps_stor[0] = NVN_FORMAT_RG32F; g_caps_stor[1] = NVN_FORMAT_RG32UI; g_caps_stor[2] = NVN_FORMAT_R32F; g_caps_stor[3] = NVN_FORMAT_R32UI;
+    tex_t rg = mk_tex(671, 0, NVN_FORMAT_RG32F, 1, 1, 1, NVN_TEXTURE_FLAGS_IMAGE), r = mk_tex(672, 0x4000, NVN_FORMAT_R32F, 1, 1, 1, NVN_TEXTURE_FLAGS_IMAGE);
+    nvn_be_reg_tex(3, &rg, NULL); nvn_be_reg_tex(4, &r, NULL); nvn_be_set_tex_pool_n(8);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 1;
+    nvn_gpu_layout_ent *e = &g_cprog.ent[0][0]; e->cls = NVN_GPU_RES_IMAGE; e->src_kind = NVN_RB_IMG; e->src_reg = 2; e->count = 1; e->access = NVN_GPU_ACC_R;
+    const uint8_t t2d = NVN_TEXTURE_TARGET_2D + 1; int ok = 0; const struct nvn_gpu_view_s *v;
+    nvn_be_sub_begin();
+    v = img_class_view(3, 1, 0, t2d, &ok); CHECK(ok && v && v->has_v && v->v.set_format && v->v.format == NVN_FORMAT_RG32UI);   // ①
+    v = img_class_view(3, 0, 0, t2d, &ok); CHECK(ok && v && !(v->has_v && v->v.set_format));                                  // ②
+    uint64_t mis0 = nvn_unimpl_count("draw", "compute_image_decl_format_size_mismatch");
+    v = img_class_view(3, 1, 33, t2d, &ok); CHECK(!ok && nvn_unimpl_count("draw", "compute_image_decl_format_size_mismatch") == mis0 + 1);   // ③
+    v = img_class_view(4, 1, 33, t2d, &ok); CHECK(ok && v && v->has_v && v->v.set_format && v->v.format == NVN_FORMAT_R32UI);  // ④
+    v = img_class_view(3, 0, 6, t2d, &ok); CHECK(ok && v && !(v->has_v && v->v.set_format));                                  // ⑤
+    v = img_class_view(3, 1, 0, 0, &ok); CHECK(ok && v && !(v->has_v && v->v.set_format));                                    // ⑥
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    memset(g_caps_stor, 0, sizeof g_caps_stor); rp_S.img[5][2] = 0; pass_fresh();
+}
+
 // #659：计算阶段独立图像槽，读写属性决定 GPU 所有权；不涉及间接参数同步。
 static void t_compute_image(void) {
     pass_fresh(); res_fresh(); g_arena_used = 0;
@@ -4055,6 +4087,7 @@ int main(int argc, char **argv) {
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
+    t_compute_image_class();
     t_compute_tex_from_image();
     t_dump_producer_compute();
     t_tex_write_log();

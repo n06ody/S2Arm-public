@@ -604,3 +604,4 @@
 20261115-1312-audio-diag-peak-nan.patch
 20261115-1505-macrojit-dynamic-code-guard.patch
 20261115-1712-hid-follow-sync-same-lock.patch
+20261116-2302-image-raw-load-formatless.patch

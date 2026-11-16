@@ -1613,6 +1613,37 @@ static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence)
 // 取计算程序 → 落地待折清除并结束通道（派发在通道外，且可能读写那些目标）→ 绑定 NVN 阶段 5 的资源 → 派发。
 // 范围：直接与池镜像参数的原生间接派发；常量缓冲、驱动段、按槽绑定的存储缓冲、单张组合贴图与图像。贴图数组：记账跳过。
 static nvn_hmap g_cpipes = {.klen = 8};   // 计算程序 → 计算管线
+// 计算存储图像的视图格式：按着色器的声明取，不按贴图自己的格式（对齐 Ryujinx TextureBindingsManager 按绑定的格式取贴图 / 视图，iOS nvn_mtl.m img_fit）。
+//   声明 Unknown：数值类（dcls：0 浮点，1 uint，2 sint）和贴图相同就用贴图的格式；不同就取同字节数、目标数值类的格式
+//     （RG32F 被按位读成 uint → RG32UI，原始位不变）。Vulkan 要求视图数值类与 Sampled Type 一致（VUID-07753）。
+//   声明具体格式（宿主不支持无格式读时 SULD.B 声明 R32ui 一类）：和贴图格式相同照用；字节数相同取声明的格式；
+//     字节数不同 Vulkan 建不出与声明一致的视图，报名跳过，不按贴图格式硬绑（那是未定义行为）。
+//   声明没解析出来（dtt = 0）：照旧用贴图格式。
+static const uint8_t k_spv_img_nvn[40] = {   // SPIR-V Image Format 枚举 → NVN 格式
+    [1] = 0x2E, [2] = 0x29, [3] = 0x0A, [4] = 0x25, [5] = 0x26, [6] = 0x16, [7] = 0x11, [8] = 0x3F, [9] = 0x05, [10] = 0x2A,
+    [11] = 0x3D, [12] = 0x12, [13] = 0x0D, [14] = 0x06, [15] = 0x01, [16] = 0x2B, [17] = 0x13, [18] = 0x0E, [19] = 0x07, [20] = 0x02,
+    [21] = 0x30, [22] = 0x2D, [23] = 0x28, [24] = 0x0C, [25] = 0x18, [26] = 0x15, [27] = 0x10, [28] = 0x09, [29] = 0x04, [30] = 0x2F,
+    [31] = 0x2C, [32] = 0x27, [33] = 0x0B, [34] = 0x3E, [35] = 0x17, [36] = 0x14, [37] = 0x0F, [38] = 0x08, [39] = 0x03 };
+static const char *image_view_format(uint32_t have, uint8_t dtt, uint8_t dcls, uint8_t difmt, uint32_t *want) {
+    *want = have;
+    if (!dtt) return NULL;
+    nvn_fmt_info fi;
+    if (!nvn_fmt_info_of(have, &fi) || fi.bw != 1 || fi.bh != 1 || fi.depth || fi.stencil) return NULL;   // 压缩 / 深度模板：存储能力检查照旧拦
+    if (difmt) {
+        uint32_t f = difmt < sizeof k_spv_img_nvn ? k_spv_img_nvn[difmt] : 0; nvn_fmt_info di;
+        if (!f || !nvn_fmt_info_of(f, &di)) return "compute_image_decl_format_unmapped";
+        if (f == have) return NULL;
+        if (di.bytes != fi.bytes) return "compute_image_decl_format_size_mismatch";
+        *want = f; return NULL;
+    }
+    int cls = fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
+    if (dcls > 2 || dcls == cls) return NULL;
+    static const uint8_t ui[17] = {[1] = 0x03, [2] = 0x08, [4] = 0x0B, [8] = 0x17, [16] = 0x2F}, si[17] = {[1] = 0x04, [2] = 0x09, [4] = 0x0C, [8] = 0x18, [16] = 0x30},
+                         fl[17] = {[2] = 0x05, [4] = 0x0A, [8] = 0x16, [16] = 0x2E};
+    uint32_t f = fi.bytes <= 16 ? (dcls == 1 ? ui : dcls == 2 ? si : fl)[fi.bytes] : 0;
+    if (!f) return "compute_image_class_no_view";
+    *want = f; return NULL;
+}
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!c) return;
     rp_perf_add(RP_PERF_DISP_N, 1);   // 派发次数（其余命令里最贵的一项，看它到底多少次）
@@ -1641,8 +1672,9 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
             uint64_t h = rp_S.img[5][e->src_reg];
             tex_t snap; view_t view; int has_view;
             if (!rp_tex_snap_by_id((int)(h & 0xFFFFF), &snap, &view, &has_view)) { skip("compute_image_unresolved", rec); goto done; }
-            uint32_t format = has_view && view.set_format ? (uint32_t)view.format : (uint32_t)snap.d.format;
-            if (!(snap.d.flags & NVN_TEXTURE_FLAGS_IMAGE) || !(nvn_gpu_format_caps(format) & NVN_GPU_FMT_STORAGE)) { skip("compute_image_storage_unsupported", rec); goto done; }
+            uint32_t format = has_view && view.set_format ? (uint32_t)view.format : (uint32_t)snap.d.format, vfmt;
+            { const char *why = image_view_format(format, pg->dtt[0][i], pg->dcls[0][i], pg->difmt[0][i], &vfmt); if (why) { skip(why, rec); goto done; } }
+            if (!(snap.d.flags & NVN_TEXTURE_FLAGS_IMAGE) || !(nvn_gpu_format_caps(vfmt) & NVN_GPU_FMT_STORAGE)) { skip("compute_image_storage_unsupported", rec); goto done; }
             uint32_t levels = has_view && view.set_levels ? (view.nlevels ? view.nlevels : 1) : (snap.d.levels ? snap.d.levels : 1);
             int swizzled = 0;
             for (int ch = 0; ch < 4; ch++) {
@@ -1652,6 +1684,12 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
             if (levels != 1 || swizzled) { skip("compute_image_view_unsupported", rec); goto done; }
             tv[i] = rp_view_by_id((int)(h & 0xFFFFF), c, &images[i]);
             if (!tv[i] || !images[i]) { skip("compute_image_unresolved", rec); goto done; }
+            if (vfmt != format) {   // 换成声明要的格式：同一份存储上的格式视图（贴图建时带 VIEW_FMT，见 rp_res.c usage_of）
+                view_t fv; if (has_view) fv = view; else memset(&fv, 0, sizeof fv);
+                fv.set_format = 1; fv.format = (uint16_t)vfmt;
+                tv[i] = rp_view_for(images[i], &fv, c);
+                if (!tv[i]) { skip("compute_image_format_view_failed", rec); goto done; }
+            }
             continue;
         }
         if (e->src_kind != NVN_RB_TEX) continue;
