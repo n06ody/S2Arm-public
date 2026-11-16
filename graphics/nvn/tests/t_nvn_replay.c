@@ -24,9 +24,10 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200]; static int g_info_watch;   // 诊断第二版：「盯计算」行数
+static int g_info_chain; static char g_chain[4][700];   // 诊断：转储链行数与前 4 行
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
@@ -2932,6 +2933,28 @@ static void t_compute_image(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); pass_fresh();
 }
 
+// 诊断：计算写的图像也进转储历史——生产者打计算程序键，源是采样的贴图（自动曝光一类 1x1 目标由计算写，不记就追不到上游）
+static void t_dump_producer_compute(void) {
+    pass_fresh(); res_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
+    tex_t img = mk_tex(781, 0, NVN_FORMAT_RGBA8, 8, 8, 1, NVN_TEXTURE_FLAGS_IMAGE), src = mk_tex(782, 0x4000, NVN_FORMAT_RGBA8, 8, 8, 1, 0);
+    samp_par sp; memset(&sp, 0, sizeof sp);
+    nvn_be_reg_tex(3, &img, NULL); nvn_be_reg_tex(4, &src, NULL); nvn_be_reg_samp(0, &sp); nvn_be_set_tex_pool_n(16);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 2;
+    nvn_gpu_layout_ent *e = &g_cprog.ent[0][0];
+    e->cls = NVN_GPU_RES_IMAGE; e->src_kind = NVN_RB_IMG; e->src_reg = 2; e->count = 1; e->access = NVN_GPU_ACC_W;
+    e = &g_cprog.ent[0][1]; e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = 1; e->src_reg2 = UINT16_MAX; e->count = 1; e->access = NVN_GPU_ACC_R;
+    memset(rp_S.img[5], 0, sizeof rp_S.img[5]); rp_S.img[5][2] = 3; rp_S.tex[5][1] = 4;
+    static const uint8_t key[8] = {0x37, 0x72, 0x7c, 0x65, 0xc9, 0x44, 0x02, 0x44}; memcpy(rp_S.skey[5], key, 8);
+    p_dispatch dp = {.x = 1, .y = 1, .z = 1}; int n = g_ndisp;
+    nvn_be_sub_begin(); rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_info_chain = 0; uint64_t fence = 0; rp_debug_dump_request(781, 9); rp_debug_dump_poll(&fence);
+    CHECK(g_info_chain == 2);
+    CHECK(strstr(g_chain[0], "帧 9 #781 层 0：最近 1 次写入，生产者 [计算 37727c65c9440244 ×1") && strstr(g_chain[0], "源 #782"));
+    CHECK(strstr(g_chain[1], "#782 层 1（是 #781 的源）") && strstr(g_chain[1], "历史里没有写它"));
+    g_info_chain = 0; memset(rp_S.skey[5], 0, 8); rp_S.img[5][2] = 0; rp_S.tex[5][1] = 0; pass_fresh();
+}
+
 // 计算核按贴图采样 c2 图像句柄表的字（贴图槽 32..39，同 iOS nvn_mtl.m tex_slot_h）：取图像槽 k 绑着的句柄，不读组合 / 分离贴图表的同号项。
 //   图像槽 0 绑贴图 3（已登记），贴图表第 32 项放一个没登记的号 9：取对了就能派发、视图非空；读错表就取不到视图、报名跳过。
 static void t_compute_tex_from_image(void) {
@@ -3451,7 +3474,15 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
     di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 0xa; di->itype = 1; di->count = 4; di->ibuf = base + 3 * PG;      // 邻接线：还没接
     p_draw *dn = put(&s, OP_DRAW, sizeof *dn); dn->prim = 5; dn->first = 2; dn->count = 4; dn->instances = 3;            // 不带索引的条带
     end(&s);
+    static const uint8_t vkey[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}, fkey[8] = {0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18};
+    memcpy(rp_S.skey[0], vkey, 8); memcpy(rp_S.skey[1], fkey, 8);
     submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    // 诊断：转储链从目标 #81 往上追——生产者是这几笔绘制（顶点 / 片元程序键），源是采样的 #82
+    { int c0 = g_info_chain; uint64_t fence = 0; rp_debug_dump_request(81, 5); rp_debug_dump_poll(&fence);
+      CHECK(g_info_chain == c0 + 2);
+      CHECK(strstr(g_chain[c0 & 3], "#81 层 0") && strstr(g_chain[c0 & 3], "[绘制 顶点 1122334455667788 片元 a1b2c3d4e5f60718 ×") && strstr(g_chain[c0 & 3], "源 #82"));
+      CHECK(strstr(g_chain[(c0 + 1) & 3], "#82 层 1（是 #81 的源）") && strstr(g_chain[(c0 + 1) & 3], "历史里没有写它")); g_info_chain = 0; }
+    memset(rp_S.skey[0], 0, 8); memset(rp_S.skey[1], 0, 8);
     CHECK(g_gdraws == 3 && g_npd == 1 && pd_zero_clear(&g_pd[0]));   // 三笔画在同一个通道里；没有清除 → 不带清除值（刚建的目标载入时清成零）
     CHECK(nvn_unimpl_count("draw", "prim_10") == 1);
     CHECK(g_resolves == 2 && g_pipe_gets == 2);          // 第一笔取一次；第二笔没变不取；条带换了图元再取一次
@@ -3916,6 +3947,7 @@ int main(int argc, char **argv) {
     t_dispatch_ubop_ro_skip();
     t_compute_image();
     t_compute_tex_from_image();
+    t_dump_producer_compute();
     t_drv2_table();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();

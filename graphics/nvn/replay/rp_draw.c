@@ -428,10 +428,12 @@ void rp_bind_tm_take3(uint64_t *alloc, uint64_t *copy) { *alloc = g_bt[6]; *copy
 
 // 调试读回用的绘制历史（见文件后部 dump_chain）
 enum { HIST_N = 4096, HIST_TEX = 12, DUMP_MAX = 48 };
-static struct { uint64_t target, tex[HIST_TEX]; } g_hist[HIST_N]; static uint32_t g_hist_n;
-static void hist_note(uint64_t target, const uint64_t *tex, int ntex) {
+// 每条：写到的目标、采样的贴图、生产者（绘制 = 顶点 / 片元程序键，计算 = 计算程序键）与所在段，供转储打「谁画 / 算出来的」
+static struct { uint64_t target, tex[HIST_TEX], key, key2, seg; uint8_t cs; } g_hist[HIST_N]; static uint32_t g_hist_n;
+static void hist_note(uint64_t target, const uint64_t *tex, int ntex, uint64_t key, uint64_t key2, int cs) {
     uint32_t i = g_hist_n++ % HIST_N; g_hist[i].target = target; memset(g_hist[i].tex, 0, sizeof g_hist[i].tex);
     for (int k = 0; k < ntex && k < HIST_TEX; k++) g_hist[i].tex[k] = tex[k];
+    g_hist[i].key = key; g_hist[i].key2 = key2; g_hist[i].cs = (uint8_t)cs; g_hist[i].seg = rp_seg_serial();
 }
 static int g_log_left;   // 逐笔日志还剩几行（调试开关 nvk_drawlog：上屏每 600 帧给下一帧开一次，见 rp_draw_log_arm）
 static int skip(const char *why, const void *rec) {
@@ -1394,8 +1396,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
           uint64_t h = rp_S.tex[st][e->src_reg]; tex_t snap; view_t sv; int hv;
           if (rp_tex_snap_by_id(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, &snap, &sv, &hv)) ts4[nt++] = snap.serial; }
       int noted = 0;
-      for (int k = 0; k < rt->n; k++) if (rt->color[k]) { hist_note(rt->color[k]->serial, ts4, nt); noted = 1; }   // 每个颜色目标各记一条：多目标的绘制，第二个以后的目标也要能往上追
-      if (!noted) hist_note(rt->depth ? rt->depth->serial : 0, ts4, nt); }
+      for (int k = 0; k < rt->n; k++) if (rt->color[k]) { hist_note(rt->color[k]->serial, ts4, nt, key_of(0), key_of(1), 0); noted = 1; }   // 每个颜色目标各记一条：多目标的绘制，第二个以后的目标也要能往上追
+      if (!noted) hist_note(rt->depth ? rt->depth->serial : 0, ts4, nt, key_of(0), key_of(1), 0); }
     rp_pso_dirty = rp_dss_dirty = 0; memset(rp_args_dirty, 0, sizeof rp_args_dirty);
     g_draws++;
     DT(RP_PERF_D_TAIL);
@@ -1457,21 +1459,49 @@ void rp_debug_dump_poll(uint64_t *fence) {
     uint64_t s = __atomic_exchange_n(&g_dump_serial, 0, __ATOMIC_ACQ_REL);
     if (s) dump_chain(s, __atomic_load_n(&g_dump_frame, __ATOMIC_ACQUIRE), fence);
 }
+// 转储链每张一行：历史里写它的生产者（至多 4 种，各自次数与最后所在段）和这些写入采样过的源序号
+static void hist_producers(uint64_t frame, uint64_t serial, int depth, uint64_t parent) {
+    struct { uint64_t key, key2, seg; uint32_t n; uint8_t cs; } p[4]; int np = 0; uint32_t total = 0, other = 0;
+    uint64_t src[HIST_TEX]; int ns = 0; uint32_t have = g_hist_n < HIST_N ? g_hist_n : HIST_N;
+    for (uint32_t h = 0; h < have; h++) { if (g_hist[h].target != serial) continue; total++;
+        int f = -1; for (int q = 0; q < np; q++) if (p[q].key == g_hist[h].key && p[q].key2 == g_hist[h].key2 && p[q].cs == g_hist[h].cs) f = q;
+        if (f < 0 && np < 4) { f = np++; p[f].key = g_hist[h].key; p[f].key2 = g_hist[h].key2; p[f].cs = g_hist[h].cs; p[f].n = 0; p[f].seg = 0; }
+        if (f < 0) other++; else { p[f].n++; if (g_hist[h].seg > p[f].seg) p[f].seg = g_hist[h].seg; }
+        for (int k = 0; k < HIST_TEX && ns < HIST_TEX; k++) { uint64_t s = g_hist[h].tex[k]; if (!s) continue;
+            int seen = 0; for (int q = 0; q < ns; q++) if (src[q] == s) seen = 1;
+            if (!seen) src[ns++] = s; } }
+    char m[700]; int o = snprintf(m, sizeof m, "转储链 帧 %llu #%llu 层 %d", (unsigned long long)frame, (unsigned long long)serial, depth);
+    if (depth > 0 && depth < 9) o += snprintf(m + o, sizeof m - (size_t)o, "（是 #%llu 的源）", (unsigned long long)parent);
+    if (!total) o += snprintf(m + o, sizeof m - (size_t)o, "：历史里没有写它的绘制 / 计算");
+    else {
+        o += snprintf(m + o, sizeof m - (size_t)o, "：最近 %u 次写入，生产者", total);
+        for (int q = 0; q < np && o < (int)sizeof m - 96; q++) {
+            if (p[q].cs) o += snprintf(m + o, sizeof m - (size_t)o, " [计算 %016llx ×%u 末段 %llu]", (unsigned long long)p[q].key, p[q].n, (unsigned long long)p[q].seg);
+            else o += snprintf(m + o, sizeof m - (size_t)o, " [绘制 顶点 %016llx 片元 %016llx ×%u 末段 %llu]", (unsigned long long)p[q].key, (unsigned long long)p[q].key2, p[q].n, (unsigned long long)p[q].seg);
+        }
+        if (other && o < (int)sizeof m - 32) o += snprintf(m + o, sizeof m - (size_t)o, " 另 %u 次别的程序", other);
+        if (o < (int)sizeof m - 16) o += snprintf(m + o, sizeof m - (size_t)o, "；源");
+        if (!ns && o < (int)sizeof m - 8) o += snprintf(m + o, sizeof m - (size_t)o, " 无");
+        for (int q = 0; q < ns && o < (int)sizeof m - 24; q++) o += snprintf(m + o, sizeof m - (size_t)o, " #%llu", (unsigned long long)src[q]);
+    }
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m);
+}
 static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence) {
-    // 先用缓存目录：安卓上它在应用私有区，调试包可以用 run-as 取出来；诊断目录在外部存储的应用目录里，新系统上 adb 读不到
-    const char *dir = nvn_plat_dir(NVN_PLAT_DIR_CACHE); if (!dir) dir = nvn_plat_dir(NVN_PLAT_DIR_DIAG);
-    if (!dir) { nvn_plat_log(NVN_PLAT_LOG_WARN, "dump", "没有可写目录，不落盘"); return; }
-    uint64_t list[DUMP_MAX]; int depth[DUMP_MAX], n = 0; list[n] = present_serial; depth[n++] = 0;
+    uint64_t list[DUMP_MAX], par[DUMP_MAX]; int depth[DUMP_MAX], n = 0; list[n] = present_serial; par[n] = 0; depth[n++] = 0;
     // 点名要读的贴图序号（调试开关 nvk_dump_s0 … s5）：不靠往上追，直接读；层号记 9
-    for (int k = 0; k < 6; k++) { char nm[16]; snprintf(nm, sizeof nm, "nvk_dump_s%d", k); int sv = nvn_plat_flag(nm, 0); if (sv > 0) { list[n] = (uint64_t)sv; depth[n++] = 9; } }
+    for (int k = 0; k < 6; k++) { char nm[16]; snprintf(nm, sizeof nm, "nvk_dump_s%d", k); int sv = nvn_plat_flag(nm, 0); if (sv > 0) { list[n] = (uint64_t)sv; par[n] = 0; depth[n++] = 9; } }
     uint32_t have = g_hist_n < HIST_N ? g_hist_n : HIST_N;
     for (int i = 0; i < n && n < DUMP_MAX; i++) {
         if (depth[i] >= 6) continue;
         for (uint32_t h = 0; h < have && n < DUMP_MAX; h++) { if (g_hist[h].target != list[i]) continue;
             for (int k = 0; k < HIST_TEX && n < DUMP_MAX; k++) { uint64_t s = g_hist[h].tex[k]; if (!s) continue;
                 int seen = 0; for (int q = 0; q < n; q++) if (list[q] == s) seen = 1;
-                if (!seen) { list[n] = s; depth[n++] = depth[i] + 1; } } }
+                if (!seen) { list[n] = s; par[n] = list[i]; depth[n++] = depth[i] + 1; } } }
     }
+    for (int i = 0; i < n; i++) hist_producers(frame, list[i], depth[i], par[i]);
+    // 先用缓存目录：安卓上它在应用私有区，调试包可以用 run-as 取出来；诊断目录在外部存储的应用目录里，新系统上 adb 读不到
+    const char *dir = nvn_plat_dir(NVN_PLAT_DIR_CACHE); if (!dir) dir = nvn_plat_dir(NVN_PLAT_DIR_DIAG);
+    if (!dir) { nvn_plat_log(NVN_PLAT_LOG_WARN, "dump", "没有可写目录，不落盘"); return; }
     for (int i = 0; i < n; i++) {
         nvn_gpu_tex g = rp_tex_backend_by_serial(list[i]); if (!g) continue;
         nvn_gpu_tex_info ti; nvn_gpu_tex_info_get(g, &ti);
@@ -1598,6 +1628,13 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (bar) nvn_gpu_barrier(c, bar);
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     watch_note(pg, dp);
+    // 转储用的历史：计算写的每张图像各记一条，源 = 采样的贴图与只读图像（自动曝光一类 1x1 目标多由计算写，不记就追不到上游）
+    { uint64_t src[HIST_TEX]; int ns = 0;
+      for (uint32_t i = 0; i < pg->nent[0] && ns < HIST_TEX; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
+          if (e->src_kind == NVN_RB_IMG && images[i] && !(e->access & NVN_GPU_ACC_W)) src[ns++] = images[i]->serial;
+          else if (e->src_kind == NVN_RB_TEX) { uint64_t h = e->src_reg >= 32 && e->src_reg < 40 ? rp_S.img[5][e->src_reg - 32] : rp_S.tex[5][e->src_reg];
+              tex_t snap; view_t sv; int hv; if (rp_tex_snap_by_id(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, &snap, &sv, &hv)) src[ns++] = snap.serial; } }
+      for (uint32_t i = 0; i < pg->nent[0]; i++) if (images[i] && (pg->ent[0][i].access & NVN_GPU_ACC_W)) hist_note(images[i]->serial, src, ns, key_of(5), 0, 1); }
     { struct lost_ent *le = lost_next();
       if (le) { le->kind = 1; le->key = key_of(5); le->ind = dp->ind != 0; le->n[0] = g_disp_dim[0]; le->n[1] = g_disp_dim[1]; le->n[2] = g_disp_dim[2];
         for (uint32_t i = 0; i < pg->nent[0] && le->nst < 4; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
