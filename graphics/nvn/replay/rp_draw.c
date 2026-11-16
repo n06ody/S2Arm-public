@@ -604,6 +604,7 @@ void rp_lost_ring_dump(const char *why) {
 //    另有「最近 32 次」：每键一个环（覆盖旧的），平时只写内存，设备丢失时随归因环一起倒出（派发行 + 当时读回的可写存储摘要）。
 struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth; struct { uint64_t addr; uint32_t len; } st[6]; char hdr[400]; };
 static struct watch_ent g_watch[8 * WATCH_PER_KEY]; static uint32_t g_watch_n, g_watch_cnt[8];
+static uint32_t g_watch_arm;   // 随转储模式：哪些键等着打下一次派发（上屏线程登记转储时置满，提交线程逐键取走）
 static struct watch_ent g_wring[8][WATCH_PER_KEY]; static uint32_t g_wring_n[8];
 static void watch_sum(const struct watch_ent *w, const char *tag, uint64_t now, int pend) {
     for (uint32_t k = 0; k < w->nst; k++) {
@@ -656,6 +657,16 @@ static void watch_note(const struct rp_prog *pg, const p_dispatch *dp) {
                 else o += snprintf(m + o, msz - (size_t)o, " 贴图槽%u→贴图%d（未登记）", (unsigned)e->src_reg, id);
             }
         }
+    }
+    if (nvn_plat_flag("nvk_cs_watch_on_dump", 0) == 1) {   // 随转储：每次 nvk_dump 读回登记后，每键只打下一次派发；不受前 32 次的限额，野外也有样本
+        uint32_t bit = 1u << slot;
+        if (!(__atomic_fetch_and(&g_watch_arm, ~bit, __ATOMIC_ACQ_REL) & bit)) return;
+        uint32_t at = g_watch_n;
+        if (at >= 8 * WATCH_PER_KEY) { for (at = 0; at < g_watch_n && !g_watch[at].done; at++) {} }   // 表满：复用已读完的项
+        if (at >= 8 * WATCH_PER_KEY) return;
+        if (at == g_watch_n) g_watch_n++;
+        g_watch[at] = *w; nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+        return;
     }
     if (g_watch_cnt[slot] < WATCH_PER_KEY && g_watch_n < 8 * WATCH_PER_KEY) {   // 前 32 次：当场打一行，结果由上屏轮询读
         g_watch_cnt[slot]++; g_watch[g_watch_n++] = *w; nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
@@ -1453,7 +1464,7 @@ static void dump_done(void *user, const nvn_gpu_done *d) {
 }
 // 上屏线程只登记「要读回」；真正的读回在提交线程上、一次提交收尾时做（时间线的值只有提交线程能发）
 static uint64_t g_dump_serial, g_dump_frame;
-void rp_debug_dump_request(uint64_t present_serial, uint64_t frame) { __atomic_store_n(&g_dump_frame, frame, __ATOMIC_RELEASE); __atomic_store_n(&g_dump_serial, present_serial, __ATOMIC_RELEASE); }
+void rp_debug_dump_request(uint64_t present_serial, uint64_t frame) { __atomic_store_n(&g_watch_arm, 0xffu, __ATOMIC_RELEASE); __atomic_store_n(&g_dump_frame, frame, __ATOMIC_RELEASE); __atomic_store_n(&g_dump_serial, present_serial, __ATOMIC_RELEASE); }
 static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence);
 void rp_debug_dump_poll(uint64_t *fence) {
     uint64_t s = __atomic_exchange_n(&g_dump_serial, 0, __ATOMIC_ACQ_REL);
@@ -1653,7 +1664,7 @@ done:
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
-    g_lost_on = -1; g_lost_dumped = 0; g_lost_n = 0; g_watch_n = 0; memset(g_watch_cnt, 0, sizeof g_watch_cnt); memset(g_wring_n, 0, sizeof g_wring_n);
+    g_lost_on = -1; g_lost_dumped = 0; g_lost_n = 0; g_watch_n = 0; __atomic_store_n(&g_watch_arm, 0, __ATOMIC_RELEASE); memset(g_watch_cnt, 0, sizeof g_watch_cnt); memset(g_wring_n, 0, sizeof g_wring_n);
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }

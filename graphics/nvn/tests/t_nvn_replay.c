@@ -33,6 +33,7 @@ static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产�
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
 static int g_flag_cs_watch0;    // 用例设：开关 nvk_cs_watch0（诊断：按程序键前 28 位盯计算派发）
 static int g_flag_cs_watch1;    // 同上，第 1 号开关（每键各自计额度）
+static int g_flag_cs_watch_on_dump;   // 调试开关 nvk_cs_watch_on_dump：盯计算只在每次转储登记后打下一次派发
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
@@ -42,6 +43,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_skip_cs0")) return g_flag_skip_cs0;
     if (!strcmp(name, "nvk_cs_watch0")) return g_flag_cs_watch0;
     if (!strcmp(name, "nvk_cs_watch1")) return g_flag_cs_watch1;
+    if (!strcmp(name, "nvk_cs_watch_on_dump")) return g_flag_cs_watch_on_dump;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -3143,6 +3145,25 @@ static void t_lost_ring_skip(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
+// 盯计算随转储：转储登记之前不打；登记后每键只打下一次；不受前 32 次限额（野外的派发也能盯到）
+static void t_watch_on_dump(void) {
+    pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0; rp_draw_reset();
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+    static const uint8_t key[8] = {0x37, 0x72, 0x7c, 0x65, 0xc9, 0x44, 0x02, 0x44}; memcpy(rp_S.skey[5], key, 8);
+    p_dispatch dp = {.x = 1, .y = 1, .z = 1};
+    g_flag_cs_watch0 = 0x37727c6; g_flag_cs_watch_on_dump = 1;
+    nvn_be_sub_begin();
+    int w0 = g_info_watch; rp_dispatch(&g_fake_cmd, &dp, NULL); int before = g_info_watch - w0;
+    int c0 = g_info_chain; int got = 0, extra = 0;
+    for (int i = 0; i < 40; i++) {
+        rp_debug_dump_request(1, 100); w0 = g_info_watch; rp_dispatch(&g_fake_cmd, &dp, NULL); got += g_info_watch - w0;
+        w0 = g_info_watch; rp_dispatch(&g_fake_cmd, &dp, NULL); extra += g_info_watch - w0; }
+    CHECK(before == 0); CHECK(got == 40); CHECK(extra == 0);
+    { uint64_t fence = 0; rp_debug_dump_poll(&fence); } g_info_chain = c0;
+    g_flag_cs_watch0 = 0; g_flag_cs_watch_on_dump = 0;
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); pass_fresh();
+}
+
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
@@ -3943,6 +3964,7 @@ int main(int argc, char **argv) {
     t_dispatch_indirect_gpu();
     t_dispatch_spill();
     t_lost_ring_skip();
+    t_watch_on_dump();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
