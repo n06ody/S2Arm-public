@@ -25,7 +25,8 @@ namespace S2A.DirectCompiler
             OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32, OpConstant = 43, OpFunction = 54,
             OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65, OpInBoundsAccessChain = 66,
             OpDecorate = 71, OpMemberDecorate = 72, OpCompositeExtract = 81, OpIAdd = 128, OpIMul = 132,
-            OpControlBarrier = 224, OpMemoryBarrier = 225;
+            OpControlBarrier = 224, OpMemoryBarrier = 225, OpTypeBool = 20, OpULessThan = 176, OpSelect = 169,
+            OpFunctionEnd = 56, OpLabel = 248, OpLine = 8, OpNoLine = 317;
         private const uint ScWorkgroup = 4, ScUniform = 2, ScInput = 1;
         private const uint DecBufferBlock = 3, DecArrayStride = 6, DecBuiltIn = 11, DecBinding = 33, DecSet = 34, DecOffset = 35;
         private const uint BuiltInNumWorkgroups = 24, BuiltInWorkgroupId = 26;
@@ -142,7 +143,9 @@ namespace S2A.DirectCompiler
                 return v;
             }
             uint vGid = Builtin(BuiltInWorkgroupId), vNum = Builtin(BuiltInNumWorkgroups);
-            uint tRa = NewId(), tSt = NewId(), tPSt = NewId(), tPU = NewId(), vSb = NewId(), cZero = NewId(), cLen = NewId();
+            uint tRa = NewId(), tSt = NewId(), tPSt = NewId(), tPU = NewId(), vSb = NewId(), cZero = NewId(), cLen = NewId(), cLast = NewId();
+            uint tBool = m.FindType(w => (w[0] & 0xFFFF) == OpTypeBool && w.Length == 2);
+            if (tBool == 0) { tBool = NewId(); globals.Add(Inst(OpTypeBool, tBool)); }
             globals.Add(Inst(OpTypeRuntimeArray, tRa, tUint));
             globals.Add(Inst(OpTypeStruct, tSt, tRa));
             globals.Add(Inst(OpTypePointer, tPSt, ScUniform, tSt));
@@ -150,6 +153,7 @@ namespace S2A.DirectCompiler
             globals.Add(Inst(OpVariable, tPSt, vSb, ScUniform));
             globals.Add(Inst(OpConstant, tUint, cZero, 0));
             globals.Add(Inst(OpConstant, tUint, cLen, length));
+            globals.Add(Inst(OpConstant, tUint, cLast, length - 1));
             decorations.Add(Inst(OpDecorate, tRa, DecArrayStride, 4));
             decorations.Add(Inst(OpDecorate, tSt, DecBufferBlock));
             decorations.Add(Inst(OpMemberDecorate, tSt, 0, DecOffset, 0));
@@ -175,6 +179,23 @@ namespace S2A.DirectCompiler
                 if (op == OpFunction && firstFunction < 0) firstFunction = k;
             }
             if (firstFunction < 0) throw Unsupported("module has no function");
+            // 本组片的基址（扁平组号 × 片长）在每个用到它的函数入口块算一次：函数入口块支配整个函数，
+            //   每处访问只剩「夹界 + 加基址」，代码量不随访问次数成倍涨（每处重算会让访问上千处的核超出结果大小上限）。
+            var baseAfter = new Dictionary<int, uint>();   // 指令下标 → 在它之后插入基址计算、基址 id
+            var baseOf = new Dictionary<int, uint>();      // 访问链指令下标 → 所在函数的基址 id
+            for (int k = 0, fn = -1, label = -1; k < m.Insts.Count; k++)
+            {
+                uint op = m.Insts[k][0] & 0xFFFF;
+                if (op == OpFunction) { fn = k; label = -1; }
+                else if (op == OpLabel && fn >= 0 && label < 0) label = k;
+                else if (op == OpFunctionEnd) fn = -1;
+                if (fn < 0 || !((op == OpAccessChain || op == OpInBoundsAccessChain) && m.Insts[k].Length == 5 && m.Insts[k][3] == spill.Id)) continue;
+                if (label < 0) throw Unsupported("access chain outside a block");
+                int at = label;
+                while (at + 1 < m.Insts.Count && (m.Insts[at + 1][0] & 0xFFFF) is OpVariable or OpLine or OpNoLine) at++;
+                if (!baseAfter.TryGetValue(at, out uint b)) { b = NewId(); baseAfter[at] = b; }
+                baseOf[k] = b;
+            }
             for (int k = 0; k < m.Insts.Count; k++)
             {
                 uint[] w = m.Insts[k]; uint op = w[0] & 0xFFFF;
@@ -190,16 +211,13 @@ namespace S2A.DirectCompiler
                 }
                 if ((op == OpAccessChain || op == OpInBoundsAccessChain) && w.Length == 5 && w[3] == spill.Id)
                 {
-                    // 扁平组号 = x + nx·(y + ny·z)；新下标 = 组号·片长 + 原下标（OpIAdd 允许两边符号性不同）
-                    uint g = NewId(), n = NewId(), gx = NewId(), gy = NewId(), gz = NewId(), nx = NewId(), ny = NewId();
-                    uint t1 = NewId(), t2 = NewId(), t3 = NewId(), flat = NewId(), baseIdx = NewId(), idx = NewId();
-                    output.Add(Inst(OpLoad, tV3, g, vGid)); output.Add(Inst(OpLoad, tV3, n, vNum));
-                    output.Add(Inst(OpCompositeExtract, tUint, gx, g, 0)); output.Add(Inst(OpCompositeExtract, tUint, gy, g, 1));
-                    output.Add(Inst(OpCompositeExtract, tUint, gz, g, 2)); output.Add(Inst(OpCompositeExtract, tUint, nx, n, 0));
-                    output.Add(Inst(OpCompositeExtract, tUint, ny, n, 1));
-                    output.Add(Inst(OpIMul, tUint, t1, ny, gz)); output.Add(Inst(OpIAdd, tUint, t2, gy, t1));
-                    output.Add(Inst(OpIMul, tUint, t3, nx, t2)); output.Add(Inst(OpIAdd, tUint, flat, gx, t3));
-                    output.Add(Inst(OpIMul, tUint, baseIdx, flat, cLen)); output.Add(Inst(OpIAdd, tUint, idx, baseIdx, w[4]));
+                    // 新下标 = 本组基址 + min(原下标, 片长 − 1)：越过声明长度的下标（在 Workgroup 里是未定义、通常无害）
+                    //   不许写出本组的片——没开 robustBufferAccess 的设备上写出缓冲尾可能是 GPU 故障。OpIAdd 允许两边符号性不同。
+                    uint u = NewId(), lt = NewId(), clamped = NewId(), idx = NewId();
+                    output.Add(Inst(OpIAdd, tUint, u, cZero, w[4]));
+                    output.Add(Inst(OpULessThan, tBool, lt, u, cLen));
+                    output.Add(Inst(OpSelect, tUint, clamped, lt, u, cLast));
+                    output.Add(Inst(OpIAdd, tUint, idx, baseOf[k], clamped));
                     output.Add(Inst(OpAccessChain, tPU, w[2], vSb, cZero, idx));
                     continue;
                 }
@@ -212,6 +230,19 @@ namespace S2A.DirectCompiler
                     if (op == 230 || op == 231) w[p + 3] = Widen(w[p + 3]);   // 比较交换：不等时的语义
                 }
                 output.Add(w);
+                if (baseAfter.TryGetValue(k, out uint baseId))
+                {
+                    // 扁平组号 = x + nx·(y + ny·z)；基址 = 组号 × 片长
+                    uint g = NewId(), n = NewId(), gx = NewId(), gy = NewId(), gz = NewId(), nx = NewId(), ny = NewId();
+                    uint t1 = NewId(), t2 = NewId(), t3 = NewId(), flat = NewId();
+                    output.Add(Inst(OpLoad, tV3, g, vGid)); output.Add(Inst(OpLoad, tV3, n, vNum));
+                    output.Add(Inst(OpCompositeExtract, tUint, gx, g, 0)); output.Add(Inst(OpCompositeExtract, tUint, gy, g, 1));
+                    output.Add(Inst(OpCompositeExtract, tUint, gz, g, 2)); output.Add(Inst(OpCompositeExtract, tUint, nx, n, 0));
+                    output.Add(Inst(OpCompositeExtract, tUint, ny, n, 1));
+                    output.Add(Inst(OpIMul, tUint, t1, ny, gz)); output.Add(Inst(OpIAdd, tUint, t2, gy, t1));
+                    output.Add(Inst(OpIMul, tUint, t3, nx, t2)); output.Add(Inst(OpIAdd, tUint, flat, gx, t3));
+                    output.Add(Inst(OpIMul, tUint, baseId, flat, cLen));
+                }
                 if (k == lastAnnotation && !decorationsPlaced) { output.AddRange(decorations); decorationsPlaced = true; }
             }
             if (!decorationsPlaced) throw Unsupported("module has no annotation section");
