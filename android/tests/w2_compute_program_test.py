@@ -94,7 +94,8 @@ class ComputeProgram(unittest.TestCase):
             obj=fixture();obj['content']['bindings'][1]={'stage':'cs','kind':'texture','set':2,'binding':3,'slot':8,'count':1};change(obj['content']);cases.append((label,obj,1))
         texgood('texture_binding')
         texbad('texture_odd_handle',lambda c:c['bindings'][1].update(slot=9))
-        texbad('texture_handle_out_of_range',lambda c:c['bindings'][1].update(slot=72))
+        texbad('texture_handle_out_of_range',lambda c:c['bindings'][1].update(slot=88))   # 72..86 是 c2 图像表的字（贴图槽 32 + k，见下）；88 在图像表之后、分离贴图表之前
+        obj=fixture();obj['content']['bindings'][1]={'stage':'cs','kind':'texture','set':2,'binding':3,'slot':72,'count':1};cases.append(('texture_image_table_word',obj,0))
         texbad('texture_missing_slot',lambda c:c['bindings'][1].pop('slot'))
         texbad('texture_with_storage_fields',lambda c:c['bindings'][1].update(nvnSlot=7))
         obj=fixture();obj['content']['bindings'][1]={'stage':'cs','kind':'image','set':3,'binding':0,'slot':88,'count':1};cases.append(('image_slot_out_of_range',obj,1))   # 72..86 偶数是 c2 图像槽（已接），88 越界照拒
