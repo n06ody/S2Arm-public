@@ -538,7 +538,9 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
     memset(out, 0, sizeof *out);
     s2a_json_object *syntax = malloc(sizeof *syntax);
     if (!syntax) return fail(why, why_size, "compute JSON allocation failed");
-    int rc = s2a_json_parse_object(bytes, length, syntax, why, why_size);
+    // 计算结果是「程序」级文档：大核（空轨 2nd 运行时那支约 9800 条指令的计算核）的 SPIR-V base64 加依赖列表超过 1 MiB 是正常体量。
+    //   上限取跨局程序缓存单条上限（program_cache.c PCACHE_MAX_PAYLOAD 64 MiB）：缓存装得下的结果就要解析得了。图形结果解析本来就不走这道校验。
+    int rc = s2a_json_parse_object_max(bytes, length, NVK_PROGRAM_RESULT_MAX_BYTES, syntax, why, why_size);
     free(syntax);
     if (rc) return -1;
     struct s2a_jv top = {(const char *)bytes, length}, content, stages, st, spirv, bindings, support;
