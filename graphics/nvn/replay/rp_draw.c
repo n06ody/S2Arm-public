@@ -362,7 +362,8 @@ static struct { nvn_gpu_cmd c; uint64_t seg, gen, reg_gen; const struct rp_prog 
 // 同一段里内容相同就复用同一片 slice，省掉每笔每阶段的 memset + 拷贝。段号（rp_seg_serial）进键：段内暂存随段回收，跨段不能复用。
 // 键仍按内容整份存下来逐字节比（碰撞不会错内容）；上面那层 64 位摘要只是先筛一遍，省掉线性扫多格时的大块比较。
 typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st, base_instance; uint64_t sb[16][2], ub[16][2]; uint32_t dim[3]; uint8_t has_ub; } drv0_key;
-typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st; uint64_t h[32]; } drv2_key;
+// 驱动句柄表 c2 的全部来源（同 iOS nvn_mtl.m DRV2 的四张表）：组合槽 0..40、图像槽 0..7、分离贴图槽 0..127、分离采样器槽 0..127
+typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st; uint64_t h[41], img[8], sep[128], samp[128]; } drv2_key;
 // 表按 64 格两路探测；键里再放一个按字段算的 64 位摘要，先比摘要再比整键。
 // 真机上每帧 2292 次 DRV0 查询，原先线性扫 8 格 × 552 字节整键比较 ≈ 4.4 KB/次（一帧 10 MB 比较）。
 enum { DRV_CACHE_N = 64, DRV_CACHE_WAYS = 2 };
@@ -378,7 +379,9 @@ static uint64_t drv0_hash(const drv0_key *k) {   // 按字段算（不整块读�
 static uint64_t drv2_hash(const drv2_key *k) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)k->c;
     h = drv_mix(h, k->seg); h = drv_mix(h, k->st);
-    for (int r = 0; r < 32; r++) h = drv_mix(h, k->h[r]);
+    for (int r = 0; r < 41; r++) h = drv_mix(h, k->h[r]);
+    for (int r = 0; r < 8; r++) h = drv_mix(h, k->img[r]);
+    for (int r = 0; r < 128; r++) { h = drv_mix(h, k->sep[r]); h = drv_mix(h, k->samp[r]); }
     return h;
 }
 static struct { drv0_key k; uint64_t h; uint8_t ok; nvn_gpu_slice sl; } g_drv0c[DRV_CACHE_N]; static int g_drv0c_next;
@@ -639,16 +642,26 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 }
                 if (cacheable && flag_read("nvk_drv_memo")) drv0_store(&k, &sl);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV0_BYTES; if (btm) g_bt[3] += dt_now() - drv0_t0; break; }
-            case NVN_RB_DRV2: {   // 驱动的贴图句柄表：贴图槽 s 的句柄（贴图号 | 采样器号 << 20）在第 4 + s 个 8 字节项
-                enum { DRV2_BYTES = (RP_HANDLE_TABLE_FIRST_SLOT + 32) * 8 };
+            case NVN_RB_DRV2: {   // 着色器把驱动句柄表 c2 当常量缓冲读：按完整驱动表填（同 iOS nvn_mtl.m DRV2，C2_TEX / C2_IMG / C2_SEPTEX / C2_SAMP）
+                //   每项 8 字节、句柄在低 4 字节：组合槽 r 在 0x20 + 8r（r ≥ 32 与图像表同址，只在绑了该组合槽、且同址的图像槽没绑时写，同 iOS「Hades II」那条）；
+                //   图像槽 r 在 0x120 + 8r；分离贴图槽 r 在 0x168 + 8r；分离采样器槽 r 在 0x568 + 8r（采样器号 << 20）。整段 0xA00，其余为 0
+                enum { DRV2_BYTES = 0xA00, C2_TEX = 0x20, C2_IMG = 0x120, C2_SEPTEX = 0x168, C2_SAMP = 0x568 };
                 drv2_key k; memset(&k, 0, sizeof k); k.c = c; k.seg = rp_seg_serial(); k.st = (uint32_t)st;
-                for (int s = 0; s < 32; s++) k.h[s] = rp_S.tex[st][s];
+                for (int r = 0; r < 41; r++) k.h[r] = rp_S.tex[st][r];
+                for (int r = 0; r < 8; r++) k.img[r] = rp_S.img[st][r];
+                for (int r = 0; r < 128; r++) { k.sep[r] = rp_S.tex[st][128 + r]; k.samp[r] = rp_S.samp[st][r]; }
                 if (flag_read("nvk_drv_memo") && drv2_lookup(&k, &sl)) {
                     rp_perf_add(RP_PERF_BIND_SLICE_HIT, 1);
                     o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV2_BYTES; break;
                 }
                 if (!alloc_copy(c, DRV2_BYTES, NULL, &sl)) return skip("arena_alloc_failed", rec);
-                for (int s = 0; s < 32; s++) { uint64_t h = rp_S.tex[st][s]; memcpy(sl.cpu + (RP_HANDLE_TABLE_FIRST_SLOT + s) * 8, &h, 8); }
+                for (int r = 0; r < 8; r++) { uint32_t v = (uint32_t)k.img[r]; memcpy(sl.cpu + C2_IMG + 8 * r, &v, 4); }
+                for (int r = 0; r < 41; r++) {
+                    if (r >= 32 && (!k.h[r] || (r - 32 < 8 && k.img[r - 32]))) continue;
+                    uint32_t v = (uint32_t)k.h[r]; memcpy(sl.cpu + C2_TEX + 8 * r, &v, 4);
+                }
+                for (int r = 0; r < 128; r++) { uint32_t v = (uint32_t)k.sep[r]; memcpy(sl.cpu + C2_SEPTEX + 8 * r, &v, 4); }
+                for (int r = 0; r < 128; r++) { uint32_t v = (uint32_t)k.samp[r]; memcpy(sl.cpu + C2_SAMP + 8 * r, &v, 4); }
                 if (flag_read("nvk_drv_memo")) drv2_store(&k, &sl);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV2_BYTES; break; }
             case NVN_RB_C1: {
