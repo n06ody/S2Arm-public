@@ -2967,6 +2967,38 @@ static void t_compute_sources(void) {
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem);
 }
 
+// 共享内存溢出缓冲（NVN_RB_SPILL，同 iOS SpillFix）：每次派发按真正的组数 × 每组字节从暂存区分一片绑上。
+//   直接派发 4×2×1 组 × 1024 = 8192 字节；间接派发读游戏内存里的组数 3×1×2 → 6144 字节；
+//   间接参数还有待落地的 GPU 写：读不到实值，报名跳过、不派发（不猜上限）；超过 512 MiB 报名跳过。
+static void t_dispatch_spill(void) {
+    pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.spill_bytes = 1024;
+    g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_SSBO; g_cprog.ent[0][0].src_kind = NVN_RB_SPILL; g_cprog.ent[0][0].access = NVN_GPU_ACC_RW;
+    g_cprog.ent[0][0].src_reg2 = UINT16_MAX;
+    static uint8_t mirror[sizeof g_pmem]; memset(mirror, 0, sizeof mirror); memset(g_pmem, 0, sizeof g_pmem); g_buf_cpu_fake = mirror;
+    nvn_be_sub_begin();
+    int n = g_ndisp;
+    p_dispatch dp = {0}; dp.x = 4; dp.y = 2; dp.z = 1;
+    rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 1 && g_ncb == 1 && g_cb[0].cls == NVN_GPU_RES_SSBO && g_cb[0].u.b.buf == &g_arena_buf && g_cb[0].u.b.len == 8 * 1024);
+    uint32_t args[3] = {3, 1, 2}; memcpy(g_pmem + 64, args, sizeof args);
+    dp = (p_dispatch){.ind = base + 64};
+    rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 2 && g_ncb == 1 && g_cb[0].u.b.len == 6 * 1024);
+    nvn_gpu_buf ab; uint64_t ao; CHECK(rp_buf_resolve(&g_fake_cmd, base + 128, 12, &ab, &ao)); CHECK(rp_post_gpu_write(base + 128, 12));
+    memcpy(g_pmem + 128, args, sizeof args);   // 游戏内存里有个看起来合法的旧值：也不许拿来用
+    uint64_t gw0 = nvn_unimpl_count("draw", "compute_spill_indirect_gpu_written");
+    dp = (p_dispatch){.ind = base + 128};
+    rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 2 && nvn_unimpl_count("draw", "compute_spill_indirect_gpu_written") == gw0 + 1);
+    uint64_t big0 = nvn_unimpl_count("draw", "compute_spill_too_large");
+    dp = (p_dispatch){0}; dp.x = 1 << 20; dp.y = 1; dp.z = 1;   // 2^20 组 × 1024 = 1 GiB
+    rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 2 && nvn_unimpl_count("draw", "compute_spill_too_large") == big0 + 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
+}
+
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
@@ -3756,6 +3788,7 @@ int main(int argc, char **argv) {
     t_dispatch();
     t_dispatch_barrier();
     t_dispatch_indirect_gpu();
+    t_dispatch_spill();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
