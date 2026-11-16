@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -4693,6 +4694,193 @@ static void c976b_border_color(const char *dir) {
     }
 }
 
+// C976r：min / max 归约（#976）。2x1 R32F 纹素 {0.25, 0.75}，线性过滤、夹到边，在两纹素中心的中点 u = 0.5 采样：
+// 两个纹素权重各一半。期望：平均 0.5、min 0.25、max 0.75。修前后端不读 reduction，三种都读到 0.5。
+static void c976r_reduction(const char *dir) {
+    printf("C976r 归约：设备 sampler_filter_minmax=%d image_mapping=%d\n", g_dev.sampler_minmax_enabled, g_dev.minmax_image_mapping);
+    static const float texels[2] = {0.25f, 0.75f};
+    static const float uv[1][2] = {{0.5f, 0.5f}};
+    static const struct { uint32_t red; const char *name; float want; } k[3] = {
+        {NVN_SAMPLER_REDUCTION_AVERAGE, "平均", 0.5f}, {NVN_SAMPLER_REDUCTION_MIN, "min", 0.25f}, {NVN_SAMPLER_REDUCTION_MAX, "max", 0.75f}};
+    nvn_gpu_err e;
+    nvn_gpu_tex t = make_tex(2, 1, NVN_FORMAT_R32F, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_tex_upload(c, t, 0, 0, NULL, texels, 8, 8);
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r) && OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C976r 上传：%s", e.why);
+    for (int i = 0; i < 3; i++) {
+        samp_par sp; memset(&sp, 0, sizeof sp);
+        sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR;
+        sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE; sp.reduction = k[i].red;
+        nvn_gpu_samp samp = NULL; memset(&e, 0, sizeof e);
+        if (i) {   // 没有扩展（模拟档 no_minmax；有扩展时本用例把启用位清零再问一次）：min / max 必须具名 UNSUPPORTED，不能静默退回平均
+            const int had = g_dev.sampler_minmax_enabled;
+            char want[48]; snprintf(want, sizeof want, "sampler_reduction_%s：", k[i].name);
+            g_dev.sampler_minmax_enabled = 0;
+            r = nvn_gpu_samp_create(&sp, &samp, &e);
+            g_dev.sampler_minmax_enabled = had;
+            CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !samp && !strncmp(e.why, want, strlen(want)),
+                  "C976r 没有扩展：%s 期望 UNSUPPORTED「%s…」→ rc=%d why=%s", k[i].name, want, r.code, e.why);
+            printf("C976r 没有扩展：%s 归约建采样器 rc=%d（%s）\n", k[i].name, r.code, e.why);
+            if (samp) { nvn_gpu_samp_release(samp); samp = NULL; }
+            if (!had) continue;
+            // mapping=0 时 Vulkan 未定义 R 以外的分量；没有用量信息，不得交出采样器。
+            const int mapping = g_dev.minmax_image_mapping;
+            g_dev.minmax_image_mapping = 0;
+            memset(&e, 0, sizeof e);
+            r = nvn_gpu_samp_create(&sp, &samp, &e);
+            g_dev.minmax_image_mapping = mapping;
+            CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !samp && strstr(e.why, "filterMinmaxImageComponentMapping"),
+                  "C976r %s 缺多分量映射：期望具名 UNSUPPORTED → rc=%d why=%s", k[i].name, r.code, e.why);
+            if (samp) { nvn_gpu_samp_release(samp); samp = NULL; }
+            if (!mapping) continue;
+            memset(&e, 0, sizeof e);
+        }
+        r = nvn_gpu_samp_create(&sp, &samp, &e);
+        CHECK(OK(r) && samp, "C976r %s 建采样器：%d %s", k[i].name, r.code, e.why);
+        if (!samp) continue;
+        float got[1][4] = {{-1, -1, -1, -1}};
+        if (samp_at(dir, t, samp, uv, 1, got, (uint64_t)(2 + i))) {
+            CHECK(got[0][0] > k[i].want - 1e-3f && got[0][0] < k[i].want + 1e-3f, "C976r %s：中点线性采样 期望 %.2f → 读到 %g", k[i].name, k[i].want, got[0][0]);
+            printf("C976r 归约 %s：期望 %.2f → 读到 %g\n", k[i].name, k[i].want, got[0][0]);
+        }
+        nvn_gpu_samp_release(samp);
+    }
+    nvn_gpu_tex_release(t);
+    // 即使本机没有支持归约的四分量格式，也可让校验层检查两个扩展结构同时建采样器。
+    if (g_dev.sampler_minmax_enabled && g_dev.minmax_image_mapping && g_dev.custom_border_enabled &&
+        g_dev.custom_border_without_format && g_dev.custom_border_max >= 2) {
+        samp_par both = {0}; both.minf = NVN_MIN_FILTER_LINEAR; both.magf = NVN_MAG_FILTER_LINEAR;
+        both.ws = NVN_WRAP_MODE_CLAMP_TO_BORDER; both.wt = both.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE;
+        both.reduction = NVN_SAMPLER_REDUCTION_MIN;
+        both.border[0] = 0.2f; both.border[1] = 0.4f; both.border[2] = 0.6f; both.border[3] = 0.8f;
+        nvn_gpu_samp sampler = NULL; memset(&e, 0, sizeof e);
+        r = nvn_gpu_samp_create(&both, &sampler, &e);
+        CHECK(OK(r) && sampler, "C976r 双扩展采样器：期望建成 → rc=%d why=%s", r.code, e.why);
+        printf("C976r 双扩展采样器：rc=%d\n", r.code);
+        if (sampler) nvn_gpu_samp_release(sampler);
+    }
+    // 两个扩展同时使用：浮点采样器必须同时携带自定义边框和 min 归约；整数采样器保留自定义边框。
+    VkFormatProperties fp = {0}; vkGetPhysicalDeviceFormatProperties(g_dev.physical, VK_FORMAT_R32G32B32A32_SFLOAT, &fp);
+    if (g_dev.sampler_minmax_enabled && g_dev.minmax_image_mapping && g_dev.custom_border_enabled &&
+        g_dev.custom_border_without_format && g_dev.custom_border_max >= 2 &&
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT)) {
+        const float pixels[2][4] = {{0.25f, 0.25f, 0.25f, 0.25f}, {0.75f, 0.75f, 0.75f, 0.75f}};
+        const float coords[2][2] = {{-0.5f, 0.5f}, {0.5f, 0.5f}};
+        const float border[4] = {0.2f, 0.4f, 0.6f, 0.8f};
+        samp_par sp; memset(&sp, 0, sizeof sp);
+        sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR;
+        sp.ws = NVN_WRAP_MODE_CLAMP_TO_BORDER; sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE;
+        sp.reduction = NVN_SAMPLER_REDUCTION_MIN; memcpy(sp.border, border, sizeof border);
+        nvn_gpu_samp samp = NULL; memset(&e, 0, sizeof e);
+        r = nvn_gpu_samp_create(&sp, &samp, &e);
+        CHECK(OK(r) && samp, "C976r 自定义边框 + min：建采样器 %d %s", r.code, e.why);
+        nvn_gpu_tex ct = make_tex(2, 1, NVN_FORMAT_RGBA32F, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+        c = begin_cmd(); nvn_gpu_tex_upload(c, ct, 0, 0, NULL, pixels, 32, 32);
+        r = nvn_gpu_cmd_commit(c, 5, on_done, NULL, &e);
+        CHECK(OK(r) && OK(nvn_gpu_fence_wait(5, 5000000000ull, &e)), "C976r 组合上传：%s", e.why);
+        float got[2][4] = {{0}};
+        if (samp && samp_at(dir, ct, samp, coords, 2, got, 6)) {
+            for (int j = 0; j < 4; j++) {
+                CHECK(fabsf(got[0][j] - border[j]) < 1e-3f, "C976r 边框 + min：边框分量 %d 期望 %g → %g", j, border[j], got[0][j]);
+                CHECK(fabsf(got[1][j] - 0.25f) < 1e-3f, "C976r 边框 + min：中点分量 %d 期望 0.25 → %g", j, got[1][j]);
+            }
+            printf("C976r 边框 + min：边框 R=%g，中点 R=%g\n", got[0][0], got[1][0]);
+        }
+        if (samp) nvn_gpu_samp_release(samp);
+        nvn_gpu_tex_release(ct);
+    } else printf("C976r 边框 + min：设备缺所需能力，组合像素未测\n");
+    // 分离图像 / 采样器没有配对信息，不能绕过格式检查。最后测试失败段，之后结束当前会话。
+    if (g_dev.sampler_minmax_enabled && g_dev.minmax_image_mapping) {
+        nvn_gpu_layout_ent ents[2] = {{0}};
+        ents[0].cls = NVN_GPU_RES_TEX; ents[0].access = NVN_GPU_ACC_R; ents[0].binding = 0; ents[0].count = 2; ents[0].stages = 1u << NVN_GPU_SH_FS;
+        ents[1].cls = NVN_GPU_RES_SAMP; ents[1].access = NVN_GPU_ACC_R; ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_FS;
+        nvn_gpu_layout fl = {0}; fl.ent = ents; fl.nent = 2;
+        nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
+        if (load_shader_pair(dir, "tri3.vert", "arr2.frag", NULL, &fl, &vs, &fs, &vm, &fm)) {
+            nvn_gpu_pipe_desc pd; fill_gpipe_desc(&pd, vs, fs, 0);
+            nvn_gpu_pipe pipe = NULL; memset(&e, 0, sizeof e);
+            r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e);
+            CHECK(OK(r) && pipe, "C976r 分离采样：管线 %d %s", r.code, e.why);
+            samp_par sp = {0}; sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR; sp.reduction = NVN_SAMPLER_REDUCTION_MIN;
+            nvn_gpu_samp samp = NULL; r = nvn_gpu_samp_create(&sp, &samp, &e);
+            CHECK(OK(r) && samp, "C976r 分离采样：建采样器 %d %s", r.code, e.why);
+            nvn_gpu_tex tex = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+            nvn_gpu_view view = make_view(tex);
+            nvn_gpu_tex out = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+            nvn_gpu_view ov = make_view(out);
+            if (pipe && samp && view && ov) {
+                c = begin_cmd(); nvn_gpu_pass_desc pass = {0};
+                pass.ncolor = 1; pass.color[0].view = ov; pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+                pass.w = 2; pass.h = 2; pass.layers = 1;
+                nvn_gpu_pass_begin(c, &pass); nvn_gpu_set_pipe(c, pipe);
+                nvn_gpu_binding bs[3] = {{0}};
+                bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_TEX; bs[0].u.view = view;
+                bs[1].ent = 0; bs[1].elem = 1; bs[1].cls = NVN_GPU_RES_TEX; bs[1].u.view = view;
+                bs[2].ent = 1; bs[2].cls = NVN_GPU_RES_SAMP; bs[2].u.samp = samp;
+                nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 3);
+                nvn_gpu_draw_args da = {0}; da.prim = 4; da.count = 3; da.instances = 1; nvn_gpu_draw(c, &da);
+                nvn_gpu_pass_end(c); memset(&e, 0, sizeof e);
+                r = nvn_gpu_cmd_commit(c, 7, on_done, NULL, &e);
+                CHECK(r.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "sampler_reduction_separate"),
+                      "C976r 分离采样：期望具名 UNSUPPORTED → rc=%d why=%s", r.code, e.why);
+                printf("C976r 分离采样：rc=%d（%s）\n", r.code, e.why);
+            }
+            if (ov) nvn_gpu_view_release(ov);
+            if (out) nvn_gpu_tex_release(out);
+            if (view) nvn_gpu_view_release(view);
+            if (tex) nvn_gpu_tex_release(tex);
+            if (samp) nvn_gpu_samp_release(samp);
+            if (vs) nvn_gpu_shader_release(vs);
+            if (fs) nvn_gpu_shader_release(fs);
+            free(vm); free(fm);
+        } else CHECK(0, "C976r 分离采样：着色器读取失败");
+    }
+}
+
+// C976r 格式负控：RGBA32F 不支持 FILTER_MINMAX 时，在真实的组合描述符路径具名拒绝。
+static void c976r_bad_format(const char *dir) {
+    VkFormatProperties fp = {0}; vkGetPhysicalDeviceFormatProperties(g_dev.physical, VK_FORMAT_R32G32B32A32_SFLOAT, &fp);
+    if (!g_dev.sampler_minmax_enabled || !g_dev.minmax_image_mapping ||
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT)) {
+        printf("C976r 不支持格式负控：设备条件不符，未测\n"); return;
+    }
+    nvn_gpu_err e = {0};
+    samp_par sp = {0}; sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR;
+    sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE; sp.reduction = NVN_SAMPLER_REDUCTION_MIN;
+    nvn_gpu_samp samp = NULL; nvn_gpu_rc r = nvn_gpu_samp_create(&sp, &samp, &e);
+    CHECK(OK(r) && samp, "C976r 格式负控建采样器：%d %s", r.code, e.why);
+    nvn_gpu_tex tex = make_tex(2, 1, NVN_FORMAT_RGBA32F, NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_view view = make_view(tex);
+    const float uv[2] = {0.5f, 0.5f};
+    nvn_gpu_buf in = make_buf(sizeof uv, NVN_GPU_MEM_SHARED, uv), out = make_buf(16, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_layout_ent ents[3] = {{0}};
+    ents[0].cls = NVN_GPU_RES_TEX_SAMP; ents[0].access = NVN_GPU_ACC_R; ents[0].binding = 0; ents[0].count = 1; ents[0].stages = 1u << NVN_GPU_SH_CS;
+    ents[1].cls = NVN_GPU_RES_SSBO; ents[1].access = NVN_GPU_ACC_R; ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_CS;
+    ents[2].cls = NVN_GPU_RES_SSBO; ents[2].access = NVN_GPU_ACC_W; ents[2].binding = 2; ents[2].count = 1; ents[2].stages = 1u << NVN_GPU_SH_CS;
+    nvn_gpu_layout layout = {0}; layout.ent = ents; layout.nent = 3;
+    nvn_gpu_shader sh = NULL; nvn_gpu_pipe pipe = mk_cpipe(dir, "samp_at.comp", &layout, &sh);
+    CHECK(pipe != NULL, "C976r 格式负控管线为空");
+    if (pipe && samp && view && in && out) {
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_set_pipe(c, pipe);
+        nvn_gpu_binding b[3] = {{0}};
+        b[0].ent = 0; b[0].cls = NVN_GPU_RES_TEX_SAMP; b[0].u.ts.view = view; b[0].u.ts.samp = samp;
+        b[1].ent = 1; b[1].cls = NVN_GPU_RES_SSBO; b[1].u.b.buf = in; b[1].u.b.len = sizeof uv;
+        b[2].ent = 2; b[2].cls = NVN_GPU_RES_SSBO; b[2].u.b.buf = out; b[2].u.b.len = 16;
+        nvn_gpu_bind(c, NVN_GPU_SH_CS, b, 3); nvn_gpu_dispatch(c, pipe, 1, 1, 1, NULL, 0);
+        memset(&e, 0, sizeof e); r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        CHECK(r.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "sampler_reduction_view_format"),
+              "C976r 不支持格式：期望具名 UNSUPPORTED → rc=%d why=%s", r.code, e.why);
+        printf("C976r 不支持格式：rc=%d（%s）\n", r.code, e.why);
+    }
+    if (view) nvn_gpu_view_release(view);
+    if (tex) nvn_gpu_tex_release(tex);
+    if (samp) nvn_gpu_samp_release(samp);
+    if (in) nvn_gpu_buf_release(in, NULL, NULL);
+    if (out) nvn_gpu_buf_release(out, NULL, NULL);
+    if (sh) nvn_gpu_shader_release(sh);
+}
+
 // C63：描述符数组元素位。t[2] 绑定 elem0=红、elem1=绿，着色器取 t[1] → 全绿。
 // 若后端把 elem 当 0 写，elem1 会盖到元素 0、t[1] 留空——本例必红。
 static void c63_desc_array_elem(const char *dir) {
@@ -8718,6 +8906,12 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;   // 自己一个会话：围栏号 1..6，配额计数从 0 起
     c976b_border_color(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976b close：%d %s", e18.rc.code, e18.why);
+    if (!open_backend()) return 1;   // 自己一个会话：围栏号 1–4
+    c976r_reduction(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976r close：%d %s", e18.rc.code, e18.why);
+    if (!open_backend()) return 1;
+    c976r_bad_format(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976r 格式负控 close：%d %s", e18.rc.code, e18.why);
 
     if (!open_backend()) return 1;
     cube_array_one_face();

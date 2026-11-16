@@ -384,7 +384,7 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         return fail(why, why_size, "required feature missing: shaderDrawParameters");
 
     // 容量 = 所有可选扩展同时启用时的项数（swapchain / maintenance1 / 校准 / index_type_uint8 / display_timing / host import /
-    // AHB + queue_family_foreign / indirect count / 4444 / 实例除数 / 镜像夹取 / 自定义边框色 / 深度裁剪控制，校准 KHR / EXT 二选一 = 14），留余量。
+    // AHB + queue_family_foreign / indirect count / 4444 / 实例除数 / 镜像夹取 / 自定义边框色 / 深度裁剪控制 / min-max 归约，校准 KHR / EXT 二选一 = 15），留余量。
     const char *device_ext[16];
     uint32_t device_ext_count = 0;
     if (out->has_swapchain) device_ext[device_ext_count++] = "VK_KHR_swapchain";
@@ -492,6 +492,19 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         vkGetPhysicalDeviceProperties2(out->physical, &p2);
         out->custom_border_max = bp.maxCustomBorderColorSamplers;
     }
+    // #976：NVN 采样器的 min / max 归约。扩展没有特性结构；属性里的 filterMinmaxImageComponentMapping 决定归约结果的可用分量。
+    out->sampler_minmax_enabled = has_device_extension(out->physical, "VK_EXT_sampler_filter_minmax");
+    if (out->sampler_minmax_enabled) {
+        VkPhysicalDeviceSamplerFilterMinmaxPropertiesEXT mp = {0};
+        mp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 p2 = {0};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &mp;
+        vkGetPhysicalDeviceProperties2(out->physical, &p2);
+        out->minmax_image_mapping = mp.filterMinmaxImageComponentMapping == VK_TRUE;
+        device_ext[device_ext_count++] = "VK_EXT_sampler_filter_minmax";
+    }
+    fprintf(stderr, "[s2a] vk sampler minmax: enabled=%d image_mapping=%d\n", out->sampler_minmax_enabled, out->minmax_image_mapping);
     out->device_extension_count = device_ext_count;
 
     // #975：NVN 16 位打包格式的路由（格式表在 nvn_vk_format.c 的 k_p16，弱引用同 #398 深度替换）。

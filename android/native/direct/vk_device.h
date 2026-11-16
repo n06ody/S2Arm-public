@@ -52,6 +52,10 @@ struct s2a_vk_device {
     int custom_border_enabled;
     int custom_border_without_format;
     uint32_t custom_border_max;
+    // #976：VK_EXT_sampler_filter_minmax 已启用（采样器 min / max 归约）；minmax_image_mapping = filterMinmaxImageComponentMapping
+    // （0 时仅 R 分量有定义，未证明分量使用前拒绝归约）。
+    int sampler_minmax_enabled;
+    int minmax_image_mapping;
     // 0 = 没有校准扩展；1 = VK_KHR_calibrated_timestamps；2 = VK_EXT_calibrated_timestamps。
     // GPU 时间戳换算到游戏时钟需要用它求 GPU 域与 CLOCK_MONOTONIC 的偏移。
     int calibrated_timestamps;
