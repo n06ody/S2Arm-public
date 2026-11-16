@@ -655,11 +655,17 @@ void rp_lost_ring_dump(const char *why) {
 //    读前查可写区间还有没有待落地的 GPU 写（rp_buf_gpu_write_pending）：有就等，等过 64 段仍有则照读并标明「可能是旧值」。
 #define WATCH_PER_KEY 32
 //    另有「最近 32 次」：每键一个环（覆盖旧的），平时只写内存，设备丢失时随归因环一起倒出（派发行 + 当时读回的可写存储摘要）。
-struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth; struct { uint64_t addr; uint32_t len; } st[6]; char hdr[640]; };
+// cb：只读常量缓冲在派发当时的内容（至多 3 个、各前 128 字）；游戏下一帧可能改写，所以当场拷，不等结果轮询
+struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth, ncb; struct { uint64_t addr; uint32_t len; } st[6]; struct { uint32_t reg, len, nw, w[128]; } cb[3]; char hdr[640]; };
 static struct watch_ent g_watch[8 * WATCH_PER_KEY]; static uint32_t g_watch_n, g_watch_cnt[8];
 static uint32_t g_watch_arm;   // 随转储模式：哪些键等着打下一次派发（上屏线程登记转储时置满，提交线程逐键取走）
 static struct watch_ent g_wring[8][WATCH_PER_KEY]; static uint32_t g_wring_n[8];
 static void watch_sum(const struct watch_ent *w, const char *tag, uint64_t now, int pend) {
+    for (uint32_t k = 0; k < w->ncb; k++) for (uint32_t j0 = 0; j0 < w->cb[k].nw; j0 += 32) {   // 只读常量缓冲：派发当时的内容，每行 32 字（十六进制，便于当 float / uint 两读）
+        char f[480]; uint32_t j1 = j0 + 32 < w->cb[k].nw ? j0 + 32 : w->cb[k].nw;
+        int q = snprintf(f, sizeof f, "常量全字 键%u-#%u %s c%u（长 %u）字 %u..%u：", w->slot, w->nth, tag, w->cb[k].reg, w->cb[k].len, j0, j1 - 1);
+        for (uint32_t j = j0; j < j1 && q > 0 && q < (int)sizeof f - 12; j++) q += snprintf(f + q, sizeof f - (size_t)q, " %08x", w->cb[k].w[j]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", f); }
     for (uint32_t k = 0; k < w->nst; k++) {
         const uint32_t *p = (const uint32_t *)(uintptr_t)w->st[k].addr; uint32_t n = w->st[k].len / 4, mx = 0, nz = 0;
         if (!p || !n) continue;
@@ -702,7 +708,14 @@ static void watch_note(const struct rp_prog *pg, const p_dispatch *dp) {
     w->key = key_of(5); w->seg = rp_seg_serial(); w->gx = g_disp_dim[0]; w->gy = g_disp_dim[1]; w->gz = g_disp_dim[2];
     char *m = w->hdr; const size_t msz = sizeof w->hdr; int o = snprintf(m, msz, "盯计算 键%u-#%u：程序键 %016llx %s %u×%u×%u 段 %llu", w->slot, w->nth, (unsigned long long)w->key, dp->ind ? "间接" : "直接", w->gx, w->gy, w->gz, (unsigned long long)w->seg);
     for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
-        if ((e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) && e->src_reg < 16) {
+        if (e->src_kind == NVN_RB_CBUF && e->src_reg < 18 && w->ncb < 3) {   // 只读常量缓冲：当场拷前 128 字（游戏内存，正是这次派发上传给 GPU 的内容）
+            const p_bind_buf *cb = &rp_S.ubo[5][e->src_reg];
+            if (cb->addr && cb->size && rp_pool_find(cb->addr, cb->size < 512 ? cb->size : 512, NULL, NULL)) {
+                uint32_t nb = cb->size < 512 ? (uint32_t)cb->size : 512; w->cb[w->ncb].reg = e->src_reg; w->cb[w->ncb].len = (uint32_t)cb->size; w->cb[w->ncb].nw = nb / 4;
+                memcpy(w->cb[w->ncb].w, (const void *)(uintptr_t)cb->addr, nb / 4 * 4); w->ncb++;
+                if (o > 0 && o < (int)msz - 40) o += snprintf(m + o, msz - (size_t)o, " 常量c%u %llx+%u", (unsigned)e->src_reg, (unsigned long long)cb->addr, (unsigned)cb->size);
+            }
+        } else if ((e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) && e->src_reg < 16) {
             const p_bind_buf *sb = e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[5][e->src_reg] : &rp_S.ssbo[5][e->src_reg];
             int rw = (e->access & NVN_GPU_ACC_W) != 0;
             if (o > 0 && o < (int)msz - 48) o += snprintf(m + o, msz - (size_t)o, " 存储%u %llx+%u%s", (unsigned)e->src_reg, (unsigned long long)sb->addr, (unsigned)sb->size, rw ? "写" : "");

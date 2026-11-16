@@ -25,12 +25,13 @@ static int g_fail, g_checks;
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200]; static int g_info_watch;   // 诊断第二版：「盯计算」行数
 static int g_info_chain; static char g_chain[4][900];
-static int g_info_full; static char g_full[700];   // 诊断：「存储全字」行数与最后一行
+static int g_info_full; static char g_full[700];
+static int g_info_cbw; static char g_cbw[700];   // 诊断：「常量全字」行数与最后一行   // 诊断：「存储全字」行数与最后一行
 static int g_info_wlog; static char g_wlog[4][700];   // 诊断：写入日志行数与最近 4 行（环）
 static int g_flag_tex_wlog0, g_flag_tex_wlog1;   // 调试开关 nvk_tex_wlog0/1：盯的贴图序号   // 诊断：转储链行数与前 4 行
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "存储全字")) { g_info_full++; snprintf(g_full, sizeof g_full, "%s", text); } if (strstr(text, "写入日志")) { snprintf(g_wlog[g_info_wlog & 3], sizeof g_wlog[0], "%s", text); g_info_wlog++; } if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text, "盯计算")) g_info_watch++; if (strstr(text, "常量全字")) { g_info_cbw++; snprintf(g_cbw, sizeof g_cbw, "%s", text); } if (strstr(text, "存储全字")) { g_info_full++; snprintf(g_full, sizeof g_full, "%s", text); } if (strstr(text, "写入日志")) { snprintf(g_wlog[g_info_wlog & 3], sizeof g_wlog[0], "%s", text); g_info_wlog++; } if (strstr(text, "转储链")) { if (g_info_chain < 4) snprintf(g_chain[g_info_chain], sizeof g_chain[0], "%s", text); g_info_chain++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
@@ -3231,6 +3232,24 @@ static void t_watch_on_dump(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); pass_fresh();
 }
 
+// 盯计算：只读常量缓冲在派发当时拷下来（游戏之后改写了也打派发时的值），随结果 / 设备丢失倒出逐字打
+static void t_watch_cbuf(void) {
+    pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0; rp_draw_reset();
+    nvn_be_pool_add(g_pmem, sizeof g_pmem); memset(g_pmem, 0, 64);
+    float c[8] = {0, 1, 2, 3, 4, 5, 0.02688f, 1.177f}; memcpy(g_pmem, c, sizeof c);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 1;
+    g_cprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_cprog.ent[0][0].src_kind = NVN_RB_CBUF; g_cprog.ent[0][0].src_reg = 5;
+    rp_S.ubo[5][5].addr = (uint64_t)(uintptr_t)g_pmem; rp_S.ubo[5][5].size = 32;
+    static const uint8_t key[8] = {0xfb, 0x82, 0x10, 0x0b, 0x5e, 0xa0, 0x13, 0x4b}; memcpy(rp_S.skey[5], key, 8);
+    g_flag_cs_watch0 = 0xfb82100; nvn_be_sub_begin(); p_dispatch dp = {.x = 1, .y = 1, .z = 1}; int n = g_ndisp;
+    rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 1);
+    memset(g_pmem, 0xff, 32);   // 游戏随后改写：倒出的仍是派发当时的值
+    int c0 = g_info_cbw; rp_lost_ring_dump("test");
+    CHECK(g_info_cbw == c0 + 1 && strstr(g_cbw, "常量全字 键0-#1 丢设备时 c5（长 32）字 0..7： 00000000 3f800000 40000000 40400000 40800000 40a00000 3cdc3372 3f96a7f0"));
+    g_flag_cs_watch0 = 0; rp_S.ubo[5][5].addr = 0; rp_S.ubo[5][5].size = 0; memset(rp_S.skey[5], 0, 8);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_pmem); rp_draw_reset(); pass_fresh();
+}
+
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
@@ -4032,6 +4051,7 @@ int main(int argc, char **argv) {
     t_dispatch_spill();
     t_lost_ring_skip();
     t_watch_on_dump();
+    t_watch_cbuf();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
