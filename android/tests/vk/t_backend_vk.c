@@ -74,8 +74,13 @@ int nvn_plat_flag(const char *name, int dflt) {
     return dflt;
 }
 static int g_shown_empty_logged;
+static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && strstr(text, "msaa_fallback:")) {
+        if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
+        if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
+    }
     if (text && strstr(text, "分时（实际上屏）") && strstr(text, "帧率= ") && strstr(text, "扩展未启用或不支持")) g_shown_empty_logged++;
     if (atomic_load_explicit(&g_c207_cap, memory_order_relaxed) && text) {   // C207：下面两种行只由绘制 / 呈现所在的（测试）线程打，不加锁
         if (strstr(text, "描述符细分（每帧毫秒，近 300 帧）")) {
@@ -8277,6 +8282,188 @@ static int present_upscale_only(void) {
     return g_fail ? 1 : 0;
 }
 
+// 设备真实支持集合提供独立期望；只检查缺失的档，不能把支持原数当降级证据。
+static void c1072_msaa_red(const char *dir) {
+    VkImageFormatProperties ip = {0};
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkResult qr = vkGetPhysicalDeviceImageFormatProperties(g_dev.physical, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &ip);
+    CHECK(qr == VK_SUCCESS, "C1072 format query rc=%d", (int)qr);
+    if (qr != VK_SUCCESS) return;
+    unsigned ran = 0;
+    const uint32_t wants[] = {2, 8};
+    for (unsigned i = 0; i < 2; i++) {
+        uint32_t want = wants[i], expected = want;
+        if (ip.sampleCounts & want) continue;
+        while (expected > 1 && !(ip.sampleCounts & expected)) expected >>= 1;
+        if (!(ip.sampleCounts & expected)) continue;
+        nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+        td.d.format = NVN_FORMAT_RGBA8; td.d.width = td.d.height = 4;
+        td.d.depth = td.d.levels = 1; td.d.samples = (int)want; td.usage = NVN_GPU_TEX_RENDER;
+        nvn_gpu_tex tex = NULL; nvn_gpu_err err = {0};
+        nvn_gpu_rc rc = nvn_gpu_tex_create(&td, &tex, &err);
+        CHECK(OK(rc) && tex, "C1072 %ux requested, expect %ux image: %s", want, expected, err.why);
+        if (tex) { nvn_gpu_tex_info info = {0}; nvn_gpu_tex_info_get(tex, &info);
+            CHECK(info.samples == expected, "C1072 %ux actual=%u expect=%u", want, info.samples, expected);
+            nvn_gpu_tex duplicate = NULL; nvn_gpu_rc dup = nvn_gpu_tex_create(&td, &duplicate, &err);
+            CHECK(OK(dup) && duplicate, "C1072 repeated %ux creation", want);
+            if (duplicate) nvn_gpu_tex_release(duplicate);
+            CHECK((want == 2 ? g_msaa_log_2 : g_msaa_log_8) == 1, "C1072 %ux fallback is logged once per format/request", want);
+            void *vsm = NULL, *fsm = NULL; nvn_gpu_shader vs = NULL, fs = NULL;
+            int shaders = load_shader_pair(dir, "quad.vert", "quad.frag", NULL, NULL, &vs, &fs, &vsm, &fsm);
+            CHECK(shaders, "C1072 shader pair");
+            if (shaders) {
+                nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.origin_ll = (uint8_t)!g_tri_origin_ul;
+                pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+                pd.samples = want; pd.prim = 5; pd.chmask.mask = 0xf; pd.color.logic_op = 3;
+                pd.attr[0].fmt = pd.attr[1].fmt = NVN_FORMAT_RGBA32F; pd.attr[1].offset = 16; pd.stream[0].stride = 32;
+                nvn_gpu_pipe pipe = NULL; CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err)) && pipe,
+                                                "C1072 %ux pipe follows image: %s", want, err.why);
+                if (pipe) {
+                    nvn_gpu_pipe cached = NULL;
+                    CHECK(nvn_gpu_pipe_lookup(&pd, &cached) && cached == pipe, "C1072 %ux lookup preserves requested identity", want);
+                    float vertices[4][8] = {{-1,-1,0,1,1,0,0,1},{-1,1,0,1,1,0,0,1},{1,-1,0,1,1,0,0,1},{1,1,0,1,1,0,0,1}};
+                    nvn_gpu_buf vb = make_buf(sizeof vertices, NVN_GPU_MEM_SHARED, vertices);
+                    nvn_gpu_tex dest = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+                    nvn_gpu_view av = make_view(tex), bv = make_view(dest); nvn_gpu_buf rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+                    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.w = pass.h = 4; pass.layers = 1;
+                    pass.color[0].view = av; pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+                    nvn_gpu_pass_begin(c, &pass); nvn_gpu_set_pipe(c, pipe);
+                    nvn_gpu_dyn dyn = {0}; dyn.origin_ll = pd.origin_ll; dyn.nvp = 1; dyn.vp[0][2] = dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
+                    dyn.has_sc = 1; dyn.sc[2] = dyn.sc[3] = 4; nvn_gpu_set_dyn(c, &dyn); nvn_gpu_set_vbuf(c, 0, vb, 0);
+                    nvn_gpu_draw_args da = {0}; da.prim = 5; da.count = 4; da.instances = 1; nvn_gpu_draw(c, &da); nvn_gpu_pass_end(c);
+                    NVNcopyRegion rr = {0, 0, 0, 4, 4, 1}; nvn_gpu_blit(c, av, &rr, bv, &rr, 0);
+                    nvn_gpu_copy_tex_buf(c, dest, 0, 0, NULL, rb, 0, 16, 64);
+                    uint64_t fence = i + 1; nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, fence, on_done, NULL, &err);
+                    CHECK(OK(cr), "C1072 %ux draw and resolve/copy commit: %s", want, err.why);
+                    if (OK(cr)) { CHECK(OK(nvn_gpu_fence_wait(fence, 5000000000ull, &err)), "C1072 fence: %s", err.why);
+                        const uint8_t *px = buf_cpu(rb); int badpx = 0;
+                        for (int j = 0; j < 16; j++) if (px[4*j] != 255 || px[4*j+1] || px[4*j+2] || px[4*j+3] != 255) badpx++;
+                        CHECK(!badpx, "C1072 %ux resolved pixels expect 16 red, bad=%d", want, badpx); }
+                    nvn_gpu_view_release(av); nvn_gpu_view_release(bv); nvn_gpu_tex_release(dest);
+                    nvn_gpu_buf_release(rb, NULL, NULL); nvn_gpu_buf_release(vb, NULL, NULL);
+                }
+                nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
+            }
+            free(vsm); free(fsm);
+            nvn_gpu_tex_release(tex); }
+        printf("C1072 request=%u expect=%u support=%#x\n", want, expected, (unsigned)ip.sampleCounts);
+        ran++;
+    }
+    CHECK(ran == 2, "C1072 requires host missing both 2x and 8x; exercised=%u", ran);
+    VkImageFormatProperties r8 = {0};
+    VkResult r8rc = vkGetPhysicalDeviceImageFormatProperties(g_dev.physical, VK_FORMAT_R8_UNORM,
+        VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &r8);
+    if (r8rc == VK_SUCCESS && (r8.sampleCounts & VK_SAMPLE_COUNT_1_BIT) && !(r8.sampleCounts & VK_SAMPLE_COUNT_2_BIT)) {
+        nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+        td.d.format = NVN_FORMAT_R8; td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1;
+        td.d.samples = 2; td.usage = NVN_GPU_TEX_RENDER;
+        nvn_gpu_tex first = NULL, second = NULL; nvn_gpu_err err = {0};
+        CHECK(OK(nvn_gpu_tex_create(&td, &first, &err)) && first, "C1072 R8 2x fallback: %s", err.why);
+        CHECK(OK(nvn_gpu_tex_create(&td, &second, &err)) && second, "C1072 repeated R8 2x fallback: %s", err.why);
+        CHECK(g_msaa_log_2 == 2, "C1072 distinct formats each log once for 2x, count=%u", g_msaa_log_2);
+        if (first) nvn_gpu_tex_release(first);
+        if (second) nvn_gpu_tex_release(second);
+        printf("C1072 diagnostic distinct formats: count=%u\n", g_msaa_log_2);
+    } else printf("C1072 diagnostic R8 case unavailable, mask=%#x rc=%d\n", (unsigned)r8.sampleCounts, (int)r8rc);
+}
+
+// 真实 SPIR-V 声明 sampler2DMS；降为单采样后必须在绑定前拒绝，不能向驱动发错类型的图。
+static void c1072_sample_guard(const char *dir) {
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+    td.d.format = NVN_FORMAT_RGBA8; td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1; td.d.samples = 2;
+    td.usage = NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED;
+    nvn_gpu_err e = {0}; nvn_gpu_tex tex = NULL;
+    CHECK(OK(nvn_gpu_tex_create(&td, &tex, &e)) && tex, "C1072 sampled target: %s", e.why);
+    if (!tex) return;
+    nvn_gpu_tex_info info = {0}; nvn_gpu_tex_info_get(tex, &info);
+    CHECK(info.samples == 1, "C1072 sampled target must be downgraded to 1x");
+    nvn_gpu_layout_ent ent = {0}; ent.cls = NVN_GPU_RES_TEX_SAMP; ent.count = 1;
+    ent.access = NVN_GPU_ACC_R; ent.stages = 1u << NVN_GPU_SH_FS;
+    nvn_gpu_layout fl = {0}; fl.ent = &ent; fl.nent = 1;
+    nvn_gpu_shader vs = NULL, fs = NULL; void *vsm = NULL, *fsm = NULL;
+    int ok = load_shader_pair(dir, "quad.vert", "msaa_read.frag", NULL, &fl, &vs, &fs, &vsm, &fsm);
+    CHECK(ok, "C1072 real multisample shader loads");
+    if (ok) {
+        nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL;
+        pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+        pd.samples = 1; pd.prim = 5; pd.chmask.mask = 0xf; pd.color.logic_op = 3;
+        pd.attr[0].fmt = pd.attr[1].fmt = NVN_FORMAT_RGBA32F; pd.attr[1].offset = 16; pd.stream[0].stride = 32;
+        nvn_gpu_pipe pipe = NULL; CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)) && pipe, "C1072 sample pipe: %s", e.why);
+        if (pipe) {
+            nvn_gpu_tex out = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+            nvn_gpu_view ov = make_view(out), tv = make_view(tex); samp_par sp = {0}; nvn_gpu_samp samp = NULL;
+            CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &e)) && samp, "C1072 sampler: %s", e.why);
+            nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.w = pass.h = 4; pass.layers = 1;
+            pass.color[0].view = ov; pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+            nvn_gpu_pass_begin(c, &pass); nvn_gpu_set_pipe(c, pipe);
+            nvn_gpu_binding b = {0}; b.cls = NVN_GPU_RES_TEX_SAMP; b.u.ts.view = tv; b.u.ts.samp = samp;
+            nvn_gpu_bind(c, NVN_GPU_SH_FS, &b, 1);
+            nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+            CHECK(cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_sampled_single"),
+                  "C1072 single sample must reject MS shader before draw: rc=%d %s", cr.code, e.why);
+            if (cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_sampled_single"))
+                printf("C1072 guard sampled: rejected before draw\n");
+            nvn_gpu_samp_release(samp); nvn_gpu_view_release(tv); nvn_gpu_view_release(ov); nvn_gpu_tex_release(out);
+        }
+        nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
+    }
+    free(vsm); free(fsm); nvn_gpu_tex_release(tex);
+}
+
+static void c1072_attachment_guard(void) {
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+    td.d.format = NVN_FORMAT_RGBA8; td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1; td.d.samples = 2; td.usage = NVN_GPU_TEX_RENDER;
+    nvn_gpu_tex a = NULL, b = NULL; nvn_gpu_err e = {0};
+    CHECK(OK(nvn_gpu_tex_create(&td, &a, &e)) && a, "C1072 1x attachment: %s", e.why);
+    td.d.samples = 4; CHECK(OK(nvn_gpu_tex_create(&td, &b, &e)) && b, "C1072 4x attachment: %s", e.why);
+    if (a && b) {
+        nvn_gpu_view av = make_view(a), bv = make_view(b); nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_pass_desc pass = {0}; pass.ncolor = 2; pass.w = pass.h = 4; pass.layers = 1;
+        pass.color[0].view = av; pass.color[1].view = bv;
+        nvn_gpu_pass_begin(c, &pass);
+        nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        CHECK(cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_attachment_mismatch"),
+              "C1072 inconsistent attachments rejected before renderpass: rc=%d %s", cr.code, e.why);
+        if (cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_attachment_mismatch"))
+            printf("C1072 guard attachments: rejected before renderpass\n");
+        nvn_gpu_view_release(av); nvn_gpu_view_release(bv);
+    }
+    if (a) nvn_gpu_tex_release(a);
+    if (b) nvn_gpu_tex_release(b);
+}
+
+static void c1072_pipe_guard(const char *dir) {
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
+    td.d.format = NVN_FORMAT_RGBA8; td.d.width = td.d.height = 4; td.d.depth = td.d.levels = 1; td.d.samples = 4; td.usage = NVN_GPU_TEX_RENDER;
+    nvn_gpu_tex tex = NULL; nvn_gpu_err e = {0};
+    CHECK(OK(nvn_gpu_tex_create(&td, &tex, &e)) && tex, "C1072 4x pipe-guard attachment: %s", e.why);
+    if (!tex) return;
+    nvn_gpu_shader vs = NULL, fs = NULL; void *vsm = NULL, *fsm = NULL;
+    int ok = load_shader_pair(dir, "quad.vert", "quad.frag", NULL, NULL, &vs, &fs, &vsm, &fsm);
+    CHECK(ok, "C1072 pipe-guard shaders");
+    if (ok) {
+        nvn_gpu_pipe_desc pd = {0}; pd.poly.mode = NVN_POLYGON_MODE_FILL;
+        pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+        pd.samples = 1; pd.prim = 5; pd.chmask.mask = 0xf; pd.color.logic_op = 3;
+        pd.attr[0].fmt = pd.attr[1].fmt = NVN_FORMAT_RGBA32F; pd.attr[1].offset = 16; pd.stream[0].stride = 32;
+        nvn_gpu_pipe pipe = NULL; CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)) && pipe, "C1072 pipe-guard pipe: %s", e.why);
+        if (pipe) {
+            nvn_gpu_view view = make_view(tex); nvn_gpu_cmd c = begin_cmd();
+            nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.w = pass.h = 4; pass.layers = 1; pass.color[0].view = view;
+            nvn_gpu_pass_begin(c, &pass); nvn_gpu_set_pipe(c, pipe);
+            nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+            CHECK(cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_pipeline_mismatch"),
+                  "C1072 pipeline mismatch rejected before draw: rc=%d %s", cr.code, e.why);
+            if (cr.code == NVN_GPU_E_UNSUPPORTED && strstr(e.why, "msaa_pipeline_mismatch"))
+                printf("C1072 guard pipeline: rejected before draw\n");
+            nvn_gpu_view_release(view);
+        }
+        nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
+    }
+    free(vsm); free(fsm); nvn_gpu_tex_release(tex);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     if (getenv("S2A_TEST_COUNT_ONLY")) return c658_main(argc, argv);
@@ -8290,6 +8477,21 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        if (!open_backend()) return 1;
+        c1072_msaa_red(argv[1]);
+        nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1072 close %s", e.why);
+        if (open_backend()) { c1072_sample_guard(argv[1]); CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1072 sampled close %s", e.why); }
+        else CHECK(0, "C1072 reopen for sample guard");
+        if (open_backend()) { c1072_attachment_guard(); CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1072 attachment close %s", e.why); }
+        else CHECK(0, "C1072 reopen for attachment guard");
+        if (open_backend()) { c1072_pipe_guard(argv[1]); CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1072 pipe close %s", e.why); }
+        else CHECK(0, "C1072 reopen for pipe guard");
+        printf("C1072 isolated failures=%d\n", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (getenv("S2A_TEST_PLC_ONLY") && argc > 1) {   // 开发时只跑 C89（run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         c89_midrun_save(argv[1]);

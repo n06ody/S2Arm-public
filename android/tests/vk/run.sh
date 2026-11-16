@@ -187,7 +187,7 @@ export TMPDIR="$repo/build/vk-tests"
 out=$(mktemp -d "$TMPDIR/s2a-nvn-vk.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 mkdir -p "$out/shaders"
-for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
+for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert msaa_read.frag count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp tsamp.comp arr2.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
 
@@ -265,9 +265,27 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
+# 撤改只写入临时源码副本；逐项必须红在指定行为断言。
+if [[ "$mode" == --msaa-neg-* ]]; then
+    python3 - "$mode" "${src[1]}" "$out/msaa_mutant.c" <<'PYMSAA'
+import pathlib, sys
+mode, source, target = sys.argv[1:]
+s = pathlib.Path(source).read_text()
+changes = {
+    '--msaa-neg-pick': ('uint32_t actual = samples <= 16 ? msaa_pick(samples, ip.sampleCounts) : 0;', 'uint32_t actual = 0;'),
+    '--msaa-neg-pipe': ('c->pass_natt && p->pass && p->actual_samples != c->pass_samples', 'c->pass_natt && p->pass && 0 && p->actual_samples != c->pass_samples'),
+    '--msaa-neg-sampled': ('if (bt && bt->samples == 1 && (bt->target', 'if (bt && 0 && bt->samples == 1 && (bt->target'),
+    '--msaa-neg-attachment': ('if (attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 颜色附件样本数不一致"); return; }', 'if (0 && attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 颜色附件样本数不一致"); return; }'),
+}
+a, b = changes[mode]
+if s.count(a) != 1: raise SystemExit('MSAA negative control anchor changed: ' + mode)
+pathlib.Path(target).write_text(s.replace(a, b))
+PYMSAA
+    src[1]="$out/msaa_mutant.c"
+fi
 
 echo "lavapipe: $icd"
 echo "validation: $layer"
@@ -385,6 +403,55 @@ with open(sys.argv[2], 'w') as f:
     json.dump({'source': 'probe', 'gs_occlusion': 'supported'}, f, separators=(',', ':'))
 PYPROBE
 export S2A_CAPPROBE_RESULT="$out/probe-result.json"
+
+if [[ "$mode" == --msaa-* ]]; then
+    set +e
+    if [ "$mode" = "--msaa-neg-attachment" ]; then
+        mkdir -p "$repo/build/msaa-tests"
+        timeout 60 "$out/t_backend_vk" "$out/shaders" --msaa-only >"$repo/build/msaa-tests/negative-attachment.log" 2>&1
+        rc=$?
+        cp "$repo/build/msaa-tests/negative-attachment.log" "$out/msaa-log"
+    else
+        timeout 60 "$out/t_backend_vk" "$out/shaders" --msaa-only 2>&1 | tee "$out/msaa-log"
+        rc=${PIPESTATUS[0]}
+    fi
+    set -e
+    if [ "$mode" = "--msaa-only" ]; then
+        if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/msaa-log"; then exit 1; fi
+        exit "$rc"
+    fi
+    case "$mode" in
+        --msaa-neg-pick) expected='C1072 2x requested, expect 1x image' ;;
+        --msaa-neg-pipe) expected='C1072 pipeline mismatch rejected before draw' ;;
+        --msaa-neg-sampled) expected='C1072 single sample must reject MS shader before draw' ;;
+        --msaa-neg-attachment) expected='C1072 inconsistent attachments rejected before renderpass' ;;
+    esac
+    if [ "$rc" -eq 0 ] || ! grep -Fq "$expected" "$out/msaa-log"; then
+        echo "【红】$mode 没有红在预期断言（rc=$rc）" >&2; exit 1
+    fi
+    if [ "$mode" = "--msaa-neg-attachment" ]; then
+        count=$(grep -c 'Validation Error' "$out/msaa-log" || true)
+        if [ "$count" -ne 1 ] || ! grep -q 'VUID-VkSubpassDescription-pColorAttachments-09430' "$out/msaa-log"; then
+            echo "【红】混合附件负控的校验报错不是预期一条（count=$count）；原文在 build/msaa-tests/negative-attachment.log" >&2; exit 1
+        fi
+        echo 'PASS: 混合附件触发预期校验错误 1 条，原文在 build/msaa-tests/negative-attachment.log'
+    elif grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/msaa-log"; then
+        echo "【红】$mode 有非预期 Vulkan 校验报错" >&2; exit 1
+    fi
+    echo "PASS: $mode 命中预期断言（validation 输出见上）"
+    exit 0
+fi
+
+if [ -z "$mode" ]; then
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --msaa-only 2>&1 | tee "$out/msaa-default-log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || ! grep -q 'C1072 isolated failures=0' "$out/msaa-default-log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/msaa-default-log"; then
+        echo "【红】MSAA 降档专项失败或 validation 报错（rc=$rc）" >&2; exit 1
+    fi
+fi
 
 if [ "$mode" = "--present-only" ]; then
     for order in rgba bgra; do
