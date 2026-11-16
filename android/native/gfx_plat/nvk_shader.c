@@ -536,8 +536,9 @@ static int usrc_put(struct rp_prog *pg, const struct fd_binding *b, nvn_gpu_layo
     return 1;
 }
 
-// 只读组合采样贴图的声明；无法识别时保留 0，不根据绑定对象猜类型。
-static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t binding, uint8_t *dtt, uint8_t *dcls) {
+// 组合采样贴图与存储图像的声明；无法识别时保留 0，不根据绑定对象猜类型。
+//   ifmt（可为 NULL）：存储图像 OpTypeImage 的 Image Format 操作数（SPIR-V 枚举，0 = Unknown），回放按它与数值类选视图格式
+static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t binding, uint8_t *dtt, uint8_t *dcls, uint8_t *ifmt) {
     const uint32_t *w = blob;
     if (!w || bytes < 20 || bytes % 4 || w[0] != 0x07230203u || !w[3] || w[3] > 0x100000u) return;
     uint32_t bound = w[3]; size_t words = bytes / 4;
@@ -606,6 +607,7 @@ static void sampled_decl(const void *blob, size_t bytes, uint32_t set, uint32_t 
             if (op_type != 22 && (op_type != 21 || sample[3] > 1)) break;
             *dtt = (uint8_t)(target + 1);
             *dcls = depth == 1 ? 3 : op_type == 21 ? (sample[3] ? 2 : 1) : 0;
+            if (ifmt && q[8] < 256) *ifmt = (uint8_t)q[8];
             goto done;
         }
     }
@@ -653,7 +655,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", b->stage); e->failed = 1; break; }
             le->stages = b->is_support ? (1u << nst) - 1u : 1u << st;
             if (b->kind == 2) sampled_decl(fp.stage[st].spirv, fp.stage[st].spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
-                &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]]);
+                &e->prog.dtt[st][e->prog.nent[st]], &e->prog.dcls[st][e->prog.nent[st]], NULL);
             if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[st][e->prog.nent[st]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
                 red1("tbuf_shader_type_unproven", b->stage); e->failed = 1; break;
             }
@@ -1391,8 +1393,8 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
         if (!ok) { char nm[56]; snprintf(nm, sizeof nm, "compute_binding_kind_%d_slot_%d_map_%d", b->kind, b->slot, b->kind == 1 ? (int)cp.storage[i].mapping : 0); red1(nm, "cs"); e->failed = 1; break; }
         if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", "cs"); e->failed = 1; break; }
         le->stages = 1u << NVN_GPU_SH_CS;
-        if (b->kind == 2) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,
-            &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]]);
+        if (b->kind == 2 || b->kind == 3) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,   // 3 = 存储图像：数值类与声明格式给回放选视图格式
+            &e->prog.dtt[0][e->prog.nent[0]], &e->prog.dcls[0][e->prog.nent[0]], &e->prog.difmt[0][e->prog.nent[0]]);
         if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[0][e->prog.nent[0]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
             red1("tbuf_shader_type_unproven", "cs"); e->failed = 1; break;
         }
