@@ -14,6 +14,8 @@
 #include <string.h>
 #include <time.h>
 
+// 弱链接[androiddraw]：nvn_unimpl_diag_summary
+extern void nvn_unimpl_diag_summary(const char *, uint64_t) __attribute__((weak));
 #define TAG "S2Arm"
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_ready;
@@ -35,6 +37,9 @@ void nvk_session_request_stop(void) {
         __android_log_print(ANDROID_LOG_ERROR, TAG,
                             "【红】nvk stop: warm 预热的静默/清单落盘没在 500 毫秒统一截止内完成"
                             "（本项超时；清单没写盘、旧文件保留；占的是会话 700 毫秒硬界限）");
+    // Actual provider Stop/Destroy call this even when the device is retained and close is not called.
+    // This is a stop snapshot, not proof that all admitted workers have retired.
+    if (nvn_unimpl_diag_summary) nvn_unimpl_diag_summary("session_stop", 0);
 }
 uint64_t nvk_session_stop_deadline(void) {
     uint64_t start = atomic_load_explicit(&g_stop_started, memory_order_acquire);

@@ -149,6 +149,36 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
     pthread_mutex_unlock(&g_bmu);
     return hit;
 }
+// Diagnostic only: caller has waited for the segment containing every previously recorded write.
+// The segment-end host barrier and coherent SHARED mirror make the completed mirror visible.
+// Never pick between conflicting mirrors or read a partially covered pending write as a complete value.
+int rp_buf_diag_snapshot(uint64_t addr, uint64_t len, void *out) {
+    const uint8_t *mem = NULL; uint64_t size = 0;
+    if (!out || !len || !rp_pool_find(addr, len, &mem, &size)) return 0;
+    uint64_t off = addr - (uint64_t)(uintptr_t)mem, key = (uint64_t)(uintptr_t)mem;
+    int mi = -1, hit = 0, covers = 0, ok = 0;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &key);
+    if (s && s->landing) goto done;  // another callback is still publishing guest bytes
+    if (s) for (int i = 0; i < s->ngw; i++) {
+        struct gpu_write *w = &s->gw[i];
+        if (w->off < off + len && off < w->off + w->len) {
+            hit = 1;
+            if (mi >= 0 && mi != w->mi) goto done;
+            mi = w->mi;
+            if (w->off <= off && len <= w->len && off - w->off <= w->len - len) covers = 1;
+        }
+    }
+    if (hit) {
+        if (!covers || !s->m[mi].buf) goto done;
+        uint8_t *src = nvn_gpu_buf_cpu(s->m[mi].buf);
+        if (!src) goto done;
+        memcpy(out, src + off, (size_t)len); ok = 1;
+    } else { memcpy(out, mem + off, (size_t)len); ok = 2; }
+done:
+    pthread_mutex_unlock(&g_bmu);
+    return ok;
+}
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
     // 锁内只做「摘登记 + 记一笔正在拷」，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
@@ -307,6 +337,8 @@ int rp_buf_mirrors(void) { pthread_mutex_lock(&g_bmu); int n = (int)g_shadow.n; 
 // ---------- 缓冲类命令：只改游戏内存（见文件头）----------
 static int in_pool(uint64_t a, uint64_t n) { return n && rp_pool_find(a, n, NULL, NULL); }
 // 回放时在 CPU 上改游戏缓冲内容的三个命令：改一次代号加一（rp_draw 的段内常量缓冲切片按它失效）
+// 弱链接[replay]：rp_diag_buffer_write
+extern void rp_diag_buffer_write(uint64_t, uint64_t, const char *) __attribute__((weak));
 uint64_t rp_cpu_write_gen;
 // 写入区间日志（开关 nvk_slc_gen 用）：只记这三个命令改写过的 [a, b)，给「暂存片还能不能用」逐区间判定。
 // 用全局写代号判会让所有区间一起作废；按区间判的话，每帧固定的那几块常量缓冲（内容没变）就能一直用同一片暂存。
@@ -314,7 +346,7 @@ enum { WL_N = 128 };
 static struct wl_ent { uint64_t seq, a, b; } g_wl[WL_N];
 static uint64_t g_wl_seq, g_wl_put;
 uint64_t rp_write_mark(void) { return g_wl_seq; }
-void rp_write_note(uint64_t a, uint64_t n) { g_wl[g_wl_put].seq = ++g_wl_seq; g_wl[g_wl_put].a = a; g_wl[g_wl_put].b = a + n; g_wl_put = (g_wl_put + 1) % WL_N; }
+void rp_write_note(uint64_t a, uint64_t n) { if (rp_diag_buffer_write) rp_diag_buffer_write(a, n, "cpu_replay_write"); g_wl[g_wl_put].seq = ++g_wl_seq; g_wl[g_wl_put].a = a; g_wl[g_wl_put].b = a + n; g_wl_put = (g_wl_put + 1) % WL_N; }
 // mark 之后有没有人写过和 [a, a+n) 重叠的区间。只顺着记号扫「mark 之后的那几条」——
 // 一帧要问 8000 次左右，扫满 128 条就是一百万次比较（实测这样做的缓存反而更慢）。
 // 日志绕一圈（mark 太旧、记录已被覆盖）时保守当作写过。
