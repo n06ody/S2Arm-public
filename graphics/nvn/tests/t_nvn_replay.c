@@ -24,15 +24,18 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200];
+static int g_noatt_lines, g_noatt_summaries; static char g_noatt_last[2048], g_noatt_summary[512];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { if (!strncmp(text, "noatt:", 6)) { if (strstr(text, "summary")) { g_noatt_summaries++; snprintf(g_noatt_summary, sizeof g_noatt_summary, "%s", text); } else { g_noatt_lines++; snprintf(g_noatt_last, sizeof g_noatt_last, "%s", text); } } (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static int g_flag_noatt;
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_noatt")) return g_flag_noatt;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -2238,6 +2241,29 @@ static void t_pass_no_attachment(void) {
     g_caps_extra = 0; pass_fresh();
 }
 
+// #697 诊断档：两类无附件通道、64 条上限，以及仅原本无目标的 A/B 分流。
+static void t_noatt_diag(void) {
+    for (int mode = 1; mode <= 2; mode++) {
+        g_flag_noatt = mode; pass_fresh(); g_caps_extra = NVN_GPU_CAP_NO_ATTACH_PASS;
+        g_noatt_lines = g_noatt_summaries = 0; int draws = g_gdraws;
+        stream a = {0}; q_env(&a); put_set_rt(&a, NULL, NULL); vp_sc(&a, 24, 20); q_draw(&a); end(&a);
+        submit1(&a); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_gdraws == draws + 1 && g_noatt_lines == 1 && strstr(g_noatt_last, "why=rt_none") && strstr(g_noatt_last, "24x20"));
+        tex_t bad = mk_tex(697, 0, NVN_FORMAT_DEPTH24_STENCIL8, 16, 16, 1, 0);
+        stream b = {0}; q_env(&b); put_set_rt_v(&b, &bad, NULL); vp_sc(&b, 24, 20); q_draw(&b); end(&b);
+        submit1(&b); fake_complete(NVN_GPU_DONE_OK);
+        if (mode == 1) CHECK(g_gdraws == draws + 2 && g_noatt_lines == 2 && strstr(g_noatt_last, "why=slots_dropped") && strstr(g_noatt_last, "color_target_depth"));
+        else CHECK(g_gdraws == draws + 1 && g_noatt_lines == 1 && nvn_unimpl_count("pass", "no_attachment") == 1);
+        if (mode == 1) {
+            for (int k = 0; k < 65; k++) { submit1(&a); fake_complete(NVN_GPU_DONE_OK); }
+            CHECK(g_noatt_lines == 64);
+        }
+        pass_fresh();
+        CHECK(g_noatt_summaries == 1 && strstr(g_noatt_summary, "summary") && strstr(g_noatt_summary, "rt_none="));
+    }
+    g_flag_noatt = 0; g_caps_extra = 0; pass_fresh();
+}
+
 // 块压缩贴图经「一块当一个像素」的非压缩视图当渲染目标（#709，对照 nvn_mtl.m bcrt_attach）：同深度影子一套，影子按块数建。
 // 期望值手算：64x32 的 BC1（RGBA_DXT1，一块 4x4、8 字节）配 RG32UI 视图 → 影子 16x8、一个像素 8 字节 → 行 128 字节、整张 1024 字节；
 // 基底那边的拷贝区域按像素给整级 64x32。BC3（RGBA_DXT5，一块 16 字节）16x16 配 RGBA32UI → 影子 4x4、行 64、整张 256。
@@ -3734,6 +3760,7 @@ int main(int argc, char **argv) {
     t_pass_clear_fold();
     t_pass_depth_shadow();
     t_pass_no_attachment();
+    t_noatt_diag();
     t_pass_bc_shadow();
     t_pass_bc_shadow_3d();
     t_autoflush();
