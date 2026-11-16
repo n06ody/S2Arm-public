@@ -387,6 +387,24 @@
             "capabilities": [
                 "unchanged"
             ]
+        },
+        "VP_S2A_SIM_no_minmax": {
+            "version": 1,
+            "api-version": "1.1.0",
+            "label": "无 min / max 归约",
+            "description": "由 sim_tiers.sh 排除 VK_EXT_sampler_filter_minmax；min / max 归约具名 UNSUPPORTED。",
+            "contributors": {},
+            "history": [
+                {
+                    "revision": 1,
+                    "date": "2026-11-14",
+                    "author": "S2Arm",
+                    "comment": "只按 Vulkan 规范扩展名手写，不含设备报告数据"
+                }
+            ],
+            "capabilities": [
+                "unchanged"
+            ]
         }
     }
 }

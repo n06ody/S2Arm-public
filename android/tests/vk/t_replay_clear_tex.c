@@ -20,6 +20,7 @@ void rp_view_pin_begin(void) {}
 void rp_view_pin_end(void) {}
 void rp_tex_mark_gpu_written(const tex_t *t) { (void)t; g_writes++; }
 void rp_dirty_all(void) {}
+uint64_t nvn_unimpl_count(const char *cls, const char *name) { (void)cls; (void)name; return 0; }
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) {
     (void)site; printf("unimplemented %s/%s\n", cls, name); return ++g_unimpl;
 }

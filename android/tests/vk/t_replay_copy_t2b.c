@@ -19,6 +19,7 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
     g_write.addr = addr; g_write.bytes = bytes; g_write.row = row; g_write.image = image; g_write.rows = rows; g_write.images = images; g_write_n++; return 1;
 }
+uint64_t nvn_unimpl_count(const char *cls, const char *name) { (void)cls; (void)name; return 0; }
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) {
     (void)site; printf("unimplemented %s/%s\n", cls, name); return ++g_unimpl;
 }
