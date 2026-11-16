@@ -5,6 +5,7 @@
 // 另外三种没有原生对应的图元（#710）：四边形带（8）当三角带画（顶点序不变；零头 1 个丢掉；带索引又开着重启时按段展开成三角形列表），
 // 多边形（9）当三角扇画，线环（2）展开成线段列表的 32 位索引（每段末尾补一条回到段首的线）。
 // 还没接：间接计数多绘、变换反馈、邻接图元与面片、图元重启以外的小状态、存储缓冲与图像绑定、空槽假贴图。
+#include <math.h>
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -1407,10 +1408,41 @@ draw_done:
 // ---------- 调试：把「上屏那张图」和它上游几层的贴图读回落盘（开关 nvk_dump；rp_present 每 600 帧调一次） ----------
 // 每笔绘制记下目标序号和它采样的头几张贴图序号；从上屏的那张图往回走：画到它的那些笔采样了谁，再往上，至多 3 层、12 张。
 // 每张读第 0 级第 0 层的原始字节，写到缓存目录（没有就写诊断目录）的 nvkdump_<帧>_<层>_<序号>_<宽>x<高>_<格式>.raw。
-struct dump_job { nvn_gpu_buf buf; uint64_t bytes; char path[300]; };
+struct dump_job { nvn_gpu_buf buf; uint64_t bytes; char path[300]; uint32_t w, h, fmt, summary; };
+// 诊断：nvk_dump=2 时不落盘，只打亮度摘要（各通道均值、最大值、NaN / 无穷计数），给 8E / 9000 同场景对比中间目标亮度。
+//   只认常见颜色格式：RGBA8 / RGBA8_SRGB / BGRA8(_SRGB)（按存储值 0..1，不做 sRGB 解码）、RGBA16F、RG16F、R16F、R11G11B10F、RGB10A2、R32F、RG32F、RGBA32F。
+static float dump_h2f(uint16_t h) { uint32_t s = (uint32_t)(h >> 15) << 31, e = h >> 10 & 31, m = h & 1023, f;
+    if (!e) { float v = (float)m / 1024.0f / 16384.0f; return s ? -v : v; }
+    if (e == 31) f = s | 0x7F800000u | m << 13; else f = s | (e + 112) << 23 | m << 13;
+    float r; memcpy(&r, &f, 4); return r; }
+static float dump_uf(uint32_t v, int mbits) { uint32_t e = v >> mbits, m = v & ((1u << mbits) - 1);
+    if (e == 31) return m ? NAN : INFINITY;
+    if (!e) return (float)m / (float)(1u << mbits) / 16384.0f;
+    return ldexpf(1.0f + (float)m / (float)(1u << mbits), (int)e - 15); }
+static void dump_summary(const struct dump_job *j, const uint8_t *p) {
+    int nc = 0, bpp = 0;
+    switch (j->fmt) { case 0x25: case 0x38: case 0x9A: case 0x9C: nc = 4; bpp = 4; break; case 0x29: nc = 4; bpp = 8; break; case 0x11: nc = 2; bpp = 4; break;
+        case 0x5: nc = 1; bpp = 2; break; case 0x3F: nc = 3; bpp = 4; break; case 0x3D: nc = 4; bpp = 4; break; case 0xA: nc = 1; bpp = 4; break;
+        case 0x16: nc = 2; bpp = 8; break; case 0x2E: nc = 4; bpp = 16; break; default: break; }
+    char m[300];
+    if (!nc || (uint64_t)j->w * j->h * (uint64_t)bpp > j->bytes) { snprintf(m, sizeof m, "亮度摘要 %s：格式 %#x 不认，跳过", j->path, j->fmt); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m); return; }
+    double sum[4] = {0}; float mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}; uint64_t bad = 0, n = (uint64_t)j->w * j->h;
+    for (uint64_t i = 0; i < n; i++) { const uint8_t *q = p + i * (uint64_t)bpp; float c[4] = {0};
+        switch (j->fmt) {
+        case 0x25: case 0x38: case 0x9A: case 0x9C: for (int k = 0; k < 4; k++) c[k] = q[k] / 255.0f; break;
+        case 0x29: case 0x11: case 0x5: for (int k = 0; k < nc; k++) { uint16_t h; memcpy(&h, q + 2 * k, 2); c[k] = dump_h2f(h); } break;
+        case 0x3F: { uint32_t v; memcpy(&v, q, 4); c[0] = dump_uf(v & 2047, 6); c[1] = dump_uf(v >> 11 & 2047, 6); c[2] = dump_uf(v >> 22 & 1023, 5); } break;
+        case 0x3D: { uint32_t v; memcpy(&v, q, 4); c[0] = (v & 1023) / 1023.0f; c[1] = (v >> 10 & 1023) / 1023.0f; c[2] = (v >> 20 & 1023) / 1023.0f; c[3] = (v >> 30) / 3.0f; } break;
+        default: for (int k = 0; k < nc; k++) memcpy(&c[k], q + 4 * k, 4); break; }
+        for (int k = 0; k < nc; k++) { if (!isfinite(c[k])) { bad++; continue; } sum[k] += c[k]; if (c[k] > mx[k]) mx[k] = c[k]; } }
+    snprintf(m, sizeof m, "亮度摘要 %s：均值 %.4g %.4g %.4g %.4g 最大 %.4g %.4g %.4g %.4g 非有限 %llu", j->path,
+             sum[0] / (double)n, sum[1] / (double)n, sum[2] / (double)n, sum[3] / (double)n, mx[0], mx[1], mx[2], mx[3], (unsigned long long)bad);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m);
+}
 static void dump_done(void *user, const nvn_gpu_done *d) {
     struct dump_job *j = user;
-    if (d->status != NVN_GPU_DONE_FAILED) { FILE *f = fopen(j->path, "wb"); if (f) { fwrite(nvn_gpu_buf_cpu(j->buf), 1, (size_t)j->bytes, f); fclose(f); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", j->path); } }
+    if (d->status != NVN_GPU_DONE_FAILED && j->summary) dump_summary(j, nvn_gpu_buf_cpu(j->buf));
+    else if (d->status != NVN_GPU_DONE_FAILED) { FILE *f = fopen(j->path, "wb"); if (f) { fwrite(nvn_gpu_buf_cpu(j->buf), 1, (size_t)j->bytes, f); fclose(f); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", j->path); } }
     nvn_gpu_buf_release(j->buf, NULL, NULL); free(j);
 }
 // 上屏线程只登记「要读回」；真正的读回在提交线程上、一次提交收尾时做（时间线的值只有提交线程能发）
@@ -1444,7 +1476,7 @@ static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence)
         uint64_t row = (uint64_t)((ti.w + (uint32_t)bw - 1) / (uint32_t)bw) * (uint64_t)bpb, bytes = row * ((ti.h + (uint32_t)bh - 1) / (uint32_t)bh);
         struct dump_job *j = calloc(1, sizeof *j); nvn_gpu_err err = {0}; nvn_gpu_cmd c = NULL; nvn_gpu_cmd_desc cd = {0, "nvk dump"};
         if (!j || !nvn_gpu_ok(nvn_gpu_buf_create(bytes, NVN_GPU_MEM_SHARED, NULL, &j->buf, &err)) || !nvn_gpu_ok(nvn_gpu_cmd_begin(&cd, &c, &err))) { if (j && j->buf) nvn_gpu_buf_release(j->buf, NULL, NULL); free(j); continue; }
-        j->bytes = bytes; snprintf(j->path, sizeof j->path, "%s/nvkdump_%llu_%d_%llu_%ux%u_%#x.raw", dir, (unsigned long long)frame, depth[i], (unsigned long long)list[i], ti.w, ti.h, ti.nvn_format);
+        j->bytes = bytes; j->w = ti.w; j->h = ti.h; j->fmt = ti.nvn_format; j->summary = nvn_plat_flag("nvk_dump", 0) == 2; snprintf(j->path, sizeof j->path, "%s/nvkdump_%llu_%d_%llu_%ux%u_%#x.raw", dir, (unsigned long long)frame, depth[i], (unsigned long long)list[i], ti.w, ti.h, ti.nvn_format);
         nvn_gpu_copy_tex_buf(c, g, 0, 0, NULL, j->buf, 0, row, bytes);
         *fence += 1;
         nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, *fence, dump_done, j, &err);

@@ -109,6 +109,11 @@ int main(void) {
     /* gs_path props without the debug_env gate: inert. */
     prop_set("debug.s2a.gs_path", "compute");
     expect("switch gated", 1, 1, "probe:supported");
+    /* 设备能力诊断开关：没开 debug_env 时不生效 */
+    prop_set("debug.s2a.caps_no_vtx_stores", "1");
+    prop_set("debug.s2a.caps_subgroup", "16");
+    CHECK(s2a_caps_force_no_vertex_stores() == 0);
+    CHECK(s2a_caps_force_subgroup() == 0);
     prop_set("debug.s2a.gs_path", "garbage");
     prop_set("debug.s2a.debug_env", "1");
     expect("bad value", 1, 1, "probe:supported");
@@ -121,11 +126,21 @@ int main(void) {
     prop_set("debug.s2a.gs_path", "hardware");
     expect("forced hardware", 1, 1, "forced-hardware");
     expect("forced hardware hw-missing", 0, 0, "forced-hardware-hw-missing");
+    CHECK(s2a_caps_force_no_vertex_stores() == 1);
+    CHECK(s2a_caps_force_subgroup() == 16);
+    prop_set("debug.s2a.caps_subgroup", "17");    /* 不是 2 的幂：不改 */
+    CHECK(s2a_caps_force_subgroup() == 0);
+    prop_set("debug.s2a.caps_subgroup", "256");   /* 超出 4..128：不改 */
+    CHECK(s2a_caps_force_subgroup() == 0);
+    prop_set("debug.s2a.caps_no_vtx_stores", "0");
+    CHECK(s2a_caps_force_no_vertex_stores() == 0);
 #else
     /* release build: both props set and the switch still does nothing —
      * the verdict file keeps deciding. */
     prop_set("debug.s2a.gs_path", "compute");
     expect("release ignores switch", 1, 1, "probe:supported");
+    CHECK(s2a_caps_force_no_vertex_stores() == 0);
+    CHECK(s2a_caps_force_subgroup() == 0);
 #endif
 
     unlink(g_result_path);
