@@ -27,3 +27,10 @@
  * android/tools) linkable, matching the weak
  * s2a_capprobe_gs_occ_state contract in capprobe.h. */
 int s2a_vk_gs_path(int hw_geometry_shader, const char **reason) __attribute__((weak));
+
+/* 诊断（Adreno / Mali 分叉定位，只在调试档生效，同 gs_path 的门）：
+ *   debug.s2a.caps_no_vtx_stores=1 → 设备能力里 vertexPipelineStoresAndAtomics 报 false（编译器按没有处理，同 Mali）；
+ *   debug.s2a.caps_subgroup=N      → 设备能力里 subgroupSize 报 N（只改编译用的宽度，不改硬件；用于看结果是否随宽度变）。
+ * 返回 0 = 不改。弱符号：不链这个文件的宿主单元看到 NULL，等于不改。 */
+int s2a_caps_force_no_vertex_stores(void) __attribute__((weak));
+unsigned s2a_caps_force_subgroup(void) __attribute__((weak));

@@ -5,6 +5,7 @@
 // 另外三种没有原生对应的图元（#710）：四边形带（8）当三角带画（顶点序不变；零头 1 个丢掉；带索引又开着重启时按段展开成三角形列表），
 // 多边形（9）当三角扇画，线环（2）展开成线段列表的 32 位索引（每段末尾补一条回到段首的线）。
 // 还没接：间接计数多绘、变换反馈、邻接图元与面片、图元重启以外的小状态、存储缓冲与图像绑定、空槽假贴图。
+#include <math.h>
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -362,7 +363,8 @@ static struct { nvn_gpu_cmd c; uint64_t seg, gen, reg_gen; const struct rp_prog 
 // 同一段里内容相同就复用同一片 slice，省掉每笔每阶段的 memset + 拷贝。段号（rp_seg_serial）进键：段内暂存随段回收，跨段不能复用。
 // 键仍按内容整份存下来逐字节比（碰撞不会错内容）；上面那层 64 位摘要只是先筛一遍，省掉线性扫多格时的大块比较。
 typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st, base_instance; uint64_t sb[16][2], ub[16][2]; uint32_t dim[3]; uint8_t has_ub; } drv0_key;
-typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st; uint64_t h[32]; } drv2_key;
+// 驱动句柄表 c2 的全部来源（同 iOS nvn_mtl.m DRV2 的四张表）：组合槽 0..40、图像槽 0..7、分离贴图槽 0..127、分离采样器槽 0..127
+typedef struct { nvn_gpu_cmd c; uint64_t seg; uint32_t st; uint64_t h[41], img[8], sep[128], samp[128]; } drv2_key;
 // 表按 64 格两路探测；键里再放一个按字段算的 64 位摘要，先比摘要再比整键。
 // 真机上每帧 2292 次 DRV0 查询，原先线性扫 8 格 × 552 字节整键比较 ≈ 4.4 KB/次（一帧 10 MB 比较）。
 enum { DRV_CACHE_N = 64, DRV_CACHE_WAYS = 2 };
@@ -378,7 +380,9 @@ static uint64_t drv0_hash(const drv0_key *k) {   // 按字段算（不整块读�
 static uint64_t drv2_hash(const drv2_key *k) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)k->c;
     h = drv_mix(h, k->seg); h = drv_mix(h, k->st);
-    for (int r = 0; r < 32; r++) h = drv_mix(h, k->h[r]);
+    for (int r = 0; r < 41; r++) h = drv_mix(h, k->h[r]);
+    for (int r = 0; r < 8; r++) h = drv_mix(h, k->img[r]);
+    for (int r = 0; r < 128; r++) { h = drv_mix(h, k->sep[r]); h = drv_mix(h, k->samp[r]); }
     return h;
 }
 static struct { drv0_key k; uint64_t h; uint8_t ok; nvn_gpu_slice sl; } g_drv0c[DRV_CACHE_N]; static int g_drv0c_next;
@@ -519,6 +523,7 @@ static int fast_items_ok(const struct rp_prog *pg, int pi, int st, const nvn_gpu
             break;
         case NVN_RB_UBOA: return 0;
         case NVN_RB_TBUF: return 0;  // 临时缓冲视图每笔重新建并绑定
+        case NVN_RB_SPILL: return 0;   // 每次派发一片新的溢出缓冲
         case NVN_RB_TEX: case NVN_RB_TEXU: {
             // 这一笔刚解析出来的视图 / 采样器必须与上一组里的逐项相同：视图被轮转重建过就交给完整构造重发。
             const uint32_t cnt = e->count > 1 ? e->count : 1;
@@ -550,7 +555,128 @@ static int prog_layout_same(const struct rp_prog *a, const struct rp_prog *b, in
     }
     return 1;
 }
+// ---- 诊断（9000 设备丢失归因，不进产品路径）----
+// ① 环形记录：最近 256 次交给后端的绘制 / 计算派发（程序键、组数或顶点数、直接 / 间接、所在段、计算的存储目标地址与长度）。
+//    平时只写内存；段完成报「设备丢失 / 失败」时由 rp_exec.c 调 rp_lost_ring_dump 整段打进日志（每会话一次）。开关 nvk_lost_ring（缺省 1）。
+// ② 二分：nvk_skip_cs0..7 = 程序键前 7 个十六进制位（28 位）按十进制给（adb shell setprop debug.s2a.nvk_skip_cs0 $((0x37727c6))），
+//    命中的计算派发报名 compute_skipped_by_flag 跳过。
+struct lost_ent { uint64_t key, key2, seg; uint32_t kind, n[3], ind; uint32_t nst; struct { uint64_t addr; uint32_t len, rw; } st[4];
+                  uint64_t ind_addr, ind_off; nvn_gpu_buf ind_buf; uint32_t ind_bytes; };   // 间接绘制：参数在游戏内存的地址、镜像缓冲与偏移（倒出时读 5 个字）
+static struct lost_ent g_lost[256]; static uint32_t g_lost_n; static int g_lost_on = -1, g_lost_dumped;
+static uint64_t key_of(int st) { uint64_t k = 0; for (int b = 0; b < 8; b++) k = k << 8 | rp_S.skey[st][b]; return k; }
+static struct lost_ent *lost_next(void) {
+    if (g_lost_on < 0) g_lost_on = nvn_plat_flag("nvk_lost_ring", 1) != 0;
+    if (!g_lost_on) return NULL;
+    struct lost_ent *e = &g_lost[g_lost_n++ & 255]; memset(e, 0, sizeof *e); e->seg = rp_seg_serial(); return e;
+}
+static void watch_ring_dump(void);   // 盯计算的「最近 32 次」，定义在下面
+void rp_lost_ring_dump(const char *why) {
+    if (g_lost_on <= 0 || g_lost_dumped) return;
+    g_lost_dumped = 1;
+    uint32_t n = g_lost_n < 256 ? g_lost_n : 256, first = g_lost_n - n;
+    char m[400]; snprintf(m, sizeof m, "设备丢失归因：%s；最近 %u 次绘制 / 派发（旧 → 新，共记 %u 次）", why ? why : "?", n, g_lost_n);
+    nvn_plat_log(NVN_PLAT_LOG_RED, "replay", m);
+    for (uint32_t i = first; i < g_lost_n; i++) {
+        const struct lost_ent *e = &g_lost[i & 255]; int o;
+        if (e->kind == 1) o = snprintf(m, sizeof m, "  #%u 段 %llu 派发 %016llx %s %u×%u×%u", i, (unsigned long long)e->seg, (unsigned long long)e->key, e->ind ? "间接" : "直接", e->n[0], e->n[1], e->n[2]);
+        else {
+            o = snprintf(m, sizeof m, "  #%u 段 %llu 绘制 vs %016llx fs %016llx 图元 %u 数 %u 实例 %u%s", i, (unsigned long long)e->seg, (unsigned long long)e->key, (unsigned long long)e->key2, e->n[0], e->n[1], e->n[2], e->ind ? " 间接" : "");
+            if (e->ind && o > 0 && o < (int)sizeof m - 160) {   // 间接参数：镜像（GPU 看到的）与游戏内存各读 5 个字（顶点 / 索引数、实例数、起点、基顶点、基实例）
+                uint32_t g[5] = {0}, mm[5] = {0}; const uint8_t *mp = e->ind_buf ? nvn_gpu_buf_cpu(e->ind_buf) : NULL;
+                if (e->ind_addr) memcpy(g, (const void *)(uintptr_t)e->ind_addr, e->ind_bytes);
+                if (mp) memcpy(mm, mp + e->ind_off, e->ind_bytes);
+                o += snprintf(m + o, sizeof m - (size_t)o, " 参数 游戏 %#llx=[%u %u %u %u %u] 镜像=%s[%u %u %u %u %u]", (unsigned long long)e->ind_addr,
+                              g[0], g[1], g[2], g[3], g[4], mp ? "" : "（不可读）", mm[0], mm[1], mm[2], mm[3], mm[4]);
+            }
+        }
+        for (uint32_t k = 0; k < e->nst && o > 0 && o < (int)sizeof m - 48; k++) o += snprintf(m + o, sizeof m - (size_t)o, " 存储 %llx+%u%s", (unsigned long long)e->st[k].addr, e->st[k].len, e->st[k].rw ? " 写" : "");
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+    }
+    watch_ring_dump();
+}
+// ③ 盯计算核（诊断第二版）：nvk_cs_watch0..7 = 程序键前 28 位（同 skip 的写法）。命中的派发记下可写存储（游戏地址 + 长度）与采样 / 取像的贴图格
+//    （贴图号、尺寸、格式、级数、GPU 写过没有），每帧上屏时对「所在段之后又过了 3 段」的记录读游戏内存（GPU 结果此时已落地）打摘要：
+//    前 16 个字、最大字、非零字数。每个开关（每个被点名的键）各自最多 32 次，互不挤占；只记被点名的键。
+//    读前查可写区间还有没有待落地的 GPU 写（rp_buf_gpu_write_pending）：有就等，等过 64 段仍有则照读并标明「可能是旧值」。
+#define WATCH_PER_KEY 32
+//    另有「最近 32 次」：每键一个环（覆盖旧的），平时只写内存，设备丢失时随归因环一起倒出（派发行 + 当时读回的可写存储摘要）。
+struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth; struct { uint64_t addr; uint32_t len; } st[6]; char hdr[400]; };
+static struct watch_ent g_watch[8 * WATCH_PER_KEY]; static uint32_t g_watch_n, g_watch_cnt[8];
+static struct watch_ent g_wring[8][WATCH_PER_KEY]; static uint32_t g_wring_n[8];
+static void watch_sum(const struct watch_ent *w, const char *tag, uint64_t now, int pend) {
+    for (uint32_t k = 0; k < w->nst; k++) {
+        const uint32_t *p = (const uint32_t *)(uintptr_t)w->st[k].addr; uint32_t n = w->st[k].len / 4, mx = 0, nz = 0;
+        if (!p || !n) continue;
+        for (uint32_t j = 0; j < n; j++) { if (p[j] > mx) mx = p[j]; if (p[j]) nz++; }
+        char m[400]; int o = snprintf(m, sizeof m, "盯计算 键%u-#%u %s（段 %llu，读于段 %llu%s）：存储 %llx+%u 最大字 %u 非零字 %u/%u 前 16 字", w->slot, w->nth, tag, (unsigned long long)w->seg,
+                                      (unsigned long long)now, pend ? "，仍有未落地的 GPU 写，可能是旧值" : "", (unsigned long long)w->st[k].addr, w->st[k].len, mx, nz, n);
+        for (uint32_t j = 0; j < 16 && j < n && o > 0 && o < (int)sizeof m - 12; j++) o += snprintf(m + o, sizeof m - (size_t)o, " %u", p[j]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+    }
+}
+static int watch_pending(const struct watch_ent *w) {
+    for (uint32_t k = 0; k < w->nst; k++) if (rp_buf_gpu_write_pending(w->st[k].addr, w->st[k].len) == 1) return 1;
+    return 0;
+}
+// 设备丢失时调（rp_lost_ring_dump 里）：各键最近 32 次，旧 → 新
+static void watch_ring_dump(void) {
+    uint64_t now = rp_seg_serial();
+    for (int sl = 0; sl < 8; sl++) { uint32_t n = g_wring_n[sl]; if (!n) continue;
+        char m[200]; snprintf(m, sizeof m, "盯计算 键%d 最近 %u 次（共派发 %u 次，旧 → 新）：", sl, n < WATCH_PER_KEY ? n : WATCH_PER_KEY, n); nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+        for (uint32_t i = n > WATCH_PER_KEY ? n - WATCH_PER_KEY : 0; i < n; i++) { const struct watch_ent *w = &g_wring[sl][i % WATCH_PER_KEY];
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", w->hdr); watch_sum(w, "丢设备时", now, watch_pending(w)); }
+    }
+}
+static int cs_watched(void) {   // 命中第几号开关；没命中 −1
+    uint64_t top = key_of(5) >> 36;
+    for (int i = 0; i < 8; i++) { char nm[16]; snprintf(nm, sizeof nm, "nvk_cs_watch%d", i); int v = nvn_plat_flag(nm, 0); if (v > 0 && (uint64_t)v == top) return i; }
+    return -1;
+}
+static void watch_note(const struct rp_prog *pg, const p_dispatch *dp) {
+    int slot = cs_watched();
+    if (slot < 0) return;
+    struct watch_ent *w = &g_wring[slot][g_wring_n[slot]++ % WATCH_PER_KEY]; memset(w, 0, sizeof *w);
+    w->slot = (uint32_t)slot; w->nth = g_wring_n[slot];
+    w->key = key_of(5); w->seg = rp_seg_serial(); w->gx = g_disp_dim[0]; w->gy = g_disp_dim[1]; w->gz = g_disp_dim[2];
+    char *m = w->hdr; const size_t msz = sizeof w->hdr; int o = snprintf(m, msz, "盯计算 键%u-#%u：程序键 %016llx %s %u×%u×%u 段 %llu", w->slot, w->nth, (unsigned long long)w->key, dp->ind ? "间接" : "直接", w->gx, w->gy, w->gz, (unsigned long long)w->seg);
+    for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
+        if ((e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) && e->src_reg < 16) {
+            const p_bind_buf *sb = e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[5][e->src_reg] : &rp_S.ssbo[5][e->src_reg];
+            int rw = (e->access & NVN_GPU_ACC_W) != 0;
+            if (o > 0 && o < (int)msz - 48) o += snprintf(m + o, msz - (size_t)o, " 存储%u %llx+%u%s", (unsigned)e->src_reg, (unsigned long long)sb->addr, (unsigned)sb->size, rw ? "写" : "");
+            if (rw && w->nst < 6) { w->st[w->nst].addr = sb->addr; w->st[w->nst].len = (uint32_t)sb->size; w->nst++; }
+        } else if (e->src_kind == NVN_RB_TEX || e->src_kind == NVN_RB_IMG) {
+            uint64_t h = e->src_kind == NVN_RB_IMG ? rp_S.img[5][e->src_reg & 31] : e->src_reg >= 32 && e->src_reg < 40 ? rp_S.img[5][e->src_reg - 32] : rp_S.tex[5][e->src_reg];
+            tex_t t; view_t v; int hv = 0; int id = h ? (int)(h & 0xFFFFF) : rp_S.tex_base;
+            if (o > 0 && o < (int)msz - 80) {
+                if (rp_tex_snap_by_id(id, &t, &v, &hv)) o += snprintf(m + o, msz - (size_t)o, " %s槽%u→贴图%d %ux%u 格式%#x 级%u%s", e->src_kind == NVN_RB_IMG ? "图像" : "贴图", (unsigned)e->src_reg, id,
+                                                            t.d.width, t.d.height, (unsigned)t.d.format, t.d.levels, rp_tex_debug_state(t.serial) & 4 ? " GPU写过" : "");
+                else o += snprintf(m + o, msz - (size_t)o, " 贴图槽%u→贴图%d（未登记）", (unsigned)e->src_reg, id);
+            }
+        }
+    }
+    if (g_watch_cnt[slot] < WATCH_PER_KEY && g_watch_n < 8 * WATCH_PER_KEY) {   // 前 32 次：当场打一行，结果由上屏轮询读
+        g_watch_cnt[slot]++; g_watch[g_watch_n++] = *w; nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+    }
+}
+void rp_cs_watch_poll(void) {
+    uint64_t now = rp_seg_serial();
+    for (uint32_t i = 0; i < g_watch_n; i++) { struct watch_ent *w = &g_watch[i];
+        if (w->done || now < w->seg + 3) continue;
+        int pend = watch_pending(w);
+        if (pend && now < w->seg + 64) continue;   // GPU 写还没拷回游戏内存：再等
+        w->done = 1; watch_sum(w, "结果", now, pend);
+    }
+}
+static int cs_skipped_by_flag(void) {
+    uint64_t top = key_of(5) >> 36;
+    for (int i = 0; i < 8; i++) { char nm[16]; snprintf(nm, sizeof nm, "nvk_skip_cs%d", i); int v = nvn_plat_flag(nm, 0); if (v > 0 && (uint64_t)v == top) return 1; }
+    return 0;
+}
+
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec);
+static nvn_gpu_slice g_spill; static uint64_t g_spill_len;   // 本次派发的共享内存溢出缓冲（rp_dispatch 分配，绑定时用；0 = 没有）
+static int g_spill_on = -1, g_spill_said;   // 平台开关 nvk_spill（缺省开；关时 spill 程序的派发报名跳过，真机 A/B 用）；会话内前 64 次 spill 派发各记一行
 static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec); }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) {
     nvn_gpu_binding b[RP_PROG_ENT_MAX]; uint32_t n = 0;
@@ -677,16 +803,26 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 }
                 if (cacheable && flag_read("nvk_drv_memo")) drv0_store(&k, &sl);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV0_BYTES; if (btm) g_bt[3] += dt_now() - drv0_t0; break; }
-            case NVN_RB_DRV2: {   // 驱动的贴图句柄表：贴图槽 s 的句柄（贴图号 | 采样器号 << 20）在第 4 + s 个 8 字节项
-                enum { DRV2_BYTES = (RP_HANDLE_TABLE_FIRST_SLOT + 32) * 8 };
+            case NVN_RB_DRV2: {   // 着色器把驱动句柄表 c2 当常量缓冲读：按完整驱动表填（同 iOS nvn_mtl.m DRV2，C2_TEX / C2_IMG / C2_SEPTEX / C2_SAMP）
+                //   每项 8 字节、句柄在低 4 字节：组合槽 r 在 0x20 + 8r（r ≥ 32 与图像表同址，只在绑了该组合槽、且同址的图像槽没绑时写，同 iOS「Hades II」那条）；
+                //   图像槽 r 在 0x120 + 8r；分离贴图槽 r 在 0x168 + 8r；分离采样器槽 r 在 0x568 + 8r（采样器号 << 20）。整段 0xA00，其余为 0
+                enum { DRV2_BYTES = 0xA00, C2_TEX = 0x20, C2_IMG = 0x120, C2_SEPTEX = 0x168, C2_SAMP = 0x568 };
                 drv2_key k; memset(&k, 0, sizeof k); k.c = c; k.seg = rp_seg_serial(); k.st = (uint32_t)st;
-                for (int s = 0; s < 32; s++) k.h[s] = rp_S.tex[st][s];
+                for (int r = 0; r < 41; r++) k.h[r] = rp_S.tex[st][r];
+                for (int r = 0; r < 8; r++) k.img[r] = rp_S.img[st][r];
+                for (int r = 0; r < 128; r++) { k.sep[r] = rp_S.tex[st][128 + r]; k.samp[r] = rp_S.samp[st][r]; }
                 if (flag_read("nvk_drv_memo") && drv2_lookup(&k, &sl)) {
                     rp_perf_add(RP_PERF_BIND_SLICE_HIT, 1);
                     o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV2_BYTES; break;
                 }
                 if (!alloc_copy(c, DRV2_BYTES, NULL, &sl)) return skip("arena_alloc_failed", rec);
-                for (int s = 0; s < 32; s++) { uint64_t h = rp_S.tex[st][s]; memcpy(sl.cpu + (RP_HANDLE_TABLE_FIRST_SLOT + s) * 8, &h, 8); }
+                for (int r = 0; r < 8; r++) { uint32_t v = (uint32_t)k.img[r]; memcpy(sl.cpu + C2_IMG + 8 * r, &v, 4); }
+                for (int r = 0; r < 41; r++) {
+                    if (r >= 32 && (!k.h[r] || (r - 32 < 8 && k.img[r - 32]))) continue;
+                    uint32_t v = (uint32_t)k.h[r]; memcpy(sl.cpu + C2_TEX + 8 * r, &v, 4);
+                }
+                for (int r = 0; r < 128; r++) { uint32_t v = (uint32_t)k.sep[r]; memcpy(sl.cpu + C2_SEPTEX + 8 * r, &v, 4); }
+                for (int r = 0; r < 128; r++) { uint32_t v = (uint32_t)k.samp[r]; memcpy(sl.cpu + C2_SAMP + 8 * r, &v, 4); }
                 if (flag_read("nvk_drv_memo")) drv2_store(&k, &sl);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = DRV2_BYTES; break; }
             case NVN_RB_C1: {
@@ -705,6 +841,9 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, ub->size >> 10);
                 if (!slc_get(c, ub->addr, ub->size, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
+            case NVN_RB_SPILL:   // 共享内存溢出缓冲：rp_dispatch 按这次的组数分好的那一片
+                if (st != 5 || !g_spill_len) return skip("compute_spill_unallocated", rec);
+                o->u.b.buf = g_spill.buf; o->u.b.off = g_spill.off; o->u.b.len = g_spill_len; break;
             case NVN_RB_IMG: {
                 if (st != 5 || e->cls != NVN_GPU_RES_IMAGE || e->count > 1) return skip("compute_image_shape", rec);
                 if (!tv[i]) return skip("compute_image_unresolved", rec);
@@ -1025,7 +1164,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) rp_pass_flush(c);
+            if (!copied) { if (rp_pass_is_open()) rp_perf_add(RP_PERF_P_CUT_IND, 1); rp_pass_flush(c); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1217,6 +1356,9 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     a.prim = prim; a.count = count; a.instances = (uint32_t)(di ? di->instances : dr->instances); if (!a.instances) a.instances = 1; a.base_instance = base_instance;
     rp_occl_draw(c);
     nvn_gpu_draw(c, &a);
+    { struct lost_ent *le = lost_next();
+      if (le) { le->kind = 0; le->key = key_of(0); le->key2 = key_of(1); le->n[0] = a.prim; le->n[1] = a.count; le->n[2] = a.instances; le->ind = a.ind != NULL;   // NVN 阶段号：0 顶点、1 片元
+        if (a.ind) { le->ind_addr = ind; le->ind_buf = a.ind; le->ind_off = a.ind_off; le->ind_bytes = di ? 20 : 16; } } }
     // 首用跳过判据的 seen 标记：本笔真画成了，每个颜色/深度目标记「近两帧画过」（跳过的笔不走到这里，故不记）。
     if (rp_fu_enabled()) {
         uint64_t ff = rp_frame();
@@ -1266,10 +1408,45 @@ draw_done:
 // ---------- 调试：把「上屏那张图」和它上游几层的贴图读回落盘（开关 nvk_dump；rp_present 每 600 帧调一次） ----------
 // 每笔绘制记下目标序号和它采样的头几张贴图序号；从上屏的那张图往回走：画到它的那些笔采样了谁，再往上，至多 3 层、12 张。
 // 每张读第 0 级第 0 层的原始字节，写到缓存目录（没有就写诊断目录）的 nvkdump_<帧>_<层>_<序号>_<宽>x<高>_<格式>.raw。
-struct dump_job { nvn_gpu_buf buf; uint64_t bytes; char path[300]; };
+struct dump_job { nvn_gpu_buf buf; uint64_t bytes; char path[300]; uint32_t w, h, fmt, summary; };
+// 诊断：nvk_dump=2 时不落盘，只打亮度摘要（各通道均值、最大值、NaN / 无穷计数），给 8E / 9000 同场景对比中间目标亮度。
+//   认的格式：RGBA8 / RGBX8 / RGBA8_SRGB / BGRA8(_SRGB) / R8（按存储值 0..1，不做 sRGB 解码）、RGBA16F、RG16F、R16F、R11G11B10F、RGB10A2、R32F、RG32F、RGBA32F、
+//   DEPTH32F（深度值）；整数格式 RGBA8UI / RG16UI 打原始整数值（不归一）。
+static float dump_h2f(uint16_t h) { uint32_t s = (uint32_t)(h >> 15) << 31, e = h >> 10 & 31, m = h & 1023, f;
+    if (!e) { float v = (float)m / 1024.0f / 16384.0f; return s ? -v : v; }
+    if (e == 31) f = s | 0x7F800000u | m << 13; else f = s | (e + 112) << 23 | m << 13;
+    float r; memcpy(&r, &f, 4); return r; }
+static float dump_uf(uint32_t v, int mbits) { uint32_t e = v >> mbits, m = v & ((1u << mbits) - 1);
+    if (e == 31) return m ? NAN : INFINITY;
+    if (!e) return (float)m / (float)(1u << mbits) / 16384.0f;
+    return ldexpf(1.0f + (float)m / (float)(1u << mbits), (int)e - 15); }
+static void dump_summary(const struct dump_job *j, const uint8_t *p) {
+    int nc = 0, bpp = 0;
+    switch (j->fmt) { case 0x25: case 0x38: case 0x9A: case 0x9C: case 0x6D: case 0x27: nc = 4; bpp = 4; break; case 0x1: nc = 1; bpp = 1; break; case 0x14: nc = 2; bpp = 4; break; case 0x34: nc = 1; bpp = 4; break; case 0x29: nc = 4; bpp = 8; break; case 0x11: nc = 2; bpp = 4; break;
+        case 0x5: nc = 1; bpp = 2; break; case 0x3F: nc = 3; bpp = 4; break; case 0x3D: nc = 4; bpp = 4; break; case 0xA: nc = 1; bpp = 4; break;
+        case 0x16: nc = 2; bpp = 8; break; case 0x2E: nc = 4; bpp = 16; break; default: break; }
+    char m[300];
+    if (!nc || (uint64_t)j->w * j->h * (uint64_t)bpp > j->bytes) { snprintf(m, sizeof m, "亮度摘要 %s：格式 %#x 不认，跳过", j->path, j->fmt); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m); return; }
+    double sum[4] = {0}; float mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}; uint64_t bad = 0, n = (uint64_t)j->w * j->h;
+    for (uint64_t i = 0; i < n; i++) { const uint8_t *q = p + i * (uint64_t)bpp; float c[4] = {0};
+        switch (j->fmt) {
+        case 0x25: case 0x38: case 0x9A: case 0x9C: case 0x6D: for (int k = 0; k < 4; k++) c[k] = q[k] / 255.0f; break;
+        case 0x1: c[0] = q[0] / 255.0f; break;
+        case 0x27: for (int k = 0; k < 4; k++) c[k] = q[k]; break;
+        case 0x14: for (int k = 0; k < 2; k++) { uint16_t u; memcpy(&u, q + 2 * k, 2); c[k] = u; } break;
+        case 0x29: case 0x11: case 0x5: for (int k = 0; k < nc; k++) { uint16_t h; memcpy(&h, q + 2 * k, 2); c[k] = dump_h2f(h); } break;
+        case 0x3F: { uint32_t v; memcpy(&v, q, 4); c[0] = dump_uf(v & 2047, 6); c[1] = dump_uf(v >> 11 & 2047, 6); c[2] = dump_uf(v >> 22 & 1023, 5); } break;
+        case 0x3D: { uint32_t v; memcpy(&v, q, 4); c[0] = (v & 1023) / 1023.0f; c[1] = (v >> 10 & 1023) / 1023.0f; c[2] = (v >> 20 & 1023) / 1023.0f; c[3] = (v >> 30) / 3.0f; } break;
+        default: for (int k = 0; k < nc; k++) memcpy(&c[k], q + 4 * k, 4); break; }
+        for (int k = 0; k < nc; k++) { if (!isfinite(c[k])) { bad++; continue; } sum[k] += c[k]; if (c[k] > mx[k]) mx[k] = c[k]; } }
+    snprintf(m, sizeof m, "亮度摘要 %s：均值 %.4g %.4g %.4g %.4g 最大 %.4g %.4g %.4g %.4g 非有限 %llu", j->path,
+             sum[0] / (double)n, sum[1] / (double)n, sum[2] / (double)n, sum[3] / (double)n, mx[0], mx[1], mx[2], mx[3], (unsigned long long)bad);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m);
+}
 static void dump_done(void *user, const nvn_gpu_done *d) {
     struct dump_job *j = user;
-    if (d->status != NVN_GPU_DONE_FAILED) { FILE *f = fopen(j->path, "wb"); if (f) { fwrite(nvn_gpu_buf_cpu(j->buf), 1, (size_t)j->bytes, f); fclose(f); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", j->path); } }
+    if (d->status != NVN_GPU_DONE_FAILED && j->summary) dump_summary(j, nvn_gpu_buf_cpu(j->buf));
+    else if (d->status != NVN_GPU_DONE_FAILED) { FILE *f = fopen(j->path, "wb"); if (f) { fwrite(nvn_gpu_buf_cpu(j->buf), 1, (size_t)j->bytes, f); fclose(f); nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", j->path); } }
     nvn_gpu_buf_release(j->buf, NULL, NULL); free(j);
 }
 // 上屏线程只登记「要读回」；真正的读回在提交线程上、一次提交收尾时做（时间线的值只有提交线程能发）
@@ -1303,7 +1480,7 @@ static void dump_chain(uint64_t present_serial, uint64_t frame, uint64_t *fence)
         uint64_t row = (uint64_t)((ti.w + (uint32_t)bw - 1) / (uint32_t)bw) * (uint64_t)bpb, bytes = row * ((ti.h + (uint32_t)bh - 1) / (uint32_t)bh);
         struct dump_job *j = calloc(1, sizeof *j); nvn_gpu_err err = {0}; nvn_gpu_cmd c = NULL; nvn_gpu_cmd_desc cd = {0, "nvk dump"};
         if (!j || !nvn_gpu_ok(nvn_gpu_buf_create(bytes, NVN_GPU_MEM_SHARED, NULL, &j->buf, &err)) || !nvn_gpu_ok(nvn_gpu_cmd_begin(&cd, &c, &err))) { if (j && j->buf) nvn_gpu_buf_release(j->buf, NULL, NULL); free(j); continue; }
-        j->bytes = bytes; snprintf(j->path, sizeof j->path, "%s/nvkdump_%llu_%d_%llu_%ux%u_%#x.raw", dir, (unsigned long long)frame, depth[i], (unsigned long long)list[i], ti.w, ti.h, ti.nvn_format);
+        j->bytes = bytes; j->w = ti.w; j->h = ti.h; j->fmt = ti.nvn_format; j->summary = nvn_plat_flag("nvk_dump", 0) == 2; snprintf(j->path, sizeof j->path, "%s/nvkdump_%llu_%d_%llu_%ux%u_%#x.raw", dir, (unsigned long long)frame, depth[i], (unsigned long long)list[i], ti.w, ti.h, ti.nvn_format);
         nvn_gpu_copy_tex_buf(c, g, 0, 0, NULL, j->buf, 0, row, bytes);
         *fence += 1;
         nvn_gpu_rc cr = nvn_gpu_cmd_commit(c, *fence, dump_done, j, &err);
@@ -1325,6 +1502,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       int srx = rp_shader_resolve_compute(&pg);
       clock_gettime(CLOCK_MONOTONIC, &tsh); rp_perf_add(RP_PERF_DISP_SHADER_NS, (uint64_t)tsh.tv_sec * 1000000000ull + (uint64_t)tsh.tv_nsec - sh0);
       if (srx) { skip(srx > 0 ? "compute_program_not_ready" : "compute_program_unresolved", rec); return; } }
+    if (cs_skipped_by_flag()) { skip("compute_skipped_by_flag", rec); return; }
     static nvn_gpu_view tv[RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_ENT_MAX];
     memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts);
     const tex_t *images[RP_PROG_ENT_MAX] = {0};
@@ -1368,6 +1546,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     }
     { struct timespec tr1; clock_gettime(CLOCK_MONOTONIC, &tr1); rp_perf_add(RP_PERF_DISP_RESOLVE_NS, (uint64_t)tr1.tv_sec * 1000000000ull + (uint64_t)tr1.tv_nsec - r0); }
     { struct timespec tsb; clock_gettime(CLOCK_MONOTONIC, &tsb); uint64_t f0 = (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec;
+      if (rp_pass_is_open()) rp_perf_add(RP_PERF_P_CUT_DISP, 1);
       rp_pass_flush(c);
       clock_gettime(CLOCK_MONOTONIC, &tsb); rp_perf_add(RP_PERF_DISP_FLUSH_NS, (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec - f0); }
     g_disp_ind = NULL; g_disp_ind_off = 0;
@@ -1375,6 +1554,33 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       int bad = dp->ind && ((dp->ind & 3) || !rp_buf_resolve(c, dp->ind, 12, &g_disp_ind, &g_disp_ind_off));
       clock_gettime(CLOCK_MONOTONIC, &tin); rp_perf_add(RP_PERF_DISP_IND_NS, (uint64_t)tin.tv_sec * 1000000000ull + (uint64_t)tin.tv_nsec - in0);
       if (bad) { skip("dispatch_indirect_unresolved", rec); goto done; } }
+    // 共享内存溢出缓冲（同 iOS nvn_mtl.m dispatch 的 cs->spill）：每个线程组一片，按这次真正派发的组数分，派发后不留。
+    //   间接派发的组数在记录里：只在这几个字没有待落地的 GPU 写时按游戏内存里的实值分；GPU 写出的读不到，报名跳过，不猜上限。
+    g_spill_len = 0;
+    if (pg->spill_bytes) {
+        if (g_spill_on < 0) g_spill_on = nvn_plat_flag("nvk_spill", 1) != 0;
+        if (!g_spill_on) { skip("compute_spill_disabled", rec); goto done; }
+        uint64_t groups;
+        if (dp->ind) {
+            if (rp_buf_gpu_write_pending(dp->ind, 12) != 0) { skip("compute_spill_indirect_gpu_written", rec); goto done; }
+            uint32_t g3[3]; memcpy(g3, (const void *)(uintptr_t)dp->ind, sizeof g3);
+            groups = (uint64_t)g3[0] * g3[1] * g3[2];
+        } else groups = (uint64_t)dp->x * (uint64_t)dp->y * (uint64_t)dp->z;
+        if (!groups) groups = 1;   // 0 组的间接派发什么都不跑，绑定仍要合法
+        const uint64_t bytes = groups * pg->spill_bytes;
+        const nvn_gpu_caps *cap = caps_cached();
+        if (bytes > (512ull << 20) || (cap->max_ssbo_range && bytes > cap->max_ssbo_range)) { skip("compute_spill_too_large", rec); goto done; }
+        nvn_gpu_err err = {0};
+        nvn_gpu_rc arc = nvn_gpu_arena_alloc(c, bytes, cap->min_ssbo_align ? cap->min_ssbo_align : 256, &g_spill, &err);
+        if (!nvn_gpu_ok(arc)) { arena_fail_detail(arc, &err, bytes); skip("compute_spill_alloc_failed", rec); goto done; }
+        g_spill_len = bytes;
+        if (g_spill_said < 64) {
+            g_spill_said++; char m[200]; uint64_t key = 0; for (int b = 0; b < 8; b++) key = key << 8 | rp_S.skey[5][b];
+            snprintf(m, sizeof m, "spill 派发 #%d：程序键 %016llx，%s %llu 组 × %u 字节 = %llu 字节", g_spill_said, (unsigned long long)key,
+                     dp->ind ? "间接" : "直接", (unsigned long long)groups, pg->spill_bytes, (unsigned long long)bytes);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "replay", m);
+        }
+    }
     uint64_t key = (uint64_t)(uintptr_t)pg; nvn_gpu_pipe cp = nvn_hm_get(&g_cpipes, &key);
     if (!cp) {
         nvn_gpu_stage_desc cs; memset(&cs, 0, sizeof cs); cs.sh = pg->sh[0]; nvn_gpu_err err = {0};
@@ -1391,6 +1597,13 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) nvn_gpu_barrier(c, bar);
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
+    watch_note(pg, dp);
+    { struct lost_ent *le = lost_next();
+      if (le) { le->kind = 1; le->key = key_of(5); le->ind = dp->ind != 0; le->n[0] = g_disp_dim[0]; le->n[1] = g_disp_dim[1]; le->n[2] = g_disp_dim[2];
+        for (uint32_t i = 0; i < pg->nent[0] && le->nst < 4; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
+          if ((e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) || e->src_reg >= 16) continue;
+          const p_bind_buf *sb = e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[5][e->src_reg] : &rp_S.ssbo[5][e->src_reg];
+          le->st[le->nst].addr = sb->addr; le->st[le->nst].len = (uint32_t)sb->size; le->st[le->nst].rw = (e->access & NVN_GPU_ACC_W) != 0; le->nst++; } } }
     { struct timespec tse; clock_gettime(CLOCK_MONOTONIC, &tse); rp_perf_add(RP_PERF_DISP_BIND_NS, (uint64_t)tse.tv_sec * 1000000000ull + (uint64_t)tse.tv_nsec - b0); }
     g_dispatches++;
 done:
@@ -1402,6 +1615,8 @@ done:
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+    g_spill_on = -1; g_spill_said = 0;
+    g_lost_on = -1; g_lost_dumped = 0; g_lost_n = 0; g_watch_n = 0; memset(g_watch_cnt, 0, sizeof g_watch_cnt); memset(g_wring_n, 0, sizeof g_wring_n);
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }
