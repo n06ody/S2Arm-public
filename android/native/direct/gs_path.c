@@ -33,6 +33,18 @@ static void prop_str(const char *name, char *out, size_t n) {
 #endif
 }
 
+int s2a_caps_force_no_vertex_stores(void) {
+    if (!s2a_debug_entries_open()) return 0;
+    char v[8]; prop_str("debug.s2a.caps_no_vtx_stores", v, sizeof v);
+    return v[0] == '1';
+}
+unsigned s2a_caps_force_subgroup(void) {
+    if (!s2a_debug_entries_open()) return 0;
+    char v[16]; prop_str("debug.s2a.caps_subgroup", v, sizeof v);
+    unsigned n = (unsigned)strtoul(v, NULL, 10);
+    return n >= 4 && n <= 128 && !(n & (n - 1)) ? n : 0;
+}
+
 /* 0 = verdict decides, 1 = force compute, 2 = force hardware. */
 static int gs_force(void) {
     if (!s2a_debug_entries_open()) return 0;

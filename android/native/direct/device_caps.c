@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "device_caps.h"
+#include "gs_path.h"
 
 #define PUT(...) do { \
     int n = snprintf(out + used, used < cap ? cap - used : 0, __VA_ARGS__); \
@@ -156,6 +157,12 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
             device_local_host_visible = 1;
     }
 
+    // 诊断开关（只在调试档生效，见 gs_path.h）：子组宽度与顶点阶段存储按开关报，给 Adreno / Mali 分叉定位
+    const unsigned sg_force = s2a_caps_force_subgroup ? s2a_caps_force_subgroup() : 0;
+    const unsigned sg_size = sg_force ? sg_force : sg.subgroupSize;
+    const int no_vtx_stores = s2a_caps_force_no_vertex_stores ? s2a_caps_force_no_vertex_stores() : 0;
+    if (sg_force || no_vtx_stores) fprintf(stderr, "[s2a] 设备能力诊断开关：subgroupSize %u → %u，vertexPipelineStoresAndAtomics %s\n",
+                                           sg.subgroupSize, sg_size, no_vtx_stores ? "报 false" : "照实");
     PUT("{\"schema\":\"s2a-device-caps-v1\",\"apiVersion\":\"%u.%u.%u\",\"driverVersion\":%u,"
         "\"vendorId\":%u,\"deviceId\":%u,\"deviceType\":%u,",
         VK_VERSION_MAJOR(p->apiVersion), VK_VERSION_MINOR(p->apiVersion), VK_VERSION_PATCH(p->apiVersion),
@@ -179,7 +186,7 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         l->maxPerStageDescriptorUniformBuffers, l->maxPerStageDescriptorStorageBuffers,
         l->maxPerStageDescriptorStorageImages,
         (unsigned long long)l->minUniformBufferOffsetAlignment, (unsigned long long)l->minStorageBufferOffsetAlignment,
-        (unsigned long long)l->minTexelBufferOffsetAlignment, sg.subgroupSize, l->maxComputeWorkGroupInvocations,
+        (unsigned long long)l->minTexelBufferOffsetAlignment, sg_size, l->maxComputeWorkGroupInvocations,
         (double)l->maxSamplerAnisotropy);
 
     // geometryShaderOcclusionQuery 即通用侧 SupportsGeometryShaderOcclusionQuery 同一位：
@@ -196,7 +203,7 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         js_bool(f->geometryShader),
         js_bool(f->tessellationShader), js_bool(f->imageCubeArray),
         js_bool(f->shaderFloat64), js_bool(f->shaderInt64),
-        js_bool(f->fragmentStoresAndAtomics), js_bool(f->vertexPipelineStoresAndAtomics),
+        js_bool(f->fragmentStoresAndAtomics), js_bool(f->vertexPipelineStoresAndAtomics && !no_vtx_stores),
         js_bool(f->textureCompressionASTC_LDR), js_bool(f->textureCompressionBC),
         js_bool(f->textureCompressionETC2), js_bool(f->shaderStorageImageExtendedFormats),
         js_bool(f->independentBlend), js_bool(f->depthClamp), js_bool(f->multiViewport),
@@ -229,7 +236,7 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         if (!first) PUT(",");
         if (put_text(out, cap, &used, "VK_EXT_swapchain_maintenance1")) return -1;
     }
-    PUT("],\"subgroupSize\":%u}", sg.subgroupSize);
+    PUT("],\"subgroupSize\":%u}", sg_size);
     if (len) *len = used;
     return 0;
 }

@@ -189,6 +189,11 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                // 收通道的其余原因（每帧）：上一行只列了换目标 / 整屏清除 / 第二次同步，其余各处收通道在这里分开记，加起来与「收通道 N 次」对账
+                snprintf(b, sizeof b, "分时（收通道的其余原因，每帧）：拷贝与清贴图命令 %.1f、间接绘制取 base_instance %.1f、计算派发 %.1f、提交收尾 %.1f、落地挂起清除 %.1f、第一次遮挡复位 %.1f、区域扩大 %.1f；收通道共 %.1f",
+                         (double)pf[RP_PERF_P_CUT_OP] / f, (double)pf[RP_PERF_P_CUT_IND] / f, (double)pf[RP_PERF_P_CUT_DISP] / f, (double)pf[RP_PERF_P_CUT_SUBMIT] / f,
+                         (double)pf[RP_PERF_P_CUT_LAND] / f, (double)pf[RP_PERF_P_CUT_OCC] / f, (double)pf[RP_PERF_P_CUT_AREA] / f, (double)pf[RP_PERF_PASSEND_N] / f);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);
@@ -243,6 +248,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
         }
         rp_sync_lag_present();   // 开关 nvk_sync_lag=3：补一次「本帧只放行一次同步等待」的额度
         frame_gap_note();
+        rp_cs_watch_poll();
         if (!g_n_shown++ || g_n_shown % 600 == 0) {   // 首帧一行，之后每 600 帧一行
             uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns);
             char b[300]; snprintf(b, sizeof b, "第 %llu 帧已交给呈现：源 #%llu（格式 %#x，%s）%ux%u 裁剪 %d,%d %dx%d → 屏 %ux%u 的 %d,%d %dx%d（丢 %llu）；累计绘制 %llu 笔、跳过 %llu 笔", (unsigned long long)g_n_shown,
@@ -255,8 +261,10 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(line, sizeof line, "未接计数：%s", u); nvn_plat_log(NVN_PLAT_LOG_INFO, "present", line);
             }
             if (nvn_plat_flag("nvk_drawlog", 0)) rp_draw_log_arm(nvn_plat_flag("nvk_drawlog", 0) > 1 ? nvn_plat_flag("nvk_drawlog", 0) : 160);
-            if (nvn_plat_flag("nvk_dump", 0)) rp_debug_dump_request(t->serial, g_n_shown);   // 调试开关：把这张图和它上游的贴图读回落盘   // 调试开关：接下来的 160 笔绘制逐笔出日志
         }
+        // 调试开关：把这张图和它上游的贴图读回（nvk_dump=1 落盘，=2 只打亮度摘要）；间隔 nvk_dump_every 帧（缺省 600，首帧也读）
+        if (nvn_plat_flag("nvk_dump", 0)) { int every = nvn_plat_flag("nvk_dump_every", 600); if (every < 1) every = 600;
+            if (g_n_shown == 1 || g_n_shown % (uint64_t)every == 0) rp_debug_dump_request(t->serial, g_n_shown); }
     } else g_n_dropped++;
     pthread_mutex_unlock(&g_pmu);
     if (!nvn_gpu_ok(r) && r.code != NVN_GPU_E_OUTDATED && nvn_unimpl("present", "present_failed", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "present", err.why);
