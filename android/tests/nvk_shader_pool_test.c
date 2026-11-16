@@ -367,6 +367,12 @@ static void cs_variant_source(unsigned variant, uint8_t digest[32]) {
     s2a_sha256 h; s2a_sha256_init(&h); s2a_sha256_update(&h,ctl,sizeof ctl); s2a_sha256_update(&h,code,sizeof code); s2a_sha256_final(&h,digest);
     CHECK(!s2a_source_keep(digest, 0, code, sizeof code, ctl, sizeof ctl), "CS fixture source variant=%u", variant);
 }
+// 绑了图像槽 2 的那次编译请求里必须有 c2 字 76、cbufSlot −1 的事实（夹具 78 号是 RGBA8 2D）
+static void check_image_fact(int rc_mode) {
+    const char *t = strstr(captured, "\"textures\"");
+    CHECK(strstr(captured, "{\"stage\":\"cs\",\"handle\":76,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\"") != NULL,
+          "CS request carries the bound image's fact at c2 word 76 (reg_changes=%d): %.160s", rc_mode, t ? t : "(none)");
+}
 static void compute_fast_path_test(void) {
     for (int rc_mode = 1; rc_mode >= 0; rc_mode--) {
         const struct rp_prog *a = NULL, *b = NULL; uint8_t dig2[32];
@@ -406,6 +412,16 @@ static void compute_fast_path_test(void) {
         CS_MISS("changed CS texture fact recompiles", rp_S.tex[5][3] = 77, rp_S.tex[5][3] = 0);
         // 分离槽 100 的下标是 228：旧键只拷了 rp_S.tex[5] 的前 160 项，覆盖不到。
         CS_MISS("changed CS separate texture fact recompiles", bind_separate(5, 100, 1, 78), bind_separate(5, 100, 1, 0));
+        // 图像槽 2（c2 字 76）：绑上图像要进请求（图像事实）、快路也要认它；换成同格式的另一张不重编
+        captured[0] = 0;
+        CS_MISS("binding a CS image recompiles", rp_S.img[5][2] = 78, (check_image_fact(rc_mode), rp_S.img[5][2] = 0));
+        { const struct rp_prog *with_img = NULL; rp_S.img[5][2] = 78;
+          CHECK(rp_shader_resolve_compute(&with_img) == 0 && with_img && with_img != a, "CS image input has its own entry (reg_changes=%d)", rc_mode);
+          calls = compiler_calls; hits = nvk_shader_cs_fast_hits();
+          rp_S.img[5][2] = 79;   // 另一张同格式 / 目标 / 深度的图像：请求不变
+          CHECK(rp_shader_resolve_compute(&b) == 0 && b == with_img && compiler_calls == calls && nvk_shader_cs_fast_hits() == hits + 1,
+                "CS same-fact image handle reuses the program (reg_changes=%d)", rc_mode);
+          rp_S.img[5][2] = 0; calls = compiler_calls; hits = nvk_shader_cs_fast_hits(); }
 #undef CS_MISS
         // 来源登记冲突会毒化短键并推进代际：同一份状态不能再命中推进之前存下的快路表项（慢路仍给同一个程序、不重编）。
         { uint8_t wrong_code[16] = {9}, wrong_control[0x760] = {0};
@@ -424,7 +440,7 @@ static void compute_fast_path_test(void) {
               "after session reset the same CS state compiles again (reg_changes=%d)", rc_mode);
     }
     fake_cs_success = 0; separate_fixture = 0; fake_reg_changes = 1;
-    bind_separate(5, 100, 1, 0); memset(rp_S.ubo[5], 0, sizeof rp_S.ubo[5]); memset(rp_S.ssbo[5], 0, sizeof rp_S.ssbo[5]); memset(rp_S.tex[5], 0, sizeof rp_S.tex[5]);
+    bind_separate(5, 100, 1, 0); memset(rp_S.img[5], 0, sizeof rp_S.img[5]); memset(rp_S.ubo[5], 0, sizeof rp_S.ubo[5]); memset(rp_S.ssbo[5], 0, sizeof rp_S.ssbo[5]); memset(rp_S.tex[5], 0, sizeof rp_S.tex[5]);
     rp_shader_reset();
 }
 // 图形与计算共用的快表（#1146）：一帧里依次访问落在同一个旧桶（桶号低 9 位相同）的 5 个键。

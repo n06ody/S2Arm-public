@@ -489,6 +489,22 @@ int main(void) {
         nvn_vk_program_free_compute(&p);
     }
 
+    // 立即句柄直接读 c2 分离贴图表的字（空轨 2nd 9000：cs 也有）：slot 90..344 偶、无 samp_slot → 分离贴图槽 128 + k；表外 / 奇字照旧拒
+    {
+        static const struct { int slot, ok, want; } sep[] = {{90, 1, 128}, {344, 1, 255}, {92, 1, 129}, {91, 0, 0}, {346, 0, 0}, {88, 0, 0}};
+        for (unsigned k = 0; k < sizeof sep / sizeof sep[0]; k++) {
+            char b[160], why[192] = ""; struct nvn_vk_compute_program p;
+            snprintf(b, sizeof b, "{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":%d,\"count\":1}", sep[k].slot);
+            int rc = parse_case(b, "[]", "[]", &p, why, sizeof why);
+            checks++;
+            if (sep[k].ok && !(rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == sep[k].want && p.bindings[0].samp_slot == -1))
+                failf("compute direct separate texture", "slot %d 期望 接受、分离贴图槽 %d，真结果 rc=%d why=%s", sep[k].slot, sep[k].want, rc, why);
+            if (!sep[k].ok && !(rc != 0 && strstr(why, "compute texture slot outside recorded range")))
+                failf("compute direct separate texture", "slot %d 期望 拒绝，真结果 rc=%d why=%s", sep[k].slot, rc, why);
+            nvn_vk_program_free_compute(&p);
+        }
+    }
+
     // 计算阶段的图像：handleIndex 72..86 偶数 = 驱动 c2 图像句柄表第 0..7 槽（同 iOS C2_IMG），槽号 = (handleIndex−72)/2；表外拒绝并报 handleIndex
     {
         static const struct { int slot, ok, want; } img[] = {{72, 1, 0}, {86, 1, 7}, {71, 0, 0}, {88, 0, 0}, {74, 1, 1}};

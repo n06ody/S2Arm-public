@@ -296,7 +296,12 @@ namespace S2A.DirectCompiler
                     // 数组的第 k 项就是句柄表的第 k 个 8 字节项，宿主按项逐个绑（slot = 0、count = 数组长度），不需要逐句柄的事实。
                     bool handleTableArray = binding.Kind == "texture" && resolved.CbufSlot == 2 && resolved.ArrayLength > 1 &&
                                             resolved.HandleIndex == 0 && binding.Count == resolved.ArrayLength;
-                    if (!handleTableArray && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
+                    // 图像句柄从 c2 图像句柄表读（字节 0x120 + 8k = 字 72 + 2k，空轨 2nd 9000 计算「cbuf slot 2」）：这个字就是 BindImages 第 k 槽的句柄，
+                    //   与立即句柄 72 + 2k 同一个图像槽（计算解析器按 72..86 换算，同 iOS C2_IMG）；要有同字直接事实（宿主按图像槽出），数组不接。
+                    bool c2Image = binding.Kind == "image" && resolved.CbufSlot == 2 && resolved.HandleIndex >= 72 && resolved.HandleIndex < 88 &&
+                                   (resolved.HandleIndex & 1) == 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
+                                   entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot);
+                    if (!handleTableArray && !c2Image && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
                         throw new DirectCompileException("UNSUPPORTED_PROGRAM",
                             binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot + " is not implemented");
                 }
@@ -376,6 +381,19 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("SPIRV_INVALID", binding.Stage + " storage has no reflected descriptor");
                 ApplyStorageDescriptor(binding, found.Value);
             }
+        }
+
+        private static void WriteRanges(Utf8JsonWriter writer, int[][] ranges)
+        {
+            if (ranges == null) { writer.WriteNullValue(); return; }
+            writer.WriteStartArray();
+            foreach (int[] range in ranges)
+            {
+                writer.WriteStartArray();
+                writer.WriteNumberValue(range[0]); writer.WriteNumberValue(range[1]);
+                writer.WriteEndArray();
+            }
+            writer.WriteEndArray();
         }
 
         private static byte[] WriteContent(DirectProgram program, DirectProfile profile,
@@ -463,6 +481,16 @@ namespace S2A.DirectCompiler
                     WriteInfo(writer, shader.Info);
                     writer.WriteNumber("stateReadFlags", accessor.StateReadFlags);
                     writer.WriteNumber("attributeReadMask", accessor.AttributeReadMask);
+                    if (program.Kind == "graphics")
+                    {
+                        // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
+                        int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0Reads");
+                        WriteRanges(writer, stageReads);
+                    }
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();

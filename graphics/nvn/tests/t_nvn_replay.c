@@ -234,7 +234,9 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
 void nvn_gpu_set_pipe(nvn_gpu_cmd c, nvn_gpu_pipe p) { (void)c; (void)p; g_set_pipes++; }
 static struct nvn_gpu_pipe_s g_fcpipe;
 nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) { (void)mode; (void)err; g_cpipe_gets++; g_cpipe_sh = cs->sh; *out = &g_fcpipe; return (nvn_gpu_rc){NVN_GPU_OK}; }
+static int g_ncopy4;   // 4 字节的缓冲拷贝：间接绘制把 GPU 侧 base instance 拷进驱动段 c0 + 0x644
 void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    if (bytes == 4) { (void)c; (void)src; (void)soff; (void)dst; (void)doff; g_ncopy4++; return; }
     (void)c; (void)src; CHECK(dst == &g_arena_buf && g_buf_cpu_fake && bytes == 12);
     if (dst == &g_arena_buf && g_buf_cpu_fake) memcpy(g_arena + doff, g_buf_cpu_fake + soff, (size_t)bytes);
 }
@@ -1784,6 +1786,29 @@ static void t_pass_rt_continue(void) {   // 同目标续接：通道开着、没
     g_flag_rt_cont = 1; pass_fresh();
 }
 
+static p_copy_t2t *put_t2t(stream *s, const tex_t *src, const tex_t *dst);   // 定义在本文件后面
+// 收通道原因对账（空轨 2nd 9000：每帧 898 个通道里 886 个只有 0–1 笔，日志只列了换目标 37 次，其余收通道没有名字）：
+//   画一笔 → 通道外的贴图拷贝 → 再画一笔 → 交提交。期望两个通道：第一个被拷贝收掉、第二个被提交收尾收掉；各原因之和 = 收通道总数。
+static void t_pass_cut_reasons(void) {
+    pass_fresh(); g_resolve_rc = g_cresolve_rc = 0;
+    tex_t dst = mk_tex(93, 0x8000, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+    stream s = {0}; q_env(&s);
+    q_draw(&s);
+    put_t2t(&s, &g_qrt, &dst);
+    q_draw(&s);
+    end(&s);
+    uint64_t p0[RP_PERF_N]; rp_perf_take(p0);
+    submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    uint64_t p[RP_PERF_N]; rp_perf_take(p);
+    CHECK(p[RP_PERF_PASSES] == 2);
+    CHECK(p[RP_PERF_P_CUT_OP] == 1);        // 拷贝收掉第一个通道（修前这个计数从没加过）
+    CHECK(p[RP_PERF_P_CUT_SUBMIT] == 1);    // 提交收尾收掉第二个
+    uint64_t named = p[RP_PERF_P_CUT_RT] + p[RP_PERF_P_CUT_CLEAR] + p[RP_PERF_P_CUT_XFER] + p[RP_PERF_P_CUT_OP] + p[RP_PERF_P_CUT_IND] + p[RP_PERF_P_CUT_DISP] +
+                     p[RP_PERF_P_CUT_SUBMIT] + p[RP_PERF_P_CUT_LAND] + p[RP_PERF_P_CUT_OCC] + p[RP_PERF_P_CUT_AREA];
+    CHECK(named == p[RP_PERF_PASSEND_N]);   // 每次收通道都有名字
+    pass_fresh();
+}
+
 static void t_pass_state_keep(void) {   // 通道边界不再等于状态边界（开关 nvk_state_keep）：跨两个不同目标的通道，新通道第一笔不重发管线与绑定
     int second[2] = {-1, -1}, first = -1;
     for (int keep = 0; keep <= 1; keep++) {
@@ -3131,6 +3156,33 @@ static void t_draw_mdi(void) {
     CHECK(g_gdraws == d0 + 3 && nvn_unimpl_count("draw", "indirect_count_no_device_support") == nd0 + 1);
 }
 
+// 间接绘制的 base instance 拷贝只给读 c0 + 0x644 的阶段（rp_prog.binst_unread 位 = 编译器 c0Reads 证明不读）。
+//   每笔拷贝都要先收通道（拷贝得排在 GPU 生产者之后），所以同一通道里连着 3 笔间接绘制：要拷 = 3 个通道、3 次拷贝；都已证不读 = 1 个通道、0 次拷贝。
+//   真机读数（9000 空轨 2nd 进 3D）：每帧收通道 884 次里 844 次是这一处。紧跟 t_draw_mdi，沿用它的池与渲染目标。
+static void t_draw_ind_binst(void) {
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem, ind = base + 4 * PG;
+    struct rp_prog saved = g_fprog;
+    tex_t rtt = mk_tex(92, 0, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+    static const struct { uint8_t unread; int copies, passes; const char *what; } cases[] = {
+        { 0, 6, 3, "unknown / read: both stages copy, every indirect draw cuts the pass" },
+        { 1, 3, 3, "vs proven, fs still reads: only fs copies, the cut stays" },
+        { 3, 0, 1, "both stages proven: no copy, one pass for all three draws" },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        for (int st = 0; st < 2; st++) { g_fprog.nent[st] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[st][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_DRV0; e->count = 1; }
+        g_fprog.binst_unread = cases[k].unread; g_arena_used = 0;   // 替身暂存区 64 KB 不查越界：每段从头用（上一段已完成）
+        int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws;
+        stream s = {0}; mdi_prelude(&s, &rtt);
+        for (int i = 0; i < 3; i++) { p_draw_idx *di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->instances = 1; di->ibuf = base + 3 * PG; di->ind = ind + (uint64_t)i * 20; }
+        end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        if (g_gdraws - d0 != 3 || g_ncopy4 - c0 != cases[k].copies || g_npd - p0 != cases[k].passes) {
+            printf("  %s: draws %d copies %d passes %d (expect 3 / %d / %d)\n", cases[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0, cases[k].copies, cases[k].passes);
+            CHECK(0);
+        }
+    }
+    g_fprog = saved;
+}
+
 static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管线 / 动态状态 / 顶点流 / 绑定；没变的管线不重取；取不到的资源跳过并记账
     pass_fresh(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; memset(g_pmem, 0, sizeof g_pmem); g_arena_used = 0;
     g_pipe_gets = g_set_pipes = g_set_dyns = g_gdraws = g_nvb = g_resolves = g_resolve_rc = 0; memset(g_nfb, 0, sizeof g_nfb);
@@ -3316,7 +3368,7 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
     submit1(&x); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_gdraws == d0 + 19);   // 新拓扑6笔 + 点模式1笔成功 + #977 重启值改写 3 笔；不支持的线模式不绘制
     uint64_t dr_n = 0, sk_n = 0; rp_draw_stats(&dr_n, &sk_n); CHECK(dr_n == 22 && sk_n == 5);   // #977 间接 + 非全 1 重启值跳过 1 笔
-    g_resolve_rc = 0; t_draw_mdi();   // 间接计数多绘：放在 t_draw 末尾、池和贴图还没释放时，沿用同一套绑定（它多画的几笔不扰动上面按笔数的断言）
+    g_resolve_rc = 0; t_draw_mdi(); t_draw_ind_binst();   // 间接计数多绘：放在 t_draw 末尾、池和贴图还没释放时，沿用同一套绑定（它多画的几笔不扰动上面按笔数的断言）
     g_resolve_rc = 0; nvn_be_tex_release(&rtt); nvn_be_tex_release(&tx); nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
@@ -3601,6 +3653,7 @@ int main(int argc, char **argv) {
     t_pass_target_persists();
     t_pass_switch_and_partial();
     t_pass_rt_continue();
+    t_pass_cut_reasons();
     t_pass_state_keep();
     t_pass_clear_park();
     t_pass_clear_park_tail();

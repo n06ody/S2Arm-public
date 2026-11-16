@@ -1147,6 +1147,41 @@ internal static unsafe class Program
             Check(root.GetProperty("contentHash").GetString().StartsWith("sha256-"), "content hash");
         }
 
+        // 2b) 图形阶段的 c0Reads：回放按它决定间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+        //     真实翻译器（DrawParametersReplace）：cbdp 真时 VS 对 c0 + 0x644 / 0x640 的立即读换成内建，读集里不再有；
+        //     cbdp 假时照实列出；寄存器下标读 c0 分析不出 → null（未知，回放照旧拷）。
+        {
+            JsonElement[] C0Stages(ulong[] vsOps, bool cbdp, out string error)
+            {
+                error = null;
+                var node = System.Text.Json.Nodes.JsonNode.Parse(graphicsRequest);
+                node["program"]["stages"][0]["code"] = Convert.ToBase64String(Guest(false, vsOps));
+                node["program"]["stages"][0]["constantBufferUse"] = 1;
+                node["program"]["graphicsState"]["hasConstantBufferDrawParameters"] = cbdp;
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(node.ToJsonString())));
+                    return d.RootElement.GetProperty("content").GetProperty("stages").EnumerateArray().Select(x => x.Clone()).ToArray();
+                }
+                catch (Exception ex) { error = ex.Message; return null; }
+            }
+            JsonValueKind Kind(JsonElement stage) => stage.TryGetProperty("c0Reads", out var r) ? r.ValueKind : JsonValueKind.Undefined;
+            bool Covers(JsonElement stage, int offset) => stage.TryGetProperty("c0Reads", out var reads) && reads.ValueKind == JsonValueKind.Array &&
+                reads.EnumerateArray().Any(r => r[0].GetInt32() < offset + 4 && r[0].GetInt32() + r[1].GetInt32() > offset);
+            string Show(JsonElement[] st, string err) => err ?? string.Join(" / ", st.Select(x => x.GetProperty("stage").GetString() + "=" +
+                (x.TryGetProperty("c0Reads", out var r) ? r.GetRawText() : "(missing)")));
+            JsonElement[] binstOff = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, false, out string e1);
+            Check(binstOff != null && Covers(binstOff[0], 0x644) && Covers(binstOff[0], 0x610),
+                "cbdp false: VS c0Reads lists the base-instance word 0x644 and 0x610: " + Show(binstOff, e1));
+            JsonElement[] binstOn = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, true, out string e2);
+            Check(binstOn != null && Kind(binstOn[0]) == JsonValueKind.Array && !Covers(binstOn[0], 0x644) && Covers(binstOn[0], 0x610),
+                "cbdp true: VS base-instance read becomes the builtin, c0Reads keeps 0x610 and drops 0x644: " + Show(binstOn, e2));
+            JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
+            Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
+                "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+        }
+
         // 3) 同快照逐字节一致；transport 不进入内容键。
         byte[] again = DirectShaderCompiler.Compile(graphicsRequest);
         using (JsonDocument a = ParseResult(result)) using (JsonDocument b = ParseResult(again))
@@ -1560,7 +1595,8 @@ internal static unsafe class Program
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":0,\"samplerType\":\"2d-array\",\"format\":\"R16G16B16A16Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":8},"
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":4,\"samplerType\":\"cube-shadow\",\"format\":\"R32Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":6},"
                 + "{\"stage\":\"fs\",\"handle\":2,\"cbufSlot\":-1,\"samplerType\":\"buffer\",\"format\":\"R32Uint\",\"isBuffer\":true,\"normalized\":false,\"separate\":false,\"arrayLength\":1},"
-                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1}"
+                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1},"
+                + "{\"stage\":\"fs\",\"handle\":72,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":1}"
                 + "]";
             byte[] matrixRequest = RequestJson(profile, "graphics", 1, 1, "tex-matrix", vs, fs, textureFacts: facts,
                 textureBufferLengths: "{\"0\":8}");
@@ -1687,6 +1723,15 @@ internal static unsafe class Program
                 ("offset past 64 KiB", "offset outside 64 KiB", UboShape("texture", "texture", 1, 4, 0x4000, 1, false)) })
                 Check(outcome == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 4 is not implemented (" + shape + ")",
                     "user-UBO " + what + " handle stays unsupported: " + outcome);
+            // 图像句柄从 c2 图像句柄表读（字 72 + 2k，空轨 2nd 9000 计算「cbuf slot 2」）：有同字直接事实（宿主按图像槽出）→ 绑同号图像槽；
+            //   没有事实的槽、表外的字、数组照旧报未接
+            string c2Img = UboShape("image", "image", 1, 2, 72, 1, false);
+            Check(c2Img == "bound -1/-1/72", "c2 image-table word 72 with its direct fact binds image handle 72: " + c2Img);
+            foreach (var (what, handle, count, len) in new[] { ("without a fact", 74, 1, 1), ("outside the image table", 88, 1, 1), ("as an array", 72, 4, 4) })
+            {
+                string r = UboShape("image", "image", count, 2, handle, len, false);
+                Check(r == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 2 is not implemented", "c2 image word " + what + " stays unsupported: " + r);
+            }
             string c19 = UboShape("texture", "texture", 1, 19, 256, 1, false);
             Check(c19 == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 19 is not implemented", "cbuf 19 is outside the user UBO range: " + c19);
             // Facts alone do not implement separate binding; the production resolver must still refuse it.
@@ -1772,6 +1817,38 @@ internal static unsafe class Program
                     Check(false, "real separate c2 shader " + (reverse ? "reversed" : "forward") + " must compile: " + error.Code + " " + error.Message);
                 }
             }
+        }
+
+        // 立即句柄直接读 c2 分离贴图表（空轨 2nd 9000：fs「QuerySamplerType has no source (handle=90,cbufSlot=-1)」）：
+        //   TEX 的立即句柄 90 = c2 字节 0x168 = 分离贴图槽 0。宿主照真机只按 (90, cbufSlot 2, separate) 给事实；
+        //   期望编出贴图绑定 slot 90、无 samp_slot（采样器取同字）。负控：只有非分离事实、相邻字、采样器表的字都不借。
+        {
+            string Fact(int handle, int cbufSlot, bool separate) => "{\"stage\":\"fs\",\"handle\":" + handle + ",\"cbufSlot\":" + cbufSlot +
+                ",\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":" + (separate ? "true" : "false") + ",\"arrayLength\":1}";
+            string Direct(int tid, string facts)
+            {
+                byte[] shader = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, tid) });
+                try
+                {
+                    using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "direct-sep-" + tid, vs, shader, textureFacts: "[" + facts + "]")));
+                    string Field(JsonElement b, string name) => b.TryGetProperty(name, out JsonElement f) ? f.GetInt32().ToString() : "-";
+                    return string.Join(";", r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").Select(b => Field(b, "slot") + "/" + Field(b, "samp_slot")));
+                }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+            string got = Direct(90, Fact(90, 2, true));
+            Check(got == "90/-", "direct handle 90 (c2 separate texture slot 0) uses the (90, cbuf 2, separate) fact and binds slot 90: " + got);
+            got = Direct(124, Fact(124, 2, true));
+            Check(got == "124/-", "direct handle 124 (separate slot 17) binds slot 124: " + got);
+            got = Direct(90, Fact(90, 2, false));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=90,cbufSlot=-1"), "a non-separate (90, cbuf 2) fact is not borrowed: " + got);
+            got = Direct(92, Fact(90, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=92,cbufSlot=-1"), "another separate slot's fact is not borrowed: " + got);
+            got = Direct(346, Fact(346, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=346,cbufSlot=-1"), "a sampler-table word is not a separate texture: " + got);
+            got = Direct(8, Fact(8, -1, false));
+            Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
         }
 
         // 7c) guest UBO：c[0] 的 LDC 必须变成 set0 binding1 的 uniform binding、槽位 0，
