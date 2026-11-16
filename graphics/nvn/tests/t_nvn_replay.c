@@ -29,12 +29,14 @@ static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_
 void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
+static int g_flag_skip_cs0;     // 用例设：开关 nvk_skip_cs0（诊断：按程序键前 28 位跳过计算派发）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
+    if (!strcmp(name, "nvk_skip_cs0")) return g_flag_skip_cs0;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -3077,6 +3079,24 @@ static void t_dispatch_spill(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
+// 诊断：设备丢失时倒出最近的绘制 / 派发记录（每会话一次）；nvk_skip_cs0 = 程序键前 28 位时该计算派发报名跳过
+static void t_lost_ring_skip(void) {
+    pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0; rp_draw_reset();
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+    static const uint8_t key[8] = {0x37, 0x72, 0x7c, 0x65, 0xc9, 0x44, 0x02, 0x44}; memcpy(rp_S.skey[5], key, 8);
+    p_dispatch dp = {.x = 2, .y = 1, .z = 1}; int n = g_ndisp;
+    nvn_be_sub_begin(); rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 1);
+    uint64_t sk0 = nvn_unimpl_count("draw", "compute_skipped_by_flag");
+    g_flag_skip_cs0 = 0x37727c6; rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 1 && nvn_unimpl_count("draw", "compute_skipped_by_flag") == sk0 + 1);
+    g_flag_skip_cs0 = 0x37727c7; rp_dispatch(&g_fake_cmd, &dp, NULL);   // 别的程序键前缀：照常派发
+    CHECK(g_ndisp == n + 2);
+    g_flag_skip_cs0 = 0;
+    int red0 = g_red_lines; rp_lost_ring_dump("test"); rp_lost_ring_dump("again");
+    CHECK(g_red_lines == red0 + 1 && strstr(g_last_red, "最近 2 次"));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); memset(rp_S.skey[5], 0, 8); rp_draw_reset(); pass_fresh();
+}
+
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
@@ -3868,6 +3888,7 @@ int main(int argc, char **argv) {
     t_dispatch_barrier();
     t_dispatch_indirect_gpu();
     t_dispatch_spill();
+    t_lost_ring_skip();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();

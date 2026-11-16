@@ -143,6 +143,7 @@ int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
+void rp_lost_ring_dump(const char *why);   // 诊断：把最近 256 次绘制 / 派发记录打进日志（每会话一次；rp_draw.c）
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里
 void rp_pass_note_draw(int uses_ds);   // 一笔绘制进了当前通道（uses_ds：这笔开着深度测试 / 深度写 / 模板测试）
