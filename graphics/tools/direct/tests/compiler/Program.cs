@@ -1228,7 +1228,7 @@ internal static unsafe class Program
                 Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
                 // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
                 var defs = new Dictionary<uint, uint[]>();
-                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5) defs[x[2]] = x;
+                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
                 bool Decorated(uint id, uint dec, int value) => Insts(w).Any(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[1] == id && x[2] == dec && x[3] == (uint)value);
                 uint spillVar = Insts(w).Where(v => (v[0] & 0xFFFF) == 59 && v[3] == 2).Select(v => v[2]).FirstOrDefault(id =>
                     Decorated(id, 34, spills[0].GetProperty("set").GetInt32()) && Decorated(id, 33, spills[0].GetProperty("binding").GetInt32()));
@@ -1238,6 +1238,14 @@ internal static unsafe class Program
                         (consts.GetValueOrDefault(mul[3]) == 10240 || consts.GetValueOrDefault(mul[4]) == 10240));
                 Check(spillVar != 0 && spillChains.Length >= 3 && spillChains.All(x => Scaled(x[^1])),
                       "every spill access indexes slice (flat group id x 10240 words) + original index: chains " + spillChains.Length);
+                // 下标夹在本组片内：加到基址上的那一项 = OpSelect(idx < 10240, idx, 10239)
+                bool Clamped(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var sel) && (sel[0] & 0xFFFF) == 169 && consts.GetValueOrDefault(sel[5]) == 10239);
+                Check(spillChains.All(x => Clamped(x[^1])), "every spill index is clamped to the group's slice (select idx < 10240 ? idx : 10239)");
+                // 组号基址每个函数算一次：读 WorkgroupId 的次数不随访问次数涨（3 处访问、1 个函数 → 1 次）
+                uint gidVar = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11 && x[3] == 26).Select(x => x[1]).First();
+                int gidLoads = Insts(w).Count(x => (x[0] & 0xFFFF) == 61 && x.Length >= 4 && x[3] == gidVar);
+                Check(gidLoads == 1, "the group base is computed once per function, not per access: WorkgroupId loads " + gidLoads);
                 var barriers = Insts(w).Where(x => (x[0] & 0xFFFF) == 224).ToArray();
                 Check(barriers.Length > 0 && barriers.All(x => (consts.GetValueOrDefault(x[3]) & 0x140) == 0x140),
                       "workgroup barriers also order uniform (spill buffer) memory");
