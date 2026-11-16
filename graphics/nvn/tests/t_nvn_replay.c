@@ -744,6 +744,40 @@ static void t_pool_nested(void) {
             if (h1 && h2) CHECK(mm == (const uint8_t *)bb && oo == B + qo[i] - (uint64_t)(uintptr_t)mm && nn == BIG);
         }
     }
+    // ⑨ 快路：小池放回来，关掉备忘，查大池内、小池之后的地址两次——第二次必须走快路
+    nvn_be_pool_add(g_pn_arena + SMALL_OFF, SMALL);
+    CHECK(rp_pool_count() == n0 + 2);
+    pm_flag(0);
+    uint64_t fh0 = rp_pool_fast_hits();
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x4000, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh0);
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x4000, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh0 + 1);
+    // ⑩ 备忘：开着时同地址连查 3 次，备忘命中数要增加（可答区间没被小池切断）
+    pm_flag(1);
+    uint64_t hz0 = pm_hits();
+    // 先查一次小池内地址：把快路/备忘指向小池，随后的大池地址装不下，只能回落锁内并写入大池的记录
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x20, 0x40, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B + SMALL_OFF && n == SMALL);
+    for (int i = 0; i < 3; i++) {
+        m = NULL; n = 0;
+        CHECK(rp_pool_find(B + SMALL_OFF + 0x4100, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    }
+    CHECK(pm_hits() >= hz0 + 2);   // 后两次从备忘答出
+    // ⑪ 左端：[大池起点, 小池起点) 的地址连查两次，第二次走快路
+    pm_flag(0);
+    uint64_t fh1 = rp_pool_fast_hits();
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + 0x800, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh1);
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + 0x800, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh1 + 1);
+    pm_flag(1);
+    nvn_be_pool_del(g_pn_arena + SMALL_OFF);
+    CHECK(rp_pool_count() == n0 + 1);
     nvn_be_pool_del(g_pn_arena);
     CHECK(rp_pool_count() == n0);
 }
