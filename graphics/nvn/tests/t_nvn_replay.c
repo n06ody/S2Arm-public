@@ -2220,11 +2220,11 @@ static void vp_sc(stream *s, float w, float h) {
     p_scissor *sc = put(s, OP_SCISSOR, sizeof *sc); sc->x = 0; sc->y = 0; sc->w = (int32_t)w; sc->h = (int32_t)h;
 }
 static void t_pass_no_attachment(void) {
-    pass_fresh(); g_caps_extra = 0;
+    g_flag_noatt = 0; pass_fresh(); g_caps_extra = 0; g_noatt_lines = g_noatt_summaries = 0;
     int d0 = g_gdraws;
     stream s = {0}; q_env(&s); put_set_rt(&s, NULL, NULL); vp_sc(&s, 24, 20); q_draw(&s); end(&s);
     submit1(&s); fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_gdraws == d0 && g_npd == 0 && nvn_unimpl_count("pass", "no_attachment") == 1);
+    CHECK(g_gdraws == d0 && g_npd == 0 && nvn_unimpl_count("pass", "no_attachment") == 1 && g_noatt_lines == 0 && g_noatt_summaries == 0);
     pass_fresh(); g_caps_extra = NVN_GPU_CAP_NO_ATTACH_PASS;
     d0 = g_gdraws;
     stream s2 = {0}; q_env(&s2); put_set_rt(&s2, NULL, NULL);
@@ -2249,6 +2249,10 @@ static void t_noatt_diag(void) {
         stream a = {0}; q_env(&a); put_set_rt(&a, NULL, NULL); vp_sc(&a, 24, 20); q_draw(&a); end(&a);
         submit1(&a); fake_complete(NVN_GPU_DONE_OK);
         CHECK(g_gdraws == draws + 1 && g_noatt_lines == 1 && strstr(g_noatt_last, "why=rt_none") && strstr(g_noatt_last, "24x20"));
+        CHECK(strstr(g_noatt_last, "main=") && strstr(g_noatt_last, "vp_set=1") && strstr(g_noatt_last, "sc_set=1") &&
+              strstr(g_noatt_last, "pipe_samples=0 pass_samples=1") && strstr(g_noatt_last, "skey0=") && strstr(g_noatt_last, "skey5=") &&
+              strstr(g_noatt_last, "fs_color=") && strstr(g_noatt_last, "fs_ssbo=") && strstr(g_noatt_last, "fs_img="));
+        if (mode == 1) printf("合成日志：%s\n", g_noatt_last);
         tex_t bad = mk_tex(697, 0, NVN_FORMAT_DEPTH24_STENCIL8, 16, 16, 1, 0);
         stream b = {0}; q_env(&b); put_set_rt_v(&b, &bad, NULL); vp_sc(&b, 24, 20); q_draw(&b); end(&b);
         submit1(&b); fake_complete(NVN_GPU_DONE_OK);
@@ -2260,6 +2264,8 @@ static void t_noatt_diag(void) {
         }
         pass_fresh();
         CHECK(g_noatt_summaries == 1 && strstr(g_noatt_summary, "summary") && strstr(g_noatt_summary, "rt_none="));
+        if (mode == 1) { CHECK(strstr(g_noatt_summary, "total=67 rt_none=66 slots_dropped=1")); printf("合成汇总：%s\n", g_noatt_summary); }
+        else CHECK(strstr(g_noatt_summary, "total=1 rt_none=1 slots_dropped=0"));
     }
     g_flag_noatt = 0; g_caps_extra = 0; pass_fresh();
 }
