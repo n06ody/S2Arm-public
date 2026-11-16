@@ -90,6 +90,21 @@ namespace S2A.DirectCompiler
                     var accessor = new DirectGpuAccessor(profile, program, cs, 0, allocator, queries);
                     accessors.Add(accessor);
                     ShaderProgram shader = ShaderCache.DecodeComputeShader(accessor, TargetApi.Vulkan, 0).Translate();
+                    int limit = profile.Caps.MaximumComputeSharedMemorySize;
+                    if (shader.BinaryCode != null && program.Compute.SharedMemoryBytes > limit)
+                    {
+                        int shared = DirectSharedSpill.WorkgroupBytes(shader.BinaryCode);
+                        if (shared < 0 || shared > limit)
+                        {
+                            // 先量出要挪的字节数再占绑定号：Rewrite 用的就是这一号
+                            int spilled = shared < 0 ? 0 : shared;
+                            var pair = allocator.Spill("cs", 0);
+                            DirectSharedSpill.Result spill = DirectSharedSpill.Rewrite(shader.BinaryCode, limit, pair.SetIndex, pair.Binding)
+                                ?? throw new DirectCompileException("UNSUPPORTED_PROGRAM", "cs: shared memory " + spilled + " bytes could not be measured for spilling");
+                            allocator.Bindings[^1].SpillBytesPerGroup = spill.BytesPerGroup;
+                            shader = new ShaderProgram(shader.Info, shader.Language, spill.Spirv);
+                        }
+                    }
                     translated.Add((cs, shader, accessor));
                 }
                 else
@@ -483,6 +498,7 @@ namespace S2A.DirectCompiler
                     writer.WriteNumber("count", binding.Count);
                     if (binding.Slot >= 0) writer.WriteNumber("slot", binding.Slot);
                     if (binding.SamplerSlot >= 0) writer.WriteNumber("samp_slot", binding.SamplerSlot);
+                    if (binding.Kind == "spill") writer.WriteNumber("bytesPerGroup", binding.SpillBytesPerGroup);
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段
