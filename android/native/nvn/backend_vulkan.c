@@ -143,6 +143,7 @@ struct nvn_gpu_pipe_s {
     uint32_t stage_nent[6];
     uint32_t stage_push_off[6], stage_push_bytes[6];
     nvn_gpu_pipe_desc key;
+    uint32_t actual_samples; // 主机实际管线样本数；key 保留请求以匹配预热与查找。
     uint8_t warm;          // 1 = 这份对象是预热带 / 预热线程建的，真实 draw 第一次命中时计数（见 nvn_gpu_pipe_get）
     struct nvn_gpu_pipe_s *all_next;
     struct nvn_gpu_pipe_s *hnext;   // 图形管线的散列桶链（g_pipe_ht）
@@ -964,6 +965,51 @@ static uint32_t sample_bits_max(VkSampleCountFlags f) {
     for (uint32_t s = 1; s <= 64; s <<= 1)
         if (f & s) n = s;
     return n;
+}
+
+// 与 Metal 选择一致：只向下寻找，不把不支持的 2x 升成 4x。
+static uint32_t msaa_pick(uint32_t want, VkSampleCountFlags available) {
+    for (uint32_t n = want; n; n >>= 1) if (available & n) return n;
+    return 0;
+}
+
+struct msaa_notice { uint32_t fmt, requested; struct msaa_notice *next; };
+static pthread_mutex_t g_msaa_notice_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct msaa_notice *g_msaa_notices;
+static void msaa_notice_once(uint32_t fmt, uint32_t requested, uint32_t actual) {
+    int report = 1;
+    pthread_mutex_lock(&g_msaa_notice_mu);
+    for (struct msaa_notice *p = g_msaa_notices; p; p = p->next)
+        if (p->fmt == fmt && p->requested == requested) { report = 0; break; }
+    if (report) {
+        struct msaa_notice *p = malloc(sizeof *p);
+        if (p) { p->fmt = fmt; p->requested = requested; p->next = g_msaa_notices; g_msaa_notices = p; }
+    }
+    pthread_mutex_unlock(&g_msaa_notice_mu);
+    if (report) { char msg[160]; snprintf(msg, sizeof msg, "msaa_fallback: 格式 %#x 请求 %u 重采样，改用 %u", fmt, requested, actual); nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", msg); }
+}
+
+// 管线没有图像对象，按附件格式的支持集合计算共同采样数；真实图像的用途可能更严格，绑定时再核实。
+static int pipe_msaa_normalize(const nvn_gpu_pipe_desc *src, nvn_gpu_pipe_desc *dst) {
+    *dst = *src;
+    if (src->samples != 2 && src->samples != 4 && src->samples != 8 && src->samples != 16) return 1;
+    uint32_t formats[10], count = 0;
+    for (int i = 0; i < 8; i++) if (src->cfmt[i]) formats[count++] = src->cfmt[i];
+    if (src->dfmt) formats[count++] = src->dfmt;
+    if (src->sfmt && src->sfmt != src->dfmt) formats[count++] = src->sfmt;
+    VkSampleCountFlags available = ~(VkSampleCountFlags)0;
+    for (uint32_t i = 0; i < count; i++) {
+        VkFormat f = nvn_vk_tex_format(formats[i]);
+        if (f == VK_FORMAT_UNDEFINED) return 0;
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            (nvn_vk_format_is_depth(f) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        VkImageFormatProperties ip = {0};
+        if (vkGetPhysicalDeviceImageFormatProperties(g.phys, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &ip) != VK_SUCCESS) return 0;
+        available &= ip.sampleCounts;
+    }
+    if (!count) available = g.dev->properties.limits.framebufferNoAttachmentsSampleCounts;
+    dst->samples = msaa_pick(src->samples, available);
+    return dst->samples != 0;
 }
 
 static void caps_digest(const void *p, size_t n, uint8_t out[16]) {
@@ -2848,6 +2894,10 @@ static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
 // 装缓存由 pipe_install_locked 做（g_mu 下双检 + 着色器引用）。
 static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
     *out = NULL;
+    const nvn_gpu_pipe_desc *requested = d;
+    nvn_gpu_pipe_desc normalized;
+    if (!pipe_msaa_normalize(d, &normalized)) return fail(err, NVN_GPU_E_UNSUPPORTED, "msaa_pipeline_samples: 附件格式没有共同支持的采样数");
+    d = &normalized;
     // NVN POINT=0 / LINE=1 / FILL=2；完整 poly 已由 same_pipe_desc 纳入缓存键。
     if (d->poly.mode > 2) return fail(err, NVN_GPU_E_ARG, "未知多边形填充模式 %u", (unsigned)d->poly.mode);
     if (d->poly.mode != 2 && !g.dev->core_features.fillModeNonSolid)
@@ -3237,7 +3287,8 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
             }
         }
     }
-    p->key = *d;   // 装缓存时按它查重 / 定位散列桶；着色器引用到装的时候才加
+    p->actual_samples = d->samples > 1 ? d->samples : 1;
+    p->key = *requested;   // 以原请求查找：预热、在途表与缓存使用同一身份。
     *out = p;
     return rc(NVN_GPU_OK);
 }
@@ -3967,6 +4018,16 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     es_reset(c);   // 冗余状态消除：新通道先保守地全部重发（#708）
     if (!d || !d->w || !d->h) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 参数非法（尺寸为 0）"); return; }   // 一个附件都没有也合法（NVN_GPU_CAP_NO_ATTACH_PASS）：帧缓冲按 w / h
     if (d->depth.view && d->stencil.view && d->depth.view != d->stencil.view) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 的深度与模板必须是同一个视图"); return; }
+    uint32_t attachment_samples = 0;
+    for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (d->color[i].view) {
+        uint32_t n = d->color[i].view->tex->samples;
+        if (attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 颜色附件样本数不一致"); return; }
+        attachment_samples = n;
+    }
+    if (d->depth.view || d->stencil.view) {
+        uint32_t n = (d->depth.view ? d->depth.view : d->stencil.view)->tex->samples;
+        if (attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 深度与颜色附件样本数不一致"); return; }
+    }
     VkImageView fb_views[9];
     VkAttachmentDescription att[9];
     VkAttachmentReference col[8];
@@ -4076,6 +4137,9 @@ void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
     struct nvn_gpu_pipe_s *p = ph;
     if (!p) { set_sticky(c, NVN_GPU_E_ARG, "set_pipe 传了空管线"); return; }
     if (!c->in_pass && p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "图形管线在通道外 set_pipe"); return; }
+    if (c->in_pass && c->pass_natt && p->pass && p->actual_samples != c->pass_samples) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_pipeline_mismatch: 管线与附件样本数不一致"); return;
+    }
     // Already allocated stage data survives pipe changes. Expand before the next push/dispatch.
     for (int st = 0; st <= NVN_GPU_SH_CS; st++) {
         uint64_t end = (uint64_t)p->stage_push_off[st] + p->stage_push_bytes[st];
@@ -4171,6 +4235,10 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
         }
         const nvn_gpu_layout_ent *e = c->pipe->stage_nent[st] ? &c->pipe->stage_ents[st][b[i].ent] : NULL;
         if (e && e->cls != b[i].cls) { set_sticky(c, NVN_GPU_E_LAYOUT, "绑定项 %u 类别 %u != 布局 %u", i, b[i].cls, e->cls); return; }
+        struct nvn_gpu_tex_s *bt = bind_tex_of(&b[i]);
+        if (bt && bt->samples == 1 && (bt->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || bt->target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY)) {
+            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_sampled_single: 多重采样纹理降为单采样后不能作为多采样着色器输入"); return;
+        }
         c->binds[st][count].b = b[i];
         if (b[i].cls == NVN_GPU_RES_TEX_SAMP) {
             if (!b[i].u.ts.view || !b[i].u.ts.samp) {
@@ -5052,14 +5120,20 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     int ms_target = target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY;
     if (ms_target || samples > 1) {
         if (d->d.samples <= 1 || samples > 64 || (samples & (samples - 1)) || levels != 1 || itype != VK_IMAGE_TYPE_2D ||
-            ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !g.dev->core_features.shaderStorageImageMultisample) ||
             (d->d.samples > 1 && (target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY)))
             return fail(err, NVN_GPU_E_UNSUPPORTED, "多重采样计数/级数/目标不支持");
         VkImageFormatProperties ip = {0};
-        VkImageCreateFlags flags = iflags | ((d->usage & NVN_GPU_TEX_VIEW_FMT) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+        VkImageCreateFlags flags = iflags | (((d->usage & NVN_GPU_TEX_VIEW_FMT) || sample_fmt != fmt) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
         if (vkGetPhysicalDeviceImageFormatProperties(g.phys, fmt, itype, VK_IMAGE_TILING_OPTIMAL, usage, flags, &ip) != VK_SUCCESS ||
-            !(ip.sampleCounts & samples) || (uint32_t)d->d.width > ip.maxExtent.width || (uint32_t)d->d.height > ip.maxExtent.height || layers > ip.maxArrayLayers)
+            (uint32_t)d->d.width > ip.maxExtent.width || (uint32_t)d->d.height > ip.maxExtent.height || layers > ip.maxArrayLayers)
             return fail(err, NVN_GPU_E_UNSUPPORTED, "设备不支持该格式/usage 的 %u 重采样贴图", samples);
+        if (!(ip.sampleCounts & samples)) {
+            uint32_t actual = samples <= 16 ? msaa_pick(samples, ip.sampleCounts) : 0;
+            if (!actual) return fail(err, NVN_GPU_E_UNSUPPORTED, "设备不支持该格式/usage 的 %u 重采样贴图", samples);
+            samples = actual;
+        }
+        if (samples > 1 && (usage & VK_IMAGE_USAGE_STORAGE_BIT) && !g.dev->core_features.shaderStorageImageMultisample)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "多重采样存储图像特性未启用");
     }
 
     // P0-6：方形、≥6 层的二维数组可能被着色器当立方体读（同 iOS tex_fit 对二维数组底图建立方体视图）。Vulkan 的立方体视图要求
@@ -5163,6 +5237,8 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     g.texs = t;
     pthread_mutex_unlock(&g_mu);
     *out = t;
+    if (d->d.samples > 1 && samples != (uint32_t)d->d.samples)
+        msaa_notice_once((uint32_t)d->d.format, (uint32_t)d->d.samples, samples);
     { const uint64_t dt = now_ns() - tc_t0;   // 建贴图超过 3 毫秒单独记一行（走路 / 进新场景时会成批出现；nvk_hitch_log 开时才记）
       static int slowt = -1; if (slowt < 0) slowt = nvn_plat_flag("nvk_hitch_log", 0) != 0;
       if (slowt && dt > 3000000ull) { char b[160]; snprintf(b, sizeof b, "建贴图 %.1f 毫秒（%ux%u）", (double)dt / 1e6, d->d.width, d->d.height); nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", b); } }
