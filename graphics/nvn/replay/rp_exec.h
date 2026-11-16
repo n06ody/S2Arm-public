@@ -63,6 +63,7 @@ void rp_present_stats(uint64_t *shown, uint64_t *dropped);
 void rp_present_reset(void);
 
 // ---------- 绘制（rp_draw.c）----------
+void rp_pass_diag_program(uint32_t color_mask) __attribute__((weak));  // 隔离绘制夹具无通道模块时可缺；0xffffffff = unknown
 void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec);   // di 非空 = 带索引
 void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec);   // OP_MULTI_DRAW：整段间接计数多绘一次交后端
 void rp_draw_stats(uint64_t *draws, uint64_t *skips);

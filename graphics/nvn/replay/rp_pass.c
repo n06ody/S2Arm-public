@@ -15,6 +15,8 @@
 #include "nvn_plat.h"
 #include "nvn_fmt_info.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
@@ -40,6 +42,52 @@ static struct {
     uint32_t shape_c[8], shape_d, shape_s, shape_smp; int shape_ok;
     uint32_t na_w, na_h;          // 无附件通道（一个附件都没挂，只为片元副作用 / 遮挡计数）的帧缓冲尺寸；有附件的通道是 0
 } P;
+
+// 仅诊断包：统计开出的零附件通道，日志上限按局；帧号变化后主目标尺寸不沿用上一帧。
+static struct { uint64_t n, none, dropped, small, equal, large, mixed, unknown, frame; uint32_t main_w, main_h, mask; int frame_ok, mask_ok; } N;
+void rp_pass_diag_program(uint32_t color_mask) { N.mask = color_mask; N.mask_ok = 1; }
+static void noatt_add(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
+    if (*pos >= cap) return;
+    va_list ap; va_start(ap, fmt); int n = vsnprintf(buf + *pos, cap - *pos, fmt, ap); va_end(ap);
+    if (n > 0) *pos += (size_t)n < cap - *pos ? (size_t)n : cap - *pos;
+}
+static void noatt_main_size(uint32_t w, uint32_t h) {
+    uint64_t f = rp_frame(); if (!N.frame_ok || N.frame != f) { N.frame = f; N.frame_ok = 1; N.main_w = N.main_h = 0; }
+    N.main_w = w; N.main_h = h;
+}
+static void noatt_note(uint32_t w, uint32_t h, int any_color, const char *dropped) {
+    uint64_t f = rp_frame(); if (!N.frame_ok || N.frame != f) { N.frame = f; N.frame_ok = 1; N.main_w = N.main_h = 0; }
+    N.n++; if (any_color) N.dropped++; else N.none++;
+    if (!N.main_w || !N.main_h) N.unknown++;
+    else if (w == N.main_w && h == N.main_h) N.equal++;
+    else if (w <= N.main_w && h <= N.main_h) N.small++;
+    else if (w >= N.main_w && h >= N.main_h) N.large++;
+    else N.mixed++;
+    if (N.n > 64) return;
+    const tex_t *c0 = NULL; for (int i = 0; i < P.rt.n && i < 8 && !c0; i++) c0 = P.rt.color[i];
+    uint32_t samples = c0 ? (uint32_t)c0->d.samples : P.rt.depth ? (uint32_t)P.rt.depth->d.samples : 0;
+    char b[2048]; size_t n = 0;
+    noatt_add(b, sizeof b, &n, "noatt: frame=%llu why=%s size=%ux%u main=%ux%u vp_set=%d vp=%.3f,%.3f,%.3f,%.3f sc_set=%d sc=%d,%d,%d,%d pipe_samples=%u pass_samples=1 dropped=%s",
+              (unsigned long long)f, any_color ? "slots_dropped" : "rt_none", w, h, N.main_w, N.main_h, rp_S.has_vp,
+              rp_S.vp[0][0], rp_S.vp[0][1], rp_S.vp[0][2], rp_S.vp[0][3], rp_R.has_sc, rp_R.sc.x, rp_R.sc.y, rp_R.sc.w, rp_R.sc.h, samples, dropped[0] ? dropped : "none");
+    if (!N.mask_ok || N.mask == 0xffffffffu) noatt_add(b, sizeof b, &n, " fs_color=unknown");
+    else noatt_add(b, sizeof b, &n, " fs_color=0x%x", N.mask);
+    for (int st = 0; st < 6; st++) {
+        noatt_add(b, sizeof b, &n, " skey%d=", st);
+        if (!(rp_S.skey_ok & (1u << st))) noatt_add(b, sizeof b, &n, "unknown");
+        else for (int k = 0; k < 8; k++) noatt_add(b, sizeof b, &n, "%02x", rp_S.skey[st][k]);
+    }
+    noatt_add(b, sizeof b, &n, " fs_ssbo=");
+    for (int i = 0; i < 16; i++) if (rp_S.ssbo[1][i].addr && rp_S.ssbo[1][i].size)
+        noatt_add(b, sizeof b, &n, "%d:0x%llx,", i, (unsigned long long)rp_S.ssbo[1][i].addr);
+    noatt_add(b, sizeof b, &n, " fs_img=");
+    for (int i = 0; i < 32; i++) if (rp_S.img[1][i]) {
+        tex_t t; int id = (int)(rp_S.img[1][i] & 0xfffff);
+        if (rp_tex_snap_by_id(id, &t, NULL, NULL)) noatt_add(b, sizeof b, &n, "%d:#%llu,", i, (unsigned long long)t.serial);
+        else noatt_add(b, sizeof b, &n, "%d:unresolved_%d,", i, id);
+    }
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "pass", b);
+}
 
 // 视图看到的尺寸（像素）。块压缩基底配非压缩视图（一块当一个像素，见 bc_view）时按块数算：通道、整屏清除判断、清除矩形都用它
 static int bc_view(const tex_t *t, const view_t *v, int has_v, uint32_t *bw, uint32_t *bh);
@@ -450,14 +498,14 @@ int rp_pass_begin(nvn_gpu_cmd c) {
     const int tm_ = rp_tm();   // 分时抽样（#1103）：只在采样帧里计时
     uint64_t pb_ = tm_ ? pb_now() : 0;   // 四段计时：取附件视图 / 屏障 / 后端开通道 / 记 GPU 写过
     nvn_gpu_pass_desc d; memset(&d, 0, sizeof d);
-    int nattached = 0;
+    int nattached = 0; char dropped[256] = {0}; size_t ndrop = 0;
     int taken[9], ntake = 0;   // 这个通道吃掉的挂起项（开通道成功后才移出表：开不了要留着下次落地）
     for (int i = 0; i < P.rt.n; i++) {
         const tex_t *t = P.rt.color[i];
         if (!t) continue;   // 颜色槽里的空位：描述里留空（view = NULL），后端按「不用的槽」处理
-        if (dup_slot(i)) continue;   // 同一张图的同一级同一层挂了两个槽：只挂前一个（nvn_mtl.m rt_dup_slot @4797）
+        if (dup_slot(i)) { noatt_add(dropped, sizeof dropped, &ndrop, "%d:dup_slot,", i); continue; }   // 同一张图的同一级同一层挂了两个槽：只挂前一个（nvn_mtl.m rt_dup_slot @4797）
         uint32_t sbytes = 0; const char *why = NULL; int kind = slot_kind(i, &sbytes, &why);
-        if (kind < 0) { nvn_unimpl("pass", why, t); continue; }   // 深度 / 块压缩格式的图挂在颜色槽、又走不了影子：当空槽（画到这个槽的内容丢掉）
+        if (kind < 0) { noatt_add(dropped, sizeof dropped, &ndrop, "%d:%s,", i, why ? why : "unknown"); nvn_unimpl("pass", why, t); continue; }   // 深度 / 块压缩格式的图挂在颜色槽、又走不了影子：当空槽（画到这个槽的内容丢掉）
         int pk = park_color(i);   // 这个槽挂着待折清除：载入时清成挂起值
         view_t av;
         uint64_t sh0_ = kind ? pb_now() : 0;
@@ -473,9 +521,10 @@ int rp_pass_begin(nvn_gpu_cmd c) {
     d.ncolor = (uint32_t)P.rt.n; d.layers = 1;
     P.na_w = P.na_h = 0;
     if (!nattached && !P.rt.depth) {   // 一个附件都没挂（没设目标，或颜色槽全成了空槽）：后端能开无附件通道就按视口尺寸开，片元副作用 / 遮挡计数照常
-        if (!noatt_ok()) { rp_view_pin_end(); nvn_unimpl("pass", "no_attachment", NULL); return 0; }   // 开不了（iOS 现在）：这个通道的绘制跳过
+        if (!noatt_ok() || (any_color && nvn_plat_flag("nvk_noatt", 0) == 2)) { rp_view_pin_end(); nvn_unimpl("pass", "no_attachment", NULL); return 0; }   // 开不了（iOS 现在）：这个通道的绘制跳过
         if (!noatt_extent(&d.w, &d.h)) { rp_view_pin_end(); nvn_unimpl("pass", "no_attachment_no_extent", NULL); return 0; }
         P.na_w = d.w; P.na_h = d.h;
+        if (nvn_plat_flag("nvk_noatt", 0)) noatt_note(d.w, d.h, any_color, dropped);
     }
     if (!d.w && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &d.w, &d.h);   // 只有深度的通道（阴影图、深度预通道）：尺寸取深度目标的
     int pdpk = park_depth();   // 深度模板挂着的待折清除（一项可以带两面）
@@ -545,6 +594,7 @@ int rp_pass_begin(nvn_gpu_cmd c) {
         }
     }
     P.area_want = 0;
+    if ((nattached || P.rt.depth) && nvn_plat_flag("nvk_noatt", 0)) noatt_main_size(d.w, d.h);
     nvn_gpu_pass_begin(c, &d);
     PB(RP_PERF_PB_BE);
     rp_view_pin_end();
@@ -660,6 +710,10 @@ int rp_pass_parked(void) {
     return n;
 }
 void rp_pass_reset(void) {
+    if (N.n) { char b[300]; snprintf(b, sizeof b, "noatt: summary total=%llu rt_none=%llu slots_dropped=%llu size_smaller=%llu size_equal=%llu size_larger=%llu size_mixed=%llu size_unknown=%llu",
+        (unsigned long long)N.n, (unsigned long long)N.none, (unsigned long long)N.dropped, (unsigned long long)N.small, (unsigned long long)N.equal,
+        (unsigned long long)N.large, (unsigned long long)N.mixed, (unsigned long long)N.unknown); nvn_plat_log(NVN_PLAT_LOG_INFO, "pass", b); }
+    memset(&N, 0, sizeof N);
     memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all();
     for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }
     memset(g_sh, 0, sizeof g_sh);

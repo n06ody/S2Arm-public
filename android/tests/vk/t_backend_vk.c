@@ -46,6 +46,7 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) { (void)native;
 static int g_memo_on;
 static int g_shown_timing_test;
 void nvn_plat_safepoint(void) {}
+static int g_noatt_diag_flag;
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
@@ -58,6 +59,7 @@ static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_noatt")) return g_noatt_diag_flag;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_ulist") && g_ulist_flag >= 0) return g_ulist_flag;
     // 整套用例在 nvk_fbdrop=2（自检档）下跑：视图销毁走快路之后再全表扫一遍，扫到残留（反查表没记到的帧缓冲）就报红，main 末尾核「残留 0」。
@@ -5547,7 +5549,7 @@ static uint64_t g_c90_occ; static uint32_t g_c90_n;
 static void c90_done(void *user, const nvn_gpu_done *d) { (void)user; g_c90_n = d->nocclusion; if (d->nocclusion && d->occlusion) g_c90_occ = d->occlusion[0]; on_done(NULL, d); }
 static void c90_no_attachment(const char *dir) {
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
-    CHECK(!(caps.caps & NVN_GPU_CAP_NO_ATTACH_PASS), "C90 后端不声明无附件通道（#697 撤回）");
+    CHECK(!!(caps.caps & NVN_GPU_CAP_NO_ATTACH_PASS) == !!g_noatt_diag_flag, "C90 mode=%d 能力位不符", g_noatt_diag_flag);
     nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
     if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) { CHECK(0, "C90 读不到 solid_green"); return; }
     nvn_gpu_buf vb = full_vb();
@@ -8290,6 +8292,18 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (getenv("S2A_TEST_NOATT_DIAG_ONLY") && argc > 1) {
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "noatt-diag";
+        for (int mode = 0; mode <= 2; mode++) {
+            g_noatt_diag_flag = mode;
+            if (!open_backend()) { g_fail++; break; }
+            c90_no_attachment(argv[1]);
+            nvn_gpu_err err = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "C90 mode=%d close %s", mode, err.why);
+            printf("C90 diag mode=%d occlusion=%llu failures=%d\n", mode, (unsigned long long)g_c90_occ, g_fail);
+        }
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (getenv("S2A_TEST_PLC_ONLY") && argc > 1) {   // 开发时只跑 C89（run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         c89_midrun_save(argv[1]);

@@ -1038,6 +1038,13 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     c->caps |= NVN_GPU_CAP_BLIT_DEPTH_STENCIL; // 辅助绘制拷贝；具体格式仍须有采样与深度模板附件能力
     // 不声明 NVN_GPU_CAP_NO_ATTACH_PASS（11-15 撤回，#697）：零附件通道在 Mali-G710 r32p1 上让一款大作标题页 / 场景整片发红（d1c76bd63 起，
     //   关掉即好），根因待查；撤回后回放核心照 11-14 前把不挂目标的笔跳过。后端开零附件通道的能力本身保留（pass_begin / C90 照测）。
+    // 诊断包专用：同一二进制的 0/1/2 三臂，正式主线仍默认不声明。
+    int noatt_mode = nvn_plat_flag("nvk_noatt", 0);
+    if (noatt_mode == 1 || noatt_mode == 2) c->caps |= NVN_GPU_CAP_NO_ATTACH_PASS;
+    if (noatt_mode == 1 || noatt_mode == 2) {
+        char line[128]; snprintf(line, sizeof line, "noatt: device framebufferNoAttachmentsSampleCounts=0x%x mode=%d", (unsigned)l->framebufferNoAttachmentsSampleCounts, noatt_mode);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+    }
     // B2：设备 advertise VK_GOOGLE_display_timing 且 debug.s2a.display_timing=1（默认关）才有
     // 每帧实际上屏时刻可报——能力位如实反映 advertise∧启用，时刻取不到时按契约报 UNKNOWN。
     if (vk->dev->has_display_timing) c->caps |= NVN_GPU_CAP_SHOWN_TIME;
