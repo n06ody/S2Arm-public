@@ -98,6 +98,7 @@ struct nvn_vk_compute_storage {
     uint32_t index, offset; /* proven NVN slot / UBO slot and optional byte offset */
 };
 #define NVK_COMPUTE_C0_MAX_READS 256
+#define NVK_PROGRAM_RESULT_MAX_BYTES (64u * 1024u * 1024u)   // 编译结果文档上限：同跨局程序缓存单条（program_cache.c PCACHE_MAX_PAYLOAD）
 #define NVK_COMPUTE_C0_BYTES 0x410u
 struct nvn_vk_c0_read { uint32_t offset, size; };
 struct nvn_vk_support_scale { uint32_t offset, stride, count, element_bytes; };
