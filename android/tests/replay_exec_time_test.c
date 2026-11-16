@@ -55,6 +55,17 @@ int nvn_plat_flag(const char *name, int dflt) {
     return dflt;
 }
 void nvn_plat_safepoint(void) {}
+const char *nvn_plat_dir(int which) { (void)which; return NULL; }
+// 本夹具诊断关闭，若仍打 dispatch 标签则明确报红；能力零值替身与时间戳测试共用。
+void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) {
+    (void)c; (void)seq; (void)key; CHECK(0 && "diagnostic tag while disabled");
+}
+int nvn_gpu_diag_image_capture(nvn_gpu_cmd c, nvn_gpu_view v, nvn_gpu_buf *out, uint64_t *bytes, char *meta, size_t cap) { (void)c; (void)v; (void)out; (void)bytes; (void)meta; (void)cap; return 0; }
+nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) { (void)bytes; (void)mem; (void)init; (void)err; *out=NULL; return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED}; }
+uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b) { (void)b; return NULL; }
+void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn fn, void *user) { (void)b; (void)fn; (void)user; }
+void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf s, uint64_t so, nvn_gpu_buf d, uint64_t doff, uint64_t n) { (void)c; (void)s; (void)so; (void)d; (void)doff; (void)n; }
+
 static const char *g_unimpl_name;
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) { (void)cls; (void)site; g_unimpl_name = name; return 1; }
 
@@ -94,7 +105,12 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) { (void
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) { (void)c; (void)o; (void)rec; }
 void rp_op_copy_b2b(const void *a, const void *rec) { (void)a; (void)rec; }
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec) { (void)cb; (void)rec; }
+uint64_t nvn_gpu_diag_buf_bytes(nvn_gpu_buf b) { (void)b; return 0; }
+uint64_t rp_pool_generation(void) { return 1; }
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = 0; if (skips) *skips = 0; }
+int rp_buf_diag_snapshot(uint64_t addr, uint64_t len, void *out) { (void)addr; (void)len; (void)out; return 0; }
+uint64_t rp_dispatch_count(void) { return 0; }
+uint64_t rp_dispatch_spill_reserved(void) { return 0; }
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) { (void)c; (void)dp; (void)rec; }
 // OP_MULTI_DRAW（main 新增的整段间接计数多绘）在 rp_draw.c：本测试不测它，给个空实现闭合链接。
 void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) { (void)c; (void)m; (void)rec; }

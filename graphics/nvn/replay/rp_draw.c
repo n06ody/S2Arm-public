@@ -569,8 +569,14 @@ static int prog_layout_same(const struct rp_prog *a, const struct rp_prog *b, in
     return 1;
 }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec);
-static nvn_gpu_slice g_spill; static uint64_t g_spill_len;   // 本次派发的共享内存溢出缓冲（rp_dispatch 分配，绑定时用；0 = 没有）
-static int g_spill_on = -1, g_spill_said;   // 平台开关 nvk_spill（缺省开；关时 spill 程序的派发报名跳过，真机 A/B 用）；会话内前 64 次 spill 派发各记一行
+// 弱链接[replay]：rp_diag_bind
+// 弱链接[replay]：rp_diag_dispatch_begin
+extern void rp_diag_dispatch_begin(nvn_gpu_cmd) __attribute__((weak));
+// 弱链接[replay]：rp_diag_dispatch_encoded
+extern void rp_diag_bind(nvn_gpu_cmd, const struct rp_prog *, int, const nvn_gpu_binding *, uint32_t) __attribute__((weak));
+extern void rp_diag_dispatch_encoded(nvn_gpu_cmd) __attribute__((weak));
+static nvn_gpu_slice g_spill; static uint64_t g_spill_len, g_spill_reserved;   // 本次派发的共享内存溢出缓冲（rp_dispatch 分配，绑定时用；0 = 没有）
+static int g_spill_on = -1, g_spill_pad = -1, g_spill_said;   // 平台开关 nvk_spill（缺省开；关时 spill 程序的派发报名跳过，真机 A/B 用）；会话内前 64 次 spill 派发各记一行
 static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec); }
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) {
     nvn_gpu_binding b[RP_PROG_ENT_MAX]; uint32_t n = 0;
@@ -782,6 +788,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
         memcpy(g_lb[pi].b, b, (size_t)n * sizeof *b);
     }
     { const uint64_t bb = btm ? dt_now() : 0;
+      if (rp_diag_bind) rp_diag_bind(c, pg, st, b, n);
       nvn_gpu_bind(c, st == 5 ? NVN_GPU_SH_CS : (nvn_gpu_stage)st, b, n);
       if (btm) { const uint64_t be = dt_now(); g_bt[1] += be - bb; g_bt[2]++; g_bt[0] += be - btm0; } }
     return 1;
@@ -1410,6 +1417,15 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       int srx = rp_shader_resolve_compute(&pg);
       clock_gettime(CLOCK_MONOTONIC, &tsh); rp_perf_add(RP_PERF_DISP_SHADER_NS, (uint64_t)tsh.tv_sec * 1000000000ull + (uint64_t)tsh.tv_nsec - sh0);
       if (srx) { skip(srx > 0 ? "compute_program_not_ready" : "compute_program_unresolved", rec); return; } }
+    if (nvn_plat_flag("nvk_csk",0)) {
+        uint64_t wanted=(uint64_t)(uint32_t)nvn_plat_flag("nvk_csk_hi",0)<<32 | (uint32_t)nvn_plat_flag("nvk_csk_lo",0);
+        uint64_t key=0; for (int i=0;i<8;i++) key=key<<8 | rp_S.skey[5][i];
+        if ((rp_S.skey_ok & (1u<<5)) && wanted && key==wanted) {
+            char line[256]; snprintf(line,sizeof line,"csf skip key=%016llx program_resolved=1 spill_bytes=%u output_action=preserved dispatch=0",(unsigned long long)key,pg->spill_bytes);
+            nvn_plat_log(NVN_PLAT_LOG_WARN,"csf",line);
+            skip("compute_diag_key_skipped",rec); return;
+        }
+    }
     static nvn_gpu_view tv[RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_ENT_MAX];
     memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts);
     const tex_t *images[RP_PROG_ENT_MAX] = {0};
@@ -1477,7 +1493,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       if (bad) { skip("dispatch_indirect_unresolved", rec); goto done; } }
     // 共享内存溢出缓冲（同 iOS nvn_mtl.m dispatch 的 cs->spill）：每个线程组一片，按这次真正派发的组数分，派发后不留。
     //   间接派发的组数在记录里：只在这几个字没有待落地的 GPU 写时按游戏内存里的实值分；GPU 写出的读不到，报名跳过，不猜上限。
-    g_spill_len = 0;
+    g_spill_len = g_spill_reserved = 0;
     if (pg->spill_bytes) {
         if (g_spill_on < 0) g_spill_on = nvn_plat_flag("nvk_spill", 1) != 0;
         if (!g_spill_on) { skip("compute_spill_disabled", rec); goto done; }
@@ -1491,10 +1507,14 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
         const uint64_t bytes = groups * pg->spill_bytes;
         const nvn_gpu_caps *cap = caps_cached();
         if (bytes > (512ull << 20) || (cap->max_ssbo_range && bytes > cap->max_ssbo_range)) { skip("compute_spill_too_large", rec); goto done; }
+        if (g_spill_pad < 0) g_spill_pad = nvn_plat_flag("nvk_spill_pad", 1);
+        if (g_spill_pad != 1 && g_spill_pad != 2) { skip("compute_spill_pad_invalid", rec); goto done; }
+        // Diagnostic tail reservation only: descriptor range and per-group index stride stay unchanged.
+        const uint64_t reserved = bytes * (uint64_t)g_spill_pad; // bytes was bounded to 512 MiB above
         nvn_gpu_err err = {0};
-        nvn_gpu_rc arc = nvn_gpu_arena_alloc(c, bytes, cap->min_ssbo_align ? cap->min_ssbo_align : 256, &g_spill, &err);
-        if (!nvn_gpu_ok(arc)) { arena_fail_detail(arc, &err, bytes); skip("compute_spill_alloc_failed", rec); goto done; }
-        g_spill_len = bytes;
+        nvn_gpu_rc arc = nvn_gpu_arena_alloc(c, reserved, cap->min_ssbo_align ? cap->min_ssbo_align : 256, &g_spill, &err);
+        if (!nvn_gpu_ok(arc)) { arena_fail_detail(arc, &err, reserved); skip("compute_spill_alloc_failed", rec); goto done; }
+        g_spill_len = bytes; g_spill_reserved = reserved;
         if (g_spill_said < 64) {
             g_spill_said++; char m[200]; uint64_t key = 0; for (int b = 0; b < 8; b++) key = key << 8 | rp_S.skey[5][b];
             snprintf(m, sizeof m, "spill 派发 #%d：程序键 %016llx，%s %llu 组 × %u 字节 = %llu 字节", g_spill_said, (unsigned long long)key,
@@ -1517,9 +1537,11 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) nvn_gpu_barrier(c, bar);
+    if (rp_diag_dispatch_begin) rp_diag_dispatch_begin(c);
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     { struct timespec tse; clock_gettime(CLOCK_MONOTONIC, &tse); rp_perf_add(RP_PERF_DISP_BIND_NS, (uint64_t)tse.tv_sec * 1000000000ull + (uint64_t)tse.tv_nsec - b0); }
     g_dispatches++;
+    if (rp_diag_dispatch_encoded) rp_diag_dispatch_encoded(c);
 done:
     for (uint32_t i = 0; i < pg->nent[0]; i++)
         if (pg->ent[0][i].src_kind == NVN_RB_TBUF && tv[i]) nvn_gpu_view_release(tv[i]);
@@ -1527,9 +1549,11 @@ done:
     { struct timespec tsc; clock_gettime(CLOCK_MONOTONIC, &tsc); rp_perf_add(RP_PERF_DISP_TOT_NS, (uint64_t)tsc.tv_sec * 1000000000ull + (uint64_t)tsc.tv_nsec - t_disp0); }
 }
 
+uint64_t rp_dispatch_count(void) { return g_dispatches; }
+uint64_t rp_dispatch_spill_reserved(void) { return g_spill_reserved; }
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
-    g_spill_on = -1; g_spill_said = 0;
+    g_spill_on = g_spill_pad = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }

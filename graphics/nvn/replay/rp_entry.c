@@ -38,6 +38,8 @@ static int g_npool;
 // 「找池取镜像」每帧 20.6–23.0 毫秒 / 5619 次调用（≈4 微秒一次），就是这把锁与这张线性表。
 // 快路只在「池表代际没变」时生效：加池 / 删池都会推进代际，之后重新走锁内二分，不会读到销毁的池。
 static volatile uint64_t g_pool_epoch = 1;
+// Diagnostic provenance must not survive guest pool address reuse.
+uint64_t rp_pool_generation(void) { return __atomic_load_n(&g_pool_epoch, __ATOMIC_ACQUIRE); }
 // 上次命中的池（无锁读）：用奇偶序号做 seqlock，读侧看到序号变化就放弃快路——
 // 只靠「代际 + 两个字段」会被撕裂读（新起点配旧长度）误判成命中，进而把地址解析到错的池上。
 static volatile uint64_t g_pool_lh_seq;
@@ -291,7 +293,7 @@ void nvn_be_begin_session(void) {}
 int nvn_be_request_stop(void) { return 0; }
 int nvn_be_drain_session(void) { nvn_be_finish(); return 0; }
 void rp_exec_reset(void);
-int nvn_be_shutdown_session(void) { rp_exec_reset(); rp_draw_reset(); rp_shader_reset(); rp_pass_reset(); rp_res_reset(); rp_buf_reset(); rp_state_reset(); return 0; }   // 上屏面由平台件摘（rp_present_set_surface）
+int nvn_be_shutdown_session(void) { nvn_unimpl_diag_summary("session_retire", 0); rp_exec_reset(); rp_draw_reset(); rp_shader_reset(); rp_pass_reset(); rp_res_reset(); rp_buf_reset(); rp_state_reset(); return 0; }   // 上屏面由平台件摘（rp_present_set_surface）
 
 // ---------- Metal 侧诊断读数：新层没有对应账本，报 0 ----------
 double nvn_be_gpu_ms(uint64_t f) { (void)f; return 0; }
