@@ -19,6 +19,20 @@ nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
 int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+enum rp_buf_diag_kind { RP_BUF_OTHER, RP_BUF_VERTEX, RP_BUF_INDEX, RP_BUF_CONSTANT, RP_BUF_STORAGE, RP_BUF_KIND_N,
+    RP_BUF_INDEX_DIRECT = RP_BUF_KIND_N, RP_BUF_INDEX_INDIRECT_CLEAR, RP_BUF_INDEX_INDIRECT_PENDING, RP_BUF_INDEX_INDIRECT_UNKNOWN,
+    RP_BUF_INDEX_COUNT_CLEAR, RP_BUF_INDEX_COUNT_PENDING, RP_BUF_INDEX_COUNT_UNKNOWN, RP_BUF_INDEX_TAG_END };
+enum { RP_BUF_DIAG_BUCKETS = 6 };
+struct rp_buf_diag_row {
+    uint64_t slow, pages, dirty, fresh_pages, first, stale, map, untracked, pool_max;
+    uint64_t hist[RP_BUF_DIAG_BUCKETS];
+    uint64_t pool_hist[RP_BUF_DIAG_BUCKETS];
+    uint64_t index_slow[RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N], index_pages[RP_BUF_INDEX_TAG_END - RP_BUF_KIND_N];
+};
+int rp_buf_resolve_tag(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off, enum rp_buf_diag_kind kind);
+int rp_buf_resolve_multi_tag(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, enum rp_buf_diag_kind kind);
+int rp_buf_diag_take(struct rp_buf_diag_row out[RP_BUF_KIND_N]);
+enum rp_buf_diag_kind rp_buf_diag_indirect_tag(uint64_t addr, uint64_t len, uint64_t count_addr);
 // 写入区间日志（rp_draw 的暂存片复用判定用）：记号 + 「记号之后有没有人写过这一段」
 uint64_t rp_write_mark(void);
 int rp_write_touched(uint64_t mark, uint64_t addr, uint64_t len);
