@@ -24,9 +24,10 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200];
+static int g_csf_flag, g_csf_auto, g_csf_waits, g_csf_begin, g_csf_done, g_csf_indirect;
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "csf")) { if (strstr(text, "csf begin")) g_csf_begin++; if (strstr(text, "csf done")) g_csf_done++; if (strstr(text, "csf indirect")) g_csf_indirect++; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
@@ -34,6 +35,9 @@ static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_f
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csf")) return g_csf_flag;
+    if (!strcmp(name, "nvk_csf_a")) return 0x01020304;
+    if (!strcmp(name, "nvk_csf_b")) return 0x01020305;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
@@ -91,7 +95,12 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c) { c->live = 0; g_aborts++; }
 nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn done, void *user, nvn_gpu_err *err) {
     (void)err; c->live = 0; g_commits++; if (!c->is_pre) g_main_commits++; g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_npend++; return (nvn_gpu_rc){NVN_GPU_OK}; }
-nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
+static void fake_complete(uint32_t status);
+nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) {
+    (void)timeout_ns; (void)err;
+    if (g_csf_flag) { g_csf_waits++; if (g_csf_auto == 1) fake_complete(NVN_GPU_DONE_OK); }
+    return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT};
+}
 // 贴图 / 视图 / 采样器 / 上传：只记账
 struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; int ord; uint32_t px[4][4]; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; view_t v; nvn_gpu_buf buf; uint64_t off, bytes; uint32_t format; }; struct nvn_gpu_samp_s { int x; };   // ord：后端贴图的递增序号；px：像素替身（4 个 mip × 4 层各一个 32 位字）；v：建视图时收到的视图记录
 static int g_tex_creates, g_tex_releases, g_view_creates, g_view_releases, g_samp_creates, g_samp_releases, g_tex_create_fail, g_tex_ord;
@@ -3055,6 +3064,30 @@ static void t_dispatch_spill(void) {
 }
 
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
+// Diagnostic contract: completion is delivered before a successful wait; timeout never permits indirect reads.
+void rp_exec_reset(void);
+static void t_csf_fence(void) {
+    for (int mode = 0; mode < 3; mode++) {
+        pass_fresh(); rp_exec_reset(); g_csf_flag = mode != 0; g_csf_auto = mode == 1 ? 1 : 0;
+        g_csf_waits = g_csf_begin = g_csf_done = g_csf_indirect = 0;
+        uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        uint32_t xyz[3] = {2, 3, 4}; memcpy(g_pmem + 64, xyz, sizeof xyz);
+        static uint8_t mirror[sizeof g_pmem]; memset(mirror, 0, sizeof mirror); memcpy(mirror + 64, xyz, sizeof xyz); g_buf_cpu_fake = mirror;
+        memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+        g_cprog.nent[0] = 1; g_cprog.ent[0][0].cls = NVN_GPU_RES_UBO; g_cprog.ent[0][0].src_kind = NVN_RB_DRV0;
+        stream s = {0}; p_dispatch *dp = put(&s, OP_DISPATCH, sizeof *dp); dp->ind = base + 64; end(&s);
+        nvn_be_sub_begin(); rp_S.skey_ok |= 1u << 5; rp_S.skey[5][0] = 1; rp_S.skey[5][1] = 2; rp_S.skey[5][2] = 3; rp_S.skey[5][3] = 4;
+        int n = g_ndisp; nvn_be_exec(s.b);
+        CHECK(g_ndisp == n + 1);
+        if (mode == 0) CHECK(g_csf_begin == 0 && g_csf_waits == 0 && g_csf_indirect == 0);
+        if (mode == 1) CHECK(g_csf_begin == 1 && g_csf_waits == 2 && g_csf_done == 2 && g_csf_indirect == 1);
+        if (mode == 2) CHECK(g_csf_begin == 1 && g_csf_waits == 1 && g_csf_done == 0 && g_csf_indirect == 0);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_pmem); g_buf_cpu_fake = NULL;
+        g_csf_flag = g_csf_auto = 0; rp_exec_reset();
+    }
+    pass_fresh();
+}
+
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
     uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
@@ -3065,6 +3098,11 @@ static void t_dispatch_indirect_gpu(void) {
     g_buf_cpu_fake = mirror; nvn_be_sub_begin(); nvn_gpu_buf args; uint64_t off;
     CHECK(rp_buf_resolve(&g_fake_cmd, base + 64, 12, &args, &off));
     rp_post_gpu_write(base + 64, 12); memcpy(mirror + 64, gpu, 12);
+    // Synthetic caller models a successfully completed fence: stale guest must not be reported as GPU result.
+    uint32_t snapshot[3] = {0};
+    CHECK(rp_buf_diag_snapshot(base + 64, 12, snapshot) == 1 && !memcmp(snapshot, gpu, 12));
+    CHECK(rp_buf_diag_snapshot(base + 60, 16, snapshot) == 0); // partially covered pending write is unproven
+    CHECK(rp_buf_diag_snapshot(base + sizeof g_pmem - 8, 12, snapshot) == 0);
     g_dirty_written = ++g_dirty_now; // 旧guest所在页即使被轮询为脏，也不得盖GPU写区间。
     p_dispatch dp = {.ind = base + 64}; int n = g_ndisp;
     rp_dispatch(&g_fake_cmd, &dp, NULL);
@@ -3843,6 +3881,7 @@ int main(int argc, char **argv) {
     t_dispatch();
     t_dispatch_barrier();
     t_dispatch_indirect_gpu();
+    t_csf_fence();
     t_dispatch_spill();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();

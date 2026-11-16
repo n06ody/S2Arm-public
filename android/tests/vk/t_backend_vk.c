@@ -47,6 +47,7 @@ static int g_memo_on;
 static int g_shown_timing_test;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
+static atomic_int g_csf_test;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
@@ -59,6 +60,7 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csf")) return atomic_load(&g_csf_test);
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
         if (g_dsetrec_flag >= 0) return g_dsetrec_flag;
@@ -8798,6 +8800,38 @@ static int present_upscale_only(void) {
     return g_fail ? 1 : 0;
 }
 
+static atomic_int csf_done_count, csf_done_status, csf_time_kind;
+static atomic_ullong csf_gpu_ns;
+static void csf_test_done(void *user, const nvn_gpu_done *d) {
+    (void)user; atomic_store(&csf_done_status, (int)d->status); atomic_store(&csf_time_kind, (int)d->time_kind);
+    atomic_store(&csf_gpu_ns, d->gpu_dur_ns); atomic_fetch_add(&csf_done_count, 1);
+}
+static int csf_only(void) {
+    memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "csf-test";
+    if (!open_backend()) return 1;
+    uint32_t n = 0, bits = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_dev.physical, &n, NULL);
+    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
+    CHECK(q != NULL && n > g_dev.queue_family, "csf queue properties");
+    if (q) { vkGetPhysicalDeviceQueueFamilyProperties(g_dev.physical, &n, q); if (g_dev.queue_family < n) bits = q[g_dev.queue_family].timestampValidBits; free(q); }
+    nvn_gpu_buf b = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    for (int on = 0; on < 2; on++) {
+        atomic_store(&g_csf_test, on); atomic_store(&csf_done_count, 0); atomic_store(&csf_time_kind, -1);
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_fill_buf(c, b, 0, 16, 0x12345678);
+        nvn_gpu_err e = {0}; nvn_gpu_rc r = nvn_gpu_cmd_commit(c, (uint64_t)on + 1, csf_test_done, NULL, &e);
+        CHECK(OK(r), "csf submit %d: %d %s", on, r.code, e.why);
+        r = nvn_gpu_fence_wait((uint64_t)on + 1, 5000000000ull, &e);
+        CHECK(OK(r) && atomic_load(&csf_done_count) == 1 && atomic_load(&csf_done_status) == NVN_GPU_DONE_OK, "csf completed fence %d", on);
+        int kind = atomic_load(&csf_time_kind);
+        CHECK(kind == (on && bits ? NVN_GPU_TIME_DURATION : NVN_GPU_TIME_NONE), "csf timestamp on=%d validbits=%u kind=%d", on, bits, kind);
+        uint32_t got = 0; uint8_t *cpu = nvn_gpu_buf_cpu(b); if (cpu) memcpy(&got, cpu, sizeof got);
+        CHECK(cpu && got == 0x12345678, "csf completed buffer result");
+        printf("csf-vulkan on=%d validbits=%u kind=%d gpu_ns=%llu\n", on, bits, kind, atomic_load(&csf_gpu_ns));
+    }
+    atomic_store(&g_csf_test, 0); nvn_gpu_buf_release(b, NULL, NULL);
+    nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "csf close");
+    printf("csf-vulkan %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
+    return g_fail ? 1 : 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     if (getenv("S2A_TEST_COUNT_ONLY")) return c658_main(argc, argv);
@@ -8811,6 +8845,7 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (argc > 2 && !strcmp(argv[2], "--csf-only")) { int rc = csf_only(); s2a_vk_device_destroy(&g_dev, 1); return rc; }
     if (getenv("S2A_TEST_PLC_ONLY") && argc > 1) {   // 开发时只跑 C89（run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         c89_midrun_save(argv[1]);
