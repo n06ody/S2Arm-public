@@ -670,7 +670,11 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         if (dst->kind == 3) dst->tex_slot = (int16_t)((dst->slot - 72) / 2);   // 图像槽（复用 tex_slot 字段，见上）
         if (dst->kind == 2) {
             if (has_samp) dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);
-            else {
+            else if (dst->slot >= 72 && dst->slot < 88 && !(dst->slot & 1)) {
+                // 按贴图采样 c2 图像句柄表的字（字节 0x120 + 8k）：贴图槽 32 + k，回放取图像槽 k 绑着的句柄
+                //   （同 iOS nvn_mtl.m tex_slot_h：C2_TEX_SLOTS = 41，寄存器 32..39 落在图像表）
+                dst->tex_slot = (int16_t)(32 + (dst->slot - 72) / 2);
+            } else {
                 if (dst->slot >= 90 && dst->slot < 346 && !(dst->slot & 1))
                     dst->tex_slot = (int16_t)(128 + (dst->slot - 90) / 2);   // 直接读 c2 分离贴图表的字（同图形）
                 else if (dst->slot < 8 || dst->slot >= 72 || (dst->slot & 1)) CS_FAIL("compute texture slot outside recorded range");

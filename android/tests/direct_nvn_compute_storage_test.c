@@ -505,6 +505,22 @@ int main(void) {
         }
     }
 
+    // 按贴图采样 c2 图像句柄表的字（空轨 2nd compute_atmosphere_scatter：slot 72）：72..86 偶、无 samp_slot → 贴图槽 32 + k（同 iOS tex_slot_h）；奇字、表外照旧拒
+    {
+        static const struct { int slot, ok, want; } it[] = {{72, 1, 32}, {74, 1, 33}, {86, 1, 39}, {73, 0, 0}, {88, 0, 0}};
+        for (unsigned k = 0; k < sizeof it / sizeof it[0]; k++) {
+            char b[160], why[192] = ""; struct nvn_vk_compute_program p;
+            snprintf(b, sizeof b, "{\"stage\":\"cs\",\"kind\":\"texture\",\"set\":2,\"binding\":0,\"slot\":%d,\"count\":1}", it[k].slot);
+            int rc = parse_case(b, "[]", "[]", &p, why, sizeof why);
+            checks++;
+            if (it[k].ok && !(rc == 0 && p.binding_count == 1 && p.bindings[0].tex_slot == it[k].want && p.bindings[0].samp_slot == -1))
+                failf("compute texture from image table", "slot %d 期望 接受、贴图槽 %d，真结果 rc=%d why=%s tex_slot=%d", it[k].slot, it[k].want, rc, why, rc == 0 ? p.bindings[0].tex_slot : -99);
+            if (!it[k].ok && !(rc != 0 && strstr(why, "compute texture slot outside recorded range")))
+                failf("compute texture from image table", "slot %d 期望 拒绝，真结果 rc=%d why=%s", it[k].slot, rc, why);
+            nvn_vk_program_free_compute(&p);
+        }
+    }
+
     // 计算阶段的图像：handleIndex 72..86 偶数 = 驱动 c2 图像句柄表第 0..7 槽（同 iOS C2_IMG），槽号 = (handleIndex−72)/2；表外拒绝并报 handleIndex
     {
         static const struct { int slot, ok, want; } img[] = {{72, 1, 0}, {86, 1, 7}, {71, 0, 0}, {88, 0, 0}, {74, 1, 1}};

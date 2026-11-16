@@ -213,7 +213,9 @@ namespace S2A.DirectCompiler
         //   S2ARuntimeState 不能走缺省：缺省跟进程开关 TranslatorContext.S2ARuntimeState，同一请求在不同进程会编出不同代码；安卓直连宿主不填 s2a_flags / s2a_point
         public bool QueryGeometryInputFixed() => Record("QueryGeometryInputFixed", "", false, "direct-v1:vs-fs-only (no fixed geometry capture contract)");
         public bool QueryTexelFetch1DWrap() => Record("QueryTexelFetch1DWrap", "", false, "direct-v1:no-tbuf-as-2d host contract");
-        public bool QueryBindlessPhiSeeThrough() => Record("QueryBindlessPhiSeeThrough", "", false, "direct-v1:upstream bindless elimination");
+        // 句柄经多层 phi 汇合（循环 / 分支里每条路各算一次同一个 c2 字 OR）时按值逐层比叶子，认出唯一句柄。
+        //   同 iOS 翻译器 translator/dmsh_xlate/Program.cs（QueryBindlessPhiSeeThrough => true），两端不再分叉。
+        public bool QueryBindlessPhiSeeThrough() => Record("QueryBindlessPhiSeeThrough", "", true, "translator:phi-see-through (same as dmsh_xlate)");
         // 0 = 回退数组一律按池长（上游原样）：安卓宿主 textureArrayLength / samplerArrayLength 就是真实描述符池容量（vk_record.c OP_SET_TEX_POOL），
         //   贴图缓冲 / 图像也按池编号取；没有 nvn_mtl.m TEXD 那种按槽绑的约定，答 32 会把编号 ≥ 32 的贴图缓冲 / 图像夹到第 31 项读错图
         public int QueryBindlessSlotArrayLength() => Record("QueryBindlessSlotArrayLength", "", 0, "direct-v1:pool-length (no per-slot texture-buffer/image binding)");

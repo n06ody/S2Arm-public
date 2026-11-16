@@ -1816,6 +1816,30 @@ internal static unsafe class Program
             Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
         }
 
+        // 7b2) 同一对 c2 分离字在两条路径上各 OR 一次、汇合（phi）后才进 TEX.B（空轨 2nd compute_atmosphere_scatter 的形状）。
+        //      真实 decoder / translator：句柄要穿过 phi 按值比叶子才认得出（QueryBindlessPhiSeeThrough，同 iOS dmsh_xlate）。
+        //      循环里套分支，TEX 处的句柄 = phi(循环前算的 OR, phi(分支 A 的 OR, 分支 B 的 OR))：上游只比 phi 的直接输入（一个是 phi、一个是 OR）认不出。
+        //      R4 = R6|R7；L: TEX.B R0, R2, R4；@P0 BRA A；R4 = R6|R7；BRA J；A: R4 = R6|R7；J: @P0 BRA L。
+        {
+            const string separateFact = "[{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            // 槽位：Guest 每 3 条指令前插一个调度字，第 oi 条在第 (oi/3)*4 + oi%3 + 1 个 8 字节；BRA 目标 = 自身地址 + 8 + Imm24
+            static int Slot(int oi) => oi / 3 * 4 + oi % 3 + 1;
+            static ulong Bra(int from, int to, int pred) => 0xE240000000000000UL | ((ulong)((Slot(to) - Slot(from) - 1) * 8 & 0xFFFFFF) << 20) | ((ulong)pred << 16) | 0xFUL;
+            const ulong IsetpNeP0R1 = 0x3660000000000000UL | (5UL << 49) | (7UL << 39) | (7UL << 16) | (1UL << 8) | 7UL;   // ISETP.NE.AND P0, PT, R1, 0, PT
+            byte[] shader = Guest(true, new[] {
+                Ald(1, 0, 1), IsetpNeP0R1, Ldc(6, 0x168, 2), Ldc(7, 0x568, 2), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f),
+                LopOr(4, 6, 7), TexBindless2D(0, 2, 4), Bra(8, 11, 0), LopOr(4, 6, 7), Bra(10, 12, 7), LopOr(4, 6, 7), Bra(12, 7, 0) }, new[] { 1 });
+            try {
+                using JsonDocument phiResult = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "separate-c2-phi", vs, shader, textureFacts: separateFact, fsCbUse: 4)));
+                var binding = phiResult.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                    .Single(b => b.GetProperty("kind").GetString() == "texture");
+                Check(binding.GetProperty("slot").GetInt32() == 90 && binding.GetProperty("samp_slot").GetInt32() == 0,
+                      "phi-merged c2 separate handle resolves to texture word 90 and sampler slot 0");
+            } catch (DirectCompileException error) {
+                Check(false, "phi-merged c2 separate handle must compile: " + error.Code + " " + error.Message);
+            }
+        }
+
         // 7c) guest UBO：c[0] 的 LDC 必须变成 set0 binding1 的 uniform binding、槽位 0，
         //     并且 constantBufferUse 记录了用到的槽位（前端据此绑定 guest 常量缓冲）。
         {

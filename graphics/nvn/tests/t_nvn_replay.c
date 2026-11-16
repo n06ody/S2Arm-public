@@ -2806,6 +2806,26 @@ static void t_compute_image(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); pass_fresh();
 }
 
+// 计算核按贴图采样 c2 图像句柄表的字（贴图槽 32..39，同 iOS nvn_mtl.m tex_slot_h）：取图像槽 k 绑着的句柄，不读组合 / 分离贴图表的同号项。
+//   图像槽 0 绑贴图 3（已登记），贴图表第 32 项放一个没登记的号 9：取对了就能派发、视图非空；读错表就取不到视图、报名跳过。
+static void t_compute_tex_from_image(void) {
+    pass_fresh(); res_fresh(); g_arena_used = 0;
+    tex_t t = mk_tex(663, 0, NVN_FORMAT_RGBA8, 8, 8, 1, NVN_TEXTURE_FLAGS_IMAGE);
+    samp_par sp; memset(&sp, 0, sizeof sp);
+    nvn_be_reg_tex(3, &t, NULL); nvn_be_reg_samp(0, &sp); nvn_be_set_tex_pool_n(16);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+    g_cprog.nent[0] = 1;
+    nvn_gpu_layout_ent *e = &g_cprog.ent[0][0];
+    e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = 32; e->src_reg2 = UINT16_MAX; e->count = 1; e->access = NVN_GPU_ACC_R;
+    memset(rp_S.img[5], 0, sizeof rp_S.img[5]); rp_S.img[5][0] = 3; rp_S.tex[5][32] = 9;
+    p_dispatch dp = {.x = 1, .y = 1, .z = 1};
+    int n = g_ndisp; uint64_t un0 = nvn_unimpl_count("draw", "texture_slot_unresolved");
+    nvn_be_sub_begin(); rp_dispatch(&g_fake_cmd, &dp, NULL);
+    CHECK(g_ndisp == n + 1 && g_ncb == 1 && g_cb[0].cls == NVN_GPU_RES_TEX_SAMP && g_cb[0].u.ts.view && g_cb[0].u.ts.samp);
+    CHECK(nvn_unimpl_count("draw", "texture_slot_unresolved") == un0);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_S.img[5][0] = 0; rp_S.tex[5][32] = 0; pass_fresh();
+}
+
 // 贴图 → 贴图的拷贝：同尺寸同格式的逐层直接拷，各按自己视图的级与起始层；缩放 / 换格式 / 镜像 / 多重采样解析分开记账；目标从此以 GPU 为准。
 static p_copy_t2t *put_t2t(stream *s, const tex_t *src, const tex_t *dst) {
     p_copy_t2t *o = put(s, OP_COPY_T2T, sizeof *o + 2 * sizeof(tex_t)); tex_t *sn = (tex_t *)(o + 1); sn[0] = *src; sn[1] = *dst; o->src = &sn[0]; o->dst = &sn[1]; return o;
@@ -3617,6 +3637,7 @@ int main(int argc, char **argv) {
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
     t_compute_image();
+    t_compute_tex_from_image();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
     t_draw();
