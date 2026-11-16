@@ -451,31 +451,34 @@ static void hist_desc(char *m, size_t n, const struct hist_ent *e) {   // 一条
         if (e->pend) snprintf(m + o, n - (size_t)o, "，拷时源有未落地的 GPU 写（拷的是游戏内存，可能是旧值）");
     } else if ((e->kind == RP_TW_T2T || e->kind == RP_TW_BLIT) && e->tex[0]) snprintf(m + o, n - (size_t)o, " 源 #%llu", (unsigned long long)e->tex[0]);
 }
-static void wlog(const struct hist_ent *e, uint64_t n_all, const void *val, uint32_t vlen) {   // 调试开关 nvk_tex_wlog0/1 = 贴图序号：这张图每被写一次打一行
+static void wlog(const struct hist_ent *e, uint64_t n_all, const void *val, uint32_t vlen, int held) {   // 调试开关 nvk_tex_wlog0/1 = 贴图序号：这张图每被写一次打一行
     for (int k = 0; k < 2; k++) { int sv = nvn_plat_flag(k ? "nvk_tex_wlog1" : "nvk_tex_wlog0", 0);
-        if (sv <= 0 || (uint64_t)sv != e->target) continue;
+        if (sv <= 0) continue;
+        int same = (uint64_t)sv == e->target;   // 同一序号；或者写的是另一个序号、背后却是同一份存储（图像写 / 采样各用一个贴图对象时）
+        if (!same) { uint64_t u0, u1, m, z; same = rp_tex_debug_storage((uint64_t)sv, &u0, &m, &z, held) && rp_tex_debug_storage(e->target, &u1, &m, &z, held) && u0 == u1; }
+        if (!same) continue;
         uint32_t c = ++g_wlog_n[k]; if (c > 2048 && c % 256) continue;   // 前 2048 次每次都打，之后每 256 次打一次（行里带累计次数）
         char d[300], m[600]; hist_desc(d, sizeof d, e);
-        int o = snprintf(m, sizeof m, "写入日志 #%llu 第 %u 次（登记以来 %llu 次）：%s 段 %llu", (unsigned long long)e->target, c, (unsigned long long)n_all, d, (unsigned long long)e->seg);
+        int o = snprintf(m, sizeof m, "写入日志 #%d%s%llu 第 %u 次（登记以来 %llu 次）：%s 段 %llu", sv, (uint64_t)sv == e->target ? " 本序号 #" : " 同存储的 #", (unsigned long long)e->target, c, (unsigned long long)n_all, d, (unsigned long long)e->seg);
         if (val && vlen) { uint32_t w[4] = {0}; float f[4]; memcpy(w, val, vlen < 16 ? vlen : 16); memcpy(f, w, 16);
             o += snprintf(m + o, sizeof m - (size_t)o, "；值（前 %u 字节）%08x %08x %08x %08x = %.6g %.6g %.6g %.6g", vlen < 16 ? vlen : 16, w[0], w[1], w[2], w[3], (double)f[0], (double)f[1], (double)f[2], (double)f[3]); }
         else snprintf(m + o, sizeof m - (size_t)o, "；值在 GPU 上（见转储的亮度摘要）");
         nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m);
     }
 }
-static void hist_put(const struct hist_ent *e, const void *val, uint32_t vlen) {
+static void hist_put(const struct hist_ent *e, const void *val, uint32_t vlen, int held) {
     g_hist[g_hist_n++ % HIST_N] = *e;
     uint32_t s = (uint32_t)(e->target % 4096); if (g_lw[s].e.target != e->target) g_lw[s].n = 0;
     g_lw[s].e = *e; g_lw[s].n++;
-    wlog(e, g_lw[s].n, val, vlen);
+    wlog(e, g_lw[s].n, val, vlen, held);
 }
 static void hist_note(uint64_t target, const uint64_t *tex, int ntex, uint64_t key, uint64_t key2, int cs) {
     struct hist_ent e; memset(&e, 0, sizeof e); e.target = target;
     for (int k = 0; k < ntex && k < HIST_TEX; k++) e.tex[k] = tex[k];
     e.key = key; e.key2 = key2; e.kind = (uint8_t)(cs ? HW_CS : HW_DRAW); e.seg = rp_seg_serial();
-    hist_put(&e, NULL, 0);
+    hist_put(&e, NULL, 0, 0);
 }
-void rp_debug_tex_write(uint64_t serial, int kind, uint64_t src, uint64_t len, const void *val, uint32_t vlen) {
+void rp_debug_tex_write(uint64_t serial, int kind, uint64_t src, uint64_t len, const void *val, uint32_t vlen, int lock_held) {
     struct hist_ent e; memset(&e, 0, sizeof e); e.target = serial; e.kind = (uint8_t)kind; e.seg = rp_seg_serial(); e.len = (uint32_t)len;
     if (kind == RP_TW_B2T) {
         e.src = src; e.pend = rp_buf_gpu_write_pending(src, len) == 1;
@@ -483,7 +486,7 @@ void rp_debug_tex_write(uint64_t serial, int kind, uint64_t src, uint64_t len, c
         for (uint32_t i = 0; i < have; i++) { uint32_t j = (g_csw_n - 1 - i) % 512;   // 新 → 旧
             if (g_csw[j].addr < src + len && src < g_csw[j].addr + g_csw[j].len) { e.key = g_csw[j].key; e.key2 = g_csw[j].seg; break; } }
     } else if (kind == RP_TW_T2T || kind == RP_TW_BLIT) e.tex[0] = src;
-    hist_put(&e, val, vlen);
+    hist_put(&e, val, vlen, lock_held);
 }
 static int g_log_left;   // 逐笔日志还剩几行（调试开关 nvk_drawlog：上屏每 600 帧给下一帧开一次，见 rp_draw_log_arm）
 static int skip(const char *why, const void *rec) {
@@ -652,7 +655,7 @@ void rp_lost_ring_dump(const char *why) {
 //    读前查可写区间还有没有待落地的 GPU 写（rp_buf_gpu_write_pending）：有就等，等过 64 段仍有则照读并标明「可能是旧值」。
 #define WATCH_PER_KEY 32
 //    另有「最近 32 次」：每键一个环（覆盖旧的），平时只写内存，设备丢失时随归因环一起倒出（派发行 + 当时读回的可写存储摘要）。
-struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth; struct { uint64_t addr; uint32_t len; } st[6]; char hdr[400]; };
+struct watch_ent { uint64_t key, seg; uint32_t gx, gy, gz, nst, done, slot, nth; struct { uint64_t addr; uint32_t len; } st[6]; char hdr[640]; };
 static struct watch_ent g_watch[8 * WATCH_PER_KEY]; static uint32_t g_watch_n, g_watch_cnt[8];
 static uint32_t g_watch_arm;   // 随转储模式：哪些键等着打下一次派发（上屏线程登记转储时置满，提交线程逐键取走）
 static struct watch_ent g_wring[8][WATCH_PER_KEY]; static uint32_t g_wring_n[8];
@@ -708,8 +711,9 @@ static void watch_note(const struct rp_prog *pg, const p_dispatch *dp) {
             uint64_t h = e->src_kind == NVN_RB_IMG ? rp_S.img[5][e->src_reg & 31] : e->src_reg >= 32 && e->src_reg < 40 ? rp_S.img[5][e->src_reg - 32] : rp_S.tex[5][e->src_reg];
             tex_t t; view_t v; int hv = 0; int id = h ? (int)(h & 0xFFFFF) : rp_S.tex_base;
             if (o > 0 && o < (int)msz - 80) {
-                if (rp_tex_snap_by_id(id, &t, &v, &hv)) o += snprintf(m + o, msz - (size_t)o, " %s槽%u→贴图%d %ux%u 格式%#x 级%u%s", e->src_kind == NVN_RB_IMG ? "图像" : "贴图", (unsigned)e->src_reg, id,
-                                                            t.d.width, t.d.height, (unsigned)t.d.format, t.d.levels, rp_tex_debug_state(t.serial) & 4 ? " GPU写过" : "");
+                if (rp_tex_snap_by_id(id, &t, &v, &hv)) { uint64_t uid = 0, mem = 0, size = 0; rp_tex_debug_storage(t.serial, &uid, &mem, &size, 0);
+                    o += snprintf(m + o, msz - (size_t)o, " %s槽%u→贴图%d #%llu 存储 uid %llu %ux%u 格式%#x 级%u%s%s", e->src_kind == NVN_RB_IMG ? "图像" : "贴图", (unsigned)e->src_reg, id, (unsigned long long)t.serial, (unsigned long long)uid,
+                                  t.d.width, t.d.height, (unsigned)t.d.format, t.d.levels, rp_tex_debug_state(t.serial) & 4 ? " GPU写过" : "", e->access & NVN_GPU_ACC_W ? " 写" : ""); }
                 else o += snprintf(m + o, msz - (size_t)o, " 贴图槽%u→贴图%d（未登记）", (unsigned)e->src_reg, id);
             }
         }
@@ -1555,6 +1559,7 @@ static void hist_producers(uint64_t frame, uint64_t serial, int depth, uint64_t 
     if (g_lw[sl].e.target == serial && g_lw[sl].n && o < (int)sizeof m - 360) { hist_desc(d, sizeof d, &g_lw[sl].e);
         o += snprintf(m + o, sizeof m - (size_t)o, "；最后一次写 %s 段 %llu（登记以来 %llu 次）", d, (unsigned long long)g_lw[sl].e.seg, (unsigned long long)g_lw[sl].n); }
     else if (o < (int)sizeof m - 40) o += snprintf(m + o, sizeof m - (size_t)o, "；登记以来没见写入");
+    { uint64_t uid, mem, size; if (rp_tex_debug_storage(serial, &uid, &mem, &size, 0) && o < (int)sizeof m - 80) o += snprintf(m + o, sizeof m - (size_t)o, "；存储 uid %llu 内存 %#llx+%llu", (unsigned long long)uid, (unsigned long long)mem, (unsigned long long)size); }
     int st = rp_tex_debug_state(serial);
     if (st && o < (int)sizeof m - 64) snprintf(m + o, sizeof m - (size_t)o, "；状态%s%s%s%s", st & 1 ? " CPU 写过" : "", st & 2 ? " 已按 CPU 内容上传" : "", st & 4 ? " 内容以 GPU 为准" : "", st & 7 ? "" : " 无标记");
     nvn_plat_log(NVN_PLAT_LOG_INFO, "dump", m);

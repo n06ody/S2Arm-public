@@ -3001,6 +3001,28 @@ static void t_tex_write_log(void) {
     rp_S.ssbo[5][0].addr = 0; rp_S.ssbo[5][0].size = 0; memset(rp_S.skey[5], 0, 8); nvn_be_pool_del(g_pmem); rp_draw_reset(); pass_fresh();
 }
 
+// 诊断：写入日志按存储认——采样用的贴图对象和计算写的图像对象序号不同、背后是同一份存储时，图像写也记到盯的序号名下；转储链打存储 uid
+static void t_wlog_same_storage(void) {
+    pass_fresh(); res_fresh(); g_arena_used = 0; g_cresolve_rc = 0; rp_draw_reset();
+    tex_t smp = mk_tex(801, 0, NVN_FORMAT_RGBA8, 1, 1, 1, 0), img = mk_tex(802, 0, NVN_FORMAT_RGBA8, 1, 1, 1, NVN_TEXTURE_FLAGS_IMAGE), other = mk_tex(803, 0x4000, NVN_FORMAT_RGBA8, 1, 1, 1, NVN_TEXTURE_FLAGS_IMAGE);   // 替身后端的存储图像格式只认 RGBA8 一类
+    nvn_be_reg_tex(3, &img, NULL); nvn_be_reg_tex(4, &smp, NULL); nvn_be_reg_tex(5, &other, NULL); nvn_be_set_tex_pool_n(8);
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0]; g_cprog.nent[0] = 1;
+    nvn_gpu_layout_ent *e = &g_cprog.ent[0][0]; e->cls = NVN_GPU_RES_IMAGE; e->src_kind = NVN_RB_IMG; e->src_reg = 1; e->count = 1; e->access = NVN_GPU_ACC_W;
+    static const uint8_t key[8] = {0xfb, 0x82, 0x10, 0x0b, 0x5e, 0xa0, 0x13, 0x4b}; memcpy(rp_S.skey[5], key, 8);
+    nvn_be_sub_begin(); { tex_t snap; view_t sv; int hv; CHECK(rp_tex_snap_by_id(4, &snap, &sv, &hv)); nvn_gpu_view gv = rp_view_by_id(4, &g_fake_cmd, NULL); CHECK(gv != NULL); }   // 先把采样对象建出来
+    g_flag_tex_wlog0 = 801; g_info_wlog = 0; p_dispatch dp = {.x = 1, .y = 1, .z = 1}; int n = g_ndisp;
+    memset(rp_S.img[5], 0, sizeof rp_S.img[5]); rp_S.img[5][1] = 3; rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 1);
+    int same = 0; for (int i = 0; i < 4 && i < g_info_wlog; i++) if (strstr(g_wlog[i], "写入日志 #801 同存储的 #802") && strstr(g_wlog[i], "计算 fb82100b5ea0134b")) same = 1;
+    CHECK(same);
+    int w0 = g_info_wlog; rp_S.img[5][1] = 5; rp_dispatch(&g_fake_cmd, &dp, NULL); CHECK(g_ndisp == n + 2);   // 别的存储：不记
+    int leak = 0; for (int i = w0; i < g_info_wlog; i++) if (strstr(g_wlog[i & 3], "#803")) leak = 1;
+    CHECK(!leak);
+    g_info_chain = 0; uint64_t fence = 0; rp_debug_dump_request(801, 4); rp_debug_dump_poll(&fence);
+    CHECK(g_info_chain >= 1 && strstr(g_chain[0], "#801 层 0") && strstr(g_chain[0], "；存储 uid "));
+    g_info_chain = 0; g_flag_tex_wlog0 = 0; rp_S.img[5][1] = 0; memset(rp_S.skey[5], 0, 8);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_draw_reset(); pass_fresh();
+}
+
 // 计算核按贴图采样 c2 图像句柄表的字（贴图槽 32..39，同 iOS nvn_mtl.m tex_slot_h）：取图像槽 k 绑着的句柄，不读组合 / 分离贴图表的同号项。
 //   图像槽 0 绑贴图 3（已登记），贴图表第 32 项放一个没登记的号 9：取对了就能派发、视图非空；读错表就取不到视图、报名跳过。
 static void t_compute_tex_from_image(void) {
@@ -4016,6 +4038,7 @@ int main(int argc, char **argv) {
     t_compute_tex_from_image();
     t_dump_producer_compute();
     t_tex_write_log();
+    t_wlog_same_storage();
     t_drv2_table();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();

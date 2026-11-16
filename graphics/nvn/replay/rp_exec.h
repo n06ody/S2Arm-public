@@ -156,4 +156,4 @@ void rp_debug_dump_request(uint64_t present_serial, uint64_t frame);
 void rp_debug_dump_poll(uint64_t *fence);
 // 调试：非绘制 / 计算的贴图写入登记进转储历史（转储链与 nvk_tex_wlog 写入日志用）。src：缓冲→贴图为源缓冲地址、拷贝为源贴图序号；val / vlen：CPU 侧知道的值（前 16 字节）
 enum { RP_TW_B2T = 2, RP_TW_T2T, RP_TW_BLIT, RP_TW_CLEAR_TEX, RP_TW_CLEAR_RT, RP_TW_UPLOAD, RP_TW_ZERO };
-void rp_debug_tex_write(uint64_t serial, int kind, uint64_t src, uint64_t len, const void *val, uint32_t vlen);
+void rp_debug_tex_write(uint64_t serial, int kind, uint64_t src, uint64_t len, const void *val, uint32_t vlen, int lock_held);   // lock_held：调用方持有资源锁

@@ -368,7 +368,7 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
     }
     rp_tex_mark_gpu_written(t);   // 这张贴图的内容从此不再从它自己的存储重传
-    rp_debug_tex_write(t->serial, RP_TW_B2T, o->src, img * nz, (const void *)(uintptr_t)o->src, img * nz < 16 ? (uint32_t)(img * nz) : 16);
+    rp_debug_tex_write(t->serial, RP_TW_B2T, o->src, img * nz, (const void *)(uintptr_t)o->src, img * nz < 16 ? (uint32_t)(img * nz) : 16, 0);
 }
 
 // 贴图 → 贴图的拷贝（nvn_mtl.m copy_t2t_ @14049）。源 / 目标各按自己视图的级与起始层；同尺寸、同格式、不镜像的逐层直接拷（三维的一次拷若干片）；
@@ -401,7 +401,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             NVNcopyRegion r = {0, 0, 0, s->d.width, s->d.height, 1};
             nvn_gpu_blit(c, gv, &r, hv, &r, 0);
             rp_view_pin_end();
-            rp_tex_mark_gpu_written(d); rp_debug_tex_write(d->serial, RP_TW_T2T, s->serial, 0, NULL, 0);
+            rp_tex_mark_gpu_written(d); rp_debug_tex_write(d->serial, RP_TW_T2T, s->serial, 0, NULL, 0, 0);
             return;
         }
         if (ss != ds || sfmt != dfmt || s->d.width != d->d.width || s->d.height != d->d.height) { nvn_unimpl("tex", ss > 1 && ds == 1 ? "t2t_multisample_resolve" : "t2t_downsample_case", rec); return; }
@@ -441,7 +441,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             if (mirror & NVN_COPY_FLAGS_MIRROR_Y_BIT) { a.yoffset += a.height; a.height = -a.height; }
             nvn_gpu_blit(c, gv, &a, hv, &b, (o->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) != 0);
             rp_view_pin_end();
-            rp_tex_mark_gpu_written(d); rp_debug_tex_write(d->serial, RP_TW_BLIT, s->serial, 0, NULL, 0);
+            rp_tex_mark_gpu_written(d); rp_debug_tex_write(d->serial, RP_TW_BLIT, s->serial, 0, NULL, 0, 0);
             return;
         }
         if (nz != dnz) { nvn_unimpl("tex", "t2t_scaled", rec); return; }
@@ -457,5 +457,5 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
         nvn_gpu_copy_tex(c, gs, sl, sz0 + (uint32_t)sr.zoffset + (uint32_t)z, &a, gd, dl, dz0 + (uint32_t)dr.zoffset + (uint32_t)z, &b);
     }
     rp_tex_mark_gpu_written(d);   // 目标的内容从此以 GPU 为准
-    rp_debug_tex_write(d->serial, RP_TW_T2T, s->serial, 0, NULL, 0);
+    rp_debug_tex_write(d->serial, RP_TW_T2T, s->serial, 0, NULL, 0, 0);
 }
