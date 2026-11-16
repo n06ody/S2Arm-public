@@ -2246,12 +2246,18 @@ static void t_noatt_diag(void) {
     for (int mode = 1; mode <= 2; mode++) {
         g_flag_noatt = mode; pass_fresh(); g_caps_extra = NVN_GPU_CAP_NO_ATTACH_PASS;
         g_noatt_lines = g_noatt_summaries = 0; int draws = g_gdraws;
-        stream a = {0}; q_env(&a); put_set_rt(&a, NULL, NULL); vp_sc(&a, 24, 20); q_draw(&a); end(&a);
+        tex_t image = mk_tex(1697, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); nvn_be_reg_tex(17, &image, NULL);
+        stream a = {0}; q_env(&a); g_fprog.color_out_mask = 0;
+        rp_S.skey_ok = 2; for (int j = 0; j < 8; j++) rp_S.skey[1][j] = (uint8_t)(j + 1);
+        p_bind_buf *sb = put(&a, OP_BIND_SSBO, sizeof *sb); sb->stage = 1; sb->index = 2; sb->addr = 0xabc000; sb->size = 64;
+        p_bind_handles *im = put(&a, OP_BIND_IMG, sizeof *im); im->stage = 1; im->first = 3; im->n = 1; im->h[0] = 17;
+        put_set_rt(&a, NULL, NULL); vp_sc(&a, 24, 20); q_draw(&a); end(&a);
         submit1(&a); fake_complete(NVN_GPU_DONE_OK);
         CHECK(g_gdraws == draws + 1 && g_noatt_lines == 1 && strstr(g_noatt_last, "why=rt_none") && strstr(g_noatt_last, "24x20"));
         CHECK(strstr(g_noatt_last, "main=") && strstr(g_noatt_last, "vp_set=1") && strstr(g_noatt_last, "sc_set=1") &&
               strstr(g_noatt_last, "pipe_samples=0 pass_samples=1") && strstr(g_noatt_last, "skey0=") && strstr(g_noatt_last, "skey5=") &&
-              strstr(g_noatt_last, "fs_color=") && strstr(g_noatt_last, "fs_ssbo=") && strstr(g_noatt_last, "fs_img="));
+              strstr(g_noatt_last, "fs_color=0x0") && strstr(g_noatt_last, "skey1=0102030405060708") &&
+              strstr(g_noatt_last, "fs_ssbo=2:0xabc000,") && strstr(g_noatt_last, "fs_img=3:#1697,"));
         if (mode == 1) printf("合成日志：%s\n", g_noatt_last);
         tex_t bad = mk_tex(697, 0, NVN_FORMAT_DEPTH24_STENCIL8, 16, 16, 1, 0);
         stream b = {0}; q_env(&b); put_set_rt_v(&b, &bad, NULL); vp_sc(&b, 24, 20); q_draw(&b); end(&b);
@@ -2267,6 +2273,13 @@ static void t_noatt_diag(void) {
         if (mode == 1) { CHECK(strstr(g_noatt_summary, "total=67 rt_none=66 slots_dropped=1")); printf("合成汇总：%s\n", g_noatt_summary); }
         else CHECK(strstr(g_noatt_summary, "total=1 rt_none=1 slots_dropped=0"));
     }
+    g_flag_noatt = 1; pass_fresh(); g_caps_extra = NVN_GPU_CAP_NO_ATTACH_PASS; g_noatt_summaries = 0;
+    stream h = {0}; q_env(&h); q_draw(&h); put_set_rt(&h, NULL, NULL);
+    vp_sc(&h, 24, 20); q_draw(&h); vp_sc(&h, 64, 36); q_draw(&h); vp_sc(&h, 100, 60); q_draw(&h);
+    end(&h); submit1(&h); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(strstr(g_noatt_last, "main=64x36") && strstr(g_noatt_last, "size=100x60"));
+    pass_fresh();
+    CHECK(g_noatt_summaries == 1 && strstr(g_noatt_summary, "size_smaller=1 size_equal=1 size_larger=1"));
     g_flag_noatt = 0; g_caps_extra = 0; pass_fresh();
 }
 
