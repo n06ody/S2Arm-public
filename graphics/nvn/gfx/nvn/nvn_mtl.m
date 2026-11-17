@@ -19,6 +19,7 @@
 #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
 #endif
 #include "nvn_mtl.h"
+#include "nvn_backend.h"
 #include "nvn_pfview.h"   // mtl_pf_bytes / mtl_pfv_compatible: never hand Metal an incompatible texture view (it aborts)
 #include "../../../metal/mtl_slot.h"   // machine-wide Metal client slot
 #include "nvn_fps.h"
@@ -18598,3 +18599,19 @@ void nvn_be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_a
 // 弱链接[nvntest]：s2a_npdm_program_id_set（同上，runtime/src/gfxmode.c）
 #include "nvn_frame_rec.inc"   // 帧录放（graphics/nvn/docs/frame_replay.md）
 #pragma clang attribute pop
+
+// This backend still uses its own PoolArrays implementation; the new cross-platform
+// contract is not connected to Metal replay and must fail explicitly.
+nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *out, nvn_gpu_err *err) {
+    (void)d; if (out) *out = NULL;
+    nvn_gpu_rc rc = {NVN_GPU_E_UNSUPPORTED};
+    if (err) { err->rc = rc; snprintf(err->why, sizeof err->why, "Metal pool table contract unsupported"); }
+    return rc;
+}
+nvn_gpu_rc nvn_gpu_pool_bind(nvn_gpu_cmd c, nvn_gpu_stage st, uint32_t ent, nvn_gpu_pool_table table, nvn_gpu_err *err) {
+    (void)c; (void)st; (void)ent; (void)table;
+    nvn_gpu_rc rc = {NVN_GPU_E_UNSUPPORTED};
+    if (err) { err->rc = rc; snprintf(err->why, sizeof err->why, "Metal pool table contract unsupported"); }
+    return rc;
+}
+void nvn_gpu_pool_release(nvn_gpu_pool_table table) { (void)table; }
