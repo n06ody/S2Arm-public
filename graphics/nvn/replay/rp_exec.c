@@ -519,6 +519,12 @@ void rp_exec_dump_ops(char *b, size_t n) {
 }
 // 帧级账（给「长帧」日志用）：本帧回放花了多久、画了多少笔、提交几次。上屏那边发现帧间隔异常时取走打印。
 static uint64_t g_fr_exec_ns, g_fr_draws, g_fr_subs;
+// 池统计（开关 pool_stats，rp_present.c 在帧边界读开关后写 rp_pool_stats_on）：开着时最外层每次回放另记一份用时与次数。
+//   关着时这里只多读一个整型；池查找路径不动。与上面的帧级账分开记：帧级账每帧被长帧日志取走清零，这份要跨帧累计。
+int rp_pool_stats_on;
+static uint64_t g_ps_exec_ns, g_ps_exec_n;
+void rp_pool_stats_exec(uint64_t *ns, uint64_t *n) { *ns = __atomic_load_n(&g_ps_exec_ns, __ATOMIC_RELAXED); *n = __atomic_load_n(&g_ps_exec_n, __ATOMIC_RELAXED); }
+void rp_pool_stats_exec_reset(void) { __atomic_store_n(&g_ps_exec_ns, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_ps_exec_n, 0, __ATOMIC_RELAXED); }
 void rp_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs) {
     *exec_ns = __atomic_exchange_n(&g_fr_exec_ns, 0, __ATOMIC_RELAXED);
     *draws = __atomic_exchange_n(&g_fr_draws, 0, __ATOMIC_RELAXED);
@@ -646,7 +652,10 @@ out:
     {
         const uint64_t t1 = timed ? now_ns() : 0;
         // 帧级账只由最外层累加一次：里层的时间已经包括在外层的墙钟里，再记一层就是重复统计。
-        if (outer) __atomic_fetch_add(&g_fr_exec_ns, t1 - t0, __ATOMIC_RELAXED);
+        if (outer) {
+            __atomic_fetch_add(&g_fr_exec_ns, t1 - t0, __ATOMIC_RELAXED);
+            if (__atomic_load_n(&rp_pool_stats_on, __ATOMIC_RELAXED)) { __atomic_fetch_add(&g_ps_exec_ns, t1 - t0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_ps_exec_n, 1, __ATOMIC_RELAXED); }
+        }
         return tm ? t1 - t0 : 0;   // 子列表耗时交给父层的 OP_CALL 账
     }
 }
