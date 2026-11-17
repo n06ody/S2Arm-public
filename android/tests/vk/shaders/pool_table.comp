@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+#ifndef POOL_ARRAY_LEN
+#define POOL_ARRAY_LEN 66
+#endif
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform texture2D textures[POOL_ARRAY_LEN];
+layout(set = 0, binding = 1) uniform sampler samplers[POOL_ARRAY_LEN];
+layout(set = 0, binding = 2, std430) buffer Result { vec4 result[]; } dst;
+void main() {
+    const uint ti[7] = uint[7](0, 0, 64, 2, 3, 999, 4);
+    const uint si[7] = uint[7](0, 64, 0, 0, 0, 0, 0);
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= 7) return;
+    uint t = min(ti[n], uint(POOL_ARRAY_LEN - 1));
+    uint s = min(si[n], uint(POOL_ARRAY_LEN - 1));
+    dst.result[n] = textureLod(sampler2D(textures[nonuniformEXT(t)], samplers[nonuniformEXT(s)]), vec2(0.5), 0.0);
+}

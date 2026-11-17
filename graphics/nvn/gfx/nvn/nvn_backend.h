@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 9   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 10   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -51,6 +51,7 @@ typedef struct nvn_gpu_samp_s *nvn_gpu_samp;     // 采样器
 typedef struct nvn_gpu_shader_s *nvn_gpu_shader; // 一个阶段的着色器代码 + 已核对的布局
 typedef struct nvn_gpu_pipe_s *nvn_gpu_pipe;     // 图形或计算管线
 typedef struct nvn_gpu_cmd_s *nvn_gpu_cmd;       // 一段命令，提交或丢弃即失效
+typedef struct nvn_gpu_pool_table_s *nvn_gpu_pool_table; // 不可变的按池 ID 索引资源快照
 typedef struct nvn_gpu_surface_s *nvn_gpu_surface; // 上屏面（接收平台层已建好的窗口 / WSI）
 
 // ---------- 出错（定稿 A5 / A7） ----------
@@ -370,6 +371,30 @@ typedef struct {
     uint32_t elem;           // 数组项的元素号
     union { struct { nvn_gpu_buf buf; uint64_t off, len; } b; nvn_gpu_view view; nvn_gpu_samp samp; struct { nvn_gpu_view view; nvn_gpu_samp samp; } ts; uint64_t va; } u;
 } nvn_gpu_binding;
+// 按池 ID 的资源快照：两个表分别存采样贴图和采样器；调用方区分真正空项和已登记但资源未构建。
+// 空项、类型不符和界外项使用调用方提供的同类型零资源；已登记但不可用的资源必须拒绝，不能换 dummy 报成功。
+// 图像类型由 dummy_view 的目标和数值类别确定。所有非空句柄创建时均须存活；创建成功后由快照保活。
+// 描述符表尾额外有一个 dummy（下标 count），着色器须将越界 ID 限到 count；容量检查须包含这个表尾。
+// 快照不可原地更新，换表先创建新快照；bind 后 release 不影响该命令段，资源至少活到段完成或 abort。
+// 默认没有消费者调用此接口，不启用游戏编译能力。设备能力不足、上限不足明确返回 UNSUPPORTED 并写明 why。
+// create / release 线程：[任意]；bind 线程：[提交]，失败记该 cmd 的粘滞错误。布局来源须为 NVN_RB_TEXP / NVN_RB_SAMPP，
+// 布局 count 等于池 count + 1；当前布局 count 为 16 位，超过其可表达上限要具名拒绝。
+enum { NVN_GPU_POOL_IMAGE = 1, NVN_GPU_POOL_SAMPLER = 2 };
+enum { NVN_GPU_POOL_EMPTY = 0, NVN_GPU_POOL_READY = 1, NVN_GPU_POOL_UNAVAILABLE = 2 };
+typedef struct {
+    uint32_t state;
+    union { nvn_gpu_view view; nvn_gpu_samp samp; } resource;
+} nvn_gpu_pool_item;
+typedef struct {
+    uint32_t kind, count;
+    uint32_t sampler_integer; // sampler 表供整数采样：使用整数兼容的采样器；只认 0 或 1
+    const nvn_gpu_pool_item *items;
+    union { nvn_gpu_view view; nvn_gpu_samp samp; } dummy;
+} nvn_gpu_pool_desc;
+nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *out, nvn_gpu_err *err);
+nvn_gpu_rc nvn_gpu_pool_bind(nvn_gpu_cmd c, nvn_gpu_stage st, uint32_t ent, nvn_gpu_pool_table table, nvn_gpu_err *err);
+void nvn_gpu_pool_release(nvn_gpu_pool_table table);
+
 // 给某阶段一次给全本笔的绑定（替换整张表；没给到的项按布局给空资源）。表项引用的句柄须活到本 cmd 完成（核心保证）。
 // 线程：[提交]。出错：粘滞 NVN_GPU_E_LAYOUT（ent 越界 / cls 不符）。
 void nvn_gpu_bind(nvn_gpu_cmd c, nvn_gpu_stage st, const nvn_gpu_binding *b, uint32_t n);
