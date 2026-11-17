@@ -244,7 +244,10 @@ struct nvn_gpu_cmd_s {
     uint8_t dyn_dirty;         // 只有动态 UBO 的偏移变了（组内容没变）：这一笔不重写组，只用新偏移重绑
     // 描述符写入影子（开关 nvk_desc_skip，缺省开）：同一个组对象里，内容和上次真正写进去的一样就不再写。
     // 真机上一帧约 1030 次整组重建、每次 11 条描述符；其中大部分条目（贴图句柄、采样器、常量缓冲片）和上一笔相同。
-    struct desc_shadow { uint64_t a, b, c; uint32_t type; uint16_t binding; uint8_t valid; } dsh[4][32];
+    // 键必须带数组元素号：同一 binding 的多个元素可以引用同一个 view（合法用法），只按 binding 记会把后写的那条
+    // 当成重复丢掉，留下的元素从没写过。一个槽只存最后一条，所以多元素 binding 会退化成每笔都写——正确但不省；
+    // 单元素 binding（绝大多数）照旧命中。
+    struct desc_shadow { uint64_t a, b, c; uint32_t type; uint32_t elem; uint16_t binding; uint8_t valid; } dsh[4][32];
     VkDescriptorSet dsh_set[4];
     uint8_t dsh_ok[4];
     uint8_t desc_point;             // 当前这几组绑在哪个绑定点：0 还没绑，1 图形，2 计算
@@ -4970,7 +4973,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
         nw = keep;
         if (tm) __atomic_fetch_add(&g_desc_hit, (uint64_t)__builtin_popcount(hit), __ATOMIC_RELAXED);
     }
-    // 只重写变过的条目（切换 nvk_desc_skip 时整份写）。影子按「组对象 + binding 槽」记：换了组对象就整组作废。
+    // 只重写变过的条目（切换 nvk_desc_skip 时整份写）。影子按「组对象 + binding + 数组元素」记：换了组对象就整组作废。
     {
         static int skip_cur = -1; static uint32_t skip_k;
         if (skip_cur < 0 || !(++skip_k & 255)) skip_cur = nvn_plat_flag("nvk_desc_skip", 1) != 0;
@@ -4987,10 +4990,11 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
                 struct desc_shadow *sh = &c->dsh[set][wr[i].dstBinding];
                 struct desc_shadow nx; memset(&nx, 0, sizeof nx);
                 nx.type = wr[i].descriptorType; nx.binding = (uint16_t)wr[i].dstBinding;
+                nx.elem = wr[i].dstArrayElement;   // write_binds 每条都是 descriptorCount = 1，元素号就是这一条的身份
                 if (wr[i].pImageInfo) { nx.a = (uint64_t)(uintptr_t)wr[i].pImageInfo->imageView; nx.b = (uint64_t)(uintptr_t)wr[i].pImageInfo->sampler; nx.c = (uint64_t)wr[i].pImageInfo->imageLayout; }
                 else if (wr[i].pBufferInfo) { nx.a = (uint64_t)(uintptr_t)wr[i].pBufferInfo->buffer; nx.b = wr[i].pBufferInfo->offset; nx.c = wr[i].pBufferInfo->range; }
                 else if (wr[i].pTexelBufferView) nx.a = (uint64_t)(uintptr_t)*wr[i].pTexelBufferView;
-                if (sh->valid && sh->a == nx.a && sh->b == nx.b && sh->c == nx.c && sh->type == nx.type) continue;
+                if (sh->valid && sh->elem == nx.elem && sh->a == nx.a && sh->b == nx.b && sh->c == nx.c && sh->type == nx.type) continue;
                 nx.valid = 1; *sh = nx; wr[keep++] = wr[i];
             }
             nw = keep;

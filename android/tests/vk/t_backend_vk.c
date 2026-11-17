@@ -5020,6 +5020,83 @@ static void c63_desc_array_elem(const char *dir) {
     free(vm); free(fm);
 }
 
+// C63b：同一个 view 写进同一描述符数组的两个元素（Vulkan 合法用法；VkWriteDescriptorSet 只约束每个元素
+// 自身，没有数组内元素必须互不相同的要求）。着色器取 t[1]，纹理填均匀 128：元素 1 必须真被写进去。
+// 后端若把 dstArrayElement 从写入影子的键里丢掉，元素 1 会留在组对象的零初始状态——采样时驱动按
+// lp_descriptor.functions == NULL 解引用（或从复用组里静默采到上一笔的旧 view），本例必红。
+static void c63b_desc_array_same_view(const char *dir) {
+    nvn_gpu_layout_ent ents[2];
+    memset(ents, 0, sizeof ents);
+    ents[0].set = 0; ents[0].cls = NVN_GPU_RES_TEX; ents[0].access = NVN_GPU_ACC_R;
+    ents[0].binding = 0; ents[0].count = 2; ents[0].stages = 1u << NVN_GPU_SH_FS;
+    ents[1].set = 0; ents[1].cls = NVN_GPU_RES_SAMP; ents[1].access = NVN_GPU_ACC_R;
+    ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_FS;
+    nvn_gpu_layout fl;
+    memset(&fl, 0, sizeof fl);
+    fl.ent = ents; fl.nent = 2;
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    void *vm = NULL, *fm = NULL;
+    if (!load_shader_pair(dir, "tri3.vert", "arr2.frag", NULL, &fl, &vs, &fs, &vm, &fm)) { CHECK(0, "C63b 读不到 arr2 着色器"); return; }
+    nvn_gpu_pipe_desc pd;
+    fill_gpipe_desc(&pd, vs, fs, 0);
+    nvn_gpu_err e;
+    nvn_gpu_pipe pipe = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "C63b pipe：%d %s", e.rc.code, e.why);
+    const uint8_t gray[16] = {128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255, 128, 0, 0, 255};
+    nvn_gpu_tex t = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_view v = make_view(t);
+    samp_par sp;
+    memset(&sp, 0, sizeof sp);
+    nvn_gpu_samp samp = NULL;
+    CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &e)), "C63b samp：%d %s", e.rc.code, e.why);
+    nvn_gpu_tex out = make_tex(64, 64, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_view ov = make_view(out);
+    nvn_gpu_buf rb = make_buf(64 * 64 * 4, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_buf vb = full_vb();
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_tex_upload(c, t, 0, 0, NULL, gray, 8, 16);
+    nvn_gpu_pass_desc p;
+    memset(&p, 0, sizeof p);
+    p.ncolor = 1; p.color[0].view = ov; p.color[0].load = NVN_GPU_LOAD_CLEAR; p.color[0].store = NVN_GPU_STORE_STORE;
+    p.color[0].clear.f[3] = 1;
+    p.w = 64; p.h = 64; p.layers = 1;
+    nvn_gpu_pass_begin(c, &p);
+    nvn_gpu_set_pipe(c, pipe);
+    nvn_gpu_dyn dyn;
+    full_dyn(&dyn);
+    nvn_gpu_set_dyn(c, &dyn);
+    nvn_gpu_set_vbuf(c, 0, vb, 0);
+    nvn_gpu_binding bs[3];
+    memset(bs, 0, sizeof bs);
+    bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_TEX; bs[0].elem = 0; bs[0].u.view = v;
+    bs[1].ent = 0; bs[1].cls = NVN_GPU_RES_TEX; bs[1].elem = 1; bs[1].u.view = v;   // 与元素 0 是同一个 view
+    bs[2].ent = 1; bs[2].cls = NVN_GPU_RES_SAMP; bs[2].u.samp = samp;
+    nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 3);
+    nvn_gpu_draw_args da;
+    memset(&da, 0, sizeof da);
+    da.prim = 4; da.count = 3; da.instances = 1;
+    nvn_gpu_draw(c, &da);
+    nvn_gpu_pass_end(c);
+    nvn_gpu_copy_tex_buf(c, out, 0, 0, NULL, rb, 0, 64 * 4, 64 * 64 * 4);
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 111, on_done, NULL, &e);
+    CHECK(OK(r), "C63b commit：%d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(111, 5000000000ull, &e);
+    CHECK(OK(r), "C63b wait：%d %s", r.code, e.why);
+    if (OK(r)) {
+        const uint8_t *px = (const uint8_t *)buf_cpu(rb) + (32 * 64 + 32) * 4;
+        printf("C63b 同 view 双元素（取元素 1）：期望 128 → %u\n", px[0]);
+        expect_rect(buf_cpu(rb), 0, 0, 64, 64, 128, 0, 0, "C63b");
+    }
+    nvn_gpu_view_release(v);
+    nvn_gpu_tex_release(t);
+    nvn_gpu_samp_release(samp);
+    nvn_gpu_view_release(ov); nvn_gpu_tex_release(out);
+    nvn_gpu_buf_release(vb, NULL, NULL);
+    nvn_gpu_buf_release(rb, NULL, NULL);
+    nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
+    free(vm); free(fm);
+}
+
 // C64：VA 类别显式报红——契约未定非 BDA 消费方式，管线创建期必须 E_UNSUPPORTED，不许静默成功。
 static void c64_va_red(const char *dir) {
     nvn_gpu_err e;
@@ -9528,6 +9605,15 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    if (argc > 2 && !strcmp(argv[2], "--c63-same-view")) {   // 只跑 C63b（默认档里也跑）；给「红在被修的那一处」取证用
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        if (!open_backend()) return 1;
+        c63b_desc_array_same_view(argv[1]);
+        nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C63b close %s", e.why);
+        printf("C63SAMEVIEW failures=%d\n", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (getenv("S2A_TEST_PLC_ONLY") && argc > 1) {   // 开发时只跑 C89（run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         c89_midrun_save(argv[1]);
@@ -9903,6 +9989,7 @@ int main(int argc, char **argv) {
     c61_storage_image(argv[1]);
     c62_tsamp_cs(argv[1]);
     c63_desc_array_elem(argv[1]);
+    c63b_desc_array_same_view(argv[1]);
     c64_va_red(argv[1]);
     c67_viewport_yflip(argv[1]);
     c68_stencil_ops(argv[1]);
