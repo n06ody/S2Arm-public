@@ -59,6 +59,7 @@ static const char *const stat_names[STAT_N] = {
 };
 
 struct nvn_gpu_buf_s {
+    uint64_t access_id;   // 供共用层认存储生命周期，不以可复用的指针充当身份
     VkBuffer buffer;
     VkDeviceMemory memory;
     uint8_t *mapped;
@@ -74,6 +75,7 @@ struct nvn_gpu_buf_s {
 };
 
 struct nvn_gpu_tex_s {
+    uint64_t access_id;
     VkImage image;
     VkDeviceMemory memory;
     VkDeviceSize mem_size; uint32_t mem_type;   // 这块显存向驱动要的大小和内存类型（还回 texmem 池时用）
@@ -98,6 +100,7 @@ struct nvn_gpu_view_s {
     struct nvn_gpu_tex_s *tex;
     VkBufferView buffer_view;
     struct nvn_gpu_buf_s *buf;
+    uint64_t buffer_off, buffer_bytes;
     VkFormat buffer_format;
     VkFormatFeatureFlags buffer_features;
     uint32_t buffer_caps;
@@ -6164,7 +6167,7 @@ nvn_gpu_rc nvn_gpu_view_create_buf(nvn_gpu_buf b, uint64_t off, uint64_t bytes, 
                          ? NVN_GPU_E_OOM : NVN_GPU_E_UNSUPPORTED, "vkCreateBufferView 失败（%d）", result);
     }
     found->refs++;
-    v->buf = found; v->nvn_format = fmt; v->buffer_format = f; v->buffer_features = features; v->buffer_caps = caps;
+    v->buf = found; v->buffer_off = off; v->buffer_bytes = bytes; v->nvn_format = fmt; v->buffer_format = f; v->buffer_features = features; v->buffer_caps = caps;
     view_link_locked(&g, v);
     pthread_mutex_unlock(&g_mu);
     *out = v;
@@ -7018,6 +7021,54 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
+}
+
+// 存储不跨生命周期复用代号。查询通常在提交线程，原子赋值也允许平台的并行资源准备。
+static uint64_t g_access_next;
+static uint64_t access_id(uint64_t *slot) {
+    uint64_t id = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    if (!id) {
+        uint64_t next = __atomic_add_fetch(&g_access_next, 1, __ATOMIC_RELAXED), empty = 0;
+        if (__atomic_compare_exchange_n(slot, &empty, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) id = next;
+        else id = empty;
+    }
+    return id;
+}
+int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!bytes || !buf_range(b, off, bytes)) return 0;
+    out->storage = access_id(&b->access_id); out->off = off; out->bytes = bytes;
+    return out->storage != 0;
+}
+int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!v) return 0;
+    if (v->buf) return nvn_gpu_buf_access_span(v->buf, v->buffer_off, v->buffer_bytes, out);
+    if (!v->tex || !v->levels || !v->layers) return 0;
+    out->storage = access_id(&v->tex->access_id);
+    out->level = v->base_level; out->levels = v->levels; out->layer = v->base_layer; out->layers = v->layers;
+    // 3D 的 Vulkan array-layer 范围固定 0+1；实际采样覆盖所选 mip 的全部深度切片。
+    // 矩形取首级最大深度，较高 mip 的合法切片是其子集；2D 切片视图仍保留真实层范围。
+    if (v->type == VK_IMAGE_VIEW_TYPE_3D) {
+        uint32_t depth = v->base_level < 32 ? v->tex->depth >> v->base_level : 0;
+        out->layer = 0; out->layers = depth ? depth : 1;
+    }
+    out->aspects = (v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? 1u : 0u) |
+                   (v->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? 2u : 0u) | (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT ? 4u : 0u);
+    return out->storage && out->aspects;
+}
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch) {
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "计算写的可见性屏障必须在通道外"); return; }
+    VkPipelineStageFlags dst = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst,
+        VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+        VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 }
 
 void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {

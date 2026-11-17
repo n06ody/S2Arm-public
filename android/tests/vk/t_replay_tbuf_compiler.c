@@ -6,6 +6,7 @@
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "nvn_unimpl.h"
 #include "direct/compile_request.h"
 #include "direct/source_store.h"
