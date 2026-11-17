@@ -53,7 +53,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--descriptor-indexing" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -94,6 +94,9 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
         exit 1
     fi
     exit 0
+fi
+if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
+    exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
 if [ "$(uname -s)" = Darwin ]; then
     export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
@@ -695,6 +698,7 @@ if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --tbuf-compiler-c
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_copy_t2b.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_clear_tex.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_ssbo_window.sh"; fi
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_compute_read.sh"; fi
 
 set +e
 # 整套三遍的超时只用来发现卡死，不量性能：负载高的机器（列车机同时跑多份同类用例，软件渲染）上单遍已接近原先的 180 / 240 秒，
