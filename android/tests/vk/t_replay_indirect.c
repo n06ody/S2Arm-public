@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Independent production rp_draw/rp_buf GPU test; never includes legacy tests.
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_shader.h"
