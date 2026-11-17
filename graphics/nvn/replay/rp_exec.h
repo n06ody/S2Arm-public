@@ -7,6 +7,7 @@
 
 const char *rp_op_name(uint32_t op);   // 录制命令名（"OP_DRAW" …）；范围外返回 "OP_?"
 int rp_pool_count(void);                // 已登记的内存池个数
+uint64_t rp_pool_fast_hits(void);       // 调用线程的快路命中累计（只读；测试与调优观测点）
 void rp_pool_memo_stats(uint64_t *hits, uint64_t *lookups);   // 池查找的线程内备忘（rp_entry.c）：调用线程自己的累计命中数、查找数
 int rp_tex_live_n(void);                // 活贴图对象个数（只是登记数，不等于已建图的个数）
 int rp_depth_zero(void);                // NVN 深度模式：1 = 近平面为 0
@@ -117,6 +118,11 @@ int rp_res_new_sizes_take(void);     // 诊断读数：上次调用以来新建�
 int rp_fence_done(uint64_t f);       // 栅栏值 f 及之前交出去的活显卡都做完了
 extern int rp_split_draws;       // 中途交段：每段的笔数（见 rp_exec.c）
 uint64_t rp_seg_serial(void);   // 第几个后端段：段里的暂存内容（arena 切片）只在同一段里能复用
+extern int rp_pool_stats_on;   // 池统计开着（rp_present.c 帧边界写；rp_exec.c 最外层回放读）
+void rp_pool_stats_exec(uint64_t *ns, uint64_t *n);   // 开着以来最外层回放的累计用时 / 次数
+void rp_pool_stats_exec_reset(void);
+void rp_pool_stats_frame(void);   // [上屏] 帧边界：读一次开关；开着时每 1024 帧打一行 S2A_POOLSTATS
+void rp_pool_stats_end(void);     // 会话收尾：开着就再打一行（why=end）并关掉
 void rp_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs);   // 取走本帧的回放耗时 / 绘制笔数 / 提交次数（长帧日志用）
 // 逐帧分项账（长帧归因，开关 nvk_hitch_log）：5 秒窗口的 rp_perf 混了多帧，回答不了「这一帧的时间花在哪」。
 // 这一组只在帧边界由上屏线程取走一次（取即清零），累计点与 rp_perf 的 D_* 同源（见 rp_exec.c 的 fr_perf_project）。
