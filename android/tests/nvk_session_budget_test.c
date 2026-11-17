@@ -14,6 +14,7 @@
 #include "rp_exec.h"
 static atomic_uint outstanding;
 static atomic_int stop_seen, backend_calls;
+static int blocks_flag, blocks_attempts;
 static char logs[4096]; static size_t log_n;
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec; }
 int __android_log_print(int level, const char *tag, const char *fmt, ...) {
@@ -25,9 +26,12 @@ void nvk_shader_stop(void) { atomic_store(&stop_seen, 1); }
 unsigned nvk_shader_inflight(void) { return atomic_load(&outstanding); }
 int nvk_shader_open(void) { return 0; }
 int nvk_warm_stop(void) { return 0; }   // #996 起停局先停预热带与需求建管线（本用例只量会话收尾等待）
+void nvk_warm_start(void) {}
+void nvn_vk_pipe_demand_start(void) {}
 void nvn_vk_pipe_demand_stop(void) {}
 void nvn_dirty_set_chunk_pages(uint32_t n) { (void)n; }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
+int nvn_dirty_blocks_configure(int enabled) { if (enabled) blocks_attempts++; return 0; } // 本夹具不提供真实写跟踪，保守拒绝。
+int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_buf_blocks") ? blocks_flag : dflt; }
 double s2a_direct_vk_display_refresh(void) { return 60; }
 void nvn_unimpl_reset(void) {}
 size_t nvn_unimpl_dump(char *b, size_t n) { if (n) *b=0; return 0; }
@@ -38,7 +42,17 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *e) { (void)d; (
 void nvn_gpu_caps_get(nvn_gpu_caps *c) { memset(c, 0, sizeof *c); }
 nvn_gpu_rc nvn_gpu_close(uint64_t n, nvn_gpu_err *e) { (void)n; atomic_fetch_add(&backend_calls,1); (void)e; return (nvn_gpu_rc){NVN_GPU_OK}; }
 int main(int argc, char **argv) {
-    if (argc != 2 || (strcmp(argv[1], "control") && strcmp(argv[1], "busy"))) return 2;
+    if (argc != 2) return 2;
+    if (!strcmp(argv[1], "blocks-off") || !strcmp(argv[1], "blocks-refuse")) {
+        blocks_flag = !strcmp(argv[1], "blocks-refuse");
+        if (nvk_session_open(NULL, NULL, NULL, 0)) return 1;
+        if (blocks_attempts != blocks_flag || (blocks_flag && !strstr(logs, "写跟踪块摘要未启用"))) {
+            fprintf(stderr, "FAIL: optional block tracking configure/diagnostic\n"); return 1;
+        }
+        printf("session/%s: attempts=%d refusal_logged=%d\n", argv[1], blocks_attempts, !!strstr(logs, "写跟踪块摘要未启用"));
+        return 0;
+    }
+    if (strcmp(argv[1], "control") && strcmp(argv[1], "busy")) return 2;
     if (!strcmp(argv[1], "busy")) atomic_store(&outstanding, 1);
     nvk_session_request_stop();
     uint64_t t = now_ns(); int rc = nvk_session_wait_compiles(); uint64_t elapsed = now_ns() - t;

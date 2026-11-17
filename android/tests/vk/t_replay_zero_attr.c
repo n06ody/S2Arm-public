@@ -110,3 +110,8 @@ static void run_case(struct s2a_vk_device *d,const char *dir,int mode){
 int main(int argc,char **argv){if(argc!=2)return 2;struct s2a_vk_device d;char why[256];if(s2a_vk_device_create(&d,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
  for(int mode=0;mode<2;mode++)run_case(&d,argv[1],mode);
  REQUIRE(!s2a_vk_device_destroy(&d,1));printf("real rp_draw zero-attr cases2 pixel-failures%u\n",failures);return failures?1:0;}
+
+// 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
+int nvn_dirty_block_snapshot(const void *s, const void *a, size_t n, uint64_t *v, uint64_t *e) {
+    (void)s; (void)a; (void)n; (void)v; (void)e; return 0;
+}

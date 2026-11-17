@@ -249,3 +249,8 @@ int main(int argc,char **argv) {
  else printf("real rp_draw/rp_buf ordinary-indirect+DRV0 cases9 plus-boundaries33 pixel-failures%u\n",failures);
  return failures?1:0;
 }
+
+// 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
+int nvn_dirty_block_snapshot(const void *s, const void *a, size_t n, uint64_t *v, uint64_t *e) {
+    (void)s; (void)a; (void)n; (void)v; (void)e; return 0;
+}

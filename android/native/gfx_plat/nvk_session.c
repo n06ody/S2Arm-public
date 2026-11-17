@@ -88,9 +88,11 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
     //   16 页       207 次、12 毫秒、37 毫秒，10.9 帧
     //   64 页       54 次、2 毫秒、34 毫秒，11.1 帧
     // 块越大一次缺页后要重传的字节越多，但一次缺页加两次改保护的代价抵得上拷两百多 KB。debug.s2a.nvk_chunk_pages 可改（0 = 逐页）。
-    { extern void nvn_dirty_set_chunk_pages(uint32_t); extern int nvn_plat_flag(const char *, int);
+    { extern void nvn_dirty_set_chunk_pages(uint32_t); extern int nvn_dirty_blocks_configure(int); extern int nvn_plat_flag(const char *, int);
       int cp = nvn_plat_flag("nvk_chunk_pages", 64);
-      nvn_dirty_set_chunk_pages(cp > 0 ? (uint32_t)cp : 0); __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 写跟踪保护分块 %d 页", cp); }
+      nvn_dirty_set_chunk_pages(cp > 0 ? (uint32_t)cp : 0); __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 写跟踪保护分块 %d 页", cp);
+      if (nvn_plat_flag("nvk_buf_blocks", 0) && !nvn_dirty_blocks_configure(1))
+          __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】写跟踪块摘要未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
     g_ready = 1;
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
     const char *drv_name = dev && dev->driver_name[0] ? dev->driver_name : "?";
