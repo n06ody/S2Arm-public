@@ -26,15 +26,18 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static char g_ps_lines[8][320]; static int g_ps_n;   // 池统计行（cls "poolstats"）收下来给 t_pool_stats 核
+void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_buf_blocks;      // 分块验证只在明确开启时尝试；产品默认关闭。
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
+static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_blocks")) return g_flag_buf_blocks;
+    if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -4241,6 +4244,63 @@ static void t_sync_reuse_after_gpu_write(void) {
     nvn_be_pool_del(g_pmem); g_buf_cpu_auto = 0;
 }
 
+// ---------- 池查找统计（rp_present.c rp_pool_stats_*，开关 pool_stats；#1368 读数）----------
+// 契约：关着一行不打；开着每 1024 帧一行（0 值也打）、会话收尾一行 why=end。各字段等于对应的累计读数：
+// fast_hits = rp_pool_fast_hits()，memo_hits / lookups = rp_pool_memo_stats，span_index_hits = nvn_dirty_span_stats，
+// submits = 开着以来的队列提交次数。fast_hits 与 lookups 是两个数：夹具先关备忘查一批（只走快路，不计 lookups）再开备忘查一批，让两者不等。
+static uint64_t ps_field(const char *line, const char *k) { const char *q = strstr(line, k); return q ? strtoull(q + strlen(k), NULL, 10) : ~0ull; }
+static void t_pool_stats(void) {
+    static uint8_t mem[0x1000]; const uint64_t b = (uint64_t)(uintptr_t)mem;
+    g_ps_n = 0; g_flag_pool_stats = 0;
+    for (int i = 0; i < 2048; i++) nvn_be_present(NULL, 0, NULL);
+    CHECK(g_ps_n == 0);                                    // 关着：0 行
+    nvn_be_pool_add(mem, sizeof mem);
+    pm_flag(0); for (int i = 0; i < 64; i++) rp_pool_find(b + 0x10, 0x10, NULL, NULL);
+    pm_flag(1); for (int i = 0; i < 8; i++) rp_pool_find(b + 0x20, 0x10, NULL, NULL);
+    g_flag_pool_stats = 1;
+    for (int i = 0; i < 1024; i++) nvn_be_present(NULL, 0, NULL);
+    CHECK(g_ps_n == 1);                                    // 开着：第 1024 帧一行，这时还没有回放，0 值也打
+    const char *l = g_ps_lines[0];
+    CHECK(strncmp(l, "S2A_POOLSTATS v=1 why=frame frames=1024 ", 40) == 0);
+    CHECK(ps_field(l, " submits=") == 0 && ps_field(l, " exec_ns=") == 0);
+    uint64_t mh = 0, ml = 0, xh = 0, xs = 0, xn = 0; rp_pool_memo_stats(&mh, &ml); nvn_dirty_span_stats(&xh, &xs, &xn);
+    CHECK(ps_field(l, " memo_hits=") == mh && ps_field(l, " lookups=") == ml && ps_field(l, " span_index_hits=") == xh);
+    CHECK(rp_pool_fast_hits() != ml);                      // 前提：两个数确实不同（不然下面那条分不出混没混）
+    CHECK(ps_field(l, " fast_hits=") == rp_pool_fast_hits());
+    stream a = {0}; end(&a); submit1(&a); submit1(&a);
+    rp_pool_stats_end();
+    CHECK(g_ps_n == 2 && strncmp(g_ps_lines[1], "S2A_POOLSTATS v=1 why=end frames=1024 ", 38) == 0 && ps_field(g_ps_lines[1], " submits=") == 2);
+    g_flag_pool_stats = 0;
+    for (int i = 0; i < 1024; i++) nvn_be_present(NULL, 0, NULL);
+    CHECK(g_ps_n == 2);                                    // 关回去：不再打
+    nvn_be_pool_del(mem);
+}
+
+// 长帧日志的帧级账（rp_frame_take）：累计计数改成「与上次取时相减」后，取走的仍是本帧的量（取完再取为 0，不跨帧累加）。
+static void t_frame_take_delta(void) {
+    uint64_t ns = 0, dr = 0, sb = 0, tn = 0, ts = 0;
+    rp_frame_take(&ns, &dr, &sb);                          // 先清掉之前用例留下的账
+    stream a = {0}; end(&a); submit1(&a); submit1(&a);
+    rp_frame_take(&ns, &dr, &sb); CHECK(sb == 2 && dr == 0);
+    rp_frame_take(&ns, &dr, &sb); CHECK(sb == 0 && dr == 0 && ns == 0);   // 取过就是 0：不再把上一帧算进来
+    submit1(&a);
+    rp_frame_take(&ns, &dr, &sb); CHECK(sb == 1);
+    rp_exec_totals(&tn, &ts); CHECK(ts >= 3);              // 累计只增：至少有本例这 3 次
+}
+
+// 会话收尾那一行走真实收尾路径（nvn_be_shutdown_session），不直接调 rp_pool_stats_end：收尾里漏接这一调用时本例必红。
+// 收尾会把回放核心整份复位，所以放在 main 的最后、所有别的用例之后。
+static void t_pool_stats_shutdown(void) {
+    g_ps_n = 0; g_flag_pool_stats = 1;
+    nvn_be_present(NULL, 0, NULL);                         // 帧边界：打开
+    stream a = {0}; end(&a); submit1(&a);
+    CHECK(g_ps_n == 0);                                    // 还没到 1024 帧：没有行
+    CHECK(nvn_be_shutdown_session() == 0);
+    CHECK(g_ps_n == 1 && strncmp(g_ps_lines[0], "S2A_POOLSTATS v=1 why=end frames=1 ", 35) == 0 && ps_field(g_ps_lines[0], " submits=") == 1);
+    g_flag_pool_stats = 0;
+    CHECK(nvn_be_shutdown_session() == 0 && g_ps_n == 1);  // 收尾后已关：再收尾不重复打
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     t_invalidated_attachment_pin();
@@ -4331,7 +4391,10 @@ int main(int argc, char **argv) {
     t_pass_3d_slice_view();
     t_bind_reuse();
     t_begin_fail();
+    t_pool_stats();
+    t_frame_take_delta();
     if (argc > 1 && t_table(argv[1])) g_fail++;
+    t_pool_stats_shutdown();   // 会话收尾会复位整个回放核心：必须是最后一个用例
     printf("t_nvn_replay：%d 项检查，%d 项红\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

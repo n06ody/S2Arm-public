@@ -118,6 +118,9 @@ int rp_res_new_sizes_take(void);     // 诊断读数：上次调用以来新建�
 int rp_fence_done(uint64_t f);       // 栅栏值 f 及之前交出去的活显卡都做完了
 extern int rp_split_draws;       // 中途交段：每段的笔数（见 rp_exec.c）
 uint64_t rp_seg_serial(void);   // 第几个后端段：段里的暂存内容（arena 切片）只在同一段里能复用
+void rp_exec_totals(uint64_t *exec_ns, uint64_t *subs);   // 进程累计：最外层回放用时 / 提交次数（与帧级账同源，只读）
+void rp_pool_stats_frame(void);   // [上屏] 帧边界：读一次开关；开着时每 1024 帧打一行 S2A_POOLSTATS
+void rp_pool_stats_end(void);     // 会话收尾：开着就再打一行（why=end）并关掉
 void rp_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs);   // 取走本帧的回放耗时 / 绘制笔数 / 提交次数（长帧日志用）
 // 逐帧分项账（长帧归因，开关 nvk_hitch_log）：5 秒窗口的 rp_perf 混了多帧，回答不了「这一帧的时间花在哪」。
 // 这一组只在帧边界由上屏线程取走一次（取即清零），累计点与 rp_perf 的 D_* 同源（见 rp_exec.c 的 fr_perf_project）。
