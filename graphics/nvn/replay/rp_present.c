@@ -265,6 +265,8 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（上传，每帧）：贴图整张上传 %.1f 次共 %.0f KB；池镜像同步 %.0f KB（其中直接写 %.0f KB）；缓冲解析：快路 %.0f 次、逐页慢路 %.0f 次（共查 %.0f 页）、不受写跟踪 %.0f 次", (double)pf[RP_PERF_TEX_UP_N] / f, (double)pf[RP_PERF_TEX_UP_KB] / f, (double)pf[RP_PERF_BUF_SYNC_KB] / f, (double)pf[RP_PERF_BUF_SYNC_DIRECT_KB] / f,
                          (double)pf[RP_PERF_BUF_FAST_N] / f, (double)pf[RP_PERF_BUF_SLOW_N] / f, (double)pf[RP_PERF_BUF_PAGES_N] / f, (double)pf[RP_PERF_BUF_NOSPAN_N] / f);
+                if (pf[RP_PERF_BUF_LOG_EV] || pf[RP_PERF_BUF_LOG_WORDS] || pf[RP_PERF_BUF_LOG_REBUILD])   // 脏页追加日志（nvk_buf_dirtylog）开着才有
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；脏页日志：事件 %.0f 条、求交看位图 %.0f 字、重建 %.2f 次", (double)pf[RP_PERF_BUF_LOG_EV] / f, (double)pf[RP_PERF_BUF_LOG_WORDS] / f, (double)pf[RP_PERF_BUF_LOG_REBUILD] / f);
                 if (pf[RP_PERF_TEX_UP_PART])   // 线性 CPU 贴图只传脏行（upload_linear_dirty）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；线性贴图按脏行传 %.1f 次共 %.0f 行", (double)pf[RP_PERF_TEX_UP_PART] / f, (double)pf[RP_PERF_TEX_UP_ROWS] / f);
                 if (pf[RP_PERF_RES_N])

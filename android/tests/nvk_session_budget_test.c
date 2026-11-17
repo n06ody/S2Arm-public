@@ -31,6 +31,7 @@ void nvn_vk_pipe_demand_start(void) {}
 void nvn_vk_pipe_demand_stop(void) {}
 void nvn_dirty_set_chunk_pages(uint32_t n) { (void)n; }
 int nvn_dirty_blocks_configure(int enabled) { if (enabled) blocks_attempts++; return 0; } // 本夹具不提供真实写跟踪，保守拒绝。
+int nvn_dirty_log_configure(int enabled) { (void)enabled; return 0; }   // 同上：脏页追加日志也保守拒绝
 int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_buf_blocks") ? blocks_flag : dflt; }
 double s2a_direct_vk_display_refresh(void) { return 60; }
 void nvn_unimpl_reset(void) {}

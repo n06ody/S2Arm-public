@@ -70,6 +70,9 @@ uint64_t nvn_dirty_mapping_generation(void){return 1;}int nvn_dirty_tracking_unr
 const void *nvn_dirty_span(const void *a,size_t n){(void)a;(void)n;return NULL;}
 long nvn_dirty_page_gens(const void *s,const void *a,size_t l,uint64_t *g,size_t n){(void)s;(void)a;(void)l;(void)g;(void)n;return -1;}
 // 本夹具不模拟真实块代号，按未知回退逐页路径。
+int nvn_dirty_log_open(const void *s, uint64_t *i, uint64_t *c) { (void)s; (void)i; (void)c; return 0; }   // 本夹具没有脏页追加日志：回放核心走原路径
+int nvn_dirty_log_read(const void *s, uint64_t i, uint64_t *c, void (*f)(void *, uintptr_t, uintptr_t), void *u) { (void)s; (void)i; (void)c; (void)f; (void)u; return 0; }
+int nvn_dirty_page_armed(const void *s, const void *a) { (void)s; (void)a; return 0; }
 int nvn_dirty_block_snapshot(const void *s,const void *a,size_t n,uint64_t *v,uint64_t *e){(void)s;(void)a;(void)n;(void)v;(void)e;return 0;}
 void nvn_dirty_protect(const void *a,size_t n){(void)a;(void)n;}
 void rp_view_pin_begin(void){}void rp_view_pin_end(void){}

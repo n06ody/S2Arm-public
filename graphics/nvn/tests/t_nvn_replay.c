@@ -34,10 +34,12 @@ static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产�
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_buf_blocks;      // 分块验证只在明确开启时尝试；产品默认关闭。
+static int g_flag_buf_dirtylog;    // 用例设：开关 nvk_buf_dirtylog（缺省同产品：关）
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_blocks")) return g_flag_buf_blocks;
+    if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
@@ -243,6 +245,35 @@ int nvn_dirty_block_snapshot(const void *span, const void *addr, size_t len, uin
     size_t p = (a - base) / BLOCK_TEST_ALIGN, q = (a + len - 1 - base) / BLOCK_TEST_ALIGN;
     if (p != q) return 0;
     *version = g_block_version[p]; *epoch = g_dirty_map; return 1;
+}
+
+// 脏页追加日志替身（只给 g_block_mem 这个池）：用例经 fake_log_write 改一页内容并追加事件；容量 FAKE_LOG_CAP，超了读者判环绕。
+enum { FAKE_LOG_CAP = 64 };
+static int g_log_fake_on, g_log_fake_bad; static uint64_t g_log_head, g_log_ident = 7;
+static struct { uintptr_t a, b; } g_log_ev[FAKE_LOG_CAP];
+static uint8_t g_log_unarmed[BLOCK_TEST_PAGES];   // 1 = 这一页加保护被并发解保护挡住（nvn_dirty_page_armed 答 0）
+static int fake_log_ok(const void *span) { return g_log_fake_on && g_block_mem && span == g_block_mem && !g_log_fake_bad && !g_block_unreliable; }
+int nvn_dirty_log_open(const void *span, uint64_t *ident, uint64_t *cursor) {
+    if (!fake_log_ok(span)) return 0;
+    *ident = g_log_ident; *cursor = g_log_head; return 1;
+}
+int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void (*fn)(void *, uintptr_t, uintptr_t), void *user) {
+    if (!fake_log_ok(span) || ident != g_log_ident || g_log_head - *cursor > FAKE_LOG_CAP) return 0;
+    for (uint64_t i = *cursor; i < g_log_head; i++) fn(user, g_log_ev[i % FAKE_LOG_CAP].a, g_log_ev[i % FAKE_LOG_CAP].b);
+    *cursor = g_log_head; return 1;
+}
+int nvn_dirty_page_armed(const void *span, const void *addr) {
+    if (!g_block_mem || span != g_block_mem) return 0;
+    size_t k = (size_t)((const uint8_t *)addr - g_block_mem) / PG;
+    return k < BLOCK_TEST_PAGES && !g_log_unarmed[k];
+}
+static void fake_log_event(size_t first, size_t last) {   // 第 first..last 页（含）变可写
+    g_log_ev[g_log_head % FAKE_LOG_CAP].a = (uintptr_t)g_block_mem + first * PG;
+    g_log_ev[g_log_head % FAKE_LOG_CAP].b = (uintptr_t)g_block_mem + (last + 1) * PG; g_log_head++;
+}
+static void fake_log_write(size_t page, uint8_t v) {   // 游戏写一页：内容、逐页代号、块版本、日志事件一起变（与真实现同序：事件先于写）
+    fake_log_event(page, page);
+    memset(g_block_mem + page * PG, v, PG); g_block_gen[page] = ++g_dirty_now; g_block_version[page / 64]++;
 }
 
 // 通道替身：记每次开通道的描述
@@ -1810,6 +1841,99 @@ static void t_buf_block_work(void) {
     g_block_unreliable = 0;
     nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
     g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_blocks = 0;
+}
+
+// 脏页追加日志（nvk_buf_dirtylog，#1501 A②）：解析不按范围逐页比代号，只灌日志事件、在旧页位图里求交。
+// 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查（与块摘要那条用例同一口径）。
+static uint64_t sync_bytes_now(void) { extern void rp_buf_stats(uint64_t *, uint64_t *); uint64_t b = 0, r = 0; rp_buf_stats(&b, &r); return b; }
+static void t_buf_dirtylog(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    extern void rp_buf_frame_flip(void);
+    nvn_be_shutdown_session(); nvn_unimpl_reset(); g_pg_tracked = 1; g_buf_cpu_auto = 1;
+    g_flag_buf_dirtylog = 1; g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++; memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+    g_dirty_now = 100; g_nbw = 0;
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    memset(g_block_mem, 0x21, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
+    memset(g_block_version, 0, sizeof g_block_version); ++g_dirty_map; g_block_unreliable = 0;
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG;
+    nvn_be_pool_add(g_block_mem, all);
+    nvn_gpu_buf b = NULL;
+    // 新镜像：整份置旧，第一次解析整段同步一次
+    nvn_be_sub_begin(); g_block_pages_examined = 0;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_gpu_buf m0 = b;
+    // 只有别的池写了：本池一页都不查、一个字节都不传（修前逐页 256 页）
+    nvn_be_sub_begin(); ++g_dirty_now; g_block_pages_examined = 0; uint64_t sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    printf("dirtylog unrelated: examined=%llu synced=%llu expected 0/0\n", (unsigned long long)g_block_pages_examined, (unsigned long long)(sync_bytes_now() - sb0));
+    CHECK(g_block_pages_examined == 0 && sync_bytes_now() == sb0);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 写一页：只同步这一页，内容对
+    fake_log_write(70, 0x7b);
+    nvn_be_sub_begin(); g_block_pages_examined = 0; sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    CHECK(g_block_pages_examined == 0 && sync_bytes_now() - sb0 == PG);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 写两页、只解析前一页：后一页的旧位留着，之后解析它照样同步
+    fake_log_write(80, 0x38); fake_log_write(81, 0x49);
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 80 * PG, PG, &b, NULL) == 1);
+    if (b && b->cpu) CHECK(b->cpu[80 * PG] == 0x38 && b->cpu[81 * PG] == 0x21);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 81 * PG, PG, &b, NULL) == 1);
+    if (b && b->cpu) CHECK(b->cpu[81 * PG] == 0x49);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 两份镜像各有游标与位图：第 0 份同步了第 90 页之后换到第 1 份写第 91 页，换回来时第 0 份必须补上第 91 页
+    fake_log_write(90, 0x5a);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b == m0); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    rp_buf_frame_flip();
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b != m0);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));   // 新的第 1 份：整份同步
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    fake_log_write(91, 0x5b);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); if (b && b->cpu) CHECK(b->cpu[91 * PG] == 0x5b); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    rp_buf_frame_flip();
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b == m0);
+    if (b && b->cpu) CHECK(b->cpu[90 * PG] == 0x5a && b->cpu[91 * PG] == 0x5b);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 加保护被并发解保护挡住（此刻不是只读）：同步了也不能清位——之后那次没缺页的写下一次解析照样要同步
+    g_log_unarmed[100] = 1; fake_log_write(100, 0x64);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); if (b && b->cpu) CHECK(b->cpu[100 * PG] == 0x64); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    memset(g_block_mem + 100 * PG, 0x65, PG); g_block_gen[100] = ++g_dirty_now;   // 页还可写：这次写不缺页、不进日志
+    g_log_unarmed[100] = 0;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); if (b && b->cpu) CHECK(b->cpu[100 * PG] == 0x65); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 环绕：第 130 页的事件被后面 70 条覆盖，读者判不可用 → 按逐页代号重建，第 130 页不能漏
+    fake_log_write(130, 0x13);
+    for (int i = 0; i < FAKE_LOG_CAP + 6; i++) fake_log_write(120, (uint8_t)(0x40 + i));
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    if (b && b->cpu) CHECK(b->cpu[130 * PG] == 0x13 && b->cpu[120 * PG] == g_block_mem[120 * PG] && !memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 重建之后照常只按事件走
+    nvn_be_sub_begin(); ++g_dirty_now; g_block_pages_examined = 0; sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && g_block_pages_examined == 0 && sync_bytes_now() == sb0);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 待落地的 GPU 写：CPU 同步不得覆盖 GPU 写进镜像、还没落地的字节
+    nvn_gpu_buf written = b; uint64_t key = 0;
+    uint64_t id = rp_buf_gpu_write_note(base + 200 * PG, PG, &key);
+    CHECK(id && key == base && written && written->cpu);
+    if (written && written->cpu) memset(written->cpu + 200 * PG, 0xee, PG);
+    fake_log_event(200, 200); g_block_gen[200] = ++g_dirty_now;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b == written);
+    if (b && b->cpu) CHECK(b->cpu[200 * PG] == 0xee);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    CHECK(g_block_mem[200 * PG] == 0xee);
+    // 跟踪不可靠：日志与逐页代号都不可用 → 这份镜像退回逐页路径，不受跟踪就整段同步
+    g_block_unreliable = 1; g_block_mem[150 * PG] = 0x71;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); if (b && b->cpu) CHECK(b->cpu[150 * PG] == 0x71); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_block_unreliable = 0;
+    nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
+    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = 0; g_log_fake_on = 0;
 }
 
 static void t_buf_ops(void) {   // 缓冲类命令只改游戏内存；GPU 顺序由使用点同步保证：先用的看到旧内容，后用的看到新内容
@@ -4415,6 +4539,7 @@ int main(int argc, char **argv) {
     t_decl_view();
     t_buf_mirror();
     t_buf_block_work();
+    t_buf_dirtylog();
     t_buf_mirror_fail_once();
     t_buf_multi_tail();
     t_buf_ops();
