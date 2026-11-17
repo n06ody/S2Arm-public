@@ -134,3 +134,8 @@ int main(int argc,char **argv){
  GPU(nvn_gpu_close(5000000000ull,&err));REQUIRE(!s2a_vk_device_destroy(&d,1));
  return bad?1:0;
 }
+
+// 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
+int nvn_dirty_block_snapshot(const void *s, const void *a, size_t n, uint64_t *v, uint64_t *e) {
+    (void)s; (void)a; (void)n; (void)v; (void)e; return 0;
+}

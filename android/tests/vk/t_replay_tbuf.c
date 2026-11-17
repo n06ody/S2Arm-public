@@ -128,3 +128,8 @@ int main(int argc, char **argv) {
     nvn_gpu_err err = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close session"); s2a_vk_device_destroy(&g_dev, 1);
     printf("TBUF replay: expected 9,13,4,255 on 16 pixels, failures=%d\n", g_fail); return g_fail ? 1 : 0;
 }
+
+// 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
+int nvn_dirty_block_snapshot(const void *s, const void *a, size_t n, uint64_t *v, uint64_t *e) {
+    (void)s; (void)a; (void)n; (void)v; (void)e; return 0;
+}
