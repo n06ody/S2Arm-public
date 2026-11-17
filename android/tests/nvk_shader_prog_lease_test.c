@@ -42,6 +42,7 @@
 
 #include "nvn_backend.h"
 #include "rp_shader.h"
+#include "rp_state.h"
 #include "nvn_plat.h"
 #include "nvn_unimpl.h"
 #include "nvn/nvn_vk_prog_warm.h"
@@ -54,6 +55,13 @@
 static int g_checks, g_fail;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
     fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+// This worker/lease fixture has no bound replay stages. Error diagnostics must see missing
+// keys, not fabricated keys; declarations and state layout come from production headers.
+struct rp_state rp_S;
+int rp_shader_stage_key(unsigned st, uint8_t key[8]) {
+    (void)st; if (key) memset(key, 0, 8); return 0;
+}
 
 // ---- 平台替身：日志按行留档（读数断言用），开关一律取缺省 ----
 enum { LOG_LINES = 256, LOG_LEN = 256 };
