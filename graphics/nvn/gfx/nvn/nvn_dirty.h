@@ -22,6 +22,16 @@ int nvn_dirty_blocks_configure(int enabled);
 // 对一个摘要块内的范围取稳定快照；返回 1 时 version + epoch 可以作为缓存身份。
 // 未跟踪、跨块、写入进行中、别名重叠或跟踪不可靠均返回 0，调用方必须保守处理。
 int nvn_dirty_block_snapshot(const void *span, const void *addr, size_t len, uint64_t *version, uint64_t *epoch);
+// 脏页追加日志（#1501 A②）：须在任何池登记前配置；失败（已有活池 / 原子操作非无锁）返回 0，调用方沿用逐页核对。
+// 每次一页从只读变可写就追加一条 [a, b)（宿主页对齐地址，在页变可写之前发布）。
+int nvn_dirty_log_configure(int enabled);
+// 起游标：之后的事件才算。返回 0 = 这个范围没有可用日志（未启用 / 保留量用尽 / 与别的池重叠 / 换底过 / 跟踪不可靠）。
+int nvn_dirty_log_open(const void *span, uint64_t *ident, uint64_t *cursor);
+// 把游标之后的事件逐条交给 fn（可能重复，调用方按幂等处理），游标前移。返回 0 = 不可用或丢过事件（环绕）：
+// 调用方必须按逐页代号重建自己的状态，再 nvn_dirty_log_open 重新起游标（先起游标、后读代号）。
+int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void (*fn)(void *user, uintptr_t a, uintptr_t b), void *user);
+// addr 所在页此刻只读（之后的写必然缺页、必然进日志）：1 = 是。加保护被并发的解保护挡住时为 0，调用方不能当已同步。
+int nvn_dirty_page_armed(const void *span, const void *addr);
 void nvn_dirty_set_chunk_pages(uint32_t pages);
 uint32_t nvn_dirty_chunk_pages(void);
 // 跟踪不可靠：任一 mprotect 失败后置位；为 1 时所有查询走保守路径（视为脏 / 代际 -1）。
