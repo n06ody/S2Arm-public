@@ -47,13 +47,18 @@ void nvk_shader_stop(void) { atomic_fetch_or_explicit(&g_shader_admission, NVK_S
 unsigned nvk_shader_inflight(void) { return atomic_load_explicit(&g_shader_admission, memory_order_acquire) & ~NVK_SHADER_STOP_BIT; }
 // 会话级在途 / 静默 / 代际清场（定义在下面的状态变量之后：open 在文件前面，用前向声明）。
 static void shader_session_state_reset(void);
+static void pool_final_summary(int normal);
+// 弱链接[androiddraw]：nvn_unimpl_diag_summary
+extern void nvn_unimpl_diag_summary(const char *, uint64_t) __attribute__((weak));
 int nvk_shader_open(void) {
     unsigned expected = NVK_SHADER_STOP_BIT;
-    if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire)) {
-        shader_session_state_reset();   // 新会话：在途 / 静默位 / 代际清一遍（上一局的后台结果不得落进新会话）
-        return 0;
-    }
-    return expected == 0 ? 0 : -1;
+    if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire))
+        shader_session_state_reset();   // 新会话，旧后台结果不能落入
+    else if (expected != 0) return -1;
+    // Register even before any texture pool/program exists. Reuse the existing single owner:
+    // normal Android exit calls s2a_direct_summary(1), not nvk_session_close / atexit.
+    if (nvn_plat_flag("nvk_csd", 0) || nvn_plat_flag("nvk_csf", 0)) s2a_direct_summary_register(pool_final_summary);
+    return 0;
 }
 static int shader_enter(void) {
     unsigned s = atomic_load_explicit(&g_shader_admission, memory_order_acquire);
@@ -151,6 +156,23 @@ static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", n
 // 后端拒装着色器时记哪一项（#1340）：设备没 shaderInt16、模块又声明了 Int16 的，具名 int16_not_supported（只拒这个程序，不整局停）；其余照旧。
 static void red_load(nvn_gpu_rc rc, const nvn_gpu_shader_src *src, const char *fallback, const char *why) {
     red1(rc.code == NVN_GPU_E_UNSUPPORTED && s2a_spirv_declares_cap(src->blob, src->bytes, 22) == 1 ? "int16_not_supported" : fallback, why);
+}
+// 程序级失败（编译拒收 / 结果解析失败）：计数同 red1，但每一条都带程序键与原因写一行（整局前 256 条），
+//   这样一局里几十个失败程序能逐个按程序归因（只记首条时，空轨 2nd 9000 局 19 个计算解析失败只看得到 1 个原因）。
+//   程序键 = 当前绑定的阶段控制键（计算 = NVN 阶段 5；图形 = 已绑的各阶段，斜杠分隔），同编译请求的 requestId 与普查的键。
+static void red_prog(const char *name, int compute, const char *why) {
+    nvn_unimpl("shader", name, NULL);
+    static _Atomic int said;
+    if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 256) return;
+    char key[96] = ""; int o = 0;
+    for (unsigned st = compute ? 5 : 0; st <= (compute ? 5u : 4u) && o < (int)sizeof key - 18; st++) {
+        uint8_t k[8];
+        if (compute) memcpy(k, rp_S.skey[5], 8); else if (!rp_shader_stage_key(st, k)) continue;
+        if (o) key[o++] = '/';
+        for (int b = 0; b < 8; b++) o += snprintf(key + o, sizeof key - (size_t)o, "%02x", k[b]);
+    }
+    char m[768]; snprintf(m, sizeof m, "%s（程序键 %s）：%s", name, o ? key : "未知", why ? why : "");
+    nvn_plat_log(NVN_PLAT_LOG_RED, "shader", m);
 }
 // 不需要 _GNU_SOURCE 的 strdup：快照要活过后台线程，profile 原文 / closure / profileHash 必须各存一份。
 static char *dup_str(const char *s) {
@@ -358,6 +380,7 @@ static void pool_stats(const char *phase) {
 /* The normal Android process exit calls this after services/GPU stop. It does
  * not pass through rp_shader_reset, which belongs to session retirement. */
 static void pool_final_summary(int normal) {
+    if (nvn_unimpl_diag_summary) nvn_unimpl_diag_summary(normal ? "normal_exit" : "exit_timeout", 0);
     if (normal && (g_pool_programs || g_pool_request_rejected)) pool_stats("final");
 }
 /* The producer's failure summary embeds its s2a-direct-error-v1 JSON. Missing,
@@ -683,6 +706,8 @@ static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
         if (b->storage_writable) e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W;
         return 1;
     }
+    // 共享内存溢出缓冲（计算）：没有客体来源，回放按派发组数 × 程序的 spill_bytes 从暂存区分配（rp_draw.c rp_dispatch）
+    if (b->kind == 4 && b->count == 1) { e->cls = NVN_GPU_RES_SSBO; e->src_kind = NVN_RB_SPILL; e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W; return 1; }
     // 图像：只接计算阶段的单个存储图像（解析器给出 NVN 图像槽 0..7，放在 tex_slot）；回放按槽取 BindImage 的句柄建存储视图
     //   （rp_draw.c rp_dispatch NVN_RB_IMG）。图形阶段的图像回放还没接，绘制时按名跳过（compute_image_shape）。
     if (b->kind == 3 && b->count == 1 && b->tex_slot >= 0 && b->tex_slot < 8) {
@@ -802,7 +827,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     memset(&fp, 0, sizeof fp);
     int parsed = nvn_vk_program_parse_graphics_stages(bytes, len, &fp, nst == 1, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("program_parse_failed", 0, why);
         nvn_vk_program_free(&fp); e->failed = 1; return e;
     }
     for (int st = 0; st < FD_MAX_STAGES; st++) {
@@ -1068,7 +1093,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
             // 编译器报缺的是用户常量缓冲里的句柄事实、且学到了新坐标：resolve_slow 会带上它当场重编，这次拒绝是学习的一步，
             // 不记成「未接 compile_failed」（不然每份着色器第一次见这类句柄都多几条假红）。学不到 / 重编到上限仍失败的，下一次照常报红。
             if (ubo_need_learn(oc.summary, (const uint8_t (*)[8])s->keys, s->nst)) g_ubo_learned = 1;
-            else red1("compile_failed", oc.summary);
+            else red_prog("compile_failed", 0, oc.summary);
             compiler_rejected(oc.summary);
             s2a_compile_outcome_free(&oc);
             struct entry *fe = (struct entry *)calloc(1, sizeof *fe);
@@ -1616,10 +1641,10 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     memset(&cp, 0, sizeof cp);
     int parsed = nvn_vk_program_parse_compute(bytes, len, &cp, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("compute_program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red_prog("compute_program_parse_failed", 1, why);
         e->failed = 1; return e;
     }
-    e->prog.support_bytes = cp.support_bytes;
+    e->prog.support_bytes = cp.support_bytes; e->prog.spill_bytes = cp.spill_bytes;
     for (int i = 0; i < cp.binding_count && !e->failed; i++) {
         const struct fd_binding *b = &cp.bindings[i];
         if (e->prog.nent[0] == RP_PROG_ENT_MAX) { red1("too_many_bindings", "cs"); e->failed = 1; break; }
@@ -1772,6 +1797,20 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         }
         return -1;
     }
+    // Private diagnostic input: exact compile request, including profile and shader facts.
+    // Runtime capture manifests use the same identity. Files never overwrite another run's inputs.
+    if (nvn_plat_flag("nvk_csc", 0)) {
+        uint32_t prefix = (uint32_t)rp_S.skey[5][0] << 24 | (uint32_t)rp_S.skey[5][1] << 16 | (uint32_t)rp_S.skey[5][2] << 8 | rp_S.skey[5][3];
+        const char *dir = nvn_plat_dir(NVN_PLAT_DIR_DIAG);
+        if (dir && prefix == (uint32_t)nvn_plat_flag("nvk_csf_a", 0)) {
+            char hex[65], path[1024]; for (int i = 0; i < 32; i++) snprintf(hex + 2*i, 3, "%02x", rq.identity[i]);
+            if (snprintf(path, sizeof path, "%s/csf-%s.request.json", dir, hex) < (int)sizeof path) {
+                FILE *f = fopen(path, "wx");
+                if (f) { int ok = fwrite(rq.json, 1, rq.json_bytes, f) == rq.json_bytes; if (fclose(f)) ok = 0;
+                    if (!ok) nvn_plat_log(NVN_PLAT_LOG_RED, "csf", "csf request_capture incomplete"); }
+            }
+        }
+    }
     pthread_mutex_lock(&g_progs_mu);
     struct entry *e = progs_get_locked(rq.identity);
     pthread_mutex_unlock(&g_progs_mu);
@@ -1800,7 +1839,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
-                red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);
+                red_prog("compute_compile_failed", 1, oc.summary); compiler_rejected(oc.summary);
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e);
                 if (e) {

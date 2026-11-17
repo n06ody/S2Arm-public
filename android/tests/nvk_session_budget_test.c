@@ -36,6 +36,8 @@ double s2a_direct_vk_display_refresh(void) { return 60; }
 void nvn_unimpl_reset(void) {}
 size_t nvn_unimpl_dump(char *b, size_t n) { if (n) *b=0; return 0; }
 int nvn_unimpl_kinds(void) { return 0; }
+// 本夹具的 nvn_plat_flag 始终返回默认值：诊断关闭，真实汇总函数同样无输出。
+void nvn_unimpl_diag_summary(const char *phase, uint64_t frame) { (void)phase; (void)frame; }
 void rp_present_set_surface(nvn_gpu_surface s, int hz) { (void)s; (void)hz; }
 void rp_present_stats(uint64_t *s, uint64_t *d) { *s = *d = 0; }
 nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *e) { (void)d; (void)e; return (nvn_gpu_rc){NVN_GPU_OK}; }

@@ -20,6 +20,7 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 mode=${1:-}
+if [ "$mode" = "--csf-reference" ]; then exec bash "$repo/android/tests/csf_reference/run.sh"; fi
 # 窄 shim 的 wrap 直通用例（#1091 复审）：不设驱动时 5 个入口必须逐条落 __real_*。
 # 只依赖编译器与仓内 Vulkan 头，不需要 lavapipe / validation，放在容器分流之前无条件跑。
 if [ "$(uname -s)" = Linux ]; then
