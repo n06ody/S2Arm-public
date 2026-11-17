@@ -7,6 +7,7 @@
 
 const char *rp_op_name(uint32_t op);   // 录制命令名（"OP_DRAW" …）；范围外返回 "OP_?"
 int rp_pool_count(void);                // 已登记的内存池个数
+uint64_t rp_pool_fast_hits(void);       // 调用线程的快路命中累计（只读；测试与调优观测点）
 void rp_pool_memo_stats(uint64_t *hits, uint64_t *lookups);   // 池查找的线程内备忘（rp_entry.c）：调用线程自己的累计命中数、查找数
 int rp_tex_live_n(void);                // 活贴图对象个数（只是登记数，不等于已建图的个数）
 int rp_depth_zero(void);                // NVN 深度模式：1 = 近平面为 0

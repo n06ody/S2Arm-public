@@ -26,13 +26,16 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static char g_prl_lines[64][256]; static int g_prl_n;   // 池登记明细（cls "poolreg"）收下来给 t_pool_reg_log 核
+void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolreg")) { if (g_prl_n < 64) snprintf(g_prl_lines[g_prl_n], 256, "%s", text); g_prl_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
+static int g_flag_pool_reg_log;   // 用例设：开关 pool_reg_log（缺省同产品：关）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "pool_reg_log")) return g_flag_pool_reg_log;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
@@ -744,6 +747,40 @@ static void t_pool_nested(void) {
             if (h1 && h2) CHECK(mm == (const uint8_t *)bb && oo == B + qo[i] - (uint64_t)(uintptr_t)mm && nn == BIG);
         }
     }
+    // ⑨ 快路：小池放回来，关掉备忘，查大池内、小池之后的地址两次——第二次必须走快路
+    nvn_be_pool_add(g_pn_arena + SMALL_OFF, SMALL);
+    CHECK(rp_pool_count() == n0 + 2);
+    pm_flag(0);
+    uint64_t fh0 = rp_pool_fast_hits();
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x4000, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh0);
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x4000, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh0 + 1);
+    // ⑩ 备忘：开着时同地址连查 3 次，备忘命中数要增加（可答区间没被小池切断）
+    pm_flag(1);
+    uint64_t hz0 = pm_hits();
+    // 先查一次小池内地址：把快路/备忘指向小池，随后的大池地址装不下，只能回落锁内并写入大池的记录
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + SMALL_OFF + 0x20, 0x40, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B + SMALL_OFF && n == SMALL);
+    for (int i = 0; i < 3; i++) {
+        m = NULL; n = 0;
+        CHECK(rp_pool_find(B + SMALL_OFF + 0x4100, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    }
+    CHECK(pm_hits() >= hz0 + 2);   // 后两次从备忘答出
+    // ⑪ 左端：[大池起点, 小池起点) 的地址连查两次，第二次走快路
+    pm_flag(0);
+    uint64_t fh1 = rp_pool_fast_hits();
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + 0x800, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh1);
+    m = NULL; n = 0;
+    CHECK(rp_pool_find(B + 0x800, 0x20, &m, &n) == 1 && (uint64_t)(uintptr_t)m == B && n == BIG);
+    CHECK(rp_pool_fast_hits() == fh1 + 1);
+    pm_flag(1);
+    nvn_be_pool_del(g_pn_arena + SMALL_OFF);
+    CHECK(rp_pool_count() == n0 + 1);
     nvn_be_pool_del(g_pn_arena);
     CHECK(rp_pool_count() == n0);
 }
@@ -3863,6 +3900,45 @@ static void t_sync_reuse_after_gpu_write(void) {
     nvn_be_pool_del(g_pmem); g_buf_cpu_auto = 0;
 }
 
+// ---------- 池登记明细（rp_entry.c prl_*，开关 pool_reg_log；#1368 取证）----------
+// 契约：关着不打任何行；打开后第一条是 begin，紧跟当时每个活池一条 op=live，之后每次登记 / 销毁一条，seq 从 0 连续；
+// 每 256 帧一个 mark、关掉时一个 end，seq_next = 到那时为止的条数。T_POOLREG_OUT 设了就把收下的行写进该文件（判定脚本的接口单测用）。
+static int prl_has(int i, const char *sub) { return i < g_prl_n && i < 64 && strstr(g_prl_lines[i], sub) != NULL; }
+static void t_pool_reg_log(void) {
+    static uint8_t a[0x100], b[0x80]; char want[96];
+    g_prl_n = 0; g_flag_pool_reg_log = 0;
+    nvn_be_pool_add(a, sizeof a); nvn_be_pool_add(b, sizeof b); nvn_be_pool_del(b);
+    CHECK(g_prl_n == 0);                                   // 关着：一行不打
+    const int live0 = rp_pool_count();
+    g_flag_pool_reg_log = 1;
+    nvn_be_pool_add(b, sizeof b);                          // 打开后第一次登记：begin + 活池快照 + 这一条
+    nvn_be_pool_del(b);
+    nvn_be_pool_del(b);                                    // 已不在表里：del_miss
+    const uint64_t f0 = rp_frame(); for (int i = 0; i < 256; i++) nvn_be_set_frame(f0 + 1 + (uint64_t)i);
+    g_flag_pool_reg_log = 0;
+    nvn_be_pool_del(a);                                    // 关掉：end（这一笔本身不再记）
+    const int n = g_prl_n;
+    CHECK(n == 1 + live0 + 3 + 1 + 1);
+    snprintf(want, sizeof want, "begin v=1 live=%d", live0); CHECK(prl_has(0, want));
+    for (int i = 0; i < live0; i++) { snprintf(want, sizeof want, "seq=%d op=live ", i); CHECK(prl_has(1 + i, want)); }
+    int seen_a = 0;
+    snprintf(want, sizeof want, "base=%#llx size=0x100", (unsigned long long)(uintptr_t)a);
+    for (int i = 1; i <= live0; i++) seen_a |= prl_has(i, want);
+    CHECK(seen_a);                                         // 关着时登记的 a 出现在快照里
+    snprintf(want, sizeof want, "seq=%d op=add ", live0); CHECK(prl_has(1 + live0, want));
+    snprintf(want, sizeof want, "base=%#llx size=0x80 live=%d", (unsigned long long)(uintptr_t)b, live0 + 1); CHECK(prl_has(1 + live0, want));
+    snprintf(want, sizeof want, "seq=%d op=del ", live0 + 1); CHECK(prl_has(2 + live0, want));
+    snprintf(want, sizeof want, "seq=%d op=del_miss ", live0 + 2); CHECK(prl_has(3 + live0, want));
+    snprintf(want, sizeof want, "mark seq_next=%d adds=1 dels=1 live=%d why=frame", live0 + 3, live0); CHECK(prl_has(4 + live0, want));
+    snprintf(want, sizeof want, "end seq_next=%d adds=1 dels=1 live=%d why=off", live0 + 3, live0); CHECK(prl_has(5 + live0, want));
+    CHECK(strncmp(g_prl_lines[0], "S2A_POOLREG run=", 16) == 0);
+    for (int i = 1; i < n && i < 64; i++) CHECK(strncmp(g_prl_lines[i], g_prl_lines[0], 33) == 0);   // 同一个 run 号
+    CHECK(rp_pool_count() == live0 - 1);
+    const char *out = getenv("T_POOLREG_OUT");
+    if (out) { FILE *fp = fopen(out, "w"); if (fp) { for (int i = 0; i < n && i < 64; i++) fprintf(fp, "I S2Arm: nvk poolreg: %s\n", g_prl_lines[i]); fclose(fp); } }
+    nvn_be_set_frame(f0);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     t_invalidated_attachment_pin();
@@ -3882,6 +3958,7 @@ int main(int argc, char **argv) {
     t_pools();
     t_pool_memo();
     t_pool_nested();
+    t_pool_reg_log();
     t_tex_init_registers_only();
     t_alias();
     t_alias_take_over();

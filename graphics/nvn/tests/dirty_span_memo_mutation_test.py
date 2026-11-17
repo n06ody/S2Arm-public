@@ -8,7 +8,7 @@
   - 写者开工处那道 release 栅栏（table_write_begin 里的 atomic_thread_fence）与读者复查前的 acquire 栅栏（find_span 里）：只约束弱序机器上的可见顺序，
     去掉它们，x86 宿主上答案不变；由 t_dirty_span_index.c 的并发用例（每次登记 / 注销都把永远在的条目整体挪一位）做压力，不在这里声称能杀。
   - 索引条目的 relaxed 原子读写改成普通读写：宿主上结果不变（TSan 才看得出），不在这里声称能杀。
-  - 池备忘的区间上界 lim：池互不重叠时去掉它答案不变，池嵌套时会把内层地址答成外层的池；已由「快路不看区间上界」变异体覆盖。
+  - 池备忘的可答区间 [lo, lim)：池互不重叠时去掉它答案不变，池嵌套时会把内层地址答成外层的池、或让外层地址每次回落锁内；已由「快路不看可答区间」变异体覆盖。
 
 「红在哪条断言」的判法：期望可以给几条同义断言（元组），任一条出现就算拦在了对的性质上；同一条性质在用例里往往不止一处断言
 （例如「装不下就不算命中」有越过池尾、池间空隙两处），不把「必须是哪一条」钉死，用例加项、挪位置时才不会误红。
@@ -93,16 +93,20 @@ dirty_mutations = [
 
 # ---------- 池查找备忘（rp_entry.c） ----------
 pool_mutations = [
-    ('池备忘不比代际', [('if (m->epoch != ep || addr < m->a || addr >= m->lim) continue;', 'if (!m->epoch || ep == 0 || addr < m->a || addr >= m->lim) continue;')],   # 代际不再比对（ep 从 1 起，ep == 0 恒假，只为不留未用变量告警）
+    ('池备忘不比代际', [('if (m->epoch != ep || addr < m->lo || addr >= m->lim) continue;', 'if (!m->epoch || ep == 0 || addr < m->lo || addr >= m->lim) continue;')],   # 代际不再比对（ep 从 1 起，ep == 0 恒假，只为不留未用变量告警）
      '0x200 + 0x10, 8) && rp_pool_find'),
     ('池备忘装不下也算命中',
-     [('if (addr - m->a > m->n || len > m->n - (addr - m->a)) return 0;   // 候选是它但装不下：锁内二分同样判不命中，交给锁内', '/* 变异：不判装不装得下 */')],
+     [('if (addr - m->a > m->n || len > m->n - (addr - m->a)) continue;', '/* 变异：不判装不装得下 */')],
      ('pm_check(B + 0xf80, 0x100)',    # 越过 P0 尾
       'pm_check(B + 0x1800, 0x10)')),  # P0 与 P1 之间的空隙：候选是 P0、装不下；两条都是「候选是它但装不下」
     ('池备忘给错长度', [('if (size) *size = m->n;', 'if (size) *size = m->n + 1;')], 'pm_check(B + 0x800, 0x100)'),
     ('池备忘关着也查', [('if (!on) return 0;', '/* 变异：关着也查 */')], 'pm_hits() == hz && pm_lookups() == lz'),
-    ('快路不看区间上界', [('if (addr >= lim) return 0;   // past a nested pool: the locked search decides', 'if (0 && addr >= lim) return 0;   // 变异：不看上界')],
+    ('快路不看可答区间', [('if (addr < lo || addr >= lim) return 0;   // outside the answer interval: the locked search decides', 'if (0 && (addr < lo || addr >= lim)) return 0;   // 变异：不看区间')],
      'rp_pool_find(B + SMALL_OFF + 0x20, 0x40'),
+    ('池查找下界不并入跨过的小池',
+     [('for (int k = ci + 1; k <= cand; k++) {',
+       'for (int k = ci + 1; k <= cand && 0; k++) {   // 变异：lo 回退旧公式 [a, 下一起点)')],
+     'm == B + SMALL_OFF && n == SMALL'),
 ]
 
 compile_flags = ['-O2', '-g', '-Wall', '-Wextra', '-Wno-unused-parameter']
