@@ -31,7 +31,7 @@ def main():
     exe=out/'current'
     subprocess.run(flags+[str(ROOT/'android/tests/nvk_session_budget_test.c'),str(session),strip,'-o',str(exe)],check=True,timeout=30)
     rc=0
-    for mode in ('control','busy'):
+    for mode in ('control','busy','blocks-off','blocks-refuse'):
         r=subprocess.run([str(exe),mode],capture_output=True,text=True,timeout=10);print(r.stdout+r.stderr,end='');rc|=r.returncode
     return rc
 if __name__=='__main__': raise SystemExit(main())
