@@ -111,8 +111,50 @@ static void on_shown(void *user, const nvn_gpu_shown *s) {   // 持 g_pmu 的 pr
 // there is no handoff to a separate presentation thread to prepare for.
 void nvn_be_present_prepare(const tex_t *t) { (void)t; }
 
+// ---------- 诊断：池查找统计（开关 debug.s2a.pool_stats=1，缺省关；#1368 三档读数）----------
+// 每 1024 帧（上屏的帧边界，回放线程）打一行，会话收尾再打一行；开着时 0 值也打。行形态（nvn_plat_log：logcat + 宿主日志）：
+//   S2A_POOLSTATS v=1 why=frame|end frames=<开着以来的帧数> fast_hits=<n|na> memo_hits=<n> lookups=<n> span_index_hits=<n> exec_ns=<n> exec_n=<n>
+// 各项口径（都是累计值，差分由离线算）：
+//   fast_hits       = rp_pool_fast_hits()：池查找「上次命中的池」快路命中（#1368 的计数，线程内）；没合 #1368 的树里没有这个函数，打 na
+//   memo_hits       = 线程内备忘命中（rp_pool_memo_stats 的 hits）
+//   lookups         = 池查找总次数（rp_pool_memo_stats 的 lookups：备忘开着时每次查找都先进备忘计一次；备忘关着时为 0）
+//   span_index_hits = 写跟踪取范围有序索引（#1133，nvn_dirty_span_stats）答的次数——这是另一张索引，不是池查找快路，单列不混
+//   exec_ns / exec_n = 开着以来最外层回放（每条提交的命令列表）的累计用时与次数
+// 计数都是回放线程自己的（线程内）；收尾那一行用最后一帧的快照（收尾可能不在回放线程上跑）。
+// 弱链接[replay]：rp_pool_fast_hits
+uint64_t rp_pool_fast_hits(void) __attribute__((weak));   // #1368 的快路命中计数；没合 #1368 的树里没有，打 na
+static struct { int on; unsigned frames; uint64_t fast, memo_h, memo_l, span_h; } g_ps;
+static void ps_snap(void) {
+    if (rp_pool_fast_hits) g_ps.fast = rp_pool_fast_hits();
+    rp_pool_memo_stats(&g_ps.memo_h, &g_ps.memo_l);
+    uint64_t xs = 0, xn = 0; nvn_dirty_span_stats(&g_ps.span_h, &xs, &xn);
+}
+static void ps_line(const char *why) {
+    uint64_t ens = 0, en = 0; rp_pool_stats_exec(&ens, &en);
+    char fh[24]; if (rp_pool_fast_hits) snprintf(fh, sizeof fh, "%llu", (unsigned long long)g_ps.fast); else snprintf(fh, sizeof fh, "na");
+    char b[320]; snprintf(b, sizeof b, "S2A_POOLSTATS v=1 why=%s frames=%u fast_hits=%s memo_hits=%llu lookups=%llu span_index_hits=%llu exec_ns=%llu exec_n=%llu",
+                          why, g_ps.frames, fh, (unsigned long long)g_ps.memo_h, (unsigned long long)g_ps.memo_l, (unsigned long long)g_ps.span_h,
+                          (unsigned long long)ens, (unsigned long long)en);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "poolstats", b);
+}
+void rp_pool_stats_frame(void) {
+    const int on = nvn_plat_flag("pool_stats", 0) == 1;   // 帧边界读一次开关
+    if (on != g_ps.on) {
+        if (on) { g_ps.frames = 0; rp_pool_stats_exec_reset(); }
+        g_ps.on = on; __atomic_store_n(&rp_pool_stats_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on) return;
+    ps_snap();
+    if (!(++g_ps.frames & 1023)) ps_line("frame");
+}
+void rp_pool_stats_end(void) {
+    if (!g_ps.on) return;
+    ps_line("end");
+    g_ps.on = 0; __atomic_store_n(&rp_pool_stats_on, 0, __ATOMIC_RELAXED);
+}
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
+    rp_pool_stats_frame();   // 池统计（开关 pool_stats；关着只读一次开关）
     rp_tm_frame_end();   // 一帧结束：刚结束的是采样帧就记一帧，再定下一帧要不要逐步计时（分时抽样，#1103）
     pthread_mutex_lock(&g_pmu);
     uint64_t ticket = ++g_ticket; double zero = 0;
