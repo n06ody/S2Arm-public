@@ -3,6 +3,8 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_shader.h"
+#include "nvn_refl.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
@@ -253,6 +255,223 @@ void rp_occl_draw(nvn_gpu_cmd c) {                                              
     g_occ_cur = (int)g_occ_next++; nvn_gpu_occlusion(c, g_occ_cur - (int)g_occ_base);
 }
 static void seg_cut(int next_occ);
+static int g_diag_next; static uint64_t g_diag_seq; static int g_diag_stopped, g_diag_on = -1;
+// Default-off diagnostic metadata is independent of fence insertion (nvk_csd / nvk_csf).
+// A reflected writable range proves a possible writer, not that every invocation wrote every byte.
+enum { DIAG_RANGES = 256, DIAG_WRITES = 512 };
+struct diag_range { uint64_t addr, len, seq, op, key; uint32_t set, binding, slot; };
+struct diag_write { uint64_t addr, len, op, key, serial; const char *kind; };
+static struct diag_range g_diag_ranges[DIAG_RANGES], g_diag_pending[RP_PROG_ENT_MAX];
+static struct diag_write g_diag_writes[DIAG_WRITES];
+static uint32_t g_diag_nranges, g_diag_npending, g_diag_put, g_diag_op;
+static uint64_t g_diag_record, g_diag_wserial, g_diag_key, g_diag_pool_epoch;
+// 弱链接[replay]：rp_pool_generation
+extern uint64_t rp_pool_generation(void) __attribute__((weak));
+static int g_diag_target;
+struct diag_capture {
+    nvn_gpu_binding binding; nvn_gpu_layout_ent layout;
+    nvn_gpu_buf before, after; int image; char image_meta[256];
+};
+static struct diag_capture g_diag_capture[RP_PROG_ENT_MAX];
+static uint32_t g_diag_ncapture, g_diag_capture_seen, g_diag_capture_count;
+static int g_diag_capture_want, g_diag_capture_bad, g_diag_capture_encoded;
+static int g_diag_dims_known;
+static uint32_t g_diag_dims[3]; static uint8_t g_diag_identity[32];
+static void diag_capture_clear(void) {
+    for (uint32_t i = 0; i < g_diag_ncapture; i++) {
+        if (g_diag_capture[i].before) nvn_gpu_buf_release(g_diag_capture[i].before, NULL, NULL);
+        if (g_diag_capture[i].after) nvn_gpu_buf_release(g_diag_capture[i].after, NULL, NULL);
+    }
+    g_diag_ncapture = 0; g_diag_capture_want = g_diag_capture_bad = g_diag_capture_encoded = 0;
+}
+// 弱链接[replay]：nvn_gpu_diag_image_capture
+extern int nvn_gpu_diag_image_capture(nvn_gpu_cmd, nvn_gpu_view, nvn_gpu_buf *, uint64_t *, char *, size_t) __attribute__((weak));
+static void diag_capture_bind(nvn_gpu_cmd c, const struct rp_prog *pg, const nvn_gpu_binding *b, uint32_t n) {
+    if (!g_diag_capture_want) return;
+    memcpy(g_diag_identity, pg->identity, sizeof g_diag_identity);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const nvn_gpu_layout_ent *e = &pg->ent[0][b[i].ent];
+        // Scratch is not an observable output; its undefined initial contents are not reference input.
+        if (e->src_kind == NVN_RB_SPILL) continue;
+        if (e->cls == NVN_GPU_RES_TEX_SAMP && e->count <= 1 && nvn_gpu_diag_image_capture && g_diag_ncapture < RP_PROG_ENT_MAX) {
+            struct diag_capture *v = &g_diag_capture[g_diag_ncapture++]; memset(v, 0, sizeof *v);
+            v->layout = *e; v->image = 1;
+            if (!nvn_gpu_diag_image_capture(c, b[i].u.ts.view, &v->before, &v->binding.u.b.len, v->image_meta, sizeof v->image_meta)) g_diag_capture_bad = 1;
+            total += v->binding.u.b.len; if (total > (128ull << 20)) { g_diag_capture_bad = 1; break; }
+            continue;
+        }
+        if ((e->cls != NVN_GPU_RES_UBO && e->cls != NVN_GPU_RES_SSBO) || e->count > 1 ||
+            !b[i].u.b.len || (b[i].u.b.len & 3) || b[i].u.b.len > (64ull << 20) ||
+            total > (128ull << 20) - b[i].u.b.len || g_diag_ncapture == RP_PROG_ENT_MAX) {
+            g_diag_capture_bad = 1; continue;
+        }
+        total += b[i].u.b.len;
+        struct diag_capture *v = &g_diag_capture[g_diag_ncapture++]; memset(v, 0, sizeof *v);
+        v->binding = b[i]; v->layout = *e; nvn_gpu_err err = {0};
+        if (!nvn_gpu_ok(nvn_gpu_buf_create(b[i].u.b.len, NVN_GPU_MEM_SHARED, NULL, &v->before, &err)) ||
+            !nvn_gpu_ok(nvn_gpu_buf_create(b[i].u.b.len, NVN_GPU_MEM_SHARED, NULL, &v->after, &err))) {
+            g_diag_capture_bad = 1; continue;
+        }
+        // The copy is in GPU order after all prior work/uploads, before this dispatch.
+        nvn_gpu_copy_buf(c, b[i].u.b.buf, b[i].u.b.off, v->before, 0, b[i].u.b.len);
+    }
+}
+static int diag_capture_file(const char *name, const void *data, uint64_t size) {
+    const char *dir = nvn_plat_dir(NVN_PLAT_DIR_DIAG); char path[1024];
+    if (!dir || !data || size > SIZE_MAX || snprintf(path, sizeof path, "%s/%s", dir, name) >= (int)sizeof path) return 0;
+    FILE *f = fopen(path, "wx"); if (!f) return 0; // Per-run directory; never overwrite another capture.
+    int ok = fwrite(data, 1, (size_t)size, f) == size; if (fclose(f)) ok = 0;
+    return ok;
+}
+static void diag_capture_finish(int completed) {
+    if (!g_diag_capture_want) return;
+    int complete = completed && g_diag_capture_encoded && !g_diag_capture_bad && g_diag_ncapture;
+    char manifest[32768]; size_t used = (size_t)snprintf(manifest, sizeof manifest,
+        "S2A-CSCAP\t1\nseq\t%llu\nkey\t%016llx\ngroups\t%u\t%u\t%u\nidentity\t",
+        (unsigned long long)g_diag_seq, (unsigned long long)g_diag_key, g_diag_dims[0], g_diag_dims[1], g_diag_dims[2]);
+    for (unsigned i = 0; i < 32; i++) used += (size_t)snprintf(manifest + used, sizeof manifest - used, "%02x", g_diag_identity[i]);
+    used += (size_t)snprintf(manifest + used, sizeof manifest - used, "\n");
+    if (completed && g_diag_capture_encoded) for (uint32_t i = 0; i < g_diag_ncapture; i++) {
+        struct diag_capture *v = &g_diag_capture[i]; char pre[96], post[96];
+        snprintf(pre, sizeof pre, "csf-%llu-%u-%u.before.bin", (unsigned long long)g_diag_seq, v->layout.set, v->layout.binding);
+        snprintf(post, sizeof post, "csf-%llu-%u-%u.after.bin", (unsigned long long)g_diag_seq, v->layout.set, v->layout.binding);
+        if (v->image) {
+            if (!diag_capture_file(pre, v->before ? nvn_gpu_buf_cpu(v->before) : NULL, v->binding.u.b.len)) complete = 0;
+            int n = snprintf(manifest + used, sizeof manifest - used, "image\t%u\t%u\t%s\t%s\n", v->layout.set, v->layout.binding, v->image_meta, pre);
+            if (n < 0 || (size_t)n >= sizeof manifest - used) { complete=0; break; } used += (size_t)n;
+            continue;
+        }
+        if (!diag_capture_file(pre, v->before ? nvn_gpu_buf_cpu(v->before) : NULL, v->binding.u.b.len) ||
+            !diag_capture_file(post, v->after ? nvn_gpu_buf_cpu(v->after) : NULL, v->binding.u.b.len)) complete = 0;
+        int n = snprintf(manifest + used, sizeof manifest - used,
+            "buffer\t%u\t%u\t%u\t%u\t%u\t%p\t%llu\t%llu\t%s\t%s\n",
+            v->layout.set, v->layout.binding, v->layout.cls, v->layout.src_kind, v->layout.access,
+            (void *)v->binding.u.b.buf, (unsigned long long)v->binding.u.b.off, (unsigned long long)v->binding.u.b.len, pre, post);
+        if (n < 0 || (size_t)n >= sizeof manifest - used) { complete = 0; break; }
+        used += (size_t)n;
+    }
+    if (used + 64 < sizeof manifest) used += (size_t)snprintf(manifest + used, sizeof manifest - used, "status\t%s\n", complete ? "complete" : "incomplete");
+    else complete = 0;
+    char name[96]; snprintf(name, sizeof name, "csf-%llu.tsv", (unsigned long long)g_diag_seq);
+    if (!diag_capture_file(name, manifest, used)) complete = 0;
+    char line[160]; snprintf(line, sizeof line, "csf capture seq=%llu status=%s buffers=%u file=%s", (unsigned long long)g_diag_seq, complete ? "complete" : "incomplete", g_diag_ncapture, name);
+    nvn_plat_log(complete ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", line);
+    diag_capture_clear();
+}
+static int diag_enabled(void);
+static void diag_reset(void) {
+    diag_capture_clear(); g_diag_capture_seen = g_diag_capture_count = 0;
+    g_diag_next = g_diag_stopped = 0; g_diag_on = -1; g_diag_seq = 0;
+    g_diag_nranges = g_diag_npending = g_diag_put = g_diag_op = 0;
+    g_diag_record = g_diag_wserial = g_diag_key = g_diag_pool_epoch = 0; g_diag_target = 0;
+    memset(g_diag_ranges, 0, sizeof g_diag_ranges); memset(g_diag_writes, 0, sizeof g_diag_writes);
+}
+static int diag_overlap(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
+    return n && m && n <= UINT64_MAX - a && m <= UINT64_MAX - b && a < b + m && b < a + n;
+}
+static int diag_range_at(uint64_t a, uint64_t n) {
+    int hit = -1;
+    for (uint32_t i = 0; i < g_diag_nranges; i++)
+        if (diag_overlap(a, n, g_diag_ranges[i].addr, g_diag_ranges[i].len) &&
+            (hit < 0 || g_diag_ranges[i].op > g_diag_ranges[hit].op)) hit = (int)i;
+    return hit;
+}
+void rp_diag_buffer_write(uint64_t addr, uint64_t len, const char *kind) {
+    if (!diag_enabled() || !len || (!g_diag_target && diag_range_at(addr, len) < 0)) return;
+    if (g_diag_wserial && !(g_diag_wserial % DIAG_WRITES)) nvn_plat_log(NVN_PLAT_LOG_WARN, "csf", "csf writer_history_evicted coverage=incomplete");
+    struct diag_write *w = &g_diag_writes[g_diag_wserial++ % DIAG_WRITES];
+    *w = (struct diag_write){addr, len, g_diag_record, g_diag_key, g_diag_wserial, kind};
+}
+// 弱链接[replay]：nvn_gpu_diag_buf_bytes
+extern uint64_t nvn_gpu_diag_buf_bytes(nvn_gpu_buf) __attribute__((weak));
+static int diag_group_count(uint64_t *groups) {
+    *groups = 0; if (!g_diag_dims_known) return 0;
+    uint64_t n = 1;
+    for (int i = 0; i < 3; i++) {
+        if (n && g_diag_dims[i] > UINT64_MAX / n) return 0;
+        n *= g_diag_dims[i];
+    }
+    *groups = n; return 1;
+}
+static void diag_spill_range(const struct rp_prog *pg, const nvn_gpu_binding *b) {
+    nvn_gpu_caps cap; nvn_gpu_caps_get(&cap);
+    uint64_t groups = 0, required = 0, last_start = 0, last_end = 0;
+    int known = diag_group_count(&groups), arithmetic = known && pg->spill_bytes;
+    if (arithmetic) {
+        uint64_t allocated_groups = groups ? groups : 1; // zero-group indirect dispatch still needs a valid binding
+        if (allocated_groups > UINT64_MAX / pg->spill_bytes) arithmetic = 0;
+        else { required = allocated_groups * pg->spill_bytes; if (groups) { last_end = required; last_start = required - pg->spill_bytes; } }
+    }
+    uint64_t capacity = nvn_gpu_diag_buf_bytes ? nvn_gpu_diag_buf_bytes(b->u.b.buf) : 0;
+    int aligned = cap.min_ssbo_align && !(b->u.b.off % cap.min_ssbo_align);
+    int range = cap.max_ssbo_range && b->u.b.len <= cap.max_ssbo_range;
+    int slices = arithmetic && required <= b->u.b.len;
+    int word32 = arithmetic && !(pg->spill_bytes & 3) && required / 4 <= (1ull << 32);
+    uint64_t reserved = rp_dispatch_spill_reserved();
+    int reserved_fits = capacity && b->u.b.off <= capacity && reserved <= capacity - b->u.b.off;
+    int backing = capacity && b->u.b.off <= capacity && b->u.b.len <= capacity - b->u.b.off;
+    int bad = (known && (!arithmetic || !slices || !word32)) || (cap.min_ssbo_align && !aligned) ||
+              (cap.max_ssbo_range && !range) || (capacity && (!backing || !reserved_fits));
+    char line[1000]; snprintf(line, sizeof line,
+        "csf spill_range seq=%llu key=%016llx dims=%u,%u,%u groups=%llu per_group=%u required=%llu slice_last_start=%llu slice_last_end=%llu buffer=%p offset=%llu bytes=%llu backing_bytes=%llu min_align=%u max_range=%llu aligned=%d range_fits=%d slices_fit=%d word32_fits=%d backing_known=%d backing_fits=%d dims_known=%d arithmetic_ok=%d caps_known=%d reserved_bytes=%llu pad=%u reserved_fits=%d index_rule=flat_group_times_slice_plus_clamped_index",
+        (unsigned long long)g_diag_seq, (unsigned long long)g_diag_key, g_diag_dims[0], g_diag_dims[1], g_diag_dims[2],
+        (unsigned long long)groups, pg->spill_bytes, (unsigned long long)required, (unsigned long long)last_start, (unsigned long long)last_end,
+        (void *)b->u.b.buf, (unsigned long long)b->u.b.off, (unsigned long long)b->u.b.len, (unsigned long long)capacity,
+        cap.min_ssbo_align, (unsigned long long)cap.max_ssbo_range, aligned, range, slices, word32, capacity != 0, backing,
+        known, arithmetic, cap.min_ssbo_align != 0 && cap.max_ssbo_range != 0,
+        (unsigned long long)reserved, b->u.b.len ? (unsigned)(reserved / b->u.b.len) : 0, reserved_fits);
+    nvn_plat_log(bad ? NVN_PLAT_LOG_RED : known && capacity && cap.min_ssbo_align && cap.max_ssbo_range ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_WARN, "csf", line);
+}
+// Called with the exact binding table sent to the backend. Only successful dispatches publish targets.
+void rp_diag_bind(nvn_gpu_cmd c, const struct rp_prog *pg, int st, const nvn_gpu_binding *b, uint32_t n) {
+    (void)c;
+    if (!diag_enabled() || !g_diag_target || st != 5) return;
+    g_diag_npending = 0;
+    diag_capture_bind(c, pg, b, n);
+    for (uint32_t i = 0; i < n; i++) {
+        const nvn_gpu_layout_ent *e = &pg->ent[0][b[i].ent]; uint64_t addr = 0;
+        if (e->src_kind == NVN_RB_SPILL) diag_spill_range(pg, &b[i]);
+        if (e->src_reg < 16 && (e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP))
+            addr = e->src_kind == NVN_RB_UBOP ? rp_S.ubo[5][e->src_reg].addr : rp_S.ssbo[5][e->src_reg].addr;
+        char line[512];
+        if (e->cls == NVN_GPU_RES_UBO || e->cls == NVN_GPU_RES_SSBO) {
+            snprintf(line, sizeof line, "csf binding seq=%llu op_id=%llu key=%016llx identity=%02x%02x%02x%02x set=%u binding=%u source=%u slot=%u access=%u guest=%#llx buffer=%p offset=%llu bytes=%llu",
+                (unsigned long long)g_diag_seq, (unsigned long long)g_diag_record, (unsigned long long)g_diag_key,
+                pg->identity[0], pg->identity[1], pg->identity[2], pg->identity[3], e->set, e->binding, e->src_kind, e->src_reg, e->access,
+                (unsigned long long)addr, (void *)b[i].u.b.buf, (unsigned long long)b[i].u.b.off, (unsigned long long)b[i].u.b.len);
+            if ((e->access & NVN_GPU_ACC_W) && addr && g_diag_npending < RP_PROG_ENT_MAX)
+                g_diag_pending[g_diag_npending++] = (struct diag_range){addr, b[i].u.b.len, g_diag_seq, g_diag_record, g_diag_key, e->set, e->binding, e->src_reg};
+        } else snprintf(line, sizeof line, "csf binding seq=%llu set=%u binding=%u source=%u slot=%u access=%u nonbuffer=1", (unsigned long long)g_diag_seq, e->set, e->binding, e->src_kind, e->src_reg, e->access);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", line);
+    }
+}
+// 弱链接[replay]：nvn_gpu_diag_dispatch_tag
+extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+void rp_diag_dispatch_begin(nvn_gpu_cmd c) {
+    if (!diag_enabled() || !g_diag_target) return;
+    if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,g_diag_seq,g_diag_key);
+    else nvn_plat_log(NVN_PLAT_LOG_WARN,"csf","csf dispatch_time source=unavailable reason=backend_hook_missing");
+}
+void rp_diag_dispatch_encoded(nvn_gpu_cmd c) {
+    (void)c;
+    if (!diag_enabled() || !g_diag_target) return;
+    g_diag_capture_encoded = 1;
+    for (uint32_t i = 0; i < g_diag_ncapture; i++) {
+        const struct diag_capture *v = &g_diag_capture[i];
+        if (!v->image && v->after) nvn_gpu_copy_buf(c, v->binding.u.b.buf, v->binding.u.b.off, v->after, 0, v->binding.u.b.len);
+    }
+    for (uint32_t i = 0; i < g_diag_npending; i++) {
+        struct diag_range *r = &g_diag_pending[i]; uint32_t j;
+        for (j = 0; j < g_diag_nranges; j++) if (r->addr == g_diag_ranges[j].addr && r->len == g_diag_ranges[j].len) break;
+        if (j == g_diag_nranges) {
+            if (j < DIAG_RANGES) g_diag_nranges++;
+            else { j = g_diag_put++ % DIAG_RANGES; nvn_plat_log(NVN_PLAT_LOG_RED, "csf", "csf target_history_evicted coverage=incomplete"); }
+        }
+        g_diag_ranges[j] = *r;
+        rp_diag_buffer_write(r->addr, r->len, "dispatch_encoded_possible");
+    }
+}
 // 第一次复位落在没声明槽的段里（开段时还不知道游戏用这个计数器）：就地交段，后半段开成带槽的新段，复位之后的绘制照计
 // （同 iOS nvn_mtl.m 第一次复位就地拆通道）。前半段没有槽，不进 mids。中间值用完交不了时具名记账，这一段复位后不计。
 static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
@@ -311,6 +530,7 @@ static void rc_cond(const p_render_cond *rc) {
 
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
+    diag_reset();
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
 
@@ -325,10 +545,15 @@ void nvn_be_sub_begin(void) {
     rp_dirty_all();   // 新段：已发给后端的状态全部重发；rp_S / rp_R 不动
 }
 
-struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; };   // counted：这次中途段持 s 的引用（完成回调里释放）；t_commit：提交时刻（算 GPU 忙）
+struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; int diag; uint64_t diag_seq; };   // counted：这次中途段持 s 的引用（完成回调里释放）；t_commit：提交时刻（算 GPU 忙）
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
     struct mid *m = user;
     if (m) ts_capture(m->ts, d);
+    if (m && m->diag) { char b[256]; snprintf(b, sizeof b,
+        "csf done seq=%llu phase=%d fence=%llu status=%u rc=%d time_kind=%u gpu_ns=%llu",
+        (unsigned long long)m->diag_seq, m->diag, (unsigned long long)d->signal,
+        d->status, d->rc.code, d->time_kind, (unsigned long long)d->gpu_dur_ns);
+        nvn_plat_log(d->status == NVN_GPU_DONE_OK ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
     if (d->status == NVN_GPU_DONE_FAILED) red("中途交的段失败：%s", d->why ? d->why : "?");
     else { if (m) busy_done(m->t_commit, now_ns());
         if (m && m->s->oc && d->occlusion) { for (uint32_t i = 0; i < d->nocclusion && m->base + i < 2048; i++) m->s->oc[m->base + i] = d->occlusion[i];
@@ -358,11 +583,11 @@ static void sub_split(void) {
 // next_occ 是新段要不要声明槽。调用方保证 g_cmd / g_sub 在、通道已收、中间值没用完。
 static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
-    if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
+    if (!m) { if (g_diag_next) g_diag_stopped = 1; nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
     if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
-    if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
+    if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); m->diag = g_diag_next; m->diag_seq = g_diag_seq; }
     if (g_occ_seg && !g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc);
     __atomic_add_fetch(&g_sub->refs, 1, __ATOMIC_ACQ_REL); m->counted = 1;
     g_sub->ts_current = NULL;
@@ -373,6 +598,94 @@ static void seg_cut(int next_occ) {
     nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
     if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_cmd, &err))) { g_cmd = NULL; red("中途交段后开新段失败：%s", err.why); }
     rp_dirty_all();
+}
+
+
+// Diagnostic only. One segment before and after each selected operation. Never treat a timeout,
+// an unsubmitted segment, or a failed timeline as permission to inspect host-visible bytes.
+static int diag_cut(int phase) {
+    if (!nvn_plat_flag("nvk_csf", 0)) return 0;
+    if (!g_cmd || !g_sub || g_diag_stopped || g_mid >= SUB_STEP - 4) {
+        char b[128]; snprintf(b, sizeof b, "csf unavailable seq=%llu phase=%d mid=%u", (unsigned long long)g_diag_seq, phase, g_mid);
+        nvn_plat_log(NVN_PLAT_LOG_RED, "csf", b); return 0;
+    }
+    rp_pass_flush(g_cmd);
+    g_diag_next = phase;
+    seg_cut(g_occ_seg);
+    g_diag_next = 0;
+    uint64_t f = g_fence + g_mid;
+    nvn_gpu_err err = {0}; uint64_t t0 = now_ns();
+    nvn_gpu_rc r = nvn_gpu_fence_wait(f, 5000000000ull, &err);
+    char b[300]; snprintf(b, sizeof b, "csf wait seq=%llu phase=%d fence=%llu rc=%d wait_ns=%llu why=%s",
+        (unsigned long long)g_diag_seq, phase, (unsigned long long)f, r.code,
+        (unsigned long long)(now_ns()-t0), err.why);
+    nvn_plat_log(nvn_gpu_ok(r) && !g_diag_stopped ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b);
+    if (!nvn_gpu_ok(r) || g_diag_stopped || !g_cmd) { g_diag_stopped = 1; return 0; }
+    return 1;
+}
+static int diag_enabled(void) {
+    if (g_diag_on < 0) g_diag_on = nvn_plat_flag("nvk_csf", 0) || nvn_plat_flag("nvk_csd", 0) || nvn_plat_flag("nvk_csb", 0);
+    return g_diag_on;
+}
+static void diag_indirect(const char *kind, uint64_t addr, int words, int completed) {
+    uint32_t v[5] = {0}; int src = 0; uint64_t bytes = (uint64_t)words * 4;
+    if (completed && addr && words > 0 && words <= 5) src = rp_buf_diag_snapshot(addr, bytes, v);
+    int ri = diag_range_at(addr, bytes); const struct diag_range *r = ri >= 0 ? &g_diag_ranges[ri] : NULL;
+    const struct diag_write *w = NULL;
+    for (uint32_t i = 0; i < DIAG_WRITES; i++) if (diag_overlap(addr, bytes, g_diag_writes[i].addr, g_diag_writes[i].len) &&
+        (!w || g_diag_writes[i].serial > w->serial)) w = &g_diag_writes[i];
+    int whole = w && w->addr <= addr && bytes <= w->len && addr - w->addr <= w->len - bytes;
+    char b[900]; snprintf(b, sizeof b, "csf indirect seq=%llu op_id=%llu kind=%s addr=%#llx bytes=%llu source=%s target_seq=%llu target_key=%016llx target_addr=%#llx target_bytes=%llu set=%u binding=%u last_recorded_writer=%s writer_op=%llu writer_key=%016llx writer_addr=%#llx writer_bytes=%llu writer_covers=%d dynamic_writer=unproven external_cpu=untracked words=%d values=%u,%u,%u,%u,%u",
+        (unsigned long long)g_diag_seq, (unsigned long long)g_diag_record, kind, (unsigned long long)addr, (unsigned long long)bytes,
+        src == 1 ? "completed_mirror" : src == 2 ? "guest_no_pending" : "unavailable",
+        (unsigned long long)(r ? r->seq : 0), (unsigned long long)(r ? r->key : 0), (unsigned long long)(r ? r->addr : 0), (unsigned long long)(r ? r->len : 0), r ? r->set : 0, r ? r->binding : 0,
+        w ? w->kind : "unknown_or_evicted", (unsigned long long)(w ? w->op : 0), (unsigned long long)(w ? w->key : 0),
+        (unsigned long long)(w ? w->addr : 0), (unsigned long long)(w ? w->len : 0), whole, words, v[0], v[1], v[2], v[3], v[4]);
+    nvn_plat_log(src ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_WARN, "csf", b);
+}
+// Find only argument records intersecting target ranges, in O(number of ranges), independent
+// of an untrusted multi-draw max. Stride padding is not a consumed argument.
+static int diag_next_argument(uint64_t ind, uint64_t width, uint64_t stride, int max, int start) {
+    int hit = max;
+    for (uint32_t j = 0; j < g_diag_nranges; j++) {
+        const struct diag_range *r = &g_diag_ranges[j];
+        if (!r->len || r->len > UINT64_MAX - r->addr || width > UINT64_MAX - ind) continue;
+        uint64_t i = (uint64_t)start;
+        if (stride && r->addr >= ind + width) {
+            uint64_t first = (r->addr - ind - width) / stride + 1;
+            if (first > i) i = first;
+        }
+        if (i >= (uint64_t)hit || (stride && i > (UINT64_MAX - ind) / stride)) continue;
+        if (diag_overlap(ind + i * stride, width, r->addr, r->len)) hit = (int)i;
+    }
+    return hit;
+}
+static int diag_draw_begin(uint64_t ind, int indexed, uint64_t count, int max, int64_t stride) {
+    if (!diag_enabled() || !ind || max <= 0) return 0;
+    uint64_t width = indexed ? 20 : 16;
+    if (stride < 0 || (max > 1 && (uint64_t)stride < width)) return 0;
+    int first = diag_next_argument(ind, width, (uint64_t)stride, max, 0);
+    int match = (count && diag_range_at(count, 4) >= 0) || first < max;
+    if (!match) return 0;
+    ++g_diag_seq;
+    char b[180]; snprintf(b, sizeof b, "csf begin seq=%llu op_id=%llu op=%s indirect=1 max=%d stride=%lld",
+        (unsigned long long)g_diag_seq, (unsigned long long)g_diag_record, indexed ? "draw_indexed" : "draw", max, (long long)stride);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b);
+    int ok = diag_cut(1);
+    if (count) diag_indirect("draw_count", count, 1, ok);
+    int i = first, logged = 0;
+    for (; i < max && logged < 128; i = diag_next_argument(ind, width, (uint64_t)stride, max, i + 1), logged++)
+        diag_indirect(indexed ? "draw_indexed" : "draw", ind + (uint64_t)i * (uint64_t)stride, indexed ? 5 : 4, ok);
+    if (i < max) nvn_plat_log(NVN_PLAT_LOG_WARN, "csf", "csf argument_log_limit coverage=incomplete max_records=128");
+    return ok;
+}
+static void diag_draw_end(int waited, uint64_t seq_before, uint64_t draws_before) {
+    if (g_diag_seq == seq_before) return;
+    uint64_t draws = 0; rp_draw_stats(&draws, NULL);
+    char line[200]; snprintf(line, sizeof line, "csf draw_encoded seq=%llu op_id=%llu draws=%llu fence_enabled=%d",
+        (unsigned long long)g_diag_seq, (unsigned long long)g_diag_record, (unsigned long long)(draws - draws_before), nvn_plat_flag("nvk_csf", 0));
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", line);
+    if (waited) diag_cut(2);
 }
 
 uint64_t nvn_be_sub_commit(void) {
@@ -517,6 +830,7 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
             return 0;
         }
         s->gw[s->ngw++] = (struct gw_ev){key, id};
+        rp_diag_buffer_write(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, "gpu_registered_possible");
     }
     return 1;
 }
@@ -619,6 +933,17 @@ static uint64_t exec_list(const uint8_t *p) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (rec_bad(h)) { nvn_unimpl("rec", "bad_record", p); break; }   // 按这条列表的 END 处理：走下面唯一的出口
         uint64_t t_cmd = tm ? now_ns() : 0;
+        if (diag_enabled()) {
+            uint64_t epoch = rp_pool_generation ? rp_pool_generation() : 0;
+            if (epoch != g_diag_pool_epoch) {
+                if (g_diag_nranges) nvn_plat_log(NVN_PLAT_LOG_WARN, "csf", "csf pool_generation_changed coverage=incomplete provenance_cleared=1");
+                g_diag_nranges = g_diag_put = 0; memset(g_diag_writes, 0, sizeof g_diag_writes);
+                g_diag_pool_epoch = epoch;
+            }
+            ++g_diag_record; g_diag_op = h.op; g_diag_key = 0; g_diag_target = 0; g_diag_npending = 0;
+            if (h.op == OP_DISPATCH && (rp_S.skey_ok & (1u << 5)))
+                for (int k = 0; k < 8; k++) g_diag_key = (g_diag_key << 8) | rp_S.skey[5][k];
+        }
         const void *a = p + 8;
         switch (h.op) {
             case OP_END: goto out;   // 唯一出口：帧级账在那边按「是否最外层」累加一次
@@ -649,9 +974,9 @@ static uint64_t exec_list(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(g_cmd); break; }   // 其余计数器的报告值本来就写 0，复位无事可做
             case OP_RENDER_COND: rc_cond(a); break;
-            case OP_DRAW: { if (g_rc_skip) break; p_draw t; rp_draw(g_cmd, draw_rec(a, h.size, &t), NULL, p); break; }
-            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; rp_draw(g_cmd, NULL, draw_idx_rec(a, h.size, &t), p); break; }
-            case OP_MULTI_DRAW: { if (g_rc_skip) break; p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); rp_multi_draw(g_cmd, &m, p); break; }
+            case OP_DRAW: { if (g_rc_skip) break; p_draw t; const p_draw *v = draw_rec(a, h.size, &t); uint64_t seq = g_diag_seq, draws = 0; if (diag_enabled()) rp_draw_stats(&draws, NULL); int d = diag_draw_begin(v->ind, 0, v->mdi_cnt, 1, 0); rp_draw(g_cmd, v, NULL, p); diag_draw_end(d, seq, draws); break; }
+            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; const p_draw_idx *v = draw_idx_rec(a, h.size, &t); uint64_t seq = g_diag_seq, draws = 0; if (diag_enabled()) rp_draw_stats(&draws, NULL); int d = diag_draw_begin(v->ind, 1, v->mdi_cnt, 1, 0); rp_draw(g_cmd, NULL, v, p); diag_draw_end(d, seq, draws); break; }
+            case OP_MULTI_DRAW: { if (g_rc_skip) break; p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); uint64_t seq = g_diag_seq, draws = 0; if (diag_enabled()) rp_draw_stats(&draws, NULL); int d = diag_draw_begin(m.ind, m.itype >= 0, m.cnt, m.max, m.stride); rp_multi_draw(g_cmd, &m, p); diag_draw_end(d, seq, draws); break; }
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
@@ -681,7 +1006,37 @@ static uint64_t exec_list(const uint8_t *p) {
                     for (int i = 0; i < 32; i++) if (rp_S.img[5][i]) o += snprintf(b + o, sizeof b - (size_t)o, " 图像%d(#%llu)", i, (unsigned long long)(rp_S.img[5][i] & 0xFFFFF));
                     for (int i = 0; i < 32; i++) if (rp_S.tex[5][i]) o += snprintf(b + o, sizeof b - (size_t)o, " 贴图%d(#%llu)", i, (unsigned long long)(rp_S.tex[5][i] & 0xFFFFF));
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "dispatch", b); }
+                uint32_t key = (uint32_t)rp_S.skey[5][0] << 24 | (uint32_t)rp_S.skey[5][1] << 16 | (uint32_t)rp_S.skey[5][2] << 8 | rp_S.skey[5][3];
+                uint32_t akey = 0, bkey = 0;
+                if (diag_enabled()) { akey = (uint32_t)nvn_plat_flag("nvk_csf_a", 0); bkey = (uint32_t)nvn_plat_flag("nvk_csf_b", 0); }
+                int d = 0;
+                if (diag_enabled() && (rp_S.skey_ok & (1u << 5)) && key && (key == akey || key == bkey)) {
+                    ++g_diag_seq; g_diag_target = 1;
+                    char b[200]; snprintf(b, sizeof b, "csf begin seq=%llu op=dispatch key=%016llx direct=%d dims=%d,%d,%d", (unsigned long long)g_diag_seq, (unsigned long long)g_diag_key, dp->ind == 0, dp->x, dp->y, dp->z);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b);
+                    d = diag_cut(1);
+                    g_diag_dims[0] = (uint32_t)dp->x; g_diag_dims[1] = (uint32_t)dp->y; g_diag_dims[2] = (uint32_t)dp->z;
+                    g_diag_dims_known = !dp->ind;
+                    if (dp->ind) {
+                        g_diag_dims_known = d && rp_buf_diag_snapshot(dp->ind, 12, g_diag_dims);
+                        if (!g_diag_dims_known) memset(g_diag_dims, 0, sizeof g_diag_dims);
+                    }
+                    int cx = nvn_plat_flag("nvk_csc_x", 0), at = nvn_plat_flag("nvk_csc_at", 1), limit = nvn_plat_flag("nvk_csc_n", 1);
+                    int cg = nvn_plat_flag("nvk_csc_g", 0); uint64_t capture_groups = 0;
+                    int groups_known = diag_group_count(&capture_groups);
+                    if (key == akey && nvn_plat_flag("nvk_csc", 0) && (!cx || g_diag_dims[0] == (uint32_t)cx) &&
+                        (!cg || (groups_known && capture_groups == (uint64_t)cg))) {
+                        ++g_diag_capture_seen;
+                        if (d && limit > 0 && g_diag_capture_count < (uint32_t)(limit > 16 ? 16 : limit) && g_diag_capture_seen >= (uint32_t)(at > 0 ? at : 1)) {
+                            ++g_diag_capture_count; g_diag_capture_want = 1; g_diag_capture_bad = g_diag_capture_encoded = 0;
+                        }
+                    }
+                    if (dp->ind) diag_indirect("dispatch", dp->ind, 3, d);
+                }
+                uint64_t dispatch_before = g_diag_target ? rp_dispatch_count() : 0;
                 rp_dispatch(g_cmd, dp, p);
+                if (g_diag_target) { char b[200]; snprintf(b, sizeof b, "csf encoded seq=%llu op_id=%llu dispatch=%u dims=%d,%d,%d fence_enabled=%d", (unsigned long long)g_diag_seq, (unsigned long long)g_diag_record, rp_dispatch_count() != dispatch_before, (int)g_diag_dims[0], (int)g_diag_dims[1], (int)g_diag_dims[2], nvn_plat_flag("nvk_csf", 0)); nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", b); int completed = d ? diag_cut(2) : 0; diag_capture_finish(completed); }
+                g_diag_target = 0;
                 break; }
             default:
                 if (!rp_state_op(h.op, a, h.size)) nvn_unimpl("op", rp_op_name(h.op), p);

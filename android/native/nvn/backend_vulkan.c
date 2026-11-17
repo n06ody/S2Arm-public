@@ -48,6 +48,14 @@
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省关）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
 
+#define CSF_TIMES_MAX 64
+struct csf_times {
+    VkQueryPool pool;
+    uint32_t count, bits;
+    float period;
+    int reported;
+    struct { uint64_t seq, key; } ids[CSF_TIMES_MAX];
+};
 #define VK_SEG_QUEUE_INIT 16
 #define VK_ARENA_MIN (256u * 1024u)
 #define VK_WAIT_SLICE_NS (50ull * 1000ull * 1000ull)
@@ -103,6 +111,7 @@ struct nvn_gpu_view_s {
     VkFormat format;       // 视图自己的原生格式：当附件时渲染通道按它声明（视图换了格式，硬件就按视图的格式写，比如经 sRGB 视图写线性存储）
     uint32_t base_level, levels, base_layer, layers;
     int released, refs;
+    VkComponentMapping diag_components; // Actual view swizzle for private diagnostic capture.
     int swizzled;   // 通道映射非恒等：只能采样，不能当附件
     int p16_remap;  // #975：16 位打包格式在本设备走退回格式，通道映射里合进了格式自带的分量换位：不能当附件 / 存储图像
     VkImageViewType type;
@@ -243,6 +252,7 @@ struct nvn_gpu_cmd_s {
     VkQueryPool report_ts;
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
+    struct csf_times *csf_times; uint64_t csf_pending_seq, csf_pending_key;
     VkQueryPool tsq;                         // 调试读数 nvk_gputime：段首尾各一个 GPU 时间戳，后面每个通道首尾各一个（没开就是空）
     struct { uint16_t w, h, draws; uint8_t ncol, ds; } tsp[TS_PASS_MAX];
     uint32_t ntsp;
@@ -334,6 +344,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    uint64_t diag_csb_count;   // 已录制的目标派发后屏障（会话累计；不代表 GPU 完成）
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
@@ -1429,7 +1440,82 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
 
 // ---------------------------------------------------------------- worker
 
+// The diagnostic uses only the actual queue family's timestamp valid bits; zero means no query.
+static uint32_t csf_timestamp_bits(void) {
+    uint32_t n = 0, bits = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &n, NULL);
+    if (!n || g.dev->queue_family >= n) return 0;
+    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
+    if (!q) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &n, q);
+    if (g.dev->queue_family < n) bits = q[g.dev->queue_family].timestampValidBits;
+    free(q); return bits <= 64 ? bits : 0;
+}
+static void csf_time_unavailable(uint64_t seq, uint64_t key, uint64_t signal, const char *reason, int code) {
+    if (!seq) return;
+    char line[320]; snprintf(line,sizeof line,"csf dispatch_time seq=%llu key=%016llx fence=%llu scope=dispatch_bracket source=unavailable reason=%s code=%d",
+        (unsigned long long)seq,(unsigned long long)key,(unsigned long long)signal,reason,code);
+    nvn_plat_log(NVN_PLAT_LOG_WARN,"csf",line);
+}
+// Arm only the immediately following dispatch, after replay resolved/bound its actual program.
+void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) {
+    if (!c) return;
+    c->csf_pending_seq=0;
+    if (!nvn_plat_flag("nvk_csd",0) && !nvn_plat_flag("nvk_csf",0) && !nvn_plat_flag("nvk_csb",0)) return;
+    c->csf_pending_seq=seq; c->csf_pending_key=key;
+}
+static int csf_dispatch_begin(struct nvn_gpu_cmd_s *c, uint64_t seq, uint64_t key) {
+    if (!seq || (!nvn_plat_flag("nvk_csd",0) && !nvn_plat_flag("nvk_csf",0))) return -1;
+    if (!c->csf_times) {
+        struct csf_times *t=calloc(1,sizeof *t);
+        if (!t) { csf_time_unavailable(seq,key,0,"query_allocation",NVN_GPU_E_OOM); return -1; }
+        c->csf_times=t; t->bits=csf_timestamp_bits();
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys,&pp); t->period=pp.limits.timestampPeriod;
+        char line[512]; snprintf(line,sizeof line,
+            "csf compute_limits seq=%llu key=%016llx max_invocations=%u max_size=%u,%u,%u max_count=%u,%u,%u shared_bytes=%u min_ssbo_align=%llu max_ssbo_range=%u timestamp_bits=%u timestamp_period_ns=%.9g",
+            (unsigned long long)seq,(unsigned long long)key,pp.limits.maxComputeWorkGroupInvocations,
+            pp.limits.maxComputeWorkGroupSize[0],pp.limits.maxComputeWorkGroupSize[1],pp.limits.maxComputeWorkGroupSize[2],
+            pp.limits.maxComputeWorkGroupCount[0],pp.limits.maxComputeWorkGroupCount[1],pp.limits.maxComputeWorkGroupCount[2],
+            pp.limits.maxComputeSharedMemorySize,(unsigned long long)pp.limits.minStorageBufferOffsetAlignment,pp.limits.maxStorageBufferRange,t->bits,(double)t->period);
+        nvn_plat_log(NVN_PLAT_LOG_INFO,"csf",line);
+        if (t->bits && t->period>0) {
+            VkQueryPoolCreateInfo qi={0}; qi.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType=VK_QUERY_TYPE_TIMESTAMP; qi.queryCount=2*CSF_TIMES_MAX;
+            VkResult vr=vkCreateQueryPool(g.d,&qi,NULL,&t->pool);
+            if (vr!=VK_SUCCESS) { t->pool=VK_NULL_HANDLE; csf_time_unavailable(seq,key,0,"query_create",vr); return -1; }
+        }
+    }
+    struct csf_times *t=c->csf_times;
+    if (!t->pool) { csf_time_unavailable(seq,key,0,"timestamp_unsupported_or_pool_unavailable",0); return -1; }
+    if (t->count==CSF_TIMES_MAX) { csf_time_unavailable(seq,key,0,"query_limit_coverage_incomplete",0); return -1; }
+    uint32_t at=t->count++; t->ids[at].seq=seq; t->ids[at].key=key;
+    vkCmdResetQueryPool(c->cb,t->pool,2*at,2);
+    // No added barrier: this is a command-bracketing interval, not exclusive shader occupancy.
+    vkCmdWriteTimestamp(c->cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,t->pool,2*at);
+    return (int)at;
+}
+static void csf_dispatch_end(struct nvn_gpu_cmd_s *c, int at) {
+    if (at>=0) vkCmdWriteTimestamp(c->cb,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,c->csf_times->pool,2*(uint32_t)at+1);
+}
+static void csf_dispatch_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status) {
+    struct csf_times *t=c?c->csf_times:NULL; if (!t || t->reported) return; t->reported=1;
+    for (uint32_t i=0;i<t->count;i++) {
+        uint64_t seq=t->ids[i].seq, key=t->ids[i].key;
+        if (status!=NVN_GPU_DONE_OK) { csf_time_unavailable(seq,key,signal,"fence_failed_or_not_submitted",status); continue; }
+        uint64_t result[2][2]={{0,0},{0,0}};
+        VkResult vr=vkGetQueryPoolResults(g.d,t->pool,2*i,2,sizeof result,result,sizeof result[0],VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (vr!=VK_SUCCESS || !result[0][1] || !result[1][1]) { csf_time_unavailable(seq,key,signal,"query_not_available",vr); continue; }
+        uint64_t delta=result[1][0]-result[0][0]; if (t->bits<64) delta&=(1ull<<t->bits)-1;
+        long double ns=(long double)delta*t->period;
+        if (!(ns>=0 && ns<=(long double)UINT64_MAX)) { csf_time_unavailable(seq,key,signal,"duration_overflow",0); continue; }
+        char line[512]; snprintf(line,sizeof line,
+            "csf dispatch_time seq=%llu key=%016llx fence=%llu scope=dispatch_bracket source=completed_query gpu_ns=%llu begin_ticks=%llu end_ticks=%llu valid_bits=%u period_ns=%.9g stages=top,bottom",
+            (unsigned long long)seq,(unsigned long long)key,(unsigned long long)signal,(unsigned long long)ns,
+            (unsigned long long)result[0][0],(unsigned long long)result[1][0],t->bits,(double)t->period);
+        nvn_plat_log(NVN_PLAT_LOG_INFO,"csf",line);
+    }
+}
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
+    csf_dispatch_report(s->cmd,s->signal,status);
     if (!s->done) return;
     nvn_gpu_done d;
     memset(&d, 0, sizeof d);
@@ -1438,6 +1524,15 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
     d.rc = rc(code);
     d.why = why;
     d.time_kind = NVN_GPU_TIME_NONE;
+    if (status == NVN_GPU_DONE_OK && s->cmd && s->cmd->tsq && nvn_plat_flag("nvk_csf", 0)) {
+        uint32_t bits = csf_timestamp_bits(); uint64_t ts[2] = {0, 0};
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys, &pp);
+        if (bits && pp.limits.timestampPeriod > 0 &&
+            vkGetQueryPoolResults(g.d, s->cmd->tsq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            uint64_t delta = ts[1] - ts[0]; if (bits < 64) delta &= (1ull << bits) - 1;
+            d.time_kind = NVN_GPU_TIME_DURATION; d.gpu_dur_ns = (uint64_t)((double)delta * pp.limits.timestampPeriod);
+        }
+    }
     d.occlusion = NULL;
     d.nocclusion = 0;
     // 遮挡结果：段已完成，用过的槽都有结果；没用过的槽读作 0（不等待，取不到的项保持预置的 0）
@@ -1517,6 +1612,11 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->dpools_full);
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
+    if (c->csf_times) {
+        csf_dispatch_report(c,0,NVN_GPU_DONE_FAILED);
+        if (c->csf_times->pool) vkDestroyQueryPool(g.d,c->csf_times->pool,NULL);
+        free(c->csf_times);
+    }
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         seg_give_q(c->qpool, c->qcount);
     free(c->q_used);
@@ -1553,6 +1653,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             r = vkWaitForFences(vk->d, 1, &s->fence, VK_TRUE, 50ull * 1000ull * 1000ull);
             if (r != VK_TIMEOUT) break;
         }
+        if (nvn_plat_flag("nvk_csf", 0) && !s->internal) { char b[160]; snprintf(b, sizeof b, "csf VkWaitForFences fence=%llu VkResult=%d", (unsigned long long)s->signal, (int)r); nvn_plat_log(r == VK_SUCCESS ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
         // 测试钩子：真实栅栏必须先完成（否则 fence / command buffer 还在途，不能销毁），
         // 完成后再把它当成失败，走真实的失败终止路径。
         if (r == VK_SUCCESS && fail_sig && fail_sig == s->signal) r = (VkResult)VK_ERROR_UNKNOWN;
@@ -5356,18 +5457,20 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
 static int g_test_no_xfer_bar;   // 测试钩子 nvn_gpu_vk_test_xfer_barrier 置（文件末）
 void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, uint32_t z, nvn_gpu_buf ind, uint64_t off) {
     struct nvn_gpu_cmd_s *c = ch;
-    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
-    if (!ind && (!x || !y || !z)) return;   // 0 组：空操作，不录、不置错（对齐 Ryujinx）
-    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 在通道内"); return; }
+    uint64_t csf_seq=c?c->csf_pending_seq:0, csf_key=c?c->csf_pending_key:0;
+    if (c) c->csf_pending_seq=0;
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) goto rejected;
+    if (!ind && (!x || !y || !z)) goto rejected;   // 0 组：空操作，不录、不置错（对齐 Ryujinx）
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 在通道内"); goto rejected; }
     es_reset(c);   // push 常量的范围按管线布局、不分绑定点：保守起见计算派发之后图形这边全部重发（#708）
-    if (ph && c->pipe && ph != c->pipe) { set_sticky(c, NVN_GPU_E_ARG, "dispatch 管线与 bind 时的管线不一致"); return; }
+    if (ph && c->pipe && ph != c->pipe) { set_sticky(c, NVN_GPU_E_ARG, "dispatch 管线与 bind 时的管线不一致"); goto rejected; }
     struct nvn_gpu_pipe_s *p = c->pipe;
-    if (!p || p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 缺计算管线"); return; }
-    if (ind && x | y | z) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 与计数不能同时给"); return; }
-    if (ind) { if (!buf_range(ind, off, 12)) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 参数越界"); return; } }
+    if (!p || p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 缺计算管线"); goto rejected; }
+    if (ind && x | y | z) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 与计数不能同时给"); goto rejected; }
+    if (ind) { if (!buf_range(ind, off, 12)) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 参数越界"); goto rejected; } }
     c->pipe = p;
-    if (!prepare_bind_layouts(c, 1)) return;
-    if (!bind_descriptor_groups(c, p, 1)) return;
+    if (!prepare_bind_layouts(c, 1)) goto rejected;
+    if (!bind_descriptor_groups(c, p, 1)) goto rejected;
     if (c->push_have[NVN_GPU_SH_CS] && p->stage_push_bytes[NVN_GPU_SH_CS])
         vkCmdPushConstants(c->cb, p->layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            p->stage_push_off[NVN_GPU_SH_CS], p->stage_push_bytes[NVN_GPU_SH_CS],
@@ -5376,12 +5479,29 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     // 之前录过缓冲作目标的传输（核心的池镜像同步、缓冲写 / 填 / 拷贝、贴图→缓冲）：契约说之后的读看到新值（nvn_backend.h buf_write），
     // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
     if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
+    int csf_at=csf_dispatch_begin(c,csf_seq,csf_key);
     if (ind) {
         vkCmdDispatchIndirect(c->cb, ind->buffer, off);
         cmd_ref(c, ind, REF_BUF);
     } else {
         vkCmdDispatch(c->cb, x, y, z);
     }
+    csf_dispatch_end(c,csf_at);
+    // 单变量诊断：仅真实编码的选中派发，把 compute 输出发布给图形消费。
+    // 标签由回放层既有选择器提供；不切段/提交/等待，计数只证明录制接管。
+    if (csf_seq && nvn_plat_flag("nvk_csb",0)) {
+        mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+        uint64_t count = __atomic_add_fetch(&g.diag_csb_count, 1, __ATOMIC_RELAXED);
+        char line[320]; snprintf(line,sizeof line,
+            "csb barrier seq=%llu key=%016llx count=%llu encoded=1 scope=compute_write_to_graphics_read src=compute dst=all_graphics access=indirect,shader,index,vertex",
+            (unsigned long long)csf_seq,(unsigned long long)csf_key,(unsigned long long)count);
+        nvn_plat_log(NVN_PLAT_LOG_INFO,"csf",line);
+    }
+    return;
+rejected:
+    csf_time_unavailable(csf_seq,csf_key,0,"dispatch_not_encoded",c?c->sticky.code:NVN_GPU_E_ARG);
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
 
@@ -5894,6 +6014,7 @@ nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex th, const view_t *v, nvn_gpu_view *ou
         free(o);
         return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateImageView 拒绝（格式 / 范围）");
     }
+    o->diag_components = ci.components;
     o->tex = t;
     o->base_level = base_level;
     o->levels = levels;
@@ -6254,6 +6375,38 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);   // 之后按采样 / 存储使用；本段统一用 GENERAL
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
+}
+
+// Private diagnostic export below the replay contract: 2D texel-fetch views only.
+// The opaque metadata contains Vulkan format/aspect/swizzle; replay never interprets it.
+// Sampling state is deliberately not fabricated: the reference runner rejects sampled operations.
+// Private read-only diagnostic: the actual backing size, not descriptor range or requested arena slice.
+uint64_t nvn_gpu_diag_buf_bytes(nvn_gpu_buf b) { return b ? b->bytes : 0; }
+
+int nvn_gpu_diag_image_capture(nvn_gpu_cmd ch, nvn_gpu_view vh, nvn_gpu_buf *out, uint64_t *bytes, char *meta, size_t cap) {
+    struct nvn_gpu_cmd_s *c = ch; struct nvn_gpu_view_s *v = vh;
+    if (!c || c->in_pass || !v || !v->tex || v->type != VK_IMAGE_VIEW_TYPE_2D || v->layers != 1 || !v->levels || v->levels > 32) return 0;
+    struct nvn_gpu_tex_s *t = v->tex; uint32_t bpp = fmt_bpp(v->format);
+    if (!bpp || t->samples != VK_SAMPLE_COUNT_1_BIT ||
+        v->format == VK_FORMAT_D32_SFLOAT_S8_UINT || v->format == VK_FORMAT_D24_UNORM_S8_UINT ||
+        (v->aspect != VK_IMAGE_ASPECT_COLOR_BIT && v->aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) return 0;
+    VkBufferImageCopy copies[32]; memset(copies, 0, sizeof copies); uint64_t total = 0;
+    for (uint32_t i = 0; i < v->levels; i++) {
+        uint32_t level = v->base_level + i, w = t->w >> level, h = t->h >> level; if (!w) w = 1; if (!h) h = 1;
+        uint64_t size = (uint64_t)w * h * bpp; if (size > (64ull << 20) || total > (64ull << 20) - size) return 0;
+        copies[i].bufferOffset = total;
+        copies[i].imageSubresource = (VkImageSubresourceLayers){v->aspect, level, v->base_layer, 1};
+        copies[i].imageExtent = (VkExtent3D){w, h, 1}; total = (total + size + 3) & ~3ull;
+    }
+    uint32_t w = t->w >> v->base_level, h = t->h >> v->base_level; if (!w) w=1; if (!h) h=1;
+    int n = snprintf(meta, cap, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u", (uint32_t)v->format, v->aspect, bpp, w, h, v->levels,
+        (uint32_t)v->diag_components.r, (uint32_t)v->diag_components.g, (uint32_t)v->diag_components.b, (uint32_t)v->diag_components.a);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    nvn_gpu_err err = {0}; if (!nvn_gpu_ok(nvn_gpu_buf_create(total, NVN_GPU_MEM_SHARED, NULL, out, &err))) return 0;
+    full_barrier(c); image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (*out)->buffer, v->levels, copies);
+    image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL); c->xfer_dirty = 1;
+    cmd_ref(c, t, REF_TEX); cmd_ref(c, *out, REF_BUF); *bytes = total; return 1;
 }
 
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
@@ -7018,9 +7171,11 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->opt = nvn_plat_flag("nvk_opt_layout", 0) != 0;   // 附件 / 采样用对齐语义的布局（缺省 0 = 全 GENERAL 的旧行为）
     {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
         static int on = -1; if (on < 0) on = nvn_plat_flag("nvk_gputime", 0);
+        int diag = nvn_plat_flag("nvk_csf", 0) != 0;
+        if (diag && !csf_timestamp_bits()) { static int said; if (!said++) nvn_plat_log(NVN_PLAT_LOG_RED, "csf", "GPU timestamp unsupported on queue; duration unavailable"); }
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
-        if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
+        if ((on || (diag && csf_timestamp_bits())) && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
             vkCmdResetQueryPool(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
@@ -7225,6 +7380,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             si.commandBufferCount = submit_cbs(c, cbs);
             si.pCommandBuffers = cbs;
             r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+            if (nvn_plat_flag("nvk_csf", 0)) { char b[160]; snprintf(b, sizeof b, "csf vkQueueSubmit fence=%llu VkResult=%d", (unsigned long long)signal, (int)r); nvn_plat_log(r == VK_SUCCESS ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "csf", b); }
             if (r == VK_SUCCESS) {
                 s->fence = fence;
                 s->submitted = 1;

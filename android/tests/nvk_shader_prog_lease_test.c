@@ -42,6 +42,7 @@
 
 #include "nvn_backend.h"
 #include "rp_shader.h"
+#include "rp_state.h"
 #include "nvn_plat.h"
 #include "nvn_unimpl.h"
 #include "nvn/nvn_vk_prog_warm.h"
@@ -50,10 +51,20 @@
 #include "direct/compile_request.h"
 #include "direct/offline_library.h"
 #include "direct/program_cache.h"
+#include "s2a_direct_host.h"
 
 static int g_checks, g_fail;
+static int g_summary_diag, g_summary_calls; static char g_summary_phase[32];
+void nvn_unimpl_diag_summary(const char *phase, uint64_t frame) { (void)frame; g_summary_calls++; snprintf(g_summary_phase, sizeof g_summary_phase, "%s", phase); }
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
     fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+// This worker/lease fixture has no bound replay stages. Error diagnostics must see missing
+// keys, not fabricated keys; declarations and state layout come from production headers.
+struct rp_state rp_S;
+int rp_shader_stage_key(unsigned st, uint8_t key[8]) {
+    (void)st; if (key) memset(key, 0, 8); return 0;
+}
 
 // ---- 平台替身：日志按行留档（读数断言用），开关一律取缺省 ----
 enum { LOG_LINES = 256, LOG_LEN = 256 };
@@ -68,7 +79,7 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     g_log_n++;
     pthread_mutex_unlock(&g_log_mu);
 }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
+int nvn_plat_flag(const char *name, int dflt) { if (!strcmp(name, "nvk_csd")) return g_summary_diag; return dflt; }
 const char *nvn_plat_dir(int which) { (void)which; return NULL; }
 void nvn_plat_safepoint(void) {}
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) { (void)cls; (void)name; (void)site; return 0; }
@@ -429,6 +440,14 @@ int main(void) {
     case_edges();
     case_borrow_table_full();
     case_ident_diag_default();
+    g_summary_diag = 1; g_summary_calls = 0;
+    CHECK(nvk_shader_open() == 0, "diagnostic open without bound texture pool");
+    CHECK(nvk_shader_open() == 0, "same summary owner may register twice");
+    s2a_direct_summary(1);
+    CHECK(g_summary_calls == 1 && !strcmp(g_summary_phase, "normal_exit"), "real normal-exit summary slot reaches unimpl diagnostics");
+    s2a_direct_summary(0);
+    CHECK(g_summary_calls == 2 && !strcmp(g_summary_phase, "exit_timeout"), "timeout summary is explicitly distinct");
+    g_summary_diag = 0;
     printf("%s：%d 项断言，%d 失败；阶段装载 %d 次、释放 %d 次\n",
            g_fail ? "FAIL" : "PASS", g_checks, g_fail, g_load_calls, g_release_calls);
     return g_fail ? 1 : 0;

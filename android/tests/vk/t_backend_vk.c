@@ -51,6 +51,9 @@ static int g_memo_dflt_seen = -1;   // 没设环境变量时后端传给 nvn_pla
 static int g_shown_timing_test;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
+static atomic_int g_csf_test, g_csd_test;
+static char g_csf_compute_limits[512];
+static atomic_int g_csf_dispatch_logs, g_csf_dispatch_complete, g_csf_dispatch_unavailable;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
@@ -63,6 +66,8 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csf")) return atomic_load(&g_csf_test);
+    if (!strcmp(name, "nvk_csd")) return atomic_load(&g_csd_test);
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
         if (g_dsetrec_flag >= 0) return g_dsetrec_flag;
@@ -91,6 +96,12 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && strstr(text,"csf compute_limits ")) snprintf(g_csf_compute_limits,sizeof g_csf_compute_limits,"%s",text);
+    if (text && strstr(text, "csf dispatch_time ")) {
+        atomic_fetch_add(&g_csf_dispatch_logs, 1);
+        if (strstr(text,"source=completed_query") && strstr(text,"scope=dispatch_bracket") && strstr(text,"gpu_ns=")) atomic_fetch_add(&g_csf_dispatch_complete,1);
+        if (strstr(text,"source=unavailable")) atomic_fetch_add(&g_csf_dispatch_unavailable,1);
+    }
     if (text && strstr(text, "msaa_fallback:")) {
         if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
         if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
@@ -9788,6 +9799,103 @@ static void c1072_pipe_guard(const char *dir) {
     free(vsm); free(fsm); nvn_gpu_tex_release(tex);
 }
 
+static atomic_int csf_done_count, csf_done_status, csf_time_kind;
+static atomic_ullong csf_gpu_ns;
+static void csf_test_done(void *user, const nvn_gpu_done *d) {
+    (void)user; atomic_store(&csf_done_status, (int)d->status); atomic_store(&csf_time_kind, (int)d->time_kind);
+    atomic_store(&csf_gpu_ns, d->gpu_dur_ns); atomic_fetch_add(&csf_done_count, 1);
+}
+static int csf_only(const char *dir) {
+    memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "csf-test";
+    if (!open_backend()) return 1;
+    uint32_t n = 0, bits = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_dev.physical, &n, NULL);
+    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
+    CHECK(q != NULL && n > g_dev.queue_family, "csf queue properties");
+    if (q) { vkGetPhysicalDeviceQueueFamilyProperties(g_dev.physical, &n, q); if (g_dev.queue_family < n) bits = q[g_dev.queue_family].timestampValidBits; free(q); }
+    nvn_gpu_buf b = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    for (int on = 0; on < 2; on++) {
+        atomic_store(&g_csf_test, on); atomic_store(&csf_done_count, 0); atomic_store(&csf_time_kind, -1);
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_fill_buf(c, b, 0, 16, 0x12345678);
+        nvn_gpu_err e = {0}; nvn_gpu_rc r = nvn_gpu_cmd_commit(c, (uint64_t)on + 1, csf_test_done, NULL, &e);
+        CHECK(OK(r), "csf submit %d: %d %s", on, r.code, e.why);
+        r = nvn_gpu_fence_wait((uint64_t)on + 1, 5000000000ull, &e);
+        CHECK(OK(r) && atomic_load(&csf_done_count) == 1 && atomic_load(&csf_done_status) == NVN_GPU_DONE_OK, "csf completed fence %d", on);
+        int kind = atomic_load(&csf_time_kind);
+        CHECK(kind == (on && bits ? NVN_GPU_TIME_DURATION : NVN_GPU_TIME_NONE), "csf timestamp on=%d validbits=%u kind=%d", on, bits, kind);
+        uint32_t got = 0; uint8_t *cpu = nvn_gpu_buf_cpu(b); if (cpu) memcpy(&got, cpu, sizeof got);
+        CHECK(cpu && got == 0x12345678, "csf completed buffer result");
+        printf("csf-vulkan on=%d validbits=%u kind=%d gpu_ns=%llu\n", on, bits, kind, atomic_load(&csf_gpu_ns));
+    }
+    // Snapshot the actual Vulkan view's two mip levels, not a guest-side texture copy.
+    {
+        extern int nvn_gpu_diag_image_capture(nvn_gpu_cmd, nvn_gpu_view, nvn_gpu_buf *, uint64_t *, char *, size_t);
+        nvn_gpu_tex_desc td = {0}; td.d.width=4; td.d.height=4; td.d.depth=1; td.d.levels=2; td.d.samples=1;
+        td.d.target=NVN_TEXTURE_TARGET_2D; td.d.format=NVN_FORMAT_RGBA8; td.usage=NVN_GPU_TEX_SAMPLED|NVN_GPU_TEX_CPU_UPLOAD;
+        nvn_gpu_err ce={0}; nvn_gpu_tex tex=NULL; nvn_gpu_view view=NULL; nvn_gpu_buf snapshot=NULL;
+        CHECK(OK(nvn_gpu_tex_create(&td,&tex,&ce)), "csf capture texture create");
+        CHECK(OK(nvn_gpu_view_create(tex,NULL,&view,&ce)), "csf capture view create");
+        unsigned char expected[80]; for (unsigned i=0;i<sizeof expected;i++) expected[i]=(unsigned char)(i*3+7);
+        nvn_gpu_cmd c=begin_cmd();
+        nvn_gpu_tex_upload(c,tex,0,0,NULL,expected,16,64);
+        nvn_gpu_tex_upload(c,tex,1,0,NULL,expected+64,8,16);
+        uint64_t bytes=0; char metadata[256]={0};
+        int captured=nvn_gpu_diag_image_capture(c,view,&snapshot,&bytes,metadata,sizeof metadata);
+        CHECK(captured && bytes==80, "csf capture exact mip bytes=%llu", (unsigned long long)bytes);
+        CHECK(strstr(metadata,"37\t1\t4\t4\t4\t2\t") == metadata, "csf capture format/aspect/extent/levels: %s", metadata);
+        CHECK(OK(nvn_gpu_cmd_commit(c,3,csf_test_done,NULL,&ce)), "csf capture commit");
+        CHECK(OK(nvn_gpu_fence_wait(3,5000000000ull,&ce)), "csf capture fence");
+        unsigned char *cpu=snapshot?nvn_gpu_buf_cpu(snapshot):NULL;
+        CHECK(cpu && !memcmp(cpu,expected,sizeof expected), "csf capture all mip data in GPU order");
+        nvn_gpu_buf_release(snapshot,NULL,NULL); nvn_gpu_view_release(view); nvn_gpu_tex_release(tex);
+    }
+    // Two real compute dispatches in one segment: individual query pairs, no diagnostic fence required.
+    {
+        extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+        nvn_gpu_layout_ent ent={.cls=NVN_GPU_RES_SSBO,.access=NVN_GPU_ACC_W,.set=0,.binding=0,.count=1,.stages=1u<<NVN_GPU_SH_CS};
+        nvn_gpu_layout lay={0}; lay.ent=&ent; lay.nent=1; nvn_gpu_shader sh=NULL;
+        nvn_gpu_pipe cp=mk_cpipe(dir,"comp.comp",&lay,&sh);
+        uint32_t data[64]={0}, args[3]={14,1,1}; nvn_gpu_buf output=make_buf(sizeof data,NVN_GPU_MEM_SHARED,data);
+        nvn_gpu_buf indirect=make_buf(sizeof args,NVN_GPU_MEM_SHARED,args);
+        nvn_gpu_binding bind={.ent=0,.cls=NVN_GPU_RES_SSBO}; bind.u.b.buf=output; bind.u.b.len=sizeof data;
+        atomic_store(&g_csf_test,0); atomic_store(&g_csd_test,1);
+        for (int selected=0; selected<2; selected++) {
+            atomic_store(&g_csf_dispatch_logs,0); atomic_store(&g_csf_dispatch_complete,0); atomic_store(&g_csf_dispatch_unavailable,0);
+            nvn_gpu_cmd c=begin_cmd(); nvn_gpu_set_pipe(c,cp); nvn_gpu_bind(c,NVN_GPU_SH_CS,&bind,1);
+            if (selected && nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,101,0x1234);
+            nvn_gpu_dispatch(c,cp,11,1,1,NULL,0);
+            nvn_gpu_fill_buf(c,output,0,sizeof data,0);
+            if (selected && nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,102,0x1234);
+            nvn_gpu_dispatch(c,cp,0,0,0,indirect,0);
+            nvn_gpu_err ce={0}; CHECK(OK(nvn_gpu_cmd_commit(c,4+selected,csf_test_done,NULL,&ce)),"csf individual dispatch commit");
+            CHECK(OK(nvn_gpu_fence_wait(4+selected,5000000000ull,&ce)),"csf individual dispatch fence");
+            CHECK(atomic_load(&g_csf_dispatch_logs)==2*selected,"csf selected dispatch has two separate query result lines (selected=%d got=%d)",selected,atomic_load(&g_csf_dispatch_logs));
+            CHECK(atomic_load(&g_csf_dispatch_complete)==(bits?2*selected:0),"csf individual dispatch completed query coverage");
+            if (selected) {
+                VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(g_dev.physical,&props); char expect[128];
+                snprintf(expect,sizeof expect,"max_size=%u,%u,%u",props.limits.maxComputeWorkGroupSize[0],props.limits.maxComputeWorkGroupSize[1],props.limits.maxComputeWorkGroupSize[2]);
+                CHECK(strstr(g_csf_compute_limits,expect)!=NULL,"csf real per-dimension workgroup limits: %s",g_csf_compute_limits);
+            }
+            CHECK(atomic_load(&g_csf_dispatch_unavailable)==(bits?0:2*selected),"csf unsupported query cannot be zero duration");
+            uint32_t got[64]={0}; uint8_t *cpu=nvn_gpu_buf_cpu(output); if (cpu) memcpy(got,cpu,sizeof got); int bad=0; for (uint32_t i=0;i<64;i++) if (!cpu || got[i]!=i+1) bad++;
+            CHECK(bad==0,"csf timed compute still writes the expected 64 words");
+        }
+        // Real fence completes before the test injects failure; no unsafe destruction or fake GPU completion.
+        int done_before=atomic_load(&g_ndone); atomic_store(&g_csf_dispatch_logs,0); atomic_store(&g_csf_dispatch_complete,0); atomic_store(&g_csf_dispatch_unavailable,0);
+        nvn_gpu_cmd c=begin_cmd(); nvn_gpu_set_pipe(c,cp); nvn_gpu_bind(c,NVN_GPU_SH_CS,&bind,1);
+        if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,103,0x1234);
+        nvn_gpu_dispatch(c,cp,14,1,1,NULL,0); nvn_gpu_vk_test_fail_fence(6);
+        nvn_gpu_err ce={0}; CHECK(OK(nvn_gpu_cmd_commit(c,6,on_done,NULL,&ce)),"csf failed timing submit");
+        CHECK(nvn_gpu_fence_wait(6,5000000000ull,&ce).code==NVN_GPU_E_FAILED,"csf failed timing fence");
+        const struct done_rec *done=wait_signal(6,done_before,5000); CHECK(done && done->status==NVN_GPU_DONE_FAILED,"csf failed timing callback");
+        CHECK(atomic_load(&g_csf_dispatch_logs)==1 && atomic_load(&g_csf_dispatch_unavailable)==1 && atomic_load(&g_csf_dispatch_complete)==0,"csf failed dispatch query must be unavailable, never completed");
+        nvn_gpu_vk_test_fail_fence(0); atomic_store(&g_csd_test,0);
+        nvn_gpu_shader_release(sh); nvn_gpu_buf_release(output,NULL,NULL); nvn_gpu_buf_release(indirect,NULL,NULL);
+    }
+    atomic_store(&g_csf_test, 0); nvn_gpu_buf_release(b, NULL, NULL);
+    nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "csf close");
+    printf("csf-vulkan %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
+    return g_fail ? 1 : 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -9826,6 +9934,7 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    if (argc > 2 && !strcmp(argv[2], "--csf-only")) { int rc = csf_only(argv[1]); s2a_vk_device_destroy(&g_dev, 1); return rc; }
     if (getenv("S2A_TEST_PLC_ONLY") && argc > 1) {   // 开发时只跑 C89（run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         c89_midrun_save(argv[1]);

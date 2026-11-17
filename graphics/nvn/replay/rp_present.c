@@ -261,6 +261,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
             if (nvn_plat_flag("nvk_drawlog", 0)) rp_draw_log_arm(nvn_plat_flag("nvk_drawlog", 0) > 1 ? nvn_plat_flag("nvk_drawlog", 0) : 160);
             if (nvn_plat_flag("nvk_dump", 0)) rp_debug_dump_request(t->serial, g_n_shown);   // 调试开关：把这张图和它上游的贴图读回落盘   // 调试开关：接下来的 160 笔绘制逐笔出日志
         }
+        if (g_n_shown % 1024 == 0) nvn_unimpl_diag_summary("frame", g_n_shown);
     } else g_n_dropped++;
     pthread_mutex_unlock(&g_pmu);
     if (!nvn_gpu_ok(r) && r.code != NVN_GPU_E_OUTDATED && nvn_unimpl("present", "present_failed", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "present", err.why);

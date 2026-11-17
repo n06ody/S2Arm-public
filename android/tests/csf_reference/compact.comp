@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x=1024) in;
+layout(set=1,binding=0,std430) readonly buffer Inputs { uint input_words[]; };
+layout(set=1,binding=1,std430) buffer Outputs { uint output_words[]; };
+layout(set=2,binding=0) uniform sampler2D mask_image;
+shared uint scratch[11264];
+void main() {
+    uint tid=gl_LocalInvocationID.x, group=gl_WorkGroupID.x;
+    uint value=input_words[group*1024+tid];
+    float mask=texelFetch(mask_image,ivec2(int(tid%16),int((tid/16)%16)),0).r;
+    scratch[tid]=(value%3u==0u && mask>0.5) ? 1u : 0u;
+    if(tid==0) scratch[11263]=group+91u;
+    barrier();
+    // Ordered compaction provides an independent word-for-word oracle, unlike atomic append order.
+    if(tid==0) {
+        uint n=0;
+        for(uint i=0;i<1024;i++) if(scratch[i]!=0) output_words[group*1026+2u+n++]=input_words[group*1024+i];
+        output_words[group*1026]=n;
+        output_words[group*1026+1]=scratch[11263];
+    }
+}
