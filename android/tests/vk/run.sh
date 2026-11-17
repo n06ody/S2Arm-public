@@ -278,7 +278,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -496,6 +496,25 @@ if [ -z "$mode" ]; then
        grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/msaa-default-log"; then
         echo "【红】MSAA 降档专项失败或 validation 报错（rc=${rc}）" >&2; exit 1
     fi
+fi
+
+# C63b：同一 view 写进同一描述符数组的两个元素（合法用法），取元素 1 必须读回 128。
+# 两遍都要绿：备忘开（生产缺省）与备忘关（nvk_desc_memo=0，套件第二遍；写入跳过只在这遍生效）。
+if [ "$mode" = "--c63-same-view" ]; then
+    for pass in memo-on memo-off; do
+        if [ "${pass}" = memo-off ]; then export S2A_TEST_DESC_MEMO=0; else unset S2A_TEST_DESC_MEMO; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --c63-same-view 2>&1 | tee "$out/c63-same-view-${pass}.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || ! grep -q 'C63SAMEVIEW failures=0' "$out/c63-same-view-${pass}.log" ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/c63-same-view-${pass}.log"; then
+            echo "【红】C63 同 view 双元素（${pass}）：rc=${rc}，没有 failures=0 或有 validation 报错" >&2; exit 1
+        fi
+        grep 'C63b 同 view 双元素' "$out/c63-same-view-${pass}.log" || true
+    done
+    unset S2A_TEST_DESC_MEMO
+    echo '【绿】C63 同 view 双元素：两遍（备忘开/关）都读回 128，validation 0 条'; exit 0
 fi
 
 if [ "$mode" = "--present-only" ]; then
