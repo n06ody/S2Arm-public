@@ -40,6 +40,13 @@
 #include "direct/compile_request.h"
 #include "direct/offline_library.h"
 #include "direct/program_cache.h"
+#include "rp_state.h"
+// 这个夹具没有已绑定的回放阶段：程序失败逐条带键的日志（nvk_shader.c red_prog）要看到「键缺失」，不能伪造键；
+// 状态布局与声明取生产头文件（同 nvk_shader_prog_lease_test.c）。
+struct rp_state rp_S;
+int rp_shader_stage_key(unsigned st, uint8_t key[8]) {
+    (void)st; if (key) memset(key, 0, 8); return 0;
+}
 
 static int g_checks, g_fail;
 #define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; \
