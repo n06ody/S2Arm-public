@@ -203,6 +203,20 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         js_bool(f->samplerAnisotropy), js_bool(f->shaderImageGatherExtended),
         js_bool(f->shaderStorageImageReadWithoutFormat));
 
+    // A 片（#1348）记录的描述符索引事实。enabled = 按 1.1 条件真的启用了；其余六位是设备支持位。
+    // 编译器 profile 只在 enabled 且四位都为真时打开非一致索引（生成器会同时声明采样 + 存储两种能力）。
+    // 扩展不存在时也写全 false，schema 稳定，消费者不用做「字段可能缺」的分支。
+    PUT("\"descriptorIndexing\":{\"enabled\":%s,\"runtimeArray\":%s,\"partiallyBound\":%s,"
+        "\"sampledImageArrayNonUniformIndexing\":%s,\"storageImageArrayNonUniformIndexing\":%s,"
+        "\"variableDescriptorCount\":%s,\"sampledImageUpdateAfterBind\":%s},",
+        js_bool(d->descriptor_indexing_enabled),
+        js_bool(d->descriptor_indexing_runtime),
+        js_bool(d->descriptor_indexing_partial),
+        js_bool(d->descriptor_indexing_sampled_nonuniform),
+        js_bool(d->descriptor_indexing_storage_nonuniform),
+        js_bool(d->descriptor_indexing_variable_count),
+        js_bool(d->descriptor_indexing_sampled_update_after_bind));
+
     PUT("\"formats\":{\"bc123\":%s,\"bc45\":%s,\"bc67\":%s,\"etc2\":%s,\"astc\":%s,"
         "\"fiveBit\":%s,\"r4g4b4a4\":%s,\"scaledVertex\":%s},",
         js_bool(optimal_all(d, k_bc123, sizeof k_bc123 / sizeof k_bc123[0])),

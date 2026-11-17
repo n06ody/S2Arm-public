@@ -75,6 +75,12 @@ namespace S2A.DirectCompiler
             if (maxTextures == 0 || maxUniforms == 0)
                 throw new DirectCompileException("UNSUPPORTED_PROFILE",
                     "device limits cannot hold the direct descriptor layout (sampled images/uniform buffers)");
+            // 池数组的非一致索引：生成器一旦开就同时声明采样 + 存储两种能力（Instructions.MarkNonUniform），
+            // 所以要求设备真的启用了描述符索引、且 runtime / partiallyBound / 采样非一致 / 存储非一致四位都为真；
+            // 缺一位保持 false（现状），由编译器照旧具名拒绝。
+            bool nonUniformIndexing = c.DescriptorIndexingEnabled && c.DescriptorIndexingRuntimeArray &&
+                                      c.DescriptorIndexingPartiallyBound && c.DescriptorIndexingSampledNonUniform &&
+                                      c.DescriptorIndexingStorageNonUniform;
 
             return new Capabilities(
                 api: TargetApi.Vulkan,
@@ -120,7 +126,7 @@ namespace S2A.DirectCompiler
                 supportsShaderBallot: false,
                 supportsShaderBarrierDivergence: c.VendorId != IntelVendorId,
                 supportsShaderFloat64: false,
-                supportsShaderNonUniformIndexing: false,
+                supportsShaderNonUniformIndexing: nonUniformIndexing,
                 supportsTextureGatherOffsets: c.ShaderImageGatherExtended,
                 supportsTextureShadowLod: false,
                 supportsVertexStoreAndAtomics: c.VertexPipelineStoresAndAtomics,

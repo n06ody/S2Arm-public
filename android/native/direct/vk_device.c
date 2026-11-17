@@ -408,8 +408,11 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // 容量 = 所有可选扩展同时启用时的项数（swapchain / maintenance1 / 校准 / index_type_uint8 / display_timing / host import /
     // AHB + queue_family_foreign / indirect count / 4444 / 实例除数 / 镜像夹取 / 自定义边框色 / 深度裁剪控制 / min-max 归约，校准 KHR / EXT 二选一 = 15；加 descriptor indexing 共 16），留余量。
     // 整组齐全才启用：缺任一项时可继续启动，但不承诺 pool/non-uniform 能力。
+    // 存储图像非一致索引也必须一起启用：生成器（MarkNonUniform）一开就同时声明采样 + 存储两种能力，
+    // 只启用采样会让 SPIR-V 的能力声明与设备不符（C1 的 profile 一致性核对按这条走）。
     const int descriptor_enable = descriptor_query && out->descriptor_indexing_runtime &&
-                                  out->descriptor_indexing_partial && out->descriptor_indexing_sampled_nonuniform;
+                                  out->descriptor_indexing_partial && out->descriptor_indexing_sampled_nonuniform &&
+                                  out->descriptor_indexing_storage_nonuniform;
     const char *device_ext[20];
     uint32_t device_ext_count = 0;
     if (out->has_swapchain) device_ext[device_ext_count++] = "VK_KHR_swapchain";
@@ -625,6 +628,7 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         descriptor_enabled.runtimeDescriptorArray = VK_TRUE;
         descriptor_enabled.descriptorBindingPartiallyBound = VK_TRUE;
         descriptor_enabled.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        descriptor_enabled.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
         descriptor_enabled.pNext = (void *)device_info.pNext;
         device_info.pNext = &descriptor_enabled;
     }

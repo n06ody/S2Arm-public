@@ -27,8 +27,13 @@ namespace S2A.DirectCompiler
         public const string ContentContract = "s2a-direct-program-content-v1";
         public const int MaxRequestBytes = 256 << 20;
 
+        [ThreadStatic] private static string _requestSha;
+        private static string RequestSha() => _requestSha ?? "unknown";
+
         public static byte[] Compile(byte[] requestUtf8)
         {
+            // 诊断：拒收行带上请求 sha，真机上就能把拒收与同一条请求对上（不用另开请求落盘开关）。
+            _requestSha = Convert.ToHexStringLower(Sha256.HashData(requestUtf8));
             using JsonDocument document = JsonStrict.Parse(requestUtf8, MaxRequestBytes);
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
@@ -174,6 +179,7 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("SPIRV_INVALID", stage.Stage + ": bad magic");
             if (words[1] != 0x00010300)
                 throw new DirectCompileException("SPIRV_INVALID", stage.Stage + ": target is not SPIR-V 1.3");
+            ValidateDescriptorIndexing(stage.Stage, words, profile);
             bool entry = false;
             int instructionEnd = 5;
             for (int i = 5; i < words.Length;)
@@ -232,6 +238,65 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("SPIRV_INVALID",
                         stage.Stage + ": reflected binding " + binding.Set + ":" + binding.Binding + " is absent from SPIR-V");
             }
+        }
+
+        // profile 与 SPIR-V 描述符索引能力必须一致（C 片 C1）：
+        // 生成器在 MarkNonUniform 里一次声明 SPV_EXT_descriptor_indexing + ShaderNonUniform +
+        // SampledImageArrayNonUniformIndexing + StorageImageArrayNonUniformIndexing（Instructions.cs:611）。
+        //   · profile 关（设备四位不齐 / 开发期隔离）：一个都不许出现；
+        //   · profile 开：要么都没有（这支着色器没有非一致访问），要么四个齐全——缺一个就是生成器/profile 漂移。
+        public static void ValidateDescriptorIndexing(string stage, uint[] words, DirectProfile profile)
+        {
+            bool ext = false, shaderNonUniform = false, sampled = false, storage = false;
+            for (int i = 5; i < words.Length;)
+            {
+                int count = (int)(words[i] >> 16);
+                int opcode = (int)(words[i] & 0xFFFF);
+                if (count == 0 || i + count > words.Length)
+                    throw new DirectCompileException("SPIRV_INVALID", stage + ": truncated instruction");
+                if (opcode == (int)Spv.Specification.Op.OpCapability && count >= 2)
+                {
+                    switch ((Spv.Specification.Capability)words[i + 1])
+                    {
+                        case Spv.Specification.Capability.ShaderNonUniform: shaderNonUniform = true; break;
+                        case Spv.Specification.Capability.SampledImageArrayNonUniformIndexing: sampled = true; break;
+                        case Spv.Specification.Capability.StorageImageArrayNonUniformIndexing: storage = true; break;
+                        default: break;
+                    }
+                }
+                else if (opcode == (int)Spv.Specification.Op.OpExtension && count >= 2)
+                {
+                    if (SpirvLiteralIs(words, i + 1, count - 1, "SPV_EXT_descriptor_indexing")) ext = true;
+                }
+                else if (opcode != (int)Spv.Specification.Op.OpExtInstImport)
+                {
+                    break;   // 能力 / 扩展段结束
+                }
+                i += count;
+            }
+            bool any = ext || shaderNonUniform || sampled || storage;
+            if (!profile.Caps.SupportsShaderNonUniformIndexing)
+            {
+                if (any)
+                    throw new DirectCompileException("SPIRV_INVALID",
+                        stage + ": descriptor indexing declared while the enabled profile disables it");
+                return;
+            }
+            if (any && !(ext && shaderNonUniform && sampled && storage))
+                throw new DirectCompileException("SPIRV_INVALID",
+                    stage + ": descriptor indexing declaration is incomplete (ext=" + ext +
+                    " shaderNonUniform=" + shaderNonUniform + " sampled=" + sampled + " storage=" + storage + ")");
+        }
+
+        private static bool SpirvLiteralIs(uint[] words, int start, int count, string want)
+        {
+            if (count <= 0 || (long)count * 4 < want.Length + 1) return false;
+            for (int i = 0; i < want.Length; i++)
+            {
+                byte b = (byte)(words[start + i / 4] >> ((i % 4) * 8));
+                if (b != (byte)want[i]) return false;
+            }
+            return (byte)(words[start + want.Length / 4] >> ((want.Length % 4) * 8)) == 0;
         }
 
         // 池槽位只能由反射结果决定：翻译器先建 texture binding、后 RegisterTexture，
@@ -301,9 +366,23 @@ namespace S2A.DirectCompiler
                     bool c2Image = binding.Kind == "image" && resolved.CbufSlot == 2 && resolved.HandleIndex >= 72 && resolved.HandleIndex < 88 &&
                                    (resolved.HandleIndex & 1) == 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
                                    entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot);
-                    if (!handleTableArray && !c2Image && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
+                    // 单值贴图句柄直接从 c2 句柄表读（运行时句柄 / 游戏自己的句柄表）：翻译阶段已经靠同字
+                    // 事实拿到了类型与格式；这里按句柄值当槽位交给回放（解析器换算 slot = (handle − 8) / 2）。
+                    // 数组仍只认 HandleIndex == 0 的整表数组（非零起点的数组回放侧还没有消费口径）。
+                    bool c2SingleHandle = binding.Kind == "texture" && resolved.CbufSlot == 2 &&
+                                          resolved.HandleIndex >= 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
+                                          entry.accessor.HasTextureFact(resolved.HandleIndex, resolved.CbufSlot);
+                    // 计算阶段的 c2 句柄表数组：编译先放行，回放侧现在按具名 skip "compute_texture_array" 计数
+                    // （C3 接池表消费）；图形数组仍只认 HandleIndex == 0 的整表数组。
+                    bool c2ComputeArray = binding.Kind == "texture" && resolved.CbufSlot == 2 && binding.Stage == "cs" &&
+                                          resolved.HandleIndex >= 0 && binding.Count > 1 &&
+                                          binding.Count == resolved.ArrayLength;
+                    if (!handleTableArray && !c2Image && !c2SingleHandle && !c2ComputeArray &&
+                        (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
                         throw new DirectCompileException("UNSUPPORTED_PROGRAM",
-                            binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot + " is not implemented");
+                            binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot +
+                            " is not implemented (handle=" + resolved.HandleIndex + ", arrayLength=" + resolved.ArrayLength +
+                            ", count=" + binding.Count + ", request=" + RequestSha() + ")");
                 }
                 if (resolved.Separate)
                     throw new DirectCompileException("UNSUPPORTED_PROGRAM",
