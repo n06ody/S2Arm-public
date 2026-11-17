@@ -18725,3 +18725,32 @@ nvn_gpu_rc nvn_gpu_pool_bind(nvn_gpu_cmd c, nvn_gpu_stage st, uint32_t ent, nvn_
     return rc;
 }
 void nvn_gpu_pool_release(nvn_gpu_pool_table table) { (void)table; }
+
+// Contract v12 compatibility entries. Metal still replays through nvn_be_*;
+// it has no nvn_gpu_buf/view wrapper or lifetime-ID registry. A legacy object
+// pointer is not a contract storage identity (aliases and reuse would be wrong).
+// Report unknown, clear stale metadata, and let the core handle query failure;
+// do not reinterpret an opaque handle or claim a successful empty range.
+int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out) {
+    (void)b; (void)off; (void)bytes;
+    if (out) memset(out, 0, sizeof *out);
+    return 0;
+}
+int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
+    (void)v;
+    if (out) memset(out, 0, sizeof *out);
+    return 0;
+}
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c) {
+    (void)c;
+    // Metal 3: tracked resources use automatic hazard tracking; indirect
+    // argument-buffer / GPU-address accesses also retain m4_end -> m3_wait's
+    // existing fence chain. This compatibility hook adds no operation.
+    // Metal 4 暂不需要额外屏障：enc_r_begin[_pass] closes a pending compute
+    // encoder through enc_close_blit -> m4_end -> enc_full_barrier_end, then
+    // main_barrier_begin applies the consumer barrier (or proven full producer
+    // coverage). Both use MTLStageAll and device visibility. m4_end clears
+    // g_last_end_relaxed, so a compute predecessor cannot take the relaxed draw
+    // path. If Metal adopts nvn_gpu_cmd, preserve this encoder-boundary ordering
+    // there before wiring shared replay; this is not a general Metal 4 no-op.
+}

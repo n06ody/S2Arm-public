@@ -3,6 +3,7 @@
 #include "nvn_obj.h"
 #include "nvn2_cmd.h"
 #include "nvn_backend.h"
+#include "nvn_fmt_info.h"
 #include "nvn_mtl.h"
 #include "../replay/rp_state.h"
 #include "../replay/rp_exec.h"
@@ -108,7 +109,7 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn do
     (void)err; c->live = 0; g_commits++; if (!c->is_pre) g_main_commits++; g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_pend[g_npend].nts = c->nts; memcpy(g_pend[g_npend].ts, c->ts, sizeof c->ts); g_npend++; return (nvn_gpu_rc){NVN_GPU_OK}; }
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
 // 贴图 / 视图 / 采样器 / 上传：只记账
-struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; int ord; uint32_t px[4][4]; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; view_t v; nvn_gpu_buf buf; uint64_t off, bytes; uint32_t format; }; struct nvn_gpu_samp_s { int x; };   // ord：后端贴图的递增序号；px：像素替身（4 个 mip × 4 层各一个 32 位字）；v：建视图时收到的视图记录
+struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; uint64_t access_id; int ord; uint32_t px[4][4]; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; view_t v; nvn_gpu_buf buf; uint64_t off, bytes; uint32_t format; }; struct nvn_gpu_samp_s { int x; };   // ord：后端贴图的递增序号；px：像素替身（4 个 mip × 4 层各一个 32 位字）；v：建视图时收到的视图记录
 static int g_tex_creates, g_tex_releases, g_view_creates, g_view_releases, g_samp_creates, g_samp_releases, g_tex_create_fail, g_tex_ord;
 // 像素替身（视图表按存储认视图的用例用）：每份后端存储有一小块「像素」——4 个 mip × 4 层各一个 32 位字，初值 0。「画」= 往视图指到的（mip，层）那个字里写
 // 一个值；写进去的值要经过视图记录的签名（格式 / 通道映射不同的视图，同一次绘制写进去的字节不同，真 GPU 上也一样）；「读回」= 把存储的 16 个字原样取出。
@@ -171,7 +172,7 @@ uint64_t nvn_dirty_now(void) { return g_dirty_now; }
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { (void)addr; (void)len; return g_dirty_written > stamp; }
 
 // 缓冲替身：记每次按 GPU 顺序的写（偏移、长度、首 8 字节）
-struct nvn_gpu_buf_s { uint64_t bytes; uint8_t *cpu; };
+struct nvn_gpu_buf_s { uint64_t bytes, access_id; uint8_t *cpu; };
 static int g_buf_cpu_auto;   // 1 = 新建的缓冲各带一块自己的 CPU 可见内存（两份池镜像要分得开的用例用）
 static int g_buf_creates, g_buf_releases; static uint64_t g_buf_bytes;
 static struct { uint64_t off, len; uint8_t head[8]; int pre; } g_bw[32]; static int g_nbw;
@@ -193,6 +194,44 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t level, uint32
     (void)c; (void)dst; (void)off; tb_note(0, src, level, layer, r, row_bytes, image_bytes); }
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t off, uint64_t row_bytes, uint64_t image_bytes, nvn_gpu_tex dst, uint32_t level, uint32_t layer, const NVNcopyRegion *r) {
     (void)c; (void)src; (void)off; tb_note(1, dst, level, layer, r, row_bytes, image_bytes); }
+// 同存储不同视图共用代号；释放后再建不能因指针复用而沿用代号。
+static uint64_t g_access_id;
+int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!b || !bytes || off > b->bytes || bytes > b->bytes - off) return 0;
+    if (!b->access_id) b->access_id = ++g_access_id;
+    out->storage = b->access_id; out->off = off; out->bytes = bytes; return 1;
+}
+int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!v) return 0;
+    if (v->buf) return nvn_gpu_buf_access_span(v->buf, v->off, v->bytes, out);
+    if (!v->of) return 0;
+    nvn_gpu_tex t = v->of;
+    uint32_t levels = t->d.d.levels ? (uint32_t)t->d.d.levels : 1, layers = 1;
+    if (t->d.d.target == NVN_TEXTURE_TARGET_1D_ARRAY || t->d.d.target == NVN_TEXTURE_TARGET_2D_ARRAY ||
+        t->d.d.target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY || t->d.d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) layers = t->d.d.depth;
+    else if (t->d.d.target == NVN_TEXTURE_TARGET_CUBEMAP) layers = 6;
+    else if (t->d.d.target == NVN_TEXTURE_TARGET_3D) layers = t->d.d.depth;
+    out->level = v->has_v && v->v.set_levels ? v->v.base_level : 0;
+    out->levels = v->has_v && v->v.set_levels ? (v->v.nlevels ? v->v.nlevels : 1) : levels;
+    out->layer = v->has_v && v->v.set_layers ? v->v.min_layer : 0;
+    out->layers = v->has_v && v->v.set_layers ? (v->v.nlayers ? v->v.nlayers : 1) : layers;
+    if (out->level >= levels || out->levels > levels - out->level || out->layer >= layers || out->layers > layers - out->layer) return 0;
+    if (t->d.d.target == NVN_TEXTURE_TARGET_3D && !(v->has_v && v->v.set_target && v->v.target != NVN_TEXTURE_TARGET_3D)) {
+        if (out->layer) return 0;
+        uint32_t depth = out->level < 32 ? (uint32_t)t->d.d.depth >> out->level : 0;
+        out->layer = 0; out->layers = depth ? depth : 1;
+    }
+    nvn_fmt_info fi;
+    if (!nvn_fmt_info_of(t->d.d.format, &fi)) return 0;
+    out->aspects = fi.depth ? 2u : fi.stencil ? 4u : 1u;
+    if (fi.depth && fi.stencil && v->has_v && v->v.set_dsmode && v->v.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL) out->aspects = 4;
+    if (!t->access_id) t->access_id = ++g_access_id;
+    out->storage = t->access_id; return 1;
+}
 static uint8_t *g_buf_cpu_fake;   // 用例要「GPU 写过镜像」时把它指到一块等大的内存；NULL = 这种缓冲 CPU 读不到
 uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b) { return b && b->cpu ? b->cpu : g_buf_cpu_fake; }
 void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user) { (void)retired; (void)user; g_buf_releases++; free(b->cpu); free(b); }
@@ -337,6 +376,8 @@ static void t_framelog_fence(void) {   // 帧日志 fence 字段：同步等待 
     g_fdone = saved;
 }
 
+static int g_compute_read_barriers;
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c) { (void)c; CHECK(!g_pass_open); g_compute_read_barriers++; }
 static struct { nvn_gpu_clear d; int npd, ends; } g_cr[8]; static int g_ncr;   // 矩形清：记描述，以及收到时已开 / 已关过几个通道
 void nvn_gpu_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *d) { (void)c; if (g_ncr < 8) { g_cr[g_ncr].d = *d; g_cr[g_ncr].npd = g_npd; g_cr[g_ncr].ends = g_pass_ends; } g_ncr++; }
 static uint64_t g_tick;   // 游戏时钟替身

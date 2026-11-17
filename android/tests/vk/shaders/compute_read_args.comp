@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) writeonly buffer Args { uint args[4]; } output_args;
+void main() {
+    output_args.args[0]=3;
+    output_args.args[1]=1;
+    output_args.args[2]=0;
+    output_args.args[3]=0;
+}
