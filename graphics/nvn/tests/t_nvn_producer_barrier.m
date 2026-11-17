@@ -10,6 +10,35 @@ static unsigned checks, failures;
 
 static id<MTLComputePipelineState> add_pipeline;
 static id<MTLRenderPipelineState> color_pipeline;
+static __typeof__(&nvn_gpu_compute_to_graphics) publish_compute;
+
+// Resolve the actual production exports: a missing contract entry must fail an
+// assertion at runtime, not stop at a link error. Types and names come from the
+// real contract header; pool_release is the pre-existing loader control.
+static void contract_entries(void) {
+    CHECK(dlsym(RTLD_DEFAULT,"nvn_gpu_pool_release")!=NULL,"existing Metal contract export is visible");
+#define LOAD(fn) (__typeof__(&fn))dlsym(RTLD_DEFAULT,#fn)
+    __typeof__(&nvn_gpu_buf_access_span) buf_span=LOAD(nvn_gpu_buf_access_span);
+    __typeof__(&nvn_gpu_view_access_span) view_span=LOAD(nvn_gpu_view_access_span);
+    publish_compute=LOAD(nvn_gpu_compute_to_graphics);
+#undef LOAD
+    CHECK(buf_span!=NULL,"Metal exports nvn_gpu_buf_access_span");
+    CHECK(view_span!=NULL,"Metal exports nvn_gpu_view_access_span");
+    CHECK(publish_compute!=NULL,"Metal exports nvn_gpu_compute_to_graphics");
+    // The legacy Metal replay cannot construct these opaque contract handles.
+    // Unknown is 0, never a fabricated identity/success; clear stale output.
+    nvn_gpu_access_span span; unsigned char zero[sizeof span]={0};
+    if(buf_span) {
+        memset(&span,0xa5,sizeof span);
+        CHECK(buf_span(NULL,0,16,&span)==0 && !memcmp(&span,zero,sizeof span),"unknown buffer span returns 0 and clears output");
+        CHECK(buf_span(NULL,0,16,NULL)==0,"buffer span permits missing output");
+    }
+    if(view_span) {
+        memset(&span,0xa5,sizeof span);
+        CHECK(view_span(NULL,&span)==0 && !memcmp(&span,zero,sizeof span),"unknown view span returns 0 and clears output");
+        CHECK(view_span(NULL,NULL)==0,"view span permits missing output");
+    }
+}
 
 static void add_seven(id<MTLBuffer> data) {
     id e=enc_c_begin(NULL);
@@ -19,6 +48,11 @@ static void add_seven(id<MTLBuffer> data) {
 }
 
 static void color(id<MTLTexture> target,id<MTLBuffer> data) {
+    // Metal's legacy replay has no nvn_gpu_cmd wrapper. The compatibility hook
+    // must leave its existing encoder barriers in charge, without a submit/wait.
+    id cb=g_cb, blit=g_blit; uint64_t fence=g_fence, full=g_bar_full;
+    if(publish_compute) publish_compute(NULL);
+    CHECK(g_cb==cb && g_blit==blit && g_fence==fence && g_bar_full==full,"contract hook does not cut or submit the Metal command stream");
     MTL4RenderPassDescriptor *d=pass_desc();
     d.colorAttachments[0].texture=target;
     d.colorAttachments[0].loadAction=MTLLoadActionDontCare;
@@ -54,6 +88,7 @@ static void pixels(id<MTLBuffer> out,uint32_t expected) {
 
 int main(int argc,char **argv) {
     @autoreleasepool {
+        contract_entries();
         REQUIRE(!setenv("DM_NVN_CUT","1",1));
         mtl_init();
         printf("backend=%s recorder=%d cover=%d\n",g_m3?"Metal3":"Metal4",rec_on(),producer_cover_on());

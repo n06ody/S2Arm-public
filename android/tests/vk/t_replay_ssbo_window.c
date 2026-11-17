@@ -3,6 +3,7 @@
 // 存储缓冲的绑定窗口：基址不对齐 minStorageBufferOffsetAlignment、长度超 maxStorageBufferRange——真实 rp_draw + rp_buf + Vulkan 后端，读回像素。
 // 片元着色器读窗口里的第 1 个 uint（字节 4）：等同编译器在基址不对齐时生成的「地址 − (基址 & −对齐)」取数（这里基址余数固定是 4）。
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_shader.h"

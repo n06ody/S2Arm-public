@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 11   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 12   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -448,6 +448,19 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *d);
 /* 定稿 #7：核心只表达 NVN 的顺序与访问语义（这个位、这次拷贝、这次附件写）；Vulkan 后端自己跟踪每个子资源的 layout / stage / access 并据此发屏障，
    VkImageLayout 不进核心；Metal 4 后端同理自己补编码器间屏障，Metal 3 交给自动冒险追踪。经裸 GPU 地址的写后读只有 NVN 位能表达，核心照游戏原样传。 */
 void nvn_gpu_barrier(nvn_gpu_cmd c, uint32_t nvn_barrier_bits);
+// 核心记计算写后的读依赖：身份是后端存储的生命周期代号（同存储的不同视图相同，销毁重建不复用）。
+// 缓冲按字节；图像按面 / mip / 层的矩形（3D 层表示深度切片）。只查询元数据，不提交、不等待、不改变布局。失败返回 0。
+// 面位是契约值（COLOR=1 / DEPTH=2 / STENCIL=4），不携带平台 API 位。
+typedef struct {
+    uint64_t storage, off, bytes;
+    uint32_t level, levels, layer, layers, aspects;   // aspects=0 表示缓冲
+} nvn_gpu_access_span;
+int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out);
+int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out);
+// 通道外：此前计算写入对后续间接参数 / 索引 / 顶点 / 图形着色器读取可见；不包含附件载入、计算或传输，不分段、不等待。
+// 由核心仅在图形实际读到计算写过的范围时调用；全体计算写对这些读阶段发布，所以核心可一起撤掉待发布表。
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c);
+
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈
 
