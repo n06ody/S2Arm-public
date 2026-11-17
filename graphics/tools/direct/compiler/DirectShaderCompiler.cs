@@ -174,6 +174,7 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("SPIRV_INVALID", stage.Stage + ": bad magic");
             if (words[1] != 0x00010300)
                 throw new DirectCompileException("SPIRV_INVALID", stage.Stage + ": target is not SPIR-V 1.3");
+            ValidateDescriptorIndexing(stage.Stage, words, profile);
             bool entry = false;
             int instructionEnd = 5;
             for (int i = 5; i < words.Length;)
@@ -232,6 +233,65 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("SPIRV_INVALID",
                         stage.Stage + ": reflected binding " + binding.Set + ":" + binding.Binding + " is absent from SPIR-V");
             }
+        }
+
+        // profile 与 SPIR-V 描述符索引能力必须一致（C 片 C1）：
+        // 生成器在 MarkNonUniform 里一次声明 SPV_EXT_descriptor_indexing + ShaderNonUniform +
+        // SampledImageArrayNonUniformIndexing + StorageImageArrayNonUniformIndexing（Instructions.cs:611）。
+        //   · profile 关（设备四位不齐 / 开发期隔离）：一个都不许出现；
+        //   · profile 开：要么都没有（这支着色器没有非一致访问），要么四个齐全——缺一个就是生成器/profile 漂移。
+        public static void ValidateDescriptorIndexing(string stage, uint[] words, DirectProfile profile)
+        {
+            bool ext = false, shaderNonUniform = false, sampled = false, storage = false;
+            for (int i = 5; i < words.Length;)
+            {
+                int count = (int)(words[i] >> 16);
+                int opcode = (int)(words[i] & 0xFFFF);
+                if (count == 0 || i + count > words.Length)
+                    throw new DirectCompileException("SPIRV_INVALID", stage + ": truncated instruction");
+                if (opcode == (int)Spv.Specification.Op.OpCapability && count >= 2)
+                {
+                    switch ((Spv.Specification.Capability)words[i + 1])
+                    {
+                        case Spv.Specification.Capability.ShaderNonUniform: shaderNonUniform = true; break;
+                        case Spv.Specification.Capability.SampledImageArrayNonUniformIndexing: sampled = true; break;
+                        case Spv.Specification.Capability.StorageImageArrayNonUniformIndexing: storage = true; break;
+                        default: break;
+                    }
+                }
+                else if (opcode == (int)Spv.Specification.Op.OpExtension && count >= 2)
+                {
+                    if (SpirvLiteralIs(words, i + 1, count - 1, "SPV_EXT_descriptor_indexing")) ext = true;
+                }
+                else if (opcode != (int)Spv.Specification.Op.OpExtInstImport)
+                {
+                    break;   // 能力 / 扩展段结束
+                }
+                i += count;
+            }
+            bool any = ext || shaderNonUniform || sampled || storage;
+            if (!profile.Caps.SupportsShaderNonUniformIndexing)
+            {
+                if (any)
+                    throw new DirectCompileException("SPIRV_INVALID",
+                        stage + ": descriptor indexing declared while the enabled profile disables it");
+                return;
+            }
+            if (any && !(ext && shaderNonUniform && sampled && storage))
+                throw new DirectCompileException("SPIRV_INVALID",
+                    stage + ": descriptor indexing declaration is incomplete (ext=" + ext +
+                    " shaderNonUniform=" + shaderNonUniform + " sampled=" + sampled + " storage=" + storage + ")");
+        }
+
+        private static bool SpirvLiteralIs(uint[] words, int start, int count, string want)
+        {
+            if (count <= 0 || (long)count * 4 < want.Length + 1) return false;
+            for (int i = 0; i < want.Length; i++)
+            {
+                byte b = (byte)(words[start + i / 4] >> ((i % 4) * 8));
+                if (b != (byte)want[i]) return false;
+            }
+            return (byte)(words[start + want.Length / 4] >> ((want.Length % 4) * 8)) == 0;
         }
 
         // 池槽位只能由反射结果决定：翻译器先建 texture binding、后 RegisterTexture，

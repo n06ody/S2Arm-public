@@ -438,6 +438,47 @@ internal static unsafe class Program
 
     // 真机 Adreno 730 的实测形态用于合成测试（值是可解释的合成输入，不是从设备读的；真机同字节
     // 比对由 CLI profile 与设备日志的 caps 完成）。geometry/interlock 用来证明"硬件支持 ≠ enabled"。
+    // C1：在 CapsJson 的稳定输出里插 descriptorIndexing 对象（不改 CapsJson 签名，基线测试要能原样编译）。
+    // enabled=false 时全部七位为 false；enabled=true 时按 storage 参数造「四位齐」或「缺存储位」。
+    private static byte[] CapsJsonWithDescriptorIndexing(bool enabled, bool storage)
+    {
+        string text = Encoding.UTF8.GetString(CapsJson());
+        string objectText = "\"descriptorIndexing\":{\"enabled\":" + (enabled ? "true" : "false") +
+            ",\"runtimeArray\":" + (enabled ? "true" : "false") +
+            ",\"partiallyBound\":" + (enabled ? "true" : "false") +
+            ",\"sampledImageArrayNonUniformIndexing\":" + (enabled ? "true" : "false") +
+            ",\"storageImageArrayNonUniformIndexing\":" + (enabled && storage ? "true" : "false") +
+            ",\"variableDescriptorCount\":false,\"sampledImageUpdateAfterBind\":false},";
+        text = text.Replace("\"formats\":", objectText + "\"formats\":", StringComparison.Ordinal);
+        return Encoding.UTF8.GetBytes(text);
+    }
+
+    // C1：造一段最小 SPIR-V（头 + 能力 / 扩展前导段 + OpMemoryModel），只给能力核对用。
+    private static uint[] SpvDescriptorIndexing(bool ext, bool shaderNonUniform, bool sampled, bool storage)
+    {
+        var words = new List<uint> { 0x07230203, 0x00010300, 0, 1, 0 };
+        words.Add((2u << 16) | 17); words.Add(1);   // OpCapability Shader
+        if (ext)
+        {
+            const string name = "SPV_EXT_descriptor_indexing";
+            int count = (name.Length + 1 + 3) / 4;
+            words.Add(((uint)count + 1) << 16 | 10);   // OpExtension
+            uint word = 0;
+            for (int i = 0; i <= count * 4; i++)
+            {
+                byte b = i < name.Length ? (byte)name[i] : (byte)0;
+                word |= (uint)b << ((i % 4) * 8);
+                if (i % 4 == 3) { words.Add(word); word = 0; }
+            }
+        }
+        void Cap(uint cap) { words.Add((2u << 16) | 17); words.Add(cap); }
+        if (shaderNonUniform) Cap(5301);
+        if (sampled) Cap(5307);
+        if (storage) Cap(5309);
+        words.Add((3u << 16) | 14); words.Add(0); words.Add(1);   // OpMemoryModel Logical GLSL450
+        return words.ToArray();
+    }
+
     private static byte[] CapsJson(bool geometry = false, bool interlock = false, uint sampledImages = 64,
         string schema = null, string duplicateField = null, bool gsOccQuery = false)
     {
@@ -897,6 +938,48 @@ internal static unsafe class Program
             Throws("MISSING_FIELD", () => DirectProfileComposer.Compose(
                 Encoding.UTF8.GetBytes("{\"schema\":\"s2a-device-caps-v1\"}"), closure), "caps without fields rejected");
             Throws("UNSUPPORTED_PROFILE", () => DirectProfileComposer.Compose(caps, "bad closure"), "invalid closure rejected");
+
+            // C1：descriptorIndexing 关闭时 profile 必须与「caps 里没有这个对象」逐字节相同；
+            // 四位齐才开；缺存储位保持 false；SPIR-V 能力声明必须与 profile 一致。
+            byte[] capsOff = CapsJsonWithDescriptorIndexing(enabled: false, storage: true);
+            byte[] capsOn = CapsJsonWithDescriptorIndexing(enabled: true, storage: true);
+            byte[] capsNoStorage = CapsJsonWithDescriptorIndexing(enabled: true, storage: false);
+            byte[] profileOff = DirectProfileComposer.Compose(capsOff, closure);
+            Check(composed.SequenceEqual(profileOff),
+                "all-false descriptor-indexing bits compose the same profile as their absence");
+            Check(profileOff.SequenceEqual(DirectProfileComposer.Compose(capsOff, closure)),
+                "descriptor-indexing caps compose deterministically");
+            byte[] profileOn = DirectProfileComposer.Compose(capsOn, closure);
+            Check(!composed.SequenceEqual(profileOn), "enabling non-uniform indexing changes the profile");
+            using (JsonDocument onDoc = JsonDocument.Parse(profileOn))
+                Check(onDoc.RootElement.GetProperty("capabilities").GetProperty("supportsShaderNonUniformIndexing").GetBoolean(),
+                    "four descriptor-indexing bits enable non-uniform indexing");
+            using (JsonDocument noStoreDoc = JsonDocument.Parse(DirectProfileComposer.Compose(capsNoStorage, closure)))
+                Check(!noStoreDoc.RootElement.GetProperty("capabilities").GetProperty("supportsShaderNonUniformIndexing").GetBoolean(),
+                    "a missing storage non-uniform bit keeps non-uniform indexing disabled");
+            string buildClosure = DirectBuildIdentity.TranslatorClosure;
+            byte[] buildProfileAbsent = DirectProfileComposer.Compose(CapsJson(), buildClosure);
+            byte[] buildProfileOff = DirectProfileComposer.Compose(CapsJsonWithDescriptorIndexing(false, true), buildClosure);
+            Check(buildProfileAbsent.SequenceEqual(buildProfileOff),
+                "descriptor-indexing bits off compose the same build profile");
+            byte[] requestAbsent = RequestJson(buildProfileAbsent, "graphics", 1, 1, "dx-off", vs, fs);
+            byte[] requestOff = RequestJson(buildProfileOff, "graphics", 1, 1, "dx-off", vs, fs);
+            Check(DirectShaderCompiler.Compile(requestAbsent).SequenceEqual(DirectShaderCompiler.Compile(requestOff)),
+                "profile without descriptor indexing compiles byte-identical to the pre-C1 caps");
+            using (JsonDocument offDoc = JsonDocument.Parse(profileOff))
+            using (JsonDocument onDoc2 = JsonDocument.Parse(profileOn))
+            {
+                DirectProfile profOff = DirectProfile.Parse(offDoc.RootElement, "caps-off");
+                DirectProfile profOn = DirectProfile.Parse(onDoc2.RootElement, "caps-on");
+                Throws("SPIRV_INVALID", () => DirectShaderCompiler.ValidateDescriptorIndexing("fs", SpvDescriptorIndexing(true, true, true, true), profOff),
+                    "descriptor indexing with profile disabled is rejected");
+                DirectShaderCompiler.ValidateDescriptorIndexing("fs", SpvDescriptorIndexing(false, false, false, false), profOff);
+                DirectShaderCompiler.ValidateDescriptorIndexing("fs", SpvDescriptorIndexing(true, true, true, true), profOn);
+                Throws("SPIRV_INVALID", () => DirectShaderCompiler.ValidateDescriptorIndexing("fs", SpvDescriptorIndexing(true, true, false, true), profOn),
+                    "incomplete descriptor indexing declaration with profile enabled is rejected");
+                Throws("SPIRV_INVALID", () => DirectShaderCompiler.ValidateDescriptorIndexing("fs", SpvDescriptorIndexing(true, true, true, false), profOn),
+                    "missing storage capability with profile enabled is rejected");
+            }
         }
 
         // 1c) 翻译闭包身份（W2.1）：构建期嵌入的闭包是唯一来源，请求里的字符串必须等于它。
