@@ -230,7 +230,7 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
     if (!span) return resolve_part_locked(addr, len, mem, size, s, m, 1);
     rp_perf_add(RP_PERF_RES_N, 1);
     const uint64_t base_page = s->page0 / ps;
-    int all_fast = 1;
+    int all_fast = 1; uint64_t skipped = 0;
     for (uint64_t i = p; i <= q;) {
         uint64_t first_bit = (base_page + i) & 63u;
         uint64_t j = i + (63u - first_bit); if (j > q) j = q;
@@ -256,10 +256,11 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
             if (m->seen_ok && nvn_dirty_block_snapshot(span, (const void *)a, b - a, &v1, &e1) &&
                 v1 == version && e1 == epoch) block->covered |= mask;
             else block->covered = 0;
-        }
+        } else skipped++;
         i = j + 1;
     }
     if (all_fast) rp_perf_add(RP_PERF_BUF_FAST_N, 1);
+    if (skipped) rp_perf_add(RP_PERF_BUF_BLOCK_SKIP_N, skipped);
     return 1;
 }
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {

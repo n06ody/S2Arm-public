@@ -24,9 +24,10 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200];
+static unsigned g_block_log_count; static char g_block_log[160];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
-void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { (void)cls; if (strstr(text,"分时（回放缓冲块核查，本窗口）")) { g_block_log_count++; snprintf(g_block_log,sizeof g_block_log,"%s",text); } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
@@ -1739,11 +1740,17 @@ static void t_buf_block_work(void) {
     CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1 && b && b->cpu);
     if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, BLOCK_TEST_PAGES * PG));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    uint64_t window[RP_PERF_N]; rp_perf_take(window); g_block_log_count = 0;
+    g_flag_buf_blocks = 0; rp_buf_blocks_report(window); CHECK(g_block_log_count == 0);
+    g_flag_buf_blocks = 1;
 
     nvn_be_sub_begin(); ++g_dirty_now; g_block_pages_examined = 0;   // 其他跟踪池写，不改本池
     CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
     printf("block-work unrelated: examined=%llu expected=0\n", (unsigned long long)g_block_pages_examined);
     CHECK(g_block_pages_examined == 0);   // 期望 4 个摘要块；main 逐页查询 256 页
+    rp_perf_take(window); CHECK(window[RP_PERF_BUF_BLOCK_SKIP_N] == 4 && window[RP_PERF_BUF_PAGES_N] == 0);
+    rp_buf_blocks_report(window); CHECK(g_block_log_count == 1 && strstr(g_block_log, "跳过 4 块、逐页查 0 页"));
+    printf("block window: %s\n", g_block_log);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 
     nvn_be_sub_begin();
@@ -1752,6 +1759,9 @@ static void t_buf_block_work(void) {
     CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
     printf("block-work dirty: examined=%llu expected<=64\n", (unsigned long long)g_block_pages_examined);
     CHECK(g_block_pages_examined <= 64);  // 只有第 2 块变脏，其他 3 块不得逐页查
+    rp_perf_take(window); CHECK(window[RP_PERF_BUF_BLOCK_SKIP_N] == 3 && window[RP_PERF_BUF_PAGES_N] == 64);
+    rp_buf_blocks_report(window); CHECK(g_block_log_count == 2 && strstr(g_block_log, "跳过 3 块、逐页查 64 页"));
+    printf("block window: %s\n", g_block_log);
     if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, BLOCK_TEST_PAGES * PG));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 

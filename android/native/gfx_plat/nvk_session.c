@@ -91,8 +91,10 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
     { extern void nvn_dirty_set_chunk_pages(uint32_t); extern int nvn_dirty_blocks_configure(int); extern int nvn_plat_flag(const char *, int);
       int cp = nvn_plat_flag("nvk_chunk_pages", 64);
       nvn_dirty_set_chunk_pages(cp > 0 ? (uint32_t)cp : 0); __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 写跟踪保护分块 %d 页", cp);
-      if (nvn_plat_flag("nvk_buf_blocks", 0) && !nvn_dirty_blocks_configure(1))
-          __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】写跟踪块摘要未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
+      if (nvn_plat_flag("nvk_buf_blocks", 0)) {
+          if (nvn_dirty_blocks_configure(1)) __android_log_print(ANDROID_LOG_INFO, TAG, "回放缓冲按块核查：开");
+          else __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】写跟踪块摘要未启用：已有登记池或所需原子操作非无锁，继续逐页核对");
+      } }
     g_ready = 1;
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
     const char *drv_name = dev && dev->driver_name[0] ? dev->driver_name : "?";
