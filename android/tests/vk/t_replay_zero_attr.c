@@ -2,6 +2,7 @@
 // #977 零属性：真 rp_draw + 真 Vulkan 后端。顶点着色器读 location 3，游戏没给它设格式；
 // 期望核心补一条步长 0、内容全 0 的 RGBA32F 属性，着色器读到 (0,0,0,0) 画红，校验层 0 条。
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_shader.h"
