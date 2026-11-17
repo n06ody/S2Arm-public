@@ -29,7 +29,10 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){(void)n;return d;}
+static int dq_mode=-1;
+int nvn_plat_flag(const char *n,int d){
+ if(!strcmp(n,"nvk_dq")){const char *e=getenv("S2A_REPLAY_DB_DQ");if(e&&strcmp(e,"0")&&strcmp(e,"1")){fprintf(stderr,"S2A_REPLAY_DB_DQ 只能是 0 / 1\n");exit(2);}dq_mode=e?atoi(e):d;return dq_mode;}   // 两级录制：缺省同产品；S2A_REPLAY_DB_DQ=0/1 两档都跑
+ return !strcmp(n,"nvk_buf_dirtylog")&&getenv("S2A_REPLAY_DIRTYLOG_OFF")?0:d;}   // 脏页日志缺省开（同产品）；S2A_REPLAY_DIRTYLOG_OFF 跑关那一档
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 void rp_buf_reset(void);
@@ -66,6 +69,7 @@ int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t b
 // 传输写和派发之间只有被测的那道屏障（同步拷贝开头的全屏障会把缺的那道盖掉）。
 size_t nvn_dirty_page_size(void){return 4096;}uint64_t nvn_dirty_now(void){return 1;}
 static int untracked;   // resync 臂：池不受写跟踪，每次解析都整段重同步（同 t_replay_indirect）
+static unsigned log_reads;   // 回放核心读了几次脏页日志（缺省开那一档 > 0，证明受跟踪的池走的是日志路）
 uint64_t nvn_dirty_mapping_generation(void){return 1;}int nvn_dirty_tracking_unreliable(void){return untracked;}
 const void *nvn_dirty_span(const void *a,size_t n){(void)n;return untracked?NULL:a;}
 long nvn_dirty_page_gens(const void *s,const void *a,size_t l,uint64_t *g,size_t n){(void)s;(void)a;(void)l;if(untracked){return -1;}for(size_t i=0;i<n;i++){g[i]=1;}return (long)n;}
@@ -77,6 +81,8 @@ nvn_gpu_samp rp_samp_by_id(int i){(void)i;return NULL;}
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid){(void)tid;return rp_samp_by_id(sid);}
 uint32_t rp_fmt_caps(uint32_t f){return nvn_gpu_format_caps(f);}
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){(void)i;(void)t;(void)v;(void)h;return 0;}
+nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)t;(void)v;(void)c;return NULL;}   // 本夹具的程序没有图像绑定，走不到；rp_draw.c 的存储图像路径（d810f73a8 / 2f076a629 起）要这两个符号才链接得上
+uint32_t rp_storage_srgb_alias(uint32_t f){(void)f;return 0;}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
 void rp_tex_mark_gpu_written(const tex_t *t){(void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){(void)s;return NULL;}
@@ -85,14 +91,35 @@ const p_set_rt *rp_pass_target(void){return &target;}int rp_pass_slot_attached(i
 void rp_pass_slot_size(int i,uint32_t *w,uint32_t *h){(void)i;*w=*h=1;}void rp_pass_noatt_size(uint32_t *w,uint32_t *h){(void)w;(void)h;}void rp_pass_note_draw(int d){(void)d;}
 int rp_pass_parked(void){return 0;}void rp_pass_prepare_draw(nvn_gpu_cmd c,uint32_t color_write_mask){(void)c;(void)color_write_mask;}void rp_pass_land_reads(nvn_gpu_cmd c,const tex_t *const *ts,int n){(void)c;(void)ts;(void)n;}
 int rp_pass_begin(nvn_gpu_cmd c){(void)c;return 0;}void rp_pass_flush(nvn_gpu_cmd c){(void)c;}
-// 数后端录了几道 vkCmdPipelineBarrier：后端经 vkGetDeviceProcAddr 取入口（nvn_vk_dq.inc），在这里换成计数的那一份
+// 数后端录了几道 vkCmdPipelineBarrier：后端经 vkGetDeviceProcAddr 取入口（nvn_vk_dq.inc），在这里换成计数的那一份。
+// 两级录制（nvk_dq，缺省开）下真实 vkCmd* 稍后在录制线程上执行：回放函数返回时观察器可能还没跑。所以只在真实 vkCmd 入口里
+// 按发生顺序记快照（开命令缓冲 B / 传输写 T / 派发 D，各带当时的屏障数），最终提交、fence 完成之后再算，不在中途读计数、不加 drain。
 PFN_vkVoidFunction __real_vkGetDeviceProcAddr(VkDevice dev,const char *name);
-static PFN_vkCmdPipelineBarrier real_barrier;static unsigned nbar;
-static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){nbar++;real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);}
+static PFN_vkCmdPipelineBarrier real_barrier;static PFN_vkCmdDispatch real_dispatch;static PFN_vkCmdUpdateBuffer real_update;static PFN_vkCmdCopyBuffer real_copy;static PFN_vkBeginCommandBuffer real_begin;
+static unsigned nbar;static struct{char k;unsigned bar;}ev[64];static int nev;   // k：B 开命令缓冲 / T 传输写 / D 派发 / P 屏障 / E 段末屏障（目标主机，当段界）；bar = 记这条时的屏障总数（含这条）   // 只由真实 vkCmd 入口写（录制线程）；fence 之后主线程读
+static void note(char k){if(nev<64){ev[nev].k=k;ev[nev].bar=nbar;}nev++;}
+static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){nbar++;note(t&VK_PIPELINE_STAGE_HOST_BIT?'E':'P');real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);}   // E：段末那道（目标是主机），段界
+static void VKAPI_CALL note_dispatch(VkCommandBuffer cb,uint32_t x,uint32_t y,uint32_t z){note('D');real_dispatch(cb,x,y,z);}
+static void VKAPI_CALL note_update(VkCommandBuffer cb,VkBuffer b,VkDeviceSize o,VkDeviceSize n,const void *d){note('T');real_update(cb,b,o,n,d);}
+static void VKAPI_CALL note_copy(VkCommandBuffer cb,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){note('T');real_copy(cb,s,d,n,r);}
+static VkResult VKAPI_CALL note_begin(VkCommandBuffer cb,const VkCommandBufferBeginInfo *i){note('B');return real_begin(cb,i);}
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);
- if(f&&name&&!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
+ if(!f||!name)return f;
+ if(!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
+ if(!strcmp(name,"vkCmdDispatch")){real_dispatch=(PFN_vkCmdDispatch)f;return (PFN_vkVoidFunction)note_dispatch;}
+ if(!strcmp(name,"vkCmdUpdateBuffer")){real_update=(PFN_vkCmdUpdateBuffer)f;return (PFN_vkVoidFunction)note_update;}
+ if(!strcmp(name,"vkCmdCopyBuffer")){real_copy=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)note_copy;}
+ if(!strcmp(name,"vkBeginCommandBuffer")){real_begin=(PFN_vkBeginCommandBuffer)f;return (PFN_vkVoidFunction)note_begin;}
  return f;
+}
+// 被测派发（第 nth 个 D，从 0 数）之前的屏障数：从它往前最近的一个 B / T / D / E 起算（中间的 P 都算）；跳过 skip_t 个 T，算作被测这次自己录的
+// （resync 臂：派发自己的解析录了一次重同步，那道开头屏障本来就算在被测派发里）。E 自己不算：上一段的段末屏障不属于下一段的派发。找不到返回 -1。
+static int bar_before(int nth,int skip_t){
+ int d=-1,seen=0;for(int i=0;i<nev&&i<64;i++){if(ev[i].k=='D'&&seen++==nth){d=i;break;}}
+ if(d<0)return -1;
+ int j=d-1;for(;j>=0;j--){if(ev[j].k=='P')continue;if(ev[j].k=='T'&&skip_t>0){skip_t--;continue;}break;}
+ return (int)(ev[d].bar-(j>=0?ev[j].bar:0));
 }
 void nvn_gpu_vk_test_xfer_barrier(int on) __attribute__((weak));   // 修前的树里没有这个钩子：none-nobar 臂只在修后跑
 int main(int argc,char **argv){
@@ -121,24 +148,25 @@ int main(int argc,char **argv){
  if(!untracked){nvn_gpu_buf_write(active,mirror,off,init,sizeof init);}   // 被测的传输写（resync 臂由派发自己的解析录）
  if(xseg){GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));GPU(nvn_gpu_cmd_begin(NULL,&active,&err));}
  if(game){rp_pass_barrier(NVN_BARRIER_ORDER_PRIMITIVES_BIT|NVN_BARRIER_INVALIDATE_SHADER_BIT);}   // 游戏的 OP_BARRIER
- unsigned b0=nbar;rp_dispatch(active,&dp,NULL);unsigned b1=nbar;   // 被测的派发：读传输写的
- unsigned b2=b1;if(dd){rp_dispatch(active,&dp,NULL);b2=nbar;}     // dd：紧跟着再派发一次，中间没有传输
+ rp_dispatch(active,&dp,NULL);   // 被测的派发：读传输写的
+ if(dd){rp_dispatch(active,&dp,NULL);}     // dd：紧跟着再派发一次，中间没有传输
  REQUIRE(nvn_unimpl_kinds()==0);
  const uint64_t sig=xseg?2:1;
  GPU(nvn_gpu_cmd_commit(active,sig,done,NULL,&err));GPU(nvn_gpu_fence_wait(sig,5000000000ull,&err));
+ // 屏障数在 fence 之后按快照算：被测派发是第 tested 个（有预派发时是第 1 个），dd 的第二次是下一个
+ const int tested=untracked?0:1,before=bar_before(tested,untracked?1:0),between=dd?bar_before(tested+1,0):0;
+ REQUIRE(nev<=64&&before>=0&&between>=0);
+ char seq[65];for(int i=0;i<nev&&i<64;i++){seq[i]=ev[i].k;}seq[nev<64?nev:64]=0;   // 真实 vkCmd 的发生顺序，读数行带出来便于对位
  const uint32_t *w=(const uint32_t*)(const void*)((const uint8_t*)nvn_gpu_buf_cpu(mirror)+off);unsigned bad=0;
  for(uint32_t i=0;i<64;i++){if(w[i]!=i*3){bad++;}if(w[64+i]!=i*6){bad++;}}
- printf("dispatch-barrier mode=%s readback w[64+i]==i*6 mismatches=%u (w[65]=%u w[127]=%u) barriers_before_dispatch=%u barriers_between_dispatches=%u\n",arm,bad,w[65],w[127],b1-b0,b2-b1);
+ printf("dispatch-barrier mode=%s readback w[64+i]==i*6 mismatches=%u (w[65]=%u w[127]=%u) barriers_before_dispatch=%d barriers_between_dispatches=%d dirtylog_reads=%u dq=%d vkcmd=%s\n",arm,bad,w[65],w[127],before,between,log_reads,dq_mode,seq);
  for(int k=0;k<nw;k++)rp_buf_gpu_write_land(wkey[k],wid[k],0);
  rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);
  GPU(nvn_gpu_close(5000000000ull,&err));REQUIRE(!s2a_vk_device_destroy(&d,1));
  return bad?1:0;
 }
 
-// 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
-int nvn_dirty_log_open(const void *s, uint64_t *i, uint64_t *c) { (void)s; (void)i; (void)c; return 0; }   // 本夹具没有脏页追加日志：回放核心走原路径
-int nvn_dirty_log_read(const void *s, uint64_t i, uint64_t *c, void (*f)(void *, uintptr_t, uintptr_t), void *u) { (void)s; (void)i; (void)c; (void)f; (void)u; return 0; }
-int nvn_dirty_page_armed(const void *s, const void *a) { (void)s; (void)a; return 0; }
-int nvn_dirty_block_snapshot(const void *s, const void *a, size_t n, uint64_t *v, uint64_t *e) {
-    (void)s; (void)a; (void)n; (void)v; (void)e; return 0;
-}
+// 脏页追加日志替身：受跟踪的池有日志，游戏一页都不写（逐页代号恒为 1），所以日志一直是空的、页一直只读；不受跟踪（resync 臂）没有日志。
+int nvn_dirty_log_open(const void *s, uint64_t *i, uint64_t *c) { (void)s; if (untracked) return 0; *i = 1; *c = 0; return 1; }
+int nvn_dirty_log_read(const void *s, uint64_t i, uint64_t *c, void (*f)(void *, uintptr_t, uintptr_t), void *u) { (void)s; (void)f; (void)u; if (untracked || i != 1) return 0; log_reads++; *c = 0; return 1; }
+int nvn_dirty_page_armed(const void *s, const void *a) { (void)s; (void)a; return !untracked; }

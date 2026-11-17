@@ -25,24 +25,21 @@ static int g_fail, g_checks;
 
 // ---------- 平台替身 ----------
 static int g_red_lines; static char g_last_red[200];
-static unsigned g_block_log_count; static char g_block_log[160];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
 static char g_ps_lines[8][320]; static int g_ps_n;   // 池统计行（cls "poolstats"）收下来给 t_pool_stats 核
-void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if (strstr(text,"分时（回放缓冲块核查，本窗口）")) { g_block_log_count++; snprintf(g_block_log,sizeof g_block_log,"%s",text); } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
-static int g_flag_buf_blocks;      // 分块验证只在明确开启时尝试；产品默认关闭。
-static int g_flag_buf_dirtylog;    // 用例设：开关 nvk_buf_dirtylog（缺省同产品：关）
+static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
-    if (!strcmp(name, "nvk_buf_blocks")) return g_flag_buf_blocks;
-    if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog;
+    if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
@@ -207,7 +204,7 @@ static _Alignas(4096) uint8_t g_pmem[PG * NPG]; static uint64_t g_pg_gen[NPG]; s
 enum { BLOCK_TEST_PAGES = 256, BLOCK_TEST_ALIGN = 64 * PG };
 static _Alignas(4096) uint8_t g_block_arena[(BLOCK_TEST_PAGES + 64) * PG];
 static uint8_t *g_block_mem;
-static uint64_t g_block_gen[BLOCK_TEST_PAGES], g_block_version[BLOCK_TEST_PAGES / 64], g_block_pages_examined;
+static uint64_t g_block_gen[BLOCK_TEST_PAGES], g_block_pages_examined;
 size_t nvn_dirty_page_size(void) { return PG; }
 // 不受写跟踪的池（用例用 g_pg_tracked=0 设）没有跟踪区间：真实现里也是返回 NULL，靠它判「每次使用都整段同步」。
 const void *nvn_dirty_span(const void *addr, size_t len) {
@@ -241,34 +238,60 @@ long nvn_dirty_page_gens(const void *span, const void *addr, size_t len, uint64_
     for (size_t i = p; i <= q; i++) gens[i - p] = g_pg_gen[i];
     return (long)(q - p + 1);
 }
-int nvn_dirty_block_snapshot(const void *span, const void *addr, size_t len, uint64_t *version, uint64_t *epoch) {
-    uintptr_t a = (uintptr_t)addr, base = (uintptr_t)g_block_mem;
-    if (!g_block_mem || span != g_block_mem || !g_pg_tracked || g_block_unreliable || !len || !version || !epoch ||
-        a < base || len > BLOCK_TEST_PAGES * PG || a - base > BLOCK_TEST_PAGES * PG - len) return 0;
-    size_t p = (a - base) / BLOCK_TEST_ALIGN, q = (a + len - 1 - base) / BLOCK_TEST_ALIGN;
-    if (p != q) return 0;
-    *version = g_block_version[p]; *epoch = g_dirty_map; return 1;
-}
 
-// 脏页追加日志替身（只给 g_block_mem 这个池）：用例经 fake_log_write 改一页内容并追加事件；容量 FAKE_LOG_CAP，超了读者判环绕。
-enum { FAKE_LOG_CAP = 64 };
+// 脏页追加日志替身，两种：
+//   手动（g_log_fake_on = 1，只给 g_block_mem）：用例经 fake_log_write 改一页内容并追加事件；容量 FAKE_LOG_CAP，超了读者判环绕。测环绕、加保护没落地这些边角。
+//   自动（其余情形，g_pmem 与 g_block_mem 都给）：用例照旧直接推页代号（g_pg_gen / g_block_gen），替身在开 / 读日志时把「代号变了」的页补成事件，
+//     对应真实现「页由只读变可写之前先记一条」；跟踪的区间增减 / 换底（g_dirty_map 变）= 重新登记：新身份，旧游标对不上，读者按代号重建。
+//   这样开关缺省（开）那一档，整套用例里受跟踪的池都走日志路；开关关的那一档（--dirtylog-off）整套另跑一遍，保住逐页退回路径。
+enum { FAKE_LOG_CAP = 64, AUTO_LOG_CAP = 1024 };
 static int g_log_fake_on, g_log_fake_bad; static uint64_t g_log_head, g_log_ident = 7;
 static struct { uintptr_t a, b; } g_log_ev[FAKE_LOG_CAP];
 static uint8_t g_log_unarmed[BLOCK_TEST_PAGES];   // 1 = 这一页加保护被并发解保护挡住（nvn_dirty_page_armed 答 0）
-static int fake_log_ok(const void *span) { return g_log_fake_on && g_block_mem && span == g_block_mem && !g_log_fake_bad && !g_block_unreliable; }
+static uint64_t g_alog_events, g_alog_reads;   // 自动日志一共补了多少条事件、被读了几次（用例核「缺省开那一档真走了日志路」）
+static int fake_log_manual(const void *span) { return g_log_fake_on && g_block_mem && span == g_block_mem; }
+static int fake_log_ok(const void *span) { return fake_log_manual(span) && !g_log_fake_bad && !g_block_unreliable; }
+static uint64_t *auto_gens(const void *span, size_t *n, uintptr_t *base) {
+    if (span == g_pmem) { *n = NPG; *base = (uintptr_t)g_pmem; return g_pg_gen; }
+    if (g_block_mem && span == g_block_mem) { *n = BLOCK_TEST_PAGES; *base = (uintptr_t)g_block_mem; return g_block_gen; }
+    return NULL;
+}
+struct auto_log { const void *span; uint64_t map, ident, head; uint64_t seen[BLOCK_TEST_PAGES]; struct { uintptr_t a, b; } ev[AUTO_LOG_CAP]; };
+static struct auto_log g_alog[2];
+static struct auto_log *auto_log(const void *span) {
+    size_t n; uintptr_t base; uint64_t *gen = auto_gens(span, &n, &base);
+    if (!gen || !g_pg_tracked || g_block_unreliable) return NULL;
+    struct auto_log *l = &g_alog[span == g_pmem ? 0 : 1];
+    if (l->span != span || l->map != g_dirty_map) {   // 新登记：之前的写不在日志里（读者开日志之后会按代号重建 / 新镜像整份置旧）
+        l->span = span; l->map = g_dirty_map; l->ident = ++g_log_ident; memcpy(l->seen, gen, n * sizeof *gen);
+    }
+    for (size_t k = 0; k < n; k++) if (gen[k] != l->seen[k]) {   // 用「变了」不用「变大」：用例换场时会把代号清零，宁可多报不能漏
+        l->seen[k] = gen[k]; l->ev[l->head % AUTO_LOG_CAP].a = base + k * PG; l->ev[l->head % AUTO_LOG_CAP].b = base + (k + 1) * PG; l->head++; g_alog_events++;
+    }
+    return l;
+}
 int nvn_dirty_log_open(const void *span, uint64_t *ident, uint64_t *cursor) {
-    if (!fake_log_ok(span)) return 0;
-    *ident = g_log_ident; *cursor = g_log_head; return 1;
+    if (fake_log_manual(span)) { if (!fake_log_ok(span)) return 0; *ident = g_log_ident; *cursor = g_log_head; return 1; }
+    struct auto_log *l = auto_log(span); if (!l) return 0;
+    *ident = l->ident; *cursor = l->head; return 1;
 }
 int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void (*fn)(void *, uintptr_t, uintptr_t), void *user) {
-    if (!fake_log_ok(span) || ident != g_log_ident || g_log_head - *cursor > FAKE_LOG_CAP) return 0;
-    for (uint64_t i = *cursor; i < g_log_head; i++) fn(user, g_log_ev[i % FAKE_LOG_CAP].a, g_log_ev[i % FAKE_LOG_CAP].b);
-    *cursor = g_log_head; return 1;
+    if (fake_log_manual(span)) {
+        if (!fake_log_ok(span) || ident != g_log_ident || g_log_head - *cursor > FAKE_LOG_CAP) return 0;
+        for (uint64_t i = *cursor; i < g_log_head; i++) fn(user, g_log_ev[i % FAKE_LOG_CAP].a, g_log_ev[i % FAKE_LOG_CAP].b);
+        *cursor = g_log_head; return 1;
+    }
+    struct auto_log *l = auto_log(span); g_alog_reads++;
+    if (!l || ident != l->ident || l->head - *cursor > AUTO_LOG_CAP) return 0;
+    for (uint64_t i = *cursor; i < l->head; i++) fn(user, l->ev[i % AUTO_LOG_CAP].a, l->ev[i % AUTO_LOG_CAP].b);
+    *cursor = l->head; return 1;
 }
 int nvn_dirty_page_armed(const void *span, const void *addr) {
-    if (!g_block_mem || span != g_block_mem) return 0;
-    size_t k = (size_t)((const uint8_t *)addr - g_block_mem) / PG;
-    return k < BLOCK_TEST_PAGES && !g_log_unarmed[k];
+    if (fake_log_manual(span)) {
+        size_t k = (size_t)((const uint8_t *)addr - g_block_mem) / PG;
+        return k < BLOCK_TEST_PAGES && !g_log_unarmed[k];
+    }
+    size_t n; uintptr_t base; return auto_gens(span, &n, &base) && g_pg_tracked && !g_block_unreliable;   // 自动日志：代号一变就有事件，等价于「同步时页已重新只读」
 }
 static void fake_log_event(size_t first, size_t last) {   // 第 first..last 页（含）变可写
     g_log_ev[g_log_head % FAKE_LOG_CAP].a = (uintptr_t)g_block_mem + first * PG;
@@ -276,7 +299,7 @@ static void fake_log_event(size_t first, size_t last) {   // 第 first..last 页
 }
 static void fake_log_write(size_t page, uint8_t v) {   // 游戏写一页：内容、逐页代号、块版本、日志事件一起变（与真实现同序：事件先于写）
     fake_log_event(page, page);
-    memset(g_block_mem + page * PG, v, PG); g_block_gen[page] = ++g_dirty_now; g_block_version[page / 64]++;
+    memset(g_block_mem + page * PG, v, PG); g_block_gen[page] = ++g_dirty_now;
 }
 
 // 通道替身：记每次开通道的描述
@@ -1763,100 +1786,8 @@ static void t_buf_multi_tail(void) {
     nvn_be_pool_del(g_pmem); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
 
-// 全池已同步后，无关写不应触发逐页扫描；本池一块变脏时只需检查这一块。
-static void t_buf_block_work(void) {
-    nvn_be_shutdown_session(); nvn_unimpl_reset(); g_pg_tracked = 1; g_buf_cpu_auto = 1;
-    g_flag_buf_blocks = 1; g_dirty_now = 100; g_nbw = 0;
-    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
-    memset(g_block_mem, 0x21, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
-    memset(g_block_version, 0, sizeof g_block_version); ++g_dirty_map; g_block_unreliable = 0;
-    uint64_t base = (uint64_t)(uintptr_t)g_block_mem;
-    nvn_be_pool_add(g_block_mem, BLOCK_TEST_PAGES * PG);
-    nvn_gpu_buf b = NULL;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1 && b && b->cpu);
-    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, BLOCK_TEST_PAGES * PG));
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-    uint64_t window[RP_PERF_N]; rp_perf_take(window); g_block_log_count = 0;
-    g_flag_buf_blocks = 0; rp_buf_blocks_report(window); CHECK(g_block_log_count == 0);
-    g_flag_buf_blocks = 1;
-
-    nvn_be_sub_begin(); ++g_dirty_now; g_block_pages_examined = 0;   // 其他跟踪池写，不改本池
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
-    printf("block-work unrelated: examined=%llu expected=0\n", (unsigned long long)g_block_pages_examined);
-    CHECK(g_block_pages_examined == 0);   // 期望 4 个摘要块；main 逐页查询 256 页
-    rp_perf_take(window); CHECK(window[RP_PERF_BUF_BLOCK_SKIP_N] == 4 && window[RP_PERF_BUF_PAGES_N] == 0);
-    rp_buf_blocks_report(window); CHECK(g_block_log_count == 1 && strstr(g_block_log, "跳过 4 块、逐页查 0 页"));
-    printf("block window: %s\n", g_block_log);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-
-    nvn_be_sub_begin();
-    memset(g_block_mem + 70 * PG, 0x7b, PG); g_block_gen[70] = ++g_dirty_now; g_block_version[1]++;
-    g_block_pages_examined = 0;
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
-    printf("block-work dirty: examined=%llu expected<=64\n", (unsigned long long)g_block_pages_examined);
-    CHECK(g_block_pages_examined <= 64);  // 只有第 2 块变脏，其他 3 块不得逐页查
-    rp_perf_take(window); CHECK(window[RP_PERF_BUF_BLOCK_SKIP_N] == 3 && window[RP_PERF_BUF_PAGES_N] == 64);
-    rp_buf_blocks_report(window); CHECK(g_block_log_count == 2 && strstr(g_block_log, "跳过 3 块、逐页查 64 页"));
-    printf("block window: %s\n", g_block_log);
-    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, BLOCK_TEST_PAGES * PG));
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-
-    // 一次写脏同块中的两页；只解析前一页不能证明后一页已核对。
-    memset(g_block_mem + 80 * PG, 0x38, PG); memset(g_block_mem + 81 * PG, 0x49, PG);
-    g_block_gen[80] = g_block_gen[81] = ++g_dirty_now; g_block_version[1]++;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 80 * PG, PG, &b, NULL) == 1);
-    if (b && b->cpu) CHECK(b->cpu[80 * PG] == 0x38 && b->cpu[81 * PG] == 0x21);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 81 * PG, PG, &b, NULL) == 1);
-    if (b && b->cpu) CHECK(b->cpu[81 * PG] == 0x49);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-
-    // 跨多个摘要块的部分覆盖：先解析第 80 页起的 66 页，不能把同块第 70 页也算核过。
-    memset(g_block_mem + 70 * PG, 0x61, PG); memset(g_block_mem + 80 * PG, 0x62, PG);
-    g_block_gen[70] = g_block_gen[80] = ++g_dirty_now; g_block_version[1]++;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 80 * PG, 66 * PG, &b, NULL) == 1);
-    if (b && b->cpu) CHECK(b->cpu[80 * PG] == 0x62 && b->cpu[70 * PG] == 0x7b);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-    nvn_be_sub_begin(); g_block_pages_examined = 0;
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
-    CHECK(g_block_pages_examined <= 64);
-    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, BLOCK_TEST_PAGES * PG));
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-
-    // 待落地写只覆盖末块时，整段解析必须留在写入的镜像，分块不能各自重选。
-    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
-    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
-    extern void rp_buf_frame_flip(void);
-    nvn_gpu_buf written = b; uint64_t key = 0;
-    uint64_t id = rp_buf_gpu_write_note(base + 200 * PG, PG, &key);
-    CHECK(id && key == base && written && written->cpu);
-    if (written && written->cpu) memset(written->cpu + 200 * PG, 0xee, PG);
-    rp_buf_frame_flip();
-    g_block_gen[200] = ++g_dirty_now; g_block_version[3]++;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1 && b == written);
-    if (b && b->cpu) CHECK(b->cpu[200 * PG] == 0xee); // CPU 同步不得覆盖 GPU 未落地的字节
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-    if (id) rp_buf_gpu_write_land(key, id, 1);
-    CHECK(g_block_mem[200 * PG] == 0xee);
-
-    // 跟踪失效后没有可用摘要，即使页代号不变也必须整段同步。
-    g_block_unreliable = 1; g_block_mem[100 * PG] = 0x71;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &b, NULL) == 1);
-    if (b && b->cpu) CHECK(b->cpu[100 * PG] == 0x71);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-    g_block_unreliable = 0;
-    nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
-    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_blocks = 0;
-}
-
 // 脏页追加日志（nvk_buf_dirtylog，#1501 A②）：解析不按范围逐页比代号，只灌日志事件、在旧页位图里求交。
-// 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查（与块摘要那条用例同一口径）。
+// 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查。
 static uint64_t sync_bytes_now(void) { extern void rp_buf_stats(uint64_t *, uint64_t *); uint64_t b = 0, r = 0; rp_buf_stats(&b, &r); return b; }
 static void t_buf_dirtylog(void) {
     extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
@@ -1867,7 +1798,7 @@ static void t_buf_dirtylog(void) {
     g_dirty_now = 100; g_nbw = 0;
     g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
     memset(g_block_mem, 0x21, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
-    memset(g_block_version, 0, sizeof g_block_version); ++g_dirty_map; g_block_unreliable = 0;
+    ++g_dirty_map; g_block_unreliable = 0;
     const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG;
     nvn_be_pool_add(g_block_mem, all);
     nvn_gpu_buf b = NULL;
@@ -1945,7 +1876,7 @@ static void t_buf_dirtylog(void) {
     nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); if (b && b->cpu) CHECK(b->cpu[150 * PG] == 0x71); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     g_block_unreliable = 0;
     nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
-    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = 0; g_log_fake_on = 0;
+    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = g_dirtylog_dflt; g_log_fake_on = 0;
 }
 
 static void t_buf_ops(void) {   // 缓冲类命令只改游戏内存；GPU 顺序由使用点同步保证：先用的看到旧内容，后用的看到新内容
@@ -4524,6 +4455,7 @@ static void t_pool_stats_shutdown(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) { g_dirtylog_dflt = g_flag_buf_dirtylog = 0; argc--; argv++; }   // 关那一档：整套用例走逐页退回路径
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     t_invalidated_attachment_pin();
     t_registered_view_pin();
@@ -4555,7 +4487,6 @@ int main(int argc, char **argv) {
     t_samp_mirror_clamp();
     t_decl_view();
     t_buf_mirror();
-    t_buf_block_work();
     t_buf_dirtylog();
     t_buf_mirror_fail_once();
     t_buf_multi_tail();
@@ -4621,6 +4552,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && t_table(argv[1])) g_fail++;
     t_tex_linear_dirty_rows();   // 放在倒数第二：它推高全局上传计数，前面有用例按「从 0 起」断言
     t_pool_stats_shutdown();   // 会话收尾会复位整个回放核心：必须是最后一个用例（不看上传计数）
+    CHECK(g_dirtylog_dflt != 0 ? g_alog_events > 0 && g_alog_reads > 0 : g_alog_events == 0 && g_alog_reads == 0);   // 两档各走各的路：开那一档受跟踪的池真读了日志，关那一档一次也没开过
+    printf("t_nvn_replay 脏页日志档：%s，自动日志读 %llu 次、事件 %llu 条\n", g_dirtylog_dflt != 0 ? "缺省（开）" : "关", (unsigned long long)g_alog_reads, (unsigned long long)g_alog_events);
     printf("t_nvn_replay：%d 项检查，%d 项红\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

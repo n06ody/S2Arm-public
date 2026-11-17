@@ -51,12 +51,6 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-enum { DIRTY_BLOCK_SHIFT = 6, DIRTY_BLOCK_PAGES = 1 << DIRTY_BLOCK_SHIFT };
-typedef struct { _Atomic uint64_t version; _Atomic uint32_t writers; } dirty_block;
-typedef struct dirty_summary {
-    uintptr_t base, end; size_t count; _Atomic int bad;
-    struct dirty_summary *next; dirty_block block[];
-} dirty_summary;
 // 脏页追加日志（#1501 A②，宿主侧开关 debug.s2a.nvk_buf_dirtylog，缺省关；须在任何池登记前 nvn_dirty_log_configure）：
 // 一页从只读变可写（缺页 / 宿主写前解除）就追加一条 [a, b)（宿主页对齐的地址），在 mprotect 之前发布——写入必然晚于这条事件。
 // 两次加保护之间一页最多产生一次事件，所以「镜像上次同步后被写过的页」= 它的游标之后的事件，消费方按事件数付钱，不按范围页数。
@@ -69,7 +63,7 @@ typedef struct dirty_log {
     struct { _Atomic uint64_t seq; _Atomic uintptr_t a, b; } ev[];
 } dirty_log;
 typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live;
-                 _Atomic(dirty_summary *) summary; _Atomic(dirty_log *) log; } range_t;
+                 _Atomic(dirty_log *) log; } range_t;
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -100,11 +94,7 @@ typedef struct retired_arrays {
     struct retired_arrays *next;
 } retired_arrays;
 static retired_arrays *g_retired_arrays;   // g_slot_mu; never read by the signal path
-// 即使槽位复用，缺页处理线程仍可能握着旧摘要；和旧页数组一样留到所有读者退出的会话重置。
-static dirty_summary *g_all_summaries;   // g_slot_mu
-static size_t g_summary_bytes;           // 会话内保留量有上限，耗尽则后续池退回旧路径。
-enum { SUMMARY_BYTES_LIMIT = 64 * 1024 * 1024 };
-// 追加日志：和摘要一样，缺页线程可能握着旧日志，留到会话重置再放；保留量有上限，耗尽则后续池没有日志（消费方退回逐页）。
+// 追加日志：即使槽位复用，缺页线程仍可能握着旧日志，和旧页数组一样留到所有读者退出的会话重置再放；保留量有上限，耗尽则后续池没有日志（消费方退回逐页）。
 static dirty_log *g_all_logs;            // g_slot_mu
 static size_t g_log_bytes;               // g_slot_mu
 static uint64_t g_log_ident;             // g_slot_mu；每次登记一条新日志加一（槽位复用后旧游标对不上）
@@ -202,21 +192,11 @@ static _Atomic uint32_t g_chunk_pages = 0;
 // 跟踪不可靠：任何一次 mprotect 失败都会置位。置位后所有查询走保守路径（整张视为脏 /
 // 代际返回 -1），不再只靠“旧代际比较”判断——否则失败后仍会认为内容没变而漏传。
 static _Atomic int g_track_unreliable;
-static int g_blocks_enabled;   // g_slot_mu；只能在没有活池时设置，缺页路径不读取此变量。
-static int g_log_enabled;      // g_slot_mu；同上（追加日志）
+static int g_log_enabled;      // g_slot_mu；只能在没有活池时设置（追加日志），缺页路径不读取此变量。
 // 映射代际：换底/重建后自增，供纹理缓存判定“旧句柄/旧保护状态已失效，必须重新验证并重新加保护”。
 static _Atomic uint64_t g_mapping_gen = 1;
 void nvn_dirty_set_chunk_pages(uint32_t pages) { atomic_store(&g_chunk_pages, pages); }
 uint32_t nvn_dirty_chunk_pages(void) { return atomic_load(&g_chunk_pages); }
-int nvn_dirty_blocks_configure(int enabled) {
-    pthread_mutex_lock(&g_slot_mu);
-    int ok = atomic_load(&g_live) == 0;
-    if (enabled && (ATOMIC_LLONG_LOCK_FREE != 2 || ATOMIC_LONG_LOCK_FREE != 2 ||
-                    ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_POINTER_LOCK_FREE != 2)) ok = 0;
-    if (ok) g_blocks_enabled = !!enabled;
-    pthread_mutex_unlock(&g_slot_mu);
-    return ok;
-}
 int nvn_dirty_log_configure(int enabled) {
     pthread_mutex_lock(&g_slot_mu);
     int ok = atomic_load(&g_live) == 0;
@@ -273,12 +253,9 @@ void nvn_dirty_reset_session(void) {
         retired_arrays *r = g_retired_arrays; g_retired_arrays = r->next;
         free(r->state); free(r->gen); free(r);
     }
-    while (g_all_summaries) { dirty_summary *s = g_all_summaries; g_all_summaries = s->next; free(s); }
-    g_summary_bytes = 0;
     while (g_all_logs) { dirty_log *l = g_all_logs; g_all_logs = l->next; free(l); }
     g_log_bytes = 0; g_log_enabled = 0;
     atomic_store(&g_nr, 0); atomic_store(&g_live, 0); atomic_store(&g_live_peak, 0);
-    g_blocks_enabled = 0;
     atomic_store(&g_now, 1); atomic_store(&g_overflow_logged, 0); atomic_store(&g_busy_red, 0); atomic_store(&g_hooks_on, 0);
     table_write_end();
     pthread_mutex_unlock(&g_slot_mu);
@@ -367,19 +344,6 @@ static uintptr_t chunk_last_page(range_t *r, uintptr_t p) {
     uintptr_t last = first + cp - 1;
     return last < npg - 1 ? last : npg - 1;
 }
-static size_t summary_index(const dirty_summary *s, uintptr_t addr) {
-    return (size_t)((addr >> (g_shift + DIRTY_BLOCK_SHIFT)) - (s->base >> (g_shift + DIRTY_BLOCK_SHIFT)));
-}
-// 在解除保护之前发布所有受影响块的在途写，直到逐页代号与状态均发布后才结束。
-// 每个块的计数支持同块并发写，版本只递增，不能被较晚完成的旧写覆盖。
-static void summary_begin(dirty_summary *s, uintptr_t a, uintptr_t b) {
-    if (!s || a < s->base || b > s->end || a >= b) return;
-    size_t p = summary_index(s, a), q = summary_index(s, b - 1);
-    for (size_t i = p; i <= q; i++) {
-        if (atomic_fetch_add(&s->block[i].writers, 1) == UINT32_MAX) atomic_store(&s->bad, 1);
-        if (atomic_fetch_add(&s->block[i].version, 1) == UINT64_MAX) atomic_store(&s->bad, 1);
-    }
-}
 // 追加一条事件（缺页路径可调：只有原子操作）。先把槽的 seq 清 0（读者见 0 = 正在写），写区间，最后发布 seq = 下标 + 1。
 static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
     const uint64_t i = atomic_fetch_add_explicit(&lg->head, 1, memory_order_acq_rel);
@@ -390,16 +354,6 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
     atomic_store_explicit(&e->b, b, memory_order_relaxed);
     atomic_store_explicit(&e->seq, i + 1, memory_order_release);
 }
-static void summary_end(dirty_summary *s, uintptr_t a, uintptr_t b) {
-    if (!s || a < s->base || b > s->end || a >= b) return;
-    size_t p = summary_index(s, a), q = summary_index(s, b - 1);
-    for (size_t i = p; i <= q; i++) atomic_fetch_sub(&s->block[i].writers, 1);
-}
-#ifdef S2A_DIRTY_BLOCK_TEST
-// 只在宿主夹具里固定「全局代号已推进、逐页代号未发布」的交错窗口。
-void (*nvn_dirty_block_test_after_now)(void);
-int nvn_dirty_block_test_fail_alloc;
-#endif
 // 整段解除 first..last（含）：成功则整段记脏（代际推进）——共享块的另一半也必须看到写入，
 // 否则只更新发起方会让同块内另一张纹理读到旧内容（维护者指出的“两张纹理共块”反例）。
 // 先逐页认领（PROT→BUSY、NONE→BUSY_WRITABLE），挡住并发的加保护，再整段 mprotect：
@@ -421,11 +375,6 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
         k++;
     }
     uintptr_t begin = r->base + (first << g_shift), end = r->base + ((last + 1) << g_shift);
-    dirty_summary *summary = NULL;
-#if ATOMIC_POINTER_LOCK_FREE == 2
-    summary = atomic_load_explicit(&r->summary, memory_order_acquire);
-#endif
-    if (summary) summary_begin(summary, begin, end);
     {   // 追加日志：在页变可写之前发布（mprotect 失败时这条是多余的，只会让消费方多同步一次；失败本身会置「跟踪不可靠」）
         dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
         if (lg) log_append(lg, begin, end);
@@ -438,15 +387,10 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
             else if (st == PG_BUSY_WRITABLE) atomic_store(&r->state[k], PG_NONE);
         }
         atomic_store(&g_track_unreliable, 1);
-        if (summary) summary_end(summary, begin, end);
         return 0;
     }
     const uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
-#ifdef S2A_DIRTY_BLOCK_TEST
-    if (nvn_dirty_block_test_after_now) nvn_dirty_block_test_after_now();
-#endif
     for (uintptr_t k = first; k <= last; k++) { atomic_store(&r->gen[k], g); atomic_store(&r->state[k], PG_NONE); }
-    if (summary) summary_end(summary, begin, end);
     return 1;
 }
 // 解除 p 所在的整块。块边界以所属映射为基准（chunk_first/last_page），不越界保护相邻内存。
@@ -636,39 +580,6 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
     }
-    dirty_summary *summary = NULL;
-    if (g_blocks_enabled && end > base) {
-        size_t count = (size_t)(((end - 1) >> (g_shift + DIRTY_BLOCK_SHIFT)) - (base >> (g_shift + DIRTY_BLOCK_SHIFT)) + 1);
-        if (count <= (SIZE_MAX - sizeof *summary) / sizeof(dirty_block)) {
-            size_t bytes = sizeof *summary + count * sizeof(dirty_block);
-            if (bytes <= SUMMARY_BYTES_LIMIT - g_summary_bytes) {
-#ifdef S2A_DIRTY_BLOCK_TEST
-                if (!nvn_dirty_block_test_fail_alloc)
-#endif
-                    summary = calloc(1, bytes);
-            }
-            if (summary) {
-                summary->base = base; summary->end = end; summary->count = count;
-                atomic_init(&summary->bad, 0);
-                for (size_t i = 0; i < count; i++) {
-                    atomic_init(&summary->block[i].version, 0);
-                    atomic_init(&summary->block[i].writers, 0);
-                }
-                summary->next = g_all_summaries; g_all_summaries = summary; g_summary_bytes += bytes;
-            }
-        }
-        if (!summary) LOG("【黄】 dirty-page tracking: 分块摘要不可用，保守使用逐页核对");
-        // 相邻池可共享宿主页；缺页回调逐个解除这些范围，中间可能有别的线程写入。
-        // 摘要不能证明重叠范围的发布原子性，涉及的池本会话退回逐页路径。
-        for (int i = 0; i < n; i++) if (i != slot && live_at(i)) {
-            range_t *other = rg(i);
-            if (base < other->end && other->base < end) {
-                dirty_summary *os = atomic_load_explicit(&other->summary, memory_order_acquire);
-                if (os) atomic_store(&os->bad, 1);
-                if (summary) atomic_store(&summary->bad, 1);
-            }
-        }
-    }
     dirty_log *lg = NULL;
     if (g_log_enabled && end > base) {
         size_t cap = np / 16; if (cap < LOG_CAP_MIN) cap = LOG_CAP_MIN; if (cap > LOG_CAP_MAX) cap = LOG_CAP_MAX;
@@ -695,7 +606,6 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
         }
     }
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
-    atomic_store_explicit(&r->summary, summary, memory_order_release);
     atomic_store_explicit(&r->log, lg, memory_order_release);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
@@ -718,26 +628,6 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 }
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
-int nvn_dirty_block_snapshot(const void *span, const void *addr, size_t len, uint64_t *version, uint64_t *epoch) {
-    uintptr_t a = (uintptr_t)addr;
-    if (!span || !len || !version || !epoch || len > UINTPTR_MAX - a) return 0;
-    uint64_t ep = atomic_load_explicit(&g_table_epoch, memory_order_acquire);
-    if ((ep & 1) || atomic_load(&g_track_unreliable)) return 0;
-    range_t *r = (range_t *)span;
-    if (!atomic_load_explicit(&r->live, memory_order_acquire)) return 0;
-    dirty_summary *s = atomic_load_explicit(&r->summary, memory_order_acquire);
-    if (!s || atomic_load(&s->bad) || a < s->base || a + len > s->end) return 0;
-    size_t p = summary_index(s, a), q = summary_index(s, a + len - 1);
-    if (p != q || p >= s->count) return 0;
-    dirty_block *b = &s->block[p];
-    uint64_t v1 = atomic_load(&b->version);
-    if (atomic_load(&b->writers)) return 0;
-    uint64_t v2 = atomic_load(&b->version);
-    if (v1 != v2 || atomic_load(&b->writers) || atomic_load(&s->bad) || atomic_load(&g_track_unreliable) ||
-        atomic_load_explicit(&r->summary, memory_order_acquire) != s ||
-        atomic_load_explicit(&g_table_epoch, memory_order_acquire) != ep) return 0;
-    *version = v2; *epoch = ep; return 1;
-}
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
 void nvn_dirty_protect(const void *addr, size_t len) {
     range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
