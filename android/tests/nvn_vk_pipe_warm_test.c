@@ -26,6 +26,7 @@ static int g_pipe_fail;
 static uint64_t g_fake_hits = 12345;
 
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_warm_max")) { const char *e = getenv("S2A_PW_MAX"); return e && *e ? atoi(e) : dflt; }
     if (!strcmp(name, "nvk_pw_diag")) { const char *e = getenv("S2A_PW_DIAG"); return e && *e ? atoi(e) : dflt; }   // #1372：诊断开关，缺省 0
     return dflt;
@@ -123,6 +124,16 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     g_last_desc = *d;
     if (g_pipe_fail) return (nvn_gpu_rc){NVN_GPU_E_COMPILE};
     *out = (nvn_gpu_pipe)(uintptr_t)0x9001;
+    return (nvn_gpu_rc){NVN_GPU_OK};
+}
+
+static int g_compute_pipe_calls;
+static nvn_gpu_shader g_compute_pipe_shader;
+nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
+    (void)mode; (void)err;
+    if (!cs || !cs->sh || !out) return (nvn_gpu_rc){NVN_GPU_E_ARG};
+    g_compute_pipe_calls++; g_compute_pipe_shader = cs->sh;
+    *out = (nvn_gpu_pipe)(uintptr_t)0x9002;
     return (nvn_gpu_rc){NVN_GPU_OK};
 }
 
@@ -356,6 +367,36 @@ static int mode_dedup(void) {
     nvk_pipe_warm_stats(&st);
     CHECK(st.recorded == 1, "repeat note must not add an entry, got %llu", (unsigned long long)st.recorded);
     CHECK(st.draw_hits == g_fake_hits, "draw_hits must forward the backend counter, got %llu", (unsigned long long)st.draw_hits);
+    return g_fail;
+}
+
+// 计算管线使用同一清单的去重、跨会话排序及借用合同；重建时必须走计算入口。
+static int mode_compute(void) {
+    setenv("S2A_COMPUTE_WARM", "1", 1);
+    prog_setup(0x31); g_prog.is_compute = 1; g_prog.sh[1] = NULL;
+    nvn_gpu_pipe_desc d; memset(&d, 0, sizeof d); d.st[0].sh = g_prog.sh[0];
+    CHECK(nvk_pipe_warm_note_prog(&d, &g_prog, NULL), "compute first note");
+    CHECK(nvk_pipe_warm_note_prog(&d, &g_prog, NULL), "compute second note");
+    nvk_pipe_warm_save();
+    CHECK(nvk_pipe_warm_load() == 1, "compute dedup and persist one recipe");
+    struct nvk_pipe_rec rec; memset(&rec, 0, sizeof rec);
+    CHECK(nvk_pipe_warm_take(&rec) == 1 && rec.uses == 2, "compute take preserves uses");
+    CHECK(nvk_pipe_warm_build(&rec) == 0, "compute prewarm succeeds");
+    CHECK(g_compute_pipe_calls == 1 && g_compute_pipe_shader == g_prog.sh[0] && g_pipe_get_calls == 0,
+          "compute recipe must build a compute pipeline with its borrowed CS");
+    g_prog.is_compute = 0;
+    CHECK(nvk_pipe_warm_build(&rec) == -1 && g_compute_pipe_calls == 1, "compute recipe rejects a graphics program");
+    g_prog.is_compute = 1;
+    rec.desc[1] = 1;
+    CHECK(nvk_pipe_warm_build(&rec) == -1 && g_compute_pipe_calls == 1, "compute recipe rejects malformed bytes");
+    CHECK(g_borrow_n == 0, "compute borrow returned");
+    return g_fail;
+}
+
+static int mode_compute_off(void) {
+    setenv("S2A_COMPUTE_WARM", "0", 1);
+    CHECK(nvk_pipe_warm_load() == 1, "compute off keeps existing manifest");
+    CHECK(nvk_pipe_warm_pending() == 0, "compute off must not schedule saved compute pipe");
     return g_fail;
 }
 
@@ -1179,7 +1220,7 @@ static int mode_diag_save(void) {
     return g_fail;
 }
 
-static const char *k_modes[] = {"fields", "dedup", "collide", "cap", "defcap", "hardcap", "frozen", "lease", "save", "load", "save_race",
+static const char *k_modes[] = {"compute", "compute_off", "fields", "dedup", "collide", "cap", "defcap", "hardcap", "frozen", "lease", "save", "load", "save_race",
                                 "tag_reload", "tag_prog", "tag_twin",
                                 "diag_thrash", "diag_vary", "diag_calm", "diag_evict", "diag_clear", "diag_mt"};
 static const char *k_bad[] = {"magic", "fmt", "descver", "entry", "count", "sum", "trunc", "payload"};
@@ -1239,7 +1280,7 @@ int main(int argc, char **argv) {
     if (argc >= 3 && (!strcmp(argv[1], "tag_old") || !strcmp(argv[1], "tag_new"))) return mode_tag(!strcmp(argv[1], "tag_new"), atoi(argv[2])) ? 1 : 0;
     if (argc >= 2) {
         const char *m = argv[1];
-        int (*fn)(void) = !strcmp(m, "fields") ? mode_fields : !strcmp(m, "dedup") ? mode_dedup :
+        int (*fn)(void) = !strcmp(m, "compute") ? mode_compute : !strcmp(m, "compute_off") ? mode_compute_off : !strcmp(m, "fields") ? mode_fields : !strcmp(m, "dedup") ? mode_dedup :
                           !strcmp(m, "collide") ? mode_collide : !strcmp(m, "cap") ? mode_cap :
                           !strcmp(m, "defcap") ? mode_defcap : !strcmp(m, "hardcap") ? mode_hardcap :
                           !strcmp(m, "frozen") ? mode_frozen : !strcmp(m, "lease") ? mode_lease :

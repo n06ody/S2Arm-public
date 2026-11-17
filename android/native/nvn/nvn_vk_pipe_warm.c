@@ -617,7 +617,7 @@ void nvk_pipe_warm_test_hash_const(int on) { __atomic_store_n(&g_hash_const, on 
 
 // ---- note（提交线程；第一次见到一条管线才走完整路径，之后按管线标签只加计数，见 nvk_pipe_warm_note_prog） ----
 // 完整路径。*tag_out（可为 NULL）= 这份配方在清单里的标签；没收下（没身份 / nspec 非 0 / 分配失败）时给 0。
-static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint64_t *tag_out) {
+static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint64_t *tag_out, int compute) {
     if (tag_out) *tag_out = 0;
     if (!d || !prog_identity) return;
     if (pw_id_zero(prog_identity)) return;   // 没有身份的程序不进清单（失败项 / 还没算出来）
@@ -627,7 +627,8 @@ static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32],
             return;
         }
     uint8_t desc[NVK_PW_DESC_BYTES];
-    pw_desc_write(d, desc);
+    if (compute) { memset(desc, 0, sizeof desc); desc[0] = 0x80; }
+    else pw_desc_write(d, desc);
     uint64_t h = pw_slot_hash(desc, prog_identity);
     pthread_mutex_lock(&g.mu);
     if (pw_init_locked() != 0) { pthread_mutex_unlock(&g.mu); return; }
@@ -667,7 +668,7 @@ static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32],
     if (dgon) pw_dg_out_run(&dgo);   // 解锁之后：打汇总行、抽样的做整表比对
 }
 
-void nvk_pipe_warm_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32]) { pw_note(d, prog_identity, NULL); }
+void nvk_pipe_warm_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32]) { pw_note(d, prog_identity, NULL, 0); }
 
 // 标签快路径：标签里的槽还占着、槽代号没变（= 还是当初记下的那份配方），并且槽里那份配方的程序身份就是这次
 // 传进来的程序，才只 uses++ / 刷新最近序号——与完整路径命中已有条目时做的事相同，只是不序列化配方、不散列、
@@ -689,7 +690,7 @@ static int pw_touch_tag(uint64_t tag, const uint8_t ident[32]) {
 
 int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p, nvn_gpu_pipe np) {
     uint8_t ident[32];
-    if (!d || !p) return 0;
+    if (!d || !p || (p->is_compute && !nvn_plat_flag("nvk_compute_warm", 0))) return 0;
     if (!rp_shader_prog_identity(p, ident)) return 0;   // 只读 32 字节，不加锁
     if (pw_id_zero(ident)) return 0;
     if (np && nvn_gpu_pipe_warm_tag) {
@@ -697,7 +698,7 @@ int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p,
         if (t && pw_touch_tag(t, ident)) return 1;
     }
     uint64_t tag = 0;
-    pw_note(d, ident, &tag);
+    pw_note(d, ident, &tag, p->is_compute != 0);
     if (np && tag && nvn_gpu_pipe_warm_tag_set) nvn_gpu_pipe_warm_tag_set(np, tag);
     return 1;
 }
@@ -754,6 +755,33 @@ int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
         return -1;
     }
     int rc = -1;
+    const int compute = rec->desc[0] == 0x80;
+    if (compute) {
+        uint8_t extra = 0; for (size_t i = 1; i < NVK_PW_DESC_BYTES; i++) extra |= rec->desc[i];
+        if (extra || !prog->is_compute || !prog->sh[0]) {
+            __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
+            pw_log(1, "管线预热：计算配方与程序不匹配，整条跳过");
+            goto out;
+        }
+        nvn_gpu_stage_desc cs = {0}; cs.sh = prog->sh[0];
+        nvn_gpu_pipe pipe = NULL; nvn_gpu_err err = {0};
+        if (nvn_gpu_pipe_warm_scope) nvn_gpu_pipe_warm_scope(1);
+        nvn_gpu_rc r = nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &pipe, &err);
+        if (nvn_gpu_pipe_warm_scope) nvn_gpu_pipe_warm_scope(0);
+        if (!nvn_gpu_ok(r) || !pipe) {
+            __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
+            pw_log(1, "计算管线预热失败（%d）：%s", (int)r.code, err.why);
+            goto out;
+        }
+        __atomic_fetch_add(&g.st.built, 1, __ATOMIC_RELAXED);
+        rc = 0;
+        goto out;
+    }
+    if (prog->is_compute) {
+        __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
+        pw_log(1, "管线预热：图形配方对应计算程序，整条跳过");
+        goto out;
+    }
     nvn_gpu_pipe_desc pd;
     if (!pw_desc_read(rec->desc, rec->bytes, &pd)) {
         __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
@@ -948,7 +976,7 @@ int nvk_pipe_warm_load(void) {
     free(g.plan); g.plan = NULL; g.plan_n = g.plan_i = 0;
     if (cnt) {
         g.plan = (struct nvk_pipe_rec *)malloc((size_t)cnt * sizeof *g.plan);
-        if (g.plan) { for (uint32_t i = 0; i < cnt; i++) g.plan[i] = g.recs[i]; g.plan_n = cnt; }
+        if (g.plan) { int cs = nvn_plat_flag("nvk_compute_warm", 0); for (uint32_t i = 0; i < cnt; i++) if (cs || g.recs[i].desc[0] != 0x80) g.plan[g.plan_n++] = g.recs[i]; }
         else pw_log(1, "【红】管线预热清单：本局预热集快照分配失败（本局不预热，清单照常记录）");
     }
     g.clock = cnt;

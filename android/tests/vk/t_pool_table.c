@@ -151,11 +151,18 @@ int main(int argc, char **argv) {
             // Samplers do not count against maxPerStageResources (Vulkan limits).
             uint32_t saved = g_dev.properties.limits.maxPerStageResources;
             g_dev.properties.limits.maxPerStageResources = 66;
-            nvn_gpu_stage_desc over_cs = {0}; over_cs.sh = sh; nvn_gpu_pipe over_pipe = NULL;
-            memset(&err, 0, sizeof err);
-            nvn_gpu_rc over_rc = nvn_gpu_cpipe_get(&over_cs, NVN_GPU_PIPE_SYNC, &over_pipe, &err);
-            CHECK(over_rc.code == NVN_GPU_E_UNSUPPORTED && !over_pipe && strstr(err.why, "maxPerStageResources"),
-                  "pipeline aggregate resources must reject before Vulkan pipeline creation: rc=%d %s", over_rc.code, err.why);
+            // Use a fresh shader identity: the already-built pipe is valid in the real device's immutable
+            // limits and is now cached; this synthetic lower limit must exercise an actual new build.
+            nvn_gpu_shader over_sh = load_one_shader(argv[1], "pool_table.comp", NVN_GPU_SH_CS, &layout);
+            CHECK(over_sh != NULL, "pipeline aggregate resources fresh shader");
+            if (over_sh) {
+                nvn_gpu_stage_desc over_cs = {0}; over_cs.sh = over_sh; nvn_gpu_pipe over_pipe = NULL;
+                memset(&err, 0, sizeof err);
+                nvn_gpu_rc over_rc = nvn_gpu_cpipe_get(&over_cs, NVN_GPU_PIPE_SYNC, &over_pipe, &err);
+                CHECK(over_rc.code == NVN_GPU_E_UNSUPPORTED && !over_pipe && strstr(err.why, "maxPerStageResources"),
+                      "pipeline aggregate resources must reject before Vulkan pipeline creation: rc=%d %s", over_rc.code, err.why);
+                nvn_gpu_shader_release(over_sh);
+            }
             nvn_gpu_cmd probe = begin_cmd(); nvn_gpu_set_pipe(probe, pipe);
             memset(&err, 0, sizeof err);
             nvn_gpu_rc limit_rc = nvn_gpu_pool_bind(probe, NVN_GPU_SH_CS, 0, image_table, &err);

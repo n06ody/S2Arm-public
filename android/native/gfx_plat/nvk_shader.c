@@ -1105,6 +1105,8 @@ static void warm_diag(const char *fmt, ...) {
     va_end(ap);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", b);
 }
+static struct entry *build_compute(const uint8_t *, size_t, const struct s2a_source_entry_view *, const uint8_t[32]);
+
 static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
     struct s2a_direct_compile_context pc;
@@ -1134,13 +1136,15 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         have_res = 1;
     }
     // 出包预编库：清单记着每阶段键，预热带直接按键取（新装的游戏第一局没有跨局缓存，靠的就是这一份）
+    const int compute = rec->stage_mask == 32u;
     struct s2a_source_entry_view views[3];
     memset(views, 0, sizeof views);
     for (int st = 0; st < nst && st < 3; st++)
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = NVK_PROG_REC_C1_BYTES; }
-    if (!bytes && libpack_fetch(rec->identity, (const uint8_t (*)[8])rec->keys, nst, NULL, rec->lp_ok == 2, &pc, &bytes, &len)) {
-        struct entry *le = build(bytes, len, views, nst, rec->identity);
-        if (le) le->prog.z_raw = 1;
+    if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
+                                compute ? 0 : nst, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, &pc, &bytes, &len)) {
+        struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity) : build(bytes, len, views, nst, rec->identity);
+        if (le && !compute) le->prog.z_raw = 1;
         free(bytes); bytes = NULL; len = 0;
         if (le && !le->failed) { libpack_note_hit(); return le; }
         if (le) entry_free(le);
@@ -1156,15 +1160,15 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         return NULL;
     }
     // c1 随清单落盘（开局 source_store 是空的）：views 在上面按清单填好、传给 build()，逐位与真实解析一致。
-    struct entry *e = build(bytes, len, views, nst, rec->identity);
-    if (e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, nst);
+    struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity) : build(bytes, len, views, nst, rec->identity);
+    if (!compute && e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, nst);
     // 结果合并命中时前台要把事实复用（#1187）登记到这份程序上，登记要用「编译器实际读了哪些绑定事实」的掩码：
     // 前台自己建的（work_run）本来就算好了，预热带建的也要算（纯函数，后台线程能算）。关着开关时保持原样不算。
-    if (e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);
+    if (!compute && e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);
     free(bytes);
     return e;
 }
-static int stage_nst(uint32_t mask) { return mask == 7u ? 3 : mask == 3u ? 2 : mask == 1u ? 1 : 0; }
+static int stage_nst(uint32_t mask) { return mask == 32u ? 1 : mask == 7u ? 3 : mask == 3u ? 2 : mask == 1u ? 1 : 0; }
 
 // 快路径：输入跟上一次取程序时一样，就还是那个程序。下面的摘要盖住 fill_facts 与身份用到的全部回放状态
 // （游戏每笔绘制前都会重绑贴图 / 缓冲，绑的东西对编译来说通常没变；不走快路径时每笔要重填事实、编码身份、算一次 SHA-256）。
@@ -1612,7 +1616,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     if (!e) return NULL;
     e->prog.is_compute = 1;
     memcpy(e->prog.identity, identity, 32);
-    static struct nvn_vk_compute_program cp; char why[192] = "";
+    static _Thread_local struct nvn_vk_compute_program cp; char why[192] = "";
     memset(&cp, 0, sizeof cp);
     int parsed = nvn_vk_program_parse_compute(bytes, len, &cp, why, sizeof why);
     if (parsed) {
@@ -1686,6 +1690,21 @@ static uint64_t compute_input_sig(const struct s2a_direct_compile_context *pc) {
     return h;
 }
 static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp);
+// 记录实际计算程序；按与 libpack 同一口径保留存储缓冲对齐事实。
+static void compute_warm_note(const struct rp_prog *p, const struct s2a_direct_compile_context *pc) {
+    if (!nvn_plat_flag("nvk_compute_warm", 0)) return;
+    struct nvk_prog_rec rec = {0};
+    memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;
+    memcpy(rec.keys[0], rp_S.skey[5], 8);
+    rec.c1_ok = p->c1_ok & 1;
+    if (rec.c1_ok) memcpy(rec.c1[0], p->c1[0], NVK_PROG_REC_C1_BYTES);
+    int unaligned = 0;
+    for (int i = 0; i < 16; i++)
+        if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment &&
+            rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) unaligned = 1;
+    rec.lp_ok = unaligned ? 0 : 2;
+    nvk_prog_warm_note(&rec);
+}
 static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在内层；外层 rp_shader_resolve_compute 做停局准入登记（#907）
     *out = NULL;
     if (!(rp_S.skey_ok >> 5 & 1)) { nvn_unimpl("shader", "compute_stage_key_missing", NULL); return -1; }
@@ -1700,6 +1719,7 @@ static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在�
     struct last_ent *le = fast ? last_find(key, pc.session, pc.generation) : NULL;
     if (le) {   // 不清任何状态：调用方只用 *out
         *out = le->prog;
+        compute_warm_note(*out, &pc);
         if (check) { const struct rp_prog *chk = NULL; int rc = resolve_compute_slow(&chk, &pc); if (rc || chk != le->prog) red1("resolve_fast_path_mismatch", "快路径给的程序与慢路径不一致"); }
         g_cs_hits++;
         if (logging) { g_cs_hit_ns += now_ns() - t0; if (!((g_cs_hits + g_cs_misses) & 255)) cs_cache_log(); }
@@ -1707,6 +1727,7 @@ static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在�
     }
     int rc = resolve_compute_slow(out, &pc);
     if (!rc && fast) last_put(key, pc.session, pc.generation, *out);
+    if (!rc && *out) compute_warm_note(*out, &pc);
     g_cs_misses++;
     if (logging) { g_cs_miss_ns += now_ns() - t0; if (!((g_cs_hits + g_cs_misses) & 255)) cs_cache_log(); }
     return rc;
@@ -1997,7 +2018,7 @@ int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
     int nst = stage_nst(rec->stage_mask);
     if (!nst) { warm_diag("程序预热：阶段掩码 %#x 不是 VS/FS/GS 组合，整条跳过", (unsigned)rec->stage_mask); nvk_prog_warm_stat_build(-1); return -1; }
     if (shader_stopped()) { warm_diag("程序预热：会话已置停局位，预热停止发布"); nvk_prog_warm_stat_build(-1); return -1; }   // 发布前校验：停局后不再建对象
-    if (alias_on()) {   // 结果合并：结果已常驻且比对键一致，登记成别名即可（不读负载、不建后端）
+    if (rec->stage_mask != 32u && alias_on()) {   // 结果合并目前只覆盖图形程序
         struct alias_key ak; memset(&ak, 0, sizeof ak);
         ak.nst = nst; ak.c1_ok = (uint8_t)(rec->c1_ok & (uint8_t)((1u << nst) - 1u));
         for (int st = 0; st < nst; st++) ak.c1[st] = rec->c1[st];

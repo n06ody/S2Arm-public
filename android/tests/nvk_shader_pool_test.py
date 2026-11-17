@@ -54,11 +54,46 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source, extra_libs=None, args=()):
+    def run(name, source, extra_libs=None, args=(), env=None):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
-        return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30)
+        return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
+
+    if sys.argv[1:] == ['--compute-warm-mutants']:
+        text = original.read_text()
+        mutants = [
+            ('no-record', '    rec.lp_ok = unaligned ? 0 : 2;\n    nvk_prog_warm_note(&rec);',
+             '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
+            ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
+             'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
+            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity) : build(bytes, len, views, nst, rec->identity);',
+             'struct entry *e = build(bytes, len, views, nst, rec->identity);', '--compute-warm', 'compute program warm builds from prior cache'),
+            ('flag-ignored', 'if (!nvn_plat_flag("nvk_compute_warm", 0)) return;',
+             '(void)nvn_plat_flag("nvk_compute_warm", 0);', '--compute-warm-off', 'compute warm off must not record programs'),
+        ]
+        for name, old, new, mode, expected in mutants:
+            assert text.count(old) == 1, (name, 'mutation anchor')
+            path = out / ('cs-warm-mutant-' + name + '.c')
+            path.write_text(text.replace(old, new))
+            with tempfile.TemporaryDirectory(prefix='cs-warm-mutant-', dir=out) as td:
+                manifest = Path(td) / 'manifest'; manifest.mkdir()
+                cache = Path(td) / 'cache'; cache.mkdir()
+                env = dict(os.environ, S2A_COMPUTE_WARM='1', S2A_PW_TEST_DIR=str(manifest), S2A_DIRECT_CACHE_DIR=str(cache))
+                if mode == '--compute-warm-off':
+                    baseline = run('cs-warm-prepare', original, args=('--compute-warm',), env=env)
+                    assert baseline.returncode == 0, (name, baseline.stdout, baseline.stderr)
+                    env['S2A_COMPUTE_WARM'] = '0'
+                result = run('cs-warm-' + name, path, args=(mode,), env=env)
+                assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
+                print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print(f'PASS: {len(mutants)} compute warm negative controls')
+        return 0
+
+    if sys.argv[1:] in (['--compute-warm'], ['--compute-warm-off']):
+        result = run('compute-warm', original, args=(sys.argv[1],))
+        sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
 
     if len(sys.argv) in (3, 4) and sys.argv[1] == '--tbuf-layout':
         exe = out/'tbuf-layout'
@@ -234,7 +269,7 @@ def main():
             ('alias-fact-registration-omitted', 'if (reusable && ae->fact_ok) fact_cache_keep_mask(&id, fact_base, ae->fact_mask, &ae->prog);',
              '(void)ae->fact_mask;', 1, 'reuses the program (no live compile'),
             # 预热线程建的那份也要算事实掩码：撤掉后，合并命中它的前台身份登记不上事实复用（真机现编 3 → 198 次的另一半）
-            ('alias-bg-fact-mask-omitted', 'if (e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);',
+            ('alias-bg-fact-mask-omitted', 'if (!compute && e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);',
              '(void)0;', 1, 'alias fact-bg[on] s2: identity differing only in an unread texture fact reuses the program'),
             # 开关关闭态（--alias-off 另起进程）：开关读了不用，关闭态下 B 就会被合并，「B 读自己的文件」必须变红
             ('alias-flag-ignored', 'if (v < 0) v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0; return v;',
@@ -298,7 +333,17 @@ def main():
     off = run('test-alias-off', original, args=('--alias-off',))
     sys.stdout.write(off.stdout)
     sys.stderr.write(off.stderr)
-    return result.returncode or off.returncode
+    with tempfile.TemporaryDirectory(prefix='compute-warm-', dir=out) as td:
+        warm_dir = Path(td) / 'manifest'; warm_dir.mkdir()
+        cache_on = Path(td) / 'cache-on'; cache_on.mkdir()
+        cache_off = Path(td) / 'cache-off'; cache_off.mkdir()
+        env = dict(os.environ, S2A_COMPUTE_WARM='1', S2A_PW_TEST_DIR=str(warm_dir), S2A_DIRECT_CACHE_DIR=str(cache_on))
+        on = run('test-compute-warm', original, args=('--compute-warm',), env=env)
+        sys.stdout.write(on.stdout); sys.stderr.write(on.stderr)
+        env.update(S2A_COMPUTE_WARM='0', S2A_DIRECT_CACHE_DIR=str(cache_off))
+        cs_off = run('test-compute-warm-off', original, args=('--compute-warm-off',), env=env)
+        sys.stdout.write(cs_off.stdout); sys.stderr.write(cs_off.stderr)
+    return result.returncode or off.returncode or on.returncode or cs_off.returncode
 
 if __name__ == '__main__':
     raise SystemExit(main())

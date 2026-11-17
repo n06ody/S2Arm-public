@@ -94,6 +94,7 @@ static int identity_zero(const uint8_t id[32]) {
 }
 // 新层只产生这三种图形阶段掩码（rp_shader_graphics_stages：VS / VS+FS / VS+FS+GS）。
 static int stage_count(uint32_t mask) {
+    if (mask == 32u) return 1;   // CS（清单中独占掩码，不与 VS 1 混）
     if (mask == 1u) return 1;
     if (mask == 3u) return 2;
     if (mask == 7u) return 3;
@@ -282,7 +283,7 @@ int nvk_prog_warm_load(void) {
     free(g.plan); g.plan = NULL; g.plan_n = g.plan_i = 0;
     if (g.n) {
         g.plan = (struct nvk_prog_rec *)malloc((size_t)g.n * sizeof *g.plan);
-        if (g.plan) { for (uint32_t i = 0; i < g.n; i++) g.plan[i] = g.v[i].rec; g.plan_n = g.n; }
+        if (g.plan) { int cs = nvn_plat_flag("nvk_compute_warm", 0); for (uint32_t i = 0; i < g.n; i++) if (cs || g.v[i].rec.stage_mask != 32u) g.plan[g.plan_n++] = g.v[i].rec; }
         else nvn_plat_log(NVN_PLAT_LOG_RED, "warm", "【红】程序清单：本局预热集快照分配失败（本局不预热，清单照常记录）");
     }
     g.st.loaded = g.n;

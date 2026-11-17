@@ -57,8 +57,9 @@ static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
-const char *nvn_plat_dir(int which) { (void)which; return NULL; }
+const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
     return dflt;
@@ -916,7 +917,53 @@ static void graphics_active_ubo_test(void) {
     rp_shader_reset(); rp_state_reset();
 }
 
+// 真实计算解析 → 跨局缓存 → 下一局后台预热发布；不让第二局依赖再次现场编译。
+static int compute_warm_test(void) {
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    source(); bind_pools(7); fake_cs_success = 1; compiler_calls = cs_loads = 0;
+    const struct rp_prog *first = NULL, *pre = NULL, *again = NULL;
+    CHECK(!rp_shader_resolve_compute(&first) && first && first->is_compute && compiler_calls == 1,
+          "compute warm first session resolves and compiles");
+    if (!first) return 1;
+    uint8_t identity[32]; memcpy(identity, first->identity, 32);
+    struct nvk_prog_warm_stats st; nvk_prog_warm_stats(&st);
+    CHECK(st.recorded == 1, "compute program must be recorded in warm manifest");
+    nvk_prog_warm_save();
+    CHECK(s2a_program_cache_drain(5000) == 0, "compute cache write drains");
+    rp_shader_reset(); compiler_calls = cs_loads = 0;
+    CHECK(nvk_prog_warm_load() == 1, "compute program manifest survives session reset");
+    struct nvk_prog_rec rec = {0};
+    CHECK(nvk_prog_warm_take(&rec) == 1 && rec.stage_mask == 32 && rec.uses == 1 &&
+          !memcmp(rec.identity, identity, 32) && !memcmp(rec.keys[0], rp_S.skey[5], 8) && rec.lp_ok == 2,
+          "persisted compute manifest retains identity, CS key, use and aligned libpack fact");
+    CHECK(nvk_prog_warm_build(&rec) == 0, "compute program warm builds from prior cache");
+    CHECK(rp_shader_prog_borrow(rec.identity, &pre) == 1 && pre && pre->is_compute && pre->sh[0],
+          "compute warm publishes borrowable CS");
+    if (pre) rp_shader_prog_return(rec.identity);
+    CHECK(!rp_shader_resolve_compute(&again) && again == pre && compiler_calls == 0 && cs_loads == 1,
+          "compute resolve reuses prewarmed program without compiling or reloading");
+    rp_shader_reset();
+    printf("compute warm: %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+static int compute_warm_off_test(void) {
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    source(); bind_pools(7); fake_cs_success = 1; compiler_calls = 0;
+    CHECK(nvk_prog_warm_load() == 1 && nvk_prog_warm_pending() == 0,
+          "compute off retains prior manifest without scheduling CS prewarm");
+    const struct rp_prog *p = NULL;
+    CHECK(!rp_shader_resolve_compute(&p) && p && compiler_calls == 1, "compute off still resolves");
+    struct nvk_prog_warm_stats st; nvk_prog_warm_stats(&st);
+    CHECK(st.recorded == 0, "compute warm off must not record programs");
+    rp_shader_reset();
+    printf("compute warm off: %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
+    if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
     if (argc == 2 && !strcmp(argv[1], "--legacy-bytes")) {
         // A baseline-vs-change comparison of the actual legacy REQUEST and canonical bytes.
         unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR");

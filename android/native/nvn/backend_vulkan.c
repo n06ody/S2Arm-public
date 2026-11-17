@@ -154,6 +154,8 @@ struct nvn_gpu_pipe_s {
     uint8_t warm;          // 1 = 这份对象是预热带 / 预热线程建的，真实 draw 第一次命中时计数（见 nvn_gpu_pipe_get）
     uint64_t warm_tag;     // 管线预热清单的标签（槽号 + 槽代号，见 nvn_vk_pipe_warm.h）；0 = 没设过。原子读写，随对象销毁
     struct nvn_gpu_pipe_s *all_next;
+    nvn_gpu_shader cshader;
+    struct nvn_gpu_pipe_s *cnext;
     struct nvn_gpu_pipe_s *hnext;   // 图形管线的散列桶链（g_pipe_ht）
     uint32_t hash;                  // 建管线时的 pipe_hash(描述)：查表先比它、相同才逐字段比（不碰 key 那一大块内存）；重排桶也用它
 };
@@ -423,6 +425,8 @@ static uint64_t g_pl_ns, g_pl_n, g_pl_steps, g_pl_cmp;   // 取图形管线：�
 // 原先桶数固定 PIPE_HT_N = 1024：世界场景里管线数是它的好几倍，真机读数「取管线查找」每次比 7.3 条（每条一次缓存未命中，0.83 微秒 / 次、每帧 487 次，#1130）。
 static struct nvn_gpu_pipe_s **g_pipe_ht;
 static uint32_t g_pipe_ht_n, g_pipe_cnt;
+#define CPIPE_BUCKETS 1024u
+static struct nvn_gpu_pipe_s *g_cpipe_ht[CPIPE_BUCKETS];
 // ---- 驱动管线缓存（#822）：后端建的每条管线都带同一个 VkPipelineCache；会话收尾把驱动给的数据写进 open_desc.cache_dir，
 // 下一局开会话时读回来喂给驱动。真机每局起局二十多秒的同步建管线（每条二三十毫秒）是驱动每次从头编，带上缓存后重开一局按内容命中。
 // 契约（nvn_backend.h open_desc.cache_dir）：NULL = 不落盘；后端有界维护、收尾时写、不逐帧写盘。文件层是旧回放用的 nvn_vk_driver_cache
@@ -2226,6 +2230,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     struct nvn_gpu_pipe_s *p = g.pipes;
     g.pipes = NULL;
     free(g_pipe_ht); g_pipe_ht = NULL; g_pipe_ht_n = 0; g_pipe_cnt = 0;
+    memset(g_cpipe_ht, 0, sizeof g_cpipe_ht);
     while (p) {
         struct nvn_gpu_pipe_s *pn = p->all_next;
         destroy_pipe_objects(p);
@@ -3947,7 +3952,7 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     return rc(NVN_GPU_OK);
 }
 
-nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
+static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
     (void)mode;
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
@@ -4059,13 +4064,77 @@ nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pip
             memcpy(p->stage_tfmt[NVN_GPU_SH_CS], sh->tfmt, (size_t)sh->nent * sizeof *sh->tfmt);
         }
     }
-    pthread_mutex_lock(&g_mu);
-    sh->refs++;
-    p->all_next = g.pipes;
-    g.pipes = p;
-    pthread_mutex_unlock(&g_mu);
     *out = p;
     return rc(NVN_GPU_OK);
+}
+
+// 计算管线只以 CS 身份为键（本路径尚不支持特化）。同键在途合并；完成后双检并安装。
+static nvk_pf g_cpi;
+static pthread_once_t g_cpi_once = PTHREAD_ONCE_INIT;
+static void cpi_init(void) { nvk_pf_init(&g_cpi, sizeof(nvn_gpu_shader)); }
+uint64_t nvn_vk_dbg_cpipe_waits(void) { uint64_t n = 0; pthread_once(&g_cpi_once, cpi_init); nvk_pf_stats(&g_cpi, &n, NULL, NULL, NULL, NULL); return n; }
+static int cpi_eq(const void *a, const void *b) { nvn_gpu_shader x, y; memcpy(&x, a, sizeof x); memcpy(&y, b, sizeof y); return x == y; }
+static uint32_t cpipe_bucket(nvn_gpu_shader sh) { return (uint32_t)(((uintptr_t)sh >> 4) & (CPIPE_BUCKETS - 1)); }
+static struct nvn_gpu_pipe_s *cpipe_find_locked(nvn_gpu_shader sh) {
+    for (struct nvn_gpu_pipe_s *p = g_cpipe_ht[cpipe_bucket(sh)]; p; p = p->cnext)
+        if (p->cshader == sh) return p;
+    return NULL;
+}
+nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
+    if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
+    *out = NULL;
+    if (!cs || !cs->sh) return fail(err, NVN_GPU_E_ARG, "计算阶段为空");
+    if (cs->nspec) return fail(err, NVN_GPU_E_UNSUPPORTED, "计算特化常量尚未实现");
+    if (!nvn_plat_flag("nvk_compute_warm", 0)) {
+        nvn_gpu_pipe p = NULL; nvn_gpu_rc r = cpipe_build(cs, mode, &p, err);
+        if (!nvn_gpu_ok(r)) return r;
+        pthread_mutex_lock(&g_mu); cs->sh->refs++; p->all_next = g.pipes; g.pipes = p; pthread_mutex_unlock(&g_mu);
+        *out = p; return r;
+    }
+    pthread_mutex_lock(&g_mu);
+    struct nvn_gpu_pipe_s *hit = cpipe_find_locked(cs->sh);
+    if (hit) pipe_hit_note_locked(hit);
+    pthread_mutex_unlock(&g_mu);
+    if (hit) { *out = hit; return rc(NVN_GPU_OK); }
+    pthread_once(&g_cpi_once, cpi_init);
+    int handle = -1, role = nvk_pf_enter(&g_cpi, &cs->sh, cpi_eq, &handle);
+    if (role == 2) {
+        void *got = NULL; char why[NVK_PF_WHY];
+        int code = nvk_pf_wait(&g_cpi, handle, &got, why, sizeof why);
+        if (code) { if (err) { err->rc = rc(code); memcpy(err->why, why, sizeof err->why); } return rc(code); }
+        if (got) { pthread_mutex_lock(&g_mu); pipe_hit_note_locked(got); pthread_mutex_unlock(&g_mu); }
+        *out = got; return rc(NVN_GPU_OK);
+    }
+    int own = role == 1;
+    pthread_mutex_lock(&g_mu); hit = cpipe_find_locked(cs->sh);
+    if (hit) pipe_hit_note_locked(hit);
+    pthread_mutex_unlock(&g_mu);
+    if (hit) {
+        if (own) { nvk_pf_note_late_hit(&g_cpi); nvk_pf_publish(&g_cpi, handle, hit, 0, NULL); }
+        *out = hit; return rc(NVN_GPU_OK);
+    }
+    nvn_gpu_pipe fresh = NULL;
+    nvn_gpu_rc built = cpipe_build(cs, mode, &fresh, err);
+    if (!nvn_gpu_ok(built)) {
+        if (own) nvk_pf_publish(&g_cpi, handle, NULL, built.code, err ? err->why : NULL);
+        return built;
+    }
+    pthread_mutex_lock(&g_mu);
+    hit = cpipe_find_locked(cs->sh);
+    if (!hit) {
+        hit = fresh; hit->cshader = cs->sh; cs->sh->refs++;
+        hit->all_next = g.pipes; g.pipes = hit;
+        uint32_t b = cpipe_bucket(cs->sh); hit->cnext = g_cpipe_ht[b]; g_cpipe_ht[b] = hit;
+        if (t_warm_scope) { hit->warm = 1; __atomic_fetch_add(&g_warm_created, 1, __ATOMIC_RELAXED); }
+    } else {
+        pipe_hit_note_locked(hit);
+        destroy_pipe_objects(fresh);
+        __atomic_fetch_add(&g_pipe_dup, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (own) nvk_pf_publish(&g_cpi, handle, hit, 0, NULL);
+    *out = hit; return rc(NVN_GPU_OK);
 }
 
 // EXTENDED_USAGE 建的图：视图默认继承整张图的用途，sRGB 的采样 / 附件视图带着存储用途会被拒（格式不支持存储），
@@ -7668,7 +7737,8 @@ void nvn_gpu_vk_test_close_pipe_only(void) {
     g_open = 0;   // 之后 nvn_gpu_pipe_get / nvn_gpu_shader_load 入口按「会话关闭」拒收
     struct nvn_gpu_pipe_s *p = g.pipes;
     g.pipes = NULL;
-    memset(g_pipe_ht, 0, sizeof g_pipe_ht);
+    if (g_pipe_ht) memset(g_pipe_ht, 0, g_pipe_ht_n * sizeof *g_pipe_ht);
+    memset(g_cpipe_ht, 0, sizeof g_cpipe_ht);
     struct nvn_gpu_shader_s *sh = g.shaders;
     g.shaders = NULL;
     pthread_mutex_unlock(&g_mu);

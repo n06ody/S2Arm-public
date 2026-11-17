@@ -30,6 +30,7 @@
 #include "vk_device.h"
 #include "spirv_storage.h"   // s2a_spirv_declares_cap（C1340）
 #include "nvn_plat_vk.h"
+#include "nvn_vk_pipe_warm.h"
 
 // 平台件替身：无头表面（lavapipe 没有窗口系统）。交换链、取图、呈现段、信号量与布局都是真的，校验层照查。
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n) {
@@ -52,6 +53,7 @@ static int g_memo_dflt_seen = -1;   // 没设环境变量时后端传给 nvn_pla
 static int g_shown_timing_test;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
+static int g_compute_warm = -1;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
@@ -64,6 +66,7 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
         if (g_dsetrec_flag >= 0) return g_dsetrec_flag;
@@ -206,7 +209,16 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateGraphicsPipelines(VkDevice device,
     return __real_vkCreateGraphicsPipelines(device, cache, n, ci, a, out);
 }
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateComputePipelines(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo *, const VkAllocationCallbacks *, VkPipeline *);
+static pthread_mutex_t g_cs_gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cs_gate_cv = PTHREAD_COND_INITIALIZER;
+static int g_cs_gate_on, g_cs_gate_entered, g_cs_gate_release;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+    pthread_mutex_lock(&g_cs_gate_mu);
+    if (g_cs_gate_on) {
+        g_cs_gate_entered = 1; pthread_cond_broadcast(&g_cs_gate_cv);
+        while (!g_cs_gate_release) pthread_cond_wait(&g_cs_gate_cv, &g_cs_gate_mu);
+    }
+    pthread_mutex_unlock(&g_cs_gate_mu);
     __atomic_fetch_add(&g_plc_rec.cp, n, __ATOMIC_RELAXED);
     if (cache != VK_NULL_HANDLE && cache == g_plc_rec.last_cache) __atomic_fetch_add(&g_plc_rec.cp_cached, n, __ATOMIC_RELAXED);
     return __real_vkCreateComputePipelines(device, cache, n, ci, a, out);
@@ -3666,6 +3678,15 @@ static void c54_3d(const char *dir) {
 }
 
 
+extern uint64_t nvn_vk_dbg_cpipe_waits(void);
+struct cs_worker { nvn_gpu_stage_desc cs; nvn_gpu_pipe pipe; nvn_gpu_rc result; nvn_gpu_err err; int warm; };
+static void *cs_worker_run(void *arg) {
+    struct cs_worker *w = arg;
+    if (w->warm) nvn_gpu_pipe_warm_scope(1);
+    w->result = nvn_gpu_cpipe_get(&w->cs, NVN_GPU_PIPE_SYNC, &w->pipe, &w->err);
+    if (w->warm) nvn_gpu_pipe_warm_scope(0);
+    return NULL;
+}
 static void c55_compute(const char *dir) {
     char path[512]; size_t csz = 0;
     snprintf(path, sizeof path, "%s/comp.comp.spv", dir);
@@ -3680,8 +3701,47 @@ static void c55_compute(const char *dir) {
     nvn_gpu_shader sh = NULL; nvn_gpu_err e;
     CHECK(OK(nvn_gpu_shader_load(&src, &sh, &e)), "C55 shader：%d %s", e.rc.code, e.why);
     nvn_gpu_stage_desc cs; memset(&cs, 0, sizeof cs); cs.sh = sh;
-    nvn_gpu_pipe cp = NULL;
-    CHECK(OK(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cp, &e)), "C55 cpipe：%d %s", e.rc.code, e.why);
+    nvn_gpu_stage_desc cs_spec = cs; cs_spec.nspec = 1; nvn_gpu_pipe unsupported = NULL;
+    CHECK(nvn_gpu_cpipe_get(&cs_spec, NVN_GPU_PIPE_SYNC, &unsupported, &e).code == NVN_GPU_E_UNSUPPORTED && !unsupported,
+          "C55 未实现的计算特化必须报错");
+    nvn_gpu_pipe cp = NULL, cold1 = NULL, cold2 = NULL;
+    g_compute_warm = -1;
+    CHECK(OK(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cold1, &e)) &&
+          OK(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cold2, &e)) && cold1 && cold2 && cold1 != cold2,
+          "C55 开关缺省关闭时沿用原来的不缓存路径");
+    g_compute_warm = 1;
+    uint64_t warm_hits_before = nvn_gpu_pipe_warm_hits(), waits_before = nvn_vk_dbg_cpipe_waits();
+    unsigned creates_before = __atomic_load_n(&g_plc_rec.cp, __ATOMIC_RELAXED);
+    struct cs_worker wa = {.cs=cs, .warm=1}, wb = {.cs=cs};
+    pthread_t ta, tb;
+    pthread_mutex_lock(&g_cs_gate_mu); g_cs_gate_on = 1; g_cs_gate_entered = g_cs_gate_release = 0; pthread_mutex_unlock(&g_cs_gate_mu);
+    int ar = pthread_create(&ta, NULL, cs_worker_run, &wa);
+    CHECK(ar == 0, "C55 预热线程启动");
+    int entered = 0;
+    if (!ar) {
+        struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline); deadline.tv_sec += 5;
+        pthread_mutex_lock(&g_cs_gate_mu);
+        while (!g_cs_gate_entered) if (pthread_cond_timedwait(&g_cs_gate_cv, &g_cs_gate_mu, &deadline) == ETIMEDOUT) break;
+        entered = g_cs_gate_entered; pthread_mutex_unlock(&g_cs_gate_mu);
+    }
+    CHECK(entered, "C55 预建到达真实驱动入口");
+    int br = entered ? pthread_create(&tb, NULL, cs_worker_run, &wb) : -1;
+    CHECK(br == 0, "C55 提交线程启动");
+    if (!br) {
+        struct timespec pause = {0, 1000000};
+        for (int i = 0; i < 2000 && nvn_vk_dbg_cpipe_waits() == waits_before; i++) nanosleep(&pause, NULL);
+        CHECK(nvn_vk_dbg_cpipe_waits() > waits_before, "C55 同一 CS 必须等待在途预建");
+    }
+    pthread_mutex_lock(&g_cs_gate_mu); g_cs_gate_release = 1; g_cs_gate_on = 0; pthread_cond_broadcast(&g_cs_gate_cv); pthread_mutex_unlock(&g_cs_gate_mu);
+    if (!ar) pthread_join(ta, NULL);
+    if (!br) pthread_join(tb, NULL);
+    CHECK(!ar && !br && OK(wa.result) && OK(wb.result), "C55 并发取计算管线成功");
+    CHECK(__atomic_load_n(&g_plc_rec.cp, __ATOMIC_RELAXED) == creates_before + 1, "C55 同配方只调用一次 Vulkan 计算管线创建");
+    cp = wa.pipe; nvn_gpu_pipe cp_used = wb.pipe;
+    CHECK(cp && cp_used == cp, "C55 预建的计算管线必须由真实派发复用");
+    CHECK(nvn_gpu_pipe_warm_hits() == warm_hits_before + 1, "C55 首次使用计一次预热命中");
+    cp = cp_used;
+    g_compute_warm = -1;
     uint32_t data[64]; memset(data, 0, sizeof data);
     nvn_gpu_buf buf = make_buf(sizeof data, NVN_GPU_MEM_SHARED, data);
     nvn_gpu_binding b; memset(&b, 0, sizeof b);

@@ -1,4 +1,4 @@
-// 管线预热清单：本机玩这款游戏真实建过的图形管线配方（跨会话、设备侧增长）。下次开局由预热线程
+// 管线预热清单：本机真实建过的图形 / 计算管线配方（跨会话、设备侧增长）。计算预热以 debug.s2a.nvk_compute_warm 隔离，缺省关。下次开局由预热线程
 // 用同一份配方提前 nvn_gpu_pipe_get，装进后端的管线缓存；真实 draw 拿同一份 nvn_gpu_pipe_desc 取时
 // 命中缓存、直接拿到预建对象（验收看 backend 的 warm 命中计数 nvn_gpu_pipe_warm_hits）。
 //
@@ -39,6 +39,7 @@ struct rp_prog;   // 回放核心的程序解析结果（rp_shader.h）；note_p
 #define NVK_PW_DESC_BYTES 352
 
 // 一条记录：程序内容身份 + 紧凑配方 + 字节长度 + 使用次数（只用于排序/淘汰，不进配方判据）。
+// 计算配方首字节 0x80、其余为零；旧图形配方首字节仅使用低 5 位，因此现有文件无需迁移。
 struct nvk_pipe_rec {
     uint8_t prog_identity[32];                 // 程序内容身份（rp_prog.identity / g_progs 键）
     uint8_t desc[NVK_PW_DESC_BYTES];           // 紧凑 nvn_gpu_pipe_desc：st[].sh / nspec / spec 不存，其余逐字段
