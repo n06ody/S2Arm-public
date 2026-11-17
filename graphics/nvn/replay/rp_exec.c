@@ -624,7 +624,7 @@ static int diag_cut(int phase) {
     return 1;
 }
 static int diag_enabled(void) {
-    if (g_diag_on < 0) g_diag_on = nvn_plat_flag("nvk_csf", 0) || nvn_plat_flag("nvk_csd", 0);
+    if (g_diag_on < 0) g_diag_on = nvn_plat_flag("nvk_csf", 0) || nvn_plat_flag("nvk_csd", 0) || nvn_plat_flag("nvk_csb", 0);
     return g_diag_on;
 }
 static void diag_indirect(const char *kind, uint64_t addr, int words, int completed) {

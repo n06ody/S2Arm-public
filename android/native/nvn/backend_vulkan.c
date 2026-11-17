@@ -344,6 +344,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    uint64_t diag_csb_count;   // 已录制的目标派发后屏障（会话累计；不代表 GPU 完成）
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
@@ -1460,11 +1461,11 @@ static void csf_time_unavailable(uint64_t seq, uint64_t key, uint64_t signal, co
 void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) {
     if (!c) return;
     c->csf_pending_seq=0;
-    if (!nvn_plat_flag("nvk_csd",0) && !nvn_plat_flag("nvk_csf",0)) return;
+    if (!nvn_plat_flag("nvk_csd",0) && !nvn_plat_flag("nvk_csf",0) && !nvn_plat_flag("nvk_csb",0)) return;
     c->csf_pending_seq=seq; c->csf_pending_key=key;
 }
 static int csf_dispatch_begin(struct nvn_gpu_cmd_s *c, uint64_t seq, uint64_t key) {
-    if (!seq) return -1;
+    if (!seq || (!nvn_plat_flag("nvk_csd",0) && !nvn_plat_flag("nvk_csf",0))) return -1;
     if (!c->csf_times) {
         struct csf_times *t=calloc(1,sizeof *t);
         if (!t) { csf_time_unavailable(seq,key,0,"query_allocation",NVN_GPU_E_OOM); return -1; }
@@ -5486,6 +5487,18 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
         vkCmdDispatch(c->cb, x, y, z);
     }
     csf_dispatch_end(c,csf_at);
+    // 单变量诊断：仅真实编码的选中派发，把 compute 输出发布给图形消费。
+    // 标签由回放层既有选择器提供；不切段/提交/等待，计数只证明录制接管。
+    if (csf_seq && nvn_plat_flag("nvk_csb",0)) {
+        mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
+        uint64_t count = __atomic_add_fetch(&g.diag_csb_count, 1, __ATOMIC_RELAXED);
+        char line[320]; snprintf(line,sizeof line,
+            "csb barrier seq=%llu key=%016llx count=%llu encoded=1 scope=compute_write_to_graphics_read src=compute dst=all_graphics access=indirect,shader,index,vertex",
+            (unsigned long long)csf_seq,(unsigned long long)csf_key,(unsigned long long)count);
+        nvn_plat_log(NVN_PLAT_LOG_INFO,"csf",line);
+    }
     return;
 rejected:
     csf_time_unavailable(csf_seq,csf_key,0,"dispatch_not_encoded",c?c->sticky.code:NVN_GPU_E_ARG);

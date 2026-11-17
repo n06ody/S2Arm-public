@@ -29,7 +29,7 @@ static int g_csf_tag_calls;
 void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) { (void)c; CHECK(seq != 0 && key != 0); g_csf_tag_calls++; }
 static int g_un_summary_lines; static char g_un_summary_last[512];
 static int g_red_lines; static char g_last_red[200];
-static int g_csd_flag, g_csf_flag, g_csf_auto, g_csf_waits, g_csf_begin, g_csf_done, g_csf_indirect;
+static int g_csb_flag, g_csd_flag, g_csf_flag, g_csf_auto, g_csf_waits, g_csf_begin, g_csf_done, g_csf_indirect;
 static char g_csf_last_indirect[1024], g_csf_last_encoded[256];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
@@ -46,6 +46,7 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_blocks")) return g_flag_buf_blocks;
     if (!strcmp(name, "nvk_csd")) return g_csd_flag;
+    if (!strcmp(name, "nvk_csb")) return g_csb_flag;
     if (!strcmp(name, "nvk_csf")) return g_csf_flag;
     if (!strcmp(name, "nvk_csf_a")) return 0x01020304;
     if (!strcmp(name, "nvk_csf_b")) return 0x01020305;
@@ -3546,8 +3547,8 @@ static void t_dispatch_target_skip(void) {
 // Diagnostic contract: completion is delivered before a successful wait; timeout never permits indirect reads.
 void rp_exec_reset(void);
 static void t_csf_fence(void) {
-    for (int mode = 0; mode < 4; mode++) {
-        pass_fresh(); rp_exec_reset(); g_csd_flag = mode == 3; g_csf_flag = mode == 1 || mode == 2; g_csf_auto = mode == 1 ? 1 : 0;
+    for (int mode = 0; mode < 5; mode++) {
+        pass_fresh(); rp_exec_reset(); g_csb_flag = mode == 4; g_csd_flag = mode == 3; g_csf_flag = mode == 1 || mode == 2; g_csf_auto = mode == 1 ? 1 : 0;
         g_csf_waits = g_csf_begin = g_csf_done = g_csf_indirect = g_csf_tag_calls = 0;
         uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
         uint32_t xyz[3] = {2, 3, 4}; memcpy(g_pmem + 64, xyz, sizeof xyz);
@@ -3561,7 +3562,13 @@ static void t_csf_fence(void) {
         CHECK(g_csf_tag_calls == (mode ? 1 : 0));
         if (mode == 0) CHECK(g_csf_begin == 0 && g_csf_waits == 0 && g_csf_indirect == 0);
         if (mode == 1) CHECK(g_csf_begin == 1 && g_csf_waits == 2 && g_csf_done == 2 && g_csf_indirect == 1);
-        if (mode == 3) CHECK(g_csf_begin == 1 && g_csf_waits == 0 && g_csf_indirect == 1 && strstr(g_csf_last_indirect, "source=unavailable"));
+        if (mode == 3 || mode == 4) CHECK(g_csf_begin == 1 && g_csf_waits == 0 && g_csf_indirect == 1 && strstr(g_csf_last_indirect, "source=unavailable"));
+        if (mode == 4) {
+            rp_S.skey[5][0] = 9; nvn_be_exec(s.b); // unrelated compute must not receive a barrier tag
+            CHECK(g_csf_tag_calls == 1 && g_csf_waits == 0);
+            rp_S.skey[5][0] = 1; rp_S.skey[5][3] = 5; nvn_be_exec(s.b); // existing selector B also works
+            CHECK(g_csf_tag_calls == 2 && g_csf_waits == 0);
+        }
         if (mode == 2) CHECK(g_csf_begin == 1 && g_csf_waits == 1 && g_csf_done == 0 && g_csf_indirect == 1 && strstr(g_csf_last_indirect, "source=unavailable"));
         if (mode == 1) {
             // An unrelated direct draw and disjoint indirect argument buffer must consume no fences.
@@ -3609,7 +3616,7 @@ static void t_csf_fence(void) {
             CHECK(g_csf_waits == waits && g_csf_begin == begins);
         }
         nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_pmem); g_buf_cpu_fake = NULL;
-        g_csd_flag = g_csf_flag = g_csf_auto = 0; rp_exec_reset();
+        g_csb_flag = g_csd_flag = g_csf_flag = g_csf_auto = 0; rp_exec_reset();
     }
     pass_fresh();
 }
