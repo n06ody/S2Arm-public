@@ -747,7 +747,7 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
                 int stencil = fi.stencil && (!fi.depth || (has_v && v.set_dsmode && v.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL));
                 int cls = stencil || fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
                 if (cls && cls != dcls) {
-                    if (t_out) *t_out = NULL;
+                    if (t_out) memset(t_out, 0, sizeof *t_out);   // 调用方持有的快照：没取到清零（#1581 C 的接口）
                     nvn_unimpl("tex", "sampled_array_numeric_mismatch", NULL);
                     return NULL;   // 不能用零元素掩盖已登记的整数视图。
                 }
