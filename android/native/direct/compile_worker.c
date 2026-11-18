@@ -476,7 +476,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
             /* Compilation dedup is unchanged. Its diagnostic attribution is
              * deliberately refused, even when the attaching call has no token. */
             diag_cancel(g_job.diagnostic, 2); diag_cancel(diagnostic, 2);
-            g_job.refs++; mine = 2; break;
+            g_job.refs++; g_job.abandoned = 0; mine = 2; break;
         }
         queue_promote_locked();   // C4a：异步短队列优先于新同步发布（同一互斥下，不会插队）
         if (g_job.state == 0) {
@@ -513,10 +513,10 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
         goto out;
     }
     // 等待本次/在途 job 完成；外部锁已经成功交出。
-    while (g_job.state == 1 && !g_stop) {
+    while (g_start_epoch == epoch && g_job.state == 1 && !memcmp(g_job.sha, sha, 32) && !g_stop) {
         if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &deadline) == ETIMEDOUT) break;
     }
-    if (g_job.state == 2) {
+    if (g_start_epoch == epoch && g_job.state == 2 && !memcmp(g_job.sha, sha, 32) && !g_stop) {
         if (!g_job.failed && g_job.bytes_len) {
             *bytes = (uint8_t *)malloc(g_job.bytes_len);
             if (*bytes) { memcpy(*bytes, g_job.bytes, g_job.bytes_len); *bytes_len = g_job.bytes_len; rc = 0; }
@@ -531,10 +531,10 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
         if (g_job.refs <= 0) { retired = job_free(&g_job); queue_promote_locked(); pthread_cond_broadcast(&g_done_cv); }
     } else {
         // Stop 或超时：放弃本次等待，worker 完成时按 abandoned 丢弃结果。
-        if (g_job.state == 1) {
+        if (g_start_epoch == epoch && g_job.state == 1 && !memcmp(g_job.sha, sha, 32)) {
             diag_cancel(g_job.diagnostic, g_stop ? 4 : 3);
             g_job.refs--;
-            if (g_job.refs <= 0) g_job.abandoned = 1;
+            if (g_job.refs <= 0 && !g_job.async) g_job.abandoned = 1;
         }
         if (why && why_size)
             snprintf(why, why_size, g_stop ? "compile worker: stopped while waiting" : "compile worker: timeout");
@@ -575,7 +575,7 @@ int s2a_compile_worker_submit_async(uint64_t session, uint64_t generation,
     }
     /* 同 sha 在途（在槽或在队）：去重附着——不补等待者计数，结果仍会进完成环。 */
     if (inflight_locked(sha)) {
-        if (g_job.state == 1 && !memcmp(g_job.sha, sha, 32)) g_job.async = 1;
+        if (g_job.state == 1 && !memcmp(g_job.sha, sha, 32)) { g_job.async = 1; g_job.abandoned = 0; }
         g_stats.dedup++;
         pthread_mutex_unlock(&g_wmu);
         diag_cancel(diagnostic, 2); diag_drop(diagnostic);
