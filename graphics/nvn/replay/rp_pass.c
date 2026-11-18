@@ -41,6 +41,7 @@ static struct {
     // 形状变了必须重取管线（见 rp_pass_begin 末尾）；形状没变、目标只是换了张同格式的图，管线与绑定都不用重发
     uint32_t shape_c[8], shape_d, shape_s, shape_smp; int shape_ok;
     uint32_t na_w, na_h;          // 无附件通道（一个附件都没挂，只为片元副作用 / 遮挡计数）的帧缓冲尺寸；有附件的通道是 0
+    uint32_t pw, ph;              // 当前通道交给后端的帧缓冲尺寸（通道内矩形清按它裁）
 } P = {.want_colors = 0xff};
 
 // 视图看到的尺寸（像素）。块压缩基底配非压缩视图（一块当一个像素，见 bc_view）时按块数算：通道、整屏清除判断、清除矩形都用它
@@ -51,6 +52,12 @@ static void level_size(const tex_t *t, const view_t *v, int has_v, uint32_t *w, 
     if (!*w) *w = 1;
     if (!*h) *h = 1;
     uint32_t bw, bh; if (bc_view(t, v, has_v, &bw, &bh)) { *w = (*w + bw - 1) / bw; *h = (*h + bh - 1) / bh; }
+}
+// 帧缓冲尺寸并入一个附件：宽、高各取最小（*w 为 0 = 还没有附件）。Vulkan 要求帧缓冲不超过每个附件，
+//   同 iOS pass_dims（nvn_mtl.m）与 Ryujinx FramebufferParams：各附件尺寸不同时取最小公共尺寸，不只看第一个颜色槽（#1581）。
+static void extent_min(uint32_t *w, uint32_t *h, uint32_t aw, uint32_t ah) {
+    if (!*w || aw < *w) *w = aw;
+    if (!*h || ah < *h) *h = ah;
 }
 static int scissor_full(const tex_t *t, const view_t *v, int has_v) {
     if (!rp_R.has_sc) return 1;
@@ -491,19 +498,19 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         d.color[i].view = v; d.color[i].store = NVN_GPU_STORE_STORE;
         d.color[i].load = pk >= 0 ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD;
         if (pk >= 0) { color_value(i, g_pk[pk].rgba, &d.color[i].clear); taken[ntake++] = pk; }
-        if (!d.w) level_size(t, &P.rt.cview[i], P.rt.has_cview[i], &d.w, &d.h);   // 尺寸取第一个有图的槽
+        { uint32_t aw, ah; level_size(t, &P.rt.cview[i], P.rt.has_cview[i], &aw, &ah); extent_min(&d.w, &d.h, aw, ah); }   // 已挂附件的最小公共尺寸
     }
     d.ncolor = (uint32_t)P.rt.n; d.layers = 1;
     P.na_w = P.na_h = 0; P.na_from_rt = 0;
     if (!nattached && !P.rt.depth) {   // 一个附件都没挂（没设目标，或颜色槽全成了空槽）：后端能开无附件通道就按视口尺寸开，片元副作用 / 遮挡计数照常
         if (!noatt_ok()) { rp_view_pin_end(); nvn_unimpl("pass", "no_attachment", NULL); return 0; }   // 开不了（iOS 现在）：这个通道的绘制跳过
         if (any_color && !P.colors) {
-            for (int i = 0; i < P.rt.n; i++) if (P.rt.color[i]) { level_size(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &d.w, &d.h); break; }
+            for (int i = 0; i < P.rt.n; i++) if (P.rt.color[i]) { uint32_t aw, ah; level_size(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &aw, &ah); extent_min(&d.w, &d.h, aw, ah); }
             P.na_from_rt = 1;
         } else if (!noatt_extent(&d.w, &d.h)) { rp_view_pin_end(); nvn_unimpl("pass", "no_attachment_no_extent", NULL); return 0; }
         P.na_w = d.w; P.na_h = d.h;
     }
-    if (!d.w && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &d.w, &d.h);   // 只有深度的通道（阴影图、深度预通道）：尺寸取深度目标的
+    if (P.rt.depth) { uint32_t aw, ah; level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &aw, &ah); extent_min(&d.w, &d.h, aw, ah); }   // 深度也算（只有深度的通道：阴影图、深度预通道就是它的尺寸）
     int pdpk = park_depth();   // 深度模板挂着的待折清除（一项可以带两面）
     int pcd = pdpk >= 0 && g_pk[pdpk].cd, pcs = pdpk >= 0 && g_pk[pdpk].cs;
     if (P.rt.depth) {
@@ -571,6 +578,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         }
     }
     P.area_want = 0;
+    P.pw = d.w; P.ph = d.h;
     nvn_gpu_pass_begin(c, &d);
     PB(RP_PERF_PB_BE);
     rp_view_pin_end();
@@ -645,6 +653,18 @@ void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
     if (P.rt.depth) { P.kept[8] = *P.rt.depth; P.rt.depth = &P.kept[8]; }
 }
 
+// 通道内矩形清必须落在帧缓冲里（后端 / vkCmdClearAttachments 越界即出错）。附件比通道大的部分在这个通道里清不到：
+//   裁到通道，裁掉了就具名记账（不是静默当清过）；裁完为空 = 这次清除在通道里无事可做。
+static int clear_clip_to_pass(nvn_gpu_clear *o, const void *rec) {
+    int64_t x1 = (int64_t)o->x + o->w, y1 = (int64_t)o->y + o->h;
+    if (x1 <= (int64_t)P.pw && y1 <= (int64_t)P.ph) return 1;
+    nvn_unimpl("pass", "clear_rect_beyond_pass_extent", rec);
+    if (x1 > (int64_t)P.pw) x1 = P.pw;
+    if (y1 > (int64_t)P.ph) y1 = P.ph;
+    if (x1 <= o->x || y1 <= o->y) return 0;
+    o->w = (uint32_t)(x1 - o->x); o->h = (uint32_t)(y1 - o->y);
+    return 1;
+}
 void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec) {
     if (!P.has_rt || cc->index < 0 || cc->index >= P.rt.n || cc->index >= 8 || !P.rt.color[cc->index]) { nvn_unimpl("pass", "clear_color_no_target", rec); return; }
     if (!(cc->mask & 0xf)) return;
@@ -654,6 +674,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         if (!scissor_rect(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &cl)) return;
         // 与 iOS clear_color_tri 一样：目标没挂进当前通道时，为显式清除恢复附件；下一笔绘制再按自己的掩码筛。
         if (!c || (!(P.open && rp_pass_slot_attached(i)) && !pass_begin_colors(c, (uint8_t)(1u << i)))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
+        if (!clear_clip_to_pass(&cl, rec)) return;
         color_value(i, cc->rgba, &cl.value);
         rp_occl_pause(c);
         nvn_gpu_clear_rect(c, &cl);
@@ -677,6 +698,7 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
         nvn_gpu_clear cl; memset(&cl, 0, sizeof cl); cl.color = -1; cl.color_mask = 0xf; cl.stencil_mask = (uint8_t)(do_s ? sm : 0xff);
         if (!scissor_rect(P.rt.depth, &P.rt.dview, P.rt.has_dview, &cl)) return;
         if (!c || (!P.open && !pass_begin_colors(c, 0xff))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
+        if (!clear_clip_to_pass(&cl, rec)) return;
         cl.depth = (uint8_t)do_d; cl.stencil = (uint8_t)do_s; cl.depth_value = depth_value(cd->depth); cl.stencil_value = (uint32_t)cd->stencil & 0xff;
         rp_occl_pause(c);
         nvn_gpu_clear_rect(c, &cl);
