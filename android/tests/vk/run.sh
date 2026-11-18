@@ -345,7 +345,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--gpu-diag|--gpu-diag-neg-indargs|--gs-neg-cap) ;;|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--stencil8-only) ;;
+    ""|--gpu-diag|--gpu-diag-neg-csdlink|--gpu-diag-neg-indargs|--gs-neg-cap) ;;|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--stencil8-only) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 if [[ "$mode" == --gpu-diag-neg-* ]]; then
@@ -357,6 +357,7 @@ changes = {
  '--gpu-diag-neg-key': ('t->ids[at].key=key;', 't->ids[at].key=key^1;'),
  '--gpu-diag-neg-load': ('p->a[i].load=(uint32_t)att[i].loadOp;', 'p->a[i].load=(uint32_t)VK_ATTACHMENT_LOAD_OP_LOAD;'),
  '--gpu-diag-neg-barrier': ('csf_note_guest(c,nvn_bits);', 'csf_note_guest(c,nvn_bits & 0u);'),
+ '--gpu-diag-neg-csdlink': ('if (csf_seq) { c->ind_csd_seq=csf_seq; c->ind_csd_key=csf_key; }', 'if (csf_seq) { c->ind_csd_seq=csf_seq-1; c->ind_csd_key=csf_key; }'),
  '--gpu-diag-neg-indargs': ('nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);', 'nvn_gpu_copy_buf(c, ind, off + 4, sl.buf, sl.off, bytes);'),
  '--gpu-diag-neg-window': ('c->diag_take = (pd || csd || ia) ? dwin_take() : 0;', 'c->diag_take = (pd || csd || ia) ? (dwin_take(), 1) : 0;'),
 }
@@ -563,6 +564,7 @@ if [[ "$mode" == --gpu-diag* ]]; then
                 --gpu-diag-neg-key) want='gpu diag selected dispatch query with exact key and groups' ;;
                 --gpu-diag-neg-load) want='gpu diag empty pass attachment load/store detail' ;;
                 --gpu-diag-neg-barrier) want='gpu diag dispatch neighboring full and guest barriers' ;;
+                --gpu-diag-neg-csdlink) want='gpu diag dispatch followed by first indirect args' ;;
                 --gpu-diag-neg-indargs) want='gpu diag indirect args readback from GPU-written buffer' ;;
                 --gpu-diag-neg-window) want='gpu diag window samples every 2nd in-window segment up to max' ;;
             esac
