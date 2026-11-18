@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // 强引用：游戏目标必须链接真实共享 core 对象，诊断 s2a_native_stub.c 不能提供这些入口。
@@ -48,6 +49,8 @@ __attribute__((visibility("hidden"))) int s2a_android_session_log_start(const ch
 // 可选：UI broker 只存在于 Android 外壳；宿主 runtime 单测没有它。调用是无条件的，
 // 所以弱声明也必须在 Android 条件之外，否则 host 单测在 -Werror 下编不过。
 __attribute__((weak)) int s2a_android_ui_bind_session(uint64_t);
+// 弱链接[runtime]：s2a_direct_diag_start
+__attribute__((weak)) int s2a_direct_diag_start(const char *, uint64_t);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct s2a_android_runtime_status g_status;
@@ -213,6 +216,8 @@ static int run_common(const struct s2a_android_runtime_request *r,
             services_v2->graphics = &frozen->table;
             services_v2->graphics_mode = 1;
             frozen_direct = 1;
+            if (s2a_direct_diag_start && s2a_direct_diag_start(getenv("S2A_FRAME_LOG_DIR"), r->services.session_id))
+                fprintf(stderr, "[s2a] 【红】direct trace 初始化失败，采集不可用\n");
             // 直连安全网（共用 dguard.c，接口 dguard_android.h）：NVN 直连已提交、客体代码
             // 还没跑——武装点与 iOS host_main 的 begin/arm 时机一致。满限 + 无人值守收局，
             // 有人局提示后照常武装继续；debug.s2a.dguard=0 整局不武装（launch 里判）。

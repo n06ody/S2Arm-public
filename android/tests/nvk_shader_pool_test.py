@@ -90,6 +90,25 @@ def main():
         print(f'PASS: {len(mutants)} compute warm negative controls')
         return 0
 
+    if sys.argv[1:] == ['--diag-mutants']:
+        code = original.read_text()
+        for name, old, expected in (
+            ('graphics', 'uint64_t trace = diag_begin(s->identity, s->stages, !background);', 'graphics live compile emits paired event'),
+            ('compute', 'uint64_t trace = diag_begin(rq.identity, 32u, 1);', 'compute live compile emits paired event'),
+        ):
+            assert code.count(old) == 1
+            path = out / ('trace-mutant-' + name + '.c')
+            path.write_text(code.replace(old, 'uint64_t trace = 0;'))
+            result = run('trace-mutant-' + name, path, args=('--diag-compile',))
+            assert result.returncode and expected in result.stderr and 'error:' not in result.stderr, (result.stdout, result.stderr)
+            print(f'PASS: {name} event removal produces expected behavior failure')
+        return 0
+
+    if sys.argv[1:] == ['--diag-compile']:
+        result = run('diag-compile', original, args=('--diag-compile',))
+        sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
+
     if sys.argv[1:] in (['--compute-warm'], ['--compute-warm-off']):
         result = run('compute-warm', original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
@@ -192,8 +211,8 @@ def main():
             ('gs-source-epoch', 'MIX(s2a_source_epoch());\n    MIX(stages);', '(void)s2a_source_epoch();\n    MIX(stages);', 1, 'poisoned GS source cannot hit fast cache'),
             ('gs-slot', '(const char *const[]){"vs", "fs", "gs"}[st]',
              '(const char *const[]){"vs", "fs", "fs"}[st]', 3, 'GS production request reaches compiler'),
-            ('ubo-learn-reported-red', 'g_ubo_learned = 1;\n            else red1("compile_failed", oc.summary);',
-             'g_ubo_learned = 1;\n            red1("compile_failed", oc.summary);', 1, 'a rejection that taught a coordinate is a learning step'),
+            ('ubo-learn-reported-red', 'g_ubo_learned = 1;\n            else red_prog("compile_failed", 0, oc.summary);',
+             'g_ubo_learned = 1;\n            red_prog("compile_failed", 0, oc.summary);', 1, 'a rejection that taught a coordinate is a learning step'),
             ('gs-wrong-stage', 'src.stage = (nvn_gpu_stage)st;',
              'src.stage = st == 2 ? NVN_GPU_SH_FS : (nvn_gpu_stage)st;', 1, 'result loads VS FS and GS'),
             ('gs-key-omitted', '((stages & 4u) ? 3 : 2)',
@@ -326,6 +345,10 @@ def main():
     sys.stdout.write(decl.stdout); sys.stderr.write(decl.stderr)
     if decl.returncode:
         return decl.returncode
+    diag = run('diag-compile', original, args=('--diag-compile',))
+    sys.stdout.write(diag.stdout); sys.stderr.write(diag.stderr)
+    if diag.returncode:
+        return diag.returncode
     result = run('test', original)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
