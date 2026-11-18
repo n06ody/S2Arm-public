@@ -323,6 +323,9 @@ namespace S2A.DirectCompiler
         // 反射到 cbuf 句柄时能否当作同一个组合槽：只认经 c2 句柄表读的、且有同句柄直接事实
         public bool HasDirectTextureFact(int handle, int cbufSlot) => cbufSlot == HandleTableCbuf &&
             _program.Textures.Any(t => t.Stage == _stage.Stage && t.Handle == handle && t.CbufSlot == -1);
+        // 是否有这个 c2 字本身的精确事实（运行时句柄从驱动句柄表读；类型 / 格式由翻译期的同字事实给出）
+        public bool HasTextureFact(int handle, int cbufSlot) =>
+            _program.Textures.Any(t => t.Stage == _stage.Stage && t.Handle == handle && t.CbufSlot == cbufSlot);
 
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1) =>
             Record("QuerySamplerType", $"handle={handle},cbufSlot={cbufSlot}",
