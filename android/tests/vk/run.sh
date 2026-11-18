@@ -682,7 +682,7 @@ if [ "$mode" = "--pipe-close" ] || [ "$mode" = "--pipe-close-neg" ]; then
         if [ "$rc" -eq 0 ] || ! grep -q 'FAIL .*pipe close waits for in-flight pipeline builds' "$out/pipe-close-log"; then
             echo "【红】pipe-close 负控未击中 rc=$rc asan=$asan" >&2; exit 1
         fi
-        echo "【绿】--pipe-close-neg 目标断言红（rc=$rc asan=$asan validation=$bad）"; exit 0
+        echo "【绿】--pipe-close-neg 目标断言红（rc=$rc asan=$asan validation=${bad}）"; exit 0
     fi
     if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ] || [ "$asan" -ne 0 ]; then echo "【红】pipe-close rc=$rc validation=$bad asan=$asan" >&2; exit 1; fi
     echo "【绿】pipe-close：close 等在途建管线、短时限报 TIMEOUT 不拆；validation 0 条"; exit 0
