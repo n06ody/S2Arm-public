@@ -82,7 +82,17 @@ void nvn_be_set_tex_pool_n(int n) { pthread_mutex_lock(&g_rmu); g_tpool_n = n; p
 void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20) || !t) return;
     pthread_mutex_lock(&g_rmu);
-    if (id >= g_ntreg) { int n = id + 1024; treg_t *nr = realloc(g_treg, (size_t)n * sizeof *nr); if (!nr) { pthread_mutex_unlock(&g_rmu); return; }
+    if (id >= g_ntreg) { int n = id + 1024;
+#ifdef S2A_TEST_TREG_SCRUB
+        // 宿主单测：扩容一定换地址，旧表写满 0xA5 后留到下一次扩容才放（读旧表读到标记值而不是崩溃），让「还拿着旧表地址」可确定地测出来
+        extern int s2a_test_treg_grows; static treg_t *retired;
+        treg_t *nr = malloc((size_t)n * sizeof *nr); if (!nr) { pthread_mutex_unlock(&g_rmu); return; }
+        if (g_ntreg) memcpy(nr, g_treg, (size_t)g_ntreg * sizeof *nr);
+        if (g_treg) memset(g_treg, 0xA5, (size_t)g_ntreg * sizeof *nr);
+        free(retired); retired = g_treg; s2a_test_treg_grows++;
+#else
+        treg_t *nr = realloc(g_treg, (size_t)n * sizeof *nr); if (!nr) { pthread_mutex_unlock(&g_rmu); return; }
+#endif
         memset(nr + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *nr); g_treg = nr; g_ntreg = n; }
     treg_t *r = &g_treg[id];
     int same = r->ok && r->t.serial == t->serial && r->has_v == (v != NULL) && (!v || !memcmp(&r->v, v, sizeof *v));
@@ -659,10 +669,12 @@ void nvn_be_alias_drop_pool(const void *pool) {
     pthread_mutex_unlock(&g_rmu);
 }
 
-nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t_out) {
+nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t_out) {
+    if (t_out) memset(t_out, 0, sizeof *t_out);
     pthread_mutex_lock(&g_rmu);
     if (id < 0 || id >= g_ntreg || !g_treg[id].ok || (g_tpool_n && id >= g_tpool_n)) { pthread_mutex_unlock(&g_rmu); return NULL; }
     tex_t t = g_treg[id].t; view_t v = g_treg[id].v; int has_v = g_treg[id].has_v;
+    if (t_out) *t_out = t;   // 锁内拷给调用方：登记表会被客体线程扩容换地址，不能把表内地址交出去
     pthread_mutex_unlock(&g_rmu);
     nvn_gpu_tex g = rp_tex_resolve(&t, c);   // 每次都过一遍：CPU 内容脏了要在这一段里重传
     if (!g) return NULL;
@@ -681,7 +693,6 @@ nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t_out) {
             } else { free(owned); nvn_unimpl("gpu", "view_create", r); }
         }
         r->gen = g_ser_gen; out = r->view;
-        if (t_out) *t_out = &r->t;
     }
     pthread_mutex_unlock(&g_rmu);
     return out;
@@ -722,10 +733,10 @@ static nvn_gpu_view decl_zero(uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c) {
     return view;
 }
 
-static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, const tex_t **t_out);
+static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out);
 static _Atomic uint64_t g_empty_slot_zero;   // 空槽绑零贴图的次数（#1147；信息计数，不是未接）
 uint64_t rp_empty_slot_zero_count(void) { return atomic_load(&g_empty_slot_zero); }
-nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, const tex_t **t_out) {
+nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, tex_t *t_out) {
     if (!dtt) return rp_view_by_id(id, c, t_out);
     if (elem) {
         tex_t t; view_t v; int has_v;
@@ -758,15 +769,15 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
     }
     return out;
 }
-static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, const tex_t **t_out) {
-    if (t_out) *t_out = NULL;
+static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out) {
+    if (t_out) memset(t_out, 0, sizeof *t_out);
     pthread_mutex_lock(&g_rmu);
     if (id < 0 || id >= g_ntreg || !g_treg[id].ok || (g_tpool_n && id >= g_tpool_n)) {
         pthread_mutex_unlock(&g_rmu);
         return NULL;
     }
     tex_t t = g_treg[id].t; view_t v = g_treg[id].v; int has_v = g_treg[id].has_v;
-    if (t_out) *t_out = &g_treg[id].t;
+    if (t_out) *t_out = t;
     pthread_mutex_unlock(&g_rmu);
     int want = dtt - 1, have = has_v && v.set_target ? v.target : t.d.target;
     int planned = rp_decl_view_target(&t, &v, has_v, dtt);

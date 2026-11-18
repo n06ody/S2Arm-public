@@ -1662,15 +1662,16 @@ static void t_registry(void) {
     tex_t a = mk_tex(31, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0), b = mk_tex(32, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
     view_t vw; memset(&vw, 0, sizeof vw); vw.set_levels = 1; vw.nlevels = 1;
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == NULL);             // 没登记
+    { tex_t miss; memset(&miss, 0x5A, sizeof miss); CHECK(rp_view_by_id(3, &g_fake_cmd, &miss) == NULL && miss.serial == 0); }   // 没取到：调用方的快照清零
     nvn_be_reg_tex(3, &a, NULL); nvn_be_set_tex_pool_n(8);
-    const tex_t *tt = NULL; nvn_gpu_view v1 = rp_view_by_id(3, &g_fake_cmd, &tt);
-    CHECK(v1 && tt && tt->serial == 31 && v1->has_v == 0);
+    tex_t tt; nvn_gpu_view v1 = rp_view_by_id(3, &g_fake_cmd, &tt);
+    CHECK(v1 && tt.serial == 31 && v1->has_v == 0);
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == v1 && g_view_creates - v0 == 1);   // 第二次取：同一个视图
     nvn_be_reg_tex(3, &a, NULL);
     CHECK(rp_view_by_id(3, &g_fake_cmd, NULL) == v1 && g_view_creates - v0 == 1);   // 同内容重登记：视图还在
     nvn_be_reg_tex(3, &b, &vw);
     nvn_gpu_view v2 = rp_view_by_id(3, &g_fake_cmd, &tt);
-    CHECK(v2 && tt->serial == 32 && v2->has_v == 1 && g_view_creates - v0 == 2 && g_view_releases - vr0 == 1);   // 换了内容：旧视图放掉
+    CHECK(v2 && tt.serial == 32 && v2->has_v == 1 && g_view_creates - v0 == 2 && g_view_releases - vr0 == 1);   // 换了内容：旧视图放掉
     nvn_be_reg_tex(9, &a, NULL);
     CHECK(rp_view_by_id(9, &g_fake_cmd, NULL) == NULL);             // 池容量 8：号 9 在池外，当空槽
     nvn_be_unreg_tex_range(0, 8);
@@ -1688,6 +1689,34 @@ static void t_registry(void) {
     res_fresh();
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
+
+#ifdef S2A_TEST_TREG_SCRUB
+// #1581 C：回放线程取到贴图号的视图和登记快照后，客体线程再登记一个更大的号使登记表扩容（换地址），
+//   回放线程之后再读快照，读到的必须仍是登记时的字段。旧表由宿主钩子写满 0xA5 并留着，读旧表读到标记值而不是崩溃。
+//   同一个二进制里登记一个表内的号（不扩容）作对照：两轮只差扩不扩容。
+int s2a_test_treg_grows;
+static int g_grow_id;
+static void *treg_grow_thread(void *arg) { nvn_be_reg_tex(g_grow_id, (const tex_t *)arg, NULL); return NULL; }
+static void t_view_snap_grow(void) {
+    for (int grow = 0; grow < 2; grow++) {
+        nvn_be_sub_begin(); res_fresh(); nvn_unimpl_reset();
+        tex_t a = mk_tex(501, 0, NVN_FORMAT_RGBA8, 16, 8, 1, 0), b = mk_tex(502, 0x4000, NVN_FORMAT_RGBA8, 32, 32, 1, 0);
+        nvn_be_reg_tex(3, &a, NULL);   // 登记表容量 3 + 1024
+        rp_view_pin_begin();
+        tex_t tt, td;
+        nvn_gpu_view v = rp_view_by_id(3, &g_fake_cmd, &tt);
+        nvn_gpu_view vd = rp_view_by_id_decl(3, NVN_TEXTURE_TARGET_2D_ARRAY + 1, 0, 0, &g_fake_cmd, &td);   // 按声明改目标的那条路
+        int g0 = s2a_test_treg_grows;
+        g_grow_id = grow ? 4000 : 100;
+        pthread_t th; CHECK(pthread_create(&th, NULL, treg_grow_thread, &b) == 0); pthread_join(th, NULL);
+        CHECK(s2a_test_treg_grows - g0 == grow);   // 扩容轮确实换了表，对照轮没换
+        CHECK(v && tt.serial == 501 && tt.d.width == 16 && tt.d.height == 8);
+        CHECK(vd && td.serial == 501 && td.d.width == 16 && td.d.height == 8);
+        rp_view_pin_end();
+        res_fresh(); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    }
+}
+#endif
 
 // 声明类型决定视图；期望目标、层数均直接写常量。
 static void t_decl_view(void) {
@@ -1708,9 +1737,9 @@ static void t_decl_view(void) {
         tex_t t = mk_tex(7000 + i, (int64_t)i * 0x1000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
         t.d.target = cases[i].target; t.d.depth = cases[i].depth; nvn_tex_layout(&t.d, &t.L);
         nvn_be_reg_tex((int)i, &t, NULL);
-        const tex_t *snap = NULL;
+        tex_t snap;
         nvn_gpu_view v = rp_view_by_id_decl((int)i, cases[i].dtt, 0, 0, &g_fake_cmd, &snap);
-        CHECK(v && snap && snap->serial == 7000 + i);
+        CHECK(v && snap.serial == 7000 + i);
         CHECK(g_vw_last_has == cases[i].modified);
         if (cases[i].modified) CHECK(g_vw_last.set_target && g_vw_last.target == cases[i].want &&
             g_vw_last.set_layers && g_vw_last.nlayers == cases[i].layers && g_vw_last.min_layer == 0);
@@ -4891,6 +4920,9 @@ int main(int argc, char **argv) {
     t_linear_upload();
     t_linear_reject();
     t_registry();
+#ifdef S2A_TEST_TREG_SCRUB
+    t_view_snap_grow();
+#endif
     t_samp_mirror_clamp();
     t_decl_view();
     t_decl_array_numeric();
