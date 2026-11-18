@@ -59,8 +59,8 @@ int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) {
 }
 void rp_view_pin_begin(void) {}
 void rp_view_pin_end(void) {}
-nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)c; (void)t; return NULL; }
-nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; (void)t; return NULL; }
+nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
+nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
 nvn_gpu_samp rp_samp_by_id(int id) { (void)id; return NULL; }
 // 这些隔离夹具只发 TBUF，不提供普通采样器；格式能力仍查真实后端。
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid) { (void)tid; return rp_samp_by_id(sid); }

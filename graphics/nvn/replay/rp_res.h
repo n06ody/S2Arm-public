@@ -8,11 +8,13 @@
 
 // 贴图对象 → 后端贴图。首次使用时建；内容来自游戏内存的，在 c 这一段里上传 / 脏了重传。NULL = 取不到（已经 nvn_unimpl 记账）。线程：[提交]。
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
-// 贴图号 → 视图（登记时带视图记录的按它建，否则默认视图）。t_out 可为 NULL。号没登记 / 池外 → NULL。线程：[提交]。
-nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t_out);
+// 贴图号 → 视图（登记时带视图记录的按它建，否则默认视图）。号没登记 / 池外 → NULL。线程：[提交]。
+// t_out 可为 NULL；非 NULL 时取到登记就在锁内把登记快照拷进调用方的 *t_out，没取到清零（serial 为 0）。
+//   不交出登记表内地址：客体线程登记更大的号会让表扩容换地址（#1581）。
+nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t_out);
 // 按着色器声明取兼容视图；dtt = NVN 目标 + 1，0 沿用原样。elem 表示句柄数组元素。
-// 返回视图由核心持有；调用方在 pin 窗口内取用并交给后端。线程：[提交]。
-nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, const tex_t **t_out);
+// 返回视图由核心持有；调用方在 pin 窗口内取用并交给后端。t_out 同 rp_view_by_id（调用方持有的快照）。线程：[提交]。
+nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, tex_t *t_out);
 // 按声明规划同一存储的视图目标；0 原样、1 已改记录、-1 无法桥接。不会创建零贴图。
 static inline int rp_decl_view_target(const tex_t *t, view_t *v, int has_v, uint8_t dtt) {
     if (!dtt) return 0;
