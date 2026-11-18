@@ -192,7 +192,7 @@ static int test_stale(void) {
 }
 
 static int test_missing_semantics(void) {
-    for (int mode = 0; mode < 7; mode++) {
+    for (int mode = 0; mode < 8; mode++) {
         struct fixture f; init(&f);
         f.facts[1].handle = 12;
         if (mode == 0) f.facts[1].cbuf_slot = 2; /* exact already answers */
@@ -201,6 +201,7 @@ static int test_missing_semantics(void) {
         if (mode == 4) f.input.query.method = S2A_W2_QUERY_NORMALIZED;
         if (mode == 5) f.input.query.method = S2A_W2_QUERY_SAMPLER_TYPE;
         if (mode == 6) f.input.query.method = S2A_W2_QUERY_IS_BUFFER;
+        if (mode == 7) f.input.query.method = S2A_W2_QUERY_SAMPLED_FORMAT;
         f.source.requested = f.input.query; CHECK(!seal(&f));
         int missing = mode == 2 || mode == 3;
         CHECK(!run(&f, missing ? S2A_W2_QUERY_OBSERVED : S2A_W2_QUERY_NOT_MISSING, missing));
@@ -210,6 +211,12 @@ static int test_missing_semantics(void) {
     f.facts[0].handle = 12; f.facts[0].cbuf_slot = 2; f.facts[0].format = "Unknown";
     f.facts[1].handle = 12; CHECK(!seal(&f));
     CHECK(!run(&f, S2A_W2_QUERY_OBSERVED, 1));
+    // sampled-format 的 c4 不是 c2 表：同偏移的直接槽不能顶替。
+    init(&f); f.facts[1].handle = 12; f.input.query.method = S2A_W2_QUERY_SAMPLED_FORMAT;
+    f.input.query.coordinate.cbuf_slot = 4; f.source.requested = f.input.query; f.source.resolved = f.input.query.coordinate;
+    CHECK(!seal(&f)); CHECK(!run(&f, S2A_W2_QUERY_OBSERVED, 1));
+    f.calls = 0; f.source.resolved.cbuf_slot = -1;
+    CHECK(!run(&f, S2A_W2_QUERY_NO_SOURCE, 1));
     return 0;
 }
 

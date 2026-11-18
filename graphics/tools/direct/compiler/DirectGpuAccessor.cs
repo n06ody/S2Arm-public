@@ -346,6 +346,10 @@ namespace S2A.DirectCompiler
             if (f == TextureFormat.Unknown) throw Missing("QueryTextureFormat", $"stage={_stage.Stage},handle={handle},cbufSlot={cbufSlot},format=Unknown");
             return Record("QueryTextureFormat", $"handle={handle},cbufSlot={cbufSlot}", f, "texture-fact:" + _stage.Stage + ":" + handle + ":" + cbufSlot);
         }
+        public TextureFormat QueryS2ASampledTextureFormat(int handle, int cbufSlot = -1) =>
+            Record("QueryS2ASampledTextureFormat", $"handle={handle},cbufSlot={cbufSlot}",
+                NeedTexture("QueryS2ASampledTextureFormat", handle, cbufSlot).Format,
+                "texture-fact:" + _stage.Stage + ":" + handle + ":" + cbufSlot);
         public int QueryTextureArrayLengthFromPool() =>
             Record("QueryTextureArrayLengthFromPool", "stage=" + _stage.Stage, _program.TextureArrayLength, "texture-pool-capacity");
         public int QuerySamplerArrayLengthFromPool() =>
