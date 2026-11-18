@@ -20,7 +20,8 @@ enum s2a_w2_query_method {
     S2A_W2_QUERY_SAMPLER_TYPE = 1,
     S2A_W2_QUERY_IS_BUFFER,
     S2A_W2_QUERY_NORMALIZED,
-    S2A_W2_QUERY_FORMAT
+    S2A_W2_QUERY_FORMAT,
+    S2A_W2_QUERY_SAMPLED_FORMAT
 };
 
 enum s2a_w2_query_stage {
