@@ -681,8 +681,10 @@ if cmd == "shell":
             st["_die_seen"] = True; save()                       # 起过 → 下一拍就死
             out(st.get("pid", "4242") + "\\n"); sys.exit(0)
         if st.get("die_before_ready") and st.get("_die_seen"):
-            st["running"] = False; save(); out(""); sys.exit(0)
-        out((st.get("pid", "4242") + "\\n") if st.get("running") else ""); sys.exit(0)
+            st["running"] = False; save(); sys.exit(1)
+        if st.get("running"):
+            out(st.get("pid", "4242") + "\\n"); sys.exit(0)
+        sys.exit(1)
     if c == "ps":
         if st.get("running"):
             out("    1 init\\n 4242 " + st["package"] + "\\n 4243 " + st["package"] + ":game\\n")
