@@ -139,15 +139,16 @@ void nvn_vk_pipe_demand_stop(void) {
     pthread_cond_broadcast(&g_q_cv);
     pthread_mutex_unlock(&g_q_mu);
     pthread_mutex_unlock(&g_life_mu);
-    // 有界 join：最多等 500ms；到点没退就 detach（迟到的建管线结果由 nvn_gpu_pipe_get 在会话关闭后按 STOPPED 早拒，
-    // 不进后端缓存），本函数立刻返回，不顶破会话停局预算。
+    // 有界 join：最多等 500ms；到点没退就 detach，本函数立刻返回，不顶破会话停局预算。
+    // 脱离的线程若还在 nvn_gpu_pipe_get 里，后端按在途计数挡住 nvn_gpu_close：close 等它建完才拆管线缓存 / 着色器 / 布局，
+    // 超出 close 时限就报 TIMEOUT、资源保留（#1581 I）。还没进 nvn_gpu_pipe_get 的，close 开始后按 STOPPED 早拒。
     int done = 0;
     for (int i = 0; i < 500; i++) {
         if (atomic_load_explicit(&g_worker_done, memory_order_acquire)) { done = 1; break; }
         struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL);
     }
     if (done) { pthread_join(th, NULL); if (g_pp_init) nvk_pp_reset(&g_pp); }
-    else pthread_detach(th);   // 线程可能仍在 nvn_gpu_pipe_get 内：不 reset（避免与在用待定表打架），交后端 STOPPED 早拒
+    else pthread_detach(th);   // 线程可能仍在 nvn_gpu_pipe_get 内：不 reset（避免与在用待定表打架）；后端 close 等它出来
     atomic_store_explicit(&g_running, 0, memory_order_release);
 }
 

@@ -301,6 +301,7 @@ extern void nvn_gpu_vk_test_set_fault(int mode);
 extern void nvn_gpu_vk_test_diag_timing(int on, uint64_t draw_log_ns);   // C207：直接开 / 关诊断计时，并改逐笔读数的周期（0 = 还原 5 秒）
 extern void nvn_gpu_vk_test_fail_fence(uint64_t signal);
 extern void nvn_gpu_vk_test_delay_segment(uint64_t signal, uint32_t ms);
+extern void nvn_gpu_vk_test_delay_pipe(uint32_t ms);
 
 static int g_fail;
 #define CHECK(cond, ...)                                     \
@@ -10395,6 +10396,62 @@ static void c1072_pipe_guard(const char *dir) {
 
 #include "t_clear_capacity.inc"
 
+// #1581 I：后台线程（首用 / 预热）还在取管线时会话 close。钩子让取管线计入在途后先睡 800 ms（模拟驱动里建得慢），
+// 主线程在这 800 ms 里 close。期望：close 等两条在途建完才拆管线缓存 / 着色器 / 布局（耗时 ≥ 650 ms），两条都建成，
+// 建出的管线由 close 收掉（validation 层不报残留 / 已销毁句柄；修前 close 先拆，线程醒来用已销毁的缓存 / 布局）。
+// 第二局：close 时限短于在途建（200 ms），close 必须报 TIMEOUT 且不拆，等在途建完后再 close 一次成功。
+struct pc_job { nvn_gpu_pipe_desc gd; nvn_gpu_stage_desc cs; int compute; nvn_gpu_rc r; nvn_gpu_pipe p; uint64_t t_done; };
+static uint64_t pc_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u; }
+static void *pc_thread(void *arg) {
+    struct pc_job *j = arg; nvn_gpu_err e = {0};
+    j->r = j->compute ? nvn_gpu_cpipe_get(&j->cs, NVN_GPU_PIPE_SYNC, &j->p, &e) : nvn_gpu_pipe_get(&j->gd, NVN_GPU_PIPE_SYNC, &j->p, &e);
+    j->t_done = pc_now_ms();
+    return NULL;
+}
+static int pipe_close_only(const char *dir) {
+    for (int round = 0; round < 2; round++) {
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "pipe-close-test";
+        if (!open_backend()) return 1;
+        nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
+        if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) { CHECK(0, "pipe close shaders"); return 1; }
+        nvn_gpu_layout_ent ent = {.cls=NVN_GPU_RES_SSBO,.access=NVN_GPU_ACC_W,.set=0,.binding=0,.count=1,.stages=1u<<NVN_GPU_SH_CS};
+        nvn_gpu_layout lay = {0}; lay.ent = &ent; lay.nent = 1;
+        nvn_gpu_shader cs = load_one_shader(dir, "comp.comp", NVN_GPU_SH_CS, &lay);
+        CHECK(cs != NULL, "pipe close compute shader");
+        struct pc_job jobs[2]; memset(jobs, 0, sizeof jobs);
+        fill_gpipe_desc(&jobs[0].gd, vs, fs, 0);
+        jobs[1].compute = 1; jobs[1].cs.sh = cs;
+        nvn_gpu_vk_test_delay_pipe(800);
+        pthread_t th[2]; uint64_t t0 = pc_now_ms();
+        for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, pc_thread, &jobs[i]);
+        struct timespec ts = {0, 150000000L}; nanosleep(&ts, NULL);   // 两条线程都已计入在途、睡在钩子里
+        nvn_gpu_err e = {0};
+        uint64_t c0 = pc_now_ms();
+        nvn_gpu_rc cr = nvn_gpu_close(round == 0 ? 5000000000ull : 200000000ull, &e);
+        uint64_t c1 = pc_now_ms();
+        if (round == 0) {
+            CHECK(OK(cr), "pipe close: close 成功 %s", e.why);
+            CHECK(c1 - t0 >= 650, "pipe close waits for in-flight pipeline builds: close 用了 %llu ms（自线程起 %llu ms）", (unsigned long long)(c1 - c0), (unsigned long long)(c1 - t0));
+        } else {
+            CHECK(cr.code == NVN_GPU_E_TIMEOUT, "pipe close short deadline reports TIMEOUT and keeps resources: rc=%d %s", cr.code, e.why);
+        }
+        for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
+        // 图形：建成并由 close 收掉。计算：cpipe_build 内部再核一次「没在关」，close 已开始就按 STOPPED 放弃（不碰已拆资源，也算对）。
+        CHECK(OK(jobs[0].r) && jobs[0].p, "pipe close: 在途的图形管线建成 rc=%d", jobs[0].r.code);
+        CHECK((OK(jobs[1].r) && jobs[1].p) || (jobs[1].r.code == NVN_GPU_E_STOPPED && !jobs[1].p), "pipe close: 在途的计算管线建成或按 STOPPED 放弃 rc=%d", jobs[1].r.code);
+        if (round == 0) for (int i = 0; i < 2; i++)
+            CHECK(jobs[i].t_done <= c1 + 5, "pipe close: %s 管线在 close 返回前建完（done=%llu close=%llu）", jobs[i].compute ? "计算" : "图形", (unsigned long long)(jobs[i].t_done - t0), (unsigned long long)(c1 - t0));
+        if (round == 1) {
+            nvn_gpu_vk_test_delay_pipe(0);
+            nvn_gpu_err e2 = {0}; nvn_gpu_pipe late = NULL;
+            CHECK(nvn_gpu_pipe_get(&jobs[0].gd, NVN_GPU_PIPE_SYNC, &late, &e2).code == NVN_GPU_E_STOPPED && !late, "pipe close: close 开始后新的取管线按 STOPPED 拒");
+            CHECK(OK(nvn_gpu_close(5000000000ull, &e2)), "pipe close: 在途建完后再 close 成功 %s", e2.why);
+        }
+        free(vm); free(fm);
+        printf("PIPE_CLOSE round=%d close_ms=%llu rc=%d failures=%d\n", round, (unsigned long long)(c1 - c0), cr.code, g_fail);
+    }
+    return g_fail ? 1 : 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -10425,6 +10482,7 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+    if (argc > 2 && !strcmp(argv[2], "--pipe-close")) { int r = pipe_close_only(argv[1]); s2a_vk_device_destroy(&g_dev, 1); return r; }
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;

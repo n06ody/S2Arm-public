@@ -345,6 +345,7 @@ struct nvn_gpu_vk {
     _Atomic int stop;
     int busy;
     int commit_active;   // 正在 commit 的线程数：close 要等它归零才拆资源
+    int pipe_active;     // 正在建 / 取管线的线程数（图形 + 计算，含后台首用 / 预热线程）：close 要等它归零才拆管线缓存、着色器、布局
     int close_active;    // 已有一个线程在跑 close，防止重复 join
     _Atomic int device_lost;
     uint64_t completed;
@@ -368,6 +369,7 @@ struct nvn_gpu_vk {
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
     uint32_t test_delay_ms;
+    uint32_t test_pipe_delay_ms;   // 测试钩子：取管线进了在途之后、建之前先睡 ms（模拟驱动里建得慢）
     uint64_t wsi_seq;    // 已提交的呈现段序号（g_submit_mu 下分配，与入队同序）
     uint64_t wsi_done;   // worker 已等到栅栏的最后一个呈现段序号（g_mu 下改；段按入队顺序处理，单调）
 };
@@ -2199,7 +2201,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     // ②③④ 等在途段 / 退休队列 / 并发 commit 全部结束。
     pthread_mutex_lock(&g_mu);
     for (;;) {
-        if (!g.qhead && !g.busy && !g.rhead && g.commit_active == 0) {
+        if (!g.qhead && !g.busy && !g.rhead && g.commit_active == 0 && g.pipe_active == 0) {
             wsi_close_locked();   // 在途段都完成了：还接着的面连同交换链一起收掉
             // 先销毁视图、放下其持有的底层缓冲引用，再由 worker 完成退休回调。
             while (g.pools) pool_destroy_locked(g.pools);
@@ -3928,8 +3930,34 @@ int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
 //   ⑤ 失败原样返回；挂了等待者的那份由建者把同一个错误广播出去（不重试、不返回假成功）。
 // 调用方契约：d->st[].sh 指向的着色器在整个调用期间必须有效（核心 / 预热 owner 的程序借用合同，见 pipe_build）。
 // 设备策略：debug.s2a.nvk_pipe_serial=1 时创建重新串行化（见 ④ 前的注释），缺省 0 = 并发建。
+// 取 / 建管线的在途计数（#1581 I）：入口在 g_mu 下核「没在关」并计入，close 等它归零才拆管线缓存、着色器、布局。
+// 只在入口核一次「没在关」不够：后台线程（首用、预热）可能已经进了建管线，close 随即拆资源 → 用后释放。
+// 建在驱动里卡住时 close 按自己的时限报 TIMEOUT、资源保留（可再调一次），不拆在用的东西。
+static int pipe_enter(void) {
+    if (!g_open) return 0;
+    pthread_mutex_lock(&g_mu);
+    int ok = !g.closing;
+    if (ok) g.pipe_active++;
+    uint32_t delay = ok ? g.test_pipe_delay_ms : 0;
+    pthread_mutex_unlock(&g_mu);
+    if (delay) { struct timespec ts = {(time_t)(delay / 1000), (long)(delay % 1000) * 1000000L}; nanosleep(&ts, NULL); }
+    return ok;
+}
+static void pipe_leave(void) {
+    pthread_mutex_lock(&g_mu);
+    g.pipe_active--;
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+}
+static nvn_gpu_rc pipe_get_impl(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err);
 nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
-    if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    if (out) *out = NULL;
+    if (!pipe_enter()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    nvn_gpu_rc r = pipe_get_impl(d, mode, out, err);
+    pipe_leave();
+    return r;
+}
+static nvn_gpu_rc pipe_get_impl(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     (void)mode;
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
@@ -4143,8 +4171,15 @@ static struct nvn_gpu_pipe_s *cpipe_find_locked(nvn_gpu_shader sh) {
         if (p->cshader == sh) return p;
     return NULL;
 }
+static nvn_gpu_rc cpipe_get_impl(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err);
 nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
-    if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    if (out) *out = NULL;
+    if (!pipe_enter()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
+    nvn_gpu_rc r = cpipe_get_impl(cs, mode, out, err);
+    pipe_leave();
+    return r;
+}
+static nvn_gpu_rc cpipe_get_impl(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!cs || !cs->sh) return fail(err, NVN_GPU_E_ARG, "计算阶段为空");
@@ -7834,6 +7869,14 @@ void nvn_gpu_vk_test_fail_fence(uint64_t signal) {
     if (!g_open) return;
     pthread_mutex_lock(&g_mu);
     g.test_fail_signal = signal;
+    pthread_mutex_unlock(&g_mu);
+}
+
+// 测试钩子：取管线（图形 / 计算）计入在途后先睡 ms，用来测 close 与在途建管线并发（#1581 I）。
+void nvn_gpu_vk_test_delay_pipe(uint32_t ms) {
+    if (!g_open) return;
+    pthread_mutex_lock(&g_mu);
+    g.test_pipe_delay_ms = ms;
     pthread_mutex_unlock(&g_mu);
 }
 
