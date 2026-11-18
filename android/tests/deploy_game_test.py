@@ -9,8 +9,11 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shlex
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,8 +24,10 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import deploy_game
 import game_apk
+import resident_warm
 
 TITLE = '0100000000ABCDEF'
+SESSION = '123e4567-e89b-42d3-a456-426614174000'
 
 
 class FakeAdb:
@@ -123,6 +128,132 @@ class FakeAdb:
         return ''
 
 
+class ResidentAdb(FakeAdb):
+    """Resident fixture: model current.json, revision hashes and an import receipt."""
+    def __init__(self, resources):
+        super().__init__()
+        self.artifact_bytes = (resources / 'game-build-artifact.json').read_bytes()
+        self.new_artifact = json.loads(self.artifact_bytes)
+        self.new_sha = hashlib.sha256(self.artifact_bytes).hexdigest()
+        self.old_artifact = json.loads(self.artifact_bytes)
+        self.old_artifact['apk']['sha256'] = 'd' * 64
+        self.old_bytes = json.dumps(self.old_artifact).encode()
+        self.old_sha = hashlib.sha256(self.old_bytes).hexdigest()
+        self.digest = 'd' * 64
+        self.root = self.new_artifact['contentRoot']
+        self.current = dict(version=1, titleId=TITLE, contentRoot=self.root,
+                            revisionDir='revisions/' + self.root,
+                            artifact='old.json', artifactSha256=self.old_sha)
+        self.receipt = (self.root, self.new_sha)
+        self.hash_calls = 0
+        self.fail_hash_call = 0
+        self.corrupt_current_after_import = False
+        self.empty_pid = False
+        self.suppress_game_receipt = False
+        self.raw_import_log = False
+        self.date_calls = 0
+
+    def installed_hash(self, package):
+        self.hash_calls += 1
+        if self.hash_calls == self.fail_hash_call:
+            raise RuntimeError('device hash unavailable')
+        return super().installed_hash(package)
+
+    def shell(self, *args):
+        if args[:2] == ('date', '+%s%3N'):
+            self.calls.append(args)
+            self.date_calls += 1
+            return '1700000000000' if self.date_calls == 1 else '1700000002000'
+        if args[0] == 'logcat' and '--pid=777' in args:
+            self.calls.append(args)
+            if self.suppress_game_receipt:
+                return ''
+            return (f'1700000001.250 777 888 I S2Arm: '
+                    f'Game startup accepted: {TITLE} session {SESSION} consoleMode handheld')
+        if args[0] == 'pidof':
+            self.calls.append(args)
+            return '' if self.empty_pid else '777'
+        if len(args) == 5 and args[0] == 'run-as' and args[2:4] == ('sh', '-c'):
+            self.calls.append(args)
+            if 'echo PRESENT' in args[4] and 'echo ABSENT' in args[4]:
+                return 'ABSENT'
+            raise RuntimeError('unexpected cache command')
+        if len(args) == 4 and args[0] == 'run-as':
+            self.calls.append(args)
+            action, path = args[2:]
+            if action == 'cat' and path.endswith('/current.json'):
+                return json.dumps(self.current)
+            if action == 'sha256sum' and path.endswith('/index.tsv'):
+                return self.root[7:] + '  ' + path
+            if action == 'sha256sum' and path.endswith('/' + self.current['artifact']):
+                return self.current['artifactSha256'] + '  ' + path
+            if action == 'cat' and path.endswith('/' + self.current['artifact']):
+                return (self.artifact_bytes if self.current['artifact'] == 'new.json'
+                        else self.old_bytes).decode()
+            raise RuntimeError('missing device file')
+        result = super().shell(*args)
+        if args[0] == 'logcat' and self.name and not self.refused and not self.slow_import:
+            self.current.update(artifact='new.json', artifactSha256=(
+                'f' * 64 if self.corrupt_current_after_import else self.new_sha))
+        if args[0] == 'logcat' and not self.raw_import_log:
+            return '\n'.join('I/S2Arm   (  777): ' + line for line in result.splitlines())
+        return result
+
+
+class GenericResidentAdb(FakeAdb):
+    def __init__(self, resources):
+        super().__init__()
+        self.artifact_bytes = (resources / 'game-build-artifact.json').read_bytes()
+        self.artifact = json.loads(self.artifact_bytes)
+        self.artifact_sha = hashlib.sha256(self.artifact_bytes).hexdigest()
+        self.root = self.artifact['contentRoot']
+        self.current = dict(version=1, titleId=TITLE, contentRoot=self.root,
+                            revisionDir='revisions/' + self.root,
+                            artifact='game-build-artifact.json', artifactSha256=self.artifact_sha)
+        self.digest = 'd' * 64
+        self.log_epoch = '1700000001.250'
+        self.switch_pid = False
+        self.pid_calls = 0
+        self.date_calls = 0
+        self.update_fingerprint_on_start = False
+
+    def shell(self, *args):
+        self.calls.append(args)
+        if args[:2] == ('date', '+%s%3N'):
+            self.date_calls += 1
+            return '1700000000000' if self.date_calls == 1 else '1700000002000'
+        if args[0] == 'pidof':
+            if not self.started:
+                raise RuntimeError('pidof: absent')
+            self.pid_calls += 1
+            return '778' if self.switch_pid and self.pid_calls > 1 else '777'
+        if args[:4] == ('am', 'start', '-W', '-n'):
+            self.started = True
+            return 'Status: ok'
+        if args[0] == 'logcat':
+            if not self.started:
+                return ''
+            if self.update_fingerprint_on_start:
+                self.current['fingerprint'] = {'version': 1, 'sha256': 'f' * 64}
+            return (f'{self.log_epoch} 777 888 I S2Arm: '
+                    f'Game startup accepted: {TITLE} session {SESSION} consoleMode handheld')
+        if len(args) == 5 and args[0] == 'run-as' and args[2:4] == ('sh', '-c'):
+            if 'echo PRESENT' in args[4] and 'echo ABSENT' in args[4]:
+                return 'ABSENT'
+            raise RuntimeError('unexpected cache command')
+        if len(args) == 4 and args[0] == 'run-as':
+            action, path = args[2:]
+            if action == 'cat' and path.endswith('/current.json'):
+                return json.dumps(self.current)
+            if action == 'sha256sum' and path.endswith('/index.tsv'):
+                return self.root[7:] + '  ' + path
+            if action == 'sha256sum' and path.endswith('/' + self.current['artifact']):
+                return self.current['artifactSha256'] + '  ' + path
+            if action == 'cat' and path.endswith('/' + self.current['artifact']):
+                return self.artifact_bytes.decode()
+        raise RuntimeError('unsupported fake adb shell call')
+
+
 class OwnLinesTest(unittest.TestCase):
     """导入结论只认目标包自己的进程：别的 S2Arm App 同标签的 refused 不算（11-13 误判）。期望按日志行手算。"""
     class Adb:
@@ -139,6 +270,90 @@ class OwnLinesTest(unittest.TestCase):
 
     def test_no_pid_keeps_everything(self):
         self.assertEqual(deploy_game.own_lines(self.Adb(''), 'p', self.LOGS), self.LOGS)
+
+
+class PidofSemanticsTest(unittest.TestCase):
+    def test_pidof_requires_consistent_rc_and_numeric_output(self):
+        adb = deploy_game.Adb('test-device')
+        for rc, out in ((0, ''), (0, 'not-a-pid'), (1, '42')):
+            with self.subTest(rc=rc, out=out), patch.object(
+                    deploy_game.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], rc, out, '')):
+                with self.assertRaises(RuntimeError):
+                    adb.running('test.package')
+
+    def test_pidof_absent_and_present(self):
+        adb = deploy_game.Adb('test-device')
+        with patch.object(deploy_game.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 1, '', '')):
+            self.assertFalse(adb.running('test.package'))
+        with patch.object(deploy_game.subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, '42 43\n', '')):
+            self.assertTrue(adb.running('test.package'))
+
+
+class CacheInventoryTest(unittest.TestCase):
+    class LocalAdb:
+        def __init__(self, root):
+            self.root = root
+            self.stat = shutil.which('gstat') or (shutil.which('stat') if sys.platform != 'darwin' else None)
+
+        def shell(self, *args):
+            if args[:4] == ('run-as', 'test.package', 'sh', '-c') and len(args) == 5:
+                # Execute the actual find/test expression. macOS stat has a
+                # different CLI; gstat matches Android's -c %s/%n contract.
+                command = args[4].replace('-exec stat -c', '-exec ' + shlex.quote(self.stat) + ' -c')
+                result = subprocess.run(['/bin/sh', '-c', command], cwd=self.root,
+                                        text=True, capture_output=True)
+                if result.returncode:
+                    raise RuntimeError(result.stderr)
+                return result.stdout.strip()
+            if args[:3] == ('run-as', 'test.package', 'sha256sum') and len(args) == 4:
+                path = self.root / args[3]
+                if not path.is_file():
+                    raise RuntimeError('missing file')
+                return game_apk.sha256(path) + '  ' + args[3]
+            raise RuntimeError('unsupported fake adb command')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.adb = self.LocalAdb(self.root)
+        if not self.adb.stat:
+            self.skipTest('GNU stat is required to model Android stat -c')
+        self.cache = (self.root / 'files/user/0/saves' / TITLE /
+                      'ryujinx-android/direct-cache/nvn-vk')
+
+    def test_absent_cache_is_distinct_from_empty_existing_cache(self):
+        self.assertEqual(resident_warm.inventory_cache(self.adb, 'test.package', TITLE)['state'], 'absent')
+        self.cache.mkdir(parents=True)
+        result = resident_warm.inventory_cache(self.adb, 'test.package', TITLE)
+        self.assertEqual(result, {'state': 'present', 'files': {}, 'sample': {}})
+
+    def test_sorted_sizes_and_first_middle_last_hashes(self):
+        self.cache.mkdir(parents=True)
+        for name in 'abcde':
+            (self.cache / name).write_bytes(name.encode() * (ord(name) - 96))
+        result = resident_warm.inventory_cache(self.adb, 'test.package', TITLE)
+        self.assertEqual(result['files'], {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5})
+        self.assertEqual(set(result['sample']), {'a', 'c', 'e'})
+        self.assertEqual(result['sample']['c'], hashlib.sha256(b'ccc').hexdigest())
+
+    def test_symlink_in_cache_is_rejected(self):
+        self.cache.mkdir(parents=True)
+        (self.cache / 'target').write_bytes(b'content')
+        (self.cache / 'link').symlink_to('target')
+        with self.assertRaisesRegex(ValueError, '链接'):
+            resident_warm.inventory_cache(self.adb, 'test.package', TITLE)
+
+    def test_symlink_at_cache_root_is_rejected(self):
+        self.cache.parent.mkdir(parents=True)
+        target = self.root / 'unrelated'
+        target.mkdir()
+        self.cache.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, '缓存路径'):
+            resident_warm.inventory_cache(self.adb, 'test.package', TITLE)
 
 
 class DeployTest(unittest.TestCase):
@@ -176,6 +391,433 @@ class DeployTest(unittest.TestCase):
 
     def deploy(self, adb, **kw):
         return deploy_game.deploy(self.pack, self.apk, adb, self.root / 'out', **kw)
+
+    def test_resident_mismatched_root_refuses_before_install_or_import(self):
+        resources = self.root / 'refresh'
+        game_apk.resources(self.pack, self.apk, resources, refresh_existing=True)
+        adb = FakeAdb()
+        calls = []
+        current = json.dumps(dict(version=1, titleId=TITLE,
+                                  contentRoot='sha256-' + '0' * 64,
+                                  revisionDir='revisions/sha256-' + '0' * 64,
+                                  artifact='game-build-artifact.json',
+                                  artifactSha256='a' * 64))
+        shell = adb.shell
+        def with_current(*args):
+            if args[:3] == ('run-as', 'org.s2arm.game.t0100000000abcdef', 'cat'):
+                return current
+            return shell(*args)
+        adb.shell = with_current
+        with self.assertRaisesRegex(ValueError, '内容根'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident',
+                                 lambda *args: calls.append(args))
+        self.assertEqual(calls, [])
+        self.assertFalse(any(call[0] in ('install', 'forward') for call in adb.calls))
+        self.assertFalse(any('start' in call for call in adb.calls))
+
+    def resident_deploy(self, *args, **kwargs):
+        kwargs.setdefault('expected_package', 'org.s2arm.game.t0100000000abcdef')
+        return resident_warm.deploy(*args, **kwargs)
+
+    def resident_fixture(self):
+        resources = self.root / 'refresh'
+        game_apk.resources(self.pack, self.apk, resources, refresh_existing=True)
+        return resources, ResidentAdb(resources)
+
+    def generic_fixture(self):
+        self.identity_mock.return_value = ('org.s2arm.android.w2', 1, True)
+        with zipfile.ZipFile(self.apk, 'w') as z:
+            z.writestr('assets/container.txt', b'synthetic container')
+        resources = self.root / 'generic'
+        (resources / 'ctl').mkdir(parents=True)
+        (resources / 'ctl/control.nacp').write_bytes(self.files['ctl/control.nacp'])
+        entries = dict(self.files)
+        entries['modules/main.fixups.tsv'] = b'fixups'
+        entries['modules/main.gates.tsv'] = b'gates'
+        index = ''.join(f'{name}\t{len(data)}\t{hashlib.sha256(data).hexdigest()}\n'
+                        for name, data in sorted(entries.items())).encode()
+        index_sha = hashlib.sha256(index).hexdigest()
+        (resources / 'index.tsv').write_bytes(index)
+        (resources / 'manifest.json').write_text(json.dumps(
+            dict(version=2, files=len(entries), total=sum(map(len, entries.values())), index_sha256=index_sha)))
+        artifact = dict(titleId=TITLE, contentRoot='sha256-' + index_sha,
+                        package={'manifest': 'manifest.json', 'indexSha256': index_sha,
+                                 'files': len(entries), 'bytes': sum(map(len, entries.values()))},
+                        modules=[{'name': 'main', 'source': 'revision',
+                                  'image': 'modules/main.patched.bin',
+                                  'fixups': 'modules/main.fixups.tsv',
+                                  'gates': 'modules/main.gates.tsv'}])
+        (resources / 'game-build-artifact.json').write_text(json.dumps(artifact))
+        return resources, GenericResidentAdb(resources)
+
+    def test_resident_generic_revision_reuses_without_import_and_binds_pid(self):
+        resources, adb = self.generic_fixture()
+        calls = []
+        def install(apk, package):
+            calls.append((apk, package))
+            adb.digest = game_apk.sha256(apk)
+        receipt = resident_warm.deploy_container(
+            self.apk, resources, adb, self.root / 'container', install,
+            expected_package='org.s2arm.android.w2', expected_prior_apk='d' * 64,
+            expected_signer='a' * 64, expected_title=TITLE)
+        self.assertIsInstance(receipt, dict)
+        self.assertEqual(receipt['pid'], 777)
+        self.assertEqual(receipt['session'], SESSION)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(call[0] in ('install', 'forward') for call in adb.calls))
+        self.assertTrue((self.root / 'container/resident.json').is_file())
+
+    def generic_deploy(self, resources, adb, install, **kwargs):
+        return resident_warm.deploy_container(
+            self.apk, resources, adb, self.root / 'container', install,
+            expected_package='org.s2arm.android.w2', expected_prior_apk='d' * 64,
+            expected_signer='a' * 64, expected_title=TITLE, **kwargs)
+
+    def test_resident_accepts_platform_uuid_session(self):
+        _, adb = self.generic_fixture()
+        with patch.object(resident_warm.time, 'monotonic', side_effect=[0, 0, 2]), \
+                patch.object(resident_warm.time, 'sleep'):
+            self.assertEqual(resident_warm._launch_session(adb, 'org.s2arm.android.w2', TITLE, 1),
+                             (777, SESSION))
+
+    def test_resident_rejects_malformed_session(self):
+        _, adb = self.generic_fixture()
+        with patch(__name__ + '.SESSION', '7'), \
+                patch.object(resident_warm.time, 'monotonic', side_effect=[0, 0, 2]), \
+                patch.object(resident_warm.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, '启动回执'):
+                resident_warm._launch_session(adb, 'org.s2arm.android.w2', TITLE, 1)
+
+    def test_resident_container_metadata_copies_only_identity_files(self):
+        pack, _ = self.generic_fixture()
+        (pack / 'romfs').mkdir()
+        (pack / 'romfs/data').write_bytes(b'synthetic payload')
+        out = self.root / 'identity'
+        self.assertEqual(resident_warm.container_metadata(pack, out), out)
+        self.assertEqual({p.relative_to(out).as_posix() for p in out.rglob('*') if p.is_file()},
+                         {'manifest.json', 'index.tsv', 'game-build-artifact.json', 'ctl/control.nacp'})
+        self.assertFalse((out / 'romfs').exists())
+        with self.assertRaisesRegex(ValueError, '不能覆盖'):
+            resident_warm.container_metadata(pack, pack / 'child')
+
+    def test_resident_container_metadata_rejects_symlink(self):
+        pack, _ = self.generic_fixture()
+        src = pack / 'index.tsv'
+        target = self.root / 'index-copy'
+        target.write_bytes(src.read_bytes())
+        src.unlink()
+        src.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, '链接'):
+            resident_warm.container_metadata(pack, self.root / 'identity')
+
+    def test_resident_generic_wrong_revision_refuses_before_install(self):
+        resources, adb = self.generic_fixture()
+        adb.current['contentRoot'] = 'sha256-' + '0' * 64
+        called = []
+        with self.assertRaisesRegex(ValueError, '内容根'):
+            self.generic_deploy(resources, adb, lambda *args: called.append(args))
+        self.assertFalse(called)
+        self.assertFalse(adb.started)
+
+    def test_resident_generic_invalid_package_metadata_refuses_before_install(self):
+        resources, _ = self.generic_fixture()
+        path = resources / 'game-build-artifact.json'
+        artifact = json.loads(path.read_text())
+        artifact['package']['manifest'] = 'wrong.json'
+        path.write_text(json.dumps(artifact))
+        adb = GenericResidentAdb(resources)
+        with self.assertRaisesRegex(ValueError, '资源身份'):
+            self.generic_deploy(resources, adb, lambda *args: self.fail('must not install'))
+        self.assertFalse(adb.calls)
+
+    def test_resident_generic_allows_fingerprint_refresh_but_keeps_revision(self):
+        resources, adb = self.generic_fixture()
+        adb.update_fingerprint_on_start = True
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        receipt = self.generic_deploy(resources, adb, install)
+        self.assertEqual(receipt['pid'], 777)
+        self.assertIn('fingerprint', adb.current)
+
+    def test_resident_generic_wrong_prior_apk_refuses_before_install(self):
+        resources, adb = self.generic_fixture()
+        adb.digest = 'e' * 64
+        called = []
+        with self.assertRaisesRegex(ValueError, '原 APK'):
+            self.generic_deploy(resources, adb, lambda *args: called.append(args))
+        self.assertFalse(called)
+        self.assertFalse(adb.started)
+
+    def test_resident_generic_apk_asset_module_does_not_use_revision_path(self):
+        resources, adb = self.generic_fixture()
+        path = resources / 'game-build-artifact.json'
+        artifact = json.loads(path.read_text())
+        artifact['modules'][0]['source'] = 'apk-asset'
+        path.write_text(json.dumps(artifact))
+        with self.assertRaisesRegex(ValueError, 'revision 模块'):
+            self.generic_deploy(resources, adb, lambda *args: self.fail('must not install'))
+        self.assertFalse(adb.calls)
+
+    def test_resident_generic_duplicate_index_refused_before_device(self):
+        resources, adb = self.generic_fixture()
+        index = resources / 'index.tsv'
+        lines = index.read_text().splitlines()
+        index.write_text('\n'.join(lines + [lines[0]]) + '\n')
+        digest = game_apk.sha256(index)
+        manifest_path = resources / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['index_sha256'] = digest
+        manifest_path.write_text(json.dumps(manifest))
+        artifact_path = resources / 'game-build-artifact.json'
+        artifact = json.loads(artifact_path.read_text())
+        artifact['contentRoot'] = 'sha256-' + digest
+        artifact['package']['indexSha256'] = digest
+        artifact_path.write_text(json.dumps(artifact))
+        with self.assertRaisesRegex(ValueError, '索引条目'):
+            self.generic_deploy(resources, adb, lambda *args: self.fail('must not install'))
+        self.assertFalse(adb.calls)
+
+    def test_resident_generic_stale_log_does_not_accept_startup(self):
+        resources, adb = self.generic_fixture()
+        adb.log_epoch = '1699999999.999'
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with patch.object(resident_warm.time, 'monotonic', side_effect=[0, 0, 2]), \
+                patch.object(resident_warm.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, '启动回执'):
+                self.generic_deploy(resources, adb, install, timeout=1)
+        self.assertFalse((self.root / 'container/resident.json').exists())
+
+    def test_resident_generic_pid_change_is_not_accepted(self):
+        resources, adb = self.generic_fixture()
+        adb.switch_pid = True
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with self.assertRaisesRegex(ValueError, 'PID 已变化'):
+            self.generic_deploy(resources, adb, install)
+        self.assertFalse((self.root / 'container/resident.json').exists())
+
+    def test_resident_generic_future_dated_log_does_not_accept_startup(self):
+        resources, adb = self.generic_fixture()
+        adb.log_epoch = '1700000999.000'
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with self.assertRaisesRegex(ValueError, '日志时间'):
+            self.generic_deploy(resources, adb, install)
+        self.assertFalse((self.root / 'container/resident.json').exists())
+
+    def test_resident_generic_changed_cache_stops_before_start(self):
+        resources, adb = self.generic_fixture()
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with patch.object(resident_warm, 'inventory_cache', side_effect=[
+                {'state': 'present', 'files': {'a': 1}, 'sample': {'a': 'a' * 64}},
+                {'state': 'present', 'files': {'a': 2}, 'sample': {'a': 'b' * 64}}]):
+            with self.assertRaisesRegex(ValueError, '缓存'):
+                self.generic_deploy(resources, adb, install)
+        self.assertFalse(adb.started)
+
+    def test_resident_matching_root_installs_once_and_verifies_receipt(self):
+        resources, adb = self.resident_fixture()
+        installs = []
+        def install(apk, package):
+            installs.append((apk, package))
+            adb.digest = game_apk.sha256(apk)
+        work = self.root / 'resident'
+        receipt = self.resident_deploy(self.apk, resources, adb, work, install)
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(receipt['contentRoot'], adb.root)
+        self.assertTrue((work / 'resident.json').is_file())
+        timing = json.loads((work / 'timing.json').read_text())
+        stamps = [timing[k] for k in ('frozen_ms', 'preflight_ms', 'install_verified_ms',
+                                      'refresh_verified_ms', 'startup_verified_ms')]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(set(adb.received),
+                         {'manifest.json', 'index.tsv', 'game-build-artifact.json', 'ctl/control.nacp'})
+        self.assertFalse(any(call[0] == 'install' for call in adb.calls))
+        start = next(call for call in adb.calls if 'MainActivity' in ' '.join(map(str, call)))
+        self.assertIn(('s2arm.graphics_mode', 'direct'),
+                      list(zip(start, start[1:])))
+        self.assertIn(('s2arm.title_id', TITLE), list(zip(start, start[1:])))
+
+    def test_resident_hash_read_failure_never_falls_back_to_ordinary_install(self):
+        resources, adb = self.resident_fixture()
+        adb.fail_hash_call = 3
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with self.assertRaisesRegex(RuntimeError, '禁止普通安装'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install)
+        self.assertFalse(any(call[0] == 'install' for call in adb.calls))
+        self.assertFalse((self.root / 'resident/resident.json').exists())
+
+    def test_resident_wrong_receipt_never_publishes_success(self):
+        resources, adb = self.resident_fixture()
+        adb.receipt = ('sha256-' + 'e' * 64, adb.new_sha)
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        work = self.root / 'resident'
+        with self.assertRaisesRegex(RuntimeError, '导入身份不匹配'):
+            self.resident_deploy(self.apk, resources, adb, work, install)
+        self.assertFalse((work / 'resident.json').exists())
+        self.assertFalse(list(work.rglob('deployment.json')))
+
+    def test_resident_per_game_requires_fresh_game_pid_receipt(self):
+        resources, adb = self.resident_fixture()
+        adb.suppress_game_receipt = True
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        def prepare():
+            monotonic = patch.object(resident_warm.time, 'monotonic', side_effect=[0, 0, 2])
+            sleep = patch.object(resident_warm.time, 'sleep')
+            monotonic.start(); sleep.start()
+            self.addCleanup(monotonic.stop); self.addCleanup(sleep.stop)
+        work = self.root / 'resident'
+        with self.assertRaisesRegex(RuntimeError, '启动回执'):
+            self.resident_deploy(self.apk, resources, adb, work, install, prepare, timeout=1)
+        self.assertFalse((work / 'resident.json').exists())
+
+    def test_resident_import_log_without_pid_is_not_trusted(self):
+        _, adb = self.resident_fixture()
+        adb.name = 'deploy-nonce'
+        adb.raw_import_log = True
+        wrapped = resident_warm._NoInstall(adb, 'org.s2arm.game.t0100000000abcdef')
+        self.assertEqual(wrapped.shell('logcat', '-d', '-v', 'brief', '-s', 'S2Arm:I'), '')
+
+    def test_resident_freezes_inputs_before_installer_can_change_sources(self):
+        resources, adb = self.resident_fixture()
+        original = game_apk.sha256(self.apk)
+        def install(frozen, package):
+            self.assertNotEqual(frozen, self.apk)
+            self.apk.write_bytes(b'changed while installing')
+            (resources / 'game-build-artifact.json').write_text('{}')
+            adb.digest = game_apk.sha256(frozen)
+        work = self.root / 'resident'
+        receipt = self.resident_deploy(self.apk, resources, adb, work, install)
+        self.assertEqual(receipt['apkSha256'], original)
+        self.assertEqual(game_apk.sha256(work / 'frozen/game.apk'), original)
+
+    def test_resident_bad_current_after_import_stops_before_game_start(self):
+        resources, adb = self.resident_fixture()
+        adb.corrupt_current_after_import = True
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with self.assertRaisesRegex(ValueError, '刷新后身份不匹配'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install)
+        self.assertFalse(any('MainActivity' in ' '.join(map(str, call)) for call in adb.calls))
+
+    def test_resident_cache_changes_stop_before_game_start(self):
+        resources, adb = self.resident_fixture()
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with patch.object(resident_warm, 'inventory_cache', side_effect=[
+                {'state': 'present', 'files': {'one': 10}, 'sample': {'one': 'a' * 64}},
+                {'state': 'present', 'files': {'one': 11}, 'sample': {'one': 'b' * 64}}]):
+            with self.assertRaisesRegex(ValueError, '缓存'):
+                self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install)
+        self.assertFalse(any('MainActivity' in ' '.join(map(str, call)) for call in adb.calls))
+
+    def test_resident_refresh_cache_changes_stop_before_game_start(self):
+        resources, adb = self.resident_fixture()
+        unchanged = {'state': 'present', 'files': {'one': 10}, 'sample': {'one': 'a' * 64}}
+        changed = {'state': 'present', 'files': {'one': 10}, 'sample': {'one': 'b' * 64}}
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with patch.object(resident_warm, 'inventory_cache', side_effect=[unchanged, unchanged, changed]):
+            with self.assertRaisesRegex(ValueError, '刷新前后缓存'):
+                self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install)
+        self.assertFalse(any('MainActivity' in ' '.join(map(str, call)) for call in adb.calls))
+
+    def test_resident_same_apk_does_not_install_again(self):
+        resources, adb = self.resident_fixture()
+        adb.old_artifact['apk']['sha256'] = game_apk.sha256(self.apk)
+        adb.old_bytes = json.dumps(adb.old_artifact).encode()
+        adb.old_sha = hashlib.sha256(adb.old_bytes).hexdigest()
+        adb.current['artifactSha256'] = adb.old_sha
+        adb.digest = game_apk.sha256(self.apk)
+        with patch.object(resident_warm, 'inventory_cache', return_value={'state': 'absent'}):
+            calls = []
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident',
+                                 lambda *args: calls.append(args))
+        self.assertEqual(calls, [])
+        self.assertFalse(any(call[0] == 'install' for call in adb.calls))
+
+    def test_resident_wrong_signer_refuses_before_device_mutation(self):
+        resources, adb = self.resident_fixture()
+        with patch.object(game_apk, 'apk_signer_sha256', return_value='b' * 64):
+            with self.assertRaisesRegex(ValueError, '签名'):
+                self.resident_deploy(self.apk, resources, adb, self.root / 'resident',
+                                     lambda *args: self.fail('must not install'))
+        self.assertFalse(adb.calls)
+
+    def test_resident_requires_the_station_fixed_package(self):
+        resources, adb = self.resident_fixture()
+        with self.assertRaisesRegex(ValueError, '固定包名'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident',
+                                 lambda *args: self.fail('must not install'),
+                                 expected_package='test.wrong.package')
+        self.assertFalse(adb.calls)
+
+    def test_resident_missing_import_process_is_not_accepted(self):
+        resources, adb = self.resident_fixture()
+        adb.empty_pid = True
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        with self.assertRaisesRegex(RuntimeError, '无法绑定导入进程'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install)
+        self.assertFalse(any('MainActivity' in ' '.join(map(str, call)) for call in adb.calls))
+
+    def test_resident_invalid_revision_and_old_apk_identity_refuse(self):
+        for mutation in ('revision', 'old_apk'):
+            with self.subTest(mutation=mutation):
+                resources = self.root / ('refresh-' + mutation)
+                game_apk.resources(self.pack, self.apk, resources, refresh_existing=True)
+                adb = ResidentAdb(resources)
+                if mutation == 'revision':
+                    adb.current['revisionDir'] = '../outside'
+                else:
+                    adb.digest = 'e' * 64
+                called = []
+                with self.assertRaises(ValueError):
+                    self.resident_deploy(self.apk, resources, adb, self.root / ('resident-' + mutation),
+                                         lambda *args: called.append(args))
+                self.assertFalse(called)
+                self.assertFalse(any(call[0] in ('install', 'forward') for call in adb.calls))
+
+    def test_resident_rejects_symlinked_refresh_file_before_device(self):
+        resources, adb = self.resident_fixture()
+        control = resources / 'ctl/control.nacp'
+        copied = self.root / 'other-control'
+        copied.write_bytes(control.read_bytes())
+        control.unlink()
+        control.symlink_to(copied)
+        with self.assertRaisesRegex(ValueError, '链接'):
+            self.resident_deploy(self.apk, resources, adb, self.root / 'resident',
+                                 lambda *args: self.fail('must not install'))
+        self.assertFalse(adb.calls)
+
+    def test_resident_prepares_session_once_before_game_start(self):
+        resources, adb = self.resident_fixture()
+        prepared = []
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        def prepare():
+            self.assertFalse(adb.started)
+            prepared.append(True)
+        self.resident_deploy(self.apk, resources, adb, self.root / 'resident', install, prepare)
+        self.assertEqual(prepared, [True])
+        self.assertTrue(adb.started)
+
+    def test_resident_session_preparation_failure_never_starts_game(self):
+        resources, adb = self.resident_fixture()
+        def install(apk, package):
+            adb.digest = game_apk.sha256(apk)
+        def prepare():
+            raise RuntimeError('fixture prepare failed')
+        work = self.root / 'resident'
+        with self.assertRaisesRegex(RuntimeError, 'prepare failed'):
+            self.resident_deploy(self.apk, resources, adb, work, install, prepare)
+        self.assertFalse(adb.started)
+        self.assertFalse((work / 'resident.json').exists())
 
     def test_debug_application_id_is_bound_without_changing_game_identity(self):
         self.identity_mock.return_value = ('org.s2arm.game.t0100000000abcdef.w2', 2, True)
