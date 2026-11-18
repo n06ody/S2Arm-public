@@ -60,6 +60,7 @@ static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0�
 static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
 // 诊断采样窗：S2A_TEST_DIAG_DFLT 设了就全按后端缺省读；否则 nvk_diag_from_s 缺省读 0（其余诊断用例从第一段就要输出），
 // S2A_TEST_NVK_DIAG_<名> 指定值。开窗 / 关窗 / 配置三行存下来给用例核。
+static atomic_int g_ind_logs, g_ind_match, g_ind_cov;
 static atomic_int g_dwin_pass_logs, g_dwin_csd_logs; static char g_dwin_cfg[256], g_dwin_open[256], g_dwin_close[256];
 static atomic_int g_c207_gputime, g_c207_cap;   // 别的线程（回放 / 完成 / 录制）也会调 nvn_plat_flag / nvn_plat_log：这两个用原子读写
 static char g_c207_win[12][512]; static int g_c207_nwin;   // 下面几个只由绘制 / 呈现所在的（测试）线程写
@@ -70,7 +71,7 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
-    if (!strcmp(name, "nvk_csd") || !strcmp(name, "nvk_pass_detail")) return getenv("S2A_TEST_GPU_DIAG_ON") ? 1 : dflt;
+    if (!strcmp(name, "nvk_csd") || !strcmp(name, "nvk_pass_detail") || !strcmp(name, "nvk_ind_args")) return getenv("S2A_TEST_GPU_DIAG_ON") ? 1 : dflt;
     if (!strncmp(name, "nvk_diag_", 9)) {
         if (getenv("S2A_TEST_DIAG_DFLT")) return dflt;
         char env[64]; snprintf(env, sizeof env, "S2A_TEST_NVK_DIAG_%s", name + 9);
@@ -112,6 +113,11 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     if (text && !strncmp(text, "diag_window open", 16)) snprintf(g_dwin_open, sizeof g_dwin_open, "%s", text);
     if (text && !strncmp(text, "diag_window close", 17)) snprintf(g_dwin_close, sizeof g_dwin_close, "%s", text);
     if (text && strstr(text, "gpu pass_detail fence=")) atomic_fetch_add(&g_dwin_pass_logs, 1);
+    if (text && !strncmp(text, "gpu ind_args fence=", 19)) {
+        atomic_fetch_add(&g_ind_logs, 1);
+        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ")) atomic_fetch_add(&g_ind_match, 1);
+    }
+    if (text && !strncmp(text, "gpu ind_args_cov fence=", 23) && strstr(text, "recorded=1 overflow=0 inpass=0 uncovered=1")) atomic_fetch_add(&g_ind_cov, 1);
     if (text && strstr(text, "csf dispatch_time") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_dwin_csd_logs, 1);
     if (text && strstr(text, "csf dispatch_time")) {
         atomic_fetch_add(&g_diag_csd_logs, 1);
@@ -9971,6 +9977,7 @@ static void c1072_pipe_guard(const char *dir) {
 // the pre-change binary run and fail at behavioral assertions, rather than link.
 static int gpu_diag_only(const char *dir) {
     extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+    extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
     const int on = getenv("S2A_TEST_GPU_DIAG_ON") != NULL;
     memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gpu-diag-test";
     if (!open_backend()) return 1;
@@ -9989,6 +9996,10 @@ static int gpu_diag_only(const char *dir) {
     nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
     if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,102,0x1234);
     nvn_gpu_dispatch(c,cp,0,0,0,indirect,0);
+    // 间接参数读回：源是本段计算刚写的 buf（CPU 初值全 0，计算写成 1,2,3,…），读回 1/2/3/4 才说明是按命令顺序拷到的 GPU 值。
+    // 第二笔传空 = 没走拷贝点，只计数。pass 号是接下来那个空通道（0），与 pass_detail 对齐。
+    nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);
+    if (nvn_gpu_diag_ind_args) { nvn_gpu_diag_ind_args(c, buf, 0, 0, 0, 0x11, 0x22, 0x11); nvn_gpu_diag_ind_args(c, NULL, 0, 0, 0, 0, 0, 0); }
     nvn_gpu_pass_desc pass = {0}; pass.w=pass.h=4; pass.layers=1; pass.ncolor=1;
     pass.color[0].view=view; pass.color[0].load=NVN_GPU_LOAD_CLEAR; pass.color[0].store=NVN_GPU_STORE_STORE;
     nvn_gpu_pass_begin(c, &pass); nvn_gpu_pass_end(c);
@@ -9998,6 +10009,8 @@ static int gpu_diag_only(const char *dir) {
           "gpu diag selected dispatch query with exact key and groups: on=%d logs=%d match=%d", on, atomic_load(&g_diag_csd_logs), atomic_load(&g_diag_csd_match));
     CHECK(atomic_load(&g_diag_barrier_match)==on, "gpu diag dispatch neighboring full and guest barriers: on=%d matched=%d", on, atomic_load(&g_diag_barrier_match));
     CHECK(atomic_load(&g_diag_indirect_match)==on, "gpu diag indirect groups unknown without CPU proof: on=%d matched=%d",on,atomic_load(&g_diag_indirect_match));
+    CHECK(atomic_load(&g_ind_logs)==on && atomic_load(&g_ind_match)==on && atomic_load(&g_ind_cov)==on,
+          "gpu diag indirect args readback from GPU-written buffer: on=%d logs=%d match=%d cov=%d", on, atomic_load(&g_ind_logs), atomic_load(&g_ind_match), atomic_load(&g_ind_cov));
     CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,
           "gpu diag empty pass attachment load/store detail: on=%d logs=%d match=%d", on, atomic_load(&g_diag_pass_logs), atomic_load(&g_diag_pass_match));
     const uint32_t *result = (const uint32_t *)buf_cpu(buf); int bad=0;
