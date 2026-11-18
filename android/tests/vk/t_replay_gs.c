@@ -68,7 +68,7 @@ void rp_pass_note_draw(int d) { (void)d; }
 // #950 新增的回放核心依赖：替身取保守中性值（写日志恒报「写过」= 不让暂存命中；没有待折清除、不缩渲染区域）
 uint64_t rp_write_mark(void) { return 0; }
 int rp_write_touched(uint64_t mark, uint64_t addr, uint64_t len) { (void)mark; (void)addr; (void)len; return 1; }
-void rp_pass_prepare_draw(nvn_gpu_cmd c) { (void)c; }
+void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) { (void)c; (void)color_write_mask; }
 void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n) { (void)c; (void)ts; (void)n; }
 int rp_pass_parked(void) { return 0; }
 int rp_pass_begin(nvn_gpu_cmd c) {
