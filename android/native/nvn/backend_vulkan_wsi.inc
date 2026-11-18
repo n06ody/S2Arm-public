@@ -28,10 +28,32 @@ struct nvn_gpu_surface_s {
     uint32_t held_sem;
     uint64_t presents;
     struct wsi_timing timing;
-    VkSurfaceTransformFlagBitsKHR built_transform;   // 建这一代交换链时表面的方向与尺寸：判「次优」是不是真的变了（见 wsi_suboptimal_stale）
-    VkExtent2D built_cur;
+    VkSurfaceTransformFlagBitsKHR built_transform;   // 建链时表面方向；有效尺寸在 extent（见 wsi_suboptimal_stale）
     uint32_t subopt_n;
 };
+
+// 建链与次优检查必须用同一套几何：UINT32_MAX 是「由窗口定尺寸」，不能拿哨兵值判 resize。
+// 固定 currentExtent 是 consumer 的首选尺寸；Android 的窗口查询可能已是 buffer geometry，不能反过来覆盖它。
+static nvn_gpu_rc wsi_geometry(struct nvn_gpu_surface_s *s, const VkSurfaceCapabilitiesKHR *caps, VkExtent2D *out, nvn_gpu_err *err) {
+    if (!(caps->supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "surface 不支持 identity preTransform，内容预旋转未实现");
+    // 已接着的窗口暂时没有绘制面积，不等于 surface 已丢失；保留代际，尺寸恢复后还可 rebuild。
+    int unavailable = s->gen ? NVN_GPU_E_OUTDATED : NVN_GPU_E_REVOKED;
+    VkExtent2D ext = caps->currentExtent;
+    if (ext.width == UINT32_MAX && ext.height == UINT32_MAX) {
+        if (!nvn_plat_window_size(s->native, &ext.width, &ext.height) || !ext.width || !ext.height)
+            return fail(err, unavailable, "窗口没有尺寸");
+    }
+    // 0 不是未定义尺寸，也不是无限上限（与 maxImageCount 的 0 不同）。最小化的 surface 可以报 max=(0,0)。
+    if (!ext.width || !ext.height || !caps->maxImageExtent.width || !caps->maxImageExtent.height)
+        return fail(err, unavailable, "表面没有可建交换链的非零尺寸");
+    if (ext.width < caps->minImageExtent.width) ext.width = caps->minImageExtent.width;
+    if (ext.height < caps->minImageExtent.height) ext.height = caps->minImageExtent.height;
+    if (ext.width > caps->maxImageExtent.width) ext.width = caps->maxImageExtent.width;
+    if (ext.height > caps->maxImageExtent.height) ext.height = caps->maxImageExtent.height;
+    *out = ext;
+    return rc(NVN_GPU_OK);
+}
 
 // 取图 / 呈现回「次优」（VK_SUBOPTIMAL_KHR）时要不要重建交换链。
 // 安卓上交换链按不旋转建（preTransform = IDENTITY，由系统的显示引擎去转），横屏时表面的当前方向是转过的，于是**每一次**呈现都回「次优」。
@@ -42,7 +64,9 @@ static int wsi_suboptimal_stale(struct nvn_gpu_surface_s *s) {
     if (s->subopt_n++ % 30) return 0;
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, s->surface, &caps) != VK_SUCCESS) return 1;
-    return caps.currentTransform != s->built_transform || caps.currentExtent.width != s->built_cur.width || caps.currentExtent.height != s->built_cur.height;
+    VkExtent2D ext;
+    if (!nvn_gpu_ok(wsi_geometry(s, &caps, &ext, NULL))) return 1;
+    return caps.currentTransform != s->built_transform || ext.width != s->extent.width || ext.height != s->extent.height;
 }
 static struct nvn_gpu_surface_s *g_surface;    // 一个后端同时只接一个面
 
@@ -140,16 +164,9 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g.phys, pick.format, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || !(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "交换链格式 %d 不能当拷贝目标", (int)pick.format);
-    VkExtent2D ext = caps.currentExtent;
-    if (ext.width == 0xffffffffu || !ext.width || !ext.height) {   // 表面不报尺寸：问平台要窗口尺寸
-        uint32_t w = 0, h = 0;
-        if (!nvn_plat_window_size(s->native, &w, &h) || !w || !h) return fail(err, NVN_GPU_E_REVOKED, "窗口没有尺寸");
-        ext.width = w; ext.height = h;
-    }
-    if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
-    if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
-    if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
-    if (caps.maxImageExtent.height && ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
+    VkExtent2D ext;
+    nvn_gpu_rc geometry = wsi_geometry(s, &caps, &ext, err);
+    if (!nvn_gpu_ok(geometry)) return geometry;
     uint32_t n = caps.minImageCount == UINT32_MAX ? UINT32_MAX : caps.minImageCount + 1; if (n < 3) n = 3;
     { int extra = nvn_plat_flag("nvk_swap_extra", 0); if (extra > 0 && extra <= 4 && n <= UINT32_MAX - (uint32_t)extra) n += (uint32_t)extra;   // 诊断：多要几张窗口图，看取图的等待是不是交换链反压
       if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
@@ -161,7 +178,7 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     ci.imageExtent = ext; ci.imageArrayLayers = 1; ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     // 预旋转固定用恒等：把当前旋转当预旋转又不转内容，合成器会再转一次（安卓真机实测过的坑）
-    ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
+    ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1));
@@ -199,7 +216,7 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     for (uint32_t i = 0; i < ni + 1; i++) if (!s->acquire[i] && vkCreateSemaphore(g.d, &si, NULL, &s->acquire[i]) != VK_SUCCESS) { wsi_destroy_swapchain(s); return fail(err, NVN_GPU_E_OOM, "信号量创建失败"); }
     for (uint32_t i = 0; i < ni; i++) if (!s->rendered[i] && vkCreateSemaphore(g.d, &si, NULL, &s->rendered[i]) != VK_SUCCESS) { wsi_destroy_swapchain(s); return fail(err, NVN_GPU_E_OOM, "信号量创建失败"); }
     s->held = -1; s->outdated = 0; s->acquire_next = 0;
-    s->built_transform = caps.currentTransform; s->built_cur = caps.currentExtent; s->subopt_n = 0;
+    s->built_transform = caps.currentTransform; s->subopt_n = 0;
     wsi_timing_init(&s->timing, g.d, nvn_plat_flag("display_timing", 0) == 1, g.dev->has_display_timing);
     return rc(NVN_GPU_OK);
 }
