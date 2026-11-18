@@ -21,7 +21,9 @@ static int res_flags_off(void) {
     if (v < 0 || !(++k & 255)) { const char *e = getenv("T_NVN_RES_FLAGS_OFF"); v = e && *e && *e != '0'; }
     return v;
 }
+static int g_flag_tex_shadow;   // 用例设：诊断开关 nvk_tex_log_shadow
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_tex_log_shadow")) return g_flag_tex_shadow;
     if (res_flags_off() && (!strcmp(name, "nvk_bind_fast") || !strcmp(name, "nvk_drv_memo") || !strcmp(name, "nvk_tex_epoch"))) return 0;
     return fixture_plat_flag(name, dflt);
 }
@@ -108,7 +110,8 @@ static void t_res_tex_epoch(void) {
 // wrap = 1 时第 WD 笔再追加 70 条无关事件（超过替身日志容量 64，读者判环绕）。
 // 纪元键仍是全局写代号，所以每笔第一次取都「没命中」；修后没命中时读日志求交，不再逐页比。
 enum { SC_N = 8, SC_D = 32, SC_WD = 10, SC_W = 128, SC_H = 128, SC_UBO = 200 };
-struct scene { uint64_t miss, skip, pages, since, log_n, log_ev, fallback, up[SC_N]; };
+struct scene { uint64_t miss, skip, pages, since, log_n, log_ev, fallback, up[SC_N], sh_n, sh_miss, sh_extra; };
+static int g_sc_silent5, g_sc_phantom6;   // 影子核对用例：第 WD 笔对贴图 5 只推代号不记事件（日志漏写）；对贴图 6 只记事件不推代号（日志多报）
 static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
     struct scene r; memset(&r, 0, sizeof r);
     const int saved_flag = g_flag_buf_dirtylog;
@@ -132,6 +135,8 @@ static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
         fake_log_write(SC_UBO + (size_t)(d % 8), (uint8_t)d);                 // 无关写：贴图之外的一页
         if (write_tex3 && d == SC_WD) fake_log_write(3 * pages_per + 5, 0x77);   // 真写贴图 3 的一页
         if (wrap && d == SC_WD) for (int k = 0; k < 70; k++) fake_log_event(SC_UBO + 20, SC_UBO + 20);   // 日志环绕
+        if (g_sc_silent5 && d == SC_WD) g_block_gen[5 * pages_per + 2] = ++g_dirty_now;          // 漏记事件的写
+        if (g_sc_phantom6 && d == SC_WD) fake_log_event(6 * pages_per + 1, 6 * pages_per + 1);   // 没真写的事件
         for (int rr = 0; rr < 2; rr++) for (int i = 0; i < SC_N; i++) {
             uint64_t u0 = rp_res_uploads();
             CHECK(rp_tex_resolve(&t[i], &g_fake_cmd) != NULL);
@@ -141,14 +146,15 @@ static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
     rp_perf_take(p);
     r.miss = p[RP_PERF_TEX_EPOCH_MISS]; r.skip = p[RP_PERF_TEX_EPOCH]; r.pages = p[RP_PERF_TEX_CHECK_PAGES]; r.since = g_since_calls;
     r.log_n = p[RP_PERF_TEX_LOG_N]; r.log_ev = p[RP_PERF_TEX_LOG_EV]; r.fallback = p[RP_PERF_TEX_LOG_FALLBACK];
-    CHECK(r.pages == g_since_pages);                    // 页数计数与独立账一致
+    r.sh_n = p[RP_PERF_TEX_SHADOW_N]; r.sh_miss = p[RP_PERF_TEX_SHADOW_MISS]; r.sh_extra = p[RP_PERF_TEX_SHADOW_EXTRA];
+    CHECK(r.pages + (g_flag_tex_shadow ? r.sh_n * (SC_W * SC_H * 4 / PG) : 0) == g_since_pages);   // 页数计数与独立账一致（影子核对另调的逐页比不进计数）
     for (int i = 0; i < SC_N; i++) nvn_be_tex_release(&t[i]);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     g_block_mem = NULL; g_log_fake_on = 0; g_flag_buf_dirtylog = saved_flag;
-    printf("tex-epoch scene log=%d write=%d wrap=%d: miss=%llu skip=%llu pages=%llu since=%llu log_checks=%llu log_events=%llu fallback=%llu up3=%llu up_other=%llu\n",
+    printf("tex-epoch scene log=%d write=%d wrap=%d: miss=%llu skip=%llu pages=%llu since=%llu log_checks=%llu log_events=%llu fallback=%llu up3=%llu up_other=%llu shadow=%llu/%llu/%llu\n",
            log_on, write_tex3, wrap, (unsigned long long)r.miss, (unsigned long long)r.skip, (unsigned long long)r.pages, (unsigned long long)r.since,
            (unsigned long long)r.log_n, (unsigned long long)r.log_ev, (unsigned long long)r.fallback, (unsigned long long)r.up[3],
-           (unsigned long long)(r.up[0] + r.up[1] + r.up[2] + r.up[4] + r.up[5] + r.up[6] + r.up[7]));
+           (unsigned long long)(r.up[0] + r.up[1] + r.up[2] + r.up[4] + r.up[5] + r.up[6] + r.up[7]), (unsigned long long)r.sh_n, (unsigned long long)r.sh_miss, (unsigned long long)r.sh_extra);
     return r;
 }
 static void t_res_tex_epoch_unrelated(void) {
@@ -169,6 +175,24 @@ static void t_res_tex_epoch_unrelated(void) {
     struct scene onx = tex_log_scene(1, 1, 1);
     for (int i = 0; i < SC_N; i++) CHECK(onx.up[i] == offw.up[i]);
     CHECK(onx.fallback == SC_N && onx.since == SC_N && onx.pages == SC_N * PP && onx.log_n == ND - SC_N);
+}
+
+// 影子核对（诊断开关 nvk_tex_log_shadow，缺省关）：日志路判完再按逐页代号判一次，不一致计次、前 8 张报行；不改判脏结论。
+static void t_res_tex_shadow(void) {
+    const uint64_t ND = (uint64_t)SC_N * SC_D;
+    struct scene off = tex_log_scene(1, 1, 0);           // 缺省关：一次都不影子核对
+    CHECK(off.sh_n == 0 && off.sh_miss == 0 && off.sh_extra == 0);
+    g_flag_tex_shadow = 1;
+    struct scene on = tex_log_scene(1, 1, 0);            // 两路一致：每次日志核对都影子一次，0 不一致；判脏结果与关时相同
+    CHECK(on.sh_n == ND && on.sh_miss == 0 && on.sh_extra == 0);
+    for (int i = 0; i < SC_N; i++) CHECK(on.up[i] == off.up[i]);
+    const int red0 = g_red_lines;
+    g_sc_silent5 = 1; g_sc_phantom6 = 1;
+    struct scene dis = tex_log_scene(1, 1, 0);           // 贴图 5：日志净、逐页脏（报红）；贴图 6：日志脏、逐页净（报信息）
+    g_sc_silent5 = g_sc_phantom6 = 0; g_flag_tex_shadow = 0;
+    CHECK(dis.sh_miss == SC_D - SC_WD && dis.sh_extra == 1);   // 漏掉的写之后每笔都不一致（贴图 5 一直没重传）；多报的事件只一次（重传后重起游标）
+    CHECK(g_red_lines == red0 + 8 && strstr(g_last_red, "贴图影子核对不一致") && strstr(g_last_red, "日志判净、逐页判脏") && strstr(g_last_red, "序号 955 "));
+    CHECK(dis.up[5] == 0 && dis.up[6] == 1 && dis.up[3] == 1);   // 只计数不改结论：照日志路的判法传
 }
 
 // ---------- ② B1 整组沿用 + B3 驱动段按内容命中（rp_draw.c）----------
@@ -296,6 +320,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     t_res_tex_epoch();
     t_res_tex_epoch_unrelated();
+    t_res_tex_shadow();
     t_res_bind_fast();
     t_res_pipe_layout();
     printf("t_nvn_res：%d 项检查，%d 项红\n", g_checks, g_fail);

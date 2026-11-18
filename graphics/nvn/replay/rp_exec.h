@@ -97,6 +97,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
        RP_PERF_WAIT_FAKED_N,   // 实验开关 nvk_sync_lag 下「没真等」的等待次数（量重叠上限用，画面可能错）
+       RP_PERF_TEX_SHADOW_N, RP_PERF_TEX_SHADOW_MISS, RP_PERF_TEX_SHADOW_EXTRA,   // 诊断 nvk_tex_log_shadow：影子核对次数 / 日志判净而逐页判脏 / 日志判脏而逐页判净
        RP_PERF_TEX_LOG_N, RP_PERF_TEX_LOG_EV, RP_PERF_TEX_LOG_FALLBACK,   // CPU 贴图内容按脏页日志核对的次数 / 读到的事件数 / 日志不可用、退回整张逐页比的次数
        RP_PERF_TEX_EPOCH_MISS, RP_PERF_TEX_CHECK_PAGES,   // CPU 贴图内容检查：本可按纪元跳过却没跳成的次数（已传过、没待重传、有跟踪句柄，但全局写代号 / 段号 / 映射代际变了）；逐页比对写代号的页数（每次调 nvn_dirty_since 记整个范围的页数，是上限：遇到脏页会提前停）
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值

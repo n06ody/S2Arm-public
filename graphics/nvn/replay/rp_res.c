@@ -24,7 +24,8 @@ struct rp_tex {
     uint8_t in_alias;
     uint8_t check_dirty;       // 上次核对内容时判过脏、但没能传（没有段 / 上传失败）：下一次必须重查
     uint8_t log_ok;            // 在所属池的脏页追加日志上有游标（log_span / log_id / log_cur）：核对只读游标之后的事件、与本贴图范围求交
-    uint8_t _rsv[2];
+    uint8_t log_shadow;        // 诊断开关 nvk_tex_log_shadow（上传时读）：日志路判完再按逐页代号判一次，不一致计次并报前 8 张
+    uint8_t _rsv[1];
     uint64_t uid;              // 创建序号（只增、不回收）：按存储取视图的表（g_vf）用它认存储——存储释放后新分配可能落在同一地址，不能拿指针当身份
     uint64_t seen;             // 共用表里的：最近一次被查到 / 新建时的提交号 + 1（alias_take_over 用）
     uint64_t wrote;            // 最近一次被 GPU 写时的提交号 + 1（0 = 没写过）
@@ -221,10 +222,20 @@ static int cpu_content(const tex_t *t) {
 // 脏页追加日志游标（开关 nvk_buf_dirtylog，安卓缺省开、同 rp_buf）：在加保护、取代号之前起（先起游标、后读代号），
 // 之后这张贴图的页再变可写必然在游标之后留一条事件。只在上传时读开关；开关关 / 起不了日志时 log_ok = 0，核对照旧整张逐页比。
 static void tex_log_arm(struct rp_tex *x, const tex_t *t) {
-    x->log_ok = 0;
+    x->log_ok = 0; x->log_shadow = 0;
     if (!nvn_plat_flag("nvk_buf_dirtylog", 1)) return;
     const void *sp = nvn_dirty_span(t->mem, t->L.size);
-    if (sp && nvn_dirty_log_open(sp, &x->log_id, &x->log_cur)) { x->log_span = sp; x->log_ok = 1; }
+    if (sp && nvn_dirty_log_open(sp, &x->log_id, &x->log_cur)) { x->log_span = sp; x->log_ok = 1; x->log_shadow = nvn_plat_flag("nvk_tex_log_shadow", 0) != 0; }
+}
+// 影子核对（诊断，缺省关）：两路判脏不一致时报前 8 张（每个方向各 8 张）。日志判净而逐页判脏 = 日志漏了写，画面可能旧，报红；反过来只是多传一次，报信息。
+static unsigned g_shadow_said[2];
+static void tex_shadow_note(const tex_t *t, int log_dirty, int page_dirty, uint64_t ev) {
+    const int miss = !log_dirty && page_dirty;
+    if (g_shadow_said[miss] >= 8) return;
+    char b[320]; snprintf(b, sizeof b, "贴图影子核对不一致 #%u：序号 %llu %ux%u 格式 %#x 级 %u 层 %u 大小 %llu 字节 地址 %p；日志判%s、逐页判%s（本次读事件 %llu 条）",
+        ++g_shadow_said[miss], (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, t->d.levels, t->L.layers, (unsigned long long)t->L.size, (const void *)t->mem,
+        log_dirty ? "脏" : "净", page_dirty ? "脏" : "净", (unsigned long long)ev);
+    nvn_plat_log(miss ? NVN_PLAT_LOG_RED : NVN_PLAT_LOG_INFO, "tex", b);
 }
 struct tex_log_q { uintptr_t a, b; uint64_t ev; int hit; };
 static void tex_log_event(void *u, uintptr_t a, uintptr_t b) { struct tex_log_q *q = u; q->ev++; if (a < q->b && b > q->a) q->hit = 1; }
@@ -236,6 +247,11 @@ static int tex_content_dirty(struct rp_tex *x, const tex_t *t) {
         struct tex_log_q q = { a, a + t->L.size, 0, 0 };
         if (x->log_span == x->span && nvn_dirty_log_read(x->log_span, x->log_id, &x->log_cur, tex_log_event, &q)) {
             rp_perf_add(RP_PERF_TEX_LOG_N, 1); rp_perf_add(RP_PERF_TEX_LOG_EV, q.ev);
+            if (x->log_shadow) {   // 影子：同一时刻按逐页代号再判一次（只计数，不改结论）
+                const int pd = nvn_dirty_since(t->mem, t->L.size, x->stamp);
+                rp_perf_add(RP_PERF_TEX_SHADOW_N, 1);
+                if (pd != q.hit) { rp_perf_add(pd ? RP_PERF_TEX_SHADOW_MISS : RP_PERF_TEX_SHADOW_EXTRA, 1); tex_shadow_note(t, q.hit, pd, q.ev); }
+            }
             return q.hit;
         }
         rp_perf_add(RP_PERF_TEX_LOG_FALLBACK, 1);
@@ -926,6 +942,7 @@ nvn_gpu_samp rp_samp_for_tex(int sid, int tid) {
 
 void rp_res_reset(void) {
     pthread_mutex_lock(&g_rmu);
+    g_shadow_said[0] = g_shadow_said[1] = 0;
     for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i]);
     vf_drop_serial(0);
     for (int target = 0; target <= NVN_TEXTURE_TARGET_BUFFER; target++) for (int cls = 0; cls < 4; cls++) {
