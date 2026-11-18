@@ -728,6 +728,22 @@ static _Atomic uint64_t g_empty_slot_zero;   // 空槽绑零贴图的次数（#1
 uint64_t rp_empty_slot_zero_count(void) { return atomic_load(&g_empty_slot_zero); }
 nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, const tex_t **t_out) {
     if (!dtt) return rp_view_by_id(id, c, t_out);
+    if (elem) {
+        tex_t t; view_t v; int has_v;
+        if (rp_tex_snap_by_id(id, &t, &v, &has_v)) {
+            nvn_fmt_info fi;
+            uint32_t fmt = has_v && v.set_format ? v.format : (uint32_t)t.d.format;
+            if (nvn_fmt_info_of(fmt, &fi)) {
+                int stencil = fi.stencil && (!fi.depth || (has_v && v.set_dsmode && v.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL));
+                int cls = stencil || fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
+                if (cls && cls != dcls) {
+                    if (t_out) *t_out = NULL;
+                    nvn_unimpl("tex", "sampled_array_numeric_mismatch", NULL);
+                    return NULL;   // 不能用零元素掩盖已登记的整数视图。
+                }
+            }
+        }
+    }
     nvn_gpu_view out = view_by_id_decl(id, dtt, dcls, c, t_out);
     // 贴图数组里取不到的元素：描述符数组每项都要有效，用声明类型的零贴图顶上（类型与声明一致，不再拿别的元素凑）
     if (!out && elem) out = decl_zero(dtt, dcls, c);
