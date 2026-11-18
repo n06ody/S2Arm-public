@@ -542,7 +542,7 @@ static nvn_gpu_buf g_sb_buf[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static uint64_t g_
 static uint8_t g_sb_ok[RP_PROG_STAGES][RP_PROG_ENT_MAX];
 // Per-draw GPU-populated driver slices. Never retained by the binding cache.
 // 弱链接[replay]：nvn_gpu_diag_ind_args
-extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
+extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, const uint32_t *, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
 static nvn_gpu_slice g_ind_drv[RP_PROG_STAGES];
 static uint8_t g_ind_drv_ok[RP_PROG_STAGES];
 static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance) {
@@ -1132,7 +1132,10 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         static int ia_on = -1; if (ia_on < 0) ia_on = nvn_plat_flag("nvk_ind_args", 0) != 0;
         if (nvn_gpu_diag_ind_args && ia_on) {   // 诊断：同一收通道点读回间接参数；没走拷贝点的只计数（不为诊断收通道）
             uint64_t vk = 0, fk = 0; for (int i = 0; i < 8; i++) { vk = (vk << 8) | rp_S.skey[0][i]; fk = (fk << 8) | rp_S.skey[1][i]; }   // NVN 阶段：0 顶点、1 片元
-            nvn_gpu_diag_ind_args(c, copied ? a.ind : NULL, a.ind_off, di != NULL, a.cnt != NULL, vk, fk, rp_S.skey_ok);
+            // 编码这一刻游戏内存里的这条记录（CPU 侧）：与段完成后的 GPU 读回对照，看清零 / 模板值是否按 GPU 顺序生效
+            uint32_t gw[5] = {0}; const uint32_t *gp = NULL; const uint64_t gb = di ? 20 : 16;
+            if (rp_pool_find(ind, gb, NULL, NULL)) { memcpy(gw, (const void *)(uintptr_t)ind, (size_t)gb); gp = gw; }
+            nvn_gpu_diag_ind_args(c, copied ? a.ind : NULL, a.ind_off, ind, gp, di != NULL, a.cnt != NULL, vk, fk, rp_S.skey_ok);
         }
         if (copied) nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // transfer writes visible to driver uniform reads
     }

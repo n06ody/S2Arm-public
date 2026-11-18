@@ -244,7 +244,7 @@ struct pass_details { struct pass_detail p[TS_PASS_MAX]; uint32_t events, overfl
 #define IND_ARGS_MAX 256
 struct ind_args {
     uint32_t n, overflow, uncovered, inpass;
-    struct { uint32_t pass, indexed, multi, keys_ok; uint64_t vkey, fkey, csd_seq, csd_key; const uint8_t *cpu; } e[IND_ARGS_MAX];
+    struct { uint32_t pass, indexed, multi, keys_ok; uint64_t vkey, fkey, csd_seq, csd_key, va, off; uint32_t g_count, g_inst, g_ok; const uint8_t *cpu; } e[IND_ARGS_MAX];
 };
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
@@ -1697,7 +1697,7 @@ static void pass_detail_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int sta
 // 回放在 firstInstance 拷贝点（已收通道、拷贝 + 间接屏障之前）调：多拷一份间接参数（非索引 16 字节 / 索引 20 字节）到暂存片。
 // 不另收通道，通道结构与诊断关时一样；pass 号是这一笔接下来要开的通道（与 pass_detail 的 pass 对齐）。
 // ind 为空 = 这一笔间接绘制没走拷贝点（阶段已证不读 base instance），只计数（读不到参数，不为它收通道）。
-void nvn_gpu_diag_ind_args(nvn_gpu_cmd c, nvn_gpu_buf ind, uint64_t off, int indexed, int multi, uint64_t vkey, uint64_t fkey, uint32_t keys_ok) {
+void nvn_gpu_diag_ind_args(nvn_gpu_cmd c, nvn_gpu_buf ind, uint64_t off, uint64_t guest_va, const uint32_t *guest, int indexed, int multi, uint64_t vkey, uint64_t fkey, uint32_t keys_ok) {
     if (!c || !c->ind_on) return;
     if (!c->ind_args && !(c->ind_args = calloc(1, sizeof *c->ind_args))) { c->ind_on = 0; nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu","gpu ind_args coverage=unavailable reason=allocation"); return; }
     struct ind_args *a = c->ind_args;
@@ -1710,23 +1710,25 @@ void nvn_gpu_diag_ind_args(nvn_gpu_cmd c, nvn_gpu_buf ind, uint64_t off, int ind
     nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);
     a->e[a->n].pass = c->ntsp; a->e[a->n].indexed = (uint32_t)!!indexed; a->e[a->n].multi = (uint32_t)!!multi;
     a->e[a->n].keys_ok = keys_ok; a->e[a->n].vkey = vkey; a->e[a->n].fkey = fkey; a->e[a->n].cpu = sl.cpu;
-    a->e[a->n].csd_seq = c->ind_csd_seq; a->e[a->n].csd_key = c->ind_csd_key;
+    a->e[a->n].csd_seq = c->ind_csd_seq; a->e[a->n].csd_key = c->ind_csd_key; a->e[a->n].va = guest_va; a->e[a->n].off = off;
+    a->e[a->n].g_ok = guest != NULL; a->e[a->n].g_count = guest ? guest[0] : 0; a->e[a->n].g_inst = guest ? guest[1] : 0;
     a->n++;
 }
 static void ind_args_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status) {
     struct ind_args *a = c ? c->ind_args : NULL; if (!a) return;
     for (uint32_t i = 0; i < a->n; i++) {
-        char line[400];
+        char line[640];
         if (status != NVN_GPU_DONE_OK) {
             snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u source=unavailable reason=fence_failed_or_not_submitted", (unsigned long long)signal, a->e[i].pass);
             nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", line); continue;
         }
         uint32_t w[5] = {0}; memcpy(w, a->e[i].cpu, a->e[i].indexed ? 20 : 16);
+        char gc[16] = "na", gi[16] = "na"; if (a->e[i].g_ok) { snprintf(gc, sizeof gc, "%u", a->e[i].g_count); snprintf(gi, sizeof gi, "%u", a->e[i].g_inst); }
         // 非索引：vertexCount, instanceCount, firstVertex, firstInstance；索引：indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
         int32_t bv = a->e[i].indexed ? (int32_t)w[3] : 0; uint32_t fi = a->e[i].indexed ? w[4] : w[3];
-        snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u indexed=%u multi=%u count=%u instances=%u first=%u base_vertex=%d first_instance=%u vs_key=%016llx fs_key=%016llx keys_ok=0x%x after_csd_seq=%llu",
+        snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u indexed=%u multi=%u count=%u instances=%u first=%u base_vertex=%d first_instance=%u vs_key=%016llx fs_key=%016llx keys_ok=0x%x after_csd_seq=%llu ind_va=0x%llx buf_off=%llu guest_count=%s guest_instances=%s",
             (unsigned long long)signal, a->e[i].pass, a->e[i].indexed, a->e[i].multi, w[0], w[1], w[2], bv, fi,
-            (unsigned long long)a->e[i].vkey, (unsigned long long)a->e[i].fkey, a->e[i].keys_ok, (unsigned long long)a->e[i].csd_seq);
+            (unsigned long long)a->e[i].vkey, (unsigned long long)a->e[i].fkey, a->e[i].keys_ok, (unsigned long long)a->e[i].csd_seq, (unsigned long long)a->e[i].va, (unsigned long long)a->e[i].off, gc, gi);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
         // 每个 csd 选中派发之后的第一笔读回：把「哪次派发之后出现这组参数」直接对上（同段内、到下一次选中派发为止都记在它名下）
         if (a->e[i].csd_seq && (i == 0 || a->e[i-1].csd_seq != a->e[i].csd_seq)) {

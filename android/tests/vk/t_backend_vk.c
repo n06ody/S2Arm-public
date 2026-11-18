@@ -115,7 +115,7 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     if (text && strstr(text, "gpu pass_detail fence=")) atomic_fetch_add(&g_dwin_pass_logs, 1);
     if (text && !strncmp(text, "gpu ind_args fence=", 19)) {
         atomic_fetch_add(&g_ind_logs, 1);
-        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ") && strstr(text, " after_csd_seq=102")) atomic_fetch_add(&g_ind_match, 1);
+        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ") && strstr(text, " after_csd_seq=102 ind_va=0xabc000 buf_off=0 guest_count=9 guest_instances=705")) atomic_fetch_add(&g_ind_match, 1);
     }
     if (text && !strncmp(text, "csf dispatch_next_ind seq=102 key=0000000000001234 ", 51) && strstr(text, " pass=0 count=1 instances=2 first_instance=4 draws_after=1 nonzero_after=1")) atomic_fetch_add(&g_ind_next, 1);
     if (text && !strncmp(text, "gpu ind_args_cov fence=", 23) && strstr(text, "recorded=1 overflow=0 inpass=0 uncovered=1")) atomic_fetch_add(&g_ind_cov, 1);
@@ -10361,7 +10361,7 @@ static void c1072_pipe_guard(const char *dir) {
 // the pre-change binary run and fail at behavioral assertions, rather than link.
 static int gpu_diag_only(const char *dir) {
     extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
-    extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
+    extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, const uint32_t *, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
     const int on = getenv("S2A_TEST_GPU_DIAG_ON") != NULL;
     memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gpu-diag-test";
     if (!open_backend()) return 1;
@@ -10383,7 +10383,7 @@ static int gpu_diag_only(const char *dir) {
     // 间接参数读回：源是本段计算刚写的 buf（CPU 初值全 0，计算写成 1,2,3,…），读回 1/2/3/4 才说明是按命令顺序拷到的 GPU 值。
     // 第二笔传空 = 没走拷贝点，只计数。pass 号是接下来那个空通道（0），与 pass_detail 对齐。
     nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);
-    if (nvn_gpu_diag_ind_args) { nvn_gpu_diag_ind_args(c, buf, 0, 0, 0, 0x11, 0x22, 0x11); nvn_gpu_diag_ind_args(c, NULL, 0, 0, 0, 0, 0, 0); }
+    if (nvn_gpu_diag_ind_args) { { static const uint32_t g5[5] = {9, 705, 0, 0, 0}; nvn_gpu_diag_ind_args(c, buf, 0, 0xabc000, g5, 0, 0, 0x11, 0x22, 0x11); } nvn_gpu_diag_ind_args(c, NULL, 0, 0, NULL, 0, 0, 0, 0, 0); }
     nvn_gpu_pass_desc pass = {0}; pass.w=pass.h=4; pass.layers=1; pass.ncolor=1;
     pass.color[0].view=view; pass.color[0].load=NVN_GPU_LOAD_CLEAR; pass.color[0].store=NVN_GPU_STORE_STORE;
     nvn_gpu_pass_begin(c, &pass); nvn_gpu_pass_end(c);
