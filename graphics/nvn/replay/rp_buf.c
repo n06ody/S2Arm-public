@@ -27,9 +27,11 @@ struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; };   // GPU 写�
 // path：这份镜像走哪条核对路（建镜像时定，之后不变）：MP_LOG = 脏页追加日志（缺省，开关 nvk_buf_dirtylog=0 可关）；MP_PLAIN = 逐页（日志不可用时的退回路径）。
 // 脏页追加日志（#1501 A②）：stale 每页一位 =「这份镜像里这页是旧的」，stale_sum 每位汇总 stale 的一个字（一位管 64 页，一个字管 4096 页）；
 // log_cur / log_id：这份镜像在池的追加日志里读到哪（nvn_dirty_log_*）。两份镜像各有一套，互不影响。
-enum { MP_PLAIN = 0, MP_LOG = 2 };
+enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32 };
+struct read_range { uint64_t sub, lo, hi; };   // 页区间 [lo, hi]；同桶碰撞取包络，宁可多走有序传输
 struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
-                uint64_t *stale, *stale_sum; uint64_t log_cur, log_id; };
+                uint64_t *stale, *stale_sum; uint64_t log_cur, log_id;
+                struct read_range reads[READ_BUCKETS]; };
 // 每个池最多两份镜像。平时只有第 0 份；游戏的 Finish 被放行、不等上一帧做完时（rp_exec.c nvn_be_finish_publish），每帧换一份用：
 // 上一帧的活显卡还在做，读的是另一份。两份各记各的页代号，换回来时自己把这两帧里变过的页补上。
 // landing：正在锁外把 GPU 写回的内容拷进游戏内存（拷贝是 13 MB/帧量级，压在全局锁里会把提交线程挡住 11–21 毫秒/帧）。
@@ -248,6 +250,25 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     pthread_mutex_unlock(&g_bmu);
 }
 
+// 每次成功解析只写一个桶，不逐页扫描；碰撞合并包络不会漏掉已读范围。
+// 只在脏页要同步时扫固定数量的桶；同一提交即使拆段也不能直接覆盖先前绘制会读的镜像。
+static void mirror_note_read(struct mirror *m, uint64_t lo, uint64_t hi) {
+    uint64_t sub = rp_sub_serial();
+    uint64_t h = lo ^ (hi * UINT64_C(0x9e3779b97f4a7c15));
+    struct read_range *r = &m->reads[(h ^ (h >> 32)) & (READ_BUCKETS - 1)];
+    if (r->sub != sub) { *r = (struct read_range){sub, lo, hi}; return; }
+    if (lo < r->lo) r->lo = lo;
+    if (hi > r->hi) r->hi = hi;
+}
+static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
+    uint64_t sub = rp_sub_serial();
+    for (int i = 0; i < READ_BUCKETS; i++) {
+        const struct read_range *r = &m->reads[i];
+        if (r->sub == sub && r->lo <= hi && lo <= r->hi) return 1;
+    }
+    return 0;
+}
+
 // 锁内版：调用方已持有 g_bmu，mem/size 是调用方查好的池。一笔绘制常要解析 3~4 段（顶点流 + 存储缓冲），
 // 逐段各抢一次全局锁时「找池取镜像」在重叠档读到 13.7–16.6 毫秒/帧（5627 次、每次约 2.4 微秒）——
 // 大头是这把锁与完成线程（落地 GPU 写）互抢，所以另给批量入口，一笔绘制只抢一次。
@@ -259,6 +280,7 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         if (b > (uintptr_t)mem + size) b = (uintptr_t)mem + size;
         nvn_dirty_protect((const void *)a, b - a); uint64_t st = nvn_dirty_now(); if (!st) st = 1;   // 先保护、取代号、再读
         uint64_t last = 0; for (uint64_t k = i; k <= j; k++) if (m->sub[k] > last) last = m->sub[k];
+        if (mirror_read_hit(m, i, j)) last = rp_sub_serial();   // 干净读取也属于本次提交，不得在 GPU 读之前直写镜像
         // 本次提交里第一次同步这一串：镜像是 CPU 也能写的共享缓冲，直接写进去，不录成 GPU 上的拷贝（理由与真机读数见坑记录）。
         // 正在拷回的段数多于登记数（表满 16 段没记上）→ 说不清哪段在拷，按原口径整池退回录拷贝
         int landing_hit = s->landing > s->nlr;   // 这一段里有没有正在锁外拷回的区间与 [a,b) 相交：有就只能退回录拷贝
@@ -343,12 +365,22 @@ static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, 
     if (q0) rp_perf_add(RP_PERF_RES_LA_NS, res_now() - q0);
     return 1;
 }
+static int resolve_inner(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m) {
+    if (m->path == MP_LOG) return resolve_log(addr, len, mem, size, s, m);
+    return resolve_part_locked(addr, len, mem, size, s, m, 1);   // 日志不可用（不受写跟踪 / 重叠池 / 跟踪不可靠 / 开关关）
+}
 static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size) {
     struct shadow *s = shadow_get(mem, size);
     if (!s) return 0;
+    // 整段先选一次镜像：未落地的 GPU 写可能只覆盖其中一个摘要块。
     struct mirror *m = mirror_pick(s, addr - (uint64_t)(uintptr_t)mem, len, NULL);
-    if (m->path == MP_LOG) return resolve_log(addr, len, mem, size, s, m);
-    return resolve_part_locked(addr, len, mem, size, s, m, 1);   // 日志不可用（不受写跟踪 / 重叠池 / 跟踪不可靠 / 开关关）
+    int ok = resolve_inner(addr, len, mem, size, s, m);
+    if (ok) {
+        const size_t ps = nvn_dirty_page_size();
+        uint64_t lo = ((uintptr_t)addr - s->page0) / ps, hi = ((uintptr_t)addr + len - 1 - s->page0) / ps;
+        mirror_note_read(m, lo, hi);
+    }
+    return ok;
 }
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
     (void)c;
