@@ -724,10 +724,15 @@ internal static unsafe class Program
         {
             try
             {
-                var spillResult = DirectSharedSpill.Rewrite(File.ReadAllBytes(args[1]), int.Parse(args[3]), 0, 1);
+                int limit = int.Parse(args[3]);
+                var spillResult = DirectSharedSpill.Rewrite(File.ReadAllBytes(args[1]), limit, 0, 1);
                 if (spillResult == null) throw new DirectCompileException("UNSUPPORTED_PROGRAM", "fixture did not require a spill");
+                // 重新解析产物，不能只信选择器自己的 remaining 账本：留在 Workgroup 的数组必须真的不超过设备上限。
+                int measured = DirectSharedSpill.WorkgroupBytes(spillResult.Spirv);
+                if (measured < 0 || measured != spillResult.RemainingSharedBytes || measured > limit)
+                    throw new DirectCompileException("RESOURCE_LIMIT", $"spill retained workgroup bytes {measured}, reported {spillResult.RemainingSharedBytes}, limit {limit}");
                 File.WriteAllBytes(args[2], spillResult.Spirv);
-                Console.WriteLine($"spill bytes/group={spillResult.BytesPerGroup} remaining={spillResult.RemainingSharedBytes} set={spillResult.Set} binding={spillResult.Binding}");
+                Console.WriteLine($"spill bytes/group={spillResult.BytesPerGroup} remaining={spillResult.RemainingSharedBytes} measured={measured} set={spillResult.Set} binding={spillResult.Binding}");
                 return;
             }
             catch (DirectCompileException e) { Console.Error.WriteLine($"{e.Code}: {e.Message}"); Environment.Exit(1); }
