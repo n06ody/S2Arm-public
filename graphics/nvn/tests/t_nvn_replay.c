@@ -150,7 +150,7 @@ static uint32_t g_caps_stor[4];   // 用例：这些格式在替身设备上也�
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
 static uint32_t g_caps_nofilter = ~0u, g_caps_noblend = ~0u;   // #1072：这个格式在替身设备上不能线性过滤 / 不能混合（FMT_FILTER / FMT_BLEND 去掉）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
-    uint32_t c = f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE | NVN_GPU_FMT_BLEND : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE;
+    uint32_t c = f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE | NVN_GPU_FMT_BLEND : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA32F || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE;
     for (int k = 0; k < 4; k++) if (g_caps_stor[k] && f == g_caps_stor[k]) c = NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_STORAGE;   // 用例指定的存储图像格式
     c |= NVN_GPU_FMT_FILTER;
     if (f == g_caps_nofilter) c &= ~(uint32_t)NVN_GPU_FMT_FILTER;
@@ -412,8 +412,13 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
 // 绘制替身：着色器来源给一份固定布局的程序；后端记下管线描述、绑定和绘制参数
 struct nvn_gpu_shader_s { int x; }; struct nvn_gpu_pipe_s { int x; };
 static struct nvn_gpu_shader_s g_fsh[3]; static struct nvn_gpu_pipe_s g_fpipe;
-static struct rp_prog g_fprog; static int g_resolves, g_resolve_rc; static struct rp_shader_req g_last_req;
-int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) { g_resolves++; g_last_req = *q; *out = g_resolve_rc ? NULL : &g_fprog; return g_resolve_rc; }
+static struct rp_prog g_fprog, g_variant_prog; static struct nvn_gpu_shader_s g_variant_fs; static int g_rt_variant;
+static int g_resolves, g_resolve_rc; static struct rp_shader_req g_last_req;
+int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) {
+    g_resolves++; g_last_req = *q;
+    *out = g_resolve_rc ? NULL : (g_rt_variant && q->rt_format[0] == NVN_FORMAT_RGBA32UI ? &g_variant_prog : &g_fprog);
+    return g_resolve_rc;
+}
 // 计算：程序、管线、派发的替身
 static struct rp_prog g_cprog; static int g_cresolves, g_cresolve_rc, g_cpipe_gets, g_ndisp; static uint32_t g_disp[3]; static struct nvn_gpu_pipe_s *g_disp_pipe; static nvn_gpu_shader g_cpipe_sh;
 static nvn_gpu_buf g_disp_ind; static uint64_t g_disp_off;
@@ -2287,6 +2292,70 @@ static void q_env(stream *s) {
     p_viewports *vp = put(s, OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = 64; vp->v[0][3] = 36;
 }
 static void q_draw(stream *s) { p_draw *d = put(s, OP_DRAW, sizeof *d); d->prim = 4; d->count = 3; d->instances = 1; }
+
+static void put_set_rt_v(stream *s, const tex_t *color, const view_t *cv);
+// 连续绘制只改一项状态：后端必须拿到该次绘制的管线描述；不变的命令不额外重取。
+static void dirty_strip(stream *s, uint64_t base) {
+    p_draw_idx *d = put(s, OP_DRAW_IDX, sizeof *d); d->prim = 5; d->itype = 1; d->count = 4; d->instances = 1; d->ibuf = base;
+}
+static void dirty_exec(stream *s) { end(s); nvn_be_exec(s->b); }
+static void t_pipeline_dirty_changes(void) {
+    pass_fresh(); g_resolve_rc = 0; g_pg_tracked = 0; memset(g_pmem, 0, sizeof g_pmem);
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem); nvn_be_sub_begin();
+    stream first = {0}; q_env(&first); dirty_strip(&first, base); dirty_exec(&first);
+    CHECK(g_last_pdesc.prim_restart == 0 && g_last_pdesc.rast_discard == 0 && g_last_pdesc.patch_size == 3);
+    int gets = g_pipe_gets, draws = g_gdraws;
+    stream restart = {0}; p_prim_restart *r = put(&restart, OP_PRIM_RESTART, sizeof *r); r->on = 1; r->index = 0xffff; dirty_strip(&restart, base); dirty_exec(&restart);
+    printf("PIPE_DIRTY restart: gets %d -> %d, value=%u\n", gets, g_pipe_gets, g_last_pdesc.prim_restart);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.prim_restart == 1 && g_gdraws == draws + 1);
+    gets = g_pipe_gets;
+    stream same = {0}; r = put(&same, OP_PRIM_RESTART, sizeof *r); r->on = 1; r->index = 0xffff; dirty_strip(&same, base); dirty_exec(&same);
+    CHECK(g_pipe_gets == gets);
+    gets = g_pipe_gets;
+    stream discard = {0}; p_rast_discard *d = put(&discard, OP_RAST_DISCARD, sizeof *d); d->on = 1; dirty_strip(&discard, base); dirty_exec(&discard);
+    printf("PIPE_DIRTY discard: gets %d -> %d, value=%u\n", gets, g_pipe_gets, g_last_pdesc.rast_discard);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.rast_discard == 1);
+    gets = g_pipe_gets;
+    stream patch = {0}; p_set_patch_size *p = put(&patch, OP_SET_PATCH_SIZE, sizeof *p); p->size = 7; dirty_strip(&patch, base); dirty_exec(&patch);
+    printf("PIPE_DIRTY patch: gets %d -> %d, value=%u\n", gets, g_pipe_gets, g_last_pdesc.patch_size);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.patch_size == 7);
+    gets = g_pipe_gets;
+    stream repeat = {0}; p = put(&repeat, OP_SET_PATCH_SIZE, sizeof *p); p->size = 7; dirty_strip(&repeat, base); dirty_exec(&repeat);
+    CHECK(g_pipe_gets == gets);
+    stream invalid = {0}; p = put(&invalid, OP_SET_PATCH_SIZE, sizeof *p); p->size = 33; dirty_strip(&invalid, base); dirty_exec(&invalid);
+    CHECK(g_pipe_gets == gets && g_last_pdesc.patch_size == 7);
+    stream off_restart = {0}; r = put(&off_restart, OP_PRIM_RESTART, sizeof *r); r->on = 0; r->index = 0xffff; dirty_strip(&off_restart, base); dirty_exec(&off_restart);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.prim_restart == 0); gets = g_pipe_gets;
+    stream off_discard = {0}; d = put(&off_discard, OP_RAST_DISCARD, sizeof *d); d->on = 0; dirty_strip(&off_discard, base); dirty_exec(&off_discard);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.rast_discard == 0); gets = g_pipe_gets;
+    stream old_patch = {0}; p = put(&old_patch, OP_SET_PATCH_SIZE, sizeof *p); p->size = 3; dirty_strip(&old_patch, base); dirty_exec(&old_patch);
+    CHECK(g_pipe_gets == gets + 1 && g_last_pdesc.patch_size == 3);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_pmem); g_pg_tracked = 1; pass_fresh();
+}
+static void t_target_format_variant(void) {
+    pass_fresh(); g_resolve_rc = 0; nvn_be_sub_begin();
+    stream first = {0}; q_env(&first); g_variant_prog = g_fprog; g_variant_prog.sh[1] = &g_variant_fs; g_rt_variant = 1;
+    q_draw(&first); dirty_exec(&first);
+    CHECK(g_last_req.rt_format[0] == NVN_FORMAT_RGBA8 && g_last_pdesc.st[1].sh == &g_fsh[1]);
+    tex_t other = mk_tex(92, 0x4000, NVN_FORMAT_RGBA32UI, 64, 36, 1, 0);
+    int resolves = g_resolves;
+    stream second = {0}; put_set_rt(&second, &other, NULL); q_draw(&second); dirty_exec(&second);
+    printf("PIPE_DIRTY target: resolves %d -> %d, request=%u, shader_variant=%d\n", resolves, g_resolves, g_last_req.rt_format[0], g_last_pdesc.st[1].sh == &g_variant_fs);
+    CHECK(g_resolves == resolves + 1 && g_last_req.rt_format[0] == NVN_FORMAT_RGBA32UI && g_last_pdesc.st[1].sh == &g_variant_fs);
+    resolves = g_resolves;
+    stream again = {0}; q_draw(&again); dirty_exec(&again);
+    CHECK(g_resolves == resolves && g_last_pdesc.st[1].sh == &g_variant_fs);
+    tex_t same_fmt = mk_tex(93, 0x8000, NVN_FORMAT_RGBA32UI, 64, 36, 1, 0);
+    stream same_target_fmt = {0}; put_set_rt(&same_target_fmt, &same_fmt, NULL); q_draw(&same_target_fmt); dirty_exec(&same_target_fmt);
+    CHECK(g_resolves == resolves && g_last_pdesc.st[1].sh == &g_variant_fs);
+    view_t view = {0}; view.set_format = 1; view.format = NVN_FORMAT_RGBA32F;
+    stream with_view = {0}; put_set_rt_v(&with_view, &same_fmt, &view); q_draw(&with_view); dirty_exec(&with_view);
+    CHECK(g_resolves == resolves + 1 && g_last_req.rt_format[0] == NVN_FORMAT_RGBA32F && g_last_pdesc.st[1].sh == &g_fsh[1]);
+    resolves = g_resolves;
+    stream back = {0}; put_set_rt(&back, &g_qrt, NULL); q_draw(&back); dirty_exec(&back);
+    CHECK(g_resolves == resolves + 1 && g_last_req.rt_format[0] == NVN_FORMAT_RGBA8 && g_last_pdesc.st[1].sh == &g_fsh[1]);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); g_rt_variant = 0; pass_fresh();
+}
 
 #include "t_pass_zero_mask.inc"
 
@@ -4726,6 +4795,8 @@ int main(int argc, char **argv) {
     t_drv2_table();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
+    t_pipeline_dirty_changes();
+    t_target_format_variant();
     t_draw();
     t_arena697_detail();
     t_logic_op_accounting();
