@@ -60,7 +60,7 @@ static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0�
 static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
 // 诊断采样窗：S2A_TEST_DIAG_DFLT 设了就全按后端缺省读；否则 nvk_diag_from_s 缺省读 0（其余诊断用例从第一段就要输出），
 // S2A_TEST_NVK_DIAG_<名> 指定值。开窗 / 关窗 / 配置三行存下来给用例核。
-static atomic_int g_ind_logs, g_ind_match, g_ind_cov;
+static atomic_int g_ind_logs, g_ind_match, g_ind_cov, g_ind_next;
 static atomic_int g_dwin_pass_logs, g_dwin_csd_logs; static char g_dwin_cfg[256], g_dwin_open[256], g_dwin_close[256];
 static atomic_int g_c207_gputime, g_c207_cap;   // 别的线程（回放 / 完成 / 录制）也会调 nvn_plat_flag / nvn_plat_log：这两个用原子读写
 static char g_c207_win[12][512]; static int g_c207_nwin;   // 下面几个只由绘制 / 呈现所在的（测试）线程写
@@ -115,8 +115,9 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     if (text && strstr(text, "gpu pass_detail fence=")) atomic_fetch_add(&g_dwin_pass_logs, 1);
     if (text && !strncmp(text, "gpu ind_args fence=", 19)) {
         atomic_fetch_add(&g_ind_logs, 1);
-        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ")) atomic_fetch_add(&g_ind_match, 1);
+        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ") && strstr(text, " after_csd_seq=102")) atomic_fetch_add(&g_ind_match, 1);
     }
+    if (text && !strncmp(text, "csf dispatch_next_ind seq=102 key=0000000000001234 ", 51) && strstr(text, " pass=0 count=1 instances=2 first_instance=4 draws_after=1 nonzero_after=1")) atomic_fetch_add(&g_ind_next, 1);
     if (text && !strncmp(text, "gpu ind_args_cov fence=", 23) && strstr(text, "recorded=1 overflow=0 inpass=0 uncovered=1")) atomic_fetch_add(&g_ind_cov, 1);
     if (text && strstr(text, "csf dispatch_time") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_dwin_csd_logs, 1);
     if (text && strstr(text, "csf dispatch_time")) {
@@ -10012,6 +10013,7 @@ static int gpu_diag_only(const char *dir) {
           "gpu diag selected dispatch query with exact key and groups: on=%d logs=%d match=%d", on, atomic_load(&g_diag_csd_logs), atomic_load(&g_diag_csd_match));
     CHECK(atomic_load(&g_diag_barrier_match)==on, "gpu diag dispatch neighboring full and guest barriers: on=%d matched=%d", on, atomic_load(&g_diag_barrier_match));
     CHECK(atomic_load(&g_diag_indirect_match)==on, "gpu diag indirect groups unknown without CPU proof: on=%d matched=%d",on,atomic_load(&g_diag_indirect_match));
+    CHECK(atomic_load(&g_ind_next)==on, "gpu diag dispatch followed by first indirect args: on=%d matched=%d", on, atomic_load(&g_ind_next));
     CHECK(atomic_load(&g_ind_logs)==on && atomic_load(&g_ind_match)==on && atomic_load(&g_ind_cov)==on,
           "gpu diag indirect args readback from GPU-written buffer: on=%d logs=%d match=%d cov=%d", on, atomic_load(&g_ind_logs), atomic_load(&g_ind_match), atomic_load(&g_ind_cov));
     CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,

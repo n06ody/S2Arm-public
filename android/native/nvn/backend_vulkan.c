@@ -236,7 +236,7 @@ struct pass_details { struct pass_detail p[TS_PASS_MAX]; uint32_t events, overfl
 #define IND_ARGS_MAX 256
 struct ind_args {
     uint32_t n, overflow, uncovered, inpass;
-    struct { uint32_t pass, indexed, multi, keys_ok; uint64_t vkey, fkey; const uint8_t *cpu; } e[IND_ARGS_MAX];
+    struct { uint32_t pass, indexed, multi, keys_ok; uint64_t vkey, fkey, csd_seq, csd_key; const uint8_t *cpu; } e[IND_ARGS_MAX];
 };
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
@@ -283,6 +283,7 @@ struct nvn_gpu_cmd_s {
     struct csf_times *csf_times; uint64_t csf_pending_seq, csf_pending_key; uint32_t csf_dims[3]; int csf_dims_known;
     struct pass_details *pass_details;
     struct ind_args *ind_args; int ind_on;   // nvk_ind_args 且本段在采样窗内
+    uint64_t ind_csd_seq, ind_csd_key;       // 本段最近一次已录的 csd 选中派发（0 = 本段还没有）：ind_args 记在它名下
     int diag_take;   // 诊断采样窗：这一段输出逐通道 / 派发诊断（dwin_take）
     int csf_barrier_on, csf_last; struct csf_barriers csf_between, csf_before;
     VkCommandBuffer init_cb;                 // 本段提交时带上的「新建图像转 GENERAL」命令缓冲（没有就是空）
@@ -1699,6 +1700,7 @@ void nvn_gpu_diag_ind_args(nvn_gpu_cmd c, nvn_gpu_buf ind, uint64_t off, int ind
     nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);
     a->e[a->n].pass = c->ntsp; a->e[a->n].indexed = (uint32_t)!!indexed; a->e[a->n].multi = (uint32_t)!!multi;
     a->e[a->n].keys_ok = keys_ok; a->e[a->n].vkey = vkey; a->e[a->n].fkey = fkey; a->e[a->n].cpu = sl.cpu;
+    a->e[a->n].csd_seq = c->ind_csd_seq; a->e[a->n].csd_key = c->ind_csd_key;
     a->n++;
 }
 static void ind_args_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status) {
@@ -1712,10 +1714,18 @@ static void ind_args_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status
         uint32_t w[5] = {0}; memcpy(w, a->e[i].cpu, a->e[i].indexed ? 20 : 16);
         // 非索引：vertexCount, instanceCount, firstVertex, firstInstance；索引：indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
         int32_t bv = a->e[i].indexed ? (int32_t)w[3] : 0; uint32_t fi = a->e[i].indexed ? w[4] : w[3];
-        snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u indexed=%u multi=%u count=%u instances=%u first=%u base_vertex=%d first_instance=%u vs_key=%016llx fs_key=%016llx keys_ok=0x%x",
+        snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u indexed=%u multi=%u count=%u instances=%u first=%u base_vertex=%d first_instance=%u vs_key=%016llx fs_key=%016llx keys_ok=0x%x after_csd_seq=%llu",
             (unsigned long long)signal, a->e[i].pass, a->e[i].indexed, a->e[i].multi, w[0], w[1], w[2], bv, fi,
-            (unsigned long long)a->e[i].vkey, (unsigned long long)a->e[i].fkey, a->e[i].keys_ok);
+            (unsigned long long)a->e[i].vkey, (unsigned long long)a->e[i].fkey, a->e[i].keys_ok, (unsigned long long)a->e[i].csd_seq);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+        // 每个 csd 选中派发之后的第一笔读回：把「哪次派发之后出现这组参数」直接对上（同段内、到下一次选中派发为止都记在它名下）
+        if (a->e[i].csd_seq && (i == 0 || a->e[i-1].csd_seq != a->e[i].csd_seq)) {
+            uint32_t n = 0, nz = 0; for (uint32_t k = i; k < a->n && a->e[k].csd_seq == a->e[i].csd_seq; k++) {
+                n++; uint32_t q[5] = {0}; memcpy(q, a->e[k].cpu, a->e[k].indexed ? 20 : 16); if (q[0] && q[1]) nz++; }
+            char l2[320]; snprintf(l2, sizeof l2, "csf dispatch_next_ind seq=%llu key=%016llx fence=%llu pass=%u count=%u instances=%u first_instance=%u draws_after=%u nonzero_after=%u",
+                (unsigned long long)a->e[i].csd_seq, (unsigned long long)a->e[i].csd_key, (unsigned long long)signal, a->e[i].pass, w[0], w[1], fi, n, nz);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "csf", l2);
+        }
     }
     char line[200]; snprintf(line, sizeof line, "gpu ind_args_cov fence=%llu recorded=%u overflow=%u inpass=%u uncovered=%u", (unsigned long long)signal, a->n, a->overflow, a->inpass, a->uncovered);
     nvn_plat_log(a->overflow || a->inpass ? NVN_PLAT_LOG_WARN : NVN_PLAT_LOG_INFO, "gpu", line);
@@ -5786,6 +5796,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
     pass_detail_event(c, PD_DISPATCH);
     csf_dispatch_boundary(c);
+    if (csf_seq) { c->ind_csd_seq=csf_seq; c->ind_csd_key=csf_key; }
     int csf_at=csf_dispatch_begin(c,csf_seq,csf_key,x,y,z,ind != NULL);
     if (ind) {
         vkCmdDispatchIndirect(c->cb, ind->buffer, off);
