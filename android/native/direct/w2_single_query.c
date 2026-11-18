@@ -63,7 +63,8 @@ static int facts_valid(const struct s2a_input_identity *identity) {
 
 /* Mirrors the EXISTING missingness predicate, not a new query evaluator:
  * DirectGpuAccessor.NeedTexture chooses exact first, then same-stage/handle -1
- * only for a cbuf query. QueryTextureFormat alone still misses on Unknown.
+ * only for a cbuf query. QueryTextureFormat alone still misses on Unknown;
+ * sampled-format queries accept Unknown for known non-integer formats.
  * Do not borrow across stage/handle or let a concrete fallback override an
  * exact Unknown fact. No new fact is synthesized here.
  */
@@ -78,7 +79,8 @@ static int already_answered(const struct s2a_input_identity *identity,
         if (f->cbuf_slot == -1) direct = f;
     }
     const struct s2a_compile_texture_src *fact = exact;
-    if (!fact && query->coordinate.cbuf_slot >= 0) fact = direct;
+    if (!fact && query->coordinate.cbuf_slot >= 0 &&
+        (query->method != S2A_W2_QUERY_SAMPLED_FORMAT || query->coordinate.cbuf_slot == 2)) fact = direct;
     if (!fact) return 0;
     return query->method != S2A_W2_QUERY_FORMAT || strcmp(fact->format, "Unknown") != 0;
 }
@@ -101,7 +103,8 @@ static int source_matches(const struct s2a_w2_query_source *source,
         !query_equal(&source->requested, query) || !source->source_id) return 0;
     const struct s2a_w2_query_coordinate *r = &source->resolved, *q = &query->coordinate;
     if (r->stage != q->stage || r->handle != q->handle ||
-        !(r->cbuf_slot == q->cbuf_slot || (q->cbuf_slot >= 0 && r->cbuf_slot == -1))) return 0;
+        !(r->cbuf_slot == q->cbuf_slot || (q->cbuf_slot >= 0 && r->cbuf_slot == -1 &&
+          (query->method != S2A_W2_QUERY_SAMPLED_FORMAT || q->cbuf_slot == 2)))) return 0;
     if (!raw_complete(&source->descriptor)) return 0;
     if (source->view_present == 1) return raw_complete(&source->view);
     if (source->view_present != 0) return 0;
@@ -121,7 +124,7 @@ int s2a_w2_single_query_diagnose(const struct s2a_w2_query_input *input,
         !input->original.stamp.session || !input->original.stamp.generation ||
         !input->original.stamp.snapshot_id ||
         !coordinate_valid(&input->query.coordinate) ||
-        input->query.method < S2A_W2_QUERY_SAMPLER_TYPE || input->query.method > S2A_W2_QUERY_FORMAT ||
+        input->query.method < S2A_W2_QUERY_SAMPLER_TYPE || input->query.method > S2A_W2_QUERY_SAMPLED_FORMAT ||
         !(input->identity->stage_mask & (1u << input->query.coordinate.stage)))
         return S2A_W2_QUERY_INVALID;
     if (!stamp_equal(&input->original.stamp, &input->current)) return S2A_W2_QUERY_STALE;

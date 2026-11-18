@@ -319,6 +319,21 @@ internal static unsafe class Program
         return (format, ints.TryGetValue(sampledType, out uint signed) && signed == 0, images);
     }
 
+    private static bool SampledImageType(byte[] spv, int wantedOp, int wantedSigned)
+    {
+        var types = new Dictionary<uint, (int Op, int Signed)>(); int images = 0, match = 0;
+        for (int i = 5; i * 4 < spv.Length;)
+        {
+            uint w0 = BitConverter.ToUInt32(spv, i * 4); int op = (int)(w0 & 0xffff), n = (int)(w0 >> 16);
+            if (n == 0 || (i + n) * 4 > spv.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            if (op == 21) types[BitConverter.ToUInt32(spv, (i + 1) * 4)] = (21, (int)BitConverter.ToUInt32(spv, (i + 3) * 4));
+            if (op == 22) types[BitConverter.ToUInt32(spv, (i + 1) * 4)] = (22, -1);
+            if (op == 25) { images++; if (types.TryGetValue(BitConverter.ToUInt32(spv, (i + 2) * 4), out var t) && t.Op == wantedOp && t.Signed == wantedSigned) match++; }
+            i += n;
+        }
+        return images == 1 && match == 1;
+    }
+
     // 原创合成 Maxwell CS：R0 = c0[0x310]（存储缓冲地址），R4 = R5 = 0，SULD.D.B32 R2, [R4]（二维、图像句柄 c2 字 74，按位读），STG [R0], R2。
     //   SULD.D 的字段来自 InstSuldD（目的 0..7、坐标 8..15、谓词 16..18、大小 20..22 = B32、目的谓词 30..32、维度 33..35 = 2D、句柄 36..48）。
     private static byte[] ComputeRawImageLoadGuest()
@@ -687,6 +702,8 @@ internal static unsafe class Program
 
     private static void Main(string[] args)
     {
+        string sampledSpvDir = args.Length == 2 && args[0] == "--emit-sampled" ? Path.GetFullPath(args[1]) : null;
+        if (sampledSpvDir != null) Directory.CreateDirectory(sampledSpvDir);
         byte[] profile = ProfileJson();
         byte[] vs = Guest(false, new[] { Ast(0) });
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
@@ -776,6 +793,35 @@ internal static unsafe class Program
             }
             Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(withShared(49153)), "shared above Maxwell 48 KiB is a bad request");
             Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(withShared(-1)), "negative shared is a bad request");
+        }
+
+        // 真实编译器输出：采样图像的 OpTypeImage Sampled Type 应与绑定视图数值类型一致。
+        foreach (var test in new[] { (Format: "R16G16Uint", Op: 21, Signed: 0), (Format: "R16G16Sint", Op: 21, Signed: 1),
+                                     (Format: "R16G16Float", Op: 22, Signed: -1), (Format: "R16G16Unorm", Op: 22, Signed: -1) })
+        {
+            string fact = "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"" + test.Format + "\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            using JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "sampled-" + test.Format,
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2) }), textureFacts: fact)));
+            byte[] spv = Convert.FromBase64String(doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetString());
+            if (sampledSpvDir != null) File.WriteAllBytes(Path.Combine(sampledSpvDir, test.Format + ".spv"), spv);
+            Check(SampledImageType(spv, test.Op, test.Signed), "sampled texture " + test.Format + " declares its numeric type");
+            var formatQueries = doc.RootElement.GetProperty("content").GetProperty("dependencies").EnumerateArray()
+                .Where(d => d.GetProperty("method").GetString() == "QueryS2ASampledTextureFormat").ToArray();
+            Check(formatQueries.Length == 1 && formatQueries[0].GetProperty("value").GetString() == test.Format,
+                "sampled texture " + test.Format + " records its format dependency");
+        }
+        {
+            // 分离贴图表的 c2 字 0x5c：与日志里的 fp_t_tcb_5C 相同的句柄坐标。
+            const string fact = "[{\"stage\":\"fs\",\"handle\":92,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"R16G16Uint\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            using JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "sampled-separate-c2-5c",
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, 92) }), textureFacts: fact)));
+            var deps = doc.RootElement.GetProperty("content").GetProperty("dependencies").EnumerateArray()
+                .Where(d => d.GetProperty("method").GetString() == "QueryS2ASampledTextureFormat").ToArray();
+            Check(deps.Length == 1 && deps[0].GetProperty("value").GetString() == "R16G16Uint",
+                "sampled c2 separate word 0x5c uses its uint format fact");
+            byte[] spv = doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetBytesFromBase64();
+            Check(SampledImageType(spv, 21, 0), "sampled c2 separate word 0x5c declares uint");
+            if (sampledSpvDir != null) File.WriteAllBytes(Path.Combine(sampledSpvDir, "c2-5c.spv"), spv);
         }
 
         // A large pool must not prevent a program with constant texture handles from compiling.
@@ -1771,6 +1817,7 @@ internal static unsafe class Program
 
             Check(matrixAccessor.QuerySamplerType(0, -1) == SamplerType.Texture2D, "2d sampler type");
             Check(matrixAccessor.QueryTextureFormat(0, -1) == TextureFormat.R8G8B8A8Unorm, "2d format");
+            Check(matrixAccessor.QueryS2ASampledTextureFormat(0, -1) == TextureFormat.R8G8B8A8Unorm, "sampled format uses exact fact");
             Check(matrixAccessor.QueryTextureCoordNormalized(0, -1) && !matrixAccessor.QueryTextureIsBuffer(0, -1),
                 "2d normalized non-buffer");
 
@@ -1781,6 +1828,7 @@ internal static unsafe class Program
             Check(matrixAccessor.QuerySamplerType(1, 4) == (SamplerType.TextureCube | SamplerType.Shadow),
                 "same handle keeps its own cbufSlot facts");
             Check(matrixAccessor.QueryTextureFormat(1, 4) == TextureFormat.R32Float, "per-slot format");
+            Check(matrixAccessor.QueryS2ASampledTextureFormat(1, 4) == TextureFormat.R32Float, "sampled format preserves cbuf slot");
 
             Check(matrixAccessor.QuerySamplerType(2, -1) == SamplerType.TextureBuffer && matrixAccessor.QueryTextureIsBuffer(2, -1),
                 "buffer texture");

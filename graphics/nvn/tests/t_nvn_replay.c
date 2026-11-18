@@ -1763,6 +1763,22 @@ static void t_decl_view(void) {
     CHECK(g_tex_releases == releases + 17 && g_view_releases == view_releases + 17);
 }
 
+// 数组各元素共享着色器声明：整数视图不能作为浮点元素交给后端。
+static void t_decl_array_numeric(void) {
+    nvn_be_sub_begin(); res_fresh(); nvn_unimpl_reset(); nvn_be_set_tex_pool_n(8); rp_view_pin_begin();
+    tex_t u = mk_tex(7091, 0, NVN_FORMAT_RG16UI, 4, 4, 1, 0);
+    tex_t f = mk_tex(7092, 0x1000, NVN_FORMAT_RGBA8, 4, 4, 1, 0);
+    view_t uv = {0}; uv.set_format = 1; uv.format = NVN_FORMAT_RGBA8UI;
+    nvn_be_reg_tex(1, &u, NULL); nvn_be_reg_tex(2, &f, &uv); nvn_be_reg_tex(3, &f, NULL);
+    uint8_t dtt = NVN_TEXTURE_TARGET_2D + 1;
+    CHECK(!rp_view_by_id_decl(1, dtt, 0, 1, &g_fake_cmd, NULL));
+    CHECK(!rp_view_by_id_decl(2, dtt, 0, 1, &g_fake_cmd, NULL));
+    CHECK(nvn_unimpl_count("tex", "sampled_array_numeric_mismatch") == 2);
+    CHECK(rp_view_by_id_decl(1, dtt, 1, 1, &g_fake_cmd, NULL));
+    CHECK(rp_view_by_id_decl(3, dtt, 0, 1, &g_fake_cmd, NULL));
+    rp_view_pin_end(); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); res_fresh();
+}
+
 static void t_buf_mirror_fail_once(void) {   // 池镜像建不出来：同一个池只尝试一次，之后直接按未接返回；池释放再登记会重试
     nvn_be_sub_begin();
     nvn_be_shutdown_session(); nvn_unimpl_reset(); g_pg_tracked = 1; g_nbw = 0;
@@ -4566,6 +4582,7 @@ int main(int argc, char **argv) {
     t_registry();
     t_samp_mirror_clamp();
     t_decl_view();
+    t_decl_array_numeric();
     t_buf_mirror();
     t_buf_dirtylog();
     t_buf_mirror_fail_once();
