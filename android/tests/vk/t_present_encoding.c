@@ -2,12 +2,14 @@
 // Copyright 2026 S2Arm contributors
 // 原创灰阶经生产呈现路径读回交换链；期望为输入编码字节，UNORM 是负对照。
 #define vkCreateImage fixture_CreateImage
+#define vkDestroyImage fixture_DestroyImage
 #define main unused_fixture_main
 #define vkGetSwapchainImagesKHR fixture_GetSwapchainImagesKHR
 #define vkQueuePresentKHR fixture_QueuePresentKHR
 #include "t_backend_vk.c"
 #undef main
 #undef vkCreateImage
+#undef vkDestroyImage
 #undef vkGetSwapchainImagesKHR
 #undef vkQueuePresentKHR
 
@@ -29,9 +31,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice d, const VkImageCreateInfo
     return r;
 }
 VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice d, VkImage im, const VkAllocationCallbacks *a) {
-    PFN_vkDestroyImage real = (PFN_vkDestroyImage)dlsym(RTLD_NEXT, "vkDestroyImage");
     if (im && im == encoded_image) { encoded_image = VK_NULL_HANDLE; encoded_destroyed++; }
-    real(d, im, a);
+    fixture_DestroyImage(d, im, a);
 }
 static uint64_t probe_bad, probe_pixels;
 // 只从真实驱动公布的格式中选择，分别验证 RGBA / BGRA 交换链，绝不伪造能力。

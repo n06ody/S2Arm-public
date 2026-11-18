@@ -16,15 +16,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// 与分时共用同一窗口；查页是所有受跟踪缓冲的逐页检查总量，不仅限索引。
-void rp_buf_blocks_report(const uint64_t pf[RP_PERF_N]) {
-    if (!nvn_plat_flag("nvk_buf_blocks", 0)) return;
-    char b[160];
-    snprintf(b, sizeof b, "分时（回放缓冲块核查，本窗口）：跳过 %llu 块、逐页查 %llu 页",
-             (unsigned long long)pf[RP_PERF_BUF_BLOCK_SKIP_N], (unsigned long long)pf[RP_PERF_BUF_PAGES_N]);
-    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-}
-
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
@@ -286,7 +277,6 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
                              (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-                rp_buf_blocks_report(pf);
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核

@@ -339,8 +339,17 @@ static int g_bc_early_n, g_bc_early_seen;
 // 派生夹具（t_pool_table.c）用：返回 1 表示这个围栏的提交还扣在主机侧，按真超时处理、不进驱动——
 // 否则后端等待线程的 vkWaitForFences 会和主线程放行时的 vkQueueSubmit 同时用这个围栏（线程校验报 MultipleThreads）。
 static int (*g_fence_held)(VkFence);
+// C197：现解贴图的 CPU 上传期间，在调用线程上数提交与等栅栏（后端工作线程自己的提交 / 等待不算）。
+static _Thread_local int t_bc_watch;
+static _Thread_local unsigned t_bc_submits, t_bc_waits;
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    PFN_vkQueueSubmit real = (PFN_vkQueueSubmit)vkGetDeviceProcAddr(g_dev.device, "vkQueueSubmit");
+    if (t_bc_watch) t_bc_submits++;
+    return real(q, n, si, f);
+}
 VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
     PFN_vkWaitForFences real = (PFN_vkWaitForFences)vkGetDeviceProcAddr(d, "vkWaitForFences");
+    if (t_bc_watch) t_bc_waits++;
     if (g_fence_held && n == 1 && g_fence_held(f[0])) {
         uint64_t ns = timeout < 1000000ull ? timeout : 1000000ull;   // 最多睡 1 毫秒，调用方会接着等
         struct timespec ts = {0, (long)ns}; nanosleep(&ts, NULL);
@@ -354,6 +363,50 @@ VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice d, uint32_t n, const VkF
     if (g_bc_early_n > 0 && n == 1) { g_bc_early_n--; g_bc_early_seen++; return VK_TIMEOUT; }   // 提前返回（#697）：不等、立刻报超时
     return real(d, n, f, all, timeout);
 }
+// C196 / C198：段内解码的临时资源账（只记武装期间建的）：临时图（STORAGE | TRANSFER_SRC）、解码输入图（RG32 / RGBA32 UINT，
+// TRANSFER_DST | SAMPLED）、暂存缓冲（带 UNIFORM 用途的共享缓冲，即段的 arena 块）。g_bc_fail_in = k：第 k 个解码输入图建失败。
+#define BC_TRACK_MAX 512
+static int g_bc_track, g_bc_fail_in, g_bc_in_seen;
+static VkImage g_bc_imgs[BC_TRACK_MAX]; static int g_bc_img_live, g_bc_img_peak;
+static VkBuffer g_bc_bufs[BC_TRACK_MAX]; static VkDeviceSize g_bc_buf_size[BC_TRACK_MAX]; static VkDeviceSize g_bc_stage_live, g_bc_stage_peak;
+static pthread_mutex_t g_bc_track_mu = PTHREAD_MUTEX_INITIALIZER;
+static int bc_track_is_transient(const VkImageCreateInfo *ci) {
+    if (ci->usage == (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (ci->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) return 1;
+    if (ci->usage == (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        (ci->format == VK_FORMAT_R32G32_UINT || ci->format == VK_FORMAT_R32G32B32A32_UINT)) return 2;
+    return 0;
+}
+static void bc_track_reset(void) {
+    pthread_mutex_lock(&g_bc_track_mu);
+    memset(g_bc_imgs, 0, sizeof g_bc_imgs); memset(g_bc_bufs, 0, sizeof g_bc_bufs);
+    g_bc_img_live = g_bc_img_peak = 0; g_bc_stage_live = g_bc_stage_peak = 0; g_bc_in_seen = 0;
+    pthread_mutex_unlock(&g_bc_track_mu);
+}
+VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice d, VkImage image, const VkAllocationCallbacks *a) {
+    PFN_vkDestroyImage real = (PFN_vkDestroyImage)vkGetDeviceProcAddr(d, "vkDestroyImage");
+    if (image) { pthread_mutex_lock(&g_bc_track_mu);
+        for (int i = 0; i < BC_TRACK_MAX; i++) if (g_bc_imgs[i] == image) { g_bc_imgs[i] = VK_NULL_HANDLE; g_bc_img_live--; break; }
+        pthread_mutex_unlock(&g_bc_track_mu); }
+    real(d, image, a);
+}
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(VkDevice d, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *buf) {
+    PFN_vkCreateBuffer real = (PFN_vkCreateBuffer)vkGetDeviceProcAddr(d, "vkCreateBuffer");
+    VkResult r = real(d, ci, a, buf);
+    if (r == VK_SUCCESS && g_bc_track && (ci->usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+        pthread_mutex_lock(&g_bc_track_mu);
+        for (int i = 0; i < BC_TRACK_MAX; i++) if (!g_bc_bufs[i]) { g_bc_bufs[i] = *buf; g_bc_buf_size[i] = ci->size;
+            g_bc_stage_live += ci->size; if (g_bc_stage_live > g_bc_stage_peak) g_bc_stage_peak = g_bc_stage_live; break; }
+        pthread_mutex_unlock(&g_bc_track_mu);
+    }
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(VkDevice d, VkBuffer buf, const VkAllocationCallbacks *a) {
+    PFN_vkDestroyBuffer real = (PFN_vkDestroyBuffer)vkGetDeviceProcAddr(d, "vkDestroyBuffer");
+    if (buf) { pthread_mutex_lock(&g_bc_track_mu);
+        for (int i = 0; i < BC_TRACK_MAX; i++) if (g_bc_bufs[i] == buf) { g_bc_bufs[i] = VK_NULL_HANDLE; g_bc_stage_live -= g_bc_buf_size[i]; break; }
+        pthread_mutex_unlock(&g_bc_track_mu); }
+    real(d, buf, a);
+}
 // 只在 BC4 体积上传用例内武装，精确匹配解码输出临时图；其余创建走真实驱动。
 static int g_bc4_fail_temp, g_bc4_temp_seen;
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice d, const VkImageCreateInfo *ci,
@@ -362,7 +415,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice d, const VkImageCreateInfo
     if (g_bc4_fail_temp && ci->imageType == VK_IMAGE_TYPE_2D && ci->format == VK_FORMAT_R8_UNORM &&
         ci->usage == (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
         ++g_bc4_temp_seen == g_bc4_fail_temp) { *image = VK_NULL_HANDLE; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
-    return real(d, ci, a, image);
+    int kind = g_bc_track ? bc_track_is_transient(ci) : 0;
+    if (kind == 2 && g_bc_fail_in && ++g_bc_in_seen == g_bc_fail_in) { *image = VK_NULL_HANDLE; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+    VkResult r = real(d, ci, a, image);
+    if (r == VK_SUCCESS && kind) {
+        pthread_mutex_lock(&g_bc_track_mu);
+        for (int i = 0; i < BC_TRACK_MAX; i++) if (!g_bc_imgs[i]) { g_bc_imgs[i] = *image; if (++g_bc_img_live > g_bc_img_peak) g_bc_img_peak = g_bc_img_live; break; }
+        pthread_mutex_unlock(&g_bc_track_mu);
+    }
+    return r;
 }
 // #697: synthetic driver enumeration, keeping real headless images/semaphores and VVL.
 // Virtual indices 8+ map to the driver's real indices; this is NOT a device result.
@@ -1511,27 +1572,170 @@ static void c193_bc_readback_rejected(void) {
     nvn_gpu_tex_release(bc); nvn_gpu_buf_release(rb, NULL, NULL);
 }
 
-// C196：上传中的解码未证明完成时，段失败/abort 和 close 超时都不能释放其资源；完成后 close 可重试。
-static void c196_bc_close_timeout(void) {
+// 等段释放（工作线程在完成后回收段的临时资源）：最多 2 秒，看解码临时图归零。
+static int bc_track_wait_drained(void) {
+    for (int i = 0; i < 2000; i++) {
+        pthread_mutex_lock(&g_bc_track_mu); int live = g_bc_img_live; pthread_mutex_unlock(&g_bc_track_mu);
+        if (!live) return 1;
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+// C196：CPU 字节 → BC 的解码录在段里，放弃 / 失败的段连同解码资源一起回收；没有「解码已单独提交、段却放弃」的悬空资源，close 不用另等。
+//   ① 上传后 abort：临时图与解码输入图立即回收，close 立即成功。
+//   ② 第 2 片的解码输入图建失败（BC4 3D 两片）：段粘滞 DEVICE（BC 解码失败），commit 报错；第 1 片已建的资源随段回收。
+static void c196_bc_abort_reclaim(void) {
     static const uint8_t red[8] = {0,0xf8,0,0xf8,0,0,0,0};
     nvn_gpu_tex bc = make_tex(4, 4, NVN_FORMAT_RGBA_DXT1, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
     if (!bc) return;
+    bc_track_reset(); g_bc_track = 1;
     nvn_gpu_cmd c = begin_cmd();
-    g_bc_inject_wait = 1; g_bc_unproven = g_bc_early_destroy = 0; g_bc_injected_fence = VK_NULL_HANDLE;
     nvn_gpu_tex_upload(c, bc, 0, 0, NULL, red, 8, 8);
-    CHECK(g_bc_injected_fence && !g_bc_early_destroy, "C196 解码超时应保活，提前销毁=%d", g_bc_early_destroy);
+    CHECK(g_bc_img_live == 2, "C196 ① 上传后段内持有临时图 + 解码输入图 2 张，实得 %d", g_bc_img_live);
     nvn_gpu_cmd_abort(c);
-    g_bc_inject_wait = 1;
+    CHECK(g_bc_img_live == 0, "C196 ① abort 后解码临时资源应全部回收，剩 %d", g_bc_img_live);
+    nvn_gpu_tex_release(bc);
     nvn_gpu_err e; nvn_gpu_rc r = nvn_gpu_close(5000000000ull, &e);
-    CHECK(r.code == NVN_GPU_E_TIMEOUT && !g_bc_early_destroy, "C196 close 未证明完成应超时并保活：%d，提前销毁=%d", r.code, g_bc_early_destroy);
-    if (g_bc_injected_fence) {
-        VkResult vr = vkWaitForFences(g_dev.device, 1, &g_bc_injected_fence, VK_TRUE, 5000000000ull);
-        CHECK(vr == VK_SUCCESS, "C196 真实 fence 应完成：%d", vr);
+    CHECK(OK(r), "C196 ① abort 后 close 应立即成功：%d %s", r.code, e.why);
+    if (!open_backend()) { g_bc_track = 0; return; }
+    nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_3D; td.d.format = NVN_FORMAT_RGTC1_UNORM;   // 现解只收 BC4 的 3D
+    td.d.width = td.d.height = 4; td.d.depth = 2; td.d.levels = 1; td.usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD;
+    nvn_gpu_tex t3 = NULL; r = nvn_gpu_tex_create(&td, &t3, &e);
+    CHECK(OK(r) && t3, "C196 ② 建 3D BC4：%d %s", r.code, e.why);
+    if (t3) {
+        uint8_t two[16]; memcpy(two, red, 8); memcpy(two + 8, red, 8);
+        bc_track_reset(); g_bc_fail_in = 2;
+        c = begin_cmd();
+        nvn_gpu_tex_upload(c, t3, 0, 0, NULL, two, 8, 16);
+        g_bc_fail_in = 0;
+        CHECK(g_bc_in_seen == 2, "C196 ② 第 2 片解码输入图注入未命中（%d）", g_bc_in_seen);
+        r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        CHECK(r.code == NVN_GPU_E_DEVICE && strstr(e.why, "BC 解码失败"), "C196 ② 解码资源建失败应 commit 报 DEVICE：%d %s", r.code, e.why);
+        if (OK(r)) nvn_gpu_fence_wait(1, 5000000000ull, &e);
+        CHECK(bc_track_wait_drained(), "C196 ② 失败段的解码临时资源应随段回收，剩 %d", g_bc_img_live);
+        nvn_gpu_tex_release(t3);
     }
-    g_bc_unproven = g_bc_inject_wait = 0;
+    g_bc_track = 0;
     r = nvn_gpu_close(5000000000ull, &e);
-    CHECK(OK(r), "C196 完成后 close 重试：%d %s", r.code, e.why);
-    printf("C196 close 超时保活与重试已执行\n");
+    CHECK(OK(r), "C196 ② 失败段之后 close：%d %s", r.code, e.why);
+    printf("C196 段内解码：abort / 失败段回收已执行\n");
+}
+
+// C197（修前红）：CPU 字节 → BC 现解贴图上传不单独提交、不在调用线程上等栅栏；解码与之后的采样同在一段、按 GPU 顺序生效。
+//   修前：bc_upload 在 g_submit_mu 里单独 vkQueueSubmit 解码再等 fence（每切片 1 次提交 + 1 次等待）。
+//   同一段里：上传 A（红）→ 拷走 → 上传 B（蓝，同一贴图）→ 拷走 → 回读两份，再按压缩块回读影子（应是 B 的原字节）。
+static void c197_bc_upload_in_segment(void) {
+    static const uint8_t red[8] = {0x00,0xf8,0x00,0xf8,0,0,0,0}, blue[8] = {0x1f,0,0x1f,0,0,0,0,0};
+    static const uint8_t want_red[4] = {255,0,0,255}, want_blue[4] = {0,0,255,255};
+    nvn_gpu_tex bc = make_tex(4, 4, NVN_FORMAT_RGBA_DXT1, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex a = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED), b = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_buf rb = make_buf(160, NVN_GPU_MEM_SHARED, NULL);
+    if (!bc || !a || !b || !rb) return;
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_err e;
+    t_bc_submits = t_bc_waits = 0; t_bc_watch = 1;
+    nvn_gpu_tex_upload(c, bc, 0, 0, NULL, red, 8, 8);
+    nvn_gpu_copy_tex(c, bc, 0, 0, NULL, a, 0, 0, NULL);
+    nvn_gpu_tex_upload(c, bc, 0, 0, NULL, blue, 8, 8);
+    t_bc_watch = 0;
+    unsigned submits = t_bc_submits, waits = t_bc_waits;
+    CHECK(submits == 0 && waits == 0, "C197 CPU BC 上传在调用线程上不应提交 / 等栅栏：提交 %u 次、等待 %u 次", submits, waits);
+    nvn_gpu_copy_tex(c, bc, 0, 0, NULL, b, 0, 0, NULL);
+    nvn_gpu_copy_tex_buf(c, a, 0, 0, NULL, rb, 0, 16, 64);
+    nvn_gpu_copy_tex_buf(c, b, 0, 0, NULL, rb, 64, 16, 64);
+    nvn_gpu_copy_tex_buf(c, bc, 0, 0, NULL, rb, 128, 8, 8);
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r), "C197 commit：%d %s", r.code, e.why);
+    if (OK(r)) {
+        CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C197 wait：%s", e.why);
+        for (int p = 0; p < 16; p++) {
+            CHECK(!memcmp(buf_cpu(rb) + p * 4, want_red, 4), "C197 第一次上传后拷走的应是红，像素 %d", p);
+            CHECK(!memcmp(buf_cpu(rb) + 64 + p * 4, want_blue, 4), "C197 第二次上传后拷走的应是蓝，像素 %d", p);
+        }
+        CHECK(!memcmp(buf_cpu(rb) + 128, blue, 8), "C197 压缩影子回读应是最后一次上传的原字节");
+    }
+    printf("C197 CPU BC 上传：调用线程提交 %u 次、等待 %u 次\n", submits, waits);
+    nvn_gpu_tex_release(bc); nvn_gpu_tex_release(a); nvn_gpu_tex_release(b); nvn_gpu_buf_release(rb, NULL, NULL);
+}
+
+// C198：同一段里大量 / 大尺寸 CPU BC 上传（三张 1024x1024 BC1 全 mip 链 + 一张 128x128x8 BC4 3D，共 41 片）。
+//   arena 不够时就地新建暂存块（不等、不提交）：超过标准块（256 KB）的切片各占一块恰好的大块，小切片挤标准块（可能取自复用池）；
+//   新建的暂存不超过「压缩总量 + 每片对齐 + 两块标准块」，不翻倍；解码临时图（每片临时图 + 输入图）在段完成前全留着、完成后归零，
+//   大块暂存随段释放。内容抽查：每张 2D 的第 0 级 4x4 与最末级 1x1、3D 全部 8 片的 4x4。
+static nvn_gpu_tex make_tex_3d_levels(uint32_t w, uint32_t h, uint32_t depth, uint32_t levels, uint32_t fmt, uint32_t usage);
+static void c198_bc_bulk_upload(void) {
+    enum { N2 = 3, W2 = 1024, L2 = 11, W3 = 128, D3 = 8, STD = 256 * 1024 };
+    static const uint16_t col565[N2] = {0xf800, 0x07e0, 0x001f};
+    static const uint8_t want[N2][4] = {{255,0,0,255},{0,255,0,255},{0,0,255,255}};
+    nvn_gpu_tex tex[N2 + 1] = {0}; nvn_gpu_err e = {0}; nvn_gpu_rc r;
+    for (int i = 0; i <= N2; i++) {
+        nvn_gpu_tex_desc td = {0}; td.usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD;
+        if (i < N2) { td.d.target = NVN_TEXTURE_TARGET_2D; td.d.format = NVN_FORMAT_RGBA_DXT1; td.d.width = td.d.height = W2; td.d.depth = 1; td.d.levels = L2; }
+        else { td.d.target = NVN_TEXTURE_TARGET_3D; td.d.format = NVN_FORMAT_RGTC1_UNORM; td.d.width = td.d.height = W3; td.d.depth = D3; td.d.levels = 1; }   // 现解只收 BC4 的 3D
+        r = nvn_gpu_tex_create(&td, &tex[i], &e);
+        CHECK(OK(r) && tex[i], "C198 建图 %d：%d %s", i, r.code, e.why);
+        if (!tex[i]) return;
+    }
+    size_t big = (size_t)(W2 / 4) * (W2 / 4) * 8;
+    uint8_t *src = malloc(big);
+    nvn_gpu_tex out = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_tex out3 = make_tex_3d_levels(4, 4, D3, 1, NVN_FORMAT_R8, NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_buf rb = make_buf(128 * N2 + 16 * D3, NVN_GPU_MEM_SHARED, NULL);
+    if (!src || !out || !out3 || !rb) { free(src); return; }
+    bc_track_reset(); g_bc_track = 1;
+    nvn_gpu_cmd c = begin_cmd();
+    uint64_t total = 0, dedicated = 0; int slices = 0;
+    t_bc_submits = t_bc_waits = 0; t_bc_watch = 1;
+    for (int i = 0; i <= N2; i++) {
+        if (i == N2) {   // BC4 块：两端点都是 200、索引全 0 → 每个纹素 200
+            for (size_t k = 0; k < big; k += 8) { uint8_t *b = src + k; b[0] = b[1] = 200; memset(b + 2, 0, 6); }
+            uint64_t row = (uint64_t)(W3 / 4) * 8, slice = row * (W3 / 4);
+            nvn_gpu_tex_upload(c, tex[i], 0, 0, NULL, src, row, slice * D3);
+            total += slice * D3; slices += D3; if (slice + 16 > STD) dedicated += slice * D3;
+            break;
+        }
+        for (size_t k = 0; k < big; k += 8) { uint8_t *b = src + k; b[0] = b[2] = (uint8_t)col565[i]; b[1] = b[3] = (uint8_t)(col565[i] >> 8); memset(b + 4, 0, 4); }
+        for (uint32_t l = 0; l < L2; l++) {
+            uint32_t w = W2 >> l, bw = (w + 3) / 4; uint64_t row = (uint64_t)bw * 8, bytes = row * bw;
+            nvn_gpu_tex_upload(c, tex[i], l, 0, NULL, src, row, bytes);
+            total += bytes; slices++; if (bytes + 16 > STD) dedicated += bytes;
+        }
+    }
+    t_bc_watch = 0;
+    CHECK(t_bc_submits == 0 && t_bc_waits == 0, "C198 大批上传期间调用线程提交 %u 次、等待 %u 次（应 0）", t_bc_submits, t_bc_waits);
+    pthread_mutex_lock(&g_bc_track_mu); int img_peak = g_bc_img_peak; VkDeviceSize stage_peak = g_bc_stage_peak; pthread_mutex_unlock(&g_bc_track_mu);
+    CHECK(img_peak == 2 * slices, "C198 段内应持有每片的临时图 + 输入图（%d 片 → %d 张），实得峰值 %d", slices, 2 * slices, img_peak);
+    CHECK(stage_peak >= dedicated && stage_peak <= total + (VkDeviceSize)slices * 16 + 2u * STD,
+          "C198 新建暂存峰值 %llu 字节：应 ≥ 大切片合计 %llu、≤ 压缩总量 %llu + 对齐 + 两块标准块（每片一份，不翻倍）",
+          (unsigned long long)stage_peak, (unsigned long long)dedicated, (unsigned long long)total);
+    for (int i = 0; i < N2; i++) {
+        NVNcopyRegion r4 = {0, 0, 0, 4, 4, 1}, r1 = {0, 0, 0, 1, 1, 1};
+        nvn_gpu_copy_tex(c, tex[i], 0, 0, &r4, out, 0, 0, &r4); nvn_gpu_copy_tex_buf(c, out, 0, 0, NULL, rb, (uint64_t)128 * i, 16, 64);
+        nvn_gpu_copy_tex(c, tex[i], L2 - 1, 0, &r1, out, 0, 0, &r1); nvn_gpu_copy_tex_buf(c, out, 0, 0, &r1, rb, (uint64_t)128 * i + 64, 4, 4);
+    }
+    { NVNcopyRegion r3 = {0, 0, 0, 4, 4, D3};
+      nvn_gpu_copy_tex(c, tex[N2], 0, 0, &r3, out3, 0, 0, &r3); nvn_gpu_copy_tex_buf(c, out3, 0, 0, &r3, rb, (uint64_t)128 * N2, 4, 16 * D3); }
+    r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r), "C198 commit：%d %s", r.code, e.why);
+    if (OK(r)) {
+        CHECK(OK(nvn_gpu_fence_wait(1, 10000000000ull, &e)), "C198 wait：%s", e.why);
+        const uint8_t *o = buf_cpu(rb);
+        for (int i = 0; i < N2; i++) {
+            for (int p = 0; p < 16; p++) CHECK(!memcmp(o + 128 * i + p * 4, want[i], 4), "C198 2D %d 第 0 级像素 %d：%u,%u,%u", i, p, o[128 * i + p * 4], o[128 * i + p * 4 + 1], o[128 * i + p * 4 + 2]);
+            CHECK(!memcmp(o + 128 * i + 64, want[i], 4), "C198 2D %d 最末级 1x1：%u,%u,%u", i, o[128 * i + 64], o[128 * i + 65], o[128 * i + 66]);
+        }
+        for (int p = 0; p < 16 * D3; p++) CHECK(o[128 * N2 + p] == 200, "C198 BC4 3D 纹素 %d：%u，期望 200", p, o[128 * N2 + p]);
+    }
+    CHECK(bc_track_wait_drained(), "C198 段完成后解码临时图应归零，剩 %d", g_bc_img_live);
+    pthread_mutex_lock(&g_bc_track_mu); VkDeviceSize stage_left = 0;
+    for (int k = 0; k < BC_TRACK_MAX; k++) if (g_bc_bufs[k] && g_bc_buf_size[k] != STD) stage_left += g_bc_buf_size[k];
+    pthread_mutex_unlock(&g_bc_track_mu);
+    CHECK(stage_left == 0, "C198 段完成后大块暂存应释放（标准块留给复用池），剩 %llu 字节", (unsigned long long)stage_left);
+    g_bc_track = 0;
+    printf("C198 同段大批 CPU BC 上传：%d 片、压缩 %llu 字节（大切片 %llu）、新建暂存峰值 %llu 字节、解码临时图峰值 %d 张，完成后归零\n",
+           slices, (unsigned long long)total, (unsigned long long)dedicated, (unsigned long long)stage_peak, img_peak);
+    for (int i = 0; i <= N2; i++) nvn_gpu_tex_release(tex[i]);
+    nvn_gpu_tex_release(out); nvn_gpu_tex_release(out3); nvn_gpu_buf_release(rb, NULL, NULL); free(src);
 }
 
 // C697e：小于一个压缩块的 mip（8×8 BC1 的第 2 级是 2×2）按整块区域 4×4 上传（NVN 的写法），应裁到边照常写入、读回纯蓝；
@@ -8935,7 +9139,7 @@ static void c697_bc4_3d(void) {
     if (!OK(rc)) goto done;
     rc = nvn_gpu_fence_wait(1, 5000000000ull, &e);
     CHECK(OK(rc), "C697 BC4 3D wait：%s", e.why); if (!OK(rc)) goto done;
-    // 后片分配失败：前面解码已经真实提交，但目标图拷贝还在待提交段中，abort 不得改旧内容。
+    // 后片分配失败：前面切片的解码与目标图拷贝都还在待提交段中，abort 不得改旧内容。
     for (int fail_at = 2; fail_at <= 3; fail_at++) {
         c = begin_cmd(); g_bc4_temp_seen = 0; g_bc4_fail_temp = fail_at;
         nvn_gpu_tex_upload(c, bc, 0, 0, NULL, blocks, 24, 184);
@@ -10247,7 +10451,17 @@ int main(int argc, char **argv) {
       c193_bc_readback_rejected();
       CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C87 close：%d %s", e72.rc.code, e72.why);
       if (!open_backend()) return 1;
-      c196_bc_close_timeout();
+      CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C196 前 close：%d %s", e72.rc.code, e72.why);
+      { uint32_t m = g_dev.bc_decode_mask; g_dev.bc_decode_mask |= 1u << (NVN_FORMAT_RGTC1_UNORM - 0x41);   // C196 ② / C198 的 3D 要 BC4 现解
+        if (!open_backend()) return 1;
+        c197_bc_upload_in_segment();
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C197 close：%d %s", e72.rc.code, e72.why);
+        if (!open_backend()) return 1;
+        c198_bc_bulk_upload();
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C198 close：%d %s", e72.rc.code, e72.why);
+        if (!open_backend()) return 1;
+        c196_bc_abort_reclaim();   // 以 close 结束
+        g_dev.bc_decode_mask = m; }
       {   // #682 的六个格式：每块按端点直接构造纯红，采样后都是 (255,0,0,255)。
           static const uint32_t fmt[6] = {0x41,0x44,0x45,0x48,0x49,0x4b};
           static const uint8_t bc1[8] = {0x00,0xf8,0x00,0xf8,0,0,0,0};
