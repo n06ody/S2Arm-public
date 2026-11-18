@@ -1,0 +1,9 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Output { float x; } output_data;
+shared float unsupported_array[2048];
+void main() {
+    unsupported_array[gl_LocalInvocationIndex] = float(gl_WorkGroupID.x);
+    barrier();
+    output_data.x = unsupported_array[gl_LocalInvocationIndex];
+}

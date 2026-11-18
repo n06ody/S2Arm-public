@@ -317,7 +317,6 @@ static void es_reset(struct nvn_gpu_cmd_s *c) { memset(&c->es, 0, sizeof c->es);
 struct nvn_gpu_vk {
     struct s2a_vk_device *dev;
     struct nvn_vk_bcdec *bc;
-    struct bc_temp *bc_pending;  // 解码已提交但未证明完成，不能随失败的命令段释放
     VkDevice d;
     VkPhysicalDevice phys;
     VkQueue queue;
@@ -1559,6 +1558,9 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         seg_give_q(c->qpool, c->qcount);
     free(c->q_used);
+    // 段内解码资源在 nvn_vk_bcdec.c 里销毁，那边的 vkDestroy* 不走两级回放的包装（不先清空录制队列）：
+    // 放弃的段里录制线程可能还没录到用它们的命令，先清空再销毁（开关关着时只是一次比较）。
+    if (c->bc_temps) vk_dq_drain();
     while (c->bc_temps) {
         struct bc_temp *b = c->bc_temps; c->bc_temps = b->next;
         nvn_vk_bcdec_rec_free(g.dev, &b->rec);
@@ -2182,22 +2184,6 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         pthread_cond_timedwait(&g_cv, &g_mu, &ts);
     }
     pthread_mutex_unlock(&g_mu);
-    pthread_mutex_lock(&g_submit_mu);
-    uint64_t now = now_ns();
-    int bc_wait = nvn_vk_bcdec_wait(g.dev, g.bc, now < deadline ? deadline - now : 0);
-    if (bc_wait != 0) {
-        pthread_mutex_unlock(&g_submit_mu);
-        pthread_mutex_lock(&g_mu); g.close_active = 0; pthread_mutex_unlock(&g_mu);
-        return fail(err, NVN_GPU_E_TIMEOUT, "close 时限内 BC 解码未证明完成（保留资源，可再调一次）");
-    }
-    while (g.bc_pending) {
-        struct bc_temp *b = g.bc_pending; g.bc_pending = b->next;
-        nvn_vk_bcdec_rec_free(g.dev, &b->rec);
-        if (b->image) vkDestroyImage(g.d, b->image, NULL);
-        if (b->memory) vkFreeMemory(g.d, b->memory, NULL);
-        free(b);
-    }
-    pthread_mutex_unlock(&g_submit_mu);
     pthread_mutex_lock(&g_mu);
     g.stop = 1;
     pthread_cond_broadcast(&g_cv);
@@ -6576,7 +6562,6 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
     cmd_ref(c, t, REF_TEX);
 }
 
-// 同步解码只写私有临时图：目标的修改仍由当前段在指定位置执行，abort 不改目标。
 // 现解贴图（bc_decoded）的压缩原数据影子：显存里存的是解码后的格式，游戏按压缩字节回读（贴图 → 缓冲拷贝）时要的是原字节。
 // 这种贴图不能当渲染目标、不能当存储图像，也不接受压缩字节直拷（见 tex_create / copy_buf_tex_impl），内容只来自 bc_upload，
 // 所以在上传时留一份原字节就是准确的回读来源，不用重新压缩。影子是一块 GPU 缓冲，写它和读它都录在同一条命令流里：
@@ -6744,61 +6729,6 @@ static void bc_temp_to_tex(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, str
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL); cmd_ref(c, t, REF_TEX);
 }
 
-static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer,
-                      const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
-    VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
-    if (!bc_src_check(c, t, level, layer, r, row_bytes, image_bytes, &off, &ext, &bb, &bw, &bh, &slice_stride)) return;
-    uint64_t packed_row = bw * (uint32_t)bb;
-    uint64_t sh_loff = 0, sh_rp = 0, sh_sp = 0, sh_total = 0; uint32_t sh_slices = 0;
-    if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
-        set_sticky(c, NVN_GPU_E_ARG, "BC 上传：压缩影子布局溢出"); return;
-    }
-    if (!bc_shadow_ensure(c, t, sh_total)) return;
-    size_t bytes = (size_t)(packed_row * bh); uint8_t *packed = malloc(bytes);
-    struct bc_temp *tmp = NULL;
-    if (!packed) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传暂存分配失败"); return; }
-    for (uint32_t z = 0; z < ext.depth; z++) {
-        for (uint64_t y = 0; y < bh; y++) memcpy(packed + y * packed_row, (const uint8_t *)src + (uint64_t)z * slice_stride + y * row_bytes, (size_t)packed_row);
-        {   // 同一份原字节按序录进压缩影子缓冲（回读用，见 bc_readback）
-            uint32_t s = t->target == NVN_TEXTURE_TARGET_3D ? (uint32_t)off.z + z : layer;
-            nvn_gpu_slice ss; nvn_gpu_err se; VkBufferCopy *rg;
-            if (s >= sh_slices) { set_sticky(c, NVN_GPU_E_ARG, "BC 上传：切片越过压缩影子"); free(packed); return; }
-            if (!rc_is(nvn_gpu_arena_alloc(c, bytes, 4, &ss, &se), NVN_GPU_OK) || !(rg = calloc((size_t)bh, sizeof *rg))) {
-                if (rc_is(c->sticky, NVN_GPU_OK)) set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子暂存分配失败");
-                free(packed); return;
-            }
-            memcpy(ss.cpu, packed, bytes);
-            uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
-            for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){ss.off + y * packed_row, dst + y * sh_rp, packed_row};
-            full_barrier(c);
-            vkCmdCopyBuffer(c->cb, ss.buf->buffer, t->bc_sbuf, (uint32_t)bh, rg);
-            c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
-            free(rg);
-        }
-        tmp = bc_temp_image(t, ext);
-        if (!tmp) goto fail;
-        char why[192] = {0}; int result = -1;
-        pthread_mutex_lock(&g_submit_mu);
-        if (g.bc || nvn_vk_bcdec_create(g.dev, &g.bc, why, sizeof why) == 0)
-            result = nvn_vk_bcdec_decode(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, packed, bytes, why, sizeof why);
-        if (result == -2) { tmp->next = g.bc_pending; g.bc_pending = tmp; }
-        pthread_mutex_unlock(&g_submit_mu);
-        if (result != 0) {
-            set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码失败：%s", why);
-            if (result == -2) { free(packed); return; } // 临时图转交会话，close 取得完成证明后释放
-            vkDestroyImage(g.d, tmp->image, NULL); vkFreeMemory(g.d, tmp->memory, NULL); free(tmp);
-            free(packed); return;   // 粘滞原因已是解码失败，不再改写
-        }
-        tmp->next = c->bc_temps; c->bc_temps = tmp;
-        bc_temp_to_tex(c, t, tmp, level, layer, off, ext, z);
-    }
-    free(packed);
-    return;
-fail:
-    free(packed);
-    set_sticky(c, NVN_GPU_E_OOM, "BC 临时图或解码初始化失败");
-}
-
 // 段内解码的命令（资源由 nvn_vk_bcdec_prepare 建好）：在这里用后端的 vkCmd* 录——两级回放开着时这些名字走包装进录制线程，
 // 和段里前后的拷贝保持同一顺序（模块里直接调 vkCmd* 会越过录制线程、跑到前面那几条拷贝之前）。
 static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_rec *rec, VkImage dst,
@@ -6831,11 +6761,74 @@ static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_
     // 结果交给 bc_temp_to_tex 的屏障（COMPUTE 写 → TRANSFER 读，同时转 TRANSFER_SRC）
 }
 
+// 一个切片的段内解码（CPU 字节 → BC 与缓冲 → BC 共用）。紧凑块已在段内暂存 (sb, soff) 里（16 字节对齐），整条按 GPU 顺序录进本段：
+//   ① 同一份块拷进压缩影子（回读用，见 bc_readback）；② 解码录进本段（nvn_vk_bcdec_prepare 建资源、bc_record_decode 录命令）落到临时图；
+//   ③ 临时图按区域拷进目标。不单独提交、不等 fence；临时图与解码资源挂 c->bc_temps，暂存是段的 arena，都随段释放
+//   （放弃的段没提交过，直接回收；执行过的段在完成后回收）。解码绑了自己的计算管线和描述符组：录完让描述符布局缓存失效，下一次派发重绑。
+// 失败置粘滞，返回 0。
+static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkBuffer sb, uint64_t soff, uint64_t bh, uint64_t packed_row,
+                           uint64_t shadow_dst, uint64_t sh_rp, uint32_t level, uint32_t layer, VkOffset3D off, VkExtent3D ext, uint32_t z) {
+    char why[192] = {0};
+    VkBufferCopy *rg = calloc((size_t)bh, sizeof *rg);
+    if (!rg) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子拷贝表分配失败"); return 0; }
+    for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){soff + y * packed_row, shadow_dst + y * sh_rp, packed_row};
+    full_barrier(c);   // 暂存此前在本段里的写（缓冲 → BC 的源拷贝）对影子拷贝和解码输入可见
+    vkCmdCopyBuffer(c->cb, sb, t->bc_sbuf, (uint32_t)bh, rg);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    free(rg);
+    struct bc_temp *tmp = bc_temp_image(t, ext);
+    if (!tmp) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：临时图分配失败"); return 0; }
+    if (nvn_vk_bcdec_prepare(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, &tmp->rec, why, sizeof why) != 0) {
+        vkDestroyImage(g.d, tmp->image, NULL); vkFreeMemory(g.d, tmp->memory, NULL); free(tmp);
+        set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码失败：%s", why); return 0;
+    }
+    bc_record_decode(c, &tmp->rec, tmp->image, sb, soff, ext.width, ext.height);
+    c->desc_layout = VK_NULL_HANDLE;   // 计算绑定点被解码占过：下一次派发重绑描述符组
+    tmp->next = c->bc_temps; c->bc_temps = tmp;
+    bc_temp_to_tex(c, t, tmp, level, layer, off, ext, z);
+    return 1;
+}
+
+// 解码器（计算管线）首次用到时建，之后只读。g_submit_mu 只护这次建立，不护任何提交或等待。
+static int bc_decoder_ready(struct nvn_gpu_cmd_s *c) {
+    char why[192] = {0};
+    pthread_mutex_lock(&g_submit_mu);
+    int ready = g.bc || nvn_vk_bcdec_create(g.dev, &g.bc, why, sizeof why) == 0;
+    pthread_mutex_unlock(&g_submit_mu);
+    if (!ready) set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码初始化失败：%s", why);
+    return ready;
+}
+
+// CPU 字节 → BC 现解贴图：每个 z 切片把源行（带行距）拷成段内暂存里的紧凑块，再交 bc_record_slice 录进本段。
+// 原先这里在 g_submit_mu 里单独 vkQueueSubmit 解码再等 fence（最长 5 s）：单独提交排在完成线程未退休的段之后，
+// 每次等待跟着前面的段一起等（天玑 9000 / Mali 每帧累计中位 641 ms），上层 rp_tex_resolve 拿着 g_rmu 一起等。
+static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer,
+                      const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
+    VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
+    if (!bc_src_check(c, t, level, layer, r, row_bytes, image_bytes, &off, &ext, &bb, &bw, &bh, &slice_stride)) return;
+    uint64_t packed_row = bw * (uint32_t)bb, bytes = packed_row * bh;
+    uint64_t sh_loff = 0, sh_rp = 0, sh_sp = 0, sh_total = 0; uint32_t sh_slices = 0;
+    if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
+        set_sticky(c, NVN_GPU_E_ARG, "BC 上传：压缩影子布局溢出"); return;
+    }
+    if (!bc_shadow_ensure(c, t, sh_total) || !bc_decoder_ready(c)) return;
+    for (uint32_t z = 0; z < ext.depth; z++) {
+        uint32_t s = t->target == NVN_TEXTURE_TARGET_3D ? (uint32_t)off.z + z : layer;
+        if (s >= sh_slices) { set_sticky(c, NVN_GPU_E_ARG, "BC 上传：切片越过压缩影子"); return; }
+        nvn_gpu_slice ss; nvn_gpu_err se;
+        if (!rc_is(nvn_gpu_arena_alloc(c, bytes, 16, &ss, &se), NVN_GPU_OK)) {
+            if (rc_is(c->sticky, NVN_GPU_OK)) set_sticky(c, NVN_GPU_E_OOM, "BC 上传暂存分配失败：%s", se.why);
+            return;
+        }
+        for (uint64_t y = 0; y < bh; y++)
+            memcpy((uint8_t *)ss.cpu + y * packed_row, (const uint8_t *)src + (uint64_t)z * slice_stride + y * row_bytes, (size_t)packed_row);
+        uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
+        if (!bc_record_slice(c, t, ss.buf->buffer, ss.off, bh, packed_row, dst, sh_rp, level, layer, off, ext, z)) return;
+    }
+}
+
 // 缓冲 → BC 现解贴图（#697）：游戏把压缩块从 GPU 缓冲拷进 BC 贴图（常见是同一段里刚从另一张 BC 贴图回读出来的字节），
-// 录制时 CPU 上没有这些字节，bc_upload 那条「CPU 字节一次性提交解码」用不上。整条在段里按 GPU 顺序做：
-//   ① 源行（带行距）拷成段内暂存区里的紧凑块（16 字节对齐）；② 同一份块拷进压缩影子（回读用，同 bc_upload）；
-//   ③ 解码录进本段（nvn_vk_bcdec_prepare 建资源、bc_record_decode 录命令）落到临时图；④ 临时图按区域拷进目标。临时资源随段完成回收（bc_temps）。
-// 解码绑了自己的计算管线和描述符组：录完让后端的描述符布局缓存失效，下一次派发重绑。
+// 录制时 CPU 上没有这些字节：源行（带行距）先在 GPU 上拷成段内暂存里的紧凑块，之后同 CPU 字节那条（bc_record_slice）。
 static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
                              struct nvn_gpu_buf_s *b, uint64_t boff, uint64_t row_bytes, uint64_t image_bytes) {
     VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
@@ -6846,12 +6839,7 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
     if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
         set_sticky(c, NVN_GPU_E_ARG, "缓冲 → BC 贴图：压缩影子布局溢出"); return;
     }
-    if (!bc_shadow_ensure(c, t, sh_total)) return;
-    char why[192] = {0};
-    pthread_mutex_lock(&g_submit_mu);
-    int ready = g.bc || nvn_vk_bcdec_create(g.dev, &g.bc, why, sizeof why) == 0;
-    pthread_mutex_unlock(&g_submit_mu);
-    if (!ready) { set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码初始化失败：%s", why); return; }
+    if (!bc_shadow_ensure(c, t, sh_total) || !bc_decoder_ready(c)) return;
     VkBufferCopy *rg = calloc((size_t)bh, sizeof *rg);
     if (!rg) { set_sticky(c, NVN_GPU_E_OOM, "缓冲 → BC 贴图：拷贝区域表分配失败"); return; }
     cmd_ref(c, b, REF_BUF);
@@ -6867,21 +6855,8 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
         for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){boff + (uint64_t)z * slice_stride + y * row_bytes, ss.off + y * packed_row, packed_row};
         vkCmdCopyBuffer(c->cb, b->buffer, ss.buf->buffer, (uint32_t)bh, rg);
         c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
-        full_barrier(c);
         uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
-        for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){ss.off + y * packed_row, dst + y * sh_rp, packed_row};
-        vkCmdCopyBuffer(c->cb, ss.buf->buffer, t->bc_sbuf, (uint32_t)bh, rg);
-        c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
-        struct bc_temp *tmp = bc_temp_image(t, ext);
-        if (!tmp) { set_sticky(c, NVN_GPU_E_OOM, "缓冲 → BC 贴图：临时图分配失败"); break; }
-        if (nvn_vk_bcdec_prepare(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, &tmp->rec, why, sizeof why) != 0) {
-            vkDestroyImage(g.d, tmp->image, NULL); vkFreeMemory(g.d, tmp->memory, NULL); free(tmp);
-            set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码失败：%s", why); break;
-        }
-        bc_record_decode(c, &tmp->rec, tmp->image, ss.buf->buffer, ss.off, ext.width, ext.height);
-        c->desc_layout = VK_NULL_HANDLE;   // 计算绑定点被解码占过：下一次派发重绑描述符组
-        tmp->next = c->bc_temps; c->bc_temps = tmp;
-        bc_temp_to_tex(c, t, tmp, level, layer, off, ext, z);
+        if (!bc_record_slice(c, t, ss.buf->buffer, ss.off, bh, packed_row, dst, sh_rp, level, layer, off, ext, z)) break;
     }
     free(rg);
 }
