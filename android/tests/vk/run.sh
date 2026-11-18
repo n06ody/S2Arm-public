@@ -55,7 +55,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--descriptor-indexing" ] || [ "$mode" = "--compute-workgroup" ] || [ "$mode" = "--zero-mask-core" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]] || [ "$mode" = "--feedback-core" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--descriptor-indexing" ] || [ "$mode" = "--compute-workgroup" ] || [ "$mode" = "--zero-mask-core" ] || [ "$mode" = "--wsi-extent" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]] || [ "$mode" = "--feedback-core" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -212,6 +212,12 @@ if [ "$mode" = --zero-mask-core ]; then
 fi
 if [ -z "$mode" ]; then
     bash "$repo/android/tests/vk/zero_mask.sh"
+fi
+if [ "$mode" = "--wsi-extent" ]; then
+    exec bash "$repo/android/tests/vk/wsi_extent.sh"
+fi
+if [ -z "$mode" ]; then
+    bash "$repo/android/tests/vk/wsi_extent.sh"
 fi
 if [[ "$mode" == --pool-table* ]]; then
     exec bash "$repo/android/tests/vk/pool_table.sh" "${mode#--pool-table}"
