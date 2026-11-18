@@ -6,7 +6,9 @@
 #define main replay_fixture_main
 #define rp_shader_resolve fixture_shader_resolve
 #define nvn_plat_flag fixture_plat_flag
+#define nvn_dirty_since fixture_dirty_since
 #include "t_nvn_replay.c"
+#undef nvn_dirty_since
 #undef nvn_plat_flag
 #undef rp_shader_resolve
 #undef main
@@ -22,6 +24,14 @@ static int res_flags_off(void) {
 int nvn_plat_flag(const char *name, int dflt) {
     if (res_flags_off() && (!strcmp(name, "nvk_bind_fast") || !strcmp(name, "nvk_drv_memo") || !strcmp(name, "nvk_tex_epoch"))) return 0;
     return fixture_plat_flag(name, dflt);
+}
+
+// 逐页比对的独立账：替身的 nvn_dirty_since 答案不变，这里另记被调次数和它要比的页数（按替身的 4096 字节页），用来核 RP_PERF_TEX_EPOCH_MISS / TEX_CHECK_PAGES。
+static uint64_t g_since_calls, g_since_pages;
+int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
+    g_since_calls++;
+    if (len) { uintptr_t a = (uintptr_t)addr; g_since_pages += (a + len - 1) / PG - a / PG + 1; }
+    return fixture_dirty_since(addr, len, stamp);
 }
 
 // 程序切换：替身只会给 g_fprog；B2 要两个程序对象，这里在用例指定时换成另一个。
@@ -84,6 +94,48 @@ static void t_res_tex_epoch(void) {
     CHECK(rp_res_uploads() == u1);                     // 没脏：也不重传
     nvn_be_tex_release(&t); nvn_be_tex_release(&u);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// ---------- ①b 无关写让贴图纪元失效（复现 9000 的「取贴图视图」持锁段）----------
+// 同一段里 N 张已传过、内容没变的 CPU 贴图；每笔绘制前游戏写一次别处（常量缓冲等，只推进全局写代号，这些贴图的页都没写），
+// 每笔绘制把 N 张各取两次。理想：贴图没被写，一次都不用逐页比。现状：纪元键是全局写代号，每笔之后第一次取都没命中、整张逐页比，
+// 第二次取才命中。两个计数必须和独立账（g_since_calls / g_since_pages）逐项一致；上传次数不变（内容没变，不该重传）。
+static void t_res_tex_epoch_unrelated(void) {
+    enum { N = 8, D = 32, W = 128, H = 128 };          // 128x128 RGBA8 = 64 KB = 16 页（替身 4096 字节一页）
+    res_fresh();
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    nvn_be_sub_begin();
+    tex_t t[N];
+    for (int i = 0; i < N; i++) {
+        t[i] = mk_tex(950 + (uint64_t)i, 0, NVN_FORMAT_RGBA8, W, H, 1, 0);
+        t[i].mem = g_block_mem + (size_t)i * t[i].L.size;   // 放在被写跟踪的块内存里，各占一段
+        memset(t[i].mem, 0x30 + i, t[i].L.size);
+        CHECK(rp_tex_resolve(&t[i], &g_fake_cmd) != NULL);   // 首用：整张传
+    }
+    const uint64_t pages_per = t[0].L.size / PG;
+    const uint64_t u0 = rp_res_uploads();
+    uint64_t p[RP_PERF_N]; rp_perf_take(p);
+    g_since_calls = g_since_pages = 0;
+    for (int d = 0; d < D; d++) {
+        g_dirty_now++;                                  // 无关写：只推进全局写代号（g_dirty_written 不动 = 这些贴图的页没被写）
+        for (int r = 0; r < 2; r++) for (int i = 0; i < N; i++) CHECK(rp_tex_resolve(&t[i], &g_fake_cmd) != NULL);
+    }
+    rp_perf_take(p);
+    CHECK(rp_res_uploads() == u0);                      // 内容没变：不重传
+    CHECK(p[RP_PERF_TEX_EPOCH] == (uint64_t)N * D);     // 每笔里第二次取命中
+    CHECK(p[RP_PERF_TEX_EPOCH_MISS] == g_since_calls && g_since_calls == (uint64_t)N * D);   // 每笔里第一次取没命中，且每次都调了逐页比对
+    CHECK(p[RP_PERF_TEX_CHECK_PAGES] == g_since_pages && g_since_pages == (uint64_t)N * D * pages_per);
+    printf("tex-epoch unrelated-write repro: textures=%d draws=%d resolves=%d epoch_skip=%llu epoch_miss=%llu pages_compared=%llu uploads=%llu (ideal: miss 0, pages 0)\n",
+           N, D, 2 * N * D, (unsigned long long)p[RP_PERF_TEX_EPOCH], (unsigned long long)p[RP_PERF_TEX_EPOCH_MISS],
+           (unsigned long long)p[RP_PERF_TEX_CHECK_PAGES], (unsigned long long)(rp_res_uploads() - u0));
+    // 对照：没有无关写时同样 2N 次取，一次都不比（纪元键本身是对的，失效只来自全局写代号推进）
+    g_since_calls = 0;
+    for (int r = 0; r < 2; r++) for (int i = 0; i < N; i++) CHECK(rp_tex_resolve(&t[i], &g_fake_cmd) != NULL);
+    rp_perf_take(p);
+    CHECK(p[RP_PERF_TEX_EPOCH_MISS] == 0 && p[RP_PERF_TEX_CHECK_PAGES] == 0 && g_since_calls == 0 && p[RP_PERF_TEX_EPOCH] == 2 * N);
+    for (int i = 0; i < N; i++) nvn_be_tex_release(&t[i]);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_block_mem = NULL;
 }
 
 // ---------- ② B1 整组沿用 + B3 驱动段按内容命中（rp_draw.c）----------
@@ -210,6 +262,7 @@ static void t_res_pipe_layout(void) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     t_res_tex_epoch();
+    t_res_tex_epoch_unrelated();
     t_res_bind_fast();
     t_res_pipe_layout();
     printf("t_nvn_res：%d 项检查，%d 项红\n", g_checks, g_fail);

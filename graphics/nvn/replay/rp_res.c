@@ -497,7 +497,10 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             && !nvn_dirty_tracking_unreliable()) {
             rp_perf_add(RP_PERF_TEX_EPOCH, 1);
         } else {
+            if (x->uploaded && x->span && !x->check_dirty) rp_perf_add(RP_PERF_TEX_EPOCH_MISS, 1);   // 能走纪元快路的贴图没跳成（代号 / 段 / 映射变了，或开关关着、跟踪不可靠）
             x->span = nvn_dirty_span(t->mem, t->L.size);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
+            if (x->uploaded && !x->check_dirty) { const size_t pg = nvn_dirty_page_size(); const uintptr_t a = (uintptr_t)t->mem;
+                rp_perf_add(RP_PERF_TEX_CHECK_PAGES, t->L.size ? ((a + t->L.size - 1) / pg - a / pg + 1) : 0); }   // 下面 nvn_dirty_since 要逐页比的页数（上限）
             if (!x->uploaded || x->check_dirty || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
