@@ -232,6 +232,12 @@ struct pass_detail {
     struct { uint32_t format, samples, load, store, sload, sstore, w, h, depth; } a[9];
 };
 struct pass_details { struct pass_detail p[TS_PASS_MAX]; uint32_t events, overflow; };
+// 诊断 nvk_ind_args：走 firstInstance 拷贝点的间接绘制，在同一个收通道点多拷一份间接参数到暂存片，段完成时读出来打行。
+#define IND_ARGS_MAX 256
+struct ind_args {
+    uint32_t n, overflow, uncovered, inpass;
+    struct { uint32_t pass, indexed, multi, keys_ok; uint64_t vkey, fkey; const uint8_t *cpu; } e[IND_ARGS_MAX];
+};
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     VkCommandBuffer cb;
@@ -276,6 +282,7 @@ struct nvn_gpu_cmd_s {
     uint32_t ntsp;
     struct csf_times *csf_times; uint64_t csf_pending_seq, csf_pending_key; uint32_t csf_dims[3]; int csf_dims_known;
     struct pass_details *pass_details;
+    struct ind_args *ind_args; int ind_on;   // nvk_ind_args 且本段在采样窗内
     int diag_take;   // 诊断采样窗：这一段输出逐通道 / 派发诊断（dwin_take）
     int csf_barrier_on, csf_last; struct csf_barriers csf_between, csf_before;
     VkCommandBuffer init_cb;                 // 本段提交时带上的「新建图像转 GENERAL」命令缓冲（没有就是空）
@@ -1676,9 +1683,47 @@ static void pass_detail_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int sta
     }
     if (c->pass_details->overflow) { char line[128]; snprintf(line,sizeof line,"gpu pass_detail coverage=incomplete overflow=%u",c->pass_details->overflow); nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu",line); }
 }
+// 回放在 firstInstance 拷贝点（已收通道、拷贝 + 间接屏障之前）调：多拷一份间接参数（非索引 16 字节 / 索引 20 字节）到暂存片。
+// 不另收通道，通道结构与诊断关时一样；pass 号是这一笔接下来要开的通道（与 pass_detail 的 pass 对齐）。
+// ind 为空 = 这一笔间接绘制没走拷贝点（阶段已证不读 base instance），只计数（读不到参数，不为它收通道）。
+void nvn_gpu_diag_ind_args(nvn_gpu_cmd c, nvn_gpu_buf ind, uint64_t off, int indexed, int multi, uint64_t vkey, uint64_t fkey, uint32_t keys_ok) {
+    if (!c || !c->ind_on) return;
+    if (!c->ind_args && !(c->ind_args = calloc(1, sizeof *c->ind_args))) { c->ind_on = 0; nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu","gpu ind_args coverage=unavailable reason=allocation"); return; }
+    struct ind_args *a = c->ind_args;
+    if (!ind) { a->uncovered++; return; }
+    if (c->in_pass) { a->inpass++; return; }
+    if (a->n == IND_ARGS_MAX) { a->overflow++; return; }
+    const uint32_t bytes = indexed ? 20u : 16u;
+    nvn_gpu_slice sl; nvn_gpu_err e = {0};
+    if (!rc_is(nvn_gpu_arena_alloc(c, bytes, 4, &sl, &e), NVN_GPU_OK) || !sl.cpu) { a->overflow++; return; }
+    nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);
+    a->e[a->n].pass = c->ntsp; a->e[a->n].indexed = (uint32_t)!!indexed; a->e[a->n].multi = (uint32_t)!!multi;
+    a->e[a->n].keys_ok = keys_ok; a->e[a->n].vkey = vkey; a->e[a->n].fkey = fkey; a->e[a->n].cpu = sl.cpu;
+    a->n++;
+}
+static void ind_args_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status) {
+    struct ind_args *a = c ? c->ind_args : NULL; if (!a) return;
+    for (uint32_t i = 0; i < a->n; i++) {
+        char line[400];
+        if (status != NVN_GPU_DONE_OK) {
+            snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u source=unavailable reason=fence_failed_or_not_submitted", (unsigned long long)signal, a->e[i].pass);
+            nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", line); continue;
+        }
+        uint32_t w[5] = {0}; memcpy(w, a->e[i].cpu, a->e[i].indexed ? 20 : 16);
+        // 非索引：vertexCount, instanceCount, firstVertex, firstInstance；索引：indexCount, instanceCount, firstIndex, vertexOffset, firstInstance
+        int32_t bv = a->e[i].indexed ? (int32_t)w[3] : 0; uint32_t fi = a->e[i].indexed ? w[4] : w[3];
+        snprintf(line, sizeof line, "gpu ind_args fence=%llu pass=%u indexed=%u multi=%u count=%u instances=%u first=%u base_vertex=%d first_instance=%u vs_key=%016llx fs_key=%016llx keys_ok=0x%x",
+            (unsigned long long)signal, a->e[i].pass, a->e[i].indexed, a->e[i].multi, w[0], w[1], w[2], bv, fi,
+            (unsigned long long)a->e[i].vkey, (unsigned long long)a->e[i].fkey, a->e[i].keys_ok);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+    }
+    char line[200]; snprintf(line, sizeof line, "gpu ind_args_cov fence=%llu recorded=%u overflow=%u inpass=%u uncovered=%u", (unsigned long long)signal, a->n, a->overflow, a->inpass, a->uncovered);
+    nvn_plat_log(a->overflow || a->inpass ? NVN_PLAT_LOG_WARN : NVN_PLAT_LOG_INFO, "gpu", line);
+}
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     csf_dispatch_report(s->cmd,s->signal,status);
     pass_detail_report(s->cmd,s->signal,status);
+    ind_args_report(s->cmd,s->signal,status);
     if (!s->done) return;
     nvn_gpu_done d;
     memset(&d, 0, sizeof d);
@@ -1768,7 +1813,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->dpools_full);
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->csf_times) { csf_dispatch_report(c,0,NVN_GPU_DONE_FAILED); if (c->csf_times->pool) vkDestroyQueryPool(g.d,c->csf_times->pool,NULL); free(c->csf_times); }
-    free(c->pass_details);
+    free(c->pass_details); free(c->ind_args);
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         seg_give_q(c->qpool, c->qcount);
@@ -7404,9 +7449,10 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         return fail(err, NVN_GPU_E_DEVICE, "vkBeginCommandBuffer 失败");
     }
     c->recording = 1;
-    {   int pd = nvn_plat_flag("nvk_pass_detail", 0) != 0, csd = nvn_plat_flag("nvk_csd",0) != 0;
-        c->diag_take = (pd || csd) ? dwin_take() : 0;
-        c->csf_barrier_on = csd && c->diag_take; }
+    {   int pd = nvn_plat_flag("nvk_pass_detail", 0) != 0, csd = nvn_plat_flag("nvk_csd",0) != 0, ia = nvn_plat_flag("nvk_ind_args", 0) != 0;
+        c->diag_take = (pd || csd || ia) ? dwin_take() : 0;
+        c->csf_barrier_on = csd && c->diag_take;
+        c->ind_on = ia && c->diag_take; }
     c->xfer_dirty = 1;   // 前置段 / 上一段的传输写：段末屏障只对主机可见，本段第一次派发前补一道
     c->sticky = rc(NVN_GPU_OK);
     c->q_active = -1;
@@ -7431,7 +7477,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         c->q_used = calloc(d->occlusion_slots, 1);
         if (c->q_used && seg_reuse_on()) c->qpool = seg_take_q(d->occlusion_slots);
         if (!c->q_used || (!c->qpool && vkCreateQueryPool(g.d, &qi, NULL, &c->qpool) != VK_SUCCESS)) {
-            free(c->pass_details); if (c->tsq) vkDestroyQueryPool(g.d,c->tsq,NULL);
+            free(c->pass_details); free(c->ind_args); if (c->tsq) vkDestroyQueryPool(g.d,c->tsq,NULL);
             free(c->q_used); vkDestroyCommandPool(g.d, c->pool, NULL); free(c);
             return fail(err, NVN_GPU_E_OOM, "遮挡查询池（%u 槽）创建失败", d->occlusion_slots);
         }
@@ -7443,7 +7489,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         pthread_mutex_unlock(&g_mu);
         if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         if (c->qpool) vkDestroyQueryPool(g.d, c->qpool, NULL);
-        free(c->q_used); free(c->pass_details);
+        free(c->q_used); free(c->pass_details); free(c->ind_args);
         vkDestroyCommandPool(g.d, c->pool, NULL);
         free(c);
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");

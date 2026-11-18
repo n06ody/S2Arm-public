@@ -319,7 +319,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--gpu-diag|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--gpu-diag|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-indargs|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 if [[ "$mode" == --gpu-diag-neg-* ]]; then
@@ -331,7 +331,8 @@ changes = {
  '--gpu-diag-neg-key': ('t->ids[at].key=key;', 't->ids[at].key=key^1;'),
  '--gpu-diag-neg-load': ('p->a[i].load=(uint32_t)att[i].loadOp;', 'p->a[i].load=(uint32_t)VK_ATTACHMENT_LOAD_OP_LOAD;'),
  '--gpu-diag-neg-barrier': ('csf_note_guest(c,nvn_bits);', 'csf_note_guest(c,nvn_bits & 0u);'),
- '--gpu-diag-neg-window': ('c->diag_take = (pd || csd) ? dwin_take() : 0;', 'c->diag_take = (pd || csd) ? (dwin_take(), 1) : 0;'),
+ '--gpu-diag-neg-indargs': ('nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);', 'nvn_gpu_copy_buf(c, ind, off + 4, sl.buf, sl.off, bytes);'),
+ '--gpu-diag-neg-window': ('c->diag_take = (pd || csd || ia) ? dwin_take() : 0;', 'c->diag_take = (pd || csd || ia) ? (dwin_take(), 1) : 0;'),
 }
 a, b = changes[mode]
 if s.count(a) != 1: raise SystemExit('GPU diagnosis negative control anchor changed: '+mode)
@@ -481,6 +482,7 @@ if [[ "$mode" == --gpu-diag* ]]; then
                 --gpu-diag-neg-key) want='gpu diag selected dispatch query with exact key and groups' ;;
                 --gpu-diag-neg-load) want='gpu diag empty pass attachment load/store detail' ;;
                 --gpu-diag-neg-barrier) want='gpu diag dispatch neighboring full and guest barriers' ;;
+                --gpu-diag-neg-indargs) want='gpu diag indirect args readback from GPU-written buffer' ;;
                 --gpu-diag-neg-window) want='gpu diag window samples every 2nd in-window segment up to max' ;;
             esac
             if [ "$rc" -eq 0 ] || [ "$bad" -ne 0 ] || ! grep -F 'FAIL ' "$out/log_gpu_diag_$arm" | grep -Fq "$want"; then echo "【红】GPU_DIAG 负控未在目标断言红 rc=$rc validation=$bad" >&2; exit 1; fi
