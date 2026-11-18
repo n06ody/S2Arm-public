@@ -606,7 +606,18 @@ void rp_pass_flush(nvn_gpu_cmd c) {
     else park_drop_all();        // 没有段：清除无处落，丢弃（提交已按失败处理）
 }
 
+// 着色器变体请求使用目标槽数与每槽有效颜色格式（见 rp_draw）；在取程序之前判断，不能等开通道再置脏。
+static int rt_shader_same(const p_set_rt *a, const p_set_rt *b) {
+    if (a->n != b->n) return 0;
+    for (int i = 0; i < a->n && i < 8; i++) {
+        uint32_t af = a->color[i] ? (uint32_t)(a->has_cview[i] && a->cview[i].set_format ? a->cview[i].format : a->color[i]->d.format) : 0;
+        uint32_t bf = b->color[i] ? (uint32_t)(b->has_cview[i] && b->cview[i].set_format ? b->cview[i].format : b->color[i]->d.format) : 0;
+        if (af != bf) return 0;
+    }
+    return 1;
+}
 void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
+    if (!P.has_rt || !rt_shader_same(&P.rt, r)) rp_pso_dirty = 1;
     // 同目标续接（对齐 nvn_mtl.m:15060 的 g_enc && g_enc_mode != 1 && !pend && R.has_rt && rt_same → 只换逻辑目标）：
     // 通道开着、没有待折清除、这组目标与当前的一致 → 只更新目标快照，不结束 / 不重开通道。游戏常在一帧里反复重设同一组目标
     //（iOS 注释里那款每帧 180–285 次遮挡查询各重设一次），每次重开通道都要把整张附件重新载入一遍。
