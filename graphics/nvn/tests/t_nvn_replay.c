@@ -3431,6 +3431,25 @@ static void t_compute_image_class(void) {
     v = img_class_view(4, 1, 33, t2d, &ok); CHECK(ok && v && v->has_v && v->v.set_format && v->v.format == NVN_FORMAT_R32UI);  // ④
     v = img_class_view(3, 0, 6, t2d, &ok); CHECK(ok && v && !(v->has_v && v->v.set_format));                                  // ⑤
     v = img_class_view(3, 1, 0, 0, &ok); CHECK(ok && v && !(v->has_v && v->v.set_format));                                    // ⑥
+    // 计算图像是立方体存储，着色器按二维数组访问：六个面与格式重解释必须落在同一视图。
+    tex_t cube = mk_tex(673, 0x8000, NVN_FORMAT_RG32F, 4, 4, 1, NVN_TEXTURE_FLAGS_IMAGE);
+    cube.d.target = NVN_TEXTURE_TARGET_CUBEMAP; cube.d.depth = 6; nvn_tex_layout(&cube.d, &cube.L);
+    nvn_be_reg_tex(5, &cube, NULL);
+    const uint8_t tarr = NVN_TEXTURE_TARGET_2D_ARRAY + 1;
+    v = img_class_view(5, 0, 0, tarr, &ok);
+    CHECK(ok && v && v->has_v && v->v.set_target && v->v.target == NVN_TEXTURE_TARGET_2D_ARRAY && v->v.set_layers && v->v.nlayers == 6);
+    v = img_class_view(5, 1, 0, tarr, &ok);
+    CHECK(ok && v && v->has_v && v->v.set_target && v->v.target == NVN_TEXTURE_TARGET_2D_ARRAY && v->v.set_layers && v->v.nlayers == 6 && v->v.set_format && v->v.format == NVN_FORMAT_RG32UI);
+    tex_t cubes = cube; cubes.serial = 674; cubes.d.target = NVN_TEXTURE_TARGET_CUBEMAP_ARRAY; cubes.d.depth = 12; nvn_tex_layout(&cubes.d, &cubes.L);
+    view_t sub = {0}; sub.set_layers = 1; sub.min_layer = 6; sub.nlayers = 6; sub.set_levels = 1; sub.base_level = 0; sub.nlevels = 1;
+    nvn_be_reg_tex(6, &cubes, &sub);
+    v = img_class_view(6, 1, 0, tarr, &ok);
+    CHECK(ok && v && v->v.target == NVN_TEXTURE_TARGET_2D_ARRAY && v->v.min_layer == 6 && v->v.nlayers == 6 && v->v.set_levels && v->v.nlevels == 1 && v->v.format == NVN_FORMAT_RG32UI);
+    tex_t volume = cube; volume.serial = 675; volume.d.target = NVN_TEXTURE_TARGET_3D; volume.d.depth = 4; nvn_tex_layout(&volume.d, &volume.L);
+    nvn_be_reg_tex(7, &volume, NULL);
+    uint64_t bad_type = nvn_unimpl_count("draw", "compute_image_decl_type_mismatch");
+    v = img_class_view(7, 0, 0, tarr, &ok);
+    CHECK(!ok && !v && nvn_unimpl_count("draw", "compute_image_decl_type_mismatch") == bad_type + 1);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     memset(g_caps_stor, 0, sizeof g_caps_stor); rp_S.img[5][2] = 0; pass_fresh();
 }

@@ -4,6 +4,7 @@
 #pragma once
 #include "nvn_obj.h"
 #include "nvn_backend.h"
+#include <string.h>
 
 // 贴图对象 → 后端贴图。首次使用时建；内容来自游戏内存的，在 c 这一段里上传 / 脏了重传。NULL = 取不到（已经 nvn_unimpl 记账）。线程：[提交]。
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
@@ -12,6 +13,34 @@ nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t_out);
 // 按着色器声明取兼容视图；dtt = NVN 目标 + 1，0 沿用原样。elem 表示句柄数组元素。
 // 返回视图由核心持有；调用方在 pin 窗口内取用并交给后端。线程：[提交]。
 nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, const tex_t **t_out);
+// 按声明规划同一存储的视图目标；0 原样、1 已改记录、-1 无法桥接。不会创建零贴图。
+static inline int rp_decl_view_target(const tex_t *t, view_t *v, int has_v, uint8_t dtt) {
+    if (!dtt) return 0;
+    int want = dtt - 1, have = has_v && v->set_target ? v->target : t->d.target;
+    if (want == have) return 0;
+    uint32_t layers = t->d.target == NVN_TEXTURE_TARGET_CUBEMAP ? 6 :
+        t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY || t->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY ? t->d.depth : 1;
+    if (has_v && v->set_layers) layers = v->nlayers ? v->nlayers : (layers > v->min_layer ? layers - v->min_layer : 1);
+    uint32_t n = 0;
+    int layered = have == NVN_TEXTURE_TARGET_2D || have == NVN_TEXTURE_TARGET_2D_ARRAY ||
+        have == NVN_TEXTURE_TARGET_CUBEMAP || have == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    if (layered) {
+        if (want == NVN_TEXTURE_TARGET_2D) n = 1;
+        else if (want == NVN_TEXTURE_TARGET_2D_ARRAY) n = layers;
+        else if (want == NVN_TEXTURE_TARGET_CUBEMAP && layers >= 6) n = 6;
+        else if (want == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && layers >= 6) n = layers / 6 * 6;
+    }
+    if ((want == NVN_TEXTURE_TARGET_2D_MULTISAMPLE && have == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY) ||
+        (want == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY && have == NVN_TEXTURE_TARGET_2D_MULTISAMPLE)) n = 1;
+    if (!n || n > UINT16_MAX) return -1;
+    int cube = want == NVN_TEXTURE_TARGET_CUBEMAP || want == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    int cube_compat_array = t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY && t->d.width == t->d.height && t->d.samples <= 1 && t->d.depth >= 6;
+    if (cube && t->d.target != NVN_TEXTURE_TARGET_CUBEMAP && t->d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && !cube_compat_array) return -1;
+    if (!has_v) memset(v, 0, sizeof *v);
+    v->set_target = 1; v->target = (uint8_t)want;
+    v->set_layers = 1; v->nlayers = (uint16_t)n;
+    return 1;
+}
 uint64_t rp_empty_slot_zero_count(void);   // 空贴图槽绑零贴图的次数（#1147；信息计数）
 // 贴图对象 + 视图记录（NULL = 默认视图）→ 视图：渲染目标、拷贝端点用。线程：[提交]。
 nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c);

@@ -1441,13 +1441,15 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
                 if (sw <= 5 && sw != (uint32_t)(2 + ch)) swizzled = 1;
             }
             if (levels != 1 || swizzled) { skip("compute_image_view_unsupported", rec); goto done; }
+            view_t fv; if (has_view) fv = view; else memset(&fv, 0, sizeof fv);
+            int target_change = rp_decl_view_target(&snap, &fv, has_view, pg->dtt[0][i]);
+            if (target_change < 0) { skip("compute_image_decl_type_mismatch", rec); goto done; }
             tv[i] = rp_view_by_id((int)(h & 0xFFFFF), c, &images[i]);
             if (!tv[i] || !images[i]) { skip("compute_image_unresolved", rec); goto done; }
-            if (vfmt != format) {   // 换成声明要的格式：同一份存储上的格式视图（贴图建时带 VIEW_FMT，见 rp_res.c usage_of）
-                view_t fv; if (has_view) fv = view; else memset(&fv, 0, sizeof fv);
-                fv.set_format = 1; fv.format = (uint16_t)vfmt;
+            if (target_change || vfmt != format) {   // 目标和格式在同一份存储视图上组合。
+                if (vfmt != format) { fv.set_format = 1; fv.format = (uint16_t)vfmt; }
                 tv[i] = rp_view_for(images[i], &fv, c);
-                if (!tv[i]) { skip("compute_image_format_view_failed", rec); goto done; }
+                if (!tv[i]) { skip("compute_image_decl_view_failed", rec); goto done; }
             }
             continue;
         }
