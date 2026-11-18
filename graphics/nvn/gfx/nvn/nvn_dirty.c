@@ -51,7 +51,8 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-// 脏页追加日志（#1501 A②，宿主侧开关 debug.s2a.nvk_buf_dirtylog，缺省关；须在任何池登记前 nvn_dirty_log_configure）：
+// 脏页追加日志（#1501 A②）：本模块里不配置就不记（g_log_enabled 初值 0），须在任何池登记前 nvn_dirty_log_configure。
+// 安卓 nvk_session 按开关 debug.s2a.nvk_buf_dirtylog 配置，缺省开、设 0 关；苹果侧不调 configure，日志不启用。
 // 一页从只读变可写（缺页 / 宿主写前解除）就追加一条 [a, b)（宿主页对齐的地址），在 mprotect 之前发布——写入必然晚于这条事件。
 // 两次加保护之间一页最多产生一次事件，所以「镜像上次同步后被写过的页」= 它的游标之后的事件，消费方按事件数付钱，不按范围页数。
 // 缺页路径里只有原子操作：条目预分配（总量有上限 g_log_bytes），写者 fetch_add 取槽、先清 seq 再写区间、最后发布 seq = 下标 + 1。
