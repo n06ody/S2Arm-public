@@ -26,6 +26,8 @@ void rp_buf_blocks_report(const uint64_t pf[RP_PERF_N]) {
 }
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：s2a_direct_diag_frame
+__attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
 
 enum { PT_RING = 256 };
@@ -206,6 +208,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
       clock_gettime(CLOCK_MONOTONIC, &p1); rp_perf_add(RP_PERF_PRESENT_NS, (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;

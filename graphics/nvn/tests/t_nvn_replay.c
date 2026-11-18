@@ -38,6 +38,8 @@ static int g_flag_buf_blocks;      // 分块验证只在明确开启时尝试；
 static int g_flag_buf_dirtylog;    // 用例设：开关 nvk_buf_dirtylog（缺省同产品：关）
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
+static int g_diag_frames;
+void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_blocks")) return g_flag_buf_blocks;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog;
@@ -4186,15 +4188,17 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
 }
 
 static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口时取图、按比例贴合、呈现；交换链过期先重建
-    pass_fresh(); rp_present_reset(); memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = g_rebuilds = g_presents = 0;
+    pass_fresh(); rp_present_reset(); g_diag_frames = 0; memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = g_rebuilds = g_presents = 0;
     tex_t t = mk_tex(71, 0, NVN_FORMAT_RGBA8, 640, 360, 1, 0);
     CHECK(nvn_be_has_window() == 0 && nvn_be_display_hz() == 0);
     uint64_t k1 = nvn_be_present(&t, 0, NULL);
     CHECK(k1 == 1 && nvn_be_presented_time(1) == -1 && g_presents == 0 && nvn_unimpl_count("present", "no_window") == 1);
+    CHECK(g_diag_frames == 0);
     CHECK(nvn_be_presented_time(2) == 0);                           // 还没发出的票：没结果
     rp_present_set_surface(&g_fake_surf, 120);
     CHECK(nvn_be_has_window() == 1 && nvn_be_display_hz() == 120);
     CHECK(nvn_be_present(&t, 0, NULL) == 2 && g_presents == 1);
+    CHECK(g_diag_frames == 1);   // 真正成功送出后才留下逐帧诊断
     CHECK(g_last_pd.src != NULL && g_last_pd.crop[2] == 0 && g_last_pd.dst[0] == 0 && g_last_pd.dst[1] == 0 && g_last_pd.dst[2] == 1280 && g_last_pd.dst[3] == 720);   // 16:9 贴满 16:9
     CHECK(nvn_be_presented_time(2) == 5.0);                         // 后端没给上屏时刻：按交给呈现引擎的时刻记
     int crop[4] = {0, 0, 320, 300};                                 // 16:15 的裁剪放进 1280x720：高贴满，宽 768，左右各 256 黑边
@@ -4206,6 +4210,7 @@ static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口
     CHECK(nvn_be_present(&t, 0, NULL) == 5 && g_rebuilds == 1 && g_presents == 4 && nvn_be_presented_time(5) == 5.0);
     g_acq_i = 0; g_acq_script[0] = NVN_GPU_E_TIMEOUT;               // 没有空闲图：丢这一帧，不算故障
     CHECK(nvn_be_present(&t, 0, NULL) == 6 && g_presents == 4 && nvn_be_presented_time(6) == -1 && nvn_unimpl_count("present", "acquire_failed") == 0);
+    CHECK(g_diag_frames == 4);   // 包括重建后成功；取图超时不计
     uint64_t sh = 0, dp = 0; rp_present_stats(&sh, &dp); CHECK(sh == 4 && dp == 2);
     rp_present_set_surface(NULL, 0);
     CHECK(nvn_be_has_window() == 0);
