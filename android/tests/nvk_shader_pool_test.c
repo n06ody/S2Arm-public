@@ -328,6 +328,13 @@ static void gs_request_test(void) {
         CHECK(rp_shader_resolve(&q, &p) != 0 && !p, "missing, duplicate or extra result stage rejected");
         CHECK(nvn_unimpl_count("shader", mode == 2 ? "program_parse_failed" : "result_stage_mismatch") == 1,
               "rejected result stage reports the correct boundary");
+        if (mode == 2) {   // 解析失败逐条带程序键与原因：同一局第二次失败（计数已是 1）也要写出来
+            CHECK(strstr(last_red, "program_parse_failed") && strstr(last_red, "程序键 ") && !strstr(last_red, "程序键 未知") &&
+                  strstr(last_red, "duplicate result stage"), "parse failure red names the program key and reason: %s", last_red);
+            rp_shader_reset(); last_red[0] = 0; p = NULL;
+            CHECK(rp_shader_resolve(&q, &p) != 0 && nvn_unimpl_count("shader", "program_parse_failed") == 2 && strstr(last_red, "程序键 "),
+                  "second parse failure in the same run is logged again: %s", last_red);
+        }
     }
     fake_gs_result_mode = 0; rp_shader_reset();
     CHECK(!rp_shader_resolve(&q, &p), "cached GS program exists before source ambiguity");
