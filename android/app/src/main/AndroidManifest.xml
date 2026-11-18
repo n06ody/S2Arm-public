@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- 手机当掌机的震动（#528 第 10 项，PhoneFeedback.java）：普通权限，安装即授予 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 原地使用游戏文件（游戏库「原地使用游戏文件夹…」、deploy_game.py 的原地模式）：直接读共享存储上的资源目录，
          不再拷一份进私有目录。安卓 11+ 要「所有文件访问」；安卓 10 用旧的读存储权限 + requestLegacyExternalStorage。 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />

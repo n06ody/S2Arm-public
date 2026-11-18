@@ -212,6 +212,15 @@ final class NativeBridge {
     /** Debug: the render thread waits this long before its teardown (destroy). */
     static native void setStopStall(long host, int ms);
     static native void input(int buttons, int lx, int ly, int rx, int ry);
+    /**
+     * Phone six-axis / rumble settings (native/phone_feedback.c, PhoneFeedback): package for the sensor
+     * manager, the two in-game menu switches, whether the device has a vibrator, and whether a physical
+     * gamepad is attached (the phone motor stays quiet then, as on iOS). Main thread; repeatable.
+     */
+    static native void configurePhoneFeedback(String packageName, boolean gyro, boolean rumble, boolean hasVibrator,
+                                              boolean gamepad);
+    /** Display.getRotation() of the default display, for the phone six-axis axes. Any thread. */
+    static native void setDisplayRotation(int rotation);
     /** Maps each rewritten module in an installed game's modules/ (load check; nothing runs). Any thread. */
     /** Native -> Java: the guest's software keyboard request (blocked guest thread). */
     static String requestText(String title, String initial, int maxChars) {

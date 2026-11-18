@@ -22,7 +22,6 @@ runtime/src/mac_slot_hold.c	macOS 宿主自拿本机 Mac 局槽（开发机显�
 runtime/src/sesdiag.c	iOS 会话标记 + 有界日志摘要（Switch2线 84）：调用方只在 ios/app.m / diag.m；安卓诊断导出走自己的 runtime 私有目录与 BootContract，无「上次异常退出」弹窗。安卓 NDK 编译已过。清零条件：安卓加上次异常退出提示时接线并同笔删本行	Switch2线	2026-11-07
 runtime/src/logcap.c	日志落盘唯一出口 s2a_log_out（强定义）：安卓单库已链（Runtime.cmake core 名单），调用方是 native.h 里的 s2a_log_line / LOG 宏（每个 TU 内联），矩阵按平台源码找调用方的文本扫描看不到；不是缺口	Switch2线	2026-11-07
 runtime/src/nvos_trace.c	Mac 专用诊断（记 GPU 驱动栈的 NvOs 分配，取重放表参照），iOS / 安卓编成空函数	dev-cheats	2026-11-13
-runtime/src/motion_pick.c	安卓侧缺口（不是不适用）：玩家 1 六轴来源仲裁（手机 / 系统手柄 / NS2 Pro），安卓还没有六轴输入通路、暂无调用方；待安卓线补六轴时接上本模块并删掉这一行	maintainer	2026-11-14
 runtime/src/game_volume.c	游戏音量（#1186）：只接苹果音频输出层（compat/tree Ryujinx.Audio.Backends.Apple ApplyVolume 取值、iOS 齿轮菜单调 S2A_AudioSetVolume）；安卓音频走自己的输出、界面没有这项，不适用	dev-yi	2026-11-15
 graphics/tools/astc/bc2astc.c	出包机宿主工具（pack/astc_pack.py 编成动态库，BC 贴图预转 ASTC 给 Apple TV），不进任何 App / 平台运行时	D2R线	2026-11-16
 runtime/src/waived.c	校验没过照常继续的原生记账（FATAL / 崩溃补报一行）：唯一写入方 launchctx.c 只在苹果 iOS（见上 launchctx.c 例外），native.h / crash.c 按 dlsym 可选取用、取不到就跳过；安卓侧同一需求由 C# Red.Waive 承担	开发乙线	2026-11-17

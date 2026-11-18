@@ -37,6 +37,10 @@
     <!-- 主界面与运行模式 -->
     <string name="console_mode_handheld">运行模式：掌机（点按切到主机）</string>
     <string name="console_mode_docked">运行模式：主机（点按切到掌机）</string>
+    <string name="phone_gyro_on">手机陀螺仪：开（点按关闭）</string>
+    <string name="phone_gyro_off">手机陀螺仪：关（点按打开）</string>
+    <string name="phone_rumble_on">手机震动：开（点按关闭）</string>
+    <string name="phone_rumble_off">手机震动：关（点按打开）</string>
     <string name="console_mode_switched">运行模式已切换。</string>
     <string name="console_mode_saved">运行模式已保存，下次启动游戏时生效。</string>
 

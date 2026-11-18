@@ -42,6 +42,10 @@
     <string name="last_session_dismiss">Not now</string>
     <string name="console_mode_handheld">Console mode: handheld (tap for docked)</string>
     <string name="console_mode_docked">Console mode: docked (tap for handheld)</string>
+    <string name="phone_gyro_on">Phone gyro: on (tap to turn off)</string>
+    <string name="phone_gyro_off">Phone gyro: off (tap to turn on)</string>
+    <string name="phone_rumble_on">Phone rumble: on (tap to turn off)</string>
+    <string name="phone_rumble_off">Phone rumble: off (tap to turn on)</string>
     <string name="console_mode_switched">Console mode switched.</string>
     <string name="console_mode_saved">Console mode saved. It applies the next time the game starts.</string>
 

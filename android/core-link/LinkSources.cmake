@@ -14,6 +14,8 @@ function(s2a_android_host_sources output)
     set(sources
         native/s2a_savecommit.c native/system_tuning.c native/capacity_affinity.cpp native/adpf_hint.c native/cpu_floor.c
         native/bridge.cpp native/lan_discovery.cpp ../runtime/src/lan_elect.c native/capture_jpeg.cpp native/touch_jni.cpp native/game_touch.c native/window.cpp native/presenter.cpp
+        # 手机当掌机的六轴 / 震动（#528 第 10 项）：坐标换算、震动信箱、六轴来源仲裁用共用的 runtime/src 实现
+        native/phone_feedback.c ../runtime/src/phone_axes.c ../runtime/src/phone_rumble_mailbox.c ../runtime/src/motion_pick.c
         native/wsi_lease.c native/input.c native/tsd.c native/module.c native/selftest.c native/selftest_gate.S
         native/guest_signal.c native/redlog.c native/redzone.S native/pcm_ring.c native/aaudio_sink.c native/hostapi.c native/screen_metrics.c
         # #48 P8：dm_thermal_now / dm_low_power_now 的安卓强定义（盖过 fps.c / hle_nvn.c 的弱缺省）

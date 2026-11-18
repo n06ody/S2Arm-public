@@ -39,6 +39,8 @@ namespace S2A.Android.Aot
         [DllImport("s2a_native")] private static extern ulong s2a_android_nvn_present_count();
         // t-direct-frametimes：逐帧帧时间局末转储（generic 经此触发；direct 已由 adapter shutdown 转过，空记录无输出）。
         [DllImport("s2a_native")] private static extern void s2a_frame_log_dump();
+        // 手机六轴 / 震动（#528 第 10 项，android/native/phone_feedback.c）：宿主函数地址登记给服务层（主程序句柄查不到本库导出）
+        [DllImport("s2a_native")] private static extern void s2a_android_pad_feedback(InputPump.HostFeedback* hooks);
 
         [UnmanagedCallersOnly]
         [DynamicDependency("get_SurfaceFlinger", typeof(Ryujinx.HLE.HOS.Horizon))]
@@ -349,6 +351,9 @@ namespace S2A.Android.Aot
                 Exports.AudioFactory = &CreateAudio;
                 Console.Error.WriteLine("[s2a] 音频驱动登记：AAudio");
                 InputPump.InputHook = &ReadInput;
+                InputPump.HostFeedback feedback;
+                s2a_android_pad_feedback(&feedback);
+                InputPump.Feedback = feedback;
                 S2A.Android.Video.AndroidVideo.Register();   // 平台 adapter P1（#1069）：Nvdec 只走 S2AVideoDecoders 登记的工厂
 
                 stage = ServiceError.Initialize;

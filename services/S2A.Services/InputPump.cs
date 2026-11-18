@@ -15,6 +15,15 @@ namespace S2A.Services
     {
         // 苹果侧手柄 / 触屏输入源（苹果侧接）：填按键位（HidNpadButton 位序）与左右摇杆
         public static delegate*<ref GamepadInput, void> InputHook;
+        // 平台登记的手柄反馈入口（震动 / 六轴，runtime/include/s2a_pad.h 同名函数的地址，ControllerFeedback 用）：
+        //   安卓宿主库以 RTLD_LOCAL 载入，主程序句柄查不到它的导出（docs/架构_多终端.md：按名查导出的几处接核心时改成函数指针），
+        //   由平台装配在起服务前登记（android/core-runtime/AndroidGameRuntime.cs）；没登记的（iOS / Mac）全为 0，照旧按名查主程序导出
+        [StructLayout(LayoutKind.Sequential)]
+        public struct HostFeedback
+        {
+            public nint RumbleSession, SetRumblePair, StopRumble, SetMotionEnabled, ReadMotion;
+        }
+        public static HostFeedback Feedback;
         // Optional platform touch consumer, on this same HID owner thread.
         // Absent on Apple and other hosts; no second sampler or HID writer.
         public static Action<Switch> TouchHook;
@@ -349,7 +358,9 @@ namespace S2A.Services
             }
 
             // 主 App 的纯 C 查询不加载可选 BLE 模块；只有真实 READY 会话才创建反馈对象。
-            if (NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "s2a_pad_rumble_session", out nint session))
+            if (Feedback.RumbleSession != 0)
+                _rumbleSession = (delegate* unmanaged<ulong>)Feedback.RumbleSession;   // 平台登记（安卓）
+            else if (NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "s2a_pad_rumble_session", out nint session))
                 _rumbleSession = (delegate* unmanaged<ulong>)session;
             // Mac 宿主只导出六轴、没有震动会话：反馈对象照建，只走六轴
             else _motionOnly = ControllerFeedback.MotionExport(out _);

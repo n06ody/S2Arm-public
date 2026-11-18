@@ -64,8 +64,12 @@ namespace S2A.Services
         private bool _rumblePermitted;
         private volatile bool _stopped;
 
-        public static bool MotionExport(out nint motion) =>
-            NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "s2a_pad_read_motion", out motion);
+        // 平台登记过（InputPump.Feedback，安卓）就用登记的地址，不再按名查主程序导出
+        public static bool MotionExport(out nint motion)
+        {
+            motion = InputPump.Feedback.ReadMotion;
+            return motion != 0 || NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "s2a_pad_read_motion", out motion);
+        }
 
         public ControllerFeedback(Switch device, PlayerIndex player)
         {
@@ -73,11 +77,13 @@ namespace S2A.Services
             _rumblePlayer = _motionPlayer = player;
             _rumblePermitted = _npads.VibrationPermitted;
             nint program = NativeLibrary.GetMainProgramHandle();
-            if (NativeLibrary.TryGetExport(program, "s2a_pad_rumble_session", out nint rumbleSession))
+            InputPump.HostFeedback hooks = InputPump.Feedback;   // 平台登记的入口（安卓）；没登记的是 0，照旧按名查
+            nint rumbleSession = hooks.RumbleSession;
+            if (rumbleSession != 0 || NativeLibrary.TryGetExport(program, "s2a_pad_rumble_session", out rumbleSession))
             {
                 // A feedback-capable host must export the atomic pair ABI; never silently split a game frame.
-                _setRumblePair = (delegate* unmanaged<ulong, VibrationValue*, void>)NativeLibrary.GetExport(program, "s2a_pad_set_rumble_pair");
-                _stopRumble = (delegate* unmanaged<ulong, void>)NativeLibrary.GetExport(program, "s2a_pad_stop_rumble");
+                _setRumblePair = (delegate* unmanaged<ulong, VibrationValue*, void>)(hooks.SetRumblePair != 0 ? hooks.SetRumblePair : NativeLibrary.GetExport(program, "s2a_pad_set_rumble_pair"));
+                _stopRumble = (delegate* unmanaged<ulong, void>)(hooks.StopRumble != 0 ? hooks.StopRumble : NativeLibrary.GetExport(program, "s2a_pad_stop_rumble"));
                 _rumbleSession = (delegate* unmanaged<ulong>)rumbleSession;
                 if (NativeLibrary.TryGetExport(program, "s2a_pad_set_rumble_slot", out nint rumbleSlot))   // 平台例外：Mac / iOS 宿主（macos/front_mac.m、ios/slot_feedback.m）的可选导出
                     _setRumbleSlot = (delegate* unmanaged<int, VibrationValue*, void>)rumbleSlot;
@@ -94,7 +100,7 @@ namespace S2A.Services
             if (MotionExport(out nint motion))
             {
                 _readMotion = (delegate* unmanaged<MotionSample*, int>)motion;
-                _setMotionEnabled = (delegate* unmanaged<int, void>)NativeLibrary.GetExport(program, "s2a_pad_set_motion_enabled");
+                _setMotionEnabled = (delegate* unmanaged<int, void>)(hooks.SetMotionEnabled != 0 ? hooks.SetMotionEnabled : NativeLibrary.GetExport(program, "s2a_pad_set_motion_enabled"));
                 if (NativeLibrary.TryGetExport(program, "s2a_pad_read_motion_slot", out nint slotMotion))   // 平台例外：Mac / iOS 宿主（macos/front_mac.m、ios/slot_feedback.m）的可选导出
                     _readMotionSlot = (delegate* unmanaged<int, MotionSample*, int>)slotMotion;
                 if (NativeLibrary.TryGetExport(program, "s2a_pad_read_motion_pair", out nint pair))   // 平台例外：Mac 宿主（macos/front_mac.m，Joy-Con HID 左右两路体感）专有的可选导出，同 s2a_pad_read_motion；iOS / 安卓宿主没有

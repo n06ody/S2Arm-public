@@ -43,6 +43,7 @@ Java_org_s2arm_android_NativeBridge_configureDebugEnvironment(JNIEnv *env, jclas
 #include "guest_signal.h"
 #include "host_android.h"
 #include "input.h"
+#include "phone_feedback.h"
 #include "memory.h"
 #include "module.h"
 #include "selftest.h"
@@ -1343,6 +1344,7 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
     s2a_capacity_foreground(foreground != JNI_FALSE);
     s2a_adpf_set_foreground(foreground != JNI_FALSE);
     s2a_cpu_floor_set_foreground(foreground != JNI_FALSE);
+    s2a_android_phone_feedback_foreground(foreground != JNI_FALSE);   // 退后台关手机传感器、停马达
     // 退后台停显示节拍源（直连 vsync 拍；前台回时由 acquire 路径按需懒重启）
     if (!foreground && s2a_android_link_stop) s2a_android_link_stop();
     host->window.set_foreground(foreground);
