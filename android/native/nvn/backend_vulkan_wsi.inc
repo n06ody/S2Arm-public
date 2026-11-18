@@ -416,6 +416,14 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         char b[400]; snprintf(b, sizeof b, "对象读数（每帧，近 300 帧）：新建渲染通道 %.1f、帧缓冲 %.1f、命令池 %.1f、描述符池 %.1f；分配描述符集 %.1f 次、写描述符 %.1f 次；遮挡查询 %.1f 个；新建视图 %.1f 个；取窗口图 %.1f 毫秒",
             v[OC_RP] / 300.0, v[OC_FB] / 300.0, v[OC_CPOOL] / 300.0, v[OC_DPOOL] / 300.0, v[OC_DALLOC] / 300.0, v[OC_DWRITE] / 300.0, v[OC_QUERY] / 300.0, v[OC_VIEW] / 300.0, (double)__atomic_exchange_n(&g_acq_ns, 0, __ATOMIC_RELAXED) / 300.0 / 1e6);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+        { static uint64_t last_feedback[3];
+          uint64_t ro = diag_delta(&g_feedback_stats[0], &last_feedback[0]);
+          uint64_t cp = diag_delta(&g_feedback_stats[1], &last_feedback[1]);
+          uint64_t split = diag_delta(&g_feedback_stats[2], &last_feedback[2]);
+          snprintf(b, sizeof b, "只读反馈（每帧，近 300 帧，录制计数）：只读采样 %.2f 笔、快照拷贝 %.2f 次、重开 %.2f 次；nvk_fb_read=%d none_ext=%d",
+              ro / 300.0, cp / 300.0, split / 300.0, nvn_plat_flag("nvk_fb_read", 0), g.dev->load_store_op_none_enabled);
+          nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+        }
         // 留存读数（#1118）：视图表按存储认视图后，存储在共用表里留着时名下的视图与帧缓冲也留着；看它们在一局里是否有界（取这一刻的现存数，不是窗口平均）
         snprintf(b, sizeof b, "留存读数（取这一刻）：现存后端视图 %llu 个、帧缓冲缓存 %llu / %u 项", (unsigned long long)nvn_vk_dbg_view_stat(0), (unsigned long long)nvn_vk_dbg_view_stat(2), (unsigned)PC_FB_N);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
