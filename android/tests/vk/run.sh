@@ -313,7 +313,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--cmdpool-only|--cmdpool-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -420,12 +420,27 @@ pathlib.Path(target).write_text(s.replace(a, b))
 PYMUT
         src[1]="$out/backend_mutant.c" ;;
 esac
+# 负控只改源码副本：撤销前置缓冲复用，池会再次累积分配。
+if [ "$mode" = "--cmdpool-neg" ]; then
+    python3 - "${src[1]}" "$out/cmdpool_mutant.c" <<'PYNEG'
+import pathlib, sys
+s = pathlib.Path(sys.argv[1]).read_text()
+a = 'if (!c->init_cb && vkAllocateCommandBuffers(g.d, &ai, &c->init_cb) != VK_SUCCESS)'
+b = 'if (vkAllocateCommandBuffers(g.d, &ai, &c->init_cb) != VK_SUCCESS)'
+if s.count(a) != 1: raise SystemExit('C1581 negative control anchor changed')
+pathlib.Path(sys.argv[2]).write_text(s.replace(a, b))
+PYNEG
+    src[1]="$out/cmdpool_mutant.c"
+fi
 # 管线缓存四个入口的 --wrap 只给默认档：--gs-core 档的测试源（t_replay_gs.c）没有对应的 __wrap 定义，带上会链接失败。
 pc_wrap=(-Wl,--wrap=vkCreatePipelineCache -Wl,--wrap=vkGetPipelineCacheData
          -Wl,--wrap=vkCreateGraphicsPipelines -Wl,--wrap=vkCreateComputePipelines)
 # --gs-core / --separate-* 档的测试源没有这四个 __wrap 定义（只有默认档的 t_backend_vk.c 有），带上会链接失败
 case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) pc_wrap=() ;; esac
 if [ "$mode" = "--shown-only" ]; then pc_wrap+=(-Wl,--wrap=vkGetDeviceProcAddr); fi
+case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) ;;
+    *) cflags+=(-DS2A_CMDPOOL_TEST=1); pc_wrap+=(-Wl,--wrap=vkBeginCommandBuffer -Wl,--wrap=vkAllocateCommandBuffers -Wl,--wrap=vkFreeCommandBuffers -Wl,--wrap=vkDestroyCommandPool -Wl,--wrap=vkResetCommandPool) ;;
+esac
 cc "${cflags[@]}" "${inc[@]}" "${src[@]}" -Wl,--wrap=vkAllocateDescriptorSets -Wl,--wrap=vkGetPhysicalDeviceFormatProperties \
     ${pc_wrap[@]+"${pc_wrap[@]}"} -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/t_backend_vk"
 
@@ -438,6 +453,28 @@ if [ "$mode" != "--tsan" ]; then
     export VK_LAYER_PATH=$layer
     export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     export VK_LAYER_VALIDATE_SYNC=1   # 同步校验：缺屏障会报 SYNC-HAZARD-*
+
+if [ "$mode" = "--cmdpool-only" ] || [ "$mode" = "--cmdpool-neg" ]; then
+    bad=0
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --cmdpool-only 2>&1 | tee "$out/cmdpool-$dq.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if ! grep -q '^device: llvmpipe' "$out/cmdpool-$dq.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/cmdpool-$dq.log"; then
+            echo "【红】C1581 DQ=$dq 非 lavapipe 或校验错误" >&2; bad=1
+        elif [ "$mode" = "--cmdpool-neg" ]; then
+            if [ "$rc" -ne 1 ] || ! grep -q 'FAIL .*C1581 池内最高命令缓冲数期望 2' "$out/cmdpool-$dq.log"; then
+                echo "【红】C1581 负控 DQ=$dq 没有在预期断言处失败 rc=$rc" >&2; bad=1
+            fi
+        elif [ "$rc" -ne 0 ] || ! grep -q 'C1581 isolated failures=0' "$out/cmdpool-$dq.log"; then
+            echo "【红】C1581 DQ=$dq rc=$rc" >&2; bad=1
+        fi
+    done
+    [ "$bad" -eq 0 ] || exit 1
+    echo "【绿】C1581 $mode DQ 开/关，validation 0 条"; exit 0
+fi
 
 # 上屏 EASU 开/关夹具（--present-upscale）：独立进程跑一次，避开 surface 单例与 C71 的提交信号序列。
 if [ "$mode" = "--present-upscale" ]; then
