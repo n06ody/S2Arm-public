@@ -8,6 +8,7 @@
 #   bash android/tests/vk/run.sh --asan       # 追加 ASan/UBSan
 #   bash android/tests/vk/run.sh --fsr        # FSR1 EASU 专项（算法对照，不接上屏）
 #   bash android/tests/vk/run.sh --present-upscale  # 上屏 EASU 开/关夹具（独立进程）
+#   bash android/tests/vk/run.sh --clear-capacity  # 48/60 个清除管线键、段完成/放弃与后续绘制
 # 环境：
 #   S2A_LAVAPIPE_ICD   指定 lavapipe ICD json（默认找 ~/.local / /usr/share/vulkan/icd.d）
 #   S2A_VK_LAYER_DIR   指定 validation 层目录（默认找 ~/.local / /usr/share/vulkan/explicit_layer.d）
@@ -332,10 +333,28 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--clear-capacity|--clear-capacity-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
+if [ "$mode" = --clear-capacity-neg ]; then
+    python3 - "${src[1]}" "$out" <<'PYCLEAR'
+import pathlib, sys
+source, out = map(pathlib.Path, sys.argv[1:])
+inc = (source.parent / 'backend_vulkan_clear.inc').read_text()
+anchor = '    for (struct clr_pipe_temp *p = c->clear_pipes;'
+if inc.count(anchor) != 1:
+    raise SystemExit('clear capacity mutation anchor changed')
+mutant = out / 'clear-capacity-mutant.inc'
+mutant.write_text(inc.replace(anchor, '    if (g_clr.n == CLR_MAX) return VK_NULL_HANDLE;\n' + anchor))
+backend = source.read_text()
+anchor = '#include "backend_vulkan_clear.inc"'
+if backend.count(anchor) != 1:
+    raise SystemExit('clear include anchor changed')
+(out / 'clear-capacity-mutant.c').write_text(backend.replace(anchor, '#include "' + str(mutant) + '"'))
+PYCLEAR
+    src[1]="$out/clear-capacity-mutant.c"
+fi
 if [[ "$mode" == --msaa-neg-* ]]; then
     python3 - "$mode" "${src[1]}" "$out/msaa_mutant.c" <<'PYMSAA'
 import pathlib, sys
@@ -552,6 +571,32 @@ if [ -z "$mode" ]; then
     fi
 fi
 
+
+if [[ "$mode" == --clear-capacity* ]]; then
+    failed=0
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --clear-capacity 2>&1 | tee "$out/clear-capacity-dq${dq}.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        log="$out/clear-capacity-dq${dq}.log"
+        expected_rc=0; expected_failures=0
+        if [ "$mode" = --clear-capacity-neg ]; then expected_rc=1; expected_failures=4; fi
+        if [ "$rc" -ne "$expected_rc" ] || ! grep -q "C1501 clear capacity failures=${expected_failures}" "$log" ||
+           ! grep -q 'C1501 keys=48 failures=0' "$log" ||
+           ! grep -q "C1501 keys=60 failures=${expected_failures}" "$log" ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
+            echo "【红】清除缓存容量（DQ=${dq}）：rc=${rc}，未命中预期断言或 validation 失败" >&2
+            failed=1
+        fi
+        if [ "$mode" = --clear-capacity-neg ] && ! grep -q '建不出清除管线（槽 3 颜色掩码 0x4' "$log"; then
+            echo '【红】清除缓存负控没有红在第49个键' >&2; failed=1
+        fi
+    done
+    unset S2A_TEST_NVK_DQ
+    exit "$failed"
+fi
 
 if [ "$mode" = "--sampler-minmax-only" ]; then
     set +e
