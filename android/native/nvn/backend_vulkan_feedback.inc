@@ -17,8 +17,38 @@ static int feedback_attached(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v) 
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (feedback_overlap(v, d->color[i].view)) return 1;
     return feedback_overlap(v, d->depth.view) || feedback_overlap(v, d->stencil.view);
 }
-static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set) {
-    if (!feedback_attached(c, v)) return 1;
+// 采用实际建管线的写状态，不把「本笔没有产生像素」猜成只读。
+// 深度模板两面共享一个物理附件；任一面可能写，都不能用 NONE 豁免另一面。
+static uint16_t feedback_writes(struct nvn_gpu_cmd_s *c) {
+    const nvn_gpu_pipe_desc *p = &c->pipe->key;
+    uint16_t writes = 0;
+    for (uint32_t i = 0; i < 8; i++)
+        if (p->cfmt[i] && ((p->chmask.mask >> (4 * i)) & 15)) writes |= 1u << i;
+    if (p->dfmt && p->ds.dt && p->ds.dw) writes |= 1u << 8;
+    if (p->sfmt && p->ds.st) {
+        uint32_t front = c->has_dyn ? c->dyn.st_wmask[0] & 255 : 255;
+        uint32_t back = c->has_dyn ? c->dyn.st_wmask[1] & 255 : 255;
+        if ((front && (vk_stencil_op(p->ds.fail_f) != VK_STENCIL_OP_KEEP ||
+                       vk_stencil_op(p->ds.zfail_f) != VK_STENCIL_OP_KEEP ||
+                       vk_stencil_op(p->ds.zpass_f) != VK_STENCIL_OP_KEEP)) ||
+            (back && (vk_stencil_op(p->ds.fail_b) != VK_STENCIL_OP_KEEP ||
+                      vk_stencil_op(p->ds.zfail_b) != VK_STENCIL_OP_KEEP ||
+                      vk_stencil_op(p->ds.zpass_b) != VK_STENCIL_OP_KEEP))) writes |= 1u << 8;
+    }
+    return writes;
+}
+static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set,
+                        uint16_t writes, uint16_t *read_mask) {
+    uint16_t attached = 0;
+    const nvn_gpu_pass_desc *d = &c->pass_desc;
+    for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
+        if (feedback_overlap(v, d->color[i].view)) attached |= 1u << i;
+    if (feedback_overlap(v, d->depth.view) || feedback_overlap(v, d->stencil.view)) attached |= 1u << 8;
+    if (!attached) return 1;
+    if (c->feedback_read_on && !(attached & writes)) {
+        *read_mask |= attached;
+        return 1;
+    }
     c->desc_dirty |= 1u << set;
     for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (f->source == v) return 1;
@@ -66,6 +96,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
             copy.extent = (VkExtent3D){w ? w : 1, h ? h : 1, z ? z : 1};
             vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[1], 1, __ATOMIC_RELAXED);
         }
     }
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
@@ -73,11 +104,32 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     nvn_gpu_tex_release(t); // cmd 引用保活到 fence；raw view 在 finish_cmd 中先释放
     return rc_is(c->sticky, NVN_GPU_OK);
 }
+static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int copy) {
+    // 同一 occlusion query 不能跨 VkRenderPass；不截断查询后假报成功。
+    if (c->q_active >= 0) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback transition inside active occlusion query"); return 0; }
+    if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[2], 1, __ATOMIC_RELAXED);
+    nvn_gpu_pass_desc d = c->pass_desc;
+    for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) {
+        d.color[i].load = NVN_GPU_LOAD_LOAD;
+    }
+    if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
+    if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
+    nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始
+    if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
+        if (!feedback_make(c, f)) return 0;
+    c->feedback_read_mask = read_mask;
+    nvn_gpu_pass_begin(c, &d);
+    return rc_is(c->sticky, NVN_GPU_OK);
+}
 static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
     // 退出反馈或进入计算时，恢复原视图描述符。原绑定表永不被快照改写。
     if (c->feedback != c->feedback_stop) c->desc_dirty = 0xfu;
     c->feedback_stop = c->feedback;
-    if (compute || !c->feedback_on || !c->in_pass || !c->pipe->nset) return 1;
+    if (compute || !c->feedback_on || !c->in_pass) return 1;
+    uint16_t writes = feedback_writes(c);
+    // 每笔由实际采样集合重建：不再采样（包括没有描述符组）就退出 NONE。
+    // 不遗留旧槽位的只读状态，避免另一附件别名到同一范围并开始写时漏恢复。
+    uint16_t read_mask = 0;
     for (int st = 0; st < 5; st++) {
         for (uint32_t i = 0; i < c->nbinds[st]; i++) {
             const nvn_gpu_binding *b = &c->binds[st][i].b;
@@ -89,25 +141,16 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             if (b->cls == NVN_GPU_RES_IMAGE && feedback_attached(c, v)) {
                 set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback storage image writes cannot use a sampled snapshot"); return 0;
             }
-            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set)) return 0;
+            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, writes, &read_mask)) return 0;
         }
         if (c->pool_active) for (uint32_t i = 0; i < c->pipe->stage_nent[st] && i < 64; i++) {
             nvn_gpu_pool_table t = c->pool_binds[st][i];
             if (!t || t->kind != NVN_GPU_POOL_IMAGE) continue;
             for (uint32_t j = 0; j <= t->count; j++)
-                if (!feedback_add(c, t->objects[j], c->pipe->stage_ents[st][i].set)) return 0;
+                if (!feedback_add(c, t->objects[j], c->pipe->stage_ents[st][i].set, writes, &read_mask)) return 0;
         }
     }
-    if (c->feedback == c->feedback_stop) return 1;
-    // 同一 occlusion query 不能跨 VkRenderPass；不截断查询后假报成功。
-    if (c->q_active >= 0) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback snapshot inside active occlusion query"); return 0; }
-    nvn_gpu_pass_desc d = c->pass_desc;
-    for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) d.color[i].load = NVN_GPU_LOAD_LOAD;
-    if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
-    if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
-    nvn_gpu_pass_end(c); // CLEAR 已在旧通道落地；重开必须 LOAD
-    for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
-        if (!feedback_make(c, f)) return 0;
-    nvn_gpu_pass_begin(c, &d);
-    return rc_is(c->sticky, NVN_GPU_OK);
+    if (read_mask && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[0], 1, __ATOMIC_RELAXED);
+    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) return 1;
+    return feedback_restart(c, read_mask, 1);
 }
