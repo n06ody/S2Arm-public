@@ -345,7 +345,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--gpu-diag|--gpu-diag-neg-csdlink|--gpu-diag-neg-indargs|--gs-neg-cap) ;;|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--stencil8-only) ;;
+    ""|--gpu-diag|--gpu-diag-neg-csdlink|--gpu-diag-neg-indargs|--gpu-diag-neg-key|--gpu-diag-neg-window|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--stencil8-only) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 if [[ "$mode" == --gpu-diag-neg-* ]]; then
