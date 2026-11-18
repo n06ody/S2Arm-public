@@ -57,6 +57,11 @@ static int g_compute_warm = -1;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
+static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
+// 诊断采样窗：S2A_TEST_DIAG_DFLT 设了就全按后端缺省读；否则 nvk_diag_from_s 缺省读 0（其余诊断用例从第一段就要输出），
+// S2A_TEST_NVK_DIAG_<名> 指定值。开窗 / 关窗 / 配置三行存下来给用例核。
+static atomic_int g_ind_logs, g_ind_match, g_ind_cov, g_ind_next;
+static atomic_int g_dwin_pass_logs, g_dwin_csd_logs; static char g_dwin_cfg[256], g_dwin_open[256], g_dwin_close[256];
 static atomic_int g_c207_gputime, g_c207_cap;   // 别的线程（回放 / 完成 / 录制）也会调 nvn_plat_flag / nvn_plat_log：这两个用原子读写
 static char g_c207_win[12][512]; static int g_c207_nwin;   // 下面几个只由绘制 / 呈现所在的（测试）线程写
 static int g_c207_nlog, g_c207_badlog; static char g_c207_firstbad[512];
@@ -66,6 +71,15 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csd") || !strcmp(name, "nvk_pass_detail") || !strcmp(name, "nvk_ind_args")) return getenv("S2A_TEST_GPU_DIAG_ON") ? 1 : dflt;
+    if (!strncmp(name, "nvk_diag_", 9)) {
+        if (getenv("S2A_TEST_DIAG_DFLT")) return dflt;
+        char env[64]; snprintf(env, sizeof env, "S2A_TEST_NVK_DIAG_%s", name + 9);
+        for (char *q = env; *q; q++) if (*q >= 'a' && *q <= 'z') *q = (char)(*q - 'a' + 'A');
+        if (getenv(env)) return atoi(getenv(env));
+        return !strcmp(name, "nvk_diag_from_s") ? 0 : dflt;
+    }
+    if (!strcmp(name, "nvk_gputime") && getenv("S2A_TEST_GPU_DIAG_ON")) return 1;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
@@ -95,6 +109,28 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && !strncmp(text, "diag_window config", 18)) snprintf(g_dwin_cfg, sizeof g_dwin_cfg, "%s", text);
+    if (text && !strncmp(text, "diag_window open", 16)) snprintf(g_dwin_open, sizeof g_dwin_open, "%s", text);
+    if (text && !strncmp(text, "diag_window close", 17)) snprintf(g_dwin_close, sizeof g_dwin_close, "%s", text);
+    if (text && strstr(text, "gpu pass_detail fence=")) atomic_fetch_add(&g_dwin_pass_logs, 1);
+    if (text && !strncmp(text, "gpu ind_args fence=", 19)) {
+        atomic_fetch_add(&g_ind_logs, 1);
+        if (strstr(text, " pass=0 indexed=0 multi=0 count=1 instances=2 first=3 base_vertex=0 first_instance=4 vs_key=0000000000000011 fs_key=0000000000000022 ") && strstr(text, " after_csd_seq=102 ind_va=0xabc000 buf_off=0 guest_count=9 guest_instances=705")) atomic_fetch_add(&g_ind_match, 1);
+    }
+    if (text && !strncmp(text, "csf dispatch_next_ind seq=102 key=0000000000001234 ", 51) && strstr(text, " pass=0 count=1 instances=2 first_instance=4 draws_after=1 nonzero_after=1")) atomic_fetch_add(&g_ind_next, 1);
+    if (text && !strncmp(text, "gpu ind_args_cov fence=", 23) && strstr(text, "recorded=1 overflow=0 inpass=0 uncovered=1")) atomic_fetch_add(&g_ind_cov, 1);
+    if (text && strstr(text, "csf dispatch_time") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_dwin_csd_logs, 1);
+    if (text && strstr(text, "csf dispatch_time")) {
+        atomic_fetch_add(&g_diag_csd_logs, 1);
+        if (strstr(text, "seq=101") && strstr(text, "key=0000000000001234") && strstr(text, "groups=11,1,1") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_diag_csd_match, 1);
+        if (strstr(text,"seq=101") && strstr(text,"before_full=1") && strstr(text,"after_full=1") && strstr(text,"before_guest=0x8") && strstr(text,"after_guest=0x20")) atomic_fetch_add(&g_diag_barrier_match, 1);
+        if (strstr(text,"seq=102") && strstr(text,"groups_known=0") && strstr(text,"source=completed_query")) atomic_fetch_add(&g_diag_indirect_match, 1);
+        if (strstr(text,"seq=103") && strstr(text,"source=unavailable") && strstr(text,"reason=fence_failed_or_not_submitted")) atomic_fetch_add(&g_diag_failed_match, 1);
+    }
+    if (text && strstr(text, "gpu pass_detail")) {
+        atomic_fetch_add(&g_diag_pass_logs, 1);
+        if (strstr(text, "size=4x4") && strstr(text, "draws=0") && strstr(text, "load=1") && strstr(text, "store=0") && strstr(text, "format=")) atomic_fetch_add(&g_diag_pass_match, 1);
+    }
     if (text && strstr(text, "msaa_fallback:")) {
         if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
         if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
@@ -9941,6 +9977,107 @@ static void c1072_pipe_guard(const char *dir) {
     free(vsm); free(fsm); nvn_gpu_tex_release(tex);
 }
 
+// Real backend, real queue completion and a real render pass.  The weak hook lets
+// the pre-change binary run and fail at behavioral assertions, rather than link.
+static int gpu_diag_only(const char *dir) {
+    extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+    extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, const uint32_t *, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
+    const int on = getenv("S2A_TEST_GPU_DIAG_ON") != NULL;
+    memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gpu-diag-test";
+    if (!open_backend()) return 1;
+    nvn_gpu_layout_ent ent = {.cls=NVN_GPU_RES_SSBO,.access=NVN_GPU_ACC_W,.set=0,.binding=0,.count=1,.stages=1u<<NVN_GPU_SH_CS};
+    nvn_gpu_layout lay = {0}; lay.ent = &ent; lay.nent = 1; nvn_gpu_shader sh = NULL;
+    nvn_gpu_pipe cp = mk_cpipe(dir, "comp.comp", &lay, &sh);
+    uint32_t data[64] = {0}, args[3]={2,1,1}; nvn_gpu_buf buf = make_buf(sizeof data, NVN_GPU_MEM_SHARED, data);
+    nvn_gpu_buf indirect = make_buf(sizeof args, NVN_GPU_MEM_SHARED, args);
+    nvn_gpu_tex tex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex);
+    nvn_gpu_binding bind = {.ent=0,.cls=NVN_GPU_RES_SSBO}; bind.u.b.buf=buf; bind.u.b.len=sizeof data;
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_set_pipe(c, cp); nvn_gpu_bind(c, NVN_GPU_SH_CS, &bind, 1);
+    nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT);
+    if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c, 101, 0x1234);
+    nvn_gpu_dispatch(c, cp, 11, 1, 1, NULL, 0);
+    nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
+    if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,102,0x1234);
+    nvn_gpu_dispatch(c,cp,0,0,0,indirect,0);
+    // 间接参数读回：源是本段计算刚写的 buf（CPU 初值全 0，计算写成 1,2,3,…），读回 1/2/3/4 才说明是按命令顺序拷到的 GPU 值。
+    // 第二笔传空 = 没走拷贝点，只计数。pass 号是接下来那个空通道（0），与 pass_detail 对齐。
+    nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);
+    if (nvn_gpu_diag_ind_args) { { static const uint32_t g5[5] = {9, 705, 0, 0, 0}; nvn_gpu_diag_ind_args(c, buf, 0, 0xabc000, g5, 0, 0, 0x11, 0x22, 0x11); } nvn_gpu_diag_ind_args(c, NULL, 0, 0, NULL, 0, 0, 0, 0, 0); }
+    nvn_gpu_pass_desc pass = {0}; pass.w=pass.h=4; pass.layers=1; pass.ncolor=1;
+    pass.color[0].view=view; pass.color[0].load=NVN_GPU_LOAD_CLEAR; pass.color[0].store=NVN_GPU_STORE_STORE;
+    nvn_gpu_pass_begin(c, &pass); nvn_gpu_pass_end(c);
+    nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e)), "gpu diag commit: %s", e.why);
+    CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "gpu diag fence: %s", e.why);
+    CHECK(atomic_load(&g_diag_csd_logs)==2*on && atomic_load(&g_diag_csd_match)==on,
+          "gpu diag selected dispatch query with exact key and groups: on=%d logs=%d match=%d", on, atomic_load(&g_diag_csd_logs), atomic_load(&g_diag_csd_match));
+    CHECK(atomic_load(&g_diag_barrier_match)==on, "gpu diag dispatch neighboring full and guest barriers: on=%d matched=%d", on, atomic_load(&g_diag_barrier_match));
+    CHECK(atomic_load(&g_diag_indirect_match)==on, "gpu diag indirect groups unknown without CPU proof: on=%d matched=%d",on,atomic_load(&g_diag_indirect_match));
+    CHECK(atomic_load(&g_ind_next)==on, "gpu diag dispatch followed by first indirect args: on=%d matched=%d", on, atomic_load(&g_ind_next));
+    CHECK(atomic_load(&g_ind_logs)==on && atomic_load(&g_ind_match)==on && atomic_load(&g_ind_cov)==on,
+          "gpu diag indirect args readback from GPU-written buffer: on=%d logs=%d match=%d cov=%d", on, atomic_load(&g_ind_logs), atomic_load(&g_ind_match), atomic_load(&g_ind_cov));
+    CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,
+          "gpu diag empty pass attachment load/store detail: on=%d logs=%d match=%d", on, atomic_load(&g_diag_pass_logs), atomic_load(&g_diag_pass_match));
+    const uint32_t *result = (const uint32_t *)buf_cpu(buf); int bad=0;
+    for (int i=0; i<64; i++) if (!result || result[i] != (uint32_t)i+1) bad++;
+    CHECK(!bad, "gpu diag dispatch output: wrong=%d", bad);
+    if (on) {
+        int before=atomic_load(&g_ndone); c=begin_cmd(); nvn_gpu_set_pipe(c,cp); nvn_gpu_bind(c,NVN_GPU_SH_CS,&bind,1);
+        if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,103,0x1234);
+        nvn_gpu_dispatch(c,cp,1,1,1,NULL,0); nvn_gpu_vk_test_fail_fence(2);
+        CHECK(OK(nvn_gpu_cmd_commit(c,2,on_done,NULL,&e)),"gpu diag failed-fence submit");
+        CHECK(nvn_gpu_fence_wait(2,5000000000ull,&e).code==NVN_GPU_E_FAILED,"gpu diag failed fence");
+        const struct done_rec *done=wait_signal(2,before,5000);
+        CHECK(done && done->status==NVN_GPU_DONE_FAILED && atomic_load(&g_diag_failed_match)==1,"gpu diag failed query unavailable");
+        nvn_gpu_vk_test_fail_fence(0);
+    }
+    nvn_gpu_buf_release(indirect,NULL,NULL);
+    nvn_gpu_view_release(view); nvn_gpu_tex_release(tex); nvn_gpu_shader_release(sh); nvn_gpu_buf_release(buf,NULL,NULL);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "gpu diag close: %s", e.why);
+    printf("GPU_DIAG isolated on=%d failures=%d\n", on, g_fail);
+    return g_fail ? 1 : 0;
+}
+// 诊断采样窗：真后端、真队列完成。每段一个空通道 + 一次打了标的派发；看哪几段打出 pass_detail / csd 行。
+// win 档：from_s=1、every=2、max_segs=2。第 1 段在窗前；睡过 1 s 后 4 段里取第 1、3 段，取满 2 段关窗，第 4 段不取。
+// dflt 档：全按后端缺省（60 s 起），这一局 1 段都不取，配置行读回缺省值。
+static int gpu_diag_window(const char *dir, int dflt) {
+    extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+    memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gpu-diag-window-test";
+    if (!open_backend()) return 1;
+    nvn_gpu_layout_ent ent = {.cls=NVN_GPU_RES_SSBO,.access=NVN_GPU_ACC_W,.set=0,.binding=0,.count=1,.stages=1u<<NVN_GPU_SH_CS};
+    nvn_gpu_layout lay = {0}; lay.ent = &ent; lay.nent = 1; nvn_gpu_shader sh = NULL;
+    nvn_gpu_pipe cp = mk_cpipe(dir, "comp.comp", &lay, &sh);
+    uint32_t data[64] = {0}; nvn_gpu_buf buf = make_buf(sizeof data, NVN_GPU_MEM_SHARED, data);
+    nvn_gpu_tex tex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); nvn_gpu_view view = make_view(tex);
+    nvn_gpu_binding bind = {.ent=0,.cls=NVN_GPU_RES_SSBO}; bind.u.b.buf=buf; bind.u.b.len=sizeof data;
+    const int nseg = dflt ? 2 : 5; nvn_gpu_err e = {0};
+    for (int i = 0; i < nseg; i++) {
+        if (i == 1 && !dflt) { struct timespec ts = {1, 150000000}; nanosleep(&ts, NULL); }
+        nvn_gpu_cmd c = begin_cmd(); nvn_gpu_set_pipe(c, cp); nvn_gpu_bind(c, NVN_GPU_SH_CS, &bind, 1);
+        if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c, 200 + (uint64_t)i, 0x1234);
+        nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
+        nvn_gpu_pass_desc pass = {0}; pass.w=pass.h=4; pass.layers=1; pass.ncolor=1;
+        pass.color[0].view=view; pass.color[0].load=NVN_GPU_LOAD_CLEAR; pass.color[0].store=NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(c, &pass); nvn_gpu_pass_end(c);
+        CHECK(OK(nvn_gpu_cmd_commit(c, (uint64_t)i + 1, on_done, NULL, &e)), "diag window commit %d: %s", i, e.why);
+        CHECK(OK(nvn_gpu_fence_wait((uint64_t)i + 1, 5000000000ull, &e)), "diag window fence %d: %s", i, e.why);
+    }
+    nvn_gpu_view_release(view); nvn_gpu_tex_release(tex); nvn_gpu_shader_release(sh); nvn_gpu_buf_release(buf,NULL,NULL);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "diag window close: %s", e.why);
+    int pl = atomic_load(&g_dwin_pass_logs), cl = atomic_load(&g_dwin_csd_logs);
+    printf("DIAG_WINDOW cfg=[%s] open=[%s] close=[%s] pass_lines=%d csd_lines=%d\n", g_dwin_cfg, g_dwin_open, g_dwin_close, pl, cl);
+    if (dflt) {
+        CHECK(strstr(g_dwin_cfg, "from_s=60 for_s=30 every=1 max_segs=1000") != NULL, "gpu diag window default readback: [%s]", g_dwin_cfg);
+        CHECK(pl == 0 && cl == 0 && !g_dwin_open[0], "gpu diag window default outside window prints nothing: pass=%d csd=%d open=[%s]", pl, cl, g_dwin_open);
+    } else {
+        CHECK(strstr(g_dwin_cfg, "from_s=1 for_s=30 every=2 max_segs=2") != NULL, "gpu diag window config readback: [%s]", g_dwin_cfg);
+        CHECK(pl == 2 && cl == 2, "gpu diag window samples every 2nd in-window segment up to max: pass=%d csd=%d", pl, cl);
+        CHECK(strstr(g_dwin_open, "seg=2 ") && strstr(g_dwin_open, "segs_before=1 csd_skipped_before=1"), "gpu diag window open counts: [%s]", g_dwin_open);
+        CHECK(strstr(g_dwin_close, "reason=max_segs seg=4 ") && strstr(g_dwin_close, "sampled=2 in_window=3 csd_skipped=2"), "gpu diag window close counts: [%s]", g_dwin_close);
+    }
+    printf("GPU_DIAG window dflt=%d failures=%d\n", dflt, g_fail);
+    return g_fail ? 1 : 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -9955,6 +10092,8 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (argc > 2 && !strcmp(argv[2], "--gpu-diag-window")) { int r = gpu_diag_window(argv[1], getenv("S2A_TEST_DIAG_DFLT") != NULL); s2a_vk_device_destroy(&g_dev, 1); return r; }
+    if (argc > 2 && !strcmp(argv[2], "--gpu-diag")) { int r = gpu_diag_only(argv[1]); s2a_vk_device_destroy(&g_dev, 1); return r; }
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;
