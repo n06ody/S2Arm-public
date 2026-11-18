@@ -51,6 +51,8 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_g
 nvn_gpu_samp rp_samp_by_id(int id) { (void)id; return NULL; }
 // 这些隔离夹具只发 TBUF，不提供普通采样器；格式能力仍查真实后端。
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid) { (void)tid; return rp_samp_by_id(sid); }
+// 夹具不提供查询采样器；请求该能力时返回不可用。
+nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 uint32_t rp_fmt_caps(uint32_t f) { return nvn_gpu_format_caps(f); }
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     if (id != 7) return 0;

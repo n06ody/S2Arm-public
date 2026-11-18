@@ -86,6 +86,8 @@ nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)t;(
 uint32_t rp_storage_srgb_alias(uint32_t f){(void)f;return 0;}
 nvn_gpu_samp rp_samp_by_id(int i){return i==1?resource_sampler:NULL;}
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid){(void)tid;return rp_samp_by_id(sid);}
+// 夹具不提供查询采样器；请求该能力时返回不可用。
+nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 uint32_t rp_fmt_caps(uint32_t f){return nvn_gpu_format_caps(f);}
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){if(i<0||i>=4||!resources[i].valid)return 0;*t=resources[i].tex;*v=resources[i].desc;*h=resources[i].has_view;return 1;}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
