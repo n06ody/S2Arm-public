@@ -30,6 +30,7 @@ static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_
 static char g_ps_lines[8][320]; static int g_ps_n;   // 池统计行（cls "poolstats"）收下来给 t_pool_stats 核
 void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
+static int g_flag_csd, g_csd_selector; static int g_diag_tags; static uint64_t g_diag_key;
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
@@ -39,6 +40,8 @@ static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产�
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csd")) return g_flag_csd;
+    if (!strcmp(name, "nvk_csf_a")) return g_csd_selector;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
@@ -369,6 +372,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf
     (void)c; (void)src; CHECK(dst == &g_arena_buf && g_buf_cpu_fake && bytes == 12);
     if (dst == &g_arena_buf && g_buf_cpu_fake) memcpy(g_arena + doff, g_buf_cpu_fake + soff, (size_t)bytes);
 }
+void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) { (void)c; (void)seq; g_diag_tags++; g_diag_key=key; }
 void nvn_gpu_dispatch(nvn_gpu_cmd c, nvn_gpu_pipe cp, uint32_t x, uint32_t y, uint32_t z, nvn_gpu_buf ind, uint64_t ind_off) { (void)c; g_disp_ind = ind; g_disp_off = ind_off; g_ndisp++; g_disp[0] = x; g_disp[1] = y; g_disp[2] = z; g_disp_pipe = cp; }
 void nvn_gpu_set_dyn(nvn_gpu_cmd c, const nvn_gpu_dyn *d) { (void)c; g_set_dyns++; g_last_dyn = *d; }
 void nvn_gpu_set_vbuf(nvn_gpu_cmd c, uint32_t stream, nvn_gpu_buf b, uint64_t off) { (void)c; (void)b; if (g_nvb < 4) { g_vb[g_nvb].stream = stream; g_vb[g_nvb].off = off; } g_nvb++; }
@@ -3581,6 +3585,19 @@ static void t_compute_sources(void) {
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem);
 }
 
+// The A baseline has no spill metadata: test selection on an ordinary direct dispatch.
+static void t_diag_dispatch_selection(void) {
+    pass_fresh(); g_cresolve_rc=0; memset(&g_cprog,0,sizeof g_cprog); g_cprog.is_compute=1; g_cprog.sh[0]=&g_fsh[0];
+    nvn_be_sub_begin(); const uint8_t key[8]={0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0};
+    memcpy(rp_S.skey[5],key,sizeof key); rp_S.skey_ok|=1u<<5;
+    p_dispatch dp={.x=4,.y=2,.z=1}; g_diag_tags=0; g_csd_selector=0x12345678; g_flag_csd=0;
+    rp_dispatch(&g_fake_cmd,&dp,NULL); CHECK(g_diag_tags==0);
+    g_flag_csd=1; g_csd_selector=0x12345679; rp_dispatch(&g_fake_cmd,&dp,NULL); CHECK(g_diag_tags==0);
+    g_csd_selector=0x12345678; rp_dispatch(&g_fake_cmd,&dp,NULL); CHECK(g_diag_tags==1 && g_diag_key==0x123456789abcdef0ull);
+    rp_S.skey_ok &= ~(1u<<5); rp_dispatch(&g_fake_cmd,&dp,NULL); CHECK(g_diag_tags==1);
+    g_flag_csd=0; g_csd_selector=0; nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); pass_fresh();
+}
+
 // 同段GPU写参数：guest保持旧值，间接派发必须引用权威镜像，不读guest组数。
 static void t_dispatch_indirect_gpu(void) {
     pass_fresh(); g_arena_used = 0; g_cresolve_rc = 0;
@@ -4516,6 +4533,7 @@ int main(int argc, char **argv) {
     t_render_cond();
     t_dispatch();
     t_dispatch_barrier();
+    t_diag_dispatch_selection();
     t_dispatch_indirect_gpu();
     t_dispatch_ubop_rw();
     t_dispatch_ubop_ro_skip();
