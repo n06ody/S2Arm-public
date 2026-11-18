@@ -221,6 +221,7 @@ struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     VkCommandBuffer cb;
     struct bc_temp *bc_temps;
+    struct clr_pipe_temp *clear_pipes;   // 清除缓存满后的段自有管线，完成 / 放弃时回收
     int recording;
     int in_pass;
     // 上一道全屏障之后录过「缓冲作目标」的传输：传输只在开头带屏障，绘制有渲染通道开头的外部依赖兜着，
@@ -1517,6 +1518,8 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
     pthread_mutex_unlock(&g_mu);
 }
 
+static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
+
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
     // 布局按段跟踪（c->lay）：段不执行时命令缓冲里什么都没跑，没有要回滚的；t->layout 只做诊断。
@@ -1566,6 +1569,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         if (b->memory) vkFreeMemory(g.d, b->memory, NULL);
         free(b);
     }
+    clr_cmd_free(c);   // 先解除旧命令的管线依赖，再把命令池交给另一线程复用
     seg_give_cmd(c->pool, c->cb);
     free(c->refs);
     free(c->refseen);

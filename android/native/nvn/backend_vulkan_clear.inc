@@ -5,6 +5,7 @@
 // 而且在高通的私有驱动上它的执行次序会乱（安卓模拟器的 Vulkan 后端因此完全不用它，见 compat/tree/src/Ryujinx.Graphics.Vulkan/PipelineFull.cs
 // ClearRenderTargetColor 的注释）。这里不按厂商分支，所有设备走同一条路。
 // 由 backend_vulkan.c include（要用它的 g、make_pipeline_pass、set_sticky）。管线按「通道的附件格式 + 槽 + 数值类别 + 掩码」缓存，会话关闭时销毁。
+// 缓存满只影响复用：新键建段自有管线，随段完成 / 放弃回收，不能把合法清除变成整段失败。
 // 下面四个数组是 android/native/nvn/clear_shaders/ 里四个 GLSL 用 glslangValidator -V --target-env vulkan1.1 编出来的 SPIR-V；
 // 片元着色器的输出位置编的是 0，建模块时把那一个 Location 字改成目标颜色槽。
 static const uint32_t k_clr_vs[323] = {
@@ -106,6 +107,7 @@ static const uint32_t k_clr_fs_i[118] = {
 
 enum { CLR_MAX = 48 };
 struct clr_key { uint32_t cfmt[8], dsfmt, samples; int32_t slot; uint32_t kind, cmask, depth, stencil; };   // slot = -1：不清颜色；depth / stencil：这一笔清不清深度 / 模板
+struct clr_pipe_temp { struct clr_key k; VkPipeline pipe; VkRenderPass pass; struct clr_pipe_temp *next; };
 static struct {
     VkShaderModule vs, fs[3][8];
     VkPipelineLayout layout;
@@ -113,6 +115,16 @@ static struct {
     uint32_t n;
 } g_clr;
 static pthread_mutex_t g_clr_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// 与段的其它临时资源共用完成证明；不能驱逐或当场销毁仍被已录制 / 在途命令引用的管线。
+static void clr_cmd_free(struct nvn_gpu_cmd_s *c) {
+    while (c->clear_pipes) {
+        struct clr_pipe_temp *p = c->clear_pipes; c->clear_pipes = p->next;
+        vkDestroyPipeline(g.d, p->pipe, NULL);
+        vkDestroyRenderPass(g.d, p->pass, NULL);
+        free(p);
+    }
+}
 
 static void clr_close(void) {   // 会话关闭：设备还在
     pthread_mutex_lock(&g_clr_mu);
@@ -146,9 +158,9 @@ static VkShaderModule clr_module(const uint32_t *words, size_t n, int location) 
 }
 
 // 取（或建）一条清除管线。调用方持 g_clr_mu。失败返回空。
-static VkPipeline clr_pipe_get(const struct clr_key *k) {
+static VkPipeline clr_pipe_get(struct nvn_gpu_cmd_s *c, const struct clr_key *k) {
     for (uint32_t i = 0; i < g_clr.n; i++) if (!memcmp(&g_clr.p[i].k, k, sizeof *k)) return g_clr.p[i].pipe;
-    if (g_clr.n == CLR_MAX) return VK_NULL_HANDLE;
+    for (struct clr_pipe_temp *p = c->clear_pipes; p; p = p->next) if (!memcmp(&p->k, k, sizeof *k)) return p->pipe;
     if (!g_clr.vs && !(g_clr.vs = clr_module(k_clr_vs, sizeof k_clr_vs / 4, -1))) return VK_NULL_HANDLE;
     if (!g_clr.layout) {
         VkPushConstantRange pr[2] = {{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16}, {VK_SHADER_STAGE_VERTEX_BIT, 16, 4}};   // 颜色 16 字节给片元，深度 4 字节给顶点
@@ -214,7 +226,17 @@ static VkPipeline clr_pipe_get(const struct clr_key *k) {
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &pipe) != VK_SUCCESS) { vkDestroyRenderPass(g.d, pass, NULL); return VK_NULL_HANDLE; }
     plc_created();
-    g_clr.p[g_clr.n].k = *k; g_clr.p[g_clr.n].pipe = pipe; g_clr.p[g_clr.n].pass = pass; g_clr.n++;
+    if (g_clr.n < CLR_MAX) {
+        g_clr.p[g_clr.n].k = *k; g_clr.p[g_clr.n].pipe = pipe; g_clr.p[g_clr.n].pass = pass; g_clr.n++;
+    } else {
+        struct clr_pipe_temp *p = malloc(sizeof *p);
+        if (!p) {
+            vkDestroyPipeline(g.d, pipe, NULL); vkDestroyRenderPass(g.d, pass, NULL);
+            set_sticky(c, NVN_GPU_E_OOM, "清除临时管线记录分配失败");
+            return VK_NULL_HANDLE;
+        }
+        *p = (struct clr_pipe_temp){*k, pipe, pass, c->clear_pipes}; c->clear_pipes = p;
+    }
     return pipe;
 }
 
@@ -227,7 +249,7 @@ static void clr_draw(struct nvn_gpu_cmd_s *c, int slot, uint32_t cmask, const vo
     k.dsfmt = c->pass_dsfmt; k.samples = c->pass_samples; k.slot = slot; k.cmask = slot >= 0 ? cmask : 0; k.depth = do_depth != 0; k.stencil = smask != 0;
     if (slot >= 0) { nvn_fmt_info fi; k.kind = nvn_fmt_info_of(c->pass_cfmt[slot], &fi) ? (fi.kind == NVN_FMT_UINT ? 1u : fi.kind == NVN_FMT_SINT ? 2u : 0u) : 0u; }
     pthread_mutex_lock(&g_clr_mu);
-    VkPipeline pipe = clr_pipe_get(&k);
+    VkPipeline pipe = clr_pipe_get(c, &k);
     VkPipelineLayout layout = g_clr.layout;
     pthread_mutex_unlock(&g_clr_mu);
     if (!pipe) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "通道内清除：建不出清除管线（槽 %d 颜色掩码 %#x 深度 %d 模板掩码 %#x）", slot, cmask, do_depth, smask); return; }
