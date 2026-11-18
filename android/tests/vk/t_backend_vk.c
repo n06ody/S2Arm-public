@@ -127,13 +127,13 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
         if (strstr(text,"seq=102") && strstr(text,"groups_known=0") && strstr(text,"source=completed_query")) atomic_fetch_add(&g_diag_indirect_match, 1);
         if (strstr(text,"seq=103") && strstr(text,"source=unavailable") && strstr(text,"reason=fence_failed_or_not_submitted")) atomic_fetch_add(&g_diag_failed_match, 1);
     }
-    if (text && !strncmp(text, "gpu seg_gaps fence=", 19)) {   // 段内只有 1 个通道、它之前录了两次派发：派发那一栏 > 0，各栏 + 通道内 + 段尾 ≈ 跨度
-        unsigned long long f, span, inp, g[8], tail; unsigned np, tr, tb;
-        if (sscanf(text, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu gap_none_ns=%llu gap_copy_ns=%llu gap_fill_ns=%llu gap_clear_ns=%llu gap_dispatch_ns=%llu gap_upload_ns=%llu gap_reopen_ns=%llu gap_mix_ns=%llu tail_ns=%llu tail_bits=0x%x",
-                   &f, &np, &tr, &span, &inp, &g[0], &g[1], &g[2], &g[3], &g[4], &g[5], &g[6], &g[7], &tail, &tb) == 15) {
-            unsigned long long sum = inp; for (int k = 0; k < 8; k++) sum += g[k];
+    if (text && !strncmp(text, "gpu seg_gaps fence=", 19)) {   // 段内只有 1 个通道、它之前录了派发：带派发位（8）的空当 > 0，各空当 + 通道内 + 段尾 ≈ 跨度
+        unsigned long long f, span, inp, tail; unsigned np, tr, tb; int used = 0;
+        if (sscanf(text, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu tail_ns=%llu tail_bits=0x%x gaps=%n", &f, &np, &tr, &span, &inp, &tail, &tb, &used) == 7 && used) {
+            unsigned long long sum = inp + tail, disp = 0; const char *p = text + used; unsigned kb; unsigned long long ns; int m;
+            while (sscanf(p, "0x%x:%llu%n", &kb, &ns, &m) == 2) { sum += ns; if (kb & 8u) disp += ns; p += m; if (*p == ',') p++; else break; }
             unsigned long long d = sum > span ? sum - span : span - sum;
-            if (f == 1 && np == 1 && !tr && g[4] > 0 && d <= 8 && span > 0) atomic_fetch_add(&g_diag_gaps_match, 1);
+            if (f == 1 && np == 1 && !tr && disp > 0 && d <= 8 && span > 0) atomic_fetch_add(&g_diag_gaps_match, 1);
         }
     }
     if (text && strstr(text, "gpu pass_detail")) {

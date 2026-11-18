@@ -356,7 +356,7 @@ s = pathlib.Path(source).read_text()
 changes = {
  '--gpu-diag-neg-key': ('t->ids[at].key=key;', 't->ids[at].key=key^1;'),
  '--gpu-diag-neg-load': ('p->a[i].load=(uint32_t)att[i].loadOp;', 'p->a[i].load=(uint32_t)VK_ATTACHMENT_LOAD_OP_LOAD;'),
- '--gpu-diag-neg-gaps': ('gap[SG_CAT(c->pass_details->p[i].before & 63u)]', 'gap[SG_CAT(0u)]'),
+ '--gpu-diag-neg-gaps': ('SG_ADD(c->pass_details->p[i].before, SG_NS(prev, b));', 'SG_ADD(0u, SG_NS(prev, b));'),
  '--gpu-diag-neg-barrier': ('csf_note_guest(c,nvn_bits);', 'csf_note_guest(c,nvn_bits & 0u);'),
  '--gpu-diag-neg-csdlink': ('if (csf_seq) { c->ind_csd_seq=csf_seq; c->ind_csd_key=csf_key; }', 'if (csf_seq) { c->ind_csd_seq=csf_seq-1; c->ind_csd_key=csf_key; }'),
  '--gpu-diag-neg-indargs': ('nvn_gpu_copy_buf(c, ind, off, sl.buf, sl.off, bytes);', 'nvn_gpu_copy_buf(c, ind, off + 4, sl.buf, sl.off, bytes);'),
