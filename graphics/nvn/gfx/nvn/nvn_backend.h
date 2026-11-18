@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 11   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 12   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -189,6 +189,12 @@ void nvn_gpu_buf_use(nvn_gpu_cmd c, nvn_gpu_buf b);
 void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes);
 // 本 cmd 的临时上传区（参数块、内嵌常量、宽屏改写副本、support 缓冲大块）：内容有效到该 cmd 完成。线程：[提交]。出错：NVN_GPU_E_OOM，*out 清零。
 nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nvn_gpu_slice *out, nvn_gpu_err *err);
+// 把 src 的 bytes 字节填进本 cmd 的临时上传片 sl（sl->cpu 起，bytes ≤ 申请时的长度）。后端可以把这次拷贝交给别的线程做（Vulkan：两级回放的录制线程，
+// 按记录顺序），但保证：① c 提交（commit）或放弃（abort）之前做完；② nvn_gpu_arena_fill_wait(返回值) 返回时做完。src 在做完之前必须保持可读、内容不变
+// ——核心改 src 所在的内存之前先等（rp_ub_fill_fence）。返回 0 = 已经在本线程拷完；否则是递增的票号。线程：[提交]。
+uint64_t nvn_gpu_arena_fill(nvn_gpu_cmd c, const nvn_gpu_slice *sl, const void *src, uint64_t bytes);
+// 等票号 ≤ ticket 的填充全部做完，返回已做完的最大票号；ticket = 0 只查不等。线程：[提交]。
+uint64_t nvn_gpu_arena_fill_wait(uint64_t ticket);
 
 // ---------- 贴图、视图、采样器 ----------
 enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不了）

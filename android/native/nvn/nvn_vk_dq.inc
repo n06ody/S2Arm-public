@@ -33,10 +33,10 @@
 #define DQ_REAL(f) static PFN_##f r_##f;
 DQ_CMDS(DQ_REAL)   // 命令缓冲之外的那几个入口（提交、呈现、池）直接调符号：它们没有版本 / 扩展的问题，宿主用例对其中几个打了桩
 #define DQ_OP(f) OP_##f,
-enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_N };
+enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
 // 诊断读数：每类调用经过包装多少次（不管开关开没开）。backend_vulkan_wsi.inc 随「对象读数」每 300 帧打一行。
 #define DQ_NAME(f) #f,
-static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) };
+static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill" };
 static uint64_t g_dq_cnt[OP_N];
 #define DQ_COUNT(op) __atomic_fetch_add(&g_dq_cnt[op], 1, __ATOMIC_RELAXED)
 
@@ -177,6 +177,11 @@ typedef struct { uint32_t first, n; int has_sizes, has_bufs, has_offs; } a_xfb;
 typedef struct { uint32_t inst, first_inst; VkBuffer b; VkDeviceSize off; uint32_t ctr_off, stride; } a_bytecount;
 typedef struct { VkBuffer b; VkDeviceSize off; VkBuffer cb; VkDeviceSize coff; uint32_t max, stride; } a_indcount;
 typedef struct { VkQueryPool p; uint32_t q; VkQueryControlFlags fl; } a_query;
+// 暂存填充（对照 iOS nvn_rec.h 的常量缓冲拷贝线程 ubc_*）：核心把常量缓冲拷进本段临时上传片，一款大型开放世界游戏（01007EF00011E000）神庙场景每帧约 1.1 万次、44 MB，占回放线程可观的一块。
+// 这份拷贝排进同一个队列由录制线程按序做：GPU 只在提交之后读上传片，而 vkEndCommandBuffer 先清空队列，所以提交前一定拷完；
+// 核心改来源内存之前按票号等（nvn_gpu_arena_fill_wait）。票号在生产者自旋锁里递增，录制线程按记录顺序做，所以「已做完」单调。
+typedef struct { void *d; const void *s; uint64_t n, seq; } a_memfill;
+static _Atomic uint64_t g_fill_seq, g_fill_done;
 
 static void dq_run(const dq_rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
@@ -238,6 +243,7 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdDrawIndirectByteCountEXT: { const a_bytecount *a = (const void *)p; r_vkCmdDrawIndirectByteCountEXT(cb, a->inst, a->first_inst, a->b, a->off, a->ctr_off, a->stride); break; }
     case OP_vkCmdBeginQuery: { const a_query *a = (const void *)p; r_vkCmdBeginQuery(cb, a->p, a->q, a->fl); break; }
     case OP_vkCmdEndQuery: { const a_query *a = (const void *)p; r_vkCmdEndQuery(cb, a->p, a->q); break; }
+    case OP_FILL: { const a_memfill *a = (const void *)p; memcpy(a->d, a->s, (size_t)a->n); atomic_store_explicit(&g_fill_done, a->seq, memory_order_release); break; }
     default: break;
     }
 }
@@ -278,6 +284,28 @@ static void *dq_recorder_main(void *arg) {
         if (atomic_load(&g_dq_draining)) { pthread_mutex_lock(&g_dq_mu); pthread_cond_broadcast(&g_dq_dcv); pthread_mutex_unlock(&g_dq_mu); }
     }
     return NULL;
+}
+
+// ---- 暂存填充（生产者：回放线程）----
+// 两级回放关着（或队列还没建）就在本线程直接拷，返回 0。
+static DQ_U uint64_t vk_dq_fill(void *d, const void *s, uint64_t n) {
+    DQ_COUNT(OP_FILL);
+    a_memfill *a = DQ_ON() && g_dq_ring ? dq_rec_begin(OP_FILL, VK_NULL_HANDLE, sizeof *a) : NULL;
+    if (!a) { memcpy(d, s, (size_t)n); return 0; }
+    const uint64_t seq = atomic_load_explicit(&g_fill_seq, memory_order_relaxed) + 1;   // 自旋锁里：按记录顺序递增
+    atomic_store_explicit(&g_fill_seq, seq, memory_order_relaxed);
+    a->d = d; a->s = s; a->n = n; a->seq = seq;
+    dq_rec_end(a);
+    return seq;
+}
+// 等票号 ≤ t 的填充做完：录制线程通常只落后几条，先叫醒它、让出几轮；还没到就走清空（它有睡眠与超时自报红），这条记录已发布，清空一定覆盖它
+static DQ_U uint64_t vk_dq_fill_wait(uint64_t t) {
+    uint64_t d = atomic_load_explicit(&g_fill_done, memory_order_acquire);
+    if (!t || d >= t) return d;
+    dq_wake();
+    for (int i = 0; i < 2000 && (d = atomic_load_explicit(&g_fill_done, memory_order_acquire)) < t; i++) sched_yield();
+    if (d < t) { vk_dq_drain(); d = atomic_load_explicit(&g_fill_done, memory_order_acquire); }
+    return d;
 }
 
 // ---- the wrappers (the producer) ----
