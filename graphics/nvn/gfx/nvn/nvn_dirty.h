@@ -16,12 +16,6 @@ void nvn_dirty_protect(const void *addr, size_t len);              // Set the co
 int nvn_dirty_replace_range(const void *mem, size_t size);
 // 映射代际：每次 add/remove/replace 后变化，缓存据此重新验证句柄与保护状态。
 uint64_t nvn_dirty_mapping_generation(void);
-// 可选的 64 宿主页摘要：须在任何池登记前配置；失败时调用方沿用逐页检查。
-// 块以宿主页的绝对地址对齐，与 mprotect 分块大小无关。
-int nvn_dirty_blocks_configure(int enabled);
-// 对一个摘要块内的范围取稳定快照；返回 1 时 version + epoch 可以作为缓存身份。
-// 未跟踪、跨块、写入进行中、别名重叠或跟踪不可靠均返回 0，调用方必须保守处理。
-int nvn_dirty_block_snapshot(const void *span, const void *addr, size_t len, uint64_t *version, uint64_t *epoch);
 // 脏页追加日志（#1501 A②）：须在任何池登记前配置；失败（已有活池 / 原子操作非无锁）返回 0，调用方沿用逐页核对。
 // 每次一页从只读变可写就追加一条 [a, b)（宿主页对齐地址，在页变可写之前发布）。
 int nvn_dirty_log_configure(int enabled);
