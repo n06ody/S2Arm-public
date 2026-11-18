@@ -153,10 +153,10 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     if (!g_cmd) return NULL;
-    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); return g_cmd; }
+    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_why(RP_CUT_PRE_XFER); rp_pass_end(g_cmd); return g_cmd; }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
-        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_end(g_cmd); return g_cmd; } }
+        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_why(RP_CUT_PRE_XFER); rp_pass_end(g_cmd); return g_cmd; } }
     return g_pre;
 }
 
@@ -263,7 +263,7 @@ static void seg_cut(int next_occ);
 static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
     if (g_occ_seg || !g_sub || !c || c != g_cmd) return c;
     if (g_mid >= SUB_STEP - 4) { nvn_unimpl("occl", "first_reset_not_counted", NULL); return c; }
-    rp_pass_flush(c);
+    rp_pass_why(RP_CUT_OCCL); rp_pass_flush(c);
     seg_cut(1);
     return g_cmd;
 }
@@ -382,7 +382,7 @@ static void seg_cut(int next_occ) {
 
 uint64_t nvn_be_sub_commit(void) {
     struct sub *s = g_sub; g_sub = NULL;
-    rp_pass_flush(g_cmd);   // 打开的通道与待折清除不跨提交
+    rp_pass_why(RP_CUT_SUBMIT); rp_pass_flush(g_cmd);   // 打开的通道与待折清除不跨提交
     if (!g_cmd) {   // 没有段（开段失败，或中途交段之后开新段失败）：副作用无处挂，按失败丢弃（不写假成功）
         if (s) sub_orphan(s);
         if (g_pre) { nvn_gpu_cmd_abort(g_pre); g_pre = NULL; }
@@ -546,7 +546,7 @@ static void post_report(uint64_t addr, uint32_t type) {
             }
             if (s->ts_current && s->ts_current->count < NVN_GPU_TIMESTAMP_SLOTS) {
                 p.ts = s->ts_current; p.slot = p.ts->count++;
-                rp_pass_flush(g_cmd); // 延后折叠的清除须先于这个报告；不跨报告位置重排
+                rp_pass_why(RP_CUT_REPORT); rp_pass_flush(g_cmd); // 延后折叠的清除须先于这个报告；不跨报告位置重排
                 nvn_gpu_timestamp(g_cmd, p.slot, type);
             }
         }
@@ -665,13 +665,13 @@ static uint64_t exec_list(const uint8_t *p) {
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); rp_pass_barrier((uint32_t)bits); break; }
-            case OP_COPY_T2B: rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
-            case OP_CLEAR_TEX: rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
-            case OP_COPY_B2T: rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
-            case OP_COPY_T2T: rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标
-            case OP_UPDATE_UB: rp_op_update_ub(a, p); break;
-            case OP_COPY_B2B: rp_op_copy_b2b(a, p); break;
-            case OP_CLEAR_BUF: rp_op_clear_buf(a, p); break;
+            case OP_COPY_T2B: rp_pass_why(RP_CUT_XFER_OP); rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
+            case OP_CLEAR_TEX: rp_pass_why(RP_CUT_XFER_OP); rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
+            case OP_COPY_B2T: rp_pass_why(RP_CUT_XFER_OP); rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
+            case OP_COPY_T2T: rp_pass_why(RP_CUT_XFER_OP); rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标
+            case OP_UPDATE_UB: if (!rp_op_update_ub_gpu(g_cmd, a, p)) rp_op_update_ub(a, p); break;   // 碰到还没落地的 GPU 写才走 GPU（#1022）
+            case OP_COPY_B2B: if (!rp_op_copy_b2b_gpu(g_cmd, a, p)) rp_op_copy_b2b(a, p); break;
+            case OP_CLEAR_BUF: if (!rp_op_clear_buf_gpu(g_cmd, a, p)) rp_op_clear_buf(a, p); break;
             case OP_WAIT_SYNC: {
                 const sync_t *s; void *ev; uint64_t v;
                 memcpy(&s, a, sizeof s);
