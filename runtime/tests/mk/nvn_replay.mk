@@ -15,7 +15,7 @@ NVN_REPLAY_SCAN = perl -0pe 's\#/\*.*?\*/\#\#gs; s\#//[^\n]*\#\#g' $(NVN_REPLAY_
 .PHONY: native-test-nvn_replay
 native-test-nvn_replay:
 	@mkdir -p $(BUILD)/tests
-	$(CC) $(CFLAGS) -DS2A_TEST_TS_ALLOC -DS2A_GPU_LAND_TEST -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -I. -Igraphics/nvn/gfx/nvn -Igraphics/nvn/gfx/nvn/include -Igraphics/nvn/gfx/tex -I$(NVN_REPLAY_DIR) \
+	$(CC) $(CFLAGS) -DS2A_TEST_TS_ALLOC -DS2A_GPU_LAND_TEST -DS2A_TEST_TREG_SCRUB -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -I. -Igraphics/nvn/gfx/nvn -Igraphics/nvn/gfx/nvn/include -Igraphics/nvn/gfx/tex -I$(NVN_REPLAY_DIR) \
 	  -o $(BUILD)/tests/t_nvn_replay graphics/nvn/tests/t_nvn_replay.c graphics/nvn/tests/nvn_clear_view_unused.c $(NVN_REPLAY_CORE) $(NVN_REPLAY_WEAK) -lm
 	@bad=$$($(NVN_REPLAY_SCAN) | grep -nE '\b(MTL[A-Za-z0-9_]*|CAMetal[A-Za-z]*|Vk[A-Z][A-Za-z0-9]*|VK_[A-Z0-9_]+|vk[A-Z][A-Za-z]*|ANativeWindow|AHardwareBuffer|OHNativeWindow|__system_property_get|getenv)\b|#(include|import) *[<"](Metal|QuartzCore|vulkan|android|jni|hilog)' || true); \
 	  if [ -n "$$bad" ]; then echo "【红】 回放核心出现图形 API / 平台专有内容（注释外）：$$bad"; exit 1; fi; \

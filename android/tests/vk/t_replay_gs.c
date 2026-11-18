@@ -51,8 +51,8 @@ int rp_buf_resolve_multi(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_bu
 }
 void rp_view_pin_begin(void) {}
 void rp_view_pin_end(void) {}
-nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)c; (void)t; return NULL; }
-nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; (void)t; return NULL; }
+nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
+nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
 // 此夹具未提供查询采样器证明，不使用内部查询对象。
 nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 nvn_gpu_samp rp_samp_by_id(int id) { (void)id; return NULL; }
