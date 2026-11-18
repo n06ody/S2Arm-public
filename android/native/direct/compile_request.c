@@ -9,12 +9,18 @@
 #include "json.h"
 #include "w2_single_query.h"
 
+#include <fcntl.h>
+#include <signal.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 /* Optional native-only producer seam. Standalone request/worker host links do
  * not need the registry or JSON parser; an absent dependency rejects diagnosis. */
@@ -183,7 +189,8 @@ static int diag_query(const char *message, struct s2a_w2_query *q) {
         {"QuerySamplerType", S2A_W2_QUERY_SAMPLER_TYPE},
         {"QueryTextureIsBuffer", S2A_W2_QUERY_IS_BUFFER},
         {"QueryTextureCoordNormalized", S2A_W2_QUERY_NORMALIZED},
-        {"QueryTextureFormat", S2A_W2_QUERY_FORMAT}
+        {"QueryTextureFormat", S2A_W2_QUERY_FORMAT},
+        {"QueryS2ASampledTextureFormat", S2A_W2_QUERY_SAMPLED_FORMAT}
     };
     const char *p = message;
     memset(q, 0, sizeof *q);
@@ -721,6 +728,95 @@ static void summarize(const uint8_t *bytes, size_t len, char *out, size_t cap) {
              tlen > 0 && tlen < 160 ? (int)tlen : 0, transport ? transport : "");
 }
 
+// 在编槽（#1501 D②）：翻译器在现编时崩了（SIGSEGV 等），把崩溃线程正在编的那份请求原样落盘，
+//   S2A_FRAME_LOG_DIR/compile-inflight-<pid>-<槽>.log：首行头（pid / session / generation / 字节数 / sha256 /
+//   session_uuid），之后是请求 JSON 原文。run_game.py 和 frame-log 一起从私有目录收走。
+//   苹果侧同一件事是 graphics/nvn/host/dsh_miss.inc 的 s2a_dsh_crash_dump（崩溃处理在 crash.c 的非安卓分支里调）；
+//   安卓崩溃处理（crash.c android_crash_fatal）按弱引用调这里的 s2a_compile_inflight_dump。
+//   路径与头在编前拼好；处理函数里只 open / write / close，不分配、不加锁、不格式化。
+//   只落「本线程」正在编的那份（槽号放线程局部，编前已写过，信号里读不会触发 TLS 分配）：别的线程崩了不冒领。
+//   编译器自己接住了这个信号、编译照常返回（NativeAOT 把托管空引用转成异常）时，返回后删掉已落的文件，不留假现场。
+//   正常路径零写盘：每次只多两次原子写和一次 snprintf。
+enum { INFLIGHT_SLOTS = 4 };
+enum { INFLIGHT_FREE, INFLIGHT_CLAIM, INFLIGHT_ARMED };
+static struct inflight_slot {
+    _Atomic int state;
+    volatile sig_atomic_t dumped;
+    const char *json;
+    size_t len, head_len;
+    char head[256];
+    char path[512];
+} g_inflight[INFLIGHT_SLOTS];
+static _Thread_local int t_inflight = -1;
+static pthread_once_t g_inflight_once = PTHREAD_ONCE_INIT;
+static char g_inflight_dir[400], g_inflight_uuid[96];
+
+static void inflight_init(void) {
+    const char *dir = getenv("S2A_FRAME_LOG_DIR");
+    if (dir && dir[0] == '/' && strlen(dir) < sizeof g_inflight_dir) strcpy(g_inflight_dir, dir);
+    strcpy(g_inflight_uuid, "-");
+#if defined(__ANDROID__)
+    char uuid[PROP_VALUE_MAX];
+    if (__system_property_get("debug.s2a.session_uuid", uuid) > 0 && strlen(uuid) < sizeof g_inflight_uuid)
+        strcpy(g_inflight_uuid, uuid);
+#endif
+}
+
+static int inflight_arm(uint64_t session, uint64_t generation, const char *json, size_t len, const char *sha) {
+    pthread_once(&g_inflight_once, inflight_init);
+    if (!g_inflight_dir[0] || !json || !len) return -1;
+    for (int k = 0; k < INFLIGHT_SLOTS; k++) {
+        int expect = INFLIGHT_FREE;
+        if (!atomic_compare_exchange_strong(&g_inflight[k].state, &expect, INFLIGHT_CLAIM)) continue;
+        struct inflight_slot *sl = &g_inflight[k];
+        int pn = snprintf(sl->path, sizeof sl->path, "%s/compile-inflight-%ld-%d.log", g_inflight_dir, (long)getpid(), k);
+        int hn = snprintf(sl->head, sizeof sl->head,
+                          "[s2a] compile-inflight v1 pid=%ld session=%llu generation=%llu bytes=%zu sha256=%s uuid=%s\n",
+                          (long)getpid(), (unsigned long long)session, (unsigned long long)generation, len, sha, g_inflight_uuid);
+        if (pn <= 0 || (size_t)pn >= sizeof sl->path || hn <= 0 || (size_t)hn >= sizeof sl->head) {
+            atomic_store(&sl->state, INFLIGHT_FREE);
+            return -1;
+        }
+        sl->json = json; sl->len = len; sl->head_len = (size_t)hn; sl->dumped = 0;
+        t_inflight = k;
+        atomic_store(&sl->state, INFLIGHT_ARMED);
+        return k;
+    }
+    return -1;   // 同时在编的超过 INFLIGHT_SLOTS 支：这支崩了不留输入（照常编）
+}
+
+static void inflight_disarm(int k) {
+    if (k < 0) return;
+    struct inflight_slot *sl = &g_inflight[k];
+    atomic_store(&sl->state, INFLIGHT_CLAIM);
+    t_inflight = -1;
+    if (sl->dumped) unlink(sl->path);   // 编译器接住了信号、照常返回：不是崩溃现场
+    sl->json = NULL; sl->len = 0; sl->dumped = 0;
+    atomic_store(&sl->state, INFLIGHT_FREE);
+}
+
+static void inflight_write_all(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return;
+        p += w; n -= (size_t)w;
+    }
+}
+
+// 崩溃处理里调（异步信号安全）：只落本线程正在编的那份。
+void s2a_compile_inflight_dump(void) {
+    int k = t_inflight;
+    if (k < 0 || k >= INFLIGHT_SLOTS) return;
+    struct inflight_slot *sl = &g_inflight[k];
+    if (atomic_load(&sl->state) != INFLIGHT_ARMED) return;
+    int fd = open(sl->path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    inflight_write_all(fd, sl->head, sl->head_len);
+    inflight_write_all(fd, sl->json, sl->len);
+    close(fd);
+    sl->dumped = 1;
+}
+
 int s2a_compile_request_execute(uint64_t session, uint64_t generation, const char *json, size_t json_len,
                                 struct s2a_compile_outcome *out) {
     int diag_owned = 0;
@@ -741,7 +837,9 @@ int s2a_compile_request_execute(uint64_t session, uint64_t generation, const cha
     // 种类校验开关不再在这里读环境变量/属性：请求 JSON 的 kindCheck 字段由 s2a_compile_request_build
     // 按调试门判一次写进去（C# 从请求读），这里只负责原样把请求交给编译器。
     s2a_direct_bytes request = { (const uint8_t *)json, (uint64_t)json_len };
+    int inflight = inflight_arm(session, generation, json, json_len, req_sha);
     out->rc = compile(session, generation, request, emit_copy, &capture);
+    inflight_disarm(inflight);
     diag_error(diag, out->rc, capture.bytes, capture.len, capture.emits);
     out->bytes = capture.bytes;
     out->bytes_len = capture.len;

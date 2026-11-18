@@ -4,15 +4,16 @@
 #include <string.h>
 
 #include "nvn.h"
+#include "../../../graphics/nvn/gfx/nvn/nvn_fmt_info.h"
 
 // NVN 颜色格式 → Ryujinx Format 名（编译器 TextureFormat 枚举）。表外的格式（BC / sRGB / 565 / 深度模板 …）照样出事实，格式写 "Unknown"：
-//   格式事实只在图像读写（QueryTextureFormat）时有意义，采样器类型、坐标是否归一化与格式无关，Ryujinx 自己对这类贴图也给 Unknown。
+//   表内格式用于图像读写与采样声明的数值类；表外的非整数格式沿用 Unknown，采样声明为浮点。
 //   编译器在图像读写查到 Unknown 时才报 MISSING_FACT（DirectGpuAccessor.QueryTextureFormat）。10-31 暗黑3 安卓：第一笔片元着色器采样 DXT1 / DXT5，
 //   原先整条事实不出，QueryTextureCoordNormalized 缺事实、整份请求被拒、进程退出。UI2F / I2F 仍拒（整数格式按浮点读，归一化与否要另证）。
 static const struct { uint32_t f; const char *name; } g_formats[] = {
     // 编译器 TextureFormat 是一个较小的枚举（Ryujinx.Graphics.Shader.TextureFormat）：只接受
     // 这里列出的名字。Bc*/sRGB/565/4444/3 通道/深度等格式不在枚举里，输出会被整份请求拒绝，
-    // 所以它们不产出事实（Shaders 若真查询则 MISSING_FACT，和空 textures[] 时一致，不回归）。
+    // 所以非整数格式用 Unknown；表外整数格式拒绝出事实，避免浮点声明读整数视图。
     { NVN_FORMAT_R8, "R8Unorm" }, { NVN_FORMAT_R8SN, "R8Snorm" },
     { NVN_FORMAT_R8UI, "R8Uint" }, { NVN_FORMAT_R8I, "R8Sint" },
     { NVN_FORMAT_R16F, "R16Float" }, { NVN_FORMAT_R16, "R16Unorm" }, { NVN_FORMAT_R16SN, "R16Snorm" },
@@ -140,7 +141,14 @@ static int s2a_nvn_texture_fact_compute(uint32_t nvn_format, uint32_t nvn_target
     memset(out, 0, sizeof *out);
     if (int_to_float_format(nvn_format)) { setwhy(why, why_size, "UI2F / I2F 格式不出事实（整数按浮点读）"); return -1; }
     const char *fmt = format_name(nvn_format);
-    if (!fmt) fmt = "Unknown";
+    if (!fmt) {
+        nvn_fmt_info info;
+        if (nvn_fmt_info_of(nvn_format, &info) && (info.kind == NVN_FMT_UINT || info.kind == NVN_FMT_SINT)) {
+            setwhy(why, why_size, "unmapped integer sampled format");
+            return -1;
+        }
+        fmt = "Unknown";
+    }
 
     const char *base = NULL;
     uint32_t array_length = 1;

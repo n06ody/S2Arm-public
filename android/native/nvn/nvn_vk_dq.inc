@@ -15,6 +15,10 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
+#if defined(S2A_ANDROID_DEBUG_ENV)
+#include "nvn_vuid_diag.h"
+#define DQ_CONTEXT_FLAG (1u << 31)
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -121,6 +125,11 @@ done:
 }
 static void *dq_rec_begin(uint32_t op, VkCommandBuffer cb, size_t n) {   // room for a record with n bytes after its header
     size_t need = (sizeof(dq_rec_hdr) + n + 15) & ~(size_t)15;   // 16-byte records: the ring's end always has room for a whole header
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    const struct s2a_vuid_context *ctx = s2a_vuid_enabled && s2a_vuid_enabled() && s2a_vuid_current ? s2a_vuid_current() : NULL;
+    const int has_ctx = ctx && ctx->kind != S2A_VUID_NONE;
+    if (has_ctx) need += (sizeof *ctx + 15) & ~(size_t)15;
+#endif
     if (need > dq_RING / 4) return NULL;   // (no call copies that much: such a call is made directly)
     pthread_spin_lock(&g_dq_pl);   // released by dq_rec_end
     size_t off = (size_t)(g_dq_w % dq_RING);
@@ -130,6 +139,9 @@ static void *dq_rec_begin(uint32_t op, VkCommandBuffer cb, size_t n) {   // room
     }
     while (g_dq_w + need - atomic_load_explicit(&g_dq_rd, memory_order_acquire) > dq_RING) { dq_wake(); sched_yield(); }
     dq_rec_hdr *h = (dq_rec_hdr *)(g_dq_ring + off); h->op = op; h->size = (uint32_t)need; h->cb = cb;
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (has_ctx) { h->op |= DQ_CONTEXT_FLAG; memcpy((uint8_t *)h + need - sizeof *ctx, ctx, sizeof *ctx); }
+#endif
     return h + 1;
 }
 static void dq_rec_end(void *payload) {
@@ -180,7 +192,12 @@ typedef struct { VkQueryPool p; uint32_t q; VkQueryControlFlags fl; } a_query;
 
 static void dq_run(const dq_rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
-    switch (h->op) {
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    const uint32_t op = h->op & ~DQ_CONTEXT_FLAG;
+#else
+    const uint32_t op = h->op;
+#endif
+    switch (op) {
     case OP_vkCmdPipelineBarrier: { const a_barrier *a = (const void *)p; const uint8_t *q = p + sizeof *a;
         const VkMemoryBarrier *m = (const void *)q; q += a->nm * sizeof *m; const VkBufferMemoryBarrier *b = (const void *)q; q += a->nb * sizeof *b; const VkImageMemoryBarrier *im = (const void *)q;
         r_vkCmdPipelineBarrier(cb, a->src, a->dst, a->dep, a->nm, a->nm ? m : NULL, a->nb, a->nb ? b : NULL, a->ni, a->ni ? im : NULL); break; }
@@ -232,7 +249,7 @@ static void dq_run(const dq_rec_hdr *h) {
         r_vkCmdBindTransformFeedbackBuffersEXT(cb, a->first, a->n, b, o, a->has_sizes ? o + a->n : NULL); break; }
     case OP_vkCmdBeginTransformFeedbackEXT: case OP_vkCmdEndTransformFeedbackEXT: { const a_xfb *a = (const void *)p; const VkBuffer *b = (const void *)(p + sizeof *a);
         const VkDeviceSize *o = (const void *)(b + (a->has_bufs ? a->n : 0));
-        (h->op == OP_vkCmdBeginTransformFeedbackEXT ? r_vkCmdBeginTransformFeedbackEXT : r_vkCmdEndTransformFeedbackEXT)(cb, a->first, a->n, a->has_bufs ? b : NULL, a->has_offs ? o : NULL); break; }
+        (op == OP_vkCmdBeginTransformFeedbackEXT ? r_vkCmdBeginTransformFeedbackEXT : r_vkCmdEndTransformFeedbackEXT)(cb, a->first, a->n, a->has_bufs ? b : NULL, a->has_offs ? o : NULL); break; }
     case OP_vkCmdDrawIndirectCount: { const a_indcount *a = (const void *)p; r_vkCmdDrawIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->max, a->stride); break; }
     case OP_vkCmdDrawIndexedIndirectCount: { const a_indcount *a = (const void *)p; r_vkCmdDrawIndexedIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->max, a->stride); break; }
     case OP_vkCmdDrawIndirectByteCountEXT: { const a_bytecount *a = (const void *)p; r_vkCmdDrawIndirectByteCountEXT(cb, a->inst, a->first_inst, a->b, a->off, a->ctr_off, a->stride); break; }
@@ -274,7 +291,26 @@ static void *dq_recorder_main(void *arg) {
                 if (atomic_load_explicit(&g_dq_stat, memory_order_relaxed)) { const uint64_t t0 = atomic_exchange_explicit(&g_dq_t0, 0, memory_order_relaxed); if (t0) dq_hist_add(g_dq_hw, &g_dq_hw_max, dq_now_ns() - t0); }   // 读数：睡着后第一条记录等了多久
             }
         }
-        while (r != pub) { const dq_rec_hdr *h = (const dq_rec_hdr *)(g_dq_ring + r % dq_RING); atomic_store_explicit(&g_dq_cur_op, h->op, memory_order_relaxed); dq_run(h); r += h->size; atomic_store(&g_dq_rd, r); }   // seq_cst (a plain stlr on arm64): the read position is stored, then g_dq_draining is read, against the drainer's "count it, then read the position"
+        while (r != pub) { const dq_rec_hdr *h = (const dq_rec_hdr *)(g_dq_ring + r % dq_RING);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+            const uint32_t op = h->op & ~DQ_CONTEXT_FLAG;
+            struct s2a_vuid_context old, copied;
+            int scoped = op != OP_WRAP && s2a_vuid_exchange && ((h->op & DQ_CONTEXT_FLAG) || (s2a_vuid_enabled && s2a_vuid_enabled()));
+            if (scoped) {
+                const struct s2a_vuid_context *pctx = NULL;
+                if (h->op & DQ_CONTEXT_FLAG) {
+                    memcpy(&copied, (const uint8_t *)h + h->size - sizeof copied, sizeof copied);
+                    snprintf(copied.api, sizeof copied.api, "%s", op < OP_N ? g_dq_names[op] : "");
+                    pctx = &copied;
+                }
+                s2a_vuid_exchange(pctx, &old);
+            }
+            atomic_store_explicit(&g_dq_cur_op, op, memory_order_relaxed); dq_run(h);
+            if (scoped) s2a_vuid_exchange(&old, NULL);
+#else
+            atomic_store_explicit(&g_dq_cur_op, h->op, memory_order_relaxed); dq_run(h);
+#endif
+            r += h->size; atomic_store(&g_dq_rd, r); }   // seq_cst (a plain stlr on arm64): the read position is stored, then g_dq_draining is read, against the drainer's "count it, then read the position"
         if (atomic_load(&g_dq_draining)) { pthread_mutex_lock(&g_dq_mu); pthread_cond_broadcast(&g_dq_dcv); pthread_mutex_unlock(&g_dq_mu); }
     }
     return NULL;

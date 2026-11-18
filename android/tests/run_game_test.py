@@ -701,6 +701,10 @@ if cmd == "shell":
                     # logcat_dump 剥行前缀派生；priv_frame_log 旋钮给显式文件内容
                     # （比如 logcat 分片被截断但文件完整的救场局）。
                     dd = DATA_DIRS.setdefault("/data/data/" + st["package"], {})
+                    # 现编崩溃留下的在编请求（compile_request.c）：priv_inflight 给 {文件名: 内容}，<SESSION_UUID> 同上替换
+                    for n_, t_ in (st.get("priv_inflight") or {}).items():
+                        u_ = st["props"].get("debug.s2a.session_uuid") or "-"
+                        dd["files/" + n_] = t_.replace("<SESSION_UUID>", u_).encode().hex()
                     if st.get("no_priv_seed"):
                         pass    # 零匹配负控：finish 不落 frame-log
                     elif st.get("priv_frame_log") is not None:
@@ -2786,6 +2790,23 @@ class RunGameTest(unittest.TestCase):
         for rec in bound:
             body = (out / "host_logs" / rec["name"]).read_bytes()
             self.assertIn(ru, body, f"{rec['name']} bound 但内容没有本局 uuid：判据被绕过")
+
+    def test_private_logs_compile_inflight(self):
+        """#1501 D②：现编崩溃落下的 compile-inflight-<pid>-<槽>.log 和 frame-log 一样收；
+        首行 pid 与文件名对上、uuid 是本局号 → bound；首行 pid 对不上 → unproven。"""
+        head = "[s2a] compile-inflight v1 pid={} session=7 generation=3 bytes=2 sha256={} uuid=<SESSION_UUID>\n{{}}"
+        state = {"priv_inflight": {"compile-inflight-4242-0.log": head.format(4242, "0" * 64),
+                                   "compile-inflight-4242-1.log": head.format(9999, "1" * 64)}}
+        rc, out, _ = self.run_tool(seconds=30, state=state)
+        self.assertEqual(0, rc)
+        man = json.loads((out / "run-manifest.json").read_text())
+        recs = {r["name"]: r for r in man["private_logs"]}
+        self.assertEqual("bound", recs["compile-inflight-4242-0.log"]["session"])
+        self.assertTrue(recs["compile-inflight-4242-0.log"]["verified"])
+        self.assertTrue((out / "host_logs/compile-inflight-4242-0.log").read_bytes().endswith(b"\n{}"))
+        self.assertEqual("unproven", recs["compile-inflight-4242-1.log"]["session"],
+                         "首行 pid 与文件名对不上不许 bound")
+        self.assertTrue(any("compile-inflight-4242-1.log" in n and "pid" in n for n in man["notes"]), man["notes"])
 
     def test_private_logs_no_birth_attribution_unproven(self):
         """㉔ qa-fone 负控：墙钟正常但 /proc/<pid>/stat 读拒 → 进程 birth 证不了，

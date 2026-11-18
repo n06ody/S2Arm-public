@@ -37,9 +37,9 @@ for c in "" graphics/tools/direct/dsh/x.cs "runtime/src/hud.c graphics/nvn/gfx/n
 done
 # ⑤ 认不得的键 / GATE_ONLY 冲突
 n=$((n + 1)); o=$(GATE_HOOK_ONLY=fps_limit GATE_HOOK_LIST=1 bash "$G" 2>&1); r=$?
-if [ $r = 1 ] && grep -q "子项键 fps_limit 认不得" <<< "$o"; then echo "通 认不得的键 fps_limit（只是 present_residency 的加跑判据）→ 红"; else echo "不通 认不得的键：退出 $r，输出 $o"; bad=1; fi
+if [ $r = 1 ] && grep -q "子项键 fps_limit 认不得" <<< "$o"; then echo "通 认不得的键 fps_limit（只是 present_residency 的加跑判据）→ 红"; else echo "不通 认不得的键：退出 ${r}，输出 $o"; bad=1; fi
 n=$((n + 1)); o=$(GATE_HOOK_ONLY=dsh GATE_ONLY=gl GATE_HOOK_LIST=1 bash "$G" 2>&1); r=$?
-if [ $r = 1 ] && grep -q "同设且不同" <<< "$o"; then echo "通 GATE_ONLY 与 GATE_HOOK_ONLY 不同 → 红"; else echo "不通 GATE_ONLY 冲突：退出 $r，输出 $o"; bad=1; fi
+if [ $r = 1 ] && grep -q "同设且不同" <<< "$o"; then echo "通 GATE_ONLY 与 GATE_HOOK_ONLY 不同 → 红"; else echo "不通 GATE_ONLY 冲突：退出 ${r}，输出 $o"; bad=1; fi
 ok "GATE_ONLY 与 GATE_HOOK_ONLY 相同（tools/gate.sh 转发时两个都放）→ 当同一请求" "$(GATE_ONLY=dsh GATE_HOOK_ONLY=dsh GATE_CHANGED= GATE_HOOK_LIST=1 bash "$G" | tr '\n' ' ' | sed 's/ $//')" "dsh"
 # ⑥ GATE_HOOK_LIST=inputs：前缀 = 判据里 touched 的参数（多分支的每一支），rest / 闭包算不出 = *
 inp=$(GATE_HOOK_LIST=inputs bash "$G"); line() { awk -F'\t' -v k="$1" '$1 == k { print $2 }' <<< "$inp"; }

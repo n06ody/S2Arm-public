@@ -126,6 +126,9 @@ int s2a_compile_request_execute(uint64_t session, uint64_t generation, const cha
                                 struct s2a_compile_outcome *out);
 
 void s2a_compile_outcome_free(struct s2a_compile_outcome *out);
+// 崩溃处理里调（异步信号安全，只 open / write / close）：本线程正在执行 s2a_compile_request_execute 时，
+// 把那份请求落成 S2A_FRAME_LOG_DIR/compile-inflight-<pid>-<槽>.log；没在编 / 没配目录什么都不做。
+void s2a_compile_inflight_dump(void);
 
 /* Internal diagnostic ownership only; not part of s2a_direct's managed ABI.
  * build -> original allocation take -> execute is the supported graphics path.

@@ -30,6 +30,9 @@
 #include "nvn/nvn_vk_program_result.h"
 #include "nvn/nvn_vk_compute_request.h"
 #include "nvn/nvn_vk_prog_warm.h"   // 跨会话程序清单（note / stats；build 与 quiesce 在本文件实现）
+#if defined(S2A_ANDROID_DEBUG_ENV)
+#include "nvn_vuid_diag.h"
+#endif
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -614,7 +617,9 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
     g->has_depth_mode = 1; g->depth_mode = !rp_depth_zero() && depth_clip_cap() != 1;
     g->has_y_negate = 1; g->y_negate = rp_origin_lower_left();
     g->has_origin = 1; g->origin_upper_left = 1;
-    g->has_halve_primitive_id = 1; g->halve_primitive_id = g->topology && q->prim == 0x7u;
+    // 同 Ryujinx GpuChannelGraphicsState：宿主不支持四边形（核心展开成三角形画）、没有几何着色器、原图元是四边形 / 四边形带。
+    //   q->prim 是 NVN 原图元（rp_draw 在展开前交过来），每个四边形变成两个三角形，着色器读到的图元号要减半
+    g->has_halve_primitive_id = 1; g->halve_primitive_id = g->topology && (q->prim == 0x7u || q->prim == 0x8u) && nst < 3;
     g->has_cb_draw_params = 1; g->cb_draw_params = pc->shader_draw_parameters;
     g->has_point_size = 1; g->program_point_size_enable = 1; g->point_size = 1.0f;
     // 参考值是绘制时的状态（OP_ALPHA_REF）。测试没开（函数是 ALWAYS）时固定给 0：不让同一个程序因为一个用不到的数拆成多份
@@ -687,7 +692,12 @@ static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
     if (b->kind == 2 && b->texel_buffer && b->count == 1 && b->tex_slot >= 0) {
         e->cls = NVN_GPU_RES_TBUF; e->src_kind = NVN_RB_TBUF; e->src_reg = (uint16_t)b->tex_slot; return 1;
     }
-    if (b->kind == 2 && !b->texel_buffer && b->count > 1 && b->slot == 0) { e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = 0; e->count = b->count; return 1; }
+    // 句柄表贴图数组：第 k 项 = c2 第 slot + 2k 字（同 iOS NVN_RB_TEXA：c2 字节 off + 8k）。布局项记句柄表下标 slot / 2、项数 = 数组长度；
+    //   起点不只是第 0 字（从组合槽起的 sampler2D tex[N] 是第 8 + 2s 字）。项数少了，描述符布局的 descriptorCount 就小于着色器声明（#1581）
+    if (b->kind == 2 && !b->texel_buffer && b->count > 1) {
+        if (b->slot < 0 || (b->slot & 1) || b->samp_slot >= 0) return 0;
+        e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = (uint16_t)(b->slot / 2); e->count = b->count; return 1;
+    }
     if (b->kind == 2 && !b->texel_buffer && b->tex_slot >= 0) { e->cls = NVN_GPU_RES_TEX_SAMP; e->src_kind = NVN_RB_TEX; e->src_reg = (uint16_t)b->tex_slot; e->src_reg2 = b->samp_slot >= 0 ? (uint16_t)b->samp_slot : UINT16_MAX; return 1; }
     // 存储缓冲：只认「NVN 存储槽」这一种来源（反射里的 nvnSlot）。地址来自 UBO 内 SbDescriptor / c1 段的要逐笔读
     // 常量缓冲内容，首版还没接，准确报红而不是猜槽位。
@@ -698,6 +708,8 @@ static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
         if (b->storage_writable) e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W;
         return 1;
     }
+    // 共享内存溢出缓冲（计算）：没有客体来源，回放按派发组数 × 程序的 spill_bytes 从暂存区分配（rp_draw.c rp_dispatch）
+    if (b->kind == 4 && b->count == 1) { e->cls = NVN_GPU_RES_SSBO; e->src_kind = NVN_RB_SPILL; e->access = NVN_GPU_ACC_R | NVN_GPU_ACC_W; return 1; }
     // 图像：只接计算阶段的单个存储图像（解析器给出 NVN 图像槽 0..7，放在 tex_slot）；回放按槽取 BindImage 的句柄建存储视图
     //   （rp_draw.c rp_dispatch NVN_RB_IMG）。图形阶段的图像回放还没接，绘制时按名跳过（compute_image_shape）。
     if (b->kind == 3 && b->count == 1 && b->tex_slot >= 0 && b->tex_slot < 8) {
@@ -806,6 +818,16 @@ done:
 // 驱动的贴图句柄表：贴图槽 s 的句柄在第 8 + 2s 个 32 位字，即第 4 + s 个 8 字节项；32 个槽 → 36 项
 enum { HANDLE_TABLE_ENTRIES = 4 + 32 };
 
+#if defined(S2A_ANDROID_DEBUG_ENV)
+static int vuid_compile_begin(unsigned st, const uint8_t *key, struct s2a_vuid_context *old) {
+    if (!s2a_vuid_enabled || !s2a_vuid_enabled() || !s2a_vuid_exchange) return 0;
+    struct s2a_vuid_context c = {.kind = S2A_VUID_COMPILE, .bound = (uint8_t)(1u << st)};
+    c.sequence = s2a_vuid_next ? s2a_vuid_next() : 0;
+    if (key) { memcpy(c.keys[st], key, 8); c.stages = (uint8_t)(1u << st); }
+    s2a_vuid_exchange(&c, old); return 1;
+}
+#endif
+
 // 解析结果字节 + 建后端着色器与绑定布局（提交线程与预热带都会调；nvn_gpu_shader_load 契约允许 [后台]）。
 // identity 是这份程序的内容身份：写进 rp_prog.identity（管线配方 / 清单用它跨会话定位同一份程序）。
 static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_source_entry_view views[3], int nst,
@@ -854,7 +876,14 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
         nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
         src.blob = fp.stage[st].spirv; src.bytes = fp.stage[st].spirv_bytes; src.entry = "main"; src.layout = &L;
         nvn_gpu_err err = {0};
+#if defined(S2A_ANDROID_DEBUG_ENV)
+        struct s2a_vuid_context vuid_old; int vuid_scoped = vuid_compile_begin((unsigned)st, views[st].key, &vuid_old);
+#endif
         nvn_gpu_rc lr = nvn_gpu_shader_load(&src, &e->prog.sh[st], &err);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+        if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+        if (vuid_scoped && nvn_gpu_ok(lr) && views[st].key && s2a_vuid_note_shader) s2a_vuid_note_shader(e->prog.sh[st], (unsigned)st, views[st].key);
+#endif
         if (!nvn_gpu_ok(lr)) { red_load(lr, &src, "shader_load_failed", err.why); e->failed = 1; }
         if (views[st].c1 && views[st].c1_bytes >= 0x100) { memcpy(e->prog.c1[st], views[st].c1, 0x100); e->prog.c1_ok |= (uint8_t)(1u << st); }
     }
@@ -1167,8 +1196,13 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     const int compute = rec->stage_mask == 32u;
     struct s2a_source_entry_view views[3];
     memset(views, 0, sizeof views);
-    for (int st = 0; st < nst && st < 3; st++)
+    for (int st = 0; st < nst && st < 3; st++) {
+        // Older manifests may lack a key. Do not turn an absent all-zero key
+        // into a precise attribution; the result identity is not a stage key.
+        static const uint8_t zero[8] = {0};
+        if (memcmp(rec->keys[st], zero, 8)) views[st].key = rec->keys[st];
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = NVK_PROG_REC_C1_BYTES; }
+    }
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
                                 compute ? 0 : nst, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, &pc, &bytes, &len)) {
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity) : build(bytes, len, views, nst, rec->identity);
@@ -1415,7 +1449,8 @@ static int shader_resolve_graphics(const struct rp_shader_req *q, const struct r
     if (nst == 3) {
         nvn_gpu_caps caps = {0}; nvn_gpu_caps_get(&caps);
         if (!(caps.caps & NVN_GPU_CAP_GEOMETRY)) { nvn_unimpl("shader", "geometry_not_enabled", NULL); return -1; }
-        if (q->prim != 0 && q->prim != 1 && q->prim != 4) { nvn_unimpl("shader", "geometry_topology_unimplemented", NULL); return -1; }
+        // q->prim 是 NVN 原图元：不带索引、非间接的三角带（5）由核心展开成三角形列表给 GS（rp_draw gs_tstrip_expand）
+        if (q->prim != 0 && q->prim != 1 && q->prim != 4 && q->prim != 5) { nvn_unimpl("shader", "geometry_topology_unimplemented", NULL); return -1; }
     }
     for (uint32_t st2 = 0; st2 < 5; st2++) if ((stages >> st2 & 1) && !rp_shader_stage_key(st2, NULL)) { nvn_unimpl("shader", "stage_key_missing", NULL); return -1; }
     if (!shader_texture_pool_ready()) return -1;
@@ -1651,7 +1686,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
         if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("compute_program_parse_failed", why);
         e->failed = 1; return e;
     }
-    e->prog.support_bytes = cp.support_bytes;
+    e->prog.support_bytes = cp.support_bytes; e->prog.spill_bytes = cp.spill_bytes;
     for (int i = 0; i < cp.binding_count && !e->failed; i++) {
         const struct fd_binding *b = &cp.bindings[i];
         if (e->prog.nent[0] == RP_PROG_ENT_MAX) { red1("too_many_bindings", "cs"); e->failed = 1; break; }
@@ -1688,7 +1723,14 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[0]; L.nent = e->prog.nent[0]; L.support_bytes = cp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src ss = {0}; ss.stage = NVN_GPU_SH_CS; ss.kind = NVN_GPU_BLOB_SPIRV; ss.blob = cp.stage.spirv; ss.bytes = cp.stage.spirv_bytes; ss.entry = "main"; ss.layout = &L;
         nvn_gpu_err err = {0};
+#if defined(S2A_ANDROID_DEBUG_ENV)
+        struct s2a_vuid_context vuid_old; int vuid_scoped = vuid_compile_begin(5, src->key, &vuid_old);
+#endif
         nvn_gpu_rc lr = nvn_gpu_shader_load(&ss, &e->prog.sh[0], &err);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+        if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+        if (vuid_scoped && nvn_gpu_ok(lr) && src->key && s2a_vuid_note_shader) s2a_vuid_note_shader(e->prog.sh[0], 5, src->key);
+#endif
         if (!nvn_gpu_ok(lr)) { red_load(lr, &ss, "compute_shader_load_failed", err.why); e->failed = 1; }
         if (src->c1 && src->c1_bytes >= 0x100) { memcpy(e->prog.c1[0], src->c1, 0x100); e->prog.c1_ok |= 1; }
     }
