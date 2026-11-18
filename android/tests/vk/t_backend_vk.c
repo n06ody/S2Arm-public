@@ -57,6 +57,7 @@ static int g_compute_warm = -1;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
+static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
 static atomic_int g_c207_gputime, g_c207_cap;   // 别的线程（回放 / 完成 / 录制）也会调 nvn_plat_flag / nvn_plat_log：这两个用原子读写
 static char g_c207_win[12][512]; static int g_c207_nwin;   // 下面几个只由绘制 / 呈现所在的（测试）线程写
 static int g_c207_nlog, g_c207_badlog; static char g_c207_firstbad[512];
@@ -66,6 +67,8 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_csd") || !strcmp(name, "nvk_pass_detail")) return getenv("S2A_TEST_GPU_DIAG_ON") ? 1 : dflt;
+    if (!strcmp(name, "nvk_gputime") && getenv("S2A_TEST_GPU_DIAG_ON")) return 1;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
@@ -95,6 +98,17 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && strstr(text, "csf dispatch_time")) {
+        atomic_fetch_add(&g_diag_csd_logs, 1);
+        if (strstr(text, "seq=101") && strstr(text, "key=0000000000001234") && strstr(text, "groups=11,1,1") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_diag_csd_match, 1);
+        if (strstr(text,"seq=101") && strstr(text,"before_full=1") && strstr(text,"after_full=1") && strstr(text,"before_guest=0x8") && strstr(text,"after_guest=0x20")) atomic_fetch_add(&g_diag_barrier_match, 1);
+        if (strstr(text,"seq=102") && strstr(text,"groups_known=0") && strstr(text,"source=completed_query")) atomic_fetch_add(&g_diag_indirect_match, 1);
+        if (strstr(text,"seq=103") && strstr(text,"source=unavailable") && strstr(text,"reason=fence_failed_or_not_submitted")) atomic_fetch_add(&g_diag_failed_match, 1);
+    }
+    if (text && strstr(text, "gpu pass_detail")) {
+        atomic_fetch_add(&g_diag_pass_logs, 1);
+        if (strstr(text, "size=4x4") && strstr(text, "draws=0") && strstr(text, "load=1") && strstr(text, "store=0") && strstr(text, "format=")) atomic_fetch_add(&g_diag_pass_match, 1);
+    }
     if (text && strstr(text, "msaa_fallback:")) {
         if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
         if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
@@ -10321,6 +10335,58 @@ static void c1072_pipe_guard(const char *dir) {
 
 #include "t_clear_capacity.inc"
 
+// Real backend, real queue completion and a real render pass.  The weak hook lets
+// the pre-change binary run and fail at behavioral assertions, rather than link.
+static int gpu_diag_only(const char *dir) {
+    extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+    const int on = getenv("S2A_TEST_GPU_DIAG_ON") != NULL;
+    memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "gpu-diag-test";
+    if (!open_backend()) return 1;
+    nvn_gpu_layout_ent ent = {.cls=NVN_GPU_RES_SSBO,.access=NVN_GPU_ACC_W,.set=0,.binding=0,.count=1,.stages=1u<<NVN_GPU_SH_CS};
+    nvn_gpu_layout lay = {0}; lay.ent = &ent; lay.nent = 1; nvn_gpu_shader sh = NULL;
+    nvn_gpu_pipe cp = mk_cpipe(dir, "comp.comp", &lay, &sh);
+    uint32_t data[64] = {0}, args[3]={2,1,1}; nvn_gpu_buf buf = make_buf(sizeof data, NVN_GPU_MEM_SHARED, data);
+    nvn_gpu_buf indirect = make_buf(sizeof args, NVN_GPU_MEM_SHARED, args);
+    nvn_gpu_tex tex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex);
+    nvn_gpu_binding bind = {.ent=0,.cls=NVN_GPU_RES_SSBO}; bind.u.b.buf=buf; bind.u.b.len=sizeof data;
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_set_pipe(c, cp); nvn_gpu_bind(c, NVN_GPU_SH_CS, &bind, 1);
+    nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT);
+    if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c, 101, 0x1234);
+    nvn_gpu_dispatch(c, cp, 11, 1, 1, NULL, 0);
+    nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
+    if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,102,0x1234);
+    nvn_gpu_dispatch(c,cp,0,0,0,indirect,0);
+    nvn_gpu_pass_desc pass = {0}; pass.w=pass.h=4; pass.layers=1; pass.ncolor=1;
+    pass.color[0].view=view; pass.color[0].load=NVN_GPU_LOAD_CLEAR; pass.color[0].store=NVN_GPU_STORE_STORE;
+    nvn_gpu_pass_begin(c, &pass); nvn_gpu_pass_end(c);
+    nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e)), "gpu diag commit: %s", e.why);
+    CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "gpu diag fence: %s", e.why);
+    CHECK(atomic_load(&g_diag_csd_logs)==2*on && atomic_load(&g_diag_csd_match)==on,
+          "gpu diag selected dispatch query with exact key and groups: on=%d logs=%d match=%d", on, atomic_load(&g_diag_csd_logs), atomic_load(&g_diag_csd_match));
+    CHECK(atomic_load(&g_diag_barrier_match)==on, "gpu diag dispatch neighboring full and guest barriers: on=%d matched=%d", on, atomic_load(&g_diag_barrier_match));
+    CHECK(atomic_load(&g_diag_indirect_match)==on, "gpu diag indirect groups unknown without CPU proof: on=%d matched=%d",on,atomic_load(&g_diag_indirect_match));
+    CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,
+          "gpu diag empty pass attachment load/store detail: on=%d logs=%d match=%d", on, atomic_load(&g_diag_pass_logs), atomic_load(&g_diag_pass_match));
+    const uint32_t *result = (const uint32_t *)buf_cpu(buf); int bad=0;
+    for (int i=0; i<64; i++) if (!result || result[i] != (uint32_t)i+1) bad++;
+    CHECK(!bad, "gpu diag dispatch output: wrong=%d", bad);
+    if (on) {
+        int before=atomic_load(&g_ndone); c=begin_cmd(); nvn_gpu_set_pipe(c,cp); nvn_gpu_bind(c,NVN_GPU_SH_CS,&bind,1);
+        if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,103,0x1234);
+        nvn_gpu_dispatch(c,cp,1,1,1,NULL,0); nvn_gpu_vk_test_fail_fence(2);
+        CHECK(OK(nvn_gpu_cmd_commit(c,2,on_done,NULL,&e)),"gpu diag failed-fence submit");
+        CHECK(nvn_gpu_fence_wait(2,5000000000ull,&e).code==NVN_GPU_E_FAILED,"gpu diag failed fence");
+        const struct done_rec *done=wait_signal(2,before,5000);
+        CHECK(done && done->status==NVN_GPU_DONE_FAILED && atomic_load(&g_diag_failed_match)==1,"gpu diag failed query unavailable");
+        nvn_gpu_vk_test_fail_fence(0);
+    }
+    nvn_gpu_buf_release(indirect,NULL,NULL);
+    nvn_gpu_view_release(view); nvn_gpu_tex_release(tex); nvn_gpu_shader_release(sh); nvn_gpu_buf_release(buf,NULL,NULL);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "gpu diag close: %s", e.why);
+    printf("GPU_DIAG isolated on=%d failures=%d\n", on, g_fail);
+    return g_fail ? 1 : 0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -10351,6 +10417,7 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+    if (argc > 2 && !strcmp(argv[2], "--gpu-diag")) { int r = gpu_diag_only(argv[1]); s2a_vk_device_destroy(&g_dev, 1); return r; }
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;
