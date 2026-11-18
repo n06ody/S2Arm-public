@@ -33,7 +33,7 @@ CASES = (
     "raw", "worker", "copy", "replay", "gate_closed", "no_emit", "multi_emit",
     "success", "bad_method", "bad_coordinate", "trailing_message", "duplicate_key",
     "malformed", "timeout", "stop", "dedup", "pause_failure", "not_running",
-    "sampler_method", "buffer_method", "format_method", "escaped_message",
+    "sampler_method", "buffer_method", "format_method", "sampled_format_method", "escaped_message",
     "parser_missing", "stale_return", "thread_exit",
 )
 

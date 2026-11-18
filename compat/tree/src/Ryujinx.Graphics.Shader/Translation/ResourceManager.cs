@@ -456,6 +456,12 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 sampledType = _gpuAccessor.QueryTextureFormat(handle, cbufSlot).GetComponentType();
             }
+            else if (!isImage && type != SamplerType.None && arrayLength == 1)
+            {
+                // S2A: sampled images require the bound view's numeric type (VUID-07753).
+                // An array shares one declaration across its descriptors and cannot use one element's format.
+                sampledType = _gpuAccessor.QueryS2ASampledTextureFormat(handle, cbufSlot).GetComponentType();
+            }
 
             // S2A：存储 texel buffer 的 Image Format 与数值型分开（VUID-08737）：宿主支持无格式读
             // （写时还要求无格式写）时保持 Unknown——R16ui 等扩展格式要求 StorageImageExtendedFormats

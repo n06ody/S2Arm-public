@@ -615,6 +615,12 @@ namespace Ryujinx.Graphics.Shader
             return TextureFormat.R8G8B8A8Unorm;
         }
 
+        /// <summary>S2A: bound sampled-view format for numeric type selection; Unknown preserves the upstream float declaration.</summary>
+        TextureFormat QueryS2ASampledTextureFormat(int handle, int cbufSlot = -1)
+        {
+            return TextureFormat.Unknown;
+        }
+
         /// <summary>
         /// Queries transform feedback enable state.
         /// </summary>
