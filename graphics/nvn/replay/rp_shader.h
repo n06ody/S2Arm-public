@@ -35,7 +35,7 @@ struct rp_prog {
     uint8_t identity[32];
 };
 struct rp_shader_req {
-    uint32_t prim;              // NVNdrawPrimitive
+    uint32_t prim;              // NVNdrawPrimitive：游戏原图元（四边形等在核心展开之前的值；管线用展开后的，不经这里）
     int rt_count;               // 当前颜色目标个数
     uint32_t rt_format[8];      // 各颜色目标的 NVN 格式（视图改了格式的取视图的）；0 = 空槽
 };

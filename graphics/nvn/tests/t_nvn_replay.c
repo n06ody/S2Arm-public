@@ -2628,6 +2628,47 @@ static void t_pass_clear_park_read(void) {   // 被读之前必须落地（正�
     CHECK(p1[RP_PERF_P_PARK] == 1 && p1[RP_PERF_P_CLEARONLY] == 1);
     pass_fresh();
 }
+// #1581 M ②：分离贴图槽（句柄在 c2 分离贴图表、回放槽 128 + k，采样器在分离采样器槽）同样要在被读之前把挂起的清除落地，
+//   与组合槽（t_pass_clear_park_read）同一条红线；只差贴图槽的来源。
+static void t_pass_clear_park_read_separate(void) {
+    pass_fresh(); g_flag_clear_park = 1; g_flag_rt_cont = 1; g_resolve_rc = g_cresolve_rc = 0;
+    int g0 = g_gdraws;
+    tex_t a = mk_tex(178, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0), b = mk_tex(179, 0x4000, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+    samp_par sp; memset(&sp, 0, sizeof sp); nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
+    stream s = {0}; q_env(&s);
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX;
+    g_fprog.ent[1][0].src_reg = 128 + 5; g_fprog.ent[1][0].src_reg2 = 2; g_fprog.ent[1][0].count = 1;   // 片元：分离贴图槽 5 + 分离采样器槽 2
+    g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1;
+    put_set_rt(&s, &a, NULL);
+    p_clear_color *cc = put(&s, OP_CLEAR_COLOR, sizeof *cc); cc->index = 0; cc->mask = 0xf; cc->rgba[0] = 0.5f;   // 清 A：挂起
+    put_set_rt(&s, &b, NULL);
+    p_bind_handles *bh = put(&s, OP_BIND_TEX, sizeof *bh); bh->stage = 1; bh->first = 128 + 5; bh->n = 1; bh->h[0] = 7;   // 分离贴图句柄：只有贴图号
+    p_bind_handles *bs = put(&s, OP_BIND_SAMP, sizeof *bs); bs->stage = 1; bs->first = 2; bs->n = 1; bs->h[0] = 3u << 20;
+    q_draw(&s);
+    end(&s);
+    submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws - g0 == 1 && nvn_unimpl_kinds() == 0);
+    CHECK(g_npd == 2 && g_pass_ends == 2);             // ① A 的纯清除（读之前落地）② B 的绘制
+    CHECK(g_pd[0].w == 16 && g_pd[0].color[0].load == NVN_GPU_LOAD_CLEAR && g_pd[0].color[0].clear.f[0] == 0.5f);   // 落地通道在绘制通道之前
+    CHECK(g_pd[1].w == 64 && g_pd[1].h == 36 && g_pd[1].color[0].view != NULL);
+    g_fprog.ent[1][0].src_reg2 = UINT16_MAX;
+    pass_fresh();
+}
+// #1581 M ①：四边形 / 四边形带在核心里展开成三角形画，交给着色器来源的仍是 NVN 原图元（rp_shader_req.prim 注明 NVNdrawPrimitive）：
+//   着色器来源据此给编译器 halvePrimitiveId（同 Ryujinx GpuChannelGraphicsState：不支持四边形的宿主、无 GS、Quads / QuadStrip）。管线拿展开后的图元。
+static void t_quad_req_prim(void) {
+    pass_fresh(); g_resolve_rc = 0;
+    static const struct { uint32_t prim, count, pipe_prim; } k[] = {{7, 8, 4}, {8, 8, 5}, {4, 6, 4}};
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        int g0 = g_gdraws;
+        stream s = {0}; q_env(&s);
+        p_draw *d = put(&s, OP_DRAW, sizeof *d); d->prim = (int)k[i].prim; d->count = (int)k[i].count; d->instances = 1;
+        end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_gdraws - g0 == 1);
+        CHECK(g_last_req.prim == k[i].prim && g_last_pdesc.prim == k[i].pipe_prim);
+    }
+    pass_fresh();
+}
 // GS 资源变化必须重新取变体；需要拆分的图元不能当原生 GS 输入。
 static void t_gs_dirty_and_topology(void) {
     pass_fresh(); g_gdraws = g_resolves = g_resolve_rc = 0;
@@ -2651,7 +2692,7 @@ static void t_gs_dirty_and_topology(void) {
     { stream u = {0}; p_draw *ts = put(&u, OP_DRAW, sizeof *ts); ts->prim = 5; ts->first = 7; ts->count = 4; ts->instances = 32; ts->base_instance = 3;
       end(&u); submit1(&u); fake_complete(NVN_GPU_DONE_OK);
       CHECK(g_gdraws == 3 && nvn_unimpl_count("draw", "geometry_topology_unimplemented") == 1);
-      CHECK(g_last_da.prim == 4 && g_last_pdesc.prim == 4 && g_last_req.prim == 4 && g_last_pdesc.prim_restart == 0);
+      CHECK(g_last_da.prim == 4 && g_last_pdesc.prim == 4 && g_last_req.prim == 5 && g_last_pdesc.prim_restart == 0);   // 着色器来源拿原图元（三角带），管线拿展开后的列表
       CHECK(g_last_da.itype == 2 && g_last_da.ibuf == &g_arena_buf && g_last_da.count == 6 && g_last_da.base_vertex == 7 && g_last_da.first == 0);
       CHECK(g_last_da.instances == 32 && g_last_da.base_instance == 3);
       { const uint32_t e[6] = {0, 1, 2, 2, 1, 3}; CHECK(g_last_da.count == 6 && !memcmp(g_arena + g_last_da.ioff, e, sizeof e)); } }
@@ -4679,6 +4720,12 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
       CHECK(g_gdraws == g1 + 1 && g_nfb[1] == 10 && v7 && v9 && v7 != v9);
       // 槽 1（这里绑的）→ 第 5 项，槽 5（本用例开头绑的）→ 第 9 项，都是贴图 7；其余读作池里第 0 项
       for (uint32_t k = 0; k < 10 && g_nfb[1] == 10; k++) CHECK(g_fb[1][k].ent == 0 && g_fb[1][k].elem == k && g_fb[1][k].u.ts.samp != NULL && g_fb[1][k].u.ts.view == (k == 5 || k == 9 ? v7 : v9));
+      // #1581 M：从组合槽 0（c2 第 8 字 = 句柄表第 4 项）起的 6 项数组（sampler2D tex[6]）：第 k 项 = 组合槽 k；槽 1、槽 5 是贴图 7
+      g_fprog.ent[1][0].count = 6; g_fprog.ent[1][0].src_reg = 4; rp_dirty_all();
+      stream a4 = {0}; di = put(&a4, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->count = 3; di->ibuf = base + 3 * PG; end(&a4);
+      g1 = g_gdraws; submit1(&a4); fake_complete(NVN_GPU_DONE_OK);
+      CHECK(g_gdraws == g1 + 1 && g_nfb[1] == 6);
+      for (uint32_t k = 0; k < 6 && g_nfb[1] == 6; k++) CHECK(g_fb[1][k].ent == 0 && g_fb[1][k].elem == k && g_fb[1][k].u.ts.view == (k == 1 || k == 5 ? v7 : v9));
       g_fprog.ent[1][0].count = 0; g_fprog.ent[1][0].src_reg = 5; nvn_be_tex_release(&tb); }
     // 正面绕序：接口值 + 建队列时定的光栅翻转位 → y 朝上的规范化设备坐标里的绕序；窗口原点一并进管线描述
     { stream w1 = {0}; by = put(&w1, OP_BIND_STATE, sizeof *by); by->kind = 4; poly_st pw = {NVN_FACE_BACK, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0}; memcpy(by->bytes, &pw, sizeof pw);
@@ -4709,8 +4756,8 @@ static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管
     stream x = {0}; p_bind_state *bs = put(&x, OP_BIND_STATE, sizeof *bs); bs->kind = 4; poly_st po = {NVN_FACE_FRONT, NVN_FRONT_FACE_CW, NVN_POLYGON_MODE_FILL, 0}; memcpy(bs->bytes, &po, sizeof po);
     di = put(&x, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->count = 3; di->ibuf = base + 3 * PG; end(&x);
     submit1(&x); fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_gdraws == d0 + 19);   // 新拓扑6笔 + 点模式1笔成功 + #977 重启值改写 3 笔；不支持的线模式不绘制
-    uint64_t dr_n = 0, sk_n = 0; rp_draw_stats(&dr_n, &sk_n); CHECK(dr_n == 22 && sk_n == 5);   // #977 间接 + 非全 1 重启值跳过 1 笔
+    CHECK(g_gdraws == d0 + 20);   // 新拓扑6笔 + 点模式1笔成功 + #977 重启值改写 3 笔 + 从组合槽起的贴图数组 1 笔；不支持的线模式不绘制
+    uint64_t dr_n = 0, sk_n = 0; rp_draw_stats(&dr_n, &sk_n); CHECK(dr_n == 23 && sk_n == 5);   // #977 间接 + 非全 1 重启值跳过 1 笔
     g_resolve_rc = 0; t_draw_mdi(); t_draw_ind_binst();   // 间接计数多绘：放在 t_draw 末尾、池和贴图还没释放时，沿用同一套绑定（它多画的几笔不扰动上面按笔数的断言）
     g_resolve_rc = 0; nvn_be_tex_release(&rtt); nvn_be_tex_release(&tx); nvn_be_pool_del(g_pmem); pass_fresh();
 }
@@ -5164,6 +5211,8 @@ int main(int argc, char **argv) {
     t_pass_clear_park();
     t_pass_clear_park_tail();
     t_pass_clear_park_read();
+    t_pass_clear_park_read_separate();
+    t_quad_req_prim();
     t_fmt_filter_blend();
     t_clear_rect();
     t_report_counter();
