@@ -368,6 +368,8 @@ s2a_gate_step "$PY" "$android_dir/tests/compile_export_w2_test.py"
 # kindCheck 调试开关只走请求 JSON（DirectShaderCompiler.cs:39 只读 JSON、不读进程 env）：默认构建不带该键，
 # 调试门开 + debug.s2a.kind_check=0 才写 "kindCheck":false；撤成 execute 里 setenv 或删掉该键必须红（宿主 C 编译，秒级）。
 s2a_gate_step "$PY" "$android_dir/tests/direct_compile_request_host_test.py"
+# 现编时翻译器崩溃留下输入（#1501 D②）：崩溃线程正在编的请求原样落 compile-inflight-<pid>-<槽>.log；crash.c 安卓分支弱引用调（宿主 C 编译，秒级）。
+s2a_gate_step "$PY" "$android_dir/tests/compile_inflight_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_compute_integration_test.py"
 # W2 single missing coordinate: standalone synthetic host contract, no provider/device wiring.
 s2a_gate_step "$PY" "$android_dir/tests/w2_single_query_test.py"
@@ -395,6 +397,8 @@ s2a_gate_step bash "$android_dir/tools/nvk_pipe_flight_test.sh"
 # 首用待定表（纯逻辑）与 demand 后台建管线（fake Vulkan）：状态机 / 同键合并 / 有界等待 / late-stuck / P0 不串管线。
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_pend_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvn_vk_pipe_demand_test.sh"
+# 新层首用管线异步的绘制级用例：真 rp_draw / rp_pass + 真 demand / 待定表 / 判定表，可控建管线闸（跳 / 等 / 预算 / 上限 / 停局丢弃）。
+s2a_gate_step bash "$android_dir/tools/nvk_pipe_async_draw_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvk_shader_lease_test.sh"
 # 按结果合并（#1355 方案 A）：编译结果相同（结果摘要 + 负载长度 + 阶段数 + c1 有无与内容都相同）的身份共用一份
 # 着色器记录与句柄、管线随之合并；真 program_cache.c + 真缓存文件，ASan 下覆盖「收尾后不留悬空」。

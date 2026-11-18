@@ -27,8 +27,13 @@ namespace S2A.DirectCompiler
         public const string ContentContract = "s2a-direct-program-content-v1";
         public const int MaxRequestBytes = 256 << 20;
 
+        [ThreadStatic] private static string _requestSha;
+        private static string RequestSha() => _requestSha ?? "unknown";
+
         public static byte[] Compile(byte[] requestUtf8)
         {
+            // 诊断：拒收行带上请求 sha，真机上就能把拒收与同一条请求对上（不用另开请求落盘开关）。
+            _requestSha = Convert.ToHexStringLower(Sha256.HashData(requestUtf8));
             using JsonDocument document = JsonStrict.Parse(requestUtf8, MaxRequestBytes);
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
@@ -77,9 +82,9 @@ namespace S2A.DirectCompiler
             var allocator = new DirectAllocator(profile);
             var accessors = new List<DirectGpuAccessor>();
             var translated = new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>();
-            using var context = new GpuContext(new ProfileOnlyRenderer(profile.Caps), new DirtyHacks(Array.Empty<ulong>()))
+            using var context = new GpuContext(new ProfileOnlyRenderer(profile.TranslationCaps), new DirtyHacks(Array.Empty<ulong>()))
             {
-                Capabilities = profile.Caps,
+                Capabilities = profile.TranslationCaps,
             };
             try
             {
@@ -90,6 +95,21 @@ namespace S2A.DirectCompiler
                     var accessor = new DirectGpuAccessor(profile, program, cs, 0, allocator, queries);
                     accessors.Add(accessor);
                     ShaderProgram shader = ShaderCache.DecodeComputeShader(accessor, TargetApi.Vulkan, 0).Translate();
+                    int limit = profile.Caps.MaximumComputeSharedMemorySize;
+                    if (shader.BinaryCode != null && program.Compute.SharedMemoryBytes > limit)
+                    {
+                        int shared = DirectSharedSpill.WorkgroupBytes(shader.BinaryCode);
+                        if (shared < 0 || shared > limit)
+                        {
+                            // 先量出要挪的字节数再占绑定号：Rewrite 用的就是这一号
+                            int spilled = shared < 0 ? 0 : shared;
+                            var pair = allocator.Spill("cs", 0);
+                            DirectSharedSpill.Result spill = DirectSharedSpill.Rewrite(shader.BinaryCode, limit, pair.SetIndex, pair.Binding)
+                                ?? throw new DirectCompileException("UNSUPPORTED_PROGRAM", "cs: shared memory " + spilled + " bytes could not be measured for spilling");
+                            allocator.Bindings[^1].SpillBytesPerGroup = spill.BytesPerGroup;
+                            shader = new ShaderProgram(shader.Info, shader.Language, spill.Spirv);
+                        }
+                    }
                     translated.Add((cs, shader, accessor));
                 }
                 else
@@ -149,8 +169,8 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control local size contains zero");
             if ((ulong)x * y * z > 1024)
                 throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control local size exceeds 1024 invocations");
-            if (shared > 0x10000)
-                throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control shared memory exceeds 64 KiB");
+            if (shared > 48 * 1024)
+                throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control shared memory exceeds 48 KiB");
             uint aligned = (shared + 15u) / 16u * 16u;
             if (x != (uint)facts.LocalSizeX || y != (uint)facts.LocalSizeY || z != (uint)facts.LocalSizeZ ||
                 aligned != (uint)facts.SharedMemoryBytes)
@@ -361,9 +381,23 @@ namespace S2A.DirectCompiler
                     bool c2Image = binding.Kind == "image" && resolved.CbufSlot == 2 && resolved.HandleIndex >= 72 && resolved.HandleIndex < 88 &&
                                    (resolved.HandleIndex & 1) == 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
                                    entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot);
-                    if (!handleTableArray && !c2Image && (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
+                    // 单值贴图句柄直接从 c2 句柄表读（运行时句柄 / 游戏自己的句柄表）：翻译阶段已经靠同字
+                    // 事实拿到了类型与格式；这里按句柄值当槽位交给回放（解析器换算 slot = (handle − 8) / 2）。
+                    // 数组仍只认 HandleIndex == 0 的整表数组（非零起点的数组回放侧还没有消费口径）。
+                    bool c2SingleHandle = binding.Kind == "texture" && resolved.CbufSlot == 2 &&
+                                          resolved.HandleIndex >= 0 && binding.Count == 1 && resolved.ArrayLength <= 1 &&
+                                          entry.accessor.HasTextureFact(resolved.HandleIndex, resolved.CbufSlot);
+                    // 计算阶段的 c2 句柄表数组：编译先放行，回放侧现在按具名 skip "compute_texture_array" 计数
+                    // （C3 接池表消费）；图形数组仍只认 HandleIndex == 0 的整表数组。
+                    bool c2ComputeArray = binding.Kind == "texture" && resolved.CbufSlot == 2 && binding.Stage == "cs" &&
+                                          resolved.HandleIndex >= 0 && binding.Count > 1 &&
+                                          binding.Count == resolved.ArrayLength;
+                    if (!handleTableArray && !c2Image && !c2SingleHandle && !c2ComputeArray &&
+                        (binding.Kind != "texture" || !entry.accessor.HasDirectTextureFact(resolved.HandleIndex, resolved.CbufSlot)))
                         throw new DirectCompileException("UNSUPPORTED_PROGRAM",
-                            binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot + " is not implemented");
+                            binding.Stage + ": texture handle from cbuf slot " + resolved.CbufSlot +
+                            " is not implemented (handle=" + resolved.HandleIndex + ", arrayLength=" + resolved.ArrayLength +
+                            ", count=" + binding.Count + ", request=" + RequestSha() + ")");
                 }
                 if (resolved.Separate)
                     throw new DirectCompileException("UNSUPPORTED_PROGRAM",
@@ -566,6 +600,7 @@ namespace S2A.DirectCompiler
                     writer.WriteNumber("count", binding.Count);
                     if (binding.Slot >= 0) writer.WriteNumber("slot", binding.Slot);
                     if (binding.SamplerSlot >= 0) writer.WriteNumber("samp_slot", binding.SamplerSlot);
+                    if (binding.Kind == "spill") writer.WriteNumber("bytesPerGroup", binding.SpillBytesPerGroup);
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段

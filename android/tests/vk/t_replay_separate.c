@@ -6,6 +6,7 @@
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "nvn_unimpl.h"
 static p_set_rt target; static tex_t target_tex; static nvn_gpu_view target_view;
 int g_s2a_logfd = 2; int s2a_nvn_rast_flip;

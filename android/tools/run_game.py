@@ -1078,7 +1078,11 @@ def write_frames(out, caps, notes, raw_text, window_us=None):
             "cover": cover, "rows": rows, "captures": len(caps)}
 
 
-PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log)$")
+PRIV_LOG_NAME = re.compile(r"^(?:host-(\d+)-(\d+)-[A-Za-z0-9]+\.log|frame-log-(\d+)\.log"
+                           r"|compile-inflight-(\d+)-\d+\.log)$")
+# compile-inflight-<pid>-<槽>.log（android/native/direct/compile_request.c）：现编时崩溃，崩溃线程正在编的那份请求原样落盘；
+#   首行 `[s2a] compile-inflight v1 pid=<pid> … uuid=<本局 session_uuid>`，之后是请求 JSON。只在崩了的局里有。
+PRIV_INFLIGHT_HEAD = re.compile(rb"^\[s2a\] compile-inflight v1 pid=(\d+) [^\n]*? uuid=(\S+)\n")
 # host-*.log 首行（os.c s2a_android_session_log_start 的 dprintf）：
 #   [s2a] Android 会话日志：session=<seg> pid=<pid> file=<path>
 # 名实互核：文件名 <seg>/<pid> 与首行写明的对不上 = 改名/拼接过的文件，不证归属。
@@ -1126,7 +1130,7 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
     for path in sorted(ln.strip() for ln in found.splitlines() if ln.strip()):
         m = PRIV_LOG_NAME.match(path.rsplit("/", 1) [-1])
         if m:
-            candidates.append((path, int(m.group(2) or m.group(3))))
+            candidates.append((path, int(m.group(2) or m.group(3) or m.group(4))))
     if pids:
         candidates = [c for c in candidates if c[1] in pids]
         if not candidates:
@@ -1212,6 +1216,12 @@ def collect_private_logs(d, pkg, pids, out, notes, birth_walls=None,
             elif name.startswith("frame-log-"):
                 um = PRIV_FRAME_UUID.search(r.stdout[:8192])
                 file_uuid = um.group(1).decode(errors="replace") if um else None
+            elif name.startswith("compile-inflight-"):
+                hm = PRIV_INFLIGHT_HEAD.match(r.stdout[:4096])
+                if hm is None or int(hm.group(1)) != pid:
+                    attr = "首行 pid 与文件名对不上（或首行缺）"
+                else:
+                    file_uuid = hm.group(2).decode(errors="replace")
             if attr is None and file_uuid != session_uuid:
                 attr = ("文件内容没有 session_uuid 字段（旧构建/属性没置上）：本局身份未证"
                         if file_uuid is None else

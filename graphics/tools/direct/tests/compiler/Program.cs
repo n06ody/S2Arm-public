@@ -86,6 +86,18 @@ internal static unsafe class Program
         }
         return b;
     }
+    // STS / LDS [RZ + imm], B32（InstSts / InstLds：Rd 0..7、Ra 8..15、Imm24 20..43、LsSize 48..50 = B32 4）；BAR.SYNC 0（InstBar，BarOp Sync = 0）
+    private static ulong Sts(int reg, int offset) => 0xEF58000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private static ulong Lds(int reg, int offset) => 0xEF48000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private const ulong BarSync = 0xF0A8000000000000UL | (7UL << 16) | (0xFFUL << 8);
+    // 计算核（没有着色器头）：每 3 条指令前一个调度字，末尾 EXIT 加自跳转
+    private static byte[] ComputeOps(params ulong[] ops)
+    {
+        var all = new List<ulong>(ops) { Exit, 0xE2400FFFFF07000FUL };
+        var words = new List<ulong>();
+        for (int i = 0; i < all.Count; i += 3) { words.Add(Sched); for (int j = 0; j < 3; j++) words.Add(i + j < all.Count ? all[i + j] : 0x50B0000000070F00UL); }
+        return MemoryMarshal.AsBytes(words.ToArray().AsSpan()).ToArray();
+    }
     private static byte[] ComputeGuest() => MemoryMarshal.AsBytes(new ulong[] { Sched, Exit, 0x50B0000000070F00UL, 0xE2400FFFFF07000FUL }.AsSpan()).ToArray();
 
     // 原创合成 Maxwell GS：普通（非 passthrough）几何阶段，读写 loc0，发出顶点并结束图元。
@@ -317,6 +329,21 @@ internal static unsafe class Program
             i += count;
         }
         return (format, ints.TryGetValue(sampledType, out uint signed) && signed == 0, images);
+    }
+
+    private static bool SampledImageType(byte[] spv, int wantedOp, int wantedSigned)
+    {
+        var types = new Dictionary<uint, (int Op, int Signed)>(); int images = 0, match = 0;
+        for (int i = 5; i * 4 < spv.Length;)
+        {
+            uint w0 = BitConverter.ToUInt32(spv, i * 4); int op = (int)(w0 & 0xffff), n = (int)(w0 >> 16);
+            if (n == 0 || (i + n) * 4 > spv.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            if (op == 21) types[BitConverter.ToUInt32(spv, (i + 1) * 4)] = (21, (int)BitConverter.ToUInt32(spv, (i + 3) * 4));
+            if (op == 22) types[BitConverter.ToUInt32(spv, (i + 1) * 4)] = (22, -1);
+            if (op == 25) { images++; if (types.TryGetValue(BitConverter.ToUInt32(spv, (i + 2) * 4), out var t) && t.Op == wantedOp && t.Signed == wantedSigned) match++; }
+            i += n;
+        }
+        return images == 1 && match == 1;
     }
 
     // 原创合成 Maxwell CS：R0 = c0[0x310]（存储缓冲地址），R4 = R5 = 0，SULD.D.B32 R2, [R4]（二维、图像句柄 c2 字 74，按位读），STG [R0], R2。
@@ -563,7 +590,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -593,7 +620,7 @@ internal static unsafe class Program
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x748), cx);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x74C), 1);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x750), 1);
-                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), 0);
+                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), sharedBytes);
                 // 让 controlX=0 明确产生非法控制段；其它情况如实填写。
                 WriteStage(w, "cs", overrideCode ?? cs, csCbUse, control);
             }
@@ -635,7 +662,7 @@ internal static unsafe class Program
                 w.WriteNumberValue(localSize); w.WriteNumberValue(1); w.WriteNumberValue(1);
                 w.WriteEndArray();
                 w.WriteNumber("localMemoryBytes", 0);
-                w.WriteNumber("sharedMemoryBytes", 0);
+                w.WriteNumber("sharedMemoryBytes", (sharedBytes + 15) / 16 * 16);
                 w.WriteBoolean("hasUnalignedStorageBuffer", false);
                 w.WriteEndObject();
             }
@@ -687,7 +714,34 @@ internal static unsafe class Program
 
     private static void Main(string[] args)
     {
+        string sampledSpvDir = args.Length == 2 && args[0] == "--emit-sampled" ? Path.GetFullPath(args[1]) : null;
+        if (sampledSpvDir != null) Directory.CreateDirectory(sampledSpvDir);
+        // GPU oracle: transform the exact reference shader with production code.
+        if (args.Length == 4 && args[0] == "--spill-spirv")
+        {
+            try
+            {
+                var spillResult = DirectSharedSpill.Rewrite(File.ReadAllBytes(args[1]), int.Parse(args[3]), 0, 1);
+                if (spillResult == null) throw new DirectCompileException("UNSUPPORTED_PROGRAM", "fixture did not require a spill");
+                File.WriteAllBytes(args[2], spillResult.Spirv);
+                Console.WriteLine($"spill bytes/group={spillResult.BytesPerGroup} remaining={spillResult.RemainingSharedBytes} set={spillResult.Set} binding={spillResult.Binding}");
+                return;
+            }
+            catch (DirectCompileException e) { Console.Error.WriteLine($"{e.Code}: {e.Message}"); Environment.Exit(1); }
+        }
         byte[] profile = ProfileJson();
+        using (JsonDocument profileDoc = JsonDocument.Parse(profile))
+        {
+            var limits = DirectProfile.Parse(profileDoc.RootElement, "spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 32768 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 49152,
+                  "spill keeps physical 32 KiB separate from translation 48 KiB");
+        }
+        using (JsonDocument largeProfileDoc = JsonDocument.Parse(Encoding.UTF8.GetString(profile).Replace("\"maximumComputeSharedMemorySize\":32768", "\"maximumComputeSharedMemorySize\":65536")))
+        {
+            var limits = DirectProfile.Parse(largeProfileDoc.RootElement, "large-spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 65536 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 65536,
+                  "translation limit preserves devices above 48 KiB");
+        }
         byte[] vs = Guest(false, new[] { Ast(0) });
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
@@ -760,6 +814,35 @@ internal static unsafe class Program
             return;
         }
 
+        // 真实编译器输出：采样图像的 OpTypeImage Sampled Type 应与绑定视图数值类型一致。
+        foreach (var test in new[] { (Format: "R16G16Uint", Op: 21, Signed: 0), (Format: "R16G16Sint", Op: 21, Signed: 1),
+                                     (Format: "R16G16Float", Op: 22, Signed: -1), (Format: "R16G16Unorm", Op: 22, Signed: -1) })
+        {
+            string fact = "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"" + test.Format + "\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            using JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "sampled-" + test.Format,
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2) }), textureFacts: fact)));
+            byte[] spv = Convert.FromBase64String(doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetString());
+            if (sampledSpvDir != null) File.WriteAllBytes(Path.Combine(sampledSpvDir, test.Format + ".spv"), spv);
+            Check(SampledImageType(spv, test.Op, test.Signed), "sampled texture " + test.Format + " declares its numeric type");
+            var formatQueries = doc.RootElement.GetProperty("content").GetProperty("dependencies").EnumerateArray()
+                .Where(d => d.GetProperty("method").GetString() == "QueryS2ASampledTextureFormat").ToArray();
+            Check(formatQueries.Length == 1 && formatQueries[0].GetProperty("value").GetString() == test.Format,
+                "sampled texture " + test.Format + " records its format dependency");
+        }
+        {
+            // 分离贴图表的 c2 字 0x5c：与日志里的 fp_t_tcb_5C 相同的句柄坐标。
+            const string fact = "[{\"stage\":\"fs\",\"handle\":92,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"R16G16Uint\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            using JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "sampled-separate-c2-5c",
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, 92) }), textureFacts: fact)));
+            var deps = doc.RootElement.GetProperty("content").GetProperty("dependencies").EnumerateArray()
+                .Where(d => d.GetProperty("method").GetString() == "QueryS2ASampledTextureFormat").ToArray();
+            Check(deps.Length == 1 && deps[0].GetProperty("value").GetString() == "R16G16Uint",
+                "sampled c2 separate word 0x5c uses its uint format fact");
+            byte[] spv = doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetBytesFromBase64();
+            Check(SampledImageType(spv, 21, 0), "sampled c2 separate word 0x5c declares uint");
+            if (sampledSpvDir != null) File.WriteAllBytes(Path.Combine(sampledSpvDir, "c2-5c.spv"), spv);
+        }
+
         // A large pool must not prevent a program with constant texture handles from compiling.
         {
             byte[] fsConstant = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2) });
@@ -795,8 +878,11 @@ internal static unsafe class Program
                 Check(false, "runtime handle must not claim an unsupported cbuf layout is usable");
             }
             catch (DirectCompileException error) {
-                Check(error.Code == "UNSUPPORTED_PROGRAM" && error.Message.Contains("texture handle from cbuf slot 0"),
-                    "runtime handle reports its actual upstream cbuf limitation: " + error.Message);
+                string reqSha = Convert.ToHexStringLower(Sha256.HashData(Encoding.UTF8.GetBytes(dynamicRequest)));
+                Check(error.Code == "UNSUPPORTED_PROGRAM" && error.Message.Contains("texture handle from cbuf slot 0") &&
+                      error.Message.Contains("handle=") && error.Message.Contains("arrayLength=") &&
+                      error.Message.Contains("count=") && error.Message.Contains("request=" + reqSha),
+                    "runtime handle reports its actual upstream cbuf limitation with shape and request sha: " + error.Message);
             }
         }
 
@@ -862,6 +948,24 @@ internal static unsafe class Program
                 UboFact(256, 5) + "]", 1u << 4);
             Check(got.StartsWith("MISSING_FACT ", StringComparison.Ordinal) && got.EndsWith("has no source (stage=fs,handle=256,cbufSlot=4)", StringComparison.Ordinal),
                 "a c4 handle without its exact fact is MISSING_FACT at (fs, 256, 4): " + got);
+        }
+
+        // C2 探针：c2 句柄表里的运行时句柄（先看现实现拒在哪一句）。
+        {
+            byte[] fsC2 = Guest(true, new[] { Ldc(4, 0x20, 2), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            const string c2Fact = "[{\"stage\":\"fs\",\"handle\":8,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            try
+            {
+                using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "c2-runtime-handle", vs, fsC2, textureFacts: c2Fact)));
+                JsonElement c2Binding = r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                    .First(b => b.GetProperty("kind").GetString() == "texture");
+                Check(c2Binding.GetProperty("slot").GetInt32() == 8 && c2Binding.GetProperty("count").GetInt32() == 1,
+                    "c2 handle-table single texture binds by handle value: " + c2Binding.GetRawText());
+            }
+            catch (DirectCompileException error)
+            {
+                Check(false, "c2 handle-table single texture binds by handle value: " + error.Code + " " + error.Message);
+            }
         }
 
         // 1) 接口全覆盖（接口新增方法时这里先红）。
@@ -1346,6 +1450,83 @@ internal static unsafe class Program
                   content.GetProperty("stages")[0].GetProperty("stage").GetString() == "cs", "compute stage");
         }
 
+        // 5b) 共享内存超过设备上限（profile 32 KB）：最大的线程组数组挪到存储缓冲（DirectSharedSpill，同 iOS SpillFix）。
+        //     真实 decoder / translator：STS 写到 0x9000（超出 32 KB）、BAR.SYNC、LDS 读回、再 STS 留住结果。
+        {
+            byte[] sharedCs = ComputeOps(Fadd32i(0, 1.0f), Sts(0, 0x9000), BarSync, Lds(1, 0x9000), Sts(1, 0x10));
+            (JsonElement content, string error) SharedCompile(uint bytes)
+            {
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "compute", 2, 1, "shared-" + bytes, cs: sharedCs, sharedBytes: bytes)));
+                    return (d.RootElement.GetProperty("content").Clone(), null);
+                }
+                catch (Exception ex) { return (default, ex.Message); }
+            }
+            uint[] Words(JsonElement content) => MemoryMarshal.Cast<byte, uint>(content.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64()).ToArray();
+            IEnumerable<uint[]> Insts(uint[] w) { for (int i = 5; i < w.Length; i += (int)(w[i] >> 16)) yield return w[i..(i + (int)(w[i] >> 16))]; }
+            bool HasWorkgroupVar(uint[] w) => Insts(w).Any(x => (x[0] & 0xFFFF) == 59 && x[3] == 4);
+            var (big, bigErr) = SharedCompile(40960);
+            if (bigErr != null) Check(false, "40 KB shared compute compiles with a spill: " + bigErr);
+            else
+            {
+                uint[] w = Words(big);
+                JsonElement[] spills = big.GetProperty("bindings").EnumerateArray().Where(b => b.GetProperty("kind").GetString() == "spill").ToArray();
+                Check(spills.Length == 1 && spills[0].GetProperty("set").GetInt32() == 1 && spills[0].GetProperty("bytesPerGroup").GetInt32() == 40960 &&
+                      spills[0].GetProperty("stage").GetString() == "cs", "40 KB shared: one spill binding in set 1, 40960 bytes per group");
+                Check(!HasWorkgroupVar(w), "40 KB shared: no workgroup variable left in the SPIR-V");
+                var consts = Insts(w).Where(x => (x[0] & 0xFFFF) == 43 && x.Length == 4).ToDictionary(x => x[2], x => x[3]);
+                var builtins = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11).Select(x => x[3]).ToHashSet();
+                Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
+                // 溢出缓冲的成员带 Coherent（组内调用经 barrier 互相看得见写，同 Workgroup 内存的语义）
+                Check(Insts(w).Any(x => (x[0] & 0xFFFF) == 72 && x.Length == 4 && x[2] == 0 && x[3] == 23),
+                      "spill buffer member is Coherent so writes are visible across the workgroup after barriers");
+                // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
+                var defs = new Dictionary<uint, uint[]>();
+                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
+                bool Decorated(uint id, uint dec, int value) => Insts(w).Any(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[1] == id && x[2] == dec && x[3] == (uint)value);
+                uint spillVar = Insts(w).Where(v => (v[0] & 0xFFFF) == 59 && v[3] == 2).Select(v => v[2]).FirstOrDefault(id =>
+                    Decorated(id, 34, spills[0].GetProperty("set").GetInt32()) && Decorated(id, 33, spills[0].GetProperty("binding").GetInt32()));
+                uint[][] spillChains = Insts(w).Where(x => (x[0] & 0xFFFF) is 65 or 66 && x.Length >= 5 && x[3] == spillVar).ToArray();
+                bool Scaled(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var mul) && (mul[0] & 0xFFFF) == 132 &&
+                        (consts.GetValueOrDefault(mul[3]) == 10240 || consts.GetValueOrDefault(mul[4]) == 10240));
+                Check(spillVar != 0 && spillChains.Length >= 3 && spillChains.All(x => Scaled(x[^1])),
+                      "every spill access indexes slice (flat group id x 10240 words) + original index: chains " + spillChains.Length);
+                // 下标夹在本组片内：加到基址上的那一项 = OpSelect(idx < 10240, idx, 10239)
+                bool Clamped(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var sel) && (sel[0] & 0xFFFF) == 169 && consts.GetValueOrDefault(sel[5]) == 10239);
+                Check(spillChains.All(x => Clamped(x[^1])), "every spill index is clamped to the group's slice (select idx < 10240 ? idx : 10239)");
+                // 组号基址每个函数算一次：读 WorkgroupId 的次数不随访问次数涨（3 处访问、1 个函数 → 1 次）
+                uint gidVar = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11 && x[3] == 26).Select(x => x[1]).First();
+                int gidLoads = Insts(w).Count(x => (x[0] & 0xFFFF) == 61 && x.Length >= 4 && x[3] == gidVar);
+                Check(gidLoads == 1, "the group base is computed once per function, not per access: WorkgroupId loads " + gidLoads);
+                var barriers = Insts(w).Where(x => (x[0] & 0xFFFF) == 224).ToArray();
+                Check(barriers.Length > 0 && barriers.All(x => (consts.GetValueOrDefault(x[3]) & 0x140) == 0x140),
+                      "workgroup barriers also order uniform (spill buffer) memory");
+                string spvPath = Path.Combine(Path.GetTempPath(), "s2a-spill-" + Environment.ProcessId + ".spv");
+                File.WriteAllBytes(spvPath, big.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64());
+                string val = Environment.GetEnvironmentVariable("SPIRV_VAL") ?? "spirv-val";
+                try
+                {
+                    using var proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(val, "--target-env vulkan1.1 \"" + spvPath + "\"")
+                        { RedirectStandardError = true, RedirectStandardOutput = true });
+                    string msg = proc.StandardError.ReadToEnd() + proc.StandardOutput.ReadToEnd(); proc.WaitForExit();
+                    Check(proc.ExitCode == 0, "spilled SPIR-V passes spirv-val (vulkan1.1): " + msg.Trim());
+                }
+                catch (System.ComponentModel.Win32Exception) { Console.WriteLine("NOTE spirv-val not found: spilled SPIR-V not validated by SPIRV-Tools (set SPIRV_VAL)"); }
+                finally { File.Delete(spvPath); }
+            }
+            var (small, smallErr) = SharedCompile(16384);
+            Check(smallErr == null && !small.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill") && HasWorkgroupVar(Words(small)),
+                  "16 KB shared stays in workgroup memory without a spill binding: " + smallErr);
+            var (maxGuest, maxGuestErr) = SharedCompile(48 * 1024);
+            Check(maxGuestErr == null && maxGuest.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill"),
+                  "48 KiB guest shared memory is accepted and spilled: " + maxGuestErr);
+            var (_, overGuestErr) = SharedCompile(48 * 1024 + 1);
+            Check(overGuestErr != null, "guest shared memory over 48 KiB is rejected");
+        }
+
         // 真实 decoder -> translator -> Info.SBuffers -> JSON 反射，补足下方 mapper 单测。
         // 预期来自维护合同 #1111/6531250423：c0 SSBO 表 0x310、UBO 指针表 0x210，步长 16 B。
         // 特意让唯一资源的 translator slot 都为 0，而 0x320 的 NVN slot 必须为 1。
@@ -1732,6 +1913,7 @@ internal static unsafe class Program
 
             Check(matrixAccessor.QuerySamplerType(0, -1) == SamplerType.Texture2D, "2d sampler type");
             Check(matrixAccessor.QueryTextureFormat(0, -1) == TextureFormat.R8G8B8A8Unorm, "2d format");
+            Check(matrixAccessor.QueryS2ASampledTextureFormat(0, -1) == TextureFormat.R8G8B8A8Unorm, "sampled format uses exact fact");
             Check(matrixAccessor.QueryTextureCoordNormalized(0, -1) && !matrixAccessor.QueryTextureIsBuffer(0, -1),
                 "2d normalized non-buffer");
 
@@ -1742,6 +1924,7 @@ internal static unsafe class Program
             Check(matrixAccessor.QuerySamplerType(1, 4) == (SamplerType.TextureCube | SamplerType.Shadow),
                 "same handle keeps its own cbufSlot facts");
             Check(matrixAccessor.QueryTextureFormat(1, 4) == TextureFormat.R32Float, "per-slot format");
+            Check(matrixAccessor.QueryS2ASampledTextureFormat(1, 4) == TextureFormat.R32Float, "sampled format preserves cbuf slot");
 
             Check(matrixAccessor.QuerySamplerType(2, -1) == SamplerType.TextureBuffer && matrixAccessor.QueryTextureIsBuffer(2, -1),
                 "buffer texture");
@@ -1855,10 +2038,13 @@ internal static unsafe class Program
             foreach (var (what, handle, count, len) in new[] { ("without a fact", 74, 1, 1), ("outside the image table", 88, 1, 1), ("as an array", 72, 4, 4) })
             {
                 string r = UboShape("image", "image", count, 2, handle, len, false);
-                Check(r == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 2 is not implemented", "c2 image word " + what + " stays unsupported: " + r);
+                Check(r.StartsWith("UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 2 is not implemented (handle=") &&
+                      r.Contains("arrayLength=" + len) && r.Contains("count=" + count),
+                    "c2 image word " + what + " stays unsupported: " + r);
             }
             string c19 = UboShape("texture", "texture", 1, 19, 256, 1, false);
-            Check(c19 == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 19 is not implemented", "cbuf 19 is outside the user UBO range: " + c19);
+            Check(c19.StartsWith("UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 19 is not implemented (handle="),
+                "cbuf 19 is outside the user UBO range: " + c19);
             // Facts alone do not implement separate binding; the production resolver must still refuse it.
             var separateAllocator = new DirectAllocator(matrixProfile);
             separateAllocator.Bindings.Add(new DirectBinding("fs", "texture", "test", 2, 0, 1));

@@ -16,15 +16,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// 与分时共用同一窗口；查页是所有受跟踪缓冲的逐页检查总量，不仅限索引。
-void rp_buf_blocks_report(const uint64_t pf[RP_PERF_N]) {
-    if (!nvn_plat_flag("nvk_buf_blocks", 0)) return;
-    char b[160];
-    snprintf(b, sizeof b, "分时（回放缓冲块核查，本窗口）：跳过 %llu 块、逐页查 %llu 页",
-             (unsigned long long)pf[RP_PERF_BUF_BLOCK_SKIP_N], (unsigned long long)pf[RP_PERF_BUF_PAGES_N]);
-    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-}
-
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
@@ -168,6 +159,11 @@ void rp_pool_stats_end(void) {
     ps_line("end");
     g_ps.on = 0;
 }
+// 逐帧帧日志（android/native/nvn/nvn_vk_frame_log.c，debug.s2a.frame_log，缺省关；#1501 D①）：成功上屏记一条，带取图 / 交上屏的 CPU 耗时。
+//   原先只有旧层（mtl_vk_shim.c）在上屏点调，新回放层这里不调，nvk 直连下帧日志整份是空的。
+//   弱引用：回放核心宿主单测与鸿蒙不链帧日志，地址为空就不调；开关关着时函数里只判一次缓存标志。
+// 弱链接[replay]：s2a_frame_log_present_timed
+void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) __attribute__((weak));
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     rp_pool_stats_frame();   // 池统计（开关 pool_stats；关着每帧只读一次开关，回放与池查找路径不动）
@@ -180,12 +176,15 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     nvn_gpu_view v = rp_present_view(t);   // 上屏视图不走可淘汰缓存：iOS present 直接拿贴图对象
     if (!v) { on_shown(NULL, &drop); g_n_dropped++; pthread_mutex_unlock(&g_pmu); return ticket; }
     nvn_gpu_err err = {0}; nvn_gpu_drawable dr; nvn_gpu_rc r = {NVN_GPU_OK};
+    struct timespec a0, a1; clock_gettime(CLOCK_MONOTONIC, &a0);
     for (int attempt = 0; attempt < 2; attempt++) {
         r = nvn_gpu_drawable_acquire(g_surf, 100000000ull, NULL, &dr, &err);
         if (r.code != NVN_GPU_E_OUTDATED) break;
         nvn_gpu_rc rb = nvn_gpu_surface_rebuild(g_surf, &err);   // 窗口尺寸 / 旋转变了：换一代交换链再取
         if (!nvn_gpu_ok(rb)) { r = rb; break; }
     }
+    clock_gettime(CLOCK_MONOTONIC, &a1);
+    const uint64_t acquire_ns = (uint64_t)(a1.tv_sec - a0.tv_sec) * 1000000000ull + (uint64_t)a1.tv_nsec - (uint64_t)a0.tv_nsec;
     if (!nvn_gpu_ok(r)) {
         on_shown(NULL, &drop); g_n_dropped++;
         pthread_mutex_unlock(&g_pmu);
@@ -203,12 +202,14 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     d.dst[0] = (int32_t)(vp.x + 0.5); d.dst[1] = (int32_t)(vp.y + 0.5); d.dst[2] = (int32_t)(vp.w + 0.5); d.dst[3] = (int32_t)(vp.h + 0.5);
     if (d.dst[0] + d.dst[2] > (int32_t)dr.w) d.dst[2] = (int32_t)dr.w - d.dst[0];
     if (d.dst[1] + d.dst[3] > (int32_t)dr.h) d.dst[3] = (int32_t)dr.h - d.dst[1];
+    uint64_t present_ns;
     { struct timespec p0, p1; clock_gettime(CLOCK_MONOTONIC, &p0);
       r = nvn_gpu_present(g_surf, &dr, &d, ticket, on_shown, NULL, &err);
-      clock_gettime(CLOCK_MONOTONIC, &p1); rp_perf_add(RP_PERF_PRESENT_NS, (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec); }
+      clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
+        if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -286,7 +287,6 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
                              (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-                rp_buf_blocks_report(pf);
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核
