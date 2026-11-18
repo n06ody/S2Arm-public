@@ -51,9 +51,12 @@ class Adb:
         for name in (package, package + ':game'):
             result = subprocess.run([*self.argv, 'shell', 'pidof', name],
                                     capture_output=True, text=True, timeout=120)
-            if result.returncode not in (0, 1) or result.stderr.strip():
+            pids = result.stdout.split()
+            if result.stderr.strip() or not (
+                    result.returncode == 1 and not pids or
+                    result.returncode == 0 and pids and all(re.fullmatch(r'[0-9]+', p) for p in pids)):
                 raise RuntimeError('无法确认设备游戏进程状态：' + result.stderr.strip())
-            if result.stdout.strip():
+            if pids:
                 return True
         return False
 
