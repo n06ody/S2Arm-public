@@ -274,7 +274,8 @@ static uint32_t gs_tstrip_expand(uint32_t count, uint32_t *d) {
 }
 
 // 贴图数组（着色器按运行时下标取句柄）的各项：每个阶段至多一个数组，至多 RP_TEXARR_MAX 项。
-// 数组第 k 项 = 驱动句柄表的第 k 个 8 字节项；贴图槽 s 的句柄在第 4 + s 项，前 4 项与没绑的槽读作池里的第 0 项（同单个贴图槽没绑时的口径）
+// 数组第 k 项 = 驱动句柄表的第 src_reg + k 个 8 字节项（src_reg = 数组起点的 c2 字 / 2，同 iOS NVN_RB_TEXA）；贴图槽 s 的句柄在第 4 + s 项，
+//   组合表之外与没绑的槽读作池里的第 0 项（同单个贴图槽没绑时的口径）
 enum { RP_TEXARR_MAX = 64, RP_HANDLE_TABLE_FIRST_SLOT = 4 };
 static nvn_gpu_view g_av[RP_PROG_STAGES][RP_TEXARR_MAX]; static nvn_gpu_samp g_as[RP_PROG_STAGES][RP_TEXARR_MAX];
 
@@ -911,6 +912,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     if (ind) count = 0;   // GPU parameters, not stale direct fields, own the draw count.
     // 没有原生对应的图元：换成能画的图元号，要展开索引的记下展开方式（quads），索引在取资源那一步展开
     int restart = di && rp_S.restart.on;
+    const uint32_t nvn_prim = prim;   // 着色器来源要的是 NVN 原图元（四边形展开后图元号减半，见 rp_shader_req.prim）
     int quads = EXP_NONE;
     if (prim == 7) { quads = EXP_QUADS; prim = 4; }
     else if (prim == 2) { quads = EXP_LOOP; prim = 1; }
@@ -936,7 +938,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
       if (face != g_face) { g_face = face; rp_pso_dirty = 1; } }   // 图元在绘制记录里，不在状态块里：换了图元就是换管线
     int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];
     if (!g_prog || rp_pso_dirty || args_dirty) {
-        struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
+        struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = nvn_prim; q.rt_count = rt->n;
         for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
         const struct rp_prog *np = NULL;
         int sr = rp_shader_resolve(&q, &np);
@@ -1143,9 +1145,9 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                 if (e->src_kind != NVN_RB_TEX) continue;
                 uint32_t cnt = e->count > 1 ? e->count : 1;
                 for (uint32_t k = 0; k < cnt && nr < (int)(sizeof rd / sizeof rd[0]); k++) {
+                    // 同取视图时的槽：数组项在组合表里（表外与没绑的读作池里第 0 项）；单槽可以是组合槽，也可以是分离贴图槽（128 + k，#1581）
                     int slot = (int)e->src_reg + (e->count > 1 ? (int)k - RP_HANDLE_TABLE_FIRST_SLOT : 0);
-                    if (slot < 0 || slot >= 32) continue;
-                    uint64_t h = rp_S.tex[st][slot];
+                    uint64_t h = e->count > 1 ? (slot >= 0 && slot < 32 ? rp_S.tex[st][slot] : 0) : (slot < RP_NTEX ? rp_S.tex[st][slot] : 0);
                     if (!rp_tex_snap_by_id(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, &rdsnap[nr], NULL, NULL)) continue;
                     rd[nr] = &rdsnap[nr]; nr++;
                 }
