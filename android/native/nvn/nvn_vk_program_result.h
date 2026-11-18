@@ -49,7 +49,7 @@ struct fd_ubo_word { uint8_t slot, sid, pair, pair_slot, pair_sid; uint16_t offs
 enum { FD_SAMP_NONE = 0, FD_SAMP_UBO, FD_SAMP_ID, FD_SAMP_SLOT };   // fd_binding.samp_src
 
 struct fd_binding {
-    int set, binding, kind;   // kind: 0 uniform/support, 1 storage, 2 texture, 3 image
+    int set, binding, kind;   // kind: 0 uniform/support, 1 storage, 2 texture, 3 image, 4 计算共享内存溢出缓冲（spill）
     int slot;
     uint16_t count;           // 描述符数组长度（不是数组为 1）。kind==2 且 count>1 = 从句柄表第 slot 项起的贴图数组
     char stage[16];
@@ -133,6 +133,7 @@ struct nvn_vk_compute_program {
     struct fd_binding bindings[FD_MAX_BINDINGS];
     int binding_count;
     uint32_t support_bytes;
+    uint32_t spill_bytes;   // 共享内存溢出缓冲每个线程组的字节数（结果里 kind = spill 的绑定）；0 = 没有
 };
 #ifdef __cplusplus
 extern "C" {
