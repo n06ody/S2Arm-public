@@ -604,6 +604,7 @@
 20261115-1312-audio-diag-peak-nan.patch
 20261115-1505-macrojit-dynamic-code-guard.patch
 20261115-1712-hid-follow-sync-same-lock.patch
+20261116-0506-direct-linked-unknown-budget.patch
 20261116-1551-audio-dsp-mix-volume-round-nearest.patch
 20261116-1552-audio-dsp-biquad-and-mix-local-state.patch
 20261116-1552-audio-dsp-command-fault-isolation.patch

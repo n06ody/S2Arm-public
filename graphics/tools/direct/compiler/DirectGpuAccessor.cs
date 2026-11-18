@@ -105,6 +105,7 @@ namespace S2A.DirectCompiler
         private readonly DirectProgram _program;
         private readonly DirectStage _stage;
         private readonly int _stageIndex;
+        private readonly bool _requiresLinkedVaryingInterface;
         private readonly DirectAllocator _allocator;
         private int _textureHandle = -1;
         public readonly List<DirectQuery> Queries;
@@ -112,10 +113,11 @@ namespace S2A.DirectCompiler
         public uint StateReadFlags, AttributeReadMask;
 
         public DirectGpuAccessor(DirectProfile profile, DirectProgram program, DirectStage stage,
-            int stageIndex, DirectAllocator allocator, List<DirectQuery> queries)
+            int stageIndex, DirectAllocator allocator, List<DirectQuery> queries, bool requiresLinkedVaryingInterface = false)
         {
             _profile = profile; _program = program; _stage = stage; _stageIndex = stageIndex;
             _allocator = allocator; Queries = queries;
+            _requiresLinkedVaryingInterface = requiresLinkedVaryingInterface;
         }
 
         private T Record<T>(string method, string arguments, T value, string source)
@@ -227,7 +229,9 @@ namespace S2A.DirectCompiler
         public bool QueryHostSupportsTextureSizeTable() => Record("QueryHostSupportsTextureSizeTable", "", false, "direct-v1:no-texture-size-table host contract");
         public SetBindingPair CreateS2AStorageOobRecordBinding(ShaderStage stage) =>
             Record("CreateS2AStorageOobRecordBinding", "stage=" + stage, new SetBindingPair(-1, -1), "direct-v1:no-storage-oob-recorder");
-        public bool QueryHostRequiresLinkedVaryingInterface() => Record("QueryHostRequiresLinkedVaryingInterface", "", _profile.Caps.RequiresLinkedVaryingInterface, ProfileSource);
+        public bool QueryHostRequiresLinkedVaryingInterface() => Record("QueryHostRequiresLinkedVaryingInterface", "",
+            _requiresLinkedVaryingInterface ? true : _profile.Caps.RequiresLinkedVaryingInterface,
+            _requiresLinkedVaryingInterface ? "request:requiresLinkedVaryingInterface" : ProfileSource);
         public bool QueryHostSupportsSpirv15() => Record("QueryHostSupportsSpirv15", "", _profile.Caps.S2ASpirv15, ProfileSource);
         public bool QueryHostSpirvLayerExt() => Record("QueryHostSpirvLayerExt", "", _profile.Caps.S2ASpirvLayerExt, ProfileSource);
         public bool QueryHostSpirvLayerNv() => Record("QueryHostSpirvLayerNv", "", _profile.Caps.S2ASpirvLayerNv, ProfileSource);

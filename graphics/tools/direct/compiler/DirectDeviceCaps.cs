@@ -22,6 +22,8 @@ namespace S2A.DirectCompiler
         public readonly uint MaxPerStageDescriptorStorageImages;
         public readonly uint MaxUniformBufferRange, MaxStorageBufferRange;
         public readonly uint MaxComputeSharedMemorySize, MaxComputeWorkGroupInvocations;
+        // Missing in older v1 snapshots means unknown, never a measured zero.
+        public readonly uint? MaxVertexOutputComponents, MaxFragmentInputComponents;
         public readonly float MaxSamplerAnisotropy;
         public readonly uint MinUniformBufferOffsetAlignment, MinStorageBufferOffsetAlignment;
         public readonly uint MinTexelBufferOffsetAlignment;
@@ -68,6 +70,7 @@ namespace S2A.DirectCompiler
                 "maxPerStageDescriptorStorageImages",
                 "maxUniformBufferRange", "maxStorageBufferRange",
                 "maxComputeSharedMemorySize", "maxComputeWorkGroupInvocations",
+                "maxVertexOutputComponents", "maxFragmentInputComponents",
                 "maxSamplerAnisotropy",
                 "minUniformBufferOffsetAlignment", "minStorageBufferOffsetAlignment",
                 "minTexelBufferOffsetAlignment", "subgroupSize");
@@ -80,6 +83,10 @@ namespace S2A.DirectCompiler
             MaxStorageBufferRange = JsonStrict.UInt32(limits, "maxStorageBufferRange", lw, 1, uint.MaxValue);
             MaxComputeSharedMemorySize = JsonStrict.UInt32(limits, "maxComputeSharedMemorySize", lw, 1, 1 << 20);
             MaxComputeWorkGroupInvocations = JsonStrict.UInt32(limits, "maxComputeWorkGroupInvocations", lw, 1, 1 << 20);
+            MaxVertexOutputComponents = limits.TryGetProperty("maxVertexOutputComponents", out _)
+                ? JsonStrict.UInt32(limits, "maxVertexOutputComponents", lw, 1, uint.MaxValue) : null;
+            MaxFragmentInputComponents = limits.TryGetProperty("maxFragmentInputComponents", out _)
+                ? JsonStrict.UInt32(limits, "maxFragmentInputComponents", lw, 1, uint.MaxValue) : null;
             MaxSamplerAnisotropy = JsonStrict.Float(limits, "maxSamplerAnisotropy", lw);
             if (!float.IsFinite(MaxSamplerAnisotropy) || MaxSamplerAnisotropy < 0 || MaxSamplerAnisotropy > 1024)
                 throw new DirectCompileException("UNSUPPORTED_PROFILE", lw + ".maxSamplerAnisotropy is outside 0..1024");

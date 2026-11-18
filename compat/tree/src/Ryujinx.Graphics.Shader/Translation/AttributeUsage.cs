@@ -119,7 +119,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             public void Validate()
             {
-                if (_enabled && (_limit <= 0 || _userEnd + _builtIns > _limit))
+                if (_enabled && _limit > 0 && _userEnd + _builtIns > _limit)
                 {
                     throw new NotSupportedException($"{(_output ? "Vertex output" : "Fragment input")} interface requires {_userEnd} user endpoint + {_builtIns} built-in components; host limit {_limit}.");
                 }

@@ -848,6 +848,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         static struct s2a_compile_request_input in;   // 提交线程独占
         memset(&in, 0, sizeof in);
         in.session = s->pc.session; in.generation = s->pc.generation;
+        in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(s->stages);
         in.profile_json = s->pc.profile_json; in.profile_bytes = s->pc.profile_bytes;
         in.direct_abi = (int)s->pc.direct_abi; in.translator_closure = s->pc.translator_closure;
         in.texture_array_length = s->tex_pool_n; in.sampler_array_length = s->samp_pool_n;
@@ -1213,6 +1214,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     struct s2a_input_identity id; memset(&id, 0, sizeof id);
     id.direct_abi = (int)pc.direct_abi; id.translator_closure = pc.translator_closure; memcpy(id.profile_sha, g_profile.sha, 32);
     id.stage_mask = stages;
+    id.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(stages);
     for (int st = 0; st < nst; st++) {
         memcpy(id.keys[st], stage_key((unsigned)st), 8);
         if (s2a_source_identity(stage_key((unsigned)st), id.source_sha[st], &id.source_code_bytes[st], &id.source_control_bytes[st])) { nvn_unimpl("shader", "source_snapshot_missing", NULL); return -1; }

@@ -442,6 +442,7 @@ int nvk_input_identity(const struct s2a_record_draw_state *state,
     if (!env || !env->have_profile) return -1;
     memcpy(in.profile_sha, env->profile_sha, 32);
     in.stage_mask = state->stages;
+    in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(in.stage_mask);
     memcpy(in.keys, state->keys, sizeof in.keys);
     // 完整源摘要来自 SetShaders/Bind 捕获时算定的那份快照（不逐笔重哈希）。
     // 缺任何一条都准确失败：拿短 key 当内容证明就是允许误命中。
@@ -869,6 +870,10 @@ int nvk_w2_capsule_claim(const struct s2a_compile_request_input *in, struct nvk_
         cap->input.original.stamp.source_epoch != s2a_source_epoch() ||
         in->session != cap->input.original.stamp.session || in->generation != cap->input.original.stamp.generation ||
         in->stage_count < 1 || in->stage_count > 2 || !in->profile_json || !in->profile_bytes) goto reject;
+    // Linked policy is request-local identity, not a diagnostic normalization.
+    // Reject before deriving correspondence; keep the frozen capsule untouched.
+    if ((in->requires_linked_varying_interface != 0 && in->requires_linked_varying_interface != 1) ||
+        in->requires_linked_varying_interface != cap->identity.requires_linked_varying_interface) goto reject;
     struct s2a_input_identity check = cap->identity;
     // A request may add tess after lookup identity creation. Keep both inputs
     // untouched: derive a separate expected request from the original owned

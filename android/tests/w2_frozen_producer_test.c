@@ -7,6 +7,7 @@
 #include "nvn/nvn_vk_compile_facts.h"
 #include "nvn.h"
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,12 @@ static void *other_thread(void *arg) {
 }
 int main(int argc, char **argv) {
     const char *mode=argc>1?argv[1]:"original";
+    int policy_case=!strncmp(mode,"policy_",7);
+    int policy_single=!strcmp(mode,"policy_single_legacy");
+    int policy_bad=!strcmp(mode,"policy_different") || !strcmp(mode,"policy_negative") ||
+        !strcmp(mode,"policy_two") || !strcmp(mode,"policy_max");
+    int policy_closed=!strcmp(mode,"policy_gate_closed");
+    int policy_empty=!strcmp(mode,"policy_no_pending");
     int partial=!strcmp(mode,"partial_view"), fullview=!strcmp(mode,"full_view");
     int zero=!strcmp(mode,"zero_layers"), missing=!strcmp(mode,"missing_raw"), epoch=!strcmp(mode,"source_epoch");
     int no_return=!strcmp(mode,"no_return"), wrong_key=!strcmp(mode,"wrong_key"), stale=!strcmp(mode,"stale_return");
@@ -75,6 +82,7 @@ int main(int argc, char **argv) {
     }
     struct s2a_record_draw_state state={0};state.stages=3;state.prim=4;state.tex_pool_base=4;
     state.tex_pool_n=8;state.samp_pool_n=8;memcpy(state.keys,keys,sizeof keys);
+    if(policy_single) state.stages=1;
     struct s2a_direct_compile_context pc={0};pc.session=31;pc.generation=7;pc.direct_abi=5;
     pc.profile_json="{\"needsFragmentOutputSpecialization\":true}";pc.profile_bytes=strlen(pc.profile_json);
     char closure[]="synthetic-w2-producer";pc.translator_closure=closure;
@@ -94,6 +102,7 @@ int main(int argc, char **argv) {
     struct s2a_compile_request_input in={0};in.session=pc.session;in.generation=pc.generation;
     in.profile_json=pc.profile_json;in.profile_bytes=pc.profile_bytes;in.direct_abi=pc.direct_abi;
     in.translator_closure=pc.translator_closure;in.stage_count=2;in.gfx=gfx;
+    if(!policy_single) in.requires_linked_varying_interface=s2a_direct_requires_linked_varying_interface(state.stages);
     in.texture_count=tex.count;memcpy(in.textures,tex.items,sizeof tex.items);
     in.texture_array_length=state.tex_pool_n;in.sampler_array_length=state.samp_pool_n;
     for(int i=0;i<2;i++) {
@@ -109,6 +118,7 @@ int main(int argc, char **argv) {
         struct s2a_input_identity actual={0};actual.direct_abi=in.direct_abi;
         actual.translator_closure=in.translator_closure;memcpy(actual.profile_sha,env.profile_sha,32);
         actual.stage_mask=state.stages;memcpy(actual.keys,state.keys,sizeof actual.keys);
+        actual.requires_linked_varying_interface=s2a_direct_requires_linked_varying_interface(actual.stage_mask);
         actual.source_present=3;
         for(int i=0;i<2;i++) {memcpy(actual.source_sha[i],views[i].content_sha,32);
             actual.source_code_bytes[i]=views[i].code_bytes;actual.source_control_bytes[i]=views[i].control_bytes;}
@@ -126,8 +136,34 @@ int main(int argc, char **argv) {
     if(epoch) {uint8_t extra[128],k[8];memset(extra,0x59,sizeof extra);hash_source(extra,sizeof extra,ctl[0],sizeof ctl[0],k);
         CHECK(!s2a_source_keep(k,0,extra,sizeof extra,ctl[0],sizeof ctl[0]));}
     if(replaced) CHECK(!s2a_source_keep(keys[0],0,code[0],sizeof code[0],ctl[0],sizeof ctl[0]));
+    if(policy_single) in.stage_count=1; // omitted linked field remains zero
+    if(!strcmp(mode,"policy_different")) in.requires_linked_varying_interface=0; // only linked differs from paired capture
+    if(!strcmp(mode,"policy_negative")) in.requires_linked_varying_interface=-1;
+    if(!strcmp(mode,"policy_two")) in.requires_linked_varying_interface=2;
+    if(!strcmp(mode,"policy_max")) in.requires_linked_varying_interface=INT_MAX;
+    if(policy_closed) enabled=0; // gate changes after a real pending capture
+    if(policy_empty) {
+        struct nvk_w2_capsule *first=NULL;
+        CHECK(nvk_w2_capsule_claim(&in,&first)==0 && first);
+        nvk_w2_capsule_release(first);
+    }
     struct nvk_w2_capsule *capsule=NULL;
     int claimed=nvk_w2_capsule_claim(&in,&capsule);
+    if(policy_case) {
+        if(policy_bad || policy_closed || policy_empty) {
+            CHECK(claimed!=0 && !capsule);
+            struct nvk_w2_capsule *again=NULL;
+            CHECK(nvk_w2_capsule_claim(&in,&again)!=0 && !again);
+            puts("PASS linked policy rejects without replay");
+        } else {
+            CHECK(claimed==0 && capsule);
+            nvk_w2_capsule_release(capsule);
+            puts("PASS linked policy matches frozen identity");
+        }
+        for(int i=0;i<2;i++) s2a_source_release(views[i].ref);
+        nvk_w2_diagnostic_cancel();
+        return 0;
+    }
     if(mismatch||mutate||race||epoch||closed||replaced||binding||collection_stop||identity_error) {CHECK(claimed!=0 && !capsule);puts("PASS precise mismatch rejects");return 0;}
     CHECK(claimed==0 && capsule);
     if(replay) {struct nvk_w2_capsule *again=NULL;CHECK(nvk_w2_capsule_claim(&in,&again)!=0&&!again);}

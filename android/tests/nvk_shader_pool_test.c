@@ -225,9 +225,18 @@ static void gs_request_test(void) {
     CHECK(rp_shader_graphics_stages() == 7, "GS fixture effective stage mask is 0x7");
     bind_pools(7); captured[0] = 0; compiler_calls = 0;
     struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+    // Run the same captured program as a VS+FS pair first. This tests the
+    // production new-layer producer, not just the shared JSON builder.
+    uint64_t gs_serial = rp_S.bser[2]; rp_S.bser[2] = 0;
+    CHECK(rp_shader_graphics_stages() == 3, "paired fixture stage mask is 0x3");
+    (void)rp_shader_resolve(&q, &p);
+    CHECK(compiler_calls == 1 && strstr(captured, "\"requiresLinkedVaryingInterface\":true"),
+          "new-layer paired request opts in");
+    rp_S.bser[2] = gs_serial; captured[0] = 0; compiler_calls = 0; p = NULL;
     int rc = rp_shader_resolve(&q, &p);
     CHECK(rc == -1 && p == NULL, "GS compiler boundary deliberately fails closed");
     CHECK(compiler_calls == 1, "GS production request reaches compiler, not stages_0x7_not_vs_fs");
+    CHECK(!strstr(captured, "\"requiresLinkedVaryingInterface\""), "GS production request omits opt-in");
     if (!compiler_calls) return;
     struct s2a_jv root = {captured, strlen(captured)}, program, stages, textures, v;
     char schema[48] = {0};

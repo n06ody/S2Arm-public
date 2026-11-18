@@ -34,7 +34,7 @@ namespace S2A.DirectCompiler
             if (root.ValueKind != JsonValueKind.Object)
                 throw new DirectCompileException("INVALID_JSON", "request root is not an object");
             JsonStrict.OnlyKeys(root, "request", "schema", "session", "generation", "requestId",
-                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "profile", "program");
+                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "profile", "program", "requiresLinkedVaryingInterface");
             string requestSchema = JsonStrict.String(root, "schema", "request");
             int requestVersion = requestSchema == RequestSchema ? 1 : requestSchema == GraphicsRequestSchemaV2 ? 2 : 0;
             if (requestVersion == 0)
@@ -61,6 +61,10 @@ namespace S2A.DirectCompiler
             if (profile.DirectAbi != directAbi || profile.TranslatorClosure != closure || profile.RuntimeCompilerAbi != compilerAbi)
                 throw new DirectCompileException("IDENTITY", "request identity does not match the effective profile");
             DirectProgram program = DirectProgram.Parse(JsonStrict.Object(root, "program", "request"), "request.program", profile, requestVersion);
+            bool linked = JsonStrict.OptionalBool(root, "requiresLinkedVaryingInterface", "request", false);
+            if (linked && (program.Kind != "graphics" || program.Stages.Length != 2 ||
+                program.StageOf("vs") == null || program.StageOf("fs") == null))
+                throw new DirectCompileException("UNSUPPORTED_PROGRAM", "linked varyings require exactly VS and FS");
             if (program.StageOf("gs") is DirectStage gs)
             {
                 if (!profile.Caps.SupportsGeometryShader)
@@ -101,13 +105,17 @@ namespace S2A.DirectCompiler
                     {
                         DirectStage stage = program.StageOf(item.name);
                         if (stage == null) continue;
-                        var accessor = new DirectGpuAccessor(profile, program, stage, item.index, allocator, queries);
+                        var accessor = new DirectGpuAccessor(profile, program, stage, item.index, allocator, queries, linked);
                         accessors.Add(accessor);
                         contexts.Add((stage, accessor, ShaderCache.DecodeGraphicsShader(accessor, TargetApi.Vulkan, ShaderCache.DefaultFlags, 0)));
                     }
                     for (int i = contexts.Count - 2; i >= 0; i--)
                     {
-                        if (contexts[i].stage.Stage == "gs") contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
+                        // Only a directly paired VS->FS uses the actual fragment inputs.
+                        // Keep VS->GS and standalone-stage translation policy unchanged.
+                        if (contexts[i].stage.Stage == "gs" ||
+                            (linked && contexts[i].stage.Stage == "vs" && contexts[i + 1].stage.Stage == "fs"))
+                            contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
                         else contexts[i].context.SetNextStage(contexts[i + 1].context);
                     }
                     foreach (var item in contexts) translated.Add((item.stage, item.context.Translate(), item.accessor));

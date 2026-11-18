@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
-// Hand-specified S2AI1/v3 wire fixtures, not an alternate encoder or captured output.
+// Hand-specified S2AI1 wire fixtures: paired v5, compute v3. Not captured output.
 #include <stdio.h>
 #include <string.h>
 #include "direct/input_identity.h"
@@ -21,6 +21,7 @@ int main(void) {
     in.direct_abi = 5;
     in.translator_closure = "";
     in.stage_mask = 3;
+    in.requires_linked_varying_interface = 1;
     in.source_present = 3;
     in.source_code_bytes[0] = in.source_code_bytes[1] = 1;
     in.source_control_bytes[0] = in.source_control_bytes[1] = 1;
@@ -31,7 +32,7 @@ int main(void) {
     // Header ends at 99; two source records occupy 80 bytes; graphics/facts
     // end at 430. The 17-byte texture record has target=1 and format=24.
     uint8_t graphics[447] = {
-        [0]='S', [1]='2', [2]='A', [3]='I', [4]='1', [5]=3, [6]=5,
+        [0]='S', [1]='2', [2]='A', [3]='I', [4]='1', [5]=5, [6]=5,
         [46]=3, [98]=3, [131]=1, [135]=1, [171]=1, [175]=1,
         [426]=1, [430]=0, [431]=0x78, [432]=0x56, [433]=0x34, [434]=0x12,
         [435]=255, [436]=255, [437]=255, [438]=255,
@@ -41,12 +42,12 @@ int main(void) {
     size_t n = 0;
     int rc = s2a_input_identity_encode(&in, out, sizeof out, &n);
     CHECK(rc == 0 && n == sizeof graphics && !memcmp(out, graphics, sizeof graphics),
-          "vs canonical bytes unchanged");
+          "paired v5 canonical bytes with VS texture");
     tex.stage = "fs";
     graphics[430] = 1;
     rc = s2a_input_identity_encode(&in, out, sizeof out, &n);
     CHECK(rc == 0 && n == sizeof graphics && !memcmp(out, graphics, sizeof graphics),
-          "fs canonical bytes unchanged");
+          "paired v5 canonical bytes with FS texture");
 
     // NVN CS is bit 5, but proof is packed in slot 0, not slot 5. One source
     // record removes 40 bytes. Texture stage index 2 is distinct from vs/fs.
@@ -59,6 +60,7 @@ int main(void) {
     };
     tex.stage = "cs";
     in.stage_mask = 32;
+    in.requires_linked_varying_interface = 0;
     in.source_present = 1;
     in.compute_has_unaligned_ssbo = 1;
     in.compute_unaligned_ssbo = 1;

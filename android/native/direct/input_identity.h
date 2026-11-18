@@ -32,6 +32,7 @@ struct s2a_input_identity {
     const char *translator_closure;
     uint8_t profile_sha[32];
     uint32_t stage_mask;
+    int requires_linked_varying_interface; // explicit request policy; zero preserves legacy identity
     uint8_t keys[6][8];
     // 完整源身份（与 keys 同序：第 i 项对应第 i 个置位的 NVN 阶段）。
     // source_present 必须恰好覆盖 stage_mask 的全部阶段，缺一个就是“缺完整源证明”——编码失败，

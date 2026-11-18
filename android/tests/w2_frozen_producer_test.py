@@ -18,7 +18,9 @@ TEST = Path(__file__).with_suffix('.c')
 CASES = ('original', 'stripped', 'allocation', 'identity', 'race', 'stop', 'tess_derived',
          'partial_view', 'full_view', 'zero_layers', 'missing_raw', 'source_epoch', 'no_return',
          'wrong_key', 'stale_return', 'closed', 'packed', 'cbuf_fallback', 'replaced_same_source',
-         'binding', 'claim_replay', 'collection_stop', 'identity_error')
+         'binding', 'claim_replay', 'collection_stop', 'identity_error',
+         'policy_same', 'policy_single_legacy', 'policy_different', 'policy_negative',
+         'policy_two', 'policy_max', 'policy_gate_closed', 'policy_no_pending')
 
 
 def extract(source, marker):
@@ -40,6 +42,9 @@ def extract(source, marker):
 def main():
     source = (NATIVE / 'nvn/nvn_vk_compile_facts.c').read_text()
     controls = [
+        ('skip-linked-policy', 'policy_different', [(
+            'in->requires_linked_varying_interface != cap->identity.requires_linked_varying_interface) goto reject;',
+            '0) goto reject;')]),
         ('wrong-allocation', 'allocation', [('match = original || stripped;', 'match = 1; (void)original; (void)stripped;')]),
         ('skip-request-correspondence', 'identity', [('if (n != cap->canonical_bytes || memcmp(bytes, cap->canonical, n)) {', 'if (0) {')]),
         ('reuse-returned', 'original', [('if (!t || t->consumed) return -1;', 'if (!t) return -1;')]),
@@ -74,7 +79,8 @@ def main():
             for case in cases:
                 result = subprocess.run([str(exe), case], capture_output=True, text=True, timeout=10)
                 if negative:
-                    if result.returncode != 1 or 'FAIL line ' not in result.stderr:
+                    expected = 'claimed!=0 && !capsule' if label == 'skip-linked-policy' else 'FAIL line '
+                    if result.returncode != 1 or expected not in result.stderr:
                         raise RuntimeError(label + ': expected functional failure\n' + result.stdout + result.stderr)
                 elif result.returncode:
                     raise RuntimeError(case + ': ' + result.stdout + result.stderr)
@@ -88,7 +94,7 @@ def main():
                     raise RuntimeError('mutation anchor changed: ' + label)
                 mutated = mutated.replace(old, new)
             run(label, mutated, (case,), True)
-    print('capsule: 23 cases and 7 compiled functional mutation controls passed')
+    print('capsule: ' + str(len(CASES)) + ' cases and ' + str(len(controls)) + ' compiled functional mutation controls passed')
 
 
 if __name__ == '__main__':

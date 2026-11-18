@@ -76,6 +76,12 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("UNSUPPORTED_PROFILE",
                     "device limits cannot hold the direct descriptor layout (sampled images/uniform buffers)");
 
+            // Missing legacy facts map to unknown (0), never to invented hardware limits.
+            uint vertexOutput = c.MaxVertexOutputComponents ?? 0;
+            uint fragmentInput = c.MaxFragmentInputComponents ?? 0;
+            if (vertexOutput > int.MaxValue || fragmentInput > int.MaxValue)
+                throw new DirectCompileException("UNSUPPORTED_PROFILE", "varying component limits exceed translator integer range");
+
             return new Capabilities(
                 api: TargetApi.Vulkan,
                 vendorName: c.DeviceName,
@@ -148,9 +154,10 @@ namespace S2A.DirectCompiler
                 gatherBiasPrecision: 0,
                 maximumGpuMemory: c.DeviceLocalBytes,
                 s2aVertexPull: false,
+                // Device facts are global; linked policy belongs to an individual request.
                 requiresLinkedVaryingInterface: false,
-                maximumVertexOutputComponents: 0,
-                maximumFragmentInputComponents: 0);
+                maximumVertexOutputComponents: (int)vertexOutput,
+                maximumFragmentInputComponents: (int)fragmentInput);
         }
 
         // 规范化 body：字段顺序固定、无空白，唯一不含 profileHash。profileHash = sha256(这份字节)。
@@ -236,6 +243,12 @@ namespace S2A.DirectCompiler
                 w.WriteNumber("textureBufferOffsetAlignment", caps.TextureBufferOffsetAlignment);
                 w.WriteNumber("gatherBiasPrecision", caps.GatherBiasPrecision);
                 w.WriteNumber("maximumGpuMemory", caps.MaximumGpuMemory);
+                // Omit unknown legacy facts to preserve historical bytes/hash. Newly
+                // measured facts intentionally change the global profile/cache identity.
+                if (caps.MaximumVertexOutputComponents > 0)
+                    w.WriteNumber("maximumVertexOutputComponents", caps.MaximumVertexOutputComponents);
+                if (caps.MaximumFragmentInputComponents > 0)
+                    w.WriteNumber("maximumFragmentInputComponents", caps.MaximumFragmentInputComponents);
                 w.WriteEndObject();
                 w.WriteEndObject();
             }
