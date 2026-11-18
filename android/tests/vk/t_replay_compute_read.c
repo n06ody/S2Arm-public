@@ -79,8 +79,8 @@ int nvn_dirty_page_armed(const void *s,const void *a){(void)s;(void)a;return 0;}
 void rp_view_pin_begin(void){}void rp_view_pin_end(void){}
 static struct { tex_t tex; view_t desc; nvn_gpu_view view; int valid, has_view; } resources[4];
 static nvn_gpu_samp resource_sampler;
-nvn_gpu_view rp_view_by_id(int i,nvn_gpu_cmd c,const tex_t **t){(void)c;if(i<0||i>=4||!resources[i].valid)return NULL;if(t)*t=&resources[i].tex;return resources[i].view;}
-nvn_gpu_view rp_view_by_id_decl(int i,uint8_t t,uint8_t k,int e,nvn_gpu_cmd c,const tex_t **o){(void)t;(void)k;(void)e;return rp_view_by_id(i,c,o);}
+nvn_gpu_view rp_view_by_id(int i,nvn_gpu_cmd c,tex_t *t){(void)c;if(t)memset(t,0,sizeof *t);if(i<0||i>=4||!resources[i].valid)return NULL;if(t)*t=resources[i].tex;return resources[i].view;}
+nvn_gpu_view rp_view_by_id_decl(int i,uint8_t t,uint8_t k,int e,nvn_gpu_cmd c,tex_t *o){(void)t;(void)k;(void)e;return rp_view_by_id(i,c,o);}
 // 本夹具不提供格式重解释；不认识的视图严格拒绝。
 nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)t;(void)v;(void)c;return NULL;}
 uint32_t rp_storage_srgb_alias(uint32_t f){(void)f;return 0;}
