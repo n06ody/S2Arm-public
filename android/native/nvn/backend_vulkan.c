@@ -378,6 +378,9 @@ struct nvn_gpu_vk {
 };
 
 static struct nvn_gpu_vk g;
+static pthread_mutex_t g_bcwait_mu=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_bcwait_uploads, g_bcwait_decodes, g_bcwait_waits, g_bcwait_ns, g_bcwait_frame;
+
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // 诊断读数（nvk_gputime 开着时每 300 次上屏打一行）：每帧新建了多少个驱动对象、写了多少次描述符、开了多少个查询。
@@ -2195,6 +2198,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         return fail(err, NVN_GPU_E_ARG, "host_device 不是已建好的 Vulkan 设备上下文");
 
     memset(&g, 0, sizeof g);
+    pthread_mutex_lock(&g_bcwait_mu); g_bcwait_uploads=g_bcwait_decodes=g_bcwait_waits=g_bcwait_ns=g_bcwait_frame=0; pthread_mutex_unlock(&g_bcwait_mu);
     g.dev = dev;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
@@ -6931,10 +6935,29 @@ static void bc_temp_to_tex(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, str
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL); cmd_ref(c, t, REF_TEX);
 }
 
+// QA only: segment count is backend retirement state, not a GPU fence query.
+struct bcwait_backlog { uint32_t user; uint64_t wsi; };
+static void bcwait_before(void *opaque) {
+    struct bcwait_backlog *b=opaque; pthread_mutex_lock(&g_mu);
+    b->user=g.nsub; b->wsi=g.wsi_seq-g.wsi_done;
+    pthread_mutex_unlock(&g_mu);
+}
+void nvn_gpu_diag_bc_frame(void) {
+    if (!nvn_plat_flag("nvk_bcwait",0)) return;
+    pthread_mutex_lock(&g_bcwait_mu);
+    uint64_t f=++g_bcwait_frame, u=g_bcwait_uploads, d=g_bcwait_decodes, w=g_bcwait_waits, n=g_bcwait_ns;
+    g_bcwait_uploads=g_bcwait_decodes=g_bcwait_waits=g_bcwait_ns=0;
+    pthread_mutex_unlock(&g_bcwait_mu);
+    char line[256]; snprintf(line,sizeof line,"bcwait frame=%llu uploads=%llu decodes=%llu waits=%llu wait_ns=%llu scope=between_present_calls",
+        (unsigned long long)f,(unsigned long long)u,(unsigned long long)d,(unsigned long long)w,(unsigned long long)n);
+    nvn_plat_log(NVN_PLAT_LOG_INFO,"gpu",line);
+}
 static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer,
                       const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
     if (!bc_src_check(c, t, level, layer, r, row_bytes, image_bytes, &off, &ext, &bb, &bw, &bh, &slice_stride)) return;
+    int diag=nvn_plat_flag("nvk_bcwait",0) != 0;
+    if (diag) { pthread_mutex_lock(&g_bcwait_mu); g_bcwait_uploads++; pthread_mutex_unlock(&g_bcwait_mu); }
     uint64_t packed_row = bw * (uint32_t)bb;
     uint64_t sh_loff = 0, sh_rp = 0, sh_sp = 0, sh_total = 0; uint32_t sh_slices = 0;
     if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
@@ -6966,8 +6989,18 @@ static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t
         if (!tmp) goto fail;
         char why[192] = {0}; int result = -1;
         pthread_mutex_lock(&g_submit_mu);
+        struct bcwait_backlog backlog={0}; struct nvn_vk_bcdec_timing timing={0};
+        timing.before_wait=bcwait_before; timing.user=&backlog;
         if (g.bc || nvn_vk_bcdec_create(g.dev, &g.bc, why, sizeof why) == 0)
-            result = nvn_vk_bcdec_decode(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, packed, bytes, why, sizeof why);
+            result = diag ? nvn_vk_bcdec_decode_timed(g.bc,g.dev,tmp->image,t->nvn_format,ext.width,ext.height,0,0,packed,bytes,why,sizeof why,&timing)
+                          : nvn_vk_bcdec_decode(g.bc,g.dev,tmp->image,t->nvn_format,ext.width,ext.height,0,0,packed,bytes,why,sizeof why);
+        if (diag) {
+            pthread_mutex_lock(&g_bcwait_mu); g_bcwait_decodes++; g_bcwait_waits+=(uint64_t)timing.called; if (timing.clock_ok) g_bcwait_ns+=timing.wait_ns; pthread_mutex_unlock(&g_bcwait_mu);
+            char line[350]; snprintf(line,sizeof line,"bcwait decode format=0x%x extent=%ux%u mip=%u layer=%u slice=%u bytes=%llu unretired=%u unretired_wsi=%llu wait_called=%d wait_clock_ok=%d wait_result=%d wait_ns=%llu decode_result=%d",
+                t->nvn_format,ext.width,ext.height,level,layer,z,(unsigned long long)bytes,backlog.user,(unsigned long long)backlog.wsi,
+                timing.called,timing.clock_ok,timing.wait_result,(unsigned long long)timing.wait_ns,result);
+            nvn_plat_log(timing.called && timing.clock_ok ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_WARN,"gpu",line);
+        }
         if (result == -2) { tmp->next = g.bc_pending; g.bc_pending = tmp; }
         pthread_mutex_unlock(&g_submit_mu);
         if (result != 0) {

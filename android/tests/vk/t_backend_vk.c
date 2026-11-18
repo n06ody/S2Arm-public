@@ -58,6 +58,7 @@ static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0�
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
 static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
+static atomic_int g_bcwait_events, g_bcwait_pending, g_bcwait_frames, g_bcwait_empty;
 static atomic_int g_c207_gputime, g_c207_cap;   // 别的线程（回放 / 完成 / 录制）也会调 nvn_plat_flag / nvn_plat_log：这两个用原子读写
 static char g_c207_win[12][512]; static int g_c207_nwin;   // 下面几个只由绘制 / 呈现所在的（测试）线程写
 static int g_c207_nlog, g_c207_badlog; static char g_c207_firstbad[512];
@@ -67,6 +68,7 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_bcwait")) return getenv("S2A_TEST_BCWAIT_ON") ? 1 : dflt;
     if (!strcmp(name, "nvk_csd") || !strcmp(name, "nvk_pass_detail")) return getenv("S2A_TEST_GPU_DIAG_ON") ? 1 : dflt;
     if (!strcmp(name, "nvk_gputime") && getenv("S2A_TEST_GPU_DIAG_ON")) return 1;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
@@ -98,6 +100,12 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && strstr(text,"bcwait decode ")) {
+        const char *ns=strstr(text,"wait_ns="); atomic_fetch_add(&g_bcwait_events,1);
+        if (strstr(text,"unretired=1") && strstr(text,"wait_called=1") && strstr(text,"wait_clock_ok=1") && strstr(text,"wait_result=0") && ns && strtoull(ns+8,NULL,10)>0) atomic_fetch_add(&g_bcwait_pending,1);
+    }
+    if (text && strstr(text,"bcwait frame=") && strstr(text,"uploads=2") && strstr(text,"decodes=2")) atomic_fetch_add(&g_bcwait_frames,1);
+    if (text && strstr(text,"bcwait frame=") && strstr(text,"uploads=0") && strstr(text,"decodes=0")) atomic_fetch_add(&g_bcwait_empty,1);
     if (text && strstr(text, "csf dispatch_time")) {
         atomic_fetch_add(&g_diag_csd_logs, 1);
         if (strstr(text, "seq=101") && strstr(text, "key=0000000000001234") && strstr(text, "groups=11,1,1") && strstr(text, "source=completed_query")) atomic_fetch_add(&g_diag_csd_match, 1);
@@ -10004,6 +10012,46 @@ static int gpu_diag_only(const char *dir) {
     printf("GPU_DIAG isolated on=%d failures=%d\n", on, g_fail);
     return g_fail ? 1 : 0;
 }
+// Real CPU-to-BC compute uploads and existing fence; the delayed worker models
+// submitted-but-not-retired work, not necessarily an unsignalled GPU fence.
+static int bcwait_only(void) {
+    int on=getenv("S2A_TEST_BCWAIT_ON") != NULL;
+    memset(&g_desc,0,sizeof g_desc); g_desc.host_device=&g_dev; g_desc.app_label="bcwait-test";
+    g_dev.bc_decode_mask |= 1u << (NVN_FORMAT_RGBA_DXT1-0x41);
+    if (!open_backend()) return 1;
+    nvn_gpu_tex tex=make_tex(4,4,NVN_FORMAT_RGBA_DXT1,NVN_GPU_TEX_SAMPLED|NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex out=make_tex(4,4,NVN_FORMAT_RGBA8,NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_buf rb=make_buf(64,NVN_GPU_MEM_SHARED,NULL), b=make_buf(16,NVN_GPU_MEM_SHARED,NULL);
+    nvn_gpu_cmd prior=begin_cmd(); nvn_gpu_fill_buf(prior,b,0,16,0);
+    nvn_gpu_err e={0}; nvn_gpu_vk_test_delay_segment(1,3000);
+    CHECK(OK(nvn_gpu_cmd_commit(prior,1,on_done,NULL,&e)),"bcwait prior submit %s",e.why);
+    nvn_gpu_cmd c=begin_cmd(); const uint8_t red[8]={0,0xf8,0,0xf8,0,0,0,0};
+    nvn_gpu_tex_upload(c,tex,0,0,NULL,red,8,8); nvn_gpu_tex_upload(c,tex,0,0,NULL,red,8,8);
+    nvn_gpu_copy_tex(c,tex,0,0,NULL,out,0,0,NULL); nvn_gpu_copy_tex_buf(c,out,0,0,NULL,rb,0,16,64);
+    CHECK(OK(nvn_gpu_cmd_commit(c,2,on_done,NULL,&e)),"bcwait upload submit %s",e.why);
+    CHECK(OK(nvn_gpu_fence_wait(2,5000000000ull,&e)),"bcwait upload fence %s",e.why);
+    for (int i=0;i<16;i++) { const uint8_t want[4]={255,0,0,255}; CHECK(!memcmp(buf_cpu(rb)+4*i,want,4),"bcwait pixel %d",i); }
+    // Exercise the real present call, rather than calling the summary helper directly.
+    nvn_gpu_surface sf=NULL; nvn_gpu_view view=make_view(out);
+    CHECK(OK(nvn_gpu_surface_attach((void *)1,&sf,&e)) && sf,"bcwait present attach %s",e.why);
+    if (sf) {
+        nvn_gpu_present_desc pd={0}; pd.src=view; pd.filter=1;
+        for (int i=0;i<2;i++) { nvn_gpu_drawable dr={0};
+            nvn_gpu_rc ar=nvn_gpu_drawable_acquire(sf,1000000000ull,NULL,&dr,&e);
+            CHECK(OK(ar),"bcwait present acquire %d %s",i,e.why);
+            if (OK(ar)) CHECK(OK(nvn_gpu_present(sf,&dr,&pd,(uint64_t)i+1,NULL,NULL,&e)),"bcwait present %d %s",i,e.why);
+        }
+        CHECK(OK(nvn_gpu_surface_detach(sf,5000000000ull,&e)),"bcwait present detach %s",e.why);
+    }
+    nvn_gpu_view_release(view);
+    CHECK(atomic_load(&g_bcwait_empty)==on,"bcwait next frame must reset counts: on=%d empty=%d",on,atomic_load(&g_bcwait_empty));
+    CHECK(atomic_load(&g_bcwait_events)==2*on && atomic_load(&g_bcwait_pending)==2*on,
+          "bcwait every real decode logs fence duration and unretired submitted segments: on=%d events=%d pending=%d",on,atomic_load(&g_bcwait_events),atomic_load(&g_bcwait_pending));
+    CHECK(atomic_load(&g_bcwait_frames)==on,"bcwait frame reports uploads and decodes: on=%d frames=%d",on,atomic_load(&g_bcwait_frames));
+    nvn_gpu_vk_test_delay_segment(0,0); nvn_gpu_tex_release(tex); nvn_gpu_tex_release(out); nvn_gpu_buf_release(rb,NULL,NULL); nvn_gpu_buf_release(b,NULL,NULL);
+    CHECK(OK(nvn_gpu_close(5000000000ull,&e)),"bcwait close %s",e.why);
+    printf("BCWAIT isolated on=%d failures=%d\n",on,g_fail); return g_fail?1:0;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -10018,6 +10066,7 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+    if (argc > 2 && !strcmp(argv[2], "--bcwait-diag")) { int r=bcwait_only(); s2a_vk_device_destroy(&g_dev,1); return r; }
     if (argc > 2 && !strcmp(argv[2], "--gpu-diag")) { int r = gpu_diag_only(argv[1]); s2a_vk_device_destroy(&g_dev, 1); return r; }
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";

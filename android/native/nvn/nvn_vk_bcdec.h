@@ -31,6 +31,16 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
                         uint32_t mip, uint32_t layer, const void *blocks, size_t bytes,
                         char *why, size_t why_size);
 
+// 可选诊断：在唯一的 fence 等待调用前后取墙钟，不改变提交或等待。
+struct nvn_vk_bcdec_timing {
+    void (*before_wait)(void *); void *user;
+    uint64_t wait_ns; int called, clock_ok, wait_result;
+};
+int nvn_vk_bcdec_decode_timed(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
+                              VkImage dst, uint32_t nvn_format, uint32_t w, uint32_t h,
+                              uint32_t mip, uint32_t layer, const void *blocks, size_t bytes,
+                              char *why, size_t why_size, struct nvn_vk_bcdec_timing *timing);
+
 // 缓冲 → BC 贴图的段内解码（#697）：游戏把压缩字节从 GPU 缓冲拷进 BC 贴图，字节往往是同一段里前面的命令刚写的，
 // 录制时 CPU 上拿不到，不能走上面那条一次性提交。这里只建资源（输入图、视图、描述符集，挑好管线），**不录命令**：
 // 命令由调用方用自己的 vkCmd* 录（后端开两级回放时 vkCmd* 走包装进录制线程，模块里直接调会和段里其它命令乱序）。

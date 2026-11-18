@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 // 见 nvn_vk_bcdec.h。路由表覆盖全部 16 个 NVN BC 格式；着色器为 Granite decode 组
 // （s3tc=BC1/2/3，rgtc=BC4/5，bc6=BC6H，bc7=BC7），变体经 specialization constant 选定。
 #include "nvn_vk_bcdec.h"
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // 管线变体：shader 索引 + 两个 specialization constant 值（无第二常量时 c1 未用）。
 struct variant { int shader; uint32_t c0, c1; };
@@ -184,10 +186,10 @@ void nvn_vk_bcdec_destroy(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc) {
     free(bc);
 }
 
-int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
+int nvn_vk_bcdec_decode_timed(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
                         VkImage dst, uint32_t nvn_format, uint32_t w, uint32_t h,
                         uint32_t mip, uint32_t layer, const void *blocks, size_t bytes,
-                        char *why, size_t why_size) {
+                        char *why, size_t why_size, struct nvn_vk_bcdec_timing *timing) {
     VkFormat view_fmt; const char *family; int bb;
     if (!nvn_vk_bcdec_route(nvn_format, &view_fmt, NULL, NULL, &family, &bb)) {
         snprintf(why, why_size, "bcdec: no route for nvn format 0x%02x", nvn_format); return -1;
@@ -306,7 +308,13 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
             snprintf(fail_why, sizeof fail_why, "bcdec: %s dispatch submit failed", family); goto cleanup;
         }
         submitted = 1;
-        if (s2a_vk_wait_fences(d->device, 1, &fence, 5000000000ull) != VK_SUCCESS) {
+        struct timespec t0={0}, t1={0}; int c0=0, c1=0;
+        if (timing) { if (timing->before_wait) timing->before_wait(timing->user); c0=clock_gettime(CLOCK_MONOTONIC,&t0)==0; }
+        VkResult wait_result=s2a_vk_wait_fences(d->device, 1, &fence, 5000000000ull);
+        if (timing) { c1=clock_gettime(CLOCK_MONOTONIC,&t1)==0; timing->called=1; timing->wait_result=(int)wait_result;
+            timing->clock_ok=c0 && c1 && (t1.tv_sec>t0.tv_sec || (t1.tv_sec==t0.tv_sec && t1.tv_nsec>=t0.tv_nsec));
+            if (timing->clock_ok) timing->wait_ns=(uint64_t)(t1.tv_sec-t0.tv_sec)*1000000000ull+(uint64_t)t1.tv_nsec-(uint64_t)t0.tv_nsec; }
+        if (wait_result != VK_SUCCESS) {
             // 提交成功但没有完成证明：转入保留账本，资源不得释放/复用。
             keep->fence = fence; keep->cmd = cmd; keep->buf = buf; keep->mem = mem;
             keep->img = in; keep->img_mem = in_mem; keep->view = in_view; keep->out_view = out_view; keep->ds = ds;
@@ -341,6 +349,13 @@ cleanup:
     vkDestroyBuffer(d->device, buf, NULL);
     vkFreeMemory(d->device, mem, NULL);
     return 0;
+}
+
+int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
+                        VkImage dst, uint32_t nvn_format, uint32_t w, uint32_t h,
+                        uint32_t mip, uint32_t layer, const void *blocks, size_t bytes,
+                        char *why, size_t why_size) {
+    return nvn_vk_bcdec_decode_timed(bc,d,dst,nvn_format,w,h,mip,layer,blocks,bytes,why,why_size,NULL);
 }
 
 void nvn_vk_bcdec_rec_free(struct s2a_vk_device *d, struct nvn_vk_bcdec_rec *rec) {
