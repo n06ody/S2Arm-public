@@ -260,6 +260,7 @@ static int pool_alloc_set(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *
 
 static int pool_write_sets(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute, uint32_t dirty) {
     VkWriteDescriptorSet writes[6 * 64]; uint32_t n = 0;
+    VkDescriptorImageInfo *copies[6 * 64] = {0};
     for (int st = compute ? NVN_GPU_SH_CS : 0; st < (compute ? NVN_GPU_SH_CS + 1 : 5); st++) {
         for (uint32_t i = 0; i < 64; i++) {
             nvn_gpu_pool_table t = c->pool_binds[st][i]; if (!t) continue;
@@ -269,10 +270,22 @@ static int pool_write_sets(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s 
             VkWriteDescriptorSet w = {0}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w.dstSet = c->desc_sets[e->set]; w.dstBinding = e->binding; w.descriptorCount = t->count + 1;
             w.descriptorType = t->kind == NVN_GPU_POOL_IMAGE ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
-            w.pImageInfo = t->images; writes[n++] = w;
+            w.pImageInfo = t->images;
+            if (t->kind == NVN_GPU_POOL_IMAGE && c->feedback != c->feedback_stop) {
+                VkDescriptorImageInfo *images = malloc(((size_t)t->count + 1) * sizeof *images);
+                if (!images) {
+                    for (uint32_t k = 0; k < n; k++) free(copies[k]);
+                    set_sticky(c, NVN_GPU_E_OOM, "feedback pool descriptors allocation failed"); return 0;
+                }
+                memcpy(images, t->images, ((size_t)t->count + 1) * sizeof *images);
+                for (uint32_t k = 0; k <= t->count; k++) images[k].imageView = feedback_view(c, t->objects[k]);
+                copies[n] = images; w.pImageInfo = images;
+            }
+            writes[n++] = w;
         }
     }
     if (n) vkUpdateDescriptorSets(g.d, n, writes, 0, NULL);
+    for (uint32_t k = 0; k < n; k++) free(copies[k]);
     return 1;
 }
 static int pool_check_layouts(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute) {
@@ -283,6 +296,7 @@ static int pool_check_layouts(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe
             nvn_gpu_pool_table t = c->pool_binds[st][i]; if (!t || t->kind != NVN_GPU_POOL_IMAGE) continue;
             for (uint32_t j = 0; j <= t->count; j++) {
                 struct nvn_gpu_view_s *v = t->objects[j];
+                if (feedback_view(c, v) != v->view) continue;
                 if (lay_cur(c, v->tex) != VK_IMAGE_LAYOUT_GENERAL) {
                     set_sticky(c, NVN_GPU_E_UNSUPPORTED, "pool image requires GENERAL layout"); return 0;
                 }
