@@ -1,5 +1,5 @@
 // F4.2B 宿主回归：NVN 纹理格式/目标 → 编译器 TextureFormat/SamplerType 的映射。
-// 只证明能证明的组合：非 buffer 目标（rect 按上游 Texture2DRect 出 2d/不归一化）。表外格式（BC / sRGB / 深度）出 "Unknown" 格式事实（采样器类型、归一化照给，图像读写时编译器才缺事实）；UI2F / I2F 给 -1。
+// 非 buffer 目标：BC / sRGB / 深度出 "Unknown"，表外整数及 UI2F / I2F 拒绝，避免误当浮点。
 #include <stdio.h>
 #include <string.h>
 
@@ -47,6 +47,12 @@ int main(void) {
           !strcmp(f.format, "Unknown") && !strcmp(f.sampler_type, "2d-array") && f.array_length == 3, "BC array keeps sampler type and layers");
     CHECK(s2a_nvn_texture_fact(NVN_FORMAT_RGBA8UI, NVN_TEXTURE_TARGET_2D, 1, &f, why, sizeof why) == 0 &&
           f.normalized == 1 && !strcmp(f.format, "R8G8B8A8Uint"), "integer 2d texture is still sampled with normalized coordinates (only the target decides)");
+    const uint32_t unmapped_int[] = {NVN_FORMAT_RGB8UI, NVN_FORMAT_RGB16I, NVN_FORMAT_RGBX8UI, NVN_FORMAT_RGBX16I, NVN_FORMAT_RGB10A2I};
+    for (unsigned i = 0; i < sizeof unmapped_int / sizeof unmapped_int[0]; i++) {
+        memset(why, 0, sizeof why);
+        CHECK(s2a_nvn_texture_fact(unmapped_int[i], NVN_TEXTURE_TARGET_2D, 1, &f, why, sizeof why) != 0 && strstr(why, "integer"),
+              "unmapped integer format must not be reported as float Unknown");
+    }
     CHECK(s2a_nvn_texture_fact(NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_2D_ARRAY, 0, &f, why, sizeof why) == 0 &&
           f.array_length == 1, "array with no declared layers falls back to 1, not 0");
     CHECK(s2a_nvn_texture_fact(NVN_FORMAT_RGBA8, NVN_TEXTURE_TARGET_CUBEMAP_ARRAY, 12, &f, why, sizeof why) == 0 &&

@@ -183,7 +183,8 @@ static int diag_query(const char *message, struct s2a_w2_query *q) {
         {"QuerySamplerType", S2A_W2_QUERY_SAMPLER_TYPE},
         {"QueryTextureIsBuffer", S2A_W2_QUERY_IS_BUFFER},
         {"QueryTextureCoordNormalized", S2A_W2_QUERY_NORMALIZED},
-        {"QueryTextureFormat", S2A_W2_QUERY_FORMAT}
+        {"QueryTextureFormat", S2A_W2_QUERY_FORMAT},
+        {"QueryS2ASampledTextureFormat", S2A_W2_QUERY_SAMPLED_FORMAT}
     };
     const char *p = message;
     memset(q, 0, sizeof *q);
