@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "nvn_pipe_pend.h"
@@ -25,6 +26,7 @@ struct dem_job {
     nvn_gpu_pipe_desc desc;   // st[].sh 置空；后台线程用借到的程序填
     uint8_t ident[32];
     uint8_t stagemask;
+    uint64_t gen;             // 入队时的会话代号：停局后迟到的结果按它丢弃
 };
 
 static nvk_pp g_pp;
@@ -37,6 +39,15 @@ static pthread_mutex_t g_life_mu = PTHREAD_MUTEX_INITIALIZER;
 static int q[DEM_MAX], qh, qn;
 static struct dem_job g_jobs[DEM_MAX];
 static struct nvn_pipe_demand_stats g_st;   // 原子累加
+// 会话代号：每次 start 加一。停局有界等不到、脱离掉的那条后台线程建完时代号已经变了：结果不发布进下一局的待定表
+// （待定表按槽号发布，下一局 reset 后同一槽号会分给别的配方），线程自己也退出，不和下一局的线程一起取队列。
+static _Atomic uint64_t g_gen;
+static int dem_gen_live(uint64_t gen) { return atomic_load_explicit(&g_gen, memory_order_acquire) == gen; }
+static void dem_publish(uint64_t gen, int h, void *obj, int code, const char *why) {
+    pthread_mutex_lock(&g_life_mu);   // start 在这把锁下换代 + reset：判代号与发布之间不会插进换代
+    if (dem_gen_live(gen)) nvk_pp_publish(&g_pp, h, obj, code, why);
+    pthread_mutex_unlock(&g_life_mu);
+}
 
 static int dem_eq(const void *a, const void *b) { return memcmp(a, b, sizeof(struct dem_key)) == 0; }
 
@@ -58,16 +69,17 @@ static void dem_key(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], struct 
 static void dem_build(int h) {
     struct dem_job j = g_jobs[h];   // 入队前写好，取到后独占读
     g_jobs[h].used = 0;
+    if (!dem_gen_live(j.gen)) return;   // 上一局的活：不建、不发布
     const struct rp_prog *prog = NULL;
     int br = rp_shader_prog_borrow(j.ident, &prog);
     if (br == 0) {
         __atomic_fetch_add(&g_st.failed, 1, __ATOMIC_RELAXED);
-        nvk_pp_publish(&g_pp, h, NULL, NVN_GPU_E_COMPILE, "程序还没发布（借用失败；下一笔现场建）");
+        dem_publish(j.gen, h, NULL, NVN_GPU_E_COMPILE, "程序还没发布（借用失败；下一笔现场建）");
         return;
     }
     if (br < 0 || !prog) {
         __atomic_fetch_add(&g_st.failed, 1, __ATOMIC_RELAXED);
-        nvk_pp_publish(&g_pp, h, NULL, NVN_GPU_E_STOPPED, "程序借用不可用（停局 / 借用表满）");
+        dem_publish(j.gen, h, NULL, NVN_GPU_E_STOPPED, "程序借用不可用（停局 / 借用表满）");
         return;
     }
     nvn_gpu_pipe_desc pd = j.desc;
@@ -78,24 +90,24 @@ static void dem_build(int h) {
     rp_shader_prog_return(j.ident);
     if (nvn_gpu_ok(r) && pipe) {
         __atomic_fetch_add(&g_st.built, 1, __ATOMIC_RELAXED);
-        nvk_pp_publish(&g_pp, h, pipe, 0, NULL);
+        dem_publish(j.gen, h, pipe, 0, NULL);
     } else {
         __atomic_fetch_add(&g_st.failed, 1, __ATOMIC_RELAXED);
-        nvk_pp_publish(&g_pp, h, NULL, r.code ? r.code : NVN_GPU_E_COMPILE, err.why[0] ? err.why : "后台建管线失败");
+        dem_publish(j.gen, h, NULL, r.code ? r.code : NVN_GPU_E_COMPILE, err.why[0] ? err.why : "后台建管线失败");
     }
 }
 
 static void *dem_main(void *arg) {
-    (void)arg;
+    const uint64_t mine = (uint64_t)(uintptr_t)arg;
     for (;;) {
         pthread_mutex_lock(&g_q_mu);
-        while (qn == 0 && !atomic_load_explicit(&g_stop, memory_order_acquire)) pthread_cond_wait(&g_q_cv, &g_q_mu);
-        if (atomic_load_explicit(&g_stop, memory_order_acquire) && qn == 0) { pthread_mutex_unlock(&g_q_mu); break; }
+        while (qn == 0 && !atomic_load_explicit(&g_stop, memory_order_acquire) && dem_gen_live(mine)) pthread_cond_wait(&g_q_cv, &g_q_mu);
+        if (!dem_gen_live(mine) || (atomic_load_explicit(&g_stop, memory_order_acquire) && qn == 0)) { pthread_mutex_unlock(&g_q_mu); break; }
         int h = q[qh]; qh = (qh + 1) % DEM_MAX; qn--;
         pthread_mutex_unlock(&g_q_mu);
         dem_build(h);
     }
-    atomic_store_explicit(&g_worker_done, 1, memory_order_release);
+    if (dem_gen_live(mine)) atomic_store_explicit(&g_worker_done, 1, memory_order_release);   // 脱离掉的上一局线程不替本局报「已退出」
     return NULL;
 }
 
@@ -103,6 +115,7 @@ void nvn_vk_pipe_demand_start(void) {
     if (!nvn_vk_pipe_demand_on()) return;
     pthread_mutex_lock(&g_life_mu);
     if (atomic_load_explicit(&g_running, memory_order_acquire)) { pthread_mutex_unlock(&g_life_mu); return; }
+    const uint64_t gen = atomic_fetch_add_explicit(&g_gen, 1, memory_order_acq_rel) + 1;
     if (!atomic_load_explicit(&g_pp_init, memory_order_acquire)) { nvk_pp_init(&g_pp, sizeof(struct dem_key)); atomic_store_explicit(&g_pp_init, 1, memory_order_release); }
     else nvk_pp_reset(&g_pp);
     if (s2a_fu_rt_reset) s2a_fu_rt_reset();   // 跨会话：清 fresh/seen 历史，别依赖帧号单调
@@ -111,7 +124,7 @@ void nvn_vk_pipe_demand_start(void) {
     qh = qn = 0;
     atomic_store_explicit(&g_stop, 0, memory_order_release);
     atomic_store_explicit(&g_worker_done, 0, memory_order_release);
-    if (pthread_create(&g_th, NULL, dem_main, NULL) != 0) { pthread_mutex_unlock(&g_life_mu); return; }
+    if (pthread_create(&g_th, NULL, dem_main, (void *)(uintptr_t)gen) != 0) { pthread_mutex_unlock(&g_life_mu); return; }
     atomic_store_explicit(&g_running, 1, memory_order_release);
     pthread_mutex_unlock(&g_life_mu);
 }
@@ -169,6 +182,7 @@ int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_ident
     for (int st = 0; st < DEM_STAGES; st++) j->desc.st[st].sh = NULL;
     memcpy(j->ident, prog_identity, 32);
     j->stagemask = (uint8_t)(mask & 0x7u);
+    j->gen = atomic_load_explicit(&g_gen, memory_order_acquire);
 
     pthread_mutex_lock(&g_q_mu);
     if (qn == DEM_MAX) {

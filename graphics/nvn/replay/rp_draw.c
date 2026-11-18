@@ -186,11 +186,15 @@ static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt
     int64_t left = s2a_fu_budget_left_ms(&g_fu_budget, frame, frame_ms);
     struct s2a_fu_verdict v = s2a_fu_wait_decide(0, late, stuck, may_skip, item_ms, frame_ms, left, unsafe_ms);
     if (v.action == S2A_FU_SKIP) { *skip = v.timeout; return rp_fu_ok(); }
-    uint32_t slice = v.wait_ms ? v.wait_ms : 250;
-    uint64_t t0 = rp_fu_now();
-    int w = nvn_vk_pipe_demand_wait(pd, ident, slice, out, err ? err->why : NULL, err ? sizeof err->why : 0);
-    uint64_t waited = rp_fu_now() - t0;
-    if (may_skip) s2a_fu_budget_spend(&g_fu_budget, frame, waited);
+    // wait_ms == 0 = 不设限（nvn_first_use.h；fu_unsafe_ms = 0）：按 250 ms 分片一直等到有结果，分片超时不当终局。
+    const uint32_t slice = v.wait_ms ? v.wait_ms : 250;
+    int w;
+    do {
+        uint64_t t0 = rp_fu_now();
+        w = nvn_vk_pipe_demand_wait(pd, ident, slice, out, err ? err->why : NULL, err ? sizeof err->why : 0);
+        uint64_t waited = rp_fu_now() - t0;
+        if (may_skip) s2a_fu_budget_spend(&g_fu_budget, frame, waited);
+    } while (w == 1 && !v.wait_ms);
     if (w == 0) return rp_fu_ok();
     if (w == 2 || w == 3)   // 后台失败 / 待定项消失：回退现场建（拿真实结果/错误，不丢笔，也不按未实现报红）
         return nvn_gpu_pipe_get(pd, NVN_GPU_PIPE_SYNC, out, err);
