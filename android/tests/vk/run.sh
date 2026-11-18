@@ -55,7 +55,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || [ "$mode" = "--compute-workgroup" ] || [ "$mode" = "--zero-mask-core" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]] || [ "$mode" = "--feedback-core" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--descriptor-indexing" ] || [ "$mode" = "--compute-workgroup" ] || [ "$mode" = "--zero-mask-core" ] || [ "$mode" = "--wsi-extent" ] || [[ "$mode" == --feedback-read* ]] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]] || [ "$mode" = "--feedback-core" ]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -96,6 +96,9 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
         exit 1
     fi
     exit 0
+fi
+if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
+    exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
 if [ "$(uname -s)" = Darwin ]; then
     export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
@@ -198,17 +201,30 @@ fi
 # 上面 find_icd / find_layer 已按通配找到 lavapipe 与 validation 层（各发行版 ICD 文件名不一，如 lvp_icd.json / lvp_icd.x86_64.json），
 #   原样传给池表用例，只留这一处负责找（11-17：池表用例自己只认 lvp_icd.x86_64.json，CI 上找不到、退 2，contract-sim 四片全红）
 export S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer"
+if [ "$mode" = --feedback-read ]; then
+    exec bash "$repo/android/tests/vk/feedback_read.sh"
+fi
+if [ "$mode" = --feedback-read-mask-repro ]; then
+    exec bash "$repo/android/tests/vk/feedback_read.sh" --mask-repro
+fi
 if [ "$mode" = --feedback-core ]; then
     exec bash "$repo/android/tests/vk/feedback.sh"
 fi
 if [ -z "$mode" ]; then
     bash "$repo/android/tests/vk/feedback.sh"
+    bash "$repo/android/tests/vk/feedback_read.sh"
 fi
 if [ "$mode" = --zero-mask-core ]; then
     exec bash "$repo/android/tests/vk/zero_mask.sh"
 fi
 if [ -z "$mode" ]; then
     bash "$repo/android/tests/vk/zero_mask.sh"
+fi
+if [ "$mode" = "--wsi-extent" ]; then
+    exec bash "$repo/android/tests/vk/wsi_extent.sh"
+fi
+if [ -z "$mode" ]; then
+    bash "$repo/android/tests/vk/wsi_extent.sh"
 fi
 if [[ "$mode" == --pool-table* ]]; then
     exec bash "$repo/android/tests/vk/pool_table.sh" "${mode#--pool-table}"
@@ -345,7 +361,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg|--pipe-close|--pipe-close-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -454,6 +470,15 @@ PYMUT
 fi
 # 负控只修改临时源副本，不关闭 validation，也不改设备特性。
 case "$mode" in
+    --pipe-close-neg)   # 负控：close 不等在途建管线（即修前行为）
+        python3 - "${src[1]}" "$out/backend_mutant.c" <<'PYMUT'
+import pathlib, sys
+s = pathlib.Path(sys.argv[1]).read_text()
+a = 'g.commit_active == 0 && g.pipe_active == 0) {'
+if s.count(a) != 1: raise SystemExit('pipe-close negative control anchor changed')
+pathlib.Path(sys.argv[2]).write_text(s.replace(a, 'g.commit_active == 0) {'))
+PYMUT
+        src[1]="$out/backend_mutant.c" ;;
     --gs-neg-stage|--gs-neg-flags|--gs-neg-cap)
         python3 - "$mode" "${src[1]}" "$out/backend_mutant.c" <<'PYMUT'
 import pathlib, sys
@@ -647,6 +672,27 @@ if [[ "$mode" == --clear-capacity* ]]; then
     exit "$failed"
 fi
 
+# #1581 I：后台取管线在途时 close（开 validation；见 t_backend_vk.c pipe_close_only）。不用 ASan 编：lavapipe 的 LLVM JIT 在 ASan 下自己先崩（RuntimeDyld::emitSection）。
+# --pipe-close-neg：close 不等在途（修前行为），必须红在「close 等在途建完」那条断言。
+if [ "$mode" = "--pipe-close" ] || [ "$mode" = "--pipe-close-neg" ]; then
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --pipe-close > "$out/pipe-close-log" 2>&1
+    rc=$?
+    set -e
+    mkdir -p "$repo/build/1581i-tests"; cp "$out/pipe-close-log" "$repo/build/1581i-tests/${mode#--}.log"
+    grep -E '^(PIPE_CLOSE|FAIL )|ERROR: AddressSanitizer|SUMMARY: AddressSanitizer' "$out/pipe-close-log" | head -20 || true
+    bad=$(grep -cE 'Validation Error|VUID-' "$out/pipe-close-log" || true)
+    asan=$(grep -c 'ERROR: AddressSanitizer' "$out/pipe-close-log" || true)
+    if [ "$mode" = "--pipe-close-neg" ]; then
+        if [ "$rc" -eq 0 ] || ! grep -q 'FAIL .*pipe close waits for in-flight pipeline builds' "$out/pipe-close-log"; then
+            echo "【红】pipe-close 负控未击中 rc=$rc asan=$asan" >&2; exit 1
+        fi
+        echo "【绿】--pipe-close-neg 目标断言红（rc=$rc asan=$asan validation=${bad}）"; exit 0
+    fi
+    if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ] || [ "$asan" -ne 0 ]; then echo "【红】pipe-close rc=$rc validation=$bad asan=$asan" >&2; exit 1; fi
+    echo "【绿】pipe-close：close 等在途建管线、短时限报 TIMEOUT 不拆；validation 0 条"; exit 0
+fi
+
 if [ "$mode" = "--sampler-minmax-only" ]; then
     set +e
     timeout 120 "$out/t_backend_vk" "$out/shaders" --sampler-minmax-only 2>&1 | tee "$out/sampler-minmax-log"
@@ -826,6 +872,7 @@ if [ "$mode" = "--gs-only" ] || [ "$mode" = "--gs-compiler" ]; then
     exit 0
 fi
 
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --pipe-close; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --gs-core; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --separate-core; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --tbuf-core; fi
@@ -833,6 +880,7 @@ if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run.sh" --tbuf-compiler-c
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_copy_t2b.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_clear_tex.sh"; fi
 if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_replay_ssbo_window.sh"; fi
+if [ "$mode" = "" ]; then bash "$repo/android/tests/vk/run_compute_read.sh"; fi
 
 set +e
 # 整套三遍的超时只用来发现卡死，不量性能：负载高的机器（列车机同时跑多份同类用例，软件渲染）上单遍已接近原先的 180 / 240 秒，

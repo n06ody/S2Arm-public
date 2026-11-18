@@ -28,6 +28,7 @@ namespace S2A.DirectCompiler
         // 编译结束后按反射到的 TextureDescriptor.HandleIndex 回填；-1 表示还没定。
         public int Slot;
         public int SamplerSlot = -1;
+        public int SpillBytesPerGroup;   // kind == "spill"：每个线程组的字节数
         // Storage address provenance, resolved from ShaderProgram.Info.SBuffers.
         // Translator guestIndex is deliberately NOT a runtime NVN slot.
         // 贴图也用 UboSlot / UboOffset：句柄在游戏 UBO 里时的来源（NVN UBO 号、句柄字的字节偏移），此时 Slot = -1。
@@ -79,6 +80,15 @@ namespace S2A.DirectCompiler
             Count(stage, "storage", _profile.Caps.MaximumStorageBuffersPerStage);
             int binding = _storage++;
             Bindings.Add(new DirectBinding(stage, "storage", "guestSSBO[" + guestIndex + "]", 1, binding, 1));
+            return new SetBindingPair(1, binding);
+        }
+
+        // 共享内存溢出缓冲（DirectSharedSpill）：与存储缓冲同一组、同一计数，种类单列 spill，没有客体来源。
+        public SetBindingPair Spill(string stage, int bytesPerGroup)
+        {
+            Count(stage, "storage", _profile.Caps.MaximumStorageBuffersPerStage);
+            int binding = _storage++;
+            Bindings.Add(new DirectBinding(stage, "spill", "sharedMemorySpill", 1, binding, 1) { SpillBytesPerGroup = bytesPerGroup });
             return new SetBindingPair(1, binding);
         }
 
@@ -346,6 +356,10 @@ namespace S2A.DirectCompiler
             if (f == TextureFormat.Unknown) throw Missing("QueryTextureFormat", $"stage={_stage.Stage},handle={handle},cbufSlot={cbufSlot},format=Unknown");
             return Record("QueryTextureFormat", $"handle={handle},cbufSlot={cbufSlot}", f, "texture-fact:" + _stage.Stage + ":" + handle + ":" + cbufSlot);
         }
+        public TextureFormat QueryS2ASampledTextureFormat(int handle, int cbufSlot = -1) =>
+            Record("QueryS2ASampledTextureFormat", $"handle={handle},cbufSlot={cbufSlot}",
+                NeedTexture("QueryS2ASampledTextureFormat", handle, cbufSlot).Format,
+                "texture-fact:" + _stage.Stage + ":" + handle + ":" + cbufSlot);
         public int QueryTextureArrayLengthFromPool() =>
             Record("QueryTextureArrayLengthFromPool", "stage=" + _stage.Stage, _program.TextureArrayLength, "texture-pool-capacity");
         public int QuerySamplerArrayLengthFromPool() =>

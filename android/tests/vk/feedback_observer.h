@@ -18,6 +18,12 @@ static _Atomic int observed_fence_proven;
 static int observed_aborted;
 static VkFramebuffer observed_fb;
 static VkDescriptorSet observed_bound[16];
+// Optional observers for the read-only extension fixture; the original
+// snapshot tests leave them NULL and keep their existing alias assertions.
+static void (*observed_on_begin)(const VkRenderPassBeginInfo *);
+static void (*observed_on_draw)(void);
+static unsigned (*observed_sample_sets)(void);
+static PFN_vkVoidFunction (*observed_command)(const char *);
 static void observer_reset(void) {
     observed_nv=observed_nf=observed_ns=observed_draws=observed_overlap=observed_copies=0;
     observed_ntargets=observed_early_destroy=0;observed_expect_samples=1;observed_aborted=0;atomic_store(&observed_fence_proven,0);
@@ -49,7 +55,7 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateFramebuffer(VkDevice d,const VkFra
 OBS_TYPE(vkCreateFramebuffer);
 OBS_REAL(vkCmdBeginRenderPass);
 VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo *p,VkSubpassContents s) {
-    observed_fb=p->framebuffer;__real_vkCmdBeginRenderPass(c,p,s);
+    observed_fb=p->framebuffer;if(observed_on_begin)observed_on_begin(p);__real_vkCmdBeginRenderPass(c,p,s);
 }
 OBS_TYPE(vkCmdBeginRenderPass);
 OBS_REAL(vkUpdateDescriptorSets);
@@ -77,7 +83,8 @@ VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdDraw(VkCommandBuffer c,uint32_t n,uint32_
     pthread_mutex_lock(&observed_mu);
     unsigned f=0;while(f<observed_nf&&observed_fbs[f].fb!=observed_fb)f++;REQUIRE(f<observed_nf);
     unsigned samples=0;
-    for(unsigned i=0;i<16;i++)if(observed_bound[i]){
+    unsigned nsets=observed_sample_sets?observed_sample_sets():16;
+    for(unsigned i=0;i<nsets;i++)if(observed_bound[i]){
       unsigned si=observed_set(observed_bound[i]);
       for(unsigned binding=0;binding<4;binding++)for(unsigned elem=0;elem<8;elem++){
         VkImageView v=observed_sets[si].views[binding][elem];if(!v)continue;
@@ -88,7 +95,7 @@ VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdDraw(VkCommandBuffer c,uint32_t n,uint32_
         }
       }
     }
-    REQUIRE(samples==observed_expect_samples);observed_draws++;pthread_mutex_unlock(&observed_mu);__real_vkCmdDraw(c,n,instances,first,base);
+    REQUIRE(samples==(nsets?observed_expect_samples:0));if(observed_on_draw)observed_on_draw();observed_draws++;pthread_mutex_unlock(&observed_mu);__real_vkCmdDraw(c,n,instances,first,base);
 }
 OBS_TYPE(vkCmdDraw);
 OBS_REAL(vkCmdCopyImage);
@@ -120,6 +127,7 @@ OBS_REAL(vkGetDeviceProcAddr);
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vkGetDeviceProcAddr(VkDevice d,const char *name) {
     PFN_vkVoidFunction real=__real_vkGetDeviceProcAddr(d,name);
     if(!real)return NULL;
+    if(observed_command){PFN_vkVoidFunction hook=observed_command(name);if(hook)return hook;}
 #define OBS_PROC(f) if(!strcmp(name,#f))return (PFN_vkVoidFunction)__wrap_##f
     OBS_PROC(vkCmdBeginRenderPass);OBS_PROC(vkCmdBindDescriptorSets);
     OBS_PROC(vkCmdDraw);OBS_PROC(vkCmdCopyImage);

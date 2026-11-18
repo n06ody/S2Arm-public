@@ -6,6 +6,7 @@
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_exec.h"
+#include "replay_pass_barrier_fixture.h"
 #include "nvn_unimpl.h"
 #include "nvn_dirty.h"
 
@@ -45,11 +46,13 @@ long nvn_dirty_page_gens(const void *s, const void *a, size_t n, uint64_t *g, si
 void nvn_dirty_protect(const void *a, size_t n) { (void)a; (void)n; }
 void rp_view_pin_begin(void) {}
 void rp_view_pin_end(void) {}
-nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)c; (void)t; return NULL; }
-nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, const tex_t **t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; (void)t; return NULL; }
+nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
+nvn_gpu_view rp_view_by_id_decl(int id, uint8_t tt, uint8_t cls, int elem, nvn_gpu_cmd c, tex_t *t) { (void)id; (void)tt; (void)cls; (void)elem; (void)c; if (t) memset(t, 0, sizeof *t); return NULL; }
 nvn_gpu_samp rp_samp_by_id(int id) { (void)id; return NULL; }
 // 这些隔离夹具只发 TBUF，不提供普通采样器；格式能力仍查真实后端。
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid) { (void)tid; return rp_samp_by_id(sid); }
+// 夹具不提供查询采样器；请求该能力时返回不可用。
+nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 uint32_t rp_fmt_caps(uint32_t f) { return nvn_gpu_format_caps(f); }
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     if (id != 7) return 0;

@@ -8,9 +8,9 @@ $(NVN_PRODUCER_BINARY): graphics/nvn/tests/t_nvn_producer_barrier.m $(NVN_PRODUC
 	  $(NATIVE_INC) -Igraphics/nvn/host -Igraphics/nvn/gfx/nvn -Igraphics/nvn/gfx/nvn/include -Igraphics/nvn/third_party/vulkan-headers/include \
 	  -DNVN_PRODUCER_SOURCE='"$(abspath $(NVN_PRODUCER_SOURCE))"' \
 	  -o $@ graphics/nvn/tests/t_nvn_producer_barrier.m $(NVN_TEST_HOST_OBJS) $(NVN_TEST_LIB) $(NVN_TEST_WIDEN) \
-	  -Wl,-rpath,@executable_path/nvn/widen $(NVN_TEST_WEAK) \
+	  -Wl,-rpath,@executable_path/nvn/widen -Wl,-export_dynamic $(NVN_TEST_WEAK) \
 	  -framework Metal -framework Foundation -framework QuartzCore -framework CoreGraphics \
-	  -framework ImageIO -framework UniformTypeIdentifiers -lc++
+	  -framework ImageIO -framework UniformTypeIdentifiers -framework Security -lc++
 .PHONY: native-test-nvn_producer_barrier
 native-test-nvn_producer_barrier: $(NVN_PRODUCER_BINARY)
 	DM_NVN_PRODUCER_COVER=0 $(NVN_PRODUCER_BINARY)

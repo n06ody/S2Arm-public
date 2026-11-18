@@ -54,6 +54,18 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
+    def layout_prim(source=None):   # #1581 M：句柄表数组布局项与 halvePrimitiveId（生产 layout_ent / fill_facts）
+        exe = out/'layout-prim'
+        test = ROOT/'android/tests/nvk_layout_prim_test.c'
+        if source is not None:
+            test = out/'layout-prim-mutant.c'
+            test.write_text((ROOT/'android/tests/nvk_layout_prim_test.c').read_text().replace(
+                '#include "../native/gfx_plat/nvk_shader.c"', '#include "' + str(source) + '"'))
+        host_link.run(base + [str(test), *[str(p) for p in libs]] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+        sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+        return r.returncode
+
     def run(name, source, extra_libs=None, args=(), env=None):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
@@ -114,6 +126,8 @@ def main():
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
         return result.returncode
 
+    if sys.argv[1:] == ['--layout-prim']:
+        return layout_prim()
     if len(sys.argv) in (3, 4) and sys.argv[1] == '--tbuf-layout':
         exe = out/'tbuf-layout'
         src = [ROOT/'android/tests/tbuf_layout_test.c', *libs]
@@ -351,6 +365,9 @@ def main():
     sys.stdout.write(decl.stdout); sys.stderr.write(decl.stderr)
     if decl.returncode:
         return decl.returncode
+    lp = layout_prim()
+    if lp:
+        return lp
     diag = run('diag-compile', original, args=('--diag-compile',))
     sys.stdout.write(diag.stdout); sys.stderr.write(diag.stderr)
     if diag.returncode:
