@@ -1078,7 +1078,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         }
         static int ia_on = -1; if (ia_on < 0) ia_on = nvn_plat_flag("nvk_ind_args", 0) != 0;
         if (nvn_gpu_diag_ind_args && ia_on) {   // 诊断：同一收通道点读回间接参数；没走拷贝点的只计数（不为诊断收通道）
-            uint64_t vk = 0, fk = 0; for (int i = 0; i < 8; i++) { vk = (vk << 8) | rp_S.skey[0][i]; fk = (fk << 8) | rp_S.skey[4][i]; }
+            uint64_t vk = 0, fk = 0; for (int i = 0; i < 8; i++) { vk = (vk << 8) | rp_S.skey[0][i]; fk = (fk << 8) | rp_S.skey[1][i]; }   // NVN 阶段：0 顶点、1 片元
             nvn_gpu_diag_ind_args(c, copied ? a.ind : NULL, a.ind_off, di != NULL, a.cnt != NULL, vk, fk, rp_S.skey_ok);
         }
         if (copied) nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // transfer writes visible to driver uniform reads
