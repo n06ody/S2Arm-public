@@ -82,7 +82,7 @@ function(s2a_android_nvk_sources output)
         native/direct/s2a_direct_abi.c native/direct/json.c native/direct/jv.c native/direct/sha256.c
         native/direct/graphics.c native/direct/attempt.c native/direct/selection.c native/direct/control.c
         # 设备与能力
-        native/direct/vk_device.c native/direct/gs_path.c native/direct/device_caps.c native/direct/vk_identity.c
+        native/direct/vk_device.c native/direct/vuid_context.c native/direct/gs_path.c native/direct/device_caps.c native/direct/vk_identity.c
         # 着色器链里与旧回放无关的部分
         native/direct/compiler_bind.c native/direct/source_store.c native/direct/diag.c
         native/direct/compile_worker.c native/direct/program_cache.c native/direct/offline_library.c

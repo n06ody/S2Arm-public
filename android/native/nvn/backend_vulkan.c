@@ -2901,6 +2901,9 @@ static nvn_gpu_rc spv_texel_formats(const void *blob, size_t bytes,
 }
 
 static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s *sh) {
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (s2a_vuid_forget_shader) s2a_vuid_forget_shader(sh);   // 诊断：校验报错 ↔ 程序键的着色器表（句柄会被复用）
+#endif
     struct nvn_gpu_shader_s **pp = &vk->shaders;
     while (*pp && *pp != sh) pp = &(*pp)->all_next;
     if (*pp) *pp = sh->all_next;
@@ -3787,7 +3790,16 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     gp.renderPass = p->pass;
     gp.subpass = 0;
     const uint64_t pl_t0 = now_ns();   // 驱动编译管线是同步的：超过 3 毫秒就打一行（走路/进新场景时会集中出现）
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    // 诊断：建管线时的校验报错（布局与着色器声明不符一类）记到所链着色器的程序键上；本函数在提交线程与后台建管线线程都会跑
+    const void *vuid_sh[5]; for (int i = 0; i < 5; i++) vuid_sh[i] = d->st[i].sh;
+    struct s2a_vuid_context vuid_old; const int vuid_scoped = s2a_vuid_pipe_begin && s2a_vuid_exchange && s2a_vuid_pipe_begin(vuid_sh, 5, &vuid_old);
+    const VkResult vuid_rc = vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe);
+    if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+    if (vuid_rc != VK_SUCCESS) {
+#else
     if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe) != VK_SUCCESS) {
+#endif
         nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateGraphicsPipelines 失败");
         destroy_pipe_objects(p);
         return bad;
@@ -4115,7 +4127,15 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
     cp.stage.pName = sh->entry;
     cp.layout = p->layout;
     const uint64_t pc_t0 = now_ns();   // 同图形管线：超过 3 毫秒打一行，用来对长帧
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    const void *vuid_sh[6] = {0}; vuid_sh[5] = sh;
+    struct s2a_vuid_context vuid_old; const int vuid_scoped = s2a_vuid_pipe_begin && s2a_vuid_exchange && s2a_vuid_pipe_begin(vuid_sh, 6, &vuid_old);
+    const VkResult vuid_rc = vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &p->pipe);
+    if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+    if (vuid_rc != VK_SUCCESS) {
+#else
     if (vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &p->pipe) != VK_SUCCESS) {
+#endif
         destroy_pipe_objects(p);
         return fail(err, NVN_GPU_E_COMPILE, "vkCreateComputePipelines 失败");
     }

@@ -17,6 +17,9 @@
 #include "nvn_fmt_info.h"
 #include "nvn_dirty.h"   // 写跟踪：暂存片的逐页写代号（nvk_slc_gen 用）
 #include "nvn_first_use.h"   // iOS pso_pend 语义共用件：fresh/seen 历史 / 帧预算 / wait_decide
+#if defined(S2A_ANDROID_DEBUG_ENV)
+#include "nvn_vuid_diag.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +90,22 @@ static const char *usrc_ids(int st, const struct rp_usrc *u, int *tid, int *sid)
 
 static const struct rp_prog *g_prog; static nvn_gpu_pipe g_pipe; static nvn_gpu_cmd g_pipe_cmd;
 static uint64_t g_draws, g_skips, g_dispatches; static uint32_t g_prim = ~0u; static int g_quads = -1, g_face = -1;   // g_quads：这笔的索引展开方式（EXP_*）
+#if defined(S2A_ANDROID_DEBUG_ENV)
+static int vuid_scope_begin(int compute, struct s2a_vuid_context *old) {
+    if (!s2a_vuid_enabled || !s2a_vuid_enabled() || !s2a_vuid_exchange) return 0;
+    struct s2a_vuid_context c = {.kind = compute ? S2A_VUID_DISPATCH : S2A_VUID_DRAW};
+    c.sequence = s2a_vuid_next ? s2a_vuid_next() : 0;
+    c.frame = rp_frame();
+    if (compute) {
+        c.bound = rp_S.cser ? 1u << 5 : 0;
+        if (c.bound && (rp_S.skey_ok & (1u << 5))) { memcpy(c.keys[5], rp_S.skey[5], 8); c.stages |= 1u << 5; }
+    } else {
+        c.bound = (uint8_t)rp_shader_graphics_stages();
+        for (unsigned st = 0; st < 5; st++) if (rp_shader_stage_key(st, c.keys[st])) c.stages |= (uint8_t)(1u << st);
+    }
+    s2a_vuid_exchange(&c, old); return 1;
+}
+#endif
 static int g_ms_off;   // #1015：当前管线是「多重采样目标上关了多重采样」（游戏 ms.enable = 0、目标样本数 > 1）
 
 // ---- 首用管线异步：后台建 + 可恢复的首次缺画（iOS pso_pend / first_skip_ok 的 Vulkan 新回放版）----
@@ -1346,7 +1365,13 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     DT(RP_PERF_D_BIND);   // 首版每笔都整组重发（support / c0 每笔在暂存区里新建）；按脏位省重发是后面的事
     a.prim = prim; a.count = count; a.instances = (uint32_t)(di ? di->instances : dr->instances); if (!a.instances) a.instances = 1; a.base_instance = base_instance;
     rp_occl_draw(c);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    struct s2a_vuid_context vuid_old; int vuid_scoped = vuid_scope_begin(0, &vuid_old);
+#endif
     nvn_gpu_draw(c, &a);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+#endif
     // 首用跳过判据的 seen 标记：本笔真画成了，每个颜色/深度目标记「近两帧画过」（跳过的笔不走到这里，故不记）。
     if (rp_fu_enabled()) {
         uint64_t ff = rp_frame();
@@ -1611,7 +1636,13 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    struct s2a_vuid_context vuid_old; int vuid_scoped = vuid_scope_begin(1, &vuid_old);
+#endif
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (vuid_scoped) s2a_vuid_exchange(&vuid_old, NULL);
+#endif
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {
         static const nvn_gpu_pipe_desc compute_recipe = {0};

@@ -15,6 +15,11 @@
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #include <android/log.h>
+#include <pthread.h>
+#if defined(S2A_ANDROID_DEBUG_ENV)
+#include "vuid_context_gate.h"
+#include "nvn_vuid_diag.h"
+#endif
 #define S2A_DLOG(...) __android_log_print(ANDROID_LOG_INFO, "S2Arm", __VA_ARGS__)
 #else
 #define S2A_DLOG(...) fprintf(stderr, __VA_ARGS__)
@@ -77,13 +82,24 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n) __attribute__((weak));
 #if defined(__ANDROID__)
 static VkDebugUtilsMessengerEXT g_val_messenger;
 static struct { int32_t id; uint64_t n; } g_val_seen[128]; static int g_val_nseen;
+static pthread_mutex_t g_val_mu = PTHREAD_MUTEX_INITIALIZER;
 static VKAPI_ATTR VkBool32 VKAPI_CALL val_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                              const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
     (void)type; (void)user;
     if (!d || sev < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) return VK_FALSE;
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (s2a_vuid_observe && s2a_vuid_enabled && s2a_vuid_enabled()) {
+        char b[1200];
+        if (s2a_vuid_observe(d->messageIdNumber, d->pMessageIdName, d->pMessage, b, sizeof b))
+            __android_log_print(ANDROID_LOG_INFO, "S2Arm", "%s", b);
+    }
+#endif
+    pthread_mutex_lock(&g_val_mu);
     int k = 0; for (; k < g_val_nseen; k++) if (g_val_seen[k].id == d->messageIdNumber) break;
-    if (k == g_val_nseen) { if (g_val_nseen == 128) return VK_FALSE; g_val_seen[g_val_nseen].id = d->messageIdNumber; g_val_seen[g_val_nseen].n = 0; g_val_nseen++; }
-    uint64_t n = ++g_val_seen[k].n;
+    if (k == g_val_nseen && g_val_nseen < 128) { g_val_seen[g_val_nseen].id = d->messageIdNumber; g_val_seen[g_val_nseen].n = 0; g_val_nseen++; }
+    uint64_t n = k < g_val_nseen ? ++g_val_seen[k].n : 0;
+    pthread_mutex_unlock(&g_val_mu);
+    if (!n) return VK_FALSE;
     if (n == 1) __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "【红】vk 校验（%s）%s：%.700s", sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "错" : "警告", d->pMessageIdName ? d->pMessageIdName : "?", d->pMessage ? d->pMessage : "");
     else if (!(n & (n - 1))) __android_log_print(ANDROID_LOG_INFO, "S2Arm", "vk 校验：%s 累计 %llu 次", d->pMessageIdName ? d->pMessageIdName : "?", (unsigned long long)n);
     return VK_FALSE;
@@ -113,6 +129,9 @@ void s2a_vk_format_properties(VkPhysicalDevice physical, VkFormat format, VkForm
 }
 
 int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) {
+#if defined(__ANDROID__) && defined(S2A_ANDROID_DEBUG_ENV)
+    if (s2a_vuid_start) s2a_vuid_start(0);
+#endif
     if (!out) return fail(why, why_size, "null device");
     memset(out, 0, sizeof *out);
     uint32_t api = VK_API_VERSION_1_1;
@@ -149,6 +168,13 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
 #if defined(__ANDROID__)
     static const char *const val_layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = val_wanted();
+#if defined(S2A_ANDROID_DEBUG_ENV)
+    if (s2a_vuid_start && s2a_vuid_reset_report) {
+        int on = s2a_vuid_gate_open(validate);
+        s2a_vuid_reset_report(); s2a_vuid_start(on);
+        if (on) __android_log_print(ANDROID_LOG_INFO, "S2Arm", "vk 校验程序关联已开启");
+    }
+#endif
     if (validate) { enabled[enabled_count++] = "VK_EXT_debug_utils"; info.enabledLayerCount = 1; info.ppEnabledLayerNames = val_layers; }
 #endif
     info.enabledExtensionCount = enabled_count;
