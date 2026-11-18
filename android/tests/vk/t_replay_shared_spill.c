@@ -5,12 +5,6 @@
 #include "t_replay_dispatch_barrier.c"
 #undef main
 
-// The fixture binds only storage buffers. Abort if an image path is reached.
-nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c) {
-    (void)t; (void)v; (void)c; abort();
-}
-uint32_t rp_storage_srgb_alias(uint32_t f) { (void)f; abort(); }
-
 enum { SPILL_GROUPS = 12, SPILL_WORDS = SPILL_GROUPS * 9 };
 static void run_spill(const char *dir, int spilled, int indirect, uint64_t serial,
                       uint32_t result[SPILL_WORDS]) {
