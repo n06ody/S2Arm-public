@@ -1401,6 +1401,10 @@ static const char *image_view_format(uint32_t have, uint8_t dtt, uint8_t dcls, u
     if (!f) return "compute_image_class_no_view";
     *want = f; return NULL;
 }
+// 弱链接[replay]：nvn_gpu_diag_dispatch_tag
+extern void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd, uint64_t, uint64_t) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_diag_dispatch_dims
+extern void nvn_gpu_diag_dispatch_dims(nvn_gpu_cmd, uint32_t, uint32_t, uint32_t) __attribute__((weak));
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!c) return;
     rp_perf_add(RP_PERF_DISP_N, 1);   // 派发次数（其余命令里最贵的一项，看它到底多少次）
@@ -1479,6 +1483,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       if (bad) { skip("dispatch_indirect_unresolved", rec); goto done; } }
     // 共享内存溢出缓冲（同 iOS nvn_mtl.m dispatch 的 cs->spill）：每个线程组一片，按这次真正派发的组数分，派发后不留。
     //   间接派发的组数在记录里：只在这几个字没有待落地的 GPU 写时按游戏内存里的实值分；GPU 写出的读不到，报名跳过，不猜上限。
+    uint32_t diag_dims[3] = {0}; int diag_dims_known = 0;
     g_spill_len = 0;
     if (pg->spill_bytes) {
         if (g_spill_on < 0) g_spill_on = nvn_plat_flag("nvk_spill", 1) != 0;
@@ -1487,6 +1492,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
         if (dp->ind) {
             if (rp_buf_gpu_write_pending(dp->ind, 12) != 0) { skip("compute_spill_indirect_gpu_written", rec); goto done; }
             memcpy(dims, (const void *)(uintptr_t)dp->ind, sizeof dims);
+            memcpy(diag_dims, dims, sizeof dims); diag_dims_known=1;   // 诊断：与分配 / 派发同一份快照
             // 同一份快照既决定分配大小，也交给 GPU 派发。原镜像可能有尚未执行的
             // 同步拷贝，不能从它的映射地址推断 GPU 最终读到的值。
             nvn_gpu_slice args;
@@ -1531,6 +1537,17 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) nvn_gpu_barrier(c, bar);
+    if (nvn_plat_flag("nvk_csd", 0) && (rp_S.skey_ok & (1u << 5))) {
+        uint64_t program_key=0; for (int i=0; i<8; i++) program_key=(program_key<<8)|rp_S.skey[5][i];
+        uint32_t prefix=(uint32_t)(program_key>>32), a=(uint32_t)nvn_plat_flag("nvk_csf_a",0), b=(uint32_t)nvn_plat_flag("nvk_csf_b",0);
+        if ((a && prefix==a) || (b && prefix==b)) {
+            static uint64_t seq; ++seq;
+            if (nvn_gpu_diag_dispatch_tag) {
+                nvn_gpu_diag_dispatch_tag(c,seq,program_key);
+                if (diag_dims_known && nvn_gpu_diag_dispatch_dims) nvn_gpu_diag_dispatch_dims(c,diag_dims[0],diag_dims[1],diag_dims[2]);
+            } else nvn_plat_log(NVN_PLAT_LOG_WARN,"csf","csf dispatch_time source=unavailable reason=backend_hook_missing");
+        }
+    }
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {
         static const nvn_gpu_pipe_desc compute_recipe = {0};
