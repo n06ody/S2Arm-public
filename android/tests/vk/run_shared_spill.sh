@@ -20,7 +20,9 @@ if [ "$(uname -s)" = Darwin ]; then
     if [ "$mode" = --candidate ]; then
         run_container --prepare
         dotnet run -c Release --project "$repo/graphics/tools/direct/tests/compiler" -- \
-            --spill-spirv "$out/reference.spv" "$out/spill.spv" 4096
+            --spill-spirv "$out/reference.spv" "$out/spill.spv" 4096 | tee "$out/selection.log"
+        # 6144 + 4096 + 4096 字节，必须至少选两个数组，剩余 4096 恰好等于模拟设备上限。
+        grep -q 'spill bytes/group=10240 remaining=4096 measured=4096 set=0 binding=1' "$out/selection.log"
         spirv-val --target-env vulkan1.1 "$out/spill.spv"
         if dotnet run -c Release --project "$repo/graphics/tools/direct/tests/compiler" -- \
             --spill-spirv "$out/unsupported.spv" "$out/unsupported-output.spv" 1024 > "$out/unsupported.log" 2>&1; then
