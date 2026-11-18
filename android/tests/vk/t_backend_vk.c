@@ -148,6 +148,64 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkAllocateDescriptorSets(VkDevice device, 
     return rc;
 }
 
+#ifdef S2A_CMDPOOL_TEST
+// 跟踪真实驱动分配；只在本用例会话启用，按池统计存活命令缓冲。
+static pthread_mutex_t g_cmdpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_cmdpool_track;
+static struct { VkCommandPool pool; unsigned live; } g_cmdpool[256];
+static unsigned g_cmdpool_peak, g_cmdpool_resets, g_cmdpool_overflow;
+static atomic_int g_cmdpool_fail_begin, g_cmdpool_failed_begin;
+VKAPI_ATTR VkResult VKAPI_CALL __real_vkBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo *);
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
+    if (atomic_exchange(&g_cmdpool_fail_begin, 0)) { atomic_fetch_add(&g_cmdpool_failed_begin, 1); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+    return __real_vkBeginCommandBuffer(cb, bi);
+}
+VKAPI_ATTR VkResult VKAPI_CALL __real_vkAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *);
+VKAPI_ATTR void VKAPI_CALL __real_vkFreeCommandBuffers(VkDevice, VkCommandPool, uint32_t, const VkCommandBuffer *);
+VKAPI_ATTR void VKAPI_CALL __real_vkDestroyCommandPool(VkDevice, VkCommandPool, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL __real_vkResetCommandPool(VkDevice, VkCommandPool, VkCommandPoolResetFlags);
+static unsigned cmdpool_index(VkCommandPool p) {
+    unsigned empty = 256;
+    for (unsigned i = 0; i < 256; i++) {
+        if (g_cmdpool[i].pool == p) return i;
+        if (!g_cmdpool[i].pool && empty == 256) empty = i;
+    }
+    if (empty == 256) { g_cmdpool_overflow++; return empty; }
+    g_cmdpool[empty].pool = p;
+    return empty;
+}
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *a, VkCommandBuffer *b) {
+    VkResult r = __real_vkAllocateCommandBuffers(d, a, b);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    if (g_cmdpool_track && r == VK_SUCCESS) {
+        unsigned i = cmdpool_index(a->commandPool);
+        if (i < 256) { g_cmdpool[i].live += a->commandBufferCount; if (g_cmdpool[i].live > g_cmdpool_peak) g_cmdpool_peak = g_cmdpool[i].live; }
+    }
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL __wrap_vkFreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, const VkCommandBuffer *b) {
+    __real_vkFreeCommandBuffers(d, p, n, b);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    if (g_cmdpool_track) { unsigned i = cmdpool_index(p); if (i < 256) { if (g_cmdpool[i].live < n) g_cmdpool_overflow++; else g_cmdpool[i].live -= n; } }
+    pthread_mutex_unlock(&g_cmdpool_mu);
+}
+VKAPI_ATTR void VKAPI_CALL __wrap_vkDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) {
+    __real_vkDestroyCommandPool(d, p, a);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    if (g_cmdpool_track) { unsigned i = cmdpool_index(p); if (i < 256) { g_cmdpool[i].pool = VK_NULL_HANDLE; g_cmdpool[i].live = 0; } }
+    pthread_mutex_unlock(&g_cmdpool_mu);
+}
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) {
+    VkResult r = __real_vkResetCommandPool(d, p, f);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    if (g_cmdpool_track && r == VK_SUCCESS) { unsigned i = cmdpool_index(p); if (i < 256 && g_cmdpool[i].live >= 2) g_cmdpool_resets++; }
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    return r;
+}
+
+#endif
+
 // C88（#822 驱动管线缓存）：包住建缓存 / 取缓存数据 / 建图形管线 / 建计算管线四个入口，只记录并转给真函数。
 // 记下：每次建缓存时交给驱动的初始数据字节数、建出的句柄、取数据拿到的字节数，以及每次建管线调用传的是不是那个缓存。
 // reject_initial 是注入：让「带初始数据」的建缓存调用失败，模拟驱动不收旧数据（其余调用走真实 lavapipe）。
@@ -609,6 +667,60 @@ static nvn_gpu_cmd begin_cmd(void) {
     CHECK(OK(r), "cmd_begin 失败：%d %s", r.code, e.why);
     return c;
 }
+
+#ifdef S2A_CMDPOOL_TEST
+// 每段造新图，使提交必需前置转布局命令；同一池重复使用后不得积累缓冲。
+static void c1581_cmdpool(void) {
+    nvn_gpu_err e = {0};
+    if (!open_backend()) { CHECK(0, "C1581 open"); return; }
+    pthread_mutex_lock(&g_cmdpool_mu);
+    memset(g_cmdpool, 0, sizeof g_cmdpool); g_cmdpool_peak = g_cmdpool_resets = g_cmdpool_overflow = 0; g_cmdpool_track = 1;
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    for (uint64_t i = 1; i <= 96; i++) {
+        nvn_gpu_tex t = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+        nvn_gpu_cmd c = begin_cmd();
+        if (!t || !c) { CHECK(0, "C1581 create %llu", (unsigned long long)i); break; }
+        nvn_gpu_rc r = nvn_gpu_cmd_commit(c, i, on_done, NULL, &e);
+        CHECK(OK(r), "C1581 commit %llu: %s", (unsigned long long)i, e.why);
+        if (OK(r)) CHECK(OK(nvn_gpu_fence_wait(i, 5000000000ull, &e)), "C1581 wait %llu: %s", (unsigned long long)i, e.why);
+        nvn_gpu_tex_release(t);
+        if (!OK(r)) break;
+        nvn_gpu_cmd abandoned = begin_cmd();
+        if (abandoned) nvn_gpu_cmd_abort(abandoned);
+    }
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1581 close: %s", e.why);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    unsigned peak = g_cmdpool_peak, resets = g_cmdpool_resets, overflow = g_cmdpool_overflow; g_cmdpool_track = 0;
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    printf("C1581 96 段：池内最高命令缓冲数=%u，带前置缓冲的池重置=%u，跟踪异常=%u\n", peak, resets, overflow);
+    CHECK(peak == 2, "C1581 池内最高命令缓冲数期望 2 → %u", peak);
+    CHECK(resets > 0, "C1581 必须复用带前置缓冲的池 → %u", resets);
+    CHECK(overflow == 0, "C1581 跟踪异常期望 0 → %u", overflow);
+
+    // 前置缓冲已分配但 begin 失败：真实失败回调与 close 仍须销毁整池。
+    if (!open_backend()) { CHECK(0, "C1581 failure open"); return; }
+    pthread_mutex_lock(&g_cmdpool_mu);
+    memset(g_cmdpool, 0, sizeof g_cmdpool); g_cmdpool_peak = g_cmdpool_resets = g_cmdpool_overflow = 0; g_cmdpool_track = 1;
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    nvn_gpu_tex t = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_cmd c = begin_cmd();
+    if (t && c) {
+        atomic_store(&g_cmdpool_failed_begin, 0); atomic_store(&g_cmdpool_fail_begin, 1);
+        nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+        atomic_store(&g_cmdpool_fail_begin, 0);
+        CHECK(!OK(r) && atomic_load(&g_cmdpool_failed_begin) == 1, "C1581 前置 begin 注入应失败：rc=%d 命中=%d", r.code, atomic_load(&g_cmdpool_failed_begin));
+        nvn_gpu_tex_release(t);
+    } else { CHECK(0, "C1581 failure create"); if (c) nvn_gpu_cmd_abort(c); if (t) nvn_gpu_tex_release(t); }
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C1581 failure close: %s", e.why);
+    pthread_mutex_lock(&g_cmdpool_mu);
+    unsigned live = 0; for (unsigned i = 0; i < 256; i++) live += g_cmdpool[i].live;
+    peak = g_cmdpool_peak; overflow = g_cmdpool_overflow; g_cmdpool_track = 0;
+    pthread_mutex_unlock(&g_cmdpool_mu);
+    printf("C1581 失败段：最高=%u，close 后存活=%u，跟踪异常=%u\n", peak, live, overflow);
+    CHECK(peak == 2 && live == 0 && overflow == 0, "C1581 失败段期望分配 2、close 后 0、跟踪异常 0 → %u/%u/%u", peak, live, overflow);
+}
+
+#endif
 
 // C01：fill 是 32 位样式，不是逐字节 memset；范围外不动。
 static void t01_fill32(void) {
@@ -10168,6 +10280,15 @@ int main(int argc, char **argv) {
         printf("C1501 clear capacity failures=%d\n", g_fail);
         return g_fail ? 1 : 0;
     }
+#ifdef S2A_CMDPOOL_TEST
+    if (argc > 2 && !strcmp(argv[2], "--cmdpool-only")) {
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        c1581_cmdpool();
+        printf("C1581 isolated failures=%d\n", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
+#endif
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;
@@ -10689,6 +10810,9 @@ int main(int argc, char **argv) {
     c201_fb_scan(0);
     c201_fb_scan(1);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C201 close：%d %s", e18.rc.code, e18.why);
+#ifdef S2A_CMDPOOL_TEST
+    c1581_cmdpool();   // 独立会话：额外命令缓冲随命令池复用
+#endif
     c202_stg_pool();   // 缺省档与对照档各自开 / 关会话（围栏号从各自会话重新算）
     c206_ref_seen();   // C206 段内已引用句柄备忘：缺省档与对照档各三个会话
 
