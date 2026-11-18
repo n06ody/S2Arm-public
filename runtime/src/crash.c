@@ -175,8 +175,12 @@ static void android_sigabrt_ctx(const ucontext_t *context) {
     (void)context;
 #endif
 }
+// android/native/direct/compile_request.c：崩溃线程正在现编时把那份请求落盘（#1501 D②，同苹果侧 s2a_dsh_crash_dump）。
+//   链接期弱引用（安卓单库导出被 --exclude-libs 藏起，dlsym(RTLD_DEFAULT) 取不到）；只链运行时的单测没有它 = 空。
+extern void s2a_compile_inflight_dump(void) __attribute__((weak));
 static void android_crash_fatal(int sig, siginfo_t *si, const ucontext_t *context) {
     if (sig == SIGABRT) android_sigabrt_ctx(context);
+    if (s2a_compile_inflight_dump) s2a_compile_inflight_dump();   // 只 open / write / close；排在 fatal 行与链回之前（链回后可能不再回来）
     s2a_android_fatal(sig, si, context->uc_mcontext.pc, context->uc_mcontext.sp, (void *)context);
 }
 static _Atomic uint64_t g_sp_unaligned;   // 替游戏模拟的「栈指针未对齐」读写条数（收局汇总报，s2a_sp_unaligned_count；同苹果段）

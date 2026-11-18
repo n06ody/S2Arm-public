@@ -368,6 +368,8 @@ s2a_gate_step "$PY" "$android_dir/tests/compile_export_w2_test.py"
 # kindCheck 调试开关只走请求 JSON（DirectShaderCompiler.cs:39 只读 JSON、不读进程 env）：默认构建不带该键，
 # 调试门开 + debug.s2a.kind_check=0 才写 "kindCheck":false；撤成 execute 里 setenv 或删掉该键必须红（宿主 C 编译，秒级）。
 s2a_gate_step "$PY" "$android_dir/tests/direct_compile_request_host_test.py"
+# 现编时翻译器崩溃留下输入（#1501 D②）：崩溃线程正在编的请求原样落 compile-inflight-<pid>-<槽>.log；crash.c 安卓分支弱引用调（宿主 C 编译，秒级）。
+s2a_gate_step "$PY" "$android_dir/tests/compile_inflight_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/w2_compute_integration_test.py"
 # W2 single missing coordinate: standalone synthetic host contract, no provider/device wiring.
 s2a_gate_step "$PY" "$android_dir/tests/w2_single_query_test.py"
