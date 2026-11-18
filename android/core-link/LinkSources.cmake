@@ -88,7 +88,7 @@ function(s2a_android_nvk_sources output)
         native/direct/compile_worker.c native/direct/program_cache.c native/direct/offline_library.c
         native/direct/libpack_vk.c   # 出包预编库读取（nvk_shader.c 按每阶段键取，同 iOS lib_pack）
         native/direct/compile_request.c native/direct/input_identity.c native/direct/texture_facts.c
-        native/nvn/nvn_vk_program_result.c native/nvn/nvn_vk_compute_request.c native/gfx_plat/nvk_shader.c
+        native/nvn/nvn_vk_program_result.c native/nvn/nvn_vk_compute_request.c native/gfx_plat/nvk_shader.c native/gfx_plat/direct_diag.c
         # 首次使用的准备工作下沉（iOS 蓝本 nvn_mtl.m warm_start/pso_pend 的 Vulkan 版）：
         #   nvn_vk_prog_warm  程序预热清单（跨会话程序内容身份 → 读盘/解析/建设备对象 → 发布到 g_progs）
         #   nvn_vk_pipe_warm  管线预热清单（完整 nvn_gpu_pipe_desc 配方 → 后台 nvn_gpu_pipe_get）

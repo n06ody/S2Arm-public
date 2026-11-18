@@ -865,6 +865,17 @@ static int libpack_state_ok(const struct s2a_compile_graphics_src *g) {
            !g->alpha_to_coverage_enable && !g->dual_source_blend &&
            !(g->has_unaligned_ssbo && g->unaligned_ssbo);   // 预编库按 Metal 翻译、存储缓冲一律当对齐：Vulkan 绑定要往下对齐到 minStorageBufferOffsetAlignment，偏差只有现编（读 c0 的偏移）会补
 }
+// 可选的直连诊断在调试包显式启用时记录每次现场编译。
+__attribute__((weak)) int s2a_direct_diag_enabled(void);
+__attribute__((weak)) uint64_t s2a_direct_diag_compile_begin(const uint8_t *, unsigned, int, int);
+__attribute__((weak)) void s2a_direct_diag_compile_end(uint64_t, int);
+static uint64_t diag_begin(const uint8_t *id, unsigned stages, int submit) {
+    return s2a_direct_diag_enabled && s2a_direct_diag_compile_begin && s2a_direct_diag_compile_end && s2a_direct_diag_enabled()
+        ? s2a_direct_diag_compile_begin(id, stages, submit, 0) : 0;
+}
+static void diag_end(uint64_t token, int success) {
+    if (token && s2a_direct_diag_compile_end) s2a_direct_diag_compile_end(token, success);
+}
 struct work_snap {
     uint64_t epoch;
     uint32_t stages;
@@ -1061,7 +1072,9 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
         if (g_texpool_diag) g_pool_attempts++;
         if (!shader_compile_admit()) { free(json); nvn_unimpl("shader", "compile_stopped", NULL); return NULL; }
+        uint64_t trace = diag_begin(s->identity, s->stages, !background);
         int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
+        diag_end(trace, !ran && oc.bytes && oc.bytes_len);
         free(json);
         if (ran || !oc.bytes || !oc.bytes_len) {
             atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
@@ -1818,7 +1831,9 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             if (g_texpool_diag) g_pool_attempts++;
             if (!shader_compile_admit()) { nvk_compute_request_release(&rq); nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
+            uint64_t trace = diag_begin(rq.identity, 32u, 1);
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
+            diag_end(trace, !ran && oc.bytes && oc.bytes_len);
             if (ran || !oc.bytes || !oc.bytes_len) {
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
                 red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary);

@@ -33,6 +33,13 @@ void nvk_shader_last_test_put(uint64_t key, const struct rp_prog *prog);
 const struct rp_prog *nvk_shader_last_test_find(uint64_t key);
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
+static int trace_on, trace_begin_count, trace_end_count;
+static uint32_t trace_stage; static int trace_submit, trace_warm, trace_success; static uint8_t trace_id[32];
+int s2a_direct_diag_enabled(void) { return trace_on; }
+uint64_t s2a_direct_diag_compile_begin(const uint8_t identity[32], unsigned stages, int submit, int warm) {
+    trace_begin_count++; memcpy(trace_id, identity, 32); trace_stage=stages; trace_submit=submit; trace_warm=warm; return 1;
+}
+void s2a_direct_diag_compile_end(uint64_t token, int success) { if (token) trace_end_count++; trace_success=success; }
 static unsigned fake_array_count;
 static int separate_fixture;
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
@@ -254,6 +261,7 @@ static void gs_request_test(void) {
     int rc = rp_shader_resolve(&q, &p);
     CHECK(rc == -1 && p == NULL, "GS compiler boundary deliberately fails closed");
     CHECK(compiler_calls == 1, "GS production request reaches compiler, not stages_0x7_not_vs_fs");
+    if (trace_on) CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 7 && trace_submit == 1 && trace_warm == 0 && trace_success == 0, "graphics live compile emits paired event including failure and stage");
     if (!compiler_calls) return;
     struct s2a_jv root = {captured, strlen(captured)}, program, stages, textures, v;
     char schema[48] = {0};
@@ -285,7 +293,9 @@ static void gs_request_test(void) {
     CHECK(gs_loads[NVN_GPU_SH_VS] == 1 && gs_loads[NVN_GPU_SH_FS] == 1 && gs_loads[NVN_GPU_SH_GS] == 1,
           "result loads VS FS and GS with their actual stage IDs");
     int calls = compiler_calls;
+    int trace_before_hit = trace_begin_count;
     CHECK(!rp_shader_resolve(&q, &p) && compiler_calls == calls, "identical GS request hits cache");
+    if (trace_on) CHECK(trace_begin_count == trace_before_hit, "cached graphics resolve does not create compile event");
     memcpy(gs_keys[0], changed, 8);
     CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "rebind changed GS source");
     CHECK(!rp_shader_resolve(&q, &p) && compiler_calls == ++calls, "changed GS key recompiles");
@@ -961,7 +971,21 @@ static int compute_warm_off_test(void) {
     return failures ? 1 : 0;
 }
 
+static int diag_compile_test(void) {
+    trace_on = 1; trace_begin_count = trace_end_count = 0; fake_gs_success = 0;
+    gs_request_test();
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset(); source(); bind_pools(7);
+    trace_begin_count = trace_end_count = 0; fake_cs_success = 1;
+    const struct rp_prog *p = NULL; CHECK(!rp_shader_resolve_compute(&p) && p, "compute diagnostic fixture compiles");
+    uint8_t zero[32] = {0};
+    CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 32 && trace_submit == 1 && trace_warm == 0 && trace_success == 1 && memcmp(trace_id, zero, 32),
+          "compute live compile emits paired event with identity and stage");
+    trace_on = 0; rp_shader_reset();
+    printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
     if (argc == 2 && !strcmp(argv[1], "--legacy-bytes")) {

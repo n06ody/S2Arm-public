@@ -133,6 +133,7 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_touch_generation_test.py"
 # 通用模式编译事件：原生文件生成、丢弃负控及读取器完整性校验。
 s2a_gate_step "$PY" "$android_dir/tests/generic_compile_events_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/compile_events_reader_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/direct_trace_test.py"
 # 每线程缓冲（备忘槽/暂存的堆化）：线程退出后归还、同线程复用、扩容保留内容。
 s2a_gate_step bash "$android_dir/tools/nvn_vk_threadbuf_test.sh"
 # CMake 挑选规则的宿主单测（假 cmake，可移植，始终跑）
