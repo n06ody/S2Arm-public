@@ -583,6 +583,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     else if (r == VK_ERROR_SURFACE_LOST_KHR) { s->gen = 0; out = fail(err, NVN_GPU_E_REVOKED, "表面已丢失"); }
     else out = fail(err, r == VK_ERROR_DEVICE_LOST ? NVN_GPU_E_DEVICE : NVN_GPU_E_UNSUPPORTED, "vkQueuePresentKHR 失败（%d）", (int)r);
 done:
+    if (nvn_gpu_ok(out)) nvn_gpu_diag_bc_frame();
     if (presented) { g_in_callback++; presented(user, &shown); g_in_callback--; }
     return out;
 }
