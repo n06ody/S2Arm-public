@@ -44,6 +44,7 @@
 #include "nvn_fmt_expand.h"
 #include "vk_device.h"
 #include "spirv_storage.h"   // 顶点阶段的存储写检查（与直连接纳同一份，按 Vulkan 规范的 NonWritable 判）
+#include "spirv_workgroup.h" // 最终 SPIR-V 的实际计算工作组尺寸（含 WorkgroupSize 的优先级）
 #include "../capprobe/capprobe.h"
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
@@ -2939,6 +2940,33 @@ static const char *spv_vertex_missing(const void *blob, size_t bytes, nvn_gpu_st
     return NULL;
 }
 
+static nvn_gpu_rc compute_workgroup_check(const nvn_gpu_shader_src *s, nvn_gpu_err *err) {
+    const char *entry = s->entry && s->entry[0] ? s->entry : "main";
+    // The driver must receive the exact entry whose execution mode we checked.
+    if (strlen(entry) >= sizeof(((struct nvn_gpu_shader_s *)0)->entry))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "compute workgroup: entry name exceeds backend capacity");
+    uint32_t local[3] = {0};
+    const char *why = s2a_spirv_workgroup_size(s->blob, s->bytes, entry, local);
+    if (why) return fail(err, NVN_GPU_E_UNSUPPORTED, "%s (entry=%s)", why, entry);
+    const VkPhysicalDeviceLimits *limits = &g.dev->properties.limits;
+    for (unsigned k = 0; k < 3; k++) {
+        if (!local[k]) return fail(err, NVN_GPU_E_UNSUPPORTED, "compute workgroup: LocalSize[%u]=0 (entry=%s)", k, entry);
+        if (local[k] > limits->maxComputeWorkGroupSize[k])
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "compute workgroup: LocalSize=%ux%ux%u exceeds maxComputeWorkGroupSize[%u]=%u (entry=%s)",
+                        local[0], local[1], local[2], k, limits->maxComputeWorkGroupSize[k], entry);
+    }
+    uint32_t threads = 1;
+    for (unsigned k = 0; k < 3; k++) {
+        // Divide before multiplying: even a malformed three-dimensional product
+        // cannot wrap around and appear to fit the device's invocation limit.
+        if (local[k] > limits->maxComputeWorkGroupInvocations / threads)
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "compute workgroup: LocalSize=%ux%ux%u exceeds maxComputeWorkGroupInvocations=%u (entry=%s)",
+                        local[0], local[1], local[2], limits->maxComputeWorkGroupInvocations, entry);
+        threads *= local[k];
+    }
+    return rc(NVN_GPU_OK);
+}
+
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err) {
     if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
@@ -2952,6 +2980,10 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
     // 按程序报 UNSUPPORTED、why 点名特性；程序层据此记未接清单 shader int16_not_supported。
     if (!g.dev->core_features.shaderInt16 && s2a_spirv_declares_cap(s->blob, s->bytes, 22) == 1)
         return fail(err, NVN_GPU_E_UNSUPPORTED, "shaderInt16：设备没有 16 位整数，模块声明了 OpCapability Int16（stage %d）", (int)s->stage);
+    if (s->stage == NVN_GPU_SH_CS) {   // 计算工作组预检：非法尺寸不交给驱动创建模块 / 管线。
+        nvn_gpu_rc workgroup = compute_workgroup_check(s, err);
+        if (!nvn_gpu_ok(workgroup)) return workgroup;
+    }
     struct nvn_gpu_shader_s *sh = calloc(1, sizeof *sh);
     if (!sh) return fail(err, NVN_GPU_E_OOM, "着色器结构分配失败");
     sh->stage = s->stage;
