@@ -33,7 +33,10 @@ def main():
         cmd = [CC, '-std=c11', '-D_DEFAULT_SOURCE', '-Wall', '-Wextra', '-Werror']
         for directory in INCLUDES:
             cmd += ['-I', str(directory)]
-        cmd += [str(HERE / 'replay_exec_time_test.c'), '-lm', '-o', str(binary)]
+        # 同 native-test-nvn_replay：Darwin 的 ld64 不接受未定义弱引用，按源码登记（弱链接[replay]）逐个放行，强符号漏了照样红
+        weak = subprocess.check_output([sys.executable, str(REPO / 'tools/weak_link_decl.py'), 'flags', 'replay'],
+                                       text=True, cwd=REPO).split() if sys.platform == 'darwin' else []
+        cmd += [str(HERE / 'replay_exec_time_test.c'), *weak, '-lm', '-o', str(binary)]
         subprocess.run(cmd, check=True, cwd=REPO)
         for args in ([], ['tm']):
             r = subprocess.run([str(binary), *args], text=True, capture_output=True, timeout=60)

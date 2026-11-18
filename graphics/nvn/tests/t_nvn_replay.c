@@ -322,6 +322,21 @@ static int g_npd_now(void) { return g_npd; } static int g_ends_now(void) { retur
 static int g_ndisp_now(void);
 static struct { uint32_t bits; int ndisp; } g_bar[8]; static int g_nbar;   // 每次屏障：交了哪些位、当时已派发几次
 void nvn_gpu_barrier(nvn_gpu_cmd c, uint32_t bits) { (void)c; g_barrier_bits |= bits; g_barrier_at = g_npd; if (g_nbar < 8) { g_bar[g_nbar].bits = bits; g_bar[g_nbar].ndisp = g_ndisp_now(); } g_nbar++; }
+// 帧日志替身（生产在 android/native/nvn/nvn_vk_frame_log.c，回放核心按弱引用调）：记次数与最后一次读数（#1501 D①）
+static int g_fl_presents, g_fl_fences; static uint64_t g_fl_acq_ns, g_fl_pres_ns;
+void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) { g_fl_presents++; g_fl_acq_ns = acquire_ns; g_fl_pres_ns = present_ns; }
+void nvn_vk_frame_log_fence_wait(uint64_t wait_ns) { (void)wait_ns; g_fl_fences++; }
+static void t_framelog_fence(void) {   // 帧日志 fence 字段：同步等待 / Finish 等待每次记一次（口径同 RP_PERF_WAIT_N + WAIT_FIN_N），栅栏 0 不算等
+    uint64_t saved = g_fdone; g_fdone = 0; g_fl_fences = 0;
+    nvn_be_wait(0, 0); nvn_be_finish_wait(0);
+    CHECK(g_fl_fences == 0);
+    nvn_be_finish_wait(1);                       // Finish：等不到也记（等过了）
+    CHECK(g_fl_fences == 1);
+    nvn_be_wait(nvn_be_last_fence() + 1000, 0);  // 真等（替身里等不到）
+    CHECK(g_fl_fences == 2);
+    g_fdone = saved;
+}
+
 static struct { nvn_gpu_clear d; int npd, ends; } g_cr[8]; static int g_ncr;   // 矩形清：记描述，以及收到时已开 / 已关过几个通道
 void nvn_gpu_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *d) { (void)c; if (g_ncr < 8) { g_cr[g_ncr].d = *d; g_cr[g_ncr].npd = g_npd; g_cr[g_ncr].ends = g_pass_ends; } g_ncr++; }
 static uint64_t g_tick;   // 游戏时钟替身
@@ -4142,6 +4157,7 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
 }
 
 static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口时取图、按比例贴合、呈现；交换链过期先重建
+    g_fl_presents = 0;
     pass_fresh(); rp_present_reset(); g_diag_frames = 0; memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = g_rebuilds = g_presents = 0;
     tex_t t = mk_tex(71, 0, NVN_FORMAT_RGBA8, 640, 360, 1, 0);
     CHECK(nvn_be_has_window() == 0 && nvn_be_display_hz() == 0);
@@ -4166,6 +4182,8 @@ static void t_present(void) {   // 上屏：没有窗口按丢帧报；有窗口
     CHECK(nvn_be_present(&t, 0, NULL) == 6 && g_presents == 4 && nvn_be_presented_time(6) == -1 && nvn_unimpl_count("present", "acquire_failed") == 0);
     CHECK(g_diag_frames == 4);   // 包括重建后成功；取图超时不计
     uint64_t sh = 0, dp = 0; rp_present_stats(&sh, &dp); CHECK(sh == 4 && dp == 2);
+    CHECK(g_fl_presents == 4);                                      // 帧日志：成功上屏才记一条（没有窗口 / 取不到图的两帧不记）
+    CHECK(g_fl_acq_ns != UINT64_MAX && g_fl_pres_ns != UINT64_MAX);  // 带取图 / 交上屏的 CPU 耗时，不是「未采集」
     rp_present_set_surface(NULL, 0);
     CHECK(nvn_be_has_window() == 0);
     nvn_be_tex_release(&t); pass_fresh(); rp_present_reset();
@@ -4559,6 +4577,7 @@ int main(int argc, char **argv) {
     t_separate_sampler();
     t_ubo_texture();
     t_present();
+    t_framelog_fence();
     t_view_pin();
     t_view_storage_key();
     t_view_storage_fields();
