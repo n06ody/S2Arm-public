@@ -478,7 +478,7 @@ static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *re
 int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
     if (!c || !n || !in_pool(d, n) || !rp_buf_gpu_pending(d, n)) return 0;
-    rp_pass_flush(c);
+    rp_pass_why(RP_CUT_BUFOPS); rp_pass_flush(c);
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, d, n, &db, &off)) return 0;
     nvn_gpu_buf_write(c, db, off, (const uint8_t *)a + 16, n);
@@ -488,7 +488,7 @@ int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
     if (!c || !n || !in_pool(s, n) || !in_pool(d, n) || (!rp_buf_gpu_pending(s, n) && !rp_buf_gpu_pending(d, n))) return 0;
     if (s < d + n && d < s + n) { nvn_unimpl("buf", "copy_overlap_gpu_pending", rec); return 0; }   // 源目标重叠（GPU 拷贝不许）：照旧 CPU 做，记账
-    rp_pass_flush(c);
+    rp_pass_why(RP_CUT_BUFOPS); rp_pass_flush(c);
     nvn_gpu_buf sb, db; uint64_t so, doff;
     if (!rp_buf_resolve(c, s, n, &sb, &so) || !rp_buf_resolve(c, d, n, &db, &doff)) return 0;
     nvn_gpu_copy_buf(c, sb, so, db, doff, n);
@@ -497,7 +497,7 @@ int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
 int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec) {
     if (!c || !cb->size || !in_pool(cb->addr, cb->size) || !rp_buf_gpu_pending(cb->addr, cb->size)) return 0;
     if ((cb->addr | cb->size) & 3) { nvn_unimpl("buf", "clear_unaligned_gpu_pending", rec); return 0; }   // GPU 填充要 4 字节对齐：照旧 CPU 做，记账
-    rp_pass_flush(c);
+    rp_pass_why(RP_CUT_BUFOPS); rp_pass_flush(c);
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, cb->addr, cb->size, &db, &off)) return 0;
     nvn_gpu_fill_buf(c, db, off, cb->size, cb->value);

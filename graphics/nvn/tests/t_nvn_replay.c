@@ -4105,18 +4105,30 @@ static void t_draw_ind_binst(void) {
     uint64_t base = (uint64_t)(uintptr_t)g_pmem, ind = base + 4 * PG;
     struct rp_prog saved = g_fprog;
     tex_t rtt = mk_tex(92, 0, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
-    static const struct { uint8_t unread; int copies, passes; const char *what; } cases[] = {
-        { 0, 6, 3, "unknown / read: both stages copy, every indirect draw cuts the pass" },
-        { 1, 3, 3, "vs proven, fs still reads: only fs copies, the cut stays" },
-        { 3, 0, 1, "both stages proven: no copy, one pass for all three draws" },
+    // 切通道原因读数（rp_pass_cut_take / rp_draw_ind_copy_take）：ic_end = 被「间接拷贝」结束的通道（全是 1 笔），ic_next = 以它开出的 1 笔通道，
+    //   unk / rd = 拷贝的阶段次里「读集未知」/「读集含 0x644」各几次（known = 编译结果带了 c0 读集的阶段位）
+    static const struct { uint8_t unread, known; int copies, passes, ic_end, ic_next, unk, rd; const char *what; } cases[] = {
+        { 0, 0, 6, 3, 2, 3, 6, 0, "unknown / read: both stages copy, every indirect draw cuts the pass" },
+        { 1, 3, 3, 3, 2, 3, 0, 3, "vs proven, fs still reads: only fs copies, the cut stays" },
+        { 3, 3, 0, 1, 0, 0, 0, 0, "both stages proven: no copy, one pass for all three draws" },
     };
     for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         for (int st = 0; st < 2; st++) { g_fprog.nent[st] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[st][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_DRV0; e->count = 1; }
-        g_fprog.binst_unread = cases[k].unread; g_arena_used = 0;   // 替身暂存区 64 KB 不查越界：每段从头用（上一段已完成）
+        g_fprog.binst_unread = cases[k].unread; g_fprog.binst_known = cases[k].known; g_arena_used = 0;
+        { uint64_t cz[RP_CUT_N][RP_CUTV_N], iz[2]; rp_pass_cut_take(cz); rp_draw_ind_copy_take(iz); }   // 清零：只看这一段   // 替身暂存区 64 KB 不查越界：每段从头用（上一段已完成）
         int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws;
         stream s = {0}; mdi_prelude(&s, &rtt);
         for (int i = 0; i < 3; i++) { p_draw_idx *di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->instances = 1; di->ibuf = base + 3 * PG; di->ind = ind + (uint64_t)i * 20; }
         end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        uint64_t cut[RP_CUT_N][RP_CUTV_N], icw[2]; rp_pass_cut_take(cut); rp_draw_ind_copy_take(icw);
+        if (cut[RP_CUT_IND_COPY][RP_CUTV_ENDED] != (uint64_t)cases[k].ic_end || cut[RP_CUT_IND_COPY][RP_CUTV_ENDED_TINY] != (uint64_t)cases[k].ic_end ||
+            cut[RP_CUT_IND_COPY][RP_CUTV_NEXT_TINY] != (uint64_t)cases[k].ic_next || cut[RP_CUT_SUBMIT][RP_CUTV_ENDED] != 1 ||
+            icw[0] != (uint64_t)cases[k].unk || icw[1] != (uint64_t)cases[k].rd) {
+            printf("  %s: cut ind_copy ended %llu tiny %llu next_tiny %llu submit %llu; copy stages unknown %llu read %llu (expect %d / %d / %d / 1; %d / %d)\n", cases[k].what,
+                   (unsigned long long)cut[RP_CUT_IND_COPY][RP_CUTV_ENDED], (unsigned long long)cut[RP_CUT_IND_COPY][RP_CUTV_ENDED_TINY], (unsigned long long)cut[RP_CUT_IND_COPY][RP_CUTV_NEXT_TINY],
+                   (unsigned long long)cut[RP_CUT_SUBMIT][RP_CUTV_ENDED], (unsigned long long)icw[0], (unsigned long long)icw[1], cases[k].ic_end, cases[k].ic_end, cases[k].ic_next, cases[k].unk, cases[k].rd);
+            CHECK(0);
+        }
         if (g_gdraws - d0 != 3 || g_ncopy4 - c0 != cases[k].copies || g_npd - p0 != cases[k].passes) {
             printf("  %s: draws %d copies %d passes %d (expect 3 / %d / %d)\n", cases[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0, cases[k].copies, cases[k].passes);
             CHECK(0);

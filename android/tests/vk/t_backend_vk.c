@@ -57,7 +57,7 @@ static int g_compute_warm = -1;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
-static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match;
+static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match, g_diag_gaps_match;
 // 诊断采样窗：S2A_TEST_DIAG_DFLT 设了就全按后端缺省读；否则 nvk_diag_from_s 缺省读 0（其余诊断用例从第一段就要输出），
 // S2A_TEST_NVK_DIAG_<名> 指定值。开窗 / 关窗 / 配置三行存下来给用例核。
 static atomic_int g_ind_logs, g_ind_match, g_ind_cov, g_ind_next;
@@ -126,6 +126,15 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
         if (strstr(text,"seq=101") && strstr(text,"before_full=1") && strstr(text,"after_full=1") && strstr(text,"before_guest=0x8") && strstr(text,"after_guest=0x20")) atomic_fetch_add(&g_diag_barrier_match, 1);
         if (strstr(text,"seq=102") && strstr(text,"groups_known=0") && strstr(text,"source=completed_query")) atomic_fetch_add(&g_diag_indirect_match, 1);
         if (strstr(text,"seq=103") && strstr(text,"source=unavailable") && strstr(text,"reason=fence_failed_or_not_submitted")) atomic_fetch_add(&g_diag_failed_match, 1);
+    }
+    if (text && !strncmp(text, "gpu seg_gaps fence=", 19)) {   // 段内只有 1 个通道、它之前录了两次派发：派发那一栏 > 0，各栏 + 通道内 + 段尾 ≈ 跨度
+        unsigned long long f, span, inp, g[8], tail; unsigned np, tr, tb;
+        if (sscanf(text, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu gap_none_ns=%llu gap_copy_ns=%llu gap_fill_ns=%llu gap_clear_ns=%llu gap_dispatch_ns=%llu gap_upload_ns=%llu gap_reopen_ns=%llu gap_mix_ns=%llu tail_ns=%llu tail_bits=0x%x",
+                   &f, &np, &tr, &span, &inp, &g[0], &g[1], &g[2], &g[3], &g[4], &g[5], &g[6], &g[7], &tail, &tb) == 15) {
+            unsigned long long sum = inp; for (int k = 0; k < 8; k++) sum += g[k];
+            unsigned long long d = sum > span ? sum - span : span - sum;
+            if (f == 1 && np == 1 && !tr && g[4] > 0 && d <= 8 && span > 0) atomic_fetch_add(&g_diag_gaps_match, 1);
+        }
     }
     if (text && strstr(text, "gpu pass_detail")) {
         atomic_fetch_add(&g_diag_pass_logs, 1);
@@ -10396,6 +10405,7 @@ static int gpu_diag_only(const char *dir) {
     CHECK(atomic_load(&g_ind_next)==on, "gpu diag dispatch followed by first indirect args: on=%d matched=%d", on, atomic_load(&g_ind_next));
     CHECK(atomic_load(&g_ind_logs)==on && atomic_load(&g_ind_match)==on && atomic_load(&g_ind_cov)==on,
           "gpu diag indirect args readback from GPU-written buffer: on=%d logs=%d match=%d cov=%d", on, atomic_load(&g_ind_logs), atomic_load(&g_ind_match), atomic_load(&g_ind_cov));
+    CHECK(atomic_load(&g_diag_gaps_match)==on, "gpu diag segment gaps attribute dispatch time before the pass: on=%d matched=%d", on, atomic_load(&g_diag_gaps_match));
     CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,
           "gpu diag empty pass attachment load/store detail: on=%d logs=%d match=%d", on, atomic_load(&g_diag_pass_logs), atomic_load(&g_diag_pass_match));
     const uint32_t *result = (const uint32_t *)buf_cpu(buf); int bad=0;

@@ -543,6 +543,22 @@ static uint8_t g_sb_ok[RP_PROG_STAGES][RP_PROG_ENT_MAX];
 // Per-draw GPU-populated driver slices. Never retained by the binding cache.
 // 弱链接[replay]：nvn_gpu_diag_ind_args
 extern void nvn_gpu_diag_ind_args(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, const uint32_t *, int, int, uint64_t, uint64_t, uint32_t) __attribute__((weak));
+// 间接绘制为 base instance 拷贝（并为它收通道）的原因读数：读集未知 = 编译结果没带 c0Reads（缺字段 / null：出包预编库、寄存器下标读 c0）；
+//   读集含 0x644 = 编译器证明这一阶段真读 c0 + 0x644（顶点阶段以外的阶段，或 cbdp 没换成内建）。前 16 个不同的（阶段，程序键）各报一行。
+static uint64_t g_ind_copy_why[2];
+static uint64_t g_ind_copy_said[16]; static int g_ind_copy_nsaid;
+void rp_draw_ind_copy_take(uint64_t out[2]) { out[0] = g_ind_copy_why[0]; out[1] = g_ind_copy_why[1]; g_ind_copy_why[0] = g_ind_copy_why[1] = 0; }
+static void ind_copy_note(int st, int known) {
+    g_ind_copy_why[known]++;
+    if (g_ind_copy_nsaid >= 16) return;
+    uint64_t k = 0; for (int i = 0; i < 8; i++) k = (k << 8) | rp_S.skey[st][i];
+    const uint64_t id = k ^ ((uint64_t)st << 60) ^ ((uint64_t)known << 59);
+    for (int i = 0; i < g_ind_copy_nsaid; i++) if (g_ind_copy_said[i] == id) return;
+    g_ind_copy_said[g_ind_copy_nsaid++] = id;
+    char b[200]; snprintf(b, sizeof b, "间接绘制为 base instance 拷贝并收通道 #%d：阶段 %d 程序键 %016llx%s，原因 %s", g_ind_copy_nsaid, st, (unsigned long long)k,
+                          (rp_S.skey_ok >> st & 1) ? "" : "（键未知）", known ? "编译器读集含 c0+0x644" : "编译结果没有 c0 读集（未知）");
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b);
+}
 static nvn_gpu_slice g_ind_drv[RP_PROG_STAGES];
 static uint8_t g_ind_drv_ok[RP_PROG_STAGES];
 static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance) {
@@ -1120,11 +1136,12 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             // 编译器证明这一阶段不读 c0 + 0x644（cbdp 真时顶点阶段对它的读已换成内建 BaseInstance，间接绘制的 firstInstance 直接生效）：
             //   不拷、不为拷贝收通道，驱动段走普通内容缓存（base_instance 那个字没人读）。未知 / 读的照旧拷。
             if (g_prog->binst_unread >> st & 1) continue;
+            ind_copy_note(st, g_prog->binst_known >> st & 1);   // 读数：这一阶段为什么要拷（读集未知 / 读集含 0x644），前 16 个程序各报一行
             if (!alloc_copy(c, DRV0_BYTES, NULL, &g_ind_drv[st])) { skip("arena_alloc_failed", rec); return; }
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) rp_pass_flush(c);
+            if (!copied) { rp_pass_why(RP_CUT_IND_COPY); rp_pass_flush(c); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1490,7 +1507,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     rp_view_pin_begin();
     for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
         if (e->src_kind == NVN_RB_TBUF) {
-            rp_pass_flush(c);
+            rp_pass_why(RP_CUT_TBUF); rp_pass_flush(c);
             if (!tbuf_prepare(c, e, 5, pg->dtt[0][i], pg->dcls[0][i], &tv[i], rec)) goto done;
             continue;
         }
@@ -1543,7 +1560,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     }
     { struct timespec tr1; clock_gettime(CLOCK_MONOTONIC, &tr1); rp_perf_add(RP_PERF_DISP_RESOLVE_NS, (uint64_t)tr1.tv_sec * 1000000000ull + (uint64_t)tr1.tv_nsec - r0); }
     { struct timespec tsb; clock_gettime(CLOCK_MONOTONIC, &tsb); uint64_t f0 = (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec;
-      rp_pass_flush(c);
+      rp_pass_why(RP_CUT_DISPATCH); rp_pass_flush(c);
       clock_gettime(CLOCK_MONOTONIC, &tsb); rp_perf_add(RP_PERF_DISP_FLUSH_NS, (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec - f0); }
     g_disp_ind = NULL; g_disp_ind_off = 0;
     { struct timespec tin; clock_gettime(CLOCK_MONOTONIC, &tin); uint64_t in0 = (uint64_t)tin.tv_sec * 1000000000ull + (uint64_t)tin.tv_nsec;
@@ -1632,7 +1649,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { g_caps_ok = 0; g_ind_copy_nsaid = 0; g_ind_copy_why[0] = g_ind_copy_why[1] = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941

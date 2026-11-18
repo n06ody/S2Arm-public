@@ -264,7 +264,7 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
                       return fail(why, why_size, "stage c0 read range is invalid");
                   if ((uint64_t)o < FD_C0_BASE_INSTANCE + 4 && (uint64_t)o + z > FD_C0_BASE_INSTANCE) hit = 1;
               }
-              out->stage[idx].binst_unread = !hit;
+              out->stage[idx].binst_unread = !hit; out->stage[idx].binst_known = 1;
           } }
         // 片元着色器的输出映射（每个颜色目标 4 位、RGBA 各 1 位）：在阶段的 info 里；读不到 = 全 1（不屏蔽）
         out->stage[idx].fragment_output_map = 0xffffffffu;

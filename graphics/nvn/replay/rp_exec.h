@@ -53,6 +53,14 @@ int rp_pass_begin(nvn_gpu_cmd c);     // 绘制前调：1 = 通道开着；0 = �
 void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n);
 int rp_pass_parked(void);   // 现在挂着几条待折清除（绘制路径的快路门：0 = 不必为读路径收集贴图）
 void rp_pass_end(nvn_gpu_cmd c);
+// 切通道原因（缺省常开，只计数）：调用方在结束通道之前报一声为什么结束（rp_pass_why），rp_pass_end 按原因记「结束了几个开着的通道、
+//   其中 0–1 笔的几个与千像素」，并把原因带给下一个开出的通道（它若也只有 0–1 笔，按「开通道前的切点」再记一次）。没报原因的记 OTHER。
+enum { RP_CUT_OTHER, RP_CUT_RT, RP_CUT_CLEAR, RP_CUT_CLEAR_RECT, RP_CUT_MASK, RP_CUT_AREA, RP_CUT_IND_COPY, RP_CUT_DISPATCH, RP_CUT_TBUF,
+       RP_CUT_BUFOPS, RP_CUT_XFER_OP, RP_CUT_REPORT, RP_CUT_SUBMIT, RP_CUT_PRE_XFER, RP_CUT_LAND, RP_CUT_OCCL, RP_CUT_N };
+enum { RP_CUTV_ENDED, RP_CUTV_ENDED_TINY, RP_CUTV_ENDED_TINY_KPIX, RP_CUTV_NEXT_TINY, RP_CUTV_NEXT_TINY_KPIX, RP_CUTV_N };
+void rp_pass_why(int why);
+void rp_draw_ind_copy_take(uint64_t out[2]);   // 间接绘制 base instance 拷贝的阶段次数：[0] 读集未知、[1] 读集含 0x644（取走并清零）
+void rp_pass_cut_take(uint64_t out[RP_CUT_N][RP_CUTV_N]);   // 取走并清零（分时窗口用）
 void rp_pass_flush(nvn_gpu_cmd c);    // 提交前 / 通道外操作前：落地待折清除并结束通道
 void rp_pass_reset(void);
 int rp_pass_is_open(void);

@@ -262,6 +262,20 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                {   // 切通道原因（缺省常开，只计数）：每类每帧结束了几个开着的通道，其中 0–1 笔的几个 / 百万像素；以这一类切点开出、又只有 0–1 笔的通道几个 / 百万像素
+                    static const char *const nm[RP_CUT_N] = { "其它", "换目标", "整屏清除", "矩形清除开通道", "写掩码集合变", "区域扩大", "间接绘制拷 base instance", "计算派发",
+                                                              "纹素缓冲准备", "GPU 上改拷清缓冲", "贴图拷贝 / 清除", "计数器报告", "提交收尾", "同一提交第二次前置传输", "落地挂起清除", "遮挡首次复位交段" };
+                    uint64_t cut[RP_CUT_N][RP_CUTV_N]; rp_pass_cut_take(cut);
+                    uint64_t icw[2]; rp_draw_ind_copy_take(icw);
+                    char cb[1500]; size_t o = (size_t)snprintf(cb, sizeof cb, "分时（切通道原因，每帧）：");
+                    for (int r = 0; r < RP_CUT_N && o < sizeof cb; r++) {
+                        if (!cut[r][RP_CUTV_ENDED] && !cut[r][RP_CUTV_NEXT_TINY]) continue;
+                        o += (size_t)snprintf(cb + o, sizeof cb - o, "%s%s 结束 %.1f（其中 0–1 笔 %.1f / %.1f 百万像素；其后 0–1 笔 %.1f / %.1f 百万像素）", o > 30 ? "；" : "", nm[r],
+                                              (double)cut[r][RP_CUTV_ENDED] / f, (double)cut[r][RP_CUTV_ENDED_TINY] / f, (double)cut[r][RP_CUTV_ENDED_TINY_KPIX] / 1e3 / f,
+                                              (double)cut[r][RP_CUTV_NEXT_TINY] / f, (double)cut[r][RP_CUTV_NEXT_TINY_KPIX] / 1e3 / f);
+                    }
+                    if (o < sizeof cb) snprintf(cb + o, sizeof cb - o, "；间接拷贝阶段次：读集未知 %.1f、读集含 0x644 %.1f", (double)icw[0] / f, (double)icw[1] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", cb); }
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);

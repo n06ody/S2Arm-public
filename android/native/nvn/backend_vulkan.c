@@ -1742,9 +1742,46 @@ static void ind_args_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status
     char line[200]; snprintf(line, sizeof line, "gpu ind_args_cov fence=%llu recorded=%u overflow=%u inpass=%u uncovered=%u", (unsigned long long)signal, a->n, a->overflow, a->inpass, a->uncovered);
     nvn_plat_log(a->overflow || a->inpass ? NVN_PLAT_LOG_WARN : NVN_PLAT_LOG_INFO, "gpu", line);
 }
+// 通道外 GPU 时间拆账（诊断，nvk_gputime + nvk_pass_detail 开着、采样窗内的段）：段首 → 第 1 个通道、相邻通道之间、最后一个通道 → 段尾，
+//   这些空当里 GPU 在做通道外的事（派发 / 拷贝 / 填充 / 上传 / 屏障）。相邻通道之间的空当按下一个通道的 before 位归账（它记的正是两通道之间
+//   录过的通道外操作），段尾按最后一个通道的 after 位归账；没有标记的（只有屏障 / 交段间隔）记 none，几类混在一起的记 mix。
+//   各项加起来 = 段首尾跨度（同一组时间戳，每项各自取整，合计只差几纳秒）。时间戳缺一个就整段不报（不拿半截数据凑）。
+static void seg_gaps_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status) {
+    if (!c || !c->pass_details || !c->tsq || status != NVN_GPU_DONE_OK) return;
+    const uint32_t n = c->ntsp < TS_PASS_MAX ? c->ntsp : TS_PASS_MAX;
+    uint32_t bits = csf_timestamp_bits(); VkPhysicalDeviceProperties prop; vkGetPhysicalDeviceProperties(g.phys, &prop);
+    if (!bits || prop.limits.timestampPeriod <= 0) return;
+    static uint64_t q[2 + 2 * TS_PASS_MAX][2];
+    if (vkGetQueryPoolResults(g.d, c->tsq, 0, 2 + 2 * n, sizeof q[0] * (2 + 2 * n), q, sizeof q[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != VK_SUCCESS) return;
+    for (uint32_t i = 0; i < 2 + 2 * n; i++) if (!q[i][1]) return;
+    const uint64_t mask = bits < 64 ? (1ull << bits) - 1 : ~0ull;
+    const double per = prop.limits.timestampPeriod;
+    #define SG_NS(a, b) ((uint64_t)((double)(((b) - (a)) & mask) * per))
+    enum { G_NONE, G_COPY, G_FILL, G_CLEAR, G_DISPATCH, G_UPLOAD, G_REOPEN, G_MIX, G_N };
+    uint64_t gap[G_N] = {0}, in_pass = 0, prev = q[0][0];
+    #define SG_CAT(b) ((b) == 0 ? G_NONE : (b) == PD_COPY ? G_COPY : (b) == PD_FILL ? G_FILL : (b) == PD_CLEAR ? G_CLEAR : (b) == PD_DISPATCH ? G_DISPATCH : (b) == PD_UPLOAD ? G_UPLOAD : (b) == PD_REOPEN ? G_REOPEN : G_MIX)
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t b = q[2 + 2 * i][0], e = q[3 + 2 * i][0];
+        gap[SG_CAT(c->pass_details->p[i].before & 63u)] += SG_NS(prev, b);
+        in_pass += SG_NS(b, e); prev = e;
+    }
+    const uint32_t tail_bits = n ? c->pass_details->p[n - 1].after & 63u : c->pass_details->events & 63u;
+    const uint64_t tail = SG_NS(prev, q[1][0]), span = SG_NS(q[0][0], q[1][0]);
+    gap[SG_CAT(tail_bits)] += tail;
+    char line[520];
+    snprintf(line, sizeof line, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu gap_none_ns=%llu gap_copy_ns=%llu gap_fill_ns=%llu gap_clear_ns=%llu gap_dispatch_ns=%llu gap_upload_ns=%llu gap_reopen_ns=%llu gap_mix_ns=%llu tail_ns=%llu tail_bits=0x%x",
+             (unsigned long long)signal, n, c->ntsp > TS_PASS_MAX, (unsigned long long)span, (unsigned long long)in_pass,
+             (unsigned long long)gap[G_NONE], (unsigned long long)gap[G_COPY], (unsigned long long)gap[G_FILL], (unsigned long long)gap[G_CLEAR],
+             (unsigned long long)gap[G_DISPATCH], (unsigned long long)gap[G_UPLOAD], (unsigned long long)gap[G_REOPEN], (unsigned long long)gap[G_MIX],
+             (unsigned long long)tail, tail_bits);
+    #undef SG_CAT
+    #undef SG_NS
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+}
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     csf_dispatch_report(s->cmd,s->signal,status);
     pass_detail_report(s->cmd,s->signal,status);
+    seg_gaps_report(s->cmd,s->signal,status);
     ind_args_report(s->cmd,s->signal,status);
     if (!s->done) return;
     nvn_gpu_done d;
