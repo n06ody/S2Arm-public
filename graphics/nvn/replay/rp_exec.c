@@ -98,6 +98,11 @@ static void fr_perf_project(int i, uint64_t v) {
     int k = fr_slot_of(i);
     if (k >= 0) __atomic_fetch_add(&g_fr_perf[k], v, __ATOMIC_RELAXED);
 }
+// 逐帧帧日志的 fence 字段（nvn_vk_frame_log.c，#1501 D①）：每次同步等待 / Finish 等待记一次，口径同 RP_PERF_WAIT_N + RP_PERF_WAIT_FIN_N
+//   （含「进等待时已完成」与放行的那几次）。弱引用：宿主单测 / 鸿蒙不链帧日志。开关关着时函数里只判一次缓存标志。
+// 弱链接[replay]：nvn_vk_frame_log_fence_wait
+void nvn_vk_frame_log_fence_wait(uint64_t wait_ns) __attribute__((weak));
+static void fl_fence(uint64_t ns) { if (nvn_vk_frame_log_fence_wait) nvn_vk_frame_log_fence_wait(ns); }
 void rp_perf_add(int i, uint64_t v) { pf_add(i, v); fr_perf_project(i, v); }   // 5 秒窗口 + 帧级分项（后者只在 nvk_hitch_log 打开时记）
 // GPU 忙时估算：每段完成时按完成顺序累计「显卡真正在跑」的区间（判 GPU 到底忙多久、是不是墙）。
 // busy += done_i - max(commit_i, done_{i-1})（第一段：done_0 - commit_0）。commit 在提交前取，done 在完成回调里取；
@@ -442,7 +447,7 @@ void nvn_be_finish_wait(uint64_t fence) {
     if (!fence) return;
     uint64_t t0 = now_ns();
     nvn_gpu_rc r = nvn_gpu_fence_wait(fence, 5000000000ull, NULL);
-    pf_add(RP_PERF_WAIT_FIN_N, 1); pf_add(RP_PERF_WAIT_FIN_NS, now_ns() - t0);
+    { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_FIN_N, 1); pf_add(RP_PERF_WAIT_FIN_NS, w); fl_fence(w); }
     (void)r;   // 时间线已失败时这里也等不到：失败本身已在 sub_done 报红，Finish 不因此卡游戏线程
 }
 
@@ -452,7 +457,7 @@ static int g_wrote_since_wait;   // 本轮等待之后有没有「显卡写游�
 int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!fence) return 1;
     uint64_t t0 = now_ns();
-    if (rp_fence_done(fence)) { pf_add(RP_PERF_WAIT_NS, now_ns() - t0); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_ALREADY_N, 1); return 1; }
+    if (rp_fence_done(fence)) { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_ALREADY_N, 1); fl_fence(w); return 1; }
     {   // 开关 debug.s2a.nvk_sync_lag（缺省 0 = 旧行为：真等）：
         //   1 = 允许「最多一次提交还在显卡上飞」：等的时候若这一栅栏只领先已完成值一格就不真等（返回已满足），
         //       下一次提交前换一份池镜像（照 nvk_finish_lag 的做法，见 rp_buf_frame_flip），让 CPU 回放与显卡执行重叠。
@@ -476,11 +481,11 @@ int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
             // 不能放行：双镜像只保护 GPU 读，不会阻止完成回调覆盖新的 CPU 写。
             // 时间戳同样会覆盖游戏内存，SyncWait 不能像 Finish 一样排除它；只读提交仍保留重叠。
             if (__atomic_load_n(&g_wait_effect_fence, __ATOMIC_ACQUIRE) > done) allow = 0;
-            if (allow) { rp_buf_frame_flip(); pf_add(RP_PERF_WAIT_NS, now_ns() - t0); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); return 1; }
+            if (allow) { rp_buf_frame_flip(); uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); fl_fence(w); return 1; }
         } }
     nvn_gpu_rc r = nvn_gpu_fence_wait(fence, timeout_ns, NULL);
     __atomic_store_n(&g_wrote_since_wait, 0, __ATOMIC_RELEASE);   // 真等过：显卡写的缓冲已经落地
-    pf_add(RP_PERF_WAIT_NS, now_ns() - t0); pf_add(RP_PERF_WAIT_N, 1);
+    { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); fl_fence(w); }
     // 时间线已失败：再等也不会完成。按「已结束」放行，让游戏线程不死等；失败本身已在 sub_done 报红
     return nvn_gpu_ok(r) || r.code == NVN_GPU_E_FAILED || r.code == NVN_GPU_E_DEVICE;
 }

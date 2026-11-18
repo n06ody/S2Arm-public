@@ -207,6 +207,47 @@ static void gpu_field_test(void) {
     g_stub_on = 0;
 }
 
+// 新回放层的 GPU 读数源（#1501 D①）：后端每段报 GPU 时间戳跨度、上屏段完成时结一帧。
+// first_draw 桩关着（新回放层不链它）时走这一路；同一帧只报一次；没开 nvk_gputime（不报段）时不发布。
+static void gpu_frame_source_test(void) {
+    struct s2a_frame_log fl;
+    int saved_on = g_fl_on;
+    s2a_fl_reset(&fl); fl_gpu_frame_reset(); g_stub_on = 0;
+    g_fl_on = 0;                                   // 帧日志关着：段与帧末都不记
+    nvn_vk_frame_log_gpu_segment(9000000); nvn_vk_frame_log_gpu_frame_end();
+    s2a_fl_note(&fl, 500);
+    CHECK(fl.rec[0].gpu_us == UINT32_MAX && fl.rec[0].gpu_seq == UINT32_MAX);
+    g_fl_on = 1;
+    nvn_vk_frame_log_gpu_segment(3000000); nvn_vk_frame_log_gpu_segment(2250000);   // 一帧两段：3 + 2.25 ms
+    s2a_fl_note(&fl, 1000);                        // 上屏段还没完成：这一帧没结出
+    CHECK(fl.rec[1].gpu_us == UINT32_MAX && fl.rec[1].gpu_seq == UINT32_MAX);
+    nvn_vk_frame_log_gpu_frame_end();              // 第 1 次上屏段完成
+    s2a_fl_note(&fl, 2000);
+    CHECK(fl.rec[2].gpu_us == 5250 && fl.rec[2].gpu_seq == 1);
+    s2a_fl_note(&fl, 3000);                        // 同一帧 → 只报一次
+    CHECK(fl.rec[3].gpu_us == UINT32_MAX && fl.rec[3].gpu_seq == UINT32_MAX);
+    nvn_vk_frame_log_gpu_frame_end();              // 第 2 帧没有段读数（nvk_gputime 关）：不发布，不写 0
+    s2a_fl_note(&fl, 4000);
+    CHECK(fl.rec[4].gpu_us == UINT32_MAX && fl.rec[4].gpu_seq == UINT32_MAX);
+    nvn_vk_frame_log_gpu_segment(1000000); nvn_vk_frame_log_gpu_frame_end();          // 第 3 帧
+    s2a_fl_note(&fl, 5000);
+    CHECK(fl.rec[5].gpu_us == 1000 && fl.rec[5].gpu_seq == 3);
+    g_stub_on = 1; g_stub_ms = 7.0; g_stub_seq = 40;                                  // 旧层 first_draw 有读数时优先用它
+    nvn_vk_frame_log_gpu_segment(1000000); nvn_vk_frame_log_gpu_frame_end();
+    s2a_fl_note(&fl, 6000);
+    CHECK(fl.rec[6].gpu_us == 7000 && fl.rec[6].gpu_seq == 40);
+    g_stub_on = 0;
+    fl_gpu_frame_reset();                          // 新会话：帧号从 1 重新数，旧的去重记录不挡新会话第 1 帧
+    nvn_vk_frame_log_gpu_segment(2000000); nvn_vk_frame_log_gpu_frame_end();
+    s2a_fl_note(&fl, 7000);
+    CHECK(fl.rec[7].gpu_us == 2000 && fl.rec[7].gpu_seq == 1);
+    fl_gpu_frame_reset();                          // 再开一局：上一局最后报的也是第 1 帧，新一局的第 1 帧照样要报
+    nvn_vk_frame_log_gpu_segment(4000000); nvn_vk_frame_log_gpu_frame_end();
+    s2a_fl_note(&fl, 8000);
+    CHECK(fl.rec[8].gpu_us == 4000 && fl.rec[8].gpu_seq == 1);
+    fl_gpu_frame_reset(); g_fl_on = saved_on;
+}
+
 // disp 字段用例：强符号桩覆盖弱符号 nvn_vk_dt_last_gap——剧本化（已确认对的
 // 较新帧号, 间隔 ns），核 disp_us/disp_seq 与「同一对已确认对只报一次」去重。
 static uint64_t g_dt_frame; static uint64_t g_dt_gap_ns; static int g_dt_on;
@@ -239,6 +280,7 @@ static void disp_field_test(void) {
 int main(void) {
     concurrent_snapshot_test();
     gpu_field_test();
+    gpu_frame_source_test();
     disp_field_test();
     struct s2a_frame_log fl;
 
