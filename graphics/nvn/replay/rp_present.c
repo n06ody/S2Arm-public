@@ -16,16 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 
-// 与分时共用同一窗口；查页是所有受跟踪缓冲的逐页检查总量，不仅限索引。
-void rp_buf_blocks_report(const uint64_t pf[RP_PERF_N]) {
-    if (!nvn_plat_flag("nvk_buf_blocks", 0)) return;
-    char b[160];
-    snprintf(b, sizeof b, "分时（回放缓冲块核查，本窗口）：跳过 %llu 块、逐页查 %llu 页",
-             (unsigned long long)pf[RP_PERF_BUF_BLOCK_SKIP_N], (unsigned long long)pf[RP_PERF_BUF_PAGES_N]);
-    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-}
-
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：s2a_direct_diag_frame
+__attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
 
 enum { PT_RING = 256 };
@@ -206,6 +199,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
       clock_gettime(CLOCK_MONOTONIC, &p1); rp_perf_add(RP_PERF_PRESENT_NS, (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -283,7 +277,6 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
                              (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
-                rp_buf_blocks_report(pf);
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核
