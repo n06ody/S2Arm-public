@@ -81,8 +81,8 @@ nvn_gpu_samp rp_samp_by_id(int i){(void)i;return NULL;}
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid){(void)tid;return rp_samp_by_id(sid);}
 uint32_t rp_fmt_caps(uint32_t f){return nvn_gpu_format_caps(f);}
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){(void)i;(void)t;(void)v;(void)h;return 0;}
-nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)t;(void)v;(void)c;return NULL;}   // 本夹具的程序没有图像绑定，走不到；rp_draw.c 的存储图像路径（d810f73a8 / 2f076a629 起）要这两个符号才链接得上
-uint32_t rp_storage_srgb_alias(uint32_t f){(void)f;return 0;}
+nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)t;(void)v;(void)c;abort();}   // 本夹具只绑缓冲：若误入图像路径立即报错
+uint32_t rp_storage_srgb_alias(uint32_t f){(void)f;abort();}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
 void rp_tex_mark_gpu_written(const tex_t *t){(void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){(void)s;return NULL;}
