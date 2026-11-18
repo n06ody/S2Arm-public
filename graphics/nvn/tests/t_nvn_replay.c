@@ -1038,15 +1038,18 @@ static void t_tex_linear_dirty_rows(void) {
     g_wp_on = 1; g_wp_dirty[10] = g_wp_dirty[11] = g_wp_dirty[40] = 1;
     memset(g_block_mem + 10 * 4096, 0xA1, 2 * 4096); memset(g_block_mem + 40 * 4096, 0xB2, 4096);
     g_nup = 0; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    g_block_gen[10] = g_block_gen[11] = g_block_gen[40] = g_dirty_written;   // 真写同时推进被写页的代号（脏页日志按它出事件）
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 2);
     CHECK(g_nup == 2);
     CHECK(g_nup >= 1 && g_up[0].y == 10 && g_up[0].h == 2 && g_up[0].w == 4096 && g_up[0].pitch == 4096 && g_up[0].first[0] == 0xA1);
     CHECK(g_nup >= 2 && g_up[1].y == 40 && g_up[1].h == 1 && g_up[1].first[0] == 0xB2);
     memset(g_wp_dirty, 0, sizeof g_wp_dirty); for (int k = 0; k < 40; k++) g_wp_dirty[k] = 1;   // 脏 40 行（过半）→ 整张
     g_nup = 0; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    for (int k = 0; k < 40; k++) g_block_gen[k] = g_dirty_written;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 1 && g_up[0].y == 0 && g_up[0].h == 64);
     g_wp_on = 0; memset(g_wp_dirty, 0, sizeof g_wp_dirty);   // 位图不可用 → 整张
     g_nup = 0; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    g_block_gen[5] = g_dirty_written;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 1 && g_up[0].h == 64);
     nvn_be_tex_release(&t);
     g_block_mem = NULL;
