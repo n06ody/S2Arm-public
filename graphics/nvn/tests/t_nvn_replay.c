@@ -2915,6 +2915,40 @@ static void put_set_rt_n(stream *s, const tex_t *const *color, int n, const tex_
     for (int i = 0; i < n; i++) if (color[i]) { snap[k] = *color[i]; pt[k] = &snap[k]; k++; }
     if (depth) { snap[k] = *depth; pt[k] = &snap[k]; }
 }
+// #1581 H：同一组目标里各附件尺寸不同。Vulkan 要求帧缓冲宽高不超过每个附件（VkFramebufferCreateInfo），
+//   通道内矩形清要落在渲染区域里（vkCmdClearAttachments）；对齐 iOS pass_dims / Ryujinx FramebufferParams：取全部已挂附件（含深度）的最小公共尺寸。
+//   期望尺寸直接写常量；每种都断言通道尺寸不超过每个附件。
+static void t_pass_mixed_extent(void) {
+    static const struct { uint32_t c0w, c0h, c1w, c1h, dw, dh, ww, wh; } k[] = {
+        {64, 32, 32, 16, 48, 24, 32, 16},   // 颜色槽 0 大、槽 1 与深度小
+        {16,  8, 64, 32, 64, 32, 16,  8},   // 反过来：槽 0 最小
+        {64, 32, 64, 32, 40, 20, 40, 20},   // 只有深度小
+        {64, 32, 20, 40, 48, 24, 20, 24},   // 宽高的最小值来自不同附件
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        pass_fresh(); g_gdraws = 0;
+        tex_t c0 = mk_tex(1581, 0, NVN_FORMAT_RGBA8, k[i].c0w, k[i].c0h, 1, 0), c1 = mk_tex(1582, 0x8000, NVN_FORMAT_RGBA8, k[i].c1w, k[i].c1h, 1, 0);
+        tex_t z = mk_tex(1583, 0x10000, NVN_FORMAT_DEPTH24_STENCIL8, k[i].dw, k[i].dh, 1, 0);
+        const tex_t *c_[2] = {&c0, &c1};
+        static stream s; memset(&s, 0, sizeof s); q_env(&s); put_set_rt_n(&s, c_, 2, &z);
+        q_draw(&s);
+        // 槽 1 带裁剪的矩形清（裁剪 30x14 不盖满槽 1，走通道内矩形清）：交给后端的矩形不能越出通道
+        p_scissor *sc = put(&s, OP_SCISSOR, sizeof *sc); sc->x = 0; sc->y = 0; sc->w = 30; sc->h = 14;
+        p_clear_color *cc = put(&s, OP_CLEAR_COLOR, sizeof *cc); cc->index = 1; cc->mask = 0xf; cc->rgba[0] = 1;
+        end(&s);
+        submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_npd == 1 && g_gdraws == 1 && g_pd[0].color[0].view && g_pd[0].color[1].view && g_pd[0].depth.view);
+        CHECK(g_pd[0].w == k[i].ww && g_pd[0].h == k[i].wh);
+        CHECK(g_pd[0].w <= k[i].c0w && g_pd[0].w <= k[i].c1w && g_pd[0].w <= k[i].dw && g_pd[0].h <= k[i].c0h && g_pd[0].h <= k[i].c1h && g_pd[0].h <= k[i].dh);
+        CHECK(g_ncr == 1 && g_cr[0].npd == 1 && g_cr[0].d.color == 1 && g_cr[0].d.x == 0 && g_cr[0].d.y == 0);
+        uint32_t sw = k[i].c1w < 30 ? k[i].c1w : 30, sh = k[i].c1h < 14 ? k[i].c1h : 14;   // 裁剪 ∩ 槽 1
+        uint32_t rw = sw < k[i].ww ? sw : k[i].ww, rh = sh < k[i].wh ? sh : k[i].wh;      // 再 ∩ 通道
+        CHECK(g_cr[0].d.w == rw && g_cr[0].d.h == rh);
+        CHECK((uint64_t)g_cr[0].d.x + g_cr[0].d.w <= g_pd[0].w && (uint64_t)g_cr[0].d.y + g_cr[0].d.h <= g_pd[0].h);
+        CHECK(nvn_unimpl_count("pass", "clear_rect_beyond_pass_extent") == (sw > k[i].ww || sh > k[i].wh ? 1u : 0u));   // 裁掉了槽 1 上要清的像素：具名记账
+    }
+    pass_fresh();
+}
 // 中途交段：换渲染目标时，自上次交段起画够了 300 笔，就把已经录下的命令先交给后端，回放接着录进新的一段；
 // 回写、同步对象的栅栏值都在最后一段上。用例把每段的笔数改成 12（手工拼的命令流放不下三百笔）：13 笔 → 交一次（主段 2 个）；11 笔 → 不交。
 static int af_run(int draws, uint64_t *last_sig, uint64_t *f0) {
@@ -4514,6 +4548,7 @@ int main(int argc, char **argv) {
     t_buf_ops();
     t_copy_b2t();
     t_pass_clear_fold();
+    t_pass_mixed_extent();
     t_pass_depth_shadow();
     t_pass_no_attachment();
     t_pass_bc_shadow();
