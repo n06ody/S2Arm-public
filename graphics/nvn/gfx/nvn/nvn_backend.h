@@ -336,7 +336,7 @@ typedef struct {
     nvn_gpu_att color[8]; uint32_t ncolor;
     nvn_gpu_att depth, stencil;
     float clear_depth; uint32_t clear_stencil;
-    uint32_t w, h, layers;
+    uint32_t w, h, layers;   // w / h = 帧缓冲尺寸：不超过任何一个已挂附件（所挂那一级）的尺寸，核心取各附件（含深度）的最小公共尺寸（同 iOS pass_dims / Ryujinx）
     // 渲染区域（像素，左上原点；w 或 h 为 0 = 整个目标）。附件只在区域内载入 / 保存，区域外保持原内容（Vulkan 的 renderArea 语义）：
     // 核心按这一遍会碰到的视口 / 裁剪矩形给出实际区域，小目标 / 阴影分块这类小遍的载入与保存就不必按整张附件算。
     // 区域内必须盖住本通道所有绘制的像素（核心保证：有绘制超出就结束通道、按并集重开）。
