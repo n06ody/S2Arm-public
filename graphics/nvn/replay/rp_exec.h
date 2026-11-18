@@ -46,7 +46,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
 void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec);
 void rp_pass_barrier(uint32_t bits);
 uint32_t rp_pass_take_barrier(void);   // 通道外的计算派发前调：取走待发的游戏屏障位（取完清零），由调用方交给后端
-void rp_pass_prepare_draw(nvn_gpu_cmd c);   // 绘制前调：把这一笔要求的像素区域交给下一步开通道（超出当前通道区域就收通道重开）
+void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask);   // 有效颜色写掩码（含片元输出映射）与像素区域；附件集合变了或区域超出时重开
 int rp_pass_begin(nvn_gpu_cmd c);     // 绘制前调：1 = 通道开着；0 = 开不了（已记账），跳过这笔
 // 被读之前必须落地（rp_pass.c）：ts 里这些贴图要以「采样贴图 / 图像 / 拷贝端点 / 上屏」身份被用到之前先调一次，
 // 把还挂着它们的待折清除落地（挂起见 rp_pass.c 的 park）。按贴图序号匹配：读的是整张图，级 / 层不参与匹配。

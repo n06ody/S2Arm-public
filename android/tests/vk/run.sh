@@ -53,7 +53,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || [ "$mode" = "--zero-mask-core" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -191,6 +191,12 @@ fi
 # 上面 find_icd / find_layer 已按通配找到 lavapipe 与 validation 层（各发行版 ICD 文件名不一，如 lvp_icd.json / lvp_icd.x86_64.json），
 #   原样传给池表用例，只留这一处负责找（11-17：池表用例自己只认 lvp_icd.x86_64.json，CI 上找不到、退 2，contract-sim 四片全红）
 export S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer"
+if [ "$mode" = --zero-mask-core ]; then
+    exec bash "$repo/android/tests/vk/zero_mask.sh"
+fi
+if [ -z "$mode" ]; then
+    bash "$repo/android/tests/vk/zero_mask.sh"
+fi
 if [[ "$mode" == --pool-table* ]]; then
     exec bash "$repo/android/tests/vk/pool_table.sh" "${mode#--pool-table}"
 fi

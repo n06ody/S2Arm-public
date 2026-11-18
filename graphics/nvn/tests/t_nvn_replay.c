@@ -2272,6 +2272,8 @@ static void q_env(stream *s) {
 }
 static void q_draw(stream *s) { p_draw *d = put(s, OP_DRAW, sizeof *d); d->prim = 4; d->count = 3; d->instances = 1; }
 
+#include "t_pass_zero_mask.inc"
+
 // ---------- 通道边界（同目标续接 / 状态保持 / 待折清除）----------
 // 对齐 nvn_mtl.m:10955 rt_same 与 :15060 的续接：通道边界不再等于状态边界。这些用例都要真的画出东西，所以放在绘制替身之后。
 static void put_set_rt_v(stream *s, const tex_t *color, const view_t *cv);   // 定义在本文件后面（带视图记录的目标）
@@ -4566,6 +4568,7 @@ int main(int argc, char **argv) {
     t_pass_target_persists();
     t_pass_switch_and_partial();
     t_pass_rt_continue();
+    t_pass_zero_mask();
     t_pass_state_keep();
     t_pass_clear_park();
     t_pass_clear_park_tail();
