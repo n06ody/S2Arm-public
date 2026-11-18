@@ -206,6 +206,7 @@ int main(int argc, char **argv) {
     if (!strcmp(name, "sampler_method")) { expected_method = S2A_W2_QUERY_SAMPLER_TYPE; make_error("QuerySamplerType has no source (stage=fs,handle=12,cbufSlot=3)", 0); }
     if (!strcmp(name, "buffer_method")) { expected_method = S2A_W2_QUERY_IS_BUFFER; make_error("QueryTextureIsBuffer has no source (stage=fs,handle=12,cbufSlot=3)", 0); }
     if (!strcmp(name, "format_method")) { expected_method = S2A_W2_QUERY_FORMAT; make_error("QueryTextureFormat has no source (stage=fs,handle=12,cbufSlot=3,format=Unknown)", 0); }
+    if (!strcmp(name, "sampled_format_method")) { expected_method = S2A_W2_QUERY_SAMPLED_FORMAT; make_error("QueryS2ASampledTextureFormat has no source (stage=fs,handle=12,cbufSlot=3)", 0); }
     if (!strcmp(name, "escaped_message")) make_error("QueryTextureCoordNormalized has no source (stage=\\u0066s,handle=12,cbufSlot=3)", 0);
     if (!strcmp(name, "bad_method")) make_error("ConstantBuffer1Read has no source (offset=12)", 0);
     if (!strcmp(name, "bad_coordinate")) make_error("QueryTextureCoordNormalized has no source (stage=fs,handle=12,cbufSlot=65536)", 0);
@@ -256,7 +257,7 @@ int main(int argc, char **argv) {
         }
         int positive = !strcmp(name, "raw") || !strcmp(name, "replay") || !strcmp(name, "stale_return") || !strcmp(name, "thread_exit") ||
             !strcmp(name, "sampler_method") || !strcmp(name, "buffer_method") ||
-            !strcmp(name, "format_method") || !strcmp(name, "escaped_message");
+            !strcmp(name, "format_method") || !strcmp(name, "sampled_format_method") || !strcmp(name, "escaped_message");
         expect_published(positive ? 1 : 0);
         int returned = consume_returned();
         CHECK(returned == (positive && strcmp(name, "replay") && strcmp(name, "stale_return")), "new unattributed invocation cannot reuse old published receipt");
