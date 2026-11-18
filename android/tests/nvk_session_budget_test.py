@@ -12,8 +12,7 @@ import link_symbols
 
 def main():
     withdraw=sys.argv[1:]==['--withdraw-wait']
-    withdraw_log=sys.argv[1:]==['--withdraw-block-log']
-    if sys.argv[1:] and not (withdraw or withdraw_log): raise ValueError('usage: nvk_session_budget_test.py [--withdraw-wait|--withdraw-block-log]')
+    if sys.argv[1:] and not withdraw: raise ValueError('usage: nvk_session_budget_test.py [--withdraw-wait]')
     out=ROOT/'build/860-session-budget'; out.mkdir(parents=True,exist_ok=True)
     ndk=link_symbols.find_ndk()
     if ndk is None: raise RuntimeError('NDK 29 headers required')
@@ -26,16 +25,13 @@ def main():
     if withdraw:
         text=(ROOT/rel).read_text(); old='while (nvk_shader_inflight()) {'; assert text.count(old)==1
         session=out/'without-wait.c'; session.write_text(text.replace(old,'while (0 && nvk_shader_inflight()) {'))
-    if withdraw_log:
-        text=(ROOT/rel).read_text(); old='__android_log_print(ANDROID_LOG_INFO, TAG, "回放缓冲按块核查：开")'; assert text.count(old)==1
-        session=out/'without-block-log.c'; session.write_text(text.replace(old,'(void)0'))
     paths=[inc,ROOT/'android/tests/hostvk',ROOT/'android/native',ROOT/'android/native/gfx_plat',ROOT/'graphics/nvn',ROOT/'graphics/nvn/replay',ROOT/'graphics/nvn/gfx/nvn',ROOT/'graphics/nvn/gfx/nvn/include']
     flags=[os.environ.get('CC','cc'),'-std=c11','-O1','-Wall','-Wextra','-Werror','-ffunction-sections','-fdata-sections','-pthread']+['-I'+str(p) for p in paths]
     strip='-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'
     exe=out/'current'
     subprocess.run(flags+[str(ROOT/'android/tests/nvk_session_budget_test.c'),str(session),strip,'-o',str(exe)],check=True,timeout=30)
     rc=0
-    for mode in ('control','busy','blocks-off','blocks-refuse','blocks-enable'):
+    for mode in ('control','busy','log-off','log-default'):
         r=subprocess.run([str(exe),mode],capture_output=True,text=True,timeout=10);print(r.stdout+r.stderr,end='');rc|=r.returncode
     return rc
 if __name__=='__main__': raise SystemExit(main())
