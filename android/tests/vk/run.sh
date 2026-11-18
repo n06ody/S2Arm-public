@@ -300,7 +300,7 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
     if [ "$db_red" -ne 0 ]; then echo "【红】$mode" >&2; exit 1; fi
     echo "【绿】$mode"; exit 0
 fi
-if [ "$mode" = "--shown-only" ] || [[ "$mode" == --tbuf-* ]]; then
+if [ "$mode" = "--shown-only" ] || [[ "$mode" == --gpu-diag* ]] || [[ "$mode" == --tbuf-* ]]; then
     [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 Vulkan headers not staged' >&2; exit 2; }
     inc=(-I "$repo/build/c883-ndk" "${inc[@]}")
 fi
@@ -326,9 +326,25 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
+    ""|--gpu-diag|--gpu-diag-neg-key|--gpu-diag-neg-load|--gpu-diag-neg-barrier|--sampler-minmax-only|--c63-same-view|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
+if [[ "$mode" == --gpu-diag-neg-* ]]; then
+    python3 - "$mode" "${src[1]}" "$out/gpu_diag_mutant.c" <<'PYDIAG'
+import pathlib, sys
+mode, source, target = sys.argv[1:]
+s = pathlib.Path(source).read_text()
+changes = {
+ '--gpu-diag-neg-key': ('t->ids[at].key=key;', 't->ids[at].key=key^1;'),
+ '--gpu-diag-neg-load': ('p->a[i].load=(uint32_t)att[i].loadOp;', 'p->a[i].load=(uint32_t)VK_ATTACHMENT_LOAD_OP_LOAD;'),
+ '--gpu-diag-neg-barrier': ('csf_note_guest(c,nvn_bits);', 'csf_note_guest(c,nvn_bits & 0u);'),
+}
+a, b = changes[mode]
+if s.count(a) != 1: raise SystemExit('GPU diagnosis negative control anchor changed: '+mode)
+pathlib.Path(target).write_text(s.replace(a,b))
+PYDIAG
+    src[1]="$out/gpu_diag_mutant.c"
+fi
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
 if [[ "$mode" == --msaa-neg-* ]]; then
     python3 - "$mode" "${src[1]}" "$out/msaa_mutant.c" <<'PYMSAA'
@@ -452,6 +468,29 @@ if [ "$mode" != "--tsan" ]; then
     export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     export VK_LAYER_VALIDATE_SYNC=1   # 同步校验：缺屏障会报 SYNC-HAZARD-*
 
+# GPU diagnosis: each arm runs in a fresh process because the backend caches flags.
+if [[ "$mode" == --gpu-diag* ]]; then
+    arms=(off on); [ "$mode" = --gpu-diag ] && arms+=(on_dq)
+    for arm in "${arms[@]}"; do
+        set +e
+        if [ "$arm" = on ]; then S2A_TEST_GPU_DIAG_ON=1 timeout 180 "$out/t_backend_vk" "$out/shaders" --gpu-diag 2>&1 | tee "$out/log_gpu_diag_$arm"; rc=${PIPESTATUS[0]};
+        elif [ "$arm" = on_dq ]; then S2A_TEST_GPU_DIAG_ON=1 S2A_TEST_NVK_DQ=1 timeout 180 "$out/t_backend_vk" "$out/shaders" --gpu-diag 2>&1 | tee "$out/log_gpu_diag_$arm"; rc=${PIPESTATUS[0]};
+        else timeout 180 "$out/t_backend_vk" "$out/shaders" --gpu-diag 2>&1 | tee "$out/log_gpu_diag_$arm"; rc=${PIPESTATUS[0]}; fi
+        set -e
+        bad=$(grep -cE "Validation Error|VUID-" "$out/log_gpu_diag_$arm" || true)
+        if [[ "$mode" == --gpu-diag-neg-* ]] && [ "$arm" = on ]; then
+            case "$mode" in
+                --gpu-diag-neg-key) want='gpu diag selected dispatch query with exact key and groups' ;;
+                --gpu-diag-neg-load) want='gpu diag empty pass attachment load/store detail' ;;
+                --gpu-diag-neg-barrier) want='gpu diag dispatch neighboring full and guest barriers' ;;
+            esac
+            if [ "$rc" -eq 0 ] || [ "$bad" -ne 0 ] || ! grep -F 'FAIL ' "$out/log_gpu_diag_$arm" | grep -Fq "$want"; then echo "【红】GPU_DIAG 负控未在目标断言红 rc=$rc validation=$bad" >&2; exit 1; fi
+            echo "【绿】$mode 目标行为断言红，validation 0 条"
+        elif [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ]; then echo "【红】GPU_DIAG $arm rc=$rc validation=$bad" >&2; exit 1; fi
+    done
+    echo "【绿】$mode 已完成，validation 0 条"
+    exit 0
+fi
 # 上屏 EASU 开/关夹具（--present-upscale）：独立进程跑一次，避开 surface 单例与 C71 的提交信号序列。
 if [ "$mode" = "--present-upscale" ]; then
     set +e
