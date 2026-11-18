@@ -276,6 +276,7 @@ struct nvn_gpu_cmd_s {
     uint32_t ntsp;
     struct csf_times *csf_times; uint64_t csf_pending_seq, csf_pending_key; uint32_t csf_dims[3]; int csf_dims_known;
     struct pass_details *pass_details;
+    int diag_take;   // 诊断采样窗：这一段输出逐通道 / 派发诊断（dwin_take）
     int csf_barrier_on, csf_last; struct csf_barriers csf_between, csf_before;
     VkCommandBuffer init_cb;                 // 本段提交时带上的「新建图像转 GENERAL」命令缓冲（没有就是空）
     struct nvn_gpu_tex_s **newimg;           // 上面那个命令缓冲转的图像（各持一份引用，段完成时归还；段没执行则放回待转表）
@@ -1517,6 +1518,54 @@ static uint32_t csf_timestamp_bits(void) {
     if (g.dev->queue_family < n) bits = q[g.dev->queue_family].timestampValidBits;
     free(q); return bits <= 64 ? bits : 0;
 }
+// 诊断采样窗（nvk_pass_detail / nvk_csd 共用，两臂同一口径）：时钟从本进程第一段开录起算。
+// 第 nvk_diag_from_s 秒起、持续 nvk_diag_for_s 秒（0 = 到进程结束）；窗内每 nvk_diag_every 段取一段，最多取 nvk_diag_max_segs 段（0 = 不限）。
+// 没取到的段不分配逐通道表、不记屏障、不打 pass_detail / csd 行，只计数；开窗、关窗各打一行带计数，配置读回在第一段打一行。
+static struct {
+    pthread_mutex_t mu; int init, state;   // state：0 窗前，1 窗内，2 已关
+    uint64_t t0, from_ns, end_ns, rt0_ms; uint32_t from_s, for_s, every, max;
+    uint64_t segs, in_win, taken, csd_skipped;
+} g_dwin = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static uint64_t dwin_rt_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u; }
+static int dwin_flag(const char *name, int dflt) { int v = nvn_plat_flag(name, dflt); return v < 0 ? dflt : v; }
+static void dwin_close_locked(uint64_t t, const char *reason) {
+    char line[320]; snprintf(line, sizeof line, "diag_window close reason=%s seg=%llu t_ms=%llu realtime_ms=%llu sampled=%llu in_window=%llu csd_skipped=%llu",
+        reason, (unsigned long long)g_dwin.segs, (unsigned long long)((t - g_dwin.t0) / 1000000u), (unsigned long long)(g_dwin.rt0_ms + (t - g_dwin.t0) / 1000000u),
+        (unsigned long long)g_dwin.taken, (unsigned long long)g_dwin.in_win, (unsigned long long)g_dwin.csd_skipped);
+    g_dwin.state = 2; nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+}
+// 段开录时调一次：返回 1 = 这一段输出逐通道 / 派发诊断。
+static int dwin_take(void) {
+    uint64_t t = now_ns(); int take = 0;
+    pthread_mutex_lock(&g_dwin.mu);
+    if (!g_dwin.init) {
+        g_dwin.init = 1; g_dwin.t0 = t; g_dwin.rt0_ms = dwin_rt_ms();
+        g_dwin.from_s = (uint32_t)dwin_flag("nvk_diag_from_s", 60); g_dwin.for_s = (uint32_t)dwin_flag("nvk_diag_for_s", 30);
+        g_dwin.every = (uint32_t)dwin_flag("nvk_diag_every", 1); g_dwin.max = (uint32_t)dwin_flag("nvk_diag_max_segs", 1000);
+        if (!g_dwin.every) g_dwin.every = 1;
+        g_dwin.from_ns = (uint64_t)g_dwin.from_s * 1000000000ull;
+        g_dwin.end_ns = g_dwin.for_s ? g_dwin.from_ns + (uint64_t)g_dwin.for_s * 1000000000ull : UINT64_MAX;
+        char line[256]; snprintf(line, sizeof line, "diag_window config from_s=%u for_s=%u every=%u max_segs=%u clock=first_segment t0_realtime_ms=%llu",
+            g_dwin.from_s, g_dwin.for_s, g_dwin.every, g_dwin.max, (unsigned long long)g_dwin.rt0_ms);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+    }
+    uint64_t rel = t - g_dwin.t0; g_dwin.segs++;
+    if (g_dwin.state == 0 && rel >= g_dwin.from_ns) {
+        g_dwin.state = 1;
+        char line[256]; snprintf(line, sizeof line, "diag_window open seg=%llu t_ms=%llu realtime_ms=%llu segs_before=%llu csd_skipped_before=%llu",
+            (unsigned long long)g_dwin.segs, (unsigned long long)(rel / 1000000u), (unsigned long long)(g_dwin.rt0_ms + rel / 1000000u),
+            (unsigned long long)(g_dwin.segs - 1), (unsigned long long)g_dwin.csd_skipped);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+    }
+    if (g_dwin.state == 1 && rel >= g_dwin.end_ns) dwin_close_locked(t, "time");
+    if (g_dwin.state == 1) {
+        if (g_dwin.in_win++ % g_dwin.every == 0) { take = 1; g_dwin.taken++; }
+        if (g_dwin.max && g_dwin.taken >= g_dwin.max) dwin_close_locked(t, "max_segs");
+    }
+    pthread_mutex_unlock(&g_dwin.mu);
+    return take;
+}
+static void dwin_csd_skipped(void) { pthread_mutex_lock(&g_dwin.mu); g_dwin.csd_skipped++; pthread_mutex_unlock(&g_dwin.mu); }
 static void csf_time_unavailable(uint64_t seq, uint64_t key, uint64_t signal, const char *reason, int code) {
     if (!seq) return;
     char line[320]; snprintf(line,sizeof line,"csf dispatch_time seq=%llu key=%016llx fence=%llu scope=dispatch_bracket source=unavailable reason=%s code=%d",
@@ -1528,6 +1577,7 @@ void nvn_gpu_diag_dispatch_tag(nvn_gpu_cmd c, uint64_t seq, uint64_t key) {
     if (!c) return;
     c->csf_pending_seq=0; c->csf_dims_known=0;
     if (!nvn_plat_flag("nvk_csd",0)) return;
+    if (!c->diag_take) { dwin_csd_skipped(); return; }   // 采样窗外：只计数
     c->csf_pending_seq=seq; c->csf_pending_key=key;
 }
 // For an indirect spill dispatch replay already proved these bytes CPU-readable.
@@ -7387,7 +7437,9 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         return fail(err, NVN_GPU_E_DEVICE, "vkBeginCommandBuffer 失败");
     }
     c->recording = 1;
-    c->csf_barrier_on = nvn_plat_flag("nvk_csd",0) != 0;
+    {   int pd = nvn_plat_flag("nvk_pass_detail", 0) != 0, csd = nvn_plat_flag("nvk_csd",0) != 0;
+        c->diag_take = (pd || csd) ? dwin_take() : 0;
+        c->csf_barrier_on = csd && c->diag_take; }
     c->xfer_dirty = 1;   // 前置段 / 上一段的传输写：段末屏障只对主机可见，本段第一次派发前补一道
     c->sticky = rc(NVN_GPU_OK);
     c->q_active = -1;
@@ -7401,8 +7453,8 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
     }
-    if (!c->tsq && nvn_plat_flag("nvk_pass_detail", 0)) nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu","gpu pass_detail coverage=unavailable reason=gputime_query_absent");
-    if (c->tsq && nvn_plat_flag("nvk_pass_detail", 0)) {
+    if (c->diag_take && !c->tsq && nvn_plat_flag("nvk_pass_detail", 0)) nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu","gpu pass_detail coverage=unavailable reason=gputime_query_absent");
+    if (c->diag_take && c->tsq && nvn_plat_flag("nvk_pass_detail", 0)) {
         c->pass_details=calloc(1,sizeof *c->pass_details);
         if (!c->pass_details) nvn_plat_log(NVN_PLAT_LOG_WARN,"gpu","gpu pass_detail coverage=unavailable reason=allocation");
     }
