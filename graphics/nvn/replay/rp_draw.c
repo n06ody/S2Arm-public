@@ -338,6 +338,46 @@ static int alloc_copy(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice 
     return 1;
 }
 
+// 常量缓冲暂存的拷贝交给后端异步填（照 iOS nvn_rec.h 的常量缓冲拷贝线程；安卓上是两级回放的录制线程按序做，见 nvn_gpu_arena_fill）。
+// 一款大型开放世界游戏（01007EF00011E000）的神庙场景每帧约 1.1 万次、44 MB，原先全在回放线程上 memcpy。正确性靠三点：
+//   ① GPU 只在段提交之后读上传片，后端保证提交 / 放弃之前填完；
+//   ② 回放线程自己改游戏内存（OP_UPDATE_UB / OP_COPY_B2B / OP_CLEAR_BUF）之前调 rp_ub_fill_fence：来源与它相交、还没填完的先等；
+//   ③ 一次提交里游戏不改它的缓冲（GPU 在提交之后才读，见段内切片表那段说明）；提交返回之前段已提交，①已经等完。
+// 完成回调里的「落地」（GPU 写回游戏内存）和原先编码时就拷一样是另一条线程上的并发写，挪后不改变这一点。
+// 只挪大块：小块走队列一条记录的开销比拷贝本身还大。开关 nvk_ub_fill（缺省开；0 = 照旧在回放线程上拷）。
+enum { UBF_MIN = 256, UBF_N = 256 };
+static struct { uint64_t lo, hi, t; } g_ubf[UBF_N];   // 交出去的填充：来源区间与票号，按交出顺序环形存放（票号递增）
+static uint32_t g_ubf_w; static uint64_t g_ubf_done;   // 交出去的条数；已知填完的最大票号
+static int ubf_on(void) { static int v = -1; static unsigned k; if (v < 0 || !(++k & 255)) v = nvn_plat_flag("nvk_ub_fill", 1) != 0; return v; }
+void rp_ub_fill_fence(uint64_t addr, uint64_t len) {
+    if (!g_ubf_w || !len) return;
+    g_ubf_done = nvn_gpu_arena_fill_wait(0);
+    const uint64_t hi = addr + len;
+    for (uint32_t k = 0; k < UBF_N && k < g_ubf_w; k++) {   // 从新往旧：票号递增，遇到已填完的，更旧的也都填完了
+        const uint32_t i = (g_ubf_w - 1 - k) % UBF_N;
+        if (g_ubf[i].t <= g_ubf_done) break;
+        if (g_ubf[i].lo < hi && addr < g_ubf[i].hi) { g_ubf_done = nvn_gpu_arena_fill_wait(g_ubf[i].t); rp_perf_add(RP_PERF_UBO_FILL_WAIT_N, 1); return; }   // 等最新一条相交的：更旧的随之填完
+    }
+}
+static int alloc_fill(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice *sl) {
+    if (n < UBF_MIN || !ubf_on()) return alloc_copy(c, n, src, sl);
+    const uint32_t align = caps_cached()->min_ubo_align ? caps_cached()->min_ubo_align : 256;
+    nvn_gpu_err err = {0};
+    const uint64_t a0 = g_btm ? dt_now() : 0;
+    nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, n, align, sl, &err);
+    const uint64_t a1 = g_btm ? dt_now() : 0;
+    if (!nvn_gpu_ok(rc) || !sl->cpu) { arena_fail_detail(rc, &err, n); return 0; }
+    const uint64_t t = nvn_gpu_arena_fill(c, sl, src, n);
+    if (t) {
+        const uint32_t i = g_ubf_w++ % UBF_N;
+        if (g_ubf[i].t > g_ubf_done) g_ubf_done = nvn_gpu_arena_fill_wait(g_ubf[i].t);   // 表满：挤掉的那条必须已经填完，否则相交的写就漏等了
+        g_ubf[i].lo = (uint64_t)(uintptr_t)src; g_ubf[i].hi = g_ubf[i].lo + n; g_ubf[i].t = t;
+        rp_perf_add(RP_PERF_UBO_FILL_N, 1);
+    }
+    if (a0) { const uint64_t a2 = dt_now(); g_bt[6] += a1 - a0; g_bt[7] += a2 - a1; }
+    return 1;
+}
+
 // 按脏位少发绑定（对照 compat/tree/src/Ryujinx.Graphics.Vulkan/DescriptorSetUpdater.cs：只有变过的那一组才重建）。
 // 后端按「缓冲 + 偏移 + 长度」判一组描述符变没变，所以核心要做到：内容没变的块，给后端的就是同一片暂存。两层：
 //   ① 段内切片表：同一段里同一个游戏地址区间的常量缓冲、同一个程序的自带常量段，只在暂存区落一份。
@@ -368,7 +408,7 @@ static int slc_get_x(nvn_gpu_cmd c, uint64_t k0, uint64_t k1, const void *src, n
         g_slc[i].gen = rp_cpu_write_gen;   // 内容确认没变：把这份片重新挂到当前代号上
         *sl = g_slc[i].sl; rp_perf_add(RP_PERF_BIND_SLICE_HIT, 1); return 1;
     }
-    if (!alloc_copy(c, k1 & 0xffffffffu, src, sl)) return 0;
+    if (!(stable ? alloc_copy(c, k1 & 0xffffffffu, src, sl) : alloc_fill(c, k1 & 0xffffffffu, src, sl))) return 0;   // 游戏内存里的常量缓冲交后端异步填；程序自带常量段照旧就地拷
     g_slc[i].c = c; g_slc[i].seg = sg; g_slc[i].gen = stable ? UINT64_MAX : rp_cpu_write_gen; g_slc[i].k0 = k0; g_slc[i].k1 = k1; g_slc[i].sl = *sl;
     g_slc[i].wmark = (!stable && src) ? rp_write_mark() : 0;
     return 1;
@@ -744,6 +784,15 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (!rp_pool_find(ub->addr, ub->size, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
                 if (ub->size > 0xffffffffull) return skip("uniform_buffer_too_large", rec);
                 rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, ub->size >> 10);
+                if (rp_buf_gpu_pending(ub->addr, ub->size)) {   // 这段有还没落地的 GPU 写（计算写、GPU 上做的拷贝 / 清除，#1022）：游戏内存里是旧内容，直接绑镜像
+                    const nvn_gpu_caps *cp = caps_cached(); const uint64_t al = cp->min_ubo_align ? cp->min_ubo_align : 256;
+                    nvn_gpu_buf mb; uint64_t mo;
+                    if ((!cp->max_ubo_range || ub->size <= cp->max_ubo_range) && rp_buf_resolve(c, ub->addr, ub->size, &mb, &mo) && !(mo & (al - 1))) {
+                        rp_perf_add(RP_PERF_UBO_MIRROR_N, 1);
+                        o->u.b.buf = mb; o->u.b.off = mo; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break;
+                    }
+                    nvn_unimpl("draw", "uniform_gpu_pending_unaligned", rec);   // 镜像偏移不满足常量缓冲对齐：照旧暂存游戏内存（旧内容），记账
+                }
                 if (!slc_get(c, ub->addr, ub->size, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
             case NVN_RB_IMG: {
@@ -1511,7 +1560,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { g_caps_ok = 0; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }

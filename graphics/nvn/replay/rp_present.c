@@ -261,11 +261,12 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 { uint64_t bt_tot = 0, bt_be = 0, bt_n = 0; rp_bind_tm_take(&bt_tot, &bt_be, &bt_n);
                   uint64_t bt_drv = 0, bt_buf = 0, bt_rest = 0; rp_bind_tm_take2(&bt_drv, &bt_buf, &bt_rest);
                   uint64_t bt_alloc = 0, bt_copy = 0; rp_bind_tm_take3(&bt_alloc, &bt_copy);
-                  snprintf(b, sizeof b, "分时（绑定重建，每帧）：重建 %.0f 次共 %.2f 毫秒（交后端 %.2f；暂存与构造 %.2f，其中驱动段 %.2f、常量缓冲与支持块 %.2f、其它 %.2f；暂存里申请 %.2f、拷贝 %.2f）；常量缓冲暂存 %.0f 次共 %.0f KB（其中程序自带常量段 %.0f 次）、段内切片表命中 %.0f 块",
+                  snprintf(b, sizeof b, "分时（绑定重建，每帧）：重建 %.0f 次共 %.2f 毫秒（交后端 %.2f；暂存与构造 %.2f，其中驱动段 %.2f、常量缓冲与支持块 %.2f、其它 %.2f；暂存里申请 %.2f、拷贝 %.2f）；常量缓冲暂存 %.0f 次共 %.0f KB（其中程序自带常量段 %.0f 次；交后端异步填 %.0f 次、改内存前等填完 %.0f 次；有还没落地的 GPU 写、直接绑镜像 %.0f 次）、段内切片表命中 %.0f 块；改 / 拷游戏内存的命令改在 GPU 上做 %.0f 次",
                            (double)bt_n / f, (double)bt_tot / 1e6 / f, (double)bt_be / 1e6 / f, (double)(bt_tot - bt_be) / 1e6 / f,
                            (double)bt_drv / 1e6 / f, (double)bt_buf / 1e6 / f, (double)bt_rest / 1e6 / f,
                            (double)bt_alloc / 1e6 / f, (double)bt_copy / 1e6 / f,
-                           (double)pf[RP_PERF_UBO_N] / f, (double)pf[RP_PERF_UBO_KB] / f, (double)pf[RP_PERF_UBO_C1_N] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f);
+                           (double)pf[RP_PERF_UBO_N] / f, (double)pf[RP_PERF_UBO_KB] / f, (double)pf[RP_PERF_UBO_C1_N] / f,
+                           (double)pf[RP_PERF_UBO_FILL_N] / f, (double)pf[RP_PERF_UBO_FILL_WAIT_N] / f, (double)pf[RP_PERF_UBO_MIRROR_N] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f, (double)pf[RP_PERF_BUF_GPU_ORDER_N] / f);
                   nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 { uint64_t hb[5]; rp_frame_gap_take(hb); uint64_t ht = hb[0] + hb[1] + hb[2] + hb[3] + hb[4]; if (!ht) ht = 1;
                   snprintf(b, sizeof b, "分时（上屏间隔分布）：不到 29 毫秒 %.0f%%、29–37.5 毫秒 %.0f%%、37.5–46 毫秒 %.0f%%、46–54 毫秒 %.0f%%、更长 %.0f%%",

@@ -1531,6 +1531,9 @@ static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
+    // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
+    // 先整队清空再归还 / 销毁下面这些资源。执行过的段已经过了 GPU 完成，记录早就做完了
+    if (!executed) vk_dq_drain();
     // 布局按段跟踪（c->lay）：段不执行时命令缓冲里什么都没跑，没有要回滚的；t->layout 只做诊断。
     detach_live(c);   // 已提交的 cmd 在 commit 时已摘下，这里兜底
     // 放弃 / 提交前失败的段仍可能有 DQ 待录命令引用快照；先排空录制，再销毁。
@@ -2495,6 +2498,16 @@ nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd ch, uint64_t bytes, uint32_t align, n
     c->arena_used = off + bytes;
     return rc(NVN_GPU_OK);
 }
+
+// 暂存填充（契约见 nvn_backend.h）：两级回放开着时交录制线程按序拷（nvn_vk_dq.inc vk_dq_fill），关着就地拷。
+// 段提交时 vkEndCommandBuffer 的包装先清空队列，所以 GPU 读上传片之前一定拷完；放弃段在 finish_cmd 开头整队清空。
+uint64_t nvn_gpu_arena_fill(nvn_gpu_cmd ch, const nvn_gpu_slice *sl, const void *src, uint64_t bytes) {
+    if (!sl || !sl->cpu || !src || !bytes) return 0;
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!c) { memcpy(sl->cpu, src, (size_t)bytes); return 0; }
+    return vk_dq_fill(sl->cpu, src, bytes);
+}
+uint64_t nvn_gpu_arena_fill_wait(uint64_t ticket) { return vk_dq_fill_wait(ticket); }
 
 // ---------------------------------------------------------------- 录制原语
 

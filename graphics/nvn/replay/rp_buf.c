@@ -187,6 +187,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
 
 // GPU 往池里写（计算着色器写存储缓冲）。提交线程登记这一段，返回登记号；段完成时 rp_buf_gpu_write_land 把结果拷回游戏内存、撤掉登记。
 // pool_key：这段所在池的起点（落地时凭它找镜像：池已经销毁就什么都不做）。0 = 地址不在登记过的池里。
+static int g_gw_live;   // 全部池里还没落地的 GPU 写登记数 + 正在锁外拷回的段数（原子；0 = rp_buf_gpu_pending 不用抢锁）
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) {
     static uint64_t next_id;
     const uint8_t *mem; uint64_t size;
@@ -196,7 +197,8 @@ uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) 
     if (s) {
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, addr - (uint64_t)(uintptr_t)mem, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
-            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){addr - (uint64_t)(uintptr_t)mem, len, id, (uint8_t)mi}; *pool_key = (uint64_t)(uintptr_t)mem; }
+            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){addr - (uint64_t)(uintptr_t)mem, len, id, (uint8_t)mi}; *pool_key = (uint64_t)(uintptr_t)mem;
+            __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
     pthread_mutex_unlock(&g_bmu);
     return id;
@@ -223,6 +225,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     s->landing--;
     if (s->landing <= 0 && s->dead) shadow_free(s);   // 拷贝期间池被销毁：现在收尾
     pthread_mutex_unlock(&g_bmu);
+    __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 登记撤掉、拷回也做完：这一段在游戏内存里已是 GPU 的结果
 }
 
 // 锁内版：调用方已持有 g_bmu，mem/size 是调用方查好的池。一笔绘制常要解析 3~4 段（顶点流 + 存储缓冲），
@@ -431,22 +434,76 @@ int rp_write_touched(uint64_t mark, uint64_t a, uint64_t n) {
     }
     return 0;
 }
+// [addr, addr+len) 与还没落地的 GPU 写相交吗（登记着的、正在锁外拷回的；表满说不清的按相交算）。线程：[提交]
+int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
+    if (!len || !__atomic_load_n(&g_gw_live, __ATOMIC_ACQUIRE)) return 0;
+    const uint8_t *mem; uint64_t size;
+    if (!rp_pool_find(addr, len, &mem, &size)) return 0;
+    uint64_t k = (uint64_t)(uintptr_t)mem, a = addr - k, b = a + len; int hit = 0;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &k);
+    if (s) {
+        for (int i = 0; i < s->ngw && !hit; i++) hit = s->gw[i].off < b && a < s->gw[i].off + s->gw[i].len;
+        if (!hit) hit = s->landing > s->nlr;
+        for (int i = 0; i < s->nlr && !hit; i++) hit = s->lr[i].off < b && a < s->lr[i].off + s->lr[i].len;
+    }
+    pthread_mutex_unlock(&g_bmu);
+    return hit;
+}
+
+// 三条 CPU 改游戏内存的命令遇到还没落地的 GPU 写（#1022、#697）：CPU 现在读写游戏内存，读到的是 GPU 写之前的旧内容；写进去的又会被稍后的落地盖掉。
+// 这时改在 GPU 上按提交顺序做（照 iOS mtl_sub_copy / mtl_sub_fill）：在镜像里拷 / 填 / 写，目标登记成本次提交的 GPU 写——镜像同步跳过它、段完成时落回游戏内存；
+// 常量缓冲绑到这段时直接绑镜像（rp_draw.c）。不相交就返回 0，调用方照旧在 CPU 上做（绝大多数情况，零额外开销）。
+static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *rec) {
+    if (!rp_post_gpu_write(d, n)) nvn_unimpl("buf", what, rec);   // 登记不上：结果留在镜像里、落不回游戏内存（记账，不静默）
+    rp_cpu_write_gen++; rp_write_note(d, n);   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用按它作废
+    rp_perf_add(RP_PERF_BUF_GPU_ORDER_N, 1);
+    return 1;
+}
+int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
+    uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
+    if (!c || !n || !in_pool(d, n) || !rp_buf_gpu_pending(d, n)) return 0;
+    rp_pass_flush(c);
+    nvn_gpu_buf db; uint64_t off;
+    if (!rp_buf_resolve(c, d, n, &db, &off)) return 0;
+    nvn_gpu_buf_write(c, db, off, (const uint8_t *)a + 16, n);
+    return gpu_dst_done(d, n, "update_gpu_write_note_failed", rec);
+}
+int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
+    uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
+    if (!c || !n || !in_pool(s, n) || !in_pool(d, n) || (!rp_buf_gpu_pending(s, n) && !rp_buf_gpu_pending(d, n))) return 0;
+    if (s < d + n && d < s + n) { nvn_unimpl("buf", "copy_overlap_gpu_pending", rec); return 0; }   // 源目标重叠（GPU 拷贝不许）：照旧 CPU 做，记账
+    rp_pass_flush(c);
+    nvn_gpu_buf sb, db; uint64_t so, doff;
+    if (!rp_buf_resolve(c, s, n, &sb, &so) || !rp_buf_resolve(c, d, n, &db, &doff)) return 0;
+    nvn_gpu_copy_buf(c, sb, so, db, doff, n);
+    return gpu_dst_done(d, n, "copy_gpu_write_note_failed", rec);
+}
+int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec) {
+    if (!c || !cb->size || !in_pool(cb->addr, cb->size) || !rp_buf_gpu_pending(cb->addr, cb->size)) return 0;
+    if ((cb->addr | cb->size) & 3) { nvn_unimpl("buf", "clear_unaligned_gpu_pending", rec); return 0; }   // GPU 填充要 4 字节对齐：照旧 CPU 做，记账
+    rp_pass_flush(c);
+    nvn_gpu_buf db; uint64_t off;
+    if (!rp_buf_resolve(c, cb->addr, cb->size, &db, &off)) return 0;
+    nvn_gpu_fill_buf(c, db, off, cb->size, cb->value);
+    return gpu_dst_done(cb->addr, cb->size, "clear_gpu_write_note_failed", rec);
+}
 void rp_op_update_ub(const void *a, const void *rec) {
     uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
     if (!n) return;
     if (!in_pool(d, n)) { nvn_unimpl("buf", "update_outside_pools", rec); return; }
-    memcpy((void *)(uintptr_t)d, (const uint8_t *)a + 16, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
+    rp_ub_fill_fence(d, n); memcpy((void *)(uintptr_t)d, (const uint8_t *)a + 16, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
 }
 void rp_op_copy_b2b(const void *a, const void *rec) {
     uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
     if (!n) return;
     if (!in_pool(s, n) || !in_pool(d, n)) { nvn_unimpl("buf", "copy_outside_pools", rec); return; }
-    memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
+    rp_ub_fill_fence(d, n); memmove((void *)(uintptr_t)d, (const void *)(uintptr_t)s, (size_t)n); rp_cpu_write_gen++; rp_write_note(d, n);
 }
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec) {   // 32 位样式填充（不是按字节）
     if (!cb->size) return;
     if (!in_pool(cb->addr, cb->size)) { nvn_unimpl("buf", "clear_outside_pools", rec); return; }
-    uint8_t *p = (uint8_t *)(uintptr_t)cb->addr; uint64_t n = cb->size, i = 0; rp_cpu_write_gen++; rp_write_note(cb->addr, cb->size);
+    rp_ub_fill_fence(cb->addr, cb->size); uint8_t *p = (uint8_t *)(uintptr_t)cb->addr; uint64_t n = cb->size, i = 0; rp_cpu_write_gen++; rp_write_note(cb->addr, cb->size);
     for (; i + 4 <= n; i += 4) memcpy(p + i, &cb->value, 4);
     if (i < n) memcpy(p + i, &cb->value, (size_t)(n - i));
 }

@@ -86,6 +86,8 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_PASSEND_N,                             // 收通道次数（含换目标、通道中途的清除、提交收尾）
        RP_PERF_BIND_NS, RP_PERF_BIND_REBUILD_N,       // 发绑定总耗时、整组重建的次数（分 B1 快路与重建两块看）
        RP_PERF_UBO_N, RP_PERF_UBO_KB, RP_PERF_UBO_C1_N,   // 常量缓冲暂存的次数 / 千字节 / 其中程序自带常量段（C1）的次数
+       RP_PERF_BUF_GPU_ORDER_N, RP_PERF_UBO_MIRROR_N,   // 改 / 拷游戏内存的命令因还没落地的 GPU 写改在 GPU 上做的次数；常量缓冲因此直接绑镜像的次数（#1022）
+       RP_PERF_UBO_FILL_N, RP_PERF_UBO_FILL_WAIT_N,   // 其中交给后端异步填的次数（nvn_gpu_arena_fill）/ 改游戏内存前因区间重叠等它填完的次数（rp_ub_fill_fence）
        RP_PERF_BUF_FAST_N, RP_PERF_BUF_SLOW_N, RP_PERF_BUF_NOSPAN_N, RP_PERF_BUF_PAGES_N,   // 缓冲解析：快路命中 / 走逐页慢路 / 不受写跟踪 / 慢路里一共查了多少页
        RP_PERF_BUF_LOG_EV, RP_PERF_BUF_LOG_WORDS, RP_PERF_BUF_LOG_REBUILD,   // 脏页追加日志（nvk_buf_dirtylog）：灌进镜像的事件数 / 求交时看的位图字数 / 日志不可用、按逐页代号重建的次数
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
@@ -113,6 +115,11 @@ void rp_sync_lag_present(void);   // 上屏之后调：给「每帧只放行一�
 void rp_bind_tm_take(uint64_t *tot, uint64_t *backend, uint64_t *n);   // 绑定重建：总时间 / 其中交后端 / 次数（纳秒，取即清零）
 void rp_bind_tm_take2(uint64_t *drv, uint64_t *buf, uint64_t *rest);
 void rp_bind_tm_take3(uint64_t *alloc, uint64_t *copy);   // 暂存：申请 / 内容拷贝  // 其中：驱动段 / 常量缓冲与支持块 / 其它
+// 回放线程要在 CPU 上改游戏内存 [addr, addr+len) 之前调：还没填完、来源与它相交的常量缓冲暂存先等填完（rp_draw.c，见 nvn_gpu_arena_fill）
+void rp_ub_fill_fence(uint64_t addr, uint64_t len);
+int rp_buf_gpu_pending(uint64_t addr, uint64_t len);   // 这段与还没落地的 GPU 写相交（rp_buf.c）
+// 改 / 拷游戏内存的三条命令遇到还没落地的 GPU 写时改在 GPU 上按提交顺序做（#1022）；返回 0 = 不需要 / 做不了，调用方照旧走 CPU 版
+int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec); int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec); int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec);
 uint64_t rp_sub_fence(void);        // 正在回放的这次提交最后一段的栅栏值
 uint64_t rp_fx_report_types(void);  // 诊断读数：上次调用以来计数器报告用到的类型（位图，取完清零）
 int rp_res_new_sizes_take(void);     // 诊断读数：上次调用以来新建贴图的宽高有几种（最多数到 64，取完清零）
