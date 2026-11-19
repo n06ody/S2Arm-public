@@ -12,6 +12,13 @@
 #   cxx=$(s2a_ndk_clangxx "$ndk" 29)
 #   glslc=$(s2a_ndk_glslc "$ndk")
 
+# 直接执行不会定义任何函数、什么都不做还 rc=0，调用方会把「没编」当成「编过」（坑记录 11-20）：
+# 检测到非 source 调用就报错退出，不留假绿出口。
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    echo "ndk_toolchain.sh 只能 source 用：. \"$0\" 后调 s2a_ndk_resolve / s2a_ndk_clang / s2a_ndk_glslc" >&2
+    exit 2
+fi
+
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/versions.sh"
 
 s2a_ndk_resolve() {

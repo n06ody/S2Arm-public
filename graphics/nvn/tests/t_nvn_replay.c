@@ -197,11 +197,13 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t l
 // 块线性上传替身：快照调用参数；能力开时回放必须传原始存储，不应先在线程解排。
 static int g_block_uploads;
 static struct { uint32_t level, layer; uint64_t bytes; const void *src; nvn_texlayout layout; } g_block_call[16];
-void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const nvn_texlayout *L, const void *src, uint64_t bytes) {
+static int g_block_rc;   // 用例设非 0：替身报该错误码（S2：后端校验失败回 rc，回放层走 CPU 具名回退）
+nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const nvn_texlayout *L, const void *src, uint64_t bytes) {
     (void)c; (void)t;
     if (g_window_capture && bytes == sizeof g_window_raw) memcpy(g_window_raw, src, sizeof g_window_raw);   // 契约：入口返回前必须拍下源字节
     if (g_block_uploads < 16) { g_block_call[g_block_uploads].level = level; g_block_call[g_block_uploads].layer = layer; g_block_call[g_block_uploads].bytes = bytes; g_block_call[g_block_uploads].src = src; g_block_call[g_block_uploads].layout = *L; }
     g_block_uploads++;
+    return (nvn_gpu_rc){ .code = g_block_rc };
 }
 // 脏页替身：代号由用例推进
 void nvn_dirty_protect(const void *addr, size_t len) { g_prot_addr = addr; g_prot_len = len; if (g_prot_n < 8) { g_prot_log[g_prot_n] = addr; g_prot_llen[g_prot_n] = len; } g_prot_n++; g_protects++; }
@@ -1634,6 +1636,20 @@ static void t_gpu_deswizzle_pending(void) {
     nvn_be_tex_release(&a); nvn_be_tex_release(&b); nvn_be_tex_release(&other);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_tmem);
     g_caps_extra &= ~NVN_GPU_CAP_GPU_DESWIZZLE; g_buf_cpu_auto = 0; g_pg_tracked = 1; nvn_be_shutdown_session(); res_fresh();
+}
+
+// 后端块线性上传报 rc（校验 / 暂存失败不粘滞命令缓冲）：回放具名回退 CPU，贴图照传且 uploaded 置位（rp_res_uploads 只在置位时 +1）。
+// 负对照：upload_all 不看 rc 直接 goto done → g_nup 不涨但 resolve 照样成，断言红。
+static void t_gpu_deswizzle_backend_fail(void) {
+    extern uint64_t rp_res_uploads(void);
+    nvn_be_sub_begin(); res_fresh(); nvn_unimpl_reset();
+    g_caps_extra |= NVN_GPU_CAP_GPU_DESWIZZLE; g_block_uploads = 0; g_nup = 0; g_block_rc = NVN_GPU_E_ARG;
+    tex_t a = mk_tex(60020, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); a.has_layout = 1; memset(a.mem, 0x5a, a.L.size);
+    uint64_t up0 = rp_res_uploads();
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_block_uploads == 1 && g_nup == 1);
+    CHECK(nvn_unimpl_count("tex", "gpu_deswizzle_backend_fail") == 1 && rp_res_uploads() == up0 + 1);
+    nvn_be_tex_release(&a); g_block_rc = 0; g_caps_extra &= ~NVN_GPU_CAP_GPU_DESWIZZLE;
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
 
 // 诊断只认完整、稳定的原始内容；未跟踪或上传期间有写不能算内容未变。
@@ -5856,6 +5872,7 @@ int main(int argc, char **argv) {
     t_cpu_upload();
     t_gpu_deswizzle_route();
     t_gpu_deswizzle_pending();
+    t_gpu_deswizzle_backend_fail();
     t_tex_reupload_diag();
     t_tex_reupload_diag_gpu_pending();
     t_cpu_rules();
