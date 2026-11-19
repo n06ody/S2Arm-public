@@ -33,8 +33,12 @@ int main(int argc,char **argv){
  disable_compute_access=strstr(arm,"disabled")!=NULL;
  int vertex=strstr(arm,"vertex")!=NULL,index=strstr(arm,"index")!=NULL;
  int vsbuf=strstr(arm,"vsbuf")!=NULL,fsbuf=strstr(arm,"fsbuf")!=NULL,tbuf=strstr(arm,"tbuf")!=NULL;
+ int transfer=strstr(arm,"transfer")!=NULL;
+ int no_compute=transfer&&strstr(arm,"nocompute")!=NULL;
+ test_no_external=transfer?(strstr(arm,"noexternal")?3:strstr(arm,"noinput")?1:strstr(arm,"nooutput")?2:0):0;
  int img=strstr(arm,"image")!=NULL,disjoint=strstr(arm,"disjoint")!=NULL,metadata=!strcmp(arm,"metadata");
  REQUIRE(vertex+index+vsbuf+fsbuf+tbuf+img+metadata==1);REQUIRE(!disjoint||img);
+ REQUIRE(!transfer||fsbuf);test_transfer_consumers=transfer;omit_transfer_graphics=transfer&&!no_compute&&disable_compute_access?(strstr(arm,"allomit")?2:1):0;
  struct s2a_vk_device d;char why[256];REQUIRE(!s2a_vk_device_create(&d,why,sizeof why));
  nvn_gpu_open_desc od={0};od.host_device=&d;od.app_label="replay-compute-resources";GPU(nvn_gpu_open(&od,&err));
  if(metadata){storage_spans();GPU(nvn_gpu_close(5000000000ull,&err));REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
@@ -42,9 +46,9 @@ int main(int argc,char **argv){
  rp_state_reset();rp_draw_reset();nvn_unimpl_reset();
  rp_S.color.logic_op=NVN_LOGIC_OP_COPY;rp_S.chmask.mask=15;rp_S.poly.mode=NVN_POLYGON_MODE_FILL;
  prog.is_compute=1;prog.nent[0]=1;
- prog.ent[0][0]=entry(img?NVN_GPU_RES_IMAGE:NVN_GPU_RES_SSBO,img?NVN_RB_IMG:NVN_RB_SBUFP,NVN_GPU_ACC_W,NVN_GPU_SH_CS);
+ prog.ent[0][0]=entry(img?NVN_GPU_RES_IMAGE:NVN_GPU_RES_SSBO,img?NVN_RB_IMG:NVN_RB_SBUFP,transfer?NVN_GPU_ACC_R:NVN_GPU_ACC_W,NVN_GPU_SH_CS);
  nvn_gpu_layout cl={0};cl.ent=prog.ent[0];cl.nent=1;
- prog.sh[0]=shader(argv[1],img?"compute_read_image.comp":index?"compute_read_index.comp":"compute_read_payload.comp",NVN_GPU_SH_CS,&cl);
+ prog.sh[0]=shader(argv[1],transfer?"compute_read_readonly.comp":img?"compute_read_image.comp":index?"compute_read_index.comp":"compute_read_payload.comp",NVN_GPU_SH_CS,&cl);
  const char *vs=vertex?"compute_read_vertex.vert":vsbuf?"compute_read_buffer.vert":"fullscreen.vert";
  const char *fs=fsbuf?"compute_read_buffer.frag":tbuf?"compute_read_texel.frag":img?"compute_read_image.frag":"solid_green.frag";
  nvn_gpu_layout gl[2]={{0},{0}};
@@ -52,7 +56,7 @@ int main(int argc,char **argv){
   int st=vsbuf?0:1;graphics.nent[st]=1;
   graphics.ent[st][0]=entry(tbuf?NVN_GPU_RES_TBUF:img?NVN_GPU_RES_TEX_SAMP:NVN_GPU_RES_SSBO,tbuf?NVN_RB_TBUF:img?NVN_RB_TEX:NVN_RB_SBUFP,NVN_GPU_ACC_R,st?NVN_GPU_SH_FS:NVN_GPU_SH_VS);
   gl[st].ent=graphics.ent[st];gl[st].nent=1;
-  rp_S.ssbo[st][0].addr=(uint64_t)(uintptr_t)(guest+256);rp_S.ssbo[st][0].size=64;
+  rp_S.ssbo[st][0].addr=(uint64_t)(uintptr_t)(guest+(transfer?320:256));rp_S.ssbo[st][0].size=64;
   if(tbuf)graphics.dtt[st][0]=NVN_TEXTURE_TARGET_BUFFER+1;
   if(img)graphics.dtt[st][0]=NVN_TEXTURE_TARGET_2D+1;
  }
@@ -79,10 +83,14 @@ int main(int argc,char **argv){
  nvn_gpu_tex_desc td={0};td.d.target=NVN_TEXTURE_TARGET_2D;td.d.format=NVN_FORMAT_RGBA8;td.d.width=td.d.height=64;td.d.depth=td.d.levels=1;td.usage=NVN_GPU_TEX_RENDER;
  nvn_gpu_tex tex=NULL;GPU(nvn_gpu_tex_create(&td,&tex,&err));GPU(nvn_gpu_view_create(tex,NULL,&target_view,&err));target_tex.d=td.d;target_tex.serial=1;target.n=1;target.color[0]=&target_tex;
  nvn_gpu_buf rb=NULL;GPU(nvn_gpu_buf_create(16384,NVN_GPU_MEM_SHARED,NULL,&rb,&err));GPU(nvn_gpu_cmd_begin(NULL,&active,&err));
- nvn_gpu_buf mirror=NULL;uint64_t off=0;REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,320,&mirror,&off));
+ nvn_gpu_buf mirror=NULL;uint64_t off=0;REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,transfer?384:320,&mirror,&off));
  pass(active,1);rp_pass_flush(active);
+ // 计算只读前 64 字节，片元只读后 64 字节；两者来自同一笔传输写。
+ if(transfer){const float payload[32]={-1,-1,0,1, 3,-1,0,1, -1,3,0,1, 0,1,0,1, -1,-1,0,1, 3,-1,0,1, -1,3,0,1, 0,1,0,1};nvn_gpu_buf_write(active,mirror,off+256,payload,sizeof payload);}
  if(img){const uint8_t green[4]={0,255,0,255};NVNcopyRegion r={0};r.width=r.height=r.depth=1;nvn_gpu_tex_upload(active,image_tex,0,1,&r,green,4,4);}
- p_dispatch dp={0};dp.x=dp.y=dp.z=1;rp_dispatch(active,&dp,NULL);
+ p_dispatch dp={0};dp.x=dp.y=dp.z=1;
+ if(!no_compute)rp_dispatch(active,&dp,NULL);
+ else if(!disable_compute_access)nvn_gpu_barrier(active,NVN_BARRIER_INVALIDATE_SHADER_BIT);
  p_draw dr={0};dr.prim=4;dr.ind=(uint64_t)(uintptr_t)guest;
  // VVL 1.4.341 对 indirect 顶点/索引访问留有 TODO，direct 提供已知范围以取得真实 RAW 阳性。
  if(vertex){dr.ind=0;dr.count=3;dr.instances=1;}
@@ -92,9 +100,10 @@ int main(int argc,char **argv){
  uint64_t draws=0,skips=0;rp_draw_stats(&draws,&skips);REQUIRE(draws==1u+(unsigned)disjoint&&skips==0);REQUIRE(!nvn_unimpl_kinds());
  rp_pass_flush(active);nvn_gpu_copy_tex_buf(active,tex,0,0,NULL,rb,0,256,16384);
  GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));
- REQUIRE(ndispatch==1);REQUIRE(ndraw==1u+(unsigned)disjoint);
+ REQUIRE(ndispatch==(unsigned)!no_compute);REQUIRE(ndraw==1u+(unsigned)disjoint);
  unsigned before=dispatch_compute_bar[0],after=draw_compute_bar[ndraw-1];
- REQUIRE(after-before==(unsigned)!disable_compute_access);
+ REQUIRE(after-before==(unsigned)(!transfer&&!disable_compute_access));
+ if(transfer){REQUIRE(transfer_seen==1);REQUIRE(omit_transfer_graphics?transfer_barriers_mutated>=1:transfer_barriers_mutated==0);}
  if(disjoint){REQUIRE(draw_compute_bar[0]==before);printf("RESOURCE_READ layer=1 overlaps_writer=0 barrier_delta=%u\n",draw_compute_bar[0]-before);}
  if(img)printf("RESOURCE_READ layer=0 overlaps_writer=1 barrier_delta=%u\n",after-before);
  unsigned bad=0;const uint8_t *pixels=nvn_gpu_buf_cpu(rb);for(unsigned i=0;i<4096;i++){const uint8_t *p=pixels+i*4;if(p[0]||p[1]!=255||p[2]||p[3]!=255)bad++;}
