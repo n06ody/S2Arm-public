@@ -327,7 +327,7 @@ def main():
             ('noop-first-warn-dropped', 'if (nvn_unimpl("shader", name, NULL) == 1) {', 'if (nvn_unimpl("shader", name, NULL) == 0) {', 1,
              'noop-log: the first hit of each instruction prints one WARN line'),
             ('noop-unexpected-accepted', 'sscanf(value, "Shader instruction %23[A-Za-z0-9] is not implemented.%n", ins, &used) != 1 || !used || value[used])',
-             'sscanf(value, "Shader instruction %23[A-Za-z0-9] is not implemented.%n", ins, &used) != 1 && 0)', 1,
+             'sscanf(value, "%23s%n", ins, &used) != 1 || !used)', 1,
              'noop-log: a log that is not an instruction stub is red'),
             ('noop-tally-compute-never-called', '            noop_log_tally(bytes, len);\n', '', 1,
              'noop-log: a compute compile counts its whitelisted log too'),
