@@ -40,6 +40,7 @@ static struct {
     // 上一个通道的管线形状（各颜色槽的附件格式、深度 / 模板格式、采样数）：Vulkan 的管线对象与渲染通道的格式绑在一起，
     // 形状变了必须重取管线（见 rp_pass_begin 末尾）；形状没变、目标只是换了张同格式的图，管线与绑定都不用重发
     uint32_t shape_c[8], shape_d, shape_s, shape_smp; int shape_ok;
+    int start_why;                // 开这个通道之前最近一次切点的原因（RP_CUT_*，读数用）
     uint32_t na_w, na_h;          // 无附件通道（一个附件都没挂，只为片元副作用 / 遮挡计数）的帧缓冲尺寸；有附件的通道是 0
 } P = {.want_colors = 0xff};
 
@@ -379,7 +380,7 @@ static void park_land_group(nvn_gpu_cmd c, int g) {
         uint32_t sc[8], sd, ss, sm; memcpy(sc, P.shape_c, sizeof sc); sd = P.shape_d; ss = P.shape_s; sm = P.shape_smp;
         int sok = P.shape_ok; uint8_t pso = rp_pso_dirty, dss = rp_dss_dirty;
         P.rt = g_pkg[g].rt; P.has_rt = 1;
-        if (pass_begin_colors(c, 0xff)) rp_pass_end(c);   // 显式清除不受绘制写掩码影响
+        if (pass_begin_colors(c, 0xff)) { rp_pass_why(RP_CUT_LAND); rp_pass_end(c); }   // 显式清除不受绘制写掩码影响
         P.rt = save_rt; memcpy(P.kept, save_kept, sizeof save_kept); P.has_rt = save_has;
         memcpy(P.shape_c, sc, sizeof sc); P.shape_d = sd; P.shape_s = ss; P.shape_smp = sm; P.shape_ok = sok;
         rp_pso_dirty = pso; rp_dss_dirty = dss;
@@ -411,12 +412,24 @@ void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n) {
                 uint64_t ser; uint32_t lv, ly; pk_id(e, &ser, &lv, &ly);
                 if (ser == ts[k]->serial) hit = 1;
             }
-            if (hit) park_land_group(c, g);
+            if (hit) { rp_pass_why(RP_CUT_LAND); park_land_group(c, g); }
         }
     }
 }
 
+static int g_why, g_next_start;   // 待记的结束原因；下一个开出的通道带上的「开通道前的切点」
+static uint64_t g_cut[RP_CUT_N][RP_CUTV_N];
+void rp_pass_why(int why) { g_why = why; }
+void rp_pass_cut_take(uint64_t out[RP_CUT_N][RP_CUTV_N]) { memcpy(out, g_cut, sizeof g_cut); memset(g_cut, 0, sizeof g_cut); }
 void rp_pass_end(nvn_gpu_cmd c) {
+    {   const int why = g_why ? g_why : RP_CUT_OTHER;
+        if (P.open) {
+            g_cut[why][RP_CUTV_ENDED]++;
+            if (P.ndraw <= 1) { g_cut[why][RP_CUTV_ENDED_TINY]++; g_cut[why][RP_CUTV_ENDED_TINY_KPIX] += P.cur_kpix;
+                                g_cut[P.start_why][RP_CUTV_NEXT_TINY]++; g_cut[P.start_why][RP_CUTV_NEXT_TINY_KPIX] += P.cur_kpix; }
+            g_next_start = why;
+        } else if (g_why) g_next_start = g_why;   // 没开着通道也记下：下一个通道是在这次操作之后开的
+        g_why = 0; }
     if (P.open) rp_perf_add(RP_PERF_PASSEND_N, 1);
     if (P.open && c) { nvn_gpu_pass_end(c); for (int i = 0; i < 8; i++) if (g_shu[i].base) shadow_copy(c, i, 1); }   // 画进影子的内容拷回各自的深度贴图
     if (P.open) { if (P.has_ds) { rp_perf_add(RP_PERF_P_DS, 1); if (!P.ds_used) rp_perf_add(RP_PERF_P_DS_IDLE, 1); } if (P.ndraw <= 1) rp_perf_add(RP_PERF_P_ONE, 1);
@@ -441,12 +454,12 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     // 后端没声明无附件通道时，全零且无深度仍须保留原目标，不能把原本可执行的片元副作用 / 查询变成跳过。
     // 部分槽被筛掉、有深度、或后端明确支持无附件通道时，才真的移除全部零掩码颜色槽。
     if (!wanted && !P.rt.depth && !noatt_ok()) wanted = select_colors(0xff);
-    if (P.open && P.colors != wanted) rp_pass_end(c);
+    if (P.open && P.colors != wanted) { rp_pass_why(RP_CUT_MASK); rp_pass_end(c); }
     P.want_colors = wanted;
     P.area_want = 0;
     if (P.open && P.na_w && !P.na_from_rt) {   // 真无目标通道按视口定；零掩码留下的逻辑目标尺寸不能随视口扩大
         uint32_t w = 0, h = 0;
-        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) rp_pass_end(c);
+        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) { rp_pass_why(RP_CUT_AREA); rp_pass_end(c); }
     }
     if (!nvn_plat_flag("nvk_pass_area", 0)) return;
     int32_t x, y; uint32_t w, h;
@@ -457,7 +470,7 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     int32_t nx = x < P.ax ? x : P.ax, ny = y < P.ay ? y : P.ay;
     int32_t nx1 = ((int32_t)x + (int32_t)w) > ((int32_t)P.ax + (int32_t)P.aw) ? (int32_t)x + (int32_t)w : (int32_t)P.ax + (int32_t)P.aw;
     int32_t ny1 = ((int32_t)y + (int32_t)h) > ((int32_t)P.ay + (int32_t)P.ah) ? (int32_t)y + (int32_t)h : (int32_t)P.ay + (int32_t)P.ah;
-    rp_pass_end(c);
+    rp_pass_why(RP_CUT_AREA); rp_pass_end(c);
     P.area_want = 1; P.wx = nx; P.wy = ny; P.ww = (uint32_t)(nx1 - nx); P.wh = (uint32_t)(ny1 - ny);
 }
 static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
@@ -582,7 +595,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     for (int k = 0; k < ntake; k++) g_pk[taken[k]].used = 0;   // 开通道成功了：吃掉的挂起项移出表
     if (pdpk >= 0) g_pk[pdpk].used = 0;
     park_gc();
-    P.open = 1;
+    P.open = 1; P.start_why = g_next_start; g_next_start = RP_CUT_OTHER;
     // 通道边界不等于状态边界（开关 debug.s2a.nvk_state_keep，缺省 1 = 新行为，0 = 旧行为全部重发）。
     // Vulkan 的管线、描述符集、动态状态在 vkCmdBeginRenderPass 前后都保持，不必因为换了通道就重发；
     // 真要让后端状态失效的路径各自已经 rp_dirty_all()，这里不动它们：矩形清（本文件两处）、计算派发（rp_draw.c）、
@@ -625,7 +638,7 @@ void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
     rp_perf_add(RP_PERF_SETRT_N, 1);
     { struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0); uint64_t s0 = (uint64_t)ts0.tv_sec * 1000000000ull + (uint64_t)ts0.tv_nsec;
       // 开关开着（缺省）：只收当前通道，待折清除挂起（等下一个把它当附件的通道吃掉，见 park 段）；关着 = 旧行为：先落地再换目标
-      if (park_on()) rp_pass_end(c); else rp_pass_flush(c);
+      rp_pass_why(RP_CUT_RT); if (park_on()) rp_pass_end(c); else rp_pass_flush(c);
       struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1); uint64_t s1 = (uint64_t)ts1.tv_sec * 1000000000ull + (uint64_t)ts1.tv_nsec;
       rp_perf_add(RP_PERF_SETRT_END_NS, s1 - s0); }
     P.rt = *r; P.has_rt = 1;
@@ -642,6 +655,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         nvn_gpu_clear cl; memset(&cl, 0, sizeof cl); cl.color = i; cl.color_mask = (uint8_t)(cc->mask & 0xf); cl.stencil_mask = 0xff;
         if (!scissor_rect(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &cl)) return;
         // 与 iOS clear_color_tri 一样：目标没挂进当前通道时，为显式清除恢复附件；下一笔绘制再按自己的掩码筛。
+        if (!(P.open && rp_pass_slot_attached(i))) rp_pass_why(RP_CUT_CLEAR_RECT);
         if (!c || (!(P.open && rp_pass_slot_attached(i)) && !pass_begin_colors(c, (uint8_t)(1u << i)))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
         color_value(i, cc->rgba, &cl.value);
         rp_occl_pause(c);
@@ -650,7 +664,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         return;
     }
     if (P.open) rp_perf_add(RP_PERF_P_CUT_CLEAR, 1);
-    if (P.open) rp_pass_end(c);   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
+    if (P.open) { rp_pass_why(RP_CUT_CLEAR); rp_pass_end(c); }   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
     park_put_color(c, i, cc->rgba);   // 挂起：下一个把这个槽当附件的通道载入时清成这个值
 }
 
@@ -665,6 +679,7 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
     if (!scissor_full(P.rt.depth, &P.rt.dview, P.rt.has_dview) || (do_s && sm != 0xff)) {
         nvn_gpu_clear cl; memset(&cl, 0, sizeof cl); cl.color = -1; cl.color_mask = 0xf; cl.stencil_mask = (uint8_t)(do_s ? sm : 0xff);
         if (!scissor_rect(P.rt.depth, &P.rt.dview, P.rt.has_dview, &cl)) return;
+        if (!P.open) rp_pass_why(RP_CUT_CLEAR_RECT);
         if (!c || (!P.open && !pass_begin_colors(c, 0xff))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
         cl.depth = (uint8_t)do_d; cl.stencil = (uint8_t)do_s; cl.depth_value = depth_value(cd->depth); cl.stencil_value = (uint32_t)cd->stencil & 0xff;
         rp_occl_pause(c);
@@ -672,7 +687,7 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
         rp_dirty_all();
         return;
     }
-    if (P.open) rp_pass_end(c);
+    if (P.open) { rp_pass_why(RP_CUT_CLEAR); rp_pass_end(c); }
     park_put_depth(c, do_d, depth_value(cd->depth), do_s, cd->stencil);   // 挂起：深度 / 模板两面合成一项
 }
 
@@ -688,7 +703,7 @@ int rp_pass_parked(void) {
     return n;
 }
 void rp_pass_reset(void) {
-    memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all();
+    memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all(); g_why = g_next_start = 0; memset(g_cut, 0, sizeof g_cut);
     P.want_colors = 0xff;
     for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }
     memset(g_sh, 0, sizeof g_sh);
