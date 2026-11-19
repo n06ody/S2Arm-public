@@ -61,6 +61,9 @@ uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) { (void
 static nvn_gpu_rc ok_rc(void) { return (nvn_gpu_rc){NVN_GPU_OK}; }
 nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gpu_err *err) { (void)d; (void)err; *out = NULL; return ok_rc(); }
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c) { (void)c; }
+// 此计时夹具不构造前置段；误走时必须报错，不能伪装完成同步。
+void nvn_gpu_inbound_diag_precedes_main(nvn_gpu_cmd c) { (void)c; CHECK(0); }
+void nvn_gpu_inbound_pre_finish(nvn_gpu_cmd c) { (void)c; CHECK(0); }
 nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn done, void *user, nvn_gpu_err *err) {
     (void)c; (void)signal; (void)done; (void)user; (void)err; return ok_rc();
 }

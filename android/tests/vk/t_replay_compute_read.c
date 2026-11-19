@@ -245,7 +245,6 @@ static VkPipelineStageFlags gfx_exec_src, gfx_exec_dst;
 static VkPipelineStageFlags gfx_src_stages, gfx_dst_stages;
 static VkAccessFlags gfx_src_access, gfx_dst_access;
 static PFN_vkCmdUpdateBuffer real_update;
-static PFN_vkCmdCopyBuffer real_copy;
 static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted, mirror_last_transfer_full;
 static VkCommandBuffer mirror_transfer_cb, mirror_barrier_cb;
 static VkPipelineStageFlags mirror_dst_stages, mirror_stages[8];
@@ -264,11 +263,7 @@ static void inbound_post_transfer(VkCommandBuffer cb){
  inbound_injected++;
 }
 static void VKAPI_CALL inbound_update(VkCommandBuffer cb,VkBuffer b,VkDeviceSize off,VkDeviceSize n,const void *data){real_update(cb,b,off,n,data);inbound_post_transfer(cb);}
-static void VKAPI_CALL inbound_copy(VkCommandBuffer cb,VkBuffer a,VkBuffer b,uint32_t n,const VkBufferCopy *regions){
- real_copy(cb,a,b,n,regions);inbound_post_transfer(cb);
-}
 _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_update), PFN_vkCmdUpdateBuffer), "vkCmdUpdateBuffer signature");
-_Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_copy), PFN_vkCmdCopyBuffer), "vkCmdCopyBuffer signature");
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
  VkPipelineStageFlags original_t=t;
  VkMemoryBarrier altered;
@@ -345,6 +340,7 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
 static void VKAPI_CALL count_copy_buffer(VkCommandBuffer cb,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){
  if(test_transfer_consumers && !ndispatch){transfer_seen++;for(uint32_t i=0;i<n;i++)printf("TRANSFER_TRACE copy cb=%p dst=%p off=%llu size=%llu\n",(void*)cb,(void*)d,(unsigned long long)r[i].dstOffset,(unsigned long long)r[i].size);}
  real_copy_buffer(cb,s,d,n,r);
+ inbound_post_transfer(cb);
 }
 static void VKAPI_CALL count_dispatch(VkCommandBuffer cb,uint32_t x,uint32_t y,uint32_t z){
  REQUIRE(ndispatch<4);dispatch_bar[ndispatch]=nbar;dispatch_compute_bar[ndispatch]=ncompute_bar;dispatch_full_bar[ndispatch]=nfull_bar;
@@ -383,7 +379,6 @@ static void VKAPI_CALL count_begin(VkCommandBuffer cb,const VkRenderPassBeginInf
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);if(!f||!name)return f;
  if(!strcmp(name,"vkCmdUpdateBuffer")){real_update=(PFN_vkCmdUpdateBuffer)f;return (PFN_vkVoidFunction)inbound_update;}
- if(!strcmp(name,"vkCmdCopyBuffer")){real_copy=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)inbound_copy;}
  if(!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
  if(!strcmp(name,"vkCmdCopyBuffer")){real_copy_buffer=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)count_copy_buffer;}
  if(!strcmp(name,"vkCmdDispatch")){real_dispatch=(PFN_vkCmdDispatch)f;return (PFN_vkVoidFunction)count_dispatch;}
