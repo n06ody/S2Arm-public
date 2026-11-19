@@ -7200,6 +7200,25 @@ void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd ch, uint32_t producers, uint32_t c
     producer_to_graphics(c, consumers, source, VK_ACCESS_SHADER_WRITE_BIT);
 }
 
+static VkPipelineStageFlags graphics_shader_stages(struct nvn_gpu_cmd_s *c, uint32_t stages) {
+    if (!stages || (stages & ~NVN_GPU_GFX_SRC_ALL)) { set_sticky(c, NVN_GPU_E_ARG, "graphics stage scope invalid"); return 0; }
+    VkPipelineStageFlags result = 0;
+    if (stages & NVN_GPU_GFX_SRC_VS) result |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & NVN_GPU_GFX_SRC_FS) result |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (stages & NVN_GPU_GFX_SRC_GS) {
+        if (!g.dev->core_features.geometryShader) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "geometry stage unavailable"); return 0; }
+        result |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    }
+    return result;
+}
+void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd ch, uint32_t readers, uint32_t writers) {
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "graphics execution barrier inside render pass"); return; }
+    VkPipelineStageFlags src = graphics_shader_stages(c, readers), dst = graphics_shader_stages(c, writers);
+    if (src && dst && rc_is(c->sticky, NVN_GPU_OK)) mem_barrier(c, src, 0, dst, 0);
+}
+
 void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
     (void)nvn_bits;
     struct nvn_gpu_cmd_s *c = ch;
