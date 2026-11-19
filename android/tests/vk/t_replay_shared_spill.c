@@ -2,7 +2,11 @@
 // Real replay + Vulkan backend: compare unspilled and transformed compute,
 // including replay's per-dispatch allocation and indirect argument snapshot.
 #define main replay_dispatch_barrier_fixture_main
+#define rp_view_for dispatch_fixture_view_for
+#define rp_storage_srgb_alias dispatch_fixture_storage_srgb_alias
 #include "t_replay_dispatch_barrier.c"
+#undef rp_storage_srgb_alias
+#undef rp_view_for
 #undef main
 
 // The fixture binds only storage buffers. Abort if an image path is reached.
