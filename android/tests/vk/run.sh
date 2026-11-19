@@ -209,6 +209,9 @@ export S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer"
 if [ "$mode" = --feedback-read-mask-repro ]; then   # 独立夹具 feedback-read 的诊断变体（带参数，不在默认档）
     exec bash "$repo/android/tests/vk/standalone/feedback-read.sh" --mask-repro
 fi
+if [ "$mode" = --external-dependency-red ]; then
+    exec bash "$repo/android/tests/vk/standalone/external-dependency.sh" red
+fi
 if standalone_mode; then
     exec bash "$repo/android/tests/vk/standalone/${mode#--}.sh"
 fi
