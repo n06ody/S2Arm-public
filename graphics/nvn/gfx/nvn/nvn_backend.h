@@ -106,7 +106,7 @@ enum {
     NVN_GPU_CAP_DYN_RASTER        = 1u << 17,  // 剔除 / 正反面 / 多边形模式是动态状态（Metal 恒有 / Vulkan extended_dynamic_state(3)）
     NVN_GPU_CAP_BLIT_SCALED       = 1u << 18,  // 带缩放 / 格式转换的贴图拷贝原生（Metal 无，核心 copy_t2t_draw 用绘制做；vkCmdBlitImage）
     NVN_GPU_CAP_GPU_DESWIZZLE     = 1u << 19,  // 后端能在 GPU 上解 NVN 块线性排布（Metal 现有 nvn_deswizzle_gpu.h；定稿 #3）
-    NVN_GPU_CAP_BLIT_DEPTH_STENCIL = 1u << 20, // 同格式 D24S8/D32FS8、二维单采样、最近点缩放（含全部模板位）
+    NVN_GPU_CAP_BLIT_DEPTH_STENCIL = 1u << 20, // 同格式深度（模板）D24S8/D32FS8（含全部模板位）与只有深度的 D32F/D16、二维单采样、最近点缩放
     NVN_GPU_CAP_NO_ATTACH_PASS    = 1u << 21,  // 能开一个附件都不挂的渲染通道（NVN 不挂目标照样绘制：片元只写存储 / 只为遮挡计数）。尺寸由 pass_desc 的 w / h 给；
                                                //   Vulkan 核心 1.0 恒有（零附件子通道 + 带宽高的帧缓冲）；Metal 的 renderTargetWidth / Height 没接，不置位 → 核心照旧跳过并记账
     NVN_GPU_CAP_REPORT_TIMESTAMP  = 1u << 22,  // 逐报告位置的时间戳：已校准 CLOCK_MONOTONIC ns；首版仅 Vulkan，Metal 明确不置位

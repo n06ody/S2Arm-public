@@ -27,7 +27,7 @@ for dq in 0 1; do
     rc=${PIPESTATUS[0]}
     set -e
     if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$out/dq$dq.log" ||
-       ! grep -q 'res-scale cases=5 failures=0' "$out/dq$dq.log"; then
+       ! grep -q 'res-scale cases=10 failures=0' "$out/dq$dq.log"; then
         echo "【红】res-scale DQ=$dq rc=$rc or validation failure" >&2; exit 1
     fi
 done

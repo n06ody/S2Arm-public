@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
-// 同格式、单采样二维深度模板缩放。对齐 Ryujinx HelperShader 的绘制拷贝；
+// 同格式、单采样二维深度（模板）缩放。对齐 Ryujinx HelperShader 的绘制拷贝；
 // 无需 BLIT_SRC/DST 或 shaderStencilExport：先写深度并清目标矩形模板，再按位写模板。
+// 只有深度的格式（D16 / D32F）只走第一笔，不挂模板附件、不写 binding 1。
 // stencil.frag 不声明 EarlyFragmentTests，discard 的片元不更新模板。
 #include "backend_vulkan_depth_blit_spv.h"
 static struct {
@@ -9,18 +10,18 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkSampler sampler;
-    struct { VkPipeline depth, stencil; VkRenderPass pass; } p[2];
+    struct { VkPipeline depth, stencil; VkRenderPass pass; } p[4];   // 槽见 depth_blit_slot
 } g_dsb;
 static pthread_mutex_t g_dsb_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void depth_blit_close(void) {
     pthread_mutex_lock(&g_dsb_mu);
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < 4; i++) {
         if (g_dsb.p[i].depth) vkDestroyPipeline(g.d, g_dsb.p[i].depth, NULL);
         if (g_dsb.p[i].stencil) vkDestroyPipeline(g.d, g_dsb.p[i].stencil, NULL);
         if (g_dsb.p[i].pass) vkDestroyRenderPass(g.d, g_dsb.p[i].pass, NULL);
-        if (g_dsb.fs[i]) vkDestroyShaderModule(g.d, g_dsb.fs[i], NULL);
     }
+    for (unsigned i = 0; i < 2; i++) if (g_dsb.fs[i]) vkDestroyShaderModule(g.d, g_dsb.fs[i], NULL);
     if (g_dsb.vs) vkDestroyShaderModule(g.d, g_dsb.vs, NULL);
     if (g_dsb.layout) vkDestroyPipelineLayout(g.d, g_dsb.layout, NULL);
     if (g_dsb.dsl) vkDestroyDescriptorSetLayout(g.d, g_dsb.dsl, NULL);
@@ -36,9 +37,19 @@ static VkShaderModule depth_blit_module(const uint32_t *words, size_t bytes) {
     return vkCreateShaderModule(g.d, &ci, NULL, &out) == VK_SUCCESS ? out : VK_NULL_HANDLE;
 }
 
-// 调用者持 g_dsb_mu；两个槽分别对应 D24S8 / D32FS8，不按设备或游戏分支。
-static int depth_blit_pipelines(uint32_t format, unsigned slot) {
-    if (g_dsb.p[slot].depth && g_dsb.p[slot].stencil) return 1;
+// 按 NVN 格式取槽（不按设备或游戏分支）；-1 = 不收。带模板的两种走深度 + 按位模板，只有深度的两种只走深度那一笔
+static int depth_blit_slot(uint32_t nvn_format) {
+    switch (nvn_format) {
+    case NVN_FORMAT_DEPTH24_STENCIL8: return 0;
+    case NVN_FORMAT_DEPTH32F_STENCIL8: return 1;
+    case NVN_FORMAT_DEPTH32F: return 2;
+    case NVN_FORMAT_DEPTH16: return 3;
+    default: return -1;
+    }
+}
+// 调用者持 g_dsb_mu。stencil = 0：只建深度那条（只有深度的格式）
+static int depth_blit_pipelines(uint32_t format, unsigned slot, int stencil) {
+    if (g_dsb.p[slot].depth && (!stencil || g_dsb.p[slot].stencil)) return 1;
     if (!g_dsb.vs) g_dsb.vs = depth_blit_module(k_dsb_vs, sizeof k_dsb_vs);
     if (!g_dsb.fs[0]) g_dsb.fs[0] = depth_blit_module(k_dsb_depth, sizeof k_dsb_depth);
     if (!g_dsb.fs[1]) g_dsb.fs[1] = depth_blit_module(k_dsb_stencil, sizeof k_dsb_stencil);
@@ -66,7 +77,7 @@ static int depth_blit_pipelines(uint32_t format, unsigned slot) {
         g_dsb.p[slot].pass = make_pipeline_pass(&pd);
         if (!g_dsb.p[slot].pass) return 0;
     }
-    for (unsigned mode = 0; mode < 2; mode++) {
+    for (unsigned mode = 0; mode < (stencil ? 2u : 1u); mode++) {
         VkPipeline *out = mode ? &g_dsb.p[slot].stencil : &g_dsb.p[slot].depth;
         if (*out) continue;
         VkPipelineShaderStageCreateInfo stages[2] = {{0}};
@@ -79,7 +90,7 @@ static int depth_blit_pipelines(uint32_t format, unsigned slot) {
         VkPipelineRasterizationStateCreateInfo rs = {0}; rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.lineWidth = 1;
         VkPipelineMultisampleStateCreateInfo ms = {0}; ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds = {0}; ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable = ds.depthWriteEnable = !mode; ds.depthCompareOp = VK_COMPARE_OP_ALWAYS; ds.stencilTestEnable = VK_TRUE;
+        ds.depthTestEnable = ds.depthWriteEnable = !mode; ds.depthCompareOp = VK_COMPARE_OP_ALWAYS; ds.stencilTestEnable = stencil ? VK_TRUE : VK_FALSE;
         ds.front.compareOp = VK_COMPARE_OP_ALWAYS; ds.front.passOp = VK_STENCIL_OP_REPLACE; ds.front.compareMask = 255; ds.back = ds.front;
         VkPipelineColorBlendStateCreateInfo cb = {0}; cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
@@ -110,11 +121,10 @@ static VkImageView depth_blit_view(struct nvn_gpu_view_s *v, unsigned stencil) {
 // 只校验、不录（nvn_gpu_blit_check 的深度模板一支）：前提不满足返回非 OK、why 写哪一条；管线在这里就建好，录的时候不会再因缺管线失败。
 static nvn_gpu_rc depth_blit_check(const struct nvn_gpu_view_s *sv, const NVNcopyRegion *sr, const struct nvn_gpu_view_s *dv, const NVNcopyRegion *dr, int linear, nvn_gpu_err *err) {
     const struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
-    const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-    if (linear || s == d || s->samples != 1 || d->samples != 1 || s->aspect != ds || d->aspect != ds ||
-        s->nvn_format != d->nvn_format || s->format != d->format || s->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_3D ||
-        (d->nvn_format != NVN_FORMAT_DEPTH24_STENCIL8 && d->nvn_format != NVN_FORMAT_DEPTH32F_STENCIL8))
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：须不同图像、同 D24S8/D32FS8 格式、单采样二维及最近点过滤（源 0x%x → 目标 0x%x）", s->nvn_format, d->nvn_format);
+    const int slot = depth_blit_slot(d->nvn_format);
+    if (linear || s == d || s->samples != 1 || d->samples != 1 || !(s->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || s->aspect != d->aspect ||
+        s->nvn_format != d->nvn_format || s->format != d->format || s->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_3D || slot < 0)
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：须不同图像、同格式（D24S8/D32FS8/D32F/D16）、单采样二维及最近点过滤（源 0x%x → 目标 0x%x）", s->nvn_format, d->nvn_format);
     VkOffset3D so, dof; VkExtent3D se, de;
     if (sr->width <= 0 || sr->height <= 0 || dr->width <= 0 || dr->height <= 0 || sr->depth != 1 || dr->depth != 1 || sr->zoffset || dr->zoffset ||
         copy_region(s, sv->base_level, sr, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) || sv->base_layer >= s->layers || dv->base_layer >= d->layers)
@@ -124,8 +134,7 @@ static nvn_gpu_rc depth_blit_check(const struct nvn_gpu_view_s *sv, const NVNcop
         return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：源图缺采样用途或目标图缺附件用途");
     if (!(features.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：格式缺采样或附件能力");
-    const unsigned slot = d->nvn_format == NVN_FORMAT_DEPTH32F_STENCIL8;
-    pthread_mutex_lock(&g_dsb_mu); const int ready = depth_blit_pipelines(d->nvn_format, slot); pthread_mutex_unlock(&g_dsb_mu);
+    pthread_mutex_lock(&g_dsb_mu); const int ready = depth_blit_pipelines(d->nvn_format, (unsigned)slot, !!(d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)); pthread_mutex_unlock(&g_dsb_mu);
     if (!ready) return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放管线创建失败");
     return rc(NVN_GPU_OK);
 }
@@ -133,20 +142,20 @@ static nvn_gpu_rc depth_blit_check(const struct nvn_gpu_view_s *sv, const NVNcop
 // 调用方已过 depth_blit_check（nvn_gpu_blit 里）
 static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const NVNcopyRegion *sr, struct nvn_gpu_view_s *dv, const NVNcopyRegion *dr) {
     struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
-    const unsigned slot = d->nvn_format == NVN_FORMAT_DEPTH32F_STENCIL8;
+    const unsigned slot = (unsigned)depth_blit_slot(d->nvn_format), planes = d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT ? 2 : 1;   // 只有深度：binding 1 管线不读，不写
     VkDescriptorSet set;
     VkDescriptorImageInfo images[2] = {{0}}; VkWriteDescriptorSet writes[2] = {{0}};
     if (!alloc_sets(c, &g_dsb.dsl, 1, &set, NULL, 0, 0)) return;
-    for (unsigned i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < planes; i++) {
         images[i].sampler = g_dsb.sampler; images[i].imageView = depth_blit_view(sv, i); images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         if (!images[i].imageView) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度模板缩放源视图创建失败"); return; }
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = set; writes[i].dstBinding = i;
         writes[i].descriptorCount = 1; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[i].pImageInfo = &images[i];
     }
-    vkUpdateDescriptorSets(g.d, 2, writes, 0, NULL);
+    vkUpdateDescriptorSets(g.d, planes, writes, 0, NULL);
     full_barrier(c); image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); cmd_ref(c, sv, REF_VIEW);
     nvn_gpu_pass_desc pass = {0}; pass.w = d->w >> dv->base_level; pass.h = d->h >> dv->base_level; if (!pass.w) pass.w = 1; if (!pass.h) pass.h = 1; pass.layers = 1;
-    pass.depth.view = pass.stencil.view = dv; pass.depth.load = pass.stencil.load = NVN_GPU_LOAD_LOAD; pass.depth.store = pass.stencil.store = NVN_GPU_STORE_STORE;
+    pass.depth.view = dv; pass.stencil.view = planes > 1 ? dv : NULL; pass.depth.load = pass.stencil.load = NVN_GPU_LOAD_LOAD; pass.depth.store = pass.stencil.store = NVN_GPU_STORE_STORE;
     nvn_gpu_pass_begin(c, &pass); if (!rc_is(c->sticky, NVN_GPU_OK)) return;
     VkViewport vp = {(float)dr->xoffset, (float)dr->yoffset, (float)dr->width, (float)dr->height, 0, 1};
     VkRect2D sc = {{dr->xoffset, dr->yoffset}, {(uint32_t)dr->width, (uint32_t)dr->height}};
@@ -156,11 +165,13 @@ static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].depth);
     vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255); vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
     vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
-    vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].stencil);
-    vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255);
-    for (unsigned bit = 0; bit < 8; bit++) {
-        push.bit = 1u << bit; vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, push.bit);
-        vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
+    if (planes > 1) {   // 模板按位写（只有深度的格式没有这一段）
+        vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].stencil);
+        vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255);
+        for (unsigned bit = 0; bit < 8; bit++) {
+            push.bit = 1u << bit; vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, push.bit);
+            vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
+        }
     }
     nvn_gpu_pass_end(c); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL); full_barrier(c);
     // 抽象绑定/动态状态仍属于调用方；物理命令缓冲被辅助绘制改过，下一笔须全部重发。

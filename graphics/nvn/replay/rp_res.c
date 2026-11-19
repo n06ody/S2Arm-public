@@ -500,10 +500,10 @@ static const char *rs_ineligible(const tex_t *t, const struct rp_tex *x, float s
     if (t->d.samples > 1) return "多重采样";
     if (!nvn_fmt_info_of((uint32_t)f, &fi)) return "格式未知";
     if (fi.bw > 1 || fi.bh > 1) return "块压缩";
-    if (fi.depth || fi.stencil) {   // 深度只放行后端深度模板 blit 收的（CAP_BLIT_DEPTH_STENCIL：同格式 D24S8 / D32FS8；只有深度的 D32F 它不收）；D16 精度不够（同 iOS）
+    if (fi.depth || fi.stencil) {   // 深度只放行后端深度 blit 收的（CAP_BLIT_DEPTH_STENCIL：同格式 D24S8 / D32FS8 / D32F）；D16 精度不够（同 iOS），后端虽收也不缩
         nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
         if (!(cp.caps & NVN_GPU_CAP_BLIT_DEPTH_STENCIL)) return "深度不能缩放拷贝";
-        if (f != NVN_FORMAT_DEPTH24_STENCIL8 && f != NVN_FORMAT_DEPTH32F_STENCIL8) return "深度格式";
+        if (f != NVN_FORMAT_DEPTH24_STENCIL8 && f != NVN_FORMAT_DEPTH32F_STENCIL8 && f != NVN_FORMAT_DEPTH32F) return "深度格式";
     } else if (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT) return "整数格式";
     if (!(nvn_gpu_format_caps((uint32_t)f) & (NVN_GPU_FMT_RENDER | NVN_GPU_FMT_DEPTH))) return "不能当附件";
     const int fl = t->d.flags;

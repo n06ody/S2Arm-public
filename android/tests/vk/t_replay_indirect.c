@@ -249,7 +249,7 @@ int main(int argc,char **argv) {
  if(!depth_only)run_color_mirror(&d);
  uint64_t dq=nvn_vk_dbg_dq_recs();REQUIRE(getenv("S2A_REPLAY_INDIRECT_DQ")?dq>0:dq==0);
  printf("DQ records=%llu\n",(unsigned long long)dq);REQUIRE(!s2a_vk_device_destroy(&d,1));
- if(depth_only)puts("real depth-copy only: 4 format/subresource cases passed");
+ if(depth_only)puts("real depth-copy only: 8 format/subresource cases passed");
  else printf("real rp_draw/rp_buf ordinary-indirect+DRV0 cases9 plus-boundaries33 pixel-failures%u\n",failures);
  return failures?1:0;
 }

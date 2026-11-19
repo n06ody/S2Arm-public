@@ -6,9 +6,9 @@
 //      render_scale[0] 三者合起来，存储像素 (x,y) 在裁剪内 = (⌊(x+0.5)/s⌋, ⌊(y+0.5)/s⌋)、裁剪外 = 清屏蓝；
 //   ② 随后一个没声明按倍率处理的用途（直接取视图）：存储缩回 200x100，读回逐像素 = 游戏坐标（倍率 2 时两像素同值，线性缩小精确）；
 //   ③ 方形 128x128 在倍率 2 不可缩：存储不变、像素 = 游戏坐标。
-//   ④ 同一通道挂深度附件（r3 真机 9000 倍率 0.75 整局黑屏）：D24S8 后端深度模板 blit 收 → 两张都缩；
-//      只有深度的 D32F 后端不收（depth_blit 只做 D24S8 / D32FS8）→ 该深度按 1×、整组附件按 1× 开、段照常提交、像素 = 1×。
-//      修前：D32F 过了资格、换存储录了一笔后端不收的 blit → 整段 sticky → 提交失败（本用例 GPU() 断言退出）。
+//   ④ 同一通道挂深度附件（r3 真机 9000 倍率 0.75 整局黑屏）：D24S8、只有深度的 D32F 后端深度 blit 都收 → 两张都缩；
+//      D16 资格不放行（精度，同 iOS）→ 该深度按 1×、整组附件按 1× 开、段照常提交、像素 = 1×。
+//      后端不收某种深度时（负控：depth_blit 去掉 D32F）→ 换存储前的询问兜住：该深度 1×、整组 1×、会话继续（尺寸红、不会提交失败）。
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -117,7 +117,7 @@ static void run_case(struct s2a_vk_device *device,const char *dir,const char *sc
  unsigned before=emitted;p_draw dr={0};dr.prim=4;dr.count=3;dr.instances=1;rp_draw(active,&dr,NULL,&dr);
  rp_pass_flush(active);GPU(nvn_gpu_cmd_commit(active,serial,done,NULL,&err));GPU(nvn_gpu_fence_wait(serial,5000000000ull,&err));completed=1;
  REQUIRE(emitted-before==1);REQUIRE(!nvn_unimpl_kinds());
- const float want=square||depth_fmt==NVN_FORMAT_DEPTH32F?1:s;uint32_t w=0,h=0;
+ const float want=square||depth_fmt==NVN_FORMAT_DEPTH16?1:s;uint32_t w=0,h=0;
  unsigned bad1=check(&t,want,1,&w,&h);
  int size1=w==(uint32_t)ceil(t.d.width*want)&&h==(uint32_t)ceil(t.d.height*want);
  uint32_t dw=0,dh=0;
@@ -131,7 +131,7 @@ static void run_case(struct s2a_vk_device *device,const char *dir,const char *sc
  else{rp_rs_level(&t,0,&w2,&h2);}          // 倍率 < 1：放回 1× 是插值，只核尺寸
  const int size2=w2==t.d.width&&h2==t.d.height;
  printf("res-scale dq=%d scale=%s %s%s：存储 %ux%u（期望 %ux%u）深度存储 %ux%u 错像素 %u；未声明用途后存储 %ux%u 错像素 %u\n",dq_mode,scale?scale:"1",square?"方形 128":"200x100",
-        depth_fmt==NVN_FORMAT_DEPTH32F?" + D32F 深度":depth_fmt==NVN_FORMAT_DEPTH24_STENCIL8?" + D24S8 深度":"",w,h,(uint32_t)ceil(t.d.width*want),(uint32_t)ceil(t.d.height*want),dw,dh,bad1,w2,h2,bad2);
+        depth_fmt==NVN_FORMAT_DEPTH32F?" + D32F 深度":depth_fmt==NVN_FORMAT_DEPTH24_STENCIL8?" + D24S8 深度":depth_fmt==NVN_FORMAT_DEPTH16?" + D16 深度":"",w,h,(uint32_t)ceil(t.d.width*want),(uint32_t)ceil(t.d.height*want),dw,dh,bad1,w2,h2,bad2);
  cases++;failures+=bad1+bad2+!size1+!size2;
  rp_res_reset();rp_pass_reset();rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);GPU(nvn_gpu_close(5000000000ull,&err));
 }
@@ -142,7 +142,7 @@ int main(int argc,char **argv){
  if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
  run_case(&device,argv[1],NULL,0,0);run_case(&device,argv[1],"2",0,0);run_case(&device,argv[1],"0.5",0,0);run_case(&device,argv[1],"0.75",0,0);run_case(&device,argv[1],"2",1,0);
  run_case(&device,argv[1],"0.75",0,NVN_FORMAT_DEPTH24_STENCIL8);run_case(&device,argv[1],"2",0,NVN_FORMAT_DEPTH24_STENCIL8);
- run_case(&device,argv[1],"0.75",0,NVN_FORMAT_DEPTH32F);run_case(&device,argv[1],"2",0,NVN_FORMAT_DEPTH32F);
+ run_case(&device,argv[1],"0.75",0,NVN_FORMAT_DEPTH32F);run_case(&device,argv[1],"2",0,NVN_FORMAT_DEPTH32F);run_case(&device,argv[1],"0.75",0,NVN_FORMAT_DEPTH16);
  rp_rs_configure(NULL);
  REQUIRE(!s2a_vk_device_destroy(&device,1));
  printf("res-scale cases=%u failures=%u\n",cases,failures);
