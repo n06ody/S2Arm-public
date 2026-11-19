@@ -59,6 +59,9 @@ static void ctl_wake(void) {}
 static int stop_window_lock(void) { return pthread_mutex_lock(&g_window_mu); }
 static int nvk_session_wait_compiles(void) { return 0; } // timing exercised separately
 static void nvk_session_flush_pipe_cache(void) {}
+void nvn_vk_frame_log_snapshot_retained(uint64_t) __attribute__((weak));
+void nvn_vk_frame_log_snapshot_retained(uint64_t deadline) { (void)deadline; }
+static uint64_t nvk_session_stop_deadline(void) { return 1; }
 static void set_window_error(struct provider_context *c, const char *s) { snprintf(c->window_error, sizeof c->window_error, "%s", s); }
 static pthread_mutex_t stop_test_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stop_test_cv = PTHREAD_COND_INITIALIZER;
