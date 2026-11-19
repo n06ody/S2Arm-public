@@ -39,6 +39,36 @@ static uint64_t g_gap_over33;   // 超过 33 毫秒的帧数（精确按纳秒�
 // 这里按弱引用处理（同 rp_entry.c 的 nvn_ft_written）：没有实现时这一项显示 0，不改变既有日志与回放语义。
 // 只在上屏线程、只在长帧日志打开时查（nvn_gpu_stats 要锁后端、走一遍统计表）。
 extern void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) __attribute__((weak));
+// 旁路：按相邻上屏提交的间隔读取累计录制/提交计数，不把它当作 GPU 完成帧归属。
+#define INBOUND_FRAME_KEYS 160
+struct inbound_frame_ent { char name[200]; uint64_t value; };
+struct inbound_frame_rd { struct inbound_frame_ent e[INBOUND_FRAME_KEYS]; unsigned n, overflow; };
+static struct inbound_frame_rd g_inbound_prev;
+static void inbound_frame_cb(void *user, const char *name, uint64_t value) {
+    if (strncmp(name, "inbound_diag_", 13) && strncmp(name, "inbound_full_", 13) && strncmp(name, "inbound_narrow_", 15) && strncmp(name, "inbound_fallback_", 17)) return;
+    struct inbound_frame_rd *rd=user;
+    if (rd->n == INBOUND_FRAME_KEYS) { rd->overflow++; return; }
+    struct inbound_frame_ent *e=&rd->e[rd->n++];
+    snprintf(e->name,sizeof e->name,"%s",name); e->value=value;
+}
+static void inbound_frame_note(uint64_t ticket) {
+    if (!nvn_gpu_stats || !nvn_plat_flag("nvk_inbound_diag",0)) return;
+    struct inbound_frame_rd now={0}; nvn_gpu_stats(inbound_frame_cb,&now,0);
+    char line[3072]; int used=snprintf(line,sizeof line,"上屏间隔 ticket=%llu 键=%u 丢键=%u",(unsigned long long)ticket,now.n,now.overflow);
+    for (unsigned i=0;i<now.n;i++) {
+        uint64_t old=0;
+        if (i<g_inbound_prev.n && !strcmp(now.e[i].name,g_inbound_prev.e[i].name)) old=g_inbound_prev.e[i].value;
+        else for (unsigned j=0;j<g_inbound_prev.n;j++) if (!strcmp(now.e[i].name,g_inbound_prev.e[j].name)) { old=g_inbound_prev.e[j].value; break; }
+        uint64_t delta=now.e[i].value >= old ? now.e[i].value-old : now.e[i].value;
+        if (delta) {
+            char item[256]; int n=snprintf(item,sizeof item," %s=%llu",now.e[i].name,(unsigned long long)delta);
+            if (used+n >= (int)sizeof line) { nvn_plat_log(NVN_PLAT_LOG_INFO,"inbound_diag",line); used=snprintf(line,sizeof line,"上屏间隔 ticket=%llu 续",(unsigned long long)ticket); }
+            memcpy(line+used,item,(size_t)n+1); used+=n;
+        }
+    }
+    nvn_plat_log(NVN_PLAT_LOG_INFO,"inbound_diag",line);
+    g_inbound_prev=now;
+}
 struct plc_ns_rd { uint64_t ns; int got; };
 static uint64_t g_plc_ns_last;   // 上次取到的累计值（只在 [上屏] 动）
 static void plc_ns_cb(void *user, const char *name, uint64_t value) {
@@ -233,6 +263,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
       clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        inbound_frame_note(ticket);
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
@@ -366,4 +397,4 @@ double nvn_be_presented_time(uint64_t n) {
     return at;
 }
 void rp_present_stats(uint64_t *shown, uint64_t *dropped) { pthread_mutex_lock(&g_pmu); if (shown) *shown = g_n_shown; if (dropped) *dropped = g_n_dropped; pthread_mutex_unlock(&g_pmu); }
-void rp_present_reset(void) { atomic_store(&g_adpf_seq, 0); pthread_mutex_lock(&g_pmu); g_surf = NULL; g_hz = 0; g_ticket = 0; g_n_shown = g_n_dropped = 0; memset(g_shown, 0, sizeof g_shown); memset(&g_fseg, 0, sizeof g_fseg); pthread_mutex_unlock(&g_pmu); }
+void rp_present_reset(void) { atomic_store(&g_adpf_seq, 0); pthread_mutex_lock(&g_pmu); memset(&g_inbound_prev, 0, sizeof g_inbound_prev); g_surf = NULL; g_hz = 0; g_ticket = 0; g_n_shown = g_n_dropped = 0; memset(g_shown, 0, sizeof g_shown); memset(&g_fseg, 0, sizeof g_fseg); pthread_mutex_unlock(&g_pmu); }

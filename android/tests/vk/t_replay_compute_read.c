@@ -28,6 +28,8 @@ void nvn_plat_safepoint(void){}
 static int disable_compute_access;
 static int dq_mode;
 int nvn_plat_flag(const char *n,int d){
+ if(!strcmp(n,"nvk_inbound_diag")){const char *e=getenv("S2A_INBOUND_DIAG");return e?atoi(e):d;}
+ if(!strcmp(n,"nvk_inbound_narrow")){const char *e=getenv("S2A_INBOUND_NARROW");return e?atoi(e):0;}
  if(!strcmp(n,"nvk_gfx_dep_narrow")){const char *e=getenv("S2A_GFX_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_mirror_dep_narrow")){const char *e=getenv("S2A_MIRROR_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_cgr"))return !disable_compute_access;
@@ -181,6 +183,7 @@ extern __typeof__(vkQueueWaitIdle) __real_vkQueueWaitIdle;
 VkResult __wrap_vkQueueWaitIdle(VkQueue q){atomic_fetch_add(&idles,1);return __real_vkQueueWaitIdle(q);}
 extern __typeof__(vkDeviceWaitIdle) __real_vkDeviceWaitIdle;
 VkResult __wrap_vkDeviceWaitIdle(VkDevice d){atomic_fetch_add(&idles,1);return __real_vkDeviceWaitIdle(d);}
+static unsigned inbound_narrow_passes, inbound_old_passes;
 extern __typeof__(vkCreateRenderPass) __real_vkCreateRenderPass;
 VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,const VkAllocationCallbacks *a,VkRenderPass *p){
  // 仅测试：按 v1.4.341 §8.2 的等价定义展开 ALL_COMMANDS；不是删除依赖，也不是生产改动。
@@ -191,6 +194,10 @@ VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,c
   for(uint32_t i=0;i<ci->dependencyCount;i++){
    VkSubpassDependency dep=deps[i];
    if(getenv("S2A_CGR_REMOVE_INCOMING") && dep.srcSubpass==VK_SUBPASS_EXTERNAL)continue;
+   if(getenv("S2A_FORCE_NARROW_INCOMING") && dep.srcSubpass==VK_SUBPASS_EXTERNAL){
+    dep.srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+   }
    if(getenv("S2A_CGR_REMOVE_OUTGOING") && dep.dstSubpass==VK_SUBPASS_EXTERNAL)continue;
    if(dep.srcStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
    if(dep.dstStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
@@ -199,6 +206,11 @@ VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,c
  }
  VkResult result=__real_vkCreateRenderPass(d,ci,a,p);if(result==VK_SUCCESS)for(uint32_t i=0;i<ci->dependencyCount;i++){
   const VkSubpassDependency *b=&ci->pDependencies[i];
+  if(getenv("S2A_INBOUND_FINAL") && b->srcSubpass==VK_SUBPASS_EXTERNAL){
+   VkPipelineStageFlags narrow=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+   if(b->srcStageMask==narrow && b->srcAccessMask==(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT))inbound_narrow_passes++;
+   if(b->srcStageMask==VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT && b->srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT)inbound_old_passes++;
+  }
   printf("TRACE pass=%p dep=%u subpass=%u->%u stage=%#x->%#x access=%#x->%#x\n",(void*)*p,i,b->srcSubpass,b->dstSubpass,b->srcStageMask,b->dstStageMask,b->srcAccessMask,b->dstAccessMask);
  }free(deps);return result;
 }
@@ -217,19 +229,19 @@ static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
 static PFN_vkCmdEndRenderPass real_end_pass;
-static unsigned gfx_injected, gfx_published, gfx_omitted, gfx_full, gfx_full_omitted, gfx_exec, gfx_exec_omitted;
+static unsigned gfx_injected, gfx_published, gfx_omitted, gfx_full, gfx_full_omitted, gfx_exec, gfx_exec_omitted, inbound_fallback, inbound_fallback_omitted;
 static VkPipelineStageFlags gfx_exec_src, gfx_exec_dst;
 static VkPipelineStageFlags gfx_src_stages, gfx_dst_stages;
 static VkAccessFlags gfx_src_access, gfx_dst_access;
 static PFN_vkCmdUpdateBuffer real_update;
 static PFN_vkCmdCopyBuffer real_copy;
-static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted;
+static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted, mirror_last_transfer_full;
 static VkCommandBuffer mirror_transfer_cb, mirror_barrier_cb;
 static VkPipelineStageFlags mirror_dst_stages, mirror_stages[8];
 static VkAccessFlags mirror_dst_access;
 static void inbound_post_transfer(VkCommandBuffer cb){
  if(!getenv("S2A_INBOUND_MAIN_ONLY"))return;
- inbound_transfers++;mirror_transfer_cb=cb;
+ inbound_transfers++;mirror_transfer_cb=cb;mirror_last_transfer_full=nfull_bar;
  const char *mode=getenv("S2A_INBOUND_INJECT");int m=mode?atoi(mode):0;
  if(!m || m>=5)return;  // 5：生产路径自己发布，不插夹具屏障
  const char *stage=getenv("S2A_INBOUND_STAGE");
@@ -277,6 +289,16 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
    VkPipelineStageFlags remaining=t & ~missing;
    real_barrier(cb,s,remaining?remaining:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im); return;
   }
+ }
+ if(is_full && getenv("S2A_MIRROR_FINAL") && inbound_transfers==1 && !ndraw){
+  inbound_fallback++;const char *mode=getenv("S2A_INBOUND_INJECT");
+  if(mode && !strcmp(mode,"19")){VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;inbound_fallback_omitted++;
+   real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;}
+ }
+ if(is_full && getenv("S2A_INBOUND_FINAL") && ndraw==1){
+  inbound_fallback++;const char *mode=getenv("S2A_GFX_ACCESS_MODE");
+  if(mode && !strcmp(mode,"13")){VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;inbound_fallback_omitted++;
+   real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;}
  }
  if(is_full && getenv("S2A_GFX_HAZARD") && ndraw==1){
   gfx_full++;const char *mode=getenv("S2A_GFX_ACCESS_MODE");
@@ -403,6 +425,12 @@ int main(int argc,char **argv){
  rp_pass_flush(active);nvn_gpu_copy_tex_buf(active,tex,0,0,NULL,rb,0,256,16384);
  GPU(nvn_gpu_cmd_commit(active,serial,done,NULL,&err));GPU(nvn_gpu_fence_wait(serial,5000000000ull,&err));
  REQUIRE(ndraw==expected_draws&&ndispatch==(unsigned)(!no_producer&&!zero)+(unsigned)rewrite);
+ if(getenv("S2A_INDIRECT_INBOUND")){
+  unsigned wanted=disable_compute_access?1u:0u;
+  printf("INDIRECT_INBOUND full_before=%u full_draw=%u omitted=%u\n",dispatch_full_bar[0],draw_full_bar[0],omitted_full);
+  REQUIRE(draw_full_bar[0]==dispatch_full_bar[0]+wanted);
+  if(getenv("S2A_CGR_OMIT_FULL"))REQUIRE(omitted_full==1);
+ }
  unsigned before=ndispatch?dispatch_bar[0]:draw_bar[0],after=draw_bar[ndraw-1],compute_after=draw_compute_bar[ndraw-1];
  if(no_producer||zero||readonly||game||disable_compute_access){REQUIRE(compute_after==0);}
  else if(!manual){REQUIRE(compute_after==1u+(unsigned)rewrite);}
