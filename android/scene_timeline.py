@@ -42,6 +42,7 @@ def analyze(trace, pid, uuid, start_us, end_us):
             if event['boot_us'] <= end_us:
                 pending.append({'type': name, **event})
     return {
+        'segments': trace.get('segments', []),
         'pid': pid, 'uuid': uuid, 'scene_start_boot_us': start_us, 'first_complete_anchor_boot_us': end_us,
         'scene_elapsed_ms': (end_us - start_us) / 1000,
         'frames': {'intervals': len(gaps), 'over_33_3_ms': sum(g > 33.3 for g in gaps),
@@ -59,7 +60,8 @@ def analyze(trace, pid, uuid, start_us, end_us):
                     'conservative_uploads': sum(e['kind'] == 3 and bool(e['reason'] & 12) for e in uploads)},
         'status': 'unproven' if pending or not gaps else 'covered',
         'inflight_at_coverage_end': pending, 'timeline': timeline,
-        'limits': ['First complete scene is an external visual anchor, not inferred from CPU present.',
+        'limits': ['Compare source and received segment byte counts externally; self-reported digests are not verified.',
+                   'First complete scene is an external visual anchor, not inferred from CPU present.',
                    'CPU upload records preparation and command recording, not GPU completion.',
                    'No-hit-reported is not proof of a driver cache miss; overlapping boundary events contribute their full duration and bytes.'],
     }

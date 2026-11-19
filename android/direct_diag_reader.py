@@ -5,7 +5,6 @@
 Only consecutive, complete segments with zero dropped records establish coverage. An
 unpaired compile_begin is reported as inflight, never counted as a completed compile.
 """
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -16,19 +15,21 @@ def read_segments(paths):
         raise ValueError('no segments')
     groups = []
     for path in paths:
-        lines = Path(path).read_bytes().splitlines(keepends=True)
+        content = Path(path).read_bytes()
+        lines = content.splitlines(keepends=True)
         if len(lines) < 2 or any(not line.endswith(b'\n') for line in lines):
             raise ValueError('incomplete segment')
         values = [json.loads(line) for line in lines]
         head, end = values[0], values[-1]
         if head.get('schema') not in ('s2a-direct-trace-v1', 's2a-direct-trace-v2') or head.get('clock') not in ('CLOCK_BOOTTIME', 'CLOCK_MONOTONIC'):
             raise ValueError('unsupported schema or clock')
-        if end != {'status': 'complete', 'sha256': hashlib.sha256(b''.join(lines[:-1])).hexdigest()}:
-            raise ValueError('incomplete segment or checksum mismatch')
+        if end.get('status') != 'complete' or not isinstance(end.get('sha256'), str):
+            raise ValueError('incomplete segment')
         records = values[1:-1]
         if head['count'] != len(records) or head['dropped'] != 0:
             raise ValueError('lost records')
-        groups.append((head, records))
+        groups.append((head, records, {'segment': head['segment'], 'bytes': len(content),
+                                        'product_reported_sha256': end['sha256']}))
     groups.sort(key=lambda v: v[0]['segment'])
     first = groups[0][0]
     if first['segment'] != 0:
@@ -38,7 +39,7 @@ def read_segments(paths):
     inflight, finished, frames = {}, [], []
     pipeline_inflight, pipelines, pack_lookups = {}, [], []
     upload_inflight, uploads = {}, []
-    for index, (head, records) in enumerate(groups):
+    for index, (head, records, metadata) in enumerate(groups):
         if (head['pid'], head['session'], head['clock'], head['uuid']) != identity or head['schema'] != first['schema'] or head['segment'] != index or head['start_us'] != prev_end or head['end_us'] < prev_end:
             raise ValueError('segment identity, ordering or coverage mismatch')
         for r in records:
@@ -89,7 +90,7 @@ def read_segments(paths):
             else:
                 raise ValueError('unknown record')
         prev_end = head['end_us']
-    return {'pid': identity[0], 'session': identity[1], 'clock': identity[2], 'uuid': identity[3], 'coverage_start_us': first['start_us'], 'coverage_end_us': prev_end, 'compiles': finished, 'inflight': list(inflight.values()), 'frames': frames, 'pipelines': pipelines, 'pipeline_inflight': list(pipeline_inflight.values()), 'pack_lookups': pack_lookups, 'uploads': uploads, 'upload_inflight': list(upload_inflight.values())}
+    return {'segments': [group[2] for group in groups], 'pid': identity[0], 'session': identity[1], 'clock': identity[2], 'uuid': identity[3], 'coverage_start_us': first['start_us'], 'coverage_end_us': prev_end, 'compiles': finished, 'inflight': list(inflight.values()), 'frames': frames, 'pipelines': pipelines, 'pipeline_inflight': list(pipeline_inflight.values()), 'pack_lookups': pack_lookups, 'uploads': uploads, 'upload_inflight': list(upload_inflight.values())}
 
 
 def main():

@@ -134,6 +134,7 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_touch_generation_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/generic_compile_events_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/compile_events_reader_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_trace_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/direct_diag_reader_metadata_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/scene_timeline_test.py"
 # 每线程缓冲（备忘槽/暂存的堆化）：线程退出后归还、同线程复用、扩容保留内容。
 s2a_gate_step bash "$android_dir/tools/nvn_vk_threadbuf_test.sh"
