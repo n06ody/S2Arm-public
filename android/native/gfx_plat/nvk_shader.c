@@ -1029,7 +1029,8 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
     if (!root) { pack_diag(identity, 1, warm); return 0; }
     if (!ckey && nst != 2) { pack_diag(identity, 2, warm); return 0; }
-    if (!ckey && !state_ok) { pack_diag(identity, 3, warm); return 0; }
+    // 状态许可同时约束图形和计算：预编计算 SPIR-V 也按存储缓冲对齐翻译。
+    if (!state_ok) { pack_diag(identity, 3, warm); return 0; }
     if (nvn_plat_flag("no_libpack", 0)) { pack_diag(identity, 4, warm); return 0; }
     char lw[192] = ""; int lrc = S2A_LIBPACK_MISS; unsigned reason = 5;
     pthread_mutex_lock(&g_lp_mu);
