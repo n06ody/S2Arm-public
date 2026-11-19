@@ -484,7 +484,7 @@ float rp_rs_setting(void) {
 static uint32_t rs_up(uint32_t v, float s) { double d = (double)v * s; uint32_t u = (uint32_t)d; if ((double)u < d) u++; return u ? u : 1; }
 static _Thread_local int g_rs_safe; static _Thread_local int g_rs_why;   // 调用方对下一次解析的声明：safe = 已按倍率处理；why = 不安全时记哪一类
 void rp_rs_safe(int safe, int why) { g_rs_safe = safe; g_rs_why = why; }
-static uint64_t g_rs_black_n[RP_RS_WHY_N]; static uint64_t g_rs_up_n, g_rs_up_kpix, g_rs_fail_n;
+static uint64_t g_rs_black_n[RP_RS_WHY_N]; static uint64_t g_rs_up_n, g_rs_up_kpix, g_rs_fail_n, g_rs_nocopy_n;
 static const char *const k_rs_why[RP_RS_WHY_N] = {"未声明的用途", "图像", "计算", "非片元阶段采样", "着色器按尺寸换算", "整池数组", "读回", "上传", "贴图拷贝", "清贴图", "同通道附件不可缩", "换存储失败"};
 const char *rp_rs_why_name(int w) { return w >= 0 && w < RP_RS_WHY_N ? k_rs_why[w] : "?"; }
 void rp_rs_take(uint64_t black[RP_RS_WHY_N], uint64_t *up, uint64_t *up_kpix, uint64_t *fail) {
@@ -500,10 +500,10 @@ static const char *rs_ineligible(const tex_t *t, const struct rp_tex *x, float s
     if (t->d.samples > 1) return "多重采样";
     if (!nvn_fmt_info_of((uint32_t)f, &fi)) return "格式未知";
     if (fi.bw > 1 || fi.bh > 1) return "块压缩";
-    if (fi.depth || fi.stencil) {   // 深度只放行后端能缩放拷贝的（CAP_BLIT_DEPTH_STENCIL：D24S8 / D32FS8；D32F 走同一条深度 blit）；D16 精度不够（同 iOS）
+    if (fi.depth || fi.stencil) {   // 深度只放行后端深度模板 blit 收的（CAP_BLIT_DEPTH_STENCIL：同格式 D24S8 / D32FS8；只有深度的 D32F 它不收）；D16 精度不够（同 iOS）
         nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
         if (!(cp.caps & NVN_GPU_CAP_BLIT_DEPTH_STENCIL)) return "深度不能缩放拷贝";
-        if (f != NVN_FORMAT_DEPTH24_STENCIL8 && f != NVN_FORMAT_DEPTH32F_STENCIL8 && f != NVN_FORMAT_DEPTH32F) return "深度格式";
+        if (f != NVN_FORMAT_DEPTH24_STENCIL8 && f != NVN_FORMAT_DEPTH32F_STENCIL8) return "深度格式";
     } else if (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT) return "整数格式";
     if (!(nvn_gpu_format_caps((uint32_t)f) & (NVN_GPU_FMT_RENDER | NVN_GPU_FMT_DEPTH))) return "不能当附件";
     const int fl = t->d.flags;
@@ -521,7 +521,9 @@ static const char *rs_ineligible(const tex_t *t, const struct rp_tex *x, float s
     return NULL;
 }
 static void vf_drop_unpinned_of(const struct rp_tex *x);   // 视图表一节
-// 把 x 的存储换成倍率 ns（1 = 游戏尺寸）：建新存储、逐级逐层缩放拷贝旧内容、换掉 x->g。持 g_rmu，调用方保证通道已收。0 = 失败（存储不动）
+// 把 x 的存储换成倍率 ns（1 = 游戏尺寸）：建新存储、逐级逐层缩放拷贝旧内容、换掉 x->g。持 g_rmu，调用方保证通道已收。
+// 1 = 换好；0 = 建存储 / 视图失败（可重试，存储不动）；-1 = 后端不收这笔缩放拷贝（nvn_gpu_blit_check 不过，确定性的，存储不动、段不受影响）。
+// 每一笔拷贝录之前先问后端：可选的换存储不能把整段打成 sticky（不然提交失败、时间线终态，见坑记录）。
 static int rs_swap_locked(const tex_t *t, struct rp_tex *x, float ns, nvn_gpu_cmd c) {
     const uint32_t nw = ns == 1 ? x->cw : rs_up(x->cw, ns), nh = ns == 1 ? x->ch : rs_up(x->ch, ns);
     nvn_gpu_tex_desc d = {0}; d.d = t->d; d.d.width = (int)nw; d.d.height = (int)nh; d.usage = usage_of(t, x->cpu) | NVN_GPU_TEX_RENDER;
@@ -530,20 +532,25 @@ static int rs_swap_locked(const tex_t *t, struct rp_tex *x, float ns, nvn_gpu_cm
     if (!nvn_gpu_ok(nvn_gpu_tex_create(&d, &g, &err))) { if (nvn_unimpl("res", "scale_storage_create", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "res", err.why); return 0; }
     nvn_fmt_info fi; const int depthy = nvn_fmt_info_of((uint32_t)t->d.format, &fi) && (fi.depth || fi.stencil);
     const uint32_t layers = t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY ? (uint32_t)t->d.depth : 1, levels = t->d.levels ? (uint32_t)t->d.levels : 1;
-    if (!x->zero_pending) {   // 待清零的：内容由下一个通道清成零，不用拷
-        for (uint32_t l = 0; l < levels; l++) for (uint32_t y = 0; y < layers; y++) {
-            view_t v; memset(&v, 0, sizeof v); v.set_levels = 1; v.base_level = (uint8_t)l; v.nlevels = 1; v.set_layers = 1; v.min_layer = (uint16_t)y; v.nlayers = 1;
-            nvn_gpu_view sv = NULL, dv = NULL;
-            if (!nvn_gpu_ok(nvn_gpu_view_create(x->g, &v, &sv, &err)) || !nvn_gpu_ok(nvn_gpu_view_create(g, &v, &dv, &err))) {
-                if (sv) nvn_gpu_view_release(sv);
-                if (dv) nvn_gpu_view_release(dv);
-                nvn_gpu_tex_release(g); if (nvn_unimpl("res", "scale_view_create", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "res", err.why); return 0;
-            }
-            NVNcopyRegion sr = {0, 0, 0, (int)(x->sw >> l ? x->sw >> l : 1), (int)(x->sh >> l ? x->sh >> l : 1), 1};
-            NVNcopyRegion dr = {0, 0, 0, (int)(nw >> l ? nw >> l : 1), (int)(nh >> l ? nh >> l : 1), 1};
-            nvn_gpu_blit(c, sv, &sr, dv, &dr, !depthy);   // 颜色线性、深度最近点（后端深度 blit 只做最近点）
-            nvn_gpu_view_release(sv); nvn_gpu_view_release(dv);
+    // 每一级每一层：先问后端收不收这笔缩放拷贝（去、回两个方向都问：换上去之后还要能降回 1×），收了才录。
+    // 待清零的（内容由下一个通道清成零）照样问、只是不拷：不让一张贴图换到将来缩不回去的存储上。
+    for (uint32_t l = 0; l < levels; l++) for (uint32_t y = 0; y < layers; y++) {
+        view_t v; memset(&v, 0, sizeof v); v.set_levels = 1; v.base_level = (uint8_t)l; v.nlevels = 1; v.set_layers = 1; v.min_layer = (uint16_t)y; v.nlayers = 1;
+        nvn_gpu_view sv = NULL, dv = NULL;
+        if (!nvn_gpu_ok(nvn_gpu_view_create(x->g, &v, &sv, &err)) || !nvn_gpu_ok(nvn_gpu_view_create(g, &v, &dv, &err))) {
+            if (sv) nvn_gpu_view_release(sv);
+            if (dv) nvn_gpu_view_release(dv);
+            nvn_gpu_tex_release(g); if (nvn_unimpl("res", "scale_view_create", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "res", err.why); return 0;
         }
+        NVNcopyRegion sr = {0, 0, 0, (int)(x->sw >> l ? x->sw >> l : 1), (int)(x->sh >> l ? x->sh >> l : 1), 1};
+        NVNcopyRegion dr = {0, 0, 0, (int)(nw >> l ? nw >> l : 1), (int)(nh >> l ? nh >> l : 1), 1};
+        if (!nvn_gpu_ok(nvn_gpu_blit_check(sv, &sr, dv, &dr, !depthy, &err)) || !nvn_gpu_ok(nvn_gpu_blit_check(dv, &dr, sv, &sr, !depthy, &err))) {
+            nvn_gpu_view_release(sv); nvn_gpu_view_release(dv); nvn_gpu_tex_release(g);   // 已录的前几级只写了新存储，放掉即可
+            if (!g_rs_nocopy_n++) { char b[320]; snprintf(b, sizeof b, "渲染倍率：贴图 #%llu（%dx%d 格式 %#x）后端不收缩放拷贝，按 1× 留用：%s", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, err.why); nvn_plat_log(NVN_PLAT_LOG_INFO, "res", b); }
+            return -1;
+        }
+        if (!x->zero_pending) nvn_gpu_blit(c, sv, &sr, dv, &dr, !depthy);   // 颜色线性、深度最近点（后端深度 blit 只做最近点）
+        nvn_gpu_view_release(sv); nvn_gpu_view_release(dv);
     }
     vf_drop_unpinned_of(x);   // 旧存储名下没钉住的视图放掉；钉住的按 uid 不再命中、轮转时放
     nvn_gpu_tex_release(x->g);   // 后端按段引用保活已录的使用
@@ -555,7 +562,7 @@ static void rs_init_locked(const tex_t *t, struct rp_tex *x) { if (!x->cw) { x->
 // 永久降回 1×（Ryujinx BlacklistScale）。持 g_rmu、通道已收
 static void rs_black_locked(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int why) {
     rs_init_locked(t, x);
-    if (x->rs == RS_SCALED && !rs_swap_locked(t, x, 1, c)) { g_rs_fail_n++; return; }   // 缩不回去：留在缩放态（下一次不安全用途再试）
+    if (x->rs == RS_SCALED && rs_swap_locked(t, x, 1, c) != 1) { g_rs_fail_n++; return; }   // 缩不回去：留在缩放态（下一次不安全用途再试）
     if (x->rs != RS_BLACK) {
         if (why < 0 || why >= RP_RS_WHY_N) why = 0;
         if (!g_rs_black_n[why]++) { char b[200]; snprintf(b, sizeof b, "渲染倍率：贴图 #%llu（%dx%d 格式 %#x）因「%s」按 1× 留用（这一类首次）", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, k_rs_why[why]); nvn_plat_log(NVN_PLAT_LOG_INFO, "res", b); }
@@ -582,8 +589,9 @@ float rp_rs_attach(const tex_t *t, float s, nvn_gpu_cmd c) {
         if (s == 1) { if (x->rs == RS_SCALED) rs_black_locked(t, x, c, RP_RS_PASS_MIXED); out = x->rs_s; }
         else if (x->rs == RS_SCALED && x->rs_s == s) out = s;
         else if (x->rs == RS_NONE && x->rs_fail < 3 && !rs_ineligible(t, x, s)) {
-            if (rs_swap_locked(t, x, s, c)) { x->rs = RS_SCALED; out = s; g_rs_up_n++; g_rs_up_kpix += (uint64_t)x->sw * x->sh / 1000; }
-            else if (++x->rs_fail >= 3) { x->rs = RS_BLACK; g_rs_fail_n++; g_rs_black_n[RP_RS_SWAP_FAIL]++; }
+            const int r = rs_swap_locked(t, x, s, c);
+            if (r == 1) { x->rs = RS_SCALED; out = s; g_rs_up_n++; g_rs_up_kpix += (uint64_t)x->sw * x->sh / 1000; }
+            else if (r < 0 || ++x->rs_fail >= 3) { g_rs_fail_n++; rs_black_locked(t, x, c, RP_RS_SWAP_FAIL); }   // 后端不收 = 确定性，当场拉黑；建失败重试满 3 次再拉黑
         } else out = x->rs_s;
     }
     pthread_mutex_unlock(&g_rmu);

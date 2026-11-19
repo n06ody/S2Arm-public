@@ -210,7 +210,18 @@ static struct { nvn_gpu_tex s, d; uint32_t sl, sy, dl, dy; NVNcopyRegion sr, dr;
 void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t slayer, const NVNcopyRegion *sr, nvn_gpu_tex dst, uint32_t dlevel, uint32_t dlayer, const NVNcopyRegion *dr) {
     (void)c; if (g_nct < 8) { g_ct[g_nct].s = src; g_ct[g_nct].d = dst; g_ct[g_nct].sl = slevel; g_ct[g_nct].sy = slayer; g_ct[g_nct].dl = dlevel; g_ct[g_nct].dy = dlayer; g_ct[g_nct].sr = *sr; g_ct[g_nct].dr = *dr; } g_nct++; }
 static struct { nvn_gpu_view s, d; NVNcopyRegion sr, dr; int linear; } g_bl[4]; static int g_nbl;
-void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view s, const NVNcopyRegion *sr, nvn_gpu_view d, const NVNcopyRegion *dr, int linear) { (void)c; if (g_nbl < 4) { g_bl[g_nbl].s = s; g_bl[g_nbl].d = d; g_bl[g_nbl].sr = *sr; g_bl[g_nbl].dr = *dr; g_bl[g_nbl].linear = linear; } g_nbl++; }
+// 用例：这个格式替身后端不收缩放拷贝（真后端 depth_blit 不收只有深度的 D32F 那一类）。blit_check 报 UNSUPPORTED；
+// 若核心没问就直接 blit，记一次「段被打成 sticky」（真后端这时整段提交失败、时间线终态）
+static uint32_t g_blit_nocopy_fmt = ~0u; static int g_blit_poison, g_blit_checks;
+nvn_gpu_rc nvn_gpu_blit_check(nvn_gpu_view s, const NVNcopyRegion *sr, nvn_gpu_view d, const NVNcopyRegion *dr, int linear, nvn_gpu_err *err) {
+    (void)sr; (void)dr; (void)linear; g_blit_checks++;
+    if ((s && s->of && (uint32_t)s->of->d.d.format == g_blit_nocopy_fmt) || (d && d->of && (uint32_t)d->of->d.d.format == g_blit_nocopy_fmt)) {
+        if (err) { snprintf(err->why, sizeof err->why, "替身：格式 %#x 不收缩放拷贝", g_blit_nocopy_fmt); err->rc = (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED}; }
+        return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
+    }
+    return (nvn_gpu_rc){NVN_GPU_OK};
+}
+void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view s, const NVNcopyRegion *sr, nvn_gpu_view d, const NVNcopyRegion *dr, int linear) { (void)c; if ((s && s->of && (uint32_t)s->of->d.d.format == g_blit_nocopy_fmt) || (d && d->of && (uint32_t)d->of->d.d.format == g_blit_nocopy_fmt)) g_blit_poison++; if (g_nbl < 4) { g_bl[g_nbl].s = s; g_bl[g_nbl].d = d; g_bl[g_nbl].sr = *sr; g_bl[g_nbl].dr = *dr; g_bl[g_nbl].linear = linear; } g_nbl++; }
 // 贴图 ↔ 缓冲的拷贝：按发生的先后记一条（to_tex：1 = 缓冲到贴图；at_pass：这时已经开过几个通道 / 结束过几个）
 static struct { int to_tex; nvn_gpu_tex t; uint32_t level, layer; int w, h; uint64_t row, img; int begun, ended; } g_tb[8]; static int g_ntb;
 static int g_npd_now(void); static int g_ends_now(void);
@@ -4516,6 +4527,32 @@ static void t_res_scale(void) {
             printf("  res-scale %.2f square: storage %d pass %u viewport %.1f render_scale[0] %.2f (expect all 512 / 1)\n", (double)s, g ? (int)g->d.d.width : -1, pd ? pd->w : 0, (double)g_last_dyn.vp[0][2], (double)rs_support_scale());
             CHECK(0);
         }
+    }
+    // 后端不收这张图的缩放拷贝（r3 真机：只有深度的 D32F 过了资格、depth_blit 不收 → 整段 sticky → 提交失败、时间线终态）：
+    //   换存储前先问后端（去、回两个方向；待清零的新图不拷也问），不收 = 当场拉黑、按 1× 开通道，一笔拷贝都不录、段不受影响；
+    //   之后同一张图不再试（不再建存储）。负控：去掉 rp_res 里的询问 → 存储换成 1280、通道 1280 → 红
+    {
+        rp_rs_configure("2"); pass_fresh();
+        { stream w = {0}; q_env(&w); end(&w); submit1(&w); fake_complete(NVN_GPU_DONE_OK); }
+        g_fprog.nent[1] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[1][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_SUPPORT; e->count = 1;
+        g_fprog.support_bytes = 4096; g_arena_used = 0;
+        nvn_be_pool_gpu_written(&g_tp);
+        tex_t rt = mk_tex(9321, 0, NVN_FORMAT_RGBA8, 640, 480, 1, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+        g_blit_nocopy_fmt = NVN_FORMAT_RGBA8; g_blit_poison = 0; g_blit_checks = 0; g_nbl = 0;
+        int pd0 = g_npd;
+        rs_draw(&rt, 0, 0, 640, 480);
+        nvn_gpu_tex g = rp_tex_backend_by_serial(rt.serial);
+        const nvn_gpu_pass_desc *pd = g_npd > pd0 && g_npd <= 8 ? &g_pd[g_npd - 1] : NULL;
+        const int ok1 = g && g->d.d.width == 640 && pd && pd->w == 640 && pd->h == 480 && g_last_dyn.vp[0][2] == 640 && rs_support_scale() == 1 &&
+            g_blit_poison == 0 && g_nbl == 0 && g_blit_checks >= 1;
+        const int tc1 = g_tex_creates, ck1 = g_blit_checks; pd0 = g_npd;
+        rs_draw(&rt, 0, 0, 640, 480);   // 第二次：已拉黑，不再建存储、不再问
+        pd = g_npd > pd0 && g_npd <= 8 ? &g_pd[g_npd - 1] : NULL;
+        const int ok2 = pd && pd->w == 640 && g_tex_creates == tc1 && g_blit_checks == ck1 && g_blit_poison == 0;
+        printf("res-scale 2 后端不收缩放拷贝：存储 %d、通道 %ux%u、render_scale[0] %.2f、录了 %d 笔 blit（打成 sticky %d 次）、问了 %d 次；第二笔又建存储 %d 张、又问 %d 次：%s\n",
+               g ? (int)g->d.d.width : -1, pd ? pd->w : 0, pd ? pd->h : 0, (double)rs_support_scale(), g_nbl, g_blit_poison, ck1, g_tex_creates - tc1, g_blit_checks - ck1, ok1 && ok2 ? "全对" : "有红");
+        CHECK(ok1); CHECK(ok2);
+        g_blit_nocopy_fmt = ~0u;
     }
     rp_rs_configure("3"); pass_fresh(); CHECK(rp_rs_setting() == 1);      // 不在 0.5 / 0.75 / 1 / 1.5 / 2 里：报红按 1
     rp_rs_configure("2x"); pass_fresh(); CHECK(rp_rs_setting() == 1);     // 带尾巴的也不认

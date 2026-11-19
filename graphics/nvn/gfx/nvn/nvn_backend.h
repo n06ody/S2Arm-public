@@ -440,6 +440,9 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t 
 // 另一端为 offset+extent；后端先校验归一化矩形，再保留端点次序。目标仍为正尺寸。
 // 该约定不扩展多采样解析、深度模板复制及三维复制。
 void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear);   // 要 CAP_BLIT_SCALED
+// 只校验、不录：nvn_gpu_blit 对这一对视图 / 区域 / 滤镜会不会报错（格式对、采样数、用途、区域、深度模板辅助管线）。nvn_gpu_blit 先调它，判据同一份。
+// 核心在录之前问它，过不了就不录（不让一笔可选的拷贝把整段打成 sticky）。线程：[任意]。不检查 cmd 状态（通道内 / 已 sticky 由 nvn_gpu_blit 自己报）
+nvn_gpu_rc nvn_gpu_blit_check(nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear, nvn_gpu_err *err);
 void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t uint4[4], int is_int);
 // v4：通道内把当前通道的附件按矩形清成给定值（NVN 带裁剪或带写掩码的 ClearColor / ClearDepthStencil；整屏全掩码的清除由核心折成 load = CLEAR，不走这里）。
 // v5：带写掩码——color_mask 是要写的颜色通道（r=1 g=2 b=4 a=8），stencil_mask 是要写的模板位；没点到的通道 / 位保持原值。

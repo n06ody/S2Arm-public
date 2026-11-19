@@ -107,30 +107,35 @@ static VkImageView depth_blit_view(struct nvn_gpu_view_s *v, unsigned stencil) {
     pthread_mutex_unlock(&g_mu); return result;
 }
 
-static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const NVNcopyRegion *sr, struct nvn_gpu_view_s *dv, const NVNcopyRegion *dr, int linear) {
-    struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
+// 只校验、不录（nvn_gpu_blit_check 的深度模板一支）：前提不满足返回非 OK、why 写哪一条；管线在这里就建好，录的时候不会再因缺管线失败。
+static nvn_gpu_rc depth_blit_check(const struct nvn_gpu_view_s *sv, const NVNcopyRegion *sr, const struct nvn_gpu_view_s *dv, const NVNcopyRegion *dr, int linear, nvn_gpu_err *err) {
+    const struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
     const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     if (linear || s == d || s->samples != 1 || d->samples != 1 || s->aspect != ds || d->aspect != ds ||
         s->nvn_format != d->nvn_format || s->format != d->format || s->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_3D ||
-        (d->nvn_format != NVN_FORMAT_DEPTH24_STENCIL8 && d->nvn_format != NVN_FORMAT_DEPTH32F_STENCIL8)) {
-        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：须不同图像、同 D24S8/D32FS8 格式、单采样二维及最近点过滤"); return;
-    }
+        (d->nvn_format != NVN_FORMAT_DEPTH24_STENCIL8 && d->nvn_format != NVN_FORMAT_DEPTH32F_STENCIL8))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：须不同图像、同 D24S8/D32FS8 格式、单采样二维及最近点过滤（源 0x%x → 目标 0x%x）", s->nvn_format, d->nvn_format);
     VkOffset3D so, dof; VkExtent3D se, de;
     if (sr->width <= 0 || sr->height <= 0 || dr->width <= 0 || dr->height <= 0 || sr->depth != 1 || dr->depth != 1 || sr->zoffset || dr->zoffset ||
-        copy_region(s, sv->base_level, sr, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) || sv->base_layer >= s->layers || dv->base_layer >= d->layers) {
-        set_sticky(c, NVN_GPU_E_ARG, "深度模板缩放区域越界"); return;
-    }
+        copy_region(s, sv->base_level, sr, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) || sv->base_layer >= s->layers || dv->base_layer >= d->layers)
+        return fail(err, NVN_GPU_E_ARG, "深度模板缩放区域越界");
     VkFormatProperties features; vkGetPhysicalDeviceFormatProperties(g.phys, s->format, &features);
-    if (!(s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || !(d->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：源图缺采样用途或目标图缺附件用途"); return;
-    }
-    if (!(features.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：格式缺采样或附件能力"); return;
-    }
-    unsigned slot = d->nvn_format == NVN_FORMAT_DEPTH32F_STENCIL8;
-    pthread_mutex_lock(&g_dsb_mu); int ready = depth_blit_pipelines(d->nvn_format, slot); pthread_mutex_unlock(&g_dsb_mu);
-    if (!ready) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度模板缩放管线创建失败"); return; }
-    VkDescriptorImageInfo images[2] = {{0}}; VkWriteDescriptorSet writes[2] = {{0}}; VkDescriptorSet set;
+    if (!(s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || !(d->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：源图缺采样用途或目标图缺附件用途");
+    if (!(features.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !(features.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放：格式缺采样或附件能力");
+    const unsigned slot = d->nvn_format == NVN_FORMAT_DEPTH32F_STENCIL8;
+    pthread_mutex_lock(&g_dsb_mu); const int ready = depth_blit_pipelines(d->nvn_format, slot); pthread_mutex_unlock(&g_dsb_mu);
+    if (!ready) return fail(err, NVN_GPU_E_UNSUPPORTED, "深度模板缩放管线创建失败");
+    return rc(NVN_GPU_OK);
+}
+
+// 调用方已过 depth_blit_check（nvn_gpu_blit 里）
+static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const NVNcopyRegion *sr, struct nvn_gpu_view_s *dv, const NVNcopyRegion *dr) {
+    struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
+    const unsigned slot = d->nvn_format == NVN_FORMAT_DEPTH32F_STENCIL8;
+    VkDescriptorSet set;
+    VkDescriptorImageInfo images[2] = {{0}}; VkWriteDescriptorSet writes[2] = {{0}};
     if (!alloc_sets(c, &g_dsb.dsl, 1, &set, NULL, 0, 0)) return;
     for (unsigned i = 0; i < 2; i++) {
         images[i].sampler = g_dsb.sampler; images[i].imageView = depth_blit_view(sv, i); images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
