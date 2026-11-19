@@ -148,6 +148,8 @@ void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳�
 
 // 资源同步用的段（见 rp_exec.c）：通常是先于主段提交的前置段；同一资源本次提交里第二次同步时结束当前通道、回到主段。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub);
+// 镜像写入完成编码后登记；提交线程。
+void rp_draw_note_mirror_write(nvn_gpu_buf b, uint64_t off, uint64_t bytes);
 // 遮挡计数（rp_exec.c）：通道与绘制那边的接入点
 int rp_occl_want(void);                 // 开通道时：要不要声明遮挡计数
 void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);
