@@ -27,7 +27,7 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-static int hz_flag=1;
+static int hz_flag=2;
 int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_opt_layout"))return !!getenv("S2A_REPLAY_INDIRECT_OPT_LAYOUT");if(!strcmp(n,"nvk_binst_hoist"))return hz_flag;return !strcmp(n,"nvk_dq")?!!getenv("S2A_REPLAY_INDIRECT_DQ"):d;}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
@@ -241,6 +241,7 @@ static void run_front_origin(struct s2a_vk_device *d,const char *dir) {
 //   mode 1：第 1、2 笔之间计算派发把记录 2 的 firstInstance 改成 99（命令流里有 OP_DISPATCH）：前瞻停在派发前，第 2 列 99；
 //   mode 2：第 1、2 笔之间游戏内存里改记录 2（CPU，页代号前进）：第 2 笔解析时同步落主段，批量表作废，第 2 列 99，收通道 1 次（同步本身的）；
 //   mode 3：开关 0（逐笔拷）：四列同 mode 0，为拷贝收通道 3 次。
+//   mode 0–2 用开关 2（一次多区域拷贝 + 只到顶点 / 片元常量读的屏障，同步校验核屏障够不够）；mode 4：开关 1（每段一次拷贝各带全屏障），同 mode 0。
 static uint8_t *hz_put(uint8_t *at,uint32_t op,uint32_t payload){op_hdr h={op,(uint32_t)((8+payload+7)&~7u)};memcpy(at,&h,8);memset(at+8,0,h.size-8);return at;}
 static void run_hoist(struct s2a_vk_device *d,const char *dir,int mode){
  nvn_gpu_open_desc od={0};od.host_device=d;od.app_label="real-replay-binst-hoist";GPU(nvn_gpu_open(&od,&err));
@@ -256,7 +257,7 @@ static void run_hoist(struct s2a_vk_device *d,const char *dir,int mode){
  for(unsigned i=0;i<6;i++)((uint32_t*)(void*)(guest+2052))[i]=i;
  nvn_gpu_tex_desc td={0};td.d.target=NVN_TEXTURE_TARGET_2D;td.d.format=NVN_FORMAT_RGBA8;td.d.width=td.d.height=64;td.d.depth=td.d.levels=1;td.usage=NVN_GPU_TEX_RENDER;nvn_gpu_tex tex=NULL;GPU(nvn_gpu_tex_create(&td,&tex,&err));GPU(nvn_gpu_view_create(tex,NULL,&target_view,&err));nvn_gpu_buf rb=buffer(16384,NULL);
  memset(&target_tex,0,sizeof target_tex);target_tex.d=td.d;target_tex.serial=1;memset(&target,0,sizeof target);target.n=1;target.color[0]=&target_tex;
- hz_flag=mode!=3;g_track=1;g_gen=g_now=1;
+ hz_flag=mode==3?0:mode==4?1:2;g_track=1;g_gen=g_now=1;
  rp_state_reset();rp_draw_reset();nvn_unimpl_reset();rp_S.nattr=1;rp_S.nstream=1;rp_S.attr[0].fmt=NVN_FORMAT_RGBA32F;rp_S.stream[0].stride=32;rp_S.vbuf[0].address=(uint64_t)(uintptr_t)(guest+256);rp_S.vbuf[0].size=192;rp_S.color.logic_op=3;rp_S.chmask.mask=15;rp_S.poly.mode=NVN_POLYGON_MODE_FILL;
  GPU(nvn_gpu_cmd_begin(NULL,&active,&err));serial++;
  nvn_gpu_buf mirror=NULL;uint64_t off=0,key=0,id=0;REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,192,&mirror,&off));
@@ -284,20 +285,20 @@ static void run_hoist(struct s2a_vk_device *d,const char *dir,int mode){
  printf("binst-hoist mode=%d flag=%d draws=%u cuts=%u(expect %u) columns vs/fs=%u/%u %u/%u %u/%u %u/%u wrong-pixels=%u unimpl=%u\n",mode,hz_flag,emitted-before,cuts,want_cuts,seen[0][0],seen[0][1],seen[1][0],seen[1][1],seen[2][0],seen[2][1],seen[3][0],seen[3][1],bad,nvn_unimpl_kinds());
  if(bad||cuts!=want_cuts||emitted-before!=4||nvn_unimpl_kinds())failures++;
  if(id)rp_buf_gpu_write_land(key,id,0);
- g_track=0;hz_flag=1;rp_R.has_sc=0;rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);int t=atomic_load(&retired)+1;nvn_gpu_buf_release(rb,retirement,NULL);struct timespec pause={0,1000000};for(int i=0;i<5000&&atomic_load(&retired)<t;i++)nanosleep(&pause,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
+ g_track=0;hz_flag=2;rp_R.has_sc=0;rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);int t=atomic_load(&retired)+1;nvn_gpu_buf_release(rb,retirement,NULL);struct timespec pause={0,1000000};for(int i=0;i<5000&&atomic_load(&retired)<t;i++)nanosleep(&pause,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
 #include "mirror_blit_test.h"
 int main(int argc,char **argv) {
  int depth_only=argc==3&&!strcmp(argv[2],"--depth-only");
- int hoist_only=(argc==3&&!strcmp(argv[2],"--hoist-only"))||(argc==2&&getenv("S2A_REPLAY_INDIRECT_HOIST_ONLY"));   // 只跑通道级批量拷四例（变异负控用）
+ int hoist_only=(argc==3&&!strcmp(argv[2],"--hoist-only"))||(argc==2&&getenv("S2A_REPLAY_INDIRECT_HOIST_ONLY"));   // 只跑通道级批量拷五例（变异负控用）
  int mirror_only=argc==3&&!strcmp(argv[2],"--mirror-only");
  if(argc!=2&&!depth_only&&!mirror_only&&!hoist_only)return 2;
  struct s2a_vk_device d;char why[256];
  if(s2a_vk_device_create(&d,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
- if(hoist_only){for(int m=0;m<4;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
+ if(hoist_only){for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
  if(mirror_only){run_color_mirror(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
  if(!depth_only){
-  for(int m=0;m<4;m++)run_hoist(&d,argv[1],m);   // 通道级批量拷（rp_draw.c nvk_binst_hoist）
+  for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);   // 通道级批量拷（rp_draw.c nvk_binst_hoist）
   for(int index=0;index<3;index++){run_case(&d,argv[1],index,0);run_case(&d,argv[1],index,2);run_case(&d,argv[1],index,3);}
   for(int index=0;index<3;index++)for(int mode=10;mode<=22;mode++){if(!index&&((mode>=13&&mode<=15)||mode>=20))continue;run_case(&d,argv[1],index,mode);}
   run_null_storage(&d,argv[1]);run_null_storage(&d,argv[1]);
