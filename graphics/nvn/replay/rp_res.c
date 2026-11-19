@@ -23,7 +23,9 @@ struct rp_tex {
     uint8_t zero_pending;      // 初始内容该是全零、还没填：等第一个通道用清零载入做掉（rp_view_for_attach / rp_tex_take_zero）
     uint8_t in_alias;
     uint8_t check_dirty;       // 上次核对内容时判过脏、但没能传（没有段 / 上传失败）：下一次必须重查
-    uint8_t _rsv[3];
+    uint8_t log_ok;            // 在所属池的脏页追加日志上有游标（log_span / log_id / log_cur）：核对只读游标之后的事件、与本贴图范围求交
+    uint8_t log_shadow;        // 诊断开关 nvk_tex_log_shadow（上传时读）：日志路判完再按逐页代号判一次，不一致计次并报前 8 张
+    uint8_t unarmed;           // 最近一次上传时有页加保护没落地（被并发的解保护挡住、此刻仍可写）：之后的写可能不缺页、不进日志也不推代号，这次上传不算同步
     uint64_t uid;              // 创建序号（只增、不回收）：按存储取视图的表（g_vf）用它认存储——存储释放后新分配可能落在同一地址，不能拿指针当身份
     uint64_t seen;             // 共用表里的：最近一次被查到 / 新建时的提交号 + 1（alias_take_over 用）
     uint64_t wrote;            // 最近一次被 GPU 写时的提交号 + 1（0 = 没写过）
@@ -33,6 +35,7 @@ struct rp_tex {
     uint64_t check_seg;        // 上次核对所在的段号：换段（新一次提交）必重核一次
     uint64_t check_map;        // 上次核对时的映射代际（换底 / 重新登记后句柄与保护状态都要重验）
     const void *span;          // 跟踪区间句柄（nvn_dirty_span）：NULL = 这段内存没被写跟踪，只能每次保守查
+    const void *log_span; uint64_t log_id, log_cur;   // 脏页日志游标（tex_log_arm 起；log_ok 为 0 时不用）
     const uint8_t *mem; uint64_t size;
 };
 // 同存储共用表的键：内存池 + 偏移 + 描述（去掉只表示用途、不影响存储布局的标志）
@@ -216,6 +219,68 @@ static int cpu_content(const tex_t *t) {
 
 // ---------- 上传：块线性存储 → 逐级逐层线性 → 后端 ----------
 // track：1 = CPU 贴图（先保护、记代号，之后脏了重传）；0 = 一次性的初始内容，不跟踪写
+// 脏页追加日志游标（开关 nvk_buf_dirtylog，安卓缺省开、同 rp_buf）：在加保护、取代号之前起（先起游标、后读代号），
+// 之后这张贴图的页再变可写必然在游标之后留一条事件。只在上传时读开关；开关关 / 起不了日志时 log_ok = 0，核对照旧整张逐页比。
+static void tex_log_arm(struct rp_tex *x, const tex_t *t) {
+    x->log_ok = 0; x->log_shadow = 0;
+    if (!nvn_plat_flag("nvk_buf_dirtylog", 1)) return;
+    const void *sp = nvn_dirty_span(t->mem, t->L.size);
+    if (sp && nvn_dirty_log_open(sp, &x->log_id, &x->log_cur)) { x->log_span = sp; x->log_ok = 1; x->log_shadow = nvn_plat_flag("nvk_tex_log_shadow", 0) != 0; }
+}
+// 加保护是否落地：贴图覆盖的每一页此刻都只读（nvn_dirty_page_armed）。被并发的解保护挡住的页（对方先记了事件、后推代号），
+//   之后的写不缺页：既不进游标之后的日志，代号也可能不晚于这次取的代号——日志路、逐页路都看不见。同 rp_buf 的「页重新只读才清旧位」。
+//   没有跟踪句柄（不被写跟踪）不查：那种贴图每次都按逐页比保守判脏。
+static int tex_pages_armed(const struct rp_tex *x, const tex_t *t) {
+    if (!x->span || !t->L.size) return 1;
+    const size_t pg = nvn_dirty_page_size();
+    const uintptr_t a = (uintptr_t)t->mem, e = a + t->L.size;
+    for (uintptr_t q = a; q < e; q = (q & ~(uintptr_t)(pg - 1)) + pg) if (!nvn_dirty_page_armed(x->span, (const void *)q)) return 0;
+    return 1;
+}
+// 「同一提交第二次同步」收通道的前 8 条明细（贴图）：类别、尺寸、格式、目标、级数、字节
+static void x2_tex_note(int kind, const tex_t *t) {
+    static int said; if (said >= 8) return; said++;
+    static const char *const nm[RP_X2_N] = { "缓冲", "贴图首取", "贴图补零", "贴图内容重传" };
+    char m[220]; snprintf(m, sizeof m, "同一提交第二次同步并收通道 #%d：%s %ux%ux%u 格式 %#x 目标 %d 级 %u 共 %llu KB", said, nm[kind],
+                          (unsigned)t->d.width, (unsigned)t->d.height, (unsigned)t->d.depth, (unsigned)t->d.format, t->d.target, (unsigned)t->d.levels,
+                          (unsigned long long)(t->L.size / 1024));
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", m);
+}
+// 影子核对（诊断，缺省关）：两路判脏不一致时报前 8 张（每个方向各 8 张）。日志判净而逐页判脏 = 日志漏了写，画面可能旧，报红；反过来只是多传一次，报信息。
+static unsigned g_shadow_said[2];
+static void tex_shadow_note(const tex_t *t, int log_dirty, int page_dirty, uint64_t ev) {
+    const int miss = !log_dirty && page_dirty;
+    if (g_shadow_said[miss] >= 8) return;
+    char b[320]; snprintf(b, sizeof b, "贴图影子核对不一致 #%u：序号 %llu %ux%u 格式 %#x 级 %u 层 %u 大小 %llu 字节 地址 %p；日志判%s、逐页判%s（本次读事件 %llu 条）",
+        ++g_shadow_said[miss], (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, t->d.levels, t->L.layers, (unsigned long long)t->L.size, (const void *)t->mem,
+        log_dirty ? "脏" : "净", page_dirty ? "脏" : "净", (unsigned long long)ev);
+    nvn_plat_log(miss ? NVN_PLAT_LOG_RED : NVN_PLAT_LOG_INFO, "tex", b);
+}
+struct tex_log_q { uintptr_t a, b; uint64_t ev; int hit; };
+static void tex_log_event(void *u, uintptr_t a, uintptr_t b) { struct tex_log_q *q = u; q->ev++; if (a < q->b && b > q->a) q->hit = 1; }
+// 内容自上次上传后是否被写过：有日志游标先读日志（按事件数付钱）；日志不可用 / 环绕 / 换底 / 句柄变了 → 计一次退回，
+//   重起游标后照旧整张逐页比代号（逐页比的结论对新游标同样成立：取游标之后的写都会进日志）。返回 1 = 脏。
+static int tex_content_dirty(struct rp_tex *x, const tex_t *t) {
+    const uintptr_t a = (uintptr_t)t->mem;
+    if (x->log_ok) {
+        struct tex_log_q q = { a, a + t->L.size, 0, 0 };
+        if (x->log_span == x->span && nvn_dirty_log_read(x->log_span, x->log_id, &x->log_cur, tex_log_event, &q)) {
+            rp_perf_add(RP_PERF_TEX_LOG_N, 1); rp_perf_add(RP_PERF_TEX_LOG_EV, q.ev);
+            if (x->log_shadow) {   // 影子：同一时刻按逐页代号再判一次（只计数，不改结论）
+                const int pd = nvn_dirty_since(t->mem, t->L.size, x->stamp);
+                rp_perf_add(RP_PERF_TEX_SHADOW_N, 1);
+                if (pd != q.hit) { rp_perf_add(pd ? RP_PERF_TEX_SHADOW_MISS : RP_PERF_TEX_SHADOW_EXTRA, 1); tex_shadow_note(t, q.hit, pd, q.ev); }
+            }
+            return q.hit;
+        }
+        rp_perf_add(RP_PERF_TEX_LOG_FALLBACK, 1);
+        tex_log_arm(x, t);
+    }
+    const size_t pg = nvn_dirty_page_size();
+    rp_perf_add(RP_PERF_TEX_CHECK_PAGES, t->L.size ? ((a + t->L.size - 1) / pg - a / pg + 1) : 0);   // nvn_dirty_since 要逐页比的页数（上限）
+    return nvn_dirty_since(t->mem, t->L.size, x->stamp);
+}
+
 static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track) {
     rp_perf_add(RP_PERF_TEX_UP_N, 1); rp_perf_add(RP_PERF_TEX_UP_KB, t->L.size / 1024);
     { const char *why = NULL; int lc = linear_class(t, &why);   // 线性：走下面 nvn_deswizzle 的逐行拷贝（源行距由公共布局解释）
@@ -226,8 +291,8 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
         if (t->pool && (uint64_t)t->off + t->L.size > (uint64_t)t->pool->size) { nvn_unimpl("tex", "tex_range_outside_pool", t); return -1; } }
     int bw = 1, bh = 1; int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { nvn_unimpl("fmt", "upload_unknown_format", t); return -1; }
-    uint64_t st = 0;
-    if (track) { nvn_dirty_protect(t->mem, t->L.size); st = nvn_dirty_now(); x->span = nvn_dirty_span(t->mem, t->L.size); }   // 先保护、取代号、再读：取代号之后的写下次查得到
+    uint64_t st = 0; int armed = 1;
+    if (track) { tex_log_arm(x, t); nvn_dirty_protect(t->mem, t->L.size); st = nvn_dirty_now(); x->span = nvn_dirty_span(t->mem, t->L.size); armed = tex_pages_armed(x, t); }   // 先保护、取代号、再读：取代号之后的写下次查得到
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
     uint8_t *tmp = NULL; size_t cap = 0; int rc = 0;
@@ -245,7 +310,7 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
         }
     }
     free(tmp);
-    if (!rc && track) { x->stamp = st; x->uploaded = 1; g_uploads++; }
+    if (!rc && track) { x->stamp = st; x->uploaded = 1; x->unarmed = !armed; if (!armed) rp_perf_add(RP_PERF_TEX_UNARMED, 1); g_uploads++; }   // 加保护没落地：下一次必重传（rp_tex_resolve）
     return rc;
 }
 
@@ -269,8 +334,10 @@ static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) 
     const size_t npg = (size_t)(((a + len - 1) & ~(uintptr_t)(P - 1)) - first) / P + 1;
     uint64_t *bits = calloc((npg + 63) / 64, sizeof *bits);
     if (!bits) return -1;
+    tex_log_arm(x, t);   // 同 upload_all：先起游标再加保护；游标之前的写由下面按旧代号取的位图接住
     nvn_dirty_protect(t->mem, len);
     const uint64_t st = nvn_dirty_now();
+    const int armed = tex_pages_armed(x, t);   // 读内容之前查：之后才重新只读的页不能证明中间那次写已读到
     long n = nvn_dirty_written_pages(x->span, t->mem, len, x->stamp, bits, npg);
     if (n < 0 || (size_t)n != npg) { free(bits); return -1; }
     // 脏页 → 行区间（合并相邻）；脏行过半就整张传，省得逐段的固定开销反而更贵
@@ -305,7 +372,7 @@ static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) 
     free(tmp); free(run);
     if (rc) return 1;
     rp_perf_add(RP_PERF_TEX_UP_PART, 1);
-    x->stamp = st; g_uploads++;
+    x->stamp = st; x->unarmed = !armed; if (!armed) rp_perf_add(RP_PERF_TEX_UNARMED, 1); g_uploads++;
     return 0;
 }
 
@@ -474,7 +541,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
     if (x->need_init && c) {   // 刚建的存储：CPU 贴图走下面的上传；其余的取一次存储里现有的内容，取不了的清零
         x->need_init = 0;
         if (!x->cpu && !x->gpu_written) {
+            const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
             nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+            if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_INIT, t->L.size)) x2_tex_note(RP_X2_TEX_INIT, t);
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
@@ -485,7 +554,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
         }
     }
     if (x->zero_pending && !g_attach_intent && c) {   // 待清零没被通道取走（开通道失败），现在有别的用途要它：照旧填零
+        const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
         nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+        if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_ZERO, t->L.size)) x2_tex_note(RP_X2_TEX_ZERO, t);
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
     if (x->cpu && !x->gpu_written && c && t->mem) {
@@ -497,11 +568,14 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             && !nvn_dirty_tracking_unreliable()) {
             rp_perf_add(RP_PERF_TEX_EPOCH, 1);
         } else {
+            if (x->uploaded && x->span && !x->check_dirty) rp_perf_add(RP_PERF_TEX_EPOCH_MISS, 1);   // 能走纪元快路的贴图没跳成（代号 / 段 / 映射变了，或开关关着、跟踪不可靠）
             x->span = nvn_dirty_span(t->mem, t->L.size);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
-            if (!x->uploaded || x->check_dirty || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
+            if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
+                const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
+                if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_REUP, t->L.size)) x2_tex_note(RP_X2_TEX_REUP, t);
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
-                if (xc && (pr == 0 || (pr < 0 && upload_all(t, x, xc, 1) == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
+                if (xc && (pr == 0 || (pr < 0 && upload_all(t, x, xc, 1) == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
         }
@@ -894,6 +968,7 @@ nvn_gpu_samp rp_samp_for_tex(int sid, int tid) {
 
 void rp_res_reset(void) {
     pthread_mutex_lock(&g_rmu);
+    g_shadow_said[0] = g_shadow_said[1] = 0;
     for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i]);
     vf_drop_serial(0);
     for (int target = 0; target <= NVN_TEXTURE_TARGET_BUFFER; target++) for (int cls = 0; cls < 4; cls++) {

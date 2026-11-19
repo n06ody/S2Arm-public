@@ -238,6 +238,28 @@ int main(void) {
             nvn_vk_program_free(&p);
         }
     }
+    // 诊断字段 c0ReadsWhy：读集未知时原样带出（只打日志）；读集已知时不读它；太长 / 不是字符串当没给，不拒结果。
+    {
+        static const struct { const char *vs_extra, *fs_extra, *vs_why, *fs_why; const char *what; } cases[] = {
+            { ",\"c0Reads\":[]", ",\"c0Reads\":null,\"c0ReadsWhy\":\"escape:op=12,w=4\"", "", "escape:op=12,w=4", "null read set carries the analyzer reason" },
+            { ",\"c0ReadsWhy\":\"dynamic\"", "", "dynamic", "", "missing c0Reads still carries the reason; missing reason stays empty" },
+            { ",\"c0Reads\":[],\"c0ReadsWhy\":\"layout\"", ",\"c0Reads\":null,\"c0ReadsWhy\":7", "", "", "known read set ignores the reason; non-string reason is dropped" },
+            { "", ",\"c0Reads\":null,\"c0ReadsWhy\":\"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"", "", "", "over-long reason is dropped, result still accepted" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char json[1024]; char msg[512];
+            int n = snprintf(json, sizeof json,
+                "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+                "\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"%s},{\"stage\":\"fs\",\"spirv\":\"%s\"%s}],"
+                "\"bindings\":[]}}", k_spirv, cases[i].vs_extra, k_spirv, cases[i].fs_extra);
+            memset(&p, 0, sizeof p); why[0] = 0;
+            int rc = nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
+            snprintf(msg, sizeof msg, "%s (rc=%d vs_why=%s fs_why=%s why=%s)", cases[i].what, rc, p.stage[0].c0_why, p.stage[1].c0_why, why);
+            CHECK(rc == 0 && !strcmp(p.stage[0].c0_why, cases[i].vs_why) && !strcmp(p.stage[1].c0_why, cases[i].fs_why) &&
+                  p.stage[0].binst_unread == (strstr(cases[i].vs_extra, "\"c0Reads\":[]") != NULL) && !p.stage[1].binst_unread, msg);
+            nvn_vk_program_free(&p);
+        }
+    }
 
     if (fails) { printf("direct nvn program result test: %d FAILED\n", fails); return 1; }
     printf("direct nvn program result test: ok\n");

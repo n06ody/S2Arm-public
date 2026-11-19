@@ -250,10 +250,39 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(b, sizeof b, "分时（贴图解析，每帧）：等锁 %.2f 毫秒、持锁 %.2f 毫秒、没见过的序号 %.1f 个、新建视图 %.1f 个、内容检查按纪元跳过 %.0f 次；影子附件 %.2f 毫秒；新贴图：后端建 %.2f 毫秒、扫存储 %.2f 毫秒、上传 %.1f 张 %.2f 毫秒、填零 %.1f 张 %.2f 毫秒、改由通道清零 %.1f 张",
                          (double)pf[RP_PERF_RES_LOCK] / 1e6 / fs, (double)pf[RP_PERF_RES_INIT] / 1e6 / fs, (double)pf[RP_PERF_RES_NEW] / f, (double)pf[RP_PERF_RES_VIEWMAKE] / f, (double)pf[RP_PERF_TEX_EPOCH] / f, (double)pf[RP_PERF_PB_SHADOW] / 1e6 / f,
                          (double)pf[RP_PERF_RES_MAKE] / 1e6 / f, (double)pf[RP_PERF_RES_SCAN] / 1e6 / f, (double)pf[RP_PERF_RES_UPN] / f, (double)pf[RP_PERF_RES_UP] / 1e6 / f, (double)pf[RP_PERF_RES_ZERON] / f, (double)pf[RP_PERF_RES_ZERO] / 1e6 / f, (double)pf[RP_PERF_RES_ZDEFER] / f);
+                snprintf(b + strlen(b), sizeof b - strlen(b), "；内容检查：纪元没命中 %.0f 次、逐页比对 %.0f 页", (double)pf[RP_PERF_TEX_EPOCH_MISS] / f, (double)pf[RP_PERF_TEX_CHECK_PAGES] / f);   // 缺省常开、只计数：纪元快路没跳成的次数与逐页比的页数（上限）
+                if (pf[RP_PERF_TEX_LOG_N] || pf[RP_PERF_TEX_LOG_FALLBACK])   // 脏页日志（nvk_buf_dirtylog）开着才有
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；按脏页日志核对 %.0f 次（读事件 %.0f 条）、日志不可用退回逐页 %.2f 次", (double)pf[RP_PERF_TEX_LOG_N] / f, (double)pf[RP_PERF_TEX_LOG_EV] / f, (double)pf[RP_PERF_TEX_LOG_FALLBACK] / f);
+                if (pf[RP_PERF_TEX_UNARMED])   // 上传时加保护没落地（下一次必重传）
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；上传时加保护没落地 %llu 次（窗口合计，下一次重传）", (unsigned long long)pf[RP_PERF_TEX_UNARMED]);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_TEX_SHADOW_N]) {   // 诊断 nvk_tex_log_shadow 开着才有（另起一行，不加长上一行）
+                    snprintf(b, sizeof b, "分时（贴图影子核对，每帧）：核对 %.0f 次；日志判净而逐页判脏 %.2f 次、日志判脏而逐页判净 %.2f 次（窗口合计 %llu / %llu）",
+                             (double)pf[RP_PERF_TEX_SHADOW_N] / f, (double)pf[RP_PERF_TEX_SHADOW_MISS] / f, (double)pf[RP_PERF_TEX_SHADOW_EXTRA] / f,
+                             (unsigned long long)pf[RP_PERF_TEX_SHADOW_MISS], (unsigned long long)pf[RP_PERF_TEX_SHADOW_EXTRA]);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                {   // 切通道原因（缺省常开，只计数）：每类每帧结束了几个开着的通道，其中 0–1 笔的几个 / 百万像素；以这一类切点开出、又只有 0–1 笔的通道几个 / 百万像素
+                    static const char *const nm[RP_CUT_N] = { "其它", "换目标", "整屏清除", "矩形清除开通道", "写掩码集合变", "区域扩大", "间接绘制拷 base instance", "计算派发",
+                                                              "纹素缓冲准备", "GPU 上改拷清缓冲", "贴图拷贝 / 清除", "计数器报告", "提交收尾", "同一提交第二次前置传输", "落地挂起清除", "遮挡首次复位交段" };
+                    uint64_t cut[RP_CUT_N][RP_CUTV_N]; rp_pass_cut_take(cut);
+                    uint64_t icw[2]; rp_draw_ind_copy_take(icw);
+                    char cb[1500]; size_t o = (size_t)snprintf(cb, sizeof cb, "分时（切通道原因，每帧）：");
+                    for (int r = 0; r < RP_CUT_N && o < sizeof cb; r++) {
+                        if (!cut[r][RP_CUTV_ENDED] && !cut[r][RP_CUTV_NEXT_TINY]) continue;
+                        o += (size_t)snprintf(cb + o, sizeof cb - o, "%s%s 结束 %.1f（其中 0–1 笔 %.1f / %.1f 百万像素；其后 0–1 笔 %.1f / %.1f 百万像素）", o > 30 ? "；" : "", nm[r],
+                                              (double)cut[r][RP_CUTV_ENDED] / f, (double)cut[r][RP_CUTV_ENDED_TINY] / f, (double)cut[r][RP_CUTV_ENDED_TINY_KPIX] / 1e3 / f,
+                                              (double)cut[r][RP_CUTV_NEXT_TINY] / f, (double)cut[r][RP_CUTV_NEXT_TINY_KPIX] / 1e3 / f);
+                    }
+                    if (o < sizeof cb) snprintf(cb + o, sizeof cb - o, "；间接拷贝阶段次：读集未知 %.1f、读集含 0x644 %.1f", (double)icw[0] / f, (double)icw[1] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", cb); }
+                if (pf[RP_PERF_X2_N0] + pf[RP_PERF_X2_N1] + pf[RP_PERF_X2_N2] + pf[RP_PERF_X2_N3]) {   // 「同一提交第二次同步」收通道按资源类别（缺省常开，只计数；有才打）
+                    snprintf(b, sizeof b, "分时（同一提交第二次同步收通道，按资源，每帧）：缓冲 %.1f 次 / %.0f KB；贴图首取 %.1f 次 / %.0f KB；贴图补零 %.1f 次 / %.0f KB；贴图内容重传 %.1f 次 / %.0f KB",
+                             (double)pf[RP_PERF_X2_N0] / f, (double)pf[RP_PERF_X2_KB0] / f, (double)pf[RP_PERF_X2_N1] / f, (double)pf[RP_PERF_X2_KB1] / f,
+                             (double)pf[RP_PERF_X2_N2] / f, (double)pf[RP_PERF_X2_KB2] / f, (double)pf[RP_PERF_X2_N3] / f, (double)pf[RP_PERF_X2_KB3] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);
@@ -261,11 +290,12 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 { uint64_t bt_tot = 0, bt_be = 0, bt_n = 0; rp_bind_tm_take(&bt_tot, &bt_be, &bt_n);
                   uint64_t bt_drv = 0, bt_buf = 0, bt_rest = 0; rp_bind_tm_take2(&bt_drv, &bt_buf, &bt_rest);
                   uint64_t bt_alloc = 0, bt_copy = 0; rp_bind_tm_take3(&bt_alloc, &bt_copy);
-                  snprintf(b, sizeof b, "分时（绑定重建，每帧）：重建 %.0f 次共 %.2f 毫秒（交后端 %.2f；暂存与构造 %.2f，其中驱动段 %.2f、常量缓冲与支持块 %.2f、其它 %.2f；暂存里申请 %.2f、拷贝 %.2f）；常量缓冲暂存 %.0f 次共 %.0f KB（其中程序自带常量段 %.0f 次）、段内切片表命中 %.0f 块",
+                  snprintf(b, sizeof b, "分时（绑定重建，每帧）：重建 %.0f 次共 %.2f 毫秒（交后端 %.2f；暂存与构造 %.2f，其中驱动段 %.2f、常量缓冲与支持块 %.2f、其它 %.2f；暂存里申请 %.2f、拷贝 %.2f）；常量缓冲暂存 %.0f 次共 %.0f KB（其中程序自带常量段 %.0f 次；交后端异步填 %.0f 次、改内存前等填完 %.0f 次；有还没落地的 GPU 写、直接绑镜像 %.0f 次）、段内切片表命中 %.0f 块；改 / 拷游戏内存的命令改在 GPU 上做 %.0f 次",
                            (double)bt_n / f, (double)bt_tot / 1e6 / f, (double)bt_be / 1e6 / f, (double)(bt_tot - bt_be) / 1e6 / f,
                            (double)bt_drv / 1e6 / f, (double)bt_buf / 1e6 / f, (double)bt_rest / 1e6 / f,
                            (double)bt_alloc / 1e6 / f, (double)bt_copy / 1e6 / f,
-                           (double)pf[RP_PERF_UBO_N] / f, (double)pf[RP_PERF_UBO_KB] / f, (double)pf[RP_PERF_UBO_C1_N] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f);
+                           (double)pf[RP_PERF_UBO_N] / f, (double)pf[RP_PERF_UBO_KB] / f, (double)pf[RP_PERF_UBO_C1_N] / f,
+                           (double)pf[RP_PERF_UBO_FILL_N] / f, (double)pf[RP_PERF_UBO_FILL_WAIT_N] / f, (double)pf[RP_PERF_UBO_MIRROR_N] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f, (double)pf[RP_PERF_BUF_GPU_ORDER_N] / f);
                   nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 { uint64_t hb[5]; rp_frame_gap_take(hb); uint64_t ht = hb[0] + hb[1] + hb[2] + hb[3] + hb[4]; if (!ht) ht = 1;
                   snprintf(b, sizeof b, "分时（上屏间隔分布）：不到 29 毫秒 %.0f%%、29–37.5 毫秒 %.0f%%、37.5–46 毫秒 %.0f%%、46–54 毫秒 %.0f%%、更长 %.0f%%",
