@@ -575,6 +575,36 @@ static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance)
     memcpy(sl->cpu + 0x610, &max_point, 4); memcpy(sl->cpu + 0x644, &base_instance, 4);
 }
 // 计算写的可见性与 CPU 回写账分开：完成回调落地不等于发布给下一笔 GPU 图形读取。
+// Mirror uploads and compute writes have independent producer scopes.
+// The incoming dependency is retained while pre-segment ordering is verified.
+static struct rp_compute_access g_mirror_access;
+static uint32_t g_mirror_published;
+static int g_mirror_unknown, g_mirror_narrow = -1;
+static int mirror_narrow_on(void) {
+    if (g_mirror_narrow < 0) g_mirror_narrow = nvn_plat_flag("nvk_mirror_dep_narrow", 1) != 0;
+    return g_mirror_narrow;
+}
+void rp_draw_note_mirror_write(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
+    if (!bytes || !mirror_narrow_on()) return;
+    nvn_gpu_access_span span;
+    if (!nvn_gpu_buf_access_span(b, off, bytes, &span) ||
+        g_mirror_access.n >= 4096 || !rp_access_reserve(&g_mirror_access, 1))
+        g_mirror_unknown = 1;
+    else rp_access_write(&g_mirror_access, &span);
+    g_mirror_published = 0;
+}
+static int mirror_read_buf(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
+    if (!b || !bytes) return 0;
+    if (g_mirror_unknown) return 1;
+    nvn_gpu_access_span span;
+    return !nvn_gpu_buf_access_span(b, off, bytes, &span) || rp_access_read(&g_mirror_access, &span);
+}
+static int mirror_read_view(nvn_gpu_view v) {
+    if (!v) return 0;
+    if (g_mirror_unknown) return 1;
+    nvn_gpu_access_span span;
+    return !nvn_gpu_view_access_span(v, &span) || rp_access_read(&g_mirror_access, &span);
+}
 static struct rp_compute_access g_compute_access;
 static nvn_gpu_access_span g_dispatch_access[RP_PROG_ENT_MAX];
 static size_t g_ndispatch_access;
@@ -1375,6 +1405,44 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             }
         }
     }
+    if (g_mirror_unknown || g_mirror_access.n) {
+        uint32_t need = 0; int writable = 0;
+#define MIRROR_READ(value, consumer) do { if (value) need |= (consumer); } while (0)
+        MIRROR_READ(mirror_read_buf(a.ind, a.ind_off, indirect_bytes), NVN_GPU_CGR_INDIRECT);
+        MIRROR_READ(mirror_read_buf(a.cnt, a.cnt_off, a.cnt ? 4 : 0), NVN_GPU_CGR_INDIRECT);
+        MIRROR_READ(mirror_read_buf(a.ibuf, a.ioff, index_bytes), NVN_GPU_CGR_INDEX);
+        for (int i = 0; i < 16; i++) if (streams >> i & 1)
+            MIRROR_READ(mirror_read_buf(vb_buf[i], vb_off[i], rp_S.vbuf[i].size), NVN_GPU_CGR_VERTEX);
+        for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
+            const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
+            uint8_t access = e->access;
+            if (!access && e->cls != NVN_GPU_RES_SAMP) access = cgr_unknown_write(e) ? NVN_GPU_ACC_RW : NVN_GPU_ACC_R;
+            if (access & NVN_GPU_ACC_W) writable = 1;
+            if (!(access & NVN_GPU_ACC_R)) continue;
+            uint32_t consumer = cgr_shader_consumer(st, e->cls == NVN_GPU_RES_UBO);
+            if (e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) {
+                const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
+                if (g_sb_ok[st][i] && sb) { uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl); MIRROR_READ(mirror_read_buf(g_sb_buf[st][i], g_sb_off[st][i], wl), consumer); }
+                else if (sb && !sb->addr && !sb->size && e->src_kind == NVN_RB_SBUFP) MIRROR_READ(mirror_read_buf(rp_buf_for_null_storage(), 0, 0x10000), consumer);
+            } else if (e->src_kind == NVN_RB_TEX || e->src_kind == NVN_RB_TEXU || e->src_kind == NVN_RB_TBUF) {
+                if (e->count > 1) { for (uint32_t k = 0; k < e->count; k++) MIRROR_READ(mirror_read_view(g_av[st][k]), consumer); }
+                else MIRROR_READ(mirror_read_view(tv[st][i]), consumer);
+            } else if (e->cls != NVN_GPU_RES_SAMP) need |= consumer;
+        }
+#undef MIRROR_READ
+        uint32_t publish = need & ~g_mirror_published;
+        if (writable || publish) {
+            rp_pass_flush(c);
+            uint32_t game_barrier = rp_pass_take_barrier();
+            if (game_barrier || writable) {
+                nvn_gpu_barrier(c, game_barrier ? game_barrier : NVN_BARRIER_INVALIDATE_SHADER_BIT);
+                g_mirror_access.n = 0; g_mirror_unknown = 0; g_mirror_published = 0;
+            } else {
+                nvn_gpu_transfer_to_graphics(c, publish);
+                g_mirror_published |= publish;
+            }
+        }
+    }
     uint32_t color_write_mask = rp_S.chmask.mask & g_prog->color_out_mask;
     { static int fm = -1; if (fm < 0) fm = nvn_plat_flag("nvk_fullmask", 0); if (fm) color_write_mask = 0xffffffffu; }   // 既有诊断：管线与附件选择必须用同一掩码
     rp_pass_prepare_draw(c, color_write_mask);   // 有效写掩码与像素区域共同决定这一笔的通道
@@ -1740,7 +1808,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { rp_access_reset(&g_mirror_access); g_mirror_published = 0; g_mirror_unknown = 0; g_mirror_narrow = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }

@@ -26,6 +26,7 @@ void nvn_plat_safepoint(void){}
 static int disable_compute_access;
 static int dq_mode;
 int nvn_plat_flag(const char *n,int d){
+ if(!strcmp(n,"nvk_mirror_dep_narrow")){const char *e=getenv("S2A_MIRROR_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_cgr"))return !disable_compute_access;
  if(!strcmp(n,"nvk_cgr_narrow")){const char *e=getenv("S2A_CGR_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_dq")){const char *e=getenv("S2A_COMPUTE_READ_DQ");REQUIRE(!e||!strcmp(e,"0")||!strcmp(e,"1"));dq_mode=e?atoi(e):d;return dq_mode;}
@@ -178,12 +179,14 @@ static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
 static PFN_vkCmdUpdateBuffer real_update;
 static PFN_vkCmdCopyBuffer real_copy;
-static unsigned inbound_transfers, inbound_injected;
+static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted;
+static VkPipelineStageFlags mirror_dst_stages, mirror_stages[8];
+static VkAccessFlags mirror_dst_access;
 static void inbound_post_transfer(VkCommandBuffer cb){
  if(!getenv("S2A_INBOUND_MAIN_ONLY"))return;
  inbound_transfers++;
  const char *mode=getenv("S2A_INBOUND_INJECT");int m=mode?atoi(mode):0;
- if(!m)return;
+ if(!m || m>=5)return;  // 5：生产路径自己发布，不插夹具屏障
  const char *stage=getenv("S2A_INBOUND_STAGE");
  VkPipelineStageFlags shader_stage=stage&&!strcmp(stage,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
  VkPipelineStageFlags dst=(m==3?0:shader_stage)|(m==4?0:VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
@@ -198,7 +201,19 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_update), PFN_vkC
 _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_copy), PFN_vkCmdCopyBuffer), "vkCmdCopyBuffer signature");
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
  nbar++;
+ if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){ REQUIRE(mirror_barriers<8); mirror_stages[mirror_barriers++]=t; mirror_dst_stages |= t; mirror_dst_access |= m[0].dstAccessMask; }
  int is_full=s==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT && m[0].dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
+ if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){
+  const char *mode=getenv("S2A_INBOUND_INJECT"); int imode=mode?atoi(mode):0;
+  if(imode==6 || imode==7 || imode==12){
+   const char *stage=getenv("S2A_INBOUND_STAGE"); VkPipelineStageFlags missing=imode==7?VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:imode==12?((t & VK_PIPELINE_STAGE_VERTEX_SHADER_BIT)?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT):
+       (stage&&!strcmp(stage,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+   VkMemoryBarrier changed=m[0]; changed.dstAccessMask &= ~(imode==7?VK_ACCESS_INDIRECT_COMMAND_READ_BIT:VK_ACCESS_SHADER_READ_BIT);
+   REQUIRE(t & missing); mirror_omitted++;
+   VkPipelineStageFlags remaining=t & ~missing;
+   real_barrier(cb,s,remaining?remaining:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im); return;
+  }
+ }
  if(is_full)nfull_bar++;
  if(getenv("S2A_CGR_OMIT_FULL") && trace_window && is_full){
   VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;omitted_full++;
