@@ -239,9 +239,11 @@ struct nvn_gpu_cmd_s {
     uint16_t feedback_read_mask; // 颜色 bit0..7、深度模板物理附件 bit8：本物理通道 LOAD / NONE
     int recording;
     int in_pass;
-    // 上一道全屏障之后录过「缓冲作目标」的传输：传输只在开头带屏障，绘制有渲染通道开头的外部依赖兜着，
-    // 计算派发没有，所以派发前按它补一道（开段置 1：前置段 / 上一段的传输写，段末那道屏障只对主机可见）
+    // 0 = 无待处理的缓冲传输；1 = 跨段或期间有未知设备操作，保守全屏障；
+    // 2 = 上次全发布之后只有本段缓冲传输。开段置 1：前置 / 上一段传输写，段末屏障只对主机可见。
     int xfer_dirty;
+    int narrow_barrier;                 // 本段 A/B 开关，缺省开启
+    int xfer_pending_graphics;          // 传输写已发布给计算，尚未发布给图形
     nvn_gpu_rc sticky;
     char why[192];
     struct vk_ref *refs;
@@ -2528,9 +2530,13 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
     vkCmdPipelineBarrier(c->cb, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
-    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+    // 只有确认上次全发布后仅录过缓冲传输时才收窄源；保留全目标以覆盖后续任意消费者。
+    VkPipelineStageFlags src = c->narrow_barrier && c->xfer_dirty == 2 && !c->xfer_pending_graphics ?
+        VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     c->xfer_dirty = 0;
+    c->xfer_pending_graphics = 0;
 }
 
 
@@ -2558,7 +2564,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     full_barrier(c);
     VkBufferCopy bc = {sl.off, off, bytes};
     vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, 1, &bc);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写；只在无其他设备操作时可收窄
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
@@ -2577,7 +2583,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     if (bytes == 0) return;
     full_barrier(c);
     vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
@@ -2596,7 +2602,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
     vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -4671,6 +4677,13 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_begin 时已在通道里"); return; }
+    if (c->xfer_pending_graphics) {
+        // 前次只发布到计算；图形后续仍可能读取同一份传输写。
+        mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        c->xfer_pending_graphics = 0;
+    }
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // 通道有附件访问 / 图形读写，不再能只按传输作源
     struct timespec pbp_ts; clock_gettime(CLOCK_MONOTONIC, &pbp_ts);
     uint64_t pbp_t = (uint64_t)pbp_ts.tv_sec * 1000000000ull + (uint64_t)pbp_ts.tv_nsec;
 #define PBP_STEP(i) do { struct timespec z_; clock_gettime(CLOCK_MONOTONIC, &z_); uint64_t n_ = (uint64_t)z_.tv_sec * 1000000000ull + (uint64_t)z_.tv_nsec; pass_prof(i, pbp_t); pbp_t = n_; } while (0)
@@ -5616,13 +5629,23 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipe);
     // 之前录过缓冲作目标的传输（核心的池镜像同步、缓冲写 / 填 / 拷贝、贴图→缓冲）：契约说之后的读看到新值（nvn_backend.h buf_write），
     // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
-    if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
+    if (c->xfer_dirty && !g_test_no_xfer_bar) {
+        if (c->narrow_barrier && c->xfer_dirty == 2) {
+            VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            if (ind) dst |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+            mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dst, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            c->xfer_dirty = 0;
+            c->xfer_pending_graphics = 1;
+        } else full_barrier(c);
+    }
     if (ind) {
         vkCmdDispatchIndirect(c->cb, ind->buffer, off);
         cmd_ref(c, ind, REF_BUF);
     } else {
         vkCmdDispatch(c->cb, x, y, z);
     }
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // 测试钩子禁屏障时计算也可能写；不再能只用传输阶段
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
 
@@ -5711,6 +5734,8 @@ static VkAccessFlags layout_src_access(VkImageLayout l) {
 
 // 录一次布局迁移：本段内跟踪，段首一律按 GENERAL 算（见「图像布局」）
 static void image_barrier_from(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout from, VkImageLayout to) {
+    if (c->xfer_pending_graphics) full_barrier(c); // 布局迁移可能触及别名内存，先完成未发布的传输写
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1;
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -7282,6 +7307,7 @@ void nvn_gpu_timestamp(nvn_gpu_cmd ch, uint32_t slot, uint32_t type) {
     }
     vkCmdWriteTimestamp(c->cb, type == NVN_COUNTER_TYPE_TIMESTAMP_TOP ?
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->report_ts, slot);
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // BOTTOM 时间戳不属于传输阶段
     c->report_used |= UINT64_C(1) << slot;
     if (c->report_count <= slot) c->report_count = slot + 1;
 }
@@ -7344,6 +7370,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     }
     c->recording = 1;
     c->xfer_dirty = 1;   // 前置段 / 上一段的传输写：段末屏障只对主机可见，本段第一次派发前补一道
+    c->narrow_barrier = nvn_plat_flag("nvk_barrier_narrow", 1) != 0;
     c->sticky = rc(NVN_GPU_OK);
     c->q_active = -1;
     c->opt = nvn_plat_flag("nvk_opt_layout", 0) != 0;   // 附件 / 采样用对齐语义的布局（缺省 0 = 全 GENERAL 的旧行为）
