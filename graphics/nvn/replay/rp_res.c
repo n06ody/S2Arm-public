@@ -314,14 +314,31 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
         if (lc > 0 && (!t->pool || !tex_window(t, &lo, &hi))) { nvn_unimpl("tex", "linear_range_outside_pool", t); return -1; } }
     int bw = 1, bh = 1; int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { nvn_unimpl("fmt", "upload_unknown_format", t); return -1; }
+    uint64_t wlo, whi; tex_window(t, &wlo, &whi);   // 在途写检查 / 写跟踪 / 客体源同一段：只罩池里那段
+    nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
+    const int gpu = (cp.caps & NVN_GPU_CAP_GPU_DESWIZZLE) &&
+        !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) &&
+        t->d.samples <= 1 && t->d.target != NVN_TEXTURE_TARGET_BUFFER;
+    // 这段池还有尚未落地的 GPU 写，CPU 地址的内容是旧的。当前契约只能接 CPU 快照，拒绝上传并留待重试。
+    // 先于取源与武装：-2 每次重试都不付池外副本的拷贝、也不动日志游标与保护。
+    if (gpu && rp_buf_gpu_pending((uint64_t)(uintptr_t)(t->mem + wlo), whi - wlo)) {
+        nvn_unimpl("tex", "gpu_deswizzle_pending_pool_write", t); return -2;
+    }
     // 非线性的布局伸出池子（真机：存储偏移 -1；宿主用例：128x64x64 三维贴图 2 MiB 放在 1 MiB 的池里）：从 rp_tex_src 的副本反交织，池外按 0，不越界读
     uint8_t *part = NULL; const uint8_t *src = rp_tex_src(t, &part);
     if (!src) { nvn_unimpl("limit", "tex_outside_pool_copy_alloc", t); return -1; }
-    uint64_t st = 0, wlo, whi; int armed = 1; tex_window(t, &wlo, &whi);   // 写跟踪只罩池里那段：池外字节恒按 0，没有可跟踪的写
+    uint64_t st = 0; int armed = 1;
     if (track) { tex_log_arm(x, t); nvn_dirty_protect(t->mem + wlo, whi - wlo); st = nvn_dirty_now(); x->span = nvn_dirty_span(t->mem + wlo, whi - wlo); armed = tex_pages_armed(x, t); }   // 先保护、取代号、再读：取代号之后的写下次查得到
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
     uint8_t *tmp = NULL; size_t cap = 0; int rc = 0;
+    if (gpu) {
+        // 客体存储按窗口源交后端（伸出池时 src 是副本：池内照拷、池外按 0），后端照布局全长读不越界；
+        // 每级、每层分别建 GPU 解排命令。线性与稀疏仍走已有路径。
+        for (uint32_t l = 0; l < levels; l++) for (uint32_t y = 0; y < layers; y++)
+            nvn_gpu_tex_upload_blocklinear(c, x->g, l, y, &t->L, src, t->L.size);
+        goto done;
+    }
     for (uint32_t l = 0; l < levels && !rc; l++) {
         uint32_t w = t->d.width >> l, h = t->d.height >> l, dp = is3d ? t->d.depth >> l : 1;
         if (!w) w = 1;
@@ -335,6 +352,7 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
             nvn_gpu_tex_upload(c, x->g, l, y, &r, tmp, pitch, img);
         }
     }
+done:
     free(tmp); free(part);
     if (!rc && track) { x->stamp = st; x->uploaded = 1; x->unarmed = !armed; if (!armed) rp_perf_add(RP_PERF_TEX_UNARMED, 1); g_uploads++; }   // 加保护没落地：下一次必重传（rp_tex_resolve）
     return rc;
@@ -571,7 +589,8 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
-                if (from) { zero = upload_all(t, x, xc, 0); uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_; }
+                if (from) { zero = upload_all(t, x, xc, 0); uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_;
+                    if (zero == -2) { x->need_init = 1; pthread_mutex_unlock(&g_rmu); return NULL; } }
                 if (zero && g_attach_intent && zero_deferrable(t)) { x->zero_pending = 1; rp_perf_add(RP_PERF_RES_ZDEFER, 1); }
                 else if (zero) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERO, res_now() - i1_); rp_perf_add(RP_PERF_RES_ZERON, 1); }
             }
@@ -596,7 +615,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
-                if (xc && (pr == 0 || (pr < 0 && upload_all(t, x, xc, 1) == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
+                int ur = xc && pr < 0 ? upload_all(t, x, xc, 1) : 0;
+                if (ur == -2) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
+                if (xc && (pr == 0 || (pr < 0 && ur == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
         }

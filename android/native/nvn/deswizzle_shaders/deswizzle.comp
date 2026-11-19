@@ -1,0 +1,32 @@
+#version 450
+// Each invocation writes one whole destination word: rows with odd byte sizes
+// never race over a shared word. Source/destination descriptors start on aligned offsets.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint data[]; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Destination { uint data[]; } dst;
+layout(push_constant) uniform Parameters {
+    uint row_bytes, rows, slices, tile_h, tile_d, gobs_x, gob2, bytes;
+} p;
+uint offset_of(uint x, uint y, uint z) {
+    uint bh = 1u << p.tile_h, bd = 1u << p.tile_d;
+    uint blocks_y = (p.rows + 8u * bh - 1u) / (8u * bh);
+    uint block = 512u * bh * bd;
+    uint gob = (z % bd) * bh + (y % (8u * bh)) / 8u;
+    uint inside = p.gob2 != 0u
+        ? (x % 64u / 32u) * 256u + (y % 8u / 4u) * 128u + (x % 32u / 16u) * 64u + (y % 4u / 2u) * 32u + (y % 2u) * 16u + x % 16u
+        : (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u + x % 16u;
+    return ((z / bd) * p.gobs_x * blocks_y + (y / (8u * bh)) * p.gobs_x + x / 64u) * block + gob * 512u + inside;
+}
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    if (word >= (p.bytes + 3u) / 4u) return;
+    uint pos = word * 4u;
+    uint result = 0u;
+    for (uint i = 0u; i < 4u && pos + i < p.bytes; ++i) {
+        uint linear = pos + i, x = linear % p.row_bytes;
+        uint yz = linear / p.row_bytes, y = yz % p.rows, z = yz / p.rows;
+        uint source = offset_of(x, y, z);
+        result |= ((src.data[source / 4u] >> ((source % 4u) * 8u)) & 255u) << (i * 8u);
+    }
+    dst.data[word] = result;
+}
