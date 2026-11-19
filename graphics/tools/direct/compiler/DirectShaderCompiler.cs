@@ -691,6 +691,11 @@ namespace S2A.DirectCompiler
                             DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, boundDynamic: true);
                         writer.WritePropertyName("c0Reads");
                         WriteRanges(writer, stageReads);
+                        // 同一内容同时携带无动态定界的原始读集，运行时只选消费策略，不改变缓存身份。
+                        int[][] staticReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0ReadsStatic");
+                        WriteRanges(writer, staticReads);
                     }
                     writer.WriteEndObject();
                 }

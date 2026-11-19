@@ -1464,6 +1464,11 @@ internal static unsafe class Program
             JsonElement[] masked = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0, 0, 1), Ast(0) }, true, out string e4);
             Check(masked != null && Kind(masked[0]) == JsonValueKind.Array && Covers(masked[0], 0x3F0) && !Covers(masked[0], 0x644),
                 "masked register index: c0Reads is data[0..63], proven not to read 0x644: " + Show(masked, e4));
+            Check(masked != null && masked[0].TryGetProperty("c0ReadsStatic", out var maskedStatic) && maskedStatic.ValueKind == JsonValueKind.Null,
+                "bounded dynamic has separate unknown static read set for switch off");
+            Check(binstOn != null && binstOn[0].TryGetProperty("c0ReadsStatic", out var staticReads) && staticReads.ValueKind == JsonValueKind.Array &&
+                  staticReads.EnumerateArray().Any(r => r[0].GetInt32() <= 0x610 && r[0].GetInt32() + r[1].GetInt32() > 0x610),
+                "constant c0 reads retain their static proof when dynamic bounds are off");
             JsonElement[] maskedReach = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0x600, 0, 1), Ast(0) }, true, out string e5);
             Check(maskedReach != null && Covers(maskedReach[0], 0x644),
                 "negative control: masked register index that can reach 0x644 is a read: " + Show(maskedReach, e5));
