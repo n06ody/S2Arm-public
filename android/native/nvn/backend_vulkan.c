@@ -30,6 +30,8 @@
 #include <time.h>
 
 #include "nvn_backend.h"
+#include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"
+#include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
@@ -48,6 +50,24 @@
 #include "../capprobe/capprobe.h"
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
+// 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
+// 弱链接[androiddraw]：nvn_deswizzle_geom
+// 弱链接[androiddraw]：nvn_deswizzle
+// 弱链接[androiddraw]：nvn_tex_layout
+// 弱链接[androiddraw]：nvn_tex_level_offset
+// 弱链接[androiddraw]：nvn_tex_level_gobs
+// 弱链接[androiddraw]：nvn_gob_switch2
+extern void nvn_tex_layout(const nvn_texdesc *, nvn_texlayout *) __attribute__((weak));
+extern int nvn_deswizzle_geom(const nvn_texdesc *, unsigned, unsigned, uint32_t *, uint32_t *, uint32_t *, uint64_t *, unsigned *, unsigned *, uint32_t *) __attribute__((weak));
+extern int nvn_deswizzle(const nvn_texdesc *, unsigned, unsigned, const void *, void *, size_t) __attribute__((weak));
+extern uint64_t nvn_tex_level_offset(const nvn_texdesc *, unsigned) __attribute__((weak));
+extern uint32_t nvn_tex_level_gobs(const nvn_texdesc *, unsigned) __attribute__((weak));
+extern int nvn_gob_switch2 __attribute__((weak));
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkShaderModule module; VkPipeline pipe; } g_deswizzle;
+static uint64_t g_deswizzle_count, g_deswizzle_bytes, g_deswizzle_fallbacks;
+static uint64_t g_deswizzle_reasons[5];
+static int deswizzle_open(void);
+static void deswizzle_close(void);
 
 #define VK_SEG_QUEUE_INIT 16
 #define VK_ARENA_MIN (256u * 1024u)
@@ -85,6 +105,7 @@ struct nvn_gpu_tex_s {
     VkImageUsageFlags usage;
     VkImageLayout layout;
     uint32_t w, h, depth, levels, layers, samples, nvn_format, target;
+    nvn_texdesc original_desc;   // 原客体排布（含 packaged 宽对齐），不能从宿主图像反推
     int array_compatible;
     int cube_compatible;   // P0-6：二维数组建图时带了 CUBE_COMPATIBLE（方形、≥6 层、单采样、设备收这个格式 / 用途 / 标志），可以建立方体（数组）视图
     int view_fmt, released, refs, bc_decoded;
@@ -1454,6 +1475,7 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     // #1199：BC 不再按 textureCompressionBC 一刀切——原生全有或缺的格式能走 compute 解码就算支持。
     if (f.textureCompressionBC || vk->dev->bc_decode_mask) c->caps |= NVN_GPU_CAP_TEX_BC;
     if (f.textureCompressionASTC_LDR) c->caps |= NVN_GPU_CAP_TEX_ASTC;
+    if (g_deswizzle.pipe) c->caps |= NVN_GPU_CAP_GPU_DESWIZZLE;
     c->caps |= NVN_GPU_CAP_BLIT_SCALED;   // vkCmdBlitImage；具体格式对行不行在 nvn_gpu_blit 里逐次按格式特性判
     c->caps |= NVN_GPU_CAP_BLIT_DEPTH_STENCIL; // 辅助绘制拷贝；具体格式仍须有采样与深度模板附件能力
     // 不声明 NVN_GPU_CAP_NO_ATTACH_PASS（11-15 撤回，#697）：零附件通道在 Mali-G710 r32p1 上让一款大作标题页 / 场景整片发红（d1c76bd63 起，
@@ -2123,6 +2145,10 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         g_cv_ready = 1;
     }
     dset_open();   // 按布局回收的描述符组（#1096）：开关在开会话时读一次
+    g_deswizzle_count = g_deswizzle_bytes = g_deswizzle_fallbacks = 0;
+    memset(g_deswizzle_reasons, 0, sizeof g_deswizzle_reasons);
+    if (nvn_plat_flag("nvk_gpu_deswizzle", 1) && !deswizzle_open())
+        nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", "【红】GPU 解排不可用，本局采用 CPU 解排");
     report_timestamp_open();
     fill_caps(&g, d);
     g_ref_n = g_ref_hit = 0;
@@ -2324,6 +2350,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     texmem_drain(g.d);
     seg_drain();
     if (g.bc) nvn_vk_bcdec_destroy(g.dev, g.bc);
+    deswizzle_close();
     free(g.submitted);
     g.submitted = NULL;
     g.nsub = g.capsub = 0;
@@ -5949,6 +5976,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     t->sample_format = sample_fmt;
     t->bc_decoded = bc_decoded;
     t->aspect = fmt_aspect(fmt);
+    t->original_desc = d->d;
     t->w = d->d.width;
     t->h = d->d.height;
     t->levels = levels;
@@ -6472,7 +6500,7 @@ static VkImageAspectFlags copy_face_aspect(const struct nvn_gpu_tex_s *t) {
 //   COPY_FACE_STENCIL = 只拷模板面，缓冲每纹素 1 字节。
 enum { COPY_FACE_DEFAULT = 0, COPY_FACE_DEPTH_F32 = 1, COPY_FACE_STENCIL = 2 };
 static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
-                              nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r, int face) {
+                              nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r, int face, int source_ready) {
     const int depth_f32 = face == COPY_FACE_DEPTH_F32, stencil = face == COPY_FACE_STENCIL;
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
@@ -6526,7 +6554,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
                    (unsigned long long)row_bytes, (unsigned long long)image_bytes, (unsigned long long)off);
         return;
     }
-    full_barrier(c);
+    if (!source_ready) full_barrier(c);
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy bc;
     memset(&bc, 0, sizeof bc);
@@ -6545,7 +6573,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
 
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
                           nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r) {
-    copy_buf_tex_impl(ch, bh, off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEFAULT);
+    copy_buf_tex_impl(ch, bh, off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEFAULT, 0);
 }
 
 void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
@@ -7036,7 +7064,7 @@ static void upload_d24s8_stencil(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level,
         const uint8_t *row = src + (uint64_t)y * row_bytes;
         for (uint32_t x = 0; x < ew; x++) dst[(uint64_t)y * ew + x] = row[(uint64_t)x * 4 + 3];
     }
-    copy_buf_tex_impl(ch, sl.buf, sl.off, ew, (uint64_t)ew * eh, th, level, layer, r, COPY_FACE_STENCIL);
+    copy_buf_tex_impl(ch, sl.buf, sl.off, ew, (uint64_t)ew * eh, th, level, layer, r, COPY_FACE_STENCIL, 0);
 }
 
 void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
@@ -7092,7 +7120,7 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t
         if (row_bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "tex_upload D24 行宽未 4 对齐"); return; }
         memcpy(sl.cpu, src, (size_t)image_bytes);
         nvn_vk_depth24_to_f32(sl.cpu, (size_t)image_bytes / 4);
-        copy_buf_tex_impl(ch, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEPTH_F32);
+        copy_buf_tex_impl(ch, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEPTH_F32, 0);
         if (t->nvn_format == NVN_FORMAT_DEPTH24_STENCIL8) upload_d24s8_stencil(ch, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);   // 换存储后模板面照样要传
     } else {
         memcpy(sl.cpu, src, (size_t)image_bytes);
@@ -7311,9 +7339,7 @@ void nvn_gpu_timestamp(nvn_gpu_cmd ch, uint32_t slot, uint32_t type) {
 
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text) { (void)c; (void)text; }
 
-void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t l, uint32_t y, const nvn_texlayout *L, const void *src, uint64_t bytes) {
-    (void)t; (void)l; (void)y; (void)L; (void)src; (void)bytes; VK_NOT_YET(c, "nvn_gpu_tex_upload_blocklinear");
-}
+#include "backend_vulkan_deswizzle.inc"
 // 上屏 6 个入口在 backend_vulkan_wsi.inc（文件末尾 include：它要用后面定义的提交与回收函数）
 
 // ---------------------------------------------------------------- 命令
