@@ -31,7 +31,8 @@ static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
 static char g_ps_lines[8][320]; static int g_ps_n;   // 池统计行（cls "poolstats"）收下来给 t_pool_stats 核
-void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static char g_tdiag_lines[32][320], g_tdiag_summary[320]; static int g_tdiag_n, g_tdiag_summaries, g_flag_tdiag;
+void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "tex-reupload-summary")) { snprintf(g_tdiag_summary, sizeof g_tdiag_summary, "%s", text); g_tdiag_summaries++; return; } if (cls && !strcmp(cls, "tex-reupload")) { if (g_tdiag_n < 32) snprintf(g_tdiag_lines[g_tdiag_n], 320, "%s", text); g_tdiag_n++; return; } if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
@@ -42,6 +43,7 @@ static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产�
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
@@ -176,12 +178,13 @@ uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
     if (f == g_caps_nofilter) c &= ~(uint32_t)NVN_GPU_FMT_FILTER;
     if (f == g_caps_noblend) c &= ~(uint32_t)NVN_GPU_FMT_BLEND;
     return c; }
+static uint64_t g_dirty_now = 100, g_dirty_written; static int g_protects, g_tdiag_race;
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     (void)t; if (g_nup == 16) return;
     g_up[g_nup].pre = c->is_pre; g_up[g_nup].level = level; g_up[g_nup].layer = layer; g_up[g_nup].pitch = row_bytes; g_up[g_nup].img = image_bytes; g_up[g_nup].y = r->yoffset; g_up[g_nup].w = r->width; g_up[g_nup].h = r->height;
-    memcpy(g_up[g_nup].first, src, image_bytes < 64 ? image_bytes : 64); g_nup++; }
+    memcpy(g_up[g_nup].first, src, image_bytes < 64 ? image_bytes : 64); g_nup++;
+    if (g_tdiag_race) { g_dirty_written = ++g_dirty_now; g_tdiag_race = 0; } }
 // 脏页替身：代号由用例推进
-static uint64_t g_dirty_now = 100, g_dirty_written; static int g_protects;
 void nvn_dirty_protect(const void *addr, size_t len) { (void)addr; (void)len; g_protects++; }
 void nvn_dirty_stats(uint64_t *f, uint64_t *p) { *f = 0; *p = 0; }
 static uint64_t g_dirty_map = 1; uint64_t nvn_dirty_mapping_generation(void) { return g_dirty_map; }
@@ -1553,6 +1556,56 @@ static void t_cpu_upload(void) {   // 存储里是 CPU 写的数据：首次使�
     nvn_be_tex_release(&t);
     CHECK(g_tex_releases - r0 == 1 && rp_res_tex_built() == 0);                     // CPU 内容贴图不进共用表：对象 Finalize 即放
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// 诊断只认完整、稳定的原始内容；未跟踪或上传期间有写不能算内容未变。
+static void t_tex_reupload_diag(void) {
+    nvn_be_sub_begin(); res_fresh(); g_flag_tdiag = 1; g_tdiag_n = g_tdiag_summaries = 0; g_pg_tracked = 1;
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    tex_t t = mk_tex(60101, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); t.mem = g_block_mem; memset(t.mem, 0x55, t.L.size);
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 1 && strstr(g_tdiag_lines[0], "kind=first state=initial"));
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 2 && strstr(g_tdiag_lines[1], "kind=repeat state=same"));
+    t.mem[3] ^= 0x7f; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 3 && strstr(g_tdiag_lines[2], "kind=repeat state=changed"));
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2; g_tdiag_race = 1;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 4 && strstr(g_tdiag_lines[3], "state=unknown_race"));
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 5 && strstr(g_tdiag_lines[4], "state=initial"));
+    g_pg_tracked = 0; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 6 && strstr(g_tdiag_lines[5], "state=unknown_untracked"));
+    g_pg_tracked = 1; g_log_fake_on = 1; g_log_unarmed[0] = 1; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_tdiag_n == 7 && strstr(g_tdiag_lines[6], "state=unknown_race"));
+    g_log_unarmed[0] = 0; g_log_fake_on = 0;
+    for (int i = 0; i < 7; i++) { char seq[24]; snprintf(seq, sizeof seq, "seq=%d ", i + 1); CHECK(!strncmp(g_tdiag_lines[i], seq, strlen(seq))); }
+    nvn_be_tex_release(&t); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    res_fresh(); g_flag_tdiag = 0; g_pg_tracked = 1; nvn_be_sub_begin();
+    CHECK(g_tdiag_summaries == 1 && strstr(g_tdiag_summary, "events=7 first=1 repeat=6 initial=2 same=1 changed=1 unknown=3"));
+    tex_t off = mk_tex(60102, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); off.mem = g_block_mem; memset(off.mem, 0x44, off.L.size);
+    CHECK(rp_tex_resolve(&off, &g_fake_cmd) != NULL && g_tdiag_n == 7 && g_tdiag_summaries == 1);
+    nvn_be_tex_release(&off); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_block_mem = NULL; res_fresh();
+}
+
+static void t_tex_reupload_diag_gpu_pending(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    nvn_be_shutdown_session(); res_fresh(); g_flag_tdiag = 1; g_tdiag_n = 0; g_pg_tracked = 1; g_buf_cpu_auto = 1;
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    g_tp.mem = g_block_mem; g_tp.size = BLOCK_TEST_PAGES * PG; memset(g_block_mem, 0x32, g_tp.size);
+    nvn_be_pool_add(g_block_mem, g_tp.size); nvn_be_sub_begin();
+    uint64_t base = (uint64_t)(uintptr_t)g_block_mem, key = 0; nvn_gpu_buf mirror = NULL;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &mirror, NULL) && mirror && mirror->cpu);
+    tex_t t = mk_tex(60103, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); t.mem = g_block_mem; t.has_layout = 1;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) && g_tdiag_n == 1 && strstr(g_tdiag_lines[0], "state=initial"));
+    uint64_t id = rp_buf_gpu_write_note(base, 16, &key); CHECK(id && key == base);
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) && g_tdiag_n == 2 && strstr(g_tdiag_lines[1], "state=unknown_gpu_pending"));
+    if (id) rp_buf_gpu_write_land(key, id, 0);
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) && g_tdiag_n == 3 && strstr(g_tdiag_lines[2], "state=initial"));
+    nvn_be_tex_release(&t); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_block_mem);
+    g_flag_tdiag = 0; g_buf_cpu_auto = 0; g_block_mem = NULL; nvn_be_shutdown_session(); res_fresh();
 }
 
 static void t_cpu_rules(void) {   // 首用判定的三条分支
@@ -5337,6 +5390,8 @@ int main(int argc, char **argv) {
     t_read_texels_guest();
     t_read_texels_gpu_owned();
     t_cpu_upload();
+    t_tex_reupload_diag();
+    t_tex_reupload_diag_gpu_pending();
     t_cpu_rules();
     t_linear_upload();
     t_linear_reject();
