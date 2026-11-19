@@ -7163,6 +7163,19 @@ void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers) {
 void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers) {
     producer_to_graphics(c, consumers, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
+void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd ch, uint32_t producers, uint32_t consumers) {
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (!producers || (producers & ~NVN_GPU_GFX_SRC_ALL)) { set_sticky(c, NVN_GPU_E_ARG, "graphics producer scope invalid"); return; }
+    VkPipelineStageFlags source = 0;
+    if (producers & NVN_GPU_GFX_SRC_VS) source |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (producers & NVN_GPU_GFX_SRC_FS) source |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (producers & NVN_GPU_GFX_SRC_GS) {
+        if (!g.dev->core_features.geometryShader) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "geometry producer unavailable"); return; }
+        source |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    }
+    producer_to_graphics(c, consumers, source, VK_ACCESS_SHADER_WRITE_BIT);
+}
 
 void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
     (void)nvn_bits;

@@ -623,6 +623,45 @@ static uint32_t cgr_shader_consumer(int stage, int uniform) {
 static int cgr_unknown_write(const nvn_gpu_layout_ent *e) {
     return !e->access && (e->cls == NVN_GPU_RES_SSBO || e->cls == NVN_GPU_RES_IMAGE || e->cls == NVN_GPU_RES_IMAGE_TBUF || e->cls == NVN_GPU_RES_VA);
 }
+// Separate producer stages retain visibility until each reader is published.
+static struct rp_compute_access g_graphics_access[RP_PROG_STAGES];
+static uint32_t g_graphics_published[RP_PROG_STAGES];
+static int g_graphics_unknown[RP_PROG_STAGES], g_graphics_narrow = -1;
+static int graphics_narrow_on(void) {
+    if (g_graphics_narrow < 0) g_graphics_narrow = nvn_plat_flag("nvk_gfx_dep_narrow", 1) != 0;
+    return g_graphics_narrow;
+}
+static int graphics_read_buf(int st, nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
+    if (!b || !bytes) return 0;
+    if (g_graphics_unknown[st]) return 1;
+    nvn_gpu_access_span span;
+    return !nvn_gpu_buf_access_span(b, off, bytes, &span) || rp_access_read(&g_graphics_access[st], &span);
+}
+static int graphics_read_view(int st, nvn_gpu_view v) {
+    if (!v) return 0;
+    if (g_graphics_unknown[st]) return 1;
+    nvn_gpu_access_span span;
+    return !nvn_gpu_view_access_span(v, &span) || rp_access_read(&g_graphics_access[st], &span);
+}
+static void graphics_note_writes(const struct rp_prog *pg) {
+    if (!graphics_narrow_on()) return;
+    for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < pg->nent[st]; i++) {
+        const nvn_gpu_layout_ent *e = &pg->ent[st][i];
+        if (!(e->access & NVN_GPU_ACC_W) && !cgr_unknown_write(e)) continue;
+        nvn_gpu_access_span span; int known = 0;
+        if ((e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) && e->src_reg < 16 && g_sb_ok[st][i]) {
+            const p_bind_buf *sb = e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg];
+            uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);
+            known = nvn_gpu_buf_access_span(g_sb_buf[st][i], g_sb_off[st][i], wl, &span);
+        }
+        if (!known || g_graphics_access[st].n >= 4096 || !rp_access_reserve(&g_graphics_access[st], 1)) g_graphics_unknown[st] = 1;
+        else rp_access_write(&g_graphics_access[st], &span);
+        g_graphics_published[st] = 0;
+    }
+}
+static void graphics_access_clear(void) {
+    for (int st = 0; st < RP_PROG_STAGES; st++) { g_graphics_access[st].n = 0; g_graphics_unknown[st] = 0; g_graphics_published[st] = 0; }
+}
 static int compute_access_on(void) {
     if (g_compute_access_on < 0) g_compute_access_on = nvn_plat_flag("nvk_cgr", 1) != 0;
     return g_compute_access_on;
@@ -1443,6 +1482,43 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             }
         }
     }
+    for (int writer = 0; writer < RP_PROG_STAGES; writer++) if (g_graphics_unknown[writer] || g_graphics_access[writer].n) {
+        uint32_t need = 0; int writable = 0;
+#define GFX_READ(value, consumer) do { if (value) need |= (consumer); } while (0)
+        GFX_READ(graphics_read_buf(writer, a.ind, a.ind_off, indirect_bytes), NVN_GPU_CGR_INDIRECT);
+        GFX_READ(graphics_read_buf(writer, a.cnt, a.cnt_off, a.cnt ? 4 : 0), NVN_GPU_CGR_INDIRECT);
+        GFX_READ(graphics_read_buf(writer, a.ibuf, a.ioff, index_bytes), NVN_GPU_CGR_INDEX);
+        for (int i = 0; i < 16; i++) if (streams >> i & 1)
+            GFX_READ(graphics_read_buf(writer, vb_buf[i], vb_off[i], rp_S.vbuf[i].size), NVN_GPU_CGR_VERTEX);
+        for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
+            const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
+            uint8_t access = e->access;
+            if (!access && e->cls != NVN_GPU_RES_SAMP) access = cgr_unknown_write(e) ? NVN_GPU_ACC_RW : NVN_GPU_ACC_R;
+            if (access & NVN_GPU_ACC_W) writable = 1;
+            if (!(access & NVN_GPU_ACC_R)) continue;
+            uint32_t consumer = cgr_shader_consumer(st, e->cls == NVN_GPU_RES_UBO);
+            if (e->src_kind == NVN_RB_SBUFP || e->src_kind == NVN_RB_UBOP) {
+                const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
+                if (g_sb_ok[st][i] && sb) { uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl); GFX_READ(graphics_read_buf(writer, g_sb_buf[st][i], g_sb_off[st][i], wl), consumer); }
+                else if (sb && !sb->addr && !sb->size && e->src_kind == NVN_RB_SBUFP) GFX_READ(graphics_read_buf(writer, rp_buf_for_null_storage(), 0, 0x10000), consumer);
+            } else if (e->src_kind == NVN_RB_TEX || e->src_kind == NVN_RB_TEXU || e->src_kind == NVN_RB_TBUF) {
+                if (e->count > 1) { for (uint32_t k = 0; k < e->count; k++) GFX_READ(graphics_read_view(writer, g_av[st][k]), consumer); }
+                else GFX_READ(graphics_read_view(writer, tv[st][i]), consumer);
+            } else if (e->cls != NVN_GPU_RES_SAMP) need |= consumer;
+        }
+#undef GFX_READ
+        uint32_t publish = need & ~g_graphics_published[writer];
+        if (writable || publish) {
+            rp_pass_flush(c);
+            uint32_t game_barrier = rp_pass_take_barrier();
+            if (game_barrier || writable) {
+                nvn_gpu_barrier(c, game_barrier ? game_barrier : NVN_BARRIER_INVALIDATE_SHADER_BIT);
+                graphics_access_clear(); break;
+            }
+            nvn_gpu_graphics_to_graphics(c, 1u << writer, publish);
+            g_graphics_published[writer] |= publish;
+        }
+    }
     uint32_t color_write_mask = rp_S.chmask.mask & g_prog->color_out_mask;
     { static int fm = -1; if (fm < 0) fm = nvn_plat_flag("nvk_fullmask", 0); if (fm) color_write_mask = 0xffffffffu; }   // 既有诊断：管线与附件选择必须用同一掩码
     rp_pass_prepare_draw(c, color_write_mask);   // 有效写掩码与像素区域共同决定这一笔的通道
@@ -1561,6 +1637,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     a.prim = prim; a.count = count; a.instances = (uint32_t)(di ? di->instances : dr->instances); if (!a.instances) a.instances = 1; a.base_instance = base_instance;
     rp_occl_draw(c);
     nvn_gpu_draw(c, &a);
+    graphics_note_writes(g_prog);
     // 首用跳过判据的 seen 标记：本笔真画成了，每个颜色/深度目标记「近两帧画过」（跳过的笔不走到这里，故不记）。
     if (rp_fu_enabled()) {
         uint64_t ff = rp_frame();
@@ -1808,7 +1885,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_mirror_access); g_mirror_published = 0; g_mirror_unknown = 0; g_mirror_narrow = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { for (int st = 0; st < RP_PROG_STAGES; st++) rp_access_reset(&g_graphics_access[st]); graphics_access_clear(); g_graphics_narrow = -1; rp_access_reset(&g_mirror_access); g_mirror_published = 0; g_mirror_unknown = 0; g_mirror_narrow = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }

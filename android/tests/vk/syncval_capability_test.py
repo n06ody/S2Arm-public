@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 CHECK = ROOT / "android/tests/vk/syncval_capability.py"
 KEY = "syncval_shader_accesses_heuristic"
-MODES = ("inbound-main-transfer", "inbound-dependency", "inbound-attachment", "inbound-attachment-compute", "inbound-indirect",
+MODES = ("graphics-storage-waw", "graphics-storage-access", "inbound-main-transfer", "inbound-dependency", "inbound-attachment", "inbound-attachment-compute", "inbound-indirect",
          "cgr-narrow", "cgr-fallback", "cgr-multi-omit", "cgr-write-control", "cgr-unknown-control")
 
 

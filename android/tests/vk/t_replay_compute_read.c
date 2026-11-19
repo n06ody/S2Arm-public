@@ -28,6 +28,7 @@ void nvn_plat_safepoint(void){}
 static int disable_compute_access;
 static int dq_mode;
 int nvn_plat_flag(const char *n,int d){
+ if(!strcmp(n,"nvk_gfx_dep_narrow")){const char *e=getenv("S2A_GFX_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_mirror_dep_narrow")){const char *e=getenv("S2A_MIRROR_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_cgr"))return !disable_compute_access;
  if(!strcmp(n,"nvk_cgr_narrow")){const char *e=getenv("S2A_CGR_NARROW");return e?atoi(e):d;}
@@ -147,7 +148,7 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&vkSignalSemaphoreKHR), P
 _Static_assert(__builtin_types_compatible_p(__typeof__(&vkGetSemaphoreCounterValueKHR), PFN_vkGetSemaphoreCounterValueKHR), "vkGetSemaphoreCounterValueKHR signature");
 extern __typeof__(vkCreateDevice) __real_vkCreateDevice;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateDevice(VkPhysicalDevice physical,const VkDeviceCreateInfo *info,const VkAllocationCallbacks *alloc,VkDevice *device){
- if(!getenv("S2A_INBOUND_PRE_ONLY"))return __real_vkCreateDevice(physical,info,alloc,device);
+ if(!getenv("S2A_INBOUND_PRE_ONLY") && !getenv("S2A_GFX_XSEG"))return __real_vkCreateDevice(physical,info,alloc,device);
  uint32_t n=info->enabledExtensionCount;const char **names=calloc((size_t)n+1,sizeof *names);REQUIRE(names);
  int found=0;for(uint32_t i=0;i<n;i++){names[i]=info->ppEnabledExtensionNames[i];if(!strcmp(names[i],VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))found=1;}
  if(!found){names[n++]=VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;}
@@ -159,12 +160,12 @@ extern __typeof__(vkQueueSubmit) __real_vkQueueSubmit;
 VkResult __wrap_vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){
  unsigned ordinal=atomic_fetch_add(&submits,1)+1;VkSubmitInfo copy;VkTimelineSemaphoreSubmitInfoKHR timeline={.sType=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
  const uint64_t value=1;VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TRANSFER_BIT;
- if(getenv("S2A_INBOUND_PRE_ONLY") && ordinal==2){
+ if((getenv("S2A_INBOUND_PRE_ONLY") && ordinal==2) || (getenv("S2A_GFX_XSEG") && ordinal==1)){
   REQUIRE(n==1 && !s->pNext && !s->waitSemaphoreCount && !s->signalSemaphoreCount && inbound_gate);
   copy=*s;timeline.waitSemaphoreValueCount=1;timeline.pWaitSemaphoreValues=&value;copy.pNext=&timeline;copy.waitSemaphoreCount=1;copy.pWaitSemaphores=&inbound_gate;copy.pWaitDstStageMask=&stage;s=&copy;
  }
  VkResult r=__real_vkQueueSubmit(q,n,s,f);
- if(getenv("S2A_INBOUND_PRE_ONLY")){pthread_mutex_lock(&inbound_submit_mu);inbound_submits_done++;pthread_cond_broadcast(&inbound_submit_cv);pthread_mutex_unlock(&inbound_submit_mu);}
+ if(getenv("S2A_INBOUND_PRE_ONLY") || getenv("S2A_GFX_XSEG")){pthread_mutex_lock(&inbound_submit_mu);inbound_submits_done++;pthread_cond_broadcast(&inbound_submit_cv);pthread_mutex_unlock(&inbound_submit_mu);}
  return r;
 }
 extern __typeof__(vkWaitForFences) __real_vkWaitForFences;
@@ -207,6 +208,10 @@ static PFN_vkCmdDrawIndexedIndirect real_indexed_draw;
 static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
+static PFN_vkCmdEndRenderPass real_end_pass;
+static unsigned gfx_injected, gfx_published, gfx_omitted, gfx_full, gfx_full_omitted;
+static VkPipelineStageFlags gfx_src_stages, gfx_dst_stages;
+static VkAccessFlags gfx_src_access, gfx_dst_access;
 static PFN_vkCmdUpdateBuffer real_update;
 static PFN_vkCmdCopyBuffer real_copy;
 static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted;
@@ -234,7 +239,13 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_update), PFN_vkC
 _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_copy), PFN_vkCmdCopyBuffer), "vkCmdCopyBuffer signature");
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
  nbar++;
+ if(getenv("S2A_GFX_ACCESS_MODE") && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && (s==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || s==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)){gfx_published++;gfx_src_stages|=s;gfx_dst_stages|=t;gfx_src_access|=m[0].srcAccessMask;gfx_dst_access|=m[0].dstAccessMask;}
  if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){ REQUIRE(mirror_barriers<8); mirror_barrier_cb=cb; mirror_stages[mirror_barriers++]=t; mirror_dst_stages |= t; mirror_dst_access |= m[0].dstAccessMask; }
+ const char *gfx_mode=getenv("S2A_GFX_ACCESS_MODE");int gm=gfx_mode?atoi(gfx_mode):0;
+ if((gm==5 || gm==6) && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && (s==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || s==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)){
+  VkMemoryBarrier changed=m[0];if(gm==5)changed.srcAccessMask=0;else changed.dstAccessMask=0;gfx_omitted++;
+  real_barrier(cb,gm==5?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:s,gm==6?VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:t,f,1,&changed,nb,b,ni,im);return;
+ }
  int is_full=s==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT && m[0].dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
  if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){
   const char *mode=getenv("S2A_INBOUND_INJECT"); int imode=mode?atoi(mode):0;
@@ -250,6 +261,11 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
    VkPipelineStageFlags remaining=t & ~missing;
    real_barrier(cb,s,remaining?remaining:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im); return;
   }
+ }
+ if(is_full && getenv("S2A_GFX_HAZARD") && ndraw==1){
+  gfx_full++;const char *mode=getenv("S2A_GFX_ACCESS_MODE");
+  if(mode && !strcmp(mode,"5")){VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;gfx_full_omitted++;
+   real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;}
  }
  if(is_full)nfull_bar++;
  if(getenv("S2A_CGR_OMIT_FULL") && trace_window && is_full){
@@ -283,10 +299,21 @@ static void VKAPI_CALL count_indexed_draw(VkCommandBuffer cb,VkBuffer buffer,VkD
 }
 static void check_direct_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,int indexed){
  note_draw();printf("TRACE direct_draw indexed=%d cb=%p count=%u instances=%u same_cb=%d\n",indexed,(void*)cb,count,instances,producer_cb==cb);
- REQUIRE(ndispatch&&cb==producer_cb);REQUIRE(atomic_load(&submits)==start_submits);REQUIRE(encoding_waits==start_encoding_waits);REQUIRE(atomic_load(&idles)==start_idles);trace_window=0;
+ if(!getenv("S2A_GFX_ACCESS_MODE")){REQUIRE(ndispatch&&cb==producer_cb);REQUIRE(atomic_load(&submits)==start_submits);REQUIRE(encoding_waits==start_encoding_waits);REQUIRE(atomic_load(&idles)==start_idles);}trace_window=0;
 }
 static void VKAPI_CALL count_direct_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,uint32_t base){if(trace_window||track_all_draws)check_direct_draw(cb,count,instances,0);real_direct_draw(cb,count,instances,first,base);}
 static void VKAPI_CALL count_direct_indexed_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,int32_t voff,uint32_t base){if(trace_window||track_all_draws)check_direct_draw(cb,count,instances,1);real_direct_indexed_draw(cb,count,instances,first,voff,base);}
+static void VKAPI_CALL gfx_end_pass(VkCommandBuffer cb){
+ real_end_pass(cb);
+ const char *mode=getenv("S2A_GFX_ACCESS_MODE");if(!mode || ndraw!=1)return;
+ int m=atoi(mode);if(!m || m>=4)return;
+ const char *src=getenv("S2A_GFX_ACCESS_SOURCE"),*dst=getenv("S2A_GFX_ACCESS_DEST");
+ VkPipelineStageFlags source=src&&!strcmp(src,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+ VkPipelineStageFlags target=dst&&!strcmp(dst,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+ VkMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=m==2?0:VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=m==3?0:(getenv("S2A_GFX_HAZARD")?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_SHADER_READ_BIT)};
+ vkCmdPipelineBarrier(cb,m==2?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:source,m==3?VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:target,0,1,&b,0,NULL,0,NULL);gfx_injected++;
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(&gfx_end_pass), PFN_vkCmdEndRenderPass), "vkCmdEndRenderPass signature");
 static void VKAPI_CALL count_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *b,VkSubpassContents contents){printf("TRACE begin cb=%p pass=%p\n",(void*)cb,(void*)b->renderPass);real_begin(cb,b,contents);}
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);if(!f||!name)return f;
@@ -298,6 +325,7 @@ PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  if(!strcmp(name,"vkCmdDrawIndexedIndirect")){real_indexed_draw=(PFN_vkCmdDrawIndexedIndirect)f;return (PFN_vkVoidFunction)count_indexed_draw;}
  if(!strcmp(name,"vkCmdDraw")){real_direct_draw=(PFN_vkCmdDraw)f;return (PFN_vkVoidFunction)count_direct_draw;}
  if(!strcmp(name,"vkCmdDrawIndexed")){real_direct_indexed_draw=(PFN_vkCmdDrawIndexed)f;return (PFN_vkVoidFunction)count_direct_indexed_draw;}
+ if(!strcmp(name,"vkCmdEndRenderPass")){real_end_pass=(PFN_vkCmdEndRenderPass)f;return (PFN_vkVoidFunction)gfx_end_pass;}
  if(!strcmp(name,"vkCmdBeginRenderPass")){real_begin=(PFN_vkCmdBeginRenderPass)f;return (PFN_vkVoidFunction)count_begin;}
  return f;
 }
