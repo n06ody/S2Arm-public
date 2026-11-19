@@ -394,6 +394,8 @@ s2a_gate_step bash "$android_dir/tools/nvn_warm_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvk_warm_modules_test.sh"
 # 复核 P1-1 / P1-2：程序借用（ASan 下读收尾释放后的记录）与配方级在途表（同配方合并 / 不同配方不排队）
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_flight_test.sh"
+# 画质设置来源（渲染倍率 / 上屏滤镜）：调试门开时调试属性 debug.s2a.res_scale / scaling_filter 优先，玩家包只认环境
+s2a_gate_step bash "$android_dir/tools/nvk_quality_cfg_test.sh"
 # 首用待定表（纯逻辑）与 demand 后台建管线（fake Vulkan）：状态机 / 同键合并 / 有界等待 / late-stuck / P0 不串管线。
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_pend_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvn_vk_pipe_demand_test.sh"

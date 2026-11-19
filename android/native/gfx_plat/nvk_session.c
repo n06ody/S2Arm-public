@@ -5,7 +5,10 @@
 #include "rp_exec.h"
 #include "direct/vk_device.h"
 #include "nvn/nvn_warm.h"   // 预热调度：会话 open 后起、Stop 前收（nvn_warm.h 合同）
-#include "nvn/nvn_vk_pipe_demand.h"   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
+#include "nvn/nvn_vk_pipe_demand.h"
+#include <stdbool.h>
+#include "debug_gate.h"         // 调试门（调试构建 + debug.s2a.debug_env=1）
+#include "nvk_quality_cfg.h"   // 画质设置来源选择   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
 #include <android/log.h>
 #include <android/native_window.h>
 #include <stdlib.h>
@@ -95,9 +98,17 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
       // 脏页追加日志（#1501 A②，缺省开，debug.s2a.nvk_buf_dirtylog=0 关）：必须在登记任何池之前配置；回放核心按同一开关决定用不用
       if (nvn_plat_flag("nvk_buf_dirtylog", 1) && !nvn_dirty_log_configure(1))
           __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】脏页追加日志未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
-    {   // 画质设置（与 iOS 同名的环境变量；玩家设置由启动器写进同名变量）：交给回放核心，核心不读环境
+    {   // 画质设置（与 iOS 同名的环境变量；玩家设置由启动器写进同名变量）：交给回放核心，核心不读环境。
+        //   调试门开着时同名调试属性 debug.s2a.res_scale / debug.s2a.scaling_filter 优先（QA A/B，见 nvk_quality_cfg.h）
         extern void rp_rs_configure(const char *); extern void rp_present_filter_configure(const char *);
-        rp_rs_configure(getenv("S2A_RES_SCALE")); rp_present_filter_configure(getenv("S2A_SCALING_FILTER")); }
+        const int gate = s2a_debug_entries_open() ? 1 : 0;
+        char rs_prop[PROP_VALUE_MAX] = {0}, sf_prop[PROP_VALUE_MAX] = {0};
+        if (gate) { __system_property_get("debug.s2a.res_scale", rs_prop); __system_property_get("debug.s2a.scaling_filter", sf_prop); }
+        const char *rs = nvk_quality_pick(rs_prop, gate, getenv("S2A_RES_SCALE")), *sf = nvk_quality_pick(sf_prop, gate, getenv("S2A_SCALING_FILTER"));
+        rp_rs_configure(rs); rp_present_filter_configure(sf);
+        if ((rs && rs[0]) || (sf && sf[0]))
+            __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 画质设置 渲染倍率 %s（%s）、上屏滤镜 %s（%s）", rs && rs[0] ? rs : "1", rs == rs_prop ? "调试属性" : "环境",
+                                sf && sf[0] ? sf : "Bilinear", sf == sf_prop ? "调试属性" : "环境"); }
     g_ready = 1;
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
     const char *drv_name = dev && dev->driver_name[0] ? dev->driver_name : "?";
