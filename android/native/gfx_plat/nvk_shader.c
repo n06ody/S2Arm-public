@@ -901,6 +901,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             if (le->cls == NVN_GPU_RES_TBUF && e->prog.dtt[st][e->prog.nent[st]] != NVN_TEXTURE_TARGET_BUFFER + 1) {
                 red1("tbuf_shader_type_unproven", b->stage); e->failed = 1; break;
             }
+            e->prog.rs_plain[st][e->prog.nent[st]] = b->scale_plain;   // 渲染倍率：这一项的采样不按尺寸换算
             e->prog.nent[st]++;
         }
         if (e->failed) break;

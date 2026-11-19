@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 static int g_fail, g_checks;
 // 红行立刻刷出：dirty_span_memo_mutation_test.py 经管道读本进程的输出，管道上 stdio 整块缓冲；变异体放行池外访问后，
@@ -4587,6 +4588,79 @@ static void t_draw_ind_binst(void) {
     g_fprog = saved;
 }
 
+// 渲染分辨率倍率（S2A_RES_SCALE，片 1）：替身后端核尺寸 / 坐标。一张 640x480 带可压缩标志的颜色目标（可缩）、一张 512x512（方形，2× 不可缩）。
+//   倍率 2：存储换成 1280x960、通道 1280x960、视口 / 裁剪 ×2（裁剪起点向下、终点向上取整）、片元支撑缓冲 render_scale[0] = 2；
+//   随后对它清贴图（片 1 没声明按倍率处理的用途）→ 先缩回 640x480（一次缩放拷贝）、之后永远 1×；
+//   方形目标：通道按 1× 开、不换存储。倍率 1（不设环境变量）：与原来完全一样（不换存储、不拷贝、视口原样）。
+static float rs_support_scale(void) {   // 最近一次片元阶段绑定里支撑缓冲的 render_scale[0]
+    for (uint32_t i = 0; i < g_nfb[1] && i < 16; i++) if (g_fb[1][i].cls == NVN_GPU_RES_UBO && g_fb[1][i].u.b.buf == &g_arena_buf && g_fb[1][i].u.b.len == 4096) {
+        float v; memcpy(&v, g_arena + g_fb[1][i].u.b.off + 192, 4); return v; }
+    return -1;
+}
+static void rs_draw(tex_t *rt, int sx, int sy, int sw, int sh) {
+    stream s = {0}; put_set_rt(&s, rt, NULL);
+    p_viewports *vp = put(&s, OP_VIEWPORTS, sizeof *vp); vp->n = 1; vp->v[0][2] = (float)rt->d.width; vp->v[0][3] = (float)rt->d.height;
+    p_scissor *sc = put(&s, OP_SCISSOR, sizeof *sc); sc->x = sx; sc->y = sy; sc->w = sw; sc->h = sh;
+    q_draw(&s); end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+}
+static void t_res_scale(void) {
+    static const struct { const char *env; float s; } arms[] = { {NULL, 1}, {"2", 2}, {"0.5", 0.5f} };
+    for (size_t a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+        rp_rs_configure(arms[a].env);   // 平台层在开会话时交的设置（NULL = 1）
+        pass_fresh();   // 会话重开：倍率重读
+        { stream w = {0}; q_env(&w); end(&w); submit1(&w); fake_complete(NVN_GPU_DONE_OK); }   // 替身程序与环境
+        g_fprog.nent[1] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[1][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_SUPPORT; e->count = 1;
+        g_fprog.support_bytes = 4096; g_arena_used = 0;
+        nvn_be_pool_gpu_written(&g_tp);   // 目标所在的池被 GPU 写过：贴图不是 CPU 内容（CPU 内容贴图不可缩）
+        tex_t rt = mk_tex(9301 + a, 0, NVN_FORMAT_RGBA8, 640, 480, 1, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+        const float s = arms[a].s;
+        const uint32_t sw = (uint32_t)ceil(640 * s), sh = (uint32_t)ceil(480 * s);
+        g_nbl = 0; int nbl0 = g_nbl, pd0 = g_npd;
+        rs_draw(&rt, 10, 21, 100, 51);
+        nvn_gpu_tex g = rp_tex_backend_by_serial(rt.serial);
+        const nvn_gpu_pass_desc *pd = g_npd > pd0 && g_npd <= 8 ? &g_pd[g_npd - 1] : NULL;
+        const int32_t ex0 = (int32_t)floor(10 * s), ey0 = (int32_t)floor(21 * s), ex1 = (int32_t)ceil(110 * s), ey1 = (int32_t)ceil(72 * s);
+        const int ok1 = g && (uint32_t)g->d.d.width == sw && (uint32_t)g->d.d.height == sh && pd && pd->w == sw && pd->h == sh &&
+            g_last_dyn.vp[0][2] == 640 * s && g_last_dyn.vp[0][3] == 480 * s && g_last_dyn.has_sc && g_last_dyn.sc[0] == ex0 && g_last_dyn.sc[1] == ey0 &&
+            g_last_dyn.sc[2] == ex1 - ex0 && g_last_dyn.sc[3] == ey1 - ey0 && rs_support_scale() == s && (s == 1 ? g_nbl == nbl0 : 1);
+        CHECK(ok1);
+        if (!ok1) {
+            printf("  res-scale %.2f draw: storage %dx%d (expect %ux%u) pass %ux%u viewport %.1fx%.1f scissor %d,%d %dx%d (expect %d,%d %dx%d) render_scale[0] %.2f blits %d\n", (double)s,
+                   g ? (int)g->d.d.width : -1, g ? (int)g->d.d.height : -1, sw, sh, pd ? pd->w : 0, pd ? pd->h : 0, (double)g_last_dyn.vp[0][2], (double)g_last_dyn.vp[0][3],
+                   g_last_dyn.sc[0], g_last_dyn.sc[1], g_last_dyn.sc[2], g_last_dyn.sc[3], ex0, ey0, ex1 - ex0, ey1 - ey0, (double)rs_support_scale(), g_nbl - nbl0);
+            CHECK(0);
+        }
+        // 片 1 没声明按倍率处理的用途：清贴图（游戏坐标 (8,8) 16x16）→ 先缩回游戏尺寸、再按 1× 清
+        int nbl1 = g_nbl;
+        { stream c = {0}; p_clear_tex *ct = put(&c, OP_CLEAR_TEX, sizeof *ct); ct->tex = &rt; ct->r.xoffset = 8; ct->r.yoffset = 8; ct->r.width = 16; ct->r.height = 16; ct->r.depth = 1; ct->mask = 0xf;
+          end(&c); submit1(&c); fake_complete(NVN_GPU_DONE_OK); }
+        g = rp_tex_backend_by_serial(rt.serial);
+        const int down_blits = g_nbl - nbl1;
+        const int ok2 = g && g->d.d.width == 640 && g->d.d.height == 480 && down_blits == (s == 1 ? 0 : 1) &&
+            (s == 1 || (nbl1 < 4 && (uint32_t)g_bl[nbl1].sr.width == sw && g_bl[nbl1].dr.width == 640));
+        pd0 = g_npd; rs_draw(&rt, 10, 21, 100, 51); pd = g_npd > pd0 && g_npd <= 8 ? &g_pd[g_npd - 1] : NULL;
+        const int ok3 = pd && pd->w == 640 && pd->h == 480 && g_last_dyn.vp[0][2] == 640 && g_last_dyn.sc[0] == 10 && g_last_dyn.sc[2] == 100 && rs_support_scale() == 1;
+        CHECK(ok2); CHECK(ok3);
+        if (!ok2 || !ok3) {
+            printf("  res-scale %.2f after clear_tex: storage %dx%d (expect 640x480) down-blits %d (expect %d) pass %ux%u viewport %.1f scissor %d %d render_scale[0] %.2f\n", (double)s,
+                   g ? (int)g->d.d.width : -1, g ? (int)g->d.d.height : -1, down_blits, s == 1 ? 0 : 1, pd ? pd->w : 0, pd ? pd->h : 0, (double)g_last_dyn.vp[0][2], g_last_dyn.sc[0], g_last_dyn.sc[2], (double)rs_support_scale());
+            CHECK(0);
+        }
+        // 方形目标 2× 不可缩（0.5× 时颜色方形也不可缩）：通道按 1× 开、存储不换
+        tex_t sq = mk_tex(9311 + a, 0x200000, NVN_FORMAT_RGBA8, 512, 512, 1, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+        pd0 = g_npd; rs_draw(&sq, 0, 0, 512, 512); pd = g_npd > pd0 && g_npd <= 8 ? &g_pd[g_npd - 1] : NULL;
+        g = rp_tex_backend_by_serial(sq.serial);
+        const int ok4 = g && g->d.d.width == 512 && pd && pd->w == 512 && g_last_dyn.vp[0][2] == 512 && rs_support_scale() == 1;
+        CHECK(ok4);
+        printf("res-scale %.2f：目标存储 %ux%u、通道 %ux%u、片元 render_scale[0] %.2f；清贴图后降回 640x480（缩放拷贝 %d 次）；方形 512 留 1×：%s\n", (double)s, sw, sh, sw, sh, (double)s, down_blits, ok1 && ok2 && ok3 && ok4 ? "全对" : "有红");
+        if (!ok4) {
+            printf("  res-scale %.2f square: storage %d pass %u viewport %.1f render_scale[0] %.2f (expect all 512 / 1)\n", (double)s, g ? (int)g->d.d.width : -1, pd ? pd->w : 0, (double)g_last_dyn.vp[0][2], (double)rs_support_scale());
+            CHECK(0);
+        }
+    }
+    rp_rs_configure(NULL); pass_fresh();
+}
+
 extern int rp_split_draws;
 static void t_clean_read_order(void) {
     const int old_split = rp_split_draws;
@@ -5520,6 +5594,7 @@ int main(int argc, char **argv) {
     t_pipeline_dirty_changes();
     t_target_format_variant();
     t_draw();
+    t_res_scale();
     t_arena697_detail();
     t_logic_op_accounting();
     t_gs_dirty_and_topology();

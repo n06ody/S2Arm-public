@@ -8,6 +8,7 @@
 #include "nvn/nvn_vk_pipe_demand.h"   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
 #include <android/log.h>
 #include <android/native_window.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -94,6 +95,9 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
       // 脏页追加日志（#1501 A②，缺省开，debug.s2a.nvk_buf_dirtylog=0 关）：必须在登记任何池之前配置；回放核心按同一开关决定用不用
       if (nvn_plat_flag("nvk_buf_dirtylog", 1) && !nvn_dirty_log_configure(1))
           __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】脏页追加日志未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
+    {   // 画质设置（与 iOS 同名的环境变量；玩家设置由启动器写进同名变量）：交给回放核心，核心不读环境
+        extern void rp_rs_configure(const char *); extern void rp_present_filter_configure(const char *);
+        rp_rs_configure(getenv("S2A_RES_SCALE")); rp_present_filter_configure(getenv("S2A_SCALING_FILTER")); }
     g_ready = 1;
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
     const char *drv_name = dev && dev->driver_name[0] ? dev->driver_name : "?";
