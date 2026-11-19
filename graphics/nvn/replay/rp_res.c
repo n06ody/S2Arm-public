@@ -103,7 +103,7 @@ static texdiag_sample texdiag_begin(const tex_t *t) {
     if (!s.bytes || s.bytes > TEXDIAG_ONE_MAX || s.bytes > TEXDIAG_TOTAL_MAX - g_texdiag_live) { s.unknown = "unknown_limit"; return s; }
     s.map = nvn_dirty_mapping_generation(); nvn_dirty_protect(t->mem + s.wlo, (size_t)(s.whi - s.wlo));
     s.stamp = nvn_dirty_now(); s.span = nvn_dirty_span(t->mem + s.wlo, (size_t)(s.whi - s.wlo));
-    if (!s.span || nvn_dirty_tracking_unreliable()) { s.unknown = "unknown_untracked"; return s; }
+    if (!s.span || nvn_dirty_tracking_unreliable()) { s.unknown = "unknown_untracked"; return s; }   // 空窗口（wlo==whi，全在池外）同样算未跟踪：没有可保护的页，不谎称内容稳定——上传侧此时拿的是全 0 源，两口径是故意不同
     if (!texdiag_stable(&s, t)) { s.unknown = "unknown_race"; return s; }
     uint8_t *part = NULL; const uint8_t *src = rp_tex_src(t, &part);   // 快照按上传的同一份源：池内实读、池外为 0
     if (!src) { s.unknown = "unknown_alloc"; return s; }
@@ -400,9 +400,12 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
     if (gpu) {
         // 客体存储按窗口源交后端（伸出池时 src 是副本：池内照拷、池外按 0），后端照布局全长读不越界；
         // 每级、每层分别建 GPU 解排命令。线性与稀疏仍走已有路径。
-        for (uint32_t l = 0; l < levels; l++) for (uint32_t y = 0; y < layers; y++)
-            nvn_gpu_tex_upload_blocklinear(c, x->g, l, y, &t->L, src, t->L.size);
-        goto done;
+        // 后端校验 / 暂存失败不粘滞命令缓冲、报 rc：具名记一笔，本张照原样走下面 CPU 上传；x->uploaded 只在 rc==0 时设。
+        nvn_gpu_rc grc = { .code = NVN_GPU_OK };
+        for (uint32_t l = 0; l < levels && nvn_gpu_ok(grc); l++) for (uint32_t y = 0; y < layers && nvn_gpu_ok(grc); y++)
+            grc = nvn_gpu_tex_upload_blocklinear(c, x->g, l, y, &t->L, src, t->L.size);
+        if (nvn_gpu_ok(grc)) goto done;
+        nvn_unimpl("tex", "gpu_deswizzle_backend_fail", t);
     }
     for (uint32_t l = 0; l < levels && !rc; l++) {
         uint32_t w = t->d.width >> l, h = t->d.height >> l, dp = is3d ? t->d.depth >> l : 1;

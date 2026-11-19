@@ -37,47 +37,51 @@ bad:
 }
 uint64_t nvn_gpu_vk_test_deswizzle_count(void) { return __atomic_load_n(&g_deswizzle_count, __ATOMIC_RELAXED); }
 uint64_t nvn_gpu_vk_test_deswizzle_fallback_count(void) { return __atomic_load_n(&g_deswizzle_fallbacks, __ATOMIC_RELAXED); }
-static void deswizzle_fallback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer,
-                               const void *src, uint32_t row, uint32_t rows, uint32_t slices, unsigned reason, const char *why) {
+// 校验 / 暂存失败不回 sticky（不粘滞整条命令缓冲）：报 rc 交回放层走 CPU 上传，本行日志带原因
+static nvn_gpu_rc dwz_fail(int code, const char *why) {
+    char b[192]; snprintf(b, sizeof b, "GPU 解排本张未传，回放层走 CPU：%s", why); nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+    return (nvn_gpu_rc){ .code = code };
+}
+static nvn_gpu_rc deswizzle_fallback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t level, uint32_t layer,
+                                     const void *src, uint32_t row, uint32_t rows, uint32_t slices, unsigned reason, const char *why) {
     __atomic_add_fetch(&g_deswizzle_fallbacks, 1, __ATOMIC_RELAXED);
     uint64_t count = __atomic_add_fetch(&g_deswizzle_reasons[reason], 1, __ATOMIC_RELAXED);
     if (count == 1) { char b[192]; snprintf(b, sizeof b, "GPU 解排回退 CPU：%s", why); nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
     uint64_t bytes = (uint64_t)row * rows * slices;
-    if (!bytes || bytes > SIZE_MAX) { set_sticky(c, NVN_GPU_E_ARG, "解排回退尺寸非法"); return; }
+    if (!bytes || bytes > SIZE_MAX) return dwz_fail(NVN_GPU_E_ARG, "解排回退尺寸非法");
     uint8_t *linear = malloc((size_t)bytes);
-    if (!linear) { set_sticky(c, NVN_GPU_E_OOM, "解排回退分配失败"); return; }
+    if (!linear) return dwz_fail(NVN_GPU_E_OOM, "解排回退分配失败");
     NVNcopyRegion region = {0, 0, 0, (int)(t->w >> level ? t->w >> level : 1), (int)(t->h >> level ? t->h >> level : 1), (int)slices};
-    if (nvn_deswizzle(&t->original_desc, level, layer, src, linear, row)) set_sticky(c, NVN_GPU_E_ARG, "解排回退失败");
+    int rc = NVN_GPU_OK;
+    if (nvn_deswizzle(&t->original_desc, level, layer, src, linear, row)) rc = NVN_GPU_E_ARG;
     else nvn_gpu_tex_upload(c, t, level, layer, &region, linear, row, bytes);
     free(linear);
+    return rc != NVN_GPU_OK ? dwz_fail(rc, "解排回退失败") : (nvn_gpu_rc){ .code = NVN_GPU_OK };
 }
-void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const nvn_texlayout *L,
-                                    const void *src, uint64_t bytes) {
+nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const nvn_texlayout *L,
+                                          const void *src, uint64_t bytes) {
     struct nvn_gpu_cmd_s *c = ch; struct nvn_gpu_tex_s *t = th;
-    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
-    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "GPU 解排在通道内"); return; }
-    if (!t || !src || !L || bytes < L->size || !L->size || !nvn_deswizzle_geom || !nvn_deswizzle || !nvn_tex_layout || !nvn_tex_level_offset || !nvn_tex_level_gobs) {
-        set_sticky(c, NVN_GPU_E_ARG, "GPU 解排参数或布局来源无效"); return;
-    }
+    if (!c) return (nvn_gpu_rc){ .code = NVN_GPU_E_ARG };
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return c->sticky;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "GPU 解排在通道内"); return (nvn_gpu_rc){ .code = NVN_GPU_E_ORDER }; }
+    if (!t || !src || !L || bytes < L->size || !L->size || !nvn_deswizzle_geom || !nvn_deswizzle || !nvn_tex_layout || !nvn_tex_level_offset || !nvn_tex_level_gobs)
+        return dwz_fail(NVN_GPU_E_ARG, "GPU 解排参数或布局来源无效");
     nvn_texlayout expected; nvn_tex_layout(&t->original_desc, &expected);
     if (L->size != expected.size || L->layer_size != expected.layer_size || L->align != expected.align || L->layers != expected.layers ||
-        L->bpb != expected.bpb || L->tileH != expected.tileH || L->tileD != expected.tileD) {
-        set_sticky(c, NVN_GPU_E_ARG, "GPU 解排布局不匹配贴图描述"); return;
-    }
+        L->bpb != expected.bpb || L->tileH != expected.tileH || L->tileD != expected.tileD)
+        return dwz_fail(NVN_GPU_E_ARG, "GPU 解排布局不匹配贴图描述");
     uint32_t row, rows, slices, bpb; uint64_t base; unsigned h, d;
-    if (level >= 32 || nvn_deswizzle_geom(&t->original_desc, level, layer, &row, &rows, &slices, &base, &h, &d, &bpb) || !row || !rows || !slices || !bpb) {
-        set_sticky(c, NVN_GPU_E_ARG, "GPU 解排子资源几何非法"); return;
-    }
+    if (level >= 32 || nvn_deswizzle_geom(&t->original_desc, level, layer, &row, &rows, &slices, &base, &h, &d, &bpb) || !row || !rows || !slices || !bpb)
+        return dwz_fail(NVN_GPU_E_ARG, "GPU 解排子资源几何非法");
     uint64_t lay_base;
-    if (__builtin_mul_overflow((uint64_t)layer, L->layer_size, &lay_base)) { set_sticky(c, NVN_GPU_E_ARG, "GPU 解排层偏移溢出"); return; }
+    if (__builtin_mul_overflow((uint64_t)layer, L->layer_size, &lay_base)) return dwz_fail(NVN_GPU_E_ARG, "GPU 解排层偏移溢出");
     uint64_t end_offset = level + 1 < t->levels ? nvn_tex_level_offset(&t->original_desc, level + 1) : L->layer_size;
     uint64_t next;
-    if (__builtin_add_overflow(lay_base, end_offset, &next)) { set_sticky(c, NVN_GPU_E_ARG, "GPU 解排末尾溢出"); return; }
-    if (base > next || next > L->size || next > bytes) { set_sticky(c, NVN_GPU_E_ARG, "GPU 解排源子资源越界"); return; }
+    if (__builtin_add_overflow(lay_base, end_offset, &next)) return dwz_fail(NVN_GPU_E_ARG, "GPU 解排末尾溢出");
+    if (base > next || next > L->size || next > bytes) return dwz_fail(NVN_GPU_E_ARG, "GPU 解排源子资源越界");
     uint64_t raw = next - base, linear;
-    if (__builtin_mul_overflow((uint64_t)row, (uint64_t)rows, &linear) || __builtin_mul_overflow(linear, (uint64_t)slices, &linear) || linear > SIZE_MAX - 3 || raw > SIZE_MAX - 3) {
-        set_sticky(c, NVN_GPU_E_ARG, "GPU 解排字节范围溢出"); return;
-    }
+    if (__builtin_mul_overflow((uint64_t)row, (uint64_t)rows, &linear) || __builtin_mul_overflow(linear, (uint64_t)slices, &linear) || linear > SIZE_MAX - 3 || raw > SIZE_MAX - 3)
+        return dwz_fail(NVN_GPU_E_ARG, "GPU 解排字节范围溢出");
     uint64_t padded = (linear + 3u) & ~3ull;
     uint64_t src_padded = (raw + 3u) & ~3ull;
     uint64_t groups = ((linear + 3u) / 4u + 63u) / 64u;
@@ -92,18 +96,18 @@ void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t lev
         src_padded > UINT32_MAX || src_padded > g.dev->properties.limits.maxStorageBufferRange || padded > g.dev->properties.limits.maxStorageBufferRange ||
         groups > g.dev->properties.limits.maxComputeWorkGroupCount[0] ||
         g.dev->properties.limits.minStorageBufferOffsetAlignment > UINT32_MAX) { fallback = 4; why = "device_limits"; }
-    if (why) { deswizzle_fallback(c, t, level, layer, src, row, rows, slices, fallback, why); return; }
+    if (why) return deswizzle_fallback(c, t, level, layer, src, row, rows, slices, fallback, why);
     uint32_t align = (uint32_t)g.dev->properties.limits.minStorageBufferOffsetAlignment; if (align < 4) align = 4;
     if (bpb > align && !(bpb & (bpb - 1))) align = bpb;
     nvn_gpu_slice input, output; nvn_gpu_err e = {0};
     if (!rc_is(nvn_gpu_arena_alloc(c, src_padded, align, &input, &e), NVN_GPU_OK) ||
         !rc_is(nvn_gpu_arena_alloc(c, padded, align, &output, &e), NVN_GPU_OK)) {
-        set_sticky(c, e.rc.code, "GPU 解排暂存：%s", e.why); return;
+        return dwz_fail(e.rc.code, e.why);
     }
     memcpy(input.cpu, (const uint8_t *)src + base, (size_t)raw);
     if (src_padded > raw) memset(input.cpu + raw, 0, (size_t)(src_padded - raw));
     VkDescriptorSet set;
-    if (!alloc_sets(c, &g_deswizzle.dsl, 1, &set, NULL, 0, 0)) return;
+    if (!alloc_sets(c, &g_deswizzle.dsl, 1, &set, NULL, 0, 0)) return dwz_fail(NVN_GPU_E_OOM, "GPU 解排描述符集分配失败");
     VkDescriptorBufferInfo bi[2] = { { input.buf->buffer, input.off, src_padded }, { output.buf->buffer, output.off, padded } };
     VkWriteDescriptorSet wr[2] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[0] },
@@ -126,4 +130,5 @@ void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t lev
     NVNcopyRegion region = {0, 0, 0, (int)(t->w >> level ? t->w >> level : 1), (int)(t->h >> level ? t->h >> level : 1), (int)slices};
     copy_buf_tex_impl(c, output.buf, output.off, row, linear, t, level, layer, &region, COPY_FACE_DEFAULT, 1);
     if (rc_is(c->sticky, NVN_GPU_OK)) { __atomic_add_fetch(&g_deswizzle_count, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_deswizzle_bytes, raw, __ATOMIC_RELAXED); }
+    return c->sticky;
 }
