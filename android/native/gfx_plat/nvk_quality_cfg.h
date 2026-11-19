@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
 #pragma once
+#include <stddef.h>
+int nvk_quality_read_properties(char *scale, size_t scale_cap, char *filter, size_t filter_cap);
 // 画质设置（渲染倍率 S2A_RES_SCALE / 上屏滤镜 S2A_SCALING_FILTER）的来源选择，开会话时用（nvk_session.c）。
 //   调试门开着（调试构建 + debug.s2a.debug_env=1，debug_gate.h）且同名调试属性（debug.s2a.res_scale / debug.s2a.scaling_filter）非空：取属性
 //   ——QA 同包 A/B 只改属性，不用改进程环境；

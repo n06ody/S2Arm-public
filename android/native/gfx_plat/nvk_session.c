@@ -7,7 +7,6 @@
 #include "nvn/nvn_warm.h"   // 预热调度：会话 open 后起、Stop 前收（nvn_warm.h 合同）
 #include "nvn/nvn_vk_pipe_demand.h"
 #include <stdbool.h>
-#include "debug_gate.h"         // 调试门（调试构建 + debug.s2a.debug_env=1）
 #include "nvk_quality_cfg.h"   // 画质设置来源选择   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
 #include <android/log.h>
 #include <android/native_window.h>
@@ -101,9 +100,8 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
     {   // 画质设置（与 iOS 同名的环境变量；玩家设置由启动器写进同名变量）：交给回放核心，核心不读环境。
         //   调试门开着时同名调试属性 debug.s2a.res_scale / debug.s2a.scaling_filter 优先（QA A/B，见 nvk_quality_cfg.h）
         extern void rp_rs_configure(const char *); extern void rp_present_filter_configure(const char *);
-        const int gate = s2a_debug_entries_open() ? 1 : 0;
-        char rs_prop[PROP_VALUE_MAX] = {0}, sf_prop[PROP_VALUE_MAX] = {0};
-        if (gate) { __system_property_get("debug.s2a.res_scale", rs_prop); __system_property_get("debug.s2a.scaling_filter", sf_prop); }
+        char rs_prop[128] = {0}, sf_prop[128] = {0};
+        const int gate = nvk_quality_read_properties(rs_prop, sizeof rs_prop, sf_prop, sizeof sf_prop);
         const char *rs = nvk_quality_pick(rs_prop, gate, getenv("S2A_RES_SCALE")), *sf = nvk_quality_pick(sf_prop, gate, getenv("S2A_SCALING_FILTER"));
         rp_rs_configure(rs); rp_present_filter_configure(sf);
         if ((rs && rs[0]) || (sf && sf[0]))

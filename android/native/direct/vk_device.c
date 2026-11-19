@@ -12,9 +12,6 @@
 #include <string.h>
 #include <time.h>
 #include <stdbool.h>
-#if defined(__ANDROID__)
-#include "../debug_gate.h"
-#endif
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -423,7 +420,8 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // Diagnostic-only; missing support leaves feedback unknown.
 #if defined(__ANDROID__) || defined(S2A_PIPE_FEEDBACK_TEST)
 #if defined(__ANDROID__)
-    int feedback_requested = s2a_debug_entries_open() && prop_int("debug.s2a.direct_trace", 0) == 1;
+    extern int nvn_plat_flag(const char *, int) __attribute__((weak));
+    int feedback_requested = nvn_plat_flag && nvn_plat_flag("direct_trace", 0) == 1;
 #else
     int feedback_requested = prop_int("S2A_TEST_PIPE_FEEDBACK", 0) == 1;
 #endif
