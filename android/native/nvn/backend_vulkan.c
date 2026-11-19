@@ -2567,7 +2567,7 @@ static void full_barrier_at(struct nvn_gpu_cmd_s *c, const char *fn, int line, i
         if (strcmp(fn,"inbound_pass_guard") && strcmp(fn,"nvn_gpu_barrier") && strcmp(fn,"nvn_gpu_inbound_pre_finish")) c->diag_pending |= DIAG_CT;
     }
     // 入向回退与前置段完结须覆盖所有先前写；只有其余调用且没有待处理入向访问时才沿用 r3 的传输源收窄。
-    int inbound_full = force_all || c->inbound_boundary || c->inbound_outside || c->inbound_draw || c->inbound_dispatch;
+    int inbound_full = force_all || (g_inbound_narrow && (c->inbound_boundary || c->inbound_outside || c->inbound_draw || c->inbound_dispatch));
     VkPipelineStageFlags src = !inbound_full && c->narrow_barrier && c->xfer_dirty == 2 && !c->xfer_pending_graphics ?
         VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,

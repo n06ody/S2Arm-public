@@ -336,8 +336,8 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
         --barrier-narrow) db_arm narrow 0 'before == 1' ;;
         --barrier-narrow-off) db_arm narrow-off 0 'before == 1' ;;
         --barrier-narrow-stage-neg) db_arm wrong-stage hit 'before == 1' ;;
-        --barrier-chain) db_arm chain 0 'before == 1'; db_arm chain-clean 0 'before == 1' ;;
-        --barrier-chain-neg) db_arm chain-neg hit 'before == 1' ;;
+        --barrier-chain) db_arm chain 0 'before == 1'; db_arm chain-diag 0 'before == 1'; db_arm chain-clean 0 'before == 1'; db_arm chain-clean-diag 0 'before == 1' ;;
+        --barrier-chain-neg) db_arm chain-neg hit 'before == 1'; db_arm chain-diag-neg hit 'before == 1'; db_arm chain-clean-neg hit 'before == 1'; db_arm chain-clean-diag-neg hit 'before == 1' ;;
         --barrier-chain-off) db_arm chain-off 0 'before == 1' ;;
         --xfer-dispatch) db_arm none 0 'before == 1'; db_arm resync 0 'before >= 2'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'
                          db_log_off=1; db_arm none 0 'before == 1'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'; db_log_off= ;;   # 关那一档：受跟踪的三臂走逐页路径再跑一遍
