@@ -260,11 +260,39 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkGetPipelineCacheData(VkDevice device, Vk
     if (w == rs && fill == extra) { __atomic_store_n(&g_plc_rec.last_data, *size, __ATOMIC_RELAXED); return VK_SUCCESS; }
     return VK_INCOMPLETE;   // 容量不够（取大小之后又有新管线）：按规范只写放得下的部分
 }
+#ifdef S2A_PIPE_FEEDBACK_TEST
+static int g_trace_pipeline_on;
+static _Atomic int g_trace_begin[9], g_trace_warm[9], g_trace_end, g_trace_feedback_bad;
+static _Thread_local int g_trace_expected;
+uint64_t s2a_direct_diag_pipe_begin(unsigned kind, int warm) {
+    if (!g_trace_pipeline_on) return 0;
+    if (kind <= 8) { atomic_fetch_add(&g_trace_begin[kind], 1); if (warm) atomic_fetch_add(&g_trace_warm[kind], 1); }
+    if (kind == 7 || kind == 8) g_trace_expected = 0;
+    return kind;
+}
+void s2a_direct_diag_pipe_end(uint64_t token, int success, unsigned feedback) {
+    if (!token) return;
+    atomic_fetch_add(&g_trace_end, 1);
+    if (!success || feedback != (unsigned)g_trace_expected) atomic_fetch_add(&g_trace_feedback_bad, 1);
+}
+#endif
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateGraphicsPipelines(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo *, const VkAllocationCallbacks *, VkPipeline *);
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     __atomic_fetch_add(&g_plc_rec.gp, n, __ATOMIC_RELAXED);   // C89 ⑩：两个线程同时建管线
     if (cache != VK_NULL_HANDLE && cache == g_plc_rec.last_cache) __atomic_fetch_add(&g_plc_rec.gp_cached, n, __ATOMIC_RELAXED);
-    return __real_vkCreateGraphicsPipelines(device, cache, n, ci, a, out);
+    VkResult result = __real_vkCreateGraphicsPipelines(device, cache, n, ci, a, out);
+#ifdef S2A_PIPE_FEEDBACK_TEST
+    if (g_trace_pipeline_on) {
+        const VkPipelineCreationFeedbackCreateInfoEXT *info = ci->pNext;
+        g_trace_expected = 0;
+        if (info && info->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT && info->pPipelineCreationFeedback) {
+            VkPipelineCreationFeedbackFlagsEXT flags = info->pPipelineCreationFeedback->flags;
+            if (flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT)
+                g_trace_expected = (flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT) ? 2 : 1;
+        }
+    }
+#endif
+    return result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateComputePipelines(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo *, const VkAllocationCallbacks *, VkPipeline *);
 static pthread_mutex_t g_cs_gate_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -279,7 +307,19 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateComputePipelines(VkDevice device, 
     pthread_mutex_unlock(&g_cs_gate_mu);
     __atomic_fetch_add(&g_plc_rec.cp, n, __ATOMIC_RELAXED);
     if (cache != VK_NULL_HANDLE && cache == g_plc_rec.last_cache) __atomic_fetch_add(&g_plc_rec.cp_cached, n, __ATOMIC_RELAXED);
-    return __real_vkCreateComputePipelines(device, cache, n, ci, a, out);
+    VkResult result = __real_vkCreateComputePipelines(device, cache, n, ci, a, out);
+#ifdef S2A_PIPE_FEEDBACK_TEST
+    if (g_trace_pipeline_on) {
+        const VkPipelineCreationFeedbackCreateInfoEXT *info = ci->pNext;
+        g_trace_expected = 0;
+        if (info && info->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT && info->pPipelineCreationFeedback) {
+            VkPipelineCreationFeedbackFlagsEXT flags = info->pPipelineCreationFeedback->flags;
+            if (flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT)
+                g_trace_expected = (flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT) ? 2 : 1;
+        }
+    }
+#endif
+    return result;
 }
 
 // 限定注入：真实 R32_UINT 支持不变，仅模拟驱动只报告单一 texel 能力。
@@ -10402,6 +10442,11 @@ int main(int argc, char **argv) {
     if (getenv("S2A_TEST_ERROR697_ONLY")) return error697_only();
     if (getenv("S2A_TEST_PRESENT_UPSCALE_ONLY")) return present_upscale_only();
     if (!getenv("S2A_TEST_LOGICOP_ONLY")) t29_format_expand();
+#ifdef S2A_PIPE_FEEDBACK_TEST
+    int trace_on = argc > 2 && !strcmp(argv[2], "--trace-feedback");
+    int trace_test = trace_on || (argc > 2 && !strcmp(argv[2], "--trace-feedback-off"));
+    if (trace_test) { setenv("S2A_TEST_PIPE_FEEDBACK", trace_on ? "1" : "0", 1); g_trace_pipeline_on = 1; }
+#endif
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why) != 0) {
         printf("SKIP? 建 Vulkan 设备失败：%s\n", why);
@@ -10409,6 +10454,26 @@ int main(int argc, char **argv) {
     }
     if (argc > 5 && !strcmp(argv[2], "--c89-child")) return c89_child_main(argv);   // C89 里被 SIGKILL 的那一局：由 c89_midrun_save 起
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
+#ifdef S2A_PIPE_FEEDBACK_TEST
+    if (trace_test) {
+        CHECK(g_dev.pipeline_creation_feedback_enabled == trace_on, "trace feedback extension must match requested mode on supported fixture driver");
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "trace-feedback-test";
+        c1501_clear_capacity(argv[1]);
+        CHECK(atomic_load(&g_trace_begin[3]) > 0, "trace clear pipeline must report each actual create");
+        CHECK(atomic_load(&g_trace_begin[1]) == 2, "trace guest graphics pipeline creates must match Vulkan calls");
+        if (open_backend()) {
+            c55_compute(argv[1]);
+            nvn_gpu_err trace_err = {0};
+            CHECK(OK(nvn_gpu_close(5000000000ull, &trace_err)), "trace compute session closes: %s", trace_err.why);
+        } else CHECK(0, "trace compute session opens");
+        CHECK(atomic_load(&g_trace_begin[2]) >= 3 && atomic_load(&g_trace_warm[2]) >= 1, "trace guest compute foreground and warm creates recorded");
+        CHECK(atomic_load(&g_trace_begin[8]) >= 1, "trace compute wait for in-flight warm create recorded");
+        CHECK(atomic_load(&g_trace_end) >= atomic_load(&g_trace_begin[3]) + atomic_load(&g_trace_begin[1]) + atomic_load(&g_trace_begin[2]), "trace begin/end pairs match");
+        CHECK(atomic_load(&g_trace_feedback_bad) == 0, "trace feedback must match real driver flags");
+        printf("TRACE_PIPELINE enabled=%d gfx=%d compute=%d warm_compute=%d clear=%d ended=%d feedback_bad=%d failures=%d\n", trace_on, atomic_load(&g_trace_begin[1]), atomic_load(&g_trace_begin[2]), atomic_load(&g_trace_warm[2]), atomic_load(&g_trace_begin[3]), atomic_load(&g_trace_end), atomic_load(&g_trace_feedback_bad), g_fail);
+        s2a_vk_device_destroy(&g_dev, 1); return g_fail ? 1 : 0;
+    }
+#endif
     if (argc > 2 && !strcmp(argv[2], "--clear-capacity")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "clear-capacity-test";
         c1501_clear_capacity(argv[1]);

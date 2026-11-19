@@ -48,6 +48,7 @@ struct s2a_vk_device {
     int sampler_mirror_clamp_enabled;
     // Vulkan 1.1 下显式启用 EXT；只读附件用 STORE_OP_NONE 避免隐式写。
     int load_store_op_none_enabled;
+    int pipeline_creation_feedback_enabled; // optional debug-only VK_EXT_pipeline_creation_feedback
     // VK_EXT_custom_border_color 已启用且 customBorderColors 特性开着：CLAMP_TO_BORDER 的采样器可用任意边框色（#976）。
     // custom_border_without_format：customBorderColorWithoutFormat 也开着，建采样器时可以不给视图格式。
     // custom_border_max：maxCustomBorderColorSamplers，同时存活的自定义边框色 VkSampler 个数上限。

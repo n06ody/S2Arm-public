@@ -46,6 +46,22 @@ int nvn_plat_flag(const char *name, int dflt) {
 int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }   // 玩家包：开关一律取缺省（s2a_debug_entries_open() 编译期恒假）
 #endif
 
+// 调试门、属性 API 都留在平台实现；主机会话夹具不依赖 Android 头。
+int nvk_quality_read_properties(char *scale, size_t scale_cap, char *filter, size_t filter_cap) {
+    if (!scale || !scale_cap || !filter || !filter_cap) return 0;
+    scale[0] = filter[0] = 0;
+#if defined(S2A_ANDROID_DEBUG_ENV) && defined(__ANDROID__)
+    if (!s2a_debug_entries_open()) return 0;
+    char value[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.s2a.res_scale", value) > 0) snprintf(scale, scale_cap, "%s", value);
+    value[0] = 0;
+    if (__system_property_get("debug.s2a.scaling_filter", value) > 0) snprintf(filter, filter_cap, "%s", value);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 // 回放循环的安全点（nvn_plat.h）：运行时改内存映射要所有游戏线程停下，回放所在的游戏线程一次提交可连续跑数秒，
 // 在命令之间让它停到事务结束（android/native/runtime/fault/thread_android.inc）。诊断目标不链运行时：弱符号。
 extern void s2a_android_guest_host_safepoint(void) __attribute__((weak));

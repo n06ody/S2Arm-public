@@ -97,6 +97,8 @@ void s2a_fl_dump(const struct s2a_frame_log *fl, void (*emit)(void *ctx, const c
 int nvn_vk_frame_log_on(void);
 void nvn_vk_frame_log_present(void);
 void nvn_vk_frame_log_dump(void);
+// Retained frontend: publish one synchronized snapshot without resetting the live ring.
+void nvn_vk_frame_log_snapshot_retained(uint64_t deadline_ns);
 void nvn_vk_frame_log_fence_wait(uint64_t wait_ns);
 // 新回放层的 GPU 读数（backend_vulkan.c 弱引用调；nvk_gputime 开着才有段时间戳）：
 //   每段完成报一次该段 GPU 时间戳跨度 ns；上屏段完成时结一帧（帧号 = 第几次上屏段完成），

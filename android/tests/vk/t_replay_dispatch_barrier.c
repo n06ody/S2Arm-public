@@ -29,9 +29,12 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-static int dq_mode=-1;
+static int dq_mode=-1, inbound_narrow=1, inbound_diag=0;
 int nvn_plat_flag(const char *n,int d){
  if(!strcmp(n,"nvk_dq")){const char *e=getenv("S2A_REPLAY_DB_DQ");if(e&&strcmp(e,"0")&&strcmp(e,"1")){fprintf(stderr,"S2A_REPLAY_DB_DQ 只能是 0 / 1\n");exit(2);}dq_mode=e?atoi(e):d;return dq_mode;}   // 两级录制：缺省同产品；S2A_REPLAY_DB_DQ=0/1 两档都跑
+ if(!strcmp(n,"nvk_barrier_narrow")&&getenv("S2A_REPLAY_NARROW_OFF"))return 0;
+ if(!strcmp(n,"nvk_inbound_narrow"))return inbound_narrow;
+ if(!strcmp(n,"nvk_inbound_diag"))return inbound_diag;
  return !strcmp(n,"nvk_buf_dirtylog")&&getenv("S2A_REPLAY_DIRTYLOG_OFF")?0:d;}   // 脏页日志缺省开（同产品）；S2A_REPLAY_DIRTYLOG_OFF 跑关那一档
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
@@ -100,8 +103,22 @@ int rp_pass_begin(nvn_gpu_cmd c){(void)c;return 0;}void rp_pass_flush(nvn_gpu_cm
 PFN_vkVoidFunction __real_vkGetDeviceProcAddr(VkDevice dev,const char *name);
 static PFN_vkCmdPipelineBarrier real_barrier;static PFN_vkCmdDispatch real_dispatch;static PFN_vkCmdUpdateBuffer real_update;static PFN_vkCmdCopyBuffer real_copy;static PFN_vkBeginCommandBuffer real_begin;
 static unsigned nbar;static struct{char k;unsigned bar;}ev[64];static int nev;   // k：B 开命令缓冲 / T 传输写 / D 派发 / P 屏障 / E 段末屏障（目标主机，当段界）；bar = 记这条时的屏障总数（含这条）   // 只由真实 vkCmd 入口写（录制线程）；fence 之后主线程读
+static int wrong_stage, narrow_test, narrow_off, chain_test, chain_clean, chain_neg, chain_off;
+static uint64_t diag_full_total; static int diag_full_seen;
+static void diag_stat(void *user, const char *name, uint64_t value) { (void)user; if (!strcmp(name,"inbound_diag_full_total")) { diag_full_seen=1; diag_full_total=value; } }
+static VkPipelineStageFlags measured_src, measured_dst;
+static VkPipelineStageFlags chain_src, chain_dst;
 static void note(char k){if(nev<64){ev[nev].k=k;ev[nev].bar=nbar;}nev++;}
-static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){nbar++;note(t&VK_PIPELINE_STAGE_HOST_BIT?'E':'P');real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);}   // E：段末那道（目标是主机），段界
+static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
+ VkMemoryBarrier altered;
+ if(nev>0 && nev<=64 && ev[nev-1].k=='T' && nm==1 && !nb && !ni && !(t&VK_PIPELINE_STAGE_HOST_BIT)){
+  measured_src=s;measured_dst=t;
+  if(t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT){chain_src=s;chain_dst=t;if(chain_neg){s=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;altered=m[0];altered.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;m=&altered;}}
+  // 只破坏传输后的被测屏障，保留屏障本身；计算消费阶段缺失须由同步校验抓到。
+  if(wrong_stage)t=VK_PIPELINE_STAGE_TRANSFER_BIT;
+ }
+ nbar++;note(t&VK_PIPELINE_STAGE_HOST_BIT?'E':'P');real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);
+}   // E：段末那道（目标是主机），段界
 static void VKAPI_CALL note_dispatch(VkCommandBuffer cb,uint32_t x,uint32_t y,uint32_t z){note('D');real_dispatch(cb,x,y,z);}
 static void VKAPI_CALL note_update(VkCommandBuffer cb,VkBuffer b,VkDeviceSize o,VkDeviceSize n,const void *d){note('T');real_update(cb,b,o,n,d);}
 static void VKAPI_CALL note_copy(VkCommandBuffer cb,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){note('T');real_copy(cb,s,d,n,r);}
@@ -128,8 +145,13 @@ void nvn_gpu_vk_test_xfer_barrier(int on) __attribute__((weak));   // 修前的�
 int main(int argc,char **argv){
  if(argc!=3){return 2;}
  const char *arm=argv[2];
+ wrong_stage=!strcmp(arm,"wrong-stage");narrow_test=!strcmp(arm,"narrow");narrow_off=!strcmp(arm,"narrow-off");
+ chain_off=!strcmp(arm,"chain-off"); chain_test=!strncmp(arm,"chain",5) && !chain_off;
+ chain_clean=chain_test && strstr(arm,"clean")!=NULL; chain_neg=chain_test && strstr(arm,"neg")!=NULL;
+ inbound_narrow=chain_clean?0:1; inbound_diag=chain_test && strstr(arm,"diag")!=NULL;
  const int game=!strcmp(arm,"barrier"),xseg=!strcmp(arm,"xseg"),dd=!strcmp(arm,"dd");untracked=!strcmp(arm,"resync");
- if(!game&&!xseg&&!dd&&!untracked&&strcmp(arm,"none")&&strcmp(arm,"none-nobar")){return 2;}
+ if(!game&&!xseg&&!dd&&!untracked&&!wrong_stage&&!narrow_test&&!narrow_off&&!chain_test&&!chain_clean&&!chain_neg&&!chain_off&&strcmp(arm,"none")&&strcmp(arm,"none-nobar")){return 2;}
+ if(narrow_off||chain_off)REQUIRE(!setenv("S2A_REPLAY_NARROW_OFF","1",1));
  if(!strcmp(arm,"none-nobar")){REQUIRE(nvn_gpu_vk_test_xfer_barrier);}
  struct s2a_vk_device d;char why[256];if(s2a_vk_device_create(&d,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
  printf("device: %s (%s)\n",d.properties.deviceName,d.driver_name);
@@ -149,6 +171,7 @@ int main(int argc,char **argv){
  if(!untracked){rp_dispatch(active,&dp,NULL);}     // 预派发：吃掉开段那道屏障，只量被测的那一段（它写的后半段读回前会被覆盖）；
                                                    // resync 不预派发：预派发会登记 GPU 写，被测那次重同步就绕开了被读的区间
  if(!untracked){nvn_gpu_buf_write(active,mirror,off,init,sizeof init);}   // 被测的传输写（resync 臂由派发自己的解析录）
+ if(chain_test||chain_clean||chain_neg||chain_off)nvn_gpu_buf_write(active,mirror,off,init,sizeof init); // 同一区间的第二次写，必须等待第一次传输
  if(xseg){GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));GPU(nvn_gpu_cmd_begin(NULL,&active,&err));}
  if(game){rp_pass_barrier(NVN_BARRIER_ORDER_PRIMITIVES_BIT|NVN_BARRIER_INVALIDATE_SHADER_BIT);}   // 游戏的 OP_BARRIER
  rp_dispatch(active,&dp,NULL);   // 被测的派发：读传输写的
@@ -159,6 +182,20 @@ int main(int argc,char **argv){
  // 屏障数在 fence 之后按快照算：被测派发是第 tested 个（有预派发时是第 1 个），dd 的第二次是下一个
  const int tested=untracked?0:1,before=bar_before(tested,untracked?1:0),between=dd?bar_before(tested+1,0):0;
  REQUIRE(nev<=64&&before>=0&&between>=0);
+ if(narrow_test){
+  fprintf(stderr,"narrow barrier src=0x%x dst=0x%x\n",measured_src,measured_dst);
+  REQUIRE(measured_src==VK_PIPELINE_STAGE_TRANSFER_BIT && measured_dst==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ }
+ if(narrow_off)REQUIRE(measured_src==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && measured_dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+ // 入向账保守未清时 ALL；关闭入向记录才允许原有的纯传输源收窄。
+ if(chain_test){
+  fprintf(stderr,"chain barrier src=0x%x dst=0x%x inbound=%d diag=%d\n",chain_src,chain_dst,inbound_narrow,inbound_diag);
+  REQUIRE(chain_src==(inbound_narrow?VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT) && chain_dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+  nvn_gpu_stats(diag_stat,NULL,0);
+  fprintf(stderr,"chain diagnostic seen=%d full_total=%llu\n",diag_full_seen,(unsigned long long)diag_full_total);
+  REQUIRE(inbound_diag ? (diag_full_seen && diag_full_total>0) : !diag_full_seen);
+ }
+ if(chain_off)REQUIRE(chain_src==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && chain_dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
  char seq[65];for(int i=0;i<nev&&i<64;i++){seq[i]=ev[i].k;}seq[nev<64?nev:64]=0;   // 真实 vkCmd 的发生顺序，读数行带出来便于对位
  const uint32_t *w=(const uint32_t*)(const void*)((const uint8_t*)nvn_gpu_buf_cpu(mirror)+off);unsigned bad=0;
  for(uint32_t i=0;i<64;i++){if(w[i]!=i*3){bad++;}if(w[64+i]!=i*6){bad++;}}

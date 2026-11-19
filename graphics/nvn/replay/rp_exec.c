@@ -154,10 +154,10 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     if (!g_cmd) return NULL;
-    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); return g_cmd; }
+    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
-        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_end(g_cmd); return g_cmd; } }
+        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; } }
     return g_pre;
 }
 
@@ -366,7 +366,7 @@ static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
     if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    if (g_pre) { nvn_gpu_inbound_diag_precedes_main(g_cmd); nvn_gpu_cmd pc = g_pre; g_pre = NULL; nvn_gpu_inbound_pre_finish(pc); if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
     if (g_occ_seg && !g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc);
@@ -399,7 +399,7 @@ uint64_t nvn_be_sub_commit(void) {
         return g_fence;
     }
     nvn_gpu_err err = {0}; uint64_t f = g_fence + SUB_STEP;
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    if (g_pre) { nvn_gpu_inbound_diag_precedes_main(g_cmd); nvn_gpu_cmd pc = g_pre; g_pre = NULL; nvn_gpu_inbound_pre_finish(pc); if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
     uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; }
@@ -697,8 +697,8 @@ static uint64_t exec_list(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(g_cmd); break; }   // 其余计数器的报告值本来就写 0，复位无事可做
             case OP_RENDER_COND: rc_cond(a); break;
-            case OP_DRAW: { if (g_rc_skip) break; p_draw t; count_feed(&count_group, draw_rec(a, h.size, &t), NULL, p, tm); break; }
-            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; count_feed(&count_group, NULL, draw_idx_rec(a, h.size, &t), p, tm); break; }
+            case OP_DRAW: { if (g_rc_skip) break; p_draw t; rp_draw_stream = p; count_feed(&count_group, draw_rec(a, h.size, &t), NULL, p, tm); rp_draw_stream = NULL; break; }
+            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; rp_draw_stream = p; count_feed(&count_group, NULL, draw_idx_rec(a, h.size, &t), p, tm); rp_draw_stream = NULL; break; }
             case OP_MULTI_DRAW: { if (g_rc_skip) break; p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); rp_multi_draw(g_cmd, &m, p); break; }
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
