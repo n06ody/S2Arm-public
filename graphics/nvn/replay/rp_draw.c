@@ -112,7 +112,6 @@ int  nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *, const uint8_t[32], nvn_g
 int  nvn_vk_pipe_demand_wait(const nvn_gpu_pipe_desc *, const uint8_t[32], uint32_t, nvn_gpu_pipe *, char *, size_t) __attribute__((weak));
 int  nvn_vk_pipe_demand_on(void) __attribute__((weak));
 // 渲染倍率（rp_res.c / rp_pass.c）：只链 rp_draw.c 的隔离用例可以不给，缺了 = 倍率 1、不声明
-void rp_rs_safe(int safe, int why) __attribute__((weak));
 float rp_pass_rs(void) __attribute__((weak));
 #define RS_DECL(safe, why) do { if (rp_rs_safe) rp_rs_safe((safe), (why)); } while (0)
 static float pass_rs(void) { return rp_pass_rs ? rp_pass_rs() : 1; }

@@ -211,7 +211,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     int c[4]; int fit = pf_crop_fit(crop, t->d.width, t->d.height, c);
     if (fit >= 0) memcpy(d.crop, c, sizeof c);   // 非法裁剪：按整张显示
     {   // 渲染倍率：源图存储是 ⌈游戏尺寸 × 倍率⌉ 时，裁剪（游戏坐标）换成存储坐标：起点向下、终点向上取整（Ryujinx Window.cs 同法）
-        uint32_t sw = 0, sh = 0; rp_rs_level(t, 0, &sw, &sh);
+        uint32_t sw = (uint32_t)t->d.width, sh = (uint32_t)t->d.height; if (rp_rs_level) rp_rs_level(t, 0, &sw, &sh);
         if (sw != (uint32_t)t->d.width || sh != (uint32_t)t->d.height) {
             const double rx = (double)sw / t->d.width, ry = (double)sh / t->d.height;
             const int32_t x0 = d.crop[2] > 0 ? d.crop[0] : 0, y0 = d.crop[3] > 0 ? d.crop[1] : 0;
@@ -287,7 +287,7 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                              (double)pf[RP_PERF_BINST_HZ] / f, (double)pf[RP_PERF_BINST_ONE] / f, (double)pf[RP_PERF_BINST_CUT] / f, (double)pf[RP_PERF_BINST_SCAN] / f, (double)pf[RP_PERF_BINST_WASTE] / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 }
-                if (rp_rs_setting() != 1) {   // 渲染倍率：按倍率 / 按 1× 开的通道、换存储、各类降回 1× 的贴图（窗口合计）
+                if (rp_rs_setting && rp_rs_setting() != 1) {   // 渲染倍率：按倍率 / 按 1× 开的通道、换存储、各类降回 1× 的贴图（窗口合计）
                     uint64_t bl[RP_RS_WHY_N], up = 0, upk = 0, fail = 0; rp_rs_take(bl, &up, &upk, &fail);
                     int o2 = snprintf(b, sizeof b, "分时（渲染倍率 %.2f，每帧）：按倍率开的通道 %.1f 个、有附件但按 1× 开的 %.1f 个；窗口合计：换成倍率存储 %llu 张（%.1f 百万像素）、换存储失败 %llu 次；降回 1×：",
                                       (double)rp_rs_setting(), (double)pf[RP_PERF_RS_PASS_S] / f, (double)pf[RP_PERF_RS_PASS_1] / f, (unsigned long long)up, (double)upk / 1e3, (unsigned long long)fail);
