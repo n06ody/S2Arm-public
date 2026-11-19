@@ -59,7 +59,10 @@ void rp_perf_add(int i,uint64_t n){(void)i;(void)n;}uint64_t rp_seg_serial(void)
 uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return serial;}
 int rp_fence_done(uint64_t f){return f<=nvn_gpu_fence_done();}
 static nvn_gpu_cmd active;
-nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
+nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){
+ if(getenv("S2A_INBOUND_MAIN_ONLY"))REQUIRE(*last==serial); // 仅测试真实的「同提交再同步 → 主段」分支
+ rp_pass_flush(active);*last=serial;return active;
+}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
 // GPU 写回登记：同 rp_exec.c 交给 rp_buf 的排除表；收尾不回写游戏内存
 static uint64_t wkey[4],wid[4];static int nw;
@@ -67,7 +70,7 @@ int rp_post_gpu_write(uint64_t a,uint64_t n){if(nw>=4){return 0;}wid[nw]=rp_buf_
 int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t base=(uint64_t)(uintptr_t)guest;if(a<base||n>sizeof guest||a-base>sizeof guest-n)return 0;if(m)*m=guest;if(s)*s=sizeof guest;return 1;}
 // 受写跟踪且 CPU 没再改过的池：首次解析直接写镜像，之后不录传输或全屏障，不能掩盖计算写的依赖。
 size_t nvn_dirty_page_size(void){return 4096;}uint64_t nvn_dirty_now(void){return 1;}
-static const int untracked=0;
+static int untracked;
 uint64_t nvn_dirty_mapping_generation(void){return 1;}int nvn_dirty_tracking_unreliable(void){return untracked;}
 const void *nvn_dirty_span(const void *a,size_t n){(void)n;return untracked?NULL:a;}
 long nvn_dirty_page_gens(const void *s,const void *a,size_t l,uint64_t *g,size_t n){(void)s;(void)a;(void)l;if(untracked){return -1;}for(size_t i=0;i<n;i++){g[i]=1;}return (long)n;}
@@ -184,6 +187,26 @@ static PFN_vkCmdDrawIndexedIndirect real_indexed_draw;
 static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
+static PFN_vkCmdUpdateBuffer real_update;
+static PFN_vkCmdCopyBuffer real_copy;
+static unsigned inbound_transfers, inbound_injected;
+static void inbound_post_transfer(VkCommandBuffer cb){
+ if(!getenv("S2A_INBOUND_MAIN_ONLY"))return;
+ inbound_transfers++;
+ const char *mode=getenv("S2A_INBOUND_INJECT");int m=mode?atoi(mode):0;
+ if(!m)return;
+ const char *stage=getenv("S2A_INBOUND_STAGE");
+ VkPipelineStageFlags shader_stage=stage&&!strcmp(stage,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+ VkPipelineStageFlags dst=(m==3?0:shader_stage)|(m==4?0:VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT);
+ VkMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=m==2?0:VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask=(m==3?0:VK_ACCESS_SHADER_READ_BIT)|(m==4?0:VK_ACCESS_INDIRECT_COMMAND_READ_BIT)};
+ vkCmdPipelineBarrier(cb,m==2?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,dst,0,1,&b,0,NULL,0,NULL);
+ inbound_injected++;
+}
+static void VKAPI_CALL inbound_update(VkCommandBuffer cb,VkBuffer b,VkDeviceSize off,VkDeviceSize n,const void *data){real_update(cb,b,off,n,data);inbound_post_transfer(cb);}
+static void VKAPI_CALL inbound_copy(VkCommandBuffer cb,VkBuffer a,VkBuffer b,uint32_t n,const VkBufferCopy *regions){real_copy(cb,a,b,n,regions);inbound_post_transfer(cb);}
+_Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_update), PFN_vkCmdUpdateBuffer), "vkCmdUpdateBuffer signature");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_copy), PFN_vkCmdCopyBuffer), "vkCmdCopyBuffer signature");
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
  VkPipelineStageFlags original_t=t;
  VkMemoryBarrier altered;
@@ -241,6 +264,8 @@ static void VKAPI_CALL count_direct_indexed_draw(VkCommandBuffer cb,uint32_t cou
 static void VKAPI_CALL count_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *b,VkSubpassContents contents){printf("TRACE begin cb=%p pass=%p\n",(void*)cb,(void*)b->renderPass);real_begin(cb,b,contents);}
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);if(!f||!name)return f;
+ if(!strcmp(name,"vkCmdUpdateBuffer")){real_update=(PFN_vkCmdUpdateBuffer)f;return (PFN_vkVoidFunction)inbound_update;}
+ if(!strcmp(name,"vkCmdCopyBuffer")){real_copy=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)inbound_copy;}
  if(!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
  if(!strcmp(name,"vkCmdCopyBuffer")){real_copy_buffer=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)count_copy_buffer;}
  if(!strcmp(name,"vkCmdDispatch")){real_dispatch=(PFN_vkCmdDispatch)f;return (PFN_vkVoidFunction)count_dispatch;}
