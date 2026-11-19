@@ -8610,14 +8610,16 @@ static struct c88_run c88_session(const char *sdir, const char *cache_dir) {
     o.opened = open_backend();
     g_desc.cache_dir = NULL;
     if (!o.opened) return o;
+    // 会话准备可能创建内部计算管线（如 GPU 解排）；C88 验的是下列三条游戏管线。
+    struct plc_rec ready = g_plc_rec;
     c88_make_pipes(sdir);
     nvn_gpu_stats(c88_stat_cb, &o, 0);
     nvn_gpu_err e;
     o.closed = OK(nvn_gpu_close(5000000000ull, &e));
     if (!o.closed) printf("C88 close 失败：%d %s\n", e.rc.code, e.why);
     o.caches = g_plc_rec.cache_creates - b.cache_creates; o.initial = g_plc_rec.last_initial; o.data = g_plc_rec.last_data;
-    o.gp = g_plc_rec.gp - b.gp; o.gp_cached = g_plc_rec.gp_cached - b.gp_cached;
-    o.cp = g_plc_rec.cp - b.cp; o.cp_cached = g_plc_rec.cp_cached - b.cp_cached;
+    o.gp = g_plc_rec.gp - ready.gp; o.gp_cached = g_plc_rec.gp_cached - ready.gp_cached;
+    o.cp = g_plc_rec.cp - ready.cp; o.cp_cached = g_plc_rec.cp_cached - ready.cp_cached;
     return o;
 }
 
@@ -9344,8 +9346,9 @@ static void c89_midrun_save(const char *sdir) {
     // ⑩ 两个线程同时建管线，局中写盘与建管线并行
     char d10[600]; snprintf(d10, sizeof d10, "%s/c10", root); CHECK(mkdir(d10, 0700) == 0, "C89 建不出 c10");
     g_plc_extra = 0; g_plc_per_pipe = 16;   // 驱动数据随管线数变大（每条 +16 字节）→ 每次触发都比上次大，写盘一直在发生
-    g_plc_pipe_base = g_plc_rec.gp + g_plc_rec.cp;
     CHECK(c89_open(d10, 2, 0, 0), "C89 ⑩ open");
+    // 人工大小只随这两线程要建的 84 条游戏管线变化，不计 open 期间的内部管线。
+    g_plc_pipe_base = g_plc_rec.gp + g_plc_rec.cp;
     struct c89_st b10 = c89_stats();
     nvn_gpu_shader vsa = NULL, fsa = NULL, vsb = NULL, fsb = NULL; void *ma[4] = {0};
     int l10 = load_shader_pair(sdir, "tri3.vert", "out1_green.frag", NULL, NULL, &vsa, &fsa, &ma[0], &ma[1]) &&

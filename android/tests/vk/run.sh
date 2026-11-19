@@ -721,9 +721,9 @@ if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
     if [ "$mode" = "--gpu-deswizzle-neg-barrier" ]; then
         grep -q 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/gpu-deswizzle-negative.log" || { echo '【红】移除屏障没有被同步校验拦住'; exit 1; }
     else
-        [ "$rc" -ne 0 ] && grep -q 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" || { echo "【红】几何变异未在字节断言处变红（rc=$rc）"; tail -25 "$out/gpu-deswizzle-negative.log"; exit 1; }
+        [ "$rc" -ne 0 ] && grep -q 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" || { echo "【红】几何变异未在字节断言处变红（rc=${rc}）"; tail -25 "$out/gpu-deswizzle-negative.log"; exit 1; }
     fi
-    echo "【绿】$mode 触发预期负控（rc=$rc）"; exit 0
+    echo "【绿】$mode 触发预期负控（rc=${rc}）"; exit 0
 fi
 
 if [ "$mode" = "--gpu-deswizzle" ]; then
