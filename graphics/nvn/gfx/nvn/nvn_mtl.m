@@ -19093,6 +19093,7 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
     if (out) memset(out, 0, sizeof *out);
     return 0;
 }
+void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd c, uint32_t readers, uint32_t writers) { (void)c; (void)readers; (void)writers; }
 void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers) { (void)c; (void)producers; (void)consumers; }
 void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers) { (void)c; (void)consumers; } // Metal 自动冒险跟踪 / 编码器栅栏。
 void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers) {

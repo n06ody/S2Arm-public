@@ -13,6 +13,7 @@ static id<MTLRenderPipelineState> color_pipeline;
 static __typeof__(&nvn_gpu_compute_to_graphics) publish_compute;
 static __typeof__(&nvn_gpu_transfer_to_graphics) publish_transfer;
 static __typeof__(&nvn_gpu_graphics_to_graphics) publish_graphics;
+static __typeof__(&nvn_gpu_graphics_read_to_write) publish_graphics_war;
 
 // Resolve the actual production exports: a missing contract entry must fail an
 // assertion at runtime, not stop at a link error. Types and names come from the
@@ -25,12 +26,14 @@ static void contract_entries(void) {
     publish_compute=LOAD(nvn_gpu_compute_to_graphics);
     publish_transfer=LOAD(nvn_gpu_transfer_to_graphics);
     publish_graphics=LOAD(nvn_gpu_graphics_to_graphics);
+    publish_graphics_war=LOAD(nvn_gpu_graphics_read_to_write);
 #undef LOAD
     CHECK(buf_span!=NULL,"Metal exports nvn_gpu_buf_access_span");
     CHECK(view_span!=NULL,"Metal exports nvn_gpu_view_access_span");
     CHECK(publish_compute!=NULL,"Metal exports nvn_gpu_compute_to_graphics");
     CHECK(publish_transfer!=NULL,"Metal exports nvn_gpu_transfer_to_graphics");
     CHECK(publish_graphics!=NULL,"Metal exports nvn_gpu_graphics_to_graphics");
+    CHECK(publish_graphics_war!=NULL,"Metal exports nvn_gpu_graphics_read_to_write");
     // The legacy Metal replay cannot construct these opaque contract handles.
     // Unknown is 0, never a fabricated identity/success; clear stale output.
     nvn_gpu_access_span span; unsigned char zero[sizeof span]={0};
@@ -60,6 +63,7 @@ static void color(id<MTLTexture> target,id<MTLBuffer> data) {
     if(publish_compute) publish_compute(NULL, NVN_GPU_CGR_ALL);
     if(publish_transfer) publish_transfer(NULL, NVN_GPU_CGR_ALL);
     if(publish_graphics) publish_graphics(NULL, NVN_GPU_GFX_SRC_ALL, NVN_GPU_CGR_ALL);
+    if(publish_graphics_war) publish_graphics_war(NULL, NVN_GPU_GFX_SRC_ALL, NVN_GPU_GFX_SRC_ALL);
     CHECK(g_cb==cb && g_blit==blit && g_fence==fence && g_bar_full==full,"contract hook does not cut or submit the Metal command stream");
     MTL4RenderPassDescriptor *d=pass_desc();
     d.colorAttachments[0].texture=target;

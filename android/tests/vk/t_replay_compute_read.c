@@ -45,6 +45,13 @@ static nvn_gpu_shader shader(const char *dir,const char *name,nvn_gpu_stage stag
  nvn_gpu_shader_src s={0};s.stage=stage;s.kind=NVN_GPU_BLOB_SPIRV;s.entry="main";s.blob=data;s.bytes=(size_t)n;s.layout=layout;
  nvn_gpu_shader h=NULL;GPU(nvn_gpu_shader_load(&s,&h,&err));free(data);return h;
 }
+// Force an unknown lifetime identity without inventing one; all other queries use the real backend.
+extern __typeof__(nvn_gpu_buf_access_span) __real_nvn_gpu_buf_access_span;
+int __wrap_nvn_gpu_buf_access_span(nvn_gpu_buf b,uint64_t off,uint64_t bytes,nvn_gpu_access_span *out){
+ if(getenv("S2A_GFX_UNKNOWN_READ") && off==256){if(out)memset(out,0,sizeof *out);return 0;}
+ return __real_nvn_gpu_buf_access_span(b,off,bytes,out);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_nvn_gpu_buf_access_span), __typeof__(&nvn_gpu_buf_access_span)), "buffer access span signature");
 // 受控替身：程序来源、通道、池登记。镜像分配、GPU 写区间排除、地址解析、派发与 Vulkan 都是真的。
 int g_s2a_logfd=2,s2a_nvn_rast_flip;
 static alignas(4096) unsigned char guest[4096];
@@ -184,6 +191,7 @@ VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,c
   for(uint32_t i=0;i<ci->dependencyCount;i++){
    VkSubpassDependency dep=deps[i];
    if(getenv("S2A_CGR_REMOVE_INCOMING") && dep.srcSubpass==VK_SUBPASS_EXTERNAL)continue;
+   if(getenv("S2A_CGR_REMOVE_OUTGOING") && dep.dstSubpass==VK_SUBPASS_EXTERNAL)continue;
    if(dep.srcStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
    if(dep.dstStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
    deps[used++]=dep;
@@ -209,7 +217,8 @@ static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
 static PFN_vkCmdEndRenderPass real_end_pass;
-static unsigned gfx_injected, gfx_published, gfx_omitted, gfx_full, gfx_full_omitted;
+static unsigned gfx_injected, gfx_published, gfx_omitted, gfx_full, gfx_full_omitted, gfx_exec, gfx_exec_omitted;
+static VkPipelineStageFlags gfx_exec_src, gfx_exec_dst;
 static VkPipelineStageFlags gfx_src_stages, gfx_dst_stages;
 static VkAccessFlags gfx_src_access, gfx_dst_access;
 static PFN_vkCmdUpdateBuffer real_update;
@@ -241,6 +250,13 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
  nbar++;
  if(getenv("S2A_GFX_ACCESS_MODE") && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && (s==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || s==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)){gfx_published++;gfx_src_stages|=s;gfx_dst_stages|=t;gfx_src_access|=m[0].srcAccessMask;gfx_dst_access|=m[0].dstAccessMask;}
  if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){ REQUIRE(mirror_barriers<8); mirror_barrier_cb=cb; mirror_stages[mirror_barriers++]=t; mirror_dst_stages |= t; mirror_dst_access |= m[0].dstAccessMask; }
+ const char *hazard=getenv("S2A_GFX_HAZARD");
+ if(hazard && !strcmp(hazard,"WAR") && ndraw==1 && nm==1 && !m[0].srcAccessMask && !m[0].dstAccessMask &&
+    (s==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || s==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) &&
+    (t==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || t==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)){
+  gfx_exec++;gfx_exec_src=s;gfx_exec_dst=t;const char *mode=getenv("S2A_GFX_ACCESS_MODE");int v=mode?atoi(mode):0;
+  if(v==5 || v==6){gfx_exec_omitted++;real_barrier(cb,v==5?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:s,v==6?VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:t,f,nm,m,nb,b,ni,im);return;}
+ }
  const char *gfx_mode=getenv("S2A_GFX_ACCESS_MODE");int gm=gfx_mode?atoi(gfx_mode):0;
  if((gm==5 || gm==6) && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && (s==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT || s==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)){
   VkMemoryBarrier changed=m[0];if(gm==5)changed.srcAccessMask=0;else changed.dstAccessMask=0;gfx_omitted++;
@@ -310,7 +326,8 @@ static void VKAPI_CALL gfx_end_pass(VkCommandBuffer cb){
  const char *src=getenv("S2A_GFX_ACCESS_SOURCE"),*dst=getenv("S2A_GFX_ACCESS_DEST");
  VkPipelineStageFlags source=src&&!strcmp(src,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
  VkPipelineStageFlags target=dst&&!strcmp(dst,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
- VkMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=m==2?0:VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=m==3?0:(getenv("S2A_GFX_HAZARD")?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_SHADER_READ_BIT)};
+ const char *hazard=getenv("S2A_GFX_HAZARD");int war=hazard&&!strcmp(hazard,"WAR");
+ VkMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=(m==2 || war)?0:VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=(m==3 || war)?0:(hazard?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_SHADER_READ_BIT)};
  vkCmdPipelineBarrier(cb,m==2?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:source,m==3?VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:target,0,1,&b,0,NULL,0,NULL);gfx_injected++;
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(&gfx_end_pass), PFN_vkCmdEndRenderPass), "vkCmdEndRenderPass signature");
