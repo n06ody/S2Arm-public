@@ -37,6 +37,7 @@ struct rp_tex {
     const void *span;          // 跟踪区间句柄（nvn_dirty_span）：NULL = 这段内存没被写跟踪，只能每次保守查
     const void *log_span; uint64_t log_id, log_cur;   // 脏页日志游标（tex_log_arm 起；log_ok 为 0 时不用）
     const uint8_t *mem; uint64_t size;
+    uint8_t *diag_prev; uint64_t diag_bytes, diag_version;   // 仅诊断开关开启时保存整份原始字节
 };
 // 同存储共用表的键：内存池 + 偏移 + 描述（去掉只表示用途、不影响存储布局的标志）
 typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;
@@ -68,6 +69,70 @@ static nvn_hmap g_pool_gpu = {.klen = 8};                   // GPU 写过的内�
 static uint64_t g_ser_gen = 1;                              // 任何「序号 → 存储」映射变了就 +1：各贴图号缓存的视图据此重验
 static uint64_t g_tex_uid;                                  // rp_tex 创建序号（只增、会话重置也不清）
 static int g_built; static uint64_t g_uploads, g_alias_taken, g_alias_dead;   // g_alias_taken：被新贴图占了存储而出表的共用存储数；g_alias_dead：其中还有对象指着的
+
+static int tex_window(const tex_t *t, uint64_t *lo, uint64_t *hi);
+const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);
+
+// 诊断只比较完整、被写跟踪保护的快照；未知不能计作相同。原始布局含 padding，变化不等同于可见像素变化。
+enum { TEXDIAG_ONE_MAX = 8 * 1024 * 1024, TEXDIAG_TOTAL_MAX = 64 * 1024 * 1024 };
+static int g_texdiag_on = -1;
+static uint64_t g_texdiag_live;
+static uint64_t g_texdiag_events, g_texdiag_first, g_texdiag_same, g_texdiag_changed, g_texdiag_initial, g_texdiag_unknown;
+typedef struct { uint8_t *copy; const void *span; uint64_t stamp, map, bytes, wlo, whi; const char *unknown; } texdiag_sample;
+static void texdiag_drop(struct rp_tex *x) {
+    if (x->diag_prev) { g_texdiag_live -= x->diag_bytes; free(x->diag_prev); }
+    x->diag_prev = NULL; x->diag_bytes = 0;
+}
+static int texdiag_armed(const void *span, const uint8_t *mem, uint64_t bytes) {
+    size_t page = nvn_dirty_page_size(); uintptr_t p = (uintptr_t)mem, end;
+    if (!span || !page || !bytes || bytes > UINTPTR_MAX - p) return 0;
+    end = p + (uintptr_t)bytes;
+    while (p < end) {
+        if (!nvn_dirty_page_armed(span, (const void *)p)) return 0;
+        uintptr_t step = page - p % page; if (step >= end - p) break; p += step;
+    }
+    return 1;
+}
+static int texdiag_stable(const texdiag_sample *s, const tex_t *t) {
+    return s->span && !nvn_dirty_tracking_unreliable() && s->map == nvn_dirty_mapping_generation() &&
+           !nvn_dirty_since(t->mem + s->wlo, (size_t)(s->whi - s->wlo), s->stamp) && texdiag_armed(s->span, t->mem + s->wlo, s->whi - s->wlo);
+}
+static texdiag_sample texdiag_begin(const tex_t *t) {
+    texdiag_sample s = {0}; s.bytes = t->L.size; tex_window(t, &s.wlo, &s.whi);   // 跟踪与挂起查询只罩池内窗口（同上传）
+    if (rp_buf_gpu_pending((uint64_t)(uintptr_t)(t->mem + s.wlo), s.whi - s.wlo)) { s.unknown = "unknown_gpu_pending"; return s; }
+    if (!s.bytes || s.bytes > TEXDIAG_ONE_MAX || s.bytes > TEXDIAG_TOTAL_MAX - g_texdiag_live) { s.unknown = "unknown_limit"; return s; }
+    s.map = nvn_dirty_mapping_generation(); nvn_dirty_protect(t->mem + s.wlo, (size_t)(s.whi - s.wlo));
+    s.stamp = nvn_dirty_now(); s.span = nvn_dirty_span(t->mem + s.wlo, (size_t)(s.whi - s.wlo));
+    if (!s.span || nvn_dirty_tracking_unreliable()) { s.unknown = "unknown_untracked"; return s; }
+    if (!texdiag_stable(&s, t)) { s.unknown = "unknown_race"; return s; }
+    uint8_t *part = NULL; const uint8_t *src = rp_tex_src(t, &part);   // 快照按上传的同一份源：池内实读、池外为 0
+    if (!src) { s.unknown = "unknown_alloc"; return s; }
+    s.copy = part ? part : malloc((size_t)s.bytes);
+    if (!s.copy) { free(part); s.unknown = "unknown_alloc"; return s; }
+    if (!part) memcpy(s.copy, src, (size_t)s.bytes);
+    g_texdiag_live += s.bytes;
+    return s;
+}
+static void texdiag_end(texdiag_sample *s, const tex_t *t, struct rp_tex *x, int first, const char *trigger, int success) {
+    const char *state = s->unknown;
+    if (!success) state = "unknown_upload";
+    else if (!state && rp_buf_gpu_pending((uint64_t)(uintptr_t)(t->mem + s->wlo), s->whi - s->wlo)) state = "unknown_gpu_pending";
+    else if (!state && !texdiag_stable(s, t)) state = "unknown_race";
+    if (!state) {
+        if (!x->diag_prev) { state = "initial"; x->diag_version++; }
+        else if (x->diag_bytes == s->bytes && !memcmp(x->diag_prev, s->copy, (size_t)s->bytes)) state = "same";
+        else { state = "changed"; x->diag_version++; }
+        texdiag_drop(x); x->diag_prev = s->copy; x->diag_bytes = s->bytes; s->copy = NULL;
+    } else texdiag_drop(x);
+    if (s->copy) { g_texdiag_live -= s->bytes; free(s->copy); }
+    g_texdiag_events++; g_texdiag_first += !!first;
+    if (!strcmp(state, "same")) g_texdiag_same++; else if (!strcmp(state, "changed")) g_texdiag_changed++;
+    else if (!strcmp(state, "initial")) g_texdiag_initial++; else g_texdiag_unknown++;
+    char line[256]; snprintf(line, sizeof line, "seq=%llu resource=%llu kind=%s state=%s trigger=%s version=%llu raw_bytes=%llu",
+        (unsigned long long)g_texdiag_events, (unsigned long long)x->uid, first ? "first" : "repeat", state, trigger,
+        (unsigned long long)x->diag_version, (unsigned long long)s->bytes);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "tex-reupload", line);
+}
 
 // 声明类型的零贴图与默认视图：会话内共用，不参与视图环淘汰。
 static struct { nvn_gpu_tex tex; nvn_gpu_view view; } g_zero[NVN_TEXTURE_TARGET_BUFFER + 1][4];
@@ -497,7 +562,7 @@ static void vf_drop_of(const struct rp_tex *x);   // 按目标取视图的表里
 static void tex_unref(struct rp_tex *x) {
     if (--x->users > 0 || x->in_alias) return;   // 共用表里的存储由表持有：池销毁时才放（nvn_be_alias_drop_pool）
     vf_drop_of(x);   // 视图表按存储认视图：存储放掉之前，它名下的视图一并放（序号销毁时不再放，见 g_vf 一节）
-    nvn_gpu_tex_release(x->g); g_built--; free(x);
+    nvn_gpu_tex_release(x->g); g_built--; texdiag_drop(x); free(x);
 }
 
 // 新的共用存储占了同一段池内存时，放掉被它盖住的旧条目。照 iOS nvn_mtl.m 的 alias_take_over，两条规则：
@@ -547,7 +612,7 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
             nvn_hm_del(&g_alias, &k);   // 删除会挪动别的格：从头再扫
             vf_drop_of(x);
             for (int r = 0; r < g_ntreg; r++) if (g_treg[r].of == x) treg_drop_view(&g_treg[r]);
-            nvn_gpu_tex_release(x->g); g_built--; free(x); g_ser_gen++; g_alias_taken++;
+            nvn_gpu_tex_release(x->g); g_built--; texdiag_drop(x); free(x); g_ser_gen++; g_alias_taken++;
             again = 1; break;
         }
     }
@@ -614,10 +679,16 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             x->span = nvn_dirty_span(t->mem + wlo, whi - wlo);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
             if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
+                if (g_texdiag_on < 0) g_texdiag_on = nvn_plat_flag("nvk_tex_reupload_diag", 0) != 0;
+                const int diag = xc && g_texdiag_on, first = !x->uploaded;
+                const char *trigger = NULL; texdiag_sample sample = {0};
+                if (diag) { trigger = first ? "first" : x->check_dirty ? "retry" : !x->span ? "untracked" : nvn_dirty_tracking_unreliable() ? "unreliable" : "dirty"; sample = texdiag_begin(t); }
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
                 int ur = xc && pr < 0 ? upload_all(t, x, xc, 1) : 0;
+                int success = xc && (pr == 0 || (pr < 0 && ur == 0));
+                if (diag) texdiag_end(&sample, t, x, first, trigger, success);   // 先收尾：回收快照、记事件（-2 延迟也按 unknown_upload 记）
                 if (ur == -2) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
-                if (xc && (pr == 0 || (pr < 0 && ur == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
+                if (success) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
         }
@@ -769,7 +840,7 @@ void nvn_be_alias_drop_pool(const void *pool) {
         for (uint32_t i = 0; i < g_alias.cap; i++) { if (!g_alias.vals[i]) continue;
             alias_key k; memcpy(&k, g_alias.keys + (size_t)i * sizeof k, sizeof k); if (k.pool != pk) continue;
             struct rp_tex *x = nvn_hm_del(&g_alias, &k); x->in_alias = 0;
-            if (x->users <= 0) { vf_drop_of(x); nvn_gpu_tex_release(x->g); g_built--; free(x); }
+            if (x->users <= 0) { vf_drop_of(x); nvn_gpu_tex_release(x->g); g_built--; texdiag_drop(x); free(x); }
             again = 1; break; } }   // 删除会挪表项：从头再扫
     g_ser_gen++;
     pthread_mutex_unlock(&g_rmu);
@@ -1175,11 +1246,18 @@ void rp_res_reset(void) {
         if (dup) continue;
         if (n == cap) { cap = cap ? cap * 2 : 64; all = realloc(all, (size_t)cap * sizeof *all); }
         all[n++] = x; }
-    for (int j = 0; j < n; j++) { nvn_gpu_tex_release(all[j]->g); free(all[j]); }
+    for (int j = 0; j < n; j++) { nvn_gpu_tex_release(all[j]->g); texdiag_drop(all[j]); free(all[j]); }
     free(all);
     nvn_hmap *clr[4] = {&g_by_serial, &g_alias, &g_cpu_ser, &g_pool_gpu};
     for (int k = 0; k < 4; k++) { uint32_t kl = clr[k]->klen; free(clr[k]->keys); free(clr[k]->vals); nvn_hm_init(clr[k], kl); }
-    g_built = 0; g_ser_gen++;
+    if (g_texdiag_on == 1 && g_texdiag_events) {
+        char line[256]; snprintf(line, sizeof line, "events=%llu first=%llu repeat=%llu initial=%llu same=%llu changed=%llu unknown=%llu",
+            (unsigned long long)g_texdiag_events, (unsigned long long)g_texdiag_first, (unsigned long long)(g_texdiag_events - g_texdiag_first),
+            (unsigned long long)g_texdiag_initial, (unsigned long long)g_texdiag_same, (unsigned long long)g_texdiag_changed, (unsigned long long)g_texdiag_unknown);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "tex-reupload-summary", line);
+    }
+    g_texdiag_events = g_texdiag_first = g_texdiag_same = g_texdiag_changed = g_texdiag_initial = g_texdiag_unknown = 0;
+    g_built = 0; g_ser_gen++; g_texdiag_on = -1;
     pthread_mutex_unlock(&g_rmu);
 }
 
