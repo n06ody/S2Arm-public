@@ -14,6 +14,14 @@
 #undef main
 #include <stdio.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+static size_t heap_in_use(void) { malloc_statistics_t s; malloc_zone_statistics(malloc_default_zone(), &s); return s.size_in_use; }
+#else
+#include <malloc.h>
+static size_t heap_in_use(void) { return (size_t)mallinfo2().uordblks; }
+#endif
+#include <sys/wait.h>
 #include <unistd.h>
 
 // 负对照开关：环境变量 T_NVN_RES_FLAGS_OFF=1 把三个省重开关都关掉（走改动前的旧行为）。
@@ -355,14 +363,84 @@ static void t_res_tex_before_pool(void) {
     munmap(m, 3 * pg);
 }
 
+// GPU 后端替身在入口内复制原始字节，再由 CPU 参考解排；两路均逐字对照手算 GOB。
+// 池首和池尾各放一页 PROT_NONE，子进程让越界访问变成有名断言，而非中止整套。
+static void t_res_tex_window_gpu_child(int tail) {
+    int fail0 = g_fail; nvn_be_sub_begin(); res_fresh();
+    const size_t pg = (size_t)getpagesize();
+    uint8_t *m = mmap(NULL, 3 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    CHECK(m != MAP_FAILED); if (m == MAP_FAILED) _exit(2);
+    CHECK(mprotect(m, pg, PROT_NONE) == 0 && mprotect(m + 2 * pg, pg, PROT_NONE) == 0);
+    pool_t pool = {0}; pool.mem = m + pg; pool.size = pg; pool.flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    for (size_t i = 0; i < pg; i++) pool.mem[i] = pool_byte(i);
+    tex_t a = mk_tex(7310 + (unsigned)tail * 2, 0, NVN_FORMAT_RGBA8, 16, 8, 1, 0);
+    a.pool = &pool; a.off = tail ? (int64_t)pg - 256 : -1; a.mem = pool.mem + a.off; a.has_layout = 1;
+    CHECK(a.L.size == 512); g_window_capture = 1; g_caps_extra &= ~NVN_GPU_CAP_GPU_DESWIZZLE;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_nup == 1);
+    uint8_t cpu[512], expected[512]; memcpy(cpu, g_window_linear, sizeof cpu);
+    for (unsigned y = 0; y < 8; y++) for (unsigned x = 0; x < 64; x++) {
+        uint64_t s = (x / 32) * 256 + (y / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16;
+        expected[y * 64 + x] = tail ? (s < 256 ? pool_byte(pg - 256 + s) : 0) : store_byte(s);
+    }
+    CHECK(!memcmp(cpu, expected, sizeof cpu)); nvn_be_tex_release(&a);
+    res_fresh(); a.serial++; g_block_uploads = 0; g_caps_extra |= NVN_GPU_CAP_GPU_DESWIZZLE;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_block_uploads == 1 && g_nup == 0);
+    uint8_t decoded[512]; CHECK(!nvn_deswizzle(&a.d, 0, 0, g_window_raw, decoded, 64));
+    CHECK(!memcmp(decoded, expected, sizeof decoded)); CHECK(!memcmp(decoded, cpu, sizeof decoded));
+    CHECK(g_prot_addr == pool.mem + (tail ? pg - 256 : 0) && g_prot_len == (tail ? 256 : 511));
+    /* 在途 GPU 写落在池内窗口 → -2 延迟重试，不拿旧快照上传；按全长区间查会漏检（rp_pool_find 要求整段在池）。落地后窗口源照传 */
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    res_fresh(); a.serial++; g_block_uploads = 0; g_nup = 0; g_buf_cpu_auto = 1;
+    nvn_be_pool_add(pool.mem, pg);
+    nvn_gpu_buf mirror = NULL; uint64_t key = 0;
+    CHECK(rp_buf_resolve(&g_fake_cmd, (uint64_t)(uintptr_t)pool.mem, pg, &mirror, NULL) && mirror && mirror->cpu);
+    uint64_t gwid = rp_buf_gpu_write_note((uint64_t)(uintptr_t)pool.mem + (tail ? pg - 128 : 64), 64, &key);
+    CHECK(gwid != 0);
+    int un0 = nvn_unimpl_count("tex", "gpu_deswizzle_pending_pool_write");
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) == NULL && g_block_uploads == 0 && g_nup == 0);
+    CHECK(nvn_unimpl_count("tex", "gpu_deswizzle_pending_pool_write") == (uint64_t)un0 + 1);
+    /* B1：-2 路径不取窗口副本、不动日志游标：连拒多次堆内存不涨（旧实现每次重试泄一份 L.size 副本） */
+    size_t h0 = heap_in_use();
+    for (int i = 0; i < 8; i++) CHECK(rp_tex_resolve(&a, &g_fake_cmd) == NULL && g_block_uploads == 0);
+    CHECK(heap_in_use() - h0 < 512);
+    if (gwid) rp_buf_gpu_write_land(key, gwid, 1);
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_block_uploads == 1);
+    nvn_be_tex_release(&a); nvn_be_pool_del(pool.mem); g_buf_cpu_auto = 0;
+    /* 诊断开：快照取与上传同一份窗口源（池外为 0），跟踪 / 保护只罩池内窗口；快照内容不变 / 变各验一档 */
+    res_fresh(); a.serial++; g_block_uploads = 0; g_flag_tdiag = 1; g_tdiag_n = 0; g_block_mem = pool.mem; g_span_len = pg; g_prot_n = 0;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 1 && strstr(g_tdiag_lines[0], "kind=first state=initial") && strstr(g_tdiag_lines[0], "raw_bytes=512"));
+    for (int i = 0; i < g_prot_n && i < 8; i++) CHECK((uintptr_t)g_prot_log[i] >= (uintptr_t)pool.mem && (uintptr_t)g_prot_log[i] + g_prot_llen[i] <= (uintptr_t)pool.mem + pg);   // 保护只罩池内窗口
+    const size_t dirty_pg = tail ? pg / PG - 1 : 0;   // 窗口覆盖的跟踪页（夹具页粒度 PG，系统页可以更大）
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2; g_block_gen[dirty_pg] = g_dirty_written;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 2 && strstr(g_tdiag_lines[1], "state=same"));
+    pool.mem[tail ? pg - 1 : 0] ^= 0xff; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2; g_block_gen[dirty_pg] = g_dirty_written;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 3 && strstr(g_tdiag_lines[2], "state=changed"));
+    g_flag_tdiag = 0; g_block_mem = NULL; g_span_len = BLOCK_TEST_PAGES * PG;
+    nvn_be_tex_release(&a); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); munmap(m, 3 * pg);
+    printf("GPU_WINDOW %s: CPU/GPU-contract bytes=512 failures=%d\n", tail ? "tail" : "before", g_fail - fail0); fflush(stdout);
+    _exit(g_fail != fail0);
+}
+static void t_res_tex_window_gpu(void) {
+    for (int tail = 0; tail < 2; tail++) {
+        pid_t child = fork(); CHECK(child >= 0); if (child < 0) continue;
+        if (!child) t_res_tex_window_gpu_child(tail);
+        int status = 0; CHECK(waitpid(child, &status, 0) == child);
+        if (WIFSIGNALED(status)) printf("GPU_WINDOW %s source access signal=%d\n", tail ? "tail" : "before", WTERMSIG(status));
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
+    if (argc > 1 && !strcmp(argv[1], "--gpu-window")) { t_res_tex_window_gpu(); return g_fail ? 1 : 0; }
     t_res_tex_epoch();
     t_res_tex_epoch_unrelated();
     t_res_tex_unarmed();
     t_res_bind_fast();
     t_res_pipe_layout();
     t_res_tex_before_pool();
+    t_res_tex_window_gpu();
     printf("t_nvn_res：%d 项检查，%d 项红\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
