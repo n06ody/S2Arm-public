@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) buffer Args {uint w[];} args;
+layout(push_constant) uniform Values {uint idx;uint value;} v;
+void main(){args.w[v.idx]=v.value;}

@@ -34,6 +34,7 @@ native-test-nvn_res:
 	$(CC) $(CFLAGS) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -I. -Igraphics/nvn/gfx/nvn -Igraphics/nvn/gfx/nvn/include -Igraphics/nvn/gfx/tex -I$(NVN_REPLAY_DIR) \
 	  -o $(BUILD)/tests/t_nvn_res graphics/nvn/tests/t_nvn_res.c graphics/nvn/tests/nvn_clear_view_unused.c $(NVN_REPLAY_CORE) $(NVN_REPLAY_WEAK) -lm
 	timeout 30 $(BUILD)/tests/t_nvn_res
+	timeout 30 $(BUILD)/tests/t_nvn_res --dirtylog-off   # 开关 nvk_buf_dirtylog 关：贴图核对走整张逐页比（同修前）
 	@echo '✓ t_nvn_res：贴图内容按纪元只查一次（换段重查 / 写后重传 / WriteTexels 强制作废）/ 连续同参数绘制第二笔整组沿用 / 驱动段暂存按内容命中 / 换管线按布局立脏'
 TEST_TARGETS += native-test-nvn_res
 

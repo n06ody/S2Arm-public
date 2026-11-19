@@ -239,9 +239,11 @@ struct nvn_gpu_cmd_s {
     uint16_t feedback_read_mask; // 颜色 bit0..7、深度模板物理附件 bit8：本物理通道 LOAD / NONE
     int recording;
     int in_pass;
-    // 上一道全屏障之后录过「缓冲作目标」的传输：传输只在开头带屏障，绘制有渲染通道开头的外部依赖兜着，
-    // 计算派发没有，所以派发前按它补一道（开段置 1：前置段 / 上一段的传输写，段末那道屏障只对主机可见）
+    // 0 = 无待处理的缓冲传输；1 = 跨段或期间有未知设备操作，保守全屏障；
+    // 2 = 上次全发布之后只有本段缓冲传输。开段置 1：前置 / 上一段传输写，段末屏障只对主机可见。
     int xfer_dirty;
+    int narrow_barrier;                 // 本段 A/B 开关，缺省开启
+    int xfer_pending_graphics;          // 传输写已发布给计算，尚未发布给图形
     nvn_gpu_rc sticky;
     char why[192];
     struct vk_ref *refs;
@@ -332,6 +334,7 @@ static void es_reset(struct nvn_gpu_cmd_s *c) { memset(&c->es, 0, sizeof c->es);
 
 struct nvn_gpu_vk {
     struct s2a_vk_device *dev;
+    int pass_dep_narrow;  // 会话内固定，模板与实际通道必须使用相同的依赖
     struct nvn_vk_bcdec *bc;
     VkDevice d;
     VkPhysicalDevice phys;
@@ -2070,6 +2073,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.pass_dep_narrow = nvn_plat_flag("nvk_pass_dep_narrow", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
         static int mt_on = -1; if (mt_on < 0) mt_on = nvn_plat_flag("nvk_mem_types", 0) != 0;
@@ -2528,9 +2532,13 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
     vkCmdPipelineBarrier(c->cb, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
-    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+    // 只有确认上次全发布后仅录过缓冲传输时才收窄源；保留全目标以覆盖后续任意消费者。
+    VkPipelineStageFlags src = c->narrow_barrier && c->xfer_dirty == 2 && !c->xfer_pending_graphics ?
+        VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     c->xfer_dirty = 0;
+    c->xfer_pending_graphics = 0;
 }
 
 
@@ -2558,7 +2566,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     full_barrier(c);
     VkBufferCopy bc = {sl.off, off, bytes};
     vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, 1, &bc);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写；只在无其他设备操作时可收窄
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
@@ -2577,7 +2585,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     if (bytes == 0) return;
     full_barrier(c);
     vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
@@ -2596,11 +2604,42 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
     vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc);
-    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
+    c->xfer_dirty = 2;   // 紧跟全屏障的缓冲传输写
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
+    pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
+    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
+    if (!ch || !n) return;
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!v[i].src || !v[i].dst || !buf_range(v[i].src, v[i].soff, v[i].bytes) || !buf_range(v[i].dst, v[i].doff, v[i].bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段越界", i); return; }
+        if (!v[i].bytes || (v[i].bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段长度 %llu 不是 4 的正整数倍", i, (unsigned long long)v[i].bytes); return; }
+    }
+    VkPipelineStageFlags dst = 0;
+    if (stages & 1u << NVN_GPU_SH_VS) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & 1u << NVN_GPU_SH_FS) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if ((stages & 1u << NVN_GPU_SH_GS) && g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    if (!dst) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 没给读的阶段（stages=%#x）", stages); return; }
+    // 源可能刚被计算 / 传输 / 图形写过（GPU 写出的间接记录、主段里的镜像同步），目标是本段新分的暂存：一道屏障盖住两者
+    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    enum { RUN = 64 }; VkBufferCopy r[RUN];
+    for (uint32_t i = 0; i < n;) {
+        struct nvn_gpu_buf_s *s = v[i].src, *d = v[i].dst; uint32_t k = 0;
+        while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
+        vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
+        cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
+    }
+    mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
+    pthread_mutex_lock(&g_mu);
+    g.stats[STAT_COPIES] += n;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -3071,6 +3110,28 @@ void nvn_gpu_shader_release(nvn_gpu_shader sh) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// 管线模板与实际通道必须使用兼容的依赖。纯颜色附件的最终存回在 COLOR_ATTACHMENT_OUTPUT；
+// 它在图形阶段序列中晚于 LATE_FRAGMENT_TESTS，也保留之前阶段的执行顺序。其他形状保守不变。
+static void pass_dependencies(VkSubpassDependency dep[2], int has_color, int has_depth) {
+    memset(dep, 0, 2 * sizeof *dep);
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    if (g.pass_dep_narrow && has_color && !has_depth) {
+        dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+}
+
 static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     VkAttachmentDescription att[9];
     VkAttachmentReference col[8];
@@ -3124,19 +3185,7 @@ static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     sp.pColorAttachments = ncol ? col : NULL;
     sp.pDepthStencilAttachment = has_depth ? &dref : NULL;
     VkSubpassDependency dep[2];
-    memset(dep, 0, sizeof dep);
-    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep[0].dstSubpass = 0;
-    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[1].srcSubpass = 0;
-    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    pass_dependencies(dep, natt > (uint32_t)has_depth, has_depth);
     VkRenderPassCreateInfo rp;
     memset(&rp, 0, sizeof rp);
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -4482,19 +4531,7 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
     sp.pColorAttachments = ncol ? col : NULL;
     sp.pDepthStencilAttachment = *has_depth ? dref : NULL;
     VkSubpassDependency dep[2];
-    memset(dep, 0, sizeof dep);
-    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep[0].dstSubpass = 0;
-    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[1].srcSubpass = 0;
-    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    pass_dependencies(dep, a > (uint32_t)*has_depth, *has_depth);
     VkRenderPassCreateInfo rp;
     memset(&rp, 0, sizeof rp);
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -4671,6 +4708,13 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_begin 时已在通道里"); return; }
+    if (c->xfer_pending_graphics) {
+        // 前次只发布到计算；图形后续仍可能读取同一份传输写。
+        mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        c->xfer_pending_graphics = 0;
+    }
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // 通道有附件访问 / 图形读写，不再能只按传输作源
     struct timespec pbp_ts; clock_gettime(CLOCK_MONOTONIC, &pbp_ts);
     uint64_t pbp_t = (uint64_t)pbp_ts.tv_sec * 1000000000ull + (uint64_t)pbp_ts.tv_nsec;
 #define PBP_STEP(i) do { struct timespec z_; clock_gettime(CLOCK_MONOTONIC, &z_); uint64_t n_ = (uint64_t)z_.tv_sec * 1000000000ull + (uint64_t)z_.tv_nsec; pass_prof(i, pbp_t); pbp_t = n_; } while (0)
@@ -5616,13 +5660,23 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipe);
     // 之前录过缓冲作目标的传输（核心的池镜像同步、缓冲写 / 填 / 拷贝、贴图→缓冲）：契约说之后的读看到新值（nvn_backend.h buf_write），
     // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
-    if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
+    if (c->xfer_dirty && !g_test_no_xfer_bar) {
+        if (c->narrow_barrier && c->xfer_dirty == 2) {
+            VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            if (ind) dst |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+            mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dst, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            c->xfer_dirty = 0;
+            c->xfer_pending_graphics = 1;
+        } else full_barrier(c);
+    }
     if (ind) {
         vkCmdDispatchIndirect(c->cb, ind->buffer, off);
         cmd_ref(c, ind, REF_BUF);
     } else {
         vkCmdDispatch(c->cb, x, y, z);
     }
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // 测试钩子禁屏障时计算也可能写；不再能只用传输阶段
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
 
@@ -5711,6 +5765,8 @@ static VkAccessFlags layout_src_access(VkImageLayout l) {
 
 // 录一次布局迁移：本段内跟踪，段首一律按 GENERAL 算（见「图像布局」）
 static void image_barrier_from(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout from, VkImageLayout to) {
+    if (c->xfer_pending_graphics) full_barrier(c); // 布局迁移可能触及别名内存，先完成未发布的传输写
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1;
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -7138,16 +7194,24 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
                    (v->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? 2u : 0u) | (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT ? 4u : 0u);
     return out->storage && out->aspects;
 }
-void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch) {
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch, uint32_t consumers) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "计算写的可见性屏障必须在通道外"); return; }
-    VkPipelineStageFlags dst = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
-    mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst,
-        VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
-        VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    if (!consumers || (consumers & ~NVN_GPU_CGR_ALL)) { set_sticky(c, NVN_GPU_E_ARG, "计算写消费者范围无效"); return; }
+    VkPipelineStageFlags dst = 0; VkAccessFlags access = 0;
+    if (consumers & NVN_GPU_CGR_INDIRECT) { dst |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT; access |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT; }
+    if (consumers & NVN_GPU_CGR_INDEX) { dst |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT; access |= VK_ACCESS_INDEX_READ_BIT; }
+    if (consumers & NVN_GPU_CGR_VERTEX) { dst |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT; access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT; }
+    if (consumers & (NVN_GPU_CGR_VS_SHADER | NVN_GPU_CGR_VS_UNIFORM)) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (consumers & (NVN_GPU_CGR_FS_SHADER | NVN_GPU_CGR_FS_UNIFORM)) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (consumers & (NVN_GPU_CGR_GS_SHADER | NVN_GPU_CGR_GS_UNIFORM)) {
+        if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+        else if (consumers != NVN_GPU_CGR_ALL) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "计算写的几何消费者不可用"); return; }
+    }
+    if (consumers & (NVN_GPU_CGR_VS_SHADER | NVN_GPU_CGR_FS_SHADER | NVN_GPU_CGR_GS_SHADER)) access |= VK_ACCESS_SHADER_READ_BIT;
+    if (consumers & (NVN_GPU_CGR_VS_UNIFORM | NVN_GPU_CGR_FS_UNIFORM | NVN_GPU_CGR_GS_UNIFORM)) access |= VK_ACCESS_UNIFORM_READ_BIT;
+    mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst, access);
 }
 
 void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
@@ -7282,6 +7346,7 @@ void nvn_gpu_timestamp(nvn_gpu_cmd ch, uint32_t slot, uint32_t type) {
     }
     vkCmdWriteTimestamp(c->cb, type == NVN_COUNTER_TYPE_TIMESTAMP_TOP ?
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->report_ts, slot);
+    if (c->xfer_dirty == 2) c->xfer_dirty = 1; // BOTTOM 时间戳不属于传输阶段
     c->report_used |= UINT64_C(1) << slot;
     if (c->report_count <= slot) c->report_count = slot + 1;
 }
@@ -7344,6 +7409,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     }
     c->recording = 1;
     c->xfer_dirty = 1;   // 前置段 / 上一段的传输写：段末屏障只对主机可见，本段第一次派发前补一道
+    c->narrow_barrier = nvn_plat_flag("nvk_barrier_narrow", 1) != 0;
     c->sticky = rc(NVN_GPU_OK);
     c->q_active = -1;
     c->opt = nvn_plat_flag("nvk_opt_layout", 0) != 0;   // 附件 / 采样用对齐语义的布局（缺省 0 = 全 GENERAL 的旧行为）

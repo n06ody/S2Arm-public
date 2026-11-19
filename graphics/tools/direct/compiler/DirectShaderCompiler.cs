@@ -83,9 +83,9 @@ namespace S2A.DirectCompiler
             var allocator = new DirectAllocator(profile) { RequestKey = requestId };
             var accessors = new List<DirectGpuAccessor>();
             var translated = new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>();
-            using var context = new GpuContext(new ProfileOnlyRenderer(profile.Caps), new DirtyHacks(Array.Empty<ulong>()))
+            using var context = new GpuContext(new ProfileOnlyRenderer(profile.TranslationCaps), new DirtyHacks(Array.Empty<ulong>()))
             {
-                Capabilities = profile.Caps,
+                Capabilities = profile.TranslationCaps,
             };
             try
             {
@@ -96,6 +96,28 @@ namespace S2A.DirectCompiler
                     var accessor = new DirectGpuAccessor(profile, program, cs, 0, allocator, queries);
                     accessors.Add(accessor);
                     ShaderProgram shader = ShaderCache.DecodeComputeShader(accessor, TargetApi.Vulkan, 0).Translate();
+                    int limit = profile.Caps.MaximumComputeSharedMemorySize;
+                    if (shader.BinaryCode != null && program.Compute.SharedMemoryBytes > limit)
+                    {
+                        try
+                        {
+                            int shared = DirectSharedSpill.WorkgroupBytes(shader.BinaryCode);
+                            if (shared < 0 || shared > limit)
+                            {
+                                // 先量出要挪的字节数再占绑定号：Rewrite 用的就是这一号
+                                var pair = allocator.Spill("cs", 0);
+                                DirectSharedSpill.Result spill = DirectSharedSpill.Rewrite(shader.BinaryCode, limit, pair.SetIndex, pair.Binding)
+                                    ?? throw new DirectCompileException("UNSUPPORTED_PROGRAM", "workgroup memory could not be measured for spilling");
+                                allocator.Bindings[^1].SpillBytesPerGroup = spill.BytesPerGroup;
+                                shader = new ShaderProgram(shader.Info, shader.Language, spill.Spirv);
+                            }
+                        }
+                        catch (DirectCompileException e)
+                        {
+                            throw new DirectCompileException(e.Code, "cs: sharedMemoryBytes " + program.Compute.SharedMemoryBytes +
+                                " exceeds device compute shared memory limit " + limit + "; spill failed: " + e.Message);
+                        }
+                    }
                     translated.Add((cs, shader, accessor));
                 }
                 else
@@ -155,8 +177,8 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control local size contains zero");
             if ((ulong)x * y * z > 1024)
                 throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control local size exceeds 1024 invocations");
-            if (shared > 0x10000)
-                throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control shared memory exceeds 64 KiB");
+            if (shared > 48 * 1024)
+                throw new DirectCompileException("CONTROL_INVALID", stage.Stage + ": control shared memory exceeds 48 KiB");
             uint aligned = (shared + 15u) / 16u * 16u;
             if (x != (uint)facts.LocalSizeX || y != (uint)facts.LocalSizeY || z != (uint)facts.LocalSizeZ ||
                 aligned != (uint)facts.SharedMemoryBytes)
@@ -684,12 +706,18 @@ namespace S2A.DirectCompiler
                     if (program.Kind == "graphics")
                     {
                         // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
-                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 分析不出（非标准布局、多个 c0、下标取值界证不了）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 非常量下标按取值界记整段（boundDynamic）：证得够不着 0x644 所在的 vec4 才算不读。
                         var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
                         int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
-                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, boundDynamic: true);
                         writer.WritePropertyName("c0Reads");
                         WriteRanges(writer, stageReads);
+                        // 同一内容同时携带无动态定界的原始读集，运行时只选消费策略，不改变缓存身份。
+                        int[][] staticReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0ReadsStatic");
+                        WriteRanges(writer, staticReads);
                     }
                     writer.WriteEndObject();
                 }
@@ -708,6 +736,7 @@ namespace S2A.DirectCompiler
                     if (binding.SamplerSlot >= 0) writer.WriteNumber("samp_slot", binding.SamplerSlot);
                     if (binding.ConstSampler >= 0) writer.WriteNumber("constSampler", binding.ConstSampler);
                     if (binding.Pool != null) writer.WriteString("pool", binding.Pool);   // 整池数组（ResolvePoolSlots）：没有 slot，宿主按池建快照
+                    if (binding.Kind == "spill") writer.WriteNumber("bytesPerGroup", binding.SpillBytesPerGroup);
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段

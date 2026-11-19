@@ -57,6 +57,9 @@ internal static unsafe class Program
     private static ulong LopOr(int dest, int a, int b) =>
         0x5C40000000000000UL | (7UL << 48) | (1UL << 41) | ((ulong)b << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     // LOP32I.OR Rd, Ra, imm32：顶层 opcode 000001（bit 58）、逻辑运算在 bit 53..54（1 = OR）、32 位立即数在 bit 20..51（InstTable / InstLop32i）。
+    // LOP32I.AND Rd, Ra, imm32：同上，逻辑运算字段 0 = AND。
+    private static ulong Lop32iAnd(int dest, int a, uint imm) =>
+        0x0400000000000000UL | ((ulong)imm << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     private static ulong Lop32iOr(int dest, int a, uint imm) =>
         0x0400000000000000UL | (1UL << 53) | ((ulong)imm << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     private static ulong Ald4(int location) =>
@@ -88,6 +91,18 @@ internal static unsafe class Program
             BinaryPrimitives.WriteUInt64LittleEndian(b.AsSpan(0x50 + i * 8), op);
         }
         return b;
+    }
+    // STS / LDS [RZ + imm], B32（InstSts / InstLds：Rd 0..7、Ra 8..15、Imm24 20..43、LsSize 48..50 = B32 4）；BAR.SYNC 0（InstBar，BarOp Sync = 0）
+    private static ulong Sts(int reg, int offset) => 0xEF58000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private static ulong Lds(int reg, int offset) => 0xEF48000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private const ulong BarSync = 0xF0A8000000000000UL | (7UL << 16) | (0xFFUL << 8);
+    // 计算核（没有着色器头）：每 3 条指令前一个调度字，末尾 EXIT 加自跳转
+    private static byte[] ComputeOps(params ulong[] ops)
+    {
+        var all = new List<ulong>(ops) { Exit, 0xE2400FFFFF07000FUL };
+        var words = new List<ulong>();
+        for (int i = 0; i < all.Count; i += 3) { words.Add(Sched); for (int j = 0; j < 3; j++) words.Add(i + j < all.Count ? all[i + j] : 0x50B0000000070F00UL); }
+        return MemoryMarshal.AsBytes(words.ToArray().AsSpan()).ToArray();
     }
     private static byte[] ComputeGuest() => MemoryMarshal.AsBytes(new ulong[] { Sched, Exit, 0x50B0000000070F00UL, 0xE2400FFFFF07000FUL }.AsSpan()).ToArray();
 
@@ -235,6 +250,57 @@ internal static unsafe class Program
         else Emit(65, 106, 120, 100, 111, dynamic ? 199u : 112u, 113);
         if (load) Emit(61, vectorLoad ? 102u : 101u, 121, 120);
         if (escape) Emit(83, 106, 122, 120);
+        return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
+    }
+
+    // 非常量下标读 c0（boundDynamic，图形阶段）：照 Ryujinx 翻 LDC c[0][Rx + imm] 的形状
+    //   a = x & mask; addr = a + imm; wo = addr >> 2; vec = wo >> 2; elem = wo & 3; OpAccessChain %c0 0 vec elem
+    // x 来自输入变量（取值不可证）。变体：
+    //   and / reach / above：mask、imm 不同（证得的 vec 区间分别在 0x644 所在第 100 个之前 / 含它 / 之后）
+    //   unmasked：没有 & mask；huge：mask 大到 vec 上界 ≥ 数组长度；local：a 先存进函数局部变量再读回；
+    //   local-escape：局部变量的指针另有用法；local-two：局部变量还存过不可证的 x；
+    //   loop：下标是循环 phi（i = phi(0, i + 1)）；sclamp：clamp(x, 0, 63)；smin：min(x, 63)（有符号，x 可能为负）
+    private static byte[] C0DynFixture(string v, uint mask = 0x3F0, uint imm = 0)
+    {
+        var w = new List<uint> { 0x07230203, 0x10000, 0, 2000, 0 };
+        void Emit(uint op, params uint[] args) { w.Add(((uint)args.Length + 1) << 16 | op); w.AddRange(args); }
+        Emit(17, 1);
+        Emit(11, 190, 0x4C534C47, 0x6474732E, 0x3035342E, 0);   // OpExtInstImport "GLSL.std.450"
+        Emit(71, 100, 33, 1); Emit(71, 100, 34, 0);
+        Emit(71, 103, 6, 16); Emit(72, 104, 0, 35, 0);
+        Emit(21, 101, 32, 0); Emit(23, 102, 101, 4);
+        Emit(43, 101, 110, 4096); Emit(28, 103, 102, 110);
+        Emit(30, 104, 103); Emit(32, 105, 2, 104);
+        Emit(32, 106, 2, 101); Emit(32, 108, 1, 101); Emit(32, 160, 7, 101);
+        Emit(43, 101, 111, 0); Emit(43, 101, 150, mask); Emit(43, 101, 151, imm); Emit(43, 101, 152, 2); Emit(43, 101, 153, 3);
+        Emit(43, 101, 154, 63); Emit(43, 101, 155, 1);
+        Emit(59, 105, 100, 2);
+        Emit(59, 108, 109, 1);                 // 输入变量：读出的 x 取值不可证
+        Emit(61, 101, 140, 109);
+        uint vec, elem;
+        if (v is "loop" or "sclamp" or "smin")
+        {
+            if (v == "loop") { Emit(245, 101, 170, 111, 1, 171, 2); Emit(128, 101, 171, 170, 155); vec = 170; }
+            else if (v == "sclamp") { Emit(12, 101, 146, 190, 45, 140, 111, 154); vec = 146; }
+            else { Emit(12, 101, 146, 190, 39, 140, 154); vec = 146; }
+            elem = 111;
+        }
+        else
+        {
+            uint a = 141;
+            if (v == "unmasked") a = 140; else Emit(199, 101, 141, 140, 150);
+            if (v is "local" or "local-escape" or "local-two")
+            {
+                Emit(59, 160, 161, 7); Emit(62, 161, 141);
+                if (v == "local-two") Emit(62, 161, 140);
+                if (v == "local-escape") Emit(83, 160, 163, 161);
+                Emit(61, 101, 162, 161); a = 162;
+            }
+            Emit(128, 101, 142, a, 151); Emit(194, 101, 143, 142, 152); Emit(194, 101, 144, 143, 152); Emit(199, 101, 145, 143, 153);
+            vec = 144; elem = 145;
+        }
+        Emit(65, 106, 120, 100, 111, vec, elem);
+        Emit(61, 101, 121, 120);
         return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
     }
 
@@ -581,7 +647,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -611,7 +677,7 @@ internal static unsafe class Program
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x748), cx);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x74C), 1);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x750), 1);
-                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), 0);
+                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), sharedBytes);
                 // 让 controlX=0 明确产生非法控制段；其它情况如实填写。
                 WriteStage(w, "cs", overrideCode ?? cs, csCbUse, control);
             }
@@ -653,7 +719,7 @@ internal static unsafe class Program
                 w.WriteNumberValue(localSize); w.WriteNumberValue(1); w.WriteNumberValue(1);
                 w.WriteEndArray();
                 w.WriteNumber("localMemoryBytes", 0);
-                w.WriteNumber("sharedMemoryBytes", 0);
+                w.WriteNumber("sharedMemoryBytes", (sharedBytes + 15) / 16 * 16);
                 w.WriteBoolean("hasUnalignedStorageBuffer", false);
                 w.WriteEndObject();
             }
@@ -707,7 +773,37 @@ internal static unsafe class Program
     {
         string sampledSpvDir = args.Length == 2 && args[0] == "--emit-sampled" ? Path.GetFullPath(args[1]) : null;
         if (sampledSpvDir != null) Directory.CreateDirectory(sampledSpvDir);
+        // GPU oracle: transform the exact reference shader with production code.
+        if (args.Length == 4 && args[0] == "--spill-spirv")
+        {
+            try
+            {
+                int limit = int.Parse(args[3]);
+                var spillResult = DirectSharedSpill.Rewrite(File.ReadAllBytes(args[1]), limit, 0, 1);
+                if (spillResult == null) throw new DirectCompileException("UNSUPPORTED_PROGRAM", "fixture did not require a spill");
+                // 重新解析产物，不能只信选择器自己的 remaining 账本：留在 Workgroup 的数组必须真的不超过设备上限。
+                int measured = DirectSharedSpill.WorkgroupBytes(spillResult.Spirv);
+                if (measured < 0 || measured != spillResult.RemainingSharedBytes || measured > limit)
+                    throw new DirectCompileException("RESOURCE_LIMIT", $"spill retained workgroup bytes {measured}, reported {spillResult.RemainingSharedBytes}, limit {limit}");
+                File.WriteAllBytes(args[2], spillResult.Spirv);
+                Console.WriteLine($"spill bytes/group={spillResult.BytesPerGroup} remaining={spillResult.RemainingSharedBytes} measured={measured} set={spillResult.Set} binding={spillResult.Binding}");
+                return;
+            }
+            catch (DirectCompileException e) { Console.Error.WriteLine($"{e.Code}: {e.Message}"); Environment.Exit(1); }
+        }
         byte[] profile = ProfileJson();
+        using (JsonDocument profileDoc = JsonDocument.Parse(profile))
+        {
+            var limits = DirectProfile.Parse(profileDoc.RootElement, "spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 32768 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 49152,
+                  "spill keeps physical 32 KiB separate from translation 48 KiB");
+        }
+        using (JsonDocument largeProfileDoc = JsonDocument.Parse(Encoding.UTF8.GetString(profile).Replace("\"maximumComputeSharedMemorySize\":32768", "\"maximumComputeSharedMemorySize\":65536")))
+        {
+            var limits = DirectProfile.Parse(largeProfileDoc.RootElement, "large-spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 65536 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 65536,
+                  "translation limit preserves devices above 48 KiB");
+        }
         byte[] vs = Guest(false, new[] { Ast(0) });
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
@@ -780,20 +876,17 @@ internal static unsafe class Program
             return;
         }
 
-        // 计算共享内存（#1592）：48 KiB 内但超过设备上限（本测 profile 32768）是设备做不到 → UNSUPPORTED_PROGRAM 带实际值；
-        //   超过 Maxwell 48 KiB / 负数才是坏请求 → MISSING_FIELD；等于上限过上限检查
+        // 计算共享内存（#1592）：48 KiB 内请求交给翻译后 spill 判断；超过上限 / 负数仍是坏请求。
         {
             string csRaw = Encoding.UTF8.GetString(RequestJson(profile, "compute", 2, 1, "shared-limit", cs: cs));
             Func<int, byte[]> withShared = n => Encoding.UTF8.GetBytes(csRaw.Replace("\"sharedMemoryBytes\":0", "\"sharedMemoryBytes\":" + n));
             // 等于上限过得了上限检查（之后按控制块核对 1x1x1 shared 0 不符才拒，那是另一道检查）
             try { DirectShaderCompiler.Compile(withShared(32768)); Check(true, "shared 32768 passes the device limit check"); }
             catch (Exception error) { Check(!error.Message.Contains("exceeds"), "shared 32768 = device limit passes the limit check: " + error.Message); }
-            try { DirectShaderCompiler.Compile(withShared(40960)); Check(false, "shared 40960 above device limit must be rejected"); }
-            catch (DirectCompileException error)
-            {
-                Check(error.Code == "UNSUPPORTED_PROGRAM" && error.Message.Contains("sharedMemoryBytes 40960") && error.Message.Contains("limit 32768"),
-                    "shared 40960 > device 32768 → UNSUPPORTED_PROGRAM with value and limit: " + error.Code + " " + error.Message);
-            }
+            using var csFacts = JsonDocument.Parse("{\"localSize\":[1,1,1],\"localMemoryBytes\":0,\"sharedMemoryBytes\":40960,\"hasUnalignedStorageBuffer\":false}");
+            using var profileDoc = JsonDocument.Parse(profile);
+            var facts = DirectComputeFacts.Parse(csFacts.RootElement, "compute", DirectProfile.Parse(profileDoc.RootElement, "profile"));
+            Check(facts.SharedMemoryBytes == 40960, "shared 40960 passes parsing for spill on a 32768-byte device");
             Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(withShared(49153)), "shared above Maxwell 48 KiB is a bad request");
             Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(withShared(-1)), "negative shared is a bad request");
         }
@@ -1406,6 +1499,18 @@ internal static unsafe class Program
             JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
             Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
                 "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            // 下标先 & 0x3f0：真实翻译器的形状（(R1 + imm) >> 2 >> 2、& 3）按取值界证得读 data[lo..hi]
+            JsonElement[] masked = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0, 0, 1), Ast(0) }, true, out string e4);
+            Check(masked != null && Kind(masked[0]) == JsonValueKind.Array && Covers(masked[0], 0x3F0) && !Covers(masked[0], 0x644),
+                "masked register index: c0Reads is data[0..63], proven not to read 0x644: " + Show(masked, e4));
+            Check(masked != null && masked[0].TryGetProperty("c0ReadsStatic", out var maskedStatic) && maskedStatic.ValueKind == JsonValueKind.Null,
+                "bounded dynamic has separate unknown static read set for switch off");
+            Check(binstOn != null && binstOn[0].TryGetProperty("c0ReadsStatic", out var staticReads) && staticReads.ValueKind == JsonValueKind.Array &&
+                  staticReads.EnumerateArray().Any(r => r[0].GetInt32() <= 0x610 && r[0].GetInt32() + r[1].GetInt32() > 0x610),
+                "constant c0 reads retain their static proof when dynamic bounds are off");
+            JsonElement[] maskedReach = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0x600, 0, 1), Ast(0) }, true, out string e5);
+            Check(maskedReach != null && Covers(maskedReach[0], 0x644),
+                "negative control: masked register index that can reach 0x644 is a read: " + Show(maskedReach, e5));
             Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
         }
 
@@ -1463,6 +1568,91 @@ internal static unsafe class Program
                   content.GetProperty("stages")[0].GetProperty("stage").GetString() == "cs", "compute stage");
         }
 
+        // 5b) 共享内存超过设备上限（profile 32 KB）：最大的线程组数组挪到存储缓冲（DirectSharedSpill，同 iOS SpillFix）。
+        //     真实 decoder / translator：STS 写到 0x9000（超出 32 KB）、BAR.SYNC、LDS 读回、再 STS 留住结果。
+        {
+            byte[] sharedCs = ComputeOps(Fadd32i(0, 1.0f), Sts(0, 0x9000), BarSync, Lds(1, 0x9000), Sts(1, 0x10));
+            (JsonElement content, string error) SharedCompile(uint bytes)
+            {
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "compute", 2, 1, "shared-" + bytes, cs: sharedCs, sharedBytes: bytes)));
+                    return (d.RootElement.GetProperty("content").Clone(), null);
+                }
+                catch (Exception ex) { return (default, ex.Message); }
+            }
+            uint[] Words(JsonElement content) => MemoryMarshal.Cast<byte, uint>(content.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64()).ToArray();
+            IEnumerable<uint[]> Insts(uint[] w) { for (int i = 5; i < w.Length; i += (int)(w[i] >> 16)) yield return w[i..(i + (int)(w[i] >> 16))]; }
+            bool HasWorkgroupVar(uint[] w) => Insts(w).Any(x => (x[0] & 0xFFFF) == 59 && x[3] == 4);
+            var (big, bigErr) = SharedCompile(40960);
+            if (bigErr != null) Check(false, "40 KB shared compute compiles with a spill: " + bigErr);
+            else
+            {
+                uint[] w = Words(big);
+                JsonElement[] spills = big.GetProperty("bindings").EnumerateArray().Where(b => b.GetProperty("kind").GetString() == "spill").ToArray();
+                Check(spills.Length == 1 && spills[0].GetProperty("set").GetInt32() == 1 && spills[0].GetProperty("bytesPerGroup").GetInt32() == 40960 &&
+                      spills[0].GetProperty("stage").GetString() == "cs", "40 KB shared: one spill binding in set 1, 40960 bytes per group");
+                Check(!HasWorkgroupVar(w), "40 KB shared: no workgroup variable left in the SPIR-V");
+                var consts = Insts(w).Where(x => (x[0] & 0xFFFF) == 43 && x.Length == 4).ToDictionary(x => x[2], x => x[3]);
+                var builtins = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11).Select(x => x[3]).ToHashSet();
+                Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
+                // 溢出缓冲的成员带 Coherent（组内调用经 barrier 互相看得见写，同 Workgroup 内存的语义）
+                Check(Insts(w).Any(x => (x[0] & 0xFFFF) == 72 && x.Length == 4 && x[2] == 0 && x[3] == 23),
+                      "spill buffer member is Coherent so writes are visible across the workgroup after barriers");
+                // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
+                var defs = new Dictionary<uint, uint[]>();
+                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
+                bool Decorated(uint id, uint dec, int value) => Insts(w).Any(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[1] == id && x[2] == dec && x[3] == (uint)value);
+                uint spillVar = Insts(w).Where(v => (v[0] & 0xFFFF) == 59 && v[3] == 2).Select(v => v[2]).FirstOrDefault(id =>
+                    Decorated(id, 34, spills[0].GetProperty("set").GetInt32()) && Decorated(id, 33, spills[0].GetProperty("binding").GetInt32()));
+                uint[][] spillChains = Insts(w).Where(x => (x[0] & 0xFFFF) is 65 or 66 && x.Length >= 5 && x[3] == spillVar).ToArray();
+                bool Scaled(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var mul) && (mul[0] & 0xFFFF) == 132 &&
+                        (consts.GetValueOrDefault(mul[3]) == 10240 || consts.GetValueOrDefault(mul[4]) == 10240));
+                Check(spillVar != 0 && spillChains.Length >= 3 && spillChains.All(x => Scaled(x[^1])),
+                      "every spill access indexes slice (flat group id x 10240 words) + original index: chains " + spillChains.Length);
+                // 下标夹在本组片内：加到基址上的那一项 = OpSelect(idx < 10240, idx, 10239)
+                bool Clamped(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var sel) && (sel[0] & 0xFFFF) == 169 && consts.GetValueOrDefault(sel[5]) == 10239);
+                Check(spillChains.All(x => Clamped(x[^1])), "every spill index is clamped to the group's slice (select idx < 10240 ? idx : 10239)");
+                // 组号基址每个函数算一次：读 WorkgroupId 的次数不随访问次数涨（3 处访问、1 个函数 → 1 次）
+                uint gidVar = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11 && x[3] == 26).Select(x => x[1]).First();
+                int gidLoads = Insts(w).Count(x => (x[0] & 0xFFFF) == 61 && x.Length >= 4 && x[3] == gidVar);
+                Check(gidLoads == 1, "the group base is computed once per function, not per access: WorkgroupId loads " + gidLoads);
+                var barriers = Insts(w).Where(x => (x[0] & 0xFFFF) == 224).ToArray();
+                Check(barriers.Length > 0 && barriers.All(x => (consts.GetValueOrDefault(x[3]) & 0x140) == 0x140),
+                      "workgroup barriers also order uniform (spill buffer) memory");
+                string spvPath = Path.Combine(Path.GetTempPath(), "s2a-spill-" + Environment.ProcessId + ".spv");
+                File.WriteAllBytes(spvPath, big.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64());
+                string val = Environment.GetEnvironmentVariable("SPIRV_VAL") ?? "spirv-val";
+                try
+                {
+                    using var proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(val, "--target-env vulkan1.1 \"" + spvPath + "\"")
+                        { RedirectStandardError = true, RedirectStandardOutput = true });
+                    string msg = proc.StandardError.ReadToEnd() + proc.StandardOutput.ReadToEnd(); proc.WaitForExit();
+                    Check(proc.ExitCode == 0, "spilled SPIR-V passes spirv-val (vulkan1.1): " + msg.Trim());
+                }
+                catch (System.ComponentModel.Win32Exception) { Console.WriteLine("NOTE spirv-val not found: spilled SPIR-V not validated by SPIRV-Tools (set SPIRV_VAL)"); }
+                finally { File.Delete(spvPath); }
+            }
+            var (small, smallErr) = SharedCompile(16384);
+            Check(smallErr == null && !small.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill") && HasWorkgroupVar(Words(small)),
+                  "16 KB shared stays in workgroup memory without a spill binding: " + smallErr);
+            byte[] noStorageProfile = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(profile).Replace("\"maximumStorageBuffersPerStage\":16", "\"maximumStorageBuffersPerStage\":0"));
+            try {
+                DirectShaderCompiler.Compile(RequestJson(noStorageProfile, "compute", 2, 1, "spill-no-storage", cs: sharedCs, sharedBytes: 40960));
+                Check(false, "spill without storage descriptors must fail");
+            } catch (DirectCompileException error) {
+                Check(error.Code == "RESOURCE_LIMIT" && error.Message.Contains("sharedMemoryBytes 40960") && error.Message.Contains("limit 32768"),
+                      "failed spill retains reason and reports shared request / device limit: " + error.Code + " " + error.Message);
+            }
+            var (maxGuest, maxGuestErr) = SharedCompile(48 * 1024);
+            Check(maxGuestErr == null && maxGuest.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill"),
+                  "48 KiB guest shared memory is accepted and spilled: " + maxGuestErr);
+            var (_, overGuestErr) = SharedCompile(48 * 1024 + 1);
+            Check(overGuestErr != null, "guest shared memory over 48 KiB is rejected");
+        }
+
         // 真实 decoder -> translator -> Info.SBuffers -> JSON 反射，补足下方 mapper 单测。
         // 预期来自维护合同 #1111/6531250423：c0 SSBO 表 0x310、UBO 指针表 0x210，步长 16 B。
         // 特意让唯一资源的 translator slot 都为 0，而 0x320 的 NVN slot 必须为 1。
@@ -1513,6 +1703,36 @@ internal static unsafe class Program
             .SequenceEqual(new[] { 0x200, 16 }) == true, "cross-boundary vec4 not narrowed to 12");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, dynamic: true), 0, 1) == null,
             "dynamic c0 read unknown not empty");
+        // 非常量下标按取值界（boundDynamic，只给图形阶段）：证得的 vec4 整段记为读；证不了照旧 null。
+        {
+            string Dyn(int[][] r) => r == null ? "null" : "[" + string.Join(",", r.Select(x => "[0x" + x[0].ToString("x") + "," + x[1] + "]")) + "]";
+            bool Hits(int[][] r, int off) => r != null && r.Any(x => x[0] < off + 4 && x[0] + x[1] > off);
+            int[][] D(string v, uint mask = 0x3F0, uint imm = 0, bool bound = true) => DirectComputeC0Reads.Analyze(C0DynFixture(v, mask, imm), 0, 1, bound);
+            int[][] and = D("and");
+            Check(and != null && and.Length == 1 && and[0].SequenceEqual(new[] { 0, 0x400 }) && !Hits(and, 0x644),
+                "masked dynamic index (x & 0x3f0) >> 4 is data[0..63]: proven not to read 0x644: " + Dyn(and));
+            int[][] reach = D("and", imm: 0x600);
+            Check(reach != null && reach[0].SequenceEqual(new[] { 0x600, 0x400 }) && Hits(reach, 0x644),
+                "negative control: dynamic index that can reach data[100] reads 0x644: " + Dyn(reach));
+            int[][] above = D("and", imm: 0x650);
+            Check(above != null && above[0].SequenceEqual(new[] { 0x650, 0x400 }) && !Hits(above, 0x644),
+                "lower bound counts too: data[101..164] does not read 0x644: " + Dyn(above));
+            Check(D("unmasked") == null, "unmasked register index stays unknown: " + Dyn(D("unmasked")));
+            Check(D("and", mask: 0xFFFF0) == null, "upper bound past the array length stays unknown: " + Dyn(D("and", mask: 0xFFFF0)));
+            int[][] local = D("local");
+            Check(local != null && local[0].SequenceEqual(new[] { 0, 0x400 }), "bounded value through a function local: " + Dyn(local));
+            Check(D("local-escape") == null, "local whose pointer escapes stays unknown: " + Dyn(D("local-escape")));
+            Check(D("local-two") == null, "local that also stores an unbounded value stays unknown: " + Dyn(D("local-two")));
+            Check(D("loop") == null, "loop phi index stays unknown: " + Dyn(D("loop")));
+            int[][] clamp = D("sclamp");
+            Check(clamp != null && clamp[0].SequenceEqual(new[] { 0, 63 * 16 + 4 }), "sclamp(x, 0, 63) bounds the index (component 0 of data[0..63]): " + Dyn(clamp));
+            Check(D("smin") == null, "signed min(x, 63) with possibly negative x stays unknown: " + Dyn(D("smin")));
+            Check(D("and", bound: false) == null, "compute (no boundDynamic) keeps dynamic index unknown");
+            Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, dynamic: true), 0, 1, true) == null,
+                "undefined index id stays unknown with boundDynamic");
+            Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x644), 0, 1, true)?[0].SequenceEqual(new[] { 0x644, 4 }) == true,
+                "constant index unchanged with boundDynamic (real 0x644 read is a read)");
+        }
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, load: false), 0, 1)?.Length == 0,
             "unused access chain is not a load");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, escape: true), 0, 1) == null,

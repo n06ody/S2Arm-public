@@ -59,7 +59,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || standalone_mode || [ "$mode" = "--compute-read-core" ] || [[ "$mode" == --feedback-read* ]] || [ "$mode" = "--compute-workgroup" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || standalone_mode || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--compute-read-multi" ] || [[ "$mode" == --barrier-* ]] || [[ "$mode" == --feedback-read* ]] || [ "$mode" = "--compute-workgroup" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -74,7 +74,7 @@ fi
 # --zero-attr-core（#977）：同一套真 rp_draw + 真后端，跑零属性用例 t_replay_zero_attr.c。
 if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     if [ "$mode" = "--indirect-core" ]; then
-        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp)
+        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp replay_binst.vert replay_binst.frag replay_binst_args.comp)
     else
         core_test=t_replay_zero_attr; core_shaders=(zattr.vert quad.frag)
     fi
@@ -101,7 +101,8 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     fi
     exit 0
 fi
-if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
+if { [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--compute-read-multi" ]; } && [ "$(uname -s)" = Linux ]; then
+    if [ "$mode" = "--compute-read-multi" ]; then exec bash "$repo/android/tests/vk/run_compute_read.sh" --multi-only; fi
     exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
 if [ "$(uname -s)" = Darwin ]; then
@@ -208,6 +209,9 @@ export S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer"
 if [ "$mode" = --feedback-read-mask-repro ]; then   # 独立夹具 feedback-read 的诊断变体（带参数，不在默认档）
     exec bash "$repo/android/tests/vk/standalone/feedback-read.sh" --mask-repro
 fi
+if [ "$mode" = --external-dependency-red ]; then
+    exec bash "$repo/android/tests/vk/standalone/external-dependency.sh" red
+fi
 if standalone_mode; then
     exec bash "$repo/android/tests/vk/standalone/${mode#--}.sh"
 fi
@@ -276,7 +280,11 @@ inc=(-I "$repo/android/tests/vkhost"
 #   --dispatch-barrier-neg  检测器负控：测试钩子关掉后端派发前那道屏障、也不发游戏屏障，同步校验必须报写后读冒险；
 #   --xfer-dispatch         不发游戏屏障的四臂（none / resync / xseg / dd）：同步校验 0 条、读回 i*6，派发前后端自己补了屏障、连续派发之间 0 道。
 # 原始日志不回显、只报条数（容器会把日志里的校验报错当成失败），留在 build/978-tests/。
-if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] || [ "$mode" = "--xfer-dispatch" ]; then
+if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] || [ "$mode" = "--barrier-narrow" ] || [ "$mode" = "--barrier-narrow-off" ] || [ "$mode" = "--barrier-narrow-stage-neg" ] || [ "$mode" = "--barrier-chain" ] || [ "$mode" = "--barrier-chain-neg" ] || [ "$mode" = "--barrier-chain-off" ] || [ "$mode" = "--xfer-dispatch" ]; then
+    if [ "$mode" = "--barrier-narrow" ] || [ "$mode" = "--barrier-narrow-off" ] || [ "$mode" = "--barrier-narrow-stage-neg" ] || [ "$mode" = "--barrier-chain" ] || [ "$mode" = "--barrier-chain-neg" ] || [ "$mode" = "--barrier-chain-off" ]; then
+        [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 Vulkan headers not staged' >&2; exit 2; }
+        inc=(-I "$repo/build/c883-ndk" "${inc[@]}")
+    fi
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/bar_double.comp" -o "$out/shaders/bar_double.comp.spv"
     src=("$repo/android/tests/vk/t_replay_dispatch_barrier.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
@@ -308,7 +316,11 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
         before=$(printf '%s\n' "$line" | sed -n 's/.*barriers_before_dispatch=\([0-9]*\).*/\1/p'); between=$(printf '%s\n' "$line" | sed -n 's/.*barriers_between_dispatches=\([0-9]*\).*/\1/p')
         grep -q '^device: llvmpipe' "$out/db-$tag.log" || { echo "  【红】臂 $tag 不是 lavapipe 设备" >&2; db_red=1; return; }
         if [ "$other" -ne 0 ] || [ -z "$line" ]; then echo "  【红】臂 ${tag}：其余报错或没跑完" >&2; db_red=1; return; fi
-        if [ "$want" = hit ]; then [ "$raw" -ge 1 ] || { echo "  【红】臂 ${tag}：负控未击中（同步校验没报写后读 / 写后写冒险）" >&2; db_red=1; }; return; fi
+        if [ "$want" = hit ]; then
+            [ "$rc" -eq 0 ] && [ "$raw" -ge 1 ] || { echo "  【红】臂 ${tag}：负控未完成或未击中（同步校验没报写后读 / 写后写冒险）" >&2; db_red=1; }
+            if [ -n "$cond" ] && ! awk -v before="${before:-x}" -v between="${between:-x}" "BEGIN{exit !($cond)}"; then echo "  【红】臂 ${tag}：屏障数不符（要 ${cond}）" >&2; db_red=1; fi
+            return
+        fi
         if [ "$rc" -ne 0 ] || [ "$raw" -ne 0 ]; then echo "  【红】臂 ${tag}：读回或同步校验不对" >&2; db_red=1; return; fi
         if [ -n "$cond" ] && ! awk -v before="${before:-x}" -v between="${between:-x}" "BEGIN{exit !($cond)}"; then echo "  【红】臂 ${tag}：屏障数不符（要 ${cond}）" >&2; db_red=1; fi
     }
@@ -316,6 +328,12 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
     case "$mode" in
         --dispatch-barrier) db_arm barrier 0 ;;
         --dispatch-barrier-neg) db_arm none-nobar hit 'before == 0' ;;
+        --barrier-narrow) db_arm narrow 0 'before == 1' ;;
+        --barrier-narrow-off) db_arm narrow-off 0 'before == 1' ;;
+        --barrier-narrow-stage-neg) db_arm wrong-stage hit 'before == 1' ;;
+        --barrier-chain) db_arm chain 0 'before == 1' ;;
+        --barrier-chain-neg) db_arm chain-neg hit 'before == 1' ;;
+        --barrier-chain-off) db_arm chain-off 0 'before == 1' ;;
         --xfer-dispatch) db_arm none 0 'before == 1'; db_arm resync 0 'before >= 2'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'
                          db_log_off=1; db_arm none 0 'before == 1'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'; db_log_off= ;;   # 关那一档：受跟踪的三臂走逐页路径再跑一遍
     esac

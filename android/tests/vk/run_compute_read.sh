@@ -2,6 +2,8 @@
 # 真 compute → render-pass indirect draw；所有臂要求实际读回正确且 syncval 无错。
 # 新修复前仅 automatic 臂应出现计算写 → 间接读取 hazard；manual/no-producer 为控制。
 set -euo pipefail
+only=${1:-}
+[ -z "$only" ] || [ "$only" = --multi-only ] || { echo "unknown mode: $only" >&2; exit 2; }
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 out="$repo/build/vk-compute-read"
 mkdir -p "$out/shaders"
@@ -36,7 +38,7 @@ print(f"DETECTOR layer_api={layer.get('api_version', 'unknown')} supports={key}�
 DETECTOR
 headers="$repo/build/c883-ndk"
 [ -f "$headers/vulkan/vulkan_core.h" ] || { echo '【红】缺真实 NDK 29 Vulkan 头；先由宿主出料' >&2; exit 2; }
-for shader in compute_read_args.comp compute_read_readonly.comp compute_read_payload.comp compute_read_index.comp compute_read_image.comp compute_read_vertex.vert compute_read_buffer.vert compute_read_buffer.frag compute_read_texel.frag compute_read_image.frag solid_green.frag; do
+for shader in compute_read_args.comp compute_read_readonly.comp compute_read_payload.comp compute_read_index.comp compute_read_image.comp compute_read_vertex.vert compute_read_buffer.vert compute_read_buffer.frag compute_multi_fragment.frag cgr_graphics_write.frag compute_read_texel.frag compute_read_image.frag solid_green.frag; do
     glslc --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
 glslc --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/fullscreen.vert.spv"
@@ -51,6 +53,7 @@ export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" 
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -I "$headers" "$repo/android/tests/vk/t_compute_read_raw.c" -lvulkan -o "$out/raw"
 failed=0
 for arm in env transfer-env sync-only explicit external external-graphics external-graphics-manual manual transfer; do
+    [ "$only" != --multi-only ] || continue
     log="$out/raw-$arm.log"
     set +e
     timeout 120 "$out/raw" "$out/shaders" "$arm" > "$log" 2>&1
@@ -69,6 +72,7 @@ done
 for dq in 0 1; do
 export S2A_COMPUTE_READ_DQ=$dq
 for arm in no-producer manual automatic-env automatic manual-normalized automatic-normalized unrelated-normalized repeat-normalized zero-normalized disabled-normalized cross-segment-normalized game-barrier-normalized rewrite-normalized readonly-normalized; do
+    [ "$only" != --multi-only ] || continue
     log="$out/dq$dq-$arm.log"
     set +e
     timeout 120 "$out/test" "$out/shaders" "$arm" > "$log" 2>&1
@@ -94,7 +98,8 @@ for arm in no-producer manual automatic-env automatic manual-normalized automati
     fi
 done
 # 每个消费者都有同输入、仅关闭跟踪的负控；间接参数在 CPU 写且不相交。
-for kind in vertex index vsbuf fsbuf tbuf image image-disjoint; do
+for kind in vertex index vsbuf fsbuf tbuf image image-disjoint fsbuf-transfer fsbuf-transfer-allomit fsbuf-transfer-nocompute fsbuf-transfer-noexternal fsbuf-transfer-nocompute-noexternal fsbuf-transfer-noinput fsbuf-transfer-nooutput fsbuf-transfer-nocompute-noinput fsbuf-transfer-nocompute-nooutput; do
+ [ "$only" != --multi-only ] || [[ "$kind" == fsbuf-transfer* ]] || continue
  for suffix in enabled disabled; do
     arm="$kind-$suffix"; log="$out/dq$dq-$arm.log"
     set +e
@@ -104,11 +109,21 @@ for kind in vertex index vsbuf fsbuf tbuf image image-disjoint; do
     errors=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD' "$log" || true)
     hazards=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$log" || true)
     other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
+    if [[ "$kind" == fsbuf-transfer* ]]; then
+        hazards=$(grep -cE 'SYNC-HAZARD-(READ|WRITE)-AFTER-WRITE' "$log" || true)
+        other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vcE 'SYNC-HAZARD-(READ|WRITE)-AFTER-WRITE' || true)
+    fi
     marker=$(grep "^COMPUTE_RESOURCE arm=$arm " "$log" || true)
     printf '%s\n' "$marker"
     printf 'compute-resource dq=%s arm=%s rc=%s validation_lines=%s RAW=%s other=%s\n' "$dq" "$arm" "$rc" "$errors" "$hazards" "$other"
     if [ "$suffix" = disabled ]; then
+        # 保留入向 ALL_GRAPHICS 外部依赖的观察臂：此 VVL 版本把传输冒险遮住。
+        # 不能据此证明正确；独立 noinput / noexternal 臂必须抓到同一冒险。
+        if [[ "$kind" == fsbuf-transfer || "$kind" == fsbuf-transfer-nocompute || "$kind" == fsbuf-transfer-nooutput || "$kind" == fsbuf-transfer-nocompute-nooutput ]]; then
+            if [ "$rc" = 0 ] && [ "$errors" = 0 ] && [ -n "$marker" ]; then continue; fi
+        else
         if [ "$rc" = 0 ] && [ "$hazards" -ge 1 ] && [ "$other" = 0 ] && [ -n "$marker" ]; then continue; fi
+        fi
     elif [ "$rc" = 0 ] && [ "$errors" = 0 ] && [ -n "$marker" ]; then continue
     fi
     failed=1; echo "【红】资源依赖 $arm 未满足断言"; tail -n 18 "$log"
@@ -116,6 +131,7 @@ for kind in vertex index vsbuf fsbuf tbuf image image-disjoint; do
 done
 done
 unset S2A_COMPUTE_READ_DQ
+if [ "$only" = --multi-only ]; then [ "$failed" = 0 ] || exit 1; echo '【绿】多消费者与检测器对照'; exit 0; fi
 set +e
 timeout 120 "$out/resources" "$out/shaders" metadata > "$out/metadata.log" 2>&1
 meta_rc=$?
@@ -143,4 +159,4 @@ for arm in env manual-env; do
     if [ "$arm" = manual-env ] && ! grep -q 'RAW=0 other_errors=0' <<< "$marker"; then failed=1; echo '【红】文件式配置屏障控制失败'; fi
 done
 [ "$failed" = 0 ] || exit 1
-echo '【绿】计算写→图形读：DQ 关/开各 14 个间接参数臂（含跨段、游戏屏障、再写、只读派发）及 7 类资源 × 开/关 14 臂，共 56 臂，4096 像素及参数正确，裸 Vulkan 检测器与文件配置对照符合断言'
+echo '【绿】DQ 关/开各 14 个间接参数臂及 16 类资源 × 开/关 32 臂，共 92 臂；含传输写→计算读→图形读及遗漏阶段的负控，4096 像素及参数正确，裸 Vulkan 检测器与文件配置对照符合断言'
