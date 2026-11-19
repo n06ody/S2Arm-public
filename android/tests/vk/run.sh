@@ -86,9 +86,10 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
         "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
     done
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/depth_state.vert.spv"
-    inc=(); for d in android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
+    inc=(); for d in android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/tex graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
     src=("$repo/android/tests/vk/$core_test.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
+    src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
     cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
     export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     set +e
@@ -342,6 +343,8 @@ src=("$repo/android/tests/vk/t_backend_vk.c"
      "$repo/android/native/nvn/nvn_vk_driver_cache.c"
      "$repo/android/native/direct/sha256.c"
      "$repo/graphics/nvn/replay/nvn_unimpl.c")
+inc+=(-I "$repo/graphics/nvn/gfx/tex")
+src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
 bc_src=("$repo/android/tests/vk/t_bc_decode.c"
      "$repo/android/native/nvn/nvn_vk_bcdec.c"
      "$repo/android/native/direct/vk_device.c"
@@ -349,14 +352,36 @@ bc_src=("$repo/android/tests/vk/t_bc_decode.c"
      "$repo/graphics/nvn/gfx/tex/nvn_bcdec.c")
 # 与发行 APK 同一组建设备规则（android/CMakeLists.txt 的 nvn_vk 后端定义此宏）。
 cflags=(-D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
+if [[ "$mode" == --gpu-deswizzle* ]]; then cflags+=(-DS2A_GPU_DESWIZZLE_TEST=1); fi
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
+if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
+    python3 - "$mode" "$repo" "$out" <<'PYGPU'
+import pathlib, sys
+mode, repo, out = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+backend = (repo / 'android/native/nvn/backend_vulkan.c').read_text()
+inc = (repo / 'android/native/nvn/backend_vulkan_deswizzle.inc').read_text()
+changes = {
+    '--gpu-deswizzle-neg-height': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, (h ? h - 1 : h), d, gobs, (uint32_t)nvn_gob_switch2'),
+    '--gpu-deswizzle-neg-stride': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, h, d, (gobs > 1 ? gobs - 1 : gobs), (uint32_t)nvn_gob_switch2'),
+    '--gpu-deswizzle-neg-barrier': ('vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);', '(void)barrier;'),
+}
+before, after = changes[mode]
+assert inc.count(before) == 1
+variant = out / 'deswizzle-mutant.inc'; variant.write_text(inc.replace(before, after))
+a = '#include "backend_vulkan_deswizzle.inc"'; assert backend.count(a) == 1
+backend = backend.replace(a, '#include "' + str(variant) + '"')
+backend = backend.replace('#include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"', '#include "' + str(repo/'graphics/nvn/gfx/tex/nvn_deswizzle.h') + '"')
+(out/'deswizzle-mutant.c').write_text(backend)
+PYGPU
+    src[1]="$out/deswizzle-mutant.c"
+fi
 if [ "$mode" = --clear-capacity-neg ]; then
     python3 - "${src[1]}" "$out" <<'PYCLEAR'
 import pathlib, sys
@@ -687,6 +712,44 @@ fi
 
 # C1581K：D24S8 的 CPU 上传拆成深度面、模板面两个区域（一个区域只能有一个面，VUID-VkBufferImageCopy-aspectMask-09103），
 #   深度面回读低 24 位一致、上传的模板经模板测试看得见。validation 0 条才绿。
+if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
+    unset S2A_TEST_NVK_DQ
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle >"$out/gpu-deswizzle-negative.log" 2>&1
+    rc=$?
+    set -e
+    if [ "$mode" = "--gpu-deswizzle-neg-barrier" ]; then
+        grep -q 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/gpu-deswizzle-negative.log" || { echo '【红】移除屏障没有被同步校验拦住'; exit 1; }
+    else
+        [ "$rc" -ne 0 ] && grep -q 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" || { echo "【红】几何变异未在字节断言处变红（rc=$rc）"; tail -25 "$out/gpu-deswizzle-negative.log"; exit 1; }
+    fi
+    echo "【绿】$mode 触发预期负控（rc=$rc）"; exit 0
+fi
+
+if [ "$mode" = "--gpu-deswizzle" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 0 ]; then unset S2A_TEST_NVK_DQ; else export S2A_TEST_NVK_DQ=1; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-${dq}.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-${dq}.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-${dq}.log"; then
+            echo "【红】GPU deswizzle dq=${dq}: rc=${rc} 或校验失败" >&2; exit 1
+        fi
+    done
+    unset S2A_TEST_NVK_DQ
+    export S2A_TEST_GPU_DESWIZZLE_OFF=1
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-off.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    unset S2A_TEST_GPU_DESWIZZLE_OFF
+    if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-off.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-off.log"; then
+        echo "【红】GPU 解排关闭：rc=${rc} 或校验失败" >&2; exit 1
+    fi
+    echo '【绿】GPU deswizzle 两级录制开关、关闭能力、校验层通过'; exit 0
+fi
+
 if [ "$mode" = "--ds-upload-only" ]; then
     set +e
     timeout 120 "$out/t_backend_vk" "$out/shaders" --ds-upload-only 2>&1 | tee "$out/ds-upload.log"
