@@ -321,6 +321,16 @@ def main():
             ('alias-bg-fact-mask-omitted', 'if (!compute && e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);',
              '(void)0;', 1, 'alias fact-bg[on] s2: identity differing only in an unread texture fact reuses the program'),
             # 开关关闭态（--alias-off 另起进程）：开关读了不用，关闭态下 B 就会被合并，「B 读自己的文件」必须变红
+            # #1680：成功结果里白名单指令的 Log 计数（撤掉计数、撤掉首次 WARN、把口径不符当放行）
+            ('noop-tally-never-called', '        s2a_compile_outcome_free(&oc);\n        noop_log_tally(bytes, len);', '        s2a_compile_outcome_free(&oc);', 1,
+             'noop-log: each whitelisted log is counted by instruction'),
+            ('noop-first-warn-dropped', 'if (nvn_unimpl("shader", name, NULL) == 1) {', 'if (nvn_unimpl("shader", name, NULL) == 0) {', 1,
+             'noop-log: the first hit of each instruction prints one WARN line'),
+            ('noop-unexpected-accepted', 'sscanf(value, "Shader instruction %23[A-Za-z0-9] is not implemented.%n", ins, &used) != 1 || !used || value[used])',
+             'sscanf(value, "Shader instruction %23[A-Za-z0-9] is not implemented.%n", ins, &used) != 1 && 0)', 1,
+             'noop-log: a log that is not an instruction stub is red'),
+            ('noop-tally-compute-never-called', '            noop_log_tally(bytes, len);\n', '', 1,
+             'noop-log: a compute compile counts its whitelisted log too'),
             ('alias-flag-ignored', 'if (v < 0) v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0; return v;',
              'if (v < 0) { (void)nvn_plat_flag("nvk_alias", 1); v = 1; } return v;', 1, 'alias[off] s2: B reads its own file', ('--alias-off',)),
         ]

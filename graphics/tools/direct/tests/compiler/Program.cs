@@ -2650,6 +2650,71 @@ internal static unsafe class Program
             Check(entry(0, 1, default, 0, 0) == DirectAbi.Argument, "unmanaged provider rejects empty input");
         }
 
+        // 11) #1680：Ryujinx 空实现指令的具名白名单（Sam / Ram 放行，其它诊断照样整份拒收）+ 拒收消息报全部诊断。
+        //   期望按规格手写：Ryujinx InstEmit.Sam / Ram / Ide 打的日志原文 + 编译器拼接规则（首条 + " [diagnostics=N: …]"，上限 245 字符）。
+        {
+            const ulong SamOp = 0xE37000000007000FUL, RamOp = 0xE38000000007000FUL, IdeOp = 0xE39000000007000FUL;   // InstTable：111000110111 / 111000111000 / 111000111001
+            const string SamLog = "Shader instruction Sam is not implemented.", RamLog = "Shader instruction Ram is not implemented.",
+                         IdeLog = "Shader instruction Ide is not implemented.";
+            byte[] vsPlain = Guest(false, new[] { Ast(0) });
+            byte[] fsPlain = Guest(true, new[] { Ald(0) }, new[] { 0 });
+            string Reject(byte[] v, byte[] f, string id)
+            {
+                try { DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, id, v, f)); return null; }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+            List<string> Logs(byte[] result)
+            {
+                using JsonDocument doc = ParseResult(result);
+                var logs = new List<string>();
+                foreach (JsonElement d in doc.RootElement.GetProperty("content").GetProperty("dependencies").EnumerateArray())
+                    if (d.GetProperty("method").GetString() == "Log") logs.Add(d.GetProperty("value").GetString() + "|" + d.GetProperty("source").GetString());
+                return logs;
+            }
+            string FsSpirv(byte[] result)
+            {
+                using JsonDocument doc = ParseResult(result);
+                foreach (JsonElement st in doc.RootElement.GetProperty("content").GetProperty("stages").EnumerateArray())
+                    if (st.GetProperty("stage").GetString() == "fs") return st.GetProperty("spirv").GetString();
+                return null;
+            }
+            byte[] plain = DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "noop-plain", vsPlain, fsPlain));
+            byte[] withSam = null, withRam = null;
+            try { withSam = DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "noop-sam", vsPlain, Guest(true, new[] { SamOp, Ald(0) }, new[] { 0 }))); }
+            catch (DirectCompileException error) { Check(false, "noop: fs with Sam compiles (Ryujinx emits nothing for it): " + error.Code + " " + error.Message); }
+            try { withRam = DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "noop-ram", Guest(false, new[] { RamOp, Ast(0) }), fsPlain)); }
+            catch (DirectCompileException error) { Check(false, "noop: vs with Ram compiles: " + error.Code + " " + error.Message); }
+            if (withSam != null)
+            {
+                Check(Logs(withSam).SequenceEqual(new[] { SamLog + "|translator" }), "noop: Sam's log stays in the result dependencies once (host counts it): " + string.Join(",", Logs(withSam)));
+                Check(FsSpirv(withSam) != null && FsSpirv(withSam) == FsSpirv(plain), "noop: fs SPIR-V with Sam is byte-identical to the same fs without it");
+            }
+            if (withRam != null) Check(Logs(withRam).SequenceEqual(new[] { RamLog + "|translator" }), "noop: Ram's log stays in the result dependencies: " + string.Join(",", Logs(withRam)));
+            Check(Logs(plain).Count == 0, "noop: a program without these instructions has no Log dependency");
+            // 白名单外：单条诊断的消息与改前逐字相同（宿主 / 旧读数按它归类）
+            Check(Reject(vsPlain, Guest(true, new[] { IdeOp, Ald(0) }, new[] { 0 }), "noop-ide") == "TRANSLATION_DIAGNOSTIC " + IdeLog + " (stage fs)",
+                  "noop: Ide (not whitelisted) is still rejected with the unchanged single-diagnostic message: " + Reject(vsPlain, Guest(true, new[] { IdeOp, Ald(0) }, new[] { 0 }), "noop-ide"));
+            // 混合：白名单 + 白名单外 → 照拒；Sam 不进消息、不算条数
+            string mixed = Reject(vsPlain, Guest(true, new[] { SamOp, IdeOp, Ald(0) }, new[] { 0 }), "noop-mixed");
+            Check(mixed == "TRANSLATION_DIAGNOSTIC " + IdeLog + " (stage fs)", "noop: Sam + Ide in one stage is rejected for Ide only: " + mixed);
+            string mixedStages = Reject(Guest(false, new[] { RamOp, Ast(0) }), Guest(true, new[] { IdeOp, Ald(0) }, new[] { 0 }), "noop-mixed-stages");
+            Check(mixedStages == "TRANSLATION_DIAGNOSTIC " + IdeLog + " (stage fs)", "noop: Ram in vs + Ide in fs is rejected for the fs Ide: " + mixedStages);
+            // 报全部诊断：vs 1 条 + fs 2 条同文 → 首条（vs）+ 总条数 3 + 其余合并
+            string all = Reject(Guest(false, new[] { IdeOp, Ast(0) }), Guest(true, new[] { IdeOp, SamOp, IdeOp, Ald(0) }, new[] { 0 }), "noop-all");
+            Check(all == "TRANSLATION_DIAGNOSTIC " + IdeLog + " (stage vs) [diagnostics=3: " + IdeLog + " (stage fs) x2]",
+                  "noop: the rejection reports every blocking diagnostic, not only the first: " + all);
+            // 拼接规则的边界（纯函数）：同文合并、整项丢、上限 245、放不下计数就只留首条
+            Check(DirectShaderCompiler.DiagnosticSummary(new List<string> { "a", "a", "b" }) == "a x2 [diagnostics=3: b]", "noop summary: repeats of the first are folded into it");
+            string longItem = new string('y', 100);
+            string dropped = DirectShaderCompiler.DiagnosticSummary(new List<string> { "first", longItem, longItem + "2", longItem + "3" });
+            Check(dropped == "first [diagnostics=4: " + longItem + "; " + longItem + "2]" && dropped.Length <= 245,
+                  "noop summary: items that do not fit are dropped whole from the end (len " + dropped.Length + "): " + dropped);
+            string huge = new string('z', 240);
+            Check(DirectShaderCompiler.DiagnosticSummary(new List<string> { huge, "b" }) == huge, "noop summary: if even the count does not fit, only the first is kept (unchanged shape)");
+            Check(DirectShaderCompiler.NoOpInstructionLogs.Count == 2 && DirectShaderCompiler.NoOpInstructionLogs.ContainsKey(SamLog) && DirectShaderCompiler.NoOpInstructionLogs.ContainsKey(RamLog),
+                  "noop: the whitelist is exactly Sam and Ram");
+        }
+
         // 10) 支持缓冲布局身份稳定。
         SupportLayout a1 = SupportLayout.Compile(), a2 = SupportLayout.Compile();
         Check(a1.Hash == a2.Hash && a1.RequiredSize > 0 && a1.Binding == 0 && a1.Fields.Length >= 8, "support layout stable");

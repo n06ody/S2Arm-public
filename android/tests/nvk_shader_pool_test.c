@@ -46,6 +46,9 @@ static unsigned fake_array_count;
 static int separate_fixture;
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
 static int fake_gs_fact_deps;
+static const char *fake_gs_log_deps;
+static const char *fake_cs_log_deps;   // 同上，计算程序的结果   // #1680：非空时成功结果的 dependencies 就是这串（编译器留下的翻译器 Log 项）
+static char warn_lines[4096];
 static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alias）：-1 = 取生产缺省，0 = 关
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
@@ -75,6 +78,7 @@ int nvn_plat_flag(const char *name, int dflt) {
 }
 void nvn_plat_log(int level, const char *cls, const char *text) {
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
+    if (level == NVN_PLAT_LOG_WARN && !strcmp(cls, "shader")) { size_t n = strlen(warn_lines); snprintf(warn_lines + n, sizeof warn_lines - n, "%s\n", text); }
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_capacity=")) {
         diag_lines++; snprintf(last_diag, sizeof last_diag, "%s", text);
     }
@@ -187,10 +191,21 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
             fake_gs_fact_deps == 5 ? "future-texture-state" : "texture-fact:vs:8:-1";
         if (fake_gs_fact_deps) snprintf(depbuf, sizeof depbuf,
             ",\"contract\":\"s2a-direct-program-content-v1\",\"dependencies\":[{\"source\":\"code:sha256:synthetic\",\"method\":\"GetCode\"},{\"source\":\"%s\",\"method\":\"QuerySamplerType\"},{\"source\":\"texture-fact:fs:10:2\",\"method\":\"QueryTextureCoordNormalized\"},{\"source\":\"code:sha256:synthetic#cbUse\",\"method\":\"QueryConstantBufferUse\",\"arguments\":\"stage=vs\"}]", source);
+        if (fake_gs_log_deps && !fake_gs_fact_deps) snprintf(depbuf, sizeof depbuf, ",\"contract\":\"s2a-direct-program-content-v1\",\"dependencies\":[%s]", fake_gs_log_deps);
         if (fake_gs_result_tag) { size_t dn = strlen(depbuf); snprintf(depbuf + dn, sizeof depbuf - dn, ",\"fixtureTag\":%d", fake_gs_result_tag); }
         const char *deps = depbuf;
         int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"},{\"stage\":\"fs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}%s],\"bindings\":[]%s}}", extra, deps);
         CHECK(n > 0 && (size_t)n < sizeof result, "GS result fixture fits");
+        s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
+        return emit(sink, payload);
+    }
+    if (fake_cs_success && fake_cs_log_deps && strstr(captured, "\"program\":{\"kind\":\"compute\"")) {
+        char result[2048];   // #1680：同下面的合法计算结果，另带 dependencies（翻译器 Log 项）
+        int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+            "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
+            "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],\"bindings\":[],"
+            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[],\"dependencies\":[%s]}}", fake_cs_log_deps);
+        CHECK(n > 0 && (size_t)n < sizeof result, "compute log result fixture fits");
         s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
         return emit(sink, payload);
     }
@@ -911,6 +926,58 @@ done:
     rp_shader_reset(); rp_state_reset();
 }
 
+/* #1680：编译器按具名白名单放行的 Sam / Ram 留在成功结果的 dependencies（method=Log）里，宿主按指令计数、首次一行 WARN；
+ * 不是这种形态的 Log 报红。期望按规格手写：计数名 noop_instruction_<指令名>，每份现编程序记一次。 */
+static void graphics_noop_log_tally_test(void) {
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    uint8_t keys[2][8]; for (unsigned st = 0; st < 2; st++) gs_source(st, 0, keys[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G');
+    gs_program.serial = 970; gs_program.nstage = 2;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned st = 0; st < 2; st++) { gs_stages[st] = (uint8_t)st; memcpy(gs_keys[st], keys[st], 8); }
+    gs_keys_ok = 3; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "noop-log fixture binds");
+    bind_pools(100); fake_reg_changes = 0;
+    fake_gs_success = 1; fake_gs_result_mode = 1;
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+    static const char sam_ram[] =
+        "{\"source\":\"code:sha256:synthetic\",\"method\":\"GetCode\",\"arguments\":\"\",\"value\":\"\"},"
+        "{\"method\":\"Log\",\"arguments\":\"\",\"value\":\"Shader instruction Sam is not implemented.\",\"source\":\"translator\"},"
+        "{\"method\":\"Log\",\"arguments\":\"\",\"value\":\"Shader instruction Ram is not implemented.\",\"source\":\"translator\"},"
+        "{\"method\":\"Log\",\"arguments\":\"\",\"value\":\"Shader instruction Sam is not implemented.\",\"source\":\"translator\"}";
+    fake_gs_log_deps = sam_ram; warn_lines[0] = 0; last_red[0] = 0;
+    CHECK(!rp_shader_resolve(&q, &p) && p, "noop-log: a compiled program carrying Sam / Ram logs is used");
+    CHECK(nvn_unimpl_count("shader", "noop_instruction_Sam") == 2 && nvn_unimpl_count("shader", "noop_instruction_Ram") == 1,
+          "noop-log: each whitelisted log is counted by instruction (Sam=%llu Ram=%llu)",
+          (unsigned long long)nvn_unimpl_count("shader", "noop_instruction_Sam"), (unsigned long long)nvn_unimpl_count("shader", "noop_instruction_Ram"));
+    CHECK(count_substr(warn_lines, "noop_instruction_Sam：") == 1 && count_substr(warn_lines, "noop_instruction_Ram：") == 1,
+          "noop-log: the first hit of each instruction prints one WARN line: %s", warn_lines);
+    CHECK(!last_red[0] && nvn_unimpl_count("shader", "noop_instruction_unexpected") == 0, "noop-log: whitelisted logs are not red: %s", last_red);
+    // 同一程序再取：走已发布的程序，不再计数
+    CHECK(!rp_shader_resolve(&q, &p) && p && nvn_unimpl_count("shader", "noop_instruction_Sam") == 2, "noop-log: a reused program is not counted again");
+    // 口径对不上：成功结果里有别的形态的 Log → 报红、具名计数
+    rp_shader_reset(); nvn_unimpl_reset(); warn_lines[0] = 0; last_red[0] = 0;
+    fake_gs_log_deps = "{\"method\":\"Log\",\"arguments\":\"\",\"value\":\"Invalid texture sampler type.\",\"source\":\"translator\"}";
+    CHECK(!rp_shader_resolve(&q, &p) && p && nvn_unimpl_count("shader", "noop_instruction_unexpected") == 1 && last_red[0] && !warn_lines[0],
+          "noop-log: a log that is not an instruction stub is red (count=%llu red=%s)", (unsigned long long)nvn_unimpl_count("shader", "noop_instruction_unexpected"), last_red);
+    // 没有 Log 项：什么都不记
+    rp_shader_reset(); nvn_unimpl_reset(); warn_lines[0] = 0; last_red[0] = 0;
+    fake_gs_log_deps = "{\"source\":\"code:sha256:synthetic\",\"method\":\"GetCode\",\"arguments\":\"\",\"value\":\"\"}";
+    CHECK(!rp_shader_resolve(&q, &p) && p && !warn_lines[0] && !last_red[0] && nvn_unimpl_count("shader", "noop_instruction_Sam") == 0,
+          "noop-log: a result without logs counts nothing");
+    fake_gs_log_deps = NULL; fake_gs_success = 0; fake_gs_result_mode = 0; fake_reg_changes = 1;
+    // 计算程序的现编走另一处（resolve_compute_slow）：同样计数
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset(); warn_lines[0] = 0;
+    source(); bind_pools(7); fake_cs_success = 1; compiler_calls = 0;
+    fake_cs_log_deps = "{\"method\":\"Log\",\"arguments\":\"\",\"value\":\"Shader instruction Ram is not implemented.\",\"source\":\"translator\"}";
+    const struct rp_prog *cp = NULL;
+    CHECK(!rp_shader_resolve_compute(&cp) && cp && compiler_calls == 1 && nvn_unimpl_count("shader", "noop_instruction_Ram") == 1 &&
+          count_substr(warn_lines, "noop_instruction_Ram：") == 1, "noop-log: a compute compile counts its whitelisted log too (Ram=%llu)",
+          (unsigned long long)nvn_unimpl_count("shader", "noop_instruction_Ram"));
+    fake_cs_log_deps = NULL; fake_cs_success = 0;
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset();
+}
+
 /* 句柄在游戏用户常量缓冲里的贴图（#999 第 4 片）：编译器按 (fs, 字 92, c3) 报缺事实 → 宿主读 c3 第 92 字 → 贴图号 → 补事实当场重编。 */
 static int ubo_fact_in_request(const char *sampler, int normalized) {
     const char *p = strstr(captured, "\"stage\":\"fs\",\"handle\":92,\"cbufSlot\":3,"), *end = p ? strchr(p, '}') : NULL;
@@ -1124,6 +1191,7 @@ int main(int argc, char **argv) {
     graphics_alias_fact_test(1);
     graphics_alias_fact_bg_test(1);
     graphics_ubo_handle_fact_test();
+    graphics_noop_log_tally_test();
     query_sampler_test();
     unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR"); rp_state_reset(); source();
     for (int cs = 0; cs < 2; cs++) {

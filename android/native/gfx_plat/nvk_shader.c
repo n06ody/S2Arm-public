@@ -932,6 +932,38 @@ static uint64_t diag_begin(const uint8_t *id, unsigned stages, int submit) {
 static void diag_end(uint64_t token, int success) {
     if (token && s2a_direct_diag_compile_end) s2a_direct_diag_compile_end(token, success);
 }
+// #1680：编译器按具名白名单放行的「Ryujinx 空实现」指令（DirectShaderCompiler.NoOpInstructionLogs：Sam / Ram）。现编成功的结果里
+// 它们留在 content.dependencies 的 method=Log 项里；这里按指令记具名计数 noop_instruction_<名>，首次一行 WARN，不静默。
+// 只数现场编译（每份程序一次，不是每笔绘制）；跨局缓存 / 离线库来的结果不再数。成功结果里出现不是「Shader instruction X is not implemented.」
+// 形态的 Log，说明编译器与宿主口径对不上：记 noop_instruction_unexpected 并报红（编译器对白名单外的诊断整份拒收，正常不会到这里）。
+static void noop_log_tally(const uint8_t *bytes, size_t len) {
+    struct s2a_jv doc = {(const char *)bytes, len}, content, deps, v;
+    if (s2a_jv_obj_find(doc, "content", &content) || s2a_jv_obj_find(content, "dependencies", &deps) || !s2a_jv_is_array(deps)) return;
+    const char *p = s2a_jv_ws(deps.p + 1, deps.p + deps.n), *end = deps.p + deps.n;   // 走一遍（依赖里有很长的取码记录，不逐项 arr_item）
+    while (p < end && *p != ']') {
+        const char *next;
+        if (s2a_jv_scan(p, end, &next)) return;
+        struct s2a_jv item = {p, (size_t)(next - p)};
+        char method[64], value[128], ins[24], name[64];
+        if (!s2a_jv_obj_find(item, "method", &v) && !s2a_jv_str(v, method, sizeof method) && !strcmp(method, "Log")) {
+            int used = 0;
+            if (s2a_jv_obj_find(item, "value", &v) || s2a_jv_str(v, value, sizeof value) ||
+                sscanf(value, "Shader instruction %23[A-Za-z0-9] is not implemented.%n", ins, &used) != 1 || !used || value[used])
+                red1("noop_instruction_unexpected", "成功的现编结果里有一条不是「Shader instruction X is not implemented.」形态的翻译器日志：编译器与宿主口径不一致");
+            else {
+                snprintf(name, sizeof name, "noop_instruction_%s", ins);
+                if (nvn_unimpl("shader", name, NULL) == 1) {
+                    char line[160];
+                    snprintf(line, sizeof line, "%s：Ryujinx 空实现的指令，按无操作放行（编译器具名白名单，#1680）；之后只计数", name);
+                    nvn_plat_log(NVN_PLAT_LOG_WARN, "shader", line);
+                }
+            }
+        }
+        p = s2a_jv_ws(next, end);
+        if (p < end && *p == ',') p = s2a_jv_ws(p + 1, end);
+        else break;
+    }
+}
 struct work_snap {
     uint64_t epoch;
     uint32_t stages;
@@ -1146,6 +1178,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         }
         bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL;
         s2a_compile_outcome_free(&oc);
+        noop_log_tally(bytes, len);
         atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
         if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
         if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, s->identity, bytes, len);
@@ -1925,6 +1958,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 return -1;
             }
             bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL; s2a_compile_outcome_free(&oc);
+            noop_log_tally(bytes, len);
             atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
             if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
             if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, rq.identity, bytes, len);

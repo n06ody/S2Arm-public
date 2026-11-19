@@ -126,10 +126,15 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("TRANSLATION", error.GetType().Name + ": " + error.Message);
             }
 
+            // 翻译器诊断（GpuAccessor.Log）：白名单里的放行（翻译照 Ryujinx 继续，宿主按结果 dependencies 里的 Log 计数），其余整份拒收。
+            //   消息带「首条拒收诊断 + 拒收诊断总条数 + 放得下的其余几条」（#1680：原先只报 Diagnostics[0]，同一程序里别的未实现指令看不到）。
+            var blocking = new List<string>();
             foreach (DirectGpuAccessor accessor in accessors)
-                if (accessor.Diagnostics.Count != 0)
-                    throw new DirectCompileException("TRANSLATION_DIAGNOSTIC",
-                        accessor.Diagnostics[0] + " (stage " + accessorStage(accessor, translated) + ")");
+                foreach (string diagnostic in accessor.Diagnostics)
+                    if (!NoOpInstructionLogs.ContainsKey(diagnostic))
+                        blocking.Add(diagnostic + " (stage " + accessorStage(accessor, translated) + ")");
+            if (blocking.Count != 0)
+                throw new DirectCompileException("TRANSLATION_DIAGNOSTIC", DiagnosticSummary(blocking));
 
             foreach (var entry in translated)
                 ValidateSpirv(entry.stage, entry.shader, entry.accessor, allocator, profile, kindCheck, program.StageOf("gs") != null);
@@ -472,6 +477,49 @@ namespace S2A.DirectCompiler
         //   （第二道 message[256] 更宽）。#1488 的那条基础消息（含 64 个字符的请求 sha）典型 175 个字符（边界用例实测）、各数取 int 极值最坏 204，
         //   留给现场的只有 41～70 个字符；
         //   超了就从最低优先级的字段起丢（用例钉最坏情形与边界；宿主用例钉「245 个字符的消息仍归类」）。
+        // #1680：Ryujinx 空实现、且在结构化控制流下语义就是无操作的指令（具名白名单；键是 Ryujinx InstEmit 打的日志原文，逐字比，不做前缀 / 模糊匹配）。
+        //   只登记逐条论证过的指令；新加一条要同时给依据和宿主用例。不在这里的诊断照样整份拒收（通用层「未实现报红、不兜底」不变）。
+        //   Sam / Ram（Maxwell 操作码 0xE37 / 0xE38）：存 / 取硬件的线程活跃掩码，与陷阱返回 RTT 配套。
+        //     依据 1（真值）：Ryujinx InstEmit.Sam / InstEmit.Ram（compat/tree/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs）只 GetOp + Log，
+        //       不发 IR，翻译继续，Ryujinx 照这个产物画；跳过它与 Ryujinx 的 IR 逐条相同。
+        //     依据 2（控制流）：InstTable 里两条只带 InstProps.NoPred，没有 Bra / 控制流属性，解码出的基本块与分支不受它们影响。
+        //     依据 3（语义）：SPIR-V 是结构化控制流，线程活跃与否由结构化分支 / 合流隐式决定，没有可存取的活跃掩码；
+        //       发散的汇合由翻译器按 SSY / SYNC / BRK 等结构重建，不依赖 SAM / RAM 存下的掩码。
+        //   指纹：本文件在直连翻译闭包（DirectClosure.targets：compiler/*.cs）里，改动自动换闭包、旧现编结果不复用；
+        //     不改 compat/tree（Ryujinx CodeGenVersion 不动）、不在苹果 Dsh 的翻译器指纹输入里（S2A.Dsh.csproj DshXfpInput 只引 compiler/Sha256.cs），苹果 xfp 不变。
+        public static readonly IReadOnlyDictionary<string, string> NoOpInstructionLogs = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["Shader instruction Sam is not implemented."] = "Sam",
+            ["Shader instruction Ram is not implemented."] = "Ram",
+        };
+
+        // 拒收消息：首条原样在前（宿主 / 旧读数按它归类）；多于一条时补 " [diagnostics=N: 第 2 条; 第 3 条 …]"，同文合并成「 xk」（只用 ASCII：宿主 reason[320] 按字节算），
+        //   放不下的从最后一项起整项丢（不截半项）；连「[diagnostics=N]」都放不下就只留首条（与改前同形）。上限同 HostMessageMaxChars。
+        public static string DiagnosticSummary(List<string> blocking)
+        {
+            string first = blocking[0];
+            if (blocking.Count == 1) return first;
+            var rest = new List<(string text, int count)>();
+            for (int i = 1; i < blocking.Count; i++)
+            {
+                int at = rest.FindIndex(r => r.text == blocking[i]);
+                if (at >= 0) rest[at] = (rest[at].text, rest[at].count + 1);
+                else if (blocking[i] == first) continue;
+                else rest.Add((blocking[i], 1));
+            }
+            int firstRepeats = blocking.Count(d => d == first);
+            string head = first + (firstRepeats > 1 ? " x" + firstRepeats : "") + " [diagnostics=" + blocking.Count;
+            if (head.Length + 1 > HostMessageMaxChars) return first;
+            var text = new StringBuilder(head);
+            for (int i = 0; i < rest.Count; i++)
+            {
+                string item = (i == 0 ? ": " : "; ") + rest[i].text + (rest[i].count > 1 ? " x" + rest[i].count : "");
+                if (text.Length + item.Length + 1 > HostMessageMaxChars) break;
+                text.Append(item);
+            }
+            return text.Append(']').ToString();
+        }
+
         private const int HandleDetailKeyChars = 48;
         private const int HostMessageMaxChars = 245;
 
