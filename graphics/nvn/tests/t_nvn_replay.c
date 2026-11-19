@@ -177,10 +177,22 @@ uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
     if (f == g_caps_nofilter) c &= ~(uint32_t)NVN_GPU_FMT_FILTER;
     if (f == g_caps_noblend) c &= ~(uint32_t)NVN_GPU_FMT_BLEND;
     return c; }
+static int g_window_capture; static uint8_t g_window_linear[512], g_window_raw[512];
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     (void)t; if (g_nup == 16) return;
     g_up[g_nup].pre = c->is_pre; g_up[g_nup].level = level; g_up[g_nup].layer = layer; g_up[g_nup].pitch = row_bytes; g_up[g_nup].img = image_bytes; g_up[g_nup].y = r->yoffset; g_up[g_nup].w = r->width; g_up[g_nup].h = r->height;
-    memcpy(g_up[g_nup].first, src, image_bytes < 64 ? image_bytes : 64); g_nup++; }
+    memcpy(g_up[g_nup].first, src, image_bytes < 64 ? image_bytes : 64);
+    if (g_window_capture && image_bytes == sizeof g_window_linear) memcpy(g_window_linear, src, sizeof g_window_linear);
+    g_nup++; }
+// 块线性上传替身：快照调用参数；能力开时回放必须传原始存储，不应先在线程解排。
+static int g_block_uploads;
+static struct { uint32_t level, layer; uint64_t bytes; const void *src; nvn_texlayout layout; } g_block_call[16];
+void nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const nvn_texlayout *L, const void *src, uint64_t bytes) {
+    (void)c; (void)t;
+    if (g_window_capture && bytes == sizeof g_window_raw) memcpy(g_window_raw, src, sizeof g_window_raw);   // 契约：入口返回前必须拍下源字节
+    if (g_block_uploads < 16) { g_block_call[g_block_uploads].level = level; g_block_call[g_block_uploads].layer = layer; g_block_call[g_block_uploads].bytes = bytes; g_block_call[g_block_uploads].src = src; g_block_call[g_block_uploads].layout = *L; }
+    g_block_uploads++;
+}
 // 脏页替身：代号由用例推进
 static uint64_t g_dirty_now = 100, g_dirty_written; static int g_protects; static const void *g_prot_addr; static size_t g_prot_len;   // 最近一次保护的范围
 void nvn_dirty_protect(const void *addr, size_t len) { g_prot_addr = addr; g_prot_len = len; g_protects++; }
@@ -1554,6 +1566,52 @@ static void t_cpu_upload(void) {   // 存储里是 CPU 写的数据：首次使�
     nvn_be_tex_release(&t);
     CHECK(g_tex_releases - r0 == 1 && rp_res_tex_built() == 0);                     // CPU 内容贴图不进共用表：对象 Finalize 即放
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// 能力位开启时原始块线性数据逐级交给后端；线性贴图仍走 CPU 行拷。
+static void t_gpu_deswizzle_route(void) {
+    nvn_be_sub_begin(); res_fresh(); g_caps_extra |= NVN_GPU_CAP_GPU_DESWIZZLE; g_block_uploads = 0;
+    tex_t t = mk_tex(60001, 0, NVN_FORMAT_RGBA8, 8, 8, 2, 0);
+    memset(t.mem, 0x5a, t.L.size);
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+    CHECK(g_block_uploads == 2 && g_nup == 0);
+    CHECK(g_block_call[0].level == 0 && g_block_call[1].level == 1 && g_block_call[0].layer == 0);
+    CHECK(g_block_call[0].src == t.mem && g_block_call[0].bytes == t.L.size && g_block_call[0].layout.layer_size == t.L.layer_size);
+    nvn_be_tex_release(&t); res_fresh(); g_block_uploads = 0;
+    tex_t lin = mk_tex(60002, 0, NVN_FORMAT_R8, 8, 8, 1, NVN_TEXTURE_FLAGS_LINEAR);
+    memset(lin.mem, 0x33, lin.L.size);
+    CHECK(rp_tex_resolve(&lin, &g_fake_cmd) != NULL && g_block_uploads == 0 && g_nup == 1);
+    nvn_be_tex_release(&lin); res_fresh(); g_caps_extra &= ~NVN_GPU_CAP_GPU_DESWIZZLE; g_block_uploads = 0;
+    tex_t off = mk_tex(60003, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); memset(off.mem, 0x37, off.L.size);
+    CHECK(rp_tex_resolve(&off, &g_fake_cmd) != NULL && g_block_uploads == 0 && g_nup == 1);
+    nvn_be_tex_release(&off); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// 在途 GPU 写的池镜像比游戏内存更新；不能从旧 CPU 字节建图或当成零。
+static void t_gpu_deswizzle_pending(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    nvn_be_shutdown_session(); res_fresh(); nvn_unimpl_reset(); g_buf_cpu_auto = 1; g_pg_tracked = 0;
+    g_caps_extra |= NVN_GPU_CAP_GPU_DESWIZZLE; g_block_uploads = 0;
+    nvn_be_pool_add(g_tmem, sizeof g_tmem); nvn_be_sub_begin();
+    uint64_t base = (uint64_t)(uintptr_t)g_tmem, key = 0;
+    nvn_gpu_buf mirror = NULL; CHECK(rp_buf_resolve(&g_fake_cmd, base, sizeof g_tmem, &mirror, NULL) && mirror && mirror->cpu);
+    uint64_t id = rp_buf_gpu_write_note(base, 16, &key); CHECK(id && key == base);
+    tex_t a = mk_tex(60011, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0); a.has_layout = 1; memset(a.mem, 0x5a, a.L.size);
+    tex_t b = mk_tex(60012, 0, NVN_FORMAT_RGBA8, 8, 8, 1, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
+    tex_t other = mk_tex(60013, 8192, NVN_FORMAT_RGBA8, 8, 8, 1, 0); other.has_layout = 1; memset(other.mem, 0x62, other.L.size);
+    int before = g_block_uploads, linear_before = g_nup;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) == NULL && g_block_uploads == before);
+    CHECK(rp_tex_resolve(&b, &g_fake_cmd) == NULL && g_block_uploads == before && g_nup == linear_before);
+    CHECK(nvn_unimpl_count("tex", "gpu_deswizzle_pending_pool_write") == 2);
+    CHECK(rp_tex_resolve(&other, &g_fake_cmd) != NULL && g_block_uploads == before + 1);
+    if (mirror && mirror->cpu) memset(mirror->cpu, 0x7b, 16);
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_block_uploads == before + 2 && a.mem[0] == 0x7b);
+    CHECK(rp_tex_resolve(&b, &g_fake_cmd) != NULL && g_block_uploads == before + 3);
+    nvn_be_tex_release(&a); nvn_be_tex_release(&b); nvn_be_tex_release(&other);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_tmem);
+    g_caps_extra &= ~NVN_GPU_CAP_GPU_DESWIZZLE; g_buf_cpu_auto = 0; g_pg_tracked = 1; nvn_be_shutdown_session(); res_fresh();
 }
 
 static void t_cpu_rules(void) {   // 首用判定的三条分支
@@ -5429,6 +5487,8 @@ int main(int argc, char **argv) {
     t_read_texels_guest();
     t_read_texels_gpu_owned();
     t_cpu_upload();
+    t_gpu_deswizzle_route();
+    t_gpu_deswizzle_pending();
     t_cpu_rules();
     t_linear_upload();
     t_linear_reject();
