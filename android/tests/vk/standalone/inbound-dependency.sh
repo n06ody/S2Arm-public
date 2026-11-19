@@ -6,6 +6,7 @@ repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 out="$repo/build/vk-inbound-dependency";mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}"
 : "${S2A_VK_LAYER_DIR:?validation required}"
+python3 "$repo/android/tests/vk/syncval_capability.py" "$S2A_VK_LAYER_DIR/VkLayer_khronos_validation.json"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2;exit 2; }
 for shader in inbound_storage_write.frag compute_read_buffer.frag;do glslc --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv";done
 glslc --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/fullscreen.vert.spv"
