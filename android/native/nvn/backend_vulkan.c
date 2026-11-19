@@ -7161,16 +7161,24 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
                    (v->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? 2u : 0u) | (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT ? 4u : 0u);
     return out->storage && out->aspects;
 }
-void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch) {
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd ch, uint32_t consumers) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "计算写的可见性屏障必须在通道外"); return; }
-    VkPipelineStageFlags dst = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
-    mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst,
-        VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
-        VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    if (!consumers || (consumers & ~NVN_GPU_CGR_ALL)) { set_sticky(c, NVN_GPU_E_ARG, "计算写消费者范围无效"); return; }
+    VkPipelineStageFlags dst = 0; VkAccessFlags access = 0;
+    if (consumers & NVN_GPU_CGR_INDIRECT) { dst |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT; access |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT; }
+    if (consumers & NVN_GPU_CGR_INDEX) { dst |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT; access |= VK_ACCESS_INDEX_READ_BIT; }
+    if (consumers & NVN_GPU_CGR_VERTEX) { dst |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT; access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT; }
+    if (consumers & (NVN_GPU_CGR_VS_SHADER | NVN_GPU_CGR_VS_UNIFORM)) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (consumers & (NVN_GPU_CGR_FS_SHADER | NVN_GPU_CGR_FS_UNIFORM)) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (consumers & (NVN_GPU_CGR_GS_SHADER | NVN_GPU_CGR_GS_UNIFORM)) {
+        if (g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+        else if (consumers != NVN_GPU_CGR_ALL) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "计算写的几何消费者不可用"); return; }
+    }
+    if (consumers & (NVN_GPU_CGR_VS_SHADER | NVN_GPU_CGR_FS_SHADER | NVN_GPU_CGR_GS_SHADER)) access |= VK_ACCESS_SHADER_READ_BIT;
+    if (consumers & (NVN_GPU_CGR_VS_UNIFORM | NVN_GPU_CGR_FS_UNIFORM | NVN_GPU_CGR_GS_UNIFORM)) access |= VK_ACCESS_UNIFORM_READ_BIT;
+    mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, dst, access);
 }
 
 void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {

@@ -19285,8 +19285,8 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
     if (out) memset(out, 0, sizeof *out);
     return 0;
 }
-void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c) {
-    (void)c;
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers) {
+    (void)c; (void)consumers;
     // Metal 3: tracked resources use automatic hazard tracking; indirect
     // argument-buffer / GPU-address accesses also retain m4_end -> m3_wait's
     // existing fence chain. This compatibility hook adds no operation.
