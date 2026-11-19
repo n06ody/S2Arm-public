@@ -88,7 +88,7 @@ static int depth_blit_pipelines(uint32_t format, unsigned slot) {
         ci.stageCount = 2; ci.pStages = stages; ci.pVertexInputState = &vi; ci.pInputAssemblyState = &ia; ci.pViewportState = &vp; ci.pRasterizationState = &rs;
         ci.pMultisampleState = &ms; ci.pDepthStencilState = &ds; ci.pColorBlendState = &cb; ci.pDynamicState = &dyn;
         ci.layout = g_dsb.layout; ci.renderPass = g_dsb.p[slot].pass;
-        if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &ci, NULL, out) != VK_SUCCESS) return 0;
+        if (diag_graphics_create(&ci, out, 4) != VK_SUCCESS) return 0;
         plc_created();
     }
     return 1;

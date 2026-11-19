@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdbool.h>
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -413,8 +414,23 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     const int descriptor_enable = descriptor_query && out->descriptor_indexing_runtime &&
                                   out->descriptor_indexing_partial && out->descriptor_indexing_sampled_nonuniform &&
                                   out->descriptor_indexing_storage_nonuniform;
-    const char *device_ext[20];
+    const char *device_ext[24];
     uint32_t device_ext_count = 0;
+    // App API version is 1.1: use the EXT only after explicit negotiation.
+    // Diagnostic-only; missing support leaves feedback unknown.
+#if defined(__ANDROID__) || defined(S2A_PIPE_FEEDBACK_TEST)
+#if defined(__ANDROID__)
+    extern int nvn_plat_flag(const char *, int) __attribute__((weak));
+    int feedback_requested = nvn_plat_flag && nvn_plat_flag("direct_trace", 0) == 1;
+#else
+    int feedback_requested = prop_int("S2A_TEST_PIPE_FEEDBACK", 0) == 1;
+#endif
+    if (feedback_requested && has_device_extension(out->physical, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+        device_ext[device_ext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
+        out->pipeline_creation_feedback_enabled = 1;
+    }
+    S2A_DLOG("[s2a] vk pipeline creation feedback enabled=%d\n", out->pipeline_creation_feedback_enabled);
+#endif
     // apiVersion=1.1，不能拿物理设备支持 1.3 当作应用已启用核心 NONE。
     // 此扩展没有额外 feature 位；缺失时仍走独立快照，不能用 DONT_CARE 假代 NONE。
     out->load_store_op_none_enabled = has_device_extension(out->physical, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);

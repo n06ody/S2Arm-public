@@ -121,6 +121,7 @@ s2a_gate_step bash "$android_dir/tools/system_tuning_test.sh"
 s2a_gate_step bash "$android_dir/tools/power_state_test.sh"
 # 转储解析器（宿主，确定性）：分片拼回/完整性拒绝、全窗统计、与 16 帧聚合行对拍、C→python 对拍。
 s2a_gate_step "$PY" "$android_dir/tests/direct_framelog_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/vk/syncval_capability_test.py"
 # 设备锁与起局最小闭环（宿主，确定性；adb 替身不起真机）：锁并发/失效/留置、还原失败保留锁、
 # 局目录被 tools/quality_check.py 安卓分支判读。
 s2a_gate_step "$PY" "$android_dir/tests/device_lock_test.py"
@@ -134,6 +135,7 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_touch_generation_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/generic_compile_events_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/compile_events_reader_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_trace_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/scene_timeline_test.py"
 # 每线程缓冲（备忘槽/暂存的堆化）：线程退出后归还、同线程复用、扩容保留内容。
 s2a_gate_step bash "$android_dir/tools/nvn_vk_threadbuf_test.sh"
 # CMake 挑选规则的宿主单测（假 cmake，可移植，始终跑）
@@ -335,9 +337,11 @@ s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链�
 s2a_gate_step "$PY" "$android_dir/tests/graphics_request_name_test.py"
 # 新回放层：真实图形/计算请求生产入口的贴图池容量、超限与调试读数。
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/nvk_libpack_alignment_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/nvk_retained_frame_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
@@ -394,6 +398,8 @@ s2a_gate_step bash "$android_dir/tools/nvn_warm_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvk_warm_modules_test.sh"
 # 复核 P1-1 / P1-2：程序借用（ASan 下读收尾释放后的记录）与配方级在途表（同配方合并 / 不同配方不排队）
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_flight_test.sh"
+# 画质设置来源（渲染倍率 / 上屏滤镜）：调试门开时调试属性 debug.s2a.res_scale / scaling_filter 优先，玩家包只认环境
+s2a_gate_step bash "$android_dir/tools/nvk_quality_cfg_test.sh"
 # 首用待定表（纯逻辑）与 demand 后台建管线（fake Vulkan）：状态机 / 同键合并 / 有界等待 / late-stuck / P0 不串管线。
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_pend_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvn_vk_pipe_demand_test.sh"

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include "gfx_plat/nvk_session.h"
+#include "gfx_plat/nvk_quality_cfg.h"
 #include "nvn_backend.h"
 #include "nvn_unimpl.h"
 #include "rp_exec.h"
@@ -29,6 +30,15 @@ int nvk_warm_stop(void) { return 0; }   // #996 起停局先停预热带与需�
 void nvk_warm_start(void) {}
 void nvn_vk_pipe_demand_start(void) {}
 void nvn_vk_pipe_demand_stop(void) {}
+// 会话夹具模拟调试门关闭：属性不可读，配置必须各交给回放一次。
+static int scale_configs, filter_configs;
+int nvk_quality_read_properties(char *scale, size_t scale_cap, char *filter, size_t filter_cap) {
+    if (!scale || !scale_cap || !filter || !filter_cap) return 0;
+    scale[0] = filter[0] = 0;
+    return 0;
+}
+void rp_rs_configure(const char *value) { (void)value; scale_configs++; }
+void rp_present_filter_configure(const char *value) { (void)value; filter_configs++; }
 void nvn_dirty_set_chunk_pages(uint32_t n) { (void)n; }
 int nvn_dirty_log_configure(int enabled) { if (enabled) log_attempts++; return 0; } // 本夹具不提供真实写跟踪，保守拒绝。
 int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_buf_dirtylog") ? (log_flag < 0 ? dflt : log_flag) : dflt; }   // log_flag -1 = 没设，取缺省
@@ -46,7 +56,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "log-off") || !strcmp(argv[1], "log-default")) {   // 关：不配置；缺省（没设开关）：要配置，夹具拒了就报黄
         log_flag = !strcmp(argv[1], "log-off") ? 0 : -1; const int want = log_flag != 0;
         if (nvk_session_open(NULL, NULL, NULL, 0)) return 1;
-        if (log_attempts != want || (want && !strstr(logs, "脏页追加日志未启用"))) {
+        if (scale_configs != 1 || filter_configs != 1 || log_attempts != want || (want && !strstr(logs, "脏页追加日志未启用"))) {
             fprintf(stderr, "FAIL: dirty-page log configure/diagnostic\n"); return 1;
         }
         printf("session/%s: attempts=%d refusal_logged=%d\n", argv[1], log_attempts, !!strstr(logs, "脏页追加日志未启用"));

@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint64_t s2a_direct_diag_pipe_begin(unsigned kind, int warm) __attribute__((weak));
+void s2a_direct_diag_pipe_end(uint64_t token, int success, unsigned feedback) __attribute__((weak));
+
 // 管线变体：shader 索引 + 两个 specialization constant 值（无第二常量时 c1 未用）。
 struct variant { int shader; uint32_t c0, c1; };
 enum { SH_S3TC, SH_RGTC, SH_BC6, SH_BC7 };
@@ -132,7 +135,10 @@ int nvn_vk_bcdec_create(struct s2a_vk_device *d, struct nvn_vk_bcdec **out, char
         ci.stage = (VkPipelineShaderStageCreateInfo){ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, bc->mod[v->shader], "main", &si };
         ci.layout = bc->pl;
-        if (vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, NULL, &bc->pipe[i]) != VK_SUCCESS) {
+        uint64_t token = s2a_direct_diag_pipe_begin ? s2a_direct_diag_pipe_begin(6, 0) : 0;
+        VkResult vr = vkCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &ci, NULL, &bc->pipe[i]);
+        if (token && s2a_direct_diag_pipe_end) s2a_direct_diag_pipe_end(token, vr == VK_SUCCESS, 0);
+        if (vr != VK_SUCCESS) {
             static const char *FAM[N_VARIANTS] = { "s3tc","s3tc","s3tc","rgtc","rgtc","rgtc","rgtc","bc6","bc6","bc7" };
             snprintf(why, why_size, "bcdec: %s compute pipeline failed (variant %u/%u)",
                      FAM[i], v->c0, v->c1); goto fail;
