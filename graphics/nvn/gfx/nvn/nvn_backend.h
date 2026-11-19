@@ -486,6 +486,9 @@ enum {
 void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
 // 通道外：此前镜像缓冲传输写对指定图形读可见；其他消费者不受此发布影响。
 void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
+// Earlier graphics shader storage writes become visible to the selected graphics readers.
+enum { NVN_GPU_GFX_SRC_VS = 1u << 0, NVN_GPU_GFX_SRC_FS = 1u << 1, NVN_GPU_GFX_SRC_GS = 1u << 2, NVN_GPU_GFX_SRC_ALL = 7 };
+void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈
