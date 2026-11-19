@@ -582,7 +582,7 @@ namespace S2A.DirectCompiler
                         var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
                         string stageWhy = stageC0.Length > 1 ? "c0_bindings=" + stageC0.Length : null;
                         int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
-                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, out stageWhy);
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, out stageWhy, boundDynamic: true);
                         writer.WritePropertyName("c0Reads");
                         WriteRanges(writer, stageReads);
                         // 诊断读数：c0Reads 为 null 时分析器是哪一条判的（见 DirectComputeC0Reads.Analyze 的 why）；消费端只拿来打日志，不参与判定。

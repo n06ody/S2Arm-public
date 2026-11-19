@@ -244,7 +244,7 @@ int main(void) {
             { ",\"c0Reads\":[]", ",\"c0Reads\":null,\"c0ReadsWhy\":\"escape:op=12,w=4\"", "", "escape:op=12,w=4", "null read set carries the analyzer reason" },
             { ",\"c0ReadsWhy\":\"dynamic\"", "", "dynamic", "", "missing c0Reads still carries the reason; missing reason stays empty" },
             { ",\"c0Reads\":[],\"c0ReadsWhy\":\"layout\"", ",\"c0Reads\":null,\"c0ReadsWhy\":7", "", "", "known read set ignores the reason; non-string reason is dropped" },
-            { "", ",\"c0Reads\":null,\"c0ReadsWhy\":\"0123456789012345678901234567\"", "", "", "over-long reason is dropped, result still accepted" },
+            { "", ",\"c0Reads\":null,\"c0ReadsWhy\":\"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"", "", "", "over-long reason is dropped, result still accepted" },
         };
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             char json[1024]; char msg[512];
