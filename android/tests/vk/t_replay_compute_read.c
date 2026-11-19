@@ -313,7 +313,7 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
  }
  if(is_full && getenv("S2A_INBOUND_FINAL") && ndraw==1){
   inbound_fallback++;const char *mode=getenv("S2A_GFX_ACCESS_MODE");
-  if(mode && !strcmp(mode,"13")){VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;inbound_fallback_omitted++;
+  if(mode && (!strcmp(mode,"13") || !strcmp(mode,"31") || !strcmp(mode,"33"))){VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;inbound_fallback_omitted++;
    real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;}
  }
  if(is_full && getenv("S2A_GFX_HAZARD") && ndraw==1){

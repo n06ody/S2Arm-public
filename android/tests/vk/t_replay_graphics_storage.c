@@ -3,10 +3,11 @@
 #define main compute_read_original_main
 #include "t_replay_compute_read.c"
 #undef main
-struct inbound_diag {uint64_t narrow, fallback, boundary, outside, draw, dispatch, multi, unknown, diag_other, diag_full, diag_game, diag_ct, diag_att, site_sum, site_overflow;};
+struct inbound_diag {uint64_t narrow, fallback, boundary, outside, draw, dispatch, multi, unknown, diag_other, diag_full, diag_game, diag_ct, diag_att, site_sum, site_overflow, pending_clean, pending_writes, pending_unknown, pending_war, pending_pre;};
 static void inbound_diag_read(void *user,const char *name,uint64_t value){
  struct inbound_diag *d=user;
- if(!strcmp(name,"inbound_narrow_passes"))d->narrow=value;else if(!strcmp(name,"inbound_fallback_passes"))d->fallback=value;
+ if(!strcmp(name,"inbound_diag_draw_pre_unresolved"))d->pending_pre=value;else if(!strcmp(name,"inbound_diag_draw_no_nonatt_write"))d->pending_clean=value;else if(!strcmp(name,"inbound_diag_draw_nonatt_write"))d->pending_writes=value;else if(!strcmp(name,"inbound_diag_draw_source_unknown"))d->pending_unknown=value;else if(!strcmp(name,"inbound_diag_draw_no_nonatt_write_prior_read"))d->pending_war=value;
+ else if(!strcmp(name,"inbound_narrow_passes"))d->narrow=value;else if(!strcmp(name,"inbound_fallback_passes"))d->fallback=value;
  else if(!strcmp(name,"inbound_fallback_boundary"))d->boundary=value;else if(!strcmp(name,"inbound_fallback_outside"))d->outside=value;
  else if(!strcmp(name,"inbound_fallback_draw"))d->draw=value;else if(!strcmp(name,"inbound_fallback_dispatch"))d->dispatch=value;
  else if(!strcmp(name,"inbound_fallback_multi_write"))d->multi=value;else if(!strcmp(name,"inbound_fallback_unknown"))d->unknown=value;
@@ -17,7 +18,7 @@ static void inbound_diag_read(void *user,const char *name,uint64_t value){
 int main(int argc,char **argv){
  encoding_thread=1;const char *mode=getenv("S2A_GFX_ACCESS_MODE");int m=mode?atoi(mode):0;REQUIRE(argc==4);int src_vs=!strcmp(argv[2],"VS"),dst_vs=!strcmp(argv[3],"VS");
  REQUIRE(src_vs||!strcmp(argv[2],"FS"));REQUIRE(dst_vs||!strcmp(argv[3],"FS"));
- const char *hazard=getenv("S2A_GFX_HAZARD");int waw=hazard&&!strcmp(hazard,"WAW"),war=(hazard&&!strcmp(hazard,"WAR")) || (m>=22 && m<=24);int xseg=getenv("S2A_GFX_XSEG")!=NULL;normalize_dependencies=1;track_all_draws=1;
+ const char *hazard=getenv("S2A_GFX_HAZARD");int waw=hazard&&!strcmp(hazard,"WAW"),war=(hazard&&!strcmp(hazard,"WAR")) || ((m>=22 && m<=24) || m==27 || m==29 || m==31 || m==32 || m==33 || m==34);int xseg=getenv("S2A_GFX_XSEG")!=NULL;normalize_dependencies=1;track_all_draws=1;
  struct s2a_vk_device d;char why[256];REQUIRE(!s2a_vk_device_create(&d,why,sizeof why));
  nvn_gpu_open_desc od={0};od.host_device=&d;od.app_label="replay-graphics-storage";GPU(nvn_gpu_open(&od,&err));
  if(xseg){REQUIRE(d.timeline_semaphore_enabled);VkSemaphoreTypeCreateInfoKHR type={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR,.semaphoreType=VK_SEMAPHORE_TYPE_TIMELINE_KHR,.initialValue=0};
@@ -60,7 +61,7 @@ int main(int argc,char **argv){
  graphics.nent[0]=graphics.nent[1]=0;graphics.nent[dst_vs?0:1]=1;graphics.ent[dst_vs?0:1][0]=entry[1];graphics.sh[0]=shaders[1][0];graphics.sh[1]=shaders[1][1];rp_dirty_all();
  rp_draw(active,&draw,NULL,&draw);rp_pass_flush(active);
  uint64_t draws=0,skips=0;rp_draw_stats(&draws,&skips);REQUIRE(draws==2&&skips==0&&!nvn_unimpl_kinds());
- nvn_gpu_copy_tex_buf(active,war?tex2:tex,0,0,NULL,rb,0,256,16384);if(m==22)nvn_gpu_inbound_diag_precedes_main(active);GPU(nvn_gpu_cmd_commit(active,serial,done,NULL,&err));
+ nvn_gpu_copy_tex_buf(active,war?tex2:tex,0,0,NULL,rb,0,256,16384);if(m==22 || m==29)nvn_gpu_inbound_diag_precedes_main(active);GPU(nvn_gpu_cmd_commit(active,serial,done,NULL,&err));
  if(xseg){
   struct timespec deadline;REQUIRE(clock_gettime(CLOCK_REALTIME,&deadline)==0);deadline.tv_sec+=10;
   pthread_mutex_lock(&inbound_submit_mu);int rc=0;while(inbound_submits_done<2 && !rc)rc=pthread_cond_timedwait(&inbound_submit_cv,&inbound_submit_mu,&deadline);
@@ -86,7 +87,7 @@ int main(int argc,char **argv){
  if(m==14) REQUIRE(inbound_fallback==0 && inbound_narrow_passes>=2);
  if(m==16) REQUIRE(inbound_fallback==1 && inbound_narrow_passes>=2);
  if(m==15) REQUIRE(inbound_fallback==0 && inbound_old_passes>=2);
- if(m>=12 && m<=26){
+ if(m>=12 && m<=34){
   struct inbound_diag diag={0};nvn_gpu_stats(inbound_diag_read,&diag,0);
   printf("INBOUND_DIAG narrow=%llu fallback=%llu boundary=%llu outside=%llu draw=%llu dispatch=%llu multi=%llu unknown=%llu\n",
    (unsigned long long)diag.narrow,(unsigned long long)diag.fallback,(unsigned long long)diag.boundary,
@@ -94,13 +95,20 @@ int main(int argc,char **argv){
   if(m==12 || m==13){REQUIRE(diag.fallback>=2 && diag.boundary>=1);if(!xseg)REQUIRE(diag.draw>=1);}
   if(m==14)REQUIRE(diag.narrow>=1 && diag.fallback>=1 && diag.boundary>=1);
   if(m==16)REQUIRE(diag.fallback>=2 && diag.draw>=1 && diag.multi>=1);
+  if(m>=27)printf("PENDING_DIAG no_nonatt_write=%llu prior_read=%llu nonatt_write=%llu unknown=%llu pre_unresolved=%llu\n",(unsigned long long)diag.pending_clean,(unsigned long long)diag.pending_war,(unsigned long long)diag.pending_writes,(unsigned long long)diag.pending_unknown,(unsigned long long)diag.pending_pre);
   if(m>=17)printf("INBOUND_SOURCE game=%llu attachment=%llu compute_transfer=%llu other=%llu full=%llu site_sum=%llu overflow=%llu\n",(unsigned long long)diag.diag_game,(unsigned long long)diag.diag_att,(unsigned long long)diag.diag_ct,(unsigned long long)diag.diag_other,(unsigned long long)diag.diag_full,(unsigned long long)diag.site_sum,(unsigned long long)diag.site_overflow);
-  if(m>=17){REQUIRE(diag.diag_other>=1 && diag.diag_full>=1);REQUIRE(diag.site_sum==diag.diag_full && !diag.site_overflow);}
+  if(m>=17 && m!=30){REQUIRE(diag.diag_other>=1 && diag.diag_full>=1);REQUIRE(diag.site_sum==diag.diag_full && !diag.site_overflow);}
   if(m==18)REQUIRE(diag.diag_game>=1);
   if(m==19)REQUIRE(diag.diag_ct>=1);
   if(m==23)REQUIRE(diag.diag_att>=1);
   if(m==22 || m==24)REQUIRE(diag.diag_att==0 && diag.diag_other>=2);
   if(m==25 || m==26)REQUIRE(diag.diag_game==0);
+  if(m==27 || m==31 || m==32 || m==33 || m==34)REQUIRE(diag.pending_clean==1 && diag.pending_war==1 && diag.pending_writes==0 && diag.pending_unknown==0 && diag.pending_pre==0);
+  if(m==31 || m==33)REQUIRE(inbound_fallback==1 && inbound_fallback_omitted==1);
+  if(m==32 || m==34)REQUIRE(inbound_fallback==1 && inbound_fallback_omitted==0);
+  if(m==30)REQUIRE(diag.pending_clean==0 && diag.pending_writes==0 && diag.pending_unknown==0);
+  if(m==28)REQUIRE(diag.pending_writes==1 && diag.pending_clean==0 && diag.pending_unknown==0);
+  if(m==29)REQUIRE(diag.pending_unknown==1 && diag.pending_clean==0 && diag.pending_writes==0 && diag.pending_pre==1);
   if(m==15)REQUIRE(!diag.narrow && !diag.fallback);
  }
  if(waw||war){const float *words=(const float *)(const void *)(nvn_gpu_buf_cpu(mirror)+(war && (m==9 || m==10)?560:304));REQUIRE(words[0]==1 && words[1]==0 && words[2]==0 && words[3]==1);}

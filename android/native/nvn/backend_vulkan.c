@@ -60,11 +60,16 @@ static const char *const stat_names[STAT_N] = {
 
 static int g_inbound_narrow, g_inbound_diag;
 enum { DIAG_ATT=1, DIAG_CT=2, DIAG_OTHER=4 };
+// 不改同步：自最近一道全阶段全访问屏障后的保守上界。附件写另由窄 dep 覆盖，
+// 但历史读仍可能与后续写构成 WAR，因此无非附件写不等于能删屏障。
+enum { DIAG_LEDGER_READ=1, DIAG_LEDGER_WRITE=2, DIAG_LEDGER_UNKNOWN=4 };
+enum { DIAG_DRAW_CLEAN, DIAG_DRAW_CLEAN_READ, DIAG_DRAW_WRITES, DIAG_DRAW_UNKNOWN, DIAG_DRAW_PRE_UNKNOWN, DIAG_DRAW_N };
 enum { DIAG_GAME, DIAG_ATTACH, DIAG_COMPUTE_TRANSFER, DIAG_MISC, DIAG_PASS_N };
 #define DIAG_SITES 128
 struct inbound_site { const char *fn; int line; uint64_t count; };
 static struct inbound_site g_inbound_sites[DIAG_SITES];
 static uint64_t g_inbound_site_overflow, g_inbound_diag_total, g_inbound_diag_pass[DIAG_PASS_N], g_inbound_host_epoch;
+static uint64_t g_diag_draw_pending[DIAG_DRAW_N];
 
 
 struct nvn_gpu_buf_s {
@@ -256,6 +261,8 @@ struct nvn_gpu_cmd_s {
     uint32_t inbound_outside, inbound_draw, inbound_dispatch, inbound_draw_reasons;
     uint32_t diag_pending; uint8_t diag_last_game, diag_has_pre;
     uint64_t diag_host_epoch, diag_pass[DIAG_PASS_N];
+    uint64_t diag_ledger_host_epoch, diag_draw_pending[DIAG_DRAW_N];
+    uint32_t diag_ledger;
     uint8_t inbound_boundary, inbound_draw_markable, inbound_mirror_markable, inbound_dispatch_markable, inbound_bind_ref, inbound_draw_overflow;
     nvn_gpu_rc sticky;
     char why[192];
@@ -1200,7 +1207,10 @@ static int cmd_ref_append(struct nvn_gpu_cmd_s *c, void *obj, int type) {
 }
 static void cmd_ref_at(struct nvn_gpu_cmd_s *c, void *obj, int type, const char *fn, int line) {
     if (!obj) return;
-    if (g_inbound_diag && !c->in_pass && !c->inbound_bind_ref && type != REF_SAMP) { c->diag_pending |= DIAG_OTHER; c->diag_last_game = 0; }
+    if (g_inbound_diag && !c->in_pass && !c->inbound_bind_ref && type != REF_SAMP) {
+        c->diag_pending |= DIAG_OTHER; c->diag_last_game = 0;
+        c->diag_ledger |= DIAG_LEDGER_UNKNOWN; // 通道外非绑定引用可能跟随传输/图像/内部操作；不能假定只读。
+    }
     if ((g_inbound_narrow || g_inbound_diag) && !c->in_pass && !c->inbound_bind_ref && type != REF_SAMP && c->inbound_outside != UINT32_MAX) c->inbound_outside++;
     uint64_t tag = 0, ep = 0;
     unsigned slot = 0;
@@ -2091,6 +2101,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g_inbound_diag = nvn_plat_flag("nvk_inbound_diag", 0) != 0;
     memset(g_inbound_sites, 0, sizeof g_inbound_sites);
     memset(g_inbound_diag_pass, 0, sizeof g_inbound_diag_pass);
+    memset(g_diag_draw_pending, 0, sizeof g_diag_draw_pending);
     g_inbound_site_overflow = g_inbound_diag_total = 0;
     __atomic_store_n(&g_inbound_host_epoch, 0, __ATOMIC_RELAXED);
     g.dev = dev;
@@ -2572,6 +2583,10 @@ static void full_barrier_at(struct nvn_gpu_cmd_s *c, const char *fn, int line, i
         VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    if (g_inbound_diag && src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) {
+        c->diag_ledger = 0;
+        c->diag_ledger_host_epoch = __atomic_load_n(&g_inbound_host_epoch, __ATOMIC_RELAXED);
+    }
     c->xfer_dirty = 0;
     c->xfer_pending_graphics = 0;
     c->inbound_boundary = 0; c->inbound_outside = c->inbound_draw = c->inbound_dispatch = c->inbound_draw_reasons = 0;
@@ -2594,6 +2609,14 @@ static void inbound_pass_guard(struct nvn_gpu_cmd_s *c) {
     inbound_diag_pass(c);
     if (!g_inbound_narrow && !g_inbound_diag) return;
     int boundary = c->inbound_boundary, outside = c->inbound_outside != 0, draw = c->inbound_draw != 0, dispatch = c->inbound_dispatch != 0;
+    if (g_inbound_diag && draw) {
+        uint32_t ledger = c->diag_ledger;
+        if (__atomic_load_n(&g_inbound_host_epoch, __ATOMIC_RELAXED) != c->diag_ledger_host_epoch) ledger |= DIAG_LEDGER_UNKNOWN;
+        if (ledger & DIAG_LEDGER_UNKNOWN) c->diag_draw_pending[DIAG_DRAW_UNKNOWN]++;
+        else if (ledger & DIAG_LEDGER_WRITE) c->diag_draw_pending[DIAG_DRAW_WRITES]++;
+        else if (ledger & DIAG_LEDGER_READ) c->diag_draw_pending[DIAG_DRAW_CLEAN_READ]++;
+        else c->diag_draw_pending[DIAG_DRAW_CLEAN]++;
+    }
     uint32_t reason = c->inbound_draw_reasons;
     pthread_mutex_lock(&g_mu);
     if (boundary || outside || draw || dispatch) {
@@ -4844,6 +4867,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    if (g_inbound_diag && natt) c->diag_ledger |= DIAG_LEDGER_READ;
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
     c->pass_natt = natt;
@@ -4947,6 +4971,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    if (g_inbound_diag && natt) c->diag_ledger |= DIAG_LEDGER_READ; // LOAD / 混合等按可能读保守计。
     PBP_STEP(3);
     c->in_pass = 1;
     c->pass_occl = d->occlusion;
@@ -5809,9 +5834,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     }
     if (g_inbound_diag) {
         c->diag_last_game = 0;
+        c->diag_ledger |= DIAG_LEDGER_READ; // 顶点/索引/间接/采样等可能读，是否别名尚未知。
         for (int st=0; st<NVN_GPU_SH_CS; st++) for (uint32_t i=0; i<c->pipe->stage_nent[st]; i++) {
             const nvn_gpu_layout_ent *e=&c->pipe->stage_ents[st][i];
-            if ((e->cls==NVN_GPU_RES_SSBO || e->cls==NVN_GPU_RES_IMAGE || e->cls==NVN_GPU_RES_IMAGE_TBUF || e->cls==NVN_GPU_RES_VA) && (!e->access || (e->access & NVN_GPU_ACC_W))) c->diag_pending |= DIAG_OTHER;
+            if ((e->cls==NVN_GPU_RES_SSBO || e->cls==NVN_GPU_RES_IMAGE || e->cls==NVN_GPU_RES_IMAGE_TBUF || e->cls==NVN_GPU_RES_VA) && (!e->access || (e->access & NVN_GPU_ACC_W))) { c->diag_pending |= DIAG_OTHER; c->diag_ledger |= DIAG_LEDGER_WRITE; }
         }
     }
     if (g_inbound_narrow || g_inbound_diag) { if (c->inbound_draw != UINT32_MAX) c->inbound_draw++; else c->inbound_draw_overflow = 1; c->inbound_draw_markable = 1; }
@@ -5860,7 +5886,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
         vkCmdDispatch(c->cb, x, y, z);
     }
     if (c->xfer_dirty == 2) c->xfer_dirty = 1; // 测试钩子禁屏障时计算也可能写；不再能只用传输阶段
-    if (g_inbound_diag) { c->diag_pending |= DIAG_CT; c->diag_last_game = 0; }
+    if (g_inbound_diag) { c->diag_pending |= DIAG_CT; c->diag_last_game = 0; c->diag_ledger |= DIAG_LEDGER_READ | DIAG_LEDGER_WRITE; }
     if (g_inbound_narrow || g_inbound_diag) { if (c->inbound_dispatch != UINT32_MAX) c->inbound_dispatch++; c->inbound_dispatch_markable = 1; }
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
@@ -5952,7 +5978,7 @@ static VkAccessFlags layout_src_access(VkImageLayout l) {
 static void image_barrier_from(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout from, VkImageLayout to) {
     if (c->xfer_pending_graphics) full_barrier(c); // 布局迁移可能触及别名内存，先完成未发布的传输写
     if (c->xfer_dirty == 2) c->xfer_dirty = 1;
-    if (g_inbound_diag) { c->diag_pending |= DIAG_OTHER; c->diag_last_game = 0; }
+    if (g_inbound_diag) { c->diag_pending |= DIAG_OTHER; c->diag_last_game = 0; c->diag_ledger |= DIAG_LEDGER_UNKNOWN; }
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -7106,6 +7132,7 @@ static void bc_temp_to_tex(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, str
 // 和段里前后的拷贝保持同一顺序（模块里直接调 vkCmd* 会越过录制线程、跑到前面那几条拷贝之前）。
 static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_rec *rec, VkImage dst,
                              VkBuffer src, VkDeviceSize src_off, uint32_t w, uint32_t h) {
+    if (g_inbound_diag) c->diag_ledger |= DIAG_LEDGER_READ | DIAG_LEDGER_WRITE; // 内部计算解码绕过 nvn_gpu_dispatch。
     VkImageMemoryBarrier b = {0}; b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = rec->in; b.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -7605,7 +7632,8 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     struct nvn_gpu_cmd_s *c = calloc(1, sizeof *c);
     if (!c) return fail(err, NVN_GPU_E_OOM, "cmd 分配失败");
     c->inbound_boundary = 1;
-    if (g_inbound_diag) { c->diag_pending = DIAG_OTHER; c->diag_host_epoch = __atomic_load_n(&g_inbound_host_epoch, __ATOMIC_RELAXED); }
+    if (g_inbound_diag) { c->diag_pending = DIAG_OTHER; c->diag_ledger = DIAG_LEDGER_UNKNOWN;
+        c->diag_host_epoch = c->diag_ledger_host_epoch = __atomic_load_n(&g_inbound_host_epoch, __ATOMIC_RELAXED); }
     memset(c->desc_sets, 0, sizeof c->desc_sets); c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;
     VkCommandPoolCreateInfo pci;
     memset(&pci, 0, sizeof pci);
@@ -7907,15 +7935,26 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     c->live_next = NULL;
     g.commit_active++;
     pthread_mutex_unlock(&g_mu);
-    uint64_t diag_pass[DIAG_PASS_N] = {0};
+    uint64_t diag_pass[DIAG_PASS_N] = {0}, diag_draw[DIAG_DRAW_N] = {0};
     if (g_inbound_diag) {
         memcpy(diag_pass, c->diag_pass, sizeof diag_pass);
-        if (c->diag_has_pre) { diag_pass[DIAG_MISC] += diag_pass[DIAG_ATTACH]; diag_pass[DIAG_ATTACH] = 0; }
+        memcpy(diag_draw, c->diag_draw_pending, sizeof diag_draw);
+        if (c->diag_has_pre) {
+            diag_pass[DIAG_MISC] += diag_pass[DIAG_ATTACH]; diag_pass[DIAG_ATTACH] = 0;
+            // 主段录好后 pre 才录、却先执行；其非附件写无法凭主段的录制顺序证明不存在。
+            uint64_t pre_candidates = diag_draw[DIAG_DRAW_CLEAN] + diag_draw[DIAG_DRAW_CLEAN_READ];
+            diag_draw[DIAG_DRAW_UNKNOWN] += pre_candidates;
+            diag_draw[DIAG_DRAW_PRE_UNKNOWN] += pre_candidates;
+            diag_draw[DIAG_DRAW_CLEAN] = diag_draw[DIAG_DRAW_CLEAN_READ] = 0;
+        }
     }
     nvn_gpu_rc r = commit_impl(ch, signal, done, user, err);
     pthread_mutex_lock(&g_mu);
     g.commit_active--;
-    if (g_inbound_diag && rc_is(r, NVN_GPU_OK)) for (int i=0;i<DIAG_PASS_N;i++) g_inbound_diag_pass[i] += diag_pass[i];
+    if (g_inbound_diag && rc_is(r, NVN_GPU_OK)) {
+        for (int i=0;i<DIAG_PASS_N;i++) g_inbound_diag_pass[i] += diag_pass[i];
+        for (int i=0;i<DIAG_DRAW_N;i++) g_diag_draw_pending[i] += diag_draw[i];
+    }
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     return r;
@@ -7992,14 +8031,19 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < STAT_N; i++) fn(user, stat_names[i], v[i]);
     if (g_inbound_diag) {
-        struct inbound_site sites[DIAG_SITES]; uint64_t passes[DIAG_PASS_N], total, overflow;
+        struct inbound_site sites[DIAG_SITES]; uint64_t passes[DIAG_PASS_N], draw[DIAG_DRAW_N], total, overflow;
         pthread_mutex_lock(&g_mu);
-        memcpy(sites, g_inbound_sites, sizeof sites); memcpy(passes, g_inbound_diag_pass, sizeof passes);
+        memcpy(sites, g_inbound_sites, sizeof sites); memcpy(passes, g_inbound_diag_pass, sizeof passes); memcpy(draw, g_diag_draw_pending, sizeof draw);
         total=g_inbound_diag_total; overflow=g_inbound_site_overflow;
         pthread_mutex_unlock(&g_mu);
         static const char *const names[DIAG_PASS_N]={"inbound_diag_pass_game", "inbound_diag_pass_attachment", "inbound_diag_pass_compute_transfer", "inbound_diag_pass_other"};
         for (int i=0;i<DIAG_PASS_N;i++) fn(user,names[i],passes[i]);
         fn(user,"inbound_diag_full_total",total); fn(user,"inbound_diag_full_overflow",overflow);
+        fn(user,"inbound_diag_draw_no_nonatt_write",draw[DIAG_DRAW_CLEAN] + draw[DIAG_DRAW_CLEAN_READ]);
+        fn(user,"inbound_diag_draw_no_nonatt_write_prior_read",draw[DIAG_DRAW_CLEAN_READ]);
+        fn(user,"inbound_diag_draw_nonatt_write",draw[DIAG_DRAW_WRITES]);
+        fn(user,"inbound_diag_draw_source_unknown",draw[DIAG_DRAW_UNKNOWN]);
+        fn(user,"inbound_diag_draw_pre_unresolved",draw[DIAG_DRAW_PRE_UNKNOWN]);
         for (int i=0;i<DIAG_SITES && sites[i].fn;i++) { char name[200]; snprintf(name,sizeof name,"inbound_full_%s_L%d",sites[i].fn,sites[i].line); fn(user,name,sites[i].count); }
     }
     // 描述符组按布局回收（#1096）：开会话起累计，不随 take 清零
@@ -8223,6 +8267,7 @@ void nvn_gpu_vk_test_open_pipe_only(struct s2a_vk_device *dev) {
     g_inbound_diag = nvn_plat_flag("nvk_inbound_diag", 0) != 0;
     memset(g_inbound_sites, 0, sizeof g_inbound_sites);
     memset(g_inbound_diag_pass, 0, sizeof g_inbound_diag_pass);
+    memset(g_diag_draw_pending, 0, sizeof g_diag_draw_pending);
     g_inbound_site_overflow = g_inbound_diag_total = 0;
     __atomic_store_n(&g_inbound_host_epoch, 0, __ATOMIC_RELAXED);
     g.dev = dev;

@@ -25,7 +25,7 @@ SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 export S2A_CGR_REMOVE_INCOMING=1
 failed=0
-modes="0 1 2 3 4 5 6 7 8 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26"
+modes="0 1 2 3 4 5 6 7 8 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34"
 for xseg in 0 1;do
  if [ "$xseg" = 1 ]; then export S2A_GFX_XSEG=1; else unset S2A_GFX_XSEG; fi
  for dq in 0 1;do
@@ -40,21 +40,29 @@ for xseg in 0 1;do
     if [ "$mode" = 16 ] && [ "$source" != VS ];then continue;fi
     if [ "$mode" -ge 22 ] && { [ "$source" != VS ] || [ "$dest" != VS ]; };then continue;fi
     export S2A_GFX_ACCESS_MODE=$mode
-    if [ "$mode" = 4 ] || [ "$mode" = 5 ] || [ "$mode" = 6 ] || [ "$mode" = 14 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; then export S2A_GFX_NARROW=1; else export S2A_GFX_NARROW=0; fi
-    if [ "$mode" -ge 17 ];then export S2A_INBOUND_DIAG=1;else unset S2A_INBOUND_DIAG;fi
+    if [ "$mode" -ge 27 ]; then export S2A_GFX_NARROW=0; elif [ "$mode" = 4 ] || [ "$mode" = 5 ] || [ "$mode" = 6 ] || [ "$mode" = 14 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; then export S2A_GFX_NARROW=1; else export S2A_GFX_NARROW=0; fi
+    if [ "$mode" -ge 17 ] && [ "$mode" != 30 ];then export S2A_INBOUND_DIAG=1;else unset S2A_INBOUND_DIAG;fi
     if [ "$mode" = 12 ] || [ "$mode" = 13 ] || [ "$mode" = 14 ] || [ "$mode" = 16 ] || { [ "$mode" -ge 17 ] && [ "$mode" != 20 ]; }; then export S2A_INBOUND_FINAL=1 S2A_INBOUND_NARROW=1; unset S2A_CGR_REMOVE_INCOMING S2A_FORCE_NARROW_INCOMING;
     elif [ "$mode" = 15 ] || [ "$mode" = 20 ]; then export S2A_INBOUND_FINAL=1 S2A_INBOUND_NARROW=0; unset S2A_CGR_REMOVE_INCOMING S2A_FORCE_NARROW_INCOMING;
     else unset S2A_INBOUND_FINAL S2A_FORCE_NARROW_INCOMING S2A_INBOUND_NARROW; if [ "$mode" = 7 ]; then unset S2A_CGR_REMOVE_INCOMING; else export S2A_CGR_REMOVE_INCOMING=1; fi; fi
+    if [ "$mode" -ge 31 ];then export S2A_CGR_REMOVE_OUTGOING=1;else unset S2A_CGR_REMOVE_OUTGOING;fi
+    if [ "$mode" -ge 33 ];then export S2A_CGR_REMOVE_INCOMING=1;fi
     log="$out/xseg${xseg}-dq${dq}-${source}-${dest}-${mode}.log";set +e
     timeout 120 "$out/resources" "$out/shaders" "$source" "$dest" > "$log" 2>&1;rc=$?;set -e
     raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$log" || true)
-    other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
+    war=$(grep -c 'SYNC-HAZARD-WRITE-AFTER-READ' "$log" || true)
+    other=$( (grep -E 'Validation Error|VUID-' "$log" | grep -Ev 'SYNC-HAZARD-(READ-AFTER-WRITE|WRITE-AFTER-READ)' || true) | wc -l | tr -d ' ')
     marker=$(grep '^GFX_STORAGE ' "$log" || true)
-    printf 'xseg=%s dq=%s src=%s dst=%s mode=%s rc=%s RAW=%s other=%s %s\n' "$xseg" "$dq" "$source" "$dest" "$mode" "$rc" "$raw" "$other" "$marker"
-    if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { { [ "$mode" = 1 ] || [ "$mode" = 4 ] || [ "$mode" = 7 ] || [ "$mode" = 12 ] || [ "$mode" = 14 ] || [ "$mode" = 15 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; } && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$mode" != 12 ] && [ "$mode" != 14 ] && [ "$mode" != 15 ] && [ "$mode" != 16 ] && [ "$mode" -lt 17 ] && [ "$raw" -lt 1 ]; };then
+    printf 'xseg=%s dq=%s src=%s dst=%s mode=%s rc=%s RAW=%s WAR=%s other=%s %s\n' "$xseg" "$dq" "$source" "$dest" "$mode" "$rc" "$raw" "$war" "$other" "$marker"
+    if [ "$rc" != 0 ] || [ "$other" != 0 ] || { [ "$mode" = 33 ] && [ "$war" -lt 1 ]; } || { [ "$mode" != 33 ] && [ "$war" != 0 ]; } || [ -z "$marker" ] || { { [ "$mode" = 1 ] || [ "$mode" = 4 ] || [ "$mode" = 7 ] || [ "$mode" = 12 ] || [ "$mode" = 14 ] || [ "$mode" = 15 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; } && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$mode" != 12 ] && [ "$mode" != 14 ] && [ "$mode" != 15 ] && [ "$mode" != 16 ] && [ "$mode" -lt 17 ] && [ "$raw" -lt 1 ]; };then
      echo 'graphics storage detection control failed';tail -15 "$log";failed=1
     elif [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$mode" != 12 ] && [ "$mode" != 14 ] && [ "$mode" != 15 ] && [ "$mode" != 16 ] && [ "$mode" -lt 17 ] && ! { grep -q "Shader stage VK_SHADER_STAGE_${stage}_BIT reads" "$log" || grep -q "VK_ACCESS_2_SHADER_STORAGE_READ_BIT accesses at VK_PIPELINE_STAGE_2_${stage}_SHADER_BIT" "$log"; };then
      echo 'graphics storage target stage not detected';failed=1
+    fi
+    if [ "$mode" = 30 ];then
+     with_diag=$(grep '^GFX_STORAGE ' "$out/xseg${xseg}-dq${dq}-${source}-${dest}-28.log" | sed -E 's/mode=[0-9]+/mode=X/')
+     without_diag=$(printf '%s\n' "$marker" | sed -E 's/mode=[0-9]+/mode=X/')
+     if [ "$with_diag" != "$without_diag" ];then echo 'diagnostic switch changed replay observations';failed=1;fi
     fi
    done
   done
