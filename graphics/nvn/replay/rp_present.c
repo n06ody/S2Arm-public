@@ -15,6 +15,8 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：s2a_direct_diag_frame
@@ -164,6 +166,17 @@ void rp_pool_stats_end(void) {
 //   弱引用：回放核心宿主单测与鸿蒙不链帧日志，地址为空就不调；开关关着时函数里只判一次缓存标志。
 // 弱链接[replay]：s2a_frame_log_present_timed
 void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) __attribute__((weak));
+// 上屏缩放滤镜（S2A_SCALING_FILTER：Bilinear 缺省 / Nearest；与 iOS 同名，MetalFX 是苹果专有，安卓报红按缺省）。平台层开会话时交来
+static int g_present_filter = 1;
+void rp_present_filter_configure(const char *e) {
+    int f = 1;
+    if (e && *e) {
+        if (!strcmp(e, "Nearest")) f = 0;
+        else if (strcmp(e, "Bilinear")) { char b[160]; snprintf(b, sizeof b, "S2A_SCALING_FILTER=%s 安卓只认 Bilinear / Nearest：按 Bilinear", e); nvn_plat_log(NVN_PLAT_LOG_RED, "present", b); }
+    }
+    g_present_filter = f;
+}
+static int present_filter(void) { return g_present_filter; }
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     rp_pool_stats_frame();   // 池统计（开关 pool_stats；关着每帧只读一次开关，回放与池查找路径不动）
@@ -192,11 +205,21 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
         return ticket;
     }
     nvn_gpu_present_desc d; memset(&d, 0, sizeof d);
-    d.src = v; d.filter = 1;
+    d.src = v; d.filter = (uint8_t)present_filter();
     // 窗口原点在左下（NVN 默认）时窗口图是自下而上存的：呈现时翻过来。裁剪按存储的行号给，不用换算
     d.flip_y = (uint8_t)(rp_present_lower_left() != 0);   // 被上屏窗口建时的原点（rp_entry.c）
     int c[4]; int fit = pf_crop_fit(crop, t->d.width, t->d.height, c);
     if (fit >= 0) memcpy(d.crop, c, sizeof c);   // 非法裁剪：按整张显示
+    {   // 渲染倍率：源图存储是 ⌈游戏尺寸 × 倍率⌉ 时，裁剪（游戏坐标）换成存储坐标：起点向下、终点向上取整（Ryujinx Window.cs 同法）
+        uint32_t sw = 0, sh = 0; rp_rs_level(t, 0, &sw, &sh);
+        if (sw != (uint32_t)t->d.width || sh != (uint32_t)t->d.height) {
+            const double rx = (double)sw / t->d.width, ry = (double)sh / t->d.height;
+            const int32_t x0 = d.crop[2] > 0 ? d.crop[0] : 0, y0 = d.crop[3] > 0 ? d.crop[1] : 0;
+            const int32_t x1 = d.crop[2] > 0 ? d.crop[0] + d.crop[2] : (int32_t)t->d.width, y1 = d.crop[3] > 0 ? d.crop[1] + d.crop[3] : (int32_t)t->d.height;
+            d.crop[0] = (int32_t)floor(x0 * rx); d.crop[1] = (int32_t)floor(y0 * ry);
+            d.crop[2] = (int32_t)ceil(x1 * rx) - d.crop[0]; d.crop[3] = (int32_t)ceil(y1 * ry) - d.crop[1];
+        }
+    }
     double cw = d.crop[2] > 0 ? (double)d.crop[2] : (double)t->d.width, ch = d.crop[3] > 0 ? (double)d.crop[3] : (double)t->d.height;
     pf_vp vp = pf_viewport(dr.w, dr.h, cw, ch);
     d.dst[0] = (int32_t)(vp.x + 0.5); d.dst[1] = (int32_t)(vp.y + 0.5); d.dst[2] = (int32_t)(vp.w + 0.5); d.dst[3] = (int32_t)(vp.h + 0.5);
@@ -254,6 +277,15 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (rp_rs_setting() != 1) {   // 渲染倍率：按倍率 / 按 1× 开的通道、换存储、各类降回 1× 的贴图（窗口合计）
+                    uint64_t bl[RP_RS_WHY_N], up = 0, upk = 0, fail = 0; rp_rs_take(bl, &up, &upk, &fail);
+                    int o2 = snprintf(b, sizeof b, "分时（渲染倍率 %.2f，每帧）：按倍率开的通道 %.1f 个、有附件但按 1× 开的 %.1f 个；窗口合计：换成倍率存储 %llu 张（%.1f 百万像素）、换存储失败 %llu 次；降回 1×：",
+                                      (double)rp_rs_setting(), (double)pf[RP_PERF_RS_PASS_S] / f, (double)pf[RP_PERF_RS_PASS_1] / f, (unsigned long long)up, (double)upk / 1e3, (unsigned long long)fail);
+                    int any = 0;
+                    for (int k = 0; k < RP_RS_WHY_N && o2 > 0 && (size_t)o2 < sizeof b; k++) if (bl[k]) { o2 += snprintf(b + o2, sizeof b - (size_t)o2, "%s%s %llu", any ? "、" : "", rp_rs_why_name(k), (unsigned long long)bl[k]); any = 1; }
+                    if (!any && o2 > 0 && (size_t)o2 < sizeof b) snprintf(b + o2, sizeof b - (size_t)o2, "没有");
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                }
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);

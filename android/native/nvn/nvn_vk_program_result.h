@@ -70,6 +70,7 @@ struct fd_binding {
     struct fd_ubo_word tex_u, samp_u;
     int16_t ubo_slot;         // kind==0 的 NVN 用户槽（cbuf - 3，clamp 到 0）
     uint8_t is_support;       // kind==0 且 stage=="program"（SupportBuffer）
+    uint8_t scale_plain;      // kind==2：结果带 "scalePlain": true = 采样不按尺寸换算（渲染倍率；缺 = 未知）
     // kind==1 的地址来源（编译期从 ShaderProgramInfo.SBuffers 解析）：
     // 0 = 没有映射；1 = NVN storage 槽；2 = 用户 UBO 槽内的 SbDescriptor；
     // 3 = 间接 UBO 指针（只有地址、没有 extent，运行时必须报红）。

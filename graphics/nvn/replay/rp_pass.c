@@ -41,7 +41,8 @@ static struct {
     // 形状变了必须重取管线（见 rp_pass_begin 末尾）；形状没变、目标只是换了张同格式的图，管线与绑定都不用重发
     uint32_t shape_c[8], shape_d, shape_s, shape_smp; int shape_ok;
     uint32_t na_w, na_h;          // 无附件通道（一个附件都没挂，只为片元副作用 / 遮挡计数）的帧缓冲尺寸；有附件的通道是 0
-} P = {.want_colors = 0xff};
+    float rs; uint32_t pw, ph;    // 渲染倍率：当前通道全部附件共同的存储倍率（1 = 游戏尺寸）与帧缓冲存储尺寸
+} P = {.want_colors = 0xff, .rs = 1};
 
 // 视图看到的尺寸（像素）。块压缩基底配非压缩视图（一块当一个像素，见 bc_view）时按块数算：通道、整屏清除判断、清除矩形都用它
 static int bc_view(const tex_t *t, const view_t *v, int has_v, uint32_t *bw, uint32_t *bh);
@@ -71,6 +72,17 @@ static int scissor_rect(const tex_t *t, const view_t *v, int has_v, nvn_gpu_clea
     o->x = (int32_t)x0; o->y = (int32_t)y0; o->w = (uint32_t)(x1 - x0); o->h = (uint32_t)(y1 - y0);
     return 1;
 }
+// 渲染倍率：游戏坐标的矩形 → 存储坐标（起点向下取整、终点向上取整，同 iOS rs_rect / Ryujinx 上屏裁剪），夹到当前帧缓冲内
+static void rs_rect(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) {
+    if (P.rs == 1) return;
+    double x0 = floor((double)*x * P.rs), y0 = floor((double)*y * P.rs), x1 = ceil(((double)*x + *w) * P.rs), y1 = ceil(((double)*y + *h) * P.rs);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (P.pw && x1 > P.pw) x1 = P.pw;
+    if (P.ph && y1 > P.ph) y1 = P.ph;
+    *x = (int32_t)x0; *y = (int32_t)y0; *w = x1 > x0 ? (uint32_t)(x1 - x0) : 0; *h = y1 > y0 ? (uint32_t)(y1 - y0) : 0;
+}
+float rp_pass_rs(void) { return P.open ? P.rs : 1; }
 // 清除值按附件格式的数值类别换算（整数格式的转换同 iOS 的清除三角形，nvn_mtl.m:14426）。out 是 16 字节的 f / u / i 联合
 static void color_value(int i, const float rgba[4], void *out) {
     const tex_t *t = P.rt.color[i];
@@ -469,6 +481,29 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     int any_color = 0; for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) any_color = 1;
     if (P.rt.n < 0 || P.rt.n > 8) { nvn_unimpl("pass", "no_attachment", NULL); return 0; }
     if (!any_color && !P.rt.depth && !noatt_ok()) { nvn_unimpl("pass", "no_attachment", NULL); return 0; }   // 后端开不了无附件通道（iOS 现在）：这笔跳过
+    P.rs = 1;
+    {   // 渲染倍率：一个通道的全部附件同一倍率；有任何一张不可缩（含影子附件）整组按 1× 开（同 iOS rs_rts / Ryujinx TextureManager），
+        // 已缩过的那几张随之降回 1×。换存储是传输：这里通道已收、还没取视图。倍率 1 时整段不进。
+        const float s = rp_rs_setting();
+        if (s != 1) {
+            int ok = 1, n = 0;
+            for (int i = 0; i < P.rt.n && i < 8; i++) {
+                if (!P.rt.color[i] || !(P.colors >> i & 1)) continue;
+                n++; if (slot_kind(i, NULL, NULL) != 0 || !rp_rs_eligible(P.rt.color[i], s)) ok = 0;
+            }
+            if (P.rt.depth) { n++; if (!rp_rs_eligible(P.rt.depth, s)) ok = 0; }
+            float want = ok && n ? s : 1; int bad = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                bad = 0;
+                for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i] && (P.colors >> i & 1) && slot_kind(i, NULL, NULL) == 0 && rp_rs_attach(P.rt.color[i], want, c) != want) bad = 1;
+                if (P.rt.depth && rp_rs_attach(P.rt.depth, want, c) != want) bad = 1;
+                if (!bad || want == 1) break;
+                want = 1;   // 有一张换存储失败：整组退回 1×（已换上去的降回来）
+            }
+            P.rs = bad ? 1 : want;
+            if (n) rp_perf_add(P.rs != 1 ? RP_PERF_RS_PASS_S : RP_PERF_RS_PASS_1, 1);
+        }
+    }
     rp_view_pin_begin();   // 下面取到的视图在本函数结束前不能被轮转放掉
     const int tm_ = rp_tm();   // 分时抽样（#1103）：只在采样帧里计时
     uint64_t pb_ = tm_ ? pb_now() : 0;   // 四段计时：取附件视图 / 屏障 / 后端开通道 / 记 GPU 写过
@@ -504,11 +539,19 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         P.na_w = d.w; P.na_h = d.h;
     }
     if (!d.w && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &d.w, &d.h);   // 只有深度的通道（阴影图、深度预通道）：尺寸取深度目标的
+    if (P.rs != 1) {   // 渲染倍率：帧缓冲取各附件存储尺寸（该级）的最小值
+        uint32_t mw = UINT32_MAX, mh = UINT32_MAX, w, h;
+        for (int i = 0; i < P.rt.n && i < 8; i++) if (d.color[i].view) { rp_rs_level(P.rt.color[i], P.rt.has_cview[i] && P.rt.cview[i].set_levels ? P.rt.cview[i].base_level : 0, &w, &h); if (w < mw) mw = w; if (h < mh) mh = h; }
+        if (P.rt.depth) { rp_rs_level(P.rt.depth, P.rt.has_dview && P.rt.dview.set_levels ? P.rt.dview.base_level : 0, &w, &h); if (w < mw) mw = w; if (h < mh) mh = h; }
+        if (mw != UINT32_MAX) { d.w = mw; d.h = mh; }
+    }
+    P.pw = d.w; P.ph = d.h;
     int pdpk = park_depth();   // 深度模板挂着的待折清除（一项可以带两面）
     int pcd = pdpk >= 0 && g_pk[pdpk].cd, pcs = pdpk >= 0 && g_pk[pdpk].cs;
     if (P.rt.depth) {
         nvn_fmt_info fi; int ok = nvn_fmt_info_of((uint32_t)P.rt.depth->d.format, &fi);
         view_t av;
+        rp_rs_safe(1, 0);   // 深度附件：按通道倍率挂（同颜色附件的 rp_view_for_attach）
         nvn_gpu_view v = rp_view_for(P.rt.depth, att_view(P.rt.depth, P.rt.has_dview, &P.rt.dview, &av), c);
         if (!v) { memset(g_shu, 0, sizeof g_shu); rp_view_pin_end(); return 0; }
         if (!ok || fi.depth) { d.depth.view = v; d.depth.store = NVN_GPU_STORE_STORE; d.depth.load = pcd ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD; if (pcd) d.clear_depth = g_pk[pdpk].dv; }
@@ -545,6 +588,9 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         if (d.depth.view && d.depth.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
         if (d.stencil.view && d.stencil.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
         int32_t x = P.wx, y = P.wy; uint32_t w = P.ww, h = P.wh;
+        if (x < 0) { w = (uint32_t)((int32_t)w + x); x = 0; }
+        if (y < 0) { h = (uint32_t)((int32_t)h + y); y = 0; }
+        rs_rect(&x, &y, &w, &h);   // 渲染倍率：区域是游戏坐标
         if (!any_clear && w && h) {
             if (x < 0) { w = (uint32_t)((int32_t)w + x); x = 0; }
             if (y < 0) { h = (uint32_t)((int32_t)h + y); y = 0; }
@@ -655,6 +701,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         // 与 iOS clear_color_tri 一样：目标没挂进当前通道时，为显式清除恢复附件；下一笔绘制再按自己的掩码筛。
         if (!c || (!(P.open && rp_pass_slot_attached(i)) && !pass_begin_colors(c, (uint8_t)(1u << i)))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
         color_value(i, cc->rgba, &cl.value);
+        rs_rect(&cl.x, &cl.y, &cl.w, &cl.h); if (!cl.w || !cl.h) return;   // 渲染倍率：清除矩形是游戏坐标
         rp_occl_pause(c);
         nvn_gpu_clear_rect(c, &cl);
         rp_dirty_all();
@@ -678,6 +725,7 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
         if (!scissor_rect(P.rt.depth, &P.rt.dview, P.rt.has_dview, &cl)) return;
         if (!c || (!P.open && !pass_begin_colors(c, 0xff))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
         cl.depth = (uint8_t)do_d; cl.stencil = (uint8_t)do_s; cl.depth_value = depth_value(cd->depth); cl.stencil_value = (uint32_t)cd->stencil & 0xff;
+        rs_rect(&cl.x, &cl.y, &cl.w, &cl.h); if (!cl.w || !cl.h) return;   // 渲染倍率：清除矩形是游戏坐标
         rp_occl_pause(c);
         nvn_gpu_clear_rect(c, &cl);
         rp_dirty_all();
@@ -700,7 +748,7 @@ int rp_pass_parked(void) {
 }
 void rp_pass_reset(void) {
     memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all();
-    P.want_colors = 0xff;
+    P.want_colors = 0xff; P.rs = 1;
     for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }
     memset(g_sh, 0, sizeof g_sh);
 }

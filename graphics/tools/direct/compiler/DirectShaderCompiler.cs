@@ -327,6 +327,8 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("SPIRV_INVALID",
                         binding.Stage + ": " + binding.Kind + " binding " + binding.Set + ":" + binding.Binding + " has no reflected descriptor");
                 TextureDescriptor resolved = found.Value;
+                binding.ScalePlain = binding.Kind == "texture" &&
+                    (resolved.Flags & (TextureUsageFlags.ResScaleUnsupported | TextureUsageFlags.NeedsScaleValue)) == 0;
                 // 整池数组：翻译器对追不到槽的句柄（算术 / 共享内存 / 全局内存 / phi 汇合拼出的）回退成按池编号读的两个数组
                 //   （compat BindlessElimination：贴图数组长 = max(2, 贴图池长)、采样器数组（类型 None）长 = max(2, 采样器池长)，
                 //   句柄 PackOffsets(0, 0, Direct) = 0x40000000、cbuf 0）。这不是从 c0 / c2 读句柄，不需要逐句柄事实；宿主按 NVN 池建快照绑整表。
@@ -708,6 +710,7 @@ namespace S2A.DirectCompiler
                     if (binding.SamplerSlot >= 0) writer.WriteNumber("samp_slot", binding.SamplerSlot);
                     if (binding.ConstSampler >= 0) writer.WriteNumber("constSampler", binding.ConstSampler);
                     if (binding.Pool != null) writer.WriteString("pool", binding.Pool);   // 整池数组（ResolvePoolSlots）：没有 slot，宿主按池建快照
+                    if (binding.Kind == "texture" && binding.ScalePlain) writer.WriteBoolean("scalePlain", true);   // 渲染倍率：缺这一项 = 按尺寸换算或未知
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段

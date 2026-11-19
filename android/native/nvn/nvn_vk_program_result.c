@@ -356,6 +356,8 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             // 一次算好逐笔要用的派生值（原来每笔都要重做 strcmp 和槽位换算）。
             dst->stage_idx = (int8_t)nvn_vk_program_graphics_stage_index(dst->stage);
             dst->is_support = (uint8_t)(dst->kind == 0 && !strcmp(dst->stage, "program"));
+            { struct s2a_jv sp = { NULL, 0 }; int bv = 0;
+              if (!s2a_jv_obj_find(b, "scalePlain", &sp)) { if (s2a_jv_bool(sp, &bv)) return fail(why, why_size, "binding scalePlain is not a boolean"); dst->scale_plain = (uint8_t)(dst->kind == 2 && bv); } }
             dst->ubo_slot = (int16_t)(dst->slot >= 3 ? dst->slot - 3 : 0);
             dst->tex_slot = -1; dst->samp_slot = -1;
             if (ubo_texture_parse(b, dst, why, why_size)) return -1;

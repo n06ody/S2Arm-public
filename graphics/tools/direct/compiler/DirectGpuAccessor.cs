@@ -40,6 +40,9 @@ namespace S2A.DirectCompiler
         public int CbSlot = -1, CbOffset = -1;
         public int NvnSlot = -1, UboPtr = -1, UboSlot = -1, UboOffset = -1;
         public bool Writable;
+        // 渲染倍率（安卓回放层）：贴图绑定的采样不按尺寸换算——翻译器没给它标 ResScaleUnsupported / NeedsScaleValue（texelFetch、取尺寸）。
+        //   true = 贴图缩放后照常采样仍正确；false = 回放层要先把它降回 1×
+        public bool ScalePlain;
         public DirectBinding(string stage, string kind, string source, int set, int binding, int count, int slot = -1)
         { Stage = stage; Kind = kind; Source = source; Set = set; Binding = binding; Count = count; Slot = slot; }
     }
