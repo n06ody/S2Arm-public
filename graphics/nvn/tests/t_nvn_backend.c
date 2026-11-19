@@ -102,6 +102,7 @@ SIG(nvn_gpu_push, void (*)(nvn_gpu_cmd, nvn_gpu_stage, uint32_t, const void *, u
 SIG(nvn_gpu_draw, void (*)(nvn_gpu_cmd, const nvn_gpu_draw_args *));
 SIG(nvn_gpu_dispatch, void (*)(nvn_gpu_cmd, nvn_gpu_pipe, uint32_t, uint32_t, uint32_t, nvn_gpu_buf, uint64_t));
 SIG(nvn_gpu_copy_buf, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, nvn_gpu_buf, uint64_t, uint64_t));
+SIG(nvn_gpu_copy_bufs_uniform, void (*)(nvn_gpu_cmd, const nvn_gpu_buf_copy *, uint32_t, uint32_t));
 SIG(nvn_gpu_fill_buf, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, uint32_t));
 SIG(nvn_gpu_copy_buf_tex, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, uint64_t, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *));
 SIG(nvn_gpu_copy_tex_buf, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *, nvn_gpu_buf, uint64_t, uint64_t, uint64_t));
