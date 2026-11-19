@@ -19093,6 +19093,14 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
     if (out) memset(out, 0, sizeof *out);
     return 0;
 }
+void nvn_gpu_inbound_draw_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_draw_reason(nvn_gpu_cmd c, uint32_t reasons) { (void)c; (void)reasons; }
+void nvn_gpu_inbound_dispatch_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_mirror_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_pre_finish(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_game_barrier(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_precedes_main(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_host_write(void) {}
 void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd c, uint32_t readers, uint32_t writers) { (void)c; (void)readers; (void)writers; }
 void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers) { (void)c; (void)producers; (void)consumers; }
 void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers) { (void)c; (void)consumers; } // Metal 自动冒险跟踪 / 编码器栅栏。

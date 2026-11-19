@@ -14,6 +14,14 @@ static __typeof__(&nvn_gpu_compute_to_graphics) publish_compute;
 static __typeof__(&nvn_gpu_transfer_to_graphics) publish_transfer;
 static __typeof__(&nvn_gpu_graphics_to_graphics) publish_graphics;
 static __typeof__(&nvn_gpu_graphics_read_to_write) publish_graphics_war;
+static __typeof__(&nvn_gpu_inbound_draw_tracked) inbound_draw;
+static __typeof__(&nvn_gpu_inbound_draw_reason) inbound_reason;
+static __typeof__(&nvn_gpu_inbound_dispatch_tracked) inbound_dispatch;
+static __typeof__(&nvn_gpu_inbound_mirror_tracked) inbound_mirror;
+static __typeof__(&nvn_gpu_inbound_pre_finish) inbound_pre;
+static __typeof__(&nvn_gpu_inbound_diag_game_barrier) inbound_game;
+static __typeof__(&nvn_gpu_inbound_diag_precedes_main) inbound_pre_main;
+static __typeof__(&nvn_gpu_inbound_diag_host_write) inbound_host;
 
 // Resolve the actual production exports: a missing contract entry must fail an
 // assertion at runtime, not stop at a link error. Types and names come from the
@@ -27,6 +35,9 @@ static void contract_entries(void) {
     publish_transfer=LOAD(nvn_gpu_transfer_to_graphics);
     publish_graphics=LOAD(nvn_gpu_graphics_to_graphics);
     publish_graphics_war=LOAD(nvn_gpu_graphics_read_to_write);
+    inbound_draw=LOAD(nvn_gpu_inbound_draw_tracked);inbound_reason=LOAD(nvn_gpu_inbound_draw_reason);
+    inbound_dispatch=LOAD(nvn_gpu_inbound_dispatch_tracked);inbound_mirror=LOAD(nvn_gpu_inbound_mirror_tracked);inbound_pre=LOAD(nvn_gpu_inbound_pre_finish);
+    inbound_game=LOAD(nvn_gpu_inbound_diag_game_barrier);inbound_pre_main=LOAD(nvn_gpu_inbound_diag_precedes_main);inbound_host=LOAD(nvn_gpu_inbound_diag_host_write);
 #undef LOAD
     CHECK(buf_span!=NULL,"Metal exports nvn_gpu_buf_access_span");
     CHECK(view_span!=NULL,"Metal exports nvn_gpu_view_access_span");
@@ -34,6 +45,8 @@ static void contract_entries(void) {
     CHECK(publish_transfer!=NULL,"Metal exports nvn_gpu_transfer_to_graphics");
     CHECK(publish_graphics!=NULL,"Metal exports nvn_gpu_graphics_to_graphics");
     CHECK(publish_graphics_war!=NULL,"Metal exports nvn_gpu_graphics_read_to_write");
+    CHECK(inbound_draw && inbound_reason && inbound_dispatch && inbound_mirror && inbound_pre,"Metal exports inbound hooks");
+    CHECK(inbound_game && inbound_pre_main && inbound_host,"Metal exports inbound diagnostic hooks");
     // The legacy Metal replay cannot construct these opaque contract handles.
     // Unknown is 0, never a fabricated identity/success; clear stale output.
     nvn_gpu_access_span span; unsigned char zero[sizeof span]={0};
@@ -64,6 +77,14 @@ static void color(id<MTLTexture> target,id<MTLBuffer> data) {
     if(publish_transfer) publish_transfer(NULL, NVN_GPU_CGR_ALL);
     if(publish_graphics) publish_graphics(NULL, NVN_GPU_GFX_SRC_ALL, NVN_GPU_CGR_ALL);
     if(publish_graphics_war) publish_graphics_war(NULL, NVN_GPU_GFX_SRC_ALL, NVN_GPU_GFX_SRC_ALL);
+    if(inbound_draw) inbound_draw(NULL);
+    if(inbound_reason) inbound_reason(NULL, NVN_GPU_INBOUND_UNKNOWN);
+    if(inbound_dispatch) inbound_dispatch(NULL);
+    if(inbound_mirror) inbound_mirror(NULL);
+    if(inbound_pre) inbound_pre(NULL);
+    if(inbound_game) inbound_game(NULL);
+    if(inbound_pre_main) inbound_pre_main(NULL);
+    if(inbound_host) inbound_host();
     CHECK(g_cb==cb && g_blit==blit && g_fence==fence && g_bar_full==full,"contract hook does not cut or submit the Metal command stream");
     MTL4RenderPassDescriptor *d=pass_desc();
     d.colorAttachments[0].texture=target;

@@ -584,14 +584,15 @@ static int mirror_narrow_on(void) {
     if (g_mirror_narrow < 0) g_mirror_narrow = nvn_plat_flag("nvk_mirror_dep_narrow", 1) != 0;
     return g_mirror_narrow;
 }
-void rp_draw_note_mirror_write(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
-    if (!bytes || !mirror_narrow_on()) return;
+int rp_draw_note_mirror_write(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
+    if (!bytes || !mirror_narrow_on()) return 0;
     nvn_gpu_access_span span;
     if (!nvn_gpu_buf_access_span(b, off, bytes, &span) ||
         g_mirror_access.n >= 4096 || !rp_access_reserve(&g_mirror_access, 1))
         g_mirror_unknown = 1;
     else rp_access_write(&g_mirror_access, &span);
     g_mirror_published = 0;
+    return !g_mirror_unknown;
 }
 static int mirror_read_buf(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
     if (!b || !bytes) return 0;
@@ -1440,7 +1441,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (need) {
             rp_pass_flush(c);
             uint32_t game_barrier = rp_pass_take_barrier();
-            if (game_barrier) nvn_gpu_barrier(c, game_barrier);
+            if (game_barrier) { nvn_gpu_barrier(c, game_barrier); nvn_gpu_inbound_diag_game_barrier(c); }
             else nvn_gpu_compute_to_graphics(c, NVN_GPU_CGR_ALL);
             g_compute_access.n = 0; g_compute_published = 0;   // 回退：一次覆盖旧接口的全部图形读
         }
@@ -1480,7 +1481,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             rp_pass_flush(c);
             uint32_t game_barrier = rp_pass_take_barrier();
             if (game_barrier || unknown_write) {
-                nvn_gpu_barrier(c, game_barrier ? game_barrier : NVN_BARRIER_INVALIDATE_SHADER_BIT);
+                if (game_barrier) { nvn_gpu_barrier(c, game_barrier); nvn_gpu_inbound_diag_game_barrier(c); } else nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
                 g_compute_access.n = 0; g_compute_published = 0;
             } else {
                 nvn_gpu_compute_to_graphics(c, publish);
@@ -1518,7 +1519,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             rp_pass_flush(c);
             uint32_t game_barrier = rp_pass_take_barrier();
             if (game_barrier || writable) {
-                nvn_gpu_barrier(c, game_barrier ? game_barrier : NVN_BARRIER_INVALIDATE_SHADER_BIT);
+                if (game_barrier) { nvn_gpu_barrier(c, game_barrier); nvn_gpu_inbound_diag_game_barrier(c); } else nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
                 g_mirror_access.n = 0; g_mirror_unknown = 0; g_mirror_published = 0;
             } else {
                 nvn_gpu_transfer_to_graphics(c, publish);
@@ -1556,7 +1557,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             rp_pass_flush(c);
             uint32_t game_barrier = rp_pass_take_barrier();
             if (game_barrier || writable) {
-                nvn_gpu_barrier(c, game_barrier ? game_barrier : NVN_BARRIER_INVALIDATE_SHADER_BIT);
+                if (game_barrier) { nvn_gpu_barrier(c, game_barrier); nvn_gpu_inbound_diag_game_barrier(c); } else nvn_gpu_barrier(c, NVN_BARRIER_INVALIDATE_SHADER_BIT);
                 graphics_access_clear(); graphics_reads_clear(); break;
             }
             nvn_gpu_graphics_to_graphics(c, 1u << writer, publish);
@@ -1573,7 +1574,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (publish) {
             rp_pass_flush(c);
             uint32_t game_barrier = rp_pass_take_barrier();
-            if (game_barrier) { nvn_gpu_barrier(c, game_barrier); graphics_reads_clear(); break; }
+            if (game_barrier) { nvn_gpu_barrier(c, game_barrier); nvn_gpu_inbound_diag_game_barrier(c); graphics_reads_clear(); break; }
             nvn_gpu_graphics_read_to_write(c, 1u << reader, publish);
             g_graphics_read_published[reader] |= publish;
         }
@@ -1698,6 +1699,32 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     nvn_gpu_draw(c, &a);
     graphics_note_writes(g_prog);
     graphics_note_reads(g_prog, tv);
+    // Admit only the proven mirror-buffer shader path. Other inputs / aliases remain conservative.
+    {
+        uint32_t reason = 0; int seen = 0, write_stages = 0;
+        if (!graphics_narrow_on()) reason |= NVN_GPU_INBOUND_UNKNOWN;
+        if (a.ind || a.cnt) reason |= NVN_GPU_INBOUND_INDIRECT;
+        if (a.ibuf) reason |= NVN_GPU_INBOUND_INDEX;
+        if (streams) reason |= NVN_GPU_INBOUND_VERTEX;
+        for (int st = 0; st < RP_PROG_STAGES; st++) {
+            if (g_graphics_unknown[st] || g_graphics_read_unknown[st]) reason |= NVN_GPU_INBOUND_UNKNOWN;
+            int stage_writes = 0;
+            for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
+                const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
+                if ((e->cls != NVN_GPU_RES_SSBO && e->cls != NVN_GPU_RES_UBO) ||
+                    (e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) ||
+                    !e->access || e->src_reg >= 16 || !g_sb_ok[st][i]) { reason |= NVN_GPU_INBOUND_UNKNOWN; continue; }
+                nvn_gpu_access_span span; const p_bind_buf *sb = e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg];
+                uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);
+                if (!nvn_gpu_buf_access_span(g_sb_buf[st][i], g_sb_off[st][i], wl, &span)) reason |= NVN_GPU_INBOUND_UNKNOWN;
+                seen = 1; if (e->access & NVN_GPU_ACC_W) stage_writes = 1;
+            }
+            write_stages += stage_writes;
+        }
+        if (!seen) reason |= NVN_GPU_INBOUND_UNKNOWN;
+        if (write_stages > 1) reason |= NVN_GPU_INBOUND_MULTI_WRITE;
+        if (!reason) nvn_gpu_inbound_draw_tracked(c); else nvn_gpu_inbound_draw_reason(c, reason);
+    }
     // 首用跳过判据的 seen 标记：本笔真画成了，每个颜色/深度目标记「近两帧画过」（跳过的笔不走到这里，故不记）。
     if (rp_fu_enabled()) {
         uint64_t ff = rp_frame();
@@ -1924,13 +1951,23 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!bind_stage_at(c, pg, 0, 5, 0, tv, ts, rec)) goto done;
     for (uint32_t i = 0; i < pg->nent[0]; i++) if (images[i] && ((pg->ent[0][i].access & NVN_GPU_ACC_W) || (cgr_narrow_on() && cgr_unknown_write(&pg->ent[0][i])))) rp_tex_mark_gpu_written(images[i]);
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
-    uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
+    uint32_t game_barrier = rp_pass_take_barrier();
+    uint32_t bar = game_barrier | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     // 长期只命中一类读时旧写可能持续保留；容量到顶先做全发布，再从当前派发重新记账。
     if (cgr_narrow_on() && g_ndispatch_access && g_compute_access.n + g_ndispatch_access > 4096) bar |= NVN_BARRIER_INVALIDATE_SHADER_BIT;
-    if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; g_compute_published = 0; }
+    if (bar) { if (game_barrier) { nvn_gpu_barrier(c, bar); nvn_gpu_inbound_diag_game_barrier(c); } else nvn_gpu_barrier(c, bar); g_compute_access.n = 0; g_compute_published = 0; }
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
     if (g_ndispatch_access) g_compute_published = 0;   // 新写不继承旧写对任何消费者的可见性
+    // Only direct, write-only mirror SSBO dispatches have complete producer metadata here.
+    if (!g_disp_ind && compute_access_on() && cgr_narrow_on() && pg->nent[0] && g_ndispatch_access == pg->nent[0]) {
+        int safe = 1;
+        for (uint32_t i = 0; i < pg->nent[0]; i++) {
+            const nvn_gpu_layout_ent *e = &pg->ent[0][i];
+            if (e->cls != NVN_GPU_RES_SSBO || (e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) || e->access != NVN_GPU_ACC_W || e->count > 1) safe = 0;
+        }
+        if (safe) nvn_gpu_inbound_dispatch_tracked(c);
+    }
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {
         static const nvn_gpu_pipe_desc compute_recipe = {0};
         nvk_pipe_warm_note_prog(&compute_recipe, pg, cp);

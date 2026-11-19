@@ -515,7 +515,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         if (ok && fi.stencil) { d.stencil.view = v; d.stencil.store = NVN_GPU_STORE_STORE; d.stencil.load = pcs ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD; if (pcs) d.clear_stencil = (uint32_t)g_pk[pdpk].sv & 0xff; }
     }
     PB(RP_PERF_PB_VIEW);
-    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); nvn_gpu_inbound_diag_game_barrier(c); P.barrier_bits = 0; }
     PB(RP_PERF_PB_BAR);
     d.occlusion = (uint8_t)rp_occl_want();
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0;

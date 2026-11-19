@@ -46,6 +46,7 @@ int main(int argc,char **argv){
   untracked=1;REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,320,&mirror,&off));
   REQUIRE(inbound_pre && inbound_pre!=active);untracked=0;
  } else untracked=1;
+ if(mode>=17 && mode<=19){REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,320,&mirror,&off));untracked=0;}
  p_draw draw={0};draw.prim=4;draw.ind=(uint64_t)(uintptr_t)guest;rp_draw(active,&draw,NULL,&draw);
  if(mode==11 || mode==12){
   untracked=0;rp_pass_flush(active);graphics.nent[0]=0;graphics.nent[1]=1;graphics.ent[1][0]=second_entry;
@@ -73,6 +74,12 @@ int main(int argc,char **argv){
  REQUIRE(inbound_injected==((mode && mode<5)?inbound_transfers:0));
  if(mode>=13 && mode<=16) REQUIRE(mirror_transfer_cb && mirror_barrier_cb && mirror_transfer_cb!=mirror_barrier_cb);
  if(mode==9 || mode==10) REQUIRE(mirror_barriers==0);
+ if(mode>=17 && mode<=19){
+  REQUIRE(inbound_transfers==1);
+  if(mode==17) REQUIRE(draw_full_bar[0]==mirror_last_transfer_full && inbound_fallback==0 && mirror_barriers==1);
+  else if(mode==18) REQUIRE(draw_full_bar[0]==mirror_last_transfer_full+1 && inbound_fallback==1 && !inbound_fallback_omitted && !mirror_barriers);
+  else REQUIRE(inbound_fallback==1 && inbound_fallback_omitted==1 && !mirror_barriers);
+ }
  if(mode==11 || mode==12){ REQUIRE(mirror_barriers==2); REQUIRE(mirror_stages[0]==(VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT|VK_PIPELINE_STAGE_VERTEX_SHADER_BIT)); REQUIRE(mirror_stages[1]==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT); REQUIRE(mirror_omitted==(unsigned)(mode==12?2:0)); }
  if((mode>=5 && mode<=7) || (mode>=13 && mode<=16)){
   VkPipelineStageFlags stages=VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | (vertex?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -80,7 +87,7 @@ int main(int argc,char **argv){
   REQUIRE(mirror_barriers==1 && mirror_dst_stages==stages && mirror_dst_access==accesses);
   REQUIRE(mirror_omitted==(unsigned)(mode==6 || mode==7 || mode==14 || mode==15 || mode==16));
  }
- printf("INBOUND_TRANSFER dq=%d stage=%s inject=%d transfers=%u injected=%u publish=%u dst=%#x access=%#x two_levels=%d pixels_bad=%u\n",dq_mode,argv[2],mode,inbound_transfers,inbound_injected,mirror_barriers,mirror_dst_stages,mirror_dst_access,mirror_transfer_cb && mirror_barrier_cb && mirror_transfer_cb!=mirror_barrier_cb,bad);
+ printf("INBOUND_TRANSFER dq=%d stage=%s inject=%d transfers=%u injected=%u publish=%u dst=%#x access=%#x two_levels=%d fallback=%u omitted=%u pixels_bad=%u\n",dq_mode,argv[2],mode,inbound_transfers,inbound_injected,mirror_barriers,mirror_dst_stages,mirror_dst_access,mirror_transfer_cb && mirror_barrier_cb && mirror_transfer_cb!=mirror_barrier_cb,inbound_fallback,inbound_fallback_omitted,bad);
  rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(initial_vs);nvn_gpu_shader_release(initial_fs);if(second_vs)nvn_gpu_shader_release(second_vs);if(second_fs)nvn_gpu_shader_release(second_fs);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);nvn_gpu_buf_release(rb,NULL,NULL);
  GPU(nvn_gpu_close(5000000000ull,&err));if(inbound_gate)vkDestroySemaphore(d.device,inbound_gate,NULL);REQUIRE(!s2a_vk_device_destroy(&d,1));return bad?1:0;
 }
