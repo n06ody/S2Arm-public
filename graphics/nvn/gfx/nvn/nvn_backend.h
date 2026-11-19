@@ -468,9 +468,16 @@ typedef struct {
 } nvn_gpu_access_span;
 int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out);
 int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out);
-// 通道外：此前计算写入对后续间接参数 / 索引 / 顶点 / 图形着色器读取可见；不包含附件载入、计算或传输，不分段、不等待。
-// 由核心仅在图形实际读到计算写过的范围时调用；全体计算写对这些读阶段发布，所以核心可一起撤掉待发布表。
-void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c);
+// 通道外：此前所有计算写对 consumers 指定的图形读阶段和访问可见；不包含附件载入、计算或传输，不分段、不等待。
+// 核心按实际相交资源选择消费者；未发布的其他消费者须保留，新计算写不继承旧发布状态。ALL 保留原全图形读范围。
+enum {
+    NVN_GPU_CGR_INDIRECT = 1u << 0, NVN_GPU_CGR_INDEX = 1u << 1, NVN_GPU_CGR_VERTEX = 1u << 2,
+    NVN_GPU_CGR_VS_SHADER = 1u << 3, NVN_GPU_CGR_VS_UNIFORM = 1u << 4,
+    NVN_GPU_CGR_FS_SHADER = 1u << 5, NVN_GPU_CGR_FS_UNIFORM = 1u << 6,
+    NVN_GPU_CGR_GS_SHADER = 1u << 7, NVN_GPU_CGR_GS_UNIFORM = 1u << 8,
+    NVN_GPU_CGR_ALL = (1u << 9) - 1,
+};
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈

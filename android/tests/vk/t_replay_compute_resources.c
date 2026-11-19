@@ -32,7 +32,8 @@ int main(int argc,char **argv){
  REQUIRE(argc==3);const char *arm=argv[2];normalize_dependencies=1;
  disable_compute_access=strstr(arm,"disabled")!=NULL;
  int vertex=strstr(arm,"vertex")!=NULL,index=strstr(arm,"index")!=NULL;
- int vsbuf=strstr(arm,"vsbuf")!=NULL,fsbuf=strstr(arm,"fsbuf")!=NULL,tbuf=strstr(arm,"tbuf")!=NULL;
+ int multi=strstr(arm,"multi")!=NULL,renew=strstr(arm,"renew")!=NULL,rw=strstr(arm,"rw")!=NULL,unknown=strstr(arm,"unknown")!=NULL,producer=strstr(arm,"producer")!=NULL;track_all_draws=multi||renew;
+ int vsbuf=strstr(arm,"vsbuf")!=NULL||multi||renew||producer,fsbuf=strstr(arm,"fsbuf")!=NULL||rw||unknown,tbuf=strstr(arm,"tbuf")!=NULL;
  int img=strstr(arm,"image")!=NULL,disjoint=strstr(arm,"disjoint")!=NULL,metadata=!strcmp(arm,"metadata");
  REQUIRE(vertex+index+vsbuf+fsbuf+tbuf+img+metadata==1);REQUIRE(!disjoint||img);
  struct s2a_vk_device d;char why[256];REQUIRE(!s2a_vk_device_create(&d,why,sizeof why));
@@ -43,21 +44,25 @@ int main(int argc,char **argv){
  rp_S.color.logic_op=NVN_LOGIC_OP_COPY;rp_S.chmask.mask=15;rp_S.poly.mode=NVN_POLYGON_MODE_FILL;
  prog.is_compute=1;prog.nent[0]=1;
  prog.ent[0][0]=entry(img?NVN_GPU_RES_IMAGE:NVN_GPU_RES_SSBO,img?NVN_RB_IMG:NVN_RB_SBUFP,NVN_GPU_ACC_W,NVN_GPU_SH_CS);
+ if(producer)prog.ent[0][0].access=0;
  nvn_gpu_layout cl={0};cl.ent=prog.ent[0];cl.nent=1;
  prog.sh[0]=shader(argv[1],img?"compute_read_image.comp":index?"compute_read_index.comp":"compute_read_payload.comp",NVN_GPU_SH_CS,&cl);
  const char *vs=vertex?"compute_read_vertex.vert":vsbuf?"compute_read_buffer.vert":"fullscreen.vert";
- const char *fs=fsbuf?"compute_read_buffer.frag":tbuf?"compute_read_texel.frag":img?"compute_read_image.frag":"solid_green.frag";
+ const char *fs=rw?"cgr_graphics_write.frag":fsbuf?"compute_read_buffer.frag":tbuf?"compute_read_texel.frag":img?"compute_read_image.frag":"solid_green.frag";
  nvn_gpu_layout gl[2]={{0},{0}};
  if(vsbuf||fsbuf||tbuf||img){
   int st=vsbuf?0:1;graphics.nent[st]=1;
-  graphics.ent[st][0]=entry(tbuf?NVN_GPU_RES_TBUF:img?NVN_GPU_RES_TEX_SAMP:NVN_GPU_RES_SSBO,tbuf?NVN_RB_TBUF:img?NVN_RB_TEX:NVN_RB_SBUFP,NVN_GPU_ACC_R,st?NVN_GPU_SH_FS:NVN_GPU_SH_VS);
+  graphics.ent[st][0]=entry(tbuf?NVN_GPU_RES_TBUF:img?NVN_GPU_RES_TEX_SAMP:NVN_GPU_RES_SSBO,tbuf?NVN_RB_TBUF:img?NVN_RB_TEX:NVN_RB_SBUFP,unknown?0:rw?NVN_GPU_ACC_W:NVN_GPU_ACC_R,st?NVN_GPU_SH_FS:NVN_GPU_SH_VS);
   gl[st].ent=graphics.ent[st];gl[st].nent=1;
-  rp_S.ssbo[st][0].addr=(uint64_t)(uintptr_t)(guest+256);rp_S.ssbo[st][0].size=64;
+  rp_S.ssbo[st][0].addr=(uint64_t)(uintptr_t)(guest+256);rp_S.ssbo[st][0].size=multi?48:64;
   if(tbuf)graphics.dtt[st][0]=NVN_TEXTURE_TARGET_BUFFER+1;
   if(img)graphics.dtt[st][0]=NVN_TEXTURE_TARGET_2D+1;
  }
  graphics.sh[0]=shader(argv[1],vs,NVN_GPU_SH_VS,gl[0].nent?&gl[0]:NULL);
  graphics.sh[1]=shader(argv[1],fs,NVN_GPU_SH_FS,gl[1].nent?&gl[1]:NULL);graphics.color_out_mask=15;
+ nvn_gpu_shader initial_vs=graphics.sh[0],initial_fs=graphics.sh[1],second_vs=NULL,second_fs=NULL;
+ nvn_gpu_layout_ent multi_ent=entry(NVN_GPU_RES_SSBO,NVN_RB_SBUFP,NVN_GPU_ACC_R,NVN_GPU_SH_FS);
+ if(multi){nvn_gpu_layout ml={.ent=&multi_ent,.nent=1};second_vs=shader(argv[1],"fullscreen.vert",NVN_GPU_SH_VS,NULL);second_fs=shader(argv[1],"compute_multi_fragment.frag",NVN_GPU_SH_FS,&ml);rp_S.ssbo[1][0].addr=(uint64_t)(uintptr_t)(guest+304);rp_S.ssbo[1][0].size=16;}
  rp_S.ssbo[5][0].addr=(uint64_t)(uintptr_t)(guest+256);rp_S.ssbo[5][0].size=index?16:64;
  if(vertex){graphics.attr_mask=1;rp_S.nattr=rp_S.nstream=1;rp_S.attr[0].fmt=NVN_FORMAT_RGBA32F;rp_S.stream[0].stride=16;rp_S.vbuf[0].address=(uint64_t)(uintptr_t)(guest+256);rp_S.vbuf[0].size=48;}
  if(tbuf){resources[1].valid=1;resources[1].tex.d.target=NVN_TEXTURE_TARGET_BUFFER;resources[1].tex.d.format=NVN_FORMAT_RGBA32F;resources[1].tex.d.width=4;resources[1].tex.d.levels=1;resources[1].tex.mem=guest+256;resources[1].tex.pool=(pool_t*)(void*)guest;rp_S.tex[1][0]=1;}
@@ -85,23 +90,58 @@ int main(int argc,char **argv){
  p_dispatch dp={0};dp.x=dp.y=dp.z=1;rp_dispatch(active,&dp,NULL);
  p_draw dr={0};dr.prim=4;dr.ind=(uint64_t)(uintptr_t)guest;
  // VVL 1.4.341 对 indirect 顶点/索引访问留有 TODO，direct 提供已知范围以取得真实 RAW 阳性。
- if(vertex){dr.ind=0;dr.count=3;dr.instances=1;}
+ if(vertex||multi||renew){dr.ind=0;dr.count=3;dr.instances=1;}
  p_draw_idx di={0};di.prim=4;di.itype=2;di.ind=(uint64_t)(uintptr_t)guest;di.ibuf=(uint64_t)(uintptr_t)(guest+256);if(index){di.ind=0;di.count=3;di.instances=1;}
  if(disjoint){rp_S.tex[1][0]=(1ull<<20)|3;rp_draw(active,&dr,NULL,&dr);rp_S.tex[1][0]=(1ull<<20)|2;}
  rp_draw(active,index?NULL:&dr,index?&di:NULL,index?(const void*)&di:(const void*)&dr);
- uint64_t draws=0,skips=0;rp_draw_stats(&draws,&skips);REQUIRE(draws==1u+(unsigned)disjoint&&skips==0);REQUIRE(!nvn_unimpl_kinds());
+ if(multi){
+  rp_pass_flush(active);graphics.nent[0]=0;graphics.nent[1]=1;graphics.ent[1][0]=multi_ent;graphics.sh[0]=second_vs;graphics.sh[1]=second_fs;rp_dirty_all();
+  rp_draw(active,&dr,NULL,&dr);rp_draw(active,&dr,NULL,&dr);
+ }
+ if(renew){
+  // 第二次写不同范围；没有游戏屏障，也不与第一笔 VS 读取相交。
+  rp_S.ssbo[5][0].addr=(uint64_t)(uintptr_t)(guest+512);rp_dispatch(active,&dp,NULL);
+  rp_S.ssbo[0][0].addr=(uint64_t)(uintptr_t)(guest+512);rp_draw(active,&dr,NULL,&dr);
+ }
+ uint64_t draws=0,skips=0;rp_draw_stats(&draws,&skips);REQUIRE(draws==1u+(unsigned)disjoint+2u*(unsigned)multi+(unsigned)renew&&skips==0);REQUIRE(!nvn_unimpl_kinds());
  rp_pass_flush(active);nvn_gpu_copy_tex_buf(active,tex,0,0,NULL,rb,0,256,16384);
  GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));
- REQUIRE(ndispatch==1);REQUIRE(ndraw==1u+(unsigned)disjoint);
+ REQUIRE(ndispatch==1u+(unsigned)renew);REQUIRE(ndraw==1u+(unsigned)disjoint+2u*(unsigned)multi+(unsigned)renew);
  unsigned before=dispatch_compute_bar[0],after=draw_compute_bar[ndraw-1];
- REQUIRE(after-before==(unsigned)!disable_compute_access);
+ if((rw||unknown) && !disable_compute_access){
+  printf("CGR_WRITE dq=%d before=%u draw=%u omitted=%u\n",dq_mode,dispatch_full_bar[0],draw_full_bar[0],omitted_full);fflush(stdout);
+  REQUIRE(draw_full_bar[0]==dispatch_full_bar[0]+1);REQUIRE(after==before);
+  if(getenv("S2A_CGR_OMIT_FULL"))REQUIRE(omitted_full==1);
+ }else if(renew && !disable_compute_access){
+  printf("CGR_RENEW dq=%d before=%u draw0=%u draw1=%u\n",dq_mode,before,draw_compute_bar[0],draw_compute_bar[1]);fflush(stdout);
+  REQUIRE(draw_compute_bar[0]==before+1);REQUIRE(draw_compute_bar[1]==before+2);
+  REQUIRE(compute_dst_stages[before]==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);REQUIRE(compute_dst_stages[before+1]==VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
+ }else if(multi && !disable_compute_access){
+  printf("CGR_MULTI dq=%d before=%u draw0=%u draw1=%u draw2=%u\n",dq_mode,before,draw_compute_bar[0],draw_compute_bar[1],draw_compute_bar[2]);fflush(stdout);
+  REQUIRE(draw_compute_bar[0]==before+1);
+  unsigned published=getenv("S2A_CGR_EXPECT_LEGACY")?1u:2u;
+  REQUIRE(draw_compute_bar[1]==before+published);REQUIRE(draw_compute_bar[2]==before+published);
+  if(getenv("S2A_CGR_OMIT_FS"))REQUIRE(omitted_fs==1);
+ }else REQUIRE(after-before==(unsigned)!disable_compute_access);
+ if((getenv("S2A_CGR_EXPECT_NARROW")||getenv("S2A_CGR_EXPECT_LEGACY")) && !disable_compute_access && !multi && !renew && !rw && !unknown){
+  VkPipelineStageFlags expected_stage=vertex||index?VK_PIPELINE_STAGE_VERTEX_INPUT_BIT:vsbuf?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  VkAccessFlags expected_access=vertex?VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT:index?VK_ACCESS_INDEX_READ_BIT:VK_ACCESS_SHADER_READ_BIT;
+  if(getenv("S2A_CGR_EXPECT_LEGACY")){
+   expected_stage=VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT|VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+   if(d.core_features.geometryShader)expected_stage|=VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+   expected_access=VK_ACCESS_INDIRECT_COMMAND_READ_BIT|VK_ACCESS_INDEX_READ_BIT|VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_SHADER_READ_BIT;
+  }
+  REQUIRE(after>0);printf("CGR_SCOPE arm=%s expected=%#x/%#x actual=%#x/%#x\n",arm,expected_stage,expected_access,compute_dst_stages[after-1],compute_dst_access[after-1]);
+  fflush(stdout);REQUIRE(compute_dst_stages[after-1]==expected_stage);REQUIRE(compute_dst_access[after-1]==expected_access);
+ }
  if(disjoint){REQUIRE(draw_compute_bar[0]==before);printf("RESOURCE_READ layer=1 overlaps_writer=0 barrier_delta=%u\n",draw_compute_bar[0]-before);}
  if(img)printf("RESOURCE_READ layer=0 overlaps_writer=1 barrier_delta=%u\n",after-before);
- unsigned bad=0;const uint8_t *pixels=nvn_gpu_buf_cpu(rb);for(unsigned i=0;i<4096;i++){const uint8_t *p=pixels+i*4;if(p[0]||p[1]!=255||p[2]||p[3]!=255)bad++;}
+ unsigned bad=0;const uint8_t *pixels=nvn_gpu_buf_cpu(rb);for(unsigned i=0;i<4096;i++){const uint8_t *p=pixels+i*4;if(p[0]||p[1]!=(rw?0:255)||p[2]||p[3]!=255)bad++;}
  REQUIRE(!memcmp((const uint8_t*)nvn_gpu_buf_cpu(mirror)+off,args,sizeof args));
+ if(producer)REQUIRE(nw==1); // 未知存储写也必须登记回写，不能只补屏障
  printf("COMPUTE_RESOURCE arm=%s dq=%d draws=%llu pixel_mismatches=%u compute_barriers=%u\n",arm,dq_mode,(unsigned long long)draws,bad,after-before);
  for(int k=0;k<nw;k++)rp_buf_gpu_write_land(wkey[k],wid[k],0);
- rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(graphics.sh[0]);nvn_gpu_shader_release(graphics.sh[1]);
+ rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(initial_vs);nvn_gpu_shader_release(initial_fs);if(second_vs)nvn_gpu_shader_release(second_vs);if(second_fs)nvn_gpu_shader_release(second_fs);
  if(img){for(int i=1;i<=3;i++)nvn_gpu_view_release(resources[i].view);nvn_gpu_samp_release(resource_sampler);nvn_gpu_tex_release(image_tex);}
  nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);nvn_gpu_buf_release(rb,NULL,NULL);GPU(nvn_gpu_close(5000000000ull,&err));REQUIRE(!s2a_vk_device_destroy(&d,1));return bad?1:0;
 }
