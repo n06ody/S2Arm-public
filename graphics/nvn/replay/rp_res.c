@@ -228,6 +228,23 @@ static int cpu_content(const tex_t *t) {
     return mem_any(t->mem, t->L.size);
 }
 
+// Optional platform diagnostic. No calls or timestamps when the hook is absent.
+// 弱链接[replay]：s2a_direct_diag_enabled
+int s2a_direct_diag_enabled(void) __attribute__((weak));
+// 弱链接[replay]：s2a_direct_diag_upload_begin
+uint64_t s2a_direct_diag_upload_begin(unsigned kind, unsigned reason) __attribute__((weak));
+// 弱链接[replay]：s2a_direct_diag_upload_end
+void s2a_direct_diag_upload_end(uint64_t token, int success, unsigned method, uint64_t bytes) __attribute__((weak));
+static uint64_t upload_diag_begin(unsigned kind, unsigned reason) {
+    return s2a_direct_diag_upload_begin && s2a_direct_diag_upload_end ? s2a_direct_diag_upload_begin(kind, reason) : 0;
+}
+static void upload_diag_end(uint64_t token, int ok, unsigned method, uint64_t bytes) {
+    if (token && s2a_direct_diag_upload_end) s2a_direct_diag_upload_end(token, ok, method, bytes);
+}
+static void upload_diag_bytes(uint64_t *total, uint64_t bytes) {
+    if (total) *total = UINT64_MAX - *total < bytes ? UINT64_MAX : *total + bytes;
+}
+
 // ---------- 上传：块线性存储 → 逐级逐层线性 → 后端 ----------
 // track：1 = CPU 贴图（先保护、记代号，之后脏了重传）；0 = 一次性的初始内容，不跟踪写
 // 脏页追加日志游标（开关 nvk_buf_dirtylog，安卓缺省开、同 rp_buf）：在加保护、取代号之前起（先起游标、后读代号），
@@ -268,7 +285,8 @@ static int tex_content_dirty(struct rp_tex *x, const tex_t *t) {
     return nvn_dirty_since(t->mem, t->L.size, x->stamp);
 }
 
-static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track) {
+static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track, uint64_t *bytes) {
+    if (bytes) *bytes = 0;
     rp_perf_add(RP_PERF_TEX_UP_N, 1); rp_perf_add(RP_PERF_TEX_UP_KB, t->L.size / 1024);
     { const char *why = NULL; int lc = linear_class(t, &why);   // 线性：走下面 nvn_deswizzle 的逐行拷贝（源行距由公共布局解释）
         if (lc < 0) { nvn_unimpl("tex", why, t); return -1; }
@@ -294,6 +312,7 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
             if (nvn_deswizzle(&t->d, l, y, t->mem, tmp, pitch)) { nvn_unimpl("tex", "deswizzle_failed", t); rc = -1; break; }
             NVNcopyRegion r = {0, 0, 0, (int)w, (int)h, (int)dp};
             nvn_gpu_tex_upload(c, x->g, l, y, &r, tmp, pitch, img);
+            upload_diag_bytes(bytes, img);
         }
     }
     free(tmp);
@@ -306,7 +325,8 @@ static int upload_all(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int track
 //   按脏页位图（nvn_dirty_written_pages）把连续的脏页换成行区间逐段上传。
 //   顺序同 upload_all：先重新保护、取新代号，再按旧代号取位图、读内容——取位图之后的写，下次照样查得到。
 //   返回 0 = 已按行传完；-1 = 不适用（没传过 / 不是线性单级二维 / 不被跟踪 / 脏行过半），调用方整张传；1 = 失败。
-static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
+static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, uint64_t *bytes) {
+    if (bytes) *bytes = 0;
     const char *why = NULL;
     if (!x->uploaded || !x->span || t->d.levels > 1 || t->L.layers > 1 || t->d.target != NVN_TEXTURE_TARGET_2D || linear_class(t, &why) <= 0) return -1;
     int bw = 1, bh = 1; int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -354,6 +374,7 @@ static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) 
         for (uint32_t y = 0; y < nr; y++) memcpy(tmp + (size_t)y * row_bytes, (const uint8_t *)t->mem + (uint64_t)(r0 + y) * sp, row_bytes);
         NVNcopyRegion r = {0, (int)r0, 0, (int)w, (int)nr, 1};
         nvn_gpu_tex_upload(c, x->g, 0, 0, &r, tmp, row_bytes, img);
+        upload_diag_bytes(bytes, img);
         rp_perf_add(RP_PERF_TEX_UP_ROWS, nr);
     }
     free(tmp); free(run);
@@ -404,7 +425,9 @@ static void zero_fill(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
     uint32_t w0 = t->d.width ? (uint32_t)t->d.width : 1, h0 = t->d.height ? (uint32_t)t->d.height : 1, d0 = is3d && t->d.depth ? (uint32_t)t->d.depth : 1;
     size_t need = (size_t)w0 * (size_t)bpb * h0 * d0;   // 第 0 级一层最大
     if (need > (64u << 20)) return;
-    uint8_t *z = calloc(1, need); if (!z) return;
+    uint64_t token = upload_diag_begin(5, 0), bytes = 0;
+    uint8_t *z = calloc(1, need);
+    if (!z) { upload_diag_end(token, 0, 0, 0); return; }
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
     for (uint32_t l = 0; l < levels; l++) {
         uint32_t w = w0 >> l, h = h0 >> l, dp = d0 >> l;
@@ -413,9 +436,12 @@ static void zero_fill(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
         if (!dp) dp = 1;
         size_t pitch = (size_t)w * (size_t)bpb;
         NVNcopyRegion r = {0, 0, 0, (int)w, (int)h, (int)dp};
-        for (uint32_t y = 0; y < layers; y++) nvn_gpu_tex_upload(c, x->g, l, y, &r, z, pitch, pitch * h * dp);
+        for (uint32_t y = 0; y < layers; y++) {
+            nvn_gpu_tex_upload(c, x->g, l, y, &r, z, pitch, pitch * h * dp);
+            if (token) upload_diag_bytes(&bytes, pitch * h * dp);
+        }
     }
-    free(z);
+    free(z); upload_diag_end(token, 1, 1, bytes);
 }
 
 uint32_t rp_storage_srgb_alias(uint32_t f) {
@@ -532,7 +558,12 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
-                if (from) { zero = upload_all(t, x, xc, 0); uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_; }
+                if (from) {
+                    uint64_t token = upload_diag_begin(1, 0), bytes = 0;
+                    zero = upload_all(t, x, xc, 0, token ? &bytes : NULL);
+                    upload_diag_end(token, zero == 0, 1, bytes);
+                    uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_;
+                }
                 if (zero && g_attach_intent && zero_deferrable(t)) { x->zero_pending = 1; rp_perf_add(RP_PERF_RES_ZDEFER, 1); }
                 else if (zero) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERO, res_now() - i1_); rp_perf_add(RP_PERF_RES_ZERON, 1); }
             }
@@ -553,10 +584,23 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
         } else {
             if (x->uploaded && x->span && !x->check_dirty) rp_perf_add(RP_PERF_TEX_EPOCH_MISS, 1);   // 具备纪元快路条件但未命中
             x->span = nvn_dirty_span(t->mem, t->L.size);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
-            if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
+            int first = !x->uploaded, prior = x->check_dirty;
+            int queried_dirty = !first && !prior ? tex_content_dirty(x, t) : 0;
+            if (first || prior || queried_dirty) {
+                // The span and reliability flags describe the sampled state; a
+                // conservative query can report dirty without a proven CPU write.
+                unsigned reason = 0;
+                if (s2a_direct_diag_enabled && s2a_direct_diag_enabled())
+                    reason = (first ? 1u : 0u) | (prior ? 2u : 0u) | (!x->span ? 4u : 0u) |
+                             (nvn_dirty_tracking_unreliable() ? 8u : 0u) | (queried_dirty ? 16u : 0u);
+                uint64_t token = upload_diag_begin(first ? 2 : 3, reason), bytes = 0;
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
-                int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
-                if (xc && (pr == 0 || (pr < 0 && upload_all(t, x, xc, 1) == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
+                int pr = xc ? upload_linear_dirty(t, x, xc, token ? &bytes : NULL) : 1;
+                unsigned method = pr == 0 ? 2u : 0u;
+                int ok = xc && pr == 0;
+                if (xc && pr < 0) { method = 1; ok = upload_all(t, x, xc, 1, token ? &bytes : NULL) == 0; }
+                upload_diag_end(token, ok, method, bytes);
+                if (ok) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = x->unarmed; }
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
         }
@@ -765,7 +809,9 @@ static nvn_gpu_view decl_zero(uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c) {
     }
     const uint32_t zero = 0;
     NVNcopyRegion r = {0, 0, 0, 1, 1, 1};
+    uint64_t token = upload_diag_begin(6, 0);
     for (uint32_t layer = 0; layer < d.d.depth; layer++) nvn_gpu_tex_upload(xc, tex, 0, layer, &r, &zero, 4, 4);
+    upload_diag_end(token, 1, 1, (uint64_t)d.d.depth * 4);
     // 视图带显式目标：6 层的立方体数组存储默认会被后端按面数配成立方体，声明是立方体数组时类型就又对不上了
     view_t zv; memset(&zv, 0, sizeof zv);
     zv.set_target = 1; zv.target = (uint8_t)want; zv.set_layers = 1; zv.nlayers = (uint16_t)d.d.depth;

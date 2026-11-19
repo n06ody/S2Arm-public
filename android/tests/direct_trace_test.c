@@ -24,13 +24,24 @@ int main(int argc, char **argv) {
         pause_ms(350); if (s2a_direct_diag_enabled()) return 7;
         puts("READY"); fflush(stdout); for (;;) pause_ms(1000);
     }
+    if (!strcmp(argv[2], "pipeline")) {
+        uint64_t p = s2a_direct_diag_pipe_begin(1, 0);
+        if (!p) { fprintf(stderr, "FAIL: driver pipeline begin must be recorded\n"); return 9; }
+        s2a_direct_diag_pipe_end(p, 1, 2);
+        uint8_t id[32]; memset(id, 0xcd, sizeof id);
+        s2a_direct_diag_pack(id, 3, 0);
+        uint64_t up = s2a_direct_diag_upload_begin(3, 20);
+        if (!up) { fprintf(stderr, "FAIL: upload begin must be recorded\n"); return 10; }
+        s2a_direct_diag_upload_end(up, 1, 1, 320);
+        pause_ms(300); puts("READY"); fflush(stdout); for (;;) pause_ms(1000);
+    }
     uint8_t id[32]; memset(id, 0xab, sizeof id);
     s2a_direct_diag_frame();
     uint64_t token = s2a_direct_diag_compile_begin(id, 7, 1, 0);
     pause_ms(180); // begin and end cross completed segment boundary
     s2a_direct_diag_compile_end(token, 1);
     s2a_direct_diag_frame();
-    if (!strcmp(argv[2], "overflow")) for (int i = 0; i < 5000; ++i) s2a_direct_diag_frame();
+    if (!strcmp(argv[2], "overflow")) for (int i = 0; i < 20000; ++i) s2a_direct_diag_frame();
     if (!strcmp(argv[2], "inflight")) (void)s2a_direct_diag_compile_begin(id, 32, 1, 0);
     pause_ms(500);
     puts("READY"); fflush(stdout);
