@@ -31,6 +31,8 @@ static void pause_ms(void) { struct timespec t = {0, 1000000}; nanosleep(&t, NUL
 static int __android_log_print(int level, const char *tag, const char *fmt, ...) { (void)level; (void)tag; va_list ap; va_start(ap, fmt); int r = vsnprintf(last_log, sizeof last_log, fmt, ap); va_end(ap); return r; }
 int nvk_session_wait_compiles(void) { return 0; }
 void nvk_session_flush_pipe_cache(void) {}
+void nvn_vk_frame_log_snapshot_retained(uint64_t) __attribute__((weak));
+void nvn_vk_frame_log_snapshot_retained(uint64_t deadline) { (void)deadline; }
 void nvk_session_request_stop(void) { if (!test_deadline) test_deadline = (uint64_t)ctl_now_ns() + NVK_SHUTDOWN_BUDGET_NS; }
 uint64_t nvk_session_stop_deadline(void) { return test_deadline; }
 static void diag_log_manifest(const char *a, const char *b) { (void)a; (void)b; }

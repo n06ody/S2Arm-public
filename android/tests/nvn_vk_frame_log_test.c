@@ -466,6 +466,19 @@ int main(void) {
     CHECK(g_nlines == 0);
     printf("ok\n");
 
+    printf("  case %-32s", "retained_busy_does_not_reset");
+    s2a_fl_reset(&g_fl);
+    s2a_fl_note_timed(&g_fl, 1000, 0, 0);
+    atomic_store(&g_fl.snapshot_lock, 1);
+    struct timespec bt; clock_gettime(CLOCK_MONOTONIC, &bt);
+    uint64_t limit = (uint64_t)bt.tv_sec * 1000000000ull + (uint64_t)bt.tv_nsec + 100000000ull;
+    nvn_vk_frame_log_snapshot_retained(limit);
+    CHECK(atomic_load(&g_retained_snapshot) == 0);
+    CHECK(g_fl.seq == 1 && g_fl.kept == 1);
+    atomic_store(&g_fl.snapshot_lock, 0);
+    s2a_fl_reset(&g_fl);
+    printf("ok\n");
+
     printf("nvn_vk_frame_log_test: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
