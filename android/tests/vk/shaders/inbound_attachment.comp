@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=1,local_size_y=1,local_size_z=1) in;
+layout(set=0,binding=0) uniform texture2D image;
+layout(set=0,binding=1) uniform sampler samp;
+layout(set=0,binding=2,std430) writeonly buffer Output { vec4 result; } output_data;
+void main(){output_data.result=texelFetch(sampler2D(image,samp),ivec2(0,0),0);}
