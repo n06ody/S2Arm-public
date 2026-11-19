@@ -5,7 +5,8 @@
 #include "t_feedback.c"
 #undef main
 
-static int omit_color_stage, expect_narrow, pass_dep_off, keep_incoming;
+static int omit_color_stage, expect_narrow, pass_dep_off, keep_incoming, ceiling;
+static unsigned ceiling_checked, ceiling_mismatches;
 static unsigned observed_passes, observed_outputs, mutated_outputs;
 static unsigned color_only, color_stage_mismatches;
 static unsigned mixed, mixed_stage_mismatches;
@@ -14,6 +15,7 @@ static unsigned depth_only, depth_only_mismatches;
 int __real_nvn_plat_flag(const char *,int);
 int __wrap_nvn_plat_flag(const char *name,int d) {
     if(!strcmp(name,"nvk_pass_dep_narrow"))return !pass_dep_off;
+    if(!strcmp(name,"nvk_barrier_ceiling"))return ceiling;
     return __real_nvn_plat_flag(name,d);
 }
 extern __typeof__(vkCreateRenderPass) __real_vkCreateRenderPass;
@@ -23,6 +25,18 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateRenderPass(VkDevice device,const V
     VkSubpassDependency deps[2];uint32_t count=0;
     for(uint32_t i=0;i<ci->dependencyCount;i++) {
         VkSubpassDependency d=ci->pDependencies[i];
+        if(ceiling) {
+            const VkSubpassDescription *sp=&ci->pSubpasses[0];
+            int depth=sp->pDepthStencilAttachment && sp->pDepthStencilAttachment->attachment!=VK_ATTACHMENT_UNUSED;
+            unsigned colors=0;for(uint32_t j=0;j<sp->colorAttachmentCount;j++)if(sp->pColorAttachments[j].attachment!=VK_ATTACHMENT_UNUSED)colors++;
+            VkPipelineStageFlags stages=(colors?VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT:0) |
+                (depth?(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT):0);
+            if(!stages)stages=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkAccessFlags wr=(colors?VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT:0)|(depth?VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:0);
+            VkAccessFlags rdwr=wr|(colors?VK_ACCESS_COLOR_ATTACHMENT_READ_BIT:0)|(depth?VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT:0);
+            ceiling_checked++;
+            if(d.srcStageMask!=stages||d.dstStageMask!=stages||d.srcAccessMask!=wr||d.dstAccessMask!=rdwr)ceiling_mismatches++;
+        }
         // 删除入向依赖，避免它掩盖被测的出向依赖；模板及实际 pass 一致变异。
         if(d.srcSubpass==VK_SUBPASS_EXTERNAL&&!keep_incoming)continue;
         if(d.dstSubpass==VK_SUBPASS_EXTERNAL) {
@@ -35,11 +49,11 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateRenderPass(VkDevice device,const V
                 VkPipelineStageFlags stages=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 VkAccessFlags access=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
                 if(pass_dep_off){stages|=VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;access|=VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;}
-                if(d.srcStageMask!=stages || d.srcAccessMask!=access)color_stage_mismatches++;
+                if(!ceiling && (d.srcStageMask!=stages || d.srcAccessMask!=access))color_stage_mismatches++;
             }
-            if(colors&&depth){mixed++;if(d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT))mixed_stage_mismatches++;}
-            if(!colors&&!depth){no_attachment++;if(d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT))no_attachment_mismatches++;}
-            if(!colors&&depth){depth_only++;if(d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT))depth_only_mismatches++;}
+            if(colors&&depth){mixed++;if(!ceiling && (d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)))mixed_stage_mismatches++;}
+            if(!colors&&!depth){no_attachment++;if(!ceiling && (d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)))no_attachment_mismatches++;}
+            if(!colors&&depth){depth_only++;if(!ceiling && (d.srcStageMask!=(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)||d.srcAccessMask!=(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)))depth_only_mismatches++;}
             if(omit_color_stage) {
                 d.srcStageMask=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
                 d.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
@@ -54,6 +68,30 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateRenderPass(VkDevice device,const V
     observed_passes++;return __real_vkCreateRenderPass(device,&copy,allocator,pass);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkCreateRenderPass), PFN_vkCreateRenderPass), "vkCreateRenderPass signature");
+
+static PFN_vkCmdPipelineBarrier ceiling_real_barrier;
+static _Atomic unsigned ceiling_full_barriers;
+static VKAPI_ATTR void VKAPI_CALL ceiling_barrier(VkCommandBuffer cb,VkPipelineStageFlags src,VkPipelineStageFlags dst,VkDependencyFlags flags,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im) {
+    if(src==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && !nb && !ni)
+        atomic_fetch_add(&ceiling_full_barriers,1);
+    ceiling_real_barrier(cb,src,dst,flags,nm,m,nb,b,ni,im);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(&ceiling_barrier), PFN_vkCmdPipelineBarrier), "vkCmdPipelineBarrier signature");
+static PFN_vkVoidFunction ceiling_command(const char *name) {
+    return !strcmp(name,"vkCmdPipelineBarrier") ? (PFN_vkVoidFunction)ceiling_barrier : NULL;
+}
+static void run_ceiling_barriers(struct s2a_vk_device *device) {
+    ceiling_real_barrier=(PFN_vkCmdPipelineBarrier)__real_vkGetDeviceProcAddr(device->device,"vkCmdPipelineBarrier");
+    REQUIRE(ceiling_real_barrier); observed_command=ceiling_command; atomic_store(&ceiling_full_barriers,0);
+    nvn_gpu_open_desc od={0};od.host_device=device;od.app_label="barrier-ceiling";GPU(nvn_gpu_open(&od,&err));
+    nvn_gpu_cmd cmd=NULL;GPU(nvn_gpu_cmd_begin(NULL,&cmd,&err));
+    nvn_gpu_inbound_pre_finish(cmd); nvn_gpu_barrier(cmd,0);
+    GPU(nvn_gpu_cmd_commit(cmd,1,done,NULL,&err));GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));
+    unsigned count=atomic_load(&ceiling_full_barriers);
+    printf("ceiling-barriers dq=%d mode=%d observed=%u expected=%u\n",dq_mode,ceiling,count,2-(unsigned)ceiling);
+    REQUIRE(count==2-(unsigned)ceiling);
+    GPU(nvn_gpu_close(5000000000ull,&err));observed_command=NULL;
+}
 
 static unsigned no_sample_sets(void) { return 0; }
 static void run_empty(struct s2a_vk_device *device,const char *dir) {
@@ -89,13 +127,39 @@ static void run_depth_only(struct s2a_vk_device *device,const char *dir) {
     nvn_gpu_view_release(view);nvn_gpu_tex_release(tex);nvn_gpu_shader_release(vs);nvn_gpu_shader_release(fs);GPU(nvn_gpu_close(5000000000ull,&err));observed_sample_sets=NULL;
 }
 
+static void run_color_shape(struct s2a_vk_device *device,const char *dir,int with_depth) {
+    observer_reset();observed_sample_sets=no_sample_sets;
+    nvn_gpu_open_desc od={0};od.host_device=device;od.app_label="ceiling-color-pass";GPU(nvn_gpu_open(&od,&err));
+    nvn_gpu_shader vs=shader(dir,"fullscreen.vert",NVN_GPU_SH_VS,NULL),fs=shader(dir,"solid_green.frag",NVN_GPU_SH_FS,NULL);
+    nvn_gpu_pipe_desc pd={0};pd.poly.mode=NVN_POLYGON_MODE_FILL;pd.color.logic_op=3;pd.prim=4;pd.samples=1;pd.cfmt[0]=NVN_FORMAT_RGBA8;
+    if(with_depth){pd.dfmt=NVN_FORMAT_DEPTH32F;pd.ds.dt=pd.ds.dw=1;pd.ds.df=8;}
+    pd.st[NVN_GPU_SH_VS].sh=vs;pd.st[NVN_GPU_SH_FS].sh=fs;
+    nvn_gpu_pipe pipe=NULL;GPU(nvn_gpu_pipe_get(&pd,NVN_GPU_PIPE_SYNC,&pipe,&err));
+    nvn_gpu_tex tex[2]={0};nvn_gpu_view view[2]={0};
+    nvn_gpu_tex_desc td={0};td.d.target=NVN_TEXTURE_TARGET_2D;td.d.format=NVN_FORMAT_RGBA8;td.d.width=td.d.height=4;td.d.depth=td.d.levels=1;td.usage=NVN_GPU_TEX_RENDER;
+    GPU(nvn_gpu_tex_create(&td,&tex[0],&err));GPU(nvn_gpu_view_create(tex[0],NULL,&view[0],&err));
+    if(with_depth){td.d.format=NVN_FORMAT_DEPTH32F;GPU(nvn_gpu_tex_create(&td,&tex[1],&err));GPU(nvn_gpu_view_create(tex[1],NULL,&view[1],&err));}
+    nvn_gpu_cmd cmd=NULL;GPU(nvn_gpu_cmd_begin(NULL,&cmd,&err));
+    nvn_gpu_pass_desc p={0};p.ncolor=1;p.color[0].view=view[0];p.color[0].load=NVN_GPU_LOAD_CLEAR;p.color[0].store=NVN_GPU_STORE_STORE;
+    if(with_depth){p.depth.view=view[1];p.depth.load=NVN_GPU_LOAD_CLEAR;p.depth.store=NVN_GPU_STORE_STORE;p.clear_depth=.25f;}
+    p.w=p.h=4;p.layers=1;nvn_gpu_pass_begin(cmd,&p);nvn_gpu_set_pipe(cmd,pipe);
+    nvn_gpu_dyn dyn={0};dyn.nvp=1;dyn.vp[0][2]=dyn.vp[0][3]=4;dyn.vp[0][5]=1;dyn.has_sc=1;dyn.sc[2]=dyn.sc[3]=4;nvn_gpu_set_dyn(cmd,&dyn);
+    nvn_gpu_draw_args a={0};a.prim=4;a.count=3;a.instances=1;nvn_gpu_draw(cmd,&a);nvn_gpu_pass_end(cmd);
+    GPU(nvn_gpu_cmd_commit(cmd,1,done,NULL,&err));GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));REQUIRE(observed_draws==1);
+    for(int i=0;i<1+with_depth;i++){nvn_gpu_view_release(view[i]);nvn_gpu_tex_release(tex[i]);}
+    nvn_gpu_shader_release(vs);nvn_gpu_shader_release(fs);GPU(nvn_gpu_close(5000000000ull,&err));observed_sample_sets=NULL;
+}
+
 int main(int argc,char **argv) {
     REQUIRE(argc==4);dq_mode=atoi(argv[2]);int mode=atoi(argv[3]);omit_color_stage=mode==1;expect_narrow=mode==2||mode==3||mode==6;pass_dep_off=mode==3;keep_incoming=mode==6;opt_mode=0;copy_mode=1;
-    REQUIRE((dq_mode==0||dq_mode==1)&&mode>=0&&mode<=7);
+    ceiling=mode>=15 ? (mode>=17?2:1) : mode>=12 ? mode-12 : mode>=8 ? (mode>=10?2:1) : 0; if(ceiling)keep_incoming=1;
+    REQUIRE((dq_mode==0||dq_mode==1)&&mode>=0&&mode<=18);
     struct s2a_vk_device device;char why[256];REQUIRE(!s2a_vk_device_create(&device,why,sizeof why));
-    if(mode==7)run_depth_only(&device,argv[1]);else if(mode==5)run_empty(&device,argv[1]);else if(mode==4)run_depth(&device,argv[1],NVN_FORMAT_DEPTH32F,12);else run_case(&device,argv[1],0);
+    if(mode>=12&&mode<=14){run_ceiling_barriers(&device);REQUIRE(!s2a_vk_device_destroy(&device,1));return 0;}
+    if(mode>=15)run_color_shape(&device,argv[1],mode==16||mode==18);else if(mode==7||mode==9||mode==11)run_depth_only(&device,argv[1]);else if(mode==5||mode==8||mode==10)run_empty(&device,argv[1]);else if(mode==4)run_depth(&device,argv[1],NVN_FORMAT_DEPTH32F,12);else run_case(&device,argv[1],0);
     REQUIRE(!s2a_vk_device_destroy(&device,1));
     REQUIRE(observed_passes>=2&&observed_outputs>=2);
+    if(ceiling) { printf("ceiling mode=%d checked=%u mismatches=%u\n",ceiling,ceiling_checked,ceiling_mismatches); REQUIRE(ceiling_checked>=4 && ceiling_mismatches==0); }
     REQUIRE(omit_color_stage?mutated_outputs==observed_outputs:mutated_outputs==0);
     printf("external dq=%d omit_color=%d passes=%u outputs=%u mutated=%u color_only=%u stage_mismatches=%u mixed=%u mixed_mismatches=%u no_attachment=%u no_attachment_mismatches=%u depth_only=%u depth_only_mismatches=%u failures=%u\n",
            dq_mode,omit_color_stage,observed_passes,observed_outputs,mutated_outputs,color_only,color_stage_mismatches,mixed,mixed_stage_mismatches,no_attachment,no_attachment_mismatches,depth_only,depth_only_mismatches,failures);

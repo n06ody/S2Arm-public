@@ -380,6 +380,7 @@ static void es_reset(struct nvn_gpu_cmd_s *c) { memset(&c->es, 0, sizeof c->es);
 struct nvn_gpu_vk {
     struct s2a_vk_device *dev;
     int pass_dep_narrow;  // 会话内固定，模板与实际通道必须使用相同的依赖
+    int barrier_ceiling;  // 一次性不安全性能探测，0 关闭；会话内固定
     struct nvn_vk_bcdec *bc;
     VkDevice d;
     VkPhysicalDevice phys;
@@ -2161,6 +2162,13 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     __atomic_store_n(&g_inbound_host_epoch, 0, __ATOMIC_RELAXED);
     g.dev = dev;
     g.pass_dep_narrow = nvn_plat_flag("nvk_pass_dep_narrow", 1) != 0;
+    g.barrier_ceiling = nvn_plat_flag("nvk_barrier_ceiling", 0);
+    if (g.barrier_ceiling < 0 || g.barrier_ceiling > 2) {
+        nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", "barrier_ceiling 参数无效，使用 0");
+        g.barrier_ceiling = 0;
+    } else if (g.barrier_ceiling) {
+        nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", "barrier_ceiling 不安全探测已开启，画面和同步结果不可用于正确性验收");
+    }
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
         static int mt_on = -1; if (mt_on < 0) mt_on = nvn_plat_flag("nvk_mem_types", 0) != 0;
@@ -2641,8 +2649,10 @@ static void full_barrier_at(struct nvn_gpu_cmd_s *c, const char *fn, int line, i
     int inbound_full = force_all || (g_inbound_narrow && (c->inbound_boundary || c->inbound_outside || c->inbound_draw || c->inbound_dispatch));
     VkPipelineStageFlags src = !inbound_full && c->narrow_barrier && c->xfer_dirty == 2 && !c->xfer_pending_graphics ?
         VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    // 仅供上限探测：1 跳过通道保护和前置段完结；2 进一步跳过所有 full_barrier（含游戏屏障）。
+    if (g.barrier_ceiling != 2 && !(g.barrier_ceiling == 1 && force_all))
+        mem_barrier(c, src, VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     c->xfer_dirty = 0;
     c->xfer_pending_graphics = 0;
     c->inbound_boundary = 0; c->inbound_outside = c->inbound_draw = c->inbound_dispatch = c->inbound_draw_reasons = 0;
@@ -3300,6 +3310,21 @@ static void pass_dependencies(VkSubpassDependency dep[2], int has_color, int has
     dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    if (g.barrier_ceiling) {
+        // 不安全探测：只保留实际附件阶段；无附件时用合法的非零图形阶段、零访问。
+        VkPipelineStageFlags stages = (has_color ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : 0) |
+            (has_depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0);
+        VkAccessFlags writes = (has_color ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0) |
+            (has_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0);
+        VkAccessFlags reads = (has_color ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT : 0) |
+            (has_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT : 0);
+        if (!stages) stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        for (int i = 0; i < 2; i++) {
+            dep[i].srcStageMask = dep[i].dstStageMask = stages;
+            dep[i].srcAccessMask = writes; dep[i].dstAccessMask = writes | reads;
+        }
+        return;
+    }
     if (g.pass_dep_narrow && has_color && !has_depth) {
         dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;

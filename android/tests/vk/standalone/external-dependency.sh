@@ -3,7 +3,7 @@
 # Copyright 2026 S2Arm contributors
 set -euo pipefail
 variant=${1:-controls}
-[ "$variant" = controls ] || [ "$variant" = red ] || { echo 'unknown variant' >&2; exit 2; }
+[ "$variant" = controls ] || [ "$variant" = red ] || [ "$variant" = ceiling ] || { echo 'unknown variant' >&2; exit 2; }
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 out="$repo/build/vk-external-dependency"; mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}"
@@ -26,12 +26,12 @@ SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 failed=0
 for dq in 0 1;do
- if [ "$variant" = red ];then modes=(2);else modes=(0 1 2 3 4 5 6 7);fi
+ if [ "$variant" = red ];then modes=(2);elif [ "$variant" = ceiling ];then modes=(8 9 10 11 12 13 14 15 16 17 18);else modes=(0 1 2 3 4 5 6 7);fi
  for omit in "${modes[@]}";do
   log="$out/dq$dq-omit$omit.log";set +e;timeout 120 "$out/test" "$out/shaders" "$dq" "$omit" > "$log" 2>&1;rc=$?;set -e
   raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$log" || true)
   other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
-  marker=$(grep '^external ' "$log" || true)
+  marker=$(grep -E '^(external |ceiling-barriers )' "$log" || true)
   printf 'external dq=%s omit=%s rc=%s RAW=%s other=%s %s\n' "$dq" "$omit" "$rc" "$raw" "$other" "$marker"
   if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { [ "$omit" != 1 ] && [ "$raw" != 0 ]; } || { [ "$omit" = 1 ] && [ "$raw" -lt 1 ]; };then
    echo '【红】外部依赖正/负控不符合预期';tail -20 "$log";failed=1
@@ -39,4 +39,4 @@ for dq in 0 1;do
  done
 done
 [ "$failed" = 0 ] || exit 1
-if [ "$variant" = red ];then echo '【绿】纯颜色通道阶段断言';else echo '【绿】出向依赖正/负控、阶段断言、关闭开关和混合附件';fi
+if [ "$variant" = red ];then echo '【绿】纯颜色通道阶段断言';elif [ "$variant" = ceiling ];then echo '【绿】探测档模板/实际通道阶段及全屏障数量';else echo '【绿】出向依赖正/负控、阶段断言、关闭开关和混合附件';fi
