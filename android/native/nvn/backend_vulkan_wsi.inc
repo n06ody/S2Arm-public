@@ -424,7 +424,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           for (int i = 0; i < OP_N; i++) { c[i] = __atomic_exchange_n(&g_dq_cnt[i], 0, __ATOMIC_RELAXED); tot += c[i]; idx[i] = i; }
           for (int i = 1; i < OP_N; i++) { int k = idx[i], j = i - 1; while (j >= 0 && c[idx[j]] < c[k]) { idx[j + 1] = idx[j]; j--; } idx[j + 1] = k; }
           size_t o = (size_t)snprintf(b, sizeof b, "驱动调用（每帧，近 300 帧）：共 %.0f 次", tot / 300.0);
-          for (int i = 0; i < 10 && i < OP_N && c[idx[i]] && o < sizeof b - 48; i++) if (idx[i] != OP_WRAP) o += (size_t)snprintf(b + o, sizeof b - o, "；%s %.1f", g_dq_names[idx[i]] + 5, c[idx[i]] / 300.0);   // + 5：去掉 vkCmd
+          for (int i = 0; i < 10 && i < OP_N && c[idx[i]] && o < sizeof b - 48; i++) if (idx[i] != OP_WRAP) o += (size_t)snprintf(b + o, sizeof b - o, "；%s %.1f", g_dq_names[idx[i]] + (strncmp(g_dq_names[idx[i]], "vkCmd", 5) ? 0 : 5), c[idx[i]] / 300.0);   // 去掉 vkCmd 前缀（暂存填充 fill 没有）
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
         if (g_dq_ring && DQ_ON()) {   // 两级回放开着才有这一行：录制线程怎么等活、生产者叫了几次、清空等了多久（nvk_dq_spin / nvk_dq_poll_us / nvk_dq_wake_kb 的 A/B 读数）
           uint64_t s[DQS_N]; for (int i = 0; i < DQS_N; i++) s[i] = __atomic_exchange_n(&g_dq_st[i], 0, __ATOMIC_RELAXED);

@@ -1,0 +1,23 @@
+#version 450
+// Original reference fits lavapipe's physical limit, but exceeds the test's
+// simulated 4096-byte device limit: at least two arrays must be spilled.
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) buffer Output { uint words[]; } output_data;
+shared uint a[1536];
+shared uint b[1024];
+shared uint c[1024];
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint group = gl_WorkGroupID.x + gl_NumWorkGroups.x * (gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z);
+    a[i] = group * 100u + i;
+    b[i] = group * 200u + i;
+    c[i] = group * 300u + i;
+    if (i == 0u) { a[32] = 0u; b[32] = 0u; }
+    barrier();
+    atomicAdd(a[32], i + 1u);
+    atomicAdd(b[32], 2u * i + 1u);
+    barrier();
+    output_data.words[group * 9u + i] = a[i] ^ b[(i + 1u) % 8u] ^ c[7u - i] ^ a[32] ^ b[32];
+    if (i == 0u) output_data.words[group * 9u + 8u] = a[32] + b[32];
+}

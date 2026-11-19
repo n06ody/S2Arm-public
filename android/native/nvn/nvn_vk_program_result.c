@@ -264,8 +264,11 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
                       return fail(why, why_size, "stage c0 read range is invalid");
                   if ((uint64_t)o < FD_C0_BASE_INSTANCE + 4 && (uint64_t)o + z > FD_C0_BASE_INSTANCE) hit = 1;
               }
-              out->stage[idx].binst_unread = !hit;
-          } }
+              out->stage[idx].binst_unread = !hit; out->stage[idx].binst_known = 1;
+          } else if (!s2a_jv_obj_find(st, "c0ReadsWhy", &reads) && s2a_jv_is_string(reads) &&
+                     s2a_jv_str(reads, out->stage[idx].c0_why, sizeof out->stage[idx].c0_why))
+              out->stage[idx].c0_why[0] = 0;   // 诊断字段：太长 / 坏了就当没给，不拒结果
+          }
         // 片元着色器的输出映射（每个颜色目标 4 位、RGBA 各 1 位）：在阶段的 info 里；读不到 = 全 1（不屏蔽）
         out->stage[idx].fragment_output_map = 0xffffffffu;
         { struct s2a_jv info = { NULL, 0 }, om = { NULL, 0 }; uint32_t om_v = 0;
@@ -619,7 +622,16 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         else if (compute_string_is(b, "kind", "storage")) dst->kind = 1;
         else if (compute_string_is(b, "kind", "texture")) dst->kind = 2;
         else if (compute_string_is(b, "kind", "image")) dst->kind = 3;
+        else if (compute_string_is(b, "kind", "spill")) dst->kind = 4;
         else CS_FAIL("unknown compute binding kind");
+        {   // 每线程组字节数只属于 spill；spill 必须带、且 4 字节对齐、不超过客体上限 48 KiB；整个程序最多一个
+            struct s2a_jv per; int has_per = !s2a_jv_obj_find(b, "bytesPerGroup", &per);
+            if (dst->kind == 4) {
+                if (!has_per || compute_u32(per, &u) || !u || (u & 3) || u > 48u * 1024u) CS_FAIL("compute spill bytesPerGroup is missing or invalid");
+                if (out->spill_bytes) CS_FAIL("compute program has more than one spill binding");
+                out->spill_bytes = u;
+            } else if (has_per) CS_FAIL("compute non-spill binding carries bytesPerGroup");
+        }
         // texture (kind 2) 是 compute 的一等资源：slot 就是 NVN c2 组合纹理表里的 handleIndex，
         // 下面按 8+2*slot 校验并换算出 NVN 纹理槽。存储图像（kind 3）还没接：显式拒绝并把
         // set/binding/handleIndex 写进原因（不绑定占位图像、不静默丢一条描述符）。
@@ -643,7 +655,8 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
             if (compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute guest slot invalid");
             dst->slot = (int)u;
         }
-        if (!dst->is_support && dst->kind != 1 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
+        if (dst->kind == 4 && dst->slot >= 0) CS_FAIL("compute spill binding carries a guest slot");
+        if (!dst->is_support && dst->kind != 1 && dst->kind != 4 && dst->slot < 0) CS_FAIL("compute binding has no reflected guest slot");
         // 图像（kind 3）：handleIndex 指驱动 c2 图像句柄表（字节 0x120 起 8 槽 × 8 字节 = 4 字节字下标 72..86 偶数，
         //   同 iOS nvn_mtl.m C2_IMG / tex_slot_h），NVN 图像槽 = (handleIndex − 72) / 2；回放按 BindImage 的槽取（rp_draw NVN_RB_IMG）
         if (dst->kind == 3 && (dst->slot < 72 || dst->slot >= 88 || (dst->slot & 1))) {
