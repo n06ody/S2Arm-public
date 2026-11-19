@@ -110,8 +110,12 @@ static void t_res_tex_epoch(void) {
 // wrap = 1 时第 WD 笔再追加 70 条无关事件（超过替身日志容量 64，读者判环绕）。
 // 纪元键仍是全局写代号，所以每笔第一次取都「没命中」；修后没命中时读日志求交，不再逐页比。
 enum { SC_N = 8, SC_D = 32, SC_WD = 10, SC_W = 128, SC_H = 128, SC_UBO = 200 };
-struct scene { uint64_t miss, skip, pages, since, log_n, log_ev, fallback, up[SC_N], sh_n, sh_miss, sh_extra; };
+struct scene { uint64_t miss, skip, pages, since, log_n, log_ev, fallback, up[SC_N], sh_n, sh_miss, sh_extra, unarmed; };
 static int g_sc_silent5, g_sc_phantom6;   // 影子核对用例：第 WD 笔对贴图 5 只推代号不记事件（日志漏写）；对贴图 6 只记事件不推代号（日志多报）
+// 加保护没落地（8E 真机影子核对：日志判净、逐页判脏）：首传贴图 4 时它的第 2 页正被另一线程解保护（nvn_dirty_page_armed 答 0），
+//   那次写在首传读完内容之后才落、且不缺页（页还可写），日志里没有事件。1 = 写的代号晚于首传取的代号（逐页比看得见、日志看不见）；
+//   2 = 代号不晚于首传取的代号（解保护在取代号之前推进了代号：两条路都看不见）。修法：上传时有页没重新只读，这次上传不算同步，下一次必重传。
+static int g_sc_unarmed;
 static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
     struct scene r; memset(&r, 0, sizeof r);
     const int saved_flag = g_flag_buf_dirtylog;
@@ -126,7 +130,13 @@ static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
         t[i] = mk_tex(950 + (uint64_t)i, 0, NVN_FORMAT_RGBA8, SC_W, SC_H, 1, 0);
         t[i].mem = g_block_mem + (size_t)i * t[i].L.size;   // 各占 16 页：贴图 i 在第 16i..16i+15 页
         memset(t[i].mem, 0x30 + i, t[i].L.size);
+        const size_t up = (size_t)i * (t[i].L.size / PG) + 2;
+        if (g_sc_unarmed && i == 4) { g_log_unarmed[up] = 1; if (g_sc_unarmed == 2) g_block_gen[up] = g_dirty_now; }
         CHECK(rp_tex_resolve(&t[i], &g_fake_cmd) != NULL);   // 首用：整张传
+        if (g_sc_unarmed && i == 4) {   // 并发的那次写在读完内容之后才落；页可写，不缺页、不进日志
+            memset(t[i].mem + 2 * PG, 0x99, PG); if (g_sc_unarmed == 1) g_block_gen[up] = ++g_dirty_now;
+            g_log_unarmed[up] = 0;       // 之后再加保护就能落地
+        }
     }
     const size_t pages_per = t[0].L.size / PG;
     uint64_t p[RP_PERF_N]; rp_perf_take(p);
@@ -146,7 +156,7 @@ static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
     rp_perf_take(p);
     r.miss = p[RP_PERF_TEX_EPOCH_MISS]; r.skip = p[RP_PERF_TEX_EPOCH]; r.pages = p[RP_PERF_TEX_CHECK_PAGES]; r.since = g_since_calls;
     r.log_n = p[RP_PERF_TEX_LOG_N]; r.log_ev = p[RP_PERF_TEX_LOG_EV]; r.fallback = p[RP_PERF_TEX_LOG_FALLBACK];
-    r.sh_n = p[RP_PERF_TEX_SHADOW_N]; r.sh_miss = p[RP_PERF_TEX_SHADOW_MISS]; r.sh_extra = p[RP_PERF_TEX_SHADOW_EXTRA];
+    r.sh_n = p[RP_PERF_TEX_SHADOW_N]; r.sh_miss = p[RP_PERF_TEX_SHADOW_MISS]; r.sh_extra = p[RP_PERF_TEX_SHADOW_EXTRA]; r.unarmed = p[RP_PERF_TEX_UNARMED];
     CHECK(r.pages + (g_flag_tex_shadow ? r.sh_n * (SC_W * SC_H * 4 / PG) : 0) == g_since_pages);   // 页数计数与独立账一致（影子核对另调的逐页比不进计数）
     for (int i = 0; i < SC_N; i++) nvn_be_tex_release(&t[i]);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
@@ -175,6 +185,21 @@ static void t_res_tex_epoch_unrelated(void) {
     struct scene onx = tex_log_scene(1, 1, 1);
     for (int i = 0; i < SC_N; i++) CHECK(onx.up[i] == offw.up[i]);
     CHECK(onx.fallback == SC_N && onx.since == SC_N && onx.pages == SC_N * PP && onx.log_n == ND - SC_N);
+    CHECK(off.unarmed == 0 && on.unarmed == 0 && onw.unarmed == 0);   // 负对照：加保护都落地时一次都不计、不多传
+}
+// 加保护没落地：两种代号先后 × 日志开关，贴图 4 都必须重传恰好一次（重传时页已重新只读，之后回到日志路 / 纪元，不再多传）；别的贴图不受影响。
+// 影子核对开着时（真机诊断包）：重传之后两路一致，一次「日志判净、逐页判脏」都不能有。
+static void t_res_tex_unarmed(void) {
+    for (int sh = 0; sh <= 1; sh++) for (int v = 1; v <= 2; v++) for (int lg = 0; lg <= 1; lg++) {
+        g_sc_unarmed = v; g_flag_tex_shadow = sh;
+        struct scene s = tex_log_scene(lg, 0, 0);
+        g_sc_unarmed = 0; g_flag_tex_shadow = 0;
+        CHECK(s.up[4] == 1);
+        CHECK(s.unarmed == 0);   // 计数在首传那次（rp_perf_take 之前）；重传那次已落地
+        CHECK(s.sh_miss == 0);
+        for (int i = 0; i < SC_N; i++) if (i != 4) CHECK(s.up[i] == 0);
+        if (s.up[4] != 1 || s.sh_miss) printf("  unarmed v=%d log=%d shadow=%d: 贴图 4 重传 %llu 次（期望 1）、日志净逐页脏 %llu 次（期望 0）\n", v, lg, sh, (unsigned long long)s.up[4], (unsigned long long)s.sh_miss);
+    }
 }
 
 // 影子核对（诊断开关 nvk_tex_log_shadow，缺省关）：日志路判完再按逐页代号判一次，不一致计次、前 8 张报行；不改判脏结论。
@@ -320,6 +345,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     t_res_tex_epoch();
     t_res_tex_epoch_unrelated();
+    t_res_tex_unarmed();
     t_res_tex_shadow();
     t_res_bind_fast();
     t_res_pipe_layout();

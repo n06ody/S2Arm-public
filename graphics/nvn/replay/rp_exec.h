@@ -107,6 +107,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_WAIT_FAKED_N,   // 实验开关 nvk_sync_lag 下「没真等」的等待次数（量重叠上限用，画面可能错）
        RP_PERF_TEX_SHADOW_N, RP_PERF_TEX_SHADOW_MISS, RP_PERF_TEX_SHADOW_EXTRA,   // 诊断 nvk_tex_log_shadow：影子核对次数 / 日志判净而逐页判脏 / 日志判脏而逐页判净
        RP_PERF_TEX_LOG_N, RP_PERF_TEX_LOG_EV, RP_PERF_TEX_LOG_FALLBACK,   // CPU 贴图内容按脏页日志核对的次数 / 读到的事件数 / 日志不可用、退回整张逐页比的次数
+       RP_PERF_TEX_UNARMED,    // CPU 贴图上传时有页加保护没落地（被并发的解保护挡住）：这次上传不算同步，下一次必重传
        RP_PERF_TEX_EPOCH_MISS, RP_PERF_TEX_CHECK_PAGES,   // CPU 贴图内容检查：本可按纪元跳过却没跳成的次数（已传过、没待重传、有跟踪句柄，但全局写代号 / 段号 / 映射代际变了）；逐页比对写代号的页数（每次调 nvn_dirty_since 记整个范围的页数，是上限：遇到脏页会提前停）
        RP_PERF_X2_N0, RP_PERF_X2_N1, RP_PERF_X2_N2, RP_PERF_X2_N3, RP_PERF_X2_KB0, RP_PERF_X2_KB1, RP_PERF_X2_KB2, RP_PERF_X2_KB3,   // 「同一提交第二次同步」收掉开着的通道：按资源类别（RP_X2_*）的次数 / 千字节
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值

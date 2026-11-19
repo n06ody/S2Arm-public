@@ -253,6 +253,8 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                 snprintf(b + strlen(b), sizeof b - strlen(b), "；内容检查：纪元没命中 %.0f 次、逐页比对 %.0f 页", (double)pf[RP_PERF_TEX_EPOCH_MISS] / f, (double)pf[RP_PERF_TEX_CHECK_PAGES] / f);   // 缺省常开、只计数：纪元快路没跳成的次数与逐页比的页数（上限）
                 if (pf[RP_PERF_TEX_LOG_N] || pf[RP_PERF_TEX_LOG_FALLBACK])   // 脏页日志（nvk_buf_dirtylog）开着才有
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；按脏页日志核对 %.0f 次（读事件 %.0f 条）、日志不可用退回逐页 %.2f 次", (double)pf[RP_PERF_TEX_LOG_N] / f, (double)pf[RP_PERF_TEX_LOG_EV] / f, (double)pf[RP_PERF_TEX_LOG_FALLBACK] / f);
+                if (pf[RP_PERF_TEX_UNARMED])   // 上传时加保护没落地（下一次必重传）
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；上传时加保护没落地 %llu 次（窗口合计，下一次重传）", (unsigned long long)pf[RP_PERF_TEX_UNARMED]);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 if (pf[RP_PERF_TEX_SHADOW_N]) {   // 诊断 nvk_tex_log_shadow 开着才有（另起一行，不加长上一行）
                     snprintf(b, sizeof b, "分时（贴图影子核对，每帧）：核对 %.0f 次；日志判净而逐页判脏 %.2f 次、日志判脏而逐页判净 %.2f 次（窗口合计 %llu / %llu）",
