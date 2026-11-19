@@ -114,6 +114,7 @@ SIG(nvn_gpu_buf_access_span, int (*)(nvn_gpu_buf, uint64_t, uint64_t, nvn_gpu_ac
 SIG(nvn_gpu_view_access_span, int (*)(nvn_gpu_view, nvn_gpu_access_span *));
 SIG(nvn_gpu_compute_to_graphics, void (*)(nvn_gpu_cmd, uint32_t));
 SIG(nvn_gpu_transfer_to_graphics, void (*)(nvn_gpu_cmd, uint32_t));
+SIG(nvn_gpu_graphics_to_graphics, void (*)(nvn_gpu_cmd, uint32_t, uint32_t));
 SIG(nvn_gpu_timestamp, void (*)(nvn_gpu_cmd, uint32_t, uint32_t));
 SIG(nvn_gpu_occlusion, void (*)(nvn_gpu_cmd, int32_t));
 SIG(nvn_gpu_label, void (*)(nvn_gpu_cmd, const char *));
