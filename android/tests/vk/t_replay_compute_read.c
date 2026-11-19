@@ -107,7 +107,7 @@ static void pass(nvn_gpu_cmd c,int clear){
 int rp_pass_begin(nvn_gpu_cmd c){if(!pass_open)pass(c,0);return 1;}
 void rp_pass_flush(nvn_gpu_cmd c){if(pass_open){nvn_gpu_pass_end(c);pass_open=0;}}
 // Vulkan 调用观察器：动态入口与直接符号均转发真函数，不能把未支持入口伪造成可用。
-static int explicit_settings=1,trace_window,normalize_dependencies,cross_segment,track_all_draws;
+static int explicit_settings=1,trace_window,normalize_dependencies,cross_segment,track_all_draws,test_no_external;
 static unsigned nbar,ndispatch,ndraw,ncompute_bar,omitted_fs,nfull_bar,omitted_full;
 static VkPipelineStageFlags compute_dst_stages[32];
 static VkAccessFlags compute_dst_access[32];
@@ -154,6 +154,15 @@ VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,c
    deps[used++]=dep;
   }copy.dependencyCount=used;copy.pDependencies=used?deps:NULL;ci=&copy;
  }
+ if(test_no_external){
+  if(!deps&&ci->dependencyCount){deps=calloc(ci->dependencyCount,sizeof *deps);REQUIRE(deps);memcpy(deps,ci->pDependencies,ci->dependencyCount*sizeof *deps);}
+  uint32_t kept=0;for(uint32_t i=0;i<ci->dependencyCount;i++){
+   if((test_no_external&1)&&deps[i].srcSubpass==VK_SUBPASS_EXTERNAL)continue;
+   if((test_no_external&2)&&deps[i].dstSubpass==VK_SUBPASS_EXTERNAL)continue;
+   deps[kept++]=deps[i];
+  }
+  copy=*ci;copy.dependencyCount=kept;copy.pDependencies=kept?deps:NULL;ci=&copy;
+ }
  VkResult result=__real_vkCreateRenderPass(d,ci,a,p);if(result==VK_SUCCESS)for(uint32_t i=0;i<ci->dependencyCount;i++){
   const VkSubpassDependency *b=&ci->pDependencies[i];
   printf("TRACE pass=%p dep=%u subpass=%u->%u stage=%#x->%#x access=%#x->%#x\n",(void*)*p,i,b->srcSubpass,b->dstSubpass,b->srcStageMask,b->dstStageMask,b->srcAccessMask,b->dstAccessMask);
@@ -167,6 +176,8 @@ void __wrap_vkUpdateDescriptorSets(VkDevice d,uint32_t n,const VkWriteDescriptor
 }
 extern __typeof__(vkGetDeviceProcAddr) __real_vkGetDeviceProcAddr;
 static PFN_vkCmdPipelineBarrier real_barrier;
+static PFN_vkCmdCopyBuffer real_copy_buffer;
+static int test_transfer_consumers, omit_transfer_graphics, transfer_seen, transfer_barriers_mutated;
 static PFN_vkCmdDispatch real_dispatch;
 static PFN_vkCmdDrawIndirect real_draw;
 static PFN_vkCmdDrawIndexedIndirect real_indexed_draw;
@@ -174,6 +185,16 @@ static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
+ VkPipelineStageFlags original_t=t;
+ VkMemoryBarrier altered;
+ if(test_transfer_consumers && omit_transfer_graphics && transfer_seen && !ndispatch && nm==1 && !nb && !ni &&
+    (t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT || (omit_transfer_graphics==2 && t==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))){
+  t=omit_transfer_graphics==2?VK_PIPELINE_STAGE_TRANSFER_BIT:VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;transfer_barriers_mutated++;
+ }
+ if(test_transfer_consumers && omit_transfer_graphics && transfer_seen && ndispatch && nm==1 && !nb && !ni &&
+    s==VK_PIPELINE_STAGE_TRANSFER_BIT && t==VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT){
+  s=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;altered=m[0];altered.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;m=&altered;transfer_barriers_mutated++;
+ }
  nbar++;
  int is_full=s==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT && m[0].dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
  if(is_full)nfull_bar++;
@@ -184,12 +205,17 @@ static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,V
  if(s==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT&&nm==1&&m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT){
   REQUIRE(ncompute_bar<32);compute_dst_stages[ncompute_bar]=t;compute_dst_access[ncompute_bar]=m[0].dstAccessMask;ncompute_bar++;
  }
+ if(test_transfer_consumers && transfer_seen)printf("TRANSFER_TRACE barrier cb=%p src=%#x dst_original=%#x dst_actual=%#x memory=%u buffer=%u image=%u\n",(void*)cb,s,original_t,t,nm,nb,ni);
  if(trace_window){printf("TRACE barrier cb=%p stage=%#x->%#x memory=%u buffer=%u image=%u\n",(void*)cb,s,t,nm,nb,ni);for(uint32_t i=0;i<nm;i++)printf("TRACE memory access=%#x->%#x\n",m[i].srcAccessMask,m[i].dstAccessMask);}
  if(getenv("S2A_CGR_OMIT_FS") && s==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT && t==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && m[0].dstAccessMask==VK_ACCESS_SHADER_READ_BIT){
   VkMemoryBarrier changed=m[0];changed.dstAccessMask=0;omitted_fs++;
   real_barrier(cb,s,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;
  }
  real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);
+}
+static void VKAPI_CALL count_copy_buffer(VkCommandBuffer cb,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){
+ if(test_transfer_consumers && !ndispatch){transfer_seen++;for(uint32_t i=0;i<n;i++)printf("TRANSFER_TRACE copy cb=%p dst=%p off=%llu size=%llu\n",(void*)cb,(void*)d,(unsigned long long)r[i].dstOffset,(unsigned long long)r[i].size);}
+ real_copy_buffer(cb,s,d,n,r);
 }
 static void VKAPI_CALL count_dispatch(VkCommandBuffer cb,uint32_t x,uint32_t y,uint32_t z){
  REQUIRE(ndispatch<4);dispatch_bar[ndispatch]=nbar;dispatch_compute_bar[ndispatch]=ncompute_bar;dispatch_full_bar[ndispatch]=nfull_bar;
@@ -216,6 +242,7 @@ static void VKAPI_CALL count_begin(VkCommandBuffer cb,const VkRenderPassBeginInf
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);if(!f||!name)return f;
  if(!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
+ if(!strcmp(name,"vkCmdCopyBuffer")){real_copy_buffer=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)count_copy_buffer;}
  if(!strcmp(name,"vkCmdDispatch")){real_dispatch=(PFN_vkCmdDispatch)f;return (PFN_vkVoidFunction)count_dispatch;}
  if(!strcmp(name,"vkCmdDrawIndirect")){real_draw=(PFN_vkCmdDrawIndirect)f;return (PFN_vkVoidFunction)count_draw;}
  if(!strcmp(name,"vkCmdDrawIndexedIndirect")){real_indexed_draw=(PFN_vkCmdDrawIndexedIndirect)f;return (PFN_vkVoidFunction)count_indexed_draw;}
