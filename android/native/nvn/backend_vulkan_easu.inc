@@ -187,7 +187,7 @@ static int easu_pipelines_locked(VkFormat fmt) {
     ci.stageCount = 2; ci.pStages = stages; ci.pVertexInputState = &vi; ci.pInputAssemblyState = &ia; ci.pViewportState = &vp;
     ci.pRasterizationState = &rs; ci.pMultisampleState = &ms; ci.pColorBlendState = &cb; ci.pDynamicState = &dyn;
     ci.layout = g_easu.layout; ci.renderPass = g_easu.pass;
-    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &ci, NULL, &g_easu.pipe) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+    if (diag_graphics_create(&ci, &g_easu.pipe, 5) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
     plc_created();
     g_easu.fmt = fmt;
     return 1;

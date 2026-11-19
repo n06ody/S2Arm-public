@@ -302,8 +302,11 @@ static void s2a_fl_platform_emit(void *ctx, const char *line) {
 #endif
 }
 
-void nvn_vk_frame_log_dump(void) {
-    if (!s2a_fl_enabled() || !g_fl.seq) return;
+static pthread_mutex_t g_dump_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_retained_snapshot;
+
+
+static void fl_emit_dump(const struct s2a_frame_log *fl) {
     FILE *file = NULL;
 #if defined(__ANDROID__)
     // PID 文件名由 READY 进程身份定位；每个进程第一次转储截断旧文件，后续段追加。
@@ -317,15 +320,103 @@ void nvn_vk_frame_log_dump(void) {
     if (!file) __android_log_print(ANDROID_LOG_WARN, "S2Arm", "direct frame-log file open failed errno=%d", errno);
     else started = 1;
 #endif
-    s2a_fl_dump(&g_fl, s2a_fl_platform_emit, file);
+    s2a_fl_dump(fl, s2a_fl_platform_emit, file);
     if (file && fclose(file) != 0) {
 #if defined(__ANDROID__)
         __android_log_print(ANDROID_LOG_WARN, "S2Arm", "direct frame-log file write failed errno=%d", errno);
 #endif
     }
-    // 进程内可能再起新会话（直连↔兜底退回）：转储过的数据清掉，下一份转储只属于下一段会话。
+}
+
+// A retained frontend can still present. The copy is immutable; encoding and IO
+// happen on a worker, and Stop only waits a bounded time. Incomplete output is
+// rejected by the frame-log reader and does not prove coverage through exit.
+static void *fl_retained_writer(void *arg) {
+    struct s2a_frame_log *copy = arg;
+    pthread_mutex_lock(&g_dump_mu);
+    fl_emit_dump(copy);
+    free(copy);
+    pthread_mutex_unlock(&g_dump_mu);
+    atomic_store_explicit(&g_retained_snapshot, 2, memory_order_release);
+    return NULL;
+}
+
+void nvn_vk_frame_log_snapshot_retained(uint64_t deadline_ns) {
+    if (!s2a_fl_enabled() || !deadline_ns) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_retained_snapshot, &expected, 1)) return;
+    struct s2a_frame_log *copy = calloc(1, sizeof *copy);
+    if (!copy) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm", "direct frame-log retained snapshot allocation failed");
+#endif
+        atomic_store(&g_retained_snapshot, 0); return;
+    }
+    // A producer may still be live. Give a brief bounded chance to finish its
+    // record, but do not wait indefinitely for a stalled unretired frontend.
+    struct timespec lock_start, lock_now;
+    int acquired = 0;
+    if (!clock_gettime(CLOCK_MONOTONIC, &lock_start)) {
+        do {
+            uint64_t current = (uint64_t)lock_start.tv_sec * 1000000000ull + (uint64_t)lock_start.tv_nsec;
+            if (current >= deadline_ns) break;
+            if (!atomic_exchange_explicit(&g_fl.snapshot_lock, 1, memory_order_acquire)) { acquired = 1; break; }
+            const struct timespec pause = {0, 100000L}; nanosleep(&pause, NULL);
+            if (clock_gettime(CLOCK_MONOTONIC, &lock_now)) break;
+            if ((uint64_t)lock_now.tv_sec * 1000000000ull + (uint64_t)lock_now.tv_nsec >= deadline_ns) break;
+        } while ((int64_t)(lock_now.tv_sec - lock_start.tv_sec) * 1000000000LL + lock_now.tv_nsec - lock_start.tv_nsec < 2000000LL);
+    }
+    if (!acquired) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm", "direct frame-log retained snapshot busy; capture unproven");
+#endif
+        free(copy); atomic_store(&g_retained_snapshot, 0); return;
+    }
+    copy->seq = g_fl.seq; copy->dropped = g_fl.dropped; copy->w = g_fl.w; copy->kept = g_fl.kept;
+    memcpy(copy->rec, g_fl.rec, sizeof copy->rec);
+    atomic_store_explicit(&g_fl.snapshot_lock, 0, memory_order_release);
+    if (!copy->seq) { free(copy); atomic_store(&g_retained_snapshot, 0); return; }
+    pthread_attr_t attr; pthread_t worker;
+    int rc = pthread_attr_init(&attr);
+    if (!rc) {
+        rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (!rc) rc = pthread_create(&worker, &attr, fl_retained_writer, copy);
+        pthread_attr_destroy(&attr);
+    }
+    if (rc) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm", "direct frame-log retained snapshot worker failed: %d", rc);
+#endif
+        free(copy); atomic_store(&g_retained_snapshot, 0); return;
+    }
+    struct timespec started, now;
+    if (clock_gettime(CLOCK_MONOTONIC, &started)) return;
+    const struct timespec pause = {0, 1000000L};
+    while (atomic_load_explicit(&g_retained_snapshot, memory_order_acquire) == 1) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) break;
+        int64_t elapsed = (int64_t)(now.tv_sec - started.tv_sec) * 1000000000LL + now.tv_nsec - started.tv_nsec;
+        if (elapsed >= 100000000LL || (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec >= deadline_ns) break;
+        nanosleep(&pause, NULL);
+    }
+    int completed = atomic_load_explicit(&g_retained_snapshot, memory_order_acquire) == 2;
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "S2Arm", "direct frame-log retained snapshot worker %s; verify complete output and coverage", completed ? "finished" : "pending");
+#else
+    (void)completed;
+#endif
+}
+
+void nvn_vk_frame_log_dump(void) {
+    if (!s2a_fl_enabled()) return;
+    // A retained writer may be stuck in IO; never wait for it here.
+    if (atomic_load_explicit(&g_retained_snapshot, memory_order_acquire) == 1) return;
+    pthread_mutex_lock(&g_dump_mu);
+    if (g_fl.seq) fl_emit_dump(&g_fl);
+    // This path runs only after the producer has stopped.
     s2a_fl_reset(&g_fl);
     fl_gpu_frame_reset();
+    atomic_store(&g_retained_snapshot, 0);
+    pthread_mutex_unlock(&g_dump_mu);
 }
 
 // 托管层入口：direct 与 generic 共用同一单例；generic 的 present 线程与 direct 不同，

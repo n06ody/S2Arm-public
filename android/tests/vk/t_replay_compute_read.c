@@ -27,6 +27,7 @@ static int disable_compute_access;
 static int dq_mode;
 int nvn_plat_flag(const char *n,int d){
  if(!strcmp(n,"nvk_cgr"))return !disable_compute_access;
+ if(!strcmp(n,"nvk_cgr_narrow")){const char *e=getenv("S2A_CGR_NARROW");return e?atoi(e):d;}
  if(!strcmp(n,"nvk_dq")){const char *e=getenv("S2A_COMPUTE_READ_DQ");REQUIRE(!e||!strcmp(e,"0")||!strcmp(e,"1"));dq_mode=e?atoi(e):d;return dq_mode;}
  return d;
 }
@@ -106,19 +107,21 @@ static void pass(nvn_gpu_cmd c,int clear){
 int rp_pass_begin(nvn_gpu_cmd c){if(!pass_open)pass(c,0);return 1;}
 void rp_pass_flush(nvn_gpu_cmd c){if(pass_open){nvn_gpu_pass_end(c);pass_open=0;}}
 // Vulkan 调用观察器：动态入口与直接符号均转发真函数，不能把未支持入口伪造成可用。
-static int explicit_settings=1,trace_window,normalize_dependencies,cross_segment;
-static unsigned nbar,ndispatch,ndraw,ncompute_bar;
+static int explicit_settings=1,trace_window,normalize_dependencies,cross_segment,track_all_draws,test_no_external;
+static unsigned nbar,ndispatch,ndraw,ncompute_bar,omitted_fs,nfull_bar,omitted_full;
+static VkPipelineStageFlags compute_dst_stages[32];
+static VkAccessFlags compute_dst_access[32];
 // Only the real vkCmd observer writes these. With DQ enabled it runs on the
 // recorder thread; inspect snapshots after the normal final commit/fence, never
 // insert a drain or GPU wait between the producer and its consumers.
-static unsigned dispatch_bar[4],dispatch_compute_bar[4],draw_bar[4],draw_compute_bar[4];
-static void note_draw(void){REQUIRE(ndraw<4);draw_bar[ndraw]=nbar;draw_compute_bar[ndraw]=ncompute_bar;ndraw++;}
+static unsigned dispatch_bar[4],dispatch_compute_bar[4],draw_bar[4],draw_compute_bar[4],dispatch_full_bar[4],draw_full_bar[4];
+static void note_draw(void){REQUIRE(ndraw<4);draw_bar[ndraw]=nbar;draw_compute_bar[ndraw]=ncompute_bar;draw_full_bar[ndraw]=nfull_bar;ndraw++;}
 static _Atomic unsigned submits,waits,idles;
 static _Thread_local int encoding_thread;
 static unsigned encoding_waits,start_encoding_waits;
 static unsigned start_submits,start_waits,start_idles;
 static VkCommandBuffer producer_cb;
-VkResult __real_vkCreateInstance(const VkInstanceCreateInfo*,const VkAllocationCallbacks*,VkInstance*);
+extern __typeof__(vkCreateInstance) __real_vkCreateInstance;
 VkResult __wrap_vkCreateInstance(const VkInstanceCreateInfo *ci,const VkAllocationCallbacks *alloc,VkInstance *out){
  if(!explicit_settings)return __real_vkCreateInstance(ci,alloc,out);
  VkBool32 yes=VK_TRUE;VkLayerSettingEXT values[]={
@@ -128,38 +131,53 @@ VkResult __wrap_vkCreateInstance(const VkInstanceCreateInfo *ci,const VkAllocati
  VkLayerSettingsCreateInfoEXT settings={.sType=VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT,.pNext=ci->pNext,.settingCount=2,.pSettings=values};
  VkInstanceCreateInfo copy=*ci;copy.pNext=&settings;return __real_vkCreateInstance(&copy,alloc,out);
 }
-VkResult __real_vkQueueSubmit(VkQueue,uint32_t,const VkSubmitInfo*,VkFence);
+extern __typeof__(vkQueueSubmit) __real_vkQueueSubmit;
 VkResult __wrap_vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){atomic_fetch_add(&submits,1);return __real_vkQueueSubmit(q,n,s,f);}
-VkResult __real_vkWaitForFences(VkDevice,uint32_t,const VkFence*,VkBool32,uint64_t);
+extern __typeof__(vkWaitForFences) __real_vkWaitForFences;
 VkResult __wrap_vkWaitForFences(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t timeout){atomic_fetch_add(&waits,1);if(encoding_thread)encoding_waits++;printf("TRACE wait role=%s timeout_ns=%llu\n",encoding_thread?"encoding":"completion",(unsigned long long)timeout);return __real_vkWaitForFences(d,n,f,all,timeout);}
-VkResult __real_vkQueueWaitIdle(VkQueue);
+extern __typeof__(vkQueueWaitIdle) __real_vkQueueWaitIdle;
 VkResult __wrap_vkQueueWaitIdle(VkQueue q){atomic_fetch_add(&idles,1);return __real_vkQueueWaitIdle(q);}
-VkResult __real_vkDeviceWaitIdle(VkDevice);
+extern __typeof__(vkDeviceWaitIdle) __real_vkDeviceWaitIdle;
 VkResult __wrap_vkDeviceWaitIdle(VkDevice d){atomic_fetch_add(&idles,1);return __real_vkDeviceWaitIdle(d);}
-VkResult __real_vkCreateRenderPass(VkDevice,const VkRenderPassCreateInfo*,const VkAllocationCallbacks*,VkRenderPass*);
+extern __typeof__(vkCreateRenderPass) __real_vkCreateRenderPass;
 VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,const VkAllocationCallbacks *a,VkRenderPass *p){
  // 仅测试：按 v1.4.341 §8.2 的等价定义展开 ALL_COMMANDS；不是删除依赖，也不是生产改动。
  VkRenderPassCreateInfo copy=*ci;VkSubpassDependency *deps=NULL;
  if(normalize_dependencies&&ci->dependencyCount){
   deps=calloc(ci->dependencyCount,sizeof *deps);REQUIRE(deps);memcpy(deps,ci->pDependencies,ci->dependencyCount*sizeof *deps);
+  uint32_t used=0;
   for(uint32_t i=0;i<ci->dependencyCount;i++){
-   if(deps[i].srcStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)deps[i].srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-   if(deps[i].dstStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)deps[i].dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-  }copy.pDependencies=deps;ci=&copy;
+   VkSubpassDependency dep=deps[i];
+   if(getenv("S2A_CGR_REMOVE_INCOMING") && dep.srcSubpass==VK_SUBPASS_EXTERNAL)continue;
+   if(dep.srcStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+   if(dep.dstStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)dep.dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+   deps[used++]=dep;
+  }copy.dependencyCount=used;copy.pDependencies=used?deps:NULL;ci=&copy;
+ }
+ if(test_no_external){
+  if(!deps&&ci->dependencyCount){deps=calloc(ci->dependencyCount,sizeof *deps);REQUIRE(deps);memcpy(deps,ci->pDependencies,ci->dependencyCount*sizeof *deps);}
+  uint32_t kept=0;for(uint32_t i=0;i<ci->dependencyCount;i++){
+   if((test_no_external&1)&&deps[i].srcSubpass==VK_SUBPASS_EXTERNAL)continue;
+   if((test_no_external&2)&&deps[i].dstSubpass==VK_SUBPASS_EXTERNAL)continue;
+   deps[kept++]=deps[i];
+  }
+  copy=*ci;copy.dependencyCount=kept;copy.pDependencies=kept?deps:NULL;ci=&copy;
  }
  VkResult result=__real_vkCreateRenderPass(d,ci,a,p);if(result==VK_SUCCESS)for(uint32_t i=0;i<ci->dependencyCount;i++){
   const VkSubpassDependency *b=&ci->pDependencies[i];
   printf("TRACE pass=%p dep=%u subpass=%u->%u stage=%#x->%#x access=%#x->%#x\n",(void*)*p,i,b->srcSubpass,b->dstSubpass,b->srcStageMask,b->dstStageMask,b->srcAccessMask,b->dstAccessMask);
  }free(deps);return result;
 }
-void __real_vkUpdateDescriptorSets(VkDevice,uint32_t,const VkWriteDescriptorSet*,uint32_t,const VkCopyDescriptorSet*);
+extern __typeof__(vkUpdateDescriptorSets) __real_vkUpdateDescriptorSets;
 void __wrap_vkUpdateDescriptorSets(VkDevice d,uint32_t n,const VkWriteDescriptorSet *w,uint32_t nc,const VkCopyDescriptorSet *copies){
  for(uint32_t i=0;i<n;i++)if(w[i].descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER&&w[i].pBufferInfo){
   const VkDescriptorBufferInfo *b=w[i].pBufferInfo;printf("TRACE ssbo set=%p binding=%u buffer=%p offset=%llu range=%llu\n",(void*)w[i].dstSet,w[i].dstBinding,(void*)b->buffer,(unsigned long long)b->offset,(unsigned long long)b->range);
  }__real_vkUpdateDescriptorSets(d,n,w,nc,copies);
 }
-PFN_vkVoidFunction __real_vkGetDeviceProcAddr(VkDevice,const char*);
+extern __typeof__(vkGetDeviceProcAddr) __real_vkGetDeviceProcAddr;
 static PFN_vkCmdPipelineBarrier real_barrier;
+static PFN_vkCmdCopyBuffer real_copy_buffer;
+static int test_transfer_consumers, omit_transfer_graphics, transfer_seen, transfer_barriers_mutated;
 static PFN_vkCmdDispatch real_dispatch;
 static PFN_vkCmdDrawIndirect real_draw;
 static PFN_vkCmdDrawIndexedIndirect real_indexed_draw;
@@ -167,13 +185,40 @@ static PFN_vkCmdDraw real_direct_draw;
 static PFN_vkCmdDrawIndexed real_direct_indexed_draw;
 static PFN_vkCmdBeginRenderPass real_begin;
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
+ VkPipelineStageFlags original_t=t;
+ VkMemoryBarrier altered;
+ if(test_transfer_consumers && omit_transfer_graphics && transfer_seen && !ndispatch && nm==1 && !nb && !ni &&
+    (t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT || (omit_transfer_graphics==2 && t==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))){
+  t=omit_transfer_graphics==2?VK_PIPELINE_STAGE_TRANSFER_BIT:VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;transfer_barriers_mutated++;
+ }
+ if(test_transfer_consumers && omit_transfer_graphics && transfer_seen && ndispatch && nm==1 && !nb && !ni &&
+    s==VK_PIPELINE_STAGE_TRANSFER_BIT && t==VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT){
+  s=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;altered=m[0];altered.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;m=&altered;transfer_barriers_mutated++;
+ }
  nbar++;
- if(s==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT&&nm==1&&m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT&&(t&VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT)&&(m[0].dstAccessMask&VK_ACCESS_INDIRECT_COMMAND_READ_BIT))ncompute_bar++;
+ int is_full=s==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT && m[0].dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
+ if(is_full)nfull_bar++;
+ if(getenv("S2A_CGR_OMIT_FULL") && trace_window && is_full){
+  VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;omitted_full++;
+  real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;
+ }
+ if(s==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT&&nm==1&&m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT){
+  REQUIRE(ncompute_bar<32);compute_dst_stages[ncompute_bar]=t;compute_dst_access[ncompute_bar]=m[0].dstAccessMask;ncompute_bar++;
+ }
+ if(test_transfer_consumers && transfer_seen)printf("TRANSFER_TRACE barrier cb=%p src=%#x dst_original=%#x dst_actual=%#x memory=%u buffer=%u image=%u\n",(void*)cb,s,original_t,t,nm,nb,ni);
  if(trace_window){printf("TRACE barrier cb=%p stage=%#x->%#x memory=%u buffer=%u image=%u\n",(void*)cb,s,t,nm,nb,ni);for(uint32_t i=0;i<nm;i++)printf("TRACE memory access=%#x->%#x\n",m[i].srcAccessMask,m[i].dstAccessMask);}
+ if(getenv("S2A_CGR_OMIT_FS") && s==VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT && t==VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_SHADER_WRITE_BIT && m[0].dstAccessMask==VK_ACCESS_SHADER_READ_BIT){
+  VkMemoryBarrier changed=m[0];changed.dstAccessMask=0;omitted_fs++;
+  real_barrier(cb,s,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;
+ }
  real_barrier(cb,s,t,f,nm,m,nb,b,ni,im);
 }
+static void VKAPI_CALL count_copy_buffer(VkCommandBuffer cb,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){
+ if(test_transfer_consumers && !ndispatch){transfer_seen++;for(uint32_t i=0;i<n;i++)printf("TRANSFER_TRACE copy cb=%p dst=%p off=%llu size=%llu\n",(void*)cb,(void*)d,(unsigned long long)r[i].dstOffset,(unsigned long long)r[i].size);}
+ real_copy_buffer(cb,s,d,n,r);
+}
 static void VKAPI_CALL count_dispatch(VkCommandBuffer cb,uint32_t x,uint32_t y,uint32_t z){
- REQUIRE(ndispatch<4);dispatch_bar[ndispatch]=nbar;dispatch_compute_bar[ndispatch]=ncompute_bar;
+ REQUIRE(ndispatch<4);dispatch_bar[ndispatch]=nbar;dispatch_compute_bar[ndispatch]=ncompute_bar;dispatch_full_bar[ndispatch]=nfull_bar;
  ndispatch++;producer_cb=cb;start_submits=atomic_load(&submits);start_waits=atomic_load(&waits);start_encoding_waits=encoding_waits;start_idles=atomic_load(&idles);trace_window=1;
  printf("TRACE dispatch cb=%p groups=%u,%u,%u\n",(void*)cb,x,y,z);real_dispatch(cb,x,y,z);
 }
@@ -191,12 +236,13 @@ static void check_direct_draw(VkCommandBuffer cb,uint32_t count,uint32_t instanc
  note_draw();printf("TRACE direct_draw indexed=%d cb=%p count=%u instances=%u same_cb=%d\n",indexed,(void*)cb,count,instances,producer_cb==cb);
  REQUIRE(ndispatch&&cb==producer_cb);REQUIRE(atomic_load(&submits)==start_submits);REQUIRE(encoding_waits==start_encoding_waits);REQUIRE(atomic_load(&idles)==start_idles);trace_window=0;
 }
-static void VKAPI_CALL count_direct_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,uint32_t base){if(trace_window)check_direct_draw(cb,count,instances,0);real_direct_draw(cb,count,instances,first,base);}
-static void VKAPI_CALL count_direct_indexed_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,int32_t voff,uint32_t base){if(trace_window)check_direct_draw(cb,count,instances,1);real_direct_indexed_draw(cb,count,instances,first,voff,base);}
+static void VKAPI_CALL count_direct_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,uint32_t base){if(trace_window||track_all_draws)check_direct_draw(cb,count,instances,0);real_direct_draw(cb,count,instances,first,base);}
+static void VKAPI_CALL count_direct_indexed_draw(VkCommandBuffer cb,uint32_t count,uint32_t instances,uint32_t first,int32_t voff,uint32_t base){if(trace_window||track_all_draws)check_direct_draw(cb,count,instances,1);real_direct_indexed_draw(cb,count,instances,first,voff,base);}
 static void VKAPI_CALL count_begin(VkCommandBuffer cb,const VkRenderPassBeginInfo *b,VkSubpassContents contents){printf("TRACE begin cb=%p pass=%p\n",(void*)cb,(void*)b->renderPass);real_begin(cb,b,contents);}
 PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  PFN_vkVoidFunction f=__real_vkGetDeviceProcAddr(dev,name);if(!f||!name)return f;
  if(!strcmp(name,"vkCmdPipelineBarrier")){real_barrier=(PFN_vkCmdPipelineBarrier)f;return (PFN_vkVoidFunction)count_barrier;}
+ if(!strcmp(name,"vkCmdCopyBuffer")){real_copy_buffer=(PFN_vkCmdCopyBuffer)f;return (PFN_vkVoidFunction)count_copy_buffer;}
  if(!strcmp(name,"vkCmdDispatch")){real_dispatch=(PFN_vkCmdDispatch)f;return (PFN_vkVoidFunction)count_dispatch;}
  if(!strcmp(name,"vkCmdDrawIndirect")){real_draw=(PFN_vkCmdDrawIndirect)f;return (PFN_vkVoidFunction)count_draw;}
  if(!strcmp(name,"vkCmdDrawIndexedIndirect")){real_indexed_draw=(PFN_vkCmdDrawIndexedIndirect)f;return (PFN_vkVoidFunction)count_indexed_draw;}
@@ -205,6 +251,13 @@ PFN_vkVoidFunction __wrap_vkGetDeviceProcAddr(VkDevice dev,const char *name){
  if(!strcmp(name,"vkCmdBeginRenderPass")){real_begin=(PFN_vkCmdBeginRenderPass)f;return (PFN_vkVoidFunction)count_begin;}
  return f;
 }
+// 观察器签名由 NDK Vulkan 头验证，动态入口不能靠夹具自造声明。
+#define CGR_TYPECHECK(fn) _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_##fn), PFN_##fn), #fn " signature")
+CGR_TYPECHECK(vkCreateInstance); CGR_TYPECHECK(vkQueueSubmit); CGR_TYPECHECK(vkWaitForFences);
+CGR_TYPECHECK(vkQueueWaitIdle); CGR_TYPECHECK(vkDeviceWaitIdle); CGR_TYPECHECK(vkCreateRenderPass);
+CGR_TYPECHECK(vkUpdateDescriptorSets); CGR_TYPECHECK(vkGetDeviceProcAddr);
+#undef CGR_TYPECHECK
+_Static_assert(__builtin_types_compatible_p(__typeof__(&count_barrier), PFN_vkCmdPipelineBarrier), "vkCmdPipelineBarrier signature");
 int main(int argc,char **argv){
  encoding_thread=1;
  REQUIRE(argc==3);

@@ -51,7 +51,7 @@ static void color(id<MTLTexture> target,id<MTLBuffer> data) {
     // Metal's legacy replay has no nvn_gpu_cmd wrapper. The compatibility hook
     // must leave its existing encoder barriers in charge, without a submit/wait.
     id cb=g_cb, blit=g_blit; uint64_t fence=g_fence, full=g_bar_full;
-    if(publish_compute) publish_compute(NULL);
+    if(publish_compute) publish_compute(NULL, NVN_GPU_CGR_ALL);
     CHECK(g_cb==cb && g_blit==blit && g_fence==fence && g_bar_full==full,"contract hook does not cut or submit the Metal command stream");
     MTL4RenderPassDescriptor *d=pass_desc();
     d.colorAttachments[0].texture=target;
