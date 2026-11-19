@@ -16,6 +16,8 @@
 #include <string.h>
 #include <stdalign.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
 static nvn_gpu_err err;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"assertion failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
@@ -58,9 +60,11 @@ int rp_depth_zero(void){return 0;}int rp_origin_lower_left(void){return 1;}
 static uint64_t serial=1;
 void rp_perf_add(int i,uint64_t n){(void)i;(void)n;}uint64_t rp_seg_serial(void){return serial;}
 uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return serial;}
-int rp_fence_done(uint64_t f){return f<=nvn_gpu_fence_done();}
-static nvn_gpu_cmd active;
+// Test-only conservative delayed observation of the prior fence; zero is still complete.
+int rp_fence_done(uint64_t f){if(getenv("S2A_INBOUND_PRE_ONLY") && f==1)return 0;return f<=nvn_gpu_fence_done();}
+static nvn_gpu_cmd active, inbound_pre;
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){
+ if(getenv("S2A_INBOUND_PRE_ONLY") && *last!=serial){*last=serial;if(!inbound_pre)GPU(nvn_gpu_cmd_begin(NULL,&inbound_pre,&err));return inbound_pre;}
  if(getenv("S2A_INBOUND_MAIN_ONLY"))REQUIRE(*last==serial); // 仅测试真实的「同提交再同步 → 主段」分支
  rp_pass_flush(active);*last=serial;return active;
 }
@@ -135,8 +139,34 @@ VkResult __wrap_vkCreateInstance(const VkInstanceCreateInfo *ci,const VkAllocati
  VkLayerSettingsCreateInfoEXT settings={.sType=VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT,.pNext=ci->pNext,.settingCount=2,.pSettings=values};
  VkInstanceCreateInfo copy=*ci;copy.pNext=&settings;return __real_vkCreateInstance(&copy,alloc,out);
 }
+static VkSemaphore inbound_gate;
+static pthread_mutex_t inbound_submit_mu=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t inbound_submit_cv=PTHREAD_COND_INITIALIZER;
+static unsigned inbound_submits_done;
+_Static_assert(__builtin_types_compatible_p(__typeof__(&vkSignalSemaphoreKHR), PFN_vkSignalSemaphoreKHR), "vkSignalSemaphoreKHR signature");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&vkGetSemaphoreCounterValueKHR), PFN_vkGetSemaphoreCounterValueKHR), "vkGetSemaphoreCounterValueKHR signature");
+extern __typeof__(vkCreateDevice) __real_vkCreateDevice;
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateDevice(VkPhysicalDevice physical,const VkDeviceCreateInfo *info,const VkAllocationCallbacks *alloc,VkDevice *device){
+ if(!getenv("S2A_INBOUND_PRE_ONLY"))return __real_vkCreateDevice(physical,info,alloc,device);
+ uint32_t n=info->enabledExtensionCount;const char **names=calloc((size_t)n+1,sizeof *names);REQUIRE(names);
+ int found=0;for(uint32_t i=0;i<n;i++){names[i]=info->ppEnabledExtensionNames[i];if(!strcmp(names[i],VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))found=1;}
+ if(!found){names[n++]=VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;}
+ VkDeviceCreateInfo copy=*info;copy.enabledExtensionCount=n;copy.ppEnabledExtensionNames=names;
+ VkResult r=__real_vkCreateDevice(physical,&copy,alloc,device);free(names);return r;
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkCreateDevice), PFN_vkCreateDevice), "vkCreateDevice signature");
 extern __typeof__(vkQueueSubmit) __real_vkQueueSubmit;
-VkResult __wrap_vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){atomic_fetch_add(&submits,1);return __real_vkQueueSubmit(q,n,s,f);}
+VkResult __wrap_vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){
+ unsigned ordinal=atomic_fetch_add(&submits,1)+1;VkSubmitInfo copy;VkTimelineSemaphoreSubmitInfoKHR timeline={.sType=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+ const uint64_t value=1;VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TRANSFER_BIT;
+ if(getenv("S2A_INBOUND_PRE_ONLY") && ordinal==2){
+  REQUIRE(n==1 && !s->pNext && !s->waitSemaphoreCount && !s->signalSemaphoreCount && inbound_gate);
+  copy=*s;timeline.waitSemaphoreValueCount=1;timeline.pWaitSemaphoreValues=&value;copy.pNext=&timeline;copy.waitSemaphoreCount=1;copy.pWaitSemaphores=&inbound_gate;copy.pWaitDstStageMask=&stage;s=&copy;
+ }
+ VkResult r=__real_vkQueueSubmit(q,n,s,f);
+ if(getenv("S2A_INBOUND_PRE_ONLY")){pthread_mutex_lock(&inbound_submit_mu);inbound_submits_done++;pthread_cond_broadcast(&inbound_submit_cv);pthread_mutex_unlock(&inbound_submit_mu);}
+ return r;
+}
 extern __typeof__(vkWaitForFences) __real_vkWaitForFences;
 VkResult __wrap_vkWaitForFences(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t timeout){atomic_fetch_add(&waits,1);if(encoding_thread)encoding_waits++;printf("TRACE wait role=%s timeout_ns=%llu\n",encoding_thread?"encoding":"completion",(unsigned long long)timeout);return __real_vkWaitForFences(d,n,f,all,timeout);}
 extern __typeof__(vkQueueWaitIdle) __real_vkQueueWaitIdle;
@@ -180,11 +210,12 @@ static PFN_vkCmdBeginRenderPass real_begin;
 static PFN_vkCmdUpdateBuffer real_update;
 static PFN_vkCmdCopyBuffer real_copy;
 static unsigned inbound_transfers, inbound_injected, mirror_barriers, mirror_omitted;
+static VkCommandBuffer mirror_transfer_cb, mirror_barrier_cb;
 static VkPipelineStageFlags mirror_dst_stages, mirror_stages[8];
 static VkAccessFlags mirror_dst_access;
 static void inbound_post_transfer(VkCommandBuffer cb){
  if(!getenv("S2A_INBOUND_MAIN_ONLY"))return;
- inbound_transfers++;
+ inbound_transfers++;mirror_transfer_cb=cb;
  const char *mode=getenv("S2A_INBOUND_INJECT");int m=mode?atoi(mode):0;
  if(!m || m>=5)return;  // 5：生产路径自己发布，不插夹具屏障
  const char *stage=getenv("S2A_INBOUND_STAGE");
@@ -196,19 +227,25 @@ static void inbound_post_transfer(VkCommandBuffer cb){
  inbound_injected++;
 }
 static void VKAPI_CALL inbound_update(VkCommandBuffer cb,VkBuffer b,VkDeviceSize off,VkDeviceSize n,const void *data){real_update(cb,b,off,n,data);inbound_post_transfer(cb);}
-static void VKAPI_CALL inbound_copy(VkCommandBuffer cb,VkBuffer a,VkBuffer b,uint32_t n,const VkBufferCopy *regions){real_copy(cb,a,b,n,regions);inbound_post_transfer(cb);}
+static void VKAPI_CALL inbound_copy(VkCommandBuffer cb,VkBuffer a,VkBuffer b,uint32_t n,const VkBufferCopy *regions){
+ real_copy(cb,a,b,n,regions);inbound_post_transfer(cb);
+}
 _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_update), PFN_vkCmdUpdateBuffer), "vkCmdUpdateBuffer signature");
 _Static_assert(__builtin_types_compatible_p(__typeof__(&inbound_copy), PFN_vkCmdCopyBuffer), "vkCmdCopyBuffer signature");
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb,VkPipelineStageFlags s,VkPipelineStageFlags t,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
  nbar++;
- if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){ REQUIRE(mirror_barriers<8); mirror_stages[mirror_barriers++]=t; mirror_dst_stages |= t; mirror_dst_access |= m[0].dstAccessMask; }
+ if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){ REQUIRE(mirror_barriers<8); mirror_barrier_cb=cb; mirror_stages[mirror_barriers++]=t; mirror_dst_stages |= t; mirror_dst_access |= m[0].dstAccessMask; }
  int is_full=s==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && t==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_MEMORY_WRITE_BIT && m[0].dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
  if(getenv("S2A_INBOUND_MAIN_ONLY") && s==VK_PIPELINE_STAGE_TRANSFER_BIT && nm==1 && m[0].srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT){
   const char *mode=getenv("S2A_INBOUND_INJECT"); int imode=mode?atoi(mode):0;
-  if(imode==6 || imode==7 || imode==12){
-   const char *stage=getenv("S2A_INBOUND_STAGE"); VkPipelineStageFlags missing=imode==7?VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:imode==12?((t & VK_PIPELINE_STAGE_VERTEX_SHADER_BIT)?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT):
+  if(imode==16){
+   VkMemoryBarrier changed=m[0];changed.srcAccessMask=0;changed.dstAccessMask=0;mirror_omitted++;
+   real_barrier(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im);return;
+  }
+  if(imode==6 || imode==7 || imode==12 || imode==14 || imode==15){
+   const char *stage=getenv("S2A_INBOUND_STAGE"); VkPipelineStageFlags missing=(imode==7 || imode==15)?VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT:imode==12?((t & VK_PIPELINE_STAGE_VERTEX_SHADER_BIT)?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT):
        (stage&&!strcmp(stage,"VS")?VK_PIPELINE_STAGE_VERTEX_SHADER_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-   VkMemoryBarrier changed=m[0]; changed.dstAccessMask &= ~(imode==7?VK_ACCESS_INDIRECT_COMMAND_READ_BIT:VK_ACCESS_SHADER_READ_BIT);
+   VkMemoryBarrier changed=m[0]; changed.dstAccessMask &= ~((imode==7 || imode==15)?VK_ACCESS_INDIRECT_COMMAND_READ_BIT:VK_ACCESS_SHADER_READ_BIT);
    REQUIRE(t & missing); mirror_omitted++;
    VkPipelineStageFlags remaining=t & ~missing;
    real_barrier(cb,s,remaining?remaining:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,f,1,&changed,nb,b,ni,im); return;
