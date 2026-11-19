@@ -81,7 +81,7 @@ SIG(nvn_gpu_view_release, void (*)(nvn_gpu_view));
 SIG(nvn_gpu_samp_create, nvn_gpu_rc (*)(const samp_par *, nvn_gpu_samp *, nvn_gpu_err *));
 SIG(nvn_gpu_samp_release, void (*)(nvn_gpu_samp));
 SIG(nvn_gpu_tex_upload, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *, const void *, uint64_t, uint64_t));
-SIG(nvn_gpu_tex_upload_blocklinear, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const nvn_texlayout *, const void *, uint64_t));
+SIG(nvn_gpu_tex_upload_blocklinear, nvn_gpu_rc (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const nvn_texlayout *, const void *, uint64_t));
 SIG(nvn_gpu_shader_load, nvn_gpu_rc (*)(const nvn_gpu_shader_src *, nvn_gpu_shader *, nvn_gpu_err *));
 SIG(nvn_gpu_shader_release, void (*)(nvn_gpu_shader));
 SIG(nvn_gpu_pipe_get, nvn_gpu_rc (*)(const nvn_gpu_pipe_desc *, int, nvn_gpu_pipe *, nvn_gpu_err *));
