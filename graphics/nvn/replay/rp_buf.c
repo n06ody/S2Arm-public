@@ -247,6 +247,13 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
 // 逐段各抢一次全局锁时「找池取镜像」在重叠档读到 13.7–16.6 毫秒/帧（5627 次、每次约 2.4 微秒）——
 // 大头是这把锁与完成线程（落地 GPU 写）互抢，所以另给批量入口，一笔绘制只抢一次。
 // 把第 i..j 页（池内页号，含）这一串从游戏内存同步进镜像：先保护、取代号、再读；记下同步代号与所在提交（两条核对路共用）。
+// 「同一提交第二次同步」收通道的前 8 条明细（缓冲）：池大小、这一串在池里的偏移与长度
+static void x2_buf_note(const uint8_t *mem, uint64_t size, uintptr_t a, uintptr_t b) {
+    static int said; if (said >= 8) return; said++;
+    char t[200]; snprintf(t, sizeof t, "同一提交第二次同步并收通道 #%d：缓冲 池 %llu KB、池内偏移 %#llx 长 %llu 字节", said,
+                          (unsigned long long)(size / 1024), (unsigned long long)(a - (uintptr_t)mem), (unsigned long long)(b - a));
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", t);
+}
 static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
         const size_t ps = nvn_dirty_page_size();
         uintptr_t a = s->page0 + (uintptr_t)(i * ps), b = s->page0 + (uintptr_t)((j + 1) * ps);   // 这一串脏页，裁到池的范围
@@ -261,7 +268,9 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        else { const uint64_t l0 = last; const int open0 = rp_pass_is_open(); nvn_gpu_cmd xc = rp_xfer_cmd(&last);
+               if (rp_xfer2_note(xc, l0, last, open0, RP_X2_BUF, b - a)) x2_buf_note(mem, size, a, b);
+               if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }

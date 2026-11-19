@@ -36,6 +36,7 @@ struct fd_stage {
     uint32_t fragment_output_map;   // 片元阶段：每个颜色目标 4 位（RGBA）= 着色器写了哪些输出分量；读不到为全 1
     int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知
     int binst_known;                // 图形阶段：结果带了 c0Reads 数组（读集已知）；0 = 缺字段或 null（未知）
+    char c0_why[24];                // 诊断：c0Reads 为 null 时编译器给的 c0ReadsWhy（分析器哪一条判的）；没给为空串。只打日志，不参与判定
 };
 #define FD_C0_BASE_INSTANCE 0x644u   // 驱动常量段里图形阶段的 base instance 字（nvn_vk_mrt.h、回放 fill_graphics_drv 同位）
 

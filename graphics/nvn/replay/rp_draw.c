@@ -555,8 +555,10 @@ static void ind_copy_note(int st, int known) {
     const uint64_t id = k ^ ((uint64_t)st << 60) ^ ((uint64_t)known << 59);
     for (int i = 0; i < g_ind_copy_nsaid; i++) if (g_ind_copy_said[i] == id) return;
     g_ind_copy_said[g_ind_copy_nsaid++] = id;
-    char b[200]; snprintf(b, sizeof b, "间接绘制为 base instance 拷贝并收通道 #%d：阶段 %d 程序键 %016llx%s，原因 %s", g_ind_copy_nsaid, st, (unsigned long long)k,
-                          (rp_S.skey_ok >> st & 1) ? "" : "（键未知）", known ? "编译器读集含 c0+0x644" : "编译结果没有 c0 读集（未知）");
+    const char *why = g_prog->c0_why[st];
+    char b[320]; snprintf(b, sizeof b, "间接绘制为 base instance 拷贝并收通道 #%d：阶段 %d 程序键 %016llx%s，原因 %s%s%s", g_ind_copy_nsaid, st, (unsigned long long)k,
+                          (rp_S.skey_ok >> st & 1) ? "" : "（键未知）", known ? "编译器读集含 c0+0x644" : "编译结果没有 c0 读集（未知）",
+                          known ? "" : "，分析器 ", known ? "" : why[0] ? why : "没给原因");
     nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b);
 }
 static nvn_gpu_slice g_ind_drv[RP_PROG_STAGES];

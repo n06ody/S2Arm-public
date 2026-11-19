@@ -108,6 +108,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_TEX_SHADOW_N, RP_PERF_TEX_SHADOW_MISS, RP_PERF_TEX_SHADOW_EXTRA,   // 诊断 nvk_tex_log_shadow：影子核对次数 / 日志判净而逐页判脏 / 日志判脏而逐页判净
        RP_PERF_TEX_LOG_N, RP_PERF_TEX_LOG_EV, RP_PERF_TEX_LOG_FALLBACK,   // CPU 贴图内容按脏页日志核对的次数 / 读到的事件数 / 日志不可用、退回整张逐页比的次数
        RP_PERF_TEX_EPOCH_MISS, RP_PERF_TEX_CHECK_PAGES,   // CPU 贴图内容检查：本可按纪元跳过却没跳成的次数（已传过、没待重传、有跟踪句柄，但全局写代号 / 段号 / 映射代际变了）；逐页比对写代号的页数（每次调 nvn_dirty_since 记整个范围的页数，是上限：遇到脏页会提前停）
+       RP_PERF_X2_N0, RP_PERF_X2_N1, RP_PERF_X2_N2, RP_PERF_X2_N3, RP_PERF_X2_KB0, RP_PERF_X2_KB1, RP_PERF_X2_KB2, RP_PERF_X2_KB3,   // 「同一提交第二次同步」收掉开着的通道：按资源类别（RP_X2_*）的次数 / 千字节
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
@@ -156,6 +157,15 @@ void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳�
 
 // 资源同步用的段（见 rp_exec.c）：通常是先于主段提交的前置段；同一资源本次提交里第二次同步时结束当前通道、回到主段。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub);
+// 读数（缺省常开，只计数）：rp_xfer_cmd 因「同一资源在本次提交里第二次同步」收掉开着的通道时，调用方按资源类别记一笔。
+// 判法：拿到了命令、进出 *last_sub 不变（rp_xfer_cmd 只有这一支不改它），且调用前通道开着（与 RP_PERF_P_CUT_XFER 同口径）。
+// 返回 1 = 记了（调用方据此打前几条明细）。
+enum { RP_X2_BUF, RP_X2_TEX_INIT, RP_X2_TEX_ZERO, RP_X2_TEX_REUP, RP_X2_N };
+static inline int rp_xfer2_note(nvn_gpu_cmd xc, uint64_t last_before, uint64_t last_after, int was_open, int kind, uint64_t bytes) {
+    if (!xc || !was_open || last_before != last_after) return 0;
+    rp_perf_add(RP_PERF_X2_N0 + kind, 1); rp_perf_add(RP_PERF_X2_KB0 + kind, (bytes + 1023) / 1024);
+    return 1;
+}
 // 遮挡计数（rp_exec.c）：通道与绘制那边的接入点
 int rp_occl_want(void);                 // 开通道时：要不要声明遮挡计数
 void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);

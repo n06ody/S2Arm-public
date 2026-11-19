@@ -276,6 +276,11 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
                     }
                     if (o < sizeof cb) snprintf(cb + o, sizeof cb - o, "；间接拷贝阶段次：读集未知 %.1f、读集含 0x644 %.1f", (double)icw[0] / f, (double)icw[1] / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", cb); }
+                if (pf[RP_PERF_X2_N0] + pf[RP_PERF_X2_N1] + pf[RP_PERF_X2_N2] + pf[RP_PERF_X2_N3]) {   // 「同一提交第二次同步」收通道按资源类别（缺省常开，只计数；有才打）
+                    snprintf(b, sizeof b, "分时（同一提交第二次同步收通道，按资源，每帧）：缓冲 %.1f 次 / %.0f KB；贴图首取 %.1f 次 / %.0f KB；贴图补零 %.1f 次 / %.0f KB；贴图内容重传 %.1f 次 / %.0f KB",
+                             (double)pf[RP_PERF_X2_N0] / f, (double)pf[RP_PERF_X2_KB0] / f, (double)pf[RP_PERF_X2_N1] / f, (double)pf[RP_PERF_X2_KB1] / f,
+                             (double)pf[RP_PERF_X2_N2] / f, (double)pf[RP_PERF_X2_KB2] / f, (double)pf[RP_PERF_X2_N3] / f, (double)pf[RP_PERF_X2_KB3] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);

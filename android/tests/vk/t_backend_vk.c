@@ -57,7 +57,7 @@ static int g_compute_warm = -1;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
-static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match, g_diag_gaps_match;
+static atomic_int g_diag_csd_logs, g_diag_csd_match, g_diag_barrier_match, g_diag_indirect_match, g_diag_failed_match, g_diag_pass_logs, g_diag_pass_match, g_diag_gaps_match, g_diag_trunc_match;
 // 诊断采样窗：S2A_TEST_DIAG_DFLT 设了就全按后端缺省读；否则 nvk_diag_from_s 缺省读 0（其余诊断用例从第一段就要输出），
 // S2A_TEST_NVK_DIAG_<名> 指定值。开窗 / 关窗 / 配置三行存下来给用例核。
 static atomic_int g_ind_logs, g_ind_match, g_ind_cov, g_ind_next;
@@ -128,8 +128,9 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
         if (strstr(text,"seq=103") && strstr(text,"source=unavailable") && strstr(text,"reason=fence_failed_or_not_submitted")) atomic_fetch_add(&g_diag_failed_match, 1);
     }
     if (text && !strncmp(text, "gpu seg_gaps fence=", 19)) {   // 段内只有 1 个通道、它之前录了派发：带派发位（8）的空当 > 0，各空当 + 通道内 + 段尾 ≈ 跨度
-        unsigned long long f, span, inp, tail; unsigned np, tr, tb; int used = 0;
-        if (sscanf(text, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu tail_ns=%llu tail_bits=0x%x gaps=%n", &f, &np, &tr, &span, &inp, &tail, &tb, &used) == 7 && used) {
+        unsigned long long f, span, inp, tail; unsigned np, tr, ut, tb; int used = 0;
+        if (sscanf(text, "gpu seg_gaps fence=%llu passes=%u truncated=%u untimed=%u span_ns=%llu in_pass_ns=%llu tail_ns=%llu tail_bits=0x%x gaps=%n", &f, &np, &tr, &ut, &span, &inp, &tail, &tb, &used) == 8 && used) {
+            if (f == 2 && np == 250 && tr == 1 && ut == 3) atomic_fetch_add(&g_diag_trunc_match, 1);   // 计时封顶：253 个通道只计 250 个，没计时的 3 个如实报出
             unsigned long long sum = inp + tail, disp = 0; const char *p = text + used; unsigned kb; unsigned long long ns; int m;
             while (sscanf(p, "0x%x:%llu%n", &kb, &ns, &m) == 2) { sum += ns; if (kb & 8u) disp += ns; p += m; if (*p == ',') p++; else break; }
             unsigned long long d = sum > span ? sum - span : span - sum;
@@ -10408,16 +10409,23 @@ static int gpu_diag_only(const char *dir) {
     CHECK(atomic_load(&g_diag_gaps_match)==on, "gpu diag segment gaps attribute dispatch time before the pass: on=%d matched=%d", on, atomic_load(&g_diag_gaps_match));
     CHECK(atomic_load(&g_diag_pass_logs)==on && atomic_load(&g_diag_pass_match)==on,
           "gpu diag empty pass attachment load/store detail: on=%d logs=%d match=%d", on, atomic_load(&g_diag_pass_logs), atomic_load(&g_diag_pass_match));
+    {   // 计时通道封顶（TS_PASS_MAX = 250）：一段 253 个空通道 → seg_gaps 报 passes=250 truncated=1 untimed=3（封顶前 truncated 永远是 0）
+        nvn_gpu_cmd c2 = begin_cmd();
+        for (int i = 0; i < 253; i++) { nvn_gpu_pass_begin(c2, &pass); nvn_gpu_pass_end(c2); }
+        CHECK(OK(nvn_gpu_cmd_commit(c2, 2, on_done, NULL, &e)), "gpu diag capped segment commit: %s", e.why);
+        CHECK(OK(nvn_gpu_fence_wait(2, 5000000000ull, &e)), "gpu diag capped segment fence: %s", e.why);
+        CHECK(atomic_load(&g_diag_trunc_match)==on, "gpu diag segment gaps report untimed passes past the timing cap: on=%d matched=%d", on, atomic_load(&g_diag_trunc_match));
+    }
     const uint32_t *result = (const uint32_t *)buf_cpu(buf); int bad=0;
     for (int i=0; i<64; i++) if (!result || result[i] != (uint32_t)i+1) bad++;
     CHECK(!bad, "gpu diag dispatch output: wrong=%d", bad);
     if (on) {
         int before=atomic_load(&g_ndone); c=begin_cmd(); nvn_gpu_set_pipe(c,cp); nvn_gpu_bind(c,NVN_GPU_SH_CS,&bind,1);
         if (nvn_gpu_diag_dispatch_tag) nvn_gpu_diag_dispatch_tag(c,103,0x1234);
-        nvn_gpu_dispatch(c,cp,1,1,1,NULL,0); nvn_gpu_vk_test_fail_fence(2);
-        CHECK(OK(nvn_gpu_cmd_commit(c,2,on_done,NULL,&e)),"gpu diag failed-fence submit");
-        CHECK(nvn_gpu_fence_wait(2,5000000000ull,&e).code==NVN_GPU_E_FAILED,"gpu diag failed fence");
-        const struct done_rec *done=wait_signal(2,before,5000);
+        nvn_gpu_dispatch(c,cp,1,1,1,NULL,0); nvn_gpu_vk_test_fail_fence(3);   // 信号 2 给了上面的计时封顶段
+        CHECK(OK(nvn_gpu_cmd_commit(c,3,on_done,NULL,&e)),"gpu diag failed-fence submit");
+        CHECK(nvn_gpu_fence_wait(3,5000000000ull,&e).code==NVN_GPU_E_FAILED,"gpu diag failed fence");
+        const struct done_rec *done=wait_signal(3,before,5000);
         CHECK(done && done->status==NVN_GPU_DONE_FAILED && atomic_load(&g_diag_failed_match)==1,"gpu diag failed query unavailable");
         nvn_gpu_vk_test_fail_fence(0);
     }

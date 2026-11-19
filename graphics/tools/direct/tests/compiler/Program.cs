@@ -247,6 +247,40 @@ internal static unsafe class Program
         return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
     }
 
+    // c0 读集分析器每条 null 分支一个变体（原创分析夹具，不是可执行模块）：基底与 C0ReadFixture(0x200) 同形
+    // （c0 = 变量 100，set0/binding1，struct{vec4 data[4096]}，读 data[32].x），变体只改一处。"base" = 负对照，必须可证。
+    private static byte[] C0WhyFixture(string v)
+    {
+        var w = new List<uint> { 0x07230203, 0x10000, 0, 2000, 0 };
+        void Emit(uint op, params uint[] args) { w.Add(((uint)args.Length + 1) << 16 | op); w.AddRange(args); }
+        Emit(17, 120);
+        Emit(11, 150, 0x4c534c47, 0x6474732e, 0x3035342e, 0);   // OpExtInstImport "GLSL.std.450"
+        Emit(71, 100, 33, 1); Emit(71, 100, 34, 0);
+        if (v == "roots=2") { Emit(71, 130, 33, 1); Emit(71, 130, 34, 0); }
+        Emit(71, 103, 6, v == "layout" ? 8u : 16u); Emit(72, 104, 0, 35, 0);
+        Emit(21, 101, 32, 0); Emit(23, 102, 101, 4);
+        Emit(43, 101, 110, 4096); Emit(28, 103, 102, 110);
+        Emit(30, 104, 103); Emit(32, 105, 2, 104);
+        Emit(32, 106, 2, 101); Emit(32, 107, 2, 102);
+        Emit(43, 101, 111, 0); Emit(43, 101, 112, 32); Emit(43, 101, 113, 0); Emit(43, 101, 114, 4096);
+        Emit(59, 105, 100, 2);
+        if (v == "roots=2") Emit(59, 105, 130, 2);
+        if (v == "init") Emit(59, 105, 131, 6, 100);   // Private 变量拿 c0 作初值
+        if (v == "escape2") Emit(245, 106, 125, 120, 151);   // OpPhi 前向引用后面才定义的派生指针
+        uint member = v == "chain:member" ? 112u : 111u, index = v == "dynamic" ? 199u : v == "chain:index-range" ? 114u : 112u,
+             component = v == "chain:component" ? 112u : 113u;
+        if (v == "chain:n=8") Emit(65, 106, 120, 100, 111, 112, 113, 113);   // 少于 3 个下标时粗分析先判动态，到不了这一条；多一个下标才到
+        else Emit(65, v == "chain:type" ? 107u : 106u, 120, 100, member, index, component);
+        if (v == "rechain") Emit(65, 106, 122, 120, 111);
+        Emit(61, v == "loadtype" ? 102u : 101u, 121, 120);
+        if (v == "escape") Emit(83, 106, 122, 120);   // OpCopyObject 复制派生指针
+        // OpExtInst 的第 4 个字是扩展指令号（字面量，不是 id）：指令号恰好等于 c0 变量号 100 时（如 GLSL.std.450 的小号指令撞上小 id），
+        // 现分析器把它当成 c0 的用法判 null；"extinst-other" 换一个不撞号的指令号做对照。
+        if (v == "extinst-literal") Emit(12, 101, 123, 150, 100, 121);
+        if (v == "extinst-other") Emit(12, 101, 123, 150, 31, 121);
+        return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
+    }
+
     // 实机 cs-1-1-7069 结构的合成等价物（无游戏数据）：c0 变量在 (set0,binding1)
     // 读 4 个 vec4 下标共 6 个分量区间；另一个 UBO（仿 cp_s1）在 (set1,binding1)
     // 按非常量下标动态索引——同 binding 号、不同描述符集。粗闸门缺 set 维度时
@@ -1371,6 +1405,12 @@ internal static unsafe class Program
             Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
                 "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
             Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+            // 诊断字段 c0ReadsWhy：只在 c0Reads 为 null 的阶段写，写分析器判 null 的那一条；可证的阶段不写。
+            string Why(JsonElement stage) => stage.TryGetProperty("c0ReadsWhy", out var w) ? w.GetString() : null;
+            Check(dynamic != null && Why(dynamic[0]) == "dynamic",
+                "real compile: register-indexed c0 read reports c0ReadsWhy=dynamic (got " + (dynamic == null ? e3 : Why(dynamic[0]) ?? "(missing)") + ")");
+            Check(binstOn != null && binstOff != null && dynamic != null && binstOn.Concat(binstOff).Concat(dynamic).All(x => (Kind(x) == JsonValueKind.Null) == (Why(x) != null)),
+                "c0ReadsWhy present exactly on stages whose c0Reads is null");
         }
 
         // 3) 同快照逐字节一致；transport 不进入内容键。
@@ -1560,6 +1600,30 @@ internal static unsafe class Program
             "escaped c0 pointer unknown not empty");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200), 1, 1) == null,
             "descriptor set must match");
+        {
+            // 每条 null 分支：变体判 null 且原因对得上；基底与不撞号对照必须可证（读 data[32].x = 0x200 一个字）。
+            int[][] baseReads = DirectComputeC0Reads.Analyze(C0WhyFixture("base"), 0, 1, out string baseWhy);
+            Check(baseReads != null && baseReads.Length == 1 && baseReads[0].SequenceEqual(new[] { 0x200, 4 }) && baseWhy == null,
+                "c0 why base fixture provable, why null (" + (baseWhy ?? "null") + ")");
+            int[][] otherReads = DirectComputeC0Reads.Analyze(C0WhyFixture("extinst-other"), 0, 1, out string otherWhy);
+            Check(otherReads != null && otherReads.Length == 1 && otherWhy == null,
+                "c0 why control: ExtInst whose instruction number is not the c0 id stays provable (" + (otherWhy ?? "null") + ")");
+            Check(S2Arm.Gfx.Widen.SpirvCbufUse.Analyze(C0WhyFixture("extinst-literal")).Single(u => u.Binding == 1 && u.Set == 0).Dynamic == false,
+                "coarse analysis skips the ExtInst instruction literal (so the refined analyzer is the one that rejects)");
+            foreach (var (variant, expect) in new[] {
+                ("roots=2", "roots=2"), ("dynamic", "dynamic"), ("layout", "layout"), ("chain:n=8", "chain:n=8"),
+                ("chain:member", "chain:member"), ("chain:index-range", "chain:index-range"), ("chain:component", "chain:component"),
+                ("chain:type", "chain:type"), ("rechain", "rechain"), ("loadtype", "loadtype"), ("escape", "escape:op=83,w=3"),
+                ("escape2", "escape2:op=245,w=3"), ("init", "init"), ("extinst-literal", "escape:op=12,w=4") })
+            {
+                int[][] r = DirectComputeC0Reads.Analyze(C0WhyFixture(variant), 0, 1, out string why);
+                Check(r == null && why == expect, "c0 why " + variant + " -> " + expect + " (got " + (why ?? "null") + ")");
+            }
+            DirectComputeC0Reads.Analyze(C0WhyFixture("base"), 1, 1, out string rootsWhy);
+            Check(rootsWhy == "roots=0", "c0 why set mismatch -> roots=0 (got " + (rootsWhy ?? "null") + ")");
+            DirectComputeC0Reads.Analyze(new byte[20], 0, 1, out string coarseWhy);
+            Check(coarseWhy == "coarse", "c0 why bad module -> coarse (got " + (coarseWhy ?? "null") + ")");
+        }
         {
             // 实机 cs-1-1-7069 等价物：c0 (set0,binding1) 可证，cp_s1 仿品
             // (set1,binding1) 动态索引。粗闸门只比 binding 号会借后者把 c0Reads 判 null。

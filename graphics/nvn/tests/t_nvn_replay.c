@@ -27,8 +27,12 @@ static int g_fail, g_checks;
 static int g_red_lines; static char g_last_red[200];
 static int g_arena_truncated_lines;
 static int g_arena_detail_lines; static char g_arena_detail[256]; static char g_arena697_lines[32][256];
+static char g_icn_lines[16][320]; static int g_icn_n;   // 「间接绘制为 base instance 拷贝并收通道」明细行（cls "draw"）收下来给 t_draw_ind_binst 核分析器原因
+static char g_x2_lines[16][320]; static int g_x2_n;     // 「同一提交第二次同步并收通道」明细行（cls "gpu" / "tex"）
 static char g_ps_lines[8][320]; static int g_ps_n;   // 池统计行（cls "poolstats"）收下来给 t_pool_stats 核
-void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+void nvn_plat_log(int level, const char *cls, const char *text) { if (text && strstr(text, "拷贝并收通道 #")) { if (g_icn_n < 16) snprintf(g_icn_lines[g_icn_n], 320, "%s", text); g_icn_n++; }
+    if (text && strstr(text, "同一提交第二次同步并收通道 #")) { if (g_x2_n < 16) snprintf(g_x2_lines[g_x2_n], 320, "%s", text); g_x2_n++; }
+    if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_csd, g_csd_selector; static int g_diag_tags, g_diag_dims_n; static uint64_t g_diag_key; static uint32_t g_diag_dims[3];
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
@@ -1537,7 +1541,9 @@ static void t_linear_upload(void) {
     // 填字形：行距 8、padding 是毒值，上传缓冲只能是 3x2 的紧凑行宽
     for (int y = 0; y < 2; y++) { t.mem[y * 8 + 0] = (uint8_t)(0x11 + y); t.mem[y * 8 + 1] = 0x22; t.mem[y * 8 + 2] = 0x33; memset(t.mem + y * 8 + 3, 0xEE, 5); }
     g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    { uint64_t pz[RP_PERF_N]; rp_perf_take(pz); }
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == n0 + 2 && g_up[n0 + 1].pitch == 3 && g_up[n0 + 1].img == 6);
+    { uint64_t pf[RP_PERF_N]; rp_perf_take(pf); CHECK(pf[RP_PERF_X2_N3] == 0 && pf[RP_PERF_X2_N0] == 0); }   // 第二次同步但没有开着的通道：不算「收通道」，不记（与 P_CUT_XFER 同口径）
     CHECK(g_up[n0 + 1].first[0] == 0x11 && g_up[n0 + 1].first[1] == 0x22 && g_up[n0 + 1].first[2] == 0x33 &&
           g_up[n0 + 1].first[3] == 0x12 && g_up[n0 + 1].first[4] == 0x22 && g_up[n0 + 1].first[5] == 0x33);   // 逐行拷：padding 不进缓冲
     CHECK(g_up[n0 + 1].pre == 0);                                                   // 同一提交里的第二次同步：排在主段
@@ -2637,9 +2643,18 @@ static void t_storage_sync_before_pass(void) {
     g_fprog.ent[1][0].src_reg = 0; g_fprog.ent[1][0].access = NVN_GPU_ACC_R;
     { p_bind_buf *sb = put(&s, OP_BIND_SSBO, sizeof *sb); sb->stage = 1; sb->index = 0; sb->addr = base + 2 * PG; sb->size = 64; }
     q_draw(&s); q_draw(&s);
+    { uint64_t pz[RP_PERF_N]; rp_perf_take(pz); } const int x20 = g_x2_n;
     end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_gdraws == 2);
     CHECK(g_nbw == 2 && g_bw[0].pre == 1 && g_bw[1].pre == 0);  // 第二次同步确实录成了主段里的传输
+    {   // 读数：这次收通道按资源记成「缓冲」一次、64 字节 → 1 KB，贴图三类都是 0；明细行一条，带池内偏移 2 页
+        uint64_t pf[RP_PERF_N]; rp_perf_take(pf);
+        int ok = pf[RP_PERF_X2_N0] == 1 && pf[RP_PERF_X2_KB0] >= 1 && pf[RP_PERF_X2_N1] + pf[RP_PERF_X2_N2] + pf[RP_PERF_X2_N3] == 0 && g_x2_n == x20 + 1 &&
+                 strstr(g_x2_lines[x20 < 16 ? x20 : 15], "缓冲 池") != NULL;
+        if (!ok) printf("  x2 buffer: n %llu kb %llu tex %llu lines %d: %s\n", (unsigned long long)pf[RP_PERF_X2_N0], (unsigned long long)pf[RP_PERF_X2_KB0],
+                        (unsigned long long)(pf[RP_PERF_X2_N1] + pf[RP_PERF_X2_N2] + pf[RP_PERF_X2_N3]), g_x2_n - x20, g_x2_n > x20 && x20 < 16 ? g_x2_lines[x20] : "");
+        CHECK(ok);
+    }
     CHECK(g_bind_outside == 0 && g_draw_outside == 0);            // 每一次图形绑定、每一笔绘制都在通道里
     CHECK(nvn_unimpl_count("draw", "storage_buffer_unresolved") == 0);
     g_pg_tracked = tracked; pass_fresh();
@@ -4115,6 +4130,8 @@ static void t_draw_ind_binst(void) {
     for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
         for (int st = 0; st < 2; st++) { g_fprog.nent[st] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[st][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_DRV0; e->count = 1; }
         g_fprog.binst_unread = cases[k].unread; g_fprog.binst_known = cases[k].known; g_arena_used = 0;
+        memset(g_fprog.c0_why, 0, sizeof g_fprog.c0_why); if (k == 0) snprintf(g_fprog.c0_why[1], sizeof g_fprog.c0_why[1], "escape:op=12,w=4");   // 编译器给的 null 原因：阶段 1 有、阶段 0 没给
+        const int icn0 = g_icn_n;
         { uint64_t cz[RP_CUT_N][RP_CUTV_N], iz[2]; rp_pass_cut_take(cz); rp_draw_ind_copy_take(iz); }   // 清零：只看这一段   // 替身暂存区 64 KB 不查越界：每段从头用（上一段已完成）
         int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws;
         stream s = {0}; mdi_prelude(&s, &rtt);
@@ -4132,6 +4149,16 @@ static void t_draw_ind_binst(void) {
         if (g_gdraws - d0 != 3 || g_ncopy4 - c0 != cases[k].copies || g_npd - p0 != cases[k].passes) {
             printf("  %s: draws %d copies %d passes %d (expect 3 / %d / %d)\n", cases[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0, cases[k].copies, cases[k].passes);
             CHECK(0);
+        }
+        // 明细行带分析器原因：读集未知的阶段写「分析器 <原因>」（没给写「没给原因」）；读集已知含 0x644 的阶段不带分析器字样。每个（阶段、程序、已知与否）只报一次。
+        if (k == 0 || k == 1) {
+            int want = k == 0 ? 2 : 1, got = g_icn_n - icn0, ok = got == want;
+            for (int i = icn0; ok && i < g_icn_n && i < 16; i++) {
+                const char *l = g_icn_lines[i];
+                if (k == 1) ok = strstr(l, "阶段 1") && strstr(l, "读集含 c0+0x644") && !strstr(l, "分析器");
+                else ok = strstr(l, "阶段 0") ? strstr(l, "分析器 没给原因") != NULL : strstr(l, "阶段 1") && strstr(l, "分析器 escape:op=12,w=4");
+            }
+            if (!ok) { printf("  %s: copy note lines %d (expect %d):\n", cases[k].what, got, want); for (int i = icn0; i < g_icn_n && i < 16; i++) printf("    %s\n", g_icn_lines[i]); CHECK(0); }
         }
     }
     g_fprog = saved;

@@ -227,6 +227,15 @@ static void tex_log_arm(struct rp_tex *x, const tex_t *t) {
     const void *sp = nvn_dirty_span(t->mem, t->L.size);
     if (sp && nvn_dirty_log_open(sp, &x->log_id, &x->log_cur)) { x->log_span = sp; x->log_ok = 1; x->log_shadow = nvn_plat_flag("nvk_tex_log_shadow", 0) != 0; }
 }
+// 「同一提交第二次同步」收通道的前 8 条明细（贴图）：类别、尺寸、格式、目标、级数、字节
+static void x2_tex_note(int kind, const tex_t *t) {
+    static int said; if (said >= 8) return; said++;
+    static const char *const nm[RP_X2_N] = { "缓冲", "贴图首取", "贴图补零", "贴图内容重传" };
+    char m[220]; snprintf(m, sizeof m, "同一提交第二次同步并收通道 #%d：%s %ux%ux%u 格式 %#x 目标 %d 级 %u 共 %llu KB", said, nm[kind],
+                          (unsigned)t->d.width, (unsigned)t->d.height, (unsigned)t->d.depth, (unsigned)t->d.format, t->d.target, (unsigned)t->d.levels,
+                          (unsigned long long)(t->L.size / 1024));
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", m);
+}
 // 影子核对（诊断，缺省关）：两路判脏不一致时报前 8 张（每个方向各 8 张）。日志判净而逐页判脏 = 日志漏了写，画面可能旧，报红；反过来只是多传一次，报信息。
 static unsigned g_shadow_said[2];
 static void tex_shadow_note(const tex_t *t, int log_dirty, int page_dirty, uint64_t ev) {
@@ -521,7 +530,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
     if (x->need_init && c) {   // 刚建的存储：CPU 贴图走下面的上传；其余的取一次存储里现有的内容，取不了的清零
         x->need_init = 0;
         if (!x->cpu && !x->gpu_written) {
+            const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
             nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+            if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_INIT, t->L.size)) x2_tex_note(RP_X2_TEX_INIT, t);
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
@@ -532,7 +543,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
         }
     }
     if (x->zero_pending && !g_attach_intent && c) {   // 待清零没被通道取走（开通道失败），现在有别的用途要它：照旧填零
+        const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
         nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+        if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_ZERO, t->L.size)) x2_tex_note(RP_X2_TEX_ZERO, t);
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
     if (x->cpu && !x->gpu_written && c && t->mem) {
@@ -547,7 +560,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             if (x->uploaded && x->span && !x->check_dirty) rp_perf_add(RP_PERF_TEX_EPOCH_MISS, 1);   // 能走纪元快路的贴图没跳成（代号 / 段 / 映射变了，或开关关着、跟踪不可靠）
             x->span = nvn_dirty_span(t->mem, t->L.size);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
             if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
+                const uint64_t l0 = x->up_sub; const int open0 = rp_pass_is_open();
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
+                if (rp_xfer2_note(xc, l0, x->up_sub, open0, RP_X2_TEX_REUP, t->L.size)) x2_tex_note(RP_X2_TEX_REUP, t);
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
                 if (xc && (pr == 0 || (pr < 0 && upload_all(t, x, xc, 1) == 0))) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_dirty = 0; }
                 else x->check_dirty = 1;

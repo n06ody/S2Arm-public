@@ -1768,8 +1768,10 @@ static void seg_gaps_report(struct nvn_gpu_cmd_s *c, uint64_t signal, int status
     }
     const uint32_t tail_bits = (n ? c->pass_details->p[n - 1].after : c->pass_details->events) & 63u;
     const uint64_t tail = SG_NS(prev, q[1][0]), span = SG_NS(q[0][0], q[1][0]);
-    char line[1400]; size_t o = (size_t)snprintf(line, sizeof line, "gpu seg_gaps fence=%llu passes=%u truncated=%u span_ns=%llu in_pass_ns=%llu tail_ns=%llu tail_bits=0x%x gaps=",
-        (unsigned long long)signal, n, c->ntsp > TS_PASS_MAX, (unsigned long long)span, (unsigned long long)in_pass, (unsigned long long)tail, tail_bits);
+    // 计时通道到 TS_PASS_MAX 就不再加（ntsp 封顶），多出的通道只记在 overflow：truncated 按它判，untimed = 没计时的通道数，它们的时间全在 tail_ns 里
+    const uint32_t untimed = c->pass_details->overflow;
+    char line[1400]; size_t o = (size_t)snprintf(line, sizeof line, "gpu seg_gaps fence=%llu passes=%u truncated=%u untimed=%u span_ns=%llu in_pass_ns=%llu tail_ns=%llu tail_bits=0x%x gaps=",
+        (unsigned long long)signal, n, untimed > 0, untimed, (unsigned long long)span, (unsigned long long)in_pass, (unsigned long long)tail, tail_bits);
     for (int k = 0; k < nk && o < sizeof line; k++) o += (size_t)snprintf(line + o, sizeof line - o, "%s0x%x:%llu", k ? "," : "", key[k], (unsigned long long)val[k]);
     #undef SG_ADD
     #undef SG_NS
