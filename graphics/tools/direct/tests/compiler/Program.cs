@@ -86,6 +86,18 @@ internal static unsafe class Program
         }
         return b;
     }
+    // STS / LDS [RZ + imm], B32（InstSts / InstLds：Rd 0..7、Ra 8..15、Imm24 20..43、LsSize 48..50 = B32 4）；BAR.SYNC 0（InstBar，BarOp Sync = 0）
+    private static ulong Sts(int reg, int offset) => 0xEF58000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private static ulong Lds(int reg, int offset) => 0xEF48000000000000UL | (4UL << 48) | ((ulong)offset << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
+    private const ulong BarSync = 0xF0A8000000000000UL | (7UL << 16) | (0xFFUL << 8);
+    // 计算核（没有着色器头）：每 3 条指令前一个调度字，末尾 EXIT 加自跳转
+    private static byte[] ComputeOps(params ulong[] ops)
+    {
+        var all = new List<ulong>(ops) { Exit, 0xE2400FFFFF07000FUL };
+        var words = new List<ulong>();
+        for (int i = 0; i < all.Count; i += 3) { words.Add(Sched); for (int j = 0; j < 3; j++) words.Add(i + j < all.Count ? all[i + j] : 0x50B0000000070F00UL); }
+        return MemoryMarshal.AsBytes(words.ToArray().AsSpan()).ToArray();
+    }
     private static byte[] ComputeGuest() => MemoryMarshal.AsBytes(new ulong[] { Sched, Exit, 0x50B0000000070F00UL, 0xE2400FFFFF07000FUL }.AsSpan()).ToArray();
 
     // 原创合成 Maxwell GS：普通（非 passthrough）几何阶段，读写 loc0，发出顶点并结束图元。
@@ -232,6 +244,40 @@ internal static unsafe class Program
         else Emit(65, 106, 120, 100, 111, dynamic ? 199u : 112u, 113);
         if (load) Emit(61, vectorLoad ? 102u : 101u, 121, 120);
         if (escape) Emit(83, 106, 122, 120);
+        return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
+    }
+
+    // c0 读集分析器每条 null 分支一个变体（原创分析夹具，不是可执行模块）：基底与 C0ReadFixture(0x200) 同形
+    // （c0 = 变量 100，set0/binding1，struct{vec4 data[4096]}，读 data[32].x），变体只改一处。"base" = 负对照，必须可证。
+    private static byte[] C0WhyFixture(string v)
+    {
+        var w = new List<uint> { 0x07230203, 0x10000, 0, 2000, 0 };
+        void Emit(uint op, params uint[] args) { w.Add(((uint)args.Length + 1) << 16 | op); w.AddRange(args); }
+        Emit(17, 120);
+        Emit(11, 150, 0x4c534c47, 0x6474732e, 0x3035342e, 0);   // OpExtInstImport "GLSL.std.450"
+        Emit(71, 100, 33, 1); Emit(71, 100, 34, 0);
+        if (v == "roots=2") { Emit(71, 130, 33, 1); Emit(71, 130, 34, 0); }
+        Emit(71, 103, 6, v == "layout" ? 8u : 16u); Emit(72, 104, 0, 35, 0);
+        Emit(21, 101, 32, 0); Emit(23, 102, 101, 4);
+        Emit(43, 101, 110, 4096); Emit(28, 103, 102, 110);
+        Emit(30, 104, 103); Emit(32, 105, 2, 104);
+        Emit(32, 106, 2, 101); Emit(32, 107, 2, 102);
+        Emit(43, 101, 111, 0); Emit(43, 101, 112, 32); Emit(43, 101, 113, 0); Emit(43, 101, 114, 4096);
+        Emit(59, 105, 100, 2);
+        if (v == "roots=2") Emit(59, 105, 130, 2);
+        if (v == "init") Emit(59, 105, 131, 6, 100);   // Private 变量拿 c0 作初值
+        if (v == "escape2") Emit(245, 106, 125, 120, 151);   // OpPhi 前向引用后面才定义的派生指针
+        uint member = v == "chain:member" ? 112u : 111u, index = v == "dynamic" ? 199u : v == "chain:index-range" ? 114u : 112u,
+             component = v == "chain:component" ? 112u : 113u;
+        if (v == "chain:n=8") Emit(65, 106, 120, 100, 111, 112, 113, 113);   // 少于 3 个下标时粗分析先判动态，到不了这一条；多一个下标才到
+        else Emit(65, v == "chain:type" ? 107u : 106u, 120, 100, member, index, component);
+        if (v == "rechain") Emit(65, 106, 122, 120, 111);
+        Emit(61, v == "loadtype" ? 102u : 101u, 121, 120);
+        if (v == "escape") Emit(83, 106, 122, 120);   // OpCopyObject 复制派生指针
+        // OpExtInst 的第 4 个字是扩展指令号（字面量，不是 id）：指令号恰好等于 c0 变量号 100 时（如 GLSL.std.450 的小号指令撞上小 id），
+        // 现分析器把它当成 c0 的用法判 null；"extinst-other" 换一个不撞号的指令号做对照。
+        if (v == "extinst-literal") Emit(12, 101, 123, 150, 100, 121);
+        if (v == "extinst-other") Emit(12, 101, 123, 150, 31, 121);
         return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
     }
 
@@ -563,7 +609,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -593,7 +639,7 @@ internal static unsafe class Program
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x748), cx);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x74C), 1);
                 BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x750), 1);
-                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), 0);
+                BinaryPrimitives.WriteUInt32LittleEndian(control.AsSpan(0x754), sharedBytes);
                 // 让 controlX=0 明确产生非法控制段；其它情况如实填写。
                 WriteStage(w, "cs", overrideCode ?? cs, csCbUse, control);
             }
@@ -635,7 +681,7 @@ internal static unsafe class Program
                 w.WriteNumberValue(localSize); w.WriteNumberValue(1); w.WriteNumberValue(1);
                 w.WriteEndArray();
                 w.WriteNumber("localMemoryBytes", 0);
-                w.WriteNumber("sharedMemoryBytes", 0);
+                w.WriteNumber("sharedMemoryBytes", (sharedBytes + 15) / 16 * 16);
                 w.WriteBoolean("hasUnalignedStorageBuffer", false);
                 w.WriteEndObject();
             }
@@ -687,7 +733,37 @@ internal static unsafe class Program
 
     private static void Main(string[] args)
     {
+        // GPU oracle: transform the exact reference shader with production code.
+        if (args.Length == 4 && args[0] == "--spill-spirv")
+        {
+            try
+            {
+                int limit = int.Parse(args[3]);
+                var spillResult = DirectSharedSpill.Rewrite(File.ReadAllBytes(args[1]), limit, 0, 1);
+                if (spillResult == null) throw new DirectCompileException("UNSUPPORTED_PROGRAM", "fixture did not require a spill");
+                // 重新解析产物，不能只信选择器自己的 remaining 账本：留在 Workgroup 的数组必须真的不超过设备上限。
+                int measured = DirectSharedSpill.WorkgroupBytes(spillResult.Spirv);
+                if (measured < 0 || measured != spillResult.RemainingSharedBytes || measured > limit)
+                    throw new DirectCompileException("RESOURCE_LIMIT", $"spill retained workgroup bytes {measured}, reported {spillResult.RemainingSharedBytes}, limit {limit}");
+                File.WriteAllBytes(args[2], spillResult.Spirv);
+                Console.WriteLine($"spill bytes/group={spillResult.BytesPerGroup} remaining={spillResult.RemainingSharedBytes} measured={measured} set={spillResult.Set} binding={spillResult.Binding}");
+                return;
+            }
+            catch (DirectCompileException e) { Console.Error.WriteLine($"{e.Code}: {e.Message}"); Environment.Exit(1); }
+        }
         byte[] profile = ProfileJson();
+        using (JsonDocument profileDoc = JsonDocument.Parse(profile))
+        {
+            var limits = DirectProfile.Parse(profileDoc.RootElement, "spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 32768 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 49152,
+                  "spill keeps physical 32 KiB separate from translation 48 KiB");
+        }
+        using (JsonDocument largeProfileDoc = JsonDocument.Parse(Encoding.UTF8.GetString(profile).Replace("\"maximumComputeSharedMemorySize\":32768", "\"maximumComputeSharedMemorySize\":65536")))
+        {
+            var limits = DirectProfile.Parse(largeProfileDoc.RootElement, "large-spill-profile");
+            Check(limits.Caps.MaximumComputeSharedMemorySize == 65536 && limits.TranslationCaps.MaximumComputeSharedMemorySize == 65536,
+                  "translation limit preserves devices above 48 KiB");
+        }
         byte[] vs = Guest(false, new[] { Ast(0) });
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
@@ -1329,6 +1405,12 @@ internal static unsafe class Program
             Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
                 "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
             Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+            // 诊断字段 c0ReadsWhy：只在 c0Reads 为 null 的阶段写，写分析器判 null 的那一条；可证的阶段不写。
+            string Why(JsonElement stage) => stage.TryGetProperty("c0ReadsWhy", out var w) ? w.GetString() : null;
+            Check(dynamic != null && Why(dynamic[0]) == "dynamic",
+                "real compile: register-indexed c0 read reports c0ReadsWhy=dynamic (got " + (dynamic == null ? e3 : Why(dynamic[0]) ?? "(missing)") + ")");
+            Check(binstOn != null && binstOff != null && dynamic != null && binstOn.Concat(binstOff).Concat(dynamic).All(x => (Kind(x) == JsonValueKind.Null) == (Why(x) != null)),
+                "c0ReadsWhy present exactly on stages whose c0Reads is null");
         }
 
         // 3) 同快照逐字节一致；transport 不进入内容键。
@@ -1383,6 +1465,83 @@ internal static unsafe class Program
             Check(content.GetProperty("supportReads").GetArrayLength() == 0, "compute declared support but no actual loads");
             Check(content.GetProperty("stages").GetArrayLength() == 1 &&
                   content.GetProperty("stages")[0].GetProperty("stage").GetString() == "cs", "compute stage");
+        }
+
+        // 5b) 共享内存超过设备上限（profile 32 KB）：最大的线程组数组挪到存储缓冲（DirectSharedSpill，同 iOS SpillFix）。
+        //     真实 decoder / translator：STS 写到 0x9000（超出 32 KB）、BAR.SYNC、LDS 读回、再 STS 留住结果。
+        {
+            byte[] sharedCs = ComputeOps(Fadd32i(0, 1.0f), Sts(0, 0x9000), BarSync, Lds(1, 0x9000), Sts(1, 0x10));
+            (JsonElement content, string error) SharedCompile(uint bytes)
+            {
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "compute", 2, 1, "shared-" + bytes, cs: sharedCs, sharedBytes: bytes)));
+                    return (d.RootElement.GetProperty("content").Clone(), null);
+                }
+                catch (Exception ex) { return (default, ex.Message); }
+            }
+            uint[] Words(JsonElement content) => MemoryMarshal.Cast<byte, uint>(content.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64()).ToArray();
+            IEnumerable<uint[]> Insts(uint[] w) { for (int i = 5; i < w.Length; i += (int)(w[i] >> 16)) yield return w[i..(i + (int)(w[i] >> 16))]; }
+            bool HasWorkgroupVar(uint[] w) => Insts(w).Any(x => (x[0] & 0xFFFF) == 59 && x[3] == 4);
+            var (big, bigErr) = SharedCompile(40960);
+            if (bigErr != null) Check(false, "40 KB shared compute compiles with a spill: " + bigErr);
+            else
+            {
+                uint[] w = Words(big);
+                JsonElement[] spills = big.GetProperty("bindings").EnumerateArray().Where(b => b.GetProperty("kind").GetString() == "spill").ToArray();
+                Check(spills.Length == 1 && spills[0].GetProperty("set").GetInt32() == 1 && spills[0].GetProperty("bytesPerGroup").GetInt32() == 40960 &&
+                      spills[0].GetProperty("stage").GetString() == "cs", "40 KB shared: one spill binding in set 1, 40960 bytes per group");
+                Check(!HasWorkgroupVar(w), "40 KB shared: no workgroup variable left in the SPIR-V");
+                var consts = Insts(w).Where(x => (x[0] & 0xFFFF) == 43 && x.Length == 4).ToDictionary(x => x[2], x => x[3]);
+                var builtins = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11).Select(x => x[3]).ToHashSet();
+                Check(builtins.Contains(26) && builtins.Contains(24), "spill index uses WorkgroupId and NumWorkgroups");
+                // 溢出缓冲的成员带 Coherent（组内调用经 barrier 互相看得见写，同 Workgroup 内存的语义）
+                Check(Insts(w).Any(x => (x[0] & 0xFFFF) == 72 && x.Length == 4 && x[2] == 0 && x[3] == 23),
+                      "spill buffer member is Coherent so writes are visible across the workgroup after barriers");
+                // 每个指向溢出缓冲的访问链：最后一个下标 = OpIAdd(OpIMul(组号, 10240 字), 原下标)
+                var defs = new Dictionary<uint, uint[]>();
+                foreach (uint[] x in Insts(w)) if ((x[0] & 0xFFFF) is 128 or 132 && x.Length == 5 || (x[0] & 0xFFFF) == 169 && x.Length == 6) defs[x[2]] = x;
+                bool Decorated(uint id, uint dec, int value) => Insts(w).Any(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[1] == id && x[2] == dec && x[3] == (uint)value);
+                uint spillVar = Insts(w).Where(v => (v[0] & 0xFFFF) == 59 && v[3] == 2).Select(v => v[2]).FirstOrDefault(id =>
+                    Decorated(id, 34, spills[0].GetProperty("set").GetInt32()) && Decorated(id, 33, spills[0].GetProperty("binding").GetInt32()));
+                uint[][] spillChains = Insts(w).Where(x => (x[0] & 0xFFFF) is 65 or 66 && x.Length >= 5 && x[3] == spillVar).ToArray();
+                bool Scaled(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var mul) && (mul[0] & 0xFFFF) == 132 &&
+                        (consts.GetValueOrDefault(mul[3]) == 10240 || consts.GetValueOrDefault(mul[4]) == 10240));
+                Check(spillVar != 0 && spillChains.Length >= 3 && spillChains.All(x => Scaled(x[^1])),
+                      "every spill access indexes slice (flat group id x 10240 words) + original index: chains " + spillChains.Length);
+                // 下标夹在本组片内：加到基址上的那一项 = OpSelect(idx < 10240, idx, 10239)
+                bool Clamped(uint id) => defs.TryGetValue(id, out var add) && (add[0] & 0xFFFF) == 128 &&
+                    new[] { add[3], add[4] }.Any(o => defs.TryGetValue(o, out var sel) && (sel[0] & 0xFFFF) == 169 && consts.GetValueOrDefault(sel[5]) == 10239);
+                Check(spillChains.All(x => Clamped(x[^1])), "every spill index is clamped to the group's slice (select idx < 10240 ? idx : 10239)");
+                // 组号基址每个函数算一次：读 WorkgroupId 的次数不随访问次数涨（3 处访问、1 个函数 → 1 次）
+                uint gidVar = Insts(w).Where(x => (x[0] & 0xFFFF) == 71 && x.Length == 4 && x[2] == 11 && x[3] == 26).Select(x => x[1]).First();
+                int gidLoads = Insts(w).Count(x => (x[0] & 0xFFFF) == 61 && x.Length >= 4 && x[3] == gidVar);
+                Check(gidLoads == 1, "the group base is computed once per function, not per access: WorkgroupId loads " + gidLoads);
+                var barriers = Insts(w).Where(x => (x[0] & 0xFFFF) == 224).ToArray();
+                Check(barriers.Length > 0 && barriers.All(x => (consts.GetValueOrDefault(x[3]) & 0x140) == 0x140),
+                      "workgroup barriers also order uniform (spill buffer) memory");
+                string spvPath = Path.Combine(Path.GetTempPath(), "s2a-spill-" + Environment.ProcessId + ".spv");
+                File.WriteAllBytes(spvPath, big.GetProperty("stages")[0].GetProperty("spirv").GetBytesFromBase64());
+                string val = Environment.GetEnvironmentVariable("SPIRV_VAL") ?? "spirv-val";
+                try
+                {
+                    using var proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(val, "--target-env vulkan1.1 \"" + spvPath + "\"")
+                        { RedirectStandardError = true, RedirectStandardOutput = true });
+                    string msg = proc.StandardError.ReadToEnd() + proc.StandardOutput.ReadToEnd(); proc.WaitForExit();
+                    Check(proc.ExitCode == 0, "spilled SPIR-V passes spirv-val (vulkan1.1): " + msg.Trim());
+                }
+                catch (System.ComponentModel.Win32Exception) { Console.WriteLine("NOTE spirv-val not found: spilled SPIR-V not validated by SPIRV-Tools (set SPIRV_VAL)"); }
+                finally { File.Delete(spvPath); }
+            }
+            var (small, smallErr) = SharedCompile(16384);
+            Check(smallErr == null && !small.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill") && HasWorkgroupVar(Words(small)),
+                  "16 KB shared stays in workgroup memory without a spill binding: " + smallErr);
+            var (maxGuest, maxGuestErr) = SharedCompile(48 * 1024);
+            Check(maxGuestErr == null && maxGuest.GetProperty("bindings").EnumerateArray().Any(b => b.GetProperty("kind").GetString() == "spill"),
+                  "48 KiB guest shared memory is accepted and spilled: " + maxGuestErr);
+            var (_, overGuestErr) = SharedCompile(48 * 1024 + 1);
+            Check(overGuestErr != null, "guest shared memory over 48 KiB is rejected");
         }
 
         // 真实 decoder -> translator -> Info.SBuffers -> JSON 反射，补足下方 mapper 单测。
@@ -1441,6 +1600,30 @@ internal static unsafe class Program
             "escaped c0 pointer unknown not empty");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200), 1, 1) == null,
             "descriptor set must match");
+        {
+            // 每条 null 分支：变体判 null 且原因对得上；基底与不撞号对照必须可证（读 data[32].x = 0x200 一个字）。
+            int[][] baseReads = DirectComputeC0Reads.Analyze(C0WhyFixture("base"), 0, 1, out string baseWhy);
+            Check(baseReads != null && baseReads.Length == 1 && baseReads[0].SequenceEqual(new[] { 0x200, 4 }) && baseWhy == null,
+                "c0 why base fixture provable, why null (" + (baseWhy ?? "null") + ")");
+            int[][] otherReads = DirectComputeC0Reads.Analyze(C0WhyFixture("extinst-other"), 0, 1, out string otherWhy);
+            Check(otherReads != null && otherReads.Length == 1 && otherWhy == null,
+                "c0 why control: ExtInst whose instruction number is not the c0 id stays provable (" + (otherWhy ?? "null") + ")");
+            Check(S2Arm.Gfx.Widen.SpirvCbufUse.Analyze(C0WhyFixture("extinst-literal")).Single(u => u.Binding == 1 && u.Set == 0).Dynamic == false,
+                "coarse analysis skips the ExtInst instruction literal (so the refined analyzer is the one that rejects)");
+            foreach (var (variant, expect) in new[] {
+                ("roots=2", "roots=2"), ("dynamic", "dynamic"), ("layout", "layout"), ("chain:n=8", "chain:n=8"),
+                ("chain:member", "chain:member"), ("chain:index-range", "chain:index-range"), ("chain:component", "chain:component"),
+                ("chain:type", "chain:type"), ("rechain", "rechain"), ("loadtype", "loadtype"), ("escape", "escape:op=83,w=3"),
+                ("escape2", "escape2:op=245,w=3"), ("init", "init"), ("extinst-literal", "escape:op=12,w=4") })
+            {
+                int[][] r = DirectComputeC0Reads.Analyze(C0WhyFixture(variant), 0, 1, out string why);
+                Check(r == null && why == expect, "c0 why " + variant + " -> " + expect + " (got " + (why ?? "null") + ")");
+            }
+            DirectComputeC0Reads.Analyze(C0WhyFixture("base"), 1, 1, out string rootsWhy);
+            Check(rootsWhy == "roots=0", "c0 why set mismatch -> roots=0 (got " + (rootsWhy ?? "null") + ")");
+            DirectComputeC0Reads.Analyze(new byte[20], 0, 1, out string coarseWhy);
+            Check(coarseWhy == "coarse", "c0 why bad module -> coarse (got " + (coarseWhy ?? "null") + ")");
+        }
         {
             // 实机 cs-1-1-7069 等价物：c0 (set0,binding1) 可证，cp_s1 仿品
             // (set1,binding1) 动态索引。粗闸门只比 binding 号会借后者把 c0Reads 判 null。

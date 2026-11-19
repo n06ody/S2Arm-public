@@ -24,7 +24,10 @@ struct rp_prog {
     uint32_t attr_mask;                                       // 顶点着色器实际读的属性位
     uint32_t color_out_mask;                                  // 片元着色器写了哪些输出分量：每个颜色目标 4 位（RGBA）。没有片元阶段 / 不知道 = 全 1
     uint8_t c1[RP_PROG_STAGES][0x100]; uint8_t c1_ok;         // NVN_RB_C1：着色器自带的常量段（位 i = 阶段 i 有）
+    uint32_t spill_bytes;                                     // 计算：共享内存溢出缓冲每个线程组的字节数（NVN_RB_SPILL 项）；0 = 没有
     uint8_t is_compute;                                       // 计算程序：只有 sh[0] / ent[0]，绑定取 NVN 阶段 5 的状态
+    uint8_t binst_known;                                      // 位 i = 阶段 i 的 c0 读集已知（编译器给了 c0Reads 数组）：读数用，区分「读集未知」与「读集含 0x644」
+    char c0_why[RP_PROG_STAGES][24];                          // 诊断：阶段 i 读集未知时编译器给的原因（c0ReadsWhy）；空串 = 没给（旧结果 / 库路径）
     uint8_t binst_unread;                                     // 位 i = 阶段 i 已证不读 c0 + 0x644（编译器 c0Reads）：间接绘制不用把 GPU 侧的 base instance 拷进它的驱动段。0 = 读或未知（照旧拷）
     uint8_t z_raw;                                            // 顶点出口 z 原样（不随深度模式改写，出包预编库的程序）：near = -w 时管线设裁剪深度 [-1, 1]
     struct rp_usrc usrc[RP_PROG_USRC_MAX]; uint32_t nusrc;    // NVN_RB_TEXU / TBUFU 项的句柄来源（布局项 src_reg2 指向这里）
