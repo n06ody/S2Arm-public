@@ -3385,6 +3385,29 @@ static void pi_init(void) { nvk_pf_init(&g_pi, sizeof(nvn_gpu_pipe_desc)); }
 static void pi_ensure(void) { pthread_once(&g_pi_once, pi_init); }
 static int pi_eq(const void *a, const void *b) { return same_pipe_desc((const nvn_gpu_pipe_desc *)a, (const nvn_gpu_pipe_desc *)b); }
 
+// 建管线失败的 VkResult 名（红行用；只列建管线可能返回的几种）
+static const char *vkr_name(VkResult r) {
+    switch (r) {
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "DEVICE_LOST";
+        case VK_ERROR_INVALID_SHADER_NV: return "INVALID_SHADER_NV";
+        case VK_PIPELINE_COMPILE_REQUIRED: return "PIPELINE_COMPILE_REQUIRED";
+        case VK_ERROR_UNKNOWN: return "UNKNOWN";
+        default: return "其它";
+    }
+}
+// 建管线失败时驱动留在输出里的句柄：规范要求置 VK_NULL_HANDLE（合规驱动这里恒为空）。不信任它：不销毁、不保存、不绑定——
+//   若驱动失败时留下的是半建对象、编译任务还在它自己的线程上跑，这时销毁会在驱动线程里出事（9000 r1 冷缓存：失败后 42 ms
+//   Mali 自起的线程在线程入口空指针，坑记录 11-19）。宁可漏一个驱动对象。返回给红行的说明。
+static uint64_t g_pipe_fail_left;   // 失败却留了非空句柄的次数（进程累计）
+uint64_t nvn_vk_pipe_fail_left_count(void) { return __atomic_load_n(&g_pipe_fail_left, __ATOMIC_RELAXED); }
+static const char *pipe_fail_left(VkPipeline out) {
+    if (out == VK_NULL_HANDLE) return "输出句柄为空";
+    __atomic_fetch_add(&g_pipe_fail_left, 1, __ATOMIC_RELAXED);
+    return "输出句柄非空（驱动没按规范置空；不销毁、不使用）";
+}
 static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
     if (!p) return;
     if (p->pipe) vkDestroyPipeline(g.d, p->pipe, NULL);
@@ -3850,11 +3873,13 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     gp.renderPass = p->pass;
     gp.subpass = 0;
     const uint64_t pl_t0 = now_ns();   // 驱动编译管线是同步的：超过 3 毫秒就打一行（走路/进新场景时会集中出现）
-    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe) != VK_SUCCESS) {
-        nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateGraphicsPipelines 失败");
-        destroy_pipe_objects(p);
-        return bad;
-    }
+    { VkPipeline out = VK_NULL_HANDLE; const VkResult vr = vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &out);
+      if (vr != VK_SUCCESS) {
+          nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateGraphicsPipelines 失败：VkResult %d（%s），%s", (int)vr, vkr_name(vr), pipe_fail_left(out));
+          destroy_pipe_objects(p);   // p->pipe 仍是空：驱动失败时留在输出里的句柄不销毁、不使用（见 pipe_fail_left）
+          return bad;
+      }
+      p->pipe = out; }
     plc_created();
     { const uint64_t dt = now_ns() - pl_t0;   // 编译耗时：>3 毫秒单独记一行（正常建管线在 0.2–1 毫秒）
       static int slow = -1; if (slow < 0) slow = nvn_plat_flag("nvk_hitch_log", 0) != 0;
@@ -4152,10 +4177,13 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
     cp.stage.pName = sh->entry;
     cp.layout = p->layout;
     const uint64_t pc_t0 = now_ns();   // 同图形管线：超过 3 毫秒打一行，用来对长帧
-    if (vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &p->pipe) != VK_SUCCESS) {
-        destroy_pipe_objects(p);
-        return fail(err, NVN_GPU_E_COMPILE, "vkCreateComputePipelines 失败");
-    }
+    { VkPipeline out = VK_NULL_HANDLE; const VkResult vr = vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &out);
+      if (vr != VK_SUCCESS) {
+          nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateComputePipelines 失败：VkResult %d（%s），%s", (int)vr, vkr_name(vr), pipe_fail_left(out));
+          destroy_pipe_objects(p);   // 同图形管线：失败时留在输出里的句柄不销毁、不使用
+          return bad;
+      }
+      p->pipe = out; }
     plc_created();
     { const uint64_t dt = now_ns() - pc_t0;
       static int slowc = -1; if (slowc < 0) slowc = nvn_plat_flag("nvk_hitch_log", 0) != 0;

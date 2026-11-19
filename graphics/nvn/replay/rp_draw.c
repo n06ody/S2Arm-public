@@ -1099,6 +1099,46 @@ void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) {
     }
     g_mdi_force_n = 0;
 }
+// 建管线失败的红行（图形 / 计算同口径）：配方（管线描述的字节）第一次失败打全量，同一配方之后只在第 2、4、8… 次再打一行（带累计次数）；
+//   每笔绘制照旧重试，不做负缓存（失败多是偶发，负缓存会把一次偶发变成整局缺几何）。全量 = 后端原因（VkResult、输出句柄）+
+//   程序身份 + 各阶段着色器键 + 配方摘要，够在下一次复现时认出是哪一条管线。
+enum { PF_SLOTS = 64 };
+static struct { uint64_t h; uint32_t n; } g_pf[PF_SLOTS]; static uint32_t g_pf_total;
+static void pipe_fail_log(int compute, const struct rp_prog *pg, const void *key, size_t key_bytes, const char *why) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)compute;
+    for (size_t i = 0; i < key_bytes; i++) { h ^= ((const uint8_t *)key)[i]; h *= 1099511628211ull; }
+    if (!h) h = 1;
+    uint32_t n = 0; int k = (int)(h % PF_SLOTS);
+    for (int t = 0; t < PF_SLOTS; t++, k = (k + 1) % PF_SLOTS) {
+        if (g_pf[k].h == h || !g_pf[k].h) { g_pf[k].h = h; n = ++g_pf[k].n; break; }
+    }
+    if (!n) n = 1;   // 表满：当新配方打（宁可多打，不漏）
+    g_pf_total++;
+    if (n & (n - 1)) return;   // 不是 2 的幂：不打
+    char b[1024]; int o = 0;
+    const uint8_t *id = pg ? pg->identity : NULL;
+    o += snprintf(b + o, sizeof b - (size_t)o, "%s管线建不出（这个配方第 %u 次、本局第 %u 次，配方 %016llx）：%s｜程序 ", compute ? "计算" : "图形", n, g_pf_total, (unsigned long long)h, why && *why ? why : "?");
+    if (id) for (int i = 0; i < 8; i++) o += snprintf(b + o, sizeof b - (size_t)o, "%02x", id[i]); else o += snprintf(b + o, sizeof b - (size_t)o, "?");
+    static const char *const sn[6] = {"顶点", "片元", "几何", "细分控制", "细分求值", "计算"};
+    for (int st = 0; st < 6; st++) {
+        if (compute != (st == 5) || !(rp_S.skey_ok >> st & 1)) continue;
+        o += snprintf(b + o, sizeof b - (size_t)o, " %s键 ", sn[st]);
+        for (int i = 0; i < 8; i++) o += snprintf(b + o, sizeof b - (size_t)o, "%02x", rp_S.skey[st][i]);
+    }
+    if (!compute) {
+        const nvn_gpu_pipe_desc *d = key;
+        uint32_t nattr = 0, nstream = 0, blend = 0;
+        for (int i = 0; i < 16; i++) { if (d->attr[i].fmt) nattr++; if (d->stream[i].stride || d->stream[i].divisor) nstream++; }
+        for (int i = 0; i < 8; i++) if (d->color.blend_en >> i & 1) blend |= 1u << i;
+        o += snprintf(b + o, sizeof b - (size_t)o, "｜配方：图元 %u、颜色格式", (unsigned)d->prim);
+        for (int i = 0; i < 8; i++) if (d->cfmt[i]) o += snprintf(b + o, sizeof b - (size_t)o, " %d:%#x", i, (unsigned)d->cfmt[i]);
+        o += snprintf(b + o, sizeof b - (size_t)o, "、深度 %#x 模板 %#x、采样 %u、属性 %u 个 / 流 %u 条、混合开的槽 %#x、逻辑运算 %u、剔除 %u 正面 %u 填充 %u、光栅丢弃 %u、深度夹取 %u、原点左下 %u",
+                      (unsigned)d->dfmt, (unsigned)d->sfmt, (unsigned)d->samples, nattr, nstream, blend, (unsigned)d->color.logic_op,
+                      (unsigned)d->poly.cull, (unsigned)d->poly.front, (unsigned)d->poly.mode, (unsigned)d->rast_discard, (unsigned)d->depth_clamp, (unsigned)d->origin_ll);
+    }
+    (void)o;
+    nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", b);
+}
 // OP_DRAW / OP_DRAW_IDX 共用。di 非空 = 带索引
 // 分时：一笔绘制里各步各花多久（累计到 rp_perf，上屏那边每 5 秒报一次）
 static uint64_t dt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -1606,7 +1646,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                 for (int i = 0; i < 16; i++)
                     if (pd.attr[i].fmt && pd.attr[i].stream < 16 && pd.stream[pd.attr[i].stream].divisor > 1) { name = "vertex_divisor_gt1"; break; }
             }
-            if (nvn_unimpl("gpu", name, rec) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why);
+            nvn_unimpl("gpu", name, rec);
+            pipe_fail_log(0, g_prog, &pd, sizeof pd, err.why);   // 每笔照旧重试（失败多是偶发）；红行按配方首次全量、之后限频
             g_skips++; g_pipe = NULL; goto draw_done;
         }
         g_pipe = np; g_pipe_cmd = c;
@@ -1898,7 +1939,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     uint64_t key = (uint64_t)(uintptr_t)pg; nvn_gpu_pipe cp = nvn_hm_get(&g_cpipes, &key);
     if (!cp) {
         nvn_gpu_stage_desc cs; memset(&cs, 0, sizeof cs); cs.sh = pg->sh[0]; nvn_gpu_err err = {0};
-        if (!nvn_gpu_ok(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cp, &err)) || !cp) { if (nvn_unimpl("gpu", "compute_pipeline", rec) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why); g_skips++; goto done; }
+        if (!nvn_gpu_ok(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cp, &err)) || !cp) { nvn_unimpl("gpu", "compute_pipeline", rec); pipe_fail_log(1, pg, &cs, sizeof cs, err.why); g_skips++; goto done; }
         nvn_hm_put(&g_cpipes, &key, cp);
     }
     struct timespec tsd; clock_gettime(CLOCK_MONOTONIC, &tsd); uint64_t b0 = (uint64_t)tsd.tv_sec * 1000000000ull + (uint64_t)tsd.tv_nsec;
@@ -1930,7 +1971,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { memset(g_pf, 0, sizeof g_pf); g_pf_total = 0; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_cgr_narrow = -1; g_compute_published = 0; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
