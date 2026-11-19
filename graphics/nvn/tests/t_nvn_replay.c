@@ -4658,7 +4658,10 @@ static void t_res_scale(void) {
             CHECK(0);
         }
     }
-    rp_rs_configure(NULL); pass_fresh();
+    rp_rs_configure("3"); pass_fresh(); CHECK(rp_rs_setting() == 1);      // 不在 0.5 / 0.75 / 1 / 1.5 / 2 里：报红按 1
+    rp_rs_configure("2x"); pass_fresh(); CHECK(rp_rs_setting() == 1);     // 带尾巴的也不认
+    rp_rs_configure("0.75"); pass_fresh(); CHECK(rp_rs_setting() == 0.75f);
+    rp_rs_configure(NULL); pass_fresh(); CHECK(rp_rs_setting() == 1);
 }
 
 extern int rp_split_draws;
