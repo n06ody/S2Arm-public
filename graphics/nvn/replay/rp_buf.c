@@ -186,8 +186,8 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
-        if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else { nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a); rp_draw_note_mirror_write(m->buf, a, stop - a); }
+        if (direct) { memcpy(direct + a, s->mem + a, (size_t)(stop - a)); nvn_gpu_inbound_diag_host_write(); }
+        else { nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a); if (rp_draw_note_mirror_write(m->buf, a, stop - a)) nvn_gpu_inbound_mirror_tracked(xc); }
         a = stop;
     }
 }

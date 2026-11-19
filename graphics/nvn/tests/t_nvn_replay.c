@@ -421,6 +421,14 @@ static int g_ndisp_now(void);
 static struct { uint32_t bits; int ndisp; } g_bar[8]; static int g_nbar;   // 每次屏障：交了哪些位、当时已派发几次
 void nvn_gpu_barrier(nvn_gpu_cmd c, uint32_t bits) { (void)c; g_barrier_bits |= bits; g_barrier_at = g_npd; if (g_nbar < 8) { g_bar[g_nbar].bits = bits; g_bar[g_nbar].ndisp = g_ndisp_now(); } g_nbar++; }
 static int g_compute_read_barriers;
+void nvn_gpu_inbound_draw_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_draw_reason(nvn_gpu_cmd c, uint32_t reasons) { (void)c; (void)reasons; }
+void nvn_gpu_inbound_dispatch_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_mirror_tracked(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_pre_finish(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_game_barrier(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_precedes_main(nvn_gpu_cmd c) { (void)c; }
+void nvn_gpu_inbound_diag_host_write(void) {}
 void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd c, uint32_t readers, uint32_t writers) { (void)c; CHECK(!g_pass_open); CHECK(readers && !(readers & ~NVN_GPU_GFX_SRC_ALL)); CHECK(writers && !(writers & ~NVN_GPU_GFX_SRC_ALL)); }
 void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers) { (void)c; CHECK(!g_pass_open); CHECK(producers && !(producers & ~NVN_GPU_GFX_SRC_ALL)); CHECK(consumers && !(consumers & ~NVN_GPU_CGR_ALL)); }
 void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers) { (void)c; CHECK(!g_pass_open); CHECK(consumers && !(consumers & ~NVN_GPU_CGR_ALL)); }

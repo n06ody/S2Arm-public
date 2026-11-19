@@ -20,6 +20,7 @@ cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
 khronos_validation.validate_sync = true
 khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
+export S2A_INBOUND_NARROW=0
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 failed=0
 for dq in 0 1; do

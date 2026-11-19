@@ -491,6 +491,19 @@ enum { NVN_GPU_GFX_SRC_VS = 1u << 0, NVN_GPU_GFX_SRC_FS = 1u << 1, NVN_GPU_GFX_S
 void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers);
 // Shader reads must complete before later storage writes; execution dependency only.
 void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd c, uint32_t readers, uint32_t writers);
+// Replay calls these only after it has recorded complete access metadata for the preceding operation.
+enum { NVN_GPU_INBOUND_VERTEX = 1u << 0, NVN_GPU_INBOUND_INDEX = 1u << 1,
+       NVN_GPU_INBOUND_INDIRECT = 1u << 2, NVN_GPU_INBOUND_MULTI_WRITE = 1u << 3,
+       NVN_GPU_INBOUND_UNKNOWN = 1u << 4 };
+void nvn_gpu_inbound_draw_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_draw_reason(nvn_gpu_cmd c, uint32_t reasons);
+void nvn_gpu_inbound_dispatch_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_mirror_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_pre_finish(nvn_gpu_cmd c);
+// 仅诊断：标明真实游戏屏障、晚录的前置段和宿主镜像写；不改变同步。
+void nvn_gpu_inbound_diag_game_barrier(nvn_gpu_cmd c);
+void nvn_gpu_inbound_diag_precedes_main(nvn_gpu_cmd c);
+void nvn_gpu_inbound_diag_host_write(void);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈

@@ -116,6 +116,12 @@ int main(int argc,char **argv){
  GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));
  REQUIRE(ndispatch==(unsigned)!no_compute+(unsigned)renew);REQUIRE(ndraw==1u+(unsigned)disjoint+2u*(unsigned)multi+(unsigned)renew);
  unsigned before=dispatch_compute_bar[0],after=draw_compute_bar[ndraw-1];
+ if(getenv("S2A_CGR_INBOUND_CHECK")){
+  unsigned want=disable_compute_access?1u:0u;
+  printf("CGR_INBOUND full_before=%u full_draw=%u omitted=%u\n",dispatch_full_bar[0],draw_full_bar[0],omitted_full);
+  REQUIRE(draw_full_bar[0]==dispatch_full_bar[0]+want);
+  if(getenv("S2A_CGR_OMIT_FULL"))REQUIRE(omitted_full==1);
+ }
  if(transfer){REQUIRE(transfer_seen==1);REQUIRE(omit_transfer_graphics?transfer_barriers_mutated>=1:transfer_barriers_mutated==0);REQUIRE(after==before);}
  else if((rw||unknown) && !disable_compute_access){
   printf("CGR_WRITE dq=%d before=%u draw=%u omitted=%u\n",dq_mode,dispatch_full_bar[0],draw_full_bar[0],omitted_full);fflush(stdout);

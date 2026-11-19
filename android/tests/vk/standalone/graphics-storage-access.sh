@@ -8,7 +8,7 @@ out="$repo/build/vk-graphics-storage";mkdir -p "$out/shaders"
 python3 "$repo/android/tests/vk/syncval_capability.py" "$S2A_VK_LAYER_DIR/VkLayer_khronos_validation.json"
 headers="$repo/build/c883-ndk"
 [ -f "$headers/vulkan/vulkan_core.h" ] || { echo '【红】缺真实 NDK 29 Vulkan 头；先由宿主出料' >&2; exit 2; }
-for shader in compute_read_args.comp compute_read_readonly.comp compute_read_payload.comp compute_read_index.comp compute_read_image.comp compute_read_vertex.vert compute_read_buffer.vert compute_read_buffer.frag compute_multi_fragment.frag cgr_graphics_write.frag inbound_storage_write.vert inbound_storage_read.vert inbound_storage_write2.vert inbound_storage_write2.frag inbound_black.frag inbound_varying.frag compute_read_texel.frag compute_read_image.frag solid_green.frag; do
+for shader in compute_read_args.comp compute_read_readonly.comp compute_read_payload.comp compute_read_index.comp compute_read_image.comp compute_read_vertex.vert compute_read_buffer.vert compute_read_buffer.frag compute_multi_fragment.frag cgr_graphics_write.frag inbound_storage_write.vert inbound_storage_read.vert inbound_storage_write2.vert inbound_storage_write2.frag inbound_storage_write_bind1.frag inbound_black.frag inbound_varying.frag compute_read_texel.frag compute_read_image.frag solid_green.frag; do
     glslc --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
 glslc --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/fullscreen.vert.spv"
@@ -25,6 +25,7 @@ SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 export S2A_CGR_REMOVE_INCOMING=1
 failed=0
+modes="0 1 2 3 4 5 6 7 8 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26"
 for xseg in 0 1;do
  if [ "$xseg" = 1 ]; then export S2A_GFX_XSEG=1; else unset S2A_GFX_XSEG; fi
  for dq in 0 1;do
@@ -34,19 +35,25 @@ for xseg in 0 1;do
   for dest in VS FS;do
    export S2A_GFX_ACCESS_DEST=$dest
    if [ "$dest" = VS ];then stage=VERTEX;else stage=FRAGMENT;fi
-   for mode in 0 1 2 3 4 5 6 7 8;do
+   for mode in $modes;do
+    if [ "$xseg" = 1 ] && { [ "$mode" = 14 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; };then continue;fi
+    if [ "$mode" = 16 ] && [ "$source" != VS ];then continue;fi
+    if [ "$mode" -ge 22 ] && { [ "$source" != VS ] || [ "$dest" != VS ]; };then continue;fi
     export S2A_GFX_ACCESS_MODE=$mode
-    if [ "$mode" = 4 ] || [ "$mode" = 5 ] || [ "$mode" = 6 ]; then export S2A_GFX_NARROW=1; else export S2A_GFX_NARROW=0; fi
-    if [ "$mode" = 7 ]; then unset S2A_CGR_REMOVE_INCOMING; else export S2A_CGR_REMOVE_INCOMING=1; fi
+    if [ "$mode" = 4 ] || [ "$mode" = 5 ] || [ "$mode" = 6 ] || [ "$mode" = 14 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; then export S2A_GFX_NARROW=1; else export S2A_GFX_NARROW=0; fi
+    if [ "$mode" -ge 17 ];then export S2A_INBOUND_DIAG=1;else unset S2A_INBOUND_DIAG;fi
+    if [ "$mode" = 12 ] || [ "$mode" = 13 ] || [ "$mode" = 14 ] || [ "$mode" = 16 ] || { [ "$mode" -ge 17 ] && [ "$mode" != 20 ]; }; then export S2A_INBOUND_FINAL=1 S2A_INBOUND_NARROW=1; unset S2A_CGR_REMOVE_INCOMING S2A_FORCE_NARROW_INCOMING;
+    elif [ "$mode" = 15 ] || [ "$mode" = 20 ]; then export S2A_INBOUND_FINAL=1 S2A_INBOUND_NARROW=0; unset S2A_CGR_REMOVE_INCOMING S2A_FORCE_NARROW_INCOMING;
+    else unset S2A_INBOUND_FINAL S2A_FORCE_NARROW_INCOMING S2A_INBOUND_NARROW; if [ "$mode" = 7 ]; then unset S2A_CGR_REMOVE_INCOMING; else export S2A_CGR_REMOVE_INCOMING=1; fi; fi
     log="$out/xseg${xseg}-dq${dq}-${source}-${dest}-${mode}.log";set +e
     timeout 120 "$out/resources" "$out/shaders" "$source" "$dest" > "$log" 2>&1;rc=$?;set -e
     raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$log" || true)
     other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
     marker=$(grep '^GFX_STORAGE ' "$log" || true)
     printf 'xseg=%s dq=%s src=%s dst=%s mode=%s rc=%s RAW=%s other=%s %s\n' "$xseg" "$dq" "$source" "$dest" "$mode" "$rc" "$raw" "$other" "$marker"
-    if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { { [ "$mode" = 1 ] || [ "$mode" = 4 ] || [ "$mode" = 7 ]; } && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$raw" -lt 1 ]; };then
+    if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { { [ "$mode" = 1 ] || [ "$mode" = 4 ] || [ "$mode" = 7 ] || [ "$mode" = 12 ] || [ "$mode" = 14 ] || [ "$mode" = 15 ] || [ "$mode" = 16 ] || [ "$mode" -ge 17 ]; } && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$mode" != 12 ] && [ "$mode" != 14 ] && [ "$mode" != 15 ] && [ "$mode" != 16 ] && [ "$mode" -lt 17 ] && [ "$raw" -lt 1 ]; };then
      echo 'graphics storage detection control failed';tail -15 "$log";failed=1
-    elif [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && ! { grep -q "Shader stage VK_SHADER_STAGE_${stage}_BIT reads" "$log" || grep -q "VK_ACCESS_2_SHADER_STORAGE_READ_BIT accesses at VK_PIPELINE_STAGE_2_${stage}_SHADER_BIT" "$log"; };then
+    elif [ "$mode" != 1 ] && [ "$mode" != 4 ] && [ "$mode" != 7 ] && [ "$mode" != 12 ] && [ "$mode" != 14 ] && [ "$mode" != 15 ] && [ "$mode" != 16 ] && [ "$mode" -lt 17 ] && ! { grep -q "Shader stage VK_SHADER_STAGE_${stage}_BIT reads" "$log" || grep -q "VK_ACCESS_2_SHADER_STORAGE_READ_BIT accesses at VK_PIPELINE_STAGE_2_${stage}_SHADER_BIT" "$log"; };then
      echo 'graphics storage target stage not detected';failed=1
     fi
    done
