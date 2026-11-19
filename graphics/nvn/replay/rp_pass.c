@@ -484,7 +484,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     P.rs = 1;
     {   // 渲染倍率：一个通道的全部附件同一倍率；有任何一张不可缩（含影子附件）整组按 1× 开（同 iOS rs_rts / Ryujinx TextureManager），
         // 已缩过的那几张随之降回 1×。换存储是传输：这里通道已收、还没取视图。倍率 1 时整段不进。
-        const float s = rp_rs_setting();
+        const float s = rp_rs_setting ? rp_rs_setting() : 1;   // 只链 rp_pass.c 的隔离用例没有 rp_res.c：倍率 1
         if (s != 1) {
             int ok = 1, n = 0;
             for (int i = 0; i < P.rt.n && i < 8; i++) {
@@ -539,7 +539,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         P.na_w = d.w; P.na_h = d.h;
     }
     if (!d.w && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &d.w, &d.h);   // 只有深度的通道（阴影图、深度预通道）：尺寸取深度目标的
-    if (P.rs != 1) {   // 渲染倍率：帧缓冲取各附件存储尺寸（该级）的最小值
+    if (P.rs != 1 && rp_rs_level) {   // 渲染倍率：帧缓冲取各附件存储尺寸（该级）的最小值
         uint32_t mw = UINT32_MAX, mh = UINT32_MAX, w, h;
         for (int i = 0; i < P.rt.n && i < 8; i++) if (d.color[i].view) { rp_rs_level(P.rt.color[i], P.rt.has_cview[i] && P.rt.cview[i].set_levels ? P.rt.cview[i].base_level : 0, &w, &h); if (w < mw) mw = w; if (h < mh) mh = h; }
         if (P.rt.depth) { rp_rs_level(P.rt.depth, P.rt.has_dview && P.rt.dview.set_levels ? P.rt.dview.base_level : 0, &w, &h); if (w < mw) mw = w; if (h < mh) mh = h; }
@@ -551,7 +551,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     if (P.rt.depth) {
         nvn_fmt_info fi; int ok = nvn_fmt_info_of((uint32_t)P.rt.depth->d.format, &fi);
         view_t av;
-        rp_rs_safe(1, 0);   // 深度附件：按通道倍率挂（同颜色附件的 rp_view_for_attach）
+        if (rp_rs_safe) rp_rs_safe(1, 0);   // 深度附件：按通道倍率挂（同颜色附件的 rp_view_for_attach）
         nvn_gpu_view v = rp_view_for(P.rt.depth, att_view(P.rt.depth, P.rt.has_dview, &P.rt.dview, &av), c);
         if (!v) { memset(g_shu, 0, sizeof g_shu); rp_view_pin_end(); return 0; }
         if (!ok || fi.depth) { d.depth.view = v; d.depth.store = NVN_GPU_STORE_STORE; d.depth.load = pcd ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD; if (pcd) d.clear_depth = g_pk[pdpk].dv; }
