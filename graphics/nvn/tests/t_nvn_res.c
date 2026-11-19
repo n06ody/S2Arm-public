@@ -381,6 +381,15 @@ static void t_res_tex_window_gpu_child(int tail) {
     uint8_t decoded[512]; CHECK(!nvn_deswizzle(&a.d, 0, 0, g_window_raw, decoded, 64));
     CHECK(!memcmp(decoded, expected, sizeof decoded)); CHECK(!memcmp(decoded, cpu, sizeof decoded));
     CHECK(g_prot_addr == pool.mem + (tail ? pg - 256 : 0) && g_prot_len == (tail ? 256 : 511));
+    /* 诊断开：快照取与上传同一份窗口源（池外为 0），跟踪 / 保护只罩池内窗口；快照内容不变 / 变各验一档 */
+    res_fresh(); a.serial++; g_block_uploads = 0; g_flag_tdiag = 1; g_tdiag_n = 0; g_block_mem = pool.mem;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 1 && strstr(g_tdiag_lines[0], "kind=first state=initial") && strstr(g_tdiag_lines[0], "raw_bytes=512"));
+    const size_t dirty_pg = tail ? pg / PG - 1 : 0;   // 窗口覆盖的跟踪页（夹具页粒度 PG，系统页可以更大）
+    g_dirty_written = g_dirty_now + 1; g_dirty_now += 2; g_block_gen[dirty_pg] = g_dirty_written;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 2 && strstr(g_tdiag_lines[1], "state=same"));
+    pool.mem[tail ? pg - 1 : 0] ^= 0xff; g_dirty_written = g_dirty_now + 1; g_dirty_now += 2; g_block_gen[dirty_pg] = g_dirty_written;
+    CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && g_tdiag_n == 3 && strstr(g_tdiag_lines[2], "state=changed"));
+    g_flag_tdiag = 0; g_block_mem = NULL;
     nvn_be_tex_release(&a); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); munmap(m, 3 * pg);
     printf("GPU_WINDOW %s: CPU/GPU-contract bytes=512 failures=%d\n", tail ? "tail" : "before", g_fail - fail0); fflush(stdout);
     _exit(g_fail != fail0);
