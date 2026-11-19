@@ -5,6 +5,7 @@ repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 out="$repo/build/vk-cgr-narrow";mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}"
 : "${S2A_VK_LAYER_DIR:?validation required}"
+python3 "$repo/android/tests/vk/syncval_capability.py" "$S2A_VK_LAYER_DIR/VkLayer_khronos_validation.json"
 headers="$repo/build/c883-ndk"
 [ -f "$headers/vulkan/vulkan_core.h" ] || { echo '【红】缺真实 NDK 29 Vulkan 头；先由宿主出料' >&2; exit 2; }
 for shader in compute_read_args.comp compute_read_readonly.comp compute_read_payload.comp compute_read_index.comp compute_read_image.comp compute_read_vertex.vert compute_read_buffer.vert compute_read_buffer.frag compute_multi_fragment.frag cgr_graphics_write.frag compute_read_texel.frag compute_read_image.frag solid_green.frag; do
