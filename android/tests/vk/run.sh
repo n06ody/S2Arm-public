@@ -349,9 +349,26 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
+    --trace-feedback|--trace-feedback-neg) cflags+=(-DS2A_PIPE_FEEDBACK_TEST=1) ;;
     ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
+if [ "$mode" = --trace-feedback-neg ]; then
+    python3 - "${src[1]}" "$out" <<'PYTRACE'
+import pathlib, sys
+source, out = map(pathlib.Path, sys.argv[1:])
+inc = (source.parent / 'backend_vulkan_clear.inc').read_text()
+old = 'diag_graphics_create(&gp, &pipe, 3)'
+assert inc.count(old) == 1
+mutant = out / 'trace-feedback-mutant.inc'
+mutant.write_text(inc.replace(old, 'vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &pipe)'))
+backend = source.read_text()
+anchor = '#include "backend_vulkan_clear.inc"'
+assert backend.count(anchor) == 1
+(out / 'trace-feedback-mutant.c').write_text(backend.replace(anchor, '#include "' + str(mutant) + '"'))
+PYTRACE
+    src[1]="$out/trace-feedback-mutant.c"
+fi
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
 if [ "$mode" = --clear-capacity-neg ]; then
     python3 - "${src[1]}" "$out" <<'PYCLEAR'
@@ -624,6 +641,26 @@ if [ -z "$mode" ]; then
     fi
 fi
 
+
+if [[ "$mode" == --trace-feedback* ]]; then
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --trace-feedback 2>&1 | tee "$out/trace-feedback.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/trace-feedback.log" || true)
+    if [ "$mode" = --trace-feedback-neg ]; then
+        [ "$rc" -ne 0 ] && [ "$bad" -eq 0 ] && grep -q 'trace clear pipeline must report each actual create' "$out/trace-feedback.log" || exit 1
+        echo 'PASS: withdrawing clear trace fails at its event assertion'; exit 0
+    fi
+    [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] && grep -q 'TRACE_PIPELINE enabled=1' "$out/trace-feedback.log" || exit 1
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --trace-feedback-off 2>&1 | tee "$out/trace-feedback-off.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/trace-feedback-off.log" || true)
+    [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] && grep -q 'TRACE_PIPELINE enabled=0' "$out/trace-feedback-off.log" || exit 1
+    exit 0
+fi
 
 if [[ "$mode" == --clear-capacity* ]]; then
     failed=0

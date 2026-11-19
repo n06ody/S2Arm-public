@@ -584,6 +584,11 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
                              (unsigned long long)row, (unsigned long long)img, (unsigned long long)o->row_stride, (unsigned long long)o->image_stride, bw, bh, bpb);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", b);
     }
+    // 弱链接[replay]：s2a_direct_diag_upload_begin
+    extern uint64_t s2a_direct_diag_upload_begin(unsigned, unsigned) __attribute__((weak));
+    // 弱链接[replay]：s2a_direct_diag_upload_end
+    extern void s2a_direct_diag_upload_end(uint64_t, int, unsigned, uint64_t) __attribute__((weak));
+    uint64_t trace = s2a_direct_diag_upload_begin && s2a_direct_diag_upload_end ? s2a_direct_diag_upload_begin(4, 0) : 0;
     for (uint32_t z = 0; z < nz; z++) {
         NVNcopyRegion r = o->r; r.depth = 1;
         // 第几层 / 第几片都经 layer 交给后端（三维贴图的 layer 就是深度方向的片号；视图的起始层只对分层贴图有意义）
@@ -591,6 +596,7 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         r.zoffset = 0;
         nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
     }
+    if (trace && s2a_direct_diag_upload_end) s2a_direct_diag_upload_end(trace, 1, 1, img * nz);
     rp_tex_mark_gpu_written(t);   // 这张贴图的内容从此不再从它自己的存储重传
 }
 

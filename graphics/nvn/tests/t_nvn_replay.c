@@ -41,6 +41,19 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_tex_diag_on, g_tex_diag_begins, g_tex_diag_ends;
+static unsigned g_tex_diag_kind, g_tex_diag_reason, g_tex_diag_method;
+static uint64_t g_tex_diag_bytes;
+int s2a_direct_diag_enabled(void) { return g_tex_diag_on; }
+uint64_t s2a_direct_diag_upload_begin(unsigned kind, unsigned reason) {
+    if (!g_tex_diag_on) return 0;
+    g_tex_diag_begins++; g_tex_diag_kind = kind; g_tex_diag_reason = reason; return (uint64_t)g_tex_diag_begins;
+}
+void s2a_direct_diag_upload_end(uint64_t token, int success, unsigned method, uint64_t bytes) {
+    if (!token) return;
+    g_tex_diag_ends++; g_tex_diag_method = method; g_tex_diag_bytes = bytes; (void)success;
+}
+
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
@@ -191,7 +204,11 @@ void nvn_dirty_mp_stats(uint64_t *c, uint64_t *g, uint64_t *n) { *c = 0; *g = 0;
 void nvn_dirty_span_stats(uint64_t *h, uint64_t *s, uint64_t *n) { *h = 0; *s = 0; *n = 0; }
 void nvn_dirty_slot_stats(int *live, int *used, uint64_t *adds) { *live = 0; *used = 0; *adds = 0; }
 uint64_t nvn_dirty_now(void) { return g_dirty_now; }
-int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { (void)addr; (void)len; return g_dirty_written > stamp; }
+int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
+    // Diagnostic fixture's texture pool has no span: real tracking treats it dirty.
+    if (g_tex_diag_on) { (void)addr; (void)len; return 1; }
+    (void)addr; (void)len; return g_dirty_written > stamp;
+}
 
 // 缓冲替身：记每次按 GPU 顺序的写（偏移、长度、首 8 字节）
 struct nvn_gpu_buf_s { uint64_t bytes, access_id; uint8_t *cpu; };
@@ -1531,20 +1548,26 @@ static void t_cpu_upload(void) {   // 存储里是 CPU 写的数据：首次使�
     uint8_t lin0[8 * 8 * 4], lin1[4 * 4 * 4]; for (unsigned i = 0; i < sizeof lin0; i++) lin0[i] = (uint8_t)(i * 7 + 1); for (unsigned i = 0; i < sizeof lin1; i++) lin1[i] = (uint8_t)(200 - i);
     CHECK(nvn_swizzle(&t.d, 0, 0, lin0, 32, t.mem) == 0 && nvn_swizzle(&t.d, 1, 0, lin1, 16, t.mem) == 0);
     int c0 = g_tex_creates, r0 = g_tex_releases, p0 = g_protects; uint64_t u0 = rp_res_uploads();
+    g_tex_diag_on = 1; g_tex_diag_begins = g_tex_diag_ends = 0;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+    CHECK(g_tex_diag_begins == 1 && g_tex_diag_ends == 1 && g_tex_diag_kind == 2 && (g_tex_diag_reason & 1) && g_tex_diag_method == 1 && g_tex_diag_bytes == 320);
     CHECK(g_tex_creates - c0 == 1 && (g_last_usage & NVN_GPU_TEX_CPU_UPLOAD));
     CHECK(rp_res_uploads() - u0 == 1 && g_nup == 2 && g_protects - p0 == 1 && g_up[0].pre == 1);   // 上传是传输：录进前置段
     CHECK(g_up[0].level == 0 && g_up[0].pitch == 32 && g_up[0].img == 256 && g_up[0].w == 8 && g_up[0].h == 8 && !memcmp(g_up[0].first, lin0, 64));
     CHECK(g_up[1].level == 1 && g_up[1].pitch == 16 && g_up[1].img == 64 && g_up[1].w == 4 && !memcmp(g_up[1].first, lin1, 64));
-    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 1);   // 没脏：不重传
+    g_tex_diag_on = 0;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 1);   // 原有非诊断夹具：没脏不重传
+    g_tex_diag_on = 1;
     g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 2);   // 游戏写过：重传
+    CHECK(g_tex_diag_begins == 2 && g_tex_diag_ends == 2 && g_tex_diag_kind == 3 && (g_tex_diag_reason & 4) && (g_tex_diag_reason & 16) && g_tex_diag_method == 1 && g_tex_diag_bytes == 320);
     CHECK(nvn_be_tex_gpu_owned(5) == 0);
     rp_tex_mark_gpu_written(&t); g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 2);   // 内容已归 GPU：不再从游戏内存传
     CHECK(nvn_be_tex_gpu_owned(5) == 1);
     nvn_be_tex_cpu_written(&t);                                                     // 游戏又 WriteTexels 了
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 3 && nvn_be_tex_gpu_owned(5) == 0);
+    g_tex_diag_on = 0;
     nvn_be_tex_release(&t);
     CHECK(g_tex_releases - r0 == 1 && rp_res_tex_built() == 0);                     // CPU 内容贴图不进共用表：对象 Finalize 即放
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
@@ -2108,7 +2131,10 @@ static void t_copy_b2t(void) {   // 缓冲 → 贴图：线性行直接传；级
     o = put(&a, OP_COPY_B2T, sizeof *o + sizeof t); snap = (tex_t *)(o + 1); *snap = t;
     o->src = (uint64_t)(uintptr_t)g_pmem + 16; o->tex = snap; o->r = (NVNcopyRegion){0, 0, 0, 4, 2, 1}; o->row_stride = 32;
     end(&a);
+    g_tex_diag_on = 1; g_tex_diag_begins = g_tex_diag_ends = 0;
     nvn_be_sub_begin(); nvn_be_exec(a.b);
+    CHECK(g_tex_diag_begins == 3 && g_tex_diag_ends == 3 && g_tex_diag_kind == 4 && g_tex_diag_bytes == 64);
+    g_tex_diag_on = 0;
     CHECK(g_nup == 5 && nvn_unimpl_count("op", "OP_COPY_B2T") == 0);   // 头 3 次是新建存储的清零（三级各一次），后 2 次是两条拷贝
     CHECK(g_up[0].level == 0 && g_up[0].img == 16 * 16 * 4 && g_up[1].level == 1 && g_up[2].level == 2 && g_up[2].img == 4 * 4 * 4 && g_up[0].first[0] == 0);
     CHECK(g_up[3].level == 2 && g_up[3].layer == 0 && g_up[3].w == 2 && g_up[3].h == 2 && g_up[3].pitch == 8 && g_up[3].img == 16 && g_up[3].first[0] == 1);

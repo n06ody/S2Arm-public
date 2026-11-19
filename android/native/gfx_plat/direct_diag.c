@@ -26,9 +26,9 @@
 #ifndef S2A_DIRECT_DIAG_INTERVAL_NS
 #define S2A_DIRECT_DIAG_INTERVAL_NS 5000000000ull
 #endif
-#define DIAG_CAP 4096u
+#define DIAG_CAP 16384u
 struct diag_record {
-    uint64_t seq, token, mono_ns, boot_us;
+    uint64_t seq, token, mono_ns, boot_us, bytes;
     uint32_t kind, stages;
     int submit, warm, success;
     uint8_t identity[32];
@@ -97,6 +97,47 @@ void s2a_direct_diag_compile_end(uint64_t token, int success) {
     if (r) { r->token = token; r->success = !!success; }
     pthread_mutex_unlock(&mu);
 }
+uint64_t s2a_direct_diag_pipe_begin(unsigned kind, int warm) {
+    if (!s2a_direct_diag_enabled() || (kind < 1 || kind > 8)) return 0;
+    pthread_mutex_lock(&mu);
+    struct diag_record *r = reserve_locked(4);
+    uint64_t token = 0;
+    if (r && token_seq != UINT64_MAX) {
+        token = ++token_seq; r->token = token; r->stages = kind; r->warm = !!warm;
+    } else if (r) { count--; drops++; }
+    pthread_mutex_unlock(&mu); return token;
+}
+void s2a_direct_diag_pipe_end(uint64_t token, int success, unsigned feedback) {
+    if (!token || !s2a_direct_diag_enabled()) return;
+    pthread_mutex_lock(&mu);
+    struct diag_record *r = reserve_locked(5);
+    if (r) { r->token = token; r->success = !!success; r->stages = feedback <= 2 ? feedback : 0; }
+    pthread_mutex_unlock(&mu);
+}
+void s2a_direct_diag_pack(const uint8_t id[32], unsigned reason, int warm) {
+    if (!s2a_direct_diag_enabled() || !id || reason < 1 || reason > 11) return;
+    pthread_mutex_lock(&mu);
+    struct diag_record *r = reserve_locked(6);
+    if (r) { memcpy(r->identity, id, 32); r->stages = reason; r->warm = !!warm; }
+    pthread_mutex_unlock(&mu);
+}
+uint64_t s2a_direct_diag_upload_begin(unsigned kind, unsigned reason) {
+    if (!s2a_direct_diag_enabled() || kind < 1 || kind > 6 || reason > 31) return 0;
+    pthread_mutex_lock(&mu);
+    struct diag_record *r = reserve_locked(7);
+    uint64_t token = 0;
+    if (r && token_seq != UINT64_MAX) {
+        token = ++token_seq; r->token = token; r->stages = kind; r->warm = (int)reason;
+    } else if (r) { count--; drops++; }
+    pthread_mutex_unlock(&mu); return token;
+}
+void s2a_direct_diag_upload_end(uint64_t token, int success, unsigned method, uint64_t bytes) {
+    if (!token || !s2a_direct_diag_enabled()) return;
+    pthread_mutex_lock(&mu);
+    struct diag_record *r = reserve_locked(8);
+    if (r) { r->token = token; r->success = !!success; r->stages = method <= 2 ? method : 0; r->bytes = bytes; }
+    pthread_mutex_unlock(&mu);
+}
 static int line(FILE *f, s2a_sha256 *hash, const char *s) {
     size_t n = strlen(s); if (fwrite(s, 1, n, f) != n) return -1;
     s2a_sha256_update(hash, s, n); return 0;
@@ -110,7 +151,7 @@ static int flush_segment(struct diag_record *batch, unsigned n, uint64_t start, 
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600); if (fd < 0) return -1;
     FILE *f = fdopen(fd, "w"); if (!f) { close(fd); unlink(tmp); return -1; }
     s2a_sha256 hash; s2a_sha256_init(&hash); char buf[512]; int bad = 0;
-    snprintf(buf, sizeof buf, "{\"schema\":\"s2a-direct-trace-v1\",\"clock\":\"%s\",\"pid\":%ld,\"session\":%llu,\"uuid\":\"%s\",\"segment\":%llu,\"start_us\":%llu,\"end_us\":%llu,\"dropped\":%llu,\"count\":%u}\n",
+    snprintf(buf, sizeof buf, "{\"schema\":\"s2a-direct-trace-v2\",\"clock\":\"%s\",\"pid\":%ld,\"session\":%llu,\"uuid\":\"%s\",\"segment\":%llu,\"start_us\":%llu,\"end_us\":%llu,\"dropped\":%llu,\"count\":%u}\n",
 #if defined(CLOCK_BOOTTIME)
              "CLOCK_BOOTTIME",
 #else
@@ -124,7 +165,15 @@ static int flush_segment(struct diag_record *batch, unsigned n, uint64_t start, 
         else if (r->kind == 2) {
             char hex[65]; s2a_sha256_hex(r->identity, hex);
             snprintf(buf, sizeof buf, "{\"type\":\"compile_begin\",\"seq\":%llu,\"token\":%llu,\"identity\":\"%s\",\"stages\":%u,\"submit\":%d,\"warm_hit\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, hex, r->stages, r->submit, r->warm, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
-        } else snprintf(buf, sizeof buf, "{\"type\":\"compile_end\",\"seq\":%llu,\"token\":%llu,\"success\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->success, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        } else if (r->kind == 3) snprintf(buf, sizeof buf, "{\"type\":\"compile_end\",\"seq\":%llu,\"token\":%llu,\"success\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->success, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        else if (r->kind == 4) snprintf(buf, sizeof buf, "{\"type\":\"pipeline_begin\",\"seq\":%llu,\"token\":%llu,\"kind\":%u,\"warm\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->stages, r->warm, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        else if (r->kind == 5) snprintf(buf, sizeof buf, "{\"type\":\"pipeline_end\",\"seq\":%llu,\"token\":%llu,\"success\":%d,\"feedback\":%u,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->success, r->stages, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        else if (r->kind == 6) {
+            char hex[65]; s2a_sha256_hex(r->identity, hex);
+            snprintf(buf, sizeof buf, "{\"type\":\"pack_lookup\",\"seq\":%llu,\"identity\":\"%s\",\"reason\":%u,\"warm\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, hex, r->stages, r->warm, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        }
+        else if (r->kind == 7) snprintf(buf, sizeof buf, "{\"type\":\"upload_begin\",\"seq\":%llu,\"token\":%llu,\"kind\":%u,\"reason\":%d,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->stages, r->warm, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
+        else snprintf(buf, sizeof buf, "{\"type\":\"upload_end\",\"seq\":%llu,\"token\":%llu,\"success\":%d,\"method\":%u,\"bytes\":%llu,\"mono_ns\":%llu,\"boot_us\":%llu}\n", (unsigned long long)r->seq, (unsigned long long)r->token, r->success, r->stages, (unsigned long long)r->bytes, (unsigned long long)r->mono_ns, (unsigned long long)r->boot_us);
         if (line(f, &hash, buf)) bad = 1;
     }
     uint8_t digest[32]; char hex[65]; s2a_sha256_final(&hash, digest); s2a_sha256_hex(digest, hex);

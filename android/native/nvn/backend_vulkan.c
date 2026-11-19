@@ -3297,7 +3297,27 @@ static pthread_mutex_t g_create_mu = PTHREAD_MUTEX_INITIALIZER;
 static int pipe_serial_on(void) { return nvn_plat_flag("nvk_pipe_serial", 0) != 0; }
 // 预热（W3）：t_warm_scope = 本线程的创建算「预建」（预热线程设 1，见 nvk_pipe_warm_build）。
 // 预建对象打 warm 位；真实 draw 第一次命中它时计 warm 命中。计数都是进程累计，nvn_gpu_stats 报。
+// Diagnostics are weak to keep backend-only host fixtures linkable.
+uint64_t s2a_direct_diag_pipe_begin(unsigned kind, int warm) __attribute__((weak));
+void s2a_direct_diag_pipe_end(uint64_t token, int success, unsigned feedback) __attribute__((weak));
 static _Thread_local int t_warm_scope;
+static unsigned pipe_feedback_class(const VkPipelineCreationFeedbackEXT *feedback) {
+    if (!(feedback->flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT)) return 0;
+    return (feedback->flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT_EXT) ? 2 : 1;
+}
+// All graphics utility pipelines are distinguished from guest pipelines.
+static VkResult diag_graphics_create(VkGraphicsPipelineCreateInfo *ci, VkPipeline *out, unsigned kind) {
+    uint64_t token = s2a_direct_diag_pipe_begin ? s2a_direct_diag_pipe_begin(kind, t_warm_scope) : 0;
+    VkPipelineCreationFeedbackEXT feedback = {0};
+    VkPipelineCreationFeedbackCreateInfoEXT info = {0};
+    if (token && g.dev->pipeline_creation_feedback_enabled) {
+        info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT;
+        info.pNext = ci->pNext; info.pPipelineCreationFeedback = &feedback; ci->pNext = &info;
+    }
+    VkResult result = vkCreateGraphicsPipelines(g.d, g_plc, 1, ci, NULL, out);
+    if (token && s2a_direct_diag_pipe_end) s2a_direct_diag_pipe_end(token, result == VK_SUCCESS, pipe_feedback_class(&feedback));
+    return result;
+}
 static uint64_t g_warm_hits, g_warm_created, g_pipe_dup;
 // 在途表读数（见 pipe_inflight）：同配方需求合并等待的次数 / 表满（或停用）自己直接建的次数 /
 // 认领后复检命中的次数（省掉一次重复建）。
@@ -3819,7 +3839,8 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     gp.renderPass = p->pass;
     gp.subpass = 0;
     const uint64_t pl_t0 = now_ns();   // 驱动编译管线是同步的：超过 3 毫秒就打一行（走路/进新场景时会集中出现）
-    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe) != VK_SUCCESS) {
+    VkResult diag_result = diag_graphics_create(&gp, &p->pipe, 1);
+    if (diag_result != VK_SUCCESS) {
         nvn_gpu_rc bad = fail(err, NVN_GPU_E_COMPILE, "vkCreateGraphicsPipelines 失败");
         destroy_pipe_objects(p);
         return bad;
@@ -3974,7 +3995,9 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     if (role == 2) {
         void *got = NULL;
         char gwhy[NVK_PF_WHY];
+        uint64_t wait_trace = s2a_direct_diag_pipe_begin ? s2a_direct_diag_pipe_begin(7, t_warm_scope) : 0;
         const int code = nvk_pf_wait(&g_pi, handle, &got, gwhy, sizeof gwhy);
+        if (wait_trace && s2a_direct_diag_pipe_end) s2a_direct_diag_pipe_end(wait_trace, code == 0, 0);
         if (code) {
             if (err) { err->rc = rc(code); memcpy(err->why, gwhy, sizeof err->why); }
             return rc(code);
@@ -4121,7 +4144,17 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
     cp.stage.pName = sh->entry;
     cp.layout = p->layout;
     const uint64_t pc_t0 = now_ns();   // 同图形管线：超过 3 毫秒打一行，用来对长帧
-    if (vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &p->pipe) != VK_SUCCESS) {
+    uint64_t diag_token = s2a_direct_diag_pipe_begin ? s2a_direct_diag_pipe_begin(2, t_warm_scope) : 0;
+    VkPipelineCreationFeedbackEXT diag_feedback = {0};
+    VkPipelineCreationFeedbackCreateInfoEXT diag_info = {0};
+    if (diag_token && g.dev->pipeline_creation_feedback_enabled) {
+        diag_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO_EXT;
+        diag_info.pPipelineCreationFeedback = &diag_feedback;
+        cp.pNext = &diag_info;
+    }
+    VkResult diag_result = vkCreateComputePipelines(g.d, g_plc, 1, &cp, NULL, &p->pipe);
+    if (diag_token && s2a_direct_diag_pipe_end) s2a_direct_diag_pipe_end(diag_token, diag_result == VK_SUCCESS, pipe_feedback_class(&diag_feedback));
+    if (diag_result != VK_SUCCESS) {
         destroy_pipe_objects(p);
         return fail(err, NVN_GPU_E_COMPILE, "vkCreateComputePipelines 失败");
     }
@@ -4185,7 +4218,9 @@ nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pip
     int handle = -1, role = nvk_pf_enter(&g_cpi, &cs->sh, cpi_eq, &handle);
     if (role == 2) {
         void *got = NULL; char why[NVK_PF_WHY];
+        uint64_t wait_trace = s2a_direct_diag_pipe_begin ? s2a_direct_diag_pipe_begin(8, t_warm_scope) : 0;
         int code = nvk_pf_wait(&g_cpi, handle, &got, why, sizeof why);
+        if (wait_trace && s2a_direct_diag_pipe_end) s2a_direct_diag_pipe_end(wait_trace, code == 0, 0);
         if (code) { if (err) { err->rc = rc(code); memcpy(err->why, why, sizeof err->why); } return rc(code); }
         if (got) { pthread_mutex_lock(&g_mu); pipe_hit_note_locked(got); pthread_mutex_unlock(&g_mu); }
         *out = got; return rc(NVN_GPU_OK);
