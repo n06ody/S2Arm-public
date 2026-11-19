@@ -30,19 +30,24 @@ for dq in 0 1;do
  for stage in VS FS;do
   export S2A_INBOUND_STAGE=$stage
   if [ "$stage" = VS ]; then shader_name=VERTEX; else shader_name=FRAGMENT; fi
-  for mode in 0 1 2 3 4;do
+  for mode in 0 1 2 3 4 5 6 7 8 9 10 11 12;do
+   if [ "$stage" = FS ] && { [ "$mode" = 11 ] || [ "$mode" = 12 ]; }; then continue; fi
    export S2A_INBOUND_INJECT=$mode
+   if [ "$mode" = 5 ] || [ "$mode" = 6 ] || [ "$mode" = 7 ] || [ "$mode" = 9 ] || [ "$mode" = 11 ] || [ "$mode" = 12 ]; then export S2A_MIRROR_NARROW=1; else export S2A_MIRROR_NARROW=0; fi
+   if [ "$mode" = 8 ]; then unset S2A_CGR_REMOVE_INCOMING; else export S2A_CGR_REMOVE_INCOMING=1; fi
    log="$out/dq${dq}-${stage}-inject${mode}.log";set +e
    timeout 120 "$out/resources" "$out/shaders" "$stage" > "$log" 2>&1;rc=$?;set -e
    raw=$(grep -c 'SYNC-HAZARD-READ-AFTER-WRITE' "$log" || true)
    other=$(grep -E 'Validation Error|VUID-' "$log" | grep -vc 'SYNC-HAZARD-READ-AFTER-WRITE' || true)
    marker=$(grep '^INBOUND_TRANSFER ' "$log" || true)
    printf 'dq=%s stage=%s mode=%s rc=%s RAW=%s other=%s %s\n' "$dq" "$stage" "$mode" "$rc" "$raw" "$other" "$marker"
-   if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { [ "$mode" = 1 ] && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$raw" -lt 1 ]; };then
+   if [ "$rc" != 0 ] || [ "$other" != 0 ] || [ -z "$marker" ] || { { [ "$mode" = 1 ] || [ "$mode" = 5 ] || [ "$mode" = 8 ] || [ "$mode" = 9 ] || [ "$mode" = 11 ]; } && [ "$raw" != 0 ]; } || { [ "$mode" != 1 ] && [ "$mode" != 5 ] && [ "$mode" != 8 ] && [ "$mode" != 9 ] && [ "$mode" != 11 ] && [ "$raw" -lt 1 ]; };then
     echo '【红】主段重同步的检测对照不成立';tail -15 "$log";failed=1
-   elif [ "$mode" = 3 ] && ! grep -q "Shader stage VK_SHADER_STAGE_${shader_name}_BIT reads" "$log";then
+   elif { [ "$mode" = 3 ] || [ "$mode" = 6 ]; } && ! grep -q "Shader stage VK_SHADER_STAGE_${shader_name}_BIT reads" "$log";then
     echo '【红】漏着色器阶段未命中该消费者';failed=1
-   elif [ "$mode" = 4 ] && ! grep -q 'vkCmdDrawIndirect reads indirect' "$log";then
+   elif [ "$mode" = 12 ] && ! grep -q "Shader stage VK_SHADER_STAGE_FRAGMENT_BIT reads" "$log";then
+    echo "missing second fragment consumer not detected";failed=1
+   elif { [ "$mode" = 4 ] || [ "$mode" = 7 ]; } && ! grep -q 'vkCmdDrawIndirect reads indirect' "$log";then
     echo '【红】漏间接阶段未命中间接参数';failed=1
    fi
   done

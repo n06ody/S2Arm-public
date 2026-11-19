@@ -11,6 +11,7 @@ static unsigned checks, failures;
 static id<MTLComputePipelineState> add_pipeline;
 static id<MTLRenderPipelineState> color_pipeline;
 static __typeof__(&nvn_gpu_compute_to_graphics) publish_compute;
+static __typeof__(&nvn_gpu_transfer_to_graphics) publish_transfer;
 
 // Resolve the actual production exports: a missing contract entry must fail an
 // assertion at runtime, not stop at a link error. Types and names come from the
@@ -21,10 +22,12 @@ static void contract_entries(void) {
     __typeof__(&nvn_gpu_buf_access_span) buf_span=LOAD(nvn_gpu_buf_access_span);
     __typeof__(&nvn_gpu_view_access_span) view_span=LOAD(nvn_gpu_view_access_span);
     publish_compute=LOAD(nvn_gpu_compute_to_graphics);
+    publish_transfer=LOAD(nvn_gpu_transfer_to_graphics);
 #undef LOAD
     CHECK(buf_span!=NULL,"Metal exports nvn_gpu_buf_access_span");
     CHECK(view_span!=NULL,"Metal exports nvn_gpu_view_access_span");
     CHECK(publish_compute!=NULL,"Metal exports nvn_gpu_compute_to_graphics");
+    CHECK(publish_transfer!=NULL,"Metal exports nvn_gpu_transfer_to_graphics");
     // The legacy Metal replay cannot construct these opaque contract handles.
     // Unknown is 0, never a fabricated identity/success; clear stale output.
     nvn_gpu_access_span span; unsigned char zero[sizeof span]={0};
@@ -52,6 +55,7 @@ static void color(id<MTLTexture> target,id<MTLBuffer> data) {
     // must leave its existing encoder barriers in charge, without a submit/wait.
     id cb=g_cb, blit=g_blit; uint64_t fence=g_fence, full=g_bar_full;
     if(publish_compute) publish_compute(NULL, NVN_GPU_CGR_ALL);
+    if(publish_transfer) publish_transfer(NULL, NVN_GPU_CGR_ALL);
     CHECK(g_cb==cb && g_blit==blit && g_fence==fence && g_bar_full==full,"contract hook does not cut or submit the Metal command stream");
     MTL4RenderPassDescriptor *d=pass_desc();
     d.colorAttachments[0].texture=target;

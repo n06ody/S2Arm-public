@@ -484,6 +484,8 @@ enum {
     NVN_GPU_CGR_ALL = (1u << 9) - 1,
 };
 void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
+// 通道外：此前镜像缓冲传输写对指定图形读可见；其他消费者不受此发布影响。
+void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈
