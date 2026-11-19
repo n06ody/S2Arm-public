@@ -106,7 +106,7 @@ enum {
     NVN_GPU_CAP_DYN_RASTER        = 1u << 17,  // 剔除 / 正反面 / 多边形模式是动态状态（Metal 恒有 / Vulkan extended_dynamic_state(3)）
     NVN_GPU_CAP_BLIT_SCALED       = 1u << 18,  // 带缩放 / 格式转换的贴图拷贝原生（Metal 无，核心 copy_t2t_draw 用绘制做；vkCmdBlitImage）
     NVN_GPU_CAP_GPU_DESWIZZLE     = 1u << 19,  // 后端能在 GPU 上解 NVN 块线性排布（Metal 现有 nvn_deswizzle_gpu.h；定稿 #3）
-    NVN_GPU_CAP_BLIT_DEPTH_STENCIL = 1u << 20, // 同格式 D24S8/D32FS8、二维单采样、最近点缩放（含全部模板位）
+    NVN_GPU_CAP_BLIT_DEPTH_STENCIL = 1u << 20, // 同格式深度（模板）D24S8/D32FS8（含全部模板位）与只有深度的 D32F/D16、二维单采样、最近点缩放
     NVN_GPU_CAP_NO_ATTACH_PASS    = 1u << 21,  // 能开一个附件都不挂的渲染通道（NVN 不挂目标照样绘制：片元只写存储 / 只为遮挡计数）。尺寸由 pass_desc 的 w / h 给；
                                                //   Vulkan 核心 1.0 恒有（零附件子通道 + 带宽高的帧缓冲）；Metal 的 renderTargetWidth / Height 没接，不置位 → 核心照旧跳过并记账
     NVN_GPU_CAP_REPORT_TIMESTAMP  = 1u << 22,  // 逐报告位置的时间戳：已校准 CLOCK_MONOTONIC ns；首版仅 Vulkan，Metal 明确不置位
@@ -428,6 +428,12 @@ void nvn_gpu_dispatch(nvn_gpu_cmd c, nvn_gpu_pipe cp, uint32_t x, uint32_t y, ui
 
 // 拷贝与清除（全部在通道外，GPU 顺序）
 void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes);
+// 一批缓冲拷贝，结果给图形阶段当常量读（回放的间接绘制 base instance 批量拷）：通道外，GPU 顺序。
+//   先一道「此前全部写 → 传输」屏障，各段按（源, 目标）相邻合并成多区域拷贝，最后一道「传输写 → stages 里各阶段的常量读」屏障
+//   （stages 第 i 位 = nvn_gpu_stage i，只认 VS / FS / GS）。不发全屏障；目标段之间、目标与源之间互不重叠由调用方保证。
+//   线程：[提交]。出错：粘滞 ORDER（通道内）/ ARG（越界、长度不是 4 的倍数）。
+typedef struct { nvn_gpu_buf src; uint64_t soff; nvn_gpu_buf dst; uint64_t doff; uint64_t bytes; } nvn_gpu_buf_copy;
+void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages);
 // 32 位样式填充（NVN ClearBuffer）：bytes 是 4 的倍数，每 4 字节按小端写 value；不是按字节 memset（用例 C01 用 0x11223344 区分）。
 void nvn_gpu_fill_buf(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, uint64_t bytes, uint32_t value);
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
@@ -440,6 +446,9 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t 
 // 另一端为 offset+extent；后端先校验归一化矩形，再保留端点次序。目标仍为正尺寸。
 // 该约定不扩展多采样解析、深度模板复制及三维复制。
 void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear);   // 要 CAP_BLIT_SCALED
+// 只校验、不录：nvn_gpu_blit 对这一对视图 / 区域 / 滤镜会不会报错（格式对、采样数、用途、区域、深度模板辅助管线）。nvn_gpu_blit 先调它，判据同一份。
+// 核心在录之前问它，过不了就不录（不让一笔可选的拷贝把整段打成 sticky）。线程：[任意]。不检查 cmd 状态（通道内 / 已 sticky 由 nvn_gpu_blit 自己报）
+nvn_gpu_rc nvn_gpu_blit_check(nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear, nvn_gpu_err *err);
 void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t uint4[4], int is_int);
 // v4：通道内把当前通道的附件按矩形清成给定值（NVN 带裁剪或带写掩码的 ClearColor / ClearDepthStencil；整屏全掩码的清除由核心折成 load = CLEAR，不走这里）。
 // v5：带写掩码——color_mask 是要写的颜色通道（r=1 g=2 b=4 a=8），stencil_mask 是要写的模板位；没点到的通道 / 位保持原值。
@@ -468,9 +477,36 @@ typedef struct {
 } nvn_gpu_access_span;
 int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out);
 int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out);
-// 通道外：此前计算写入对后续间接参数 / 索引 / 顶点 / 图形着色器读取可见；不包含附件载入、计算或传输，不分段、不等待。
-// 由核心仅在图形实际读到计算写过的范围时调用；全体计算写对这些读阶段发布，所以核心可一起撤掉待发布表。
-void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c);
+// 通道外：此前所有计算写对 consumers 指定的图形读阶段和访问可见；不包含附件载入、计算或传输，不分段、不等待。
+// 核心按实际相交资源选择消费者；未发布的其他消费者须保留，新计算写不继承旧发布状态。ALL 保留原全图形读范围。
+enum {
+    NVN_GPU_CGR_INDIRECT = 1u << 0, NVN_GPU_CGR_INDEX = 1u << 1, NVN_GPU_CGR_VERTEX = 1u << 2,
+    NVN_GPU_CGR_VS_SHADER = 1u << 3, NVN_GPU_CGR_VS_UNIFORM = 1u << 4,
+    NVN_GPU_CGR_FS_SHADER = 1u << 5, NVN_GPU_CGR_FS_UNIFORM = 1u << 6,
+    NVN_GPU_CGR_GS_SHADER = 1u << 7, NVN_GPU_CGR_GS_UNIFORM = 1u << 8,
+    NVN_GPU_CGR_ALL = (1u << 9) - 1,
+};
+void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
+// 通道外：此前镜像缓冲传输写对指定图形读可见；其他消费者不受此发布影响。
+void nvn_gpu_transfer_to_graphics(nvn_gpu_cmd c, uint32_t consumers);
+// Earlier graphics shader storage writes become visible to the selected graphics readers.
+enum { NVN_GPU_GFX_SRC_VS = 1u << 0, NVN_GPU_GFX_SRC_FS = 1u << 1, NVN_GPU_GFX_SRC_GS = 1u << 2, NVN_GPU_GFX_SRC_ALL = 7 };
+void nvn_gpu_graphics_to_graphics(nvn_gpu_cmd c, uint32_t producers, uint32_t consumers);
+// Shader reads must complete before later storage writes; execution dependency only.
+void nvn_gpu_graphics_read_to_write(nvn_gpu_cmd c, uint32_t readers, uint32_t writers);
+// Replay calls these only after it has recorded complete access metadata for the preceding operation.
+enum { NVN_GPU_INBOUND_VERTEX = 1u << 0, NVN_GPU_INBOUND_INDEX = 1u << 1,
+       NVN_GPU_INBOUND_INDIRECT = 1u << 2, NVN_GPU_INBOUND_MULTI_WRITE = 1u << 3,
+       NVN_GPU_INBOUND_UNKNOWN = 1u << 4 };
+void nvn_gpu_inbound_draw_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_draw_reason(nvn_gpu_cmd c, uint32_t reasons);
+void nvn_gpu_inbound_dispatch_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_mirror_tracked(nvn_gpu_cmd c);
+void nvn_gpu_inbound_pre_finish(nvn_gpu_cmd c);
+// 仅诊断：标明真实游戏屏障、晚录的前置段和宿主镜像写；不改变同步。
+void nvn_gpu_inbound_diag_game_barrier(nvn_gpu_cmd c);
+void nvn_gpu_inbound_diag_precedes_main(nvn_gpu_cmd c);
+void nvn_gpu_inbound_diag_host_write(void);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈

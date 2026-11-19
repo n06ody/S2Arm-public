@@ -224,7 +224,7 @@ static VkPipeline clr_pipe_get(struct nvn_gpu_cmd_s *c, const struct clr_key *k)
     gp.pMultisampleState = &ms; gp.pDepthStencilState = &ds; gp.pColorBlendState = &cbs; gp.pDynamicState = &dyns;
     gp.layout = g_clr.layout; gp.renderPass = pass;
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &pipe) != VK_SUCCESS) { vkDestroyRenderPass(g.d, pass, NULL); return VK_NULL_HANDLE; }
+    if (diag_graphics_create(&gp, &pipe, 3) != VK_SUCCESS) { vkDestroyRenderPass(g.d, pass, NULL); return VK_NULL_HANDLE; }
     plc_created();
     if (g_clr.n < CLR_MAX) {
         g_clr.p[g_clr.n].k = *k; g_clr.p[g_clr.n].pipe = pipe; g_clr.p[g_clr.n].pass = pass; g_clr.n++;

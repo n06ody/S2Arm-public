@@ -39,6 +39,12 @@ def main():
         c = result['compiles'][0]
         assert c['identity'] == 'ab'*32 and c['stages'] == 7 and c['submit'] == 1 and c['warm_hit'] == 0 and c['success'] == 1 and c['duration_ns'] >= 100000000
         assert result['frames'][1]['gap_ns'] >= 100000000
+        pipeline = read_segments(scenario('pipeline', 'pipeline'))
+        assert len(pipeline['pipelines']) == 1 and not pipeline['pipeline_inflight']
+        event = pipeline['pipelines'][0]
+        assert event['kind'] == 1 and event['warm'] == 0 and event['success'] == 1 and event['feedback'] == 2
+        assert len(pipeline['pack_lookups']) == 1 and pipeline['pack_lookups'][0]['identity'] == 'cd'*32 and pipeline['pack_lookups'][0]['reason'] == 3
+        assert len(pipeline['uploads']) == 1 and pipeline['uploads'][0]['kind'] == 3 and pipeline['uploads'][0]['reason'] == 20 and pipeline['uploads'][0]['bytes'] == 320 and pipeline['uploads'][0]['method'] == 1
         lost = scenario('overflow', 'overflow')
         try: read_segments(lost)
         except ValueError as e: assert 'lost records' in str(e)

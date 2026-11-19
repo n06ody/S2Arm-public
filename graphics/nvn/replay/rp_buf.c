@@ -186,8 +186,8 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
-        if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        if (direct) { memcpy(direct + a, s->mem + a, (size_t)(stop - a)); nvn_gpu_inbound_diag_host_write(); }
+        else { nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a); if (rp_draw_note_mirror_write(m->buf, a, stop - a)) nvn_gpu_inbound_mirror_tracked(xc); }
         a = stop;
     }
 }
@@ -208,6 +208,21 @@ uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) 
     }
     pthread_mutex_unlock(&g_bmu);
     return id;
+}
+int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
+    const uint8_t *mem; uint64_t size;
+    if (!len || !rp_pool_find(addr, len, &mem, &size)) return -1;
+    const uint64_t off = addr - (uint64_t)(uintptr_t)mem, key = (uint64_t)(uintptr_t)mem;
+    int hit = 0;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &key);
+    if (s) {
+        for (int i = 0; i < s->ngw && !hit; i++) if (s->gw[i].off < off + len && off < s->gw[i].off + s->gw[i].len) hit = 1;
+        if (s->landing > s->nlr) hit = 1;   // 正在拷回的段多于记下的区间：说不清，按有算
+        for (int i = 0; i < s->nlr && !hit; i++) if (s->lr[i].off < off + len && off < s->lr[i].off + s->lr[i].len) hit = 1;
+    }
+    pthread_mutex_unlock(&g_bmu);
+    return hit;
 }
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
@@ -513,7 +528,7 @@ int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
 // 常量缓冲绑到这段时直接绑镜像（rp_draw.c）。不相交就返回 0，调用方照旧在 CPU 上做（绝大多数情况，零额外开销）。
 static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *rec) {
     if (!rp_post_gpu_write(d, n)) nvn_unimpl("buf", what, rec);   // 登记不上：结果留在镜像里、落不回游戏内存（记账，不静默）
-    rp_cpu_write_gen++; rp_write_note(d, n);   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用按它作废
+    rp_cpu_write_gen++; rp_write_note(d, n); rp_gpu_wr_gen++;   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用、base instance 批量表按它作废
     rp_perf_add(RP_PERF_BUF_GPU_ORDER_N, 1);
     return 1;
 }
@@ -584,6 +599,11 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
                              (unsigned long long)row, (unsigned long long)img, (unsigned long long)o->row_stride, (unsigned long long)o->image_stride, bw, bh, bpb);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", b);
     }
+    // 弱链接[replay]：s2a_direct_diag_upload_begin
+    extern uint64_t s2a_direct_diag_upload_begin(unsigned, unsigned) __attribute__((weak));
+    // 弱链接[replay]：s2a_direct_diag_upload_end
+    extern void s2a_direct_diag_upload_end(uint64_t, int, unsigned, uint64_t) __attribute__((weak));
+    uint64_t trace = s2a_direct_diag_upload_begin && s2a_direct_diag_upload_end ? s2a_direct_diag_upload_begin(4, 0) : 0;
     for (uint32_t z = 0; z < nz; z++) {
         NVNcopyRegion r = o->r; r.depth = 1;
         // 第几层 / 第几片都经 layer 交给后端（三维贴图的 layer 就是深度方向的片号；视图的起始层只对分层贴图有意义）
@@ -591,6 +611,7 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         r.zoffset = 0;
         nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
     }
+    if (trace && s2a_direct_diag_upload_end) s2a_direct_diag_upload_end(trace, 1, 1, img * nz);
     rp_tex_mark_gpu_written(t);   // 这张贴图的内容从此不再从它自己的存储重传
 }
 

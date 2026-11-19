@@ -35,13 +35,15 @@ void nvk_shader_last_test_put(uint64_t key, const struct rp_prog *prog);
 const struct rp_prog *nvk_shader_last_test_find(uint64_t key);
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
-static int trace_on, trace_begin_count, trace_end_count;
+static int trace_on, trace_begin_count, trace_end_count, trace_pack_count;
+static unsigned trace_pack_reason;
 static uint32_t trace_stage; static int trace_submit, trace_warm, trace_success; static uint8_t trace_id[32];
 int s2a_direct_diag_enabled(void) { return trace_on; }
 uint64_t s2a_direct_diag_compile_begin(const uint8_t identity[32], unsigned stages, int submit, int warm) {
     trace_begin_count++; memcpy(trace_id, identity, 32); trace_stage=stages; trace_submit=submit; trace_warm=warm; return 1;
 }
 void s2a_direct_diag_compile_end(uint64_t token, int success) { if (token) trace_end_count++; trace_success=success; }
+void s2a_direct_diag_pack(const uint8_t id[32], unsigned reason, int warm) { (void)id; (void)warm; if (trace_on) { trace_pack_count++; trace_pack_reason = reason; } }
 static unsigned fake_array_count;
 static int separate_fixture;
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
@@ -273,7 +275,10 @@ static void gs_request_test(void) {
     int rc = rp_shader_resolve(&q, &p);
     CHECK(rc == -1 && p == NULL, "GS compiler boundary deliberately fails closed");
     CHECK(compiler_calls == 1, "GS production request reaches compiler, not stages_0x7_not_vs_fs");
-    if (trace_on) CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 7 && trace_submit == 1 && trace_warm == 0 && trace_success == 0, "graphics live compile emits paired event including failure and stage");
+    if (trace_on) {
+        CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 7 && trace_submit == 1 && trace_warm == 0 && trace_success == 0, "graphics live compile emits paired event including failure and stage");
+        CHECK(trace_pack_count == 1 && trace_pack_reason == 2, "GS pack lookup reports unsupported stage");
+    }
     if (!compiler_calls) return;
     struct s2a_jv root = {captured, strlen(captured)}, program, stages, textures, v;
     char schema[48] = {0};
@@ -1059,19 +1064,63 @@ static void query_sampler_test(void) {
 }
 
 static int diag_compile_test(void) {
-    trace_on = 1; trace_begin_count = trace_end_count = 0; fake_gs_success = 0;
+    const char *root = getenv("S2A_TEST_PACK_ROOT");
+    if (!root || setenv("S2A_SHADER_REVISION_ROOT", root, 1)) { fprintf(stderr, "FAIL: synthetic package root unavailable\n"); return 1; }
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    trace_on = 1; trace_begin_count = trace_end_count = trace_pack_count = 0; fake_gs_success = 0;
     gs_request_test();
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset(); source(); bind_pools(7);
-    trace_begin_count = trace_end_count = 0; fake_cs_success = 1;
+    trace_begin_count = trace_end_count = trace_pack_count = 0; fake_cs_success = 1;
     const struct rp_prog *p = NULL; CHECK(!rp_shader_resolve_compute(&p) && p, "compute diagnostic fixture compiles");
     uint8_t zero[32] = {0};
     CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 32 && trace_submit == 1 && trace_warm == 0 && trace_success == 1 && memcmp(trace_id, zero, 32),
           "compute live compile emits paired event with identity and stage");
+    CHECK(trace_pack_count == 1 && trace_pack_reason == 6, "compute pack lookup reports absent container");
+    unsetenv("S2A_SHADER_REVISION_ROOT");
     trace_on = 0; rp_shader_reset();
     printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
 }
 
+// 实际解析与 LibPack 夹具：逐进程隔离已发布程序和不可用表。
+static int libpack_alignment_test(const char *mode) {
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    if (!strcmp(mode, "live-absent")) unsetenv("S2A_SHADER_REVISION_ROOT");
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    source(); bind_pools(7); compiler_calls = cs_loads = shader_load_count = 0;
+    if (!strncmp(mode, "live-", 5)) {
+        fake_cs_success = 1;
+        rp_S.ssbo[5][2].addr = !strcmp(mode, "live-aligned") ? 0x70000 : 0x70001;
+        rp_S.ssbo[5][2].size = 16;
+        const struct rp_prog *p = NULL;
+        int rc = rp_shader_resolve_compute(&p);
+        CHECK(rc == 0 && p && cs_loads == 1, "live compute resolves with one shader load");
+        int want_compile = strcmp(mode, "live-aligned") != 0;
+        CHECK(compiler_calls == want_compile && p && p->nent[0] == (want_compile ? 0 : 1),
+              "live alignment must select the correct source: %s compiler=%d bindings=%d", mode, compiler_calls, p ? p->nent[0] : -1);
+    } else {
+        struct nvk_prog_rec rec = {0};
+        memset(rec.identity, 0x47, sizeof rec.identity);
+        int graphics = !strncmp(mode, "graphics-", 9);
+        int allowed = strstr(mode, "allowed") && !strstr(mode, "disallowed");
+        rec.stage_mask = graphics ? 3 : 32; rec.lp_ok = allowed ? 2 : 0;
+        if (graphics) {
+            const uint8_t vs[8] = {1,0x23,0x45,0x67,0x89,0xab,0xcd,0xef};
+            const uint8_t fs[8] = {0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe};
+            memcpy(rec.keys[0], vs, 8); memcpy(rec.keys[1], fs, 8); fake_gs_success = 1;
+        } else { memcpy(rec.keys[0], rp_S.skey[5], 8); fake_cs_success = 1; }
+        int rc = nvk_prog_warm_build(&rec); const struct rp_prog *p = NULL;
+        int borrowed = rp_shader_prog_borrow(rec.identity, &p);
+        CHECK((allowed ? rc == 0 && borrowed == 1 && p : rc == -1 && borrowed == 0 && !p),
+              "warm alignment must honor lp_ok: %s rc=%d borrowed=%d", mode, rc, borrowed);
+        CHECK(compiler_calls == 0, "warm does not compile");
+        if (borrowed == 1) rp_shader_prog_return(rec.identity);
+    }
+    printf("%s: checks=%d failures=%d compiler=%d cs_loads=%d graphics_loads=%d\n", mode, checks, failures, compiler_calls, cs_loads, shader_load_count);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--libpack-alignment")) return libpack_alignment_test(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();

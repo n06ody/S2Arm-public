@@ -53,6 +53,8 @@ def main():
         base.append('-D_GNU_SOURCE')
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
+    pack_root = out/'synthetic-pack-root'; pack_root.mkdir(exist_ok=True)
+    os.environ['S2A_TEST_PACK_ROOT'] = str(pack_root.resolve())
 
     def run(name, source, extra_libs=None, args=(), env=None):
         exe = out/name
@@ -103,6 +105,18 @@ def main():
             assert result.returncode and expected in result.stderr and 'error:' not in result.stderr, (result.stdout, result.stderr)
             print(f'PASS: {name} event removal produces expected behavior failure')
         return 0
+
+    if sys.argv[1:] == ['--pack-controls']:
+        baseline = out/'pack-baseline.c'
+        baseline.write_text(subprocess.check_output(['git', 'show', 'HEAD:android/native/gfx_plat/nvk_shader.c'], cwd=ROOT, text=True))
+        old = run('pack-baseline', baseline, args=('--diag-compile',))
+        if old.returncode == 0 or 'GS pack lookup reports unsupported stage' not in old.stderr:
+            print(old.stdout + old.stderr, file=sys.stderr)
+            raise SystemExit('FAIL: baseline did not fail at coverage assertion')
+        print('PASS: baseline fails at GS pack lookup reports unsupported stage')
+        current = run('pack-current', original, args=('--diag-compile',))
+        sys.stdout.write(current.stdout); sys.stderr.write(current.stderr)
+        return current.returncode
 
     if sys.argv[1:] == ['--diag-compile']:
         result = run('diag-compile', original, args=('--diag-compile',))

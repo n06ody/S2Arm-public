@@ -59,7 +59,7 @@ if { [ "$mode" = "--tbuf-compiler-core" ] || [ -z "$mode" ]; } && [ -z "${S2A_VU
      [ ! -f "$repo/build/tbuf-real-red/profile.json" ] || [ ! -f "$tbuf_cli" ]; }; then
     python3 "$repo/android/tests/tbuf_compiler_chain_test.py"
 fi
-if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || standalone_mode || [ "$mode" = "--compute-read-core" ] || [[ "$mode" == --feedback-read* ]] || [ "$mode" = "--compute-workgroup" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
+if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || standalone_mode || [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--compute-read-multi" ] || [[ "$mode" == --barrier-* ]] || [[ "$mode" == --feedback-read* ]] || [ "$mode" = "--compute-workgroup" ] || [[ "$mode" == --pool-table* ]] || [ -z "$mode" ] || [[ "$mode" == --tbuf-* ]]; } && [ -z "${S2A_VULKAN_IMAGE_ID:-}" ]; then
     . "$repo/android/tools/ndk_toolchain.sh"
     ndk=$(s2a_ndk_resolve) || { echo 'NDK 29 missing' >&2; exit 2; }
     grep -q '^Pkg.Revision = 29\.0\.14206865$' "$ndk/source.properties" || { echo 'NDK 29.0.14206865 required' >&2; exit 2; }
@@ -72,9 +72,14 @@ if { [ "$mode" = "--shown-only" ] || [ "$mode" = "--descriptor-indexing" ] || st
 fi
 # Isolated production replay indirect test. Exit before every legacy test path.
 # --zero-attr-core（#977）：同一套真 rp_draw + 真后端，跑零属性用例 t_replay_zero_attr.c。
-if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
-    if [ "$mode" = "--indirect-core" ]; then
-        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp)
+if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ] || [ "$mode" = "--pipe-fail-core" ]; then
+    core_wrap=(-Wl,--wrap=nvn_gpu_draw)
+    if [ "$mode" = "--pipe-fail-core" ]; then
+        # 建管线失败的处理：包三个驱动入口注入失败（失败却留非空句柄 / 合规失败），核句柄不销毁不绑定、红行内容与限频
+        core_test=t_replay_pipe_fail; core_shaders=(replay_front_face.vert solid_green.frag count_args.comp)
+        core_wrap+=(-Wl,--wrap=vkCreateGraphicsPipelines -Wl,--wrap=vkCreateComputePipelines -Wl,--wrap=vkDestroyPipeline -Wl,--wrap=vkCmdBindPipeline -Wl,--wrap=vkGetDeviceProcAddr)
+    elif [ "$mode" = "--indirect-core" ]; then
+        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp replay_binst.vert replay_binst.frag replay_binst_args.comp)
     else
         core_test=t_replay_zero_attr; core_shaders=(zattr.vert quad.frag)
     fi
@@ -86,10 +91,11 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
         "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
     done
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/depth_state.vert.spv"
-    inc=(); for d in android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
+    inc=(); for d in android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/tex graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
     src=("$repo/android/tests/vk/$core_test.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
-    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
+    src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
+    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections "${core_wrap[@]}" -lvulkan -lpthread -lm -o "$out/$core_test"
     export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     set +e
     "$out/$core_test" "$out/shaders" 2>&1 | tee "$out/run.log"
@@ -101,7 +107,8 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     fi
     exit 0
 fi
-if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
+if { [ "$mode" = "--compute-read-core" ] || [ "$mode" = "--compute-read-multi" ]; } && [ "$(uname -s)" = Linux ]; then
+    if [ "$mode" = "--compute-read-multi" ]; then exec bash "$repo/android/tests/vk/run_compute_read.sh" --multi-only; fi
     exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
 if [ "$(uname -s)" = Darwin ]; then
@@ -208,6 +215,9 @@ export S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer"
 if [ "$mode" = --feedback-read-mask-repro ]; then   # 独立夹具 feedback-read 的诊断变体（带参数，不在默认档）
     exec bash "$repo/android/tests/vk/standalone/feedback-read.sh" --mask-repro
 fi
+if [ "$mode" = --external-dependency-red ]; then
+    exec bash "$repo/android/tests/vk/standalone/external-dependency.sh" red
+fi
 if standalone_mode; then
     exec bash "$repo/android/tests/vk/standalone/${mode#--}.sh"
 fi
@@ -276,7 +286,11 @@ inc=(-I "$repo/android/tests/vkhost"
 #   --dispatch-barrier-neg  检测器负控：测试钩子关掉后端派发前那道屏障、也不发游戏屏障，同步校验必须报写后读冒险；
 #   --xfer-dispatch         不发游戏屏障的四臂（none / resync / xseg / dd）：同步校验 0 条、读回 i*6，派发前后端自己补了屏障、连续派发之间 0 道。
 # 原始日志不回显、只报条数（容器会把日志里的校验报错当成失败），留在 build/978-tests/。
-if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] || [ "$mode" = "--xfer-dispatch" ]; then
+if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] || [ "$mode" = "--barrier-narrow" ] || [ "$mode" = "--barrier-narrow-off" ] || [ "$mode" = "--barrier-narrow-stage-neg" ] || [ "$mode" = "--barrier-chain" ] || [ "$mode" = "--barrier-chain-neg" ] || [ "$mode" = "--barrier-chain-off" ] || [ "$mode" = "--xfer-dispatch" ]; then
+    if [ "$mode" = "--barrier-narrow" ] || [ "$mode" = "--barrier-narrow-off" ] || [ "$mode" = "--barrier-narrow-stage-neg" ] || [ "$mode" = "--barrier-chain" ] || [ "$mode" = "--barrier-chain-neg" ] || [ "$mode" = "--barrier-chain-off" ]; then
+        [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 Vulkan headers not staged' >&2; exit 2; }
+        inc=(-I "$repo/build/c883-ndk" "${inc[@]}")
+    fi
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/bar_double.comp" -o "$out/shaders/bar_double.comp.spv"
     src=("$repo/android/tests/vk/t_replay_dispatch_barrier.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
@@ -308,7 +322,11 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
         before=$(printf '%s\n' "$line" | sed -n 's/.*barriers_before_dispatch=\([0-9]*\).*/\1/p'); between=$(printf '%s\n' "$line" | sed -n 's/.*barriers_between_dispatches=\([0-9]*\).*/\1/p')
         grep -q '^device: llvmpipe' "$out/db-$tag.log" || { echo "  【红】臂 $tag 不是 lavapipe 设备" >&2; db_red=1; return; }
         if [ "$other" -ne 0 ] || [ -z "$line" ]; then echo "  【红】臂 ${tag}：其余报错或没跑完" >&2; db_red=1; return; fi
-        if [ "$want" = hit ]; then [ "$raw" -ge 1 ] || { echo "  【红】臂 ${tag}：负控未击中（同步校验没报写后读 / 写后写冒险）" >&2; db_red=1; }; return; fi
+        if [ "$want" = hit ]; then
+            [ "$rc" -eq 0 ] && [ "$raw" -ge 1 ] || { echo "  【红】臂 ${tag}：负控未完成或未击中（同步校验没报写后读 / 写后写冒险）" >&2; db_red=1; }
+            if [ -n "$cond" ] && ! awk -v before="${before:-x}" -v between="${between:-x}" "BEGIN{exit !($cond)}"; then echo "  【红】臂 ${tag}：屏障数不符（要 ${cond}）" >&2; db_red=1; fi
+            return
+        fi
         if [ "$rc" -ne 0 ] || [ "$raw" -ne 0 ]; then echo "  【红】臂 ${tag}：读回或同步校验不对" >&2; db_red=1; return; fi
         if [ -n "$cond" ] && ! awk -v before="${before:-x}" -v between="${between:-x}" "BEGIN{exit !($cond)}"; then echo "  【红】臂 ${tag}：屏障数不符（要 ${cond}）" >&2; db_red=1; fi
     }
@@ -316,6 +334,12 @@ if [ "$mode" = "--dispatch-barrier" ] || [ "$mode" = "--dispatch-barrier-neg" ] 
     case "$mode" in
         --dispatch-barrier) db_arm barrier 0 ;;
         --dispatch-barrier-neg) db_arm none-nobar hit 'before == 0' ;;
+        --barrier-narrow) db_arm narrow 0 'before == 1' ;;
+        --barrier-narrow-off) db_arm narrow-off 0 'before == 1' ;;
+        --barrier-narrow-stage-neg) db_arm wrong-stage hit 'before == 1' ;;
+        --barrier-chain) db_arm chain 0 'before == 1'; db_arm chain-diag 0 'before == 1'; db_arm chain-clean 0 'before == 1'; db_arm chain-clean-diag 0 'before == 1' ;;
+        --barrier-chain-neg) db_arm chain-neg hit 'before == 1'; db_arm chain-diag-neg hit 'before == 1'; db_arm chain-clean-neg hit 'before == 1'; db_arm chain-clean-diag-neg hit 'before == 1' ;;
+        --barrier-chain-off) db_arm chain-off 0 'before == 1' ;;
         --xfer-dispatch) db_arm none 0 'before == 1'; db_arm resync 0 'before >= 2'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'
                          db_log_off=1; db_arm none 0 'before == 1'; db_arm xseg 0 'before == 1'; db_arm dd 0 'before == 1 && between == 0'; db_log_off= ;;   # 关那一档：受跟踪的三臂走逐页路径再跑一遍
     esac
@@ -338,6 +362,8 @@ src=("$repo/android/tests/vk/t_backend_vk.c"
      "$repo/android/native/nvn/nvn_vk_driver_cache.c"
      "$repo/android/native/direct/sha256.c"
      "$repo/graphics/nvn/replay/nvn_unimpl.c")
+inc+=(-I "$repo/graphics/nvn/gfx/tex")
+src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
 bc_src=("$repo/android/tests/vk/t_bc_decode.c"
      "$repo/android/native/nvn/nvn_vk_bcdec.c"
      "$repo/android/native/direct/vk_device.c"
@@ -345,14 +371,53 @@ bc_src=("$repo/android/tests/vk/t_bc_decode.c"
      "$repo/graphics/nvn/gfx/tex/nvn_bcdec.c")
 # 与发行 APK 同一组建设备规则（android/CMakeLists.txt 的 nvn_vk 后端定义此宏）。
 cflags=(-D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
+if [[ "$mode" == --gpu-deswizzle* ]]; then cflags+=(-DS2A_GPU_DESWIZZLE_TEST=1); fi
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    --trace-feedback|--trace-feedback-neg) cflags+=(-DS2A_PIPE_FEEDBACK_TEST=1) ;;
+    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
+if [ "$mode" = --trace-feedback-neg ]; then
+    python3 - "${src[1]}" "$out" <<'PYTRACE'
+import pathlib, sys
+source, out = map(pathlib.Path, sys.argv[1:])
+inc = (source.parent / 'backend_vulkan_clear.inc').read_text()
+old = 'diag_graphics_create(&gp, &pipe, 3)'
+assert inc.count(old) == 1
+mutant = out / 'trace-feedback-mutant.inc'
+mutant.write_text(inc.replace(old, 'vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &pipe)'))
+backend = source.read_text()
+anchor = '#include "backend_vulkan_clear.inc"'
+assert backend.count(anchor) == 1
+(out / 'trace-feedback-mutant.c').write_text(backend.replace(anchor, '#include "' + str(mutant) + '"'))
+PYTRACE
+    src[1]="$out/trace-feedback-mutant.c"
+fi
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
+if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
+    python3 - "$mode" "$repo" "$out" <<'PYGPU'
+import pathlib, sys
+mode, repo, out = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+backend = (repo / 'android/native/nvn/backend_vulkan.c').read_text()
+inc = (repo / 'android/native/nvn/backend_vulkan_deswizzle.inc').read_text()
+changes = {
+    '--gpu-deswizzle-neg-height': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, (h ? h - 1 : h), d, gobs, (uint32_t)nvn_gob_switch2'),
+    '--gpu-deswizzle-neg-stride': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, h, d, (gobs > 1 ? gobs - 1 : gobs), (uint32_t)nvn_gob_switch2'),
+    '--gpu-deswizzle-neg-barrier': ('vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);', '(void)barrier;'),
+}
+before, after = changes[mode]
+assert inc.count(before) == 1
+variant = out / 'deswizzle-mutant.inc'; variant.write_text(inc.replace(before, after))
+a = '#include "backend_vulkan_deswizzle.inc"'; assert backend.count(a) == 1
+backend = backend.replace(a, '#include "' + str(variant) + '"')
+backend = backend.replace('#include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"', '#include "' + str(repo/'graphics/nvn/gfx/tex/nvn_deswizzle.h') + '"')
+(out/'deswizzle-mutant.c').write_text(backend)
+PYGPU
+    src[1]="$out/deswizzle-mutant.c"
+fi
 if [ "$mode" = --clear-capacity-neg ]; then
     python3 - "${src[1]}" "$out" <<'PYCLEAR'
 import pathlib, sys
@@ -625,6 +690,26 @@ if [ -z "$mode" ]; then
 fi
 
 
+if [[ "$mode" == --trace-feedback* ]]; then
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --trace-feedback 2>&1 | tee "$out/trace-feedback.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/trace-feedback.log" || true)
+    if [ "$mode" = --trace-feedback-neg ]; then
+        [ "$rc" -ne 0 ] && [ "$bad" -eq 0 ] && grep -q 'trace clear pipeline must report each actual create' "$out/trace-feedback.log" || exit 1
+        echo 'PASS: withdrawing clear trace fails at its event assertion'; exit 0
+    fi
+    [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] && grep -q 'TRACE_PIPELINE enabled=1' "$out/trace-feedback.log" || exit 1
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --trace-feedback-off 2>&1 | tee "$out/trace-feedback-off.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/trace-feedback-off.log" || true)
+    [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] && grep -q 'TRACE_PIPELINE enabled=0' "$out/trace-feedback-off.log" || exit 1
+    exit 0
+fi
+
 if [[ "$mode" == --clear-capacity* ]]; then
     failed=0
     for dq in 0 1; do
@@ -683,6 +768,44 @@ fi
 
 # C1581K：D24S8 的 CPU 上传拆成深度面、模板面两个区域（一个区域只能有一个面，VUID-VkBufferImageCopy-aspectMask-09103），
 #   深度面回读低 24 位一致、上传的模板经模板测试看得见。validation 0 条才绿。
+if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
+    unset S2A_TEST_NVK_DQ
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle >"$out/gpu-deswizzle-negative.log" 2>&1
+    rc=$?
+    set -e
+    if [ "$mode" = "--gpu-deswizzle-neg-barrier" ]; then
+        grep -q 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/gpu-deswizzle-negative.log" || { echo '【红】移除屏障没有被同步校验拦住'; exit 1; }
+    else
+        [ "$rc" -ne 0 ] && grep -q 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" || { echo "【红】几何变异未在字节断言处变红（rc=${rc}）"; tail -25 "$out/gpu-deswizzle-negative.log"; exit 1; }
+    fi
+    echo "【绿】$mode 触发预期负控（rc=${rc}）"; exit 0
+fi
+
+if [ "$mode" = "--gpu-deswizzle" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 0 ]; then unset S2A_TEST_NVK_DQ; else export S2A_TEST_NVK_DQ=1; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-${dq}.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-${dq}.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-${dq}.log"; then
+            echo "【红】GPU deswizzle dq=${dq}: rc=${rc} 或校验失败" >&2; exit 1
+        fi
+    done
+    unset S2A_TEST_NVK_DQ
+    export S2A_TEST_GPU_DESWIZZLE_OFF=1
+    set +e
+    timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-off.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    unset S2A_TEST_GPU_DESWIZZLE_OFF
+    if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-off.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-off.log"; then
+        echo "【红】GPU 解排关闭：rc=${rc} 或校验失败" >&2; exit 1
+    fi
+    echo '【绿】GPU deswizzle 两级录制开关、关闭能力、校验层通过'; exit 0
+fi
+
 if [ "$mode" = "--ds-upload-only" ]; then
     set +e
     timeout 120 "$out/t_backend_vk" "$out/shaders" --ds-upload-only 2>&1 | tee "$out/ds-upload.log"
@@ -970,6 +1093,17 @@ for dq in 0 1; do
         exit 1
     fi
 done
+
+# 建管线失败（9000 r1 冷缓存标题崩溃）：驱动失败时留在输出里的句柄不销毁、不绑定；红行带 VkResult / 程序身份 / 阶段键 / 配方、按配方限频
+set +e
+S2A_LAVAPIPE_ICD="$icd" S2A_VK_LAYER_DIR="$layer" GLSLC="$glslc" timeout 300 bash "$repo/android/tests/vk/run.sh" --pipe-fail-core 2>&1 | tee "$out/log_pipe_fail"
+rc=${PIPESTATUS[0]}
+set -e
+bad=$(grep -cE "Validation Error|VUID-" "$out/log_pipe_fail" || true)
+if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ] || ! grep -q "pipe-fail cases=4 failures0" "$out/log_pipe_fail"; then
+    echo "【红】建管线失败用例：rc=${rc}，validation 报错 $bad 条" >&2
+    exit 1
+fi
 
 # 零属性（#977）：着色器读了但没设格式的顶点属性，核心补全 0 属性；修前校验层报这个输入没有来源。
 set +e
