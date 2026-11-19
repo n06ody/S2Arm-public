@@ -1010,7 +1010,8 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
 static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], int nst, const uint8_t *ckey, int state_ok,
                          const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
-    if (!root || (!ckey && (nst != 2 || !state_ok)) || nvn_plat_flag("no_libpack", 0)) return 0;
+    // 状态许可同时约束图形和计算：预编计算 SPIR-V 也按存储缓冲对齐翻译。
+    if (!root || !state_ok || (!ckey && nst != 2) || nvn_plat_flag("no_libpack", 0)) return 0;
     char lw[192] = ""; int lrc = S2A_LIBPACK_MISS;
     pthread_mutex_lock(&g_lp_mu);
     if (!g_lp_bad_init) { nvn_hm_init(&g_lp_bad, 32); g_lp_bad_init = 1; }

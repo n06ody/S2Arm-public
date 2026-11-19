@@ -1071,7 +1071,46 @@ static int diag_compile_test(void) {
     printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
 }
 
+// 实际解析与 LibPack 夹具：逐进程隔离已发布程序和不可用表。
+static int libpack_alignment_test(const char *mode) {
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    if (!strcmp(mode, "live-absent")) unsetenv("S2A_SHADER_REVISION_ROOT");
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    source(); bind_pools(7); compiler_calls = cs_loads = shader_load_count = 0;
+    if (!strncmp(mode, "live-", 5)) {
+        fake_cs_success = 1;
+        rp_S.ssbo[5][2].addr = !strcmp(mode, "live-aligned") ? 0x70000 : 0x70001;
+        rp_S.ssbo[5][2].size = 16;
+        const struct rp_prog *p = NULL;
+        int rc = rp_shader_resolve_compute(&p);
+        CHECK(rc == 0 && p && cs_loads == 1, "live compute resolves with one shader load");
+        int want_compile = strcmp(mode, "live-aligned") != 0;
+        CHECK(compiler_calls == want_compile && p && p->nent[0] == (want_compile ? 0 : 1),
+              "live alignment must select the correct source: %s compiler=%d bindings=%d", mode, compiler_calls, p ? p->nent[0] : -1);
+    } else {
+        struct nvk_prog_rec rec = {0};
+        memset(rec.identity, 0x47, sizeof rec.identity);
+        int graphics = !strncmp(mode, "graphics-", 9);
+        int allowed = strstr(mode, "allowed") && !strstr(mode, "disallowed");
+        rec.stage_mask = graphics ? 3 : 32; rec.lp_ok = allowed ? 2 : 0;
+        if (graphics) {
+            const uint8_t vs[8] = {1,0x23,0x45,0x67,0x89,0xab,0xcd,0xef};
+            const uint8_t fs[8] = {0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe};
+            memcpy(rec.keys[0], vs, 8); memcpy(rec.keys[1], fs, 8); fake_gs_success = 1;
+        } else { memcpy(rec.keys[0], rp_S.skey[5], 8); fake_cs_success = 1; }
+        int rc = nvk_prog_warm_build(&rec); const struct rp_prog *p = NULL;
+        int borrowed = rp_shader_prog_borrow(rec.identity, &p);
+        CHECK((allowed ? rc == 0 && borrowed == 1 && p : rc == -1 && borrowed == 0 && !p),
+              "warm alignment must honor lp_ok: %s rc=%d borrowed=%d", mode, rc, borrowed);
+        CHECK(compiler_calls == 0, "warm does not compile");
+        if (borrowed == 1) rp_shader_prog_return(rec.identity);
+    }
+    printf("%s: checks=%d failures=%d compiler=%d cs_loads=%d graphics_loads=%d\n", mode, checks, failures, compiler_calls, cs_loads, shader_load_count);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--libpack-alignment")) return libpack_alignment_test(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
