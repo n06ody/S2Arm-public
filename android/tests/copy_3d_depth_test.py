@@ -73,6 +73,7 @@ if not match:
 face_enum = match.group(0)
 production = face_enum + '\n' + '\n'.join(function(x) for x in (
     'static VkImageAspectFlags copy_face_aspect(',
+    'static const char *readback_refusal(',   # copy_tex_buf 先问它拒不拒收（展开格式 / 替换存储，#1715）；与 NVN_GPU_FMT_READBACK 同一个判断
     'static void copy_region_block_clamp(', 'static int copy_region(', 'static int check_copy_params(',   # block_clamp：#697 小 mip 整块区域裁边，copy_region 调它
     'static void copy_buf_tex_impl(', 'void nvn_gpu_copy_buf_tex(', 'void nvn_gpu_copy_tex_buf('))   # copy_buf_tex_impl：#422 起 nvn_gpu_copy_buf_tex 是它的薄壳
 main = r'''
