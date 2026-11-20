@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 15   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 16   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 

@@ -13,7 +13,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 15, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 16, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
