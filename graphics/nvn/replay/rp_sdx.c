@@ -21,6 +21,7 @@
 #include "nvn_plat.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c（0 照执行，2 跳同设备地址的新录制，<0 跳过）
 int rp_prog_is(const prog_t *p, uint64_t serial);     // rp_state.c
@@ -53,6 +54,19 @@ int rp_fd_on(void) {
     if (g_fd_enabled < 0) g_fd_enabled = nvn_plat_flag("nvk_fd", 1) && tbdr();
     return g_fd_enabled;
 }
+// 真机诊断（r2/r3 全零定位）：索引成败、对账、decide 六码的逐条件计数；rp_present 每帧长行带走并清零。
+// st: 0 门关 1 建 2 坏记录 3 桶满 4 深度/守卫 5 分配 6 序坏 7 作废 8..13 decide 存{读,再挂,拷,清,否,无} 14 decide 跳
+static uint64_t g_sdx_st[16];
+static void sdx_abort(int k) { g_sdx_st[k]++; g_sdx_ok = 0; }
+int rp_sdx_diag(char *b, size_t n) {   // → 已写字节数；全零不写
+    uint64_t t = 0; for (int i = 0; i < 16; i++) t |= g_sdx_st[i]; if (!t) return 0;
+    int o = snprintf(b, n, "前瞻因：关%llu 建%llu 坏%llu 桶%llu 深%llu 分%llu 序%llu 作%llu | 存：读%llu 挂%llu 拷%llu 清%llu 否%llu 无%llu | 跳%llu",
+        (unsigned long long)g_sdx_st[0], (unsigned long long)g_sdx_st[1], (unsigned long long)g_sdx_st[2], (unsigned long long)g_sdx_st[3],
+        (unsigned long long)g_sdx_st[4], (unsigned long long)g_sdx_st[5], (unsigned long long)g_sdx_st[6], (unsigned long long)g_sdx_st[7],
+        (unsigned long long)g_sdx_st[8], (unsigned long long)g_sdx_st[9], (unsigned long long)g_sdx_st[10], (unsigned long long)g_sdx_st[11],
+        (unsigned long long)g_sdx_st[12], (unsigned long long)g_sdx_st[13], (unsigned long long)g_sdx_st[14]);
+    memset(g_sdx_st, 0, sizeof g_sdx_st); return o;
+}
 static uint64_t h_ser(uint64_t h) {   // 槽句柄 → 贴图序号（0 = 登记里没有 / 解不出）
     tex_t t; return rp_tex_snap_by_id((int)(h & 0xfffff), &t, NULL, NULL) ? t.serial : 0;
 }
@@ -60,7 +74,7 @@ static int sdx_bucket(uint64_t ser, int add) {
     if (!ser) return -1;
     for (uint32_t i = (uint32_t)(ser * 0x9E3779B97F4A7C15ull >> 53), n = 0; n < SDX_HB; i = (i + 1) & (SDX_HB - 1), n++) {
         if (g_sdx_hk[i] == ser) return g_sdx_hb[i];
-        if (!g_sdx_hk[i]) { if (!add) return -1; if (g_sdx_nb >= SDX_HB / 2) { g_sdx_ok = 0; return -1; } g_sdx_hk[i] = ser; g_sdx_hb[i] = (uint16_t)g_sdx_nb; return (int)g_sdx_nb++; }
+        if (!g_sdx_hk[i]) { if (!add) return -1; if (g_sdx_nb >= SDX_HB / 2) { sdx_abort(3); return -1; } g_sdx_hk[i] = ser; g_sdx_hb[i] = (uint16_t)g_sdx_nb; return (int)g_sdx_nb++; }
     }
     return -1;
 }
@@ -69,7 +83,7 @@ static void sdx_ev_add(sdx_ev e) {
     if (g_sdx_n == g_sdx_cap) {
         uint32_t c = g_sdx_cap ? g_sdx_cap * 2 : 4096;
         sdx_ev *a = realloc(g_sdx, (size_t)c * sizeof *g_sdx), *b = realloc(g_sdx_tmp, (size_t)c * sizeof *g_sdx_tmp);
-        if (!a || !b) { free(a); free(b); g_sdx_ok = 0; return; }
+        if (!a || !b) { free(a); free(b); sdx_abort(5); return; }
         g_sdx = a; g_sdx_tmp = b; g_sdx_cap = c;
     }
     g_sdx[g_sdx_n++] = e;
@@ -111,15 +125,15 @@ static void sdx_reads(const struct rp_prog *pg, uint32_t seq, int is_compute) {
 const struct rp_prog *rp_shader_peek(uint64_t ser);   // nvk_shader.c：程序序号 → 已编译的 rp_prog（没编出 = NULL，不触发编译）
 
 static void sdx_walk(const uint8_t *p, int depth) {
-    if (depth > 64) { g_sdx_ok = 0; return; }
+    if (depth > 64) { sdx_abort(4); return; }
     uint32_t guard = 0;
     for (; guard < 4000000 && p && g_sdx_ok; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN) { g_sdx_ok = 0; return; }   // 坏记录：索引作废，余下通道全存
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN) { sdx_abort(2); return; }   // 坏记录：索引作废，余下通道全存
         if (g_sdx_nop == g_sdx_opcap) {
             uint32_t c = g_sdx_opcap ? g_sdx_opcap * 2 : 16384;
             const uint8_t **t = realloc(g_sdx_op, (size_t)c * sizeof *g_sdx_op);
-            if (!t) { g_sdx_ok = 0; return; }
+            if (!t) { sdx_abort(5); return; }
             g_sdx_op = t; g_sdx_opcap = c;
         }
         uint32_t seq = g_sdx_nop; g_sdx_op[g_sdx_nop++] = p;
@@ -184,12 +198,12 @@ static void sdx_walk(const uint8_t *p, int depth) {
         }
         p += h.size;
     }
-    if (guard >= 4000000) g_sdx_ok = 0;
+    if (guard >= 4000000) sdx_abort(4);
 }
 void nvn_be_sub_index(const uint64_t *h, int n) {   // 提交开头（hle_nvn.c QueueSubmitCommands）：建本次提交的存储前瞻索引
     g_sdx_n = g_sdx_nop = 0; g_exec_seq = 0; g_sdx_ok = sdx_on();
     rp_pass_rtseq_reset();   // 序号按提交重数：上次留下的旧 rtseq 会把这次的事件全吞掉
-    if (!g_sdx_ok) return;
+    if (!g_sdx_ok) { g_sdx_st[0]++; return; }
     memset(g_sdx_hk, 0, sizeof g_sdx_hk); g_sdx_nb = 0;
     const p_set_rt *live = rp_pass_target();
     if (live) { for (int k = 0; k < live->n && k < 8; k++) if (live->color[k]) sdx_bucket(live->color[k]->serial, 1); if (live->depth) sdx_bucket(live->depth->serial, 1); }   // 提交开头还挂着的目标
@@ -209,6 +223,7 @@ void nvn_be_sub_index(const uint64_t *h, int n) {   // 提交开头（hle_nvn.c 
     for (uint32_t b = 0; b < g_sdx_nb; b++) g_sdx_bcnt[b] = g_sdx_bst[b];
     for (uint32_t i = 0; i < g_sdx_n; i++) g_sdx_tmp[g_sdx_bcnt[sdx_bucket(g_sdx[i].ser, 0)]++] = g_sdx[i];
     sdx_ev *t = g_sdx; g_sdx = g_sdx_tmp; g_sdx_tmp = t;
+    g_sdx_st[1]++;
 }
 void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }   // 前瞻游标（fz_cursor）这台机器这里不搬：索引已盖整次提交
 
@@ -216,17 +231,17 @@ void rp_sdx_seq(const uint8_t *p) {   // 回放每条命令开头打一次：序
     if (!g_sdx_ok) return;
     if (g_exec_seq >= g_sdx_nop || g_sdx_op[g_exec_seq] != p) {
         static unsigned said; if (said++ < 8) nvn_plat_log(NVN_PLAT_LOG_INFO, "sdx", "存储前瞻索引与回放顺序对不上：索引作废，本次提交余下通道全存");
-        g_sdx_ok = 0; return;
+        g_sdx_st[6]++; g_sdx_ok = 0; return;
     }
     g_exec_seq++;
 }
-void rp_sdx_invalidate(void) { g_sdx_ok = 0; }   // 条件渲染真跳过了命令：索引里有它们、回放里没有，作废（rp_exec 每条 op 处判）
+void rp_sdx_invalidate(void) { if (g_sdx_ok) { g_sdx_st[7]++; g_sdx_ok = 0; } }   // 条件渲染真跳过了命令：索引里有它们、回放里没有，作废（rp_exec 每条 op 处判）
 uint32_t rp_sdx_cur(void) { return g_exec_seq ? g_exec_seq - 1 : SDX_NONE; }   // 正在回放的那条的序号（rp_pass_set_rt 记目标的 rtseq 用）
 void rp_sdx_reset(void) { g_sdx_ok = 0; g_sdx_n = g_sdx_nop = g_exec_seq = 0; }
 
 // 通道 begin 时的单附件判定：ser/lv/sl 是附件子资源，plane 0 颜色 / 1 深度 / 2 模板，rt0seq 是当前目标的 SET_RT 序号。
 // 返回 iOS 的 st 码：2 = 冗余（可 DONTCARE）；其他 = why<<2 要存（1 被读 2 重新挂上再画 3 拷贝端 4 整图清除 5 判不到 6 索引不可用）。
-int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq) {
+static int sdx_decide_(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq) {
     if (!g_sdx_ok || !g_exec_seq) return 6 << 2;
     const uint32_t P = g_exec_seq;   // 正在回放的绘制之后的第一条
     int b = sdx_bucket(ser, 0); if (b < 0) return 5 << 2;   // 没进候选集：本次提交与它无关的事件一条没有 → 判不到，存
@@ -242,4 +257,9 @@ int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq) {
         return e->kind == SDX_CLEAR ? 2 : 2 << 2;
     }
     return 5 << 2;
+}
+int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq) {
+    int rc = sdx_decide_(ser, lv, sl, plane, rt0seq);
+    if (rc == 2) g_sdx_st[14]++; else { int w = rc >> 2; if (w >= 1 && w <= 6) g_sdx_st[7 + w]++; }
+    return rc;
 }

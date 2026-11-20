@@ -129,6 +129,23 @@ static void t_invalidate_paths(void) {
     rp_sdx_reset();
 }
 
+// 条件渲染真跳过（真机全零嫌疑之一）：先丢一笔（invalidate 在这笔处发），恢复后走正例形状
+// （A 画 → 回 A 整屏清 → 再画）。索引已死：本来能判 DONTCARE 的通道只能 STORE。
+static void t_rcond_invalidate(void) {
+    sdx_fresh(); g_rcond = 1;
+    static tex_t ta;
+    ta = mk_tex(300801, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0); nvn_be_tex_init(&ta);
+    stream s = {0};
+    { p_render_cond *rc = put(&s, OP_RENDER_COND, sizeof *rc); rc->mode = 3; }
+    q_draw(&s);   // 被丢：索引里这条序号有事件、回放没有 → 作废
+    { p_render_cond *rc = put(&s, OP_RENDER_COND, sizeof *rc); rc->mode = 2; }   // 恢复
+    put_set_rt(&s, &ta, NULL); q_draw(&s); put_set_rt(&s, &ta, NULL);
+    { p_clear_color *c = put(&s, OP_CLEAR_COLOR, sizeof *c); c->index = 0; c->mask = 0xf; }
+    q_draw(&s); end(&s); submit1(&s);
+    g_rcond = 0;
+    CHECK(g_npd >= 1 && g_pd[0].color[0].store == NVN_GPU_STORE_STORE);
+}
+
 // nvk_sdx 关：索引根本不建，通道全 STORE。只在 off 进程跑（开关进程内只读一次）。
 static void t_disabled(void) {
     sdx_fresh();
@@ -232,12 +249,19 @@ int main(int argc, char **argv) {
         printf("rp_sdx(off): %d checks, %d failures\n", g_checks, g_fail);
         return g_fail != 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "capsoff")) {   // 真机 r2 形态：后端不报 TBDR 位（vendorID 置位修复前的 Mali）→ 同 off
+        g_caps_remove = NVN_GPU_CAP_TILE_MEMORY;
+        t_disabled();
+        printf("rp_sdx(capsoff): %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail != 0;
+    }
     t_dontcare_after_clear();
     t_cont_att_stores();
     t_read_stores();
     t_read_stores_peekmiss();
     t_copy_stores();
     t_invalidate_paths();
+    t_rcond_invalidate();
     t_fd_positive();
     t_fd_neg_small();
     t_fd_neg_nofacts();

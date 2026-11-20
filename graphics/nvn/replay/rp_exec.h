@@ -67,6 +67,8 @@ uint32_t rp_sdx_cur(void);              // 正在回放的那条的序号（0xff
 int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq);   // 单附件：2 = 冗余可 DONTCARE；其他 why<<2 要存
 int rp_sdx_on(void);                    // 存储前瞻生效否（nvk_sdx × NVN_GPU_CAP_TILE_MEMORY，锁存）
 int rp_fd_on(void);                     // 首笔全画跳载入生效否（nvk_fd × NVN_GPU_CAP_TILE_MEMORY，锁存）
+int rp_sdx_diag(char *b, size_t n);     // 前瞻逐条件计数格式化（带走清零，全零不写）→ 已写字节
+int rp_fd_diag(char *b, size_t n);      // 全画逐条件计数同上
 void rp_pass_rtseq_reset(void);           // 提交开头：目标序号归零（序号按提交重数，上次的旧值会把这次的事件全吞掉）
 
 // ---------- 上屏（rp_present.c）----------

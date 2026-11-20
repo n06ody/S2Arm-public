@@ -39,11 +39,13 @@ flags=(-std=c11 -D_DEFAULT_SOURCE -DS2A_TEST_TS_ALLOC -O1 -g -pthread -Wall -Wex
 rc=0
 (cd "$repo" && timeout 60 "$tmp/t" main) || rc=1
 (cd "$repo" && timeout 60 "$tmp/t" off) || rc=1
+(cd "$repo" && timeout 60 "$tmp/t" capsoff) || rc=1
 if [ -z "${S2A_SDX_NEG:-}" ]; then
     "$cc" "${flags[@]}" -fsanitize=address -fno-omit-frame-pointer "${incs[@]}" -o "$tmp/ta" "${srcs[@]}" ${weak[@]+"${weak[@]}"} -lm
     leak=1; [ "$(uname -s)" = Darwin ] && leak=0
     (cd "$repo" && ASAN_OPTIONS=detect_leaks=$leak timeout 120 "$tmp/ta" main) || rc=1
     (cd "$repo" && ASAN_OPTIONS=detect_leaks=$leak timeout 120 "$tmp/ta" off) || rc=1
+    (cd "$repo" && ASAN_OPTIONS=detect_leaks=$leak timeout 120 "$tmp/ta" capsoff) || rc=1
 fi
 [ "$rc" = 0 ] && echo "nvk_sdx: GREEN${S2A_SDX_NEG:+（负对照 ${S2A_SDX_NEG}）}" || echo "nvk_sdx: RED${S2A_SDX_NEG:+（负对照 ${S2A_SDX_NEG}）}"
 exit $rc

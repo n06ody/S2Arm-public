@@ -1196,29 +1196,42 @@ static int fd_attr_read(int a, const p_draw *dw, const p_draw_idx *di, float P[6
     }
     return 0;
 }
+// 真机诊断（r2/r3 全零定位）：fd_cover_mask 各早退因的逐条件计数；rp_present 每帧长行带走并清零。
+// 0 证出 1 门关 2 阶段/几何 3 弃栅 4 事实缺 5 多样本 6 数/间接 7 图元 8 自采样/无目标 9 多边形 10 逻αDS 11 视口/夹 12 顶点读 13 覆盖全否
+static uint64_t g_fd_st[16];
+static uint32_t fd_no(int k) { g_fd_st[k]++; return 0; }
+int rp_fd_diag(char *b, size_t n) {   // → 已写字节数；全零不写
+    uint64_t t = 0; for (int i = 0; i < 16; i++) t |= g_fd_st[i]; if (!t) return 0;
+    int o = snprintf(b, n, "全画因：证%llu 关%llu 程%llu 弃%llu 实%llu 采%llu 数%llu 型%llu 自%llu 形%llu 逻%llu 视%llu 顶%llu 零%llu",
+        (unsigned long long)g_fd_st[0], (unsigned long long)g_fd_st[1], (unsigned long long)g_fd_st[2], (unsigned long long)g_fd_st[3],
+        (unsigned long long)g_fd_st[4], (unsigned long long)g_fd_st[5], (unsigned long long)g_fd_st[6], (unsigned long long)g_fd_st[7],
+        (unsigned long long)g_fd_st[8], (unsigned long long)g_fd_st[9], (unsigned long long)g_fd_st[10], (unsigned long long)g_fd_st[11],
+        (unsigned long long)g_fd_st[12], (unsigned long long)g_fd_st[13]);
+    memset(g_fd_st, 0, sizeof g_fd_st); return o;
+}
 // → 位掩码：位 i（0..7）= 颜色槽 i 证出、位 8 = 深度证出（模板不单独证）。在 rp_pass_prepare_draw 之前取，随这一笔交给通道。
 static uint32_t fd_cover_mask(const p_draw *dr, const p_draw_idx *di, uint32_t cwm) {
-    if (!rp_fd_on()) return 0;   // nvk_fd 关 / 后端不是 TBDR：证明不做，载入照旧
-    if (!g_prog || !g_prog->sh[0] || !g_prog->sh[1] || g_prog->sh[2] || rp_S.bst[3] || rp_S.bst[4]) return 0;   // 只有顶点 + 片元：位置过了几何 / 细分的手就证不了
-    if (rp_S.rast_discard) return 0;   // patch_size 的 NVN 缺省就是 3（恒 >0），细分在不在用看 bst[3]/bst[4] 那一条
-    if (g_prog->pos_attr < 0 || g_prog->may_discard || g_prog->writes_smask) return 0;
-    if (rp_S.ms.a2c || rp_S.ms.cov2color_en) return 0;   // a2c 改写 alpha、覆盖到颜色转换再占一条输出：本笔的写不满本槽
+    if (!rp_fd_on()) return fd_no(1);   // nvk_fd 关 / 后端不是 TBDR：证明不做，载入照旧
+    if (!g_prog || !g_prog->sh[0] || !g_prog->sh[1] || g_prog->sh[2] || rp_S.bst[3] || rp_S.bst[4]) return fd_no(2);   // 只有顶点 + 片元：位置过了几何 / 细分的手就证不了
+    if (rp_S.rast_discard) return fd_no(3);   // patch_size 的 NVN 缺省就是 3（恒 >0），细分在不在用看 bst[3]/bst[4] 那一条
+    if (g_prog->pos_attr < 0 || g_prog->may_discard || g_prog->writes_smask) return fd_no(4);
+    if (rp_S.ms.a2c || rp_S.ms.cov2color_en) return fd_no(5);   // a2c 改写 alpha、覆盖到颜色转换再占一条输出：本笔的写不满本槽
     int n = dr ? dr->count : di->count;
-    if (n < 3 || n > 64) return 0;
-    if (dr && (dr->ind || dr->tfc || dr->mdi_cnt)) return 0;   // 间接 / 变换反馈计数 / 间接计数多笔：顶点数不在 CPU 上
-    if (di && (di->ind || di->mdi_cnt)) return 0;
+    if (n < 3 || n > 64) return fd_no(6);
+    if (dr && (dr->ind || dr->tfc || dr->mdi_cnt)) return fd_no(6);   // 间接 / 变换反馈计数 / 间接计数多笔：顶点数不在 CPU 上
+    if (di && (di->ind || di->mdi_cnt)) return fd_no(6);
     int prim = dr ? dr->prim : di->prim;
-    if (prim != NVN_COVER_TRIANGLES && prim != NVN_COVER_TRIANGLE_STRIP) return 0;
-    const p_set_rt *rt = rp_pass_target(); if (!rt) return 0;
-    if (fd_self_sample()) return 0;
-    if (rp_S.poly.mode != NVN_POLYGON_MODE_FILL) return 0;
-    if (rp_S.color.logic_op != NVN_LOGIC_OP_COPY && rp_S.color.logic_op != NVN_LOGIC_OP_NOOP) return 0;   // 逻辑操作读旧像素
-    if (rp_S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) return 0;   // alpha 测试能丢片元
-    if (rt->depth && (rp_S.ds.st || (rp_S.ds.dt && rp_S.ds.df != NVN_DEPTH_FUNC_ALWAYS))) return 0;   // 深度测试 / 模板读本像素：写不满
-    uint32_t sw; memcpy(&sw, rp_S.vp_sw[0], 4); if (sw) return 0;   // 视口重排过的 NDC 映射不在证明里（0 = 不变）
-    if (rp_S.depth_clamp) return 0;   // 深度夹取会改裁剪行为：保守不证
+    if (prim != NVN_COVER_TRIANGLES && prim != NVN_COVER_TRIANGLE_STRIP) return fd_no(7);
+    const p_set_rt *rt = rp_pass_target(); if (!rt) return fd_no(8);
+    if (fd_self_sample()) return fd_no(8);
+    if (rp_S.poly.mode != NVN_POLYGON_MODE_FILL) return fd_no(9);
+    if (rp_S.color.logic_op != NVN_LOGIC_OP_COPY && rp_S.color.logic_op != NVN_LOGIC_OP_NOOP) return fd_no(10);   // 逻辑操作读旧像素
+    if (rp_S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) return fd_no(10);   // alpha 测试能丢片元
+    if (rt->depth && (rp_S.ds.st || (rp_S.ds.dt && rp_S.ds.df != NVN_DEPTH_FUNC_ALWAYS))) return fd_no(10);   // 深度测试 / 模板读本像素：写不满
+    uint32_t sw; memcpy(&sw, rp_S.vp_sw[0], 4); if (sw) return fd_no(11);   // 视口重排过的 NDC 映射不在证明里（0 = 不变）
+    if (rp_S.depth_clamp) return fd_no(11);   // 深度夹取会改裁剪行为：保守不证
     float P[64][4];
-    if (fd_attr_read(g_prog->pos_attr, dr, di, P)) return 0;
+    if (fd_attr_read(g_prog->pos_attr, dr, di, P)) return fd_no(12);
     if (g_prog->pos_w1) for (int k = 0; k < n; k++) P[k][3] = 1.0f;   // 位置 w 是常量 1（不取属性的 .w）
     if (g_prog->pos_z_half) for (int k = 0; k < n; k++) P[k][2] = P[k][2] * 0.5f + P[k][3] * 0.5f;   // 翻译器在位置写后追加的 z=fma(z,0.5,w*0.5)：事实记的是改写后的位置
     int sc[4] = {rp_R.sc.x, rp_R.sc.y, rp_R.sc.w, rp_R.sc.h};
@@ -1242,6 +1255,7 @@ static uint32_t fd_cover_mask(const p_draw *dr, const p_draw_idx *di, uint32_t c
             if (nvn_cover((const float (*)[4])P, n, prim, rp_S.poly.cull, fccw, rp_S.has_vp, rp_S.vp[0], rp_R.has_sc, sc, w, h)) out |= 1u << 8;
         }
     }
+    if (out) g_fd_st[0]++; else fd_no(13);
     return out;
 }
 
