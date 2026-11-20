@@ -1,5 +1,6 @@
 // Host contract: only Android's ADPF API, thread identity, and monotonic clock are faked.
 #include "adpf_hint.h"
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -9,14 +10,32 @@ static int64_t clock_ns;
 static int32_t thread_id;
 static int creates, reports, closes, updates, fail_report, fail_create, fail_update;
 static int enabled = 1;
+static int real_cpu_enabled = 1;
 int s2a_adpf_test_enabled(void) { return enabled; }
+int s2a_adpf_test_cpu_work_enabled(void) { return real_cpu_enabled; }
 static int32_t created_tid;
+static int32_t recording_tid, created_recorder;
+static size_t created_threads;
+static size_t updated_threads;
+static int set_threads_calls, set_threads_result;
+static int adpf_supported = 1;
+int s2a_adpf_test_supported(void) { return adpf_supported; }
 static int64_t created_target, actual, updated_target;
 uint64_t s2a_adpf_test_now(void) { return (uint64_t)clock_ns; }
 int32_t s2a_adpf_test_tid(void) { return thread_id; }
-void *s2a_adpf_test_create(int32_t tid, int64_t target) {
-    creates++; created_tid=tid; created_target=target;
+int32_t s2a_adpf_recorder_tid(void) { return recording_tid; }
+void *s2a_adpf_test_create(const int32_t *tids, size_t count, int64_t target) {
+    creates++; created_tid=tids[0]; created_target=target;
+    created_threads = count;
+    created_recorder = count == 2 ? tids[1] : 0;
     return fail_create ? NULL : (void *)(uintptr_t)1;
+}
+int s2a_adpf_test_set_threads(void *s, const int32_t *tids, size_t count) {
+    (void)s;
+    CHECK(tids[0] == thread_id);
+    set_threads_calls++;
+    updated_threads = count;
+    return set_threads_result;
 }
 int s2a_adpf_test_update(void *s, int64_t target) { (void)s; updates++; updated_target=target; return fail_update; }
 int s2a_adpf_test_report(void *s, int64_t ns) { (void)s; reports++; actual=ns; return fail_report; }
@@ -109,6 +128,86 @@ int main(void) {
     s2a_adpf_stop(); CHECK(closes==9);
     clock_ns=7700000000; s2a_adpf_work_begin(28); clock_ns=7710000000; s2a_adpf_frame_end(16666667, 28);
     CHECK(creates==10 && reports==14);
+
+    s2a_adpf_test_reset();
+    s2a_adpf_set_foreground(1);
+    s2a_adpf_set_surface(1);
+    thread_id = 42;
+    recording_tid = 71;
+    clock_ns = 8000000000;
+    s2a_adpf_work_begin(1);
+    clock_ns = 8009000000;
+    s2a_adpf_exclude_gpu_wait(8002000000, clock_ns);
+    clock_ns = 8012000000;
+    s2a_adpf_frame_end(16666667, 1);
+    CHECK(created_threads == 2 && created_tid == 42 && created_recorder == 71);
+    CHECK(created_target == 16666667);
+    CHECK(actual == 5000000); // 2 ms of work, 7 ms fence wait, 3 ms of work.
+
+    // Another thread's wait and a late wait from the last frame stay out.
+    clock_ns = 8020000000;
+    s2a_adpf_work_begin(2);
+    thread_id = 43;
+    s2a_adpf_exclude_gpu_wait(8020000000, 8022000000);
+    thread_id = 42;
+    s2a_adpf_exclude_gpu_wait(8011000000, 8022000000);
+    clock_ns = 8030000000;
+    s2a_adpf_frame_end(16666667, 2);
+    CHECK(actual == 10000000 && set_threads_calls == 0);
+
+    // API 34+: disabling two-level recording removes the recorder in place.
+    int previous_creates = creates;
+    recording_tid = 0;
+    clock_ns = 8040000000;
+    s2a_adpf_work_begin(3);
+    clock_ns = 8050000000;
+    s2a_adpf_frame_end(16666667, 3);
+    CHECK(set_threads_calls == 1 && updated_threads == 1 && creates == previous_creates);
+
+    // API 33: an absent setThreads entry point requires a fresh session.
+    const int previous_closes = closes;
+    set_threads_result = ENOSYS;
+    recording_tid = 72;
+    clock_ns = 8060000000;
+    s2a_adpf_work_begin(4);
+    clock_ns = 8070000000;
+    s2a_adpf_frame_end(16666667, 4);
+    CHECK(creates == previous_creates + 1 && closes == previous_closes + 1);
+    CHECK(created_threads == 2 && created_recorder == 72 && actual == 10000000);
+
+    // Changing presenter midway cannot complete the previous thread's span.
+    int previous_reports = reports;
+    clock_ns = 8080000000;
+    s2a_adpf_work_begin(5);
+    clock_ns = 8090000000;
+    thread_id = 43;
+    s2a_adpf_frame_end(16666667, 5);
+    CHECK(reports == previous_reports);
+    thread_id = 42;
+
+    // The diagnostic rollback retains the old single-TID, full-span report.
+    real_cpu_enabled = 0;
+    clock_ns = 9100000000;
+    s2a_adpf_work_begin(6);
+    s2a_adpf_exclude_gpu_wait(9102000000, 9109000000);
+    clock_ns = 9112000000;
+    s2a_adpf_frame_end(16666667, 6);
+    CHECK(created_threads == 1 && actual == 12000000);
+
+    // Without base NDK entry points no platform session is attempted.
+    s2a_adpf_test_reset();
+    s2a_adpf_set_foreground(1);
+    s2a_adpf_set_surface(1);
+    real_cpu_enabled = 1;
+    adpf_supported = 0;
+    previous_creates = creates;
+    previous_reports = reports;
+    clock_ns = 9200000000;
+    s2a_adpf_work_begin(7);
+    clock_ns = 9210000000;
+    s2a_adpf_frame_end(16666667, 7);
+    CHECK(creates == previous_creates && reports == previous_reports);
+
     if (failed) return 1;
     printf("adpf host lifecycle: passed\n"); return 0;
 }
