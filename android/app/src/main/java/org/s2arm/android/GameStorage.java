@@ -13,6 +13,10 @@ import java.nio.file.StandardOpenOption;
 /** Cross-process exclusion: installation/sweep and a live game cannot retire each other's revision.
  *  一款游戏一把锁（games/<程序号>.lock，不堵门）：装 / 清某一款只会动这一款的版本目录，原先整库一把锁让任何一款在跑时别的游戏都导不进来。 */
 final class GameStorage implements AutoCloseable {
+    static final class Busy extends IOException {
+        Busy() { super("this game is busy (running or being installed); try again after it exits"); }
+    }
+
     private static final java.util.Set<Path> HELD = new java.util.HashSet<>();
     private final FileChannel channel;
     private final FileLock lock;
@@ -34,18 +38,18 @@ final class GameStorage implements AutoCloseable {
         Path key = games.resolve(titleId + ".lock");
         // POSIX locks belong to the process: even closing an unsuccessful second fd can release the
         // first channel's OS lock. Refuse local contention BEFORE opening another descriptor.
-        if (HELD.contains(key)) throw new IOException("this game is busy (running or being installed); try again after it exits");
+        if (HELD.contains(key)) throw new Busy();
         FileChannel channel = FileChannel.open(key, StandardOpenOption.CREATE,
             StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
         try {
             FileLock lock = channel.tryLock();
-            if (lock == null) throw new IOException("this game is busy (running or being installed); try again after it exits");
+            if (lock == null) throw new Busy();
             HELD.add(key);
             return new GameStorage(channel, lock, key);
         } catch (IOException | RuntimeException error) {
             channel.close();
             if (error instanceof OverlappingFileLockException)
-                throw new IOException("this game is busy (running or being installed); try again after it exits");
+                throw new Busy();
             throw error;
         }
     }

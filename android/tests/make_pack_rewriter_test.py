@@ -171,7 +171,9 @@ class MakePackRewriterTest(unittest.TestCase):
         java = REPO / 'android/app/src/main/java/org/s2arm/android'
         tests = REPO / 'android/tests'
         classes = self.directory / 'classes'; classes.mkdir()
-        sources = [str(java / (n + '.java')) for n in ('Json','BootContract','RuntimeLibrary','GamePack','GameFingerprint','GameInstall','ImportReceiver','GameStorage','GameMetadata')]
+        sources = [str(java / (n + '.java')) for n in
+                   ('Json', 'BootContract', 'RuntimeLibrary', 'GamePack', 'GameFingerprint', 'GameInstall',
+                    'SaveArchive', 'ImportReceiver', 'GameStorage', 'GameMetadata')]
         sources += [str(tests / (n + '.java')) for n in ('GamePackTest','GameInstallTest')]
         compiled = self.command(['javac', '-encoding', 'UTF-8', '-d', str(classes)] + sources, self.env)
         self.assertEqual(compiled.returncode, 0, compiled.stderr)

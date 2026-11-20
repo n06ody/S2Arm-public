@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -28,9 +30,12 @@ public static partial class SaveTransfer
     private static readonly object Gate = new();
     public static readonly object HostGate = new();
     public static bool HostStarted;
-    private sealed class Failure(string code, string message) : Exception(message)
+    public static Action<string> DiagnosticLog { get; set; } = line => Console.Error.WriteLine(line);
+
+    private sealed class Failure(string code, string message, [CallerMemberName] string member = "", [CallerLineNumber] int line = 0) : Exception(message)
     {
         internal readonly string Code = code;
+        internal readonly string Site = $"{member}:{line}";
     }
     // 玩家看得到的说明按请求里的 language 出中文或英文（#316）：iOS 宿主（ios/save_transfer.m，含 iCloud 同步经 s2a_shell_save_context）带
     //   "language"（"en" / "zh-Hans"）；没带（Mac 等其它调用方）照旧中文。错误码不变；日志（stderr）照旧中文。一次请求在本线程上有效，入口处设定
@@ -44,9 +49,10 @@ public static partial class SaveTransfer
         try { if (JsonNode.Parse(requestJson)?["language"] is JsonValue v && v.TryGetValue(out string language)) s_english = !language.StartsWith("zh", StringComparison.OrdinalIgnoreCase); }
         catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException) { }
     }
-    private static void Require(bool value, string message, string code = "save_invalid")
+    private static void Require(bool value, string message, string code = "save_invalid",
+        [CallerMemberName] string member = "", [CallerLineNumber] int line = 0)
     {
-        if (!value) throw new Failure(code, message);
+        if (!value) throw new Failure(code, message, member, line);
     }
     private static JsonNode Parse(ReadOnlySpan<byte> bytes)
     {
@@ -300,24 +306,43 @@ public static partial class SaveTransfer
                 };
                 return new JsonObject { ["ok"] = true, ["result"] = result }.ToJsonString();
             }
-            catch (Failure ex) { return Error(ex.Code, ex.Message); }
-            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or JsonException or OverflowException or NotSupportedException or KeyNotFoundException)
+            catch (Failure ex)
             {
-                System.Console.Error.WriteLine("存档操作失败：" + ex.GetType().Name + "（" + ex.HResult + "）：" + ex.Message);
-                var (code, message) = Describe(ex);
-                return Error(code, message);
+                if (ex.Code == "save_invalid") LogFailure(ex.Code, ex);
+                return Error(ex.Code, ex.Message);
             }
             catch (Exception ex)
             {
-#if SAVE_TRANSFER_TEST
-                System.Console.Error.WriteLine(ex);
-#endif
-                return Error("save_unsupported_runtime", T("存档格式库或运行时不兼容：", "The save format library or runtime is incompatible: ") + ex.GetType().Name + T("。未完成的事务记录已保留。", ". Unfinished transaction records are kept."));
+                var (code, message) = Describe(ex);
+                LogFailure(code, ex);
+                return Error(code, message);
             }
         }
     }
-    // 失败原因转人话（审计 P2-11：原先玩家只看到「存档操作失败：IOException」）：按 errno / 异常类型分成空间不足、没权限、备份损坏、
-    //   读写出错、数据不符五句，与 Mac pack/jobs/saves.py 同口径；类型名与系统原文只进 stderr 日志。
+
+    private static void LogFailure(string code, Exception error)
+    {
+        // Exception.Message and source file names may contain private paths.
+        string site;
+        if (error is Failure failure) site = failure.Site;
+        else
+        {
+            string[] frames = new StackTrace(error, fNeedFileInfo: false).ToString()
+                .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            // Parameter signatures can fill the log entry before the service caller.
+            site = string.Join(" | ", frames.Select(frame =>
+            {
+                int parameters = frame.IndexOf('(');
+                return parameters < 0 ? frame : frame[..parameters];
+            }));
+        }
+        if (site.Length == 0) site = "unavailable";
+        // Keep the first frames within a single Android log entry.
+        if (site.Length > 850) site = site[..850];
+        DiagnosticLog($"[s2a] save transfer failed code={code} type={error.GetType().Name} hresult=0x{error.HResult:X8} site={site}");
+    }
+
+    // 失败原因转人话（审计 P2-11）：按 errno / 异常类型给玩家说明；日志记录类型、错误码及抛出位置。
     //   .NET 在 Unix 上把 errno 原样放进 IOException.HResult（ENOSPC 28、EDQUOT 69 / Linux 122、EACCES 13、EPERM 1）；Windows 磁盘满是 112
     internal static (string Code, string Message) Describe(Exception ex)
     {
@@ -327,7 +352,7 @@ public static partial class SaveTransfer
         if (ex is UnauthorizedAccessException || e is 1 or 13) return ("save_invalid", T("没有权限读写存档目录，存档操作没有完成。请关闭 App 重新打开后再试。", "No permission to read or write the save folder, so the save operation didn’t finish. Close and reopen the app, then try again.") + keep);
         if (ex is InvalidDataException or JsonException or OverflowException) return ("save_invalid", T("备份文件已损坏或格式不对。请重新导出一份备份再试。", "The backup file is damaged or in the wrong format. Export a new backup and try again.") + keep);
         if (ex is IOException) return ("save_invalid", T("读写存档时出错，存档操作没有完成。请关闭 App 重新打开后再试；仍失败可导出诊断包。", "An error occurred while reading or writing the save, so the save operation didn’t finish. Close and reopen the app, then try again; if it still fails, export diagnostics.") + keep);
-        return ("save_invalid", T("存档数据不符合要求，这次操作没有完成。", "The save data doesn’t meet the requirements, so this operation didn’t finish.") + keep);
+        return ("save_internal", T("存档操作遇到内部错误，这次操作没有完成。", "An internal error prevented the save operation from finishing.") + keep);
     }
     internal static string Error(string code, string message) => new JsonObject { ["ok"] = false,
         ["error"] = new JsonObject { ["code"] = code, ["message"] = message } }.ToJsonString();

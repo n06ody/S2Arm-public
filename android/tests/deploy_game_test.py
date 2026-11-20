@@ -43,6 +43,8 @@ class FakeAdb:
         self.remote = {}      # 设备共享存储上已有文件的 SHA-256（路径 → 摘要），sha256sum 照它答
         self.in_place = None  # App 收到的原地登记请求路径
         self.in_place_refused = False
+        self.save_received = None
+        self.save_reply = None
 
     def _serve(self, server):
         while True:
@@ -60,6 +62,18 @@ class FakeAdb:
                 if head[0] == 'S2A-INPLACE':
                     self.in_place = head[2]
                     conn.sendall(b'OK in-place\n')
+                    continue
+                if head[0] == 'S2A-SAVE':
+                    title, size_text = head[2].split(' ')
+                    size = int(size_text)
+                    received = f.read(size)
+                    if head[1] != '1' or title != TITLE or size <= 0 or len(received) != size or f.readline() != b'END\n':
+                        conn.sendall(b'ERR save_header\n')
+                        continue
+                    self.save_received = received, self.started
+                    backup = f'save-transfer/{title}/save-backups/{title}/test/before-restore.s2asave'
+                    receipt = dict(titleId=title, files=2, bytes=16, previousBackup=backup)
+                    conn.sendall(((self.save_reply or 'OK ' + json.dumps(receipt)) + '\n').encode())
                     continue
                 self.name = head[2]
                 while True:
@@ -176,6 +190,27 @@ class DeployTest(unittest.TestCase):
 
     def deploy(self, adb, **kw):
         return deploy_game.deploy(self.pack, self.apk, adb, self.root / 'out', **kw)
+
+    def test_save_transfer_commit_precedes_launch(self):
+        archive = self.root / 'test.s2asave'
+        archive.write_bytes(b'synthetic wire payload')
+        adb = FakeAdb()
+        out = self.deploy(adb, save_archive=archive)
+        self.assertEqual(adb.save_received, (archive.read_bytes(), False))
+        self.assertTrue(adb.started)
+        result = json.loads((out / 'deployment.json').read_text())['saveImport']
+        self.assertEqual((result['titleId'], result['files'], result['bytes']), (TITLE, 2, 16))
+        self.assertTrue(result['previousBackup'].endswith('/before-restore.s2asave'))
+        self.assertNotIn('run-as', ' '.join(str(call) for call in adb.calls))
+
+    def test_save_refusal_does_not_launch_game(self):
+        archive = self.root / 'test.s2asave'
+        archive.write_bytes(b'synthetic wire payload')
+        adb = FakeAdb()
+        adb.save_reply = 'ERR save_wrong_game'
+        with self.assertRaisesRegex(RuntimeError, 'save_wrong_game'):
+            self.deploy(adb, save_archive=archive)
+        self.assertFalse(adb.started)
 
     def test_debug_application_id_is_bound_without_changing_game_identity(self):
         self.identity_mock.return_value = ('org.s2arm.game.t0100000000abcdef.w2', 2, True)
