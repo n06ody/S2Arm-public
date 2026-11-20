@@ -10,6 +10,7 @@ import android.content.SharedPreferences;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.Log;
+import android.view.View;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -73,13 +74,16 @@ final class AndroidLdnSettings {
         RadioGroup modes = new RadioGroup(activity);
         String[] values = {"auto", "host", "client"};
         int[] labels = {R.string.ldn_auto, R.string.ldn_host, R.string.ldn_client};
+        RadioButton[] buttons = new RadioButton[values.length];
         for (int i = 0; i < values.length; i++) {
             RadioButton button = new RadioButton(activity);
-            button.setId(i + 1);
+            buttons[i] = button;
+            button.setId(View.generateViewId());
             button.setText(labels[i]);
             modes.addView(button);
-            if (values[i].equals(saved.mode)) modes.check(i + 1);
+            if (values[i].equals(saved.mode)) modes.check(button.getId());
         }
+        RadioButton client = buttons[2];
         content.addView(modes);
         EditText address = new EditText(activity);
         address.setSingleLine(true);
@@ -98,7 +102,7 @@ final class AndroidLdnSettings {
         dialog.setOnShowListener(ignored -> {
             // Override the default dismiss-on-click: input errors stay visible in this dialog.
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-                LdnSettings settings = readInput(activity, modes, values, address, result);
+                LdnSettings settings = readInput(activity, modes, values, buttons, address, result);
                 if (settings == null) return;
                 preferences(activity).edit().putString("mode", settings.mode)
                     .putString("address", settings.address).apply();
@@ -106,7 +110,7 @@ final class AndroidLdnSettings {
                 dialog.dismiss();
             });
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
-                LdnSettings settings = readInput(activity, modes, values, address, result);
+                LdnSettings settings = readInput(activity, modes, values, buttons, address, result);
                 if (settings == null) return;
                 if (!"client".equals(settings.mode)) {
                     result.setText(R.string.ldn_test_client);
@@ -133,7 +137,7 @@ final class AndroidLdnSettings {
                         if (activity.isFinishing() || activity.isDestroyed() || !dialog.isShowing()) return;
                         test.setEnabled(true);
                         // Do not label an edited address with a previous target's result.
-                        if (modes.getCheckedRadioButtonId() == 3
+                        if (modes.getCheckedRadioButtonId() == client.getId()
                                 && settings.address.equals(address.getText().toString().trim()))
                             result.setText(completed);
                         else result.setText("");
@@ -153,9 +157,16 @@ final class AndroidLdnSettings {
         dialog.show();
     }
 
+    private static int selectedMode(RadioGroup modes, RadioButton[] buttons) {
+        int checked = modes.getCheckedRadioButtonId();
+        for (int i = 0; i < buttons.length; i++)
+            if (buttons[i].getId() == checked) return i;
+        return -1;
+    }
+
     private static LdnSettings readInput(Activity activity, RadioGroup modes, String[] values,
-            EditText address, TextView result) {
-        int selected = modes.getCheckedRadioButtonId() - 1;
+            RadioButton[] buttons, EditText address, TextView result) {
+        int selected = selectedMode(modes, buttons);
         if (selected < 0 || selected >= values.length) {
             result.setText(R.string.ldn_select_mode);
             return null;

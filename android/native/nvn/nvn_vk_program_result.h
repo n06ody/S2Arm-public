@@ -37,6 +37,12 @@ struct fd_stage {
     int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知
     int binst_unread_static;        // 不做动态下标定界的证明；缺字段 / null = 未知
     int binst_static_present;       // 新结果带静态读集（null 也算有字段）
+    // 栅格事实（编译器在注入修正尾巴之前证出的，结果 JSON 的 raster 段；回放首笔全画用，缺字段 = 全保守值）
+    int32_t pos_attr;               // ≥0：顶点位置 xyz 原样取自该顶点属性号；-1 = 证不出
+    uint8_t pos_w1;                 // 1：位置 w 是常量 1；0：取同一属性的 .w
+    uint8_t pos_z_half;             // 1：写出位置过 z=fma(z,0.5,w*0.5) 深度改写
+    uint8_t may_discard;            // 片元可能丢片元（缺省 1 = 可能）
+    uint8_t writes_smask;           // 片元写 sample_mask（缺省 1 = 写）
 };
 static inline int nvn_vk_binst_unread(const struct fd_stage *st, int bound_on) {
     return bound_on ? st->binst_unread : (st->binst_static_present && st->binst_unread_static);
