@@ -258,6 +258,12 @@ def main():
     if sys.argv[1:] == ['--withdraw']:
         text = original.read_text(encoding='utf-8')
         changes = [
+            # 出包预编库缺失 / 坏要说出来（--gs-libpack 单独进程；offline-shader-miss 修法）
+            ('libpack-missing-silent', "                nvn_plat_log(NVN_PLAT_LOG_WARN, \"shader\", b);\n            }\n        }\n    }\n    return lp;",
+             "                (void)b;\n            }\n        }\n    }\n    return lp;", 1, 'missing libpack directory is one yellow line', ('--gs-libpack',)),
+            ('libpack-missing-every-call', 'else if (strcmp(said_root, root)) {', 'else if (1) {', 1, 'missing libpack directory is one yellow line', ('--gs-libpack',)),
+            ('libpack-state-not-set', 'atomic_store(&g_lp_state, orc < 0 ? LP_ST_BAD : LP_ST_MISSING);', '(void)0;', 1, 'libpack tally says the library is missing', ('--gs-libpack',)),
+            ('libpack-bad-as-missing', 'atomic_store(&g_lp_state, orc < 0 ? LP_ST_BAD : LP_ST_MISSING);', 'atomic_store(&g_lp_state, LP_ST_MISSING);', 1, 'broken container: tally says bad', ('--gs-libpack',)),
             ('gs-source-epoch', 'MIX(s2a_source_epoch());\n    MIX(stages);', '(void)s2a_source_epoch();\n    MIX(stages);', 1, 'poisoned GS source cannot hit fast cache'),
             ('cs-query-proof-omitted', 'e->prog.sampler_unused[0][e->prog.nent[0]] = (uint8_t)s2a_spirv_sampler_unused(',
              'e->prog.sampler_unused[0][e->prog.nent[0]] = 0 && (uint8_t)s2a_spirv_sampler_unused(', 1,
@@ -273,8 +279,8 @@ def main():
              'src.stage = st == 2 ? NVN_GPU_SH_FS : (nvn_gpu_stage)st;', 1, 'result loads VS FS and GS'),
             ('gs-key-omitted', '((stages & 4u) ? 3 : 2)',
              '((stages & 4u) ? 2 : 2)', 1, 'changed GS key recompiles'),
-            ('gs-texture-omitted', 'if (stages & 4u) MIX(rp_tex_fact_sig(rp_S.tex[2], 32, rp_S.tex_base, rp_S.tex_pool_n));',
-             'if (0) MIX(rp_tex_fact_sig(rp_S.tex[2], 32, rp_S.tex_base, rp_S.tex_pool_n));', 1, 'changed GS texture fact recompiles'),
+            ('gs-texture-omitted', 'MIX(rp_tex_fact_sig(rp_S.tex[2], 32, rp_S.tex_base, rp_S.tex_pool_n)); sig_hot_recomp(NVK_SIG_GS',
+             '(void)0; sig_hot_recomp(NVK_SIG_GS', 1, 'changed GS texture fact recompiles'),
             ('gs-separate-fast-omitted', 'if (stages & 4u) MIX(sep_fact_sig(2));',
              'if (0) MIX(sep_fact_sig(2));', 1, 'GS separate texture fact reaches compiler'),
             ('gs-separate-generation-omitted', 'const uint64_t sg = rp_tex_sep_gen[st], rg = rp_tex_reg_gen();',
@@ -344,6 +350,15 @@ def main():
             ('alias-fact-registration-omitted', 'if (reusable && ae->fact_ok) fact_cache_keep_mask(&id, fact_base, ae->fact_mask, &ae->prog);',
              '(void)ae->fact_mask;', 1, 'reuses the program (no live compile'),
             # 预热线程建的那份也要算事实掩码：撤掉后，合并命中它的前台身份登记不上事实复用（真机现编 3 → 198 次的另一半）
+            # 热点计数 ③（--sig-hot 单独进程）：贴图事实摘要按调用点 × 重算原因
+            ('sig-hot-reg-as-slots', '!reg_same ? NVK_SIG_REG :', '!reg_same ? NVK_SIG_SLOTS :', 1, 'sig hot registry generation', ('--sig-hot',)),
+            ('sig-hot-pool-skipped', '!pool_same ? NVK_SIG_POOL : NVK_SIG_SLOTS;', 'NVK_SIG_SLOTS;', 1, 'sig hot pool size', ('--sig-hot',)),
+            ('sig-hot-high-hit-dropped', '    } else sig_hot_hit(NVK_SIG_HIGH);', '    }', 1, 'sig hot same state hits', ('--sig-hot',)),
+            ('sig-hot-sep-hit-dropped', '{ sig_hot_hit(NVK_SIG_SEP); return c[st].sig; }', '{ return c[st].sig; }', 1, 'sig hot same state hits', ('--sig-hot',)),
+            ('sig-hot-gs-uncounted', 'sig_hot_recomp(NVK_SIG_GS, NVK_SIG_UNCACHED, t0);', '(void)t0;', 1, 'sig hot GS first', ('--sig-hot',)),
+            ('sig-hot-cs-img-uncounted', 'sig_hot_recomp(NVK_SIG_CS_IMG, NVK_SIG_UNCACHED, t0);', '(void)t0;', 1, 'sig hot compute first', ('--sig-hot',)),
+            ('sig-hot-counts-while-off', 'if (sig_hot_on()) __atomic_fetch_add(&g_sig_hot_n[site][NVK_SIG_HIT], 1, __ATOMIC_RELAXED);',
+             '__atomic_fetch_add(&g_sig_hot_n[site][NVK_SIG_HIT], 1, __ATOMIC_RELAXED);', 1, 'sig hot off again', ('--sig-hot',)),
             ('alias-bg-fact-mask-omitted', 'if (!compute && e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);',
              '(void)0;', 1, 'alias fact-bg[on] s2: identity differing only in an unread texture fact reuses the program'),
             # 开关关闭态（--alias-off 另起进程）：开关读了不用，关闭态下 B 就会被合并，「B 读自己的文件」必须变红
@@ -463,6 +478,9 @@ def main():
     gsl = run('test-gs-libpack', original, args=('--gs-libpack',))
     sys.stdout.write(gsl.stdout); sys.stderr.write(gsl.stderr)
     # 结果合并开关关闭态（debug.s2a.nvk_alias=0）：开关在进程内只读一次，单独起一个进程
+    # 热点计数 ③（贴图事实摘要的调用点 × 重算原因）：几处摘要缓存是进程内静态的，单独起一个进程从空开始
+    sig = run('test-sig-hot', original, args=('--sig-hot',))
+    sys.stdout.write(sig.stdout); sys.stderr.write(sig.stderr)
     off = run('test-alias-off', original, args=('--alias-off',))
     sys.stdout.write(off.stdout)
     sys.stderr.write(off.stderr)
@@ -476,7 +494,7 @@ def main():
         env.update(S2A_COMPUTE_WARM='0', S2A_DIRECT_CACHE_DIR=str(cache_off))
         cs_off = run('test-compute-warm-off', original, args=('--compute-warm-off',), env=env)
         sys.stdout.write(cs_off.stdout); sys.stderr.write(cs_off.stderr)
-    return result.returncode or gsl.returncode or off.returncode or on.returncode or cs_off.returncode
+    return result.returncode or gsl.returncode or sig.returncode or off.returncode or on.returncode or cs_off.returncode
 
 if __name__ == '__main__':
     raise SystemExit(main())

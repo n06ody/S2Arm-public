@@ -510,7 +510,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           pthread_mutex_unlock(&g_mu);
           snprintf(b, sizeof b, "现存对象：贴图 %llu 张 %llu MB（其中悬着 %llu 张 %llu MB）；缓冲 %llu 个 %llu MB（悬着 %llu 个）；视图 %llu 个；在途段 %llu 个",
               (unsigned long long)nt, (unsigned long long)(tb >> 20), (unsigned long long)ntd, (unsigned long long)(tdb >> 20), (unsigned long long)nb, (unsigned long long)(bb >> 20), (unsigned long long)nbd, (unsigned long long)nvw, (unsigned long long)nq);
-          nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); } } }
+          nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); } }
+      hot_cnt_window(np); }
     if (!s || !dr || !d || !d->src || !d->src->tex) { out = fail(err, NVN_GPU_E_ARG, "present 参数为空"); goto done; }
     if (!s->gen) { out = fail(err, NVN_GPU_E_REVOKED, "面已撤销"); goto done; }
     if (dr->gen != s->gen || !(dr->token >> 32)) { out = fail(err, NVN_GPU_E_OUTDATED, "drawable 不属于当前交换链"); goto done; }

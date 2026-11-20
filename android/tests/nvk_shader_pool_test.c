@@ -21,6 +21,7 @@
 #include "direct/s2a_direct.h"
 #include "../../runtime/include/s2a_direct_host.h"
 #include "direct/jv.h"
+#include "nvn/nvn_hot_cnt.h"
 #include "direct/program_cache.h"
 #include "nvn/nvn_vk_prog_warm.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：出包预编库目录 b-<链>-vk 与容器头的链号
@@ -78,7 +79,10 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
     return dflt;
 }
+static int lp_missing_lines, lp_open_lines;   // 出包预编库「不在」（黄）/「已打开」两种行各打了几次
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "texture_pool_capacity=")) {
         diag_lines++; snprintf(last_diag, sizeof last_diag, "%s", text);
@@ -388,6 +392,70 @@ static void bind_separate(int stage, int first, int count, uint64_t handle) {
         CHECK(rp_state_op(OP_BIND_TEX, &b, sizeof b), "separate bind is recorded");
         first += b.n; count -= b.n;
     }
+}
+// 热点计数 ③：贴图事实摘要的调用点 × 结果。开关关着一个都不记；开着时每处的命中 / 首次 / 登记表变 / 池变 / 槽变 / 不缓存各自对上。
+// 单独起进程跑（--sig-hot）：几处缓存是进程内静态的，要从「空」开始才能钉「首次」。
+static void sig_hot_expect(const char *what, const uint64_t want[NVK_SIG_SITES][NVK_SIG_WHYS]) {
+    struct nvk_sig_hot h; nvk_shader_sig_hot_take(&h);
+    static const char *const site[NVK_SIG_SITES] = {"sep", "comb", "high", "gs", "cs_img"};
+    for (int i = 0; i < NVK_SIG_SITES; i++) {
+        uint64_t re = 0;
+        for (int j = 0; j < NVK_SIG_WHYS; j++) {
+            CHECK(h.n[i][j] == want[i][j], "sig hot %s: %s[%d] = %llu, want %llu", what, site[i], j, (unsigned long long)h.n[i][j], (unsigned long long)want[i][j]);
+            if (j != NVK_SIG_HIT) re += want[i][j];
+        }
+        CHECK(re || h.ns[i] == 0, "sig hot %s: %s recompute time recorded only when recomputed (%llu ns)", what, site[i], (unsigned long long)h.ns[i]);   // 重算了也可能读到 0（时钟粒度）
+    }
+}
+static void sig_hot_test(void) {
+    unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR");
+    rp_state_reset(); rp_shader_reset(); source(); bind_pools(7); fake_reg_changes = 0;
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+    enum { H = NVK_SIG_HIT, F = NVK_SIG_FIRST, R = NVK_SIG_REG, P = NVK_SIG_POOL, S = NVK_SIG_SLOTS, U = NVK_SIG_UNCACHED };
+    // 关着：取程序照常，计数全 0
+    rp_shader_resolve(&q, &p);
+    { const uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; sig_hot_expect("off", w); }
+    rp_state_reset(); rp_shader_reset(); source(); bind_pools(7); nvk_shader_sig_hot_enable(1); nvk_shader_sig_hot_take(&(struct nvk_sig_hot){0});
+    // 这份夹具程序只有 VS（source() 只登记阶段 0）：组合 / 分离两处固定算 VS、FS 两个阶段，高槽只算活动阶段（1 次）。
+    // rp_shader_reset 清组合与高槽的缓存（→ 首次）；分离槽缓存不随它清，但 rp_state_reset 推进了分离槽代号（→ 槽变）。
+    rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_SEP][S] = 2; w[NVK_SIG_COMB][F] = 2; w[NVK_SIG_HIGH][F] = 1; sig_hot_expect("after reset", w); }
+    rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_SEP][H] = w[NVK_SIG_COMB][H] = 2; w[NVK_SIG_HIGH][H] = 1; sig_hot_expect("same state hits", w); }
+    fake_reg_generation++; rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_SEP][R] = w[NVK_SIG_COMB][R] = 2; w[NVK_SIG_HIGH][R] = 1; sig_hot_expect("registry generation", w); }
+    bind_pools(11); rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_SEP][P] = w[NVK_SIG_COMB][P] = 2; w[NVK_SIG_HIGH][P] = 1; sig_hot_expect("pool size", w); }
+    rp_S.tex[0][3] = 5; rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_SEP][H] = 2; w[NVK_SIG_HIGH][H] = 1; w[NVK_SIG_COMB][S] = 1; w[NVK_SIG_COMB][H] = 1; sig_hot_expect("VS combined slot", w); }
+    bind_separate(1, 0, 1, 6); rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_COMB][H] = 2; w[NVK_SIG_HIGH][H] = 1; w[NVK_SIG_SEP][S] = 1; w[NVK_SIG_SEP][H] = 1; sig_hot_expect("FS separate slot", w); }
+    rp_S.tex[0][32] = 6; rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_COMB][H] = w[NVK_SIG_SEP][H] = 2; w[NVK_SIG_HIGH][S] = 1; sig_hot_expect("VS high slot", w); }
+    // 计算：组合 / 分离（阶段 5）各一处有缓存，图像槽每次都算
+    fake_cs_success = 1; rp_shader_resolve_compute(&p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_COMB][F] = w[NVK_SIG_SEP][F] = 1; w[NVK_SIG_CS_IMG][U] = 1; sig_hot_expect("compute first", w); }
+    rp_shader_resolve_compute(&p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; w[NVK_SIG_COMB][H] = w[NVK_SIG_SEP][H] = 1; w[NVK_SIG_CS_IMG][U] = 1; sig_hot_expect("compute again", w); }
+    // 三段程序：GS 组合槽不缓存（每次都算），GS 分离 / 高槽各有缓存，首次
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    uint8_t by_stage[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, by_stage[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned i = 0; i < 3; i++) { gs_stages[i] = (uint8_t)i; memcpy(gs_keys[i], by_stage[i], 8); }
+    gs_keys_ok = 7;
+    p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "sig hot GS binds program record");
+    bind_pools(11); fake_gs_success = 1; nvk_shader_sig_hot_take(&(struct nvk_sig_hot){0});
+    rp_shader_resolve(&q, &p);
+    { uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}};
+      w[NVK_SIG_SEP][S] = 2; w[NVK_SIG_SEP][F] = 1;   // VS、FS 分离槽代号被 rp_state_reset 推进；GS（阶段 2）分离槽第一次
+      w[NVK_SIG_COMB][F] = 2; w[NVK_SIG_HIGH][F] = 3;  // rp_shader_reset 清了组合 / 高槽缓存；三段程序三个活动阶段各一次高槽
+      w[NVK_SIG_GS][U] = 1;                          // GS 组合槽不缓存
+      sig_hot_expect("GS first", w); }
+    fake_gs_success = 0; nvk_shader_sig_hot_enable(0);
+    rp_shader_resolve(&q, &p);
+    { const uint64_t w[NVK_SIG_SITES][NVK_SIG_WHYS] = {{0}}; sig_hot_expect("off again", w); }
 }
 static int count_substr(const char *s, const char *needle) {
     int n = 0; size_t len = strlen(needle); while ((s = strstr(s, needle))) { n++; s += len; } return n;
@@ -1335,8 +1403,25 @@ static int gs_libpack_test(void) {
         if (rec[j].key < rec[i].key || (rec[j].key == rec[i].key && rec[j].kind < rec[i].kind)) { __typeof__(rec[0]) t = rec[i]; rec[i] = rec[j]; rec[j] = t; }
     uint64_t keys[8]; uint8_t kinds[8]; const uint8_t *data[8]; size_t lens[8];
     for (int i = 0; i < 8; i++) { keys[i] = rec[i].key; kinds[i] = rec[i].kind; data[i] = rec[i].d; lens[i] = rec[i].n; }
-    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written");
+    // 库目录还不在：取程序照常走现编；「出包预编库不在」打一行黄、同一资源根只打一次；程序累计行的库状态 = 不在
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
+    {
+        extern void nvk_shader_test_tally_line(char *out, size_t n);
+        char tl[640];
+        nvk_shader_test_tally_line(tl, sizeof tl);
+        CHECK(strstr(tl, "出包预编（库没查过）") != NULL, "libpack tally before any lookup says not looked up: %s", tl);
+        fake_gs_success = 1; lp_missing_lines = lp_open_lines = 0;
+        for (int i = 0; i < 2; i++) {
+            rp_shader_reset(); compiler_calls = 0;
+            struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+            CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 1, "libpack missing (%d): live compile resolves (calls=%d)", i, compiler_calls);
+        }
+        CHECK(lp_missing_lines == 1, "missing libpack directory is one yellow line per root (got %d)", lp_missing_lines);
+        nvk_shader_test_tally_line(tl, sizeof tl);
+        CHECK(strstr(tl, "出包预编（库不在）") != NULL, "libpack tally says the library is missing: %s", tl);
+        fake_gs_success = 0;
+    }
+    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written");
     static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
     static const char prof_off[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":false}}";
     snprintf(external_profile, sizeof external_profile, "%s", prof_on);
@@ -1358,6 +1443,23 @@ static int gs_libpack_test(void) {
         } else {
             CHECK(compiler_calls == 1, "libpack GS %s: library misses, live compile runs (calls=%d)", what[c], compiler_calls);
         }
+    }
+    {
+        extern void nvk_shader_test_tally_line(char *out, size_t n);
+        char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
+        CHECK(lp_open_lines >= 1 && strstr(tl, "出包预编（库已打开）") != NULL, "libpack tally says opened after the container appears (%d open lines): %s", lp_open_lines, tl);
+        // 另一个资源根里的库是坏的（lib.idx 不是容器）：照旧报红 libpack_container_rejected，库状态 = 坏，不打「不在」
+        char root2[300], d2[700], f2[760];
+        snprintf(root2, sizeof root2, "%s-bad", root); mkdir(root2, 0700);
+        snprintf(d2, sizeof d2, "%s/shaders", root2); mkdir(d2, 0700); snprintf(d2, sizeof d2, "%s/shaders/direct", root2); mkdir(d2, 0700);
+        snprintf(d2, sizeof d2, "%s/shaders/direct/b-%s-vk", root2, DMSH_CHAIN); mkdir(d2, 0700);
+        snprintf(f2, sizeof f2, "%s/lib.idx", d2); { FILE *g = fopen(f2, "wb"); if (g) { fputs("not a libpack index", g); fclose(g); } }
+        setenv("S2A_SHADER_REVISION_ROOT", root2, 1); lp_missing_lines = 0; last_red[0] = 0;
+        rp_shader_reset(); compiler_calls = 0;
+        { struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL; rp_shader_resolve(&q, &p); }
+        nvk_shader_test_tally_line(tl, sizeof tl);
+        CHECK(strstr(tl, "出包预编（库坏）") != NULL && lp_missing_lines == 0, "broken container: tally says bad, no missing line (%d): %s", lp_missing_lines, tl);
+        unlink(f2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders/direct", root2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders", root2); rmdir(d2); rmdir(root2);
     }
     fake_gs_success = 0; external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
@@ -1418,6 +1520,7 @@ int main(int argc, char **argv) {
         return emit_real_request(argv[2], argv[3], argv[4], argv[5], !strcmp(argv[1], "--execute-tbuf") ? 2 : !strcmp(argv[1], "--emit-real-tbuf"));
     if (argc == 6 && (!strcmp(argv[1], "--emit-compute-tbuf") || !strcmp(argv[1], "--execute-compute-tbuf")))
         return emit_compute_request(argv[2], argv[3], argv[4], argv[5], !strcmp(argv[1], "--execute-compute-tbuf"));
+    if (argc == 2 && !strcmp(argv[1], "--sig-hot")) { sig_hot_test(); printf("nvk shader pool (sig hot): %d checks, %d failures\n", checks, failures); return failures ? 1 : 0; }
     if (argc == 2 && !strcmp(argv[1], "--alias-off")) {
         // 结果合并开关关闭（debug.s2a.nvk_alias=0）：alias_on() 进程内只读一次，关闭态单独起一个进程
         fixture_alias_flag = 0;

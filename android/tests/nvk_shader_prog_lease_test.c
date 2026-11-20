@@ -126,7 +126,7 @@ int s2a_program_cache_probe(const char *dir, const uint8_t identity[32], uint8_t
     (void)dir; (void)identity; (void)why; (void)why_size;
     if (result_sha) memset(result_sha, 0, 32);
     if (len) *len = 0;
-    return -1;
+    return 1;   // 没有文件（返回值口径见 program_cache.h）
 }
 int s2a_offline_library_fetch(const char *revision_root, const struct s2a_offline_request *request,
                               struct s2a_offline_program *out, char *why, size_t why_size) {

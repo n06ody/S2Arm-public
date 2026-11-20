@@ -32,6 +32,7 @@
 #include "nvn_backend.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
+#include "nvn_hot_cnt.h"   // 热点诊断计数（缺省关）
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
 #include "nvn_vk_format.h"
 #include "nvn_pipe_flight.h"   // 配方级在途表（纯逻辑）：同配方合并成一份创建，不同配方不互相排队
@@ -435,6 +436,46 @@ static uint64_t g_life_ns[8], g_life_n[8];
 #define LIFE_ADD(i) do { if (g_draw_tm) { uint64_t ln_ = now_ns(); __atomic_fetch_add(&g_life_ns[i], ln_ - lt_, __ATOMIC_RELAXED); __atomic_fetch_add(&g_life_n[i], 1, __ATOMIC_RELAXED); lt_ = ln_; } } while (0)
 static uint64_t now_ns(void);
 static int g_draw_tm; static uint64_t g_draw_ns[3];   // 绘制入口分段计时：描述符 / 状态 / 顶点索引与绘制调用
+// 热点计数 ①（nvn_hot_cnt.h，开关 nvk_hot_cnt 缺省关）：顶点缓冲绑定。有换绑的绘制笔数 / vkCmdBindVertexBuffers 调用数 / 变化槽数 / 连续区间数
+static int g_hot_cnt; static uint64_t g_hot_vb[4];
+void nvn_gpu_vk_hot_cnt_set(int on) { __atomic_store_n(&g_hot_cnt, on ? 1 : 0, __ATOMIC_RELAXED); }
+void nvn_gpu_vk_test_hot_vb(uint64_t out[4]) { for (int i = 0; i < 4; i++) out[i] = __atomic_load_n(&g_hot_vb[i], __ATOMIC_RELAXED); }
+// ② ③ 在别的模块里；只链后端的目标没有它们（弱引用为空就不打那一行）
+extern void s2a_cfdict_hot_enable(int) __attribute__((weak)); extern void s2a_cfdict_hot_take(struct s2a_cfdict_hot *) __attribute__((weak));
+extern void nvk_shader_sig_hot_enable(int) __attribute__((weak)); extern void nvk_shader_sig_hot_take(struct nvk_sig_hot *) __attribute__((weak));
+// 上屏线程每帧调一次（np = 第几帧）：第 1、301、601… 帧读开关并传给另两个模块，第 300、600… 帧打这一窗的读数（近 300 帧，按帧平均）。
+static void hot_cnt_window(uint64_t np) {
+    if (np % 300 == 1) {
+        const int on = nvn_plat_flag("nvk_hot_cnt", 0) != 0;
+        nvn_gpu_vk_hot_cnt_set(on);
+        if (s2a_cfdict_hot_enable) s2a_cfdict_hot_enable(on);
+        if (nvk_shader_sig_hot_enable) nvk_shader_sig_hot_enable(on);
+    }
+    if (np % 300 || !__atomic_load_n(&g_hot_cnt, __ATOMIC_RELAXED)) return;
+    char b[480];
+    { uint64_t v[4]; for (int i = 0; i < 4; i++) v[i] = __atomic_exchange_n(&g_hot_vb[i], 0, __ATOMIC_RELAXED);
+      snprintf(b, sizeof b, "热点计数·顶点缓冲绑定（每帧，近 300 帧）：有换绑的绘制 %.1f 笔；vkCmdBindVertexBuffers %.1f 次、变化槽 %.1f 个、连续区间 %.1f 段；合并相邻槽可省 %.1f 次（占绑定调用 %.1f%%）",
+          v[0] / 300.0, v[1] / 300.0, v[2] / 300.0, v[3] / 300.0, (double)(v[2] - v[3]) / 300.0, v[1] ? 100.0 * (double)(v[2] - v[3]) / (double)v[1] : 0.0);
+      nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
+    if (s2a_cfdict_hot_take) {
+        struct s2a_cfdict_hot h; s2a_cfdict_hot_take(&h);
+        snprintf(b, sizeof b, "热点计数·指针表查找（CFDictionaryGetValue，每帧，近 300 帧）：查 %.1f 次、比较 %.1f 次（平均每次 %.1f、窗口内最多 %llu）、命中 %.1f%%、与同表上次同键 %.1f%%；表 %u 张共 %u 键（单张表本局最多 %u 键）",
+            h.lookups / 300.0, h.compares / 300.0, h.lookups ? (double)h.compares / (double)h.lookups : 0.0, (unsigned long long)h.max_cmp,
+            h.lookups ? 100.0 * (double)h.hits / (double)h.lookups : 0.0, h.lookups ? 100.0 * (double)h.same_key / (double)h.lookups : 0.0, h.tables, h.keys, h.keys_max);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+    }
+    if (nvk_shader_sig_hot_take) {
+        static const char *const site[NVK_SIG_SITES] = {"分离槽", "组合槽", "高槽", "GS 组合槽", "计算图像槽"};
+        struct nvk_sig_hot h; nvk_shader_sig_hot_take(&h);
+        size_t o = (size_t)snprintf(b, sizeof b, "热点计数·贴图事实摘要（每帧，近 300 帧；命中 / 首次 / 登记表变 / 池变 / 槽变 / 不缓存，重算墙钟毫秒）：");
+        for (int i = 0; i < NVK_SIG_SITES && o < sizeof b; i++)
+            o += (size_t)snprintf(b + o, sizeof b - o, "%s%s %.1f/%.1f/%.1f/%.1f/%.1f/%.1f %.3f", i ? "；" : "", site[i],
+                h.n[i][NVK_SIG_HIT] / 300.0, h.n[i][NVK_SIG_FIRST] / 300.0, h.n[i][NVK_SIG_REG] / 300.0, h.n[i][NVK_SIG_POOL] / 300.0,
+                h.n[i][NVK_SIG_SLOTS] / 300.0, h.n[i][NVK_SIG_UNCACHED] / 300.0, h.ns[i] / 300.0 / 1e6);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+    }
+}
+void nvn_gpu_vk_test_hot_window(uint64_t np) { hot_cnt_window(np); }   // 测试读数：直接驱动窗口（真机由上屏每帧调）
 static uint64_t g_feedback_stats[3]; // nvk_gputime：只读采样 draw / 快照 vkCmdCopyImage / 反馈重开次数，只增不清零
 static uint64_t g_draw_log_ns = 5000000000ull;         // 逐笔读数（nvn_gpu_draw 末尾）的周期，缺省 5 秒；测试钩子 nvn_gpu_vk_test_diag_timing 可缩短
 static void draw_tm_init(void) { if (!g_draw_tm) g_draw_tm = nvn_plat_flag("nvk_gputime", 0) != 0; }   // 与 GPU 时间戳同一个开关
@@ -2719,6 +2760,37 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     cmd_ref(c, d, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
+    pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
+    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
+    if (!ch || !n) return;
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!v[i].src || !v[i].dst || !buf_range(v[i].src, v[i].soff, v[i].bytes) || !buf_range(v[i].dst, v[i].doff, v[i].bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段越界", i); return; }
+        if (!v[i].bytes || (v[i].bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段长度 %llu 不是 4 的正整数倍", i, (unsigned long long)v[i].bytes); return; }
+    }
+    VkPipelineStageFlags dst = 0;
+    if (stages & 1u << NVN_GPU_SH_VS) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & 1u << NVN_GPU_SH_FS) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if ((stages & 1u << NVN_GPU_SH_GS) && g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    if (!dst) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 没给读的阶段（stages=%#x）", stages); return; }
+    // 源可能刚被计算 / 传输 / 图形写过（GPU 写出的间接记录、主段里的镜像同步），目标是本段新分的暂存：一道屏障盖住两者
+    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    enum { RUN = 64 }; VkBufferCopy r[RUN];
+    for (uint32_t i = 0; i < n;) {
+        struct nvn_gpu_buf_s *s = v[i].src, *d = v[i].dst; uint32_t k = 0;
+        while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
+        vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
+        cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
+    }
+    mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
+    pthread_mutex_lock(&g_mu);
+    g.stats[STAT_COPIES] += n;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -5688,13 +5760,19 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         if (!c->es.db_ok || memcmp(c->es.db, db, sizeof db)) { vkCmdSetDepthBias(c->cb, db[0], db[1], db[2]); memcpy(c->es.db, db, sizeof db); c->es.db_ok = 1; c->es_count[ES_DB]++; }
     }
     const uint64_t dt2 = dtm ? now_ns() : 0;
+    uint32_t vb_changed = 0, vb_calls = 0;   // 热点计数 ①：这一笔真发了绑定的槽、真发的绑定调用
     for (uint32_t s = 0; s < 16; s++) {
         if (!c->vbuf[s].buf) continue;
         VkBuffer vb = c->vbuf[s].buf->buffer;
         VkDeviceSize off = c->vbuf[s].off;
         if ((c->es.vb_ok >> s & 1) && c->es.vb[s] == vb && c->es.vboff[s] == off) continue;
-        vkCmdBindVertexBuffers(c->cb, s, 1, &vb, &off);
+        vkCmdBindVertexBuffers(c->cb, s, 1, &vb, &off); vb_calls++;
         c->es.vb[s] = vb; c->es.vboff[s] = off; c->es.vb_ok |= (uint16_t)(1u << s); c->es_count[ES_VB]++;
+        vb_changed |= 1u << s;
+    }
+    if (vb_changed && __atomic_load_n(&g_hot_cnt, __ATOMIC_RELAXED)) {
+        __atomic_fetch_add(&g_hot_vb[0], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_hot_vb[1], vb_calls, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_hot_vb[2], (uint64_t)__builtin_popcount(vb_changed), __ATOMIC_RELAXED); __atomic_fetch_add(&g_hot_vb[3], nvn_hot_runs16(vb_changed), __ATOMIC_RELAXED);
     }
     uint32_t inst = a->instances ? a->instances : 1;
     uint32_t draws = a->max_draws ? a->max_draws : 1;

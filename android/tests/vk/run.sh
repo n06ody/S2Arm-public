@@ -74,7 +74,7 @@ fi
 # --zero-attr-core（#977）：同一套真 rp_draw + 真后端，跑零属性用例 t_replay_zero_attr.c。
 if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     if [ "$mode" = "--indirect-core" ]; then
-        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp)
+        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp replay_binst.vert replay_binst.frag replay_binst_args.comp)
     else
         core_test=t_replay_zero_attr; core_shaders=(zattr.vert quad.frag)
     fi
@@ -353,7 +353,7 @@ case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
-    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--sampler-minmax-only|--c63-same-view|--stencil8-only|--hot-cnt-only|--ds-upload-only|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -696,6 +696,22 @@ if [ "$mode" = "--ds-upload-only" ]; then
         echo "【红】C1581K 深度模板上传：rc=${rc}，没有 failures=0 或有 validation 报错" >&2; exit 1
     fi
     echo '【绿】C1581K 深度模板上传：深度面回读一致、模板面生效，validation 0 条'; exit 0
+fi
+
+# C-HOT：热点计数 ①（开关 nvk_hot_cnt 缺省关）：顶点缓冲绑定的变化槽 / 连续区间计数与窗口行，关着不记不打。validation 0 条才绿。
+if [ "$mode" = "--hot-cnt-only" ]; then
+    for dq in 0 1; do   # 两级回放关 / 开各一遍：计数在后端调用处，录制是否异步不影响
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --hot-cnt-only 2>&1 | tee "$out/hot-cnt-$dq.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || ! grep -q 'C-HOT isolated failures=0' "$out/hot-cnt-$dq.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/hot-cnt-$dq.log"; then
+            echo "【红】C-HOT 顶点缓冲绑定计数（DQ=$dq）：rc=${rc}，没有 failures=0 或有 validation 报错" >&2; exit 1
+        fi
+    done
+    unset S2A_TEST_NVK_DQ
+    echo '【绿】C-HOT 顶点缓冲绑定计数（DQ 关 / 开）：槽 / 区间 / 窗口行对上，关着不记，validation 0 条'; exit 0
 fi
 
 # C1581O：纯模板格式 STENCIL8 当模板附件：图像 / 视图的面只有模板面，管线的兼容通道按 sfmt 挂上这个附件。左绿右蓝、validation 0 条才绿。

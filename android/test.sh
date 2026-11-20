@@ -340,6 +340,9 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # 几何着色器走出包预编库的负对照（正例在上面无参那一步里单独起进程跑）：撤掉接线各一处，--gs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mutants
+# 热点计数 ②（缺省关）：CFDictionary 兼容表查找的比较次数 / 命中 / 同键 / 键数，正例 + 逐处撤改必红（纯宿主 C，秒级）
+s2a_gate_step "$PY" "$android_dir/tests/cfdict_hot_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/cfdict_hot_test.py" --withdraw
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。

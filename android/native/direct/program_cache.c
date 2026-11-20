@@ -247,7 +247,10 @@ int s2a_program_cache_probe(const char *dir, const uint8_t identity[32],
     char path[PCACHE_PATH];
     if (entry_path(dir, identity, path, sizeof path)) { setwhy(why, why_size, "缓存路径过长"); return -1; }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) { setwhy(why, why_size, errno == ENOENT ? "未命中" : "打开失败：%s", strerror(errno)); return -1; }
+    if (fd < 0) {
+        if (errno == ENOENT) { setwhy(why, why_size, "未命中"); return 1; }   // 没有这个身份的文件：与「文件坏」分开返回（调用方分开计数）
+        setwhy(why, why_size, "打开失败：%s", strerror(errno)); return -1;
+    }
     struct stat st;
     uint8_t head[PCACHE_HEADER];
     if (fstat(fd, &st) != 0 || st.st_size < (off_t)PCACHE_HEADER) { close(fd); setwhy(why, why_size, "文件短于头部"); return -1; }

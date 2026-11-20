@@ -251,21 +251,25 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
         uint32_t mask_value = 0;
         if (!s2a_jv_obj_find(st, "attributeReadMask", &mask) && !s2a_jv_u32(mask, &mask_value))
             out->stage[idx].attr_mask = mask_value;
-        // c0Reads（可选）：编译器证得的本阶段 c0 读集。缺字段或 null = 未知（binst_unread 留 0，回放照旧拷 base instance）；
-        // 数组且没有一段与 c0 + 0x644 的 4 字节相交 = 已证不读。写了但形状不对如实拒，不当成未知。
-        { struct s2a_jv reads;
-          if (!s2a_jv_obj_find(st, "c0Reads", &reads) && !s2a_jv_is_null(reads)) {
-              int rn = s2a_jv_arr_count(reads); int hit = 0;
-              if (rn < 0) return fail(why, why_size, "stage c0 reads must be an array or null");
-              for (int r = 0; r < rn; r++) {
-                  struct s2a_jv pair, off, size; uint32_t o = 0, z = 0;
-                  if (s2a_jv_arr_item(reads, r, &pair) || s2a_jv_arr_count(pair) != 2 || s2a_jv_arr_item(pair, 0, &off) ||
-                      s2a_jv_arr_item(pair, 1, &size) || compute_u32(off, &o) || compute_u32(size, &z) || !z)
-                      return fail(why, why_size, "stage c0 read range is invalid");
-                  if ((uint64_t)o < FD_C0_BASE_INSTANCE + 4 && (uint64_t)o + z > FD_C0_BASE_INSTANCE) hit = 1;
-              }
-              out->stage[idx].binst_unread = !hit;
-          } }
+        // 两份读集均逐范围校验；缺字段 / null 是未知，不能当成不读。
+        for (int variant = 0; variant < 2; variant++) {
+            struct s2a_jv reads;
+            const char *field = variant ? "c0ReadsStatic" : "c0Reads";
+            if (s2a_jv_obj_find(st, field, &reads)) continue;
+            if (variant) out->stage[idx].binst_static_present = 1;
+            if (s2a_jv_is_null(reads)) continue;
+            int rn = s2a_jv_arr_count(reads), hit = 0;
+            if (rn < 0) return fail(why, why_size, "stage c0 reads must be an array or null");
+            for (int r = 0; r < rn; r++) {
+                struct s2a_jv pair, off, size; uint32_t o = 0, z = 0;
+                if (s2a_jv_arr_item(reads, r, &pair) || s2a_jv_arr_count(pair) != 2 || s2a_jv_arr_item(pair, 0, &off) ||
+                    s2a_jv_arr_item(pair, 1, &size) || compute_u32(off, &o) || compute_u32(size, &z) || !z)
+                    return fail(why, why_size, "stage c0 read range is invalid");
+                if ((uint64_t)o < FD_C0_BASE_INSTANCE + 4 && (uint64_t)o + z > FD_C0_BASE_INSTANCE) hit = 1;
+            }
+            if (variant) out->stage[idx].binst_unread_static = !hit;
+            else out->stage[idx].binst_unread = !hit;
+        }
         // 片元着色器的输出映射（每个颜色目标 4 位、RGBA 各 1 位）：在阶段的 info 里；读不到 = 全 1（不屏蔽）
         out->stage[idx].fragment_output_map = 0xffffffffu;
         { struct s2a_jv info = { NULL, 0 }, om = { NULL, 0 }; uint32_t om_v = 0;

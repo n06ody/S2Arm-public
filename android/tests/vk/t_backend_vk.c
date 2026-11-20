@@ -65,7 +65,10 @@ static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
+static int g_hot_flag;   // C-HOT：调试开关 nvk_hot_cnt 读成这个值（缺省 0 = 关，同生产缺省）
+static char g_hot_line[512]; static int g_hot_lines;   // C-HOT：抓「热点计数·顶点缓冲绑定」行（只由测试线程打）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_hot_cnt")) return g_hot_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
@@ -95,6 +98,7 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (text && !strncmp(text, "热点计数·", strlen("热点计数·"))) { snprintf(g_hot_line, sizeof g_hot_line, "%s", text); g_hot_lines++; }
     if (text && strstr(text, "msaa_fallback:")) {
         if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
         if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
@@ -8058,6 +8062,68 @@ static void c75_depth_bias(const char *dir) {
     free(vm); free(fm); free(vm2); free(fm2);
 }
 
+// C-HOT（热点计数 ①，开关 nvk_hot_cnt 缺省关）：顶点缓冲绑定的「变化槽数 − 连续区间数」= 合并相邻槽可省的调用数。
+//   槽 0、1、2、4 绑缓冲，每笔换偏移 → 一笔 4 个变化槽、2 段连续区间（0–2、4）、4 次 vkCmdBindVertexBuffers；同样一笔不换绑 → 不记。
+//   只换槽 1、2 → 2 槽 1 段；只换槽 0、4 → 2 槽 2 段。窗口行：300 笔每笔都换 4 槽 → 每帧 有换绑的绘制 1.0、调用 4.0、变化槽 4.0、区间 2.0、可省 2.0（50.0%）。
+//   开关关着：照样录（绑定调用数不变），计数不涨、窗口不打。行为不变：录了的顶点缓冲次数（es_count）与计数里的调用数相等。
+extern void nvn_gpu_vk_test_hot_vb(uint64_t out[4]);
+extern void nvn_gpu_vk_test_hot_window(uint64_t np);
+static void c_hot_vb(const char *dir) {
+    nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
+    if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) { CHECK(0, "C-HOT 读不到 solid_green"); return; }
+    nvn_gpu_pipe_desc pd; fill_gpipe_desc(&pd, vs, fs, 0);
+    nvn_gpu_err e; nvn_gpu_pipe pipe = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "C-HOT pipe：%d %s", e.rc.code, e.why);
+    nvn_gpu_tex out = make_tex(16, 16, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED);
+    nvn_gpu_view ov = make_view(out);
+    const float verts[8][4] = {{-1, -1, 0, 1}, {3, -1, 0, 1}, {-1, 3, 0, 1}, {-1, -1, 0, 1}, {-1, -1, 0, 1}, {3, -1, 0, 1}, {-1, 3, 0, 1}, {-1, -1, 0, 1}};
+    nvn_gpu_buf vb = make_buf(sizeof verts, NVN_GPU_MEM_SHARED, verts);
+    nvn_gpu_pass_desc p; memset(&p, 0, sizeof p);
+    p.ncolor = 1; p.color[0].view = ov; p.color[0].load = NVN_GPU_LOAD_CLEAR; p.color[0].store = NVN_GPU_STORE_STORE; p.w = 16; p.h = 16; p.layers = 1;
+    nvn_gpu_dyn dyn; full_dyn(&dyn);
+    nvn_gpu_draw_args da; memset(&da, 0, sizeof da); da.prim = 4; da.count = 3; da.instances = 1;
+    uint64_t v[4], base[4]; uint32_t n[9];
+#define HOT_EXPECT(tag, d0, d1, d2, d3) do { nvn_gpu_vk_test_hot_vb(v); \
+        CHECK(v[0] - base[0] == (d0) && v[1] - base[1] == (d1) && v[2] - base[2] == (d2) && v[3] - base[3] == (d3), \
+              "C-HOT %s：有换绑的绘制 %llu、调用 %llu、变化槽 %llu、区间 %llu，期望 %u %u %u %u", tag, (unsigned long long)(v[0] - base[0]), \
+              (unsigned long long)(v[1] - base[1]), (unsigned long long)(v[2] - base[2]), (unsigned long long)(v[3] - base[3]), (d0), (d1), (d2), (d3)); \
+        memcpy(base, v, sizeof v); } while (0)
+    g_hot_flag = 1; nvn_gpu_vk_test_hot_window(1); g_hot_lines = 0; nvn_gpu_vk_test_hot_vb(base);
+    nvn_gpu_cmd c = begin_cmd(); nvn_gpu_pass_begin(c, &p);
+    nvn_gpu_set_pipe(c, pipe); nvn_gpu_set_dyn(c, &dyn);
+    nvn_gpu_set_vbuf(c, 0, vb, 0); nvn_gpu_set_vbuf(c, 1, vb, 0); nvn_gpu_set_vbuf(c, 2, vb, 0); nvn_gpu_set_vbuf(c, 4, vb, 0);
+    nvn_gpu_draw(c, &da); HOT_EXPECT("① 槽 0 1 2 4 首次", 1u, 4u, 4u, 2u);
+    nvn_gpu_draw(c, &da); HOT_EXPECT("② 同样一笔", 0u, 0u, 0u, 0u);
+    nvn_gpu_set_vbuf(c, 1, vb, 16); nvn_gpu_set_vbuf(c, 2, vb, 16); nvn_gpu_draw(c, &da); HOT_EXPECT("③ 只换槽 1 2", 1u, 2u, 2u, 1u);
+    nvn_gpu_set_vbuf(c, 0, vb, 16); nvn_gpu_set_vbuf(c, 4, vb, 16); nvn_gpu_draw(c, &da); HOT_EXPECT("④ 只换槽 0 4", 1u, 2u, 2u, 2u);
+    nvn_gpu_vk_test_emit_counts(c, n); CHECK(n[6] == 8, "C-HOT 录了的顶点缓冲 %u 次 = 计数里的调用 8 次", n[6]);
+    // 窗口行：每笔都换 4 槽，300 笔
+    nvn_gpu_vk_test_hot_window(300); g_hot_lines = 0; nvn_gpu_vk_test_hot_vb(base);
+    for (int i = 0; i < 300; i++) {
+        const uint64_t off = (uint64_t)(i & 1 ? 16 : 0);   // ④ 之后四个槽都在 16：第 0 笔换到 0，此后每笔都换
+        nvn_gpu_set_vbuf(c, 0, vb, off); nvn_gpu_set_vbuf(c, 1, vb, off); nvn_gpu_set_vbuf(c, 2, vb, off); nvn_gpu_set_vbuf(c, 4, vb, off); nvn_gpu_draw(c, &da);
+    }
+    nvn_gpu_vk_test_hot_window(600);
+    CHECK(g_hot_lines == 1 && strstr(g_hot_line, "有换绑的绘制 1.0 笔；vkCmdBindVertexBuffers 4.0 次、变化槽 4.0 个、连续区间 2.0 段；合并相邻槽可省 2.0 次（占绑定调用 50.0%）"),
+          "C-HOT 窗口行（%d 行）：%s", g_hot_lines, g_hot_line);
+    nvn_gpu_vk_test_hot_vb(v); CHECK(!v[0] && !v[1] && !v[2] && !v[3], "C-HOT 窗口打完清零");
+    // 关着：照样录，计数不涨、窗口不打
+    g_hot_flag = 0; nvn_gpu_vk_test_hot_window(601); g_hot_lines = 0; nvn_gpu_vk_test_hot_vb(base);
+    nvn_gpu_vk_test_emit_counts(c, n); const uint32_t vb_before = n[6];
+    nvn_gpu_set_vbuf(c, 0, vb, 0); nvn_gpu_set_vbuf(c, 4, vb, 0); nvn_gpu_draw(c, &da);
+    nvn_gpu_vk_test_emit_counts(c, n); CHECK(n[6] == vb_before + 2, "C-HOT 关着照样录顶点缓冲：%u → %u", vb_before, n[6]);
+    HOT_EXPECT("⑤ 关着", 0u, 0u, 0u, 0u);
+    nvn_gpu_vk_test_hot_window(900); CHECK(g_hot_lines == 0, "C-HOT 关着不打窗口行（%d 行）", g_hot_lines);
+#undef HOT_EXPECT
+    nvn_gpu_pass_end(c);
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 150, on_done, NULL, &e);
+    CHECK(OK(r), "C-HOT commit：%d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(150, 5000000000ull, &e);
+    CHECK(OK(r), "C-HOT wait：%d %s", r.code, e.why);
+    nvn_gpu_buf_release(vb, NULL, NULL); nvn_gpu_view_release(ov); nvn_gpu_tex_release(out);
+    free(vm); free(fm);
+}
+
 // C85（#708）：冗余状态消除——管线、动态状态、顶点 / 索引缓冲、push 只在和上次真正录进去的不同时才录。
 //   计数（期望值手算，下标：管线、视口、裁剪、混合常量、模板、深度偏移、顶点缓冲、索引缓冲、push）：
 //   ① 同一通道里两笔完全相同的带索引绘制 → 各录 1 次；② 第三笔只改裁剪 → 只有裁剪多 1 次；
@@ -10464,6 +10530,15 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+    if (argc > 2 && !strcmp(argv[2], "--hot-cnt-only")) {   // 只跑 C-HOT（默认档里也跑）；给红 / 绿 / 负控取证用
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        if (!open_backend()) return 1;
+        c_hot_vb(argv[1]);
+        nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C-HOT close %s", e.why);
+        printf("C-HOT isolated failures=%d\n", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 2 && !strcmp(argv[2], "--msaa-only")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;
@@ -10952,6 +11027,9 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;
     c85_redundant_state(argv[1]);   // 独占会话：时间线信号不受前后用例的排列影响
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C85 close：%d %s", e18.rc.code, e18.why);
+    if (!open_backend()) return 1;
+    c_hot_vb(argv[1]);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C-HOT close：%d %s", e18.rc.code, e18.why);
     if (!open_backend()) return 1;
     c58a_push_oob_cs(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C58a close：%d %s", e18.rc.code, e18.why);

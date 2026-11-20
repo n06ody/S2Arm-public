@@ -12,10 +12,12 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "nvn_vk_prog_warm.h"
 #include "nvn_plat.h"
 #include "direct/compile_request.h"
+#include "direct/sha256.h"
 #ifdef __APPLE__   // 文件修改时间字段：Linux / 安卓是 st_mtim，苹果是 st_mtimespec（宿主测试在 macOS 上也编）
 #define S2A_ST_MTIM st_mtimespec
 #else
@@ -31,7 +33,7 @@ static int g_warm_max = -1;
 static char g_profile[128] = "profile-A";
 static char g_closure[64] = "closure-A";
 static int32_t g_abi = 7;
-static char g_last_red[512], g_last_info[2048];
+static char g_last_red[512], g_last_warn[512], g_last_info[2048];
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE && g_dir[0] ? g_dir : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_warm_max")) return g_warm_max >= 0 ? g_warm_max : dflt;
@@ -40,6 +42,7 @@ int nvn_plat_flag(const char *name, int dflt) {
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
     if (level == NVN_PLAT_LOG_RED) snprintf(g_last_red, sizeof g_last_red, "%s", text);
+    if (level == NVN_PLAT_LOG_WARN) snprintf(g_last_warn, sizeof g_last_warn, "%s", text);
     snprintf(g_last_info, sizeof g_last_info, "%s", text);
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *out) {
@@ -95,6 +98,14 @@ static int write_file(const char *path, const uint8_t *buf, size_t len) {
     return ok ? 0 : -1;
 }
 static void dir_reset(void) { g_warm_max = -1; nvk_prog_warm_reset(); }
+// 清单路径按闭包命名：programs-v1-<SHA-256(闭包原文) 前 8 字节 hex>.bin（期望值由测试自己算，不调被测实现）
+static void closure_path(char *out, size_t n, const char *dir, const char *closure) {
+    s2a_sha256 h; uint8_t d[32]; s2a_sha256_init(&h); s2a_sha256_update(&h, closure, strlen(closure)); s2a_sha256_final(&h, d);
+    char hx[17]; for (int i = 0; i < 8; i++) snprintf(hx + 2 * i, 3, "%02x", d[i]);
+    snprintf(out, n, "%s/programs-v1-%s.bin", dir, hx);
+}
+static int exists(const char *path) { struct stat st; return stat(path, &st) == 0; }
+static void set_mtime(const char *path, time_t t) { struct utimbuf u = { t, t }; utime(path, &u); }
 static int load_now(void) { return nvk_prog_warm_load(); }
 static void stats_now(struct nvk_prog_warm_stats *s) { nvk_prog_warm_stats(s); }
 
@@ -104,8 +115,9 @@ int main(void) {
     CHECK(dir != NULL, "temp dir");
     if (!dir) return 1;
     snprintf(g_dir, sizeof g_dir, "%s", dir);
-    char file[600];
-    snprintf(file, sizeof file, "%s/programs-v1.bin", dir);
+    char file[600], legacy[600];
+    closure_path(file, sizeof file, dir, g_closure);
+    snprintf(legacy, sizeof legacy, "%s/programs-v1.bin", dir);
 
     // 1) 首次没有文件：readiness 事实齐 → 0 条（不是失败），pending 0。
     {
@@ -350,24 +362,52 @@ int main(void) {
         free(good);
     }
 
-    // 6) 本局有效性：profile / directABI / translator 闭包任一变化，整份拒绝（不是逐条过滤）。
+    // 6) 本局有效性。profile / directABI 变：本闭包这份整份拒绝（打黄、不打红），原因各报各的。
+    //    闭包变：清单按闭包分文件，新闭包没有自己的清单 → 从零记录、不拒绝、旧闭包那份不动。
     {
-        for (int i = 0; i < 3; i++) {
-            char saved_profile[128], saved_closure[64];
-            snprintf(saved_profile, sizeof saved_profile, "%s", g_profile);
-            snprintf(saved_closure, sizeof saved_closure, "%s", g_closure);
+        for (int i = 0; i < 2; i++) {
+            char saved_profile[128]; snprintf(saved_profile, sizeof saved_profile, "%s", g_profile);
             int32_t saved_abi = g_abi;
-            if (i == 0) g_profile[0] = (char)(g_profile[0] ^ 1);        // profile 原文变一个字节
+            if (i == 0) g_profile[0] = (char)(g_profile[0] ^ 1);        // profile 原文变一个字节（同一版翻译器）
             if (i == 1) g_abi = saved_abi + 1;
-            if (i == 2) g_closure[0] = (char)(g_closure[0] ^ 1);        // translator 闭包变一个字节
-            nvk_prog_warm_reset();
-            CHECK(load_now() == 0, "manifest from another session (%s) is rejected whole", i == 0 ? "profile" : i == 1 ? "ABI" : "closure");
+            nvk_prog_warm_reset(); g_last_red[0] = g_last_warn[0] = 0;
+            CHECK(load_now() == 0, "manifest from another session (%s) is rejected whole", i == 0 ? "profile" : "ABI");
             struct nvk_prog_warm_stats s; stats_now(&s);
             CHECK(s.loaded == 0 && s.rejected == 3, "rejected entries are counted (%s), loaded=%llu rejected=%llu",
-                  i == 0 ? "profile" : i == 1 ? "ABI" : "closure", (unsigned long long)s.loaded, (unsigned long long)s.rejected);
+                  i == 0 ? "profile" : "ABI", (unsigned long long)s.loaded, (unsigned long long)s.rejected);
+            CHECK(strstr(g_last_warn, i == 0 ? "设备 profile 不同" : "directABI 不同") && !g_last_red[0],
+                  "%s mismatch is a yellow line with its own reason: warn=%s red=%s", i == 0 ? "profile" : "ABI", g_last_warn, g_last_red);
             snprintf(g_profile, sizeof g_profile, "%s", saved_profile);
-            snprintf(g_closure, sizeof g_closure, "%s", saved_closure);
             g_abi = saved_abi;
+        }
+        {   // 换闭包：新闭包的文件名不同，没有就从零记录；旧闭包那份留着
+            char saved_closure[64]; snprintf(saved_closure, sizeof saved_closure, "%s", g_closure);
+            g_closure[0] = (char)(g_closure[0] ^ 1);
+            char other[600]; closure_path(other, sizeof other, dir, g_closure);
+            nvk_prog_warm_reset(); g_last_red[0] = g_last_warn[0] = 0;
+            CHECK(load_now() == 0, "another closure has no manifest of its own yet");
+            struct nvk_prog_warm_stats s; stats_now(&s);
+            CHECK(s.loaded == 0 && s.rejected == 0 && !g_last_red[0] && !g_last_warn[0], "new closure starts empty without a rejection (rejected=%llu red=%s warn=%s)",
+                  (unsigned long long)s.rejected, g_last_red, g_last_warn);
+            CHECK(strstr(g_last_info, "还没有这一版翻译器的清单") && strstr(g_last_info, strrchr(other, '/') + 1), "missing manifest line names this closure's file: %s", g_last_info);
+            CHECK(exists(file) && !exists(other), "the previous closure's manifest is left alone");
+            snprintf(g_closure, sizeof g_closure, "%s", saved_closure);
+        }
+        {   // 旧名文件（一款一份，另一版闭包记的）碰上新闭包且 profile 也不同（真机上换 APK 时 profile 原文里的闭包也跟着变）：
+            //   原因必须报闭包，不能报「设备 profile」
+            uint8_t *good = NULL; size_t glen = 0;
+            CHECK(read_file(file, &good, &glen) == 0 && write_file(legacy, good, glen) == 0, "legacy-named manifest from closure A written");
+            free(good);
+            char saved_profile[128], saved_closure[64];
+            snprintf(saved_profile, sizeof saved_profile, "%s", g_profile); snprintf(saved_closure, sizeof saved_closure, "%s", g_closure);
+            g_profile[0] = (char)(g_profile[0] ^ 1); g_closure[0] = (char)(g_closure[0] ^ 1);
+            nvk_prog_warm_reset(); g_last_red[0] = g_last_warn[0] = 0;
+            CHECK(load_now() == 0, "legacy manifest of another closure is rejected");
+            struct nvk_prog_warm_stats s; stats_now(&s);
+            CHECK(s.rejected == 3 && strstr(g_last_warn, "翻译器闭包不同") && !strstr(g_last_warn, "设备 profile"),
+                  "closure is reported before profile: %s", g_last_warn);
+            snprintf(g_profile, sizeof g_profile, "%s", saved_profile); snprintf(g_closure, sizeof g_closure, "%s", saved_closure);
+            unlink(legacy);
         }
         nvk_prog_warm_reset();
         CHECK(load_now() == 3, "same session facts accept the manifest again");
@@ -427,6 +467,47 @@ int main(void) {
         CHECK(!nvk_prog_warm_contains(a.identity), "next session: previous session's note is cleared");
     }
 
+    // 10) A/B 交替（两臂闭包不同）：各自的清单各自留着，换回来还在；第三个闭包落盘后只留最近 2 份，旧名文件删掉。
+    {
+        char ca[64], cb[64], cc[64], pa[600], pb[600], pc[600];
+        snprintf(ca, sizeof ca, "%s", g_closure); snprintf(cb, sizeof cb, "closure-B"); snprintf(cc, sizeof cc, "closure-C");
+        closure_path(pa, sizeof pa, dir, ca); closure_path(pb, sizeof pb, dir, cb); closure_path(pc, sizeof pc, dir, cc);
+        snprintf(g_closure, sizeof g_closure, "%s", ca); dir_reset();
+        for (int n = 1; n <= 3; n++) { struct nvk_prog_rec r = mkrec(n, 3); nvk_prog_warm_note(&r); }
+        nvk_prog_warm_save();
+        snprintf(g_closure, sizeof g_closure, "%s", cb); nvk_prog_warm_reset();
+        CHECK(load_now() == 0, "arm B starts without A's manifest");
+        for (int n = 4; n <= 5; n++) { struct nvk_prog_rec r = mkrec(n, 3); nvk_prog_warm_note(&r); }
+        nvk_prog_warm_save();
+        CHECK(exists(pa) && exists(pb), "both arms keep their own manifest");
+        snprintf(g_closure, sizeof g_closure, "%s", ca); nvk_prog_warm_reset();
+        CHECK(load_now() == 3, "back on arm A: its 3 entries are still there");
+        snprintf(g_closure, sizeof g_closure, "%s", cb); nvk_prog_warm_reset();
+        CHECK(load_now() == 2, "back on arm B: its 2 entries are still there");
+        set_mtime(pa, time(NULL) - 3600); set_mtime(pb, time(NULL) - 60);   // A 最旧、B 较新
+        CHECK(write_file(legacy, (const uint8_t *)"x", 1) == 0, "stray legacy-named file");
+        snprintf(g_closure, sizeof g_closure, "%s", cc); nvk_prog_warm_reset();
+        CHECK(load_now() == 0, "arm C starts empty");
+        { struct nvk_prog_rec r = mkrec(6, 3); nvk_prog_warm_note(&r); }
+        nvk_prog_warm_save();
+        CHECK(exists(pc) && exists(pb) && !exists(pa), "after C saves: C and the newest other (B) stay, the oldest (A) is pruned (a=%d b=%d c=%d)", exists(pa), exists(pb), exists(pc));
+        CHECK(!exists(legacy), "the legacy-named file is removed after a per-closure save");
+        unlink(pb); unlink(pc);
+        snprintf(g_closure, sizeof g_closure, "%s", ca);
+    }
+    // 11) 升级过渡：只有旧名文件、闭包与本局相同 → 照收；落盘后换成按闭包命名的文件。
+    {
+        dir_reset();
+        for (int n = 1; n <= 2; n++) { struct nvk_prog_rec r = mkrec(n, 3); nvk_prog_warm_note(&r); }
+        nvk_prog_warm_save();
+        CHECK(rename(file, legacy) == 0 && !exists(file), "manifest moved to the legacy name");
+        nvk_prog_warm_reset();
+        CHECK(load_now() == 2, "legacy-named manifest of the same closure is accepted");
+        { struct nvk_prog_rec r = mkrec(3, 3); nvk_prog_warm_note(&r); }
+        nvk_prog_warm_save();
+        CHECK(exists(file) && !exists(legacy), "save writes the per-closure name and drops the legacy one");
+        unlink(file);
+    }
     printf("nvn_vk_prog_warm: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

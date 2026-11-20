@@ -707,12 +707,18 @@ namespace S2A.DirectCompiler
                     if (program.Kind == "graphics")
                     {
                         // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
-                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 分析不出（非标准布局、多个 c0、下标取值界证不了）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 非常量下标按取值界记整段（boundDynamic）：证得够不着 0x644 所在的 vec4 才算不读。
                         var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
                         int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
-                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, boundDynamic: true);
                         writer.WritePropertyName("c0Reads");
                         WriteRanges(writer, stageReads);
+                        // 同一内容同时携带无动态定界的原始读集，运行时只选消费策略，不改变缓存身份。
+                        int[][] staticReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0ReadsStatic");
+                        WriteRanges(writer, staticReads);
                     }
                     writer.WriteEndObject();
                 }

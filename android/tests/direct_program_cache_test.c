@@ -151,11 +151,11 @@ static void probe_tests(void) {
     path_for(id, path, sizeof path);
     uint64_t plen = 99;
 
-    // 未命中：-1，输出清零，原因「未命中」，不计 misses / failures
+    // 未命中：1（与「文件坏」的 -1 分开），输出清零，原因「未命中」，不计 misses / failures
     {
         uint64_t m0 = s2a_program_cache_misses(), f0 = s2a_program_cache_failures();
         memset(sha, 0xAA, sizeof sha);
-        CHECK(s2a_program_cache_probe(g_dir, id, sha, &plen, why, sizeof why) != 0, "probe of a missing entry fails");
+        CHECK(s2a_program_cache_probe(g_dir, id, sha, &plen, why, sizeof why) == 1, "probe of a missing entry returns 1 (no file), not -1 (bad file)");
         CHECK(!memcmp(sha, zero, 32) && plen == 0, "probe miss leaves outputs zeroed");
         CHECK(strstr(why, "未命中") != NULL, "probe miss is reported as a miss");
         CHECK(s2a_program_cache_misses() == m0 && s2a_program_cache_failures() == f0, "probe miss touches neither miss nor failure counters");
@@ -205,7 +205,7 @@ static void probe_tests(void) {
         why[0] = 0; memset(sha, 0xAA, sizeof sha); plen = 99;
         char what[96];
         snprintf(what, sizeof what, "probe rejects a damaged header: %s", bad[k].name);
-        CHECK(s2a_program_cache_probe(g_dir, id, sha, &plen, why, sizeof why) != 0, what);
+        CHECK(s2a_program_cache_probe(g_dir, id, sha, &plen, why, sizeof why) == -1, what);   // 坏文件是 -1，不是「没有文件」的 1
         snprintf(what, sizeof what, "probe damage leaves outputs zeroed: %s", bad[k].name);
         CHECK(!memcmp(sha, zero, 32) && plen == 0, what);
         snprintf(what, sizeof what, "probe damage is reported with its reason: %s", bad[k].name);

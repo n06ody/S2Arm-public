@@ -414,6 +414,29 @@ static void case_key_c1(void) {
 }
 
 // ⑦ 关闭（退路 debug.s2a.nvk_alias=0）：逐身份各装载、各释放
+// ⑨ 读头的两种失败分开数：这个身份没有缓存文件 → 「没有缓存文件」+1；有文件但头坏（magic 不对）→ 「缓存文件坏」+1，并打一行带原因的黄。
+//    换翻译器闭包后的第一局，读头失败几乎全是前一种（offline-shader-miss 调查），原先两种混在「读头失败」里。
+extern void nvk_shader_test_alias_probe(uint64_t out[3]);
+static void case_probe_split(void) {
+    rp_shader_reset();
+    uint64_t a[3], b[3];
+    nvk_shader_test_alias_probe(a);
+    (void)publish(41, 2);   // 没有缓存文件
+    nvk_shader_test_alias_probe(b);
+    CHECK(b[0] - a[0] == 1 && b[1] - a[1] == 1 && b[2] == a[2], "没有文件：读头 +%llu、没有缓存文件 +%llu、缓存文件坏 +%llu（期望 1 1 0）",
+          (unsigned long long)(b[0] - a[0]), (unsigned long long)(b[1] - a[1]), (unsigned long long)(b[2] - a[2]));
+    put_result(42, 51, 200);
+    { char pth[256]; path_of(42, pth, sizeof pth); FILE *f = fopen(pth, "r+b"); CHECK(f != NULL, "打开夹具缓存文件"); if (f) { fputc('X', f); fclose(f); } }
+    log_reset();
+    nvk_shader_test_alias_probe(a);
+    (void)publish(42, 2);   // 文件头坏
+    nvk_shader_test_alias_probe(b);
+    CHECK(b[0] - a[0] == 1 && b[1] == a[1] && b[2] - a[2] == 1, "头坏：读头 +%llu、没有缓存文件 +%llu、缓存文件坏 +%llu（期望 1 0 1）",
+          (unsigned long long)(b[0] - a[0]), (unsigned long long)(b[1] - a[1]), (unsigned long long)(b[2] - a[2]));
+    CHECK(log_has("缓存文件头不对") && log_has("magic"), "头坏打一行带原因（magic）");
+    rp_shader_reset();
+}
+
 static void case_off(void) {
     rp_shader_reset();
     g_load_calls = g_release_calls = 0;
@@ -462,6 +485,7 @@ int main(int argc, char **argv) {
         case_failed_not_aliased();
         case_key_nst();
         case_key_c1();
+        case_probe_split();
         case_borrowed_alias_retention();   // 留到最后：它按设计泄漏一份记录到进程结束
     }
     cleanup_dir();
