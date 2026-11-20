@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -235,6 +238,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -323,6 +337,14 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
                              (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_SYNC_SAMP_N] || pf[RP_PERF_SYNC_LANDED_KB] || pf[RP_PERF_SYNC_ORD_SUB_KB] || pf[RP_PERF_SYNC_ORD_FENCE_KB]) {   // 同步分账（nvk_sync_acct，rp_buf.c）
+                    const double sn = pf[RP_PERF_SYNC_SAMP_N] ? (double)pf[RP_PERF_SYNC_SAMP_N] : 1, ln = pf[RP_PERF_SYNC_SAMP_LAND_N] ? (double)pf[RP_PERF_SYNC_SAMP_LAND_N] : 1;
+                    snprintf(b, sizeof b, "分时（镜像同步分账，每帧，按整页计）：落地后重搬 %.0f KB、同提交重搬 %.0f KB；录成 GPU 拷贝：本提交已用过 %.0f KB、上次提交没做完 %.0f KB、与落地中区间相交 %.0f KB、镜像无 CPU 映射 %.0f KB；"
+                             "抽样页 %.1f 次/帧、内容与上次同步相同 %.0f%%；其中上次是整页落地的 %.1f 次/帧、与落地时相同 %.0f%%",
+                             (double)pf[RP_PERF_SYNC_LANDED_KB] / f, (double)pf[RP_PERF_SYNC_RESUB_KB] / f, (double)pf[RP_PERF_SYNC_ORD_SUB_KB] / f, (double)pf[RP_PERF_SYNC_ORD_FENCE_KB] / f,
+                             (double)pf[RP_PERF_SYNC_ORD_LAND_KB] / f, (double)pf[RP_PERF_SYNC_ORD_NOCPU_KB] / f, (double)pf[RP_PERF_SYNC_SAMP_N] / f, 100.0 * (double)pf[RP_PERF_SYNC_SAMP_SAME_N] / sn,
+                             (double)pf[RP_PERF_SYNC_SAMP_LAND_N] / f, 100.0 * (double)pf[RP_PERF_SYNC_SAMP_LAND_SAME_N] / ln);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核

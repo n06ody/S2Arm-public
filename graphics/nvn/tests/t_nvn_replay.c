@@ -2000,10 +2000,71 @@ static void t_buf_multi_tail(void) {
     nvn_be_pool_del(g_pmem); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
 
+// 镜像同步分账（nvk_sync_acct，诊断计数，不改同步行为）：落地后重搬 / 同提交重搬 / 录拷贝原因 / 抽样内容未变，各自只在该计的时候计。
+// 修前（没有分账）：这些计数项不存在，「池镜像同步 70 MB/帧」分不出哪些是原样重搬。
+static void t_sync_acct(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    nvn_be_shutdown_session(); nvn_unimpl_reset(); g_pg_tracked = 1; g_buf_cpu_auto = 1;
+    g_flag_buf_dirtylog = 1; g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++; memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+    g_dirty_now = 100; g_nbw = 0;
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    memset(g_block_mem, 0x21, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
+    ++g_dirty_map; g_block_unreliable = 0;
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG, kb = PG / 1024;
+    nvn_be_pool_add(g_block_mem, all);
+    nvn_gpu_buf b = NULL; uint64_t pf[RP_PERF_N];
+    // 新镜像整份同步一次：抽样页（0、64、128、192）各记一次摘要，此前没有摘要，不算「相同」
+    nvn_be_sub_begin(); rp_perf_take(pf);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    CHECK(pf[RP_PERF_SYNC_SAMP_N] == BLOCK_TEST_PAGES / 64 && pf[RP_PERF_SYNC_SAMP_SAME_N] == 0 && pf[RP_PERF_SYNC_LANDED_KB] == 0 && pf[RP_PERF_SYNC_RESUB_KB] == 0);
+    // 游戏原样重写第 128 页（页变脏、字节没变）：同步一页，抽样「与上次相同」
+    fake_log_event(128, 128); g_block_gen[128] = ++g_dirty_now;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    printf("sync acct same-bytes rewrite: samp=%llu same=%llu landed=%llu expected 1/1/0\n", (unsigned long long)pf[RP_PERF_SYNC_SAMP_N], (unsigned long long)pf[RP_PERF_SYNC_SAMP_SAME_N], (unsigned long long)pf[RP_PERF_SYNC_LANDED_KB]);
+    CHECK(pf[RP_PERF_SYNC_SAMP_N] == 1 && pf[RP_PERF_SYNC_SAMP_SAME_N] == 1 && pf[RP_PERF_SYNC_LANDED_KB] == 0);
+    // 真改了第 128 页：抽样不相同
+    fake_log_write(128, 0x5c);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    CHECK(pf[RP_PERF_SYNC_SAMP_N] == 1 && pf[RP_PERF_SYNC_SAMP_SAME_N] == 0);
+    // 显卡写第 192–193 页、落地（落地的 memcpy 让页变脏）：下次使用两页都算「落地后重搬」，第 192 页抽样与落地时相同
+    nvn_gpu_buf written = b; uint64_t key = 0;
+    uint64_t id = rp_buf_gpu_write_note(base + 192 * PG, 2 * PG, &key);
+    CHECK(id && key == base && written && written->cpu);
+    if (written && written->cpu) memset(written->cpu + 192 * PG, 0xd4, 2 * PG);
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    CHECK(g_block_mem[192 * PG] == (uint8_t)0xd4);
+    fake_log_event(192, 193); g_block_gen[192] = ++g_dirty_now; g_block_gen[193] = ++g_dirty_now;
+    rp_perf_take(pf);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    printf("sync acct after land: landed=%llu KB samp_land=%llu land_same=%llu expected %llu/1/1\n", (unsigned long long)pf[RP_PERF_SYNC_LANDED_KB], (unsigned long long)pf[RP_PERF_SYNC_SAMP_LAND_N], (unsigned long long)pf[RP_PERF_SYNC_SAMP_LAND_SAME_N], (unsigned long long)(2 * kb));
+    CHECK(pf[RP_PERF_SYNC_LANDED_KB] == 2 * kb && pf[RP_PERF_SYNC_SAMP_LAND_N] == 1 && pf[RP_PERF_SYNC_SAMP_LAND_SAME_N] == 1 && pf[RP_PERF_SYNC_SAMP_SAME_N] == 1);
+    // 落地位只算一次：再写第 193 页，不再算落地后重搬
+    fake_log_write(193, 0x6e);
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    CHECK(pf[RP_PERF_SYNC_LANDED_KB] == 0);
+    // 同一次提交里同一页搬两次：第二次算「同提交重搬」，且录成 GPU 拷贝的原因是「本提交已用过」；第一次是直接写，不进原因
+    nvn_be_sub_begin();
+    fake_log_write(70, 0x70); CHECK(rp_buf_resolve(&g_fake_cmd, base + 70 * PG, PG, &b, NULL) == 1);
+    fake_log_write(70, 0x71); CHECK(rp_buf_resolve(&g_fake_cmd, base + 70 * PG, PG, &b, NULL) == 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    printf("sync acct same submit: resub=%llu ord_sub=%llu KB expected %llu/%llu\n", (unsigned long long)pf[RP_PERF_SYNC_RESUB_KB], (unsigned long long)pf[RP_PERF_SYNC_ORD_SUB_KB], (unsigned long long)kb, (unsigned long long)kb);
+    CHECK(pf[RP_PERF_SYNC_RESUB_KB] == kb && pf[RP_PERF_SYNC_ORD_SUB_KB] == kb && pf[RP_PERF_SYNC_ORD_FENCE_KB] == 0);
+    // 上一次用这份镜像的提交还没做完：下一次提交第一次同步的页录成 GPU 拷贝，原因记「上次提交没做完」
+    nvn_be_sub_begin(); fake_log_write(71, 0x72); CHECK(rp_buf_resolve(&g_fake_cmd, base + 71 * PG, PG, &b, NULL) == 1); nvn_be_sub_commit();
+    nvn_be_sub_begin(); fake_log_write(72, 0x73); rp_perf_take(pf); CHECK(rp_buf_resolve(&g_fake_cmd, base + 72 * PG, PG, &b, NULL) == 1); nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+    CHECK(pf[RP_PERF_SYNC_ORD_FENCE_KB] == kb && pf[RP_PERF_SYNC_ORD_SUB_KB] == 0 && pf[RP_PERF_SYNC_RESUB_KB] == 0);
+    nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
+    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = g_dirtylog_dflt; g_log_fake_on = 0;
+}
+
 // 脏页追加日志（nvk_buf_dirtylog，#1501 A②）：解析不按范围逐页比代号，只灌日志事件、在旧页位图里求交。
 // 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查。
 static uint64_t sync_bytes_now(void) { extern void rp_buf_stats(uint64_t *, uint64_t *); uint64_t b = 0, r = 0; rp_buf_stats(&b, &r); return b; }
 static void t_buf_dirtylog(void) {
+    extern void rp_buf_stats(uint64_t *, uint64_t *);
     extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
     extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
     extern void rp_buf_frame_flip(void);
@@ -2033,6 +2094,31 @@ static void t_buf_dirtylog(void) {
     nvn_be_sub_begin(); g_block_pages_examined = 0; sb0 = sync_bytes_now();
     CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
     CHECK(g_block_pages_examined == 0 && sync_bytes_now() - sb0 == PG);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // Adjacent stale pages in different bitmap words need a single rearm.
+    fake_log_write(63, 0x6a); fake_log_write(64, 0x7a);
+    g_log_unarmed[64] = 1;
+    nvn_be_sub_begin();
+    uint64_t runs_before, runs_after;
+    rp_buf_stats(&sb0, &runs_before);
+    int rearm_before = g_protects;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 63 * PG && g_prot_len == 2 * PG);
+    uint64_t bytes_after;
+    rp_buf_stats(&bytes_after, &runs_after);
+    CHECK(bytes_after - sb0 == 2 * PG && runs_after - runs_before == 2);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // The page on the second word stayed writable. Its next write lacks an
+    // event, so it must still be stale and the clean neighboring pages stay out.
+    memset(g_block_mem + 64 * PG, 0x7c, PG);
+    g_block_gen[64] = ++g_dirty_now;
+    g_log_unarmed[64] = 0;
+    nvn_be_sub_begin(); rearm_before = g_protects; sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 64 * PG && g_prot_len == PG);
+    CHECK(sync_bytes_now() - sb0 == PG);
     if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     // 写两页、只解析前一页：后一页的旧位留着，之后解析它照样同步
@@ -5839,6 +5925,7 @@ int main(int argc, char **argv) {
 #endif
     t_buf_mirror();
     t_buf_dirtylog();
+    t_sync_acct();
     t_buf_untracked_once();
     t_buf_mirror_fail_once();
     t_buf_multi_tail();
