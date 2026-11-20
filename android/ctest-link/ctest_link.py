@@ -25,8 +25,8 @@
 --parts apk：安卓单库 libs2arm_android.so（APK 里那个库）同一套真编真链。起因 #1086：共享前端 hle_nvn.c 每帧调用
 nvn_be_tex_tick，只有 Apple 后端有定义，单库缺符号；core-link/link_symbols.py 的 -z defs 真链只在合入后层，合入前没拦住。
   1. 用 NDK 自带的 build/cmake/android.toolchain.cmake（与 Gradle 同一工具链、arm64-v8a、android-29 = minSdk、Debug）按
-     android/CMakeLists.txt 的 if(ANDROID) 分支配置，APK_CONFIGS 五种组合各配一次：诊断 / 游戏 × 直连前端关 /
-     nvn_vk 后端（S2A_ANDROID_VK_ENGINE 开时共享前端 hle_nvn.c 等才编进来），外加 Gradle 缺省的诊断构建
+     android/CMakeLists.txt 的 if(ANDROID) 分支配置，APK_CONFIGS 七种组合各配一次：诊断 / 游戏 × 直连前端关 /
+     nvn_vk 后端 / nvk 后端（S2A_ANDROID_VK_ENGINE 开时共享前端 hle_nvn.c 等才编进来），外加 Gradle 缺省的诊断构建
      （S2A_CS_SERVICES=0、不带探针，#557）；
   2. NativeAOT 静态服务层（libs2a_cs.a）不编：沿用 link_symbols.py 的 S2A_ANDROID_LINK_PROBE 探针——check_once 从真实
      C# 工程收出 DllImport 入口（探针引用它们）和 [UnmanagedCallersOnly] 导出（探针给空定义），write_probe 写探针；
@@ -64,9 +64,9 @@ UNDEF = re.compile(r"^ld\.lld: error: undefined symbol: (.+?)\s*$")
 REFBY = re.compile(r"^>>> referenced by (\S+?)(?: \((.+)\))?\s*$")
 EXE = re.compile(r"^build (\S+): C(?:XX)?_EXECUTABLE_LINKER__")
 OBJ_TARGET = re.compile(r"CMakeFiles/([^/]+)\.dir/")
-# 单库配置：(模式, S2A_ANDROID_VK_ENGINE, S2ARM_ANDROID_VK_BACKEND, 标签)。Gradle 缺省是引擎关；引擎开时
+# 单库配置：(模式, S2A_ANDROID_VK_ENGINE, S2ARM_ANDROID_VK_BACKEND, 标签, 是否带探针)。Gradle 缺省是引擎关；引擎开时
 # 共享前端（graphics/nvn/gfx/nvn/hle_nvn.c 等）编进来，两种后端各自要给齐 nvn_be_* —— #1086 缺的就在这里。
-APK_CONFIGS = (   # engine 后端已随 #1108 删除，S2ARM_ANDROID_VK_BACKEND 只剩 nvn_vk
+APK_CONFIGS = (
     # 最后一项 = 带不带 link_symbols 探针（探针配置走 S2A_ANDROID_LINK_PROBE，等同服务层静态链入的源集合）
     ("diagnostic", "OFF", "nvn_vk", "诊断", True),
     ("diagnostic", "ON", "nvn_vk", "诊断 + nvn_vk 后端", True),
@@ -75,6 +75,9 @@ APK_CONFIGS = (   # engine 后端已随 #1108 删除，S2ARM_ANDROID_VK_BACKEND 
     # Gradle 缺省 assembleDebug：S2A_CS_SERVICES=0、没有探针，服务层不链入（#557：这条路缺 s2a_host_session_state，
     # 上面四种都带探针 = 走静态源集合，没拦住）。game 模式要求 static（CoreLink.cmake），只有诊断有这条路。
     ("diagnostic", "OFF", "nvn_vk", "诊断 · Gradle 缺省（服务层不链入）", False),
+    # 产品游戏包走引擎开 + nvk（pack/targets/android/package.py）；同时覆盖诊断角色的 nvk 单库。
+    ("game", "ON", "nvk", "游戏 + nvk 后端", True),
+    ("diagnostic", "ON", "nvk", "诊断 + nvk 后端", True),
 )
 APK_LIB = "libs2arm_android.so"
 
@@ -321,10 +324,11 @@ def apk_part(root, project, work, ndk, jobs, cs_project):
             red += 1
         if (bdir / APK_LIB).is_file() and not bld.returncode:
             linked += 1
+            print("【绿】目标 %s 链接成功" % tlabel)
         elif not fails and not bld.returncode:
             print("【红】目标 %s 没链出来（射程不全）" % tlabel)
             red += 1
-    print("单库链接配置 %d 个（%s，NDK 安卓工具链 arm64-v8a android-29，诊断 / 游戏 × 直连前端关 / nvn_vk + 诊断 Gradle 缺省）：链过 %d、红 %d" % (
+    print("单库链接配置 %d 个（%s，NDK 安卓工具链 arm64-v8a android-29，诊断 / 游戏 × 直连前端关 / nvn_vk / nvk + 诊断 Gradle 缺省）：链过 %d、红 %d" % (
         len(APK_CONFIGS), APK_LIB, linked, len(APK_CONFIGS) - linked))
     return len(APK_CONFIGS), linked, red, bdirs
 

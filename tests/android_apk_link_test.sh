@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 门禁只看：android/CMakeLists.txt android/native/* android/core-link/* android/ctest-link/* android/tools/ndk_toolchain.sh runtime/src/* runtime/include/* graphics/nvn/* graphics/dsx/*
 # 门禁本机：要 NDK 29 与 CMake / ninja（gate-host 没有）；维护方本机名单配了 S2A_ANDROID_LINK_REMOTE 时整步送安卓专用 Mac跑
-# 安卓 APK 单库链接核对（android/ctest-link/ctest_link.py --parts apk：NDK 工具链按 android/CMakeLists.txt 五种组合真编真链 libs2arm_android.so，
+# 安卓 APK 单库链接核对（android/ctest-link/ctest_link.py --parts apk：NDK 工具链按 android/CMakeLists.txt 七种组合真编真链 libs2arm_android.so，含游戏 / 诊断 nvk，
 #   每个未定义符号打【红】并给「文件:行」；不出整包、不装机）。起因 11-13：#871 在共用的 graphics 前端 hle_nvn.c 调了只有苹果宿主才定义的
 #   dm_shader_mesh_hold / _key，安卓 APK 链接不过，列车不编 APK 没拦住，合入后所有安卓出包都失败。改到共用 C 的支路由命中就跑。
 #   缺 NDK / CMake 的机器（贡献者）退 75「环境未就绪」，不判红。

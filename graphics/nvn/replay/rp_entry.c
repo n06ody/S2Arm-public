@@ -278,7 +278,7 @@ void nvn_be_prog_release(prog_t *p) { (void)p; }               // 还没有按�
 void nvn_be_shader_prefetch(const uint8_t key[8]) { (void)key; }   // 预取是提速手段，不影响正确性；着色器链接上后再接
 // 1 = 超过 1,024 条的间接计数多绘整段录一条 OP_MULTI_DRAW（rp_multi_draw 一次交后端）；设备没开 drawIndirectCount 时仍逐条录（rp_draw 报名跳过）
 int nvn_be_multi_draw_range(void) { nvn_gpu_caps caps; nvn_gpu_caps_get(&caps); return (caps.caps & NVN_GPU_CAP_INDIRECT_COUNT) != 0; }
-int nvn_be_buf_extent_consumer(void) { return 1; }             // Vulkan 上 size = 0 的存储绑定要按地址求活缓冲长度：让前端登记
+int nvn_be_buf_extent_consumer(void) { return 0; }             // 新回放按绑定范围和池镜像解析，未查询前端的活缓冲表
 
 // ---------- 全局状态 ----------
 static int g_depth_zero, g_origin_ll = 1; static uint64_t g_frame;

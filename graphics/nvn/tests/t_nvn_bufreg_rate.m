@@ -5,10 +5,11 @@
 //   ① 单线程；② 4 线程（各建删自己那 1/4，建完等齐再一起删）抓锁争用：锁内做 O(n) 活时等锁时间同样平方级涨。
 //   只比比值、不设绝对耗时上限：机器快慢 / 负载高低同时作用于两次测量，比值不受影响。每档取 5 次里最快的一次压掉偶发抖动。
 //   负对照：同一单测放在 810f70a2b 的 hle_nvn.c 上跑，① ② 比值都约 16、判红（见坑记录 11-07）。
-// 两种模式（mk 各跑一遍）：
+// 建删计时与登记功能分开验证：
 //   缺省 = 安卓路线：S2A_NVN_BUF_REG=1 强制登记（安卓后端 nvn_be_buf_extent_consumer 报 1 时同一条路径）；③ 功能：每个活缓冲内的地址
 //     nvn_buf_extent 都命中 {该缓冲起点, 长度}，注销后不再命中；再跑 ① ②。
 //   metal = Metal 路线：不设开关，后端（nvn_mtl.m）报没有查询方 → ④ 建了 4N 个活缓冲，nvn_buf_extent 一个都不命中（一次登记都没发生）；① ② 只报耗时不判。
+//   nvk / nvk-forced = 只测登记：前端接真实 rp_entry.c 的能力查询，同一夹具验证缺省不登记、强制打开能登记。
 #include "nvn_protos.h"
 #include "nvn_obj.h"
 #import <Foundation/Foundation.h>
@@ -81,7 +82,7 @@ static void judge(const char *what, int nthreads) {
 }
 
 // ③ / ④：建 n 个活缓冲，逐个查缓冲中间的地址；want = 1 应命中自身 {起点, 长度}，0 应全不命中；全部注销后再查一遍应全不命中
-static void extent_check(int n, int want) {
+static void extent_check(int n, int want, const char *backend) {
     NVNbufferBuilder b; unsigned bad = 0, stale = 0;
     for (int i = 0; i < n; i++) { p_defaults(&b); p_device(&b, &device); p_storage(&b, &pool, (ptrdiff_t)i * BUF, BUF); REQUIRE(p_init(&bufs[i], &b)); }
     uint8_t *mem = (uint8_t *)(uintptr_t)API(nvnBufferMap)(&bufs[0]);
@@ -92,17 +93,22 @@ static void extent_check(int n, int want) {
     }
     for (int i = 0; i < n; i++) p_fini(&bufs[i]);
     for (int i = 0; i < n; i++) { uint64_t base, size; stale += nvn_buf_extent((uint64_t)(uintptr_t)(mem + (size_t)i * BUF + BUF / 2), &base, &size); }
-    const char *what = want ? "③ 安卓路线：活缓冲按地址查长度全命中、注销后全不命中" : "④ Metal 路线：活缓冲一个都没登记";
-    printf("  %s：%d 个活缓冲，不符 %u、注销后仍命中 %u\n", what, n, bad, stale);
-    if (bad || stale) { fails++; printf("✗ t_nvn_bufreg_rate：%s 不成立（不符 %u、注销后仍命中 %u）\n", what, bad, stale); }
+    const char *what = want ? "活缓冲按地址查长度全命中" : "活缓冲一个都没登记";
+    printf("  %s：%s，%d 个活缓冲，不符 %u、注销后仍命中 %u\n", backend, what, n, bad, stale);
+    if (bad || stale) { fails++; printf("✗ t_nvn_bufreg_rate：%s %s 不成立（不符 %u、注销后仍命中 %u）\n", backend, what, bad, stale); }
 }
 
 int main(int argc, char **argv) {
     metal = argc > 1 && !strcmp(argv[1], "metal");
-    if (!metal) setenv("S2A_NVN_BUF_REG", "1", 1);   // 安卓路线：强制登记（Mac 上的后端是 Metal，自报没有查询方）
+    int nvk = argc > 1 && (!strcmp(argv[1], "nvk") || !strcmp(argv[1], "nvk-forced"));
+    int want = nvk ? !strcmp(argv[1], "nvk-forced") : !metal;
+    const char *backend = nvk ? argv[1] : metal ? "Metal" : "强制登记";
+    if (want) REQUIRE(setenv("S2A_NVN_BUF_REG", "1", 1) == 0);
+    else REQUIRE(unsetenv("S2A_NVN_BUF_REG") == 0);
     @autoreleasepool {
         setup();
-        extent_check(NMAX, !metal);
+        extent_check(NMAX, want, backend);
+        if (nvk) return fails != 0;
         run_once(NMAX, 1);   // 预热：表的结点池 / 页面先长到 4N，不算进计时
         judge("① 单线程", 1);
         judge("② 4 线程", THREADS);
