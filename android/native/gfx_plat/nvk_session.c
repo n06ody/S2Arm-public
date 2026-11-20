@@ -94,6 +94,7 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
       // 脏页追加日志（#1501 A②，缺省开，debug.s2a.nvk_buf_dirtylog=0 关）：必须在登记任何池之前配置；回放核心按同一开关决定用不用
       if (nvn_plat_flag("nvk_buf_dirtylog", 1) && !nvn_dirty_log_configure(1))
           __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】脏页追加日志未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
+    { extern void nvn_dirty_mp_probe_enable(int); nvn_dirty_mp_probe_enable(nvn_plat_flag("nvk_mp_probe", 0)); }
     g_ready = 1;
     nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
     const char *drv_name = dev && dev->driver_name[0] ? dev->driver_name : "?";

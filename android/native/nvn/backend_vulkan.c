@@ -46,6 +46,9 @@
 #include "spirv_storage.h"   // 顶点阶段的存储写检查（与直连接纳同一份，按 Vulkan 规范的 NonWritable 判）
 #include "spirv_workgroup.h" // 最终 SPIR-V 的实际计算工作组尺寸（含 WorkgroupSize 的优先级）
 #include "../capprobe/capprobe.h"
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../capacity_affinity.h"
+#endif
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
 
@@ -1838,6 +1841,10 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
 }
 
 static void *worker_main(void *arg) {
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    pthread_setname_np(pthread_self(), "s2a-vk-done");
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     struct nvn_gpu_vk *vk = arg;
     pthread_mutex_lock(&g_mu);
     for (;;) {
@@ -1994,6 +2001,10 @@ struct plcw_job {
 
 // 后台写盘线程（分离线程）：写一份、收尾、清「在飞」标记（最后一步，收尾那边靠它判断写完没有）。写失败只记日志，收尾时会再试一次。
 static void *plcw_main(void *arg) {
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    pthread_setname_np(pthread_self(), "nvk-pipe-save");
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     struct plcw_job *j = (struct plcw_job *)arg;
     char why[96] = "";
     uint64_t t0 = now_ns();

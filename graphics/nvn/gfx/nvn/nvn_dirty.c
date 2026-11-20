@@ -216,14 +216,65 @@ static _Atomic int g_mp_fail_logged;
 // 之前忽略返回值，失败后照样把页面记成已解除保护并声称异常已处理，会导致写异常反复触发。
 // 单测钩子（默认 NULL）：记录实际 mprotect 区间，或注入失败。生产路径不设钩子，零开销。
 int (*nvn_dirty_mp_hook)(void *addr, size_t len, int prot);
-static int mp(uintptr_t a, size_t len, int prot) {
+// Disposable diagnostic. In the fault path record fixed-size atomic counters only.
+enum { MP_RO, MP_REPLACE, MP_RW, MP_RW_DUP, MP_KIND_N, MP_PROBE_N = 4096 };
+static _Atomic int mp_probe_enabled;
+static _Atomic uint64_t mp_probe_dropped, mp_probe_map_changed;
+static struct {
+    _Atomic uint64_t key, calls[MP_KIND_N], pages[MP_KIND_N], ticks[MP_KIND_N];
+} mp_probe[MP_PROBE_N];
+void nvn_dirty_mp_probe_enable(int enabled) { atomic_store(&mp_probe_enabled, !!enabled); }
+static void mp_probe_note(uint64_t mapping, unsigned kind, size_t len, uint64_t ticks) {
+    if (!atomic_load_explicit(&mp_probe_enabled, memory_order_relaxed)) return;
+    if (mapping > UINT32_MAX) { atomic_fetch_add(&mp_probe_dropped, 1); return; }
+    const uint64_t key = (mapping << 32) | (uint32_t)gettid();
+    if (mapping != atomic_load(&g_mapping_gen)) atomic_fetch_add(&mp_probe_map_changed, 1);
+    const size_t first = ((uint32_t)key * 2654435761u + (uint32_t)mapping) & (MP_PROBE_N - 1);
+    for (size_t n = 0; n < MP_PROBE_N; n++) {
+        const size_t i = (first + n) & (MP_PROBE_N - 1);
+        uint64_t current = atomic_load(&mp_probe[i].key);
+        if (!current && atomic_compare_exchange_strong(&mp_probe[i].key, &current, key)) current = key;
+        if (current != key) continue;
+        atomic_fetch_add(&mp_probe[i].pages[kind], len >> g_shift);
+        atomic_fetch_add(&mp_probe[i].ticks[kind], ticks);
+        atomic_fetch_add(&mp_probe[i].calls[kind], 1);
+        return;
+    }
+    atomic_fetch_add(&mp_probe_dropped, 1);
+}
+void nvn_dirty_mp_probe_dump(void) {
+    if (!atomic_load(&mp_probe_enabled)) return;
+    static const char *const names[] = {"ro-rearm", "ro-replace", "rw-needed", "rw-already-writable"};
+    static uint64_t last[MP_PROBE_N][MP_KIND_N];
+    uint64_t num, den;
+    dirty_tick_rate(&num, &den);
+    for (size_t i = 0; i < MP_PROBE_N; i++) {
+        const uint64_t key = atomic_load(&mp_probe[i].key);
+        if (!key) continue;
+        for (unsigned k = 0; k < MP_KIND_N; k++) {
+            const uint64_t count = atomic_load(&mp_probe[i].calls[k]);
+            if (count == last[i][k]) continue;
+            last[i][k] = count;
+            LOG("[s2a-mp] tid=%u mapping=%llu op=%s cumulative_calls=%llu cumulative_pages=%llu cumulative_ns=%llu",
+                (unsigned)(uint32_t)key, (unsigned long long)(key >> 32), names[k], (unsigned long long)count,
+                (unsigned long long)atomic_load(&mp_probe[i].pages[k]),
+                (unsigned long long)(atomic_load(&mp_probe[i].ticks[k]) * num / den));
+        }
+    }
+    LOG("[s2a-mp] checkpoint dropped=%llu map_changed_during_call=%llu",
+        (unsigned long long)atomic_load(&mp_probe_dropped), (unsigned long long)atomic_load(&mp_probe_map_changed));
+}
+static int mp(uintptr_t a, size_t len, int prot, unsigned probe_kind) {
     if (nvn_dirty_mp_hook && nvn_dirty_mp_hook((void *)a, len, prot) != 0) {
         atomic_fetch_add(&g_mp_fails, 1);
         return -1;   // 注入失败：按真失败处理
     }
+    const uint64_t mapping = atomic_load(&g_mapping_gen);
     uint64_t t = dirty_tick();
     int rc = mprotect((void *)a, len, prot);
-    atomic_fetch_add(&g_mp_ticks, dirty_tick() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    const uint64_t elapsed = dirty_tick() - t;
+    mp_probe_note(mapping, probe_kind, len, elapsed);
+    atomic_fetch_add(&g_mp_ticks, elapsed); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
     if (rc != 0) {
         int e = errno;
         atomic_fetch_add(&g_mp_fails, 1);
@@ -363,9 +414,10 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
 // 不能 mprotect 完再无条件写状态——另一线程刚把某页 NONE→BUSY→mprotect(READ)，本线程再写 NONE
 // 就留下“状态可写、内存只读”的漏检（维护方审 11-04 第 7 条）。
 static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+    int had_protected = 0;
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
-        if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; }
+        if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; had_protected = 1; }
         else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
         else if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
             for (uintptr_t j = first; j < k; j++) {
@@ -382,7 +434,7 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
         dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
         if (lg) log_append(lg, begin, end);
     }
-    if (mp(begin, end - begin, PROT_READ | PROT_WRITE) != 0) {
+    if (mp(begin, end - begin, PROT_READ | PROT_WRITE, had_protected ? MP_RW : MP_RW_DUP) != 0) {
         // 失败：不推进代际，按认领前状态回退，并标记跟踪不可靠（跨 VMA 的 mprotect 可能部分成功，不能假定整段未变）
         for (uintptr_t k = first; k <= last; k++) {
             uint8_t st = atomic_load(&r->state[k]);
@@ -510,7 +562,7 @@ int nvn_dirty_replace_range(const void *mem, size_t size) {
         uintptr_t first = chunk_first_page(r, k), last = chunk_last_page(r, k);
         if (last >= np) last = np - 1;
         if (first >= np) break;
-        if (mp(r->base + (first << g_shift), (last - first + 1) << g_shift, PROT_READ) == 0) {
+        if (mp(r->base + (first << g_shift), (last - first + 1) << g_shift, PROT_READ, MP_REPLACE) == 0) {
             for (uintptr_t j = first; j <= last; j++) atomic_store(&r->state[j], PG_PROT);
         } else {
             atomic_store(&g_track_unreliable, 1);
@@ -648,7 +700,7 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         if (took && !open) { run = i; open = 1; }
         if (!took && open) {
             // 只有整段成功才记 PG_PROT；失败则记未跟踪并置“跟踪不可靠”，让查询走保守路径。
-            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ) == 0) {
+            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ, MP_RO) == 0) {
                 for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
             } else {
                 for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_NONE);
