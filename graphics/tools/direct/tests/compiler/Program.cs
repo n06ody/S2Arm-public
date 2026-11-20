@@ -57,6 +57,9 @@ internal static unsafe class Program
     private static ulong LopOr(int dest, int a, int b) =>
         0x5C40000000000000UL | (7UL << 48) | (1UL << 41) | ((ulong)b << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     // LOP32I.OR Rd, Ra, imm32：顶层 opcode 000001（bit 58）、逻辑运算在 bit 53..54（1 = OR）、32 位立即数在 bit 20..51（InstTable / InstLop32i）。
+    // LOP32I.AND Rd, Ra, imm32：同上，逻辑运算字段 0 = AND。
+    private static ulong Lop32iAnd(int dest, int a, uint imm) =>
+        0x0400000000000000UL | ((ulong)imm << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     private static ulong Lop32iOr(int dest, int a, uint imm) =>
         0x0400000000000000UL | (1UL << 53) | ((ulong)imm << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     // FMNMX Rd, Ra, Rb（寄存器形式 0x5c60，谓词 bit 39 = PT 取 MIN、bit 42 取反 = MAX；编码同 tests/shader_cases/run.py）。
@@ -250,6 +253,57 @@ internal static unsafe class Program
         else Emit(65, 106, 120, 100, 111, dynamic ? 199u : 112u, 113);
         if (load) Emit(61, vectorLoad ? 102u : 101u, 121, 120);
         if (escape) Emit(83, 106, 122, 120);
+        return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
+    }
+
+    // 非常量下标读 c0（boundDynamic，图形阶段）：照 Ryujinx 翻 LDC c[0][Rx + imm] 的形状
+    //   a = x & mask; addr = a + imm; wo = addr >> 2; vec = wo >> 2; elem = wo & 3; OpAccessChain %c0 0 vec elem
+    // x 来自输入变量（取值不可证）。变体：
+    //   and / reach / above：mask、imm 不同（证得的 vec 区间分别在 0x644 所在第 100 个之前 / 含它 / 之后）
+    //   unmasked：没有 & mask；huge：mask 大到 vec 上界 ≥ 数组长度；local：a 先存进函数局部变量再读回；
+    //   local-escape：局部变量的指针另有用法；local-two：局部变量还存过不可证的 x；
+    //   loop：下标是循环 phi（i = phi(0, i + 1)）；sclamp：clamp(x, 0, 63)；smin：min(x, 63)（有符号，x 可能为负）
+    private static byte[] C0DynFixture(string v, uint mask = 0x3F0, uint imm = 0)
+    {
+        var w = new List<uint> { 0x07230203, 0x10000, 0, 2000, 0 };
+        void Emit(uint op, params uint[] args) { w.Add(((uint)args.Length + 1) << 16 | op); w.AddRange(args); }
+        Emit(17, 1);
+        Emit(11, 190, 0x4C534C47, 0x6474732E, 0x3035342E, 0);   // OpExtInstImport "GLSL.std.450"
+        Emit(71, 100, 33, 1); Emit(71, 100, 34, 0);
+        Emit(71, 103, 6, 16); Emit(72, 104, 0, 35, 0);
+        Emit(21, 101, 32, 0); Emit(23, 102, 101, 4);
+        Emit(43, 101, 110, 4096); Emit(28, 103, 102, 110);
+        Emit(30, 104, 103); Emit(32, 105, 2, 104);
+        Emit(32, 106, 2, 101); Emit(32, 108, 1, 101); Emit(32, 160, 7, 101);
+        Emit(43, 101, 111, 0); Emit(43, 101, 150, mask); Emit(43, 101, 151, imm); Emit(43, 101, 152, 2); Emit(43, 101, 153, 3);
+        Emit(43, 101, 154, 63); Emit(43, 101, 155, 1);
+        Emit(59, 105, 100, 2);
+        Emit(59, 108, 109, 1);                 // 输入变量：读出的 x 取值不可证
+        Emit(61, 101, 140, 109);
+        uint vec, elem;
+        if (v is "loop" or "sclamp" or "smin")
+        {
+            if (v == "loop") { Emit(245, 101, 170, 111, 1, 171, 2); Emit(128, 101, 171, 170, 155); vec = 170; }
+            else if (v == "sclamp") { Emit(12, 101, 146, 190, 45, 140, 111, 154); vec = 146; }
+            else { Emit(12, 101, 146, 190, 39, 140, 154); vec = 146; }
+            elem = 111;
+        }
+        else
+        {
+            uint a = 141;
+            if (v == "unmasked") a = 140; else Emit(199, 101, 141, 140, 150);
+            if (v is "local" or "local-escape" or "local-two")
+            {
+                Emit(59, 160, 161, 7); Emit(62, 161, 141);
+                if (v == "local-two") Emit(62, 161, 140);
+                if (v == "local-escape") Emit(83, 160, 163, 161);
+                Emit(61, 101, 162, 161); a = 162;
+            }
+            Emit(128, 101, 142, a, 151); Emit(194, 101, 143, 142, 152); Emit(194, 101, 144, 143, 152); Emit(199, 101, 145, 143, 153);
+            vec = 144; elem = 145;
+        }
+        Emit(65, 106, 120, 100, 111, vec, elem);
+        Emit(61, 101, 121, 120);
         return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
     }
 
@@ -1498,6 +1552,18 @@ internal static unsafe class Program
             JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
             Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
                 "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            // 下标先 & 0x3f0：真实翻译器的形状（(R1 + imm) >> 2 >> 2、& 3）按取值界证得读 data[lo..hi]
+            JsonElement[] masked = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0, 0, 1), Ast(0) }, true, out string e4);
+            Check(masked != null && Kind(masked[0]) == JsonValueKind.Array && Covers(masked[0], 0x3F0) && !Covers(masked[0], 0x644),
+                "masked register index: c0Reads is data[0..63], proven not to read 0x644: " + Show(masked, e4));
+            Check(masked != null && masked[0].TryGetProperty("c0ReadsStatic", out var maskedStatic) && maskedStatic.ValueKind == JsonValueKind.Null,
+                "bounded dynamic has separate unknown static read set for switch off");
+            Check(binstOn != null && binstOn[0].TryGetProperty("c0ReadsStatic", out var staticReads) && staticReads.ValueKind == JsonValueKind.Array &&
+                  staticReads.EnumerateArray().Any(r => r[0].GetInt32() <= 0x610 && r[0].GetInt32() + r[1].GetInt32() > 0x610),
+                "constant c0 reads retain their static proof when dynamic bounds are off");
+            JsonElement[] maskedReach = C0Stages(new[] { Ald(0, 0, 1), Lop32iAnd(1, 1, 0x3F0), Ldc(0, 0x600, 0, 1), Ast(0) }, true, out string e5);
+            Check(maskedReach != null && Covers(maskedReach[0], 0x644),
+                "negative control: masked register index that can reach 0x644 is a read: " + Show(maskedReach, e5));
             Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
         }
 
@@ -1690,6 +1756,36 @@ internal static unsafe class Program
             .SequenceEqual(new[] { 0x200, 16 }) == true, "cross-boundary vec4 not narrowed to 12");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, dynamic: true), 0, 1) == null,
             "dynamic c0 read unknown not empty");
+        // 非常量下标按取值界（boundDynamic，只给图形阶段）：证得的 vec4 整段记为读；证不了照旧 null。
+        {
+            string Dyn(int[][] r) => r == null ? "null" : "[" + string.Join(",", r.Select(x => "[0x" + x[0].ToString("x") + "," + x[1] + "]")) + "]";
+            bool Hits(int[][] r, int off) => r != null && r.Any(x => x[0] < off + 4 && x[0] + x[1] > off);
+            int[][] D(string v, uint mask = 0x3F0, uint imm = 0, bool bound = true) => DirectComputeC0Reads.Analyze(C0DynFixture(v, mask, imm), 0, 1, bound);
+            int[][] and = D("and");
+            Check(and != null && and.Length == 1 && and[0].SequenceEqual(new[] { 0, 0x400 }) && !Hits(and, 0x644),
+                "masked dynamic index (x & 0x3f0) >> 4 is data[0..63]: proven not to read 0x644: " + Dyn(and));
+            int[][] reach = D("and", imm: 0x600);
+            Check(reach != null && reach[0].SequenceEqual(new[] { 0x600, 0x400 }) && Hits(reach, 0x644),
+                "negative control: dynamic index that can reach data[100] reads 0x644: " + Dyn(reach));
+            int[][] above = D("and", imm: 0x650);
+            Check(above != null && above[0].SequenceEqual(new[] { 0x650, 0x400 }) && !Hits(above, 0x644),
+                "lower bound counts too: data[101..164] does not read 0x644: " + Dyn(above));
+            Check(D("unmasked") == null, "unmasked register index stays unknown: " + Dyn(D("unmasked")));
+            Check(D("and", mask: 0xFFFF0) == null, "upper bound past the array length stays unknown: " + Dyn(D("and", mask: 0xFFFF0)));
+            int[][] local = D("local");
+            Check(local != null && local[0].SequenceEqual(new[] { 0, 0x400 }), "bounded value through a function local: " + Dyn(local));
+            Check(D("local-escape") == null, "local whose pointer escapes stays unknown: " + Dyn(D("local-escape")));
+            Check(D("local-two") == null, "local that also stores an unbounded value stays unknown: " + Dyn(D("local-two")));
+            Check(D("loop") == null, "loop phi index stays unknown: " + Dyn(D("loop")));
+            int[][] clamp = D("sclamp");
+            Check(clamp != null && clamp[0].SequenceEqual(new[] { 0, 63 * 16 + 4 }), "sclamp(x, 0, 63) bounds the index (component 0 of data[0..63]): " + Dyn(clamp));
+            Check(D("smin") == null, "signed min(x, 63) with possibly negative x stays unknown: " + Dyn(D("smin")));
+            Check(D("and", bound: false) == null, "compute (no boundDynamic) keeps dynamic index unknown");
+            Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, dynamic: true), 0, 1, true) == null,
+                "undefined index id stays unknown with boundDynamic");
+            Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x644), 0, 1, true)?[0].SequenceEqual(new[] { 0x644, 4 }) == true,
+                "constant index unchanged with boundDynamic (real 0x644 read is a read)");
+        }
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, load: false), 0, 1)?.Length == 0,
             "unused access chain is not a load");
         Check(DirectComputeC0Reads.Analyze(C0ReadFixture(0x200, escape: true), 0, 1) == null,

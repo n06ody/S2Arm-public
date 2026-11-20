@@ -37,6 +37,7 @@ void nvn_plat_log(int level, const char *cls, const char *text) { if (level == N
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
+static int g_flag_binst_hoist = -1;   // 用例设：开关 nvk_binst_hoist（-1 = 缺省）
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
@@ -56,6 +57,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_rt_cont")) return g_flag_rt_cont;
     if (!strcmp(name, "nvk_clear_park")) return g_flag_clear_park;
     if (!strcmp(name, "nvk_pass_area")) return g_flag_pass_area;
+    if (!strcmp(name, "nvk_binst_hoist")) return g_flag_binst_hoist < 0 ? dflt : g_flag_binst_hoist;
     return dflt;
 }
 const char *nvn_plat_dir(int which) { (void)which; return NULL; }
@@ -471,16 +473,23 @@ void nvn_gpu_set_pipe(nvn_gpu_cmd c, nvn_gpu_pipe p) { (void)c; (void)p; g_set_p
 static struct nvn_gpu_pipe_s g_fcpipe;
 nvn_gpu_rc nvn_gpu_cpipe_get(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) { (void)mode; (void)err; g_cpipe_gets++; g_cpipe_sh = cs->sh; *out = &g_fcpipe; return (nvn_gpu_rc){NVN_GPU_OK}; }
 static int g_ncopy4;   // 4 字节的缓冲拷贝：间接绘制把 GPU 侧 base instance 拷进驱动段 c0 + 0x644
+// 每次 4 字节拷贝的源 / 目标与录它时已发了几笔绘制（核「前移的拷贝排在生产者之后」）；每笔绘制发出时两阶段驱动段绑在哪（核「每笔一个切片、读到自己的记录」）
+static struct { nvn_gpu_buf s, d; uint64_t soff, doff; int at_draw; } g_c4[64]; static int g_nc4;
+static struct { nvn_gpu_buf b[2]; uint64_t off[2]; } g_dd[64]; static int g_ndd, g_dd_on;
+static int g_ncopyv, g_ncopy1; static uint32_t g_copyv_stages;   // 多区域拷贝的调用次数、单段 4 字节拷贝次数、多区域拷贝声明的读阶段（并集）
+static int g_hz_bump_at = -1;   // 第几笔绘制发出时把 rp_gpu_wr_gen 加一（替身：主段里录了一次写镜像的传输）
 // 按 GPU 顺序做的缓冲拷贝 / 填充（#1022：改 / 拷游戏内存的命令碰到还没落地的 GPU 写时走它）：g_gx_rec 开着就记下来
 static int g_gx_rec, g_ngx; static struct { char op; nvn_gpu_buf s, d; uint64_t soff, doff, n; uint32_t v; } g_gx[8];
 void nvn_gpu_fill_buf(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, uint64_t bytes, uint32_t value) { (void)c;
     CHECK(g_gx_rec); if (g_ngx < 8) { g_gx[g_ngx].op = 'f'; g_gx[g_ngx].d = dst; g_gx[g_ngx].doff = off; g_gx[g_ngx].n = bytes; g_gx[g_ngx].v = value; g_ngx++; } }
 void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
-    if (bytes == 4) { (void)c; (void)src; (void)soff; (void)dst; (void)doff; g_ncopy4++; return; }
+    if (bytes == 4) { (void)c; g_ncopy1++; if (g_nc4 < 64) { g_c4[g_nc4].s = src; g_c4[g_nc4].soff = soff; g_c4[g_nc4].d = dst; g_c4[g_nc4].doff = doff; g_c4[g_nc4].at_draw = g_ndd; g_nc4++; } g_ncopy4++; return; }
     if (g_gx_rec) { if (g_ngx < 8) { g_gx[g_ngx].op = 'c'; g_gx[g_ngx].s = src; g_gx[g_ngx].soff = soff; g_gx[g_ngx].d = dst; g_gx[g_ngx].doff = doff; g_gx[g_ngx].n = bytes; g_ngx++; } return; }
     (void)c; (void)src; CHECK(dst == &g_arena_buf && g_buf_cpu_fake && bytes == 12);
     if (dst == &g_arena_buf && g_buf_cpu_fake) memcpy(g_arena + doff, g_buf_cpu_fake + soff, (size_t)bytes);
 }
+void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) { (void)c; g_ncopyv++; g_copyv_stages |= stages;
+    for (uint32_t i = 0; i < n; i++) { CHECK(v[i].bytes == 4); if (g_nc4 < 64) { g_c4[g_nc4].s = v[i].src; g_c4[g_nc4].soff = v[i].soff; g_c4[g_nc4].d = v[i].dst; g_c4[g_nc4].doff = v[i].doff; g_c4[g_nc4].at_draw = g_ndd; g_nc4++; } g_ncopy4++; } }
 void nvn_gpu_dispatch(nvn_gpu_cmd c, nvn_gpu_pipe cp, uint32_t x, uint32_t y, uint32_t z, nvn_gpu_buf ind, uint64_t ind_off) { (void)c; g_disp_ind = ind; g_disp_off = ind_off; g_ndisp++; g_disp[0] = x; g_disp[1] = y; g_disp[2] = z; g_disp_pipe = cp; }
 void nvn_gpu_set_dyn(nvn_gpu_cmd c, const nvn_gpu_dyn *d) { (void)c; g_set_dyns++; g_last_dyn = *d; }
 void nvn_gpu_set_vbuf(nvn_gpu_cmd c, uint32_t stream, nvn_gpu_buf b, uint64_t off) { (void)c; if (g_order_active && stream == 0) { g_order_vbuf = b; g_order_voff = off; } if (g_nvb < 4) { g_vb[g_nvb].stream = stream; g_vb[g_nvb].off = off; } g_nvb++; }
@@ -502,6 +511,8 @@ void nvn_gpu_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *a) {
         else { int i = g_order_n++; g_order_ev[i].seg = g_order_seg; g_order_ev[i].pre = c->is_pre; g_order_ev[i].draw = 1; g_order_ev[i].buf = g_order_vbuf; g_order_ev[i].off = g_order_voff; }
     }
     g_gdraws++; g_last_da = *a; if (!g_pass_open) g_draw_outside++;
+    if (g_dd_on && g_ndd < 64) { for (int st = 0; st < 2; st++) { g_dd[g_ndd].b[st] = g_fb[st][0].u.b.buf; g_dd[g_ndd].off[st] = g_fb[st][0].u.b.off; } }
+    if (g_dd_on) { g_ndd++; if (g_ndd - 1 == g_hz_bump_at) rp_gpu_wr_gen++; }
 }
 static uint32_t g_caps_remove;
 static uint32_t g_caps_extra;   // 用例临时打开的能力位（如间接计数多绘）
@@ -4511,29 +4522,97 @@ static void t_draw_mdi(void) {
 }
 
 // 间接绘制的 base instance 拷贝只给读 c0 + 0x644 的阶段（rp_prog.binst_unread 位 = 编译器 c0Reads 证明不读）。
-//   每笔拷贝都要先收通道（拷贝得排在 GPU 生产者之后），所以同一通道里连着 3 笔间接绘制：要拷 = 3 个通道、3 次拷贝；都已证不读 = 1 个通道、0 次拷贝。
+//   逐笔拷（nvk_binst_hoist=0）：每笔拷贝都要先收通道（拷贝得排在 GPU 生产者之后），同一通道里连着 3 笔间接绘制：要拷 = 3 个通道；
+//   通道级批量拷（缺省）：开通道前前瞻，3 笔的 firstInstance 一次拷进各自切片 = 1 个通道。都已证不读 = 1 个通道、0 次拷贝。
 //   真机读数（9000 空轨 2nd 进 3D）：每帧收通道 884 次里 844 次是这一处。紧跟 t_draw_mdi，沿用它的池与渲染目标。
+// 每笔发出时两阶段绑的驱动段切片：need 里的阶段必须是一次 4 字节拷贝的目标（目标 = 切片 + 0x644），那次拷贝的源是这一笔自己的记录 + 16，
+//   且录在 min_draw 笔绘制之后；不同笔的切片互不相同。返回 1 = 都对。
+static int binst_slices_ok(int n, uint8_t need, const uint64_t *rec_off, const int *min_draw, const char *what) {
+    int ok = g_ndd == n;
+    for (int d = 0; d < n && d < g_ndd; d++) for (int st = 0; st < 2; st++) {
+        if (!(need >> st & 1)) continue;
+        int hit = -1;
+        for (int k = 0; k < g_nc4; k++) if (g_c4[k].d == g_dd[d].b[st] && g_c4[k].doff == g_dd[d].off[st] + 0x644) hit = k;
+        if (hit < 0 || g_c4[hit].soff != rec_off[d] + 16 || g_c4[hit].at_draw < min_draw[d]) {
+            printf("  %s: draw %d stage %d slice %#llx copy %d src %#llx (expect %#llx) recorded after %d draws (expect >= %d)\n", what, d, st,
+                   (unsigned long long)g_dd[d].off[st], hit, hit < 0 ? 0ull : (unsigned long long)g_c4[hit].soff, (unsigned long long)(rec_off[d] + 16),
+                   hit < 0 ? -1 : g_c4[hit].at_draw, min_draw[d]);
+            ok = 0;
+        }
+        for (int e = 0; e < d; e++) if (g_dd[e].b[st] == g_dd[d].b[st] && g_dd[e].off[st] == g_dd[d].off[st]) { printf("  %s: draws %d and %d share the stage %d slice\n", what, e, d, st); ok = 0; }
+    }
+    return ok;
+}
 static void t_draw_ind_binst(void) {
     uint64_t base = (uint64_t)(uintptr_t)g_pmem, ind = base + 4 * PG;
     struct rp_prog saved = g_fprog;
     tex_t rtt = mk_tex(92, 0, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
-    static const struct { uint8_t unread; int copies, passes; const char *what; } cases[] = {
-        { 0, 6, 3, "unknown / read: both stages copy, every indirect draw cuts the pass" },
-        { 1, 3, 3, "vs proven, fs still reads: only fs copies, the cut stays" },
-        { 3, 0, 1, "both stages proven: no copy, one pass for all three draws" },
+    // hoist：开关值；calls：多区域拷贝调用次数（开关 2 时一次前瞻一次，单段拷贝为 0）
+    static const struct { uint8_t unread; int hoist, copies, passes, calls; const char *what; } cases[] = {
+        { 0, 0, 6, 3, 0, "per-draw, unknown / read: both stages copy, every indirect draw cuts the pass" },
+        { 1, 0, 3, 3, 0, "per-draw, vs proven, fs still reads: only fs copies, the cut stays" },
+        { 3, 0, 0, 1, 0, "per-draw, both stages proven: no copy, one pass for all three draws" },
+        { 0, 1, 6, 1, 0, "hoisted one copy each, unknown / read: three draws' copies before the pass, one pass" },
+        { 1, 1, 3, 1, 0, "hoisted one copy each, fs reads: fs copies before the pass, one pass" },
+        { 3, 1, 0, 1, 0, "hoisted one copy each, both stages proven: no copy, one pass" },
+        { 0, 2, 6, 1, 1, "hoisted multi-region, unknown / read: one call with 6 regions for vs+fs, one pass" },
+        { 1, 2, 3, 1, 1, "hoisted multi-region, fs reads: one call with 3 regions for fs, one pass" },
+        { 3, 2, 0, 1, 0, "hoisted multi-region, both stages proven: no copy, one pass" },
     };
     for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        g_flag_binst_hoist = cases[k].hoist; rp_draw_reset();   // 开关会话打开时读定
         for (int st = 0; st < 2; st++) { g_fprog.nent[st] = 1; nvn_gpu_layout_ent *e = &g_fprog.ent[st][0]; memset(e, 0, sizeof *e); e->src_reg2 = UINT16_MAX; e->cls = NVN_GPU_RES_UBO; e->src_kind = NVN_RB_DRV0; e->count = 1; }
         g_fprog.binst_unread = cases[k].unread; g_arena_used = 0;   // 替身暂存区 64 KB 不查越界：每段从头用（上一段已完成）
-        int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws;
+        int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws, v0 = g_ncopyv, s0 = g_ncopy1; g_nc4 = g_ndd = 0; g_dd_on = 1; g_copyv_stages = 0;
         stream s = {0}; mdi_prelude(&s, &rtt);
         for (int i = 0; i < 3; i++) { p_draw_idx *di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->instances = 1; di->ibuf = base + 3 * PG; di->ind = ind + (uint64_t)i * 20; }
-        end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
-        if (g_gdraws - d0 != 3 || g_ncopy4 - c0 != cases[k].copies || g_npd - p0 != cases[k].passes) {
-            printf("  %s: draws %d copies %d passes %d (expect 3 / %d / %d)\n", cases[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0, cases[k].copies, cases[k].passes);
+        end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK); g_dd_on = 0;
+        const int singles = cases[k].hoist == 2 ? 0 : cases[k].copies;
+        const uint32_t want_st = cases[k].calls ? (3u & ~cases[k].unread) : 0;
+        if (g_gdraws - d0 != 3 || g_ncopy4 - c0 != cases[k].copies || g_npd - p0 != cases[k].passes || g_ncopyv - v0 != cases[k].calls || g_ncopy1 - s0 != singles || g_copyv_stages != want_st) {
+            printf("  %s: draws %d copies %d passes %d multi-region calls %d single copies %d barrier stages %#x (expect 3 / %d / %d / %d / %d / %#x)\n", cases[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0,
+                   g_ncopyv - v0, g_ncopy1 - s0, g_copyv_stages, cases[k].copies, cases[k].passes, cases[k].calls, singles, want_st);
             CHECK(0);
         }
+        const uint64_t ro[3] = {4 * PG, 4 * PG + 20, 4 * PG + 40}; const int md[3] = {0, 0, 0};
+        const uint8_t need = (uint8_t)(3u & ~cases[k].unread);
+        if (!binst_slices_ok(3, need, ro, md, cases[k].what)) CHECK(0);
     }
+    // 批量拷的边界（开关缺省）：每段 3 笔间接绘制的记录 i 在 ind + 20 i，两阶段都要拷
+    static const struct { int kind, passes, copies, calls; int min_draw[3]; const char *what; } edge[] = {
+        { 0, 1, 6, 1, {0, 0, 0}, "a direct draw opens the pass: the indirect draws after it are hoisted with it, no cut" },
+        { 1, 2, 6, 2, {0, 0, 2}, "UPDATE_UB writes between draw 1 and 2: the scan stops there, draw 2 cuts and copies after the write" },
+        { 2, 2, 10, 2, {0, 1, 1}, "a main-stream mirror write while draw 0 records: the hoisted table is dropped, draw 1 cuts and copies draws 1-2 again" },
+    };
+    for (size_t k = 0; k < sizeof edge / sizeof edge[0]; k++) {
+        g_flag_binst_hoist = -1; rp_draw_reset();
+        g_fprog.binst_unread = 0; g_arena_used = 0;
+        int c0 = g_ncopy4, p0 = g_npd, d0 = g_gdraws, v0 = g_ncopyv; g_nc4 = g_ndd = 0; g_dd_on = 1; g_hz_bump_at = edge[k].kind == 2 ? 0 : -1;
+        stream s = {0}; mdi_prelude(&s, &rtt);
+        if (edge[k].kind == 0) {   // 新会话先学阶段掩码（一段里一笔要拷的间接绘制），再让一笔普通绘制开通道：它开之前前瞻
+            stream l = {0}; mdi_prelude(&l, &rtt); p_draw_idx *li = put(&l, OP_DRAW_IDX, sizeof *li); li->prim = 4; li->itype = 1; li->instances = 1; li->ibuf = base + 3 * PG; li->ind = ind; end(&l);
+            submit1(&l); fake_complete(NVN_GPU_DONE_OK);
+            c0 = g_ncopy4; p0 = g_npd; d0 = g_gdraws; v0 = g_ncopyv; g_nc4 = g_ndd = 0;
+            p_draw_idx *pre = put(&s, OP_DRAW_IDX, sizeof *pre); pre->prim = 4; pre->itype = 1; pre->instances = 1; pre->count = 3; pre->ibuf = base + 3 * PG;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (edge[k].kind == 1 && i == 2) {   // 改第 2 笔记录的 firstInstance（CPU 路：游戏内存此刻改）
+                uint8_t *u = put(&s, OP_UPDATE_UB, 16 + 8); uint64_t d = ind + 2 * 20 + 16, n = 4; uint32_t v = 77;
+                memcpy(u, &d, 8); memcpy(u + 8, &n, 8); memcpy(u + 16, &v, 4);
+            }
+            p_draw_idx *di = put(&s, OP_DRAW_IDX, sizeof *di); di->prim = 4; di->itype = 1; di->instances = 1; di->ibuf = base + 3 * PG; di->ind = ind + (uint64_t)i * 20;
+        }
+        end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK); g_dd_on = 0; g_hz_bump_at = -1;
+        const int pre = edge[k].kind == 0;
+        if (g_gdraws - d0 != 3 + pre || g_ncopy4 - c0 != edge[k].copies || g_npd - p0 != edge[k].passes || g_ncopyv - v0 != edge[k].calls) {
+            printf("  %s: draws %d copies %d passes %d multi-region calls %d (expect %d / %d / %d / %d)\n", edge[k].what, g_gdraws - d0, g_ncopy4 - c0, g_npd - p0, g_ncopyv - v0, 3 + pre, edge[k].copies, edge[k].passes, edge[k].calls);
+            CHECK(0);
+        }
+        if (pre) { memmove(g_dd, g_dd + 1, sizeof g_dd[0] * 63); g_ndd--; }
+        const uint64_t ro[3] = {4 * PG, 4 * PG + 20, 4 * PG + 40};
+        if (!binst_slices_ok(3, 3, ro, edge[k].min_draw, edge[k].what)) CHECK(0);
+    }
+    g_flag_binst_hoist = -1; rp_draw_reset();
     g_fprog = saved;
 }
 

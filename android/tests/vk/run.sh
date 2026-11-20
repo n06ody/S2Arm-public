@@ -74,7 +74,7 @@ fi
 # --zero-attr-core（#977）：同一套真 rp_draw + 真后端，跑零属性用例 t_replay_zero_attr.c。
 if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     if [ "$mode" = "--indirect-core" ]; then
-        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp)
+        core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp replay_binst.vert replay_binst.frag replay_binst_args.comp)
     else
         core_test=t_replay_zero_attr; core_shaders=(zattr.vert quad.frag)
     fi

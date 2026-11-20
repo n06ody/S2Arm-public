@@ -528,7 +528,7 @@ int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
 // 常量缓冲绑到这段时直接绑镜像（rp_draw.c）。不相交就返回 0，调用方照旧在 CPU 上做（绝大多数情况，零额外开销）。
 static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *rec) {
     if (!rp_post_gpu_write(d, n)) nvn_unimpl("buf", what, rec);   // 登记不上：结果留在镜像里、落不回游戏内存（记账，不静默）
-    rp_cpu_write_gen++; rp_write_note(d, n);   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用按它作废
+    rp_cpu_write_gen++; rp_write_note(d, n); rp_gpu_wr_gen++;   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用、base instance 批量表按它作废
     rp_perf_add(RP_PERF_BUF_GPU_ORDER_N, 1);
     return 1;
 }
