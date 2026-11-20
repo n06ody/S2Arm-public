@@ -354,6 +354,8 @@ s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
 # 落地免重搬（rp_buf.c land_verify）：修前（main 的 rp_buf.c）落地后整页重搬必红；逐字节比 / 代号 / 布防 / 整页 / 两条路径各撤一处必红（纯宿主 C）
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/land_noresync_mutation_test.py"
+# 镜像同步分账（rp_buf.c nvk_sync_acct，诊断计数）：落地后重搬 / 同提交重搬 / 录拷贝原因 / 抽样内容未变，6 个改坏点各自必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/sync_acct_mutation_test.py"
 # 原创 Maxwell 经生产请求、真实编译器与生产结果解析；GPU 像素由 Vulkan 门禁另验。
 s2a_gate_step "$PY" "$android_dir/tests/gs_compiler_chain_test.py"
 # BUFFER texture: real producer, Maxwell compiler and SPIR-V parser.

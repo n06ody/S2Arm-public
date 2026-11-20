@@ -48,7 +48,9 @@ struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t 
                 struct land_rng lr[16]; int nlr;
                 // 落地后核过「与写它的那份镜像逐字节相同」的整页串（land_verify）：那份镜像下次走脏页日志解析时，
                 // 这些页若仍是落地 memcpy 自己弄出来的旧位（落地后加保护时的代号之后没有任何写），就清位不搬。
-                struct land_ok { uint64_t lo, hi, st; uint8_t mi; } lok[LAND_OK_N]; int nlok; };
+                struct land_ok { uint64_t lo, hi, st; uint8_t mi; } lok[LAND_OK_N]; int nlok;
+                uint64_t *acct_landed;   // 同步分账（nvk_sync_acct）：每页一位 =「上次同步之后有显卡写回落地碰过这页」，第一次落地时才分配
+                uint64_t *acct_hash; uint8_t *acct_src; };   // 抽样页（页号 % ACCT_SAMPLE == 0）上次同步 / 整页落地时游戏内存的摘要；src 1 = 来自同步，2 = 来自整页落地
 static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finish 与提交互斥）
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
@@ -85,7 +87,76 @@ static void mirror_free(struct mirror *m, int defer) {
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s); }
+                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->acct_landed); free(s->acct_hash); free(s->acct_src); free(s); }
+
+// ---------- 同步分账（诊断，开关 nvk_sync_acct，缺省开；只计数，不改同步行为）----------
+// 回答「池镜像同步的字节里，多少是重复搬」：
+//   · 落地相交：这页上次同步之后被显卡写回落地碰过（受跟踪的池里落地的 memcpy 自己会让页变脏，于是整页重搬；写它的那份镜像里本来就是这些字节）；
+//   · 同提交重搬：这页本次提交里已经同步过一次；
+//   · 录成 GPU 拷贝的原因：本次提交已用过 / 已读过这页、上一次用这份镜像的提交还没做完、正在落地的区间相交、镜像没有 CPU 映射；
+//   · 抽样（每 ACCT_SAMPLE 页取一页）：同步时游戏内存与上次同步（或整页落地）时的摘要相同 = 这一页这次是原样重搬。
+enum { ACCT_SAMPLE = 64 };
+static int g_acct = -1; static unsigned g_acct_k;
+static int acct_on(void) { if (g_acct < 0 || !(++g_acct_k & 255)) g_acct = nvn_plat_flag("nvk_sync_acct", 1) != 0; return g_acct; }
+static uint64_t acct_digest(const uint8_t *p, size_t n) {   // FNV-1a 64 位，按 8 字节取（页对齐的整页，n 是 8 的倍数时逐字；尾巴逐字节）
+    uint64_t h = 0xcbf29ce484222325ull; size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001b3ull; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+// 第 k 页（池内页号）在游戏内存里落在池范围内的那一段
+static void acct_page_span(const struct shadow *s, uint64_t k, const uint8_t **p, size_t *n) {
+    const size_t ps = nvn_dirty_page_size();
+    uintptr_t a = s->page0 + (uintptr_t)(k * ps), b = a + ps;
+    if (a < (uintptr_t)s->mem) a = (uintptr_t)s->mem;
+    if (b > (uintptr_t)s->mem + s->size) b = (uintptr_t)s->mem + s->size;
+    *p = (const uint8_t *)a; *n = b > a ? (size_t)(b - a) : 0;
+}
+static int acct_alloc_samples(struct shadow *s) {
+    if (s->acct_hash) return 1;
+    const uint64_t n = s->npages / ACCT_SAMPLE + 1;
+    s->acct_hash = calloc((size_t)n, sizeof *s->acct_hash); s->acct_src = calloc((size_t)n, 1);
+    if (!s->acct_hash || !s->acct_src) { free(s->acct_hash); free(s->acct_src); s->acct_hash = NULL; s->acct_src = NULL; return 0; }
+    return 1;
+}
+// 落地完成（锁内，游戏内存里已经是显卡写的字节）：碰到的页记一位；整页都被这次落地覆盖的抽样页记下此刻的摘要
+static void acct_note_land(struct shadow *s, uint64_t off, uint64_t len) {
+    if (!len || off >= s->size || !acct_on()) return;
+    if (len > s->size - off) len = s->size - off;
+    const size_t ps = nvn_dirty_page_size();
+    const uintptr_t a = (uintptr_t)s->mem + off, b = a + len;
+    const uint64_t p = (a - s->page0) / ps, q = (b - 1 - s->page0) / ps;
+    if (!s->acct_landed && !(s->acct_landed = calloc((size_t)(s->npages / 64 + 1), sizeof *s->acct_landed))) return;
+    for (uint64_t k = p; k <= q && k < s->npages; k++) s->acct_landed[k >> 6] |= 1ull << (k & 63);
+    if (!acct_alloc_samples(s)) return;
+    for (uint64_t k = (p + ACCT_SAMPLE - 1) / ACCT_SAMPLE * ACCT_SAMPLE; k <= q && k < s->npages; k += ACCT_SAMPLE) {
+        const uint8_t *pp; size_t n; acct_page_span(s, k, &pp, &n);
+        if (!n || (uintptr_t)pp < a || (uintptr_t)pp + n > b) continue;   // 只记整页都是这次落地写的
+        s->acct_hash[k / ACCT_SAMPLE] = acct_digest(pp, n); s->acct_src[k / ACCT_SAMPLE] = 2;
+    }
+}
+// sync_run 记账：第 i..j 页（含）即将同步；why = 录成 GPU 拷贝的原因对应的计数项（直接写时为 -1）
+static void acct_sync(struct shadow *s, const struct mirror *m, uint64_t i, uint64_t j, int why) {
+    const size_t ps = nvn_dirty_page_size(); const uint64_t kb = (uint64_t)ps / 1024, cur = rp_sub_serial();
+    uint64_t landed = 0, resub = 0;
+    for (uint64_t k = i; k <= j; k++) {
+        if (s->acct_landed && (s->acct_landed[k >> 6] >> (k & 63) & 1)) { landed++; s->acct_landed[k >> 6] &= ~(1ull << (k & 63)); }
+        if (m->synced[k] && m->sub[k] == cur) resub++;
+    }
+    if (landed) rp_perf_add(RP_PERF_SYNC_LANDED_KB, landed * kb);
+    if (resub) rp_perf_add(RP_PERF_SYNC_RESUB_KB, resub * kb);
+    if (why >= 0) rp_perf_add(why, (j - i + 1) * kb);
+    if (!acct_alloc_samples(s)) return;
+    for (uint64_t k = (i + ACCT_SAMPLE - 1) / ACCT_SAMPLE * ACCT_SAMPLE; k <= j; k += ACCT_SAMPLE) {
+        const uint8_t *pp; size_t n; acct_page_span(s, k, &pp, &n);
+        if (!n) continue;
+        const uint64_t h = acct_digest(pp, n), x = k / ACCT_SAMPLE; const uint8_t src = s->acct_src[x];
+        rp_perf_add(RP_PERF_SYNC_SAMP_N, 1);
+        if (src == 2) rp_perf_add(RP_PERF_SYNC_SAMP_LAND_N, 1);
+        if (src && s->acct_hash[x] == h) { rp_perf_add(RP_PERF_SYNC_SAMP_SAME_N, 1); if (src == 2) rp_perf_add(RP_PERF_SYNC_SAMP_LAND_SAME_N, 1); }
+        s->acct_hash[x] = h; s->acct_src[x] = 1;
+    }
+}
 // 镜像映射代号：新建镜像、换镜像都会让「同一段地址解析出的 (缓冲, 偏移)」变掉。回放核心的解析结果缓存按它作废。
 
 // ---------- 脏页追加日志（nvk_buf_dirtylog，#1501 A②）----------
@@ -395,6 +466,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 写它的那一份镜像里本来就是新的，不动（受跟踪的池里落地的 memcpy 自己会让页变脏）。
     if (ok && s->untracked) pages_invalidate_locked(s, off, len, wmi);
     land_verify_commit(s, wmi, &lv);
+    if (ok && src) acct_note_land(s, off, len);
     s->landing--;
     __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 锁内撤登记与计数保持一致
     if (!s->landing) pthread_cond_broadcast(&g_land_cv);   // 池销毁 / 会话收尾可安全解除目标映射
@@ -438,7 +510,10 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         int landing_hit = s->landing > s->nlr;   // 这一段里有没有正在锁外拷回的区间与 [a,b) 相交：有就只能退回录拷贝
         if (!landing_hit && s->nlr) { const uint64_t ra = a - (uintptr_t)mem, rb = b - (uintptr_t)mem;
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
-        uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
+        const int sub_hit = last == rp_sub_serial(), fence_open = !rp_fence_done(m->prev_fence);
+        uint8_t *d = !sub_hit && !fence_open && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
+        if (acct_on()) acct_sync(s, m, i, j, d ? -1 : sub_hit ? RP_PERF_SYNC_ORD_SUB_KB : fence_open ? RP_PERF_SYNC_ORD_FENCE_KB
+                                                  : landing_hit ? RP_PERF_SYNC_ORD_LAND_KB : RP_PERF_SYNC_ORD_NOCPU_KB);
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
         else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
