@@ -111,7 +111,7 @@ int main(void) {
     if (!open_backend()) return 1;
     run_array_upload(); run_clear(); run_3d(); run_bc1(); run_formats();
     uint64_t st[4]; nvn_be_read_texels_gpu_stats(st);
-    CHECK(st[0] == 4 && g_locks == g_unlocks && g_locks == 5, "4 reads counted (%llu), locks %d/%d", (unsigned long long)st[0], g_locks, g_unlocks);
+    CHECK(st[0] == 4 && g_locks == g_unlocks && g_locks == 4, "4 reads counted (%llu), locks %d/%d (the D24S8 refusal happens before the lock)", (unsigned long long)st[0], g_locks, g_unlocks);
     nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "close: %d %s", e.rc.code, e.why);
     s2a_vk_device_destroy(&g_dev, 1);
     printf("%s replay ReadTexels GPU: array / clear / 3D / BC1 / formats, failures=%d\n", g_fail ? "FAIL" : "PASS", g_fail);
