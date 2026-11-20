@@ -1,17 +1,48 @@
 // 真实 AudioManagers / AudioRendererManager / AudioProcessor + Dummy 驱动；只替换 Horizon 内核事件。
 using System;
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Threading;
 using Ryujinx.Audio.Backends.Dummy;
 using Ryujinx.Audio.Backends.CompatLayer;
+using Ryujinx.Audio.Common;
 using Ryujinx.Audio.Integration;
 using Ryujinx.Horizon;
 using Ryujinx.Horizon.Audio;
+using Ryujinx.Memory;
 using S2A.Services;
+
+if (args.Length != 0 && args[0] == "partial-start")
+{
+    using var partialDriver = new PartialStartDriver();
+    using var partial = new Ryujinx.Audio.Renderer.Server.AudioRendererManager(null);
+    partial.Initialize(Array.Empty<IWritableEvent>(), new CompatLayerHardwareDeviceDriver(partialDriver));
+    var start = partial.GetType().GetMethod("StartLocked", BindingFlags.Instance | BindingFlags.NonPublic);
+    try
+    {
+        start.Invoke(partial, null);
+        throw new Exception("the second audio output unexpectedly opened");
+    }
+    catch (TargetInvocationException e) when (e.InnerException?.Message == PartialStartDriver.Failure)
+    {
+        if (partialDriver.Opens != 2)
+            throw new Exception("the first output did not open before the injected failure");
+    }
+    partial.StopSendingCommands();
+    if (partial.Processor.OutputDevices != null)
+        throw new Exception("partially opened audio outputs were not cleaned up");
+    start.Invoke(partial, null);
+    partial.StopSendingCommands();
+    if (partial.Processor.OutputDevices != null)
+        throw new Exception("audio outputs were not cleaned up after retry");
+    Console.WriteLine("PASS partial audio start cleanup and retry");
+    return;
+}
 
 var lifetime = new HorizonAudioLifetime();
 S2AHorizonHooks.AudioCreated = lifetime.Register;
-var driver = new CompatLayerHardwareDeviceDriver(new DummyHardwareDeviceDriver());
+var audioBackend = new RecordingAudioThreadDriver();
+var driver = new CompatLayerHardwareDeviceDriver(audioBackend);
 var managers = new AudioManagers(driver, null);
 var renderer = managers.AudioRendererManager;
 const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -31,12 +62,36 @@ if (args.Length != 0 && args[0] == "old-order")
     Thread.Sleep(1000); // 未处理的异常应先终止子进程，不能把程序正常结束当作红。
     throw new Exception("missing expected AudioProcessor.Signal failure");
 }
+if (!audioBackend.Threads.ContainsKey(worker.ManagedThreadId) ||
+    audioBackend.Threads.Count != (Environment.GetEnvironmentVariable("S2A_AUDIO_INLINE") == "0" ? 2 : 1))
+    throw new Exception("owned audio threads did not call the real backend's affinity hook");
 lifetime.Dispose();
 if (worker.IsAlive) throw new Exception("audio renderer survived owner cleanup");
 driver.Dispose();
 lifetime.Dispose();
 managers.Dispose(); // 服务入口晚到的 Shutdown 幂等。
 Console.WriteLine("PASS audio lifetime: real manager/processor joined before driver pause event disposal; repeated cleanup safe");
+Console.WriteLine("PASS audio placement hook: owned renderer threads registered with the real backend");
+
+sealed class RecordingAudioThreadDriver : DummyHardwareDeviceDriver, IHardwareDeviceDriver
+{
+    public readonly ConcurrentDictionary<int, byte> Threads = new();
+    void IHardwareDeviceDriver.S2AConfigureRenderThread() => Threads.TryAdd(Environment.CurrentManagedThreadId, 0);
+}
+
+sealed class PartialStartDriver : DummyHardwareDeviceDriver, IHardwareDeviceDriver
+{
+    public const string Failure = "injected failure on the second audio output";
+    public int Opens { get; private set; }
+
+    IHardwareDeviceSession IHardwareDeviceDriver.OpenDeviceSession(IHardwareDeviceDriver.Direction direction,
+        IVirtualMemoryManager memoryManager, SampleFormat sampleFormat, uint sampleRate, uint channelCount)
+    {
+        if (++Opens == 2)
+            throw new InvalidOperationException(Failure);
+        return base.OpenDeviceSession(direction, memoryManager, sampleFormat, sampleRate, channelCount);
+    }
+}
 
 namespace Ryujinx.Horizon
 {

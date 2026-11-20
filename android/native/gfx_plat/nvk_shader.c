@@ -4,7 +4,7 @@
 // 三段式：提交线程只捕获「不可变输入快照」（读 rp_S 填事实 / 算内容身份 / pin 住源引用）；工作函数只吃快照
 // （离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器），同一身份在途只有一份；最后在锁里校验会话未停 /
 // 代际未变才发布到 g_progs。预热带（nvn/nvn_warm.c）按跨会话清单在后台重建热点程序，真实 draw 直接命中；
-// 取不到就照旧同步做，不跳过任何绘制。
+// 缓存未命中时由提交线程生成请求；启用需求编译后，worker 只执行不可变请求并返回字节。
 // 线程：后台线程不读 rp_S、不编码命令、不提交；nvn_gpu_shader_load 的契约明确允许 [后台]（预取）。
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -16,6 +16,7 @@
 #include "nvn_fmt_info.h"
 #include "nvn_hmap.h"
 #include "direct/compile_request.h"
+#include "direct/compile_worker.h"
 #include "direct/input_identity.h"
 #include "direct/source_store.h"
 #include "direct/texture_facts.h"
@@ -44,17 +45,40 @@
 // merely until the managed compiler returns.
 #define NVK_SHADER_STOP_BIT (1u << 31)
 static _Atomic unsigned g_shader_admission;
-void nvk_shader_stop(void) { atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel); }
+static int g_live_compile;   // 0 = 对照档，1 = 后台，-1 = 启动失败（具名退回原路径）；会话准备时定
+static uint32_t g_live_frame_ms, g_live_unsafe_ms;
+static uint64_t now_ns(void);
+static uint64_t g_live_budget_frame, g_live_spent_ns;   // 提交 owner 独占
+static _Atomic uint64_t g_live_enqueued, g_live_wait_ns, g_live_pending, g_live_fallback, g_live_timeout;
+static int live_worker(void *, uint64_t, uint64_t, const char *, size_t, uint8_t **, size_t *, char *, size_t);
+void nvk_shader_stop(void) {
+    atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel);
+    // 先唤醒等待者，不在 Stop 入口 join。执行 managed 的 worker 自己持准入，现有停局限时等它。
+    if (g_live_compile == 1) (void)s2a_compile_worker_stop_bounded(0, NULL, 0);
+}
 unsigned nvk_shader_inflight(void) { return atomic_load_explicit(&g_shader_admission, memory_order_acquire) & ~NVK_SHADER_STOP_BIT; }
 // 会话级在途 / 静默 / 代际清场（定义在下面的状态变量之后：open 在文件前面，用前向声明）。
 static void shader_session_state_reset(void);
 int nvk_shader_open(void) {
     unsigned expected = NVK_SHADER_STOP_BIT;
     if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire)) {
-        shader_session_state_reset();   // 新会话：在途 / 静默位 / 代际清一遍（上一局的后台结果不得落进新会话）
-        return 0;
+        shader_session_state_reset();   // 在途 / 静默位 / 代际清场
+    } else if (expected != 0) return -1;
+    g_live_compile = 0;
+    g_live_budget_frame = 0;
+    g_live_spent_ns = 0;
+    struct rp_shader_live_compile_stats discarded;
+    rp_shader_live_compile_take(&discarded);
+    if (nvn_plat_flag("nvk_live_compile_async", 1)) {
+        const int frame_ms = nvn_plat_flag("fu_frame_ms", 100);
+        const int unsafe_ms = nvn_plat_flag("fu_unsafe_ms", 10000);
+        g_live_frame_ms = frame_ms > 0 ? (uint32_t)frame_ms : 0;
+        g_live_unsafe_ms = unsafe_ms > 0 ? (uint32_t)unsafe_ms : 0;
+        char why[160] = "";
+        g_live_compile = s2a_compile_worker_start(live_worker, NULL, why, sizeof why) ? -1 : 1;
+        if (g_live_compile < 0) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why);
     }
-    return expected == 0 ? 0 : -1;
+    return 0;
 }
 static int shader_enter(void) {
     unsigned s = atomic_load_explicit(&g_shader_admission, memory_order_acquire);
@@ -154,8 +178,21 @@ static unsigned g_reject_lines, g_img_reject_lines, g_reject_total, g_img_reject
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
 static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
 // 后端拒装着色器时记哪一项（#1340）：设备没 shaderInt16、模块又声明了 Int16 的，具名 int16_not_supported（只拒这个程序，不整局停）；其余照旧。
+// int16 首行带阶段键（#1774②）：本项按名累计程序数、首条红行留首个程序键，供普查统计；拒收语义不变。
 static void red_load(nvn_gpu_rc rc, const nvn_gpu_shader_src *src, const char *fallback, const char *why) {
-    red1(rc.code == NVN_GPU_E_UNSUPPORTED && s2a_spirv_declares_cap(src->blob, src->bytes, 22) == 1 ? "int16_not_supported" : fallback, why);
+    if (rc.code == NVN_GPU_E_UNSUPPORTED && s2a_spirv_declares_cap(src->blob, src->bytes, 22) == 1) {
+        char b[320];
+        snprintf(b, sizeof b, "%s（键 %02x%02x%02x%02x%02x%02x%02x%02x）", why,
+                 src->key[0], src->key[1], src->key[2], src->key[3], src->key[4], src->key[5], src->key[6], src->key[7]);
+        red1("int16_not_supported", b);
+    } else red1(fallback, why);
+}
+// 预编库拒收文本 → 未接名（#1774② 三项之二）：libpack_vk.c 的 lp_fail 文本里已带程序键 khex。
+static const char *lp_reject_name(const char *why) {
+    if (!why) return NULL;
+    if (strstr(why, "int64_type_used") || strstr(why, "int64_atomics_used")) return "int64_not_supported";
+    if (strstr(why, "writes a viewport")) return "geometry_viewport_write";
+    return NULL;
 }
 // 不需要 _GNU_SOURCE 的 strdup：快照要活过后台线程，profile 原文 / closure / profileHash 必须各存一份。
 static char *dup_str(const char *s) {
@@ -413,6 +450,8 @@ static void compiler_rejected(const char *summary, const struct work_snap *snap)
                 snprintf(reason, sizeof reason, "cbuf_handle_unsupported");
             else if (!strcmp(code, "UNSUPPORTED_PROGRAM") && strstr(message, "separate sampler slot is not implemented"))
                 snprintf(reason, sizeof reason, "separate_sampler_unsupported");
+            else if (!strcmp(code, "UNSUPPORTED_PROGRAM") && strstr(message, "viewport arrays are not implemented"))
+                snprintf(reason, sizeof reason, "geometry_viewport_write");   // #1774②：几何程序写视口号（现编路径）
             else if (!strcmp(code, "MISSING_FACT")) {
                 snprintf(reason, sizeof reason, "MISSING_FACT.unclassified");
                 size_t method = strspn(message, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_");
@@ -927,7 +966,12 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
             if (!(b->is_support || b->stage_idx == st)) continue;
             if (e->prog.nent[st] == RP_PROG_ENT_MAX) { red1("too_many_bindings", ""); e->failed = 1; break; }
             nvn_gpu_layout_ent *le = &e->prog.ent[st][e->prog.nent[st]];
-            if (!layout_ent(b, le)) { char nm[40]; snprintf(nm, sizeof nm, "binding_kind_%d_slot_%d", b->kind, b->slot); red1(nm, b->stage); e->failed = 1; break; }
+            if (!layout_ent(b, le)) {
+                char nm[40], wy[96]; const uint8_t *k = views[st].key ? views[st].key : identity;
+                snprintf(nm, sizeof nm, "binding_kind_%d_slot_%d", b->kind, b->slot);
+                snprintf(wy, sizeof wy, "%s 键 %02x%02x%02x%02x…", b->stage[0] ? b->stage : "?", k[0], k[1], k[2], k[3]);
+                red1(nm, wy); e->failed = 1; break;
+            }
             if ((le->src_kind == NVN_RB_TEXU || le->src_kind == NVN_RB_TBUFU) && !usrc_put(&e->prog, b, le)) { red1("too_many_uniform_handles", b->stage); e->failed = 1; break; }
             if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", b->stage); e->failed = 1; break; }
             le->stages = b->is_support ? (1u << nst) - 1u : 1u << st;
@@ -942,6 +986,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[st]; L.nent = e->prog.nent[st]; L.support_bytes = fp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
         src.blob = fp.stage[st].spirv; src.bytes = fp.stage[st].spirv_bytes; src.entry = "main"; src.layout = &L;
+        if (views[st].key) memcpy(src.key, views[st].key, 8);   // 阶段键：装填报红的程序身份（int16_not_supported 首行带它）
         nvn_gpu_err err = {0};
         nvn_gpu_rc lr = nvn_gpu_shader_load(&src, &e->prog.sh[st], &err);
         if (!nvn_gpu_ok(lr)) { red_load(lr, &src, "shader_load_failed", err.why); e->failed = 1; }
@@ -1090,6 +1135,10 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     pthread_mutex_unlock(&g_lp_mu);
     if (!lp) return 0;
     if (lrc != S2A_LIBPACK_HIT) {   // 没找到 / 容器里这一键坏：前几条把原因打出来（键 = 每阶段 8 字节控制键）
+        if (lrc == S2A_LIBPACK_REJECT) {   // #1774②：三项未接能力按名入未接清单——程序数累计 + 首行红带首个键（lw 已含 khex）；具名拒照旧
+            const char *un = lp_reject_name(lw);
+            if (un) red1(un, lw);
+        }
         static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 6) {
             const uint8_t *k = ckey ? ckey : gkeys[0];
             char b[400]; snprintf(b, sizeof b, "出包预编库没取到%s（%s，键 %02x%02x%02x%02x…）：%s", ckey ? "计算程序" : "",
@@ -1161,6 +1210,11 @@ static void reject_context(const struct work_snap *s, const char *reason, const 
         snprintf(line, sizeof line, "texture_pool_reject_program reason=%.79s stages=%d key=%s", reason, s->nst, key);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
     }
+    // #1774②：几何程序写视口号（现编路径）入未接清单——程序数按名累计、首条红行带首个程序键；具名拒照旧
+    if (!strcmp(reason, "geometry_viewport_write")) {
+        snprintf(line, sizeof line, "几何程序写视口号：现编拒收（键 %s）", key);
+        red1("geometry_viewport_write", line);
+    }
     const char *img = strstr(message, "[kind=image ");
     if (!img || strcmp(reason, "cbuf_handle_unsupported")) return;
     const int st = !strncmp(message, "vs:", 3) ? 0 : !strncmp(message, "fs:", 3) ? 1 : !strncmp(message, "gs:", 3) ? 2 : -1;   // 消息以阶段名开头
@@ -1189,11 +1243,111 @@ static void reject_context(const struct work_snap *s, const char *reason, const 
     nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
 }
 
-// [提交 / 后台] 只吃快照：离线库 → 跨局缓存 →（仅提交线程）现场编译 → parse + 建后端着色器。
-// background 时没有结果字节就返回 NULL（清单里没有编译事实，编译请求只能由提交线程的那一份快照建；
-// 也不去启动编译 worker：nvk 层没有需求编译 worker，启动它会改变会话编译拓扑）。
-// 返回失败项 entry（failed=1）表示编译失败——调用方按「同一份输入不再反复编」发布它。
-static struct entry *work_run(const struct work_snap *s, int background) {
+// 仅 worker 执行 managed 翻译。生命周期准入在 worker 本线程持有，与提交者是否还等结果无关。
+static int live_worker(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t len,
+                       uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size) {
+    (void)ctx;
+    if (shader_enter()) return -1;
+    struct s2a_compile_outcome oc = {0};
+    int ran = shader_compile_admit() ? s2a_compile_request_execute(session, generation, json, len, &oc) : -1;
+    const int ok = !ran && oc.bytes && oc.bytes_len;
+    if (ok) {
+        *bytes = oc.bytes;
+        *bytes_len = oc.bytes_len;
+        oc.bytes = NULL;
+    } else snprintf(why, why_size, "%s", oc.summary[0] ? oc.summary : "compile stopped or produced no result");
+    s2a_compile_outcome_free(&oc);
+    shader_leave();
+    return ok ? 0 : -1;
+}
+
+enum live_status { LIVE_OK, LIVE_REJECTED, LIVE_PENDING, LIVE_ABORT };
+void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *s) {
+    s->enqueued = atomic_exchange_explicit(&g_live_enqueued, 0, memory_order_relaxed);
+    s->wait_ns = atomic_exchange_explicit(&g_live_wait_ns, 0, memory_order_relaxed);
+    s->pending = atomic_exchange_explicit(&g_live_pending, 0, memory_order_relaxed);
+    s->fallback = atomic_exchange_explicit(&g_live_fallback, 0, memory_order_relaxed);
+    s->timeout = atomic_exchange_explicit(&g_live_timeout, 0, memory_order_relaxed);
+}
+
+// Worker 的键按实际请求字节（包括 c1），而非 g_progs 的较粗身份。没就绪/队满/停局均不缓存成编译器拒收。
+static enum live_status live_compile(uint64_t session, uint64_t generation, const char *json, size_t len,
+                                     const uint8_t identity[32], unsigned stages, const struct rp_shader_req *q,
+                                     struct s2a_compile_outcome *oc) {
+    if (!shader_compile_admit()) {
+        nvn_unimpl("shader", "compile_stopped", NULL);
+        return LIVE_ABORT;
+    }
+    if (g_live_compile != 1) {
+        if (g_texpool_diag) g_pool_attempts++;
+        if (g_live_compile < 0) atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
+        const uint64_t trace = diag_begin(identity, stages, 1);
+        const int ran = s2a_compile_request_execute(session, generation, json, len, oc);
+        const int ok = !ran && oc->bytes && oc->bytes_len;
+        diag_end(trace, ok);
+        return ok ? LIVE_OK : LIVE_REJECTED;
+    }
+    uint8_t key[32];
+    s2a_sha256 hash;
+    s2a_sha256_init(&hash);
+    s2a_sha256_update(&hash, &session, sizeof session);
+    s2a_sha256_update(&hash, &generation, sizeof generation);
+    s2a_sha256_update(&hash, json, len);
+    s2a_sha256_final(&hash, key);
+    int w = s2a_compile_worker_poll(key, &oc->bytes, &oc->bytes_len, oc->summary, sizeof oc->summary);
+    if (shader_stopped()) return LIVE_ABORT;
+    if (w == 0 && oc->bytes && oc->bytes_len) return LIVE_OK;
+    if (w == 2) return LIVE_REJECTED;
+    uint64_t frame = 0;
+    const int may_defer = q && q->compile_defer_frame && q->compile_defer_frame(&frame);
+    const uint64_t start = now_ns();
+    uint64_t budget = (uint64_t)g_live_unsafe_ms * 1000000;
+    if (may_defer) {
+        if (frame != g_live_budget_frame) {
+            g_live_budget_frame = frame;
+            g_live_spent_ns = 0;
+        }
+        budget = (uint64_t)g_live_frame_ms * 1000000;
+        budget = g_live_spent_ns < budget ? budget - g_live_spent_ns : 0;
+    }
+    while (w == 3 && !shader_stopped()) {
+        int sr = s2a_compile_worker_submit_async(session, generation, json, len, key, oc->summary, sizeof oc->summary);
+        if (sr == 0) {
+            atomic_fetch_add_explicit(&g_live_enqueued, 1, memory_order_relaxed);
+            if (g_texpool_diag) g_pool_attempts++;
+        }
+        if (sr == 0 || sr == 2) {
+            w = s2a_compile_worker_poll(key, &oc->bytes, &oc->bytes_len, oc->summary, sizeof oc->summary);
+            break;
+        }
+        if (sr < 0) { w = -1; break; }
+        const uint64_t elapsed = now_ns() - start;
+        const uint32_t left = elapsed < budget ? (uint32_t)((budget - elapsed) / 1000000) : 0;
+        if (!left) break;
+        if (s2a_compile_worker_pump(left) < 0) break;
+    }
+    const uint64_t elapsed = now_ns() - start;
+    const uint32_t wait_ms = elapsed < budget ? (uint32_t)((budget - elapsed) / 1000000) : 0;
+    if (w == 1 && wait_ms)
+        w = s2a_compile_worker_wait_async(key, wait_ms, &oc->bytes, &oc->bytes_len, oc->summary, sizeof oc->summary);
+    const uint64_t spent = now_ns() - start;
+    atomic_fetch_add_explicit(&g_live_wait_ns, spent, memory_order_relaxed);
+    if (may_defer) g_live_spent_ns += spent;
+    if (shader_stopped()) return LIVE_ABORT;
+    if (w == 0 && oc->bytes && oc->bytes_len) return LIVE_OK;
+    if (w == 2) return LIVE_REJECTED;
+    if (may_defer && (w == 1 || w == 3)) {
+        atomic_fetch_add_explicit(&g_live_pending, 1, memory_order_relaxed);
+        return LIVE_PENDING;
+    }
+    atomic_fetch_add_explicit(&g_live_timeout, 1, memory_order_relaxed);
+    red1(w == 1 ? "live_compile_timeout" : "live_compile_unavailable", "后台着色器在等待时限内没有可用结果");
+    return LIVE_ABORT;
+}
+
+// [提交] 只吃快照：离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器。
+// 仅真实编译器拒收生成 failed entry；预算用尽和 Stop 不作永久失败缓存。
+static struct entry *work_run(const struct work_snap *s, const struct rp_shader_req *q, int *pending) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
     uint8_t rsha[32]; int have_res = 0;   // 结果摘要（跨局缓存读到的已校验摘要 / 现编结果现算的）：挂在 entry 上给结果合并用，离线库 / 预编库来的不挂
     const char *root = getenv("S2A_SHADER_REVISION_ROOT"), *cdir = getenv("S2A_DIRECT_CACHE_DIR");
@@ -1222,8 +1376,8 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         if (le) entry_free(le);
         libpack_mark_bad(s->identity);
     }
-    if (!bytes && !background) {
-        // 现场编译：提交线程同步做（取不到就地做，不跳过绘制）。
+    if (!bytes) {
+        // 现场编译只读取已捕获的请求，回到原 owner 处理事实学习和结果发布。
         static struct s2a_compile_request_input in;   // 提交线程独占
         memset(&in, 0, sizeof in);
         in.session = s->pc.session; in.generation = s->pc.generation;
@@ -1252,13 +1406,14 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         char *json = NULL; size_t jl = 0; char gaps[1024] = "";
         if (s2a_compile_request_build(&in, &json, &jl, gaps, sizeof gaps)) { red1("request_build_failed", gaps); return NULL; }
         struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
-        if (g_texpool_diag) g_pool_attempts++;
-        if (!shader_compile_admit()) { free(json); nvn_unimpl("shader", "compile_stopped", NULL); return NULL; }
-        uint64_t trace = diag_begin(s->identity, s->stages, !background);
-        int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
-        diag_end(trace, !ran && oc.bytes && oc.bytes_len);
+        enum live_status status = live_compile(in.session, in.generation, json, jl, s->identity, s->stages, q, &oc);
         free(json);
-        if (ran || !oc.bytes || !oc.bytes_len) {
+        if (status == LIVE_PENDING || status == LIVE_ABORT) {
+            *pending = status == LIVE_PENDING;
+            s2a_compile_outcome_free(&oc);
+            return NULL;
+        }
+        if (status == LIVE_REJECTED) {
             atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
             // 编译器报缺的是用户常量缓冲里的句柄事实、且学到了新坐标：resolve_slow 会带上它当场重编，这次拒绝是学习的一步，
             // 不记成「未接 compile_failed」（不然每份着色器第一次见这类句柄都多几条假红）。学不到 / 重编到上限仍失败的，下一次照常报红。
@@ -1781,10 +1936,11 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     const uint64_t dg_c0 = atomic_load(&g_n_compiled);
     struct work_snap *snap = snap_capture(&f, &id, sha, &pc, stages, nst);
     g_ubo_learned = 0;
-    if (!snap || !(ne = work_run(snap, 0))) {
+    int pending = 0;
+    if (!snap || !(ne = work_run(snap, q, &pending))) {
         snap_free(snap);
         if (claimed) inflight_abort(sha);
-        return -1;
+        return pending ? 1 : -1;
     }
     idg_work(group, atomic_load(&g_n_compiled) > dg_c0);   // 身份粒度诊断：这份身份是现场编出来的还是读盘/离线库拿到的
     idg_log();
@@ -1833,7 +1989,10 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     memset(&cp, 0, sizeof cp);
     int parsed = nvn_vk_program_parse_compute(bytes, len, &cp, why, sizeof why);
     if (parsed) {
-        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("compute_program_parse_failed", why);
+        if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why);
+        else { const uint8_t *k = src && src->key ? src->key : identity;
+               char wy[288]; snprintf(wy, sizeof wy, "%s（键 %02x%02x%02x%02x…）", why, k[0], k[1], k[2], k[3]);
+               red1("compute_program_parse_failed", wy); }
         e->failed = 1; return e;
     }
     e->prog.support_bytes = cp.support_bytes; e->prog.spill_bytes = cp.spill_bytes;
@@ -1858,7 +2017,10 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
                 }
             }
         } else ok = layout_ent(b, le);
-        if (!ok) { char nm[56]; snprintf(nm, sizeof nm, "compute_binding_kind_%d_slot_%d_map_%d", b->kind, b->slot, b->kind == 1 ? (int)cp.storage[i].mapping : 0); red1(nm, "cs"); e->failed = 1; break; }
+        if (!ok) { char nm[56], wy[80]; const uint8_t *k = src && src->key ? src->key : identity;
+            snprintf(nm, sizeof nm, "compute_binding_kind_%d_slot_%d_map_%d", b->kind, b->slot, b->kind == 1 ? (int)cp.storage[i].mapping : 0);
+            snprintf(wy, sizeof wy, "cs 键 %02x%02x%02x%02x…", k[0], k[1], k[2], k[3]);
+            red1(nm, wy); e->failed = 1; break; }
         if (le->cls == NVN_GPU_RES_TBUF && le->src_kind != NVN_RB_TBUF) { red1("texture_buffer_replay_unsupported", "cs"); e->failed = 1; break; }
         le->stages = 1u << NVN_GPU_SH_CS;
         if (b->kind == 2 || b->kind == 3) sampled_decl(cp.stage.spirv, cp.stage.spirv_bytes, (uint32_t)b->set, (uint32_t)b->binding,   // 3 = 存储图像：数值类与声明格式给回放选视图格式
@@ -2027,12 +2189,13 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         }
         if (!bytes && !lpe) {
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
-            if (g_texpool_diag) g_pool_attempts++;
-            if (!shader_compile_admit()) { nvk_compute_request_release(&rq); nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
-            uint64_t trace = diag_begin(rq.identity, 32u, 1);
-            int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
-            diag_end(trace, !ran && oc.bytes && oc.bytes_len);
-            if (ran || !oc.bytes || !oc.bytes_len) {
+            enum live_status status = live_compile(rq.session, rq.generation, rq.json, rq.json_bytes, rq.identity, 32u, NULL, &oc);
+            if (status == LIVE_ABORT) {
+                s2a_compile_outcome_free(&oc);
+                nvk_compute_request_release(&rq);
+                return -1;
+            }
+            if (status == LIVE_REJECTED) {
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
                 red1("compute_compile_failed", oc.summary); compiler_rejected(oc.summary, NULL);
                 s2a_compile_outcome_free(&oc);
@@ -2228,7 +2391,7 @@ int rp_shader_prog_borrowed(void) {
 //   1 = 该身份已被真实 draw 在途构建（同一张在途表）——立即返回，不占预热线程等编译；
 //  -1 = 失败（跨局缓存/离线库里没有这份身份的结果字节，或 parse/建对象失败；已计数，本局不再重试）。
 // 只按内容身份读盘 + parse + 建对象：清单里没有编译事实，预热不重建编译请求、不启动编译 worker；
-// 真到现场编译一律留给提交线程的真实 draw（取不到就照旧同步做，不跳过绘制）。
+// 现编请求只能由真实 draw/dispatch 捕获，预热读不到结果时让真实首用走需求路径。
 int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
     if (!rec) return -1;
     int nst = stage_nst(rec->stage_mask);
@@ -2290,7 +2453,7 @@ int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
             return -1;   // 本局不再重试（重试也没用，清单要等真实 draw 把 c1 记回去）；真实 draw 会自己备出来
         }
     }
-    if (!e) {   // 缓存/离线库里没有这份身份的结果字节：正常分支（不是 bug），真实 draw 到时同步编
+    if (!e) {   // 缓存/离线库里没有这份身份的结果字节：正常分支（不是 bug），真实 draw 到时发需求编译
         inflight_abort(rec->identity);
         nvk_prog_warm_stat_build(-1);
         return -1;
