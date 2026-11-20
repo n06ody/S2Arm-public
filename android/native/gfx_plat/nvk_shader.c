@@ -890,6 +890,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
                            const uint8_t identity[32]) {
     struct entry *e = calloc(1, sizeof *e);
     if (!e) return NULL;
+    e->prog.pos_attr = -1; e->prog.may_discard = 1; e->prog.writes_smask = 1;   // 栅格事实缺省 = 证不出（calloc 的 0 会误证「属性 0 / 不丢片元」）
     memcpy(e->prog.identity, identity, 32);
     struct fd_program fp; char why[192] = "";
     memset(&fp, 0, sizeof fp);
@@ -919,6 +920,10 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
       } }
     e->prog.z_raw = depth_clip_cap() == 1;   // 同 fill_facts：有管线裁剪深度时所有图形程序都不改写 z（预编库的程序另在取用处置 1）
     e->prog.color_out_mask = nst >= 2 && fp.stage[1].present ? fp.stage[1].fragment_output_map : 0xffffffffu;
+    // 栅格事实（编译结果 raster 段；缺段 = 解析器已填保守值，首笔全画自动拒绝）
+    e->prog.pos_attr = fp.stage[0].pos_attr; e->prog.pos_w1 = fp.stage[0].pos_w1; e->prog.pos_z_half = fp.stage[0].pos_z_half;
+    e->prog.may_discard = nst >= 2 && fp.stage[1].present ? fp.stage[1].may_discard : 1;
+    e->prog.writes_smask = nst >= 2 && fp.stage[1].present ? fp.stage[1].writes_smask : 1;
     { static _Atomic int said; if (nst >= 2 && nvn_plat_flag("nvk_drawlog", 0) && atomic_fetch_add(&said, 1) < 40) { char m[96]; snprintf(m, sizeof m, "片元输出映射 %#x（片元代码 %zu 字节）", (unsigned)e->prog.color_out_mask, fp.stage[1].spirv_bytes); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", m); } }
     for (int st = 0; st < nst && !e->failed; st++) {
         if (!fp.stage[st].present) { red1("stage_missing_in_result", st ? "fs" : "vs"); e->failed = 1; break; }
@@ -1268,7 +1273,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
             compiler_rejected(oc.summary, learned ? NULL : s);   // 学坐标的那一步马上重编，不打上下文；其余被拒打程序键与图像槽原因（只加日志）
             s2a_compile_outcome_free(&oc);
             struct entry *fe = (struct entry *)calloc(1, sizeof *fe);
-            if (fe) { fe->failed = 1; memcpy(fe->prog.identity, s->identity, 32); }
+            if (fe) { fe->failed = 1; fe->prog.pos_attr = -1; fe->prog.may_discard = 1; fe->prog.writes_smask = 1; memcpy(fe->prog.identity, s->identity, 32); }
             return fe;
         }
         bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL;
@@ -1828,6 +1833,7 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     struct entry *e = calloc(1, sizeof *e);
     if (!e) return NULL;
     e->prog.is_compute = 1;
+    e->prog.pos_attr = -1; e->prog.may_discard = 1; e->prog.writes_smask = 1;
     memcpy(e->prog.identity, identity, 32);
     static _Thread_local struct nvn_vk_compute_program cp; char why[192] = "";
     memset(&cp, 0, sizeof cp);
@@ -2038,7 +2044,8 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 s2a_compile_outcome_free(&oc);
                 e = calloc(1, sizeof *e);
                 if (e) {
-                    e->failed = 1; memcpy(e->prog.identity, rq.identity, 32);
+                    e->failed = 1; e->prog.pos_attr = -1; e->prog.may_discard = 1; e->prog.writes_smask = 1;
+                    memcpy(e->prog.identity, rq.identity, 32);
                     pthread_mutex_lock(&g_progs_mu);
                     struct entry *have0 = progs_get_locked(rq.identity);
                     if (!have0) (void)nvn_hm_put(&g_progs, rq.identity, e);
@@ -2068,17 +2075,52 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
     return 0;
 }
 
+// rp_sdx.c 前瞻索引用的「绑定程序序号 → 已编译程序」表：每次 resolve 成功把生效阶段绑定的程序序号
+// （rp_S.bser / cser，绑定对象的内容序号，单调不复用）登记到当时的编译结果。同一 prog_t 换个绑定序号
+// 或同一序号换了阶段槽都会再记一格——读集 / 栅格事实只跟源程序走，与管线变体（rt 格式、图元）无关，
+// 用哪个变体的 rp_prog 看事实都一样。peek miss（没编过 / 被顶掉 / 已收尾）= 前瞻按保守全槽读记。
+// 生命周期：条目随 rp_shader_reset 与 g_progs 同步清空（entry 在重置时释放，这里绝不能留悬指针）。
+#define NVK_PEEK_SLOTS 64
+static const struct rp_prog *g_peek_tab[NVK_PEEK_SLOTS];
+static uint64_t g_peek_key[NVK_PEEK_SLOTS];
+
+static void peek_note(uint64_t ser, const struct rp_prog *p) {
+    if (!ser || !p) return;
+    unsigned h = (unsigned)(ser * 0x9E3779B97F4A7C15ull >> 58);
+    for (unsigned i = 0; i < 8; i++) {
+        unsigned k = (h + i) & (NVK_PEEK_SLOTS - 1);
+        if (g_peek_key[k] == ser) { g_peek_tab[k] = p; return; }
+        if (!g_peek_key[k]) { g_peek_key[k] = ser; g_peek_tab[k] = p; return; }
+    }
+    g_peek_key[h] = ser; g_peek_tab[h] = p;   // 探测满了：顶掉本槽（丢一格只是保守，不会错）
+}
+const struct rp_prog *rp_shader_peek(uint64_t ser) {   // 线程：[提交]（前瞻索引与 resolve 同在提交线程跑）
+    if (!ser) return NULL;
+    unsigned h = (unsigned)(ser * 0x9E3779B97F4A7C15ull >> 58);
+    for (unsigned i = 0; i < 8; i++) {
+        unsigned k = (h + i) & (NVK_PEEK_SLOTS - 1);
+        if (g_peek_key[k] == ser) return g_peek_tab[k];
+        if (!g_peek_key[k]) break;
+    }
+    return NULL;
+}
+
 int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) {
     pool_log_flush();
     if (shader_enter()) { *out = NULL; nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
-    int rc = shader_resolve_graphics(q, out); shader_leave(); return rc;
+    int rc = shader_resolve_graphics(q, out);
+    if (!rc && *out) { uint32_t st = rp_shader_graphics_stages(); for (int i = 0; i < 5; i++) if (st & (1u << i)) peek_note(rp_S.bser[i], *out); }
+    shader_leave(); return rc;
 }
 int rp_shader_resolve_compute(const struct rp_prog **out) {
     if (shader_enter()) { *out = NULL; nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
-    int rc = shader_resolve_compute(out); shader_leave(); return rc;
+    int rc = shader_resolve_compute(out);
+    if (!rc && *out) peek_note(rp_S.cser, *out);
+    shader_leave(); return rc;
 }
 
 void rp_shader_reset(void) {
+    memset(g_peek_tab, 0, sizeof g_peek_tab); memset(g_peek_key, 0, sizeof g_peek_key);   // 先清 peek 表再释放 entry：前瞻的借用指针不能悬
     fact_cache_reset();
     if (g_pool_programs || g_pool_request_rejected) pool_stats("reset");
     // 后台预热一律不得越过这一步进会话收尾：先有界静默（置位后后台不再发布），再释放。
