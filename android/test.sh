@@ -302,12 +302,15 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mu
 # 计算程序预热（清单记账 / 阶段 / 从缓存建 / 开关）与现场编译诊断事件（图形 / 计算）的负对照：各撤一处，对应断言必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --live-compile-mutants
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
+# 落地免重搬（rp_buf.c land_verify）：修前（main 的 rp_buf.c）落地后整页重搬必红；逐字节比 / 代号 / 布防 / 整页 / 两条路径各撤一处必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/land_noresync_mutation_test.py"
 # 存储缓冲槽长度语义：地址有效、长度 0 按硬件语义绑真实内存（池剩余长度，回写按它登记），没有可绑内存才绑空缓冲照画；5 个点变异各撤一处必红（纯宿主 C）
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/storage_unmapped_mutation_test.py"
 # ReadTexels 读 GPU 内容（rp_read_texels.inc / 旁路段 / rp_entry 分支）：等之前的活、提交锁、行距片距、READBACK 与块对齐、栅栏推进、提交内拒绝、修前，各撤一处必红（纯宿主 C）
@@ -355,6 +358,8 @@ s2a_gate_step bash "$android_dir/tools/nvk_pipe_pend_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvn_vk_pipe_demand_test.sh"
 # 新层首用管线异步的绘制级用例：真 rp_draw / rp_pass + 真 demand / 待定表 / 判定表，可控建管线闸（跳 / 等 / 预算 / 上限 / 停局丢弃）。
 s2a_gate_step bash "$android_dir/tools/nvk_pipe_async_draw_test.sh"
+# 存储前瞻 + 首笔全画（rp_sdx / rp_pass 的 store-dontcare 决策与 rp_draw 的 fd 证明）：真回放核心 + 通道描述替身，双负对照脚本另跑（tools/nvk_sdx_test.sh 头部注释里的 S2A_SDX_NEG）。
+s2a_gate_step bash "$android_dir/tools/nvk_sdx_test.sh"
 s2a_gate_step bash "$android_dir/tools/nvk_shader_lease_test.sh"
 # 按结果合并（#1355 方案 A）：编译结果相同（结果摘要 + 负载长度 + 阶段数 + c1 有无与内容都相同）的身份共用一份
 # 着色器记录与句柄、管线随之合并；真 program_cache.c + 真缓存文件，ASan 下覆盖「收尾后不留悬空」。

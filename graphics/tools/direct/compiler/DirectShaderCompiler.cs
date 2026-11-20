@@ -720,6 +720,43 @@ namespace S2A.DirectCompiler
                         writer.WritePropertyName("c0ReadsStatic");
                         WriteRanges(writer, staticReads);
                     }
+                    // 光栅事实（可选段，C 侧缺省全保守）：只写证得出的形状；
+                    // 证不出照旧写保守值，缺整个 raster 段时宿主按同一批缺省处理。
+                    DirectRasterFacts.Result raster = DirectRasterFacts.Analyze(shader.BinaryCode);
+                    if (raster.HasVertex || raster.HasFragment)
+                    {
+                        writer.WriteStartObject("raster");
+                        if (raster.HasVertex)
+                        {
+                            writer.WriteNumber("pos_attr", raster.PosAttr);
+                            writer.WriteBoolean("pos_w1", raster.PosW1);
+                            writer.WriteBoolean("pos_z_half", raster.PosZHalf);
+                            // pos_src：complex（0，缺省）不写字段，C 侧缺省即 0；
+                            // pos_const / pos_vtab 只在各自来源类别下写。
+                            if (raster.PosSrc != 0)
+                            {
+                                writer.WriteNumber("pos_src", raster.PosSrc);
+                                if (raster.PosSrc == 2 && raster.PosConst != null)
+                                {
+                                    writer.WriteStartArray("pos_const");
+                                    foreach (uint bits in raster.PosConst) writer.WriteNumberValue(bits);
+                                    writer.WriteEndArray();
+                                }
+                                if (raster.PosSrc == 3 && raster.PosVTab != null)
+                                {
+                                    writer.WriteStartArray("pos_vtab");
+                                    foreach (uint bits in raster.PosVTab) writer.WriteNumberValue(bits);
+                                    writer.WriteEndArray();
+                                }
+                            }
+                        }
+                        if (raster.HasFragment)
+                        {
+                            writer.WriteBoolean("may_discard", raster.MayDiscard);
+                            writer.WriteBoolean("writes_smask", raster.WritesSampleMask);
+                        }
+                        writer.WriteEndObject();
+                    }
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
