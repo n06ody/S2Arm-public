@@ -350,6 +350,8 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
+# 落地免重搬（rp_buf.c land_verify）：修前（main 的 rp_buf.c）落地后整页重搬必红；逐字节比 / 代号 / 布防 / 整页 / 两条路径各撤一处必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/land_noresync_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
 # 原创 Maxwell 经生产请求、真实编译器与生产结果解析；GPU 像素由 Vulkan 门禁另验。
