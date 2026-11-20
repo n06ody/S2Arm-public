@@ -2,6 +2,7 @@
 """部署签名游戏 APK 和绑定资源。默认导入后启动；--no-start 只导入。
 
 --pack 接受 make_pack 输出并冻结资源；--resources 接受已绑定资源目录。
+--save-archive 在资源安装后、起局前直传并恢复一份 .s2asave，保留现有存档备份。
 --in-place：资源目录 adb push 到手机共享存储的约定位置（/storage/emulated/0/S2Arm/Games/<程序号>），
   再让 App 原地登记（不复制进私有目录，App 要「所有文件访问」，这里用 appops 给本包打开）；默认是直传进私有目录。
 所有设备操作须由外部设备租约保护。
@@ -273,13 +274,55 @@ def send_tree(adb, package, resources, name, timeout, log):
         adb.call('forward', '--remove', 'tcp:' + port, timeout=30)
 
 
+def save_archive_size(archive):
+    if not archive.is_file():
+        raise ValueError('存档备份必须是常规文件。')
+    size = archive.stat().st_size
+    if not 0 < size <= (32 << 30) + (64 << 20):
+        raise ValueError('存档备份为空或超过存档服务上限。')
+    return size
+
+
+def send_save(adb, package, title, archive, timeout):
+    """Send one archive and wait for the shared restore service's commit receipt."""
+    size = save_archive_size(archive)
+    library = package + '/org.s2arm.android.LibraryActivity'
+    start_activity(adb, '-n', library, '--ez', IMPORT_RECEIVE_EXTRA, 'true')
+    port = adb.call('forward', 'tcp:0', 'localabstract:s2arm-import.' + package, timeout=30).strip()
+    if not port.isdigit():
+        raise RuntimeError('adb forward 没给出端口。')
+    try:
+        with _connect(port) as sock, archive.open('rb') as source:
+            sock.settimeout(timeout)
+            sock.sendall(f'S2A-SAVE 1 {title} {size}\n'.encode('ascii'))
+            if sock.sendfile(source, count=size) != size:
+                raise RuntimeError('存档传输期间文件大小变化。')
+            sock.sendall(b'END\n')
+            reply = _line(sock)
+        if not reply.startswith('OK '):
+            raise RuntimeError('App 拒绝恢复存档：' + reply[:180])
+        receipt = json.loads(reply[3:])
+        if (not isinstance(receipt, dict) or receipt.get('titleId') != title
+                or type(receipt.get('files')) is not int or receipt['files'] <= 0
+                or type(receipt.get('bytes')) is not int or receipt['bytes'] <= 0
+                or not isinstance(receipt.get('previousBackup'), str)):
+            raise RuntimeError('存档回执无效或标题号不符。')
+        return receipt
+    finally:
+        adb.call('forward', '--remove', 'tcp:' + port, timeout=30)
+
+
 def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_timeout=None,
-                     start=True, refresh_existing=False, require_current=True, log=None, in_place=False):
+                     start=True, refresh_existing=False, require_current=True, log=None, in_place=False,
+                     save_archive=None):
     """装 APK 后把资源树直传进 App 私有目录（send_tree），等 App 按 index.tsv 核完装进库的回执。
     in_place：改为推到共享存储约定位置、请 App 原地登记（push_in_place / request_in_place），回执来源是「in-place <路径>」。
     log：进度回调。"""
     log = log or (lambda *a, **k: None)
     apk, resources, work = Path(apk), Path(resources), Path(work)
+    if save_archive is not None:
+        save_archive = Path(save_archive).resolve(strict=True)
+        save_archive_size(save_archive)
     artifact, artifact_hash = validate(apk, resources)
     title, package = artifact['titleId'], artifact['apk']['packageName']
     if adb.running(package):
@@ -350,6 +393,9 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
     else:
         raise RuntimeError(f'等待导入超时（{import_wait} 秒内没有成功回执）：导入可能还在进行，没有强停应用；'
                            f'等它做完后用同一命令加 --refresh-existing 重跑核对')
+    save_receipt = None
+    if save_archive is not None:
+        save_receipt = send_save(adb, package, title, save_archive, max(timeout, push_timeout or 0))
     if start:
         since = adb.shell('date', '+%m-%d %H:%M:%S.000')
         before = adb.shell('logcat', '-d', '-v', 'brief', '-T', since, '-s', 'S2Arm:I')
@@ -375,12 +421,14 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
     receipt = dict(serial=adb.serial, package=package, packageName=package, apkSha256=artifact['apk']['sha256'],
                    contentRoot=artifact['contentRoot'], artifactSha256=artifact_hash, mode=mode,
                    refreshExisting=refresh_existing, startupAccepted=start, inPlace=remote if in_place else None)
+    if save_receipt is not None:
+        receipt['saveImport'] = save_receipt
     (work / 'deployment.json').write_text(json.dumps(receipt, indent=2) + '\n')
     return receipt
 
 
 def deploy(pack, apk, adb, output_root, mode='auto', refresh_existing=False, timeout=180, push_timeout=None,
-           start=True, in_place=False):
+           start=True, in_place=False, save_archive=None):
     pack, apk = Path(pack).resolve(), Path(apk).resolve()
     title, _, _ = game_apk.nacp_info(pack / 'ctl/control.nacp')
     output_root = Path(output_root).resolve()
@@ -394,7 +442,7 @@ def deploy(pack, apk, adb, output_root, mode='auto', refresh_existing=False, tim
     resources = work / 'resources'
     game_apk.resources(pack, frozen, resources, refresh_existing=refresh_existing)
     deploy_resources(frozen, resources, adb, work, mode, timeout, push_timeout, start, refresh_existing,
-                     require_current=False, log=print, in_place=in_place)
+                     require_current=False, log=print, in_place=in_place, save_archive=save_archive)
     return work
 
 
@@ -405,6 +453,7 @@ def main():
     source.add_argument('--resources', type=Path)
     parser.add_argument('--apk', required=True, type=Path)
     parser.add_argument('--serial', required=True)
+    parser.add_argument('--save-archive', type=Path, help='确认恢复此 .s2asave；会在起局前备份并替换目标存档')
     parser.add_argument('--mode', choices=('auto', 'direct', 'generic'), default='auto')
     parser.add_argument('--refresh-existing', action='store_true')
     parser.add_argument('--timeout', type=int, default=180)
@@ -426,14 +475,15 @@ def main():
         adb = Adb(args.serial, os.environ.get('S2A_ADB') or 'adb')   # 启动器给的 adb（android_export.fetch_adb）；命令行缺省 PATH 上的
         if args.pack:
             work = deploy(args.pack, args.apk, adb, REPO / 'build/android-deploy', args.mode,
-                          args.refresh_existing, args.timeout, args.push_timeout, args.start, args.in_place)
+                          args.refresh_existing, args.timeout, args.push_timeout, args.start, args.in_place,
+                          save_archive=args.save_archive)
             receipt = json.loads((work / 'deployment.json').read_text())
         else:
             root = REPO / 'build/android-deploy'; root.mkdir(parents=True, exist_ok=True)
             work = Path(tempfile.mkdtemp(prefix='resources-', dir=root))
             receipt = deploy_resources(args.apk.resolve(strict=True), args.resources.resolve(strict=True), adb,
                                        work, args.mode, args.timeout, args.push_timeout, args.start, log=print,
-                                       in_place=args.in_place)
+                                       in_place=args.in_place, save_archive=args.save_archive)
         print(json.dumps(receipt, ensure_ascii=False))
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print('【红】部署失败：' + str(error), file=sys.stderr)
