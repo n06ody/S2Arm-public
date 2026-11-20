@@ -1198,6 +1198,7 @@ static int fd_attr_read(int a, const p_draw *dw, const p_draw_idx *di, float P[6
 }
 // → 位掩码：位 i（0..7）= 颜色槽 i 证出、位 8 = 深度证出（模板不单独证）。在 rp_pass_prepare_draw 之前取，随这一笔交给通道。
 static uint32_t fd_cover_mask(const p_draw *dr, const p_draw_idx *di, uint32_t cwm) {
+    if (!rp_fd_on()) return 0;   // nvk_fd 关 / 后端不是 TBDR：证明不做，载入照旧
     if (!g_prog || !g_prog->sh[0] || !g_prog->sh[1] || g_prog->sh[2] || rp_S.bst[3] || rp_S.bst[4]) return 0;   // 只有顶点 + 片元：位置过了几何 / 细分的手就证不了
     if (rp_S.rast_discard) return 0;   // patch_size 的 NVN 缺省就是 3（恒 >0），细分在不在用看 bst[3]/bst[4] 那一条
     if (g_prog->pos_attr < 0 || g_prog->may_discard || g_prog->writes_smask) return 0;

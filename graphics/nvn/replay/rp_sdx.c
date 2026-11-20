@@ -38,14 +38,20 @@ static uint32_t g_exec_seq;                            // 回放已数到的命�
 static uint64_t g_pp_slot[6][RP_NTEX + 32];            // 各阶段的贴图槽（0..RP_NTEX-1），随后 32 个图像槽
 static const prog_t *g_pp_prog[6], *g_pp_cprog;        // 扫描时各阶段绑着的程序对象（绘制读谁反射看谁）
 static const p_set_rt *g_pp_rt; static p_set_rt g_pp_rt_buf; static uint32_t g_pp_rtseq;
-static int g_sdx_enabled = -1;                         // -1 未取：nvk_sdx 开关 × 后端 TBDR 能力
+static int g_sdx_enabled = -1, g_fd_enabled = -1;      // -1 未取：各自开关 × 后端 TBDR 能力
+static int tbdr(void) {   // 后端能力位：load / store 有真实瓦片内存代价（IMR / 未知 = 0，优化不开）
+    nvn_gpu_caps cp; nvn_gpu_caps_get(&cp); return (cp.caps & NVN_GPU_CAP_TILE_MEMORY) != 0;
+}
 
 static int sdx_on(void) {
-    if (g_sdx_enabled < 0) {
-        nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
-        g_sdx_enabled = nvn_plat_flag("nvk_sdx", 1) && (cp.caps & NVN_GPU_CAP_TILE_MEMORY);
-    }
+    if (g_sdx_enabled < 0) g_sdx_enabled = nvn_plat_flag("nvk_sdx", 1) && tbdr();
     return g_sdx_enabled;
+}
+int rp_sdx_on(void) { return sdx_on(); }
+// 首笔全画跳载入（rp_draw.c fd_*）同走 TBDR 能力位，独立开关 nvk_fd 便于设备 A/B 分离读数。
+int rp_fd_on(void) {
+    if (g_fd_enabled < 0) g_fd_enabled = nvn_plat_flag("nvk_fd", 1) && tbdr();
+    return g_fd_enabled;
 }
 static uint64_t h_ser(uint64_t h) {   // 槽句柄 → 贴图序号（0 = 登记里没有 / 解不出）
     tex_t t; return rp_tex_snap_by_id((int)(h & 0xfffff), &t, NULL, NULL) ? t.serial : 0;

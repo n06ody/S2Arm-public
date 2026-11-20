@@ -132,6 +132,7 @@ static void borrow_log(int level, const char *phase, const struct borrow_snap *s
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
 static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
+static _Atomic uint64_t g_n_rpos, g_n_rnd, g_n_rns;   // 栅格事实证出计数：位置直通 / 不丢片元 / 不写 sample_mask（首笔全画用的三个条件）
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
     pthread_mutex_lock(&g_progs_mu);
@@ -924,6 +925,9 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     e->prog.pos_attr = fp.stage[0].pos_attr; e->prog.pos_w1 = fp.stage[0].pos_w1; e->prog.pos_z_half = fp.stage[0].pos_z_half;
     e->prog.may_discard = nst >= 2 && fp.stage[1].present ? fp.stage[1].may_discard : 1;
     e->prog.writes_smask = nst >= 2 && fp.stage[1].present ? fp.stage[1].writes_smask : 1;
+    if (e->prog.pos_attr >= 0) atomic_fetch_add(&g_n_rpos, 1);   // 栅格事实到达与证出的设备可见度（prog_tally_text）
+    if (!e->prog.may_discard) atomic_fetch_add(&g_n_rnd, 1);
+    if (!e->prog.writes_smask) atomic_fetch_add(&g_n_rns, 1);
     { static _Atomic int said; if (nst >= 2 && nvn_plat_flag("nvk_drawlog", 0) && atomic_fetch_add(&said, 1) < 40) { char m[96]; snprintf(m, sizeof m, "片元输出映射 %#x（片元代码 %zu 字节）", (unsigned)e->prog.color_out_mask, fp.stage[1].spirv_bytes); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", m); } }
     for (int st = 0; st < nst && !e->failed; st++) {
         if (!fp.stage[st].present) { red1("stage_missing_in_result", st ? "fs" : "vs"); e->failed = 1; break; }
@@ -1120,6 +1124,9 @@ static void prog_tally_text(char *b, size_t bn) {
         k_lp_state[atomic_load(&g_lp_state)], (unsigned long long)atomic_load(&g_n_libpack), (unsigned long long)s2a_libpack_misses(), (unsigned long long)s2a_libpack_rejects(),
         (unsigned long long)atomic_load(&g_n_libpack_bad), (unsigned long long)atomic_load(&g_n_offline), (unsigned long long)atomic_load(&g_n_cache),
         (unsigned long long)atomic_load(&g_n_compiled), (unsigned long long)atomic_load(&g_n_failed));
+    if (bo > 0 && (size_t)bo < bn)
+        bo += snprintf(b + bo, bn - (size_t)bo, "、栅格事实：位置直通 %llu / 不丢片元 %llu / 不写掩码 %llu",
+            (unsigned long long)atomic_load(&g_n_rpos), (unsigned long long)atomic_load(&g_n_rnd), (unsigned long long)atomic_load(&g_n_rns));
     if (alias_on() && bo > 0 && (size_t)bo < bn) {   // 结果合并读数（开着才出）
         uint32_t resn = 0;
         pthread_mutex_lock(&g_progs_mu); resn = g_res_tab.n; pthread_mutex_unlock(&g_progs_mu);
@@ -1131,7 +1138,7 @@ static void prog_tally_text(char *b, size_t bn) {
 static void prog_tally_log(void) {
     uint64_t n = atomic_load(&g_n_libpack) + atomic_load(&g_n_offline) + atomic_load(&g_n_cache) + atomic_load(&g_n_compiled) + atomic_load(&g_n_alias_fg);
     if (n != 1 && (!n || n % 50)) return;
-    char b[640]; prog_tally_text(b, sizeof b);
+    char b[768]; prog_tally_text(b, sizeof b);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b);
 }
 // 测试读数：当下的「程序累计」行（不受每 50 个打一次的节拍限制）；结果合并读头的三个计数（读头 / 没有缓存文件 / 缓存文件坏）

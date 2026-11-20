@@ -11,7 +11,7 @@
 
 static int g_sdx_flag = 1;
 int nvn_plat_flag(const char *name, int dflt) {
-    if (!strcmp(name, "nvk_sdx")) return g_sdx_flag;
+    if (!strcmp(name, "nvk_sdx") || !strcmp(name, "nvk_fd")) return g_sdx_flag;   // off 进程同关两个优化
     return fixture_plat_flag(name, dflt);
 }
 

@@ -65,6 +65,8 @@ void rp_sdx_invalidate(void);           // 回放真跳过命令（条件渲染�
 void rp_sdx_reset(void);                // 会话收尾：索引作废、计数归零
 uint32_t rp_sdx_cur(void);              // 正在回放的那条的序号（0xffffffff = 还没开始）
 int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq);   // 单附件：2 = 冗余可 DONTCARE；其他 why<<2 要存
+int rp_sdx_on(void);                    // 存储前瞻生效否（nvk_sdx × NVN_GPU_CAP_TILE_MEMORY，锁存）
+int rp_fd_on(void);                     // 首笔全画跳载入生效否（nvk_fd × NVN_GPU_CAP_TILE_MEMORY，锁存）
 void rp_pass_rtseq_reset(void);           // 提交开头：目标序号归零（序号按提交重数，上次的旧值会把这次的事件全吞掉）
 
 // ---------- 上屏（rp_present.c）----------
