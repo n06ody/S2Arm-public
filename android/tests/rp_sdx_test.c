@@ -183,7 +183,7 @@ static void fd_fresh(const float verts[3][4]) {   // 程序事实全开（pos_at
     memset(&g_fprog, 0, sizeof g_fprog);
     for (int st = 0; st < RP_PROG_STAGES; ++st) for (int i = 0; i < RP_PROG_ENT_MAX; ++i) g_fprog.ent[st][i].src_reg2 = UINT16_MAX;
     g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.color_out_mask = 0xffffffffu;
-    g_fprog.pos_attr = 0; g_fprog.pos_w1 = 1; g_fprog.may_discard = 0; g_fprog.writes_smask = 0;
+    g_fprog.pos_src = 1; g_fprog.pos_attr = 0; g_fprog.pos_w1 = 1; g_fprog.may_discard = 0; g_fprog.writes_smask = 0;
     memcpy(g_pool, verts, sizeof(float[3][4]));
 }
 // ta 画一遍（待清零标记被吃掉）→ 换 tb → 回 ta 再画：第三个通道（g_pd[2]）是「载入非零旧内容」的那次，全画证明生效就 DONTCARE。
@@ -198,6 +198,36 @@ static void fd_run3(int bad_vb) {
 }
 static const float FD_FULL[3][4] = {{-1,-1,.5f,1},{3,-1,.5f,1},{-1,3,.5f,1}};   // 盖满 NDC 方块的三角形
 static const float FD_SMALL[3][4] = {{-.1f,-.1f,.5f,1},{.1f,-.1f,.5f,1},{-.1f,.1f,.5f,1}};
+
+// 编译期求值表（pos_src=3 的证据形态）：vid k 的出口位置 vec4 位模式
+static void fd_vtab(const float verts[][4], int n) {
+    memset(g_fprog.pos_vtab, 0, sizeof g_fprog.pos_vtab);
+    for (int k = 0; k < n; k++) for (int c = 0; c < 4; c++) { float f = verts[k][c]; memcpy(&g_fprog.pos_vtab[k * 4 + c], &f, 4); }
+}
+static void t_fd_vid_positive(void) {   // 序号生成：位置全在表里——顶点缓冲故意指到池外也证出（vidgen 不读顶点数据）
+    fd_fresh(FD_FULL);
+    g_fprog.pos_src = 3; g_fprog.pos_attr = -1; fd_vtab(FD_FULL, 3);
+    fd_run3(1);
+    CHECK(g_npd >= 3 && g_pd[2].color[0].load == NVN_GPU_LOAD_DONTCARE);
+}
+static void t_fd_neg_vid_small(void) {   // 表在但摆出来盖不满：证不出，载（表错不等于无脑跳载入）
+    fd_fresh(FD_FULL);
+    g_fprog.pos_src = 3; g_fprog.pos_attr = -1; fd_vtab(FD_SMALL, 3);
+    fd_run3(0);
+    CHECK(g_npd >= 3 && g_pd[2].color[0].load == NVN_GPU_LOAD_LOAD);
+}
+static void t_fd_neg_src_const(void) {   // 编译期常量位置（src=2）：全顶点同点退化，永不盖满
+    fd_fresh(FD_FULL);
+    g_fprog.pos_src = 2; g_fprog.pos_attr = -1;
+    fd_run3(0);
+    CHECK(g_npd >= 3 && g_pd[2].color[0].load == NVN_GPU_LOAD_LOAD);
+}
+static void t_fd_neg_src_unknown(void) {   // src=0（complex）：来源证不出，载
+    fd_fresh(FD_FULL);
+    g_fprog.pos_src = 0; g_fprog.pos_attr = -1;
+    fd_run3(0);
+    CHECK(g_npd >= 3 && g_pd[2].color[0].load == NVN_GPU_LOAD_LOAD);
+}
 
 static void t_fd_positive(void) {
     fd_fresh(FD_FULL); fd_run3(0);
@@ -263,6 +293,10 @@ int main(int argc, char **argv) {
     t_invalidate_paths();
     t_rcond_invalidate();
     t_fd_positive();
+    t_fd_vid_positive();
+    t_fd_neg_vid_small();
+    t_fd_neg_src_const();
+    t_fd_neg_src_unknown();
     t_fd_neg_small();
     t_fd_neg_nofacts();
     t_fd_neg_discard();

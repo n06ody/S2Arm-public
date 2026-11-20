@@ -38,6 +38,8 @@ struct rp_prog {
     int32_t pos_attr;                                         // ≥0：顶点位置 xyz 原样取自该顶点属性号；w 按 pos_w1 / 属性 .w。-1 = 证不出
     uint8_t pos_w1;                                           // 1：位置 w 是常量 1.0（属性 .w 不被取）；0：w 取同一属性的 .w
     uint8_t pos_z_half;                                       // 1：写出位置还要过翻译器追加的 z=fma(z,0.5,w*0.5)（读出的原始 z 要乘 0.5 加 0.5·w）
+    uint8_t pos_src;                                          // 位置来源分类：0 证不出 1 属性直通（pos_attr）2 编译期常量（全顶点同点，永不盖满）3 顶点序号生成（pos_vtab）
+    uint32_t pos_vtab[256];                                   // pos_src==3：编译器对 vid=0..63 逐点求值出的出口位置 vec4 位模式（vid*4 + 分量）；其余未用
     uint8_t may_discard;                                      // 片元可能丢片元
     uint8_t writes_smask;                                     // 片元写 sample_mask（覆盖改写：本笔写不满附件）
     struct rp_usrc usrc[RP_PROG_USRC_MAX]; uint32_t nusrc;    // NVN_RB_TEXU / TBUFU 项的句柄来源（布局项 src_reg2 指向这里）

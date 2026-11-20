@@ -293,6 +293,23 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
               if (!s2a_jv_obj_find(ras, "pos_z_half", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].pos_z_half = (uint8_t)!!bv;
               if (!s2a_jv_obj_find(ras, "may_discard", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].may_discard = (uint8_t)!!bv;
               if (!s2a_jv_obj_find(ras, "writes_smask", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].writes_smask = (uint8_t)!!bv;
+              { uint32_t ps = 0; int has_src = !s2a_jv_obj_find(ras, "pos_src", &v), vtab_ok = 0;
+                struct s2a_jv vt = { NULL, 0 };
+                if (has_src && (s2a_jv_u32(v, &ps) || ps > 3)) return fail(why, why_size, "raster pos_src out of range");
+                if (!s2a_jv_obj_find(ras, "pos_vtab", &vt)) {
+                    if (!s2a_jv_is_array(vt) || s2a_jv_arr_count(vt) != 256)
+                        return fail(why, why_size, "raster pos_vtab must be 256 u32");
+                    for (int k = 0; k < 256; k++) {
+                        struct s2a_jv e; uint32_t u;
+                        if (s2a_jv_arr_item(vt, k, &e) || s2a_jv_u32(e, &u))
+                            return fail(why, why_size, "raster pos_vtab must be 256 u32");
+                        out->stage[idx].pos_vtab[k] = u;
+                    }
+                    vtab_ok = 1;
+                }
+                if (!has_src) ps = out->stage[idx].pos_attr >= 0 ? 1 : 0;   // 旧结果（离线库转发）没有 pos_src：attr 证出即 attr 类
+                if ((ps == 3 && !vtab_ok) || (ps == 1 && out->stage[idx].pos_attr < 0)) ps = 0;   // 分类声称了但证据不齐：回证不出
+                out->stage[idx].pos_src = (uint8_t)ps; }
           } }
     }
 

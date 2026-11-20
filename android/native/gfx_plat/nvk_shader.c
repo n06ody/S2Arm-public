@@ -132,9 +132,10 @@ static void borrow_log(int level, const char *phase, const struct borrow_snap *s
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
 static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
-static _Atomic uint64_t g_n_rpos, g_n_rnd, g_n_rns;   // 栅格事实证出计数：位置直通 / 不丢片元 / 不写 sample_mask（首笔全画用的三个条件）
-void nvk_shader_raster_counts(uint64_t *rpos, uint64_t *rnd, uint64_t *rns) {   // rp_draw.c 弱符号取：全画因行尾「栅」段
-    *rpos = atomic_load(&g_n_rpos); *rnd = atomic_load(&g_n_rnd); *rns = atomic_load(&g_n_rns);
+static _Atomic uint64_t g_n_rpos, g_n_rnd, g_n_rns, g_n_src[4];   // 栅格事实证出计数（直通 / 不丢 / 不掩）+ 位置来源分布（0 杂 1 直通 2 常量 3 序号）
+void nvk_shader_raster_counts(uint64_t o[7]) {   // rp_draw.c 弱符号取：全画因行尾「栅」段；o[0..2] 证出计数，o[3..6] 源分布
+    o[0] = atomic_load(&g_n_rpos); o[1] = atomic_load(&g_n_rnd); o[2] = atomic_load(&g_n_rns);
+    for (int i = 0; i < 4; i++) o[3 + i] = atomic_load(&g_n_src[i]);
 }
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
@@ -926,11 +927,14 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     e->prog.color_out_mask = nst >= 2 && fp.stage[1].present ? fp.stage[1].fragment_output_map : 0xffffffffu;
     // 栅格事实（编译结果 raster 段；缺段 = 解析器已填保守值，首笔全画自动拒绝）
     e->prog.pos_attr = fp.stage[0].pos_attr; e->prog.pos_w1 = fp.stage[0].pos_w1; e->prog.pos_z_half = fp.stage[0].pos_z_half;
+    e->prog.pos_src = fp.stage[0].pos_src;
+    memcpy(e->prog.pos_vtab, fp.stage[0].pos_vtab, sizeof e->prog.pos_vtab);
     e->prog.may_discard = nst >= 2 && fp.stage[1].present ? fp.stage[1].may_discard : 1;
     e->prog.writes_smask = nst >= 2 && fp.stage[1].present ? fp.stage[1].writes_smask : 1;
     if (e->prog.pos_attr >= 0) atomic_fetch_add(&g_n_rpos, 1);   // 栅格事实到达与证出的设备可见度（prog_tally_text）
     if (!e->prog.may_discard) atomic_fetch_add(&g_n_rnd, 1);
     if (!e->prog.writes_smask) atomic_fetch_add(&g_n_rns, 1);
+    atomic_fetch_add(&g_n_src[e->prog.pos_src & 3], 1);          // 位置来源形态分布（r5b 直通=0 之后的形态归因）
     { static _Atomic int said; if (nst >= 2 && nvn_plat_flag("nvk_drawlog", 0) && atomic_fetch_add(&said, 1) < 40) { char m[96]; snprintf(m, sizeof m, "片元输出映射 %#x（片元代码 %zu 字节）", (unsigned)e->prog.color_out_mask, fp.stage[1].spirv_bytes); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", m); } }
     for (int st = 0; st < nst && !e->failed; st++) {
         if (!fp.stage[st].present) { red1("stage_missing_in_result", st ? "fs" : "vs"); e->failed = 1; break; }

@@ -872,6 +872,9 @@ internal static unsafe class Program
                 Check(hasRv && rv.GetProperty("pos_attr").GetInt32() == 0, "raster: position passthrough proves pos_attr 0");
                 Check(hasRv && !rv.GetProperty("pos_w1").GetBoolean(), "raster: w comes from the attribute, not constant 1");
                 Check(hasRv && !rv.GetProperty("pos_z_half").GetBoolean(), "raster: no depth tail, no z-half fact");
+                Check(hasRv && rv.GetProperty("pos_src").GetInt32() == 1, "raster: attribute passthrough emits pos_src 1");
+                Check(!rv.TryGetProperty("pos_const", out _) && !rv.TryGetProperty("pos_vtab", out _),
+                      "raster: attr form emits no pos_const/pos_vtab");
                 Check(hasRf && !rf.GetProperty("may_discard").GetBoolean(), "raster: kill-free fs proves may_discard false");
                 Check(hasRf && !rf.GetProperty("writes_smask").GetBoolean(), "raster: no SampleMask output proves writes_smask false");
             }
@@ -884,6 +887,7 @@ internal static unsafe class Program
                 bool hasRv = stages[0].TryGetProperty("raster", out var rv);
                 Check(hasRv && rv.GetProperty("pos_attr").GetInt32() == 0, "raster: depth tail keeps pos_attr 0 (rewritten source)");
                 Check(hasRv && rv.GetProperty("pos_z_half").GetBoolean(), "raster: unconditional depth tail proves pos_z_half");
+                Check(hasRv && rv.GetProperty("pos_src").GetInt32() == 1, "raster: depth tail stays pos_src 1");
             }
             // 单元夹具：对拼出来的模块直接跑分析器（直挂 BuiltIn Position、运行时 OpSelect 尾巴、
             // OpKill、BuiltIn SampleMask——这些形状现有夹具产不出）。
@@ -906,8 +910,8 @@ internal static unsafe class Program
             {
                 I(61, A(5, 13, 10)), I(62, A(9, 13))
             }).Concat(tail).ToArray()));
-            Check(r.HasVertex && r.PosAttr == 0 && !r.PosW1 && !r.PosZHalf,
-                  "raster unit: whole-vector attr passthrough proves pos_attr 0");
+            Check(r.HasVertex && r.PosAttr == 0 && !r.PosW1 && !r.PosZHalf && r.PosSrc == 1,
+                  "raster unit: whole-vector attr passthrough proves pos_attr 0 (pos_src 1)");
             // construct(x, y, z, 1.0)：w 常量 1 → pos_w1=1
             r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
             {
@@ -915,7 +919,7 @@ internal static unsafe class Program
                 I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 16, 13, 2)),
                 I(80, A(5, 17, 14, 15, 16, 31)), I(62, A(9, 17))
             }).Concat(tail).ToArray()));
-            Check(r.PosAttr == 0 && r.PosW1, "raster unit: constant w=1.0 proves pos_w1");
+            Check(r.PosAttr == 0 && r.PosW1 && r.PosSrc == 1, "raster unit: constant w=1.0 proves pos_w1");
             // 编译期 z-half：z' = z*0.5 + w*0.5（两步 FMul+FAdd）→ z_half=1 且 pos_attr 指向改写源 0
             r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
             {
@@ -924,7 +928,7 @@ internal static unsafe class Program
                 I(133, A(4, 19, 16, 32)), I(133, A(4, 20, 18, 32)), I(129, A(4, 21, 19, 20)),
                 I(80, A(5, 17, 14, 15, 21, 18)), I(62, A(9, 17))
             }).Concat(tail).ToArray()));
-            Check(r.PosAttr == 0 && r.PosZHalf, "raster unit: FMul/FAdd z-half shape proves pos_z_half");
+            Check(r.PosAttr == 0 && r.PosZHalf && r.PosSrc == 1, "raster unit: FMul/FAdd z-half shape proves pos_z_half");
             // FMA 形态：ext inst GLSL.std.450 #50 → 同样证出
             r = DirectRasterFacts.Analyze(Spv(new[]
             {
@@ -941,7 +945,7 @@ internal static unsafe class Program
                 I(133, A(4, 20, 18, 32)), I(12, A(4, 21, 1, 50, 16, 32, 20)),
                 I(80, A(5, 17, 14, 15, 21, 18)), I(62, A(9, 17))
             }.Concat(tail).ToArray()));
-            Check(r.PosAttr == 0 && r.PosZHalf, "raster unit: GLSL Fma z-half shape proves pos_z_half");
+            Check(r.PosAttr == 0 && r.PosZHalf && r.PosSrc == 1, "raster unit: GLSL Fma z-half shape proves pos_z_half");
             // 负例：z 走 OpSelect（运行时深度尾巴的形态）→ z 证不出，pos_attr=-1、z_half=0
             r = DirectRasterFacts.Analyze(Spv(new[]
             {
@@ -957,8 +961,8 @@ internal static unsafe class Program
                 I(169, A(4, 19, 41, 16, 18)),                       // z = select(cond, z, w)
                 I(80, A(5, 17, 14, 15, 19, 18)), I(62, A(9, 17))
             }.Concat(tail).ToArray()));
-            Check(r.HasVertex && r.PosAttr == -1 && !r.PosZHalf,
-                  "raster unit: OpSelect z is unprovable (pos_attr -1, z_half 0)");
+            Check(r.HasVertex && r.PosAttr == -1 && !r.PosZHalf && r.PosSrc == 0,
+                  "raster unit: OpSelect z is unprovable (pos_attr -1, z_half 0, pos_src 0)");
             // 负例：z = x + y（非 z-half 形状）→ -1 / 0
             r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
             {
@@ -967,7 +971,7 @@ internal static unsafe class Program
                 I(129, A(4, 19, 14, 15)),
                 I(80, A(5, 17, 14, 15, 19, 18)), I(62, A(9, 17))
             }).Concat(tail).ToArray()));
-            Check(r.PosAttr == -1 && !r.PosZHalf, "raster unit: plain FAdd z is unprovable");
+            Check(r.PosAttr == -1 && !r.PosZHalf && r.PosSrc == 0, "raster unit: plain FAdd z is unprovable");
             // FS：OpKill → may_discard=1；写 BuiltIn SampleMask 输出 → writes_smask=1
             var fsHead = new List<uint[]>
             {
@@ -990,8 +994,190 @@ internal static unsafe class Program
                   "raster unit: kill-free mask-free fs proves both false");
             // 截断模块 → 全保守（may_discard / writes_smask 只能保守真）。
             r = DirectRasterFacts.Analyze(new byte[] { 0x03, 0x02, 0x23, 0x07 });
-            Check(!r.HasVertex && r.PosAttr == -1 && r.MayDiscard && r.WritesSampleMask,
+            Check(!r.HasVertex && r.PosAttr == -1 && r.PosSrc == 0 && r.MayDiscard && r.WritesSampleMask,
                   "raster unit: truncated module falls back to conservative defaults");
+
+            // pos_src=2（const）：四分量全常量 → PosConst 位模式逐分量对得上。
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(43, A(4, 33, 0xBF800000)), I(43, A(4, 34, 0)),       // -1.0f / 0.0f
+                I(80, A(5, 17, 33, 33, 34, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && r.PosSrc == 2 && r.PosConst != null && r.PosConst.Length == 4 &&
+                  r.PosConst[0] == 0xBF800000u && r.PosConst[1] == 0xBF800000u &&
+                  r.PosConst[2] == 0 && r.PosConst[3] == 0x3F800000u && r.PosVTab == null,
+                  "raster unit: constant position proves pos_src=2 with bit patterns");
+
+            // z 放宽：x,y 同 attr、z 常量、w 常量 1 → 仍 pos_attr 直通（pos_src=1）。
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)),
+                I(43, A(4, 33, 0)),                                    // f32 0.0
+                I(80, A(5, 17, 14, 15, 33, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == 0 && r.PosSrc == 1 && r.PosW1,
+                  "raster unit: constant z still proves pos_attr (pos_src 1)");
+            // 负例：z 取同一属性的 .x（非常量、非 .z）→ pos_src=0
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)),
+                I(80, A(5, 17, 14, 15, 14, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && r.PosSrc == 0,
+                  "raster unit: z from the attribute's x component is unprovable");
+
+            // vidgen 夹具：gl_VertexIndex(42) 输入变量 + i32 类型链（GLSL.std.450 与 0.5f
+            // 供深度尾巴用例，别的用例放着也无害）。
+            var vidHead = new List<uint[]>
+            {
+                I(14, A(0, 1)), I(11, A(1), SpvStr("GLSL.std.450")),
+                I(15, A(0, 8), SpvStr("main"), A(9, 10, 35)),
+                I(71, A(9, 11, 0)),                                   // %pos BuiltIn Position
+                I(71, A(10, 30, 0)),                                  // %attr Location 0
+                I(71, A(35, 11, 42)),                                 // %vid BuiltIn VertexIndex
+                I(19, A(2)), I(33, A(3, 2)),
+                I(22, A(4, 32)),                                      // f32
+                I(21, A(36, 32, 1)),                                  // i32
+                I(23, A(5, 4, 4)),                                    // vec4 f32
+                I(32, A(6, 3, 5)), I(32, A(7, 1, 5)),                 // ptr Output vec4 / ptr Input vec4
+                I(32, A(37, 1, 36)),                                  // ptr Input i32
+                I(43, A(4, 31, 0x3F800000)), I(43, A(4, 34, 0)),       // f32 1.0 / 0.0
+                I(43, A(4, 33, 0x3F000000)),                          // f32 0.5（深度尾巴）
+                I(43, A(36, 41, 1)), I(43, A(36, 42, 4)), I(43, A(36, 46, 2)),  // i32 1 / 4 / 2
+                I(59, A(6, 9, 3)), I(59, A(7, 10, 1)), I(59, A(37, 35, 1)),
+                I(54, A(2, 8, 0, 3)), I(248, A(12)),
+            };
+            // 经典全屏三角形：x=(vid&1)*4-1、y=(vid&2)*2-1、z=0、w=1 → pos_src=3，
+            // vtab[0..2] = (-1,-1,0,1) (3,-1,0,1) (-1,3,0,1)，vid=63 → (3,3,0,1)。
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),                                  // %38 = gl_VertexIndex
+                I(199, A(36, 39, 38, 41)),                             // vid & 1
+                I(132, A(36, 40, 39, 42)),                             // * 4
+                I(130, A(36, 43, 40, 41)),                             // - 1
+                I(111, A(4, 44, 43)),                                  // SToF → x
+                I(199, A(36, 45, 38, 46)),                             // vid & 2
+                I(132, A(36, 47, 45, 46)),                             // * 2
+                I(130, A(36, 48, 47, 41)),                             // - 1
+                I(111, A(4, 49, 48)),                                  // SToF → y
+                I(80, A(5, 17, 44, 49, 34, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && r.PosSrc == 3 && r.PosVTab != null && r.PosVTab.Length == 256 &&
+                  r.PosVTab[0] == 0xBF800000u && r.PosVTab[1] == 0xBF800000u &&
+                  r.PosVTab[2] == 0 && r.PosVTab[3] == 0x3F800000u &&
+                  r.PosVTab[4] == 0x40400000u && r.PosVTab[5] == 0xBF800000u &&
+                  r.PosVTab[6] == 0 && r.PosVTab[7] == 0x3F800000u &&
+                  r.PosVTab[8] == 0xBF800000u && r.PosVTab[9] == 0x40400000u &&
+                  r.PosVTab[10] == 0 && r.PosVTab[11] == 0x3F800000u &&
+                  r.PosVTab[63 * 4] == 0x40400000u && r.PosVTab[63 * 4 + 1] == 0x40400000u &&
+                  r.PosConst == null,
+                  "raster unit: vidgen fullscreen triangle proves pos_src=3 with per-vertex table");
+            // 白名单外的 OpSelect（运行时分支形态）→ pos_src=0
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(20, A(50)), I(41, A(50, 51)),                        // bool + true
+                I(61, A(36, 38, 35)),
+                I(199, A(36, 39, 38, 41)), I(132, A(36, 40, 39, 42)),
+                I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(169, A(4, 49, 51, 34, 34)),                          // y = select(true, 0f, 0f)
+                I(80, A(5, 17, 44, 49, 34, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && r.PosSrc == 0 && r.PosVTab == null,
+                  "raster unit: vidgen through OpSelect is unprovable");
+            // 白名单外的算术 op（OpBitwiseOr 未登记）→ pos_src=0
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),
+                I(197, A(36, 39, 38, 41)),                             // OpBitwiseOr：不在白名单
+                I(132, A(36, 40, 39, 42)), I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(199, A(36, 45, 38, 46)), I(132, A(36, 47, 45, 46)),
+                I(130, A(36, 48, 47, 41)), I(111, A(4, 49, 48)),
+                I(80, A(5, 17, 44, 49, 34, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && r.PosSrc == 0 && r.PosVTab == null,
+                  "raster unit: vidgen through a non-whitelist op is unprovable");
+
+            // vidgen + 编译期 fma 深度尾巴：z' = fma(zsrc,0.5, w*0.5)，zsrc=SToF(vid)、
+            // 位置 w = 常量 1.0、尾巴 wOp 同源 → src3、pos_z_half=true、
+            // vtab 的 z 列 = pre-tail 的 float(vid)。
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),
+                I(199, A(36, 39, 38, 41)), I(132, A(36, 40, 39, 42)),
+                I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(199, A(36, 45, 38, 46)), I(132, A(36, 47, 45, 46)),
+                I(130, A(36, 48, 47, 41)), I(111, A(4, 49, 48)),
+                I(111, A(4, 52, 38)),                                   // zsrc = SToF(vid)
+                I(133, A(4, 53, 31, 33)),                               // wmul = w*0.5（wOp=%31=1.0f）
+                I(12, A(4, 54, 1, 50, 52, 33, 53)),                     // z' = fma(zsrc, 0.5, wmul)
+                I(80, A(5, 17, 44, 49, 54, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosSrc == 3 && r.PosZHalf && r.PosVTab != null &&
+                  r.PosVTab[4] == 0x40400000u &&                        // x(vid=1)=3
+                  r.PosVTab[2] == 0 && r.PosVTab[6] == 0x3F800000u &&   // z = float(vid)：0、1
+                  r.PosVTab[10] == 0x40000000u &&                       // z(vid=2)=2
+                  r.PosVTab[63 * 4 + 2] == 0x427C0000u,                 // z(vid=63)=63
+                  "raster unit: vidgen with fma depth tail proves pos_src=3 with pre-tail z");
+            // 两步式尾巴（FAdd+FMul 在求值白名单内）：直算出口值 → src3 但 pos_z_half=false
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),
+                I(199, A(36, 39, 38, 41)), I(132, A(36, 40, 39, 42)),
+                I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(199, A(36, 45, 38, 46)), I(132, A(36, 47, 45, 46)),
+                I(130, A(36, 48, 47, 41)), I(111, A(4, 49, 48)),
+                I(111, A(4, 52, 38)),
+                I(133, A(4, 53, 52, 33)),                               // zsrc*0.5
+                I(133, A(4, 54, 31, 33)),                               // w*0.5
+                I(129, A(4, 55, 53, 54)),                               // z' = z*0.5 + w*0.5
+                I(80, A(5, 17, 44, 49, 55, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosSrc == 3 && !r.PosZHalf &&
+                  r.PosVTab[2] == 0x3F000000u && r.PosVTab[6] == 0x3F800000u &&
+                  r.PosVTab[10] == 0x3FC00000u && r.PosVTab[63 * 4 + 2] == 0x42000000u,
+                  "raster unit: vidgen two-step tail evaluates through to output value (no z-half flag)");
+            // 尾巴的 w 源与位置 w 不同源（wmul 用 0.0f 而位置 w 是 1.0f）→ src0
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),
+                I(199, A(36, 39, 38, 41)), I(132, A(36, 40, 39, 42)),
+                I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(199, A(36, 45, 38, 46)), I(132, A(36, 47, 45, 46)),
+                I(130, A(36, 48, 47, 41)), I(111, A(4, 49, 48)),
+                I(111, A(4, 52, 38)),
+                I(133, A(4, 53, 34, 33)),                               // wmul = 0.0f*0.5（wOp≠位置 w）
+                I(12, A(4, 54, 1, 50, 52, 33, 53)),
+                I(80, A(5, 17, 44, 49, 54, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosSrc == 0 && r.PosVTab == null,
+                  "raster unit: tail w operand not matching the position w is unprovable");
+            // 「改写前那次 z 写」与尾巴 zOp 不同源（先写 z=SToF(vid)，尾巴读的是 SToF(2)）→ src0
+            r = DirectRasterFacts.Analyze(Spv(vidHead.Concat(new[]
+            {
+                I(61, A(36, 38, 35)),
+                I(199, A(36, 39, 38, 41)), I(132, A(36, 40, 39, 42)),
+                I(130, A(36, 43, 40, 41)), I(111, A(4, 44, 43)),
+                I(199, A(36, 45, 38, 46)), I(132, A(36, 47, 45, 46)),
+                I(130, A(36, 48, 47, 41)), I(111, A(4, 49, 48)),
+                I(111, A(4, 52, 38)),                                   // zsrc = SToF(vid)
+                I(80, A(5, 17, 44, 49, 52, 31)), I(62, A(9, 17)),       // 先写 z=zsrc
+                I(111, A(4, 55, 46)),                                   // %55 = SToF(2) = 2.0（≠ 改写前 z）
+                I(133, A(4, 53, 31, 33)),
+                I(12, A(4, 54, 1, 50, 55, 33, 53)),                     // z' = fma(%55, 0.5, wmul)
+                I(80, A(5, 56, 44, 49, 54, 31)), I(62, A(9, 56))        // 再写 z=z'
+            }).Concat(tail).ToArray()));
+            Check(r.PosSrc == 0 && r.PosVTab == null,
+                  "raster unit: prev z write not matching tail zOp is unprovable");
+            // 多基本块入口：分支 + 第二标号 → 无条件路径前提不成立 → pos_src=0
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(249, A(13)),                                         // branch → label 13
+                I(248, A(13)), I(61, A(5, 13, 10)), I(62, A(9, 13)), I(253), I(56)
+            }).ToArray()));
+            Check(r.HasVertex && r.PosAttr == -1 && r.PosSrc == 0,
+                  "raster unit: multi-block vertex entry is unprovable");
         }
 
         if (args.Length == 1 && args[0] == "--legacy-artifact")

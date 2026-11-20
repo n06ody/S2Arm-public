@@ -58,7 +58,7 @@ int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p,
 // 弱链接[replay]：nvn_gva_pool_of
 int nvn_gva_pool_of(uint64_t cpu_addr, uint64_t *cpu_base, uint64_t *bytes) __attribute__((weak));   // hle_nvn.c：前端池图（宿主单测不链前端，缺实现 = fd_pool 恒假 → 全画证明直接拒）
 // 弱链接[replay]：nvk_shader_raster_counts
-void nvk_shader_raster_counts(uint64_t *rpos, uint64_t *rnd, uint64_t *rns) __attribute__((weak));   // nvk_shader.c：栅格事实证出的设备可见度（宿主替身不链 → 全画因行尾「栅」段恒 0）
+void nvk_shader_raster_counts(uint64_t o[7]) __attribute__((weak));   // nvk_shader.c：栅格事实证出 + 位置来源分布的设备可见度（宿主替身不链 → 全画因行尾「栅」段恒 0）
 
 // 句柄放在游戏用户常量缓冲里的贴图（NVN_RB_TEXU；语义照 iOS nvn_mtl.m ubo_read / ubo_handle / ubo_packed / ubo_tex_id / ubo_samp_id / bind_sid）。
 // 一个字：常量槽 reg 的字节 off 处，编码这一刻从游戏内存读（同 NVN_RB_CBUF 绑的就是这一刻的内容）；槽没绑、越界、不在登记过的池里读作 0（iOS：空槽）
@@ -1135,7 +1135,8 @@ void rp_tm_frame_end(void) {   // 每次上屏调一次：刚结束的是采样�
 // ---------- 首笔全画证明（iOS nvn_mtl.m:13245 first_draw_covers / :13133 attr_read 的移植）----------
 // 开通道的那笔绘制如果能从 CPU 上的原始输入证出「盖满整张附件」，这个附件就不用载入旧内容（load=DONTCARE）。
 // 证明不了任何东西都是 0：不载入是优化，载入是正确性。判据逐项对齐 iOS 注释（同文件 rp_pass.c 开头）：
-//   着色器：位置 xyz 取自同一个顶点属性、w 是常量 1 或该属性的 .w（编译期的栅格事实，rp_prog.pos_attr / pos_w1 / pos_z_half）；
+//   着色器：位置来源可证——属性直通（pos_src=1：xyz 取自同一顶点属性、w 是常量 1 或该属性 .w）或顶点序号生成
+//           （pos_src=3：编译器对 vid 0..63 逐点求值出的出口位置表，顶点数据不读）；编译期常量（2）全顶点同点退化、永不盖满。
 //           片元不 discard、不写 sample_mask、本槽是它的输出。
 //   状态：本槽不开混合、四分量写掩码全、无 alpha-to-coverage、填充模式、无深度测试（或 ALWAYS）、无模板测试、单采样、非 3D。
 //   顶点：非索引或 16/32 位索引，索引与位置都从 CPU 可见的池内存读出，没被本次提交里没落地的 GPU 写碰过；
@@ -1198,20 +1199,41 @@ static int fd_attr_read(int a, const p_draw *dw, const p_draw_idx *di, float P[6
     }
     return 0;
 }
+// 序号生成位置（pos_src==3）：本笔全部顶点的 VertexIndex 查编译期求值表
+//（vid = first + k 或 索引值 + base_vertex，与 Vulkan VertexIndex 语义同口径，同 fd_attr_read 的 vid 算法）。
+// 顶点数据一个字节都不读——表就是全部证据；索引缓冲仍要在池内、没被没落地的 GPU 写碰过。返回码同 fd_attr_read。
+static int fd_vid_read(const struct rp_prog *p, const p_draw *dw, const p_draw_idx *di, float P[64][4]) {
+    int n = dw ? dw->count : di->count;
+    if (n < 1 || n > 64 || (dw && dw->first < 0) || (di && (di->itype < 1 || di->itype > 2))) return 6;
+    const uint8_t *ib = NULL; int isz = di ? (di->itype == 1 ? 2 : 4) : 0;
+    if (di) {
+        uint64_t ca = nvn_ga2ca(di->ibuf);
+        if (!fd_pool(ca, (uint64_t)n * isz) || rp_buf_gpu_pending(ca, (uint64_t)n * isz)) return 10;   // 索引在池外 / 被没落地的 GPU 写碰过
+        ib = (const uint8_t *)(uintptr_t)ca;
+    }
+    for (int k = 0; k < n; k++) {
+        int64_t vid = dw ? (int64_t)dw->first + k
+                         : (isz == 2 ? (int64_t)((const uint16_t *)ib)[k] : (int64_t)((const uint32_t *)ib)[k]) + di->base_vertex;
+        if (vid < 0 || vid >= 64) return 9;   // 表只有 vid 0..63：超出的顶点位置未知
+        for (int c = 0; c < 4; c++) { uint32_t u = p->pos_vtab[(size_t)vid * 4 + c]; memcpy(&P[k][c], &u, 4); }
+    }
+    return 0;
+}
 // 真机诊断（r2/r3 全零定位）：fd_cover_mask 各早退因的逐条件计数；rp_present 每帧长行带走并清零。
 // 0 证出 1 门关 2 阶段/几何 3 弃栅 4 位置缺 5 多样本 6 数/间接 7 图元 8 自采样/无目标 9 多边形 10 逻αDS 11 视口/夹 12 顶点读 13 覆盖全否 14 丢片元 15 写掩码
 static uint64_t g_fd_st[16];
 static uint32_t fd_no(int k) { g_fd_st[k]++; return 0; }
 int rp_fd_diag(char *b, size_t n) {   // → 已写字节数；全零不写
     uint64_t t = 0; for (int i = 0; i < 16; i++) t |= g_fd_st[i];
-    uint64_t rp_ = 0, rd = 0, rs = 0; if (nvk_shader_raster_counts) nvk_shader_raster_counts(&rp_, &rd, &rs);
-    if (!t && !(rp_ | rd | rs)) return 0;
-    int o = snprintf(b, n, "全画因：证%llu 关%llu 程%llu 弃%llu 位%llu 丢%llu 掩%llu 采%llu 数%llu 型%llu 自%llu 形%llu 逻%llu 视%llu 顶%llu 零%llu | 栅：直通%llu 不丢%llu 不掩%llu",
+    uint64_t q[7] = {0}; if (nvk_shader_raster_counts) nvk_shader_raster_counts(q);
+    if (!t && !(q[0] | q[1] | q[2] | q[3] | q[4] | q[5] | q[6])) return 0;
+    int o = snprintf(b, n, "全画因：证%llu 关%llu 程%llu 弃%llu 位%llu 丢%llu 掩%llu 采%llu 数%llu 型%llu 自%llu 形%llu 逻%llu 视%llu 顶%llu 零%llu | 栅：直通%llu 不丢%llu 不掩%llu | 源：属%llu 常%llu 序%llu 杂%llu",
         (unsigned long long)g_fd_st[0], (unsigned long long)g_fd_st[1], (unsigned long long)g_fd_st[2], (unsigned long long)g_fd_st[3],
         (unsigned long long)g_fd_st[4], (unsigned long long)g_fd_st[14], (unsigned long long)g_fd_st[15], (unsigned long long)g_fd_st[5],
         (unsigned long long)g_fd_st[6], (unsigned long long)g_fd_st[7], (unsigned long long)g_fd_st[8], (unsigned long long)g_fd_st[9],
         (unsigned long long)g_fd_st[10], (unsigned long long)g_fd_st[11], (unsigned long long)g_fd_st[12], (unsigned long long)g_fd_st[13],
-        (unsigned long long)rp_, (unsigned long long)rd, (unsigned long long)rs);
+        (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+        (unsigned long long)q[4], (unsigned long long)q[5], (unsigned long long)q[6], (unsigned long long)q[3]);
     memset(g_fd_st, 0, sizeof g_fd_st); return o;
 }
 // → 位掩码：位 i（0..7）= 颜色槽 i 证出、位 8 = 深度证出（模板不单独证）。在 rp_pass_prepare_draw 之前取，随这一笔交给通道。
@@ -1219,7 +1241,8 @@ static uint32_t fd_cover_mask(const p_draw *dr, const p_draw_idx *di, uint32_t c
     if (!rp_fd_on()) return fd_no(1);   // nvk_fd 关 / 后端不是 TBDR：证明不做，载入照旧
     if (!g_prog || !g_prog->sh[0] || !g_prog->sh[1] || g_prog->sh[2] || rp_S.bst[3] || rp_S.bst[4]) return fd_no(2);   // 只有顶点 + 片元：位置过了几何 / 细分的手就证不了
     if (rp_S.rast_discard) return fd_no(3);   // patch_size 的 NVN 缺省就是 3（恒 >0），细分在不在用看 bst[3]/bst[4] 那一条
-    if (g_prog->pos_attr < 0) return fd_no(4);   // 位置输出证不出是「顶点属性直通」
+    if (g_prog->pos_src != 1 && g_prog->pos_src != 3) return fd_no(4);   // 位置来源证不出（0）；编译期常量（2）全顶点同点退化，永不盖满
+    if (g_prog->pos_src == 1 && g_prog->pos_attr < 0) return fd_no(4);   // 分类与事实不齐：保守
     if (g_prog->may_discard) return fd_no(14);   // 片元能丢：写不满本槽
     if (g_prog->writes_smask) return fd_no(15);   // 写 sample_mask：覆盖不满本槽
     if (rp_S.ms.a2c || rp_S.ms.cov2color_en) return fd_no(5);   // a2c 改写 alpha、覆盖到颜色转换再占一条输出：本笔的写不满本槽
@@ -1238,9 +1261,11 @@ static uint32_t fd_cover_mask(const p_draw *dr, const p_draw_idx *di, uint32_t c
     uint32_t sw; memcpy(&sw, rp_S.vp_sw[0], 4); if (sw) return fd_no(11);   // 视口重排过的 NDC 映射不在证明里（0 = 不变）
     if (rp_S.depth_clamp) return fd_no(11);   // 深度夹取会改裁剪行为：保守不证
     float P[64][4];
-    if (fd_attr_read(g_prog->pos_attr, dr, di, P)) return fd_no(12);
-    if (g_prog->pos_w1) for (int k = 0; k < n; k++) P[k][3] = 1.0f;   // 位置 w 是常量 1（不取属性的 .w）
-    if (g_prog->pos_z_half) for (int k = 0; k < n; k++) P[k][2] = P[k][2] * 0.5f + P[k][3] * 0.5f;   // 翻译器在位置写后追加的 z=fma(z,0.5,w*0.5)：事实记的是改写后的位置
+    if (g_prog->pos_src == 1) {
+        if (fd_attr_read(g_prog->pos_attr, dr, di, P)) return fd_no(12);
+        if (g_prog->pos_w1) for (int k = 0; k < n; k++) P[k][3] = 1.0f;   // 位置 w 是常量 1（不取属性的 .w）
+    } else if (fd_vid_read(g_prog, dr, di, P)) return fd_no(12);   // pos_src==3：序号查表，不读顶点数据
+    if (g_prog->pos_z_half) for (int k = 0; k < n; k++) P[k][2] = P[k][2] * 0.5f + P[k][3] * 0.5f;   // 翻译器在位置写后追加的 z=fma(z,0.5,w*0.5)：事实记的是改写前的 z，回放重做同一变换
     int sc[4] = {rp_R.sc.x, rp_R.sc.y, rp_R.sc.w, rp_R.sc.h};
     const int fccw = ((rp_S.poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0)) != (rp_origin_lower_left() != 0);   // NDC 逆时针为正面，镜像同绘制管线（rp_draw.c 管线描述同一式）
     uint32_t out = 0;

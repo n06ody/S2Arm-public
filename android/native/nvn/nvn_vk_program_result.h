@@ -41,6 +41,8 @@ struct fd_stage {
     int32_t pos_attr;               // ≥0：顶点位置 xyz 原样取自该顶点属性号；-1 = 证不出
     uint8_t pos_w1;                 // 1：位置 w 是常量 1；0：取同一属性的 .w
     uint8_t pos_z_half;             // 1：写出位置过 z=fma(z,0.5,w*0.5) 深度改写
+    uint8_t pos_src;                // 位置来源：0 证不出 1 属性直通 2 编译期常量 3 顶点序号生成（pos_vtab 有效）
+    uint32_t pos_vtab[256];         // pos_src==3：vid=0..63 的出口位置 vec4 位模式；其余未用
     uint8_t may_discard;            // 片元可能丢片元（缺省 1 = 可能）
     uint8_t writes_smask;           // 片元写 sample_mask（缺省 1 = 写）
 };
