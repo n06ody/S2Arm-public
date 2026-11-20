@@ -91,7 +91,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
                 return;
             }
 
-            StartThread();
+            StartThread(deviceDriver.GetRealDeviceDriver());
 
             _mailbox.SendMessage(MailboxMessage.Start);
 
@@ -360,9 +360,13 @@ namespace Ryujinx.Audio.Renderer.Dsp
             return true;
         }
 
-        private void StartThread()
+        private void StartThread(IHardwareDeviceDriver deviceDriver)
         {
-            _workerThread = new Thread(Work)
+            _workerThread = new Thread(() =>
+            {
+                deviceDriver.S2AConfigureRenderThread();
+                Work();
+            })
             {
                 Name = "AudioProcessor.Worker",
             };

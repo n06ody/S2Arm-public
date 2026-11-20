@@ -192,6 +192,7 @@ static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;
 // 而且恢复读写、甚至整段恢复都不合并——碎片永久留下，世界跑几分钟就把 vm.max_map_count 吃满。
 // 安卓在第一次纹理上传前由 fd_apply_chunk_kb() 设成 1 MiB（debug.s2a.chunk_kb 可调）。
 static _Atomic uint32_t g_chunk_pages = 0;
+static _Atomic int g_mp_dedupe;
 // 跟踪不可靠：任何一次 mprotect 失败都会置位。置位后所有查询走保守路径（整张视为脏 /
 // 代际返回 -1），不再只靠“旧代际比较”判断——否则失败后仍会认为内容没变而漏传。
 static _Atomic int g_track_unreliable;
@@ -200,6 +201,7 @@ static int g_log_enabled;      // g_slot_mu；只能在没有活池时设置（�
 static _Atomic uint64_t g_mapping_gen = 1;
 void nvn_dirty_set_chunk_pages(uint32_t pages) { atomic_store(&g_chunk_pages, pages); }
 uint32_t nvn_dirty_chunk_pages(void) { return atomic_load(&g_chunk_pages); }
+void nvn_dirty_set_mp_dedupe(int enabled) { atomic_store(&g_mp_dedupe, !!enabled); }
 int nvn_dirty_log_configure(int enabled) {
     pthread_mutex_lock(&g_slot_mu);
     int ok = atomic_load(&g_live) == 0;
@@ -216,14 +218,65 @@ static _Atomic int g_mp_fail_logged;
 // 之前忽略返回值，失败后照样把页面记成已解除保护并声称异常已处理，会导致写异常反复触发。
 // 单测钩子（默认 NULL）：记录实际 mprotect 区间，或注入失败。生产路径不设钩子，零开销。
 int (*nvn_dirty_mp_hook)(void *addr, size_t len, int prot);
-static int mp(uintptr_t a, size_t len, int prot) {
+// Disposable diagnostic. In the fault path record fixed-size atomic counters only.
+enum { MP_RO, MP_REPLACE, MP_RW, MP_RW_DUP, MP_KIND_N, MP_PROBE_N = 4096 };
+static _Atomic int mp_probe_enabled;
+static _Atomic uint64_t mp_probe_dropped, mp_probe_map_changed;
+static struct {
+    _Atomic uint64_t key, calls[MP_KIND_N], pages[MP_KIND_N], ticks[MP_KIND_N];
+} mp_probe[MP_PROBE_N];
+void nvn_dirty_mp_probe_enable(int enabled) { atomic_store(&mp_probe_enabled, !!enabled); }
+static void mp_probe_note(uint64_t mapping, unsigned kind, size_t len, uint64_t ticks) {
+    if (!atomic_load_explicit(&mp_probe_enabled, memory_order_relaxed)) return;
+    if (mapping > UINT32_MAX) { atomic_fetch_add(&mp_probe_dropped, 1); return; }
+    const uint64_t key = (mapping << 32) | (uint32_t)gettid();
+    if (mapping != atomic_load(&g_mapping_gen)) atomic_fetch_add(&mp_probe_map_changed, 1);
+    const size_t first = ((uint32_t)key * 2654435761u + (uint32_t)mapping) & (MP_PROBE_N - 1);
+    for (size_t n = 0; n < MP_PROBE_N; n++) {
+        const size_t i = (first + n) & (MP_PROBE_N - 1);
+        uint64_t current = atomic_load(&mp_probe[i].key);
+        if (!current && atomic_compare_exchange_strong(&mp_probe[i].key, &current, key)) current = key;
+        if (current != key) continue;
+        atomic_fetch_add(&mp_probe[i].pages[kind], len >> g_shift);
+        atomic_fetch_add(&mp_probe[i].ticks[kind], ticks);
+        atomic_fetch_add(&mp_probe[i].calls[kind], 1);
+        return;
+    }
+    atomic_fetch_add(&mp_probe_dropped, 1);
+}
+void nvn_dirty_mp_probe_dump(void) {
+    if (!atomic_load(&mp_probe_enabled)) return;
+    static const char *const names[] = {"ro-rearm", "ro-replace", "rw-needed", "rw-already-writable"};
+    static uint64_t last[MP_PROBE_N][MP_KIND_N];
+    uint64_t num, den;
+    dirty_tick_rate(&num, &den);
+    for (size_t i = 0; i < MP_PROBE_N; i++) {
+        const uint64_t key = atomic_load(&mp_probe[i].key);
+        if (!key) continue;
+        for (unsigned k = 0; k < MP_KIND_N; k++) {
+            const uint64_t count = atomic_load(&mp_probe[i].calls[k]);
+            if (count == last[i][k]) continue;
+            last[i][k] = count;
+            LOG("[s2a-mp] tid=%u mapping=%llu op=%s cumulative_calls=%llu cumulative_pages=%llu cumulative_ns=%llu",
+                (unsigned)(uint32_t)key, (unsigned long long)(key >> 32), names[k], (unsigned long long)count,
+                (unsigned long long)atomic_load(&mp_probe[i].pages[k]),
+                (unsigned long long)(atomic_load(&mp_probe[i].ticks[k]) * num / den));
+        }
+    }
+    LOG("[s2a-mp] checkpoint dropped=%llu map_changed_during_call=%llu",
+        (unsigned long long)atomic_load(&mp_probe_dropped), (unsigned long long)atomic_load(&mp_probe_map_changed));
+}
+static int mp(uintptr_t a, size_t len, int prot, unsigned probe_kind) {
     if (nvn_dirty_mp_hook && nvn_dirty_mp_hook((void *)a, len, prot) != 0) {
         atomic_fetch_add(&g_mp_fails, 1);
         return -1;   // 注入失败：按真失败处理
     }
+    const uint64_t mapping = atomic_load(&g_mapping_gen);
     uint64_t t = dirty_tick();
     int rc = mprotect((void *)a, len, prot);
-    atomic_fetch_add(&g_mp_ticks, dirty_tick() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    const uint64_t elapsed = dirty_tick() - t;
+    mp_probe_note(mapping, probe_kind, len, elapsed);
+    atomic_fetch_add(&g_mp_ticks, elapsed); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
     if (rc != 0) {
         int e = errno;
         atomic_fetch_add(&g_mp_fails, 1);
@@ -362,27 +415,39 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
 // 先逐页认领（PROT→BUSY、NONE→BUSY_WRITABLE），挡住并发的加保护，再整段 mprotect：
 // 不能 mprotect 完再无条件写状态——另一线程刚把某页 NONE→BUSY→mprotect(READ)，本线程再写 NONE
 // 就留下“状态可写、内存只读”的漏检（维护方审 11-04 第 7 条）。
-static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+enum release_result { RELEASE_FAILED, RELEASE_ALREADY_WRITABLE, RELEASE_CHANGED };
+static enum release_result unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+    const uint64_t epoch = atomic_load_explicit(&g_mp_dedupe, memory_order_relaxed) ? atomic_load(&g_table_epoch) : 0;
+    int had_protected = 0;
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
-        if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; }
-        else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
+        if (st == PG_PROT) {
+            if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue;
+            had_protected = 1;
+        } else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
         else if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
             for (uintptr_t j = first; j < k; j++) {
                 uint8_t js = atomic_load(&r->state[j]);
                 if (js == PG_BUSY) atomic_store(&r->state[j], PG_PROT);
                 else if (js == PG_BUSY_WRITABLE) atomic_store(&r->state[j], PG_NONE);
             }
-            return 0;
+            return RELEASE_FAILED;
         }
         k++;
     }
+    dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
+    // A competing unlock can finish while this request waits. Once all claims
+    // are already-writable in the same mapped range, its published event suffices.
+    if (!had_protected && epoch && !(epoch & 1) && lg && !atomic_load(&lg->bad) &&
+        !atomic_load(&g_track_unreliable) && atomic_load(&g_table_epoch) == epoch) {
+        for (uintptr_t k = first; k <= last; k++) atomic_store(&r->state[k], PG_NONE);
+        return RELEASE_ALREADY_WRITABLE;
+    }
     uintptr_t begin = r->base + (first << g_shift), end = r->base + ((last + 1) << g_shift);
     {   // 追加日志：在页变可写之前发布（mprotect 失败时这条是多余的，只会让消费方多同步一次；失败本身会置「跟踪不可靠」）
-        dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
         if (lg) log_append(lg, begin, end);
     }
-    if (mp(begin, end - begin, PROT_READ | PROT_WRITE) != 0) {
+    if (mp(begin, end - begin, PROT_READ | PROT_WRITE, had_protected ? MP_RW : MP_RW_DUP) != 0) {
         // 失败：不推进代际，按认领前状态回退，并标记跟踪不可靠（跨 VMA 的 mprotect 可能部分成功，不能假定整段未变）
         for (uintptr_t k = first; k <= last; k++) {
             uint8_t st = atomic_load(&r->state[k]);
@@ -390,15 +455,15 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
             else if (st == PG_BUSY_WRITABLE) atomic_store(&r->state[k], PG_NONE);
         }
         atomic_store(&g_track_unreliable, 1);
-        return 0;
+        return RELEASE_FAILED;
     }
     const uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
     for (uintptr_t k = first; k <= last; k++) { atomic_store(&r->gen[k], g); atomic_store(&r->state[k], PG_NONE); }
     last_max(r, g);
-    return 1;
+    return RELEASE_CHANGED;
 }
 // 解除 p 所在的整块。块边界以所属映射为基准（chunk_first/last_page），不越界保护相邻内存。
-static int unprotect_chunk(range_t *r, uintptr_t p) {
+static enum release_result unprotect_chunk(range_t *r, uintptr_t p) {
     return unprotect_span_pages(r, chunk_first_page(r, p), chunk_last_page(r, p));
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
@@ -408,7 +473,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         uint8_t st = atomic_load(&r->state[p]);
         if (st == PG_NONE) return atomic_load(&r->gen[p]) != 0;   // already writable (another thread just unprotected it) -> re-execute; pages never protected are not ours
         if (st == PG_PROT) {
-            if (!unprotect_chunk(r, p)) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
+            if (unprotect_chunk(r, p) == RELEASE_FAILED) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
             if (count) atomic_fetch_add(count, 1);
             return 1;
         }
@@ -443,12 +508,12 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (any_prot) {
             if (!open) { run_first = i; open = 1; }
         } else if (open) {
-            if (unprotect_span_pages(r, run_first, i - 1)) { if (count) atomic_fetch_add(count, i - run_first); }
+            if (unprotect_span_pages(r, run_first, i - 1) == RELEASE_CHANGED && count) atomic_fetch_add(count, i - run_first);
             open = 0;
         }
         i = last + 1;
     }
-    if (open && unprotect_span_pages(r, run_first, lq)) { if (count) atomic_fetch_add(count, lq - run_first + 1); }
+    if (open && unprotect_span_pages(r, run_first, lq) == RELEASE_CHANGED && count) atomic_fetch_add(count, lq - run_first + 1);
 }
 static void prep_write(void *addr, size_t len) {
     if (!len) return;
@@ -510,7 +575,7 @@ int nvn_dirty_replace_range(const void *mem, size_t size) {
         uintptr_t first = chunk_first_page(r, k), last = chunk_last_page(r, k);
         if (last >= np) last = np - 1;
         if (first >= np) break;
-        if (mp(r->base + (first << g_shift), (last - first + 1) << g_shift, PROT_READ) == 0) {
+        if (mp(r->base + (first << g_shift), (last - first + 1) << g_shift, PROT_READ, MP_REPLACE) == 0) {
             for (uintptr_t j = first; j <= last; j++) atomic_store(&r->state[j], PG_PROT);
         } else {
             atomic_store(&g_track_unreliable, 1);
@@ -648,7 +713,7 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         if (took && !open) { run = i; open = 1; }
         if (!took && open) {
             // 只有整段成功才记 PG_PROT；失败则记未跟踪并置“跟踪不可靠”，让查询走保守路径。
-            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ) == 0) {
+            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ, MP_RO) == 0) {
                 for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
             } else {
                 for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_NONE);
