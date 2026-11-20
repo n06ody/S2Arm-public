@@ -32,5 +32,6 @@ namespace S2A.Audio.AAudio
         [DllImport(Lib)] public static extern void s2a_aaudio_set_volume(nint sink, float volume);
         [DllImport(Lib)] public static extern void s2a_aaudio_stats(nint sink, Stats* stats);
         [DllImport(Lib)] public static extern void s2a_aaudio_close(nint sink);
+        [DllImport(Lib)] internal static extern void s2a_capacity_audio_enter();
     }
 }

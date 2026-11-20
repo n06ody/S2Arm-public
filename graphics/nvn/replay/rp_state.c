@@ -56,8 +56,10 @@ static void bh_fresh(const p_bind_handles *b, int is_samp) {
         }
     }
 }
+void rp_bh_fresh(const p_bind_handles *b, int is_samp) { bh_fresh(b, is_samp); }   // rp_sdx.c 的索引扫描与回放做同一次递延取
 
 static int prog_is(const prog_t *p, uint64_t serial) { return p && p->magic == MAGIC('P', 'R', 'O', 'G') && p->serial == serial; }
+int rp_prog_is(const prog_t *p, uint64_t serial) { return prog_is(p, serial); }   // rp_sdx.c 的绑定程序跟踪用
 
 // 程序对象在绑定之后可能被游戏 Finalize 或复用（nvn_mtl.m:7150 一带的两次崩溃）：之后只认绑定当时的序号 bser，
 // bst 只在对象仍是它时非空。bser 为 0 = 该阶段没有绑定。

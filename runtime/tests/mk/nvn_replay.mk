@@ -4,7 +4,7 @@
 #   2. 分层扫描：回放核心（rp_*.c / rp_*.h / nvn_unimpl.* / nvn_plat.h）注释外不许出现 Vulkan / Metal / 安卓 / 鸿蒙的头文件与类型，
 #      也不许直接读系统属性或环境变量（开关只走 nvn_plat_flag）。nvn_plat_vk.h 是给后端的，不在扫描范围。
 NVN_REPLAY_DIR := graphics/nvn/replay
-NVN_REPLAY_CORE := $(NVN_REPLAY_DIR)/rp_exec.c $(NVN_REPLAY_DIR)/rp_copy_t2b.c $(NVN_REPLAY_DIR)/rp_clear_tex.c $(NVN_REPLAY_DIR)/rp_state.c $(NVN_REPLAY_DIR)/rp_entry.c $(NVN_REPLAY_DIR)/rp_res.c $(NVN_REPLAY_DIR)/rp_buf.c $(NVN_REPLAY_DIR)/rp_pass.c $(NVN_REPLAY_DIR)/rp_present.c $(NVN_REPLAY_DIR)/rp_draw.c $(NVN_REPLAY_DIR)/nvn_unimpl.c \
+NVN_REPLAY_CORE := $(NVN_REPLAY_DIR)/rp_exec.c $(NVN_REPLAY_DIR)/rp_copy_t2b.c $(NVN_REPLAY_DIR)/rp_clear_tex.c $(NVN_REPLAY_DIR)/rp_state.c $(NVN_REPLAY_DIR)/rp_entry.c $(NVN_REPLAY_DIR)/rp_res.c $(NVN_REPLAY_DIR)/rp_buf.c $(NVN_REPLAY_DIR)/rp_pass.c $(NVN_REPLAY_DIR)/rp_sdx.c $(NVN_REPLAY_DIR)/rp_present.c $(NVN_REPLAY_DIR)/rp_draw.c $(NVN_REPLAY_DIR)/nvn_unimpl.c \
   graphics/nvn/gfx/nvn/nvn_tex.c graphics/nvn/gfx/tex/nvn_deswizzle.c
 # 回放核心对平台 / 后端的可选件写的是弱引用（缺实现 = 地址为空、走不到调用）。ELF 链接器认未定义弱符号，苹果 ld 默认不认：
 #   逐个列名允许缺，不用 dynamic_lookup 一刀切——真漏掉的强符号照样链接红。放行清单只从源码登记生成（「// 弱链接[replay]：符号」，见 tools/weak_link_decl.py）

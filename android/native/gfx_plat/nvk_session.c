@@ -1,5 +1,6 @@
 #include "nvk_session.h"
 #include "nvn_backend.h"
+#include "nvn_dirty.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "rp_exec.h"
@@ -88,9 +89,9 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
     //   16 页       207 次、12 毫秒、37 毫秒，10.9 帧
     //   64 页       54 次、2 毫秒、34 毫秒，11.1 帧
     // 块越大一次缺页后要重传的字节越多，但一次缺页加两次改保护的代价抵得上拷两百多 KB。debug.s2a.nvk_chunk_pages 可改（0 = 逐页）。
-    { extern void nvn_dirty_set_chunk_pages(uint32_t); extern int nvn_dirty_log_configure(int); extern int nvn_plat_flag(const char *, int);
-      int cp = nvn_plat_flag("nvk_chunk_pages", 64);
+    { int cp = nvn_plat_flag("nvk_chunk_pages", 64);
       nvn_dirty_set_chunk_pages(cp > 0 ? (uint32_t)cp : 0); __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 写跟踪保护分块 %d 页", cp);
+      nvn_dirty_set_mp_dedupe(nvn_plat_flag("nvk_mp_dedupe", 1));
       // 脏页追加日志（#1501 A②，缺省开，debug.s2a.nvk_buf_dirtylog=0 关）：必须在登记任何池之前配置；回放核心按同一开关决定用不用
       if (nvn_plat_flag("nvk_buf_dirtylog", 1) && !nvn_dirty_log_configure(1))
           __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】脏页追加日志未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
@@ -101,6 +102,9 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
                         caps.name, caps.api_version, caps.caps,
                         (unsigned long long)caps.max_buf_bytes, (unsigned long long)caps.max_ssbo_range,
                         drv_name, dev ? dev->driver_id : -1);
+    { extern int rp_sdx_on(void); extern int rp_fd_on(void);   // 一次性启动诊断（#1740 跳写回 / 跳载入真机定位）：厂商真值、能力位、两个门的读值
+      __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 跳写回 / 跳载入门检 vendorID=0x%04x caps=0x%x TILE_MEMORY=%d nvk_sdx=%d nvk_fd=%d",
+                          caps.vendor_id, caps.caps, !!(caps.caps & NVN_GPU_CAP_TILE_MEMORY), rp_sdx_on(), rp_fd_on()); }
     pthread_mutex_unlock(&g_mu);
     // 开局预热（iOS 蓝本：nvn_mtl.m warm_start 在 shader map 读完就起，后台把上一局清单建出来）。
     // 放在解锁之后：预热线程会取会话缓存目录 / 后端锁，不在 g_mu 里起线程。

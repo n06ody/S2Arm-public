@@ -93,7 +93,7 @@ void rp_pass_note_draw(int d) { (void)d; }
 // These fixtures issue no deferred clears and leave pass-area optimization off.
 int rp_pass_parked(void) { return 0; }
 void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *t, int n) { (void)c; (void)t; (void)n; abort(); }
-void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) { (void)c; (void)color_write_mask; }
+void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cover, int fd_bucket) { (void)c; (void)color_write_mask; (void)cover; (void)fd_bucket; }
 int rp_pass_begin(nvn_gpu_cmd c) {
     nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.color[0].view = target_view;
     pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;

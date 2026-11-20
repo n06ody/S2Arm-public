@@ -1,5 +1,6 @@
 // 真实 AudioManagers / AudioRendererManager / AudioProcessor + Dummy 驱动；只替换 Horizon 内核事件。
 using System;
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Threading;
 using Ryujinx.Audio.Backends.Dummy;
@@ -11,7 +12,8 @@ using S2A.Services;
 
 var lifetime = new HorizonAudioLifetime();
 S2AHorizonHooks.AudioCreated = lifetime.Register;
-var driver = new CompatLayerHardwareDeviceDriver(new DummyHardwareDeviceDriver());
+var audioBackend = new RecordingAudioThreadDriver();
+var driver = new CompatLayerHardwareDeviceDriver(audioBackend);
 var managers = new AudioManagers(driver, null);
 var renderer = managers.AudioRendererManager;
 const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -31,12 +33,22 @@ if (args.Length != 0 && args[0] == "old-order")
     Thread.Sleep(1000); // 未处理的异常应先终止子进程，不能把程序正常结束当作红。
     throw new Exception("missing expected AudioProcessor.Signal failure");
 }
+if (!audioBackend.Threads.ContainsKey(worker.ManagedThreadId) ||
+    audioBackend.Threads.Count != (Environment.GetEnvironmentVariable("S2A_AUDIO_INLINE") == "0" ? 2 : 1))
+    throw new Exception("owned audio threads did not call the real backend's affinity hook");
 lifetime.Dispose();
 if (worker.IsAlive) throw new Exception("audio renderer survived owner cleanup");
 driver.Dispose();
 lifetime.Dispose();
 managers.Dispose(); // 服务入口晚到的 Shutdown 幂等。
 Console.WriteLine("PASS audio lifetime: real manager/processor joined before driver pause event disposal; repeated cleanup safe");
+Console.WriteLine("PASS audio placement hook: owned renderer threads registered with the real backend");
+
+sealed class RecordingAudioThreadDriver : DummyHardwareDeviceDriver, IHardwareDeviceDriver
+{
+    public readonly ConcurrentDictionary<int, byte> Threads = new();
+    void IHardwareDeviceDriver.S2AConfigureRenderThread() => Threads.TryAdd(Environment.CurrentManagedThreadId, 0);
+}
 
 namespace Ryujinx.Horizon
 {

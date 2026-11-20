@@ -99,7 +99,7 @@ nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){(void)s;return NULL;}
 static p_set_rt target;static tex_t target_tex;static nvn_gpu_view target_view;static int pass_open;
 const p_set_rt *rp_pass_target(void){return &target;}int rp_pass_slot_attached(int i){return i==0;}
 void rp_pass_slot_size(int i,uint32_t *w,uint32_t *h){(void)i;*w=*h=64;}void rp_pass_noatt_size(uint32_t *w,uint32_t *h){(void)w;(void)h;}void rp_pass_note_draw(int d){(void)d;}
-int rp_pass_parked(void){return 0;}void rp_pass_prepare_draw(nvn_gpu_cmd c,uint32_t color_write_mask){(void)c;(void)color_write_mask;}void rp_pass_land_reads(nvn_gpu_cmd c,const tex_t *const *ts,int n){(void)c;(void)ts;(void)n;}
+int rp_pass_parked(void){return 0;}void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cover, int fd_bucket) { (void)c; (void)color_write_mask; (void)cover; (void)fd_bucket; }void rp_pass_land_reads(nvn_gpu_cmd c,const tex_t *const *ts,int n){(void)c;(void)ts;(void)n;}
 static void pass(nvn_gpu_cmd c,int clear){
  nvn_gpu_pass_desc p={0};p.ncolor=1;p.color[0].view=target_view;
  p.color[0].load=clear?NVN_GPU_LOAD_CLEAR:NVN_GPU_LOAD_LOAD;p.color[0].store=NVN_GPU_STORE_STORE;
