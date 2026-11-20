@@ -248,6 +248,29 @@ static void buf_invalidate_written(uint64_t addr, uint64_t n) {
     pthread_mutex_unlock(&g_bmu);
 }
 
+// [a, b)（池内偏移）是否整段被已登记的显卡写区间（可多段拼接）盖住
+static int gw_covers(const struct shadow *s, uint64_t a, uint64_t b) {
+    if (!s->ngw || a >= b) return 0;
+    for (int moved = 1; moved && a < b;) {
+        moved = 0;
+        for (int i = 0; i < s->ngw; i++) { const uint64_t g0 = s->gw[i].off, g1 = g0 + s->gw[i].len;
+            if (g0 <= a && a < g1) { a = g1; moved = 1; } }
+    }
+    return a >= b;
+}
+// 池内第 k 页（裁到池范围）是否整页被显卡写区间盖住
+static int gw_covers_page(const struct shadow *s, const uint8_t *mem, uint64_t size, uint64_t k) {
+    const size_t ps = nvn_dirty_page_size();
+    uintptr_t a = s->page0 + (uintptr_t)(k * ps), b = a + ps;
+    if (a < (uintptr_t)mem) a = (uintptr_t)mem;
+    if (b > (uintptr_t)mem + size) b = (uintptr_t)mem + size;
+    return gw_covers(s, a - (uintptr_t)mem, b - (uintptr_t)mem);
+}
+static int gw_covers_any_page(const struct shadow *s, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
+    if (!s->ngw) return 0;
+    for (uint64_t k = i; k <= j; k++) if (gw_covers_page(s, mem, size, k)) return 1;
+    return 0;
+}
 // 把游戏内存的 [a, b)（池内偏移）传进镜像，绕开 GPU 写过、还没回写落地的那些段：
 // 那些字节镜像里的才是新的，游戏内存里是旧的（同步按页，一页里别的字节脏了不能连它一起盖回去）。
 static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct mirror *m, uint64_t a, uint64_t b) {   // direct 非空：直接写进镜像的 CPU 映射（见 rp_buf_resolve）
@@ -338,6 +361,19 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
     pthread_mutex_unlock(&g_bmu);
     return hit;
 }
+// 落地撤登记时（锁内）：显卡写区间整页盖住的页在登记存活期间被清过旧位（sync_run 里拆出时，那时它们的字节全是显卡写的）。
+// 登记一撤，这些页就是普通页：重新置旧，下次使用照常整页重搬（与没有「显卡写区间里不进同步」时一样）。只对脏页日志路径的那份镜像（逐页路径靠 synced 与代号）。
+// 不在落地后核对、不布防：9000 b4r3 单变量——落地后立即布防把下一次缺页挪进回放、贴图纪元快路失效、整张重传 ×15、GPU 忙 +15 ms（cap_kb=0 只关这一步即回到比 main 更好）。
+static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
+    struct mirror *m = &s->m[mi];
+    if (m->path != MP_LOG || !m->stale || !len || off >= s->size) return;
+    if (len > s->size - off) len = s->size - off;
+    const size_t ps = nvn_dirty_page_size();
+    const uintptr_t a = (uintptr_t)s->mem + off, b = a + len;
+    const uint64_t k0 = (a - s->page0 + ps - 1) / ps, k1 = (b - s->page0) / ps;   // 整页：[k0, k1)
+    if (k1 > k0) stale_set(m, k0, (k1 < s->npages ? k1 : s->npages) - 1);
+}
+
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
@@ -367,6 +403,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 登记撤掉之后同一段改用当前那份镜像：不受写跟踪的池里，那份镜像此前同步这些页时按登记跳过了这段字节，落地的内容它没有——作废这几页，下次使用重新同步。
     // 写它的那一份镜像里本来就是新的，不动（受跟踪的池里落地的 memcpy 自己会让页变脏）。
     if (ok && s->untracked) pages_invalidate_locked(s, off, len, wmi);
+    land_restale(s, wmi, off, len);
     s->landing--;
     __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 锁内撤登记与计数保持一致
     if (!s->landing) pthread_cond_broadcast(&g_land_cv);   // 池销毁 / 会话收尾可安全解除目标映射
@@ -411,6 +448,28 @@ static inline uint64_t rearm_span(struct sync_span range) {
 }
 // 先保护、取代号，再同步到镜像。相邻段的保护可合并，传输仍分别判定。
 static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j, uint64_t st) {
+        // 整页落在已登记的显卡写区间里（显卡还在写 / 正在锁外拷回游戏内存）的页：sync_write 本来就跳过这些字节，拷 0 字节，
+        // 再往下走只会白取一条传输命令（切开当前通道）、白记一笔同步。镜像里本来就是显卡写的字节：不搬、不记已同步，
+        // 落地撤登记时整段重新置旧，下次使用照常重搬（8E 探针：同提交重搬 33–36 MB/帧里 98% 是这种「落地中」的页）。
+        // 必须在布防之前拆：布防这些页会被落地 memcpy 立刻写到缺页、再解保护，每帧白来回一轮（8E b3：改保护 374→454 次 / 22.8k→30k 页）。
+        if (s->ngw) {
+            // 盖住的页不搬（显卡写区间首尾常不对齐页，按页判），其余每一段照常同步
+            uint64_t k = i; while (k <= j && !gw_covers_page(s, mem, size, k)) k++;
+            if (k <= j) {
+                for (uint64_t x = i; x <= j;) {
+                    if (gw_covers_page(s, mem, size, x)) {
+                        // 被盖住的页的字节全是显卡写的，没有要跟踪的游戏字节：旧位当场清掉，登记存活期间别的解析不再逐页复查它
+                        // （8E b4r2：旧位因「没布防」一直留着，大范围解析每次重扫 ~100 万页、顶点流与索引 26–34 ms/帧）。
+                        // 落地撤登记时整段重新置旧（land_restale），照常重搬。
+                        if (m->path == MP_LOG && m->stale && (m->stale[x >> 6] >> (x & 63) & 1)) stale_clear(m, x);
+                        rp_perf_add(RP_PERF_BUF_SYNC_GW_KB, nvn_dirty_page_size() / 1024); x++; continue; }
+                    uint64_t y = x; while (y + 1 <= j && !gw_covers_page(s, mem, size, y + 1)) y++;
+                    sync_run(s, m, mem, size, x, y, st);   // 父段若已布防取代号（st 非 0）各段沿用；否则各段只布防自己那段
+                    x = y + 1;
+                }
+                return;
+            }
+        }
         const struct sync_span range = sync_span_for(s, mem, size, i, j);
         const uintptr_t a = range.begin, b = range.end;
         if (!st) st = rearm_span(range);
@@ -460,7 +519,7 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
                 j += next_unset ? (uint64_t)__builtin_ctzll(next_unset) : 64;
             }
             if (j > q) j = q;
-            if (j > word_end) {
+            if (j > word_end && !gw_covers_any_page(s, mem, size, i, j)) {   // 串里有被显卡写区间盖住的页：不合并布防，交给 sync_run 先剔掉再按段布防
                 const uint64_t stamp = rearm_span(sync_span_for(s, mem, size, i, j));
                 sync_run(s, m, mem, size, i, word_end, stamp);
                 sync_run(s, m, mem, size, word_end + 1, j, stamp);
