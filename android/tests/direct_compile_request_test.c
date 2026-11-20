@@ -6,6 +6,8 @@
 
 #include "direct/compile_request.h"
 #include "direct/kind_check.h"
+#include "direct/xlate_debug.h"
+#include "direct/sha256.h"
 #include "direct/s2a_direct.h"
 
 // kindCheck 调试开关的宿主矩阵：开发者包里“调试构建 + debug.s2a.debug_env=1 + debug.s2a.kind_check=0”
@@ -21,9 +23,11 @@
 #endif
 static const char *g_debug_env = "0";   // debug.s2a.debug_env 的桩值（门②）
 static const char *g_kind_check = "";   // debug.s2a.kind_check 的桩值（缺省 = 不设）
+static const char *g_xlate_debug = "";  // debug.s2a.xlate_debug 的桩值（缺省 = 不设）
 int __system_property_get(const char *name, char *out) {
     const char *v = !strcmp(name, "debug.s2a.debug_env") ? g_debug_env :
-                    !strcmp(name, "debug.s2a.kind_check") ? g_kind_check : "";
+                    !strcmp(name, "debug.s2a.kind_check") ? g_kind_check :
+                    !strcmp(name, "debug.s2a.xlate_debug") ? g_xlate_debug : "";
     strcpy(out, v);
     return (int)strlen(v);
 }
@@ -53,6 +57,14 @@ static void check_kind_check_contract(const struct s2a_compile_request_input *in
     }
     // 可选键是条件写的，拼错分隔符会整段 JSON 非法（编译器的严格解析直接拒），不是开关问题。
     CHECK(!strstr(json, ",,"), "conditional kindCheck key keeps the JSON separators valid");
+    // debugMode 恒显式写（含缺省 false）：sha256 覆盖整个请求 JSON，不带键的旧格式请求与
+    // 「编译器 DebugMode 恒开」时期逐字节相同，会命中旧的膨胀产物缓存——显式写 false 让翻译旗
+    // 口径落进身份、旧缓存条目自然 miss（「旧格式请求在新版本下不被命中」的机制层证明）。
+    if (s2a_direct_xlate_debug_enabled()) {
+        CHECK(contains(json, "\"debugMode\":true"), "xlate debug on: request JSON carries debugMode:true");
+    } else {
+        CHECK(contains(json, "\"debugMode\":false"), "xlate debug off: request JSON carries debugMode:false");
+    }
     if (dump_path && *dump_path) {
         FILE *f = fopen(dump_path, "wb");
         if (f) { fwrite(json, 1, len, f); fclose(f); }
@@ -154,6 +166,32 @@ int main(int argc, char **argv) {
     char gaps[2048] = {0};
     CHECK(s2a_compile_request_build(&in, &json, &len, gaps, sizeof gaps) == 0, "build succeeds");
     CHECK(json && len > 100, "json has bytes");
+    // 「旧格式请求的缓存条目在新版本下不被命中」：抠掉 debugMode 键得到旧格式字节，
+    // 同一 sha256（程序缓存身份覆盖整个请求 JSON，compile_request.c s2a_compile_request_execute）
+    // 必须不同——旧 sha 槽位对新请求自然 miss。
+    if (json) {
+        const char *needle = strstr(json, ",\"debugMode\":");
+        CHECK(needle != NULL, "new-format request carries explicit debugMode");
+        if (needle) {
+            char new_sha[65], old_sha[65];
+            s2a_sha256 ctx;
+            uint8_t digest[32];
+            s2a_sha256_init(&ctx); s2a_sha256_update(&ctx, json, len); s2a_sha256_final(&ctx, digest);
+            s2a_sha256_hex(digest, new_sha);
+            char *oldfmt = malloc(len + 1);
+            memcpy(oldfmt, json, len + 1);
+            char *hit = strstr(oldfmt, ",\"debugMode\":");
+            // 键值段 = ,\"debugMode\": + true/false（尾键，值后紧跟 }）：整段抠掉。
+            char *colon = strchr(hit, ':') + 1;
+            size_t vlen = strncmp(colon, "true", 4) == 0 ? 4 : 5;
+            memmove(hit, colon + vlen, strlen(colon + vlen) + 1);
+            size_t old_len = strlen(oldfmt);
+            s2a_sha256_init(&ctx); s2a_sha256_update(&ctx, oldfmt, old_len); s2a_sha256_final(&ctx, digest);
+            s2a_sha256_hex(digest, old_sha);
+            CHECK(strcmp(new_sha, old_sha) != 0, "old-format request sha differs from new (old cache entry misses)");
+            free(oldfmt);
+        }
+    }
     if (json) {
         char text[64];
         snprintf(text, sizeof text, "\"session\":%d", 7);
@@ -276,12 +314,45 @@ int main(int argc, char **argv) {
         CHECK(s2a_direct_kind_check_enabled() == 0, "gate open + prop=0 disables kind check");
         check_kind_check_contract(&in, "gate open + prop=0 build succeeds", argc > 3 ? argv[3] : NULL);
         // 保持“本应关掉”的状态进入 execute：下面断言 execute 不写进程环境。
+
+        g_debug_env = "0"; g_xlate_debug = "1";
+        CHECK(s2a_direct_xlate_debug_enabled() == 0, "gate off: property alone cannot enable xlate debug");
+        check_kind_check_contract(&in, "gate off + xlate prop=1 build succeeds", NULL);
+
+        g_debug_env = "1"; g_xlate_debug = "";
+        CHECK(s2a_direct_xlate_debug_enabled() == 0, "gate open + unset property keeps xlate debug off");
+
+        g_debug_env = "1"; g_xlate_debug = "1";
+        CHECK(s2a_direct_xlate_debug_enabled() != 0, "gate open + prop=1 enables xlate debug");
+        check_kind_check_contract(&in, "gate open + xlate prop=1 build succeeds", NULL);
+        g_xlate_debug = "";
 #else
         // 正式构建：S2A_ANDROID_DEBUG_ENV 没定义，门①编译期就关着，adb 把两个属性都设上也打不开。
-        g_debug_env = "1"; g_kind_check = "0";
+        g_debug_env = "1"; g_kind_check = "0"; g_xlate_debug = "1";
         CHECK(s2a_direct_kind_check_enabled() != 0, "release build: properties cannot open the debug gate");
+        CHECK(s2a_direct_xlate_debug_enabled() == 0, "release build: properties cannot enable xlate debug");
         check_kind_check_contract(&in, "release build + props set keeps the request free of kindCheck", NULL);
 #endif
+    }
+
+    // 阶段口径：含几何段的图形请求恒 debugMode:true（#1774 — 顶点/片元关、几何保留，
+    // 组合翻译一条程序一个旗没法只给 gs 留）。xlate 属性不设也要 true。
+    {
+        struct s2a_compile_request_input gsin = in;
+        gsin.stages[0] = (struct s2a_compile_stage_src){ "vs", code, sizeof code, control, sizeof control, NULL, 0, 0x5 };
+        gsin.stages[1] = (struct s2a_compile_stage_src){ "fs", code, sizeof code, control, sizeof control, NULL, 0, 0 };
+        gsin.stages[2] = (struct s2a_compile_stage_src){ "gs", code, sizeof code, control, sizeof control, NULL, 0, 0 };
+        gsin.stage_count = 3;
+        char *gjson = NULL;
+        size_t glen = 0;
+        char gaps[512] = "";
+        CHECK(s2a_compile_request_build(&gsin, &gjson, &glen, gaps, sizeof gaps) == 0,
+              "vs+fs+gs request builds");
+        if (gjson) {
+            CHECK(contains(gjson, "\"debugMode\":true"),
+                  "gs-containing request keeps DebugMode regardless of xlate prop");
+            free(gjson);
+        }
     }
 #endif
 
