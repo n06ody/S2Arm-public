@@ -35,7 +35,12 @@ struct fd_stage {
     uint32_t attr_mask;
     uint32_t fragment_output_map;   // 片元阶段：每个颜色目标 4 位（RGBA）= 着色器写了哪些输出分量；读不到为全 1
     int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知
+    int binst_unread_static;        // 不做动态下标定界的证明；缺字段 / null = 未知
+    int binst_static_present;       // 新结果带静态读集（null 也算有字段）
 };
+static inline int nvn_vk_binst_unread(const struct fd_stage *st, int bound_on) {
+    return bound_on ? st->binst_unread : (st->binst_static_present && st->binst_unread_static);
+}
 #define FD_C0_BASE_INSTANCE 0x644u   // 驱动常量段里图形阶段的 base instance 字（nvn_vk_mrt.h、回放 fill_graphics_drv 同位）
 
 /* 句柄放在游戏用户常量缓冲里的一个 32 位字（v1 uboHandle / sampler.handle；iOS nvn_refl.h NVN_RB_TEXU / SAMPU / TBUFU 的 reg / off / sid / pair）：

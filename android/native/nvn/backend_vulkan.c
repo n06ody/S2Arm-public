@@ -380,6 +380,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
@@ -2188,6 +2189,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
         static int mt_on = -1; if (mt_on < 0) mt_on = nvn_plat_flag("nvk_mem_types", 0) != 0;
@@ -2719,6 +2721,37 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     cmd_ref(c, d, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
+    pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
+    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
+    if (!ch || !n) return;
+    struct nvn_gpu_cmd_s *c = ch;
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!v[i].src || !v[i].dst || !buf_range(v[i].src, v[i].soff, v[i].bytes) || !buf_range(v[i].dst, v[i].doff, v[i].bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段越界", i); return; }
+        if (!v[i].bytes || (v[i].bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 第 %u 段长度 %llu 不是 4 的正整数倍", i, (unsigned long long)v[i].bytes); return; }
+    }
+    VkPipelineStageFlags dst = 0;
+    if (stages & 1u << NVN_GPU_SH_VS) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & 1u << NVN_GPU_SH_FS) dst |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if ((stages & 1u << NVN_GPU_SH_GS) && g.dev->core_features.geometryShader) dst |= VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    if (!dst) { set_sticky(c, NVN_GPU_E_ARG, "copy_bufs 没给读的阶段（stages=%#x）", stages); return; }
+    // 源可能刚被计算 / 传输 / 图形写过（GPU 写出的间接记录、主段里的镜像同步），目标是本段新分的暂存：一道屏障盖住两者
+    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    enum { RUN = 64 }; VkBufferCopy r[RUN];
+    for (uint32_t i = 0; i < n;) {
+        struct nvn_gpu_buf_s *s = v[i].src, *d = v[i].dst; uint32_t k = 0;
+        while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
+        vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
+        cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
+    }
+    mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
+    c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
+    pthread_mutex_lock(&g_mu);
+    g.stats[STAT_COPIES] += n;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -5688,13 +5721,23 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         if (!c->es.db_ok || memcmp(c->es.db, db, sizeof db)) { vkCmdSetDepthBias(c->cb, db[0], db[1], db[2]); memcpy(c->es.db, db, sizeof db); c->es.db_ok = 1; c->es_count[ES_DB]++; }
     }
     const uint64_t dt2 = dtm ? now_ns() : 0;
+    uint32_t changed_vbuf = 0;
     for (uint32_t s = 0; s < 16; s++) {
         if (!c->vbuf[s].buf) continue;
         VkBuffer vb = c->vbuf[s].buf->buffer;
         VkDeviceSize off = c->vbuf[s].off;
         if ((c->es.vb_ok >> s & 1) && c->es.vb[s] == vb && c->es.vboff[s] == off) continue;
-        vkCmdBindVertexBuffers(c->cb, s, 1, &vb, &off);
-        c->es.vb[s] = vb; c->es.vboff[s] = off; c->es.vb_ok |= (uint16_t)(1u << s); c->es_count[ES_VB]++;
+        c->es.vb[s] = vb; c->es.vboff[s] = off; c->es.vb_ok |= (uint16_t)(1u << s);
+        changed_vbuf |= 1u << s;
+    }
+    // 只发送连续的变化槽。位图仅低 16 位，按首槽右移后取反必非零，可数出这一段的连续 1。
+    // 两级录制入队时复制数组，保活仍由 nvn_gpu_set_vbuf 按缓冲登记。
+    while (changed_vbuf) {
+        uint32_t first = (uint32_t)__builtin_ctz(changed_vbuf);
+        uint32_t count = g.vbuf_batch ? (uint32_t)__builtin_ctz(~(changed_vbuf >> first)) : 1;
+        vkCmdBindVertexBuffers(c->cb, first, count, c->es.vb + first, c->es.vboff + first);
+        c->es_count[ES_VB]++;
+        changed_vbuf &= ~(((1u << count) - 1) << first);
     }
     uint32_t inst = a->instances ? a->instances : 1;
     uint32_t draws = a->max_draws ? a->max_draws : 1;
