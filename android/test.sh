@@ -72,6 +72,8 @@ s2a_gate_step bash "$android_dir/tools/nvn_vk_program_binding_cap.sh"
 s2a_gate_step bash "$android_dir/tools/vk_poolahb_alias_test.sh"
 # 直连逐帧帧时间（宿主，确定性）：环形语义、丢弃/计数可见、分片转储字节级核回。
 s2a_gate_step bash "$android_dir/tools/nvn_vk_frame_log_test.sh"
+# 逐帧时间探针（宿主，确定性）：帧归属 / acquire-present-submit 精确起止 / 转储核回 / 开销实测。
+s2a_gate_step bash "$android_dir/tools/nvn_ft_probe_test.sh"
 # WSI actual-present diagnostics: NDK declarations, partial batches and generation isolation.
 s2a_gate_step bash "$android_dir/tests/nvk_shown_timing_test.sh"
 # 设备 / 实例扩展查询：枚举失败（能力未知、报红）与确实不支持分开；VK_INCOMPLETE 重取。
@@ -302,10 +304,13 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mu
 # 计算程序预热（清单记账 / 阶段 / 从缓存建 / 开关）与现场编译诊断事件（图形 / 计算）的负对照：各撤一处，对应断言必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --live-compile-mutants
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
+# 落地免重搬（rp_buf.c land_verify）：修前（main 的 rp_buf.c）落地后整页重搬必红；逐字节比 / 代号 / 布防 / 整页 / 两条路径各撤一处必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/land_noresync_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
 # 存储缓冲槽长度语义：地址有效、长度 0 按硬件语义绑真实内存（池剩余长度，回写按它登记），没有可绑内存才绑空缓冲照画；5 个点变异各撤一处必红（纯宿主 C）
@@ -407,6 +412,7 @@ PY
 s2a_gate_step javac -encoding UTF-8 -d "$out/java" -cp "$out/java" \
     "$android_dir/app/src/main/java/org/s2arm/android/GamePack.java" \
     "$android_dir/app/src/main/java/org/s2arm/android/GameInstall.java" \
+    "$android_dir/app/src/main/java/org/s2arm/android/SaveArchive.java" \
     "$android_dir/app/src/main/java/org/s2arm/android/ImportReceiver.java" \
     "$android_dir/tests/GamePackTest.java" \
     "$android_dir/tests/GameInstallTest.java"

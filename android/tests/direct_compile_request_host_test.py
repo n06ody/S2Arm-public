@@ -88,7 +88,13 @@ def main():
         assert 'kindCheck' not in default_json, '默认构建的请求 JSON 不应出现 kindCheck 键'
         assert default_json['schema'] == 's2a-direct-compile-v1'
         assert 'sourceParserVersion' in default_json and 'profile' in default_json
-        print('default build: no kindCheck key (validation stays on)')
+        # debugMode 恒显式写（含缺省 false）：sha256 覆盖整个请求 JSON，缺省不带键的旧格式请求
+        # 与「编译器 DebugMode 恒开」时期逐字节相同、会命中旧的膨胀产物缓存——显式写让翻译旗
+        # 口径落进身份，旧缓存条目（无此键的请求 sha）在新版本下自然 miss。
+        assert default_json.get('debugMode') is False, \
+            '请求 JSON 必须恒显式写 debugMode（缺省 false），否则旧 DebugMode 产物缓存继续命中'
+        print('default build: no kindCheck key (validation stays on); '
+              'debugMode:false explicit (identity carries the flag)')
 
         # ② 调试构建桩矩阵：只有门开 + 属性=0 才关，且以 JSON 的 false 交给编译器。
         debug = tmp / 'debug'
@@ -103,6 +109,7 @@ def main():
         assert keys.index('kindCheck') == keys.index('sourceParserVersion') + 1, \
             f'kindCheck 必须紧跟 sourceParserVersion（现顺序 {keys}）'
         assert keys[keys.index('kindCheck') + 1] == 'profile', 'kindCheck 必须在 profile 之前'
+        assert flagged.get('debugMode') is False, 'xlate_debug 未设时请求 JSON 带 debugMode:false'
         print('debug gate open + kind_check=0: '
               '"kindCheck":false between sourceParserVersion and profile')
 

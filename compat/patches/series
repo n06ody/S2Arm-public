@@ -656,3 +656,4 @@
 20261119-2317-docked-operation-mode.patch
 20261119-1303-local-multiplayer-operation-mode.patch
 20261119-2131-audio-pace-thread-outlives-driver.patch
+20261120-1837-audio-renderer-partial-start.patch

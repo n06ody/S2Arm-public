@@ -285,6 +285,8 @@ nvn_gpu_rc nvn_gpu_drawable_acquire(nvn_gpu_surface s, uint64_t timeout_ns, void
         if (wsi_wait_acquire_free(s->acquire_waiter[sem], timeout_ns)) return fail(err, NVN_GPU_E_TIMEOUT, "上一次等这把取图信号量的呈现段还没确认完成");
         VkResult r = vkAcquireNextImageKHR(g.d, s->swapchain, timeout_ns, s->acquire[sem], VK_NULL_HANDLE, &idx);
         clock_gettime(CLOCK_MONOTONIC, &q1); __atomic_fetch_add(&g_acq_ns, (uint64_t)(q1.tv_sec - q0.tv_sec) * 1000000000ull + (uint64_t)q1.tv_nsec - (uint64_t)q0.tv_nsec, __ATOMIC_RELAXED);
+        if (ft_on_()) s2a_ft_acquire((uint64_t)q0.tv_sec * 1000000000ull + (uint64_t)q0.tv_nsec,
+                                    (uint64_t)q1.tv_sec * 1000000000ull + (uint64_t)q1.tv_nsec, (int32_t)r);   // 探针：vkAcquireNextImageKHR 精确起止
         if (r == VK_TIMEOUT || r == VK_NOT_READY) return fail(err, NVN_GPU_E_TIMEOUT, "没有空闲的交换链图");
         if (r == VK_ERROR_OUT_OF_DATE_KHR) { s->outdated = 1; return fail(err, NVN_GPU_E_OUTDATED, "交换链已过期"); }
         if (r == VK_ERROR_SURFACE_LOST_KHR) { s->gen = 0; return fail(err, NVN_GPU_E_REVOKED, "表面已丢失"); }
@@ -424,6 +426,7 @@ static int wsi_compose_easu(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
 nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const nvn_gpu_present_desc *d, uint64_t ticket,
                            nvn_gpu_presented_fn presented, void *user, nvn_gpu_err *err) {
     nvn_gpu_err local; if (!err) err = &local;
+    g_att_probe = 0;   // 首帧附件体检（backend_vulkan.c pass_begin）：第一帧上屏后不再打
     nvn_gpu_rc out = rc(NVN_GPU_OK);
     nvn_gpu_shown shown = {ticket, NVN_GPU_SHOWN_DROPPED, 0.0};
     nvn_gpu_cmd ch = NULL;
@@ -556,7 +559,9 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
+    uint64_t ft_b = ft_on_() ? now_ns() : 0;   // 探针：呈现段工作入口（含等提交锁）
     pthread_mutex_lock(&g_submit_mu);
+    uint64_t ft_qb = 0, ft_qe = 0;
     if (r == VK_SUCCESS) {
         VkPipelineStageFlags wait_stage = upscaled
             ? (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)   // 先清场再画
@@ -566,9 +571,12 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
+        if (ft_b && si.commandBufferCount) ft_qb = 1;
         r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (ft_qb) dq_ft_call_span(&ft_qb, &ft_qe);   // 探针：真驱动调用起止（不含包装 drain）
     }
     if (r != VK_SUCCESS) {
+        if (ft_qb) s2a_ft_submit(ft_b, ft_qb, ft_qe, S2A_FT_KEY_PRESENT_);   // 探针：呈现段提交失败也记（wsi_seq=0 未分配）
         pthread_mutex_unlock(&g_submit_mu);
         if (fence) vkDestroyFence(g.d, fence, NULL);
         free(seg);
@@ -581,6 +589,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
     enqueue_segment(&g, seg);
+    if (ft_qb) { s2a_ft_submit(ft_b, ft_qb, ft_qe, S2A_FT_KEY_PRESENT_ | seg->wsi_seq);   // 探针：呈现内嵌段提交
+                 s2a_ft_seg_end(now_ns()); }
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];
     pi.swapchainCount = 1; pi.pSwapchains = &s->swapchain; pi.pImageIndices = &idx;
@@ -589,6 +599,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkPresentTimesInfoGOOGLE pts = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi.pNext, 1, &pt };
     if (timing_id) pi.pNext = &pts;
     r = vkQueuePresentKHR(g.queue, &pi);
+    if (ft_b) { uint64_t pb, pe; dq_ft_call_span(&pb, &pe);   // 探针：vkQueuePresentKHR 真驱动调用起止（不含包装 drain）
+                s2a_ft_present(ticket, pb, pe, (int32_t)r); }
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {

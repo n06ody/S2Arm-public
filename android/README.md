@@ -752,6 +752,10 @@ python3 android/tools/game_apk.py --resources build/pack/<game> \
 出包链路（`pack/targets/android/package.py`）给 `--resources` 加 `--reuse-from <上一个已发布 release 的 resources/>`：上一包自己的 index 里与新包同路径、同大小、同 SHA-256 的**只读**文件改成硬链接，不再各写一份（ext4 没有 reflink，以前每个 release 的 `resources/` 都是一整份 RomFS）。链接后仍逐个核新包的 index；上一包不可用（读不出、与输出或输入重叠）、跨盘、链接被拒、文件可写或字节已变的，一律退回复制。所以同一台机器上相邻 release 的只读文件共享同一个 inode：别原地改 release 里的文件（先改权限再写会同时改到两个包），删哪个 release 都不影响另一个。
 
 构建后的设备部署统一用 `python3 android/tools/deploy_game.py --pack <完整源包> --apk <最终签名APK> --serial <设备> --mode direct`。
+
+要在正式包恢复已有进度，先关闭游戏，在游戏库选中目标游戏，打开设置面板的「导入存档备份」，用系统文件选择器选择 Mac 或 iPhone 导出的 `.s2asave`。核对检查结果再确认恢复，现有存档会先备份。
+
+QA 可在设备租约内给同一部署命令加 `--save-archive <备份.s2asave> --no-start`。应用完成恢复后，部署回执的 `saveImport` 包含标题号、恢复的文件数和字节数、以及相对于应用私有文件目录的备份位置。无旧存档时位置为空。确认回执后在游戏内选择继续，并验证预期的检查点场景。
 脚本冻结 APK、生成配套资源绑定、安装、导入并核对设备 APK 哈希，避免重编后反复出现 `artifact.apk.sha256` 不匹配。
 同资源版本仅更新 APK 时加 `--refresh-existing`，通过正常安装事务刷新绑定，无须重传 RomFS。
 已绑定的资源目录可改用 `--resources <目录>`；默认导入后启动并等待接受，`--no-start` 只导入。导入仅指定本次暂存目录。

@@ -114,7 +114,7 @@ function(s2a_android_nvk_sources output)
         native/gfx_plat/nvk_session.c native/gfx_plat/plat_nvn.c native/gfx_plat/plat_nvn_vk.c
         native/nvn/nvn_vsync_android.c native/nvn/nvn_vk_lifecycle.c native/nvn/poolahb_alias.c
         # 层外按名字要的两组：C# 的帧日志转储（AndroidGameRuntime）与通用后端的编译事件（S2ACompileEvents）
-        native/nvn/nvn_vk_frame_log.c native/nvn/nvn_vk_compile_events.c
+        native/nvn/nvn_vk_frame_log.c native/nvn/nvn_ft_probe.c native/nvn/nvn_vk_compile_events.c
         # 共用前端的纯逻辑件
         ../graphics/nvn/gfx/nvn/nvn_tex.c ../graphics/nvn/gfx/tex/nvn_deswizzle.c
         ../graphics/nvn/gfx/nvn/nvn_first_use.c
