@@ -41,6 +41,8 @@ namespace S2A.Audio.AAudio
         public ManualResetEvent GetUpdateRequiredEvent() => _updateRequiredEvent;
         public ManualResetEvent GetPauseEvent() => _pauseEvent;
 
+        public void S2AConfigureRenderThread() => AAudioSink.s2a_capacity_audio_enter();
+
         public bool SupportsDirection(Direction direction) => direction == Direction.Output;
         public bool SupportsSampleRate(uint sampleRate) => true;
         public bool SupportsSampleFormat(SampleFormat sampleFormat) => sampleFormat is SampleFormat.PcmInt16 or SampleFormat.PcmFloat;

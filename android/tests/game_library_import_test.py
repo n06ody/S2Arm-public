@@ -20,6 +20,8 @@ STUBS = {
 'android/net/Credentials.java': '''package android.net; public class Credentials { public int getUid() { return 0; } }''',
 'android/net/Uri.java': '''package android.net; public class Uri implements android.os.Parcelable { public static Uri parse(String s){return new Uri();} }''',
 'android/os/Build.java': '''package android.os; public class Build { public static class VERSION { public static int SDK_INT=34; } }''',
+'android/os/Process.java': '''package android.os; public class Process {
+ public static int myPid() {throw new AssertionError("save import unexpectedly called");} }''',
 'android/os/Environment.java': '''package android.os; public class Environment { public static boolean allFiles=true;
  public static boolean isExternalStorageManager(){return allFiles;} public static java.io.File getExternalStorageDirectory(){return new java.io.File("/storage/emulated/0");} }''',
 'android/Manifest.java': '''package android; public class Manifest { public static class permission { public static final String READ_EXTERNAL_STORAGE="android.permission.READ_EXTERNAL_STORAGE"; } }''',
@@ -40,6 +42,7 @@ STUBS = {
  public class Context { public static String packageName="fixture"; public static int flags; public final File root; public Context(File root){this.root=root;}
  public File getExternalFilesDir(String s){return new File(root,"external");} public File getFilesDir(){return new File(root,"internal");}
  public Context getApplicationContext(){return this;} public File getCacheDir(){return new File(root,"cache");}
+ public File getCodeCacheDir(){return new File(root,"code-cache");}
  public ContentResolver getContentResolver(){return new ContentResolver();} public PackageManager getPackageManager(){return new PackageManager();}
  public String getPackageName(){return packageName;} public ApplicationInfo getApplicationInfo(){ApplicationInfo a=new ApplicationInfo();a.flags=flags;return a;}
  public static final int MODE_PRIVATE=0; private static final java.util.Map<String,SharedPreferences> prefs=new java.util.HashMap<>();
@@ -57,7 +60,7 @@ STUBS = {
   };}
  } }''',
 'android/content/pm/ApplicationInfo.java': '''package android.content.pm; public class ApplicationInfo {
- public static final int FLAG_DEBUGGABLE=2; public int flags; public String sourceDir="fixture"; public String[] splitSourceDirs; }''',
+ public static final int FLAG_DEBUGGABLE=2; public int flags; public String sourceDir="fixture", nativeLibraryDir=""; public String[] splitSourceDirs; }''',
 'android/content/pm/PackageManager.java': '''package android.content.pm; public class PackageManager {
  public static final int GET_SIGNING_CERTIFICATES=1, PERMISSION_GRANTED=0; public PackageInfo getPackageInfo(String n,int f) throws NameNotFoundException {return new PackageInfo();}
  public static class NameNotFoundException extends Exception {} }''',
@@ -128,15 +131,21 @@ STUBS = {
  public Activity(){super(testRoot);} public void onCreate(Bundle b){} protected void onResume(){} protected void onNewIntent(Intent i){}
  protected void onActivityResult(int a,int b,Intent i){} protected void onSaveInstanceState(Bundle b){} protected void onDestroy(){} public Intent getIntent(){return intent;} public void setIntent(Intent i){intent=i;}
  public Resources getResources(){return new Resources();} public void setContentView(View v){} public void startActivityForResult(Intent i,int n){}
- public void startActivity(Intent i){} public void runOnUiThread(Runnable r){r.run();} public boolean isDestroyed(){return false;}
+ public void startActivity(Intent i){} public void runOnUiThread(Runnable r){r.run();} public boolean isDestroyed(){return false;} public boolean isFinishing(){return false;}
  public int checkSelfPermission(String p){return 0;} public void requestPermissions(String[] p,int r){} public void onRequestPermissionsResult(int r,String[] p,int[] g){} }''',
 'android/os/Looper.java': '''package android.os; public class Looper { public static Looper getMainLooper(){return new Looper();} }''',
 'android/os/Handler.java': '''package android.os; public class Handler { public Handler(Looper l){} public boolean postDelayed(Runnable r,long ms){return true;} }''',
-'android/content/DialogInterface.java': '''package android.content; public interface DialogInterface { interface OnClickListener { void onClick(DialogInterface d,int which); } }''',
+'android/content/DialogInterface.java': '''package android.content; public interface DialogInterface {
+ interface OnClickListener { void onClick(DialogInterface d,int which); }
+ interface OnDismissListener { void onDismiss(DialogInterface d); } }''',
 'android/app/AlertDialog.java': '''package android.app; import android.content.*;
- public class AlertDialog { public static class Builder { public Builder(Context c){}
+ public class AlertDialog {
+ public void setOnDismissListener(DialogInterface.OnDismissListener listener){throw new AssertionError("save dialog unexpectedly called");}
+ public void show(){throw new AssertionError("save dialog unexpectedly called");}
+ public static class Builder { public Builder(Context c){}
   public Builder setTitle(int id){return this;} public Builder setMessage(CharSequence m){return this;}
   public Builder setPositiveButton(int id,DialogInterface.OnClickListener l){return this;} public Builder setNegativeButton(int id,DialogInterface.OnClickListener l){return this;}
+  public AlertDialog create(){throw new AssertionError("save dialog unexpectedly called");}
   public AlertDialog show(){return new AlertDialog();} } }''',
 'org/s2arm/android/R.java': '''package org.s2arm.android; public class R { public static class string { public static final int import_game=1, fps_overlay_show=2, export_diagnostics=3, export_diagnostics_running=4, export_diagnostics_failed=5, export_diagnostics_done=6,
  library_game_starting=7, library_current_game=8, library_switch_title=9, library_switch_message=10, library_switch_confirm=11, library_switch_waiting=12, library_switch_timeout=13, library_launch_failed=14, library_switch_cancel=15, player_err_fmt=100, player_err_import=101, player_err_start=102, player_err_no_space=103, player_err_no_space_next=104, player_err_apk=105, player_err_apk_next=106, player_err_access=107, player_err_access_next=108, player_err_pack=109, player_err_pack_next=110, player_err_other=111, player_err_other_next=112, library_title=113, library_more=114, import_progress=115,
@@ -147,7 +156,15 @@ STUBS = {
  mods_title=142, mods_for_game=143, mods_no_game=144, mods_import_zip=145, mods_import_folder=146, mods_none=147, mods_item=148, mods_remove=149,
  mods_working=150, mods_imported=151, mods_failed=152, mods_err_not_archive=153, mods_err_too_many=154, mods_err_too_large=155, mods_err_no_romfs=156,
  mods_err_missing=157, mods_err_name_taken=158, mods_note_other_game=159, mods_note_exefs=160, mods_note_empty=161, mods_note=162,
- stall_off_note=163, stall_reopen=164, stall_reopen_failed=165, ldn_settings=166; } }''',
+ stall_off_note=163, stall_reopen=164, stall_reopen_failed=165, ldn_settings=166,
+ import_save=167, import_save_select_game=168, import_save_reading=169, import_save_summary=170,
+ import_save_confirm_title=171, import_save_confirm=172, import_save_access_failed=173, import_save_failed=174, import_save_done=175; } }''',
+'org/s2arm/android/NativeBridge.java': '''package org.s2arm.android; final class NativeBridge {
+ static RuntimeLibrary loaded(){throw new AssertionError("save import unexpectedly called");}
+ static void load(RuntimeLibrary runtime,String apk,String[] splits,String nativeDir) throws RuntimeLibrary.Rejected {
+  throw new AssertionError("save import unexpectedly called");}
+ static byte[] saveTransfer(byte[] request){throw new AssertionError("save service unexpectedly called");}
+ }''',
 'org/s2arm/android/AndroidLdnSettings.java': '''package org.s2arm.android; final class AndroidLdnSettings { static void show(android.app.Activity a) {throw new AssertionError("LDN settings unexpectedly called");} }''',
 # These unrelated app boundaries must never be called in an import test.
 'org/s2arm/android/DiagnosticExport.java': '''package org.s2arm.android; import android.content.Context; import java.io.IOException; import java.nio.file.Path;
