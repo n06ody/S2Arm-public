@@ -96,6 +96,7 @@ static int backend_init(void) {
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static int foreground, surface, stopping;
 static void *session;
+static _Atomic int session_active;
 static int32_t session_tid;
 static int64_t session_target;
 // One in-flight frame span: the sequence it belongs to, the CLOCK_MONOTONIC
@@ -110,6 +111,9 @@ static _Thread_local int32_t cached_tid;
 static uint64_t retry_at;
 static uint64_t property_checked;
 static int enabled = 1;
+int s2a_adpf_session_active(void) {
+    return atomic_load_explicit(&session_active, memory_order_relaxed);
+}
 static int enabled_locked(uint64_t now) {
     if (!property_checked || now < property_checked || now - property_checked >= 1000000000ULL) {
         int was = enabled;
@@ -123,6 +127,7 @@ static void clear_work_locked(void) {
     atomic_store_explicit(&pending_seq, 0, memory_order_release);
 }
 static void close_locked(void) {
+    atomic_store_explicit(&session_active, 0, memory_order_relaxed);
     if (session) { ADPF_LOG("[s2a-adpf] close tid=%d", session_tid); backend_close(session); }
     session = NULL; session_tid = 0; session_target = 0;
     clear_work_locked();
@@ -190,6 +195,7 @@ void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) {
         ADPF_LOG("[s2a-adpf] target_ns=%lld", (long long)target_ns);
     }
     if (backend_report(session, (int64_t)elapsed)) fail_locked(now);
+    else if (!s2a_adpf_session_active()) atomic_store_explicit(&session_active, 1, memory_order_relaxed);
     pthread_mutex_unlock(&mu);
 }
 void s2a_adpf_discard(void) { pthread_mutex_lock(&mu); clear_work_locked(); pthread_mutex_unlock(&mu); }
