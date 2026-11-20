@@ -72,7 +72,7 @@ S2A_VPX_EFF := $(if $(S2A_MAKE_DRY),1,$(shell DEVELOPER_DIR=$(DEVELOPER_DIR) S2A
 # 构建配置戳：S2A_CS / S2A_PGO_GEN / S2A_DAV1D 与 S2A_VPX（生效值）/ CC / CFLAGS 变了也要重编（先不带 C# 编、再带 C# 编之类）；内容不变就不改写，不触发重编
 HOST_CFG     := S2A_CS=$(S2A_CS) S2A_PGO_GEN=$(S2A_PGO_GEN) S2A_DAV1D=$(S2A_DAV1D_EFF) S2A_VPX=$(S2A_VPX_EFF) S2A_MAC_FRONTEND=$(S2A_MAC_FRONTEND) CC=$(CC) CFLAGS=$(CFLAGS)
 HOST_CFG_STAMP := $(BUILD)/.host_cfg
-$(shell mkdir -p $(BUILD); [ "$$(cat $(HOST_CFG_STAMP) 2>/dev/null)" = '$(HOST_CFG)' ] || printf '%s' '$(HOST_CFG)' > $(HOST_CFG_STAMP))
+$(shell mkdir -p "$(BUILD)"; [ "$$(cat "$(HOST_CFG_STAMP)" 2>/dev/null)" = '$(HOST_CFG)' ] || printf '%s' '$(HOST_CFG)' > "$(HOST_CFG_STAMP)")
 $(BUILD)/s2arm-host: $(HOST_SRCS) $(wildcard $(addsuffix *.h,$(sort $(dir $(HOST_SRCS)))) runtime/include/*.h) $(HOST_CFG_STAMP) Makefile $(wildcard */build.mk)
 
 .PHONY: host test clean

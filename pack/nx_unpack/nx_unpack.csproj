@@ -15,4 +15,18 @@
     <PackageReference Include="Ryujinx.LibHac" Version="0.21.0-alpha.133" />
     <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />   <!-- NCZ（nsz / xcz）的标准 zstd；NSO 的 ZBIC 段用自写的 ZbicDecoder.cs（11-04 换掉 ezhevita.ZstdSharp.Zbic） -->
   </ItemGroup>
+
+  <!-- NativeAOT's Unix target copies NativeLibrary into LinkerArg before the
+       project target runs. Quote the final linker arguments so repository
+       paths containing spaces remain one argument. -->
+  <Target Name="QuoteNativeAotLibraryPaths" AfterTargets="IlcCompile">
+    <ItemGroup>
+      <_S2AQuotedLinkerArg Include="@(LinkerArg->'&quot;%(Identity)&quot;')"
+                           Condition="$([System.String]::Copy('%(Identity)').StartsWith('/'))" />
+      <_S2APlainLinkerArg Include="@(LinkerArg)"
+                          Condition="!$([System.String]::Copy('%(Identity)').StartsWith('/'))" />
+      <LinkerArg Remove="@(LinkerArg)" />
+      <LinkerArg Include="@(_S2APlainLinkerArg);@(_S2AQuotedLinkerArg)" />
+    </ItemGroup>
+  </Target>
 </Project>

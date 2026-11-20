@@ -716,8 +716,9 @@ class JobsTests(unittest.TestCase):
         gdir = layout.find_game(self.c, "0100000000000000")
         self.assertEqual(Path(a[a.index("--out") + 1]), gdir / "build" / "ios")
         self.assertEqual((seen["env"]["S2A_PACK_PLAT"], seen["env"]["DOTNET_ROOT"]), ("ios", str(home)))
-        # 直连包与机型无关（一包通用 10-30）：不把目标架构 / 系统大版本交给出包
-        self.assertNotIn("S2A_PSO_ARCHS", seen["env"]); self.assertNotIn("S2A_PSO_OS", seen["env"])
+        # 直连包本身仍与机型无关（一包通用 10-30）；随包管线归档按架构出，目标设备认得出 GPU 架构就交给出包（ipa.pso_env），
+        #   别的机型装这个包照常能玩，只是首遇现编（11-20 维护者定）
+        self.assertEqual((seen["env"]["S2A_PSO_ARCHS"], seen["env"]["S2A_PSO_OS"]), ("applegpu_g17p", "26"))
         self.assertEqual(r["buildId"], "abc-123")
         image = gdir / "image" / "ios"
         self.assertEqual((r["ipa"], r["outputPath"]), ("", str(image)))   # 不再交付单款 ipa：装机时现组容器
@@ -1585,6 +1586,19 @@ class JobsTests(unittest.TestCase):
         self.assertEqual(identity, library.input_identity(self.game(packages=list(reversed(packages)))))
         packages[2]["sha256"] = "b" * 64
         self.assertNotEqual(identity, library.input_identity(game))
+
+    def test_duplicate_same_version_prefers_source_that_still_exists(self):
+        old_base = self.package(sha="a" * 64)
+        old_dlc = self.package("dlc", tid="0100000000001001", sha="b" * 64)
+        new_base = self.package(sha="c" * 64)
+        new_dlc = self.package("dlc", tid="0100000000001001", sha="d" * 64)
+        update = self.package("update", 1, sha="e" * 64)
+        for stale in (old_base, old_dlc):
+            stale["path"] = str(self.root / "moved-away.xci")
+
+        selected = library.selected_packages(self.game(packages=[old_base, old_dlc, new_base, new_dlc, update]))
+        self.assertEqual([p["sha256"] for p in selected], ["c" * 64, "e" * 64, "d" * 64])
+        self.assertEqual(library.requirements(self.c, self.game(packages=[old_base, old_dlc, new_base, new_dlc, update])), [])
 
     def test_catalog_marks_games_recorded_on_a_phone(self):
         # 删除确认框据 onPhone 多写一句「下次往这台手机装游戏时，手机上的这款会打不开」：哪台设备记录里有这款就是 True，没有的 False

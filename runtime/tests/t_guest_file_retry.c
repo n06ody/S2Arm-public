@@ -41,6 +41,13 @@ int main(void) {
     if (mprotect(q, N, PROT_READ | PROT_WRITE)) { printf("✗ t_guest_file_retry：放开 64 MB 失败\n"); return 1; }
     long long f0 = fp(); for (size_t i = 0; i < N; i += 64) q[i] = 1; long long df = fp() - f0;
     CHECK(df < (16ll << 20), "② 接上文件后窗口里写满 64 MB 实占 +%lld KB（期望 < 16384 KB）", df >> 10);
+    {   // ⑤ 补接的这局预算 0（Mac 起局剩余 0、没显式设）= 整段模式：心跳照写预算记录，B 记 0、Hmin 照记（下一局按它回升，vawin.c s2a_guest_budget_note）。期望记录「0 3000」
+        void s2a_guest_budget_note(uint64_t); int s2a_guest_budget_rec_read(uint64_t *, uint64_t *); char d[] = "/tmp/t_gfr_recXXXXXX", pk[300], rp[300];
+        if (!mkdtemp(d)) CHECK(0, "⑤ 建临时目录失败");
+        else { snprintf(pk, sizeof pk, "%s/mem_peak_anon", d); snprintf(rp, sizeof rp, "%s/anon_budget", d); setenv("S2A_GUEST_MEM_PEAK", pk, 1);
+            s2a_guest_budget_note(3000ull << 20); uint64_t rb = 1, rh = 0; int ok = s2a_guest_budget_rec_read(&rb, &rh);
+            CHECK(ok && rb == 0 && rh == (3000ull << 20), "⑤ 整段模式（预算 0、非显式）照写记录「%llu %llu」（期望 0 3000）", (unsigned long long)(rb >> 20), (unsigned long long)(rh >> 20));
+            unlink(rp); rmdir(d); unsetenv("S2A_GUEST_MEM_PEAK"); } }
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "③ 窗口里已有映射时补接：不换、照旧匿名（子进程退出码 %d，期望 0）", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
     printf("%s t_guest_file_retry：%d 项不符\n", bad ? "✗" : "✓", bad);
     return bad != 0;

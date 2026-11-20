@@ -3,14 +3,15 @@
 #include "gl_int.h"
 const char gl_slice_gl_buf = 1;   // 分片锚（gl_core.m 引用：静态链接时整片进来，见 gl_int.h「分片锚」）
 
-enum { GL_ARRAY_BUFFER = 0x8892, GL_ELEMENT_ARRAY_BUFFER = 0x8893, GL_UNIFORM_BUFFER = 0x8A11, GL_PIXEL_PACK_BUFFER = 0x88EB, GL_INVALID_ENUM = 0x0500, GL_INVALID_VALUE = 0x0501, GL_INVALID_OPERATION = 0x0502, GL_OUT_OF_MEMORY = 0x0505 };
+enum { GL_ARRAY_BUFFER = 0x8892, GL_ELEMENT_ARRAY_BUFFER = 0x8893, GL_UNIFORM_BUFFER = 0x8A11, GL_PIXEL_PACK_BUFFER = 0x88EB, GL_PIXEL_UNPACK_BUFFER = 0x88EC, GL_INVALID_ENUM = 0x0500, GL_INVALID_VALUE = 0x0501, GL_INVALID_OPERATION = 0x0502, GL_OUT_OF_MEMORY = 0x0505 };
 #define CTX(ret) do { if (!gl_cur) { GLRED1("%s：没有当前上下文", __func__); return ret; } } while (0)
 
 // 绑定目标 → gl_state.buf_bound 的序号（元素数组缓冲绑在顶点数组上，不在这里）
 //   像素打包缓冲（GL 2.1 / ES 3.0）：绑着它时 glReadPixels 的 data 是缓冲内偏移、读回写进缓冲（gl_fb.m）。D-WR8B Worms W.M.D：进战役时
 //   绑它 → glBufferStorage → glMapBufferRange 拿指针、两条工作线程往里写，原先三步都报「目标没实现」回空，线程写 0 / 0x800 崩。
-//   像素解包缓冲（0x88EC）要改所有纹理上传入口，没有游戏证据，不接
-static int buf_slot(GLenum target) { return target == GL_ARRAY_BUFFER ? 0 : target == GL_UNIFORM_BUFFER ? 1 : target == GL_PIXEL_PACK_BUFFER ? 2 : -1; }
+//   像素解包缓冲（0x88EC，GL 2.1 / ES 3.0）：绑着它时纹理上传（glTex(Sub)Image2D/3D、glCompressedTex(Sub)Image2D）的 data 是缓冲内偏移、像素从缓冲取（gl_tex.m）。
+//   D-W2MJ 白日梦的构想图（#1440）：绑 0x88EC → glMapBufferRange 写像素 → 从缓冲上传纹理，原先绑定 / 映射都报「目标没实现」，纹理一张没上，整屏黑
+static int buf_slot(GLenum target) { return target == GL_ARRAY_BUFFER ? 0 : target == GL_UNIFORM_BUFFER ? 1 : target == GL_PIXEL_PACK_BUFFER ? 2 : target == GL_PIXEL_UNPACK_BUFFER ? 3 : -1; }
 struct gl_vao *gl_vao_cur(void) {
     struct gl_vao *v = gl_name_get(&gl_vaos, gl_cur->vao);
     if (!v && !gl_cur->vao) {   // 顶点数组 0：兼容配置 / GLES 的缺省顶点数组，属于当前上下文（core 配置下用它是错误，但 GLES 3.x 允许）
@@ -52,6 +53,8 @@ static struct gl_buffer *bound(GLenum target) {
 }
 GLuint gl_pack_buffer_name(void) { return gl_cur->buf_bound[buf_slot(GL_PIXEL_PACK_BUFFER)]; }
 struct gl_buffer *gl_pack_buffer(void) { return bound(GL_PIXEL_PACK_BUFFER); }
+GLuint gl_unpack_buffer_name(void) { return gl_cur->buf_bound[buf_slot(GL_PIXEL_UNPACK_BUFFER)]; }
+struct gl_buffer *gl_unpack_buffer(void) { return bound(GL_PIXEL_UNPACK_BUFFER); }
 GLB(glBufferData, void, GLenum target, GLsizeiptr size, const void *data, GLenum usage) { @autoreleasepool {
     (void)usage; CTX();
     struct gl_buffer *b = bound(target); if (!b || b->storage) { gl_set_error(GL_INVALID_OPERATION); return; }   // 不可变存储不许 BufferData（GL 4.5 §6.2）

@@ -58,6 +58,7 @@ void s2a_window_get(uint64_t *b, uint64_t *s) { *b = *s = 0; } void s2a_window_t
 // #258 懒清零的桩：g_gfile=1 时把 [g_gfile_lo, g_gfile_hi) 当成文件后备窗口（没有文件后备时还页照旧换匿名占位）
 static int g_gfile; static uint64_t g_gfile_lo, g_gfile_hi;
 int s2a_guest_in_file(uint64_t a, uint64_t n) { return g_gfile && n && a >= g_gfile_lo && a + n <= g_gfile_hi; }
+void s2a_guest_commit(uint64_t a, uint64_t n) { (void)a; (void)n; }   // vawin.c 的桩：放开前按块定后备（文件后备溢出模式；本测不链 vawin.c）
 uint64_t s2a_module_span(const char *d) { (void)d; return 0; }   // 桩：模块跨度（loader.c；本单测不装模块）
 
 static int bad, checks;

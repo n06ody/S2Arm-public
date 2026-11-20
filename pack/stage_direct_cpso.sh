@@ -12,10 +12,7 @@
 #   Metal 4 归档；iPhone 包逐对 lzfse 压成 .mtl4archive.lzfse、Mac 包原样；另带一对首查预热 s2a_warm.*），
 #   设备混合管线首遇先查它（nvn_hybrid.inc hybrid_get），命中直接特化、不在设备上后台建基础管线。与计算管线同目标对、同一个缓存目录（store/cpso/：键带各自格式号，不会互相命中；直连缓存回收照样认得）、同一次提交；
 #   放同一段：输入（直连库 + 目标对 + metal-tt 版本）与产物目录都相同，分两段只多一份键和一次产物根提交。
-#   基础管线随包字节上限 = 原件大小 × 10%（base_pipelines.py BUDGET_FRAC，按组装填）。原件大小（进键）：
-#     启动器出包给的 S2A_SOURCE_BYTES = 玩家导入的原件文件总字节（游戏库 catalog 里所选原件导入时记的大小，按 sha256 去重；pack/jobs/space_rule.py source_file_bytes）；
-#     没给（一键出包 / 门禁刷新）→ 近似：现行根解开的 romfs + exefs + aoc 文件总字节（11-19 本机 9 款对登记表原件：0.73–1.07 倍，8 款在 0.89–1.07；
-#     偏小的是卡带镜像里的空白区，偏大的是 NSZ 压缩原件）；都拿不到（0）→ 基础管线一对不出、打黄，计算管线照出。
+#   plan 能出的对全部随包，不设体积上限（11-20 维护者：玩家玩着不卡更重要；原先原件 10% 预算见 graphics/tools/direct/base_pipelines.py 文件头）。
 # 不出：安卓（S2A_PACK_PLAT=android）、Vulkan / OpenGL / 运行时现编空库（没有 Metal 库容器 b-<链>/lib.idx）。
 set -u
 G=${1:?款}; H=$(cd "$(dirname "$0")" && pwd); R=$(cd "$H/.." && pwd); source "$H/roots.sh"; source "$H/stage_keyfiles.sh"; source "$H/srcs.sh"; stage_deps_on || exit 1; SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -40,17 +37,7 @@ ARCHS=$(awk -F'\t' -v v="$OSV" '$2 == v { print $1 }' <<< "$PAIRS" | sort -u | t
 OTHER=$(cut -f2 <<< "$PAIRS" | sort -nu | grep -vx "$OSV" | tr '\n' ' '); OTHER=${OTHER% }
 [ -n "$OSV" ] && [ -n "$ARCHS" ] || soft "目标对是空的"
 KT=$(stage_files_key direct_cpso "$R") || exit 1
-ORIG=${S2A_SOURCE_BYTES:-}; OSRC=原件文件
-[ -n "$ORIG" ] && [ -z "${ORIG//[0-9]/}" ] && [ "$ORIG" -gt 0 ] 2> /dev/null || { OSRC='近似：解开的 romfs+exefs+aoc'; ORIG=$("$PY" -c '
-import os, sys
-n = 0
-for top in sys.argv[1:]:
-    for d, _, fs in os.walk(os.path.realpath(top)):
-        for f in fs:
-            try: n += os.lstat(os.path.join(d, f)).st_size
-            except OSError: pass
-print(n)' "$CUR/romfs" "$CUR/exefs" "$CUR/aoc") || ORIG=0; }
-K=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$(cat "$CUR/.stage_direct" 2> /dev/null)" "$PLAT $OSV $ARCHS" "$TTV" "$KT" "$(cat "$D/pso_manifest.tsv" "$D/shader_pairs.tsv" 2> /dev/null | shasum -a 256 | cut -c1-16)" "$ORIG $OSRC" | shasum -a 256 | cut -c1-16)   # 种子表与配对表进键：基础管线的对取自两者之并（base_pipelines.py read_pairs），换了这一段要重出；原件大小进键：预算随它变
+K=$(printf '%s\n%s\n%s\n%s\n%s\n' "$(cat "$CUR/.stage_direct" 2> /dev/null)" "$PLAT $OSV $ARCHS" "$TTV" "$KT" "$(cat "$D/pso_manifest.tsv" "$D/shader_pairs.tsv" 2> /dev/null | shasum -a 256 | cut -c1-16)" | shasum -a 256 | cut -c1-16)   # 种子表与配对表进键：基础管线的对取自两者之并（base_pipelines.py read_pairs），换了这一段要重出；原件大小进键：预算随它变
 KB=$K; K=$(stage_deps_key "$CUR" direct_cpso "$KB" "$SELF") || exit 1
 root_stage_done "$CUR" direct_cpso "$K" && { echo "🟢 $G 现行已是计算管线归档 ${K}，跳过"; exit 0; }
 TID=$(prog_id "$CUR")
@@ -59,7 +46,7 @@ TAG=$(root_tag "$G" "cp-${K:0:8}"); W=$(root_begin "$G" "$TAG") || exit 1
 P=$W/shaders/direct/pipelines; rm -rf "$P"
 o=$("$PY" "$R/graphics/tools/direct/cs_pipelines.py" "$W/shaders/direct" "$P" --plat "$PLAT" --os "$OSV" $(printf -- '--arch %s ' $ARCHS) --cache "$C/store/cpso" -j "${J:-$(getconf _NPROCESSORS_ONLN)}" 2>&1); rc=$?
 if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then root_abort "$G" "$TAG"; soft "cs_pipelines.py 退出 ${rc}：$(tail -1 <<< "$o" | cut -c1-200)"; fi
-ob=$("$PY" "$R/graphics/tools/direct/base_pipelines.py" "$W/shaders/direct" "$P" --plat "$PLAT" --os "$OSV" $(printf -- '--arch %s ' $ARCHS) --orig-bytes "$ORIG" --orig-src "$OSRC" --cache "$C/store/cpso" -j "${J:-$(getconf _NPROCESSORS_ONLN)}" 2>&1); rb=$?
+ob=$("$PY" "$R/graphics/tools/direct/base_pipelines.py" "$W/shaders/direct" "$P" --plat "$PLAT" --os "$OSV" $(printf -- '--arch %s ' $ARCHS) --cache "$C/store/cpso" -j "${J:-$(getconf _NPROCESSORS_ONLN)}" 2>&1); rb=$?
 if [ "$rb" != 0 ] && [ "$rb" != 3 ]; then root_abort "$G" "$TAG"; soft "base_pipelines.py 退出 ${rb}：$(tail -1 <<< "$ob" | cut -c1-200)"; fi
 NOTE=; [ "$rc" = 3 ] && NOTE="；🟡 有支没编成，照旧首遇现编（$(grep -c '^【黄】计算管线' <<< "$o") 条示例见日志）"
 [ "$rb" = 3 ] && NOTE="${NOTE}；🟡 有对的拉取基础管线没编成，照旧设备后台建（$(grep -c '^【黄】拉取基础管线' <<< "$ob") 条示例见日志）"

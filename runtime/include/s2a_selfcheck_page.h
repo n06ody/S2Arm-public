@@ -6,11 +6,11 @@
 // 没签「提高内存上限」权限 → 重装
 #define S2A_SELFCHECK_ENT_TITLE    "安装少了一项必要权限"
 #define S2A_SELFCHECK_ENT_TITLE_EN "A required permission is missing"
-#define S2A_SELFCHECK_ENT_BODY     "这款游戏要用「提高内存上限」权限。请用 电脑上的 S2Arm 对这款游戏点「装到 iPhone」重新装一次，会自动带上它。"
-#define S2A_SELFCHECK_ENT_BODY_EN  "This game needs the \"Increased Memory Limit\" permission. In S2Arm on your computer, click \"Install on iPhone\" for this game again; it will be included automatically."
+#define S2A_SELFCHECK_ENT_BODY     "这款游戏要用「提高内存上限」权限。请用 电脑上的 S2Arm 点游戏库第一格「S2Arm」里的「续签 S2Arm」重新装一次，会自动带上它。"
+#define S2A_SELFCHECK_ENT_BODY_EN  "This game needs the \"Increased Memory Limit\" permission. In S2Arm on your computer, click \"Renew S2Arm\" on the S2Arm card first in the library; it will be included automatically."
 // 地址窗口占到、只是内存上限不够（没签权限）→ 让玩家自己选：先试着玩，或重装补权限（v0.3.1 装机原则：认得出的风险让玩家确认，不替他拒）
-#define S2A_SELFCHECK_MEM_BODY     "这次安装没带上「提高内存上限」权限，系统给 S2Arm 的内存偏少。可以先点「仍要启动」试着玩，大游戏可能玩到一半被系统结束；想彻底解决，请用 电脑上的 S2Arm 对这款游戏点「装到 iPhone」重新装一次，会自动带上它。"
-#define S2A_SELFCHECK_MEM_BODY_EN  "This install is missing the \"Increased Memory Limit\" permission, so iOS gives S2Arm less memory. You can tap \"Start Anyway\" to try it; large games may be closed by iOS mid-play. To fix it for good, click \"Install on iPhone\" for this game again in S2Arm on your computer; the permission will be included automatically."
+#define S2A_SELFCHECK_MEM_BODY     "这次安装没带上「提高内存上限」权限，系统给 S2Arm 的内存偏少。可以先点「仍要启动」试着玩，大游戏可能玩到一半被系统结束；想彻底解决，请用 电脑上的 S2Arm 点游戏库第一格「S2Arm」里的「续签 S2Arm」重新装一次，会自动带上它。"
+#define S2A_SELFCHECK_MEM_BODY_EN  "This install is missing the \"Increased Memory Limit\" permission, so iOS gives S2Arm less memory. You can tap \"Start Anyway\" to try it; large games may be closed by iOS mid-play. To fix it for good, click \"Renew S2Arm\" on the S2Arm card first in the library in S2Arm on your computer; the permission will be included automatically."
 #define S2A_SELFCHECK_GO           "仍要启动"
 #define S2A_SELFCHECK_GO_EN        "Start Anyway"
 // 读不到本款要多大地址（包不完整）→ 重装补资源

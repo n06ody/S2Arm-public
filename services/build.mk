@@ -57,7 +57,7 @@ HOST_LIBS += $(S2A_OPUS_LIB)
 #   （10-31 直连线帧回放实测：改回 WidenSession.cs 后 make 秒过、宿主仍是带实验开关的旧库）。库路径进戳文件（路径变了才改写），宿主依赖它；
 #   不进 .host_cfg：那份戳所有目标文件都依赖，C# 一改会把全部 C 代码重编
 S2A_CS_LIB_STAMP := $(BUILD)/.cs_lib
-$(shell mkdir -p $(BUILD); [ "$$(cat $(S2A_CS_LIB_STAMP) 2>/dev/null)" = '$(S2A_CS_LIB)' ] || printf '%s' '$(S2A_CS_LIB)' > $(S2A_CS_LIB_STAMP))
+$(shell mkdir -p "$(BUILD)"; [ "$$(cat "$(S2A_CS_LIB_STAMP)" 2>/dev/null)" = '$(S2A_CS_LIB)' ] || printf '%s' '$(S2A_CS_LIB)' > "$(S2A_CS_LIB_STAMP)")
 $(BUILD)/s2arm-host: $(S2A_CS_LIB) $(S2A_CS_LIB_STAMP)
 endif
 endif

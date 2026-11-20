@@ -22,6 +22,7 @@ static uint64_t g_lin;   // 线性影子基址（0 = 分块）：影子 = g_lin 
 static uint64_t g_ov_used;   // 堆区装不下后从宿主任意空闲地址分的影子（目录存的是每块差值，影子块放哪都成立；不占堆区，不影响 s2a_far_floor）
 __attribute__((weak)) uint64_t s2a_mem_heap_end(void) { return 0; }   // svc_mem.c；只链本文件的单测没有堆
 __attribute__((weak)) int s2a_guest_map_fixed(uint64_t a, uint64_t len) { (void)a; (void)len; return 1; }   // vawin.c：线性影子块走文件后备（1 = 没开文件后备）
+__attribute__((weak)) void s2a_guest_commit(uint64_t a, uint64_t len) { (void)a; (void)len; }   // vawin.c：堆区影子在窗口里，放开前按块定后备（文件后备溢出模式）；窗口外的不管
 // 每 2 MiB 游戏块一项「影子 − 游戏」的差值：0 = 没分块（影子在窗口前段、远端在窗口之外，差值不可能为 0）。
 //   改写器的翻译跳板（runtime/rewriter，S2A_FAR_TSV 列的点）与缺页代执行查同一张表：s2a_far_desc = {远端起点, 目录}
 static _Atomic int64_t *g_dir;
@@ -176,6 +177,7 @@ int s2a_far_map(uint64_t a, uint64_t n) {
     far_run *rv = NULL; int rm = 0;   // 已分块里的页：先记原保护，再逐段放开；中途放不开退回已改的段
     if (old_runs(a, n, &rv, &rm)) { pthread_mutex_unlock(&g_mu); LOG("【红】远端：取不到已分块影子页的原保护（游戏 %#llx +%#llx），不改", (unsigned long long)a, (unsigned long long)n); return -1; }
     for (int r = 0; r < rm; r++) {
+        if (rv[r].prot != (PROT_READ | PROT_WRITE)) s2a_guest_commit(rv[r].h, rv[r].n);   // 还回过的影子页（窗口里的块多半已定，不加锁直接回）
         if (rv[r].prot == (PROT_READ | PROT_WRITE) || !mprotect((void *)(uintptr_t)rv[r].h, rv[r].n, PROT_READ | PROT_WRITE)) continue;
         int e = errno; runs_undo(rv, r); free(rv); pthread_mutex_unlock(&g_mu);
         LOG("【红】远端：已分块影子页放不开（游戏 %#llx +%#llx，errno=%d），已改的 %d 段退回原保护", (unsigned long long)a, (unsigned long long)n, e, r);
@@ -208,6 +210,7 @@ int s2a_far_map(uint64_t a, uint64_t n) {
         for (uint64_t i = i0, j = 0; i <= i1; i++) {   // 新块里请求覆盖的页（块内连续）
             if (atomic_load(&g_dir[i])) continue;
             uint64_t cb = g_lo + i * CHUNK, lo = a > cb ? a : cb, hi = a + n < cb + CHUNK ? a + n : cb + CHUNK;
+            if (!ov) s2a_guest_commit(at + j * CHUNK + (lo - cb), hi - lo);   // 堆区影子在窗口里（宿主任意地址分的那种已按文件后备映射，见上）
             if (mprotect((void *)(uintptr_t)(at + j++ * CHUNK + (lo - cb)), hi - lo, PROT_READ | PROT_WRITE)) {
                 int e = errno;
                 if (ov) { munmap((void *)(uintptr_t)at, k * CHUNK); g_ov_used -= k * CHUNK; }

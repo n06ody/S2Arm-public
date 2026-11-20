@@ -497,7 +497,7 @@ nvnSyncInitialize	语义	已做	是	是
 nvnSyncFinalize	语义	已做	是	是	
 nvnSyncSetDebugLabel	语义	已做	是	是	
 nvnQueueFenceSync	语义	已做	是	是	
-nvnSyncWait	语义	已做	是	是	从未被栅栏过的同步对象（Seq=-1）：我方返回 0（ALREADY_SIGNALED）；直连层返回 TIMEOUT_EXPIRED(2)。已栅栏的两边一致（先判已到返回 0，否则等，到 1 / 超时 2）（高（差异确定，影响小））
+nvnSyncWait	语义	已做	是	是	从未被栅栏过的同步对象：返回 FAILED(3)，同真机驱动（nvnSyncInitialize 置类型 0，nvnSyncWait 类型 0 返回 3；11-19 改，原回 0 致 #343862）。已栅栏的两边一致（先判已到返回 0，否则等，到 1 / 超时 2）（高（差异确定，影响小））
 nvnQueueWaitSync	语义	已做	是	是	
 nvnSyncInitializeFromFencedGLSync	红	已做	是	是	11-01 补：GL 栅栏（GL 层共享事件 + 提交序号）转 NVN 同步对象，nvnQueueWaitSync 在 GPU 上跨队列等、nvnSyncWait 在 CPU 上等（t_nvn_glsync）
 nvnSyncCreateGLSync	红	已做	是	是	11-01 补：NVN 栅栏（NVN 提交共享事件 + 栅栏号）转 GL 同步对象，glWaitSync 在 GPU 上跨队列等、glClientWaitSync 在 CPU 上等（t_nvn_glsync）

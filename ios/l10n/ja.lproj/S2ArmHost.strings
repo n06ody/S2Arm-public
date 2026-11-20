@@ -342,7 +342,7 @@
 "diag.error.zip" = "バンドルを作成できませんでした(zip の書き込みに失敗しました。iPhone の空き容量が不足している可能性があります)";
 "diag.export" = "診断パッケージをエクスポート";
 "diag.prompt.abnormalExit" = "前回 S2Arm が正常に終了しませんでした(クラッシュ、フリーズ、またはシステムによる終了)";
-"diag.prompt.imlLost" = "前回 S2Arm が正常に終了しませんでした。このインストールは「メモリ上限の引き上げ」権限を失っているため、大容量ゲームが終了したのはおそらくメモリ不足です。S2Arm をインストールした方法に合わせて付け直してください：\n· パソコンの S2Arm（無料・有料の Apple ID）：このゲームの「iPhone にインストール」を押して再インストールします。その後もこの案内が出る場合は、下の GetMoreRam で権限を追加してから、もう一度「iPhone にインストール」を押してください。\n· 自分の開発者証明書（.p12 + プロビジョニングプロファイル）：Apple Developer サイトで S2Arm の App ID（Apple が App ごとに登録する識別情報）の「Increased Memory Limit」をオンにし、プロファイルを作り直して、新しいプロファイルで署名し直してインストールします。\n· AltStore：AltStore Classic 2.2 以降で再インストールします（更新ではありません）。\n· SideStore 0.7.0：署名でこの権限が外れます。下の GetMoreRam で追加してから、SideStore で再インストールしてください。\n· Sideloadly：現在は非対応です。無料アカウントでこの権限が保たれるとは案内されておらず、カスタム権限には有料の Apple Developer アカウントが必要です。\n· GetMoreRam：S2Arm と同じ Apple ID で自分で署名してインストールし（無料アカウントの App 枠を 1 つ使います。使い終わったら削除してかまいません）、サインインして App IDs を開き、更新をタップ、S2Arm を選んで「Add Increased Memory Limit」をタップし、元の方法で S2Arm を再インストールします。";
+"diag.prompt.imlLost" = "前回 S2Arm が正常に終了しませんでした。このインストールは「メモリ上限の引き上げ」権限を失っているため、大容量ゲームが終了したのはおそらくメモリ不足です。S2Arm をインストールした方法に合わせて付け直してください：\n· パソコンの S2Arm（無料・有料の Apple ID）：ライブラリ先頭の「S2Arm」タイルの「S2Arm を再署名」を押して再インストールします。その後もこの案内が出る場合は、下の GetMoreRam で権限を追加してから、もう一度「S2Arm を再署名」を押してください。\n· 自分の開発者証明書（.p12 + プロビジョニングプロファイル）：Apple Developer サイトで S2Arm の App ID（Apple が App ごとに登録する識別情報）の「Increased Memory Limit」をオンにし、プロファイルを作り直して、新しいプロファイルで署名し直してインストールします。\n· AltStore：AltStore Classic 2.2 以降で再インストールします（更新ではありません）。\n· SideStore 0.7.0：署名でこの権限が外れます。下の GetMoreRam で追加してから、SideStore で再インストールしてください。\n· Sideloadly：現在は非対応です。無料アカウントでこの権限が保たれるとは案内されておらず、カスタム権限には有料の Apple Developer アカウントが必要です。\n· GetMoreRam：S2Arm と同じ Apple ID で自分で署名してインストールし（無料アカウントの App 枠を 1 つ使います。使い終わったら削除してかまいません）、サインインして App IDs を開き、更新をタップ、S2Arm を選んで「Add Increased Memory Limit」をタップし、元の方法で S2Arm を再インストールします。";
 "diag.prompt.crash" = "システムは前回 S2Arm がクラッシュまたはフリーズしたと報告しています";
 "diag.prompt.message" = "%@。実行ログ、クラッシュレポート、ゲームが使用したグラフィックスパイプラインのリスト(シェーダー ID のみ)をアップロードします(セーブデータ、キー、ゲームファイルは含まれません)。短いコードが発行されます。";
 "diag.prompt.no" = "結構です";
@@ -366,7 +366,7 @@
 "diag.report.placeholder" = "必須：どのゲーム・何をした・何が起きた";
 "diag.upload.post" = "GitHub に投稿";
 "diag.upload.retry" = "再試行";
-"dprompt.expiry.body" = "残り時間：%@。期限が切れるとゲームは起動できなくなりますが、セーブデータは安全です。iPhone を接続して「iPhone にインストール」を再度クリックするか、AltStore で更新してください。";
+"dprompt.expiry.body" = "残り時間：%@。期限が切れるとゲームは起動できなくなりますが、セーブデータは安全です。iPhone を接続してパソコンのライブラリ先頭の「S2Arm」タイルの「S2Arm を再署名」をクリックするか、AltStore で更新してください。";
 "dprompt.expiry.hours" = "約 %d 時間";
 "dprompt.expiry.lessThanHour" = "1 時間未満";
 "dprompt.expiry.title" = "署名の有効期限が近づいています";
@@ -393,7 +393,7 @@
 "gfx.fpsLimit" = "フレームレート上限";
 "gfx.fpsLimit.none" = "無制限";
 "gfx.resolution" = "レンダリング解像度";
-"iml.lost.body" = "大容量ゲームはメモリ不足で終了したり遅くなったりする可能性があります。S2Arm をインストールした方法に合わせて付け直してください：\n· パソコンの S2Arm（無料・有料の Apple ID）：このゲームの「iPhone にインストール」を押して再インストールします。その後もこの案内が出る場合は、下の GetMoreRam で権限を追加してから、もう一度「iPhone にインストール」を押してください。\n· 自分の開発者証明書（.p12 + プロビジョニングプロファイル）：Apple Developer サイトで S2Arm の App ID（Apple が App ごとに登録する識別情報）の「Increased Memory Limit」をオンにし、プロファイルを作り直して、新しいプロファイルで署名し直してインストールします。\n· AltStore：AltStore Classic 2.2 以降で再インストールします（更新ではありません）。\n· SideStore 0.7.0：署名でこの権限が外れます。下の GetMoreRam で追加してから、SideStore で再インストールしてください。\n· Sideloadly：現在は非対応です。無料アカウントでこの権限が保たれるとは案内されておらず、カスタム権限には有料の Apple Developer アカウントが必要です。\n· GetMoreRam：S2Arm と同じ Apple ID で自分で署名してインストールし（無料アカウントの App 枠を 1 つ使います。使い終わったら削除してかまいません）、サインインして App IDs を開き、更新をタップ、S2Arm を選んで「Add Increased Memory Limit」をタップし、元の方法で S2Arm を再インストールします。";
+"iml.lost.body" = "大容量ゲームはメモリ不足で終了したり遅くなったりする可能性があります。S2Arm をインストールした方法に合わせて付け直してください：\n· パソコンの S2Arm（無料・有料の Apple ID）：ライブラリ先頭の「S2Arm」タイルの「S2Arm を再署名」を押して再インストールします。その後もこの案内が出る場合は、下の GetMoreRam で権限を追加してから、もう一度「S2Arm を再署名」を押してください。\n· 自分の開発者証明書（.p12 + プロビジョニングプロファイル）：Apple Developer サイトで S2Arm の App ID（Apple が App ごとに登録する識別情報）の「Increased Memory Limit」をオンにし、プロファイルを作り直して、新しいプロファイルで署名し直してインストールします。\n· AltStore：AltStore Classic 2.2 以降で再インストールします（更新ではありません）。\n· SideStore 0.7.0：署名でこの権限が外れます。下の GetMoreRam で追加してから、SideStore で再インストールしてください。\n· Sideloadly：現在は非対応です。無料アカウントでこの権限が保たれるとは案内されておらず、カスタム権限には有料の Apple Developer アカウントが必要です。\n· GetMoreRam：S2Arm と同じ Apple ID で自分で署名してインストールし（無料アカウントの App 枠を 1 つ使います。使い終わったら削除してかまいません）、サインインして App IDs を開き、更新をタップ、S2Arm を選んで「Add Increased Memory Limit」をタップし、元の方法で S2Arm を再インストールします。";
 "iml.lost.short" = "大容量ゲームはメモリ不足で終了することがあります。「詳しく見る」で、この権限を付けて署名し直す方法を確認できます。";
 "iml.lost.title" = "このインストールは「メモリ上限の引き上げ」権限を失いました";
 "lan.denied.later" = "後で";

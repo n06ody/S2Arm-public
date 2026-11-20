@@ -8,7 +8,7 @@ import contextlib
 from copy import deepcopy
 import errno
 import filelock
-from space_rule import pack_direct_bytes, pack_input_bytes, pack_need_bytes, selected_packages, source_file_bytes   # 出包空间规则的唯一定义（剃刀 H11）
+from space_rule import pack_direct_bytes, pack_input_bytes, pack_need_bytes, selected_packages   # 出包空间规则的唯一定义（剃刀 H11）
 import hashlib
 import io
 import json

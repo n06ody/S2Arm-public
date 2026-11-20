@@ -23,5 +23,6 @@ void s2a_heartbeat_mac(void) {
     LOG("[心跳] 帧 %llu，进程实占 %llu MB，近 %.0f 秒出帧 %llu（%.1f 帧/秒）、%s（客体内存文件后备 %s）", (unsigned long long)f, fp, sec,
         (unsigned long long)(have && f >= lf ? f - lf : 0), sec > 0 && f >= lf ? (double)(f - lf) / sec : 0.0, iob, s2a_guest_fd() >= 0 ? "开" : "关");
     lf = f; lt = t; if (io) { lr = rd; lw = wr; lp = pi; } have = 1;
+    { void s2a_guest_backing_log(void); s2a_guest_backing_log(); }   // vawin.c：文件后备开着时报匿名块 / 文件块各多少（溢出模式，没开不打）
     s2a_energy_log();
 }

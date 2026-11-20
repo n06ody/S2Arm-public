@@ -54,6 +54,10 @@
 //   原先三步都报「目标没实现」回空，线程写地址 0 / 0x800 崩）。期望按 GL 4.5 §6 / §18.2：绑定、建存储、查 PIXEL_PACK_BUFFER_BINDING = 绑的名字；
 //   绑着时 glReadPixels 的 data 是缓冲内偏移：清除成绿后读 4×4 到偏移 16，映射偏移 16 起 64 字节读回 16 个像素都是 0 255 0 255、偏移 0..15 保持建存储时的 0xAB；
 //   放不下（偏移 + 64 > 大小）、缓冲映射着（非持久）→ INVALID_OPERATION；解绑后 glReadPixels 照旧写客户端内存（读到绿）
+// U 像素解包缓冲（D-W2MJ 白日梦的构想图，#1440：绑 GL_PIXEL_UNPACK_BUFFER → glMapBufferRange 写像素 → 从缓冲上传纹理，原先绑定 / 映射都报「目标没实现」、
+//   纹理没上、整屏黑）。期望按 GL 4.5 §8.4.4.1 / ES 3.0 §3.7.1：绑定无错、PIXEL_UNPACK_BUFFER_BINDING = 绑的名字；96 字节缓冲偏移 0..15 填 0xAB、16..79 填 16 个红像素，
+//   glTexImage2D(4×4 RGBA8, data = 偏移 16) 后纹理当附件读回 (1,1)、(3,3) 都是红；映射偏移 80 起 16 字节写 4 个绿像素，glTexSubImage2D(2×2 于 (0,0), data = 偏移 80) 后
+//   (0,0)、(1,1) 绿、(3,3) 仍红；偏移 40 上传 4×4（40 + 64 > 96）、缓冲映射着（非持久）上传 → INVALID_OPERATION 且纹理不变；解绑后 glTexSubImage2D 照旧读客户端内存（(0,0) 变蓝）
 #include "../../gfx/gl/gl_int.h"
 #include <pthread.h>
 #include <dispatch/dispatch.h>
@@ -708,6 +712,31 @@ static void t_pack_buffer(void) {
     glDeleteBuffers(1, &pb); glBindFramebuffer(0x8D40, 0); glDeleteFramebuffers(1, &fb);
 }
 
+static void t_unpack_buffer(void) {
+    printf("U 像素解包缓冲\n");
+    G(glMapBufferRange, void *, GLenum, GLintptr, GLsizeiptr, GLbitfield) G(glUnmapBuffer, GLboolean, GLenum)
+    G(glTexSubImage2D, void, GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)
+    uint8_t init[96]; memset(init, 0xAB, 16); for (int i = 0; i < 16; i++) { init[16 + i * 4] = 255; init[17 + i * 4] = 0; init[18 + i * 4] = 0; init[19 + i * 4] = 255; } memset(init + 80, 0, 16);
+    GLuint ub = 0; glGenBuffers(1, &ub); glBindBuffer(0x88EC, ub); GLenum e_bind = glGetError(); GLint got = -1; glGetIntegerv(0x88EF, &got);
+    glBufferData(0x88EC, sizeof init, init, 0x88E4); GLenum e_data = glGetError();
+    CHECK(e_bind == 0 && e_data == 0 && got == (GLint)ub, "绑定 / 建存储无错（%#x / %#x）、PIXEL_UNPACK_BUFFER_BINDING = %d（期望 %u）", e_bind, e_data, got, ub);
+    GLuint fb, tex; glGenFramebuffers(1, &fb); glBindFramebuffer(0x8D40, fb); glGenTextures(1, &tex); glBindTexture(0x0DE1, tex);
+    glTexImage2D(0x0DE1, 0, 0x8058, 4, 4, 0, 0x1908, 0x1401, (const void *)16); GLenum e_img = glGetError();
+    glFramebufferTexture2D(0x8D40, 0x8CE0, 0x0DE1, tex, 0); char a[20], b[20]; pxs(1, 1, a); pxs(3, 3, b);
+    CHECK(e_img == 0 && px_is(1, 1, 255, 0, 0, 255) && px_is(3, 3, 255, 0, 0, 255), "glTexImage2D 从偏移 16 取像素：(1,1) %s、(3,3) %s（期望都是 255 0 0 255，错 %#x）", a, b, e_img);
+    uint8_t *m = glMapBufferRange(0x88EC, 80, 16, 2); if (m) for (int i = 0; i < 4; i++) { m[i * 4] = 0; m[i * 4 + 1] = 255; m[i * 4 + 2] = 0; m[i * 4 + 3] = 255; }
+    glUnmapBuffer(0x88EC); GLenum e_map = glGetError();
+    glTexSubImage2D(0x0DE1, 0, 0, 0, 2, 2, 0x1908, 0x1401, (const void *)80); GLenum e_sub = glGetError(); char c[20]; pxs(0, 0, a); pxs(1, 1, b); pxs(3, 3, c);
+    CHECK(m && e_map == 0 && e_sub == 0 && px_is(0, 0, 0, 255, 0, 255) && px_is(1, 1, 0, 255, 0, 255) && px_is(3, 3, 255, 0, 0, 255),
+          "映射写绿（%s）后 glTexSubImage2D 从偏移 80 取：(0,0) %s、(1,1) %s 期望绿，(3,3) %s 期望仍红（错 %#x / %#x）", m ? "映射成" : "映射回空", a, b, c, e_map, e_sub);
+    glTexSubImage2D(0x0DE1, 0, 0, 0, 4, 4, 0x1908, 0x1401, (const void *)40); GLenum e_over = glGetError();
+    glMapBufferRange(0x88EC, 0, 16, 1); glTexSubImage2D(0x0DE1, 0, 0, 0, 1, 1, 0x1908, 0x1401, (const void *)16); GLenum e_mapped = glGetError(); glUnmapBuffer(0x88EC); pxs(0, 0, a);
+    CHECK(e_over == INVALID_OPERATION && e_mapped == INVALID_OPERATION && px_is(0, 0, 0, 255, 0, 255), "偏移 40 + 64 > 96 → INVALID_OPERATION（%#x）；映射着上传 → INVALID_OPERATION（%#x）；纹理不变 (0,0) %s", e_over, e_mapped, a);
+    glBindBuffer(0x88EC, 0); const uint8_t blue[4] = {0, 0, 255, 255}; glTexSubImage2D(0x0DE1, 0, 0, 0, 1, 1, 0x1908, 0x1401, blue); GLenum e_cli = glGetError(); pxs(0, 0, a);
+    CHECK(e_cli == 0 && px_is(0, 0, 0, 0, 255, 255), "解绑后 glTexSubImage2D 读客户端内存：(0,0) %s（期望 0 0 255 255，错 %#x）", a, e_cli);
+    glDeleteBuffers(1, &ub); glBindFramebuffer(0x8D40, 0); glDeleteFramebuffers(1, &fb); glDeleteTextures(1, &tex);
+}
+
 // ---------- O GLSL ES 3.00 程序 ----------
 static void t_es300(void) {
     printf("O GLSL ES 3.00 程序\n");
@@ -945,6 +974,6 @@ int main(void) { alarm(120); @autoreleasepool {
     g_sf = eglCreateWindowSurface(g_dpy, cfg, NULL, NULL); EGLContext ctx = eglCreateContext(g_dpy, cfg, NULL, ctx_attr);
     if (!eglMakeCurrent(g_dpy, g_sf, g_sf, ctx)) { printf("✗ 建上下文失败\n"); return 1; }
     g_tri = program("tri"); glGenVertexArrays(1, &g_tri_vao); glGenBuffers(1, &g_tri_vbo);
-    t_queries(); t_sync(); t_readback(); t_fb_query(); t_volume(); t_msaa(); t_map(); t_instanced(); t_packed_attr(); t_raster_read(); t_uniforms(); t_names_programs(); t_threads(); t_frame_storage(); t_core_stub(); t_tex_storage3d(); t_tex_swizzle(); t_bool_uniform(); t_api_version(); t_egl_current(); t_map_range(); t_pack_buffer(); t_es300(); t_sampler_array(); t_shader_iv(); t_love();
+    t_queries(); t_sync(); t_readback(); t_fb_query(); t_volume(); t_msaa(); t_map(); t_instanced(); t_packed_attr(); t_raster_read(); t_uniforms(); t_names_programs(); t_threads(); t_frame_storage(); t_core_stub(); t_tex_storage3d(); t_tex_swizzle(); t_bool_uniform(); t_api_version(); t_egl_current(); t_map_range(); t_pack_buffer(); t_unpack_buffer(); t_es300(); t_sampler_array(); t_shader_iv(); t_love();
     printf("%s t_gl_api：%d 项，失败 %d\n", fails ? "✗" : "✓", checks, fails); return fails != 0;
 }}

@@ -4856,14 +4856,6 @@
   "en": "If you'd rather not sign in to Xcode, or want the app to refresh automatically over Wi‑Fi, use AltStore:"
  },
  {
-  "source": "免费 Apple ID 签的 App 7 天过期，到时连上 iPhone 再点一次「装到 iPhone」；同时最多 3 个自签 App。",
-  "en": "Apps signed with a free Apple ID expire after 7 days — connect your iPhone and click “Install on iPhone” again. Up to 3 self-signed apps at a time."
- },
- {
-  "source": "免费 Apple ID 签的 App 7 天过期：到时连上 iPhone 再点一次「装到 iPhone」，已经在机上的资源包不用重拷。",
-  "en": "Apps signed with a free Apple ID expire after 7 days: connect your iPhone and click “Install on iPhone” again; resources already on the phone are not copied again."
- },
- {
   "source": "启动器出的包是自签的，iPhone 不认，要用你自己的 Apple ID 重新签一次。打包本来就要装 Xcode，用它最省事：",
   "en": "The package is self-signed, so iPhone won't accept it until it's signed with your own Apple ID. You already have Xcode for packing — that's the easiest way:"
  },
@@ -4906,10 +4898,6 @@
  {
   "source": "装到 iPhone",
   "en": "Install on iPhone"
- },
- {
-  "source": "。打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏。免费 Apple ID 签的 App 7 天过期，到时连上再点一次「装到 iPhone」。",
-  "en": ". Open the game: the first launch imports the game resources (a few minutes). Keep it in the foreground and the screen unlocked; the game starts by itself when the import finishes. Apps signed with a free Apple ID expire after 7 days — connect and click “Install on iPhone” again."
  },
  {
   "source": "删除这款游戏…",
@@ -9844,10 +9832,6 @@
   "en": "Removes only the resource pack: games already on your phone keep working and still come along when you update S2Arm; make the package again only to install on another phone or copy the resources again."
  },
  {
-  "source": "按你装 S2Arm 的方式补上：\n· 电脑上的 S2Arm（免费或付费 Apple ID）：对这款游戏点「装到 iPhone」重装一次；重装后还看到这条提示，就用下面的 GetMoreRam 补上，再点一次「装到 iPhone」。\n· 自己的开发者证书（.p12 + 描述文件）：在苹果开发者网站给 S2Arm 的 App ID（苹果给每个 App 登记的身份）打开「Increased Memory Limit」，重新生成描述文件，用新描述文件重签再装。\n· AltStore：用 AltStore Classic 2.2 或更新版重装（不是刷新）。\n· SideStore 0.7.0：签名会丢这项权限，用下面的 GetMoreRam 补上后，在 SideStore 里重装。\n· Sideloadly：暂不支持，它没说免费账号会保留这项权限，自定义权限要付费开发者账号。\n· GetMoreRam：用装 S2Arm 的同一个 Apple ID 把它自签装到手机（占免费账号一个 App 名额，用完可删），登录后打开 App IDs、点刷新、选 S2Arm、点「Add Increased Memory Limit」，再用原来的方式重装 S2Arm。",
-  "en": "Fix it the way you installed S2Arm:\n· S2Arm on your computer (free or paid Apple ID): click “Install on iPhone” for this game to reinstall. If you still see this message afterwards, add the permission with GetMoreRam below, then click “Install on iPhone” again.\n· Your own developer certificate (.p12 + provisioning profile): on the Apple Developer website, turn on “Increased Memory Limit” for S2Arm’s App ID (the identity Apple registers for each app), regenerate the provisioning profile, then re-sign and install with the new profile.\n· AltStore: reinstall (not refresh) with AltStore Classic 2.2 or later.\n· SideStore 0.7.0: its signing drops this permission; add it with GetMoreRam below, then reinstall in SideStore.\n· Sideloadly: not supported for now; it doesn’t say it keeps this permission with a free Apple ID, and custom entitlements need a paid Apple Developer account.\n· GetMoreRam: sideload it with the same Apple ID you used for S2Arm (it takes one of a free account’s app slots; delete it afterwards), sign in, open App IDs, tap Refresh, choose S2Arm, tap “Add Increased Memory Limit”, then reinstall S2Arm the way you did before."
- },
- {
   "source": "准备更新 iPhone 上的 S2Arm",
   "en": "Preparing the S2Arm update for iPhone"
  },
@@ -10574,5 +10558,33 @@
  {
   "source": "选过的那个 S2Arm 已经从这台 iPhone 上删掉或换掉了。",
   "en": "The S2Arm you chose has been removed from or replaced on this iPhone."
+ },
+ {
+  "source": "无法为带空格的构建路径创建无空格别名。",
+  "en": "Couldn't create a space-free alias for the build path that contains spaces."
+ },
+ {
+  "source": "带空格的构建路径没有得到无空格别名。",
+  "en": "The build path that contains spaces didn't get a space-free alias."
+ },
+ {
+  "source": "无法准备构建缓存目录：{0}",
+  "en": "Couldn't prepare the build cache folder: {0}"
+ },
+ {
+  "source": "免费 Apple ID 签的 App 7 天过期，到时连上 iPhone 点游戏库第一格「S2Arm」里的「续签 S2Arm」；同时最多 3 个自签 App。",
+  "en": "Apps signed with a free Apple ID expire after 7 days — connect your iPhone and click “Renew S2Arm” on the S2Arm card first in the library. Up to 3 self-signed apps at a time."
+ },
+ {
+  "source": "免费 Apple ID 签的 App 7 天过期：到时连上 iPhone 点游戏库第一格「S2Arm」里的「续签 S2Arm」，手机上的游戏不用重新推。",
+  "en": "Apps signed with a free Apple ID expire after 7 days: connect your iPhone and click “Renew S2Arm” on the S2Arm card first in the library; games already on the phone don’t need to be pushed again."
+ },
+ {
+  "source": "。打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏。免费 Apple ID 签的 App 7 天过期，到时连上手机点游戏库第一格「S2Arm」里的「续签 S2Arm」。",
+  "en": ". Open the game: the first launch imports the game resources (a few minutes). Keep it in the foreground and the screen unlocked; the game starts by itself when the import finishes. Apps signed with a free Apple ID expire after 7 days — connect and click “Renew S2Arm” on the S2Arm card first in the library."
+ },
+ {
+  "source": "按你装 S2Arm 的方式补上：\n· 电脑上的 S2Arm（免费或付费 Apple ID）：点游戏库第一格「S2Arm」里的「续签 S2Arm」重装一次；重装后还看到这条提示，就用下面的 GetMoreRam 补上，再点一次「续签 S2Arm」。\n· 自己的开发者证书（.p12 + 描述文件）：在苹果开发者网站给 S2Arm 的 App ID（苹果给每个 App 登记的身份）打开「Increased Memory Limit」，重新生成描述文件，用新描述文件重签再装。\n· AltStore：用 AltStore Classic 2.2 或更新版重装（不是刷新）。\n· SideStore 0.7.0：签名会丢这项权限，用下面的 GetMoreRam 补上后，在 SideStore 里重装。\n· Sideloadly：暂不支持，它没说免费账号会保留这项权限，自定义权限要付费开发者账号。\n· GetMoreRam：用装 S2Arm 的同一个 Apple ID 把它自签装到手机（占免费账号一个 App 名额，用完可删），登录后打开 App IDs、点刷新、选 S2Arm、点「Add Increased Memory Limit」，再用原来的方式重装 S2Arm。",
+  "en": "Fix it the way you installed S2Arm:\n· S2Arm on your computer (free or paid Apple ID): click “Renew S2Arm” on the S2Arm card first in the library to reinstall. If you still see this message afterwards, add the permission with GetMoreRam below, then click “Renew S2Arm” again.\n· Your own developer certificate (.p12 + provisioning profile): on the Apple Developer website, turn on “Increased Memory Limit” for S2Arm’s App ID (the identity Apple registers for each app), regenerate the provisioning profile, then re-sign and install with the new profile.\n· AltStore: reinstall (not refresh) with AltStore Classic 2.2 or later.\n· SideStore 0.7.0: its signing drops this permission; add it with GetMoreRam below, then reinstall in SideStore.\n· Sideloadly: not supported for now; it doesn’t say it keeps this permission with a free Apple ID, and custom entitlements need a paid Apple Developer account.\n· GetMoreRam: sideload it with the same Apple ID you used for S2Arm (it takes one of a free account’s app slots; delete it afterwards), sign in, open App IDs, tap Refresh, choose S2Arm, tap “Add Increased Memory Limit”, then reinstall S2Arm the way you did before."
  }
 ]

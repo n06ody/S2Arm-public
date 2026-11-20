@@ -21527,46 +21527,6 @@
         }
       }
     },
-    "On a Mac, click “Install on iPhone”. It signs with the Apple ID you added in Xcode and keeps this permission, even with a free Apple ID. On Windows, the launcher signs with Impactor 2.7.2, which keeps it too. If you still see the notice after reinstalling, add it with GetMoreRam below, then click “Install on iPhone” again.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "On a Mac, click “Install on iPhone”. It signs with the Apple ID you added in Xcode and keeps this permission, even with a free Apple ID. On Windows, the launcher signs with Impactor 2.7.2, which keeps it too. If you still see the notice after reinstalling, add it with GetMoreRam below, then click “Install on iPhone” again."
-          }
-        },
-        "es": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "En un Mac, haz clic en «Instalar en el iPhone». Firma con el Apple ID que añadiste en Xcode y conserva este permiso, incluso con un Apple ID gratuito. En Windows, el lanzador firma con Impactor 2.7.2, que también lo conserva. Si sigues viendo el aviso después de reinstalar, añádelo con GetMoreRam (abajo) y vuelve a hacer clic en «Instalar en el iPhone»."
-          }
-        },
-        "fr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Sur Mac, cliquez sur « Installer sur l'iPhone ». La signature utilise l'identifiant Apple ajouté dans Xcode et conserve ce droit, même avec un identifiant gratuit. Sous Windows, le lanceur signe avec Impactor 2.7.2, qui le conserve aussi. Si l'avis apparaît encore après la réinstallation, ajoutez-le avec GetMoreRam (ci-dessous), puis cliquez à nouveau sur « Installer sur l'iPhone »."
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Mac では「iPhone にインストール」をクリックします。Xcode に追加した Apple ID で署名され、無料の Apple ID でもこの権限が付きます。Windows ではランチャーが Impactor 2.7.2 で署名し、同じく権限が付きます。再インストール後もこの案内が出る場合は、下の GetMoreRam で追加してから、もう一度「iPhone にインストール」をクリックしてください。"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "在 Mac 上点「装到 iPhone」，用你在 Xcode 里登录的 Apple ID 签名，会带上这项权限，免费 Apple ID 也行。Windows 上启动器用 Impactor 2.7.2 签名，同样会带上。重装后还看到这条提示，就用下面的 GetMoreRam 补上，再点一次「装到 iPhone」。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "在 Mac 上點「裝到 iPhone」，用你在 Xcode 裡登入的 Apple ID 簽署，會帶上這項權限，免費 Apple ID 也可以。Windows 上啟動器用 Impactor 2.7.2 簽署，同樣會帶上。重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「裝到 iPhone」。"
-          }
-        }
-      }
-    },
     "Your own developer certificate": {
       "localizations": {
         "en": {
@@ -24029,6 +23989,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "联机模式"
+          }
+        }
+      }
+    },
+    "In S2Arm on your Mac or Windows PC, click “Renew S2Arm” on the S2Arm card first in the library. It signs with your Apple ID and keeps this permission, even with a free Apple ID. If you still see the notice after reinstalling, add it with GetMoreRam below, then click “Renew S2Arm” again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In S2Arm on your Mac or Windows PC, click “Renew S2Arm” on the S2Arm card first in the library. It signs with your Apple ID and keeps this permission, even with a free Apple ID. If you still see the notice after reinstalling, add it with GetMoreRam below, then click “Renew S2Arm” again."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En S2Arm en tu Mac o PC con Windows, haz clic en «Renovar S2Arm» en la ficha «S2Arm» (la primera de la biblioteca). Firma con tu Apple ID y conserva este permiso, incluso con un Apple ID gratuito. Si sigues viendo el aviso después de reinstalar, añádelo con GetMoreRam (abajo) y vuelve a hacer clic en «Renovar S2Arm»."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dans S2Arm sur votre Mac ou PC Windows, cliquez sur « Renouveler S2Arm » dans la vignette « S2Arm » (la première de la bibliothèque). La signature utilise votre identifiant Apple et conserve ce droit, même avec un identifiant gratuit. Si l'avis apparaît encore après la réinstallation, ajoutez-le avec GetMoreRam (ci-dessous), puis cliquez à nouveau sur « Renouveler S2Arm »."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "パソコン（Mac または Windows）の S2Arm で、ライブラリ先頭の「S2Arm」タイルの「S2Arm を再署名」をクリックします。あなたの Apple ID で署名され、無料の Apple ID でもこの権限が付きます。再インストール後もこの案内が出る場合は、下の GetMoreRam で追加してから、もう一度「S2Arm を再署名」をクリックしてください。"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在电脑上的 S2Arm（Mac 或 Windows）里点游戏库第一格「S2Arm」里的「续签 S2Arm」，用你的 Apple ID 签名，会带上这项权限，免费 Apple ID 也行。重装后还看到这条提示，就用下面的 GetMoreRam 补上，再点一次「续签 S2Arm」。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在電腦上的 S2Arm（Mac 或 Windows）裡點遊戲庫第一格「S2Arm」裡的「續簽 S2Arm」，用你的 Apple ID 簽署，會帶上這項權限，免費 Apple ID 也可以。重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「續簽 S2Arm」。"
           }
         }
       }

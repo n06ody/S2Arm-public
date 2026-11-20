@@ -21,20 +21,9 @@
 #   ⑦ --plat ios 26、架构 applegpu_g16p（出包目标表 pack/pso_targets.tsv 里的 iPhone 行；iOS 的 metal-tt 不收本机 Mac 架构）（metal-tt 换成转调真 metal-tt、把它写出的原样另存一份的包装）：出 4 个对文件 + 预热对，全是 .mtl4archive.lzfse、没有原样 .mtl4archive；
 #      每份 compression_tool -decode 解开后与 metal-tt 写出的原样逐字节相同，且比原样小；读数「逐对 lzfse 压缩」；再跑缓存命中 4、文件逐字节相同。
 #      iPhone 归档在本机打不开（11-19 实测：newArchiveWithURL 报「deployment target … is not compatible with current OS」），设备上解压后命中由 t_nvn_hybrid ⑦ 在本机用 Mac 归档的 .lzfse 测
-#   ①–⑦ 给 --orig-bytes 1e11（预算 1e10 字节，全装，同原行为）；⑥ 阶段给 S2A_SOURCE_BYTES=1e11。
-#   ⑥b 同一根不给 S2A_SOURCE_BYTES、根里没有 romfs / exefs / aoc：原件大小拿不到 → 阶段重跑（原件大小进键）、退出 0、打黄「原件大小拿不到」、pipelines/ 里没有 p*.mtl4archive 与预热对
-#   ⑥c 现行根放 romfs/ 3000000 字节 + exefs/main 1000 字节：近似原件 3001000 字节，读数「原件 3001000 字节（近似：解开的 romfs+exefs+aoc）」，随包字节 = 盘上 p* + 预热对之和 ≤ 300100
-#   ⑧ 预算按组装（假 metal-tt：每对写 1000 字节、预热对写 100 字节；--plat macos 不压，随包字节 = 这些 + 预热库 W 字节；-j 1）。夹具：顶点 V1–V8 都用 A 的拉取库，片元 P、Q；
-#      shader_map.tsv：V1「…bundle:CAB-1#Seed/S#var19.0」、V2 V3 V4「/e/a.ptcl#BNSH@0x1000#var0/1/2」、V5 V8「/e/b.ptcl#BNSH@0x2000#var0/1」、V6「main#GLSLC@0x10」（没有 #var），
-#      V7 不在表里；片元 P、Q 的来源记在 a.ptcl 那组（按片元分组的实现会把全部对并成一组）。种子表 R 行只有 V1×P；配对表：V1×Q、V7×Q、V6×P、V6×Q、V5×P、V5×Q、V8×P、V2×P、V3×P、V4×P、V2×Q。
-#      组与次序（手排）：种子组 Seed/S{V1×P, V1×Q} 2 对 → V7 自成 1 对 → V6 自成 2 对 → b.ptcl{V5×P, V5×Q, V8×P} 3 对 → a.ptcl{V2×P, V3×P, V4×P, V2×Q} 4 对；共 12 对 5 组。
-#      原件 = 10 × 预算 + 5（int(原件 × 0.1) = 预算）：
-#      ⑧a 全装（原件 1e11）：12 个对文件 + 预热对两份，读数「装进 12 对 / 5 组（含种子对的 1 组），超预算不出 0 对 / 0 组」、随包 12100 + W
-#      ⑧b 预算 8600 + W：装 Seed、V7、V6、b.ptcl 共 8 对 / 4 组（8100 + W），a.ptcl 再装 12100 + W 超 → 停；a.ptcl 4 个文件不在、读数「超预算不出 4 对 / 1 组（多编后删 4 对」——
-#          分批手算：首批要 max(4×1, 0) = 4 对 → Seed+V7+V6 = 5 对；剩 3500 字节、均 1000 → 第二批要 ⌈3500×0.9÷1000⌉ = 4 对 → b.ptcl+a.ptcl，a.ptcl 编了再删
-#      ⑧c 预算 4600 + W：Seed + V7 = 3100 + W 装下，V6 整组 2 对再装 5100 + W 超 → 停，不拆组：恰 3 个对文件，读数「装进 3 对 / 2 组」
-#      ⑧d 预算 1600 + W：种子组 2 对 2100 + W 就装不下 → 停（不跳过它去装更小的 V7）：0 个文件（预热对也不带），读数「装进 0 对 / 0 组，超预算不出 12 对 / 5 组」，退出 0
-#      ⑧e 不给 --orig-bytes：退出 0、0 个文件、标准错误一行【黄】「原件大小拿不到」、读数「出 0 对」
+#   ⑧ 全装（11-20：撤掉原件 10% 预算）：假 metal-tt 每对写 1000 字节、预热对写 100 字节，-j 1。夹具：顶点 V1–V8 都用 A 的拉取库，片元 P、Q；
+#      种子表 R 行 V1×P，配对表 11 对（见下），并集 12 对：12 个对文件 + 预热对两份全部随包，读数「出 12 对」、随包 12100 + W 字节（W = 预热库字节），
+#      读数里不再有「预算」「原件」字样。反证：把上限加回去（只出前 4 对）的实现，这条红。
 set -u; H=$(cd "$(dirname "$0")/../../../.." && pwd); T=$(mktemp -d "${TMPDIR:-/tmp}/t_base_pipelines.XXXXXX"); trap 'rm -rf "$T"' EXIT
 n=0; fail=0
 ck() { n=$((n + 1)); if eval "$2"; then echo "✓ $1"; else echo "✗ $1"; fail=$((fail + 1)); fi; }
@@ -98,8 +87,7 @@ pfile() { printf '%s_b\t%s_b\tmain0' "$1" "$2" | shasum -a 256 | cut -c1-40 | se
 FAP=$(pfile $A $P) FAQ=$(pfile $A $Q) FBP=$(pfile $B $P) FBQ=$(pfile $B $Q)
 WF='s2a_warm.metallib s2a_warm.mtl4archive'   # 首查预热对（Mac 原样）
 want() { printf '%s\n' "$FAP" "$FAQ" "$FBP" "$FBQ" $WF | sort; }
-BIG=100000000000   # ①–⑦ 的原件大小：预算 1e10 字节，全装
-BP() { python3 "$H/graphics/tools/direct/base_pipelines.py" "$F" "$1" --plat macos --orig-bytes $BIG "${@:2}"; }
+BP() { python3 "$H/graphics/tools/direct/base_pipelines.py" "$F" "$1" --plat macos "${@:2}"; }
 probe() { "$T/probe" "$1" "$T/v$2.metallib" "$3" "$T/fb.metallib" "s$4_main0" "${5:-u}" "${6:-1}" 2>> "$T/probe.err"; }   # 打不开的原因进 probe.err，输出只留一行
 
 # ① ①b ②
@@ -137,24 +125,15 @@ ck "⑤ metal-tt 失败：退出 3、0 个文件、读数失败 4 对、预热�
 RT=$T/roots; mkdir -p "$RT/fx@v1/shaders"; cp -R "$F" "$RT/fx@v1/shaders/"; echo k1 > "$RT/fx@v1/.stage_direct"; printf 'title_id\t0100aaaa00000000\n' > "$RT/fx@v1/unpack.tsv"; ln -s fx@v1 "$RT/fx@现行"
 cur() { cd -P "$RT/fx@现行" && pwd; }
 stage() { S2A_ROOTS=$RT S2A_ROOTS_SHARED=$T/shared S2A_RUN_ROOT=$T/run S2A_PACK_PLAT=macos S2A_MAC_OS=$MAJ S2A_PSO_ARCHS=$ARCH J=2 bash "$H/pack/stage_direct_cpso.sh" fx 2>&1; }
-o=$(S2A_SOURCE_BYTES=$BIG stage); r=$?; [ $r = 0 ] || echo "$o" | tail -5
+o=$(stage); r=$?; [ $r = 0 ] || echo "$o" | tail -5
 ck "⑥ 阶段：退出 ${r}、现行根 pipelines/ 恰是这 4 个 + 预热对两份、记了键（$(grep -o '拉取基础管线归档[^；]*' <<< "$o" | head -1 | cut -c1-100)）" \
    '[ $r = 0 ] && [ "$(ls "$(cur)/shaders/direct/pipelines" 2> /dev/null | sort)" = "$(want)" ] && [ -s "$(cur)/.stage_direct_cpso" ]'
 ck "⑥ 阶段出的 A×P 按设备描述命中（$(probe "$(cur)/shaders/direct/pipelines/$FAP" A main0 $P)）、缓存 5 条（4 对 + 预热对）落在直连缓存 store/cpso/" \
    '[ "$(probe "$(cur)/shaders/direct/pipelines/$FAP" A main0 $P)" = "hit=1 spec=1" ] && [ "$(find "$T/run/s2arm/cache/direct/0100AAAA00000000/store/cpso" -name "*.e" | wc -l | tr -d " ")" = 5 ]'
-o=$(stage); r=$?
-nbp() { ls "$(cur)/shaders/direct/pipelines" 2> /dev/null | grep -c -e '^p' -e '^s2a_warm'; }
-ck "⑥b 不给原件大小、根里没有 romfs / exefs / aoc：重跑（不是「现行已是」）、退出 ${r}、打黄「原件大小拿不到」、pipelines/ 里基础管线 $(nbp) 份（$(grep -o '原件大小拿不到[^）]*' <<< "$o" | head -1)）" \
-   '[ $r = 0 ] && [[ "$o" != *"现行已是"* ]] && grep -q "^【黄】拉取基础管线这次一对都不出：原件大小拿不到" <<< "$o" && [ "$(nbp)" = 0 ]'
-mkdir -p "$(cur)/romfs" "$(cur)/exefs"; python3 -c 'import sys; open(sys.argv[1], "wb").truncate(3000000)' "$(cur)/romfs/data.bin"; head -c 1000 /dev/zero > "$(cur)/exefs/main"
-o=$(stage); r=$?
-got=$(grep -o '随包共 [0-9]* 字节' <<< "$o" | grep -o '[0-9]*'); disk=$(cat "$(cur)"/shaders/direct/pipelines/p* "$(cur)"/shaders/direct/pipelines/s2a_warm.* 2> /dev/null | wc -c | tr -d ' ')
-ck "⑥c 根里 romfs 3000000 + exefs 1000：退出 ${r}、读数「原件 3001000 字节（近似：解开的 romfs+exefs+aoc）」、随包 ${got:-?} 字节 = 盘上 ${disk} 字节 ≤ 300100" \
-   '[ $r = 0 ] && [[ "$o" == *"原件 3001000 字节（近似：解开的 romfs+exefs+aoc）"* ]] && [ -n "$got" ] && [ "$got" = "$disk" ] && [ "$got" -le 300100 ]'
 # ⑦ iPhone 包：逐对 lzfse。metal-tt 换成包装：转调真 metal-tt，把它写出的原样（-o 那份）另存到 $T/raw/ 作对照
 mkdir -p "$T/raw"
 printf '#!/bin/bash\nxcrun -sdk iphoneos metal-tt "$@"; rc=$?\nwhile [ $# -gt 1 ]; do [ "$1" = -o ] && { [ -f "$2" ] && cp "$2" "%s/raw/$(basename "$2")"; break; }; shift; done\nexit $rc\n' "$T" > "$T/teett"; chmod +x "$T/teett"
-o=$(S2A_METAL_TT=$T/teett python3 "$H/graphics/tools/direct/base_pipelines.py" "$FI" "$T/o5" --plat ios --os 26 --arch applegpu_g16p --orig-bytes $BIG --cache "$T/cache5" 2>&1); r=$?
+o=$(S2A_METAL_TT=$T/teett python3 "$H/graphics/tools/direct/base_pipelines.py" "$FI" "$T/o5" --plat ios --os 26 --arch applegpu_g16p --cache "$T/cache5" 2>&1); r=$?
 wanti() { printf '%s.lzfse\n' "$FAP" "$FAQ" "$FBP" "$FBQ" s2a_warm.mtl4archive; echo s2a_warm.metallib; }
 ck "⑦ --plat ios：退出 ${r}、恰好 4 个对 + 预热对的 .mtl4archive.lzfse 与预热库、没有原样 .mtl4archive（实：$(ls "$T/o5" 2> /dev/null | tr '\n' ' ' | cut -c1-200)）" \
    '[ $r = 0 ] && [ "$(ls "$T/o5" | sort)" = "$(wanti | sort)" ] && [ -z "$(ls "$T/o5" | grep "\.mtl4archive$")" ]'
@@ -165,10 +144,10 @@ unz_ok() {   # 每份解开 = metal-tt 写出的原样（包装另存的 <名>.b
   [ $n = 5 ]; }
 ck "⑦ 5 份 .lzfse 用 compression_tool 解开都与 metal-tt 写出的原样逐字节相同、且比原样小（$(du -k "$T/raw" | tail -1 | cut -f1) KB 原样 → $(cat "$T"/o5/*.lzfse | wc -c | tr -d ' ') 字节）；读数「逐对 lzfse 压缩」" \
    'unz_ok && [[ "$(tail -1 <<< "$o")" == *"逐对 lzfse 压缩"* ]]'
-o=$(S2A_METAL_TT=$T/teett python3 "$H/graphics/tools/direct/base_pipelines.py" "$FI" "$T/o6" --plat ios --os 26 --arch applegpu_g16p --orig-bytes $BIG --cache "$T/cache5" 2>&1); r=$?
+o=$(S2A_METAL_TT=$T/teett python3 "$H/graphics/tools/direct/base_pipelines.py" "$FI" "$T/o6" --plat ios --os 26 --arch applegpu_g16p --cache "$T/cache5" 2>&1); r=$?
 samei() { local f; for f in $(wanti); do cmp -s "$T/o5/$f" "$T/o6/$f" || return 1; done; }
 ck "⑦ --plat ios 再跑：缓存命中 4、现编 0、文件逐字节相同（$(tail -1 <<< "$o" | grep -o '缓存命中[^）]*')）" '[ $r = 0 ] && [[ "$o" == *"缓存命中 4、现编 0"* ]] && samei'
-# ⑧ 预算按组装：假 metal-tt 写已知字节数，夹具 FB（库容器用 A 的拉取库与同一段批库，键 V1–V8 / P / Q）
+# ⑧ 全装：假 metal-tt 写已知字节数，夹具 FB（库容器用 A 的拉取库与同一段批库，键 V1–V8 / P / Q）
 V1=0000010000000001 V2=0000010000000002 V3=0000010000000003 V4=0000010000000004 V5=0000010000000005 V6=0000010000000006 V7=0000010000000007 V8=0000010000000008
 FB=$T/fb/shaders/direct; mkdir -p "$FB/b-t1"
 python3 - "$FB/b-t1" "$T" $P $Q $V1 $V2 $V3 $V4 $V5 $V6 $V7 $V8 <<'EOF'
@@ -203,24 +182,10 @@ grp() { local v f; for pr in "$@"; do v=${pr% *} f=${pr#* }; pfile $v $f; done; 
 S_G="$V1 $P|$V1 $Q" V7_G="$V7 $Q" V6_G="$V6 $P|$V6 $Q" B_G="$V5 $P|$V5 $Q|$V8 $P" A_G="$V2 $P|$V3 $P|$V4 $P|$V2 $Q"
 files() { local IFS='|'; grp $* | sort; }   # 这些组的对文件名
 pfiles() { ls "$1" 2> /dev/null | grep '^p' | sort; }
-o=$(BB "$T/b1" --orig-bytes $BIG 2>&1); r=$?
+o=$(BB "$T/b1" 2>&1); r=$?
 W=$(wc -c < "$T/b1/s2a_warm.metallib" 2> /dev/null | tr -d ' '); W=${W:-0}
-ck "⑧a 全装：退出 ${r}、12 个对文件 + 预热对两份、随包 $((12100 + W)) 字节（W=${W}）（$(grep -o '预算：[^；]*' <<< "$o")）" \
+ck "⑧ 全装：退出 ${r}、12 个对文件 + 预热对两份、随包 $((12100 + W)) 字节（W=${W}）、读数没有预算字样（$(tail -1 <<< "$o" | grep -o '出 [0-9]* 对[^；]*')）" \
    '[ $r = 0 ] && [ "$(pfiles "$T/b1")" = "$(files "$S_G|$V7_G|$V6_G|$B_G|$A_G")" ] && [ -s "$T/b1/s2a_warm.mtl4archive" ] && [ "$W" -gt 0 ] \
-    && [[ "$o" == *"装进 12 对 / 5 组（含种子对的 1 组），超预算不出 0 对 / 0 组；"* ]] && [[ "$o" == *"随包共 $((12100 + W)) 字节"* ]]'
-o=$(BB "$T/b2" --orig-bytes $(( (8600 + W) * 10 + 5 )) 2>&1); r=$?
-ck "⑧b 预算 $((8600 + W))：装 Seed / V7 / V6 / b.ptcl 共 8 对 4 组、a.ptcl 整组不出且编了再删 4 对、随包 $((8100 + W))（$(grep -o '预算：[^；]*' <<< "$o")）" \
-   '[ $r = 0 ] && [ "$(pfiles "$T/b2")" = "$(files "$S_G|$V7_G|$V6_G|$B_G")" ] && [ -s "$T/b2/s2a_warm.mtl4archive" ] \
-    && [[ "$o" == *"装进 8 对 / 4 组（含种子对的 1 组），超预算不出 4 对 / 1 组（多编后删 4 对，已进缓存）"* ]] && [[ "$o" == *"随包共 $((8100 + W)) 字节"* ]] \
-    && [[ "$o" == *"原件 $(( (8600 + W) * 10 + 5 )) 字节（原件）"* ]]'
-o=$(BB "$T/b3" --orig-bytes $(( (4600 + W) * 10 + 5 )) 2>&1); r=$?
-ck "⑧c 预算 $((4600 + W))：Seed + V7 装下、V6 整组装不下就停不拆：恰 3 个对文件（$(grep -o '装进[^，]*' <<< "$o")）" \
-   '[ $r = 0 ] && [ "$(pfiles "$T/b3")" = "$(files "$S_G|$V7_G")" ] && [[ "$o" == *"装进 3 对 / 2 组（含种子对的 1 组），超预算不出 9 对 / 3 组"* ]] && [[ "$o" == *"随包共 $((3100 + W)) 字节"* ]]'
-o=$(BB "$T/b4" --orig-bytes $(( (1600 + W) * 10 + 5 )) 2>&1); r=$?
-ck "⑧d 预算 $((1600 + W))：种子组装不下就停、不跳去装 V7：退出 ${r}、0 个文件（实 $(ls "$T/b4" 2> /dev/null | wc -l | tr -d ' ')）（$(grep -o '装进[^；]*' <<< "$o")）" \
-   '[ $r = 0 ] && [ -z "$(ls "$T/b4" 2> /dev/null)" ] && [[ "$o" == *"装进 0 对 / 0 组（含种子对的 0 组），超预算不出 12 对 / 5 组"* ]] && [[ "$o" == *"随包共 0 字节"* ]]'
-o=$(BB "$T/b5" 2>&1); r=$?
-ck "⑧e 不给原件大小：退出 ${r}、0 个文件、一行黄「原件大小拿不到」、读数「出 0 对」（$(tail -1 <<< "$o" | grep -o '原件大小拿不到.*')）" \
-   '[ $r = 0 ] && [ -z "$(ls "$T/b5" 2> /dev/null)" ] && [ "$(grep -c "^【黄】拉取基础管线这次一对都不出：原件大小拿不到" <<< "$o")" = 1 ] && [[ "$(tail -1 <<< "$o")" == *"可出 12 对 / 5 组，出 0 对" ]]'
+    && [[ "$(tail -1 <<< "$o")" == *"出 12 对"* ]] && [[ "$o" == *"随包共 $((12100 + W)) 字节"* ]] && [[ "$(tail -1 <<< "$o")" != *预算* ]] && [[ "$(tail -1 <<< "$o")" != *原件* ]]'
 echo "t_base_pipelines：$n 项，失败 $fail"
 [ $fail = 0 ]

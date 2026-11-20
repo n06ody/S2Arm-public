@@ -373,6 +373,15 @@ GL(glBindTexture, void, GLenum target, GLuint name) {
     else if (t && t->target != target) { gl_set_error(GL_INVALID_OPERATION); return; }
     gl_cur->tex_unit[gl_cur->active_unit][slot] = name;
 }
+// 像素解包缓冲（GL 4.5 §8.4.4.1 / ES 3.0 §3.7.1）：绑着它时上传入口的 data 是缓冲内偏移，像素从缓冲取（NULL = 偏移 0）。
+//   缓冲没建存储、映射着（持久映射除外）、偏移 + need 超出大小 → INVALID_OPERATION（规范），不上传。没绑：data 原样是客户端内存
+static size_t unpack_image(GLenum format, GLenum type, GLsizei w, GLsizei h);
+static int unpack_src(const void **data, size_t need) {
+    if (!gl_unpack_buffer_name()) return 1;
+    struct gl_buffer *b = gl_unpack_buffer(); size_t off = (size_t)(uintptr_t)*data;
+    if (!b || !b->buf || (b->map_access && !(b->map_bits & 0x40)) || off > b->size || need > b->size - off) { gl_set_error(GL_INVALID_OPERATION); return 0; }
+    *data = (const uint8_t *)b->buf.contents + off; return 1;
+}
 static int define(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, int compressed, GLsizei size, GLenum format, GLenum type, const void *data) {
     int face; gl_texture *t = bound_image(target, &face); if (!t) return 0;
     if (t->immutable) { gl_set_error(GL_INVALID_OPERATION); return 0; }
@@ -385,6 +394,7 @@ static int define(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei
         if (size < 0 || (size_t)size != row_bytes(f, (NSUInteger)w) * row_count(f, (NSUInteger)h)) { gl_set_error(GL_INVALID_VALUE); return 0; }
     } else if (k_fmt[f].kind == K_BLOCK) { GLRED1("glTexImage2D 往压缩格式 %#x 传未压缩数据没实现", internal); gl_set_error(GL_INVALID_OPERATION); gl_bad_feat++; return 0; }
     else if (!pixel_layout(format, type, &nc, &nb)) return 0;
+    if (!unpack_src(&data, compressed ? (size_t)size : unpack_image(format, type, w, h))) return 0;
     if (!gpu_settle(t)) return 0;
     if (!face && !level) { gl_wd_drop(&t->wd, 0); t->wd.cpu = data != NULL; }   // 宽屏：第 0 级换存储，影子作废
     if (!w || !h) { t->level[face][level].image = nil; sample_drop(t); return 1; }
@@ -432,6 +442,7 @@ GLB(glTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint y, GLsizei
     // 压缩存储不接受未压缩来源：这是规范规定的错（GL_INVALID_OPERATION），不是本层缺实现，所以不计未实现、不报红
     if (k_fmt[lv->fmt].kind == K_BLOCK) { gl_set_error(GL_INVALID_OPERATION); return; }
     int nc, nb; if (!pixel_layout(format, type, &nc, &nb)) return; if (!w || !h) return;
+    if (!unpack_src(&data, unpack_image(format, type, w, h))) return;
     if (!data) { gl_set_error(GL_INVALID_VALUE); return; }
     if (!gpu_settle(t)) return;
     id<MTLTexture> image = old;
@@ -465,6 +476,7 @@ GLB(glCompressedTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint 
     int edge_x = (NSUInteger)(x + w) == old.width, edge_y = (NSUInteger)(y + h) == old.height;
     if (x % bw || y % bw || (w % bw && !edge_x) || (h % bw && !edge_y)) { gl_set_error(GL_INVALID_VALUE); return; }
     size_t blocks_x = (size_t)((x + w + bw - 1) / bw - x / bw), blocks_y = (size_t)((y + h + bw - 1) / bw - y / bw), row = blocks_x * m->bytes;
+    if (size >= 0 && !unpack_src(&data, (size_t)size)) return;
     if (!data || size < 0 || (size_t)size != row * blocks_y) { gl_set_error(GL_INVALID_VALUE); return; }
     if (!gpu_settle(t)) return;
     id<MTLTexture> image = old;
@@ -789,6 +801,7 @@ GLB(glTexImage3D, void, GLenum target, GLint level, GLint internal, GLsizei w, G
     if (k_fmt[f].kind == K_BLOCK) { GLRED1("glTexImage3D 往压缩格式 %#x 传未压缩数据没实现", internal); gl_set_error(GL_INVALID_OPERATION); gl_bad_feat++; return; }
     if (is3d && k_fmt[f].kind != K_COL) { gl_set_error(GL_INVALID_OPERATION); return; }   // 深度 / 模板格式不能做 3D 纹理（规范）
     if (!pixel_layout(format, type, &nc, &nb)) return;
+    if (!unpack_src(&data, unpack_image(format, type, w, h) * (size_t)d)) return;
     if (!gpu_settle(t)) return;
     if (!w || !h || !d) { t->level[0][level].image = nil; sample_drop(t); return; }
     id<MTLTexture> image = allocate_vol(f, (NSUInteger)w, (NSUInteger)h, (NSUInteger)d, 1, is3d); if (!image) return;
@@ -810,6 +823,7 @@ GLB(glTexSubImage3D, void, GLenum target, GLint level, GLint x, GLint y, GLint z
         (NSUInteger)y > old.height || (NSUInteger)h > old.height - (NSUInteger)y || (NSUInteger)z > depth || (NSUInteger)d > depth - (NSUInteger)z) { gl_set_error(GL_INVALID_VALUE); return; }
     if (k_fmt[lv->fmt].kind == K_BLOCK) { gl_set_error(GL_INVALID_OPERATION); return; }   // 压缩存储不收未压缩来源（规范错误，同 2D）
     int nc, nb; if (!pixel_layout(format, type, &nc, &nb)) return; if (!w || !h || !d) return;
+    if (!unpack_src(&data, unpack_image(format, type, w, h) * (size_t)d)) return;
     if (!data) { gl_set_error(GL_INVALID_VALUE); return; }
     if (!gpu_settle(t)) return;
     id<MTLTexture> image = old;

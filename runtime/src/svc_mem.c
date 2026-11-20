@@ -109,6 +109,15 @@ static void backing_reuse_denied(const char *what, uint64_t a, uint64_t n, _Atom
 static void vma_report_start(void);
 #endif
 const s2a_layout *s2a_layout_get(void) { return &L; }
+// 窗口里一段第一次放开成可读写之前调（vawin.c s2a_guest_commit）：客体内存文件后备溢出模式按块定后备（预算内匿名、超出的块换文件）。
+//   只登记匿名占位 → 读写的放开点；vm_remap 别名盖上去的（alias_map、MapMemory 对齐路径、MapSharedMemory）不调——那段的页是源的，不占这边的后备。
+//   不进 native.h（出包抽取阶段的键）；安卓窗口另有实现（vawin_android.inc），不调
+#ifndef __ANDROID__
+void s2a_guest_commit(uint64_t a, uint64_t n);
+#define GUEST_COMMIT(a, n) s2a_guest_commit((uint64_t)(a), (uint64_t)(n))
+#else
+#define GUEST_COMMIT(a, n) ((void)0)
+#endif
 uint64_t s2a_mem_heap_end(void) { return (uint64_t)g_heap + g_heap_cur; }
 void s2a_mem_guest_split(uint64_t *heap_lo, uint64_t *heap_len, uint64_t *alias_lo, uint64_t *alias_len, uint64_t *phys) { *heap_lo = (uint64_t)g_heap; *heap_len = g_heap_cur; *alias_lo = L.alias_base; *alias_len = L.alias_size; *phys = g_phys; }
 uint64_t s2a_program_id(void) { return g_program_id; }
@@ -301,6 +310,7 @@ void *s2a_tlr_alloc(void) {
     else {
         if (!g_tlr_next) g_tlr_next = L.tlsio_base;
         if (g_tlr_next + 0x200 > L.tlsio_base + L.tlsio_size) die("TLS/IO 区放不下更多线程的 TLR");
+        if (!(g_tlr_next & (HPG - 1))) GUEST_COMMIT(g_tlr_next, HPG);
         if (!(g_tlr_next & (HPG - 1)) && mprotect((void *)g_tlr_next, HPG, PROT_READ | PROT_WRITE)) die("TLR 页 mprotect errno=%d", errno);
         p = (void *)g_tlr_next; g_tlr_next += 0x200;
     }
@@ -639,6 +649,7 @@ uint64_t s2a_mem_init(const char *npdm) {
 #endif
     if (!ms) die("NPDM MainThreadStackSize 为 0");
     uint64_t len = ((uint64_t)ms + HPG - 1) & ~(HPG - 1), base = L.stack_base + L.stack_size - len;
+    GUEST_COMMIT(base, len);
     if (mprotect((void *)base, len, PROT_READ | PROT_WRITE)) die("主线程栈 mprotect errno=%d", errno);
     map_add(base, ms, 0, ST_STACK, 0);
     g_mstack = ((uint64_t)ms + 0xfff) & ~0xfffull;
@@ -1649,6 +1660,7 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
 #else
         int shrink = size < g_heap_cur;
         if (backing_begin_locked(lo, n, 0)) { GMU_UNLOCK(); regs[0] = 0xD401; return 1; }
+        if (size > g_heap_cur) GUEST_COMMIT(g_heap + g_heap_cur, size - g_heap_cur);
         if (size > g_heap_cur && mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE)) die("SetHeapSize mprotect errno=%d", errno);
         if (size > g_heap_cur) punch_zero_locked((uint64_t)g_heap + g_heap_cur, (uint64_t)g_heap + size);   // #258：增长段里待清零的旧页就地清零
         if (shrink) pages_release((uint64_t)g_heap + size, g_heap_cur - size);
@@ -1700,6 +1712,7 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
         if (hi > lo) {
             // 跟踪器在同一个每页临界区里先占页再 mprotect（与缺页自愈串行）；没有挂这个钩子（单测夹具）时退回直接 mprotect。
             //   苹果也走（10-28 审计 #806 第 1 条：原先苹果先 mprotect 再 prot_changed，中间的写缺页被自愈改回可写）
+            if (pr) GUEST_COMMIT(lo, hi - lo);   // 放宽到一段从没放开过的地址（多半已放开、块已定，不加锁直接回）
             int ge = g_hooks.guest_protect ? g_hooks.guest_protect(lo, hi - lo, pr) : (mprotect((void *)lo, hi - lo, pr) ? errno : 0);
             if (ge) { regs[0] = 0xD401; return 1; }
             prot_changed(lo, hi - lo);   // 通知（生产就是跟踪器；重复收尾幂等）
@@ -1820,6 +1833,7 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
         GMU_LOCK();
         if (backing_begin_locked(lo, hi - lo, src)) { GMU_UNLOCK(); regs[0] = 0xD401; return 1; }
 #endif
+        GUEST_COMMIT(lo, hi - lo);   // 拷贝路径：目标是栈区的匿名占位
         if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) {
             int saved_errno = errno;
             if (map_failure_claim()) {
@@ -2061,6 +2075,7 @@ static int svc_mem_impl(int num, uint64_t *regs, uint64_t orig) {
                 uint64_t f1 = hi; while (f1 > f0 && *amask_at(f1 - HPG)) f1 -= HPG;
                 if (f1 > f0 && s2a_far_map(f0, f1 - f0)) { if (wl > lo) backing_end_locked(lo, wl - lo, 0, 0); GMU_UNLOCK(); regs[0] = va_short(num, a, size, "别名区（影子区与堆撞上）"); return 1; }
             }
+            if (wl > lo) GUEST_COMMIT(lo, wl - lo);   // 只窗口内那段；远端影子由 far.c 管
             if (wl > lo && mprotect((void *)lo, wl - lo, PROT_READ | PROT_WRITE)) die("MapPhysicalMemory mprotect errno=%d", errno);
             if (wl > lo) punch_zero_locked(lo, wl);   // #258：整宿主页原先全空、释放后待清零的，内容是旧的，先清零（下面按「原先全空 = 零」不再清）
             uint64_t run = 0;   // 新映射的连续子页起点：权限账按段清（已映射的子页保留游戏改过的权限）
@@ -2481,6 +2496,7 @@ void *s2a_det_arena_alloc(size_t n) {
     uint64_t lo = g_det_arena_top - n;
     if (lo < g_tlr_next + HPG) die("确定性：TLS/IO 区放不下 TLS 块");
     uint64_t pg = lo & ~(HPG - 1);
+    GUEST_COMMIT(pg, g_det_arena_top - pg);
     if (mprotect((void *)pg, g_det_arena_top - pg, PROT_READ | PROT_WRITE)) die("确定性：TLS 块页 mprotect errno=%d", errno);
     g_det_arena_top = lo; GMU_UNLOCK();
     memset((void *)lo, 0, n); return (void *)lo;

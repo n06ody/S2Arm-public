@@ -45,18 +45,39 @@ class HostCacheTests(unittest.TestCase):
     def test_generated_game_bundle_supports_macos15(self):
         private = self.app.parent / "private"
         host_build = private / "tools/mac-host/fixture/build"
+        run_root = private / "tool cache/run"
+        cache_root = private / "tool cache/cache"
         fixture = self.app / "Contents/MacOS"
         def run(args, log, env):
             if args[0] == "make":
-                host_build.mkdir(parents=True)
+                # make 会把未转义的绝对路径按空格拆成多个目标；本树的临时目录名故意带空格。
+                self.assertNotIn(" ", str(args[2]))
+                build_arg = next((str(a) for a in args if str(a).startswith("BUILD=")), "")
+                root_arg = next((str(a) for a in args if str(a).startswith("ROOT=")), "")
+                self.assertTrue(build_arg and " " not in build_arg)
+                self.assertTrue(root_arg and " " not in root_arg)
+                for key in ("S2A_RUN_ROOT", "S2A_CS_CACHE", "S2A_VPX_CACHE",
+                            "S2A_OPUS_CACHE", "S2A_DAV1D_CACHE"):
+                    self.assertIn(key, env)
+                    self.assertNotIn(" ", env[key])
+                    self.assertTrue(Path(env[key]).is_dir())
+                host_build.mkdir(parents=True, exist_ok=True)
                 for name in ("s2arm-host", build.VAGUARD):
                     shutil.copy2(fixture / name, host_build / name)
             else:
                 subprocess.run([str(x) for x in args], check=True, capture_output=True)
+        env = {
+            "DEVELOPER_DIR": "fixture",
+            "S2A_RUN_ROOT": str(run_root),
+            "S2A_CS_CACHE": str(cache_root / "nxaot"),
+            "S2A_VPX_CACHE": str(cache_root / "vpx"),
+            "S2A_OPUS_CACHE": str(cache_root / "opus"),
+            "S2A_DAV1D_CACHE": str(cache_root / "dav1d"),
+        }
         context = SimpleNamespace(private=private, engine=self.app.parent / "engine",
                                   run=run, emit=lambda *a, **k: None)
         with patch("embedded.artifact", return_value=None):
-            app = build.compile_host(context, "fixture", {"DEVELOPER_DIR": "fixture"}, self.app.parent)
+            app = build.compile_host(context, "fixture", env, self.app.parent)
         info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
         self.assertEqual(info["LSMinimumSystemVersion"], "15.0")
         self.assertEqual(info["CFBundleExecutable"], "s2arm-host")

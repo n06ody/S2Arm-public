@@ -178,7 +178,7 @@ for name in ("core", "build", "toolchain"):
     if name == "core":
         m.Context = m.atomic = m.digest = m.tree_hash = object
     elif name == "build":
-        m.compile_host = object
+        m.compile_host = m.nospace = object
     sys.modules[name] = m
 sys.path.insert(0, h + "/launchers/macos")
 import bundle_engine
@@ -197,7 +197,7 @@ for name in ("core", "build", "toolchain"):
     if name == "core":
         m.Context = m.atomic = m.digest = m.tree_hash = object
     elif name == "build":
-        m.compile_host = object
+        m.compile_host = m.nospace = object
     sys.modules[name] = m
 sys.path.insert(0, h + "/launchers/macos")
 import bundle_engine
@@ -215,7 +215,7 @@ for name in ("core", "build", "toolchain"):
     if name == "core":
         m.Context = m.atomic = m.digest = m.tree_hash = object
     elif name == "build":
-        m.compile_host = object
+        m.compile_host = m.nospace = object
     sys.modules[name] = m
 sys.path.insert(0, h + "/launchers/macos")
 import bundle_engine

@@ -317,7 +317,7 @@
 "diag.error.zip" = "打包失敗（寫入 zip 時出錯，可能是手機空間不足）";
 "diag.export" = "匯出診斷包";
 "diag.prompt.abnormalExit" = "上次 S2Arm 沒有正常結束（當機、卡住或被系統關閉）";
-"diag.prompt.imlLost" = "上次 S2Arm 沒有正常結束。這次安裝遺失了「提高記憶體上限」權限，玩大型遊戲時結束多半是記憶體不足。依你安裝 S2Arm 的方式補上：\n· 電腦上的 S2Arm（免費或付費 Apple ID）：對這款遊戲點「裝到 iPhone」重裝一次；重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「裝到 iPhone」。\n· 自己的開發者憑證（.p12 + 描述檔）：在蘋果開發者網站替 S2Arm 的 App ID（蘋果替每個 App 登記的身分）開啟「Increased Memory Limit」，重新產生描述檔，用新描述檔重簽再裝。\n· AltStore：用 AltStore Classic 2.2 或更新版重新安裝（不是重新整理）。\n· SideStore 0.7.0：簽署會遺失這項權限，用下面的 GetMoreRam 補上後，在 SideStore 裡重新安裝。\n· Sideloadly：暫不支援，它沒說免費帳號會保留這項權限，自訂權限要付費開發者帳號。\n· GetMoreRam：用安裝 S2Arm 的同一個 Apple ID 把它自簽裝到手機（佔免費帳號一個 App 名額，用完可刪），登入後開啟 App IDs、點重新整理、選 S2Arm、點「Add Increased Memory Limit」，再用原來的方式重裝 S2Arm。";
+"diag.prompt.imlLost" = "上次 S2Arm 沒有正常結束。這次安裝遺失了「提高記憶體上限」權限，玩大型遊戲時結束多半是記憶體不足。依你安裝 S2Arm 的方式補上：\n· 電腦上的 S2Arm（免費或付費 Apple ID）：點遊戲庫第一格「S2Arm」裡的「續簽 S2Arm」重裝一次；重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「續簽 S2Arm」。\n· 自己的開發者憑證（.p12 + 描述檔）：在蘋果開發者網站替 S2Arm 的 App ID（蘋果替每個 App 登記的身分）開啟「Increased Memory Limit」，重新產生描述檔，用新描述檔重簽再裝。\n· AltStore：用 AltStore Classic 2.2 或更新版重新安裝（不是重新整理）。\n· SideStore 0.7.0：簽署會遺失這項權限，用下面的 GetMoreRam 補上後，在 SideStore 裡重新安裝。\n· Sideloadly：暫不支援，它沒說免費帳號會保留這項權限，自訂權限要付費開發者帳號。\n· GetMoreRam：用安裝 S2Arm 的同一個 Apple ID 把它自簽裝到手機（佔免費帳號一個 App 名額，用完可刪），登入後開啟 App IDs、點重新整理、選 S2Arm、點「Add Increased Memory Limit」，再用原來的方式重裝 S2Arm。";
 "diag.prompt.crash" = "系統回報上次 S2Arm 當機或卡住了";
 "diag.prompt.message" = "%@。會上傳執行紀錄、當機紀錄和遊戲用過的圖形管線清單（只有著色器編號），不會上傳存檔、金鑰和遊戲檔案；上傳完成後會給你一組短碼。";
 "diag.prompt.no" = "不用了";
@@ -341,7 +341,7 @@
 "diag.report.placeholder" = "必填：哪款遊戲、做了什麼、看到了什麼";
 "diag.upload.post" = "前往 GitHub 發文";
 "diag.upload.retry" = "再試一次";
-"dprompt.expiry.body" = "還剩%@。到期後遊戲將無法開啟，存檔不會遺失：連接手機後再點一次「裝到 iPhone」，或在 AltStore 裡重新整理。";
+"dprompt.expiry.body" = "還剩%@。到期後遊戲將無法開啟，存檔不會遺失：連接手機後點遊戲庫第一格「S2Arm」裡的「續簽 S2Arm」，或在 AltStore 裡重新整理。";
 "dprompt.expiry.hours" = "約 %d 小時";
 "dprompt.expiry.lessThanHour" = "不到 1 小時";
 "dprompt.expiry.title" = "簽署即將到期";
@@ -368,7 +368,7 @@
 "gfx.fpsLimit" = "幀率上限";
 "gfx.fpsLimit.none" = "不限";
 "gfx.resolution" = "渲染解析度";
-"iml.lost.body" = "大型遊戲可能會記憶體不足而閃退或變慢。依你安裝 S2Arm 的方式補上：\n· 電腦上的 S2Arm（免費或付費 Apple ID）：對這款遊戲點「裝到 iPhone」重裝一次；重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「裝到 iPhone」。\n· 自己的開發者憑證（.p12 + 描述檔）：在蘋果開發者網站替 S2Arm 的 App ID（蘋果替每個 App 登記的身分）開啟「Increased Memory Limit」，重新產生描述檔，用新描述檔重簽再裝。\n· AltStore：用 AltStore Classic 2.2 或更新版重新安裝（不是重新整理）。\n· SideStore 0.7.0：簽署會遺失這項權限，用下面的 GetMoreRam 補上後，在 SideStore 裡重新安裝。\n· Sideloadly：暫不支援，它沒說免費帳號會保留這項權限，自訂權限要付費開發者帳號。\n· GetMoreRam：用安裝 S2Arm 的同一個 Apple ID 把它自簽裝到手機（佔免費帳號一個 App 名額，用完可刪），登入後開啟 App IDs、點重新整理、選 S2Arm、點「Add Increased Memory Limit」，再用原來的方式重裝 S2Arm。";
+"iml.lost.body" = "大型遊戲可能會記憶體不足而閃退或變慢。依你安裝 S2Arm 的方式補上：\n· 電腦上的 S2Arm（免費或付費 Apple ID）：點遊戲庫第一格「S2Arm」裡的「續簽 S2Arm」重裝一次；重裝後還看到這則提示，就用下面的 GetMoreRam 補上，再點一次「續簽 S2Arm」。\n· 自己的開發者憑證（.p12 + 描述檔）：在蘋果開發者網站替 S2Arm 的 App ID（蘋果替每個 App 登記的身分）開啟「Increased Memory Limit」，重新產生描述檔，用新描述檔重簽再裝。\n· AltStore：用 AltStore Classic 2.2 或更新版重新安裝（不是重新整理）。\n· SideStore 0.7.0：簽署會遺失這項權限，用下面的 GetMoreRam 補上後，在 SideStore 裡重新安裝。\n· Sideloadly：暫不支援，它沒說免費帳號會保留這項權限，自訂權限要付費開發者帳號。\n· GetMoreRam：用安裝 S2Arm 的同一個 Apple ID 把它自簽裝到手機（佔免費帳號一個 App 名額，用完可刪），登入後開啟 App IDs、點重新整理、選 S2Arm、點「Add Increased Memory Limit」，再用原來的方式重裝 S2Arm。";
 "iml.lost.short" = "大型遊戲可能會記憶體不足而閃退。點「了解詳情」看怎麼重新簽署帶上這項權限。";
 "iml.lost.title" = "這次安裝遺失了「提高記憶體上限」權限";
 "lan.denied.later" = "以後再說";

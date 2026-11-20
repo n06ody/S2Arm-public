@@ -10,7 +10,7 @@
 #include <mach/mach.h>
 #include <string.h>
 #include <unistd.h>
-__attribute__((constructor(100))) static void need(void) { setenv("S2A_WIN_NEED_MB", "63488", 1); setenv("S2A_GUEST_FILE", "1", 1); setenv("S2A_GUEST_FILE_MIN_FREE_MB", "1", 1); }   // 空间门槛压到 1 MB：门禁机临时盘余量不定，这里只验接上后的行为（空间不够见 t_guest_file_nospace）   // 先于 vawin.c 的构造函数（101）
+__attribute__((constructor(100))) static void need(void) { setenv("S2A_WIN_NEED_MB", "63488", 1); setenv("S2A_GUEST_FILE", "1", 1); setenv("S2A_GUEST_FILE_MIN_FREE_MB", "1", 1); setenv("S2A_GUEST_FILE_ANON_BUDGET_MB", "0", 1); }   // 匿名预算 0 = 旧行为（整段进文件）：本测验的是文件后备本身（溢出模式见 t_guest_file_overflow）   // 空间门槛压到 1 MB：门禁机临时盘余量不定，这里只验接上后的行为（空间不够见 t_guest_file_nospace）   // 先于 vawin.c 的构造函数（101）
 static long long fp(void) { task_vm_info_data_t i; mach_msg_type_number_t c = TASK_VM_INFO_COUNT; task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&i, &c); return (long long)i.phys_footprint; }
 static int bad;
 #define CHECK(c, ...) do { if (c) { printf("✓ "); } else { printf("✗ "); bad++; } printf(__VA_ARGS__); putchar('\n'); } while (0)
@@ -18,6 +18,13 @@ int main(void) {
     if (!s2a_window_ok()) { printf("✗ t_guest_file：窗口没占到\n"); return 1; }
     uint64_t b, n; s2a_window_get(&b, &n); size_t pg = (size_t)getpagesize();
     CHECK(s2a_guest_fd() >= 0, "① 窗口换成文件后备（fd %d）", s2a_guest_fd());
+    {   // ⓪ 匿名预算 0 = 旧行为：判开时整段进文件——没放开过的任意地址都已在文件里，放开前不必按块定（s2a_guest_commit 不改什么）
+        void s2a_guest_commit(uint64_t, uint64_t); uint64_t far = b + (20ull << 30);
+        CHECK(s2a_guest_in_file(b, 0x4000) == 1 && s2a_guest_in_file(far, 0x4000) == 1 && s2a_guest_in_file(b + n - 0x4000, 0x4000) == 1, "⓪ 预算 0：窗口首 / 中 / 尾没放开过的地址都已在文件里");
+        s2a_guest_commit(far, 64u << 20); uint8_t *f = (uint8_t *)(uintptr_t)far;
+        if (mprotect(f, 0x4000, PROT_READ | PROT_WRITE)) CHECK(0, "⓪ 放开失败");
+        else { f[9] = 0x3c; uint8_t c = 0; CHECK(pread(s2a_guest_fd(), &c, 1, (off_t)(far + 9 - b)) == 1 && c == 0x3c, "⓪ 预算 0：第一次放开写入就在文件里（文件字节 %#x）", c); mprotect(f, 0x4000, PROT_NONE); }
+    }
     uint8_t *q = (uint8_t *)(uintptr_t)(b + (4ull << 30)); size_t N = 256u << 20;
     if (mprotect(q, N, PROT_READ | PROT_WRITE)) { printf("✗ t_guest_file：放开 256 MB 失败\n"); return 1; }
     long long f0 = fp(); for (size_t i = 0; i < N; i += 64) q[i] = (uint8_t)(i >> 6) | 1; long long df = fp() - f0;
@@ -67,6 +74,13 @@ int main(void) {
             CHECK(dg > (48ll << 20), "⑥ 挖回的段写 64 MB：实占 +%lld KB（匿名计实占，期望 > 49152 KB）", dg >> 10);
             CHECK(r == (ssize_t)sizeof buf && nz == 0 && c[64] == 7, "⑥ 后备文件同偏移读回全 0（数据没进文件，非 0 %zu 处，读 %zd 字节）", nz, r); }
     }
+    {   // ⑦ 显式设 S2A_GUEST_FILE_ANON_BUDGET_MB=0 的对照局不写预算记录（vawin.c s2a_guest_budget_note）：心跳报剩余 3000 MB 后，记录目录里没有 anon_budget
+        void s2a_guest_budget_note(uint64_t); char d[] = "/tmp/t_gf_recXXXXXX", pk[300], rp[300];
+        if (!mkdtemp(d)) CHECK(0, "⑦ 建临时目录失败");
+        else { snprintf(pk, sizeof pk, "%s/mem_peak_anon", d); snprintf(rp, sizeof rp, "%s/anon_budget", d); setenv("S2A_GUEST_MEM_PEAK", pk, 1);
+            s2a_guest_budget_note(3000ull << 20);
+            CHECK(access(rp, F_OK) != 0, "⑦ 显式设 0 的对照局：心跳后没写预算记录（%s）", access(rp, F_OK) ? "没有" : "有");
+            unlink(rp); rmdir(d); unsetenv("S2A_GUEST_MEM_PEAK"); } }
     printf("%s t_guest_file：%d 项不符\n", bad ? "✗" : "✓", bad);
     return bad != 0;
 }

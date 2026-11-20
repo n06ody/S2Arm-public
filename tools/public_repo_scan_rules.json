@@ -174,6 +174,16 @@
       "reason": "自家 S2Arm 应用图标（同目录 AppIcon.svg 为源稿）、透明底字标，和由应用图标生成的金色 S（毛玻璃双色：香槟金 + 玫瑰金，make_s_gold.py）。"
     },
     {
+      "id": "own_v060_posters",
+      "categories": [
+        "game_screenshot"
+      ],
+      "paths": [
+        "docs/images/v060/poster-*.png"
+      ],
+      "reason": "0.6.0 README / 官网用的五张功能海报（中文、英文各一套）：HTML + CSS 画的界面示意、几何图形和文字，由无头浏览器渲染，不含任何游戏画面或角色。"
+    },
+    {
       "id": "own_feature_spotlight_art",
       "categories": [
         "game_screenshot"

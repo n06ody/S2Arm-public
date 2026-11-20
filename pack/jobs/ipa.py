@@ -286,8 +286,6 @@ def _build(c):
         env.update(S2A_PACK_PLAT="ios", S2A_TARGET="ios", S2A_PY=os.sys.executable)
         for k, v in pso_env(tgt).items():   # 随包管线（计算 / 基础）按目标设备出：不传时 pack/jobs/archs.py 对用户 iPhone 包不猜、管线段整段跳过（0 份）
             env.setdefault(k, v)
-        from library import source_file_bytes
-        env["S2A_SOURCE_BYTES"] = str(source_file_bytes(selected_packages(game)))   # 原件文件总字节：随包基础管线上限 = 它的 10%（pack/stage_direct_cpso.sh）
         # 存档游戏身份（和 Mac 存档作业 saves.identity 同一份）：一键出包只在「从原件出包」时自己生成，启动器走 --from-extract 一直缺，
         #   iPhone 包里没有 save-identity.json → 存档管理页报「缺少游戏身份」、iCloud 存档不同步（11-09 真机）。这里按游戏库目录写好交给它
         from saves import identity as save_identity

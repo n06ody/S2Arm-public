@@ -1,39 +1,91 @@
 <p align="center"><a href="https://s2arm.com"><img src="docs/images/s2arm-wordmark.png" width="420" alt="S2Arm"></a><br><a href="https://s2arm.com">s2arm.com</a></p>
 
+<p align="center">[简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [English](README.md) · [日本語](README.ja.md) · [Español](README.es.md) · [Français](README.fr.md)</p>
+
 > [!NOTE]
-> **Good news: [s2arm.com](https://s2arm.com) is now the official S2Arm website.** S2Arm is free and open source and never accepts donations; get S2Arm only from [s2arm.com](https://s2arm.com) or this GitHub repository.
+> **[s2arm.com](https://s2arm.com) is the official S2Arm website.** S2Arm is free and open source and never accepts donations; get S2Arm only from [s2arm.com](https://s2arm.com) or this GitHub repository.
 
-**Your own Switch games, running natively on iPhone, iPad and Mac.** Game code is rewritten to native ARM64 and runs directly on the device's processor, with graphics going straight to Metal. Your whole library lives in one app, and a few clicks in the Mac or Windows launcher take a game from import to play.
+**Your own Switch games, running natively on iPhone, iPad and Mac.** Game code is rewritten to native ARM64 and runs directly on the device's processor, with graphics going straight to Metal. From 0.6.0 there is a single S2Arm app on your phone and every game lives in its library: in the Mac or Windows launcher, send games to your iPhone one by one and play.
 
-Platforms: iPhone / iPad (iOS / iPadOS 18 and later) · Mac (Apple silicon, macOS 15 and later) · Build on Mac or Windows · Android / HarmonyOS coming soon · License: Apache-2.0 · **Bring your own games**
+Platforms: iPhone / iPad (iOS / iPadOS 18 and later) · Mac (Apple silicon, macOS 15 and later) · Mac or Windows launcher · License: Apache-2.0 · **Bring your own games**
 
-[简体中文](README.zh-CN.md) · [Download the launcher](https://jhaizhou-ops.github.io/S2Arm/) · [All releases](https://github.com/jhaizhou-ops/S2Arm/releases) · [Evidence](docs/validation/EVIDENCE.md)
+[Download the launcher](https://s2arm.com) · [All releases](https://github.com/jhaizhou-ops/S2Arm/releases) · [Evidence](docs/validation/EVIDENCE.md)
 
-<p align="center"><img src="docs/images/launcher-welcome-en.png" width="760" alt="S2Arm launcher welcome page"></p>
+<p align="center"><img src="docs/images/v060/poster-01.en.png" width="420" alt="One app for all your games"></p>
 
-## A native port, not an emulator
+## What's new in 0.6.0
 
-The game's own ARM64 code is rewritten at build time and then runs directly on the processor in your iPhone, iPad or Mac. There is no CPU emulator in between. Graphics calls are translated straight to Metal, and system services come from a native host. That is where the speed, the low heat and the battery life come from. [Evidence](docs/validation/EVIDENCE.md#native-port)
+### One app for all your games
 
-## One app, your whole library
+Install S2Arm on your phone once, then add games one by one. Updating or renewing S2Arm never means installing your games again, and your saves stay. Sign with a free or paid Apple ID or a developer certificate, or sign it yourself and import it.
 
-Every game you import goes into the same S2Arm app; open it and pick what to play. The whole library takes a single App slot on your developer account, so adding a game never means installing another app or spending another signing slot. [Evidence](docs/validation/EVIDENCE.md#one-app-whole-library)
+### Snapshots: save this moment, come back any time
 
-## Graphical launchers, next to zero setup
+No need to wait for the game's own save point. In a game, tap the ◉ in the top-right corner to save the moment you're in; press and hold it and choose Go back to the saved moment to return. Next time, Continue from this moment at the top of the library takes you straight there.
 
-There is a graphical launcher for Mac and one for Windows. On first launch the welcome page boils everything down to three steps: get this computer ready, add your keys, add your games, with a single primary button at any moment. Everything else is either bundled or fetched in one click, and you never touch a command line.
+- Each game keeps only the latest snapshot; a new one replaces the old.
+- A snapshot takes storage on your phone (the size depends on the game). Press and hold to delete it and free the space, or turn snapshots off in Settings.
+- A snapshot only works on the device that saved it, and still works after you update S2Arm.
 
-After you click Build, every stage shows its progress, elapsed and remaining time, and disk use. Several games can queue up and build one after another. [Evidence](docs/validation/EVIDENCE.md#graphical-launchers)
+<p align="center"><img src="docs/images/v060/poster-02.en.png" width="420" alt="Snapshots"></p>
 
-<p align="center">
-  <img src="docs/images/launcher-oneclick-en.png" width="400" alt="One-click build">
-  <img src="docs/images/launcher-export-en.png" width="400" alt="Build progress">
-</p>
+### One file, any of your devices
 
-<p align="center">
-  <img src="docs/images/launcher-success-en.png" width="400" alt="Build finished">
-  <img src="docs/images/launcher-library-en.png" width="400" alt="Game library">
-</p>
+Export any game as a .s2arm file and import it on another of your devices to play; the phone signs it by itself. Each game keeps one copy of its files, and Free up space shows what games, saves and snapshots take.
+
+### Every shader, ready from the first play
+
+Shaders the game needs are prepared when you send it, so new areas no longer stutter the first time. Player diagnostics collected **26,809** shaders from 69 games that failed to compile on the device. Leaving out 278 damaged inputs that can't be read as shaders, **all 26,531** of the rest now compile.
+
+How it is counted: the rate covers only shaders that **had failed to compile** in player diagnostics; it is not a coverage rate for all shaders. Of the remaining 98, 91 were not shaders at all but memory read wrongly during capture (capture fixed), and the other 7 have been fixed at the root.
+
+Note: on iPhone, precompiled pipelines are generated only when you Push to iPhone with that iPhone connected. When exporting for self-signing (no iPhone connected) or with several iPhones connected, this version still compiles them the first time they are needed, as in 0.5. This will improve in a later version.
+
+### Fixes, performance and graphics
+
+From 0.5.0 to 0.6.0 (how each number is counted is in the table):
+
+| | Number | How it's counted |
+|---|---|---|
+| Fixes merged | **344** | Fix commits merged into main after 0.5.0 |
+| Player reports handled | **156** | Feedback issues closed after 0.5.0 |
+| Community contributions | **126** | Pull requests from players and developers |
+| GPU render time | **−50%** | Deferred-lighting scene, 4.8–5.9 ms → 2.7 ms |
+| Build memory peak | **−35%** | Peak memory while building large games |
+
+Also: several kinds of shader problems fixed at the root, more reliable loading and saving, smoother frame generation, and steadier app install, signing and sending on Windows and Mac. Thank you to every player who reported a problem.
+
+## Getting started
+
+1. Download the Mac or Windows launcher from [s2arm.com](https://s2arm.com) and open it.
+2. Import your own keys and games; put the base game, updates and DLC in one folder and import them together.
+3. Connect your iPhone, click Install S2Arm on the S2Arm tile, first in the launcher's game library, sign in and sign with your Apple ID, and S2Arm goes onto your phone.
+4. Pick a game and click Push to iPhone.
+5. Open S2Arm on your phone and pick a game in the library.
+
+You can also play on the Mac itself: choose This Mac. Without a cable, export a .s2arm file and put it on your phone with AirDrop or the Files app.
+
+### Self-signing with AltStore / SideStore
+
+Import games right on your phone, with no Apple ID sign-in on a computer and no new certificate:
+
+1. In AltStore or SideStore settings, export your signing certificate and set a password.
+2. Open S2Arm: gear → Signing certificate → Import .p12…, pick the certificate and enter the password.
+3. Then put .s2arm and .img files (exported from your computer or shared by a friend) into S2Arm's Import Here folder, and play.
+
+Note: manage each Apple ID from AltServer on only one computer. Using two makes them revoke each other's certificates, and AltStore shows "Multiple AltServers". Before the 7 days run out, just tap Refresh All in AltStore; nothing else to do in S2Arm.
+
+### Upgrading from 0.5
+
+The games, saves and game data already on your phone all stay. No exporting again, no sending game data again.
+
+1. On a Mac, sign in with your Apple ID once in S2Arm (0.5 used the account signed in to Xcode; 0.6.0 signs in inside S2Arm. Windows players skip this step).
+2. Connect your phone and click Update S2Arm on the S2Arm tile, first in the game library. Your saves are backed up to the computer first, then the new app goes on over the old one (same Apple ID).
+3. Right after that, the same page says how many old games on this phone need one update before they play; they are all checked, so click Update these N games (or later, check the games marked Update suggested in the dashboard and click Update selected). One game at a time, it brings the saves back to the computer, pushes the new program and sends only the resources that changed; each game takes about 1–2 minutes. For games whose shader library was built by the old version, the computer rebuilds it with the new one in this step (the game's files or its Mac version must still be in your library); the first time takes from a few minutes to a few tens of minutes. You don't need S-grade optimization for this. On a Windows PC without the Metal developer tools, this step sends the old library and says why; the game still plays, and once you install them under Get this PC ready, push again to get the new library.
+
+Until step 3 is done those games show Update once on your computer on the phone and won't open, but they aren't gone. Games installed from another computer are listed on a separate line on the same page; update them on that computer. If you used Free up space to delete a game's iPhone resource pack, build that game's iPhone package again.
+
+If you sign the app yourself with AltStore or similar: connect the phone, click Install S2Arm on the S2Arm card first in the game library, and on the page saying you aren't signed in with an Apple ID, click Export for self-signing instead (no iPhone needed) to get the new S2Arm.ipa; install it over the old one with AltStore; import your signing certificate (SideStore: gear → Signing certificate → Get from SideStore in S2Arm; AltStore: export it in AltStore settings, then Import .p12…); finally click Send selected to iPhone in the console, or click Export for self-signing on each game and put its .s2arm and .img into Import Here.
 
 ## Let an AI drive
 
@@ -53,7 +105,7 @@ It moves forward with a few commands, and you can watch every step in the launch
 /Applications/S2Arm.app/Contents/Resources/s2armctl diag export ~/Desktop/S2Arm-diagnostics.zip   # export a diagnostic bundle if it cannot fix a problem
 ```
 
-Anything only you can do (system permission prompts, signing in with your Apple ID, tapping Trust on your phone), the AI stops and asks you to do. On Windows, use `s2armctl.cmd` in the launcher folder with the same commands. Windows builds iPhone / iPad packages only, so for problems inside a game export the diagnostic bundle on the phone: long-press the game screen with four fingers for 1.5 seconds and choose Export diagnostics.
+Anything only you can do (system permission prompts, signing in with your Apple ID, tapping Trust on your phone), the AI stops and asks you to do. On Windows, use `s2armctl.cmd` in the launcher folder with the same commands. Windows builds iPhone / iPad packages only, so report problems inside a game from the phone: tap the report button to the right of the gear at the top left in game and say which game, what you did and what you saw. The diagnostic bundle is uploaded with it.
 
 **Something wrong inside a game** (graphics, frame rate, stutter, crashes)? Send your AI:
 
@@ -79,10 +131,9 @@ A Switch 2 game, measured on an iPhone 17 Pro Max: a **full 60 fps** while the p
 
 | Platform | Support |
 |---|---|
-| iPhone / iPad | iOS / iPadOS 18 and later; every game is chosen inside one app |
-| Mac | Apple silicon, macOS 15 and later; builds locally and plays games right on the Mac |
-| Windows | Graphical launcher that builds and installs games for iPhone / iPad |
-| Android / HarmonyOS | Coming soon |
+| iPhone / iPad | iOS / iPadOS 18 and later; every game in one S2Arm app |
+| Mac | Apple silicon, macOS 15 and later; the launcher installs the app and sends games, and you can also play on the Mac |
+| Windows | Graphical launcher: install the app, send games, export .s2arm |
 
 [Evidence](docs/validation/EVIDENCE.md#platforms)
 
@@ -93,15 +144,6 @@ Some games have a deep port made specially by the community. S2Arm recognizes th
 | Route | Project | Devices | Contract |
 |---|---|---|---|
 | D2R-Mobile | [jhaizhou-ops/d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) | iPhone / iPad (iOS 26 and later; Android and HarmonyOS in progress) | [docs/S2ARM.md](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/S2ARM.md) |
-
-## Getting started
-
-1. Download the Mac or Windows launcher from the [download page](https://jhaizhou-ops.github.io/S2Arm/) and open it. Building for iPhone on a Mac needs the free Xcode from the App Store, signed in with your Apple ID; the launcher walks you through it.
-2. Import your own keys and games. Put the base game, updates and DLC in one folder and import them together.
-3. Choose iPhone / iPad or this Mac, then click Build.
-4. Follow the launcher to sign and install with your own Apple ID (the Windows launcher ships with the Impactor signing tool), open S2Arm, and pick a game from the library.
-
-Back up your saves before updating the app. The release uses the new app identifier `io.s2arm.*`, which the system treats as a new app: saves from the beta builds do not carry over automatically.
 
 ## Honest boundaries
 

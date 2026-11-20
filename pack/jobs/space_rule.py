@@ -38,12 +38,20 @@ PACK_SMALL_BYTES, DIRECT_SMALL_BYTES, DIRECT_LARGE_BYTES = int(3e9), int(5e9), i
 def selected_packages(game):
     bases = [p for p in game["packages"] if p["type"] == "base"]
     updates = [p for p in game["packages"] if p["type"] == "update"]
-    result = ([max(bases, key=lambda p: p["version"])] if bases else [])
+    # Integrated packages can leave duplicate version=0 records after an old
+    # source is moved or removed. Prefer a source that still exists so a stale
+    # first entry cannot pin the build to the wrong game version.
+    def rank(package):
+        path = package.get("path") or ""   # 没记路径的包（夹具 / 旧目录）当作在
+        available = os.path.exists(path) if os.path.isabs(path) else True
+        return package["version"], available
+
+    result = ([max(bases, key=rank)] if bases else [])
     if updates:
-        result.append(max(updates, key=lambda p: p["version"]))
+        result.append(max(updates, key=rank))
     dlc = {}
     for p in game["packages"]:
-        if p["type"] == "dlc" and (p["titleId"] not in dlc or dlc[p["titleId"]]["version"] < p["version"]):
+        if p["type"] == "dlc" and (p["titleId"] not in dlc or rank(dlc[p["titleId"]]) < rank(p)):
             dlc[p["titleId"]] = p
     return result + [dlc[k] for k in sorted(dlc)]
 
@@ -59,12 +67,6 @@ def pack_input_bytes(packages):
         content = p.get("contentBytes", 0)
         by_sha[p["sha256"]] = (max(size, p.get("size", 0)), summed + content, max(largest, content), nup or p.get("format") == "nup")
     return sum(max(size, largest if nup else summed) for size, summed, largest, nup in by_sha.values())
-
-
-def source_file_bytes(packages):
-    """玩家导入的原件文件总字节：所选原件按 sha256 去重、取导入时记的文件大小（不含解开后的内容字节）。
-    出包阶段的随包基础管线上限按它算（S2A_SOURCE_BYTES → pack/stage_direct_cpso.sh：原件 × 10%）"""
-    return sum(int(p.get("size") or 0) for p in {p["sha256"]: p for p in packages}.values())
 
 
 def pack_direct_bytes(size):

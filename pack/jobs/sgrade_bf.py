@@ -60,10 +60,6 @@ def rebuild(c, gid, src_root, plat, work):
     os.symlink(tag, roots / f"{gid}@现行")  # 非玩家句
     env = c.env()
     env.update(S2A_ROOTS=str(roots), S2A_ROOTS_SHARED=str(work / "never-shared"), S2A_ROOTS_PRIV=str(work / "roots-private"), S2A_PACK_PLAT=plat)
-    from library import selected_packages, source_file_bytes
-    game = next((g for g in c.catalog().get("games", []) if str(g.get("id", "")).upper() == gid.upper()), None)
-    if game:   # 原件文件总字节：随包基础管线上限 = 它的 10%（pack/stage_direct_cpso.sh；游戏库里没有这款 → 阶段按解开的 romfs 近似）
-        env["S2A_SOURCE_BYTES"] = str(source_file_bytes(selected_packages(game)))
     logs = Path(c.logs) / c.task; logs.mkdir(parents=True, exist_ok=True)
     for st, extra in STAGES:
         c.run(["bash", Path(c.engine) / f"pack/stage_{st}.sh", gid, *extra], logs / f"sgbf_{st}.log", env)

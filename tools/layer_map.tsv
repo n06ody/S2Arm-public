@@ -95,6 +95,10 @@ Directory.Build.rsp	工具与测试	构建开关	工具与文档
 AGENTS.md	文档与约定	总说明	工具与文档
 README.md	文档与约定	总说明	工具与文档
 README.zh-CN.md	文档与约定	总说明	工具与文档
+README.zh-TW.md	文档与约定	总说明	工具与文档
+README.ja.md	文档与约定	总说明	工具与文档
+README.es.md	文档与约定	总说明	工具与文档
+README.fr.md	文档与约定	总说明	工具与文档
 CONTRIBUTING.md	文档与约定	总说明	工具与文档
 CODE_OF_CONDUCT.md	文档与约定	总说明	工具与文档
 SECURITY.md	文档与约定	总说明	工具与文档

@@ -157,11 +157,13 @@ int main(int argc, char **argv) { @autoreleasepool {
         NVNsyncWaitResult r = API(nvnSyncWait)(&after, W30);
         CHECK(r == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED || r == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
         printf("%s：通过（开闸后 %.1f ms 完成）\n", phase, (now_ns() - t0) / 1e6); } }
-    if (want(argc, argv, 7)) { phase = "⑦ 没围栏的 SyncWait：给多长超时都立刻回 ALREADY_SIGNALED";
+    if (want(argc, argv, 7)) { phase = "⑦ 没围栏的 SyncWait：给多长超时都立刻回 FAILED（同真机驱动）";
     {   // 11-01 原生崩溃线：怒之铁拳4 开局在没围栏的同步对象上带长超时等，原先睡到超时（封顶 1 小时）主线程卡死无首帧；10-29 普查时立刻返回、直连通过
+        // 期望值 3 取自真机驱动（一款 UE4 游戏随包的 NVN：nvnSyncInitialize 置类型 0，nvnSyncWait 类型 0 返回预置的 3），不由被测实现反推；
+        //   回 0 会让以超时 0 轮询「数据就绪」的游戏提前去读（诊断 #343862）
         NVNsync s; API(nvnSyncInitialize)(&s, &device);
-        uint64_t t0 = now_ns(), b0 = s2a_nvn_syncwait_blocks(); CHECK(API(nvnSyncWait)(&s, 2000000000ull) == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
-        CHECK(API(nvnSyncWait)(&s, 0) == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);   // DOOM Eternal：超时 0 轮询也不回超时
+        uint64_t t0 = now_ns(), b0 = s2a_nvn_syncwait_blocks(); CHECK(API(nvnSyncWait)(&s, 2000000000ull) == NVN_SYNC_WAIT_RESULT_FAILED);
+        CHECK(API(nvnSyncWait)(&s, 0) == NVN_SYNC_WAIT_RESULT_FAILED);   // DOOM Eternal：超时 0 轮询也不回超时（它只在 TIMEOUT 时睡下再查）
         // 原判用时 < 50 ms：负载高时调用本身被抢占就假红。改判「没进入阻塞等待」（计数不涨），睡到超时的旧实现必进阻塞等待
         double ms = (now_ns() - t0) / 1e6; uint64_t blocks = s2a_nvn_syncwait_blocks() - b0; CHECK(blocks == 0);
         printf("%s：通过（2 秒超时：进入阻塞等待 %llu 次，用时 %.1f ms 仅供参考）\n", phase, (unsigned long long)blocks, ms); } }

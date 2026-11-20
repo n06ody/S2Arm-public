@@ -1628,7 +1628,11 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
-// A sync never fenced counts as signaled: ALREADY_SIGNALED at once, whatever the timeout. 11-06 质量线（DOOM Eternal 起局 90 秒无首帧，c1106_rj3）：渲染线程在
+// 没打过栅栏的同步对象：立即回 FAILED(3)，不论超时。11-19 按真机驱动核定（一款 UE4 游戏随包的 NVN 驱动：nvnSyncInitialize 把类型字段置 0，nvnSyncWait 先置结果 3、
+//   按类型跳表，类型 0 直达收尾返回 3；nvnCommandBufferFenceSync 录制时不碰同步对象，提交后才有类型）。原先回 ALREADY_SIGNALED：诊断 #343862（010097100EDD6000，
+//   3 台 23 次崩）UE4 粒子实例计数回读先 Clear 栅栏（Finalize + Initialize）、把拷贝与栅栏排给 RHI 线程，工作线程以超时 0 轮询，拿到 0 当成数据已就绪，
+//   去锁还没建出的暂存缓冲（+0x18 空）读 0x28 崩。下面两款的约束照样满足：都是立即返回，DOOM Eternal 只在 TIMEOUT 时睡下再查。
+// 以下为旧注释（「回已触发」的依据是推断，真机实为 FAILED）：A sync never fenced counts as signaled: ALREADY_SIGNALED at once, whatever the timeout. 11-06（DOOM Eternal 起局 90 秒无首帧，c1106_rj3）：渲染线程在
 //   main+0x2c2cac0 以超时 0 轮询每帧两个同步对象里的「上一个」，回 TIMEOUT_EXPIRED 就睡 50 µs 再查（svc 0xb 21 万次）；两个槽只 SyncInitialize、要提交后才
 //   QueueFenceSync，帧开头先等的槽 1 第一次一定没打过栅栏——游戏在真机上能跑，真机对「初始化过、没打栅栏」的同步对象就不回超时（同 InitializeFromNvRmSyncNVX
 //   「一开始就已触发」）。下面怒之铁拳4 的约束（带长超时等没围栏的对象，必须立刻返回）照样满足。原注释：A sync never fenced returns TIMEOUT_EXPIRED at once. 11-01 原生崩溃线：缺口族 40（34a54ae83）把这里改成「睡到别的线程围栏或超时、封顶 1 小时」，
@@ -1649,7 +1653,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
               if (timeout <= first) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
               xq_lock(); nvn_be_xq_flush(owner, "the CPU waits on a fence taken behind it (SyncWait, 100 ms)"); xq_unlock();
           } } }
-    if (!sync_published((const sync_t *)s, &fence)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (!sync_published((const sync_t *)s, &fence)) return NVN_SYNC_WAIT_RESULT_FAILED;   // 没打过栅栏：同真机驱动回 3（见上）
     { int ext = 0; if (sync_ext_wait((const sync_t *)s, 0, &ext)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
       if (ext) { if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
                  return sync_ext_wait((const sync_t *)s, timeout, &ext) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; } }

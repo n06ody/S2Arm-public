@@ -8,7 +8,7 @@
 #include <mach/mach.h>
 #include <stdio.h>
 #include <stdlib.h>
-__attribute__((constructor(100))) static void need(void) { setenv("S2A_WIN_NEED_MB", "63488", 1); setenv("S2A_GUEST_FILE", "1", 1); setenv("S2A_GUEST_FILE_MIN_FREE_MB", "1099511627776", 1); }   // 先于 vawin.c 的构造函数（101）
+__attribute__((constructor(100))) static void need(void) { setenv("S2A_WIN_NEED_MB", "63488", 1); setenv("S2A_GUEST_FILE", "1", 1); setenv("S2A_GUEST_FILE_MIN_FREE_MB", "1099511627776", 1); setenv("S2A_GUEST_FILE_ANON_BUDGET_MB", "0", 1); }   // 匿名预算 0 = 旧行为（整段进文件）：本测验的是文件后备本身（溢出模式见 t_guest_file_overflow）   // 先于 vawin.c 的构造函数（101）
 static long long fp(void) { task_vm_info_data_t i; mach_msg_type_number_t c = TASK_VM_INFO_COUNT; task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&i, &c); return (long long)i.phys_footprint; }
 static int bad;
 #define CHECK(c, ...) do { if (c) { printf("✓ "); } else { printf("✗ "); bad++; } printf(__VA_ARGS__); putchar('\n'); } while (0)

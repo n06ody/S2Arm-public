@@ -123,7 +123,11 @@ def tools():
     folders = {name: _unpack(name, spec, source_root / name) for name, spec in SOURCES.items()}
     _cmake(folders["spirv-headers"], build / "headers", prefix, target)
     _cmake(folders["spirv-tools"], build / "tools", prefix, target, f"-DSPIRV-Headers_SOURCE_DIR={folders['spirv-headers']}", "-DSPIRV_SKIP_TESTS=ON", "-DSPIRV_WERROR=OFF")
-    _cmake(folders["glslang"], build / "glslang", prefix, target, "-DENABLE_OPT=ON", "-DALLOW_EXTERNAL_SPIRV_TOOLS=ON", "-DGLSLANG_TESTS=OFF")
+    # Apple Clang places /usr/local/include ahead of imported -isystem paths.
+    # A stale Homebrew SPIRV-Tools header there otherwise shadows the pinned
+    # headers used by this release runtime.
+    _cmake(folders["glslang"], build / "glslang", prefix, target, "-DENABLE_OPT=ON", "-DALLOW_EXTERNAL_SPIRV_TOOLS=ON", "-DGLSLANG_TESTS=OFF",
+           f'-DCMAKE_CXX_FLAGS=-iquote"{prefix}/include"')
     _cmake(folders["spirv-cross"], build / "cross", prefix, target, "-DSPIRV_CROSS_SHARED=OFF", "-DSPIRV_CROSS_CLI=ON", "-DSPIRV_CROSS_ENABLE_TESTS=OFF")
     # libzstd.1.dylib 要随包（graphics/tools/shbake/zstd_lib.py 用 ctypes 加载），其余压缩库不链，Homebrew 版会带上 macOS 26 的 liblzma
     _cmake(folders["zstd"] / "build/cmake", build / "zstd", prefix, target, "-DZSTD_BUILD_SHARED=ON", "-DZSTD_BUILD_STATIC=OFF", "-DZSTD_PROGRAMS_LINK_SHARED=ON",

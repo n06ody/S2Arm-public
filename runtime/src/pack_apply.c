@@ -1054,6 +1054,7 @@ const char *s2a_s2arm_import_code(void) { return g_s2arm_code; }
 static int s2arm_fail(int rc, const char *code, const char *fmt, ...) {
     snprintf(g_s2arm_code, sizeof g_s2arm_code, "%s", code);
     va_list ap; va_start(ap, fmt); vsnprintf(g_s2arm_err, sizeof g_s2arm_err, fmt, ap); va_end(ap);
+    LOG("【红】.s2arm 导入（%s）：%s", g_s2arm_code, g_s2arm_err);   // 每条失败都进日志（11-17 真机：解压 / 建临时文件阶段失败原先只设码不打日志，看不出是没扫到还是失败）
     return rc;
 }
 static int s2arm_json_str(const char *j, const char *key, char *out, size_t n) {   // 电脑端 json.dumps 写的平铺字符串字段（不处理嵌套）
@@ -1102,7 +1103,7 @@ int s2a_s2arm_import(const char *proc_docs, const char *src, char *gid_out, size
             if (rc) break; }
     }
     ZSTD_freeDStream(z); close(in);
-    if (!rc && last != 0) rc = 1;   // 帧没到尾：还在拷（或拷断了），下次再看
+    if (!rc && last != 0) { rc = 1; LOG(".s2arm 导入：%s 的 zstd 帧还没读到尾，当作还在拷，原样留着，下次扫再看", src); }   // 帧没到尾：还在拷（或拷断了）
     if (rc) { close(out); unlink(tarp); return rc; }
     // ② 读 tar：第一个条目必须是 s2arm.json
     char gid[17] = "", sha[80] = "", root[1400], prog[1400], vdir[64], fmt[32] = "", *cat = NULL; size_t catn = 0; unsigned nprog = 0, npack = 0; uint64_t off = 0;
@@ -1149,7 +1150,7 @@ int s2a_s2arm_import(const char *proc_docs, const char *src, char *gid_out, size
         if (!ok || rename(tp, cp)) { int e = errno; unlink(tp); rc = s2arm_fail(-4, e == ENOSPC ? "ios_install_no_space" : "ios_install_dir_unwritable", "写程序包清单 %s 失败：%s", cp, strerror(e)); }
     }
     free(cat);
-    if (rc) { LOG("【红】.s2arm 导入（%s）：%s", g_s2arm_code, g_s2arm_err); return rc; }
+    if (rc) return rc;   // 原因已在 s2arm_fail 记过
     if (gid_out && gid_n) snprintf(gid_out, gid_n, "%s", gid);
     LOG(".s2arm 导入：%s → 程序 %s（%u 个文件）、资源包派生件 %u 个；game.img 照常放「放这里导入」认领", gid, vdir, nprog, npack);
     return 0;

@@ -13,7 +13,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 16, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 17, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
@@ -81,7 +81,7 @@ SIG(nvn_gpu_view_release, void (*)(nvn_gpu_view));
 SIG(nvn_gpu_samp_create, nvn_gpu_rc (*)(const samp_par *, nvn_gpu_samp *, nvn_gpu_err *));
 SIG(nvn_gpu_samp_release, void (*)(nvn_gpu_samp));
 SIG(nvn_gpu_tex_upload, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *, const void *, uint64_t, uint64_t));
-SIG(nvn_gpu_tex_upload_blocklinear, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const nvn_texlayout *, const void *, uint64_t));
+SIG(nvn_gpu_tex_upload_blocklinear, nvn_gpu_rc (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const nvn_texlayout *, const void *, uint64_t));
 SIG(nvn_gpu_shader_load, nvn_gpu_rc (*)(const nvn_gpu_shader_src *, nvn_gpu_shader *, nvn_gpu_err *));
 SIG(nvn_gpu_shader_release, void (*)(nvn_gpu_shader));
 SIG(nvn_gpu_pipe_get, nvn_gpu_rc (*)(const nvn_gpu_pipe_desc *, int, nvn_gpu_pipe *, nvn_gpu_err *));

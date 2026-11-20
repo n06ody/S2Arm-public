@@ -421,7 +421,7 @@ struct PackCompletionHero: View {
                     }
                 }
                 step(2, L("打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏")) { EmptyView() }
-                Text(L("免费 Apple ID 签的 App 7 天过期：到时连上 iPhone 再点一次「装到 iPhone」，已经在机上的资源包不用重拷。"))
+                Text(L("免费 Apple ID 签的 App 7 天过期：到时连上 iPhone 点游戏库第一格「S2Arm」里的「续签 S2Arm」，手机上的游戏不用重新推。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

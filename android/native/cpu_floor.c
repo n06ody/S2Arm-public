@@ -15,6 +15,7 @@
 #endif
 #include "cpu_floor.h"
 #include "cpu_floor_policy.h"
+#include "adpf_hint.h"
 #include "power_state.h"
 #include "system_tuning.h"
 #include <errno.h>
@@ -295,6 +296,7 @@ static const char *why_text(int why) {
     case S2A_FLOOR_WHY_IDLE: return "没在出图";
     case S2A_FLOOR_WHY_CAP_DROP: return "系统在压上限";
     case S2A_FLOOR_WHY_NO_GAIN: return "没有收益";
+    case S2A_FLOOR_WHY_ADPF: return "ADPF 已接受帧耗时";
     default: return "-";
     }
 }
@@ -467,7 +469,7 @@ static void *floor_main(void *arg) {
             };
             memcpy(in.max_khz, fq.max_khz, sizeof in.max_khz);
             const int was = active;
-            active = s2a_floor_step(&st, &in);
+            active = s2a_floor_cpu_step(&st, &in, s2a_adpf_session_active());
             {   // GPU 锁频：同一份帧率 / 生命周期输入，频率与上限换成 GPU
                 gq_poll(&gq, now);
                 struct s2a_floor_in gin = in;
@@ -528,6 +530,9 @@ static void *floor_main(void *arg) {
                          (unsigned long long)((st.nogain_until_ns > now ? st.nogain_until_ns - now : 0) / 1000000000ull));
                 floor_log(text);
                 block_log_ns = now;
+            } else if (st.block == S2A_FLOOR_BLOCK_ADPF && (!block_log_ns || now - block_log_ns >= 30000000000ull)) {
+                floor_log("CPU 托底暂停，ADPF 已接受帧耗时");
+                block_log_ns = now;
             }
             if (!next_stat) {   // 第一次：开读数窗口，丢掉之前攒下的间隔
                 unsigned h0[S2A_FLOOR_NBUCKET]; drain_hist(h0);
@@ -553,7 +558,7 @@ static void *floor_main(void *arg) {
 #endif
             atomic_fetch_add_explicit(&g_ticks, 1, memory_order_release);   // 一个周期的全部事做完才计数（测试靠它同步）
         }
-        if (active) { burn_slice(kind); continue; }
+        if (active && !s2a_adpf_session_active()) { burn_slice(kind); continue; }
         uint64_t t = now_ns();
         wait_for(next_tick > t ? next_tick - t : 0);
     }

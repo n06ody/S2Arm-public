@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 直连库每对着色器（离线配对表 ∪ 管线种子表）的拉取基础管线归档（出包时离线编，随包放 shaders/direct/pipelines/）：
-#   python3 base_pipelines.py <shaders/direct 目录> <输出 pipelines 目录> --plat ios|macos --os <系统大版本> --arch <GPU 架构> [--arch …] --orig-bytes <原件字节> [--orig-src <来源>] [--cache <目录>] [-j <路数>]
+#   python3 base_pipelines.py <shaders/direct 目录> <输出 pipelines 目录> --plat ios|macos --os <系统大版本> --arch <GPU 架构> [--arch …] [--cache <目录>] [-j <路数>]
 # 为什么：混合管线（nvn_hybrid.inc hybrid_get）首遇一对着色器时要它的「拉取基础管线」（拉取式顶点 <键>_bp + 片元、颜色状态留空、不带顶点描述），
 #   原先只能在设备上后台用 Metal 4 编译器现建，建好之前这对的首遇照旧跳过 / 等精确管线（Ori 2 菜单进序章：提交线程首遇现建 42 条、合计 825 ms）。
 #   这里在出包机上按设备同一描述离线编好，设备首遇先查随包归档（MTL4Archive 只查不编），命中直接按本笔颜色状态特化，不再后台建。
@@ -26,18 +26,10 @@
 #   代价：同一片元配几个顶点时它的库在每个文件里各带一份（11-19 本机实测 3 对共用片元：分开 249696 字节、合进一个文件 169664 字节，多约 1/3）。
 # metal-tt / 缓存 / 进程组 / 重试与 cs_pipelines.py 同一套（从那里引用）。缓存键 = 本工具格式号 + 两个函数的模块 sha256（或整段库）+ 特化与否 + 入口 + 平台 + 大版本 + 架构表 + metal-tt 版本。
 #   缓存存的就是随包的那份（iPhone 压过的、Mac 原样）：键里本来就有平台，两种不会互相命中；命中只克隆、不再压，iPhone 那份缓存也省一半盘。
-# 预算（维护者定，对所有游戏）：随包基础管线（随包实际字节：iPhone 压过的、Mac 原样，含首查预热对两份）不超过原件大小 × BUDGET_FRAC（10%）。
-#   原件大小由阶段脚本给（--orig-bytes：玩家导入的原件文件总字节，拿不到时是解开的 romfs + exefs + aoc 的近似，--orig-src 写明是哪种）；
-#   给 0 / 没给 = 拿不到 → 一对都不出、打一行黄、退出 0（不拦出包；设备首遇照旧后台建 + 混合管线）。
-#   超了按组装：组 = 顶点着色器在 shader_map.tsv 第 5 列来源里「#var<号>」之前的部分（source_groups：BNSH 系 = 一个 BNSH 容器，Unity = 一个着色器，
-#     MSHD / SDF = 一个文件）；没有 #var 的来源（GLSLC、UE、合并进来的 s2a: 行、计算着色器…）和不在映射表里的顶点认不出，一个顶点键单独成组。
-#     一对归它顶点着色器的组（order_groups）：同一变体的顶点 / 片元本来同组；不同组时按顶点，因为片元常被大量顶点共用（单阶段程序的覆盖片元
-#     配全部单阶段顶点，shader_split.separable_pairs），按片元分组会把这些对全并成一个巨组；且映射表一个键只记首次出现的来源，共用的片元记在哪组是偶然的。
-#   次序：先装「组里有任一对出现在种子表 R 行」的组（整组都装），再装其余组；两类各自按组内对数从少到多（同数按组名）。
-#   装到预算为止：按组为单位，一组装不下就停（不跳过它去试后面的组：非种子组按对数升序，后面的只会更大；种子组排在前，停在种子组 = 种子都装不下）。
-#   并行编译：按上面的次序分批提交（批 = 若干整组，凑够 max(4 × 路数, 剩余预算 × 0.9 ÷ 已编对的平均字节) 对），一批编完按真实字节逐组累计，
-#     装不下的那组起这一批余下的组文件删掉（编进了缓存，不白编）。随包字节从不超过预算；多编的上界 = 最后一批（至多 max(4 × 路数, 估算对数) 对再加一整组）。
-# 输出：标准输出最后一行一句读数（总对数、装进对数 / 组数、超预算不出的对数 / 组数、随包字节、原件字节、占比）；有对（或预热对）编不出 → 照出其余、退出 3（调用方打黄）；参数 / 库读不了 → 退出 1。配对表与种子表都没有 = 0 对、退出 0（也不出预热对）。
+# 全装：plan 能出的对全部编、全部随包，不设体积上限（11-20 维护者：「规定包里最多放原件体积的 10%，这是啥规定，没这个规定啊，玩家玩着不卡更重要」）。
+#   原先按原件 10% 预算按组装填（11-19 我方自定的工程上限），Ori 2 可出 14935 对只装进 4776 对，序章真用到的 181 对里只有 44 对随包；全装后 181 对全在。
+#   代价（11-20 本机实测 Ori 2，Mac 原样、单架构）：随包 464 MB → 1422 MB（原件的 30.6%），这一步 CPU 1641 → 4951 秒。
+# 输出：标准输出最后一行一句读数（总对数、跳过、出 / 失败对数、随包字节、每对字节）；有对（或预热对）编不出 → 照出其余、退出 3（调用方打黄）；参数 / 环境错 → 其他非 0。
 import argparse
 import ctypes
 import hashlib
@@ -70,8 +62,6 @@ WARM = 's2a_warm'   # 首查预热对的文件名（设备 nvn_hybrid.inc hybrid
 WARM_SRC = ('#include <metal_stdlib>\nusing namespace metal;\n'   # 无输入、无绑定，只为让设备开局查中一次（函数名设备同名）
             'vertex float4 s2a_warm_v(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }\n'
             'fragment float4 s2a_warm_f() { return float4(0); }\n')
-BUDGET_FRAC = 0.10   # 随包基础管线字节 ≤ 原件大小 × 本值（维护者定，对所有游戏；不做开关、不读环境变量）
-VAR = re.compile(r'^(.*)#var\d+(?:\.\d+)?$')   # shader_map.tsv 来源的变体后缀：BNSH / MSHD / SDF「#var<号>」、Unity「#var<平台>.<号>」（translator/shader_split.py）
 COLOR = ('pixel_format', 'write_mask', 'blending_state', 'alpha_blend_operation', 'rgb_blend_operation', 'destination_alpha_blend_factor',
          'destination_rgb_blend_factor', 'source_alpha_blend_factor', 'source_rgb_blend_factor')
 
@@ -135,29 +125,6 @@ def seed_pairs(direct):
     return out
 
 
-def source_groups(direct):
-    """shader_map.tsv（包名、序号、阶段、键、来源）→ {键: 组名}：来源带 #var 后缀的取它之前的部分；认不出的键不在表里（调用方让它单独成组）。没有这个文件 = 空"""
-    f = direct / 'shader_map.tsv'
-    if not f.is_file(): return {}
-    out = {}
-    for line in f.read_text(encoding='utf-8', errors='replace').splitlines():
-        c = line.split('\t')
-        if len(c) < 5 or line.startswith('#') or len(c[3]) != 16: continue
-        m = VAR.match(c[4])
-        if m: out[c[3].lower()] = m.group(1)
-    return out
-
-
-def order_groups(jobs, groups, seeds):
-    """要出的对 → 装填次序 [(组名, [对…], 含种子)]：对归顶点着色器的组（认不出的顶点键自成一组）；含种子对的组在前，两类各按组内对数升序、同数按组名"""
-    g = {}
-    for job in jobs:
-        g.setdefault(groups.get(job[0].lower()) or '\0' + job[0].lower(), []).append(job)
-    seeds = {(v.lower(), f.lower()) for v, f in seeds}
-    out = [(n, js, any((v.lower(), f.lower()) in seeds for v, f, _, _ in js)) for n, js in g.items()]
-    return sorted(out, key=lambda t: (not t[2], len(t[1]), t[0]))
-
-
 def read_pairs(direct):
     """要出的对 = 离线配对表 ∪ 管线种子表，去重保序（配对表在前）→ ([(顶点键, 片元键)], {来源: 对数})。
     11-19 维护者定「全对」：BNSH 系游戏的配对表是离线认出的真对；Unity 系的配对表几乎是空的，先靠种子（真跑见过的对）。两边并起来。
@@ -214,29 +181,19 @@ def main():
     ap.add_argument('direct', type=Path); ap.add_argument('out', type=Path)
     ap.add_argument('--plat', choices=('ios', 'macos'), required=True); ap.add_argument('--os', type=int, required=True)
     ap.add_argument('--arch', action='append', required=True); ap.add_argument('--cache', type=Path)
-    ap.add_argument('--orig-bytes', type=int, default=0)   # 原件大小（字节）：0 / 没给 = 拿不到
-    ap.add_argument('--orig-src', default='原件')           # 原件大小从哪来（只进读数）
     ap.add_argument('-j', type=int, default=cores())
     a = ap.parse_args()
     archs = sorted(set(a.arch))
     lib = container(a.direct)
     pairs, src = read_pairs(a.direct)
     jobs, left = plan(lib, pairs)
-    groups = order_groups(jobs, source_groups(a.direct), seed_pairs(a.direct))
-    budget = int(a.orig_bytes * BUDGET_FRAC) if a.orig_bytes > 0 else 0
     skip = '、'.join(f'{k} {n}' for k, n in left.items() if n) or '无'
     head = f'拉取基础管线归档：着色器对 {len(pairs)} 对（{"、".join(f"{k} {n}" for k, n in src.items())}；跳过：{skip}）'
-    if a.orig_bytes <= 0:
-        if jobs:
-            print(f'【黄】拉取基础管线这次一对都不出：原件大小拿不到（{a.orig_src}），定不了随包上限（原件 × {BUDGET_FRAC:.0%}）；'
-                  f'{len(jobs)} 对照旧设备首遇后台建 + 混合管线', file=sys.stderr)
-        print(f'{head}，原件大小拿不到：可出 {len(jobs)} 对 / {len(groups)} 组，出 0 对')
-        return 0
     a.out.mkdir(parents=True, exist_ok=True)
     ext = EXT + '.lzfse' if a.plat == 'ios' else EXT   # 随包文件扩展名：iPhone 逐对压，Mac 原样
     path = lambda job: a.out / f'{bkey(job[0], job[1], job[2])}{ext}'
     res = {}   # 对 → (结果, 按整段库带函数次数)；结果 'hit' / 'built' / (退出码, 谁, 原因)
-    packed, trimmed, used, warm = [], 0, 0, '没出（0 对）'
+    used, warm = 0, '没出（0 对）'
     if jobs:
         argv0, ttpath, ttver = tt_command(a.plat)
         env = dict(os.environ, DIRHELPER_USER_DIR_SUFFIX=tt_suffix(ttpath)) if ttver != 'fake' else dict(os.environ)
@@ -320,14 +277,8 @@ def main():
                 return ('-', '顶点' if not vl else '片元', f'库里没有函数 {entry if not vl else fname}（或读不出它的常量表）'), whole
             return build(path(job), vl, entry, fl, fname), whole
 
-        def size(job):   # 这对随包的真实字节；没编成 = 0（同名旧文件一并清掉）
-            if isinstance(res[job][0], tuple):
-                path(job).unlink(missing_ok=True); return 0
-            try: return path(job).stat().st_size
-            except OSError: return 0
-
         warm_files = (a.out / f'{WARM}{ext}', a.out / f'{WARM}.metallib')
-        if jobs:   # 首查预热对先出（本工具现编小库，与目标同 SDK、同最低系统版本，库与归档一起随包），字节先占预算
+        if jobs:   # 首查预热对先出（本工具现编小库，与目标同 SDK、同最低系统版本，库与归档一起随包）
             wm = work / f'{WARM}.metal'; wm.write_text(WARM_SRC); wair, wlib = work / f'{WARM}.air', work / f'{WARM}.metallib'
             p = subprocess.run(['xcrun', '-sdk', sdk, 'metal', f'-m{a.plat}-version-min={a.os}.0', '-c', str(wm), '-o', str(wair)], capture_output=True, text=True)
             if not p.returncode:
@@ -343,55 +294,28 @@ def main():
             else:
                 clone(wlib, warm_files[1]); warm = '1 份' + ('（缓存命中）' if r == 'hit' else '')
                 used = sum(x.stat().st_size for x in warm_files)
-        # 按组装填（见文件头「预算」）：一批若干整组并行编，编完逐组按真实字节累计，装不下的那组起本批余下的组删掉、停
-        gi, nb, bb = 0, 0, 0   # 下一个组号；已编出文件的对数与字节（估下一批对数用）
-        with ThreadPoolExecutor(max(1, a.j)) as ex:
-            while gi < len(groups):
-                rem = budget - used
-                want = max(4 * max(1, a.j), -(-rem * 9 * nb // (10 * bb)) if bb else 0)
-                batch, n = [], 0
-                while gi < len(groups) and n < want:
-                    batch.append(groups[gi]); n += len(groups[gi][1]); gi += 1
-                todo = [job for g in batch for job in g[1]]
-                for job, r in zip(todo, ex.map(one, todo)): res[job] = r
-                sizes = [sum(size(job) for job in g[1]) for g in batch]
-                nb += sum(1 for job in todo if not isinstance(res[job][0], tuple)); bb += sum(sizes)
-                stop = None
-                for k, (g, gb) in enumerate(zip(batch, sizes)):
-                    if used + gb > budget: stop = k; break
-                    used += gb; packed.append(g)
-                if stop is not None:
-                    for g in batch[stop:]:
-                        for job in g[1]:
-                            trimmed += 1 if not isinstance(res[job][0], tuple) else 0
-                            path(job).unlink(missing_ok=True)
-                    break
-        if jobs and not packed:   # 一组都装不下：预热对也不带（没有可查的对，它查中了也没用）
-            for x in warm_files: x.unlink(missing_ok=True)
-            used, warm = 0, '没带（一组都装不下）'
+        with ThreadPoolExecutor(max(1, a.j)) as ex:   # 全装：plan 出的对全部并行编
+            for job, r in zip(jobs, ex.map(one, jobs)): res[job] = r
+        for job in jobs:   # 没编成的不留同名旧文件
+            if isinstance(res[job][0], tuple): path(job).unlink(missing_ok=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    mine = [job for g in packed for job in g[1]]
     stat = {'hit': 0, 'built': 0, 'whole': 0}
     fail = []
-    for job in mine:
+    for job in jobs:
         r, whole = res[job]; stat['whole'] += whole
         if isinstance(r, tuple): fail.append(job[:2] + r)
         else: stat[r] += 1
-    ok = len(mine) - len(fail)
+    ok = len(jobs) - len(fail)
     for v, f, rc, who, why in fail[:8]:
         print(f'【黄】拉取基础管线 {v} × {f} 没编成（{who}，退出 {rc}）：{why}', file=sys.stderr)
-    rest = groups[len(packed):]
-    seeded = sum(1 for g in packed if g[2])
     how = '逐对 lzfse 压缩' if a.plat == 'ios' else '原样不压'
-    pair_bytes = sum(path(job).stat().st_size for job in mine if path(job).is_file())
+    pair_bytes = sum(path(job).stat().st_size for job in jobs if path(job).is_file())
+    used += pair_bytes
     print(f'{head}，出 {ok} 对（缓存命中 {stat["hit"]}、现编 {stat["built"]}，'
           f'其中按整段库带函数 {stat["whole"]} 次）、失败 {len(fail)} 对；首查预热对 {warm}；'
-          f'预算：可出 {len(jobs)} 对 / {len(groups)} 组，装进 {len(mine)} 对 / {len(packed)} 组（含种子对的 {seeded} 组），'
-          f'超预算不出 {sum(len(g[1]) for g in rest)} 对 / {len(rest)} 组' + (f'（多编后删 {trimmed} 对，已进缓存）' if trimmed else '') + '；'
-          f'{a.plat} {a.os}.0 × {len(archs)} 个架构（{" ".join(archs)}）；{how}，随包共 {used} 字节（含预热对），'
-          f'原件 {a.orig_bytes} 字节（{a.orig_src}），占 {used * 100 / a.orig_bytes:.2f}%（上限 {BUDGET_FRAC:.0%}），每对 {pair_bytes // ok if ok else 0} 字节')
-    return 3 if fail or (packed and warm == '没编成') else 0
+          f'{a.plat} {a.os}.0 × {len(archs)} 个架构（{" ".join(archs)}）；{how}，随包共 {used} 字节（含预热对），每对 {pair_bytes // ok if ok else 0} 字节')
+    return 3 if fail or warm == '没编成' else 0
 
 
 if __name__ == '__main__':

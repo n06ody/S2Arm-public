@@ -747,6 +747,7 @@ static int query(GLenum p, double v[4]) {
         case 0x85B5: v[0] = gl_cur->vao; return 1;                              // VERTEX_ARRAY_BINDING
         case 0x8894: v[0] = gl_cur->buf_bound[0]; return 1;                     // ARRAY_BUFFER_BINDING
         case 0x88ED: v[0] = gl_pack_buffer_name(); return 1;                    // PIXEL_PACK_BUFFER_BINDING
+        case 0x88EF: v[0] = gl_unpack_buffer_name(); return 1;                  // PIXEL_UNPACK_BUFFER_BINDING
         case 0x84E0: v[0] = 0x84C0 + gl_cur->active_unit; return 1;             // ACTIVE_TEXTURE
         case 0x8069: v[0] = gl_cur->tex_unit[gl_cur->active_unit][0]; return 1; // TEXTURE_BINDING_2D
         case 0x8514: v[0] = gl_cur->tex_unit[gl_cur->active_unit][1]; return 1; // TEXTURE_BINDING_CUBE_MAP

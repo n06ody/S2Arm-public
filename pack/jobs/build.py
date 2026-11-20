@@ -18,7 +18,7 @@ import community
 import host_update
 import layout
 from core import Cancelled, Failure, atomic, clone, contained, digest, read, resolve_path, tree_hash
-from library import input_identity, require_game, selected_packages, source_file_bytes, source_path, stage_sources, validate_input
+from library import input_identity, require_game, selected_packages, source_path, stage_sources, validate_input
 import milestones as ms
 import toolchain
 
@@ -29,6 +29,31 @@ LANGUAGES = {
     "fr-CA": "CanadianFrench", "es-419": "LatinAmericanSpanish", "zh-Hans": "SimplifiedChinese",
     "zh-Hant": "TraditionalChinese", "pt-BR": "BrazilianPortuguese",
 }
+
+
+def nospace(path):
+    """Return a stable no-space alias for make/NativeAOT paths.
+
+    The repository and launcher cache can live under directories containing
+    spaces.  Make expands several paths into shell fragments and NativeAOT
+    passes library paths through a shell command, so those callers need an
+    alias rather than quoted argv entries.  Reuse the repository helper so the
+    alias rules stay identical for shell and Python entry points.
+    """
+    raw = os.fspath(path)
+    if " " not in raw:
+        return Path(raw)
+    helper = Path(__file__).resolve().parents[2] / "tools/nospace.sh"
+    try:
+        alias = subprocess.check_output(
+            ["bash", "-c", '. "$1"; s2a_nospace "$2"', "s2a-nospace", str(helper), raw],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise Failure("无法为带空格的构建路径创建无空格别名。") from error
+    if not alias or " " in alias:
+        raise Failure("带空格的构建路径没有得到无空格别名。")
+    return Path(alias)
 
 
 def snapshot(c, root):
@@ -473,8 +498,32 @@ def compile_host(c, fingerprint, env, log_root):
         c.emit("cache", "已校验并复用 S2Arm Mac 宿主（含地址窗口护栏库）", cacheHit=True)
         ms.reuse(c, "host")
         return app
-    args = ["make", "-C", c.engine, "host", "S2A_CS=1", "S2A_MAC_FRONTEND=1",
-            "BUILD=" + str(host_root / "build"), "DEVELOPER_DIR=" + env["DEVELOPER_DIR"]]
+    # Create the real output directory before aliasing it.  A symlink to a
+    # not-yet-existing directory makes make's mkdir -p fail with ENOENT.
+    (host_root / "build").mkdir(parents=True, exist_ok=True)
+    # Cache roots also reach the linker through services/*.sh.  Keep their
+    # real directories present, then expose stable no-space aliases so paths
+    # under this repository's spaced parent are not split by make/shell.
+    cache_keys = ("S2A_RUN_ROOT", "S2A_CS_CACHE", "S2A_VPX_CACHE",
+                  "S2A_OPUS_CACHE", "S2A_DAV1D_CACHE")
+    for key in cache_keys:
+        raw = env.get(key)
+        if not raw:
+            if key == "S2A_DAV1D_CACHE" and env.get("S2A_RUN_ROOT"):
+                raw = str(Path(env["S2A_RUN_ROOT"]) / "s2arm/cache/dav1d")
+            else:
+                continue
+        path = Path(raw)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise Failure(f"无法准备构建缓存目录：{path}") from error
+        env[key] = str(nospace(path))
+    engine = nospace(c.engine)
+    build = nospace(host_root / "build")
+    args = ["make", "-C", engine, "host", "S2A_CS=1", "S2A_MAC_FRONTEND=1",
+            "ROOT=" + str(engine), "BUILD=" + str(build),
+            "DEVELOPER_DIR=" + env["DEVELOPER_DIR"]]
     # c.env() 会清掉 S2A_*；构建开关显式带给 make（缺省 auto = 引擎快照里的 make 按本机探测，tools/av1hw.sh / tools/vp9hw.sh）
     for k in ("S2A_DAV1D", "S2A_VPX"):
         v = os.environ.get(k)
@@ -959,8 +1008,7 @@ def prepare(c):
         src = root / "src"; shutil.rmtree(src, ignore_errors=True)
         stage_sources(c, packages, src)
         env.update(
-            S2A_GAME_SRC=str(src), S2A_KEYS=str(c.keys), S2A_NX_UNPACK=str(toolchain.reader(c)),
-            S2A_SOURCE_BYTES=str(source_file_bytes(packages)),   # 原件文件总字节：随包基础管线上限 = 它的 10%（pack/stage_direct_cpso.sh）
+            S2A_GAME_SRC=str(src), S2A_KEYS=str(c.keys), S2A_NX_UNPACK=str(toolchain.reader(c))
         )
         try:
             with ms.DirectWatcher(c, root / "roots", game["id"]):
