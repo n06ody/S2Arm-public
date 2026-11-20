@@ -15,6 +15,10 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
+#ifdef __ANDROID__
+#include <unistd.h>
+#include "../adpf_hint.h"
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -51,6 +55,12 @@ static pthread_spinlock_t g_dq_pl;   // the producers' lock, from dq_rec_begin t
 static pthread_mutex_t g_dq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dq_cv, g_dq_dcv = PTHREAD_COND_INITIALIZER;   // g_dq_cv 在 vk_dq_init 里按单调时钟初始化（录制线程定时醒要用）；录制线程起来之前没有人睡在它上面，也没有人叫它
 static _Atomic int g_dq_on;   // 开关：dq_poll 在提交处改，各生产者线程读（relaxed：切换点之后的调用走新路径即可）
 #define DQ_ON() atomic_load_explicit(&g_dq_on, memory_order_relaxed)
+#ifdef __ANDROID__
+static _Atomic int32_t g_dq_rec_tid;
+int32_t s2a_adpf_recorder_tid(void) {
+    return DQ_ON() ? atomic_load_explicit(&g_dq_rec_tid, memory_order_relaxed) : 0;
+}
+#endif
 static uint64_t g_dq_recs, g_dq_drains, g_dq_direct;   // records queued, drains, calls made directly (unknown arguments); 诊断计数，各线程可能同时读写：一律 relaxed 原子访问
 static _Atomic uint32_t g_dq_cur_op;                   // 录制线程正在做 / 刚开始做的那条的 op（清空等超时的自报红里指出卡在哪一类调用）
 static pthread_t g_dq_rec_th;                          // 录制线程（读它的 CPU 时间用，见 nvn_vk_dbg_dq_thread_cpu_ns）
@@ -251,9 +261,15 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
 #endif
 #ifdef __linux__
     prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);   // 定时醒（nvk_dq_poll_us）别被默认 50 微秒的定时器松弛拖长；只作用于本线程
+#endif
+#ifdef __ANDROID__
+    atomic_store_explicit(&g_dq_rec_tid, gettid(), memory_order_relaxed);
 #endif
     uint64_t r = 0;
     for (;;) {
