@@ -34,6 +34,12 @@ struct rp_prog {
     uint8_t is_compute;                                       // 计算程序：只有 sh[0] / ent[0]，绑定取 NVN 阶段 5 的状态
     uint8_t binst_unread;                                     // 位 i = 阶段 i 已证不读 c0 + 0x644（编译器 c0Reads）：间接绘制不用把 GPU 侧的 base instance 拷进它的驱动段。0 = 读或未知（照旧拷）
     uint8_t z_raw;                                            // 顶点出口 z 原样（不随深度模式改写，出包预编库的程序）：near = -w 时管线设裁剪深度 [-1, 1]
+    // 栅格事实（编译期证明，给 rp_draw.c 的首笔全画用；-1/0 = 证不出，一律保守画）：
+    int32_t pos_attr;                                         // ≥0：顶点位置 xyz 原样取自该顶点属性号；w 按 pos_w1 / 属性 .w。-1 = 证不出
+    uint8_t pos_w1;                                           // 1：位置 w 是常量 1.0（属性 .w 不被取）；0：w 取同一属性的 .w
+    uint8_t pos_z_half;                                       // 1：写出位置还要过翻译器追加的 z=fma(z,0.5,w*0.5)（读出的原始 z 要乘 0.5 加 0.5·w）
+    uint8_t may_discard;                                      // 片元可能丢片元
+    uint8_t writes_smask;                                     // 片元写 sample_mask（覆盖改写：本笔写不满附件）
     struct rp_usrc usrc[RP_PROG_USRC_MAX]; uint32_t nusrc;    // NVN_RB_TEXU / TBUFU 项的句柄来源（布局项 src_reg2 指向这里）
     // 内容身份：S2AI1 v3 规范输入的 SHA-256，也就是来源缓存（g_progs）的键。管线配方与跨会话预热清单
     // 用它跨会话定位「同一份程序」；全 0 = 没有身份（失败项 / 还没算出来），这种程序不进任何清单。

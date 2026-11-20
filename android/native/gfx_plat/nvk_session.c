@@ -101,6 +101,9 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
                         caps.name, caps.api_version, caps.caps,
                         (unsigned long long)caps.max_buf_bytes, (unsigned long long)caps.max_ssbo_range,
                         drv_name, dev ? dev->driver_id : -1);
+    { extern int rp_sdx_on(void); extern int rp_fd_on(void);   // 一次性启动诊断（#1740 跳写回 / 跳载入真机定位）：厂商真值、能力位、两个门的读值
+      __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 跳写回 / 跳载入门检 vendorID=0x%04x caps=0x%x TILE_MEMORY=%d nvk_sdx=%d nvk_fd=%d",
+                          caps.vendor_id, caps.caps, !!(caps.caps & NVN_GPU_CAP_TILE_MEMORY), rp_sdx_on(), rp_fd_on()); }
     pthread_mutex_unlock(&g_mu);
     // 开局预热（iOS 蓝本：nvn_mtl.m warm_start 在 shader map 读完就起，后台把上一局清单建出来）。
     // 放在解锁之后：预热线程会取会话缓存目录 / 后端锁，不在 g_mu 里起线程。
