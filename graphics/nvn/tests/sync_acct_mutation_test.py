@@ -14,13 +14,15 @@ mutations = [
     # 同步后不清落地位：之后普通的写也被算成「落地后重搬」
     ('land-bit-kept', 'landed++; s->acct_landed[k >> 6] &= ~(1ull << (k & 63));', 'landed++;', 'pf[RP_PERF_SYNC_LANDED_KB] == 0'),
     # 同提交重搬不看提交号：上一次提交同步过的页也算重搬
-    ('resub-any-sub', 'if (m->synced[k] && m->sub[k] == cur) resub++;', 'if (m->synced[k] && (m->sub[k] == cur || cur)) resub++;', 'RP_PERF_SYNC_RESUB_KB] == 0'),
+    ('resub-any-sub', 'if (m->synced[k] && m->sub[k] == cur) {', 'if (m->synced[k] && (m->sub[k] == cur || cur)) {', 'RP_PERF_SYNC_RESUB_KB] == 0'),
     # 原因判错：上次提交没做完记成「本提交已用过」
     ('fence-as-sub', 'sub_hit ? RP_PERF_SYNC_ORD_SUB_KB : fence_open ? RP_PERF_SYNC_ORD_FENCE_KB',
      '(sub_hit || fence_open) ? RP_PERF_SYNC_ORD_SUB_KB : 0 ? RP_PERF_SYNC_ORD_FENCE_KB', 'RP_PERF_SYNC_ORD_FENCE_KB] == kb'),
     # 抽样摘要比较坏掉：原样重搬永远看不出来
     ('sample-never-same', 'if (src && s->acct_hash[x] == h) {', 'if (src && s->acct_hash[x] == h + 1) {', 'RP_PERF_SYNC_SAMP_SAME_N] == 1'),
     # 整页落地的摘要记成「来自同步」：落地那一类抽样数不出来
+    # 回放自写不记：同提交重搬的「回放自写」来源数不出来
+    ('rpw-not-noted', '    acct_note_rpw(a, n);', '    if (0) acct_note_rpw(a, n);', 'RP_PERF_SYNC_RESUB_RPW_KB] == kb'),
     ('land-src-as-sync', 's->acct_src[k / ACCT_SAMPLE] = 2;', 's->acct_src[k / ACCT_SAMPLE] = 1;', 'RP_PERF_SYNC_SAMP_LAND_N] == 1'),
 ]
 sources = ['graphics/nvn/tests/t_nvn_replay.c','graphics/nvn/tests/nvn_clear_view_unused.c',

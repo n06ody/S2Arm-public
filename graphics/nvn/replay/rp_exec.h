@@ -111,6 +111,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_SYNC_LANDED_KB, RP_PERF_SYNC_RESUB_KB,   // 同步分账（nvk_sync_acct，rp_buf.c）：同步的页里，上次同步后被落地碰过的 / 本次提交里已同步过又搬的（按整页计）
        RP_PERF_SYNC_ORD_SUB_KB, RP_PERF_SYNC_ORD_FENCE_KB, RP_PERF_SYNC_ORD_LAND_KB, RP_PERF_SYNC_ORD_NOCPU_KB,   // 录成 GPU 拷贝的原因：本次提交已用过 / 上次用这份镜像的提交没做完 / 与正在落地的区间相交 / 镜像没有 CPU 映射
        RP_PERF_SYNC_SAMP_N, RP_PERF_SYNC_SAMP_SAME_N, RP_PERF_SYNC_SAMP_LAND_N, RP_PERF_SYNC_SAMP_LAND_SAME_N,   // 抽样页：同步次数 / 内容与上次同步时相同 / 上次是整页落地 / 其中与落地时相同
+       RP_PERF_SYNC_RPW_KB, RP_PERF_SYNC_RESUB_RPW_KB, RP_PERF_SYNC_RESUB_LANDING_KB,   // 同步的页里上次同步后回放自写过的 / 同提交重搬里回放自写引起的 / 与落地中区间相交的（其余 = 别的线程写）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
