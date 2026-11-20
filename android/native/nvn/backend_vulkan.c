@@ -1532,7 +1532,12 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     if (vk->dev->draw_indirect_count_enabled && vk->dev->draw_indirect_count &&
         vk->dev->draw_indexed_indirect_count && f.multiDrawIndirect && f.drawIndirectFirstInstance)
         c->caps |= NVN_GPU_CAP_INDIRECT_COUNT;
-    // HOST_IMPORT / GPU_VA / TILE_MEMORY / SAMP_MINMAX / LOD_BIAS / DEPTH_CLIP_CTL / GEOMETRY / TESSELLATION /
+    // TILE_MEMORY：Vulkan 没有「分块渲染」查询位；ARM Mali / 高通 Adreno / Imagination PowerVR
+    // 是瓦片架构（load / store 走真实片上瓦片内存），其余厂商按 IMR 不置位——回放核心的
+    // 存储前瞻 / 首笔全画只在这条位下启用，不做就是浪费 CPU。
+    if (p->vendorID == 0x13B5 || p->vendorID == 0x5143 || p->vendorID == 0x1010)
+        c->caps |= NVN_GPU_CAP_TILE_MEMORY;
+    // HOST_IMPORT / GPU_VA / SAMP_MINMAX / LOD_BIAS / DEPTH_CLIP_CTL / GEOMETRY / TESSELLATION /
     // XFB / LINKED_PIPE / GPU_DURATION / GPU_TIME_HOST / DYN_* / DESWIZZLE：
     // 本段没有实现或没实测生效，一律不置位（契约：后端不做近似）。
 
