@@ -350,6 +350,8 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("SPIRV_INVALID",
                         binding.Stage + ": " + binding.Kind + " binding " + binding.Set + ":" + binding.Binding + " has no reflected descriptor");
                 TextureDescriptor resolved = found.Value;
+                binding.ScalePlain = binding.Kind == "texture" &&
+                    (resolved.Flags & (TextureUsageFlags.ResScaleUnsupported | TextureUsageFlags.NeedsScaleValue)) == 0;
                 // 整池数组：翻译器对追不到槽的句柄（算术 / 共享内存 / 全局内存 / phi 汇合拼出的）回退成按池编号读的两个数组
                 //   （compat BindlessElimination：贴图数组长 = max(2, 贴图池长)、采样器数组（类型 None）长 = max(2, 采样器池长)，
                 //   句柄 PackOffsets(0, 0, Direct) = 0x40000000、cbuf 0）。这不是从 c0 / c2 读句柄，不需要逐句柄事实；宿主按 NVN 池建快照绑整表。
@@ -707,12 +709,18 @@ namespace S2A.DirectCompiler
                     if (program.Kind == "graphics")
                     {
                         // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
-                        // 分析不出（动态下标、非标准布局、多个 c0）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 分析不出（非标准布局、多个 c0、下标取值界证不了）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
+                        // 非常量下标按取值界记整段（boundDynamic）：证得够不着 0x644 所在的 vec4 才算不读。
                         var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
                         int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
-                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, boundDynamic: true);
                         writer.WritePropertyName("c0Reads");
                         WriteRanges(writer, stageReads);
+                        // 同一内容同时携带无动态定界的原始读集，运行时只选消费策略，不改变缓存身份。
+                        int[][] staticReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
+                            DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        writer.WritePropertyName("c0ReadsStatic");
+                        WriteRanges(writer, staticReads);
                     }
                     writer.WriteEndObject();
                 }
@@ -732,6 +740,7 @@ namespace S2A.DirectCompiler
                     if (binding.ConstSampler >= 0) writer.WriteNumber("constSampler", binding.ConstSampler);
                     if (binding.Pool != null) writer.WriteString("pool", binding.Pool);   // 整池数组（ResolvePoolSlots）：没有 slot，宿主按池建快照
                     if (binding.Kind == "spill") writer.WriteNumber("bytesPerGroup", binding.SpillBytesPerGroup);
+                    if (binding.Kind == "texture" && binding.ScalePlain) writer.WriteBoolean("scalePlain", true);   // 渲染倍率：缺这一项 = 按尺寸换算或未知
                     if (binding.Kind == "texture" && binding.UboSlot >= 0)
                     {
                         // 句柄在游戏 UBO 里（ResolvePoolSlots）：没有 slot，只有这两个来源字段

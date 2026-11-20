@@ -250,6 +250,20 @@ static int lp_find_member(struct s2a_jv arr, const char *name, struct s2a_jv *ou
 // stage_no = 本段 StageNo（绑定号换算用它），v1_stage = v1 阶段名标签
 // compute = 1：计算结果合同（nvn_vk_program_parse_compute）比图形严——每条带 count、storage 带
 //   cbSlot/cbOffset 出处、c0 驱动常量段（drvcb bank 0）挂 slot 0；图形输出逐字节不变。
+// 渲染倍率（安卓回放层片 1）：这个贴图绑定的采样不按尺寸换算 = 它不在 tex_scales（[支撑缓冲序号, SPIR-V 绑定号, 是否图像]）里。
+//   没有 tex_scales 这一项（旧库）或形状不对 = 未知，返回 0（回放层按会换算处理，先降回 1×）
+static int lp_scale_plain(struct s2a_jv top, uint32_t binding) {
+    struct s2a_jv a;
+    if (s2a_jv_obj_find(top, "tex_scales", &a) || !s2a_jv_is_array(a)) return 0;
+    int n = s2a_jv_arr_count(a);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        struct s2a_jv e, v; uint32_t b = 0;
+        if (s2a_jv_arr_item(a, i, &e) || s2a_jv_arr_count(e) != 3 || s2a_jv_arr_item(e, 1, &v) || s2a_jv_u32(v, &b)) return 0;
+        if (b == binding) return 0;
+    }
+    return 1;
+}
 static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_stage,
                             int stage_no, const char *v1_stage, int compute, int *sep, char *why, size_t why_size) {
     struct s2a_jv arr;
@@ -384,6 +398,7 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         if (has_slot) jw_fmt(j, ",\"slot\":%u", slot);
         if (provenance[0]) jw_str(j, provenance);
         if (!strcmp(v1kind, "storage")) jw_fmt(j, ",\"rw\":%s", rw ? "true" : "false");
+        if (!strcmp(v1kind, "texture") && lp_scale_plain(top, binding)) jw_str(j, ",\"scalePlain\":true");   // 渲染倍率：不在 tex_scales 里 = 不按尺寸换算
         jw_str(j, "}");
     }
     return 0;

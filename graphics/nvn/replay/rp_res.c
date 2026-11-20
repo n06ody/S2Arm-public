@@ -37,7 +37,10 @@ struct rp_tex {
     const void *span;          // 跟踪区间句柄（nvn_dirty_span）：NULL = 这段内存没被写跟踪，只能每次保守查
     const void *log_span; uint64_t log_id, log_cur;   // 脏页日志游标（tex_log_arm 起；log_ok 为 0 时不用）
     const uint8_t *mem; uint64_t size;
+    // 渲染倍率（rp_rs_*，只在 S2A_RES_SCALE ≠ 1 时动）：rs 状态；cw / ch 游戏尺寸（第 0 级），sw / sh 现存储尺寸；rs_fail 换存储失败次数
+    uint8_t rs, rs_fail; uint32_t cw, ch, sw, sh; float rs_s;
 };
+enum { RS_NONE = 0, RS_SCALED = 1, RS_BLACK = 2 };
 // 同存储共用表的键：内存池 + 偏移 + 描述（去掉只表示用途、不影响存储布局的标志）
 typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;
 enum { ALIAS_USE_FLAGS = NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL | NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL };
@@ -47,7 +50,7 @@ static void alias_key_of(alias_key *k, const tex_t *t) { memset(k, 0, sizeof *k)
 // Reserve the retirement node when creating a registered view, not when it is
 // invalidated: pinning an already borrowed handle must never require allocation.
 struct registered_view { nvn_gpu_view view; struct registered_view *next; };
-typedef struct { tex_t t; view_t v; uint8_t ok, has_v; nvn_gpu_view view; struct registered_view *owned; struct rp_tex *of; uint64_t gen; } treg_t;
+typedef struct { tex_t t; view_t v; uint8_t ok, has_v; nvn_gpu_view view; struct registered_view *owned; struct rp_tex *of; uint64_t gen, of_uid; } treg_t;   // of_uid：建视图时那份存储的 uid（换存储后作废）
 typedef struct { samp_par p; uint8_t ok; nvn_gpu_samp s, sn; } sreg_t;   // sn：同参数的最近点采样器（#1072，配不能线性过滤的格式时用），用到才建
 static nvn_gpu_samp g_query_sampler;
 
@@ -535,6 +538,158 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
     }
 }
 
+// ---------- 渲染分辨率倍率（S2A_RES_SCALE，片 1）----------
+// 照 iOS nvn_rscale.inc / Ryujinx TextureScaleMode：贴图第一次当渲染目标、且资格成立时，把存储换成 ⌈游戏尺寸 × 倍率⌉（rp_rs_attach，开通道前）；
+// 之后任何没声明「按倍率处理过」的用途（拷贝、读回、上传、图像、计算、整池数组、非片元阶段采样、着色器按尺寸换算的采样……）一律
+// 先把存储缩回游戏尺寸、永远留在 1×（黑名单，rs_black_locked）——证不了就原尺寸。声明安全的只有：附件（rp_view_for_attach）、
+// 片元阶段不按尺寸换算的普通采样、上屏（rp_rs_safe）。倍率 1 时这里每个入口第一行返回，存储、视图、内容与原来逐位相同。
+static float g_rs_cfg = 1;   // 平台交来的设置（rp_rs_configure；平台层在开会话时按 S2A_RES_SCALE 给，回放核心不读环境）
+static float g_rs;           // 本会话倍率：0 = 还没定；会话收尾清零，下一会话第一次用时取 g_rs_cfg
+void rp_rs_configure(const char *text) {
+    float v = 1;
+    if (text && *text) {
+        char *end = NULL; double d = strtod(text, &end);
+        static const double ok[5] = {0.5, 0.75, 1, 1.5, 2}; int hit = 0;
+        for (int i = 0; i < 5; i++) if (end && !*end && d == ok[i]) hit = 1;
+        if (hit) v = (float)d;
+        else { char b[160]; snprintf(b, sizeof b, "S2A_RES_SCALE=%s 不是 0.5 / 0.75 / 1 / 1.5 / 2 之一：按 1 渲染", text); nvn_plat_log(NVN_PLAT_LOG_RED, "res", b); }
+    }
+    g_rs_cfg = v;
+}
+float rp_rs_setting(void) {
+    if (g_rs == 0) {
+        g_rs = g_rs_cfg;
+        if (g_rs != 1) { char b[96]; snprintf(b, sizeof b, "渲染倍率 %.2f（S2A_RES_SCALE）", (double)g_rs); nvn_plat_log(NVN_PLAT_LOG_INFO, "res", b); }
+    }
+    return g_rs;
+}
+static uint32_t rs_up(uint32_t v, float s) { double d = (double)v * s; uint32_t u = (uint32_t)d; if ((double)u < d) u++; return u ? u : 1; }
+static _Thread_local int g_rs_safe; static _Thread_local int g_rs_why;   // 调用方对下一次解析的声明：safe = 已按倍率处理；why = 不安全时记哪一类
+void rp_rs_safe(int safe, int why) { g_rs_safe = safe; g_rs_why = why; }
+static uint64_t g_rs_black_n[RP_RS_WHY_N]; static uint64_t g_rs_up_n, g_rs_up_kpix, g_rs_fail_n, g_rs_nocopy_n;
+static const char *const k_rs_why[RP_RS_WHY_N] = {"未声明的用途", "图像", "计算", "非片元阶段采样", "着色器按尺寸换算", "整池数组", "读回", "上传", "贴图拷贝", "清贴图", "同通道附件不可缩", "换存储失败"};
+const char *rp_rs_why_name(int w) { return w >= 0 && w < RP_RS_WHY_N ? k_rs_why[w] : "?"; }
+void rp_rs_take(uint64_t black[RP_RS_WHY_N], uint64_t *up, uint64_t *up_kpix, uint64_t *fail) {
+    pthread_mutex_lock(&g_rmu);
+    for (int i = 0; i < RP_RS_WHY_N; i++) { black[i] = g_rs_black_n[i]; g_rs_black_n[i] = 0; }
+    *up = g_rs_up_n; *up_kpix = g_rs_up_kpix; *fail = g_rs_fail_n; g_rs_up_n = g_rs_up_kpix = g_rs_fail_n = 0;
+    pthread_mutex_unlock(&g_rmu);
+}
+// 静态资格（照 iOS rs_eligible + Ryujinx UpscaleSafeMode / IsUpscaleCompatible）；返回不可缩的原因，NULL = 可缩
+static const char *rs_ineligible(const tex_t *t, const struct rp_tex *x, float s) {
+    const int f = t->d.format; nvn_fmt_info fi;
+    if (t->d.target != NVN_TEXTURE_TARGET_2D && t->d.target != NVN_TEXTURE_TARGET_2D_ARRAY) return "目标类型";
+    if (t->d.samples > 1) return "多重采样";
+    if (!nvn_fmt_info_of((uint32_t)f, &fi)) return "格式未知";
+    if (fi.bw > 1 || fi.bh > 1) return "块压缩";
+    if (fi.depth || fi.stencil) {   // 深度只放行后端深度 blit 收的（CAP_BLIT_DEPTH_STENCIL：同格式 D24S8 / D32FS8 / D32F）；D16 精度不够（同 iOS），后端虽收也不缩
+        nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
+        if (!(cp.caps & NVN_GPU_CAP_BLIT_DEPTH_STENCIL)) return "深度不能缩放拷贝";
+        if (f != NVN_FORMAT_DEPTH24_STENCIL8 && f != NVN_FORMAT_DEPTH32F_STENCIL8 && f != NVN_FORMAT_DEPTH32F) return "深度格式";
+    } else if (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT) return "整数格式";
+    if (!(nvn_gpu_format_caps((uint32_t)f) & (NVN_GPU_FMT_RENDER | NVN_GPU_FMT_DEPTH))) return "不能当附件";
+    const int fl = t->d.flags;
+    if (fl & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return "线性 / 视频 / 稀疏";
+    if ((fl & NVN_TEXTURE_FLAGS_DISPLAY) && s < 1) return "显示贴图（倍率 < 1）";
+    if (!(fl & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && !(fl & NVN_TEXTURE_FLAGS_DISPLAY)) return "没有可压缩标志";
+    if (t->has_layout || (x && x->cpu)) return "CPU 内容";
+    const uint32_t w = (uint32_t)t->d.width, h = (uint32_t)t->d.height;
+    if (t->d.levels > 3) return "层级多于 3";
+    if (w < 8 || h < 8) return "小于 8 像素";
+    if (w == h && (s > 1 || !(fi.depth || fi.stencil || fi.channels == 1))) return "方形";
+    if (h < 360 && (w > h * 16 / 9 ? w - h * 16 / 9 : h * 16 / 9 - w) <= 16) return "16:9 小图（模糊链）";
+    if ((uint64_t)w == (uint64_t)h * h) return "宽 = 高²（查找表）";
+    if (s > 1) { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp); if (cp.max_tex_dim && (rs_up(w, s) > cp.max_tex_dim || rs_up(h, s) > cp.max_tex_dim)) return "放大后超设备上限"; }
+    return NULL;
+}
+static void vf_drop_unpinned_of(const struct rp_tex *x);   // 视图表一节
+// 把 x 的存储换成倍率 ns（1 = 游戏尺寸）：建新存储、逐级逐层缩放拷贝旧内容、换掉 x->g。持 g_rmu，调用方保证通道已收。
+// 1 = 换好；0 = 建存储 / 视图失败（可重试，存储不动）；-1 = 后端不收这笔缩放拷贝（nvn_gpu_blit_check 不过，确定性的，存储不动、段不受影响）。
+// 每一笔拷贝录之前先问后端：可选的换存储不能把整段打成 sticky（不然提交失败、时间线终态，见坑记录）。
+static int rs_swap_locked(const tex_t *t, struct rp_tex *x, float ns, nvn_gpu_cmd c) {
+    const uint32_t nw = ns == 1 ? x->cw : rs_up(x->cw, ns), nh = ns == 1 ? x->ch : rs_up(x->ch, ns);
+    nvn_gpu_tex_desc d = {0}; d.d = t->d; d.d.width = (int)nw; d.d.height = (int)nh; d.usage = usage_of(t, x->cpu) | NVN_GPU_TEX_RENDER;
+    d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0; d.stencil_view = t->stencil;
+    nvn_gpu_tex g = NULL; nvn_gpu_err err = {0};
+    if (!nvn_gpu_ok(nvn_gpu_tex_create(&d, &g, &err))) { if (nvn_unimpl("res", "scale_storage_create", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "res", err.why); return 0; }
+    nvn_fmt_info fi; const int depthy = nvn_fmt_info_of((uint32_t)t->d.format, &fi) && (fi.depth || fi.stencil);
+    const uint32_t layers = t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY ? (uint32_t)t->d.depth : 1, levels = t->d.levels ? (uint32_t)t->d.levels : 1;
+    // 每一级每一层：先问后端收不收这笔缩放拷贝（去、回两个方向都问：换上去之后还要能降回 1×），收了才录。
+    // 待清零的（内容由下一个通道清成零）照样问、只是不拷：不让一张贴图换到将来缩不回去的存储上。
+    for (uint32_t l = 0; l < levels; l++) for (uint32_t y = 0; y < layers; y++) {
+        view_t v; memset(&v, 0, sizeof v); v.set_levels = 1; v.base_level = (uint8_t)l; v.nlevels = 1; v.set_layers = 1; v.min_layer = (uint16_t)y; v.nlayers = 1;
+        nvn_gpu_view sv = NULL, dv = NULL;
+        if (!nvn_gpu_ok(nvn_gpu_view_create(x->g, &v, &sv, &err)) || !nvn_gpu_ok(nvn_gpu_view_create(g, &v, &dv, &err))) {
+            if (sv) nvn_gpu_view_release(sv);
+            if (dv) nvn_gpu_view_release(dv);
+            nvn_gpu_tex_release(g); if (nvn_unimpl("res", "scale_view_create", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "res", err.why); return 0;
+        }
+        NVNcopyRegion sr = {0, 0, 0, (int)(x->sw >> l ? x->sw >> l : 1), (int)(x->sh >> l ? x->sh >> l : 1), 1};
+        NVNcopyRegion dr = {0, 0, 0, (int)(nw >> l ? nw >> l : 1), (int)(nh >> l ? nh >> l : 1), 1};
+        if (!nvn_gpu_ok(nvn_gpu_blit_check(sv, &sr, dv, &dr, !depthy, &err)) || !nvn_gpu_ok(nvn_gpu_blit_check(dv, &dr, sv, &sr, !depthy, &err))) {
+            nvn_gpu_view_release(sv); nvn_gpu_view_release(dv); nvn_gpu_tex_release(g);   // 已录的前几级只写了新存储，放掉即可
+            if (!g_rs_nocopy_n++) { char b[320]; snprintf(b, sizeof b, "渲染倍率：贴图 #%llu（%dx%d 格式 %#x）后端不收缩放拷贝，按 1× 留用：%s", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, err.why); nvn_plat_log(NVN_PLAT_LOG_INFO, "res", b); }
+            return -1;
+        }
+        if (!x->zero_pending) nvn_gpu_blit(c, sv, &sr, dv, &dr, !depthy);   // 颜色线性、深度最近点（后端深度 blit 只做最近点）
+        nvn_gpu_view_release(sv); nvn_gpu_view_release(dv);
+    }
+    vf_drop_unpinned_of(x);   // 旧存储名下没钉住的视图放掉；钉住的按 uid 不再命中、轮转时放
+    nvn_gpu_tex_release(x->g);   // 后端按段引用保活已录的使用
+    x->g = g; x->uid = ++g_tex_uid; x->sw = nw; x->sh = nh; x->rs_s = ns;
+    g_ser_gen++; __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE);   // 贴图号视图、池快照、整组绑定沿用都按它重验
+    return 1;
+}
+static void rs_init_locked(const tex_t *t, struct rp_tex *x) { if (!x->cw) { x->cw = x->sw = (uint32_t)t->d.width; x->ch = x->sh = (uint32_t)t->d.height; x->rs_s = 1; } }
+// 永久降回 1×（Ryujinx BlacklistScale）。持 g_rmu、通道已收
+static void rs_black_locked(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int why) {
+    rs_init_locked(t, x);
+    if (x->rs == RS_SCALED && rs_swap_locked(t, x, 1, c) != 1) { g_rs_fail_n++; return; }   // 缩不回去：留在缩放态（下一次不安全用途再试）
+    if (x->rs != RS_BLACK) {
+        if (why < 0 || why >= RP_RS_WHY_N) why = 0;
+        if (!g_rs_black_n[why]++) { char b[200]; snprintf(b, sizeof b, "渲染倍率：贴图 #%llu（%dx%d 格式 %#x）因「%s」按 1× 留用（这一类首次）", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned)t->d.format, k_rs_why[why]); nvn_plat_log(NVN_PLAT_LOG_INFO, "res", b); }
+    }
+    x->rs = RS_BLACK;
+}
+int rp_rs_eligible(const tex_t *t, float s) {
+    if (s == 1 || !t || !t->serial) return 0;
+    pthread_mutex_lock(&g_rmu);
+    struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
+    const int ok = !(x && x->rs == RS_BLACK) && !rs_ineligible(t, x, s);
+    pthread_mutex_unlock(&g_rmu);
+    return ok;
+}
+// 开通道前给附件定倍率：s ≠ 1 时没缩过的换存储；s == 1 时（同通道有不可缩的）已缩的降回 1× 并拉黑。返回这张图现在的倍率
+float rp_rs_attach(const tex_t *t, float s, nvn_gpu_cmd c) {
+    if (!t || !t->serial || !c) return 1;
+    g_attach_intent = 1; nvn_gpu_tex g0 = rp_tex_resolve(t, c); g_attach_intent = 0;   // 先建好（内容初始化照旧、待清零照旧可延到通道），再换
+    if (!g0) return 1;
+    pthread_mutex_lock(&g_rmu);
+    struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial); float out = 1;
+    if (x) {
+        rs_init_locked(t, x);
+        if (s == 1) { if (x->rs == RS_SCALED) rs_black_locked(t, x, c, RP_RS_PASS_MIXED); out = x->rs_s; }
+        else if (x->rs == RS_SCALED && x->rs_s == s) out = s;
+        else if (x->rs == RS_NONE && x->rs_fail < 3 && !rs_ineligible(t, x, s)) {
+            const int r = rs_swap_locked(t, x, s, c);
+            if (r == 1) { x->rs = RS_SCALED; out = s; g_rs_up_n++; g_rs_up_kpix += (uint64_t)x->sw * x->sh / 1000; }
+            else if (r < 0 || ++x->rs_fail >= 3) { g_rs_fail_n++; rs_black_locked(t, x, c, RP_RS_SWAP_FAIL); }   // 后端不收 = 确定性，当场拉黑；建失败重试满 3 次再拉黑
+        } else out = x->rs_s;
+    }
+    pthread_mutex_unlock(&g_rmu);
+    return out;
+}
+// 贴图现在的存储倍率与某一级的存储尺寸（没建过 / 没缩 = 游戏尺寸、倍率 1）
+float rp_rs_level(const tex_t *t, uint32_t level, uint32_t *w, uint32_t *h) {
+    pthread_mutex_lock(&g_rmu);
+    struct rp_tex *x = t && t->serial ? nvn_hm_get(&g_by_serial, &t->serial) : NULL;
+    float s = x && x->rs == RS_SCALED ? x->rs_s : 1;
+    uint32_t bw = x && x->rs == RS_SCALED ? x->sw : (uint32_t)t->d.width, bh = x && x->rs == RS_SCALED ? x->sh : (uint32_t)t->d.height;
+    pthread_mutex_unlock(&g_rmu);
+    if (w) *w = bw >> level ? bw >> level : 1;
+    if (h) *h = bh >> level ? bh >> level : 1;
+    return s;
+}
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
     if (!t || !t->serial) return NULL;
     // 分时抽样（#1103）：原先每次解析都取 3 次时钟（世界稳态每帧至少 2148 次），现在只在采样帧里计时（见 rp_exec.h 的 rp_tm）。
@@ -564,6 +719,16 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
         x->users++;
         nvn_hm_put(&g_by_serial, &t->serial, x); g_ser_gen++;
     }
+    if (x->rs == RS_SCALED && c && (!(g_rs_safe || g_attach_intent) || (x->zero_pending && !g_attach_intent))) {   // 渲染倍率：没声明按倍率处理过的用途 → 先缩回 1× 并永久留在 1×（见上面一节）
+        const int why = g_rs_why;
+        pthread_mutex_unlock(&g_rmu);
+        rp_pass_flush(c);   // 缩放拷贝是传输：通道外做（收通道可能落地挂起清除、再取附件视图，不能持锁）
+        pthread_mutex_lock(&g_rmu);
+        x = nvn_hm_get(&g_by_serial, &t->serial);
+        if (!x) { pthread_mutex_unlock(&g_rmu); return NULL; }
+        if (x->rs == RS_SCALED) rs_black_locked(t, x, c, why);
+    }
+    g_rs_safe = 0; g_rs_why = 0;   // 声明只管这一次解析
     if (x->need_init && c) {   // 刚建的存储：CPU 贴图走下面的上传；其余的取一次存储里现有的内容，取不了的清零
         x->need_init = 0;
         if (!x->cpu && !x->gpu_written) {
@@ -659,6 +824,7 @@ static void vf_drop(int i) {   // Hold g_rmu; invalidation must preserve handed-
     }
     memset(&g_vf[i], 0, sizeof g_vf[i]);
 }
+static void vf_drop_unpinned_of(const struct rp_tex *x) { for (int i = 0; i < VF_N; i++) if (g_vf[i].view && g_vf[i].of_uid == x->uid && !(g_pin_depth > 0 && g_vf_seen[i] == g_pin_token)) vf_drop(i); }   // 持 g_rmu（渲染倍率换存储用）
 static void vf_drop_of(const struct rp_tex *x) { for (int i = 0; i < VF_N; i++) if (g_vf[i].view && g_vf[i].of_uid == x->uid) vf_drop(i); }   // 持 g_rmu；按存储的 uid 认，两种键的项都放
 static void vf_drop_serial(uint64_t serial) {   // 持 g_rmu。serial = 0：全放。否则只放按序号记的项——按存储记的项跟着存储走，序号销毁不放（存储还在共用表里，下一个同描述的新序号接着用）
     for (int i = 0; i < VF_N; i++) if (g_vf[i].view && (!serial || (!g_vf[i].kmode && g_vf[i].serial == serial))) vf_drop(i);
@@ -768,13 +934,13 @@ nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t_out) {
     if (id < g_ntreg && g_treg[id].ok && g_treg[id].t.serial == t.serial) {
         treg_t *r = &g_treg[id];
         struct rp_tex *x = nvn_hm_get(&g_by_serial, &t.serial);
-        if (r->view && (r->gen != g_ser_gen) && r->of != x) treg_drop_view(r);   // 序号换了存储：旧视图作废
+        if (r->view && ((r->gen != g_ser_gen && r->of != x) || (x && r->of_uid != x->uid))) treg_drop_view(r);   // 序号换了存储 / 存储换了尺寸（渲染倍率）：旧视图作废
         if (!r->view && x) {
             nvn_gpu_err err = {0};
             struct registered_view *owned = calloc(1, sizeof *owned);
             if (!owned) nvn_unimpl("gpu", "registered_view_allocation", r);
             else if (nvn_gpu_ok(nvn_gpu_view_create(x->g, has_v ? &v : NULL, &owned->view, &err))) {
-                r->owned = owned; r->view = owned->view; r->of = x;
+                r->owned = owned; r->view = owned->view; r->of = x; r->of_uid = x->uid;
             } else { free(owned); nvn_unimpl("gpu", "view_create", r); }
         }
         r->gen = g_ser_gen; out = r->view;
@@ -1132,6 +1298,7 @@ static void pool_cache_reset(void) {
 }
 
 void rp_res_reset(void) {
+    g_rs = 0;   // 渲染倍率：下一会话重读
     pool_cache_reset();   // 池快照先放（引用着零贴图 / 视图 / 采样器）
     pthread_mutex_lock(&g_rmu);
     for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i]);

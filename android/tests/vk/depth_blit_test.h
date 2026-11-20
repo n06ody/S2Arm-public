@@ -98,29 +98,36 @@ static const uint32_t depth_state_frag_spv[] = {
 };
 
 static void test_depth_blit(void) {
-    for (unsigned round=0;round<4;round++) {
-        int subresource = round >= 2; const unsigned st[4] = {0, 255, 85, 170};
+    // 0–3：带模板的 D24S8 / D32FS8 × 基级 / 非零级与层；4–7：只有深度的 D32F / D16 × 同样两种子资源（只核深度，模板那一路绑一张 R8UI 占位）
+    static const int fmts[4] = {NVN_FORMAT_DEPTH24_STENCIL8, NVN_FORMAT_DEPTH32F_STENCIL8, NVN_FORMAT_DEPTH32F, NVN_FORMAT_DEPTH16};
+    for (unsigned round=0;round<8;round++) {
+        int subresource = (round & 2) != 0; const unsigned st[4] = {0, 255, 85, 170};
+        const int fmt = fmts[(round >> 2) * 2 + (round & 1)], has_st = round < 4;
+        const float tol = fmt == NVN_FORMAT_DEPTH16 ? 1.0f / 65535 : .000001f;
         nvn_gpu_tex_desc td={0};td.d.target=subresource ? NVN_TEXTURE_TARGET_2D_ARRAY : NVN_TEXTURE_TARGET_2D;
-        td.d.format=(round & 1) ? NVN_FORMAT_DEPTH32F_STENCIL8 : NVN_FORMAT_DEPTH24_STENCIL8;
+        td.d.format=fmt;
         td.d.width=td.d.height=subresource ? 8 : 4;td.d.depth=subresource ? 3 : 1;td.d.samples=1;td.d.levels=subresource ? 2 : 1;
         td.usage=NVN_GPU_TEX_SAMPLED|NVN_GPU_TEX_RENDER;
         nvn_gpu_tex src=NULL,dst=NULL;GPU(nvn_gpu_tex_create(&td,&src,&err));GPU(nvn_gpu_tex_create(&td,&dst,&err));
         view_t selected={0};selected.set_target=1;selected.target=NVN_TEXTURE_TARGET_2D;selected.set_levels=1;selected.base_level=subresource ? 1 : 0;selected.nlevels=1;selected.set_layers=1;selected.min_layer=subresource ? 2 : 0;selected.nlayers=1;
         nvn_gpu_view sv=NULL,dv=NULL,stencil=NULL;GPU(nvn_gpu_view_create(src,&selected,&sv,&err));GPU(nvn_gpu_view_create(dst,&selected,&dv,&err));
         view_t vd=selected;vd.set_dsmode=1;vd.dsmode=NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL;
-        GPU(nvn_gpu_view_create(dst,&vd,&stencil,&err));
+        nvn_gpu_tex dummy=NULL;
+        if (has_st) GPU(nvn_gpu_view_create(dst,&vd,&stencil,&err));
+        else { nvn_gpu_tex_desc ud={0};ud.d.target=NVN_TEXTURE_TARGET_2D;ud.d.format=NVN_FORMAT_R8UI;ud.d.width=ud.d.height=4;ud.d.depth=ud.d.levels=ud.d.samples=1;ud.usage=NVN_GPU_TEX_SAMPLED;
+               GPU(nvn_gpu_tex_create(&ud,&dummy,&err));GPU(nvn_gpu_view_create(dummy,NULL,&stencil,&err)); }
         nvn_gpu_cmd cmd=NULL;GPU(nvn_gpu_cmd_begin(NULL,&cmd,&err));
         nvn_gpu_pass_desc pass={0};pass.w=pass.h=4;pass.layers=1;
-        pass.depth.view=pass.stencil.view=sv;pass.depth.load=pass.stencil.load=NVN_GPU_LOAD_CLEAR;
+        pass.depth.view=sv;pass.stencil.view=has_st ? sv : NULL;pass.depth.load=pass.stencil.load=NVN_GPU_LOAD_CLEAR;
         pass.depth.store=pass.stencil.store=NVN_GPU_STORE_STORE;pass.clear_depth=.125f;pass.clear_stencil=st[0];
         nvn_gpu_pass_begin(cmd,&pass);
         for (unsigned q=1;q<4;q++) {
-            nvn_gpu_clear clear={0};clear.color=-1;clear.depth=clear.stencil=1;clear.stencil_mask=255;
+            nvn_gpu_clear clear={0};clear.color=-1;clear.depth=1;clear.stencil=has_st;clear.stencil_mask=has_st ? 255 : 0;
             clear.depth_value=.125f+.25f*q;clear.stencil_value=st[q];
             clear.x=2*(q%2);clear.y=2*(q/2);clear.w=clear.h=2;nvn_gpu_clear_rect(cmd,&clear);
         }
         nvn_gpu_pass_end(cmd);
-        pass.depth.view=pass.stencil.view=dv;pass.clear_depth=.9375f;pass.clear_stencil=0xa5;
+        pass.depth.view=dv;pass.stencil.view=has_st ? dv : NULL;pass.clear_depth=.9375f;pass.clear_stencil=0xa5;
         nvn_gpu_pass_begin(cmd,&pass);nvn_gpu_pass_end(cmd);
         NVNcopyRegion a={0,0,0,4,4,1},b={1,1,0,2,2,1};nvn_gpu_blit(cmd,sv,&a,dv,&b,0);
         nvn_gpu_layout_ent entries[3]={
@@ -144,11 +151,11 @@ static void test_depth_blit(void) {
         for (unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++) {
             int inside=x>=1&&x<3&&y>=1&&y<3;unsigned q=inside ? (y-1)*2+x-1 : 0;
             float expected=inside ? .125f+.25f*q : .9375f,got;memcpy(&got,actual+2*(y*4+x),4);
-            CHECK(fabsf(got-expected)<.000001f);CHECK(actual[2*(y*4+x)+1]==(inside ? st[q] : 0xa5));
+            CHECK(fabsf(got-expected)<=tol);if(has_st)CHECK(actual[2*(y*4+x)+1]==(inside ? st[q] : 0xa5));
         }
         for (unsigned i=32;i<36;i++)CHECK(actual[i]==0xccccccccu);
         nvn_gpu_buf_release(output,NULL,NULL);nvn_gpu_samp_release(sampler);nvn_gpu_shader_release(shader);
-        nvn_gpu_view_release(stencil);nvn_gpu_view_release(dv);nvn_gpu_view_release(sv);nvn_gpu_tex_release(dst);nvn_gpu_tex_release(src);
+        nvn_gpu_view_release(stencil);if(dummy)nvn_gpu_tex_release(dummy);nvn_gpu_view_release(dv);nvn_gpu_view_release(sv);nvn_gpu_tex_release(dst);nvn_gpu_tex_release(src);
     }
-    puts("PASS: depth-stencil nearest blit, 2 formats x 2 subresources, 64 depth + 64 stencil samples (all 8 bits), 64 sentinel bytes");
+    puts("PASS: depth(-stencil) nearest blit, D24S8/D32FS8 + depth-only D32F/D16 x 2 subresources, 128 depth + 64 stencil samples (all 8 bits), 128 sentinel bytes");
 }

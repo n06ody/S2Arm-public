@@ -91,6 +91,19 @@ void rp_tex_mark_gpu_written(const tex_t *t);
 int rp_tex_cpu_written(uint64_t serial);
 // 调试：序号 → 后端贴图（没建过 = NULL）。
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t serial);
+// ---------- 渲染分辨率倍率（S2A_RES_SCALE，片 1；见 rp_res.c 同名一节）----------
+// 入口全部弱声明：只链 rp_pass.c / rp_draw.c、不链 rp_res.c 的隔离用例取不到 = 倍率 1、不声明（调用处判空）。
+// 不安全用途的分类（诊断行与首次日志用）
+enum { RP_RS_UNDECLARED, RP_RS_IMAGE, RP_RS_COMPUTE, RP_RS_STAGE, RP_RS_SHADER, RP_RS_POOL, RP_RS_READBACK, RP_RS_UPLOAD, RP_RS_COPY, RP_RS_CLEAR_TEX, RP_RS_PASS_MIXED, RP_RS_SWAP_FAIL, RP_RS_WHY_N };
+void rp_rs_configure(const char *text) __attribute__((weak));                           // 平台层交设置（S2A_RES_SCALE 原文；NULL / 空 = 1，非法值报红按 1）。下一会话起生效
+void rp_present_filter_configure(const char *text) __attribute__((weak));               // 上屏缩放滤镜（S2A_SCALING_FILTER：Bilinear 缺省 / Nearest）
+float rp_rs_setting(void) __attribute__((weak));                                       // 本会话倍率（0.5 / 0.75 / 1 / 1.5 / 2；会话打开后第一次调用时定）
+void rp_rs_safe(int safe, int why) __attribute__((weak));                              // 声明下一次贴图解析：safe = 1 已按倍率处理（附件 / 普通片元采样 / 上屏）；0 = 不安全，why 是分类
+int rp_rs_eligible(const tex_t *t, float s) __attribute__((weak));                     // 这张图能不能按倍率 s 当目标（静态资格 + 没进黑名单）
+float rp_rs_attach(const tex_t *t, float s, nvn_gpu_cmd c) __attribute__((weak));      // 开通道前定附件倍率（通道外调）：返回这张图现在的存储倍率
+float rp_rs_level(const tex_t *t, uint32_t level, uint32_t *w, uint32_t *h) __attribute__((weak));   // 现存储倍率与第 level 级的存储尺寸
+const char *rp_rs_why_name(int w) __attribute__((weak));
+void rp_rs_take(uint64_t black[RP_RS_WHY_N], uint64_t *up, uint64_t *up_kpix, uint64_t *fail) __attribute__((weak));   // 取走并清零：各类降回 1× 次数、换存储次数 / 千像素 / 失败次数
 // 会话收尾：放掉全部后端对象、清表。
 void rp_res_reset(void);
 // 读数（单测 / 内存账）
