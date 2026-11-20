@@ -3,6 +3,9 @@
 #endif
 #include "compile_worker.h"
 #include "compile_request.h"
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../capacity_affinity.h"
+#endif
 
 #include <errno.h>
 #include <pthread.h>
@@ -201,6 +204,10 @@ static struct s2a_compile_diag_attempt *job_free(struct job *j) {
 
 static void *worker_main(void *arg) {
     (void)arg;
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    pthread_setname_np(pthread_self(), "s2a-vk-compile");
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     pthread_mutex_lock(&g_wmu);
     for (;;) {
         while (!g_stop && g_job.state != 1) pthread_cond_wait(&g_work_cv, &g_wmu);
