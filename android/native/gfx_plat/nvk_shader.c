@@ -133,6 +133,9 @@ static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profi
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
 static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
 static _Atomic uint64_t g_n_rpos, g_n_rnd, g_n_rns;   // 栅格事实证出计数：位置直通 / 不丢片元 / 不写 sample_mask（首笔全画用的三个条件）
+void nvk_shader_raster_counts(uint64_t *rpos, uint64_t *rnd, uint64_t *rns) {   // rp_draw.c 弱符号取：全画因行尾「栅」段
+    *rpos = atomic_load(&g_n_rpos); *rnd = atomic_load(&g_n_rnd); *rns = atomic_load(&g_n_rns);
+}
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
     pthread_mutex_lock(&g_progs_mu);

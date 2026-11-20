@@ -55,16 +55,17 @@ int rp_fd_on(void) {
     return g_fd_enabled;
 }
 // 真机诊断（r2/r3 全零定位）：索引成败、对账、decide 六码的逐条件计数；rp_present 每帧长行带走并清零。
-// st: 0 门关 1 建 2 坏记录 3 桶满 4 深度/守卫 5 分配 6 序坏 7 作废 8..13 decide 存{读,再挂,拷,清,否,无} 14 decide 跳
-static uint64_t g_sdx_st[16];
+// st: 0 门关 1 建 2 坏记录 3 桶满 4 深度/守卫 5 分配 6 序坏 7 作废 8..13 decide 存{读,再挂,拷,清,否,无} 14 跳 15 读失（程序没编出按全槽读）16 读句（bindless 按全部候选读）
+static uint64_t g_sdx_st[18];
 static void sdx_abort(int k) { g_sdx_st[k]++; g_sdx_ok = 0; }
 int rp_sdx_diag(char *b, size_t n) {   // → 已写字节数；全零不写
-    uint64_t t = 0; for (int i = 0; i < 16; i++) t |= g_sdx_st[i]; if (!t) return 0;
-    int o = snprintf(b, n, "前瞻因：关%llu 建%llu 坏%llu 桶%llu 深%llu 分%llu 序%llu 作%llu | 存：读%llu 挂%llu 拷%llu 清%llu 否%llu 无%llu | 跳%llu",
+    uint64_t t = 0; for (int i = 0; i < 18; i++) t |= g_sdx_st[i]; if (!t) return 0;
+    int o = snprintf(b, n, "前瞻因：关%llu 建%llu 坏%llu 桶%llu 深%llu 分%llu 序%llu 作%llu | 存：读%llu 挂%llu 拷%llu 清%llu 否%llu 无%llu | 读失%llu 读句%llu | 跳%llu",
         (unsigned long long)g_sdx_st[0], (unsigned long long)g_sdx_st[1], (unsigned long long)g_sdx_st[2], (unsigned long long)g_sdx_st[3],
         (unsigned long long)g_sdx_st[4], (unsigned long long)g_sdx_st[5], (unsigned long long)g_sdx_st[6], (unsigned long long)g_sdx_st[7],
         (unsigned long long)g_sdx_st[8], (unsigned long long)g_sdx_st[9], (unsigned long long)g_sdx_st[10], (unsigned long long)g_sdx_st[11],
-        (unsigned long long)g_sdx_st[12], (unsigned long long)g_sdx_st[13], (unsigned long long)g_sdx_st[14]);
+        (unsigned long long)g_sdx_st[12], (unsigned long long)g_sdx_st[13], (unsigned long long)g_sdx_st[15], (unsigned long long)g_sdx_st[16],
+        (unsigned long long)g_sdx_st[14]);
     memset(g_sdx_st, 0, sizeof g_sdx_st); return o;
 }
 static uint64_t h_ser(uint64_t h) {   // 槽句柄 → 贴图序号（0 = 登记里没有 / 解不出）
@@ -97,7 +98,7 @@ static void sdx_att_all(const p_set_rt *r, uint32_t seq, int why) {   // 当前�
 // 程序带 TEXU / IMGU / TBUFU（句柄在常量缓冲里，前瞻看不到内容）按「全部候选贴图都可能被读」保守记。
 static void sdx_reads(const struct rp_prog *pg, uint32_t seq, int is_compute) {
     if (!pg) {
-        for (int st = 0; st < 6; st++) for (int k = 0; k < RP_NTEX + 32; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], NULL, 0, 0, SDX_READ, 0, 0, 1});
+        for (int st = 0; st < 6; st++) for (int k = 0; k < RP_NTEX + 32; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], NULL, 0, 0, SDX_READ, 0, 0, 7});
         return;
     }
     int bindless = 0;
@@ -107,7 +108,7 @@ static void sdx_reads(const struct rp_prog *pg, uint32_t seq, int is_compute) {
             if (k == NVN_RB_TEXU || k == NVN_RB_IMGU || k == NVN_RB_TBUFU) { bindless = 1; break; }
         }
     if (bindless) {   // 常量缓冲里的句柄前瞻看不到：候选集里每张都可能被它读
-        for (uint32_t b = 0; b < g_sdx_nb; b++) if (g_sdx_hk[b]) sdx_ev_add((sdx_ev){seq, 0, g_sdx_hk[b], NULL, 0, 0, SDX_READ, 0, 0, 1});
+        for (uint32_t b = 0; b < g_sdx_nb; b++) if (g_sdx_hk[b]) sdx_ev_add((sdx_ev){seq, 0, g_sdx_hk[b], NULL, 0, 0, SDX_READ, 0, 0, 8});
         return;
     }
     int nst = is_compute ? 1 : RP_PROG_STAGES, base = is_compute ? 5 : 0;   // 计算程序的 ent 装在 0 号段、槽位取 NVN 阶段 5
@@ -260,6 +261,7 @@ static int sdx_decide_(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq)
 }
 int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq) {
     int rc = sdx_decide_(ser, lv, sl, plane, rt0seq);
-    if (rc == 2) g_sdx_st[14]++; else { int w = rc >> 2; if (w >= 1 && w <= 6) g_sdx_st[7 + w]++; }
+    if (rc == 2) g_sdx_st[14]++;
+    else { int w = rc >> 2; if (w >= 1 && w <= 6) g_sdx_st[7 + w]++; else if (w == 7) g_sdx_st[15]++; else if (w == 8) g_sdx_st[16]++; }
     return rc;
 }
