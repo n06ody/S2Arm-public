@@ -591,6 +591,125 @@ static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance)
     float max_point = 2047.0f;
     memcpy(sl->cpu + 0x610, &max_point, 4); memcpy(sl->cpu + 0x644, &base_instance, 4);
 }
+
+// ---------- 间接绘制 base instance 的通道级批量拷（开关 debug.s2a.nvk_binst_hoist：0 逐笔拷；1 批量、每段一次拷贝各带全屏障；2 批量、一次多区域拷贝 + 精确屏障（缺省）；会话打开时读定） ----------
+// 间接绘制的 firstInstance 在 GPU 侧的间接记录里，读 c0 + 0x644 的阶段要先把它拷进这一笔自己的驱动段切片。Vulkan 渲染通道里不能拷贝，
+//   逐笔拷就是每笔先收通道（8E：每帧收通道 381.7 个里 250 个是它，切出的 0–1 笔通道 190.8 个）。
+// 这里改成开通道之前前瞻：从这一笔的记录往后扫命令流，到第一条可能写缓冲 / 结束通道的命令为止，把途经的单条间接绘制各拷一份进各自的切片
+//   （每笔每阶段一个独立切片，不共用），之后这一遍里的这些笔直接用拷好的切片，不再为拷贝收通道。CPU 侧的驱动段内容照旧在这一笔发绑定前填
+//   （0x644 那个字由排在前面的 GPU 拷贝覆盖：CPU 写在提交之前，拷贝在提交之后执行）。
+// 正确性边界（任一不成立就照旧逐笔拷）：
+//   ① 前瞻只越过纯状态命令、绘制、换目标和跳转；派发、传输、改缓冲（CPU / GPU）、屏障、清除、计数器、事件、调用子列表、列表尾都停。
+//      游戏让一笔图形写对后面的间接读可见只能靠屏障，所以停在屏障就排除了通道内的图形生产者；派发 / 传输本来就先结束通道，也停。
+//   ② 前移之后主段里录了写镜像的传输（rp_gpu_wr_gen 变）：间接记录可能已被改，整表作废。
+//   ③ 段（rp_seg_serial）或命令缓冲换了：切片是那一段的暂存，作废。
+//   ④ 按命令流顺序消费：这一笔必须是表里当前位置之后的某一项，记录里的间接地址、绑定时解析出的镜像位置都要和表里一致，阶段要被表里的掩码盖住。
+// 阶段掩码：前瞻时不知道后面每笔的程序，按「这一会话里要拷过的阶段」的并集拷（g_hz_mask）；后面某笔要的阶段不在掩码里就照旧逐笔拷。
+int rp_pass_is_open(void) __attribute__((weak));   // 只链 rp_draw.c 的隔离用例可以不给：拿不到通道状态就只在要拷的那一笔前移
+const void *rp_draw_stream;
+uint64_t rp_gpu_wr_gen;
+enum { HZ_MAX = 128, HZ_SCAN = 4096 };
+struct hz_ent { const void *rec; uint64_t ind; nvn_gpu_buf buf; uint64_t off; uint8_t indexed, mask, used, carried; nvn_gpu_slice sl[RP_PROG_STAGES]; };
+struct hz_tab { struct hz_ent e[HZ_MAX]; int n, cur; nvn_gpu_cmd c; uint64_t seg, wgen; };
+static struct hz_tab g_hzt[2]; static int g_hzi;   // 当前表 g_hzt[g_hzi]；重建写进另一张再换
+static int g_hz_on = -1; static uint8_t g_hz_mask;
+static int hz_mode(int v) { return v <= 0 ? 0 : v == 1 ? 1 : 2; }   // 0 逐笔拷；1 批量、每段一次 nvn_gpu_copy_buf（各带全屏障）；2 批量、一次多区域拷贝 + 只到读它的阶段的屏障（缺省）
+static int hz_on(void) { if (g_hz_on < 0) g_hz_on = hz_mode(nvn_plat_flag("nvk_binst_hoist", 2)); return g_hz_on; }
+static int hz_live(const struct hz_tab *t, nvn_gpu_cmd c) { return t->n && t->c == c && t->seg == rp_seg_serial() && t->wgen == rp_gpu_wr_gen; }
+// 前瞻能越过的命令：只改回放状态、不碰缓冲内容、自己不结束通道（换目标可能结束通道，但不写缓冲：越过它只多拷几笔，见 ④）
+static int hz_pass_op(uint32_t op) {
+    switch (op) {
+        case OP_SET_RT: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
+        case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL:
+        case OP_POLY_OFFSET: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BLEND_COLOR: case OP_BIND_IMG: case OP_DEPTH_CLAMP:
+        case OP_VP_SWIZZLE: case OP_BIND_TEX1: case OP_PRIM_RESTART: case OP_SET_PATCH_SIZE: case OP_ALPHA_REF: case OP_RAST_DISCARD:
+        case OP_PUSH_CONST: case OP_PUSH_CONST_PTR: return 1;
+        default: return 0;
+    }
+}
+// 从 rec（本笔记录头）往后前瞻，建新表：已在旧表里、还有效的项沿用（不再拷），其余解析间接记录、分切片、录拷贝，最后一道屏障。调用方保证通道已收。
+static void hz_build(nvn_gpu_cmd c, const void *rec, uint8_t mask) {
+    struct hz_tab *o = &g_hzt[g_hzi], *t = &g_hzt[g_hzi ^ 1];
+    t->n = 0; t->cur = 0;
+    const uint8_t *p = rec;
+    for (int k = 0; k < HZ_SCAN && t->n < HZ_MAX; k++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7)) break;
+        if (h.op == OP_JUMP) { const uint8_t *to; memcpy(&to, p + 8, 8); if (!to) break; p = to; continue; }
+        if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) {
+            const int ix = h.op == OP_DRAW_IDX; uint64_t ind, mc, tfc = 0;
+            if (ix) { p_draw_idx tt; const p_draw_idx *d = draw_idx_rec(p + 8, h.size, &tt); ind = d->ind; mc = d->mdi_cnt; }
+            else { p_draw tt; const p_draw *d = draw_rec(p + 8, h.size, &tt); ind = d->ind; mc = d->mdi_cnt; tfc = d->tfc; }
+            if (ind && !mc && !tfc) {
+                struct hz_ent *e = &t->e[t->n++]; memset(e, 0, sizeof *e); e->rec = p; e->ind = ind; e->indexed = (uint8_t)ix;
+            }
+        } else if (!hz_pass_op(h.op)) break;
+        p += h.size;
+    }
+    // 先把全部间接记录解析完（脏页同步可能录进主段），再判旧表还能不能沿用、再录拷贝：拷贝之后不能再有同步改这些记录
+    static uint64_t ra[HZ_MAX], rl[HZ_MAX], ro[HZ_MAX]; static nvn_gpu_buf rb[HZ_MAX]; static unsigned char rok[HZ_MAX];
+    for (int i = 0; i < t->n; i++) { ra[i] = t->e[i].ind; rl[i] = t->e[i].indexed ? 20 : 16; }
+    if (t->n) rp_buf_resolve_multi(t->n, ra, rl, rb, ro, rok);   // 一次抢锁解析一批（同顶点流）
+    int n = 0;
+    for (int i = 0; i < t->n; i++) {
+        if (!rok[i] || (ro[i] & 3)) continue;   // 解析不了：这一笔到时自己按原路记未接
+        t->e[n] = t->e[i]; t->e[n].buf = rb[i]; t->e[n].off = ro[i]; n++;
+    }
+    t->n = n;
+    const int live = hz_live(o, c);
+    int j = live ? o->cur : o->n;
+    for (int i = 0; i < t->n; i++) {
+        struct hz_ent *e = &t->e[i];
+        for (int q = j; q < o->n; q++) {
+            const struct hz_ent *f = &o->e[q];
+            if (f->rec != e->rec) continue;
+            if (f->ind == e->ind && f->indexed == e->indexed && f->buf == e->buf && f->off == e->off && (f->mask & mask) == mask) {
+                memcpy(e->sl, f->sl, sizeof e->sl); e->mask = f->mask; e->carried = 1; o->e[q].carried = 1;
+            }
+            j = q + 1; break;
+        }
+    }
+    uint64_t waste = 0;
+    for (int q = 0; q < o->n; q++) if (!o->e[q].used && !o->e[q].carried) waste++;
+    if (waste) rp_perf_add(RP_PERF_BINST_WASTE, waste);
+    static nvn_gpu_buf_copy cv[HZ_MAX * RP_PROG_STAGES]; uint32_t ncv = 0;
+    for (int i = 0; i < t->n; i++) {
+        struct hz_ent *e = &t->e[i];
+        if (e->carried) { e->carried = 0; continue; }
+        int ok = 1;
+        for (int st = 0; st < RP_PROG_STAGES && ok; st++) if (mask >> st & 1) {
+            if (!alloc_copy(c, DRV0_BYTES, NULL, &e->sl[st])) ok = 0;
+        }
+        if (!ok) { t->n = i; break; }   // 暂存区满：表截在这里，后面的照旧逐笔
+        e->mask = mask;
+        for (int st = 0; st < RP_PROG_STAGES; st++) if (mask >> st & 1) {
+            cv[ncv++] = (nvn_gpu_buf_copy){e->buf, e->off + (e->indexed ? 16 : 12), e->sl[st].buf, e->sl[st].off + 0x644, 4};
+        }
+    }
+    if (ncv && g_hz_on == 2) nvn_gpu_copy_bufs_uniform(c, cv, ncv, mask);   // 一次多区域拷贝，屏障只到读驱动段的这几个阶段（不发全屏障）
+    else if (ncv) {   // 开关 1：每段一次拷贝（后端各带一次全屏障），最后一道同逐笔拷的屏障
+        for (uint32_t k = 0; k < ncv; k++) nvn_gpu_copy_buf(c, cv[k].src, cv[k].soff, cv[k].dst, cv[k].doff, cv[k].bytes);
+        nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // 同逐笔拷：传输写对驱动段常量读可见
+    }
+    for (int q = 0; q < o->n; q++) o->e[q].carried = 0;
+    o->n = 0;
+    t->c = c; t->seg = rp_seg_serial(); t->wgen = rp_gpu_wr_gen;
+    g_hzi ^= 1;
+    rp_perf_add(RP_PERF_BINST_SCAN, 1);
+}
+// 表里有这一笔、仍有效、阶段被盖住：返回它（并把消费位置挪到它后面），否则 NULL
+static struct hz_ent *hz_take(nvn_gpu_cmd c, const void *rec, uint64_t ind, int indexed, nvn_gpu_buf buf, uint64_t off, uint8_t need) {
+    struct hz_tab *t = &g_hzt[g_hzi];
+    if (!hz_live(t, c)) return NULL;
+    for (int i = t->cur; i < t->n; i++) {
+        struct hz_ent *e = &t->e[i];
+        if (e->rec != rec) continue;
+        if (e->ind != ind || e->indexed != (uint8_t)indexed || e->buf != buf || e->off != off || (e->mask & need) != need) return NULL;
+        t->cur = i + 1; e->used = 1;
+        return e;
+    }
+    return NULL;
+}
 // 计算写的可见性与 CPU 回写账分开：完成回调落地不等于发布给下一笔 GPU 图形读取。
 static struct rp_compute_access g_compute_access;
 static nvn_gpu_access_span g_dispatch_access[RP_PROG_ENT_MAX];
@@ -1198,6 +1317,32 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (!rp_buf_resolve(c, di->ibuf, (uint64_t)count * isz, &a.ibuf, &a.ioff)) { skip("index_buffer_unresolved", rec); return; }
         a.itype = (uint32_t)di->itype; a.base_vertex = di->base_vertex; index_bytes = (uint64_t)count * isz;
     } else a.first = (uint32_t)dr->first;
+    if (ind || g_hz_mask) {
+        // 要拷的阶段：用驱动段、编译器没证明不读 c0 + 0x644
+        uint8_t need = 0;
+        if (ind) for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++)
+            if (g_prog->ent[st][i].src_kind == NVN_RB_DRV0 && !(g_prog->binst_unread >> st & 1)) need |= (uint8_t)(1u << st);
+        const int hz = hz_on() && rec && rec == rp_draw_stream && !mdi_n;
+        if (hz) {
+            g_hz_mask |= need;
+            // 通道还没开（这一笔会开它）：开之前前瞻一遍，本通道里后面的间接绘制一起拷
+            int built = 0;
+            if (rp_pass_is_open && !rp_pass_is_open() && g_hz_mask) { hz_build(c, rec, g_hz_mask); built = 1; }
+            if (need) {
+                struct hz_ent *e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
+                if (!e && !built) {   // 表里没有（前瞻停在前面 / 作废了 / 阶段不够）：收通道，从这一笔重新前瞻；刚建过还没有就走下面的逐笔拷
+                    if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1);
+                    rp_pass_flush(c); hz_build(c, rec, g_hz_mask);
+                    e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
+                    if (e) rp_perf_add(RP_PERF_BINST_ONE, 1);
+                } else if (e) rp_perf_add(RP_PERF_BINST_HZ, 1);
+                if (e) for (int st = 0; st < RP_PROG_STAGES; st++) if (need >> st & 1) {
+                    g_ind_drv[st] = e->sl[st]; fill_graphics_drv(&g_ind_drv[st], st, 0);
+                    g_ind_drv_ok[st] = 1; g_lb[st].ok = 0;
+                }
+            }
+        }
+    }
     if (ind) {
         int copied = 0;
         for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
@@ -1209,7 +1354,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) rp_pass_flush(c);
+            if (!copied) { rp_perf_add(RP_PERF_BINST_ONE, 1); if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1); rp_pass_flush(c); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1782,4 +1927,5 @@ void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
+    memset(g_hzt, 0, sizeof g_hzt); g_hzi = 0; g_hz_mask = 0; g_hz_on = hz_mode(nvn_plat_flag("nvk_binst_hoist", 2));   // 批量拷开关会话打开时读定
     free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }
