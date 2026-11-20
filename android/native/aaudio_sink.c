@@ -115,8 +115,11 @@ static int open_stream_impl(void *arg) {
 static int open_stream(struct s2a_aaudio *a) {
     int result;
     int handled = s2a_capacity_call_wide(open_stream_impl, a, &result);
-    if (handled < 0) { __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "AAudio affinity helper failed: %d", handled); return AAUDIO_ERROR_INTERNAL; }
-    return handled ? result : open_stream_impl(a);
+    if (handled > 0) return result;
+    if (handled < 0) {
+        __android_log_print(ANDROID_LOG_WARN, "S2Arm", "【黄】AAudio affinity helper failed (%d); opening on the caller", handled);
+    }
+    return open_stream_impl(a);
 }
 
 int s2a_aaudio_open(int format, int sample_rate, int channels, int ring_ms, s2a_aaudio **out) {

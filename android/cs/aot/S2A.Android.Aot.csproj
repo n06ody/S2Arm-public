@@ -16,7 +16,7 @@
     <NativeLib>Shared</NativeLib>
     <PublishAotUsingRuntimePack>true</PublishAotUsingRuntimePack>
     <DisableUnsupportedError>true</DisableUnsupportedError>
-    <NoWarn>$(NoWarn);CA1416;IL2026;IL2072;IL2075;IL2080;IL3050</NoWarn>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
     <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../'))</RepoRoot>
   </PropertyGroup>
   <ItemGroup>

@@ -1,7 +1,5 @@
-// Android Performance Hint (ADPF): one measured worker thread, no CPU affinity
-// policy. Frame correlation is by sequence: the direct shim tags every job with
-// the frame it executes in, so a span can only be reported against the present
-// that actually depended on it — never a present interval mistaken for work.
+// Android Performance Hint (ADPF): the replay thread and optional Vulkan
+// recorder share one session. Frame work is correlated with present by sequence.
 #pragma once
 #include <stdint.h>
 #ifdef __cplusplus
@@ -9,15 +7,16 @@ extern "C" {
 #endif
 void s2a_adpf_set_foreground(int foreground);
 void s2a_adpf_set_surface(int present);
-// A queued translation job is about to execute on this thread, tagged with the
-// frame sequence it belongs to. The first job of a frame opens its work span;
-// later jobs of the same frame are ignored (the span is a wall-clock critical
-// path, not a sum of job durations).
+// Vulkan backend's optional recorder, or zero when it is inactive.
+int32_t s2a_adpf_recorder_tid(void);
+// Begin the CPU work period after presentation. A duplicate begin for the same
+// sequence keeps the first timestamp.
 void s2a_adpf_work_begin(uint64_t seq);
-// The frame's GPU dependency is complete (translation queue drained), before
-// present/acquire pacing. Reports the recorded span only when its sequence is
-// still this frame; a stale sequence means its present never happened and the
-// record is dropped instead of charged to the wrong frame.
+// Exclude a blocking GPU dependency wait on the frame's work thread. Both
+// timestamps are CLOCK_MONOTONIC nanoseconds.
+void s2a_adpf_exclude_gpu_wait(uint64_t begin_ns, uint64_t end_ns);
+// End the CPU work period before present/acquire pacing, using the current
+// exchange interval as the target. Only the matching sequence may be reported.
 void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq);
 void s2a_adpf_discard(void);
 // The live session has successfully reported work for the recorded frame thread.

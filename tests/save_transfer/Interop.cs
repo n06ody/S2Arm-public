@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using LibHac;
 using LibHac.Common.Keys;
@@ -14,7 +15,7 @@ if (args.Length is 1 or 2 && args[0] == "--describe")   // 审计 P2-11：失败
 {
     S2A.Services.SaveTransfer.UseLanguage(args.Length == 2 ? JsonSerializer.Serialize(new { language = args[1] }) : "{}");
     foreach (var ex in new Exception[] { new IOException("disk", 28), new IOException("quota", 69), new UnauthorizedAccessException("no"), new IOException("perm", 13),
-                                         new InvalidDataException("bad"), new JsonException("bad"), new IOException("other", 5), new ArgumentException("arg") })
+                                         new InvalidDataException("bad"), new JsonException("bad"), new IOException("other", 5), new ArgumentException("arg"), new InvalidOperationException("state") })
     {
         var (code, message) = S2A.Services.SaveTransfer.Describe(ex);
         Console.WriteLine(JsonSerializer.Serialize(new { type = ex.GetType().Name, code, message }));
@@ -28,8 +29,10 @@ if (args.Length == 3 && args[0] == "--copytree")   // 审计 P2-24：恢复用�
     Console.WriteLine(JsonSerializer.Serialize(new { ms = watch.ElapsedMilliseconds }));
     return;
 }
-if (args.Length == 2 && args[0] == "--request")
+if (args.Length is 2 or 3 && args[0] == "--request")
 {
+    if (args.Length == 3 && (args[2] != "--require-aot" || RuntimeFeature.IsDynamicCodeSupported || JsonSerializer.IsReflectionEnabledByDefault))
+        throw new InvalidOperationException("Save inspection requires NativeAOT without reflection serialization.");
     Console.WriteLine(S2A.Services.SaveTransfer.Execute(File.ReadAllText(args[1])));
     return;
 }

@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -173,7 +176,7 @@ void rp_pool_stats_end(void) {
 // 弱链接[replay]：s2a_frame_log_present_timed
 void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) __attribute__((weak));
 // ADPF 帧负载上报（android/native/adpf_hint.c；原先只接在旧层 mtl_vk_shim.c，缺省的新回放层构建不编它，CPU 调度器一直拿不到帧负载）：
-//   一帧的工作 = 上一次出图返回 → 这一次取图之前（游戏逻辑 + 录命令 + 回放），取图 / 呈现的阻塞是节拍不是工作。
+//   从上一次出图返回量到这一次取图之前，ADPF 层按帧号扣除回放线程显式等 GPU 的区间。取图 / 呈现节拍留在区间之外。
 //   每次出图前对本帧报 frame_end（目标 = 游戏登记的上屏周期），出图后对下一帧开 work_begin；没有显示面时关会话（invisible），不报。
 //   序号独立计（不借票号：票号在出图锁里发，ADPF 不该在出图锁里调）。弱引用：回放核心宿主单测与鸿蒙不链 ADPF，地址为空就不调。
 // 弱链接[replay]：s2a_adpf_work_begin
@@ -243,6 +246,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -333,9 +347,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 if (pf[RP_PERF_TEX_UP_PART])   // 线性 CPU 贴图只传脏行（upload_linear_dirty）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；线性贴图按脏行传 %.1f 次共 %.0f 行", (double)pf[RP_PERF_TEX_UP_PART] / f, (double)pf[RP_PERF_TEX_UP_ROWS] / f);
                 if (pf[RP_PERF_RES_N])
-                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB、新建镜像 %.0f 次",
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB（显卡写区间里不搬 %.0f KB）、新建镜像 %.0f 次",
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
-                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
+                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_BUF_SYNC_GW_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 if (pf[RP_PERF_GW_REG_N])   // 显卡写登记：收到多少条、同段合并掉多少条（落地次数 = 登记 − 合并）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);

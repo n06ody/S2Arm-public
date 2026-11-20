@@ -3,8 +3,10 @@
 #endif
 #include "compile_worker.h"
 #include "compile_request.h"
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../capacity_affinity.h"
+#endif
 
-#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -201,6 +203,10 @@ static struct s2a_compile_diag_attempt *job_free(struct job *j) {
 
 static void *worker_main(void *arg) {
     (void)arg;
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    pthread_setname_np(pthread_self(), "s2a-vk-compile");
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     pthread_mutex_lock(&g_wmu);
     for (;;) {
         while (!g_stop && g_job.state != 1) pthread_cond_wait(&g_work_cv, &g_wmu);
@@ -335,6 +341,26 @@ int s2a_compile_worker_active(void) {
     return active;
 }
 
+// Android minSdk 29 提供 monotonic_np；旧层和新层的超时都不受系统时间校准影响。
+static void deadline_at(struct timespec *ts, int ms) {
+#ifdef __ANDROID__
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#else
+    clock_gettime(CLOCK_REALTIME, ts);
+#endif
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
+}
+
+static int wait_until(const struct timespec *deadline) {
+#ifdef __ANDROID__
+    return pthread_cond_timedwait_monotonic_np(&g_done_cv, &g_wmu, deadline);
+#else
+    return pthread_cond_timedwait(&g_done_cv, &g_wmu, deadline);
+#endif
+}
+
 // 收尾状态机：请求停止 → 按预算等 worker 走完 → 只有确认走完才 join/清编译入口。
 // 返回 0 = 已退出并回收；1 = 仍在编译（迟到结果会被丢弃，下一次 start/stop 先尝试回收）；
 // -1 = 参数问题。预算 0 表示不等待（只发停止请求）。
@@ -350,12 +376,9 @@ static int worker_stop_locked(int budget_ms, char *why, size_t why_size,
     pthread_cond_broadcast(&g_done_cv);
     if (budget_ms > 0 && g_thread_running && !g_thread_done) {
         struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        dl.tv_sec += budget_ms / 1000;
-        dl.tv_nsec += (long)(budget_ms % 1000) * 1000000L;
-        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        deadline_at(&dl, budget_ms);
         while (g_thread_running && !g_thread_done) {
-            if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &dl) == ETIMEDOUT) break;
+            if (wait_until(&dl)) break;
         }
     }
     if (g_thread_running && !g_thread_done) {
@@ -398,24 +421,14 @@ int s2a_compile_worker_pump(uint32_t budget_ms) {
     if (!g_started) { pthread_mutex_unlock(&g_wmu); return -1; }
     if (g_job.state) {
         struct timespec dl;
-        clock_gettime(CLOCK_REALTIME, &dl);
-        dl.tv_nsec += (long)budget_ms * 1000000L;
-        if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+        deadline_at(&dl, (int)budget_ms);
         while (g_job.state && !g_stop) {
-            if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &dl) == ETIMEDOUT) break;
+            if (wait_until(&dl)) break;
         }
     }
     int pending = g_job.state ? 1 : 0;
     pthread_mutex_unlock(&g_wmu);
     return pending;
-}
-
-static void deadline_at(struct timespec *ts, int ms) {
-    clock_gettime(CLOCK_REALTIME, ts);
-    if (ms <= 0) ms = 10000;
-    ts->tv_sec += ms / 1000;
-    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
-    if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
 }
 
 int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *json, size_t len,
@@ -441,7 +454,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
         return -1;
     }
     struct timespec deadline;
-    deadline_at(&deadline, deadline_ms);
+    deadline_at(&deadline, deadline_ms > 0 ? deadline_ms : 10000);
     int paused = 0, rc = -1;
     pthread_mutex_lock(&g_wmu);
     if (!g_started || g_stop) {
@@ -500,7 +513,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
             break;
         }
         // 槽被另一个请求占用（state 1 不同 sha / state 2 待取）：容量 1，等它让出。
-        if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &deadline) == ETIMEDOUT) {
+        if (wait_until(&deadline)) {
             if (why && why_size) snprintf(why, why_size, "compile worker: slot busy timeout");
             g_stats.busy_timeouts++;
             goto out;
@@ -514,7 +527,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
     }
     // 等待本次/在途 job 完成；外部锁已经成功交出。
     while (g_start_epoch == epoch && g_job.state == 1 && !memcmp(g_job.sha, sha, 32) && !g_stop) {
-        if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &deadline) == ETIMEDOUT) break;
+        if (wait_until(&deadline)) break;
     }
     if (g_start_epoch == epoch && g_job.state == 2 && !memcmp(g_job.sha, sha, 32) && !g_stop) {
         if (!g_job.failed && g_job.bytes_len) {
@@ -670,13 +683,14 @@ int s2a_compile_worker_wait_async(const uint8_t sha[32], uint32_t deadline_ms,
     }
     *bytes = NULL; *bytes_len = 0;
     struct timespec deadline;
-    deadline_at(&deadline, (int)(deadline_ms > 0x7fffffffu ? 0x7fffffff : deadline_ms));
+    if (!deadline_ms) deadline_ms = 10000;
+    deadline_at(&deadline, deadline_ms > 0x7fffffffu ? 0x7fffffff : (int)deadline_ms);
     pthread_mutex_lock(&g_wmu);
     int rc;
     for (;;) {
         rc = query_locked(sha, bytes, bytes_len, why, why_size);
         if (rc != 1 || g_stop) break;
-        if (pthread_cond_timedwait(&g_done_cv, &g_wmu, &deadline) == ETIMEDOUT) {
+        if (wait_until(&deadline)) {
             /* 超时：结果可能恰在醒来前入环——以最后一次查询为准。 */
             rc = query_locked(sha, bytes, bytes_len, why, why_size);
             break;

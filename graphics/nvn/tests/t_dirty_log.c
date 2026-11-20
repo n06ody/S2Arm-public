@@ -28,6 +28,15 @@ extern int (*nvn_dirty_mp_hook)(void *, size_t, int);
 static int checks, fails;
 #define CK(expr) do { checks++; if (!(expr)) { fails++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #expr); } } while (0)
 static _Atomic int g_hold, g_entered, g_release, g_fail_mp;
+static _Atomic int g_prepare_waiting;
+static _Thread_local int g_observe_prepare_wait;
+
+// The test build redirects nvn_dirty.c's sched_yield only. Observe that the
+// second operation really reached busy_wait before allowing the first to finish.
+int dirty_test_sched_yield(void) {
+    if (g_observe_prepare_wait) atomic_store(&g_prepare_waiting, 1);
+    return sched_yield();
+}
 static int mp_hook(void *addr, size_t len, int prot) {   // 解保护（PROT_WRITE）进 mprotect 之前停住：此刻页还只读，写入还没发生
     (void)addr; (void)len;
     if (atomic_load(&g_fail_mp)) return 1;
@@ -38,6 +47,11 @@ static int mp_hook(void *addr, size_t len, int prot) {   // 解保护（PROT_WRI
     return 0;
 }
 static void *writer(void *p) { *(volatile uint8_t *)p = 0x6d; return NULL; }   // 真缺页：回调解保护后重新执行这次写
+static void *preparer(void *p) {
+    g_observe_prepare_wait = 1;
+    g_prep(p, 1);
+    return NULL;
+}
 
 // 收事件：把 [a, b) 记成页位图（相对 mem，最多 256 页）
 static uint8_t *g_mem; static size_t g_pg; static uint8_t g_hit[256]; static int g_events;
@@ -68,6 +82,7 @@ int main(void) {
 
     // 开：缺页写一页 → 一条事件正好是这一页；写之前的页「只读」，写之后不是
     CK(nvn_dirty_log_configure(1));
+    nvn_dirty_set_mp_dedupe(1);
     nvn_dirty_add_range(mem, 256 * pg); span = nvn_dirty_span(mem, 256 * pg);
     CK(span && nvn_dirty_log_open(span, &id, &cur));
     nvn_dirty_protect(mem, 256 * pg);
@@ -91,8 +106,19 @@ int main(void) {
     while (atomic_load(&g_entered) != 1) sched_yield();
     CK(read_log(span, id, &cur) && g_hit[70]);
     CK(mem[70 * pg] != 0x6d);   // 写入还没发生
-    atomic_store(&g_release, 1); pthread_join(t1, NULL); atomic_store(&g_hold, 0);
+    pthread_t t2;
+    if (pthread_create(&t2, NULL, preparer, mem + 70 * pg)) return 2;
+    while (!atomic_load(&g_prepare_waiting)) sched_yield();
+    atomic_store(&g_release, 1);
+    pthread_join(t1, NULL); pthread_join(t2, NULL); atomic_store(&g_hold, 0);
     CK(mem[70 * pg] == 0x6d);
+    CK(atomic_load(&g_entered) == 1);  // 第一个已经把页改成可写，第二个无需重复 mprotect。
+    CK(read_log(span, id, &cur) && g_events == 0);
+    nvn_dirty_protect(mem + 70 * pg, pg);
+    const uint64_t rearmed = nvn_dirty_now();
+    mem[70 * pg + 1] = 0x63;
+    CK(nvn_dirty_since_span(span, mem + 70 * pg, pg, rearmed));
+    CK(read_log(span, id, &cur) && g_events == 1 && g_hit[70]);
 
     // 读者游标之后只有自己没读过的：另一个游标（另一份镜像）各读各的
     uint64_t id2 = 0, cur2 = 0; CK(nvn_dirty_log_open(span, &id2, &cur2) && id2 == id);
