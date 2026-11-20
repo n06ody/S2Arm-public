@@ -33,7 +33,7 @@ PY
 esac
 incs=(-I "$repo" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" -I "$repo/$rp" -I "$repo/android/native/nvn")
 srcs=("$repo/android/tests/nvk_pipe_async_draw_test.c" "$repo/graphics/nvn/tests/nvn_clear_view_unused.c")
-for f in rp_exec.c rp_copy_t2b.c rp_clear_tex.c rp_state.c rp_entry.c rp_res.c rp_buf.c rp_pass.c rp_present.c nvn_unimpl.c; do srcs+=("$repo/$rp/$f"); done
+for f in rp_exec.c rp_copy_t2b.c rp_clear_tex.c rp_state.c rp_entry.c rp_res.c rp_buf.c rp_pass.c rp_present.c rp_sdx.c nvn_unimpl.c; do srcs+=("$repo/$rp/$f"); done
 srcs+=("$draw" "$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c" "$demand" "$repo/android/native/nvn/nvn_pipe_pend.c" "$repo/graphics/nvn/gfx/nvn/nvn_first_use.c")
 weak=(); [ "$(uname -s)" = Darwin ] && read -r -a weak <<< "$(cd "$repo" && python3 tools/weak_link_decl.py flags replay)"
 flags=(-std=c11 -D_DEFAULT_SOURCE -DS2A_TEST_TS_ALLOC -O1 -g -pthread -Wall -Wextra -Werror)

@@ -303,6 +303,8 @@ extern void nvn_gpu_vk_test_ref_seen(int on);               // #1194：对照档
 extern void nvn_gpu_vk_test_emit_counts(nvn_gpu_cmd c, uint32_t out[9]);   // #708：管线、视口、裁剪、混合常量、模板、深度偏移、顶点缓冲、索引缓冲、push 各录了几次
 extern void nvn_gpu_vk_test_set_fault(int mode);
 extern void nvn_gpu_vk_test_diag_timing(int on, uint64_t draw_log_ns);   // C207：直接开 / 关诊断计时，并改逐笔读数的周期（0 = 还原 5 秒）
+extern uint64_t nvn_vk_shader_key(nvn_gpu_shader s);          // 通道探针：着色器阶段键（上游 key 或 blob FNV-1a）
+extern int nvn_vk_probe_seen2(uint64_t (*t)[2], int cap, int *n, int *ovf, uint64_t k1, uint64_t k2);   // 通道探针：去重助手
 extern void nvn_gpu_vk_test_fail_fence(uint64_t signal);
 extern void nvn_gpu_vk_test_delay_segment(uint64_t signal, uint32_t ms);
 
@@ -2269,7 +2271,7 @@ static void t21_clear_int(void) {
 
 // C27b：视图覆盖格式的 clear 明确不支持（Vulkan 按 image 格式解释 clear 值）。
 static void t22_clear_view_fmt(void) {
-    // 带存储用途：自由可改格式（跨类原始位视图只在存储图上保留；普通颜色图走格式列表保 UBWC，见 t22b）
+    // 带存储用途 + VIEW_FMT：跨类视图按需重建后照样建（见 t22b 的按需语义）
     nvn_gpu_tex t = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE | NVN_GPU_TEX_VIEW_FMT);
     view_t vd;
     memset(&vd, 0, sizeof vd);
@@ -2290,42 +2292,148 @@ static void t22_clear_view_fmt(void) {
 }
 
 
-// 保 Adreno UBWC（格式列表代替自由 MUTABLE_FORMAT）：普通颜色图按 sRGB 孪生看照常建视图、不退回；
-//   跨类格式（RGBA8 → RGBA8UI）不在列表，退回图本身格式建视图并计数（不失败、不跳笔）；深度图不开 MUTABLE，按本格式看照常。
-//   期望（手算）：孪生视图 0 次退回；BGRA 视图 0 次（通道互换等效）；跨类视图 1 次；深度本格式视图 0 次。全程校验层 0 报错由 run.sh 检测器判。
+// 异格式视图按需重建（保 Mali AFBC / Adreno UBWC）：默认建图不带 MUTABLE_FORMAT——修前这条断言红；
+//   异格式视图首用时照 iOS tex_upgrade 语义重建（MUTABLE + 内容随下次提交的 init_cb 逐层拷贝），
+//   BGRA 视图照旧由通道互换等效，深度图不重建。退回计数 nvn_vk_tex_view_fallbacks 只在不该升 / 升不了时涨。
+//   期望（手算）：默认 flags 无 MUTABLE；sRGB 孪生 0 退回 + 重建 1 次；BGRA 0 退回 + 不再重建；跨类 0 退回；深度 0 退回 + 不重建。
 uint64_t nvn_vk_tex_view_fallbacks(void);
-int nvn_vk_tex_fmt_list_active(void);
-static void t22b_ubwc_format_list(void) {
-    nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
-    if (!nvn_vk_tex_fmt_list_active()) { printf("【未证】t22b：本设备没启用 VK_KHR_image_format_list，格式列表模式不生效，跳过\n"); return; }
-    uint64_t f0 = nvn_vk_tex_view_fallbacks();
+uint64_t nvn_vk_tex_upgraded(void);
+uint32_t nvn_vk_tex_create_flags(nvn_gpu_tex);
+static void t22b_view_fmt_on_demand(void) {
+    uint64_t f0 = nvn_vk_tex_view_fallbacks(), u0 = nvn_vk_tex_upgraded();
     nvn_gpu_tex t = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_VIEW_FMT);
+    CHECK(!(nvn_vk_tex_create_flags(t) & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
+          "按需模式：默认建图不该带 MUTABLE_FORMAT（丢了帧缓冲压缩），flags=0x%x", nvn_vk_tex_create_flags(t));
     view_t vd; memset(&vd, 0, sizeof vd); vd.set_format = 1; vd.format = NVN_FORMAT_RGBA8_SRGB;
     nvn_gpu_view v = NULL; nvn_gpu_err e = {0};
     nvn_gpu_rc r = nvn_gpu_view_create(t, &vd, &v, &e);
-    CHECK(OK(r), "列表模式：sRGB 孪生视图创建 %d %s", r.code, e.why);
-    CHECK(nvn_vk_tex_view_fallbacks() == f0, "列表模式：孪生视图不应退回，实为 %llu 次", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
+    CHECK(OK(r), "按需模式：sRGB 孪生视图创建 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0, "按需模式：孪生视图应走重建、不退回，实为 %llu 次", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
+    CHECK(nvn_vk_tex_upgraded() == u0 + 1, "按需模式：异格式视图首用应重建 1 次，实为 %llu", (unsigned long long)(nvn_vk_tex_upgraded() - u0));
+    CHECK((nvn_vk_tex_create_flags(t) & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT), "重建后建图 flags 应带 MUTABLE_FORMAT");
     if (v) nvn_gpu_view_release(v);
-    // RGBA8 ↔ BGRA8：列表里不放 BGRA，按本格式 + 互换 R/B 的通道映射等效（像素读回由 t_feedback 第 8 种钉住），也不算退回
+    // RGBA8 ↔ BGRA8：按本格式 + 互换 R/B 的通道映射等效（像素读回由 t_feedback 第 8 种钉住），不退回也不再重建
     vd.format = NVN_FORMAT_BGRA8; v = NULL;
     r = nvn_gpu_view_create(t, &vd, &v, &e);
-    CHECK(OK(r), "列表模式：BGRA 视图创建 %d %s", r.code, e.why);
-    CHECK(nvn_vk_tex_view_fallbacks() == f0, "列表模式：BGRA 视图应由通道互换等效、不退回，实为 %llu 次", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
+    CHECK(OK(r), "按需模式：BGRA 视图创建 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0 && nvn_vk_tex_upgraded() == u0 + 1,
+          "按需模式：BGRA 视图应由通道互换等效（退回 %llu、重建 %llu）",
+          (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0), (unsigned long long)(nvn_vk_tex_upgraded() - u0));
     if (v) nvn_gpu_view_release(v);
+    // 已可变的图：跨类视图直接建（不再退回）
     vd.format = NVN_FORMAT_RGBA8UI; v = NULL;
     r = nvn_gpu_view_create(t, &vd, &v, &e);
-    CHECK(OK(r), "列表模式：跨类视图应退回本格式而不是失败 %d %s", r.code, e.why);
-    CHECK(nvn_vk_tex_view_fallbacks() == f0 + 1, "列表模式：跨类视图应退回 1 次，实为 %llu 次", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
+    CHECK(OK(r), "按需模式：跨类视图创建 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0, "按需模式：跨类视图应直接建成、不退回，实为 %llu 次", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
     if (v) nvn_gpu_view_release(v);
     nvn_gpu_tex_release(t);
+    // 深度图不重建（深度视图只能取本格式）：同格式视图照常，全程 0 退回 0 重建
     nvn_gpu_tex dt = make_tex(8, 8, NVN_FORMAT_DEPTH32F, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_VIEW_FMT);
+    CHECK(!(nvn_vk_tex_create_flags(dt) & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT), "深度图建图不带 MUTABLE_FORMAT");
     memset(&vd, 0, sizeof vd); vd.set_format = 1; vd.format = NVN_FORMAT_DEPTH32F; v = NULL;
     r = nvn_gpu_view_create(dt, &vd, &v, &e);
-    CHECK(OK(r), "深度图（不开 MUTABLE）：本格式视图创建 %d %s", r.code, e.why);
-    CHECK(nvn_vk_tex_view_fallbacks() == f0 + 1, "深度图本格式视图不应退回");
+    CHECK(OK(r), "深度图（不重建）：本格式视图创建 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0 && nvn_vk_tex_upgraded() == u0 + 1, "深度图不该退回也不该重建");
     if (v) nvn_gpu_view_release(v);
     nvn_gpu_tex_release(dt);
-    (void)cp;
+    // 8E b2 黑场形态（Adreno + image_format_list）：STORAGE + VIEW_FMT 建图即 MUTABLE——跨类存储视图
+    //   （RG32F 图要 R32G32_UINT）段内先写后要、seg_write 必拒升；退回错格式视图在 Adreno 全黑。
+    //   出生 MUTABLE 则视图直建：0 退回、0 重建（已可变的图升级路径不触发）。
+    nvn_gpu_tex st = make_tex(8, 8, NVN_FORMAT_RG32F, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE | NVN_GPU_TEX_VIEW_FMT);
+    CHECK((nvn_vk_tex_create_flags(st) & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
+          "8E 形态：STORAGE+VIEW_FMT 建图必须带 MUTABLE（拒升即黑场），flags=0x%x", nvn_vk_tex_create_flags(st));
+    memset(&vd, 0, sizeof vd); vd.set_format = 1; vd.format = NVN_FORMAT_RG32UI; v = NULL;
+    r = nvn_gpu_view_create(st, &vd, &v, &e);
+    CHECK(OK(r), "8E 形态：RG32F→RG32UI 跨类存储视图应直接建成 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0 && nvn_vk_tex_upgraded() == u0 + 1,
+          "8E 形态：出生 MUTABLE 不该有退回也不该有重建");
+    if (v) nvn_gpu_view_release(v);
+    nvn_gpu_tex_release(st);
+}
+
+// 按需重建的画面风险点：段内未提交的写挡住重建（退回不丢写）；提交后重建时内容随载体段 init_cb 逐层拷贝——
+//   读回字节必须与上传真值逐字节相同（拷贝 + 布局同步的真机口径在 lavapipe 上照跑，校验层判布局链合法性）。
+static void t22c_view_upgrade_copy(void) {
+    uint64_t f0 = nvn_vk_tex_view_fallbacks(), u0 = nvn_vk_tex_upgraded();
+    uint8_t pat[8 * 8 * 4];
+    for (int i = 0; i < (int)sizeof pat; i++) pat[i] = (uint8_t)(i * 5 + 1);
+    nvn_gpu_tex t = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD | NVN_GPU_TEX_VIEW_FMT);
+    nvn_gpu_err e = {0};
+    // 段内未提交的写：异格式视图具名拒绝（不兜底错格式视图——退回视图会被缓存常驻，8E 实证 RG32F 存储
+    //   视图错格式全黑，b2；提交后 seg_write 清零、下一次请求重建成功，拒绝是瞬态）
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_tex_upload(c, t, 0, 0, NULL, pat, 32, sizeof pat);
+    view_t vd; memset(&vd, 0, sizeof vd); vd.set_format = 1; vd.format = NVN_FORMAT_RGBA8_SRGB;
+    nvn_gpu_view v = NULL;
+    nvn_gpu_rc r = nvn_gpu_view_create(t, &vd, &v, &e);
+    CHECK(r.code == NVN_GPU_E_UNSUPPORTED && !v, "段内写后：异格式视图应具名拒绝 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_view_fallbacks() == f0, "段内写后不该退回错格式视图，实为 %llu", (unsigned long long)(nvn_vk_tex_view_fallbacks() - f0));
+    CHECK(nvn_vk_tex_upgraded() == u0, "段内写后不该重建");
+    if (v) nvn_gpu_view_release(v);
+    r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r), "commit 1：%d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(1, 2000000000ull, &e);
+    CHECK(OK(r), "wait 1：%d %s", r.code, e.why);
+    // 提交后再要异格式视图 → 重建；旧图内容应随下一次提交的 init_cb 逐层拷到新图
+    v = NULL;
+    r = nvn_gpu_view_create(t, &vd, &v, &e);
+    CHECK(OK(r), "提交后：异格式视图创建 %d %s", r.code, e.why);
+    CHECK(nvn_vk_tex_upgraded() == u0 + 1, "提交后应重建 1 次，实为 %llu", (unsigned long long)(nvn_vk_tex_upgraded() - u0));
+    CHECK(nvn_vk_tex_view_fallbacks() == f0, "提交后不该再退回");
+    if (v) nvn_gpu_view_release(v);
+    uint8_t zero[sizeof pat]; memset(zero, 0, sizeof zero);
+    nvn_gpu_buf b = make_buf(sizeof zero, NVN_GPU_MEM_SHARED, zero);
+    nvn_gpu_cmd c2 = begin_cmd();
+    nvn_gpu_copy_tex_buf(c2, t, 0, 0, NULL, b, 0, 32, sizeof pat);
+    r = nvn_gpu_cmd_commit(c2, 2, on_done, NULL, &e);
+    CHECK(OK(r), "commit 2：%d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(2, 2000000000ull, &e);
+    CHECK(OK(r), "wait 2：%d %s", r.code, e.why);
+    CHECK(memcmp(buf_cpu(b), pat, sizeof pat) == 0, "重建后读回内容与上传真值不同（升级拷贝没保内容）");
+    nvn_gpu_tex_release(t);
+    nvn_gpu_buf_release(b, NULL, NULL);
+}
+
+// 通道探针键（laze②）：s->key 全零的管线路径取 blob FNV-1a——同 blob 同键、异 blob 异键、永不为 0；
+// 探针去重表满后只计数、不再返回新键（修前满表逐次打，9000 探针2 PID 3899 刷出 62357 行采样清单把 logcat 配额打爆）。
+static void t22d_probe_keys(const char *dir) {
+    uint64_t tab[4][2]; int n = 0, ovf = 0;
+    CHECK(nvn_vk_probe_seen2(tab, 4, &n, &ovf, 7, 1) == 1 && n == 1, "新键应入表");
+    CHECK(nvn_vk_probe_seen2(tab, 4, &n, &ovf, 7, 1) == 0 && n == 1, "重键应返 0");
+    for (int i = 1; i < 4; i++) CHECK(nvn_vk_probe_seen2(tab, 4, &n, &ovf, 7, 100 + i) == 1, "新键 %d 应入表", i);
+    CHECK(n == 4, "表应满 4，实为 %d", n);
+    for (int i = 0; i < 300; i++) CHECK(nvn_vk_probe_seen2(tab, 4, &n, &ovf, 9, (uint64_t)i) == 0, "满表后不得再当新键");
+    CHECK(ovf == 300, "满表溢出应计数，实为 %d", ovf);
+
+    char path[512]; size_t vsz = 0, fsz = 0;
+    snprintf(path, sizeof path, "%s/tri.vert.spv", dir); void *vs = read_file(path, &vsz);
+    snprintf(path, sizeof path, "%s/tri.frag.spv", dir); void *fs = read_file(path, &fsz);
+    CHECK(vs && fs, "读不到 SPIR-V（%s）", dir);
+    if (!vs || !fs) { free(vs); free(fs); return; }
+    nvn_gpu_layout_ent ents[2];
+    memset(ents, 0, sizeof ents);
+    ents[0].set = 0; ents[0].cls = NVN_GPU_RES_TEX; ents[0].access = NVN_GPU_ACC_R;
+    ents[0].binding = 0; ents[0].count = 1; ents[0].stages = 1u << NVN_GPU_SH_FS;
+    ents[1].set = 0; ents[1].cls = NVN_GPU_RES_SAMP; ents[1].access = NVN_GPU_ACC_R;
+    ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_FS;
+    nvn_gpu_layout fs_layout, vs_layout;
+    memset(&fs_layout, 0, sizeof fs_layout); fs_layout.ent = ents; fs_layout.nent = 2;
+    memset(&vs_layout, 0, sizeof vs_layout);
+    nvn_gpu_shader_src ssrc; memset(&ssrc, 0, sizeof ssrc);   // ssrc.key 全零 = 上游没填阶段键的路径
+    ssrc.stage = NVN_GPU_SH_VS; ssrc.kind = NVN_GPU_BLOB_SPIRV; ssrc.entry = "main";
+    ssrc.blob = vs; ssrc.bytes = vsz; ssrc.layout = &vs_layout;
+    nvn_gpu_shader s1 = NULL, s2 = NULL, s3 = NULL; nvn_gpu_err e; memset(&e, 0, sizeof e);
+    CHECK(OK(nvn_gpu_shader_load(&ssrc, &s1, &e)), "VS 装载1：%d %s", e.rc.code, e.why);
+    CHECK(nvn_vk_shader_key(s1) != 0, "上游 key 全零时阶段键应取 blob 摘要，实为 0");
+    CHECK(OK(nvn_gpu_shader_load(&ssrc, &s2, &e)), "VS 装载2：%d %s", e.rc.code, e.why);
+    CHECK(nvn_vk_shader_key(s2) == nvn_vk_shader_key(s1), "同 blob 应同键");
+    ssrc.stage = NVN_GPU_SH_FS; ssrc.blob = fs; ssrc.bytes = fsz; ssrc.layout = &fs_layout;
+    CHECK(OK(nvn_gpu_shader_load(&ssrc, &s3, &e)), "FS 装载：%d %s", e.rc.code, e.why);
+    CHECK(nvn_vk_shader_key(s3) != 0 && nvn_vk_shader_key(s3) != nvn_vk_shader_key(s1), "异 blob 应异键且非零");
+    if (s1) nvn_gpu_shader_release(s1);
+    if (s2) nvn_gpu_shader_release(s2);
+    if (s3) nvn_gpu_shader_release(s3);
+    free(vs); free(fs);
 }
 
 // C76：单次分配上限必须来自 maxMemoryAllocationSize，不能与 maxStorageBufferRange 共用同一个值。
@@ -10957,9 +11065,15 @@ int main(int argc, char **argv) {
     CHECK(OK(nvn_gpu_close(5000000000ull, &e5)), "t21 close：%d %s", e5.rc.code, e5.why);
     if (!open_backend()) return 1;
     t22_clear_view_fmt();
-    t22b_ubwc_format_list();
+    t22b_view_fmt_on_demand();
     nvn_gpu_err e6;
     CHECK(OK(nvn_gpu_close(5000000000ull, &e6)), "t22 close：%d %s", e6.rc.code, e6.why);
+    if (!open_backend()) return 1;
+    t22c_view_upgrade_copy();   // t22 留了失败终态，重建 + 拷贝回读放独立会话
+    { nvn_gpu_err ec; CHECK(OK(nvn_gpu_close(5000000000ull, &ec)), "t22c close：%d %s", ec.rc.code, ec.why); }
+    if (!open_backend()) return 1;
+    t22d_probe_keys(argv[1]);
+    { nvn_gpu_err ed; CHECK(OK(nvn_gpu_close(5000000000ull, &ed)), "t22d close：%d %s", ed.rc.code, ed.why); }
     if (!open_backend()) return 1;
     t30_rgb8_sampled(argv[1]);
     t28_rgb8_upload();
