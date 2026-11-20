@@ -40,7 +40,8 @@ namespace S2A.DirectCompiler
             if (root.ValueKind != JsonValueKind.Object)
                 throw new DirectCompileException("INVALID_JSON", "request root is not an object");
             JsonStrict.OnlyKeys(root, "request", "schema", "session", "generation", "requestId",
-                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "profile", "program");
+                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "debugMode",
+                "profile", "program");
             string requestSchema = JsonStrict.String(root, "schema", "request");
             int requestVersion = requestSchema == RequestSchema ? 1 : requestSchema == GraphicsRequestSchemaV2 ? 2 : 0;
             if (requestVersion == 0)
@@ -48,6 +49,12 @@ namespace S2A.DirectCompiler
             // 描述符种类校验开关：native 过了调试门、debug.s2a.kind_check=0 才在请求里带 kindCheck=false；
             // 缺省（离线库/CLI）为开。这里只从请求读，不读进程环境变量。
             bool kindCheck = JsonStrict.OptionalBool(root, "kindCheck", "request", true);
+            // 翻译器调试模式开关：native 恒显式写 debugMode（调试门 + debug.s2a.xlate_debug=1 才为 true，
+            // 缺省也写 false——让翻译旗口径进 sha256 身份；离线/CLI 不带键按缺省关，与 libpack job.debug=false 同口径）。
+            // DebugMode 关掉 AstOptimizer 的表达式传播，每个 IR 临时量物化成 OpVariable Function，
+            // 9000 post_deferred FS 实测 62,841 词 vs 出库 30,099 词。
+            bool debugMode = JsonStrict.OptionalBool(root, "debugMode", "request", false);
+            TranslationFlags xlateFlags = debugMode ? TranslationFlags.DebugMode : 0;
             ulong session = JsonStrict.UInt64(root, "session", "request", 1, ulong.MaxValue);
             ulong generation = JsonStrict.UInt64(root, "generation", "request", 1, ulong.MaxValue);
             string requestId = JsonStrict.String(root, "requestId", "request", 127);
@@ -132,7 +139,7 @@ namespace S2A.DirectCompiler
                         if (stage == null) continue;
                         var accessor = new DirectGpuAccessor(profile, program, stage, item.index, allocator, queries);
                         accessors.Add(accessor);
-                        contexts.Add((stage, accessor, ShaderCache.DecodeGraphicsShader(accessor, TargetApi.Vulkan, ShaderCache.DefaultFlags, 0)));
+                        contexts.Add((stage, accessor, ShaderCache.DecodeGraphicsShader(accessor, TargetApi.Vulkan, xlateFlags, 0)));
                     }
                     for (int i = contexts.Count - 2; i >= 0; i--)
                     {
