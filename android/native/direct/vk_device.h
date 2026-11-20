@@ -49,6 +49,10 @@ struct s2a_vk_device {
     // Vulkan 1.1 下显式启用 EXT；只读附件用 STORE_OP_NONE 避免隐式写。
     int load_store_op_none_enabled;
     int image_format_list_enabled;   // 启用了 VK_KHR_image_format_list（应用 apiVersion 1.1，1.2 核心的格式列表结构要靠这条扩展；保 Adreno UBWC 用）
+    // VK_EXT_image_compression_control 已启用：可查图像实际拿到的压缩方式（Mali AFBC / Adreno UBBC 的驱动侧读数）。
+    // 只作探针用——建图挂 DEFAULT（与不挂等价），不请求任何压缩方式的改变。
+    int image_compression_control_enabled;
+    PFN_vkGetImageSubresourceLayout2EXT get_image_subresource_layout2;
     // VK_EXT_custom_border_color 已启用且 customBorderColors 特性开着：CLAMP_TO_BORDER 的采样器可用任意边框色（#976）。
     // custom_border_without_format：customBorderColorWithoutFormat 也开着，建采样器时可以不给视图格式。
     // custom_border_max：maxCustomBorderColorSamplers，同时存活的自定义边框色 VkSampler 个数上限。

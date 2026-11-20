@@ -459,6 +459,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     // 格式列表（VkImageFormatListCreateInfo）：可改格式的颜色图按列表建，Adreno 才保 UBWC 帧缓冲压缩（backend_vulkan.c tex_fmt_allowed 一节）
     out->image_format_list_enabled = has_device_extension(out->physical, "VK_KHR_image_format_list");
     if (out->image_format_list_enabled) device_ext[device_ext_count++] = "VK_KHR_image_format_list";
+    // 压缩实况探针（backend_vulkan.c 的附件诊断行）：只查不改——建图挂 DEFAULT，等效不挂。
+    out->image_compression_control_enabled = has_device_extension(out->physical, "VK_EXT_image_compression_control");
+    if (out->image_compression_control_enabled) device_ext[device_ext_count++] = "VK_EXT_image_compression_control";
     if (out->swapchain_maintenance1_enabled) device_ext[device_ext_count++] = "VK_EXT_swapchain_maintenance1";
     if (has_timeline) device_ext[device_ext_count++] = "VK_KHR_timeline_semaphore";
     // 时间戳换算成游戏时钟要用校准扩展求 GPU 域与 CLOCK_MONOTONIC 的偏移。两种扩展同名同签名，
@@ -693,6 +696,8 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         out->draw_indexed_indirect_count = (PFN_vkCmdDrawIndexedIndirectCountKHR)vkGetDeviceProcAddr(out->device, "vkCmdDrawIndexedIndirectCountKHR");
         out->draw_indirect_count_enabled = out->draw_indirect_count && out->draw_indexed_indirect_count;
     }
+    if (out->image_compression_control_enabled)
+        out->get_image_subresource_layout2 = (PFN_vkGetImageSubresourceLayout2EXT)vkGetDeviceProcAddr(out->device, "vkGetImageSubresourceLayout2EXT");
     vkGetDeviceQueue(out->device, out->queue_family, 0, &out->queue);
     VkCommandPoolCreateInfo pool = {0};
     pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
