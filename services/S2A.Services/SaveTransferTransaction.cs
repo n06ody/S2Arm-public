@@ -187,8 +187,9 @@ public static partial class SaveTransfer
         // 维护者 11-17：检查之后备份或目标存档又变了（玩家刚又存了一次）不再拒绝——上面刚按现在的内容重新校验过，恢复前副本也在这次执行时现拍，
         //   刚存的进度就在副本里（stderr 记一句）。iCloud 自动同步（sync）照旧拒绝
         bool sync = c.Request["sync"]?.GetValue<bool>() == true;
+        bool requireUnchanged = sync || c.Request["unattendedRestore"]?.GetValue<bool>() == true;
         bool changed = c.Request["archiveSha256"]?.GetValue<string>() != archive.Sha || c.Request["targetFingerprint"]?.GetValue<string>() != fingerprint;
-        Require(!(sync && changed), T("备份或目标已变化，请重新检查后确认。", "The backup or target has changed. Check again, then confirm."), "save_changed");
+        Require(!(requireUnchanged && changed), T("备份或目标已变化，请重新检查后确认。", "The backup or target has changed. Check again, then confirm."), "save_changed");
         if (changed) Console.Error.WriteLine("S2A 存档恢复：检查之后备份或当前存档又变了，按现在的内容恢复（恢复前副本在这次执行时现拍）");
         long total = Scan(c.Root).Files.Sum(p => p.Value) + archive.Manifest["files"].AsArray().Sum(f => f["size"].GetValue<long>());
         Space(c.Work, checked(2 * total + (64 << 20)));
@@ -249,12 +250,12 @@ public static partial class SaveTransfer
             // 恢复途中目标又被写了：自动同步照旧拒绝；手动恢复再拍一份恢复前副本（刚写的进度在里面）照常恢复。备份文件在途中变了：逐文件已按清单 SHA 核过，照常
             if (Fingerprint(c.Root) != fingerprint)
             {
-                Require(!sync, T("确认后备份或目标发生变化。", "The backup or target changed after confirmation."), "save_changed");
+                Require(!requireUnchanged, T("确认后备份或目标发生变化。", "The backup or target changed after confirmation."), "save_changed");
                 if (Scan(c.Root).Files.Keys.Any(n => n.StartsWith("bis/user/save/", StringComparison.Ordinal)))
                     WriteArchive(c, c.Root, Path.Combine(previous, "before-restore-2.s2asave"));
                 Console.Error.WriteLine("S2A 存档恢复：恢复途中当前存档又变了，已另拍一份恢复前副本");
             }
-            Require(!sync || Hash(archive.Source) == archive.Sha, T("确认后备份或目标发生变化。", "The backup or target changed after confirmation."), "save_changed");
+            Require(!requireUnchanged || Hash(archive.Source) == archive.Sha, T("确认后备份或目标发生变化。", "The backup or target changed after confirmation."), "save_changed");
             SyncTree(next);
             var record = new JsonObject { ["schema"] = 1, ["gameId"] = Copy(c.Game["id"]), ["dataRoot"] = c.Root,
                 ["transaction"] = token, ["hadOriginal"] = hadOriginal, ["phase"] = "prepared" };

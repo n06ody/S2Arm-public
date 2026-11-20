@@ -407,6 +407,7 @@ PY
 s2a_gate_step javac -encoding UTF-8 -d "$out/java" -cp "$out/java" \
     "$android_dir/app/src/main/java/org/s2arm/android/GamePack.java" \
     "$android_dir/app/src/main/java/org/s2arm/android/GameInstall.java" \
+    "$android_dir/app/src/main/java/org/s2arm/android/SaveArchive.java" \
     "$android_dir/app/src/main/java/org/s2arm/android/ImportReceiver.java" \
     "$android_dir/tests/GamePackTest.java" \
     "$android_dir/tests/GameInstallTest.java"

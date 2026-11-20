@@ -4,6 +4,15 @@
     <string name="preview_description">安卓宿主调试构建，尚未接入游戏运行。</string>
     <string name="native_unavailable">原生宿主无法启动，详情见 S2Arm 日志。</string>
     <string name="import_game">导入游戏包…</string>
+    <string name="import_save">导入存档备份…</string>
+    <string name="import_save_select_game">请先选择要导入存档的游戏。</string>
+    <string name="import_save_reading">正在检查存档备份…</string>
+    <string name="import_save_summary">将为「%1$s」恢复 %2$d 个文件（%3$d 字节）。现有存档会在恢复前保留备份。</string>
+    <string name="import_save_confirm_title">恢复存档备份？</string>
+    <string name="import_save_confirm">恢复</string>
+    <string name="import_save_access_failed">请关闭正在运行的游戏，并确认备份文件可以读取。</string>
+    <string name="import_save_failed">存档导入失败（%1$s）。%2$s</string>
+    <string name="import_save_done">存档已恢复（%1$d 个文件）。打开游戏即可继续。</string>
     <string name="in_place_game">原地使用游戏文件夹…</string>
     <string name="in_place_access_title">需要「所有文件访问」</string>
     <string name="in_place_access_text">原地使用会直接读手机存储里的游戏文件，不再往 App 里拷一份，省下和游戏一样大的空间。请在接下来的系统设置里给本 App 打开「允许访问所有文件」，回来后再点一次「原地使用游戏文件夹…」选游戏文件夹。</string>
