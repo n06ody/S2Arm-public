@@ -165,7 +165,7 @@ void rp_pool_stats_end(void) {
 // 弱链接[replay]：s2a_frame_log_present_timed
 void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) __attribute__((weak));
 // ADPF 帧负载上报（android/native/adpf_hint.c；原先只接在旧层 mtl_vk_shim.c，缺省的新回放层构建不编它，CPU 调度器一直拿不到帧负载）：
-//   一帧的工作 = 上一次出图返回 → 这一次取图之前（游戏逻辑 + 录命令 + 回放），取图 / 呈现的阻塞是节拍不是工作。
+//   从上一次出图返回量到这一次取图之前，ADPF 层按帧号扣除回放线程显式等 GPU 的区间。取图 / 呈现节拍留在区间之外。
 //   每次出图前对本帧报 frame_end（目标 = 游戏登记的上屏周期），出图后对下一帧开 work_begin；没有显示面时关会话（invisible），不报。
 //   序号独立计（不借票号：票号在出图锁里发，ADPF 不该在出图锁里调）。弱引用：回放核心宿主单测与鸿蒙不链 ADPF，地址为空就不调。
 // 弱链接[replay]：s2a_adpf_work_begin
