@@ -14,7 +14,7 @@ if (args.Length is 1 or 2 && args[0] == "--describe")   // 审计 P2-11：失败
 {
     S2A.Services.SaveTransfer.UseLanguage(args.Length == 2 ? JsonSerializer.Serialize(new { language = args[1] }) : "{}");
     foreach (var ex in new Exception[] { new IOException("disk", 28), new IOException("quota", 69), new UnauthorizedAccessException("no"), new IOException("perm", 13),
-                                         new InvalidDataException("bad"), new JsonException("bad"), new IOException("other", 5), new ArgumentException("arg") })
+                                         new InvalidDataException("bad"), new JsonException("bad"), new IOException("other", 5), new ArgumentException("arg"), new InvalidOperationException("state") })
     {
         var (code, message) = S2A.Services.SaveTransfer.Describe(ex);
         Console.WriteLine(JsonSerializer.Serialize(new { type = ex.GetType().Name, code, message }));

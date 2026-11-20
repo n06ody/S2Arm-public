@@ -111,8 +111,10 @@ final class GameLibrary {
                     GameSession.InstalledApk apk = installedApk();
                     GameFingerprint.Timing.end(timing, "installed_apk_identity", phase);
                     phase = GameFingerprint.Timing.start(timing);
+                    SaveImport saves = new SaveImport(context.getFilesDir(), Locale.getDefault().toLanguageTag(), NativeBridge::saveTransfer);
                     GameSession session = GameSession.load(spec, context.getFilesDir(), apk,
-                        (context.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0, DebugGate.open(), timing);
+                        (context.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+                        DebugGate.open(), timing, saves::recoverIfNeeded);
                     GameFingerprint.Timing.end(timing, "session_load_total", phase);
                     if (timing != null) for (String line : timing.lines()) Log.d("S2ArmBootTiming", line);
                     Log.i("S2Arm", session.resourceValidation);
