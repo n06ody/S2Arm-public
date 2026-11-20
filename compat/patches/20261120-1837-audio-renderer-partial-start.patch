@@ -1,0 +1,138 @@
+diff --git a/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs b/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
+index 7fa74ca078ef76e25bdac0e5c7738416306ed404..79dc111714065e71b49126bfae1757f2e4974577 100644
+--- a/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
++++ b/src/Ryujinx.Audio/Renderer/Dsp/AudioProcessor.cs
+@@ -103,26 +103,34 @@ namespace Ryujinx.Audio.Renderer.Dsp
+ 
+         public void Stop()
+         {
+-            if (S2AInline)
++            if (_workerThread?.IsAlive == true)
+             {
+-                foreach (IHardwareDevice d in OutputDevices)
++                _mailbox.SendMessage(MailboxMessage.Stop);
++                MailboxMessage response = _mailbox.ReceiveResponse();
++                // Startup rollback may leave the DSP's first RenderEnd unread.
++                if (response == MailboxMessage.RenderEnd)
+                 {
+-                    d.Dispose();
++                    response = _mailbox.ReceiveResponse();
+                 }
+ 
+-                return;
+-            }
+-
+-            _mailbox.SendMessage(MailboxMessage.Stop);
+-
+-            if (_mailbox.ReceiveResponse() != MailboxMessage.Stop)
+-            {
+-                throw new InvalidOperationException("Audio Processor Stop response was invalid!");
++                if (response != MailboxMessage.Stop)
++                {
++                    throw new InvalidOperationException("Audio Processor Stop response was invalid!");
++                }
++                _workerThread.Join();
+             }
++            _workerThread = null;
+ 
+-            foreach (IHardwareDevice device in OutputDevices)
++            _mailbox?.Dispose();
++            _mailbox = null;
++            IHardwareDevice[] devices = OutputDevices;
++            OutputDevices = null;
++            if (devices != null)
+             {
+-                device.Dispose();
++                foreach (IHardwareDevice device in devices)
++                {
++                    device?.Dispose();
++                }
+             }
+         }
+ 
+@@ -389,8 +397,6 @@ namespace Ryujinx.Audio.Renderer.Dsp
+             {
+                 Ryujinx.Common.S2AThreadAlloc.Tick("声音 DSP"); // S2Arm: per-thread allocation accounting
+ 
+-                _pauseEvent?.WaitOne();
+-
+                 MailboxMessage message = _mailbox.ReceiveMessage();
+ 
+                 if (message == MailboxMessage.Stop)
+@@ -400,6 +406,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
+ 
+                 if (message == MailboxMessage.RenderStart)
+                 {
++                    _pauseEvent?.WaitOne();
+                     Render();
+ 
+                     _mailbox.SendResponse(MailboxMessage.RenderEnd);
+diff --git a/src/Ryujinx.Audio/Renderer/Server/AudioRendererManager.cs b/src/Ryujinx.Audio/Renderer/Server/AudioRendererManager.cs
+index e560ed7d9357640fb0fd1155b8ab4248a8a9bd24..f48c633ddaa3daa94134c338df227c7e2ff0858b 100644
+--- a/src/Ryujinx.Audio/Renderer/Server/AudioRendererManager.cs
++++ b/src/Ryujinx.Audio/Renderer/Server/AudioRendererManager.cs
+@@ -182,17 +182,25 @@ namespace Ryujinx.Audio.Renderer.Server
+         /// </summary>
+         private void StartLocked()
+         {
+-            _isRunning = true;
+-
+-            // TODO: virtual device mapping (IAudioDevice)
+-            Processor.Start(_deviceDriver);
+-
+-            _workerThread = new Thread(SendCommands)
++            try
+             {
+-                Name = "AudioRendererManager.Worker",
+-            };
++                // TODO: virtual device mapping (IAudioDevice)
++                Processor.Start(_deviceDriver);
+ 
+-            _workerThread.Start();
++                Thread worker = new(SendCommands)
++                {
++                    Name = "AudioRendererManager.Worker",
++                };
++                _isRunning = true;
++                worker.Start();
++                _workerThread = worker;
++            }
++            catch
++            {
++                _isRunning = false;
++                Processor.Stop();
++                throw;
++            }
+         }
+ 
+         /// <summary>
+@@ -202,7 +210,8 @@ namespace Ryujinx.Audio.Renderer.Server
+         {
+             _isRunning = false;
+ 
+-            _workerThread.Join();
++            _workerThread?.Join();
++            _workerThread = null;
+             Processor.Stop();
+ 
+             Logger.Info?.Print(LogClass.AudioRenderer, "Stopped audio renderer");
+@@ -394,9 +403,16 @@ namespace Ryujinx.Audio.Renderer.Server
+ 
+             if (result == ResultCode.Success)
+             {
+-                renderer = audioRenderer;
+-
+-                Register(renderer);
++                try
++                {
++                    Register(audioRenderer);
++                    renderer = audioRenderer;
++                }
++                catch
++                {
++                    audioRenderer.Dispose();
++                    throw;
++                }
+             }
+             else
+             {

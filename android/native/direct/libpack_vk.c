@@ -627,6 +627,21 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         if (mask) jw_fmt(stages, ",\"attributeReadMask\":%u", mask);
         uint32_t fom = 0;
         if (!strcmp(v1_stage, "fs") && !s2a_libpack_spv_frag_outputs(spv, sn, &fom)) jw_fmt(stages, ",\"info\":{\"fragmentOutputMap\":%u}", fom);
+        {   // 栅格事实转发：_b.json raster（Dsh.RasterFacts：vs 出 pos_attr/pos_w，ps 出 discard/sample_mask）→ v1 字段名；
+            //   只转发证明成立的值——pos_attr<0、pos_w!="one"、布尔 0 一律不写（v1 解析器缺省即保守值，不写 = 证不出）。
+            //   pos_z_half 没有来源：离线库不注入深度改写（libpack 路径 z_raw=1），缺省 0 正确。
+            struct s2a_jv ras;
+            if (!s2a_jv_obj_find(top, "raster", &ras) && s2a_jv_is_object(ras)) {
+                uint32_t pa = 0, bv = 0; char pw[8] = "";
+                jw_str(stages, ",\"raster\":{");
+                int wrote = 0;
+                if (!jf_u32(ras, "pos_attr", &pa) && pa < 16) { jw_fmt(stages, "\"pos_attr\":%u", pa); wrote = 1; }
+                if (!jf_str(ras, "pos_w", pw, sizeof pw) && !strcmp(pw, "one")) { jw_fmt(stages, "%s\"pos_w1\":true", wrote ? "," : ""); wrote = 1; }
+                if (!jf_u32(ras, "discard", &bv) && !bv) { jw_fmt(stages, "%s\"may_discard\":false", wrote ? "," : ""); wrote = 1; }
+                if (!jf_u32(ras, "sample_mask", &bv) && !bv) { jw_fmt(stages, "%s\"writes_smask\":false", wrote ? "," : ""); wrote = 1; }
+                jw_str(stages, "}");
+            }
+        }
         jw_str(stages, "}");
         *stage_mask |= 1u << nvn;
         out = 0;
