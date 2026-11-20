@@ -96,6 +96,12 @@ static struct { int seg, pre, draw; nvn_gpu_buf buf; uint64_t off, len; uint8_t 
 
 static int g_aborts;
 static int g_begins, g_commits;
+// ReadTexels 读 GPU 内容（rt_gpu）的替身：提交锁计数、提交值、「等的时候 GPU 正好做完」、copy_tex_buf 往共享缓冲里写可算的「GPU 内容」
+static int g_rt_locks, g_rt_unlocks, g_auto_done, g_tb_fill; static uint64_t g_last_signal;
+void nvn_hle_submit_lock(void) { g_rt_locks++; CHECK(g_rt_locks == g_rt_unlocks + 1); }      // 不重入：拿之前一定放过
+void nvn_hle_submit_unlock(void) { g_rt_unlocks++; CHECK(g_rt_unlocks == g_rt_locks); }
+static uint8_t gpu_byte(uint32_t layer, uint32_t level, int yo, int xo, uint64_t y, uint64_t i) { return (uint8_t)(0x40 + layer * 17 + level * 5 + ((uint64_t)yo + y) * 3 + ((uint64_t)xo + i)); }
+static void fake_complete(uint32_t status);   // 定义在本文件后面
 static struct { nvn_gpu_done_fn fn; void *user; uint64_t signal; uint32_t nts; nvn_gpu_timestamp_result ts[64]; } g_pend[72]; static int g_npend, g_main_commits;   // g_pend：一次提交最多 64 个中间值 + 主段；g_main_commits：不算前置段
 static uint64_t g_fdone;
 static uint32_t g_occ_slots_decl; static int g_occ_log[32], g_nocc_log; static int g_rcond;
@@ -134,8 +140,8 @@ uint64_t nvn_gpu_arena_fill(nvn_gpu_cmd c, const nvn_gpu_slice *sl, const void *
 uint64_t nvn_gpu_arena_fill_wait(uint64_t t) { if (t && g_fill_done < t) { g_fill_waits++; fill_run_to(t); } return g_fill_done; }
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c) { fill_run_to(UINT64_MAX); c->live = 0; g_aborts++; }
 nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn done, void *user, nvn_gpu_err *err) {
-    (void)err; fill_run_to(UINT64_MAX); c->live = 0; g_commits++; if (!c->is_pre) g_main_commits++; g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_pend[g_npend].nts = c->nts; memcpy(g_pend[g_npend].ts, c->ts, sizeof c->ts); g_npend++; return (nvn_gpu_rc){NVN_GPU_OK}; }
-nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
+    (void)err; fill_run_to(UINT64_MAX); c->live = 0; g_commits++; g_last_signal = signal; if (!c->is_pre) g_main_commits++; g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_pend[g_npend].nts = c->nts; memcpy(g_pend[g_npend].ts, c->ts, sizeof c->ts); g_npend++; return (nvn_gpu_rc){NVN_GPU_OK}; }
+nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; if (g_auto_done && v > g_fdone && g_npend) fake_complete(NVN_GPU_DONE_OK); return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
 // 贴图 / 视图 / 采样器 / 上传：只记账
 struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; uint64_t access_id; int ord; uint32_t px[4][4]; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; view_t v; nvn_gpu_buf buf; uint64_t off, bytes; uint32_t format; }; struct nvn_gpu_samp_s { int x; };   // ord：后端贴图的递增序号；px：像素替身（4 个 mip × 4 层各一个 32 位字）；v：建视图时收到的视图记录
 static int g_tex_creates, g_tex_releases, g_view_creates, g_view_releases, g_samp_creates, g_samp_releases, g_tex_create_fail, g_tex_ord;
@@ -174,6 +180,7 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
 void nvn_gpu_samp_release(nvn_gpu_samp s) { g_samp_releases++; free(s); }
 static uint32_t g_caps_stor[4];   // 用例：这些格式在替身设备上也能当存储图像（默认只有 RGBA8）
 static uint32_t g_caps_nosample = ~0u;   // 用例：这个格式在替身设备上不能直接采样（后端走计算解码的 BC 格式，能力位回 0）
+static uint32_t g_caps_readback[4] = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA_DXT1};   // 带 NVN_GPU_FMT_READBACK 的格式（用例可改）
 static uint32_t g_caps_nofilter = ~0u, g_caps_noblend = ~0u;   // #1072：这个格式在替身设备上不能线性过滤 / 不能混合（FMT_FILTER / FMT_BLEND 去掉）
 uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
     uint32_t c = f == NVN_FORMAT_RGBA8 ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER | NVN_GPU_FMT_STORAGE | NVN_GPU_FMT_BLEND : f == NVN_FORMAT_R16 || f == NVN_FORMAT_RG32UI || f == NVN_FORMAT_RGBA32UI || f == NVN_FORMAT_RGBA32F || f == NVN_FORMAT_RGBA16UI ? NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_RENDER : NVN_GPU_FMT_SAMPLE;
@@ -181,6 +188,7 @@ uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
     c |= NVN_GPU_FMT_FILTER;
     if (f == g_caps_nofilter) c &= ~(uint32_t)NVN_GPU_FMT_FILTER;
     if (f == g_caps_noblend) c &= ~(uint32_t)NVN_GPU_FMT_BLEND;
+    for (int k = 0; k < 4; k++) if (g_caps_readback[k] && f == g_caps_readback[k]) c |= NVN_GPU_FMT_READBACK;
     return c; }
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     (void)t; if (g_nup == 16) return;
@@ -223,7 +231,10 @@ static void tb_note(int to_tex, nvn_gpu_tex t, uint32_t level, uint32_t layer, c
     if (g_ntb < 8) { g_tb[g_ntb].to_tex = to_tex; g_tb[g_ntb].t = t; g_tb[g_ntb].level = level; g_tb[g_ntb].layer = layer; g_tb[g_ntb].w = r ? r->width : 0; g_tb[g_ntb].h = r ? r->height : 0;
                      g_tb[g_ntb].row = row; g_tb[g_ntb].img = img; g_tb[g_ntb].begun = g_npd_now(); g_tb[g_ntb].ended = g_ends_now(); } g_ntb++; }
 void nvn_gpu_copy_tex_buf(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t level, uint32_t layer, const NVNcopyRegion *r, nvn_gpu_buf dst, uint64_t off, uint64_t row_bytes, uint64_t image_bytes) {
-    (void)c; (void)dst; (void)off; tb_note(0, src, level, layer, r, row_bytes, image_bytes); }
+    (void)c; tb_note(0, src, level, layer, r, row_bytes, image_bytes);
+    if (g_tb_fill && dst && dst->cpu && r && row_bytes && image_bytes / row_bytes * row_bytes <= dst->bytes - off) {   // 「GPU 内容」= gpu_byte(层, 级, 区域原点, 行, 字节)
+        for (uint64_t y = 0; y < image_bytes / row_bytes; y++) for (uint64_t i = 0; i < row_bytes; i++) dst->cpu[off + y * row_bytes + i] = gpu_byte(layer, level, r->yoffset, r->xoffset, y, i);
+    } }
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t off, uint64_t row_bytes, uint64_t image_bytes, nvn_gpu_tex dst, uint32_t level, uint32_t layer, const NVNcopyRegion *r) {
     (void)c; (void)src; (void)off; tb_note(1, dst, level, layer, r, row_bytes, image_bytes); }
 // 同存储不同视图共用代号；释放后再建不能因指针复用而沿用代号。
@@ -1536,15 +1547,103 @@ static void t_read_texels_gpu_owned(void) {
     CHECK(!memcmp(dst, lin, 64) && un_cnt("read_texels") == 0);
     rp_tex_mark_gpu_written(&k);
     CHECK(nvn_be_tex_gpu_owned(52) == 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);   // 读回在提交之外（旁路段要拿提交锁）
+    // GPU 写过：不读游戏内存里更旧的字节，读的是 GPU 的内容（替身 copy_tex_buf 写的 gpu_byte）
+    uint8_t gpu[64]; for (unsigned y = 0; y < 4; y++) for (unsigned i = 0; i < 16; i++) gpu[y * 16 + i] = gpu_byte(0, 0, 0, 0, y, i);
+    const int cpu_auto = g_buf_cpu_auto; g_buf_cpu_auto = 1; g_auto_done = 1; g_tb_fill = 1;
     sent_fill(dst, sizeof dst); nvn_be_read_texels(&k, 0, 0, &one, dst, 16, 64);
-    CHECK(all_sent(dst, sizeof dst) && un_cnt("read_texels") == 1);                      // GPU 写过：不读游戏内存，记账
+    CHECK(!memcmp(dst, gpu, 64) && memcmp(dst, lin, 64) && un_cnt("read_texels") == 0);
     g_ft_hit = 1; sent_fill(dst, sizeof dst); nvn_be_read_texels(&k, 0, 0, &one, dst, 16, 64); g_ft_hit = 0;
-    CHECK(all_sent(dst, sizeof dst) && un_cnt("read_texels") == 2 && nvn_be_tex_gpu_owned(52) == 1);   // 脏页追踪的答案不能把归属翻回去
+    CHECK(!memcmp(dst, gpu, 64) && un_cnt("read_texels") == 0 && nvn_be_tex_gpu_owned(52) == 1);   // 脏页追踪的答案不能把归属翻回去
+    g_buf_cpu_auto = cpu_auto; g_auto_done = 0; g_tb_fill = 0;
     nvn_be_tex_cpu_written(&k);                                                          // 游戏又 WriteTexels 了
     sent_fill(dst, sizeof dst); nvn_be_read_texels(&k, 0, 0, &one, dst, 16, 64);
-    CHECK(nvn_be_tex_gpu_owned(52) == 0 && !memcmp(dst, lin, 64) && un_cnt("read_texels") == 2);
+    CHECK(nvn_be_tex_gpu_owned(52) == 0 && !memcmp(dst, lin, 64) && un_cnt("read_texels") == 0);
     nvn_be_tex_release(&k);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+}
+
+// ReadTexels 读 GPU 内容（rp_entry.c rt_gpu）。期望值都来自替身对「GPU 内容」的定义（gpu_byte）与用例给的区域，不跑被测实现：
+//   一次读回 = 拿提交锁 → 等之前的活 → 一段旁路段（开 1 交 1，提交值 = 上一个 + 64，之后的提交接着递增）→ 每层 / 片一次 copy_tex_buf → 按行距 / 片距写 dst；
+//   读不了的（格式没有 READBACK、块没对齐、在提交里、之前的活 / 读回等不到）：一段都不开（或开了也交掉）、不动 dst、具名记账，提交锁一定放回。
+static tex_t mk_tex3d(uint64_t serial, int fmt, uint32_t w, uint32_t h, uint32_t depth, uint32_t levels);   // 定义在本文件后面
+static tex_t mk_tex_tgt(uint64_t serial, int target, int fmt, uint32_t w, uint32_t h, uint32_t depth);
+static void rt_gpu_tex(tex_t *t) { nvn_be_sub_begin(); CHECK(rp_tex_resolve(t, &g_fake_cmd) != NULL); rp_tex_mark_gpu_written(t); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); }
+static int rt_rows_are(const uint8_t *dst, size_t row, uint32_t layer, const NVNcopyRegion *r, uint64_t wb, uint64_t hb) {   // 每行 wb 字节是 GPU 内容
+    for (uint64_t y = 0; y < hb; y++) for (uint64_t i = 0; i < wb; i++) if (dst[y * row + i] != gpu_byte(layer, 0, r->yoffset, r->xoffset, y, i)) return 0;
+    return 1;
+}
+static void t_read_texels_gpu(void) {
+    res_fresh(); nvn_unimpl_reset(); g_ft_hit = 0;
+    const int cpu_auto = g_buf_cpu_auto; g_buf_cpu_auto = 1; g_auto_done = 1; g_tb_fill = 1;
+    uint8_t dst[1024];
+    uint64_t st0[4]; nvn_be_read_texels_gpu_stats(st0);
+    // ① 8×4 RGBA8 整块：一段旁路段、一次拷贝（层 0、宽 8 高 4、行距 32、一片 128）、提交值 = 上一个 + 64
+    tex_t a = mk_tex(61, 0, NVN_FORMAT_RGBA8, 8, 4, 1, 0); rt_gpu_tex(&a);
+    const uint64_t f0 = nvn_be_last_fence(); const int b0 = g_begins, c0 = g_commits, l0 = g_rt_locks; g_ntb = 0;
+    NVNcopyRegion all = {.width = 8, .height = 4, .depth = 1};
+    sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &all, dst, 32, 128);
+    CHECK(g_begins == b0 + 1 && g_commits == c0 + 1 && g_last_signal == f0 + 64 && nvn_be_last_fence() == f0 + 64);
+    CHECK(g_ntb == 1 && g_tb[0].to_tex == 0 && g_tb[0].layer == 0 && g_tb[0].level == 0 && g_tb[0].w == 8 && g_tb[0].h == 4 && g_tb[0].row == 32 && g_tb[0].img == 128);
+    CHECK(rt_rows_are(dst, 32, 0, &all, 32, 4) && all_sent(dst + 128, sizeof dst - 128));
+    CHECK(g_rt_locks == l0 + 1 && g_rt_unlocks == g_rt_locks && un_cnt("read_texels") == 0);
+    { uint64_t st[4]; nvn_be_read_texels_gpu_stats(st); CHECK(st[0] == st0[0] + 1); }
+    // 之后的正常提交：提交值接着往后取（不与旁路段撞）
+    nvn_be_sub_begin(); nvn_be_sub_commit(); CHECK(g_last_signal == f0 + 128); fake_complete(NVN_GPU_DONE_OK);
+    // ② 子区域 + 带 pad 的行距：x 2..4、y 1..2，每行 12 字节内容 + 4 字节 pad
+    NVNcopyRegion sub = {.xoffset = 2, .yoffset = 1, .width = 3, .height = 2, .depth = 1}; g_ntb = 0;
+    sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &sub, dst, 16, 32);
+    CHECK(g_ntb == 1 && g_tb[0].w == 3 && g_tb[0].h == 2 && g_tb[0].row == 12);
+    CHECK(rt_rows_are(dst, 16, 0, &sub, 12, 2) && all_sent(dst + 12, 4) && all_sent(dst + 28, sizeof dst - 28));
+    // ③ 二维数组 4×4 共 3 层：起始层 1、深度 2 → 拷第 1、2 层；片距 80（64 + 16 pad）
+    tex_t b = mk_tex_tgt(62, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 4, 4, 3); rt_gpu_tex(&b);
+    NVNcopyRegion two = {.width = 4, .height = 4, .depth = 2}; g_ntb = 0;
+    sent_fill(dst, sizeof dst); nvn_be_read_texels(&b, 0, 1, &two, dst, 16, 80);
+    CHECK(g_ntb == 2 && g_tb[0].layer == 1 && g_tb[1].layer == 2);
+    CHECK(rt_rows_are(dst, 16, 1, &two, 16, 4) && all_sent(dst + 64, 16) && rt_rows_are(dst + 80, 16, 2, &two, 16, 4) && all_sent(dst + 144, sizeof dst - 144));
+    // ④ 三维 4×4×4：第 1、2 片（copy_tex_buf 的 layer 在三维上是片号）
+    tex_t e = mk_tex3d(63, NVN_FORMAT_RGBA8, 4, 4, 4, 1); rt_gpu_tex(&e);
+    NVNcopyRegion s12 = {.zoffset = 1, .width = 4, .height = 4, .depth = 2}; g_ntb = 0;
+    sent_fill(dst, sizeof dst); nvn_be_read_texels(&e, 0, 0, &s12, dst, 16, 64);
+    CHECK(g_ntb == 2 && g_tb[0].layer == 1 && g_tb[1].layer == 2 && rt_rows_are(dst, 16, 1, &s12, 16, 4) && rt_rows_are(dst + 64, 16, 2, &s12, 16, 4));
+    // ⑤ BC1 16×8：块列 1..2、块行 0..1 → 一行 16 字节（2 块 × 8）、2 块行
+    tex_t d = mk_tex(64, 0x30000, NVN_FORMAT_RGBA_DXT1, 16, 8, 1, 0); rt_gpu_tex(&d);
+    NVNcopyRegion bc = {.xoffset = 4, .width = 8, .height = 8, .depth = 1}; g_ntb = 0;
+    sent_fill(dst, sizeof dst); nvn_be_read_texels(&d, 0, 0, &bc, dst, 16, 32);
+    CHECK(g_ntb == 1 && g_tb[0].row == 16 && g_tb[0].img == 32 && rt_rows_are(dst, 16, 0, &bc, 16, 2) && all_sent(dst + 32, sizeof dst - 32));
+    // ⑥ 读不了的：一段都不开、不动 dst、具名记账、锁平衡
+    {   // 格式没有 READBACK（后端会拒 / 拷不出 NVN 字节）：开段前挡住
+        const uint32_t saved = g_caps_readback[0]; g_caps_readback[0] = 0;
+        const int bb = g_begins, cc = g_commits, ll = g_rt_locks;
+        sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &all, dst, 32, 128);
+        CHECK(all_sent(dst, sizeof dst) && g_begins == bb && g_commits == cc && g_rt_locks == ll && un_cnt("read_texels_gpu_format") == 1);
+        g_caps_readback[0] = saved;
+    }
+    {   // 块没对齐（BC1 x 从 2 起）
+        NVNcopyRegion un = {.xoffset = 2, .width = 4, .height = 4, .depth = 1}; const int bb = g_begins;
+        sent_fill(dst, sizeof dst); nvn_be_read_texels(&d, 0, 0, &un, dst, 16, 16);
+        CHECK(all_sent(dst, sizeof dst) && g_begins == bb && un_cnt("read_texels_gpu_unaligned") == 1);
+    }
+    {   // 在一次提交的回放里（持着提交锁的那条路上）：旁路段开不出来，锁放回
+        nvn_be_sub_begin(); const int bb = g_begins;
+        sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &all, dst, 32, 128);
+        CHECK(all_sent(dst, sizeof dst) && g_begins == bb && un_cnt("side_segment_inside_submit") == 1 && g_rt_unlocks == g_rt_locks);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    }
+    {   // 之前交的活没做完、等不到：不开段
+        nvn_be_sub_begin(); nvn_be_sub_commit(); g_auto_done = 0; const int bb = g_begins;
+        sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &all, dst, 32, 128);
+        CHECK(all_sent(dst, sizeof dst) && g_begins == bb && un_cnt("read_texels_gpu_wait") == 1 && g_rt_unlocks == g_rt_locks);
+        fake_complete(NVN_GPU_DONE_OK);
+        // 读回那一段交了、等不到：不动 dst；时间线照样往后走，下一次提交的值更大
+        const uint64_t fx = nvn_be_last_fence();
+        sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &all, dst, 32, 128);
+        CHECK(all_sent(dst, sizeof dst) && un_cnt("read_texels_gpu_wait") == 2 && nvn_be_last_fence() == fx + 64 && g_rt_unlocks == g_rt_locks);
+        fake_complete(NVN_GPU_DONE_OK); g_auto_done = 1;
+        nvn_be_sub_begin(); nvn_be_sub_commit(); CHECK(g_last_signal == fx + 128); fake_complete(NVN_GPU_DONE_OK);
+    }
+    { uint64_t st[4]; nvn_be_read_texels_gpu_stats(st); CHECK(st[0] == st0[0] + 5); }   // 只数读成的：① ② ③ ④ ⑤
+    nvn_be_tex_release(&a); nvn_be_tex_release(&b); nvn_be_tex_release(&e); nvn_be_tex_release(&d);
+    g_buf_cpu_auto = cpu_auto; g_auto_done = 0; g_tb_fill = 0;
 }
 
 static void t_cpu_upload(void) {   // 存储里是 CPU 写的数据：首次使用上传，之后只在脏了时重传；内容交 GPU 后不再传
@@ -5740,6 +5839,7 @@ int main(int argc, char **argv) {
     t_alias_take_over();
     t_read_texels_guest();
     t_read_texels_gpu_owned();
+    t_read_texels_gpu();
     t_cpu_upload();
     t_cpu_rules();
     t_linear_upload();

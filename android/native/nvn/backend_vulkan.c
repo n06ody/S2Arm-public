@@ -2248,6 +2248,23 @@ void nvn_gpu_caps_get(nvn_gpu_caps *out) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// 贴图 → 缓冲回读的格式判断（nvn_gpu_copy_tex_buf 与 nvn_gpu_format_caps 的 NVN_GPU_FMT_READBACK 共用，两边不会不一致）：
+//   readback_refusal：copy_tex_buf 拒收的原因（展开格式 / 替换存储），NULL = 能拷。拒收是粘滞错误，整段提交失败、时间线进失败终态，
+//     所以 ReadTexels 这类旁路读回必须先查 READBACK 位、在开段前挡住。
+//   readback_exact：拷出来就是 NVN 的字节——不拒收，且不是深度模板合一（缓冲 ↔ 贴图一个区域只拷一个面，取深度面）、不是 D24（深度面高 8 位未定义）。
+static const char *readback_refusal(uint32_t nvn_format) {
+    nvn_fmt_info fi;
+    if (nvn_fmt_info_of(nvn_format, &fi) && fi.expand) return "展开格式回读未实现";
+    if (nvn_vk_format_substituted(nvn_format)) return "替换存储格式（D24 换 D32）按字节回读未实现";
+    return NULL;
+}
+static int readback_exact(uint32_t nvn_format) {
+    nvn_fmt_info fi;
+    if (readback_refusal(nvn_format) || !nvn_fmt_info_of(nvn_format, &fi)) return 0;
+    if (fi.depth && fi.stencil) return 0;
+    if (nvn_format == NVN_FORMAT_DEPTH24) return 0;
+    return 1;
+}
 uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     if (!g_open) return 0;
     nvn_fmt_info info;
@@ -2272,6 +2289,7 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     if (o & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) out |= NVN_GPU_FMT_ATOMIC;
     if (o & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) out |= NVN_GPU_FMT_VERTEX;
     if (nvn_vk_format_substituted(nvn_format)) out |= NVN_GPU_FMT_SUBST;   // #398：D24 换 D32 存储
+    if (readback_exact(nvn_format)) out |= NVN_GPU_FMT_READBACK;
     if (expand) {
         out |= NVN_GPU_FMT_SUBST;   // 存储被换成展开目标，逐字节拷贝要核心换算
         VkFormat sf = nvn_vk_format(nvn_format);
@@ -2282,7 +2300,8 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     }
     // 走计算解码的块压缩格式：能力是照「解码后的格式」查的，但它只能被采样——建图入口不收渲染 / 存储用途。
     // 把解码后格式的「可存储」原样报出去，核心会给带 IMAGE 标志的压缩贴图加存储用途，建图就被拒（#697：Mali 上 5 种格式的贴图全建不出来，背景全黑）。
-    if (bcdec) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER;
+    if (bcdec) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER | NVN_GPU_FMT_READBACK;   // 回读照样是原压缩块字节（copy_tex_buf → bc_readback）
+    // 通道映射补分量位置的退回格式：存储字节的分量顺序不是 NVN 的，回读也就不是 NVN 字节（下一行连 READBACK 一起去掉）
     // #975：16 位打包格式走退回格式时，分量位置靠采样视图的通道映射补回；渲染 / 存储 / 顶点取数不经通道映射，不报这些能力。
     { uint8_t map[4]; if (nvn_vk_format_chanmap(nvn_format, map)) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER; }
     return out;
@@ -6852,15 +6871,8 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     struct nvn_gpu_tex_s *t = th;
     struct nvn_gpu_buf_s *b = bh;
     if (t && t->bc_decoded) { bc_readback(c, t, level, layer, r, b, off, row_bytes, image_bytes); return; }   // 按上传时留下的压缩原字节回读
-    nvn_fmt_info fi;
-    if (t && nvn_fmt_info_of(t->nvn_format, &fi) && fi.expand) {
-        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "展开格式回读未实现（0x%x）", t->nvn_format);
-        return;
-    }
-    if (t && nvn_vk_format_substituted(t->nvn_format)) {
-        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "替换存储格式（D24 换 D32）按字节回读未实现（0x%x）", t->nvn_format);
-        return;
-    }
+    { const char *no = t ? readback_refusal(t->nvn_format) : NULL;   // 与 NVN_GPU_FMT_READBACK 同一个判断
+      if (no) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "%s（0x%x）", no, t->nvn_format); return; } }
     uint32_t bpp = t ? fmt_bpp(t->format) : 0;
     // 块信息（同 copy_buf_tex_impl）：压缩格式一行是一排块（blk_w x blk_h 纹素、blk 字节），区域按纹素给、偏移要落在块边上；
     // 没列进 fmt_bpp 的非压缩格式按 NVN 格式表的每纹素字节数。原先这里对压缩格式一律拒绝（核心把块压缩贴图逐字节拷进影子要用它）。

@@ -21,6 +21,7 @@ void rp_shader_reset(void);            // 着色器来源（核心外）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define UN(name) nvn_unimpl("be", name, __builtin_return_address(0))
 
@@ -220,10 +221,12 @@ void nvn_be_tex_tick(uint64_t frame) { (void)frame; }
 int nvn_be_tex_from_gl(void *t, uint32_t gl_name) { (void)t; (void)gl_name; UN("tex_from_gl"); return 0; }
 void nvn_be_xv_window_tex(uint64_t serial) { (void)serial; }   // 跨提交有效性账本随通道规划接
 
-// ---------- 同步读贴图（ReadTexels）：内容在游戏内存里的这一条 ----------
-// 对齐 iOS（nvn_mtl.m 的 nvn_be_read_texels）：游戏内存里就是内容（随包 / WriteTexels 或刷新写过 / 脏页追踪发现被 CPU 写过）时，
-// 就地反交织，按调用方给的区域 / 行距 / 片距逐行拷进 dst；不碰 GPU、不建宿主贴图，任何线程都能调。
-// 内容归 GPU 的那一条（读回）还没接：照旧记 be read_texels、不动 dst，不返回假结果。
+// ---------- 同步读贴图（ReadTexels） ----------
+// 对齐 iOS（nvn_mtl.m 的 nvn_be_read_texels）：
+// ① 游戏内存里就是内容（随包 / WriteTexels 或刷新写过 / 脏页追踪发现被 CPU 写过）：就地反交织，按调用方给的区域 / 行距 / 片距逐行拷进 dst；
+//    不碰 GPU、不建宿主贴图，任何线程都能调。
+// ② 内容归 GPU（渲染 / 拷贝 / 计算写过）：rt_gpu 从宿主贴图读回（片 1：二维 / 二维数组 / 立方体 / 三维，NVN_GPU_FMT_READBACK 的格式）。
+// 别的（线性 / 稀疏 / 多重采样 / 缓冲贴图、没人写过的、读回不了的格式）照旧具名记账、不动 dst，不返回假结果。
 int nvn_ft_written(const tex_t *t) __attribute__((weak));   // hle_nvn.c：脏页追踪（档案开关在它里面判），命中时它自己记 nvn_be_tex_cpu_written；没有它的构建当「没写过」
 static int tex_content_in_guest_memory(const tex_t *t) {
     if (!t->mem) return 0;
@@ -231,6 +234,9 @@ static int tex_content_in_guest_memory(const tex_t *t) {
     if (nvn_be_tex_gpu_owned(t->serial)) return 0;
     return t->has_layout || rp_tex_cpu_written(t->serial) || (nvn_ft_written && nvn_ft_written(t));
 }
+// 弱链接[replay]：nvn_hle_submit_lock
+// 弱链接[replay]：nvn_hle_submit_unlock
+#include "rp_read_texels.inc"   // ② 内容归 GPU 的读回（rt_gpu）
 void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     if (!t || !r || !dst) { nvn_unimpl("be", "read_texels_bad_args", __builtin_return_address(0)); return; }
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -256,7 +262,11 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     size_t ext = 0, ext_all = 0;   // 一片 / 全部输出占的字节范围：行距 / 片距得容得下一行 / 一片，且这个范围本身不回绕
     if (row < wb || __builtin_mul_overflow(hb - 1, row, &ext) || __builtin_add_overflow(ext, wb, &ext) ||
         (nz > 1 && (img < ext || __builtin_mul_overflow((size_t)(nz - 1), img, &ext_all) || __builtin_add_overflow(ext_all, ext, &ext_all)))) { nvn_unimpl("be", "read_texels_bad_stride", t); return; }
-    if (!tex_content_in_guest_memory(t)) { UN("read_texels"); return; }   // 内容归 GPU / 游戏内存里没有内容：等读回路径
+    if (!tex_content_in_guest_memory(t)) {
+        if (nvn_be_tex_gpu_owned(t->serial)) rt_gpu(t, level, is3d ? (uint32_t)zoff : (uint32_t)(layer0 + zoff), (uint32_t)nz, r, wb, hb, bw, bh, lw, lh, dst, row, img);
+        else UN("read_texels");   // 游戏内存里没有内容、GPU 也没写过：内容未定义，不猜
+        return;
+    }
     uint64_t need = 0;   // 一级（三维：整个体积）线性化后的字节数
     if (__builtin_mul_overflow((uint64_t)lp, (uint64_t)lr, &need) || (is3d && __builtin_mul_overflow(need, (uint64_t)ld, &need)) || need > SIZE_MAX) need = 0;
     uint8_t *lin = need ? malloc((size_t)need) : NULL;

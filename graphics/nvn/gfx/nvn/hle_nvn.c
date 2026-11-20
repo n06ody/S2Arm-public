@@ -2786,6 +2786,10 @@ __attribute__((weak)) uint64_t nvn_be_finish_publish(void) { nvn_be_finish(); re
 __attribute__((weak)) void nvn_be_finish_wait(uint64_t fence) { (void)fence; }
 static void xq_lock(void) { pthread_mutex_lock(&g_sub_mu); }
 static void xq_unlock(void) { pthread_mutex_unlock(&g_sub_mu); }
+// 提交锁给回放核心（graphics/nvn/replay/rp_entry.c）：ReadTexels 读 GPU 内容要开一段旁路段，开段 / 交段与栅栏值分配都归提交线程，
+//   和 nvnQueueSubmitCommands 串行。苹果后端不调它（nvn_mtl.m 的读回走自己的旧队列），对苹果没有行为变化
+void nvn_hle_submit_lock(void) { xq_lock(); }
+void nvn_hle_submit_unlock(void) { xq_unlock(); }
 static void queue_finish(void) { pthread_mutex_lock(&g_sub_mu); uint64_t f = nvn_be_finish_publish(); pthread_mutex_unlock(&g_sub_mu); nvn_be_finish_wait(f); }
 int nvn_frec_on(void); void nvn_frec_submit(const uint64_t *h, int n); void nvn_frec_present(const tex_t *t, double period, const int crop[4]);   // 帧录（nvn_frame_rec.inc）
 static NVNqueue *g_err_queue;   // 最近一次提交的队列（nvnDeviceWaitForError 报错时填进错误信息）

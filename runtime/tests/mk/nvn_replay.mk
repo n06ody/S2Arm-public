@@ -11,7 +11,7 @@ NVN_REPLAY_CORE := $(NVN_REPLAY_DIR)/rp_exec.c $(NVN_REPLAY_DIR)/rp_copy_t2b.c $
 ifeq ($(shell uname -s),Darwin)
 NVN_REPLAY_WEAK = $(shell python3 tools/weak_link_decl.py flags replay)   # 用到才求值（= 不是 :=）：本文件随 runtime 总 make 引入，iOS 出壳也会读到这行；立即求值会让出壳去扫安卓源码（壳输入表外 112 个文件）
 endif
-NVN_REPLAY_SCAN = perl -0pe 's\#/\*.*?\*/\#\#gs; s\#//[^\n]*\#\#g' $(NVN_REPLAY_DIR)/rp_*.c $(NVN_REPLAY_DIR)/rp_*.h $(NVN_REPLAY_DIR)/nvn_unimpl.c $(NVN_REPLAY_DIR)/nvn_unimpl.h $(NVN_REPLAY_DIR)/nvn_plat.h
+NVN_REPLAY_SCAN = perl -0pe 's\#/\*.*?\*/\#\#gs; s\#//[^\n]*\#\#g' $(NVN_REPLAY_DIR)/rp_*.c $(NVN_REPLAY_DIR)/rp_*.h $(wildcard $(NVN_REPLAY_DIR)/rp_*.inc) $(NVN_REPLAY_DIR)/nvn_unimpl.c $(NVN_REPLAY_DIR)/nvn_unimpl.h $(NVN_REPLAY_DIR)/nvn_plat.h
 .PHONY: native-test-nvn_replay
 native-test-nvn_replay:
 	@mkdir -p $(BUILD)/tests

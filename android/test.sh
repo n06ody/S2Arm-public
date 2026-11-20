@@ -351,6 +351,8 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
+# ReadTexels 读 GPU 内容（rp_read_texels.inc / 旁路段 / rp_entry 分支）：等之前的活、提交锁、行距片距、READBACK 与块对齐、栅栏推进、提交内拒绝、修前，各撤一处必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/read_texels_gpu_mutation_test.py"
 # 原创 Maxwell 经生产请求、真实编译器与生产结果解析；GPU 像素由 Vulkan 门禁另验。
 s2a_gate_step "$PY" "$android_dir/tests/gs_compiler_chain_test.py"
 # BUFFER texture: real producer, Maxwell compiler and SPIR-V parser.
