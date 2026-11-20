@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -235,6 +238,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -242,8 +256,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
             if (now - t_last >= 5000000000ull) {
                 uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
                 uint64_t fr = g_n_shown + 1 - n_last; double sec = (double)(now - t_last) / 1e9, f = fr ? (double)fr : 1.0;
+                char b[640];
                 const double fs = pf[RP_PERF_TM_FRAMES] ? (double)pf[RP_PERF_TM_FRAMES] : 1.0;   // 逐步计时那几项只在采样帧里计：按计时过的帧数求每帧值（#1103）
-                char b[640]; snprintf(b, sizeof b, "分时：%.1f 秒上屏 %llu 帧（每秒 %.1f）；每帧：绘制 %.0f 笔、队列提交 %.1f 次共 %.1f 毫秒（其中交后端 %.1f）、等围栏 %.1f 次共 %.1f 毫秒（其中等同步 %.1f 次 %.1f 毫秒、Finish %.1f 次 %.1f 毫秒）；段从提交到完成平均 %.1f 毫秒；回放分三段：开段 %.1f / 回放 %.1f / 收尾 %.1f 毫秒、等已完成 %.1f 次、没真等 %.1f 次；GPU 忙 %.1f 毫秒；通道 %.1f 个、交上屏 %.1f 毫秒",
+                snprintf(b, sizeof b, "分时：%.1f 秒上屏 %llu 帧（每秒 %.1f）；每帧：绘制 %.0f 笔、队列提交 %.1f 次共 %.1f 毫秒（其中交后端 %.1f）、等围栏 %.1f 次共 %.1f 毫秒（其中等同步 %.1f 次 %.1f 毫秒、Finish %.1f 次 %.1f 毫秒）；段从提交到完成平均 %.1f 毫秒；回放分三段：开段 %.1f / 回放 %.1f / 收尾 %.1f 毫秒、等已完成 %.1f 次、没真等 %.1f 次；GPU 忙 %.1f 毫秒；通道 %.1f 个、交上屏 %.1f 毫秒",
                                       sec, (unsigned long long)fr, (double)fr / sec, (double)(nd - d_last) / f, (double)pf[RP_PERF_SUBS] / f, (double)pf[RP_PERF_SUBMIT_NS] / 1e6 / f, (double)pf[RP_PERF_COMMIT_NS] / 1e6 / f,
                                       (double)(pf[RP_PERF_WAIT_N] + pf[RP_PERF_WAIT_FIN_N]) / f, (double)(pf[RP_PERF_WAIT_NS] + pf[RP_PERF_WAIT_FIN_NS]) / 1e6 / f,
                                       (double)pf[RP_PERF_WAIT_N] / f, (double)pf[RP_PERF_WAIT_NS] / 1e6 / f,
