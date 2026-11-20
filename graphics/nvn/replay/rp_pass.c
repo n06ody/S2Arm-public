@@ -22,6 +22,7 @@
 
 // 首用跳过开关（安卓 demand 层，弱引用）：iOS / 鸿蒙 / 宿主单测没有实现 → 不标记，行为同现状。
 int nvn_vk_pipe_demand_on(void) __attribute__((weak));
+void rp_fd_chan_note(int bucket) __attribute__((weak));   // rp_draw.c：0–1 笔通道的判据桶回记（不链则丢这段统计）
 #pragma weak s2a_fu_rt_mark_fresh   // 只编回放核的宿主门禁可能没链接 nvn_first_use.c；缺实现时 enabled 为假、不会调用
 static int rp_pass_fu_enabled(void) { return nvn_vk_pipe_demand_on && nvn_vk_pipe_demand_on(); }
 
@@ -39,6 +40,8 @@ static struct {
     int area_want; int32_t wx, wy; uint32_t ww, wh; // 下一笔绘制要求的区域（rp_pass_prepare_draw 设，rp_pass_begin 用）
     uint32_t rtseq;               // 当前目标的 SET_RT 在索引里的序号（存储前瞻的「本通道之后」分界，rp_sdx.c）
     uint32_t fd_cov;              // 下一笔开通道的首笔全画掩码（rp_draw 的 fd_cover_mask，pass_begin_colors 吃掉就清）
+    int fd_bkt;                   // 下一笔开通道那笔命中的判据桶（rp_pass_prepare_draw 随 fd_cov 一起设，pass_begin_colors 同口径吃掉就清）
+    int fd_bucket;                // 本通道的开通道笔命中的判据桶（收通道且 ndraw<=1 时回记「单笔」分布，-1=这通道不是绘制判出来的）
     // 上一个通道的管线形状（各颜色槽的附件格式、深度 / 模板格式、采样数）：Vulkan 的管线对象与渲染通道的格式绑在一起，
     // 形状变了必须重取管线（见 rp_pass_begin 末尾）；形状没变、目标只是换了张同格式的图，管线与绑定都不用重发
     uint32_t shape_c[8], shape_d, shape_s, shape_smp; int shape_ok;
@@ -434,6 +437,7 @@ void rp_pass_end(nvn_gpu_cmd c) {
                   if (P.ndraw <= 1) {   // 0–1 笔通道的构成：挂不挂深度模板、各吃掉多少像素（碎片化到底是阴影/深度遍还是轻量目标）
                       if (P.has_ds) rp_perf_add(RP_PERF_P_TINY_DS, 1); else rp_perf_add(RP_PERF_P_TINY_NODS, 1);
                       rp_perf_add(RP_PERF_P_TINY_KPIX, (uint64_t)P.cur_kpix);
+                      if (P.ndraw <= 1 && P.fd_bucket >= 0 && rp_fd_chan_note) rp_fd_chan_note(P.fd_bucket);   // 它的开通道笔命中哪个全画判据桶（判完才跳的笔也归）
                   } }   // 一笔绘制都没有的通道：只为落地待折清除（或一开就被别的操作截断）
     memset(g_shu, 0, sizeof g_shu);
     P.open = 0; P.area_on = 0; P.area_want = 0; rp_occl_pass_closed();
@@ -444,8 +448,8 @@ static uint64_t pb_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC
 #define PB(step) do { if (tm_) { uint64_t n_ = pb_now(); rp_perf_add(step, n_ - pb_); pb_ = n_; } } while (0)
 // 绘制前调（rp_draw 在 rp_pass_begin 之前）：把这一笔要求的像素区域交给下一步开通道；通道已经开着而这一笔超出当前区域，
 // 收通道并按并集重开（重开用 LOAD：上一遍只保存过它自己的区域，区域外内容本来就是原样；带清除负载的通道区域必是整张，走不到这里）。
-void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cover) {
-    P.fd_cov = cover;
+void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cover, int fd_bkt) {
+    P.fd_cov = cover; P.fd_bkt = fd_bkt;
     uint8_t wanted = 0;
     for (int i = 0; i < 8; i++) if (color_write_mask >> (4 * i) & 0xf) wanted |= (uint8_t)(1u << i);
     wanted = select_colors(wanted);
@@ -473,6 +477,7 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cov
 }
 static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     const uint32_t fd_cov = P.fd_cov; P.fd_cov = 0;   // 首笔全画掩码一次性消费：本函数任何出口之后都不得被别的通道用
+    const int fd_bkt = P.fd_bkt; P.fd_bkt = -1;       // 判据桶同口径一次性消费：续开早退吃掉丢弃，真开才落 P.fd_bucket
     colors = select_colors(colors);
     if (P.open && P.colors == colors) return 1;
     if (P.open) rp_pass_end(c);
@@ -615,6 +620,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     for (int k = 0; k < ntake; k++) g_pk[taken[k]].used = 0;   // 开通道成功了：吃掉的挂起项移出表
     if (pdpk >= 0) g_pk[pdpk].used = 0;
     park_gc();
+    P.fd_bucket = fd_bkt;   // 开通道那笔的判据桶落为通道字段（0–1 笔通道归因，r6；非绘制开的通道这里恒 -1）
     P.open = 1;
     // 通道边界不等于状态边界（开关 debug.s2a.nvk_state_keep，缺省 1 = 新行为，0 = 旧行为全部重发）。
     // Vulkan 的管线、描述符集、动态状态在 vkCmdBeginRenderPass 前后都保持，不必因为换了通道就重发；

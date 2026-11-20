@@ -272,6 +272,65 @@ static void t_fd_neg_scissor(void) {   // 裁剪框缩过：画不满整张，�
     CHECK(g_npd >= 3 && g_pd[2].color[0].load == NVN_GPU_LOAD_LOAD);
 }
 
+// ---- 诊断归因（r6）：判据8「自拆」子桶 + 0–1 笔通道「单笔」判据桶分布 ----
+static int fd_diag_grab(char *db, size_t n, unsigned long long sub[4], unsigned long long ty[16]) {   // rp_fd_diag 一行里解析两段计数；先调一次清累计
+    int dl = rp_fd_diag(db, n); if (dl <= 0) return 0;
+    char *p = strstr(db, "自拆：真");
+    if (!p || sscanf(p, "自拆：真%llu 解%llu 数%llu 空%llu", &sub[0], &sub[1], &sub[2], &sub[3]) != 4) return 0;
+    p = strstr(db, "单笔：证");
+    if (!p || sscanf(p, "单笔：证%llu 关%llu 程%llu 弃%llu 位%llu 丢%llu 掩%llu 采%llu 数%llu 型%llu 自%llu 形%llu 逻%llu 视%llu 顶%llu 零%llu",
+            &ty[0], &ty[1], &ty[2], &ty[3], &ty[4], &ty[14], &ty[15], &ty[5], &ty[6], &ty[7], &ty[8], &ty[9], &ty[10], &ty[11], &ty[12], &ty[13]) != 16) return 0;
+    return 1;
+}
+static void t_fd_diag_tiny(void) {   // fd_run3 的三个通道都是单笔：开通道笔全落「位」桶，要原样回记
+    char db[1024]; unsigned long long sub[4], ty[16];
+    rp_fd_diag(db, sizeof db);
+    fd_fresh(FD_FULL); g_fprog.pos_src = 0; g_fprog.pos_attr = -1; fd_run3(0);
+    CHECK(fd_diag_grab(db, sizeof db, sub, ty) && ty[4] == 3 && !(sub[0] | sub[1] | sub[2] | sub[3]));
+}
+static void t_fd_diag_self_serial(void) {   // serial 真命中：fs 槽 3 绑的就是当前目标 → 自拆「真」、单笔「自」，载
+    char db[1024]; unsigned long long sub[4], ty[16];
+    rp_fd_diag(db, sizeof db);
+    fd_fresh(FD_FULL);
+    static tex_t ta;
+    ta = mk_tex(300721, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0); nvn_be_tex_init(&ta); nvn_be_reg_tex(21, &ta, NULL);
+    samp_par sp; memset(&sp, 0, sizeof sp); nvn_be_reg_samp(3, &sp);   // 绑定走得到底：采这张贴图的采样器登记上
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 3; g_fprog.ent[1][0].count = 1;
+    stream s = {0}; fd_state(&s, 0);
+    put_set_rt(&s, &ta, NULL); q_bind_tex(&s, 1, 3, 1, 21); q_draw(&s);
+    end(&s); submit1(&s);
+    CHECK(g_npd >= 1 && g_pd[0].color[0].load == NVN_GPU_LOAD_LOAD);
+    CHECK(fd_diag_grab(db, sizeof db, sub, ty) && sub[0] == 1 && sub[1] + sub[2] + sub[3] == 0 && ty[8] == 1);
+}
+static void t_fd_diag_self_unres(void) {   // IMGU 句柄在常量缓冲：判定点解不到 → 自拆「解」，载（夹具里 TEXU 在 fd 判定前的 usrc 解析就跳了，IMGU 同子桶且能走到判定）
+    char db[1024]; unsigned long long sub[4], ty[16];
+    rp_fd_diag(db, sizeof db);
+    fd_fresh(FD_FULL);
+    static tex_t ta;
+    ta = mk_tex(300723, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0); nvn_be_tex_init(&ta); nvn_be_reg_tex(23, &ta, NULL);
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].src_kind = NVN_RB_IMGU; g_fprog.ent[1][0].count = 1;
+    stream s = {0}; fd_state(&s, 0);
+    put_set_rt(&s, &ta, NULL); q_draw(&s);
+    end(&s); submit1(&s);
+    CHECK(g_npd >= 1 && g_pd[0].color[0].load != NVN_GPU_LOAD_DONTCARE);   // 新贴图带待清零标记 → 首通道 load=CLEAR 也算「fd 没证出」
+    CHECK(fd_diag_grab(db, sizeof db, sub, ty) && sub[1] == 1 && ty[8] == 1);
+}
+static void t_fd_diag_self_array(void) {   // 句柄表数组（count>1）：判定点不逐项解 → 自拆「数」，载（槽位绑真贴图只为让笔走完判定点之后的绑定）
+    char db[1024]; unsigned long long sub[4], ty[16];
+    rp_fd_diag(db, sizeof db);
+    fd_fresh(FD_FULL);
+    static tex_t ta, tc;
+    ta = mk_tex(300725, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0); nvn_be_tex_init(&ta); nvn_be_reg_tex(25, &ta, NULL);
+    tc = mk_tex(300727, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0); nvn_be_tex_init(&tc); nvn_be_reg_tex(24, &tc, NULL);
+    samp_par sp; memset(&sp, 0, sizeof sp); nvn_be_reg_samp(3, &sp);
+    g_fprog.nent[1] = 1; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 4; g_fprog.ent[1][0].count = 2;   // 数组槽 0/1
+    stream s = {0}; fd_state(&s, 0);
+    put_set_rt(&s, &ta, NULL); q_bind_tex(&s, 1, 0, 1, 24); q_bind_tex(&s, 1, 1, 1, 24); q_draw(&s);
+    end(&s); submit1(&s);
+    CHECK(g_npd >= 1 && g_pd[0].color[0].load != NVN_GPU_LOAD_DONTCARE);   // 新贴图带待清零标记 → 首通道 load=CLEAR 也算「fd 没证出」
+    CHECK(fd_diag_grab(db, sizeof db, sub, ty) && sub[2] == 1 && ty[8] == 1);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "off")) {
         g_sdx_flag = 0;
@@ -303,6 +362,10 @@ int main(int argc, char **argv) {
     t_fd_neg_blend();
     t_fd_neg_outofpool();
     t_fd_neg_scissor();
+    t_fd_diag_tiny();
+    t_fd_diag_self_serial();
+    t_fd_diag_self_unres();
+    t_fd_diag_self_array();
     printf("rp_sdx: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail != 0;
 }
