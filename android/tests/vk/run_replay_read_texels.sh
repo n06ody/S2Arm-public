@@ -20,7 +20,8 @@ if [ -z "$icd" ] || [ -z "$layer" ]; then echo '【红】缺 lavapipe 或 valida
 mkdir -p "$repo/build/vk-rt-tmp"
 out=$(mktemp -d "$repo/build/vk-rt-tmp/run.XXXXXX")
 trap 'rm -rf "$out"' EXIT
-cc -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 \
+# -Wno-address：夹具在同一编译单元里给了提交锁的强定义，.inc 里「弱引用在不在」的判断对它恒真
+cc -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -Wno-address -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 \
     -I "$repo/android/tests/vkhost" -I "$repo/graphics/nvn/third_party/vulkan-headers/include" \
     -I "$repo/graphics/nvn" -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" \
     -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/android/native" -I "$repo/android/native/nvn" -I "$repo/android/native/direct" \
@@ -40,7 +41,7 @@ for dq in 0 1; do   # 两级回放关 / 开：读回段在 DQ 下由录制线程
     rc=${PIPESTATUS[0]}
     set -e
     if [ "$rc" -ne 0 ] || ! grep -q 'device: llvmpipe' "$out/log-$dq" || ! grep -q '^PASS replay ReadTexels GPU' "$out/log-$dq" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/log-$dq"; then
-        echo "【红】回放 ReadTexels GPU Vulkan 验证失败（DQ=$dq）rc=$rc" >&2; exit 1
+        echo "【红】回放 ReadTexels GPU Vulkan 验证失败（DQ=${dq}）rc=${rc}" >&2; exit 1
     fi
 done
 unset S2A_TEST_NVK_DQ

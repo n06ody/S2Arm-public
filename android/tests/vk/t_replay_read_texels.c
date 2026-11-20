@@ -8,6 +8,7 @@
 #undef main
 #include "rp_exec.h"
 #include "rp_res.h"
+#include "nvn_plat.h"
 
 static nvn_gpu_tex g_src; static uint64_t g_sig, g_last; static int g_side_begins, g_side_commits, g_locks, g_unlocks, g_in_sub;
 static char g_un_last[64]; static int g_un_n;
