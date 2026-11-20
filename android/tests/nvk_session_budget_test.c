@@ -30,6 +30,7 @@ void nvk_warm_start(void) {}
 void nvn_vk_pipe_demand_start(void) {}
 void nvn_vk_pipe_demand_stop(void) {}
 void nvn_dirty_set_chunk_pages(uint32_t n) { (void)n; }
+void nvn_dirty_set_mp_dedupe(int enabled) { (void)enabled; }
 int nvn_dirty_log_configure(int enabled) { if (enabled) log_attempts++; return 0; } // 本夹具不提供真实写跟踪，保守拒绝。
 int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_buf_dirtylog") ? (log_flag < 0 ? dflt : log_flag) : dflt; }   // log_flag -1 = 没设，取缺省
 double s2a_direct_vk_display_refresh(void) { return 60; }
