@@ -8,6 +8,7 @@ static int failed;
 static int64_t clock_ns;
 static int32_t thread_id;
 static int creates, reports, closes, updates, fail_report, fail_create, fail_update;
+static int active_during_report;
 static int enabled = 1;
 int s2a_adpf_test_enabled(void) { return enabled; }
 static int32_t created_tid;
@@ -19,10 +20,15 @@ void *s2a_adpf_test_create(int32_t tid, int64_t target) {
     return fail_create ? NULL : (void *)(uintptr_t)1;
 }
 int s2a_adpf_test_update(void *s, int64_t target) { (void)s; updates++; updated_target=target; return fail_update; }
-int s2a_adpf_test_report(void *s, int64_t ns) { (void)s; reports++; actual=ns; return fail_report; }
+int s2a_adpf_test_report(void *s, int64_t ns) {
+    (void)s;
+    active_during_report = s2a_adpf_session_active();
+    reports++; actual=ns; return fail_report;
+}
 void s2a_adpf_test_close(void *s) { (void)s; closes++; }
 int main(void) {
     s2a_adpf_test_reset();
+    CHECK(!s2a_adpf_session_active());
     s2a_adpf_set_foreground(1); s2a_adpf_set_surface(1);
     // First frame: session is created for the worker tid at the present period;
     // the reported span is measured begin->end, never the interval itself.
@@ -31,6 +37,7 @@ int main(void) {
     clock_ns=1012000000; s2a_adpf_frame_end(16666667, 1);
     CHECK(creates==1 && created_tid==42 && created_target==16666667);
     CHECK(reports==1 && actual==12000000);
+    CHECK(!active_during_report && s2a_adpf_session_active());
     // Same target is not re-updated; a real target change is.
     clock_ns=2000000000; s2a_adpf_work_begin(2); clock_ns=2020000000; s2a_adpf_frame_end(16666667, 2);
     CHECK(updates==0 && reports==2 && actual==20000000);
@@ -39,12 +46,15 @@ int main(void) {
     // A failed report closes the session and rate-limits a retry for a second.
     fail_report=1; clock_ns=2050000000; s2a_adpf_work_begin(4); clock_ns=2060000000; s2a_adpf_frame_end(33333334, 4);
     CHECK(reports==4 && closes==1);
+    CHECK(!s2a_adpf_session_active());
     fail_report=0; clock_ns=2500000000; s2a_adpf_work_begin(5); clock_ns=2510000000; s2a_adpf_frame_end(33333334, 5);
     CHECK(creates==1 && reports==4);
     clock_ns=3061000000; s2a_adpf_work_begin(6); clock_ns=3071000000; s2a_adpf_frame_end(33333334, 6);
     CHECK(creates==2 && reports==5);
+    CHECK(s2a_adpf_session_active());
     // Backgrounding closes the session; work while backgrounded is not recorded.
     s2a_adpf_set_foreground(0); CHECK(closes==2);
+    CHECK(!s2a_adpf_session_active());
     clock_ns=3200000000; s2a_adpf_work_begin(7); clock_ns=3210000000; s2a_adpf_frame_end(33333334, 7);
     CHECK(creates==2 && reports==5);
     s2a_adpf_set_foreground(1);
@@ -69,6 +79,7 @@ int main(void) {
     CHECK(creates==4 && reports==9);
     // Surface loss closes and gates recording; restore resumes.
     s2a_adpf_set_surface(0); CHECK(closes==4);
+    CHECK(!s2a_adpf_session_active());
     clock_ns=3800000000; s2a_adpf_work_begin(15); clock_ns=3810000000; s2a_adpf_frame_end(33333334, 15);
     CHECK(creates==4 && reports==9);
     s2a_adpf_set_surface(1);
@@ -79,6 +90,7 @@ int main(void) {
     // re-enable frame must sit more than a second later.
     enabled=0; clock_ns=4100000000; s2a_adpf_work_begin(17); clock_ns=4110000000; s2a_adpf_frame_end(33333334, 17);
     CHECK(creates==5 && reports==10 && closes==5);
+    CHECK(!s2a_adpf_session_active());
     enabled=1; clock_ns=5200000000; s2a_adpf_work_begin(18); clock_ns=5210000000; s2a_adpf_frame_end(33333334, 18);
     CHECK(creates==6 && reports==11);
     // A changed owner replaces the session; no work from different threads is mixed.
@@ -96,6 +108,7 @@ int main(void) {
     s2a_adpf_invisible(); CHECK(closes==8);
     fail_create=1; clock_ns=6500000000; s2a_adpf_work_begin(23); clock_ns=6510000000; s2a_adpf_frame_end(16666667, 23);
     CHECK(creates==9 && reports==13);
+    CHECK(!s2a_adpf_session_active());
     fail_create=0; clock_ns=6600000000; s2a_adpf_work_begin(24); clock_ns=6610000000; s2a_adpf_frame_end(16666667, 24);
     CHECK(creates==9 && reports==13);
     clock_ns=7520000000; s2a_adpf_work_begin(25); clock_ns=7530000000; s2a_adpf_frame_end(16666667, 25);
@@ -107,6 +120,7 @@ int main(void) {
     CHECK(reports==14);
     // Stop latches: closes the session and blocks further work.
     s2a_adpf_stop(); CHECK(closes==9);
+    CHECK(!s2a_adpf_session_active());
     clock_ns=7700000000; s2a_adpf_work_begin(28); clock_ns=7710000000; s2a_adpf_frame_end(16666667, 28);
     CHECK(creates==10 && reports==14);
     if (failed) return 1;

@@ -107,6 +107,48 @@ def iml_facts(ipa):
                 team=str((prof.get('TeamIdentifier') or [''])[0]))
 
 
+def cert_not_after(der):
+    """X.509 证书（DER）→ 到期时刻（epoch 秒）；读不了 → None"""
+    import calendar
+    try:
+        _, s, e = _tlv(der, 0)
+        _, ts, te = _children(der, s, e)[0]
+        tbs = _children(der, ts, te)
+        if tbs[0][0] == 0xA0: tbs = tbs[1:]   # 版本号 [0]
+        _, vs, ve = tbs[3]
+        na = _children(der, vs, ve)[1]
+        w = der[na[1]:na[2]].decode('ascii')
+        w = ('20' + w if na[0] == 0x17 else w).rstrip('Z')   # UTCTime YYMMDDhhmmssZ / GeneralizedTime YYYYMMDDhhmmssZ
+        return float(calendar.timegm(time.strptime(w[:14], '%Y%m%d%H%M%S')))
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def signed_expiry(ipa):
+    """签好的 ipa → {expires: 到期时刻 epoch 秒, days: 描述文件有效天数}；读不到 → None（#1772）。
+    到期取主 App 描述文件 ExpirationDate；描述文件里只列了一张开发证书时，再和它的到期取较早的（证书先到期，App 也就打不开了）。
+    列了不止一张时认不出是哪张签的，只按描述文件。days 是苹果这次实际给的期限（免费账号 7 天、付费一年），调用方据此判免费 / 付费，不再估"""
+    import calendar
+    try:
+        with zipfile.ZipFile(ipa) as z:
+            n = next((x for x in z.namelist() if re.fullmatch(r'Payload/[^/]+\.app/embedded\.mobileprovision', x)), None)
+            if not n:
+                return None
+            raw = z.read(n)
+        a, b = raw.find(b'<?xml'), raw.rfind(b'</plist>')
+        prof = plistlib.loads(raw[a:b + 8]) if a >= 0 and b > a else {}
+        made, until = prof.get('CreationDate'), prof.get('ExpirationDate')
+        if not (made and until):
+            return None
+        made, exp = calendar.timegm(made.utctimetuple()), float(calendar.timegm(until.utctimetuple()))
+    except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException, ValueError, AttributeError):
+        return None
+    certs = prof.get('DeveloperCertificates') or []
+    if len(certs) == 1 and cert_not_after(certs[0]):
+        exp = min(exp, cert_not_after(certs[0]))
+    return dict(expires=exp, days=round((calendar.timegm(until.utctimetuple()) - made) / 86400))
+
+
 def iml_line(ipa):
     """装机日志 / 进度里的一行：签出的 S2Arm 带不带「提高内存上限」。丢了的那行以「【IML 丢了】」开头（作业层据此记诊断、黄字提示玩家）"""
     f = iml_facts(ipa)
@@ -387,7 +429,8 @@ def main(argv=None):
 
 
 def install_app(a, say=lambda m: print(m, flush=True)):
-    """签名 + 覆盖装（同包名不卸载，Documents 保留）→ 装机后的实际包名；失败抛 Fail"""
+    """签名 + 覆盖装（同包名不卸载，Documents 保留）→ 装机后的实际包名；失败抛 Fail。
+    签好的包里读到的真实到期（signed_expiry）放在 a.signed_expiry（读不到为 None），调用方据此记签名状态（#1772）"""
     exe = plumesign_path(a.plumesign)
     if not exe: raise Fail('找不到 plumesign（Impactor 官方同版命令行，和 Impactor 放在同一目录，或用 --plumesign / S2A_PLUMESIGN 指定）', 75, 'impactor_missing')
     try: devs = mux_devices()
@@ -452,6 +495,7 @@ def install_app(a, say=lambda m: print(m, flush=True)):
                 finally:
                     Path(log).write_text(first + f'\n--- 9401：改用 {legacy} 重试 ---\n' + Path(log).read_text(encoding='utf-8', errors='replace'), encoding='utf-8')
         bid = bundle_id_of(out) if out.is_file() else None
+        a.signed_expiry = signed_expiry(out) if out.is_file() else None
         if out.is_file():
             line = iml_line(out)   # 核对结果一律进装机日志；丢了才交给调用方（作业层记黄字诊断，不当进度显示）
             with open(log, 'a', encoding='utf-8') as f:

@@ -86,6 +86,15 @@ class PhoneOverview(unittest.TestCase):
         self.assertEqual({g["gameId"]: g["dataOnComputer"] for g in p2["games"]}, {self.A: True, self.B: False, self.C: True, self.D: False, self.E: False})
         self.assertNotIn("online", p1, "没带 probe：不查连接、不出 online")
 
+    def test_real_expiry_beats_estimate(self):
+        # #1772：装机时从签好的包里读到的真实到期（signed.expires）优先；没有才按 7 天 / 365 天估。期望手写
+        layout.save_device(self.c, "P-REAL", dict(shellId="S", signed=dict(at=T, free=False, expires=T + 360 * 86400), games={}))
+        layout.save_device(self.c, "P-EST", dict(shellId="S", signed=dict(at=T, free=True), games={}))
+        import time as _t
+        with patch.object(_t, "time", lambda: T + 86400):
+            got = {p["device"]: (p["expiresAtEstimate"], p["remainingDays"], p["expiresKnown"]) for p in self.overview()["phones"]}
+        self.assertEqual(got, {"P-REAL": (T + 360 * 86400, 359, True), "P-EST": (T + 7 * 86400, 6, False)})
+
     def test_probe_reports_connection(self):
         self.fixture()
         r = self.overview(probe=True, online={"PHONE-1": "usb"})

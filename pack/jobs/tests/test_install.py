@@ -1831,21 +1831,23 @@ class WinWidgetInstallTests(unittest.TestCase):
             z.writestr("Payload/S2Arm.app/PlugIns/S2ArmWidget.appex/S2ArmWidget", b"ext")
         (self.tmp / "logs").mkdir()
 
-    def run_install(self, fails=(), widget=None):
+    def run_install(self, fails=(), widget=None, expiry=None, info=None):
         given = []
         class Fail(Exception):
             def __init__(self, msg, err=None): super().__init__(msg); self.err = err
         def install_app(ns, say=None):
             with zipfile.ZipFile(ns.ipa) as z: given.append(sorted(z.namelist()))
             if len(given) <= len(fails): raise Fail("plumesign 退 1", fails[len(given) - 1])
+            if expiry: ns.signed_expiry = expiry   # 同 install_win.install_app：签好的包里读到的真实期限
             return "io.s2arm.games.abcde12345"
         W = types.SimpleNamespace(Fail=Fail, install_app=install_app, plumesign_path=lambda x=None: "C:/plumesign.exe",
                                   impactor=types.SimpleNamespace(bundled=lambda r: {}, select_only_account=lambda exe: None))
         r = {} if widget is None else {"widget": widget}
         c = types.SimpleNamespace(r=r, private=self.tmp, logs=self.tmp / "logs", task="t", emit=lambda *a, **k: None, begin=lambda *a, **k: None,
                                   last_log=None, diagnostic=um.MagicMock())
-        me = types.SimpleNamespace(W=W, c=c, udid="U", key="dev1", bid=None, backup=lambda g: None, bundle_for_signing=lambda: None)
+        me = types.SimpleNamespace(W=W, c=c, udid="U", key="dev1", bid=None, backup=lambda g: None, bundle_for_signing=lambda: None, info=info if info is not None else {})
         me.say = lambda m: install.WinPhone.say(me, m)   # install_win 的进度回调（签好后核 IML 的那行也经它）
+        self.me = me
         with um.patch.object(install.devcert, "active", return_value=False), um.patch.object(install.layout, "load_device", return_value={}), \
              um.patch.object(install.layout, "save_device"):
             install.WinPhone.install(me, self.ipa, [], steps=False)
@@ -1868,6 +1870,15 @@ class WinWidgetInstallTests(unittest.TestCase):
         self.assertEqual(given, [["Payload/S2Arm.app/S2Arm"]]); diag.assert_not_called()
         given, diag = self.run_install()
         self.assertEqual(len(given), 1); self.assertEqual(len(given[0]), 3); diag.assert_not_called()
+
+    def test_real_expiry_sets_free_and_expires(self):
+        # #1772：装好后按签好的包里的真实期限记（PlumeMacPhone 原先一律 free=True，付费账号显示 7 天）。期望手写
+        self.run_install(expiry=dict(expires=1_900_000_000.0, days=365), info=dict(free=True, device="U"))
+        self.assertEqual(self.me.info, dict(free=False, device="U", expires=1_900_000_000.0))
+        self.run_install(expiry=dict(expires=1_800_000_000.0, days=7), info=dict(free=True, device="U"))
+        self.assertEqual(self.me.info, dict(free=True, device="U", expires=1_800_000_000.0))
+        self.run_install(info=dict(free=True, device="U"))   # 读不到：照旧
+        self.assertEqual(self.me.info, dict(free=True, device="U"))
 
     def test_strip_keeps_exec_bit(self):
         out = self.tmp / "o.ipa"

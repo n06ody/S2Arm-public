@@ -459,20 +459,24 @@ out:
 //   模块里没有对应宽度的类型（OpTypeFloat 64 / OpTypeInt 64）时这条能力声明用不上，原地删掉（只删那一条 OpCapability，
 //   id 上界不变，语义不变）；真用到了就拒收，由调用方退回现编（现编按本机 profile 翻，Float64 关时 double 降成 float）。
 //   Int64Atomics 必带 64 位整型，一律拒收。返回 0 = 可用（*n 可能变小）；-1 = 拒收（why 以具名原因开头：
-//   fp64_type_used / int64_type_used / int64_atomics_used，调用方照常走库拒收计数 s2a_libpack_rejects）。
+//   fp64_type_used / int64_type_used / int64_atomics_used / interlock_used，调用方照常走库拒收计数 s2a_libpack_rejects）。
 //   判据以类型声明为准：OpTypeFloat 64 只被 OpConstant 引用、没有运算也算用到（模块仍按 Float64 校验）。
 //   真删了能力声明的模块按条计数（libpack_caps_stripped，s2a_libpack_caps_stripped）；同一模块再核一遍不再计。
 int s2a_libpack_spv_admit_caps(uint8_t *spv, size_t *n, char *why, size_t why_size) {
     uint32_t *w = (uint32_t *)spv; size_t nw = *n / 4;
-    int f64 = 0, i64 = 0;
+    int f64 = 0, i64 = 0, il_used = 0;
     if (nw < 5 || w[0] != 0x07230203u) { lp_fail(why, why_size, "not a SPIR-V module"); return -1; }
     for (size_t i = 5; i < nw; ) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
         if (!wc || i + wc > nw) { lp_fail(why, why_size, "truncated instruction at word %zu", i); return -1; }
         if (op == 22 && wc >= 3 && w[i + 2] == 64) f64 = 1;          // OpTypeFloat 64
         if (op == 21 && wc >= 4 && w[i + 2] == 64) i64 = 1;          // OpTypeInt 64
+        if (op == 5364 || op == 5365) il_used = 1;                   // OpBegin/EndInvocationInterlockEXT
         i += wc;
     }
+    // interlock 与 Float64 同病：批翻链按宿主缺省「支持」给几乎每个模块挂 cap 5378 + 扩展名（11-26 全库核：8571/9060 声明、0 个真有
+    //   Begin/End 指令）。设备没 VK_EXT_fragment_shader_interlock 时模块创建过不了能力核；真有临界区的不能剥（剥了改变读写序语义），具名拒。
+    if (il_used) { lp_fail(why, why_size, "interlock_used: uses FragmentShaderPixelInterlockEXT, which the Vulkan device does not enable"); return -1; }
     for (size_t i = 5; i < nw; ) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
         if (op == 17 && wc == 2) {                                    // OpCapability
@@ -483,9 +487,25 @@ int s2a_libpack_spv_admit_caps(uint8_t *spv, size_t *n, char *why, size_t why_si
                         cap == 10 ? "Float64" : cap == 11 ? "Int64" : "Int64Atomics");
                 return -1;
             }
-            if (cap == 10 || cap == 11) {
+            if (cap == 10 || cap == 11 || cap == 5378) {
                 memmove(&w[i], &w[i + 2], (nw - i - 2) * sizeof *w);
                 nw -= 2;
+                continue;
+            }
+        }
+        if (op == 10 && wc >= 2) {                                    // OpExtension "SPV_EXT_fragment_shader_interlock"
+            char ext[40]; size_t el = 0;
+            for (size_t k = 1; k < wc && el < sizeof ext - 1; k++) {
+                for (int b = 0; b < 4 && el < sizeof ext - 1; b++) {
+                    char c = (char)(w[i + k] >> (8 * b));
+                    if (!c) { k = wc; break; }
+                    ext[el++] = c;
+                }
+            }
+            ext[el] = 0;
+            if (!strcmp(ext, "SPV_EXT_fragment_shader_interlock")) {
+                memmove(&w[i], &w[i + wc], (nw - i - wc) * sizeof *w);
+                nw -= wc;
                 continue;
             }
         }

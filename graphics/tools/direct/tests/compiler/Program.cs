@@ -193,6 +193,22 @@ internal static unsafe class Program
         return sets.Where(p => bindings.ContainsKey(p.Key)).Select(p => (p.Value, bindings[p.Key])).ToHashSet();
     }
 
+    // OpVariable（opcode 59）里 storage class 7=Function 的条数：DebugMode 关掉表达式传播时
+    // 每个 IR 临时量都物化一条，两种模式的分水岭指标。
+    private static int CountFunctionLocals(byte[] spirv)
+    {
+        uint[] words = MemoryMarshal.Cast<byte, uint>(spirv).ToArray();
+        int locals = 0;
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            if ((words[i] & 0xffff) == 59 && count >= 4 && words[i + 3] == 7) locals++;
+            i += count;
+        }
+        return locals;
+    }
+
     private static uint GeometryInputArrayLength(JsonElement stage, uint location)
     {
         uint[] words = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
@@ -650,7 +666,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0, bool debugMode = false)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -664,6 +680,7 @@ internal static unsafe class Program
             w.WriteString("translatorClosure", closure ?? DirectBuildIdentity.TranslatorClosure);
             w.WriteString("runtimeCompilerABI", DirectProfile.CompilerAbi);
             w.WriteNumber("sourceParserVersion", 1);
+            if (debugMode) w.WriteBoolean("debugMode", true);   // 与 native 同口径：缺省不带这个键 = 编译器按关
             w.WritePropertyName("profile"); w.WriteRawValue(profile);
             w.WriteStartObject("program");
             w.WriteString("kind", kind);
@@ -2097,6 +2114,24 @@ internal static unsafe class Program
             Check(fsInfo.GetProperty("textures")[0].GetProperty("handleIndex").GetInt32() == 2 &&
                   fsInfo.GetProperty("textures")[1].GetProperty("handleIndex").GetInt32() == 3,
                 "reflected texture handles 2/3");
+        }
+
+        // 7b1b) 翻译器调试模式开关（debugMode）：缺省与 libpack 出库同口径（表达式传播开），
+        //       debugMode:true 走 TranslationFlags.DebugMode（传播关、临时量物化成 Function 局部）。
+        //       同一请求两种形态都编译成功，但调试形态词数与 Function 局部数严格更多；
+        //       9000 post_deferred 实测 62,841 vs 30,099 词的差距就来自这一项（非缩放代码）。
+        {
+            byte[] defaultSpv, debugSpv;
+            using (JsonDocument doc = JsonDocument.Parse(DirectShaderCompiler.Compile(
+                RequestJson(profile, "graphics", 1, 1, "xlate-default", vs, FsTwoTextures(), textureFacts: TwoTextureFacts))))
+                defaultSpv = doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetBytesFromBase64();
+            using (JsonDocument doc = JsonDocument.Parse(DirectShaderCompiler.Compile(
+                RequestJson(profile, "graphics", 1, 1, "xlate-debug", vs, FsTwoTextures(), textureFacts: TwoTextureFacts, debugMode: true))))
+                debugSpv = doc.RootElement.GetProperty("content").GetProperty("stages")[1].GetProperty("spirv").GetBytesFromBase64();
+            int fnDefault = CountFunctionLocals(defaultSpv), fnDebug = CountFunctionLocals(debugSpv);
+            Check(fnDefault < fnDebug, "debugMode off keeps locals propagated (" + fnDefault + " < " + fnDebug + ")");
+            Check(defaultSpv.Length < debugSpv.Length,
+                "debugMode off emits a smaller module (" + defaultSpv.Length + " < " + debugSpv.Length + ")");
         }
 
         // 7b2) 纹理事实矩阵（W2.2）：每个字段在 accessor 查询处逐项对上；同一 handle 不同

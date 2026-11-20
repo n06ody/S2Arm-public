@@ -40,6 +40,7 @@ _Static_assert(NVN_REFL_PUSH_SLOTS == NVN2_PUSH_SLOTS && NVN_REFL_PUSH_BYTES == 
 #include "nvn_fmt_info.h"   // #529 lb_fill：客体格式是不是定点深度
 #include "nvn_red.h"   // sampler reduction / LOD bias where the GPU has none: the variant's function constants and table entries (se_need / se_bind)
 #include "vp_prog_pick.h"   // #674: find the guest program that still holds a shader's code / control (vp_ask)
+#include "nvn_tex3d_bridge.h"   // #674: a 2D / 2D array texture in a 3D slot reads its own texels through a 3D copy (tex3d_prepare)
 #include "../../../metal/gal_samp_caps.h"   // whether this GPU reduces / biases natively (#800; the generic path's same test)
 #include "nvn_cover.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
@@ -7335,7 +7336,7 @@ static void shmap_load_once(void) {
     id<MTLLibrary> at_lib; NSString *at_main, *at_u; NSMutableDictionary<NSNumber *, id<MTLFunction>> *at_fns; uint8_t has_atms, fout_fc;   // gap families 34 / 37: a fragment main0 declaring S2A_AT / S2A_MSOFF (Dsh.cs FsAlphaMs): its library and entry names, specialized per (u, at, msoff, output types) on demand (fs_atms_fn); fout_fc: main0 also declares S2A_FU / S2A_FS (Dsh.cs FsFout), its output types are constants too
     int load_depth_zero;   // captured with the identity, also used by its layer variant
     uint8_t u_mask;   // S2Arm gap 2 A: the colour outputs fn_u returns as uint, bit n = color(n) (json u_mask; dmsh_build.py fs_uint turns only the integer-bit writers)
-    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; uint8_t t3d /* 0 not looked at, 1 no 3D texture slot, 2 has one (tex3d_prepare) */; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, afr, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
     // NVN2 task / mesh shader (json msl_entry_kind object / mesh, at stage 3 / 4; nvn_geometry.inc mesh_tasks_draw): mesh_kind 1 object 2 mesh (0 = neither); its workgroup's threads,
     //   the payload's bytes (task), a task shader feeds it (mesh), the most vertices / primitives a mesh workgroup emits (Switch2 line's interface contract, item 6)
@@ -8281,7 +8282,7 @@ void nvn_be_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view_id, view_rid, view_ser, view_dirty, view_ep; int view_pkg;   // view_pkg: CPU-written (packaged); only those depend on guest writes (view_dirty)
                  uint32_t view_pf; uint8_t view_tt;                         // view's pixel format / texture type, read once when it is set (the P1-20 probe compares them per binding without a message send)
                  uint8_t view_tbu;                                          // view is a texture buffer at a pool offset off the linear-texture alignment (the only kind tba_copy copies), read once when it is set
-                 void *alt, *alt_of; uint64_t alt_rid; uint8_t alt_type;   // alt: compatible view used when the shader's declared type differs from view (tex_fit), alt_of = the view it was built from
+                 void *alt, *alt_of; uint64_t alt_rid, alt_made; uint8_t alt_type, alt_copy;   // alt: compatible view used when the shader's declared type differs from view (tex_fit), alt_of = the view it was built from
                  void *ar, *ar_of; uint64_t ar_rid;                         // ar: the alpha-from-red view for the profile's alpha_from_red shaders (tex_alpha_red), ar_of = the view it was built from
                  void *im, *im_of; uint64_t im_rid;                         // im: the view an image slot reads in the shader's pixel class (img_fit), im_of = the view it was built from
                  uint8_t tt1, gone;   // tt1: Metal texture type + 1 a pool walk found here (0 = not looked; pool_gpu skips the ID in tables of another type); gone: its memory pool was finalized (treg_drop_pool_views), until registered again
@@ -8313,11 +8314,14 @@ static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; stati
 static void **g_sbview; static uint64_t *g_sbrid;   // 2 per sampler ID: the same sampler with a transparent black / opaque white border (samp_border_rid; the custom border emulation)
 // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
 // so a linear texture built directly on a pool kept the whole pool buffer alive (6 to 17 finalized 16 MB pool buffers stayed alive in Engage's title demo). If the ID is still used, the next lookup rebuilds it on the slow path
+// alt is a view of the base texture (tex_fit), or a 3D texture of its own holding a copy (alt_copy, tex3d_prepare, #674): the copy is in the residency set and leaves it here
+static void treg_drop_alt(treg_t *r) { if (r->alt) { if (r->alt_copy) defer_obj_release((__bridge id)r->alt); else defer_obj_unref((__bridge id)r->alt); CFRelease(r->alt);
+                                      r->alt = r->alt_of = NULL; r->alt_rid = r->alt_made = 0; r->alt_copy = 0; } }
 static void treg_drop_ar(treg_t *r) { if (r->ar) { defer_obj_unref((__bridge id)r->ar); CFRelease(r->ar); r->ar = r->ar_of = NULL; r->ar_rid = 0; }
                                      if (r->im) { defer_obj_unref((__bridge id)r->im); CFRelease(r->im); r->im = r->im_of = NULL; r->im_rid = 0; } }   // and the image class view (img_fit)
 static void treg_drop_views(treg_t *r) {   // every view the ID caches (view, alt, ar, im): each retains its base texture
     if (r->view) { defer_obj_unref((__bridge id)r->view); CFRelease(r->view); r->view = NULL; r->view_id = r->view_rid = 0; }
-    if (r->alt) { defer_obj_unref((__bridge id)r->alt); CFRelease(r->alt); r->alt = r->alt_of = NULL; r->alt_rid = 0; }
+    treg_drop_alt(r);
     treg_drop_ar(r);
 }
 // Texture views by texture serial and view parameters, beside the per-ID view: KTGL (Age of Calamity) registers a texture into the next ID of a ring before every bind (about 21,000
@@ -8895,17 +8899,22 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, in
     if (!ns && (want == MTLTextureTypeCube || want == MTLTextureTypeCubeArray) && (have == MTLTextureType2D || (have == MTLTextureType2DArray && t.arrayLength < 6))) {
         { static int once; if (!once++) MLOG("shader declares a cube, texture is 2D (texture ID %d): bound as the zero cube, as Ryujinx binds no texture there", tid); }
         id<MTLTexture> z = dummy_tex((int)want, dpf); *rid = g_dummy_tex_rid[want & 15][dpf & 3]; return z; }   // of the declared class (a uint cube sampler got a float zero cube, PR #490)
+    // #674: a 2D / 2D array texture read as 3D has no view; tex3d_prepare copied it into a 3D texture before this draw (nvn_tex3d_bridge.h). Not copied (another stage's slot, a format
+    //   a 3D texture cannot take): nil, the caller's zero texture and report as before
+    if (!ns && want == MTLTextureType3D && tid >= 0 && tid < g_ntreg) { treg_t *r3 = &g_treg[tid];
+        if (r3->alt && r3->alt_copy && r3->alt_made && r3->alt_of == (__bridge void *)t) { *rid = r3->alt_rid; return (__bridge id<MTLTexture>)r3->alt; }
+        return nil; }
     if (!ns || tid < 0 || tid >= g_ntreg) return nil;   // no view bridges it: the caller reports it (tex_mis_note)
     treg_t *r = &g_treg[tid];
     if (r->alt && r->alt_of == (__bridge void *)t && r->alt_type == (uint8_t)want) { *rid = r->alt_rid; return (__bridge id<MTLTexture>)r->alt; }
-    if (r->alt) { defer_obj_unref((__bridge id)r->alt); CFRelease(r->alt); r->alt = r->alt_of = NULL; r->alt_rid = 0; }
+    treg_drop_alt(r);
     // A view's level / slice ranges are relative to its source texture, so a view of t would start at t's own level 0 / layer 0: build it from t's parent at the offset t stands at
     // (a mip- or layer-offset view read through a type-compatible view would otherwise take the parent's first levels and layers). l0 / s0 are 0 and base is t when t is not a view
     id<MTLTexture> base = t.parentTexture ? t.parentTexture : t;
     NSUInteger l0 = t.parentTexture ? t.parentRelativeLevel : 0, s0 = t.parentTexture ? t.parentRelativeSlice : 0;
     id<MTLTexture> v = [base newTextureViewWithPixelFormat:t.pixelFormat textureType:want levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns) swizzle:t.swizzle];
     if (!v) { RED_ONCE(77, "cannot create a type-compatible texture view: %lu → %lu (texture ID %d)", (unsigned long)have, (unsigned long)want, tid); return nil; }
-    r->alt = (void *)CFBridgingRetain(v); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)want; r->alt_rid = v.gpuResourceID._impl;
+    r->alt = (void *)CFBridgingRetain(v); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)want; r->alt_rid = v.gpuResourceID._impl; r->alt_copy = 0; r->alt_made = 0;
     *rid = r->alt_rid; return v;
 }
 // tex_fit for an element of a handle array (TEXD, TEXU arrays): every element is declared as the type of the one the shader picks, and the others hold whatever the slots or handles do.
@@ -14982,6 +14991,51 @@ static id<MTLTexture> dsnap_storage(MTLPixelFormat pf, NSUInteger bw, NSUInteger
     if (g_dsnap_slot[lru].t) defer_obj_release(g_dsnap_slot[lru].t);
     g_dsnap_slot[lru].t = n; g_dsnap_slot[lru].used = ++g_dsnap_tick; return n;
 }
+// #674: the fragment shader's 3D texture slots that hold a 2D / 2D array texture get a 3D copy of it (nvn_tex3d_bridge.h), made here, before the draw binds: a blit cannot start inside the
+//   open pass, and tex_fit runs while the draw is being encoded. The copy is the ID's alt (treg_t), dropped with its views. Fragment stage only: every case seen is a lighting shader's slot;
+//   another stage's slot keeps the zero texture and the report. A copy is refreshed once a frame where no pass is open, so content the game changes later is at most a frame behind
+static uint64_t g_t3b_made, g_t3b_copies;
+static int t3b_pf_plain(MTLPixelFormat pf) {
+    switch (pf) { case MTLPixelFormatR8Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Float: case MTLPixelFormatRG8Unorm: case MTLPixelFormatR32Float: case MTLPixelFormatRG16Unorm:
+        case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Float:
+        case MTLPixelFormatRGBA32Float: return 1; default: return 0; }
+}
+static void tex3d_prepare(NvProg *pr) {
+    NvShader *fs = pr ? pr->sh[1] : nil; if (!fs || g_fz.active || g_defer_replaying) return;
+    if (!fs->t3d) { int any = 0; for (int i = 0; i < fs->rf.nb; i++) any |= fs->rf.b[i].kind == NVN_RB_TEX && fs->rf.b[i].dtt == (uint8_t)MTLTextureType3D; fs->t3d = any ? 2 : 1; }
+    if (fs->t3d != 2) return;
+    uint64_t frame = atomic_load(&g_cur_frame); id<MTLTexture> src[8], dst[8]; int n = 0;
+    for (int i = 0; i < fs->rf.nb && n < 8; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->dtt != (uint8_t)MTLTextureType3D) continue;
+        int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff); id<MTLTexture> t = nil, have = nil; uint64_t made = 0;
+        pthread_mutex_lock(&g_rmu);
+        if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) { void *tv = NULL; tex_fast_rid(tid, &tv); t = (__bridge id<MTLTexture>)tv; treg_t *r = &g_treg[tid];
+            if (t && r->alt && r->alt_copy && r->alt_of == (__bridge void *)t) { have = (__bridge id<MTLTexture>)r->alt; made = r->alt_made; } }
+        pthread_mutex_unlock(&g_rmu);
+        unsigned depth = t ? t3b_depth((int)t.textureType, T3B_TYPE_3D, (unsigned)t.sampleCount, (unsigned)t.arrayLength, t3b_pf_plain(t.pixelFormat)) : 0;
+        if (!depth || (have && t3b_action(made, frame, g_enc != nil) == T3B_USE)) continue;
+        if (!have) { MTLTextureDescriptor *d = [MTLTextureDescriptor new]; d.textureType = MTLTextureType3D; d.pixelFormat = t.pixelFormat; d.width = t.width; d.height = t.height; d.depth = depth;
+            d.mipmapLevelCount = 1; d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+            have = [g_dev newTextureWithDescriptor:d]; if (!have) { static int once; if (!once++) MLOG("【红】 cannot create the 3D copy of a %lux%lu texture of format %lu read through a 3D slot (shader %s): the slot reads 0 (first case)", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, fs->key); continue; }
+            res_add(have); g_t3b_made++;
+            if (g_t3b_made <= 4) MLOG("3D slot holding a %s texture (texture ID %d, %lux%lu, %u layer%s, format %lu, shader %s slot %d): bound as a 3D copy of it (%llu so far)", t.textureType == MTLTextureType2D ? "2D" : "2D array", tid,
+                                      (unsigned long)t.width, (unsigned long)t.height, depth, depth == 1 ? "" : "s", (unsigned long)t.pixelFormat, fs->key, b->reg, (unsigned long long)g_t3b_made); }
+        pthread_mutex_lock(&g_rmu);
+        int keep = 0; if (tid < g_ntreg && g_treg[tid].ok) { void *tv = NULL; tex_fast_rid(tid, &tv); treg_t *r = &g_treg[tid];
+            if (tv == (__bridge void *)t) { if (r->alt != (__bridge void *)have) { treg_drop_alt(r); r->alt = (void *)CFBridgingRetain(have); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)MTLTextureType3D; r->alt_rid = have.gpuResourceID._impl; r->alt_copy = 1; }
+                r->alt_made = frame + 1; keep = 1; } }
+        pthread_mutex_unlock(&g_rmu);
+        if (!keep) { defer_obj_release(have); continue; }   // the ID was registered again meanwhile: the next draw looks again
+        src[n] = t; dst[n] = have; n++; }
+    if (!n) return;
+    { int pend = g_nlc || R.clear_d || R.clear_s; for (int c = 0; c < 8; c++) pend |= R.clear_c[c]; if (pend) { lc_land(); rp_flush(); memset(g_fb_dirty, 0, sizeof g_fb_dirty); } }   // a clear still waiting has not reached the source (as fb_prepare's copies)
+    if (g_enc) rp_end();
+    id e = blit();   // 变量用 id（MTL4 棘轮：直连 MTL4 只经包装）
+    for (int i = 0; i < n; i++) { id<MTLTexture> t = src[i], base = t.parentTexture ? t.parentTexture : t;
+        NSUInteger tl = t.parentTexture ? t.parentRelativeLevel : 0, ts = t.parentTexture ? t.parentRelativeSlice : 0, planes = dst[i].depth;
+        for (NSUInteger sl = 0; sl < planes; sl++) enc_b_copy_texture(e, base, ts + sl, tl, MTLOriginMake(0, 0, 0), MTLSizeMake(t.width, t.height, 1), dst[i], 0, 0, MTLOriginMake(0, 0, sl));
+        g_t3b_copies++; }
+}
 static void fb_prepare(NvProg *pr) {
     g_draw_seq++; g_fb_n = 0; g_fbt.on = 0; g_fbt.fn = nil; g_fb_want_load = 0;
     {   // a draw that may write depth / stencil changes what the copy holds: stale before it (its own sampling copies the depth as it is) and after it (its writes land after its reads)
@@ -14998,6 +15052,7 @@ static void fb_prepare(NvProg *pr) {
     if (!g_enc) memset(g_fb_dirty, 0, sizeof g_fb_dirty);   // no pass open: the last one ended and its writes are in memory (g_fb_dirty is only reset when a pass opens; a stale 1 sent the first self-sampling draw of the next pass to ④)
     if (g_fbc.forcing) { g_fbt.on = 1; memcpy(g_fbt.fx, g_fbc.fx, sizeof g_fbt.fx); g_fbt.fbmask = g_fbc.fbmask; memcpy(g_fbt.lmap, g_fbc.lmap, 8); g_fbt.fn = g_fbc.fn; return; }   // 双画检查的第二遍：强制 ⑤
     if (g_fb_rebind) { args_dirty_all(); g_fb_rebind = 0; }   // the previous draw had a substituted binding: re-encode with the original bindings this time
+    tex3d_prepare(pr);   // #674: 3D copies of the 2D textures this draw's fragment shader reads through 3D slots
     if (!pr || !pr->sh[1] || !R.rt.n || g_fz.active || g_defer_replaying) return;
     __unsafe_unretained NvShader *fs = pr->sh[1]; int listed = fb_want(fs->key); if (g_fb_off) return;   // the program holds it
     id<MTLTexture> cbase[4] = {nil}, csnap[4] = {nil}; NSUInteger ckey[4][4]; int ncopy = 0, settled = 0;   // ④ copies of this draw by real subresource (base, levels, slices); clears landed

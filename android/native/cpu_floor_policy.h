@@ -25,7 +25,7 @@
 //     → 暂缓 60 秒再试；再没有收益就翻倍（120 / 240 / 480 秒，封顶 600 秒），量出收益清零。
 //     不用「本局不再出手」：真机 6 个 auto 局的第一次出手都落在载入阶段（托底前 10.3–16.0 → 托底后 4.6–9.6 fps），
 //     一票否决会让之后的游玩段再也托不上。
-// 任何模式下：不在前台、没有显示面、已停局、省电模式、热状态 severe 及以上，都不托底。
+// 任何模式下：不在前台、没有显示面、已停局，都不托底。CPU 托底还受 ADPF 会话状态约束。
 // 频率 / 上限读不到（输入为 0）= 对应的判据不参与，不拦：只剩帧率判据与「没有收益」自检。
 #pragma once
 #include <stddef.h>
@@ -56,8 +56,9 @@ enum { S2A_FLOOR_OFF = 0, S2A_FLOOR_ALWAYS = 1, S2A_FLOOR_AUTO = 2 };
 #define S2A_FLOOR_NOGAIN_BACKOFF_MAX_NS 600000000000ull    // 连着没有收益：每次翻倍，封顶
 
 enum { S2A_FLOOR_WHY_NONE = 0, S2A_FLOOR_WHY_GATE, S2A_FLOOR_WHY_MODE, S2A_FLOOR_WHY_DONE,
-       S2A_FLOOR_WHY_IDLE, S2A_FLOOR_WHY_CAP_DROP, S2A_FLOOR_WHY_NO_GAIN };
-enum { S2A_FLOOR_BLOCK_NONE = 0, S2A_FLOOR_BLOCK_CEILING, S2A_FLOOR_BLOCK_LATCHED, S2A_FLOOR_BLOCK_BACKOFF };
+       S2A_FLOOR_WHY_IDLE, S2A_FLOOR_WHY_CAP_DROP, S2A_FLOOR_WHY_NO_GAIN, S2A_FLOOR_WHY_ADPF };
+enum { S2A_FLOOR_BLOCK_NONE = 0, S2A_FLOOR_BLOCK_CEILING, S2A_FLOOR_BLOCK_LATCHED, S2A_FLOOR_BLOCK_BACKOFF,
+       S2A_FLOOR_BLOCK_ADPF };
 enum { S2A_FLOOR_BENCH_OFF = 0, S2A_FLOOR_BENCH_SETTLE, S2A_FLOOR_BENCH_MEASURE, S2A_FLOOR_BENCH_DONE };
 
 struct s2a_floor_in {
@@ -283,6 +284,16 @@ static inline int s2a_floor_step(struct s2a_floor_state *st, const struct s2a_fl
         }
     }
     return st->active;
+}
+
+// 只有 CPU 托底受 ADPF 约束。会话关闭后重新量取窗口，保留本局退避记录。
+static inline int s2a_floor_cpu_step(struct s2a_floor_state *st, const struct s2a_floor_in *in, int adpf_active) {
+    if (!adpf_active || in->mode == S2A_FLOOR_OFF) return s2a_floor_step(st, in);
+    const int was_active = st->active;
+    s2a_floor_reset_run(st);
+    st->why = was_active ? S2A_FLOOR_WHY_ADPF : S2A_FLOOR_WHY_NONE;
+    st->block = S2A_FLOOR_BLOCK_ADPF;
+    return 0;
 }
 
 // 选哪一组核托底：按 cpu_capacity 分组（容量相同 = 同一档核），取「核数 × 容量」最大的一组，
