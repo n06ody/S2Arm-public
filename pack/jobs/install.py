@@ -2063,6 +2063,9 @@ class WinPhone:
                     raise win_install_failure(e2) from e2
                 why = WIDGET_QUOTA if e.err == "free_appid_limit" else str(first)
                 self.c.diagnostic(f"这次没装小组件：{why}", code="widget_skipped", severity="warning")
+            got = getattr(ns, "signed_expiry", None)
+            if got:   # 签好的包里的真实期限（#1772）：免费 / 付费照它判，不再按账号猜（plumesign 判不了付费，PlumeMacPhone 原先一律记免费、付费账号显示 7 天）
+                self.info.update(expires=got["expires"], free=got["days"] <= 7)
         rec = layout.load_device(self.c, self.key)
         layout.save_device(self.c, self.key, dict(rec, bundleId=self.bid))
 
@@ -2185,7 +2188,7 @@ class PlumeMacPhone(MacPhone):
         acct = plume_account(c, self.W)
         if not acct:
             raise Failure(APPLE_SIGN_IN, code="apple_not_signed_in")
-        # free：plumesign 判不了付费 / 免费，一律按免费记
+        # free：plumesign 登录时判不了付费 / 免费，先按免费记；装好后按签好的包里的真实期限改（WinPhone.install，#1772）
         super().__init__(c, team=dict(id=acct["team"], name=acct["teamName"] or acct["account"], free=True), dev=dev, udid=udid)
 
     install = WinPhone.install                       # plumesign 签名装机（含 9401 旧写法、设备已登记、小组件去掉重来）
@@ -3058,7 +3061,8 @@ def install_shell(c, ph, steps=True):
     ph.install(ipa, [], steps=False)
     forget_other_app(c, ph)
     rec = layout.load_device(c, ph.key)
-    signed = dict(signed=dict(at=time.time(), free=bool(ph.info["free"]), device=ph.info["device"], mode=sign_mode(c))) if "free" in ph.info else {}
+    signed = dict(signed=dict(at=time.time(), free=bool(ph.info["free"]), device=ph.info["device"], mode=sign_mode(c),
+                              **({"expires": ph.info["expires"]} if ph.info.get("expires") else {}))) if "free" in ph.info else {}
     # 换了签名方式后第一次装（Mac 从 Xcode 钥匙串换到 plumesign、证书 ↔ Apple ID）：结果带 signerSwitched，完成页写「这一次要重新装一下」，只这一次
     now = signer_kind(c, ph)
     layout.save_device(c, ph.key, dict(rec, shellId=sid, bundleId=ph.bid or rec.get("bundleId", ""), at=time.time(), signer=now, **signed))

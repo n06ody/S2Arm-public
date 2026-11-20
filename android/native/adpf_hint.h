@@ -20,6 +20,8 @@ void s2a_adpf_work_begin(uint64_t seq);
 // record is dropped instead of charged to the wrong frame.
 void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq);
 void s2a_adpf_discard(void);
+// The live session has successfully reported work for the recorded frame thread.
+int s2a_adpf_session_active(void);
 // Close an invisible renderer without changing the host lifecycle state.
 void s2a_adpf_invisible(void);
 void s2a_adpf_stop(void);

@@ -233,6 +233,21 @@ class InstallTest(TvCase):
         self.assertTrue(tvos.tv_ready(self.c, H))
 
 
+class AssembleShellTest(TvCase):
+    def test_real_assemble_shell_signs_container(self):
+        # 不桩 assemble_shell 本身（别处的装机测试都桩了它，#1758 的 AttributeError 因此漏过）：只桩子进程与签名，
+        # 期望（手写）：组壳子进程按 tvOS 环境跑一次，接着对同一个 S2Arm.app 调 ipa.sign_container 一次，返回 (临时目录, 临时目录/S2Arm.app)
+        import ipa
+        self.assertTrue((self.c.engine / "launchers/macos/Branding/AppIcon-iOS.png").is_file())   # 用仓库里的真图标，不写引擎目录
+        runs, signed = [], []
+        with um.patch.object(self.c, "run", lambda cmd, log, env=None: runs.append(env.get("S2A_APPLE_OS"))), \
+             um.patch.object(ipa, "sign_container", lambda c, app, log: signed.append(app)), \
+             um.patch.object(ipa, "release_version", lambda e: "1"), um.patch.object(ipa, "display_version", lambda e: "0.6.0"):
+            out, app = tvos.assemble_shell(self.c, self.c.library / "shell")
+        self.addCleanup(shutil.rmtree, out, True)
+        self.assertEqual((runs, signed, app), (["tvos"], [out / "S2Arm.app"], out / "S2Arm.app"))
+
+
 class TvProgramPushTest(TvCase):
     def test_push_programs_drops_unusable_other_game(self):
         # 期望（手写）：G 的程序件能用 → 签 tvOS 版、打成 .s2arm 推进电视上 App 的导入文件夹 Library/Caches/S2Arm/Import Here；

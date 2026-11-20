@@ -4,6 +4,7 @@
 // 没有真实来源的字段不写默认值，直接记进 gaps；编译器因此会给出准确的 MISSING_FIELD。
 #include "compile_request.h"
 #include "kind_check.h"
+#include "xlate_debug.h"
 #include "s2a_direct.h"
 #include "sha256.h"
 #include "json.h"
@@ -440,6 +441,7 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
         sb_puts(&b, ",");
         sb_json_string(&b, "kindCheck"); sb_puts(&b, ":false");
     }
+
     sb_puts(&b, ",");
     sb_json_string(&b, "profile");
     sb_puts(&b, ":");
@@ -669,7 +671,17 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
     sb_json_string(&b, "transformFeedbackEnabled");
     sb_puts(&b, ":");
     sb_puts(&b, in->transform_feedback_enabled ? "true" : "false");
-    sb_puts(&b, "}}");
+    sb_puts(&b, "}");
+    // 翻译器调试模式开关同 kindCheck 的走法：调试门 + debug.s2a.xlate_debug 判一次、随请求 JSON 带给编译器
+    // （消费端 DirectShaderCompiler.cs JsonStrict.OptionalBool 缺省 false，离线/CLI 不带键也合法）。
+    // 这里恒显式写（缺省也写 false）：sha256 覆盖整个请求 JSON（s2a_compile_request_execute），
+    // 不带键的请求与「编译器 DebugMode 恒开」时期的请求逐字节相同 → 老设备会命中旧的膨胀产物缓存；
+    // 显式写 false 让翻译旗口径落进身份，旧缓存条目 miss、修后产物占新槽。
+    // 写在 JSON 尾部：sourceParserVersion→kindCheck→profile 的既有顺序契约不动。
+    sb_puts(&b, ",");
+    sb_json_string(&b, "debugMode");
+    sb_puts(&b, s2a_direct_xlate_debug_enabled() ? ":true" : ":false");
+    sb_puts(&b, "}");
 
     if (b.oom) { free(b.p); return -1; }
     *json = b.p;

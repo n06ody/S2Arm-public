@@ -153,7 +153,7 @@ def update_hints(c):
     return dict(games=games)
 
 
-SIGN_LIFETIME = dict(free=7 * 86400, paid=365 * 86400)   # 按苹果规则估：免费账号描述文件 7 天、付费 / 证书一年（手机上 App 自己读描述文件给准数）
+SIGN_LIFETIME = dict(free=7 * 86400, paid=365 * 86400)   # 读不到真实到期时按苹果规则估：免费账号描述文件 7 天、付费 / 证书一年（手机上 App 自己读描述文件给准数）
 
 
 def _game_hint(c, gid, rid, want):
@@ -261,6 +261,9 @@ def phone_overview(c):
         signed = rec.get("signed") or {}
         at = signed.get("at") if isinstance(signed.get("at"), (int, float)) else None
         free = bool(signed.get("free", True))
+        # 到期：装机时从签好的包里读到的真实值（signed.expires，#1772）；没有（旧记录、Xcode 钥匙串签的）才按苹果规则估
+        known = isinstance(signed.get("expires"), (int, float))
+        until = signed["expires"] if known else (at + SIGN_LIFETIME["free" if free else "paid"]) if at else None
         recs = {str(g).upper(): v for g, v in (rec.get("games") or {}).items() if isinstance(v, dict)}
         games = []
         for g in library:
@@ -297,8 +300,7 @@ def phone_overview(c):
                      installedBy=who if who in ("launcher", "external") else None, bundleId=ext if external else rec.get("bundleId") or "",
                      shellCurrent=None if external else bool(sid) and rec.get("shellId") == sid, signedAt=at, free=free,
                      signMode="external" if external else _sign_mode(c, rec, signed),
-                     expiresAtEstimate=(at + SIGN_LIFETIME["free" if free else "paid"]) if at else None,
-                     remainingDays=max(0, math.ceil((at + SIGN_LIFETIME["free" if free else "paid"] - time.time()) / 86400)) if at else None,
+                     expiresAtEstimate=until, remainingDays=max(0, math.ceil((until - time.time()) / 86400)) if until else None, expiresKnown=known,
                      lastSeen=rec.get("at") if isinstance(rec.get("at"), (int, float)) else None, canSign=_can_sign(rec), games=games)
         if external:   # 别的工具装的：给它自己的一套按钮，不出「安装 S2Arm」（会新建证书、顶掉玩家 AltStore 的证书）
             phone["actions"] = list(EXTERNAL_PHONE_ACTIONS)

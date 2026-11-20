@@ -94,7 +94,8 @@ int nvn_be_shutdown_session(void) {
     // texture/program owners, then no-copy memory-pool buffers.
     for (int i = 0; i < g_ntreg; i++) {
         treg_t *t = &g_treg[i];
-        if (t->view) CFRelease(t->view); if (t->alt) CFRelease(t->alt);
+        if (t->view) CFRelease(t->view);
+        if (t->alt) { if (t->alt_copy) res_remove((__bridge id)t->alt); CFRelease(t->alt); }   // alt_copy: a 3D copy of its own (tex3d_prepare, #674), in the residency set
         if (t->ar) CFRelease(t->ar); if (t->im) CFRelease(t->im);
     }
     free(g_treg); g_treg = NULL; g_ntreg = g_tpool_n = 0;
