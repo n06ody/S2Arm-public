@@ -275,6 +275,25 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
         { struct s2a_jv info = { NULL, 0 }, om = { NULL, 0 }; uint32_t om_v = 0;
           if (!s2a_jv_obj_find(st, "info", &info) && s2a_jv_is_object(info) && !s2a_jv_obj_find(info, "fragmentOutputMap", &om) && !s2a_jv_u32(om, &om_v))
               out->stage[idx].fragment_output_map = om_v; }
+        // 栅格事实（可选）：缺段 / 缺字段 = 保守值（pos_attr -1、may_discard / writes_smask 1）；
+        // 写了但形状不对如实拒——字段在就不是未知，错的就是错的。
+        out->stage[idx].pos_attr = -1; out->stage[idx].pos_w1 = 0; out->stage[idx].pos_z_half = 0;
+        out->stage[idx].may_discard = 1; out->stage[idx].writes_smask = 1;
+        { struct s2a_jv ras = { NULL, 0 }, v = { NULL, 0 }; int bv = 0;
+          if (!s2a_jv_obj_find(st, "raster", &ras) && s2a_jv_is_object(ras)) {
+              if (!s2a_jv_obj_find(ras, "pos_attr", &v)) {   // -1..15：jv 没有有符号解析，跨度原文 strtol
+                  char nb[8]; long av; char *ep = NULL;
+                  if (v.n >= sizeof nb) return fail(why, why_size, "raster pos_attr is invalid");
+                  memcpy(nb, v.p, v.n); nb[v.n] = 0;
+                  av = strtol(nb, &ep, 10);
+                  if (ep != nb + v.n || av < -1 || av > 15) return fail(why, why_size, "raster pos_attr out of range");
+                  out->stage[idx].pos_attr = (int32_t)av;
+              }
+              if (!s2a_jv_obj_find(ras, "pos_w1", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].pos_w1 = (uint8_t)!!bv;
+              if (!s2a_jv_obj_find(ras, "pos_z_half", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].pos_z_half = (uint8_t)!!bv;
+              if (!s2a_jv_obj_find(ras, "may_discard", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].may_discard = (uint8_t)!!bv;
+              if (!s2a_jv_obj_find(ras, "writes_smask", &v) && !s2a_jv_bool(v, &bv)) out->stage[idx].writes_smask = (uint8_t)!!bv;
+          } }
     }
 
     struct s2a_jv bindings;

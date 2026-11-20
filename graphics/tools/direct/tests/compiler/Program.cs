@@ -650,7 +650,7 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0, bool depthMode = false)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -696,7 +696,7 @@ internal static unsafe class Program
                 w.WriteBoolean("alphaToCoverageEnable", false);
                 w.WriteBoolean("alphaToCoverageDitherEnable", false);
                 w.WriteBoolean("viewportTransformDisable", false);
-                w.WriteBoolean("depthMode", false);
+                w.WriteBoolean("depthMode", depthMode);
                 w.WriteBoolean("programPointSizeEnable", false);
                 w.WriteNumber("pointSize", 1);
                 w.WriteString("alphaTestCompare", "Always");
@@ -740,6 +740,34 @@ internal static unsafe class Program
             w.WriteEndObject();
         }
         return stream.ToArray();
+    }
+
+    // 极简 SPIR-V 拼装器：每条指令 = opcode + 操作数字，只够喂 DirectRasterFacts.Analyze 的单元用例。
+    private static uint[] A(params uint[] words) => words;
+    private static uint[] I(uint op, params uint[][] parts)
+    {
+        var r = new List<uint> { op };
+        foreach (uint[] p in parts) r.AddRange(p);
+        return r.ToArray();
+    }
+    private static uint[] SpvStr(string s)
+    {
+        byte[] b = Encoding.ASCII.GetBytes(s + "\0");
+        var r = new uint[(b.Length + 3) / 4];
+        for (int i = 0; i < b.Length; i++) r[i / 4] |= (uint)b[i] << ((i % 4) * 8);
+        return r;
+    }
+    private static byte[] Spv(params uint[][] insts)
+    {
+        var words = new List<uint> { 0x07230203, 0x00010000, 0, 128, 0 };
+        foreach (uint[] inst in insts)
+        {
+            words.Add((uint)(inst.Length << 16) | inst[0]);
+            words.AddRange(inst.Skip(1));
+        }
+        var bytes = new byte[words.Count * 4];
+        for (int i = 0; i < words.Count; i++) BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(i * 4), words[i]);
+        return bytes;
     }
 
     private static void WriteStage(Utf8JsonWriter w, string stage, byte[] code, uint cbUse, byte[] control = null)
@@ -828,6 +856,142 @@ internal static unsafe class Program
             }
             Check(ops.Contains(79) && ops.Contains(80) && !ops.Contains(37) && !ops.Contains(40),
                   "real compile: FMNMX emits GLSL NMin / NMax, no FMin / FMax (GLSL ops " + string.Join(",", ops) + ")");
+        }
+
+        // 光栅事实（raster 段）：live-compile 的最终 SPIR-V 上 SSA 溯源证出的保守事实，
+        // 字段名/摆放与 android 侧 nvn_vk_program_result.c 的 stage "raster" 解析器一一对应。
+        {
+            byte[] fsFlat = Guest(true, new[] { Fadd32i(0, 1.0f), Fadd32i(1, 0.0f), Fadd32i(2, 0.0f), Fadd32i(3, 1.0f) });
+            // 正例：attr0 四分量直通到 out position，无深度尾巴 → pos_attr=0、w 取属性 .w、无 z-half。
+            using (JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "raster-pos",
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), fsFlat))))
+            {
+                var stages = doc.RootElement.GetProperty("content").GetProperty("stages");
+                bool hasRv = stages[0].TryGetProperty("raster", out var rv);
+                bool hasRf = stages[1].TryGetProperty("raster", out var rf);
+                Check(hasRv && rv.GetProperty("pos_attr").GetInt32() == 0, "raster: position passthrough proves pos_attr 0");
+                Check(hasRv && !rv.GetProperty("pos_w1").GetBoolean(), "raster: w comes from the attribute, not constant 1");
+                Check(hasRv && !rv.GetProperty("pos_z_half").GetBoolean(), "raster: no depth tail, no z-half fact");
+                Check(hasRf && !rf.GetProperty("may_discard").GetBoolean(), "raster: kill-free fs proves may_discard false");
+                Check(hasRf && !rf.GetProperty("writes_smask").GetBoolean(), "raster: no SampleMask output proves writes_smask false");
+            }
+            // depthMode=true：翻译器追加的无条件 z=fma(z,0.5,w*0.5) 尾巴 → pos_z_half=1，
+            // pos_attr 仍指改写源的属性 0（回放侧 rp_draw.c 先读属性再对 P.z 重做同一变换）。
+            using (JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "raster-zhalf",
+                Guest(false, new[] { Ald4(0), Ast4Pos(0) }), fsFlat, depthMode: true))))
+            {
+                var stages = doc.RootElement.GetProperty("content").GetProperty("stages");
+                bool hasRv = stages[0].TryGetProperty("raster", out var rv);
+                Check(hasRv && rv.GetProperty("pos_attr").GetInt32() == 0, "raster: depth tail keeps pos_attr 0 (rewritten source)");
+                Check(hasRv && rv.GetProperty("pos_z_half").GetBoolean(), "raster: unconditional depth tail proves pos_z_half");
+            }
+            // 单元夹具：对拼出来的模块直接跑分析器（直挂 BuiltIn Position、运行时 OpSelect 尾巴、
+            // OpKill、BuiltIn SampleMask——这些形状现有夹具产不出）。
+            var posHead = new List<uint[]>
+            {
+                I(14, A(0, 1)),                                   // OpMemoryModel Logical GLSL450
+                I(15, A(0, 8), SpvStr("main"), A(9, 10)),          // OpEntryPoint Vertex %main %pos %attr
+                I(71, A(9, 11, 0)),                                // OpDecorate %pos BuiltIn Position
+                I(71, A(10, 30, 0)),                               // OpDecorate %attr Location 0
+                I(19, A(2)), I(33, A(3, 2)), I(22, A(4, 32)),      // void / fn / f32
+                I(23, A(5, 4, 4)),                                 // vec4 f32
+                I(32, A(6, 3, 5)), I(32, A(7, 1, 5)),              // ptr Output vec4 / ptr Input vec4
+                I(43, A(4, 31, 0x3F800000)), I(43, A(4, 32, 0x3F000000)),  // f32 1.0 / 0.5
+                I(59, A(6, 9, 3)), I(59, A(7, 10, 1)),             // %pos out / %attr in
+                I(54, A(2, 8, 0, 3)), I(248, A(12)),               // function + label
+            };
+            uint[][] tail = { I(253), I(56) };                     // return / function end
+            // 整向量 attr 直通
+            var r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)), I(62, A(9, 13))
+            }).Concat(tail).ToArray()));
+            Check(r.HasVertex && r.PosAttr == 0 && !r.PosW1 && !r.PosZHalf,
+                  "raster unit: whole-vector attr passthrough proves pos_attr 0");
+            // construct(x, y, z, 1.0)：w 常量 1 → pos_w1=1
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 16, 13, 2)),
+                I(80, A(5, 17, 14, 15, 16, 31)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == 0 && r.PosW1, "raster unit: constant w=1.0 proves pos_w1");
+            // 编译期 z-half：z' = z*0.5 + w*0.5（两步 FMul+FAdd）→ z_half=1 且 pos_attr 指向改写源 0
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 16, 13, 2)), I(81, A(4, 18, 13, 3)),
+                I(133, A(4, 19, 16, 32)), I(133, A(4, 20, 18, 32)), I(129, A(4, 21, 19, 20)),
+                I(80, A(5, 17, 14, 15, 21, 18)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == 0 && r.PosZHalf, "raster unit: FMul/FAdd z-half shape proves pos_z_half");
+            // FMA 形态：ext inst GLSL.std.450 #50 → 同样证出
+            r = DirectRasterFacts.Analyze(Spv(new[]
+            {
+                I(14, A(0, 1)), I(11, A(1), SpvStr("GLSL.std.450")),
+                I(15, A(0, 8), SpvStr("main"), A(9, 10)),
+                I(71, A(9, 11, 0)), I(71, A(10, 30, 0)),
+                I(19, A(2)), I(33, A(3, 2)), I(22, A(4, 32)), I(23, A(5, 4, 4)),
+                I(32, A(6, 3, 5)), I(32, A(7, 1, 5)),
+                I(43, A(4, 32, 0x3F000000)),
+                I(59, A(6, 9, 3)), I(59, A(7, 10, 1)),
+                I(54, A(2, 8, 0, 3)), I(248, A(12)),
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 16, 13, 2)), I(81, A(4, 18, 13, 3)),
+                I(133, A(4, 20, 18, 32)), I(12, A(4, 21, 1, 50, 16, 32, 20)),
+                I(80, A(5, 17, 14, 15, 21, 18)), I(62, A(9, 17))
+            }.Concat(tail).ToArray()));
+            Check(r.PosAttr == 0 && r.PosZHalf, "raster unit: GLSL Fma z-half shape proves pos_z_half");
+            // 负例：z 走 OpSelect（运行时深度尾巴的形态）→ z 证不出，pos_attr=-1、z_half=0
+            r = DirectRasterFacts.Analyze(Spv(new[]
+            {
+                I(14, A(0, 1)), I(15, A(0, 8), SpvStr("main"), A(9, 10)),
+                I(71, A(9, 11, 0)), I(71, A(10, 30, 0)),
+                I(19, A(2)), I(33, A(3, 2)), I(22, A(4, 32)), I(23, A(5, 4, 4)),
+                I(32, A(6, 3, 5)), I(32, A(7, 1, 5)),
+                I(20, A(40)), I(41, A(40, 41)),                     // bool + const true
+                I(59, A(6, 9, 3)), I(59, A(7, 10, 1)),
+                I(54, A(2, 8, 0, 3)), I(248, A(12)),
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 16, 13, 2)), I(81, A(4, 18, 13, 3)),
+                I(169, A(4, 19, 41, 16, 18)),                       // z = select(cond, z, w)
+                I(80, A(5, 17, 14, 15, 19, 18)), I(62, A(9, 17))
+            }.Concat(tail).ToArray()));
+            Check(r.HasVertex && r.PosAttr == -1 && !r.PosZHalf,
+                  "raster unit: OpSelect z is unprovable (pos_attr -1, z_half 0)");
+            // 负例：z = x + y（非 z-half 形状）→ -1 / 0
+            r = DirectRasterFacts.Analyze(Spv(posHead.Concat(new[]
+            {
+                I(61, A(5, 13, 10)),
+                I(81, A(4, 14, 13, 0)), I(81, A(4, 15, 13, 1)), I(81, A(4, 18, 13, 3)),
+                I(129, A(4, 19, 14, 15)),
+                I(80, A(5, 17, 14, 15, 19, 18)), I(62, A(9, 17))
+            }).Concat(tail).ToArray()));
+            Check(r.PosAttr == -1 && !r.PosZHalf, "raster unit: plain FAdd z is unprovable");
+            // FS：OpKill → may_discard=1；写 BuiltIn SampleMask 输出 → writes_smask=1
+            var fsHead = new List<uint[]>
+            {
+                I(14, A(0, 1)), I(15, A(4, 8), SpvStr("main"), A(45)),
+                I(71, A(45, 11, 20)),                                // %sm BuiltIn SampleMask(20)
+                I(19, A(2)), I(33, A(3, 2)), I(21, A(42, 32, 1)),    // void / fn / i32
+                I(32, A(43, 3, 42)),                                 // ptr Output i32
+                I(43, A(42, 44, 0)),                                 // i32 const 0
+                I(59, A(43, 45, 3)),                                 // %sm out
+                I(54, A(2, 8, 0, 3)), I(248, A(12)),
+            };
+            r = DirectRasterFacts.Analyze(Spv(fsHead.Concat(new[]
+            {
+                I(62, A(45, 44)), I(252)
+            }).Concat(tail).ToArray()));
+            Check(r.HasFragment && r.MayDiscard && r.WritesSampleMask,
+                  "raster unit: OpKill and SampleMask store prove both flags");
+            r = DirectRasterFacts.Analyze(Spv(fsHead.Concat(new[] { I(253) }).Concat(tail).ToArray()));
+            Check(!r.MayDiscard && !r.WritesSampleMask,
+                  "raster unit: kill-free mask-free fs proves both false");
+            // 截断模块 → 全保守（may_discard / writes_smask 只能保守真）。
+            r = DirectRasterFacts.Analyze(new byte[] { 0x03, 0x02, 0x23, 0x07 });
+            Check(!r.HasVertex && r.PosAttr == -1 && r.MayDiscard && r.WritesSampleMask,
+                  "raster unit: truncated module falls back to conservative defaults");
         }
 
         if (args.Length == 1 && args[0] == "--legacy-artifact")
