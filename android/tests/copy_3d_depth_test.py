@@ -51,6 +51,7 @@ static int buf_range(struct nvn_gpu_buf_s *b, uint64_t off, uint64_t n) { return
 static void full_barrier(struct nvn_gpu_cmd_s *c) { (void)c; }
 static void image_barrier(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, int l) { (void)c; (void)t; (void)l; }
 static void cmd_ref(struct nvn_gpu_cmd_s *c, void *p, int type) { (void)c; (void)p; (void)type; }
+static void seg_mark_write(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t) { (void)c; (void)t; }   /* 按需重建的段写标记：边界夹具不测 */
 VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b, VkImage i, VkImageLayout layout, uint32_t n, const VkBufferImageCopy *r) { (void)cb; (void)b; (void)i; (void)layout; (void)n; copies++; last=*r; }
 VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage i, VkImageLayout layout, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) { (void)cb; (void)i; (void)layout; (void)b; (void)n; copies++; last=*r; }
 '''

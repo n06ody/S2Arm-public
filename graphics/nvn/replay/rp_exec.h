@@ -52,7 +52,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
 void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec);
 void rp_pass_barrier(uint32_t bits);
 uint32_t rp_pass_take_barrier(void);   // 通道外的计算派发前调：取走待发的游戏屏障位（取完清零），由调用方交给后端
-void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask);   // 有效颜色写掩码（含片元输出映射）与像素区域；附件集合变了或区域超出时重开
+void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask, uint32_t cover, int fd_bucket);   // 有效颜色写掩码（含片元输出映射）、像素区域、首笔全画掩码与这笔命中的判据桶（-1=没判）；附件集合变了或区域超出时重开
 int rp_pass_begin(nvn_gpu_cmd c);     // 绘制前调：1 = 通道开着；0 = 开不了（已记账），跳过这笔
 // 被读之前必须落地（rp_pass.c）：ts 里这些贴图要以「采样贴图 / 图像 / 拷贝端点 / 上屏」身份被用到之前先调一次，
 // 把还挂着它们的待折清除落地（挂起见 rp_pass.c 的 park）。按贴图序号匹配：读的是整张图，级 / 层不参与匹配。
@@ -63,6 +63,18 @@ void rp_pass_flush(nvn_gpu_cmd c);    // 提交前 / 通道外操作前：落地
 void rp_pass_reset(void);
 int rp_pass_is_open(void);
 const p_set_rt *rp_pass_target(void); // 当前目标（没设过 NULL）
+
+// ---------- 存储前瞻索引（rp_sdx.c）----------
+void rp_sdx_seq(const uint8_t *p);      // 回放每条命令开头打：序号对上索引才有效，对不上作废
+void rp_sdx_invalidate(void);           // 回放真跳过命令（条件渲染）：索引作废
+void rp_sdx_reset(void);                // 会话收尾：索引作废、计数归零
+uint32_t rp_sdx_cur(void);              // 正在回放的那条的序号（0xffffffff = 还没开始）
+int rp_sdx_decide(uint64_t ser, int lv, int sl, int plane, uint32_t rt0seq);   // 单附件：2 = 冗余可 DONTCARE；其他 why<<2 要存
+int rp_sdx_on(void);                    // 存储前瞻生效否（nvk_sdx × NVN_GPU_CAP_TILE_MEMORY，锁存）
+int rp_fd_on(void);                     // 首笔全画跳载入生效否（nvk_fd × NVN_GPU_CAP_TILE_MEMORY，锁存）
+int rp_sdx_diag(char *b, size_t n);     // 前瞻逐条件计数格式化（带走清零，全零不写）→ 已写字节
+int rp_fd_diag(char *b, size_t n);      // 全画逐条件计数同上
+void rp_pass_rtseq_reset(void);           // 提交开头：目标序号归零（序号按提交重数，上次的旧值会把这次的事件全吞掉）
 
 // ---------- 上屏（rp_present.c）----------
 void rp_present_set_surface(nvn_gpu_surface s, int display_hz);   // 平台件：窗口挂上（s 非空）/ 摘下（NULL）
@@ -107,6 +119,11 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
+       RP_PERF_LAND_SAME_KB, RP_PERF_LAND_SKIP_KB,   // 落地免重搬（rp_buf.c land_verify）：落地后核过与镜像逐字节相同的整页 / 其中脏页日志路径因此清旧位、没再搬的
+       RP_PERF_SYNC_LANDED_KB, RP_PERF_SYNC_RESUB_KB,   // 同步分账（nvk_sync_acct，rp_buf.c）：同步的页里，上次同步后被落地碰过的 / 本次提交里已同步过又搬的（按整页计）
+       RP_PERF_SYNC_ORD_SUB_KB, RP_PERF_SYNC_ORD_FENCE_KB, RP_PERF_SYNC_ORD_LAND_KB, RP_PERF_SYNC_ORD_NOCPU_KB,   // 录成 GPU 拷贝的原因：本次提交已用过 / 上次用这份镜像的提交没做完 / 与正在落地的区间相交 / 镜像没有 CPU 映射
+       RP_PERF_SYNC_SAMP_N, RP_PERF_SYNC_SAMP_SAME_N, RP_PERF_SYNC_SAMP_LAND_N, RP_PERF_SYNC_SAMP_LAND_SAME_N,   // 抽样页：同步次数 / 内容与上次同步时相同 / 上次是整页落地 / 其中与落地时相同
+       RP_PERF_SYNC_RPW_KB, RP_PERF_SYNC_RESUB_RPW_KB, RP_PERF_SYNC_RESUB_LANDING_KB,   // 同步的页里上次同步后回放自写过的 / 同提交重搬里回放自写引起的 / 与落地中区间相交的（其余 = 别的线程写）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
@@ -115,6 +132,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_TEX_UNARMED,    // CPU 贴图上传时有页加保护没落地（被并发的解保护挡住）：这次上传不算同步，下一次必重传
        RP_PERF_TEX_EPOCH_MISS, RP_PERF_TEX_CHECK_PAGES,   // CPU 贴图内容检查：本可按纪元跳过却没跳成的次数（已传过、没待重传、有跟踪句柄，但全局写代号 / 段号 / 映射代际变了）；逐页比对写代号的页数（每次调 nvn_dirty_since 记整个范围的页数，是上限：遇到脏页会提前停）
        RP_PERF_BINST_HZ, RP_PERF_BINST_ONE, RP_PERF_BINST_CUT, RP_PERF_BINST_SCAN, RP_PERF_BINST_WASTE,   // 间接绘制 base instance 拷贝：批量前移供上的笔数 / 逐笔拷的笔数 / 其中为它收了开着的通道 / 前移扫描次数 / 前移了没用上的笔数（rp_draw.c 通道级批量拷）
+       RP_PERF_P_SDXDC, RP_PERF_P_FDDC,   // 存储前瞻判出「之后没人用」跳写回的附件数；首笔全画判出「整张贴满」跳载入的附件数（rp_sdx.c / rp_draw.c fd_*）
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
