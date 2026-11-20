@@ -2055,6 +2055,15 @@ static void t_sync_acct(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
     printf("sync acct same submit: resub=%llu ord_sub=%llu KB expected %llu/%llu\n", (unsigned long long)pf[RP_PERF_SYNC_RESUB_KB], (unsigned long long)pf[RP_PERF_SYNC_ORD_SUB_KB], (unsigned long long)kb, (unsigned long long)kb);
     CHECK(pf[RP_PERF_SYNC_RESUB_KB] == kb && pf[RP_PERF_SYNC_ORD_SUB_KB] == kb && pf[RP_PERF_SYNC_ORD_FENCE_KB] == 0);
+    CHECK(pf[RP_PERF_SYNC_RESUB_RPW_KB] == 0 && pf[RP_PERF_SYNC_RESUB_LANDING_KB] == 0);   // 别的线程写的：不算回放自写 / 落地中
+    // 回放自己按序改了第 74 页（rp_write_note）再同步：同提交重搬记「回放自写」
+    { extern void rp_write_note(uint64_t, uint64_t);
+      nvn_be_sub_begin();
+      fake_log_write(74, 0x74); CHECK(rp_buf_resolve(&g_fake_cmd, base + 74 * PG, PG, &b, NULL) == 1);
+      rp_write_note(base + 74 * PG + 8, 16); fake_log_write(74, 0x75); CHECK(rp_buf_resolve(&g_fake_cmd, base + 74 * PG, PG, &b, NULL) == 1);
+      nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_perf_take(pf);
+      printf("sync acct replay write: resub=%llu rpw=%llu expected %llu/%llu\n", (unsigned long long)pf[RP_PERF_SYNC_RESUB_KB], (unsigned long long)pf[RP_PERF_SYNC_RESUB_RPW_KB], (unsigned long long)kb, (unsigned long long)kb);
+      CHECK(pf[RP_PERF_SYNC_RESUB_KB] == kb && pf[RP_PERF_SYNC_RESUB_RPW_KB] == kb && pf[RP_PERF_SYNC_RPW_KB] == kb); }
     // 上一次用这份镜像的提交还没做完：下一次提交第一次同步的页录成 GPU 拷贝，原因记「上次提交没做完」
     nvn_be_sub_begin(); fake_log_write(71, 0x72); CHECK(rp_buf_resolve(&g_fake_cmd, base + 71 * PG, PG, &b, NULL) == 1); nvn_be_sub_commit();
     nvn_be_sub_begin(); fake_log_write(72, 0x73); rp_perf_take(pf); CHECK(rp_buf_resolve(&g_fake_cmd, base + 72 * PG, PG, &b, NULL) == 1); nvn_be_sub_commit();

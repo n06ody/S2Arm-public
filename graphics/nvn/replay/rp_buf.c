@@ -50,7 +50,8 @@ struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t 
                 // 这些页若仍是落地 memcpy 自己弄出来的旧位（落地后加保护时的代号之后没有任何写），就清位不搬。
                 struct land_ok { uint64_t lo, hi, st; uint8_t mi; } lok[LAND_OK_N]; int nlok;
                 uint64_t *acct_landed;   // 同步分账（nvk_sync_acct）：每页一位 =「上次同步之后有显卡写回落地碰过这页」，第一次落地时才分配
-                uint64_t *acct_hash; uint8_t *acct_src; };   // 抽样页（页号 % ACCT_SAMPLE == 0）上次同步 / 整页落地时游戏内存的摘要；src 1 = 来自同步，2 = 来自整页落地
+                uint64_t *acct_hash; uint8_t *acct_src;
+                uint64_t *acct_rpw; };   // 同步分账：每页一位 =「上次同步之后回放自己按序改过这页」（rp_write_note），第一次记时才分配   // 抽样页（页号 % ACCT_SAMPLE == 0）上次同步 / 整页落地时游戏内存的摘要；src 1 = 来自同步，2 = 来自整页落地
 static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finish 与提交互斥）
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
@@ -87,7 +88,7 @@ static void mirror_free(struct mirror *m, int defer) {
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->acct_landed); free(s->acct_hash); free(s->acct_src); free(s); }
+                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->acct_landed); free(s->acct_hash); free(s->acct_src); free(s->acct_rpw); free(s); }
 
 // ---------- 同步分账（诊断，开关 nvk_sync_acct，缺省开；只计数，不改同步行为）----------
 // 回答「池镜像同步的字节里，多少是重复搬」：
@@ -135,16 +136,48 @@ static void acct_note_land(struct shadow *s, uint64_t off, uint64_t len) {
         s->acct_hash[k / ACCT_SAMPLE] = acct_digest(pp, n); s->acct_src[k / ACCT_SAMPLE] = 2;
     }
 }
+// 第 k 页此刻与正在锁外拷回的落地区间相交（同提交重搬的「落地中」来源）
+static int acct_page_landing(const struct shadow *s, uint64_t k) {
+    if (!s->landing) return 0;
+    if (s->landing > s->nlr) return 1;   // 正在拷的段多于登记的区间：说不清，按相交算
+    const size_t ps = nvn_dirty_page_size();
+    const uint64_t a = s->page0 + k * ps - (uintptr_t)s->mem, b = a + ps;
+    for (int i = 0; i < s->nlr; i++) if (s->lr[i].off < b && a < s->lr[i].off + s->lr[i].len) return 1;
+    return 0;
+}
+// 回放自己按序改了游戏内存 [addr, addr + n)（rp_write_note）：落在受跟踪池里的页记一位（不受跟踪的池另由 buf_invalidate_written 作废）
+static void acct_note_rpw(uint64_t addr, uint64_t n) {
+    const uint8_t *mem; uint64_t size;
+    if (!n || !acct_on() || !rp_pool_find(addr, n, &mem, &size)) return;
+    const uint64_t key = (uint64_t)(uintptr_t)mem;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &key);
+    if (s && !s->untracked && (s->acct_rpw || (s->acct_rpw = calloc((size_t)(s->npages / 64 + 1), sizeof *s->acct_rpw)))) {
+        const size_t ps = nvn_dirty_page_size();
+        const uint64_t p = ((uintptr_t)addr - s->page0) / ps, q = ((uintptr_t)addr + n - 1 - s->page0) / ps;
+        for (uint64_t k = p; k <= q && k < s->npages; k++) s->acct_rpw[k >> 6] |= 1ull << (k & 63);
+    }
+    pthread_mutex_unlock(&g_bmu);
+}
 // sync_run 记账：第 i..j 页（含）即将同步；why = 录成 GPU 拷贝的原因对应的计数项（直接写时为 -1）
 static void acct_sync(struct shadow *s, const struct mirror *m, uint64_t i, uint64_t j, int why) {
     const size_t ps = nvn_dirty_page_size(); const uint64_t kb = (uint64_t)ps / 1024, cur = rp_sub_serial();
-    uint64_t landed = 0, resub = 0;
+    uint64_t landed = 0, resub = 0, rpw = 0, resub_rpw = 0, resub_landing = 0;
     for (uint64_t k = i; k <= j; k++) {
         if (s->acct_landed && (s->acct_landed[k >> 6] >> (k & 63) & 1)) { landed++; s->acct_landed[k >> 6] &= ~(1ull << (k & 63)); }
-        if (m->synced[k] && m->sub[k] == cur) resub++;
+        const int w = s->acct_rpw && (s->acct_rpw[k >> 6] >> (k & 63) & 1);
+        if (w) { rpw++; s->acct_rpw[k >> 6] &= ~(1ull << (k & 63)); }
+        if (m->synced[k] && m->sub[k] == cur) {
+            resub++;
+            if (w) resub_rpw++;
+            else if (acct_page_landing(s, k)) resub_landing++;
+        }
     }
     if (landed) rp_perf_add(RP_PERF_SYNC_LANDED_KB, landed * kb);
     if (resub) rp_perf_add(RP_PERF_SYNC_RESUB_KB, resub * kb);
+    if (rpw) rp_perf_add(RP_PERF_SYNC_RPW_KB, rpw * kb);
+    if (resub_rpw) rp_perf_add(RP_PERF_SYNC_RESUB_RPW_KB, resub_rpw * kb);
+    if (resub_landing) rp_perf_add(RP_PERF_SYNC_RESUB_LANDING_KB, resub_landing * kb);
     if (why >= 0) rp_perf_add(why, (j - i + 1) * kb);
     if (!acct_alloc_samples(s)) return;
     for (uint64_t k = (i + ACCT_SAMPLE - 1) / ACCT_SAMPLE * ACCT_SAMPLE; k <= j; k += ACCT_SAMPLE) {
@@ -740,6 +773,7 @@ uint64_t rp_write_mark(void) { return g_wl_seq; }
 void rp_write_note(uint64_t a, uint64_t n) {
     g_wl[g_wl_put].seq = ++g_wl_seq; g_wl[g_wl_put].a = a; g_wl[g_wl_put].b = a + n; g_wl_put = (g_wl_put + 1) % WL_N;
     buf_invalidate_written(a, n);   // 不受写跟踪的池靠这条知道「回放自己改了哪几页」（受跟踪的池由写跟踪看到）
+    acct_note_rpw(a, n);   // 同步分账（探针）：同提交重搬里多少是回放自写引起的
 }
 // mark 之后有没有人写过和 [a, a+n) 重叠的区间。只顺着记号扫「mark 之后的那几条」——
 // 一帧要问 8000 次左右，扫满 128 条就是一百万次比较（实测这样做的缓存反而更慢）。

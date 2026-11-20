@@ -330,6 +330,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (double)pf[RP_PERF_SYNC_LANDED_KB] / f, (double)pf[RP_PERF_SYNC_RESUB_KB] / f, (double)pf[RP_PERF_SYNC_ORD_SUB_KB] / f, (double)pf[RP_PERF_SYNC_ORD_FENCE_KB] / f,
                              (double)pf[RP_PERF_SYNC_ORD_LAND_KB] / f, (double)pf[RP_PERF_SYNC_ORD_NOCPU_KB] / f, (double)pf[RP_PERF_SYNC_SAMP_N] / f, 100.0 * (double)pf[RP_PERF_SYNC_SAMP_SAME_N] / sn,
                              (double)pf[RP_PERF_SYNC_SAMP_LAND_N] / f, 100.0 * (double)pf[RP_PERF_SYNC_SAMP_LAND_SAME_N] / ln);
+                    const uint64_t rs = pf[RP_PERF_SYNC_RESUB_KB], rw = pf[RP_PERF_SYNC_RESUB_RPW_KB], rl = pf[RP_PERF_SYNC_RESUB_LANDING_KB];
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；同提交重搬来源：回放自写 %.0f KB、落地中 %.0f KB、其它线程 %.0f KB（全部同步里上次同步后回放自写过 %.0f KB）",
+                             (double)rw / f, (double)rl / f, (double)(rs > rw + rl ? rs - rw - rl : 0) / f, (double)pf[RP_PERF_SYNC_RPW_KB] / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
