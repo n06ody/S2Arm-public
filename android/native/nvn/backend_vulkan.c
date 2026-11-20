@@ -380,6 +380,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    int barrier_ceiling;  // 一次性不安全性能探测，0 关闭；会话内固定
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
@@ -2188,6 +2189,13 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.barrier_ceiling = nvn_plat_flag("nvk_barrier_ceiling", 0);
+    if (g.barrier_ceiling < 0 || g.barrier_ceiling > 2) {
+        nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", "barrier_ceiling 参数无效，使用 0");
+        g.barrier_ceiling = 0;
+    } else if (g.barrier_ceiling) {
+        nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", "barrier_ceiling 不安全探测已开启，画面和同步结果不可用于正确性验收");
+    }
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
         static int mt_on = -1; if (mt_on < 0) mt_on = nvn_plat_flag("nvk_mem_types", 0) != 0;
@@ -2646,8 +2654,9 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
     vkCmdPipelineBarrier(c->cb, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
-    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    if (g.barrier_ceiling != 2)
+        mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     c->xfer_dirty = 0;
 }
 
@@ -3224,6 +3233,41 @@ void nvn_gpu_shader_release(nvn_gpu_shader sh) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// 模板和实际通道用同一组依赖；探测档在设备会话内固定。
+static void pass_dependencies(VkSubpassDependency dep[2], const VkSubpassDescription *sp) {
+    memset(dep, 0, 2 * sizeof *dep);
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    if (!g.barrier_ceiling) return;
+
+    int has_color = 0;
+    for (uint32_t i = 0; i < sp->colorAttachmentCount; i++)
+        has_color |= sp->pColorAttachments[i].attachment != VK_ATTACHMENT_UNUSED;
+    const int has_depth = sp->pDepthStencilAttachment && sp->pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED;
+    VkPipelineStageFlags stages = (has_color ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : 0) |
+        (has_depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0);
+    VkAccessFlags writes = (has_color ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0) |
+        (has_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0);
+    VkAccessFlags reads = (has_color ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT : 0) |
+        (has_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT : 0);
+    if (!stages) stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    for (int i = 0; i < 2; i++) {
+        dep[i].srcStageMask = dep[i].dstStageMask = stages;
+        dep[i].srcAccessMask = writes;
+        dep[i].dstAccessMask = writes | reads;
+    }
+}
+
 static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     VkAttachmentDescription att[9];
     VkAttachmentReference col[8];
@@ -3277,19 +3321,7 @@ static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     sp.pColorAttachments = ncol ? col : NULL;
     sp.pDepthStencilAttachment = has_depth ? &dref : NULL;
     VkSubpassDependency dep[2];
-    memset(dep, 0, sizeof dep);
-    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep[0].dstSubpass = 0;
-    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[1].srcSubpass = 0;
-    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    pass_dependencies(dep, &sp);
     VkRenderPassCreateInfo rp;
     memset(&rp, 0, sizeof rp);
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -4636,19 +4668,7 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
     sp.pColorAttachments = ncol ? col : NULL;
     sp.pDepthStencilAttachment = *has_depth ? dref : NULL;
     VkSubpassDependency dep[2];
-    memset(dep, 0, sizeof dep);
-    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep[0].dstSubpass = 0;
-    dep[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
-    dep[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    dep[1].srcSubpass = 0;
-    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dep[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dep[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    pass_dependencies(dep, &sp);
     VkRenderPassCreateInfo rp;
     memset(&rp, 0, sizeof rp);
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
