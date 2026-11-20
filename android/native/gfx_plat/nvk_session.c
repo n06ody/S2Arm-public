@@ -1,5 +1,6 @@
 #include "nvk_session.h"
 #include "nvn_backend.h"
+#include "nvn_dirty.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "rp_exec.h"
@@ -94,9 +95,9 @@ int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why
     //   16 页       207 次、12 毫秒、37 毫秒，10.9 帧
     //   64 页       54 次、2 毫秒、34 毫秒，11.1 帧
     // 块越大一次缺页后要重传的字节越多，但一次缺页加两次改保护的代价抵得上拷两百多 KB。debug.s2a.nvk_chunk_pages 可改（0 = 逐页）。
-    { extern void nvn_dirty_set_chunk_pages(uint32_t); extern int nvn_dirty_log_configure(int); extern int nvn_plat_flag(const char *, int);
-      int cp = nvn_plat_flag("nvk_chunk_pages", 64);
+    { int cp = nvn_plat_flag("nvk_chunk_pages", 64);
       nvn_dirty_set_chunk_pages(cp > 0 ? (uint32_t)cp : 0); __android_log_print(ANDROID_LOG_INFO, TAG, "nvk session: 写跟踪保护分块 %d 页", cp);
+      nvn_dirty_set_mp_dedupe(nvn_plat_flag("nvk_mp_dedupe", 1));
       // 脏页追加日志（#1501 A②，缺省开，debug.s2a.nvk_buf_dirtylog=0 关）：必须在登记任何池之前配置；回放核心按同一开关决定用不用
       if (nvn_plat_flag("nvk_buf_dirtylog", 1) && !nvn_dirty_log_configure(1))
           __android_log_print(ANDROID_LOG_WARN, TAG, "【黄】脏页追加日志未启用：已有登记池或所需原子操作非无锁，继续逐页核对"); }
@@ -136,6 +137,9 @@ static void dump_unimpl(void) {
 //   C# 只在通用模式收局时转（AndroidGameRuntime.Cleanup），新回放层原先没有人转。放在后端关闭之后：在途段都完成了，
 //   最后一帧的 GPU 读数也已结出。弱引用：会话宿主夹具不链帧日志。开关关着 / 没记过帧时什么都不做。
 void nvn_vk_frame_log_dump(void) __attribute__((weak));
+// 逐帧时间探针的局末转储（nvn_ft_probe.c，debug.s2a.ft_probe，探针头）：同帧日志同一收尾点——
+//   在途段已清空、present 线程已停，此刻环里就是整局轨迹。开关关 / 没记过时它自己不做事。
+void s2a_ft_dump(void) __attribute__((weak));
 int nvk_session_close(void) {
     pthread_mutex_lock(&g_mu);
     if (!g_ready) { pthread_mutex_unlock(&g_mu); return 0; }
@@ -152,6 +156,7 @@ int nvk_session_close(void) {
     nvn_gpu_err err = {0};
     nvn_gpu_rc rc = nvn_gpu_close(2000000000ull, &err);
     if (nvn_vk_frame_log_dump) nvn_vk_frame_log_dump();
+    if (s2a_ft_dump) s2a_ft_dump();
     if (!nvn_gpu_ok(rc)) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk session: backend close %d: %s", rc.code, err.why);
         pthread_mutex_unlock(&g_mu);

@@ -130,9 +130,14 @@ static const char *lp_nvn_stage_name(unsigned nvn) {
 static const char *lp_v1_stage_name(const char *lib_stage) {
     return !strcmp(lib_stage, "ps") ? "fs" : lib_stage;   // v1 用 NVN 阶段名 fs；vs/gs/cs 同名
 }
-// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：0x20 区 0..31、0x168 区 128+
+// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：主表 0..31（字 8+2r）、与图像表同址的 32..39
+//   （字 72+2(r−32)，iOS nvn_mtl.m C2_IMG / tex_slot_h 同一区间）、分离贴图表 128..255（字 0x5A+2(r−128)）。
+//   其余号段（40..127、≥256）在 c2 里没有句柄字：返回 0 = 无映射（真实槽号从 8 起，0 不会被当成槽 0 写出）。
 static uint32_t lp_tex_slot_word(uint32_t reg) {
-    return reg < 32 ? 8 + reg * 2 : 0x5A + (reg - 128) * 2;
+    if (reg < 32) return 8 + reg * 2;
+    if (reg < 40) return 72 + (reg - 32) * 2;
+    if (reg >= 128 && reg < 256) return 0x5A + (reg - 128) * 2;
+    return 0;
 }
 static uint32_t lp_img_slot_word(uint32_t reg) {
     return 0x48 + reg * 2;   // IMG_BASE 0x120 / 4
@@ -284,7 +289,7 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         if (!strcmp(kind, "tex") || !strcmp(kind, "tbuf") || !strcmp(kind, "tex_pool")) {
             uint32_t reg = 0; int has_reg = !jf_u32(b, "reg", &reg);
             v1kind = "texture";
-            if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = 1; }
+            if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = slot != 0; }
             // 分离贴图（reg ≥ 128，c2 字 90 + 2k）：v1 只有贴图槽、没有分离采样器字段，消费端按「采样器取同字高位」取（同组合槽，
             //   也是立即句柄读这张表时的硬件语义）。只有这一条成立时才给槽：采样器半边缺（不采样：取尺寸 / texelFetch）或是
             //   samp_tex（Dsh.cs Reflect：句柄类型 0，采样器就是同一个字）。半边是 samp（分离采样器槽）/ samp_id / samp_ubo 时
@@ -331,11 +336,12 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         } else if (!strcmp(kind, "img") || !strcmp(kind, "img_ubo")) {
             uint32_t reg = 0;
             v1kind = "image";
-            if (!strcmp(kind, "img") && !jf_u32(b, "reg", &reg)) { slot = lp_img_slot_word(reg); has_slot = 1; }
+            if (!strcmp(kind, "img") && !jf_u32(b, "reg", &reg) && reg < 8) { slot = lp_img_slot_word(reg); has_slot = 1; }   // NVN 图像槽只有 0..7（c2 图像表字 72..86）
         } else if (!strcmp(kind, "cbuf")) {
             uint32_t reg = 0;
             if (jf_u32(b, "reg", &reg)) return lp_fail(why, why_size, "%s bindings[%u] cbuf without reg", lib_stage, i);
-            v1kind = "uniform"; slot = reg + 3; has_slot = 1;   // v1：驱动槽号，消费端 ubo_slot = slot-3
+            v1kind = "uniform";
+            if (reg < 16) { slot = reg + 3; has_slot = 1; }   // v1：驱动槽号，消费端 ubo_slot = slot-3；reg≥16 出 NVN 槽域
         } else if (!strcmp(kind, "c1")) {
             v1kind = "uniform"; slot = 1; has_slot = 1;   // 着色器自带常量段 c[1]：v1 槽 1（消费端 NVN_RB_C1）
         } else if (!strcmp(kind, "ubolen") || !strcmp(kind, "uvx") || !strcmp(kind, "lb") || !strcmp(kind, "sbsize")) {
@@ -356,13 +362,13 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             //   ubo_ptr reg = (off − 0x210)/16 → c0 + 0x210 + reg×16；sbuf_ubo reg = cb_slot − 3、off = cb_offset×4 → c(reg+3) + off
             uint32_t cb_slot = 0, cb_off = 0; int has_cb = 0;
             if (!strcmp(kind, "sbuf")) {
-                if (!jf_u32(b, "reg", &v)) { snprintf(provenance, sizeof provenance, ",\"nvnSlot\":%u", v); cb_off = 0x310 + v * 16; has_cb = 1; }
+                if (!jf_u32(b, "reg", &v) && v < 16) { snprintf(provenance, sizeof provenance, ",\"nvnSlot\":%u", v); cb_off = 0x310 + v * 16; has_cb = 1; }
             } else if (!strcmp(kind, "sbuf_ubo")) {
                 uint32_t off = 0;
-                if (!jf_u32(b, "reg", &v) && !jf_u32(b, "off", &off)) {
+                if (!jf_u32(b, "reg", &v) && !jf_u32(b, "off", &off) && v < 16) {
                     snprintf(provenance, sizeof provenance, ",\"uboSlot\":%u,\"uboOffset\":%u", v, off); cb_slot = v + 3; cb_off = off; has_cb = 1; }
             } else if (!strcmp(kind, "ubo_ptr")) {
-                if (!jf_u32(b, "reg", &v)) { snprintf(provenance, sizeof provenance, ",\"uboPtr\":%u", v); cb_off = 0x210 + v * 16; has_cb = 1; }
+                if (!jf_u32(b, "reg", &v) && v < 16) { snprintf(provenance, sizeof provenance, ",\"uboPtr\":%u", v); cb_off = 0x210 + v * 16; has_cb = 1; }
             }
             if (compute && has_cb) {
                 char pv[sizeof provenance]; memcpy(pv, provenance, sizeof pv);
@@ -388,6 +394,16 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             if (!strcmp(kind, "geometry")) { rw = 1; has_rw = 1; }
             else return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' missing rw", lib_stage, i, msl, kind);
         }
+        // 消费端映射不了来源的绑定不出库：没有 guest 槽、又没有消费端认的出处字段时，解析后 slot = -1，
+        //   图形按 binding_kind_*_slot_-1、计算按 guest slot 类如实拒收——拒收挪到出库这一步，语义相同、
+        //   原因写进 why，不把死绑定写进结果。认得的来源：guest 槽；uboHandle 句柄（TEXU/TBUFU）；
+        //   存储出处——图形只接 nvnSlot（layout_ent 只认 storage_kind 1），计算另接 uboPtr / uboSlot+uboOffset
+        //   （compute_storage 三种映射；图形消费端还没接，出的照样是死绑定）。
+        int mappable = has_slot || strstr(provenance, "\"uboHandle\"")
+            || strstr(provenance, "\"nvnSlot\"")
+            || (compute && (strstr(provenance, "\"uboPtr\"") || strstr(provenance, "\"uboSlot\"")));
+        if (!mappable)
+            return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' has no consumable guest source", lib_stage, i, msl, kind);
         jw_fmt(j, "%s{\"kind\":\"%s\",\"stage\":\"%s\",\"set\":0,\"binding\":%u", *sep ? "," : "", v1kind, v1_stage, binding);
         *sep = 1;
         if (compute) jw_str(j, ",\"count\":1");   // 计算合同必填；.spv 里每个成员是单个描述符（数组形的 tex_c2a 等无槽，解析器另拒）

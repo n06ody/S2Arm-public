@@ -85,6 +85,35 @@ public final class ImportReceiverTest {
         try { ImportReceiver.receive(new ByteArrayInputStream(stream("S2A-INPLACE 1 /a\n")), new ByteArrayOutputStream(), parent); }
         catch (IOException e) { err = e.getMessage(); }
         check(err.startsWith("in-place request where a transfer"), "transfer-only entry refuses in-place (" + err + ")");
+        // 存档直传只暂存原始包，存档服务完成恢复后才能回成功。
+        out = new ByteArrayOutputStream();
+        try {
+            req = ImportReceiver.receiveAny(new ByteArrayInputStream(stream(
+                "S2A-SAVE 1 0100000000ABCDEF 4\n", "test", "END\n")), out, parent);
+            check(req.dir.isFile() && Arrays.equals(Files.readAllBytes(req.dir.toPath()), "test".getBytes()),
+                "save archive bytes reach the application staging directory");
+            check("0100000000ABCDEF".equals(req.saveTitle), "save destination title passes through");
+            check(out.toString().equals("READY 1\n"), "transport does not report a successful restore");
+            Files.delete(req.dir.toPath());
+        } catch (IOException e) {
+            check(false, "save archive reaches the application staging directory (" + e.getMessage() + ")");
+        }
+        for (String[] bad : new String[][] {
+            {"S2A-SAVE 1 ../../bad 4\ntestEND\n", "save_header"},
+            {"S2A-SAVE 1 0100000000ABCDEF 99999999999\n", "save_size"},
+            {"S2A-SAVE 1 0100000000ABCDEF 4\nte", "save_truncated"},
+            {"S2A-SAVE 1 0100000000ABCDEF 4\ntestmoreEND\n", "save_trailing_data"}
+        }) {
+            out = new ByteArrayOutputStream();
+            err = "";
+            try { ImportReceiver.receiveAny(new ByteArrayInputStream(stream(bad[0])), out, parent); }
+            catch (IOException error) { err = error.getMessage(); }
+            check(err.equals(bad[1]) && out.toString().equals("READY 1\nERR " + bad[1] + "\n"),
+                "rejects bad save frame (" + bad[1] + ")");
+            try (var entries = Files.list(parent.toPath())) {
+                check(entries.noneMatch(p -> p.getFileName().toString().endsWith(".s2asave")), "failed save leaves no archive");
+            }
+        }
         GameInstall.deleteTree(parent);
         if (failures > 0) { System.err.println(failures + " / " + checks + " failed"); System.exit(1); }
         System.out.println("ImportReceiver: ok (" + checks + " checks)");

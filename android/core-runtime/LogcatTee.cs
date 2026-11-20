@@ -87,6 +87,8 @@ namespace S2A.Android.Aot
             return line.Contains("Android session failed", StringComparison.Ordinal);
         }
 
+        internal static void WriteError(string message) => AndroidLog(ErrorPriority, message);
+
         private static void AndroidLog(int priority, string message)
         {
             try

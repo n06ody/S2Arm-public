@@ -139,23 +139,32 @@ echo "NativeAOT probe: $out/jniLibs/arm64-v8a/libs2a_cs_probe.so"
 #   S2ARM_ANDROID_CS_SERVICES=static  a static library + build/android-cs/static/link.txt that
 #                                     CMake links into libs2arm_android.so (one library, as on iOS)
 # A process holds one NativeAOT runtime, so the static mode packages no other .NET library.
+publish_services() {
+    local log="$out/services-publish.log"
+    # Roslyn reports a source path with line/column. NativeAOT may only report a method name.
+    local warning='warning IL(2[0-9]{3}|3050):'
+    local source='[/\\]S2A\.Services[/\\]SaveTransfer[^/\\:]*\.cs(\([0-9,]+\))?:'
+    "$dotnet" publish "$cs_dir/aot/S2A.Android.Aot.csproj" -c Release -r linux-bionic-arm64 \
+        -p:S2AAndroidHost=true -p:PathMap="$pathmap" -v quiet -nologo "$@" 2>&1 | tee "$log" || return
+    if grep -E "$source .*$warning|$warning S2A\.Services\.SaveTransfer[.+]" "$log"; then
+        echo "【红】存档服务 NativeAOT 裁剪或动态代码告警，拒绝发布" >&2
+        return 1
+    elif [ "$?" -ne 1 ]; then
+        return 1
+    fi
+}
 rm -rf "$out/jniLibs/arm64-v8a/libs2a_cs.so" "$out/static"
 case ${S2ARM_ANDROID_CS_SERVICES:-0} in
 0) ;;
 1)
-    "$dotnet" publish "$cs_dir/aot/S2A.Android.Aot.csproj" -c Release -r linux-bionic-arm64 \
-        -p:S2AAndroidHost=true -p:PathMap="$pathmap" \
-        -o "$out/aot/publish" -v quiet -nologo
+    publish_services -o "$out/aot/publish"
     python3 "$cs_dir/nuget_verify.py" --assets "$cs_dir/aot/obj/project.assets.json"
     cp "$out/aot/publish/libs2a_cs.so" "$out/jniLibs/arm64-v8a/"
     echo "NativeAOT services: $out/jniLibs/arm64-v8a/libs2a_cs.so" ;;
 static)
     mkdir -p "$out/static"
-    "$dotnet" publish "$cs_dir/aot/S2A.Android.Aot.csproj" -c Release -r linux-bionic-arm64 \
-        -p:S2AAndroidHost=true -p:PathMap="$pathmap" \
-        -p:NativeLib=Static -p:S2ALinkInputs="$out/static/link.txt" \
-        -p:CppLibCreator="$ndk_bin/llvm-ar" \
-        -o "$out/static/publish" -v quiet -nologo || { echo "dotnet publish (static) failed" >&2; exit 1; }
+    publish_services -p:NativeLib=Static -p:S2ALinkInputs="$out/static/link.txt" \
+        -p:CppLibCreator="$ndk_bin/llvm-ar" -o "$out/static/publish" || { echo "dotnet publish (static) failed" >&2; exit 1; }
     python3 "$cs_dir/nuget_verify.py" --assets "$cs_dir/aot/obj/project.assets.json" || exit 1
     [ -s "$out/static/publish/libs2a_cs.a" ] || { echo "dotnet publish produced no/empty libs2a_cs.a" >&2; exit 1; }
     # CppLibCreator 必须指 NDK llvm-ar：macOS 上落到 BSD ar 会把 ELF 成员静默丢掉、产出空归档。

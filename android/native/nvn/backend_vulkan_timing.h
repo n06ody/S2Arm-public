@@ -57,6 +57,7 @@ static void wsi_timing_poll(struct wsi_timing *t, VkDevice dev, VkSwapchainKHR s
             if (at < t->start) { t->late++; continue; }
             if (t->nsamples == WSI_TIMING_CAP) { t->lost++; continue; }
             t->samples[t->nsamples++] = at;
+            if (s2a_ft_present_actual) s2a_ft_present_actual(id, at);   // 探针：按 presentID 回填 actual_present（同 CLOCK_MONOTONIC）
         }
         if (r == VK_SUCCESS) break;
         if (!n) { t->invalid++; break; }

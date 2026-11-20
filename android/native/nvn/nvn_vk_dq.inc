@@ -15,6 +15,10 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
+#ifdef __ANDROID__
+#include <unistd.h>
+#include "../adpf_hint.h"
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -51,6 +55,12 @@ static pthread_spinlock_t g_dq_pl;   // the producers' lock, from dq_rec_begin t
 static pthread_mutex_t g_dq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dq_cv, g_dq_dcv = PTHREAD_COND_INITIALIZER;   // g_dq_cv 在 vk_dq_init 里按单调时钟初始化（录制线程定时醒要用）；录制线程起来之前没有人睡在它上面，也没有人叫它
 static _Atomic int g_dq_on;   // 开关：dq_poll 在提交处改，各生产者线程读（relaxed：切换点之后的调用走新路径即可）
 #define DQ_ON() atomic_load_explicit(&g_dq_on, memory_order_relaxed)
+#ifdef __ANDROID__
+static _Atomic int32_t g_dq_rec_tid;
+int32_t s2a_adpf_recorder_tid(void) {
+    return DQ_ON() ? atomic_load_explicit(&g_dq_rec_tid, memory_order_relaxed) : 0;
+}
+#endif
 static uint64_t g_dq_recs, g_dq_drains, g_dq_direct;   // records queued, drains, calls made directly (unknown arguments); 诊断计数，各线程可能同时读写：一律 relaxed 原子访问
 static _Atomic uint32_t g_dq_cur_op;                   // 录制线程正在做 / 刚开始做的那条的 op（清空等超时的自报红里指出卡在哪一类调用）
 static pthread_t g_dq_rec_th;                          // 录制线程（读它的 CPU 时间用，见 nvn_vk_dbg_dq_thread_cpu_ns）
@@ -251,9 +261,15 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
 #endif
 #ifdef __linux__
     prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);   // 定时醒（nvk_dq_poll_us）别被默认 50 微秒的定时器松弛拖长；只作用于本线程
+#endif
+#ifdef __ANDROID__
+    atomic_store_explicit(&g_dq_rec_tid, gettid(), memory_order_relaxed);
 #endif
     uint64_t r = 0;
     for (;;) {
@@ -435,8 +451,20 @@ static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffe
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) { vk_dq_drain(); return vkEndCommandBuffer(cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb) { vk_dq_drain(); return vkAllocateCommandBuffers(d, ai, cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) { vk_dq_drain(); return vkResetCommandPool(d, p, f); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { vk_dq_drain(); dq_poll(); return vkQueueSubmit(q, n, si, f); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) { vk_dq_drain(); return vkQueuePresentKHR(q, pi); }
+// 逐帧时间探针的「真驱动调用」精确起止：包装里的 drain/poll 不计入——下面两个包装把内层
+//   vkQueueSubmit/vkQueuePresentKHR 的调用前后写进这对值，调用方（持 g_submit_mu，串行）紧接着读。
+static uint64_t g_ft_call_b, g_ft_call_e;
+static void dq_ft_call_span(uint64_t *b, uint64_t *e) { *b = g_ft_call_b; *e = g_ft_call_e; }
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    vk_dq_drain(); dq_poll();
+    g_ft_call_b = dq_now_ns(); VkResult r = vkQueueSubmit(q, n, si, f); g_ft_call_e = dq_now_ns();
+    return r;
+}
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    vk_dq_drain();
+    g_ft_call_b = dq_now_ns(); VkResult r = vkQueuePresentKHR(q, pi); g_ft_call_e = dq_now_ns();
+    return r;
+}
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) { vk_dq_drain(); return vkQueueWaitIdle(q); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) { vk_dq_drain(); return vkDeviceWaitIdle(d); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) { vk_dq_drain(); vkDestroyCommandPool(d, p, a); }

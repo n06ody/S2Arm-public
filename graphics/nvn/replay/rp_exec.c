@@ -103,6 +103,8 @@ static void fr_perf_project(int i, uint64_t v) {
 // 弱链接[replay]：nvn_vk_frame_log_fence_wait
 void nvn_vk_frame_log_fence_wait(uint64_t wait_ns) __attribute__((weak));
 static void fl_fence(uint64_t ns) { if (nvn_vk_frame_log_fence_wait) nvn_vk_frame_log_fence_wait(ns); }
+// 弱链接[replay]：s2a_adpf_exclude_gpu_wait
+void s2a_adpf_exclude_gpu_wait(uint64_t begin_ns, uint64_t end_ns) __attribute__((weak));
 void rp_perf_add(int i, uint64_t v) { pf_add(i, v); fr_perf_project(i, v); }   // 5 秒窗口 + 帧级分项（后者只在 nvk_hitch_log 打开时记）
 // GPU 忙时估算：每段完成时按完成顺序累计「显卡真正在跑」的区间（判 GPU 到底忙多久、是不是墙）。
 // busy += done_i - max(commit_i, done_{i-1})（第一段：done_0 - commit_0）。commit 在提交前取，done 在完成回调里取；
@@ -478,9 +480,12 @@ uint64_t nvn_be_finish_publish(void) {
 // 分开才知道每帧 27–38 毫秒的等围栏里各占多少——两条路的根治法不一样（见 nvn_be_finish_publish 的开关说明）。
 void nvn_be_finish_wait(uint64_t fence) {
     if (!fence) return;
+    const int blocking = s2a_adpf_exclude_gpu_wait && !rp_fence_done(fence);
     uint64_t t0 = now_ns();
     nvn_gpu_rc r = nvn_gpu_fence_wait(fence, 5000000000ull, NULL);
-    { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_FIN_N, 1); pf_add(RP_PERF_WAIT_FIN_NS, w); fl_fence(w); }
+    const uint64_t end = now_ns();
+    if (blocking && (nvn_gpu_ok(r) || r.code == NVN_GPU_E_TIMEOUT)) s2a_adpf_exclude_gpu_wait(t0, end);
+    { uint64_t w = end - t0; pf_add(RP_PERF_WAIT_FIN_N, 1); pf_add(RP_PERF_WAIT_FIN_NS, w); fl_fence(w); }
     (void)r;   // 时间线已失败时这里也等不到：失败本身已在 sub_done 报红，Finish 不因此卡游戏线程
 }
 
@@ -516,9 +521,13 @@ int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
             if (__atomic_load_n(&g_wait_effect_fence, __ATOMIC_ACQUIRE) > done) allow = 0;
             if (allow) { rp_buf_frame_flip(); uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); fl_fence(w); return 1; }
         } }
+    const uint64_t wait_begin = timeout_ns && s2a_adpf_exclude_gpu_wait ? now_ns() : 0;
     nvn_gpu_rc r = nvn_gpu_fence_wait(fence, timeout_ns, NULL);
     __atomic_store_n(&g_wrote_since_wait, 0, __ATOMIC_RELEASE);   // 真等过：显卡写的缓冲已经落地
-    { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); fl_fence(w); }
+    const uint64_t end = now_ns();
+    if (wait_begin && (nvn_gpu_ok(r) || r.code == NVN_GPU_E_TIMEOUT))
+        s2a_adpf_exclude_gpu_wait(wait_begin, end);
+    { uint64_t w = end - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); fl_fence(w); }
     // 时间线已失败：再等也不会完成。按「已结束」放行，让游戏线程不死等；失败本身已在 sub_done 报红
     return nvn_gpu_ok(r) || r.code == NVN_GPU_E_FAILED || r.code == NVN_GPU_E_DEVICE;
 }
