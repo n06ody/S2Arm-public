@@ -48,9 +48,12 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_flag_lv_cap_kb = -1, g_flag_lv_kbps = -1;   // 用例设：落地逐字节核对预算（nvk_land_verify_cap_kb / _kbps；-1 = 产品缺省）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
+    if (!strcmp(name, "nvk_land_verify_cap_kb")) return g_flag_lv_cap_kb < 0 ? dflt : g_flag_lv_cap_kb;
+    if (!strcmp(name, "nvk_land_verify_kbps")) return g_flag_lv_kbps < 0 ? dflt : g_flag_lv_kbps;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
@@ -2236,6 +2239,7 @@ static void t_buf_multi_tail(void) {
 // 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查。
 static uint64_t sync_bytes_now(void) { extern void rp_buf_stats(uint64_t *, uint64_t *); uint64_t b = 0, r = 0; rp_buf_stats(&b, &r); return b; }
 static void t_buf_dirtylog(void) {
+    extern void rp_buf_stats(uint64_t *, uint64_t *);
     extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
     extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
     extern void rp_buf_frame_flip(void);
@@ -2265,6 +2269,31 @@ static void t_buf_dirtylog(void) {
     nvn_be_sub_begin(); g_block_pages_examined = 0; sb0 = sync_bytes_now();
     CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
     CHECK(g_block_pages_examined == 0 && sync_bytes_now() - sb0 == PG);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // Adjacent stale pages in different bitmap words need a single rearm.
+    fake_log_write(63, 0x6a); fake_log_write(64, 0x7a);
+    g_log_unarmed[64] = 1;
+    nvn_be_sub_begin();
+    uint64_t runs_before, runs_after;
+    rp_buf_stats(&sb0, &runs_before);
+    int rearm_before = g_protects;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 63 * PG && g_prot_len == 2 * PG);
+    uint64_t bytes_after;
+    rp_buf_stats(&bytes_after, &runs_after);
+    CHECK(bytes_after - sb0 == 2 * PG && runs_after - runs_before == 2);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // The page on the second word stayed writable. Its next write lacks an
+    // event, so it must still be stale and the clean neighboring pages stay out.
+    memset(g_block_mem + 64 * PG, 0x7c, PG);
+    g_block_gen[64] = ++g_dirty_now;
+    g_log_unarmed[64] = 0;
+    nvn_be_sub_begin(); rearm_before = g_protects; sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 64 * PG && g_prot_len == PG);
+    CHECK(sync_bytes_now() - sb0 == PG);
     if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     // 写两页、只解析前一页：后一页的旧位留着，之后解析它照样同步
@@ -4025,8 +4054,12 @@ static void *pool_del_thread(void *p) {
     pthread_mutex_lock(&g_land_mu); g_destroy_done = 1; pthread_cond_broadcast(&g_land_cv); pthread_mutex_unlock(&g_land_mu);
     return NULL;
 }
+// 落地免重搬用例（t_land_noresync）：落地 memcpy 期间真实写跟踪会因缺页记事件、推页代号——替身在拷贝前补上；
+// g_land_touch >= 0：拷完、落地加保护之前，游戏又改了这一页的一个字节（页已可写，不缺页、不推代号，只有逐字节比能发现）。
+static int g_land_fault_on, g_land_touch = -1; static size_t g_land_fault_lo, g_land_fault_hi;
 void rp_test_land_copy(void *dst, const void *src, size_t len) {
-    if (!g_land_pause) { memcpy(dst, src, len); return; }
+    if (g_land_fault_on) { fake_log_event(g_land_fault_lo, g_land_fault_hi); for (size_t k = g_land_fault_lo; k <= g_land_fault_hi; k++) g_block_gen[k] = ++g_dirty_now; }
+    if (!g_land_pause) { memcpy(dst, src, len); if (g_land_touch >= 0) g_block_mem[(size_t)g_land_touch * PG + 5] ^= 0x5a; return; }
     size_t half = len / 2; memcpy(dst, src, half);
     pthread_mutex_lock(&g_land_mu); g_land_half = 1; pthread_cond_broadcast(&g_land_cv);
     while (!g_land_resume) pthread_cond_wait(&g_land_cv, &g_land_mu);
@@ -4170,6 +4203,185 @@ static void fake_complete_first(int n) {   // 只做完最早交的 n 段
     for (int i = 0; i < n && i < g_npend; i++) { nvn_gpu_done d = {0}; d.signal = g_pend[i].signal; d.status = NVN_GPU_DONE_OK; g_pend[i].fn(g_pend[i].user, &d); g_fdone = g_pend[i].signal; }
     int k = n < g_npend ? n : g_npend; memmove(&g_pend[0], &g_pend[k], (size_t)(g_npend - k) * sizeof g_pend[0]); g_npend -= k;
 }
+#ifdef S2A_GPU_LAND_TEST   // 用落地拷贝替身（rp_test_land_copy）造「落地 memcpy 期间的缺页事件」
+// 落地免重搬（rp_buf.c land_verify）：受写跟踪的池里，落地 memcpy 让页变脏 → 下次使用整页搬回镜像，而写它的那份镜像里本来就是这些字节。
+// 修前：落地后的第一次解析把整页覆盖的页再搬一次（每例 2 页）；修后不搬。负控：落地后真写了 / 拷完到加保护之间改过 / 只覆盖半页 /
+// 页没布防的必须照常搬；8E 路径（本提交已用过这页）与 9000 路径（上次用镜像的提交没做完）各测一遍。
+static int g_land_dirtylog = 1;   // 1 = 脏页日志路径；0 = 逐页代号路径（日志不可用时的退回）
+static void land_case_setup(void) {
+    nvn_be_shutdown_session(); nvn_unimpl_reset(); g_pg_tracked = 1; g_buf_cpu_auto = 1;
+    g_flag_buf_dirtylog = g_land_dirtylog; g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++; memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+    g_dirty_now = 100; g_nbw = 0; g_land_fault_on = 0; g_land_touch = -1;
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    memset(g_block_mem, 0x21, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
+    ++g_dirty_map; g_block_unreliable = 0;
+    nvn_be_pool_add(g_block_mem, BLOCK_TEST_PAGES * PG);
+}
+static void land_case_teardown(void) {
+    nvn_be_pool_del(g_block_mem); nvn_be_shutdown_session();
+    g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = g_dirtylog_dflt; g_log_fake_on = 0; g_land_fault_on = 0; g_land_touch = -1;
+}
+// 一例：显卡写 [first, first + npg) 页（off_in 字节偏移，用来造半页），落地；之后按 path（0 = 下一次提交、上次已做完；1 = 同一次提交里再用；
+// 2 = 上次用镜像的提交没做完）再解析整池，返回这一次搬了多少字节。after：落地后游戏真写一页（-1 = 不写）。
+static uint64_t land_case(size_t first, size_t npg, uint64_t off_in, int path, int after, int touch, int unarmed, uint8_t *mirror_ok) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    land_case_setup();
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG;
+    nvn_gpu_buf b = NULL;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);   // 整份同步一次
+    uint64_t key = 0, id = rp_buf_gpu_write_note(base + first * PG + off_in, npg * PG - off_in, &key);
+    CHECK(id && key == base);
+    nvn_be_sub_commit();
+    if (path == 2) { nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL) == 1); nvn_be_sub_commit(); fake_complete_first(1); }   // 后一段（用了镜像）没做完
+    else fake_complete(NVN_GPU_DONE_OK);
+    if (b && b->cpu) memset(b->cpu + first * PG + off_in, 0xd4, (size_t)(npg * PG - off_in));   // 显卡写进镜像
+    if (path == 1) { nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1); }   // 本提交先用过这段
+    if (unarmed) g_log_unarmed[first] = 1;
+    g_land_fault_on = 1; g_land_fault_lo = first; g_land_fault_hi = first + npg - 1; g_land_touch = touch;
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    g_land_fault_on = 0; g_land_touch = -1;
+    CHECK(g_block_mem[first * PG + off_in] == 0xd4);
+    if (after >= 0) fake_log_write((size_t)after, 0x6e);
+    if (path != 1) nvn_be_sub_begin();
+    const uint64_t sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    const uint64_t moved = sync_bytes_now() - sb0;
+    *mirror_ok = b && b->cpu && !memcmp(b->cpu + first * PG, g_block_mem + first * PG, npg * PG);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); fake_complete(NVN_GPU_DONE_OK);
+    land_case_teardown();
+    return moved;
+}
+// 显卡写还登记着（还在写 / 正在锁外拷回）时被解析到的旧页：整串都在显卡写区间里 → 不进同步（sync_write 本来拷 0 字节，修前照样记一笔、取一条传输命令）；
+// 半页在区间外 → 照常同步区间外的字节。path：0 = 上次已做完；2 = 上次用镜像的提交没做完（9000）；1 = 同一次提交里（8E）。
+static uint64_t g_gw_case_cuts;   // gw_pending_case 那一次解析里主段录了几次写镜像的传输（= 切了几次通道，rp_xfer_cmd 落主段时 rp_gpu_wr_gen 加一）
+static uint64_t gw_pending_case(uint64_t off_in, int path, int split, uint8_t *mirror_ok) {   // split：拆成首尾相接的两次显卡写登记
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    land_case_setup();
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG;
+    nvn_gpu_buf b = NULL;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+    uint64_t key = 0, id2 = 0, id;
+    if (split) { id = rp_buf_gpu_write_note(base + 192 * PG, PG / 2, &key); id2 = rp_buf_gpu_write_note(base + 192 * PG + PG / 2, 2 * PG - PG / 2, &key); CHECK(id2); }
+    else id = rp_buf_gpu_write_note(base + 192 * PG + off_in, 2 * PG - off_in, &key);
+    CHECK(id && key == base);
+    if (path != 1) { nvn_be_sub_commit(); if (path == 2) { nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL) == 1); nvn_be_sub_commit(); } else fake_complete(NVN_GPU_DONE_OK); nvn_be_sub_begin(); }
+    if (b && b->cpu) memset(b->cpu + 192 * PG + off_in, 0xd4, (size_t)(2 * PG - off_in));   // 显卡写进镜像
+    fake_log_event(192, 193); g_block_gen[192] = ++g_dirty_now; g_block_gen[193] = ++g_dirty_now;   // 这两页此刻是旧的（上一轮落地 / 游戏写）
+    g_block_mem[192 * PG + 1] = 0x7c;                                                                // 区间外的字节（半页时第 192 页前半）游戏改过
+    const uint64_t sb0 = sync_bytes_now(), wg0 = rp_gpu_wr_gen;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    const uint64_t moved = sync_bytes_now() - sb0;
+    g_gw_case_cuts = rp_gpu_wr_gen - wg0;
+    *mirror_ok = b && b->cpu && b->cpu[192 * PG + off_in] == 0xd4 && b->cpu[193 * PG] == 0xd4;          // 显卡写的字节没被游戏内存里的旧值盖掉
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); fake_complete(NVN_GPU_DONE_OK); fake_complete(NVN_GPU_DONE_OK);
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    if (id2) rp_buf_gpu_write_land(key, id2, 1);
+    land_case_teardown();
+    return moved;
+}
+// 逐字节核对的预算（land_verify_take）：不补（kbps = 0）、上限 4 KB 时 2 页的落地超预算 → 不核、照旧搬两页；上限 64 KB → 核过、不搬；
+// 预算内的一次扣掉后不再够下一次（同样 8 KB 上限连落两次：第一次免搬、第二次照搬）；会话收尾装满。
+static void t_land_verify_budget(void) {
+    uint8_t ok = 0; uint64_t moved;
+    g_flag_lv_kbps = 0;
+    g_flag_lv_cap_kb = 4;  moved = land_case(192, 2, 0, 0, -1, -1, 0, &ok);
+    printf("land verify budget 4KB: moved=%llu expected 8192\n", (unsigned long long)moved);
+    CHECK(moved == 2 * PG);                                         // 超预算：不核，照旧重搬
+    g_flag_lv_cap_kb = 64; moved = land_case(192, 2, 0, 0, -1, -1, 0, &ok);
+    CHECK(moved == 0 && ok);                                        // 预算内：核过，不搬（land_case 每例 shutdown_session → 装满）
+    g_flag_lv_cap_kb = 8;
+    {   extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+        extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+        land_case_setup();
+        const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG; nvn_gpu_buf b = NULL; uint64_t key = 0;
+        nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+        uint64_t id1 = rp_buf_gpu_write_note(base + 100 * PG, 2 * PG, &key), id2 = rp_buf_gpu_write_note(base + 200 * PG, 2 * PG, &key);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        if (b && b->cpu) { memset(b->cpu + 100 * PG, 0xa1, 2 * PG); memset(b->cpu + 200 * PG, 0xa2, 2 * PG); }
+        g_land_fault_on = 1; g_land_fault_lo = 100; g_land_fault_hi = 101; rp_buf_gpu_write_land(key, id1, 1);
+        g_land_fault_lo = 200; g_land_fault_hi = 201; rp_buf_gpu_write_land(key, id2, 1); g_land_fault_on = 0;
+        nvn_be_sub_begin(); const uint64_t sb0 = sync_bytes_now();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+        moved = sync_bytes_now() - sb0;
+        printf("land verify budget 8KB twice: moved=%llu expected 8192\n", (unsigned long long)moved);
+        CHECK(moved == 2 * PG);                                     // 第一次落地扣光 8 KB → 免搬；第二次不够 → 照搬那两页
+        if (b && b->cpu) CHECK(!memcmp(b->cpu + 100 * PG, g_block_mem + 100 * PG, 2 * PG) && b->cpu[200 * PG] == 0xa2);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        land_case_teardown();
+    }
+    g_flag_lv_cap_kb = g_flag_lv_kbps = -1;
+}
+// 与写跟踪去重（65c4aa804，相邻旧页跨位图字合并布防）同开：第 60–67 页是旧页、跨第 63 / 64 页的位图字边界，第 64–67 页整页在显卡写区间里。
+// 期望：整串只布防一次（子段沿用父段的代号，不重布防）、只传没被盖住的第 60–63 页、镜像里显卡写的第 64–67 页不被游戏内存里的旧值盖掉；
+// 落地之后游戏真写第 65 页，照样重搬那一页。
+static void t_land_gw_cross_word(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    land_case_setup();
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG; nvn_gpu_buf b = NULL; uint64_t key = 0;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+    uint64_t id = rp_buf_gpu_write_note(base + 64 * PG, 4 * PG, &key); CHECK(id && key == base);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    if (b && b->cpu) memset(b->cpu + 64 * PG, 0xd6, 4 * PG);                                     // 显卡写进镜像
+    fake_log_event(60, 67); for (size_t k = 60; k <= 67; k++) { g_block_gen[k] = ++g_dirty_now; g_block_mem[k * PG] = (uint8_t)(0x30 + k); }
+    nvn_be_sub_begin();
+    const uint64_t sb0 = sync_bytes_now(); const int p0 = g_protects;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    const uint64_t moved = sync_bytes_now() - sb0; const int prot = g_protects - p0;
+    printf("gw cross word: moved=%llu protects=%d expected %d/1\n", (unsigned long long)moved, prot, 4 * PG);
+    CHECK(moved == 4 * PG);                                                                          // 只传第 60–63 页
+    CHECK(prot == 1);                                                                                // 整串只布防一次
+    if (b && b->cpu) { CHECK(b->cpu[63 * PG] == (uint8_t)(0x30 + 63)); CHECK(b->cpu[64 * PG] == 0xd6 && b->cpu[67 * PG] == 0xd6); }   // 显卡写的字节没被盖
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_land_fault_on = 1; g_land_fault_lo = 64; g_land_fault_hi = 67; rp_buf_gpu_write_land(key, id, 1); g_land_fault_on = 0;
+    CHECK(g_block_mem[64 * PG] == 0xd6);
+    fake_log_write(65, 0x65);                                                                         // 落地之后游戏真写
+    nvn_be_sub_begin(); const uint64_t sb1 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    CHECK(sync_bytes_now() - sb1 == PG);                                                             // 只重搬第 65 页（第 64、66、67 页核过、免搬）
+    if (b && b->cpu) CHECK(b->cpu[65 * PG] == 0x65);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    land_case_teardown();
+}
+static void t_land_noresync(void) {
+    {   uint8_t ok = 0; uint64_t moved;
+        for (int dl = 1; dl >= 0; dl--) for (int path = 0; path < 3; path++) {
+            g_land_dirtylog = dl;
+            moved = gw_pending_case(0, path, 0, &ok);
+            printf("gw pending %s path%d: moved=%llu cuts=%llu expected 0/0\n", dl ? "log" : "plain", path, (unsigned long long)moved, (unsigned long long)g_gw_case_cuts);
+            CHECK(moved == 0 && ok);                                    // 整串在显卡写区间里：不进同步
+            CHECK(g_gw_case_cuts == 0);                                 // 9000 b2 回退的那一条：落地期间不在主段录 GPU 拷贝、不切通道（修前同一次提交里每次 +1）
+            moved = gw_pending_case(PG / 2, path, 0, &ok);
+            CHECK(moved == PG && ok);                                   // 负控：第 192 页前半在区间外 → 这一页照常同步（区间外的字节），显卡写的字节不被盖
+            moved = gw_pending_case(0, path, 1, &ok);
+            printf("gw pending %s path%d split: moved=%llu expected 0\n", dl ? "log" : "plain", path, (unsigned long long)moved);
+            CHECK(moved == 0 && ok);                                    // 两段首尾相接的显卡写合起来盖住：也不进同步
+        }
+        g_land_dirtylog = 1;
+    }
+    uint8_t ok = 0; uint64_t moved;
+    const char *paths[3] = {"next submit", "same submit (8E)", "fence open (9000)"};
+    for (int dl = 1; dl >= 0; dl--) for (int path = 0; path < 3; path++) {
+        g_land_dirtylog = dl;
+        moved = land_case(192, 2, 0, path, -1, -1, 0, &ok);
+        printf("land noresync %s %s: moved=%llu expected 0\n", dl ? "log" : "plain", paths[path], (unsigned long long)moved);
+        CHECK(moved == 0 && ok);                                        // 整页落地、之后没写：不再搬
+        moved = land_case(192, 2, 0, path, 193, -1, 0, &ok);
+        CHECK(moved == PG);                                             // 负控：落地后真写了第 193 页 → 只搬这一页
+        moved = land_case(192, 2, 0, path, -1, 192, 0, &ok);
+        printf("land noresync %s %s touched-before-protect: moved=%llu expected %d\n", dl ? "log" : "plain", paths[path], (unsigned long long)moved, PG);
+        CHECK(moved == PG);                                             // 负控：拷完到加保护之间改了第 192 页（不缺页）→ 逐字节比不同，照常搬
+        moved = land_case(192, 2, PG / 2, path, -1, -1, 0, &ok);
+        CHECK(moved == PG);                                             // 负控：第 192 页只覆盖半页 → 照常搬；第 193 页整页 → 不搬
+        moved = land_case(192, 2, 0, path, -1, -1, 1, &ok);
+        CHECK(moved == PG);                                             // 负控：第 192 页加保护没落地（不布防）→ 照常搬
+    }
+    g_land_dirtylog = 1;
+}
+#endif
+
 static void t_frame_overlap(void) {
     pass_fresh(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; g_nbw = 0; g_buf_cpu_fake = NULL;
     g_buf_cpu_auto = 1; g_flag_finish_lag = 1;
@@ -6201,6 +6413,9 @@ int main(int argc, char **argv) {
 #ifdef S2A_GPU_LAND_TEST
     t_gpu_land_concurrent();
     t_gpu_land_destroy();
+    t_land_noresync();
+    t_land_verify_budget();
+    t_land_gw_cross_word();
     t_gpu_land_count_cleanup();
 #endif
     t_pool_gone_hold();

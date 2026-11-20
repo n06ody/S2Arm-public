@@ -251,6 +251,9 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
 #endif
 #ifdef __linux__
     prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);   // 定时醒（nvk_dq_poll_us）别被默认 50 微秒的定时器松弛拖长；只作用于本线程

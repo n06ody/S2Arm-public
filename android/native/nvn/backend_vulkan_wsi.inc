@@ -424,6 +424,7 @@ static int wsi_compose_easu(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
 nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const nvn_gpu_present_desc *d, uint64_t ticket,
                            nvn_gpu_presented_fn presented, void *user, nvn_gpu_err *err) {
     nvn_gpu_err local; if (!err) err = &local;
+    g_att_probe = 0;   // 首帧附件体检（backend_vulkan.c pass_begin）：第一帧上屏后不再打
     nvn_gpu_rc out = rc(NVN_GPU_OK);
     nvn_gpu_shown shown = {ticket, NVN_GPU_SHOWN_DROPPED, 0.0};
     nvn_gpu_cmd ch = NULL;
