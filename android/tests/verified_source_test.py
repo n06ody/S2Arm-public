@@ -78,7 +78,8 @@ extern "C" JNIEXPORT jint JNICALL Java_org_s2arm_android_VerifiedSourceProbe_rea
         library = out/'probe.so'
         subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-Wall','-Wextra','-Werror','-shared','-fPIC',
                         '-I'+str(home/'include'),'-I'+str(home/'include'/platform), str(out/'probe.cpp'),'-o',str(library)],check=True)
-        sources = ['Json','BootContract','BootSpec','RuntimeLibrary','GamePack','GameFingerprint','GameInstall','ImportReceiver','GameStorage','GameSession','GameResume']
+        sources = ['Json', 'BootContract', 'BootSpec', 'RuntimeLibrary', 'GamePack', 'GameFingerprint', 'GameInstall',
+                   'SaveArchive', 'ImportReceiver', 'GameStorage', 'GameSession', 'GameResume']
         subprocess.run([str(home/'bin/javac'),'-encoding','UTF-8','-d',str(out/'classes'),
                         *[str(JAVA/(name+'.java')) for name in sources],
                         str(ANDROID/'tests/stubs/android/util/Log.java'),str(out/'NativeBridge.java'),

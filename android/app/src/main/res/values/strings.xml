@@ -7,6 +7,15 @@
     <string name="native_unavailable">The native host could not start. See the S2Arm log for details.</string>
     <string name="capability_status" translatable="false">%1$s\n%2$s</string>
     <string name="import_game">Import game package…</string>
+    <string name="import_save">Import save backup…</string>
+    <string name="import_save_select_game">Select a game before importing its save.</string>
+    <string name="import_save_reading">Checking the save backup…</string>
+    <string name="import_save_summary">Restore %2$d files (%3$d bytes) for %1$s. Any existing save will be backed up first.</string>
+    <string name="import_save_confirm_title">Restore save backup?</string>
+    <string name="import_save_confirm">Restore</string>
+    <string name="import_save_access_failed">Close the game if it is running and check that the backup is readable.</string>
+    <string name="import_save_failed">Save import failed (%1$s). %2$s</string>
+    <string name="import_save_done">Save restored (%1$d files). Open the game to continue.</string>
     <string name="in_place_game">Use a game folder in place…</string>
     <string name="in_place_access_title">All files access needed</string>
     <string name="in_place_access_text">Using a game in place reads its files straight from your phone\'s storage instead of copying them into the app, which saves as much space as the game takes. In the system settings that open next, turn on \"Allow access to manage all files\" for this app, then come back and tap \"Use a game folder in place…\" again to pick the game folder.</string>

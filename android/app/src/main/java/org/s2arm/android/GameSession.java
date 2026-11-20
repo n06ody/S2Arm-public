@@ -74,6 +74,16 @@ final class GameSession implements AutoCloseable {
     static GameSession load(BootSpec spec, File privateRoot, InstalledApk installed, boolean debuggable,
             boolean debugEntriesOpen, GameFingerprint.Timing timing)
             throws IOException, BootContract.BadGame, GamePack.BadPack {
+        return load(spec, privateRoot, installed, debuggable, debugEntriesOpen, timing, null);
+    }
+
+    interface SaveRecovery {
+        void beforeStart(BootContract.Game game) throws IOException;
+    }
+
+    static GameSession load(BootSpec spec, File privateRoot, InstalledApk installed, boolean debuggable,
+            boolean debugEntriesOpen, GameFingerprint.Timing timing, SaveRecovery saves)
+            throws IOException, BootContract.BadGame, GamePack.BadPack {
         long phase = GameFingerprint.Timing.start(timing);
         GameStorage storage = GameStorage.acquire(privateRoot, new File(spec.gameRoot).getName());   // 只锁这一款（不堵门）
         GameFingerprint.Timing.end(timing, "storage_lock", phase);
@@ -84,6 +94,7 @@ final class GameSession implements AutoCloseable {
                 throw new IOException("game root is outside the private game library");
             phase = GameFingerprint.Timing.start(timing);
             BootContract.Game game = BootContract.open(gameRoot);
+            if (saves != null) saves.beforeStart(game);
             GameFingerprint.Timing.end(timing, "session_open", phase);
             if (game.apk != null)
                 BootContract.requireTestApkPermission(game.titleId, game.apk.packageName,
