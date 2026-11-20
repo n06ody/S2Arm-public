@@ -623,7 +623,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 GpuAccessor.QueryHostSupportsLayerVertexTessellation(),
                 GpuAccessor.QueryHostSupportsViewportIndexVertexTessellation());
 
-            CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi);
+            CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi, Address);
 
             return Options.TargetLanguage switch
             {

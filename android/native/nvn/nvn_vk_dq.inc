@@ -251,6 +251,9 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
 #endif
 #ifdef __linux__
     prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);   // 定时醒（nvk_dq_poll_us）别被默认 50 微秒的定时器松弛拖长；只作用于本线程
@@ -435,8 +438,20 @@ static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffe
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) { vk_dq_drain(); return vkEndCommandBuffer(cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb) { vk_dq_drain(); return vkAllocateCommandBuffers(d, ai, cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) { vk_dq_drain(); return vkResetCommandPool(d, p, f); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { vk_dq_drain(); dq_poll(); return vkQueueSubmit(q, n, si, f); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) { vk_dq_drain(); return vkQueuePresentKHR(q, pi); }
+// 逐帧时间探针的「真驱动调用」精确起止：包装里的 drain/poll 不计入——下面两个包装把内层
+//   vkQueueSubmit/vkQueuePresentKHR 的调用前后写进这对值，调用方（持 g_submit_mu，串行）紧接着读。
+static uint64_t g_ft_call_b, g_ft_call_e;
+static void dq_ft_call_span(uint64_t *b, uint64_t *e) { *b = g_ft_call_b; *e = g_ft_call_e; }
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    vk_dq_drain(); dq_poll();
+    g_ft_call_b = dq_now_ns(); VkResult r = vkQueueSubmit(q, n, si, f); g_ft_call_e = dq_now_ns();
+    return r;
+}
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    vk_dq_drain();
+    g_ft_call_b = dq_now_ns(); VkResult r = vkQueuePresentKHR(q, pi); g_ft_call_e = dq_now_ns();
+    return r;
+}
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) { vk_dq_drain(); return vkQueueWaitIdle(q); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) { vk_dq_drain(); return vkDeviceWaitIdle(d); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) { vk_dq_drain(); vkDestroyCommandPool(d, p, a); }

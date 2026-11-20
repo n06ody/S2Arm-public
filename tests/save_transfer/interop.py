@@ -231,6 +231,38 @@ with tempfile.TemporaryDirectory(prefix="s2arm-public-save-interop-") as tempora
     shutil.move(original, source)
     print("PASS both warn on independently API-created different account owner (sync rejects alike: save_wrong_user)")
 
+    android_root = scratch / "android-state"
+    shutil.copytree(source, android_root)
+    previous = next(android_root.glob("bis/user/save/*/0/nested/readme.md"))
+    previous.write_bytes(b"previous synthetic Android progress")
+    old_android = snapshot(android_root)
+    android_identity = identity | dict(version=0, contentIdentity="e" * 64)
+    android = dict(root=android_root, game_identity=android_identity, androidRevisionIdentity=True,
+                   unattendedRestore=True, workRoot=str(scratch / "android-work"))
+    for archive, code, overrides in (
+        (rewrite("android-wrong-title", lambda m: m["game"].update(id="0100000000000001")), "save_wrong_game", {}),
+        (bad, "save_damaged", {}),
+        (python_archive, "save_wrong_user", {"root": other}),
+    ):
+        csharp_call("inspect", archive, expected_code=code, **(android | overrides))
+    preview = csharp_call("inspect", python_archive, **android)
+    confirmation = dict(archiveSha256=preview["archiveSha256"], targetFingerprint=preview["targetFingerprint"])
+    csharp_call("restore", python_archive, expected_code="save_changed",
+                **(confirmation | {"targetFingerprint": "0" * 64}), **android)
+    assert snapshot(android_root) == old_android
+    csharp_call("restore", python_archive, expected_code="save_invalid",
+                env={"SAVE_TRANSFER_FAIL_AT": "oldMoved"}, **confirmation, **android)
+    assert snapshot(android_root) == old_android
+    result = csharp_call("restore", python_archive, **confirmation, **android)
+    assert result["committed"] and snapshot(android_root, exported=True) == exported
+    backup = Path(result["previousBackup"])
+    with zipfile.ZipFile(backup) as saved:
+        assert saved.read("payload/" + previous.relative_to(android_root).as_posix()) == b"previous synthetic Android progress"
+        assert json.loads(saved.read("manifest.json"))["platform"] == "android"
+    csharp_call("recover", **android)
+    assert backup.is_file()
+    print("PASS Android restore shares G06 verification: title, owner, damage, stale preview, rollback, backup")
+
     # 本地玩家（#623）：一边多一个玩家（账号集合是包含关系：另一台设备还没建这个玩家、恢复建玩家之前的备份）→ 两种实现都照常检查、C# 照常恢复；
     #   上面「各有对方没有的账号」照旧拒绝。期望手写：恢复后目标的账号就是备份里的那几个
     two = scratch / "two-players"

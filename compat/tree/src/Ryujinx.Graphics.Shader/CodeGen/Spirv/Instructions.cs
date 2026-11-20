@@ -548,7 +548,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             return GenerateUnary(context, operation, context.Delegates.GlslExp2, null);
         }
 
-        private static bool s_s2aFsiReported;
+        private static int s_s2aFsiOmittedCount;
+        private static long s_s2aFsiFirstVa = -1;
 
         private static OperationResult GenerateFSIBegin(CodeGenContext context, AstOperation operation)
         {
@@ -556,11 +557,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             {
                 context.BeginInvocationInterlockEXT();
             }
-            else if (!s_s2aFsiReported)
+            else if (!context.S2AFsiNoted)
             {
-                // S2A（画幅线 10-24，图形接口盘点 10）：后端不支持片元互锁时互锁段被省略（同像素的片元读改写不再有序）。先报出来（每进程一次），看哪款真用到再补 Metal 光栅顺序组
-                s_s2aFsiReported = true;
-                System.Console.Error.WriteLine("[gpu] 【红】着色器用了片元互锁（FSI）：后端不支持、互锁被省略（图形接口盘点 10）");
+                // S2A（画幅线 10-24，图形接口盘点 10）：后端不支持片元互锁时互锁段被省略（同像素的片元读改写不再有序）。
+                // 每个程序都计数并报出来（全局程序数 + 首个程序键 = 代码 GPU VA）：之前只报一次，省略面有多大、哪款先用都没有数。
+                context.S2AFsiNoted = true;
+                int n = System.Threading.Interlocked.Increment(ref s_s2aFsiOmittedCount);
+                System.Threading.Interlocked.CompareExchange(ref s_s2aFsiFirstVa, (long)context.GpuAddress, -1);
+                long first = System.Threading.Interlocked.Read(ref s_s2aFsiFirstVa);
+                System.Console.Error.WriteLine($"[gpu] 【红】着色器用了片元互锁（FSI）：后端不支持、互锁被省略（程序 va=0x{context.GpuAddress:x}，全局第 {n} 个，首个 va=0x{first:x}；图形接口盘点 10）");
             }
 
             return OperationResult.Invalid;

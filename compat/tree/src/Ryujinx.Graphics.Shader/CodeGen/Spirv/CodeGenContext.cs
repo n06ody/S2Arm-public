@@ -38,6 +38,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         public HostCapabilities HostCapabilities { get; }
         public ILogger Logger { get; }
         public TargetApi TargetApi { get; }
+        public ulong GpuAddress { get; }
+        internal bool S2AFsiNoted;   // S2A：本程序已记过一次互锁省略（一个程序多条 Begin 只算一个程序）
 
         public Dictionary<int, Instruction> ConstantBuffers { get; } = new();
         public Dictionary<int, Instruction> StorageBuffers { get; } = new();
@@ -113,6 +115,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             HostCapabilities = parameters.HostCapabilities;
             Logger = parameters.Logger;
             TargetApi = parameters.TargetApi;
+            GpuAddress = parameters.GpuAddress;
 
             Delegates = new SpirvDelegates(this);
         }
