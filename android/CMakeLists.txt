@@ -182,8 +182,14 @@ if(ANDROID)
     endif()
     # NDK 29 defaults to 16 KB ELF alignment; keep it explicit for this library.
     target_link_options(s2arm_android PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,defs)
-    target_compile_definitions(s2arm_android PRIVATE $<$<CONFIG:Debug>:S2A_CAPACITY_WRAP=1>)
-    target_link_options(s2arm_android PRIVATE $<$<CONFIG:Debug>:-Wl,--wrap=pthread_create>)
+    if(S2A_ANDROID_VK_ENGINE AND S2ARM_ANDROID_VK_BACKEND STREQUAL "nvk")
+        # A thread created by a pinned nvk role must start with the original mask.
+        target_compile_definitions(s2arm_android PRIVATE S2A_CAPACITY_WRAP=1)
+        target_link_options(s2arm_android PRIVATE -Wl,--wrap=pthread_create)
+    else()
+        target_compile_definitions(s2arm_android PRIVATE $<$<CONFIG:Debug>:S2A_CAPACITY_WRAP=1>)
+        target_link_options(s2arm_android PRIVATE $<$<CONFIG:Debug>:-Wl,--wrap=pthread_create>)
+    endif()
     # 外挂 Vulkan 驱动：libadrenotools（BSD-2-Clause）与它的 hook 库。刻意做成三个独立的
     # 共享库、不链进 s2arm_android——没有选择驱动时谁也不会加载它们（linkernsbypass 的
     # 构造器会改 dlopen 所在页的保护），系统驱动路径与改前完全相同。
@@ -534,18 +540,17 @@ else()
     target_compile_options(adpf_hint_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(adpf_hint_test PRIVATE Threads::Threads)
     add_test(NAME android_adpf_hint COMMAND adpf_hint_test)
-    # CPU 频率托底：判定表是纯函数（模拟时间线）；运行体把生产的 cpu_floor.c / power_state.c / system_tuning.c
-    # 原样链入，只假系统属性、时钟、核拓扑与钉核 / 降优先级、「满载一片」本身。
-    add_executable(cpu_floor_policy_test tests/cpu_floor_policy_test.c)
-    target_include_directories(cpu_floor_policy_test PRIVATE native)
-    target_compile_options(cpu_floor_policy_test PRIVATE -Wall -Wextra -Werror)
-    add_test(NAME android_cpu_floor_policy COMMAND cpu_floor_policy_test)
-    add_executable(cpu_floor_test tests/cpu_floor_test.c native/cpu_floor.c native/power_state.c native/system_tuning.c)
-    target_include_directories(cpu_floor_test PRIVATE native)
-    target_compile_definitions(cpu_floor_test PRIVATE S2A_CPU_FLOOR_TEST)
-    target_compile_options(cpu_floor_test PRIVATE -Wall -Wextra -Werror)
-    target_link_libraries(cpu_floor_test PRIVATE Threads::Threads)
-    add_test(NAME android_cpu_floor COMMAND cpu_floor_test)
+    # Adreno GPU 提频。用模拟时间线和 KGSL 观测独立判定。
+    add_executable(gpu_turbo_policy_test tests/gpu_turbo_policy_test.c)
+    target_include_directories(gpu_turbo_policy_test PRIVATE native)
+    target_compile_options(gpu_turbo_policy_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME android_gpu_turbo_policy COMMAND gpu_turbo_policy_test)
+    add_executable(gpu_turbo_test tests/gpu_turbo_test.c native/gpu_turbo.c native/system_tuning.c)
+    target_include_directories(gpu_turbo_test PRIVATE native)
+    target_compile_definitions(gpu_turbo_test PRIVATE S2A_GPU_TURBO_TEST)
+    target_compile_options(gpu_turbo_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(gpu_turbo_test PRIVATE Threads::Threads)
+    add_test(NAME android_gpu_turbo COMMAND gpu_turbo_test)
     # wsi_lease.c 用 pthread_condattr_setclock（Linux 专属）：同一门。
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(wsi_lease_test tests/wsi_lease_test.c native/wsi_lease.c)

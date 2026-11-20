@@ -61,7 +61,7 @@ void s2a_mem_lockorder_vp_enter(void);
 //   max(原周期, 33.3 ms)；登记最终周期给 Surface.setFrameRate 刷新率投票。
 uint64_t s2a_android_limit_frame_period(uint64_t period_ns);
 void s2a_android_present_note(uint64_t period_ns);
-// android/native/cpu_floor.c：每帧一次的上屏计数（一次原子加），安卓侧据此量实际出图帧率。
+// android/native/gpu_turbo.c：每次请求上屏时登记一帧，供安卓 GPU 提频判定。
 void s2a_android_frame_note(void);
 #endif
 
@@ -4235,7 +4235,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (g_frame % TWIN == 0) tsummary(g_frame);
     nvn_be_set_frame(g_frame);
 #if defined(__ANDROID__)
-    s2a_android_frame_note();   // 每帧一次（与上一行同点）：安卓侧量实际出图帧率，慢于目标才托 CPU 频率（android/native/cpu_floor.c）
+    s2a_android_frame_note();
 #endif
     atomic_store(&g_fps_game_itv, s2a_fps_present_hook() | (g_display_mode && s2a_fps_cap_reason() != 0));   // | 不用 ||：钩子每帧都要调（动态步长）。 S2Arm 帧率表：每帧只在这里调一次（present_period 一帧被调 3 次：取图 / 入队 / 节拍器，直连线 10-26 审出），present_itv 只读结果
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)

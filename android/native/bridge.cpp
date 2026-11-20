@@ -15,7 +15,7 @@
 #include "system_tuning.h"
 #include "capacity_affinity.h"
 #include "adpf_hint.h"
-#include "cpu_floor.h"
+#include "gpu_turbo.h"
 #include "aaudio_sink.h"
 #include "wsi_qa.h"
 #include "redlog.h"
@@ -472,7 +472,7 @@ Java_org_s2arm_android_NativeBridge_offerSurface(JNIEnv *env, jclass, jlong hand
     if (!handle) return text(env, "Native host unavailable");
     ANativeWindow *window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
     s2a_adpf_set_surface(window != nullptr);
-    s2a_cpu_floor_set_surface(window != nullptr);
+    s2a_gpu_turbo_set_surface(window != nullptr);
     return text(env, get(handle)->window.offer(window));
 }
 extern "C" JNIEXPORT jstring JNICALL
@@ -1208,7 +1208,7 @@ Java_org_s2arm_android_NativeBridge_stopGame(JNIEnv *env, jclass, jlong handle, 
     if (!host || host != g_game_host || !host->game_runtime || host->stop_started.exchange(true)) return;
     s2a_capacity_stop();
     s2a_adpf_stop();
-    s2a_cpu_floor_stop();
+    s2a_gpu_turbo_stop();
     host->stop_reason = jstring_or(env, why, "game stop requested");
     host->stop_normal.store(normal == JNI_TRUE);
     // 后台冻着的客机先放开（同 Mac display_focus_publish_ex(NO, NO) 的「收尾只报不冻」）：
@@ -1320,7 +1320,7 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
     s2a_aaudio_set_foreground(foreground != JNI_FALSE);
     s2a_capacity_foreground(foreground != JNI_FALSE);
     s2a_adpf_set_foreground(foreground != JNI_FALSE);
-    s2a_cpu_floor_set_foreground(foreground != JNI_FALSE);
+    s2a_gpu_turbo_set_foreground(foreground != JNI_FALSE);
     s2a_android_phone_feedback_foreground(foreground != JNI_FALSE);   // 退后台关手机传感器、停马达
     // 退后台停显示节拍源（直连 vsync 拍；前台回时由 acquire 路径按需懒重启）
     if (!foreground && s2a_android_link_stop) s2a_android_link_stop();
@@ -1454,7 +1454,7 @@ Java_org_s2arm_android_NativeBridge_presentPeriodNs(JNIEnv *, jclass) {
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_s2arm_android_NativeBridge_releaseSurface(JNIEnv *env, jclass, jlong handle) {
-    if (handle) { s2a_adpf_set_surface(0); s2a_cpu_floor_set_surface(0); }
+    if (handle) { s2a_adpf_set_surface(0); s2a_gpu_turbo_set_surface(0); }
     return text(env, handle ? get(handle)->window.release() : "Native host unavailable");
 }
 extern "C" JNIEXPORT void JNICALL

@@ -318,6 +318,7 @@ static void rc_cond(const p_render_cond *rc) {
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
+    rp_sdx_reset();
 }
 
 void nvn_be_sub_begin(void) {
@@ -588,8 +589,7 @@ static void post_report(uint64_t addr, uint32_t type) {
     s->p[s->n++] = p; if (type != NVN_COUNTER_TYPE_TIMESTAMP && type != NVN_COUNTER_TYPE_TIMESTAMP_TOP) s->nfx++; pf_add(RP_PERF_FX_REPORT, 1); __atomic_fetch_or(&g_fx_types, 1ull << (type & 63), __ATOMIC_RELAXED);
 }
 
-void nvn_be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }     // 存储前瞻索引：通道规划接上时再建
-void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
+// nvn_be_sub_index / nvn_be_exec_rest 的实现在 rp_sdx.c（存储前瞻索引）。
 
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
@@ -697,6 +697,8 @@ static uint64_t exec_list(const uint8_t *p) {
         nvn_plat_safepoint();   // 一次提交可连续回放数秒：让平台的停世界事务在命令之间越过本线程（nvn_plat.h）
         op_hdr h; memcpy(&h, p, sizeof h);
         if (rec_bad(h)) { count_flush(&count_group, tm); nvn_unimpl("rec", "bad_record", p); break; }   // 按这条列表的 END 处理：走下面唯一的出口
+        rp_sdx_seq(p);   // 存储前瞻索引逐条对账（对不上就作废，余下通道全 STORE）
+        if (g_rc_skip) rp_sdx_invalidate();   // 条件渲染真跳过了命令：索引里有它们、回放里没有，作废
         if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush(&count_group, tm);
         uint64_t t_cmd = tm ? now_ns() : 0;
         const void *a = p + 8;

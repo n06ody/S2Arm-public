@@ -2107,6 +2107,7 @@ static void t_buf_multi_tail(void) {
 // 修前（没有这条路）：开关开着也走逐页路径，「全池已同步、只有别的池写了」时整段 256 页逐页查。
 static uint64_t sync_bytes_now(void) { extern void rp_buf_stats(uint64_t *, uint64_t *); uint64_t b = 0, r = 0; rp_buf_stats(&b, &r); return b; }
 static void t_buf_dirtylog(void) {
+    extern void rp_buf_stats(uint64_t *, uint64_t *);
     extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
     extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
     extern void rp_buf_frame_flip(void);
@@ -2136,6 +2137,31 @@ static void t_buf_dirtylog(void) {
     nvn_be_sub_begin(); g_block_pages_examined = 0; sb0 = sync_bytes_now();
     CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
     CHECK(g_block_pages_examined == 0 && sync_bytes_now() - sb0 == PG);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // Adjacent stale pages in different bitmap words need a single rearm.
+    fake_log_write(63, 0x6a); fake_log_write(64, 0x7a);
+    g_log_unarmed[64] = 1;
+    nvn_be_sub_begin();
+    uint64_t runs_before, runs_after;
+    rp_buf_stats(&sb0, &runs_before);
+    int rearm_before = g_protects;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 63 * PG && g_prot_len == 2 * PG);
+    uint64_t bytes_after;
+    rp_buf_stats(&bytes_after, &runs_after);
+    CHECK(bytes_after - sb0 == 2 * PG && runs_after - runs_before == 2);
+    if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // The page on the second word stayed writable. Its next write lacks an
+    // event, so it must still be stale and the clean neighboring pages stay out.
+    memset(g_block_mem + 64 * PG, 0x7c, PG);
+    g_block_gen[64] = ++g_dirty_now;
+    g_log_unarmed[64] = 0;
+    nvn_be_sub_begin(); rearm_before = g_protects; sb0 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 62 * PG, 4 * PG, &b, NULL) == 1);
+    CHECK(g_protects - rearm_before == 1 && g_prot_addr == g_block_mem + 64 * PG && g_prot_len == PG);
+    CHECK(sync_bytes_now() - sb0 == PG);
     if (b && b->cpu) CHECK(!memcmp(b->cpu, g_block_mem, all));
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     // 写两页、只解析前一页：后一页的旧位留着，之后解析它照样同步
