@@ -32,10 +32,11 @@ static void s2a_lp_log(const char *fmt, ...) {
 #include "../../../graphics/nvn/lib_pack_core.inc"
 #include "../../../graphics/nvn/gfx/nvn/dmsh_chain.h"
 
-struct s2a_libpack { lp_pack p; };
+struct s2a_libpack { lp_pack p; _Atomic int caps_said; };   // caps_said：本局（这次 open）已打过「删 64 位能力声明」那一行
 
-static _Atomic uint64_t g_hits, g_misses, g_rejects;
+static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped;
 uint64_t s2a_libpack_hits(void) { return atomic_load(&g_hits); }
+uint64_t s2a_libpack_caps_stripped(void) { return atomic_load(&g_caps_stripped); }
 uint64_t s2a_libpack_misses(void) { return atomic_load(&g_misses); }
 uint64_t s2a_libpack_rejects(void) { return atomic_load(&g_rejects); }
 
@@ -450,6 +451,50 @@ out:
     free(dec); free(ncomp); free(ptr_to);
     return rc;
 }
+// 能力核：离线库的 .spv 是批翻链（translator/dmsh_xlate）按它自己的宿主口径翻的，不是按本机 profile——那边
+//   QueryHostSupportsShaderFloat64 缺省答「有」（Metal 只在模块真用到 double 时重翻），所以几乎每个模块都带 OpCapability Float64。
+//   本后端建设备时从不启用 shaderFloat64 / shaderInt64（direct/vk_device.c enabled_features），模块声明这两项能力就违反
+//   VUID-VkShaderModuleCreateInfo-pCode-08740；Maleoon 920 的转换器直接拒（「SPV01: Unsupported capability (10)」，
+//   vkCreateComputePipelines 回 VK_ERROR_OUT_OF_HOST_MEMORY，11-20 真机 13 个计算程序全是出包预编命中的那 13 个）。
+//   模块里没有对应宽度的类型（OpTypeFloat 64 / OpTypeInt 64）时这条能力声明用不上，原地删掉（只删那一条 OpCapability，
+//   id 上界不变，语义不变）；真用到了就拒收，由调用方退回现编（现编按本机 profile 翻，Float64 关时 double 降成 float）。
+//   Int64Atomics 必带 64 位整型，一律拒收。返回 0 = 可用（*n 可能变小）；-1 = 拒收（why 以具名原因开头：
+//   fp64_type_used / int64_type_used / int64_atomics_used，调用方照常走库拒收计数 s2a_libpack_rejects）。
+//   判据以类型声明为准：OpTypeFloat 64 只被 OpConstant 引用、没有运算也算用到（模块仍按 Float64 校验）。
+//   真删了能力声明的模块按条计数（libpack_caps_stripped，s2a_libpack_caps_stripped）；同一模块再核一遍不再计。
+int s2a_libpack_spv_admit_caps(uint8_t *spv, size_t *n, char *why, size_t why_size) {
+    uint32_t *w = (uint32_t *)spv; size_t nw = *n / 4;
+    int f64 = 0, i64 = 0;
+    if (nw < 5 || w[0] != 0x07230203u) { lp_fail(why, why_size, "not a SPIR-V module"); return -1; }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) { lp_fail(why, why_size, "truncated instruction at word %zu", i); return -1; }
+        if (op == 22 && wc >= 3 && w[i + 2] == 64) f64 = 1;          // OpTypeFloat 64
+        if (op == 21 && wc >= 4 && w[i + 2] == 64) i64 = 1;          // OpTypeInt 64
+        i += wc;
+    }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 17 && wc == 2) {                                    // OpCapability
+            const uint32_t cap = w[i + 1];
+            if (cap == 12 || (cap == 10 && f64) || (cap == 11 && i64)) {
+                lp_fail(why, why_size, "%s: uses %s, which the Vulkan device does not enable",
+                        cap == 10 ? "fp64_type_used" : cap == 11 ? "int64_type_used" : "int64_atomics_used",
+                        cap == 10 ? "Float64" : cap == 11 ? "Int64" : "Int64Atomics");
+                return -1;
+            }
+            if (cap == 10 || cap == 11) {
+                memmove(&w[i], &w[i + 2], (nw - i - 2) * sizeof *w);
+                nw -= 2;
+                continue;
+            }
+        }
+        i += wc;
+    }
+    if (nw * 4 != *n) atomic_fetch_add(&g_caps_stripped, 1);
+    *n = nw * 4;
+    return 0;
+}
 // _b.json 里某个参数号的绑定是不是 v1 有意不出行的种类（Metal 专用宿主表 / 采样器半边）
 static int lp_json_has_binding(struct s2a_jv top, int stage_no, uint32_t binding, int *skipped_kind) {
     struct s2a_jv arr; *skipped_kind = 0;
@@ -524,6 +569,11 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             { lp_fail(why, why_size, "%s %s gs_input_topology is not %d", khex, jname, gs_topology); goto done; }
         if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
             { lp_fail(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
+        {   char cw[128] = ""; const size_t sn0 = sn;
+            if (s2a_libpack_spv_admit_caps(spv, &sn, cw, sizeof cw)) { lp_fail(why, why_size, "%s %s %s", khex, sname, cw); goto done; }
+            if (sn != sn0 && !atomic_exchange(&lp->caps_said, 1))   // 每局首次一行（信息级），之后只计数
+                LP_LOG("libpack_caps_stripped: program %s %s dropped %zu unused 64-bit capability declaration(s) (Float64/Int64 without a 64-bit type); counted per module, first one this session",
+                       khex, sname, (sn0 - sn) / 8); }
         // 带几何的程序：每一段都不许写视口号 / 视口掩码（lp_spv_viewport_builtin，同现编具名拒）
         if (gs_topology >= 0) {
             int vp = lp_spv_viewport_builtin(spv, sn);
@@ -577,6 +627,21 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         if (mask) jw_fmt(stages, ",\"attributeReadMask\":%u", mask);
         uint32_t fom = 0;
         if (!strcmp(v1_stage, "fs") && !s2a_libpack_spv_frag_outputs(spv, sn, &fom)) jw_fmt(stages, ",\"info\":{\"fragmentOutputMap\":%u}", fom);
+        {   // 栅格事实转发：_b.json raster（Dsh.RasterFacts：vs 出 pos_attr/pos_w，ps 出 discard/sample_mask）→ v1 字段名；
+            //   只转发证明成立的值——pos_attr<0、pos_w!="one"、布尔 0 一律不写（v1 解析器缺省即保守值，不写 = 证不出）。
+            //   pos_z_half 没有来源：离线库不注入深度改写（libpack 路径 z_raw=1），缺省 0 正确。
+            struct s2a_jv ras;
+            if (!s2a_jv_obj_find(top, "raster", &ras) && s2a_jv_is_object(ras)) {
+                uint32_t pa = 0, bv = 0; char pw[8] = "";
+                jw_str(stages, ",\"raster\":{");
+                int wrote = 0;
+                if (!jf_u32(ras, "pos_attr", &pa) && pa < 16) { jw_fmt(stages, "\"pos_attr\":%u", pa); wrote = 1; }
+                if (!jf_str(ras, "pos_w", pw, sizeof pw) && !strcmp(pw, "one")) { jw_fmt(stages, "%s\"pos_w1\":true", wrote ? "," : ""); wrote = 1; }
+                if (!jf_u32(ras, "discard", &bv) && !bv) { jw_fmt(stages, "%s\"may_discard\":false", wrote ? "," : ""); wrote = 1; }
+                if (!jf_u32(ras, "sample_mask", &bv) && !bv) { jw_fmt(stages, "%s\"writes_smask\":false", wrote ? "," : ""); wrote = 1; }
+                jw_str(stages, "}");
+            }
+        }
         jw_str(stages, "}");
         *stage_mask |= 1u << nvn;
         out = 0;

@@ -30,6 +30,7 @@ void nvk_warm_start(void) {}
 void nvn_vk_pipe_demand_start(void) {}
 void nvn_vk_pipe_demand_stop(void) {}
 void nvn_dirty_set_chunk_pages(uint32_t n) { (void)n; }
+void nvn_dirty_set_mp_dedupe(int enabled) { (void)enabled; }
 int nvn_dirty_log_configure(int enabled) { if (enabled) log_attempts++; return 0; } // 本夹具不提供真实写跟踪，保守拒绝。
 int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_buf_dirtylog") ? (log_flag < 0 ? dflt : log_flag) : dflt; }   // log_flag -1 = 没设，取缺省
 double s2a_direct_vk_display_refresh(void) { return 60; }
@@ -38,6 +39,8 @@ size_t nvn_unimpl_dump(char *b, size_t n) { if (n) *b=0; return 0; }
 int nvn_unimpl_kinds(void) { return 0; }
 void rp_present_set_surface(nvn_gpu_surface s, int hz) { (void)s; (void)hz; }
 void rp_present_stats(uint64_t *s, uint64_t *d) { *s = *d = 0; }
+int rp_sdx_on(void) { return -1; }   // 门检日志的读数：夹具没有 replay 门，打 -1 即可
+int rp_fd_on(void) { return -1; }
 nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *e) { (void)d; (void)e; return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_caps_get(nvn_gpu_caps *c) { memset(c, 0, sizeof *c); }
 nvn_gpu_rc nvn_gpu_close(uint64_t n, nvn_gpu_err *e) { (void)n; atomic_fetch_add(&backend_calls,1); (void)e; return (nvn_gpu_rc){NVN_GPU_OK}; }

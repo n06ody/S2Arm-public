@@ -142,6 +142,21 @@ static const uint32_t CS_SUP_SPV[] = {
     0x00040047u, 2u, 34u, 0u,                                              // OpDecorate %2 DescriptorSet 0
 };
 
+// 能力核用例：批翻链按「宿主有 FP64」翻出的模块带 OpCapability Float64（Maleoon 920 转换器拒、计算管线建不出）。
+//   CAP_UNUSED：Shader + Float64 + Int64，模块里没有 64 位类型 → 两条都删、留 Shader；CAP_F64：真有 OpTypeFloat 64 → 拒；
+//   CAP_I64A：Int64Atomics → 拒
+static const uint32_t CAP_UNUSED_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u,
+    0x00020011u, 1u, 0x00020011u, 10u, 0x00040015u, 1u, 32u, 0u, 0x00020011u, 11u, 0x00030016u, 2u, 32u };
+static const uint32_t CAP_F64_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u,
+    0x00020011u, 1u, 0x00020011u, 10u, 0x00030016u, 2u, 64u };
+// 只有 64 位常量类型、没有运算：OpTypeFloat %2 64 只被 OpConstant %3 = 1.0 引用（双字字面量 0x3ff00000_00000000）。
+//   判据以类型声明为准：照样算用到 Float64 → 拒收，不删能力声明（删了模块就不合法）
+static const uint32_t CAP_F64_CONST_SPV[] = { 0x07230203u, 0x00010000u, 0u, 4u, 0u,
+    0x00020011u, 1u, 0x00020011u, 10u, 0x00030016u, 2u, 64u, 0x0005002bu, 2u, 3u, 0u, 0x3ff00000u };
+static const uint32_t CAP_I64A_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u, 0x00020011u, 1u, 0x00020011u, 12u };
+static const char *CS_F64_JSON =
+    "{\"key\":\"f0f1f2f3f4f5f6f7_b\",\"stage\":\"cs\",\"dm_ctl\":\"f0f1f2f3f4f5f6f7\",\"bindings\":[]}";
+
 static int has(const uint8_t *j, const char *sub) { return j && strstr((const char *)j, sub) != NULL; }
 
 // 原生几何阶段（DshVk.CompileGeometry 的 _vg<t>.json / _vg<t>.spv，种类 112+t / 120+t）：三角输入（t = 3）。
@@ -737,6 +752,27 @@ int main(void) {
             CHECK(mk_pack(rc4, 4, pc, nc, 1) == 0, "compute pack rewritten");
             CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "reopen compute pack");
         }
+        // 能力核接进取库：模块真用 64 位浮点 → 整个计算程序 REJECT（调用方退回现编），原因带 Float64
+        {
+            struct trec rf[2] = {
+                { .key = 0xf0f1f2f3f4f5f6f7, .kind = 1,  .len = (uint32_t)strlen(CS_F64_JSON) },
+                { .key = 0xf0f1f2f3f4f5f6f7, .kind = 52, .len = sizeof CAP_F64_SPV },
+            };
+            const uint8_t *pf[2] = { (const uint8_t *)CS_F64_JSON, (const uint8_t *)CAP_F64_SPV };
+            size_t nf[2] = { strlen(CS_F64_JSON), sizeof CAP_F64_SPV };
+            s2a_libpack_close(cl); cl = NULL;
+            CHECK(mk_pack(rf, 2, pf, nf, 1) == 0, "compute float64 pack written");
+            CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute float64 pack");
+            const uint8_t kf[8] = { 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7 };
+            w[0] = 0;
+            const uint64_t rj0 = s2a_libpack_rejects();
+            rc = cl ? s2a_libpack_compute_v1(cl, kf, 1, "h", "c", &j, &jl, w, sizeof w) : -9;
+            CHECK(rc == -1 && !j && strstr(w, "fp64_type_used") && strstr(w, "Float64"), "模块用 OpTypeFloat 64 → 计算程序 REJECT（退回现编），原因 fp64_type_used");
+            CHECK(s2a_libpack_rejects() == rj0 + 1, "能力核拒收走库拒收计数 +1");
+            s2a_libpack_close(cl); cl = NULL;
+            CHECK(mk_pack(rc4, 4, pc, nc, 1) == 0, "compute pack rewritten after float64 case");
+            CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "reopen compute pack after float64 case");
+        }
         // 负控：拿图形键（stage vs）当计算键 → REJECT；缺席键 → MISS
         uint64_t r0 = s2a_libpack_rejects(), m0 = s2a_libpack_misses();
         const uint8_t ka[8] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33 };
@@ -887,6 +923,29 @@ int main(void) {
         CHECK(s2a_libpack_spv_frag_outputs(libpack_frag_spv, sizeof libpack_frag_spv, &m) == 0 && m == 0xFu, "片元输出映射：样本片元 location 0 vec4 → 0xF");
         CHECK(s2a_libpack_spv_frag_outputs((const uint8_t *)FO2_SPV, sizeof FO2_SPV, &m) != 0, "片元输出映射：数组输出读不懂 → 不出");
         CHECK(s2a_libpack_spv_frag_outputs(libpack_frag_spv, 12, &m) != 0, "片元输出映射：截断模块拒");
+    }
+    {   // 能力核：用不上的 Float64 / Int64 声明删掉（其余字不动），真用到的 / Int64Atomics 拒
+        uint32_t m[sizeof CAP_UNUSED_SPV / 4]; memcpy(m, CAP_UNUSED_SPV, sizeof m);
+        size_t n = sizeof m; char cw[128] = "";
+        const uint64_t c0 = s2a_libpack_caps_stripped();
+        const uint32_t want[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u, 0x00020011u, 1u, 0x00040015u, 1u, 32u, 0u, 0x00030016u, 2u, 32u };
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)m, &n, cw, sizeof cw) == 0 && n == sizeof want && !memcmp(m, want, sizeof want),
+              "能力核：无 64 位类型 → 删 Float64 + Int64 两条，留 Shader 与类型");
+        CHECK(s2a_libpack_caps_stripped() == c0 + 1, "能力核：删过能力声明的模块计 1 条（libpack_caps_stripped）");
+        size_t n2 = n;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)m, &n2, cw, sizeof cw) == 0 && n2 == n, "能力核：再核一遍不变（幂等）");
+        CHECK(s2a_libpack_caps_stripped() == c0 + 1, "能力核：再核一遍没删东西，不再计");
+        uint32_t f[sizeof CAP_F64_SPV / 4]; memcpy(f, CAP_F64_SPV, sizeof f); n = sizeof f; cw[0] = 0;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)f, &n, cw, sizeof cw) == -1 && strstr(cw, "fp64_type_used") && strstr(cw, "Float64") && n == sizeof f,
+              "能力核：OpTypeFloat 64 → 拒，原因 fp64_type_used");
+        uint32_t fc[sizeof CAP_F64_CONST_SPV / 4]; memcpy(fc, CAP_F64_CONST_SPV, sizeof fc); n = sizeof fc; cw[0] = 0;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)fc, &n, cw, sizeof cw) == -1 && strstr(cw, "fp64_type_used") && n == sizeof fc
+              && !memcmp(fc, CAP_F64_CONST_SPV, sizeof fc), "能力核：只有 64 位常量类型、没有运算 → 拒收（不是删能力），模块原样");
+        uint32_t a[sizeof CAP_I64A_SPV / 4]; memcpy(a, CAP_I64A_SPV, sizeof a); n = sizeof a; cw[0] = 0;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)a, &n, cw, sizeof cw) == -1 && strstr(cw, "int64_atomics_used") && strstr(cw, "Int64Atomics"), "能力核：Int64Atomics → 拒，原因 int64_atomics_used");
+        CHECK(s2a_libpack_caps_stripped() == c0 + 1, "能力核：拒收的模块不计入删能力计数");
+        uint32_t ok[sizeof CS_SPV / 4]; memcpy(ok, CS_SPV, sizeof ok); n = sizeof ok;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)ok, &n, cw, sizeof cw) == 0 && n == sizeof CS_SPV, "能力核：无能力声明的模块原样过");
     }
     if (fails) { printf("libpack_vk_test: %d FAIL\n", fails); return 1; }
     printf("libpack_vk_test: all checks passed\n");
