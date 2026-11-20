@@ -12,7 +12,7 @@ endif()
 
 function(s2a_android_host_sources output)
     set(sources
-        native/s2a_savecommit.c native/system_tuning.c native/capacity_affinity.cpp native/adpf_hint.c native/cpu_floor.c
+        native/s2a_savecommit.c native/system_tuning.c native/capacity_affinity.cpp native/adpf_hint.c native/gpu_turbo.c
         native/bridge.cpp native/lan_discovery.cpp ../runtime/src/lan_elect.c native/capture_jpeg.cpp native/touch_jni.cpp native/game_touch.c native/window.cpp native/presenter.cpp
         # 手机当掌机的六轴 / 震动（#528 第 10 项）：坐标换算、震动信箱、六轴来源仲裁用共用的 runtime/src 实现
         native/phone_feedback.c ../runtime/src/phone_axes.c ../runtime/src/phone_rumble_mailbox.c ../runtime/src/motion_pick.c
@@ -108,7 +108,7 @@ function(s2a_android_nvk_sources output)
         # 回放核心（安卓 / 鸿蒙共用）
         ../graphics/nvn/replay/rp_exec.c ../graphics/nvn/replay/rp_copy_t2b.c ../graphics/nvn/replay/rp_clear_tex.c ../graphics/nvn/replay/rp_state.c ../graphics/nvn/replay/rp_entry.c
         ../graphics/nvn/replay/rp_res.c ../graphics/nvn/replay/rp_buf.c ../graphics/nvn/replay/rp_pass.c
-        ../graphics/nvn/replay/rp_present.c ../graphics/nvn/replay/rp_draw.c
+        ../graphics/nvn/replay/rp_present.c ../graphics/nvn/replay/rp_draw.c ../graphics/nvn/replay/rp_sdx.c
         ../graphics/nvn/replay/nvn_unimpl.c
         # 安卓平台件
         native/gfx_plat/nvk_session.c native/gfx_plat/plat_nvn.c native/gfx_plat/plat_nvn_vk.c

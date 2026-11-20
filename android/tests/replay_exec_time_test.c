@@ -108,6 +108,12 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) { (void)pool_
 void rp_buf_frame_flip(void) {}
 void rp_buf_hold_begin(void) {}   // 本测试只测计时：回放窗口（池销毁的镜像缓冲延后放）在 t_nvn_replay / 隔离夹具里测
 void rp_buf_hold_end(void) {}
+// 存储前瞻（rp_sdx.c）本用例不测：空实现闭合链接（计时口径不变）
+void rp_sdx_seq(const uint8_t *p) { (void)p; }
+void rp_sdx_invalidate(void) {}
+void rp_sdx_reset(void) {}
+void nvn_be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
+void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // 「干活」的三条命令：每执行一条推进虚拟钟 1 毫秒。推进只发生在替身里：
 //   回放实现无论嵌套几层都不许让时间自己走，所以「时间过了多少」就是「干了几件活」。
