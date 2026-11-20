@@ -152,6 +152,11 @@ static class SwshXlate
         public bool QueryGeometryInputFixed() => _job["geometry_topology"] != null;
         // 直连宿主的两条合同（compat/tree IGpuAccessor 上缺省关，只有直连答真）：1D 整数取样折行读 2D（宿主 tbuf_as_2d 配合）、bindless 句柄穿过嵌套 phi
         public bool QueryTexelFetch1DWrap() => true;
+        // 按出库目标档案答（job imgload_raw，Dsh Ctx.ImageLoadRaw 写）：档档案有 shaderStorageImageReadWithoutFormat 才 true——
+        //   直连 Vulkan 宿主按「贴图字节数绑同数值类视图」消费无格式声明（rp_draw.c image_view_format），Unknown 与现编
+        //   （DirectGpuAccessor 按设备真能力答）同口径。缺省 false = 最低档案：只读非缓冲图像声明具体格式，任何设备都合法；
+        //   声明与设备不配时出库件在绑定核时被拒、退回现编（#1850 的 rp_shader_lib_reject），不出库成死件（#1774 ②）。
+        public bool QueryHostSupportsImageLoadFormattedRaw() => _job["imgload_raw"] is JsonNode n && (bool)n;
         public bool QueryBindlessPhiSeeThrough() => true;
         public bool QueryS2ARuntimeState() => false;   // 直连宿主不填 s2a_flags / s2a_point（compat/tree IGpuAccessor.QueryS2ARuntimeState）
         public bool QueryHostSpirvLayerExt() => true; // Metal conversion consumes the legacy EXT form.

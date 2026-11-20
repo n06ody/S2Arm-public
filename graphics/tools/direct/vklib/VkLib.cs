@@ -35,8 +35,10 @@ namespace S2A.DshVkLib
 
         public sealed class Row { public string Key, Stage, Status, Why; }
 
-        /// <summary>整批：返回逐键结果（ok / skipped / failed），产物写进 outDir</summary>
-        public static List<Row> Build(string pkg, string profile, string outDir, ISpvCross xc, string work)
+        /// <summary>整批：返回逐键结果（ok / skipped / failed），产物写进 outDir。
+        /// imgLoadRaw = 出库目标档案的 shaderStorageImageReadWithoutFormat：false = 最低档案（只读非缓冲图像声明具体格式，
+        /// 任何设备都合法的 SPIR-V；不配设备的库取件在绑定核被拒、退回现编——#1850）。</summary>
+        public static List<Row> Build(string pkg, string profile, string outDir, ISpvCross xc, string work, bool imgLoadRaw = false)
         {
             Directory.CreateDirectory(outDir); Directory.CreateDirectory(work);
             var packs = new Dictionary<string, List<byte[]>>(StringComparer.Ordinal); var rows = new List<Row>();
@@ -55,10 +57,10 @@ namespace S2A.DshVkLib
                     try
                     {
                         if (stage == "gs")
-                            foreach (var (name, bytes) in DshVk.CompileGeometry(key, cc.Value.Code, cc.Value.Ctl, xc, profile, work)) Write(outDir, name, bytes);
+                            foreach (var (name, bytes) in DshVk.CompileGeometry(key, cc.Value.Code, cc.Value.Ctl, xc, profile, imgLoadRaw, work)) Write(outDir, name, bytes);
                         else
                         {
-                            DshVk.CompileWithSpv(key, stage, cc.Value.Code, cc.Value.Ctl, outDir, xc, profile, work);
+                            DshVk.CompileWithSpv(key, stage, cc.Value.Code, cc.Value.Ctl, outDir, xc, profile, imgLoadRaw, work);
                             Write(outDir, key + "_b.json", Encoding.UTF8.GetBytes(DshCompiler.PackFiles[key + "_b.json"]));
                             Write(outDir, key + "_b.spv", DshVk.PackSpv[key + "_b.spv"]);
                         }
@@ -104,12 +106,14 @@ namespace S2A.DshVkLib
             var a = new Dictionary<string, string>();
             for (int i = 0; i + 1 < args.Length; i += 2) a[args[i]] = args[i + 1];
             foreach (var k in new[] { "--pkg", "--profile", "--out", "--spirv-cross", "--dsx" })
-                if (!a.ContainsKey(k)) { Console.Error.WriteLine("用法：dsh_vklib --pkg <包目录> --profile <配置档目录> --out <输出目录> --spirv-cross <命令行> --dsx <libdsx> [--work <工作目录>] [--lib <库目录> --chain <链号>]；dsh_vklib --fp"); return 2; }
+                if (!a.ContainsKey(k)) { Console.Error.WriteLine("用法：dsh_vklib --pkg <包目录> --profile <配置档目录> --out <输出目录> --spirv-cross <命令行> --dsx <libdsx> [--work <工作目录>] [--lib <库目录> --chain <链号>] [--imgload-raw 0|1]；dsh_vklib --fp"); return 2; }
             if (a.ContainsKey("--lib") != a.ContainsKey("--chain")) { Console.Error.WriteLine("--lib 与 --chain 要一起给"); return 2; }
+            // --imgload-raw 1 = 出库目标档案有 shaderStorageImageReadWithoutFormat（只读非缓冲图像声明 Unknown）；缺省 0 = 最低档案，声明具体格式
+            bool imgLoadRaw = a.GetValueOrDefault("--imgload-raw", "0") == "1";
             string dsx = a["--dsx"];
             NativeLibrary.SetDllImportResolver(typeof(NxgalSpvCross).Assembly, (name, asm, path) => name == "dsx" ? NativeLibrary.Load(dsx) : IntPtr.Zero);
             string work = a.GetValueOrDefault("--work", Path.Combine(a["--out"], ".work"));
-            var rows = VkLib.Build(a["--pkg"], a["--profile"], a["--out"], new CliSpvCross(a["--spirv-cross"], work), work);
+            var rows = VkLib.Build(a["--pkg"], a["--profile"], a["--out"], new CliSpvCross(a["--spirv-cross"], work), work, imgLoadRaw);
             Console.WriteLine(VkLib.Summary(rows));
             // 个别键翻不了不拒绝整库：失败的键记在 vk_build.tsv（出库脚本按它报 🟡 缺口、keys.tsv 不列它们），运行时对缺的键现编；成功的照常打库发布。
             // 原先只要有 1 键失败就整库不出，手机上上万支全部退回现编（010028600EBDA000 的 11194 键里 17 键失败就是这样）

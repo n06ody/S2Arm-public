@@ -58,16 +58,17 @@ namespace S2A.Dsh
         const int TF_SLOT = 8;
 
         /// <summary>Android Vulkan 运行时补编的翻译段：与 iOS 现编同一 JobFor / 翻译器，只取 SPIR-V + 反射，不出 MSL。
-        /// 没有离线答案表时用空表（查询按缺省）；返回 control 键（也是 .xgs 文件名）与 c1。</summary>
+        /// 没有离线答案表时用空表（查询按缺省）；返回 control 键（也是 .xgs 文件名）与 c1。
+        /// imgLoadRaw = 目标档案的 shaderStorageImageReadWithoutFormat（job imgload_raw）：缺省 false = 最低档案，只读非缓冲图像声明具体格式。</summary>
         public static (string Key, byte[] Spv, JsonObject Res, byte[] C1) TranslateForVulkan(
-            string stage, byte[] code, byte[] ctl, string workRoot = null)
+            string stage, byte[] code, byte[] ctl, string workRoot = null, bool imgLoadRaw = false)
         {
             if (Array.IndexOf(Stages, stage) < 0) throw new DshError("bad stage", "阶段 " + stage + " 不支持（只认 vs / ps / cs / gs）");
             if (ctl == null || ctl.Length < 0x880) throw new DshError("bad record", $"控制段只有 0x{ctl?.Length ?? 0:x} 字节（要 0x880）");
             string key = Convert.ToHexStringLower(Sha256.HashData(ctl.AsSpan(0, 0x880)))[..16];
             string w = Path.Combine(workRoot ?? Path.GetTempPath(), "dshvk_" + key + "_" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(w);
-            var c = new Ctx { Key = key, Out = w, W = w, Xc = null, T = DshTables.Empty() };
+            var c = new Ctx { Key = key, Out = w, W = w, Xc = null, T = DshTables.Empty(), ImageLoadRaw = imgLoadRaw };
             try
             {
                 (JsonObject j, byte[] c1) = c.JobFor(stage, code, ctl);
@@ -135,6 +136,9 @@ namespace S2A.Dsh
         internal sealed class Ctx
         {
             public string Key, Out, W; public ISpvCross Xc; public DshTables T;
+            // 出库目标档案的 shaderStorageImageReadWithoutFormat（job imgload_raw）：false = 最低档案，只读非缓冲图像声明具体格式，
+            //   在任何设备上都是合法 SPIR-V；真档案有这能力才写 true 声明 Unknown（dmsh_xlate Accessor 答问，#1774 ②）
+            public bool ImageLoadRaw;
             public readonly List<string> Written = new();
             string Spv => Path.Combine(W, Key + ".spv");
 
@@ -157,7 +161,7 @@ namespace S2A.Dsh
                 }
                 string cp = Path.Combine(W, Key + ".bin"); XIo.WriteAllBytes(cp, code);
                 var tf = stage == "vs" ? TfLayout(Key, ctl) : null;
-                var j = new JsonObject { ["key"] = Key, ["stage"] = stage, ["code"] = cp, ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1) };
+                var j = new JsonObject { ["key"] = Key, ["stage"] = stage, ["code"] = cp, ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1), ["imgload_raw"] = ImageLoadRaw };
                 if (tf != null) j["tf"] = TfJson(tf);
                 if (stage == "gs" && TfLayout(Key, ctl) is { } gtf) j["gs_tf"] = TfJson(gtf);   // 几何着色器的变换反馈由宿主按输出记录写（同 dmsh_build.py tf_entries → geometry_finish geo_tf，审计 P2-40）
                 // S2Arm 曲面细分：域着色器的模式在控制段 +0x738 / +0x73c / +0x744（GL 枚举，TessCtl.Nvn1）；外壳没有自己的模式，取本款第一种域的，其余域在 TessFinish 里重翻
@@ -199,7 +203,7 @@ namespace S2A.Dsh
                 if (stage is "ts" or "ms") return MeshJob(stage, code, ctl, ilen, c1);
                 code = Sl(code, 0, (int)ilen);
                 string cp = Path.Combine(W, Key + ".bin"); XIo.WriteAllBytes(cp, code);
-                var j = new JsonObject { ["key"] = Key, ["stage"] = stage, ["code"] = cp, ["arch"] = "sm86", ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1) };
+                var j = new JsonObject { ["key"] = Key, ["stage"] = stage, ["code"] = cp, ["arch"] = "sm86", ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1), ["imgload_raw"] = ImageLoadRaw };
                 if (stage == "cs") j["tensor_mma_count"] = DshTensor.Count(code);
                 // 计算阶段的驱动常量在 c[0] 里按程序排（推送常量字数 +0xa9，uniform / storage / 纹理项数 +0xb1..+0xb3，分离纹理 / 分离采样器项数 +0xb4 / +0xb5（图像在它们之后，上游参考实现（MIT）67f1d0055），大小 +0xba），翻译器按它映射（InstEmitAmpere.cs AMapC0）
                 //   推常量块 1（+0xaa 字数，排在推常量块 0 之后、uniform 项之前）：游戏推进来的 {地址, 大小} 存储缓冲项或 8 字节句柄，翻译器映射到推常量槽 1 = c[25]（上游参考实现（MIT）nvn2_cs[7]）。
@@ -245,7 +249,7 @@ namespace S2A.Dsh
                 if (size > MeshStage.METAL_MAX_SHARED && !(stage == "ms" && MeshStage.Relay(mi))) throw new DshError("mesh stage failed", $"{stage}: 阶段内存 {size} 字节超 Metal 线程组内存 {MeshStage.METAL_MAX_SHARED}");
                 if (mi.Threads == 0 || mi.Threads > 1024) throw new DshError("mesh stage failed", $"{stage}: 控制段 +0x58 每组线程数 {mi.Threads}");
                 string cp = Path.Combine(W, Key + ".bin"); XIo.WriteAllBytes(cp, code);
-                var j = new JsonObject { ["key"] = Key, ["stage"] = "cs", ["code"] = cp, ["arch"] = "sm86", ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1) };
+                var j = new JsonObject { ["key"] = Key, ["stage"] = "cs", ["code"] = cp, ["arch"] = "sm86", ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject(), ["c1"] = Convert.ToHexStringLower(c1), ["imgload_raw"] = ImageLoadRaw };
                 j["stage_memory"] = new JsonArray(lay.Select(v => (JsonNode)JsonValue.Create((long)v)).ToArray());
                 j["local"] = new JsonArray(JsonValue.Create((long)mi.Threads), JsonValue.Create(1L), JsonValue.Create(1L));
                 j["shared"] = JsonValue.Create((long)size);
