@@ -45,8 +45,11 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_flag_lv_cap_kb = -1, g_flag_lv_kbps = -1;   // 用例设：落地逐字节核对预算（nvk_land_verify_cap_kb / _kbps；-1 = 产品缺省）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
+    if (!strcmp(name, "nvk_land_verify_cap_kb")) return g_flag_lv_cap_kb < 0 ? dflt : g_flag_lv_cap_kb;
+    if (!strcmp(name, "nvk_land_verify_kbps")) return g_flag_lv_kbps < 0 ? dflt : g_flag_lv_kbps;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
@@ -3918,6 +3921,38 @@ static uint64_t gw_pending_case(uint64_t off_in, int path, int split, uint8_t *m
     land_case_teardown();
     return moved;
 }
+// 逐字节核对的预算（land_verify_take）：不补（kbps = 0）、上限 4 KB 时 2 页的落地超预算 → 不核、照旧搬两页；上限 64 KB → 核过、不搬；
+// 预算内的一次扣掉后不再够下一次（同样 8 KB 上限连落两次：第一次免搬、第二次照搬）；会话收尾装满。
+static void t_land_verify_budget(void) {
+    uint8_t ok = 0; uint64_t moved;
+    g_flag_lv_kbps = 0;
+    g_flag_lv_cap_kb = 4;  moved = land_case(192, 2, 0, 0, -1, -1, 0, &ok);
+    printf("land verify budget 4KB: moved=%llu expected 8192\n", (unsigned long long)moved);
+    CHECK(moved == 2 * PG);                                         // 超预算：不核，照旧重搬
+    g_flag_lv_cap_kb = 64; moved = land_case(192, 2, 0, 0, -1, -1, 0, &ok);
+    CHECK(moved == 0 && ok);                                        // 预算内：核过，不搬（land_case 每例 shutdown_session → 装满）
+    g_flag_lv_cap_kb = 8;
+    {   extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+        extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+        land_case_setup();
+        const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG; nvn_gpu_buf b = NULL; uint64_t key = 0;
+        nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+        uint64_t id1 = rp_buf_gpu_write_note(base + 100 * PG, 2 * PG, &key), id2 = rp_buf_gpu_write_note(base + 200 * PG, 2 * PG, &key);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        if (b && b->cpu) { memset(b->cpu + 100 * PG, 0xa1, 2 * PG); memset(b->cpu + 200 * PG, 0xa2, 2 * PG); }
+        g_land_fault_on = 1; g_land_fault_lo = 100; g_land_fault_hi = 101; rp_buf_gpu_write_land(key, id1, 1);
+        g_land_fault_lo = 200; g_land_fault_hi = 201; rp_buf_gpu_write_land(key, id2, 1); g_land_fault_on = 0;
+        nvn_be_sub_begin(); const uint64_t sb0 = sync_bytes_now();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+        moved = sync_bytes_now() - sb0;
+        printf("land verify budget 8KB twice: moved=%llu expected 8192\n", (unsigned long long)moved);
+        CHECK(moved == 2 * PG);                                     // 第一次落地扣光 8 KB → 免搬；第二次不够 → 照搬那两页
+        if (b && b->cpu) CHECK(!memcmp(b->cpu + 100 * PG, g_block_mem + 100 * PG, 2 * PG) && b->cpu[200 * PG] == 0xa2);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        land_case_teardown();
+    }
+    g_flag_lv_cap_kb = g_flag_lv_kbps = -1;
+}
 static void t_land_noresync(void) {
     {   uint8_t ok = 0; uint64_t moved;
         for (int dl = 1; dl >= 0; dl--) for (int path = 0; path < 3; path++) {
@@ -5981,6 +6016,7 @@ int main(int argc, char **argv) {
     t_gpu_land_concurrent();
     t_gpu_land_destroy();
     t_land_noresync();
+    t_land_verify_budget();
     t_gpu_land_count_cleanup();
 #endif
     t_buf_mirror();

@@ -24,6 +24,10 @@ mutations = [
     ('gw-no-split', 'while (k <= j && !gw_covers_page(s, mem, size, k)) k++;', 'k = j + 1;', 'moved == PG && ok'),
     # 区间拼接判错：只看起点所在那一段，盖不住跨两段的串
     ('gw-covers-start-only', 'if (g0 <= a && a < g1) { a = g1; moved = 1; } }', 'if (g0 <= a && a < g1) { a = g1 >= b ? g1 : a; moved = 0; } }', 'split: moved=4096'),
+    # 不看核对预算：超预算的落地也核、也免搬
+    ('budget-ignored', '    ok = bytes <= g_lv_tokens;', '    ok = 1;', 'budget 4KB: moved=0'),
+    # 预算不扣：同一个桶能无限核
+    ('budget-not-spent', '    if (ok) g_lv_tokens -= bytes;', '    if (ok) g_lv_tokens -= 0;', 'budget 8KB twice: moved=0'),
     # 脏页日志路径不清旧位
     ('apply-not-called', '    land_ok_apply(s, m);\n', '    if (0) land_ok_apply(s, m);\n', 'log next submit: moved=8192'),
 ]

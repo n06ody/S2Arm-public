@@ -294,6 +294,24 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
 // 相同的页 = 「此刻游戏内存与镜像一致，且之后任何写都会让代号大于 st」，记成已同步（不靠抽样，不比就不记）。
 // 加保护之前（memcpy 之后）游戏若写过这些页，逐字节比会不同 → 照常重搬；加保护之后的写代号 > st → 照常重搬。
 struct land_verify { uint64_t k0, n, st; uint64_t *eq; };   // 页号 k0 起 n 页；eq 每页一位 = 与镜像相同
+// 逐字节核对的上界（完成线程上的读量）：按字节的令牌桶，缺省每秒补 1 GB、最多攒 64 MB（开关 nvk_land_verify_kbps / nvk_land_verify_cap_kb）。
+// 落地量大的游戏（不合并登记时 0100559011740000 落地 900 MB/帧，#1752）不会因此在完成线程上再读同样多；预算不够的这次落地整段不核，
+// 照旧由下次使用整页重搬——只少省，不靠抽样、不放宽正确性。会话收尾（rp_buf_reset）把桶装满。
+static pthread_mutex_t g_lv_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_lv_init; static uint64_t g_lv_tokens, g_lv_t;   // 当前余额（字节）、上次补的时刻（纳秒）
+static int land_verify_take(uint64_t bytes) {
+    const uint64_t cap = (uint64_t)nvn_plat_flag("nvk_land_verify_cap_kb", 65536) * 1024, rate = (uint64_t)nvn_plat_flag("nvk_land_verify_kbps", 1048576) * 1024;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    int ok;
+    pthread_mutex_lock(&g_lv_mu);
+    if (!g_lv_init) { g_lv_init = 1; g_lv_tokens = cap; g_lv_t = now; }
+    if (now > g_lv_t) { const uint64_t add = (now - g_lv_t) / 1000 * rate / 1000000; if (add) { g_lv_tokens = g_lv_tokens + add > cap ? cap : g_lv_tokens + add; g_lv_t = now; } }
+    if (g_lv_tokens > cap) g_lv_tokens = cap;
+    ok = bytes <= g_lv_tokens;
+    if (ok) g_lv_tokens -= bytes;
+    pthread_mutex_unlock(&g_lv_mu);
+    return ok;
+}
 static void land_verify(const struct shadow *s, const uint8_t *src, uint64_t off, uint64_t len, struct land_verify *v) {
     memset(v, 0, sizeof *v);
     if (s->untracked || !len) return;
@@ -301,6 +319,7 @@ static void land_verify(const struct shadow *s, const uint8_t *src, uint64_t off
     const uintptr_t a = (uintptr_t)s->mem + off, b = a + len;
     const uint64_t k0 = (a - s->page0 + ps - 1) / ps, k1 = (b - s->page0) / ps;   // 整页：[k0, k1)
     if (k1 <= k0) return;
+    if (!land_verify_take((k1 - k0) * ps)) { rp_perf_add(RP_PERF_LAND_NOVERIFY_KB, (k1 - k0) * ps / 1024); return; }   // 超预算：这次不核，照旧重搬
     const uint64_t n = k1 - k0;
     uint64_t *eq = calloc((size_t)((n + 63) / 64), sizeof *eq);
     if (!eq) return;
@@ -660,6 +679,7 @@ nvn_gpu_buf rp_buf_for_null_storage(void) {
 }
 
 void rp_buf_reset(void) {
+    pthread_mutex_lock(&g_lv_mu); g_lv_init = 0; pthread_mutex_unlock(&g_lv_mu);   // 逐字节核对的预算：新会话装满
     pthread_mutex_lock(&g_bmu);
     // 收尾也不能释放正在被锁外拷贝引用的镜像；等待期间表可能变化，醒来重新扫描。
     for (;;) {
