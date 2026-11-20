@@ -192,6 +192,7 @@ static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;
 // 而且恢复读写、甚至整段恢复都不合并——碎片永久留下，世界跑几分钟就把 vm.max_map_count 吃满。
 // 安卓在第一次纹理上传前由 fd_apply_chunk_kb() 设成 1 MiB（debug.s2a.chunk_kb 可调）。
 static _Atomic uint32_t g_chunk_pages = 0;
+static _Atomic int g_mp_dedupe;
 // 跟踪不可靠：任何一次 mprotect 失败都会置位。置位后所有查询走保守路径（整张视为脏 /
 // 代际返回 -1），不再只靠“旧代际比较”判断——否则失败后仍会认为内容没变而漏传。
 static _Atomic int g_track_unreliable;
@@ -200,6 +201,7 @@ static int g_log_enabled;      // g_slot_mu；只能在没有活池时设置（�
 static _Atomic uint64_t g_mapping_gen = 1;
 void nvn_dirty_set_chunk_pages(uint32_t pages) { atomic_store(&g_chunk_pages, pages); }
 uint32_t nvn_dirty_chunk_pages(void) { return atomic_load(&g_chunk_pages); }
+void nvn_dirty_set_mp_dedupe(int enabled) { atomic_store(&g_mp_dedupe, !!enabled); }
 int nvn_dirty_log_configure(int enabled) {
     pthread_mutex_lock(&g_slot_mu);
     int ok = atomic_load(&g_live) == 0;
@@ -362,24 +364,36 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
 // 先逐页认领（PROT→BUSY、NONE→BUSY_WRITABLE），挡住并发的加保护，再整段 mprotect：
 // 不能 mprotect 完再无条件写状态——另一线程刚把某页 NONE→BUSY→mprotect(READ)，本线程再写 NONE
 // 就留下“状态可写、内存只读”的漏检（维护方审 11-04 第 7 条）。
-static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+enum release_result { RELEASE_FAILED, RELEASE_ALREADY_WRITABLE, RELEASE_CHANGED };
+static enum release_result unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+    const uint64_t epoch = atomic_load_explicit(&g_mp_dedupe, memory_order_relaxed) ? atomic_load(&g_table_epoch) : 0;
+    int had_protected = 0;
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
-        if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; }
-        else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
+        if (st == PG_PROT) {
+            if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue;
+            had_protected = 1;
+        } else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
         else if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
             for (uintptr_t j = first; j < k; j++) {
                 uint8_t js = atomic_load(&r->state[j]);
                 if (js == PG_BUSY) atomic_store(&r->state[j], PG_PROT);
                 else if (js == PG_BUSY_WRITABLE) atomic_store(&r->state[j], PG_NONE);
             }
-            return 0;
+            return RELEASE_FAILED;
         }
         k++;
     }
+    dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
+    // A competing unlock can finish while this request waits. Once all claims
+    // are already-writable in the same mapped range, its published event suffices.
+    if (!had_protected && epoch && !(epoch & 1) && lg && !atomic_load(&lg->bad) &&
+        !atomic_load(&g_track_unreliable) && atomic_load(&g_table_epoch) == epoch) {
+        for (uintptr_t k = first; k <= last; k++) atomic_store(&r->state[k], PG_NONE);
+        return RELEASE_ALREADY_WRITABLE;
+    }
     uintptr_t begin = r->base + (first << g_shift), end = r->base + ((last + 1) << g_shift);
     {   // 追加日志：在页变可写之前发布（mprotect 失败时这条是多余的，只会让消费方多同步一次；失败本身会置「跟踪不可靠」）
-        dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
         if (lg) log_append(lg, begin, end);
     }
     if (mp(begin, end - begin, PROT_READ | PROT_WRITE) != 0) {
@@ -390,15 +404,15 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
             else if (st == PG_BUSY_WRITABLE) atomic_store(&r->state[k], PG_NONE);
         }
         atomic_store(&g_track_unreliable, 1);
-        return 0;
+        return RELEASE_FAILED;
     }
     const uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
     for (uintptr_t k = first; k <= last; k++) { atomic_store(&r->gen[k], g); atomic_store(&r->state[k], PG_NONE); }
     last_max(r, g);
-    return 1;
+    return RELEASE_CHANGED;
 }
 // 解除 p 所在的整块。块边界以所属映射为基准（chunk_first/last_page），不越界保护相邻内存。
-static int unprotect_chunk(range_t *r, uintptr_t p) {
+static enum release_result unprotect_chunk(range_t *r, uintptr_t p) {
     return unprotect_span_pages(r, chunk_first_page(r, p), chunk_last_page(r, p));
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
@@ -408,7 +422,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         uint8_t st = atomic_load(&r->state[p]);
         if (st == PG_NONE) return atomic_load(&r->gen[p]) != 0;   // already writable (another thread just unprotected it) -> re-execute; pages never protected are not ours
         if (st == PG_PROT) {
-            if (!unprotect_chunk(r, p)) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
+            if (unprotect_chunk(r, p) == RELEASE_FAILED) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
             if (count) atomic_fetch_add(count, 1);
             return 1;
         }
@@ -443,12 +457,12 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (any_prot) {
             if (!open) { run_first = i; open = 1; }
         } else if (open) {
-            if (unprotect_span_pages(r, run_first, i - 1)) { if (count) atomic_fetch_add(count, i - run_first); }
+            if (unprotect_span_pages(r, run_first, i - 1) == RELEASE_CHANGED && count) atomic_fetch_add(count, i - run_first);
             open = 0;
         }
         i = last + 1;
     }
-    if (open && unprotect_span_pages(r, run_first, lq)) { if (count) atomic_fetch_add(count, lq - run_first + 1); }
+    if (open && unprotect_span_pages(r, run_first, lq) == RELEASE_CHANGED && count) atomic_fetch_add(count, lq - run_first + 1);
 }
 static void prep_write(void *addr, size_t len) {
     if (!len) return;
