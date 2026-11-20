@@ -20,6 +20,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -196,6 +197,55 @@ static class SwshXlate
         return false;
     }
 
+    // 翻译出口能力修剪：本翻译器按宿主缺省「支持」挂的能力声明/扩展名，模块实际没用到就剥——
+    //   Float64/Int64 按 64 位类型有无，FragmentShaderPixelInterlockEXT(cap 5378)+扩展名按 Begin/End 指令有无。
+    //   依据：无 VK_EXT_fragment_shader_interlock 的设备（Mali-G710 等）建模块过不了能力核、整库退回现编
+    //   （11-26 全库核 8571/9060 声明、0 个真用）。设备 admit_caps 同款剥留作保险；真有临界区/真用 64 位的不动。
+    static byte[] PruneCaps(byte[] spirv)
+    {
+        bool f64 = false, i64 = false, il = false;
+        for (int i = 20; i + 4 <= spirv.Length;)
+        {
+            uint word = BitConverter.ToUInt32(spirv, i);
+            int wc = (int)(word >> 16); if (wc <= 0) break;
+            uint op = word & 0xffff;
+            if (op == 22 && wc >= 3 && BitConverter.ToUInt32(spirv, i + 8) == 64) f64 = true;
+            if (op == 21 && wc >= 4 && BitConverter.ToUInt32(spirv, i + 8) == 64) i64 = true;
+            if (op == 5364 || op == 5365) il = true;
+            i += wc * 4;
+        }
+        if (f64 && i64 && il) return spirv;
+        byte[] outp = new byte[spirv.Length]; int w = 0;
+        for (int i = 0; i + 4 <= spirv.Length;)
+        {
+            if (i < 20) { Array.Copy(spirv, i, outp, w, 4); i += 4; w += 4; continue; }   // 头 5 词不是指令：原样拷
+            uint word = BitConverter.ToUInt32(spirv, i);
+            int wc = (int)(word >> 16);
+            if (wc <= 0 || i + wc * 4 > spirv.Length) { Array.Copy(spirv, i, outp, w, spirv.Length - i); w += spirv.Length - i; break; }
+            uint op = word & 0xffff;
+            bool drop = false;
+            if (op == 17 && wc == 2)
+            {
+                uint cap = BitConverter.ToUInt32(spirv, i + 4);
+                drop = cap == 5378 && !il || cap == 10 && !f64 || cap == 11 && !i64 || cap == 12 && !i64;
+            }
+            else if (op == 10 && !il && wc >= 2)
+            {
+                var sb = new StringBuilder();
+                for (int k = 1; k < wc; k++)
+                {
+                    uint v = BitConverter.ToUInt32(spirv, i + k * 4);
+                    for (int b = 0; b < 4; b++) { byte c = (byte)(v >> (8 * b)); if (c == 0) goto ext_done; sb.Append((char)c); }
+                }
+            ext_done:
+                drop = sb.ToString() == "SPV_EXT_fragment_shader_interlock";
+            }
+            if (!drop) { Array.Copy(spirv, i, outp, w, wc * 4); w += wc * 4; }
+            i += wc * 4;
+        }
+        return w == spirv.Length ? spirv : outp[..w];
+    }
+
     // S2Arm geometry transform feedback (10-26): word offsets in a geometry shader's output record (GeometryToCompute: one record of OutputSizePerInvocation words per emitted
     //   vertex). The record is packed by what the shader writes (ResourceReservations.FillIoOffsetMap: position 0-3, point size, written clip distances, layer, viewport, then each
     //   written generic output n as 4 words), so the offsets come from the translator itself, not recomputed. TryGetOffset and both enums are internal: called by reflection.
@@ -322,7 +372,7 @@ static class SwshXlate
                 {
                     // A fresh context: translation mutates the decoded program.
                     var reader = Ctx(new Accessor(code, job, imageTypes), flags, geometry);
-                    XIo.WriteAllBytes(Path.Combine(outDir, key + ".reader.spv"), reader.GenerateVertexPassthroughForCompute().BinaryCode);
+                    XIo.WriteAllBytes(Path.Combine(outDir, key + ".reader.spv"), PruneCaps(reader.GenerateVertexPassthroughForCompute().BinaryCode));
                     // Passthrough geometry fast path (S2Arm 11-06 energy line, Donkey Kong: the kernel's record writes and the index compaction were the largest GPU item of a frame):
                     //   a passthrough shader's output primitives are its input primitives and its vertex values are the previous stage's, so the main pass can read the vertex capture
                     //   directly (.capture.spv, the _bgc library) and the kernel only keeps the shader body's side effects (.side.spv, _bgs<topology>: no records, no indices).
@@ -334,14 +384,14 @@ static class SwshXlate
                         byte[] sideCode = side.Translate(geometry).BinaryCode;
                         if (!side.S2APassthroughBodyOutputs)
                         {
-                            XIo.WriteAllBytes(Path.Combine(outDir, key + ".side.spv"), sideCode);
+                            XIo.WriteAllBytes(Path.Combine(outDir, key + ".side.spv"), PruneCaps(sideCode));
                             var capture = Ctx(new Accessor(code, job, imageTypes), flags, geometry);
-                            XIo.WriteAllBytes(Path.Combine(outDir, key + ".capture.spv"), capture.S2AGeneratePassthroughCaptureReader().BinaryCode);
+                            XIo.WriteAllBytes(Path.Combine(outDir, key + ".capture.spv"), PruneCaps(capture.S2AGeneratePassthroughCaptureReader().BinaryCode));
                             passthroughFast = true;
                         }
                     }
                 }
-                XIo.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);
+                XIo.WriteAllBytes(Path.Combine(outDir, key + ".spv"), PruneCaps(p.BinaryCode));
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),

@@ -35,8 +35,13 @@ static void s2a_lp_log(const char *fmt, ...) {
 struct s2a_libpack { lp_pack p; _Atomic int caps_said; };   // caps_said：本局（这次 open）已打过「删 64 位能力声明」那一行
 
 static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped;
+static _Atomic uint64_t g_il_stripped;          // 剥掉互锁指令/执行模式后照常收录的模块数（interlock_stripped）
+static _Atomic int g_il_first_set;              // 首个被剥程序键已记
+static char g_il_first_key[24];                 // 首个被剥程序键 hex（16 字符 + NUL）
 uint64_t s2a_libpack_hits(void) { return atomic_load(&g_hits); }
 uint64_t s2a_libpack_caps_stripped(void) { return atomic_load(&g_caps_stripped); }
+uint64_t s2a_libpack_interlock_stripped(void) { return atomic_load(&g_il_stripped); }
+const char *s2a_libpack_interlock_first_key(void) { return atomic_load(&g_il_first_set) ? g_il_first_key : ""; }
 uint64_t s2a_libpack_misses(void) { return atomic_load(&g_misses); }
 uint64_t s2a_libpack_rejects(void) { return atomic_load(&g_rejects); }
 
@@ -461,18 +466,28 @@ out:
 //   Int64Atomics 必带 64 位整型，一律拒收。返回 0 = 可用（*n 可能变小）；-1 = 拒收（why 以具名原因开头：
 //   fp64_type_used / int64_type_used / int64_atomics_used，调用方照常走库拒收计数 s2a_libpack_rejects）。
 //   判据以类型声明为准：OpTypeFloat 64 只被 OpConstant 引用、没有运算也算用到（模块仍按 Float64 校验）。
+//   interlock 不拒收：零指令只剥声明；真有临界区时 Begin/End 指令与互锁执行模式一并剥掉照常收录，
+//   语义损失 = 同像素片元读改写不再有序（#1774：拒收整款缺 FS），信号写 why 前缀 interlock_stripped，
+//   调用方具名红 + 计数（g_il_stripped / g_il_first_key，s2a_libpack_interlock_*）。
 //   真删了能力声明的模块按条计数（libpack_caps_stripped，s2a_libpack_caps_stripped）；同一模块再核一遍不再计。
 int s2a_libpack_spv_admit_caps(uint8_t *spv, size_t *n, char *why, size_t why_size) {
     uint32_t *w = (uint32_t *)spv; size_t nw = *n / 4;
-    int f64 = 0, i64 = 0;
+    int f64 = 0, i64 = 0, il_used = 0;
     if (nw < 5 || w[0] != 0x07230203u) { lp_fail(why, why_size, "not a SPIR-V module"); return -1; }
     for (size_t i = 5; i < nw; ) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
         if (!wc || i + wc > nw) { lp_fail(why, why_size, "truncated instruction at word %zu", i); return -1; }
         if (op == 22 && wc >= 3 && w[i + 2] == 64) f64 = 1;          // OpTypeFloat 64
         if (op == 21 && wc >= 4 && w[i + 2] == 64) i64 = 1;          // OpTypeInt 64
+        if (op == 5364 || op == 5365) il_used = 1;                   // OpBegin/EndInvocationInterlockEXT
         i += wc;
     }
+    // interlock 与 Float64 同病但处置不同（11-26 全库核：8571/9060 声明、0 个真有 Begin/End 指令）：
+    //   没 VK_EXT_fragment_shader_interlock 时模块创建过不了能力核；零指令只剥声明（语义不变）。
+    //   真有临界区的也不拒收（#1774 拍板：拒了整款缺 FS 画不出来）——把互锁指令、互锁执行模式、
+    //   cap、扩展名一并剥掉照常画，同像素的片元读改写不再有序，与现编侧 FSI 省略同口径；
+    //   信号走 why 前缀 "interlock_stripped"，调用方按程序具名红 + 计数（剥了改变读写序语义，必须亮出来）。
+    int il_dropped = 0;
     for (size_t i = 5; i < nw; ) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
         if (op == 17 && wc == 2) {                                    // OpCapability
@@ -483,14 +498,43 @@ int s2a_libpack_spv_admit_caps(uint8_t *spv, size_t *n, char *why, size_t why_si
                         cap == 10 ? "Float64" : cap == 11 ? "Int64" : "Int64Atomics");
                 return -1;
             }
-            if (cap == 10 || cap == 11) {
+            if (cap == 10 || cap == 11 || cap == 5378) {
                 memmove(&w[i], &w[i + 2], (nw - i - 2) * sizeof *w);
                 nw -= 2;
                 continue;
             }
         }
+        if (il_used && (op == 5364 || op == 5365)) {                  // OpBegin/EndInvocationInterlockEXT
+            memmove(&w[i], &w[i + wc], (nw - i - wc) * sizeof *w);
+            nw -= wc; il_dropped++;
+            continue;
+        }
+        if (il_used && (op == 16 || op == 331) && wc >= 3 && w[i + 2] >= 5366 && w[i + 2] <= 5369) {
+            // OpExecutionMode(Id) PixelInterlockOrdered/Unordered/SampleInterlockOrdered/UnorderedEXT
+            memmove(&w[i], &w[i + wc], (nw - i - wc) * sizeof *w);
+            nw -= wc; il_dropped++;
+            continue;
+        }
+        if (op == 10 && wc >= 2) {                                    // OpExtension "SPV_EXT_fragment_shader_interlock"
+            char ext[40]; size_t el = 0;
+            for (size_t k = 1; k < wc && el < sizeof ext - 1; k++) {
+                for (int b = 0; b < 4 && el < sizeof ext - 1; b++) {
+                    char c = (char)(w[i + k] >> (8 * b));
+                    if (!c) { k = wc; break; }
+                    ext[el++] = c;
+                }
+            }
+            ext[el] = 0;
+            if (!strcmp(ext, "SPV_EXT_fragment_shader_interlock")) {
+                memmove(&w[i], &w[i + wc], (nw - i - wc) * sizeof *w);
+                nw -= wc;
+                continue;
+            }
+        }
         i += wc;
     }
+    if (il_dropped && why && why_size)
+        snprintf(why, why_size, "interlock_stripped: dropped %d interlock instruction(s)/mode(s); ordering semantics lost", il_dropped);
     if (nw * 4 != *n) atomic_fetch_add(&g_caps_stripped, 1);
     *n = nw * 4;
     return 0;
@@ -571,7 +615,12 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             { lp_fail(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
         {   char cw[128] = ""; const size_t sn0 = sn;
             if (s2a_libpack_spv_admit_caps(spv, &sn, cw, sizeof cw)) { lp_fail(why, why_size, "%s %s %s", khex, sname, cw); goto done; }
-            if (sn != sn0 && !atomic_exchange(&lp->caps_said, 1))   // 每局首次一行（信息级），之后只计数
+            if (!strncmp(cw, "interlock_stripped", 18)) {   // 真用临界区：指令/执行模式已剥、照常收录——按程序具名红 + 计数（首个程序键记账）
+                uint64_t n = atomic_fetch_add(&g_il_stripped, 1) + 1;
+                if (!atomic_exchange(&g_il_first_set, 1)) snprintf(g_il_first_key, sizeof g_il_first_key, "%s", khex);
+                LP_LOG("【红】interlock_stripped: program %s %s had a real critical section — interlock instructions/modes dropped, fragment read-modify-write no longer ordered (global stripped programs: %llu, first: %s)",
+                       khex, sname, (unsigned long long)n, g_il_first_key);
+            } else if (sn != sn0 && !atomic_exchange(&lp->caps_said, 1))   // 每局首次一行（信息级），之后只计数
                 LP_LOG("libpack_caps_stripped: program %s %s dropped %zu unused 64-bit capability declaration(s) (Float64/Int64 without a 64-bit type); counted per module, first one this session",
                        khex, sname, (sn0 - sn) / 8); }
         // 带几何的程序：每一段都不许写视口号 / 视口掩码（lp_spv_viewport_builtin，同现编具名拒）

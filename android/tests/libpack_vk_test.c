@@ -154,6 +154,22 @@ static const uint32_t CAP_F64_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u,
 static const uint32_t CAP_F64_CONST_SPV[] = { 0x07230203u, 0x00010000u, 0u, 4u, 0u,
     0x00020011u, 1u, 0x00020011u, 10u, 0x00030016u, 2u, 64u, 0x0005002bu, 2u, 3u, 0u, 0x3ff00000u };
 static const uint32_t CAP_I64A_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u, 0x00020011u, 1u, 0x00020011u, 12u };
+// CAP_IL：批翻链按宿主缺省挂 FragmentShaderPixelInterlockEXT(cap 5378) + "SPV_EXT_fragment_shader_interlock" 扩展名、
+//   但模块里一条 Begin/EndInvocationInterlockEXT 都没有（11-26 全库 8571 声明 / 0 真用）→ 两条都剥、留 Shader；
+//   CAP_IL_USED：真有临界区（Begin+End 指令 + PixelInterlockOrderedEXT 执行模式）→ 剥指令/执行模式/声明照常
+//   收录、信号 interlock_stripped（#1774：拒收整款缺 FS；剥了改变读写序语义，具名红 + 计数亮出来）
+static const uint32_t CAP_IL_SPV[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u,
+    0x00020011u, 1u, 0x00020011u, 5378u,
+    0x000A000Au, 0x5F565053u, 0x5F545845u, 0x67617266u, 0x746E656Du, 0x6168735Fu, 0x5F726564u, 0x65746E69u, 0x636F6C72u, 0x0000006Bu,
+    0x00030016u, 2u, 32u };
+static const uint32_t CAP_IL_USED_SPV[] = { 0x07230203u, 0x00010000u, 0u, 4u, 0u,
+    0x00020011u, 1u, 0x00020011u, 5378u,
+    0x000A000Au, 0x5F565053u, 0x5F545845u, 0x67617266u, 0x746E656Du, 0x6168735Fu, 0x5F726564u, 0x65746E69u, 0x636F6C72u, 0x0000006Bu,
+    0x00030010u, 9u, 5366u,   // OpExecutionMode %9 PixelInterlockOrderedEXT
+    0x000114F4u, 0x000114F5u, // OpBegin/EndInvocationInterlockEXT
+    0x00030016u, 2u, 32u };
+static const uint32_t CAP_IL_USED_WANT[] = { 0x07230203u, 0x00010000u, 0u, 4u, 0u,
+    0x00020011u, 1u, 0x00030016u, 2u, 32u };
 static const char *CS_F64_JSON =
     "{\"key\":\"f0f1f2f3f4f5f6f7_b\",\"stage\":\"cs\",\"dm_ctl\":\"f0f1f2f3f4f5f6f7\",\"bindings\":[]}";
 
@@ -946,6 +962,26 @@ int main(void) {
         CHECK(s2a_libpack_caps_stripped() == c0 + 1, "能力核：拒收的模块不计入删能力计数");
         uint32_t ok[sizeof CS_SPV / 4]; memcpy(ok, CS_SPV, sizeof ok); n = sizeof ok;
         CHECK(s2a_libpack_spv_admit_caps((uint8_t *)ok, &n, cw, sizeof cw) == 0 && n == sizeof CS_SPV, "能力核：无能力声明的模块原样过");
+    }
+    {   // interlock：声明了 cap 5378 + 扩展名但 Begin/End 指令为零 → 两条都剥；
+        // 真有临界区（指令 + 执行模式）→ 剥指令/执行模式/声明照常收录，信号 interlock_stripped（#1774：不拒整款）
+        uint32_t m[sizeof CAP_IL_SPV / 4]; memcpy(m, CAP_IL_SPV, sizeof m);
+        size_t n = sizeof m; char cw[128] = "";
+        const uint64_t c0 = s2a_libpack_caps_stripped();
+        const uint32_t want[] = { 0x07230203u, 0x00010000u, 0u, 3u, 0u, 0x00020011u, 1u, 0x00030016u, 2u, 32u };
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)m, &n, cw, sizeof cw) == 0 && n == sizeof want && !memcmp(m, want, sizeof want),
+              "interlock：cap 5378 + 扩展名、零指令 → 剥两条，留 Shader 与类型");
+        CHECK(s2a_libpack_caps_stripped() == c0 + 1, "interlock：剥过的模块计 1 条（libpack_caps_stripped）");
+        size_t n2 = n;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)m, &n2, cw, sizeof cw) == 0 && n2 == n, "interlock：剥后再核一遍不变（幂等）");
+        uint32_t u[sizeof CAP_IL_USED_SPV / 4]; memcpy(u, CAP_IL_USED_SPV, sizeof u); n = sizeof u; cw[0] = 0;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)u, &n, cw, sizeof cw) == 0 && strstr(cw, "interlock_stripped")
+              && n == sizeof CAP_IL_USED_WANT && !memcmp(u, CAP_IL_USED_WANT, sizeof CAP_IL_USED_WANT),
+              "interlock：有临界区 → 剥指令/执行模式/声明照常收录，信号 interlock_stripped，留 Shader 与类型");
+        cw[0] = 0; n2 = n;
+        CHECK(s2a_libpack_spv_admit_caps((uint8_t *)u, &n2, cw, sizeof cw) == 0 && n2 == n && !strstr(cw, "interlock_stripped"),
+              "interlock：剥后再核一遍不变（幂等），且不再报 stripped 信号");
+        CHECK(s2a_libpack_caps_stripped() == c0 + 2, "interlock：剥指令的模块也计入 libpack_caps_stripped");
     }
     if (fails) { printf("libpack_vk_test: %d FAIL\n", fails); return 1; }
     printf("libpack_vk_test: all checks passed\n");

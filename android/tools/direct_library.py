@@ -150,7 +150,7 @@ GEOMETRY_STAGES = ('vs', 'gs', 'fs')
 
 REQUEST_KEYS = frozenset(('request', 'schema', 'session', 'generation', 'requestId',
                           'directABI', 'translatorClosure', 'runtimeCompilerABI',
-                          'sourceParserVersion', 'kindCheck', 'profile', 'program'))
+                          'sourceParserVersion', 'kindCheck', 'debugMode', 'profile', 'program'))
 CAPTURE_KEYS = frozenset(('schema', 'directABI', 'translatorClosure', 'sourceParserVersion',
                           'profileHash', 'entries'))
 
@@ -700,6 +700,9 @@ def validate_request(raw, what):
     # 可选调试开关：native 过了调试门且 debug.s2a.kind_check=0 时才带 false；缺省表示校验开着。
     if 'kindCheck' in doc and not isinstance(doc['kindCheck'], bool):
         _fail(f'{what}.kindCheck is not a boolean')
+    # 可选调试开关：debug.s2a.xlate_debug=1 时才带 true；缺省表示翻译器走正常（非 DebugMode）口径。
+    if 'debugMode' in doc and not isinstance(doc['debugMode'], bool):
+        _fail(f'{what}.debugMode is not a boolean')
     _integer(doc['session'], f'{what}.session', 1, 2 ** 64 - 1)
     _integer(doc['generation'], f'{what}.generation', 1, 2 ** 64 - 1)
     # The device producer builds requestId from the stage keys (16 hex per stage); other legal

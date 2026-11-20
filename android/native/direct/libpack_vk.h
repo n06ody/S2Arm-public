@@ -78,6 +78,8 @@ uint64_t s2a_libpack_hits(void);
 uint64_t s2a_libpack_misses(void);
 uint64_t s2a_libpack_rejects(void);
 uint64_t s2a_libpack_caps_stripped(void);   // 删过用不上的 Float64 / Int64 能力声明的模块条数（libpack_caps_stripped）
+uint64_t s2a_libpack_interlock_stripped(void);        // 剥掉真用互锁指令/执行模式后照常收录的模块数（interlock_stripped，#1774）
+const char *s2a_libpack_interlock_first_key(void);    // 首个被剥互锁程序键 hex（没剥过 = 空串）
 
 #ifdef __cplusplus
 }
