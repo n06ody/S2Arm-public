@@ -275,6 +275,32 @@ def apk_probes(root, work, cs_project):
     return probes, sites
 
 
+def adpf_ndk_contract(root, work, toolchain):
+    """Check the minSdk object and type-check its dynamic bindings against API 34."""
+    source = Path(root) / "android/native/adpf_hint.c"
+    for api in (29, 34):
+        obj = work / ("adpf-api%d.o" % api)
+        compile_result = subprocess.run([
+            str(toolchain / "bin/clang"), "--target=aarch64-linux-android%d" % api,
+            "--sysroot=" + str(toolchain / "sysroot"), "-std=gnu11",
+            "-Werror=unguarded-availability", "-DS2A_ANDROID_DEBUG_ENV=1",
+            "-c", str(source), "-o", str(obj),
+        ], capture_output=True, text=True)
+        if compile_result.returncode:
+            print("【红】ADPF NDK API %d 编译失败" % api)
+            print(compile_result.stderr.strip())
+            return 1
+        symbols = subprocess.check_output([
+            str(toolchain / "bin/llvm-nm"), "--undefined-only", "--format=just-symbols", str(obj),
+        ], text=True)
+        direct = [name for name in symbols.splitlines() if name.startswith("APerformanceHint_")]
+        if direct:
+            print("【红】ADPF API %d 有直接导入：%s" % (api, ", ".join(direct)))
+            return 1
+    print("PASS ADPF：API 29 / 34 真头编译，0 个 APerformanceHint 直接导入")
+    return 0
+
+
 def apk_part(root, project, work, ndk, jobs, cs_project):
     """返回 (配置数, 链过数, 红行数, [构建目录…])。"""
     toolchain = ndk / "build/cmake/android.toolchain.cmake"
@@ -394,6 +420,7 @@ def main(argv=None):
             total, linked, red = total + n, linked + ok, red + r
             bdirs += [bdir] if bdir else []
         if "apk" in parts:
+            red += adpf_ndk_contract(root, work, base)
             n, ok, r, more = apk_part(root, project, work, ndk, a.jobs, a.cs_project)
             total, linked, red = total + n, linked + ok, red + r
             bdirs += more

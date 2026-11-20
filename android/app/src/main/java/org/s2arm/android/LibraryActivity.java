@@ -29,7 +29,8 @@ public final class LibraryActivity extends Activity {
     private final Set<String> listed = new HashSet<>();
     private final java.util.Map<String, String> names = new java.util.HashMap<>();
     private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
-    private static final int PICK_PACKAGE = 1, PICK_IN_PLACE = 2, ASK_LEGACY_READ = 3, SAVE_DIAGNOSTICS = 4, PICK_MOD_ZIP = 5, PICK_MOD_DIR = 6;
+    private static final int PICK_PACKAGE = 1, PICK_IN_PLACE = 2, ASK_LEGACY_READ = 3, SAVE_DIAGNOSTICS = 4,
+        PICK_MOD_ZIP = 5, PICK_MOD_DIR = 6, PICK_SAVE = 7;
     // 资源替换类 mod（GameMods）：面板打开时正中那张卡片的那一款；一次只做一件（导入 / 开关 / 删除）
     private String modsTitle;
     private boolean modsBusy;
@@ -42,6 +43,9 @@ public final class LibraryActivity extends Activity {
     // Bundle name waiting for the system file picker (kept across activity recreation).
     private String pendingSave;
     private static final String STATE_PENDING_SAVE = "pendingDiagnosticSave";
+    private static final String STATE_SAVE_TITLE = "pendingSaveTitle";
+    private String pendingSaveTitle;
+    private Button importSaveButton;
     // A caller opts in to consuming one direct child of files/import/.
     public static final String EXTRA_IMPORT_STAGING = "org.s2arm.android.IMPORT_STAGING";
     /** 电脑直传资源包（ImportReceiver）：开本地套接字 s2arm-import.&lt;包名&gt;，只收 adb（shell uid）连进来的一次传输。 */
@@ -51,7 +55,10 @@ public final class LibraryActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        if (state != null) pendingSave = state.getString(STATE_PENDING_SAVE);
+        if (state != null) {
+            pendingSave = state.getString(STATE_PENDING_SAVE);
+            pendingSaveTitle = state.getString(STATE_SAVE_TITLE);
+        }
         // 与 iOS 同一个样子（shell/Sources/ShellUI/CoverFlowView.swift）：横屏封面流，点正中的卡片开始玩。
         //   导入 / 帧率显示 / 诊断包不在主页面：右上「游戏设置」「设置」两个圆钮打开右侧面板（iOS 的设置页还没整套搬过来，先放这三项）。
         float density = getResources().getDisplayMetrics().density;
@@ -130,6 +137,10 @@ public final class LibraryActivity extends Activity {
         Button saveButton = new Button(this); saveButton.setText(R.string.save_diagnostics);
         saveButton.setOnClickListener(v -> exportDiagnostics(saveButton, true));
         more.addView(saveButton);
+        importSaveButton = new Button(this);
+        importSaveButton.setText(R.string.import_save);
+        importSaveButton.setOnClickListener(v -> pickSave());
+        more.addView(importSaveButton);
         // 资源替换类 mod（口径同 pack/jobs/mods.py）：按游戏放，落到这款起局用的 state 目录 mods/（GameMods.modsDir），下次起局叠上
         TextView modsHeader = new TextView(this); modsHeader.setText(R.string.mods_title); modsHeader.setTextColor(0xFFFFFFFF);
         more.addView(modsHeader);
@@ -519,6 +530,7 @@ public final class LibraryActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         if (pendingSave != null) state.putString(STATE_PENDING_SAVE, pendingSave);
+        if (pendingSaveTitle != null) state.putString(STATE_SAVE_TITLE, pendingSaveTitle);
     }
 
     /** Copies the exported bundle into the document the player created in the system file picker. */
@@ -541,6 +553,132 @@ public final class LibraryActivity extends Activity {
     }
 
     @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); }
+
+    private void pickSave() {
+        String title = shelf.selectedId();
+        if (title == null) {
+            show(getString(R.string.import_save_select_game));
+            return;
+        }
+        pendingSaveTitle = title;
+        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK_SAVE);
+    }
+
+    private java.io.File saveStaging() { return new java.io.File(getCacheDir(), "save-import"); }
+
+    private SaveImport saveImport() throws RuntimeLibrary.Rejected {
+        android.content.pm.ApplicationInfo app = getApplicationInfo();
+        RuntimeLibrary runtime = RuntimeLibrary.select(null, false, getFilesDir(), getCodeCacheDir(),
+            android.os.Process.myPid(), NativeBridge.loaded(), () -> GameSession.apkSha256(new java.io.File(app.sourceDir)));
+        NativeBridge.load(runtime, app.sourceDir, app.splitSourceDirs, app.nativeLibraryDir);
+        return new SaveImport(getFilesDir(), java.util.Locale.getDefault().toLanguageTag(), NativeBridge::saveTransfer);
+    }
+
+    private String saveErrorCode(Throwable error) {
+        if (error instanceof SaveImport.Failure failure && failure.code.matches("save_[a-z_]+")) return failure.code;
+        if (error instanceof GameStorage.Busy) return "save_busy";
+        if (error instanceof BootContract.BadGame) return "save_target";
+        if (error instanceof UnsupportedOperationException || error instanceof LinkageError || error instanceof RuntimeLibrary.Rejected)
+            return "save_unsupported_runtime";
+        return "save_import_failed";
+    }
+
+    private void showSaveError(Throwable error) {
+        String code = saveErrorCode(error);
+        android.util.Log.e("S2Arm", "Save import refused " + code);
+        String detail = error instanceof SaveImport.Failure ? error.getMessage()
+            : getString(R.string.import_save_access_failed);
+        show(getString(R.string.import_save_failed, code, detail));
+    }
+
+    private static void discardSave(java.nio.file.Path path) {
+        if (path == null) return;
+        try { java.nio.file.Files.deleteIfExists(path); }
+        catch (java.io.IOException error) { android.util.Log.w("S2Arm", "Save import staging cleanup failed", error); }
+    }
+
+    private void inspectSave(String title, android.net.Uri uri) {
+        importSaveButton.setEnabled(false);
+        show(getString(R.string.import_save_reading));
+        new Thread(() -> {
+            java.nio.file.Path staged = null;
+            try {
+                try (java.io.InputStream input = getContentResolver().openInputStream(uri)) {
+                    if (input == null) throw new java.io.IOException("save_open");
+                    staged = SaveArchive.stage(saveStaging().toPath(), input, -1);
+                }
+                SaveImport.Preview preview = saveImport().inspect(title, staged);
+                runOnUiThread(() -> {
+                    if (isDestroyed() || isFinishing()) discardSave(preview.archive);
+                    else confirmSave(preview);
+                });
+            } catch (java.io.IOException | BootContract.BadGame | RuntimeLibrary.Rejected | RuntimeException | LinkageError error) {
+                discardSave(staged);
+                runOnUiThread(() -> {
+                    if (isDestroyed()) return;
+                    importSaveButton.setEnabled(true);
+                    showSaveError(error);
+                });
+            }
+        }, "s2a-save-inspect").start();
+    }
+
+    private void confirmSave(SaveImport.Preview preview) {
+        StringBuilder message = new StringBuilder(getString(R.string.import_save_summary,
+            label(preview.title), preview.files, preview.bytes));
+        for (Object warning : preview.warnings) message.append("\n\n").append(warning);
+        boolean[] confirmed = {false};
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+            .setTitle(R.string.import_save_confirm_title)
+            .setMessage(message)
+            .setNegativeButton(R.string.library_switch_cancel, null)
+            .setPositiveButton(R.string.import_save_confirm, (dismissed, which) -> {
+                confirmed[0] = true;
+                restoreSave(preview);
+            })
+            .create();
+        dialog.setOnDismissListener(dismissed -> {
+            if (!confirmed[0]) {
+                discardSave(preview.archive);
+                importSaveButton.setEnabled(true);
+            }
+        });
+        dialog.show();
+    }
+
+    private void restoreSave(SaveImport.Preview preview) {
+        new Thread(() -> {
+            try {
+                SaveImport.Receipt receipt = saveImport().restore(preview);
+                runOnUiThread(() -> {
+                    if (!isDestroyed()) show(getString(R.string.import_save_done, receipt.files));
+                });
+            } catch (java.io.IOException | BootContract.BadGame | RuntimeLibrary.Rejected | RuntimeException | LinkageError error) {
+                runOnUiThread(() -> { if (!isDestroyed()) showSaveError(error); });
+            } finally {
+                discardSave(preview.archive);
+                runOnUiThread(() -> { if (!isDestroyed()) importSaveButton.setEnabled(true); });
+            }
+        }, "s2a-save-restore").start();
+    }
+
+    private void restoreReceivedSave(ImportReceiver.Received got, java.io.OutputStream output) throws java.io.IOException {
+        SaveImport.Receipt receipt;
+        try {
+            receipt = saveImport().restoreUnattended(got.saveTitle, got.dir.toPath());
+        } catch (java.io.IOException | BootContract.BadGame | RuntimeLibrary.Rejected | RuntimeException | LinkageError error) {
+            String code = saveErrorCode(error);
+            android.util.Log.e("S2Arm", "Save import refused " + code);
+            ImportReceiver.reply(output, "ERR " + code);
+            return;
+        } finally {
+            discardSave(got.dir.toPath());
+        }
+        String json = receipt.json();
+        ImportReceiver.reply(output, "OK " + json);
+        android.util.Log.i("S2Arm", "Save import receipt " + json);
+    }
 
     // 直传：本地套接字收一次资源包进私有 files/import/<名字>，收完照常 scanImports（按 index.tsv 逐文件核）。
     //   不经共享存储（FUSE）。只认 shell uid 的对端：别的 App 连进来直接断开、接着等
@@ -569,7 +707,12 @@ public final class LibraryActivity extends Activity {
                         }
                         timer.interrupt();
                         long t0 = System.nanoTime();
-                        ImportReceiver.Received got = ImportReceiver.receiveAny(c.getInputStream(), c.getOutputStream(), parent);
+                        ImportReceiver.Received got = ImportReceiver.receiveAny(c.getInputStream(), c.getOutputStream(),
+                            parent, saveStaging());
+                        if (got.saveTitle != null) {
+                            restoreReceivedSave(got, c.getOutputStream());
+                            return;
+                        }
                         if (got.inPlace) {   // 电脑已把资源目录 adb push 到共享存储：原地登记，不传字节
                             android.util.Log.i("S2Arm", "Game in-place request: " + got.dir);
                             runOnUiThread(() -> lib.registerInPlace(got.dir));
@@ -608,6 +751,12 @@ public final class LibraryActivity extends Activity {
             String name = pendingSave;
             pendingSave = null;
             if (result == RESULT_OK && data != null && data.getData() != null && name != null) saveDiagnostics(data.getData(), name);
+        }
+        if (request == PICK_SAVE) {
+            String title = pendingSaveTitle;
+            pendingSaveTitle = null;
+            if (title != null && result == RESULT_OK && data != null && data.getData() != null)
+                inspectSave(title, data.getData());
         }
     }
 
