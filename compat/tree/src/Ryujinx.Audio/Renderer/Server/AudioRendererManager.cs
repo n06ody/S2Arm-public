@@ -235,6 +235,7 @@ namespace Ryujinx.Audio.Renderer.Server
         /// </summary>
         private void SendCommands()
         {
+            _deviceDriver.GetRealDeviceDriver().S2AConfigureRenderThread();
             Logger.Info?.Print(LogClass.AudioRenderer, "Starting audio renderer");
 
             // S2Arm: this thread runs the 5 ms period loop (and the DSP itself when inline, the default): real-time scheduling,

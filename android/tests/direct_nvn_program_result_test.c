@@ -399,6 +399,7 @@ int main(void) {
             { ",\"c0Reads\":[[1600,4]]", ",\"c0Reads\":[[1604,0]]", -1, 0, 0, "zero-size range is rejected" },
             { ",\"c0Reads\":7", "", -1, 0, 0, "non-array c0Reads is rejected" },
             { ",\"c0Reads\":[[1604]]", "", -1, 0, 0, "single-element range is rejected" },
+            { ",\"c0Reads\":[],\"c0ReadsStatic\":7", "", -1, 0, 0, "invalid static c0 read metadata must be rejected" },
         };
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             char json[1024]; char msg[192];
@@ -411,6 +412,26 @@ int main(void) {
             snprintf(msg, sizeof msg, "%s (rc=%d vs=%d fs=%d why=%s)", cases[i].what, rc, p.stage[0].binst_unread, p.stage[1].binst_unread, why);
             if (cases[i].rc) CHECK(rc != 0 && strstr(why, "c0 read") != NULL, msg);
             else CHECK(rc == 0 && p.stage[0].binst_unread == cases[i].vs && p.stage[1].binst_unread == cases[i].fs, msg);
+            nvn_vk_program_free(&p);
+        }
+    }
+
+    // 同一个结果对象按开关选读集：动态可证仅开档省拷；静态可证两档都省；旧结果关档保守。
+    {
+        static const struct { const char *fields; int on, off; const char *why; } cases[] = {
+            { ",\"c0Reads\":[[0,1024]],\"c0ReadsStatic\":null", 1, 0, "bounded dynamic only proves on" },
+            { ",\"c0Reads\":[[0,4]],\"c0ReadsStatic\":[[0,4]]", 1, 1, "static proof works in both modes" },
+            { ",\"c0Reads\":[[1604,4]],\"c0ReadsStatic\":[[1604,4]]", 0, 0, "real base-instance read copied in both modes" },
+            { ",\"c0Reads\":null,\"c0ReadsStatic\":null", 0, 0, "unknown dynamic copied in both modes" },
+            { ",\"c0Reads\":[]", 1, 0, "legacy result without static proof is conservative when off" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char json[1024], msg[192];
+            int n = snprintf(json, sizeof json, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"%s\"%s},{\"stage\":\"fs\",\"spirv\":\"%s\"}],\"bindings\":[]}}", k_spirv, cases[i].fields, k_spirv);
+            memset(&p, 0, sizeof p); why[0] = 0;
+            int rc = nvn_vk_program_parse_graphics((const uint8_t *)json, (size_t)n, &p, why, sizeof why);
+            snprintf(msg, sizeof msg, "%s (rc=%d why=%s)", cases[i].why, rc, why);
+            CHECK(rc == 0 && nvn_vk_binst_unread(&p.stage[0], 1) == cases[i].on && nvn_vk_binst_unread(&p.stage[0], 0) == cases[i].off, msg);
             nvn_vk_program_free(&p);
         }
     }

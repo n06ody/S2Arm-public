@@ -39,6 +39,7 @@ s2a_gate_step bash "$android_dir/tests/diagnostics/run.sh"
 # Capacity selection is shared by the production Android host implementation.
 s2a_gate_step "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror "$android_dir/tests/capacity/policy_test.cpp" -o "$out/capacity-policy-test"
 s2a_gate_step "$out/capacity-policy-test"
+s2a_gate_step bash "$android_dir/tests/cf_dictionary_test.sh"
 # Linux 专项验证真实亲和、继承及音频路径；macOS 由 Linux 门禁执行。
 if [ "$(uname -s)" = Linux ]; then
     s2a_gate_step bash "$android_dir/tests/capacity/run_linux.sh" "$out/capacity"
