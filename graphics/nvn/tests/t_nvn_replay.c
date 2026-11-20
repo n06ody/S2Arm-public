@@ -3953,6 +3953,38 @@ static void t_land_verify_budget(void) {
     }
     g_flag_lv_cap_kb = g_flag_lv_kbps = -1;
 }
+// 与写跟踪去重（65c4aa804，相邻旧页跨位图字合并布防）同开：第 60–67 页是旧页、跨第 63 / 64 页的位图字边界，第 64–67 页整页在显卡写区间里。
+// 期望：整串只布防一次（子段沿用父段的代号，不重布防）、只传没被盖住的第 60–63 页、镜像里显卡写的第 64–67 页不被游戏内存里的旧值盖掉；
+// 落地之后游戏真写第 65 页，照样重搬那一页。
+static void t_land_gw_cross_word(void) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    land_case_setup();
+    const uint64_t base = (uint64_t)(uintptr_t)g_block_mem, all = BLOCK_TEST_PAGES * PG; nvn_gpu_buf b = NULL; uint64_t key = 0;
+    nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1 && b && b->cpu);
+    uint64_t id = rp_buf_gpu_write_note(base + 64 * PG, 4 * PG, &key); CHECK(id && key == base);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    if (b && b->cpu) memset(b->cpu + 64 * PG, 0xd6, 4 * PG);                                     // 显卡写进镜像
+    fake_log_event(60, 67); for (size_t k = 60; k <= 67; k++) { g_block_gen[k] = ++g_dirty_now; g_block_mem[k * PG] = (uint8_t)(0x30 + k); }
+    nvn_be_sub_begin();
+    const uint64_t sb0 = sync_bytes_now(); const int p0 = g_protects;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    const uint64_t moved = sync_bytes_now() - sb0; const int prot = g_protects - p0;
+    printf("gw cross word: moved=%llu protects=%d expected %d/1\n", (unsigned long long)moved, prot, 4 * PG);
+    CHECK(moved == 4 * PG);                                                                          // 只传第 60–63 页
+    CHECK(prot == 1);                                                                                // 整串只布防一次
+    if (b && b->cpu) { CHECK(b->cpu[63 * PG] == (uint8_t)(0x30 + 63)); CHECK(b->cpu[64 * PG] == 0xd6 && b->cpu[67 * PG] == 0xd6); }   // 显卡写的字节没被盖
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_land_fault_on = 1; g_land_fault_lo = 64; g_land_fault_hi = 67; rp_buf_gpu_write_land(key, id, 1); g_land_fault_on = 0;
+    CHECK(g_block_mem[64 * PG] == 0xd6);
+    fake_log_write(65, 0x65);                                                                         // 落地之后游戏真写
+    nvn_be_sub_begin(); const uint64_t sb1 = sync_bytes_now();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, all, &b, NULL) == 1);
+    CHECK(sync_bytes_now() - sb1 == PG);                                                             // 只重搬第 65 页（第 64、66、67 页核过、免搬）
+    if (b && b->cpu) CHECK(b->cpu[65 * PG] == 0x65);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    land_case_teardown();
+}
 static void t_land_noresync(void) {
     {   uint8_t ok = 0; uint64_t moved;
         for (int dl = 1; dl >= 0; dl--) for (int path = 0; path < 3; path++) {
@@ -6017,6 +6049,7 @@ int main(int argc, char **argv) {
     t_gpu_land_destroy();
     t_land_noresync();
     t_land_verify_budget();
+    t_land_gw_cross_word();
     t_gpu_land_count_cleanup();
 #endif
     t_buf_mirror();
