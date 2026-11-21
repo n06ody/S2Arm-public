@@ -68,7 +68,9 @@ static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
-static int g_pass_capture_test;
+static int g_pass_capture_test, g_pass_loop_test;
+static char g_pass_loop_log[24][600];
+static unsigned g_pass_loop_rows, g_pass_loop_end;
 static unsigned g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end, g_pass_capture_ticks;
 static unsigned g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions;
 static int32_t g_pass_key_hi, g_pass_key_lo;
@@ -77,7 +79,8 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (g_pass_capture_test && !strcmp(name, "nvk_gputime")) return 2;
     if (g_pass_capture_test && !strcmp(name, "nvk_pass_capture_s"))
         return g_pass_capture_test == 2 || !getenv("S2A_TEST_PRESENT_BGRA");
-    if (g_pass_capture_test == 2) {
+    if (g_pass_loop_test && !strcmp(name, "nvk_pass_loop_s")) return g_pass_loop_test == 1;
+    if (g_pass_capture_test == 2 || g_pass_loop_test) {
         if (!strcmp(name, "nvk_pass_key_hi")) return g_pass_key_hi;
         if (!strcmp(name, "nvk_pass_key_lo")) return g_pass_key_lo;
         if (!strcmp(name, "nvk_pass_constant")) return !getenv("S2A_TEST_PRESENT_BGRA");
@@ -116,6 +119,13 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (cls && text && !strcmp(cls, "pass-loop")) {
+        if (!strncmp(text, "phase=", 6) && g_pass_loop_rows < 24) {
+            snprintf(g_pass_loop_log[g_pass_loop_rows++], sizeof g_pass_loop_log[0], "%s", text);
+        }
+        if (!strcmp(text, "end frames=24")) g_pass_loop_end++;
+        printf("pass-loop %s\n", text);
+    }
     if (cls && text && !strcmp(cls, "pass-capture")) {
         if (g_pass_capture_test == 2) {
             if (strstr(text, g_pass_expected_identity) && strstr(text, "entry=main flags=0 blend=0 mask=ff bindings=1 omitted=0"))

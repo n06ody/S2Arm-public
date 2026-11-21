@@ -1851,6 +1851,67 @@ static void prog_note_use(const uint8_t sha[32], uint32_t stages, int nst, const
     nvk_prog_warm_note(&rec);
 }
 
+static int graphics_input_identity(const struct s2a_direct_compile_context *pc, const uint8_t profile[32],
+                                   uint32_t stages, int nst, const struct facts *f, struct s2a_input_identity *id) {
+    memset(id, 0, sizeof *id);
+    id->direct_abi = (int)pc->direct_abi;
+    id->translator_closure = pc->translator_closure;
+    memcpy(id->profile_sha, profile, 32);
+    id->stage_mask = stages;
+    for (int st = 0; st < nst; st++) {
+        const uint8_t *key = stage_key((unsigned)st);
+        if (!key) return 0;
+        memcpy(id->keys[st], key, 8);
+        if (s2a_source_identity(key, id->source_sha[st], &id->source_code_bytes[st], &id->source_control_bytes[st])) return 0;
+        id->source_present |= (uint8_t)(1u << st);
+    }
+    memcpy(id->ubo_use, f->ubo_use, sizeof id->ubo_use);
+    id->texture_array_length = (uint32_t)rp_S.tex_pool_n;
+    id->sampler_array_length = (uint32_t)rp_S.samp_pool_n;
+    id->transform_feedback_enabled = rp_S.tf_on;
+    id->gfx = &f->gfx;
+    id->textures = f->tex;
+    id->texture_count = f->ntex;
+    return 1;
+}
+
+const char *nvk_pass_loop_dir(void);
+const char *nvk_pass_loop_dir(void) { return nvn_plat_dir(NVN_PLAT_DIR_DIAG); }
+
+int nvk_pass_loop_facts(const struct rp_shader_req *q, char *out, size_t cap);
+int nvk_pass_loop_facts(const struct rp_shader_req *q, char *out, size_t cap) {
+    uint32_t stages = rp_shader_graphics_stages();
+    if (stages != 3u && stages != 7u) return 0;
+    struct s2a_direct_compile_context pc = {0};
+    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return 0;
+    const int nst = stages == 7u ? 3 : 2;
+    static struct facts f;
+    static uint8_t encoded[S2A_INPUT_IDENTITY_MAX];
+    uint8_t profile[32], digest[32];
+    char profile_hex[65], source_hex[65], requests[3][65], keys[2][17];
+    struct s2a_input_identity id;
+    fill_facts(q, &pc, &f, nst);
+    sha256(pc.profile_json, pc.profile_bytes, profile);
+    if (!graphics_input_identity(&pc, profile, stages, nst, &f, &id)) return 0;
+    s2a_sha256_hex(profile, profile_hex);
+    s2a_sha256_hex(id.source_sha[1], source_hex);
+    for (int st = 0; st < 2; st++) for (int b = 0; b < 8; b++)
+        snprintf(keys[st] + b * 2, 3, "%02x", id.keys[st][b]);
+    size_t n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (s2a_input_identity_encode(&id, encoded, sizeof encoded, &n)) return 0;
+        sha256(encoded, n, digest);
+        s2a_sha256_hex(digest, requests[i]);
+        memset(id.profile_sha, 0, sizeof id.profile_sha);
+        if (i == 1) id.texture_count = 0;
+    }
+    int len = snprintf(out, cap, "guest_vs=%s guest_fs=%s source_fs=%s request=%s request_noprofile=%s "
+                       "request_noprofile_notex=%s profile=%s texfacts=%d ssbo_align=%u unaligned=%d depth=%d yneg=%d",
+                       keys[0], keys[1], source_hex, requests[0], requests[1], requests[2], profile_hex, f.ntex,
+                       (unsigned)pc.storage_buffer_offset_alignment, f.gfx.unaligned_ssbo, f.gfx.depth_mode, f.gfx.y_negate);
+    return len >= 0 && (size_t)len < cap;
+}
+
 // [提交线程] 三段式的第二、三段：先查已发布与在途（不重复准备），否则捕获快照 → 工作 → 发布。
 static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pcp,
                         uint32_t stages, int nst, uint64_t group) {
@@ -1862,17 +1923,11 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     }
     static struct facts f;   // 提交线程独占；结构大，不放栈上
     fill_facts(q, &pc, &f, nst);
-    struct s2a_input_identity id; memset(&id, 0, sizeof id);
-    id.direct_abi = (int)pc.direct_abi; id.translator_closure = pc.translator_closure; memcpy(id.profile_sha, g_profile.sha, 32);
-    id.stage_mask = stages;
-    for (int st = 0; st < nst; st++) {
-        memcpy(id.keys[st], stage_key((unsigned)st), 8);
-        if (s2a_source_identity(stage_key((unsigned)st), id.source_sha[st], &id.source_code_bytes[st], &id.source_control_bytes[st])) { nvn_unimpl("shader", "source_snapshot_missing", NULL); return -1; }
-        id.source_present |= (uint8_t)(1u << st);
+    struct s2a_input_identity id;
+    if (!graphics_input_identity(&pc, g_profile.sha, stages, nst, &f, &id)) {
+        nvn_unimpl("shader", "source_snapshot_missing", NULL);
+        return -1;
     }
-    memcpy(id.ubo_use, f.ubo_use, sizeof id.ubo_use);
-    id.texture_array_length = (uint32_t)rp_S.tex_pool_n; id.sampler_array_length = (uint32_t)rp_S.samp_pool_n; id.transform_feedback_enabled = rp_S.tf_on;
-    id.gfx = &f.gfx; id.textures = f.tex; id.texture_count = f.ntex;
     static uint8_t idbuf[S2A_INPUT_IDENTITY_MAX]; size_t idlen = 0; uint8_t sha[32];
     if (s2a_input_identity_encode(&id, idbuf, sizeof idbuf, &idlen)) { nvn_unimpl("shader", "identity_encode_failed", NULL); return -1; }
     sha256(idbuf, idlen, sha);

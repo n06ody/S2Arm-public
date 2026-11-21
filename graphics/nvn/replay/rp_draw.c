@@ -77,6 +77,8 @@ extern int s2a_nvn_rast_flip;   // hle_nvn.c：当前提交队列的正面光栅
 // 没有身份（失败项 / 还没算出来）就不记。np 是刚取到的后端管线：清单在它上面存一个标签，之后换回同一条
 // 管线只加计数（不序列化、不散列、不查表）。
 int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p, nvn_gpu_pipe np) __attribute__((weak));
+int nvk_pass_loop_context(nvn_gpu_cmd c, const struct rp_shader_req *q,
+                          const uint8_t program[32]) __attribute__((weak));
 
 // 句柄放在游戏用户常量缓冲里的贴图（NVN_RB_TEXU；语义照 iOS nvn_mtl.m ubo_read / ubo_handle / ubo_packed / ubo_tex_id / ubo_samp_id / bind_sid）。
 // 一个字：常量槽 reg 的字节 off 处，编码这一刻从游戏内存读（同 NVN_RB_CBUF 绑的就是这一刻的内容）；槽没绑、越界、不在登记过的池里读作 0（iOS：空槽）
@@ -1738,6 +1740,12 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
     rp_occl_draw(c);
     rp_seg_prog_note(g_prog);   // 段失败行的「本段末笔程序键」：这笔真的要发射了才记
     nvn_gpu_draw(c, &a);
+    if (nvk_pass_loop_context && nvk_pass_loop_context(c, NULL, NULL)) {
+        struct rp_shader_req q = {.prim = prim, .rt_count = rt->n};
+        for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i])
+            q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
+        nvk_pass_loop_context(c, &q, g_prog->identity);
+    }
     for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++)   // 图形阶段写了的存储图像：内容归 GPU（CPU 读前要回读）
         if (g_gimg[st][i] && (g_prog->ent[st][i].access & NVN_GPU_ACC_W)) rp_tex_mark_gpu_written(g_gimg[st][i]);
     // 首用跳过判据的 seen 标记：本笔真画成了，每个颜色/深度目标记「近两帧画过」（跳过的笔不走到这里，故不记）。

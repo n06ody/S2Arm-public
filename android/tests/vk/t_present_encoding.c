@@ -245,9 +245,122 @@ done:
            enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
     g_pass_capture_test = 0;
 }
+static const char *g_pass_loop_dir;
+const char *nvk_pass_loop_dir(void) { return g_pass_loop_dir; }
+
+static void profile_loop_pixels(const char *dir, const char *sha, int enabled) {
+    char word[9] = {0};
+    memcpy(word, sha, 8);
+    g_pass_key_hi = (int32_t)strtoul(word, NULL, 16);
+    memcpy(word, sha + 8, 8);
+    g_pass_key_lo = (int32_t)strtoul(word, NULL, 16);
+    g_pass_loop_dir = dir;
+    g_pass_loop_test = enabled ? 1 : 2;
+    nvn_gpu_err e = {0};
+    CHECK(open_backend(), "pass loop open");
+    nvn_gpu_surface sf = NULL;
+    CHECK(OK(nvn_gpu_surface_attach((void *)1, &sf, &e)) && sf, "pass loop attach: %s", e.why);
+    if (!sf) goto done;
+    char path[512];
+    size_t vn = 0, fn = 0;
+    snprintf(path, sizeof path, "%s/pass_capture_fixture.vert.spv", dir);
+    void *vcode = read_file(path, &vn);
+    snprintf(path, sizeof path, "%s/pass_loop_fixture.spv", dir);
+    void *fcode = read_file(path, &fn);
+    CHECK(vcode && fcode, "pass loop shader fixtures");
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    nvn_gpu_layout_ent ents[] = {
+        {.set = 1, .binding = 1, .count = 1, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_R},
+        {.set = 2, .binding = 0, .count = 1, .cls = NVN_GPU_RES_TEX_SAMP, .access = NVN_GPU_ACC_R},
+    };
+    for (size_t i = 0; i < sizeof ents / sizeof ents[0]; i++) ents[i].stages = 1u << NVN_GPU_SH_FS;
+    nvn_gpu_layout empty = {0}, layout = {.ent = ents, .nent = 2};
+    nvn_gpu_shader_src src = {.stage = NVN_GPU_SH_VS, .kind = NVN_GPU_BLOB_SPIRV,
+                             .layout = &empty, .entry = "main", .blob = vcode, .bytes = vn};
+    CHECK(OK(nvn_gpu_shader_load(&src, &vs, &e)), "pass loop VS: %s", e.why);
+    src = (nvn_gpu_shader_src){.stage = NVN_GPU_SH_FS, .kind = NVN_GPU_BLOB_SPIRV,
+                              .layout = &layout, .entry = "main", .blob = fcode, .bytes = fn};
+    CHECK(OK(nvn_gpu_shader_load(&src, &fs, &e)), "pass loop FS: %s", e.why);
+    free(vcode); free(fcode);
+    if (!vs || !fs) goto done;
+    nvn_gpu_pipe_desc pd = {.samples = 1, .prim = 4, .color.logic_op = 3, .poly.mode = NVN_POLYGON_MODE_FILL,
+                            .origin_ll = 1, .chmask.mask = 0xff, .cfmt = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA8UI}};
+    pd.st[NVN_GPU_SH_VS].sh = vs;
+    pd.st[NVN_GPU_SH_FS].sh = fs;
+    nvn_gpu_pipe pipe = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "pass loop pipeline: %s", e.why);
+    if (!pipe) goto done;
+    nvn_gpu_tex input = make_tex(1, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex shown = make_tex(64, 36, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER);
+    nvn_gpu_tex aux = make_tex(64, 36, NVN_FORMAT_RGBA8UI, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view iv = make_view(input), sv = make_view(shown), av = make_view(aux);
+    nvn_gpu_samp samp = NULL;
+    CHECK(OK(nvn_gpu_samp_create(&(samp_par){0}, &samp, &e)), "pass loop sampler: %s", e.why);
+    size_t offset = g_dev.properties.limits.minStorageBufferOffsetAlignment;
+    if (offset < 64) offset = 64;
+    uint32_t initial[288] = {[63] = 0, [127] = 3, [207] = 64, [271] = 2};
+    nvn_gpu_buf source = NULL;
+    CHECK(OK(nvn_gpu_buf_create(offset + sizeof initial, NVN_GPU_MEM_DEVICE, NULL, &source, &e)),
+          "pass loop input SSBO: %s", e.why);
+    if (!iv || !sv || !av || !samp || !source) goto done;
+    const uint8_t white[4] = {255, 255, 255, 255};
+    nvn_gpu_cmd upload = begin_cmd();
+    nvn_gpu_tex_upload(upload, input, 0, 0, NULL, white, 4, 4);
+    nvn_gpu_buf_write(upload, source, offset, initial, sizeof initial);
+    CHECK(OK(nvn_gpu_cmd_commit(upload, 1, on_done, NULL, &e)), "pass loop upload: %s", e.why);
+    nvn_gpu_present_desc present = {.src = sv};
+    nvn_gpu_binding binds[] = {
+        {.ent = 0, .cls = NVN_GPU_RES_SSBO, .u.b = {source, offset, sizeof initial}},
+        {.ent = 1, .cls = NVN_GPU_RES_TEX_SAMP, .u.ts = {iv, samp}},
+    };
+    for (uint64_t i = 2; i <= 56; i++) {
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_pass_desc pass = {.w = 64, .h = 36, .layers = 1, .ncolor = 2};
+        pass.color[0].view = sv; pass.color[1].view = av;
+        pass.color[0].load = pass.color[1].load = NVN_GPU_LOAD_CLEAR;
+        pass.color[0].store = pass.color[1].store = NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(c, &pass);
+        nvn_gpu_set_pipe(c, pipe);
+        nvn_gpu_bind(c, NVN_GPU_SH_FS, binds, 2);
+        nvn_gpu_draw(c, &(nvn_gpu_draw_args){.prim = 4, .count = 3, .instances = 1});
+        nvn_gpu_pass_end(c);
+        CHECK(OK(nvn_gpu_cmd_commit(c, i, on_done, NULL, &e)), "pass loop commit: %s", e.why);
+        nvn_gpu_drawable d = {0};
+        CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass loop acquire: %s", e.why);
+        CHECK(OK(nvn_gpu_present(sf, &d, &present, i, NULL, NULL, &e)), "pass loop present: %s", e.why);
+        if (i == 2) nanosleep(&(struct timespec){1, 200000000}, NULL);
+    }
+    nvn_gpu_buf_release(source, NULL, NULL);
+    nvn_gpu_samp_release(samp);
+    nvn_gpu_view_release(iv); nvn_gpu_view_release(sv); nvn_gpu_view_release(av);
+    nvn_gpu_tex_release(input); nvn_gpu_tex_release(shown); nvn_gpu_tex_release(aux);
+done:
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "pass loop close: %s", e.why);
+    unsigned valid = 0;
+    for (unsigned j = 0; j < g_pass_loop_rows; j++) {
+        const char *line = g_pass_loop_log[j];
+        unsigned phase = 0;
+        if (sscanf(line, "phase=%u", &phase) == 1 && phase == j + 1 &&
+            strstr(line, "expected=144 samples=144 overlap=0 invalid=0") &&
+            strstr(line, "b1_range=1152 prefixes=1 prefix_mask=0000000000000001") &&
+            strstr(line, "read252=144 iter252=4536 at63_252=72 gt63_252=72") &&
+            strstr(line, "read508=144 iter508=360 at63_508=0 gt63_508=0 dref_pixels=72 dref_iters=72")) valid++;
+    }
+    CHECK(enabled ? (g_pass_loop_end == 1 && valid == 24 && valid == g_pass_loop_rows)
+                  : (!g_pass_loop_end && !g_pass_loop_rows),
+          "PASS_LOOP enabled=%d end=%u valid=%u recorded=%u", enabled, g_pass_loop_end, valid, g_pass_loop_rows);
+    printf("PASS_LOOP enabled=%d end=%u valid=%u recorded=%u\n", enabled, g_pass_loop_end, valid, g_pass_loop_rows);
+}
+
 int main(int argc, char **argv) {
     char why[256]={0};if(s2a_vk_device_create(&g_dev,why,sizeof why)) {fprintf(stderr,"device %s\n",why);return 2;}
     memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="original-present-grayscale";
+    if (argc == 4 && strlen(argv[2]) == 64 &&
+        (!strcmp(argv[3], "--pass-loop") || !strcmp(argv[3], "--pass-loop-off"))) {
+        profile_loop_pixels(argv[1], argv[2], !strcmp(argv[3], "--pass-loop"));
+        s2a_vk_device_destroy(&g_dev,1);
+        return g_fail != 0;
+    }
     profile_rendered_frames();
     if (argc > 2 && strlen(argv[2]) == 64) profile_constant_pixels(argv[1], argv[2]);
     if(!open_backend())return 2;
