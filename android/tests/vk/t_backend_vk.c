@@ -57,6 +57,7 @@ static int g_shown_timing_test;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
 static int g_compute_warm = -1;
+static int g_bar_flag;   // 冗余屏障合并 / 写串：1 = 调试开关 nvk_bar_dedupe 读成 1（后端每段开头读）
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
@@ -80,6 +81,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     // 整套用例在 nvk_fbdrop=2（自检档）下跑：视图销毁走快路之后再全表扫一遍，扫到残留（反查表没记到的帧缓冲）就报红，main 末尾核「残留 0」。
     if (!strcmp(name, "nvk_fbdrop") && g_fbdrop_flag != -2) return g_fbdrop_flag >= 0 ? g_fbdrop_flag : 2;   // -2 = 读成生产缺省（C201 核缺省档的行为）
     if (!strcmp(name, "nvk_stg_std") && g_stg_std_flag >= 0) return g_stg_std_flag;
+    if (!strcmp(name, "nvk_bar_dedupe")) return g_bar_flag;
     if (!strcmp(name, "nvk_pipe_cache") && g_plc_flag_off) return 0;
     if (!strcmp(name, "nvk_gputime") && atomic_load_explicit(&g_c207_gputime, memory_order_relaxed)) return 1;
     if (!strcmp(name, "nvk_upscale") && g_upscale_flag >= 0) return g_upscale_flag;
@@ -817,6 +819,37 @@ static void t02_write_copy(void) {
     nvn_gpu_buf_release(a, NULL, NULL);
     nvn_gpu_buf_release(b, NULL, NULL);
     wait_done(2);
+}
+
+// 写串（nvk_bar_dedupe）：同一命令缓冲上连续三笔按序写——第二笔与第一笔不重叠，共用一道屏障（省 1 道）；第三笔与第一笔重叠，必须照排屏障（负控）。
+// 再拷进另一个缓冲核内容：重叠处第三笔赢。开关关时一道都不省（对照）。同步校验层下不能报写后写冒险。
+uint64_t nvn_gpu_test_bar_skips(void);
+static void t02b_write_run(int on, uint64_t sig) {   // 自己一个会话：sig = 本会话里的提交序号；done 按相对计数等
+    uint8_t zero[256]; memset(zero, 0, sizeof zero);
+    nvn_gpu_buf a = make_buf(256, NVN_GPU_MEM_SHARED, zero), b = make_buf(256, NVN_GPU_MEM_SHARED, zero);
+    uint8_t w1[16], w2[16], w3[16];
+    for (int i = 0; i < 16; i++) { w1[i] = (uint8_t)(0x10 + i); w2[i] = (uint8_t)(0x40 + i); w3[i] = (uint8_t)(0x90 + i); }
+    g_bar_flag = on;
+    const int nd0 = atomic_load(&g_ndone);
+    nvn_gpu_cmd c = begin_cmd();
+    const uint64_t s0 = nvn_gpu_test_bar_skips();
+    nvn_gpu_buf_write(c, a, 0, w1, sizeof w1);
+    nvn_gpu_buf_write(c, a, 64, w2, sizeof w2);    // 不重叠：开时不排屏障
+    nvn_gpu_buf_write(c, a, 8, w3, sizeof w3);     // 与第一笔重叠：必须排屏障
+    const uint64_t skipped = nvn_gpu_test_bar_skips() - s0;
+    nvn_gpu_copy_buf(c, a, 0, b, 0, 256);
+    nvn_gpu_err e;
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, sig, on_done, NULL, &e);
+    CHECK(OK(r), "写串 commit：%d %s", r.code, e.why);
+    r = nvn_gpu_fence_wait(sig, 2000000000ull, &e);
+    CHECK(OK(r), "写串 wait：%d %s", r.code, e.why);
+    printf("写串 on=%d：省屏障 %llu 道，期望 %d\n", on, (unsigned long long)skipped, on ? 1 : 0);
+    CHECK(skipped == (on ? 1u : 0u), "写串 on=%d 省屏障 %llu 道，期望 %d", on, (unsigned long long)skipped, on ? 1 : 0);
+    const uint8_t *p = buf_cpu(b);
+    CHECK(!memcmp(p, w1, 8) && !memcmp(p + 8, w3, 16) && !memcmp(p + 64, w2, 16), "写串 on=%d 内容不对（重叠处应是第三笔）", on);
+    g_bar_flag = 0;
+    nvn_gpu_buf_release(a, NULL, NULL); nvn_gpu_buf_release(b, NULL, NULL);
+    CHECK(wait_until(&g_ndone, nd0 + 1, 5000), "写串 on=%d 等 done 回调超时", on);
 }
 
 // C05：录制进未提交 cmd 后立刻 release，真正销毁必须等提交段 done 之后。
@@ -11303,6 +11336,10 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;
     c49b_restart_pipe_cache(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C49b close：%d %s", e18.rc.code, e18.why);
+
+    if (!open_backend()) return 1;   // 写串（nvk_bar_dedupe）：开 / 关各一笔，自己一个会话
+    t02b_write_run(1, 1); t02b_write_run(0, 2);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "写串 close：%d %s", e18.rc.code, e18.why);
 
     c1501_clear_capacity(argv[1]);
     c88_pipe_cache(argv[1]);   // 每个会话自己开 / 关（带不同的 cache_dir）

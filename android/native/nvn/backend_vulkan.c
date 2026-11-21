@@ -58,9 +58,13 @@
 // 只改状态的绑定 / 设置 / 推常量不算。只在本编译单元录的命令上成立（nvk 的命令缓冲只在这里录）。
 // 另：CPU 侧每帧计数（0 GPU 开销）：全部管线屏障 / 其中全屏障 / 被合并掉的全屏障 / 布局转换 / 开通道。
 static uint64_t g_bar_cb;   // 最后一道全屏障后还干净的命令缓冲（0 = 没有）
+// 写串（同一开关）：最后一道全屏障之后，这个命令缓冲上只录过「暂存 → 缓冲」的按序写（g_bw_cb），写过的区间记在 g_bw_rng。
+// 再来一笔按序写、目标区间与它们都不重叠时，不需要屏障：之前的读写已被那道全屏障排完，这一串里只有互不重叠的传输写（暂存区由主机写、提交时可见）。
+// 区间满 16 段或重叠就照常排屏障、重新开串。任何别的工作命令（bar_work）结束这一串。
+static uint64_t g_bw_cb; static struct { const void *buf; uint64_t off, len; } g_bw_rng[16]; static int g_bw_nrng;
 static uint64_t g_bar_all, g_bar_full, g_bar_skip, g_bar_layout, g_bar_pass;
-static int g_bar_dedupe;
-static inline void bar_work(void) { __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); }
+static int g_bar_dedupe; static uint64_t g_bar_skip_tot;
+static inline void bar_work(void) { __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_bw_cb, 0, __ATOMIC_RELAXED); }
 static inline void bar_any(void) { bar_work(); __atomic_fetch_add(&g_bar_all, 1, __ATOMIC_RELAXED); }
 #undef vkCmdDraw
 #define vkCmdDraw(cb, ...) (bar_work(), w_vkCmdDraw(cb, __VA_ARGS__))
@@ -2898,12 +2902,24 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
     c->xfer_dirty = 0;
-    if (g_bar_dedupe && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
+    if (g_bar_dedupe && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     __atomic_fetch_add(&g_bar_full, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&g_bar_cb, (uint64_t)(uintptr_t)c->cb, __ATOMIC_RELAXED);   // 屏障之后才记（mem_barrier 里的时间戳探针会先清掉它）
 }
+// 按序写前的屏障：开关开着、本命令缓冲正处在写串里、目标区间与串里已写的都不重叠 → 不排；否则照常排全屏障并开新串。返回后调用方必须用 bw_copy 录拷贝
+static void bw_barrier(struct nvn_gpu_cmd_s *c, const void *buf, uint32_t n, const uint64_t *off, const uint64_t *len) {
+    const uint64_t cb = (uint64_t)(uintptr_t)c->cb;
+    int ok = g_bar_dedupe && __atomic_load_n(&g_bw_cb, __ATOMIC_RELAXED) == cb && g_bw_nrng + (int)n <= 16;
+    for (uint32_t i = 0; ok && i < n; i++) for (int k = 0; k < g_bw_nrng; k++)
+        if (g_bw_rng[k].buf == buf && g_bw_rng[k].off < off[i] + len[i] && off[i] < g_bw_rng[k].off + g_bw_rng[k].len) { ok = 0; break; }
+    if (ok) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); c->xfer_dirty = 0; }
+    else { full_barrier(c); g_bw_nrng = 0; }
+    for (uint32_t i = 0; i < n && g_bw_nrng < 16; i++) g_bw_rng[g_bw_nrng++] = (__typeof__(g_bw_rng[0])){buf, off[i], len[i]};
+}
+// 写串里的拷贝：绕开 bar_work 包装直接录（它本身就是串的一员），录完把串记在这个命令缓冲上
+#define bw_copy(c, ...) do { (w_vkCmdCopyBuffer)((c)->cb, __VA_ARGS__); __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_bw_cb, (uint64_t)(uintptr_t)(c)->cb, __ATOMIC_RELAXED); } while (0)
 
 
 static int buf_range(const struct nvn_gpu_buf_s *b, uint64_t off, uint64_t bytes) {
@@ -2928,9 +2944,9 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
         return;
     }
     memcpy(sl.cpu, src, (size_t)bytes);
-    full_barrier(c);
+    bw_barrier(c, b, 1, &off, &bytes);   // 写串里互不重叠的按序写共用一道屏障（nvk_bar_dedupe）
     VkBufferCopy bc = {sl.off, off, bytes};
-    vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, 1, &bc);
+    bw_copy(c, sl.buf->buffer, b->buffer, 1, &bc);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -2961,8 +2977,9 @@ void nvn_gpu_buf_write_multi(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint32_t n, const u
         bc[nb++] = (VkBufferCopy){sl.off + at, off[i], bytes[i]};
         at += (bytes[i] + 3) & ~3ull;
     }
-    full_barrier(c);   // 一道屏障管 n 段：段与段目标不重叠，彼此之间不需要顺序
-    vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, nb, bc);
+    {   uint64_t ro[64], rl[64]; for (uint32_t i = 0; i < nb; i++) { ro[i] = bc[i].dstOffset; rl[i] = bc[i].size; }
+        bw_barrier(c, b, nb, ro, rl); }   // 一道屏障管 n 段：段与段目标不重叠，彼此之间不需要顺序；写串里还可以与前面的写共用
+    bw_copy(c, sl.buf->buffer, b->buffer, nb, bc);
     c->xfer_dirty = 1;
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -8014,7 +8031,8 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->feedback_read_on = c->feedback_on && g.dev->load_store_op_none_enabled && nvn_plat_flag("nvk_fb_read", 0) != 0;
     {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
         static int on = -1; static unsigned on_k;
-        if (on < 0 || !(++on_k & 63)) { on = nvn_plat_flag("nvk_gputime", 0); g_bar_dedupe = nvn_plat_flag("nvk_bar_dedupe", 0) != 0; }   // 每 64 段重读一次：同进程开 / 关做 A/A（量探针开销）
+        if (on < 0 || !(++on_k & 63)) on = nvn_plat_flag("nvk_gputime", 0);
+        g_bar_dedupe = nvn_plat_flag("nvk_bar_dedupe", 0) != 0;   // 每段读：同局 ABAB 切档立即生效   // 每 64 段重读一次：同进程开 / 关做 A/A（量探针开销）
         c->ts_seg = on == 2;   // 2 = 只打段首尾（每帧十几个时间戳），不打逐通道槽、不做分账
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
@@ -8554,6 +8572,7 @@ void nvn_gpu_vk_test_delay_segment(uint64_t signal, uint32_t ms) {
 // 测试钩子（同步校验的检测器负控）：on = 0 时派发前不再按传输写补屏障，用来证明用例测得出缺屏障。只给测试用。
 void nvn_gpu_vk_test_xfer_barrier(int on) { g_test_no_xfer_bar = !on; }
 
+uint64_t nvn_gpu_test_bar_skips(void) { return __atomic_load_n(&g_bar_skip_tot, __ATOMIC_RELAXED); }   // 测试钩子：累计被省掉的屏障（冗余全屏障 + 写串）
 // 测试钩子（C207）：直接开 / 关诊断计时（nvk_gputime 的效果，g_draw_tm），并把逐笔读数的周期改成 draw_log_ns 纳秒（0 = 还原 5 秒）。只给测试用。
 void nvn_gpu_vk_test_diag_timing(int on, uint64_t draw_log_ns) {
     __atomic_store_n(&g_draw_log_ns, draw_log_ns ? draw_log_ns : 5000000000ull, __ATOMIC_RELAXED);
