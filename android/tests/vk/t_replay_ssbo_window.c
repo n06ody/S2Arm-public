@@ -62,6 +62,7 @@ uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return 1
 int rp_fence_done(uint64_t f){(void)f;return 1;}
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 int rp_post_gpu_write(uint64_t a,uint64_t n){(void)a;(void)n;return 0;}
 int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t base=(uint64_t)(uintptr_t)guest;if(a<base||n>sizeof guest||a-base>sizeof guest-n)return 0;if(m)*m=guest;if(s)*s=sizeof guest;return 1;}
 // Deliberately untracked pool: every resolve resynchronizes CPU pages, so real

@@ -60,6 +60,7 @@ int rp_fence_done(uint64_t f){return f<=nvn_gpu_fence_done();}
 static nvn_gpu_cmd active;
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 // GPU 写回登记：同 rp_exec.c 交给 rp_buf 的排除表；收尾不回写游戏内存
 static uint64_t wkey[4],wid[4];static int nw;
 int rp_post_gpu_write(uint64_t a,uint64_t n){if(nw>=4){return 0;}wid[nw]=rp_buf_gpu_write_note(a,n,&wkey[nw]);if(!wid[nw]){return 0;}nw++;return 1;}
