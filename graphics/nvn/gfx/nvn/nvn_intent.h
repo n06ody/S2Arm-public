@@ -8,6 +8,7 @@ struct nvn_intent {
     uint64_t pool_n[16], pool_b[16];     // 累计：按 (CPU 访问 0 无 / 1 不缓存 / 2 缓存 / 3 没给) × 4 + (GPU 访问同口径) 分桶的池个数 / 字节
     uint64_t pool_comp_b, pool_shader_b, pool_virt_b, pool_phys_b;   // 累计：带 COMPRESSIBLE / SHADER_CODE / VIRTUAL / PHYSICAL 的池字节
     uint64_t pool_noaccess_tracked_b;    // 累计：CPU_NO_ACCESS 却有存储、进了写跟踪的池字节
+    uint64_t pool_back_n[4], pool_back_b[4];   // 累计（安卓）：有存储的池按背板分——0 guest memfd（s2a-guest）/ 1 私有匿名（模块映像等）/ 2 共享匿名或其它文件 / 3 查不到
     uint64_t tex_n, tex_bit[11];         // 累计：建过的贴图数、各贴图标志位（DISPLAY / VIDEO_DECODE / IMAGE / COMPRESSIBLE / LINEAR / SPARSE / LINEAR_RT / ADAPTIVE_ZCULL / D16_FAST_CLEAR / MINIMAL_LAYOUT / ZCULL_STENCIL）的个数
 };
 void nvn_intent_take(struct nvn_intent *out);

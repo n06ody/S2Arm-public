@@ -316,8 +316,11 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     size_t o = (size_t)snprintf(b, sizeof b, "分时（收通道原因 × 尺寸，每帧）：");
                     for (int k = 0; k < RP_CUT_N; k++) { const uint64_t cn = pf[RP_PERF_CUTR_BASE + 3 * k]; if (!cn) continue;
                         o += (size_t)snprintf(b + o, sizeof b - o, "%s %.2f 次（全屏级 %.2f）共 %.2f 百万像素；", why[k], (double)cn / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 2] / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 1] / 1e3 / f); }
-                    snprintf(b + o, sizeof b - o, "主段 GPU 拷贝（缓冲同步）按成因：落地回流 %.0f KB、同提交第二次同步 %.0f KB、其余真脏 %.0f KB",
+                    o += (size_t)snprintf(b + o, sizeof b - o, "主段 GPU 拷贝（缓冲同步）按成因：落地回流 %.0f KB、同提交第二次同步 %.0f KB、其余真脏 %.0f KB",
                              (double)pf[RP_PERF_GX_LAND_KB] / f, (double)pf[RP_PERF_GX_SECOND_KB] / f, (double)pf[RP_PERF_GX_DIRTY_KB] / f);
+                    if (pf[RP_PERF_S5_NS]) snprintf(b + o, sizeof b - o, "；影子计数类 5（同步页与上次同步进同一镜像时内容比，KB）：相同 %.0f / 不同 %.0f / 无效 %.0f，其中落地回流页 相同 %.0f / 不同 %.0f / 无效 %.0f；算摘要 %.2f 毫秒",
+                             (double)pf[RP_PERF_S5_SAME_KB] / f, (double)pf[RP_PERF_S5_DIFF_KB] / f, (double)pf[RP_PERF_S5_INV_KB] / f,
+                             (double)pf[RP_PERF_S5_LSAME_KB] / f, (double)pf[RP_PERF_S5_LDIFF_KB] / f, (double)pf[RP_PERF_S5_LINV_KB] / f, (double)pf[RP_PERF_S5_NS] / 1e6 / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 if (nvn_intent_take) {   // 批 0 诊断探针：游戏显式意图
                     struct nvn_intent it; memset(&it, 0, sizeof it); nvn_intent_take(&it);
@@ -326,6 +329,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                         (unsigned long long)it.discard[0], (unsigned long long)it.discard[1], (unsigned long long)it.discard[2], (unsigned long long)it.discard[3], (unsigned long long)it.discard[4],
                         (unsigned long long)it.discard[5], (unsigned long long)it.discard[6], (unsigned long long)it.discard[7], (unsigned long long)it.discard[8]);
                     for (int k = 0; k < 16; k++) if (it.pool_n[k]) o += (size_t)snprintf(b + o, sizeof b - o, "%s×%s %llu/%.0f、", acc[k / 4], acc[k % 4], (unsigned long long)it.pool_n[k], (double)it.pool_b[k] / 1048576.0);
+                    static const char *const bk[4] = {"guest memfd", "私有匿名（模块映像等）", "共享匿名 / 其它", "查不到"};
+                    o += (size_t)snprintf(b + o, sizeof b - o, "按背板 ");
+                    for (int k = 0; k < 4; k++) if (it.pool_back_n[k]) o += (size_t)snprintf(b + o, sizeof b - o, "%s %llu/%.0f、", bk[k], (unsigned long long)it.pool_back_n[k], (double)it.pool_back_b[k] / 1048576.0);
                     o += (size_t)snprintf(b + o, sizeof b - o, "可压缩 %.0f MB、着色器代码 %.0f MB、虚拟 %.0f MB、物理 %.0f MB、CPU 不访问却进写跟踪 %.0f MB；贴图（累计 %llu 张）标志位：",
                         (double)it.pool_comp_b / 1048576.0, (double)it.pool_shader_b / 1048576.0, (double)it.pool_virt_b / 1048576.0, (double)it.pool_phys_b / 1048576.0, (double)it.pool_noaccess_tracked_b / 1048576.0, (unsigned long long)it.tex_n);
                     static const char *const tb[11] = {"显示", "视频解码", "图像/存储", "可压缩", "线性", "稀疏", "线性渲染目标", "自适应Z剔除", "D16快清", "最小布局", "Z剔除含模板"};

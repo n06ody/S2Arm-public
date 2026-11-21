@@ -4596,6 +4596,12 @@ static void land_restale_case(int mode) {
     const uint64_t moved = sync_bytes_now() - sb0;
     printf("land restale mode %d: moved=%llu expected %d\n", mode, (unsigned long long)moved, 4 * PG);
     CHECK(moved == 4 * PG);                                           // 撤登记时整段置旧：落地成功 / 落地失败都照常重搬 4 页
+    {   // 影子计数类 5：落地成功后重搬的 4 页与落地后的内容相同（落地回流·相同）；落地失败时摘要作废（落地回流·无效）
+        uint64_t p5[RP_PERF_N]; rp_perf_take(p5); const uint64_t pk = PG / 1024;
+        printf("shadow5 mode %d: lsame=%llu linv=%llu ldiff=%llu expected %llu/%llu/0\n", mode, (unsigned long long)p5[RP_PERF_S5_LSAME_KB], (unsigned long long)p5[RP_PERF_S5_LINV_KB], (unsigned long long)p5[RP_PERF_S5_LDIFF_KB],
+               (unsigned long long)(mode == 0 ? 4 * pk : 0), (unsigned long long)(mode == 0 ? 0 : 4 * pk));
+        CHECK(p5[RP_PERF_S5_LSAME_KB] == (mode == 0 ? 4 * pk : 0) && p5[RP_PERF_S5_LINV_KB] == (mode == 0 ? 0 : 4 * pk) && p5[RP_PERF_S5_LDIFF_KB] == 0);
+    }
     if (b && b->cpu && mode != 1) CHECK(!memcmp(b->cpu + 64 * PG, g_block_mem + 64 * PG, 4 * PG));   // 镜像与游戏内存一致
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     land_case_teardown();

@@ -121,7 +121,10 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_XO_BUF, RP_PERF_XO_TEX_UP, RP_PERF_XO_TEX_INIT, RP_PERF_XO_TEX_ZERO,   // 断遍探针：主段里按序录的传输按调用点（缓冲同步 / CPU 贴图第二次上传 / 新建存储取内容 / 待清零落地）
        RP_PERF_CUT_REOPEN_SAME, RP_PERF_CUT_REOPEN_OTHER, RP_PERF_CUT_KPIX,
        RP_PERF_CUTR_BASE, RP_PERF_CUTR_LAST = RP_PERF_CUTR_BASE + 3 * RP_CUT_N - 1,   // 收通道原因 × 尺寸：每个原因 3 项（次数 / 千像素 / 全屏级次数）
-       RP_PERF_GX_LAND_KB, RP_PERF_GX_SECOND_KB, RP_PERF_GX_DIRTY_KB,               // 主段 GPU 拷贝（缓冲同步）按成因：落地回流 / 同提交第二次同步 / 其余真脏（上次提交没做完等）          // 断遍探针：被「第二次同步」切掉的通道重开时同组目标 / 异组目标；被切通道首个目标的千像素和   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
+       RP_PERF_GX_LAND_KB, RP_PERF_GX_SECOND_KB, RP_PERF_GX_DIRTY_KB,
+       // 影子计数（类 5，只数不改动作）：每次缓冲同步的页与「上次同步进同一份镜像时」的内容摘要比——相同 / 不同 / 无效（第一次、或中间被显卡写过）；
+       //   落地回流页单列。NS = 算摘要花的 CPU 时间（开关 nvk_shadow5，缺省开）
+       RP_PERF_S5_SAME_KB, RP_PERF_S5_DIFF_KB, RP_PERF_S5_INV_KB, RP_PERF_S5_LSAME_KB, RP_PERF_S5_LDIFF_KB, RP_PERF_S5_LINV_KB, RP_PERF_S5_NS,               // 主段 GPU 拷贝（缓冲同步）按成因：落地回流 / 同提交第二次同步 / 其余真脏（上次提交没做完等）          // 断遍探针：被「第二次同步」切掉的通道重开时同组目标 / 异组目标；被切通道首个目标的千像素和   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间

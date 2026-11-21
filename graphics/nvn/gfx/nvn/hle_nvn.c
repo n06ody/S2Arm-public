@@ -411,9 +411,24 @@ void nvn_intent_take(struct nvn_intent *out) {
     out->pool_comp_b = __atomic_load_n(&g_intent.pool_comp_b, __ATOMIC_RELAXED); out->pool_shader_b = __atomic_load_n(&g_intent.pool_shader_b, __ATOMIC_RELAXED);
     out->pool_virt_b = __atomic_load_n(&g_intent.pool_virt_b, __ATOMIC_RELAXED); out->pool_phys_b = __atomic_load_n(&g_intent.pool_phys_b, __ATOMIC_RELAXED);
     out->pool_noaccess_tracked_b = __atomic_load_n(&g_intent.pool_noaccess_tracked_b, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++) { out->pool_back_n[i] = __atomic_load_n(&g_intent.pool_back_n[i], __ATOMIC_RELAXED); out->pool_back_b[i] = __atomic_load_n(&g_intent.pool_back_b[i], __ATOMIC_RELAXED); }
     out->tex_n = __atomic_load_n(&g_intent.tex_n, __ATOMIC_RELAXED);
     for (int i = 0; i < 11; i++) out->tex_bit[i] = __atomic_load_n(&g_intent.tex_bit[i], __ATOMIC_RELAXED);
 }
+#if defined(__ANDROID__) || defined(__OHOS__)
+static int intent_backing(const void *mem) {   // 池存储落在哪类映射上：/proc/self/maps 查起址所在的那一行（诊断探针；开池时一次）
+    FILE *fp = fopen("/proc/self/maps", "r"); if (!fp) return 3;
+    char ln[512]; int r = 3; const uintptr_t a = (uintptr_t)mem;
+    while (fgets(ln, sizeof ln, fp)) {
+        unsigned long lo, hi; char perm[8]; int pos = 0;
+        if (sscanf(ln, "%lx-%lx %7s %*s %*s %*s %n", &lo, &hi, perm, &pos) < 3 || a < lo || a >= hi) continue;
+        const char *path = pos > 0 ? ln + pos : "";
+        r = strstr(path, "memfd:s2a-guest") ? 0 : (perm[3] == 'p' && (!*path || *path == '\n' || *path == '[')) ? 1 : 2;
+        break;
+    }
+    fclose(fp); return r;
+}
+#endif
 static void intent_pool(uint32_t f, uint64_t size, int tracked) {
     const int cpu = f & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? 0 : f & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? 1 : f & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? 2 : 3;
     const int gpu = f & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS ? 0 : f & NVN_MEMORY_POOL_FLAGS_GPU_UNCACHED ? 1 : f & NVN_MEMORY_POOL_FLAGS_GPU_CACHED ? 2 : 3;
@@ -424,6 +439,14 @@ static void intent_pool(uint32_t f, uint64_t size, int tracked) {
     if (f & NVN_MEMORY_POOL_FLAGS_PHYSICAL) __atomic_fetch_add(&g_intent.pool_phys_b, size, __ATOMIC_RELAXED);
     if (cpu == 0 && tracked) __atomic_fetch_add(&g_intent.pool_noaccess_tracked_b, size, __ATOMIC_RELAXED);
 }
+static void intent_pool_backing(const void *mem, uint64_t size) {
+#if defined(__ANDROID__) || defined(__OHOS__)
+    const int k = intent_backing(mem);
+#else
+    const int k = 3; (void)mem;
+#endif
+    __atomic_fetch_add(&g_intent.pool_back_n[k], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_intent.pool_back_b[k], size, __ATOMIC_RELAXED);
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->nvmap = ((const pool_builder_x *)b)->native;   // native：构建器给的 nvmap 句柄（SetNativeHandleNVX），MemoryPoolGetNativeHandleNVX 回它
@@ -433,6 +456,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     if (!o->mem && (o->flags & 0x200)) o->mem = vpool_reserve(o);   // every virtual pool: its own address range, a page table over physical pools (see MapVirtual)
     else if (o->mem) { nvn_be_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
     intent_pool((uint32_t)o->flags, o->size, o->mem && !(o->flags & 0x200));   // 意图探针
+    if (o->mem && !(o->flags & 0x200)) intent_pool_backing(o->mem, o->size);   // 意图探针：池背板类别
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】 MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     // Switch 2（NVN2）：池建在 gsv GPU 可访问内存上，那段内存的 GPU 虚拟地址就是它的 CPU 虚拟地址，缓冲区地址 = 存储的 CPU 地址；游戏会拿 GetBufferAddress 的结果加偏移直接用 CPU 读写
     //   （#351：给窗口地址时 CPU 读 0xC086D00000 一带非法地址崩）。所以 NVN2 不另分窗口地址，pool_ga 回存储地址，nvn_ga2ca 对它原样过。窗口只给 Switch 1（大页对齐语义，见上）

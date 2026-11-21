@@ -48,7 +48,9 @@ struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t 
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
                 int failed;   // 第一份镜像建不出来：记住，之后这个池直接按未接返回，不再每笔重建（池释放时随表项删掉，重建池会重试）
                 struct land_rng lr[16]; int nlr;
-                uint64_t *probe_land; };   // 批 0 诊断探针：撤登记时整段置旧的页（落地回流），每页一位，第一次用到时分配
+                uint64_t *probe_land;      // 批 0 诊断探针：撤登记时整段置旧的页（落地回流），每页一位，第一次用到时分配
+                uint64_t *s5h[2]; }; static void s5_invalidate(struct shadow *s, uint64_t off, uint64_t len);   // 影子计数类 5（定义在 land_restale 前）
+      // 影子计数类 5：每份镜像每页上次同步进去的内容摘要（0 = 无效），第一次用到时分配   // 批 0 诊断探针：撤登记时整段置旧的页（落地回流），每页一位，第一次用到时分配
 static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finish 与提交互斥）
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
@@ -94,7 +96,7 @@ static void mirror_free(struct mirror *m, int defer) {
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->probe_land); free(s); }
+                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->probe_land); free(s->s5h[0]); free(s->s5h[1]); free(s); }
 // 镜像映射代号：新建镜像、换镜像都会让「同一段地址解析出的 (缓冲, 偏移)」变掉。回放核心的解析结果缓存按它作废。
 
 // ---------- 脏页追加日志（nvk_buf_dirtylog，#1501 A②）----------
@@ -332,6 +334,7 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
                 g->off = lo; g->len = hi - lo;
+                s5_invalidate(s, off, len);   // 影子计数类 5：显卡要写这段，镜像里的旧摘要作废
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
                 rp_perf_add(RP_PERF_GW_MERGED_KB, (len > grow ? len - grow : 0) / 1024);
@@ -342,6 +345,7 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
         }
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
+            s5_invalidate(s, off, len);   // 影子计数类 5：显卡要写这段，镜像里的旧摘要作废
             id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
@@ -367,6 +371,43 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
 // 落地撤登记时（锁内）：显卡写区间整页盖住的页在登记存活期间被清过旧位（sync_run 里拆出时，那时它们的字节全是显卡写的）。
 // 登记一撤，这些页就是普通页：重新置旧，下次使用照常整页重搬（与没有「显卡写区间里不进同步」时一样）。只对脏页日志路径的那份镜像（逐页路径靠 synced 与代号）。
 // 不在落地后核对、不布防：9000 b4r3 单变量——落地后立即布防把下一次缺页挪进回放、贴图纪元快路失效、整张重传 ×15、GPU 忙 +15 ms（cap_kb=0 只关这一步即回到比 main 更好）。
+// 影子计数类 5（只数不改动作）：页内容摘要。页 k 只算落在池内的那一段；结果恒非 0（0 留给「无效」）
+static int g_s5_on = -1; static unsigned g_s5_k;
+static int s5_on(void) { if (g_s5_on < 0 || !(++g_s5_k & 255)) g_s5_on = nvn_plat_flag("nvk_shadow5", 1) != 0; return g_s5_on; }
+static uint64_t s5_page_hash(const struct shadow *s, uint64_t k) {
+    const size_t ps = nvn_dirty_page_size();
+    uintptr_t a = s->page0 + (uintptr_t)(k * ps), e = a + ps; const uintptr_t lo = (uintptr_t)s->mem, hi = lo + s->size;
+    if (a < lo) a = lo;
+    if (e > hi) e = hi;
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ (uint64_t)(e - a);
+    const uint8_t *p = (const uint8_t *)a; size_t n = e > a ? e - a : 0, i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h | 1;
+}
+static uint64_t *s5_tab(struct shadow *s, int mi) {
+    if (!s->s5h[mi]) s->s5h[mi] = calloc((size_t)s->npages + 1, sizeof *s->s5h[mi]);
+    return s->s5h[mi];
+}
+static void s5_invalidate(struct shadow *s, uint64_t off, uint64_t len) {   // 显卡写过的页：两份镜像的摘要都作废
+    if (!len || !s->npages) return;
+    const size_t ps = nvn_dirty_page_size(); const uintptr_t a = (uintptr_t)s->mem + off, b = a + len;
+    const uint64_t k0 = (a - s->page0) / ps, k1 = (b - s->page0 + ps - 1) / ps;
+    for (int mi = 0; mi < 2; mi++) if (s->s5h[mi]) for (uint64_t k = k0; k < k1 && k < s->npages; k++) s->s5h[mi][k] = 0;
+}
+static uint64_t s5_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+// 影子计数类 5：落地成功后这份镜像与游戏内存的整页一致，摘要记成落地后的内容；首尾不整的页作废。落地失败（镜像有显卡写的、游戏内存没有）只作废
+static void s5_land(struct shadow *s, int mi, uint64_t off, uint64_t len, int landed) {
+    if (len && off < s->size && s5_on()) {
+        const uint64_t t0 = s5_ns(); const uint64_t l2 = len > s->size - off ? s->size - off : len;
+        const size_t ps = nvn_dirty_page_size(); const uintptr_t a = (uintptr_t)s->mem + off, b = a + l2;
+        const uint64_t f0 = (a - s->page0 + ps - 1) / ps, f1 = (b - s->page0) / ps;
+        s5_invalidate(s, off, l2);
+        uint64_t *t = landed ? s5_tab(s, mi) : NULL;
+        if (t) for (uint64_t k = f0; k < f1 && k < s->npages; k++) t[k] = s5_page_hash(s, k);
+        rp_perf_add(RP_PERF_S5_NS, s5_ns() - t0);
+    }
+}
 static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
     struct mirror *m = &s->m[mi];
     if (m->path != MP_LOG || !m->stale || !len || off >= s->size) return;
@@ -409,6 +450,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 写它的那一份镜像里本来就是新的，不动（受跟踪的池里落地的 memcpy 自己会让页变脏）。
     if (ok && s->untracked) pages_invalidate_locked(s, off, len, wmi);
     land_restale(s, wmi, off, len);
+    s5_land(s, wmi, off, len, src != NULL);
     s->landing--;
     __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 锁内撤登记与计数保持一致
     if (!s->landing) pthread_cond_broadcast(&g_land_cv);   // 池销毁 / 会话收尾可安全解除目标映射
@@ -488,9 +530,16 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
         {   // 批 0 诊断探针：主段 GPU 拷贝（录成拷贝的同步）按成因分账——落地回流 / 同提交第二次同步 / 其余真脏；直接写的只清标记
             const uint64_t pkb = nvn_dirty_page_size() / 1024; uint64_t pl = 0, po = 0;
+            const int s5 = s5_on(); const int mi5 = (int)(m - s->m); uint64_t *t5 = s5 ? s5_tab(s, mi5) : NULL; const uint64_t t0 = s5 ? s5_ns() : 0;
+            uint64_t c5[6] = {0};   // 相同 / 不同 / 无效；落地回流页的相同 / 不同 / 无效
             for (uint64_t k = i; k <= j; k++) {
-                if (s->probe_land && (s->probe_land[k >> 6] >> (k & 63) & 1)) { s->probe_land[k >> 6] &= ~(1ull << (k & 63)); pl++; } else po++;
+                const int lb = s->probe_land && (s->probe_land[k >> 6] >> (k & 63) & 1);
+                if (lb) { s->probe_land[k >> 6] &= ~(1ull << (k & 63)); pl++; } else po++;
+                if (t5) { const uint64_t hv = s5_page_hash(s, k); c5[(lb ? 3 : 0) + (!t5[k] ? 2 : t5[k] == hv ? 0 : 1)]++; t5[k] = hv; }
             }
+            if (t5) { static const int id5[6] = {RP_PERF_S5_SAME_KB, RP_PERF_S5_DIFF_KB, RP_PERF_S5_INV_KB, RP_PERF_S5_LSAME_KB, RP_PERF_S5_LDIFF_KB, RP_PERF_S5_LINV_KB};
+                      for (int q = 0; q < 6; q++) if (c5[q]) rp_perf_add(id5[q], c5[q] * pkb);
+                      rp_perf_add(RP_PERF_S5_NS, s5_ns() - t0); }
             if (!d) { if (pl) rp_perf_add(RP_PERF_GX_LAND_KB, pl * pkb); if (po) rp_perf_add(last == rp_sub_serial() ? RP_PERF_GX_SECOND_KB : RP_PERF_GX_DIRTY_KB, po * pkb); }
         }
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
