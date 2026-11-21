@@ -91,7 +91,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
                 return;
             }
 
-            StartThread();
+            StartThread(deviceDriver.GetRealDeviceDriver());
 
             _mailbox.SendMessage(MailboxMessage.Start);
 
@@ -103,26 +103,34 @@ namespace Ryujinx.Audio.Renderer.Dsp
 
         public void Stop()
         {
-            if (S2AInline)
+            if (_workerThread?.IsAlive == true)
             {
-                foreach (IHardwareDevice d in OutputDevices)
+                _mailbox.SendMessage(MailboxMessage.Stop);
+                MailboxMessage response = _mailbox.ReceiveResponse();
+                // Startup rollback may leave the DSP's first RenderEnd unread.
+                if (response == MailboxMessage.RenderEnd)
                 {
-                    d.Dispose();
+                    response = _mailbox.ReceiveResponse();
                 }
 
-                return;
+                if (response != MailboxMessage.Stop)
+                {
+                    throw new InvalidOperationException("Audio Processor Stop response was invalid!");
+                }
+                _workerThread.Join();
             }
+            _workerThread = null;
 
-            _mailbox.SendMessage(MailboxMessage.Stop);
-
-            if (_mailbox.ReceiveResponse() != MailboxMessage.Stop)
+            _mailbox?.Dispose();
+            _mailbox = null;
+            IHardwareDevice[] devices = OutputDevices;
+            OutputDevices = null;
+            if (devices != null)
             {
-                throw new InvalidOperationException("Audio Processor Stop response was invalid!");
-            }
-
-            foreach (IHardwareDevice device in OutputDevices)
-            {
-                device.Dispose();
+                foreach (IHardwareDevice device in devices)
+                {
+                    device?.Dispose();
+                }
             }
         }
 
@@ -360,9 +368,13 @@ namespace Ryujinx.Audio.Renderer.Dsp
             return true;
         }
 
-        private void StartThread()
+        private void StartThread(IHardwareDeviceDriver deviceDriver)
         {
-            _workerThread = new Thread(Work)
+            _workerThread = new Thread(() =>
+            {
+                deviceDriver.S2AConfigureRenderThread();
+                Work();
+            })
             {
                 Name = "AudioProcessor.Worker",
             };
@@ -389,8 +401,6 @@ namespace Ryujinx.Audio.Renderer.Dsp
             {
                 Ryujinx.Common.S2AThreadAlloc.Tick("声音 DSP"); // S2Arm: per-thread allocation accounting
 
-                _pauseEvent?.WaitOne();
-
                 MailboxMessage message = _mailbox.ReceiveMessage();
 
                 if (message == MailboxMessage.Stop)
@@ -400,6 +410,7 @@ namespace Ryujinx.Audio.Renderer.Dsp
 
                 if (message == MailboxMessage.RenderStart)
                 {
+                    _pauseEvent?.WaitOne();
                     Render();
 
                     _mailbox.SendResponse(MailboxMessage.RenderEnd);

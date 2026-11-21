@@ -72,6 +72,13 @@ int nvk_pf_wait(nvk_pf *t, int handle, void **obj, char *why, size_t why_cap) {
     int code = e->used ? e->code : 0;
     void *got = e->used ? e->obj : NULL;
     if (e->used && why && why_cap) { strncpy(why, e->why, why_cap - 1); why[why_cap - 1] = 0; }
+    // 成功就必须有对象：(NULL,0) 交付给等待侧就是「成功拿到空管线」——调用方会把 NULL 当对象往下用，
+    //   成员偏移解引即崩（真实 0x28 崩溃链：pipe->dsl[2] 正在 +0x28）。两类来源都堵在这：
+    //   建者错误地发布 (NULL,0)，或表项在放行前被复用（e->used==0 且无 code）。
+    if (!got && !code) {
+        code = -1;
+        if (why && why_cap) { const char *m = "管线在途表交付了空对象"; strncpy(why, m, why_cap - 1); why[why_cap - 1] = 0; }
+    }
     if (e->used && --e->users == 0) { e->used = 0; e->done = 0; e->obj = NULL; e->why[0] = 0; }
     pthread_mutex_unlock(&t->mu);
     *obj = got;

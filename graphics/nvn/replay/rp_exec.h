@@ -90,6 +90,9 @@ extern uint64_t rp_gpu_wr_gen;
 void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec);   // OP_MULTI_DRAW：整段间接计数多绘一次交后端
 void rp_draw_stats(uint64_t *draws, uint64_t *skips);
 // 分时读数：自上次取走以来的累计（纳秒 / 次数），取走即清零
+// 收通道原因（批 0 诊断探针，rp_pass_cut_why）：每次结束开着的通道按原因记次数 / 千像素 / 其中全屏级（≥100 万像素）的次数
+enum { RP_CUT_OTHER = 0, RP_CUT_XFER, RP_CUT_RT, RP_CUT_CLEAR, RP_CUT_MASK, RP_CUT_AREA, RP_CUT_OP, RP_CUT_SUBMIT, RP_CUT_REPORT, RP_CUT_BUF, RP_CUT_DRAW, RP_CUT_N };
+void rp_pass_cut_why(int why);   // 下一次 rp_pass_end 结束开着的通道时记到这个原因名下（只记一次，记完回到 OTHER）
 enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_PERF_WAIT_N, RP_PERF_DONE_NS, RP_PERF_DONE_N, RP_PERF_PASSES, RP_PERF_PRESENT_NS,
        RP_PERF_D_PROG, RP_PERF_D_PREP, RP_PERF_D_TEX, RP_PERF_D_PIPE, RP_PERF_D_DYN, RP_PERF_D_BIND, RP_PERF_D_DRAW, RP_PERF_D_TAIL, RP_PERF_D_PASS, RP_PERF_D_PGET, RP_PERF_PB_VIEW, RP_PERF_PB_BAR, RP_PERF_PB_BE, RP_PERF_PB_MARK, RP_PERF_RES_LOCK, RP_PERF_RES_NEW, RP_PERF_RES_INIT, RP_PERF_RES_VIEWMAKE, RP_PERF_PB_SHADOW, RP_PERF_RES_SCAN, RP_PERF_RES_UP, RP_PERF_RES_UPN, RP_PERF_RES_ZERO, RP_PERF_RES_ZERON, RP_PERF_RES_MAKE, RP_PERF_RES_ZDEFER, RP_PERF_BIND_SLICE_HIT, RP_PERF_BIND_SKIP,   // 绑定：段内切片表命中的块数、整组沿用没发的阶段数
       
@@ -116,6 +119,14 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
+       RP_PERF_BUF_SYNC_GW_KB,
+       RP_PERF_XO_BUF, RP_PERF_XO_TEX_UP, RP_PERF_XO_TEX_INIT, RP_PERF_XO_TEX_ZERO,   // 断遍探针：主段里按序录的传输按调用点（缓冲同步 / CPU 贴图第二次上传 / 新建存储取内容 / 待清零落地）
+       RP_PERF_CUT_REOPEN_SAME, RP_PERF_CUT_REOPEN_OTHER, RP_PERF_CUT_KPIX,
+       RP_PERF_CUTR_BASE, RP_PERF_CUTR_LAST = RP_PERF_CUTR_BASE + 3 * RP_CUT_N - 1,   // 收通道原因 × 尺寸：每个原因 3 项（次数 / 千像素 / 全屏级次数）
+       RP_PERF_GX_LAND_KB, RP_PERF_GX_SECOND_KB, RP_PERF_GX_DIRTY_KB,
+       // 影子计数（类 5，只数不改动作）：每次缓冲同步的页与「上次同步进同一份镜像时」的内容摘要比——相同 / 不同 / 无效（第一次、或中间被显卡写过）；
+       //   落地回流页单列。NS = 算摘要花的 CPU 时间（开关 nvk_shadow5，缺省开）
+       RP_PERF_S5_SAME_KB, RP_PERF_S5_DIFF_KB, RP_PERF_S5_INV_KB, RP_PERF_S5_LSAME_KB, RP_PERF_S5_LDIFF_KB, RP_PERF_S5_LINV_KB, RP_PERF_S5_NS,               // 主段 GPU 拷贝（缓冲同步）按成因：落地回流 / 同提交第二次同步 / 其余真脏（上次提交没做完等）          // 断遍探针：被「第二次同步」切掉的通道重开时同组目标 / 异组目标；被切通道首个目标的千像素和   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
@@ -168,12 +179,17 @@ int rp_fr_perf_on(void);   // 开关（nvk_hitch_log，进程内缓存一次，�
 void rp_fr_perf_take(uint64_t out[RP_FR_N]);   // [上屏] 取走本帧分项并清零；每帧只调一次（与 rp_frame_take 同一个帧边界）
 int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t draws, uint64_t subs, const uint64_t fr[RP_FR_N]);   // 长帧行（见 rp_exec.c）
 uint64_t rp_sub_serial(void);   // 第几次提交（一次提交内可复用的暂存内容按它判）
+struct rp_prog;
+// 录制侧：记一笔「本段已发射的绘制 / 派发用了哪个程序」（段失败日志打本段末 ≤4 笔的阶段键；
+// rp_draw 在实际落命令前调；线程：[提交]，当前段开着才记）
+void rp_seg_prog_note(const struct rp_prog *p);
 void rp_perf_take(uint64_t out[RP_PERF_N]);
 void rp_draw_reset(void);
 void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳过的）各出一行日志；0 = 关
 
 // 资源同步用的段（见 rp_exec.c）：通常是先于主段提交的前置段；同一资源本次提交里第二次同步时结束当前通道、回到主段。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub);
+void rp_pass_note_cut(void);   // 断遍探针：rp_xfer_cmd 收通道前记下被切通道的目标（rp_pass.c）
 // 遮挡计数（rp_exec.c）：通道与绘制那边的接入点
 int rp_occl_want(void);                 // 开通道时：要不要声明遮挡计数
 void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);
