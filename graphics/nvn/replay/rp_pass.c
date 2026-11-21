@@ -23,6 +23,8 @@
 
 // 首用跳过开关（安卓 demand 层，弱引用）：iOS / 鸿蒙 / 宿主单测没有实现 → 不标记，行为同现状。
 int nvn_vk_pipe_demand_on(void) __attribute__((weak));
+// 弱链接[replay]：nvn_vk_nvnbar_pass_barrier
+void nvn_vk_nvnbar_pass_barrier(nvn_gpu_cmd, uint32_t) __attribute__((weak));
 #pragma weak s2a_fu_rt_mark_fresh   // 只编回放核的宿主门禁可能没链接 nvn_first_use.c；缺实现时 enabled 为假、不会调用
 static int rp_pass_fu_enabled(void) { return nvn_vk_pipe_demand_on && nvn_vk_pipe_demand_on(); }
 
@@ -278,6 +280,17 @@ static void pipe_shape(uint32_t cf[8], uint32_t *dfmt, uint32_t *sfmt, uint32_t 
 // 一个通道可以同时吃掉好几个目标的清除，纯清除通道就没了。
 // 身份 = 贴图序号 + 级 + 层 + 类别（颜色 / 深度模板）：同一张图挂不同视图还是同一份存储，级 / 层取自视图记录。
 // 正确性红线：挂着的图在被读（采样 / 图像 / 拷贝端点 / 上屏）之前必须先落地（rp_pass_land_reads），否则读到没清过的旧内容。
+// 一次性安卓诊断：只标记实际开出的物理通道，不介入清除的落地决策。
+#if defined(__ANDROID__)
+extern void nvn_vk_pass_capture_reason(nvn_gpu_cmd c, const char *reason) __attribute__((weak));
+#endif
+static void pass_capture_reason(nvn_gpu_cmd c, const char *reason) {
+#if defined(__ANDROID__)
+    if (nvn_vk_pass_capture_reason) nvn_vk_pass_capture_reason(c, reason);
+#else
+    (void)c; (void)reason;
+#endif
+}
 enum { PK_COLOR = 0, PK_DEPTH = 1 };   // 类别：颜色槽 / 深度模板
 enum { PK_ENT = 16, PK_GRP = 8 };      // 挂起项 / 目标组（一组 = 一次 SET_RT 的附件表；落地时一组开一个只做清除的通道）
 static struct {                        // 挂起项
@@ -310,11 +323,11 @@ static int park_find(uint64_t ser, uint32_t lv, uint32_t ly, int kind) {   // �
     }
     return -1;
 }
-static void park_land_group(nvn_gpu_cmd c, int g);
+static void park_land_group(nvn_gpu_cmd c, int g, const char *reason);
 static void park_land_oldest(nvn_gpu_cmd c) {   // 表满：先把挂得最早的一组落地（等于把旧行为的一次提前落地搬到这里）
     int g = -1;
     for (int k = 0; k < PK_GRP; k++) if (g_pkg[k].used && (g < 0 || g_pkg[k].seq < g_pkg[g].seq)) g = k;
-    if (g >= 0) park_land_group(c, g);
+    if (g >= 0) park_land_group(c, g, "park-capacity");
 }
 static int park_group(nvn_gpu_cmd c) {   // 当前目标那一组：按附件表比（rt_same）；没有就新建（组也满了先落地最早的一组）
     for (int g = 0; g < PK_GRP; g++) if (g_pkg[g].used && rt_same(&g_pkg[g].rt, &P.rt)) return g;
@@ -377,7 +390,7 @@ static void park_gc(void) {   // 空了的组放掉（组位有限）
 // 落地一组：用这一组自己的附件表开一个只做清除的通道（开通道时把这一组的挂起项吃掉），开完就结束。
 // 落地要开通道，所以当前通道先收掉（调用方随后会重开它：rp_draw 的贴图解析循环在开通道之前调，见 rp_pass_land_reads）。
 // 管线形状与脏位是给「有绘制的通道」记的：落地通道一笔都不画，前后原样还原，不打扰下一笔。
-static void park_land_group(nvn_gpu_cmd c, int g) {
+static void park_land_group(nvn_gpu_cmd c, int g, const char *reason) {
     if (!g_pkg[g].used) return;
     int any = 0; for (int e = 0; e < PK_ENT; e++) if (g_pk[e].used && g_pk[e].grp == g) any = 1;
     if (c && any) {
@@ -387,7 +400,10 @@ static void park_land_group(nvn_gpu_cmd c, int g) {
         uint32_t sc[8], sd, ss, sm; memcpy(sc, P.shape_c, sizeof sc); sd = P.shape_d; ss = P.shape_s; sm = P.shape_smp;
         int sok = P.shape_ok; uint8_t pso = rp_pso_dirty, dss = rp_dss_dirty;
         P.rt = g_pkg[g].rt; P.has_rt = 1;
-        if (pass_begin_colors(c, 0xff)) rp_pass_end(c);   // 显式清除不受绘制写掩码影响
+        if (pass_begin_colors(c, 0xff)) {   // 显式清除不受绘制写掩码影响
+            pass_capture_reason(c, reason);
+            rp_pass_end(c);
+        }
         P.rt = save_rt; memcpy(P.kept, save_kept, sizeof save_kept); P.has_rt = save_has;
         memcpy(P.shape_c, sc, sizeof sc); P.shape_d = sd; P.shape_s = ss; P.shape_smp = sm; P.shape_ok = sok;
         rp_pso_dirty = pso; rp_dss_dirty = dss;
@@ -401,7 +417,7 @@ static void park_land_all(nvn_gpu_cmd c) {
         int g = -1;
         for (int k = 0; k < PK_GRP; k++) if (g_pkg[k].used && (g < 0 || g_pkg[k].seq < g_pkg[g].seq)) g = k;
         if (g < 0) return;
-        park_land_group(c, g);
+        park_land_group(c, g, "park-flush");
     }
 }
 static void park_drop_all(void) { memset(g_pk, 0, sizeof g_pk); memset(g_pkg, 0, sizeof g_pkg); g_pk_seq = 0; }
@@ -419,7 +435,7 @@ void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n) {
                 uint64_t ser; uint32_t lv, ly; pk_id(e, &ser, &lv, &ly);
                 if (ser == ts[k]->serial) hit = 1;
             }
-            if (hit) park_land_group(c, g);
+            if (hit) park_land_group(c, g, "park-read");
         }
     }
 }
@@ -485,6 +501,7 @@ static void pass_land_full(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, int color,
         one.clear_depth = d->clear_depth; one.clear_stencil = d->clear_stencil;
     }
     nvn_gpu_pass_begin(c, &one);
+    pass_capture_reason(c, "clear-larger-than-fb");
     nvn_gpu_pass_end(c);
     rp_perf_add(RP_PERF_PASSES, 1);
     rp_tex_mark_gpu_written(t);
@@ -553,7 +570,11 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         }
     }
     PB(RP_PERF_PB_VIEW);
-    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    if (P.barrier_bits) {
+        if (nvn_vk_nvnbar_pass_barrier) nvn_vk_nvnbar_pass_barrier(c, P.barrier_bits);
+        else nvn_gpu_barrier(c, P.barrier_bits);
+        P.barrier_bits = 0;
+    }
     PB(RP_PERF_PB_BAR);
     d.occlusion = (uint8_t)rp_occl_want();
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0;
@@ -605,6 +626,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     P.area_want = 0;
     P.pass_w = d.w; P.pass_h = d.h;
     nvn_gpu_pass_begin(c, &d);
+    if (ntake || pdpk >= 0) pass_capture_reason(c, "park-fold");
     // 大附件已单独落地；剩下的 CLEAR 尺寸等于公共范围，开通道后才可标 fresh。
     if (rp_pass_fu_enabled()) {
         uint64_t ff = rp_frame();
