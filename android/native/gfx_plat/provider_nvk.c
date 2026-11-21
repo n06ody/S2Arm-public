@@ -800,7 +800,8 @@ static int32_t destroy_impl(void *context) {
     g_retained_context = ctx; // 等待期间也不允许新 prepare 覆盖 owner。
     pthread_mutex_unlock(&g_window_mu);
     uint64_t deadline = nvk_session_stop_deadline();
-    if (!deadline || device_idle_bounded(ctx, deadline)) return S2A_DIRECT_RES_RETIREMENT;
+    if (!deadline || nvk_session_wait_compiles() || device_idle_bounded(ctx, deadline))
+        return S2A_DIRECT_RES_RETIREMENT;
     if (ctx->device_ok) {
         if (s2a_vk_device_destroy(&ctx->device, 1)) return S2A_DIRECT_RES_RETIREMENT;
         ctx->device_ok = 0;

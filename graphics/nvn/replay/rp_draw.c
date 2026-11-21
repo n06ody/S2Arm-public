@@ -150,6 +150,8 @@ uint32_t nvk_fu_unsafe_ms(void) __attribute__((weak));
 #pragma weak s2a_fu_wait_decide
 #pragma weak s2a_fu_rt_mark_seen
 
+// 弱链接[replay]：rp_occl_want
+#pragma weak rp_occl_want
 static int rp_fu_enabled(void) { return nvn_vk_pipe_demand_on && nvn_vk_pipe_demand_on(); }
 static uint64_t rp_fu_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static struct s2a_fu_budget g_fu_budget;   // 本帧首用等待总账（iOS g_pp_bud_*）；只提交线程碰
@@ -199,6 +201,17 @@ static int rp_fu_skip_safe(const p_set_rt *rt) {
         if (!s2a_fu_rt_seen_steady(rt->depth->serial, sk, (uint64_t)rt->depth->d.format, frame)) return 0;
     }
     return targets > 0;
+}
+// 还没有程序反射时也必须保护可能的写入和查询。逐槽检查实际绑定，不借上一笔程序的反射。
+static int rp_live_compile_defer_frame(uint64_t *frame) {
+    if (!rp_fu_enabled() || !rp_occl_want || rp_occl_want() ||
+        !s2a_fu_rt_fresh_now || !s2a_fu_rt_seen_steady) return 0;
+    for (unsigned st = 0; st < sizeof rp_S.img / sizeof rp_S.img[0]; st++)
+        for (unsigned slot = 0; slot < sizeof rp_S.img[0] / sizeof rp_S.img[0][0]; slot++)
+            if (rp_S.img[st][slot]) return 0;
+    if (!rp_fu_skip_safe(rp_pass_target())) return 0;
+    *frame = rp_frame();
+    return 1;
 }
 static nvn_gpu_rc rp_fu_ok(void) { nvn_gpu_rc r; r.code = NVN_GPU_OK; return r; }
 // 首用取管线：kick→PENDING 时按 iOS pso_pend_take 的判定限时等/跳；可安全丢才跳，否则按 unsafe 上限等一次后标 stuck。
@@ -1286,6 +1299,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     if (!g_prog || rp_pso_dirty || args_dirty) {
         struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
         for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
+        q.compile_defer_frame = rp_live_compile_defer_frame;
         const struct rp_prog *np = NULL;
         int sr = rp_shader_resolve(&q, &np);
         if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }

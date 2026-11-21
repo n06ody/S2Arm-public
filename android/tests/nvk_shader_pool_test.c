@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
+#include <time.h>
 #include "nvn.h"
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -15,6 +17,7 @@
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "direct/compile_request.h"
+#include "direct/compile_worker.h"
 #include "direct/input_identity.h"
 #include "direct/source_store.h"
 #include "direct/sha256.h"
@@ -31,6 +34,9 @@
 
 // 实现在 nvk_shader.c，声明在 nvk_session.h。这里不包 nvk_session.h：nvk_compile_stop_test.py 拿本文件当夹具，
 // 会在同一个翻译单元里把 nvk_session_request_stop 等会话函数定义成 static，包了头就是「static 声明跟在非 static 声明后面」，编不过。
+int nvk_shader_open(void);
+void nvk_shader_stop(void);
+unsigned nvk_shader_inflight(void);
 uint64_t nvk_shader_cs_fast_hits(void);
 int nvk_shader_last_allocated(void);
 void nvk_shader_last_test_put(uint64_t key, const struct rp_prog *prog);
@@ -56,6 +62,36 @@ static int fake_cs_success, cs_loads;
 int g_s2a_logfd = 2;
 static const char *fake_compile_error;
 static const char *fake_compile_file;
+static pthread_t last_compiler_thread;
+static int fixture_live_compile, fixture_live_slots, fixture_live_frame_ms = 100, fixture_live_unsafe_ms = 10000;
+static pthread_mutex_t live_gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t live_gate_cv = PTHREAD_COND_INITIALIZER;
+static int live_gate_hold, live_gate_entered;
+static void live_gate_pause(void) {
+    pthread_mutex_lock(&live_gate_mu);
+    if (live_gate_hold) {
+        live_gate_entered = 1;
+        pthread_cond_broadcast(&live_gate_cv);
+        while (live_gate_hold) pthread_cond_wait(&live_gate_cv, &live_gate_mu);
+    }
+    pthread_mutex_unlock(&live_gate_mu);
+}
+static int live_gate_wait(void) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&live_gate_mu);
+    while (!live_gate_entered) if (pthread_cond_timedwait(&live_gate_cv, &live_gate_mu, &deadline)) break;
+    int entered = live_gate_entered;
+    pthread_mutex_unlock(&live_gate_mu);
+    return entered;
+}
+static void live_gate_release(void) {
+    pthread_mutex_lock(&live_gate_mu);
+    live_gate_hold = 0;
+    pthread_cond_broadcast(&live_gate_cv);
+    pthread_mutex_unlock(&live_gate_mu);
+}
 static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512], last_request_reason[512];
 static int ubo_default_lines; static char last_ubo_default_line[512];   // 常量缓冲句柄指向没登记的贴图：每局首次的那一行（片 4）
 static char reason_history[8192];
@@ -73,6 +109,10 @@ void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
+    if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
+    if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
+    if (!strcmp(name, "fu_unsafe_ms")) return fixture_live_unsafe_ms;
     if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
@@ -157,10 +197,12 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
+    last_compiler_thread = pthread_self();
     CHECK(session == 4 && gen == 6, "compile session");
     CHECK(req.bytes < sizeof captured, "request fits capture");
     if (req.bytes >= sizeof captured) return -1;
     memcpy(captured, req.data, (size_t)req.bytes); captured[req.bytes] = 0; compiler_calls++;
+    live_gate_pause();
     if (fake_ubo_missing && !strstr(captured, "\"stage\":\"fs\",\"handle\":92,\"cbufSlot\":3,")) {
         static const char err[] = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=fs,handle=92,cbufSlot=3)\"}";
         s2a_direct_bytes payload = {(const uint8_t *)err, sizeof err - 1};
@@ -1497,7 +1539,103 @@ static int diag_compile_test(void) {
     printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
 }
 
+static int live_compile_thread_test(void) {
+    fixture_live_compile = -1;   // simulate an unset property and exercise the production default
+    fixture_live_slots = 2;
+    CHECK(nvk_shader_open() == 0, "open shader session");
+    struct s2a_compile_worker_stats slots;
+    s2a_compile_worker_stats(&slots);
+    CHECK(slots.slots == 2, "session passes its configured slot count to the compiler worker");
+    rp_state_reset(); source(); bind_pools(64);
+    fake_array_count = 64;
+    fake_cs_success = 1;
+    struct rp_shader_req q = {.prim = 4};
+    const struct rp_prog *graphics = NULL, *compute = NULL, *again = NULL;
+    int rc = rp_shader_resolve(&q, &graphics);
+    CHECK(rc == 0 && graphics && !graphics->is_compute && compiler_calls == 1,
+          "graphics first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
+    if (compiler_calls == 1)
+        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
+              "graphics live compiler ran on the submitting thread");
+    rc = rp_shader_resolve_compute(&compute);
+    CHECK(rc == 0 && compute && compute->is_compute && compiler_calls == 2,
+          "compute first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
+    if (compiler_calls == 2)
+        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
+              "compute live compiler ran on the submitting thread");
+    CHECK(rp_shader_resolve(&q, &again) == 0 && again == graphics && compiler_calls == 2,
+          "second graphics lookup reuses the published program");
+    CHECK(rp_shader_resolve_compute(&again) == 0 && again == compute && compiler_calls == 2,
+          "second compute lookup reuses the published program");
+    nvk_shader_stop(); rp_shader_reset(); s2a_source_clear();
+    printf("live-compile-thread checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+static int fixture_defer_frame(uint64_t *frame) {
+    *frame = 1;
+    return 1;
+}
+
+static int live_compile_pending_test(int stop) {
+    fixture_live_compile = 1;
+    fixture_live_frame_ms = 0;
+    fixture_live_unsafe_ms = stop ? 20 : 2000;
+    live_gate_hold = 1;
+    CHECK(nvk_shader_open() == 0, "open async session");
+    rp_state_reset(); source(); bind_pools(64); fake_array_count = 64;
+    struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    const struct rp_prog *p = NULL;
+    CHECK(rp_shader_resolve(&q, &p) == 1 && !p, "exhausted safe budget must defer, with no program");
+    CHECK(live_gate_wait(), "compiler is still gated on worker");
+    CHECK(rp_shader_resolve(&q, &p) == 1 && !p, "second use while pending must not publish a program");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == 1 && stats.pending == 2, "same pending request must enqueue once (enqueued=%llu pending=%llu)",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.pending);
+    q.compile_defer_frame = NULL;
+    if (stop) {
+        CHECK(rp_shader_resolve(&q, &p) < 0 && !p, "unsafe hard deadline must report failure, not skip or publish");
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.timeout == 1 && stats.pending == 0, "unsafe deadline must count timeout separately");
+        // Keep the active translator held while saturating the real worker queue.
+        for (unsigned i = 0; i < S2A_CW_QUEUE_MAX; i++) {
+            uint8_t filler_key[32] = {(uint8_t)i, 0xff};
+            CHECK(s2a_compile_worker_submit_async(1, 1, "{}", 2, filler_key, NULL, 0) == 0,
+                  "queue accepts filler %u while active compile is held", i);
+        }
+        fake_cs_success = 1;
+        CHECK(rp_shader_resolve_compute(&p) < 0 && !p, "full queue must fail a bounded compute first use explicitly");
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.timeout == 1 && stats.pending == 0 && stats.enqueued == 0,
+              "full queue must not count the rejected compute as queued or skippable");
+        CHECK(nvk_shader_inflight() == 1, "waiting resolver gone but worker retains session admission");
+        nvk_shader_stop();
+        CHECK(nvk_shader_open() < 0, "must not reopen while retired compile is still in provider");
+        live_gate_release();
+        CHECK(s2a_compile_worker_stop_bounded(2000, NULL, 0) == 0, "stopped worker eventually retires");
+        rp_shader_reset();
+        CHECK(nvk_shader_open() == 0, "session may reopen after old worker quiesces");
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 2,
+              "completion from stopped session must not satisfy the same request after reopen");
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && p->is_compute && compiler_calls == 3,
+              "a compute first use refused by the full queue must be admitted on retry");
+    } else {
+        live_gate_release();
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 1,
+              "deferred result must be installed on re-use without recompiling");
+    }
+    nvk_shader_stop();
+    CHECK(s2a_compile_worker_stop_bounded(2000, NULL, 0) == 0, "stop retires worker");
+    rp_shader_reset(); s2a_source_clear();
+    printf("live-compile-%s checks=%d failures=%d\n", stop ? "stop" : "pending", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test();
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();

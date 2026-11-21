@@ -4,6 +4,7 @@
 #include "nvn_plat.h"
 #include "rp_exec.h"
 #include "direct/vk_device.h"
+#include "direct/compile_worker.h"
 #include "nvn/nvn_warm.h"   // 预热调度：会话 open 后起、Stop 前收（nvn_warm.h 合同）
 #include "nvn/nvn_vk_pipe_demand.h"   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
 #include <android/log.h>
@@ -58,6 +59,15 @@ int nvk_session_wait_compiles(void) {
             return -1;
         }
         struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL);
+    }
+    // Shader admission can reach zero just before a worker exits. Retire
+    // idle threads inside the same Stop deadline so a retry can open a pool.
+    const uint64_t now = mono_ns();
+    const uint32_t remaining_ms = now < deadline ? (uint32_t)((deadline - now) / 1000000ull) : 0;
+    char why[128] = "";
+    if (s2a_compile_worker_stop_bounded(remaining_ms, why, sizeof why)) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk stop compiler pool: %s", why);
+        return -1;
     }
     __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop exit shader wait: elapsed=%llums in_flight=0", (unsigned long long)((mono_ns() - start) / 1000000ull));
     return 0;

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "direct/compile_worker.h"
 #include "gfx_plat/nvk_session.h"
 #include "nvn_backend.h"
 #include "nvn_unimpl.h"
@@ -23,7 +24,10 @@ int __android_log_print(int level, const char *tag, const char *fmt, ...) {
     if (log_n < sizeof logs) { int n=vsnprintf(logs+log_n, sizeof logs-log_n, fmt, ap); if (n>0 && (size_t)n < sizeof logs-log_n) log_n+=(size_t)n; }
     va_end(ap); return 0;
 }
-void nvk_shader_stop(void) { atomic_store(&stop_seen, 1); }
+void nvk_shader_stop(void) {
+    atomic_store(&stop_seen, 1);
+    (void)s2a_compile_worker_stop_bounded(0, NULL, 0);
+}
 unsigned nvk_shader_inflight(void) { return atomic_load(&outstanding); }
 int nvk_shader_open(void) { atomic_fetch_add(&shader_open_calls, 1); return 0; }
 int nvk_warm_stop(void) { return 0; }   // #996 起停局先停预热带与需求建管线（本用例只量会话收尾等待）
@@ -44,8 +48,32 @@ void rp_present_stats(uint64_t *s, uint64_t *d) { *s = *d = 0; }
 nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *e) { (void)d; (void)e; atomic_fetch_add(&backend_open_calls,1); return (nvn_gpu_rc){NVN_GPU_OK}; }
 void nvn_gpu_caps_get(nvn_gpu_caps *c) { memset(c, 0, sizeof *c); }
 nvn_gpu_rc nvn_gpu_close(uint64_t n, nvn_gpu_err *e) { (void)n; atomic_fetch_add(&backend_calls,1); (void)e; return (nvn_gpu_rc){NVN_GPU_OK}; }
+static int no_compile(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t len,
+                      uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size) {
+    (void)ctx; (void)session; (void)generation; (void)json; (void)len;
+    (void)bytes; (void)bytes_len; (void)why; (void)why_size;
+    return -1;
+}
+
+static int retire_idle_pool(void) {
+    if (s2a_compile_worker_start_pool(no_compile, NULL, 2, NULL, 0)) return 1;
+    nvk_session_request_stop();
+    int rc = nvk_session_wait_compiles();
+    struct s2a_compile_worker_stats stats;
+    s2a_compile_worker_stats(&stats);
+    const int failed = rc || stats.slots;
+    if (failed)
+        fprintf(stderr, "FAIL: session stop must retire idle compile slots before returning (rc=%d slots=%u)\n",
+                rc, stats.slots);
+    else
+        puts("session/idle-pool: retired 2 slots inside Stop budget");
+    s2a_compile_worker_stop();
+    return failed;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    if (!strcmp(argv[1], "idle-pool")) return retire_idle_pool();
     if (!strcmp(argv[1], "log-off") || !strcmp(argv[1], "log-default")) {   // 关：不配置；缺省（没设开关）：要配置，夹具拒了就报黄
         log_flag = !strcmp(argv[1], "log-off") ? 0 : -1; const int want = log_flag != 0;
         if (nvk_session_open(NULL, NULL, NULL, 0)) return 1;

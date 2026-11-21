@@ -1,5 +1,6 @@
-// F4.4：有界需求编译 worker。只有一个编译槽；同一内容身份（sha256）的并发需求合并成一次编译，
-// 不同需求排队。调用方在等待结果时可以交出外部锁（pause/resume），让 owner 继续处理 Stop/窗口；
+// 有界需求编译 worker。同一内容身份（SHA-256）的并发需求合并到一份编译，
+// 多个槽可并行处理不同请求。调用方的 SHA 必须包含会话、代际与完整请求。
+// 等待结果时可交出外部锁（pause/resume），让 owner 处理 Stop/窗口。
 // Stop 会唤醒等待者并取消在途任务，worker 完成后丢弃迟到结果；正常退出 join 线程。
 #pragma once
 #include <stddef.h>
@@ -17,6 +18,13 @@ typedef int (*s2a_compile_worker_fn)(void *ctx, uint64_t session, uint64_t gener
 
 // 幂等启动；失败时 run 会明确报错（调用方可退回同步编译）。
 int s2a_compile_worker_start(s2a_compile_worker_fn fn, void *ctx, char *why, size_t why_size);
+#define S2A_CW_SLOTS_MAX 8u
+// Runtime sizing uses the current Android CPU affinity mask and capacity tiers.
+unsigned s2a_compile_worker_capacity_slots(const unsigned *capacities, size_t count);
+unsigned s2a_compile_worker_recommended_slots(void);
+// A partial start may use fewer slots. stats.slots reports the live count.
+int s2a_compile_worker_start_pool(s2a_compile_worker_fn fn, void *ctx, unsigned slots,
+                                  char *why, size_t why_size);
 int s2a_compile_worker_active(void);
 // 取消在途/等待中的任务并 join。可重复调用；之后可再次 start（测试用）。无预算上限，
 // 收尾路径必须用有界版本，不能把“编译卡住”变成无界 join。
@@ -26,12 +34,13 @@ void s2a_compile_worker_stop(void);
 int s2a_compile_worker_stop_bounded(uint32_t budget_ms, char *why, size_t why_size);
 // W2.6 计数：runs 是 run() 进入次数，compiles 是真正调用编译函数的次数（去重/排队不增加），
 // dedup 是附着到同 sha 在途 job 的次数，busy_timeouts 是等槽位超时，failures 是失败返回，
-// late_discarded 是 Stop/放弃后丢弃的迟到结果。容量只有 1，这些数直接说明背压与合并。
+// late_discarded 是 Stop/放弃后丢弃的迟到结果。slots 是已创建的编译槽数。
 struct s2a_compile_worker_stats {
     uint64_t runs, compiles, dedup, busy_timeouts, failures, late_discarded;
     // C4a 异步侧：queued = 进短队列次数，queue_full = 队列满拒绝（调用方应退回 run()），
     // done_pushed = 完成环入项，done_evicted = 完成环满挤出（fail-closed 的证据计数）。
     uint64_t queued, queue_full, done_pushed, done_evicted;
+    unsigned slots;
 };
 void s2a_compile_worker_stats(struct s2a_compile_worker_stats *out);
 
@@ -55,7 +64,7 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
                            int (*pause)(void *), void (*resume)(void *), void *pause_ctx,
                            uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size);
 
-/* C4a：非阻塞提交 + 短队列 + 完成环。与 run() 同一编译槽、同一 sha 去重；提交者不等待，
+/* C4a：非阻塞提交 + 短队列 + 完成环。与 run() 共用编译槽，同一 sha 去重；提交者不等待，
    结果不进槽位等待者计数，而是按 sha 放进有界完成环（S2A_CW_DONE_MAX）由 poll 取走。
    返回 0 = 已入队/已在途（同 sha 去重，不重复编译）；2 = 同 sha 结果已在完成环
    （条目被淘汰后重提同身份不必再编）；1 = 短队列已满（调用方退回 run() 同步路径，
@@ -66,6 +75,14 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
 int s2a_compile_worker_submit_async(uint64_t session, uint64_t generation,
                                     const char *json, size_t len, const uint8_t sha[32],
                                     char *why, size_t why_size);
+// Background shares dedup and completion with foreground. Foreground
+// submissions promote matching queued work, and keep one slot and one queue
+// entry available to foreground. Single-slot pools decline background work.
+int s2a_compile_worker_submit_background(uint64_t session, uint64_t generation,
+                                         const char *json, size_t len, const uint8_t sha[32],
+                                         char *why, size_t why_size);
+// Promote matching queued work when the foreground has already polled it.
+void s2a_compile_worker_promote(const uint8_t sha[32]);
 /* 按内容身份查结果；返回 0 = 编译成功（bytes 由调用方 free，poll 不消费：同 sha 的
    其它条目也能取到）；1 = 在途（排队/在编译）；2 = 编译失败（why 为编译器原因）；
    3 = 不在册（未提交/完成环已挤出/stop 清场——fail-closed，调用方按编译失败处理）。 */
