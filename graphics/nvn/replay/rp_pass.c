@@ -23,6 +23,8 @@
 
 // 首用跳过开关（安卓 demand 层，弱引用）：iOS / 鸿蒙 / 宿主单测没有实现 → 不标记，行为同现状。
 int nvn_vk_pipe_demand_on(void) __attribute__((weak));
+// 弱链接[replay]：nvn_vk_nvnbar_pass_barrier
+void nvn_vk_nvnbar_pass_barrier(nvn_gpu_cmd, uint32_t) __attribute__((weak));
 #pragma weak s2a_fu_rt_mark_fresh   // 只编回放核的宿主门禁可能没链接 nvn_first_use.c；缺实现时 enabled 为假、不会调用
 static int rp_pass_fu_enabled(void) { return nvn_vk_pipe_demand_on && nvn_vk_pipe_demand_on(); }
 
@@ -553,7 +555,11 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         }
     }
     PB(RP_PERF_PB_VIEW);
-    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    if (P.barrier_bits) {
+        if (nvn_vk_nvnbar_pass_barrier) nvn_vk_nvnbar_pass_barrier(c, P.barrier_bits);
+        else nvn_gpu_barrier(c, P.barrier_bits);
+        P.barrier_bits = 0;
+    }
     PB(RP_PERF_PB_BAR);
     d.occlusion = (uint8_t)rp_occl_want();
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0;
