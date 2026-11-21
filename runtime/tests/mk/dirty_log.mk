@@ -3,6 +3,7 @@ NATIVE_TEST_OWN += dirty_log
 .PHONY: native-test-dirty_log
 native-test-dirty_log:
 	@mkdir -p $(BUILD)/tests
-	$(CC) $(CFLAGS) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iruntime/include -o $(BUILD)/tests/t_dirty_log graphics/nvn/tests/t_dirty_log.c graphics/nvn/gfx/nvn/nvn_dirty.c -lpthread
+	$(CC) $(CFLAGS) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iruntime/include -Dsched_yield=dirty_test_sched_yield -c graphics/nvn/gfx/nvn/nvn_dirty.c -o $(BUILD)/tests/t_dirty_log_impl.o
+	$(CC) $(CFLAGS) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Iruntime/include -o $(BUILD)/tests/t_dirty_log graphics/nvn/tests/t_dirty_log.c $(BUILD)/tests/t_dirty_log_impl.o -lpthread
 	timeout 30 $(BUILD)/tests/t_dirty_log
 TEST_TARGETS += native-test-dirty_log

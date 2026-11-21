@@ -7,6 +7,7 @@
 //   或 0x5A + (reg-128)×2；img 句柄在 0x120 区 → slot = 0x48 + reg×2。
 #include "libpack_vk.h"
 #include "jv.h"   // 跨度式 JSON：_b.json 有长串字段（pos_slice 表 base64），s2a_json 短串上限吃不下
+#include "spirv_workgroup.h"   // s2a_spv_workgroup_bytes：计算出库的设备共享内存上限闸
 #include "../nvn/nvn_vk_program_result.h"   // SUPPORT_DEFAULT_BYTES：计算结果的 supportLayout.requiredSize
 
 #include <errno.h>
@@ -130,9 +131,14 @@ static const char *lp_nvn_stage_name(unsigned nvn) {
 static const char *lp_v1_stage_name(const char *lib_stage) {
     return !strcmp(lib_stage, "ps") ? "fs" : lib_stage;   // v1 用 NVN 阶段名 fs；vs/gs/cs 同名
 }
-// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：0x20 区 0..31、0x168 区 128+
+// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：主表 0..31（字 8+2r）、与图像表同址的 32..39
+//   （字 72+2(r−32)，iOS nvn_mtl.m C2_IMG / tex_slot_h 同一区间）、分离贴图表 128..255（字 0x5A+2(r−128)）。
+//   其余号段（40..127、≥256）在 c2 里没有句柄字：返回 0 = 无映射（真实槽号从 8 起，0 不会被当成槽 0 写出）。
 static uint32_t lp_tex_slot_word(uint32_t reg) {
-    return reg < 32 ? 8 + reg * 2 : 0x5A + (reg - 128) * 2;
+    if (reg < 32) return 8 + reg * 2;
+    if (reg < 40) return 72 + (reg - 32) * 2;
+    if (reg >= 128 && reg < 256) return 0x5A + (reg - 128) * 2;
+    return 0;
 }
 static uint32_t lp_img_slot_word(uint32_t reg) {
     return 0x48 + reg * 2;   // IMG_BASE 0x120 / 4
@@ -284,7 +290,7 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         if (!strcmp(kind, "tex") || !strcmp(kind, "tbuf") || !strcmp(kind, "tex_pool")) {
             uint32_t reg = 0; int has_reg = !jf_u32(b, "reg", &reg);
             v1kind = "texture";
-            if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = 1; }
+            if (has_reg && strcmp(kind, "tex_pool")) { slot = lp_tex_slot_word(reg); has_slot = slot != 0; }
             // 分离贴图（reg ≥ 128，c2 字 90 + 2k）：v1 只有贴图槽、没有分离采样器字段，消费端按「采样器取同字高位」取（同组合槽，
             //   也是立即句柄读这张表时的硬件语义）。只有这一条成立时才给槽：采样器半边缺（不采样：取尺寸 / texelFetch）或是
             //   samp_tex（Dsh.cs Reflect：句柄类型 0，采样器就是同一个字）。半边是 samp（分离采样器槽）/ samp_id / samp_ubo 时
@@ -331,11 +337,12 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         } else if (!strcmp(kind, "img") || !strcmp(kind, "img_ubo")) {
             uint32_t reg = 0;
             v1kind = "image";
-            if (!strcmp(kind, "img") && !jf_u32(b, "reg", &reg)) { slot = lp_img_slot_word(reg); has_slot = 1; }
+            if (!strcmp(kind, "img") && !jf_u32(b, "reg", &reg) && reg < 8) { slot = lp_img_slot_word(reg); has_slot = 1; }   // NVN 图像槽只有 0..7（c2 图像表字 72..86）
         } else if (!strcmp(kind, "cbuf")) {
             uint32_t reg = 0;
             if (jf_u32(b, "reg", &reg)) return lp_fail(why, why_size, "%s bindings[%u] cbuf without reg", lib_stage, i);
-            v1kind = "uniform"; slot = reg + 3; has_slot = 1;   // v1：驱动槽号，消费端 ubo_slot = slot-3
+            v1kind = "uniform";
+            if (reg < 16) { slot = reg + 3; has_slot = 1; }   // v1：驱动槽号，消费端 ubo_slot = slot-3；reg≥16 出 NVN 槽域
         } else if (!strcmp(kind, "c1")) {
             v1kind = "uniform"; slot = 1; has_slot = 1;   // 着色器自带常量段 c[1]：v1 槽 1（消费端 NVN_RB_C1）
         } else if (!strcmp(kind, "ubolen") || !strcmp(kind, "uvx") || !strcmp(kind, "lb") || !strcmp(kind, "sbsize")) {
@@ -356,13 +363,13 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             //   ubo_ptr reg = (off − 0x210)/16 → c0 + 0x210 + reg×16；sbuf_ubo reg = cb_slot − 3、off = cb_offset×4 → c(reg+3) + off
             uint32_t cb_slot = 0, cb_off = 0; int has_cb = 0;
             if (!strcmp(kind, "sbuf")) {
-                if (!jf_u32(b, "reg", &v)) { snprintf(provenance, sizeof provenance, ",\"nvnSlot\":%u", v); cb_off = 0x310 + v * 16; has_cb = 1; }
+                if (!jf_u32(b, "reg", &v) && v < 16) { snprintf(provenance, sizeof provenance, ",\"nvnSlot\":%u", v); cb_off = 0x310 + v * 16; has_cb = 1; }
             } else if (!strcmp(kind, "sbuf_ubo")) {
                 uint32_t off = 0;
-                if (!jf_u32(b, "reg", &v) && !jf_u32(b, "off", &off)) {
+                if (!jf_u32(b, "reg", &v) && !jf_u32(b, "off", &off) && v < 16) {
                     snprintf(provenance, sizeof provenance, ",\"uboSlot\":%u,\"uboOffset\":%u", v, off); cb_slot = v + 3; cb_off = off; has_cb = 1; }
             } else if (!strcmp(kind, "ubo_ptr")) {
-                if (!jf_u32(b, "reg", &v)) { snprintf(provenance, sizeof provenance, ",\"uboPtr\":%u", v); cb_off = 0x210 + v * 16; has_cb = 1; }
+                if (!jf_u32(b, "reg", &v) && v < 16) { snprintf(provenance, sizeof provenance, ",\"uboPtr\":%u", v); cb_off = 0x210 + v * 16; has_cb = 1; }
             }
             if (compute && has_cb) {
                 char pv[sizeof provenance]; memcpy(pv, provenance, sizeof pv);
@@ -388,6 +395,16 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             if (!strcmp(kind, "geometry")) { rw = 1; has_rw = 1; }
             else return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' missing rw", lib_stage, i, msl, kind);
         }
+        // 消费端映射不了来源的绑定不出库：没有 guest 槽、又没有消费端认的出处字段时，解析后 slot = -1，
+        //   图形按 binding_kind_*_slot_-1、计算按 guest slot 类如实拒收——拒收挪到出库这一步，语义相同、
+        //   原因写进 why，不把死绑定写进结果。认得的来源：guest 槽；uboHandle 句柄（TEXU/TBUFU）；
+        //   存储出处——图形只接 nvnSlot（layout_ent 只认 storage_kind 1），计算另接 uboPtr / uboSlot+uboOffset
+        //   （compute_storage 三种映射；图形消费端还没接，出的照样是死绑定）。
+        int mappable = has_slot || strstr(provenance, "\"uboHandle\"")
+            || strstr(provenance, "\"nvnSlot\"")
+            || (compute && (strstr(provenance, "\"uboPtr\"") || strstr(provenance, "\"uboSlot\"")));
+        if (!mappable)
+            return lp_fail(why, why_size, "%s bindings[%u] %s kind '%s' has no consumable guest source", lib_stage, i, msl, kind);
         jw_fmt(j, "%s{\"kind\":\"%s\",\"stage\":\"%s\",\"set\":0,\"binding\":%u", *sep ? "," : "", v1kind, v1_stage, binding);
         *sep = 1;
         if (compute) jw_str(j, ",\"count\":1");   // 计算合同必填；.spv 里每个成员是单个描述符（数组形的 tex_c2a 等无槽，解析器另拒）
@@ -555,6 +572,7 @@ static int lp_spv_viewport_builtin(const uint8_t *spv, size_t n) {
 #define LP_SUPPORT_ABI2_BYTES 3776u
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
 static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
+                         uint32_t shared_limit,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
                          uint32_t *support_bytes, char *why, size_t why_size) {
     const char *lib_stage = lp_nvn_stage_name(nvn);
@@ -625,6 +643,23 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             uint32_t abi = 0;
             if (!jf_u32(top, "resolution_scale_abi", &abi) && abi == 2) { if (*support_bytes < LP_SUPPORT_ABI2_BYTES) *support_bytes = LP_SUPPORT_ABI2_BYTES; }
             else if (abi && abi != 2) { lp_fail(why, why_size, "%s resolution_scale_abi %u unknown", khex, abi); goto done; }
+        }
+        {   // 计算共享内存闸：_b.json 的 spill 是批翻链按 32K 阈值在 MSL 侧做的溢出标记（Dsh.cs SPILL_SLOT），
+            //   本库 _b.spv 里 Workgroup 声明原样保留——装不装得下一律按本设备 maxComputeSharedMemorySize 真值判，
+            //   装不下的结果建不出计算管线（vkCreateComputePipelines 必败），出库前如实拒、退回现编
+            //   （现编路径 DirectSharedSpill.Rewrite 会把溢出数组改写进宿主绑定的设备缓冲）。
+            struct s2a_jv spf;
+            if (compute && !s2a_jv_obj_find(top, "spill", &spf)) {
+                uint32_t sps = 0; uint64_t wg = 0;
+                if (jf_u32(top, "spill", &sps) || !sps) { lp_fail(why, why_size, "%s %s spill field invalid", khex, jname); goto done; }
+                const char *werr = s2a_spv_workgroup_bytes(spv, sn, &wg);
+                if (werr) { lp_fail(why, why_size, "%s %s: %s", khex, sname, werr); goto done; }
+                if (wg > shared_limit) {
+                    lp_fail(why, why_size, "%s %s compute shared memory %llu exceeds device limit %u",
+                            khex, sname, (unsigned long long)wg, shared_limit);
+                    goto done;
+                }
+            }
         }
         // tex_scales（缩放访问的贴图）不再拒收：ABI 2 下换算在着色器里经支撑缓冲的尺寸表做，表项全 0 走倍率 1 的旧路径，与现编同口径
         const char *v1_stage = lp_v1_stage_name(st);
@@ -720,7 +755,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     for (unsigned nvn = 0, idx = 0; nvn < 6 && idx < 6; nvn++) {
         if (!(stages & (1u << nvn))) continue;
         char sw[192] = "";
-        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, &st, &bd, &sep, &got, &support, sw, sizeof sw);
+        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, &st, &bd, &sep, &got, &support, sw, sizeof sw);
         idx++;
         if (rc == 0) continue;
         // 半程序不命中：任一所需阶段拿不到，整个程序按该段的 miss/reject 计
@@ -766,6 +801,7 @@ out:
 //   绑定号 = arg_id×6 + 5。计数口径同 program_v1（hit / miss / reject 三个计数器共用）。
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
+                           uint32_t shared_limit,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size) {
     struct s2a_libpack *lp = (struct s2a_libpack *)lp_c;
     if (!lp || !lp->p.idx || !key || !json || !json_len) return S2A_LIBPACK_INVALID;
@@ -773,7 +809,7 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     struct jw st = {0}, bd = {0};
     int sep = 0; uint32_t got = 0;
     uint32_t csupport = 0;
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, &st, &bd, &sep, &got, &csupport, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, &st, &bd, &sep, &got, &csupport, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0) {
         struct jw j = {0};

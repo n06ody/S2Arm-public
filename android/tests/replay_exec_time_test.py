@@ -77,11 +77,89 @@ static void check_count1266(void) {
     count_flush(&group,0);CHECK(group.n==0);
 }
 
+// 段失败行的「本段末笔程序键」（rp_exec.c seg_pk）：键随段快照、完成回调在另一线程读不到活表。
+// 覆盖：mid 段 done 失败、seg_cut 里前置段提交失败、末段提交失败 + sub_done、空段的「无可定位」分支。
+static void check_segkeys(void) {
+    memset(&rp_S, 0, sizeof rp_S);
+    struct rp_prog gp = {0}, cp = {0};
+    gp.sh[0] = (nvn_gpu_shader)(uintptr_t)1; gp.sh[1] = (nvn_gpu_shader)(uintptr_t)2;
+    cp.is_compute = 1; cp.sh[0] = (nvn_gpu_shader)(uintptr_t)3;
+    rp_S.skey_ok = 3 | 32;
+    for (int b = 0; b < 8; b++) { rp_S.skey[0][b] = (uint8_t)(0xa0 + b); rp_S.skey[1][b] = (uint8_t)(0xb0 + b); rp_S.skey[5][b] = (uint8_t)(0xc0 + b); }
+    nvn_gpu_done fd = {0}; fd.status = NVN_GPU_DONE_FAILED; fd.why = "设备丢失";
+
+    // ① mid 段 done 失败：快照里两笔（图形 0/1 阶段键 + 计算 5 键）
+    g_ncommits = 0; g_red = 0; g_commit_fail = 0; g_seg_pk.n = 0;
+    g_cmd = (nvn_gpu_cmd)(uintptr_t)0x100; g_pre = NULL;
+    g_sub = calloc(1, sizeof *g_sub); g_sub->refs = 1;
+    rp_seg_prog_note(&gp); rp_seg_prog_note(&cp);
+    CHECK(g_seg_pk.n == 2);
+    seg_cut(0);
+    CHECK(g_seg_pk.n == 0);
+    CHECK(g_ncommits == 1);
+    g_commits[0].fn(g_commits[0].user, &fd);
+    CHECK(g_red == 1);
+    CHECK(strstr(g_last_red, "中途交的段失败：设备丢失") != NULL);
+    CHECK(strstr(g_last_red, "本段末 2 笔") != NULL);
+    CHECK(strstr(g_last_red, "0=a0a1a2a3a4a5a6a7") != NULL);
+    CHECK(strstr(g_last_red, "1=b0b1b2b3b4b5b6b7") != NULL);
+    CHECK(strstr(g_last_red, "5=c0c1c2c3c4c5c6c7") != NULL);
+    sub_release(g_sub);   // mid_done 已放掉 counted 引用；这里放掉录制者引用
+
+    // ② seg_cut 里 g_pre 提交失败：活环（本段已录的键）随行打出
+    g_ncommits = 0; g_red = 0; g_commit_fail = 1; g_seg_pk.n = 0;
+    g_cmd = (nvn_gpu_cmd)(uintptr_t)0x200; g_pre = (nvn_gpu_cmd)(uintptr_t)0x210;
+    g_sub = calloc(1, sizeof *g_sub); g_sub->refs = 1;
+    rp_seg_prog_note(&gp);
+    seg_cut(0);
+    CHECK(g_red == 1);
+    CHECK(strstr(g_last_red, "前置段提交失败：注入提交失败") != NULL);
+    CHECK(strstr(g_last_red, "0=a0a1a2a3a4a5a6a7") != NULL);
+    CHECK(g_ncommits == 1);   // pre 失败后 mid 照常提交
+    g_commits[0].fn(g_commits[0].user, &(nvn_gpu_done){0});
+    sub_release(g_sub);
+
+    // ③ 末段提交失败 + sub_done FAILED：两条行都带 s->pk 快照
+    g_ncommits = 0; g_red = 0; g_commit_fail = 1; g_seg_pk.n = 0;
+    g_cmd = (nvn_gpu_cmd)(uintptr_t)0x300; g_pre = NULL;
+    g_sub = calloc(1, sizeof *g_sub); g_sub->refs = 1;
+    struct sub *sv = g_sub;   // sub_commit_body 会把全局 g_sub 清掉：留住对象指针给手动 done 用
+    rp_seg_prog_note(&cp);
+    nvn_be_sub_commit();
+    CHECK(g_red == 1);
+    CHECK(strstr(g_last_red, "提交失败：注入提交失败") != NULL);
+    CHECK(strstr(g_last_red, "5=c0c1c2c3c4c5c6c7") != NULL);
+    CHECK(strstr(g_last_red, "本段末 1 笔") != NULL);
+    g_red = 0;
+    sub_done(sv, &fd);   // 契约：失败段 done 也恰好调一次（本桩不自动调）
+    CHECK(strstr(g_last_red, "提交段失败，本段的事件 / 计数器不回写：设备丢失") != NULL);
+    CHECK(strstr(g_last_red, "5=c0c1c2c3c4c5c6c7") != NULL);
+
+    // ④ 空段：无可定位键的显式分支（不是缺尾巴）
+    g_ncommits = 0; g_red = 0; g_seg_pk.n = 0;
+    g_cmd = (nvn_gpu_cmd)(uintptr_t)0x400; g_pre = NULL;
+    g_sub = calloc(1, sizeof *g_sub); g_sub->refs = 1;
+    seg_cut(0);
+    g_commits[0].fn(g_commits[0].user, &fd);
+    CHECK(strstr(g_last_red, "本段无可定位的程序键") != NULL);
+    sub_release(g_sub);
+
+    // ⑤ 滚动窗口：5 笔后只剩末 4 笔（最早一笔被挤出）
+    g_seg_pk.n = 0;
+    g_cmd = (nvn_gpu_cmd)(uintptr_t)0x500; g_pre = NULL;
+    g_sub = calloc(1, sizeof *g_sub); g_sub->refs = 1;
+    for (int i = 0; i < 5; i++) rp_seg_prog_note(&cp);
+    CHECK(g_seg_pk.n == 4);
+    CHECK(g_seg_pk.bm[0] == 32);
+    sub_release(g_sub); g_sub = NULL; g_cmd = NULL;
+}
+
 
 int main(int argc, char **argv) {
     int rc=regression_main(argc,argv); if(rc) return rc;
     check_count1266();
-    printf("count-group exit checks: %d checks, %d failures\n", g_checks,g_fail);
+    check_segkeys();
+    printf("count-group + seg-keys checks: %d checks, %d failures\n", g_checks,g_fail);
     return g_fail ? 1 : 0;
 }
 """
