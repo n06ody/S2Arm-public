@@ -44,7 +44,7 @@ uint64_t s2a_rp_test_clock_ns(void) { return g_vt; }   // 供 rp_exec.c 的 now_
 
 // ---------- 平台 / 未接 / 后端 / 回放核心其余文件的替身 ----------
 // 本用例只走 nvn_be_exec 的循环：状态、通道、传输、绘制、资源都不在这里验，给出链接需要的空实现。
-static int g_red; static char g_last_red[200];
+static int g_red; static char g_last_red[640];   // 段失败键尾巴最多 4 笔 × 阶段键：比生产 b[] 宽
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls; if (level != NVN_PLAT_LOG_RED) return;
     g_red++; snprintf(g_last_red, sizeof g_last_red, "%s", text);
@@ -61,8 +61,16 @@ uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) { (void
 static nvn_gpu_rc ok_rc(void) { return (nvn_gpu_rc){NVN_GPU_OK}; }
 nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gpu_err *err) { (void)d; (void)err; *out = NULL; return ok_rc(); }
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c) { (void)c; }
+// 段失败键用例要拿到 done 回调并在自己选的时刻触发它；g_commit_fail 非 0 时按次数返回失败。
+struct commit_rec { nvn_gpu_cmd c; uint64_t signal; nvn_gpu_done_fn fn; void *user; };
+static struct commit_rec g_commits[32];
+static int g_ncommits, g_commit_fail;
 nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn done, void *user, nvn_gpu_err *err) {
-    (void)c; (void)signal; (void)done; (void)user; (void)err; return ok_rc();
+    if (g_commit_fail > 0) { g_commit_fail--;
+        if (err) { err->rc = (nvn_gpu_rc){NVN_GPU_E_FAILED}; snprintf(err->why, sizeof err->why, "注入提交失败"); }
+        return (nvn_gpu_rc){NVN_GPU_E_FAILED}; }
+    if (g_ncommits < 32) g_commits[g_ncommits++] = (struct commit_rec){c, signal, done, user};
+    return ok_rc();
 }
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)v; (void)timeout_ns; (void)err; return ok_rc(); }
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot) { (void)c; (void)slot; }

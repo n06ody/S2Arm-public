@@ -106,9 +106,8 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     test_shader = native/'gfx_plat/nvk_shader.c'
     if sys.argv[1:] == ['--withdraw-stop']:
         src = test_shader.read_text()
-        before = 'void nvk_shader_stop(void) { atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel); }'
-        assert src.count(before) == 1
-        test_shader = out/'without-stop.c'; test_shader.write_text(src.replace(before, 'void nvk_shader_stop(void) {}'))
+        before = function(src, 'void nvk_shader_stop(void) {')
+        test_shader = out/'without-stop.c'; test_shader.write_text(src.replace(before, 'void nvk_shader_stop(void) {}', 1))
     elif sys.argv[1:] == ['--withdraw-admit']:
         src = test_shader.read_text()
         # 停局挡编译有两道：准入（停局位）与三段式认领时的停局检查（#996 起，后者在更前面先拦住）。

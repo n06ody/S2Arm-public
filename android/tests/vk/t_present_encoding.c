@@ -114,9 +114,142 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q,const VkPresentInfoKH
     if(probe_active) probe_readback(q,probe_images[pi->pImageIndices[0]]);
     return fixture_QueuePresentKHR(q,pi);
 }
-int main(void) {
+static void profile_rendered_frames(void) {
+    g_pass_capture_test = 1;
+    CHECK(open_backend(), "pass capture open");
+    nvn_gpu_err e = {0};
+    nvn_gpu_surface sf = NULL;
+    CHECK(OK(nvn_gpu_surface_attach((void *)1, &sf, &e)) && sf, "pass capture attach: %s", e.why);
+    nvn_gpu_tex t = make_tex(64, 36, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER);
+    nvn_gpu_view v = make_view(t);
+    if (sf && v) {
+        nvn_gpu_present_desc present = {.src = v};
+        for (uint64_t i = 1; i <= 30; i++) {
+            nvn_gpu_cmd c = begin_cmd();
+            nvn_gpu_pass_desc p = {.w = 64, .h = 36, .layers = 1, .ncolor = 1};
+            p.color[0].view = v;
+            p.color[0].load = NVN_GPU_LOAD_CLEAR;
+            p.color[0].store = NVN_GPU_STORE_STORE;
+            nvn_gpu_pass_begin(c, &p);
+            nvn_gpu_pass_end(c);
+            p.color[0].load = NVN_GPU_LOAD_LOAD;
+            nvn_gpu_pass_begin(c, &p);
+            nvn_gpu_pass_end(c);
+            CHECK(OK(nvn_gpu_cmd_commit(c, i, on_done, NULL, &e)), "pass capture commit: %s", e.why);
+            nvn_gpu_drawable d = {0};
+            CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass capture acquire: %s", e.why);
+            CHECK(OK(nvn_gpu_present(sf, &d, &present, i, NULL, NULL, &e)), "pass capture present: %s", e.why);
+            if (i == 1) nanosleep(&(struct timespec){1, 500000000}, NULL);
+        }
+    }
+    nvn_gpu_view_release(v);
+    nvn_gpu_tex_release(t);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "pass capture close: %s", e.why);
+    unsigned want = getenv("S2A_TEST_PRESENT_BGRA") ? 0 : 24;
+    CHECK(g_pass_capture_frames == want && g_pass_capture_clear == want && g_pass_capture_load == want &&
+          g_pass_capture_end == (want != 0), "PASS_CAPTURE expected=%u actual=%u clear=%u load=%u end=%u",
+          want, g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end);
+    printf("PASS_CAPTURE expected=%u actual=%u clear=%u load=%u end=%u\n",
+           want, g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end);
+    CHECK(g_pass_capture_ticks == want * 2, "PASS_CAPTURE raw timestamp pairs expected=%u actual=%u",
+          want * 2, g_pass_capture_ticks);
+    printf("PASS_CAPTURE raw timestamp pairs expected=%u actual=%u\n", want * 2, g_pass_capture_ticks);
+    g_pass_capture_test = 0;
+}
+static void profile_constant_pixels(const char *dir, const char *sha) {
+    char word[9] = {0};
+    memcpy(word, sha, 8);
+    g_pass_key_hi = (int32_t)strtoul(word, NULL, 16);
+    memcpy(word, sha + 8, 8);
+    g_pass_key_lo = (int32_t)strtoul(word, NULL, 16);
+    snprintf(g_pass_expected_identity, sizeof g_pass_expected_identity, "key=%.16s sha=%s", sha, sha);
+    g_pass_capture_test = 2;
+    nvn_gpu_err e = {0};
+    CHECK(open_backend(), "pass replacement open");
+    nvn_gpu_surface sf = NULL;
+    CHECK(OK(nvn_gpu_surface_attach((void *)1, &sf, &e)) && sf, "pass replacement attach: %s", e.why);
+    if (!sf) goto done;
+    char path[512];
+    size_t vn = 0, fn = 0;
+    snprintf(path, sizeof path, "%s/pass_capture_fixture.vert.spv", dir);
+    void *vcode = read_file(path, &vn);
+    snprintf(path, sizeof path, "%s/pass_capture_fixture.frag.spv", dir);
+    void *fcode = read_file(path, &fn);
+    CHECK(vcode && fcode, "pass replacement shader fixture files");
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    nvn_gpu_layout_ent ent = {.set = 0, .binding = 0, .count = 1, .cls = NVN_GPU_RES_TEX_SAMP,
+                              .stages = 1u << NVN_GPU_SH_FS, .access = NVN_GPU_ACC_R};
+    nvn_gpu_layout empty = {0}, fl = {.ent = &ent, .nent = 1};
+    nvn_gpu_shader_src src = {.stage = NVN_GPU_SH_VS, .kind = NVN_GPU_BLOB_SPIRV,
+                             .layout = &empty, .entry = "main", .blob = vcode, .bytes = vn};
+    CHECK(OK(nvn_gpu_shader_load(&src, &vs, &e)), "pass replacement VS: %s", e.why);
+    src = (nvn_gpu_shader_src){.stage = NVN_GPU_SH_FS, .kind = NVN_GPU_BLOB_SPIRV,
+                              .layout = &fl, .entry = "main", .blob = fcode, .bytes = fn};
+    CHECK(OK(nvn_gpu_shader_load(&src, &fs, &e)), "pass replacement FS: %s", e.why);
+    free(vcode); free(fcode);
+    if (!vs || !fs) goto done;
+    nvn_gpu_pipe_desc pd = {.samples = 1, .prim = 4, .color.logic_op = 3, .poly.mode = NVN_POLYGON_MODE_FILL,
+                            .origin_ll = 1, .chmask.mask = 0xff, .cfmt = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA8UI}};
+    pd.st[NVN_GPU_SH_VS].sh = vs;
+    pd.st[NVN_GPU_SH_FS].sh = fs;
+    nvn_gpu_pipe pipe = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "pass replacement pipeline: %s", e.why);
+    if (!pipe) goto done;
+    nvn_gpu_tex input = make_tex(1, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex shown = make_tex(64, 36, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER);
+    nvn_gpu_tex aux = make_tex(64, 36, NVN_FORMAT_RGBA8UI, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view iv = make_view(input), sv = make_view(shown), av = make_view(aux);
+    samp_par sp = {0};
+    nvn_gpu_samp samp = NULL;
+    CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &e)), "pass replacement sampler: %s", e.why);
+    if (!iv || !sv || !av || !samp) goto done;
+    const uint8_t white[4] = {255, 255, 255, 255};
+    nvn_gpu_cmd upload = begin_cmd();
+    nvn_gpu_tex_upload(upload, input, 0, 0, NULL, white, 4, 4);
+    CHECK(OK(nvn_gpu_cmd_commit(upload, 1, on_done, NULL, &e)), "pass replacement upload: %s", e.why);
+    nvn_gpu_present_desc present = {.src = sv};
+    nvn_gpu_binding bind = {.ent = 0, .cls = NVN_GPU_RES_TEX_SAMP, .u.ts = {iv, samp}};
+    int replace = !getenv("S2A_TEST_PRESENT_BGRA");
+    for (uint64_t i = 2; i <= 32; i++) {
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_pass_desc p = {.w = 64, .h = 36, .layers = 1, .ncolor = 2};
+        p.color[0].view = sv; p.color[1].view = av;
+        p.color[0].load = p.color[1].load = NVN_GPU_LOAD_CLEAR;
+        p.color[0].store = p.color[1].store = NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(c, &p);
+        nvn_gpu_set_pipe(c, pipe);
+        nvn_gpu_bind(c, NVN_GPU_SH_FS, &bind, 1);
+        nvn_gpu_draw(c, &(nvn_gpu_draw_args){.prim = 4, .count = 3, .instances = 1});
+        nvn_gpu_pass_end(c);
+        CHECK(OK(nvn_gpu_cmd_commit(c, i, on_done, NULL, &e)), "pass replacement commit: %s", e.why);
+        nvn_gpu_drawable d = {0};
+        CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass replacement acquire: %s", e.why);
+        probe_active = i >= 8 && i <= 12;
+        probe_alpha255 = 1;
+        probe_value = replace ? 0 : 255;
+        CHECK(OK(nvn_gpu_present(sf, &d, &present, i, NULL, NULL, &e)), "pass replacement present: %s", e.why);
+        probe_active = probe_alpha255 = 0;
+        if (i == 2) nanosleep(&(struct timespec){1, 500000000}, NULL);
+    }
+    nvn_gpu_samp_release(samp);
+    nvn_gpu_view_release(iv); nvn_gpu_view_release(sv); nvn_gpu_view_release(av);
+    nvn_gpu_tex_release(input); nvn_gpu_tex_release(shown); nvn_gpu_tex_release(aux);
+done:
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "pass replacement close: %s", e.why);
+    int enabled = !getenv("S2A_TEST_PRESENT_BGRA");
+    CHECK(g_pass_capture_shaders == 24 && g_pass_capture_samples == 24 &&
+          (enabled ? g_pass_capture_substitutions >= 20 : g_pass_capture_substitutions == 0),
+          "PASS_CONSTANT enabled=%d fs=%u bindings=%u replaced=%u",
+          enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
+    printf("PASS_CONSTANT enabled=%d fs=%u bindings=%u replaced=%u\n",
+           enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
+    g_pass_capture_test = 0;
+}
+int main(int argc, char **argv) {
     char why[256]={0};if(s2a_vk_device_create(&g_dev,why,sizeof why)) {fprintf(stderr,"device %s\n",why);return 2;}
     memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="original-present-grayscale";
+    profile_rendered_frames();
+    if (argc > 2 && strlen(argv[2]) == 64) profile_constant_pixels(argv[1], argv[2]);
     if(!open_backend())return 2;
     nvn_gpu_err e={0};nvn_gpu_surface sf=NULL;CHECK(OK(nvn_gpu_surface_attach((void *)1,&sf,&e)),"attach %s",e.why);
     if(!sf)return 2;

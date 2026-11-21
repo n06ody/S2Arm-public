@@ -117,6 +117,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
+       RP_PERF_BUF_SYNC_GW_KB,   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
@@ -169,6 +170,10 @@ int rp_fr_perf_on(void);   // 开关（nvk_hitch_log，进程内缓存一次，�
 void rp_fr_perf_take(uint64_t out[RP_FR_N]);   // [上屏] 取走本帧分项并清零；每帧只调一次（与 rp_frame_take 同一个帧边界）
 int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t draws, uint64_t subs, const uint64_t fr[RP_FR_N]);   // 长帧行（见 rp_exec.c）
 uint64_t rp_sub_serial(void);   // 第几次提交（一次提交内可复用的暂存内容按它判）
+struct rp_prog;
+// 录制侧：记一笔「本段已发射的绘制 / 派发用了哪个程序」（段失败日志打本段末 ≤4 笔的阶段键；
+// rp_draw 在实际落命令前调；线程：[提交]，当前段开着才记）
+void rp_seg_prog_note(const struct rp_prog *p);
 void rp_perf_take(uint64_t out[RP_PERF_N]);
 void rp_draw_reset(void);
 void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳过的）各出一行日志；0 = 关
