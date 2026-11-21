@@ -47,12 +47,15 @@ static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值�
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
+static int g_flag_sync_same, g_flag_bw_merge;   // 用例设：开关 nvk_sync_same / nvk_bw_merge（缺省同产品：关）；开关缓存随会话收尾（rp_buf_reset）作废
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
+    if (!strcmp(name, "nvk_sync_same")) return g_flag_sync_same;
+    if (!strcmp(name, "nvk_bw_merge")) return g_flag_bw_merge;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_land_merge")) return g_flag_land_merge;
@@ -239,6 +242,7 @@ struct nvn_gpu_buf_s { uint64_t bytes, access_id; uint8_t *cpu; };
 static int g_buf_cpu_auto;   // 1 = 新建的缓冲各带一块自己的 CPU 可见内存（两份池镜像要分得开的用例用）
 static int g_buf_creates, g_buf_releases; static uint64_t g_buf_bytes;
 static struct { uint64_t off, len; uint8_t head[8]; int pre; } g_bw[32]; static int g_nbw;
+static int g_bw_multi, g_bw_multi_segs;   // nvn_gpu_buf_write_multi 替身：调用次数 / 段数
 #ifdef S2A_GPU_LAND_TEST
 static int g_land_capture;
 static uint8_t g_land_staged[4096], g_land_mask[4096];
@@ -320,6 +324,10 @@ void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void 
 #endif
     if (g_nbw == 32) return;
     g_bw[g_nbw].off = off; g_bw[g_nbw].len = bytes; g_bw[g_nbw].pre = c->is_pre; memcpy(g_bw[g_nbw].head, src, bytes < 8 ? bytes : 8); g_nbw++; }
+void nvn_gpu_buf_write_multi(nvn_gpu_cmd c, nvn_gpu_buf dst, uint32_t n, const uint64_t *off, const uint8_t *const *src, const uint64_t *bytes) {
+    g_bw_multi++; g_bw_multi_segs += n;
+    for (uint32_t i = 0; i < n; i++) nvn_gpu_buf_write(c, dst, off[i], src[i], bytes[i]);   // 替身：语义等于逐段写
+}
 // 页级脏账替身：4096 字节一页，g_pmem 这个池每页的写代号由用例设
 enum { PG = 4096, NPG = 8 };
 static _Alignas(4096) uint8_t g_pmem[PG * NPG]; static uint64_t g_pg_gen[NPG]; static int g_pg_tracked = 1;
@@ -2187,6 +2195,57 @@ static void t_buf_mirror_fail_once(void) {   // 池镜像建不出来：同一�
     g_buf_fail_bytes = 0;
     CHECK(rp_buf_resolve(&g_fake_cmd, base + 64, 16, &b, &o) == 1 && b && o == 64);   // 同一地址重新使用：重试并建成
     CHECK(g_buf_creates - c0 == 2);
+    nvn_be_shutdown_session();
+}
+// 同值跳过（nvk_sync_same）：录成 GPU 写的同步，页内容与上次同步进同一份镜像的字节相同就不写、不切通道；改 1 字节必须写（负控）；
+// 显卡写登记 / 落地之后副本作废，同内容也照写；开关关时每次照写（对照）
+static void t_sync_same(int on) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *); extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    nvn_be_sub_begin();
+    nvn_be_shutdown_session(); nvn_unimpl_reset(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_nbw = 0; g_dirty_now = 100;
+    g_flag_sync_same = on;
+    for (unsigned i = 0; i < sizeof g_pmem; i++) g_pmem[i] = (uint8_t)(i / PG + 1);
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem; uint64_t pf[RP_PERF_N];
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 1);          // 第一次：照写（还没有副本）
+    rp_perf_take(pf);
+    g_pg_gen[1] = 101; g_dirty_now = 102;                                                     // 游戏重写第 1 页，内容不变
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1); rp_perf_take(pf);
+    const int same_writes = g_nbw - 1;
+    printf("sync_same on=%d: same-content resync writes=%d skip_runs=%llu expected %d/%d\n", on, same_writes, (unsigned long long)pf[RP_PERF_SAME_SKIP_RUN], on ? 0 : 1, on ? 1 : 0);
+    CHECK(same_writes == (on ? 0 : 1) && pf[RP_PERF_SAME_SKIP_RUN] == (on ? 1u : 0u));
+    int n0 = g_nbw; g_pmem[PG + 777] ^= 0x5a; g_pg_gen[1] = 103; g_dirty_now = 104;           // 负控：改 1 字节，必须写
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == n0 + 1 && g_bw[n0].off == PG);
+    n0 = g_nbw; g_pg_gen[1] = 105; g_dirty_now = 106;                                         // 改后的内容再原样重写：开时跳过
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == n0 + (on ? 0 : 1));
+    uint64_t key = 0; const uint64_t id = rp_buf_gpu_write_note(base + PG + 64, 64, &key); CHECK(id != 0);   // 显卡写登记 → 副本作废
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    rp_buf_gpu_write_land(key, id, 0);
+    nvn_be_sub_begin();
+    n0 = g_nbw; g_pg_gen[1] = 107; g_dirty_now = 108;                                         // 撤登记后同内容重写：副本已作废，必须写
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == n0 + 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    g_flag_sync_same = 0;
+    nvn_be_shutdown_session();
+}
+// 合并写（nvk_bw_merge）：一页被显卡写区间切成两段，开时一次多段写（一道屏障）、关时两次单段写；写进镜像的字节一样
+static void t_bw_merge(int on) {
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *); extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    nvn_be_sub_begin();
+    nvn_be_shutdown_session(); nvn_unimpl_reset(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_nbw = 0; g_dirty_now = 100;
+    g_flag_bw_merge = on;
+    for (unsigned i = 0; i < sizeof g_pmem; i++) g_pmem[i] = (uint8_t)(i / PG + 1);
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 2 * PG, PG, NULL, NULL) == 1 && g_nbw == 1);
+    uint64_t key = 0; const uint64_t id = rp_buf_gpu_write_note(base + 2 * PG + 1024, 512, &key); CHECK(id != 0);
+    g_pg_gen[2] = 101; g_dirty_now = 102;
+    const int m0 = g_bw_multi, n0 = g_nbw;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 2 * PG, PG, NULL, NULL) == 1);
+    printf("bw_merge on=%d: writes=%d multi=%d expected 2/%d\n", on, g_nbw - n0, g_bw_multi - m0, on);
+    CHECK(g_nbw - n0 == 2 && g_bw_multi - m0 == on && g_bw[n0].off == 2 * PG && g_bw[n0].len == 1024 && g_bw[n0 + 1].off == 2 * PG + 1536 && g_bw[n0 + 1].len == PG - 1536);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_buf_gpu_write_land(key, id, 0);
+    g_flag_bw_merge = 0;
     nvn_be_shutdown_session();
 }
 static void t_buf_mirror(void) {   // 池镜像：首次使用建一份、按页同步；没写过的页不重传；按使用点的先后保证 GPU 顺序
@@ -6809,6 +6868,7 @@ int main(int argc, char **argv) {
 #endif
     t_pool_gone_hold();
     t_buf_mirror();
+    t_sync_same(1); t_sync_same(0); t_bw_merge(1); t_bw_merge(0);
     t_buf_dirtylog();
     t_buf_untracked_once();
     t_buf_mirror_fail_once();
