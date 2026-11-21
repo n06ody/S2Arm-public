@@ -72,7 +72,7 @@ if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 
 if [ "$mode" = --negative ]; then
     if [ "$rc" != 1 ] || ! grep -q 'workgroup cases=17 failures=10' "$log" ||
        ! grep -q 'case=product expected=reject:maxComputeWorkGroupInvocations actual_rc=0 modules=1 pipelines=0 bad=1' "$log" ||
-       ! grep -q 'case=shared_over expected=reject:exceeds maxComputeSharedMemorySize actual_rc=0' "$log"; then
+       ! grep -q 'case=shared_over expected=reject:本机 maxComputeSharedMemorySize actual_rc=0' "$log"; then
         cat "$log"; echo '【红】workgroup negative control missed' >&2; exit 1
     fi
     echo 'workgroup negative: PASS (10 invalid shapes reached driver; 7 legal controls passed)'; exit 0

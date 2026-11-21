@@ -322,6 +322,10 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
 s2a_gate_step "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$android_dir/native/direct" -I "$repo_dir/graphics/third_party/spirv_cross" \
     "$android_dir/tests/t_spv_workgroup_bytes.c" -o "$out/spv-workgroup-bytes-test"
 s2a_gate_step "$out/spv-workgroup-bytes-test"
+# #1865 统一 SPIR-V 合规核对的宿主件：声明扫描 / 能力扩展需求表 / push 与 Workgroup 字节，合成模块逐类负控
+s2a_gate_step "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$android_dir/native/direct" -I "$repo_dir/graphics/third_party/spirv_cross" \
+    "$android_dir/tests/t_spv_compliance.c" -o "$out/spv-compliance-test"
+s2a_gate_step "$out/spv-compliance-test"
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # 上屏线程 CPU（rp_present.c，#1501 差距 9）：同线程配对 / 跨线程与时间倒退不计 / 首次只记起点 / 取走清零 / 会话清起点 / 上屏接线，6 个点变异各撤一处必红（纯宿主 C）

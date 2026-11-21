@@ -140,12 +140,12 @@ static const char *pool_pipeline_limit(const struct nvn_gpu_pipe_s *p, const nvn
         }
     }
     if (graphics) for (uint32_t i = 0; i < 8; i++) if (graphics->cfmt[i]) resources[NVN_GPU_SH_FS]++;
-    if (images > l->maxDescriptorSetSampledImages) return "pool maxDescriptorSetSampledImages exceeded";
-    if (samplers > l->maxDescriptorSetSamplers) return "pool maxDescriptorSetSamplers exceeded";
+    if (images > l->maxDescriptorSetSampledImages) return "本机 pool maxDescriptorSetSampledImages exceeded";
+    if (samplers > l->maxDescriptorSetSamplers) return "本机 pool maxDescriptorSetSamplers exceeded";
     for (int st = 0; st <= NVN_GPU_SH_CS; st++) {
-        if (stage_images[st] > l->maxPerStageDescriptorSampledImages) return "pool maxPerStageDescriptorSampledImages exceeded";
-        if (stage_samplers[st] > l->maxPerStageDescriptorSamplers) return "pool maxPerStageDescriptorSamplers exceeded";
-        if (resources[st] > l->maxPerStageResources) return "pool maxPerStageResources exceeded";
+        if (stage_images[st] > l->maxPerStageDescriptorSampledImages) return "本机 pool maxPerStageDescriptorSampledImages exceeded";
+        if (stage_samplers[st] > l->maxPerStageDescriptorSamplers) return "本机 pool maxPerStageDescriptorSamplers exceeded";
+        if (resources[st] > l->maxPerStageResources) return "本机 pool maxPerStageResources exceeded";
     }
     return NULL;
 }

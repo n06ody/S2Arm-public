@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
         uint32_t saved = l->maxComputeSharedMemorySize;
         size_t bytes; uint32_t *w8 = read_shader(argv[1], "shared8k", &bytes);
         l->maxComputeSharedMemorySize = 4096;
-        run_case("shared_over", w8, bytes, "main", "exceeds maxComputeSharedMemorySize", 0);
+        run_case("shared_over", w8, bytes, "main", "本机 maxComputeSharedMemorySize", 0);
         l->maxComputeSharedMemorySize = 8192;
         run_case("shared_at_limit", w8, bytes, "main", NULL, 1);
         l->maxComputeSharedMemorySize = saved;
