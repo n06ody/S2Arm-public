@@ -72,6 +72,7 @@ static struct nvn_gpu_tex_s *feedback_snap_reuse(struct nvn_gpu_cmd_s *c, struct
     return NULL;
 }
 static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
+    TK_SCOPE(c, TK_FEEDBACK);   // GPU 时间分账探针：反馈快照拷贝
     struct nvn_gpu_view_s *v = f->source;
     struct nvn_gpu_tex_s *s = v->tex;
     struct nvn_gpu_tex_s *t = feedback_snap_reuse(c, f, s);
