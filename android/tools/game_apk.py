@@ -49,6 +49,7 @@ import direct_library   # noqa: E402  F5.2：直连描述的文件清单只按�
 sys.path.insert(1, os.path.join(REPO, 'pack'))
 import display_name   # noqa: E402  桌面标签与 iPhone 同一函数：「<游戏自带 nacp 标题> S2Arm」（11-04 维护者）
 GRAPHICS_FEATURE = direct_library.GRAPHICS_FEATURE
+REFRESH_PAYLOAD = ('manifest.json', 'index.tsv', 'game-build-artifact.json', 'ctl/control.nacp')
 
 
 def sha256(path):
@@ -356,7 +357,7 @@ def resources(pack, apk, out, refresh_existing=False, reuse_from=None):
     index = ''
     reused = 0
     for p in kept:
-        if not refresh_existing or p == nacp:
+        if not refresh_existing or p in REFRESH_PAYLOAD:
             dst = os.path.join(out, p)
             linked = previous is not None and link_previous(previous, p, rows[p], dst)
             if linked and sha256(dst) != rows[p][1]:

@@ -82,7 +82,8 @@ class FakeAdb:
                         break
                     _, size, path = line.split(' ', 2)
                     self.received[path] = f.read(int(size))
-                conn.sendall(((self.receive_reply or f'OK {len(self.received)} 0') + '\n').encode())
+                received_bytes = sum(map(len, self.received.values()))
+                conn.sendall(((self.receive_reply or f'OK {len(self.received)} {received_bytes}') + '\n').encode())
 
     def call(self, *args, timeout=600):
         self.calls.append(args)
@@ -261,6 +262,72 @@ class DeployTest(unittest.TestCase):
         self.assertTrue((full / 'romfs/data').exists())
         self.assertFalse((refresh / 'romfs').exists())
 
+    def test_refresh_sends_only_metadata_even_with_full_resources(self):
+        resources = self.root / 'resources'
+        game_apk.resources(self.pack, self.apk, resources)
+        adb = FakeAdb()
+        deploy_game.deploy_resources(self.apk, resources, adb, self.root, start=False,
+                                     refresh_existing=True, require_current=False)
+        self.assertEqual(set(adb.received), {'manifest.json', 'index.tsv',
+                         'game-build-artifact.json', 'ctl/control.nacp'})
+
+    def test_strict_upgrade_uses_old_receipt_and_checks_new_receipt(self):
+        resources = self.root / 'resources'
+        game_apk.resources(self.pack, self.apk, resources)
+        artifact, new_binding = deploy_game.validate(self.apk, resources)
+        resident = dict(packageName=artifact['apk']['packageName'], apkSha256='1' * 64,
+                        contentRoot=artifact['contentRoot'], artifactSha256='2' * 64)
+        adb = FakeAdb()
+        adb.digest = resident['apkSha256']
+        adb.receipt = (resident['contentRoot'], new_binding)
+        paths = ('manifest.json', 'index.tsv', 'game-build-artifact.json', 'ctl/control.nacp')
+        size = sum((resources / name).stat().st_size for name in paths)
+        receipt = deploy_game.deploy_resources(self.apk, resources, adb, self.root, start=False,
+                                               allow_full_import=False, resident_receipt=resident,
+                                               max_resource_bytes=size)
+        self.assertEqual(adb.received, {name: (resources / name).read_bytes() for name in paths})
+        self.assertEqual((receipt['transferMode'], receipt['previousContentRoot'],
+                          receipt['sentFiles'], receipt['sentBytes']),
+                         ('refresh', resident['contentRoot'], 4, size))
+        self.assertGreaterEqual(receipt['transferMs'], 0)
+        self.assertEqual(receipt['artifactSha256'], new_binding)
+        self.assertEqual([call for call in adb.calls if call[0] == 'install'], [('install', '-r', self.apk)])
+
+    def test_strict_upgrade_refuses_stale_missing_mismatched_or_over_budget_plan_before_install(self):
+        resources = self.root / 'resources'
+        game_apk.resources(self.pack, self.apk, resources)
+        artifact, _ = deploy_game.validate(self.apk, resources)
+        resident = dict(packageName=artifact['apk']['packageName'], apkSha256='1' * 64,
+                        contentRoot=artifact['contentRoot'], artifactSha256='2' * 64)
+        for proof, budget, expected in (
+            (None, None, '全量导入已禁止'),
+            (dict(resident, contentRoot='sha256-' + '3' * 64), None, '全量导入已禁止'),
+            (dict(resident, apkSha256='4' * 64), None, '驻留导入回执与当前 APK 不匹配'),
+            (resident, 1, '资源直传超过预算'),
+        ):
+            with self.subTest(expected=expected):
+                adb = FakeAdb()
+                adb.digest = resident['apkSha256']
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    deploy_game.deploy_resources(self.apk, resources, adb, self.root, start=False,
+                                                 allow_full_import=False, resident_receipt=proof,
+                                                 max_resource_bytes=budget)
+                self.assertEqual(adb.calls, [])
+
+    def test_strict_upgrade_never_falls_back_when_receiver_refuses(self):
+        resources = self.root / 'resources'
+        game_apk.resources(self.pack, self.apk, resources)
+        artifact, _ = deploy_game.validate(self.apk, resources)
+        resident = dict(packageName=artifact['apk']['packageName'], apkSha256='1' * 64,
+                        contentRoot=artifact['contentRoot'], artifactSha256='2' * 64)
+        adb = FakeAdb(refused=True)
+        adb.digest = resident['apkSha256']
+        with self.assertRaisesRegex(RuntimeError, '^资源导入被拒绝$'):
+            deploy_game.deploy_resources(self.apk, resources, adb, self.root, start=False,
+                                         allow_full_import=False, resident_receipt=resident)
+        self.assertEqual(len(adb.received), 4)
+        self.assertFalse((self.root / 'deployment.json').exists())
+
     def test_deploy_freezes_apk_and_records_matching_identity(self):
         adb = FakeAdb()
         original = game_apk.sha256(self.apk)
@@ -373,6 +440,12 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(adb.connects, 3)
         self.assertEqual(len(adb.received), sum(1 for p in (out / 'resources').rglob('*') if p.is_file()))
 
+    def test_false_wire_byte_count_is_rejected(self):
+        adb = FakeAdb(receive_reply='OK 6 0')
+        with self.assertRaisesRegex(RuntimeError, 'App 收包文件数或字节数不符'):
+            self.deploy(adb)
+        self.assertFalse(adb.started)
+
     def test_app_refusal_is_red_and_never_starts(self):
         adb = FakeAdb(receive_reply='ERR bad path: ../x')
         with self.assertRaisesRegex(RuntimeError, 'App 拒收资源：ERR bad path'):
@@ -386,6 +459,7 @@ class DeployTest(unittest.TestCase):
             seen = []
             def fake_send(adb, package, resources, name, timeout, log):
                 adb.name = name; seen.append(timeout)
+                return {}
             with self.subTest(size=size), patch.object(deploy_game, 'tree_bytes', return_value=size), \
                     patch.object(deploy_game, 'send_tree', fake_send):
                 self.deploy(FakeAdb())
@@ -393,6 +467,7 @@ class DeployTest(unittest.TestCase):
         seen = []
         def fake_send50(adb, package, resources, name, timeout, log):
             adb.name = name; seen.append(timeout)
+            return {}
         with patch.object(deploy_game, 'tree_bytes', return_value=21_000_000_000), \
                 patch.object(deploy_game, 'send_tree', fake_send50):
             self.deploy(FakeAdb(), push_timeout=50)
@@ -478,6 +553,7 @@ class DeployTest(unittest.TestCase):
         adb0 = FakeAdb(stale_start=True); adb0.name = None
         def fake_send(adb, package, resources, name, timeout, log):
             adb.name = name
+            return {}
         with patch.object(deploy_game, 'send_tree', fake_send), \
                 patch.object(deploy_game.time, 'monotonic', side_effect=[0] * 3 + [5] * 10), \
                 patch.object(deploy_game.time, 'sleep'):
