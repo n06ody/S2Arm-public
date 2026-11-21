@@ -9,6 +9,8 @@
 #define _GNU_SOURCE 1   // process_vm_readv（逐笔日志经内核读游戏内存）；编译参数已定义的不重复
 #endif
 #include "rp_exec.h"
+// 弱链接[replay]：rp_pass_cut_why
+__attribute__((weak)) void rp_pass_cut_why(int why);   // 批 0 诊断探针：收通道原因（rp_pass.c）
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_shader.h"
@@ -148,6 +150,8 @@ uint32_t nvk_fu_unsafe_ms(void) __attribute__((weak));
 #pragma weak s2a_fu_wait_decide
 #pragma weak s2a_fu_rt_mark_seen
 
+// 弱链接[replay]：rp_occl_want
+#pragma weak rp_occl_want
 static int rp_fu_enabled(void) { return nvn_vk_pipe_demand_on && nvn_vk_pipe_demand_on(); }
 static uint64_t rp_fu_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static struct s2a_fu_budget g_fu_budget;   // 本帧首用等待总账（iOS g_pp_bud_*）；只提交线程碰
@@ -197,6 +201,17 @@ static int rp_fu_skip_safe(const p_set_rt *rt) {
         if (!s2a_fu_rt_seen_steady(rt->depth->serial, sk, (uint64_t)rt->depth->d.format, frame)) return 0;
     }
     return targets > 0;
+}
+// 还没有程序反射时也必须保护可能的写入和查询。逐槽检查实际绑定，不借上一笔程序的反射。
+static int rp_live_compile_defer_frame(uint64_t *frame) {
+    if (!rp_fu_enabled() || !rp_occl_want || rp_occl_want() ||
+        !s2a_fu_rt_fresh_now || !s2a_fu_rt_seen_steady) return 0;
+    for (unsigned st = 0; st < sizeof rp_S.img / sizeof rp_S.img[0]; st++)
+        for (unsigned slot = 0; slot < sizeof rp_S.img[0] / sizeof rp_S.img[0][0]; slot++)
+            if (rp_S.img[st][slot]) return 0;
+    if (!rp_fu_skip_safe(rp_pass_target())) return 0;
+    *frame = rp_frame();
+    return 1;
 }
 static nvn_gpu_rc rp_fu_ok(void) { nvn_gpu_rc r; r.code = NVN_GPU_OK; return r; }
 // 首用取管线：kick→PENDING 时按 iOS pso_pend_take 的判定限时等/跳；可安全丢才跳，否则按 unsafe 上限等一次后标 stuck。
@@ -1279,14 +1294,17 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     { int face = (rp_origin_lower_left() != 0) | (s2a_nvn_rast_flip != 0) << 1;   // 窗口原点与光栅翻转位不在状态块里，但进管线描述（正面绕序）：变了就是换管线
       if (face != g_face) { g_face = face; rp_pso_dirty = 1; } }   // 图元在绘制记录里，不在状态块里：换了图元就是换管线
     int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];
+    int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
     if (!g_prog || rp_pso_dirty || args_dirty) {
         struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
         for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
+        q.compile_defer_frame = rp_live_compile_defer_frame;
         const struct rp_prog *np = NULL;
         int sr = rp_shader_resolve(&q, &np);
         if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }
         if (np != g_prog) { g_prog = np; rp_pso_dirty = 1; }
     }
+draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置，下面按新程序重取资源与管线）
     // 仅拒绝绑定 DRV0 且未证明不读 base instance 的已解码 count 组；单条间接/#941 和 OP_MULTI_DRAW 保持原路径。
     // 组大小 1（max_draws = 1）只有一条命令，没有「别的命令的 firstInstance 被第一条顶替」的问题，语义与单条间接绘制相同：
     //   不跳，走下面单条间接的那次 4 字节拷贝（firstInstance 取这一条记录的）。组大小 ≥ 2 照旧具名跳（#1787 第二处）。
@@ -1423,7 +1441,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                 struct hz_ent *e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
                 if (!e && !built) {   // 表里没有（前瞻停在前面 / 作废了 / 阶段不够）：收通道，从这一笔重新前瞻；刚建过还没有就走下面的逐笔拷
                     if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1);
-                    rp_pass_flush(c); hz_build(c, rec, g_hz_mask);
+                    (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c)); hz_build(c, rec, g_hz_mask);
                     e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
                     if (e) rp_perf_add(RP_PERF_BINST_ONE, 1);
                 } else if (e) rp_perf_add(RP_PERF_BINST_HZ, 1);
@@ -1445,7 +1463,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) { rp_perf_add(RP_PERF_BINST_ONE, 1); if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1); rp_pass_flush(c); }
+            if (!copied) { rp_perf_add(RP_PERF_BINST_ONE, 1); if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1); (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c)); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1484,7 +1502,17 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         }
         if (e->src_kind == NVN_RB_IMG) {   // 图形阶段存储图像：与计算派发同一解析（image_resolve），句柄取这一阶段 BindImage 的槽
             const char *why = image_resolve(c, g_prog, st, i, st, &tv[st][i], &g_gimg_snap[st][i]);
-            if (why) { skip(why, rec); goto draw_done; }
+            if (why) {
+                if (g_prog->lib_sourced && !lib_retry && rp_shader_lib_reject(g_prog)) {   // 出库版声明与实绑不符：身份标坏换现编版，同一笔重绑
+                    struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
+                    for (int k = 0; k < rt->n && k < 8; k++) if (rt->color[k]) q.rt_format[k] = (uint32_t)(rt->has_cview[k] && rt->cview[k].set_format ? rt->cview[k].format : rt->color[k]->d.format);
+                    const struct rp_prog *np = NULL;
+                    lib_retry = 1;
+                    rp_view_pin_end();
+                    if (!rp_shader_resolve(&q, &np) && np) { g_prog = np; rp_pso_dirty = 1; goto draw_rebind; }
+                }
+                skip(why, rec); goto draw_done;
+            }
             g_gimg[st][i] = &g_gimg_snap[st][i];
             continue;
         }
@@ -1583,7 +1611,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         }
 #undef ACCESS_READ
         if (need) {
-            rp_pass_flush(c);
+            (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
             uint32_t game_barrier = rp_pass_take_barrier();
             if (game_barrier) nvn_gpu_barrier(c, game_barrier);
             else nvn_gpu_compute_to_graphics(c);
@@ -1707,6 +1735,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     DT(RP_PERF_D_BIND);   // 首版每笔都整组重发（support / c0 每笔在暂存区里新建）；按脏位省重发是后面的事
     a.prim = prim; a.count = count; a.instances = (uint32_t)(di ? di->instances : dr->instances); if (!a.instances) a.instances = 1; a.base_instance = base_instance;
     rp_occl_draw(c);
+    rp_seg_prog_note(g_prog);   // 段失败行的「本段末笔程序键」：这笔真的要发射了才记
     nvn_gpu_draw(c, &a);
     for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++)   // 图形阶段写了的存储图像：内容归 GPU（CPU 读前要回读）
         if (g_gimg[st][i] && (g_prog->ent[st][i].access & NVN_GPU_ACC_W)) rp_tex_mark_gpu_written(g_gimg[st][i]);
@@ -1905,21 +1934,31 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
       clock_gettime(CLOCK_MONOTONIC, &tsh); rp_perf_add(RP_PERF_DISP_SHADER_NS, (uint64_t)tsh.tv_sec * 1000000000ull + (uint64_t)tsh.tv_nsec - sh0);
       if (srx) { skip(srx > 0 ? "compute_program_not_ready" : "compute_program_unresolved", rec); return; } }
     static nvn_gpu_view tv[RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_ENT_MAX];
-    memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts);
     static tex_t img_snap[RP_PROG_ENT_MAX];   // 存储图像的登记快照（调用方持有；登记表会扩容换地址）
-    const tex_t *images[RP_PROG_ENT_MAX] = {0};
+    const tex_t *images[RP_PROG_ENT_MAX];
+    int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
+cs_rebind:
+    memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts); memset(images, 0, sizeof images);
     struct timespec tr0; clock_gettime(CLOCK_MONOTONIC, &tr0); uint64_t r0 = (uint64_t)tr0.tv_sec * 1000000000ull + (uint64_t)tr0.tv_nsec;
     rp_perf_add(RP_PERF_DISP_ENTS, pg->nent[0]);
     rp_view_pin_begin();
     for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
         if (e->src_kind == NVN_RB_TBUF) {
-            rp_pass_flush(c);
+            (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
             if (!tbuf_prepare(c, e, 5, pg->dtt[0][i], pg->dcls[0][i], &tv[i], rec)) goto done;
             continue;
         }
         if (e->src_kind == NVN_RB_IMG) {
             const char *why = image_resolve(c, pg, 0, i, 5, &tv[i], &img_snap[i]);
-            if (why) { skip(why, rec); goto done; }
+            if (why) {
+                if (pg->lib_sourced && !lib_retry && rp_shader_lib_reject(pg)) {   // 出库版声明与实绑不符：身份标坏换现编版，同一笔重绑
+                    const struct rp_prog *np = NULL;
+                    lib_retry = 1;
+                    rp_view_pin_end();
+                    if (!rp_shader_resolve_compute(&np) && np && np != pg) { pg = np; goto cs_rebind; }
+                }
+                skip(why, rec); goto done;
+            }
             images[i] = &img_snap[i];
             continue;
         }
@@ -1952,7 +1991,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     }
     { struct timespec tr1; clock_gettime(CLOCK_MONOTONIC, &tr1); rp_perf_add(RP_PERF_DISP_RESOLVE_NS, (uint64_t)tr1.tv_sec * 1000000000ull + (uint64_t)tr1.tv_nsec - r0); }
     { struct timespec tsb; clock_gettime(CLOCK_MONOTONIC, &tsb); uint64_t f0 = (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec;
-      rp_pass_flush(c);
+      (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
       clock_gettime(CLOCK_MONOTONIC, &tsb); rp_perf_add(RP_PERF_DISP_FLUSH_NS, (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec - f0); }
     g_disp_ind = NULL; g_disp_ind_off = 0;
     { struct timespec tin; clock_gettime(CLOCK_MONOTONIC, &tin); uint64_t in0 = (uint64_t)tin.tv_sec * 1000000000ull + (uint64_t)tin.tv_nsec;
@@ -2024,6 +2063,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
+    rp_seg_prog_note(pg);   // 同上：段失败行的「本段末笔程序键」
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {
