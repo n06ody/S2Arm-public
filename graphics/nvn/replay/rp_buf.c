@@ -41,6 +41,7 @@ struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen
 // 真机表现为走路一顿一顿（池镜像同步 4.2 MB/帧、其中直接写只剩 0.2 MB，见坑记录续 33）。
 struct land_rng { uint64_t off, len; };
 struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing;
+                uint64_t cost_id, cost_span, cost_direct, cost_ordered, cost_skip;  // window totals under g_bmu
                 int log_on;
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
@@ -50,7 +51,28 @@ static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finis
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
 static nvn_hmap g_shadow = {.klen = 8};   // 池起点 → struct shadow *
-static uint64_t g_sync_bytes, g_sync_runs;
+static uint64_t g_sync_bytes, g_sync_runs, g_cost_next_id;
+void rp_buf_cost_report(double frames) {
+    uint64_t id = 0, size = 0, span = 0, direct = 0, ordered = 0, skip = 0;
+    pthread_mutex_lock(&g_bmu);
+    for (uint32_t i = 0; i < g_shadow.cap; i++) {
+        struct shadow *s = g_shadow.vals[i];
+        if (!s) continue;
+        if (s->cost_span > span) {
+            id = s->cost_id; size = s->size; span = s->cost_span;
+            direct = s->cost_direct; ordered = s->cost_ordered; skip = s->cost_skip;
+        }
+        s->cost_span = s->cost_direct = s->cost_ordered = s->cost_skip = 0;
+    }
+    pthread_mutex_unlock(&g_bmu);
+    if (span) {
+        char line[320];
+        snprintf(line, sizeof line, "镜像探针（候选字节最多的在用池）：池 #%llu、容量 %llu KiB；每帧候选 %.1f、直写 %.1f、交录拷 %.1f、跳过 GPU 写 %.1f KiB",
+                 (unsigned long long)id, (unsigned long long)(size / 1024), span / frames / 1024,
+                 direct / frames / 1024, ordered / frames / 1024, skip / frames / 1024);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", line);
+    }
+}
 static nvn_gpu_buf g_null_storage;
 static int g_gw_live;   // 所有池的未落地登记数（含正在落地的项）
 static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数（原子读写）：为 0（受跟踪的游戏全程如此）时 rp_write_note 不多走一步
@@ -256,9 +278,21 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
         for (int i = 0; i < s->ngw; i++) { uint64_t g0 = s->gw[i].off, g1 = g0 + s->gw[i].len;
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
-        if (inside) { a = skip_to; continue; }
+        if (inside) {
+            if (rp_cost_on) {
+                uint64_t skipped = (skip_to < b ? skip_to : b) - a;
+                s->cost_skip += skipped;
+                rp_perf_add(RP_PERF_COST_GPU_SKIP_B, skipped);
+            }
+            a = skip_to; continue;
+        }
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
         else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        if (rp_cost_on) {
+            if (direct) s->cost_direct += stop - a;
+            else s->cost_ordered += stop - a;
+            rp_perf_add(direct ? RP_PERF_COST_DIRECT_B : RP_PERF_COST_ORDERED_B, stop - a);
+        }
         a = stop;
     }
 }
@@ -400,7 +434,10 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         uintptr_t a = s->page0 + (uintptr_t)(i * ps), b = s->page0 + (uintptr_t)((j + 1) * ps);   // 这一串脏页，裁到池的范围
         if (a < (uintptr_t)mem) a = (uintptr_t)mem;
         if (b > (uintptr_t)mem + size) b = (uintptr_t)mem + size;
-        nvn_dirty_protect((const void *)a, b - a); uint64_t st = nvn_dirty_now(); if (!st) st = 1;   // 先保护、取代号、再读
+        uint64_t start = rp_cost_on ? rp_cost_cpu_ns() : 0;
+        nvn_dirty_protect((const void *)a, b - a);
+        if (start) rp_perf_add(RP_PERF_COST_PROTECT_NS, rp_cost_cpu_ns() - start);
+        uint64_t st = nvn_dirty_now(); if (!st) st = 1;   // 先保护、取代号、再读
         uint64_t last = 0; for (uint64_t k = i; k <= j; k++) if (m->sub[k] > last) last = m->sub[k];
         if (mirror_read_hit(m, i, j)) last = rp_sub_serial();   // 干净读取也属于本次提交，不得在 GPU 读之前直写镜像
         // 本次提交里第一次同步这一串：镜像是 CPU 也能写的共享缓冲，直接写进去，不录成 GPU 上的拷贝（理由与真机读数见坑记录）。
@@ -410,8 +447,14 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem);
+               else if (rp_cost_on) rp_perf_add(RP_PERF_COST_NO_CMD_B, b - a); }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
+        if (rp_cost_on) {
+            if (!s->cost_id) s->cost_id = ++g_cost_next_id;
+            s->cost_span += b - a;
+            if (start) rp_perf_add(RP_PERF_COST_SYNC_NS, rp_cost_cpu_ns() - start);
+        }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }
 static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, int count_resolve);
@@ -499,7 +542,9 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
     if (!s) return 0;
     // 整段先选一次镜像：未落地的 GPU 写可能只覆盖其中一个摘要块。
     struct mirror *m = mirror_pick(s, addr - (uint64_t)(uintptr_t)mem, len, NULL);
+    uint64_t start = rp_cost_cs_bind ? rp_cost_cpu_ns() : 0;
     int ok = resolve_inner(addr, len, mem, size, s, m);
+    if (start) rp_perf_add(RP_PERF_COST_CS_RESOLVE_NS, rp_cost_cpu_ns() - start);
     if (ok) {
         const size_t ps = nvn_dirty_page_size();
         uint64_t lo = ((uintptr_t)addr - s->page0) / ps, hi = ((uintptr_t)addr + len - 1 - s->page0) / ps;

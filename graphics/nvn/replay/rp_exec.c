@@ -321,7 +321,16 @@ void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
 
+_Thread_local int rp_cost_on, rp_cost_cs_bind;
+
+uint64_t rp_cost_cpu_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0
+        ? (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec : 0;
+}
+
 void nvn_be_sub_begin(void) {
+    rp_cost_on = nvn_plat_flag("nvk_cost_probe", 0) != 0;
     rp_buf_hold_begin();   // 回放窗口开：到 nvn_be_sub_commit 收尾之前，别的线程销毁池不当场放镜像缓冲（rp_buf.c）
     g_sub = calloc(1, sizeof *g_sub);
     if (g_sub) g_sub->refs = 1;

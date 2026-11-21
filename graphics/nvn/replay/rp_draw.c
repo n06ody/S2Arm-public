@@ -2338,12 +2338,19 @@ cs_rebind:
     g_pipe = NULL; g_pipe_cmd = NULL; rp_dirty_all();   // 后端的当前管线换成了计算管线：下一笔绘制全部重发
     g_disp_dim[0] = dp->ind ? 0 : (uint32_t)dp->x; g_disp_dim[1] = dp->ind ? 0 : (uint32_t)dp->y; g_disp_dim[2] = dp->ind ? 0 : (uint32_t)dp->z;
     g_ndispatch_access = 0;
-    if (!bind_stage_at(c, pg, 0, 5, 0, tv, ts, rec)) goto done;
+    uint64_t cost_start = rp_cost_on ? rp_cost_cpu_ns() : 0;
+    rp_cost_cs_bind = rp_cost_on;
+    int bound = bind_stage_at(c, pg, 0, 5, 0, tv, ts, rec);
+    rp_cost_cs_bind = 0;
+    if (cost_start) rp_perf_add(RP_PERF_COST_CS_BIND_NS, rp_cost_cpu_ns() - cost_start);
+    if (!bound) goto done;
     for (uint32_t i = 0; i < pg->nent[0]; i++) if (images[i] && (pg->ent[0][i].access & NVN_GPU_ACC_W)) rp_tex_mark_gpu_written(images[i]);
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
+    cost_start = rp_cost_on ? rp_cost_cpu_ns() : 0;
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
+    if (cost_start) rp_perf_add(RP_PERF_COST_CS_DISPATCH_NS, rp_cost_cpu_ns() - cost_start);
     texel_wb_flush(c);   // imageBuffer 的对齐副本：派发写完拷回池镜像
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {

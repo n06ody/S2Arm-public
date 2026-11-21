@@ -366,6 +366,16 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_COST_SYNC_NS] || pf[RP_PERF_COST_CS_BIND_NS] || pf[RP_PERF_COST_CS_DISPATCH_NS]) {
+                    const double ms = 1e6 * f, kib = 1024.0 * f;
+                    snprintf(b, sizeof b, "提交探针（每帧，本线程 CPU 毫秒）：计算资源绑定 %.3f（其中镜像解析 %.3f）、后端派发 %.3f；全场镜像同步 %.3f（其中加保护 %.3f）；直写 %.1f、交录拷 %.1f、跳过 GPU 写 %.1f、无传输命令 %.1f KiB",
+                             pf[RP_PERF_COST_CS_BIND_NS] / ms, pf[RP_PERF_COST_CS_RESOLVE_NS] / ms,
+                             pf[RP_PERF_COST_CS_DISPATCH_NS] / ms, pf[RP_PERF_COST_SYNC_NS] / ms,
+                             pf[RP_PERF_COST_PROTECT_NS] / ms, pf[RP_PERF_COST_DIRECT_B] / kib,
+                             pf[RP_PERF_COST_ORDERED_B] / kib, pf[RP_PERF_COST_GPU_SKIP_B] / kib, pf[RP_PERF_COST_NO_CMD_B] / kib);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    rp_buf_cost_report(f);
+                }
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核

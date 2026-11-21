@@ -52,8 +52,10 @@ static int g_flag_ub_steal = -1;   // 用例设：开关 nvk_ub_fill_steal（-1 
 static int g_flag_split_pass = -1, g_flag_diag_load_dc, g_flag_diag_store_dc;   // 用例设：开关 nvk_split_pass（-1 = 缺省）、诊断开关 nvk_diag_load_dontcare / nvk_diag_store_dontcare
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
+static int g_cost_probe = -1;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_cost_probe")) return g_cost_probe < 0 ? dflt : g_cost_probe;
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
@@ -4354,7 +4356,12 @@ static void t_dispatch(void) {
     q_draw(&s);                                                                                    // 派发之后再画：管线全部重发
     end(&s);
     int ends0 = g_pass_ends, sp0 = g_set_pipes, pg0 = g_pipe_gets;
+    uint64_t cost[RP_PERF_N];
+    rp_perf_take(cost);
     submit1(&s);
+    rp_perf_take(cost);
+    CHECK((cost[RP_PERF_COST_CS_BIND_NS] > 0) == (g_cost_probe == 1));
+    CHECK((cost[RP_PERF_COST_CS_DISPATCH_NS] > 0) == (g_cost_probe == 1));
     CHECK(g_cresolves == 2 && g_cpipe_gets == 1 && g_cpipe_sh == &g_fsh[0] && g_ndisp == 1 && g_disp[0] == 2 && g_disp[1] == 3 && g_disp[2] == 1 && g_disp_pipe == &g_fcpipe);
     CHECK(g_pass_ends - ends0 >= 1 && g_npd == 2);                         // 派发前通道结束；之后那一笔另开一个通道
     CHECK(g_set_pipes - sp0 == 3 && g_pipe_gets - pg0 == 2);               // 图形、计算、再图形：派发之后图形管线重取重设
@@ -4374,12 +4381,20 @@ static void t_dispatch(void) {
     nvn_be_sub_commit();
     // 上一次提交（那次派发）显卡还没做完：镜像里的旧内容它可能还没读，这次同步不能直接写镜像，按序录成 GPU 上的拷贝；
     // [PG+64, PG+192) 是 GPU 写过还没落地的，绕开 → 前后两段（64 字节、PG−192 字节），镜像内存一个字节都没被 CPU 动
+    rp_perf_take(cost);
+    CHECK(cost[RP_PERF_COST_ORDERED_B] == (g_cost_probe == 1 ? PG - 128u : 0u));
+    CHECK(cost[RP_PERF_COST_GPU_SKIP_B] == (g_cost_probe == 1 ? 128u : 0u));
+    CHECK(cost[RP_PERF_COST_DIRECT_B] == 0);
+    CHECK((cost[RP_PERF_COST_SYNC_NS] > 0) == (g_cost_probe == 1));
     CHECK(g_nbw == 2 && mirror[PG] == 0xEE && mirror[PG + 64] == 0xEE && mirror[PG + 192] == 0xEE);
     fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_pmem[PG + 63] == 0x11 && g_pmem[PG + 64] == 0xEE && g_pmem[PG + 191] == 0xEE && g_pmem[PG + 192] == 0x11);   // 完成：只有那 128 字节回到游戏内存
     g_pg_gen[1] = 103; g_dirty_now = 104; g_nbw = 0;                       // 回写落地之后再脏：整页照传，不再绕
     nvn_be_sub_begin();
     CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 0 && !memcmp(mirror + PG, g_pmem + PG, PG));
+    rp_perf_take(cost);
+    CHECK(cost[RP_PERF_COST_DIRECT_B] == (g_cost_probe == 1 ? PG : 0));
+    CHECK(cost[RP_PERF_COST_GPU_SKIP_B] == 0 && cost[RP_PERF_COST_ORDERED_B] == 0);
     g_pmem[PG + 8] ^= 0x40; g_pg_gen[1] = 105; g_dirty_now = 106;          // 同一次提交里同步过又变了：这一次要排在已录的绘制之后，录成 GPU 上的拷贝
     CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 1 && g_bw[0].off == PG && g_bw[0].len == PG);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
@@ -7228,6 +7243,9 @@ int main(int argc, char **argv) {
     t_msoff();
     t_render_cond();
     t_dispatch();
+    g_cost_probe = 1;
+    t_dispatch();
+    g_cost_probe = -1;
     t_dispatch_barrier();
     t_dispatch_indirect_gpu();
     t_dispatch_ubop_rw(); t_bufops_gpu_order();
