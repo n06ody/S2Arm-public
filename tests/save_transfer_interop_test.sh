@@ -8,4 +8,13 @@ dotnet="${DOTNET:-$HOME/.dotnet/dotnet}"
 #   compat/tree 工程，Ryujinx.Memory 等「构建时打包」抢同一个 .nupkg 报「The process cannot access the file」，本测试被误判红
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 "$dotnet" build tests/save_transfer/SaveTransferInterop.csproj -c Release --nologo --artifacts-path "$T/artifacts" -p:GeneratePackageOnBuild=false
-"${PYTHON:-python3}" tests/save_transfer/interop.py "$dotnet" "$T/artifacts/bin/SaveTransferInterop/release/SaveTransferInterop.dll"
+# Run inspect inside NativeAOT with reflection serialization disabled, as in the APK.
+"$dotnet" publish tests/save_transfer/SaveTransferInterop.csproj -c Release --nologo \
+    --artifacts-path "$T/aot-artifacts" -o "$T/aot" \
+    -p:S2ASaveAotTests=1 -p:GeneratePackageOnBuild=false
+args=("$dotnet" "$T/artifacts/bin/SaveTransferInterop/release/SaveTransferInterop.dll" "$T/aot/SaveTransferInterop")
+if [ "$(uname -s)" = Darwin ]; then
+    "${CC:-cc}" -Wall -Wextra -Werror -dynamiclib tests/save_transfer/space_faults.c -o "$T/space_faults.dylib"
+    args+=("$T/space_faults.dylib")
+fi
+"${PYTHON:-python3}" tests/save_transfer/interop.py "${args[@]}"

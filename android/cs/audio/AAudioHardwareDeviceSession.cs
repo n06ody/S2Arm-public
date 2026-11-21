@@ -90,6 +90,7 @@ namespace S2A.Audio.AAudio
 
         private void FeedLoop()
         {
+            AAudioSink.s2a_capacity_audio_enter();
             while (!_closing)
             {
                 // The sink outlives this thread (Dispose joins it before closing the sink).

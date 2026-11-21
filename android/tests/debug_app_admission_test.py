@@ -155,7 +155,10 @@ class DebugAppAdmissionTest(unittest.TestCase):
         self.assertIn('source -> checkedImportSource(source, context.getPackageName(),', library)
         install = (JAVA / 'GameInstall.java').read_text()
         self.assertIn('sourceCheck.checked(directory(dir))', install)
-        self.assertIn('!= 0, DebugGate.open(), timing)', library)
+        self.assertRegex(library,
+                         r'GameSession\.load\(spec,\s*context\.getFilesDir\(\),\s*apk,\s*'
+                         r'\(context\.getApplicationInfo\(\)\.flags & android\.content\.pm\.ApplicationInfo\.FLAG_DEBUGGABLE\)'
+                         r'\s*!=\s*0,\s*DebugGate\.open\(\),\s*timing,\s*saves::recoverIfNeeded\)')
         main = (JAVA / 'MainActivity.java').read_text()
         self.assertIn('BootContract.packageTitle(getPackageName(),', main)
         self.assertIn('(getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 && DebugGate.open())', main)
@@ -165,7 +168,8 @@ class DebugAppAdmissionTest(unittest.TestCase):
             (root / 'DebugAppProbe.java').write_text(PROBE)
             (root / 'ImportGuard.java').write_text(wrapper)
             classes = ['Json', 'BootContract', 'BootSpec', 'ProcessBirth', 'RuntimeLibrary',
-                       'GamePack', 'GameFingerprint', 'GameStorage', 'GameInstall', 'ImportReceiver', 'GameSession', 'GameResume']
+                       'GamePack', 'GameFingerprint', 'GameStorage', 'GameInstall', 'SaveArchive', 'ImportReceiver',
+                       'GameSession', 'GameResume']
             sources = [JAVA / (x + '.java') for x in classes]
             sources += [ANDROID / 'tests/GameSessionAdmissionTest.java', root / 'ImportGuard.java', root / 'DebugAppProbe.java']
             # Host-only Android logging seam; admission/import decisions stay production code.
