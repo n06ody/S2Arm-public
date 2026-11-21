@@ -1187,6 +1187,25 @@ extern "C" __attribute__((visibility("default"))) long long s2a_android_copy_ass
 #endif
 }
 
+// copy_asset 的内存直读变体：asset 内容整个读进 buf（至多 cap 字节），不落盘——给包内小配置用，
+//   调用方目录时序不保证（直编缓存目录冷开局后才由首个缓存写 ensure_dir 建出）。返回读到的字节数；负数同 copy_asset 口径。
+extern "C" __attribute__((visibility("default"))) long long s2a_android_read_asset(const char *name, void *buf, long long cap) {
+#ifdef S2A_ANDROID_GAME_RUNTIME
+    if (!g_game_host || !g_game_host->assets || !name || !*name || !buf || cap <= 0) return -1;
+    AAsset *asset = AAssetManager_open(g_game_host->assets, name, AASSET_MODE_STREAMING);
+    if (!asset) return -2;
+    long long total = 0;
+    int read;
+    while (total < cap && (read = AAsset_read(asset, static_cast<char *>(buf) + total, cap - total)) > 0)
+        total += read;
+    AAsset_close(asset);
+    return read < 0 ? -5 : total;
+#else
+    (void)name; (void)buf; (void)cap;
+    return -1;
+#endif
+}
+
 // 接口 v2.15（缺口扫描族 1，#1228）：前后台转给服务层。平台壳写焦点（onPause → 失焦，onResume → 焦点；不发睡眠，
 //   见 setForeground）；退后台一律冻客机与游戏时钟（同 iOS 后台整体冻结，#855），
 //   时钟原因位 4 是安卓专属（1=后台会话、2=系统键盘、3=Mac 失焦），回前台放开；停机路径不冻、冻着先放开，
