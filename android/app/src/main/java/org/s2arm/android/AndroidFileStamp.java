@@ -5,11 +5,27 @@ import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructStat;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.IOException;
 
 /** Android's NIO FileTime may truncate nanoseconds; use the public stat timespec directly. */
 final class AndroidFileStamp {
     private AndroidFileStamp() { }
+
+    static void syncDirectory(File directory) throws IOException {
+        try {
+            FileDescriptor fd = Os.open(directory.getPath(),
+                OsConstants.O_RDONLY | OsConstants.O_NOFOLLOW | OsConstants.O_CLOEXEC, 0);
+            try {
+                if (!OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) throw new IOException("sync target is not a directory");
+                Os.fsync(fd);
+            } finally {
+                Os.close(fd);
+            }
+        } catch (ErrnoException error) {
+            throw new IOException("cannot sync object install directory", error);
+        }
+    }
 
     // Diagnostic replay only: no path canonicalization and no application Stamp allocation.
     static void probe(File file) throws IOException {
