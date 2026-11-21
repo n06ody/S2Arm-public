@@ -60,6 +60,17 @@ if(ANDROID)
     include(core-link/LinkSources.cmake)
     s2a_android_host_sources(host_sources)
     add_library(s2arm_android SHARED ${host_sources})
+    set(S2A_MALI_COUNTERS_SRC "" CACHE PATH "Offline Arm libGPUCounters source directory")
+    if(S2A_MALI_COUNTERS_SRC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        file(READ "${S2A_MALI_COUNTERS_SRC}/LICENSE.md" mali_license)
+        file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mali_license.inc"
+             CONTENT "R\"S2Alicense(${mali_license})S2Alicense\"")
+        target_include_directories(s2arm_android PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        add_subdirectory("${S2A_MALI_COUNTERS_SRC}" mali-counters EXCLUDE_FROM_ALL)
+        target_sources(s2arm_android PRIVATE native/mali_counters.cpp)
+        target_link_libraries(s2arm_android PRIVATE hwcpipe)
+        target_compile_definitions(s2arm_android PRIVATE S2A_MALI_COUNTERS=1)
+    endif()
     # Independent native boundary: never enabled in Release/RelWithDebInfo/MinSizeRel.
     target_compile_definitions(s2arm_android PRIVATE $<$<CONFIG:Debug>:S2A_ANDROID_DEBUG_ENV=1>)
     # 窗口/呈现始终用 Android Vulkan surface；direct 后端只是额外的消费者。

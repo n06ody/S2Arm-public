@@ -1564,12 +1564,18 @@ static void s2a_tune_heap_for_game() {
 
 // JNI 装载即重定向 stderr（debug.s2a.stderr）并注册 exit 探针（debug.s2a.exitlog），
 // 早于任何 Java/游戏逻辑。exit() 会触发 atexit；_exit()/abort() 不会。:game 进程同时设好堆分配器策略（见上）。
+#if defined(S2A_MALI_COUNTERS)
+void s2a_mali_counters_arm();
+#endif
 extern "C" int JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)vm; (void)reserved;
     s2a_redirect_stderr_once();
     __system_property_get("debug.s2a.exitlog", g_exitlog_path);
     if (g_exitlog_path[0]) atexit(s2a_exit_probe);
     s2a_tune_heap_for_game();
+#if defined(S2A_MALI_COUNTERS)
+    if (s2a_is_game_process()) s2a_mali_counters_arm();
+#endif
     return 0x00010006;   // JNI_VERSION_1_6
 }
 
