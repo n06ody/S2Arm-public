@@ -425,9 +425,20 @@ void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n) {
 }
 
 // 仅内部余区重开路径使用可见拷回失败；不把此结果当作后端执行成功。
+static int g_cut_why, g_last_end_why = -1;   // 上一个结束的通道的收通道原因（屏障直方图用）
+static uint64_t g_bar_hist[RP_BAR_SITES][256];
+void rp_bar_note(int site, uint32_t bits) { if (site >= 0 && site < RP_BAR_SITES) g_bar_hist[site][bits & 0xff]++; }
+void rp_bar_take(uint64_t out[RP_BAR_SITES][256]) { memcpy(out, g_bar_hist, sizeof g_bar_hist); memset(g_bar_hist, 0, sizeof g_bar_hist); }
+void rp_pass_cut_why(int why) { g_cut_why = why >= 0 && why < RP_CUT_N ? why : RP_CUT_OTHER; }
 static int pass_end_checked(nvn_gpu_cmd c) {
     int copied = 1;
     if (P.open) rp_perf_add(RP_PERF_PASSEND_N, 1);
+    if (P.open) {   // 收通道原因 × 尺寸（批 0 诊断探针）
+        rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why, 1); rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why + 1, (uint64_t)P.cur_kpix);
+        if (P.cur_kpix >= 1000) rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why + 2, 1);
+        g_last_end_why = g_cut_why;
+    }
+    g_cut_why = RP_CUT_OTHER;
     if (P.open && c) { nvn_gpu_pass_end(c); for (int i = 0; i < 8; i++) if (g_shu[i].base && !shadow_copy(c, i, 1)) copied = 0; }   // 画进影子的内容拷回各自的深度贴图
     if (P.open) { if (P.has_ds) { rp_perf_add(RP_PERF_P_DS, 1); if (!P.ds_used) rp_perf_add(RP_PERF_P_DS_IDLE, 1); } if (P.ndraw <= 1) rp_perf_add(RP_PERF_P_ONE, 1);
                   if (!P.ndraw) rp_perf_add(RP_PERF_P_CLEARONLY, 1);
@@ -453,12 +464,12 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     // 后端没声明无附件通道时，全零且无深度仍须保留原目标，不能把原本可执行的片元副作用 / 查询变成跳过。
     // 部分槽被筛掉、有深度、或后端明确支持无附件通道时，才真的移除全部零掩码颜色槽。
     if (!wanted && !P.rt.depth && !noatt_ok()) wanted = select_colors(0xff);
-    if (P.open && P.colors != wanted) rp_pass_end(c);
+    if (P.open && P.colors != wanted) { rp_pass_cut_why(RP_CUT_MASK); rp_pass_end(c); }
     P.want_colors = wanted;
     P.area_want = 0;
     if (P.open && P.na_w && !P.na_from_rt) {   // 真无目标通道按视口定；零掩码留下的逻辑目标尺寸不能随视口扩大
         uint32_t w = 0, h = 0;
-        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) rp_pass_end(c);
+        if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) { rp_pass_cut_why(RP_CUT_AREA); rp_pass_end(c); }
     }
     if (!nvn_plat_flag("nvk_pass_area", 0)) return;
     int32_t x, y; uint32_t w, h;
@@ -493,11 +504,31 @@ static void pass_land_full(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, int color,
     else { d->depth.load = NVN_GPU_LOAD_LOAD; d->stencil.load = NVN_GPU_LOAD_LOAD; }
     rp_dirty_all();
 }
+// 断遍探针（诊断，「同一提交里第二次同步」切掉的通道重开时是不是原来那组目标）：rp_xfer_cmd 收通道前记下这组目标的序号，
+// 下一次开通道时比；同组 = 断了又原样重开（附件要整张载回），异组 = 断点恰在换目标附近。顺带记被切通道的首个颜色目标面积。
+static struct { int pending, n; uint64_t col[8], depth; } g_cut;
+void rp_pass_note_cut(void) {
+    if (!P.open || !P.has_rt) return;
+    g_cut.pending = 1; g_cut.n = P.rt.n; g_cut.depth = P.rt.depth ? P.rt.depth->serial : 0;
+    uint64_t kpix = 0;
+    for (int i = 0; i < 8; i++) { g_cut.col[i] = i < P.rt.n && P.rt.color[i] ? P.rt.color[i]->serial : 0;
+        if (!kpix && i < P.rt.n && P.rt.color[i]) kpix = (uint64_t)P.rt.color[i]->d.width * P.rt.color[i]->d.height / 1000; }
+    if (!kpix && P.rt.depth) kpix = (uint64_t)P.rt.depth->d.width * P.rt.depth->d.height / 1000;
+    rp_perf_add(RP_PERF_CUT_KPIX, kpix);
+}
+static void cut_reopen_note(void) {
+    if (!g_cut.pending) return;
+    g_cut.pending = 0;
+    int same = g_cut.n == P.rt.n && g_cut.depth == (P.rt.depth ? P.rt.depth->serial : 0);
+    for (int i = 0; i < 8 && same; i++) if (g_cut.col[i] != (i < P.rt.n && P.rt.color[i] ? P.rt.color[i]->serial : 0)) same = 0;
+    rp_perf_add(same ? RP_PERF_CUT_REOPEN_SAME : RP_PERF_CUT_REOPEN_OTHER, 1);
+}
 static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
     colors = select_colors(colors);
     if (P.open && P.colors == colors) return 1;
     if (P.open) rp_pass_end(c);
     if (!c || !P.has_rt) { if (c) nvn_unimpl("pass", "draw_without_target", NULL); return 0; }
+    cut_reopen_note();
     P.colors = colors;
     int any_color = 0; for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) any_color = 1;
     if (P.rt.n < 0 || P.rt.n > 8) { nvn_unimpl("pass", "no_attachment", NULL); return 0; }
@@ -553,7 +584,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         }
     }
     PB(RP_PERF_PB_VIEW);
-    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    if (P.barrier_bits) { rp_bar_note(g_last_end_why == RP_CUT_RT ? 0 : 1, P.barrier_bits); nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
     PB(RP_PERF_PB_BAR);
     d.occlusion = (uint8_t)rp_occl_want();
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0;
@@ -680,7 +711,7 @@ void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
     rp_perf_add(RP_PERF_SETRT_N, 1);
     { struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0); uint64_t s0 = (uint64_t)ts0.tv_sec * 1000000000ull + (uint64_t)ts0.tv_nsec;
       // 开关开着（缺省）：只收当前通道，待折清除挂起（等下一个把它当附件的通道吃掉，见 park 段）；关着 = 旧行为：先落地再换目标
-      if (park_on()) rp_pass_end(c); else rp_pass_flush(c);
+      rp_pass_cut_why(RP_CUT_RT); if (park_on()) rp_pass_end(c); else rp_pass_flush(c);
       struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1); uint64_t s1 = (uint64_t)ts1.tv_sec * 1000000000ull + (uint64_t)ts1.tv_nsec;
       rp_perf_add(RP_PERF_SETRT_END_NS, s1 - s0); }
     P.rt = *r; P.has_rt = 1;
@@ -768,7 +799,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         return;
     }
     if (P.open) rp_perf_add(RP_PERF_P_CUT_CLEAR, 1);
-    if (P.open) rp_pass_end(c);   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
+    if (P.open) { rp_pass_cut_why(RP_CUT_CLEAR); rp_pass_end(c); }   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
     park_put_color(c, i, cc->rgba);   // 挂起：下一个把这个槽当附件的通道载入时清成这个值
 }
 
