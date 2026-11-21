@@ -318,6 +318,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                         o += (size_t)snprintf(b + o, sizeof b - o, "%s %.2f 次（全屏级 %.2f）共 %.2f 百万像素；", why[k], (double)cn / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 2] / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 1] / 1e3 / f); }
                     o += (size_t)snprintf(b + o, sizeof b - o, "主段 GPU 拷贝（缓冲同步）按成因：落地回流 %.0f KB、同提交第二次同步 %.0f KB、其余真脏 %.0f KB",
                              (double)pf[RP_PERF_GX_LAND_KB] / f, (double)pf[RP_PERF_GX_SECOND_KB] / f, (double)pf[RP_PERF_GX_DIRTY_KB] / f);
+                    if (pf[RP_PERF_SAME_CMP_NS] || pf[RP_PERF_BW_MERGED])
+                        o += (size_t)snprintf(b + o, sizeof b - o, "；同值跳过（nvk_sync_same）%.0f KB、整串跳过 %.2f 次、比较 %.2f 毫秒；合并写（nvk_bw_merge）省屏障 %.1f 道",
+                                              (double)pf[RP_PERF_SAME_SKIP_KB] / f, (double)pf[RP_PERF_SAME_SKIP_RUN] / f, (double)pf[RP_PERF_SAME_CMP_NS] / 1e6 / f, (double)pf[RP_PERF_BW_MERGED] / f);
                     if (pf[RP_PERF_S5_NS]) snprintf(b + o, sizeof b - o, "；影子计数类 5（同步页与上次同步进同一镜像时内容比，KB）：相同 %.0f / 不同 %.0f / 无效 %.0f，其中落地回流页 相同 %.0f / 不同 %.0f / 无效 %.0f；算摘要 %.2f 毫秒",
                              (double)pf[RP_PERF_S5_SAME_KB] / f, (double)pf[RP_PERF_S5_DIFF_KB] / f, (double)pf[RP_PERF_S5_INV_KB] / f,
                              (double)pf[RP_PERF_S5_LSAME_KB] / f, (double)pf[RP_PERF_S5_LDIFF_KB] / f, (double)pf[RP_PERF_S5_LINV_KB] / f, (double)pf[RP_PERF_S5_NS] / 1e6 / f);

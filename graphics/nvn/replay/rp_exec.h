@@ -124,6 +124,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_GX_LAND_KB, RP_PERF_GX_SECOND_KB, RP_PERF_GX_DIRTY_KB,
        // 影子计数（类 5，只数不改动作）：每次缓冲同步的页与「上次同步进同一份镜像时」的内容摘要比——相同 / 不同 / 无效（第一次、或中间被显卡写过）；
        //   落地回流页单列。NS = 算摘要花的 CPU 时间（开关 nvk_shadow5，缺省开）
+       RP_PERF_SAME_SKIP_KB, RP_PERF_SAME_SKIP_RUN, RP_PERF_SAME_CMP_NS, RP_PERF_BW_MERGED,   // 同值跳过（nvk_sync_same）：跳过的 KB / 整串跳过（没录传输、没切通道）的次数 / 比较花的 CPU；合并写（nvk_bw_merge）省掉的屏障数
        RP_PERF_S5_SAME_KB, RP_PERF_S5_DIFF_KB, RP_PERF_S5_INV_KB, RP_PERF_S5_LSAME_KB, RP_PERF_S5_LDIFF_KB, RP_PERF_S5_LINV_KB, RP_PERF_S5_NS,               // 主段 GPU 拷贝（缓冲同步）按成因：落地回流 / 同提交第二次同步 / 其余真脏（上次提交没做完等）          // 断遍探针：被「第二次同步」切掉的通道重开时同组目标 / 异组目标；被切通道首个目标的千像素和   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
