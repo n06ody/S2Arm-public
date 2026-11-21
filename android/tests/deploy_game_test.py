@@ -38,6 +38,7 @@ class FakeAdb:
         self.drop_first = drop_first         # 前几次连接一接上就断（设备端还没监听时 adb forward 的样子）
         self.started = False
         self.receipt = None   # (contentRoot, artifactSha256)：App 导入成功时在 logcat 打的回执（正式包读不了 current.json）
+        self.delta_receipt = False
         self.received, self.name, self.connects = {}, None, 0
         self.digest = None    # 机上没装：真 adb 的 installed_hash 此时抛 RuntimeError（pm path 为空）
         self.remote = {}      # 设备共享存储上已有文件的 SHA-256（路径 → 摘要），sha256sum 照它答
@@ -133,7 +134,9 @@ class FakeAdb:
                 return ''
             imported = f'Game build artifact updated (same files): test [{TITLE}] from import/{self.name}'
             if self.receipt:
-                imported += f'\nGame import receipt: {TITLE} contentRoot={self.receipt[0]} artifactSha256={self.receipt[1]} from import/{self.name}'
+                proof = ' resourceDelta=1' if self.delta_receipt else ''
+                imported += (f'\nGame import receipt: {TITLE} contentRoot={self.receipt[0]}'
+                             f' artifactSha256={self.receipt[1]}{proof} from import/{self.name}')
             return '\n'.join((accepted, imported) if self.stale_start else ((imported, accepted) if self.started else (imported,)))
         return ''
 
@@ -327,6 +330,68 @@ class DeployTest(unittest.TestCase):
                                          allow_full_import=False, resident_receipt=resident)
         self.assertEqual(len(adb.received), 4)
         self.assertFalse((self.root / 'deployment.json').exists())
+
+    def delta_fixture(self):
+        old, new = self.root / 'old', self.root / 'new'
+        game_apk.resources(self.pack, self.apk, old)
+        artifact, binding = deploy_game.validate(self.apk, old)
+        resident = dict(packageName=artifact['apk']['packageName'], apkSha256=artifact['apk']['sha256'],
+                        contentRoot=artifact['contentRoot'], artifactSha256=binding)
+        payload = b'changed resource'
+        (self.pack / 'romfs/data').write_bytes(payload)
+        index = self.pack / 'index.tsv'
+        rows = index.read_text().splitlines()
+        rows = [f'romfs/data\t{len(payload)}\t{hashlib.sha256(payload).hexdigest()}'
+                if row.startswith('romfs/data\t') else row for row in rows]
+        content = ('\n'.join(rows) + '\n').encode()
+        index.write_bytes(content)
+        (self.pack / 'manifest.json').write_text(json.dumps(
+            dict(version=2, index_sha256=hashlib.sha256(content).hexdigest())))
+        with zipfile.ZipFile(self.apk, 'a') as apk:
+            apk.writestr('assets/diagnostic.txt', b'upgraded')
+        game_apk.resources(self.pack, self.apk, new)
+        target, new_binding = deploy_game.validate(self.apk, new)
+        return old, new, resident, (target['contentRoot'], new_binding)
+
+    def test_cross_root_delta_sends_changed_files_and_requires_receiver_confirmation(self):
+        old, new, resident, target = self.delta_fixture()
+        marker = (f's2a-resource-delta-v1\t{resident["contentRoot"]}\t{resident["artifactSha256"]}'
+                  f'\t{target[0]}\n').encode()
+        uploaded = {path: (new / path).read_bytes() for path in (*game_apk.REFRESH_PAYLOAD, 'romfs/data')}
+        uploaded['game-resource-delta.tsv'] = marker
+        size = sum(map(len, uploaded.values()))
+        adb = FakeAdb()
+        adb.digest, adb.receipt = resident['apkSha256'], target
+        options = dict(start=False, allow_full_import=False, resident_receipt=resident,
+                       delta_from=old, max_resource_bytes=size)
+        with self.assertRaisesRegex(RuntimeError, '设备未确认资源差分导入'):
+            deploy_game.deploy_resources(self.apk, new, adb, self.root, **options)
+        self.assertEqual(adb.received, uploaded)
+        adb.delta_receipt = True  # Same APK is already installed; verify an explicit retry.
+        receipt = deploy_game.deploy_resources(self.apk, new, adb, self.root, **options)
+        self.assertEqual(adb.received, uploaded)
+        self.assertEqual((receipt['transferMode'], receipt['previousContentRoot'], receipt['sentFiles'],
+                          receipt['sentBytes'], receipt['contentRoot'], receipt['artifactSha256']),
+                         ('delta', resident['contentRoot'], 6, size, *target))
+        self.assertEqual([call for call in adb.calls if call[0] == 'install'], [('install', '-r', self.apk)])
+
+    def test_cross_root_delta_rejects_invalid_plan_before_install(self):
+        old, new, resident, target = self.delta_fixture()
+        adb = FakeAdb()
+        adb.digest, adb.receipt = resident['apkSha256'], target
+        with self.assertRaisesRegex(RuntimeError, '资源直传超过预算'):
+            deploy_game.deploy_resources(self.apk, new, adb, self.root, start=False, resident_receipt=resident,
+                                         delta_from=old, max_resource_bytes=1)
+        with self.assertRaisesRegex(ValueError, '旧资源与驻留回执不符'):
+            deploy_game.deploy_resources(self.apk, new, adb, self.root, start=False, delta_from=old,
+                                         resident_receipt=dict(resident, artifactSha256='0' * 64))
+        data = new / 'romfs/data'
+        data.unlink()
+        data.write_bytes(b'x' * len(b'changed resource'))
+        with self.assertRaisesRegex(ValueError, '差分文件与目标索引不符：romfs/data'):
+            deploy_game.deploy_resources(self.apk, new, adb, self.root, start=False,
+                                         resident_receipt=resident, delta_from=old)
+        self.assertEqual(adb.calls, [])
 
     def test_deploy_freezes_apk_and_records_matching_identity(self):
         adb = FakeAdb()

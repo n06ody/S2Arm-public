@@ -449,6 +449,79 @@ public final class GameInstallTest {
         GameInstall.deleteTree(games);
     }
 
+    private static void crossRootDeltaWithNoLinks() throws Exception {
+        File games = Files.createTempDirectory("s2a-games-delta").toFile();
+        File initial = pack("delta old"), delta = pack("delta new");
+        try {
+            GameInstall.Linker noLinks = (created, existing) -> { throw new IOException("links denied"); };
+            GameInstall.Result first = GameInstall.install(games, GameInstall.directory(initial), null, noLinks);
+            File gameRoot = new File(games, first.titleId);
+            BootContract.Current before = BootContract.readCurrent(gameRoot);
+            String next = root(delta);
+            java.nio.file.Path marker = new File(delta, "game-resource-delta.tsv").toPath();
+            String proof = "s2a-resource-delta-v1\t" + before.contentRoot + "\t" + before.artifactSha256 + "\t" + next + "\n";
+            Files.delete(new File(delta, "exefs/main.npdm").toPath());
+            Files.writeString(marker, proof.replace(before.artifactSha256, "0".repeat(64)));
+            refused(games, delta, "delta wrong base binding", "base root or binding", before.contentRoot);
+            Files.writeString(marker, proof.replace(before.contentRoot, "sha256-" + "0".repeat(64)));
+            refused(games, delta, "delta wrong base root", "base root or binding", before.contentRoot);
+            Files.writeString(marker, proof);
+            java.nio.file.Path changed = new File(delta, "romfs/readme.txt").toPath();
+            Files.delete(changed);
+            refused(games, delta, "delta missing changed payload", "lacks changed file", before.contentRoot);
+            Files.writeString(changed, "bad bytes");
+            refused(games, delta, "delta corrupt changed payload", "does not match index.tsv", before.contentRoot);
+            Files.writeString(changed, "delta new");
+            File oldNpdm = new File(gameRoot, before.revisionDir + "/exefs/main.npdm");
+            byte[] correct = Files.readAllBytes(oldNpdm.toPath());
+            byte[] broken = correct.clone();
+            broken[0] = 1;
+            check(oldNpdm.setWritable(true), "test can perturb private base bytes");
+            Files.write(oldNpdm.toPath(), broken);
+            try {
+                GameInstall.install(games, GameInstall.directory(delta), null, noLinks);
+                check(false, "delta accepted corrupted fallback bytes");
+            } catch (GamePack.BadPack error) {
+                check(error.getMessage().contains("exefs/main.npdm does not match"), error.getMessage());
+            }
+            check(current(gameRoot).equals(before.contentRoot), "failed delta leaves the old activation pointer");
+            Files.write(oldNpdm.toPath(), correct);
+            try {
+                java.io.ByteArrayOutputStream wire = new java.io.ByteArrayOutputStream();
+                wire.write("S2A-IMPORT 1 delta\n".getBytes(StandardCharsets.UTF_8));
+                int bytes = 0;
+                String[] paths = {"manifest.json", "index.tsv", "game-build-artifact.json",
+                                  "ctl/control.nacp", "romfs/readme.txt", "game-resource-delta.tsv"};
+                for (String path : paths) {
+                    byte[] data = Files.readAllBytes(new File(delta, path).toPath());
+                    wire.write(("F " + data.length + " " + path + "\n").getBytes(StandardCharsets.UTF_8));
+                    wire.write(data);
+                    bytes += data.length;
+                }
+                wire.write("END\n".getBytes(StandardCharsets.UTF_8));
+                java.io.ByteArrayOutputStream reply = new java.io.ByteArrayOutputStream();
+                File received = ImportReceiver.receive(new java.io.ByteArrayInputStream(wire.toByteArray()), reply,
+                    new File(games, "inbox"));
+                check(reply.toString(StandardCharsets.UTF_8).equals("READY 1\nOK 6 " + bytes + "\n"),
+                    "receiver acknowledges six delta wire entries");
+                GameInstall.Result updated = GameInstall.install(games, GameInstall.directory(received), null, noLinks);
+                check(next.equals(updated.contentRoot) && next.equals(current(gameRoot)) && !updated.linked && updated.resourceDelta,
+                    "delta fills omitted unchanged file from the old revision when hard links fail");
+                check(!new File(received, "romfs/readme.txt").exists(), "verified changed data is adopted from receiver staging");
+                GameInstall.Result repeated = GameInstall.install(games, GameInstall.directory(delta), null, noLinks);
+                check(repeated.alreadyActive && repeated.resourceDelta, "replaying the complete installed delta is idempotent");
+                Files.writeString(marker, proof.replace(next, "sha256-" + "f".repeat(64)));
+                refused(games, delta, "delta retry wrong target", "target root does not match", next);
+            } catch (GamePack.BadPack | BootContract.BadGame error) {
+                check(false, "delta fills omitted unchanged file: " + error.getMessage());
+            }
+        } finally {
+            GameInstall.deleteTree(games);
+            GameInstall.deleteTree(initial);
+            GameInstall.deleteTree(delta);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length == 3 && "--locked-import-child".equals(args[0])) {
             File internal = new File(args[1]), external = new File(args[2]);
@@ -629,6 +702,7 @@ public final class GameInstallTest {
         check(BootContract.open(plainRoot).modules.size() == 1, "copied revision opens");
         GameInstall.deleteTree(plainGames);
         sharedObjectRehashed();
+        crossRootDeltaWithNoLinks();
 
         if (args.length == 1) {   // a package from tools/make_pack.py
             File real = Files.createTempDirectory("s2a-games-real").toFile();

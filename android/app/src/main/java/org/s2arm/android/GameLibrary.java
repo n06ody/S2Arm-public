@@ -142,7 +142,8 @@ final class GameLibrary {
                             try {
                                 BootContract.Current now = BootContract.readCurrent(new File(gamesDir, result.titleId));
                                 Log.i("S2Arm", "Game import receipt: " + result.titleId + " contentRoot=" + now.contentRoot
-                                    + " artifactSha256=" + now.artifactSha256 + " from import/" + source.getName());
+                                    + " artifactSha256=" + now.artifactSha256
+                                    + (result.resourceDelta ? " resourceDelta=1" : "") + " from import/" + source.getName());
                             } catch (BootContract.BadGame | IOException receipt) {
                                 Log.i("S2Arm", "Game import receipt unavailable: " + result.titleId + " from import/" + source.getName());
                             }

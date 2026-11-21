@@ -2,6 +2,7 @@
 """部署签名游戏 APK 和绑定资源。默认导入后启动；--no-start 只导入。
 
 --pack 接受 make_pack 输出并冻结资源；--resources 接受已绑定资源目录。
+--delta-from 与 --resident-receipt 一起将跨根导入限制为差分，目标 APK 需支持差分接收。
 --save-archive 在资源安装后、起局前直传并恢复一份 .s2asave，保留现有存档备份。
 --in-place：资源目录 adb push 到手机共享存储的约定位置（/storage/emulated/0/S2Arm/Games/<程序号>），
   再让 App 原地登记（不复制进私有目录，App 要「所有文件访问」，这里用 appops 给本包打开）；默认是直传进私有目录。
@@ -26,6 +27,7 @@ from filecopy import copy_file
 
 REPO = Path(__file__).resolve().parents[2]
 IMPORT_RECEIVE_EXTRA = 'org.s2arm.android.IMPORT_RECEIVE'
+RESOURCE_DELTA = 'game-resource-delta.tsv'
 
 
 class Adb:
@@ -93,6 +95,39 @@ def validate(apk, resources):
     if artifact['contentRoot'] != 'sha256-' + index_hash or manifest.get('index_sha256') != index_hash:
         raise ValueError('资源包索引与身份不一致。')
     return artifact, digest(artifact_path)
+
+
+def resource_delta(resources, artifact, previous, resident):
+    """The uploaded paths and base/target proof for an explicit private revision update."""
+    previous = Path(previous)
+    old_root = resident['contentRoot']
+    old_artifact = previous / 'game-build-artifact.json'
+    old = json.loads(old_artifact.read_bytes())
+    if (resident.get('inPlace') or old_root == artifact['contentRoot']
+            or digest(old_artifact) != resident['artifactSha256']
+            or ('sha256-' + digest(previous / 'index.tsv')) != old_root
+            or old['contentRoot'] != old_root
+            or old['apk']['sha256'] != resident['apkSha256']
+            or old['apk']['packageName'] != artifact['apk']['packageName']
+            or old['apk']['signingCertSha256'] != artifact['apk']['signingCertSha256']):
+        raise ValueError('旧资源与驻留回执不符，或没有可做差分的私有旧修订')
+    old_rows = game_apk.direct_library.rows_map(game_apk.direct_library.read_index(previous / 'index.tsv'))
+    changed = []
+    rows = game_apk.direct_library.read_index(resources / 'index.tsv')
+    for name, size, sha in rows:
+        if name == RESOURCE_DELTA:
+            raise ValueError(f'目标索引占用了差分标记路径：{name}')
+        if old_rows.get(name) == (size, sha):
+            continue
+        path = resources / name
+        if (not path.is_file() or path.resolve() != path.absolute()
+                or path.stat().st_size != size or digest(path) != sha):
+            raise ValueError(f'差分文件与目标索引不符：{name}')
+        changed.append(name)
+    names = dict.fromkeys((*game_apk.REFRESH_PAYLOAD, *changed))
+    marker = (f's2a-resource-delta-v1\t{old_root}\t{resident["artifactSha256"]}'
+              f'\t{artifact["contentRoot"]}\n').encode('ascii')
+    return [resources / name for name in names], marker, sum(size for _, size, _ in rows)
 
 
 def own_lines(adb, package, logs):
@@ -241,12 +276,13 @@ def _line(sock):
     return b[:-1].decode('utf-8')
 
 
-def send_tree(adb, package, resources, name, timeout, log, *, paths=None, max_bytes=None):
+def send_tree(adb, package, resources, name, timeout, log, *, paths=None, max_bytes=None, delta_marker=None):
     """经 adb forward 把资源树直传进 App（LibraryActivity 已带 IMPORT_RECEIVE 起好）。协议见 ImportReceiver.java。"""
     resources = Path(resources)
     files = sorted(p for p in resources.rglob('*') if p.is_file()) if paths is None else paths
     entries = [(p, p.stat().st_size) for p in files]
-    total = sum(size for _, size in entries)
+    total = sum(size for _, size in entries) + (len(delta_marker) if delta_marker else 0)
+    count = len(entries) + (1 if delta_marker else 0)
     check_transfer_budget(total, max_bytes)
     port = adb.call('forward', 'tcp:0', 'localabstract:s2arm-import.' + package, timeout=30).strip()
     if not port.isdigit():
@@ -272,15 +308,18 @@ def send_tree(adb, package, resources, name, timeout, log, *, paths=None, max_by
                 if now - last >= PUSH_PROGRESS_S:
                     last = now
                     log(f'直传中：{sent / 1e6:.0f} / {total / 1e6:.0f} MB（{sent / 1e6 / max(1, now - t0):.0f} MB/s）')
+            if delta_marker:
+                s.sendall(f'F {len(delta_marker)} {RESOURCE_DELTA}\n'.encode() + delta_marker)
+                sent += len(delta_marker)
             s.sendall(b'END\n')
             reply = _line(s)
         if not reply.startswith('OK '):
             raise RuntimeError('App 拒收资源：' + reply[:300])
-        if reply != f'OK {len(entries)} {sent}':
+        if reply != f'OK {count} {sent}':
             raise RuntimeError('App 收包文件数或字节数不符：' + reply[:300])
         elapsed = time.monotonic() - t0
-        log(f'直传完成：{len(entries)} 文件 / {sent / 1e6:.0f} MB / {elapsed:.0f}s')
-        return dict(sentFiles=len(entries), sentBytes=sent, transferMs=round(elapsed * 1000))
+        log(f'直传完成：{count} 文件 / {sent / 1e6:.0f} MB / {elapsed:.0f}s')
+        return dict(sentFiles=count, sentBytes=sent, transferMs=round(elapsed * 1000))
     finally:
         adb.call('forward', '--remove', 'tcp:' + port, timeout=30)
 
@@ -330,11 +369,13 @@ def check_transfer_budget(size, max_bytes):
 
 def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_timeout=None,
                      start=True, refresh_existing=False, require_current=True, log=None, in_place=False,
-                     save_archive=None, *, allow_full_import=True, resident_receipt=None, max_resource_bytes=None):
+                     save_archive=None, *, allow_full_import=True, resident_receipt=None, max_resource_bytes=None,
+                     delta_from=None):
     """装 APK 后把资源树直传进 App 私有目录（send_tree），等 App 按 index.tsv 核完装进库的回执。
     in_place：改为推到共享存储约定位置、请 App 原地登记（push_in_place / request_in_place），回执来源是「in-place <路径>」。
     resident_receipt：外部租约内已核的上次部署回执，用于旧接收器的同根元数据刷新。
-    allow_full_import=False：必须能在安装前选定驻留刷新路径，拒绝全量传输。
+    allow_full_import=False：必须能在安装前选定驻留刷新或明确差分路径，拒绝全量传输。
+    delta_from：旧资源目录，配合驻留回执选出变化条目。接收端在安装锁内再次验证旧根和绑定。
     max_resource_bytes：私有目录直传的载荷字节上限。log：进度回调。"""
     log = log or (lambda *a, **k: None)
     apk, resources, work = Path(apk), Path(resources), Path(work)
@@ -343,6 +384,8 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
         save_archive_size(save_archive)
     artifact, artifact_hash = validate(apk, resources)
     title, package = artifact['titleId'], artifact['apk']['packageName']
+    if delta_from is not None and (resident_receipt is None or in_place or refresh_existing):
+        raise ValueError('差分导入需要私有部署的驻留回执和旧资源目录')
     if adb.running(package):
         raise ValueError('设备上的游戏仍在运行，不能安装。')
     # 机上已是同一份 APK（哈希相同）就不重装：同版本重装在部分机型上既不弹确认也不返回，干等到超时（11-14 vivo）
@@ -355,7 +398,8 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
         previous_root = resident_receipt.get('contentRoot')
         old_apk = resident_receipt.get('apkSha256')
         old_binding = resident_receipt.get('artifactSha256')
-        if (resident_receipt.get('packageName') != package or old_apk != installed_hash or
+        retry_delta = delta_from is not None and installed_hash == artifact['apk']['sha256']
+        if (resident_receipt.get('packageName') != package or (old_apk != installed_hash and not retry_delta) or
                 not all(isinstance(value, str) and re.fullmatch(pattern, value)
                         for value, pattern in ((previous_root, r'sha256-[0-9a-f]{64}'),
                                                (old_apk, r'[0-9a-f]{64}'),
@@ -363,13 +407,17 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
             raise RuntimeError('驻留导入回执与当前 APK 不匹配')
         if not in_place and previous_root == artifact['contentRoot']:
             refresh_existing = True
-    if not allow_full_import and (in_place or previous_root != artifact['contentRoot']):
+    if not allow_full_import and delta_from is None and (in_place or previous_root != artifact['contentRoot']):
         raise RuntimeError('全量导入已禁止：缺少目标同根的驻留回执')
     if max_resource_bytes is not None and (in_place or type(max_resource_bytes) is not int or max_resource_bytes < 0):
         raise ValueError('资源字节预算仅支持私有目录直传且必须为非负整数')
-    paths = [resources / name for name in game_apk.REFRESH_PAYLOAD] if refresh_existing and not in_place else None
+    delta_marker = None
+    if delta_from is not None:
+        paths, delta_marker, indexed_bytes = resource_delta(resources, artifact, delta_from, resident_receipt)
+    else:
+        paths = [resources / name for name in game_apk.REFRESH_PAYLOAD] if refresh_existing and not in_place else None
     if paths is not None:
-        planned_bytes = sum(path.stat().st_size for path in paths)
+        planned_bytes = sum(path.stat().st_size for path in paths) + (len(delta_marker) if delta_marker else 0)
         check_transfer_budget(planned_bytes, max_resource_bytes)
     elif max_resource_bytes is not None:
         check_transfer_budget(tree_bytes(resources), max_resource_bytes)
@@ -402,20 +450,29 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
         origin = 'import/' + name
     since = adb.shell('date', '+%m-%d %H:%M:%S.000')
     start_activity(adb, '-n', library, '--ez', IMPORT_RECEIVE_EXTRA, 'true')
-    transfer = dict(transferMode='inPlace' if in_place else 'refresh' if refresh_existing else 'full',
+    transfer_mode = 'inPlace' if in_place else 'refresh' if refresh_existing else 'full'
+    if delta_marker:
+        transfer_mode = 'delta'
+    transfer = dict(transferMode=transfer_mode,
                     previousContentRoot=previous_root)
     if in_place:
         request_in_place(adb, package, remote)
     else:
-        files = tree_files(resources) if paths is None else len(paths)
+        files = tree_files(resources) if paths is None else len(paths) + (1 if delta_marker else 0)
         log(f'资源 {files} 文件直传进 App（超时 {est}s，模式 {transfer["transferMode"]}）')
         options = {}
         if paths is not None:
             options['paths'] = paths
+        if delta_marker:
+            options['delta_marker'] = delta_marker
         if max_resource_bytes is not None:
             options['max_bytes'] = max_resource_bytes
         transfer.update(send_tree(adb, package, resources, name, est, log, **options))
-    import_wait = import_wait_for(resources, timeout) if paths is None else max(timeout, transfer_timeout(planned_bytes))
+    if delta_marker:
+        # The receiver still verifies and places the complete new revision.
+        import_wait = max(timeout, transfer_timeout(indexed_bytes))
+    else:
+        import_wait = import_wait_for(resources, timeout) if paths is None else max(timeout, transfer_timeout(planned_bytes))
     deadline = time.monotonic() + import_wait
     while time.monotonic() < deadline:
         logs = own_lines(adb, package, adb.shell('logcat', '-d', '-v', 'brief', '-T', since, '-s', 'S2Arm:I'))
@@ -431,7 +488,7 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
                                       'Game registered in place:'))
             for line in logs.splitlines())
         if imported_ok:
-            if require_current or not allow_full_import:
+            if require_current or not allow_full_import or delta_marker:
                 # 正式包不可调试，run-as 读不了 current.json；App 导入成功时在 logcat 打完整回执（GameLibrary「Game import receipt」）
                 receipt = next((line for line in logs.splitlines()
                                 if f'Game import receipt: {title} ' in line and line.endswith(f' from {origin}')), None)
@@ -439,11 +496,14 @@ def deploy_resources(apk, resources, adb, work, mode='auto', timeout=180, push_t
                     raise RuntimeError('导入成功但设备没打出导入回执，无法核身份。')
                 if f' contentRoot={artifact["contentRoot"]} ' not in receipt or f' artifactSha256={artifact_hash} ' not in receipt:
                     raise RuntimeError('设备导入身份不匹配。')
+                if delta_marker and ' resourceDelta=1 ' not in receipt:
+                    raise RuntimeError('设备未确认资源差分导入。')
             break
         time.sleep(1)
     else:
+        retry = '同一差分命令' if delta_marker else '同一命令加 --refresh-existing'
         raise RuntimeError(f'等待导入超时（{import_wait} 秒内没有成功回执）：导入可能还在进行，没有强停应用；'
-                           f'等它做完后用同一命令加 --refresh-existing 重跑核对')
+                           f'等它做完后用{retry}重跑核对')
     save_receipt = None
     if save_archive is not None:
         save_receipt = send_save(adb, package, title, save_archive, max(timeout, push_timeout or 0))
@@ -508,6 +568,8 @@ def main():
     parser.add_argument('--save-archive', type=Path, help='确认恢复此 .s2asave；会在起局前备份并替换目标存档')
     parser.add_argument('--mode', choices=('auto', 'direct', 'generic'), default='auto')
     parser.add_argument('--refresh-existing', action='store_true')
+    parser.add_argument('--delta-from', type=Path, help='经驻留回执验证过的上一份资源目录')
+    parser.add_argument('--resident-receipt', type=Path, help='上一份设备部署 JSON 回执')
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--push-timeout', type=int, default=None, help='资源直传超时秒数；缺省按字节算（约 30 MB/s、2 倍余量）')
     parser.add_argument('--in-place', action='store_true',
@@ -519,6 +581,9 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0 or (args.push_timeout is not None and args.push_timeout <= 0) or (args.resources and args.refresh_existing):
         parser.error('超时必须大于零；--refresh-existing 只用于 --pack')
+    if ((args.delta_from is None) != (args.resident_receipt is None)
+            or (args.delta_from is not None and (not args.resources or args.in_place))):
+        parser.error('差分部署要求 --resources、--delta-from 与 --resident-receipt，并走私有导入')
     def interrupt(_signal, _frame):
         raise InterruptedError('部署已取消。')
     signal.signal(signal.SIGTERM, interrupt)
@@ -533,9 +598,12 @@ def main():
         else:
             root = REPO / 'build/android-deploy'; root.mkdir(parents=True, exist_ok=True)
             work = Path(tempfile.mkdtemp(prefix='resources-', dir=root))
+            previous = json.loads(args.resident_receipt.read_bytes()) if args.resident_receipt else None
             receipt = deploy_resources(args.apk.resolve(strict=True), args.resources.resolve(strict=True), adb,
                                        work, args.mode, args.timeout, args.push_timeout, args.start, log=print,
-                                       in_place=args.in_place, save_archive=args.save_archive)
+                                       in_place=args.in_place, save_archive=args.save_archive,
+                                       allow_full_import=args.delta_from is None, resident_receipt=previous,
+                                       delta_from=args.delta_from)
         print(json.dumps(receipt, ensure_ascii=False))
     except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print('【红】部署失败：' + str(error), file=sys.stderr)

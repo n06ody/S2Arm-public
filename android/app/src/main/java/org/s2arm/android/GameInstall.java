@@ -1,15 +1,21 @@
 package org.s2arm.android;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -59,12 +65,14 @@ final class GameInstall {
     private static final Linker HARD_LINK = (link, target) -> Files.createLink(link.toPath(), target.toPath());
 
     static final String ARTIFACT = GamePack.ARTIFACT;
+    private static final String DELTA = "game-resource-delta.tsv";
 
     static final class Result {
         final String titleId, contentRoot, previousContentRoot;
         final GamePack.Info info;
         final boolean alreadyActive;
         boolean artifactRefreshed;       // same files, new artifact (e.g. a per-game APK upgrade)
+        boolean resourceDelta;
         long storedBytes, sharedBytes;   // copied in this time / already stored (unchanged files)
         boolean linked;                  // revision files are hard links to shared objects (else plain copies)
         String inPlaceRoot;              // 原地来源的根（内容没复制），否则 null
@@ -242,6 +250,110 @@ final class GameInstall {
         }
     }
 
+    private static final class DeltaSource implements Source {
+        final Source incoming, base;
+        final List<GamePack.Entry> entries;
+        final BitSet unchanged;
+
+        private DeltaSource(Source incoming, Source base, List<GamePack.Entry> entries) {
+            this.incoming = incoming;
+            this.base = base;
+            this.entries = new ArrayList<>(entries);
+            this.entries.sort(Comparator.comparing(e -> e.path));
+            unchanged = new BitSet(entries.size());
+        }
+
+        private int find(String path) {
+            int lo = 0, hi = entries.size() - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >>> 1;
+                int cmp = entries.get(mid).path.compareTo(path);
+                if (cmp == 0) return mid;
+                if (cmp < 0) lo = mid + 1;
+                else hi = mid - 1;
+            }
+            return -1;
+        }
+
+        boolean unchanged(String path) {
+            int i = find(path);
+            return i >= 0 && unchanged.get(i);
+        }
+
+        @Override public InputStream open(String path) throws IOException {
+            InputStream in = incoming.open(path);
+            return in == null && unchanged(path) ? base.open(path) : in;
+        }
+
+        @Override public boolean adopt(String path, String sha256, long size, File target) throws IOException {
+            // The previous revision stays intact. Only adopt incoming bytes.
+            return incoming.adopt(path, sha256, size, target);
+        }
+    }
+
+    private static String[] readDelta(Source incoming, List<GamePack.Entry> entries, String nextRoot)
+            throws GamePack.BadPack, IOException {
+        // An indexed file is ordinary game content, even if it has the same name as the marker.
+        for (GamePack.Entry e : entries)
+            if (DELTA.equals(e.path)) return null;
+        String marker;
+        try (InputStream stream = incoming.open(DELTA)) {
+            if (stream == null) return null;
+            byte[] bytes = new byte[256];
+            int length = 0;
+            for (int value; (value = stream.read()) != -1; ) {
+                if (length == bytes.length) throw new GamePack.BadPack("game resource delta marker is too long");
+                bytes[length++] = (byte) value;
+            }
+            marker = new String(bytes, 0, length, StandardCharsets.US_ASCII);
+        }
+        if (!marker.matches("s2a-resource-delta-v1\\tsha256-[0-9a-f]{64}\\t[0-9a-f]{64}\\tsha256-[0-9a-f]{64}\\n"))
+            throw new GamePack.BadPack("invalid game resource delta marker");
+        String[] fields = marker.substring(0, marker.length() - 1).split("\t");
+        if (!fields[3].equals(nextRoot) || fields[1].equals(nextRoot))
+            throw new GamePack.BadPack("game resource delta target root does not match");
+        return fields;
+    }
+
+    private static DeltaSource deltaSource(File gameRoot, BootContract.Current current, Source incoming,
+            List<GamePack.Entry> entries, String[] proof) throws GamePack.BadPack, IOException {
+        if (current == null || !proof[1].equals(current.contentRoot) || !proof[2].equals(current.artifactSha256))
+            throw new GamePack.BadPack("game resource delta base root or binding does not match");
+        File previous = new File(gameRoot, current.revisionDir);
+        if (inPlace(previous)) throw new GamePack.BadPack("game resource delta requires a private installed base");
+        Source base = directory(previous);
+        if (!GamePack.sha256(required(base, current.artifact)).equals(current.artifactSha256))
+            throw new GamePack.BadPack("game resource delta base artifact has changed");
+        DeltaSource delta = new DeltaSource(incoming, base, entries);
+        MessageDigest digest = GamePack.digest();
+        // Stream the old index instead of holding two potentially large indices in memory.
+        try (InputStream stream = base.open("index.tsv")) {
+            if (stream == null) throw new GamePack.BadPack("game resource delta base index missing");
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    new DigestInputStream(stream, digest), StandardCharsets.UTF_8))) {
+                for (String line; (line = reader.readLine()) != null; ) {
+                    if (line.isEmpty()) continue;
+                    String[] row = line.split("\t", -1);
+                    if (row.length != 3) throw new GamePack.BadPack("invalid game resource delta base index");
+                    int ordinal = delta.find(row[0]);
+                    if (ordinal < 0) continue;
+                    GamePack.Entry entry = delta.entries.get(ordinal);
+                    if (Long.parseLong(row[1]) == entry.size && row[2].equals(entry.sha256))
+                        delta.unchanged.set(ordinal);
+                }
+            }
+        }
+        if (!("sha256-" + GamePack.hex(digest.digest())).equals(current.contentRoot))
+            throw new GamePack.BadPack("game resource delta base index has changed");
+        for (int i = delta.unchanged.nextClearBit(0); i < delta.entries.size(); i = delta.unchanged.nextClearBit(i + 1)) {
+            String path = delta.entries.get(i).path;
+            try (InputStream stream = incoming.open(path)) {
+                if (stream == null) throw new GamePack.BadPack("game resource delta lacks changed file: " + path);
+            }
+        }
+        return delta;
+    }
+
     private static Result installLocked(File gamesDir, Source source, Progress progress, Linker linker, byte[] manifest, byte[] index,
             byte[] artifact, List<GamePack.Entry> entries, String contentRoot, GamePack.Info info)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
@@ -250,14 +362,21 @@ final class GameInstall {
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
         String previous = current == null ? null : current.contentRoot;
+        String[] proof = readDelta(source, entries, contentRoot);
         // 同一内容根、但当前是原地登记：这次是复制进私有目录，照常装（换掉原地登记）
-        if (current != null && contentRoot.equals(previous) && active.isDirectory() && !inPlace(active)) {
-            if (GamePack.sha256(artifact).equals(current.artifactSha256))
-                return new Result(info.titleId, contentRoot, previous, info, true);
-            return refreshArtifact(gameRoot, current, artifact, info);
+        boolean samePrivateRevision = current != null && contentRoot.equals(previous) && active.isDirectory() && !inPlace(active);
+        if (samePrivateRevision && GamePack.sha256(artifact).equals(current.artifactSha256)) {
+            Result same = new Result(info.titleId, contentRoot, previous, info, true);
+            same.resourceDelta = proof != null;
+            return same;
         }
+        DeltaSource delta = proof == null ? null : deltaSource(gameRoot, current, source, entries, proof);
+        if (samePrivateRevision)
+            return refreshArtifact(gameRoot, current, artifact, info);
+        if (delta != null) source = delta;
 
         Result result = new Result(info.titleId, contentRoot, contentRoot.equals(previous) ? null : previous, info, false);
+        result.resourceDelta = delta != null;
         File objects = new File(gameRoot, "objects");
         deleteTree(staging);
         if (!staging.mkdirs()) throw new IOException("cannot create " + staging);
@@ -276,7 +395,9 @@ final class GameInstall {
                 GamePack.Entry e = entries.get(i);
                 File out = new File(staging, e.path);
                 out.getParentFile().mkdirs();
-                if (!result.linked) {   // no shared store here: a checked copy in the revision itself
+                if (!result.linked || (delta != null && !delta.unchanged(e.path))) {
+                    // With no links, copy from the incoming or verified base source.
+                    // A changed delta entry must be verified from this upload even if a CAS object exists.
                     put(source, e, out, new File(objects, "tmp"), buf, progress, done, total);
                     result.storedBytes += e.size;
                     checked[i] = GameFingerprint.stat(out);
