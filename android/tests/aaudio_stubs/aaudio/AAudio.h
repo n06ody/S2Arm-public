@@ -2,8 +2,8 @@
 #include <stdint.h>
 typedef int32_t aaudio_result_t;
 typedef int32_t aaudio_data_callback_result_t;
-typedef struct AAudioStream { int dummy; } AAudioStream;
-typedef struct AAudioStreamBuilder { int dummy; } AAudioStreamBuilder;
+typedef struct AAudioStreamStruct AAudioStream;
+typedef struct AAudioStreamBuilderStruct AAudioStreamBuilder;
 enum { AAUDIO_OK=0, AAUDIO_ERROR_INTERNAL=-5, AAUDIO_ERROR_INVALID_FORMAT=-1, AAUDIO_ERROR_ILLEGAL_ARGUMENT=-2, AAUDIO_ERROR_NO_MEMORY=-3, AAUDIO_ERROR_DISCONNECTED=-4, AAUDIO_FORMAT_PCM_I16=1, AAUDIO_FORMAT_PCM_FLOAT=2, AAUDIO_DIRECTION_OUTPUT=0, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY=0, AAUDIO_SHARING_MODE_EXCLUSIVE=0, AAUDIO_USAGE_GAME=0, AAUDIO_CONTENT_TYPE_SONIFICATION=0, AAUDIO_CALLBACK_RESULT_CONTINUE=0 };
 aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder **);
 void AAudioStreamBuilder_setDirection(AAudioStreamBuilder *, int);
@@ -17,7 +17,7 @@ void AAudioStreamBuilder_setContentType(AAudioStreamBuilder *, int);
 void AAudioStreamBuilder_setDataCallback(AAudioStreamBuilder *, aaudio_data_callback_result_t (*)(AAudioStream *, void *, void *, int32_t), void *);
 void AAudioStreamBuilder_setErrorCallback(AAudioStreamBuilder *, void (*)(AAudioStream *, void *, aaudio_result_t), void *);
 int AAudioStreamBuilder_openStream(AAudioStreamBuilder *, AAudioStream **);
-void AAudioStreamBuilder_delete(AAudioStreamBuilder *);
+aaudio_result_t AAudioStreamBuilder_delete(AAudioStreamBuilder *);
 int AAudioStream_getFormat(AAudioStream *);
 int AAudioStream_getSampleRate(AAudioStream *);
 int AAudioStream_getChannelCount(AAudioStream *);

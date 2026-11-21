@@ -24,6 +24,8 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 mode=${1:-}
+# 第二个参数供 CI 同版容器在缺省整套上强制启用三合一屏障探针。
+if [ "${2:-}" = --nvnbar-on ]; then export S2A_TEST_NVK_NVNBAR=1; fi
 # 独立夹具：android/tests/vk/standalone/<模式名>.sh（模式名不带前导 --），单独 `--<模式名>` 只跑它，默认档逐个跑。
 #   新夹具只加一个文件，不改本脚本：原先每支 PR 都往下面的模式名单和分派段里加一行，同一天十几支在这几行上互相冲突。
 standalone_mode() { [ -n "$mode" ] && [ -f "$repo/android/tests/vk/standalone/${mode#--}.sh" ]; }
@@ -91,7 +93,7 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     src=("$repo/android/tests/vk/$core_test.c")
     for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
     src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
-    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
+    cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_NVK_GAP_HOST_TEST -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
     export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     set +e
     "$out/$core_test" "$out/shaders" 2>&1 | tee "$out/run.log"
@@ -431,6 +433,8 @@ fi
 echo "lavapipe: $icd"
 echo "validation: $layer"
 if [ "$mode" = "--present-only" ]; then
+    "$glslc" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/pass_capture_fixture.vert.spv"
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/pass_capture_fixture.frag" -o "$out/shaders/pass_capture_fixture.frag.spv"
     src[0]="$repo/android/tests/vk/t_present_encoding.c"
     cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
 fi
@@ -441,7 +445,7 @@ if [ "$mode" = "--gs-core" ]; then
          "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c"
          "$repo/android/native/nvn/nvn_vk_driver_cache.c"
          "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
-         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c" "$repo/android/native/direct/compile_worker.c"
          "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
     cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
 fi
@@ -465,7 +469,7 @@ if [ "$mode" = "--tbuf-compiler-core" ]; then
          "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
          "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c" "$repo/android/native/nvn/nvn_vk_driver_cache.c"
          "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
-         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c" "$repo/android/native/direct/compile_worker.c"
          "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
 fi
 if [[ "$mode" == --tbuf-neg-* ]]; then
@@ -791,10 +795,11 @@ if [ "$mode" = "--stencil8-only" ]; then
 fi
 
 if [ "$mode" = "--present-only" ]; then
+    read -r pass_frag_sha _ < <(sha256sum "$out/shaders/pass_capture_fixture.frag.spv")
     for order in rgba bgra; do
     if [ "$order" = bgra ]; then export S2A_TEST_PRESENT_BGRA=1; else unset S2A_TEST_PRESENT_BGRA; fi
     set +e
-    timeout 60 "$out/t_backend_vk" 2>&1 | tee "$out/present-log"
+    timeout 60 "$out/t_backend_vk" "$out/shaders" "$pass_frag_sha" 2>&1 | tee "$out/present-log"
     rc=${PIPESTATUS[0]}
     set -e
     bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/present-log" || true)

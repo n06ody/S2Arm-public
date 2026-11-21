@@ -28,6 +28,8 @@ int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void 
 int nvn_dirty_page_armed(const void *span, const void *addr);
 void nvn_dirty_set_chunk_pages(uint32_t pages);
 uint32_t nvn_dirty_chunk_pages(void);
+// Session policy: skip an unlock that finds every claimed page already writable under the same live mapping.
+void nvn_dirty_set_mp_dedupe(int enabled);
 // 跟踪不可靠：任一 mprotect 失败后置位；为 1 时所有查询走保守路径（视为脏 / 代际 -1）。
 int nvn_dirty_tracking_unreliable(void);
 uint64_t nvn_dirty_now(void);                                      // Current generation: taken before upload, as the stamp of that content
