@@ -31,6 +31,22 @@ public final class ImportReceiverTest {
         check(out.toString().equals("READY 1\nOK 2 5\n"), "replies READY then OK (" + out + ")");
         check(!new File(parent, ".pkg.part").exists(), "no .part left");
 
+        out = new ByteArrayOutputStream();
+        try {
+            ImportReceiver.Received delta = ImportReceiver.receiveAny(new ByteArrayInputStream(stream(
+                "S2A-DELTA 1 delta sha256-" + "0".repeat(64) + "\n",
+                "R shaders/direct/b-abcdef123456-vk/lib.000.pak\n",
+                "F 3 shaders/direct/b-abcdef123456-vk/lib.idx\n", "new", "END\n")), out, parent);
+            check(new File(delta.dir, "shaders/direct/b-abcdef123456-vk/lib.idx").length() == 3,
+                "delta payload lands without an unchanged resource tree");
+            check(delta.delta.baseRoot.equals("sha256-" + "0".repeat(64)) &&
+                delta.delta.removals.equals(java.util.Set.of("shaders/direct/b-abcdef123456-vk/lib.000.pak")),
+                "delta preserves base root and explicit removals");
+            check(out.toString().equals("READY 1\nGO delta\nOK 1 3\n"), "delta accounts only sent files and bytes");
+        } catch (IOException e) {
+            check(false, "delta header and removal frame are supported: " + e.getMessage());
+        }
+
         // ② 越界路径：拒，回 ERR，不留临时目录，不落 parent/evil
         for (String bad : new String[] {"../x", "/abs", "a//b", "a/./b", "a\\b"}) {
             out = new ByteArrayOutputStream(); String err = "";

@@ -11,11 +11,14 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.regex.Pattern;
 
 /**
  * The install transaction for a game package (implementation plan §6.5, A0 contracts): build
@@ -59,6 +62,8 @@ final class GameInstall {
     private static final Linker HARD_LINK = (link, target) -> Files.createLink(link.toPath(), target.toPath());
 
     static final String ARTIFACT = GamePack.ARTIFACT;
+    private static final Pattern LIBPACK_MEMBER = Pattern.compile(
+        "shaders/direct/b-[0-9a-f]{12}-vk/lib\\.(?:idx|[0-9]{3,}\\.pak)");
 
     static final class Result {
         final String titleId, contentRoot, previousContentRoot;
@@ -121,6 +126,12 @@ final class GameInstall {
     /** Apply admission to the exact artifact stream before installation writes, under the lease. */
     static void importDirectory(File privateRoot, File[] inboxes, String target,
             ImportSourceCheck sourceCheck, Progress progress, ImportListener listener) throws IOException {
+        importDirectory(privateRoot, inboxes, target, sourceCheck, progress, listener, null);
+    }
+
+    static void importDirectory(File privateRoot, File[] inboxes, String target,
+            ImportSourceCheck sourceCheck, Progress progress, ImportListener listener,
+            ImportReceiver.Delta delta) throws IOException {
         if (target == null) return;
         {   // 不再取整库锁：install 拿到程序号后只锁那一款
             File dir = new File(target);
@@ -151,8 +162,12 @@ final class GameInstall {
                 // A consumed target is a no-op. Incomplete packages wait for manifest-last staging.
                 if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return;
                 if (!dir.isDirectory()) throw new IOException("import target is not a directory");
-                if (!new File(dir, "manifest.json").isFile()) return;
-                Result result = install(new File(privateRoot, "games"), sourceCheck.checked(directory(dir)), progress);
+                if (!new File(dir, "manifest.json").isFile()) {
+                    if (delta != null) throw new GamePack.BadPack("delta has no manifest.json");
+                    return;
+                }
+                Result result = install(new File(privateRoot, "games"), sourceCheck.checked(directory(dir)), progress,
+                                        HARD_LINK, delta, delta == null ? null : ImportReceiver.verified(dir));
                 try {
                     Files.walkFileTree(path, new java.nio.file.SimpleFileVisitor<Path>() {
                         @Override public java.nio.file.FileVisitResult visitFile(Path file,
@@ -223,6 +238,12 @@ final class GameInstall {
 
     static Result install(File gamesDir, Source source, Progress progress, Linker linker)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
+        return install(gamesDir, source, progress, linker, null, null);
+    }
+
+    private static Result install(File gamesDir, Source source, Progress progress, Linker linker,
+            ImportReceiver.Delta delta, Map<String, String> received)
+            throws GamePack.BadPack, BootContract.BadGame, IOException {
         byte[] manifest = required(source, "manifest.json");
         byte[] index = required(source, "index.tsv");
         byte[] artifact;
@@ -238,18 +259,83 @@ final class GameInstall {
         GamePack.describe(info, verified(source, entry(entries, "ctl/control.nacp")));
         // 只锁这一款（不堵门）：别的游戏在跑不挡本款导入；本款正在跑 / 正在装才报忙
         try (GameStorage lease = GameStorage.acquireIn(gamesDir, info.titleId)) {
-            return installLocked(gamesDir, source, progress, linker, manifest, index, artifact, entries, contentRoot, info);
+            return installLocked(gamesDir, source, progress, linker, manifest, index, artifact, entries,
+                                 contentRoot, info, delta, received);
         }
     }
 
+    private static boolean libraryMember(String path) {
+        return BootContract.GRAPHICS_MANIFEST.equals(path) || LIBPACK_MEMBER.matcher(path).matches();
+    }
+
+    /** Validate the received difference against the live private revision under the game lease. */
+    private static Map<String, GameFingerprint.Stamp> verifyDelta(File gameRoot, File prior,
+            BootContract.Current current, ImportReceiver.Delta delta, Map<String, String> received,
+            List<GamePack.Entry> target) throws IOException, GamePack.BadPack, BootContract.BadGame {
+        Source resident = directory(prior);
+        byte[] index = required(resident, "index.tsv");
+        String indexSha = GamePack.sha256(index);
+        if (received == null || !("sha256-" + indexSha).equals(delta.baseRoot))
+            throw new GamePack.BadPack("delta resident index or received file ledger differs");
+        List<GamePack.Entry> previous = GamePack.readIndex(required(resident, "manifest.json"), index);
+        Map<String, GamePack.Entry> old = new HashMap<>();
+        for (GamePack.Entry e : previous) old.put(e.path, e);
+        Set<String> expected = new HashSet<>(java.util.Arrays.asList(
+            "manifest.json", "index.tsv", ARTIFACT, "ctl/control.nacp"));
+        Set<String> unchanged = new HashSet<>();
+        for (GamePack.Entry e : target) {
+            GamePack.Entry before = old.remove(e.path);
+            if (before != null && before.size == e.size && before.sha256.equals(e.sha256)) {
+                unchanged.add(e.path);
+            } else {
+                if (!libraryMember(e.path) || !e.sha256.equals(received.get(e.path)))
+                    throw new GamePack.BadPack("delta update is outside the library or has incorrect bytes: " + e.path);
+                expected.add(e.path);
+            }
+        }
+        if (!old.keySet().equals(delta.removals) || !old.keySet().stream().allMatch(GameInstall::libraryMember)
+                || !received.keySet().equals(expected))
+            throw new GamePack.BadPack("delta files or removals differ from the two resource indexes");
+
+        GameFingerprint.Reference ref = GameFingerprint.currentReference(gameRoot, indexSha);
+        GameFingerprint.Verification verified = GameFingerprint.verify(prior, previous, indexSha, ref, null,
+                                                                        current.artifact);
+        Map<String, GameFingerprint.Stamp> stamps = new HashMap<>();
+        for (int i = 0; i < previous.size(); i++) {
+            String path = previous.get(i).path;
+            if (unchanged.contains(path)) stamps.put(path, verified.stamps.get(i));
+        }
+        return stamps;
+    }
+
     private static Result installLocked(File gamesDir, Source source, Progress progress, Linker linker, byte[] manifest, byte[] index,
-            byte[] artifact, List<GamePack.Entry> entries, String contentRoot, GamePack.Info info)
+            byte[] artifact, List<GamePack.Entry> entries, String contentRoot, GamePack.Info info,
+            ImportReceiver.Delta delta, Map<String, String> received)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
         File gameRoot = new File(gamesDir, info.titleId);
         File revisions = new File(gameRoot, "revisions");
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
         String previous = current == null ? null : current.contentRoot;
+        Map<String, GameFingerprint.Stamp> reused = java.util.Collections.emptyMap();
+        if (delta != null) {
+            if (!delta.baseRoot.equals(previous) || contentRoot.equals(previous))
+                throw new GamePack.BadPack("delta base is no longer active or equals the target root");
+            File prior = new File(gameRoot, current.revisionDir);
+            if (inPlace(prior)) throw new GamePack.BadPack("delta requires a private resident revision");
+            reused = verifyDelta(gameRoot, prior, current, delta, received, entries);
+            Source incoming = source, resident = directory(prior);
+            Map<String, GameFingerprint.Stamp> compatible = reused;
+            source = new Source() {
+                @Override public InputStream open(String path) throws IOException {
+                    return compatible.containsKey(path) && !received.containsKey(path)
+                        ? resident.open(path) : incoming.open(path);
+                }
+                @Override public boolean adopt(String path, String sha256, long size, File target) throws IOException {
+                    return incoming.adopt(path, sha256, size, target);
+                }
+            };
+        }
         // 同一内容根、但当前是原地登记：这次是复制进私有目录，照常装（换掉原地登记）
         if (current != null && contentRoot.equals(previous) && active.isDirectory() && !inPlace(active)) {
             if (GamePack.sha256(artifact).equals(current.artifactSha256))
@@ -295,7 +381,7 @@ final class GameInstall {
                 }
                 try {
                     linker.link(out, object);
-                    if (fresh) checked[i] = GameFingerprint.stat(out);
+                    checked[i] = fresh ? GameFingerprint.stat(out) : reused.get(e.path);
                 } catch (IOException | UnsupportedOperationException | SecurityException linkFailure) {
                     // This path refuses a hard link (e.g. a SELinux label) although the probe
                     // worked: keep the install usable by copying the already verified object.

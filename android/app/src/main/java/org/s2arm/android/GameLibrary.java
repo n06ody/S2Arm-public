@@ -89,7 +89,9 @@ final class GameLibrary {
     void scanImports() { scanImports(null); }
 
     /** Import only the explicitly selected absolute staging path, then report the library. */
-    void scanImports(String stagingName) {
+    void scanImports(String stagingName) { scanImports(stagingName, null); }
+
+    void scanImports(String stagingName, ImportReceiver.Delta delta) {
         if (selectedTitle != null) {
             if (selectedRequested) return;
             selectedRequested = true;
@@ -148,12 +150,13 @@ final class GameLibrary {
                             }
                         }
                         @Override public void refused(File source, Exception error) {
-                            failure("Game import of requested directory refused: " + error.getMessage(), R.string.player_err_import, error);
+                            String target = delta == null ? "requested directory" : "import/" + source.getName();
+                            failure("Game import of " + target + " refused: " + error.getMessage(), R.string.player_err_import, error);
                         }
                         @Override public void cleanupDeferred(File source, IOException error) {
                             status("Imported staging cleanup deferred: " + error.getMessage());
                         }
-                    });
+                    }, delta);
             } catch (IOException error) {
                 failure("Game import deferred: " + error.getMessage(), R.string.player_err_import, error);
             }

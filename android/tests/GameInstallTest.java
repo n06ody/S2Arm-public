@@ -1,5 +1,7 @@
 package org.s2arm.android;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -37,6 +39,11 @@ public final class GameInstallTest {
 
     /** A package as tools/make_pack.py writes it; romfs text varies the content root. */
     private static File pack(String romfs, long artifactTitle, boolean withArtifact) throws IOException {
+        return pack(romfs, artifactTitle, withArtifact, java.util.Collections.emptyMap());
+    }
+
+    private static File pack(String romfs, long artifactTitle, boolean withArtifact,
+            Map<String, byte[]> library) throws IOException {
         Map<String, byte[]> files = new LinkedHashMap<>();
         files.put("exefs/main.npdm", new byte[128]);
         files.put("romfs/readme.txt", romfs.getBytes(StandardCharsets.UTF_8));
@@ -50,6 +57,7 @@ public final class GameInstallTest {
         files.put(PACK_DIR + "/manifest.json", PACK_MANIFEST.getBytes(StandardCharsets.UTF_8));
         files.put(PACK_DIR + "/profile.json", "{\"profile\":true}\n".getBytes(StandardCharsets.UTF_8));
         files.put(PACK_DIR + "/shcache/0100000000abcdef/guest.data", new byte[4096]);
+        files.putAll(library);
         File dir = Files.createTempDirectory("s2a-install-pack").toFile();
         StringBuilder index = new StringBuilder();
         long total = 0;
@@ -449,7 +457,95 @@ public final class GameInstallTest {
         GameInstall.deleteTree(games);
     }
 
+    private static ImportReceiver.Received libraryDelta(File inbox, File target, String name,
+            String oldRoot, String removed, String... changed) throws IOException {
+        ByteArrayOutputStream payload = new ByteArrayOutputStream();
+        payload.write(("S2A-DELTA 1 " + name + " " + oldRoot + "\nR " + removed + "\n")
+                      .getBytes(StandardCharsets.UTF_8));
+        java.util.List<String> paths = new java.util.ArrayList<>(java.util.List.of(
+            "manifest.json", "index.tsv", GamePack.ARTIFACT, "ctl/control.nacp"));
+        paths.addAll(Arrays.asList(changed));
+        for (String path : paths) {
+            byte[] bytes = Files.readAllBytes(new File(target, path).toPath());
+            payload.write(("F " + bytes.length + " " + path + "\n").getBytes(StandardCharsets.UTF_8));
+            payload.write(bytes);
+        }
+        payload.write("END\n".getBytes(StandardCharsets.UTF_8));
+        return ImportReceiver.receiveAny(new ByteArrayInputStream(payload.toByteArray()),
+                                        new ByteArrayOutputStream(), inbox);
+    }
+
+    private static void deltaInstall() throws Exception {
+        String library = "shaders/direct/b-abcdef123456-vk/";
+        String idx = library + "lib.idx", deleted = library + "lib.000.pak", added = library + "lib.001.pak";
+        File old = pack("unchanged static", 0x0100000000ABCDEFL, true,
+                        Map.of(idx, new byte[] {1}, deleted, new byte[] {2}));
+        File next = pack("unchanged static", 0x0100000000ABCDEFL, true,
+                         Map.of(idx, new byte[] {3}, added, new byte[] {4, 5}));
+        File base = Files.createTempDirectory("s2a-library-delta").toFile();
+        File games = new File(base, "games"), inbox = new File(base, "import");
+        File game = new File(games, "0100000000ABCDEF");
+        String oldRoot = root(old), newRoot = root(next);
+        try {
+            GameInstall.install(games, GameInstall.directory(old), null);
+            File oldRevision = new File(game, "revisions/" + oldRoot);
+            File staticFile = new File(oldRevision, "romfs/readme.txt");
+            File save = new File(base, "test-save");
+            Files.writeString(save.toPath(), "save contents");
+            GameInstall.Result[] installed = {null};
+            Exception[] refused = {null};
+            GameInstall.ImportListener listener = new GameInstall.ImportListener() {
+                public void installed(File source, GameInstall.Result result) { installed[0] = result; }
+                public void refused(File source, Exception error) { refused[0] = error; }
+            };
+
+            ImportReceiver.Received got = libraryDelta(inbox, next, "bad-removal", oldRoot,
+                                                        library + "lib.999.pak", idx, added);
+            GameInstall.importDirectory(base, new File[] {inbox}, got.dir.getAbsolutePath(),
+                                        source -> source, null, listener, got.delta);
+            check(installed[0] == null && refused[0] != null && refused[0].getMessage().contains("removals differ")
+                  && current(game).equals(oldRoot),
+                  "mismatched library delta cannot switch the active revision");
+
+            // Replace only the resident hard-link name, keeping the verified CAS object intact.
+            Files.delete(staticFile.toPath());
+            Files.writeString(staticFile.toPath(), "corrupted bytes!");
+            got = libraryDelta(inbox, next, "bad-resident", oldRoot, deleted, idx, added);
+            refused[0] = null;
+            GameInstall.importDirectory(base, new File[] {inbox}, got.dir.getAbsolutePath(),
+                                        source -> source, null, listener, got.delta);
+            check(installed[0] == null && refused[0] != null && refused[0].getMessage().contains("romfs/readme.txt")
+                  && current(game).equals(oldRoot), "tampered resident file rejects before activation");
+
+            GameInstall.install(games, GameInstall.directory(next), null);
+            File newRevision = new File(game, "revisions/" + newRoot);
+            check(current(game).equals(newRoot) && Files.readString(new File(newRevision, "romfs/readme.txt").toPath())
+                  .equals("unchanged static"), "explicit full retry installs verified bytes after delta refusal");
+            GameInstall.install(games, GameInstall.directory(old), null);
+            refused[0] = null;
+            got = libraryDelta(inbox, next, "approved", oldRoot, deleted, idx, added);
+            check(!new File(got.dir, "romfs").exists(), "delta wire omitted resident static payload");
+            GameInstall.importDirectory(base, new File[] {inbox}, got.dir.getAbsolutePath(),
+                                        source -> source, null, listener, got.delta);
+            check(installed[0] != null && refused[0] == null && current(game).equals(newRoot)
+                  && oldRoot.equals(installed[0].previousContentRoot), "delta atomically activates target and retains rollback");
+            check(Files.isSameFile(staticFile.toPath(), new File(newRevision, "romfs/readme.txt").toPath()),
+                  "static content keeps its inode across delta");
+            check(new File(oldRevision, deleted).isFile() && !new File(newRevision, deleted).exists()
+                  && Arrays.equals(Files.readAllBytes(new File(newRevision, added).toPath()), new byte[] {4, 5}),
+                  "delta deletion affects only the new revision and installed bytes match");
+            check(Files.readString(save.toPath()).equals("save contents"), "delta leaves saves untouched");
+            GameInstall.install(games, GameInstall.directory(old), null);
+            check(current(game).equals(oldRoot) && new File(oldRevision, deleted).isFile(), "old library remains usable after rollback");
+        } finally {
+            GameInstall.deleteTree(base);
+            GameInstall.deleteTree(old);
+            GameInstall.deleteTree(next);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
+        if (args.length == 0) deltaInstall();
         if (args.length == 3 && "--locked-import-child".equals(args[0])) {
             File internal = new File(args[1]), external = new File(args[2]);
             try {

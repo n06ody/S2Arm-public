@@ -45,6 +45,9 @@ class FakeAdb:
         self.in_place_refused = False
         self.save_received = None
         self.save_reply = None
+        self.delta_capable = True
+        self.refuse_delta = False
+        self.transfers = []
 
     def _serve(self, server):
         while True:
@@ -75,13 +78,32 @@ class FakeAdb:
                     receipt = dict(titleId=title, files=2, bytes=16, previousBackup=backup)
                     conn.sendall(((self.save_reply or 'OK ' + json.dumps(receipt)) + '\n').encode())
                     continue
-                self.name = head[2]
+                delta = head[0] == 'S2A-DELTA'
+                base = None
+                removed = []
+                if delta:
+                    if not self.delta_capable:
+                        conn.sendall(b'ERR bad header\n')
+                        continue
+                    self.name, base = head[2].split(' ')
+                    conn.sendall(b'GO delta\n')
+                else:
+                    self.name = head[2]
+                self.received = {}
                 while True:
                     line = f.readline().decode().rstrip('\n')
                     if line == 'END':
                         break
+                    if delta and line.startswith('R '):
+                        removed.append(line[2:])
+                        continue
                     _, size, path = line.split(' ', 2)
-                    self.received[path] = f.read(int(size))
+                    data = f.read(int(size))
+                    if len(data) != int(size):
+                        conn.sendall(b'ERR stream ended inside entry\n')
+                        return
+                    self.received[path] = data
+                self.transfers.append((base, removed, self.received))
                 received_bytes = sum(map(len, self.received.values()))
                 conn.sendall(((self.receive_reply or f'OK {len(self.received)} {received_bytes}') + '\n').encode())
 
@@ -127,6 +149,8 @@ class FakeAdb:
             return '\n'.join((imported, accepted) if self.started else (imported,))
         if args[0] == 'logcat':
             accepted = f'Game startup accepted: {TITLE} session 1'
+            if self.refuse_delta and self.transfers and self.transfers[-1][0] is not None:
+                return f'Game import of import/{self.name} refused: resident SHA-256 differs'
             if self.refused:
                 return f'Game import of import/{self.name} refused: missing resource'
             if self.slow_import:
@@ -184,10 +208,12 @@ class DeployTest(unittest.TestCase):
         self.identity = patch.object(game_apk, 'apk_identity', return_value=('org.s2arm.game.t0100000000abcdef', 2, False), create=True)
         self.identity_mock = self.identity.start(); self.addCleanup(self.identity.stop)
 
-    def write_apk(self, code):
+    def write_apk(self, code, *, delta=True):
         with zipfile.ZipFile(self.apk, 'w') as z:
             z.writestr('assets/game/game.properties', f'titleId={TITLE}\nversionCode=2\n')
             z.writestr('assets/game/modules/main.patched.bin', code)
+            if delta:
+                z.writestr(deploy_game.DELTA_CAPABILITY, b'1\n')
 
     def deploy(self, adb, **kw):
         return deploy_game.deploy(self.pack, self.apk, adb, self.root / 'out', **kw)
@@ -327,6 +353,110 @@ class DeployTest(unittest.TestCase):
                                          allow_full_import=False, resident_receipt=resident)
         self.assertEqual(len(adb.received), 4)
         self.assertFalse((self.root / 'deployment.json').exists())
+
+    def libpack_revisions(self, changed_static=False):
+        library = 'shaders/direct/b-abcdef123456-vk/'
+        old_files = {library+'lib.idx': b'old', library+'lib.000.pak': b'gone',
+                     library+'lib.001.pak': b'same'}
+        new_files = {library+'lib.idx': b'new', library+'lib.001.pak': b'same',
+                     library+'lib.002.pak': b'added bytes'}
+        if changed_static:
+            new_files['romfs/data'] = b'different static bytes'
+        for name, lib in (('old', old_files), ('new', new_files)):
+            rows = []
+            for relative, data in sorted({**self.files, **lib}.items()):
+                path = self.pack / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                rows.append(f'{relative}\t{len(data)}\t{hashlib.sha256(data).hexdigest()}\n')
+            index = ''.join(rows).encode()
+            (self.pack / 'index.tsv').write_bytes(index)
+            (self.pack / 'manifest.json').write_text(json.dumps(
+                dict(version=2, index_sha256=hashlib.sha256(index).hexdigest())))
+            game_apk.resources(self.pack, self.apk, self.root / name)
+        return self.root / 'old', self.root / 'new', library
+
+    def test_library_delta_reads_frozen_old_index_and_only_sends_changed_members(self):
+        old, new, library = self.libpack_revisions()
+        previous, old_binding = deploy_game.validate(self.apk, old)
+        target, target_binding = deploy_game.validate(self.apk, new)
+        peer = FakeAdb()
+        peer.digest = '1' * 64
+        peer.receipt = target['contentRoot'], target_binding
+        observed = deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+            allow_full_import=False, max_resource_bytes=100_000, resident_index=old/'index.tsv',
+            resident_receipt=dict(packageName=target['apk']['packageName'], apkSha256=peer.digest,
+                                  contentRoot=previous['contentRoot'], artifactSha256=old_binding))
+        base, removed, sent = peer.transfers[0]
+        self.assertEqual(base, previous['contentRoot'])
+        self.assertEqual(removed, [library+'lib.000.pak'])
+        self.assertEqual(set(sent), set(game_apk.REFRESH_PAYLOAD) | {library+'lib.idx', library+'lib.002.pak'})
+        self.assertEqual(observed['transferMode'], 'delta')
+        self.assertEqual(observed['sentBytes'], sum(map(len, sent.values())))
+        self.assertEqual(observed['sentFiles'], 6)
+
+    def test_library_delta_never_accepts_static_change_in_strict_mode(self):
+        old, new, _ = self.libpack_revisions(changed_static=True)
+        previous, old_binding = deploy_game.validate(self.apk, old)
+        peer = FakeAdb()
+        peer.digest = '1' * 64
+        with self.assertRaisesRegex(RuntimeError, '静态资源不同'):
+            deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+                allow_full_import=False, resident_index=old/'index.tsv',
+                resident_receipt=dict(packageName=previous['apk']['packageName'], apkSha256=peer.digest,
+                                      contentRoot=previous['contentRoot'], artifactSha256=old_binding))
+        self.assertEqual(peer.calls, [])
+
+    def test_library_delta_refusal_only_retries_full_when_allowed(self):
+        old, new, _ = self.libpack_revisions()
+        previous, old_binding = deploy_game.validate(self.apk, old)
+        target, target_binding = deploy_game.validate(self.apk, new)
+        for allow in (False, True):
+            with self.subTest(allow=allow):
+                peer = FakeAdb()
+                peer.digest = '1' * 64
+                peer.receipt = target['contentRoot'], target_binding
+                peer.refuse_delta = True
+                proof = dict(packageName=target['apk']['packageName'], apkSha256=peer.digest,
+                             contentRoot=previous['contentRoot'], artifactSha256=old_binding)
+                if not allow:
+                    with self.assertRaisesRegex(deploy_game.DeltaRefused, 'resident SHA-256 differs'):
+                        deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+                            allow_full_import=False, resident_index=old/'index.tsv', resident_receipt=proof)
+                    self.assertEqual(len(peer.transfers), 1)
+                else:
+                    done = deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+                        allow_full_import=True, resident_index=old/'index.tsv', resident_receipt=proof)
+                    self.assertEqual([x[0] for x in peer.transfers], [proof['contentRoot'], None])
+                    self.assertIn('resident SHA-256 differs', done['fallbackReason'])
+                    self.assertEqual(done['transferMode'], 'full')
+                    self.assertEqual(done['sentBytes'], sum(len(v) for _, _, files in peer.transfers for v in files.values()))
+
+    def test_old_receiver_declines_delta_before_resource_payload(self):
+        old, new, _ = self.libpack_revisions()
+        previous, old_binding = deploy_game.validate(self.apk, old)
+        peer = FakeAdb()
+        peer.digest = '1' * 64
+        peer.delta_capable = False
+        with self.assertRaisesRegex(deploy_game.DeltaRefused, 'App 未接受差量请求：ERR bad header'):
+            deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+                allow_full_import=False, resident_index=old/'index.tsv',
+                resident_receipt=dict(packageName=previous['apk']['packageName'], apkSha256=peer.digest,
+                                      contentRoot=previous['contentRoot'], artifactSha256=old_binding))
+        self.assertEqual(peer.transfers, [])
+
+    def test_strict_delta_rejects_old_apk_before_install(self):
+        self.write_apk(b'code', delta=False)
+        old, new, _ = self.libpack_revisions()
+        previous, old_binding = deploy_game.validate(self.apk, old)
+        peer = FakeAdb()
+        peer.digest = '1' * 64
+        with self.assertRaisesRegex(deploy_game.DeltaRefused, '目标 APK 未声明库件差量协议'):
+            deploy_game.deploy_resources(self.apk, new, peer, self.root, start=False,
+                allow_full_import=False, resident_index=old/'index.tsv',
+                resident_receipt=dict(packageName=previous['apk']['packageName'], apkSha256=peer.digest,
+                                      contentRoot=previous['contentRoot'], artifactSha256=old_binding))
+        self.assertEqual(peer.calls, [])
 
     def test_deploy_freezes_apk_and_records_matching_identity(self):
         adb = FakeAdb()

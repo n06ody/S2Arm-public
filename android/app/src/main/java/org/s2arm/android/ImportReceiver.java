@@ -10,6 +10,8 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * 资源包直传（电脑 → App 私有目录），不经共享存储：电脑端 android/tools/deploy_game.py 经
@@ -22,6 +24,8 @@ import java.nio.file.Path;
  *   F &lt;字节数&gt; &lt;相对路径&gt;    后面紧跟这么多字节，可重复
  *   END
  * 回一行：OK &lt;文件数&gt; &lt;字节数&gt; 或 ERR &lt;原因&gt;。
+ * 库件差量：S2A-DELTA 1 &lt;名字&gt; &lt;当前内容根&gt;，可带 R &lt;相对路径&gt; 声明删除。
+ * OK 只确认收包。GameInstall 核对旧根、差集与新根后才发布成功回执。
  * 原地登记（资源目录电脑已 adb push 到共享存储，不传字节）：电脑发一行 S2A-INPLACE 1 &lt;绝对路径&gt;，回 OK in-place，
  * 之后由 GameLibrary.registerInPlace 原地登记（GameInstall.installInPlace）。
  * 存档恢复：S2A-SAVE 1 &lt;程序号&gt; &lt;字节数&gt;，紧跟 .s2asave 字节和 END 行。
@@ -44,16 +48,30 @@ final class ImportReceiver {
     }
     private static final int MAX_LINE = 4096;
 
+    static final class Delta {
+        final String baseRoot;
+        final Set<String> removals;
+        Delta(String baseRoot, Set<String> removals) {
+            this.baseRoot = baseRoot;
+            this.removals = java.util.Collections.unmodifiableSet(removals);
+        }
+    }
+
     /** 一次连接的结果。只有 saveTitle 非空时 dir 指向暂存的存档文件。 */
     static final class Received {
         final File dir;
         final boolean inPlace;
         final String saveTitle;
+        final Delta delta;
         Received(File dir, boolean inPlace) { this(dir, inPlace, null); }
         Received(File dir, boolean inPlace, String saveTitle) {
+            this(dir, inPlace, saveTitle, null);
+        }
+        Received(File dir, boolean inPlace, String saveTitle, Delta delta) {
             this.dir = dir;
             this.inPlace = inPlace;
             this.saveTitle = saveTitle;
+            this.delta = delta;
         }
     }
 
@@ -61,6 +79,10 @@ final class ImportReceiver {
     static File receive(InputStream rawIn, OutputStream out, File parent) throws IOException {
         Received got = receiveAny(rawIn, out, parent);
         if (got.inPlace) throw new IOException("in-place request where a transfer was expected");
+        if (got.delta != null) {
+            GameInstall.deleteTree(got.dir);
+            throw new IOException("delta request where a full transfer was expected");
+        }
         if (got.saveTitle != null) {
             Files.deleteIfExists(got.dir.toPath());
             throw new IOException("save request where a resource transfer was expected");
@@ -88,26 +110,45 @@ final class ImportReceiver {
                 reply(out, "OK in-place");
                 return new Received(new File(root), true);
             }
-            if (head.length != 3 || !head[0].equals("S2A-IMPORT") || !head[1].equals(String.valueOf(VERSION)))
+            boolean delta = head[0].equals("S2A-DELTA");
+            if (head.length != 3 || (!delta && !head[0].equals("S2A-IMPORT")) || !head[1].equals(String.valueOf(VERSION)))
                 throw new IOException("bad header");
             String name = head[2];
+            String baseRoot = null;
+            Set<String> removals = new HashSet<>();
+            if (delta) {
+                String[] target = name.split(" ", -1);
+                if (target.length != 2 || !target[1].matches("sha256-[0-9a-f]{64}"))
+                    throw new IOException("bad delta base root");
+                name = target[0];
+                baseRoot = target[1];
+            }
             if (!name.matches("[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}")) throw new IOException("bad package name: " + name);
             if (!parent.isDirectory() && !parent.mkdirs()) throw new IOException("cannot create " + parent);
             part = new File(parent, "." + name + ".part");
             GameInstall.deleteTree(part);
             if (!part.mkdirs()) throw new IOException("cannot create " + part);
+            if (delta) reply(out, "GO delta");
             long files = 0, bytes = 0;
             byte[] buf = new byte[1 << 20];
             java.util.Map<String, String> sums = new java.util.HashMap<>();
             while (true) {
                 String l = line(in);
                 if (l.equals("END")) break;
+                if (delta && l.startsWith("R ")) {
+                    String path = safePath(l.substring(2));
+                    if (sums.containsKey(path) || !removals.add(path)) throw new IOException("duplicate delta path");
+                    continue;
+                }
                 String[] f = l.split(" ", 3);
                 if (f.length != 3 || !f[0].equals("F")) throw new IOException("bad entry line");
                 long size;
                 try { size = Long.parseLong(f[1]); } catch (NumberFormatException e) { throw new IOException("bad size"); }
                 if (size < 0) throw new IOException("bad size");
-                File target = new File(part, safePath(f[2]));
+                String path = safePath(f[2]);
+                if (delta && (removals.contains(path) || sums.containsKey(path)))
+                    throw new IOException("duplicate delta path");
+                File target = new File(part, path);
                 File dir = target.getParentFile();
                 if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
                 java.security.MessageDigest md = GamePack.digest();
@@ -128,7 +169,7 @@ final class ImportReceiver {
             part = null;
             VERIFIED.put(done.getCanonicalPath(), sums);
             reply(out, "OK " + files + " " + bytes);
-            return new Received(done, false);
+            return new Received(done, false, null, delta ? new Delta(baseRoot, removals) : null);
         } catch (IOException | RuntimeException e) {
             if (part != null) GameInstall.deleteTree(part);
             try { reply(out, "ERR " + String.valueOf(e.getMessage()).replace('\n', ' ')); } catch (IOException ignored) { }

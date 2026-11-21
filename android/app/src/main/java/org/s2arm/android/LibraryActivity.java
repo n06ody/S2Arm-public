@@ -720,7 +720,7 @@ public final class LibraryActivity extends Activity {
                         }
                         java.io.File dir = got.dir;
                         android.util.Log.i("S2Arm", "Game import received " + dir.getName() + " in " + (System.nanoTime() - t0) / 1000000 + " ms");
-                        runOnUiThread(() -> lib.scanImports(dir.getAbsolutePath()));
+                        runOnUiThread(() -> lib.scanImports(dir.getAbsolutePath(), got.delta));
                         return;
                     } catch (java.io.IOException e) {
                         android.util.Log.e("S2Arm", "Game import of requested directory refused: receive failed: " + e.getMessage());
