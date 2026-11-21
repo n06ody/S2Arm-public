@@ -56,15 +56,38 @@ static void pass_shader_identify(struct nvn_gpu_shader_s *sh, const uint8_t key[
             sh->capture_flags |= PASS_FS_DEPTH_OR_MASK;
         i += len;
     }
-    pass_shader_dump(sh, blob, size);
+    if (g.pass_capture_dump) pass_shader_dump(sh, blob, size);
+}
+
+// The Android platform exposes the app-private diagnostics directory. Host
+// fixtures that do not supply it cannot load an external module.
+extern const char *nvk_pass_variant_dir(void) __attribute__((weak));
+
+static uint32_t *pass_variant_load(const char *source_sha, size_t *size) {
+    const char *dir = nvk_pass_variant_dir ? nvk_pass_variant_dir() : NULL;
+    char path[4096];
+    int len = dir ? snprintf(path, sizeof path, "%s/pass-variant-%d-%s.spv", dir,
+                             g.pass_capture_variant, source_sha) : -1;
+    if (len < 0 || (size_t)len >= sizeof path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 256 * 1024;
+    uint32_t *words = malloc(cap);
+    *size = words ? fread(words, 1, cap, f) : 0;
+    int valid = *size >= 20 && *size < cap && (*size & 3) == 0 && feof(f) && !ferror(f) &&
+                s2a_spv_word((const unsigned char *)words) == UINT32_C(0x07230203) && s2a_spirv_storage_need(words, *size, 4) == 0;
+    fclose(f);
+    if (valid) return words;
+    free(words);
+    return NULL;
 }
 
 // Build a second pipeline with the same layout, render pass and static state.
 // The cached game pipeline and descriptor preparation remain authoritative.
-static void pass_build_constant(struct nvn_gpu_pipe_s *p, const nvn_gpu_pipe_desc *d,
+static void pass_build_alt(struct nvn_gpu_pipe_s *p, const nvn_gpu_pipe_desc *d,
                                 const VkGraphicsPipelineCreateInfo *gp) {
     const struct nvn_gpu_shader_s *fs = d->st[NVN_GPU_SH_FS].sh;
-    if (!g.pass_capture_blank || !fs || fs->capture_key != g.pass_capture_key) return;
+    if (!g.pass_capture_alt || !fs || fs->capture_key != g.pass_capture_key) return;
     if (d->dfmt || d->sfmt || d->samples > 1 || fs->capture_flags & (PASS_FS_STORAGE | PASS_FS_DEPTH_OR_MASK))
         goto unsupported;
     const uint32_t n = gp->pColorBlendState->attachmentCount;
@@ -84,21 +107,50 @@ static void pass_build_constant(struct nvn_gpu_pipe_s *p, const nvn_gpu_pipe_des
     VkShaderModuleCreateInfo module = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = n == 2 ? sizeof pass_constant_color_uint : sizeof pass_constant_color,
         .pCode = n == 2 ? pass_constant_color_uint : pass_constant_color};
+    uint32_t *variant = NULL;
+    if (g.pass_capture_variant) {
+        variant = pass_variant_load(fs->capture_sha, &module.codeSize);
+        if (!variant) {
+            nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-variant", "diagnostic module missing, malformed or writes storage");
+            return;
+        }
+        module.pCode = variant;
+        s2a_sha256 ctx;
+        uint8_t digest[32];
+        s2a_sha256_init(&ctx);
+        s2a_sha256_update(&ctx, variant, module.codeSize);
+        s2a_sha256_final(&ctx, digest);
+        s2a_sha256_hex(digest, p->capture_alt_sha);
+    }
     VkShaderModule mod = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(g.d, &module, NULL, &mod) != VK_SUCCESS) goto unsupported;
+    VkResult made = vkCreateShaderModule(g.d, &module, NULL, &mod);
+    free(variant);
+    if (made != VK_SUCCESS) goto unsupported;
     VkPipelineShaderStageCreateInfo stages[5];
     memcpy(stages, gp->pStages, gp->stageCount * sizeof stages[0]);
     for (uint32_t i = 0; i < gp->stageCount; i++) {
         if (stages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
         stages[i].module = mod;
-        stages[i].pName = "main";
-        stages[i].pSpecializationInfo = NULL;
+        if (!g.pass_capture_variant) {
+            stages[i].pName = "main";
+            stages[i].pSpecializationInfo = NULL;
+        }
     }
     VkGraphicsPipelineCreateInfo alt = *gp;
     alt.pStages = stages;
-    VkResult r = vkCreateGraphicsPipelines(g.d, VK_NULL_HANDLE, 1, &alt, NULL, &p->capture_constant);
+    VkResult r = vkCreateGraphicsPipelines(g.d, VK_NULL_HANDLE, 1, &alt, NULL, &p->capture_alt);
     vkDestroyShaderModule(g.d, mod, NULL);
-    if (r == VK_SUCCESS) return;
+    if (r == VK_SUCCESS) {
+        if (g.pass_capture_variant) {
+            char line[210];
+            snprintf(line, sizeof line, "variant=%d source_sha=%s replacement_sha=%s",
+                     g.pass_capture_variant, fs->capture_sha, p->capture_alt_sha);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-variant", line);
+        }
+        return;
+    }
+    if (p->capture_alt) vkDestroyPipeline(g.d, p->capture_alt, NULL);
+    p->capture_alt = VK_NULL_HANDLE;
 unsupported:
-    nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-spv", "constant replacement rejected: pipeline or fragment interface unsupported");
+    nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-spv", "alternate fragment rejected: pipeline or fragment interface unsupported");
 }

@@ -68,7 +68,9 @@ static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
-static int g_pass_capture_test;
+static int g_pass_capture_test, g_pass_variant_test;
+static char g_pass_variant_line[128];
+static unsigned g_pass_variant_rows;
 static unsigned g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end, g_pass_capture_ticks;
 static unsigned g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions;
 static int32_t g_pass_key_hi, g_pass_key_lo;
@@ -80,7 +82,8 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (g_pass_capture_test == 2) {
         if (!strcmp(name, "nvk_pass_key_hi")) return g_pass_key_hi;
         if (!strcmp(name, "nvk_pass_key_lo")) return g_pass_key_lo;
-        if (!strcmp(name, "nvk_pass_constant")) return !getenv("S2A_TEST_PRESENT_BGRA");
+        if (!strcmp(name, "nvk_pass_constant")) return !g_pass_variant_test && !getenv("S2A_TEST_PRESENT_BGRA");
+        if (!strcmp(name, "nvk_pass_variant")) return g_pass_variant_test;
         if (!strcmp(name, "nvk_pass_match_w")) return 64;
         if (!strcmp(name, "nvk_pass_match_h")) return 36;
         if (!strcmp(name, "nvk_pass_match_vertices")) return 3;
@@ -124,6 +127,8 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
                 strstr(text, " samp=1 min=0 mag=0 mip=0 "))
                 g_pass_capture_samples++;
             if (strstr(text, " substituted=1")) g_pass_capture_substitutions++;
+            if (g_pass_variant_test && strstr(text, " substituted=1") && strstr(text, g_pass_variant_line))
+                g_pass_variant_rows++;
         }
         unsigned n, incomplete;
         unsigned long long seq, b, e;

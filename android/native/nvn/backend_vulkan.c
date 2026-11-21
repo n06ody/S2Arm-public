@@ -176,7 +176,8 @@ struct nvn_gpu_shader_s {
 };
 
 struct nvn_gpu_pipe_s {
-    VkPipeline pipe, capture_constant;
+    VkPipeline pipe, capture_alt;
+    char capture_alt_sha[65];
     uint32_t capture_blend, capture_writemask;
     VkPipelineLayout layout;
     VkRenderPass pass;
@@ -268,7 +269,8 @@ struct pass_capture_att {
 struct pass_capture_row {
     const char *reason;
     uint64_t ns, tick0, tick1, submit, record, fs_key;
-    char fs_sha[65], fs_entry[32];
+    char fs_sha[65], fs_entry[32], replacement_sha[65];
+    uint32_t variant;
     uint32_t fs_flags, fs_blend, fs_writemask, substituted, nbind, lost_bind;
     struct pass_capture_binding binds[PASS_CAPTURE_BINDS];
     uint32_t w, h, layers, rw, rh, n;
@@ -484,7 +486,8 @@ struct nvn_gpu_vk {
     _Atomic int pass_capture_record, pass_capture_replace;
     _Atomic uint64_t pass_capture_serial;
     uint64_t pass_capture_key;
-    int pass_capture_blank, pass_capture_w, pass_capture_h, pass_capture_vertices, pass_capture_colors;
+    int pass_capture_alt, pass_capture_w, pass_capture_h, pass_capture_vertices, pass_capture_colors;
+    int pass_capture_variant, pass_capture_dump;
     struct pass_capture *pass_capture;
     uint64_t wsi_seq;    // 已提交的呈现段序号（g_submit_mu 下分配，与入队同序）
     uint64_t wsi_done;   // worker 已等到栅栏的最后一个呈现段序号（g_mu 下改；段按入队顺序处理，单调）
@@ -2441,8 +2444,17 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         g.pass_capture_h = nvn_plat_flag("nvk_pass_match_h", 0);
         g.pass_capture_vertices = nvn_plat_flag("nvk_pass_match_vertices", 0);
         g.pass_capture_colors = nvn_plat_flag("nvk_pass_match_colors", 0);
-        g.pass_capture_blank = g.pass_capture_key && g.pass_capture_w > 0 && g.pass_capture_h > 0 &&
-            g.pass_capture_vertices > 0 && g.pass_capture_colors > 0 && nvn_plat_flag("nvk_pass_constant", 0) == 1;
+        g.pass_capture_dump = nvn_plat_flag("nvk_pass_dump", 1) != 0;
+        int variant = nvn_plat_flag("nvk_pass_variant", 0);
+        int constant = nvn_plat_flag("nvk_pass_constant", 0) == 1;
+        int shape = g.pass_capture_key && g.pass_capture_w > 0 && g.pass_capture_h > 0 &&
+                    g.pass_capture_vertices > 0 && g.pass_capture_colors > 0;
+        if (variant < 0 || variant > 2 || (variant && (constant || !shape))) {
+            nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-variant", "invalid mode, concurrent constant arm or missing target signature");
+        } else {
+            g.pass_capture_variant = variant;
+            g.pass_capture_alt = shape && (variant || constant);
+        }
     }
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
@@ -3890,7 +3902,7 @@ static int pi_eq(const void *a, const void *b) { return same_pipe_desc((const nv
 static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
     if (!p) return;
     if (p->pipe) vkDestroyPipeline(g.d, p->pipe, NULL);
-    if (p->capture_constant) vkDestroyPipeline(g.d, p->capture_constant, NULL);
+    if (p->capture_alt) vkDestroyPipeline(g.d, p->capture_alt, NULL);
     if (p->pass) vkDestroyRenderPass(g.d, p->pass, NULL);
     if (p->layout) vkDestroyPipelineLayout(g.d, p->layout, NULL);
     // 描述符组布局（p->dsl / p->dlay）归布局表所有，会话收尾由 dlay_close 销毁，这里只借用过、不销毁
@@ -4360,7 +4372,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     }
     plc_created();
     if (g.pass_capture_delay > 0) {
-        pass_build_constant(p, d, &gp);
+        pass_build_alt(p, d, &gp);
         for (uint32_t i = 0; i < ncb; i++) {
             p->capture_blend |= (uint32_t)(cb[i].blendEnable != VK_FALSE) << i;
             p->capture_writemask |= cb[i].colorWriteMask << (4 * i);
@@ -6253,11 +6265,11 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     struct pass_capture_row *profile = pass_capture_current(c);
     VkPipeline selected = p->pipe;
     if (profile && !profile->draws && !profile->clears && !profile->aux_draws &&
-        p->capture_constant && !c->pass_occl && !c->feedback_read_mask &&
+        p->capture_alt && !c->pass_occl && !c->feedback_read_mask &&
         !a->ind && !a->ibuf && c->pass_w == (uint32_t)g.pass_capture_w && c->pass_h == (uint32_t)g.pass_capture_h &&
         a->count == (uint32_t)g.pass_capture_vertices && profile->n == (uint32_t)g.pass_capture_colors &&
         atomic_load_explicit(&g.pass_capture_replace, memory_order_relaxed))
-        selected = p->capture_constant;
+        selected = p->capture_alt;
     if (c->es.gpipe != selected) {
         vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, selected);
         c->es.gpipe = selected;
@@ -6404,6 +6416,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     }
     if (profile && profile->draws++ == 0) {
         profile->substituted = selected != p->pipe;
+        if (profile->substituted && g.pass_capture_variant) {
+            profile->variant = (uint32_t)g.pass_capture_variant;
+            memcpy(profile->replacement_sha, p->capture_alt_sha, sizeof profile->replacement_sha);
+        }
         pass_capture_draw_detail(profile, c, p);
         profile->primitive = a->prim;
         profile->count = a->cnt ? a->max_draws : a->ind ? draws : a->count;

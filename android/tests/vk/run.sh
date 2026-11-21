@@ -806,6 +806,17 @@ if [ "$mode" = "--present-only" ]; then
     [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] || exit 1
     done
     unset S2A_TEST_PRESENT_BGRA
+    for arm in 1 2; do
+        probe="$out/shaders/pass-variant-$arm-$pass_frag_sha.spv"
+        "$glslc" --target-env=vulkan1.1 -DPASS_VARIANT="$arm" "$repo/android/tests/vk/shaders/pass_capture_fixture.frag" -o "$probe"
+        read -r probe_sha _ < <(sha256sum "$probe")
+        set +e
+        timeout 60 "$out/t_backend_vk" "$out/shaders" "$pass_frag_sha" "$arm" "$probe_sha" 2>&1 | tee "$out/present-variant-$arm.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        bad=$(grep -cE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/present-variant-$arm.log" || true)
+        [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ] || exit 1
+    done
     exit 0
 fi
 

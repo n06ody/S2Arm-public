@@ -24,7 +24,7 @@ static void pass_capture_frame(struct nvn_gpu_vk *vk, const struct vk_segment *s
         p->frame[0].seq = s->wsi_seq + 1;
         p->frame[0].begin = now;
         p->failed = 0;
-        atomic_store_explicit(&vk->pass_capture_replace, vk->pass_capture_blank, memory_order_relaxed);
+        atomic_store_explicit(&vk->pass_capture_replace, vk->pass_capture_alt, memory_order_relaxed);
         return;
     }
     p->frame[f].failed = p->failed || failed || !p->frame[f].count || p->frame[f].seq != s->wsi_seq;
@@ -58,6 +58,9 @@ static void pass_capture_frame(struct nvn_gpu_vk *vk, const struct vk_segment *s
                      r->vp[0], r->vp[1], r->vp[2], r->vp[3],
                      (unsigned long long)r->tick0, (unsigned long long)r->tick1, (unsigned long long)r->submit,
                      (unsigned long long)r->record, r->substituted);
+            if (r->variant && o < sizeof line)
+                o += (size_t)snprintf(line + o, sizeof line - o, " variant=%u replacement_sha=%s",
+                                      r->variant, r->replacement_sha);
             for (uint32_t k = 0; k < r->n && o < sizeof line; k++) {
                 const struct pass_capture_att *a = &r->att[k];
                 o += (size_t)snprintf(line + o, sizeof line - o, " a=%u,%u,%u,%ux%u,%u,%u,%u,%u,%u,%u,%llu",

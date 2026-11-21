@@ -156,6 +156,10 @@ static void profile_rendered_frames(void) {
     printf("PASS_CAPTURE raw timestamp pairs expected=%u actual=%u\n", want * 2, g_pass_capture_ticks);
     g_pass_capture_test = 0;
 }
+static const char *g_pass_variant_dir;
+const char *nvk_pass_variant_dir(void);
+const char *nvk_pass_variant_dir(void) { return g_pass_variant_dir; }
+
 static void profile_constant_pixels(const char *dir, const char *sha) {
     char word[9] = {0};
     memcpy(word, sha, 8);
@@ -226,7 +230,7 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
         CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass replacement acquire: %s", e.why);
         probe_active = i >= 8 && i <= 12;
         probe_alpha255 = 1;
-        probe_value = replace ? 0 : 255;
+        probe_value = replace && g_pass_variant_test != 2 ? 0 : 255;
         CHECK(OK(nvn_gpu_present(sf, &d, &present, i, NULL, NULL, &e)), "pass replacement present: %s", e.why);
         probe_active = probe_alpha255 = 0;
         if (i == 2) nanosleep(&(struct timespec){1, 500000000}, NULL);
@@ -243,11 +247,29 @@ done:
           enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
     printf("PASS_CONSTANT enabled=%d fs=%u bindings=%u replaced=%u\n",
            enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
+    if (g_pass_variant_test) {
+        CHECK(g_pass_variant_rows >= 20 && g_pass_variant_rows == g_pass_capture_substitutions,
+              "PASS_VARIANT arm=%d expected=%s rows=%u substituted=%u", g_pass_variant_test,
+              g_pass_variant_line, g_pass_variant_rows, g_pass_capture_substitutions);
+        printf("PASS_VARIANT arm=%d rows=%u substituted=%u\n", g_pass_variant_test,
+               g_pass_variant_rows, g_pass_capture_substitutions);
+    }
     g_pass_capture_test = 0;
 }
 int main(int argc, char **argv) {
     char why[256]={0};if(s2a_vk_device_create(&g_dev,why,sizeof why)) {fprintf(stderr,"device %s\n",why);return 2;}
     memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="original-present-grayscale";
+    if (argc == 5 && strlen(argv[2]) == 64 && strlen(argv[4]) == 64) {
+        g_pass_variant_dir = argv[1];
+        g_pass_variant_test = atoi(argv[3]);
+        snprintf(g_pass_variant_line, sizeof g_pass_variant_line, " variant=%d replacement_sha=%s",
+                 g_pass_variant_test, argv[4]);
+        profile_constant_pixels(argv[1], argv[2]);
+        CHECK(probe_cases == 5 && probe_bad == 0, "pass variant pixels cases=%u bad=%llu",
+              probe_cases, (unsigned long long)probe_bad);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail != 0;
+    }
     profile_rendered_frames();
     if (argc > 2 && strlen(argv[2]) == 64) profile_constant_pixels(argv[1], argv[2]);
     if(!open_backend())return 2;
