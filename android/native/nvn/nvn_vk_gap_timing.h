@@ -5,10 +5,10 @@
 
 enum nvk_gap_kind {
     NVK_GAP_NONE, NVK_GAP_BARRIER, NVK_GAP_LAYOUT, NVK_GAP_TRANSFER, NVK_GAP_CLEAR,
-    NVK_GAP_COMPUTE, NVK_GAP_PASS_BEGIN, NVK_GAP_PASS_END, NVK_GAP_PARK, NVK_GAP_KIND_COUNT
+    NVK_GAP_COMPUTE, NVK_GAP_PASS_BEGIN, NVK_GAP_PASS_END, NVK_GAP_KIND_COUNT
 };
 enum { NVK_GAP_OFF, NVK_GAP_TIME, NVK_GAP_EMPTY };
-enum { NVK_GAP_PAIRS = 64 };
+enum { NVK_GAP_PAIRS = 128 };
 struct nvk_gap_row { uint8_t kind; uint16_t window; };
 struct nvk_gap_plan {
     uint8_t mode, active;

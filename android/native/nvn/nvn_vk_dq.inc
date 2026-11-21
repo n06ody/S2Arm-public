@@ -371,10 +371,10 @@ static DQ_U uint64_t vk_dq_fill_wait(uint64_t t) {
 
 // ---- the wrappers (the producer) ----
 #define DQ_DIRECT(f, ...) do { vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_##f(__VA_ARGS__); } while (0)
-#define DQ_BEGIN(op, T, extra) if (gap_record_cmd) gap_before_op(cb, op); DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
+#define DQ_BEGIN(op, T, extra) if (gap_registered) gap_before_op(cb, op); DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t nm, const VkMemoryBarrier *m,
                                                          uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
-    if (gap_record_cmd) gap_before_barrier(cb, ni, im);
+    if (gap_registered) gap_before_barrier(cb, ni, im);
     for (uint32_t i = 0; i < nm; i++) if (m[i].pNext) goto direct;
     for (uint32_t i = 0; i < nb; i++) if (b[i].pNext) goto direct;
     for (uint32_t i = 0; i < ni; i++) if (im[i].pNext) goto direct;
@@ -413,28 +413,37 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdClearAttachments(VkCommandBuffer c
       dq_put(&at_, at, DQ_ARR(VkClearAttachment, at, na)); dq_put(&at_, rc, DQ_ARR(VkClearRect, rc, nr)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdClearAttachments, cb, na, at, nr, rc); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) {
-    if (gap_record_cmd) gap_before_op(cb, OP_vkCmdBeginRenderPass);
+    if (gap_registered) gap_render_edge(cb, 1, 0);
     const VkRenderPassAttachmentBeginInfo *ab = NULL;
     if (bi->pNext) { const VkBaseInStructure *x = bi->pNext; if (x->sType != VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO || x->pNext) goto direct; ab = (const void *)x; }
     { size_t nc = DQ_ARR(VkClearValue, bi->pClearValues, bi->clearValueCount), nv = ab ? DQ_ARR(VkImageView, ab->pAttachments, ab->attachmentCount) : 0;
       DQ_BEGIN(OP_vkCmdBeginRenderPass, a_rpbegin, nc + nv); memset(a, 0, sizeof *a); a->bi = *bi; a->c = c;
       if (!bi->pClearValues) a->bi.clearValueCount = 0;
       if (ab) { a->ab = *ab; a->has_ab = 1; }
-      dq_put(&at_, bi->pClearValues, nc); dq_put(&at_, ab ? ab->pAttachments : NULL, nv); dq_rec_end(base_); return; }
+      dq_put(&at_, bi->pClearValues, nc); dq_put(&at_, ab ? ab->pAttachments : NULL, nv); dq_rec_end(base_); if (gap_registered) gap_render_edge(cb, 1, 1); return; }
 direct: DQ_DIRECT(vkCmdBeginRenderPass, cb, bi, c);
+    if (gap_registered) gap_render_edge(cb, 1, 1);
 }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
-    if (gap_record_cmd) gap_before_op(cb, OP_vkCmdBeginRendering);
+    if (gap_registered) gap_render_edge(cb, 1, 0);
     if (ri->pNext || (ri->pDepthAttachment && ri->pDepthAttachment->pNext) || (ri->pStencilAttachment && ri->pStencilAttachment->pNext)) goto direct;
     for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) if (ri->pColorAttachments[i].pNext) goto direct;
     { DQ_BEGIN(OP_vkCmdBeginRendering, a_rbegin, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); memset(a, 0, sizeof *a); a->ri = *ri;
       if (!ri->pColorAttachments) a->ri.colorAttachmentCount = 0;
       if (ri->pDepthAttachment) { a->d = *ri->pDepthAttachment; a->has_d = 1; }
       if (ri->pStencilAttachment) { a->s = *ri->pStencilAttachment; a->has_s = 1; }
-      dq_put(&at_, ri->pColorAttachments, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); dq_rec_end(base_); return; }
+      dq_put(&at_, ri->pColorAttachments, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); dq_rec_end(base_); if (gap_registered) gap_render_edge(cb, 1, 1); return; }
 direct: DQ_DIRECT(vkCmdBeginRendering, cb, ri);
+    if (gap_registered) gap_render_edge(cb, 1, 1);
 }
-#define W_NOARG(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { DQ_COUNT(OP_##f); void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; if (!a) { DQ_DIRECT(f, cb); return; } dq_rec_end(a); }
+#define W_NOARG(f) \
+    static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { \
+        if (gap_registered) gap_render_edge(cb, 0, 0); \
+        DQ_COUNT(OP_##f); \
+        void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; \
+        if (a) dq_rec_end(a); else DQ_DIRECT(f, cb); \
+        if (gap_registered) gap_render_edge(cb, 0, 1); \
+    }
 W_NOARG(vkCmdEndRenderPass) W_NOARG(vkCmdEndRendering)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pl) {
     { DQ_BEGIN(OP_vkCmdBindPipeline, a_bindpipe, 0); *a = (a_bindpipe){bp, pl}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdBindPipeline, cb, bp, pl); }

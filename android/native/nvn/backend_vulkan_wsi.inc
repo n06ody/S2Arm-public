@@ -553,9 +553,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         if (!nvn_gpu_ok(out)) { s->held = idx; s->held_sem = sem; goto done; }
     }
     VkImage target = encode ? s->encoded : s->images[idx];
-    gap_skip_wsi = 1;
     out = nvn_gpu_cmd_begin(NULL, &ch, err);
-    gap_skip_wsi = 0;
     if (!nvn_gpu_ok(out)) { s->held = idx; s->held_sem = sem; goto done; }
     struct nvn_gpu_cmd_s *c = ch;
     // 上屏 EASU 放大：玩家选「高画质」时开（S2A_HIGH_QUALITY=1，宿主创建前由外壳设，缺省更省电 = 关）；
@@ -577,6 +575,10 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     struct vk_segment *seg = calloc(1, sizeof *seg);
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (c->gap_tag) {
+        gap_main_end(c);
+        if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
+    }
     VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
     pthread_mutex_lock(&g_submit_mu);
@@ -589,7 +591,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
-        r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        r = si.commandBufferCount ? gap_queue_submit(seg, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);

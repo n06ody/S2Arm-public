@@ -34,7 +34,10 @@ static int hz_flag=2;
 static int depth_ab_seconds;
 #ifdef S2A_NVK_GAP_HOST_TEST
 static int gap_fixture, gap_fixture_dq;
-struct gap_counts { unsigned ranges, anchors, frames, matches, transfers, invalid; };
+struct gap_counts {
+    unsigned frames, segments, ranges, main_passes, main_transfers, pre_transfers, inside_gap, invalid;
+    uint64_t first_end, second_begin;
+};
 static struct gap_counts gap_observed[2];
 static int gap_fixture_flag(const char *name, int fallback) {
     if (!strcmp(name, "nvk_dq")) return gap_fixture_dq;
@@ -47,24 +50,37 @@ static int gap_fixture_flag(const char *name, int fallback) {
     return fallback;
 }
 static void gap_fixture_log(const char *row) {
-    unsigned long long frame, signal;
-    unsigned cb, id, field, valid, park, draws;
-    if (sscanf(row, "range frame=%llu submit=%llu cb=%u id=%u kind=%u valid=%u",
-               &frame, &signal, &cb, &id, &field, &valid) == 6) {
+    unsigned long long frame, signal, a, b, done_ns;
+    unsigned cb, id, field, valid;
+    if (sscanf(row, "range frame=%llu submit=%llu cb=%u id=%u kind=%u valid=%u t0=%llu t1=%llu",
+               &frame, &signal, &cb, &id, &field, &valid, &a, &b) == 8) {
         REQUIRE(frame == 19 || frame == 35);
         struct gap_counts *c = &gap_observed[frame == 35];
-        c->ranges++; c->invalid += !valid;
-        c->transfers += field == NVK_GAP_TRANSFER && cb == 0 && signal == (frame == 35 ? 4u : 2u);
-    } else if (sscanf(row, "anchor frame=%llu submit=%llu id=%u event=%u valid=%u",
-                      &frame, &signal, &id, &field, &valid) == 5) {
+        c->ranges++;
+        c->invalid += !valid;
+        if (field == NVK_GAP_TRANSFER && cb == 0) {
+            if (signal == (frame == 35 ? 5u : 3u)) {
+                c->main_transfers++;
+                c->inside_gap += c->first_end && c->first_end <= a && a <= b && b <= c->second_begin;
+            }
+            c->pre_transfers += signal == (frame == 35 ? 4u : 2u);
+        }
+    } else if (sscanf(row, "pass frame=%llu submit=%llu id=%u valid=%u t0=%llu t1=%llu",
+                      &frame, &signal, &id, &valid, &a, &b) == 6) {
         REQUIRE(frame == 19 || frame == 35);
         struct gap_counts *c = &gap_observed[frame == 35];
-        c->anchors++; c->invalid += !valid;
-    } else if (sscanf(row, "match frame=%llu submit=%llu id=%u focus=%u shape=%u park=%u draws=%u",
-                      &frame, &signal, &id, &field, &valid, &park, &draws) == 7) {
+        c->invalid += !valid;
+        if (signal == (frame == 35 ? 5u : 3u)) {
+            c->main_passes++;
+            if (!id) c->first_end = b;
+            if (id == 1) c->second_begin = a;
+        }
+    } else if (sscanf(row, "submit frame=%llu signal=%llu cpu_submit_ns=%llu cpu_return_ns=%llu cpu_done_ns=%llu",
+                      &frame, &signal, &a, &b, &done_ns) == 5) {
         REQUIRE(frame == 19 || frame == 35);
         struct gap_counts *c = &gap_observed[frame == 35];
-        c->matches += field == 3 && valid && !park && draws == 1 && signal == (frame == 35 ? 5u : 3u);
+        c->segments++;
+        c->invalid += !a || a > b || b > done_ns;
     } else if (sscanf(row, "frame=%llu", &frame) == 1) {
         REQUIRE(frame == 19 || frame == 35);
         gap_observed[frame == 35].frames++;
@@ -460,28 +476,30 @@ static void run_gap_vulkan(struct s2a_vk_device *device, const char *dir, int dq
         const uint64_t signal = 2 + 2 * arm;
         nvk_gap_test_present(start, secs);
         nvk_gap_test_present(start + 15, secs);
+        nvn_gpu_cmd pre;
         GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+        GPU(nvn_gpu_cmd_begin(NULL, &pre, &err));
         gap_fixture_draw(cmd, view[0], 16, pipe[0]);
-        nvn_gpu_copy_buf(cmd, src, 0, dst, 4 * arm, sizeof word);
-        GPU(nvn_gpu_cmd_commit(cmd, signal, done, NULL, &err));
-        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+        nvn_gpu_copy_buf(pre, src, 0, dst, 8 * arm, sizeof word);
+        nvn_gpu_copy_buf(cmd, src, 0, dst, 8 * arm + 4, sizeof word);
         gap_fixture_draw(cmd, view[1], 8, pipe[1]);
+        GPU(nvn_gpu_cmd_commit(pre, signal, done, NULL, &err));
         GPU(nvn_gpu_cmd_commit(cmd, signal + 1, done, NULL, &err));
         GPU(nvn_gpu_fence_wait(signal + 1, 5000000000ull, &err));
     }
     nvk_gap_test_present(35, 9);
     nvk_gap_test_present(36, 12);
-    uint32_t copied[2];
+    uint32_t copied[4];
     const uint8_t *bytes = nvn_gpu_buf_cpu(dst);
     REQUIRE(bytes);
     memcpy(copied, bytes, sizeof copied);
-    REQUIRE(copied[0] == word && copied[1] == word);
+    for (unsigned i = 0; i < 4; i++) REQUIRE(copied[i] == word);
     for (unsigned arm = 0; arm < 2; arm++) {
         const struct gap_counts *c = &gap_observed[arm];
-        printf("gap-vulkan dq=%d arm=%u frames=%u ranges=%u anchors=%u matches=%u transfers=%u invalid=%u\n",
-               dq, arm, c->frames, c->ranges, c->anchors, c->matches, c->transfers, c->invalid);
-        if (c->frames != 1 || c->ranges < 3 || c->anchors != 4 || c->matches != 1 ||
-            c->transfers != 1 || c->invalid || c->ranges != gap_observed[0].ranges) failures++;
+        printf("frame-ledger dq=%d arm=%u frames=%u submits=%u ranges=%u main-passes=%u main-copies=%u pre-copies=%u inside-gap=%u invalid=%u\n",
+               dq, arm, c->frames, c->segments, c->ranges, c->main_passes, c->main_transfers, c->pre_transfers, c->inside_gap, c->invalid);
+        if (c->frames != 1 || c->segments != 2 || c->main_passes != 2 || c->main_transfers != 1 ||
+            c->pre_transfers != 1 || c->inside_gap != 1 || c->invalid || c->ranges != gap_observed[0].ranges) failures++;
     }
     nvn_gpu_buf_release(src, NULL, NULL);
     nvn_gpu_buf_release(dst, NULL, NULL);
