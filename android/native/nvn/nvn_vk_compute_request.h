@@ -42,6 +42,7 @@ struct s2a_record_dispatch_state {
 /* Extracted from the exact provider profile bytes embedded in REQUEST. */
 struct nvk_compute_profile_facts {
     uint32_t storage_alignment;
+    uint32_t max_shared;   // capabilities.maximumComputeSharedMemorySize；缺席按 Vulkan 下限 32768（只会多拒不会多放）
     char hash[72];
 };
 /* Same strict provider-profile parser used by REQUEST and the pre-identity bridge. */

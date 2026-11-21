@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer InputWords { uint words[]; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Result { uint field0, field1, valid; } dst;
+layout(push_constant) uniform Domain { uint count, stride, field0, field1; } p;
+shared uvec2 partial[64];
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uvec2 value = uvec2(0);
+    for (uint i = lane; i < p.count; i += 64u) {
+        uint base = i * p.stride;
+        value |= uvec2(src.words[base + p.field0], src.words[base + p.field1]);
+    }
+    partial[lane] = value;
+    barrier();
+
+    for (uint step = 32u; step != 0u; step >>= 1u) {
+        if (lane < step)
+            partial[lane] |= partial[lane + step];
+        barrier();
+    }
+    if (lane == 0u) {
+        dst.field0 = partial[0].x;
+        dst.field1 = partial[0].y;
+        dst.valid = 1u;
+    }
+}

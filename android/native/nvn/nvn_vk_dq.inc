@@ -302,6 +302,9 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
     if (s2a_adpf_pin_self) s2a_adpf_pin_self();
 #endif
 #ifdef __linux__

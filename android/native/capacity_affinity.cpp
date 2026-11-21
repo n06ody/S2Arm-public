@@ -7,6 +7,9 @@
 #include "capacity_affinity.h"
 #include "capacity_policy.h"
 #include "capacity_snapshot.h"
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../../graphics/nvn/replay/nvn_plat.h"
+#endif
 #if defined(S2A_CAPACITY_TEST)
 static bool s2a_debug_entries_open() { const char *v=std::getenv("S2A_TEST_DEBUG_GATE"); return v && v[0]=='1'; }
 #else
@@ -32,6 +35,8 @@ static bool s2a_debug_entries_open() { const char *v=std::getenv("S2A_TEST_DEBUG
 namespace {
 std::mutex mu;
 struct Slot { pid_t tid=0; cpu_set_t *original=nullptr, *preferred=nullptr, *scratch=nullptr; size_t bytes=0; bool applied=false; } slots[2];
+struct Worker { Slot slot; int role; };
+std::map<pid_t, Worker> workers;
 // Only threads observed through our linker wrapper are known; other coverage is unknown.
 std::map<pid_t,std::string> wrapped_original;
 bool foreground=true;
@@ -40,6 +45,11 @@ bool topology_failed=false;
 // Only registered role threads can inherit a narrowed mask. Avoid touching
 // global placement state on unrelated or pre-initialization pthread calls.
 thread_local bool role_thread=false;
+struct WorkerLifetime {
+    int role = -1;
+    ~WorkerLifetime() { if (role >= 0) s2a_capacity_leave(role); }
+};
+thread_local WorkerLifetime worker_lifetime;
 long long boot_us() { timespec t{}; return clock_gettime(CLOCK_BOOTTIME, &t)==0 ? static_cast<long long>(t.tv_sec)*1000000LL+t.tv_nsec/1000 : -1; }
 std::string mask_string(const cpu_set_t *mask, size_t bytes) {
     std::string out;
@@ -49,7 +59,7 @@ std::string mask_string(const cpu_set_t *mask, size_t bytes) {
     }
     return out.empty()?"-":out;
 }
-// Production defaults to split. Debug mode may explicitly disable or select another strategy.
+// nvk defaults to tiered. The old replay paths keep their existing split policy.
 const char *read_capacity_mode() {
     if (s2a_debug_entries_open()) {
         const char *v = std::getenv("S2A_DEBUG_CAPACITY_AFFINITY");
@@ -59,9 +69,14 @@ const char *read_capacity_mode() {
             if (!std::strcmp(v,"split")) return "split";
             if (!std::strcmp(v,"split2")) return "split2";
             if (!std::strcmp(v,"top2grp")) return "top2grp";
+            if (!std::strcmp(v,"tiered")) return "tiered";
         }
     }
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    return nvn_plat_flag("nvk_hot_cores", 1) ? "tiered" : "split";
+#else
     return "split";
+#endif
 }
 // pthread_create can be called before debug_env is installed. Observe without
 // freezing until the first guest role registers after debug environment seal.
@@ -78,6 +93,12 @@ void freeze_mode() {
 extern "C" void s2a_capacity_test_reset_mode() { frozen_mode.store(nullptr, std::memory_order_release); topology_failed=false; }
 #endif
 bool enabled() { return std::strcmp(capacity_mode(), "0") != 0; }
+bool tiered() { return std::strcmp(capacity_mode(), "tiered") == 0; }
+Slot *current_slot(pid_t tid) {
+    for (auto &s : slots) if (s.tid == tid) return &s;
+    auto w = workers.find(tid);
+    return w == workers.end() ? nullptr : &w->second.slot;
+}
 void debug_log(const char *fmt, ...) {
     if (!s2a_debug_entries_open()) return;
     va_list args; va_start(args, fmt); std::vfprintf(stderr, fmt, args); va_end(args);
@@ -95,21 +116,30 @@ void restore(Slot &s, int role, bool report) {
     else if(report) debug_log("[s2a-capacity] role=%d tid=%d boot_us=%lld restore=verified errno=0\n",role,s.tid,boot_us());
     clear(s);
 }
-// Fail closed to mode0 for both roles: a partial placement is not split.
-void fallback_to_mode0(int role, pid_t tid, const char *reason, int error) {
-    std::fprintf(stderr,"[s2a-capacity] fallback=mode0 role=%d tid=%d reason=%s errno=%d\n",role,tid,reason,error);
-    topology_failed=true;
+void restore_all() {
     for (int i=0; i<2; ++i) restore(slots[i],i,true);
+    for (auto &entry : workers) restore(entry.second.slot,entry.second.role,true);
+}
+void placement_failed(Slot &s, int role, const char *reason, int error) {
+    if (role > S2A_CAPACITY_RECORD) {
+        debug_log("[s2a-capacity] fallback=allowed role=%d tid=%d reason=%s errno=%d\n",role,s.tid,reason,error);
+        restore(s,role,true);
+        return;
+    }
+    // Fail closed to mode0 if either hot role cannot safely be placed.
+    std::fprintf(stderr,"[s2a-capacity] fallback=mode0 role=%d tid=%d reason=%s errno=%d\n",role,s.tid,reason,error);
+    topology_failed=true;
+    restore_all();
 }
 void apply(Slot &s,int role) {
   try {
     if(!s.tid || !foreground || stopping || topology_failed || !enabled() || s.applied) return;
     long cpus=sysconf(_SC_NPROCESSORS_CONF);
-    if(cpus<=0 || cpus>65536) { fallback_to_mode0(role,s.tid,"cpu-count",0); return; }
+    if(cpus<=0 || cpus>65536) { placement_failed(s,role,"cpu-count",0); return; }
     size_t n=static_cast<size_t>(cpus); s.bytes=CPU_ALLOC_SIZE(n); s.original=CPU_ALLOC(n); s.preferred=CPU_ALLOC(n); s.scratch=CPU_ALLOC(n);
-    if(!s.original || !s.preferred || !s.scratch) { fallback_to_mode0(role,s.tid,"allocation",ENOMEM); return; }
+    if(!s.original || !s.preferred || !s.scratch) { placement_failed(s,role,"allocation",ENOMEM); return; }
     CPU_ZERO_S(s.bytes,s.original); CPU_ZERO_S(s.bytes,s.preferred);
-    if(sched_getaffinity(s.tid,s.bytes,s.original)) { int er=errno; fallback_to_mode0(role,s.tid,"get-affinity",er); return; }
+    if(sched_getaffinity(s.tid,s.bytes,s.original)) { int er=errno; placement_failed(s,role,"get-affinity",er); return; }
     std::vector<s2a::CpuCapacity> cap; unsigned low=~0u,high=0;
     for(size_t i=0;i<n;++i) if(CPU_ISSET_S(i,s.bytes,s.original)) {
         char path[512];
@@ -120,7 +150,7 @@ void apply(Slot &s,int role) {
         std::snprintf(path,sizeof(path),"/sys/devices/system/cpu/cpu%zu/cpu_capacity",i);
 #endif
         FILE *f=std::fopen(path,"r"); unsigned v=0; int ok=f && std::fscanf(f,"%u",&v)==1 && v; if(f) std::fclose(f);
-        if(!ok) { fallback_to_mode0(role,s.tid,"capacity-unavailable",0); return; }
+        if(!ok) { placement_failed(s,role,"capacity-unavailable",0); return; }
         cap.push_back({static_cast<unsigned>(i),v}); if(v<low)low=v; if(v>high)high=v;
     }
     const char *mode=capacity_mode();
@@ -129,30 +159,59 @@ void apply(Slot &s,int role) {
         const char *reason = cap.size()<2 ? "insufficient-cpus" : "homogeneous";
         if ((!std::strcmp(mode,"split") || !std::strcmp(mode,"split2")) &&
             s2a::highest_capacity_cpus(cap).size() == 1) reason = "highest-group-single";
-        fallback_to_mode0(role,s.tid,reason,0); return;
+        if (role >= S2A_CAPACITY_BACKGROUND && cap.size() == 2 && low != high) reason = "no-spare-cpu";
+        placement_failed(s,role,reason,0); return;
     }
     for(unsigned i:selected) CPU_SET_S(i,s.bytes,s.preferred);
-    Slot &other=slots[1-role];
-    if ((!std::strcmp(mode,"split") || !std::strcmp(mode,"split2")) && other.applied && other.bytes==s.bytes && CPU_EQUAL_S(s.bytes,other.preferred,s.preferred)) {
-        fallback_to_mode0(role,s.tid,"split-collision",0); return;
+    if (role <= S2A_CAPACITY_RECORD && (tiered() || !std::strcmp(mode,"split") || !std::strcmp(mode,"split2"))) {
+        Slot &other=slots[1-role];
+        if (other.applied && other.bytes==s.bytes && CPU_EQUAL_S(s.bytes,other.preferred,s.preferred)) {
+            placement_failed(s,role,"split-collision",0); return;
+        }
     }
-    if(sched_setaffinity(s.tid,s.bytes,s.preferred)) { int er=errno; fallback_to_mode0(role,s.tid,"set-affinity",er); return; }
+    if(sched_setaffinity(s.tid,s.bytes,s.preferred)) { int er=errno; placement_failed(s,role,"set-affinity",er); return; }
     s.applied=true;
     cpu_set_t *actual=s.scratch;
     int er=0;
     if(actual && sched_getaffinity(s.tid,s.bytes,actual)) er=errno;
     if(actual && !er && !CPU_EQUAL_S(s.bytes,actual,s.preferred)) er=EAGAIN;
-    if (er) { fallback_to_mode0(role,s.tid,"apply-readback",er); return; }
+    if (er) { placement_failed(s,role,"apply-readback",er); return; }
     if (s2a_debug_entries_open()) debug_log("[s2a-capacity] role=%d tid=%d boot_us=%lld mode=%s allowed=%s requested=%s actual=%s capacity=%u..%u apply=verified errno=0\n",role,s.tid,boot_us(),mode,
         mask_string(s.original,s.bytes).c_str(),mask_string(s.preferred,s.bytes).c_str(),
         mask_string(actual,s.bytes).c_str(),low,high);
   } catch (...) {
     // Diagnostic allocation must not terminate the game; undo any placement we made.
-    fallback_to_mode0(role,s.tid,"allocation",ENOMEM);
+    placement_failed(s,role,"allocation",ENOMEM);
   }
 }
 }
-extern "C" void s2a_capacity_enter(int role) { if(role<0||role>1)return; freeze_mode(); if(!enabled())return; std::lock_guard<std::mutex> lock(mu); Slot &s=slots[role]; if(s.tid) return; s.tid=static_cast<pid_t>(syscall(SYS_gettid)); role_thread=true; apply(s,role); }
+extern "C" void s2a_capacity_enter(int role) {
+    if (role < S2A_CAPACITY_REPLAY || role > S2A_CAPACITY_AUDIO) return;
+    if (role > S2A_CAPACITY_RECORD && !tiered()) return;
+    freeze_mode();
+    if (!enabled()) return;
+    std::lock_guard<std::mutex> lock(mu);
+    if (stopping) return;
+    pid_t tid=static_cast<pid_t>(syscall(SYS_gettid));
+    Slot *s;
+    if (role <= S2A_CAPACITY_RECORD) {
+        s=&slots[role];
+        if (s->tid) return;
+    } else {
+        if (current_slot(tid)) return;
+        try {
+            s=&workers.emplace(tid, Worker{{},role}).first->second.slot;
+        } catch (...) {
+            debug_log("[s2a-capacity] fallback=allowed role=%d tid=%d reason=allocation errno=%d\n",role,tid,ENOMEM);
+            return;
+        }
+        worker_lifetime.role=role;
+    }
+    s->tid=tid; role_thread=true; apply(*s,role);
+}
+extern "C" void s2a_capacity_nvk_record_enter(void) { if (tiered()) s2a_capacity_enter(S2A_CAPACITY_RECORD); }
+extern "C" void s2a_capacity_guest_enter(void) { s2a_capacity_enter(S2A_CAPACITY_GUEST); }
+extern "C" void s2a_capacity_audio_enter(void) { s2a_capacity_enter(S2A_CAPACITY_AUDIO); }
 // 新建的游戏线程进游戏代码之前调：Linux 上新线程继承创建者的亲和掩码，角色线程（游戏主线程）被收窄到一个核之后，
 // 它建出来的游戏线程会全部挤在那一个核上——游戏的作业系统是「几条线程并行干活、主线程自旋等它们干完」，同核轮转时
 // 自旋的那条把时间片吃掉、干活的排不上（真机取样：一局标题画面 73% 的 CPU 在那个自旋循环里，三条游戏线程的掩码都是同一个核）。
@@ -172,13 +231,33 @@ extern "C" void s2a_capacity_child(void) {
         std::free(cur);
     }
 }
-extern "C" void s2a_capacity_leave(int role) { if(role<0||role>1||!enabled())return; std::lock_guard<std::mutex> lock(mu); Slot &s=slots[role]; if(s.tid!=syscall(SYS_gettid))return; restore(s,role,true); s.tid=0; role_thread=false; }
-extern "C" void s2a_capacity_foreground(int fg) { if(!enabled())return; std::lock_guard<std::mutex> lock(mu); if(stopping)return; foreground=fg!=0; for(int i=0;i<2;++i) if(foreground)apply(slots[i],i);else restore(slots[i],i,true); }
+extern "C" void s2a_capacity_leave(int role) {
+    if (role < S2A_CAPACITY_REPLAY || role > S2A_CAPACITY_AUDIO || !role_thread) return;
+    std::lock_guard<std::mutex> lock(mu);
+    pid_t tid=static_cast<pid_t>(syscall(SYS_gettid));
+    if (role <= S2A_CAPACITY_RECORD) {
+        Slot &s=slots[role]; if (s.tid != tid) return;
+        restore(s,role,true); s.tid=0;
+    } else {
+        auto w=workers.find(tid); if (w == workers.end() || w->second.role != role) return;
+        restore(w->second.slot,role,true); workers.erase(w); worker_lifetime.role=-1;
+    }
+    role_thread = current_slot(tid) != nullptr;
+}
+extern "C" void s2a_capacity_foreground(int fg) {
+    if (!enabled()) return;
+    std::lock_guard<std::mutex> lock(mu);
+    if (stopping) return;
+    foreground=fg!=0;
+    if (!foreground) { restore_all(); return; }
+    for (int i=0; i<2; ++i) apply(slots[i],i);
+    for (auto &entry : workers) apply(entry.second.slot,entry.second.role);
+}
 // 诊断只低频观察线程掩码；枚举不是原子快照，退出/权限/长度上限均明确报不完整。
 static void sample_thread_masks() {
     if (!s2a_debug_entries_open()) return;
     const char *v=std::getenv("S2A_DEBUG_CAPACITY_AFFINITY");
-    if (!v || (std::strcmp(v,"0") && std::strcmp(v,"1") && std::strcmp(v,"split") && std::strcmp(v,"split2") && std::strcmp(v,"top2grp"))) return;
+    if (!v || (std::strcmp(v,"0") && std::strcmp(v,"1") && std::strcmp(v,"split") && std::strcmp(v,"split2") && std::strcmp(v,"top2grp") && std::strcmp(v,"tiered"))) return;
     static long long last=0;
     long long begin=boot_us(); if(begin<0 || (last && begin-last<15000000LL)) return; last=begin;
     try {
@@ -193,8 +272,14 @@ static void sample_thread_masks() {
                 for(int i=0;i<2;++i) if(slots[i].applied && slots[i].tid==static_cast<pid_t>(record.tid)) {
                     original=mask_string(slots[i].original,slots[i].bytes); coverage=i==0?"role0":"role1";
                 }
+                auto worker=workers.find(static_cast<pid_t>(record.tid));
+                if (worker!=workers.end() && worker->second.slot.applied) {
+                    const auto &w=worker->second;
+                    original=mask_string(w.slot.original,w.slot.bytes);
+                    coverage=w.role==S2A_CAPACITY_GUEST?"guest":w.role==S2A_CAPACITY_AUDIO?"audio":"background";
+                }
                 auto it=wrapped_original.find(static_cast<pid_t>(record.tid));
-                if(it!=wrapped_original.end()) { original=it->second; coverage="wrapped"; }
+                if(coverage=="unknown" && it!=wrapped_original.end()) { original=it->second; coverage="wrapped"; }
             }
             std::string item=std::to_string(record.tid)+":"+record.name+":"+record.mask+":"+original+":"+coverage+";";
             if (!group.empty() && group.size()+item.size()>1024) {
@@ -221,7 +306,7 @@ extern "C" void s2a_capacity_check(void) {
     }
 }
 
-extern "C" void s2a_capacity_stop(void) { if(!enabled())return; std::lock_guard<std::mutex> lock(mu); stopping=true; foreground=false; for(int i=0;i<2;++i) restore(slots[i],i,true); }
+extern "C" void s2a_capacity_stop(void) { if(!enabled())return; std::lock_guard<std::mutex> lock(mu); stopping=true; foreground=false; restore_all(); }
 
 #if defined(S2A_CAPACITY_WRAP)
 // Linker --wrap covers references in this shared object's own objects / static
@@ -275,19 +360,24 @@ static void *child_entry(void *raw) {
     return returned;
 }
 extern "C" int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(void *), void *arg) {
-    if (!role_thread || std::strcmp(capacity_mode(),"split2")) return __real_pthread_create(thread,attr,start,arg);
+    if (!role_thread || (!tiered() && std::strcmp(capacity_mode(),"split2"))) return __real_pthread_create(thread,attr,start,arg);
     ChildAffinity *child=nullptr; bool role_found=false;
     {
         std::lock_guard<std::mutex> lock(mu);
         pid_t tid=static_cast<pid_t>(syscall(SYS_gettid));
-        for (auto &s:slots) if(s.applied && s.tid==tid) {
+        Slot *known=current_slot(tid);
+        if (known && known->applied) {
+            auto &s=*known;
             role_found=true;
             child=static_cast<ChildAffinity *>(std::calloc(1,sizeof(*child)));
-            if (!child) break;
-            child->bytes=s.bytes; child->original=CPU_ALLOC(s.bytes*8); child->preferred=CPU_ALLOC(s.bytes*8);
-            if (!child->original || !child->preferred) { if(child->original)CPU_FREE(child->original); if(child->preferred)CPU_FREE(child->preferred); std::free(child); child=nullptr; break; }
-            std::memcpy(child->original,s.original,s.bytes); std::memcpy(child->preferred,s.preferred,s.bytes);
-            child->start=start; child->arg=arg; break;
+            if (child) {
+                child->bytes=s.bytes; child->original=CPU_ALLOC(s.bytes*8); child->preferred=CPU_ALLOC(s.bytes*8);
+                if (!child->original || !child->preferred) { if(child->original)CPU_FREE(child->original); if(child->preferred)CPU_FREE(child->preferred); std::free(child); child=nullptr; }
+                else {
+                    std::memcpy(child->original,s.original,s.bytes); std::memcpy(child->preferred,s.preferred,s.bytes);
+                    child->start=start; child->arg=arg;
+                }
+            }
         }
     }
     if(!child) { if(role_found) debug_log("[s2a-capacity-child] error=capture-allocation\n"); return __real_pthread_create(thread,attr,start,arg); }
@@ -329,16 +419,18 @@ void *wide_call_worker(void *raw) {
 }
 }
 extern "C" int s2a_capacity_call_wide(int (*operation)(void *), void *argument, int *result) {
-    if (!role_thread || std::strcmp(capacity_mode(),"split2")) return 0;
+    if (!role_thread || (!tiered() && std::strcmp(capacity_mode(),"split2"))) return 0;
     if (!operation || !result) return -EINVAL;
     WideCall job{}; job.operation=operation; job.argument=argument;
     pid_t caller=static_cast<pid_t>(syscall(SYS_gettid)); job.caller=caller;
     {
         std::lock_guard<std::mutex> lock(mu);
-        for (auto &s:slots) if (s.applied && s.tid==caller) {
+        Slot *known=current_slot(caller);
+        if (known && known->applied) {
+            auto &s=*known;
             job.bytes=s.bytes; job.original=CPU_ALLOC(s.bytes*8); job.preferred=CPU_ALLOC(s.bytes*8);
             if (!job.original || !job.preferred) { if(job.original)CPU_FREE(job.original); if(job.preferred)CPU_FREE(job.preferred); return -ENOMEM; }
-            std::memcpy(job.original,s.original,s.bytes); std::memcpy(job.preferred,s.preferred,s.bytes); break;
+            std::memcpy(job.original,s.original,s.bytes); std::memcpy(job.preferred,s.preferred,s.bytes);
         }
     }
     if (!job.original) { debug_log("[s2a-capacity-call] caller=%d boot_us=%lld skip=not-role\n",caller,boot_us()); return 0; }

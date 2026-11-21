@@ -4,12 +4,13 @@
 #include "replay_pass_barrier_fixture.h"
 #include "rp_state.h"
 #include "rp_res.h"
-#include "rp_shader.h"
+#include "no_libpack_fixture.h"
 #include "nvn_unimpl.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
 #include "vk_device.h"
 #include "nvn_plat_vk.h"
+#include "nvn_vk_pass_or.h"
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -18,6 +19,8 @@
 #include <stdalign.h>
 #include <time.h>
 extern uint64_t nvn_vk_dbg_dq_recs(void);
+uint64_t nvn_vk_nvnbar_state(void);
+void nvn_vk_nvnbar_submit(uint64_t now);
 static nvn_gpu_err err;
 static atomic_int retired;
 static unsigned failures;
@@ -28,7 +31,8 @@ VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
 static int hz_flag=2;
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_opt_layout"))return !!getenv("S2A_REPLAY_INDIRECT_OPT_LAYOUT");if(!strcmp(n,"nvk_binst_hoist"))return hz_flag;return !strcmp(n,"nvk_dq")?!!getenv("S2A_REPLAY_INDIRECT_DQ"):d;}
+static int depth_ab_seconds;
+int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_opt_layout"))return !!getenv("S2A_REPLAY_INDIRECT_OPT_LAYOUT");if(!strcmp(n,"nvk_binst_hoist"))return hz_flag;if(!strcmp(n,"nvk_nvnbar_ab"))return depth_ab_seconds;return !strcmp(n,"nvk_dq")?!!getenv("S2A_REPLAY_INDIRECT_DQ"):d;}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 static void retirement(void *u){(void)u;atomic_fetch_add(&retired,1);}
@@ -62,6 +66,7 @@ uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return 1
 int rp_fence_done(uint64_t f){(void)f;return 1;}
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;rp_gpu_wr_gen++;return active;}   // 同 rp_exec.c：同步落主段 = 主段里写了镜像
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 int rp_post_gpu_write(uint64_t a,uint64_t n){(void)a;(void)n;return 0;}
 int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t base=(uint64_t)(uintptr_t)guest;if(a<base||n>sizeof guest||a-base>sizeof guest-n)return 0;if(m)*m=guest;if(s)*s=sizeof guest;return 1;}
 // Deliberately untracked pool: every resolve resynchronizes CPU pages, so real
@@ -214,9 +219,11 @@ static void run_depth_state_restore(struct s2a_vk_device *d,const char *dir) {
  rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);nvn_gpu_buf_release(rb,NULL,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
  puts("depth-state: 4096 green pixels after helper; 32 sentinel bytes preserved");
 }
-static void run_depth_copy(struct s2a_vk_device *d) {
+static void run_depth_copy(struct s2a_vk_device *d, unsigned ab_seconds) {
+ depth_ab_seconds=(int)ab_seconds;
  nvn_gpu_open_desc od={0};od.host_device=d;od.app_label="real-depth-copy";GPU(nvn_gpu_open(&od,&err));
- test_depth_blit();GPU(nvn_gpu_close(5000000000ull,&err));
+ test_depth_blit(ab_seconds);GPU(nvn_gpu_close(5000000000ull,&err));
+ depth_ab_seconds=0;
 }
 // Independent oracle: StateUpdater flips API winding when queue flip is off,
 // EnumConversion inverts GAL for Vulkan, and C80 defines the viewport sign.
@@ -294,6 +301,58 @@ static void run_hoist(struct s2a_vk_device *d,const char *dir,int mode){
  if(id)rp_buf_gpu_write_land(key,id,0);
  g_track=0;hz_flag=2;rp_R.has_sc=0;rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);int t=atomic_load(&retired)+1;nvn_gpu_buf_release(rb,retirement,NULL);struct timespec pause={0,1000000};for(int i=0;i<5000&&atomic_load(&retired)<t;i++)nanosleep(&pause,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
+static void run_guard_or(struct s2a_vk_device *d, const char *dir) {
+    nvn_gpu_open_desc od = {.host_device = d, .app_label = "real-gpu-guard-or"};
+    GPU(nvn_gpu_open(&od, &err));
+    const struct nvn_vk_pass_or_domain domain = {4608, 576, 508 + 32, 252 + 32};
+    const uint64_t range = 2654240;
+    const uint64_t off = d->properties.limits.minStorageBufferOffsetAlignment;
+    nvn_gpu_layout_ent ent = {.cls = NVN_GPU_RES_SSBO, .count = 1, .access = NVN_GPU_ACC_RW, .stages = 1u << NVN_GPU_SH_CS};
+    nvn_gpu_layout lay = {.ent = &ent, .nent = 1, .push_bytes = 8};
+    nvn_gpu_shader writer = shader(dir, "replay_binst_args.comp", NVN_GPU_SH_CS, &lay);
+    nvn_gpu_stage_desc sd = {.sh = writer};
+    nvn_gpu_pipe producer = NULL;
+    GPU(nvn_gpu_cpipe_get(&sd, NVN_GPU_PIPE_SYNC, &producer, &err));
+    nvn_gpu_shader_release(writer);
+    nvn_gpu_buf src = buffer(off + range, NULL);
+    nvn_gpu_buf dst = buffer(sizeof(struct nvn_vk_pass_or_value), NULL);
+    for (int k = 0; k < 5; k++) {
+        memset(nvn_gpu_buf_cpu(src), 0, off + range);
+        memset(nvn_gpu_buf_cpu(dst), 0, sizeof(struct nvn_vk_pass_or_value));
+        nvn_gpu_cmd c = NULL;
+        GPU(nvn_gpu_cmd_begin(NULL, &c, &err));
+        const nvn_gpu_binding b = {.cls = NVN_GPU_RES_SSBO, .u.b = {src, off, range}};
+        if (k == 1 || k == 2 || k == 3) {
+            const uint32_t field = k == 2 ? domain.field1 : domain.field0;
+            const uint32_t words[] = {((domain.count - 1) * domain.stride + field) / 4, k == 2 ? 0x400u : 0x200u};
+            nvn_gpu_set_pipe(c, producer);
+            nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1);
+            nvn_gpu_push(c, NVN_GPU_SH_CS, 0, words, sizeof words);
+            nvn_gpu_dispatch(c, producer, 1, 1, 1, NULL, 0);
+        }
+        const int recorded = nvn_vk_pass_or_record(c, src, off, k == 4 ? range - 128 : range, dst, 0, domain);
+        if (k == 3) {
+            // The following producer reuses the guest compute pipeline and
+            // descriptor. It must not overwrite the probe's input early.
+            const uint32_t words[] = {((domain.count - 1) * domain.stride + domain.field0) / 4, 0x800u};
+            nvn_gpu_push(c, NVN_GPU_SH_CS, 0, words, sizeof words);
+            nvn_gpu_dispatch(c, producer, 1, 1, 1, NULL, 0);
+        }
+        GPU(nvn_gpu_cmd_commit(c, (uint64_t)k + 1, done, NULL, &err));
+        GPU(nvn_gpu_fence_wait((uint64_t)k + 1, 5000000000ull, &err));
+        struct nvn_vk_pass_or_value out;
+        memcpy(&out, nvn_gpu_buf_cpu(dst), sizeof out);
+        const unsigned want0 = k == 1 || k == 3 ? 0x200 : 0, want1 = k == 2 ? 0x400 : 0;
+        printf("guard-or case=%d recorded=%d valid=%u words=%x/%x expected=%x/%x\n", k, recorded,
+               out.valid, out.field0, out.field1, want0, want1);
+        if (recorded != (k != 4) || out.valid != (unsigned)(k != 4) || out.field0 != want0 || out.field1 != want1)
+            failures++;
+    }
+    nvn_gpu_buf_release(src, NULL, NULL);
+    nvn_gpu_buf_release(dst, NULL, NULL);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+}
+
 #include "mirror_blit_test.h"
 int main(int argc,char **argv) {
  int depth_only=argc==3&&!strcmp(argv[2],"--depth-only");
@@ -305,6 +364,7 @@ int main(int argc,char **argv) {
  if(hoist_only){for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
  if(mirror_only){run_color_mirror(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
  if(!depth_only){
+  run_guard_or(&d,argv[1]);
   for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);   // 通道级批量拷（rp_draw.c nvk_binst_hoist）
   for(int index=0;index<3;index++){run_case(&d,argv[1],index,0);run_case(&d,argv[1],index,2);run_case(&d,argv[1],index,4);run_case(&d,argv[1],index,3);}
   for(int index=0;index<3;index++)for(int mode=10;mode<=22;mode++){if(!index&&((mode>=13&&mode<=15)||mode>=20))continue;run_case(&d,argv[1],index,mode);}
@@ -312,7 +372,9 @@ int main(int argc,char **argv) {
   run_depth_state_restore(&d,argv[1]);
   run_front_origin(&d,argv[1]);
  }
- run_depth_copy(&d);
+ run_depth_copy(&d,0);
+ const char *probe=getenv("S2A_TEST_NVK_NVNBAR");
+ if(probe&&!strcmp(probe,"1"))run_depth_copy(&d,30);
  if(!depth_only)run_color_mirror(&d);
  uint64_t dq=nvn_vk_dbg_dq_recs();REQUIRE(getenv("S2A_REPLAY_INDIRECT_DQ")?dq>0:dq==0);
  printf("DQ records=%llu\n",(unsigned long long)dq);REQUIRE(!s2a_vk_device_destroy(&d,1));
