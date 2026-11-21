@@ -28,6 +28,26 @@ int main() {
     assert((capacity_cpus(elite,"split",1)==std::vector<unsigned>{6}));
     assert((capacity_cpus(elite,"split2",0)==std::vector<unsigned>{7}));
     assert((capacity_cpus(elite,"split2",1)==std::vector<unsigned>{6}));
+    // Tiered: replay and recording each keep a core, guest workers stay on the remaining performance cores.
+    assert((capacity_cpus(d9000,"tiered",0)==std::vector<unsigned>{7}));
+    assert((capacity_cpus(d9000,"tiered",1)==std::vector<unsigned>{6}));
+    assert((capacity_cpus(d9000,"tiered",2)==std::vector<unsigned>{5,4}));
+    assert((capacity_cpus(d9000,"tiered",3)==std::vector<unsigned>{5,4}));
+    assert((capacity_cpus(d9000,"tiered",4)==std::vector<unsigned>{5,4}));
+    assert((capacity_cpus(elite,"tiered",0)==std::vector<unsigned>{7}));
+    assert((capacity_cpus(elite,"tiered",1)==std::vector<unsigned>{6}));
+    assert((capacity_cpus(elite,"tiered",2)==std::vector<unsigned>{5,4,3,2,1,0}));
+    assert((capacity_cpus(elite,"tiered",3)==std::vector<unsigned>{5,4,3,2,1,0}));
+    assert((capacity_cpus(elite,"tiered",4)==std::vector<unsigned>{5,4,3,2,1,0}));
+    assert((capacity_cpus(restricted,"tiered",0)==std::vector<unsigned>{6}));
+    assert((capacity_cpus(restricted,"tiered",1)==std::vector<unsigned>{5}));
+    assert((capacity_cpus(restricted,"tiered",2)==std::vector<unsigned>{4}));
+    const std::vector<CpuCapacity> big_little{{7,256},{2,1024},{30,256},{19,1024}};
+    assert((capacity_cpus(big_little,"tiered",2)==std::vector<unsigned>{19,2})); // no other fast CPU
+    assert((capacity_cpus(big_little,"tiered",3)==std::vector<unsigned>{30,7}));
+    assert(capacity_cpus({{0,512}},"tiered",0).empty());
+    assert(capacity_cpus({{0,512},{1,512}},"tiered",0).empty());
+    assert(capacity_cpus({{0,0},{1,512}},"tiered",1).empty());
     assert((capacity_cpus(three,"top2grp",0)==std::vector<unsigned>{7,6,1}));
     assert(capacity_cpus({{0,512}},"split",0).empty());
     assert(capacity_cpus({{0,0},{1,512}},"split",0).empty());

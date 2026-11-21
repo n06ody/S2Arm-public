@@ -60,6 +60,34 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
+    if len(sys.argv) == 2 and sys.argv[1] in ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop'):
+        result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if sys.argv[1:] == ['--live-compile-mutants']:
+        text = original.read_text()
+        mutants = [
+            ('default-off', 'nvn_plat_flag("nvk_live_compile_async", 1)', 'nvn_plat_flag("nvk_live_compile_async", 0)',
+             '--live-compile-thread', 'compiler ran on the submitting thread'),
+            ('inline', '    if (g_live_compile != 1) {', '    if (1) {',
+             '--live-compile-thread', 'compiler ran on the submitting thread'),
+            ('request-bytes-ignored', '    s2a_sha256_update(&hash, json, len);', '    (void)json; (void)len;',
+             '--live-compile-thread', 'compute first use publishes the real compiled program'),
+            ('pending-marked-failed', '        return LIVE_PENDING;', '        return LIVE_ABORT;',
+             '--live-compile-pending', 'exhausted safe budget must defer'),
+        ]
+        for name, old, new, mode, expected in mutants:
+            assert text.count(old) == 1, (name, 'mutation anchor')
+            mutant = out / ('live-mutant-' + name + '.c')
+            mutant.write_text(text.replace(old, new))
+            result = run('live-mutant-' + name, mutant, args=(mode,))
+            assert result.returncode == 1 and expected in result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print(f'PASS: {len(mutants)} live compile negative controls')
+        return 0
+
     if sys.argv[1:] == ['--compute-warm-mutants']:
         text = original.read_text()
         mutants = [
@@ -92,16 +120,15 @@ def main():
 
     if sys.argv[1:] == ['--diag-mutants']:
         code = original.read_text()
-        for name, old, expected in (
-            ('graphics', 'uint64_t trace = diag_begin(s->identity, s->stages, !background);', 'graphics live compile emits paired event'),
-            ('compute', 'uint64_t trace = diag_begin(rq.identity, 32u, 1);', 'compute live compile emits paired event'),
-        ):
-            assert code.count(old) == 1
-            path = out / ('trace-mutant-' + name + '.c')
-            path.write_text(code.replace(old, 'uint64_t trace = 0;'))
-            result = run('trace-mutant-' + name, path, args=('--diag-compile',))
-            assert result.returncode and expected in result.stderr and 'error:' not in result.stderr, (result.stdout, result.stderr)
-            print(f'PASS: {name} event removal produces expected behavior failure')
+        old = 'const uint64_t trace = diag_begin(identity, stages, 1);'
+        assert code.count(old) == 1
+        path = out / 'trace-mutant.c'
+        path.write_text(code.replace(old, 'const uint64_t trace = 0; (void)identity; (void)stages; (void)diag_begin;'))
+        result = run('trace-mutant', path, args=('--diag-compile',))
+        assert result.returncode == 1 and 'error:' not in result.stderr, (result.stdout, result.stderr)
+        for stage in ('graphics', 'compute'):
+            assert f'{stage} live compile emits paired event' in result.stderr, result.stderr
+            print(f'PASS: {stage} event removal produces expected behavior failure')
         return 0
 
     if sys.argv[1:] == ['--gs-libpack-mutants']:
@@ -365,7 +392,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --compute-warm-mutants | --diag-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'
@@ -388,6 +415,11 @@ def main():
     result = run('test', original)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
+    live_rc = 0
+    for mode in ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop'):
+        live = subprocess.run([str(out/'test'), mode], capture_output=True, text=True, timeout=30)
+        sys.stdout.write(live.stdout); sys.stderr.write(live.stderr)
+        live_rc = live_rc or live.returncode
     # 三段程序（vs + fs + gs）查出包预编库：环境变量与深度能力缓存是进程级的，单独起一个进程
     gsl = run('test-gs-libpack', original, args=('--gs-libpack',))
     sys.stdout.write(gsl.stdout); sys.stderr.write(gsl.stderr)
@@ -405,7 +437,7 @@ def main():
         env.update(S2A_COMPUTE_WARM='0', S2A_DIRECT_CACHE_DIR=str(cache_off))
         cs_off = run('test-compute-warm-off', original, args=('--compute-warm-off',), env=env)
         sys.stdout.write(cs_off.stdout); sys.stderr.write(cs_off.stderr)
-    return result.returncode or gsl.returncode or off.returncode or on.returncode or cs_off.returncode
+    return result.returncode or live_rc or gsl.returncode or off.returncode or on.returncode or cs_off.returncode
 
 if __name__ == '__main__':
     raise SystemExit(main())

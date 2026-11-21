@@ -5,7 +5,7 @@
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
-#include "rp_shader.h"
+#include "no_libpack_fixture.h"
 #include "nvn_unimpl.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
@@ -60,6 +60,7 @@ int rp_fence_done(uint64_t f){return f<=nvn_gpu_fence_done();}
 static nvn_gpu_cmd active;
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 // GPU 写回登记：同 rp_exec.c 交给 rp_buf 的排除表；收尾不回写游戏内存
 static uint64_t wkey[4],wid[4];static int nw;
 int rp_post_gpu_write(uint64_t a,uint64_t n){if(nw>=4){return 0;}wid[nw]=rp_buf_gpu_write_note(a,n,&wkey[nw]);if(!wid[nw]){return 0;}nw++;return 1;}
@@ -146,6 +147,10 @@ VkResult __wrap_vkCreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,c
   deps=calloc(ci->dependencyCount,sizeof *deps);REQUIRE(deps);memcpy(deps,ci->pDependencies,ci->dependencyCount*sizeof *deps);
   for(uint32_t i=0;i<ci->dependencyCount;i++){
    if(deps[i].srcStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)deps[i].srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+   // 关跟踪的臂要单独证明探测器能看到 RAW。开档另有显式入向计算依赖，
+   // 只在这个负控撤掉它；其余传输 / 主机发布保留，正向臂仍跑真实开档依赖。
+   if(disable_compute_access&&deps[i].srcSubpass==VK_SUBPASS_EXTERNAL)
+    deps[i].srcStageMask&=~VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
    if(deps[i].dstStageMask==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)deps[i].dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
   }copy.pDependencies=deps;ci=&copy;
  }

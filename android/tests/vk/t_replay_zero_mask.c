@@ -5,7 +5,7 @@
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
-#include "rp_shader.h"
+#include "no_libpack_fixture.h"
 #include "nvn_unimpl.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
@@ -62,6 +62,7 @@ uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return 1
 int rp_fence_done(uint64_t f){return !f || completed;}
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 int rp_occl_want(void){return 0;}void rp_occl_pass_opened(int d){REQUIRE(!d);}
 void rp_occl_pass_closed(void){}void rp_occl_pause(nvn_gpu_cmd c){(void)c;}
 static uint64_t write_key,write_id;

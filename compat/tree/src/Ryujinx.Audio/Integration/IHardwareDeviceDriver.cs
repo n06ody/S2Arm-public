@@ -34,6 +34,9 @@ namespace Ryujinx.Audio.Integration
         //   声道数照旧只看 SupportsChannelCount(6)，不走这里
         string? S2AActiveDeviceName() => null;
 
+        // Called once on an owned renderer thread before it starts processing audio.
+        void S2AConfigureRenderThread() { }
+
         static abstract bool IsSupported { get; }
 
         IHardwareDeviceDriver GetRealDeviceDriver()

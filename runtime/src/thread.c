@@ -818,6 +818,9 @@ static void thread_bind_host(thr_t *t) {
 }
 static void svc_exit(thr_t *t);
 static void samecore_init(void);
+#if defined(__ANDROID__)
+extern void s2a_capacity_guest_enter(void) __attribute__((weak));
+#endif
 static void *thread_main(void *p) {
     thr_t *t = p;
 #if defined(__APPLE__)
@@ -833,6 +836,7 @@ static void *thread_main(void *p) {
 #if (defined(__ANDROID__) || defined(__OHOS__))
     int s2a_android_runtime_enter_guest_thread(void);
     if (s2a_android_runtime_enter_guest_thread()) die("Android guest线程准入失败");
+    if (!hostent && s2a_capacity_guest_enter) s2a_capacity_guest_enter();
 #endif
     // S2A_CORES：进游戏代码前先取核（同 Horizon：线程被调度上核才开始跑）；原先到第一次系统调用才取，期间不持核在跑、同核可 ≥2（调度计数 / t_thread ⑯ 抓到）。
     // 走系统调用出口同一条路：等核期间算在系统调用里（暂停方不去 Mach 挂起它），出来前认暂停

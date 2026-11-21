@@ -3,6 +3,9 @@
 #include "nvn_vk_prog_warm.h"
 #include "nvn_vk_pipe_warm.h"
 #include "nvn_plat.h"
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../capacity_affinity.h"
+#endif
 
 #include <errno.h>
 #include <pthread.h>
@@ -217,6 +220,9 @@ static void warm_leave(void) {
 static void *warm_saver_main(void *unused) {
     (void)unused;
     warm_thread_name("nvk-warm-save");
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     warm_persist_stop();
     return NULL;
 }
@@ -237,6 +243,9 @@ static void *warm_main(void *unused) {
         setpriority(PRIO_PROCESS, 0, 5);
         warm_thread_name("nvk-warm");
     }
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     g_t0 = warm_now_ms();
     int loaded = warm_load();
     if (loaded == -1) {   // 载入重试期间就收到 Stop：照常落盘退出（清单落盘归本线程）
