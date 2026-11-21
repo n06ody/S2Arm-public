@@ -118,7 +118,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
         td.d.target = s->target; td.d.format = s->nvn_format;
         td.d.width = s->w; td.d.height = s->h; td.d.depth = s->depth;
         td.d.levels = s->levels; td.d.samples = s->samples;
-        td.usage = NVN_GPU_TEX_SAMPLED | ((s->view_fmt || s->fmt_n) ? NVN_GPU_TEX_VIEW_FMT : 0);   // 列表模式的源（保 UBWC）也要能按孪生格式看
+        td.usage = NVN_GPU_TEX_SAMPLED | ((s->view_fmt || s->want_view) ? NVN_GPU_TEX_VIEW_FMT : 0);   // 源可能要异格式视图（已可变或声明过）：快照同样保留按需重建的资格
         nvn_gpu_tex th = NULL; nvn_gpu_err err = {0};
         nvn_gpu_rc r = nvn_gpu_tex_create(&td, &th, &err);
         if (!nvn_gpu_ok(r)) { set_sticky(c, r.code, "feedback texture: %s", err.why); return 0; }
@@ -183,6 +183,7 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
         if (!feedback_make(c, f)) return 0;
     c->feedback_read_mask = read_mask;
     nvn_gpu_pass_begin(c, &d);
+    nvn_vk_pass_capture_reason(c, copy ? "feedback-copy" : read_mask ? "feedback-read" : "feedback-restore");
     if (cont_ok && rc_is(c->sticky, NVN_GPU_OK)) occl_spare_begin(c, occ, &cont);   // 新通道里接着数
     return rc_is(c->sticky, NVN_GPU_OK);
 }

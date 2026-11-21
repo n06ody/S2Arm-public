@@ -41,6 +41,14 @@ static class Program
     // TEXS.2D Rd(仅 R 分量), Ra = x, Rb = y；TidB = 驱动常量段 c2 里的句柄字偏移（8 → 0x20 = 纹理槽 0）
     static ulong Texs2D(int rd, int ra, int rb, int tid) => 0xd800000000000000UL | (1UL << 53) | ((ulong)tid << 36) | (255UL << 28) | ((ulong)rb << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
 
+    // SULD.D Rd, [Ra…]：非 bindless 的表面读——TidB = c2 图像表槽位号；格式按读的大小定（Size 4 = B32 → R32Uint、5 = B64 → R32G32Uint），
+    //   空轨 2nd 的 post_tonemap_update（读上一帧曝光的 1x1）与 set_texture_alpha 同型；Dim 3 = _2d。
+    static ulong SuldD(int rd, int ra, int tid, int dim, int size) =>
+        0xeb18000000000000UL | ((ulong)tid << 36) | ((ulong)dim << 33) | (7UL << 30) | ((ulong)size << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
+    // SUST.D [Ra…], Rd 写出值——同槽位有写就并入 ImageStore 用途，声明照旧必须具体格式（无格式写能力还没进 profile）
+    static ulong SustD(int rd, int ra, int tid, int dim, int size) =>
+        0xeb38000000000000UL | ((ulong)tid << 36) | ((ulong)dim << 33) | (7UL << 30) | ((ulong)size << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
+
     static byte[] Bundles(byte[] head, ulong[] ops)
     {
         int n = (ops.Length + 2) / 3 * 3;
@@ -115,6 +123,21 @@ static class Program
         }
         return vars.Where(v => v.Value is 0 or 2 or 12 && bind.ContainsKey(v.Key))
                    .ToDictionary(v => names.GetValueOrDefault(v.Key, "%" + v.Key), v => (set.GetValueOrDefault(v.Key, uint.MaxValue), bind[v.Key], touched.Contains(v.Key)));
+    }
+
+    // 全部 OpTypeImage 的（dim, Sampled, Image Format 操作数）：OpTypeImage %id %采样类型 %dim %depth %arrayed %ms %sampled %format
+    static List<(uint Dim, uint Sampled, uint Fmt)> ImageFormats(byte[] spv)
+    {
+        var w = new uint[spv.Length / 4]; Buffer.BlockCopy(spv, 0, w, 0, w.Length * 4);
+        var list = new List<(uint, uint, uint)>();
+        for (int i = 5; i < w.Length;)
+        {
+            int n = (int)(w[i] >> 16), op = (int)(w[i] & 0xffff);
+            if (n == 0) throw new InvalidDataException("bad SPIR-V word count");
+            if (op == 25 && n >= 9) list.Add((w[i + 3], w[i + 7], w[i + 8]));
+            i += n;
+        }
+        return list;
     }
 
     // 阶段号（期望表，照卡面口径手写）：绑定号 = arg_id × 6 + 阶段号
@@ -279,6 +302,30 @@ static class Program
         Check("⑨ 出包模式（PackOut）：输出目录不建、json 取自 PackFiles、_b.spv 进 PackSpv 且与落盘那份逐字节相同",
             packed != null && packed.Contains(pk + "_b.spv") && !Directory.Exists(packDir) && DshCompiler.PackFiles?.ContainsKey(pk + "_b.json") == true
             && inMem != null && inMem.AsSpan().SequenceEqual(File.ReadAllBytes(Path.Combine(outDir, pk + "_b.spv"))), why9);
+
+        // ⑬ 非缓冲存储图像的只读按位读：OpTypeImage 的 Image Format 必须是 Unknown（与现编同口径，#1774 ②）。
+        //   SULD.D.2D.B32 / B64 只读不写——Raw 放行后翻译器按宿主「按字节数绑同数值类视图」的契约声明 Unknown；
+        //   修前声明 R32Uint / R32G32Uint，安卓回放 image_view_format 按声明字节数与绑定视图比对 → 尺寸不合整笔 dispatch 被 skip
+        //   （8E post_tonemap_update b56206eabdd3e4df / set_texture_alpha 6ee1fa73e2b1b220 同型实机证：compute_image_decl_format_size_mismatch 每帧一条，tonemap 不落 → 世界黑）。
+        var imgHead = new byte[0x100]; BitConverter.TryWriteBytes(imgHead.AsSpan(0), 0x12345679u);
+        foreach (var (shape, size, mark) in new[] { ("SULD.D.2D.B32（post_tonemap_update 形）", 4, (byte)9), ("SULD.D.2D.B64（set_texture_alpha 形）", 5, (byte)10) })
+        {
+            var ictl = new byte[0x880]; ictl[0x10] = mark;
+            var icode = Bundles(imgHead, new[] { SuldD(4, 0, 1, 3, size), EXIT });
+            var ifmts = ImageFormats(DshCompiler.TranslateForVulkan("cs", icode, ictl, root).Spv);
+            Check($"⑬ cs {shape}：存储图像 OpTypeImage Format = Unknown（{ifmts.Count} 个声明）",
+                ifmts.Count > 0 && ifmts.All(f => f.Fmt == 0),
+                string.Join(",", ifmts.Select(f => $"dim{f.Dim} sampled{f.Sampled} fmt{f.Fmt}")));
+        }
+        {
+            // ⑬ 守卫：同槽位有写（ImageStore 用途并集）时照旧必须具体格式——Raw 放行只放松只读绑定，不能顺手把写绑定也放成 Unknown
+            var ictl = new byte[0x880]; ictl[0x10] = 11;
+            var icode = Bundles(imgHead, new[] { SuldD(4, 0, 1, 3, 4), SustD(4, 0, 1, 3, 4), EXIT });
+            var ifmts = ImageFormats(DshCompiler.TranslateForVulkan("cs", icode, ictl, root).Spv);
+            Check($"⑬ cs 读写同槽（SULD.D + SUST.D.2D.B32）：OpTypeImage Format 仍 = 具体格式（{ifmts.Count} 个声明）",
+                ifmts.Count > 0 && ifmts.All(f => f.Fmt != 0),
+                string.Join(",", ifmts.Select(f => $"dim{f.Dim} sampled{f.Sampled} fmt{f.Fmt}")));
+        }
 
         // ⑩ 几何 / 曲面外壳 / 曲面域：不出 .spv，明确报红（在 Compile 之前）
         var (_, _, vcode, vctl) = keys.First(k => k.Stage == "vs");
