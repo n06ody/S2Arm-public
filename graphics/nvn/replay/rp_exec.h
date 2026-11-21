@@ -20,12 +20,56 @@ nvn_gpu_cmd rp_side_begin(const char *label);
 uint64_t rp_side_commit(nvn_gpu_cmd c);
 void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels 读 GPU 内容的读数（次数 / 等之前的活共纳秒 / 最长纳秒 / 读回共纳秒）
 
+// 一次实际关遍只归给第一个触发同步的解析调用，名称也供分时打印。
+#define RP_CUT_SITE_LIST(X) \
+    X(OTHER, other) X(VERTEX, vertex) X(INDEX, index) X(INDEX_IND, index_ind) \
+    X(SSBO_RO, ssbo_ro) X(SSBO_RW, ssbo_rw) X(SSBO_UNKNOWN, ssbo_unknown) \
+    X(SSBO_RO_WRITE_GUARD, ssbo_ro_write_guard) X(SSBO_RO_UNKNOWN_GUARD, ssbo_ro_unknown_guard) \
+    X(SSBO_RO_WINDOW, ssbo_ro_window) X(SSBO_LATE_RO, ssbo_late_ro) \
+    X(SSBO_LATE_RW, ssbo_late_rw) X(SSBO_LATE_UNKNOWN, ssbo_late_unknown) \
+    X(UBOP, ubop) X(CBUF_MIRROR, cbuf_mirror) X(UBOA_POINTER, uboa_pointer) X(UBOA_TARGET, uboa_target) \
+    X(TBUF, tbuf) X(INDIRECT, indirect) X(INDIRECT_COUNT, indirect_count) \
+    X(TEX_INIT, tex_init) X(TEX_ZERO, tex_zero) X(TEX_UPLOAD, tex_upload)
+#define RP_REJECT_REASON_LIST(X) \
+    X(POOL_UNTRACKED, pool_untracked) X(BINDING_GT64K, binding_gt64k) X(TRACKING_UNRELIABLE, tracking_unreliable) \
+    X(GPU_PENDING, gpu_pending) X(GPU_LANDING, gpu_landing) X(LANDING_OVERFLOW, landing_overflow) \
+    X(SPAN_MISSING, span_missing) X(SEG_BUDGET, seg_budget) X(ARENA, arena) \
+    X(PAGE_UNARMED, page_unarmed) X(SNAPSHOT_CHANGED, snapshot_changed)
+#define RP_SITE_ENUM(id, label) RP_CUT_SITE_##id,
+enum rp_cut_site { RP_CUT_SITE_LIST(RP_SITE_ENUM) RP_CUT_SITE_N };
+#undef RP_SITE_ENUM
+#define RP_REJECT_ENUM(id, label) RP_REJECT_##id,
+enum rp_reject_reason { RP_REJECT_NONE = -1, RP_REJECT_REASON_LIST(RP_REJECT_ENUM) RP_REJECT_N };
+#undef RP_REJECT_ENUM
+
 // ---------- 内存池镜像（rp_buf.c）----------
 // 合法但未绑定的 NVN 存储槽：内部 64 KiB 缓冲（初始全零），不登记 guest 池；会话收尾释放。
 nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
 int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+// 独立回放夹具可能只提供无诊断的解析替身。
+// 弱链接[replay]：rp_buf_resolve_at
+int rp_buf_resolve_at(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off,
+                      enum rp_cut_site site) __attribute__((weak));
+// 弱链接[replay]：rp_buf_resolve_multi_at
+int rp_buf_resolve_multi_at(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off,
+                            unsigned char *ok, enum rp_cut_site site) __attribute__((weak));
+static inline int rp_buf_resolve_for(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off,
+                                      enum rp_cut_site site) {
+    return rp_buf_resolve_at ? rp_buf_resolve_at(c, addr, len, buf, off, site) : rp_buf_resolve(c, addr, len, buf, off);
+}
+static inline int rp_buf_resolve_many_for(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf,
+                                         uint64_t *off, unsigned char *ok, enum rp_cut_site site) {
+    return rp_buf_resolve_multi_at ? rp_buf_resolve_multi_at(n, addr, len, buf, off, ok, site)
+                                  : rp_buf_resolve_multi(n, addr, len, buf, off, ok);
+}
+// readonly 标记有界且整笔无未知写入的图形读；n <= 64。
+int rp_buf_resolve_readonly(nvn_gpu_cmd c, int n, const uint64_t *addr, const uint64_t *len,
+                        nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, uint64_t readonly, uint32_t align,
+                        const enum rp_cut_site *sites);
+int rp_geom_rename_on(void);
+uint64_t rp_ssbo_rename_state(void);   // 低位是提交锁存的档位，高位是 AB 窗口编号
 // 回放窗口 = 一次提交的回放（nvn_be_sub_begin → nvn_be_sub_commit，开窗口的线程是回放线程）。窗口开着时别的线程销毁池（MapVirtual 改 run、MemoryPoolFinalize），
 // 镜像缓冲不当场放（回放线程手里可能已有 rp_buf_resolve 取到、后端还没 cmd_ref 的句柄），推迟到窗口收尾；窗口外或同线程销毁照旧当场放。
 void rp_buf_hold_begin(void);
@@ -117,6 +161,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
+       RP_PERF_BUF_SYNC_GW_KB,   // 整页落在已登记显卡写区间里（显卡还在写 / 正在拷回）而没进同步的页（rp_buf.c sync_run）
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
        RP_PERF_SUB_PRE_NS, RP_PERF_SUB_EXEC_NS, RP_PERF_SUB_POST_NS, RP_PERF_WAIT_ALREADY_N, RP_PERF_GPU_BUSY_NS,   // 提交三段耗时 / 进等待时已完成 / GPU 忙区间
@@ -127,8 +172,20 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_BINST_HZ, RP_PERF_BINST_ONE, RP_PERF_BINST_CUT, RP_PERF_BINST_SCAN, RP_PERF_BINST_WASTE,   // 间接绘制 base instance 拷贝：批量前移供上的笔数 / 逐笔拷的笔数 / 其中为它收了开着的通道 / 前移扫描次数 / 前移了没用上的笔数（rp_draw.c 通道级批量拷）
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值
        RP_PERF_GW_REG_N, RP_PERF_GW_REG_KB, RP_PERF_GW_MERGED_N, RP_PERF_GW_MERGED_KB,   // 显卡写登记：收到的登记条数 / 千字节；同段合并掉的条数 / 因重叠省下的千字节（落地拷贝按合并后的条数算，见 rp_buf.c rp_buf_gpu_write_note2）
+       RP_PERF_SSBO_RENAME_HIT, RP_PERF_SSBO_RENAME_REJECT, RP_PERF_SSBO_RENAME_BYTES,
+       RP_PERF_CUT_SITE_BASE, RP_PERF_CUT_SITE_LAST = RP_PERF_CUT_SITE_BASE + RP_CUT_SITE_N - 1,
+       RP_PERF_REJECT_BASE, RP_PERF_REJECT_LAST = RP_PERF_REJECT_BASE + RP_REJECT_N - 1,
+       RP_PERF_GEOM_VERTEX, RP_PERF_GEOM_INDEX, RP_PERF_GEOM_INDEX_IND, RP_PERF_GEOM_REJECT, RP_PERF_GEOM_BYTES,
+       RP_PERF_SSBO_SIZE_BASE, RP_PERF_SSBO_SIZE_MAX = RP_PERF_SSBO_SIZE_BASE + 6,
+       RP_PERF_INDEX_SIZE_BASE, RP_PERF_INDEX_SIZE_MAX = RP_PERF_INDEX_SIZE_BASE + 6,
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
+// 弱链接[replay]：rp_perf_cut_diag
+void rp_perf_cut_diag(int total, int bucket, uint64_t bytes) __attribute__((weak));
+static inline void rp_perf_cut_reject(enum rp_reject_reason reason, uint64_t bytes) {
+    if (rp_perf_cut_diag) rp_perf_cut_diag(RP_PERF_SSBO_RENAME_REJECT, RP_PERF_REJECT_BASE + reason, bytes);
+    else rp_perf_add(RP_PERF_SSBO_RENAME_REJECT, 1);   // 不链接提交层的独立夹具沿用原计数
+}
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。
 // 改成每 rp_tm_stride() 帧只完整计 1 帧（缺省 32）：采样帧里逐步计时照旧，其余帧一次时钟都不取；纯计数的项不动、每帧都记。
 // 「分时」里这几项按采样帧数（RP_PERF_TM_FRAMES）求每帧值，读数行的格式和含义不变。
@@ -169,12 +226,21 @@ int rp_fr_perf_on(void);   // 开关（nvk_hitch_log，进程内缓存一次，�
 void rp_fr_perf_take(uint64_t out[RP_FR_N]);   // [上屏] 取走本帧分项并清零；每帧只调一次（与 rp_frame_take 同一个帧边界）
 int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t draws, uint64_t subs, const uint64_t fr[RP_FR_N]);   // 长帧行（见 rp_exec.c）
 uint64_t rp_sub_serial(void);   // 第几次提交（一次提交内可复用的暂存内容按它判）
+struct rp_prog;
+// 录制侧：记一笔「本段已发射的绘制 / 派发用了哪个程序」（段失败日志打本段末 ≤4 笔的阶段键；
+// rp_draw 在实际落命令前调；线程：[提交]，当前段开着才记）
+void rp_seg_prog_note(const struct rp_prog *p);
 void rp_perf_take(uint64_t out[RP_PERF_N]);
 void rp_draw_reset(void);
 void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳过的）各出一行日志；0 = 关
 
 // 资源同步用的段（见 rp_exec.c）：通常是先于主段提交的前置段；同一资源本次提交里第二次同步时结束当前通道、回到主段。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub);
+// 弱链接[replay]：rp_xfer_cmd_at
+nvn_gpu_cmd rp_xfer_cmd_at(uint64_t *last_sub, enum rp_cut_site site, uint64_t binding_bytes) __attribute__((weak));
+static inline nvn_gpu_cmd rp_xfer_cmd_for(uint64_t *last_sub, enum rp_cut_site site, uint64_t binding_bytes) {
+    return rp_xfer_cmd_at ? rp_xfer_cmd_at(last_sub, site, binding_bytes) : rp_xfer_cmd(last_sub);
+}
 // 遮挡计数（rp_exec.c）：通道与绘制那边的接入点
 int rp_occl_want(void);                 // 开通道时：要不要声明遮挡计数
 void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);

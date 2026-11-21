@@ -22,7 +22,7 @@ if [ -z "$glslc" ]; then echo '【红】缺 glslc' >&2; exit 2; fi
 mkdir -p "$repo/build/vk-ssbo-window-tmp"
 out=$(mktemp -d "$repo/build/vk-ssbo-window-tmp/run.XXXXXX")
 trap 'rm -rf "$out"' EXIT
-for s in quad.vert replay_ssbo_window.frag; do "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/$s.spv"; done
+for s in quad.vert quad.frag replay_ssbo_window.frag; do "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/$s.spv"; done
 inc=(); for d in android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
 src=("$repo/android/tests/vk/t_replay_ssbo_window.c")
 for f in graphics/nvn/replay/rp_draw.c graphics/nvn/replay/rp_buf.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do src+=("$repo/$f"); done
@@ -32,11 +32,19 @@ if [ -n "${S2A_VK_PROFILE_LAYER_DIR:-}" ]; then
     export VK_LAYER_PATH="$VK_LAYER_PATH:$S2A_VK_PROFILE_LAYER_DIR"
     export VK_INSTANCE_LAYERS="$VK_INSTANCE_LAYERS:VK_LAYER_KHRONOS_profiles"
 fi
-set +e
-timeout 180 "$out/test" "$out" 2>&1 | tee "$out/log"
-rc=${PIPESTATUS[0]}
-set -e
-if [ "$rc" -ne 0 ] || ! grep -q 'device: llvmpipe' "$out/log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/log"; then
-    echo "【红】存储缓冲窗口回放 Vulkan 验证失败 rc=$rc" >&2; exit 1
-fi
-echo '【绿】存储缓冲窗口回放：起点按对齐下取整、超范围夹到上限，像素正确，validation 0 条'
+# vk_dq_init 会跨会话保留已启动的录制线程及开关，用独立进程验证两档。
+failed=0
+for dq in 0 1; do
+    args=("$@")
+    if [ "$dq" = 0 ]; then args=(--rename-only); fi
+    set +e
+    S2A_REPLAY_SSBO_DQ=$dq timeout 180 "$out/test" "$out" "${args[@]}" 2>&1 | tee "$out/log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || ! grep -q 'device: llvmpipe' "$out/log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/log"; then
+        echo "【红】存储缓冲回放 Vulkan 验证失败 dq=$dq rc=$rc" >&2
+        failed=1
+    fi
+done
+[ "$failed" = 0 ] || exit 1
+echo '【绿】存储缓冲回放：窗口及切片用例像素正确，DQ 关开 validation 各 0 条'

@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -183,6 +186,27 @@ void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
 // 弱链接[replay]：s2a_adpf_invisible
 void s2a_adpf_invisible(void) __attribute__((weak));
 static _Atomic uint64_t g_adpf_seq;
+#define RP_DIAG_LABEL(id, label) #label,
+static const char *const cut_site_names[RP_CUT_SITE_N] = {RP_CUT_SITE_LIST(RP_DIAG_LABEL)};
+static const char *const reject_names[RP_REJECT_N] = {RP_REJECT_REASON_LIST(RP_DIAG_LABEL)};
+static const char *const binding_size_names[] = {"le64k", "le128k", "le256k", "le512k", "le1m", "gt1m"};
+#undef RP_DIAG_LABEL
+
+static void print_cut_diag(const char *name, const char *const *labels, const uint64_t *counts, unsigned n,
+                           uint64_t total, uint64_t state, int transition, uint64_t frames, uint64_t max_bytes) {
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < n; i++) sum += counts[i];
+    char line[1400];
+    int pos = snprintf(line, sizeof line, "%s window=%llu mode=%u transition=%d frames=%llu total=%llu sum=%llu ok=%d",
+                       name, (unsigned long long)(state >> 1), (unsigned)(state & 1u), transition,
+                       (unsigned long long)frames, (unsigned long long)total, (unsigned long long)sum, sum == total);
+    if (max_bytes && pos > 0 && (size_t)pos < sizeof line)
+        pos += snprintf(line + pos, sizeof line - (size_t)pos, " max_bytes=%llu", (unsigned long long)max_bytes);
+    for (unsigned i = 0; i < n && pos > 0 && (size_t)pos < sizeof line; i++)
+        pos += snprintf(line + pos, sizeof line - (size_t)pos, " %s=%llu", labels[i], (unsigned long long)counts[i]);
+    nvn_plat_log(sum == total ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "present", line);
+}
+
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]);
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     pthread_mutex_lock(&g_pmu); const int surf = g_surf != NULL; pthread_mutex_unlock(&g_pmu);
@@ -253,6 +277,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -272,6 +307,39 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                                       (double)pf[RP_PERF_WAIT_ALREADY_N] / f, (double)pf[RP_PERF_WAIT_FAKED_N] / f, (double)pf[RP_PERF_GPU_BUSY_NS] / 1e6 / f,
                                       (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_PRESENT_NS] / 1e6 / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                {
+                    static uint64_t last_rename;
+                    const uint64_t state = rp_ssbo_rename_state();
+                    const int geom = rp_geom_rename_on();
+                    if (state || geom) {
+                        snprintf(b, sizeof b,
+                                 "分时（SSBO 重同步）：window=%llu mode=%u transition=%u；每帧切片命中 %.1f、退回 %.1f、复制 %.0f 字节、通道 %.1f、二次同步拆遍 %.1f、颜色 LOAD %.1f",
+                                 (unsigned long long)(state >> 1), (unsigned)(state & 1u), state != last_rename,
+                                 (double)pf[RP_PERF_SSBO_RENAME_HIT] / f, (double)pf[RP_PERF_SSBO_RENAME_REJECT] / f,
+                                 (double)pf[RP_PERF_SSBO_RENAME_BYTES] / f, (double)pf[RP_PERF_PASSES] / f,
+                                 (double)pf[RP_PERF_P_CUT_XFER] / f, (double)pf[RP_PERF_P_LOADC] / f);
+                        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                        print_cut_diag("cut_by_site", cut_site_names, pf + RP_PERF_CUT_SITE_BASE, RP_CUT_SITE_N,
+                                       pf[RP_PERF_P_CUT_XFER], state, state != last_rename, fr, 0);
+                        print_cut_diag("reject_by_reason", reject_names, pf + RP_PERF_REJECT_BASE, RP_REJECT_N,
+                                       pf[RP_PERF_SSBO_RENAME_REJECT], state, state != last_rename, fr, 0);
+                        const unsigned sizes = sizeof binding_size_names / sizeof binding_size_names[0];
+                        print_cut_diag("ssbo_gt64k_by_size", binding_size_names, pf + RP_PERF_SSBO_SIZE_BASE, sizes,
+                                       pf[RP_PERF_REJECT_BASE + RP_REJECT_BINDING_GT64K], state, state != last_rename,
+                                       fr, pf[RP_PERF_SSBO_SIZE_MAX]);
+                        print_cut_diag("index_ind_cut_by_size", binding_size_names, pf + RP_PERF_INDEX_SIZE_BASE, sizes,
+                                       pf[RP_PERF_CUT_SITE_BASE + RP_CUT_SITE_INDEX_IND], state, state != last_rename,
+                                       fr, pf[RP_PERF_INDEX_SIZE_MAX]);
+                        if (geom) {
+                            snprintf(b, sizeof b, "geometry_rename frames=%llu vertex=%llu index=%llu index_ind=%llu rejects=%llu bytes=%llu",
+                                     (unsigned long long)fr, (unsigned long long)pf[RP_PERF_GEOM_VERTEX],
+                                     (unsigned long long)pf[RP_PERF_GEOM_INDEX], (unsigned long long)pf[RP_PERF_GEOM_INDEX_IND],
+                                     (unsigned long long)pf[RP_PERF_GEOM_REJECT], (unsigned long long)pf[RP_PERF_GEOM_BYTES]);
+                            nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                        }
+                    }
+                    last_rename = state;
+                }
                 {   // 上屏线程 CPU（见 rp_present_tc_note）：每样本 = 相邻两次上屏
                     uint64_t tc[4]; rp_present_tc_take(tc); const double tn = tc[2] ? (double)tc[2] : 1.0;
                     snprintf(b, sizeof b, "分时（上屏线程 CPU，每帧）：两次上屏之间墙钟 %.1f 毫秒、本线程 CPU %.1f 毫秒（占 %.0f%%）；同线程样本 %llu、跨线程样本 %llu（不计）",
@@ -344,9 +412,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 if (pf[RP_PERF_TEX_UP_PART])   // 线性 CPU 贴图只传脏行（upload_linear_dirty）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；线性贴图按脏行传 %.1f 次共 %.0f 行", (double)pf[RP_PERF_TEX_UP_PART] / f, (double)pf[RP_PERF_TEX_UP_ROWS] / f);
                 if (pf[RP_PERF_RES_N])
-                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB、新建镜像 %.0f 次",
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB（显卡写区间里不搬 %.0f KB）、新建镜像 %.0f 次",
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
-                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
+                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_BUF_SYNC_GW_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 if (pf[RP_PERF_GW_REG_N])   // 显卡写登记：收到多少条、同段合并掉多少条（落地次数 = 登记 − 合并）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
