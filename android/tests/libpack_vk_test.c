@@ -809,9 +809,12 @@ int main(void) {
     {
         snprintf(g_dir, sizeof g_dir, "%s/dead", tmpl);
         CHECK(mkdir(g_dir, 0700) == 0, "create dead-binding pack directory");
-        static const char *CS_TEX36 =   // tex reg36：图像表同址区 32..39，放行提交接入前按无映射拒收
-            "{\"key\":\"0101010101010101_b\",\"stage\":\"cs\",\"dm_ctl\":\"0101010101010101\",\"bindings\":["
+        static const char *CS_TEX36 =   // tex reg36：图像表同址区 32..39 → c2 字 72+2×(36−32)=80，出库给槽（正样）
+            "{\"key\":\"0808080808080808_b\",\"stage\":\"cs\",\"dm_ctl\":\"0808080808080808\",\"bindings\":["
             "{\"msl_name\":\"cp_t36\",\"kind\":\"tex\",\"reg\":36,\"arg_id\":0}]}";
+        static const char *CS_TEX40 =   // tex reg40：贴图槽域出界——32..39 已接入，40..127 仍无映射拒收
+            "{\"key\":\"0101010101010101_b\",\"stage\":\"cs\",\"dm_ctl\":\"0101010101010101\",\"bindings\":["
+            "{\"msl_name\":\"cp_t40\",\"kind\":\"tex\",\"reg\":40,\"arg_id\":0}]}";
         static const char *CS_TEX64 =   // tex reg64：c2 无对应字——修前出 wrap 垃圾槽（compute guest slot invalid）
             "{\"key\":\"0202020202020202_b\",\"stage\":\"cs\",\"dm_ctl\":\"0202020202020202\",\"bindings\":["
             "{\"msl_name\":\"cp_t64\",\"kind\":\"tex\",\"reg\":64,\"arg_id\":0}]}";
@@ -830,17 +833,17 @@ int main(void) {
         static const char *CS_DRVCB3 =  // drvcb bank3：非 c0/c2 的驱动常量段无 guest 槽
             "{\"key\":\"0707070707070707_b\",\"stage\":\"cs\",\"dm_ctl\":\"0707070707070707\",\"bindings\":["
             "{\"msl_name\":\"cp_cb3\",\"kind\":\"drvcb\",\"bank\":3,\"arg_id\":0}]}";
-        const char *CS_JSONS[7] = { CS_TEX36, CS_TEX64, CS_TEX256, CS_TEXPOOL, CS_IMG9, CS_SBUF16, CS_DRVCB3 };
-        struct trec rd[14];
-        const uint8_t *pd[14]; size_t nd[14];
-        for (int i = 0; i < 7; i++) {
+        const char *CS_JSONS[8] = { CS_TEX40, CS_TEX64, CS_TEX256, CS_TEXPOOL, CS_IMG9, CS_SBUF16, CS_DRVCB3, CS_TEX36 };
+        struct trec rd[16];
+        const uint8_t *pd[16]; size_t nd[16];
+        for (int i = 0; i < 8; i++) {
             uint64_t k = (uint64_t)(i + 1) * 0x0101010101010101ULL;
             rd[i * 2]     = (struct trec){ .key = k, .kind = 1,  .len = (uint32_t)strlen(CS_JSONS[i]) };
             rd[i * 2 + 1] = (struct trec){ .key = k, .kind = 52, .len = sizeof CS_SPV };
             pd[i * 2] = (const uint8_t *)CS_JSONS[i]; nd[i * 2] = strlen(CS_JSONS[i]);
             pd[i * 2 + 1] = (const uint8_t *)CS_SPV;  nd[i * 2 + 1] = sizeof CS_SPV;
         }
-        CHECK(mk_pack(rd, 14, pd, nd, 1) == 0, "dead-binding pack written");
+        CHECK(mk_pack(rd, 16, pd, nd, 1) == 0, "dead-binding pack written");
         struct s2a_libpack *dl = NULL;
         CHECK(s2a_libpack_open(&dl, g_dir) == 1 && dl, "open dead-binding pack");
         for (int i = 0; i < 7; i++) {
@@ -850,6 +853,16 @@ int main(void) {
             int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
             if (!(rc == -1 && !j && strstr(w, "no consumable guest source"))) printf("  dead binding %d: rc=%d why=%s\n", i, rc, w);
             CHECK(rc == -1 && !j && strstr(w, "no consumable guest source"), "dead binding → REJECT with named reason");
+            free(j);
+        }
+        {   // 正样：第 8 键 CS_TEX36——tex reg36 落图像表同址区 32..39 → c2 字 72+2×(36−32)=80，出库给槽不拒
+            uint64_t k64 = 8 * 0x0101010101010101ULL;
+            uint8_t k[8]; memcpy(k, &k64, 8);
+            uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
+            int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+            if (rc != 0) printf("  tex36: rc=%d why=%s\n", rc, w);
+            CHECK(rc == 0 && j && has(j, "\"kind\":\"texture\",\"stage\":\"cs\",\"set\":0,\"binding\":5,\"count\":1,\"slot\":80}"),
+                  "tex reg36 → b5 slot 72+2×4=80");
             free(j);
         }
         s2a_libpack_close(dl);

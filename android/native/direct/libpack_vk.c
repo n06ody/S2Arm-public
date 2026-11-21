@@ -131,12 +131,12 @@ static const char *lp_nvn_stage_name(unsigned nvn) {
 static const char *lp_v1_stage_name(const char *lib_stage) {
     return !strcmp(lib_stage, "ps") ? "fs" : lib_stage;   // v1 用 NVN 阶段名 fs；vs/gs/cs 同名
 }
-// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：主表 0..31（字 8+2r）、分离贴图表 128..255
-//   （字 0x5A+2(r−128)）。与图像表同址的 32..39（字 72+2(r−32)，iOS nvn_mtl.m C2_IMG / tex_slot_h 同一区间）
-//   由放行提交单独接入；其余号段（32..127、≥256）在 c2 里没有句柄字：返回 0 = 无映射
-//   （真实槽号从 8 起，0 不会被当成槽 0 写出）。
+// 纹理号 → cb2 句柄表字偏移（v1 texture slot 的约定）：主表 0..31（字 8+2r）、与图像表同址的 32..39
+//   （字 72+2(r−32)，iOS nvn_mtl.m C2_IMG / tex_slot_h 同一区间）、分离贴图表 128..255（字 0x5A+2(r−128)）。
+//   其余号段（40..127、≥256）在 c2 里没有句柄字：返回 0 = 无映射（真实槽号从 8 起，0 不会被当成槽 0 写出）。
 static uint32_t lp_tex_slot_word(uint32_t reg) {
     if (reg < 32) return 8 + reg * 2;
+    if (reg < 40) return 72 + (reg - 32) * 2;
     if (reg >= 128 && reg < 256) return 0x5A + (reg - 128) * 2;
     return 0;
 }
