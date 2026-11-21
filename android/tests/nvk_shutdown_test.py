@@ -12,6 +12,7 @@ CASES = (
     ('nvk_compile_stop_test.py', '--withdraw-admit', 'FAIL: stop won admission race'),
     ('nvk_compile_stop_test.py', '--withdraw-activation', 'FAIL: stop during activation must retain context'),
     ('nvk_session_budget_test.py', '--withdraw-wait', 'FAIL: in-flight resolver must wait until deadline'),
+    ('nvk_session_budget_test.py', '--withdraw-pool-retire', 'FAIL: session stop must retire idle compile slots'),
     ('nvk_device_idle_test.py', '--withdraw-deadline', 'FAIL: provider destroy exceeded budget waiting device idle'),
 )
 for script in ('nvk_compile_stop_test.py', 'nvk_session_budget_test.py', 'nvk_device_idle_test.py'):
@@ -22,4 +23,4 @@ for script, flag, assertion in CASES:
         print(result.stdout, result.stderr, file=sys.stderr)
         raise SystemExit(f'FAIL: {script} {flag} did not fail at {assertion}')
     print(f'PASS: {flag}: {assertion}', flush=True)
-print('PASS: shutdown admission, budget, retention and five negative controls')
+print('PASS: shutdown admission, budget, retention and six negative controls')

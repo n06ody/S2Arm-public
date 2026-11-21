@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 internal static unsafe class Program
 {
@@ -764,6 +765,7 @@ internal static unsafe class Program
         return stream.ToArray();
     }
 
+    [ThreadStatic]
     private static byte[] _emitted;
 
     [UnmanagedCallersOnly]
@@ -772,6 +774,54 @@ internal static unsafe class Program
         if (sink != 0 || result.Data == 0 || result.Bytes == 0) return -1;
         _emitted = new ReadOnlySpan<byte>((void*)result.Data, checked((int)result.Bytes)).ToArray();
         return 0;
+    }
+
+    private static void CheckNativeParallel(byte[] graphicsRequest, byte[] computeRequest)
+    {
+        byte[][] requests = { graphicsRequest, computeRequest };
+        byte[][] expected = requests.Select(request => DirectShaderCompiler.Compile(request)).ToArray();
+        using var start = new Barrier(requests.Length);
+        var failures = new string[requests.Length];
+        var threads = new Thread[requests.Length];
+        for (int index = 0; index < requests.Length; index++)
+        {
+            int lane = index;
+            threads[lane] = new Thread(() =>
+            {
+                try
+                {
+                    var entry = (delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.Compile;
+                    var emit = (delegate* unmanaged<nint, DirectBytes, int>)&Emit;
+                    byte[] request = requests[lane];
+                    for (int attempt = 0; attempt < 16; attempt++)
+                    {
+                        if (!start.SignalAndWait(TimeSpan.FromSeconds(5)))
+                        {
+                            failures[lane] = $"lane {lane} could not enter compile round {attempt}";
+                            return;
+                        }
+                        _emitted = null;
+                        int rc;
+                        fixed (byte* requestData = request)
+                            rc = entry((ulong)lane + 1, 1,
+                                new DirectBytes { Data = (nint)requestData, Bytes = (ulong)request.Length }, (nint)emit, 0);
+                        if (rc != 0 || _emitted == null || !_emitted.SequenceEqual(expected[lane]))
+                        {
+                            failures[lane] = $"lane {lane} round {attempt} returned rc={rc} or different result";
+                            return;
+                        }
+                    }
+                }
+                catch (Exception error)
+                {
+                    failures[lane] = $"lane {lane} failed: {error}";
+                }
+            }, 64 << 20);
+            threads[lane].Start();
+        }
+        foreach (Thread thread in threads) thread.Join();
+        Check(failures.All(failure => failure == null),
+            "unmanaged provider returns both reference results across 16 parallel rounds " + string.Join(" ", failures));
     }
 
     private static void Main(string[] args)
@@ -812,6 +862,15 @@ internal static unsafe class Program
         byte[] vs = Guest(false, new[] { Ast(0) });
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
+
+        if (args.Length == 1 && args[0] == "--native-parallel")
+        {
+            CheckNativeParallel(RequestJson(profile, "graphics", 1, 1, "parallel-graphics", vs, fs),
+                RequestJson(profile, "compute", 2, 1, "parallel-compute", cs: cs));
+            Console.WriteLine($"direct-compiler native parallel: {_checks} checks, {_failures} failures");
+            Environment.ExitCode = _failures == 0 ? 0 : 1;
+            return;
+        }
 
         // 端到端：真编译器（DirectShaderCompiler.Compile）编一段读两个输入分量、做 FMNMX.MIN / MAX 的片元程序（读输入免得被常量折叠），
         // 出来的片元 SPIR-V 必须有 GLSL NMin + NMax、没有 FMin / FMax（共用翻译器的 Clamp / Maximum / Minimum 若回到 F 版，这一项必红）。
@@ -3009,6 +3068,8 @@ internal static unsafe class Program
             Check(rc == 0 && _emitted != null && _emitted.SequenceEqual(direct), "unmanaged provider returns the same program bytes");
             Check(entry(0, 1, default, 0, 0) == DirectAbi.Argument, "unmanaged provider rejects empty input");
         }
+
+        CheckNativeParallel(graphicsRequest, computeRequest);
 
         // 10) 支持缓冲布局身份稳定。
         SupportLayout a1 = SupportLayout.Compile(), a2 = SupportLayout.Compile();

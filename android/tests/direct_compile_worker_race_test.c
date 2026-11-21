@@ -49,7 +49,7 @@ static int test_cond_wait(pthread_cond_t *cv, pthread_mutex_t *mu, const struct 
     int r = pthread_cond_timedwait(cv, mu, t);
     pthread_mutex_lock(&ctl_mu);
     int hold_old = role == 1 && arm_old && r == ETIMEDOUT;
-    int hold_new = role == 2 && arm_new && r == 0 && g_job.state == 2 && !memcmp(g_job.sha, new_sha, 32);
+    int hold_new = role == 2 && arm_new && r == 0 && g_slots[0].job.state == 2 && !memcmp(g_slots[0].job.sha, new_sha, 32);
     pthread_mutex_unlock(&ctl_mu);
     if (hold_old || hold_new) {
         pthread_mutex_unlock(mu);  // simulate scheduler delay before reacquiring the worker mutex
@@ -96,7 +96,7 @@ static void reattach(int async_mode) {
         if (!async_mode) { pthread_create(&b, NULL, run_call, &next); CHECK(wait_flag(&attach_waiting), "same SHA sync reattached"); }
         else CHECK(!s2a_compile_worker_submit_async(1, 1, next.json, strlen(next.json), next.sha, NULL, 0), "same SHA async reattached");
     }
-    pthread_mutex_lock(&g_wmu); int abandoned = g_job.abandoned, refs = g_job.refs; pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&g_wmu); int abandoned = g_slots[0].job.abandoned, refs = g_slots[0].job.refs; pthread_mutex_unlock(&g_wmu);
     printf("F reattach mode=%d abandoned=%d refs=%d\n", async_mode, abandoned, refs);
     CHECK(!abandoned && (async_mode || refs == 1), "reattached subscriber keeps job live and its own ref");
     release_compile();
@@ -120,7 +120,7 @@ static void replacement(int completed) {
     pthread_create(&tb, NULL, run_call, &b); CHECK(wait_flag(&entered), "B compiler entered");
     if (completed) { release_compile(); CHECK(wait_flag(&new_paused), "B completed before A resumes"); }
     set_flag(&allow_old, 1); pthread_join(ta, NULL);
-    pthread_mutex_lock(&g_wmu); int refs = g_job.refs, abandoned = g_job.abandoned; pthread_mutex_unlock(&g_wmu);
+    pthread_mutex_lock(&g_wmu); int refs = g_slots[0].job.refs, abandoned = g_slots[0].job.abandoned; pthread_mutex_unlock(&g_wmu);
     printf("F replacement completed=%d old_rc=%d old_len=%zu old_first=%02x B_refs=%d B_abandoned=%d\n", completed, a.rc, a.n, a.bytes && a.n ? a.bytes[0] : 0, refs, abandoned);
     CHECK(a.rc != 0 && !a.bytes && !a.n, "old A never receives B bytes");
     CHECK(refs == 1 && !abandoned, "old A never removes B reference or abandons B");
@@ -128,7 +128,46 @@ static void replacement(int completed) {
     pthread_join(tb, NULL); CHECK(result_is(&b, "B"), "B receives its own compile result");
     free(a.bytes); free(b.bytes); s2a_compile_worker_stop();
 }
+static void *wait_async_call(void *arg) {
+    struct call *c = arg;
+    role = c->role;
+    c->rc = s2a_compile_worker_wait_async(c->sha, (uint32_t)c->ms,
+                                         &c->bytes, &c->n, c->why, sizeof c->why);
+    return NULL;
+}
+
+static void replaced_async_generation(void) {
+    reset_gate();
+    set_flag(&arm_old, 1);
+    CHECK(!s2a_compile_worker_start_pool(gated_compile, NULL, 2, NULL, 0), "start old async pool");
+    struct call old;
+    init_call(&old, "old", 40, 1);
+    CHECK(!s2a_compile_worker_submit_async(22, 1, old.json, 3, old.sha, NULL, 0), "submit old result");
+    CHECK(wait_flag(&entered), "old compiler entered");
+    pthread_t waiter;
+    pthread_create(&waiter, NULL, wait_async_call, &old);
+    CHECK(wait_flag(&old_paused), "old async waiter paused before reacquiring worker mutex");
+    CHECK(s2a_compile_worker_stop_bounded(1, NULL, 0) == 1, "old compile has not exited");
+    release_compile();
+    CHECK(!s2a_compile_worker_stop_bounded(2000, NULL, 0), "old pool retired");
+    CHECK(!s2a_compile_worker_start_pool(gated_compile, NULL, 2, NULL, 0), "start new async pool");
+    // Reusing the raw fixture key demonstrates that a delayed waiter cannot
+    // observe a new generation even when the result ring contains that key.
+    CHECK(!s2a_compile_worker_submit_async(22, 2, "new", 3, old.sha, NULL, 0), "submit replacement result");
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    CHECK(!s2a_compile_worker_wait_async(old.sha, 2000, &bytes, &len, NULL, 0) &&
+          bytes && len == 3 && !memcmp(bytes, "new", 3), "fresh waiter sees replacement result");
+    free(bytes);
+    set_flag(&allow_old, 1);
+    pthread_join(waiter, NULL);
+    CHECK(old.rc == 3 && !old.bytes && !old.n, "old async waiter cannot observe the new generation");
+    free(old.bytes);
+    s2a_compile_worker_stop();
+}
+
 int main(void) {
     alarm(25); reattach(0); reattach(1); reattach(2); replacement(0); replacement(1);
+    replaced_async_generation();
     printf("compile worker races: %d checks %d failures\n", checks, failures); return failures ? 1 : 0;
 }

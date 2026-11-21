@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -253,6 +256,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
