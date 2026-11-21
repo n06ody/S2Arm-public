@@ -314,6 +314,7 @@ typedef struct {
        origin_ll 必须与绘制时 nvn_gpu_dyn.origin_ll 相同，不同则粘滞 NVN_GPU_E_ARG。 */
     uint8_t origin_ll;
     uint8_t depth_clamp;             // v6：深度夹取（NVN SetDepthClamp）：1 = 超出近远面的片元夹到范围内而不是裁掉。必须与 nvn_gpu_dyn.depth_clamp 相同
+    uint8_t barrier_ceiling;        // 一次性 Vulkan 诊断档；同时标记后台实际创建的管线配方
 } nvn_gpu_pipe_desc;
 enum {
     NVN_GPU_PIPE_SYNC = 0,         // 现在就建，阻塞到出结果
