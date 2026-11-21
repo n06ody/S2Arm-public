@@ -67,8 +67,8 @@ def main():
              '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
-            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0]) : build(bytes, len, views, nst, rec->identity);',
-             'struct entry *e = build(bytes, len, views, nst, rec->identity);', '--compute-warm', 'compute program warm builds from prior cache'),
+            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);',
+             'struct entry *e = build(bytes, len, views, nst, rec->identity, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
             ('flag-ignored', 'if (!nvn_plat_flag("nvk_compute_warm", 0)) return;',
              '(void)nvn_plat_flag("nvk_compute_warm", 0);', '--compute-warm-off', 'compute warm off must not record programs'),
         ]

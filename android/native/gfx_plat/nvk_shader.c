@@ -902,8 +902,10 @@ static void with_program_key(char *out, size_t cap, const char *why, const uint8
         snprintf(out + n, cap - (size_t)n, "（程序键 %02x%02x%02x%02x%02x%02x%02x%02x）",
                  key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
 }
+// lib = 这份结果字节来自出包预编库（shader_src.precompiled=1）：装载闸对表外声明按拒收，
+//   调用方照旧 mark_bad 退回现编。离线库 / 跨局缓存 / 现编结果传 0。
 static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_source_entry_view views[3], int nst,
-                           const uint8_t identity[32]) {
+                           const uint8_t identity[32], int lib) {
     struct entry *e = calloc(1, sizeof *e);
     if (!e) return NULL;
     memcpy(e->prog.identity, identity, 32);
@@ -963,6 +965,8 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[st]; L.nent = e->prog.nent[st]; L.support_bytes = fp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src src = {0}; src.stage = (nvn_gpu_stage)st; src.kind = NVN_GPU_BLOB_SPIRV;
         src.blob = fp.stage[st].spirv; src.bytes = fp.stage[st].spirv_bytes; src.entry = "main"; src.layout = &L;
+        src.precompiled = (uint8_t)lib;
+        if (views[st].key) memcpy(src.key, views[st].key, 8);
         nvn_gpu_err err = {0};
         nvn_gpu_rc lr = nvn_gpu_shader_load(&src, &e->prog.sh[st], &err);
         if (!nvn_gpu_ok(lr)) { red_load(lr, &src, "shader_load_failed", err.why); e->failed = 1; }
@@ -1247,7 +1251,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         have_res = 1;
     }
     if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len)) {
-        struct entry *le = build(bytes, len, s->views, s->nst, s->identity);
+        struct entry *le = build(bytes, len, s->views, s->nst, s->identity, 1);
         if (le) { le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
         if (le && !le->failed) { libpack_note_hit(); return le; }
@@ -1311,7 +1315,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         if (alias_on()) { sha256(bytes, len, rsha); have_res = 1; }   // 与缓存文件头里写的是同一个量（整份负载的 SHA-256）
     }
     if (!bytes) return NULL;
-    struct entry *e = build(bytes, len, s->views, s->nst, s->identity);
+    struct entry *e = build(bytes, len, s->views, s->nst, s->identity, 0);
     if (e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, s->nst);
     // 事实复用（#1187 nvk_shader_fact_cache.h）：结果字节在这里释放，掩码先算好挂在 entry 上（纯函数，后台线程也能算）
     if (e && !e->failed) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);
@@ -1333,7 +1337,7 @@ static void warm_diag(const char *fmt, ...) {
     va_end(ap);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", b);
 }
-static struct entry *build_compute(const uint8_t *, size_t, const struct s2a_source_entry_view *, const uint8_t[32], const uint8_t[8]);
+static struct entry *build_compute(const uint8_t *, size_t, const struct s2a_source_entry_view *, const uint8_t[32], const uint8_t[8], int lib);
 
 static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
@@ -1367,12 +1371,14 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     const int compute = rec->stage_mask == 32u;
     struct s2a_source_entry_view views[3];
     memset(views, 0, sizeof views);
-    for (int st = 0; st < nst && st < 3; st++)
+    for (int st = 0; st < nst && st < 3; st++) {
+        views[st].key = rec->keys[st];   // 拒收 / 合规核对行要靠它打程序键
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = NVK_PROG_REC_C1_BYTES; }
+    }
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
                                 compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len)) {
-        struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0]) : build(bytes, len, views, nst, rec->identity);
+        struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 1) : build(bytes, len, views, nst, rec->identity, 1);
         if (le) { if (!compute) le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
         if (le && !le->failed) { libpack_note_hit(); return le; }
@@ -1389,7 +1395,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         return NULL;
     }
     // c1 随清单落盘（开局 source_store 是空的）：views 在上面按清单填好、传给 build()，逐位与真实解析一致。
-    struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0]) : build(bytes, len, views, nst, rec->identity);
+    struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);
     if (!compute && e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, nst);
     // 结果合并命中时前台要把事实复用（#1187）登记到这份程序上，登记要用「编译器实际读了哪些绑定事实」的掩码：
     // 前台自己建的（work_run）本来就算好了，预热带建的也要算（纯函数，后台线程能算）。关着开关时保持原样不算。
@@ -1861,7 +1867,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
 // 存储缓冲三种来源：NVN 存储槽（SBUFP）、别名某个用户 UBO 槽的本体（map 2 / UBOP）、
 // 用户 UBO 里 8 字节裸指针（map 3 / UBOA，带字节偏移）。图像、间接派发：记账、取不到。
 static struct entry *build_compute(const uint8_t *bytes, size_t len, const struct s2a_source_entry_view *src,
-                                   const uint8_t identity[32], const uint8_t key[8]) {
+                                   const uint8_t identity[32], const uint8_t key[8], int lib) {
     struct entry *e = calloc(1, sizeof *e);
     if (!e) return NULL;
     e->prog.is_compute = 1;
@@ -1917,6 +1923,8 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     if (!e->failed) {
         nvn_gpu_layout L = {0}; L.ent = e->prog.ent[0]; L.nent = e->prog.nent[0]; L.support_bytes = cp.support_bytes; L.id_src = "s2a-direct-program-v1";
         nvn_gpu_shader_src ss = {0}; ss.stage = NVN_GPU_SH_CS; ss.kind = NVN_GPU_BLOB_SPIRV; ss.blob = cp.stage.spirv; ss.bytes = cp.stage.spirv_bytes; ss.entry = "main"; ss.layout = &L;
+        ss.precompiled = (uint8_t)lib;
+        if (key) memcpy(ss.key, key, 8);
         nvn_gpu_err err = {0};
         nvn_gpu_rc lr = nvn_gpu_shader_load(&ss, &e->prog.sh[0], &err);
         if (!nvn_gpu_ok(lr)) { red_load(lr, &ss, "compute_shader_load_failed", err.why); e->failed = 1; }
@@ -2063,7 +2071,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
         if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len)) {
-            lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5]);
+            lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 1);
             free(bytes); bytes = NULL; len = 0;
             if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(); }
             else { entry_free(lpe); lpe = NULL; libpack_mark_bad(rq.identity); }
@@ -2097,7 +2105,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, rq.identity, bytes, len);
         }
         if (lpe) e = lpe;
-        else { e = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5]); free(bytes); }
+        else { e = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 0); free(bytes); }
         pthread_mutex_lock(&g_progs_mu);
         struct entry *have = progs_get_locked(rq.identity);
         if (have && have->prog.lib_bad) { orphan_note(have); have = NULL; }   // 拒收旧项被现编版顶替：转孤儿表（借用方持有的指针仍有效），put 覆盖登记

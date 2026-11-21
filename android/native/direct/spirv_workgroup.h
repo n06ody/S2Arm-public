@@ -125,7 +125,8 @@ static inline const char *s2a_spv_wg_type_size(const unsigned char *p, size_t n,
     uint32_t first = s2a_spv_wg_word(p, def), op = first & 65535u, len = first >> 16;
     switch (op) {
     case SpvOpTypeInt: case SpvOpTypeFloat: {
-        if (len != 4) return "compute shared: malformed scalar type";
+        // OpTypeInt 恒 4 词；OpTypeFloat 在 SPIR-V 1.6 起可带浮点编码操作数成 4 词（3 | 4 都收）
+        if (op == SpvOpTypeInt ? len != 4 : (len != 3 && len != 4)) return "compute shared: malformed scalar type";
         uint32_t bits = s2a_spv_wg_word(p, def + 2);
         if (!bits || (bits & 7u)) return "compute shared: non-byte scalar width";
         *out = bits / 8; return NULL; }
@@ -158,19 +159,20 @@ static inline const char *s2a_spv_wg_type_size(const unsigned char *p, size_t n,
     }
 }
 
-static inline const char *s2a_spv_workgroup_bytes(const void *blob, size_t bytes, uint64_t *total) {
+// Total bytes of all variables in one storage class (Workgroup / PushConstant).
+static inline const char *s2a_spv_class_bytes(const void *blob, size_t bytes, uint32_t storage_class, uint64_t *total) {
     const unsigned char *p = (const unsigned char *)blob;
     *total = 0;
     if (!p || bytes < 20 || (bytes & 3u) || s2a_spv_word(p) != SpvMagicNumber)
-        return "compute shared: malformed SPIR-V header";
+        return "storage bytes: malformed SPIR-V header";
     const size_t n = bytes / 4;
     for (size_t i = 5; i < n;) {
         uint32_t first = s2a_spv_wg_word(p, i), len = first >> 16, op = first & 65535u;
-        if (!len || len > n - i) return "compute shared: malformed instruction length";
-        if (op == SpvOpVariable && len >= 4 && s2a_spv_wg_word(p, i + 3) == SpvStorageClassWorkgroup) {
+        if (!len || len > n - i) return "storage bytes: malformed instruction length";
+        if (op == SpvOpVariable && len >= 4 && s2a_spv_wg_word(p, i + 3) == storage_class) {
             size_t pt = s2a_spv_wg_type_def(p, n, s2a_spv_wg_word(p, i + 1));
             if (!pt || (s2a_spv_wg_word(p, pt) & 65535u) != SpvOpTypePointer || (s2a_spv_wg_word(p, pt) >> 16) != 4)
-                return "compute shared: workgroup variable without pointer type";
+                return "storage bytes: variable without pointer type";
             uint64_t e = 0; const char *r = s2a_spv_wg_type_size(p, n, s2a_spv_wg_word(p, pt + 3), 0, &e);
             if (r) return r;
             if (UINT64_MAX - *total < e) return "compute shared: byte count overflow";
@@ -179,4 +181,8 @@ static inline const char *s2a_spv_workgroup_bytes(const void *blob, size_t bytes
         i += len;
     }
     return NULL;
+}
+
+static inline const char *s2a_spv_workgroup_bytes(const void *blob, size_t bytes, uint64_t *total) {
+    return s2a_spv_class_bytes(blob, bytes, SpvStorageClassWorkgroup, total);
 }
