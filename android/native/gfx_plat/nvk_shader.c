@@ -1067,13 +1067,18 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
     }
     return lp;
 }
+#include "nvk_lib_deny.inc"
 // 取一份（图形：stages 是 vs+fs 0x3 或 vs+fs+gs 0x7，keys 按 NVN 位序紧排 vs / fs / gs；计算：ckey 非空）。1 = 取到（*bytes 归调用方 free）
 //   topology：本笔绘制的输入图元名（fill_facts 的 topology()，快照里已算好——工作线程不碰 rp_S）；几何程序按它挑离线库里同图元那份，
 //   没有来源（NULL）几何程序 miss。本局 profile 的 geometryShader 没开时 libpack 照旧 miss（与现编同一字段）
 static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, int state_ok,
-                         const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len) {
+                         const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len,
+                         unsigned *deny_mask, int bg) {
+    if (deny_mask) *deny_mask = 0;
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
     if (!root || (!ckey && ((stages != 0x3u && stages != 0x7u) || !state_ok)) || nvn_plat_flag("no_libpack", 0)) return 0;
+    unsigned dm = lib_deny_hit(identity, gkeys, stages, ckey, bg);
+    if (dm) { if (deny_mask) *deny_mask = dm; return 0; }
     char lw[192] = ""; int lrc = S2A_LIBPACK_MISS;
     pthread_mutex_lock(&g_lp_mu);
     if (!g_lp_bad_init) { nvn_hm_init(&g_lp_bad, 32); g_lp_bad_init = 1; }
@@ -1214,7 +1219,8 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
         have_res = 1;
     }
-    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len)) {
+    unsigned deny_mask = 0;
+    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len, &deny_mask, background)) {
         struct entry *le = build(bytes, len, s->views, s->nst, s->identity);
         if (le) le->prog.z_raw = 1;
         free(bytes); bytes = NULL; len = 0;
@@ -1254,6 +1260,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
         if (g_texpool_diag) g_pool_attempts++;
         if (!shader_compile_admit()) { free(json); nvn_unimpl("shader", "compile_stopped", NULL); return NULL; }
+        lib_deny_note_compile(s->identity, deny_mask, (const uint8_t (*)[8])s->keys, s->nst, "图形");
         uint64_t trace = diag_begin(s->identity, s->stages, !background);
         int ran = s2a_compile_request_execute(in.session, in.generation, json, jl, &oc);
         diag_end(trace, !ran && oc.bytes && oc.bytes_len);
@@ -1339,7 +1346,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = NVK_PROG_REC_C1_BYTES; }
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
-                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len)) {
+                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len, NULL, 1)) {
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0]) : build(bytes, len, views, nst, rec->identity);
         if (le && !compute) le->prog.z_raw = 1;
         free(bytes); bytes = NULL; len = 0;
@@ -2028,7 +2035,8 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0) && s2a_program_cache_load(cdir, rq.identity, &bytes, &len, NULL, why, sizeof why) == 0) atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
-        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len)) {
+        unsigned deny_mask = 0;
+        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len, &deny_mask, 0)) {
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5]);
             free(bytes); bytes = NULL; len = 0;
             if (lpe && !lpe->failed) libpack_note_hit();
@@ -2038,6 +2046,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             if (g_texpool_diag) g_pool_attempts++;
             if (!shader_compile_admit()) { nvk_compute_request_release(&rq); nvn_unimpl("shader", "compile_stopped", NULL); return -1; }
+            lib_deny_note_compile(rq.identity, deny_mask, (const uint8_t (*)[8])&rp_S.skey[5], 1, "计算");
             uint64_t trace = diag_begin(rq.identity, 32u, 1);
             int ran = s2a_compile_request_execute(rq.session, rq.generation, rq.json, rq.json_bytes, &oc);
             diag_end(trace, !ran && oc.bytes && oc.bytes_len);
