@@ -1,6 +1,7 @@
 // 前端调用的其余入口（上沿 nvn_be_*，声明在 nvn_mtl.h / nvn_obj.h）。
 // 有真实语义而新层还没接的入口，一律经 nvn_unimpl("be", 名字) 记账后返回「没有 / 没做」，不返回假成功；
 // 只是 Metal 侧诊断读数的入口返回 0。接上一个就把对应的 nvn_unimpl 换成实现，并在单测里加用例。
+#include "rp_guard_probe.h"
 #include "rp_exec.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -191,6 +192,20 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
     int hit = pool_find_locked(addr, len, mem, size);
     pthread_mutex_unlock(&g_mu);
     return hit;
+}
+// Mirrors are separate allocations. Overlapping guest registrations can still
+// obscure producer provenance, including a pool that has not made a mirror.
+int rp_pool_guard_alias(const void *owner, uint64_t start, uint64_t end) {
+    int found = 0, alias = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool; i++) {
+        const uint64_t base = (uintptr_t)g_pool[i].mem;
+        if (base >= end) break;
+        if (g_pool[i].mem == owner) found = 1;
+        else if (base + g_pool[i].size > start) { alias = 1; break; }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return alias || !found;
 }
 int rp_pool_count(void) { pthread_mutex_lock(&g_mu); int n = g_npool; pthread_mutex_unlock(&g_mu); return n; }
 uint64_t rp_pool_fast_hits(void) { return g_pool_tls.fast_hits; }

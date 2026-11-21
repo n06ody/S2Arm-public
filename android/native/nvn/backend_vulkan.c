@@ -36,6 +36,7 @@
 #include "nvn_vk_report_ts.h"
 #include "../direct/sha256.h"
 #include "backend_vulkan_pass_constant_spv.h"
+#include "../../../graphics/nvn/replay/rp_guard_probe.h"
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
 #include "nvn_vk_format.h"
 #include "nvn_pipe_flight.h"   // 配方级在途表（纯逻辑）：同配方合并成一份创建，不同配方不互相排队
@@ -69,6 +70,9 @@ extern int nvn_deswizzle(const nvn_texdesc *, unsigned, unsigned, const void *, 
 extern uint64_t nvn_tex_level_offset(const nvn_texdesc *, unsigned) __attribute__((weak));
 extern uint32_t nvn_tex_level_gobs(const nvn_texdesc *, unsigned) __attribute__((weak));
 extern int nvn_gob_switch2 __attribute__((weak));
+// Weak for backend-only fixtures, whose descriptors never come from replay mirrors.
+// 弱链接[androiddraw]：rp_buf_guard_probe
+extern __typeof__(rp_buf_guard_probe) rp_buf_guard_probe __attribute__((weak));
 static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkShaderModule module; VkPipeline pipe; } g_deswizzle;
 static uint64_t g_deswizzle_count, g_deswizzle_bytes, g_deswizzle_fallbacks;
 static uint64_t g_deswizzle_reasons[5];
@@ -169,7 +173,7 @@ struct nvn_gpu_shader_s {
     uint32_t push_off, push_bytes;
     char entry[32];
     char capture_sha[65];
-    uint64_t capture_key;
+    uint64_t capture_key, capture_digest_prefix;
     unsigned capture_flags;
     int released, refs;
     struct nvn_gpu_shader_s *all_next;
@@ -486,6 +490,13 @@ struct nvn_gpu_vk {
     uint64_t pass_capture_key;
     int pass_capture_blank, pass_capture_w, pass_capture_h, pass_capture_vertices, pass_capture_colors;
     struct pass_capture *pass_capture;
+    struct {
+        _Atomic int armed;
+        uint64_t deadline, sha_prefix;
+        uint32_t delay, records, stride, field, prefix_offset, prefix_mask, data_slot, prefix_slot;
+        uint32_t draws, ranges, prefixes, versions[3], uploads[4], gpu_writer, cpu_writer, writer_unknown;
+        uint32_t pending, landing, alias, zero[3];
+    } guard;
     uint64_t wsi_seq;    // 已提交的呈现段序号（g_submit_mu 下分配，与入队同序）
     uint64_t wsi_done;   // worker 已等到栅栏的最后一个呈现段序号（g_mu 下改；段按入队顺序处理，单调）
 };
@@ -2043,6 +2054,14 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     if (!s->internal && (failed || !sampled)) pass_capture_segment(vk->pass_capture, NULL, NULL, 0, s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         pass_capture_frame(vk, s, failed);
+        if (vk->guard.delay && !failed && !atomic_load_explicit(&vk->guard.armed, memory_order_relaxed)) {
+            const uint64_t now = now_ns();
+            if (!vk->guard.deadline) vk->guard.deadline = now + (uint64_t)vk->guard.delay * 1000000000ull;
+            if (now >= vk->guard.deadline) {
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-guard", "active");
+                atomic_store_explicit(&vk->guard.armed, 1, memory_order_release);
+            }
+        }
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2432,15 +2451,37 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(&g, 0, sizeof g);
     g.dev = dev;
     nvnbar_open();
-    g.pass_capture_delay = nvn_plat_flag("nvk_gputime", 0) == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
-    if (g.pass_capture_delay > 0) {
+    const int gputime = nvn_plat_flag("nvk_gputime", 0);
+    g.pass_capture_delay = gputime == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
+    const int guard_delay = gputime == 0 && rp_buf_guard_probe ? nvn_plat_flag("nvk_pass_guard_s", 0) : 0;
+    if (guard_delay > 0) {
+        g.guard.records = (uint32_t)nvn_plat_flag("nvk_guard_records", 0);
+        g.guard.stride = (uint32_t)nvn_plat_flag("nvk_guard_stride", 0);
+        g.guard.field = (uint32_t)nvn_plat_flag("nvk_guard_field", 0);
+        g.guard.prefix_offset = (uint32_t)nvn_plat_flag("nvk_guard_prefix_off", 0);
+        g.guard.prefix_mask = (uint32_t)nvn_plat_flag("nvk_guard_prefix_mask", 0);
+        g.guard.data_slot = (uint32_t)nvn_plat_flag("nvk_guard_data_slot", -1);
+        g.guard.prefix_slot = (uint32_t)nvn_plat_flag("nvk_guard_prefix_slot", -1);
+        if (g.guard.records && g.guard.records <= 65536 && g.guard.stride && !(g.guard.stride % 4) &&
+            g.guard.field < g.guard.stride && !(g.guard.field % 4) && g.guard.prefix_mask <= 255 &&
+            g.guard.data_slot >> 16 < 4 && g.guard.prefix_slot >> 16 < 4)
+            g.guard.delay = (uint32_t)guard_delay;
+        else nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-guard", "invalid guard configuration");
+    }
+    if (g.pass_capture_delay > 0 || g.guard.delay) {
         uint32_t hi = (uint32_t)nvn_plat_flag("nvk_pass_key_hi", 0);
         uint32_t lo = (uint32_t)nvn_plat_flag("nvk_pass_key_lo", 0);
-        g.pass_capture_key = ((uint64_t)hi << 32) | lo;
+        if (g.pass_capture_delay > 0) g.pass_capture_key = ((uint64_t)hi << 32) | lo;
+        if (g.guard.delay) g.guard.sha_prefix = ((uint64_t)hi << 32) | lo;
         g.pass_capture_w = nvn_plat_flag("nvk_pass_match_w", 0);
         g.pass_capture_h = nvn_plat_flag("nvk_pass_match_h", 0);
         g.pass_capture_vertices = nvn_plat_flag("nvk_pass_match_vertices", 0);
         g.pass_capture_colors = nvn_plat_flag("nvk_pass_match_colors", 0);
+        if (g.guard.delay && (!g.guard.sha_prefix || g.pass_capture_w <= 0 || g.pass_capture_h <= 0 ||
+                             g.pass_capture_vertices <= 0 || g.pass_capture_colors <= 0)) {
+            nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-guard", "invalid draw selector");
+            g.guard.delay = 0;
+        }
         g.pass_capture_blank = g.pass_capture_key && g.pass_capture_w > 0 && g.pass_capture_h > 0 &&
             g.pass_capture_vertices > 0 && g.pass_capture_colors > 0 && nvn_plat_flag("nvk_pass_constant", 0) == 1;
     }
@@ -3567,7 +3608,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             }
         }
         VkResult module_result = vkCreateShaderModule(g.d, &ci, NULL, &sh->mod);
-        if (module_result == VK_SUCCESS && g.pass_capture_delay > 0 && s->stage == NVN_GPU_SH_FS)
+        if (module_result == VK_SUCCESS && (g.pass_capture_delay > 0 || g.guard.delay) && s->stage == NVN_GPU_SH_FS)
             pass_shader_identify(sh, s->key, ci.pCode, ci.codeSize);
         free(array_code);
         if (module_result != VK_SUCCESS) {
@@ -6200,6 +6241,8 @@ static void pass_capture_draw_detail(struct pass_capture_row *r, struct nvn_gpu_
     }
 }
 
+#include "backend_vulkan_pass_guard.inc"
+
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     draw_tm_init();   // 诊断：这笔绘制各段用时（nvk_gputime 开着才计）
     const int dtm = g_draw_tm; const uint64_t dt0 = dtm ? now_ns() : 0;
@@ -6401,6 +6444,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         }
     } else {
         vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance);
+        if (g.guard.delay && inst == 1) pass_guard_draw(c, p, a->count);
     }
     if (profile && profile->draws++ == 0) {
         profile->substituted = selected != p->pipe;

@@ -6,6 +6,7 @@
 #include "nvn_fmt_info.h"
 #include "nvn_mtl.h"
 #include "../replay/rp_state.h"
+#include "../replay/rp_guard_probe.h"
 #include "../replay/rp_exec.h"
 #include "../replay/rp_fps_seg.h"
 #include "../replay/rp_res.h"
@@ -50,9 +51,10 @@ static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺
 static int g_flag_ub_steal = -1;   // 用例设：开关 nvk_ub_fill_steal（-1 = 缺省）；rp_draw 缓存它，换值后要 pass_fresh（会话重开清缓存）
 static int g_flag_split_pass = -1, g_flag_diag_load_dc, g_flag_diag_store_dc;   // 用例设：开关 nvk_split_pass（-1 = 缺省）、诊断开关 nvk_diag_load_dontcare / nvk_diag_store_dontcare
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
-static int g_diag_frames;
+static int g_diag_frames, g_flag_pass_guard;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_pass_guard_s")) return g_flag_pass_guard;
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
@@ -6035,6 +6037,66 @@ static void t_clean_read_scopes(void) {
     g_block_mem = NULL; g_buf_cpu_auto = 0; g_flag_buf_dirtylog = g_dirtylog_dflt; pass_fresh();
 }
 
+static struct rp_guard_observation guard_observe(nvn_gpu_buf b, uint64_t len, int known) {
+    struct rp_guard_observation out = {0};
+    rp_buf_guard_probe(b, 0, len, 12, 16, 16, known, &out);
+    return out;
+}
+static void t_guard_probe(void) {
+    pass_fresh();
+    g_flag_pass_guard = 1;
+    g_buf_cpu_auto = g_pg_tracked = 1;
+    g_dirty_now = 100;
+    memset(g_pg_gen, 0, sizeof g_pg_gen);
+    memset(g_pmem, 0, sizeof g_pmem);
+    const uint64_t base = (uintptr_t)g_pmem;
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    nvn_gpu_buf b = NULL;
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL) && b && b->cpu);
+    struct rp_guard_observation out = guard_observe(b, PG, 1);
+    CHECK(out.range && out.prefix && out.version && out.upload == RP_GUARD_UPLOAD_DIRECT);
+    CHECK(out.zero == RP_GUARD_ALL_ZERO && out.cpu_writer && !out.gpu_writer);
+    nvn_be_pool_add(g_pmem + 256, PG);
+    out = guard_observe(b, PG, 1);
+    CHECK(out.range && out.alias && !out.cpu_writer && out.zero == RP_GUARD_ZERO_UNKNOWN);
+    nvn_be_pool_del(g_pmem + 256);
+    CHECK(guard_observe(b, PG, 0).zero == RP_GUARD_ZERO_UNKNOWN);
+    CHECK(!guard_observe(b, 255, 1).range);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+
+    g_pmem[12 + 15 * 16] = 0x80;
+    g_pg_gen[0] = ++g_dirty_now;
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+    CHECK(guard_observe(b, PG, 1).zero == RP_GUARD_NONZERO);
+    g_pmem[12 + 15 * 16] = 0;
+    g_pg_gen[0] = ++g_dirty_now;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+    out = guard_observe(b, PG, 1);
+    CHECK(out.upload == RP_GUARD_UPLOAD_ORDERED && out.cpu_writer && out.zero == RP_GUARD_ZERO_UNKNOWN);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 2 * PG, &b, NULL));
+    out = guard_observe(b, 2 * PG, 1);
+    CHECK(out.upload == RP_GUARD_UPLOAD_MIXED && out.version == RP_GUARD_VERSION_MULTIPLE &&
+          out.zero == RP_GUARD_ZERO_UNKNOWN);
+    extern uint64_t rp_buf_gpu_write_note(uint64_t, uint64_t, uint64_t *);
+    extern void rp_buf_gpu_write_land(uint64_t, uint64_t, int);
+    uint64_t key = 0;
+    const uint64_t id = rp_buf_gpu_write_note(base + 12, 4, &key);
+    CHECK(id && key == base);
+    out = guard_observe(b, PG, 1);
+    CHECK(out.pending && out.gpu_writer && out.zero == RP_GUARD_ZERO_UNKNOWN);
+    if (id) rp_buf_gpu_write_land(key, id, 0);
+    out = guard_observe(b, PG, 1);
+    CHECK(!out.pending && out.gpu_writer && out.zero == RP_GUARD_ZERO_UNKNOWN);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_pool_del(g_pmem);
+    g_flag_pass_guard = g_buf_cpu_auto = 0;
+    pass_fresh();
+}
+
 static void t_draw(void) {   // 绘制：状态在绘制时才变成后端的管线 / 动态状态 / 顶点流 / 绑定；没变的管线不重取；取不到的资源跳过并记账
     pass_fresh(); memset(g_pg_gen, 0, sizeof g_pg_gen); g_pg_tracked = 1; g_dirty_now = 100; memset(g_pmem, 0, sizeof g_pmem); g_arena_used = 0;
     g_pipe_gets = g_set_pipes = g_set_dyns = g_gdraws = g_nvb = g_resolves = g_resolve_rc = 0; memset(g_nfb, 0, sizeof g_nfb);
@@ -7299,6 +7361,7 @@ int main(int argc, char **argv) {
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
     t_clean_read_order();
+    t_guard_probe();
     t_clean_read_scopes();
     t_pipeline_dirty_changes();
     t_target_format_variant();
