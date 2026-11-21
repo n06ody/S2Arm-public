@@ -1224,7 +1224,7 @@ static struct entry *work_run(const struct work_snap *s, int background) {
         struct entry *le = build(bytes, len, s->views, s->nst, s->identity);
         if (le) le->prog.z_raw = 1;
         free(bytes); bytes = NULL; len = 0;
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed) { libpack_note_hit(); lib_deny_note_hit_gfx((const uint8_t (*)[8])s->keys, s->nst, background); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity);
     }
@@ -1350,7 +1350,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0]) : build(bytes, len, views, nst, rec->identity);
         if (le && !compute) le->prog.z_raw = 1;
         free(bytes); bytes = NULL; len = 0;
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed) { libpack_note_hit(); if (compute) lib_deny_note_hit(rec->keys[0], "cs", rec->keys[0], 1); else lib_deny_note_hit_gfx((const uint8_t (*)[8])rec->keys, nst, 1); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(rec->identity);
     }
@@ -2039,7 +2039,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len, &deny_mask, 0)) {
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5]);
             free(bytes); bytes = NULL; len = 0;
-            if (lpe && !lpe->failed) libpack_note_hit();
+            if (lpe && !lpe->failed) { libpack_note_hit(); lib_deny_note_hit(rp_S.skey[5], "cs", rp_S.skey[5], 0); }
             else { entry_free(lpe); lpe = NULL; libpack_mark_bad(rq.identity); }
         }
         if (!bytes && !lpe) {
