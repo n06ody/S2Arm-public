@@ -10,6 +10,12 @@
     <IsAotCompatible>false</IsAotCompatible>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(S2AAndroidHost)' == 'true'">
+    <!-- Run the Roslyn analyzers in the service assembly even though the composed app
+         has compatibility suppressions for third-party code during NativeAOT linking. -->
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.IO.Hashing" Version="10.0.9" />
     <ProjectReference Include="../../compat/tree/src/Ryujinx.HLE/Ryujinx.HLE.csproj" />
