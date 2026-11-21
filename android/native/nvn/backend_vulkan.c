@@ -54,7 +54,8 @@
 
 // 冗余屏障合并（诊断包开关 nvk_bar_dedupe，缺省 0）：记下「最后一道全屏障之后还没录过任何 GPU 工作」的命令缓冲；
 // 下一道全屏障若落在同一个命令缓冲上、中间没有工作命令，它就是冗余的（前一道已经把之前的一切排完、之后没有新访问），不录。
-// 「工作命令」= 下面包起来的绘制 / 派发 / 拷贝 / 清除 / 填充 / 解析 / 开收通道 / 查询 / 时间戳，以及任何别的屏障（含布局转换）；
+// 「工作命令」= 下面包起来的绘制 / 派发 / 拷贝 / 清除 / 填充 / 解析 / 开收通道 / 查询，以及任何别的屏障（含布局转换）；时间戳不算（不访问内存，屏障对它没有排序作用；
+//   探针 nvk_gputime 的逐操作时间戳若算工作，会让开计时时一道也合并不了）；
 // 只改状态的绑定 / 设置 / 推常量不算。只在本编译单元录的命令上成立（nvk 的命令缓冲只在这里录）。
 // 另：CPU 侧每帧计数（0 GPU 开销）：全部管线屏障 / 其中全屏障 / 被合并掉的全屏障 / 布局转换 / 开通道。
 static uint64_t g_bar_cb;   // 最后一道全屏障后还干净的命令缓冲（0 = 没有）
@@ -109,8 +110,6 @@ static inline void bar_any(void) { bar_work(); __atomic_fetch_add(&g_bar_all, 1,
 #define vkCmdEndQuery(cb, ...) (bar_work(), w_vkCmdEndQuery(cb, __VA_ARGS__))
 #undef vkCmdResetQueryPool
 #define vkCmdResetQueryPool(cb, ...) (bar_work(), w_vkCmdResetQueryPool(cb, __VA_ARGS__))
-#undef vkCmdWriteTimestamp
-#define vkCmdWriteTimestamp(cb, ...) (bar_work(), w_vkCmdWriteTimestamp(cb, __VA_ARGS__))
 #undef vkCmdEndRenderPass
 #define vkCmdEndRenderPass(cb) (bar_work(), w_vkCmdEndRenderPass(cb))
 #undef vkCmdPipelineBarrier
@@ -2902,7 +2901,7 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
     c->xfer_dirty = 0;
-    if (g_bar_dedupe && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
+    if (g_bar_dedupe && c->cb && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     __atomic_fetch_add(&g_bar_full, 1, __ATOMIC_RELAXED);
@@ -2911,7 +2910,7 @@ static void full_barrier(struct nvn_gpu_cmd_s *c) {
 // 按序写前的屏障：开关开着、本命令缓冲正处在写串里、目标区间与串里已写的都不重叠 → 不排；否则照常排全屏障并开新串。返回后调用方必须用 bw_copy 录拷贝
 static void bw_barrier(struct nvn_gpu_cmd_s *c, const void *buf, uint32_t n, const uint64_t *off, const uint64_t *len) {
     const uint64_t cb = (uint64_t)(uintptr_t)c->cb;
-    int ok = g_bar_dedupe && __atomic_load_n(&g_bw_cb, __ATOMIC_RELAXED) == cb && g_bw_nrng + (int)n <= 16;
+    int ok = g_bar_dedupe && cb && __atomic_load_n(&g_bw_cb, __ATOMIC_RELAXED) == cb && g_bw_nrng + (int)n <= 16;   // 空句柄不参与（0 是「没有」）
     for (uint32_t i = 0; ok && i < n; i++) for (int k = 0; k < g_bw_nrng; k++)
         if (g_bw_rng[k].buf == buf && g_bw_rng[k].off < off[i] + len[i] && off[i] < g_bw_rng[k].off + g_bw_rng[k].len) { ok = 0; break; }
     if (ok) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); c->xfer_dirty = 0; }
