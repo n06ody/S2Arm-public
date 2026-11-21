@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+#include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
@@ -17,6 +18,8 @@
 #include <string.h>
 
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
+// 弱链接[replay]：rp_shader_live_compile_take
+#pragma weak rp_shader_live_compile_take
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -183,6 +186,9 @@ void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
 // 弱链接[replay]：s2a_adpf_invisible
 void s2a_adpf_invisible(void) __attribute__((weak));
 static _Atomic uint64_t g_adpf_seq;
+#include "nvn_intent.h"
+// 弱链接[replay]：nvn_intent_take
+__attribute__((weak)) void nvn_intent_take(struct nvn_intent *out);   // 批 0 诊断探针：游戏在 NVN 层显式给出的意图（前端 hle_nvn.c；没有前端的单测里没有）
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]);
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     pthread_mutex_lock(&g_pmu); const int surf = g_surf != NULL; pthread_mutex_unlock(&g_pmu);
@@ -253,6 +259,17 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
     if (nvn_gpu_ok(r)) {
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
+        if (rp_shader_live_compile_take) {
+            struct rp_shader_live_compile_stats live;
+            rp_shader_live_compile_take(&live);
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
+                char b[272];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                         (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
+                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+            }
+        }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
             if (!t_last) t_last = now;
@@ -262,7 +279,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
                 uint64_t fr = g_n_shown + 1 - n_last; double sec = (double)(now - t_last) / 1e9, f = fr ? (double)fr : 1.0;
                 const double fs = pf[RP_PERF_TM_FRAMES] ? (double)pf[RP_PERF_TM_FRAMES] : 1.0;   // 逐步计时那几项只在采样帧里计：按计时过的帧数求每帧值（#1103）
-                char b[768]; snprintf(b, sizeof b, "分时：%.1f 秒上屏 %llu 帧（每秒 %.1f）；每帧：绘制 %.0f 笔、队列提交 %.1f 次共 %.1f 毫秒（其中交后端 %.1f）、等围栏 %.1f 次共 %.1f 毫秒（其中等同步 %.1f 次 %.1f 毫秒、Finish %.1f 次 %.1f 毫秒）；段从提交到完成平均 %.1f 毫秒；回放分三段：开段 %.1f / 回放 %.1f / 收尾 %.1f 毫秒、等已完成 %.1f 次、没真等 %.1f 次；GPU 忙 %.1f 毫秒；通道 %.1f 个、交上屏 %.1f 毫秒",
+                char b[1536]; snprintf(b, sizeof b, "分时：%.1f 秒上屏 %llu 帧（每秒 %.1f）；每帧：绘制 %.0f 笔、队列提交 %.1f 次共 %.1f 毫秒（其中交后端 %.1f）、等围栏 %.1f 次共 %.1f 毫秒（其中等同步 %.1f 次 %.1f 毫秒、Finish %.1f 次 %.1f 毫秒）；段从提交到完成平均 %.1f 毫秒；回放分三段：开段 %.1f / 回放 %.1f / 收尾 %.1f 毫秒、等已完成 %.1f 次、没真等 %.1f 次；GPU 忙 %.1f 毫秒；通道 %.1f 个、交上屏 %.1f 毫秒",
                                       sec, (unsigned long long)fr, (double)fr / sec, (double)(nd - d_last) / f, (double)pf[RP_PERF_SUBS] / f, (double)pf[RP_PERF_SUBMIT_NS] / 1e6 / f, (double)pf[RP_PERF_COMMIT_NS] / 1e6 / f,
                                       (double)(pf[RP_PERF_WAIT_N] + pf[RP_PERF_WAIT_FIN_N]) / f, (double)(pf[RP_PERF_WAIT_NS] + pf[RP_PERF_WAIT_FIN_NS]) / 1e6 / f,
                                       (double)pf[RP_PERF_WAIT_N] / f, (double)pf[RP_PERF_WAIT_NS] / 1e6 / f,
@@ -308,11 +325,36 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f、超长通道中途先交 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f, (double)pf[RP_PERF_P_CUT_LONG] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                {   // 断遍探针：「同一提交里第二次同步」按调用点分账，被切通道是否原样重开
+                    snprintf(b, sizeof b, "分时（断遍探针，每帧）：同一提交里第二次同步切通道 %.2f 次（重开同组目标 %.2f、异组 %.2f；被切通道首目标共 %.2f 百万像素）；主段按序传输按调用点：缓冲同步 %.2f、CPU 贴图第二次上传 %.2f、新建存储取内容 %.2f、待清零落地 %.2f",
+                             (double)pf[RP_PERF_P_CUT_XFER] / f, (double)pf[RP_PERF_CUT_REOPEN_SAME] / f, (double)pf[RP_PERF_CUT_REOPEN_OTHER] / f, (double)pf[RP_PERF_CUT_KPIX] / 1e3 / f,
+                             (double)pf[RP_PERF_XO_BUF] / f, (double)pf[RP_PERF_XO_TEX_UP] / f, (double)pf[RP_PERF_XO_TEX_INIT] / f, (double)pf[RP_PERF_XO_TEX_ZERO] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 if (pf[RP_PERF_BINST_HZ] || pf[RP_PERF_BINST_ONE] || pf[RP_PERF_BINST_SCAN]) {
                     snprintf(b, sizeof b, "分时（间接绘制 base instance 拷贝，每帧）：批量前移拷贝 %.1f 笔、回退逐笔 %.1f 笔（其中为它收了开着的通道 %.1f 次）、前移扫描 %.1f 次、前移了没用上 %.1f 笔",
                              (double)pf[RP_PERF_BINST_HZ] / f, (double)pf[RP_PERF_BINST_ONE] / f, (double)pf[RP_PERF_BINST_CUT] / f, (double)pf[RP_PERF_BINST_SCAN] / f, (double)pf[RP_PERF_BINST_WASTE] / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 }
+                {   // 批 0 诊断探针：收通道原因 × 尺寸；主段 GPU 拷贝按成因
+                    static const char *const why[RP_CUT_N] = {"其它", "第二次同步", "换目标", "整屏清除", "写掩码变", "区域扩大", "通道外操作", "提交收尾", "报告", "缓冲按序操作", "绘制内收通道"};
+                    size_t o = (size_t)snprintf(b, sizeof b, "分时（收通道原因 × 尺寸，每帧）：");
+                    for (int k = 0; k < RP_CUT_N; k++) { const uint64_t cn = pf[RP_PERF_CUTR_BASE + 3 * k]; if (!cn) continue;
+                        o += (size_t)snprintf(b + o, sizeof b - o, "%s %.2f 次（全屏级 %.2f）共 %.2f 百万像素；", why[k], (double)cn / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 2] / f, (double)pf[RP_PERF_CUTR_BASE + 3 * k + 1] / 1e3 / f); }
+                    snprintf(b + o, sizeof b - o, "主段 GPU 拷贝（缓冲同步）按成因：落地回流 %.0f KB、同提交第二次同步 %.0f KB、其余真脏 %.0f KB",
+                             (double)pf[RP_PERF_GX_LAND_KB] / f, (double)pf[RP_PERF_GX_SECOND_KB] / f, (double)pf[RP_PERF_GX_DIRTY_KB] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                if (nvn_intent_take) {   // 批 0 诊断探针：游戏显式意图
+                    struct nvn_intent it; memset(&it, 0, sizeof it); nvn_intent_take(&it);
+                    static const char *const acc[4] = {"无", "不缓存", "缓存", "未给"};
+                    size_t o = (size_t)snprintf(b, sizeof b, "分时（游戏意图，NVN 层）：本窗口 DiscardColor 槽0–7 %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu 次、DiscardDepthStencil %llu 次；池（累计，CPU×GPU 个数/MB）：",
+                        (unsigned long long)it.discard[0], (unsigned long long)it.discard[1], (unsigned long long)it.discard[2], (unsigned long long)it.discard[3], (unsigned long long)it.discard[4],
+                        (unsigned long long)it.discard[5], (unsigned long long)it.discard[6], (unsigned long long)it.discard[7], (unsigned long long)it.discard[8]);
+                    for (int k = 0; k < 16; k++) if (it.pool_n[k]) o += (size_t)snprintf(b + o, sizeof b - o, "%s×%s %llu/%.0f、", acc[k / 4], acc[k % 4], (unsigned long long)it.pool_n[k], (double)it.pool_b[k] / 1048576.0);
+                    o += (size_t)snprintf(b + o, sizeof b - o, "可压缩 %.0f MB、着色器代码 %.0f MB、虚拟 %.0f MB、物理 %.0f MB、CPU 不访问却进写跟踪 %.0f MB；贴图（累计 %llu 张）标志位：",
+                        (double)it.pool_comp_b / 1048576.0, (double)it.pool_shader_b / 1048576.0, (double)it.pool_virt_b / 1048576.0, (double)it.pool_phys_b / 1048576.0, (double)it.pool_noaccess_tracked_b / 1048576.0, (unsigned long long)it.tex_n);
+                    static const char *const tb[11] = {"显示", "视频解码", "图像/存储", "可压缩", "线性", "稀疏", "线性渲染目标", "自适应Z剔除", "D16快清", "最小布局", "Z剔除含模板"};
+                    for (int k = 0; k < 11; k++) if (it.tex_bit[k]) o += (size_t)snprintf(b + o, sizeof b - o, "%s %llu、", tb[k], (unsigned long long)it.tex_bit[k]);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 snprintf(b, sizeof b, "分时（绑定，每帧）：整组没重建直接沿用 %.0f 个、整组重建后没发的阶段 %.0f 个、段内切片表命中 %.0f 块；可沿用却没用成：命令变 %.0f、段变 %.0f、全局写代号变 %.0f、贴图登记代号变 %.0f、程序变 %.0f、base_instance 变 %.0f、换过管线 %.0f、逐项校验不过 %.0f", (double)pf[RP_PERF_BIND_FAST] / f, (double)pf[RP_PERF_BIND_SKIP] / f, (double)pf[RP_PERF_BIND_SLICE_HIT] / f,
                          (double)pf[RP_PERF_KEEP_F_CMD] / f, (double)pf[RP_PERF_KEEP_F_SEG] / f, (double)pf[RP_PERF_KEEP_F_GEN] / f, (double)pf[RP_PERF_KEEP_F_REG] / f,
                          (double)pf[RP_PERF_KEEP_F_PG] / f, (double)pf[RP_PERF_KEEP_F_BI] / f, (double)pf[RP_PERF_KEEP_F_PIPESET] / f, (double)pf[RP_PERF_KEEP_F_ITEMS] / f);
@@ -343,9 +385,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 if (pf[RP_PERF_TEX_UP_PART])   // 线性 CPU 贴图只传脏行（upload_linear_dirty）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；线性贴图按脏行传 %.1f 次共 %.0f 行", (double)pf[RP_PERF_TEX_UP_PART] / f, (double)pf[RP_PERF_TEX_UP_ROWS] / f);
                 if (pf[RP_PERF_RES_N])
-                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB、新建镜像 %.0f 次",
+                    snprintf(b + strlen(b), sizeof b - strlen(b), "；解析分段：取镜像与快检 %.1f、锁等待 %.1f、慢路尾 %.1f 毫秒（%.0f 段/帧）；落地 %.0f 次共 %.0f KB（显卡写区间里不搬 %.0f KB）、新建镜像 %.0f 次",
                              (double)pf[RP_PERF_RES_FIND_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LW_NS] / 1e6 / f, (double)pf[RP_PERF_RES_LA_NS] / 1e6 / f, (double)pf[RP_PERF_RES_N] / f,
-                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
+                             (double)pf[RP_PERF_LAND_N] / f, (double)pf[RP_PERF_LAND_KB] / f, (double)pf[RP_PERF_BUF_SYNC_GW_KB] / f, (double)pf[RP_PERF_MIRROR_N] / f);
                 if (pf[RP_PERF_GW_REG_N])   // 显卡写登记：收到多少条、同段合并掉多少条（落地次数 = 登记 − 合并）
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);

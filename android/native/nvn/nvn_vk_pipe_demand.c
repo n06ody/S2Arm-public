@@ -11,6 +11,9 @@
 #include "nvn_plat.h"     // nvn_plat_flag（debug.s2a.*）
 #include "rp_shader.h"    // rp_shader_prog_borrow/return / struct rp_prog
 #include "nvn_plat.h"     // 已有；nvn_plat_log / nvn_plat_flag
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+#include "../capacity_affinity.h"
+#endif
 // 弱链接[pipedemand]：s2a_fu_rt_reset（nvn_first_use.c 提供；android/tools/nvn_vk_pipe_demand_test.sh 不链它）
 void s2a_fu_rt_reset(void) __attribute__((weak));   // 首用 fresh/seen 历史清表（nvn_first_use.c；弱引用，宿主缺实现就跳过）
 
@@ -113,6 +116,10 @@ static void dem_build(int h) {
 }
 
 static void *dem_main(void *arg) {
+#if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
+    pthread_setname_np(pthread_self(), "nvk-pipe-build");
+    s2a_capacity_enter(S2A_CAPACITY_BACKGROUND);
+#endif
     const uint64_t mine = (uint64_t)(uintptr_t)arg;
     for (;;) {
         pthread_mutex_lock(&g_q_mu);

@@ -12,6 +12,7 @@
 #include "nvn_protos.h"
 #include "nvn_count.h"
 #include "nvn_tex.h"
+#include "nvn_intent.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
 #include "nvn_fps.h"
@@ -402,6 +403,27 @@ static inline uint64_t pool_ga(const pool_t *o) { pool_mark_addressed(o); return
 #define GA(a) nvn_ga2ca(a)
 
 static uint8_t *vpool_reserve(const pool_t *o); static void vpool_release(const pool_t *o);   // sparse virtual pools, see MapVirtual
+// 意图探针（nvn_intent.h）：Discard / 池标志 / 贴图标志，只数不改语义
+static struct nvn_intent g_intent;
+void nvn_intent_take(struct nvn_intent *out) {
+    for (int i = 0; i < 9; i++) out->discard[i] = __atomic_exchange_n(&g_intent.discard[i], 0, __ATOMIC_RELAXED);
+    for (int i = 0; i < 16; i++) { out->pool_n[i] = __atomic_load_n(&g_intent.pool_n[i], __ATOMIC_RELAXED); out->pool_b[i] = __atomic_load_n(&g_intent.pool_b[i], __ATOMIC_RELAXED); }
+    out->pool_comp_b = __atomic_load_n(&g_intent.pool_comp_b, __ATOMIC_RELAXED); out->pool_shader_b = __atomic_load_n(&g_intent.pool_shader_b, __ATOMIC_RELAXED);
+    out->pool_virt_b = __atomic_load_n(&g_intent.pool_virt_b, __ATOMIC_RELAXED); out->pool_phys_b = __atomic_load_n(&g_intent.pool_phys_b, __ATOMIC_RELAXED);
+    out->pool_noaccess_tracked_b = __atomic_load_n(&g_intent.pool_noaccess_tracked_b, __ATOMIC_RELAXED);
+    out->tex_n = __atomic_load_n(&g_intent.tex_n, __ATOMIC_RELAXED);
+    for (int i = 0; i < 11; i++) out->tex_bit[i] = __atomic_load_n(&g_intent.tex_bit[i], __ATOMIC_RELAXED);
+}
+static void intent_pool(uint32_t f, uint64_t size, int tracked) {
+    const int cpu = f & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? 0 : f & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? 1 : f & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? 2 : 3;
+    const int gpu = f & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS ? 0 : f & NVN_MEMORY_POOL_FLAGS_GPU_UNCACHED ? 1 : f & NVN_MEMORY_POOL_FLAGS_GPU_CACHED ? 2 : 3;
+    __atomic_fetch_add(&g_intent.pool_n[cpu * 4 + gpu], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_intent.pool_b[cpu * 4 + gpu], size, __ATOMIC_RELAXED);
+    if (f & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE) __atomic_fetch_add(&g_intent.pool_comp_b, size, __ATOMIC_RELAXED);
+    if (f & NVN_MEMORY_POOL_FLAGS_SHADER_CODE) __atomic_fetch_add(&g_intent.pool_shader_b, size, __ATOMIC_RELAXED);
+    if (f & NVN_MEMORY_POOL_FLAGS_VIRTUAL) __atomic_fetch_add(&g_intent.pool_virt_b, size, __ATOMIC_RELAXED);
+    if (f & NVN_MEMORY_POOL_FLAGS_PHYSICAL) __atomic_fetch_add(&g_intent.pool_phys_b, size, __ATOMIC_RELAXED);
+    if (cpu == 0 && tracked) __atomic_fetch_add(&g_intent.pool_noaccess_tracked_b, size, __ATOMIC_RELAXED);
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->nvmap = ((const pool_builder_x *)b)->native;   // native：构建器给的 nvmap 句柄（SetNativeHandleNVX），MemoryPoolGetNativeHandleNVX 回它
@@ -410,6 +432,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     if (((const pool_builder_x *)b)->res_pitch) { static int once; if (!once++) LOG("【红】 MemoryPoolInitialize: 池 %p 预留了线性 GPU 地址 %#llx（SetPitchAddressNVX），本层 GPU 地址自己分配、不按预留值", (void *)p, (unsigned long long)((const pool_builder_x *)b)->res_pitch); }
     if (!o->mem && (o->flags & 0x200)) o->mem = vpool_reserve(o);   // every virtual pool: its own address range, a page table over physical pools (see MapVirtual)
     else if (o->mem) { nvn_be_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    intent_pool((uint32_t)o->flags, o->size, o->mem && !(o->flags & 0x200));   // 意图探针
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】 MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     // Switch 2（NVN2）：池建在 gsv GPU 可访问内存上，那段内存的 GPU 虚拟地址就是它的 CPU 虚拟地址，缓冲区地址 = 存储的 CPU 地址；游戏会拿 GetBufferAddress 的结果加偏移直接用 CPU 读写
     //   （#351：给窗口地址时 CPU 读 0xC086D00000 一带非法地址崩）。所以 NVN2 不另分窗口地址，pool_ga 回存储地址，nvn_ga2ca 对它原样过。窗口只给 Switch 1（大页对齐语义，见上）
@@ -761,6 +784,10 @@ static void ft_flush(const uint8_t *a, uint64_t n) {
 }
 int nvn_be_tex_from_gl(tex_t *t, uint32_t gl_name);   // nvn_mtl.m：按 GL 纹理名接存储与描述（声明不放 nvn_obj.h：那是直连出库阶段键的输入，宿主改动不该让各款直连库重出）
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
+    {   // 意图探针（nvn_intent.h）：贴图标志位分布，只数不改语义
+        const uint32_t tf = (uint32_t)TB(b)->d.flags; __atomic_fetch_add(&g_intent.tex_n, 1, __ATOMIC_RELAXED);
+        for (int k = 0; k < 11; k++) if (tf >> k & 1) __atomic_fetch_add(&g_intent.tex_bit[k], 1, __ATOMIC_RELAXED);
+    }
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
     //   previously every init created a new private MTLTexture and the old one stayed in the serial table forever, so GPU memory grew about 13 MB per frame (killed by the memory watchdog at 24 GB)
@@ -5826,8 +5853,8 @@ NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) { (void)c; 
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetConservativeRasterEnable on: ignored by the host for now"); }
 NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; }        // Tegra tiled cache hint, no Metal equivalent
 // A bound target's contents may be discarded: they are undefined afterwards, so keeping them is correct (The Great Ace Attorney Chronicles discards colour target 0)
-NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; (void)i; }
-NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; }
+NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; if (i >= 0 && i < 8) __atomic_fetch_add(&g_intent.discard[i], 1, __ATOMIC_RELAXED); }   // 只数（意图探针），不改语义
+NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; __atomic_fetch_add(&g_intent.discard[8], 1, __ATOMIC_RELAXED); }
 NVN(nvnCommandBufferSetTiledCacheTileSize, void, NVNcommandBuffer *c, int w, int h) { (void)c; (void)w; (void)h; }
 NVN_NOPROTO(nvnCommandBufferSetColorReductionEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; (void)en; }   // color compression hints
 NVN_NOPROTO(nvnCommandBufferSetColorReductionThresholds, void, NVNcommandBuffer *c, int cls, const int *t) { (void)c; (void)cls; (void)t; }
