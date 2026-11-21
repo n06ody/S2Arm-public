@@ -65,6 +65,7 @@ static uint64_t g_bar_cb;   // 最后一道全屏障后还干净的命令缓冲�
 static uint64_t g_bw_cb; static struct { const void *buf; uint64_t off, len; } g_bw_rng[16]; static int g_bw_nrng;
 static uint64_t g_bar_all, g_bar_full, g_bar_skip, g_bar_layout, g_bar_pass;
 static int g_bar_dedupe; static uint64_t g_bar_skip_tot;
+static struct { const char *f; int line; uint64_t n; } g_fb_site[24];   // 全屏障按调用点分账（见 full_barrier_at）
 static inline void bar_work(void) { __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_bw_cb, 0, __ATOMIC_RELAXED); }
 static inline void bar_any(void) { bar_work(); __atomic_fetch_add(&g_bar_all, 1, __ATOMIC_RELAXED); }
 #undef vkCmdDraw
@@ -1976,8 +1977,12 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
                 const double n = 300.0;
                 const uint64_t ba = __atomic_exchange_n(&g_bar_all, 0, __ATOMIC_RELAXED), bu = __atomic_exchange_n(&g_bar_full, 0, __ATOMIC_RELAXED), bs = __atomic_exchange_n(&g_bar_skip, 0, __ATOMIC_RELAXED),
                                bl = __atomic_exchange_n(&g_bar_layout, 0, __ATOMIC_RELAXED), bp = __atomic_exchange_n(&g_bar_pass, 0, __ATOMIC_RELAXED);
-                char bt[300]; snprintf(bt, sizeof bt, "屏障计数（CPU 侧，每帧，300 帧）：管线屏障 %.1f 道（其中全屏障 %.1f、布局转换 %.1f）、冗余全屏障合并掉 %.1f 道（nvk_bar_dedupe=%d）、开通道 %.1f 个",
+                char bt[1400]; size_t bo = (size_t)snprintf(bt, sizeof bt, "屏障计数（CPU 侧，每帧，300 帧）：管线屏障 %.1f 道（其中全屏障 %.1f、布局转换 %.1f）、冗余全屏障合并掉 %.1f 道（nvk_bar_dedupe=%d）、开通道 %.1f 个；全屏障按调用点：",
                                        (double)ba / n, (double)bu / n, (double)bl / n, (double)bs / n, g_bar_dedupe, (double)bp / n);
+                for (int i = 0; i < 24 && bo < sizeof bt; i++) if (g_fb_site[i].n) {
+                    const char *fn = g_fb_site[i].f ? strrchr(g_fb_site[i].f, '/') : NULL; fn = fn ? fn + 1 : g_fb_site[i].f ? g_fb_site[i].f : "其它";
+                    bo += (size_t)snprintf(bt + bo, sizeof bt - bo, "%s:%d %.1f、", fn, i == 23 ? 0 : g_fb_site[i].line, (double)g_fb_site[i].n / n);
+                    g_fb_site[i].n = 0; }
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", bt); }
         }
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
@@ -2899,24 +2904,35 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
     b.dstAccessMask = dst_access;
     vkCmdPipelineBarrier(c->cb, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
 }
-static void full_barrier(struct nvn_gpu_cmd_s *c) {
+// 全屏障按调用点分账（CPU 侧，0 GPU 开销）：(文件, 行) → 本窗口次数；表满的记进最后一格「其它」
+static void fb_site_note(const char *f, int line) {
+    for (int i = 0; i < 23; i++) {
+        if (g_fb_site[i].f == f && g_fb_site[i].line == line) { g_fb_site[i].n++; return; }
+        if (!g_fb_site[i].f) { g_fb_site[i].f = f; g_fb_site[i].line = line; g_fb_site[i].n = 1; return; }
+    }
+    g_fb_site[23].n++;
+}
+static void full_barrier_at(struct nvn_gpu_cmd_s *c, const char *site_f, int site_line) {
     c->xfer_dirty = 0;
     if (g_bar_dedupe && c->cb && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     __atomic_fetch_add(&g_bar_full, 1, __ATOMIC_RELAXED);
+    fb_site_note(site_f, site_line);   // 只记真录了的
     __atomic_store_n(&g_bar_cb, (uint64_t)(uintptr_t)c->cb, __ATOMIC_RELAXED);   // 屏障之后才记（mem_barrier 里的时间戳探针会先清掉它）
 }
+#define full_barrier(c) full_barrier_at((c), __FILE__, __LINE__)
 // 按序写前的屏障：开关开着、本命令缓冲正处在写串里、目标区间与串里已写的都不重叠 → 不排；否则照常排全屏障并开新串。返回后调用方必须用 bw_copy 录拷贝
-static void bw_barrier(struct nvn_gpu_cmd_s *c, const void *buf, uint32_t n, const uint64_t *off, const uint64_t *len) {
+static void bw_barrier_at(struct nvn_gpu_cmd_s *c, const void *buf, uint32_t n, const uint64_t *off, const uint64_t *len, const char *site_f, int site_line) {
     const uint64_t cb = (uint64_t)(uintptr_t)c->cb;
     int ok = g_bar_dedupe && cb && __atomic_load_n(&g_bw_cb, __ATOMIC_RELAXED) == cb && g_bw_nrng + (int)n <= 16;   // 空句柄不参与（0 是「没有」）
     for (uint32_t i = 0; ok && i < n; i++) for (int k = 0; k < g_bw_nrng; k++)
         if (g_bw_rng[k].buf == buf && g_bw_rng[k].off < off[i] + len[i] && off[i] < g_bw_rng[k].off + g_bw_rng[k].len) { ok = 0; break; }
     if (ok) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_bar_skip_tot, 1, __ATOMIC_RELAXED); c->xfer_dirty = 0; }
-    else { full_barrier(c); g_bw_nrng = 0; }
+    else { full_barrier_at(c, site_f, site_line); g_bw_nrng = 0; }
     for (uint32_t i = 0; i < n && g_bw_nrng < 16; i++) g_bw_rng[g_bw_nrng++] = (__typeof__(g_bw_rng[0])){buf, off[i], len[i]};
 }
+#define bw_barrier(c, buf, n, off, len) bw_barrier_at((c), (buf), (n), (off), (len), __FILE__, __LINE__)
 // 写串里的拷贝：绕开 bar_work 包装直接录（它本身就是串的一员），录完把串记在这个命令缓冲上
 #define bw_copy(c, ...) do { (w_vkCmdCopyBuffer)((c)->cb, __VA_ARGS__); __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); __atomic_store_n(&g_bw_cb, (uint64_t)(uintptr_t)(c)->cb, __ATOMIC_RELAXED); } while (0)
 
