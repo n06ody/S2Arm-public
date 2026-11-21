@@ -62,6 +62,7 @@
 入	graphics/nvn/tools/romfs_list.py	仓库里唯一的 RomFS 遍历与文件头清单（11-03）：抽取 / 直连读哪些 RomFS 文件、文件头由它给（glslc_offline / nxsh_extract / ue_pak / spirv_msl / resource_input_key / direct_lib.py 经它）
 入	pack/romfs_img.py	标准 RomFS 镜像读取（11-16）：RomFS 目录不在、旁边有 <目录>.std 时 romfs_list.py 从镜像盘点 / 读头经它
 入	graphics/tools/direct/direct_lib.py
+入	graphics/tools/direct/vk_request_material.py	安卓出库拒收的请求原料随资源交付
 入	graphics/tools/direct/dsh/Dsh.cs	运行时与离线颜色出口同链失效
 入	graphics/tools/direct/dsh/SpvCross.cs	共用 half 出口改写的互操作入口
 入	graphics/tools/direct/dsh/DshCApi.cs	S2A.Dsh 源码（11-01 起出包每键改写由 C# 批量进程做，dmsh_build.py dsh_batch；S2A.Dsh.csproj 按 *.cs 全编，静态扫描扫不出）

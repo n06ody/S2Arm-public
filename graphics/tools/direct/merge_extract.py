@@ -32,12 +32,17 @@ ctl_len = nvn_key.ctl_len
 nx_key = nvn_key.skey   # 第 2 代键（两段易变字段置零，translator/nvn_key.py）
 
 
-def records(d):   # 同出库 Build.cs Records：按分隔符切
-    out, p = [], d.find(SEP)
+def record_spans(d):
+    """直连包记录的起止偏移。切法同出库 PkgRead.Records。"""
+    p = d.find(SEP)
     while p >= 0:
         q = d.find(SEP, p + 1)
-        out.append(d[p:q if q >= 0 else len(d)]); p = q
-    return out
+        yield p, q if q >= 0 else len(d)
+        p = q
+
+
+def records(d):
+    return [d[start:end] for start, end in record_spans(d)]
 
 
 def split_rec(rec):

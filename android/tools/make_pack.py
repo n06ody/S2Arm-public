@@ -386,6 +386,9 @@ def entries_from_root(root, staging, sysdata=None, direct_vulkan=False):
                         if n.startswith('b-') and n.endswith('-vk') and os.path.isdir(os.path.join(libs, n))]
                 # 首局预热种子（pack/stage_vk_warm_seed.sh）：宿主首局按 <revision>/shaders/direct/warm-vk/<闭包>-<profile>/ 读（nvn_vk_prog_warm.h「随包种子」）
                 if os.path.isdir(os.path.join(libs, 'warm-vk')): out.append(('shaders/direct/warm-vk', os.path.join(libs, 'warm-vk')))
+                material = os.path.join(libs, 'request-material.bin')
+                if os.path.isfile(material):
+                    out.append(('shaders/direct/request-material.bin', material))
         else:
             out += [(f'shaders/{n}', os.path.join(shaders, n)) for n in sorted(os.listdir(shaders)) if n != 'work']
     # 社区补丁装载器表（#48 D2）：本次按安卓改写器出的那份已写进 staging（随下面的 modules/ 进包）；产物根里苹果改写阶段留下的 cpatch.tsv 不进安卓包

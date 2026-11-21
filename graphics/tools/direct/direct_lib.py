@@ -709,6 +709,15 @@ class Lib:
         try: shutil.copy(K + '/vk_build.tsv', OS + '/vk_build.tsv')
         except OSError as e: red('vk_build.tsv 拷不进输出目录', text=str(e))
         rows = [l.split('\t') for l in lines_of(K + '/vk_build.tsv') or []]
+        material_cmd = [PY, R + '/graphics/tools/direct/vk_request_material.py',
+                        W + '/merged/pkg', P + '/shader_map.tsv', P + '/shader_pairs.tsv',
+                        K + '/vk_build.tsv', V, OS + '/request-material.bin']
+        material_log = W + '/request_material.log'
+        rc = run(material_cmd, log=material_log)
+        if rc != 0:
+            say(f'🟡 请求原料未生成（rc={rc}），缺的程序首遇现编；{last_line(material_log)}')
+        else:
+            say(last_line(material_log))
         f3 = lambda c, i: c[i] if len(c) > i else ''
         put(OS + '/keys.tsv', ''.join(k + '\n' for k in sorted(c[0] for c in rows if f3(c, 2) == 'ok')))
         cnt = collections.Counter(f3(c, 2) for c in rows if f3(c, 2) != 'ok')

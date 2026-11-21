@@ -1,5 +1,5 @@
 #!/bin/bash
-# 门禁覆盖：graphics/tools/direct/direct_lib.py tests/direct_lib_android_test.sh
+# 门禁覆盖：graphics/tools/direct/direct_lib.py graphics/tools/direct/vk_request_material.py android/tools/make_pack.py tests/direct_lib_android_test.sh tests/vk_request_material_test.py
 # 直连库出包脚本的安卓目标单测（graphics/tools/direct/direct_lib.py，S2A_DIRECT_TARGETS=android，#783；假仓库 + 桩，约 3 秒）：bash tests/direct_lib_android_test.sh
 #   脚本原样拷进假仓库；抽取合并、配对表、出库工具 dsh_vklib 换成桩（桩记下调用与参数）。Metal 那几步（fout_want.py / se_want.py / dsh_batch.py / spvc_inproc.py / pso_seed.py）
 #   假仓库里不放：安卓分支调到它们就找不到、报红。期望按 #783 直连线 / 出包线的答复手写：
@@ -11,7 +11,7 @@
 #   ④ Vulkan / OpenGL 款 → 退出 0、不出库、不调出库工具
 #   ⑤ 出库工具失败 → 退出 1、🔴、输出目录不动
 #   ⑥ 只出安卓却要发布 iOS（S2A_DIRECT_PUBLISH=ios）→ 退出 1、🔴、不调出库工具
-set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); bad=0; trap 'rm -rf "$T"' EXIT
+set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d "${TMPDIR:-/tmp}/s2a-direct-lib-XXXXXX"); bad=0; trap 'rm -rf "$T"' EXIT
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
 P=$T/repo; mkdir -p $P/graphics/tools/direct/vklib $P/graphics/nvn/tools $P/graphics/nvn/games $P/translator $P/pack $P/tools
 cp "$H/graphics/tools/direct/direct_lib.py" $P/graphics/tools/direct/; mkdir -p $P/pack/jobs && cp "$H/pack/jobs/space_rule.py" "$H/pack/jobs/library.py" $P/pack/jobs/; cp "$H/tools/progress.py" "$H/tools/pool_workers.py" "$H/tools/clonedir.py" "$H/tools/nostall.py" $P/tools/
@@ -25,7 +25,7 @@ import os, sys
 print(os.path.join(os.environ['FAKE_PROF'], sys.argv[2]))
 EOF
 : > $P/graphics/nvn/games/zero_skip.tsv
-printf 'def version(): return "v1"\n' > $P/translator/dmsh_chain.py
+printf 'def version(): return "0123456789ab"\n' > $P/translator/dmsh_chain.py
 cat > $P/graphics/tools/direct/extract.py <<'EOF'
 import os
 open(os.environ['FAKE_CALLS'] + '.extract', 'a').write('extract\n'); raise SystemExit(1)
@@ -46,6 +46,13 @@ import os, sys
 os.makedirs(sys.argv[1], exist_ok=True)
 for t in ('pairs', 'fout_want', 'se_want', 'seen'): open(os.path.join(sys.argv[1], t + '.tsv'), 'w').write('# 桩\n')
 print('跑局知识快照：桩')
+EOF
+export TEST_DIRECT_TOOLS="$H/graphics/tools/direct"
+cat > "$P/graphics/tools/direct/vk_request_material.py" <<'EOF'
+import os, sys
+sys.path.insert(0, os.environ["TEST_DIRECT_TOOLS"])
+from vk_request_material import main
+main(sys.argv[1:])
 EOF
 # 出库工具桩：记参数；FAKE_VK_RC 非空就按它退出；否则 --out 里 a / c 两键 ok（出 _b.spv + _b.json）、b / d（gs）skipped；FAKE_VK_FAILED 时 b 为 failed 并非零退出，
 #   --lib 里写 lib.idx / lib.000.pak（真工具是 LibPack 打的容器，那支在 t_dsh_vklib ⑩ 核）与 run<FAKE_RUN>（认出是第几次）
@@ -71,19 +78,19 @@ printf 'split\t1\ns2a_extract\t2\n' > $G/extract/ok; echo s > $G/extract/split.l
 printf 'vs_0.bin\t0\t-\tcccccccccccccccc\t-\n' > $G/extract/split/shader_map.tsv; : > $G/extract/split/shader_facts.tsv; : > $G/extract/split/shader_pairs.tsv
 echo 'title	桩' > $T/prof/0100ABCD00000000/game.tsv
 export S2A_DISK_FREE_G=999   # 出库开工前的空间复核（pack/jobs/space_rule.py）按注入余量判，单测结果不随本机磁盘余量变（11-09 门禁机余量紧时假红）
-export FAKE_PROF=$T/prof S2A_PYTHON=python3 S2A_DIRECT_CACHE=$T/cache S2A_CPU_LEDGER=0 S2A_PSO_SOURCES=$T/nopso J=2 DSX_LIB=$T/libdsx.so
+export FAKE_PROF=$T/prof S2A_PYTHON=${S2A_PYTHON:-python3} S2A_DIRECT_CACHE=$T/cache S2A_CPU_LEDGER=0 S2A_PSO_SOURCES=$T/nopso J=2 DSX_LIB=$T/libdsx.so
 O=$T/out
-D() { S2A_DIRECT_TARGETS=android S2A_DIRECT_PUBLISH=${PUB:-android} python3 $P/graphics/tools/direct/direct_lib.py $G $O 2>&1; }
+D() { S2A_DIRECT_TARGETS=android S2A_DIRECT_PUBLISH=${PUB:-android} "$S2A_PYTHON" $P/graphics/tools/direct/direct_lib.py $G $O 2>&1; }
 n() { wc -l < "$1" 2> /dev/null | tr -d ' ' || echo 0; }
 snap() { (cd $O 2> /dev/null && find . -type f | LC_ALL=C sort | xargs -r cat | cksum); }
-o=$(D); r=$?; V=$O/b-v1-vk
-ck "① 出成（rc=${r}）：b-v1-vk/ 里是库容器、没有逐键散文件，没有 Metal 的 b-v1/，vk_build.tsv 副本在输出目录" '[ $r = 0 ] && [ -s $V/lib.idx ] && [ -s $V/lib.000.pak ] && [ -z "$(ls $V | grep _b\.)" ] && [ -f $O/vk_build.tsv ] && [ ! -e $O/b-v1 ]'
+o=$(D); r=$?; V=$O/b-0123456789ab-vk
+ck "① 出成（rc=${r}）：b-0123456789ab-vk/ 里是库容器、没有逐键散文件，没有 Metal 的 b-0123456789ab/，vk_build.tsv 副本在输出目录" '[ $r = 0 ] && [ -s $V/lib.idx ] && [ -s $V/lib.000.pak ] && [ -z "$(ls $V | grep _b\.)" ] && [ -f $O/vk_build.tsv ] && [ ! -e $O/b-0123456789ab ]'
 ck "① keys.tsv 只列 ok 的键、排好序（实 $(tr '\n' ' ' < $O/keys.tsv 2> /dev/null)）" '[ "$(tr "\n" " " < $O/keys.tsv)" = "aaaaaaaaaaaaaaaa cccccccccccccccc " ]'
 ck "① 表与 key_map 收进输出目录、direct_lib.json 记 target=android" '[ -f $O/game.tsv ] && [ -f $O/shader_map.tsv ] && [ -f $O/key_map.tsv ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"target\"] == \"android\" and d[\"built\"] == 2 and d[\"union\"] == 4 else 1)" $O/direct_lib.json'
 a=$(tail -1 $T/calls.vk)
-ck "① dsh_vklib 收到合并后的包目录、配置档副本、库目录与链号、libdsx（${a:0:60}…）" '[[ "$a" == "build --pkg "*"/merged/pkg --profile "*"/profile/0100ABCD00000000 --out "*"/vk/keys --lib "*"/b-v1-vk --chain v1 --dsx $T/libdsx.so --work "* ]]'
+ck "① dsh_vklib 收到合并后的包目录、配置档副本、库目录与链号、libdsx（${a:0:60}…）" '[[ "$a" == "build --pkg "*"/merged/pkg --profile "*"/profile/0100ABCD00000000 --out "*"/vk/keys --lib "*"/b-0123456789ab-vk --chain 0123456789ab --dsx $T/libdsx.so --work "* ]]'
 l=$(echo "$o" | tail -1)
-ck "① 末行部分出库 🟡，带 skipped 2 支（${l:0:90}）" '[[ "$l" == *"🟡 直连缺口（部分出库）："* ]] && [[ "$l" == *"skipped 2 支"* ]] && [[ "$l" == *"安卓 Vulkan 库 b-v1-vk：并集 4，出库 2，没出成 2"* ]]'
+ck "① 末行部分出库 🟡，带 skipped 2 支（${l:0:90}）" '[[ "$l" == *"🟡 直连缺口（部分出库）："* ]] && [[ "$l" == *"skipped 2 支"* ]] && [[ "$l" == *"安卓 Vulkan 库 b-0123456789ab-vk：并集 4，出库 2，没出成 2"* ]]'
 o=$(FAKE_RUN=2 D); r=$?
 ck "② 输出目录已在时再出一次（rc=${r}）：换成新的一份、旧的删掉、不留临时目录" '[ $r = 0 ] && [ -f $V/run2 ] && [ ! -e $V/run1 ] && [ -z "$(ls -d $O.stage.* 2> /dev/null)" ]'
 s0=$(snap); nv=$(n $T/calls.vk); mv $G/extract/ok $T/ok; o=$(D); r=$?; mv $T/ok $G/extract/ok
@@ -92,10 +99,12 @@ for api in vulkan gl; do o=$(FAKE_API=$api D); r=$?
   ck "④ ${api} 款（rc=${r}）：退 0、不出库、不调出库工具" '[ $r = 0 ] && [[ "$o" == *"安卓运行时自己编，不出直连库"* ]] && [ "$(n $T/calls.vk)" = "$nv" ] && [ "$(snap)" = "$s0" ]'; done
 o=$(FAKE_VK_FAILED=1 FAKE_RUN=3 D); r=$?; l=$(echo "$o" | tail -1)
 ck "⑤ 个别键翻译失败（rc=${r}）：退 0、照常发布成功的键、末行 🟡 带 failed 1 支、keys.tsv 不列失败的键（${l:0:90}）" '[ $r = 0 ] && [ -f $V/run3 ] && [[ "$l" == *"🟡 直连缺口（部分出库）："* ]] && [[ "$l" == *"failed 1 支"* ]] && [ "$(tr "\n" " " < $O/keys.tsv)" = "aaaaaaaaaaaaaaaa cccccccccccccccc " ] && [ -z "$(ls -d $O.stage.* 2> /dev/null)" ]'
+ck '⑤ 个别键拒收后交付版本化请求原料' 'test -s "$O/request-material.bin"'
 s0=$(snap)
 o=$(FAKE_VK_RC=1 D); r=$?
 ck "⑤ 出库工具失败（rc=${r}）：退 1、🔴、输出目录不动" '[ $r = 1 ] && [[ "$o" == *"🔴 安卓 Vulkan 库出库失败 rc=1"* ]] && [ "$(snap)" = "$s0" ] && [ -z "$(ls -d $O.stage.* 2> /dev/null)" ]'
 nv=$(n $T/calls.vk); o=$(PUB=ios D); r=$?
 ck "⑥ 只出安卓却要发布 iOS（rc=${r}）：退 1、🔴、不调出库工具" '[ $r = 1 ] && [[ "$o" == *🔴* ]] && [ "$(n $T/calls.vk)" = "$nv" ]'
+"$S2A_PYTHON" "$H/tests/vk_request_material_test.py" || bad=1
 [ $bad = 0 ] && echo "直连库安卓目标单测：全通" || echo "直连库安卓目标单测：有不通"
 exit $bad
