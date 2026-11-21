@@ -7,6 +7,7 @@
 // GPU 往池里写（贴图拷回缓冲、计算着色器写存储缓冲、变换反馈）要反方向回写游戏内存，随那几条命令一起接。
 // 平台有零拷贝后备（安卓 AHB）时镜像与同步都可以省掉，那是平台接口「内存池后备」一组，接它不改这里的对外形状。
 #include "rp_exec.h"
+#include "rp_guard_probe.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -31,7 +32,10 @@ enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32 };
 struct read_range { uint64_t sub, lo, hi; };   // 页区间 [lo, hi]；同桶碰撞取包络，宁可多走有序传输
 struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
                 uint64_t *stale, *stale_sum; uint64_t log_cur, log_id;
-                struct read_range reads[READ_BUCKETS]; };
+                struct read_range reads[READ_BUCKETS];
+                uint64_t *guard_upload;
+                uint64_t guard_version;
+              };
 // 每个池最多两份镜像。平时只有第 0 份；游戏的 Finish 被放行、不等上一帧做完时（rp_exec.c nvn_be_finish_publish），每帧换一份用：
 // 上一帧的活显卡还在做，读的是另一份。两份各记各的页代号，换回来时自己把这两帧里变过的页补上。
 // landing：正在锁外把 GPU 写回的内容拷进游戏内存（拷贝是 13 MB/帧量级，压在全局锁里会把提交线程挡住 11–21 毫秒/帧）。
@@ -45,7 +49,7 @@ struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t 
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
                 int failed;   // 第一份镜像建不出来：记住，之后这个池直接按未接返回，不再每笔重建（池释放时随表项删掉，重建池会重试）
-                struct land_rng lr[16]; int nlr; };
+                struct land_rng lr[16]; int nlr; uint8_t *guard_gpu_pages; };
 static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finish 与提交互斥）
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
@@ -88,10 +92,10 @@ static int limbo_push(nvn_gpu_buf b) {   // 调用方持 g_bmu；0 = 记不下�
 }
 static void mirror_free(struct mirror *m, int defer) {
     if (m->buf && !(defer && limbo_push(m->buf))) nvn_gpu_buf_release(m->buf, NULL, NULL);
-    free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
+    free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); free(m->guard_upload); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s); }
+                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->guard_gpu_pages); free(s); }
 // 镜像映射代号：新建镜像、换镜像都会让「同一段地址解析出的 (缓冲, 偏移)」变掉。回放核心的解析结果缓存按它作废。
 
 // ---------- 脏页追加日志（nvk_buf_dirtylog，#1501 A②）----------
@@ -171,6 +175,7 @@ static int mirror_make(struct shadow *s, int i) {
     m->sub = calloc(s->npages ? s->npages : 1, sizeof *m->sub);
     m->checked = calloc(s->npages ? s->npages : 1, sizeof *m->checked);
     if (!m->synced || !m->sub || !m->checked) { mirror_free(m, 0); return 0; }   // 页表没分出来：不留半份镜像（之后每次使用都会读它）
+    if (s->guard_gpu_pages) m->guard_upload = calloc(s->npages, sizeof *m->guard_upload);
     if (s->log_on && log_arm(s, m)) m->path = MP_LOG;   // 起不了日志就沿用逐页路径
     return 1;
 }
@@ -187,6 +192,8 @@ static struct shadow *shadow_get(const uint8_t *mem, uint64_t size) {
     s->mem = mem; s->size = size;
     s->page0 = (uintptr_t)mem & ~(uintptr_t)(ps - 1);
     s->npages = ((uintptr_t)mem + size - s->page0 + ps - 1) / ps;
+    if (nvn_plat_flag("nvk_pass_guard_s", 0) > 0)
+        s->guard_gpu_pages = calloc(s->npages, sizeof *s->guard_gpu_pages);
     s->untracked = nvn_dirty_span(mem, (size_t)size) == NULL;   // 池登记时就定了（写跟踪在登记池的同一刻起区间），之后不变
     // 脏页追加日志：开关开着、写跟踪给这个池起了日志（nvk_session 在登记任何池之前配置）才用；整池的范围句柄在这里取一次
     if (nvn_plat_flag("nvk_buf_dirtylog", 1) && (s->span = nvn_dirty_span(mem, (size_t)size))) { uint64_t id, cur; s->log_on = nvn_dirty_log_open(s->span, &id, &cur); }
@@ -305,6 +312,11 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
     struct shadow *s = shadow_get(mem, size); uint64_t id = 0;
     if (s) {
         const uint64_t off = addr - (uint64_t)(uintptr_t)mem, sub = rp_sub_serial();
+        // Persist after landing: a later mirror upload can copy bytes produced by the GPU.
+        if (s->guard_gpu_pages) {
+            const uint64_t first = addr - s->page0, ps = nvn_dirty_page_size();
+            memset(s->guard_gpu_pages + first / ps, 1, (first + len - 1) / ps - first / ps + 1);
+        }
         rp_perf_add(RP_PERF_GW_REG_N, 1); rp_perf_add(RP_PERF_GW_REG_KB, len / 1024);
         if (merged && merge_on) {
             int mi = g_mirror_cur;   // 与 mirror_pick 同一规则（不带它记账的副作用）：与任一未落地登记相交就跟着那一条的镜像，否则用当前这一份
@@ -420,7 +432,7 @@ static void mirror_note_read(struct mirror *m, uint64_t lo, uint64_t hi) {
     if (lo < r->lo) r->lo = lo;
     if (hi > r->hi) r->hi = hi;
 }
-static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
+static int mirror_read_hit(const struct mirror *m, uint64_t lo, uint64_t hi) {
     uint64_t sub = rp_sub_serial();
     for (int i = 0; i < READ_BUCKETS; i++) {
         const struct read_range *r = &m->reads[i];
@@ -481,8 +493,19 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         if (!landing_hit && s->nlr) { const uint64_t ra = a - (uintptr_t)mem, rb = b - (uintptr_t)mem;
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
+        nvn_gpu_cmd xc = NULL;
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        else { xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        if (m->guard_upload) {
+            const uint64_t version = ++m->guard_version << 2;
+            for (uint64_t k = i; k <= j; k++) {
+                // sync_write skips registered GPU intervals. A page with a GPU writer
+                // cannot be certified by a later CPU mirror upload.
+                if (s->guard_gpu_pages[k]) m->guard_upload[k] = 0;
+                else if (d) m->guard_upload[k] = version | RP_GUARD_UPLOAD_DIRECT;
+                else m->guard_upload[k] = xc ? version | RP_GUARD_UPLOAD_ORDERED : 0;
+            }
+        }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }
@@ -615,6 +638,72 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
     pthread_mutex_unlock(&g_bmu);
     return r;
 }
+// Diagnostic-only. Check the exact descriptor window against the mirror selected
+// by replay. Only direct CPU uploads can be read from the mapping at record time.
+static void guard_classify(const struct shadow *s, const struct mirror *m,
+                           uint64_t off, uint64_t len, uint32_t field, uint32_t stride, uint32_t count,
+                           struct rp_guard_observation *out) {
+    if (off > s->size || len > s->size - off || !out->range) { out->range = 0; return; }
+    const uint64_t addr = (uintptr_t)s->mem + off, hi = addr + len;
+    for (int i = 0; i < s->ngw; i++) {
+        const struct gpu_write *w = &s->gw[i];
+        if (off < w->off + w->len && w->off < off + len) {
+            if (w->landing) out->landing = 1;
+            else out->pending = 1;
+        }
+    }
+    if (s->landing > s->nlr) out->landing = 1;
+    for (int i = 0; i < s->nlr; i++)
+        if (off < s->lr[i].off + s->lr[i].len && s->lr[i].off < off + len) out->landing = 1;
+    out->alias = rp_pool_guard_alias(s->mem, addr, hi);
+    if (!m->guard_upload) return;
+    const uint64_t ps = nvn_dirty_page_size(), lo_page = (addr - s->page0) / ps, hi_page = (hi - 1 - s->page0) / ps;
+    const uint64_t first = m->guard_upload[lo_page];
+    unsigned types = 0;
+    int one_version = first != 0;
+    for (uint64_t i = lo_page; i <= hi_page; i++) {
+        const uint64_t entry = m->guard_upload[i];
+        types |= 1u << (entry & 3);
+        one_version &= (entry >> 2) == (first >> 2);
+        out->gpu_writer |= s->guard_gpu_pages[i];
+    }
+    if (!(types & 1)) out->upload = types == (1u << RP_GUARD_UPLOAD_DIRECT) ? RP_GUARD_UPLOAD_DIRECT :
+                                    types == (1u << RP_GUARD_UPLOAD_ORDERED) ? RP_GUARD_UPLOAD_ORDERED : RP_GUARD_UPLOAD_MIXED;
+    if (!(types & 1)) out->version = one_version ? RP_GUARD_VERSION_SINGLE : RP_GUARD_VERSION_MULTIPLE;
+    if (out->pending || out->landing || out->alias || out->gpu_writer || s->untracked ||
+        nvn_dirty_tracking_unreliable() || m->use_sub != rp_sub_serial() ||
+        !mirror_read_hit(m, lo_page, hi_page)) return;
+    out->cpu_writer = out->upload != RP_GUARD_UPLOAD_UNKNOWN;
+    if (!out->prefix || out->version != RP_GUARD_VERSION_SINGLE || out->upload != RP_GUARD_UPLOAD_DIRECT) return;
+    const uint8_t *cpu = nvn_gpu_buf_cpu(m->buf);
+    if (!cpu) return;
+    out->zero = RP_GUARD_ALL_ZERO;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t word;
+        memcpy(&word, cpu + off + field + (uint64_t)i * stride, sizeof word);
+        if (word) { out->zero = RP_GUARD_NONZERO; break; }
+    }
+}
+
+void rp_buf_guard_probe(nvn_gpu_buf buf, uint64_t off, uint64_t len,
+                        uint32_t field, uint32_t stride, uint32_t count, int prefix_known,
+                        struct rp_guard_observation *out) {
+    *out = (struct rp_guard_observation){.prefix = prefix_known != 0};
+    if (!buf || !stride || !count || count > 65536 || field % 4 || stride % 4 ||
+        (uint64_t)field + (uint64_t)(count - 1) * stride + sizeof(uint32_t) > len) return;
+    pthread_mutex_lock(&g_bmu);
+    for (uint32_t i = 0; i < g_shadow.cap; i++) {
+        const struct shadow *s = g_shadow.vals[i];
+        if (!s) continue;
+        const struct mirror *m = s->m[0].buf == buf ? &s->m[0] : s->m[1].buf == buf ? &s->m[1] : NULL;
+        if (!m) continue;
+        out->range = 1;
+        guard_classify(s, m, off, len, field, stride, count, out);
+        break;
+    }
+    pthread_mutex_unlock(&g_bmu);
+}
+
 // 批量：一次抢锁解析多段（顶点流 / 存储缓冲），成功写 1、失败写 0。
 static void resolve_multi_chunk(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
     const uint8_t *mem[16]; uint64_t size[16];

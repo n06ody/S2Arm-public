@@ -35,8 +35,9 @@ static void pass_shader_identify(struct nvn_gpu_shader_s *sh, const uint8_t key[
     s2a_sha256_hex(digest, sh->capture_sha);
     // Some replay artifact paths have no guest stage key. Use the first eight
     // bytes of the exact Vulkan module digest for diagnostic selection.
-    if (!sh->capture_key)
-        for (unsigned i = 0; i < 8; i++) sh->capture_key = (sh->capture_key << 8) | digest[i];
+    for (unsigned i = 0; i < 8; i++) sh->capture_digest_prefix = (sh->capture_digest_prefix << 8) | digest[i];
+    if (!sh->capture_key) sh->capture_key = sh->capture_digest_prefix;
+    if (g.pass_capture_delay <= 0) return;
     sh->capture_flags = s2a_spirv_storage_need(blob, size, 4) != 0 ? PASS_FS_STORAGE : 0;
     size_t n = size / 4;
     for (size_t i = 5; i < n;) {
