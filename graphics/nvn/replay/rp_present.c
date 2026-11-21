@@ -184,6 +184,8 @@ void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
 void s2a_adpf_invisible(void) __attribute__((weak));
 static _Atomic uint64_t g_adpf_seq;
 #include "nvn_intent.h"
+// 弱链接[replay]：rp_ssbo_align_take
+__attribute__((weak)) int rp_ssbo_align_take(struct rp_ssbo_align_row out[RP_SSBO_ALIGN_ROWS], uint32_t *min_align);   // 诊断探针（rp_draw.c；只链 rp_present 的夹具里没有）
 // 弱链接[replay]：nvn_intent_take
 __attribute__((weak)) void nvn_intent_take(struct nvn_intent *out);   // 批 0 诊断探针：游戏在 NVN 层显式给出的意图（前端 hle_nvn.c；没有前端的单测里没有）
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]);
@@ -325,6 +327,21 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (double)pf[RP_PERF_S5_SAME_KB] / f, (double)pf[RP_PERF_S5_DIFF_KB] / f, (double)pf[RP_PERF_S5_INV_KB] / f,
                              (double)pf[RP_PERF_S5_LSAME_KB] / f, (double)pf[RP_PERF_S5_LDIFF_KB] / f, (double)pf[RP_PERF_S5_LINV_KB] / f, (double)pf[RP_PERF_S5_NS] / 1e6 / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                if (rp_ssbo_align_take) {   // 诊断探针（nvk_ssbo_align）：计算程序存储缓冲原始地址对齐，按样本数前 8 个程序 + 50c91227a1082f2c 单列
+                    static struct rp_ssbo_align_row sr[RP_SSBO_ALIGN_ROWS]; uint32_t ma = 0; const int nr = rp_ssbo_align_take(sr, &ma);
+                    if (nr > 0) {
+                        uint64_t tn = 0, t16 = 0, tm = 0; for (int i = 0; i < nr; i++) { tn += sr[i].n; t16 += sr[i].un16; tm += sr[i].unmin; }
+                        size_t o = (size_t)snprintf(b, sizeof b, "存储缓冲原始地址对齐（计算，本窗口，minStorageBufferOffsetAlignment=%u）：合计 %llu 个绑定样本、%%16≠0 %llu、%%min≠0 %llu；", ma,
+                                                    (unsigned long long)tn, (unsigned long long)t16, (unsigned long long)tm);
+                        const uint64_t want = 0x50c91227a1082f2cull;   // owner 点名的程序键
+                        for (int i = 0; i < nr; i++) if (sr[i].key == want) o += (size_t)snprintf(b + o, sizeof b - o, "50c91227a1082f2c：%llu / %llu / %llu；",
+                                (unsigned long long)sr[i].n, (unsigned long long)sr[i].un16, (unsigned long long)sr[i].unmin);
+                        for (int k = 0; k < 8; k++) { int bi = -1; for (int i = 0; i < nr; i++) if (sr[i].n && (bi < 0 || sr[i].n > sr[bi].n)) bi = i;
+                            if (bi < 0) break;
+                            o += (size_t)snprintf(b + o, sizeof b - o, "%s%016llx %llu/%llu/%llu", k ? "、" : "前 8（键 样本/%%16≠0/%%min≠0）：", (unsigned long long)sr[bi].key,
+                                                  (unsigned long long)sr[bi].n, (unsigned long long)sr[bi].un16, (unsigned long long)sr[bi].unmin); sr[bi].n = 0; }
+                        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                }
                 {   // 批 0 诊断探针：游戏 / 回放屏障直方图（调用点 × NVN 屏障位），每帧次数，前 10 项
                     static uint64_t bh[RP_BAR_SITES][256]; rp_bar_take(bh);
                     static const char *const sn[RP_BAR_SITES] = {"通道前·紧挨换目标", "通道前·其它", "绘制读计算写", "派发前", "回放自发"};

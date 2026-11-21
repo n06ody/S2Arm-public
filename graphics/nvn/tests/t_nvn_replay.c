@@ -47,13 +47,14 @@ static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值�
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
-static int g_flag_sync_same, g_flag_bw_merge;   // 用例设：开关 nvk_sync_same / nvk_bw_merge（缺省同产品：关）；开关缓存随会话收尾（rp_buf_reset）作废
+static int g_flag_sync_same, g_flag_bw_merge, g_flag_ssbo_align;   // 用例设：开关 nvk_sync_same / nvk_bw_merge（缺省同产品：关）；开关缓存随会话收尾（rp_buf_reset）作废
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
+    if (!strcmp(name, "nvk_ssbo_align")) return g_flag_ssbo_align;
     if (!strcmp(name, "nvk_sync_same")) return g_flag_sync_same;
     if (!strcmp(name, "nvk_bw_merge")) return g_flag_bw_merge;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
@@ -4194,6 +4195,26 @@ static void t_dispatch(void) {
 // 游戏屏障对通道外的计算派发也生效（#978；iOS 在下一个编码器开头消费游戏屏障，计算编码器也算）：
 // 派发 A → 屏障 → 派发 B：屏障在 A 之后、B 之前交给后端，只交一次（之后开的绘制通道不再重发）；
 // 间接派发自带的那道屏障和待发位合成一次；负控：没有游戏屏障就一道都不插。
+// 诊断探针 nvk_ssbo_align：每次派发按程序键数存储槽原始地址的对齐。开时：16 对齐的地址计样本不计 %16；构造的非对齐地址（+8）必须计到（负控对照）；
+// 关时一个都不数。计数在取程序之前，取不到程序的派发也算（数的是游戏给的地址）
+static void t_ssbo_align(int on) {
+    struct rp_ssbo_align_row sr[RP_SSBO_ALIGN_ROWS]; uint32_t ma = 0;
+    nvn_be_shutdown_session();   // 开关缓存随 rp_draw_reset 作废，下一次派发重读
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    g_flag_ssbo_align = on; (void)rp_ssbo_align_take(sr, &ma);
+    stream s = {0}; q_env(&s);
+    p_bind_buf *sb = put(&s, OP_BIND_SSBO, sizeof *sb); sb->stage = 5; sb->index = 0; sb->addr = base + PG + 64; sb->size = 128;
+    p_dispatch *dp = put(&s, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1;
+    sb = put(&s, OP_BIND_SSBO, sizeof *sb); sb->stage = 5; sb->index = 1; sb->addr = base + PG + 8; sb->size = 64;   // 非对齐：+8
+    dp = put(&s, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1;
+    end(&s); submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+    const int nr = rp_ssbo_align_take(sr, &ma);
+    uint64_t n = 0, u16 = 0; for (int i = 0; i < nr; i++) { n += sr[i].n; u16 += sr[i].un16; }
+    printf("ssbo_align on=%d: samples=%llu un16=%llu expected %d/%d\n", on, (unsigned long long)n, (unsigned long long)u16, on ? 3 : 0, on ? 1 : 0);
+    CHECK(n == (on ? 3u : 0u) && u16 == (on ? 1u : 0u));   // 第一次派发 1 个槽（对齐），第二次 2 个槽（其一 +8）
+    g_flag_ssbo_align = 0; rp_S.ssbo[5][0].addr = rp_S.ssbo[5][1].addr = 0;
+    nvn_be_pool_del(g_pmem); pass_fresh();
+}
 static void t_dispatch_barrier(void) {
     const int32_t bits = NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT;
     for (int mode = 0; mode < 3; mode++) {   // 0 有屏障；1 有屏障、B 是间接派发；2 负控：没有屏障
@@ -6869,6 +6890,7 @@ int main(int argc, char **argv) {
     t_pool_gone_hold();
     t_buf_mirror();
     t_sync_same(1); t_sync_same(0); t_bw_merge(1); t_bw_merge(0);
+    t_ssbo_align(1); t_ssbo_align(0);
     t_buf_dirtylog();
     t_buf_untracked_once();
     t_buf_mirror_fail_once();

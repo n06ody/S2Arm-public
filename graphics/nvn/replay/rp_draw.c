@@ -1868,11 +1868,30 @@ static const char *image_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi
     return NULL;
 #undef IMGW
 }
+static struct rp_ssbo_align_row g_sal[RP_SSBO_ALIGN_ROWS]; static int g_nsal, g_sal_on = -1; static unsigned g_sal_k;
+int rp_ssbo_align_take(struct rp_ssbo_align_row out[RP_SSBO_ALIGN_ROWS], uint32_t *min_align) {
+    const int n = g_nsal; memcpy(out, g_sal, sizeof g_sal); memset(g_sal, 0, sizeof g_sal); g_nsal = 0;
+    if (min_align) *min_align = caps_cached()->min_ssbo_align;
+    return n;
+}
+static void ssbo_align_note(void) {   // 诊断探针（nvk_ssbo_align）：本次派发绑定的存储缓冲原始地址
+    if (g_sal_on < 0 || !(++g_sal_k & 255)) g_sal_on = nvn_plat_flag("nvk_ssbo_align", 0) != 0;
+    if (!g_sal_on) return;
+    uint64_t key = 0; if (rp_S.skey_ok >> 5 & 1) for (int b = 0; b < 8; b++) key = key << 8 | rp_S.skey[5][b];   // 同全仓「程序键 %016llx」的口径
+    int r = -1;
+    for (int i = 0; i < g_nsal; i++) if (g_sal[i].key == key) { r = i; break; }
+    if (r < 0) { if (g_nsal < RP_SSBO_ALIGN_ROWS - 1) { r = g_nsal++; g_sal[r].key = key; }
+                 else { r = RP_SSBO_ALIGN_ROWS - 1; g_sal[r].key = ~0ull; if (g_nsal < RP_SSBO_ALIGN_ROWS) g_nsal = RP_SSBO_ALIGN_ROWS; } }
+    const uint64_t ma = caps_cached()->min_ssbo_align ? caps_cached()->min_ssbo_align : 1;
+    for (int i = 0; i < 16; i++) { const uint64_t a = rp_S.ssbo[5][i].addr; if (!a) continue;
+        g_sal[r].n++; if (a % 16) g_sal[r].un16++; if (a % ma) g_sal[r].unmin++; }
+}
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!c) return;
     rp_perf_add(RP_PERF_DISP_N, 1);   // 派发次数（其余命令里最贵的一项，看它到底多少次）
     struct timespec tsa; clock_gettime(CLOCK_MONOTONIC, &tsa); uint64_t t_disp0 = (uint64_t)tsa.tv_sec * 1000000000ull + (uint64_t)tsa.tv_nsec;
     if (!dp->ind && (dp->x <= 0 || dp->y <= 0 || dp->z <= 0)) return;   // 0 组：空操作
+    ssbo_align_note();
     const struct rp_prog *pg = NULL;
     { struct timespec tsh; clock_gettime(CLOCK_MONOTONIC, &tsh); uint64_t sh0 = (uint64_t)tsh.tv_sec * 1000000000ull + (uint64_t)tsh.tv_nsec;
       int srx = rp_shader_resolve_compute(&pg);
@@ -2002,7 +2021,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { g_sal_on = -1; /* 诊断探针 nvk_ssbo_align：下一局第一次派发重读开关 */ rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941

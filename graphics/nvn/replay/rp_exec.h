@@ -95,7 +95,12 @@ void rp_pass_cut_why(int why);
 //   2 绘制读计算写 / 3 派发前 / 4 回放自发（base instance 拷贝）。rp_bar_take 取走并清零
 enum { RP_BAR_SITES = 5 };
 void rp_bar_note(int site, uint32_t bits);
-void rp_bar_take(uint64_t out[RP_BAR_SITES][256]);   // 下一次 rp_pass_end 结束开着的通道时记到这个原因名下（只记一次，记完回到 OTHER）
+void rp_bar_take(uint64_t out[RP_BAR_SITES][256]);
+// 计算程序存储缓冲原始地址对齐（诊断探针，开关 nvk_ssbo_align，缺省 0；rp_draw.c）：每次派发对每个非零存储槽按程序键累计
+//   样本数 / 地址 % 16 != 0 / 地址 % minStorageBufferOffsetAlignment != 0（游戏给的原始 GPU 地址，绑定解析与向下对齐之前）
+struct rp_ssbo_align_row { uint64_t key, n, un16, unmin; };
+enum { RP_SSBO_ALIGN_ROWS = 32 };   // 最后一行 key = ~0：表满之后的其它程序合在一起
+int rp_ssbo_align_take(struct rp_ssbo_align_row out[RP_SSBO_ALIGN_ROWS], uint32_t *min_align);   // 取走并清零，返回行数   // 下一次 rp_pass_end 结束开着的通道时记到这个原因名下（只记一次，记完回到 OTHER）
 enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_PERF_WAIT_N, RP_PERF_DONE_NS, RP_PERF_DONE_N, RP_PERF_PASSES, RP_PERF_PRESENT_NS,
        RP_PERF_D_PROG, RP_PERF_D_PREP, RP_PERF_D_TEX, RP_PERF_D_PIPE, RP_PERF_D_DYN, RP_PERF_D_BIND, RP_PERF_D_DRAW, RP_PERF_D_TAIL, RP_PERF_D_PASS, RP_PERF_D_PGET, RP_PERF_PB_VIEW, RP_PERF_PB_BAR, RP_PERF_PB_BE, RP_PERF_PB_MARK, RP_PERF_RES_LOCK, RP_PERF_RES_NEW, RP_PERF_RES_INIT, RP_PERF_RES_VIEWMAKE, RP_PERF_PB_SHADOW, RP_PERF_RES_SCAN, RP_PERF_RES_UP, RP_PERF_RES_UPN, RP_PERF_RES_ZERO, RP_PERF_RES_ZERON, RP_PERF_RES_MAKE, RP_PERF_RES_ZDEFER, RP_PERF_BIND_SLICE_HIT, RP_PERF_BIND_SKIP,   // 绑定：段内切片表命中的块数、整组沿用没发的阶段数
       
