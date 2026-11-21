@@ -60,7 +60,7 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
-    if len(sys.argv) == 2 and sys.argv[1] in ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop'):
+    if len(sys.argv) == 2 and sys.argv[1] in ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack'):
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
@@ -150,6 +150,23 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print('PASS: 3 libpack GS negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--cs-libpack-mutants']:
+        # 负对照：计算出库的非对齐闸撤掉（state_ok 对 ckey 不生效），--cs-libpack 必红
+        code = original.read_text()
+        for name, old, new, expected in (
+            ('unaligned-gate', 'if (!root || !state_ok || (!ckey && stages != 0x3u && stages != 0x7u) || nvn_plat_flag("no_libpack", 0)) {',
+             'if (!root || (!ckey && ((stages != 0x3u && stages != 0x7u) || !state_ok)) || nvn_plat_flag("no_libpack", 0)) {',
+             'unaligned CS storage refuses the library'),
+        ):
+            assert code.count(old) == 1, (name, 'mutation anchor')
+            path = out / ('cs-libpack-mutant-' + name + '.c')
+            path.write_text(code.replace(old, new))
+            result = run('cs-libpack-' + name, path, args=('--cs-libpack',))
+            assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print('PASS: 1 libpack CS unaligned-gate negative control')
         return 0
 
     if len(sys.argv) in (3, 4) and sys.argv[1] == '--tbuf-layout':
@@ -392,7 +409,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --cs-libpack-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'
@@ -423,6 +440,9 @@ def main():
     # 三段程序（vs + fs + gs）查出包预编库：环境变量与深度能力缓存是进程级的，单独起一个进程
     gsl = run('test-gs-libpack', original, args=('--gs-libpack',))
     sys.stdout.write(gsl.stdout); sys.stderr.write(gsl.stderr)
+    # 计算程序查出包预编库的非对齐闸（#496085）：库根环境变量进程级，单独起一个进程
+    csl2 = run('test-cs-libpack', original, args=('--cs-libpack',))
+    sys.stdout.write(csl2.stdout); sys.stderr.write(csl2.stderr)
     # 结果合并开关关闭态（debug.s2a.nvk_alias=0）：开关在进程内只读一次，单独起一个进程
     off = run('test-alias-off', original, args=('--alias-off',))
     sys.stdout.write(off.stdout)
@@ -437,7 +457,7 @@ def main():
         env.update(S2A_COMPUTE_WARM='0', S2A_DIRECT_CACHE_DIR=str(cache_off))
         cs_off = run('test-compute-warm-off', original, args=('--compute-warm-off',), env=env)
         sys.stdout.write(cs_off.stdout); sys.stderr.write(cs_off.stderr)
-    return result.returncode or live_rc or gsl.returncode or off.returncode or on.returncode or cs_off.returncode
+    return result.returncode or live_rc or gsl.returncode or csl2.returncode or off.returncode or on.returncode or cs_off.returncode
 
 if __name__ == '__main__':
     raise SystemExit(main())
