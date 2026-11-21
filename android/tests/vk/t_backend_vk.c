@@ -69,6 +69,7 @@ static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的备忘用例用；后端每 256 次绑定重读，改完调 nvn_gpu_vk_test_pool_memo_refresh 立即作废缓存）
+static int g_bc_stats_flag = -1;  // C805：nvk_bc_stats：-1 = 生产缺省，>= 0 = 读成这个值（每次上传调用读，不设缓存）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
@@ -90,6 +91,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_plc_every_ms") && g_plc_thr_every_ms >= 0) return g_plc_thr_every_ms;
     if (!strcmp(name, "nvk_gpu_deswizzle") && getenv("S2A_TEST_GPU_DESWIZZLE_OFF")) return 0;
     if (!strcmp(name, "nvk_dq")) { g_dq_dflt_seen = dflt; return getenv("S2A_TEST_NVK_DQ") ? 1 : 0; }   // 两档都由用例显式定（生产缺省开，见 C-DQ-DFLT），不跟缺省走
+    if (!strcmp(name, "nvk_bc_stats")) return g_bc_stats_flag < 0 ? dflt : g_bc_stats_flag;
     if (!strcmp(name, "nvk_desc_memo")) {
         if (getenv("S2A_TEST_DESC_MEMO")) return g_memo_on;
         g_memo_dflt_seen = dflt;   // 没指定：读后端自己的缺省，核它是开（C208）
@@ -1784,6 +1786,51 @@ static void c196_bc_abort_reclaim(void) {
     r = nvn_gpu_close(5000000000ull, &e);
     CHECK(OK(r), "C196 ② 失败段之后 close：%d %s", r.code, e.why);
     printf("C196 段内解码：abort / 失败段回收已执行\n");
+}
+
+// C805（#501805 只读计数）：nvk_bc_stats 开关缺省关；开着时按 NVN 格式累计「上传调用 / 解码平面 / 压缩字节 / 解码字节」，
+//   nvn_vk_bc_stats_line 出累计快照（长帧行尾段）。断言：关着不计、开着计对、关开关快照为空、别路（非现解）上传不计。
+static void c805_bc_stats(void) {
+    extern void nvn_vk_bc_stats_line(char *, size_t);
+    static const uint8_t bc1blk[8] = {0x00,0xf8,0x00,0xf8,0,0,0,0};                                   // BC1 红块
+    static const uint8_t bc3blk[16] = {255,255,0,0,0,0,0,0, 0x00,0xf8,0x00,0xf8,0,0,0,0};              // BC3 红块
+    uint32_t saved = g_dev.bc_decode_mask;
+    g_dev.bc_decode_mask |= (1u << (NVN_FORMAT_RGBA_DXT1 - 0x41)) | (1u << (NVN_FORMAT_RGBA_DXT5 - 0x41));
+    nvn_gpu_tex t1 = make_tex(8, 8, NVN_FORMAT_RGBA_DXT1, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex t5 = make_tex(4, 4, NVN_FORMAT_RGBA_DXT5, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_tex tr = make_tex(8, 8, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    if (!t1 || !t5 || !tr) { g_dev.bc_decode_mask = saved; return; }
+    char buf[256];
+    // 关着开关上传 8x8 BC1（4 块 32B → 8*8*4=256B）：不计
+    g_bc_stats_flag = 0;
+    nvn_gpu_cmd c = begin_cmd();
+    uint8_t src1[32]; for (int i = 0; i < 4; i++) memcpy(src1 + i * 8, bc1blk, 8);
+    nvn_gpu_tex_upload(c, t1, 0, 0, NULL, src1, 16, 32);
+    nvn_vk_bc_stats_line(buf, sizeof buf);
+    CHECK(buf[0] == 0, "C805 关开关快照应为空串，实得 %s", buf);
+    // 开开关：BC1 8x8（1 调用 1 平面，32B→256B）+ BC3 4x4（1 调用 1 平面，16B→64B）+ 非现解 RGBA8（不计）
+    g_bc_stats_flag = 1;
+    static const uint8_t px[256] = {0};
+    nvn_gpu_tex_upload(c, t1, 0, 0, NULL, src1, 16, 32);
+    nvn_gpu_tex_upload(c, t5, 0, 0, NULL, bc3blk, 16, 16);
+    nvn_gpu_tex_upload(c, tr, 0, 0, NULL, px, 32, 256);
+    nvn_vk_bc_stats_line(buf, sizeof buf);
+    CHECK(!strcmp(buf, "; bc 42:1u/1p/32B>256B 44:1u/1p/16B>64B"), "C805 快照应为两格式精确读数（非现解 RGBA8 不计）：%s", buf);
+    // 再传一次同张 BC1：累计 2u/2p/64B→512B
+    nvn_gpu_tex_upload(c, t1, 0, 0, NULL, src1, 16, 32);
+    nvn_vk_bc_stats_line(buf, sizeof buf);
+    CHECK(strstr(buf, "42:2u/2p/64B>512B"), "C805 累计应为 2 调用/2 平面/64B→512B：%s", buf);
+    nvn_gpu_err e; nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
+    CHECK(OK(r), "C805 commit：%d %s", r.code, e.why);
+    if (OK(r)) CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C805 wait：%s", e.why);
+    // 关开关再取：空串（计数在、不出）
+    g_bc_stats_flag = 0;
+    nvn_vk_bc_stats_line(buf, sizeof buf);
+    CHECK(buf[0] == 0, "C805 关开关后快照应回空：%s", buf);
+    g_bc_stats_flag = -1;
+    g_dev.bc_decode_mask = saved;
+    nvn_gpu_tex_release(t1); nvn_gpu_tex_release(t5); nvn_gpu_tex_release(tr);
+    printf("C805 nvk_bc_stats：只读计数与快照行已验\n");
 }
 
 // C197（修前红）：CPU 字节 → BC 现解贴图上传不单独提交、不在调用线程上等栅栏；解码与之后的采样同在一段、按 GPU 顺序生效。
@@ -11051,6 +11098,9 @@ int main(int argc, char **argv) {
         if (!open_backend()) return 1;
         c198_bc_bulk_upload();
         CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C198 close：%d %s", e72.rc.code, e72.why);
+        if (!open_backend()) return 1;
+        c805_bc_stats();
+        CHECK(OK(nvn_gpu_close(5000000000ull, &e72)), "C805 close：%d %s", e72.rc.code, e72.why);
         if (!open_backend()) return 1;
         c196_bc_abort_reclaim();   // 以 close 结束
         g_dev.bc_decode_mask = m; }

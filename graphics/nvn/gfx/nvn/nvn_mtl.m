@@ -6394,6 +6394,7 @@ void nvn_be_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
         MLOG("GPU allocation growth by op: op%d %llu MB, op%d %llu MB, op%d %llu MB, op%d %llu MB", top[0], g_ap_bytes[top[0]] >> 20, top[1], g_ap_bytes[top[1]] >> 20, top[2], g_ap_bytes[top[2]] >> 20, top[3], g_ap_bytes[top[3]] >> 20); }
 }
 void nvn_be_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
+void nvn_be_bc_stats(char *b, size_t n) { if (b && n) b[0] = 0; }   // #501805：bc_decoded 是 Vulkan 后端的路，Metal 侧没有这条计数
 uint64_t nvn_be_pkg_same(void) { return g_pkg_same; }
 void nvn_be_pkg_gpu_stats(uint64_t *writes, uint64_t *kept, uint64_t *partial) { *writes = g_pkg_gpu_writes; *kept = g_pkg_gpu_kept; *partial = g_pkg_partial; }   // GPU writes into uploaded textures; checks that left the GPU's content; partial re-uploads   // written pages whose texture bytes were unchanged: re-uploads skipped
 uint64_t nvn_be_pkg_miss(void) { return g_pkg_miss; }

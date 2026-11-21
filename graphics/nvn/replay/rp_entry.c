@@ -339,6 +339,12 @@ uint64_t nvn_be_drawable_ns_take(void) { return 0; }
 void nvn_be_bw(uint64_t *load, uint64_t *store, uint64_t *full) { if (load) *load = 0; if (store) *store = 0; if (full) *full = 0; }
 uint64_t nvn_be_udc_saved_bytes(void) { return 0; }
 void nvn_be_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { if (uploads) *uploads = 0; if (reuploads) *reuploads = 0; }
+// 现解 BC 贴图的累计读数段（#501805，debug.s2a.nvk_bc_stats）：Vulkan 后端给了才出内容；没给（通用回放 / 别端）或关开关都出空串。
+void nvn_vk_bc_stats_line(char *buf, size_t n) __attribute__((weak));
+void nvn_be_bc_stats(char *buf, size_t n) {
+    if (nvn_vk_bc_stats_line) { nvn_vk_bc_stats_line(buf, n); return; }
+    if (buf && n) buf[0] = 0;
+}
 uint64_t nvn_be_upload_ns_take(void) { return 0; }
 uint64_t nvn_be_upload_gpu_ns_take(void) { return 0; }
 void nvn_be_create_stats(uint64_t *lib, uint64_t *pso) { if (lib) *lib = 0; if (pso) *pso = 0; }

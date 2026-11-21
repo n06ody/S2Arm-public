@@ -7505,6 +7505,48 @@ static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_
     // 结果交给 bc_temp_to_tex 的屏障（COMPUTE 写 → TRANSFER 读，同时转 TRANSFER_SRC）
 }
 
+// ---- 只读计数（#501805，debug.s2a.nvk_bc_stats 缺省 0）----
+//   bc_decoded 贴图的上传按 NVN 格式累计：上传调用数 / 解码平面数（级 × 层 × z 切片）/ 压缩字节（= 写进压缩影子的字节）/
+//   解码后字节。快照由 nvn_vk_bc_stats_line 出给 hle_nvn 的长帧行（末位追加一段，末行即全账）。
+//   玩家包 nvn_plat_flag 恒取缺省 0 → 整块不运行；每上传调用读一次开关，不计纹素级热路径。
+static uint64_t g_bc_stat[16][4];   // NVN 0x41..0x50：0 调用 / 1 平面 / 2 压缩字节 / 3 解码字节
+static int bc_stat_on(void) { return nvn_plat_flag("nvk_bc_stats", 0); }
+static int bc_stat_obpp(uint32_t f) { return f >= 0x4f ? 8 : (f == 0x4b || f == 0x4c) ? 2 : (f == 0x49 || f == 0x4a) ? 1 : 4; }   // 与 nvn_vk_bcdec_route 的解码格式同口径
+static void bc_stat_call(uint32_t f) {
+    if (bc_stat_on() && f >= 0x41 && f <= 0x50) __atomic_fetch_add(&g_bc_stat[f - 0x41][0], 1, __ATOMIC_RELAXED);
+}
+static void bc_stat_plane(uint32_t f, uint64_t bc_bytes, uint64_t w, uint64_t h) {
+    if (!bc_stat_on() || f < 0x41 || f > 0x50) return;
+    uint64_t *s = g_bc_stat[f - 0x41];
+    __atomic_fetch_add(&s[1], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&s[2], bc_bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s[3], w * h * (uint64_t)bc_stat_obpp(f), __ATOMIC_RELAXED);
+}
+static void bc_stat_sz(uint64_t b, char *out, size_t n) {
+    if (b >= (1ull << 30)) snprintf(out, n, "%.1fG", b / 1073741824.0);
+    else if (b >= (1ull << 20)) snprintf(out, n, "%.1fM", b / 1048576.0);
+    else if (b >= (1ull << 10)) snprintf(out, n, "%.1fK", b / 1024.0);
+    else snprintf(out, n, "%lluB", (unsigned long long)b);
+}
+
+// hle_nvn 长帧行尾段（经 rp_entry.c 的 nvn_be_bc_stats 弱转到这里）：累计快照；关着开关或还没计过时出空串。
+void nvn_vk_bc_stats_line(char *buf, size_t n) {
+    if (!buf || !n) return;
+    buf[0] = 0;
+    if (!bc_stat_on()) return;
+    size_t at = 0;
+    for (int i = 0; i < 16; i++) {
+        uint64_t u = __atomic_load_n(&g_bc_stat[i][0], __ATOMIC_RELAXED), p = __atomic_load_n(&g_bc_stat[i][1], __ATOMIC_RELAXED);
+        if (!u) continue;
+        uint64_t cb = __atomic_load_n(&g_bc_stat[i][2], __ATOMIC_RELAXED), db = __atomic_load_n(&g_bc_stat[i][3], __ATOMIC_RELAXED);
+        char a[16], b[16]; bc_stat_sz(cb, a, sizeof a); bc_stat_sz(db, b, sizeof b);
+        if (!at) at = (size_t)snprintf(buf, n, "; bc");
+        int w = snprintf(buf + at, n - at, " %02x:%lluu/%llup/%s>%s", 0x41 + i,
+                         (unsigned long long)u, (unsigned long long)p, a, b);
+        if (w < 0 || (size_t)w >= n - at) { buf[n - 1] = 0; return; }
+        at += (size_t)w;
+    }
+}
+
 // 一个切片的段内解码（CPU 字节 → BC 与缓冲 → BC 共用）。紧凑块已在段内暂存 (sb, soff) 里（16 字节对齐），整条按 GPU 顺序录进本段：
 //   ① 同一份块拷进压缩影子（回读用，见 bc_readback）；② 解码录进本段（nvn_vk_bcdec_prepare 建资源、bc_record_decode 录命令）落到临时图；
 //   ③ 临时图按区域拷进目标。不单独提交、不等 fence；临时图与解码资源挂 c->bc_temps，暂存是段的 arena，都随段释放
@@ -7530,6 +7572,7 @@ static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
     c->desc_layout = VK_NULL_HANDLE;   // 计算绑定点被解码占过：下一次派发重绑描述符组
     tmp->next = c->bc_temps; c->bc_temps = tmp;
     bc_temp_to_tex(c, t, tmp, level, layer, off, ext, z);
+    bc_stat_plane(t->nvn_format, bh * packed_row, ext.width, ext.height);
     return 1;
 }
 
@@ -7550,6 +7593,7 @@ static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t
                       const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
     if (!bc_src_check(c, t, level, layer, r, row_bytes, image_bytes, &off, &ext, &bb, &bw, &bh, &slice_stride)) return;
+    bc_stat_call(t->nvn_format);
     uint64_t packed_row = bw * (uint32_t)bb, bytes = packed_row * bh;
     uint64_t sh_loff = 0, sh_rp = 0, sh_sp = 0, sh_total = 0; uint32_t sh_slices = 0;
     if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
@@ -7578,6 +7622,7 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
     VkOffset3D off; VkExtent3D ext; int bb = 0; uint64_t bw = 0, bh = 0, slice_stride = 0;
     if (!bc_src_check(c, t, level, layer, r, row_bytes, image_bytes, &off, &ext, &bb, &bw, &bh, &slice_stride)) return;
     if (boff > b->bytes || image_bytes > b->bytes - boff) { set_sticky(c, NVN_GPU_E_ARG, "缓冲 → BC 贴图：源越过缓冲末尾"); return; }
+    bc_stat_call(t->nvn_format);
     uint64_t packed_row = bw * (uint32_t)bb, bytes = packed_row * bh;
     uint64_t sh_loff = 0, sh_rp = 0, sh_sp = 0, sh_total = 0; uint32_t sh_slices = 0;
     if (!bc_shadow_layout(t, (uint32_t)bb, level, &sh_loff, &sh_rp, &sh_sp, &sh_slices, &sh_total)) {
