@@ -1,0 +1,38 @@
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs b/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
+index 2563d1ea330368c11d12406c166be06c8c1016d5..e2864938b9d8d7e0042d4b4f753cd840330e9250 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
+@@ -214,9 +214,18 @@ namespace Ryujinx.Graphics.Shader.Translation
+         public int GetVaryingLocation(int logicalLocation, bool isOutput)
+         {
+             LinkedLocations locations = isOutput ? _linkedOutputs : _linkedInputs;
+-            return locations?.GetLocation(logicalLocation) ?? logicalLocation;
++            int hostLocation = locations?.GetLocation(logicalLocation) ?? logicalLocation;
++            (isOutput ? _emittedOutputLocations : _emittedInputLocations)[logicalLocation] = hostLocation;
++            return hostLocation;
+         }
+ 
++        // S2A：本阶段实际发射的「客体逻辑 location → 宿主 Location」，只记不改（诊断读，翻译结果不受影响）。
++        private readonly SortedDictionary<int, int> _emittedInputLocations = new();
++        private readonly SortedDictionary<int, int> _emittedOutputLocations = new();
++
++        public IReadOnlyDictionary<int, int> S2AEmittedVaryingLocations(bool isOutput) =>
++            isOutput ? _emittedOutputLocations : _emittedInputLocations;
++
+         public void MergeFromtNextStage(bool gpPassthrough, bool nextUsesFixedFunctionAttributes, AttributeUsage nextStage)
+         {
+             NextInputAttributesComponents = nextStage.ThisInputAttributesComponents;
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+index 44114dfeb61faec95b74869572a364dc02bd6e35..050fdce917626d40f754e1d1873276dfc1e4e4e9 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -254,6 +254,9 @@ namespace Ryujinx.Graphics.Shader.Translation
+         // 避免独立缓存策略把原生 GS 输出扩到全部 32 个 location。
+         public void S2ASetNextStageActual(TranslatorContext nextStage) => SetNextStage(nextStage, true);
+ 
++        // S2A：Translate() 之后读本阶段实际发射的用户 varying「逻辑 location → 宿主 Location」（输出 / 输入各一份，按逻辑号升序）。
++        public IReadOnlyDictionary<int, int> S2AVaryingLocationMap(bool isOutput) => AttributeUsage.S2AEmittedVaryingLocations(isOutput);
++
+         private void SetNextStage(TranslatorContext nextStage, bool actualNextStage)
+         {
+             bool linked = AttributeUsage.RequiresLinkedVaryingInterface;

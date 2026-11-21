@@ -119,7 +119,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             public void Validate()
             {
-                if (_enabled && (_limit <= 0 || _userEnd + _builtIns > _limit))
+                if (_enabled && _limit > 0 && _userEnd + _builtIns > _limit)
                 {
                     throw new NotSupportedException($"{(_output ? "Vertex output" : "Fragment input")} interface requires {_userEnd} user endpoint + {_builtIns} built-in components; host limit {_limit}.");
                 }
@@ -214,8 +214,17 @@ namespace Ryujinx.Graphics.Shader.Translation
         public int GetVaryingLocation(int logicalLocation, bool isOutput)
         {
             LinkedLocations locations = isOutput ? _linkedOutputs : _linkedInputs;
-            return locations?.GetLocation(logicalLocation) ?? logicalLocation;
+            int hostLocation = locations?.GetLocation(logicalLocation) ?? logicalLocation;
+            (isOutput ? _emittedOutputLocations : _emittedInputLocations)[logicalLocation] = hostLocation;
+            return hostLocation;
         }
+
+        // S2A：本阶段实际发射的「客体逻辑 location → 宿主 Location」，只记不改（诊断读，翻译结果不受影响）。
+        private readonly SortedDictionary<int, int> _emittedInputLocations = new();
+        private readonly SortedDictionary<int, int> _emittedOutputLocations = new();
+
+        public IReadOnlyDictionary<int, int> S2AEmittedVaryingLocations(bool isOutput) =>
+            isOutput ? _emittedOutputLocations : _emittedInputLocations;
 
         public void MergeFromtNextStage(bool gpPassthrough, bool nextUsesFixedFunctionAttributes, AttributeUsage nextStage)
         {

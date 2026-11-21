@@ -46,7 +46,7 @@ namespace S2A.DirectCompiler
             if (root.ValueKind != JsonValueKind.Object)
                 throw new DirectCompileException("INVALID_JSON", "request root is not an object");
             JsonStrict.OnlyKeys(root, "request", "schema", "session", "generation", "requestId",
-                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "profile", "program");
+                "directABI", "translatorClosure", "runtimeCompilerABI", "sourceParserVersion", "kindCheck", "profile", "program", "requiresLinkedVaryingInterface", "linkMapDiag");
             string requestSchema = JsonStrict.String(root, "schema", "request");
             int requestVersion = requestSchema == RequestSchema ? 1 : requestSchema == GraphicsRequestSchemaV2 ? 2 : 0;
             if (requestVersion == 0)
@@ -73,6 +73,15 @@ namespace S2A.DirectCompiler
             if (profile.DirectAbi != directAbi || profile.TranslatorClosure != closure || profile.RuntimeCompilerAbi != compilerAbi)
                 throw new DirectCompileException("IDENTITY", "request identity does not match the effective profile");
             DirectProgram program = DirectProgram.Parse(JsonStrict.Object(root, "program", "request"), "request.program", profile, requestVersion);
+            bool linked = JsonStrict.OptionalBool(root, "requiresLinkedVaryingInterface", "request", false);
+            if (linked && (program.Kind != "graphics" || program.Stages.Length != 2 ||
+                program.StageOf("vs") == null || program.StageOf("fs") == null))
+                throw new DirectCompileException("UNSUPPORTED_PROGRAM", "linked varyings require exactly VS and FS");
+            // 诊断（native 开关 nvk_link_map_diag 开时才带）：结果信封外层附两侧实际发射的「逻辑 location → 宿主 Location」，
+            // 不进 content / contentHash，翻译与 SPIR-V 不受影响。只对配对 VS+FS 有意义，单独带视为请求错误。
+            bool linkMapDiag = JsonStrict.OptionalBool(root, "linkMapDiag", "request", false);
+            if (linkMapDiag && !linked)
+                throw new DirectCompileException("UNSUPPORTED_PROGRAM", "linkMapDiag requires requiresLinkedVaryingInterface");
             if (program.StageOf("gs") is DirectStage gs)
             {
                 if (!profile.Caps.SupportsGeometryShader)
@@ -90,6 +99,7 @@ namespace S2A.DirectCompiler
             var allocator = new DirectAllocator(profile) { RequestKey = requestId };
             var accessors = new List<DirectGpuAccessor>();
             var translated = new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>();
+            IReadOnlyDictionary<int, int> linkMapVs = null, linkMapFs = null;
             using var context = new GpuContext(new ProfileOnlyRenderer(profile.TranslationCaps), new DirtyHacks(Array.Empty<ulong>()))
             {
                 Capabilities = profile.TranslationCaps,
@@ -136,16 +146,25 @@ namespace S2A.DirectCompiler
                     {
                         DirectStage stage = program.StageOf(item.name);
                         if (stage == null) continue;
-                        var accessor = new DirectGpuAccessor(profile, program, stage, item.index, allocator, queries);
+                        var accessor = new DirectGpuAccessor(profile, program, stage, item.index, allocator, queries, linked);
                         accessors.Add(accessor);
                         contexts.Add((stage, accessor, ShaderCache.DecodeGraphicsShader(accessor, TargetApi.Vulkan, GraphicsFlags(item.name), 0)));
                     }
                     for (int i = contexts.Count - 2; i >= 0; i--)
                     {
-                        if (contexts[i].stage.Stage == "gs") contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
+                        // Only a directly paired VS->FS uses the actual fragment inputs.
+                        // Keep VS->GS and standalone-stage translation policy unchanged.
+                        if (contexts[i].stage.Stage == "gs" ||
+                            (linked && contexts[i].stage.Stage == "vs" && contexts[i + 1].stage.Stage == "fs"))
+                            contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
                         else contexts[i].context.SetNextStage(contexts[i + 1].context);
                     }
                     foreach (var item in contexts) translated.Add((item.stage, item.context.Translate(), item.accessor));
+                    if (linkMapDiag)
+                    {
+                        linkMapVs = contexts.First(c => c.stage.Stage == "vs").context.S2AVaryingLocationMap(true);
+                        linkMapFs = contexts.First(c => c.stage.Stage == "fs").context.S2AVaryingLocationMap(false);
+                    }
                 }
             }
             catch (DirectCompileException) { throw; }
@@ -167,7 +186,7 @@ namespace S2A.DirectCompiler
             bool v2 = allocator.Bindings.Any(b => b.SamplerSlot >= 0 || b.ConstSampler >= 0 || b.Pool != null);   // 新字段（samp_slot / constSampler / pool）都按 v2 写：v1 宿主不认就整份拒
             byte[] content = WriteContent(program, profile, translated, allocator, queries, v2);
             string contentHash = "sha256-" + Convert.ToHexStringLower(Sha256.HashData(content));
-            return WriteEnvelope(session, generation, requestId, content, contentHash, v2);
+            return WriteEnvelope(session, generation, requestId, content, contentHash, v2, linkMapVs, linkMapFs);
         }
 
         // 与 runtime/direct/control.c、merge_extract.py:cs_facts 同口径：+0x748 三组、+0x754 shared，
@@ -867,7 +886,8 @@ namespace S2A.DirectCompiler
         };
 
         private static byte[] WriteEnvelope(ulong session, ulong generation, string requestId,
-            byte[] content, string contentHash, bool v2)
+            byte[] content, string contentHash, bool v2,
+            IReadOnlyDictionary<int, int> linkMapVs = null, IReadOnlyDictionary<int, int> linkMapFs = null)
         {
             using var stream = new MemoryStream();
             using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
@@ -882,6 +902,24 @@ namespace S2A.DirectCompiler
                 writer.WriteString("contentHash", contentHash);
                 writer.WritePropertyName("content");
                 writer.WriteRawValue(content);
+                if (linkMapVs != null && linkMapFs != null)
+                {
+                    // 诊断附录（只在请求带 linkMapDiag 时出现）：[[逻辑, 宿主], …] 按逻辑号升序；结果解析器不读它。
+                    writer.WriteStartObject("linkMap");
+                    foreach (var (name, map) in new[] { ("vs", linkMapVs), ("fs", linkMapFs) })
+                    {
+                        writer.WriteStartArray(name);
+                        foreach (var kv in map)
+                        {
+                            writer.WriteStartArray();
+                            writer.WriteNumberValue(kv.Key);
+                            writer.WriteNumberValue(kv.Value);
+                            writer.WriteEndArray();
+                        }
+                        writer.WriteEndArray();
+                    }
+                    writer.WriteEndObject();
+                }
                 writer.WriteEndObject();
             }
             return stream.ToArray();

@@ -1,0 +1,13 @@
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs b/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
+index 77e0f7beaf4f51a30e8efb725dec393f5ddde2ea..2563d1ea330368c11d12406c166be06c8c1016d5 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
+@@ -119,7 +119,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+             public void Validate()
+             {
+-                if (_enabled && (_limit <= 0 || _userEnd + _builtIns > _limit))
++                if (_enabled && _limit > 0 && _userEnd + _builtIns > _limit)
+                 {
+                     throw new NotSupportedException($"{(_output ? "Vertex output" : "Fragment input")} interface requires {_userEnd} user endpoint + {_builtIns} built-in components; host limit {_limit}.");
+                 }

@@ -1,4 +1,4 @@
-// Compare identical VS, VS+FS and CS identities with the pre-GS encoder.
+// Compare fixed-closure/profile identities with the pre-GS encoder; paired VS+FS advances to v5.
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,10 +26,21 @@ int main(int argc, char **argv) {
         if (argc != 4) return 1;
         FILE *f = fopen(argv[i + 1], "rb"); CHECK(f != NULL, "pre-GS identity fixture opens"); if (!f) return 1;
         na = fread(a, 1, sizeof a, f); int extra = fgetc(f); fclose(f);
+        in.requires_linked_varying_interface = 0;
         nb = 0; int y = s2a_input_identity_encode(&in, b, sizeof b, &nb);
+        CHECK(na > 5 && !memcmp(a, "S2AI1", 5) && a[5] == 3, "legacy fixture has v3 marker");
+        CHECK(extra == EOF && y == 0 && na == nb && !memcmp(a, b, na), "all legacy requests without linked policy retain full bytes");
+        // Check separation BEFORE adjusting the expected version byte.
+        if (masks[i] == 3 && na > 5) {
+            in.requires_linked_varying_interface = 1;
+            y = s2a_input_identity_encode(&in, b, sizeof b, &nb);
+            CHECK(y == 0 && na == nb && memcmp(a, b, na), "paired identity differs from original legacy bytes");
+            a[5] = 5;
+        }
         CHECK(extra == EOF && y == 0 && na == nb && !memcmp(a,b,na), "old vs new bytes for VS, VS+FS or CS");
 
     }
+    in.requires_linked_varying_interface = 0;
     in.stage_mask = 7; in.source_present = 7; in.texture_count = 96;
     for (int i = 0; i < 96; i++) tex[i].stage = i < 32 ? "vs" : i < 64 ? "fs" : "gs";
     na = 0; CHECK(!s2a_input_identity_encode(&in, a, sizeof a, &na), "96 texture facts fit");
@@ -70,6 +81,6 @@ int main(int argc, char **argv) {
         CHECK(!s2a_input_identity_encode(&in, b, sizeof b, &nb), "2d control identity encodes");
         if (na && nb == na) CHECK(memcmp(a, b, na) != 0, "buffer identity cannot collide with 2d");
     }
-    if (!bad) puts("identity: baseline VS/VS+FS/CS byte-identical; 96, 97 and 480 facts, 481 rejection passed");
+    if (!bad) puts("identity: fixed-closure/profile VS/CS byte-identical, paired VS+FS only version advances to v5; 96, 97 and 480 facts, 481 rejection passed");
     return bad != 0;
 }

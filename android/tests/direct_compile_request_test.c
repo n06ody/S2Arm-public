@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
     in.stages[0] = (struct s2a_compile_stage_src){ "vs", code, sizeof code, control, sizeof control, NULL, 0, 0x5 };
     in.stages[1] = (struct s2a_compile_stage_src){ "fs", code, sizeof code, control, sizeof control, NULL, 0, 0 };
     in.stage_count = 2;
+    in.requires_linked_varying_interface = 1;
     in.gfx.topology = "Triangles";
     in.gfx.tess_mode = 0x100 | 1 | 0x20;    // 顺时针 / Triangles / FractionalOddSpacing
     in.gfx.has_tess_mode = 1;
@@ -167,6 +168,7 @@ int main(int argc, char **argv) {
         CHECK(contains(json, "\"kind\":\"graphics\""), "graphics program");
         CHECK(contains(json, "\"stage\":\"vs\""), "vs stage");
         CHECK(contains(json, "\"stage\":\"fs\""), "fs stage");
+        CHECK(contains(json, "\"requiresLinkedVaryingInterface\":true"), "paired VS+FS requires linked interface");
         CHECK(contains(json, "\"constantBufferUse\":5"), "cb use from draw snapshot");
         CHECK(contains(json, "\"topology\":\"Triangles\""), "topology from draw primitive");
         CHECK(contains(json, "\"tessCw\":true"), "tess winding from control");
@@ -212,6 +214,78 @@ int main(int argc, char **argv) {
             FILE *f = fopen(argv[1], "wb");
             if (f) { fwrite(json, 1, len, f); fclose(f); }
         }
+    }
+
+    // Production pair policy is derived once from stages; old zero-initialized
+    // producers must agree. Malformed opt-ins cannot change non-pair semantics.
+    {
+        struct s2a_compile_request_input u = in;
+        char *j = NULL; size_t n = 0; char g[512] = {0};
+        u.requires_linked_varying_interface = 0;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == 0 && j, "zero-initialized VS+FS producer builds");
+        CHECK(j && contains(j, "\"requiresLinkedVaryingInterface\":true"), "pair derives linked policy without per-caller opt-in");
+        free(j); j = NULL;
+        u.stages[0].stage = "fs"; u.stages[1].stage = "vs";
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) != 0 && !j,
+              "reverse pair is rejected even without explicit opt-in");
+        u.stages[0].stage = "vs"; u.stages[1].stage = "fs";
+        u.stage_count = 1;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == 0 && j, "single VS builds");
+        CHECK(j && !contains(j, "\"requiresLinkedVaryingInterface\""), "single VS omits linked flag");
+        free(j); j = NULL;
+        u.requires_linked_varying_interface = 1;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) != 0 && !j, "single VS opt-in rejected");
+        u.stage_count = 3; u.stages[2] = u.stages[0]; u.stages[2].stage = "gs";
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) != 0 && !j, "GS opt-in rejected");
+        u.requires_linked_varying_interface = 0;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == 0 && j, "VS+FS+GS builds");
+        CHECK(j && !contains(j, "\"requiresLinkedVaryingInterface\""), "GS group omits linked flag");
+        free(j); j = NULL;
+        u.stage_count = 2; u.stages[1].stage = "gs"; u.requires_linked_varying_interface = 1;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) != 0 && !j, "wrong pair opt-in rejected");
+        u.stages[1].stage = "fs"; u.requires_linked_varying_interface = 2;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) != 0 && !j, "invalid linked boolean rejected");
+
+        // Exact ordered VS->FS is the only linked pair. These combinations test
+        // the request guard, not support for arbitrary graphics pipelines.
+        const char *stage_names[] = { "vs", "fs", "gs", "tcs", "tes", "cs" };
+        for (unsigned a = 0; a < 6; a++) {
+            for (unsigned b = 0; b < 6; b++) {
+                u.stages[0].stage = stage_names[a]; u.stages[1].stage = stage_names[b];
+                u.requires_linked_varying_interface = 1;
+                j = NULL; n = 0;
+                int pair_rc = s2a_compile_request_build(&u, &j, &n, g, sizeof g);
+                if (a == 0 && b == 1) {
+                    CHECK(pair_rc == 0 && j && contains(j, "\"requiresLinkedVaryingInterface\":true"),
+                          "ordered linked pair matrix accepts VS FS");
+                } else {
+                    CHECK(pair_rc == -1 && !j, "ordered linked pair matrix rejects other pairs");
+                }
+                free(j); j = NULL;
+            }
+        }
+        u.stages[0].stage = "vs"; u.stages[1].stage = "fs";
+        const int invalid_policies[] = { -1, 2, 2147483647 };
+        for (unsigned v = 0; v < 3; v++) {
+            u.requires_linked_varying_interface = invalid_policies[v];
+            CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == -1 && !j,
+                  "linked policy matrix rejects non-boolean values");
+        }
+        // 配对接口表诊断请求位：只在配对 VS+FS 上写 linkMapDiag，其余组合 / 非布尔值拒收；缺省 0 不写。
+        u.requires_linked_varying_interface = 1; u.link_map_diag = 0;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == 0 && j && !contains(j, "linkMapDiag"), "link map diag off omits linkMapDiag");
+        free(j); j = NULL;
+        u.link_map_diag = 1;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == 0 && j &&
+              contains(j, "\"requiresLinkedVaryingInterface\":true,\"linkMapDiag\":true"), "paired VS+FS with link map diag asks for the map");
+        free(j); j = NULL;
+        u.link_map_diag = 2;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == -1 && !j, "non-boolean link map diag rejected");
+        u.link_map_diag = 1; u.requires_linked_varying_interface = 0; u.stage_count = 1;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == -1 && !j, "link map diag on a single VS rejected");
+        u.stage_count = 3;
+        CHECK(s2a_compile_request_build(&u, &j, &n, g, sizeof g) == -1 && !j, "link map diag on VS+FS+GS rejected");
+        u.stage_count = 2; u.link_map_diag = 0;
     }
 
     // 主线缺省路径：调试门关（正式构建 / 非调试）时请求里不带 kindCheck，校验保持开着。
