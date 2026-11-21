@@ -141,7 +141,7 @@ public static partial class SaveTransfer
             }
             catch (Exception e) when ((e is Failure || e is InvalidDataException) && name != Profile && name != Index)
             {
-                damaged.Add(name);
+                damaged.Add((JsonNode)JsonValue.Create(name));
             }
         }
         Profiles(EntryBytes(archive, "payload/" + Profile));
@@ -161,19 +161,22 @@ public static partial class SaveTransfer
     private static JsonArray Identity(Context c, JsonNode manifest)
     {
         bool sync = c.Request["sync"]?.GetValue<bool>() == true;
+        bool unattended = sync || c.Request["unattendedRestore"]?.GetValue<bool>() == true;
         var warnings = new JsonArray();
         Require(string.Equals(Str(manifest["game"], "id"), Str(c.Game, "id"), StringComparison.OrdinalIgnoreCase), T("备份属于另一款游戏。", "The backup belongs to a different game."), "save_wrong_game");
         if (manifest["game"]["version"].GetValue<long>() != c.Game["version"].GetValue<long>() ||
             Str(manifest["game"], "contentIdentity") != Str(c.Game, "contentIdentity"))
         {
             Require(!sync, T("备份的游戏版本或 DLC 组合不符。", "The backup’s game version or DLC combination doesn’t match."), "save_version");
-            warnings.Add(T("备份的游戏版本或 DLC 组合不符，仍可恢复；游戏可能读不到这份进度，恢复前的存档会自动保留一份副本。", "The backup’s game version or DLC combination doesn’t match. You can still restore it; the game may not be able to read this progress. The save from before the restore is kept automatically."));
+            warnings.Add((JsonNode)JsonValue.Create(c.Request["androidRevisionIdentity"]?.GetValue<bool>() == true
+                ? T("无法用安卓资源版本核对备份的游戏版本与 DLC 组合。游戏可能读不到这份进度，恢复前的存档会自动保留一份副本。", "The Android resource revision can’t verify the backup’s game version and DLC. The game may not be able to read this progress. The save from before the restore is kept automatically.")
+                : T("备份的游戏版本或 DLC 组合不符，仍可恢复；游戏可能读不到这份进度，恢复前的存档会自动保留一份副本。", "The backup’s game version or DLC combination doesn’t match. You can still restore it; the game may not be able to read this progress. The save from before the restore is kept automatically.")));
         }
         if (manifest["damaged"] is JsonArray damaged && damaged.Count > 0)
         {
-            Require(!sync, T("备份文件 CRC 或 SHA-256 校验失败。", "The backup file failed the CRC or SHA-256 check."), "save_damaged");
+            Require(!unattended, T("备份文件 CRC 或 SHA-256 校验失败。", "The backup file failed the CRC or SHA-256 check."), "save_damaged");
             string names = string.Join(", ", damaged.Take(5).Select(d => d.GetValue<string>())) + (damaged.Count > 5 ? " …" : "");
-            warnings.Add(string.Format(T("备份里有 {0} 个文件校验对不上（{1}），这几个不恢复、保留当前存档里原来的，其余照常恢复。", "{0} files in the backup failed the integrity check ({1}). Those files are not restored and the current save’s originals are kept; everything else is restored."), damaged.Count, names));
+            warnings.Add((JsonNode)JsonValue.Create(string.Format(T("备份里有 {0} 个文件校验对不上（{1}），这几个不恢复、保留当前存档里原来的，其余照常恢复。", "{0} files in the backup failed the integrity check ({1}). Those files are not restored and the current save’s originals are kept; everything else is restored."), damaged.Count, names)));
         }
         var owners = OwnerSets(c, manifest);
         if (owners == null) return warnings;
@@ -182,8 +185,8 @@ public static partial class SaveTransfer
         //   两边各有对方没有的账号 = 不是同一套账号（原先要求完全相同，加了第二个玩家后 iCloud 另一端、旧备份都恢复不了）
         if (a.Keys.Intersect(b.Keys).Any(group => !(a[group].IsSubsetOf(b[group]) || b[group].IsSubsetOf(a[group]))))
         {
-            Require(!sync, T("备份与目标存档账号归属不同。", "The backup and the target save belong to different accounts."), "save_wrong_user");
-            warnings.Add(T("备份与目标存档账号归属不同，仍可恢复；恢复后当前账号的进度会换成备份里的，恢复前的存档会自动保留一份副本。", "The backup and the target save belong to different accounts. You can still restore it; the current account’s progress will be replaced with the backup’s. The save from before the restore is kept automatically."));
+            Require(!unattended, T("备份与目标存档账号归属不同。", "The backup and the target save belong to different accounts."), "save_wrong_user");
+            warnings.Add((JsonNode)JsonValue.Create(T("备份与目标存档账号归属不同，仍可恢复；恢复后当前账号的进度会换成备份里的，恢复前的存档会自动保留一份副本。", "The backup and the target save belong to different accounts. You can still restore it; the current account’s progress will be replaced with the backup’s. The save from before the restore is kept automatically.")));
         }
         return warnings;
     }
@@ -234,7 +237,8 @@ public static partial class SaveTransfer
         Require(scan.Files.Keys.Any(n => n.StartsWith("bis/user/save/", StringComparison.Ordinal)), T("此游戏尚无可备份存档。", "This game has no save to back up yet."), "save_empty");
         Profiles(SmallFile(Path.Combine(root, Profile)));
         var entries = Entries(name => SmallFile(Path.Combine(root, name)), scan.Files.Keys, scan.Directories);
-        return new() { ["format"] = "S2ArmSave", ["schema"] = 1, ["layout"] = "ryujinx-data-v1", ["platform"] = "ios",
+        string platform = c.Request["androidRevisionIdentity"]?.GetValue<bool>() == true ? "android" : "ios";
+        return new() { ["format"] = "S2ArmSave", ["schema"] = 1, ["layout"] = "ryujinx-data-v1", ["platform"] = platform,
             ["createdAt"] = DateTimeOffset.UtcNow.ToString("O"), ["game"] = Copy(c.Game), ["saveEntries"] = entries,
             ["users"] = Users(entries), ["deviceSettings"] = Settings(c.Request["deviceSettings"]),
             ["directories"] = new JsonArray(scan.Directories.Where(n => Exported(n, true)).Select(n => (JsonNode)JsonValue.Create(n)).ToArray()), ["files"] = new JsonArray() };
@@ -297,8 +301,17 @@ public static partial class SaveTransfer
         Access = FileAccess.Write, Share = FileShare.None, UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite });
     private static void Space(string path, long bytes)
     {
-        var drive = DriveInfo.GetDrives().Where(d => Within(path, d.RootDirectory.FullName.TrimEnd('/')) || d.RootDirectory.FullName == "/")
-            .OrderByDescending(d => d.RootDirectory.FullName.Length).First();
-        Require(drive.AvailableFreeSpace >= bytes, T("磁盘空间不足，无法保留旧存档。", "Not enough disk space to keep the old save."), "save_space");
+        long available;
+        try
+        {
+            // Unix 的 AvailableFreeSpace 按原路径调用 statfs/statvfs。安卓应用可能无权枚举挂载点。
+            available = new DriveInfo(path).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or OverflowException)
+        {
+            LogFailure("save_space_unknown", ex);
+            throw new Failure("save_space_unknown", T("无法查询存档目录的可用空间，已停止操作。", "Could not determine available space in the save folder."));
+        }
+        Require(available >= bytes, T("磁盘空间不足，无法保留旧存档。", "Not enough disk space to keep the old save."), "save_space");
     }
 }

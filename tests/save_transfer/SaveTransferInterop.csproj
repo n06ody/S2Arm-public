@@ -5,6 +5,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ImplicitUsings>enable</ImplicitUsings>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <PublishAot Condition="'$(S2ASaveAotTests)' == '1'">true</PublishAot>
+    <JsonSerializerIsReflectionEnabledByDefault Condition="'$(S2ASaveAotTests)' == '1'">false</JsonSerializerIsReflectionEnabledByDefault>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../platform/apple/cs/S2A.Apple.csproj" />
