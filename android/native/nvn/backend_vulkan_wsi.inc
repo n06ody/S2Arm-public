@@ -553,7 +553,9 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         if (!nvn_gpu_ok(out)) { s->held = idx; s->held_sem = sem; goto done; }
     }
     VkImage target = encode ? s->encoded : s->images[idx];
+    gap_skip_wsi = 1;
     out = nvn_gpu_cmd_begin(NULL, &ch, err);
+    gap_skip_wsi = 0;
     if (!nvn_gpu_ok(out)) { s->held = idx; s->held_sem = sem; goto done; }
     struct nvn_gpu_cmd_s *c = ch;
     // 上屏 EASU 放大：玩家选「高画质」时开（S2A_HIGH_QUALITY=1，宿主创建前由外壳设，缺省更省电 = 关）；
@@ -601,6 +603,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     s->acquire_pending[sem] = 0;   // 这把信号量已交给呈现段去等
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
+    gap_wsi_record(seg);
     enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];

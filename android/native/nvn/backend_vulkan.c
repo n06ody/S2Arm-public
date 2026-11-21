@@ -34,6 +34,7 @@
 #include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
+#include "nvn_vk_gap_timing.h"
 #include "../direct/sha256.h"
 #include "backend_vulkan_pass_constant_spv.h"
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
@@ -54,6 +55,10 @@
 #if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
 #include "../capacity_affinity.h"
 #endif
+static _Thread_local nvn_gpu_cmd gap_record_cmd;
+static _Thread_local int gap_skip_wsi;
+static void gap_before_op(VkCommandBuffer cb, unsigned op);
+static void gap_before_barrier(VkCommandBuffer cb, uint32_t n, const VkImageMemoryBarrier *images);
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
@@ -293,6 +298,7 @@ enum { OCC_CHUNK = 256, OCC_QUERY_SPARE_MAX = 65536 };   // 遮挡查询的续�
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
 enum { ES_PIPE, ES_VP, ES_SC, ES_BC, ES_ST, ES_DB, ES_VB, ES_IB, ES_PUSH, ES_KINDS };
 struct vk_segment {
+    uint64_t gap_tag, gap_cpu_submit;
     struct vk_segment *next;
     struct nvn_gpu_cmd_s *cmd;
     uint64_t signal;
@@ -317,7 +323,12 @@ struct feedback_copy {
     struct nvn_gpu_tex_s *snap, *snap_src; // 快照图（本段 REF_TEX 保活到 fence）与它照的源图；同段同源复用，见 feedback_make
 };
 
+struct gap_cmd;
 struct nvn_gpu_cmd_s {
+    struct gap_cmd *gap;
+    uint64_t gap_tag;
+    uint32_t gap_draws, gap_first_count;
+    uint16_t gap_head_window;
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     VkCommandBuffer cb;
     struct bc_temp *bc_temps;
@@ -491,6 +502,20 @@ struct nvn_gpu_vk {
 };
 
 static struct nvn_gpu_vk g;
+static void gap_open(void);
+static void gap_close(void);
+static void gap_cmd_begin(nvn_gpu_cmd c);
+static void gap_cmd_free(nvn_gpu_cmd c);
+static void gap_main_end(nvn_gpu_cmd c);
+static void gap_init_start(nvn_gpu_cmd c);
+static void gap_init_end(nvn_gpu_cmd c);
+static void gap_wsi_record(struct vk_segment *s);
+static void gap_segment_done(const struct vk_segment *s, int failed);
+static void gap_pass_begin_before(nvn_gpu_cmd c, const nvn_gpu_pass_desc *d);
+static void gap_pass_begin_after(nvn_gpu_cmd c);
+static void gap_pass_end_before(nvn_gpu_cmd c);
+static void gap_pass_end_after(nvn_gpu_cmd c);
+static void gap_reason(nvn_gpu_cmd c, const char *reason);
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
@@ -1942,6 +1967,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->refseen);
     free(c->staging);
     free(c->pass_capture);
+    gap_cmd_free(c);
     free(c);
 }
 
@@ -2040,6 +2066,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         }
     }
 
+    gap_segment_done(s, failed);
     if (!s->internal && (failed || !sampled)) pass_capture_segment(vk->pass_capture, NULL, NULL, 0, s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         pass_capture_frame(vk, s, failed);
@@ -2431,6 +2458,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    gap_open();
     nvnbar_open();
     g.pass_capture_delay = nvn_plat_flag("nvk_gputime", 0) == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
     if (g.pass_capture_delay > 0) {
@@ -2624,6 +2652,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
+    gap_close();
     free(g.pass_capture);
     g.pass_capture = NULL;
     g.worker_started = 0;
@@ -5116,6 +5145,7 @@ static void pass_capture_begin(struct nvn_gpu_cmd_s *c, const nvn_gpu_pass_desc 
 }
 
 void nvn_vk_pass_capture_reason(nvn_gpu_cmd c, const char *reason) {
+    gap_reason(c, reason);
     if (!c || !c->in_pass) return;
     struct pass_capture_row *r = pass_capture_current(c);
     if (r) r->reason = reason;
@@ -5394,7 +5424,9 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
+    gap_pass_begin_before(c, d);
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    gap_pass_begin_after(c);
     PBP_STEP(3);
     c->in_pass = 1;
     c->pass_occl = d->occlusion;
@@ -5431,7 +5463,9 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (!c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_end 时不在通道里"); return; }
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
+    gap_pass_end_before(c);
     vkCmdEndRenderPass(c->cb);
+    gap_pass_end_after(c);
     c->in_pass = 0;
     if (c->pass_capture_on) pass_capture_rt(c);
     c->pass_natt = 0;
@@ -6401,6 +6435,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         }
     } else {
         vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance);
+    }
+    if (c->gap_tag & 3u) {
+        if (!c->gap_draws) c->gap_first_count = a->ind || a->ibuf || a->cnt ? 0 : a->count;
+        c->gap_draws++;
     }
     if (profile && profile->draws++ == 0) {
         profile->substituted = selected != p->pipe;
@@ -8505,6 +8543,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->live_next = g.live;
     g.live = c;
     pthread_mutex_unlock(&g_mu);
+    gap_cmd_begin(c);
     *out = c;
     return rc(NVN_GPU_OK);
 }
@@ -8578,6 +8617,7 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(c->init_cb, &bi) != VK_SUCCESS) return 0;
+    gap_init_start(c);
     // 首次报告可能在 render pass 内；reset 必须在独立前置缓冲中，不能打断通道。
     if (c->report_ts) {
         vkCmdResetQueryPool(c->init_cb, c->report_ts, 0, NVN_GPU_TIMESTAMP_SLOTS);
@@ -8639,6 +8679,7 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     }
+    gap_init_end(c);
     if (vkEndCommandBuffer(c->init_cb) != VK_SUCCESS) return 0;
     cbs[0] = c->init_cb; cbs[1] = c->cb;
     return 2;
@@ -8709,6 +8750,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT);
     if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
     // 结束录制并提交。
+    gap_main_end(c);
     VkResult r = vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) {
         VkFenceCreateInfo fi;
@@ -8723,6 +8765,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             VkCommandBuffer cbs[2];
             si.commandBufferCount = submit_cbs(c, cbs);
             si.pCommandBuffers = cbs;
+            if (c->gap) s->gap_cpu_submit = now_ns();
             r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
             if (r == VK_SUCCESS) {
                 s->fence = fence;
@@ -9060,6 +9103,7 @@ void nvn_gpu_vk_test_set_fault(int mode) {
     pthread_mutex_unlock(&g_mu);
 }
 
+#include "backend_vulkan_gap_timing.inc"
 #include "backend_vulkan_wsi.inc"
 
 #ifdef S2A_NVK_BACKEND_HOST_TEST
