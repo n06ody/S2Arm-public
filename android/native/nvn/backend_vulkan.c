@@ -224,6 +224,11 @@ struct dset_bin;
 struct dset_use { struct dset_bin *bin; VkDescriptorSet set; VkDescriptorPool pool; };   // 本段从按布局回收的表项里取的一组（见「描述符组按布局回收」）；bin = 取用时的表项，放回时直接放回它
 struct bc_temp { VkImage image; VkDeviceMemory memory; struct nvn_vk_bcdec_rec rec; struct bc_temp *next; };   // rec：缓冲 → BC 贴图录进段里的解码资源（#697）
 enum { TS_PASS_MAX = 250 };   // 调试读数：一段里逐个计时的通道数上限
+// GPU 时间分账探针（诊断，开关 nvk_gputime，与上面同一个；只进探针包）：段内在每个被标的操作边界写一个 BOTTOM_OF_PIPE 时间戳并记它的类别，
+// 相邻两个标之间的 GPU 区间归给后一个标的类别——区间首尾相接、互不重叠，总和 = 段首尾。被标的操作入口先写一个「未归属」标，
+// 于是两次被标操作之间没被标的活落在「未归属」里，不会被算到别的类别（兄弟项目 gpu_profile.inc 的做法：借原命令 fence 回收、不加等待）。
+static uint64_t g_tk_frames;   // GPU 时间分账探针：读数窗口里完成的呈现段数（= 帧数）
+enum { TK_UNATTR = 0, TK_PASS, TK_PREPASS, TK_DISPATCH, TK_COPY, TK_FILL, TK_BUFWRITE, TK_CLEAR, TK_BLIT, TK_FEEDBACK, TK_TAIL, TK_N, TK_MAX = 2048 };
 enum { OCC_CHUNK = 256, OCC_QUERY_SPARE_MAX = 65536 };   // 遮挡查询的续段槽按块给：一块 = 一个 OCC_CHUNK 槽的查询池，用到哪块才要哪块；OCC_QUERY_SPARE_MAX = 一个声明槽名下最多几个续段槽（保险丝：防失控，不是预期用量）
 
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
@@ -298,6 +303,9 @@ struct nvn_gpu_cmd_s {
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
     VkQueryPool tsq;                         // 调试读数 nvk_gputime：段首尾各一个 GPU 时间戳，后面每个通道首尾各一个（没开就是空）
+    VkQueryPool tkq;                         // GPU 时间分账探针：每个标一个时间戳（没开就是空）
+    uint8_t tk[TK_MAX]; uint32_t ntk, tk_drop; uint32_t tk_depth;   // 各标的类别、已写几个、写不下丢了几个、嵌套深度（只有最外层操作写标）
+    uint64_t tk_dev_submit;                  // 提交时校准出的 GPU 计数（0 = 没校准扩展）：算「提交 → GPU 开工」
     struct { uint16_t w, h, draws; uint8_t ncol, ds; } tsp[TS_PASS_MAX];
     uint32_t ntsp;
     VkCommandBuffer init_cb;                 // 本池复用的前置命令缓冲；本段需要时录入图像转布局 / 时间戳重置
@@ -1401,6 +1409,20 @@ static int report_calibration(uint64_t t[2], uint64_t *deviation) {
     };
     return g.report_calibrate && g.report_calibrate(g.d, 2, info, t, deviation) == VK_SUCCESS;
 }
+static void tk_mark(struct nvn_gpu_cmd_s *c, int kind) {
+    if (!c || !c->tkq) return;
+    if (c->ntk >= TK_MAX) { c->tk_drop++; return; }
+    vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tkq, c->ntk);
+    c->tk[c->ntk++] = (uint8_t)kind;
+}
+struct tk_scope { struct nvn_gpu_cmd_s *c; int kind; };
+static inline struct tk_scope tk_enter(nvn_gpu_cmd ch, int kind) {
+    struct nvn_gpu_cmd_s *c = ch;
+    if (c && c->tkq && c->tk_depth++ == 0) tk_mark(c, TK_UNATTR);
+    return (struct tk_scope){c && c->tkq ? c : NULL, kind};
+}
+static inline void tk_leave(struct tk_scope *sc) { if (sc->c && --sc->c->tk_depth == 0) tk_mark(sc->c, sc->kind); }
+#define TK_SCOPE(ch, kind) struct tk_scope tk_sc_ __attribute__((cleanup(tk_leave), unused)) = tk_enter((ch), (kind))
 
 // 报告时间戳自校（11-19，Adreno 830 驱动 0x80320049 实测）：vkGetCalibratedTimestamps 的 DEVICE 值与 vkCmdWriteTimestamp 写出的
 // 计数零点差一个常数（7318 万计数 ≈ 3.81 秒），按驱动校准对换算的每个样本都落在录制窗口之前，回放层全部记 timestamp result_unavailable。
@@ -1730,6 +1752,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+    if (c->tkq) vkDestroyQueryPool(g.d, c->tkq, NULL);
         seg_give_q(c->qpool, c->qcount);
     for (uint32_t k = 0; k < c->qnchunk; k++) seg_give_q(c->qchunk[k], OCC_CHUNK);   // 续段块：同大小的池回收表里再用
     free(c->qchunk); free(c->q_owner);
@@ -1824,6 +1847,33 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
                                 o += (size_t)snprintf(l2 + o, sizeof l2 - o, "%s%ux%u：%u 个（带深度 %u、0–1 笔 %u 个耗 %.0f）%u 笔 %.0f 毫秒", r ? "；" : "", bk[r].key >> 16, bk[r].key & 0xffff, bk[r].n, bk[r].ds, bk[r].n1, (double)bk[r].ns1 / 1e6, bk[r].draws, (double)bk[r].ns / 1e6); if (o >= sizeof l2) break; }
                             char l3[800]; snprintf(l3, sizeof l3, "GPU 时间（按通道尺寸，同样这 400 段）：%s", l2); nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", l3); nbk = 0; }
                     }
+                    if (s->cmd->tkq && s->cmd->ntk >= 2) {   // GPU 时间分账探针：相邻两个标之间的区间归后一个标的类别
+                        static uint64_t kns[TK_N], kn[TK_N], tseg, tdrop, tspan, st_sum, st_n, lt_sum, lt_n, f0;
+                        static uint64_t tkts[TK_MAX];
+                        const uint32_t nt = s->cmd->ntk;
+                        const uint64_t mask = g.report_bits && g.report_bits < 64 ? (1ull << g.report_bits) - 1 : ~0ull;
+                        if (vkGetQueryPoolResults(vk->d, s->cmd->tkq, 0, nt, sizeof tkts[0] * nt, tkts, sizeof tkts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                            if (!tseg) f0 = __atomic_load_n(&g_tk_frames, __ATOMIC_RELAXED);
+                            for (uint32_t i = 1; i < nt; i++) { const uint64_t dt = (uint64_t)((double)((tkts[i] - tkts[i - 1]) & mask) * period); kns[s->cmd->tk[i]] += dt; kn[s->cmd->tk[i]]++; }
+                            tspan += (uint64_t)((double)((tkts[nt - 1] - tkts[0]) & mask) * period);
+                            tseg++; tdrop += s->cmd->tk_drop;
+                            uint64_t cal[2], dv;
+                            if (s->cmd->tk_dev_submit && tkts[0] >= s->cmd->tk_dev_submit) { st_sum += (uint64_t)((double)(tkts[0] - s->cmd->tk_dev_submit) * period); st_n++; }
+                            if (s->cmd->tk_dev_submit && report_calibration(cal, &dv)) { const uint64_t dn = cal[0] - (uint64_t)g.report_corr_ticks;
+                                if (dn >= tkts[nt - 1]) { lt_sum += (uint64_t)((double)(dn - tkts[nt - 1]) * period); lt_n++; } }
+                        }
+                        if (tseg == 400) {
+                            const uint64_t fr = __atomic_load_n(&g_tk_frames, __ATOMIC_RELAXED) - f0; const double ff = fr ? (double)fr : 1.0;
+                            static const char *const nm[TK_N] = {"未归属", "通道（含存储）", "开通道前准备", "派发", "拷贝", "填充", "按序写", "通道外清除", "blit", "反馈快照", "段末"};
+                            char tl[900]; size_t o = (size_t)snprintf(tl, sizeof tl, "GPU 时间分账（%llu 段 / %llu 帧，每帧毫秒）：", (unsigned long long)tseg, (unsigned long long)fr);
+                            for (int k = 1; k < TK_N; k++) o += (size_t)snprintf(tl + o, sizeof tl - o, "%s %.2f（%.1f 次）、", nm[k], (double)kns[k] / 1e6 / ff, (double)kn[k] / ff);
+                            o += (size_t)snprintf(tl + o, sizeof tl - o, "%s %.2f；段内首尾合计 %.2f；漏标 %llu；时间戳有效位 %u；", nm[0], (double)kns[0] / 1e6 / ff, (double)tspan / 1e6 / ff, (unsigned long long)tdrop, g.report_bits);
+                            if (st_n) o += (size_t)snprintf(tl + o, sizeof tl - o, "提交→GPU 开工平均 %.2f 毫秒（%llu 段）", (double)st_sum / 1e6 / (double)st_n, (unsigned long long)st_n); else o += (size_t)snprintf(tl + o, sizeof tl - o, "提交→GPU 开工未测（无校准时间戳）");
+                            if (lt_n) snprintf(tl + o, sizeof tl - o, "、GPU 做完→完成线程看到平均 %.2f 毫秒", (double)lt_sum / 1e6 / (double)lt_n);
+                            nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", tl);
+                            memset(kns, 0, sizeof kns); memset(kn, 0, sizeof kn); tseg = tdrop = tspan = st_sum = st_n = lt_sum = lt_n = 0;
+                        }
+                    }
                     if (n == 400) { char line[300]; snprintf(line, sizeof line, "GPU 时间：%llu 段，段内首尾平均 %.2f 毫秒、最长 %.2f 毫秒；这些段前后共 %.0f 毫秒，其中 GPU 在段内 %.0f 毫秒、段与段之间空着 %.0f 毫秒",
                                                          (unsigned long long)n, (double)sum / 1e6 / (double)n, (double)mx / 1e6, (double)(e - t_first) / 1e6, (double)sum / 1e6, (double)gap / 1e6);
                                     nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line); n = 0; sum = mx = gap = 0; }
@@ -1842,6 +1892,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     }
 
     if (s->internal) {   // 呈现段：没有回调、不动时间线
+        __atomic_fetch_add(&g_tk_frames, 1, __ATOMIC_RELAXED);   // GPU 时间分账探针：帧数
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2772,6 +2823,7 @@ static int buf_range(const struct nvn_gpu_buf_s *b, uint64_t off, uint64_t bytes
 }
 
 void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void *src, uint64_t bytes) {
+    TK_SCOPE(ch, TK_BUFWRITE);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch) return;
     struct nvn_gpu_cmd_s *c = ch;
@@ -2799,6 +2851,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
 }
 
 void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t bytes, uint32_t value) {
+    TK_SCOPE(ch, TK_FILL);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch) return;
     struct nvn_gpu_cmd_s *c = ch;
@@ -2818,6 +2871,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
 }
 
 void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    TK_SCOPE(ch, TK_COPY);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch) return;
     struct nvn_gpu_cmd_s *c = ch;
@@ -2838,6 +2892,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
 }
 
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
+    TK_SCOPE(ch, TK_COPY);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch || !n) return;
     struct nvn_gpu_cmd_s *c = ch;
@@ -4880,8 +4935,9 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) { d.color[i].load = NVN_GPU_LOAD_LOAD; d.color[i].store = NVN_GPU_STORE_STORE; }
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
-    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     vkCmdEndRenderPass(c->cb);
+    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }   // 结束时间戳在 EndRenderPass 之后：含附件存储 / 解析
+    if (!c->tk_depth) tk_mark(c, TK_PASS);   // GPU 时间分账探针
     c->in_pass = 0;
     c->pass_occl = 0;
     pass_read_sync(c);
@@ -4925,6 +4981,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
         c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
+    if (!c->tk_depth) tk_mark(c, TK_PREPASS);   // GPU 时间分账探针：附件屏障 / 载入准备到此
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
@@ -4955,6 +5012,7 @@ static void pass_prof(int i, uint64_t t0) {
     }
 }
 void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
+    { struct nvn_gpu_cmd_s *tc_ = ch; if (tc_ && !tc_->tk_depth) tk_mark(tc_, TK_UNATTR); }   // GPU 时间分账探针：开通道前的准备从这里算
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_begin 时已在通道里"); return; }
@@ -5020,6 +5078,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
+    if (!c->tk_depth) tk_mark(c, TK_PREPASS);   // GPU 时间分账探针：附件屏障 / 载入准备到此
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     PBP_STEP(3);
     c->in_pass = 1;
@@ -5063,6 +5122,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     pass_read_sync(c);
     c->feedback_read_mask = 0;
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
+    if (!c->tk_depth) tk_mark(c, TK_PASS);   // GPU 时间分账探针：EndRenderPass（含存储 / 解析）之后
     // 附件在通道里用的布局由 make_pass 定（缺省全程 GENERAL，开 nvk_opt_layout 时用附件专用布局），通道内不迁移：
     // 出通道后本段第一次用到它时按需迁移（采样 / 存储 / 传输 / 再当附件），段末统一转回 GENERAL（lay_rest_at_commit）。
     // render pass / framebuffer 被已录制的命令引用，等 cmd 真正完成后再销毁（finish_cmd）。
@@ -5983,6 +6043,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
 
 static int g_test_no_xfer_bar;   // 测试钩子 nvn_gpu_vk_test_xfer_barrier 置（文件末）
 void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, uint32_t z, nvn_gpu_buf ind, uint64_t off) {
+    TK_SCOPE(ch, TK_DISPATCH);   // GPU 时间分账探针
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!ind && (!x || !y || !z)) return;   // 0 组：空操作，不录、不置错（对齐 Ryujinx）
@@ -6999,11 +7060,13 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
 
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
                           nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r) {
+    TK_SCOPE(ch, TK_COPY);   // GPU 时间分账探针
     copy_buf_tex_impl(ch, bh, off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEFAULT, 0);
 }
 
 void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
                           nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes) {
+    TK_SCOPE(ch, TK_COPY);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -7071,6 +7134,7 @@ static int copy_block_region_ok(const struct nvn_gpu_tex_s *t, uint32_t level, c
 
 void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t slayer, const NVNcopyRegion *sr,
                       nvn_gpu_tex dh, uint32_t dlevel, uint32_t dlayer, const NVNcopyRegion *dr) {
+    TK_SCOPE(ch, TK_COPY);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -7117,6 +7181,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
 }
 
 void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], const uint32_t u4[4], int is_int) {
+    TK_SCOPE(ch, TK_CLEAR);   // GPU 时间分账探针
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -7635,6 +7700,7 @@ void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
 // 颜色采用原生 blit；同格式 D24S8/D32FS8 最近点缩放采用辅助绘制，不依赖深度 BLIT 格式位。
 // 其它不支持的格式对报 UNSUPPORTED。sRGB 目标按 sRGB 编码（同颜色附件写入）。
 void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_gpu_view dv, const NVNcopyRegion *dr, int linear) {
+    TK_SCOPE(ch, TK_BLIT);   // GPU 时间分账探针
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "传输操作在通道内"); return; }
@@ -7813,13 +7879,20 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->feedback_on = nvn_plat_flag("nvk_fb_copy", 1) != 0; // 0 仅供回退诊断，不保证反馈采样正确
     c->feedback_read_on = c->feedback_on && g.dev->load_store_op_none_enabled && nvn_plat_flag("nvk_fb_read", 0) != 0;
     {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
-        static int on = -1; if (on < 0) on = nvn_plat_flag("nvk_gputime", 0);
+        static int on = -1; static unsigned on_k;
+        if (on < 0 || !(++on_k & 63)) on = nvn_plat_flag("nvk_gputime", 0);   // 每 64 段重读一次：同进程开 / 关做 A/A（量探针开销）
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
         if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
             vkCmdResetQueryPool(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
+        VkQueryPoolCreateInfo ki = qi; ki.queryCount = TK_MAX;
+        c->ntk = c->tk_drop = c->tk_depth = 0; c->tk_dev_submit = 0;
+        if (c->tsq && vkCreateQueryPool(g.d, &ki, NULL, &c->tkq) == VK_SUCCESS) {
+            vkCmdResetQueryPool(c->cb, c->tkq, 0, TK_MAX);
+            vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tkq, 0); c->tk[0] = TK_UNATTR; c->ntk = 1;
+        } else c->tkq = VK_NULL_HANDLE;
     }
     if (d && d->occlusion_slots) {   // 查询池：整池重置只能在通道外，放在段的最开头
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
@@ -7837,6 +7910,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     if (g.closing) {
         pthread_mutex_unlock(&g_mu);
         if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+        if (c->tkq) vkDestroyQueryPool(g.d, c->tkq, NULL);
         if (c->qpool) vkDestroyQueryPool(g.d, c->qpool, NULL);
         free(c->q_used);
         vkDestroyCommandPool(g.d, c->pool, NULL);
@@ -8005,6 +8079,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT);
     if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
+    if (!c->tk_depth) tk_mark(c, TK_TAIL);   // GPU 时间分账探针：段末布局复位 / 主机可见屏障
     // 结束录制并提交。
     VkResult r = vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) {
@@ -8020,6 +8095,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             VkCommandBuffer cbs[2];
             si.commandBufferCount = submit_cbs(c, cbs);
             si.pCommandBuffers = cbs;
+            if (c->tkq) { uint64_t t2[2], dv; if (report_calibration(t2, &dv)) c->tk_dev_submit = t2[0] - (uint64_t)g.report_corr_ticks; }   // GPU 时间分账探针
             r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
             if (r == VK_SUCCESS) {
                 s->fence = fence;

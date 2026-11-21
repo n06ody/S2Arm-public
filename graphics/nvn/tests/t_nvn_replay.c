@@ -2950,6 +2950,7 @@ static void t_pass_rt_continue(void) {   // 同目标续接：通道开着、没
     CHECK(g_gdraws - d0 == 2);
     CHECK(g_npd - npd0 == 1 && g_pass_ends - ends0 == 1);       // 只开一个通道、只结束一次（修前：两个通道、两次结束）
     CHECK(p1[RP_PERF_PASSES] == 1 && p1[RP_PERF_P_CONT] == 1);  // 续接命中一次
+    CHECK(p1[RP_PERF_CUTR_BASE + 3 * RP_CUT_SUBMIT] == 1 && p1[RP_PERF_CUTR_BASE + 3 * RP_CUT_RT] == 0);   // 批 0 探针：唯一的通道由提交收尾结束
     // 负对照：同一个开关关掉 → 每次重设目标都是一次通道边界
     g_flag_rt_cont = 0;
     int npd1 = g_npd;
@@ -2958,6 +2959,8 @@ static void t_pass_rt_continue(void) {   // 同目标续接：通道开着、没
     submit1(&s2); fake_complete(NVN_GPU_DONE_OK);
     uint64_t p3[RP_PERF_N]; rp_perf_take(p3);
     CHECK(g_gdraws - d0 == 4 && g_npd - npd1 == 2 && p3[RP_PERF_P_CONT] == 0);
+    printf("cut reasons rt_cont=0: rt=%llu submit=%llu other=%llu expected 1/1/0\n", (unsigned long long)p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_RT], (unsigned long long)p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_SUBMIT], (unsigned long long)p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_OTHER]);
+    CHECK(p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_RT] == 1 && p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_SUBMIT] == 1 && p3[RP_PERF_CUTR_BASE + 3 * RP_CUT_OTHER] == 0);   // 批 0 探针：换目标 1 次 + 提交收尾 1 次，没有落到「其它」
     g_flag_rt_cont = 1; pass_fresh();
 }
 
