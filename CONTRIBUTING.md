@@ -94,6 +94,27 @@ Copyright 2026 S2Arm contributors
 
 Linux 暂不支持。跑不了的步骤写清原因和未测范围，不省略。
 
+## 安卓两条翻译路（设备现编 / 出包预编库）
+
+安卓直连的两条路共用 Ryujinx 着色器翻译核心。调试包使用设备现编。正式包可先从随包分发的 LibPack 取件，缺件时走设备现编。
+
+| 环节 | 设备现编 | 出包预编库（LibPack） |
+| --- | --- | --- |
+| 回答层 | 从 Vulkan 能力和当前绑定收集事实，按设备回答格式、类型和能力查询。[device_caps.c](android/native/direct/device_caps.c)、[compile_request.c](android/native/direct/compile_request.c)、[DirectGpuAccessor.cs](graphics/tools/direct/compiler/DirectGpuAccessor.cs) | 从出包配置档回答查询，生成 SPIR-V 和反射数据并写入库。[dmsh_xlate/Program.cs](translator/dmsh_xlate/Program.cs)、[VkLib.cs](graphics/tools/direct/vklib/VkLib.cs) |
+| 收编层 | 编译器输出 v1 程序结果，设备解析结果并建管线。[DirectShaderCompiler.cs](graphics/tools/direct/compiler/DirectShaderCompiler.cs)、[nvk_shader.c](android/native/gfx_plat/nvk_shader.c) | 设备按键取 SPIR-V 和反射数据，核对能力、重建绑定并合成 v1 结果，再走同一解析和建管线路径。[libpack_vk.c](android/native/direct/libpack_vk.c)、[nvn_vk_program_result.c](android/native/nvn/nvn_vk_program_result.c) |
+
+两条路的绑定模型在现编结果、LibPack 反射转换以及共用解析和回放之间传递。改动时沿着 guest 槽来源、描述符种类、图像维度与数值类型核到实际绑定。纹素缓冲和普通纹理即使槽号相同，也要保留各自的资源类型。[DirectShaderCompiler.cs](graphics/tools/direct/compiler/DirectShaderCompiler.cs)、[libpack_vk.c](android/native/direct/libpack_vk.c)、[nvn_vk_program_result.c](android/native/nvn/nvn_vk_program_result.c)、[rp_draw.c](graphics/nvn/replay/rp_draw.c)
+
+改回答层、收编层或绑定模型任一处，逐一核对两条路的对应实现。比对描述符集合与类型、图像声明格式与维度、共享内存与工作组大小、能力与扩展声明，以及着色阶段输入输出。补充回归时使用仓内夹具和合成的最小着色器，用设备能力档案重放查询。运行同口径检查并在 PR 写出结果。[门禁设计 #1836](https://github.com/jhaizhou-ops/S2Arm/issues/1836)
+
+```sh
+bash tests/libpack_device_parity_test.sh
+```
+
+该命令随 #1836 的小语料门禁接入。实际出库的全量检查由出包流程负责。收编改动须验证库件不符时会回到设备现编，现编也无法处理时会具名报红。
+
+曾遇到的差异包括无像素互锁能力的设备收到多余声明、只读按位读的库版声明 `R32ui` 而现编用 `Unknown`、计算程序的共享内存超出设备上限，以及反射无法映射的绑定产生槽 `-1`。这些差异需要用带 LibPack 的正式包进可操控场景复核，确认库已打开且有命中，并检查 GPU 故障和拒收后跳过的计数。[案例和正式包冒烟判据 #1836](https://github.com/jhaizhou-ops/S2Arm/issues/1836)
+
 ## 验证改动
 
 先运行与问题对应的最小充分检查，确认修复覆盖原场景。文档和配置检查内容、链接、格式及实际配置行为；运行代码需要验证受影响的调用路径。界面、设备、图形和性能结论应附对应运行证据，不能用编译成功代替。
