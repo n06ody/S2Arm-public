@@ -65,9 +65,10 @@ static uint8_t *g_gchunk; static uint64_t g_gchunk_n;   // 每块一字节（窗
 static int g_gwhole;   // 1 = 整段进文件（预算 0，旧行为）
 static uint64_t g_anon_budget, g_anon_used;   // 匿名预算；已定为匿名的块累计字节
 static pthread_mutex_t g_gchunk_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *g_gtouch;   // 每块一字节：游戏放开过（s2a_guest_commit 见过）= 1。心跳记需求（s2a_guest_file_live）只扫这些块（#1842 后续：整段 34 GB 每 10 秒扫一遍）
 static int gchunk_alloc(uint8_t st) {
-    free(g_gchunk); g_gchunk_n = (g_size + GCHUNK - 1) / GCHUNK; g_gchunk = malloc(g_gchunk_n ? g_gchunk_n : 1);
-    if (!g_gchunk) { g_gchunk_n = 0; return 0; }
+    free(g_gchunk); free(g_gtouch); g_gchunk_n = (g_size + GCHUNK - 1) / GCHUNK; g_gchunk = malloc(g_gchunk_n ? g_gchunk_n : 1); g_gtouch = calloc(g_gchunk_n ? g_gchunk_n : 1, 1);
+    if (!g_gchunk || !g_gtouch) { free(g_gchunk); free(g_gtouch); g_gchunk = NULL; g_gtouch = NULL; g_gchunk_n = 0; return 0; }
     memset(g_gchunk, st, g_gchunk_n); return 1;
 }
 static uint8_t gc_get(uint64_t i) { return __atomic_load_n(&g_gchunk[i], __ATOMIC_ACQUIRE); }
@@ -551,7 +552,7 @@ static void guest_file_map(uint64_t room) {
     }
     void *p = mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_SHARED, fd, 0);
     if (p != (void *)g_base) {   // 失败时那段可能已被拆掉：盖回匿名占位
-        int er = errno; mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); close(fd); free(g_gchunk); g_gchunk = NULL; g_gchunk_n = 0;
+        int er = errno; mmap((void *)g_base, g_size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); close(fd); free(g_gchunk); g_gchunk = NULL; free(g_gtouch); g_gtouch = NULL; g_gchunk_n = 0;
         LOG("【红】客体内存文件后备：窗口 %#llx +%llu MB 映射成文件失败（errno=%d），照旧用匿名内存", (unsigned long long)g_base, (unsigned long long)(g_size >> 20), er); return; }
     g_gwhole = 1; g_anon_budget = g_anon_used = 0; g_gfd = fd;
     LOG("客体内存文件后备：窗口 %#llx +%llu MB 映射到临时文件（已 unlink，稀疏），脏页不计进程实占（S2A_GUEST_FILE）；匿名预算 0（%s）：整段进文件（旧行为）",
@@ -725,10 +726,12 @@ static int gchunk_to_file(uint64_t i) {
 // 窗口里 [a, a + n) 第一次放开成可读写之前调（svc_mem.c 各放开点）：覆盖到的每个「未定」块按预算定后备，定了不再变（见 GCHUNK 上的注）。
 //   没开文件后备 / 整段进文件（预算 0）/ 不在窗口里：什么都不做。窗口外（远端影子，far.c）不走这里
 void s2a_guest_commit(uint64_t a, uint64_t n) {
-    if (g_gfd < 0 || g_gwhole || !g_gchunk || !n) return;
+    if (g_gfd < 0 || !g_gchunk || !n) return;
     uint64_t end = g_base + g_size, lo = a > g_base ? a : g_base, hi = a + n < end ? a + n : end;
     if (lo >= hi) return;
     uint64_t i0 = (lo - g_base) / GCHUNK, i1 = (hi - 1 - g_base) / GCHUNK, i;
+    for (i = i0; i <= i1; i++) if (!__atomic_load_n(&g_gtouch[i], __ATOMIC_RELAXED)) __atomic_store_n(&g_gtouch[i], 1, __ATOMIC_RELAXED);   // 放开过：心跳记需求要扫这块（整段模式也记）
+    if (g_gwhole) return;
     for (i = i0; i <= i1; i++) { uint8_t st = gc_get(i); if (st == GC_UNDEC || st == GC_CARVE) break; }
     if (i > i1) return;   // 全定过（常态）：不加锁
     pthread_mutex_lock(&g_gchunk_mu);
@@ -790,12 +793,16 @@ void s2a_guest_backing_sum(uint64_t sum[4]) {
 // 文件块里在内存或已落在后备文件里的客体字节（文件后备局的心跳记需求用，s2a_guest_mem_note）：逐个文件块，mincore 取在内存的页，
 //   后备文件里已落块的段（苹果 F_LOG2PHYS_EXT，别处 SEEK_DATA / SEEK_HOLE；还页会打洞，落块 = 游戏此刻还占着的客体页），两者取并集按页计。
 //   匿名块、挖区、未定块不算（匿名的已在进程实占里）。文件页不计进程实占：Mac 实测写脏 512 MB 共享文件页实占不变，写回后文件落块 512 MB
+static uint64_t g_live_scanned;   // 单测：s2a_guest_file_live 累计扫过的块数
+uint64_t s2a_guest_file_live_scanned(void) { return __atomic_load_n(&g_live_scanned, __ATOMIC_RELAXED); }
 uint64_t s2a_guest_file_live(void) {
     if (g_gfd < 0 || !g_base || !g_size) return 0;
     size_t pg = (size_t)getpagesize(); uint64_t got = 0;
     static unsigned char vec[GCHUNK / 4096];   // 一块的页数上限（页 ≥ 4 KB）；心跳在后台串行队列里调，不并发
     for (uint64_t i = 0, nch = g_gchunk ? g_gchunk_n : (g_size + GCHUNK - 1) / GCHUNK; i < nch; i++) {
         if (g_gchunk && !g_gwhole && gc_get(i) != GC_FILE) continue;
+        if (g_gtouch && !__atomic_load_n(&g_gtouch[i], __ATOMIC_RELAXED)) continue;   // 游戏没放开过的块：不可访问、没内容，不扫（整段 34 GB 窗口游戏常只用几 GB）
+        __atomic_fetch_add(&g_live_scanned, 1, __ATOMIC_RELAXED);
         uint64_t cl, ch; gchunk_span(i, &cl, &ch);
         size_t np = (size_t)((ch - cl + pg - 1) / pg);
         if (mincore((void *)(uintptr_t)cl, (size_t)(ch - cl), (char *)vec)) memset(vec, 0, np);
@@ -1025,7 +1032,7 @@ int s2a_window_span_widen(void) {
         (unsigned long long)(learned >> 20), (unsigned long long)g_base, (unsigned long long)(g_size >> 20), (unsigned long long)lo, (unsigned long long)((end - lo) >> 20), (unsigned long long)((lo - g_keep_lo) >> 20));
     g_base = lo; g_size = g_res = end - lo;
     if (g_gfd >= 0 && !gchunk_alloc(g_gwhole ? GC_FILE : GC_UNDEC)) die("客体内存文件后备：放宽后块状态表分配失败");
-    if (g_gfd < 0) { free(g_gchunk); g_gchunk = NULL; g_gchunk_n = 0; }
+    if (g_gfd < 0) { free(g_gchunk); g_gchunk = NULL; free(g_gtouch); g_gtouch = NULL; g_gchunk_n = 0; }
     { void (*gc)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_gc_limit_reapply"); if (gc) gc(); }   // GC 上限是按放宽前的低区选的（gclimit.c），按现在的重选
     return 1;
 }

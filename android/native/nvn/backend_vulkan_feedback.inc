@@ -108,30 +108,114 @@ static struct nvn_gpu_tex_s *feedback_snap_reuse(struct nvn_gpu_cmd_s *c, struct
     }
     return NULL;
 }
+// ---- 快照池：快照图跨段复用（同 iOS nvn_mtl.m 的 dsnap_storage / fb_snap_shape：按形状留存储、原地复用、满了换掉最久没用的）----
+// 起因：段内复用（上面的 feedback_snap_reuse）只在同一个提交段里查，段一完成快照随段引用销毁，下一段同一张源图又整张新建。
+//   一台骁龙 8 至尊版手机（Adreno 830）初始山洞场景 simpleperf 30 秒：游戏线程 47% 的样本在
+//   nvn_gpu_tex_create → vkAllocateMemory → kgsl_sharedmem_alloc → ioctl（高通驱动每次分配都进内核并清零），来源就是这里每段新建的快照图。
+// 寿命：快照图只被它所在的那一段引用（cmd_ref REF_TEX；建它的 feedback_make 末尾已 release，released = 1）。段完成时 finish_cmd
+//   （executed = 1 只在完成线程等到栅栏之后）给它记 fb_ready，随后归还最后一份引用：unref_locked 看到 released && refs == 0，
+//   先问 fbpool_put_locked——收下就不销毁，图连同显存、默认视图原样留在 g.texs 上。所以池里的图 GPU 一定已经用完。
+//   提交线程 feedback_make 取图、完成线程放回，两边都在 g_mu 下动池。取出后图回到「刚建好、本函数持一份建图所有权」的状态
+//   （released = 0），与新建走同一条路：cmd_ref 进本段、末尾 release。
+// 形状键 = 建它时的整份建图请求（目标 / NVN 格式 / 宽高深 / 级数 / 样本数 / 用途位含 VIEW_FMT）：nvn_gpu_tex_create 在一个会话里
+//   是这份请求的确定函数，Vulkan 格式、面、层数、usage、MUTABLE / 格式列表、内存类型都随之相同；取图时再核一遍与源图的
+//   格式 / 样本 / 层 / 面（宁可少复用，不错复用）。
+// 内容：取出的图里是上一次的旧内容，本函数随后的 vkCmdCopyImage 覆盖 v 的 [base_level, +levels) × [base_layer, +layers)（3D 为整级全部 z）
+//   × v->aspect 的每个面，快照视图的 subresourceRange 恰是同一段，采样永远看不到没覆盖的部分。
+// 布局：段与段之间的静止布局一律 GENERAL（本函数末尾转回 GENERAL，段末 lay_rest_at_commit 兜底），image_barrier 按段跟踪、段首按 GENERAL 起算；
+//   放回时图已转出 UNDEFINED（fb_ready 只在段执行过才置），与取出后第一次 image_barrier 的前提一致。
+// 同一段里同一形状同时要两张：取走的就不在池里了，第二张池里没有就照旧新建。会话关闭 / 设备丢失：池清空（关闭时随 g.texs 一起销毁）。
+static int fbpool_key_eq(const struct fb_key *a, const struct fb_key *b) {
+    return a->target == b->target && a->nvn_format == b->nvn_format && a->w == b->w && a->h == b->h && a->depth == b->depth &&
+           a->levels == b->levels && a->samples == b->samples && a->usage == b->usage;
+}
+static void fbpool_evict0_locked(struct nvn_gpu_vk *vk) {   // 调用方持 g_mu：淘汰最久没用的那张
+    struct nvn_gpu_tex_s *t = g_fbpool[0];
+    g_fbpool_bytes -= t->mem_size;
+    memmove(&g_fbpool[0], &g_fbpool[1], (g_fbpool_n - 1) * sizeof g_fbpool[0]); g_fbpool_n--;
+    __atomic_fetch_add(&g_fbpool_cnt[2], 1, __ATOMIC_RELAXED);
+    destroy_tex_locked(vk, t);
+}
+// 调用方持 g_mu，t 已 released 且 refs == 0。收下返回 1（不销毁）；不收返回 0，调用方照旧销毁。
+static int fbpool_put_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t) {
+    if (!t->fb_snap || !t->fb_ready || !g_fbpool_cap || vk->closing || vk->device_lost || t->mem_size > g_fbpool_cap) return 0;
+    while (g_fbpool_n && (g_fbpool_n == FBPOOL_N || g_fbpool_bytes + t->mem_size > g_fbpool_cap)) fbpool_evict0_locked(vk);
+    g_fbpool[g_fbpool_n++] = t;
+    g_fbpool_bytes += t->mem_size;
+    return 1;
+}
+static void fbpool_drain_locked(struct nvn_gpu_vk *vk) {   // 调用方持 g_mu
+    while (g_fbpool_n) fbpool_evict0_locked(vk);
+}
+// 提交线程：取一张同形状的（从最近放回的找起）。取出的图 released = 0、refs = 0，归调用方所有，与刚建好的图一样处理。
+static struct nvn_gpu_tex_s *fbpool_take(const struct fb_key *k, const struct nvn_gpu_tex_s *s) {
+    if (!g_fbpool_cap) return NULL;
+    struct nvn_gpu_tex_s *t = NULL;
+    pthread_mutex_lock(&g_mu);
+    for (uint32_t i = g_fbpool_n; i-- > 0;) {
+        struct nvn_gpu_tex_s *p = g_fbpool[i];
+        if (!fbpool_key_eq(&p->fbk, k) || p->format != s->format || p->samples != s->samples ||
+            p->layers != s->layers || p->aspect != s->aspect) continue;
+        t = p;
+        g_fbpool_bytes -= p->mem_size;
+        memmove(&g_fbpool[i], &g_fbpool[i + 1], (g_fbpool_n - i - 1) * sizeof g_fbpool[0]); g_fbpool_n--;
+        t->released = 0; t->fb_ready = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (t) __atomic_fetch_add(&g_fbpool_cnt[1], 1, __ATOMIC_RELAXED);
+    return t;
+}
+// 读数（缺省常开）：out = 新建 / 池命中 / 淘汰（会话起累计、只增）、池里张数、池里字节。上屏的 5 秒读数行与宿主用例用。
+void nvn_vk_fbpool_stat(uint64_t out[5]) {
+    for (int i = 0; i < 3; i++) out[i] = __atomic_load_n(&g_fbpool_cnt[i], __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_mu); out[3] = g_fbpool_n; out[4] = g_fbpool_bytes; pthread_mutex_unlock(&g_mu);
+}
 static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
+    TK_SCOPE(c, TK_FEEDBACK);   // GPU 时间分账探针：反馈快照拷贝
     struct nvn_gpu_view_s *v = f->source;
     struct nvn_gpu_tex_s *s = v->tex;
     struct nvn_gpu_tex_s *t = feedback_snap_reuse(c, f, s);
-    const int fresh = !t;   // 新建的要在本函数末尾 release（段引用保活）；复用的不归本函数管
+    const int fresh = !t;   // 新建 / 从快照池取的要在本函数末尾 release（段引用保活）；段内复用的不归本函数管
     if (fresh) {
         nvn_gpu_tex_desc td = {0};
         td.d.target = s->target; td.d.format = s->nvn_format;
         td.d.width = s->w; td.d.height = s->h; td.d.depth = s->depth;
         td.d.levels = s->levels; td.d.samples = s->samples;
-        td.usage = NVN_GPU_TEX_SAMPLED | ((s->view_fmt || s->fmt_n) ? NVN_GPU_TEX_VIEW_FMT : 0);   // 列表模式的源（保 UBWC）也要能按孪生格式看
-        nvn_gpu_tex th = NULL; nvn_gpu_err err = {0};
-        nvn_gpu_rc r = nvn_gpu_tex_create(&td, &th, &err);
-        if (!nvn_gpu_ok(r)) { set_sticky(c, r.code, "feedback texture: %s", err.why); return 0; }
-        t = th;
+        td.usage = NVN_GPU_TEX_SAMPLED | ((s->view_fmt || s->want_view) ? NVN_GPU_TEX_VIEW_FMT : 0);   // 源可能要异格式视图（已可变或声明过）：快照同样保留按需重建的资格
+        const struct fb_key key = {(uint32_t)td.d.target, (uint32_t)td.d.format, (uint32_t)td.d.width, (uint32_t)td.d.height,
+                                   (uint32_t)td.d.depth, (uint32_t)td.d.levels, (uint32_t)td.d.samples, (uint32_t)td.usage};
+        t = fbpool_take(&key, s);
+        if (!t) {
+            nvn_gpu_tex th = NULL; nvn_gpu_err err = {0};
+            nvn_gpu_rc r = nvn_gpu_tex_create(&td, &th, &err);
+            if (!nvn_gpu_ok(r)) { set_sticky(c, r.code, "feedback texture: %s", err.why); return 0; }
+            t = th;
+            t->fb_snap = 1; t->fbk = key;
+            __atomic_fetch_add(&g_fbpool_cnt[0], 1, __ATOMIC_RELAXED);
+            if (g_draw_tm) __atomic_fetch_add(&g_feedback_snap[0], 1, __ATOMIC_RELAXED);
+        }
         cmd_ref(c, t, REF_TEX);
         if (!rc_is(c->sticky, NVN_GPU_OK)) { nvn_gpu_tex_release(t); return 0; }
         // 深度 / 多采样保持物理格式和样本数，绝不 resolve / 近似格式替代。
         if (t->format != s->format || t->samples != s->samples) {
             set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback snapshot format/sample mismatch"); nvn_gpu_tex_release(t); return 0;
         }
-        if (g_draw_tm) __atomic_fetch_add(&g_feedback_snap[0], 1, __ATOMIC_RELAXED);
     } else if (g_draw_tm) __atomic_fetch_add(&g_feedback_snap[1], 1, __ATOMIC_RELAXED);
     f->snap = t; f->snap_src = s;   // 新建的此刻已登记进本段引用表，下面失败也活到段结束
+    if (!tex_fmt_allowed(t, v->format)) {
+        // 快照视图照被绑定的源视图格式建（v->format，如 sRGB 孪生）：与 nvn_gpu_view_create 同一闸——声明过 VIEW_FMT
+        //   资格（usage 带了 VIEW_FMT → want_view）的非可变快照就地升 MUTABLE；快照的写只录在命令里、不走 seg_mark_write，
+        //   这里永远没 seg_write。拒件具名失败：直接 vkCreateImageView 绕过这闸就是非可变 UNORM 图上建 sRGB 视图的 VUID-01762。
+        if (t->want_view && !t->seg_write && !nvn_vk_format_is_depth(t->format) && !t->bc_decoded && t->samples == 1 &&
+            tex_upgrade_mutable(t) && nvn_unimpl("gpu", "view_fmt_upgrade", t) == 1)
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", "异格式反馈视图首用：快照图按需重建为可改格式");
+        if (!tex_fmt_allowed(t, v->format)) {
+            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "异格式反馈快照视图：快照未声明 VIEW_FMT 资格或按需重建失败");
+            if (fresh) nvn_gpu_tex_release(t);
+            return 0;
+        }
+    }
     VkImageViewCreateInfo vi = {0}; vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = t->image; vi.viewType = v->type; vi.format = v->format; vi.components = v->components;
     vi.subresourceRange = (VkImageSubresourceRange){v->aspect, v->base_level, v->levels, v->base_layer, v->layers};

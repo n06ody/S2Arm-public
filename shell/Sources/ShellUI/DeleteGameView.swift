@@ -101,6 +101,16 @@ extension EnvironmentValues {
         set { self[ShellExportGameKey.self] = newValue }
     }
 }
+/// Shows the three-step guide for adding the game to the Home Screen (Safari, Add to Home Screen). Nil: no item in the menu.
+private struct ShellAddToHomeKey: EnvironmentKey {
+    nonisolated(unsafe) static let defaultValue: ((String) -> Void)? = nil
+}
+extension EnvironmentValues {
+    var shellAddToHome: ((String) -> Void)? {
+        get { self[ShellAddToHomeKey.self] }
+        set { self[ShellAddToHomeKey.self] = newValue }
+    }
+}
 /// Goes back to the game's saved moment (instant snapshot). Nil, or no snapshot for the game: no item in the card's menu.
 private struct ShellSnapshotKey: EnvironmentKey {
     nonisolated(unsafe) static let defaultValue: (available: (String) -> Bool, restore: (String) -> Void, delete: ((String) -> Void)?)? = nil
@@ -127,6 +137,7 @@ struct GameTileMenu: ViewModifier {
     @Environment(\.shellAskDelete) private var askDelete
     @Environment(\.shellManageSaves) private var manageSaves
     @Environment(\.shellExportGame) private var exportGame
+    @Environment(\.shellAddToHome) private var addToHome
     @Environment(\.shellSnapshot) private var snapshot
     func body(content: Content) -> some View {
         content.contextMenu {
@@ -136,6 +147,9 @@ struct GameTileMenu: ViewModifier {
             Button { select(detail.id); openSettings() } label: { Label(ShellStrings.text("Game settings"), systemImage: "slider.horizontal.3") }
             if let manageSaves {
                 Button { manageSaves(detail.id) } label: { Label(ShellStrings.text("Manage saves…"), systemImage: "externaldrive") }
+            }
+            if let addToHome, detail.game.state == .playable {
+                Button { addToHome(detail.id) } label: { Label(ShellStrings.text("Add to Home Screen…"), systemImage: "plus.app") }
             }
             if let exportGame, detail.game.state == .playable {
                 Button { exportGame(detail.id) } label: { Label(ShellStrings.text("Export this game…"), systemImage: "square.and.arrow.up") }

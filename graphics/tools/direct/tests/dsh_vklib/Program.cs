@@ -107,21 +107,21 @@ static class Program
         File.WriteAllLines(Path.Combine(prof, "shader_map.tsv"), map);
 
         var xc = new CliSpvCross(args[0], work);
-        var rows = VkLib.Build(pkg, prof, outDir, xc, work);
+        var rows = VkLib.Build(pkg, prof, outDir, xc, work, imgLoadRaw: true);   // 目标档案 true：与下面两处参照调用同档（false = 最低档案形态另由 dsh_vk ⑬ 覆盖）
         var tsv = File.ReadAllLines(Path.Combine(outDir, "vk_build.tsv")).Select(l => l.Split('\t')).ToDictionary(c => c[0], c => c[2]);
         Check($"① vk_build.tsv：{tsv.Count} 行，vs / ps / cs / 真几何 ok、顶点代码的 gs skipped、越界 failed", tsv.Count == 6 && expect.All(kv => tsv.GetValueOrDefault(kv.Key) == kv.Value),
             string.Join(" ", tsv.Select(kv => kv.Key + "=" + kv.Value)));
         var files = Directory.GetFiles(outDir).Select(Path.GetFileName).OrderBy(x => x, StringComparer.Ordinal).ToList();
         var want = fx.SelectMany(f => new[] { Key(f.Ctl) + "_b.json", Key(f.Ctl) + "_b.spv" }).Concat(gnames).Append("vk_build.tsv").OrderBy(x => x, StringComparer.Ordinal).ToList();
         Check($"② 输出目录只有三键的 _b.json / _b.spv、几何键的 6 个 _vg 文件和 vk_build.tsv（{files.Count} 个），没有 _b.metal", files.SequenceEqual(want), string.Join(",", files));
-        var gref = DshVk.CompileGeometry(gk, gcode, gctl, xc, prof, work);
+        var gref = DshVk.CompileGeometry(gk, gcode, gctl, xc, prof, true, work);
         Check("③g 几何键 6 个 _vg 文件与直接调 CompileGeometry 的逐字节相同", gref.Count == 6 && gnames.All(n => File.Exists(Path.Combine(outDir, n)) && File.ReadAllBytes(Path.Combine(outDir, n)).AsSpan().SequenceEqual(gref[n])));
 
         foreach (var (stage, code, ctl) in fx)
         {
             string k = Key(ctl);
             if (!File.Exists(Path.Combine(outDir, k + "_b.spv")) || !File.Exists(Path.Combine(outDir, k + "_b.json"))) { Check($"③ {stage} 输出里有 _b.spv / _b.json", false, "缺"); continue; }
-            DshVk.CompileWithSpv(k, stage, code, ctl, refDir, xc, prof, work);   // 落盘模式（DshCompiler.PackOut 已由 Build 复原）
+            DshVk.CompileWithSpv(k, stage, code, ctl, refDir, xc, prof, true, work);   // 落盘模式（DshCompiler.PackOut 已由 Build 复原）
             byte[] a = File.ReadAllBytes(Path.Combine(outDir, k + "_b.spv")), b = File.ReadAllBytes(Path.Combine(refDir, k + "_b.spv"));
             var ja = JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, k + "_b.json")))["bindings"]?.ToJsonString();
             var jb = JsonNode.Parse(File.ReadAllText(Path.Combine(refDir, k + "_b.json")))["bindings"]?.ToJsonString();

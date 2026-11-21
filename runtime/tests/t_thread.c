@@ -37,7 +37,14 @@ void s2a_log_out(int fd, const char *p, size_t n) {
 // ---- 桩 ----
 pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 void sw_gate(void) {}
-void s2a_crash_thread_init(void) {}
+// 同生产（crash.c）：每条游戏线程装一块备用信号栈，抢占信号（SA_ONSTACK）的信号帧落在它上面、不压游戏栈。
+//   原先是空桩：信号帧直接压在游戏栈 sp 以下（Darwin 先跳过 128 字节红区），⑲b 量到的是这个与生产不同的差，量不到 tramp 自己踩没踩
+void s2a_crash_thread_init(void) {
+    static __thread int done; if (done) return;
+    stack_t cur; if (!sigaltstack(NULL, &cur) && !(cur.ss_flags & SS_DISABLE)) { done = 1; return; }   // 已有一块（如 ASan 自己装的）：留着，换掉的话它退线程时 munmap 我们的内存会失败
+    stack_t ss = {.ss_sp = malloc(64u << 10), .ss_size = 64u << 10, .ss_flags = 0};
+    if (ss.ss_sp && !sigaltstack(&ss, NULL)) done = 1;
+}
 static uint8_t g_tlr_pool[16][0x200]; static int g_ntlr;
 void *s2a_tlr_alloc(void) { return g_tlr_pool[g_ntlr++ & 15]; }
 void s2a_tlr_free(void *p) { (void)p; }
@@ -71,6 +78,7 @@ static void ss_spin(uint64_t arg);        // ⑮ 用：纯自旋客体线程（�
 static void ua_spin(uint64_t arg);        // ⑰ 用：纯自旋客体线程（游戏代码里暂停 / 恢复它）
 static void rp_spin(uint64_t arg);        // ⑱ 用：被连续抢占两次的纯自旋低优先级线程
 static void rz_spin(uint64_t arg);        // ⑲ 用：用 sp 下方（红区）存临时值的纯自旋线程（同改写器补丁区桩），被反复抢占
+static void bz_spin(uint64_t arg);        // ⑲b 用：sp 下方 4 KB 都是活数据（游戏收回 sp 后还用的变长数组，#515），被反复抢占
 static void start_probe(uint64_t arg);    // ⑯ 用：入口算游戏代码（sw_is_host_code 桩对它回 0），进门第一件事读持核
 static void mg_spin(uint64_t arg);        // ⑳ 用：高优先级、掩码 0x7 的纯自旋持核者（巫师3 现场 id 126 / 117）
 static void hz_spin(uint64_t arg);        // Horizon 时间片轮转用：优先级 59 的纯自旋持核者
@@ -90,6 +98,8 @@ module_t *module_of(const void *p) {
     if (a >= lo && a < lo + 0x400) { g_fake_mod.base = (uint8_t *)lo; g_fake_mod.patch_off = -1; return &g_fake_mod; }
     if (a >= lo2 && a < lo2 + 0x400) { g_fake_mod.base = (uint8_t *)lo2; g_fake_mod.patch_off = -1; return &g_fake_mod; }
     uint64_t lo6 = (uint64_t)(void *)rz_spin;
+    uint64_t lobz = (uint64_t)(void *)bz_spin;
+    if (a >= lobz && a < lobz + 0x400) { g_fake_mod.base = (uint8_t *)lobz; g_fake_mod.patch_off = -1; return &g_fake_mod; }
     if (a >= lo6 && a < lo6 + 0x400) { g_fake_mod.base = (uint8_t *)lo6; g_fake_mod.patch_off = -1; return &g_fake_mod; }
     uint64_t lo5 = (uint64_t)(void *)rp_spin;
     if (a >= lo5 && a < lo5 + 0x400) { g_fake_mod.base = (uint8_t *)lo5; g_fake_mod.patch_off = -1; return &g_fake_mod; }
@@ -480,6 +490,31 @@ static __attribute__((noinline)) void rz_spin(uint64_t arg) { (void)arg;
         n++;
     }
     atomic_store(&g_rz_bad, bad); atomic_store(&g_rz_loops, n);
+    uint64_t e[31] = {0}; svc_thread(0x0A, e);
+}
+// ---- ⑲b 抢占不碰被抢线程 sp 下方的大块活数据（#515：游戏开变长数组后 mov sp, x29 收回 sp，之后照读写 sp 以下的数组；旧 tramp 跑在游戏栈上、
+//      只从原 sp 让 256 字节，数组超出的部分被 tramp 的栈帧盖掉 → 野指针段错误）。L 在汇编里把 [sp-4096, sp) 512 个 8 字节全写成标记、空转、逐个读回比，
+//      H 反复同核抢占 L。期望 = 标记一个都没坏（标记是写进去的常数，与被测实现无关） ----
+static _Atomic int g_bz_ready, g_bz_stop, g_bz_hdone; static _Atomic uint64_t g_bz_bad, g_bz_loops;
+static __attribute__((noinline)) void bz_spin(uint64_t arg) { (void)arg;
+    uint64_t r[31] = {0}; svc_thread(0x25, r);
+    atomic_store(&g_bz_ready, 1);
+    uint64_t bad = 0, n = 0;
+    while (!atomic_load(&g_bz_stop)) {
+        uint64_t miss;
+        __asm__ volatile("movz x9, #0x5a5a\n movk x9, #0xa5a5, lsl #16\n movk x9, #0x4321, lsl #32\n"
+                         "sub x11, sp, #4096\n mov x10, #512\n 1: str x9, [x11], #8\n subs x10, x10, #1\n b.ne 1b\n"
+                         "mov x10, #4000\n 2: subs x10, x10, #1\n b.ne 2b\n"
+                         "sub x11, sp, #4096\n mov x10, #512\n mov %0, #0\n 3: ldr x12, [x11], #8\n cmp x12, x9\n cinc %0, %0, ne\n subs x10, x10, #1\n b.ne 3b"
+                         : "=&r"(miss) :: "x9", "x10", "x11", "x12", "cc", "memory");
+        bad += miss; n++;
+    }
+    atomic_store(&g_bz_bad, bad); atomic_store(&g_bz_loops, n);
+    uint64_t e[31] = {0}; svc_thread(0x0A, e);
+}
+static void bz_hi(uint64_t arg) { (void)arg;
+    uint64_t r[31] = {0}; svc_thread(0x25, r);   // 高优先级等核 0：靠抢占 L
+    atomic_fetch_add(&g_bz_hdone, 1);
     uint64_t e[31] = {0}; svc_thread(0x0A, e);
 }
 static void rz_hi(uint64_t arg) { (void)arg;
@@ -925,7 +960,18 @@ static void sc_loop(uint64_t arg) {
     atomic_fetch_add(&g_sc_done, 1);
     uint64_t e[31] = {0}; svc_thread(0x0A, e);
 }
+// ---- ㉜ 调度诊断玩家局缺省关（#1842）：判定纯函数 显式 > 开发设施 > 关；关着时有人等核、看门狗醒着也不采样、不做持核长跑探测（不挂起线程）；
+//      开着照旧采样。A 持核 0 纯自旋、B 同核等核（同 ⑮ 的搭法），期望按构造：关 300 ms 采样 +0、长跑读数全不变；开后采样 ≥ 5 次 ----
+static _Atomic int g_sd_ready, g_sd_stop;
+static __attribute__((noinline)) void sd_spin(uint64_t arg) {
+    uint64_t r[31] = {0}; svc_thread(0x25, r);
+    if (!arg) atomic_store(&g_sd_ready, 1);
+    while (!atomic_load(&g_sd_stop)) __asm__ volatile("" ::: "memory");
+    uint64_t e[31] = {0}; svc_thread(0x0A, e);
+}
+int s2a_sched_diag_decide(const char *env, int dev); extern int g_sched_diag; void s2a_test_hostcore(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 int main(void) {
+    setenv("S2A_SCHED_DIAG", "1", 1);   // 调度计数 / 宿主侧持核长跑的用例（⑮ 等）要它：玩家局缺省关（#1842），本单测显式开；缺省关的行为由 ㉜ 单独测
     if (getenv("S2A_TEST_FOREIGN_TSD")) return foreign_tsd_before_init();
     // Isolate the deliberately occupied host key from the normal guest setup.
     { fflush(stdout); pid_t pid = fork();
@@ -1274,6 +1320,29 @@ int main(void) {
         CHECK(atomic_load(&g_lz3_core) >= 0 && atomic_load(&g_lz3_core) <= 2, "㉚ 解冻后应取到核：→ %d", atomic_load(&g_lz3_core));
         g_lazy_core = 0;   // 收尾恢复旧行为（后面的用例不依赖惰性；本条用例之后也没有 block_* 调用者）
     }
+    {   // ㉜ 调度诊断玩家局缺省关（见 sd_spin 处说明）
+        g_case = "㉜ 调度诊断缺省关";
+        CHECK(s2a_sched_diag_decide(NULL, 0) == 0 && s2a_sched_diag_decide("", 0) == 0, "㉜ 不设、开发设施关 → 关");
+        CHECK(s2a_sched_diag_decide(NULL, 1) == 1, "㉜ 不设、开发设施开 → 开");
+        CHECK(s2a_sched_diag_decide("1", 0) == 1 && s2a_sched_diag_decide("0", 1) == 0, "㉜ 显式最优先：=1 开、=0 关");
+        void s2a_core_leave(void);
+        int saved = g_sched_diag; g_sched_diag = 0;
+        atomic_store(&g_sd_ready, 0); atomic_store(&g_sd_stop, 0);
+        spawn(sd_spin, 0, NULL); s2a_core_leave();
+        CHECK(wait_flag(&g_sd_ready, WAIT_LONG), "㉜ A 没起来");
+        spawn(sd_spin, 1, NULL); s2a_core_leave();   // B 同核等核：看门狗醒着（有等核者）
+        usleep(50000);
+        uint64_t n0 = sched_samples(), h0[6], h1[6]; s2a_test_hostcore(&h0[0], &h0[1], &h0[2], &h0[3], &h0[4], &h0[5]);
+        usleep(300000);
+        uint64_t n1 = sched_samples(); s2a_test_hostcore(&h1[0], &h1[1], &h1[2], &h1[3], &h1[4], &h1[5]);
+        int same = 1; for (int i = 0; i < 6; i++) same &= h0[i] == h1[i];
+        CHECK(n1 == n0 && same, "㉜ 关：有人等核 300 ms，采样应 +0、持核长跑读数不变 → 采样 +%llu、长跑%s", (unsigned long long)(n1 - n0), same ? "不变" : "变了");
+        g_sched_diag = 1;
+        uint64_t n2 = n1; for (int k = 0; k < WAIT_LONG && n2 - n1 < 5; k++) { usleep(1000); n2 = sched_samples(); }
+        CHECK(n2 - n1 >= 5, "㉜ 开：采样应恢复（≥ 5 次）→ +%llu", (unsigned long long)(n2 - n1));
+        atomic_store(&g_sd_stop, 1); usleep(20000);
+        g_sched_diag = saved;
+    }
     {   // ㉛ 宿主侧可借（见 sc_loop 处说明）
         g_case = "㉛ 宿主侧可借：免锁拿回 / 被取走 / 同核互斥";
         void s2a_core_leave(void);
@@ -1556,6 +1625,19 @@ int main(void) {
         atomic_store(&g_rz_stop, 1);
         for (int k = 0; k < 2000 && !atomic_load(&g_rz_loops); k++) usleep(1000);
         CHECK(got == 40 && atomic_load(&g_rz_bad) == 0, "⑲ 抢占 %d / 40 次成功；sp 下方标记被改 %llu 次（应 0，共转 %llu 圈）", got, (unsigned long long)atomic_load(&g_rz_bad), (unsigned long long)atomic_load(&g_rz_loops));
+    }
+    {   // ⑲b
+        g_case = "⑲b 抢占不碰被抢线程 sp 下方 4 KB";
+        void s2a_core_leave(void);
+        spawn_prio_arg(bz_spin, 0, 48); s2a_core_leave();
+        CHECK(wait_flag(&g_bz_ready, WAIT_LONG), "⑲b L 没起来");
+        int got = 0;
+        for (int i = 0; i < 40; i++) { int want = i + 1; spawn_prio_arg(bz_hi, 0, 40); s2a_core_leave();
+            for (int k = 0; k < 3000 && atomic_load(&g_bz_hdone) < want; k++) usleep(1000);
+            if (atomic_load(&g_bz_hdone) >= want) got++; usleep(2000); }
+        atomic_store(&g_bz_stop, 1);
+        for (int k = 0; k < 2000 && !atomic_load(&g_bz_loops); k++) usleep(1000);
+        CHECK(got == 40 && atomic_load(&g_bz_bad) == 0, "⑲b 抢占 %d / 40 次成功；sp 下方 4 KB 标记被改 %llu 个（应 0，共转 %llu 圈）", got, (unsigned long long)atomic_load(&g_bz_bad), (unsigned long long)atomic_load(&g_bz_loops));
     }
     {   // ⑳
         g_case = "⑳ 空闲核迁移不看优先级";

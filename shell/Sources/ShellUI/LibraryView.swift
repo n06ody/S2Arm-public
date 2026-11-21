@@ -76,6 +76,8 @@ public struct LibraryView: View {
     @State private var edgeDrag: CGFloat = 0
     @State private var libraryPosition = ScrollPosition()
     @State private var gameOrderOpen = false
+    /// The game whose "Add to Home Screen…" guide is open
+    @State private var addToHomeID: String?
     @State private var layout: ShellLayout = .column
     @State private var returnFocus: String?
     /// The device that sent the last input, for the glyphs.
@@ -340,6 +342,7 @@ public struct LibraryView: View {
         .environment(\.shellAskDelete, actions.onDeleteGame == nil ? nil : { game in openDelete(game.id) })
         .environment(\.shellManageSaves, guardedActions.onManageSaves)
         .environment(\.shellExportGame, guardedActions.onExportGame)
+        .environment(\.shellAddToHome, guardedActions.onAddToHome == nil ? nil : { id in addToHomeID = id })
         .environment(\.shellSnapshot, { () -> (available: (String) -> Bool, restore: (String) -> Void, delete: ((String) -> Void)?)? in
             guard let has = actions.snapshotAvailable, let go = guardedActions.onRestoreSnapshot else { return nil }
             return (available: has, restore: go, delete: guardedActions.onDeleteSnapshot) }())
@@ -358,6 +361,15 @@ public struct LibraryView: View {
                 .preferredColorScheme(.dark)
         }
         #endif
+        .sheet(isPresented: Binding(get: { addToHomeID != nil }, set: { if !$0 { addToHomeID = nil } })) {
+            if let id = addToHomeID {
+                AddToHomeGuideView(name: games.first { $0.id == id }?.game.title ?? "", go: {
+                    addToHomeID = nil
+                    guardedActions.onAddToHome?(id)
+                }, close: { addToHomeID = nil })
+                .preferredColorScheme(.dark)
+            }
+        }
         .environment(\.shellFocus, focus)
         .environment(\.shellInputDevice, device)
         .foregroundStyle(.white)
@@ -534,6 +546,7 @@ public struct LibraryView: View {
         a.onDeleteGame = o.onDeleteGame.map { act in { if !echo() { act($0, $1) } } }
         a.onManageSaves = o.onManageSaves.map { act in { if !echo() { act($0) } } }
         a.onExportGame = o.onExportGame.map { act in { if !echo() { act($0) } } }
+        a.onAddToHome = o.onAddToHome.map { act in { if !echo() { act($0) } } }
         a.onRestoreSnapshot = o.onRestoreSnapshot.map { act in { if !echo() { act($0) } } }
         a.onDeleteSnapshot = o.onDeleteSnapshot.map { act in { if !echo() { act($0) } } }
         return a

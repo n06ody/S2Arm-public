@@ -182,8 +182,14 @@ if(ANDROID)
     endif()
     # NDK 29 defaults to 16 KB ELF alignment; keep it explicit for this library.
     target_link_options(s2arm_android PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,defs)
-    target_compile_definitions(s2arm_android PRIVATE $<$<CONFIG:Debug>:S2A_CAPACITY_WRAP=1>)
-    target_link_options(s2arm_android PRIVATE $<$<CONFIG:Debug>:-Wl,--wrap=pthread_create>)
+    if(S2A_ANDROID_VK_ENGINE AND S2ARM_ANDROID_VK_BACKEND STREQUAL "nvk")
+        # A thread created by a pinned nvk role must start with the original mask.
+        target_compile_definitions(s2arm_android PRIVATE S2A_CAPACITY_WRAP=1)
+        target_link_options(s2arm_android PRIVATE -Wl,--wrap=pthread_create)
+    else()
+        target_compile_definitions(s2arm_android PRIVATE $<$<CONFIG:Debug>:S2A_CAPACITY_WRAP=1>)
+        target_link_options(s2arm_android PRIVATE $<$<CONFIG:Debug>:-Wl,--wrap=pthread_create>)
+    endif()
     # 外挂 Vulkan 驱动：libadrenotools（BSD-2-Clause）与它的 hook 库。刻意做成三个独立的
     # 共享库、不链进 s2arm_android——没有选择驱动时谁也不会加载它们（linkernsbypass 的
     # 构造器会改 dlopen 所在页的保护），系统驱动路径与改前完全相同。

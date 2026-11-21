@@ -167,6 +167,7 @@ typedef struct thr {
     _Atomic int csoft;                 // 宿主侧可借（S2A_VCORE_SOFT）：0 = 硬持 / 不持；1 = 持着核但在宿主代码里，等核者可直接取走；2 = 已被取走（回客体走取核慢路）
 #if defined(__APPLE__)
     _STRUCT_MCONTEXT porig;            // 时钟抢占：被抢点原 mcontext（客体区 sig1 存、二次信号恢复）
+    void *pstk;                        // 时钟抢占：tramp 专用栈（PSTK_SIZE，线程起来时在普通上下文分配、thr_free 释放；见 on_preempt）
     sigset_t pmask;
 #endif                    // 时钟抢占：被抢前的信号掩码（sig1 存、二次信号写回 uc_sigmask）
     uint32_t ss_nocore;                // 调度计数：本线程被采到「在跑客体却不持核」的次数（收局按线程列前 5，定位违规来源）
@@ -791,6 +792,17 @@ static void set_qos(qos_class_t want) {
     if (rc || got != want) { static _Atomic int n; if (!atomic_fetch_add(&n, 1)) LOG("【红】游戏线程 QoS 设 %#x 失败：rc=%d 读回 %#x", want, rc, got); }
 }
 #endif
+#if defined(__APPLE__)
+// 时钟抢占 tramp 的专用栈（#515）：tramp 是 C 代码，原先跑在被抢线程的游戏栈上、只从原 sp 往下让 256 字节。游戏可以把活数据留在 sp 以下
+//   （一款第一方动作游戏：开变长数组后 mov sp, x29 收回 sp，之后照读写数组，数组大小随元素数涨），超出 256 字节的部分被 tramp 的栈帧盖掉 →
+//   下标成垃圾、野指针段错误（崩在同一函数，随抢占时机偶发）。改为每条线程一块自己的栈，tramp 一律在上面跑，不碰游戏栈
+#define PSTK_SIZE (64u << 10)
+static void preempt_stack_init(thr_t *t) {
+    if (!t->pstk && !(t->pstk = malloc(PSTK_SIZE))) die("时钟抢占：tramp 栈分配失败（%u 字节）", PSTK_SIZE);
+}
+#else
+static void preempt_stack_init(thr_t *t) { (void)t; }
+#endif
 static void thread_bind_host(thr_t *t) {
 #if !defined(__APPLE__)
     // Publish pthread lifetime under the same roster lock as the VM census.
@@ -814,10 +826,14 @@ static void thread_bind_host(thr_t *t) {
 #endif
     t->tsd = plat_tsd_base();
     s2a_crash_thread_init();
+    preempt_stack_init(t);
     guest_thread_init(t);
 }
 static void svc_exit(thr_t *t);
 static void samecore_init(void);
+#if defined(__ANDROID__)
+extern void s2a_capacity_guest_enter(void) __attribute__((weak));
+#endif
 static void *thread_main(void *p) {
     thr_t *t = p;
 #if defined(__APPLE__)
@@ -833,6 +849,7 @@ static void *thread_main(void *p) {
 #if (defined(__ANDROID__) || defined(__OHOS__))
     int s2a_android_runtime_enter_guest_thread(void);
     if (s2a_android_runtime_enter_guest_thread()) die("Android guest线程准入失败");
+    if (!hostent && s2a_capacity_guest_enter) s2a_capacity_guest_enter();
 #endif
     // S2A_CORES：进游戏代码前先取核（同 Horizon：线程被调度上核才开始跑）；原先到第一次系统调用才取，期间不持核在跑、同核可 ≥2（调度计数 / t_thread ⑯ 抓到）。
     // 走系统调用出口同一条路：等核期间算在系统调用里（暂停方不去 Mach 挂起它），出来前认暂停
@@ -897,7 +914,11 @@ static void thr_free(thr_t *t) {   // 持 G。被系统调用钉着（pins）就
     if (s2a_test_thr_freed) s2a_test_thr_freed(t);
 #endif
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
-    pthread_cond_destroy(&t->cv); free(t);
+    pthread_cond_destroy(&t->cv);
+#if defined(__APPLE__)
+    free(t->pstk);
+#endif
+    free(t);
 }
 static void core_release(thr_t *t);
 #if defined(__APPLE__)
@@ -1309,10 +1330,10 @@ static void on_preempt(int sig, siginfo_t *si, void *ctx) {
     if (module_of((void *)pc)) {                       // 客体区：改 PC 到 tramp（信号返回后让核）
         me->porig = *uc->uc_mcontext; me->pmask = uc->uc_sigmask;   // 被抢前的掩码（二次信号返回时写回）
         uc->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)preempt_tramp;
-        // tramp 是 C 代码、跑在被抢线程的游戏栈上：sp 先往下让出 256 字节再进。改写器补丁区的桩把临时寄存器存在 sp 下方不挪 sp
-        //   （stp x0, x2, [sp, #-0x10] … ldp x0, x2, [sp, #-0x10]，红区用法），tramp 的栈帧若压在原 sp 上会盖掉它们（10-23 虚拟核缺省开后 Mac 塞尔达
-        //   两局 SIGBUS：x2 被读成 lr、拿去当偏移）。原 sp 随 porig 由二次信号恢复
-        uc->uc_mcontext->__ss.__sp = (uc->uc_mcontext->__ss.__sp - 256) & ~(uint64_t)15;
+        // tramp 跑在本线程的专用栈上（preempt_stack_init），不碰游戏栈：游戏栈 sp 以下可能有活数据——改写器补丁区桩的 16 字节暂存（10-23 Mac 塞尔达 SIGBUS），
+        //   也可能是游戏自己收回 sp 后还在用的变长数组（#515，大小不定，原先让 256 字节盖不住）。原 sp 随 porig 由二次信号恢复
+        uc->uc_mcontext->__ss.__sp = me->pstk ? ((uint64_t)(uintptr_t)me->pstk + PSTK_SIZE) & ~(uint64_t)15
+                                              : (uc->uc_mcontext->__ss.__sp - 256) & ~(uint64_t)15;   // 没分到专用栈的线程（不该有）：退回旧做法
     } else {                                           // 宿主区（svc 处理中 / 宿主代码里）
         // 置标志（svc_exit 是它的主场消费点），并当场 trylock 放核——只在正处系统调用处理中（in_svc）时放：
         //   卡在 svc 里回不到 svc_exit 就是这个缺口的现场（preempt_req 没人消费 = 抢占 100% 无效）。
@@ -1395,11 +1416,12 @@ enum { HC_KEY_MAX = 16 };
 static struct { int svc; uint64_t ret; uint32_t segs; uint64_t hits, max_us; } g_hc_key[HC_KEY_MAX];
 static int g_hc_nkey;
 static uint64_t g_hc_segs, g_hc_hits, g_hc_short, g_hc_pcskip, g_hc_over, g_hc_max_us, g_hc_last_us, g_hc_b[4];   // 全部在 G 内读写
+static int sched_diag(void);   // 调度诊断开关（定义在调度计数那段）
 static int hostcore_ms(void) {
     if (!cores_on()) return 0;   // 虚拟核没开就没有「等核」这回事：正式包热路径与日志与改前逐字节相同
     static int v = -1;
     if (v < 0) {
-        const char *e = getenv("S2A_HOSTCORE_MS"); v = e ? atoi(e) : 1; if (v < 0) v = 0;
+        const char *e = getenv("S2A_HOSTCORE_MS"); v = e ? atoi(e) : sched_diag() ? 1 : 0; if (v < 0) v = 0;   // 不设跟调度诊断（缺省关；持锁等核计时分桶同用这个阈值）
         if (v) LOG("宿主侧持核长跑：开（阈值 %d ms；调度计数 2 ms 采一次，故连续持核 ≥2 ms 才判长跑；S2A_HOSTCORE_MS 可调，0 关）", v);
     }
     return v;
@@ -1486,7 +1508,24 @@ static void hostcore_corewait(void *ra, uint64_t ticks) {
 // 在跑客体 = 已启动未退出、不在系统调用里、没被暂停、没在等核、没放核去宿主侧干活。持核的按持有核记，不持核却在跑的按理想核记（这就是违规）。
 // 线程对象会被释放，遍历要持 G：trylock 抢不到就跳过这次并计数，不拖慢系统调用。收局打进 host.log（s2a_sched_stat_log）
 static _Atomic uint64_t g_ss_n, g_ss_skip, g_ss_multi, g_ss_nocore, g_ss_sameprio_core, g_ss_sameprio_any; static _Atomic int g_ss_peak;
+// 调度诊断（调度计数采样 + 宿主侧持核长跑探测）开不开（纯函数，t_thread ㉜ 测）：S2A_SCHED_DIAG 显式（0 / 1）> 开发设施（os.c s2a_dev_on）> 缺省关。
+//   11-21 #1842：两者原本随虚拟核开就跑（代码自 v0.1.0 就有，0.5.8 虚拟核关所以没跑）——0.6.0 虚拟核缺省按需后进了玩家局：
+//   看门狗每 2 ms 持全局 G + g_cmu 遍历全部线程，对连续持核 ≥ 2 ms 的游戏线程持着这两把锁 Mach 挂起取 PC
+//   （一款开放世界游戏 iPhone 一局 15 分钟：采样 22.9 万次、抢不到锁跳过 5.2 万次，挂起 39,324 段、约每秒 43 次）。属开发设施（持全局锁、挂起线程），不是只进日志的诊断读数
+int s2a_sched_diag_decide(const char *env, int dev) { return env && *env ? *env != '0' : dev != 0; }
+int g_sched_diag = -1;   // -1 未读、0 关、1 开；非 static：单测同一进程里 A/B
+static int sched_diag(void) {
+    int v = g_sched_diag;
+    if (v < 0) {
+        int (*dev)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "s2a_dev_on");   // os.c；按名字取：只链 thread.c 的单测没有它 = 开发设施关
+        const char *e = getenv("S2A_SCHED_DIAG");
+        v = s2a_sched_diag_decide(e, dev ? dev() : 0); g_sched_diag = v;
+        if (cores_on()) LOG("调度诊断（调度计数采样 / 宿主侧持核长跑探测）：%s（%s；S2A_SCHED_DIAG=1 开）", v ? "开" : "关", e && *e ? "显式设定" : "跟开发设施");
+    }
+    return v;
+}
 static void sched_sample(void) {
+    if (!sched_diag()) return;
     if (pthread_mutex_trylock(&G)) { atomic_fetch_add(&g_ss_skip, 1); return; }
     // 核状态（held_core / g_cown）在 g_cmu 下改（取核 / 放核 / 空闲核迁移）：采样也持 g_cmu，读到的是一致快照。
     //   只持 G 时，迁移中途会读到被迁线程的旧核号与抢核线程的新核号同核，误报「同核 ≥2」（10-23 Mac 缺省开核对）
@@ -1695,6 +1734,7 @@ static void *preempt_watchdog(void *a) {
         // 没人等核时抢占 / 时间片轮转都无事可做（两者都要有等核者）：睡在 g_wd_cv 上，有线程开始等核即醒；空闲期调度计数降到每 20 ms 一次。
         //   原先不管有没有等核者都 0.5 ms 轮询：每秒 2000 次唤醒、常驻性能核，10-24 测试设备2 动森直连同包虚拟核开 3.754 W / 关 2.597 W（唤醒 2380 / 630 次每秒）
         pthread_mutex_lock(&g_cmu);
+        while (!g_ncw && !sched_diag()) pthread_cond_wait(&g_wd_cv, &g_cmu);   // 调度诊断关：空闲期没事可做，等第一个等核者叫醒（不再每 20 ms 醒一次采样）
         while (!g_ncw) {
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 20000000; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&g_wd_cv, &g_cmu, &dl) == ETIMEDOUT && !g_ncw) { pthread_mutex_unlock(&g_cmu); sched_sample(); pthread_mutex_lock(&g_cmu); }
@@ -2746,6 +2786,7 @@ static void *snap_thread_main(void *arg) {
     { char nm[24]; snprintf(nm, sizeof nm, "nx-%llu", (unsigned long long)t->id); pthread_setname_np(nm); }
     t->mport = pthread_mach_thread_np(pthread_self()); t->tsd = plat_tsd_base(); t->pt = pthread_self();
     s2a_crash_thread_init();
+    preempt_stack_init(t);
 #if defined(__APPLE__)
     gl_snap_thread_bind(t->id);
 #endif

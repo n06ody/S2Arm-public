@@ -365,7 +365,9 @@ namespace S2A.Dsh
         /// 再用同一张答案表、同一 JobFor / 翻译器重出单线程改写之前的 .spv（VulkanSpv），按 json 改写绑定号（BindToArgIds），写 &lt;key&gt;_b.spv。
         /// 出包（DshCompiler.PackOut）时 Compile 的产物留在 DshCompiler.PackFiles、不落盘：json 从那里取，_b.spv 进 PackSpv，同样不落盘。
         /// 几何着色器走 CompileGeometry（按输入图元出几份，见那里）；曲面外壳 / 曲面域着色器不出 .spv（报红，不静默）。返回产物名。</summary>
-        public static List<string> CompileWithSpv(string key, string stage, byte[] code, byte[] ctl, string outDir, ISpvCross xc, string tablesDir, string workRoot = null)
+        /// <param name="imgLoadRaw">出库目标档案的 shaderStorageImageReadWithoutFormat：false = 最低档案（只读非缓冲图像声明具体格式，
+        /// 任何设备都合法）；按真档案 true 才声明 Unknown。不配设备的库取件在绑定核被拒、退回现编（#1850）。</param>
+        public static List<string> CompileWithSpv(string key, string stage, byte[] code, byte[] ctl, string outDir, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot = null)
         {
             if (stage is "gs" or "hs" or "ds") throw new DshError("export failed", $"{stage} 着色器不走 CompileWithSpv（vs / ps / cs 在这里，几何走 CompileGeometry，曲面不出）");
             PackSpv = DshCompiler.PackOut ? new Dictionary<string, byte[]>() : null;
@@ -375,7 +377,7 @@ namespace S2A.Dsh
                 : DshCompiler.PackFiles != null && DshCompiler.PackFiles.TryGetValue(jsonName, out var t) ? t
                 : throw new DshError("export failed", "出包模式下 PackFiles 里没有 " + jsonName);
             var json = JsonNode.Parse(jsonText).AsObject();
-            byte[] spv = BindToArgIds(VulkanSpv(key, stage, code, ctl, xc, tablesDir, workRoot),
+            byte[] spv = BindToArgIds(VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot),
                 json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings"), stage);
             if (DshCompiler.PackOut) PackSpv[spvName] = spv;
             else
@@ -390,10 +392,10 @@ namespace S2A.Dsh
         /// <summary>json 对应的那一遍翻译的 .spv，取在单线程改写（SpvSingleLane，Metal 专用）之前。顶点着色器照 Finish 的判据：
         /// 单线程改写后的 MSL 里有答案表没给类型的整数输入，就补进 attr 再译一遍（json 记的是这一遍）；Dsh.cs 在 dmsh_chain 的 FILES 里，这里只调不改。
         /// 工作文件同 Compile 留在本线程的内存表（XIo），不落临时目录（出包时整条路都不碰盘）。</summary>
-        static byte[] VulkanSpv(string key, string stage, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, string workRoot)
+        static byte[] VulkanSpv(string key, string stage, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot)
         {
             string w = Path.Combine(workRoot ?? Path.GetTempPath(), "dshvkb_" + key + "_" + Guid.NewGuid().ToString("N")[..8]);
-            var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir) };
+            var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir), ImageLoadRaw = imgLoadRaw };
             var mem0 = XIo.Mem; XIo.Mem = new Dictionary<string, byte[]>();
             try
             {
@@ -523,13 +525,14 @@ namespace S2A.Dsh
         /// 拼出参数缓冲成员表交 DshCompiler.Reflect（与 vs / ps / cs 的 _b.json 同一套按名字分类：cbuf / c1 / sbuf / tex / samp…），参数号按成员先后编；
         /// 再按它改写绑定号（BindToArgIds：参数号 × 6 + 3）。输出接口不配片元（翻译器不调 SetNextStage）：只写着色器自己写的输出，与离线顶点阶段同一口径。
         /// 运行时描述符数组（池）、认不出的资源类型、直通型几何头报 DshError，不出这支（设备现编）。</summary>
-        public static Dictionary<string, byte[]> CompileGeometry(string key, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, string workRoot = null)
+        /// <param name="imgLoadRaw">同 CompileWithSpv：出库目标档案的 shaderStorageImageReadWithoutFormat。</param>
+        public static Dictionary<string, byte[]> CompileGeometry(string key, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot = null)
         {
             if (GeometrySkip(code, ctl) is string why) throw new DshError("export failed", why);
             var outFiles = new Dictionary<string, byte[]>(StringComparer.Ordinal);
             foreach (int t in GeometryTopologies)
             {
-                var (spv, res) = GeometryXlate(key, code, ctl, t, xc, tablesDir, workRoot);
+                var (spv, res) = GeometryXlate(key, code, ctl, t, xc, tablesDir, imgLoadRaw, workRoot);
                 var bindings = (JsonArray)JsonNode.Parse(Py.Dumps(DshCompiler.Reflect("gs", GeometryArgs(spv), res)));
                 var json = new JsonObject
                 {
@@ -543,10 +546,10 @@ namespace S2A.Dsh
         }
 
         /// <summary>一种输入图元的翻译：同 JobFor / 翻译器，任务带 gs_input_topology（不带 geometry_topology：那个是几何转计算）。工作文件留在本线程的内存表（XIo）</summary>
-        static (byte[] Spv, JsonObject Res) GeometryXlate(string key, byte[] code, byte[] ctl, int topology, ISpvCross xc, string tablesDir, string workRoot)
+        static (byte[] Spv, JsonObject Res) GeometryXlate(string key, byte[] code, byte[] ctl, int topology, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot)
         {
             string w = Path.Combine(workRoot ?? Path.GetTempPath(), "dshvkg_" + key + "_" + Guid.NewGuid().ToString("N")[..8]);
-            var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir) };
+            var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir), ImageLoadRaw = imgLoadRaw };
             var mem0 = XIo.Mem; XIo.Mem = new Dictionary<string, byte[]>();
             try
             {

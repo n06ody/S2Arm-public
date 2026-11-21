@@ -50,6 +50,7 @@ long nvn_dirty_page_gens(const void *s, const void *a, size_t n, uint64_t *g, si
 void nvn_dirty_protect(const void *a, size_t n) { (void)a; (void)n; }
 void rp_buf_reset(void);
 void rp_occl_draw(nvn_gpu_cmd c) { (void)c; }
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) {
     uint64_t start = (uint64_t)(uintptr_t)guest;

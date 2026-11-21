@@ -66,6 +66,20 @@ if [[ ${PRESENT_SETTINGS_BUILD_ONLY:-0} == 1 ]]; then
     exit 0
 fi
 
+stuck_awk='
+# sample 调用图 → 每线程一行：线程名｜我方最深帧（in 本测二进制）→ 叶子帧；只取每线程第一条（最重）路径
+function flush() { if (th != "" && own != "") printf "%s｜%s → %s\n", th, own, leaf; th = ""; own = ""; leaf = ""; done = 0 }
+/^Call graph:/ { on = 1; next }
+on && /^Total number in stack/ { flush(); exit }
+on && /^    [0-9]+ Thread_/ { flush(); s = $0; sub(/^ +[0-9]+ /, "", s); gsub(/ +/, " ", s); th = substr(s, 1, 60); depth = -1; next }
+on && th != "" && !done {
+  if ($0 !~ /\(in /) next
+  d = match($0, /[0-9]+ [^ ]/); if (depth >= 0 && d <= depth) { done = 1; next }   # 回到同层或更浅 = 第一条路径走完
+  depth = d; f = substr($0, d); sub(/^[0-9]+ /, "", f); sub(/ +\[0x[0-9a-f]+\].*/, "", f); sub(/  \(in /, " (", f)
+  leaf = f; if (f ~ /\(t_present_settings\)/) own = f
+}
+END { flush() }
+'
 # 各格 edge 图跨跑残留：格没跑成时旧图会让 distinctions 假绿——先清
 rm -f "$out"/mtl?-*/edge-*.bgra
 bad=0; unproven=0; unpr=' '
@@ -89,7 +103,14 @@ for backend in mtl3 mtl4; do
                 nodbg=(); for e in "${run_env[@]}"; do case $e in MTL_DEBUG_LAYER=*|MTL_DEBUG_LAYER_ERROR_MODE=*) ;; *) nodbg+=("$e");; esac; done; run_env=("${nodbg[@]}")
                 echo "说明 ${name}：macOS $(sw_vers -productVersion) 的 Metal 调试层不支持 Metal 4 + MetalFX，本格不开调试层（macOS 27 起照开）"; fi
             status=0
-            "${run_env[@]}" "$out/t_present_settings" "$runtime" > "$runtime/run.log" 2>&1 || status=$?
+            rm -f "$runtime/stuck.sample"
+            "${run_env[@]}" "$out/t_present_settings" "$runtime" > "$runtime/run.log" 2>&1 & pid=$!
+            # 一格正常 4～7 秒跑完；活过 20 秒（本测内部等待 30 秒、闹钟 60 秒之前）就是卡住了：取 3 秒线程栈，红时摘每个线程「我方最深帧 → 叶子帧」，直接读出卡在哪
+            #   看门的每 0.2 秒查一次、进程一退就走（不留 sleep 占着本步输出管道），标准输入输出都不接本步
+            ( for ((i=0;i<100;i++)); do kill -0 "$pid" 2> /dev/null || exit 0; sleep 0.2; done
+              /usr/bin/sample "$pid" 3 -file "$runtime/stuck.sample" ) < /dev/null > /dev/null 2>&1 & wd=$!
+            wait "$pid" || status=$?
+            wait "$wd" 2> /dev/null || true
             # 77 = 宿主显示环境未证（屏睡/非活动 Space）：记未证不计红，见 t_present_settings.m 探针
             if [[ "$status" == 77 ]]; then unpr+="$name "; unproven=$((unproven+1)); printf 'UNPROVEN %s（宿主显示环境未证）\n' "$name"; continue; fi
             ok=1
@@ -121,6 +142,7 @@ for backend in mtl3 mtl4; do
                 #   门禁存下的只有红摘要。行首用「✗」：两条路径的摘要都认它——graphics/gate.sh evidence 摘 ^(✗ |不通 |FAIL) 前 20 行，
                 #   作为单测（tests/present_settings_test.sh）时 tools/gate.sh 摘 ^(不通|✗) 前 10 行；「FAIL: 」与【红】那几行名额会被编译命令文本占掉
                 printf '✗ %s（exit=%s）\n' "$name" "$status" >&2
+                [[ ! -s "$runtime/stuck.sample" ]] || awk "$stuck_awk" "$runtime/stuck.sample" | cut -c1-220 | sed "s/^/✗ 栈 ${name}｜/" >&2
                 tail -n 6 "$runtime/run.log" 2> /dev/null | sed "s/^/✗ 尾 ${name}｜/" >&2; fi
         done
     done

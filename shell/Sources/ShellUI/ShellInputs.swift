@@ -348,6 +348,9 @@ public struct ShellActions {
     /// S2Arm: "Export this game…" on a playable game (0.6.3): the host writes its .s2arm and .img and hands them to the Files
     /// app. Nil: no item in the card's menu.
     public var onExportGame: ((_ gameID: String) -> Void)? = nil
+    /// S2Arm: "Add to Home Screen…" on a playable game: after the library's three-step guide, the host opens the game's page
+    /// in Safari, which the player adds to the Home Screen; its icon then opens the game directly. Nil: no item in the menu.
+    public var onAddToHome: ((_ gameID: String) -> Void)? = nil
     /// Instant snapshot (0.6.0): whether this game has a complete snapshot to go back to, and going back to it (starts the
     /// game restored to that moment). Both nil: no snapshot item anywhere in the library.
     public var snapshotAvailable: ((_ gameID: String) -> Bool)? = nil

@@ -85,6 +85,7 @@ def adapt(root,out):
     unit=unit.replace('return pause_wait_suite();',
         'if (argc>1 && !strcmp(argv[1],"scope")) return pw_finish("deadline-scope",pw_scope_suite(),0);\n'
         '    if (argc>1 && !strcmp(argv[1],"watchdog")) { pthread_t wd;\n'
+        '        setenv("S2A_SCHED_DIAG","1",1);   /* 测的是空闲期按时醒（调度诊断开时才定时醒；玩家局缺省关时空闲期纯等等核者叫醒，#1842） */\n'
         '        pw_check(!pthread_create(&wd,NULL,preempt_watchdog,NULL),"actual watchdog starts");\n'
         '        while(pw_watchdog_calls<4)usleep(100);   /* 按事件等满 4 轮（不设墙钟：负载高时 1 秒转不满 4 轮，11-02 假红）；挂死交 run_pause_wait_checks.run() 的 40 秒 */\n'
         '        pw_check(pw_watchdog_calls>=4 && pw_watchdog_changes>=3,"independent watchdog deadlines may change");\n'

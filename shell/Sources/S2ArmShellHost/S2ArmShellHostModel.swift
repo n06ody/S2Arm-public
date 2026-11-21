@@ -488,6 +488,7 @@ public final class S2ArmShellHostModel {
         actions.onGetSigningCert = { s2a_shell_cert_get() }   // 库卡片「需要签名证书」的主按钮
         actions.onImportProgram = { id in s2a_shell_pick_s2arm(id) }   // 库卡片「导入 .s2arm…」：还缺 .s2arm 的款、0.5 老款
         actions.onExportGame = { id in s2a_shell_export_game(id) }   // 长按「导出这一款…」（0.6.3）：生成 .s2arm + .img 交「文件」App
+        actions.onAddToHome = { [weak self] id in self?.openHomeShortcut(id) }   // 长按「添加到主屏幕…」：引导后开官网启动页（HomeShortcut.swift）
         #endif
         actions.featureIntro = featureIntro   // 新功能介绍（0.6.0 起 iPhone 两页）：有才在游戏库设置里出「再看一遍」那一行
         // 快照（0.6.0）：有完整快照的那款，长按卡片多一项「回到上次存下的这一刻」（宿主 ios/app.m；开关关着时宿主回 0，菜单里没有这一项）
