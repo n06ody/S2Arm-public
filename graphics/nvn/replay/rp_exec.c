@@ -3,6 +3,7 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_shader.h"   // struct rp_prog（rp_seg_prog_note 按它的阶段表记键）
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
@@ -43,9 +44,14 @@ struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_r
 struct post { volatile uint32_t *val; uint32_t mode, v; uint64_t report; uint32_t type; struct ts_segment *ts; uint32_t slot; };   // 完成后写事件值（mode 0 写 / 1 加）；report 非 0 = 计数器报告的写回地址
 struct occ_ev { uint32_t pos; uint32_t report; uint64_t addr; };   // 遮挡计数的事件：发生时本段已经开过 pos 个槽；report 0 = 复位、1 = 报告（写回 addr）
 struct gw_ev { uint64_t pool_key, id; };   // 本段里 GPU 写进池的一段（rp_buf_gpu_write_note 的登记）
+// 段失败定位：录制侧滚动记本段最后 ≤4 笔（绘制 / 派发）实际绑上的程序阶段键。键 = rp_S.skey 的 8 字节
+// 着色器键（与具名拒收行、出包程序表同一键空间）；bm 位 = NVN 阶段号（0..2 图形、5 计算）。
+// 完成回调在 worker 线程跑：中途段 / 末段的键在提交时随段快照（mid / sub 各存一份），失败时不看还在滚动的活表。
+enum { SEG_PK_MAX = 4 };
+struct seg_pk { uint8_t k[SEG_PK_MAX][6][8]; uint8_t bm[SEG_PK_MAX]; int n; };
 struct sub { struct ts_segment *ts_head, *ts_current; uint32_t refs; /* 录制者/末段回调持一引用，每个 mid 回调另持一引用。 */
              struct post *p; int n, cap, nfx; /* nfx：p 里时间戳报告以外的条数 */ uint64_t t_commit; struct occ_ev *oe; int noe, oecap; uint64_t fence; struct gw_ev *gw; int ngw, gwcap;
-    uint64_t *oc; uint32_t noc, occ_base; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
+    uint64_t *oc; uint32_t noc, occ_base; struct seg_pk pk; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
 // 分时读数（上屏那边每 5 秒取走一次清零）：一次队列提交里回放花的、交给后端花的、游戏等围栏花的、段从提交到完成隔了多久
 // 回放层只从这里取时刻。宿主单测（android/tests/replay_exec_time_test.c）把本文件整个编进测试 TU 时先定义
 // S2A_RP_EXEC_TEST_CLOCK，换成测试可控的虚拟钟（否则「一帧回放花了多久」没有手算得出的期望值）；
@@ -141,6 +147,37 @@ int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c：CALL 目标
 
 // 缓冲 512：最长的中文前缀约 150 字节 + 原因串最多 191 字节；256 时 gcc -O2 -Werror=format-truncation 在 Linux 容器编译红
 static void red(const char *fmt, const char *why) { char b[512]; snprintf(b, sizeof b, fmt, why); nvn_plat_log(NVN_PLAT_LOG_RED, "replay", b); }
+static struct seg_pk g_seg_pk;
+// 发射点（rp_draw 每笔绘制 / 派发真正落命令之前）调：记这笔用的程序的阶段键。
+// 没有可定位键的笔也占位——保住「最后几笔」的笔数口径，打印侧显式报「无键」。线程：[提交]（当前段开着才记）。
+void rp_seg_prog_note(const struct rp_prog *p) {
+    if (!p || !g_cmd || !g_sub) return;
+    if (g_seg_pk.n == SEG_PK_MAX) { memmove(&g_seg_pk.k[0], &g_seg_pk.k[1], sizeof g_seg_pk.k - sizeof g_seg_pk.k[0]);
+                                    memmove(&g_seg_pk.bm[0], &g_seg_pk.bm[1], SEG_PK_MAX - 1); g_seg_pk.n = SEG_PK_MAX - 1; }
+    uint8_t bm = 0;
+    if (p->is_compute) { if (rp_S.skey_ok >> 5 & 1) { memcpy(g_seg_pk.k[g_seg_pk.n][5], rp_S.skey[5], 8); bm = 32; } }
+    else for (int st = 0; st < RP_PROG_STAGES; st++)
+        if (p->sh[st] && (rp_S.skey_ok >> st & 1)) { memcpy(g_seg_pk.k[g_seg_pk.n][st], rp_S.skey[st], 8); bm |= (uint8_t)(1u << st); }
+    g_seg_pk.bm[g_seg_pk.n] = bm;
+    g_seg_pk.n++;
+}
+// 「（本段末 N 笔程序键：阶段=键+阶段=键、…）」；无快照 / 段里一笔没记 → 「（本段无可定位的程序键）」
+static void seg_pk_fmt(char *o, size_t cap, const struct seg_pk *s) {
+    if (!s || !s->n) { snprintf(o, cap, "（本段无可定位的程序键）"); return; }
+    size_t w = (size_t)snprintf(o, cap, "（本段末 %d 笔程序键：", s->n);
+    for (int i = 0; i < s->n && w + 48 < cap; i++) {
+        w += (size_t)snprintf(o + w, cap - w, "%s", i ? "、" : "");
+        int had = 0;
+        for (int st = 0; st < 6; st++) if (s->bm[i] >> st & 1) {
+            w += (size_t)snprintf(o + w, cap - w, "%s%d=", had ? "+" : "", st);
+            for (int b = 0; b < 8; b++) w += (size_t)snprintf(o + w, cap - w, "%02x", s->k[i][st][b]);
+            had = 1;
+        }
+        if (!had) w += (size_t)snprintf(o + w, cap - w, "无键");
+    }
+    snprintf(o + (w < cap ? w : cap - 1), cap - (w < cap ? w : cap - 1), "）");
+}
+static void red_seg(const char *fmt, const char *why, const struct seg_pk *s) { char t[400], b[640]; seg_pk_fmt(t, sizeof t, s); snprintf(b, sizeof b, fmt, why, t); nvn_plat_log(NVN_PLAT_LOG_RED, "replay", b); }
 static void pre_done(void *user, const nvn_gpu_done *d) {
     struct pre_note *p = user;
     if (d->status == NVN_GPU_DONE_FAILED) red("前置段失败：%s", d->why ? d->why : "?");
@@ -204,7 +241,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
             if (s->p[i].mode & 1) __atomic_fetch_add((uint32_t *)s->p[i].val, s->p[i].v, __ATOMIC_SEQ_CST);
             else __atomic_store_n((uint32_t *)s->p[i].val, s->p[i].v, __ATOMIC_SEQ_CST);
         }
-    else red("提交段失败，本段的事件 / 计数器不回写：%s", d->why ? d->why : "?");
+    else red_seg("提交段失败，本段的事件 / 计数器不回写：%s%s", d->why ? d->why : "?", s ? &s->pk : NULL);
     // 遮挡计数：自上次复位以来通过的样本数是队列上的累计值。按槽号顺序把本段各槽加进累计；复位 / 报告事件落在「它发生时已经开过的槽」之后。
     // 段按提交顺序完成，累计值只在这里（完成回调）动。失败的段：槽值当 0，报告不写。
     { uint64_t acc = g_occ_acc; uint32_t n = d->status != NVN_GPU_DONE_FAILED && d->occlusion ? d->nocclusion : 0; int e = 0;
@@ -317,6 +354,7 @@ static void rc_cond(const p_render_cond *rc) {
 }
 
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
+    g_seg_pk.n = 0;
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
@@ -328,16 +366,16 @@ void nvn_be_sub_begin(void) {
     rc_retire(); g_rc_npend = 0; g_rc_skip = 0;
     g_occ_seg = g_occ_used; g_occ_next = 0; g_occ_base = 0; g_occ_cur = -1; g_occ_pass = 0;
     nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
-    g_cmd = NULL; g_pre = NULL; g_sub_serial++; g_seg_serial++; g_mid = 0; g_pass_cuts = 0; { uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns); g_split_base = nd; }
+    g_cmd = NULL; g_pre = NULL; g_sub_serial++; g_seg_serial++; g_mid = 0; g_pass_cuts = 0; g_seg_pk.n = 0; { uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns); g_split_base = nd; }
     if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_cmd, &err))) { g_cmd = NULL; static int said; if (!said++) red("开提交段失败（之后同样的失败不再逐条报）：%s", err.why); }
     rp_dirty_all();   // 新段：已发给后端的状态全部重发；rp_S / rp_R 不动
 }
 
-struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; };   // counted：这次中途段持 s 的引用（完成回调里释放）；t_commit：提交时刻（算 GPU 忙）
+struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; struct seg_pk pk; };   // counted：这次中途段持 s 的引用（完成回调里释放）；t_commit：提交时刻（算 GPU 忙）；pk：本段末笔程序键快照
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
     struct mid *m = user;
     if (m) ts_capture(m->ts, d);
-    if (d->status == NVN_GPU_DONE_FAILED) red("中途交的段失败：%s", d->why ? d->why : "?");
+    if (d->status == NVN_GPU_DONE_FAILED) red_seg("中途交的段失败：%s%s", d->why ? d->why : "?", m ? &m->pk : NULL);
     else { if (m) busy_done(m->t_commit, now_ns());
         if (m && m->s->oc && d->occlusion) { for (uint32_t i = 0; i < d->nocclusion && m->base + i < 2048; i++) m->s->oc[m->base + i] = d->occlusion[i];
             uint32_t end = m->base + d->nocclusion < 2048 ? m->base + d->nocclusion : 2048; if (end > m->s->noc) m->s->noc = end; } }
@@ -388,14 +426,15 @@ static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
     if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red_seg("前置段提交失败：%s%s", err.why, &g_seg_pk); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
-    if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
+    if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); m->pk = g_seg_pk; }
     if (g_occ_seg && !g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc);
     __atomic_add_fetch(&g_sub->refs, 1, __ATOMIC_ACQ_REL); m->counted = 1;
     g_sub->ts_current = NULL;
-    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, g_fence + ++g_mid, mid_done, m, &err))) red("中途交段失败：%s", err.why);
+    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, g_fence + ++g_mid, mid_done, m, &err))) red_seg("中途交段失败：%s%s", err.why, &g_seg_pk);
     pf_add(RP_PERF_SUBS, 1);
+    g_seg_pk.n = 0;   // 新段从空键表记起（快照已随 mid 走）
     g_occ_base = g_occ_next; g_occ_cur = -1; g_seg_serial++;
     g_occ_seg = next_occ;
     nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
@@ -427,15 +466,15 @@ static uint64_t sub_commit_body(void) {
         return g_fence;
     }
     nvn_gpu_err err = {0}; uint64_t f = g_fence + SUB_STEP;
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red_seg("前置段提交失败：%s%s", err.why, &g_seg_pk); }
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
-    uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; }
+    uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; s->pk = g_seg_pk; }
     if (s && (s->n || s->noe || s->ngw)) __atomic_store_n(&g_wait_effect_fence, f, __ATOMIC_RELEASE);
     if (s && (s->nfx || s->noe || s->ngw)) g_effect_fence = f;   // 这次提交做完时有东西要写回游戏内存（事件、时间戳以外的计数器报告、遮挡结果、GPU 写的缓冲）
     if (s && (s->n || s->noe || s->ngw)) { pf_add(RP_PERF_FX_SUBS, 1); pf_add(RP_PERF_FX_OCC, (uint64_t)s->noe); pf_add(RP_PERF_FX_GW, (uint64_t)s->ngw); }   // 这次提交做完时有东西要写回游戏内存（事件、计数器报告、遮挡结果、GPU 写的缓冲）
     rc_commit(f);
-    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, sub_done, s, &err))) red("提交失败：%s", err.why);
+    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, sub_done, s, &err))) red_seg("提交失败：%s%s", err.why, s ? &s->pk : &g_seg_pk);
     pf_add(RP_PERF_COMMIT_NS, now_ns() - t0); pf_add(RP_PERF_SUBS, 1);
     g_fence = f;
     rp_debug_dump_poll(&g_fence);   // 调试开关 nvk_dump：有登记才做事

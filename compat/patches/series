@@ -659,3 +659,4 @@
 20261120-0617-ldn-mitm-join-handshake.patch
 20261120-1306-ldn-mitm-disconnect-diagnostics.patch
 20261120-1021-spirv-declare-used-caps.patch
+20261120-1837-audio-renderer-partial-start.patch
