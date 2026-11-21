@@ -254,6 +254,9 @@ namespace Ryujinx.Graphics.Shader.Translation
         // 避免独立缓存策略把原生 GS 输出扩到全部 32 个 location。
         public void S2ASetNextStageActual(TranslatorContext nextStage) => SetNextStage(nextStage, true);
 
+        // S2A：Translate() 之后读本阶段实际发射的用户 varying「逻辑 location → 宿主 Location」（输出 / 输入各一份，按逻辑号升序）。
+        public IReadOnlyDictionary<int, int> S2AVaryingLocationMap(bool isOutput) => AttributeUsage.S2AEmittedVaryingLocations(isOutput);
+
         private void SetNextStage(TranslatorContext nextStage, bool actualNextStage)
         {
             bool linked = AttributeUsage.RequiresLinkedVaryingInterface;

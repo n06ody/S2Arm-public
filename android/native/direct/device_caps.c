@@ -172,6 +172,7 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         "\"maxPerStageDescriptorStorageImages\":%u,"
         "\"minUniformBufferOffsetAlignment\":%llu,\"minStorageBufferOffsetAlignment\":%llu,"
         "\"minTexelBufferOffsetAlignment\":%llu,\"subgroupSize\":%u,\"maxComputeWorkGroupInvocations\":%u,"
+        "\"maxVertexOutputComponents\":%u,\"maxFragmentInputComponents\":%u,"
         "\"maxSamplerAnisotropy\":%.6f},",
         l->maxImageDimension2D, l->maxImageDimensionCube, l->maxImageArrayLayers,
         l->maxUniformBufferRange, l->maxStorageBufferRange, l->maxComputeSharedMemorySize,
@@ -180,6 +181,7 @@ int s2a_vk_device_caps_json(const struct s2a_vk_device *d, char *out, size_t cap
         l->maxPerStageDescriptorStorageImages,
         (unsigned long long)l->minUniformBufferOffsetAlignment, (unsigned long long)l->minStorageBufferOffsetAlignment,
         (unsigned long long)l->minTexelBufferOffsetAlignment, sg.subgroupSize, l->maxComputeWorkGroupInvocations,
+        l->maxVertexOutputComponents, l->maxFragmentInputComponents,
         (double)l->maxSamplerAnisotropy);
 
     // geometryShaderOcclusionQuery 即通用侧 SupportsGeometryShaderOcclusionQuery 同一位：

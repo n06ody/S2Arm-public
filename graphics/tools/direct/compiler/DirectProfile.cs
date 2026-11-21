@@ -125,7 +125,12 @@ namespace S2A.DirectCompiler
                 "maximumUniformBuffersPerStage", "maximumStorageBuffersPerStage",
                 "maximumTexturesPerStage", "maximumImagesPerStage",
                 "maximumComputeSharedMemorySize", "maximumSupportedAnisotropy", "shaderSubgroupSize",
-                "storageBufferOffsetAlignment", "textureBufferOffsetAlignment", "gatherBiasPrecision", "maximumGpuMemory");
+                "storageBufferOffsetAlignment", "textureBufferOffsetAlignment", "gatherBiasPrecision", "maximumGpuMemory",
+                "maximumVertexOutputComponents", "maximumFragmentInputComponents");
+            int vertexOutput = caps.TryGetProperty("maximumVertexOutputComponents", out _)
+                ? JsonStrict.Int(caps, "maximumVertexOutputComponents", cw, 0, int.MaxValue) : 0;
+            int fragmentInput = caps.TryGetProperty("maximumFragmentInputComponents", out _)
+                ? JsonStrict.Int(caps, "maximumFragmentInputComponents", cw, 0, int.MaxValue) : 0;
             string memory = JsonStrict.String(caps, "memoryType", cw, 31);
             SystemMemoryType memoryType = memory switch
             {
@@ -201,8 +206,8 @@ namespace S2A.DirectCompiler
                 maximumGpuMemory: JsonStrict.UInt64(caps, "maximumGpuMemory", cw, 0, ulong.MaxValue),
                 s2aVertexPull: JsonStrict.Bool(caps, "s2aVertexPull", cw),
                 requiresLinkedVaryingInterface: false,
-                maximumVertexOutputComponents: 0,
-                maximumFragmentInputComponents: 0);
+                maximumVertexOutputComponents: vertexOutput,
+                maximumFragmentInputComponents: fragmentInput);
             int physicalShared = JsonStrict.Int(caps, "maximumComputeSharedMemorySize", cw, 1, 1 << 20);
             var parsed = BuildCaps(physicalShared);
             var translation = physicalShared < 48 * 1024 ? BuildCaps(48 * 1024) : parsed;
