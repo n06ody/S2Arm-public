@@ -9,6 +9,8 @@
 #define _GNU_SOURCE 1   // process_vm_readv（逐笔日志经内核读游戏内存）；编译参数已定义的不重复
 #endif
 #include "rp_exec.h"
+// 弱链接[replay]：rp_pass_cut_why
+__attribute__((weak)) void rp_pass_cut_why(int why);   // 批 0 诊断探针：收通道原因（rp_pass.c）
 #include "rp_state.h"
 #include "rp_res.h"
 #include "rp_shader.h"
@@ -1388,7 +1390,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                 struct hz_ent *e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
                 if (!e && !built) {   // 表里没有（前瞻停在前面 / 作废了 / 阶段不够）：收通道，从这一笔重新前瞻；刚建过还没有就走下面的逐笔拷
                     if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1);
-                    rp_pass_flush(c); hz_build(c, rec, g_hz_mask);
+                    (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c)); hz_build(c, rec, g_hz_mask);
                     e = hz_take(c, rec, ind, di != NULL, a.ind, a.ind_off, need);
                     if (e) rp_perf_add(RP_PERF_BINST_ONE, 1);
                 } else if (e) rp_perf_add(RP_PERF_BINST_HZ, 1);
@@ -1410,7 +1412,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
             fill_graphics_drv(&g_ind_drv[st], st, 0);
             // Stay in the main command stream after any GPU producer; a pre-submit
             // transfer command would move this read before that producer.
-            if (!copied) { rp_perf_add(RP_PERF_BINST_ONE, 1); if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1); rp_pass_flush(c); }
+            if (!copied) { rp_perf_add(RP_PERF_BINST_ONE, 1); if (!rp_pass_is_open || rp_pass_is_open()) rp_perf_add(RP_PERF_BINST_CUT, 1); (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c)); }
             nvn_gpu_copy_buf(c, a.ind, a.ind_off + (di ? 16 : 12),
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
@@ -1552,7 +1554,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         }
 #undef ACCESS_READ
         if (need) {
-            rp_pass_flush(c);
+            (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
             uint32_t game_barrier = rp_pass_take_barrier();
             if (game_barrier) nvn_gpu_barrier(c, game_barrier);
             else nvn_gpu_compute_to_graphics(c);
@@ -1882,7 +1884,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     rp_view_pin_begin();
     for (uint32_t i = 0; i < pg->nent[0]; i++) { const nvn_gpu_layout_ent *e = &pg->ent[0][i];
         if (e->src_kind == NVN_RB_TBUF) {
-            rp_pass_flush(c);
+            (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
             if (!tbuf_prepare(c, e, 5, pg->dtt[0][i], pg->dcls[0][i], &tv[i], rec)) goto done;
             continue;
         }
@@ -1908,7 +1910,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     }
     { struct timespec tr1; clock_gettime(CLOCK_MONOTONIC, &tr1); rp_perf_add(RP_PERF_DISP_RESOLVE_NS, (uint64_t)tr1.tv_sec * 1000000000ull + (uint64_t)tr1.tv_nsec - r0); }
     { struct timespec tsb; clock_gettime(CLOCK_MONOTONIC, &tsb); uint64_t f0 = (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec;
-      rp_pass_flush(c);
+      (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
       clock_gettime(CLOCK_MONOTONIC, &tsb); rp_perf_add(RP_PERF_DISP_FLUSH_NS, (uint64_t)tsb.tv_sec * 1000000000ull + (uint64_t)tsb.tv_nsec - f0); }
     g_disp_ind = NULL; g_disp_ind_off = 0;
     { struct timespec tin; clock_gettime(CLOCK_MONOTONIC, &tin); uint64_t in0 = (uint64_t)tin.tv_sec * 1000000000ull + (uint64_t)tin.tv_nsec;

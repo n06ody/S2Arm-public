@@ -661,7 +661,7 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
     if (x->need_init && c) {   // 刚建的存储：CPU 贴图走下面的上传；其余的取一次存储里现有的内容，取不了的清零
         x->need_init = 0;
         if (!x->cpu && !x->gpu_written) {
-            nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+            const uint64_t wg0 = rp_gpu_wr_gen; nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub); if (rp_gpu_wr_gen != wg0) rp_perf_add(RP_PERF_XO_TEX_INIT, 1);   // 断遍探针
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
@@ -673,7 +673,7 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
         }
     }
     if (x->zero_pending && !g_attach_intent && c) {   // 待清零没被通道取走（开通道失败），现在有别的用途要它：照旧填零
-        nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
+        const uint64_t wg0 = rp_gpu_wr_gen; nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub); if (rp_gpu_wr_gen != wg0) rp_perf_add(RP_PERF_XO_TEX_ZERO, 1);   // 断遍探针
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
     if (x->cpu && !x->gpu_written && c && t->mem) {
@@ -689,7 +689,9 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
             uint64_t wlo, whi; tex_window(t, &wlo, &whi);   // 同 upload_all：只跟踪池里那段
             x->span = nvn_dirty_span(t->mem + wlo, whi - wlo);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
             if (!x->uploaded || x->check_dirty || tex_content_dirty(x, t)) {
+                const uint64_t wg0 = rp_gpu_wr_gen;
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
+                if (rp_gpu_wr_gen != wg0) rp_perf_add(RP_PERF_XO_TEX_UP, 1);   // 断遍探针：CPU 贴图在本次提交里第二次上传
                 if (g_texdiag_on < 0) g_texdiag_on = nvn_plat_flag("nvk_tex_reupload_diag", 0) != 0;
                 const int diag = xc && g_texdiag_on, first = !x->uploaded;
                 const char *trigger = NULL; texdiag_sample sample = {0};

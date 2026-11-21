@@ -19,6 +19,8 @@
 #include <stdio.h>
 #include <string.h>
 
+// 弱链接[replay]：rp_pass_cut_why
+__attribute__((weak)) void rp_pass_cut_why(int why);   // 批 0 诊断探针：收通道原因（rp_pass.c；只链 rp_buf 的单测里没有）
 struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
@@ -45,7 +47,8 @@ struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t 
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
                 int failed;   // 第一份镜像建不出来：记住，之后这个池直接按未接返回，不再每笔重建（池释放时随表项删掉，重建池会重试）
-                struct land_rng lr[16]; int nlr; };
+                struct land_rng lr[16]; int nlr;
+                uint64_t *probe_land; };   // 批 0 诊断探针：撤登记时整段置旧的页（落地回流），每页一位，第一次用到时分配
 static int g_mirror_cur;   // 现在用第几份；只在提交锁里改（Finish 与提交互斥）
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_land_cv = PTHREAD_COND_INITIALIZER;
@@ -91,7 +94,7 @@ static void mirror_free(struct mirror *m, int defer) {
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s); }
+                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s->probe_land); free(s); }
 // 镜像映射代号：新建镜像、换镜像都会让「同一段地址解析出的 (缓冲, 偏移)」变掉。回放核心的解析结果缓存按它作废。
 
 // ---------- 脏页追加日志（nvk_buf_dirtylog，#1501 A②）----------
@@ -372,6 +375,8 @@ static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
     const uintptr_t a = (uintptr_t)s->mem + off, b = a + len;
     const uint64_t k0 = (a - s->page0 + ps - 1) / ps, k1 = (b - s->page0) / ps;   // 整页：[k0, k1)
     if (k1 > k0) stale_set(m, k0, (k1 < s->npages ? k1 : s->npages) - 1);
+    if (k1 > k0 && (s->probe_land || (s->probe_land = calloc((size_t)(s->npages / 64 + 1), sizeof *s->probe_land))))   // 批 0 诊断探针：记下这些页是「落地回流」
+        for (uint64_t k = k0; k < k1 && k < s->npages; k++) s->probe_land[k >> 6] |= 1ull << (k & 63);
 }
 
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
@@ -481,8 +486,16 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         if (!landing_hit && s->nlr) { const uint64_t ra = a - (uintptr_t)mem, rb = b - (uintptr_t)mem;
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
+        {   // 批 0 诊断探针：主段 GPU 拷贝（录成拷贝的同步）按成因分账——落地回流 / 同提交第二次同步 / 其余真脏；直接写的只清标记
+            const uint64_t pkb = nvn_dirty_page_size() / 1024; uint64_t pl = 0, po = 0;
+            for (uint64_t k = i; k <= j; k++) {
+                if (s->probe_land && (s->probe_land[k >> 6] >> (k & 63) & 1)) { s->probe_land[k >> 6] &= ~(1ull << (k & 63)); pl++; } else po++;
+            }
+            if (!d) { if (pl) rp_perf_add(RP_PERF_GX_LAND_KB, pl * pkb); if (po) rp_perf_add(last == rp_sub_serial() ? RP_PERF_GX_SECOND_KB : RP_PERF_GX_DIRTY_KB, po * pkb); }
+        }
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        else { const uint64_t wg0 = rp_gpu_wr_gen; nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (rp_gpu_wr_gen != wg0) rp_perf_add(RP_PERF_XO_BUF, 1);   // 断遍探针：主段里按序录的缓冲同步
+               if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }
@@ -769,6 +782,7 @@ static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *re
 int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
     if (!c || !n || !in_pool(d, n) || !rp_buf_gpu_pending(d, n)) return 0;
+    if (rp_pass_cut_why) rp_pass_cut_why(RP_CUT_BUF);
     rp_pass_flush(c);
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, d, n, &db, &off)) return 0;
@@ -779,6 +793,7 @@ int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
     if (!c || !n || !in_pool(s, n) || !in_pool(d, n) || (!rp_buf_gpu_pending(s, n) && !rp_buf_gpu_pending(d, n))) return 0;
     if (s < d + n && d < s + n) { nvn_unimpl("buf", "copy_overlap_gpu_pending", rec); return 0; }   // 源目标重叠（GPU 拷贝不许）：照旧 CPU 做，记账
+    if (rp_pass_cut_why) rp_pass_cut_why(RP_CUT_BUF);
     rp_pass_flush(c);
     nvn_gpu_buf sb, db; uint64_t so, doff;
     if (!rp_buf_resolve(c, s, n, &sb, &so) || !rp_buf_resolve(c, d, n, &db, &doff)) return 0;
@@ -788,6 +803,7 @@ int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
 int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec) {
     if (!c || !cb->size || !in_pool(cb->addr, cb->size) || !rp_buf_gpu_pending(cb->addr, cb->size)) return 0;
     if ((cb->addr | cb->size) & 3) { nvn_unimpl("buf", "clear_unaligned_gpu_pending", rec); return 0; }   // GPU 填充要 4 字节对齐：照旧 CPU 做，记账
+    if (rp_pass_cut_why) rp_pass_cut_why(RP_CUT_BUF);
     rp_pass_flush(c);
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, cb->addr, cb->size, &db, &off)) return 0;
