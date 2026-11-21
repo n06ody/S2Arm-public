@@ -10,6 +10,7 @@
 #include "nvn_refl.h"
 #include "vk_device.h"
 #include "nvn_plat_vk.h"
+#include "nvn_vk_pass_or.h"
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -300,6 +301,58 @@ static void run_hoist(struct s2a_vk_device *d,const char *dir,int mode){
  if(id)rp_buf_gpu_write_land(key,id,0);
  g_track=0;hz_flag=2;rp_R.has_sc=0;rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);int t=atomic_load(&retired)+1;nvn_gpu_buf_release(rb,retirement,NULL);struct timespec pause={0,1000000};for(int i=0;i<5000&&atomic_load(&retired)<t;i++)nanosleep(&pause,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
+static void run_guard_or(struct s2a_vk_device *d, const char *dir) {
+    nvn_gpu_open_desc od = {.host_device = d, .app_label = "real-gpu-guard-or"};
+    GPU(nvn_gpu_open(&od, &err));
+    const struct nvn_vk_pass_or_domain domain = {4608, 576, 508 + 32, 252 + 32};
+    const uint64_t range = 2654240;
+    const uint64_t off = d->properties.limits.minStorageBufferOffsetAlignment;
+    nvn_gpu_layout_ent ent = {.cls = NVN_GPU_RES_SSBO, .count = 1, .access = NVN_GPU_ACC_RW, .stages = 1u << NVN_GPU_SH_CS};
+    nvn_gpu_layout lay = {.ent = &ent, .nent = 1, .push_bytes = 8};
+    nvn_gpu_shader writer = shader(dir, "replay_binst_args.comp", NVN_GPU_SH_CS, &lay);
+    nvn_gpu_stage_desc sd = {.sh = writer};
+    nvn_gpu_pipe producer = NULL;
+    GPU(nvn_gpu_cpipe_get(&sd, NVN_GPU_PIPE_SYNC, &producer, &err));
+    nvn_gpu_shader_release(writer);
+    nvn_gpu_buf src = buffer(off + range, NULL);
+    nvn_gpu_buf dst = buffer(sizeof(struct nvn_vk_pass_or_value), NULL);
+    for (int k = 0; k < 5; k++) {
+        memset(nvn_gpu_buf_cpu(src), 0, off + range);
+        memset(nvn_gpu_buf_cpu(dst), 0, sizeof(struct nvn_vk_pass_or_value));
+        nvn_gpu_cmd c = NULL;
+        GPU(nvn_gpu_cmd_begin(NULL, &c, &err));
+        const nvn_gpu_binding b = {.cls = NVN_GPU_RES_SSBO, .u.b = {src, off, range}};
+        if (k == 1 || k == 2 || k == 3) {
+            const uint32_t field = k == 2 ? domain.field1 : domain.field0;
+            const uint32_t words[] = {((domain.count - 1) * domain.stride + field) / 4, k == 2 ? 0x400u : 0x200u};
+            nvn_gpu_set_pipe(c, producer);
+            nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1);
+            nvn_gpu_push(c, NVN_GPU_SH_CS, 0, words, sizeof words);
+            nvn_gpu_dispatch(c, producer, 1, 1, 1, NULL, 0);
+        }
+        const int recorded = nvn_vk_pass_or_record(c, src, off, k == 4 ? range - 128 : range, dst, 0, domain);
+        if (k == 3) {
+            // The following producer reuses the guest compute pipeline and
+            // descriptor. It must not overwrite the probe's input early.
+            const uint32_t words[] = {((domain.count - 1) * domain.stride + domain.field0) / 4, 0x800u};
+            nvn_gpu_push(c, NVN_GPU_SH_CS, 0, words, sizeof words);
+            nvn_gpu_dispatch(c, producer, 1, 1, 1, NULL, 0);
+        }
+        GPU(nvn_gpu_cmd_commit(c, (uint64_t)k + 1, done, NULL, &err));
+        GPU(nvn_gpu_fence_wait((uint64_t)k + 1, 5000000000ull, &err));
+        struct nvn_vk_pass_or_value out;
+        memcpy(&out, nvn_gpu_buf_cpu(dst), sizeof out);
+        const unsigned want0 = k == 1 || k == 3 ? 0x200 : 0, want1 = k == 2 ? 0x400 : 0;
+        printf("guard-or case=%d recorded=%d valid=%u words=%x/%x expected=%x/%x\n", k, recorded,
+               out.valid, out.field0, out.field1, want0, want1);
+        if (recorded != (k != 4) || out.valid != (unsigned)(k != 4) || out.field0 != want0 || out.field1 != want1)
+            failures++;
+    }
+    nvn_gpu_buf_release(src, NULL, NULL);
+    nvn_gpu_buf_release(dst, NULL, NULL);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+}
+
 #include "mirror_blit_test.h"
 int main(int argc,char **argv) {
  int depth_only=argc==3&&!strcmp(argv[2],"--depth-only");
@@ -311,6 +364,7 @@ int main(int argc,char **argv) {
  if(hoist_only){for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
  if(mirror_only){run_color_mirror(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
  if(!depth_only){
+  run_guard_or(&d,argv[1]);
   for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);   // 通道级批量拷（rp_draw.c nvk_binst_hoist）
   for(int index=0;index<3;index++){run_case(&d,argv[1],index,0);run_case(&d,argv[1],index,2);run_case(&d,argv[1],index,4);run_case(&d,argv[1],index,3);}
   for(int index=0;index<3;index++)for(int mode=10;mode<=22;mode++){if(!index&&((mode>=13&&mode<=15)||mode>=20))continue;run_case(&d,argv[1],index,mode);}

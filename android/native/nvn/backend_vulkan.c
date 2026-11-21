@@ -34,6 +34,8 @@
 #include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
+#include "nvn_vk_pass_or.h"
+#include "../../../graphics/nvn/replay/rp_pass_or_probe.h"
 #include "../direct/sha256.h"
 #include "backend_vulkan_pass_constant_spv.h"
 #include "../../../graphics/nvn/replay/rp_guard_probe.h"
@@ -321,6 +323,7 @@ struct feedback_copy {
     struct nvn_gpu_tex_s *snap, *snap_src; // 快照图（本段 REF_TEX 保活到 fence）与它照的源图；同段同源复用，见 feedback_make
 };
 
+struct pass_or_cmd;
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     VkCommandBuffer cb;
@@ -364,6 +367,8 @@ struct nvn_gpu_cmd_s {
     uint32_t pass_color_mask;                // 哪些颜色槽有附件（位 i = 槽 i；空位为 0）
     uint32_t pass_cfmt[8], pass_dsfmt, pass_samples;   // 当前通道各槽的 NVN 格式（空位 0）、深度模板格式、采样数（带掩码的清除建管线用）
     VkImageAspectFlags pass_ds_aspect;       // 当前通道深度模板附件有的面（0 = 没有该附件）
+    VkDescriptorPool pass_or_pool;
+    struct pass_or_cmd *pass_or;
     VkQueryPool report_ts;
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
@@ -484,6 +489,16 @@ struct nvn_gpu_vk {
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
     uint32_t test_delay_ms;
+    VkDescriptorSetLayout pass_or_dsl;
+    VkPipelineLayout pass_or_layout;
+    VkPipeline pass_or_pipe;
+    int pass_or_resource_failed;
+    struct {
+        _Atomic int armed;
+        uint32_t delay, field1, ticks, reserved, processed;
+        uint32_t unknown[6], zeros[2], nonzeros[2], timestamps;
+        uint64_t deadline;
+    } pass_or;
     int pass_capture_delay;
     _Atomic int pass_capture_record, pass_capture_replace;
     _Atomic uint64_t pass_capture_serial;
@@ -1861,6 +1876,7 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 
+static void pass_or_free(nvn_gpu_cmd c);
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
@@ -1931,6 +1947,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     for (uint32_t i = 0; i < c->ndpools_full; i++) seg_give_desc(c->dpools_full[i]);
     free(c->dpools_full);
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
+    pass_or_free(c);
+    if (c->pass_or_pool) vkDestroyDescriptorPool(g.d, c->pass_or_pool, NULL);
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         seg_give_q(c->qpool, c->qcount);
@@ -1965,6 +1983,8 @@ void s2a_adpf_gpu_segment(uint64_t gpu_ns) __attribute__((weak));
 void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_pass_capture.inc"
 
+static void pass_or_finish(nvn_gpu_cmd c, int failed);
+static void pass_or_clock_open(void);
 static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int sampled = 0;
     int failed = s->failed;
@@ -2051,9 +2071,18 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         }
     }
 
+    if (s->cmd && s->cmd->pass_or) pass_or_finish(s->cmd, failed);
     if (!s->internal && (failed || !sampled)) pass_capture_segment(vk->pass_capture, NULL, NULL, 0, s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         pass_capture_frame(vk, s, failed);
+        if (vk->pass_or.delay && !failed && !atomic_load_explicit(&vk->pass_or.armed, memory_order_relaxed)) {
+            const uint64_t now = now_ns();
+            if (!vk->pass_or.deadline) vk->pass_or.deadline = now + (uint64_t)vk->pass_or.delay * 1000000000ull;
+            if (now >= vk->pass_or.deadline) {
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-or", "active");
+                atomic_store_explicit(&vk->pass_or.armed, 1, memory_order_release);
+            }
+        }
         if (vk->guard.delay && !failed && !atomic_load_explicit(&vk->guard.armed, memory_order_relaxed)) {
             const uint64_t now = now_ns();
             if (!vk->guard.deadline) vk->guard.deadline = now + (uint64_t)vk->guard.delay * 1000000000ull;
@@ -2454,7 +2483,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     const int gputime = nvn_plat_flag("nvk_gputime", 0);
     g.pass_capture_delay = gputime == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
     const int guard_delay = gputime == 0 && rp_buf_guard_probe ? nvn_plat_flag("nvk_pass_guard_s", 0) : 0;
-    if (guard_delay > 0) {
+    const int or_delay = gputime == 0 ? nvn_plat_flag("nvk_pass_or_s", 0) : 0;
+    if (guard_delay > 0 || or_delay > 0) {
         g.guard.records = (uint32_t)nvn_plat_flag("nvk_guard_records", 0);
         g.guard.stride = (uint32_t)nvn_plat_flag("nvk_guard_stride", 0);
         g.guard.field = (uint32_t)nvn_plat_flag("nvk_guard_field", 0);
@@ -2464,27 +2494,32 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         g.guard.prefix_slot = (uint32_t)nvn_plat_flag("nvk_guard_prefix_slot", -1);
         if (g.guard.records && g.guard.records <= 65536 && g.guard.stride && !(g.guard.stride % 4) &&
             g.guard.field < g.guard.stride && !(g.guard.field % 4) && g.guard.prefix_mask <= 255 &&
-            g.guard.data_slot >> 16 < 4 && g.guard.prefix_slot >> 16 < 4)
-            g.guard.delay = (uint32_t)guard_delay;
-        else nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-guard", "invalid guard configuration");
+            g.guard.data_slot >> 16 < 4 && g.guard.prefix_slot >> 16 < 4) {
+            g.pass_or.field1 = (uint32_t)nvn_plat_flag("nvk_guard_field1", -1);
+            g.guard.delay = or_delay > 0 ? 0 : (uint32_t)guard_delay;
+            if (or_delay > 0 && g.pass_or.field1 < g.guard.stride && !(g.pass_or.field1 & 3u) &&
+                g.pass_or.field1 != g.guard.field) g.pass_or.delay = (uint32_t)or_delay;
+            else if (or_delay > 0) nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-or", "invalid second field");
+        } else nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-guard", "invalid guard configuration");
     }
-    if (g.pass_capture_delay > 0 || g.guard.delay) {
+    if (g.pass_capture_delay > 0 || g.guard.delay || g.pass_or.delay) {
         uint32_t hi = (uint32_t)nvn_plat_flag("nvk_pass_key_hi", 0);
         uint32_t lo = (uint32_t)nvn_plat_flag("nvk_pass_key_lo", 0);
         if (g.pass_capture_delay > 0) g.pass_capture_key = ((uint64_t)hi << 32) | lo;
-        if (g.guard.delay) g.guard.sha_prefix = ((uint64_t)hi << 32) | lo;
+        if (g.guard.delay || g.pass_or.delay) g.guard.sha_prefix = ((uint64_t)hi << 32) | lo;
         g.pass_capture_w = nvn_plat_flag("nvk_pass_match_w", 0);
         g.pass_capture_h = nvn_plat_flag("nvk_pass_match_h", 0);
         g.pass_capture_vertices = nvn_plat_flag("nvk_pass_match_vertices", 0);
         g.pass_capture_colors = nvn_plat_flag("nvk_pass_match_colors", 0);
-        if (g.guard.delay && (!g.guard.sha_prefix || g.pass_capture_w <= 0 || g.pass_capture_h <= 0 ||
+        if ((g.guard.delay || g.pass_or.delay) && (!g.guard.sha_prefix || g.pass_capture_w <= 0 || g.pass_capture_h <= 0 ||
                              g.pass_capture_vertices <= 0 || g.pass_capture_colors <= 0)) {
             nvn_plat_log(NVN_PLAT_LOG_WARN, "pass-guard", "invalid draw selector");
-            g.guard.delay = 0;
+            g.guard.delay = g.pass_or.delay = 0;
         }
         g.pass_capture_blank = g.pass_capture_key && g.pass_capture_w > 0 && g.pass_capture_h > 0 &&
             g.pass_capture_vertices > 0 && g.pass_capture_colors > 0 && nvn_plat_flag("nvk_pass_constant", 0) == 1;
     }
+    if (g.pass_or.delay) pass_or_clock_open();
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
@@ -2613,6 +2648,7 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
 static void wsi_close_locked(void);   // backend_vulkan_wsi.inc
 static void clr_close(void);          // backend_vulkan_clear.inc
 static void depth_blit_close(void);   // backend_vulkan_depth_blit.inc
+static void pass_or_close(void);
 static void easu_close(void);   // backend_vulkan_easu.inc
 nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     if (!g_open) return rc(NVN_GPU_OK);
@@ -2665,6 +2701,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
+    pass_or_close();
     free(g.pass_capture);
     g.pass_capture = NULL;
     g.worker_started = 0;
@@ -3608,7 +3645,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             }
         }
         VkResult module_result = vkCreateShaderModule(g.d, &ci, NULL, &sh->mod);
-        if (module_result == VK_SUCCESS && (g.pass_capture_delay > 0 || g.guard.delay) && s->stage == NVN_GPU_SH_FS)
+        if (module_result == VK_SUCCESS && (g.pass_capture_delay > 0 || g.guard.delay || g.pass_or.delay) && s->stage == NVN_GPU_SH_FS)
             pass_shader_identify(sh, s->key, ci.pCode, ci.codeSize);
         free(array_code);
         if (module_result != VK_SUCCESS) {
@@ -6242,6 +6279,7 @@ static void pass_capture_draw_detail(struct pass_capture_row *r, struct nvn_gpu_
 }
 
 #include "backend_vulkan_pass_guard.inc"
+#include "backend_vulkan_pass_or.inc"
 
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     draw_tm_init();   // 诊断：这笔绘制各段用时（nvk_gputime 开着才计）
@@ -6445,6 +6483,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance);
         if (g.guard.delay && inst == 1) pass_guard_draw(c, p, a->count);
+        if (g.pass_or.delay && inst == 1) pass_or_confirm(c, p, a->count);
     }
     if (profile && profile->draws++ == 0) {
         profile->substituted = selected != p->pipe;
