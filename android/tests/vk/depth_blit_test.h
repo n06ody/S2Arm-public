@@ -97,8 +97,15 @@ static const uint32_t depth_state_frag_spv[] = {
     0x0003003eu, 0x00000009u, 0x00000011u, 0x000100fdu, 0x00010038u,
 };
 
-static void test_depth_blit(void) {
-    for (unsigned round=0;round<4;round++) {
+static void test_depth_blit(unsigned ab_seconds) {
+    const int alternate = ab_seconds != 0;
+    const unsigned cases = alternate ? 8 : 4;
+    for (unsigned i=0;i<cases;i++) {
+        const unsigned round = alternate ? i/2 : i;
+        if (alternate) {
+            nvn_vk_nvnbar_submit((1ull + (uint64_t)ab_seconds * i) * 1000000000ull);
+            CHECK(nvn_vk_nvnbar_state() == (((uint64_t)(i+1) << 1) | (i & 1u)));
+        }
         int subresource = round >= 2; const unsigned st[4] = {0, 255, 85, 170};
         nvn_gpu_tex_desc td={0};td.d.target=subresource ? NVN_TEXTURE_TARGET_2D_ARRAY : NVN_TEXTURE_TARGET_2D;
         td.d.format=(round & 1) ? NVN_FORMAT_DEPTH32F_STENCIL8 : NVN_FORMAT_DEPTH24_STENCIL8;
@@ -139,7 +146,7 @@ static void test_depth_blit(void) {
             {.ent=1,.cls=NVN_GPU_RES_TEX_SAMP,.u.ts={stencil,sampler}},
             {.ent=2,.cls=NVN_GPU_RES_SSBO,.u.b={output,0,sizeof initial}}};
         nvn_gpu_set_pipe(cmd,pipe);nvn_gpu_bind(cmd,NVN_GPU_SH_CS,bindings,3);nvn_gpu_dispatch(cmd,pipe,1,1,1,NULL,0);
-        GPU(nvn_gpu_cmd_commit(cmd,200+round,done,NULL,&err));GPU(nvn_gpu_fence_wait(200+round,5000000000ull,&err));
+        GPU(nvn_gpu_cmd_commit(cmd,200+i,done,NULL,&err));GPU(nvn_gpu_fence_wait(200+i,5000000000ull,&err));
         const uint32_t *actual=(const uint32_t *)nvn_gpu_buf_cpu(output);CHECK(actual);
         for (unsigned y=0;y<4;y++)for(unsigned x=0;x<4;x++) {
             int inside=x>=1&&x<3&&y>=1&&y<3;unsigned q=inside ? (y-1)*2+x-1 : 0;
@@ -150,5 +157,6 @@ static void test_depth_blit(void) {
         nvn_gpu_buf_release(output,NULL,NULL);nvn_gpu_samp_release(sampler);nvn_gpu_shader_release(shader);
         nvn_gpu_view_release(stencil);nvn_gpu_view_release(dv);nvn_gpu_view_release(sv);nvn_gpu_tex_release(dst);nvn_gpu_tex_release(src);
     }
-    puts("PASS: depth-stencil nearest blit, 2 formats x 2 subresources, 64 depth + 64 stencil samples (all 8 bits), 64 sentinel bytes");
+    printf("PASS: depth-stencil nearest blit, 2 formats x 2 subresources x %u modes, %u depth + %u stencil samples (all 8 bits), %u sentinel bytes\n",
+           alternate ? 2u : 1u, 16 * cases, 16 * cases, 16 * cases);
 }

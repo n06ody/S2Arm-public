@@ -114,9 +114,49 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q,const VkPresentInfoKH
     if(probe_active) probe_readback(q,probe_images[pi->pImageIndices[0]]);
     return fixture_QueuePresentKHR(q,pi);
 }
+static void profile_rendered_frames(void) {
+    g_pass_capture_test = 1;
+    CHECK(open_backend(), "pass capture open");
+    nvn_gpu_err e = {0};
+    nvn_gpu_surface sf = NULL;
+    CHECK(OK(nvn_gpu_surface_attach((void *)1, &sf, &e)) && sf, "pass capture attach: %s", e.why);
+    nvn_gpu_tex t = make_tex(64, 36, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER);
+    nvn_gpu_view v = make_view(t);
+    if (sf && v) {
+        nvn_gpu_present_desc present = {.src = v};
+        for (uint64_t i = 1; i <= 30; i++) {
+            nvn_gpu_cmd c = begin_cmd();
+            nvn_gpu_pass_desc p = {.w = 64, .h = 36, .layers = 1, .ncolor = 1};
+            p.color[0].view = v;
+            p.color[0].load = NVN_GPU_LOAD_CLEAR;
+            p.color[0].store = NVN_GPU_STORE_STORE;
+            nvn_gpu_pass_begin(c, &p);
+            nvn_gpu_pass_end(c);
+            p.color[0].load = NVN_GPU_LOAD_LOAD;
+            nvn_gpu_pass_begin(c, &p);
+            nvn_gpu_pass_end(c);
+            CHECK(OK(nvn_gpu_cmd_commit(c, i, on_done, NULL, &e)), "pass capture commit: %s", e.why);
+            nvn_gpu_drawable d = {0};
+            CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass capture acquire: %s", e.why);
+            CHECK(OK(nvn_gpu_present(sf, &d, &present, i, NULL, NULL, &e)), "pass capture present: %s", e.why);
+            if (i == 1) nanosleep(&(struct timespec){1, 500000000}, NULL);
+        }
+    }
+    nvn_gpu_view_release(v);
+    nvn_gpu_tex_release(t);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "pass capture close: %s", e.why);
+    unsigned want = getenv("S2A_TEST_PRESENT_BGRA") ? 0 : 24;
+    CHECK(g_pass_capture_frames == want && g_pass_capture_clear == want && g_pass_capture_load == want &&
+          g_pass_capture_end == (want != 0), "PASS_CAPTURE expected=%u actual=%u clear=%u load=%u end=%u",
+          want, g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end);
+    printf("PASS_CAPTURE expected=%u actual=%u clear=%u load=%u end=%u\n",
+           want, g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end);
+    g_pass_capture_test = 0;
+}
 int main(void) {
     char why[256]={0};if(s2a_vk_device_create(&g_dev,why,sizeof why)) {fprintf(stderr,"device %s\n",why);return 2;}
     memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="original-present-grayscale";
+    profile_rendered_frames();
     if(!open_backend())return 2;
     nvn_gpu_err e={0};nvn_gpu_surface sf=NULL;CHECK(OK(nvn_gpu_surface_attach((void *)1,&sf,&e)),"attach %s",e.why);
     if(!sf)return 2;

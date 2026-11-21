@@ -24,6 +24,8 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 mode=${1:-}
+# 第二个参数供 CI 同版容器在缺省整套上强制启用三合一屏障探针。
+if [ "${2:-}" = --nvnbar-on ]; then export S2A_TEST_NVK_NVNBAR=1; fi
 # 独立夹具：android/tests/vk/standalone/<模式名>.sh（模式名不带前导 --），单独 `--<模式名>` 只跑它，默认档逐个跑。
 #   新夹具只加一个文件，不改本脚本：原先每支 PR 都往下面的模式名单和分派段里加一行，同一天十几支在这几行上互相冲突。
 standalone_mode() { [ -n "$mode" ] && [ -f "$repo/android/tests/vk/standalone/${mode#--}.sh" ]; }
@@ -441,7 +443,7 @@ if [ "$mode" = "--gs-core" ]; then
          "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c"
          "$repo/android/native/nvn/nvn_vk_driver_cache.c"
          "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
-         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c" "$repo/android/native/direct/compile_worker.c"
          "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
     cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
 fi
@@ -465,7 +467,7 @@ if [ "$mode" = "--tbuf-compiler-core" ]; then
          "$repo/android/native/nvn/nvn_vk_format.c" "$repo/graphics/nvn/gfx/nvn/nvn_fmt_expand.c" "$repo/android/native/nvn/nvn_vk_bcdec.c"
          "$repo/android/native/nvn/nvn_vk_program_result.c" "$repo/android/native/nvn/nvn_vk_compute_request.c" "$repo/android/native/nvn/nvn_vk_driver_cache.c"
          "$repo/android/native/direct/source_store.c" "$repo/android/native/direct/control.c" "$repo/android/native/direct/input_identity.c" "$repo/android/native/direct/texture_facts.c"
-         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c"
+         "$repo/android/native/direct/sha256.c" "$repo/android/native/direct/json.c" "$repo/android/native/direct/jv.c" "$repo/android/native/direct/compile_request.c" "$repo/android/native/direct/compile_worker.c"
          "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c")
 fi
 if [[ "$mode" == --tbuf-neg-* ]]; then
