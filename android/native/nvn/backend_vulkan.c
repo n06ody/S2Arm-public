@@ -39,6 +39,7 @@
 #include "nvn_pipe_flight.h"   // 配方级在途表（纯逻辑）：同配方合并成一份创建，不同配方不互相排队
 #include "nvn_vk_texview.h"
 #include "nvn_vk_bcdec.h"
+
 #include "nvn_vk_pipe_once.h"     // 装缓存的双检去重（纯逻辑，宿单测用假创建驱动）
 #include "nvn_vk_pipe_warm.h"     // 预热清单：warm 标记 / 命中计数的口径
 #include "nvn_vk_driver_cache.h"   // 驱动管线缓存的落盘文件层（见「驱动管线缓存」一节）
@@ -50,6 +51,71 @@
 #include "spirv_workgroup.h" // 最终 SPIR-V 的实际计算工作组尺寸（含 WorkgroupSize 的优先级）
 #include "../capprobe/capprobe.h"
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
+
+// 冗余屏障合并（诊断包开关 nvk_bar_dedupe，缺省 0）：记下「最后一道全屏障之后还没录过任何 GPU 工作」的命令缓冲；
+// 下一道全屏障若落在同一个命令缓冲上、中间没有工作命令，它就是冗余的（前一道已经把之前的一切排完、之后没有新访问），不录。
+// 「工作命令」= 下面包起来的绘制 / 派发 / 拷贝 / 清除 / 填充 / 解析 / 开收通道 / 查询 / 时间戳，以及任何别的屏障（含布局转换）；
+// 只改状态的绑定 / 设置 / 推常量不算。只在本编译单元录的命令上成立（nvk 的命令缓冲只在这里录）。
+// 另：CPU 侧每帧计数（0 GPU 开销）：全部管线屏障 / 其中全屏障 / 被合并掉的全屏障 / 布局转换 / 开通道。
+static uint64_t g_bar_cb;   // 最后一道全屏障后还干净的命令缓冲（0 = 没有）
+static uint64_t g_bar_all, g_bar_full, g_bar_skip, g_bar_layout, g_bar_pass;
+static int g_bar_dedupe;
+static inline void bar_work(void) { __atomic_store_n(&g_bar_cb, 0, __ATOMIC_RELAXED); }
+static inline void bar_any(void) { bar_work(); __atomic_fetch_add(&g_bar_all, 1, __ATOMIC_RELAXED); }
+#undef vkCmdDraw
+#define vkCmdDraw(cb, ...) (bar_work(), w_vkCmdDraw(cb, __VA_ARGS__))
+#undef vkCmdDrawIndexed
+#define vkCmdDrawIndexed(cb, ...) (bar_work(), w_vkCmdDrawIndexed(cb, __VA_ARGS__))
+#undef vkCmdDrawIndirect
+#define vkCmdDrawIndirect(cb, ...) (bar_work(), w_vkCmdDrawIndirect(cb, __VA_ARGS__))
+#undef vkCmdDrawIndexedIndirect
+#define vkCmdDrawIndexedIndirect(cb, ...) (bar_work(), w_vkCmdDrawIndexedIndirect(cb, __VA_ARGS__))
+#undef vkCmdDrawIndirectCount
+#define vkCmdDrawIndirectCount(cb, ...) (bar_work(), w_vkCmdDrawIndirectCount(cb, __VA_ARGS__))
+#undef vkCmdDrawIndexedIndirectCount
+#define vkCmdDrawIndexedIndirectCount(cb, ...) (bar_work(), w_vkCmdDrawIndexedIndirectCount(cb, __VA_ARGS__))
+#undef vkCmdDispatch
+#define vkCmdDispatch(cb, ...) (bar_work(), w_vkCmdDispatch(cb, __VA_ARGS__))
+#undef vkCmdDispatchIndirect
+#define vkCmdDispatchIndirect(cb, ...) (bar_work(), w_vkCmdDispatchIndirect(cb, __VA_ARGS__))
+#undef vkCmdCopyBuffer
+#define vkCmdCopyBuffer(cb, ...) (bar_work(), w_vkCmdCopyBuffer(cb, __VA_ARGS__))
+#undef vkCmdCopyImage
+#define vkCmdCopyImage(cb, ...) (bar_work(), w_vkCmdCopyImage(cb, __VA_ARGS__))
+#undef vkCmdCopyBufferToImage
+#define vkCmdCopyBufferToImage(cb, ...) (bar_work(), w_vkCmdCopyBufferToImage(cb, __VA_ARGS__))
+#undef vkCmdCopyImageToBuffer
+#define vkCmdCopyImageToBuffer(cb, ...) (bar_work(), w_vkCmdCopyImageToBuffer(cb, __VA_ARGS__))
+#undef vkCmdBlitImage
+#define vkCmdBlitImage(cb, ...) (bar_work(), w_vkCmdBlitImage(cb, __VA_ARGS__))
+#undef vkCmdResolveImage
+#define vkCmdResolveImage(cb, ...) (bar_work(), w_vkCmdResolveImage(cb, __VA_ARGS__))
+#undef vkCmdClearColorImage
+#define vkCmdClearColorImage(cb, ...) (bar_work(), w_vkCmdClearColorImage(cb, __VA_ARGS__))
+#undef vkCmdClearDepthStencilImage
+#define vkCmdClearDepthStencilImage(cb, ...) (bar_work(), w_vkCmdClearDepthStencilImage(cb, __VA_ARGS__))
+#define vkCmdClearAttachments(cb, ...) (bar_work(), vkCmdClearAttachments(cb, __VA_ARGS__))
+#undef vkCmdFillBuffer
+#define vkCmdFillBuffer(cb, ...) (bar_work(), w_vkCmdFillBuffer(cb, __VA_ARGS__))
+#undef vkCmdBeginRenderPass
+#define vkCmdBeginRenderPass(cb, ...) (bar_work(), w_vkCmdBeginRenderPass(cb, __VA_ARGS__))
+#undef vkCmdBeginQuery
+#define vkCmdBeginQuery(cb, ...) (bar_work(), w_vkCmdBeginQuery(cb, __VA_ARGS__))
+#undef vkCmdEndQuery
+#define vkCmdEndQuery(cb, ...) (bar_work(), w_vkCmdEndQuery(cb, __VA_ARGS__))
+#undef vkCmdResetQueryPool
+#define vkCmdResetQueryPool(cb, ...) (bar_work(), w_vkCmdResetQueryPool(cb, __VA_ARGS__))
+#undef vkCmdWriteTimestamp
+#define vkCmdWriteTimestamp(cb, ...) (bar_work(), w_vkCmdWriteTimestamp(cb, __VA_ARGS__))
+#undef vkCmdEndRenderPass
+#define vkCmdEndRenderPass(cb) (bar_work(), w_vkCmdEndRenderPass(cb))
+#undef vkCmdPipelineBarrier
+#define vkCmdPipelineBarrier(cb, ...) (bar_any(), w_vkCmdPipelineBarrier(cb, __VA_ARGS__))
+// 命令缓冲开始 / 结束也算工作：同一个句柄复用到下一段时，新录制里的第一道全屏障还要对之前提交的工作排序，不能沿用上一段的「干净」
+#undef vkBeginCommandBuffer
+#define vkBeginCommandBuffer(cb, ...) (bar_work(), w_vkBeginCommandBuffer(cb, __VA_ARGS__))
+#undef vkEndCommandBuffer
+#define vkEndCommandBuffer(cb) (bar_work(), w_vkEndCommandBuffer(cb))
 S2A_CAPPROBE_RUNTIME_LOST_WEAK_REF;   // 宿主链接单元无 bridge.cpp 时解析为 NULL
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -307,6 +373,7 @@ struct nvn_gpu_cmd_s {
     VkQueryPool tkq;                         // GPU 时间分账探针：每个标一个时间戳（没开就是空）
     uint8_t tk[TK_MAX]; uint32_t ntk, tk_drop; uint32_t tk_depth;   // 各标的类别、已写几个、写不下丢了几个、嵌套深度（只有最外层操作写标）
     uint64_t tk_dev_submit;                  // 提交时校准出的 GPU 计数（0 = 没校准扩展）：算「提交 → GPU 开工」
+    int ts_seg;   // nvk_gputime=2：只打段首尾时间戳
     const void *clr_t[8]; uint32_t nclr; int clr_gap;   // GPU 时间分账探针：通道外清除过、还没被下一个通道用到的图；中间有没有夹别的操作
     struct { uint16_t w, h, draws; uint8_t ncol, ds; } tsp[TS_PASS_MAX];
     uint32_t ntsp;
@@ -1900,6 +1967,16 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
 
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         __atomic_fetch_add(&g_tk_frames, 1, __ATOMIC_RELAXED);   // GPU 时间分账探针：帧数
+        {   // CPU 侧每帧屏障计数（0 GPU 开销），每 300 帧一行
+            static unsigned bf;
+            if (++bf == 300) { bf = 0;
+                const double n = 300.0;
+                const uint64_t ba = __atomic_exchange_n(&g_bar_all, 0, __ATOMIC_RELAXED), bu = __atomic_exchange_n(&g_bar_full, 0, __ATOMIC_RELAXED), bs = __atomic_exchange_n(&g_bar_skip, 0, __ATOMIC_RELAXED),
+                               bl = __atomic_exchange_n(&g_bar_layout, 0, __ATOMIC_RELAXED), bp = __atomic_exchange_n(&g_bar_pass, 0, __ATOMIC_RELAXED);
+                char bt[300]; snprintf(bt, sizeof bt, "屏障计数（CPU 侧，每帧，300 帧）：管线屏障 %.1f 道（其中全屏障 %.1f、布局转换 %.1f）、冗余全屏障合并掉 %.1f 道（nvk_bar_dedupe=%d）、开通道 %.1f 个",
+                                       (double)ba / n, (double)bu / n, (double)bl / n, (double)bs / n, g_bar_dedupe, (double)bp / n);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", bt); }
+        }
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2820,9 +2897,12 @@ static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage,
     vkCmdPipelineBarrier(c->cb, src_stage, dst_stage, 0, 1, &b, 0, NULL, 0, NULL);
 }
 static void full_barrier(struct nvn_gpu_cmd_s *c) {
+    c->xfer_dirty = 0;
+    if (g_bar_dedupe && __atomic_load_n(&g_bar_cb, __ATOMIC_RELAXED) == (uint64_t)(uintptr_t)c->cb) { __atomic_fetch_add(&g_bar_skip, 1, __ATOMIC_RELAXED); return; }   // 冗余：上一道全屏障之后没有工作命令
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    c->xfer_dirty = 0;
+    __atomic_fetch_add(&g_bar_full, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_bar_cb, (uint64_t)(uintptr_t)c->cb, __ATOMIC_RELAXED);   // 屏障之后才记（mem_barrier 里的时间戳探针会先清掉它）
 }
 
 
@@ -4983,7 +5063,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
     vkCmdEndRenderPass(c->cb);
-    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }   // 结束时间戳在 EndRenderPass 之后：含附件存储 / 解析
+    if (c->tsq && !c->ts_seg && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }   // 结束时间戳在 EndRenderPass 之后：含附件存储 / 解析
     if (!c->tk_depth) tk_mark(c, TK_PASS);   // GPU 时间分账探针
     c->in_pass = 0;
     c->pass_occl = 0;
@@ -4999,6 +5079,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     if (pass_p16_reject(c, &d)) return 0;
     VkRenderPass pass = make_pass(&d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on, c->feedback_read_mask);
     clr_note(c, att_tex, natt);   // GPU 时间分账探针：通道外清除去向
+    __atomic_fetch_add(&g_bar_pass, 1, __ATOMIC_RELAXED);
     if (!pass) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "通道重开：渲染通道创建失败"); return 0; }
     for (uint32_t i = 0; i < natt; i++) {   // 新布局（fb_sample 置位的附件变成 GENERAL），要在开新通道之前转完
         image_barrier(c, att_tex[i], att_lay[i]);
@@ -5024,7 +5105,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(&d, pass, fb, natt, has_depth, &bi, clear);
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
+    if (c->tsq && !c->ts_seg && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d.w; c->tsp[c->ntsp].h = (uint16_t)d.h; c->tsp[c->ntsp].draws = 0;
         c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
@@ -5091,6 +5172,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     if (pass_p16_reject(c, d)) return;
     VkRenderPass pass = make_pass(d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on, c->feedback_read_mask);
     clr_note(c, att_tex, natt);   // GPU 时间分账探针：通道外清除去向
+    __atomic_fetch_add(&g_bar_pass, 1, __ATOMIC_RELAXED);
     PBP_STEP(0);
     if (!pass) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "渲染通道创建失败（附件格式 / 采样数）"); return; }
     // 附件先从现在的布局迁到这一段要用的布局：必须在 vkCmdBeginRenderPass 之前，通道内不许再迁
@@ -5123,7 +5205,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(d, pass, fb, natt, has_depth, &bi, clear);
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
+    if (c->tsq && !c->ts_seg && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
@@ -5170,7 +5252,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     c->pass_natt = 0;
     pass_read_sync(c);
     c->feedback_read_mask = 0;
-    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
+    if (c->tsq && !c->ts_seg && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     if (!c->tk_depth) tk_mark(c, TK_PASS);   // GPU 时间分账探针：EndRenderPass（含存储 / 解析）之后
     // 附件在通道里用的布局由 make_pass 定（缺省全程 GENERAL，开 nvk_opt_layout 时用附件专用布局），通道内不迁移：
     // 出通道后本段第一次用到它时按需迁移（采样 / 存储 / 传输 / 再当附件），段末统一转回 GENERAL（lay_rest_at_commit）。
@@ -5872,7 +5954,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!c->in_pass || !c->pipe || !a) { set_sticky(c, NVN_GPU_E_ORDER, "draw 缺通道 / 管线 / 参数"); return; }
-    if (c->tsq && c->ntsp < TS_PASS_MAX) c->tsp[c->ntsp].draws++;
+    if (c->tsq && !c->ts_seg && c->ntsp < TS_PASS_MAX) c->tsp[c->ntsp].draws++;
     if (a->cnt) {
         if (!(g.caps.caps & NVN_GPU_CAP_INDIRECT_COUNT)) {
             set_sticky(c, NVN_GPU_E_UNSUPPORTED, "draw_indirect_count：设备未启用 KHR count / multiDrawIndirect / firstInstance"); return;
@@ -6209,6 +6291,7 @@ static VkAccessFlags layout_src_access(VkImageLayout l) {
 // 录一次布局迁移：本段内跟踪，段首一律按 GENERAL 算（见「图像布局」）
 static void image_barrier_from(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout from, VkImageLayout to) {
     TK_SCOPE(c, TK_LAYOUT);   // GPU 时间分账探针：不在被标操作里的布局转换单列
+    __atomic_fetch_add(&g_bar_layout, 1, __ATOMIC_RELAXED);
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -7931,7 +8014,8 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->feedback_read_on = c->feedback_on && g.dev->load_store_op_none_enabled && nvn_plat_flag("nvk_fb_read", 0) != 0;
     {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
         static int on = -1; static unsigned on_k;
-        if (on < 0 || !(++on_k & 63)) on = nvn_plat_flag("nvk_gputime", 0);   // 每 64 段重读一次：同进程开 / 关做 A/A（量探针开销）
+        if (on < 0 || !(++on_k & 63)) { on = nvn_plat_flag("nvk_gputime", 0); g_bar_dedupe = nvn_plat_flag("nvk_bar_dedupe", 0) != 0; }   // 每 64 段重读一次：同进程开 / 关做 A/A（量探针开销）
+        c->ts_seg = on == 2;   // 2 = 只打段首尾（每帧十几个时间戳），不打逐通道槽、不做分账
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
         if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
@@ -7940,7 +8024,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         } else c->tsq = VK_NULL_HANDLE;
         VkQueryPoolCreateInfo ki = qi; ki.queryCount = TK_MAX;
         c->ntk = c->tk_drop = c->tk_depth = 0; c->tk_dev_submit = 0;
-        if (c->tsq && vkCreateQueryPool(g.d, &ki, NULL, &c->tkq) == VK_SUCCESS) {
+        if (c->tsq && !c->ts_seg && vkCreateQueryPool(g.d, &ki, NULL, &c->tkq) == VK_SUCCESS) {
             vkCmdResetQueryPool(c->cb, c->tkq, 0, TK_MAX);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tkq, 0); c->tk[0] = TK_UNATTR; c->ntk = 1;
         } else c->tkq = VK_NULL_HANDLE;
