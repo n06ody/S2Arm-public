@@ -425,7 +425,10 @@ void rp_pass_land_reads(nvn_gpu_cmd c, const tex_t *const *ts, int n) {
 }
 
 // 仅内部余区重开路径使用可见拷回失败；不把此结果当作后端执行成功。
-static int g_cut_why;
+static int g_cut_why, g_last_end_why = -1;   // 上一个结束的通道的收通道原因（屏障直方图用）
+static uint64_t g_bar_hist[RP_BAR_SITES][256];
+void rp_bar_note(int site, uint32_t bits) { if (site >= 0 && site < RP_BAR_SITES) g_bar_hist[site][bits & 0xff]++; }
+void rp_bar_take(uint64_t out[RP_BAR_SITES][256]) { memcpy(out, g_bar_hist, sizeof g_bar_hist); memset(g_bar_hist, 0, sizeof g_bar_hist); }
 void rp_pass_cut_why(int why) { g_cut_why = why >= 0 && why < RP_CUT_N ? why : RP_CUT_OTHER; }
 static int pass_end_checked(nvn_gpu_cmd c) {
     int copied = 1;
@@ -433,6 +436,7 @@ static int pass_end_checked(nvn_gpu_cmd c) {
     if (P.open) {   // 收通道原因 × 尺寸（批 0 诊断探针）
         rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why, 1); rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why + 1, (uint64_t)P.cur_kpix);
         if (P.cur_kpix >= 1000) rp_perf_add(RP_PERF_CUTR_BASE + 3 * g_cut_why + 2, 1);
+        g_last_end_why = g_cut_why;
     }
     g_cut_why = RP_CUT_OTHER;
     if (P.open && c) { nvn_gpu_pass_end(c); for (int i = 0; i < 8; i++) if (g_shu[i].base && !shadow_copy(c, i, 1)) copied = 0; }   // 画进影子的内容拷回各自的深度贴图
@@ -580,7 +584,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors) {
         }
     }
     PB(RP_PERF_PB_VIEW);
-    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    if (P.barrier_bits) { rp_bar_note(g_last_end_why == RP_CUT_RT ? 0 : 1, P.barrier_bits); nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
     PB(RP_PERF_PB_BAR);
     d.occlusion = (uint8_t)rp_occl_want();
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0;

@@ -743,6 +743,7 @@ static void hz_build(nvn_gpu_cmd c, const void *rec, uint8_t mask) {
     if (ncv && g_hz_on == 2) nvn_gpu_copy_bufs_uniform(c, cv, ncv, mask);   // 一次多区域拷贝，屏障只到读驱动段的这几个阶段（不发全屏障）
     else if (ncv) {   // 开关 1：每段一次拷贝（后端各带一次全屏障），最后一道同逐笔拷的屏障
         for (uint32_t k = 0; k < ncv; k++) nvn_gpu_copy_buf(c, cv[k].src, cv[k].soff, cv[k].dst, cv[k].doff, cv[k].bytes);
+        rp_bar_note(4, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);
         nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // 同逐笔拷：传输写对驱动段常量读可见
     }
     for (int q = 0; q < o->n; q++) o->e[q].carried = 0;
@@ -1417,7 +1418,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
                              g_ind_drv[st].buf, g_ind_drv[st].off + 0x644, 4);
             g_ind_drv_ok[st] = 1; g_lb[st].ok = 0; copied = 1;
         }
-        if (copied) nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // transfer writes visible to driver uniform reads
+        if (copied) { rp_bar_note(4, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT); nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT); }   // transfer writes visible to driver uniform reads
     }
     static nvn_gpu_view tv[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_STAGES][RP_PROG_ENT_MAX];
     memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts); memset(g_gimg, 0, sizeof g_gimg);
@@ -1556,7 +1557,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (need) {
             (rp_pass_cut_why ? rp_pass_cut_why(RP_CUT_DRAW) : (void)0, rp_pass_flush(c));
             uint32_t game_barrier = rp_pass_take_barrier();
-            if (game_barrier) nvn_gpu_barrier(c, game_barrier);
+            if (game_barrier) { rp_bar_note(2, game_barrier); nvn_gpu_barrier(c, game_barrier); }
             else nvn_gpu_compute_to_graphics(c);
             g_compute_access.n = 0;   // 同一发布覆盖此前全部计算写；重复读不会再加屏障
         }
@@ -1981,7 +1982,7 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     for (uint32_t i = 0; i < pg->nent[0]; i++) if (images[i] && (pg->ent[0][i].access & NVN_GPU_ACC_W)) rp_tex_mark_gpu_written(images[i]);
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
-    if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
+    if (bar) { rp_bar_note(3, bar); nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
     if (nvk_pipe_warm_note_prog && nvn_plat_flag("nvk_compute_warm", 0)) {
