@@ -325,6 +325,19 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (double)pf[RP_PERF_S5_SAME_KB] / f, (double)pf[RP_PERF_S5_DIFF_KB] / f, (double)pf[RP_PERF_S5_INV_KB] / f,
                              (double)pf[RP_PERF_S5_LSAME_KB] / f, (double)pf[RP_PERF_S5_LDIFF_KB] / f, (double)pf[RP_PERF_S5_LINV_KB] / f, (double)pf[RP_PERF_S5_NS] / 1e6 / f);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                {   // 批 0 诊断探针：游戏 / 回放屏障直方图（调用点 × NVN 屏障位），每帧次数，前 10 项
+                    static uint64_t bh[RP_BAR_SITES][256]; rp_bar_take(bh);
+                    static const char *const sn[RP_BAR_SITES] = {"通道前·紧挨换目标", "通道前·其它", "绘制读计算写", "派发前", "回放自发"};
+                    size_t o = (size_t)snprintf(b, sizeof b, "分时（屏障位直方图，每帧；位：1 序几何 2 序片元 4 序片元分块 8 序间接 10 废贴图 20 废着色器 40 废贴图描述符 80 废Z剔除）：");
+                    uint64_t tot = 0; for (int k = 0; k < RP_BAR_SITES; k++) for (int v = 0; v < 256; v++) tot += bh[k][v];
+                    for (int n = 0; n < 10; n++) {
+                        int bk = -1, bv = 0; uint64_t bc = 0;
+                        for (int k = 0; k < RP_BAR_SITES; k++) for (int v = 0; v < 256; v++) if (bh[k][v] > bc) { bc = bh[k][v]; bk = k; bv = v; }
+                        if (bk < 0) break;
+                        o += (size_t)snprintf(b + o, sizeof b - o, "%s 0x%02x %.1f、", sn[bk], bv, (double)bc / f); bh[bk][bv] = 0;
+                    }
+                    snprintf(b + o, sizeof b - o, "合计 %.1f 道", (double)tot / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
                 if (nvn_intent_take) {   // 批 0 诊断探针：游戏显式意图
                     struct nvn_intent it; memset(&it, 0, sizeof it); nvn_intent_take(&it);
                     static const char *const acc[4] = {"无", "不缓存", "缓存", "未给"};

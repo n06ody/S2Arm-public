@@ -90,7 +90,12 @@ void rp_draw_stats(uint64_t *draws, uint64_t *skips);
 // 分时读数：自上次取走以来的累计（纳秒 / 次数），取走即清零
 // 收通道原因（批 0 诊断探针，rp_pass_cut_why）：每次结束开着的通道按原因记次数 / 千像素 / 其中全屏级（≥100 万像素）的次数
 enum { RP_CUT_OTHER = 0, RP_CUT_XFER, RP_CUT_RT, RP_CUT_CLEAR, RP_CUT_MASK, RP_CUT_AREA, RP_CUT_OP, RP_CUT_SUBMIT, RP_CUT_REPORT, RP_CUT_BUF, RP_CUT_DRAW, RP_CUT_N };
-void rp_pass_cut_why(int why);   // 下一次 rp_pass_end 结束开着的通道时记到这个原因名下（只记一次，记完回到 OTHER）
+void rp_pass_cut_why(int why);
+// 游戏 / 回放屏障直方图（批 0 诊断探针，rp_pass.c）：调用点 × NVN 屏障位（低 8 位）的次数；site：0 通道开头且上一通道因换目标结束 / 1 通道开头其它 /
+//   2 绘制读计算写 / 3 派发前 / 4 回放自发（base instance 拷贝）。rp_bar_take 取走并清零
+enum { RP_BAR_SITES = 5 };
+void rp_bar_note(int site, uint32_t bits);
+void rp_bar_take(uint64_t out[RP_BAR_SITES][256]);   // 下一次 rp_pass_end 结束开着的通道时记到这个原因名下（只记一次，记完回到 OTHER）
 enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_PERF_WAIT_N, RP_PERF_DONE_NS, RP_PERF_DONE_N, RP_PERF_PASSES, RP_PERF_PRESENT_NS,
        RP_PERF_D_PROG, RP_PERF_D_PREP, RP_PERF_D_TEX, RP_PERF_D_PIPE, RP_PERF_D_DYN, RP_PERF_D_BIND, RP_PERF_D_DRAW, RP_PERF_D_TAIL, RP_PERF_D_PASS, RP_PERF_D_PGET, RP_PERF_PB_VIEW, RP_PERF_PB_BAR, RP_PERF_PB_BE, RP_PERF_PB_MARK, RP_PERF_RES_LOCK, RP_PERF_RES_NEW, RP_PERF_RES_INIT, RP_PERF_RES_VIEWMAKE, RP_PERF_PB_SHADOW, RP_PERF_RES_SCAN, RP_PERF_RES_UP, RP_PERF_RES_UPN, RP_PERF_RES_ZERO, RP_PERF_RES_ZERON, RP_PERF_RES_MAKE, RP_PERF_RES_ZDEFER, RP_PERF_BIND_SLICE_HIT, RP_PERF_BIND_SKIP,   // 绑定：段内切片表命中的块数、整组沿用没发的阶段数
       
