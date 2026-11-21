@@ -1,19 +1,26 @@
 #!/bin/bash
 # 出库 × 现编双翻等价门禁（#1836 PR-1，宿主 ≤60 秒）：同一合成请求语料过两条翻译路，比对 SPIR-V 接口事实面
 # （能力 / 图像类型 / 执行模式 / IO 位置 / 描述符计数 / cs Workgroup 字节）；未命中白名单的差异即红。
-#   语料由 S2A.DirectCompiler.Tests --emit-requests 产（合成、无游戏字节）；设备档是真机 caps，经
-#   DirectProfileComposer 组档注入；白名单记已知形态差（键 + 一句事实性原因），只减不增。
+#   语料由 S2A.DirectCompiler.Tests --emit-requests 产（合成、无游戏字节）；设备档是真机 caps 加最低支持档
+#   （graphics/tools/direct/profiles/s2a-device-caps-min.json，脚本内并入 devices 轮），经
+#   DirectProfileComposer 组档注入；出库侧 imgload_raw 取同一组档 profile 的 supportsImageLoadFormatted。
+#   白名单记已知形态差（键 + 一句事实性原因），只减不增。
 #   用法：bash tests/libpack_device_parity_test.sh
-# 门禁覆盖：graphics/tools/direct/tests/parity_corpus/* tests/libpack_device_parity_test.sh graphics/tools/direct/tests/parity/* graphics/tools/direct/dsh/* graphics/tools/direct/compiler/* android/tests/vk/profiles/devices/*
+# 门禁覆盖：graphics/tools/direct/tests/parity_corpus/* tests/libpack_device_parity_test.sh graphics/tools/direct/tests/parity/* graphics/tools/direct/dsh/* graphics/tools/direct/compiler/* android/tests/vk/profiles/devices/* graphics/tools/direct/profiles/s2a-device-caps-min.json
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd)
 T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/parity.XXXXXX")" && pwd -P); trap 'rm -rf "$T"' EXIT
 red() { echo "🔴 双翻等价门禁：$1"; exit 1; }
 CORPUS=$R/graphics/tools/direct/tests/parity_corpus
 DEVICES=$R/android/tests/vk/profiles/devices
+MINPROF=$R/graphics/tools/direct/profiles/s2a-device-caps-min.json
 [ -f "$CORPUS/whitelist.tsv" ] || red "缺 graphics/tools/direct/tests/parity_corpus/whitelist.tsv"
 ls "$CORPUS"/requests/*.json > /dev/null 2>&1 || red "缺 graphics/tools/direct/tests/parity_corpus/requests/*.json 语料"
 ls "$DEVICES"/*.json > /dev/null 2>&1 || red "缺 android/tests/vk/profiles/devices/*.json 设备档"
+# 真机档之外并入最低支持档（shaderStorageImageReadWithoutFormat=false）：出库与现编在该档
+# 都应声明具体格式，最低档轮红即「出库写死 true」型回归（#1774 ② / #490275）。
+mkdir -p "$T/devices"; cp "$DEVICES"/*.json "$T/devices/"; cp "$MINPROF" "$T/devices/minimum.json"
+DEVICES=$T/devices
 DN=${DOTNET:-$HOME/.dotnet/dotnet}; [ -x "$DN" ] || DN=$(command -v dotnet) || red "没有 dotnet（.NET 10）"
 XC=${SPIRV_CROSS:-$(command -v spirv-cross || true)}
 if [ -z "$XC" ]; then

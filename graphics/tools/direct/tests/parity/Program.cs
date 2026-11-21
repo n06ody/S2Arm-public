@@ -11,6 +11,10 @@
 // 差异行：<语料>\<设备>\<阶段>\<字段>\t<细节>；命中 whitelist.tsv 报过不判红；
 // 未被消费的 whitelist 行本身报红（白名单只减不增）。
 //
+// 出库侧的 imgload_raw 与现编同一来源：组档后的 profile.capabilities.supportsImageLoadFormatted
+// 逐轮传给 CompileWithSpv（#1774 ② / #490275）——8E/9000 档两轮两侧都声明 Unknown，最低档
+// （s2a-device-caps-min.json 合入 devices 轮）两侧都声明具体格式，接口事实面按轮判等。
+//
 // 用法：parity <corpus_dir> <devices_dir|-> <spirv-cross> <work_dir> --dsx <libdsx>
 
 using System.Runtime.InteropServices;
@@ -62,7 +66,9 @@ internal static class Program
             {
                 var r2 = (JsonObject)req.DeepClone();
                 if (prof != null) r2["profile"] = prof.DeepClone();
-                var diffs = Compare(name, dev, r2, xc, tables, work);
+                // 出库按所用档案答 Raw 读位：与现编同一份组档 profile 取 supportsImageLoadFormatted。
+                bool imgLoadRaw = prof?["capabilities"]?["supportsImageLoadFormatted"]?.GetValue<bool>() ?? false;
+                var diffs = Compare(name, dev, r2, xc, tables, work, imgLoadRaw);
                 foreach (var d in diffs)
                 {
                     if (whitelist.Contains(d.Key)) { wlUsed.Add(d.Key); pass++; Console.WriteLine("ok-wl " + d.Line); }
@@ -76,7 +82,7 @@ internal static class Program
         return fail == 0 ? 0 : 1;
     }
 
-    static List<(string Key, string Line)> Compare(string name, string dev, JsonObject req, CliSpvCross xc, string tables, string work)
+    static List<(string Key, string Line)> Compare(string name, string dev, JsonObject req, CliSpvCross xc, string tables, string work, bool imgLoadRaw)
     {
         var diffs = new List<(string, string)>();
         void Add(string stage, string field, string detail) =>
@@ -114,7 +120,7 @@ internal static class Program
                 string key = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
                     rec.Concat(ctl).Concat(System.Text.Encoding.ASCII.GetBytes(ex)).ToArray()))[..16];
                 si++;
-                DshVk.CompileWithSpv(key, ex, rec, ctl, od, xc, tables, work);
+                DshVk.CompileWithSpv(key, ex, rec, ctl, od, xc, tables, imgLoadRaw, work);
                 exByStage[st] = File.ReadAllBytes(Path.Combine(od, key + "_b.spv"));
             }
         }
