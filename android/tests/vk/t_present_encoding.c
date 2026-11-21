@@ -156,6 +156,129 @@ static void profile_rendered_frames(void) {
     printf("PASS_CAPTURE raw timestamp pairs expected=%u actual=%u\n", want * 2, g_pass_capture_ticks);
     g_pass_capture_test = 0;
 }
+static const char *const export_module_names[] = {
+    "pass_capture_fixture.vert.spv", "pass_capture_fixture.frag.spv",
+    "pass_draw_export_depth.frag.spv", "pass_draw_export_color.frag.spv",
+};
+
+struct export_copy_fixture {
+    int depth;
+    nvn_gpu_tex src, dst;
+    nvn_gpu_view src_view, dst_view;
+    nvn_gpu_pipe pipe;
+    nvn_gpu_shader fs;
+};
+
+static nvn_gpu_pass_desc export_copy_pass(const struct export_copy_fixture *copy, nvn_gpu_view target) {
+    nvn_gpu_pass_desc pass = {.w = 64, .h = 36, .layers = 1};
+    const nvn_gpu_att att = {.view = target, .load = NVN_GPU_LOAD_CLEAR, .store = NVN_GPU_STORE_STORE};
+    if (copy->depth) { pass.depth = att; pass.clear_depth = 0.5f; }
+    else { pass.ncolor = 1; pass.color[0] = att; }
+    return pass;
+}
+
+static int export_copy_setup(struct export_copy_fixture *copy, nvn_gpu_shader vs,
+                             const nvn_gpu_layout *layout, const char *dir, int depth) {
+    char path[512];
+    size_t bytes = 0;
+    snprintf(path, sizeof path, "%s/%s", dir, export_module_names[depth ? 2 : 3]);
+    void *blob = read_file(path, &bytes);
+    if (!blob) return 0;
+    copy->depth = depth;
+    nvn_gpu_shader_src src = {.stage = NVN_GPU_SH_FS, .kind = NVN_GPU_BLOB_SPIRV,
+        .layout = layout, .entry = "main", .blob = blob, .bytes = bytes};
+    nvn_gpu_err e = {0};
+    nvn_gpu_rc rc = nvn_gpu_shader_load(&src, &copy->fs, &e);
+    free(blob);
+    CHECK(OK(rc), "pass draw export copy shader: %s", e.why);
+    if (!OK(rc)) return 0;
+    const uint32_t format = depth ? NVN_FORMAT_DEPTH32F : NVN_FORMAT_R11G11B10F;
+    copy->src = make_tex(64, 36, format, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED);
+    copy->dst = make_tex(64, 36, format, NVN_GPU_TEX_RENDER);
+    if (!copy->src || !copy->dst) return 0;
+    copy->src_view = make_view(copy->src);
+    copy->dst_view = make_view(copy->dst);
+    nvn_gpu_pipe_desc pipe = {.samples = 1, .prim = 4, .color.logic_op = 3,
+        .poly.mode = NVN_POLYGON_MODE_FILL, .origin_ll = 1};
+    pipe.st[NVN_GPU_SH_VS].sh = vs;
+    pipe.st[NVN_GPU_SH_FS].sh = copy->fs;
+    if (depth) { pipe.dfmt = format; pipe.ds.dt = pipe.ds.dw = 1; pipe.ds.df = 8; }
+    else { pipe.cfmt[0] = format; pipe.chmask.mask = 0xf; }
+    rc = nvn_gpu_pipe_get(&pipe, NVN_GPU_PIPE_SYNC, &copy->pipe, &e);
+    CHECK(OK(rc), "pass draw export copy pipeline: %s", e.why);
+    return OK(rc) && copy->src_view && copy->dst_view;
+}
+
+static void export_copy_draw(nvn_gpu_cmd cmd, const struct export_copy_fixture *copy,
+                             nvn_gpu_samp samp, unsigned draws) {
+    const nvn_gpu_pass_desc pass = export_copy_pass(copy, copy->dst_view);
+    const nvn_gpu_binding bind = {.ent = 0, .cls = NVN_GPU_RES_TEX_SAMP, .u.ts = {copy->src_view, samp}};
+    nvn_gpu_pass_begin(cmd, &pass);
+    nvn_gpu_set_pipe(cmd, copy->pipe);
+    nvn_gpu_bind(cmd, NVN_GPU_SH_FS, &bind, 1);
+    for (unsigned i = 0; i < draws; i++)
+        nvn_gpu_draw(cmd, &(nvn_gpu_draw_args){.prim = 4, .count = 3, .instances = 1});
+    nvn_gpu_pass_end(cmd);
+}
+
+static void inspect_pass_draw_export(const char *dir, const char *frag_sha) {
+    CHECK(!strncmp(g_pass_draw_export_directory, "nvk-draw-export-", 16), "PASS_DRAW_EXPORT directory");
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s/draws.tsv", dir, g_pass_draw_export_directory);
+    FILE *table = fopen(path, "r");
+    CHECK(table != NULL, "PASS_DRAW_EXPORT TSV exists");
+    if (!table) return;
+    char line[8192], sha[4][65] = {{0}}, pso[3][65] = {{0}};
+    const uint32_t view_formats[3] = {
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+    };
+    unsigned rows = 0;
+    unsigned long long previous_seq = 0;
+    CHECK(fgets(line, sizeof line, table) && strstr(line, "descriptor_sets\trun\ttextures"),
+          "PASS_DRAW_EXPORT TSV header");
+    while (fgets(line, sizeof line, table)) {
+        unsigned long long seq;
+        unsigned pass, draw, format, changed, sets, run;
+        char vertex[65], fragment[65], pipeline[65], state[65], texture[4096], entry1[32], entry2[32];
+        int fields = sscanf(line, "%llu\t%u\t%u\t%u\t%64s\t%31s\t%64s\t%31s\t%64s\t%64s\t%x\t%x\t%u\t%4095s",
+            &seq, &pass, &draw, &format, vertex, entry1, fragment, entry2, pipeline, state, &changed, &sets, &run, texture);
+        CHECK(fields == 14, "PASS_DRAW_EXPORT parse row %u fields=%d", rows, fields);
+        if (fields != 14) break;
+        const unsigned expected_draw = rows % 4;
+        const unsigned family = expected_draw < 2 ? 0 : expected_draw - 1;
+        const int unchanged = expected_draw == 1;
+        char expected_texture[48];
+        snprintf(expected_texture, sizeof expected_texture, "%u/0/0/0:%u:", NVN_GPU_SH_FS, view_formats[family]);
+        if (!rows) strcpy(sha[0], vertex);
+        if (!sha[family + 1][0]) {
+            strcpy(sha[family + 1], fragment);
+            strcpy(pso[family], pipeline);
+        }
+        CHECK(draw == expected_draw && run == (unchanged ? 2u : 1u) && format == (family ? view_formats[family] : 0) &&
+              (expected_draw ? seq == previous_seq : seq > previous_seq) &&
+              (unchanged ? changed == 0 && sets == 0 : changed && sets == 1) &&
+              strlen(vertex) == 64 && strlen(pipeline) == 64 && strlen(state) == 64 && !strcmp(vertex, sha[0]) &&
+              !strcmp(pipeline, pso[family]) && !strcmp(fragment, sha[family + 1]) &&
+              !strcmp(entry1, "main") && !strcmp(entry2, "main") && strstr(texture, expected_texture) &&
+              strstr(texture, ":plain:"), "PASS_DRAW_EXPORT state or binding row %u", rows);
+        previous_seq = seq;
+        rows++;
+    }
+    CHECK(!ferror(table) && rows == 96 && !strcmp(sha[1], frag_sha), "PASS_DRAW_EXPORT rows=%u", rows);
+    fclose(table);
+    for (unsigned i = 0; i < 4; i++) {
+        size_t reference_bytes = 0, captured_bytes = 0;
+        snprintf(path, sizeof path, "%s/%s", dir, export_module_names[i]);
+        void *reference = read_file(path, &reference_bytes);
+        snprintf(path, sizeof path, "%s/%s/%s.spv", dir, g_pass_draw_export_directory, sha[i]);
+        void *captured = read_file(path, &captured_bytes);
+        CHECK(reference && captured && reference_bytes == captured_bytes &&
+              !memcmp(reference, captured, reference_bytes), "PASS_DRAW_EXPORT module %u bytes", i);
+        free(reference);
+        free(captured);
+    }
+}
+
 static void profile_constant_pixels(const char *dir, const char *sha) {
     char word[9] = {0};
     memcpy(word, sha, 8);
@@ -164,6 +287,8 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
     g_pass_key_lo = (int32_t)strtoul(word, NULL, 16);
     snprintf(g_pass_expected_identity, sizeof g_pass_expected_identity, "key=%.16s sha=%s", sha, sha);
     g_pass_capture_test = 2;
+    int export_draws = getenv("S2A_TEST_PRESENT_BGRA") != NULL;
+    if (export_draws) CHECK(!setenv("S2A_FRAME_LOG_DIR", dir, 1), "PASS_DRAW_EXPORT fixture output root");
     nvn_gpu_err e = {0};
     CHECK(open_backend(), "pass replacement open");
     nvn_gpu_surface sf = NULL;
@@ -190,6 +315,10 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
     if (!vs || !fs) goto done;
     nvn_gpu_pipe_desc pd = {.samples = 1, .prim = 4, .color.logic_op = 3, .poly.mode = NVN_POLYGON_MODE_FILL,
                             .origin_ll = 1, .chmask.mask = 0xff, .cfmt = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA8UI}};
+    if (export_draws) {
+        pd.cfmt[2] = pd.cfmt[3] = NVN_FORMAT_RGBA8;
+        pd.dfmt = NVN_FORMAT_DEPTH32F;
+    }
     pd.st[NVN_GPU_SH_VS].sh = vs;
     pd.st[NVN_GPU_SH_FS].sh = fs;
     nvn_gpu_pipe pipe = NULL;
@@ -199,13 +328,34 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
     nvn_gpu_tex shown = make_tex(64, 36, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER);
     nvn_gpu_tex aux = make_tex(64, 36, NVN_FORMAT_RGBA8UI, NVN_GPU_TEX_RENDER);
     nvn_gpu_view iv = make_view(input), sv = make_view(shown), av = make_view(aux);
+    nvn_gpu_tex ext[3] = {0};
+    nvn_gpu_view ext_view[3] = {0};
+    if (export_draws) {
+        for (unsigned i = 0; i < 3; i++) {
+            ext[i] = make_tex(64, 36, i == 2 ? NVN_FORMAT_DEPTH32F : NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+            if (ext[i]) ext_view[i] = make_view(ext[i]);
+            CHECK(ext_view[i], "pass draw export attachment %u", i);
+            if (!ext_view[i]) goto done;
+        }
+    }
     samp_par sp = {0};
     nvn_gpu_samp samp = NULL;
     CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &e)), "pass replacement sampler: %s", e.why);
     if (!iv || !sv || !av || !samp) goto done;
+    struct export_copy_fixture copies[2] = {{0}};
+    if (export_draws && (!export_copy_setup(&copies[0], vs, &fl, dir, 1) ||
+                         !export_copy_setup(&copies[1], vs, &fl, dir, 0))) {
+        CHECK(0, "pass draw export copy fixtures");
+        goto done;
+    }
     const uint8_t white[4] = {255, 255, 255, 255};
     nvn_gpu_cmd upload = begin_cmd();
     nvn_gpu_tex_upload(upload, input, 0, 0, NULL, white, 4, 4);
+    if (export_draws) for (unsigned i = 0; i < 2; i++) {
+        const nvn_gpu_pass_desc init = export_copy_pass(&copies[i], copies[i].src_view);
+        nvn_gpu_pass_begin(upload, &init);
+        nvn_gpu_pass_end(upload);
+    }
     CHECK(OK(nvn_gpu_cmd_commit(upload, 1, on_done, NULL, &e)), "pass replacement upload: %s", e.why);
     nvn_gpu_present_desc present = {.src = sv};
     nvn_gpu_binding bind = {.ent = 0, .cls = NVN_GPU_RES_TEX_SAMP, .u.ts = {iv, samp}};
@@ -216,11 +366,25 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
         p.color[0].view = sv; p.color[1].view = av;
         p.color[0].load = p.color[1].load = NVN_GPU_LOAD_CLEAR;
         p.color[0].store = p.color[1].store = NVN_GPU_STORE_STORE;
+        if (export_draws) {
+            p.ncolor = 4;
+            p.color[2] = (nvn_gpu_att){.view = ext_view[0], .load = NVN_GPU_LOAD_CLEAR, .store = NVN_GPU_STORE_STORE};
+            p.color[3] = (nvn_gpu_att){.view = ext_view[1], .load = NVN_GPU_LOAD_CLEAR, .store = NVN_GPU_STORE_STORE};
+            p.depth = (nvn_gpu_att){.view = ext_view[2], .load = NVN_GPU_LOAD_CLEAR, .store = NVN_GPU_STORE_STORE};
+            p.clear_depth = 1.0f;
+        }
         nvn_gpu_pass_begin(c, &p);
         nvn_gpu_set_pipe(c, pipe);
         nvn_gpu_bind(c, NVN_GPU_SH_FS, &bind, 1);
         nvn_gpu_draw(c, &(nvn_gpu_draw_args){.prim = 4, .count = 3, .instances = 1});
+        if (export_draws)
+            nvn_gpu_draw(c, &(nvn_gpu_draw_args){.prim = 4, .count = 3, .instances = 1});
         nvn_gpu_pass_end(c);
+        if (export_draws) {
+            export_copy_draw(c, &copies[0], samp, 1);
+            export_copy_draw(c, &copies[1], samp, 1);
+            export_copy_draw(c, &copies[1], samp, 2); // same format, but not a single-draw pass
+        }
         CHECK(OK(nvn_gpu_cmd_commit(c, i, on_done, NULL, &e)), "pass replacement commit: %s", e.why);
         nvn_gpu_drawable d = {0};
         CHECK(OK(nvn_gpu_drawable_acquire(sf, 1000000000ull, NULL, &d, &e)), "pass replacement acquire: %s", e.why);
@@ -234,6 +398,19 @@ static void profile_constant_pixels(const char *dir, const char *sha) {
     nvn_gpu_samp_release(samp);
     nvn_gpu_view_release(iv); nvn_gpu_view_release(sv); nvn_gpu_view_release(av);
     nvn_gpu_tex_release(input); nvn_gpu_tex_release(shown); nvn_gpu_tex_release(aux);
+    if (export_draws) {
+        for (unsigned i = 0; i < 3; i++) {
+            nvn_gpu_view_release(ext_view[i]);
+            nvn_gpu_tex_release(ext[i]);
+        }
+        for (unsigned i = 0; i < 2; i++) {
+            nvn_gpu_view_release(copies[i].src_view);
+            nvn_gpu_view_release(copies[i].dst_view);
+            nvn_gpu_tex_release(copies[i].src);
+            nvn_gpu_tex_release(copies[i].dst);
+            nvn_gpu_shader_release(copies[i].fs);
+        }
+    }
 done:
     CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "pass replacement close: %s", e.why);
     int enabled = !getenv("S2A_TEST_PRESENT_BGRA");
@@ -243,6 +420,9 @@ done:
           enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
     printf("PASS_CONSTANT enabled=%d fs=%u bindings=%u replaced=%u\n",
            enabled, g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions);
+    CHECK(g_pass_draw_export_done == (unsigned)export_draws,
+          "PASS_DRAW_EXPORT: expected one complete 24-frame export of 96 draws and 4 distinct modules when enabled");
+    if (g_pass_draw_export_done) inspect_pass_draw_export(dir, sha);
     g_pass_capture_test = 0;
 }
 int main(int argc, char **argv) {

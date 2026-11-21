@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "nvn_backend.h"
 #include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"
@@ -169,6 +170,7 @@ struct nvn_gpu_shader_s {
     uint32_t push_off, push_bytes;
     char entry[32];
     char capture_sha[65];
+    struct pass_draw_module *draw_module;
     uint64_t capture_key;
     unsigned capture_flags;
     int released, refs;
@@ -178,6 +180,7 @@ struct nvn_gpu_shader_s {
 struct nvn_gpu_pipe_s {
     VkPipeline pipe, capture_constant;
     uint32_t capture_blend, capture_writemask;
+    char draw_sha[65];
     VkPipelineLayout layout;
     VkRenderPass pass;
     VkDescriptorSetLayout dsl[4];
@@ -253,6 +256,21 @@ struct dset_bin;
 struct dset_use { struct dset_bin *bin; VkDescriptorSet set; VkDescriptorPool pool; };   // 本段从按布局回收的表项里取的一组（见「描述符组按布局回收」）；bin = 取用时的表项，放回时直接放回它
 struct bc_temp { VkImage image; VkDeviceMemory memory; struct nvn_vk_bcdec_rec rec; struct bc_temp *next; };   // rec：缓冲 → BC 贴图录进段里的解码资源（#697）
 enum { PASS_CAPTURE_FRAMES = 24, PASS_CAPTURE_MAX = 768, PASS_CAPTURE_BINDS = 24 };
+struct pass_draw_module {
+    struct pass_draw_module *next;
+    char sha[65];
+    size_t size;
+    int written;
+    unsigned char code[];
+};
+struct pass_draw_record {
+    struct pass_draw_module *vs, *fs;
+    char pso[65], vs_entry[32], fs_entry[32];
+    uint8_t state[32];
+    char *textures;
+    uint64_t seq;
+    uint32_t pass, ordinal, changes, descriptors, run, format;
+};
 struct pass_capture_binding {
     uint64_t tex, last_rt;
     uint32_t set, binding, elem, cls, fmt, viewfmt, nvnfmt, w, h, mip, levels, base_layer, layers;
@@ -274,6 +292,7 @@ struct pass_capture_row {
     uint32_t w, h, layers, rw, rh, n;
     int32_t x, y;
     uint32_t draws, clears, partial_clears, aux_draws, reopen;
+    uint32_t draw_first, draw_count;
     uint32_t primitive, count, instances, indirect, indexed, pipe;
     int32_t sc[4];
     float vp[4];
@@ -283,8 +302,11 @@ struct pass_capture {
     uint64_t deadline;
     uint32_t frames, rows, failed;
     double period;
-    struct { uint64_t seq, begin, end; uint32_t first, count, failed; } frame[PASS_CAPTURE_FRAMES];
+    struct { uint64_t seq, begin, end; uint32_t first, count, failed, ordinal; } frame[PASS_CAPTURE_FRAMES];
     struct pass_capture_row row[PASS_CAPTURE_FRAMES * PASS_CAPTURE_MAX];
+    struct pass_draw_record *draw;
+    uint32_t draw_count, draw_cap;
+    int draw_failed;
 };
 
 enum { TS_PASS_MAX = 250 };   // 调试读数：一段里逐个计时的通道数上限
@@ -368,6 +390,9 @@ struct nvn_gpu_cmd_s {
     uint32_t ntsp;
     struct pass_capture_row *pass_capture;
     uint8_t pass_capture_on, pass_capture_failed;
+    struct pass_draw_record *draw;
+    uint32_t draw_count, draw_cap, draw_descriptors;
+    uint8_t draw_failed;
     VkCommandBuffer init_cb;                 // 本池复用的前置命令缓冲；本段需要时录入图像转布局 / 时间戳重置
     struct nvn_gpu_tex_s **newimg;           // 上面那个命令缓冲转的图像（各持一份引用，段完成时归还；段没执行则放回待转表）
     uint32_t n_newimg;
@@ -486,6 +511,9 @@ struct nvn_gpu_vk {
     uint64_t pass_capture_key;
     int pass_capture_blank, pass_capture_w, pass_capture_h, pass_capture_vertices, pass_capture_colors;
     struct pass_capture *pass_capture;
+    int pass_draw_export;
+    struct pass_draw_module *pass_draw_modules;
+    size_t pass_draw_module_bytes;
     uint64_t wsi_seq;    // 已提交的呈现段序号（g_submit_mu 下分配，与入队同序）
     uint64_t wsi_done;   // worker 已等到栅栏的最后一个呈现段序号（g_mu 下改；段按入队顺序处理，单调）
 };
@@ -744,6 +772,11 @@ static void queue_retire_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_buf_s *b) 
 }
 
 static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p);
+static void pass_draw_write(const struct pass_capture *p);
+static void pass_draw_retire(struct pass_capture *, const struct nvn_gpu_cmd_s *,
+                             const struct pass_capture_row *);
+static void pass_draw_free(struct pass_draw_record *rows, uint32_t count);
+static void pass_draw_close(struct nvn_gpu_vk *vk);
 static void dlay_close(void);
 static void destroy_tex_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t);
 static void destroy_view_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_view_s *v);
@@ -1942,6 +1975,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->refseen);
     free(c->staging);
     free(c->pass_capture);
+    pass_draw_free(c->draw, c->draw_count);
     free(c);
 }
 
@@ -2433,6 +2467,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g.dev = dev;
     nvnbar_open();
     g.pass_capture_delay = nvn_plat_flag("nvk_gputime", 0) == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
+    g.pass_draw_export = g.pass_capture_delay > 0 && nvn_plat_flag("nvk_pass_draw_export", 0) == 1;
     if (g.pass_capture_delay > 0) {
         uint32_t hi = (uint32_t)nvn_plat_flag("nvk_pass_key_hi", 0);
         uint32_t lo = (uint32_t)nvn_plat_flag("nvk_pass_key_lo", 0);
@@ -2624,6 +2659,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
+    pass_draw_close(&g);
     free(g.pass_capture);
     g.pass_capture = NULL;
     g.worker_started = 0;
@@ -3480,6 +3516,8 @@ static int array_query_default(void) {
     return g.dev->properties.vendorID == 0x19E5u && !strncmp(g.dev->driver_name, "Maleoon", 7);
 }
 #include "backend_vulkan_pass_detail.inc"
+static void pass_draw_module_note(struct nvn_gpu_shader_s *, const void *, size_t);
+static void pass_draw_pipe_note(struct nvn_gpu_pipe_s *, const nvn_gpu_pipe_desc *);
 
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err) {
     if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
@@ -3569,6 +3607,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
         VkResult module_result = vkCreateShaderModule(g.d, &ci, NULL, &sh->mod);
         if (module_result == VK_SUCCESS && g.pass_capture_delay > 0 && s->stage == NVN_GPU_SH_FS)
             pass_shader_identify(sh, s->key, ci.pCode, ci.codeSize);
+        if (module_result == VK_SUCCESS && g.pass_draw_export && s->stage != NVN_GPU_SH_CS)
+            pass_draw_module_note(sh, ci.pCode, ci.codeSize);
         free(array_code);
         if (module_result != VK_SUCCESS) {
             free(sh->tfmt); free(sh->ents); free(sh);
@@ -4405,6 +4445,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         }
     }
     p->actual_samples = d->samples > 1 ? d->samples : 1;
+    if (g.pass_draw_export) pass_draw_pipe_note(p, d);
     p->key = *requested;   // 以原请求查找：预热、在途表与缓存使用同一身份。
     *out = p;
     return rc(NVN_GPU_OK);
@@ -6082,6 +6123,8 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
         if (p->dyn_all) for (uint32_t s = 0; s < p->nset && s < 4; s++) for (uint32_t k = 0; k < p->ndyn[s]; k++) offs[no++] = c->dyn_off[s][k];
         vkCmdBindDescriptorSets(c->cb, compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 p->layout, 0, p->nset, c->desc_sets, no, no ? offs : NULL);
+        if (!compute && g.pass_draw_export && c->pass_capture_on)
+            c->draw_descriptors = (1u << p->nset) - 1u;
         if (tm && !dirty) __atomic_fetch_add(&g_dyn_rebind, 1, __ATOMIC_RELAXED);
     }
     if (tm) { const uint64_t t4 = now_ns();
@@ -6200,12 +6243,20 @@ static void pass_capture_draw_detail(struct pass_capture_row *r, struct nvn_gpu_
     }
 }
 
+#include "backend_vulkan_draw_export.inc"
+
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     draw_tm_init();   // 诊断：这笔绘制各段用时（nvk_gputime 开着才计）
     const int dtm = g_draw_tm; const uint64_t dt0 = dtm ? now_ns() : 0;
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!c->in_pass || !c->pipe || !a) { set_sticky(c, NVN_GPU_E_ORDER, "draw 缺通道 / 管线 / 参数"); return; }
+    const int export_draw = g.pass_draw_export && c->pass_capture_on;
+    uint32_t emit_before[ES_KINDS];
+    if (export_draw) {
+        memcpy(emit_before, c->es_count, sizeof emit_before);
+        c->draw_descriptors = 0;
+    }
     if (c->tsq && c->ntsp < TS_PASS_MAX) c->tsp[c->ntsp].draws++;
     if (a->cnt) {
         if (!(g.caps.caps & NVN_GPU_CAP_INDIRECT_COUNT)) {
@@ -6402,6 +6453,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance);
     }
+    if (profile && export_draw) pass_draw_note(c, profile, p, selected, emit_before);
     if (profile && profile->draws++ == 0) {
         profile->substituted = selected != p->pipe;
         pass_capture_draw_detail(profile, c, p);

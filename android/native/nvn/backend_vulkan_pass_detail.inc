@@ -56,7 +56,7 @@ static void pass_shader_identify(struct nvn_gpu_shader_s *sh, const uint8_t key[
             sh->capture_flags |= PASS_FS_DEPTH_OR_MASK;
         i += len;
     }
-    pass_shader_dump(sh, blob, size);
+    if (!g.pass_draw_export) pass_shader_dump(sh, blob, size);
 }
 
 // Build a second pipeline with the same layout, render pass and static state.

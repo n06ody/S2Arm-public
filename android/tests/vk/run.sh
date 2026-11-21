@@ -435,6 +435,8 @@ echo "validation: $layer"
 if [ "$mode" = "--present-only" ]; then
     "$glslc" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/pass_capture_fixture.vert.spv"
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/pass_capture_fixture.frag" -o "$out/shaders/pass_capture_fixture.frag.spv"
+    "$glslc" --target-env=vulkan1.1 -DDRAW_EXPORT_DEPTH "$repo/android/tests/vk/shaders/pass_draw_export_copy.frag" -o "$out/shaders/pass_draw_export_depth.frag.spv"
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/pass_draw_export_copy.frag" -o "$out/shaders/pass_draw_export_color.frag.spv"
     src[0]="$repo/android/tests/vk/t_present_encoding.c"
     cflags+=(-ffunction-sections -fdata-sections -Wno-unused-function)
 fi

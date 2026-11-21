@@ -71,6 +71,8 @@ static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的�
 static int g_pass_capture_test;
 static unsigned g_pass_capture_frames, g_pass_capture_clear, g_pass_capture_load, g_pass_capture_end, g_pass_capture_ticks;
 static unsigned g_pass_capture_shaders, g_pass_capture_samples, g_pass_capture_substitutions;
+static unsigned g_pass_draw_export_done;
+static char g_pass_draw_export_directory[96];
 static int32_t g_pass_key_hi, g_pass_key_lo;
 static char g_pass_expected_identity[128];
 int nvn_plat_flag(const char *name, int dflt) {
@@ -78,6 +80,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (g_pass_capture_test && !strcmp(name, "nvk_pass_capture_s"))
         return g_pass_capture_test == 2 || !getenv("S2A_TEST_PRESENT_BGRA");
     if (g_pass_capture_test == 2) {
+        if (!strcmp(name, "nvk_pass_draw_export")) return getenv("S2A_TEST_PRESENT_BGRA") != NULL;
         if (!strcmp(name, "nvk_pass_key_hi")) return g_pass_key_hi;
         if (!strcmp(name, "nvk_pass_key_lo")) return g_pass_key_lo;
         if (!strcmp(name, "nvk_pass_constant")) return !getenv("S2A_TEST_PRESENT_BGRA");
@@ -116,6 +119,12 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (cls && text && !strcmp(cls, "pass-draw-export")) {
+        if (!strcmp(text, "end frames=24 rows=96 modules=4 failed=0"))
+            g_pass_draw_export_done++;
+        if (!strncmp(text, "directory=", 10) && strlen(text + 10) < sizeof g_pass_draw_export_directory)
+            strcpy(g_pass_draw_export_directory, text + 10);
+    }
     if (cls && text && !strcmp(cls, "pass-capture")) {
         if (g_pass_capture_test == 2) {
             if (strstr(text, g_pass_expected_identity) && strstr(text, "entry=main flags=0 blend=0 mask=ff bindings=1 omitted=0"))

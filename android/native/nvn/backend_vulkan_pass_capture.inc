@@ -83,6 +83,7 @@ static void pass_capture_frame(struct nvn_gpu_vk *vk, const struct vk_segment *s
             }
         }
     }
+    if (vk->pass_draw_export) pass_draw_write(p);
     char line[96];
     snprintf(line, sizeof line, "end frames=%u rows=%u", p->frames, p->rows);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-capture", line);
@@ -95,6 +96,7 @@ static void pass_capture_segment(struct pass_capture *p, const struct nvn_gpu_cm
         p->failed = 1;
         return;
     }
+    if (g.pass_draw_export && c->draw_failed) p->draw_failed = 1;
     for (uint32_t i = 0; i < c->ntsp; i++) {
         if (p->frame[p->frames].count == PASS_CAPTURE_MAX || pts[2 * i + 1] < pts[2 * i]) {
             p->failed = 1;
@@ -102,6 +104,7 @@ static void pass_capture_segment(struct pass_capture *p, const struct nvn_gpu_cm
         }
         struct pass_capture_row *r = &p->row[p->rows++];
         *r = c->pass_capture[i];
+        if (g.pass_draw_export) pass_draw_retire(p, c, r);
         r->tick0 = pts[2 * i];
         r->tick1 = pts[2 * i + 1];
         r->submit = signal;
