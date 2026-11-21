@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+// Shared production policy for direct runtime, captured facts and offline identity.
+// Historical decoder re-encoding retains the policy stored in its wire version.
+static inline int s2a_direct_requires_linked_varying_interface(uint32_t stage_mask) {
+    return stage_mask == 3u;
+}
+
 // provider 在 Prepare 时合成、在 Activate 后可供 Draw 读取的请求身份半（profile 原文 + session/generation）。
 struct s2a_direct_compile_context {
     uint64_t session;
@@ -97,6 +103,10 @@ struct s2a_compile_request_input {
     const char *translator_closure;
     struct s2a_compile_stage_src stages[3];
     int stage_count;
+    // Android new replay VS+FS pair opts in. Zero preserves legacy requests.
+    int requires_linked_varying_interface;
+    // 诊断（缺省 0）：1 = 请结果信封附 VS/FS 两侧「逻辑 location → 宿主 Location」表（linkMap），只许配对 VS+FS 带。
+    int link_map_diag;
     struct s2a_compile_graphics_src gfx;
     struct s2a_compile_texture_src textures[S2A_COMPILE_TEXTURE_MAX];   // 真实绑定的纹理事实；0 条 = 没有可用来源
     int texture_count;

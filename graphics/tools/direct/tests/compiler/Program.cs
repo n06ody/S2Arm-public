@@ -653,13 +653,15 @@ internal static unsafe class Program
         byte[] vs = null, byte[] fs = null, byte[] cs = null, string fragmentType = "Float",
         string textureFacts = null, bool transformFeedback = false, uint localSize = 1,
         byte[] overrideCode = null, int controlX = -1, uint fsCbUse = 0, string closure = null,
-        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0, string[] attributeTypes = null)
+        string textureBufferLengths = null, uint csCbUse = 0, uint sharedBytes = 0, string[] attributeTypes = null,
+        bool linked = false)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
         {
             w.WriteStartObject();
             w.WriteString("schema", DirectShaderCompiler.RequestSchema);
+            if (linked) w.WriteBoolean("requiresLinkedVaryingInterface", true);
             w.WriteNumber("session", session);
             w.WriteNumber("generation", generation);
             w.WriteString("requestId", requestId);
@@ -1174,6 +1176,79 @@ internal static unsafe class Program
             const string closure = "synthetic-closure-v1";
             byte[] caps = CapsJson();
             byte[] composed = DirectProfileComposer.Compose(caps, closure);
+            using (JsonDocument oldProfile = JsonDocument.Parse(composed))
+            {
+                var oldCaps = DirectProfile.Parse(oldProfile.RootElement, "legacy profile").Caps;
+                Check(!oldCaps.RequiresLinkedVaryingInterface && oldCaps.MaximumVertexOutputComponents == 0 &&
+                    oldCaps.MaximumFragmentInputComponents == 0, "old profile missing linked fields keeps legacy policy");
+            }
+            using (JsonDocument legacy = JsonDocument.Parse(caps))
+            {
+                var parsed = DirectDeviceCaps.Parse(legacy.RootElement, "legacy caps");
+                Check(parsed.MaxVertexOutputComponents == null && parsed.MaxFragmentInputComponents == null,
+                    "legacy missing varying limits remain unknown, not zero");
+            }
+            var measured = System.Text.Json.Nodes.JsonNode.Parse(caps);
+            measured["limits"]["maxVertexOutputComponents"] = 64;
+            measured["limits"]["maxFragmentInputComponents"] = 128;
+            using (JsonDocument current = JsonDocument.Parse(measured.ToJsonString()))
+            {
+                var parsed = DirectDeviceCaps.Parse(current.RootElement, "measured caps");
+                Check(parsed.MaxVertexOutputComponents == 64 && parsed.MaxFragmentInputComponents == 128,
+                    "measured varying limits retain exact device values");
+            }
+            byte[] factProfile = DirectProfileComposer.Compose(Encoding.UTF8.GetBytes(measured.ToJsonString()), closure);
+            Check(!composed.SequenceEqual(factProfile), "new measured limits intentionally change global profile bytes");
+            using (JsonDocument facts = JsonDocument.Parse(factProfile))
+            using (JsonDocument old = JsonDocument.Parse(composed))
+            {
+                var parsed = DirectProfile.Parse(facts.RootElement, "global fact profile").Caps;
+                Check(!parsed.RequiresLinkedVaryingInterface && parsed.MaximumVertexOutputComponents == 64 &&
+                    parsed.MaximumFragmentInputComponents == 128, "global profile retains facts but never enables linked policy");
+                Check(facts.RootElement.GetProperty("profileHash").GetString() != old.RootElement.GetProperty("profileHash").GetString(),
+                    "new measured limits intentionally invalidate global profile hash once");
+                Check(!facts.RootElement.GetProperty("capabilities").TryGetProperty("requiresLinkedVaryingInterface", out _),
+                    "linked request property is absent from global profile");
+            }
+            var globalLinked = System.Text.Json.Nodes.JsonNode.Parse(factProfile);
+            globalLinked["capabilities"]["requiresLinkedVaryingInterface"] = true;
+            Throws("INVALID_JSON", () => {
+                using JsonDocument doc = JsonDocument.Parse(globalLinked.ToJsonString());
+                DirectProfile.Parse(doc.RootElement, "invalid global linked policy");
+            }, "global profile rejects per-request linked policy");
+            foreach (string field in new[] { "maxVertexOutputComponents", "maxFragmentInputComponents" })
+            {
+                string duplicate = measured.ToJsonString().Replace("\"" + field + "\":",
+                    "\"" + field + "\":32,\"" + field + "\":");
+                Throws("DUPLICATE_KEY", () => DirectProfileComposer.Compose(
+                    Encoding.UTF8.GetBytes(duplicate), closure), "reject duplicate varying limit " + field);
+                var partial = measured.DeepClone();
+                partial["limits"].AsObject().Remove(field);
+                using JsonDocument doc = JsonDocument.Parse(partial.ToJsonString());
+                var parsed = DirectDeviceCaps.Parse(doc.RootElement, "partial varying caps");
+                Check(field == "maxVertexOutputComponents"
+                    ? parsed.MaxVertexOutputComponents == null && parsed.MaxFragmentInputComponents == 128
+                    : parsed.MaxFragmentInputComponents == null && parsed.MaxVertexOutputComponents == 64,
+                    "missing one varying limit does not erase the other " + field);
+            }
+            foreach (string field in new[] { "maxVertexOutputComponents", "maxFragmentInputComponents" })
+            foreach (string invalid in new[] { "0", "-1", "4294967296", "null", "\"64\"", "1.5" })
+            {
+                var broken = measured.DeepClone();
+                broken["limits"][field] = System.Text.Json.Nodes.JsonNode.Parse(invalid);
+                Throws("MISSING_FIELD", () => {
+                    using JsonDocument doc = JsonDocument.Parse(broken.ToJsonString());
+                    DirectDeviceCaps.Parse(doc.RootElement, "invalid varying caps");
+                }, "reject invalid measured varying limit " + field + "=" + invalid);
+            }
+            foreach (string field in new[] { "maxVertexOutputComponents", "maxFragmentInputComponents" })
+            {
+                var tooWide = measured.DeepClone();
+                tooWide["limits"][field] = 2147483648L;
+                Throws("UNSUPPORTED_PROFILE", () => DirectProfileComposer.Compose(
+                    Encoding.UTF8.GetBytes(tooWide.ToJsonString()), closure),
+                    "composer rejects uint limit outside translator int range " + field);
+            }
             using (JsonDocument doc = JsonDocument.Parse(composed))
             {
                 JsonElement root = doc.RootElement;
@@ -1349,6 +1424,10 @@ internal static unsafe class Program
             byte[] enabledProfile = DirectProfileComposer.Compose(CapsJson(geometry: true), DirectBuildIdentity.TranslatorClosure);
             requestNode["profile"] = System.Text.Json.Nodes.JsonNode.Parse(enabledProfile);
             byte[] enabledRequest = Encoding.UTF8.GetBytes(requestNode.ToJsonString());
+            var linkedGeometry = requestNode.DeepClone();
+            linkedGeometry["requiresLinkedVaryingInterface"] = true;
+            Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(
+                Encoding.UTF8.GetBytes(linkedGeometry.ToJsonString())), "linked request rejects VS->GS->FS");
             {
                 var badSlot = requestNode.DeepClone();
                 var badStages = badSlot["program"]["stages"].AsArray();
@@ -1579,6 +1658,121 @@ internal static unsafe class Program
                   bindings[0].GetProperty("binding").GetInt32() == 0, "support binding first");
             Check(content.GetProperty("dependencies").GetArrayLength() > 10, "query dependencies recorded");
             Check(root.GetProperty("contentHash").GetString().StartsWith("sha256-"), "content hash");
+        }
+
+        // #696: exercise the real paired compiler rather than a synthetic SPIR-V pass.
+        // Global limits are facts; only the paired request opts into compaction.
+        var pairedCaps = System.Text.Json.Nodes.JsonNode.Parse(CapsJson());
+        pairedCaps["limits"]["maxVertexOutputComponents"] = 64;
+        pairedCaps["limits"]["maxFragmentInputComponents"] = 128;
+        byte[] pairedProfile = DirectProfileComposer.Compose(Encoding.UTF8.GetBytes(pairedCaps.ToJsonString()),
+            DirectBuildIdentity.TranslatorClosure);
+        byte[] absentLinkedRequest = RequestJson(pairedProfile, "graphics", 1, 1, "legacy-linked-omitted", vs, fs);
+        var explicitFalse = System.Text.Json.Nodes.JsonNode.Parse(absentLinkedRequest);
+        explicitFalse["requiresLinkedVaryingInterface"] = false;
+        string duplicatedLinked = explicitFalse.ToJsonString().Replace(
+            "\"requiresLinkedVaryingInterface\":false",
+            "\"requiresLinkedVaryingInterface\":false,\"requiresLinkedVaryingInterface\":true");
+        Throws("DUPLICATE_KEY", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(duplicatedLinked)),
+            "linked request rejects duplicate policy keys");
+        Check(DirectShaderCompiler.Compile(absentLinkedRequest).SequenceEqual(DirectShaderCompiler.Compile(
+            Encoding.UTF8.GetBytes(explicitFalse.ToJsonString()))),
+            "explicit false and absent linked request produce identical complete result bytes");
+        foreach (string invalid in new[] { "null", "0", "1", "\"true\"", "{}", "[]" })
+        {
+            var malformed = explicitFalse.DeepClone();
+            malformed["requiresLinkedVaryingInterface"] = System.Text.Json.Nodes.JsonNode.Parse(invalid);
+            Throws("INVALID_JSON", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(malformed.ToJsonString())),
+                "linked request rejects nonboolean " + invalid);
+        }
+        // Unknown limits do not prevent linking; measured positive limits still constrain it.
+        using (JsonDocument unknown = ParseResult(DirectShaderCompiler.Compile(RequestJson(
+            profile, "graphics", 1, 1, "linked-unknown-limits", vs, fs, linked: true))))
+            Check(unknown.RootElement.GetProperty("content").GetProperty("stages").GetArrayLength() == 2,
+                "linked accepts legacy profile with both limits unknown");
+        foreach (string field in new[] { "maxVertexOutputComponents", "maxFragmentInputComponents" })
+        {
+            var partial = pairedCaps.DeepClone();
+            partial["limits"].AsObject().Remove(field);
+            byte[] partialProfile = DirectProfileComposer.Compose(Encoding.UTF8.GetBytes(partial.ToJsonString()),
+                DirectBuildIdentity.TranslatorClosure);
+            using JsonDocument partialLinkedResult = ParseResult(DirectShaderCompiler.Compile(RequestJson(
+                partialProfile, "graphics", 1, 1, "linked-partial", vs, fs, linked: true)));
+            Check(partialLinkedResult.RootElement.GetProperty("content").GetProperty("stages").GetArrayLength() == 2,
+                "linked accepts missing device limit " + field);
+        }
+        foreach (string field in new[] { "maxVertexOutputComponents", "maxFragmentInputComponents" })
+        {
+            var constrained = pairedCaps.DeepClone();
+            constrained["limits"][field] = 1;
+            byte[] constrainedProfile = DirectProfileComposer.Compose(Encoding.UTF8.GetBytes(constrained.ToJsonString()),
+                DirectBuildIdentity.TranslatorClosure);
+            bool rejectedByBudget = false;
+            try
+            {
+                DirectShaderCompiler.Compile(RequestJson(constrainedProfile, "graphics", 1, 1, "linked-over-budget",
+                    Guest(false, new[] { Ast(0), Ast(1) }),
+                    Guest(true, new[] { Ald(0), Ald(1, reg: 1), FaddR(0, 0, 1) }, new[] { 0, 1 }), linked: true));
+            }
+            catch (DirectCompileException error)
+            {
+                rejectedByBudget = error.Code == "TRANSLATION" &&
+                    error.Message.Contains("interface requires") && error.Message.Contains("host limit 1");
+            }
+            Check(rejectedByBudget, "known positive limit still rejects actual over-budget interface " + field);
+        }
+        Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(RequestJson(
+            pairedProfile, "graphics", 1, 1, "linked-vs-only", vs, linked: true)), "linked rejects VS-only");
+        Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(RequestJson(
+            pairedProfile, "compute", 1, 1, "linked-compute", cs: cs, linked: true)), "linked rejects compute");
+        foreach (bool sparse in new[] { false, true })
+        foreach (bool unwritten in new[] { false, true })
+        {
+            int[] reads = sparse ? new[] { 0, 31 } : new[] { 0 };
+            ulong[] vertexOps = sparse ? new[] { Ast(0), Ast(31) } : new[] { Ast(0) };
+            // Downstream reads must still synthesize an interface when the VS
+            // does not write it; declarations alone do not prove default values.
+            if (unwritten) vertexOps = Array.Empty<ulong>();
+            ulong[] fragmentOps = sparse
+                ? new[] { Ald(0, reg: 0), Ald(31, reg: 1), FaddR(0, 0, 1) }
+                : new[] { Ald(0) };
+            using JsonDocument paired = ParseResult(DirectShaderCompiler.Compile(RequestJson(
+                pairedProfile, "graphics", 1, 1, "paired-varyings-" + sparse + "-unwritten-" + unwritten,
+                Guest(false, vertexOps), Guest(true, fragmentOps, reads), linked: true)));
+            JsonElement pairedStages = paired.RootElement.GetProperty("content").GetProperty("stages");
+            var producer = ShaderInterface(pairedStages[0], 3);
+            var consumer = ShaderInterface(pairedStages[1], 1);
+            Check(producer.Count == reads.Length && consumer.Count == reads.Length,
+                "paired VS->FS has only actual varying locations; sparse=" + sparse + "; unwritten=" + unwritten);
+            foreach (int location in Enumerable.Range(0, reads.Length))
+                Check(producer.TryGetValue((uint)location, out string outputType) &&
+                    consumer.TryGetValue((uint)location, out string inputType) && outputType == inputType,
+                    "paired VS->FS matches location and type " + location);
+        }
+        // 配对接口表诊断（linkMapDiag）：信封外层带两侧实际发射的 [逻辑, 宿主]，content / contentHash 与不带时逐字节相同。
+        // 手算期望（AttributeUsage.LinkedLocations）：共用掩码 = FS 实际读 {3,7} ∪ VS 最终 IR 声明的输出 {0,3,7}，
+        // 宿主号 = 掩码里比它小的位数 → VS 0→0、3→1、7→2；FS 3→1、7→2（VS 多写的 0 照发射，两侧同号对上）。
+        {
+            byte[] mapVs = Guest(false, new[] { Ast(0), Ast(3), Ast(7) });
+            byte[] mapFs = Guest(true, new[] { Ald(3, reg: 0), Ald(7, reg: 1), FaddR(0, 0, 1) }, new[] { 3, 7 });
+            byte[] plain = RequestJson(pairedProfile, "graphics", 1, 1, "link-map", mapVs, mapFs, linked: true);
+            var diagNode = System.Text.Json.Nodes.JsonNode.Parse(plain);
+            diagNode["linkMapDiag"] = true;
+            byte[] withMap = DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(diagNode.ToJsonString()));
+            byte[] withoutMap = DirectShaderCompiler.Compile(plain);
+            using JsonDocument a = ParseResult(withMap), b = ParseResult(withoutMap);
+            string Side(string side) => a.RootElement.TryGetProperty("linkMap", out var m)
+                ? string.Join(",", m.GetProperty(side).EnumerateArray().Select(x => x[0].GetInt32() + ">" + x[1].GetInt32())) : "(missing)";
+            Check(Side("vs") == "0>0,3>1,7>2" && Side("fs") == "3>1,7>2",
+                "link map diag reports both sides logical>host: vs=" + Side("vs") + " fs=" + Side("fs"));
+            Check(!b.RootElement.TryGetProperty("linkMap", out _), "link map is absent unless requested");
+            Check(a.RootElement.GetProperty("content").GetRawText() == b.RootElement.GetProperty("content").GetRawText() &&
+                a.RootElement.GetProperty("contentHash").GetString() == b.RootElement.GetProperty("contentHash").GetString(),
+                "link map diag leaves content and contentHash byte-identical");
+            var unlinked = System.Text.Json.Nodes.JsonNode.Parse(RequestJson(pairedProfile, "graphics", 1, 1, "link-map-unlinked", mapVs, mapFs));
+            unlinked["linkMapDiag"] = true;
+            Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(unlinked.ToJsonString())),
+                "link map diag without linked request rejected");
         }
 
         // 2b) 图形阶段的 c0Reads：回放按它决定间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
@@ -1956,6 +2150,18 @@ internal static unsafe class Program
             var queries = new List<DirectQuery>();
             var allocator = new DirectAllocator(parsedProfile);
             var accessor = new DirectGpuAccessor(parsedProfile, program, program.StageOf("fs"), 5, allocator, queries);
+            Check(accessor.QueryHostRequiresLinkedVaryingInterface() == parsedProfile.Caps.RequiresLinkedVaryingInterface &&
+                  queries.Last().Source == "profile:" + parsedProfile.ProfileHash &&
+                  queries.Last().Value == (parsedProfile.Caps.RequiresLinkedVaryingInterface ? "true" : "false"),
+                  "omitted linked accessor keeps exact profile value and recorded source");
+            var explicitUnlinked = new DirectGpuAccessor(parsedProfile, program, program.StageOf("fs"), 5, allocator, queries, false);
+            Check(explicitUnlinked.QueryHostRequiresLinkedVaryingInterface() == parsedProfile.Caps.RequiresLinkedVaryingInterface &&
+                  queries.Last().Source == "profile:" + parsedProfile.ProfileHash,
+                  "explicit false linked accessor retains profile fallback");
+            var explicitLinked = new DirectGpuAccessor(parsedProfile, program, program.StageOf("fs"), 5, allocator, queries, true);
+            Check(explicitLinked.QueryHostRequiresLinkedVaryingInterface() &&
+                  queries.Last().Source == "request:requiresLinkedVaryingInterface" && queries.Last().Value == "true",
+                  "explicit linked accessor returns request value and source");
             Check(!accessor.QueryHostStorageWindowClamp() && !accessor.QueryHostStorageOobRecord(), "direct-v1 keeps uninstrumented storage policy");
             foreach (ShaderStage stage in Enum.GetValues<ShaderStage>())
                 Check(accessor.CreateS2AStorageOobRecordBinding(stage) == new SetBindingPair(-1, -1), "no undeclared OOB binding for " + stage);

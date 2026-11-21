@@ -3,6 +3,7 @@
 # Copyright 2026 S2Arm contributors
 """Host-only identity checks plus three independent rejection controls. No device/SDK."""
 import os
+import json
 from pathlib import Path
 import shlex
 import subprocess
@@ -31,6 +32,13 @@ def main():
                 command.append(str(NATIVE / "direct/sha256.c"))
             subprocess.run(command + ["-o", str(binary)], check=True, timeout=30)
             result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+            print(json.dumps({"case": name, "argv": [str(binary)],
+                              "returncode": result.returncode,
+                              "stdout": result.stdout, "stderr": result.stderr}))
+            diagnostics = result.stdout + result.stderr
+            if result.stderr or any(marker in diagnostics for marker in
+                    ("AddressSanitizer", "UndefinedBehaviorSanitizer", "LeakSanitizer", "runtime error:")):
+                raise SystemExit(name + " emitted unexpected runtime diagnostics")
             print(name + ": " + result.stdout.strip())
             return result
 

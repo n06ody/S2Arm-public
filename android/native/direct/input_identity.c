@@ -46,6 +46,8 @@ int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf,
     if (in->texture_count && !in->textures) return -1;
     // 阶段掩码只有 6 个 NVN 阶段位；每个已置位阶段都必须带完整源摘要与真实长度。
     if (!in->stage_mask || (in->stage_mask & ~0x3Fu)) return -1;
+    if (in->requires_linked_varying_interface != 0 && in->requires_linked_varying_interface != 1) return -1;
+    if (in->requires_linked_varying_interface && in->stage_mask != 3) return -1;
     unsigned stages = 0;
     for (uint32_t m = in->stage_mask; m; m >>= 1) stages += m & 1u;
     if (stages > 6) return -1;
@@ -64,7 +66,10 @@ int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf,
     // 会和新程序混判。只有真正用到高位的输入才用 4：掩码落在旧窗口内的输入逐字节保持 3。
     int wide_cbuf = 0;
     for (int i = 0; i < 6; i++) if (in->ubo_use[i] & ~0x1Fu) wide_cbuf = 1;
-    wu8(&w, wide_cbuf ? 4 : 3);
+    // 5 = directly paired VS->FS uses actual fragment inputs. Do not reuse v4:
+    // that version already identifies high-cbuf inputs under the old policy.
+    // Standalone VS, compute and VS->GS->FS retain their existing v3/v4 bytes.
+    wu8(&w, in->requires_linked_varying_interface ? 5 : (wide_cbuf ? 4 : 3));
     wi32(&w, in->direct_abi);
     wstr(&w, in->translator_closure);
     wb(&w, in->profile_sha, sizeof in->profile_sha);
@@ -221,13 +226,15 @@ int s2a_input_identity_decode(const uint8_t *buf, size_t len, struct s2a_input_i
     }
     uint8_t vb = 0;
     if (rd_u8(&r, &vb)) goto bad;
-    if (vb != 3 && vb != 4) { set_why(why, why_size, "unknown identity version"); return -1; }
+    if (vb != 3 && vb != 4 && vb != 5) { set_why(why, why_size, "unknown identity version"); return -1; }
     version = vb;
+    out->id.requires_linked_varying_interface = version == 5;
     if (rd_i32(&r, (int32_t *)&out->id.direct_abi)) goto bad;
     if (rd_str(&r, out->closure, sizeof out->closure, &out->id.translator_closure)) goto bad;
     if (!out->id.translator_closure) { set_why(why, why_size, "identity has no translator closure"); return -1; }
     if (rd_bytes(&r, out->id.profile_sha, sizeof out->id.profile_sha)) goto bad;
     if (rd_u32(&r, &out->id.stage_mask)) goto bad;
+    if (version == 5 && out->id.stage_mask != 3u) { set_why(why, why_size, "linked identity requires exact VS/FS stages"); return -1; }
     if (rd_bytes(&r, out->id.keys, sizeof out->id.keys)) goto bad;
     {
         uint32_t sm = out->id.stage_mask;
@@ -255,8 +262,8 @@ int s2a_input_identity_decode(const uint8_t *buf, size_t len, struct s2a_input_i
         int wide_cbuf = 0;
         for (int i = 0; i < 6; i++) if (out->id.ubo_use[i] & ~0x1Fu) wide_cbuf = 1;
         // 版本字节是内容的一部分：v4 只在出现旧 5 位窗口外的 constantBufferUse 位时才有。别的组合重编码
-        // 会变成另一版（v3/v4 不能互认），所以这里就按「版本与内容不一致」拒绝。
-        if (version != (unsigned)(wide_cbuf ? 4 : 3)) { set_why(why, why_size, "identity version does not match its content"); return -1; }
+        // 会变成另一版（v3/v4 不能互认）；v5 明确表示 linked VS/FS，低/高 cbuf 都保留 v5。
+        if (version != (unsigned)(out->id.requires_linked_varying_interface ? 5 : (wide_cbuf ? 4 : 3))) { set_why(why, why_size, "identity version does not match its content"); return -1; }
     }
     out->id.compute_has_unaligned_ssbo = 0;
     out->id.compute_unaligned_ssbo = 0;

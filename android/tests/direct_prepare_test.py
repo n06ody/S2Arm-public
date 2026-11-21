@@ -694,8 +694,27 @@ class NativeIdentityTests(unittest.TestCase):
         encoded = encode(facts)
         self.assertEqual(encoded.returncode, 0, encoded.stderr)
         output = json.loads(encoded.stdout)
+        self.assertEqual(bytes.fromhex(output['canonical'])[5], 5, 'pair must use v5')
         self.assertEqual(bytes.fromhex(output['canonical']), binary_out.read_bytes())
         self.assertEqual(output['identity'], hashlib.sha256(binary_out.read_bytes()).hexdigest())
+        # Repeat parity with wide cbuf usage: paired policy remains v5, not v4.
+        wide_source = source.replace('in.ubo_use[0] = 0;', 'in.ubo_use[0] = 0x38u;')
+        self.assertNotEqual(wide_source, source, 'wide fixture anchor must match')
+        fixture.write_text(wide_source)
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
+            '-I' + str(android / 'native'), '-I' + str(repo / 'runtime/include'),
+            '-I' + str(repo / 'graphics/nvn/gfx/nvn/include'), str(fixture),
+            str(android / 'native/direct/input_identity.c'), str(android / 'native/direct/texture_facts.c'),
+            str(android / 'native/direct/sha256.c'), '-o', str(exe)], check=True, capture_output=True)
+        wide_run = subprocess.run([str(exe)], capture_output=True, text=True)
+        self.assertEqual(wide_run.returncode, 0, wide_run.stderr + wide_run.stdout)
+        facts['ubo_use'][0] = 0x38
+        wide_encoded = encode(facts)
+        self.assertEqual(wide_encoded.returncode, 0, wide_encoded.stderr)
+        wide_output = json.loads(wide_encoded.stdout)
+        self.assertEqual(bytes.fromhex(wide_output['canonical'])[5], 5)
+        self.assertEqual(bytes.fromhex(wide_output['canonical']), binary_out.read_bytes())
+        facts['ubo_use'][0] = 0
         # Repeated input and semantic variations exercise the transport mapping.
         self.assertEqual(encode(facts).stdout, encoded.stdout)
         for group, name, value in [(facts,'texture_array_length',10257),

@@ -52,6 +52,7 @@ uint64_t s2a_direct_diag_compile_begin(const uint8_t identity[32], unsigned stag
 void s2a_direct_diag_compile_end(uint64_t token, int success) { if (token) trace_end_count++; trace_success=success; }
 static unsigned fake_array_count;
 static int separate_fixture;
+static int link_map_flag;   // nvk_link_map_diag 开关替身
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
@@ -116,10 +117,13 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
+    if (!strcmp(name, "nvk_link_map_diag")) return link_map_flag;
     return dflt;
 }
+static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
 static int lp_missing_lines, lp_open_lines;   // 出包预编库「不在」（黄）/「已打开」两种行各打了几次
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
@@ -260,7 +264,9 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
             ",\"contract\":\"s2a-direct-program-content-v1\",\"dependencies\":[{\"source\":\"code:sha256:synthetic\",\"method\":\"GetCode\"},{\"source\":\"%s\",\"method\":\"QuerySamplerType\"},{\"source\":\"texture-fact:fs:10:2\",\"method\":\"QueryTextureCoordNormalized\"},{\"source\":\"code:sha256:synthetic#cbUse\",\"method\":\"QueryConstantBufferUse\",\"arguments\":\"stage=vs\"}]", source);
         if (fake_gs_result_tag) { size_t dn = strlen(depbuf); snprintf(depbuf + dn, sizeof depbuf - dn, ",\"fixtureTag\":%d", fake_gs_result_tag); }
         const char *deps = depbuf;
-        int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"},{\"stage\":\"fs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}%s],\"bindings\":[]%s}}", extra, deps);
+        // 请求带 linkMapDiag 时照编译器口径在信封外层附 linkMap（VS 写逻辑 0/3/7、FS 读 3/7 → 压缩后宿主 0/1/2 与 1/2）
+        const char *link_map = strstr(captured, "\"linkMapDiag\":true") ? ",\"linkMap\":{\"vs\":[[0,0],[3,1],[7,2]],\"fs\":[[3,1],[7,2]]}" : "";
+        int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"},{\"stage\":\"fs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}%s],\"bindings\":[]%s}%s}", extra, deps, link_map);
         CHECK(n > 0 && (size_t)n < sizeof result, "GS result fixture fits");
         s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
         return emit(sink, payload);
@@ -341,9 +347,18 @@ static void gs_request_test(void) {
     CHECK(rp_shader_graphics_stages() == 7, "GS fixture effective stage mask is 0x7");
     bind_pools(7); captured[0] = 0; compiler_calls = 0;
     struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+    // Run the same captured program as a VS+FS pair first. This tests the
+    // production new-layer producer, not just the shared JSON builder.
+    uint64_t gs_serial = rp_S.bser[2]; rp_S.bser[2] = 0;
+    CHECK(rp_shader_graphics_stages() == 3, "paired fixture stage mask is 0x3");
+    (void)rp_shader_resolve(&q, &p);
+    CHECK(compiler_calls == 1 && strstr(captured, "\"requiresLinkedVaryingInterface\":true"),
+          "new-layer paired request opts in");
+    rp_S.bser[2] = gs_serial; captured[0] = 0; compiler_calls = 0; p = NULL; trace_begin_count = trace_end_count = 0;
     int rc = rp_shader_resolve(&q, &p);
     CHECK(rc == -1 && p == NULL, "GS compiler boundary deliberately fails closed");
     CHECK(compiler_calls == 1, "GS production request reaches compiler, not stages_0x7_not_vs_fs");
+    CHECK(!strstr(captured, "\"requiresLinkedVaryingInterface\""), "GS production request omits opt-in");
     if (trace_on) CHECK(trace_begin_count == 1 && trace_end_count == 1 && trace_stage == 7 && trace_submit == 1 && trace_warm == 0 && trace_success == 0, "graphics live compile emits paired event including failure and stage");
     if (!compiler_calls) return;
     struct s2a_jv root = {captured, strlen(captured)}, program, stages, textures, v;
@@ -1141,6 +1156,26 @@ static void graphics_reject_context_test(void) {
     CHECK(!rp_shader_resolve(&q, &p) && p && !reject_lines[0], "an accepted program prints no rejection context: %s", reject_lines);
     for (unsigned k = 0; k < sizeof img_counters / sizeof img_counters[0]; k++)
         CHECK(nvn_unimpl_count("shader", img_counters[k]) == 0, "an accepted program does not count as %s", img_counters[k]);
+    // 配对接口表诊断（nvk_link_map_diag）：关时请求不带 linkMapDiag、不打行；开时配对 VS+FS 请求带上，结果信封里的两侧表原样打成一行（带程序键）
+    CHECK(!strstr(captured, "linkMapDiag") && link_map_lines == 0, "link map diag off: request omits linkMapDiag and nothing is printed");
+    link_map_flag = 1; rp_shader_reset(); reject_log_reset(); link_map_lines = 0; last_link_map[0] = 0;
+    CHECK(!rp_shader_resolve(&q, &p) && p && strstr(captured, "\"requiresLinkedVaryingInterface\":true,\"linkMapDiag\":true"), "link map diag on: paired request asks for the map");
+    { char want[200]; snprintf(want, sizeof want, "配对接口表 程序键=vs:%.16s fs:%.16s 身份=", want_key, want_key + 16);
+      CHECK(link_map_lines == 1 && strstr(last_link_map, want) == last_link_map &&
+            strstr(last_link_map, " VS输出(逻辑>宿主)=0>0,3>1,7>2 FS输入(逻辑>宿主)=3>1,7>2") && !strstr(last_link_map, "?"),
+            "link map diag on: one line with program key and both sides: %s", last_link_map); }
+    // 档位：替身编译器给的表两侧对得上（FS 3>1,7>2 都在 VS 里）、VS 有 3 个 varying →
+    //   3 档（只打对不上的）不打、不占名额；2 档（≥2 个 varying 或对不上）打。手算：3 档后行数不变，2 档后 +1
+    { int before = link_map_lines;
+      link_map_flag = 3; bind_pools(201); (void)rp_shader_resolve(&q, &p);
+      CHECK(link_map_lines == before, "link map diag level 3 skips matching pairs (lines %d -> %d)", before, link_map_lines);
+      link_map_flag = 2; bind_pools(202); (void)rp_shader_resolve(&q, &p);
+      CHECK(link_map_lines == before + 1, "link map diag level 2 prints pairs with >=2 varyings (lines %d -> %d)", before, link_map_lines);
+      link_map_flag = 1; }
+    // 上限：同一进程只打前 40 对（换身份重编也不再请求、不再打）
+    for (int i = 0; i < 45; i++) { bind_pools(300 + i); (void)rp_shader_resolve(&q, &p); }
+    CHECK(link_map_lines == 40 && !strstr(captured, "linkMapDiag"), "link map diag stops after 40 pairs and stops asking (lines=%d)", link_map_lines);
+    link_map_flag = 0; bind_pools(100);
     // 行数预算：140 个不同程序（换池长度就换身份）连续被拒，两类日志各只打 128 行，计数不设上限；
     // 超出预算时在拒绝原因读数里补一行「已截断，共 N 条」（诊断开关开着，进程正常收尾的回调才注册，用它触发那一组读数）；换会话预算归位
     fake_gs_success = 0; fake_gs_result_mode = 0; separate_fixture = 1;

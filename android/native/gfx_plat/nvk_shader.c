@@ -1021,6 +1021,66 @@ static int libpack_state_ok(const struct s2a_compile_graphics_src *g) {
 __attribute__((weak)) int s2a_direct_diag_enabled(void);
 __attribute__((weak)) uint64_t s2a_direct_diag_compile_begin(const uint8_t *, unsigned, int, int);
 __attribute__((weak)) void s2a_direct_diag_compile_end(uint64_t, int);
+// 配对接口表诊断（开关 nvk_link_map_diag，缺省关）：新编出的配对 VS+FS 每对打一行，两侧各自实际发射的
+// 「客体逻辑 location → 宿主 Location」（编译器在结果信封外层 linkMap 里带出，不进 content / 缓存身份），
+// 带程序键（两段 8 字节阶段键）与输入身份前 8 字节；SPIR-V 没有变量名时用它直接核两侧对应关系。只打前 LINK_MAP_DIAG_MAX 对。
+// 档位：1 全打；2 只打任一侧 ≥2 个 varying 或两侧对不上的；3 只打两侧对不上的（标题 / 菜单那些单 varying 程序不再占满名额）。
+#define LINK_MAP_DIAG_MAX 40
+static _Atomic int g_link_map_said;
+static int link_map_diag_want(void) {
+    return nvn_plat_flag("nvk_link_map_diag", 0) && atomic_load_explicit(&g_link_map_said, memory_order_relaxed) < LINK_MAP_DIAG_MAX;
+}
+// 一侧 [[逻辑, 宿主], …] → "0>0,3>1"；格式不对写 "?"（诊断只读，不影响建程序）。
+static void link_map_side(struct s2a_jv map, const char *side, char *out, size_t cap) {
+    struct s2a_jv arr; int n; size_t o = 0; out[0] = 0;
+    if (s2a_jv_obj_find(map, side, &arr) || (n = s2a_jv_arr_count(arr)) < 0) { snprintf(out, cap, "?"); return; }
+    if (!n) { snprintf(out, cap, "-"); return; }
+    for (int i = 0; i < n && o < cap; i++) {
+        struct s2a_jv pair, a, b; uint32_t lg, ph;
+        if (s2a_jv_arr_item(arr, i, &pair) || s2a_jv_arr_count(pair) != 2 || s2a_jv_arr_item(pair, 0, &a) || s2a_jv_arr_item(pair, 1, &b) ||
+            s2a_jv_u32(a, &lg) || s2a_jv_u32(b, &ph)) { snprintf(out, cap, "?"); return; }
+        int w = snprintf(out + o, cap - o, "%s%u>%u", i ? "," : "", lg, ph);
+        if (w < 0) return;
+        o += (size_t)w;
+    }
+}
+// 「0>0,3>1」逐项拆开：FS 的每一项（逻辑>宿主）都必须在 VS 里原样出现，否则算对不上；「?」一律算对不上（看不懂就打出来）。
+static int link_map_count(const char *t) { if (!t[0] || !strcmp(t, "-")) return 0; int n = 1; for (; *t; t++) n += *t == ','; return n; }
+static int link_map_mismatch(const char *vs, const char *fs) {
+    if (!strcmp(vs, "?") || !strcmp(fs, "?")) return 1;
+    if (!strcmp(fs, "-")) return 0;
+    const char *p = fs;
+    while (*p) {
+        const char *q = strchr(p, ','); size_t n = q ? (size_t)(q - p) : strlen(p);
+        int found = 0;
+        for (const char *v = vs; *v && !found; ) {
+            const char *w = strchr(v, ','); size_t m = w ? (size_t)(w - v) : strlen(v);
+            if (m == n && !strncmp(v, p, n)) found = 1;
+            v = w ? w + 1 : v + m;
+        }
+        if (!found) return 1;
+        p = q ? q + 1 : p + n;
+    }
+    return 0;
+}
+static int link_map_interesting(const char *vs, const char *fs, int level) {
+    if (link_map_mismatch(vs, fs)) return 1;
+    return level == 2 && (link_map_count(vs) >= 2 || link_map_count(fs) >= 2);
+}
+static void link_map_note(const uint8_t *bytes, size_t len, const char *keys_hex, const uint8_t identity[32]) {
+    struct s2a_jv top = {(const char *)bytes, len}, map;
+    char vs[256], fs[256], m[640];
+    if (s2a_jv_obj_find(top, "linkMap", &map)) { snprintf(vs, sizeof vs, "?"); snprintf(fs, sizeof fs, "?"); }
+    else { link_map_side(map, "vs", vs, sizeof vs); link_map_side(map, "fs", fs, sizeof fs); }
+    {   // 档位（nvk_link_map_diag）：1 全打；2 只打「任一侧 ≥2 个 varying 或两侧对不上」；3 只打「两侧对不上」。不合档的不占名额
+        const int level = nvn_plat_flag("nvk_link_map_diag", 0);
+        if (level >= 2 && !link_map_interesting(vs, fs, level)) return;
+    }
+    if (atomic_fetch_add_explicit(&g_link_map_said, 1, memory_order_relaxed) >= LINK_MAP_DIAG_MAX) return;
+    snprintf(m, sizeof m, "配对接口表 程序键=vs:%.16s fs:%.16s 身份=%02x%02x%02x%02x%02x%02x%02x%02x VS输出(逻辑>宿主)=%s FS输入(逻辑>宿主)=%s",
+             keys_hex, keys_hex + 16, identity[0], identity[1], identity[2], identity[3], identity[4], identity[5], identity[6], identity[7], vs, fs);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", m);
+}
 static uint64_t diag_begin(const uint8_t *id, unsigned stages, int submit) {
     return s2a_direct_diag_enabled && s2a_direct_diag_compile_begin && s2a_direct_diag_compile_end && s2a_direct_diag_enabled()
         ? s2a_direct_diag_compile_begin(id, stages, submit, 0) : 0;
@@ -1387,6 +1447,8 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         static struct s2a_compile_request_input in;   // 提交线程独占
         memset(&in, 0, sizeof in);
         in.session = s->pc.session; in.generation = s->pc.generation;
+        in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(s->stages);
+        in.link_map_diag = in.requires_linked_varying_interface && link_map_diag_want();
         in.profile_json = s->pc.profile_json; in.profile_bytes = s->pc.profile_bytes;
         in.direct_abi = (int)s->pc.direct_abi; in.translator_closure = s->pc.translator_closure;
         in.texture_array_length = s->tex_pool_n; in.sampler_array_length = s->samp_pool_n;
@@ -1434,6 +1496,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         }
         bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL;
         s2a_compile_outcome_free(&oc);
+        if (in.link_map_diag) link_map_note(bytes, len, ident, s->identity);
         atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
         if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
         if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, s->identity, bytes, len);
@@ -1844,6 +1907,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     struct s2a_input_identity id; memset(&id, 0, sizeof id);
     id.direct_abi = (int)pc.direct_abi; id.translator_closure = pc.translator_closure; memcpy(id.profile_sha, g_profile.sha, 32);
     id.stage_mask = stages;
+    id.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(stages);
     for (int st = 0; st < nst; st++) {
         memcpy(id.keys[st], stage_key((unsigned)st), 8);
         if (s2a_source_identity(stage_key((unsigned)st), id.source_sha[st], &id.source_code_bytes[st], &id.source_control_bytes[st])) { nvn_unimpl("shader", "source_snapshot_missing", NULL); return -1; }

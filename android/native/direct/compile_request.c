@@ -412,6 +412,20 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
         const struct s2a_compile_stage_src *s = &in->stages[i];
         if (!s->stage || !s->code || !s->code_bytes || !s->control || !s->control_bytes) return -1;
     }
+    if (in->requires_linked_varying_interface != 0 && in->requires_linked_varying_interface != 1) return -1;
+    uint32_t stage_mask = 0;
+    for (int i = 0; i < in->stage_count; ++i) {
+        const char *stage = in->stages[i].stage;
+        uint32_t bit = !strcmp(stage, "vs") ? 1u : !strcmp(stage, "fs") ? 2u :
+            !strcmp(stage, "gs") ? 4u : !strcmp(stage, "cs") ? 32u : 0u;
+        if (!bit || (stage_mask & bit)) return -1;
+        stage_mask |= bit;
+    }
+    const int linked = s2a_direct_requires_linked_varying_interface(stage_mask);
+    // Preserve the wire protocol stage order independently of the shared policy.
+    if (linked && (strcmp(in->stages[0].stage, "vs") || strcmp(in->stages[1].stage, "fs"))) return -1;
+    if (in->requires_linked_varying_interface && !linked) return -1;
+    if ((in->link_map_diag != 0 && in->link_map_diag != 1) || (in->link_map_diag && !linked)) return -1;
 
     struct sb b;
     memset(&b, 0, sizeof b);
@@ -430,6 +444,12 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
     sb_puts(&b, ",");
     // 与描述符/统一编译器常量同一值（graphics.h S2A_GRAPHICS_RUNTIME_COMPILER_ABI），不另写字面量。
     sb_key_string(&b, "runtimeCompilerABI", "s2a-direct-compile-v1");
+    // The linked interface changes only the Android direct paired VS+FS
+    // program; absent means legacy independent interface semantics.
+    if (linked) {
+        sb_puts(&b, ",\"requiresLinkedVaryingInterface\":true");
+        if (in->link_map_diag) sb_puts(&b, ",\"linkMapDiag\":true");
+    }
     sb_puts(&b, ",");
     sb_key_u32(&b, "sourceParserVersion", 1);
     // 描述符种类校验的调试开关只在这里判一次（debug_gate.h 两道门 + debug.s2a.kind_check），

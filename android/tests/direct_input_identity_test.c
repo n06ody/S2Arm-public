@@ -62,6 +62,7 @@ int main(void) {
     in.translator_closure = "closure-5";
     for (int i = 0; i < 32; i++) in.profile_sha[i] = (uint8_t)(i * 3 + 1);
     in.stage_mask = 0x3;
+    in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(in.stage_mask);
     for (int s = 0; s < 2; s++) for (int b = 0; b < 8; b++) in.keys[s][b] = (uint8_t)(0x10 * s + b);
     // F4.3 修订：短 key 只是完整摘要的前 8 字节，身份必须带完整源摘要与真实长度。
     // 反例基线：只改 code、强制同短 key 时，旧编码完全相同（canonical_equal=1）。
@@ -116,7 +117,7 @@ int main(void) {
     MUTATE(m.source_sha[1][0] ^= 0x80, "second stage source digest is covered");
     MUTATE(m.source_code_bytes[0] += 1, "real code length is covered (same concat digest, different split)");
     MUTATE(m.source_control_bytes[1] -= 0x10, "real control length is covered");
-    MUTATE(m.stage_mask = 0x1; m.source_present = 0x1, "stage mask is covered (consistent source proof)");
+    MUTATE(m.stage_mask = 0x1; m.source_present = 0x1; m.requires_linked_varying_interface = 0, "stage mask is covered (consistent source proof)");
     MUTATE(m.profile_sha[5] ^= 0xff, "profile identity is covered");
     MUTATE(m.translator_closure = "closure-6", "translator closure is covered");
     MUTATE(m.direct_abi = 6, "direct ABI is covered");
@@ -210,21 +211,25 @@ int main(void) {
         m = in; m.source_control_bytes[0] = 0;
         CHECK(s2a_input_identity_encode(&m, other, sizeof other, &mn) != 0,
               "zero control length is rejected");
+        m = in; m.requires_linked_varying_interface = 2;
+        CHECK(s2a_input_identity_encode(&m, other, sizeof other, &mn) != 0, "nonboolean linked policy rejected");
+        m = in; m.stage_mask = 1; m.source_present = 1;
+        CHECK(s2a_input_identity_encode(&m, other, sizeof other, &mn) != 0, "linked policy on nonpaired identity rejected");
         m = in; m.stage_mask = 0;
         CHECK(s2a_input_identity_encode(&m, other, sizeof other, &mn) != 0,
               "empty stage mask is rejected");
         m = in; m.stage_mask = 0x40;
         CHECK(s2a_input_identity_encode(&m, other, sizeof other, &mn) != 0,
               "stage mask beyond the six NVN stages is rejected");
-        // 编码版本字节：v2 → v3 的修改必须改变身份（旧磁盘条目/旧内存身份不能互认）。
-        static const uint8_t v3_magic[] = { 'S', '2', 'A', 'I', '1', 3 };
-        CHECK(n >= sizeof v3_magic && !memcmp(base, v3_magic, sizeof v3_magic),
-              "identity carries the S2AI1 version 3 marker");
+        // 配对编译策略改变必须升级身份；旧磁盘条目/旧内存身份不能互认。
+        static const uint8_t v5_magic[] = { 'S', '2', 'A', 'I', '1', 5 };
+        CHECK(n >= sizeof v5_magic && !memcmp(base, v5_magic, sizeof v5_magic),
+              "paired VS->FS identity carries the S2AI1 version 5 marker");
     }
 
     // constantBufferUse 加宽（compute 的用户 uniform 槽 0..15 = NVN cbuf 3..18）：
     // 旧 5 位窗口（cbuf 0..4）的输入逐字节仍是 v3；只有出现高位 (cbuf 5..18) 的 compute 输入才用 v4。
-    // 图形路径不参与加宽：同一图形输入即使掩码带高位也保持 v3（图形填表仍只产生旧窗口内的位）。
+    // 非配对图形同样按宽掩码分 v3/v4；直接配对 VS->FS 使用独立 v5。
     {
         static const uint8_t v3_magic[] = { 'S', '2', 'A', 'I', '1', 3 };
         static const uint8_t v4_magic[] = { 'S', '2', 'A', 'I', '1', 4 };
@@ -260,6 +265,7 @@ int main(void) {
         // 图形填表也扩到完整掩码（P0-3）：图形出现高位同样必须落 v4，否则旧缓存里截断掩码的
         // 程序会和新程序混判；窗口内（cbuf 0..4）仍逐字节 v3。
         struct s2a_input_identity gfx = in;
+        gfx.stage_mask = 1; gfx.source_present = 1; gfx.requires_linked_varying_interface = 0; // non-paired graphics retains v3/v4
         gfx.ubo_use[0] = 0x1f;
         size_t gn = 0;
         CHECK(s2a_input_identity_encode(&gfx, cwide, sizeof cwide, &gn) == 0 &&
@@ -272,6 +278,16 @@ int main(void) {
               gwn >= sizeof v4_magic && !memcmp(gwbuf, v4_magic, sizeof v4_magic),
               "graphics identity version-bumps to v4 when a high cbuf bit is set");
         CHECK(!(gwn == gn && !memcmp(cwide, gwbuf, gn)), "graphics high cbuf mask cannot share the v3 identity");
+        gfx.stage_mask = 3; gfx.source_present = 3; gfx.requires_linked_varying_interface = 1;
+        uint8_t pairedLow[4096]; size_t pairedLowLen = 0;
+        for (int wide = 0; wide < 2; wide++) {
+            gfx.ubo_use[0] = wide ? 0x38 : 0x1f;
+            CHECK(s2a_input_identity_encode(&gfx, gwbuf, sizeof gwbuf, &gwn) == 0 &&
+                  gwn > 5 && gwbuf[5] == 5, "paired low/high cbuf uses new v5 identity");
+            if (!wide) { memcpy(pairedLow, gwbuf, gwn); pairedLowLen = gwn; }
+            else CHECK(gwn != pairedLowLen || memcmp(pairedLow, gwbuf, gwn),
+                       "paired low/high cbuf full identities differ");
+        }
     }
 
     // F4.3/A2：名字不在已映射表里时必须明确失败。以前用 wstr 编名字，未知名字照样能编码，
@@ -393,6 +409,7 @@ int main(void) {
             }
             // 版本必须由内容决定：v4 blob 改成 v3 后重编码会变成另一版，必须拒绝。
             struct s2a_input_identity wide = in;
+            wide.requires_linked_varying_interface = 0;
             wide.ubo_use[0] = 0x38;   // 旧 5 位窗口外的 cbuf 位 → v4
             static uint8_t wbuf[4096];
             size_t wn = 0;
@@ -404,6 +421,40 @@ int main(void) {
             CHECK(s2a_input_identity_decode(wbuf, wn, &dec, why, sizeof why) == 0,
                   "wide identity still decodes (rejection above is about the version byte)");
         }
+    }
+
+    // Linked v5 must round-trip both cbuf policies without leaking into legacy v3/v4.
+    {
+        static struct s2a_input_identity_decoded dec;
+        static uint8_t linked[4096], again[4096];
+        char why[192];
+        for (int high = 0; high < 2; high++) {
+            struct s2a_input_identity pair = in;
+            pair.requires_linked_varying_interface = 1;
+            pair.ubo_use[0] = high ? 0x38u : 1u;
+            size_t ln = 0, an = 0;
+            CHECK(s2a_input_identity_encode(&pair, linked, sizeof linked, &ln) == 0 && linked[5] == 5,
+                  "linked low/high cbuf encodes v5");
+            CHECK(s2a_input_identity_decode(linked, ln, &dec, why, sizeof why) == 0 &&
+                  dec.id.requires_linked_varying_interface == 1 && dec.id.stage_mask == 3,
+                  "linked decoder restores explicit pair policy");
+            CHECK(s2a_input_identity_encode(&dec.id, again, sizeof again, &an) == 0 &&
+                  an == ln && !memcmp(again, linked, ln), "linked v5 round-trip is byte identical");
+            // Header stage_mask follows closure and profile SHA; non-pair v5 must fail before payload parsing.
+            size_t mask_at = 14 + strlen(pair.translator_closure) + 32;
+            linked[mask_at] = 7;
+            CHECK(s2a_input_identity_decode(linked, ln, &dec, why, sizeof why) != 0 &&
+                  !strcmp(why, "linked identity requires exact VS/FS stages"),
+                  "v5 non-pair rejects with exact policy reason");
+        }
+        struct s2a_input_identity legacy = in;
+        legacy.requires_linked_varying_interface = 0;
+        size_t legacy_n = 0;
+        CHECK(s2a_input_identity_encode(&legacy, linked, sizeof linked, &legacy_n) == 0,
+              "legacy fixture encodes without linked policy");
+        CHECK(s2a_input_identity_decode(linked, legacy_n, &dec, why, sizeof why) == 0 &&
+              dec.id.requires_linked_varying_interface == 0,
+              "legacy decode after linked resets request policy");
     }
 
     // 容量不足：准确失败，不截断成“看似相同”的输入。
