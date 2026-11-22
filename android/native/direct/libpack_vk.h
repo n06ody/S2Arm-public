@@ -51,11 +51,17 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
 /* 片元 .spv 的输出映射（同现编结果 info.fragmentOutputMap：每个颜色目标 4 位，第 c 分量 = 位 4×location + c）。
  * 0 = 推出；-1 = 读不懂（数组输出、location ≥ 8 等），调用方不出这一项（消费端按全写）。 */
 int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map);
-// 几何程序（stages 0x7 = vs|fs|gs）要的两样绘制事实；vs+fs 程序不读，可传 NULL（传 NULL 时几何程序 miss）。
+// 图形库的绘制和设备事实。旧版 VS+FS 对齐程序可传 NULL，几何与对齐补偿变体需要相应事实。
 //   topology：绘制图元名，与现编请求 graphicsState.topology 同源（nvk_input_topology：Points / Lines / Triangles / …Adjacency）；
 //   profile_json：本局 effective profile（s2a_direct_compile_context.profile_json），取 capabilities.supportsGeometryShader，
 //   与现编 profile.Caps.SupportsGeometryShader 同一判据：没开 = miss。
-struct s2a_libpack_gfx { const char *topology; const char *profile_json; size_t profile_bytes; };
+struct s2a_libpack_gfx {
+    const char *topology;
+    const char *profile_json;
+    size_t profile_bytes;
+    uint32_t storage_alignment;
+    int require_ssbo_window;
+};
 int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile_bytes);
 /* 能力核（见 .c）：删掉模块用不上的 Float64 / Int64 能力声明（本后端设备从不启用 shaderFloat64 / shaderInt64），
  * 真用到 64 位浮点 / 整型或声明 Int64Atomics 就拒。0 = 可用（*n 可能变小）；-1 = 拒，why 以具名原因开头

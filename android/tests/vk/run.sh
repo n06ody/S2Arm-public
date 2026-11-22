@@ -107,9 +107,18 @@ fi
 if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
     exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
+# 存储缓冲窗口读回夹具（standalone/libpack-ssbo-window.sh）的料：翻译器出库的合成顶点段，要 dotnet，只能在宿主出（容器里没有）。
+#   默认档与 --libpack-ssbo-window 都先出；已在容器里（S2A_VULKAN_IMAGE_ID）就用宿主出好的那份。
+prep_ssbo_window_stages() {
+    if [ -n "${S2A_VULKAN_IMAGE_ID:-}" ]; then return 0; fi
+    if [ -n "$mode" ] && [ "$mode" != "--libpack-ssbo-window" ]; then return 0; fi
+    rm -rf "$repo/build/libpack-ssbo-window/stages"
+    S2A_DSH_VK_EMIT_DIR="$repo/build/libpack-ssbo-window/stages" bash "$repo/graphics/tools/direct/tests/t_dsh_vk.sh"
+}
 if [ "$(uname -s)" = Darwin ]; then
     export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
     if [ -z "$mode" ]; then python3 "$repo/android/tests/gs_compiler_chain_test.py"; fi
+    prep_ssbo_window_stages
     exec bash "$repo/tests/vulkan/run.sh" android/tests/vk/run.sh "$@"
 fi
 # 以下是 Linux：在宿主上（原生跑；缺原生工具时转容器，见下），或已在 tests/vulkan/run.sh 起的离线容器里（带 S2A_VULKAN_IMAGE_ID）。
@@ -131,6 +140,7 @@ if [ -z "$mode" ] && [ ! -f "$repo/build/696-real-compiler/compiled/program.json
     fi
     python3 "$repo/android/tests/gs_compiler_chain_test.py"
 fi
+prep_ssbo_window_stages
 
 find_icd() {
     if [ -n "${S2A_LAVAPIPE_ICD:-}" ]; then printf '%s\n' "$S2A_LAVAPIPE_ICD"; return; fi

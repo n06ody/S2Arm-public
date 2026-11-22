@@ -800,9 +800,84 @@ static int lp_spv_viewport_builtin(const uint8_t *spv, size_t n) {
 //   偏移 2608 起是 73 项 × 16 字节的尺寸表。安卓宿主不填这张表：按 3776 分配、回放核心整块清零，表项全 0 时着色器走旧路径
 //   （倍率恒 1，与机上现编同口径）。只按 2608 绑的话越界读到的是未定义值（设备没开 robustBufferAccess）
 #define LP_SUPPORT_ABI2_BYTES 3776u
+
+// 只固化翻译器单独分配、并在阶段合同中指出的掩码常量。
+static int lp_fix_ssbo_window_mask(uint8_t *spv, size_t n, uint32_t id, uint32_t alignment) {
+    static const char name[] = "s2a_storage_window_mask";
+    uint32_t *w = (uint32_t *)spv;
+    const size_t nw = n / sizeof(*w);
+    if (nw < 5 || !id || id >= w[3]) return -1;
+    size_t constant = 0;
+    unsigned names = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || wc > nw - i) return -1;
+        if (op == 5 && wc >= 3 && w[i + 1] == id &&
+            (wc - 2) * sizeof(*w) >= sizeof(name) && !memcmp(w + i + 2, name, sizeof(name)))
+            names++;
+        if (op == 50 && wc == 4 && w[i + 2] == id) {   // OpSpecConstant
+            if (constant || w[i + 3] != UINT32_MAX) return -1;
+            constant = i;
+        }
+        if (op == 71 && wc >= 3 && w[i + 1] == id && w[i + 2] == 1) return -1;  // SpecId
+        i += wc;
+    }
+    if (!constant || names != 1) return -1;
+    for (size_t i = 5; i < constant; i += w[i] >> 16) {
+        if (w[i] != ((4u << 16) | 21u) || w[i + 1] != w[constant + 1]) continue;   // OpTypeInt
+        if (w[i + 2] != 32 || w[i + 3] != 0) return -1;
+        w[constant] = (4u << 16) | 43u;   // OpConstant
+        w[constant + 3] = 0u - alignment;
+        return 0;
+    }
+    return -1;
+}
+
+static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx *gfx,
+                                uint8_t *spv, size_t n, const struct lp_stage_contract *contract,
+                                char *why, size_t why_size) {
+    struct s2a_jv abi, field;
+    int has_mask = !s2a_jv_obj_find(top, "ssbo_window_mask", &field);
+    if (s2a_jv_obj_find(top, "ssbo_window_abi", &abi)) {
+        if (has_mask) return lp_fail(why, why_size, "%s %s mask without SSBO window ABI", contract->key, contract->json_name);
+        if (!gfx || !gfx->require_ssbo_window) return 0;
+        if (why && why_size) snprintf(why, why_size, "%s %s has no SSBO window variant", contract->key, contract->json_name);
+        return S2A_LIBPACK_MISS;
+    }
+    uint32_t version = 0;
+    if (jf_u32(top, "ssbo_window_abi", &version) || version != 1)
+        return lp_fail(why, why_size, "%s %s unknown SSBO window ABI", contract->key, contract->json_name);
+    if (!has_mask) {
+        // 没有掩码 = 这一段没有会随基址低位移动的窗口读取。基址对齐时窗口起点就是 B，照用；
+        //   只有本笔基址非对齐（require_ssbo_window）时，带存储缓冲的段才缺补偿、必须拒。
+        if (!gfx || !gfx->require_ssbo_window) return 0;
+        struct s2a_jv bindings;
+        if (!s2a_jv_obj_find(top, "bindings", &bindings)) {
+            int count = s2a_jv_arr_count(bindings);
+            for (int i = 0; i < count; i++) {
+                struct s2a_jv binding;
+                char kind[24];
+                if (!s2a_jv_arr_item(bindings, i, &binding) && !jf_str(binding, "kind", kind, sizeof kind) && !strcmp(kind, "sbuf"))
+                    return lp_fail(why, why_size, "%s %s SBUFP uses a fixed SSBO window", contract->key, contract->json_name);
+            }
+        }
+        return 0;
+    }
+    uint32_t alignment = gfx ? gfx->storage_alignment : 0;
+    uint32_t profile_alignment = 0, id = 0;
+    struct s2a_jv caps;
+    if (!alignment || (alignment & (alignment - 1)) || !gfx->profile_json ||
+        s2a_jv_obj_find((struct s2a_jv){gfx->profile_json, gfx->profile_bytes}, "capabilities", &caps) ||
+        jf_u32(caps, "storageBufferOffsetAlignment", &profile_alignment) || profile_alignment != alignment)
+        return lp_fail(why, why_size, "%s %s device/profile SSBO alignments differ", contract->key, contract->json_name);
+    if (jf_u32(top, "ssbo_window_mask", &id) || lp_fix_ssbo_window_mask(spv, n, id, alignment))
+        return lp_fail(why, why_size, "%s %s invalid SSBO window mask", contract->key, contract->spv_name);
+    return 0;
+}
+
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
 static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
-                         uint32_t shared_limit,
+                         uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
                          uint32_t *support_bytes, int *uses_v2, struct lp_stage_contract *contract,
                          char *why, size_t why_size) {
@@ -843,6 +918,10 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             { lp_fail(why, why_size, "%s %s gs_input_topology is not %d", khex, jname, gs_topology); goto done; }
         if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
             { lp_fail(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
+        if (!compute) {
+            int window = lp_stage_ssbo_window(top, gfx, spv, sn, contract, why, why_size);
+            if (window != 0) { out = window; goto done; }
+        }
         {   char cw[128] = ""; const size_t sn0 = sn; const uint64_t il0 = s2a_libpack_interlock_dropped();
             if (s2a_libpack_spv_admit_caps(spv, &sn, cw, sizeof cw)) { lp_fail(why, why_size, "%s %s %s", khex, sname, cw); goto done; }
             if (s2a_libpack_interlock_dropped() != il0 && !atomic_exchange(&lp->ilk_said, 1))   // 每局首次一行具名红，之后只计数
@@ -991,7 +1070,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     for (unsigned nvn = 0, idx = 0; nvn < sizeof contracts / sizeof contracts[0] && idx < LP_NVN_STAGES; nvn++) {
         if (!(stages & (1u << nvn))) continue;
         char sw[192] = "";
-        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, &st, &bd, &sep, &got, &support, &uses_v2,
+        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, gfx, &st, &bd, &sep, &got, &support, &uses_v2,
                                &contracts[nvn], sw, sizeof sw);
         idx++;
         if (rc == 0) continue;
@@ -1057,7 +1136,7 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     int sep = 0, uses_v2 = 0; uint32_t got = 0;
     uint32_t csupport = 0;
     struct lp_stage_contract contract = {0};
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, NULL, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0 && uses_v2) rc = lp_finish_v2_bindings(&contract, &bd, &sep, 1, why, why_size);
     if (rc == 0) {

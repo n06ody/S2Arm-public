@@ -373,6 +373,30 @@ static int c0_program(const char *vs_json, const void *vs_spv, size_t vs_n, cons
     s2a_libpack_close(lp);
     return rc;
 }
+// 存储缓冲窗口准入：写一份带窗口合同（ssbo_window_abi:1，无掩码）的 vs+fs 容器，按给定绘制事实合成。返回 s2a_libpack_program_v1 的 rc。
+static int window_program(const struct s2a_libpack_gfx *gfx, uint8_t **j, size_t *jl, char *why, size_t why_size) {
+    char vs[1500], ps[600];
+    snprintf(vs, sizeof vs, "%.*s,\"ssbo_window_abi\":1}", (int)strlen(VS_JSON) - 1, VS_JSON);
+    snprintf(ps, sizeof ps, "%.*s,\"ssbo_window_abi\":1}", (int)strlen(PS_JSON) - 1, PS_JSON);
+    struct trec r[4] = {
+        { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(vs) },
+        { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)sizeof libpack_vert_spv },
+        { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(ps) },
+        { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)sizeof libpack_frag_spv },
+    };
+    const uint8_t *p[4] = { (const uint8_t *)vs, libpack_vert_spv, (const uint8_t *)ps, libpack_frag_spv };
+    size_t n[4] = { strlen(vs), sizeof libpack_vert_spv, strlen(ps), sizeof libpack_frag_spv };
+    uint8_t keys[6][8] = {{0}};
+    const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }, kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
+    memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
+    if (mk_pack(r, 4, p, n, 1)) return -9;
+    struct s2a_libpack *lp = NULL;
+    if (s2a_libpack_open(&lp, g_dir) != 1 || !lp) return -9;
+    *j = NULL; *jl = 0;
+    int rc = s2a_libpack_program_v1(lp, keys, 0x3, gfx, 1, "h", "c", j, jl, why, why_size);
+    s2a_libpack_close(lp);
+    return rc;
+}
 // 把 c0 片元 SPIR-V 改成「不能证实」的几种：0 = Block 改 BufferBlock（旧式存储缓冲）、1 = Uniform 存储类改 StorageBuffer、2 = 描述符集改 1、
 //   3 = 输出变量 o 也带 Binding 22（同一绑定号两个变量，指不出是哪一个）
 static void c0_patch_spv(uint32_t *w, size_t nw, int what) {
@@ -1321,6 +1345,19 @@ int main(void) {
         if (rc != 0) printf("  vs c0 bank 0: rc=%d why=%s\n", rc, w);
         CHECK(rc == 0 && has(j, "\"kind\":\"uniform\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"slot\":0}"), "graphics vs c0 bank 0 → uniform binding 6 slot 0");
         free(j); j = NULL;
+        // 存储缓冲窗口准入：有合同、无掩码、带存储缓冲（vp_s0）的段——基址对齐照用，非对齐才拒（缺补偿）
+        {
+            const struct s2a_libpack_gfx aligned = { NULL, NULL, 0, 64, 0 }, unaligned = { NULL, NULL, 0, 64, 1 };
+            w[0] = 0;
+            rc = window_program(&aligned, &j, &jl, w, sizeof w);
+            if (rc != 0) printf("  window aligned: rc=%d why=%s\n", rc, w);
+            CHECK(rc == 0 && j, "ssbo window: aligned state, ABI 1, no mask, sbuf → HIT (library used as before)");
+            free(j); j = NULL;
+            w[0] = 0;
+            rc = window_program(&unaligned, &j, &jl, w, sizeof w);
+            CHECK(rc == -1 && !j && strstr(w, "SBUFP uses a fixed SSBO window"), "ssbo window: unaligned state, same library → REJECT by name (no compensation)");
+            free(j); j = NULL;
+        }
         // 负控：异 bank
         for (unsigned bank = 2; bank <= 3; bank++) {
             snprintf(ps, sizeof ps, PS_C0_FMT, bank, bank, 3u);
@@ -1435,7 +1472,7 @@ int main(void) {
         const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
         const uint8_t kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8); memset(keys[2], 0x60, 8);   // 紧排：vs / fs / gs（NVN 位序 0 / 1 / 2）
-        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
 
         // 命中：三段齐、gs 绑定号 = arg×6+3、宿主解析出第 2 段（gs）
@@ -1467,18 +1504,18 @@ int main(void) {
 
         // 设备没开 geometryShader（profile 同字段 false）：照旧 miss，不合成
         uint64_t m0 = s2a_libpack_misses();
-        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF) };
+        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF), 0, 0 };
         w[0] = 0;
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &tri_off, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j
               && strstr(w, "geometryShader"), "geometryShader 没开 → MISS（原因写明）");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, NULL, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "没给绘制事实（gfx = NULL）→ 几何程序 MISS");
-        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0 };
+        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0, 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &noprof, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "profile 读不出 → 按没开 MISS");
         // 图元：线输入没有 _vg1 → miss；邻接离线不出 → miss
-        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
-        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
+        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &lines, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "线输入、库里只有三角那份 → MISS");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &adj, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
