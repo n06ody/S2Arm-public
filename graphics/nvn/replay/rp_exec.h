@@ -189,6 +189,9 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_strid
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
+struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
+void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里

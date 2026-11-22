@@ -13,7 +13,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 20, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 21, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
@@ -104,6 +104,8 @@ SIG(nvn_gpu_draw, void (*)(nvn_gpu_cmd, const nvn_gpu_draw_args *));
 SIG(nvn_gpu_dispatch, void (*)(nvn_gpu_cmd, nvn_gpu_pipe, uint32_t, uint32_t, uint32_t, nvn_gpu_buf, uint64_t));
 SIG(nvn_gpu_copy_buf, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, nvn_gpu_buf, uint64_t, uint64_t));
 SIG(nvn_gpu_copy_bufs_uniform, void (*)(nvn_gpu_cmd, const nvn_gpu_buf_copy *, uint32_t, uint32_t));
+SIG(nvn_gpu_readback_enabled, int (*)(void));
+SIG(nvn_gpu_readback_record, uint64_t (*)(nvn_gpu_cmd, nvn_gpu_readback_span *, uint32_t));
 SIG(nvn_gpu_fill_buf, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, uint32_t));
 SIG(nvn_gpu_copy_buf_tex, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, uint64_t, uint64_t, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *));
 SIG(nvn_gpu_copy_tex_buf, void (*)(nvn_gpu_cmd, nvn_gpu_tex, uint32_t, uint32_t, const NVNcopyRegion *, nvn_gpu_buf, uint64_t, uint64_t, uint64_t));
