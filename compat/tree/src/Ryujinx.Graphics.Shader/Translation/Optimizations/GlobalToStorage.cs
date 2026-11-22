@@ -52,6 +52,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
     static class GlobalToStorage
     {
+        private static Operand StorageWindowMask(IGpuAccessor gpuAccessor) =>
+            gpuAccessor.QueryS2ALateStorageBufferAlignment()
+                ? new Operand(OperandType.StorageWindowMask, 0)
+                : Const(-gpuAccessor.QueryHostStorageBufferOffsetAlignment());
+
         private const int DriverReservedCb = 0;
 
         enum LsMemoryType
@@ -586,9 +591,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             if (gpuAccessor.QueryHasUnalignedStorageBuffer())
             {
-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
-
-                windowStart = context.BitwiseAnd(baseAddressLow, Const(-alignment));
+                windowStart = context.BitwiseAnd(baseAddressLow, StorageWindowMask(gpuAccessor));
             }
 
             Operand offset = context.ISubtract(globalAddressLow, windowStart);
@@ -786,9 +789,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 SearchResult result = new(sbCbSlot, sbCbOffset);
 
-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
-
-                Operand baseAddressMasked = context.BitwiseAnd(baseAddrLow, Const(-alignment));
+                Operand baseAddressMasked = context.BitwiseAnd(baseAddrLow, StorageWindowMask(gpuAccessor));
                 Operand hostOffset = context.ISubtract(globalAddressLow, baseAddressMasked);
 
                 if (!clamp)
@@ -1604,9 +1605,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 Operand baseAddressMasked = Local();
                 Operand hostOffset = Local();
 
-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
-
-                Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, Const(-alignment));
+                Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, StorageWindowMask(gpuAccessor));
                 Operation subOp = new(Instruction.Subtract, hostOffset, globalAddress, baseAddressMasked);
 
                 node.List.AddBefore(node, maskOp);
