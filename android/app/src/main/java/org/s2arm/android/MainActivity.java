@@ -34,6 +34,7 @@ public class MainActivity extends Activity
     private TouchPadView touchPad;      // on-screen gamepad over the surface
     private String touchMode = "auto";  // auto: shown unless a physical gamepad is connected
     private boolean touchLog;           // debug: log every change of the published input
+    private TouchTrace touchTrace;
     private TouchLayoutStore touchLayouts;   // the player's layout for this game (P11)
     private LinearLayout touchEditBar;       // Save / Default / Cancel while dragging controls
     private static final String PREF_TOUCH_PASSTHROUGH = "touchPassthrough.";   // + layout file name: per game
@@ -249,6 +250,9 @@ public class MainActivity extends Activity
         if (runtimeLoaded) {
             touchPad = new TouchPadView(this, new TouchPadView.Listener() {
                 @Override public void onTouchPad(boolean fromInputEvent) { publishInput(fromInputEvent); }
+                @Override public void onTouchLayoutTrace(String layout, String input) {
+                    if (BuildConfig.DEBUG && touchTrace != null) touchTrace.record(layout, input);
+                }
                 @Override public void onTouchMenu() { showTouchMenu(); }
             });
             root.addView(touchPad, new FrameLayout.LayoutParams(
@@ -1017,6 +1021,12 @@ public class MainActivity extends Activity
         if (touch != null) { touchMode = touch; updateTouchPad(); }
         if (intent != null && intent.hasExtra("s2arm.touchlog")) {
             touchLog = "on".equals(intent.getStringExtra("s2arm.touchlog"));
+            if (BuildConfig.DEBUG) {
+                touchTrace = touchLog && gameMode && DebugGate.open()
+                    ? TouchTrace.open(getFilesDir(), android.os.Process.myPid(),
+                        error -> Log.w("S2Arm", "Private touch trace unavailable", error))
+                    : null;
+            }
             touchPad.setTrace(touchLog);
         }
         updateGamepadMapping(intent);
@@ -1457,10 +1467,14 @@ public class MainActivity extends Activity
             if (magnitude(t.rightX(), t.rightY()) > magnitude(rx, ry)) { rx = t.rightX(); ry = t.rightY(); }
         }
         if (touchLog) {
-            if (fromInputEvent && touchPad != null)
-                touchPad.pad().traceInput((buttons | lx | ly | rx | ry) != 0);
             String line = String.format(java.util.Locale.ROOT, "input: buttons=0x%04x L=(%d,%d) R=(%d,%d)", buttons, lx, ly, rx, ry);
-            if (!line.equals(lastInputLog)) { Log.i("S2Arm", line); lastInputLog = line; }
+            boolean paired = fromInputEvent && touchPad != null && (buttons | lx | ly | rx | ry) != 0
+                && touchPad.pad().traceInput(line);
+            if (!line.equals(lastInputLog)) {
+                if (BuildConfig.DEBUG && touchTrace != null && !paired) touchTrace.record(null, line);
+                Log.i("S2Arm", line);
+                lastInputLog = line;
+            }
         }
         if (host != 0) NativeBridge.input(buttons, lx, ly, rx, ry);
     }

@@ -5,7 +5,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * On-screen gamepad state: layout and multi-touch tracking, no Android types (unit-tested).
@@ -58,7 +58,7 @@ final class TouchPad {
     private TouchLayout custom;              // null: Android's built-in layout for the current box
     private TouchLayout current;
     private int layoutGeneration;
-    private Consumer<String> layoutTrace;
+    private BiConsumer<String, String> layoutTrace;
     private boolean layoutTracePendingInput;
     private final float[] box = new float[4];
 
@@ -77,7 +77,7 @@ final class TouchPad {
     float[] box() { return box.clone(); }
 
     /** Publish the current layout on enable, then publish each completed generation. */
-    void setLayoutTrace(Consumer<String> trace) {
+    void setLayoutTrace(BiConsumer<String, String> trace) {
         boolean changed = (layoutTrace == null) != (trace == null);
         layoutTrace = trace;
         if (changed) traceLayout();
@@ -85,17 +85,18 @@ final class TouchPad {
 
     private void traceLayout() {
         layoutTracePendingInput = layoutTrace != null && current != null;
-        if (layoutTracePendingInput) logLayout();
+        if (layoutTracePendingInput) logLayout(null);
     }
 
     /** The collector may miss startup logs. Replay the current layout once on live input. */
-    void traceInput(boolean active) {
-        if (!active || !layoutTracePendingInput) return;
+    boolean traceInput(String activeInput) {
+        if (activeInput == null || !layoutTracePendingInput) return false;
         layoutTracePendingInput = false;
-        logLayout();
+        logLayout(activeInput);
+        return true;
     }
 
-    private void logLayout() {
+    private void logLayout(String input) {
         StringBuilder line = new StringBuilder("touchpad layout:");
         for (Control c : controls) {
             String name = c.label;
@@ -103,7 +104,7 @@ final class TouchPad {
             if (c.kind == DPAD) name = "DPAD";
             line.append(String.format(Locale.ROOT, " %s=(%.0f,%.0f,r%.0f)", name, c.x, c.y, c.radius));
         }
-        layoutTrace.accept(line.append(" generation=").append(layoutGeneration).toString());
+        layoutTrace.accept(line.append(" generation=").append(layoutGeneration).toString(), input);
     }
 
     /**

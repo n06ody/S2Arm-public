@@ -47,7 +47,7 @@ public final class TouchPadTest {
         List<String> lines = new ArrayList<>();
         late.layout(0, 0, 2400, 1080);
         check(lines.isEmpty(), "trace off is silent");
-        late.setLayoutTrace(lines::add);
+        late.setLayoutTrace((layout, input) -> lines.add(layout));
         check(lines.size() == 1, "layout before enable: one immediate snapshot");
         if (!lines.isEmpty()) {
             String line = lines.get(0);
@@ -55,7 +55,7 @@ public final class TouchPadTest {
                     && line.split("=\\(").length - 1 == 15 && line.endsWith(" generation=1"),
                     "complete snapshot preserves the layout log format and includes its generation");
         }
-        late.setLayoutTrace(lines::add);
+        late.setLayoutTrace((layout, input) -> lines.add(layout));
         late.down(1, 2232, 605);
         check(late.buttons() == 1, "trace leaves input unchanged");
         late.up(1);
@@ -64,16 +64,16 @@ public final class TouchPadTest {
         late.setLayoutTrace(null);
         late.layout(0, 0, 1600, 1200);
         check(lines.size() == 1, "relayout while trace is off is silent");
-        late.setLayoutTrace(lines::add);
+        late.setLayoutTrace((layout, input) -> lines.add(layout));
         check(lines.size() == 2 && lines.get(1).contains("RSTICK=(1168,960,r144)")
                 && lines.get(1).endsWith(" generation=2"), "re-enable: one current snapshot");
         late.setLayoutTrace(null);
-        late.setLayoutTrace(lines::add);
+        late.setLayoutTrace((layout, input) -> lines.add(layout));
         check(lines.size() == 3 && lines.get(2).equals(lines.get(1)), "reopen trace requests the current generation");
 
         TouchPad early = new TouchPad();
         lines.clear();
-        early.setLayoutTrace(lines::add);
+        early.setLayoutTrace((layout, input) -> lines.add(layout));
         check(lines.isEmpty(), "enable before layout: no empty snapshot");
         early.layout(0, 0, 2400, 1080);
         check(lines.size() == 1 && lines.get(0).endsWith(" generation=1"),
@@ -86,8 +86,13 @@ public final class TouchPadTest {
     private static void startupLayoutLogLoss() {
         TouchPad pad = new TouchPad();
         List<String> lines = new ArrayList<>();
-        pad.setLayoutTrace(lines::add);
-        pad.traceInput(true);
+        List<String> inputs = new ArrayList<>();
+        pad.setLayoutTrace((layout, input) -> {
+            lines.add(layout);
+            if (input != null) inputs.add(input);
+        });
+        String active = "input: buttons=0x0001 L=(0,0) R=(0,0)";
+        pad.traceInput(active);
         check(lines.isEmpty(), "input before layout does not emit an empty snapshot");
         pad.layout(0, 0, 2400, 1080);
         check(lines.size() == 1, "startup snapshot logged");
@@ -95,25 +100,26 @@ public final class TouchPadTest {
 
         // The collector misses startup logs but starts receiving before the user moves a stick.
         lines.clear();
-        pad.traceInput(false);
+        pad.traceInput(null);
         check(lines.isEmpty(), "neutral input does not replay or consume the snapshot");
-        pad.traceInput(true);
+        pad.traceInput(active);
         check(lines.equals(List.of(startup)), "surviving first active input carries the full startup snapshot");
-        pad.traceInput(true);
-        pad.traceInput(false);
+        check(inputs.equals(List.of(active)), "first input text and its layout are passed together");
+        pad.traceInput(active);
+        pad.traceInput(null);
         check(lines.size() == 1, "later inputs do not replay the same layout");
 
         pad.layout(0, 0, 1600, 1200);
-        pad.traceInput(true);
+        pad.traceInput(active);
         check(lines.size() == 3 && lines.get(1).equals(lines.get(2))
                 && lines.get(2).endsWith(" generation=2"), "first active input also replays the latest generation");
         pad.layout(0, 0, 2400, 1080);
         int beforeDisable = lines.size();
         pad.setLayoutTrace(null);
-        pad.traceInput(true);
+        pad.traceInput(active);
         check(lines.size() == beforeDisable, "disabling trace cancels the input replay");
-        pad.setLayoutTrace(lines::add);
-        pad.traceInput(true);
+        pad.setLayoutTrace((layout, input) -> lines.add(layout));
+        pad.traceInput(active);
         check(lines.size() == beforeDisable + 2
                 && lines.get(lines.size() - 1).endsWith(" generation=3"), "reopening trace arms the current layout");
     }

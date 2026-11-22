@@ -16,6 +16,7 @@ import android.view.View;
 final class TouchPadView extends View {
     interface Listener {
         void onTouchPad(boolean fromInputEvent);
+        default void onTouchLayoutTrace(String layout, String input) { }
         /** Exactly four fingers held for MENU_HOLD_MS (the iOS gesture): the in-game touch menu. */
         default void onTouchMenu() { }
     }
@@ -62,7 +63,10 @@ final class TouchPadView extends View {
     void setTrace(boolean enabled) {
         trace = enabled;
         TouchInputBridge.touchTrace(enabled);
-        pad.setLayoutTrace(enabled ? line -> android.util.Log.i("S2Arm", line) : null);
+        pad.setLayoutTrace(enabled ? (layout, input) -> {
+            android.util.Log.i("S2Arm", layout);
+            listener.onTouchLayoutTrace(layout, input);
+        } : null);
     }
 
     boolean gameTouchEnabled() { return gameTouch.enabled(); }

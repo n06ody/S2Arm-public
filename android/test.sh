@@ -244,6 +244,11 @@ s2a_gate_step javac -encoding UTF-8 -d "$out/java" -cp "$out/java" \
 s2a_gate_step java -cp "$out/java" org.s2arm.android.TouchPadTest "$repo_dir/ios/layouts/classic-reference.json"
 s2a_gate_step java -cp "$out/java" org.s2arm.android.TouchPadDpadEdgeTest
 s2a_gate_step java -cp "$out/java" org.s2arm.android.TouchRoutingTest
+s2a_gate_step javac -encoding UTF-8 -d "$out/java" -cp "$out/java" \
+    "$android_dir/app/src/main/java/org/s2arm/android/ProcessBirth.java" \
+    "$android_dir/app/src/debug/java/org/s2arm/android/TouchTrace.java" \
+    "$android_dir/tests/TouchTraceTest.java"
+s2a_gate_step java -cp "$out/java" org.s2arm.android.TouchTraceTest "$out/java"
 # 触屏菜单文案：英文默认和 values-zh 必须成对，MainActivity 不再硬编码（#528 第 11 项）
 s2a_gate_step "$PY" "$android_dir/tests/touch_strings_test.py"
 s2a_gate_step javac -encoding UTF-8 -d "$out/java" \
