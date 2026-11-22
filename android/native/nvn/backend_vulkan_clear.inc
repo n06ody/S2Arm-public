@@ -106,7 +106,7 @@ static const uint32_t k_clr_fs_i[118] = {
 };
 
 enum { CLR_MAX = 48 };
-struct clr_key { uint32_t cfmt[8], dsfmt, samples; int32_t slot; uint32_t kind, cmask, depth, stencil; };   // slot = -1：不清颜色；depth / stencil：这一笔清不清深度 / 模板
+struct clr_key { uint32_t cfmt[8], dsfmt, samples; int32_t slot; uint32_t kind, cmask, depth, stencil, nvnbar; };   // slot = -1：不清颜色；depth / stencil：这一笔清不清深度 / 模板
 struct clr_pipe_temp { struct clr_key k; VkPipeline pipe; VkRenderPass pass; struct clr_pipe_temp *next; };
 static struct {
     VkShaderModule vs, fs[3][8];
@@ -183,6 +183,7 @@ static VkPipeline clr_pipe_get(struct nvn_gpu_cmd_s *c, const struct clr_key *k)
     memcpy(pd.cfmt, k->cfmt, sizeof pd.cfmt);
     pd.dfmt = k->dsfmt;
     pd.samples = k->samples;
+    pd.nvnbar = (uint8_t)k->nvnbar;
     VkRenderPass pass = make_pipeline_pass(&pd);
     if (!pass) return VK_NULL_HANDLE;
 
@@ -246,6 +247,7 @@ static void clr_draw(struct nvn_gpu_cmd_s *c, int slot, uint32_t cmask, const vo
     struct clr_key k;
     memset(&k, 0, sizeof k);
     memcpy(k.cfmt, c->pass_cfmt, sizeof k.cfmt);
+    k.nvnbar = c->nvnbar;   // 清除管线在此段的游戏通道内使用，与实际通道同档。
     k.dsfmt = c->pass_dsfmt; k.samples = c->pass_samples; k.slot = slot; k.cmask = slot >= 0 ? cmask : 0; k.depth = do_depth != 0; k.stencil = smask != 0;
     if (slot >= 0) { nvn_fmt_info fi; k.kind = nvn_fmt_info_of(c->pass_cfmt[slot], &fi) ? (fi.kind == NVN_FMT_UINT ? 1u : fi.kind == NVN_FMT_SINT ? 2u : 0u) : 0u; }
     pthread_mutex_lock(&g_clr_mu);

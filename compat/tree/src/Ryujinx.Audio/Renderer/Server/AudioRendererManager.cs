@@ -182,17 +182,25 @@ namespace Ryujinx.Audio.Renderer.Server
         /// </summary>
         private void StartLocked()
         {
-            _isRunning = true;
-
-            // TODO: virtual device mapping (IAudioDevice)
-            Processor.Start(_deviceDriver);
-
-            _workerThread = new Thread(SendCommands)
+            try
             {
-                Name = "AudioRendererManager.Worker",
-            };
+                // TODO: virtual device mapping (IAudioDevice)
+                Processor.Start(_deviceDriver);
 
-            _workerThread.Start();
+                Thread worker = new(SendCommands)
+                {
+                    Name = "AudioRendererManager.Worker",
+                };
+                _isRunning = true;
+                worker.Start();
+                _workerThread = worker;
+            }
+            catch
+            {
+                _isRunning = false;
+                Processor.Stop();
+                throw;
+            }
         }
 
         /// <summary>
@@ -202,7 +210,8 @@ namespace Ryujinx.Audio.Renderer.Server
         {
             _isRunning = false;
 
-            _workerThread.Join();
+            _workerThread?.Join();
+            _workerThread = null;
             Processor.Stop();
 
             Logger.Info?.Print(LogClass.AudioRenderer, "Stopped audio renderer");
@@ -235,6 +244,7 @@ namespace Ryujinx.Audio.Renderer.Server
         /// </summary>
         private void SendCommands()
         {
+            _deviceDriver.GetRealDeviceDriver().S2AConfigureRenderThread();
             Logger.Info?.Print(LogClass.AudioRenderer, "Starting audio renderer");
 
             // S2Arm: this thread runs the 5 ms period loop (and the DSP itself when inline, the default): real-time scheduling,
@@ -394,9 +404,16 @@ namespace Ryujinx.Audio.Renderer.Server
 
             if (result == ResultCode.Success)
             {
-                renderer = audioRenderer;
-
-                Register(renderer);
+                try
+                {
+                    Register(audioRenderer);
+                    renderer = audioRenderer;
+                }
+                catch
+                {
+                    audioRenderer.Dispose();
+                    throw;
+                }
             }
             else
             {

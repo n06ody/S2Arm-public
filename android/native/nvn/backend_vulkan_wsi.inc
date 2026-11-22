@@ -436,9 +436,24 @@ static int wsi_compose_selected(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_
     return *upscaled ? 1 : wsi_compose_blit(c, s, idx, st, d, fp, encode, target);
 }
 
+static VkResult wsi_end_recording(nvn_gpu_cmd c, int ok, int has_segment) {
+    const int submit = ok && has_segment;
+    if (submit) narrow_commit_end(c);
+    else narrow_detach(c);
+    pre_detach(c);
+    if (c->gap_tag) {
+        if (submit) {
+            gap_main_end(c);
+            if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
+        } else gap_unbind_main(c);
+    }
+    return !ok ? VK_ERROR_UNKNOWN : !has_segment ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
+}
+
 nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const nvn_gpu_present_desc *d, uint64_t ticket,
                            nvn_gpu_presented_fn presented, void *user, nvn_gpu_err *err) {
     nvn_gpu_err local; if (!err) err = &local;
+    g_att_probe = 0;   // 首帧附件体检（backend_vulkan.c pass_begin）：第一帧上屏后不再打
     nvn_gpu_rc out = rc(NVN_GPU_OK);
     nvn_gpu_shown shown = {ticket, NVN_GPU_SHOWN_DROPPED, 0.0};
     nvn_gpu_cmd ch = NULL;
@@ -574,7 +589,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     struct vk_segment *seg = calloc(1, sizeof *seg);
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
+    VkResult r = wsi_end_recording(c, ok, seg != NULL);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
     pthread_mutex_lock(&g_submit_mu);
     if (r == VK_SUCCESS) {
@@ -586,7 +601,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
-        r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        r = si.commandBufferCount ? gap_queue_submit(seg, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);
@@ -600,6 +615,9 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     s->acquire_pending[sem] = 0;   // 这把信号量已交给呈现段去等
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
+    narrow_wsi_tick(seg);
+    gap_wsi_record(seg);
+    pre_wsi_tick(seg, 0);
     enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];

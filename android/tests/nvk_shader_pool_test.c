@@ -7,6 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
+#include <time.h>
 #include "nvn.h"
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -15,12 +17,14 @@
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "direct/compile_request.h"
+#include "direct/compile_worker.h"
 #include "direct/input_identity.h"
 #include "direct/source_store.h"
 #include "direct/sha256.h"
 #include "direct/s2a_direct.h"
 #include "../../runtime/include/s2a_direct_host.h"
 #include "direct/jv.h"
+#include "direct/spirv_storage.h"   // s2a_spirv_declares_cap：int16 夹具与红名判据同一个函数
 #include "direct/program_cache.h"
 #include "nvn/nvn_vk_prog_warm.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：出包预编库目录 b-<链>-vk 与容器头的链号
@@ -31,6 +35,9 @@
 
 // 实现在 nvk_shader.c，声明在 nvk_session.h。这里不包 nvk_session.h：nvk_compile_stop_test.py 拿本文件当夹具，
 // 会在同一个翻译单元里把 nvk_session_request_stop 等会话函数定义成 static，包了头就是「static 声明跟在非 static 声明后面」，编不过。
+int nvk_shader_open(void);
+void nvk_shader_stop(void);
+unsigned nvk_shader_inflight(void);
 uint64_t nvk_shader_cs_fast_hits(void);
 int nvk_shader_last_allocated(void);
 void nvk_shader_last_test_put(uint64_t key, const struct rp_prog *prog);
@@ -55,7 +62,38 @@ static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, sha
 static int fake_cs_success, cs_loads;
 int g_s2a_logfd = 2;
 static const char *fake_compile_error;
+static int fake_i16_result, fake_no_int16;   // #1774② int16 夹具：结果给 Int16 模块 + 设备桩没 shaderInt16
 static const char *fake_compile_file;
+static pthread_t last_compiler_thread;
+static int fixture_live_compile, fixture_live_frame_ms = 100, fixture_live_unsafe_ms = 10000;
+static pthread_mutex_t live_gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t live_gate_cv = PTHREAD_COND_INITIALIZER;
+static int live_gate_hold, live_gate_entered;
+static void live_gate_pause(void) {
+    pthread_mutex_lock(&live_gate_mu);
+    if (live_gate_hold) {
+        live_gate_entered = 1;
+        pthread_cond_broadcast(&live_gate_cv);
+        while (live_gate_hold) pthread_cond_wait(&live_gate_cv, &live_gate_mu);
+    }
+    pthread_mutex_unlock(&live_gate_mu);
+}
+static int live_gate_wait(void) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&live_gate_mu);
+    while (!live_gate_entered) if (pthread_cond_timedwait(&live_gate_cv, &live_gate_mu, &deadline)) break;
+    int entered = live_gate_entered;
+    pthread_mutex_unlock(&live_gate_mu);
+    return entered;
+}
+static void live_gate_release(void) {
+    pthread_mutex_lock(&live_gate_mu);
+    live_gate_hold = 0;
+    pthread_cond_broadcast(&live_gate_cv);
+    pthread_mutex_unlock(&live_gate_mu);
+}
 static char captured[262144], last_red[512], last_diag[512], last_stats[512], last_reason[512], last_request_reason[512];
 static int ubo_default_lines; static char last_ubo_default_line[512];   // 常量缓冲句柄指向没登记的贴图：每局首次的那一行（片 4）
 static char reason_history[8192];
@@ -73,6 +111,9 @@ void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
+    if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
+    if (!strcmp(name, "fu_unsafe_ms")) return fixture_live_unsafe_ms;
     if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
@@ -157,10 +198,12 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
+    last_compiler_thread = pthread_self();
     CHECK(session == 4 && gen == 6, "compile session");
     CHECK(req.bytes < sizeof captured, "request fits capture");
     if (req.bytes >= sizeof captured) return -1;
     memcpy(captured, req.data, (size_t)req.bytes); captured[req.bytes] = 0; compiler_calls++;
+    live_gate_pause();
     if (fake_ubo_missing && !strstr(captured, "\"stage\":\"fs\",\"handle\":92,\"cbufSlot\":3,")) {
         static const char err[] = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"MISSING_FACT\",\"message\":\"QuerySamplerType has no source (stage=fs,handle=92,cbufSlot=3)\"}";
         s2a_direct_bytes payload = {(const uint8_t *)err, sizeof err - 1};
@@ -200,6 +243,14 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
         char result[8192];
         int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v%d\",\"content\":{\"contract\":\"s2a-direct-program-content-v%d\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],\"supportReads\":[],\"supportLayout\":{\"requiredSize\":16},\"stages\":[{\"stage\":\"cs\",\"spirv\":\"%s\"}],\"bindings\":%s}}", ver, ver, code, bindings);
         CHECK(n > 0 && (size_t)n < sizeof result, "compute result fixture fits");
+        s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
+        return emit(sink, payload);
+    }
+    if (fake_i16_result) {
+        // fs 段是「头 + OpCapability Int16」的最小模块；vs 沿用干净夹具模块（排在 fake_gs_success 之前才有用）
+        char result[1024];
+        int n = snprintf(result, sizeof result, "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"},{\"stage\":\"fs\",\"spirv\":\"AwIjBwADAQAAAAAAAQAAAAAAAAARAAIAFgAAAA==\"}],\"bindings\":[]}}");
+        CHECK(n > 0 && (size_t)n < sizeof result, "int16 result fixture fits");
         s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)n};
         return emit(sink, payload);
     }
@@ -248,7 +299,10 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
 }
 s2a_direct_compile_fn s2a_direct_bound_compile_any(void) { return fake_compile; }
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, nvn_gpu_err *e) {
-    (void)e;
+    if (fake_no_int16 && s2a_spirv_declares_cap(s->blob, s->bytes, 22) == 1) {
+        snprintf(e->why, sizeof e->why, "shaderInt16：设备没有 16 位整数，模块声明了 OpCapability Int16（stage %d）", (int)s->stage);
+        return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
+    }
     if (fake_gs_success && (unsigned)s->stage < 6) {
         shader_load_count++; gs_loads[s->stage]++; gs_blob_bytes[s->stage] = s->bytes; *o = (nvn_gpu_shader)(uintptr_t)(s->stage + 1); return (nvn_gpu_rc){NVN_GPU_OK};
     }
@@ -1484,6 +1538,127 @@ static int gs_libpack_test(void) {
     printf("nvk shader pool (libpack GS): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
+// ---- #1774②：三项未接能力计数（int16 / int64 / 几何程序写视口号）——程序数入 nvn_unimpl、首条红行带首个程序键；逐程序具名拒照旧。
+static void rc_bind2(uint8_t keys[2][8]) {   // 两阶段程序夹具（同 graphics_reject_context_test 口径）
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    for (unsigned st = 0; st < 2; st++) gs_source(st, 0, keys[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G');
+    gs_program.serial = 971; gs_program.nstage = 2;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned st = 0; st < 2; st++) { gs_stages[st] = (uint8_t)st; memcpy(gs_keys[st], keys[st], 8); }
+    gs_keys_ok = 3; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "reject-count program binds");
+    bind_pools(100);
+}
+static void hex8(char *out, const uint8_t k[8]) { for (int b = 0; b < 8; b++) snprintf(out + 2 * b, 3, "%02x", k[b]); }
+// lp_write 要求记录按 (键,种类) 升序——键值是大端摘要看不出大小，统一在这里插排
+static void rc_sort_lp(uint64_t key[], uint8_t kind[], const uint8_t *data[], size_t len[], int n) {
+    for (int i = 1; i < n; i++) {
+        uint64_t k = key[i]; uint8_t kd = kind[i]; const uint8_t *d = data[i]; size_t l = len[i]; int j = i - 1;
+        while (j >= 0 && (key[j] > k || (key[j] == k && kind[j] > kd))) { key[j+1] = key[j]; kind[j+1] = kind[j]; data[j+1] = data[j]; len[j+1] = len[j]; j--; }
+        key[j+1] = k; kind[j+1] = kd; data[j+1] = d; len[j+1] = l;
+    }
+}
+static int reject_count_test(void) {
+    uint8_t keys[2][8]; rc_bind2(keys);
+    char fshex[17]; hex8(fshex, keys[1]);
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+    // 1) int16：现编结果的 fs 段声明 Int16 + 设备桩没 shaderInt16 → 装填拒；int16_not_supported ×1、首行红带阶段键
+    fake_i16_result = 1; fake_no_int16 = 1; fake_gs_success = 1; fake_depth_clip = 1;   // depth_clip_cap 首次取到即定死，先给它 1 免得后两个 libpack 用例 lp_ok 归零
+    rp_shader_reset(); reject_log_reset(); last_red[0] = 0;
+    CHECK(rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1, "int16: compile result reaches load, load rejects (calls=%d)", compiler_calls);
+    CHECK(nvn_unimpl_count("shader", "int16_not_supported") == 1, "int16 count=%llu", (unsigned long long)nvn_unimpl_count("shader", "int16_not_supported"));
+    CHECK(strstr(last_red, fshex) != NULL, "int16 first red line carries the stage key: %s", last_red);
+    fake_i16_result = fake_no_int16 = fake_gs_success = 0;
+    // 2) 视口（现编）：编译器回 UNSUPPORTED_PROGRAM + viewport arrays → geometry_viewport_write ×1、首行红带程序键
+    rc_bind2(keys);
+    fake_compile_error = "{\"schema\":\"s2a-direct-error-v1\",\"code\":\"UNSUPPORTED_PROGRAM\",\"message\":\"gs: viewport arrays are not implemented\"}";
+    rp_shader_reset(); reject_log_reset(); last_red[0] = 0;
+    CHECK(rp_shader_resolve(&q, &p) != 0 && compiler_calls == 1, "viewport-jit: rejection reaches the host");
+    CHECK(nvn_unimpl_count("shader", "geometry_viewport_write") == 1, "viewport-jit count=%llu", (unsigned long long)nvn_unimpl_count("shader", "geometry_viewport_write"));
+    char want_key[40] = ""; { int o = 0; for (unsigned st = 0; st < 2; st++) hex8(want_key + o, keys[st]), o += 16; }
+    CHECK(strstr(last_red, want_key) != NULL, "viewport-jit first red line carries the program key: %s", last_red);
+    fake_compile_error = NULL;
+    // 3) int64（预编库）：fs 段 OpCapability Int64 + OpTypeInt 64 真用 → 收编拒 int64_type_used；
+    //    int64_not_supported ×1、首行红带 fs 键；程序退回现编照常解出
+    {
+        char root[256], dir[600];
+        snprintf(root, sizeof root, "%s/nvk_rc_i64.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        CHECK(mkdtemp(root) != NULL, "int64 libpack temp root");
+        snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+        snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+        snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+        static const uint32_t spv0[5] = {0x07230203u, 0x00010300u, 0, 1, 0};
+        static const uint32_t spv_i64[11] = {0x07230203u, 0x00010300u, 0, 1, 0, (2u << 16) | 17, 11, (4u << 16) | 21, 2, 64, 0};
+        char vhx[17], fhx[17]; hex8(vhx, keys[0]); hex8(fhx, keys[1]);
+        char jvs[160], jfs[160];
+        snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", vhx);
+        snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", fhx);
+        uint64_t k4[4] = {lp_key(keys[0]), lp_key(keys[0]), lp_key(keys[1]), lp_key(keys[1])};
+        uint8_t kd[4] = {1, 52, 1, 52};
+        const uint8_t *dt[4] = {(const uint8_t *)jvs, (const uint8_t *)spv0, (const uint8_t *)jfs, (const uint8_t *)spv_i64};
+        size_t ln[4] = {strlen(jvs), sizeof spv0, strlen(jfs), sizeof spv_i64};
+        rc_sort_lp(k4, kd, dt, ln, 4);
+        CHECK(!lp_write(dir, k4, kd, dt, ln, 4), "int64 libpack container written");
+        setenv("S2A_SHADER_REVISION_ROOT", root, 1); fake_depth_clip = 1; fake_gs_success = 1; fake_gs_result_mode = 1;
+        rp_shader_reset(); reject_log_reset(); last_red[0] = 0;
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 1, "int64-libpack: reject falls back to live compile (calls=%d)", compiler_calls);
+        CHECK(nvn_unimpl_count("shader", "int64_not_supported") == 1, "int64-libpack count=%llu", (unsigned long long)nvn_unimpl_count("shader", "int64_not_supported"));
+        CHECK(strstr(last_red, fhx) != NULL, "int64-libpack first red line carries the fs key: %s", last_red);
+        fake_gs_success = fake_depth_clip = fake_gs_result_mode = 0; unsetenv("S2A_SHADER_REVISION_ROOT");
+        char path[700];
+        snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
+        rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders/direct", root); rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders", root); rmdir(dir); rmdir(root);
+    }
+    // 4) 视口（预编库）：几何程序的 gs 段带 BuiltIn ViewportIndex → 收编拒 writes a viewport；
+    //    geometry_viewport_write ×1、首行红带 gs 键；程序退回现编照常解出
+    {
+        rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+        uint8_t k3[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k3[st]);
+        memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 972; gs_program.nstage = 3;
+        memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+        for (unsigned i = 0; i < 3; i++) { gs_stages[i] = (uint8_t)i; memcpy(gs_keys[i], k3[i], 8); }
+        gs_keys_ok = 7; p_bind_program_id b3 = {&gs_program, gs_program.serial, 0x1f, 0};
+        CHECK(rp_state_op(OP_BIND_PROGRAM, &b3, sizeof b3 + 8), "viewport libpack GS binds");
+        CHECK(rp_shader_graphics_stages() == 7, "viewport libpack stage mask 0x7");
+        bind_pools(7);
+        char root[256], dir[600];
+        snprintf(root, sizeof root, "%s/nvk_rc_vp.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        CHECK(mkdtemp(root) != NULL, "viewport libpack temp root");
+        snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+        snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+        snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+        static const uint32_t spv0[5] = {0x07230203u, 0x00010300u, 0, 1, 0};
+        static const uint32_t spv_vp[9] = {0x07230203u, 0x00010300u, 0, 1, 0, (4u << 16) | 71, 9, 11, 10};
+        char hx[3][17]; for (int st = 0; st < 3; st++) hex8(hx[st], k3[st]);
+        char jvs[160], jfs[160], jg0[200], jg3[200];   // _vg0/_vg3 两档都写：程序拓扑串选哪档，哪档的 spv 拒
+        snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
+        snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[1]);
+        snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
+        snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+        uint64_t k8[8] = {lp_key(k3[0]), lp_key(k3[0]), lp_key(k3[1]), lp_key(k3[1]), lp_key(k3[2]), lp_key(k3[2]), lp_key(k3[2]), lp_key(k3[2])};
+        uint8_t kd[8] = {1, 52, 1, 52, 115, 123, 112, 120};   // LP_K_VGJSON=112+i / LP_K_VGSPV=120+i：_vg0=112/120、_vg3=115/123
+        const uint8_t *dt[8] = {(const uint8_t *)jvs, (const uint8_t *)spv0, (const uint8_t *)jfs, (const uint8_t *)spv0,
+                                (const uint8_t *)jg3, (const uint8_t *)spv_vp, (const uint8_t *)jg0, (const uint8_t *)spv_vp};
+        size_t ln[8] = {strlen(jvs), sizeof spv0, strlen(jfs), sizeof spv0, strlen(jg3), sizeof spv_vp, strlen(jg0), sizeof spv_vp};
+        rc_sort_lp(k8, kd, dt, ln, 8);
+        CHECK(!lp_write(dir, k8, kd, dt, ln, 8), "viewport libpack container written");
+        // GS 程序的预编库准入要 profile 开 supportsGeometryShader（s2a_libpack_profile_geometry_shader，与现编同判据）
+        static const char prof_gs[] = "{\"schema\":\"s2a-direct-profile-v1\",\"capabilities\":{\"supportsGeometryShader\":true}}";
+        snprintf(external_profile, sizeof external_profile, "%s", prof_gs);
+        setenv("S2A_SHADER_REVISION_ROOT", root, 1); fake_depth_clip = 1; fake_gs_success = 1;
+        rp_shader_reset(); reject_log_reset(); last_red[0] = 0;
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 1, "viewport-libpack: reject falls back to live compile (calls=%d)", compiler_calls);
+        CHECK(nvn_unimpl_count("shader", "geometry_viewport_write") == 1, "viewport-libpack count=%llu", (unsigned long long)nvn_unimpl_count("shader", "geometry_viewport_write"));
+        CHECK(strstr(last_red, hx[2]) != NULL, "viewport-libpack first red line carries the gs key: %s", last_red);
+        fake_gs_success = fake_depth_clip = 0; external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT");
+        char path[700];
+        snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
+        rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders/direct", root); rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders", root); rmdir(dir); rmdir(root);
+    }
+    printf("nvk shader pool (reject count): %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
 static int diag_compile_test(void) {
     trace_on = 1; trace_begin_count = trace_end_count = 0; fake_gs_success = 0;
     gs_request_test();
@@ -1497,9 +1672,102 @@ static int diag_compile_test(void) {
     printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
 }
 
+static int live_compile_thread_test(void) {
+    fixture_live_compile = -1;   // simulate an unset property and exercise the production default
+    CHECK(nvk_shader_open() == 0, "open shader session");
+    rp_state_reset(); source(); bind_pools(64);
+    fake_array_count = 64;
+    fake_cs_success = 1;
+    struct rp_shader_req q = {.prim = 4};
+    const struct rp_prog *graphics = NULL, *compute = NULL, *again = NULL;
+    int rc = rp_shader_resolve(&q, &graphics);
+    CHECK(rc == 0 && graphics && !graphics->is_compute && compiler_calls == 1,
+          "graphics first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
+    if (compiler_calls == 1)
+        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
+              "graphics live compiler ran on the submitting thread");
+    rc = rp_shader_resolve_compute(&compute);
+    CHECK(rc == 0 && compute && compute->is_compute && compiler_calls == 2,
+          "compute first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
+    if (compiler_calls == 2)
+        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
+              "compute live compiler ran on the submitting thread");
+    CHECK(rp_shader_resolve(&q, &again) == 0 && again == graphics && compiler_calls == 2,
+          "second graphics lookup reuses the published program");
+    CHECK(rp_shader_resolve_compute(&again) == 0 && again == compute && compiler_calls == 2,
+          "second compute lookup reuses the published program");
+    nvk_shader_stop(); rp_shader_reset(); s2a_source_clear();
+    printf("live-compile-thread checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+static int fixture_defer_frame(uint64_t *frame) {
+    *frame = 1;
+    return 1;
+}
+
+static int live_compile_pending_test(int stop) {
+    fixture_live_compile = 1;
+    fixture_live_frame_ms = 0;
+    fixture_live_unsafe_ms = stop ? 20 : 2000;
+    live_gate_hold = 1;
+    CHECK(nvk_shader_open() == 0, "open async session");
+    rp_state_reset(); source(); bind_pools(64); fake_array_count = 64;
+    struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    const struct rp_prog *p = NULL;
+    CHECK(rp_shader_resolve(&q, &p) == 1 && !p, "exhausted safe budget must defer, with no program");
+    CHECK(live_gate_wait(), "compiler is still gated on worker");
+    CHECK(rp_shader_resolve(&q, &p) == 1 && !p, "second use while pending must not publish a program");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == 1 && stats.pending == 2, "same pending request must enqueue once (enqueued=%llu pending=%llu)",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.pending);
+    q.compile_defer_frame = NULL;
+    if (stop) {
+        CHECK(rp_shader_resolve(&q, &p) < 0 && !p, "unsafe hard deadline must report failure, not skip or publish");
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.timeout == 1 && stats.pending == 0, "unsafe deadline must count timeout separately");
+        // Keep the active translator held while saturating the real worker queue.
+        for (unsigned i = 0; i < S2A_CW_QUEUE_MAX; i++) {
+            uint8_t filler_key[32] = {(uint8_t)i, 0xff};
+            CHECK(s2a_compile_worker_submit_async(1, 1, "{}", 2, filler_key, NULL, 0) == 0,
+                  "queue accepts filler %u while active compile is held", i);
+        }
+        fake_cs_success = 1;
+        CHECK(rp_shader_resolve_compute(&p) < 0 && !p, "full queue must fail a bounded compute first use explicitly");
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.timeout == 1 && stats.pending == 0 && stats.enqueued == 0,
+              "full queue must not count the rejected compute as queued or skippable");
+        CHECK(nvk_shader_inflight() == 1, "waiting resolver gone but worker retains session admission");
+        nvk_shader_stop();
+        CHECK(nvk_shader_open() < 0, "must not reopen while retired compile is still in provider");
+        live_gate_release();
+        CHECK(s2a_compile_worker_stop_bounded(2000, NULL, 0) == 0, "stopped worker eventually retires");
+        rp_shader_reset();
+        CHECK(nvk_shader_open() == 0, "session may reopen after old worker quiesces");
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 2,
+              "completion from stopped session must not satisfy the same request after reopen");
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && p->is_compute && compiler_calls == 3,
+              "a compute first use refused by the full queue must be admitted on retry");
+    } else {
+        live_gate_release();
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p && compiler_calls == 1,
+              "deferred result must be installed on re-use without recompiling");
+    }
+    nvk_shader_stop();
+    CHECK(s2a_compile_worker_stop_bounded(2000, NULL, 0) == 0, "stop retires worker");
+    rp_shader_reset(); s2a_source_clear();
+    printf("live-compile-%s checks=%d failures=%d\n", stop ? "stop" : "pending", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test();
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test();
+    if (argc == 2 && !strcmp(argv[1], "--reject-count")) return reject_count_test();   // 独立进程：depth_clip_cap 进程内定死一次，libpack 用例要在它取到 1 的状态跑
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
     if (argc == 2 && !strcmp(argv[1], "--legacy-bytes")) {

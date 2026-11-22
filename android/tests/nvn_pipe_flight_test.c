@@ -105,6 +105,21 @@ static void case_failure(void) {
     CHECK(fl == 1, "failure counted once");
 }
 
+// ⑦ 空对象不能当成功交付：建者错误发布 (NULL,0) → 等待者必须拿到具名失败而不是 NULL+OK
+//   （#1774：等待侧拿 NULL 管线往下走，成员偏移解引即崩——返回码必须拦住空对象）
+static void case_empty_publish(void) {
+    nvk_pf_init(&g_t, sizeof(pkey_t));
+    pkey_t k = {.key = 42};
+    int h1 = -1, h2 = -1;
+    CHECK(nvk_pf_enter(&g_t, &k, key_eq, &h1) == 1, "empty: owner");
+    CHECK(nvk_pf_enter(&g_t, &k, key_eq, &h2) == 2, "empty: waiter");
+    nvk_pf_publish(&g_t, h1, NULL, 0, NULL);   // 错误用法：成功码配空对象
+    void *obj = (void *)1; char why[NVK_PF_WHY] = "";
+    int code = nvk_pf_wait(&g_t, h2, &obj, why, sizeof why);
+    CHECK(code != 0 && obj == NULL, "empty: (NULL,0) publish must not hand out a null object as success (code=%d)", code);
+    CHECK(why[0], "empty: a named reason is attached");
+}
+
 // ④ 表满
 static void case_full(void) {
     nvk_pf_init(&g_t, sizeof(pkey_t));
@@ -152,6 +167,7 @@ int main(void) {
     case_merge();
     case_independent();
     case_failure();
+    case_empty_publish();
     case_full();
     case_late_hit();
     printf("%s：%d 项断言，%d 失败\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);

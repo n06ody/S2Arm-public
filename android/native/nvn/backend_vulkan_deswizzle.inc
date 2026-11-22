@@ -117,6 +117,7 @@ nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32
     VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = input.buf->buffer, .offset = input.off, .size = src_padded };
+    const struct pre_origin pre_saved = pre_origin(c, PRE_DESWIZZLE);
     vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
     uint32_t params[8] = { row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2, (uint32_t)linear };
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_deswizzle.pipe);
@@ -129,6 +130,7 @@ nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32
     es_reset(c); c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;
     NVNcopyRegion region = {0, 0, 0, (int)(t->w >> level ? t->w >> level : 1), (int)(t->h >> level ? t->h >> level : 1), (int)slices};
     copy_buf_tex_impl(c, output.buf, output.off, row, linear, t, level, layer, &region, COPY_FACE_DEFAULT, 1);
+    pre_origin_restore(c, pre_saved);
     if (rc_is(c->sticky, NVN_GPU_OK)) { __atomic_add_fetch(&g_deswizzle_count, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_deswizzle_bytes, raw, __ATOMIC_RELAXED); }
     return c->sticky;
 }

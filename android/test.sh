@@ -307,18 +307,23 @@ s2a_gate_step "$PY" "$android_dir/tests/vk_warm_seed_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链接闭包：自动补链 / 弱引用放行 / 无提供方点名红 / 替身优先
 # 新回放层：真实图形/计算请求生产入口的贴图池容量、超限与调试读数。
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
+# 三项未接能力计数（int16 / int64 / 几何写视口号，#1774②）：depth_clip_cap 进程内定死一次，libpack 用例在上面那步构建出的二进制上单独起一个进程
+s2a_gate_step "$repo_dir/build/nvk-shader-pool-test/test" --reject-count
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # 几何着色器走出包预编库的负对照（正例在上面无参那一步里单独起进程跑）：撤掉接线各一处，--gs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mutants
 # 计算程序预热（清单记账 / 阶段 / 从缓存建 / 开关）与现场编译诊断事件（图形 / 计算）的负对照：各撤一处，对应断言必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --live-compile-mutants
 # Shutdown admission, bounded waits and active-context retention (including negative controls).
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shutdown_test.py"
 # 上屏线程 CPU（rp_present.c，#1501 差距 9）：同线程配对 / 跨线程与时间倒退不计 / 首次只记起点 / 取走清零 / 会话清起点 / 上屏接线，6 个点变异各撤一处必红（纯宿主 C）
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/present_tc_mutation_test.py"
 # GS 脏位、阶段绑定、管线和原始图元拒绝的独立回退反证。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/gs_replay_mutation_test.py"
+# 落地期间显卡写区间里的页不进同步（rp_buf.c sync_run / gw_covers / land_restale）：修前（main 的 rp_buf.c）落地期间被盖住的页照样同步必红；按页拆 / 区间拼接 / 不布防 / 清旧位 / 撤登记置旧各撤一处必红（纯宿主 C）
+s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/land_noresync_mutation_test.py"
 # 写跟踪取范围（find_span）的有序索引（#1133）与池查找的线程内备忘（#974）：索引的排序 / 子树最大值 / 复查代际 / 写者纪律 / 上限与停用 / 备忘的键各处的撤改必红（纯宿主 C 编译）。
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/dirty_span_memo_mutation_test.py"
 # 存储缓冲槽长度语义：地址有效、长度 0 按硬件语义绑真实内存（池剩余长度，回写按它登记），没有可绑内存才绑空缓冲照画；5 个点变异各撤一处必红（纯宿主 C）
