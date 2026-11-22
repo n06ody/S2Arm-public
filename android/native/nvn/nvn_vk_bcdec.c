@@ -401,7 +401,7 @@ int nvn_vk_bcdec_prepare(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d, VkIma
     wr[1].descriptorCount = 1; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[1].pImageInfo = &ii;
     vkUpdateDescriptorSets(d->device, 2, wr, 0, NULL);
 
-    rec->pipe = bc->pipe[vi]; rec->pl = bc->pl; rec->bw = bw; rec->bh = bh;
+    rec->pipe = bc->pipe[vi]; rec->pl = bc->pl; rec->bw = bw; rec->bh = bh; rec->in_format = in_fmt;
     return 0;
 fail:
     snprintf(why, why_size, "bcdec: %s prepare resource setup failed", family);

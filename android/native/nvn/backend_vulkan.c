@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -55,6 +56,24 @@
 #if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
 #include "../capacity_affinity.h"
 #endif
+static _Atomic unsigned pre_active, pre_count_active;
+static void pre_op(VkCommandBuffer cb, unsigned op);
+static void pre_begin_pass(VkCommandBuffer cb, const VkRect2D *area, unsigned attachments, unsigned dynamic);
+static void pre_end_pass(VkCommandBuffer cb);
+static void pre_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
+                        uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b,
+                        uint32_t ni, const VkImageMemoryBarrier *im);
+static void pre_copy_buffer(VkCommandBuffer cb, uint32_t n, const VkBufferCopy *rg);
+static void pre_buffer_image(VkCommandBuffer cb, unsigned op, VkImage image, VkImageLayout layout,
+                             uint32_t n, const VkBufferImageCopy *rg);
+static void pre_copy_image(VkCommandBuffer cb, unsigned op, VkImage src, VkImageLayout sl,
+                           VkImage dst, VkImageLayout dl, uint32_t n, const void *regions, VkFilter filter);
+static void pre_clear(VkCommandBuffer cb, unsigned op, VkImage image, VkImageLayout layout, uint32_t n,
+                      const VkImageSubresourceRange *rg);
+static void pre_buffer_span(VkCommandBuffer cb, unsigned op, VkDeviceSize off, VkDeviceSize size);
+static void pre_dispatch(VkCommandBuffer cb, unsigned op, unsigned x, unsigned y, unsigned z, VkDeviceSize off);
+static void pre_image_add(VkImage image, VkFormat format, VkExtent3D extent);
+static void pre_image_del(VkImage image);
 static _Thread_local unsigned gap_registered;
 static void gap_before_op(VkCommandBuffer cb, unsigned op);
 static void gap_render_edge(VkCommandBuffer cb, int begin, int after);
@@ -298,6 +317,8 @@ enum { OCC_CHUNK = 256, OCC_QUERY_SPARE_MAX = 65536 };   // 遮挡查询的续�
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
 enum { ES_PIPE, ES_VP, ES_SC, ES_BC, ES_ST, ES_DB, ES_VB, ES_IB, ES_PUSH, ES_KINDS };
 struct vk_segment {
+    uint64_t pre_frame, pre_cpu_ns;
+    unsigned pre_phase, pre_frame_submits, pre_frame_pairs, pre_missing;
     uint64_t gap_tag, gap_cpu_submit, gap_cpu_return, gap_cpu_done;
     struct vk_segment *next;
     struct nvn_gpu_cmd_s *cmd;
@@ -324,7 +345,11 @@ struct feedback_copy {
 };
 
 struct gap_cmd;
+struct pre_record;
+struct pre_origin { unsigned kind, id; };
+enum { PRE_EXPLICIT, PRE_POOL, PRE_UPLOAD, PRE_DESWIZZLE, PRE_BC, PRE_TAIL };
 struct nvn_gpu_cmd_s {
+    struct pre_record *pre;
     struct gap_cmd *gap;
     uint64_t gap_tag;
     uint8_t gap_has_init;
@@ -501,6 +526,16 @@ struct nvn_gpu_vk {
 };
 
 static struct nvn_gpu_vk g;
+static void pre_open(void);
+static void pre_close(void);
+static void pre_cmd_begin(nvn_gpu_cmd c, const char *label);
+static void pre_cmd_free(nvn_gpu_cmd c);
+static void pre_detach(nvn_gpu_cmd c);
+static void pre_submitted(struct vk_segment *s, unsigned ncb);
+static void pre_wsi_tick(struct vk_segment *s, uint64_t now);
+static void pre_finish(const struct vk_segment *s, int failed);
+static struct pre_origin pre_origin(nvn_gpu_cmd c, unsigned kind);
+static void pre_origin_restore(nvn_gpu_cmd c, struct pre_origin origin);
 static void gap_open(void);
 static void gap_close(void);
 static void gap_cmd_begin(nvn_gpu_cmd c);
@@ -1953,6 +1988,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (c->bc_temps) vk_dq_drain();
     while (c->bc_temps) {
         struct bc_temp *b = c->bc_temps; c->bc_temps = b->next;
+        pre_image_del(b->rec.in);
         nvn_vk_bcdec_rec_free(g.dev, &b->rec);
         if (b->image) vkDestroyImage(g.d, b->image, NULL);
         if (b->memory) vkFreeMemory(g.d, b->memory, NULL);
@@ -1965,6 +2001,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->staging);
     free(c->pass_capture);
     gap_cmd_free(c);
+    pre_cmd_free(c);
     free(c);
 }
 
@@ -2065,6 +2102,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     }
 
     gap_segment_done(s, failed);
+    pre_finish(s, failed);
     if (!s->internal && (failed || !sampled)) pass_capture_segment(vk->pass_capture, NULL, NULL, 0, s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         pass_capture_frame(vk, s, failed);
@@ -2457,6 +2495,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(&g, 0, sizeof g);
     g.dev = dev;
     gap_open();
+    pre_open();
     nvnbar_open();
     g.pass_capture_delay = nvn_plat_flag("nvk_gputime", 0) == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
     if (g.pass_capture_delay > 0) {
@@ -2651,6 +2690,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     gap_close();
+    pre_close();
     free(g.pass_capture);
     g.pass_capture = NULL;
     g.worker_started = 0;
@@ -8020,20 +8060,25 @@ static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
     VkBufferCopy *rg = calloc((size_t)bh, sizeof *rg);
     if (!rg) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子拷贝表分配失败"); return 0; }
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){soff + y * packed_row, shadow_dst + y * sh_rp, packed_row};
+    const struct pre_origin pre_saved = pre_origin(c, PRE_BC);
     full_barrier(c);   // 暂存此前在本段里的写（缓冲 → BC 的源拷贝）对影子拷贝和解码输入可见
     vkCmdCopyBuffer(c->cb, sb, t->bc_sbuf, (uint32_t)bh, rg);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
+    pre_origin_restore(c, pre_saved);
     struct bc_temp *tmp = bc_temp_image(t, ext);
     if (!tmp) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：临时图分配失败"); return 0; }
     if (nvn_vk_bcdec_prepare(g.bc, g.dev, tmp->image, t->nvn_format, ext.width, ext.height, 0, 0, &tmp->rec, why, sizeof why) != 0) {
         vkDestroyImage(g.d, tmp->image, NULL); vkFreeMemory(g.d, tmp->memory, NULL); free(tmp);
         set_sticky(c, NVN_GPU_E_DEVICE, "BC 解码失败：%s", why); return 0;
     }
+    if (c->pre) pre_image_add(tmp->rec.in, tmp->rec.in_format, (VkExtent3D){tmp->rec.bw, tmp->rec.bh, 1});
+    const struct pre_origin pre_decode = pre_origin(c, PRE_BC);
     bc_record_decode(c, &tmp->rec, tmp->image, sb, soff, ext.width, ext.height);
     c->desc_layout = VK_NULL_HANDLE;   // 计算绑定点被解码占过：下一次派发重绑描述符组
     tmp->next = c->bc_temps; c->bc_temps = tmp;
     bc_temp_to_tex(c, t, tmp, level, layer, off, ext, z);
+    pre_origin_restore(c, pre_decode);
     return 1;
 }
 
@@ -8099,9 +8144,11 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
             if (rc_is(c->sticky, NVN_GPU_OK)) set_sticky(c, NVN_GPU_E_OOM, "缓冲 → BC 贴图：暂存分配失败");
             break;
         }
+        const struct pre_origin pre_saved = pre_origin(c, PRE_BC);
         full_barrier(c);   // 源缓冲此前在本段里的写（如回读）对拷贝可见
         for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){boff + (uint64_t)z * slice_stride + y * row_bytes, ss.off + y * packed_row, packed_row};
         vkCmdCopyBuffer(c->cb, b->buffer, ss.buf->buffer, (uint32_t)bh, rg);
+        pre_origin_restore(c, pre_saved);
         c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
         uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
         if (!bc_record_slice(c, t, ss.buf->buffer, ss.off, bh, packed_row, dst, sh_rp, level, layer, off, ext, z)) break;
@@ -8175,16 +8222,18 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t
         set_sticky(c, e.rc.code, "tex_upload 暂存：%s", e.why);
         return;
     }
+    const struct pre_origin pre_saved = pre_origin(c, PRE_UPLOAD);
     if (expand) {
         if (nvn_fmt_expand_upload(t->nvn_format, src, (size_t)row_bytes, ew, eh,
                                   sl.cpu, (size_t)out_row) != 0) {
+            pre_origin_restore(c, pre_saved);
             set_sticky(c, NVN_GPU_E_ARG, "tex_upload 展开失败（格式 0x%x）", t->nvn_format);
             return;
         }
         nvn_gpu_copy_buf_tex(ch, sl.buf, sl.off, out_row, out_bytes, th, level, layer, r);
     } else if (nvn_vk_format_substituted(t->nvn_format)) {
         // #398：D24 换成 D32 存储。按原 D24 深度面口径（每纹素 4 字节，低 24 位 UNORM）换成 float 再传深度面。
-        if (row_bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "tex_upload D24 行宽未 4 对齐"); return; }
+        if (row_bytes & 3) { pre_origin_restore(c, pre_saved); set_sticky(c, NVN_GPU_E_ARG, "tex_upload D24 行宽未 4 对齐"); return; }
         memcpy(sl.cpu, src, (size_t)image_bytes);
         nvn_vk_depth24_to_f32(sl.cpu, (size_t)image_bytes / 4);
         copy_buf_tex_impl(ch, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEPTH_F32, 0);
@@ -8195,6 +8244,7 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t
         if (t->nvn_format == NVN_FORMAT_DEPTH24_STENCIL8 && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
             upload_d24s8_stencil(ch, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);
     }
+    pre_origin_restore(c, pre_saved);
 }
 
 #include "backend_vulkan_clear.inc"
@@ -8519,8 +8569,9 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
             return fail(err, NVN_GPU_E_OOM, "遮挡查询池（%u 槽）创建失败", d->occlusion_slots);
         }
         c->qcount = d->occlusion_slots;
-        vkCmdResetQueryPool(c->cb, c->qpool, 0, c->qcount);
     }
+    pre_cmd_begin(c, d ? d->label : NULL);
+    if (c->qpool) vkCmdResetQueryPool(c->cb, c->qpool, 0, c->qcount);
     pthread_mutex_lock(&g_mu);
     if (g.closing) {
         pthread_mutex_unlock(&g_mu);
@@ -8528,6 +8579,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         if (c->qpool) vkDestroyQueryPool(g.d, c->qpool, NULL);
         free(c->q_used);
         vkDestroyCommandPool(g.d, c->pool, NULL);
+        pre_cmd_free(c);
         free(c);
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
@@ -8708,6 +8760,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
         g.failed = g.failed ? (f < g.failed ? f : g.failed) : f;
         pthread_mutex_unlock(&g_mu);
         gap_unbind_main(c);
+        pre_detach(c);
         s->gap_tag = c->gap_tag;
         s->failed = 1;
         s->rc = rc(NVN_GPU_E_ARG);
@@ -8727,6 +8780,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
         const char *why = !rc_is(sticky, NVN_GPU_OK) ? c->why
                         : (closing ? "会话正在关闭" : (lost ? "设备已丢失" : (failed_state ? "时间线已失败，本段不执行" : "测试注入：本段提交失败")));
         gap_unbind_main(c);
+        pre_detach(c);
         s->gap_tag = c->gap_tag;
         s->failed = 1;
         s->rc = code;
@@ -8739,10 +8793,13 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     }
 
     // 段末：本段动过的图一律转回 GENERAL（段与段之间的静止布局约定，见「图像布局」）。
+    const struct pre_origin pre_saved = pre_origin(c, PRE_TAIL);
     lay_rest_at_commit(c);
     // 段末：让本段的所有 GPU 写对主机可见（fence 只保证执行完，不保证主机可见）。
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT);
+    pre_origin_restore(c, pre_saved);
+    pre_detach(c);
     gap_main_end(c);
     if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
     // 结束录制并提交。
@@ -8762,6 +8819,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             si.pCommandBuffers = cbs;
             r = si.commandBufferCount ? gap_queue_submit(s, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
             if (r == VK_SUCCESS) {
+                pre_submitted(s, si.commandBufferCount);
                 s->fence = fence;
                 s->submitted = 1;
                 s->executed = 1;
@@ -9098,6 +9156,7 @@ void nvn_gpu_vk_test_set_fault(int mode) {
     pthread_mutex_unlock(&g_mu);
 }
 
+#include "backend_vulkan_pre_trace.inc"
 #include "backend_vulkan_gap_timing.inc"
 #include "backend_vulkan_wsi.inc"
 

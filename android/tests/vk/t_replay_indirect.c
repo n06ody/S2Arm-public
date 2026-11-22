@@ -39,8 +39,18 @@ struct gap_counts {
     uint64_t first_end, second_begin;
 };
 static struct gap_counts gap_observed[2];
+static struct {
+    unsigned tail, pool_pre, pool_copy, upload_copy, upload_layout, in_gap, clear, gaps, timing[2], unexpected;
+} pre_observed;
+void nvn_vk_pre_trace_pool(nvn_gpu_cmd c, int active);
 static int gap_fixture_flag(const char *name, int fallback) {
     if (!strcmp(name, "nvk_dq")) return gap_fixture_dq;
+    if (gap_fixture == 2) {
+        if (!strcmp(name, "nvk_pre_trace_s") || !strcmp(name, "nvk_pre_trace_count_s") ||
+            !strcmp(name, "nvk_pre_trace_arm_s")) return 1;
+        if (!strcmp(name, "nvk_pre_trace_p3")) return 1025;
+        return fallback;
+    }
     if (!strcmp(name, "nvk_gap_s") || !strcmp(name, "nvk_gap_off_seconds")) return 1;
     if (!strcmp(name, "nvk_gap_seconds") || !strcmp(name, "nvk_gap_quad_vertices")) return 3;
     if (!strcmp(name, "nvk_gap_large_w") || !strcmp(name, "nvk_gap_large_h") ||
@@ -88,6 +98,83 @@ static void gap_fixture_log(const char *row) {
         REQUIRE(strncmp(row, "missing", 7) && strncmp(row, "log_overflow", 12));
     }
 }
+static unsigned long long trace_field(const char *row, const char *name) {
+    const char *value = strstr(row, name);
+    REQUIRE(value);
+    return strtoull(value + strlen(name), NULL, 0);
+}
+
+static void pre_fixture_log(const char *row) {
+    if (!strncmp(row, "sample ", 7)) {
+        const unsigned long long phase = trace_field(row, " phase=");
+        REQUIRE(phase == 1 || phase == 2);
+        REQUIRE(trace_field(row, " signal=") == 66 + phase);
+        REQUIRE(trace_field(row, " gap=") == 1 && trace_field(row, " slot=") == 1);
+        REQUIRE(trace_field(row, " closed=") == 1 && trace_field(row, " valid=") == 1);
+        REQUIRE(trace_field(row, " empty=") == (phase == 2));
+        pre_observed.timing[phase - 1]++;
+        return;
+    }
+    if (!strncmp(row, "gap ", 4)) {
+        REQUIRE(trace_field(row, " signal=") == 66 && trace_field(row, " gap=") == 1);
+        REQUIRE(trace_field(row, " ops=") >= 2);
+        pre_observed.gaps++;
+        return;
+    }
+    if (!strncmp(row, "barrier ", 8) && trace_field(row, " signal=") == 65) {
+        const unsigned long long src = trace_field(row, " src_access=");
+        const unsigned long long dst = trace_field(row, " dst_access=");
+        if (strstr(row, " origin=pool ")) {
+            REQUIRE(src == VK_ACCESS_MEMORY_WRITE_BIT && dst == (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT));
+        }
+        if (strstr(row, " origin=upload ") && strstr(row, " type=image ")) {
+            const char *layout = strstr(row, " layout=");
+            unsigned old, new_layout;
+            REQUIRE(layout && sscanf(layout, " layout=%u,%u", &old, &new_layout) == 2);
+            if (!pre_observed.upload_layout) {
+                REQUIRE(old == VK_IMAGE_LAYOUT_GENERAL && new_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                REQUIRE(src == VK_ACCESS_MEMORY_WRITE_BIT && dst == VK_ACCESS_TRANSFER_WRITE_BIT);
+            } else {
+                REQUIRE(old == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && new_layout == VK_IMAGE_LAYOUT_GENERAL);
+                REQUIRE(src == VK_ACCESS_TRANSFER_WRITE_BIT && dst == (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT));
+            }
+            pre_observed.upload_layout++;
+        }
+        return;
+    }
+    if (strncmp(row, "op ", 3)) return;
+    const unsigned long long signal = trace_field(row, " signal=");
+    if (signal == 66 && strstr(row, " name=vkCmdCopyBuffer ")) {
+        if (trace_field(row, " gap=") == 1 && trace_field(row, " bytes=") == 8 &&
+            strstr(row, " origin=explicit ")) pre_observed.in_gap++;
+        else pre_observed.unexpected++;
+    } else if (signal == 66 && strstr(row, " name=vkCmdClearColorImage ")) {
+        if (trace_field(row, " gap=") == 1 && trace_field(row, " format=") == VK_FORMAT_R8G8B8A8_UNORM &&
+            trace_field(row, " regions=") == 1 && strstr(row, " extent=4x4x1")) pre_observed.clear++;
+        else pre_observed.unexpected++;
+    } else if (signal != 64 && signal != 65 &&
+               (signal != 66 || trace_field(row, " gap=") != 1)) {
+        pre_observed.unexpected++;
+    }
+    if (strstr(row, " name=vkCmdPipelineBarrier ")) {
+        const unsigned long long src = trace_field(row, " src_stage=");
+        const unsigned long long dst = trace_field(row, " dst_stage=");
+        if (signal == 64 && src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_HOST_BIT &&
+            strstr(row, " origin=tail ")) pre_observed.tail++;
+        if (signal == 65 && src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+            strstr(row, " origin=pool ")) pre_observed.pool_pre++;
+    } else if (signal == 65 && strstr(row, " name=vkCmdCopyBuffer ") &&
+               strstr(row, " origin=pool ") && trace_field(row, " bytes=") == 16 &&
+               trace_field(row, " regions=") == 1) {
+        pre_observed.pool_copy++;
+    } else if (signal == 65 && strstr(row, " name=vkCmdCopyBufferToImage ") &&
+               strstr(row, " origin=upload ") && trace_field(row, " bytes=") == 64 &&
+               trace_field(row, " regions=") == 1 && trace_field(row, " bytes_known=") == 1 &&
+               trace_field(row, " format=") == VK_FORMAT_R8G8B8A8_UNORM && strstr(row, " extent=4x4x1")) {
+        pre_observed.upload_copy++;
+    }
+}
+
 #endif
 int nvn_plat_flag(const char *n, int d) {
 #ifdef S2A_NVK_GAP_HOST_TEST
@@ -101,7 +188,8 @@ int nvn_plat_flag(const char *n, int d) {
 void nvn_plat_log(int l, const char *c, const char *s) {
     (void)l;
 #ifdef S2A_NVK_GAP_HOST_TEST
-    if (gap_fixture && c && s && !strcmp(c, "gap-gpu")) gap_fixture_log(s);
+    if (gap_fixture == 1 && c && s && !strcmp(c, "gap-gpu")) gap_fixture_log(s);
+    if (gap_fixture == 2 && c && s && !strcmp(c, "pre-trace")) pre_fixture_log(s);
 #endif
     fprintf(stderr, "[%s] %s\n", c ? c : "", s ? s : "");
 }
@@ -512,6 +600,92 @@ static void run_gap_vulkan(struct s2a_vk_device *device, const char *dir, int dq
     GPU(nvn_gpu_close(5000000000ull, &err));
     gap_fixture = 0;
 }
+static void run_pre_trace(struct s2a_vk_device *device, const char *dir, int dq) {
+    gap_fixture = 2;
+    gap_fixture_dq = dq;
+    memset(&pre_observed, 0, sizeof pre_observed);
+    nvn_gpu_open_desc od = {.host_device = device, .app_label = "pre-command-trace"};
+    GPU(nvn_gpu_open(&od, &err));
+    nvn_gpu_tex_desc td = {0};
+    td.d.target = NVN_TEXTURE_TARGET_2D;
+    td.d.format = NVN_FORMAT_RGBA8;
+    td.d.width = td.d.height = 4;
+    td.d.depth = td.d.levels = td.d.samples = 1;
+    td.usage = NVN_GPU_TEX_CPU_UPLOAD | NVN_GPU_TEX_SAMPLED;
+    nvn_gpu_tex tex, rt;
+    nvn_gpu_view view;
+    GPU(nvn_gpu_tex_create(&td, &tex, &err));
+    td.usage = NVN_GPU_TEX_RENDER;
+    GPU(nvn_gpu_tex_create(&td, &rt, &err));
+    GPU(nvn_gpu_view_create(rt, NULL, &view, &err));
+    nvn_gpu_shader vs = shader(dir, "depth_state.vert", NVN_GPU_SH_VS, NULL);
+    nvn_gpu_shader fs = shader(dir, "solid_green.frag", NVN_GPU_SH_FS, NULL);
+    nvn_gpu_pipe pipe = gap_fixture_pipe(vs, fs, NVN_FORMAT_RGBA8);
+    nvn_gpu_buf dst = buffer(96, NULL), src = buffer(32, NULL);
+    nvn_gpu_cmd warm;
+    GPU(nvn_gpu_cmd_begin(NULL, &warm, &err));
+    GPU(nvn_gpu_cmd_commit(warm, 1, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(1, 5000000000ull, &err));
+
+    nvk_gap_test_present(1, 1);
+    nvk_gap_test_present(2, 2);
+    nvn_gpu_cmd lead, pre, later;
+    nvn_gpu_cmd_desc role = {.label = "nvn submit pre"};
+    GPU(nvn_gpu_cmd_begin(NULL, &lead, &err));
+    GPU(nvn_gpu_cmd_begin(&role, &pre, &err));
+    GPU(nvn_gpu_cmd_begin(NULL, &later, &err));
+    uint32_t word[4] = {11, 22, 33, 44};
+    uint32_t texels[16] = {0x0A09110Bu};
+    NVNcopyRegion region = {0, 0, 0, 4, 4, 1};
+    nvn_vk_pre_trace_pool(pre, 1);
+    nvn_gpu_buf_write(pre, dst, 0, word, sizeof word);
+    nvn_vk_pre_trace_pool(pre, 0);
+    nvn_gpu_tex_upload(pre, tex, 0, 0, &region, texels, 16, sizeof texels);
+    nvn_gpu_copy_buf(later, src, 0, dst, 64, 4);
+    gap_fixture_draw(later, view, 4, pipe);
+    nvn_gpu_copy_buf(later, src, 4, dst, 72, 8);
+    nvn_gpu_clear_view(later, view, (float[4]){0, .5f, 0, 1}, NULL, 0);
+    gap_fixture_draw(later, view, 4, pipe);
+    nvn_gpu_copy_tex_buf(later, tex, 0, 0, &region, dst, 0, 16, sizeof texels);
+    GPU(nvn_gpu_cmd_commit(lead, 64, done, NULL, &err));
+    GPU(nvn_gpu_cmd_commit(pre, 65, done, NULL, &err));
+    GPU(nvn_gpu_cmd_commit(later, 66, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(66, 5000000000ull, &err));
+    nvk_gap_test_present(3, 3);
+    for (unsigned phase = 1; phase <= 2; ++phase) {
+        const unsigned at = phase == 1 ? 18 : 34;
+        nvk_gap_test_present(at, 2 + phase);
+        nvn_gpu_cmd timed;
+        GPU(nvn_gpu_cmd_begin(NULL, &timed, &err));
+        gap_fixture_draw(timed, view, 4, pipe);
+        nvn_gpu_copy_buf(timed, src, 4, dst, 80, 8);
+        gap_fixture_draw(timed, view, 4, pipe);
+        GPU(nvn_gpu_cmd_commit(timed, 66 + phase, done, NULL, &err));
+        GPU(nvn_gpu_fence_wait(66 + phase, 5000000000ull, &err));
+        nvk_gap_test_present(at + 1, 3 + phase);
+    }
+    const uint8_t *copied = nvn_gpu_buf_cpu(dst);
+    REQUIRE(copied && !memcmp(copied, texels, sizeof texels));
+    nvn_gpu_buf_release(dst, NULL, NULL);
+    nvn_gpu_tex_release(tex);
+    nvn_gpu_buf_release(src, NULL, NULL);
+    nvn_gpu_view_release(view);
+    nvn_gpu_tex_release(rt);
+    nvn_gpu_shader_release(vs);
+    nvn_gpu_shader_release(fs);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+    printf("pre-cmd dq=%d tail=%u pool-before=%u pool-copy=%u upload-copy=%u gap-copy=%u clear=%u gaps=%u upload-layout=%u time=%u empty=%u unexpected=%u\n",
+           dq, pre_observed.tail, pre_observed.pool_pre, pre_observed.pool_copy,
+           pre_observed.upload_copy, pre_observed.in_gap, pre_observed.clear, pre_observed.gaps,
+           pre_observed.upload_layout, pre_observed.timing[0],
+           pre_observed.timing[1], pre_observed.unexpected);
+    if (pre_observed.tail != 1 || pre_observed.pool_pre != 1 || pre_observed.pool_copy != 1 ||
+        pre_observed.upload_copy != 1 || pre_observed.upload_layout != 2 || pre_observed.in_gap != 1 ||
+        pre_observed.clear != 1 || pre_observed.gaps != 1 ||
+        pre_observed.timing[0] != 1 || pre_observed.timing[1] != 1 || pre_observed.unexpected) failures++;
+    gap_fixture = 0;
+}
+
 #endif
 
 #include "mirror_blit_test.h"
@@ -540,7 +714,10 @@ int main(int argc,char **argv) {
  uint64_t dq=nvn_vk_dbg_dq_recs();REQUIRE(getenv("S2A_REPLAY_INDIRECT_DQ")?dq>0:dq==0);
  printf("DQ records=%llu\n",(unsigned long long)dq);
 #ifdef S2A_NVK_GAP_HOST_TEST
- if(!depth_only){run_gap_vulkan(&d,argv[1],0);run_gap_vulkan(&d,argv[1],1);}
+ if(!depth_only){
+  run_gap_vulkan(&d,argv[1],0);run_gap_vulkan(&d,argv[1],1);
+  run_pre_trace(&d,argv[1],0);run_pre_trace(&d,argv[1],1);
+ }
 #endif
  REQUIRE(!s2a_vk_device_destroy(&d,1));
  if(depth_only)puts("real depth-copy only: 4 format/subresource cases passed");
