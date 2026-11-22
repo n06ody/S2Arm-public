@@ -41,10 +41,10 @@ void s2a_libpack_close(struct s2a_libpack *lp);
 int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned kind,
                     uint8_t **bytes, size_t *len, char *why, size_t why_size);
 
-// 程序命中：keys[6][8] + stages 位图（vs+fs 0x3 或 vs+fs+gs 0x7）→ 合成的 s2a-direct-program-v1 字节（malloc，调用方 free）。
+// 程序命中：keys[6][8] + stages 位图（vs+fs 0x3 或 vs+fs+gs 0x7）→ 合成的 s2a-direct-program-v1/v2 字节（malloc，调用方 free）。
 //   每阶段取 _b.json + _b.spv：绑定号 = arg_id×6+阶段号（与 .spv 内烘焙的一致），kind 桶照
 //   _b.json 的语义种类译：cbuf→uniform、tex/samp_tex→texture、img→image、sbuf 系→storage、
-//   support→support(stage="program")；…Smplr / samp* 是组合纹理的采样器半边，v1 不出行；
+//   support→support(stage="program")；…Smplr / samp* 不另出描述符行。独立 c2 采样器按 v2 附在纹理的 samp_slot；
 //   宿主辅助（uvx/lb/ubolen/sbsize/geometry/drvcb/c1）→ uniform/storage 无 guest 槽。
 //   任一键缺段/坏段 → 整个程序 MISS/REJECT（半程序不命中）。identity 段由调用方给
 //   （direct_abi/profile_hash/translator_closure——与现编 request 同源）。
@@ -66,7 +66,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
 
-// 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1（malloc，调用方 free），
+// 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1/v2（malloc，调用方 free），
 //   按 nvn_vk_program_parse_compute 的合同合成：绑定号 = arg_id×6+5、每条 count 1、storage 带 cbSlot/cbOffset
 //   出处与 rw、c0 驱动常量段挂 slot 0；c0Reads / supportReads 写 null（_b.json 给不出，解析器认可的「未知」），
 //   hasUnalignedStorageBuffer 写 false（批翻链按缺省 false 翻）。返回码与计数口径同 program_v1。
