@@ -41,8 +41,17 @@ static void dirty_tick_rate(uint64_t *num, uint64_t *den) { *num = 1; *den = 1; 
 // (the movie decoder thread writing a frame into texture storage, a disk read into a guest buffer) could set the state back to NONE, then the mprotect landed => the page read-only with state NONE: a game thread writing it got only
 // "re-execute" from the fault handler and spun forever; a host system call reading into it saw NONE in prep_write, skipped, and failed with EFAULT (reproduced by t_dirty_race).
 // BUSY lasts at most one mprotect (plus a few atomic writes when setting read-only). The wait is capped at BUSY_WAIT_MS and reports red beyond it: in the fault handler it then returns "not our page" so the crash handler reports truthfully
-enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_BUSY_WRITABLE = 3 };
+enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_BUSY_WRITABLE = 3, PG_PROBE = 4, PG_BUSY_PROBE = 5 };
 enum { BUSY_WAIT_MS = 2000 };
+enum { LAND_PROBE_MAX = 128 };
+enum { PROBE_TRIED, PROBE_ARMED, PROBE_GUEST, PROBE_OTHER, PROBE_EXPIRED, PROBE_COUNT };
+static _Atomic uint64_t g_land_probe_counts[PROBE_COUNT];
+static _Atomic uintptr_t g_land_probe_pages[LAND_PROBE_MAX];
+static _Atomic unsigned g_land_probe_count;
+static _Thread_local uintptr_t g_land_last_retry;
+#if defined(__ANDROID__)
+int s2a_android_direct_guest_context(const void *context) __attribute__((weak));
+#endif
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 // The table grows in blocks of 1,024 slots, up to 262,144; a block is never moved or freed, so the signal handler reads it without locks. A pool past the end goes untracked: its textures count
 // as dirty and are re-uploaded at every use. The table was a fixed 256 slots (Zelda has about 300 pools at the title), then a fixed 4,096, and Breath of the Wild reaches 4,006 pools in its first
@@ -262,13 +271,17 @@ void nvn_dirty_reset_session(void) {
     g_log_bytes = 0; g_log_enabled = 0;
     atomic_store(&g_nr, 0); atomic_store(&g_live, 0); atomic_store(&g_live_peak, 0);
     atomic_store(&g_now, 1); atomic_store(&g_overflow_logged, 0); atomic_store(&g_busy_red, 0); atomic_store(&g_hooks_on, 0);
+    atomic_store(&g_land_probe_count, 0);
+    for (unsigned i = 0; i < PROBE_COUNT; i++) atomic_store(&g_land_probe_counts[i], 0);
     table_write_end();
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, dirty_tick and sched_yield
 static int busy_wait(range_t *r, uintptr_t p) {
     uint64_t t0 = 0;
-    for (unsigned n = 1; atomic_load(&r->state[p]) == PG_BUSY || atomic_load(&r->state[p]) == PG_BUSY_WRITABLE; n++) {
+    for (unsigned n = 1; ; n++) {
+        uint8_t st = atomic_load(&r->state[p]);
+        if (st != PG_BUSY && st != PG_BUSY_WRITABLE && st != PG_BUSY_PROBE) break;
         if (n & 0x3ff) continue;
         uint64_t now = dirty_tick(); if (!t0) t0 = now;
         uint64_t num = g_tb_den ? g_tb_num : 1, den = g_tb_den ? g_tb_den : 1;
@@ -370,8 +383,8 @@ static enum release_result unprotect_span_pages(range_t *r, uintptr_t first, uin
     int had_protected = 0;
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
-        if (st == PG_PROT) {
-            if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue;
+        if (st == PG_PROT || st == PG_PROBE) {
+            if (!atomic_compare_exchange_strong(&r->state[k], &st, st == PG_PROBE ? PG_BUSY_PROBE : PG_BUSY)) continue;
             had_protected = 1;
         } else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
         else if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
@@ -379,6 +392,7 @@ static enum release_result unprotect_span_pages(range_t *r, uintptr_t first, uin
                 uint8_t js = atomic_load(&r->state[j]);
                 if (js == PG_BUSY) atomic_store(&r->state[j], PG_PROT);
                 else if (js == PG_BUSY_WRITABLE) atomic_store(&r->state[j], PG_NONE);
+                else if (js == PG_BUSY_PROBE) atomic_store(&r->state[j], PG_PROBE);
             }
             return RELEASE_FAILED;
         }
@@ -402,6 +416,7 @@ static enum release_result unprotect_span_pages(range_t *r, uintptr_t first, uin
             uint8_t st = atomic_load(&r->state[k]);
             if (st == PG_BUSY) atomic_store(&r->state[k], PG_PROT);
             else if (st == PG_BUSY_WRITABLE) atomic_store(&r->state[k], PG_NONE);
+            else if (st == PG_BUSY_PROBE) atomic_store(&r->state[k], PG_PROBE);
         }
         atomic_store(&g_track_unreliable, 1);
         return RELEASE_FAILED;
@@ -421,7 +436,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = atomic_load(&r->state[p]);
         if (st == PG_NONE) return atomic_load(&r->gen[p]) != 0;   // already writable (another thread just unprotected it) -> re-execute; pages never protected are not ours
-        if (st == PG_PROT) {
+        if (st == PG_PROT || st == PG_PROBE) {
             if (unprotect_chunk(r, p) == RELEASE_FAILED) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
             if (count) atomic_fetch_add(count, 1);
             return 1;
@@ -429,9 +444,50 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;   // another thread is changing its protection: wait, then look again
     }
 }
+static int land_probe_restore(range_t *r, uintptr_t page) {
+    uintptr_t p = (page - r->base) >> g_shift;
+    uint8_t state = PG_PROBE;
+    if (!atomic_compare_exchange_strong(&r->state[p], &state, PG_BUSY_PROBE)) return 0;
+    // In the signal path, do not use mp()'s failure logger.
+    int ok = mprotect((void *)page, g_pg, PROT_READ) == 0;
+    atomic_store(&r->state[p], ok ? PG_PROT : PG_PROBE);
+    return ok ? 1 : -1;
+}
+
+static int land_probe_fault(uintptr_t addr, const void *context) {
+    unsigned n = atomic_load_explicit(&g_land_probe_count, memory_order_acquire);
+    if (!n) return 0;
+    uintptr_t page = addr & ~(g_pg - 1);
+    unsigned j = 0;
+    while (j < n && atomic_load_explicit(&g_land_probe_pages[j], memory_order_relaxed) != page) j++;
+    if (j == n) return 0;
+    int nr = atomic_load(&g_nr);
+    for (int i = 0; i < nr; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || page < r->base || page >= r->end) continue;
+        if (!busy_wait(r, (page - r->base) >> g_shift)) return 0;
+        int restored = land_probe_restore(r, page);
+        if (restored < 0) return 0;
+        if (restored) {
+            int guest = 0;
+#if defined(__ANDROID__)
+            guest = s2a_android_direct_guest_context && s2a_android_direct_guest_context(context);
+#else
+            (void)context;
+#endif
+            atomic_fetch_add_explicit(&g_land_probe_counts[guest ? PROBE_GUEST : PROBE_OTHER], 1, memory_order_relaxed);
+            return 1;
+        }
+    }
+    // A write, another read or window expiry may already have restored the
+    // page. Retry once only for an address this probe explicitly armed.
+    if (g_land_last_retry == page) return 0;
+    g_land_last_retry = page;
+    return 1;
+}
+
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
-    if (!is_write) return 0;
+    if (!is_write) return land_probe_fault((uintptr_t)addr, uc);
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
@@ -749,7 +805,62 @@ int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void 
 int nvn_dirty_page_armed(const void *span, const void *addr) {
     range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a >= r->end || atomic_load(&g_track_unreliable)) return 0;
-    return atomic_load(&r->state[(a - r->base) >> g_shift]) == PG_PROT;
+    uint8_t state = atomic_load(&r->state[(a - r->base) >> g_shift]);
+    return state == PG_PROT || state == PG_PROBE;
+}
+
+int nvn_dirty_land_probe_arm(const void *addr, size_t len, uint64_t sequence) {
+    atomic_fetch_add_explicit(&g_land_probe_counts[PROBE_TRIED], 1, memory_order_relaxed);
+    uintptr_t a = (uintptr_t)addr;
+    const uintptr_t ps = g_pg;
+    if (!ps || len < 2 * ps || UINTPTR_MAX - a < len || atomic_load(&g_track_unreliable)) return 0;
+    uintptr_t first = (a + ps - 1) & ~(ps - 1), end = (a + len) & ~(ps - 1);
+    uintptr_t page = first + (sequence % ((end - first) / ps)) * ps;
+    int ok = 0;
+    pthread_mutex_lock(&g_slot_mu);
+    unsigned n = atomic_load_explicit(&g_land_probe_count, memory_order_relaxed);
+    if (n >= LAND_PROBE_MAX) goto out;
+    for (unsigned i = 0; i < n; i++) if (atomic_load_explicit(&g_land_probe_pages[i], memory_order_relaxed) == page) goto out;
+    range_t *owner = NULL;
+    const int nr = atomic_load(&g_nr);
+    for (int i = 0; i < nr; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || page < r->base || page >= r->end) continue;
+        if (owner) goto out;   // 邻池 / 重叠池共页，不改权限
+        owner = r;
+    }
+    if (!owner) goto out;
+    uintptr_t p = (page - owner->base) >> g_shift;
+    uint8_t state = PG_PROT;
+    if (!atomic_compare_exchange_strong(&owner->state[p], &state, PG_BUSY)) goto out;
+    atomic_store_explicit(&g_land_probe_pages[n], page, memory_order_relaxed);
+    atomic_store_explicit(&g_land_probe_count, n + 1, memory_order_release);
+    ok = mp(page, ps, PROT_NONE) == 0;
+    atomic_store(&owner->state[p], ok ? PG_PROBE : PG_PROT);
+    if (ok) atomic_fetch_add_explicit(&g_land_probe_counts[PROBE_ARMED], 1, memory_order_relaxed);
+out:
+    pthread_mutex_unlock(&g_slot_mu);
+    return ok;
+}
+
+void nvn_dirty_land_probe_finish(void) {
+    pthread_mutex_lock(&g_slot_mu);
+    unsigned n = atomic_load_explicit(&g_land_probe_count, memory_order_relaxed);
+    int nr = atomic_load(&g_nr);
+    for (unsigned i = 0; i < n; i++) {
+        uintptr_t page = atomic_load_explicit(&g_land_probe_pages[i], memory_order_relaxed);
+        for (int slot = 0; slot < nr; slot++) {
+            range_t *r = rg(slot);
+            if (!live_at(slot) || page < r->base || page >= r->end) continue;
+            if (land_probe_restore(r, page) == 1)
+                atomic_fetch_add_explicit(&g_land_probe_counts[PROBE_EXPIRED], 1, memory_order_relaxed);
+        }
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+void nvn_dirty_land_probe_counts(uint64_t out[5]) {
+    for (unsigned i = 0; i < PROBE_COUNT; i++) out[i] = atomic_load_explicit(&g_land_probe_counts[i], memory_order_relaxed);
 }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;

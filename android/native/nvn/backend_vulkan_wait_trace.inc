@@ -9,7 +9,7 @@ struct wait_trace_row {
     uint64_t begin, end, call, object, site, target, before, after, wsi, timeout;
     int result;
     uint32_t tid;
-    uint64_t extra[10];
+    uint64_t extra[12];
 };
 struct wait_trace_retire {
     uint64_t target, driver_end, cpu_begin, done_enter, callback_enter, callback_exit, done_exit, completed_locked;
@@ -93,11 +93,11 @@ static void wait_trace_dump(uint64_t actual_end) {
                          (unsigned long long)r->extra[2], (unsigned long long)r->extra[3],
                          (unsigned long long)r->extra[4], (unsigned long long)r->extra[5]);
             else if (!strcmp(r->kind, "land"))
-                snprintf(line+n, sizeof line-(size_t)n, " locked=%llu copy_begin=%llu copy_end=%llu relocked=%llu id=%llu registered=%llu copied=%llu mirror=%llu offset=%llu readback=%llu",
+                snprintf(line+n, sizeof line-(size_t)n, " locked=%llu copy_begin=%llu copy_end=%llu relocked=%llu id=%llu registered=%llu copied=%llu mirror=%llu offset=%llu readback=%llu skipped=%llu probe_armed=%llu",
                          (unsigned long long)r->extra[0], (unsigned long long)r->extra[1], (unsigned long long)r->extra[2],
                          (unsigned long long)r->extra[3], (unsigned long long)r->extra[4], (unsigned long long)r->extra[5],
                          (unsigned long long)r->extra[6], (unsigned long long)r->extra[7], (unsigned long long)r->extra[8],
-                         (unsigned long long)r->extra[9]);
+                         (unsigned long long)r->extra[9], (unsigned long long)r->extra[10], (unsigned long long)r->extra[11]);
         }
         nvn_plat_log(NVN_PLAT_LOG_INFO, "wait-trace", line);
     }
@@ -178,7 +178,7 @@ void s2a_nvk_wait_trace_land(const struct nvn_wait_trace_land *row) {
     if (!row->begin || !wait_trace_retire.target) return;
     wait_trace_add((struct wait_trace_row){.kind="land", .begin=row->begin, .end=row->end,
         .target=wait_trace_retire.target, .extra={row->locked, row->copy_begin, row->copy_end,
-        row->relocked, row->id, row->registered, row->copied, row->mirror, row->offset, row->readback}});
+        row->relocked, row->id, row->registered, row->copied, row->mirror, row->offset, row->readback, row->skipped, row->probe_armed}});
 }
 
 void s2a_nvk_wait_trace_sub(const struct nvn_wait_trace_sub *row) {

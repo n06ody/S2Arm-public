@@ -11,11 +11,12 @@
 
 static int (*g_hook)(void *, int, void *);
 static void (*g_prep)(void *, size_t);
+static volatile sig_atomic_t g_read_operation;
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc)) { g_hook = fn; }
 void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len)) { g_prep = fn; }
 static void host_prepare(void *addr, size_t len) { if (g_prep) g_prep(addr, len); }   // 宿主写前解保护入口（生产是 dm_guest_write_prepare）
 void dm_log(const char *fmt, ...) { (void)fmt; }
-static void on_sig(int s, siginfo_t *si, void *uc) { if (g_hook && g_hook(si->si_addr, 1, uc)) return; signal(s, SIG_DFL); }
+static void on_sig(int s, siginfo_t *si, void *uc) { if (g_hook && g_hook(si->si_addr, !g_read_operation, uc)) return; signal(s, SIG_DFL); }
 
 extern int (*nvn_dirty_mp_hook)(void *addr, size_t len, int prot);
 
@@ -34,9 +35,42 @@ static int rec_hook(void *addr, size_t len, int prot) {
     return 0;
 }
 
+static void test_land_probe(void) {
+    size_t pg = (size_t)getpagesize();
+    uint8_t *m = mmap(NULL, 8 * pg, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    CK(m != MAP_FAILED, "read probe mapping");
+    if (m == MAP_FAILED) return;
+    memset(m, 0x51, 8 * pg);
+    nvn_dirty_add_range(m, 8 * pg);
+    nvn_dirty_protect(m, 8 * pg);
+    const uint64_t stamp = nvn_dirty_now();
+    nvn_dirty_land_probe_arm(m + 17, 2 * pg, 0);   // host page 1 only
+    volatile uint8_t *read_ptr = m;
+    g_read_operation = 1;
+    uint8_t outside = read_ptr[17], first = read_ptr[pg + 17], second = read_ptr[pg + 19];
+    g_read_operation = 0;
+    uint64_t counts[5] = {0};
+    nvn_dirty_land_probe_counts(counts);
+    CK(outside == 0x51 && first == 0x51 && second == 0x51, "probe read preserves the original guest byte");
+    CK(counts[0] == 1 && counts[1] == 1 && counts[2] == 0 && counts[3] == 1, "one real read fault on the single wholly covered page");
+    CK(!nvn_dirty_since(m + pg, pg, stamp), "read did not mark the page dirty");
+    m[pg] = 0x33;
+    CK(nvn_dirty_since(m + pg, pg, stamp), "write still faults and stamps after a probe read");
+    nvn_dirty_land_probe_arm(m + 4 * pg, 2 * pg, 0);
+    nvn_dirty_land_probe_finish();
+    nvn_dirty_land_probe_counts(counts);
+    CK(counts[1] == 2 && counts[3] == 1 && counts[4] == 1, "unobserved probe expires without counting a read");
+    g_read_operation = 1;
+    CK(read_ptr[4 * pg] == 0x51, "window end restores readability");
+    g_read_operation = 0;
+    nvn_dirty_remove_range(m);
+    munmap(m, 8 * pg);
+}
+
 int main(void) {
     struct sigaction sa = {0}; sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO;
     sigaction(SIGBUS, &sa, NULL); sigaction(SIGSEGV, &sa, NULL);
+    test_land_probe();
     nvn_dirty_mp_hook = rec_hook;
 
     const size_t pg = (size_t)getpagesize();

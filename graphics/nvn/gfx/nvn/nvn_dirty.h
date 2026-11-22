@@ -41,6 +41,9 @@ long nvn_dirty_page_gens(const void *span, const void *addr, size_t len, uint64_
 // 调用线程自己的累计：索引答的次数、退回线性扫的次数（写者正在改表 / 复查代际不一致 / 零长度 / 索引不可用）、索引答的那些次一共访问了多少个节点。
 void nvn_dirty_span_stats(uint64_t *idx_hits, uint64_t *scans, uint64_t *nodes);
 size_t nvn_dirty_page_size(void);                                  // Host page size the tracking works in (16 KB on Apple systems: one page can hold several 4 KB-aligned NVN resources)
+int nvn_dirty_land_probe_arm(const void *addr, size_t len, uint64_t sequence);
+void nvn_dirty_land_probe_finish(void);
+void nvn_dirty_land_probe_counts(uint64_t out[5]);   // attempts, armed, guest reads, other read faults, expired
 long nvn_dirty_written_pages(const void *span, const void *addr, size_t len, uint64_t stamp, uint64_t *bits, size_t nbits);   // bit k = page k of the span written after stamp; returns the page count, -1 = untracked / over nbits
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // Cumulative: this module's mprotect call count, pages covered, time spent

@@ -397,6 +397,15 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_LAND_SKIP_N]) {
+                    uint64_t reads[5] = {0};
+                    rp_buf_land_probe_counts(reads);
+                    snprintf(b, sizeof b, "skipped=%llu bytes=%llu probes_attempted=%llu probes_armed=%llu guest_reads=%llu other_reads=%llu probes_expired=%llu",
+                             (unsigned long long)pf[RP_PERF_LAND_SKIP_N], (unsigned long long)pf[RP_PERF_LAND_SKIP_B],
+                             (unsigned long long)reads[0], (unsigned long long)reads[1], (unsigned long long)reads[2],
+                             (unsigned long long)reads[3], (unsigned long long)reads[4]);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "land-ceiling", b);
+                }
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take());
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 {   // 写跟踪的开销：游戏写到被保护的页要走一次缺页处理，改保护要进内核

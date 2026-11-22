@@ -45,6 +45,7 @@ static int g_flag_binst_hoist = -1;   // 用例设：开关 nvk_binst_hoist（-1
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值（缺省同产品：开）；每 256 次登记才重读一次，换值后要用 rp_test_gw_merge_reload() 推一下
+static int g_flag_land_ceiling;
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_ub_steal = -1;   // 用例设：开关 nvk_ub_fill_steal（-1 = 缺省）；rp_draw 缓存它，换值后要 pass_fresh（会话重开清缓存）
@@ -59,6 +60,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
     if (!strcmp(name, "nvk_land_merge")) return g_flag_land_merge;
+    if (!strcmp(name, "nvk_land_ceiling")) return g_flag_land_ceiling;
     if (!strcmp(name, "nvk_vf_key")) return g_flag_vf_key;
     if (!strcmp(name, "nvk_finish_lag")) return g_flag_finish_lag;
     if (!strcmp(name, "nvk_sync_lag")) return g_flag_sync_lag;
@@ -7242,6 +7244,40 @@ static void t_land_readback(void) {
     pass_fresh();
 }
 
+static void t_land_ceiling(void) {
+    enum { BIG = 1 << 20, SPACE = BIG + 256 };
+    uint8_t *mem = malloc(SPACE), *mirror = malloc(SPACE);
+    CHECK(mem && mirror);
+    if (!mem || !mirror) { free(mem); free(mirror); return; }
+    const uint64_t base = (uint64_t)(uintptr_t)mem;
+    for (int enabled = 0; enabled <= 1; enabled++) {
+        pass_fresh();
+        g_flag_land_ceiling = enabled;
+        memset(mem, 0x11, SPACE);
+        memset(mirror, 0x7a, SPACE);
+        g_buf_cpu_fake = mirror;
+        nvn_be_pool_add(mem, SPACE);
+        const uint64_t f0 = nvn_be_last_fence();
+        nvn_be_sub_begin();
+        CHECK(rp_post_gpu_write(base + 32, BIG));
+        CHECK(rp_post_gpu_write(base + BIG + 64, 32));
+        CHECK(rp_buf_gpu_write_pending(base + 32, BIG) == 1);
+        const uint64_t f = nvn_be_sub_commit();
+        CHECK(f > f0 && mem[32] == 0x11 && mem[BIG + 64] == 0x11);
+        fake_complete(NVN_GPU_DONE_OK);
+        CHECK(nvn_be_wait(f, 0) == 1);
+        CHECK(mem[32] == (enabled ? 0x11 : 0x7a) && mem[BIG + 31] == (enabled ? 0x11 : 0x7a));
+        CHECK(mem[BIG + 64] == 0x7a && mem[BIG + 95] == 0x7a && mem[BIG + 96] == 0x11);
+        CHECK(rp_buf_gpu_write_pending(base + 32, BIG) == 0);
+        g_buf_cpu_fake = NULL;
+        nvn_be_pool_del(mem);
+    }
+    g_flag_land_ceiling = 0;
+    pass_fresh();
+    free(mirror);
+    free(mem);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) { g_dirtylog_dflt = g_flag_buf_dirtylog = 0; argc--; argv++; }   // 关那一档：整套用例走逐页退回路径
 #ifdef S2A_GPU_LAND_TEST
@@ -7252,7 +7288,9 @@ int main(int argc, char **argv) {
 #endif
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--land-readback")) { t_land_readback(); printf("land readback: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    if (argc > 1 && !strcmp(argv[1], "--land-ceiling")) { t_land_ceiling(); printf("land ceiling: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     t_land_readback();
+    t_land_ceiling();
     t_invalidated_attachment_pin();
     t_registered_view_pin();
     t_registered_view_freed_with_storage();

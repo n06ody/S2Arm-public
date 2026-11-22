@@ -212,6 +212,10 @@ static void android_crash_fatal(int sig, siginfo_t *si, const ucontext_t *contex
 }
 static _Atomic uint64_t g_sp_unaligned;   // 替游戏模拟的「栈指针未对齐」读写条数（收局汇总报，s2a_sp_unaligned_count；同苹果段）
 uint64_t s2a_sp_unaligned_count(void) { return atomic_load(&g_sp_unaligned); }
+int s2a_android_direct_guest_context(const void *context) {
+    const ucontext_t *u = context;
+    return u && module_of((void *)(uintptr_t)u->uc_mcontext.pc) != NULL;
+}
 static void on_crash(int sig, siginfo_t *si, void *context) {
     ucontext_t *u = context;
     // 双补丁岛 brk 兜底点（traps.c）：两岛都够不着的必改点，按原语义模拟后 pc += 4

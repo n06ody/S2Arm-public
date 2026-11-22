@@ -56,6 +56,30 @@ static nvn_gpu_buf g_null_storage;
 static int g_gw_live;   // 所有池的未落地登记数（含正在落地的项）
 static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数（原子读写）：为 0（受跟踪的游戏全程如此）时 rp_write_note 不多走一步
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
+static int g_land_ceiling = -1;   // 持 g_bmu；每个会话首次落地读一次
+static int g_land_ceiling_reads, g_land_probe_window;
+enum { LAND_CEILING_MIN = 1 << 20 };
+
+// 弱链接[replay]：nvn_dirty_land_probe_arm
+// 弱链接[replay]：nvn_dirty_land_probe_finish
+// 弱链接[replay]：nvn_dirty_land_probe_counts
+int nvn_dirty_land_probe_arm(const void *addr, size_t len, uint64_t sequence) __attribute__((weak));
+void nvn_dirty_land_probe_finish(void) __attribute__((weak));
+void nvn_dirty_land_probe_counts(uint64_t out[5]) __attribute__((weak));
+
+static int land_ceiling_skip(uint64_t len) {
+    if (len < LAND_CEILING_MIN) return 0;
+    if (g_land_ceiling < 0) {
+        g_land_ceiling = nvn_plat_flag("nvk_land_ceiling", 0) == 1;
+        g_land_ceiling_reads = g_land_ceiling && nvn_plat_flag("nvk_land_ceiling_reads", 0) == 1 &&
+                               nvn_dirty_land_probe_arm && nvn_dirty_land_probe_finish;
+    }
+    return g_land_ceiling;
+}
+
+void rp_buf_land_probe_counts(uint64_t out[5]) {
+    if (nvn_dirty_land_probe_counts) nvn_dirty_land_probe_counts(out);
+}
 #ifdef S2A_GPU_LAND_TEST
 int rp_test_gw_live(void) { return __atomic_load_n(&g_gw_live, __ATOMIC_ACQUIRE); }
 void rp_test_gw_merge_reload(void) { __atomic_store_n(&g_gw_merge_on, -1, __ATOMIC_RELAXED); }   // 单测换开关值后让下一次登记立刻重读
@@ -389,7 +413,8 @@ void rp_buf_gpu_write_snapshot(uint64_t pool_key, uint64_t id, nvn_gpu_buf_copy 
     if (s) for (int i = 0; i < s->ngw; i++) {
         const struct gpu_write *w = &s->gw[i];
         if (w->id != id || w->landing) continue;
-        *out = (nvn_gpu_buf_copy){.src=s->m[w->mi].buf, .soff=w->off, .bytes=w->len};
+        if (!land_ceiling_skip(w->len))
+            *out = (nvn_gpu_buf_copy){.src=s->m[w->mi].buf, .soff=w->off, .bytes=w->len};
         break;
     }
     pthread_mutex_unlock(&g_bmu);
@@ -403,18 +428,38 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
-    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
+    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0, skipped = 0;
     struct nvn_wait_trace_land trace = {.begin=nvn_wait_trace_stamp(), .id=id};
     pthread_mutex_lock(&g_bmu);
+    if (g_land_probe_window == 1 && !trace.begin) {
+        nvn_dirty_land_probe_finish();
+        g_land_probe_window = 2;
+    }
     if (trace.begin) trace.locked = nvn_wait_trace_stamp();
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
+        if (trace.begin) { trace.mirror = s->m[wmi].trace_id; trace.offset = off; }
+        if (ok && land_ceiling_skip(len)) {
+            // 一次性上限诊断：只撤登记。镜像保留 GPU 写入，游戏内存保留原字节。
+            if (g_land_ceiling_reads && trace.begin && g_land_probe_window != 2) {
+                g_land_probe_window = 1;
+                uint64_t sample = id * 11400714819323198485ull;
+                if ((sample >> 61) == 0)   // 按位混合避免固定步长总落在同一槽
+                    trace.probe_armed = nvn_dirty_land_probe_arm(mem + off, (size_t)len, sample);
+            }
+            s->gw[i] = s->gw[--s->ngw];
+            __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);
+            rp_perf_add(RP_PERF_LAND_SKIP_N, 1);
+            rp_perf_add(RP_PERF_LAND_SKIP_B, len);
+            skipped = 1;
+            break;
+        }
         if (ok) {
             const uint8_t *mirror = staged ? NULL : nvn_gpu_buf_cpu(s->m[wmi].buf);
             src = staged ? staged : (mirror ? mirror + off : NULL);
         }
-        if (trace.begin) { trace.mirror = s->m[wmi].trace_id; trace.offset = off; trace.readback = ok && staged; }
+        if (trace.begin) trace.readback = ok && staged;
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
         s->gw[i].landing = 1; found = 1;
         s->landing++;
@@ -423,6 +468,7 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     pthread_mutex_unlock(&g_bmu);
     if (trace.begin) {
         trace.registered = len;
+        trace.skipped = skipped ? len : 0;
         trace.copy_begin = nvn_wait_trace_stamp();
     }
     if (!found) {
@@ -757,6 +803,9 @@ void rp_buf_reset(void) {
     if (g_null_storage) nvn_gpu_buf_release(g_null_storage, NULL, NULL);
     g_null_storage = NULL;
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
+    if (g_land_probe_window == 1) nvn_dirty_land_probe_finish();
+    g_land_ceiling = -1;
+    g_land_ceiling_reads = g_land_probe_window = 0;
     pthread_mutex_unlock(&g_bmu);
 }
 void rp_buf_stats(uint64_t *bytes, uint64_t *runs) { pthread_mutex_lock(&g_bmu); if (bytes) *bytes = g_sync_bytes; if (runs) *runs = g_sync_runs; pthread_mutex_unlock(&g_bmu); }
