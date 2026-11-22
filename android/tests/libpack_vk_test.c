@@ -1435,7 +1435,7 @@ int main(void) {
         const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
         const uint8_t kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8); memset(keys[2], 0x60, 8);   // 紧排：vs / fs / gs（NVN 位序 0 / 1 / 2）
-        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
 
         // 命中：三段齐、gs 绑定号 = arg×6+3、宿主解析出第 2 段（gs）
@@ -1467,18 +1467,18 @@ int main(void) {
 
         // 设备没开 geometryShader（profile 同字段 false）：照旧 miss，不合成
         uint64_t m0 = s2a_libpack_misses();
-        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF) };
+        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF), 0, 0 };
         w[0] = 0;
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &tri_off, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j
               && strstr(w, "geometryShader"), "geometryShader 没开 → MISS（原因写明）");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, NULL, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "没给绘制事实（gfx = NULL）→ 几何程序 MISS");
-        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0 };
+        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0, 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &noprof, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "profile 读不出 → 按没开 MISS");
         // 图元：线输入没有 _vg1 → miss；邻接离线不出 → miss
-        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
-        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
+        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &lines, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "线输入、库里只有三角那份 → MISS");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &adj, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
