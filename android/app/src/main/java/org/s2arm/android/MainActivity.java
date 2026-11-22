@@ -253,6 +253,13 @@ public class MainActivity extends Activity
                 @Override public void onTouchLayoutTrace(String layout, String input) {
                     if (BuildConfig.DEBUG && touchTrace != null) touchTrace.record(layout, input);
                 }
+                @Override public void onTouchEnd(boolean canceled, long downMs, long eventNs) {
+                    if (!BuildConfig.DEBUG || !touchLog || !gameMode || !DebugGate.open()) return;
+                    String line = "touch gesture end: action=" + (canceled ? "cancel" : "up")
+                        + " down_ms=" + downMs + " event_ns=" + eventNs;
+                    if (touchTrace != null) touchTrace.record(null, line);
+                    Log.i("S2Arm", line);
+                }
                 @Override public void onTouchMenu() { showTouchMenu(); }
             });
             root.addView(touchPad, new FrameLayout.LayoutParams(

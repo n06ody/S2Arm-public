@@ -93,10 +93,15 @@ final class TouchTraceTest {
         Path sample = files.resolve("writer-sample.log");
         Files.copy(path, sample);
 
+        String terminal = "touch gesture end: action=up down_ms=1000 event_ns=1030000000";
+        trace.record(null, terminal);
+        var withEnd = await(path, 7001, 4);
+        check(withEnd.get(3).text().equals(terminal + "\n"), "gesture end is a separate verified block after zero");
+
         for (int n = 1; n <= 7500; n++) {
             trace.record(null, "input: buttons=0x0000 L=(0,0) R=(" + n + ",0)");
         }
-        var ring = await(path, 7001, 7503);
+        var ring = await(path, 7001, 7504);
         check(ring.get(0).field(4) > 0, "rotation must announce evictions");
         check(ring.get(ring.size() - 1).text().endsWith("R=(7500,0)\n"), "rotation retains newest input");
 

@@ -17,6 +17,7 @@ final class TouchPadView extends View {
     interface Listener {
         void onTouchPad(boolean fromInputEvent);
         default void onTouchLayoutTrace(String layout, String input) { }
+        default void onTouchEnd(boolean canceled, long downMs, long eventNs) { }
         /** Exactly four fingers held for MENU_HOLD_MS (the iOS gesture): the in-game touch menu. */
         default void onTouchMenu() { }
     }
@@ -196,7 +197,14 @@ final class TouchPadView extends View {
         if (editing) return handleEditEvent(e);
         watchMenuHold(e);
         try {
-            return handleTouchEvent(e);
+            boolean handled = handleTouchEvent(e);
+            if (BuildConfig.DEBUG && trace && handled) {
+                int action = e.getActionMasked();
+                // Emit after input publication even when the axes never changed.
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+                    listener.onTouchEnd(action == MotionEvent.ACTION_CANCEL, e.getDownTime(), e.getEventTimeNanos());
+            }
+            return handled;
         } catch (IllegalArgumentException | IllegalStateException error) {
             // Invalid/overflowing contacts or a failed JNI publisher cancel the
             // experiment; they must not crash the Activity or leave controls held.
