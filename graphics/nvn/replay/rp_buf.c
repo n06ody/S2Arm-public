@@ -7,6 +7,7 @@
 // GPU 往池里写（贴图拷回缓冲、计算着色器写存储缓冲、变换反馈）要反方向回写游戏内存，随那几条命令一起接。
 // 平台有零拷贝后备（安卓 AHB）时镜像与同步都可以省掉，那是平台接口「内存池后备」一组，接它不改这里的对外形状。
 #include "rp_exec.h"
+#include "nvn_wait_trace.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -379,7 +380,9 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
     const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
+    struct nvn_wait_trace_land trace = {.begin=nvn_wait_trace_stamp(), .id=id};
     pthread_mutex_lock(&g_bmu);
+    if (trace.begin) trace.locked = nvn_wait_trace_stamp();
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
         src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
@@ -390,14 +393,29 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
         break; }
     pthread_mutex_unlock(&g_bmu);
-    if (!found) return;
+    if (trace.begin) {
+        trace.registered = len;
+        trace.copy_begin = nvn_wait_trace_stamp();
+    }
+    if (!found) {
+        if (trace.begin) {
+            trace.end = trace.copy_end = trace.copy_begin;
+            nvn_wait_trace_emit_land(&trace);
+        }
+        return;
+    }
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
     if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);
 #else
     if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
+    if (trace.begin) {
+        trace.copied = src ? len : 0;
+        trace.copy_end = nvn_wait_trace_stamp();
+    }
     pthread_mutex_lock(&g_bmu);
+    if (trace.begin) trace.relocked = nvn_wait_trace_stamp();
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
     // 登记撤掉之后同一段改用当前那份镜像：不受写跟踪的池里，那份镜像此前同步这些页时按登记跳过了这段字节，落地的内容它没有——作废这几页，下次使用重新同步。
@@ -408,6 +426,10 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 锁内撤登记与计数保持一致
     if (!s->landing) pthread_cond_broadcast(&g_land_cv);   // 池销毁 / 会话收尾可安全解除目标映射
     pthread_mutex_unlock(&g_bmu);
+    if (trace.begin) {
+        trace.end = nvn_wait_trace_stamp();
+        nvn_wait_trace_emit_land(&trace);
+    }
 }
 
 // 每次成功解析只写一个桶，不逐页扫描；碰撞合并包络不会漏掉已读范围。

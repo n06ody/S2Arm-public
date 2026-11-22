@@ -1793,6 +1793,8 @@ static uint32_t occl_read(VkQueryPool pool, uint32_t first, uint32_t n, uint64_t
     return miss;
 }
 
+#include "backend_vulkan_wait_trace.inc"
+
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     if (!s->done) return;
     nvn_gpu_done d;
@@ -1868,7 +1870,9 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
         d.ntimestamps = c->report_count;
     }
     g_in_callback++;
+    if (wait_trace_retire.target) wait_trace_retire.callback_enter = wait_trace_clock();
     s->done(s->user, &d);
+    if (wait_trace_retire.target) wait_trace_retire.callback_exit = wait_trace_clock();
     g_in_callback--;
     free(occ);
 }
@@ -1988,7 +1992,6 @@ void nvn_vk_frame_log_gpu_frame_end(void) __attribute__((weak));
 void s2a_adpf_gpu_segment(uint64_t gpu_ns) __attribute__((weak));
 void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_pass_capture.inc"
-#include "backend_vulkan_wait_trace.inc"
 
 static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int sampled = 0;
@@ -2011,8 +2014,12 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             r = vkWaitForFences(vk->d, 1, &s->fence, VK_TRUE, 50ull * 1000ull * 1000ull);
             if (r != VK_TIMEOUT) break;
         }
-        if (wait_begin)
-            wait_trace_add((struct wait_trace_row){.kind="driver_fence", .begin=wait_begin, .end=wait_trace_clock(),
+        uint64_t driver_end = wait_begin ? wait_trace_clock() : 0;
+        if (driver_end && r == VK_SUCCESS && !s->internal)
+            wait_trace_retire = (struct wait_trace_retire){.target=s->signal, .driver_end=driver_end,
+                .cpu_begin=wait_trace_thread_cpu()};
+        if (driver_end)
+            wait_trace_add((struct wait_trace_row){.kind="driver_fence", .begin=wait_begin, .end=driver_end,
                 .target=s->signal, .wsi=s->wsi_seq, .result=r});
         // 测试钩子：真实栅栏必须先完成（否则 fence / command buffer 还在途，不能销毁），
         // 完成后再把它当成失败，走真实的失败终止路径。
@@ -2091,6 +2098,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
     } else if (failed) {
+        wait_trace_retire = (struct wait_trace_retire){0};
         segment_done(s, NVN_GPU_DONE_FAILED, code.code, why);
         pthread_mutex_lock(&g_mu);
         vk->stats[STAT_DONE_FAILED]++;
@@ -2098,8 +2106,11 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         pthread_mutex_unlock(&g_mu);
     } else {
         // 发布顺序：先 done（核心回写），done 返回后才推进已完成值。
+        if (wait_trace_retire.target) wait_trace_retire.done_enter = wait_trace_clock();
         segment_done(s, NVN_GPU_DONE_OK, NVN_GPU_OK, NULL);
+        if (wait_trace_retire.target) wait_trace_retire.done_exit = wait_trace_clock();
         pthread_mutex_lock(&g_mu);
+        if (wait_trace_retire.target) wait_trace_retire.completed_locked = wait_trace_clock();
         uint64_t previous = vk->completed;
         if (s->signal > 0 && s->signal > vk->completed) vk->completed = s->signal;
         uint64_t completed = vk->completed;
@@ -2108,6 +2119,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         vk->stats[STAT_DONE_OK]++;
         pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
+        if (wait_trace_retire.target) wait_trace_retire_end(published, wait_trace_thread_cpu());
         wait_trace_add((struct wait_trace_row){.kind="complete", .begin=published, .end=published,
             .target=s->signal, .before=previous, .after=completed});
     }

@@ -212,12 +212,15 @@ static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
 static void sub_release(struct sub *s);
 static void sub_done(void *user, const nvn_gpu_done *d) {
     struct sub *s = user;
+    struct nvn_wait_trace_sub trace = {.begin=nvn_wait_trace_stamp()};
     ts_capture(s->ts_current, d);
     uint64_t t_done = now_ns();
     if (s->t_commit) { pf_add(RP_PERF_DONE_NS, t_done - s->t_commit); pf_add(RP_PERF_DONE_N, 1); }
     if (d->status != NVN_GPU_DONE_FAILED) busy_done(s->t_commit, t_done);   // 失败段没执行：不算显卡忙
     // 先落 GPU 写，再发布事件和完成序号：等待事件的 CPU 不能先看见旧内存。
+    if (trace.begin) trace.land_begin = nvn_wait_trace_stamp();
     for (int i = 0; i < s->ngw; i++) rp_buf_gpu_write_land(s->gw[i].pool_key, s->gw[i].id, d->status != NVN_GPU_DONE_FAILED);
+    if (trace.begin) trace.land_end = nvn_wait_trace_stamp();
     if (d->status != NVN_GPU_DONE_FAILED)   // 没执行的段不做任何成功回写
         for (int i = 0; i < s->n; i++) {
             if (s->p[i].report) {   // 计数器记录 = {计数值, 时间}（各 8 字节）。时间戳类优先取报告位置的校准 GPU 时刻；
@@ -260,8 +263,14 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
           if (i >= n && e >= s->noe) break;
       }
       g_occ_acc = acc; }
+    if (trace.begin) trace.effects_end = nvn_wait_trace_stamp();
     if (s->fence) { uint64_t f = __atomic_load_n(&g_done_fence, __ATOMIC_RELAXED); if (s->fence > f) __atomic_store_n(&g_done_fence, s->fence, __ATOMIC_RELEASE); }
+    if (trace.begin) trace.replay_publish = nvn_wait_trace_stamp();
     sub_release(s);
+    if (trace.begin) {
+        trace.end = nvn_wait_trace_stamp();
+        nvn_wait_trace_emit_sub(&trace);
+    }
 }
 // 最后一段没交成的提交（开段失败）：它的回写、事件、计数器都不做（同「提交段失败」），登记过的 GPU 写按失败落地。
 // 中途回调与录制者各持引用，原子减到零者释放，避免 orphan 发布后再读已释放内存。
