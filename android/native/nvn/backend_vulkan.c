@@ -94,6 +94,8 @@ struct nvn_gpu_buf_s {
     uint64_t bytes;
     uint64_t va;
     int mem_kind;
+    uint32_t trace_type_bits, trace_type;
+    int trace_prefer_cached;
     int released;
     int refs;
     nvn_gpu_retired_fn retired;
@@ -507,6 +509,7 @@ struct nvn_gpu_vk {
     uint64_t test_delay_signal;   // 测试钩子：让指定 signal 的段先睡 ms
     uint32_t test_delay_ms;
     int pass_capture_delay;
+    int trace_mem_types;
     _Atomic int pass_capture_record, pass_capture_replace;
     _Atomic uint64_t pass_capture_serial;
     uint64_t pass_capture_key;
@@ -2506,7 +2509,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
         static int mt_on = -1; if (mt_on < 0) mt_on = nvn_plat_flag("nvk_mem_types", 0) != 0;
-        if (mt_on) {
+        g.trace_mem_types = mt_on;
+        if (g.trace_mem_types) {
             const VkPhysicalDeviceMemoryProperties *mp = &dev->memory;
             for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
                 char lb[200];
@@ -2934,6 +2938,11 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
             return fail(err, NVN_GPU_E_OOM, "vkMapMemory 失败");
         }
         if (init) memcpy(b->mapped, init, (size_t)bytes);
+        if (g.trace_mem_types) {
+            b->trace_type_bits = req.memoryTypeBits;
+            b->trace_type = type;
+            b->trace_prefer_cached = prefer_cached;
+        }
     }
     pthread_mutex_lock(&g_mu);
     if (g.closing || g.closed) {   // 与 close 的快照串行：close 开始后新建的对象不留在账上
@@ -8284,6 +8293,17 @@ static uint64_t access_id(uint64_t *slot) {
         if (__atomic_compare_exchange_n(slot, &empty, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) id = next;
         else id = empty;
     }
+    return id;
+}
+uint64_t s2a_nvk_wait_trace_mirror(nvn_gpu_buf b, uint64_t pool, unsigned slot) {
+    if (!b || !b->trace_type_bits) return 0;
+    uint64_t id = access_id(&b->access_id);
+    VkMemoryPropertyFlags flags = g.dev->memory.memoryTypes[b->trace_type].propertyFlags;
+    char line[320];
+    snprintf(line, sizeof line, "pool=%llu slot=%u mirror=%llu bytes=%llu bits=0x%x type_index=%u flags=0x%x prefer_cached=%d",
+             (unsigned long long)pool, slot, (unsigned long long)id, (unsigned long long)b->bytes,
+             b->trace_type_bits, b->trace_type, (unsigned)flags, b->trace_prefer_cached);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "mirror-alloc", line);
     return id;
 }
 int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out) {

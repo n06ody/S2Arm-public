@@ -30,7 +30,7 @@ struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; }; 
 // log_cur / log_id：这份镜像在池的追加日志里读到哪（nvn_dirty_log_*）。两份镜像各有一套，互不影响。
 enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32 };
 struct read_range { uint64_t sub, lo, hi; };   // 页区间 [lo, hi]；同桶碰撞取包络，宁可多走有序传输
-struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
+struct mirror { nvn_gpu_buf buf; uint64_t trace_id; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
                 uint64_t *stale, *stale_sum; uint64_t log_cur, log_id;
                 struct read_range reads[READ_BUCKETS]; };
 // 每个池最多两份镜像。平时只有第 0 份；游戏的 Finish 被放行、不等上一帧做完时（rp_exec.c nvn_be_finish_publish），每帧换一份用：
@@ -41,7 +41,7 @@ struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen
 // 以前按整份池禁止，走路时剔除数据每帧都在落地，于是几乎每次解析都退回「录成 GPU 拷贝 + 全屏障」，
 // 真机表现为走路一顿一顿（池镜像同步 4.2 MB/帧、其中直接写只剩 0.2 MB，见坑记录续 33）。
 struct land_rng { uint64_t off, len; };
-struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing;
+struct shadow { const uint8_t *mem; uint64_t size, trace_pool; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing;
                 int log_on, merge_rearm;
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
@@ -173,6 +173,13 @@ static int mirror_make(struct shadow *s, int i) {
     m->checked = calloc(s->npages ? s->npages : 1, sizeof *m->checked);
     if (!m->synced || !m->sub || !m->checked) { mirror_free(m, 0); return 0; }   // 页表没分出来：不留半份镜像（之后每次使用都会读它）
     if (s->log_on && log_arm(s, m)) m->path = MP_LOG;   // 起不了日志就沿用逐页路径
+#if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
+    if (s2a_nvk_wait_trace_mirror) {
+        static uint64_t next_trace_pool; // mirror_make 由 g_bmu 串行，池地址复用时换号
+        if (!s->trace_pool) s->trace_pool = ++next_trace_pool;
+        m->trace_id = s2a_nvk_wait_trace_mirror(b, s->trace_pool, (unsigned)i);
+    }
+#endif
     return 1;
 }
 static struct shadow *shadow_get(const uint8_t *mem, uint64_t size) {
@@ -387,6 +394,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
         src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
+        if (trace.begin) { trace.mirror = s->m[wmi].trace_id; trace.offset = off; }
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
         s->gw[i].landing = 1; found = 1;
         s->landing++;
