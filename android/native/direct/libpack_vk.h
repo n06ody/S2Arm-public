@@ -77,6 +77,21 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
                            uint32_t shared_limit,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
 
+struct fd_program;
+struct nvn_vk_compute_program;
+int s2a_libpack_is_binary(const struct s2a_libpack *lp);
+int s2a_libpack_binary_program(struct s2a_libpack *lp,const uint8_t keys[6][8],uint32_t stages,
+                               const struct s2a_libpack_gfx *gfx,uint32_t shared_limit,
+                               struct fd_program *gp,struct nvn_vk_compute_program *cp,char *why,size_t cap);
+
+#ifdef S2A_LIBPACK_PACKER
+// Host packer and fixtures only. Each result owns its encoded stage bytes.
+int s2a_pack_stage(const uint8_t key[8], unsigned stage, int topology, uint64_t fingerprint,
+                   const uint8_t *json, size_t json_size, const uint8_t *spirv, size_t spirv_size,
+                   uint8_t **record, size_t *record_size);
+void s2a_pack_stage_free(void *record);
+#endif
+
 uint64_t s2a_libpack_hits(void);
 uint64_t s2a_libpack_misses(void);
 uint64_t s2a_libpack_rejects(void);

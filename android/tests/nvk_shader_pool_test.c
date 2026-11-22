@@ -1613,6 +1613,7 @@ static int lp_write(const char *dir, uint64_t key[], const uint8_t kind[], const
     uint8_t idx[48 + 16 + 24 * 16]; memset(idx, 0, sizeof idx);
     memcpy(idx, "S2ALIB\0\0", 8); lp_put32(idx + 8, 1); lp_put32(idx + 12, (uint32_t)n); lp_put32(idx + 16, 1);
     memcpy(idx + 24, DMSH_CHAIN, 12); lp_put64(idx + 48, at);
+    if (kind[n-1] >= 128) memcpy(idx + 44, "S2SB", 4);
     for (int i = 0; i < n; i++) {   // 调用方已按 (键, 种类) 升序给
         uint8_t *r = idx + 64 + 24 * i;
         lp_put64(r, key[i]); r[8] = kind[i]; r[9] = 0; lp_put32(r + 12, (uint32_t)len[i]); lp_put64(r + 16, off[i]);
@@ -1623,6 +1624,9 @@ static int lp_write(const char *dir, uint64_t key[], const uint8_t kind[], const
     return 0;
 }
 static uint64_t lp_key(const uint8_t k[8]) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = v << 8 | k[i]; return v; }
+#ifdef S2A_LIBPACK_PACKER
+#include "direct/libpack_vk.h"
+#endif
 // Exercise the actual warm VS/FS refusal and foreground GS refusal on the same library.
 static void link_refused_test(const char *root, uint8_t keys[3][8], char hex[3][17]) {
     char path[320];
@@ -1737,7 +1741,43 @@ static int gs_libpack_test(int diagnose_refusals) {
         CHECK(strstr(tl, "出包预编（库不在）") != NULL, "libpack tally says the library is missing: %s", tl);
         fake_gs_success = 0;
     }
-    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written");
+    int interface_mismatch = 0;
+#ifdef S2A_LIBPACK_PACKER
+    const char *binary_mode=getenv("S2A_TEST_BINARY_STAGE");
+    if(binary_mode) {
+        interface_mismatch=!strcmp(binary_mode,"missing-varying");
+        // Only the input declaration matters to the host link checker. GS declares no user output.
+        static const uint32_t fragment_input[] = {
+            0x07230203,0x00010300,0,8,0, 0x00040047,4,30,2, 0x00030016,1,32,
+            0x00040020,3,1,1, 0x0004003b,3,4,1,
+        };
+        uint64_t stage_keys[4];
+        uint8_t stage_kind[4], *record[4]={0};
+        const uint8_t *contents[4];
+        size_t record_size[4];
+        unsigned count=0;
+        for(unsigned i=0;i<8;i++) {
+            if(kinds[i]!=1 && kinds[i]!=112 && kinds[i]!=115) continue;
+            unsigned stage=keys[i]==lp_key(k[0])?0:keys[i]==lp_key(k[1])?1:2;
+            int topo=stage==2?kinds[i]-112:-1;
+            unsigned j=0;
+            while(j<8 && (keys[j]!=keys[i] || kinds[j]!=(stage==2?120+topo:52))) j++;
+            if(j==8) { CHECK(0,"binary fixture is missing a stage source"); return 1; }
+            const uint8_t *spv=stage==1 && interface_mismatch?(const uint8_t*)fragment_input:data[j];
+            size_t size=stage==1 && interface_mismatch?sizeof fragment_input:lens[j];
+            int rc=s2a_pack_stage(k[stage],stage,topo,0,data[i],lens[i],spv,size,&record[count],&record_size[count]);
+            CHECK(!rc && record[count],"encode graphics stage via production exporter");
+            if(rc || !record[count]) return 1;
+            stage_keys[count]=keys[i];
+            stage_kind[count]=stage==2?(uint8_t)(129+topo):128;
+            contents[count]=record[count];
+            count++;
+        }
+        CHECK(count==4 && !lp_write(dir,stage_keys,stage_kind,contents,record_size,(int)count),"binary GS container written");
+        for(unsigned i=0;i<count;i++) s2a_pack_stage_free(record[i]);
+    } else
+#endif
+    { CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written"); }
     static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
     static const char prof_off[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":false}}";
     snprintf(external_profile, sizeof external_profile, "%s", prof_on);
@@ -1755,7 +1795,10 @@ static int gs_libpack_test(int diagnose_refusals) {
         int rc = rp_shader_resolve(&q, &p);
         CHECK(rc == 0 && p, "libpack GS %s: program resolves", what[c]);
         CHECK(gs_loads[NVN_GPU_SH_VS] == 1 && gs_loads[NVN_GPU_SH_FS] == 1 && gs_loads[NVN_GPU_SH_GS] == 1, "libpack GS %s: three stages load", what[c]);
-        if (c < 2) {
+        if (interface_mismatch && c < 2) {
+            CHECK(compiler_calls==1 && p && !p->lib_sourced,
+                  "fragment reads unwritten location 2: packaged program rejected and live compiler called");
+        } else if (c < 2) {
             CHECK(compiler_calls == 0, "libpack GS %s: hit from the library, compiler not called (calls=%d)", what[c], compiler_calls);
             CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == sizeof spv0, "libpack GS %s: vs / fs are the library's", what[c]);
             CHECK(gs_blob_bytes[NVN_GPU_SH_GS] == (c == 0 ? sizeof spv_vg3 : sizeof spv_vg0),
@@ -1856,9 +1899,35 @@ static int cs_libpack_test(void) {
     uint8_t ckind[2] = { 1, 52 };
     const uint8_t *cd[2] = { (const uint8_t *)csjson, (const uint8_t *)csspv };
     size_t cn[2] = { strlen(csjson), sizeof csspv };
-    CHECK(lp_write(dir, ck, ckind, cd, cn, 2) == 0, "cs libpack container written");
+#ifdef S2A_LIBPACK_PACKER
+    const char *binary_mode = getenv("S2A_TEST_BINARY_STAGE");
+    int corrupt = binary_mode && !strcmp(binary_mode,"bad-version");
+    if (binary_mode) {
+        uint8_t *record = NULL;
+        size_t record_len = 0;
+        CHECK(!s2a_pack_stage(rp_S.skey[5],5,-1,0,cd[0],cn[0],cd[1],cn[1],&record,&record_len) && record,
+              "production encoder creates binary CS fixture");
+        if (!record) return 1;
+        if (corrupt) record[4] ^= 1;
+        // Include working legacy records with the same key. A broken S2SB must select live compilation.
+        uint64_t keys[3] = {ck[0],ck[0],ck[0]};
+        const uint8_t kinds[3] = {1,52,128};
+        const uint8_t *data[3] = {cd[0],cd[1],record};
+        size_t lengths[3] = {cn[0],cn[1],record_len};
+        CHECK(!lp_write(dir,keys,kinds,data,lengths,3),"write dual-format CS test container");
+        s2a_pack_stage_free(record);
+    } else
+#endif
+    { CHECK(lp_write(dir, ck, ckind, cd, cn, 2) == 0, "cs libpack container written"); }
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
     const struct rp_prog *p = NULL;
+#ifdef S2A_LIBPACK_PACKER
+    if (corrupt) {
+        CHECK(!rp_shader_resolve_compute(&p) && p && compiler_calls==1 && !p->lib_sourced,
+              "damaged binary selects live compilation even with a working legacy pair");
+        goto cs_cleanup;
+    }
+#endif
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == 0 && cs_loads == 1,
           "aligned CS storage hits the library, compiler not called (calls=%d red=%s)", compiler_calls, last_red);
     CHECK(lp_unref_lines == 0, "aligned library hit does not log the unaligned-refuse line (got %d)", lp_unref_lines);
@@ -1909,6 +1978,9 @@ static int cs_libpack_test(void) {
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "没有这一键"), "missing key is remembered: %s", note ? note : "(none)");
         cs_lib_root_rm(sroot); cs_lib_root_rm(mroot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
+#ifdef S2A_LIBPACK_PACKER
+cs_cleanup:
+#endif
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);

@@ -81,7 +81,9 @@ namespace S2A.DshVkLib
             Directory.CreateDirectory(libDir);
             var vg = new System.Text.RegularExpressions.Regex(@"_vg\d\.(json|spv)\z", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
             var names = Directory.EnumerateFiles(keysDir).Select(Path.GetFileName).Where(n => !n.StartsWith("._", StringComparison.Ordinal) && (n.EndsWith("_b.json", StringComparison.Ordinal) || n.EndsWith("_b.spv", StringComparison.Ordinal) || vg.IsMatch(n))).ToList();
-            return LibPack.PackFiles(names, n => File.ReadAllBytes(Path.Combine(keysDir, n)), libDir, chain, Fp);
+            string fp = Fp;
+            return LibPack.PackFiles(names, n => File.ReadAllBytes(Path.Combine(keysDir, n)), libDir, chain, fp,
+                vkStage: n => StagePack.Read(keysDir, n, Convert.ToUInt64(fp, 16)));
         }
 
         /// <summary>汇总行：指纹、键数、ok / skipped（按阶段分列，如「gs 3, hs 1」，看覆盖面用）/ failed</summary>

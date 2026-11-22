@@ -83,6 +83,19 @@ def main():
                 return result.returncode
         return 0
 
+    if sys.argv[1:] == ['--binary-libpack']:
+        first = run('binary-stages', original, args=('--cs-libpack',), extra_flags=['-DS2A_LIBPACK_PACKER'],
+                    env=dict(os.environ, S2A_TEST_BINARY_STAGE='valid'))
+        sys.stdout.write(first.stdout)
+        sys.stderr.write(first.stderr)
+        if first.returncode:
+            return first.returncode
+        for mode, case in (('--cs-libpack', 'bad-version'), ('--gs-libpack', 'valid'),
+                           ('--gs-libpack', 'missing-varying')):
+            subprocess.run([str(out/'binary-stages'), mode], check=True, timeout=30,
+                           env=dict(os.environ, S2A_TEST_BINARY_STAGE=case))
+        return 0
+
     if sys.argv[1:] == ['--live-compile-mutants']:
         text = original.read_text()
         mutants = [
@@ -112,8 +125,8 @@ def main():
              '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
-            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);',
-             'struct entry *e = build(bytes, len, views, nst, rec->identity, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
+            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0, NULL) : build(bytes, len, views, nst, rec->identity, 0, NULL);',
+             'struct entry *e = build(bytes, len, views, nst, rec->identity, 0, NULL);', '--compute-warm', 'compute program warm builds from prior cache'),
             ('flag-ignored', 'if (!nvn_plat_flag("nvk_compute_warm", 0)) return;',
              '(void)nvn_plat_flag("nvk_compute_warm", 0);', '--compute-warm-off', 'compute warm off must not record programs'),
         ]

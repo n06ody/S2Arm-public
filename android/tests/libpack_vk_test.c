@@ -42,9 +42,9 @@ static int trec_cmp(const void *a, const void *b) {
     return x->kind < y->kind ? -1 : x->kind > y->kind;
 }
 // 写 <g_dir>/lib.000.pak（段字节顺序拼接）与 lib.idx；recs[i].off 按拼接回填。
-static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
+static int mk_pack_at(const char *dir, int binary, struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
     char p[400];
-    snprintf(p, sizeof p, "%s/lib.000.pak", g_dir);
+    snprintf(p, sizeof p, "%s/lib.000.pak", dir);
     FILE *f = fopen(p, "wb");
     if (!f) return -1;
     uint64_t off = 0;
@@ -57,19 +57,27 @@ static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], siz
     wr32(idx, 1, &at); wr32(idx, n, &at); wr32(idx, nshard ? nshard : 1, &at); wr32(idx, 0, &at);
     char chain[12] = {0}; memcpy(chain, CHAIN, 12);
     wr(idx, chain, 12, &at); memset(idx + at, 0, 48 - at); at = 48;
+    if (binary) memcpy(idx + 44, "S2SB", 4);
     for (uint32_t s = 0; s < (nshard ? nshard : 1); s++) { wr64(idx, s == 0 ? off : 0, &at); wr64(idx, 0, &at); }
     for (uint32_t i = 0; i < n; i++) {
         wr64(idx, recs[i].key, &at); idx[at++] = recs[i].kind; idx[at++] = recs[i].shard;
         idx[at++] = 0; idx[at++] = 0;
         wr32(idx, recs[i].len, &at); wr64(idx, recs[i].off, &at);
     }
-    snprintf(p, sizeof p, "%s/lib.idx", g_dir);
+    snprintf(p, sizeof p, "%s/lib.idx", dir);
     f = fopen(p, "wb");
     if (!f) return -1;
     fwrite(idx, 1, at, f);
     fclose(f);
     return 0;
 }
+
+static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
+    return mk_pack_at(g_dir, 0, recs, n, payloads, plens, nshard);
+}
+#ifdef S2A_LIBPACK_PACKER
+#include "libpack_stage_cases.inc"
+#endif
 
 static const char *VS_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
@@ -670,6 +678,9 @@ int main(void) {
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
         CHECK(s2a_libpack_open(&slp, g_dir) == 1 && slp, "open separate-sampler pack");
         int rc = slp ? s2a_libpack_program_v1(slp, keys, 3, NULL, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
+#ifdef S2A_LIBPACK_PACKER
+        check_binary_contract(keys, 3, pr, nr, rc, j, jl, w, variant == SEPARATE_C2);
+#endif
         if (variant == SEPARATE_C2 || variant == SUPPORT_FROM_SPV || variant == SUPPORT_LISTED) {
             struct fd_program parsed = {0}; char why[192] = "";
             CHECK(rc == 0 && j && has(j, "\"schema\":\"s2a-direct-program-v2\""),
@@ -743,7 +754,8 @@ int main(void) {
     }
 
     // 计算着色器实际读取组合纹理与支撑缓冲，分别核对反射列出和缺席两种输入。
-    for (int variant = SUPPORT_FROM_SPV; variant <= SUPPORT_WRONG_OWNER; variant++) {
+    enum { COMPUTE_TYPE3_UBO = SUPPORT_WRONG_OWNER + 1 };
+    for (int variant = SUPPORT_FROM_SPV; variant <= COMPUTE_TYPE3_UBO; variant++) {
         const uint8_t key[8] = { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
         char reflection[512];
         snprintf(reflection, sizeof reflection,
@@ -754,6 +766,13 @@ int main(void) {
                  variant == SUPPORT_FROM_SPV ? "" : variant == SUPPORT_LISTED ?
                  ",{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":3}" :
                  ",{\"msl_name\":\"cp_c3_wrong_owner\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":3}");
+        if (variant == COMPUTE_TYPE3_UBO) {
+            snprintf(reflection, sizeof reflection,
+                     "{\"stage\":\"cs\",\"dm_ctl\":\"c0c1c2c3c4c5c6c7\",\"bindings\":["
+                     "{\"msl_name\":\"cp_t_cb5_3001C028\",\"kind\":\"tex_ubo\",\"reg\":2,\"off\":40,\"arg_id\":1},"
+                     "{\"msl_name\":\"cp_t_cb5_3001C028Smplr\",\"kind\":\"samp_id\",\"reg\":7,\"arg_id\":2},"
+                     "{\"msl_name\":\"cp_i0\",\"kind\":\"img\",\"reg\":0,\"arg_id\":4}]}");
+        }
         snprintf(g_dir, sizeof g_dir, "%s/v2cs%d", tmpl, variant);
         CHECK(mkdir(g_dir, 0700) == 0, "create compute v2 pack directory");
         size_t sizes[2] = { strlen(reflection), sizeof libpack_support_v2_comp_spv };
@@ -767,7 +786,17 @@ int main(void) {
         CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute v2 pack");
         uint8_t *j = NULL; size_t jl = 0; char why[192] = "";
         int rc = cl ? s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, &j, &jl, why, sizeof why) : -1;
-        if (variant == SUPPORT_WRONG_OWNER) {
+#ifdef S2A_LIBPACK_PACKER
+        uint8_t binary_keys[6][8] = {{0}};
+        memcpy(binary_keys[0], key, 8);
+        check_binary_contract(binary_keys, 32, payloads, sizes, rc, j, jl, why, 0);
+#endif
+        if (variant == COMPUTE_TYPE3_UBO) {
+            struct nvn_vk_compute_program parsed;
+            CHECK(!rc && j && nvn_vk_program_parse_compute(j,jl,&parsed,why,sizeof why) < 0 &&
+                  strstr(why,"compute binding has no reflected guest slot"),
+                  "current compute contract rejects type-3 guest UBO rather than reading c2");
+        } else if (variant == SUPPORT_WRONG_OWNER) {
             CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(why, "binding 23 is owned by support_buffer"),
                   "compute v2 rejects guest uniform ownership of support binding");
         } else {

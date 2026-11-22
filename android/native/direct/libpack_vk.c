@@ -6,6 +6,7 @@
 //   0x168 区 = 128+），_b.json 的 tex reg 是已解好的 NVN 纹理号 → slot = 8 + reg×2（reg<32）
 //   或 0x5A + (reg-128)×2；img 句柄在 0x120 区 → slot = 0x48 + reg×2。
 #include "libpack_vk.h"
+#include "libpack_stage_wire.h"
 #include "jv.h"   // 跨度式 JSON：_b.json 有长串字段（pos_slice 表 base64），s2a_json 短串上限吃不下
 #include "spirv_workgroup.h"   // s2a_spv_workgroup_bytes：计算出库的设备共享内存上限闸
 #include "../nvn/nvn_vk_program_result.h"   // SUPPORT_DEFAULT_BYTES：计算结果的 supportLayout.requiredSize
@@ -78,7 +79,14 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
     *bytes = NULL; *len = 0;
     const lp_rec *r = lp_find(&lp->p, lp_key8(key), kind);
     if (!r) return S2A_LIBPACK_MISS;
-    if (lp_shard(r) >= lp->p.nshard || r->off + r->len > lp->p.ssize[2 * lp_shard(r)]) {
+    if (kind >= 128 && !memcmp(lp->p.idx + 44, "S2SB", 4) &&
+        r->len > NVK_PROGRAM_RESULT_MAX_BYTES + SB_HEADER + SB_SECTIONS * SB_SECTION + SB_META_SIZE +
+                     2 * (SB_CHOICE + FD_MAX_BINDINGS * SB_BINDING + 4)) {
+        if (why && why_size) snprintf(why, why_size, "binary stage exceeds maximum record size");
+        return S2A_LIBPACK_REJECT;
+    }
+    if (lp_shard(r) >= lp->p.nshard || r->off > lp->p.ssize[2 * lp_shard(r)] ||
+        r->len > lp->p.ssize[2 * lp_shard(r)] - r->off) {
         if (why && why_size) snprintf(why, why_size, "record points outside shard table (%u/%u off=%llu len=%u)",
                                       lp_shard(r), lp->p.nshard, (unsigned long long)r->off, r->len);
         return S2A_LIBPACK_REJECT;
@@ -735,8 +743,8 @@ static int lp_json_has_binding(struct s2a_jv top, int stage_no, uint32_t binding
 }
 
 // 任一段使用 v2 字段时，整个程序的每段都要满足描述符合同。反射里未发出的行不能充当布局条目。
-static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct jw *binds, int *sep, int compute,
-                                 char *why, size_t why_size) {
+static int lp_check_v2_bindings(const struct lp_stage_contract *stage, int *implicit_support,
+                                char *why, size_t why_size) {
     const struct lp_emitted_bindings *emitted = &stage->emitted;
     const struct lp_spv_bindings *declared = &stage->declared;
     if (emitted->count > LP_STAGE_BINDINGS || declared->overflow)
@@ -778,8 +786,17 @@ static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct j
                            stage->key, stage->spv_name, binding, stage->json_name);
         }
     }
-    if (add_support) lp_emit_support(binds, sep, (uint32_t)declared->support, compute);
+    *implicit_support = add_support ? declared->support : -1;
     return 0;
+}
+
+static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct jw *binds, int *sep, int compute,
+                                 char *why, size_t why_size) {
+    int implicit_support = -1;
+    int rc = lp_check_v2_bindings(stage, &implicit_support, why, why_size);
+    if (!rc && implicit_support >= 0)
+        lp_emit_support(binds, sep, (uint32_t)implicit_support, compute);
+    return rc;
 }
 // 几何程序里任一阶段写视口号 / 视口掩码（OpDecorate / OpMemberDecorate BuiltIn ViewportIndex 10、ViewportMaskNV 5253、
 //   SecondaryViewportMaskNV 5258、ViewportMaskPerViewNV 5262）：回放层没有视口数组，现编（DirectShaderCompiler ValidateSpirv
@@ -801,8 +818,8 @@ static int lp_spv_viewport_builtin(const uint8_t *spv, size_t n) {
 //   （倍率恒 1，与机上现编同口径）。只按 2608 绑的话越界读到的是未定义值（设备没开 robustBufferAccess）
 #define LP_SUPPORT_ABI2_BYTES 3776u
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
-static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
-                         uint32_t shared_limit,
+static int lp_stage_from_bytes(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
+                         uint32_t shared_limit, const uint8_t *jb, size_t jn, uint8_t *spv, size_t sn,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
                          uint32_t *support_bytes, int *uses_v2, struct lp_stage_contract *contract,
                          char *why, size_t why_size) {
@@ -813,16 +830,9 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
     char *khex = contract->key;
     for (int i = 0; i < 8; i++) snprintf(khex + 2 * i, 3, "%02x", key[i]);
     // 几何段：每种输入图元一份（DshVk.CompileGeometry），_vg<t>.json 种类 112+t / _vg<t>.spv 种类 120+t
-    const unsigned kjson = gs ? LP_K_VGJSON + (unsigned)gs_topology : LP_K_BJSON, kspv = gs ? LP_K_VGSPV + (unsigned)gs_topology : LP_K_BSPV;
     const char *jname = contract->json_name, *sname = contract->spv_name;
     snprintf(contract->json_name, sizeof contract->json_name, gs ? "_vg%d.json" : "_b.json", gs_topology);
     snprintf(contract->spv_name, sizeof contract->spv_name, gs ? "_vg%d.spv" : "_b.spv", gs_topology);
-    uint8_t *jb = NULL, *spv = NULL; size_t jn = 0, sn = 0;
-    char gw[192] = "";
-    int rc = s2a_libpack_get(lp, key, kjson, &jb, &jn, gw, sizeof gw);
-    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, jname, gw[0] ? gw : "absent"); free(jb); return rc; }
-    rc = s2a_libpack_get(lp, key, kspv, &spv, &sn, gw, sizeof gw);
-    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, sname, gw[0] ? gw : "absent"); free(jb); free(spv); return rc; }
     struct s2a_jv top = { (const char *)jb, jn };
     int out = -1;
     {   // 全文档语法核 + 顶层必须恰是一个对象（jv 不具现字符串，长串字段只吃跨度）
@@ -928,8 +938,35 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         out = 0;
     }
 done:
-    free(jb); free(spv);
     return out;
+}
+
+static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
+                         uint32_t shared_limit,
+                         struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
+                         uint32_t *support_bytes, int *uses_v2, struct lp_stage_contract *contract,
+                         char *why, size_t why_size) {
+    const char *lib_stage = lp_nvn_stage_name(nvn);
+    if (!lib_stage) return S2A_LIBPACK_MISS;
+    int gs = nvn == 2;
+    if (gs && (gs_topology < 0 || gs_topology > 4)) return S2A_LIBPACK_MISS;
+    char khex[17], jname[16], sname[16];
+    for (int i = 0; i < 8; i++) snprintf(khex + 2*i, 3, "%02x", key[i]);
+    snprintf(jname, sizeof jname, gs ? "_vg%d.json" : "_b.json", gs_topology);
+    snprintf(sname, sizeof sname, gs ? "_vg%d.spv" : "_b.spv", gs_topology);
+    unsigned kjson = gs ? LP_K_VGJSON + (unsigned)gs_topology : LP_K_BJSON;
+    unsigned kspv = gs ? LP_K_VGSPV + (unsigned)gs_topology : LP_K_BSPV;
+    uint8_t *jb = NULL, *spv = NULL; size_t jn = 0, sn = 0;
+    char gw[192] = "";
+    int rc = s2a_libpack_get(lp, key, kjson, &jb, &jn, gw, sizeof gw);
+    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, jname, gw[0] ? gw : "absent"); free(jb); return rc; }
+    rc = s2a_libpack_get(lp, key, kspv, &spv, &sn, gw, sizeof gw);
+    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, sname, gw[0] ? gw : "absent"); free(jb); free(spv); return rc; }
+    rc = lp_stage_from_bytes(lp, key, nvn, compute, gs_topology, shared_limit, jb, jn, spv, sn,
+                             stages, binds, bind_sep, stage_mask, support_bytes, uses_v2, contract, why, why_size);
+    free(jb);
+    free(spv);
+    return rc;
 }
 
 // 绘制图元名（现编请求 graphicsState.topology 同名：nvn_vk_compile_facts.c nvk_input_topology）→ InputTopology 编号；
@@ -1080,3 +1117,9 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     else atomic_fetch_add(&g_rejects, 1);
     return rc;
 }
+
+#include "libpack_stage_read.inc"
+
+#ifdef S2A_LIBPACK_PACKER
+#include "libpack_stage_export.inc"
+#endif
