@@ -1643,7 +1643,7 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 // 只读计数（单测按事件判、不量墙钟，t_nvn_glsync ⑦）：nvnSyncWait 进入带超时（> 0）阻塞等待的次数。只增不减，不改行为
 static _Atomic uint64_t g_syncwait_blocks;
 uint64_t s2a_nvn_syncwait_blocks(void) { return atomic_load_explicit(&g_syncwait_blocks, memory_order_relaxed); }
-NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
+static NVNsyncWaitResult sync_wait_impl(const NVNsync *s, uint64_t timeout, uint64_t *observed) {
     uint64_t fence;
     { void *owner = NULL;
       if (nvn_be_xq_owed(s, &owner)) {
@@ -1654,12 +1654,27 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
               xq_lock(); nvn_be_xq_flush(owner, "the CPU waits on a fence taken behind it (SyncWait, 100 ms)"); xq_unlock();
           } } }
     if (!sync_published((const sync_t *)s, &fence)) return NVN_SYNC_WAIT_RESULT_FAILED;   // 没打过栅栏：同真机驱动回 3（见上）
+    if (observed) *observed = fence;
     { int ext = 0; if (sync_ext_wait((const sync_t *)s, 0, &ext)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
       if (ext) { if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
                  return sync_ext_wait((const sync_t *)s, timeout, &ext) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; } }
     if (nvn_be_wait(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
     return nvn_be_wait(fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+}
+NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
+#if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
+    if (s2a_nvk_wait_trace_begin && s2a_nvk_wait_trace_end) {
+        uint64_t call = s2a_nvk_wait_trace_begin(s, timeout, (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)));
+        if (call) {
+            uint64_t fence = 0;
+            NVNsyncWaitResult result = sync_wait_impl(s, timeout, &fence);
+            s2a_nvk_wait_trace_end(call, fence, result);
+            return result;
+        }
+    }
+#endif
+    return sync_wait_impl(s, timeout, NULL);
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }

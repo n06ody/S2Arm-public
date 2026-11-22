@@ -7,6 +7,7 @@
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
+#include "nvn_wait_trace.h"
 #include "nvn_mtl.h"   // 上沿声明（nvn_be_* 与 NVN_EV_WAIT；文件名是历史名，内容与 Metal 无关）
 #include <limits.h>
 #include <pthread.h>
@@ -550,10 +551,19 @@ void nvn_be_finish_wait(uint64_t fence) {
 // WAIT_* 记的是游戏主动等同步对象的次数 / 耗时。入口先看这段活是不是早就做完（rp_fence_done）：是的话不必再下去等，
 // 但仍照旧记一次 WAIT_N / WAIT_NS（耗时只含这次判定），另记一个 WAIT_ALREADY_N——它不为 0 说明我们把已完成的等待也当成了阻塞在等。
 static int g_wrote_since_wait;   // 本轮等待之后有没有「显卡写游戏缓冲」的活（定义在 rp_post_gpu_write_rows 上面）
+static inline void trace_wait_fast(uint64_t fence, uint64_t timeout, int allowed) {
+#if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
+    if (s2a_nvk_wait_trace_fast)
+        s2a_nvk_wait_trace_fast(fence, __atomic_load_n(&g_done_fence, __ATOMIC_ACQUIRE), timeout,
+                               allowed ? NVN_WAIT_TRACE_ALLOWED : NVN_WAIT_TRACE_READY);
+#else
+    (void)fence; (void)timeout; (void)allowed;
+#endif
+}
 int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!fence) return 1;
     uint64_t t0 = now_ns();
-    if (rp_fence_done(fence)) { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_ALREADY_N, 1); fl_fence(w); return 1; }
+    if (rp_fence_done(fence)) { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_ALREADY_N, 1); fl_fence(w); trace_wait_fast(fence, timeout_ns, 0); return 1; }
     {   // 开关 debug.s2a.nvk_sync_lag（缺省 0 = 旧行为：真等）：
         //   1 = 允许「最多一次提交还在显卡上飞」：等的时候若这一栅栏只领先已完成值一格就不真等（返回已满足），
         //       下一次提交前换一份池镜像（照 nvk_finish_lag 的做法，见 rp_buf_frame_flip），让 CPU 回放与显卡执行重叠。
@@ -577,7 +587,7 @@ int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
             // 不能放行：双镜像只保护 GPU 读，不会阻止完成回调覆盖新的 CPU 写。
             // 时间戳同样会覆盖游戏内存，SyncWait 不能像 Finish 一样排除它；只读提交仍保留重叠。
             if (__atomic_load_n(&g_wait_effect_fence, __ATOMIC_ACQUIRE) > done) allow = 0;
-            if (allow) { rp_buf_frame_flip(); uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); fl_fence(w); return 1; }
+            if (allow) { rp_buf_frame_flip(); uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); fl_fence(w); trace_wait_fast(fence, timeout_ns, 1); return 1; }
         } }
     nvn_gpu_rc r = nvn_gpu_fence_wait(fence, timeout_ns, NULL);
     __atomic_store_n(&g_wrote_since_wait, 0, __ATOMIC_RELEASE);   // 真等过：显卡写的缓冲已经落地

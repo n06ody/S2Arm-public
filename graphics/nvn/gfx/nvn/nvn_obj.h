@@ -6,6 +6,7 @@
 #include <string.h>
 #include "nvn.h"
 #include "nvn_tex.h"
+#include "nvn_wait_trace.h"
 
 #define MAGIC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 #define FITS(T, H) _Static_assert(sizeof(T) <= sizeof(H), #T " exceeds the reserved size of " #H)
@@ -83,6 +84,9 @@ static inline void sync_publish_ext(sync_t *s, uint64_t fence, void *ev, uint64_
     __atomic_store_n(&s->fence, fence, __ATOMIC_RELAXED);
     __atomic_store_n(&s->ext_ev, ev, __ATOMIC_RELAXED); __atomic_store_n(&s->ext_val, v, __ATOMIC_RELAXED);
     __atomic_store_n(&s->fenced, 1u, __ATOMIC_RELEASE);
+#if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
+    if (s2a_nvk_wait_trace_publish) s2a_nvk_wait_trace_publish(s, fence);
+#endif
 }
 static inline void sync_publish(sync_t *s, uint64_t fence) { sync_publish_ext(s, fence, NULL, 0); }   // 重新围栏：别的队列的栅栏作废
 // 已发布且是别的队列的栅栏：*ev / *v 给出要等的共享事件与值

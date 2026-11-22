@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "nvn_backend.h"
+#include "nvn_wait_trace.h"
 #include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"
 #include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
@@ -1987,6 +1988,7 @@ void nvn_vk_frame_log_gpu_frame_end(void) __attribute__((weak));
 void s2a_adpf_gpu_segment(uint64_t gpu_ns) __attribute__((weak));
 void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_pass_capture.inc"
+#include "backend_vulkan_wait_trace.inc"
 
 static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int sampled = 0;
@@ -2004,10 +2006,14 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             nanosleep(&ts, NULL);
         }
         VkResult r = VK_TIMEOUT;
+        uint64_t wait_begin = wait_trace_stamp();
         while (!vk->stop && !vk->device_lost) {
             r = vkWaitForFences(vk->d, 1, &s->fence, VK_TRUE, 50ull * 1000ull * 1000ull);
             if (r != VK_TIMEOUT) break;
         }
+        if (wait_begin)
+            wait_trace_add((struct wait_trace_row){.kind="driver_fence", .begin=wait_begin, .end=wait_trace_clock(),
+                .target=s->signal, .wsi=s->wsi_seq, .result=r});
         // 测试钩子：真实栅栏必须先完成（否则 fence / command buffer 还在途，不能销毁），
         // 完成后再把它当成失败，走真实的失败终止路径。
         if (r == VK_SUCCESS && fail_sig && fail_sig == s->signal) r = (VkResult)VK_ERROR_UNKNOWN;
@@ -2094,11 +2100,16 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         // 发布顺序：先 done（核心回写），done 返回后才推进已完成值。
         segment_done(s, NVN_GPU_DONE_OK, NVN_GPU_OK, NULL);
         pthread_mutex_lock(&g_mu);
+        uint64_t previous = vk->completed;
         if (s->signal > 0 && s->signal > vk->completed) vk->completed = s->signal;
+        uint64_t completed = vk->completed;
+        uint64_t published = wait_trace_stamp();
         submitted_compact_locked(vk);
         vk->stats[STAT_DONE_OK]++;
         pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
+        wait_trace_add((struct wait_trace_row){.kind="complete", .begin=published, .end=published,
+            .target=s->signal, .before=previous, .after=completed});
     }
     if (s->fence) vkDestroyFence(vk->d, s->fence, NULL);
     int embedded = s->embedded;
@@ -2530,6 +2541,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g_seg_stg_std = nvn_plat_flag("nvk_stg_std", 1) != 0; g_seg_stg_hit = g_seg_stg_miss = g_seg_stg_kept = g_seg_stg_rej = g_seg_stg_full = 0;
     pthread_mutex_unlock(&g_seg_mu);
     plc_open(d->cache_dir);   // 缓存是加速不是前提：里面任何一步失败都落到「不带缓存」，不让 open 失败
+    wait_trace_open(nvn_plat_flag("nvk_wait_trace_s", 0));
     g_open = 1;
     return rc(NVN_GPU_OK);
 }
@@ -2756,6 +2768,8 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     g.nsub = g.capsub = 0;
     g.closed = 1;
     g.close_active = 0;
+    if (atomic_load_explicit(&wait_trace_phase, memory_order_relaxed) == WT_ACTIVE)
+        wait_trace_dump(wait_trace_clock());
     g_open = 0;
     return rc(NVN_GPU_OK);
 }
@@ -8597,6 +8611,9 @@ static void publish_signal(uint64_t signal, int failed) {
     }
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
+    uint64_t now = wait_trace_stamp();
+    wait_trace_add((struct wait_trace_row){.kind="submit", .begin=now, .end=now,
+        .target=signal, .result=failed});
 }
 
 // 持 g_submit_mu，c 已录完。待转表不空：在 c 的池里另录一个命令缓冲，把表里的图像从 UNDEFINED 转到 GENERAL（见「图像布局」），
@@ -8852,48 +8869,48 @@ uint64_t nvn_gpu_fence_failed(void) {
     return v;
 }
 
+// g_mu is held by the caller. The condition wait alone releases it.
+static nvn_gpu_rc fence_wait_locked(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err, int *blocked) {
+    if (g.completed >= v) return rc(NVN_GPU_OK);   // 已完成的旧值不再保留在提交集合里
+    if (g.failed && v >= g.failed) {
+        uint64_t f = g.failed;
+        return fail(err, NVN_GPU_E_FAILED, "时间线首个失败段 F=%llu", (unsigned long long)f);
+    }
+    if (!submitted_has(&g, v)) {
+        return fail(err, NVN_GPU_E_ARG, "v=%llu 从未提交过", (unsigned long long)v);
+    }
+    if (timeout_ns == 0) return rc(NVN_GPU_E_TIMEOUT);
+    struct timespec ts;
+    deadline_after(&ts, timeout_ns);
+    while (g.completed < v) {
+        if (g.failed && v >= g.failed) {
+            return fail(err, NVN_GPU_E_FAILED, "时间线首个失败段 F=%llu", (unsigned long long)g.failed);
+        }
+        if (g.device_lost) {
+            return fail(err, NVN_GPU_E_DEVICE, "设备已丢失");
+        }
+        *blocked = 1;
+        if (pthread_cond_timedwait(&g_cv, &g_mu, &ts) != 0 && g.completed < v)
+            return rc(NVN_GPU_E_TIMEOUT);
+    }
+    return rc(NVN_GPU_OK);
+}
+
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) {
     if (!g_open) return fail(err, NVN_GPU_E_STOPPED, "后端未打开");
     if (g_in_callback) return fail(err, NVN_GPU_E_ORDER, "回调里不许等栅栏");
     if (v == 0) return fail(err, NVN_GPU_E_ARG, "v = 0 不是提交过的值");
     pthread_mutex_lock(&g_mu);
-    if (g.completed >= v) {   // 已完成的旧值不再保留在提交集合里
-        pthread_mutex_unlock(&g_mu);
-        return rc(NVN_GPU_OK);
-    }
-    if (g.failed && v >= g.failed) {
-        uint64_t f = g.failed;
-        pthread_mutex_unlock(&g_mu);
-        return fail(err, NVN_GPU_E_FAILED, "时间线首个失败段 F=%llu", (unsigned long long)f);
-    }
-    if (!submitted_has(&g, v)) {
-        pthread_mutex_unlock(&g_mu);
-        return fail(err, NVN_GPU_E_ARG, "v=%llu 从未提交过", (unsigned long long)v);
-    }
-    if (timeout_ns == 0) {
-        pthread_mutex_unlock(&g_mu);
-        return rc(NVN_GPU_E_TIMEOUT);
-    }
-    struct timespec ts;
-    deadline_after(&ts, timeout_ns);
-    while (g.completed < v) {
-        if (g.failed && v >= g.failed) {
-            pthread_mutex_unlock(&g_mu);
-            return fail(err, NVN_GPU_E_FAILED, "时间线首个失败段 F=%llu", (unsigned long long)g.failed);
-        }
-        if (g.device_lost) {
-            pthread_mutex_unlock(&g_mu);
-            return fail(err, NVN_GPU_E_DEVICE, "设备已丢失");
-        }
-        if (pthread_cond_timedwait(&g_cv, &g_mu, &ts) != 0) {
-            if (g.completed < v) {
-                pthread_mutex_unlock(&g_mu);
-                return rc(NVN_GPU_E_TIMEOUT);
-            }
-        }
-    }
+    uint64_t begin = wait_trace_stamp(), before = g.completed;
+    int blocked = 0;
+    nvn_gpu_rc result = fence_wait_locked(v, timeout_ns, err, &blocked);
+    uint64_t after = g.completed, end = begin ? wait_trace_clock() : 0;
     pthread_mutex_unlock(&g_mu);
-    return rc(NVN_GPU_OK);
+    if (begin)
+        wait_trace_add((struct wait_trace_row){.kind=blocked ? "cpu_block" : timeout_ns ? "cpu_immediate" : "cpu_query",
+            .begin=begin, .end=end, .call=wait_trace_call, .target=v, .before=before, .after=after,
+            .timeout=timeout_ns, .result=result.code});
+    return result;
 }
 
 // ---------------------------------------------------------------- 读数 / 测试钩子

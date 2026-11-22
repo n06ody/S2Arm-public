@@ -600,7 +600,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     }
     s->acquire_pending[sem] = 0;   // 这把信号量已交给呈现段去等
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
-    seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
+    uint64_t wsi_seq = ++g.wsi_seq;
+    seg->wsi_seq = s->acquire_waiter[sem] = wsi_seq;   // 持 g_submit_mu：序号与入队同序
     enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];
@@ -613,6 +614,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        wait_trace_present(wsi_seq);
         uint64_t tnow = now_ns();
         if (!s->timing.start) s->timing.start = tnow;
         wsi_timing_submitted(&s->timing, timing_id);
