@@ -100,6 +100,13 @@ static const char *PS_SEPSAMP_JSON =
     "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
     "{\"msl_name\":\"fp_t_sepSmplr\",\"kind\":\"samp\",\"reg\":3,\"arg_id\":3},"
     "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
+// 0x1056805A: 类型 1，c2 字 90（分离贴图 #128）与 c2 字 346（分离采样器 #0）。
+static const char *PS_SEPSAMP_C2_JSON =
+    "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"1032547698badcfe\",\"bindings\":["
+    "{\"msl_name\":\"fp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+    "{\"msl_name\":\"fp_t_cb196610_1056805A\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+    "{\"msl_name\":\"fp_t_cb196610_1056805ASmplr\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":3},"
+    "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
 
 static const char *VS_BUFFER_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
@@ -433,19 +440,60 @@ int main(void) {
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     }
 
-    // 分离贴图的采样器半边：samp_tex → 槽 90、分离贴图槽 128；samp（分离采样器）→ 不给槽、解析后不挂槽
-    for (int variant = 0; variant < 2; variant++) {
-        const char *ps = variant ? PS_SEPSAMP_JSON : PS_SAMPTEX_JSON;
+    // 同字采样器仍是 v1；有真类型/来源/声明证明的独立采样器才是 v2。
+    enum { SAME_WORD, UNKNOWN_HANDLE, SEPARATE_C2, TYPE_2, MISSING_HALF, DUP_HALF, WRONG_HALF_SLOT,
+           WRONG_SET, WRONG_BINDING, DESCRIPTOR_ARRAY, EXTRA_SAMPLER, SKIPPED_KIND, SEP_CASES };
+    for (int variant = SAME_WORD; variant < SEP_CASES; variant++) {
+        char reflection[1024];
+        snprintf(reflection, sizeof reflection, "%s", variant == SAME_WORD ? PS_SAMPTEX_JSON :
+                 variant == UNKNOWN_HANDLE ? PS_SEPSAMP_JSON : PS_SEPSAMP_C2_JSON);
+        uint32_t mutated[sizeof libpack_frag_spv / sizeof(uint32_t)];
+        const uint8_t *fragment = libpack_frag_spv;
+        size_t fragment_bytes = sizeof libpack_frag_spv;
+        if (variant == TYPE_2) {
+            char *handle = strstr(reflection, "1056805A");
+            *handle = '2'; *strstr(handle + 1, "1056805A") = '2';
+        } else if (variant == MISSING_HALF || variant == DUP_HALF || variant == WRONG_HALF_SLOT) {
+            char *half = strstr(reflection, "{\"msl_name\":\"fp_t_cb196610_1056805ASmplr\"");
+            size_t half_bytes = (size_t)(strchr(half, '}') + 2 - half);
+            if (variant == MISSING_HALF) memmove(half, half + half_bytes, strlen(half + half_bytes) + 1);
+            else if (variant == DUP_HALF) memmove(half + half_bytes, half, strlen(half) + 1);
+            else strstr(half, "\"reg\":0")[6] = '1';
+        } else if (variant == WRONG_SET || variant == WRONG_BINDING) {
+            memcpy(mutated, libpack_frag_spv, fragment_bytes);
+            uint32_t target = 0;
+            size_t n = fragment_bytes / sizeof(uint32_t);
+            for (size_t i = 5; i < n; i += mutated[i] >> 16) {
+                if (mutated[i] != 0x00040047 || mutated[i + 2] != 33 || mutated[i + 3] != 10) continue;
+                target = mutated[i + 1];
+                if (variant == WRONG_BINDING) mutated[i + 3] = 12;
+            }
+            CHECK(target != 0, "fixture has descriptor binding 10");
+            if (variant == WRONG_SET) for (size_t i = 5; i < n; i += mutated[i] >> 16)
+                if (mutated[i] == 0x00040047 && mutated[i + 1] == target && mutated[i + 2] == 34) mutated[i + 3] = 1;
+            fragment = (const uint8_t *)mutated;
+        } else if (variant == DESCRIPTOR_ARRAY) {
+            fragment = (const uint8_t *)libpack_array_spv; fragment_bytes = sizeof libpack_array_spv;
+        } else if (variant == EXTRA_SAMPLER || variant == SKIPPED_KIND) {
+            fragment = (const uint8_t *)libpack_half_spv; fragment_bytes = sizeof libpack_half_spv;
+            if (variant == SKIPPED_KIND) {
+                char *half = strstr(reflection, "1056805ASmplr\"");
+                strstr(half, "\"arg_id\":3")[9] = '5';
+                snprintf(reflection + strlen(reflection) - 2, sizeof reflection - strlen(reflection) + 2,
+                         ",{\"msl_name\":\"fp_sampler_only\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":3}]}");
+            }
+        }
+        const char *ps = reflection;
         snprintf(g_dir, sizeof g_dir, "%s/sepsamp%d", tmpl, variant);
         CHECK(mkdir(g_dir, 0700) == 0, "create separate-sampler pack directory");
         struct trec rs[4] = {
             { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(VS_JSON) },
             { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
             { .key = 0x1032547698badcfe, .kind = 1, .len = (uint32_t)strlen(ps) },
-            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)fragment_bytes },
         };
-        const uint8_t *pr[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)ps, libpack_frag_spv };
-        size_t nr[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(ps), sizeof libpack_frag_spv };
+        const uint8_t *pr[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)ps, fragment };
+        size_t nr[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(ps), fragment_bytes };
         CHECK(mk_pack(rs, 4, pr, nr, 1) == 0, "separate-sampler pack written");
         struct s2a_libpack *slp = NULL; uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
         uint8_t keys[6][8] = {{0}};
@@ -454,11 +502,28 @@ int main(void) {
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
         CHECK(s2a_libpack_open(&slp, g_dir) == 1 && slp, "open separate-sampler pack");
         int rc = slp ? s2a_libpack_program_v1(slp, keys, 3, NULL, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
-        if (variant) {
-            // samp（分离采样器槽）v1 表达不了：绑定出不了 guest 槽也没有出处字段 → 出库即 REJECT，
-            //   不再产 slot -1 死绑定让消费端再拒一遍（#1774）
-            CHECK(rc == -1 && !j && strstr(w, "no consumable guest source") && strstr(w, "fp_t_sep"),
-                  "sep-tex + samp（分离采样器）→ REJECT（不产 slot -1 死绑定）");
+        if (variant == SEPARATE_C2) {
+            struct fd_program parsed = {0}; char why[192] = "";
+            CHECK(rc == 0 && j && has(j, "\"schema\":\"s2a-direct-program-v2\""),
+                  "type-1 c2 separate sampler produces a v2 program");
+            int parsed_rc = j ? nvn_vk_program_parse_graphics(j, jl, &parsed, why, sizeof why) : -1;
+            const struct fd_binding *binding = NULL;
+            int sampler_half = 0;
+            for (int i = 0; i < parsed.binding_count; i++) {
+                if (parsed.bindings[i].binding == 10) binding = &parsed.bindings[i];
+                if (parsed.bindings[i].binding == 22) sampler_half++;
+            }
+            CHECK(parsed_rc == 0 && binding && binding->set == 0 && binding->count == 1 &&
+                  binding->tex_slot == 128 && binding->samp_slot == 0 && !sampler_half,
+                  "v2 preserves the single combined descriptor with independent sampler slot 0");
+            nvn_vk_program_free(&parsed);
+        } else if (variant != SAME_WORD) {
+            const char *reason = variant == DUP_HALF ? "duplicate sampler half" :
+                    variant >= EXTRA_SAMPLER ? "binding 22 has no" :
+                    variant >= WRONG_SET ? "single combined image sampler at set 0 binding 10" : "no consumable guest source";
+            if (rc != S2A_LIBPACK_REJECT || j || !strstr(w, reason))
+                fprintf(stderr, "separate sampler variant %d returned %d: %s\n", variant, rc, w);
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(w, reason), "invalid separate sampler shape is rejected before assembly");
         } else {
             CHECK(rc == 0 && j, "separate-sampler pack yields a v1 program");
             CHECK(has(j, "\"kind\":\"texture\",\"stage\":\"fs\",\"set\":0,\"binding\":10,\"slot\":90"),
