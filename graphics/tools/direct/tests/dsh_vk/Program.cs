@@ -20,7 +20,9 @@
 // libdsx（--dsx，必给）：Finish 对片元调 NxgalSpvCross.ColorRound，Compile 对所有阶段交 SPIRV-Cross 前先调 NxgalSpvCross.Harden（main de14970a6，#1204 T1），
 //   两者都 DllImport("dsx")。t_dsh_vk.sh 在 Mac 给 build/dsx/libdsx.dylib，在 Linux 给 build/dsx/linux/libdsx.so（#783），
 //   三个键都走 CompileWithSpv。SPIRV-Cross 两边都用命令行版（CliSpvCross），--dsx 只改上面两个 DllImport 的去处。
-// 用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx>
+//   ⑭ 存储缓冲窗口读回夹具料（可选 --emit <目录>）：同一份 VS（读 [基址+0x20]、写 [基址+0x40] 与 [基址+0]，基址取自 c0+0x110，写入值取自 c3[0]）
+//      走 CompileWithSpv 出 _b.json / _b.spv 放进给定目录，android/tests/vk/standalone/libpack-ssbo-window.sh 在 lavapipe 上用它读回字节。
+// 用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx> [--emit <目录>]
 using S2A.Dsh;
 using System;
 using System.Collections.Generic;
@@ -87,6 +89,16 @@ static class Program
         return (code, ctl);
     }
 
+    // ⑭ 窗口读回夹具的 VS：R0:R1 = c0+0x110 的存储缓冲 0 基址（游戏原始地址），R2 = c3[0]；R4 = [基址+0x20]；[基址+0x40] = R4；[基址+0] = R2
+    static (byte[] Code, byte[] Ctl) WindowFixture()
+    {
+        const uint store = (1u << 16) | (1u << 26);   // SPH DoesGlobalStore / DoesLoadOrStore
+        var code = Bundles(Sph(1 | (3 << 5) | (1 << 10) | store, -1), new[] {
+            Ldc(0, 0, 0x110, 5), Ldc(2, 3, 0, 4), Ldg32(4, 0, 0x20), Stg32(4, 0, 0x40), Stg32(2, 0, 0), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 21;
+        return (code, ctl);
+    }
+
     static (string Stage, byte[] Code, byte[] Ctl)[] Fixtures()
     {
         const uint store = (1u << 16) | (1u << 26);   // SPH DoesGlobalStore / DoesLoadOrStore
@@ -123,6 +135,28 @@ static class Program
         }
         return vars.Where(v => v.Value is 0 or 2 or 12 && bind.ContainsKey(v.Key))
                    .ToDictionary(v => names.GetValueOrDefault(v.Key, "%" + v.Key), v => (set.GetValueOrDefault(v.Key, uint.MaxValue), bind[v.Key], touched.Contains(v.Key)));
+    }
+
+    static bool UsesStorageWindowMask(byte[] spv, uint id)
+    {
+        var words = MemoryMarshal.Cast<byte, uint>(spv.AsSpan());
+        bool defaultMask = false;
+        bool maskedAddress = false;
+        var maskIds = new HashSet<uint> { id };
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("bad SPIR-V word count");
+            int op = (int)(words[i] & 0xffff);
+            if (op == 50 && count == 4 && words[i + 2] == id) // OpSpecConstant
+                defaultMask = words[i + 3] == uint.MaxValue;
+            if (op == 124 && count == 4 && maskIds.Contains(words[i + 3])) // OpBitcast
+                maskIds.Add(words[i + 2]);
+            if (op == 199 && count == 5 && (maskIds.Contains(words[i + 3]) || maskIds.Contains(words[i + 4]))) // OpBitwiseAnd
+                maskedAddress = true;
+            i += count;
+        }
+        return defaultMask && maskedAddress;
     }
 
     // 全部 OpTypeImage 的（dim, Sampled, Image Format 操作数）：OpTypeImage %id %采样类型 %dim %depth %arrayed %ms %sampled %format
@@ -209,7 +243,7 @@ static class Program
 
     static int Main(string[] args)
     {
-        if (!(args.Length == 5 && args[3] == "--dsx")) { Console.Error.WriteLine("用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx>"); return 2; }
+        if (!((args.Length == 5 || (args.Length == 7 && args[5] == "--emit")) && args[3] == "--dsx")) { Console.Error.WriteLine("用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx> [--emit <目录>]"); return 2; }
         string val = args[1], root = args[2], tables = Path.Combine(root, "tables"), outDir = Path.Combine(root, "out"), dsx = args[4];
         NativeLibrary.SetDllImportResolver(typeof(NxgalSpvCross).Assembly, (name, asm, path) => name == "dsx" ? NativeLibrary.Load(dsx) : IntPtr.Zero);
         Directory.CreateDirectory(tables); Directory.CreateDirectory(outDir);
@@ -232,7 +266,8 @@ static class Program
         var perStage = new Dictionary<string, (Dictionary<string, (uint Set, uint Binding, bool Used)> Res, JsonArray Bindings)>();
         foreach (var (key, stage, code, ctl) in keys)
         {
-            var bindings = JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, key + "_b.json")))["bindings"].AsArray();
+            var metadata = JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, key + "_b.json")));
+            var bindings = metadata["bindings"].AsArray();
             string spvPath = Path.Combine(outDir, key + "_b.spv");
             byte[] spv = File.ReadAllBytes(spvPath);
             var res = Resources(spv);
@@ -251,8 +286,24 @@ static class Program
             string err = p.StandardError.ReadToEnd() + p.StandardOutput.ReadToEnd(); p.WaitForExit();
             Check($"③ {stage} spirv-val --target-env vulkan1.1", p.ExitCode == 0, err.Trim());
 
-            var raw = DshCompiler.TranslateForVulkan(stage, code, ctl, root).Spv;   // 同空表：与 _b.spv 同一遍翻译、未改写
+            var raw = DshCompiler.TranslateForVulkan(stage, code, ctl, root).Spv;   // 空表，现编路径，未改写绑定
             rawDiff += Mismatch(Resources(raw), bindings, StageNoOf[stage]).Count;
+
+            if (stage == "vs")
+            {
+                uint mask = (uint?)metadata["ssbo_window_mask"] ?? 0;
+                Check("顶点出包将驱动地址与可替换 SSBO 窗口掩码相与",
+                    (int?)metadata["ssbo_window_abi"] == 1 && mask != 0 && UsesStorageWindowMask(spv, mask));
+                Check("顶点的驱动常量段 c0 在绑定表中且入口取用",
+                    bindings.OfType<JsonObject>().Any(o => (string)o["kind"] == "drvcb" && (int?)o["bank"] == 0 &&
+                        res.TryGetValue((string)o["msl_name"], out var driver) && driver.Used));
+            }
+            if (stage == "ps")
+                Check("不访问 SSBO 的片元仍声明窗口协议，无掩码", (int?)metadata["ssbo_window_abi"] == 1 &&
+                    metadata["ssbo_window_mask"] == null);
+            if (stage == "cs")
+                Check("计算出包沿用既有窗口路径", metadata["ssbo_window_abi"] == null &&
+                    metadata["ssbo_window_mask"] == null);
 
             if (stage == "ps")
             {
@@ -388,6 +439,20 @@ static class Program
         try { DshVk.CompileGeometry("pt" + gkey[2..], pcode2, pctl2, xc, tables, true, root); } catch (DshError e) { pwhy = e.Detail; }
         Check("⑫ 直通型几何头：GeometrySkip 给原因、CompileGeometry 报 DshError（离线不出，设备现编）",
             DshVk.GeometrySkip(pcode2, pctl2) is string sk && sk.Contains("passthrough") && pwhy != null && pwhy.Contains("passthrough") && DshVk.GeometrySkip(gcode, gctl) == null, pwhy ?? "没有报错");
+        // ⑭ 窗口读回夹具料：给了 --emit 才出（android/tests/vk/standalone/libpack-ssbo-window.sh 在 lavapipe 上读回字节）
+        if (args.Length == 7)
+        {
+            var (wcode, wctl) = WindowFixture();
+            string wkey = Convert.ToHexStringLower(SHA256.HashData(wctl.AsSpan(0, 0x880)))[..16], emit = args[6];
+            Directory.CreateDirectory(emit);
+            DshVk.CompileWithSpv(wkey, "vs", wcode, wctl, emit, xc, tables, true, root);
+            var wj = JsonNode.Parse(File.ReadAllText(Path.Combine(emit, wkey + "_b.json")));
+            byte[] wspv = File.ReadAllBytes(Path.Combine(emit, wkey + "_b.spv"));
+            uint wmask = (uint?)wj["ssbo_window_mask"] ?? 0;
+            Check("⑭ 读回夹具 VS：窗口协议 1、有掩码且参与按位与",
+                (int?)wj["ssbo_window_abi"] == 1 && wmask != 0 && UsesStorageWindowMask(wspv, wmask));
+            File.WriteAllText(Path.Combine(emit, "window_vs.key"), wkey);
+        }
         Console.WriteLine(bad == 0 ? "dsh_vk: 全过" : "dsh_vk: 有不通");
         return bad;
     }

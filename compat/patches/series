@@ -673,3 +673,4 @@
 20261122-0047-audio-effect-state-restore.patch
 20261122-0129-audio-interrupt-virtual-playback.patch
 20261122-1231-offline-tcp-loopback.patch
+20261123-0424-libpack-ssbo-window-mask.patch
