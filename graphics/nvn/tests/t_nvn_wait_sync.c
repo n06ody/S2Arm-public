@@ -8,8 +8,17 @@
 #undef main
 
 static int wait_calls;
+static uint64_t fail_on_wait, first_failed;
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t ns, nvn_gpu_err *err) {
     wait_calls++;
+    if (v <= g_fdone) return (nvn_gpu_rc){NVN_GPU_OK};
+    if (ns && fail_on_wait == v) {
+        // 后端先发布失败值，再执行一次失败回调，最后唤醒正在等的调用者。
+        first_failed = v;
+        fail_on_wait = 0;
+        fake_complete(NVN_GPU_DONE_FAILED);
+    }
+    if (first_failed && v >= first_failed) return (nvn_gpu_rc){NVN_GPU_E_FAILED};
     return fixture_fence_wait(v, ns, err);
 }
 static void put_sync(stream *s, uint32_t op, const sync_t *sync) {
@@ -58,8 +67,35 @@ static void wait_invalid_or_external(void) {
     CHECK(wait_calls == 0 && rp_S.alpha_ref == 0.75f);
     fake_complete(NVN_GPU_DONE_OK);
 }
+static void wait_failed_submission(void) {
+    stream prior = {0}, failing = {0};
+    end(&prior); submit1(&prior);
+    const uint64_t completed = nvn_be_last_fence();
+    fake_complete(NVN_GPU_DONE_OK);
+
+    volatile uint32_t event = 19;
+    volatile uint32_t *ptr = &event;
+    const uint32_t value = 20;
+    uint8_t *op = put(&failing, OP_SIGNAL_EVENT, 16);
+    // 有回写副作用，禁止未完成时提前放行。put 已把 mode 清为 0。
+    memcpy(op, &ptr, sizeof ptr);
+    memcpy(op + 12, &value, sizeof value);
+    sync_t sync = {0};
+    put_sync(&failing, OP_FENCE_SYNC, &sync);
+    end(&failing); submit1(&failing);
+    uint64_t f = 0;
+    CHECK(sync_published(&sync, &f) && f > completed);
+    fail_on_wait = f;
+    CHECK(nvn_be_wait(f, 0) == 0);
+    CHECK(nvn_be_wait(f, 1000) == -1);   // 正在等待的游戏线程不能看到成功
+    CHECK(first_failed == f && event == 19);
+    CHECK(nvn_be_wait(f, 0) == -1);     // 失败回调之后的快查也不能成功
+    CHECK(!rp_fence_done(f));
+    CHECK(nvn_be_wait(completed, 0) == 1);
+}
 int main(void) {
     wait_prior_submission(); wait_same_submission(); wait_invalid_or_external();
+    wait_failed_submission();
     printf("%s t_nvn_wait_sync：%d 项检查，%d 项不通\n", g_fail ? "✗" : "✓", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

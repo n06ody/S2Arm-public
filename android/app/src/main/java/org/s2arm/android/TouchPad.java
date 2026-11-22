@@ -3,7 +3,9 @@ package org.s2arm.android;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * On-screen gamepad state: layout and multi-touch tracking, no Android types (unit-tested).
@@ -55,6 +57,9 @@ final class TouchPad {
     private final int[] axes = new int[4];   // lx, ly, rx, ry
     private TouchLayout custom;              // null: Android's built-in layout for the current box
     private TouchLayout current;
+    private int layoutGeneration;
+    private Consumer<String> layoutTrace;
+    private boolean layoutTracePendingInput;
     private final float[] box = new float[4];
 
     List<Control> controls() { return controls; }
@@ -71,16 +76,43 @@ final class TouchPad {
     TouchLayout layoutModel() { return current; }
     float[] box() { return box.clone(); }
 
+    /** Publish the current layout on enable, then publish each completed generation. */
+    void setLayoutTrace(Consumer<String> trace) {
+        boolean changed = (layoutTrace == null) != (trace == null);
+        layoutTrace = trace;
+        if (changed) traceLayout();
+    }
+
+    private void traceLayout() {
+        layoutTracePendingInput = layoutTrace != null && current != null;
+        if (layoutTracePendingInput) logLayout();
+    }
+
+    /** The collector may miss startup logs. Replay the current layout once on live input. */
+    void traceInput(boolean active) {
+        if (!active || !layoutTracePendingInput) return;
+        layoutTracePendingInput = false;
+        logLayout();
+    }
+
+    private void logLayout() {
+        StringBuilder line = new StringBuilder("touchpad layout:");
+        for (Control c : controls) {
+            String name = c.label;
+            if (c.kind == STICK) name = c.bit == 0 ? "LSTICK" : "RSTICK";
+            if (c.kind == DPAD) name = "DPAD";
+            line.append(String.format(Locale.ROOT, " %s=(%.0f,%.0f,r%.0f)", name, c.x, c.y, c.radius));
+        }
+        layoutTrace.accept(line.append(" generation=").append(layoutGeneration).toString());
+    }
+
     /**
      * Lay the controls out in the area left, top, width x height (view pixels, inside the system
      * bars). Landscape uses the whole area; portrait puts the pad in a landscape-shaped box at
      * the bottom. Geometry is the F01 layout projected into that box; the four direction keys
      * become one D-pad disc and sticks sit fixed at their activation centres.
      */
-    int layouts;   // how many times layout() ran (debug logging)
-
     void layout(float left, float top, float width, float height) {
-        layouts++;
         float bw = width, bh = height, by = top;
         if (height > width) { bh = width * 0.56f; by = top + height - bh; }
         box[0] = left; box[1] = by; box[2] = bw; box[3] = bh;
@@ -118,6 +150,8 @@ final class TouchPad {
             add(c);
         }
         update();
+        layoutGeneration++;
+        traceLayout();
     }
 
     private void add(Control c) {

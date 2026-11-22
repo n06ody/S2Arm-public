@@ -38,7 +38,6 @@ public class MainActivity extends Activity
     private LinearLayout touchEditBar;       // Save / Default / Cancel while dragging controls
     private static final String PREF_TOUCH_PASSTHROUGH = "touchPassthrough.";   // + layout file name: per game
     private String lastInputLog = "";
-    private int loggedLayout;
     private static final int PICK_PACKAGE = 1;
     private static final int PICK_TOUCH_LAYOUT = 2, EXPORT_TOUCH_LAYOUT = 3;
     private byte[] touchExport;
@@ -249,7 +248,7 @@ public class MainActivity extends Activity
             android.view.Gravity.TOP | android.view.Gravity.CENTER_HORIZONTAL);
         if (runtimeLoaded) {
             touchPad = new TouchPadView(this, new TouchPadView.Listener() {
-                @Override public void onTouchPad(TouchPad changed) { publishInput(); }
+                @Override public void onTouchPad(boolean fromInputEvent) { publishInput(fromInputEvent); }
                 @Override public void onTouchMenu() { showTouchMenu(); }
             });
             root.addView(touchPad, new FrameLayout.LayoutParams(
@@ -1448,7 +1447,8 @@ public class MainActivity extends Activity
     }
     private static long magnitude(int x, int y) { return (long) x * x + (long) y * y; }
     // Physical controller and on-screen pad together: buttons OR'ed, each stick from whichever is deflected more.
-    private void publishInput() {
+    private void publishInput() { publishInput(false); }
+    private void publishInput(boolean fromInputEvent) {
         int buttons = gamepad.buttons(), lx = gamepad.leftX(), ly = gamepad.leftY(), rx = gamepad.rightX(), ry = gamepad.rightY();
         if (touchPad != null && touchPad.getVisibility() == android.view.View.VISIBLE) {
             TouchPad t = touchPad.pad();
@@ -1456,15 +1456,9 @@ public class MainActivity extends Activity
             if (magnitude(t.leftX(), t.leftY()) > magnitude(lx, ly)) { lx = t.leftX(); ly = t.leftY(); }
             if (magnitude(t.rightX(), t.rightY()) > magnitude(rx, ry)) { rx = t.rightX(); ry = t.rightY(); }
         }
-        if (touchLog && touchPad != null && touchPad.pad().layouts != loggedLayout) {
-            loggedLayout = touchPad.pad().layouts;
-            StringBuilder sb = new StringBuilder("touchpad layout:");
-            for (TouchPad.Control c : touchPad.pad().controls())
-                sb.append(String.format(java.util.Locale.ROOT, " %s=(%.0f,%.0f,r%.0f)",
-                    c.kind == TouchPad.STICK ? (c.bit == 0 ? "LSTICK" : "RSTICK") : c.kind == TouchPad.DPAD ? "DPAD" : c.label, c.x, c.y, c.radius));
-            Log.i("S2Arm", sb.toString());
-        }
         if (touchLog) {
+            if (fromInputEvent && touchPad != null)
+                touchPad.pad().traceInput((buttons | lx | ly | rx | ry) != 0);
             String line = String.format(java.util.Locale.ROOT, "input: buttons=0x%04x L=(%d,%d) R=(%d,%d)", buttons, lx, ly, rx, ry);
             if (!line.equals(lastInputLog)) { Log.i("S2Arm", line); lastInputLog = line; }
         }
@@ -1500,7 +1494,7 @@ public class MainActivity extends Activity
         }
         if (event.getAction() != KeyEvent.ACTION_MULTIPLE) {
             noteController(event.getDevice());
-            gamepad.button(bit, event.getAction() == KeyEvent.ACTION_DOWN); publishInput();
+            gamepad.button(bit, event.getAction() == KeyEvent.ACTION_DOWN); publishInput(true);
         }
         return true;
     }
@@ -1512,7 +1506,7 @@ public class MainActivity extends Activity
             event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ),
             event.getAxisValue(MotionEvent.AXIS_HAT_X), event.getAxisValue(MotionEvent.AXIS_HAT_Y),
             event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_RTRIGGER), 0.15f);
-        publishInput(); return true;
+        publishInput(true); return true;
     }
 
     /**

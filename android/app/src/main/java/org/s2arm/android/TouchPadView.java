@@ -15,7 +15,7 @@ import android.view.View;
 @android.annotation.SuppressLint({"ViewConstructor", "ClickableViewAccessibility"})
 final class TouchPadView extends View {
     interface Listener {
-        void onTouchPad(TouchPad pad);
+        void onTouchPad(boolean fromInputEvent);
         /** Exactly four fingers held for MENU_HOLD_MS (the iOS gesture): the in-game touch menu. */
         default void onTouchMenu() { }
     }
@@ -59,7 +59,11 @@ final class TouchPadView extends View {
     /** The editor bar fades while a control is dragged, so a control can pass under it. */
     void setEditDragListener(EditDragListener listener) { editDrag = listener; }
     private final Runnable menuHold = this::openMenu;
-    void setTrace(boolean enabled) { trace = enabled; TouchInputBridge.touchTrace(enabled); }
+    void setTrace(boolean enabled) {
+        trace = enabled;
+        TouchInputBridge.touchTrace(enabled);
+        pad.setLayoutTrace(enabled ? line -> android.util.Log.i("S2Arm", line) : null);
+    }
 
     boolean gameTouchEnabled() { return gameTouch.enabled(); }
     boolean controlsVisible() { return controlsVisible; }
@@ -180,7 +184,7 @@ final class TouchPadView extends View {
         pad.cancel();
         revokeGameViewport();
         pad.layout(insetLeft, insetTop, getWidth() - insetLeft - insetRight, getHeight() - insetTop - insetBottom);
-        listener.onTouchPad(pad);
+        listener.onTouchPad(false);
         invalidate();
     }
 
@@ -237,7 +241,7 @@ final class TouchPadView extends View {
         int pressed = pad.buttons() & ~lastButtons;
         if (pressed != 0) performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
         lastButtons = pad.buttons();
-        listener.onTouchPad(pad);
+        listener.onTouchPad(true);
         invalidate();
         return true;
     }
@@ -294,7 +298,7 @@ final class TouchPadView extends View {
         pad.cancel();
         gameTouch.cancel();
         lastButtons = 0;
-        listener.onTouchPad(pad);
+        listener.onTouchPad(false);
         invalidate();
     }
 

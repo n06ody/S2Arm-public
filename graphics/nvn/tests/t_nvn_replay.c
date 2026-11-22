@@ -4567,10 +4567,8 @@ static void t_dispatch(void) {
     stream s2 = {0}; dp = put(&s2, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1; end(&s2);
     submit1(&s2); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && g_cpipe_gets == 1 && g_pmem[PG + 64] == 0x22);   // 同一个程序不重建管线；失败不回写
-    g_pg_gen[1] = 107; g_dirty_now = 108; g_nbw = 0;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[PG] == 0x22 && mirror[2 * PG - 1] == 0x22);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 终态不推进已完成值。直接查撤登记，不在失败时间线上模拟下一次成功的镜像同步。
+    CHECK(rp_buf_gpu_write_pending(base + PG, PG) == 0);
     // 取不到程序：记账跳过，不派发
     g_cresolve_rc = -1; submit1(&s2); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_ndisp == 2 && nvn_unimpl_count("draw", "compute_program_unresolved") == 1);
@@ -5113,10 +5111,7 @@ static void t_dispatch_ubop_rw(void) {
     stream f = {0}; put_dispatch1(&f); end(&f);
     submit1(&f); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && pmem_all(2 * PG, 4 * PG, 0x22));                                                         // 派发了、这一段失败：游戏内存还是游戏自己的
-    g_pg_gen[2] = g_pg_gen[3] = 101; g_dirty_now = 102; g_nbw = 0;                                                 // 游戏又写了这两页
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 2 * PG, 2 * PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[2 * PG + 32] == 0x22 && mirror[2 * PG + 127] == 0x22 && mirror[3 * PG + 16] == 0x22 && mirror[3 * PG + 63] == 0x22);   // 两段都重传了：登记已撤
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_buf_gpu_write_pending(base + 2 * PG, 2 * PG) == 0);   // 两段登记均已撤，失败值仍未完成
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
