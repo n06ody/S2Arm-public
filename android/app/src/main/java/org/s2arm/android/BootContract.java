@@ -214,14 +214,19 @@ final class BootContract {
     }
 
     /** The activation pointer, parsed but not yet followed. The installer can read it without a revision. */
+    static final String OBJECT_STORE_EXTENSION = "org.s2arm.android.objects.v1";
+
     static final class Current {
         final String titleId, contentRoot, revisionDir, artifact, artifactSha256;
-        Current(String titleId, String contentRoot, String revisionDir, String artifact, String artifactSha256) {
+        final boolean managedObjects;
+        Current(String titleId, String contentRoot, String revisionDir, String artifact, String artifactSha256,
+                boolean managedObjects) {
             this.titleId = titleId;
             this.contentRoot = contentRoot;
             this.revisionDir = revisionDir;
             this.artifact = artifact;
             this.artifactSha256 = artifactSha256;
+            this.managedObjects = managedObjects;
         }
     }
 
@@ -254,7 +259,9 @@ final class BootContract {
         if (!artifactRel.endsWith(".json")) throw new BadGame("current.json artifact is not a .json file");
         String artifactSha = string(current, "artifactSha256", "current.json");
         if (!HEX64.matcher(artifactSha).matches()) throw new BadGame("current.json artifactSha256 is not 64 lowercase hex");
-        return new Current(titleId, contentRoot, revisionDir, artifactRel, artifactSha);
+        boolean managed = current.containsKey("extensions")
+            && object(current, "extensions", "current.json").containsKey(OBJECT_STORE_EXTENSION);
+        return new Current(titleId, contentRoot, revisionDir, artifactRel, artifactSha, managed);
     }
 
     /** Validates one revision without reading current.json. Used by the installer before the atomic rename. */

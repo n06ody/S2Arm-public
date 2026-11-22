@@ -713,19 +713,18 @@ All of it is listed in one index.
     5. `current.json` is switched by a flushed temp file and a rename, recording
        `previousContentRoot`.
 
-    Any failure, or a killed process, leaves the previous version active. Stale
-    `.staging` folders are removed at startup.
-  - **Versions share storage.** Each file is stored once, under its SHA-256, in
-    `objects/<aa>/<sha256>`: checked, then read-only. A revision's files are hard
-    links to those objects: a hard link is an ordinary directory entry, not a
-    symbolic link, so package readers that reject links (the offline shader pack
-    validator) see regular files. An update stores only the files it changes.
-    The previous version is kept for rollback at the cost of the files that
-    differ. Objects no revision uses are deleted. If a hard link is refused for
-    one path, the stored object is copied into the revision instead; if hard
-    links are refused entirely, every file is copied into the revision and no
-    store is kept, so no file is ever stored twice. A file already stored is not
-    read from the package again.
+    A managed revision syncs its file data and directories before activation.
+    Recovery keeps the old revision when the pointer was not switched, or
+    retains the complete new revision after activation. Staging folders and
+    interrupted replacements are recovered under the game lock.
+  - **Versions share storage.** Managed private revisions store checked,
+    read-only files in `objects/<aa>/<sha256>` and expose them through relative
+    file links. A delta reuses an unchanged object when the previous index and
+    its verified file stamp agree. A missing or stale stamp requires a hash
+    check. The previous revision continues to reference its objects for
+    rollback. Generic offline shader packs require regular files and use hard
+    links or checked copies. A delta from a legacy plain revision uses checked
+    copies until that revision is migrated.
   - Game files are only read. Rewritten modules are copied into anonymous memory
     by `native/module.c`, never mapped executable from storage.
 - **Load check:** the panel lists installed games, and maps each module through

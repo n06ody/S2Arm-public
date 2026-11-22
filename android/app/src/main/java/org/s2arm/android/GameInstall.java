@@ -6,10 +6,16 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
@@ -32,15 +38,11 @@ import java.util.TimeZone;
  * replaced (previousContentRoot, for rollback), removes older ones.
  *
  * <p>Revisions share storage: every file is stored once under its SHA-256 in
- * games/&lt;title id&gt;/objects/ (copied in with its size and hash checked, then read-only), and a
- * revision's files are hard links to those objects (a hard link is an ordinary directory entry, so
- * readers that refuse symbolic links see regular files; the links survive the .staging rename and
- * a move of the app's data). An update costs only the files it changes, and keeping the previous
- * revision costs only the files that differ. Objects no revision uses are removed after each
- * install and at startup. Where hard links are refused, the file is copied into the revision
- * instead: one file at a time when only that path is refused, and every file (with no object
- * store) when the storage cannot hard-link at all. No Android types, so the unit test runs on a
- * plain JDK.
+ * games/&lt;title id&gt;/objects/ after size and SHA verification. Managed revisions expose these
+ * objects through relative file links, which survive the staging rename and relocation of the
+ * app's data. Generic shader packs require regular files, so those entries keep a hard link or
+ * checked copy. A delta from an older plain revision keeps the existing checked-copy transaction.
+ * Objects no remaining revision references are collected under the game lock.
  *
  * <p>原地来源（installInPlace）：资源目录已经在共享存储上（玩家拷进去 / 电脑 adb push），内容文件不复制、不进
  * objects/。版本目录只放元数据：manifest.json、index.tsv、构建描述、指纹表和 in-place.json（登记的根）；
@@ -63,6 +65,14 @@ final class GameInstall {
     interface Linker { void link(File link, File target) throws IOException; }
 
     private static final Linker HARD_LINK = (link, target) -> Files.createLink(link.toPath(), target.toPath());
+    private static final Linker RELATIVE_LINK = (link, target) -> Files.createSymbolicLink(
+        link.toPath(), link.getParentFile().toPath().relativize(target.toPath()));
+    interface DirectorySync { void sync(File directory) throws IOException; }
+    private static volatile DirectorySync directorySync = GameInstall::syncDirectoryOnHost;
+    private static volatile Linker objectLink = RELATIVE_LINK;
+
+    static void setDirectorySync(DirectorySync sync) { directorySync = sync; }
+    static void setObjectLink(Linker link) { objectLink = link; }
 
     static final String ARTIFACT = GamePack.ARTIFACT;
     private static final String DELTA = "game-resource-delta.tsv";
@@ -73,6 +83,9 @@ final class GameInstall {
         final boolean alreadyActive;
         boolean artifactRefreshed;       // same files, new artifact (e.g. a per-game APK upgrade)
         boolean resourceDelta;
+        boolean managedObjects;
+        long unchangedReadBytes, unchangedWriteBytes;
+        long planMs, placeMs, verifyMs, publishMs, collectMs;
         long storedBytes, sharedBytes;   // copied in this time / already stored (unchanged files)
         boolean linked;                  // revision files are hard links to shared objects (else plain copies)
         String inPlaceRoot;              // 原地来源的根（内容没复制），否则 null
@@ -231,6 +244,7 @@ final class GameInstall {
 
     static Result install(File gamesDir, Source source, Progress progress, Linker linker)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
+        File library = libraryDirectory(gamesDir);
         byte[] manifest = required(source, "manifest.json");
         byte[] index = required(source, "index.tsv");
         byte[] artifact;
@@ -245,9 +259,20 @@ final class GameInstall {
         GamePack.Info info = new GamePack.Info();
         GamePack.describe(info, verified(source, entry(entries, "ctl/control.nacp")));
         // 只锁这一款（不堵门）：别的游戏在跑不挡本款导入；本款正在跑 / 正在装才报忙
-        try (GameStorage lease = GameStorage.acquireIn(gamesDir, info.titleId)) {
-            return installLocked(gamesDir, source, progress, linker, manifest, index, artifact, entries, contentRoot, info);
+        try (GameStorage lease = GameStorage.acquireIn(library, info.titleId)) {
+            return installLocked(library, source, progress, linker, manifest, index, artifact, entries, contentRoot, info);
         }
+    }
+
+    private static File libraryDirectory(File gamesDir) throws IOException {
+        File absolute = gamesDir.getAbsoluteFile();
+        File parent = absolute.getParentFile();
+        if (parent == null) throw new IOException("game library has no private parent");
+        // The supplied private parent can have a system alias. Managed paths under it
+        // still have to be real directories and leaf links still have to name objects.
+        File library = new File(parent.getCanonicalFile(), absolute.getName());
+        if (Files.isSymbolicLink(library.toPath())) throw new IOException("games directory is a symbolic link");
+        return library;
     }
 
     private static final class DeltaSource implements Source {
@@ -278,6 +303,11 @@ final class GameInstall {
         boolean unchanged(String path) {
             int i = find(path);
             return i >= 0 && unchanged.get(i);
+        }
+
+        int unchangedOrdinal(String path) {
+            int i = find(path);
+            return i >= 0 && unchanged.get(i) ? i : -1;
         }
 
         @Override public InputStream open(String path) throws IOException {
@@ -357,10 +387,12 @@ final class GameInstall {
     private static Result installLocked(File gamesDir, Source source, Progress progress, Linker linker, byte[] manifest, byte[] index,
             byte[] artifact, List<GamePack.Entry> entries, String contentRoot, GamePack.Info info)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
+        long start = System.nanoTime();
         File gameRoot = new File(gamesDir, info.titleId);
         File revisions = new File(gameRoot, "revisions");
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
+        recoverRetired(gameRoot, current);
         String previous = current == null ? null : current.contentRoot;
         String[] proof = readDelta(source, entries, contentRoot);
         // 同一内容根、但当前是原地登记：这次是复制进私有目录，照常装（换掉原地登记）
@@ -378,9 +410,27 @@ final class GameInstall {
         Result result = new Result(info.titleId, contentRoot, contentRoot.equals(previous) ? null : previous, info, false);
         result.resourceDelta = delta != null;
         File objects = new File(gameRoot, "objects");
+        // An existing plain revision needs a separate migration. Continue its checked
+        // delta path until then. The explicit hard-link injector exercises the legacy path.
+        boolean oldManaged = current != null && current.managedObjects;
+        boolean managed = linker == HARD_LINK && !contentRoot.equals(previous) && (delta == null || oldManaged);
+        if (managed) {
+            requireRealDirectory(objects.toPath());
+            requireRealDirectory(objects.toPath().resolve("tmp"));
+            managed = canLink(objects, objectLink);
+            if (!managed && oldManaged) throw new IOException("cannot publish relative object links in this revision");
+        }
+        result.managedObjects = managed;
+        GameFingerprint.Stamp[] reference = null;
+        if (managed && delta != null) {
+            String oldHash = previous.substring(7);
+            reference = GameFingerprint.readSelected(new File(gameRoot, current.revisionDir), delta.entries, oldHash,
+                GameFingerprint.currentReference(gameRoot, oldHash), delta::unchangedOrdinal);
+        }
         deleteTree(staging);
         if (!staging.mkdirs()) throw new IOException("cannot create " + staging);
-        result.linked = canLink(objects, linker);
+        result.linked = managed || canLink(objects, linker);
+        result.planMs = elapsedMs(start);
         GameFingerprint.Reference fingerprint;
         try {
             long total = 0;
@@ -391,10 +441,17 @@ final class GameInstall {
             //   下面的指纹核对按身份命中、不再把整包重读一遍（大包 16 GB 重读要十几分钟）。只有以前装过、当年只核了大小的共享对象，
             //   和链接被拒后另复制出来的文件，才重算 SHA-256
             GameFingerprint.Stamp[] checked = new GameFingerprint.Stamp[entries.size()];
+            Set<File> objectDirs = new HashSet<>();
+            long placing = System.nanoTime();
             for (int i = 0; i < entries.size(); i++) {
                 GamePack.Entry e = entries.get(i);
                 File out = new File(staging, e.path);
                 out.getParentFile().mkdirs();
+                if (managed) {
+                    checked[i] = projectObject(source, delta, e, out, objects, reference, objectDirs,
+                        buf, progress, done, total, result);
+                    continue;
+                }
                 if (!result.linked || (delta != null && !delta.unchanged(e.path))) {
                     // With no links, copy from the incoming or verified base source.
                     // A changed delta entry must be verified from this upload even if a CAS object exists.
@@ -423,6 +480,8 @@ final class GameInstall {
                     copyObject(object, out);
                 }
             }
+            result.placeMs = elapsedMs(placing);
+            long verifying = System.nanoTime();
             writeSynced(new File(staging, "manifest.json"), manifest);
             writeSynced(new File(staging, "index.tsv"), index);
             writeSynced(new File(staging, ARTIFACT), artifact);
@@ -432,17 +491,158 @@ final class GameInstall {
             // while they were placed above are matched by their stamp instead of re-read.
             GameFingerprint.Verification verified = GameFingerprint.verifyPlaced(staging, entries, java.util.Arrays.asList(checked));
             fingerprint = GameFingerprint.write(staging, entries, contentRoot.substring(7), verified.stamps);
-
-            deleteTree(active);   // same content root but not active: a leftover, replaced by the checked copy
-            if (!staging.renameTo(active)) throw new IOException("cannot move the staged revision into place");
+            if (managed && delta != null) {
+                for (int i = verified.hashed.nextSetBit(0); i >= 0; i = verified.hashed.nextSetBit(i + 1))
+                    if (delta.unchanged(entries.get(i).path)) result.unchangedReadBytes += entries.get(i).size;
+            }
+            result.verifyMs = elapsedMs(verifying);
+            long publishing = System.nanoTime();
+            if (managed) publishObjectRevision(staging, active, objects, objectDirs);
+            else {
+                deleteTree(active);
+                if (!staging.renameTo(active)) throw new IOException("cannot move the staged revision into place");
+            }
+            result.publishMs = elapsedMs(publishing);
         } catch (GamePack.BadPack | BootContract.BadGame | IOException | RuntimeException e) {
             deleteTree(staging);
             throw e;
         }
-        writeCurrent(gameRoot, info.titleId, contentRoot, ARTIFACT, GamePack.sha256(artifact), result.previousContentRoot, fingerprint);
+        long activation = System.nanoTime();
+        writeCurrent(gameRoot, info.titleId, contentRoot, ARTIFACT, GamePack.sha256(artifact), result.previousContentRoot,
+            fingerprint, managed);
         BootContract.open(gameRoot);   // what the runtime will read
+        result.publishMs += elapsedMs(activation);
+        long collecting = System.nanoTime();
         prune(gameRoot, contentRoot, result.previousContentRoot);
+        result.collectMs = elapsedMs(collecting);
         return result;
+    }
+
+    private static long elapsedMs(long start) { return (System.nanoTime() - start) / 1_000_000; }
+
+    private static void requireRealDirectory(Path dir) throws IOException {
+        if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS) && !Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("object store component is not a directory: " + dir.getFileName());
+        Files.createDirectories(dir);
+    }
+
+    static void syncDirectoryOnHost(File directory) throws IOException {
+        try (FileChannel channel = FileChannel.open(directory.toPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            channel.force(true);
+        }
+    }
+
+    private static GameFingerprint.Stamp projectObject(Source source, DeltaSource delta, GamePack.Entry e, File out,
+            File objects, GameFingerprint.Stamp[] reference, Set<File> objectDirs,
+            byte[] buffer, Progress progress, long[] done, long total, Result result)
+            throws IOException, GamePack.BadPack {
+        File parent = new File(objects, e.sha256.substring(0, 2));
+        boolean firstInBucket = objectDirs.add(parent);
+        if (firstInBucket) requireRealDirectory(parent.toPath());
+        File object = new File(parent, e.sha256);
+        int prior = delta == null ? -1 : delta.unchangedOrdinal(e.path);
+        boolean exists = Files.exists(object.toPath(), LinkOption.NOFOLLOW_LINKS);
+        GameFingerprint.Stamp checked = null;
+        if (exists) {
+            if (!Files.isRegularFile(object.toPath(), LinkOption.NOFOLLOW_LINKS) || object.length() != e.size)
+                throw new IOException("existing object fails size / SHA-256: " + e.path);
+            if (prior >= 0 && reference != null) checked = reference[prior];
+            if (delta != null && prior < 0) {
+                // The delta promised the changed bytes on the wire. Verify them even
+                // when an older revision already happens to have the same object.
+                File incoming = Files.createTempFile(objects.toPath().resolve("tmp"), "upload", null).toFile();
+                try {
+                    put(source, e, incoming, new File(objects, "tmp"), buffer, progress, done, total);
+                } finally {
+                    Files.deleteIfExists(incoming.toPath());
+                }
+            } else {
+                done[0] += e.size;
+                if (progress != null) progress.update(done[0], total);
+            }
+            result.sharedBytes += e.size;
+        } else {
+            if (prior >= 0) throw new IOException("managed delta object is missing: " + e.path);
+            put(source, e, object, new File(objects, "tmp"), buffer, progress, done, total);
+            // adopt() can have renamed a fully hashed but still unflushed receive file.
+            try (FileChannel channel = FileChannel.open(object.toPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+                channel.force(true);
+            }
+            checked = GameFingerprint.stat(object);
+            result.storedBytes += e.size;
+        }
+        if (e.path.startsWith("shaders/vulkan/generic/")) {
+            // The generic pack validator requires every component to be free of symlinks.
+            try {
+                HARD_LINK.link(out, object);
+            } catch (IOException | UnsupportedOperationException | SecurityException denied) {
+                store(path -> Files.newInputStream(object.toPath(), LinkOption.NOFOLLOW_LINKS),
+                    e, out, new File(objects, "tmp"), buffer, null, new long[]{0}, total);
+                if (exists) result.sharedBytes -= e.size;
+                result.storedBytes += e.size;
+                if (prior >= 0) {
+                    result.unchangedReadBytes += e.size;
+                    result.unchangedWriteBytes += e.size;
+                }
+                return GameFingerprint.stat(out);
+            }
+        } else {
+            objectLink.link(out, object);
+        }
+        return checked;
+    }
+
+    private static void publishObjectRevision(File staging, File active, File objects, Set<File> buckets)
+            throws IOException {
+        for (File bucket : buckets) directorySync.sync(bucket);
+        directorySync.sync(objects);
+        Files.walkFileTree(staging.toPath(), new SimpleFileVisitor<Path>() {
+            @Override public FileVisitResult postVisitDirectory(Path dir, IOException error) throws IOException {
+                if (error != null) throw error;
+                directorySync.sync(dir.toFile());
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        File revisions = active.getParentFile(), gameRoot = revisions.getParentFile();
+        // A retained target can be replaced only after its old name is recoverable.
+        if (Files.exists(active.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isDirectory(active.toPath(), LinkOption.NOFOLLOW_LINKS))
+                throw new IOException("retained revision is not a directory");
+            Files.move(active.toPath(), new File(revisions, ".retired-" + active.getName()).toPath(),
+                StandardCopyOption.ATOMIC_MOVE);
+            directorySync.sync(revisions);
+        }
+        Files.move(staging.toPath(), active.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        directorySync.sync(revisions);
+        directorySync.sync(gameRoot);
+        directorySync.sync(gameRoot.getParentFile());
+        File privateRoot = gameRoot.getParentFile().getParentFile();
+        if (privateRoot != null) directorySync.sync(privateRoot);
+    }
+
+    private static void recoverRetired(File gameRoot, BootContract.Current current) throws IOException {
+        File revisions = new File(gameRoot, "revisions");
+        if (Files.isSymbolicLink(gameRoot.toPath()) || Files.isSymbolicLink(revisions.toPath()))
+            throw new IOException("object revision directory is a symbolic link");
+        File[] retired = revisions.listFiles(f -> f.getName().matches("\\.retired-sha256-[0-9a-f]{64}"));
+        if (retired == null) return;
+        if (retired.length > 0 && current == null
+                && Files.exists(new File(gameRoot, "current.json").toPath(), LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("cannot recover a retired revision with an unreadable current pointer");
+        for (File saved : retired) {
+            if (!Files.isDirectory(saved.toPath(), LinkOption.NOFOLLOW_LINKS))
+                throw new IOException("retired object revision is not a directory");
+            String root = saved.getName().substring(".retired-".length());
+            if (current != null && root.equals(current.contentRoot)) {
+                directorySync.sync(gameRoot);
+                deleteTree(saved);
+            } else {
+                File target = new File(revisions, root);
+                deleteTree(target);
+                Files.move(saved.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            }
+            directorySync.sync(revisions);
+        }
     }
 
     /**
@@ -452,10 +652,11 @@ final class GameInstall {
      */
     static Result installInPlace(File gamesDir, File root, ImportSourceCheck check, Progress progress)
             throws GamePack.BadPack, BootContract.BadGame, IOException {
+        File library = libraryDirectory(gamesDir);
         if (!root.isAbsolute()) throw new IOException("in-place root must be an absolute path: " + root);
         if (!root.isDirectory()) throw new IOException("in-place game folder is missing or unreadable: " + root);
         File canonical = root.getCanonicalFile();
-        BootContract.checkInPlaceRoot(canonical.getPath(), gamesDir);
+        BootContract.checkInPlaceRoot(canonical.getPath(), library);
         Source source = check.checked(directory(canonical));
         byte[] manifest = required(source, "manifest.json");
         byte[] index = required(source, "index.tsv");
@@ -464,8 +665,8 @@ final class GameInstall {
         String contentRoot = "sha256-" + GamePack.sha256(index);
         GamePack.Info info = new GamePack.Info();
         GamePack.describe(info, verified(source, entry(entries, "ctl/control.nacp")));
-        try (GameStorage lease = GameStorage.acquireIn(gamesDir, info.titleId)) {
-            return installInPlaceLocked(gamesDir, canonical, progress, manifest, index, artifact, entries, contentRoot, info);
+        try (GameStorage lease = GameStorage.acquireIn(library, info.titleId)) {
+            return installInPlaceLocked(library, canonical, progress, manifest, index, artifact, entries, contentRoot, info);
         }
     }
 
@@ -476,6 +677,7 @@ final class GameInstall {
         File revisions = new File(gameRoot, "revisions");
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
+        recoverRetired(gameRoot, current);
         String previous = current == null ? null : current.contentRoot;
         String artifactSha = GamePack.sha256(artifact);
         if (current != null && contentRoot.equals(previous) && active.isDirectory()
@@ -531,7 +733,7 @@ final class GameInstall {
             throw e;
         }
         String kept = result.previousContentRoot;
-        writeCurrent(gameRoot, info.titleId, contentRoot, ARTIFACT, artifactSha, kept, fingerprint);
+        writeCurrent(gameRoot, info.titleId, contentRoot, ARTIFACT, artifactSha, kept, fingerprint, false);
         BootContract.open(gameRoot);
         prune(gameRoot, contentRoot, result.previousContentRoot);
         return result;
@@ -627,6 +829,7 @@ final class GameInstall {
         if (games != null) for (File g : games) {
             // 逐款取锁：这一款正在跑 / 正在装就跳过（下次再清），不碰它的半成品
             try (GameStorage lease = GameStorage.acquireIn(gamesDir, g.getName())) {
+                recoverRetired(g, readCurrent(g));
                 File[] staged = new File(g, "revisions").listFiles(f -> f.getName().endsWith(".staging"));
                 if (staged != null) for (File s : staged) { deleteTree(s); removed++; }
                 new File(g, "current.json.tmp").delete();
@@ -679,7 +882,9 @@ final class GameInstall {
         }
         String previous = previousRoot(gameRoot);
         GameFingerprint.Reference fingerprint = GameFingerprint.currentReference(gameRoot, current.contentRoot.substring(7));
-        writeCurrent(gameRoot, info.titleId, current.contentRoot, name, sha, previous, fingerprint);
+        if (current.managedObjects) directorySync.sync(revision);
+        writeCurrent(gameRoot, info.titleId, current.contentRoot, name, sha, previous, fingerprint,
+            current.managedObjects);
         BootContract.open(gameRoot);
         if (!current.artifact.equals(name)) new File(revision, current.artifact).delete();
         Result r = new Result(info.titleId, current.contentRoot, previous, info, false);
@@ -688,7 +893,7 @@ final class GameInstall {
     }
 
     private static void writeCurrent(File gameRoot, String titleId, String contentRoot, String artifactRel, String artifactSha,
-                                     String previous, GameFingerprint.Reference fingerprint) throws IOException {
+                                     String previous, GameFingerprint.Reference fingerprint, boolean managedObjects) throws IOException {
         SimpleDateFormat utc = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT);
         utc.setTimeZone(TimeZone.getTimeZone("UTC"));
         // Every value is a fixed word, hex or a timestamp: no JSON escaping needed.
@@ -696,6 +901,7 @@ final class GameInstall {
             + " \"revisionDir\": \"revisions/" + contentRoot + "\",\n \"artifact\": \"" + artifactRel + "\",\n"
             + " \"artifactSha256\": \"" + artifactSha + "\",\n \"activatedAt\": \"" + utc.format(new Date()) + "\",\n"
             + " \"previousContentRoot\": " + (previous == null ? "null" : "\"" + previous + "\"")
+            + (managedObjects ? ",\n \"extensions\": {\"" + BootContract.OBJECT_STORE_EXTENSION + "\":{}}" : "")
             + (fingerprint == null ? "" : ",\n \"fingerprint\": {\"version\":1,\"path\":\"" + fingerprint.path
                 + "\",\"sha256\":\"" + fingerprint.sha256 + "\",\"indexSha256\":\"" + fingerprint.indexSha256 + "\"}") + "\n}\n";
         File tmp = new File(gameRoot, "current.json.tmp");
@@ -704,6 +910,7 @@ final class GameInstall {
             throw new IOException("current temporary file is not regular");
         writeSynced(tmp, json.getBytes(StandardCharsets.UTF_8));
         if (!tmp.renameTo(new File(gameRoot, "current.json"))) throw new IOException("cannot activate current.json");
+        if (managedObjects) directorySync.sync(gameRoot);
     }
 
     // Keep the active revision and the one it replaced; then the objects only removed ones used.

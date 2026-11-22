@@ -190,6 +190,10 @@ public class AndroidFileStamp {
   } catch(InvocationTargetException e) { if(e.getCause() instanceof IOException)throw (IOException)e.getCause();throw new IOException(e.getCause());
   } catch(ReflectiveOperationException e) {throw new IOException(e);} }
  public static void probe(File f) throws IOException {read(f);} }''',
+'org/s2arm/android/AndroidDirectorySync.java': '''package org.s2arm.android; import java.io.*;
+final class AndroidDirectorySync { static void sync(File directory) throws IOException {
+ GameInstall.syncDirectoryOnHost(directory);
+} }''',
 'org/s2arm/android/DebugGate.java': 'package org.s2arm.android; class DebugGate { static boolean enabled; static boolean open(){return enabled;} }',
 'org/s2arm/android/BuildConfig.java': '''package org.s2arm.android; public class BuildConfig { public static final boolean DEBUG=false; }''',
 'org/s2arm/android/ImportProbe.java': '''package org.s2arm.android;
@@ -447,10 +451,10 @@ class GameLibraryImportTest(unittest.TestCase):
             if missing_fingerprint:
                 install = JAVA / 'org/s2arm/android/GameInstall.java'
                 text = install.read_text(encoding='utf-8')
-                original = 'result.previousContentRoot, fingerprint);'
+                original = 'fingerprint, managed);'
                 self.assertEqual(text.count(original), 1)
                 mutant = base / 'GameInstall.java'
-                mutant.write_text(text.replace(original, 'result.previousContentRoot, null);'), encoding='utf-8')
+                mutant.write_text(text.replace(original, 'null, managed);'), encoding='utf-8')
                 sources.append(str(mutant))
             if bypass_admission:
                 install = JAVA / 'org/s2arm/android/GameInstall.java'

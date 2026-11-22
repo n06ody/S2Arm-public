@@ -55,6 +55,7 @@ final class GameLibrary {
     GameLibrary(Context context, Listener listener, String selectedTitle) {
         GameFingerprint.setStatProvider(AndroidFileStamp::read);
         GameFingerprint.setStatProbe(AndroidFileStamp::probe);
+        GameInstall.setDirectorySync(AndroidDirectorySync::sync);
         this.selectedTitle = selectedTitle;
         this.context = context;
         this.listener = listener;
@@ -310,7 +311,10 @@ final class GameLibrary {
         if (r.artifactRefreshed) return "build artifact updated (same files): " + game + " -> " + r.contentRoot.substring(0, 19);
         return "installed: " + game + " -> " + r.contentRoot.substring(0, 19)
             + String.format(Locale.ROOT, "; stored %.1f MiB, shared %.1f MiB with installed versions", r.storedBytes / 1048576.0, r.sharedBytes / 1048576.0)
-            + (r.linked ? "" : " (hard links refused: files copied, not shared)")
+            + (r.managedObjects ? String.format(Locale.ROOT,
+                " (objects plan_ms=%d place_ms=%d verify_ms=%d publish_ms=%d collect_ms=%d unchanged_read_bytes=%d unchanged_write_bytes=%d)",
+                r.planMs, r.placeMs, r.verifyMs, r.publishMs, r.collectMs, r.unchangedReadBytes, r.unchangedWriteBytes)
+                : r.linked ? "" : " (hard links refused: files copied, not shared)")
             + (r.previousContentRoot == null ? "" : "; previous " + r.previousContentRoot.substring(0, 19) + " kept");
     }
 
