@@ -57,6 +57,7 @@ struct s2a_frame_log {
     uint32_t w;                 /* 下一次写入的槽位（独立游标，不依赖 seq % CAP） */
     uint32_t kept;              /* 环内现存帧数 ≤ S2A_FL_CAP */
     _Atomic int snapshot_lock;
+    int sealed;                 /* snapshot_lock 保护。封存后 present / fence 不再写环 */
     _Atomic uint64_t fence_ns_acc;  /* 距上一条 present 累计的 fence 等待 ns */
     _Atomic uint64_t fence_n_acc;   /* 距上一条 present 累计的 fence 等待次数 */
 };
@@ -97,6 +98,8 @@ void s2a_fl_dump(const struct s2a_frame_log *fl, void (*emit)(void *ctx, const c
 int nvn_vk_frame_log_on(void);
 void nvn_vk_frame_log_present(void);
 void nvn_vk_frame_log_dump(void);
+// 前端仍可能有在途调用的保留停局路径：封存当时的环，只转储一次，不复位到可写态。
+void nvn_vk_frame_log_dump_retained(void);
 void nvn_vk_frame_log_fence_wait(uint64_t wait_ns);
 // 新回放层的 GPU 读数（backend_vulkan.c 弱引用调；nvk_gputime 开着才有段时间戳）：
 //   每段完成报一次该段 GPU 时间戳跨度 ns；上屏段完成时结一帧（帧号 = 第几次上屏段完成），
