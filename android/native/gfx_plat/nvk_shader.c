@@ -1336,8 +1336,35 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
 // 取一份（图形：stages 是只有 vs 0x1、vs+fs 0x3 或 vs+fs+gs 0x7，keys 按 NVN 位序紧排 vs / fs / gs；计算：ckey 非空）。1 = 取到（*bytes 归调用方 free）
 //   topology：本笔绘制的输入图元名（fill_facts 的 topology()，快照里已算好——工作线程不碰 rp_S）；几何程序按它挑离线库里同图元那份，
 //   没有来源（NULL）几何程序 miss。本局 profile 的 geometryShader 没开时 libpack 照旧 miss（与现编同一字段）
+// Private diagnostic APK. Log intervals on the same boot clock as v5 present records.
+struct stair_probe { uint64_t start, fetched; const char *format; };
+static _Atomic uint64_t stair_sequence;
+static uint64_t stair_us(void) {
+    struct timespec t;
+#ifdef __ANDROID__
+    clock_gettime(CLOCK_BOOTTIME, &t);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
+#endif
+    return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+static struct stair_probe stair_begin(int attempted) {
+    struct stair_probe p = {0, 0, "none"};
+    if (attempted && nvn_plat_flag("nvk_libpack_timing", 0)) p.start = stair_us();
+    return p;
+}
+static void stair_end(struct stair_probe *p, const char *role, const uint8_t *id, unsigned stages, int ok) {
+    if (!p->start) return;
+    uint64_t end = stair_us();
+    uint64_t seq = atomic_fetch_add(&stair_sequence, 1) + 1;
+    char line[256];
+    snprintf(line, sizeof line, "S2SB_EVT seq=%llu role=%s format=%s ok=%d st=%u id=%02x%02x%02x%02x%02x%02x%02x%02x start=%llu fetch=%llu end=%llu",
+             (unsigned long long)seq, role, p->format, ok, stages, id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+             (unsigned long long)p->start, (unsigned long long)(p->fetched ? p->fetched : end), (unsigned long long)end);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
 static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, int state_ok,
-                         const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len, union lp_prepared **ready) {
+                         const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len, union lp_prepared **ready, struct stair_probe *probe) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
     // state_ok 对计算同样生效：ckey 路径传 !unaligned（慢路）/ rec->lp_ok==2（暖路径），含义同图形 lp_ok。库件只有
     //   对齐变体（libpack_vk.c 恒写 hasUnalignedStorageBuffer:false，c0 钳制补偿只有现编能出），非对齐 sbuf 绑定下
@@ -1377,6 +1404,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
         if (ckey) memcpy(keys[0], ckey, 8);
         else memcpy(keys, gkeys, (stages == 0x7u ? 3u : stages == 0x3u ? 2u : 1u) * sizeof keys[0]);
 
+        if (probe->start) probe->format = s2a_libpack_is_binary(lp) ? "s2sb" : "json";
         char profile_why[160] = "";
         if (ckey && nvk_compute_profile_parse(pc, &pf, profile_why, sizeof profile_why)) {
             snprintf(lw, sizeof lw, "compute profile: %s", profile_why[0] ? profile_why : "invalid");
@@ -1508,12 +1536,26 @@ static void reject_context(const struct work_snap *s, const char *reason, const 
 }
 
 // 仅 worker 执行 managed 翻译。生命周期准入在 worker 本线程持有，与提交者是否还等结果无关。
+static _Atomic uint64_t stair_exec_count;
+static int stair_execute(uint64_t session, uint64_t generation, const char *json, size_t len, struct s2a_compile_outcome *out) {
+    uint64_t start = nvn_plat_flag("nvk_libpack_timing", 0) ? stair_us() : 0;
+    int rc = s2a_compile_request_execute(session, generation, json, len, out);
+    if (start) {
+        uint64_t end = stair_us();
+        char line[128];
+        snprintf(line, sizeof line, "S2SB_LIVE seq=%llu start=%llu end=%llu rc=%d",
+                 (unsigned long long)(atomic_fetch_add(&stair_exec_count, 1) + 1),
+                 (unsigned long long)start, (unsigned long long)end, rc);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+    }
+    return rc;
+}
 static int live_worker(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t len,
                        uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size) {
     (void)ctx;
     if (shader_enter()) return -1;
     struct s2a_compile_outcome oc = {0};
-    int ran = shader_compile_admit() ? s2a_compile_request_execute(session, generation, json, len, &oc) : -1;
+    int ran = shader_compile_admit() ? stair_execute(session, generation, json, len, &oc) : -1;
     const int ok = !ran && oc.bytes && oc.bytes_len;
     if (ok) {
         *bytes = oc.bytes;
@@ -1546,7 +1588,7 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
         if (g_texpool_diag) g_pool_attempts++;
         if (g_live_compile < 0) atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
         const uint64_t trace = diag_begin(identity, stages, 1);
-        const int ran = s2a_compile_request_execute(session, generation, json, len, oc);
+        const int ran = stair_execute(session, generation, json, len, oc);
         const int ok = !ran && oc->bytes && oc->bytes_len;
         diag_end(trace, ok);
         return ok ? LIVE_OK : LIVE_REJECTED;
@@ -1634,14 +1676,17 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         have_res = 1;
     }
     union lp_prepared *ready = NULL;
-    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len, &ready)) {
+    struct stair_probe probe = stair_begin(!bytes);
+    if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_ok, s->f.gfx.topology, &s->pc, &bytes, &len, &ready, &probe)) {
+        if (probe.start) probe.fetched = stair_us();
         struct entry *le = build(bytes, len, s->views, s->nst, s->identity, 1, ready);
         if (le) { le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
+        stair_end(&probe, "fg", s->identity, s->stages, le && !le->failed);
         if (le && !le->failed) { libpack_note_hit(); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity);
-    }
+    } else stair_end(&probe, "fg", s->identity, s->stages, 0);
     if (!bytes) {
         // 现场编译只读取已捕获的请求，回到原 owner 处理事实学习和结果发布。
         static struct s2a_compile_request_input in;   // 提交线程独占
@@ -1765,15 +1810,18 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     }
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
     union lp_prepared *ready = NULL;
+    struct stair_probe probe = stair_begin(!bytes);
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
-                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len, &ready)) {
+                                compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len, &ready, &probe)) {
+        if (probe.start) probe.fetched = stair_us();
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 1, ready) : build(bytes, len, views, nst, rec->identity, 1, ready);
         if (le) { if (!compute) le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
+        stair_end(&probe, "warm", rec->identity, rec->stage_mask, le && !le->failed);
         if (le && !le->failed) { libpack_note_hit(); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(rec->identity);
-    }
+    } else stair_end(&probe, "warm", rec->identity, rec->stage_mask, 0);
     if (!bytes) {
         warm_diag("程序预热：结果字节取不到（身份 %02x%02x%02x%02x…，离线库 %s，跨局缓存 %s「%s」，缓存目录 %s）",
                   rec->identity[0], rec->identity[1], rec->identity[2], rec->identity[3],
@@ -2479,12 +2527,15 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
         union lp_prepared *ready = NULL;
-        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len, &ready)) {
+        struct stair_probe probe = stair_begin(!bytes);
+        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len, &ready, &probe)) {
+            if (probe.start) probe.fetched = stair_us();
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 1, ready);
             free(bytes); bytes = NULL; len = 0;
+            stair_end(&probe, "fg", rq.identity, 32, lpe && !lpe->failed);
             if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(); }
             else { entry_free(lpe); lpe = NULL; libpack_mark_bad(rq.identity); }
-        }
+        } else stair_end(&probe, "fg", rq.identity, 32, 0);
         if (!bytes && !lpe) {
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
             enum live_status status = live_compile(rq.session, rq.generation, rq.json, rq.json_bytes, rq.identity, 32u, NULL, &oc);
@@ -2566,6 +2617,13 @@ int rp_shader_lib_reject(const struct rp_prog *p) {
     return 1;
 }
 void rp_shader_reset(void) {
+    if (nvn_plat_flag("nvk_libpack_timing", 0)) {
+        char summary[144];
+        snprintf(summary, sizeof summary, "S2SB_CUT seq=%llu live=%llu time=%llu",
+                 (unsigned long long)atomic_load(&stair_sequence), (unsigned long long)atomic_load(&stair_exec_count),
+                 (unsigned long long)stair_us());
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", summary);
+    }
     fact_cache_reset();
     if (g_pool_programs || g_pool_request_rejected) pool_stats("reset");
     // 后台预热一律不得越过这一步进会话收尾：先有界静默（置位后后台不再发布），再释放。

@@ -113,6 +113,7 @@ void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_timing")) return getenv("S2SB_QA_TIMING") != NULL;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
@@ -128,6 +129,7 @@ static int link_map_lines; static char last_link_map[700];   // 配对接口表�
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (!strncmp(text, "S2SB_", 5)) puts(text);
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
