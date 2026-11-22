@@ -41,7 +41,7 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
 // → dst 子资源 UNDEFINED 转 GENERAL → 绑 pipe / ds（布局 pl）→ 推 {w, h} 8 字节 → Dispatch((w+7)/8, (h+7)/8, 1)。
 // 资源要等段执行完才能 nvn_vk_bcdec_rec_free；返回非 0 时 rec 已清空。
 struct nvn_vk_bcdec_rec { VkImage in; VkDeviceMemory in_mem; VkImageView in_view, out_view; VkDescriptorPool pool;
-                          VkDescriptorSet ds; VkPipeline pipe; VkPipelineLayout pl; uint32_t bw, bh; };
+                          VkDescriptorSet ds; VkPipeline pipe; VkPipelineLayout pl; uint32_t bw, bh; VkFormat in_format; };
 int nvn_vk_bcdec_prepare(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d, VkImage dst, uint32_t nvn_format,
                          uint32_t w, uint32_t h, uint32_t mip, uint32_t layer, struct nvn_vk_bcdec_rec *rec, char *why, size_t why_size);
 void nvn_vk_bcdec_rec_free(struct s2a_vk_device *d, struct nvn_vk_bcdec_rec *rec);

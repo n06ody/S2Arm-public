@@ -302,6 +302,9 @@ static void *dq_recorder_main(void *arg) {
     (void)arg; 
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "s2a-vk-record");
+#if defined(S2A_ANDROID_VK_BACKEND_NVK)
+    s2a_capacity_nvk_record_enter();
+#endif
     if (s2a_adpf_pin_self) s2a_adpf_pin_self();
 #endif
 #ifdef __linux__
@@ -368,67 +371,90 @@ static DQ_U uint64_t vk_dq_fill_wait(uint64_t t) {
 
 // ---- the wrappers (the producer) ----
 #define DQ_DIRECT(f, ...) do { vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_##f(__VA_ARGS__); } while (0)
-#define DQ_BEGIN(op, T, extra) DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
+#define DQ_BEGIN_RAW(op, T, extra) if (gap_registered) gap_before_op(cb, op); DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
+#define PRE_TRACE_EDGE(call) do { if (atomic_load_explicit(&pre_active, memory_order_relaxed)) call; } while (0)
+#define PRE_TRACE(call) do { if (atomic_load_explicit(&pre_count_active, memory_order_relaxed)) call; } while (0)
+#define DQ_BEGIN(op, T, extra) PRE_TRACE(pre_op(cb, op)); DQ_BEGIN_RAW(op, T, extra)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t nm, const VkMemoryBarrier *m,
                                                          uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
+    PRE_TRACE(pre_barrier(cb, src, dst, dep, nm, m, nb, b, ni, im));
+    if (gap_registered) gap_before_barrier(cb, ni, im);
     for (uint32_t i = 0; i < nm; i++) if (m[i].pNext) goto direct;
     for (uint32_t i = 0; i < nb; i++) if (b[i].pNext) goto direct;
     for (uint32_t i = 0; i < ni; i++) if (im[i].pNext) goto direct;
-    { DQ_BEGIN(OP_vkCmdPipelineBarrier, a_barrier, DQ_ARR(VkMemoryBarrier, m, nm) + DQ_ARR(VkBufferMemoryBarrier, b, nb) + DQ_ARR(VkImageMemoryBarrier, im, ni));
+    { DQ_BEGIN_RAW(OP_vkCmdPipelineBarrier, a_barrier, DQ_ARR(VkMemoryBarrier, m, nm) + DQ_ARR(VkBufferMemoryBarrier, b, nb) + DQ_ARR(VkImageMemoryBarrier, im, ni));
       *a = (a_barrier){src, dst, dep, m ? nm : 0, b ? nb : 0, im ? ni : 0}; dq_put(&at_, m, DQ_ARR(VkMemoryBarrier, m, nm)); dq_put(&at_, b, DQ_ARR(VkBufferMemoryBarrier, b, nb)); dq_put(&at_, im, DQ_ARR(VkImageMemoryBarrier, im, ni));
       dq_rec_end(base_); return; }
 direct: DQ_DIRECT(vkCmdPipelineBarrier, cb, src, dst, dep, nm, m, nb, b, ni, im);
 }
-#define W_REGIONS(f, OP, T, R, sig, init, call) \
-    static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f sig { { DQ_BEGIN(OP, T, DQ_ARR(R, rg, n)); *a = init; dq_put(&at_, rg, DQ_ARR(R, rg, n)); dq_rec_end(base_); return; } direct: DQ_DIRECT call; }
-W_REGIONS(vkCmdCopyBuffer, OP_vkCmdCopyBuffer, a_copybuf, VkBufferCopy, (VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *rg), ((a_copybuf){s, d, n}), (vkCmdCopyBuffer, cb, s, d, n, rg))
+#define W_REGIONS(f, OP, T, R, sig, init, call, trace) \
+    static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f sig { PRE_TRACE(trace); { DQ_BEGIN_RAW(OP, T, DQ_ARR(R, rg, n)); *a = init; dq_put(&at_, rg, DQ_ARR(R, rg, n)); dq_rec_end(base_); return; } direct: DQ_DIRECT call; }
+W_REGIONS(vkCmdCopyBuffer, OP_vkCmdCopyBuffer, a_copybuf, VkBufferCopy, (VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *rg), ((a_copybuf){s, d, n}), (vkCmdCopyBuffer, cb, s, d, n, rg), pre_copy_buffer(cb, n, rg))
 W_REGIONS(vkCmdCopyBufferToImage, OP_vkCmdCopyBufferToImage, a_b2i, VkBufferImageCopy, (VkCommandBuffer cb, VkBuffer b, VkImage i, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg),
-          ((a_b2i){b, i, l, n}), (vkCmdCopyBufferToImage, cb, b, i, l, n, rg))
+          ((a_b2i){b, i, l, n}), (vkCmdCopyBufferToImage, cb, b, i, l, n, rg), pre_buffer_image(cb, OP_vkCmdCopyBufferToImage, i, l, n, rg))
 W_REGIONS(vkCmdCopyImageToBuffer, OP_vkCmdCopyImageToBuffer, a_i2b, VkBufferImageCopy, (VkCommandBuffer cb, VkImage i, VkImageLayout l, VkBuffer b, uint32_t n, const VkBufferImageCopy *rg),
-          ((a_i2b){i, l, b, n}), (vkCmdCopyImageToBuffer, cb, i, l, b, n, rg))
+          ((a_i2b){i, l, b, n}), (vkCmdCopyImageToBuffer, cb, i, l, b, n, rg), pre_buffer_image(cb, OP_vkCmdCopyImageToBuffer, i, l, n, rg))
 W_REGIONS(vkCmdCopyImage, OP_vkCmdCopyImage, a_img2, VkImageCopy, (VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageCopy *rg),
-          ((a_img2){si, sl, di, dl, n, VK_FILTER_NEAREST}), (vkCmdCopyImage, cb, si, sl, di, dl, n, rg))
+          ((a_img2){si, sl, di, dl, n, VK_FILTER_NEAREST}), (vkCmdCopyImage, cb, si, sl, di, dl, n, rg), pre_copy_image(cb, OP_vkCmdCopyImage, si, sl, di, dl, n, rg, VK_FILTER_NEAREST))
 W_REGIONS(vkCmdBlitImage, OP_vkCmdBlitImage, a_img2, VkImageBlit, (VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageBlit *rg, VkFilter f),
-          ((a_img2){si, sl, di, dl, n, f}), (vkCmdBlitImage, cb, si, sl, di, dl, n, rg, f))
+          ((a_img2){si, sl, di, dl, n, f}), (vkCmdBlitImage, cb, si, sl, di, dl, n, rg, f), pre_copy_image(cb, OP_vkCmdBlitImage, si, sl, di, dl, n, rg, f))
 W_REGIONS(vkCmdResolveImage, OP_vkCmdResolveImage, a_img2, VkImageResolve, (VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageResolve *rg),
-          ((a_img2){si, sl, di, dl, n, VK_FILTER_NEAREST}), (vkCmdResolveImage, cb, si, sl, di, dl, n, rg))
-W_REGIONS(vkCmdSetViewport, OP_vkCmdSetViewport, a_range, VkViewport, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *rg), ((a_range){first, n}), (vkCmdSetViewport, cb, first, n, rg))
-W_REGIONS(vkCmdSetScissor, OP_vkCmdSetScissor, a_range, VkRect2D, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D *rg), ((a_range){first, n}), (vkCmdSetScissor, cb, first, n, rg))
+          ((a_img2){si, sl, di, dl, n, VK_FILTER_NEAREST}), (vkCmdResolveImage, cb, si, sl, di, dl, n, rg), pre_copy_image(cb, OP_vkCmdResolveImage, si, sl, di, dl, n, rg, VK_FILTER_NEAREST))
+W_REGIONS(vkCmdSetViewport, OP_vkCmdSetViewport, a_range, VkViewport, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *rg), ((a_range){first, n}), (vkCmdSetViewport, cb, first, n, rg), pre_op(cb, OP_vkCmdSetViewport))
+W_REGIONS(vkCmdSetScissor, OP_vkCmdSetScissor, a_range, VkRect2D, (VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D *rg), ((a_range){first, n}), (vkCmdSetScissor, cb, first, n, rg), pre_op(cb, OP_vkCmdSetScissor))
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkDeviceSize size, uint32_t data) {
-    { DQ_BEGIN(OP_vkCmdFillBuffer, a_fill, 0); *a = (a_fill){b, off, size, data}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdFillBuffer, cb, b, off, size, data); }
+    PRE_TRACE(pre_buffer_span(cb, OP_vkCmdFillBuffer, off, size));
+    { DQ_BEGIN_RAW(OP_vkCmdFillBuffer, a_fill, 0); *a = (a_fill){b, off, size, data}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdFillBuffer, cb, b, off, size, data); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkDeviceSize size, const void *data) {
-    { DQ_BEGIN(OP_vkCmdUpdateBuffer, a_upd, (size_t)size); *a = (a_upd){b, off, size}; dq_put(&at_, data, (size_t)size); dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdUpdateBuffer, cb, b, off, size, data); }
+    PRE_TRACE(pre_buffer_span(cb, OP_vkCmdUpdateBuffer, off, size));
+    { DQ_BEGIN_RAW(OP_vkCmdUpdateBuffer, a_upd, (size_t)size); *a = (a_upd){b, off, size}; dq_put(&at_, data, (size_t)size); dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdUpdateBuffer, cb, b, off, size, data); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *rg) {
-    { DQ_BEGIN(OP_vkCmdClearColorImage, a_clrimg, DQ_ARR(VkImageSubresourceRange, rg, n)); memset(a, 0, sizeof *a); a->i = i; a->l = l; a->c = *c; a->n = n; dq_put(&at_, rg, DQ_ARR(VkImageSubresourceRange, rg, n)); dq_rec_end(base_); return; }
+    PRE_TRACE(pre_clear(cb, OP_vkCmdClearColorImage, i, l, n, rg));
+    { DQ_BEGIN_RAW(OP_vkCmdClearColorImage, a_clrimg, DQ_ARR(VkImageSubresourceRange, rg, n)); memset(a, 0, sizeof *a); a->i = i; a->l = l; a->c = *c; a->n = n; dq_put(&at_, rg, DQ_ARR(VkImageSubresourceRange, rg, n)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdClearColorImage, cb, i, l, c, n, rg); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearDepthStencilValue *ds, uint32_t n, const VkImageSubresourceRange *rg) {
-    { DQ_BEGIN(OP_vkCmdClearDepthStencilImage, a_clrimg, DQ_ARR(VkImageSubresourceRange, rg, n)); memset(a, 0, sizeof *a); a->i = i; a->l = l; a->ds = *ds; a->n = n; dq_put(&at_, rg, DQ_ARR(VkImageSubresourceRange, rg, n)); dq_rec_end(base_); return; }
+    PRE_TRACE(pre_clear(cb, OP_vkCmdClearDepthStencilImage, i, l, n, rg));
+    { DQ_BEGIN_RAW(OP_vkCmdClearDepthStencilImage, a_clrimg, DQ_ARR(VkImageSubresourceRange, rg, n)); memset(a, 0, sizeof *a); a->i = i; a->l = l; a->ds = *ds; a->n = n; dq_put(&at_, rg, DQ_ARR(VkImageSubresourceRange, rg, n)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdClearDepthStencilImage, cb, i, l, ds, n, rg); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t na, const VkClearAttachment *at, uint32_t nr, const VkClearRect *rc) {
     { DQ_BEGIN(OP_vkCmdClearAttachments, a_clratt, DQ_ARR(VkClearAttachment, at, na) + DQ_ARR(VkClearRect, rc, nr)); *a = (a_clratt){na, nr};
       dq_put(&at_, at, DQ_ARR(VkClearAttachment, at, na)); dq_put(&at_, rc, DQ_ARR(VkClearRect, rc, nr)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdClearAttachments, cb, na, at, nr, rc); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) {
+    PRE_TRACE_EDGE(pre_begin_pass(cb, &bi->renderArea, bi->clearValueCount, 0));
+    if (gap_registered) gap_render_edge(cb, 1, 0);
     const VkRenderPassAttachmentBeginInfo *ab = NULL;
     if (bi->pNext) { const VkBaseInStructure *x = bi->pNext; if (x->sType != VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO || x->pNext) goto direct; ab = (const void *)x; }
     { size_t nc = DQ_ARR(VkClearValue, bi->pClearValues, bi->clearValueCount), nv = ab ? DQ_ARR(VkImageView, ab->pAttachments, ab->attachmentCount) : 0;
-      DQ_BEGIN(OP_vkCmdBeginRenderPass, a_rpbegin, nc + nv); memset(a, 0, sizeof *a); a->bi = *bi; a->c = c;
+      DQ_BEGIN_RAW(OP_vkCmdBeginRenderPass, a_rpbegin, nc + nv); memset(a, 0, sizeof *a); a->bi = *bi; a->c = c;
       if (!bi->pClearValues) a->bi.clearValueCount = 0;
       if (ab) { a->ab = *ab; a->has_ab = 1; }
-      dq_put(&at_, bi->pClearValues, nc); dq_put(&at_, ab ? ab->pAttachments : NULL, nv); dq_rec_end(base_); return; }
+      dq_put(&at_, bi->pClearValues, nc); dq_put(&at_, ab ? ab->pAttachments : NULL, nv); dq_rec_end(base_); if (gap_registered) gap_render_edge(cb, 1, 1); return; }
 direct: DQ_DIRECT(vkCmdBeginRenderPass, cb, bi, c);
+    if (gap_registered) gap_render_edge(cb, 1, 1);
 }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
+    PRE_TRACE_EDGE(pre_begin_pass(cb, &ri->renderArea, ri->colorAttachmentCount, 1));
+    if (gap_registered) gap_render_edge(cb, 1, 0);
     if (ri->pNext || (ri->pDepthAttachment && ri->pDepthAttachment->pNext) || (ri->pStencilAttachment && ri->pStencilAttachment->pNext)) goto direct;
     for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) if (ri->pColorAttachments[i].pNext) goto direct;
-    { DQ_BEGIN(OP_vkCmdBeginRendering, a_rbegin, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); memset(a, 0, sizeof *a); a->ri = *ri;
+    { DQ_BEGIN_RAW(OP_vkCmdBeginRendering, a_rbegin, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); memset(a, 0, sizeof *a); a->ri = *ri;
       if (!ri->pColorAttachments) a->ri.colorAttachmentCount = 0;
       if (ri->pDepthAttachment) { a->d = *ri->pDepthAttachment; a->has_d = 1; }
       if (ri->pStencilAttachment) { a->s = *ri->pStencilAttachment; a->has_s = 1; }
-      dq_put(&at_, ri->pColorAttachments, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); dq_rec_end(base_); return; }
+      dq_put(&at_, ri->pColorAttachments, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); dq_rec_end(base_); if (gap_registered) gap_render_edge(cb, 1, 1); return; }
 direct: DQ_DIRECT(vkCmdBeginRendering, cb, ri);
+    if (gap_registered) gap_render_edge(cb, 1, 1);
 }
-#define W_NOARG(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { DQ_COUNT(OP_##f); void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; if (!a) { DQ_DIRECT(f, cb); return; } dq_rec_end(a); }
+#define W_NOARG(f) \
+    static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { \
+        if (gap_registered) gap_render_edge(cb, 0, 0); \
+        DQ_COUNT(OP_##f); \
+        void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; \
+        if (a) dq_rec_end(a); else DQ_DIRECT(f, cb); \
+        if (gap_registered) gap_render_edge(cb, 0, 1); \
+        PRE_TRACE_EDGE(pre_end_pass(cb)); \
+    }
 W_NOARG(vkCmdEndRenderPass) W_NOARG(vkCmdEndRendering)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pl) {
     { DQ_BEGIN(OP_vkCmdBindPipeline, a_bindpipe, 0); *a = (a_bindpipe){bp, pl}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdBindPipeline, cb, bp, pl); }
@@ -463,9 +489,11 @@ W_INDIRECT(vkCmdDrawIndirect) W_INDIRECT(vkCmdDrawIndexedIndirect)
     { DQ_BEGIN(OP_##f, a_indcount, 0); *a = (a_indcount){b, off, c, coff, max, stride}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(f, cb, b, off, c, coff, max, stride); }
 W_INDCOUNT(vkCmdDrawIndirectCount) W_INDCOUNT(vkCmdDrawIndexedIndirectCount)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
-    { DQ_BEGIN(OP_vkCmdDispatch, a_draw, 0); *a = (a_draw){x, y, z, 0, 0, 0}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdDispatch, cb, x, y, z); }
+    PRE_TRACE(pre_dispatch(cb, OP_vkCmdDispatch, x, y, z, 0));
+    { DQ_BEGIN_RAW(OP_vkCmdDispatch, a_draw, 0); *a = (a_draw){x, y, z, 0, 0, 0}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdDispatch, cb, x, y, z); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off) {
-    { DQ_BEGIN(OP_vkCmdDispatchIndirect, a_indirect, 0); *a = (a_indirect){b, off, 0, 0}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdDispatchIndirect, cb, b, off); }
+    PRE_TRACE(pre_dispatch(cb, OP_vkCmdDispatchIndirect, 0, 0, 0, off));
+    { DQ_BEGIN_RAW(OP_vkCmdDispatchIndirect, a_indirect, 0); *a = (a_indirect){b, off, 0, 0}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdDispatchIndirect, cb, b, off); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool p, uint32_t first, uint32_t n) {
     { DQ_BEGIN(OP_vkCmdResetQueryPool, a_qreset, 0); *a = (a_qreset){p, first, n}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdResetQueryPool, cb, p, first, n); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits st, VkQueryPool p, uint32_t q) {
@@ -543,7 +571,17 @@ static void vk_dq_init(VkDevice dev) {
 // 队列空时 vk_dq_drain 只是一次比较。原文没有这一层：它的引擎把资源销毁都推迟到槽退役之后。
 #define DQ_DESTROY(f, T) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkDevice d, T o, const VkAllocationCallbacks *a) { vk_dq_drain(); f(d, o, a); }
 DQ_DESTROY(vkDestroyBuffer, VkBuffer)
-DQ_DESTROY(vkDestroyImage, VkImage)
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkCreateImage(VkDevice d, const VkImageCreateInfo *ci,
+                                                          const VkAllocationCallbacks *a, VkImage *image) {
+    const VkResult rc = vkCreateImage(d, ci, a, image);
+    if (rc == VK_SUCCESS) pre_image_add(*image, ci->format, ci->extent);
+    return rc;
+}
+static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkDestroyImage(VkDevice d, VkImage image, const VkAllocationCallbacks *a) {
+    vk_dq_drain();
+    pre_image_del(image);
+    vkDestroyImage(d, image, a);
+}
 DQ_DESTROY(vkDestroyImageView, VkImageView)
 DQ_DESTROY(vkDestroyBufferView, VkBufferView)
 DQ_DESTROY(vkDestroyFramebuffer, VkFramebuffer)
@@ -618,6 +656,7 @@ int nvn_vk_dbg_dq_thread_cpu_ns(uint64_t *ns) {   // 用例读：录制线程至
 #define vkCmdBeginRenderPass w_vkCmdBeginRenderPass
 #define vkCmdBeginQuery w_vkCmdBeginQuery
 #define vkDestroyBuffer w_vkDestroyBuffer
+#define vkCreateImage w_vkCreateImage
 #define vkDestroyImage w_vkDestroyImage
 #define vkDestroyImageView w_vkDestroyImageView
 #define vkDestroyBufferView w_vkDestroyBufferView

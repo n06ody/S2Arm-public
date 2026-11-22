@@ -167,6 +167,15 @@ int nvk_compute_profile_parse(const struct s2a_direct_compile_context *c,
         (field->unsigned_value & (field->unsigned_value - 1)))
         { PROFILE_REJECT("compute profile storage alignment missing or invalid"); }
     out->storage_alignment = (uint32_t)field->unsigned_value;
+    field = s2a_json_get(&profile, "maximumComputeSharedMemorySize");
+    // 缺席按 Vulkan 1.0 下限 32768：只会比真值多拒库程序退回现编，不会放行超上限的结果
+    out->max_shared = 32768;
+    if (field) {
+        if (field->kind != S2A_JSON_NUMBER || !field->is_unsigned ||
+            field->unsigned_value < 16384 || field->unsigned_value > (1u << 20))
+            { PROFILE_REJECT("compute profile shared memory limit invalid"); }
+        out->max_shared = (uint32_t)field->unsigned_value;
+    }
     return 0;
 #undef PROFILE_REJECT
 }

@@ -660,3 +660,4 @@
 20261120-1306-ldn-mitm-disconnect-diagnostics.patch
 20261120-1021-spirv-declare-used-caps.patch
 20261120-1330-nifm-offline-submit-onhold.patch
+20261120-1837-audio-renderer-partial-start.patch

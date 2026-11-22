@@ -38,6 +38,7 @@ void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }
 uint64_t rp_frame(void) { return 1; }   // #996：rp_draw 首用策略按帧号判（rp_entry.c 的替身）
 uint64_t rp_seg_serial(void) { return 1; }
 void rp_occl_draw(nvn_gpu_cmd c) { (void)c; }
+void rp_seg_prog_note(const struct rp_prog *p) { (void)p; }   // rp_exec.c 的段失败键记录：本用例不验
 int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) { (void)a; (void)n; (void)m; (void)s; return 0; }
 // 本夹具没有存储缓冲声明；空存储语义由真实 rp_buf GPU 用例验证。
