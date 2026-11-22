@@ -606,6 +606,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
     gap_wsi_record(seg);
+    pre_wsi_tick(seg, 0);
     enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];

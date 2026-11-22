@@ -273,6 +273,7 @@ static int gw_covers_any_page(const struct shadow *s, const uint8_t *mem, uint64
 }
 // 把游戏内存的 [a, b)（池内偏移）传进镜像，绕开 GPU 写过、还没回写落地的那些段：
 // 那些字节镜像里的才是新的，游戏内存里是旧的（同步按页，一页里别的字节脏了不能连它一起盖回去）。
+void nvn_vk_pre_trace_pool(nvn_gpu_cmd c, int active) __attribute__((weak));
 static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct mirror *m, uint64_t a, uint64_t b) {   // direct 非空：直接写进镜像的 CPU 映射（见 rp_buf_resolve）
     while (a < b) {
         uint64_t stop = b, skip_to = 0;   // 找起点落在 [a, b) 里最靠前的一段；a 本身在某段里就先跳过去
@@ -282,7 +283,11 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        else {
+            if (nvn_vk_pre_trace_pool) nvn_vk_pre_trace_pool(xc, 1);
+            nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+            if (nvn_vk_pre_trace_pool) nvn_vk_pre_trace_pool(xc, 0);
+        }
         a = stop;
     }
 }

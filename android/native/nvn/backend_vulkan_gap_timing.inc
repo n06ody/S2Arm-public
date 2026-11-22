@@ -405,5 +405,7 @@ void nvk_gap_test_present(uint64_t seq, uint64_t elapsed_seconds) {
     struct vk_segment s = {.internal = 1, .wsi_seq = seq};
     gap_wsi_time(&s, elapsed_seconds * UINT64_C(1000000000));
     gap_segment_done(&s, 0);
+    pre_wsi_tick(&s, elapsed_seconds * UINT64_C(1000000000));
+    pre_finish(&s, 0);
 }
 #endif
