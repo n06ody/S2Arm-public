@@ -39,6 +39,8 @@ public class MainActivity extends Activity
     private static final String PREF_TOUCH_PASSTHROUGH = "touchPassthrough.";   // + layout file name: per game
     private String lastInputLog = "";
     private int loggedLayout;
+    private boolean layoutProbeFirstInput, layoutProbeFirstStick;
+    private int layoutProbePrintGeneration, layoutProbePrintResult;
     private static final int PICK_PACKAGE = 1;
     private static final int PICK_TOUCH_LAYOUT = 2, EXPORT_TOUCH_LAYOUT = 3;
     private byte[] touchExport;
@@ -1019,6 +1021,8 @@ public class MainActivity extends Activity
         if (intent != null && intent.hasExtra("s2arm.touchlog")) {
             touchLog = "on".equals(intent.getStringExtra("s2arm.touchlog"));
             touchPad.setTrace(touchLog);
+            layoutProbeFirstInput = layoutProbeFirstStick = false;
+            if (touchLog) touchPad.layoutEvidence("trace_applied", "logged=" + loggedLayout);
         }
         updateGamepadMapping(intent);
         String o = intent == null ? null : intent.getStringExtra("s2arm.orientation");
@@ -1456,13 +1460,30 @@ public class MainActivity extends Activity
             if (magnitude(t.leftX(), t.leftY()) > magnitude(lx, ly)) { lx = t.leftX(); ly = t.leftY(); }
             if (magnitude(t.rightX(), t.rightY()) > magnitude(rx, ry)) { rx = t.rightX(); ry = t.rightY(); }
         }
+        if (touchLog && touchPad != null) {
+            if (!layoutProbeFirstInput) {
+                layoutProbeFirstInput = true;
+                touchPad.layoutEvidence("first_input", "logged=" + loggedLayout);
+            }
+            if (!layoutProbeFirstStick && (rx != 0 || ry != 0)) {
+                layoutProbeFirstStick = true;
+                String printRc = layoutProbePrintGeneration == 0 ? "none" : Integer.toString(layoutProbePrintResult);
+                touchPad.layoutEvidence("first_right_stick", "logged=" + loggedLayout
+                    + " print_generation=" + layoutProbePrintGeneration + " print_rc=" + printRc);
+            }
+        }
         if (touchLog && touchPad != null && touchPad.pad().layouts != loggedLayout) {
             loggedLayout = touchPad.pad().layouts;
             StringBuilder sb = new StringBuilder("touchpad layout:");
             for (TouchPad.Control c : touchPad.pad().controls())
                 sb.append(String.format(java.util.Locale.ROOT, " %s=(%.0f,%.0f,r%.0f)",
                     c.kind == TouchPad.STICK ? (c.bit == 0 ? "LSTICK" : "RSTICK") : c.kind == TouchPad.DPAD ? "DPAD" : c.label, c.x, c.y, c.radius));
-            Log.i("S2Arm", sb.toString());
+            String line = sb.toString();
+            touchPad.layoutEvidence("print_begin", "logged=" + loggedLayout + " chars=" + line.length());
+            int result = Log.i("S2Arm", line);
+            layoutProbePrintResult = result;
+            layoutProbePrintGeneration = loggedLayout;
+            touchPad.layoutEvidence("print_return", "logged=" + loggedLayout + " rc=" + result);
         }
         if (touchLog) {
             String line = String.format(java.util.Locale.ROOT, "input: buttons=0x%04x L=(%d,%d) R=(%d,%d)", buttons, lx, ly, rx, ry);

@@ -31,6 +31,7 @@ final class TouchPadView extends View {
     private final GameTouch gameTouch = new GameTouch(this::publishGameTouch);
     private boolean controlsVisible = true;
     private boolean trace;
+    private long firstLayoutNs, latestLayoutNs;
     private boolean editing;
     private int opacityPercent = 100;
 
@@ -60,6 +61,14 @@ final class TouchPadView extends View {
     void setEditDragListener(EditDragListener listener) { editDrag = listener; }
     private final Runnable menuHold = this::openMenu;
     void setTrace(boolean enabled) { trace = enabled; TouchInputBridge.touchTrace(enabled); }
+
+    void layoutEvidence(String event, String detail) {
+        if (!trace) return;
+        android.util.Log.i("S2ArmTouchLayout", event + " monotonic_ns=" + System.nanoTime()
+            + " view=" + System.identityHashCode(this) + " generation=" + pad.layouts
+            + " controls=" + pad.controls().size() + " first_layout_ns=" + firstLayoutNs
+            + " latest_layout_ns=" + latestLayoutNs + " " + detail);
+    }
 
     boolean gameTouchEnabled() { return gameTouch.enabled(); }
     boolean controlsVisible() { return controlsVisible; }
@@ -180,6 +189,9 @@ final class TouchPadView extends View {
         pad.cancel();
         revokeGameViewport();
         pad.layout(insetLeft, insetTop, getWidth() - insetLeft - insetRight, getHeight() - insetTop - insetBottom);
+        latestLayoutNs = System.nanoTime();
+        if (pad.layouts == 1) firstLayoutNs = latestLayoutNs;
+        layoutEvidence("built", "");
         listener.onTouchPad(pad);
         invalidate();
     }
