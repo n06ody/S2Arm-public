@@ -56,6 +56,10 @@
 #if defined(__ANDROID__) && defined(S2A_ANDROID_VK_BACKEND_NVK)
 #include "../capacity_affinity.h"
 #endif
+static _Atomic unsigned narrow_registered, narrow_queued_batches;
+static void narrow_before_cmd(VkCommandBuffer cb, unsigned op);
+static void narrow_before_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                  uint32_t nm, const VkMemoryBarrier *m, unsigned images);
 static _Atomic unsigned pre_active, pre_count_active;
 static void pre_op(VkCommandBuffer cb, unsigned op);
 static void pre_begin_pass(VkCommandBuffer cb, const VkRect2D *area, unsigned attachments, unsigned dynamic);
@@ -317,6 +321,7 @@ enum { OCC_CHUNK = 256, OCC_QUERY_SPARE_MAX = 65536 };   // 遮挡查询的续�
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
 enum { ES_PIPE, ES_VP, ES_SC, ES_BC, ES_ST, ES_DB, ES_VB, ES_IB, ES_PUSH, ES_KINDS };
 struct vk_segment {
+    uint64_t narrow_prev, narrow_next, narrow_ns;
     uint64_t pre_frame, pre_cpu_ns;
     unsigned pre_phase, pre_frame_submits, pre_frame_pairs, pre_missing;
     uint64_t gap_tag, gap_cpu_submit, gap_cpu_return, gap_cpu_done;
@@ -346,9 +351,11 @@ struct feedback_copy {
 
 struct gap_cmd;
 struct pre_record;
+struct narrow_cmd;
 struct pre_origin { unsigned kind, id; };
 enum { PRE_EXPLICIT, PRE_POOL, PRE_UPLOAD, PRE_DESWIZZLE, PRE_BC, PRE_TAIL };
 struct nvn_gpu_cmd_s {
+    struct narrow_cmd *narrow;
     struct pre_record *pre;
     struct gap_cmd *gap;
     uint64_t gap_tag;
@@ -526,6 +533,23 @@ struct nvn_gpu_vk {
 };
 
 static struct nvn_gpu_vk g;
+static void narrow_open(void);
+static void narrow_close(void);
+static void narrow_cmd_begin(nvn_gpu_cmd c);
+static void narrow_cmd_free(nvn_gpu_cmd c);
+static void narrow_detach(nvn_gpu_cmd c);
+static void narrow_commit_end(nvn_gpu_cmd c);
+static void narrow_pool_source(nvn_gpu_cmd c, int active);
+static void narrow_wsi_tick(struct vk_segment *s);
+static void narrow_wsi_time(struct vk_segment *s, uint64_t now);
+static unsigned narrow_timing_windows(void);
+static unsigned narrow_phase(void);
+static void narrow_finish(const struct vk_segment *s, int failed);
+static int narrow_try_copy(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, VkBufferCopy region, unsigned staged);
+static void narrow_legacy_copy(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, VkBufferCopy region);
+static int narrow_clear_begin(nvn_gpu_cmd c, const struct cmd_lay *layout, int color);
+static void narrow_clear_record(nvn_gpu_cmd c, int scoped_color);
+static void narrow_clear_end(nvn_gpu_cmd c);
 static void pre_open(void);
 static void pre_close(void);
 static void pre_cmd_begin(nvn_gpu_cmd c, const char *label);
@@ -1907,8 +1931,15 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 
+#ifdef S2A_NVK_GAP_HOST_TEST
+void nvk_narrow_test_after_give(VkCommandBuffer cb) __attribute__((weak));
+#endif
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
+    // Retire recording observers before the pool can be reset by another
+    // producer. Abort/failed recording drops deferred transfers.
+    narrow_detach(c);
+    pre_detach(c);
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
     // 先整队清空再归还 / 销毁下面这些资源。执行过的段已经过了 GPU 完成，记录早就做完了
     if (!executed) vk_dq_drain();
@@ -1996,12 +2027,16 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     }
     clr_cmd_free(c);   // 先解除旧命令的管线依赖，再把命令池交给另一线程复用
     seg_give_cmd(c->pool, c->cb, c->init_cb);
+#ifdef S2A_NVK_GAP_HOST_TEST
+    if (nvk_narrow_test_after_give) nvk_narrow_test_after_give(c->cb);
+#endif
     free(c->refs);
     free(c->refseen);
     free(c->staging);
     free(c->pass_capture);
     gap_cmd_free(c);
     pre_cmd_free(c);
+    narrow_cmd_free(c);
     free(c);
 }
 
@@ -2103,6 +2138,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
 
     gap_segment_done(s, failed);
     pre_finish(s, failed);
+    narrow_finish(s, failed);
     if (!s->internal && (failed || !sampled)) pass_capture_segment(vk->pass_capture, NULL, NULL, 0, s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         pass_capture_frame(vk, s, failed);
@@ -2494,6 +2530,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    narrow_open();
     gap_open();
     pre_open();
     nvnbar_open();
@@ -2691,6 +2728,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_join(g.worker, NULL);
     gap_close();
     pre_close();
+    narrow_close();
     free(g.pass_capture);
     g.pass_capture = NULL;
     g.worker_started = 0;
@@ -3087,9 +3125,11 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
         return;
     }
     memcpy(sl.cpu, src, (size_t)bytes);
-    full_barrier(c);
-    VkBufferCopy bc = {sl.off, off, bytes};
-    vkCmdCopyBuffer(c->cb, sl.buf->buffer, b->buffer, 1, &bc);
+    const VkBufferCopy bc = {sl.off, off, bytes};
+    if (!narrow_try_copy(c, sl.buf, b, bc, 1)) {
+        full_barrier(c);
+        narrow_legacy_copy(c, sl.buf, b, bc);
+    }
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -3125,9 +3165,11 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     if (!s || !d || !buf_range(s, soff, bytes) || !buf_range(d, doff, bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 越界"); return; }
     if (bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
     if (bytes == 0) return;
-    full_barrier(c);
-    VkBufferCopy bc = {soff, doff, bytes};
-    vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc);
+    const VkBufferCopy bc = {soff, doff, bytes};
+    if (!narrow_try_copy(c, s, d, bc, 0)) {
+        full_barrier(c);
+        narrow_legacy_copy(c, s, d, bc);
+    }
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
@@ -7827,7 +7869,10 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
     }
     VkImageSubresourceRange range = {t->aspect, v->base_level, v->levels, v->base_layer, v->layers};
     seg_mark_write(c, t);   // 清除写本段未提交：拒绝按需重建
-    full_barrier(c);
+    const struct cmd_lay *old = lay_get(c, t, 0);
+    const int color_transition = !ds_img && (!old || old->cur != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (!narrow_clear_begin(c, old, color_transition)) full_barrier(c);
+    narrow_clear_record(c, color_transition);
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (ds_img) {
         VkClearDepthStencilValue ds;
@@ -7846,6 +7891,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
+    narrow_clear_end(c);
     cmd_ref(c, t, REF_TEX);
 }
 
@@ -8571,15 +8617,17 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         c->qcount = d->occlusion_slots;
     }
     pre_cmd_begin(c, d ? d->label : NULL);
+    narrow_cmd_begin(c);
     if (c->qpool) vkCmdResetQueryPool(c->cb, c->qpool, 0, c->qcount);
     pthread_mutex_lock(&g_mu);
     if (g.closing) {
         pthread_mutex_unlock(&g_mu);
+        pre_cmd_free(c);
+        narrow_cmd_free(c);
         if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         if (c->qpool) vkDestroyQueryPool(g.d, c->qpool, NULL);
         free(c->q_used);
         vkDestroyCommandPool(g.d, c->pool, NULL);
-        pre_cmd_free(c);
         free(c);
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
@@ -8761,6 +8809,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
         pthread_mutex_unlock(&g_mu);
         gap_unbind_main(c);
         pre_detach(c);
+        narrow_detach(c);
         s->gap_tag = c->gap_tag;
         s->failed = 1;
         s->rc = rc(NVN_GPU_E_ARG);
@@ -8781,6 +8830,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                         : (closing ? "会话正在关闭" : (lost ? "设备已丢失" : (failed_state ? "时间线已失败，本段不执行" : "测试注入：本段提交失败")));
         gap_unbind_main(c);
         pre_detach(c);
+        narrow_detach(c);
         s->gap_tag = c->gap_tag;
         s->failed = 1;
         s->rc = code;
@@ -8793,6 +8843,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     }
 
     // 段末：本段动过的图一律转回 GENERAL（段与段之间的静止布局约定，见「图像布局」）。
+    narrow_commit_end(c);
     const struct pre_origin pre_saved = pre_origin(c, PRE_TAIL);
     lay_rest_at_commit(c);
     // 段末：让本段的所有 GPU 写对主机可见（fence 只保证执行完，不保证主机可见）。
@@ -9156,9 +9207,56 @@ void nvn_gpu_vk_test_set_fault(int mode) {
     pthread_mutex_unlock(&g_mu);
 }
 
+#include "backend_vulkan_narrow.inc"
 #include "backend_vulkan_pre_trace.inc"
 #include "backend_vulkan_gap_timing.inc"
 #include "backend_vulkan_wsi.inc"
+
+#ifdef S2A_NVK_GAP_HOST_TEST
+VkCommandBuffer nvk_narrow_test_cb(nvn_gpu_cmd c) { return c->cb; }
+
+unsigned nvk_narrow_test_registrations(VkCommandBuffer cb) {
+    unsigned count = 0;
+    pthread_mutex_lock(&narrow_mu);
+    for (struct narrow_cmd *n = narrow_cmds; n; n = n->next)
+        count += n->owner->cb == cb;
+    pthread_mutex_unlock(&narrow_mu);
+    return count;
+}
+
+// Use the WSI end-recording helper plus a real fence and the normal
+// retirement worker, without pretending to have a native window.
+VkResult nvk_narrow_test_internal(nvn_gpu_cmd c, unsigned *after_end) {
+    detach_live(c);
+    struct vk_segment *seg = calloc(1, sizeof *seg);
+    VkResult rc = wsi_end_recording(c, 1, seg != NULL);
+    *after_end = nvk_narrow_test_registrations(c->cb);
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (rc == VK_SUCCESS) rc = vkCreateFence(g.d, &fi, NULL, &fence);
+    pthread_mutex_lock(&g_submit_mu);
+    if (rc == VK_SUCCESS) {
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c->cb};
+        rc = vkQueueSubmit(g.queue, 1, &si, fence);
+    }
+    if (rc == VK_SUCCESS) {
+        seg->cmd = c;
+        seg->fence = fence;
+        seg->internal = seg->submitted = seg->executed = 1;
+        seg->wsi_seq = ++g.wsi_seq;
+        narrow_wsi_tick(seg);
+        enqueue_segment(&g, seg);
+    }
+    pthread_mutex_unlock(&g_submit_mu);
+    if (rc != VK_SUCCESS) {
+        if (fence) vkDestroyFence(g.d, fence, NULL);
+        free(seg);
+        finish_cmd(c, 0);
+    }
+    return rc;
+}
+#endif
+
 
 #ifdef S2A_NVK_BACKEND_HOST_TEST
 // ---- 宿主单测入口（只有宿主测试的 cc 命令行定义 S2A_NVK_BACKEND_HOST_TEST；正式构建里这段不存在）----

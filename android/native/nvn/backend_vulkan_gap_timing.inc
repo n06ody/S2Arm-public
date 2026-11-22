@@ -1,7 +1,7 @@
 // Full-frame Vulkan timing in a diagnostic session. The ordinary pass anchors
 // use the same command positions as nvk_gputime. Category pairs are additive.
 enum { GAP_RANGES = 2 * NVK_GAP_PAIRS, GAP_PART = GAP_RANGES + 2, GAP_REGISTRY = 8 };
-enum { GAP_PHASE_SHIFT = 2, GAP_EMIT = 32, GAP_RUN = 64, GAP_CALIBRATE = 128, GAP_SEQ_SHIFT = 8 };
+enum { GAP_PHASE_SHIFT = 2, GAP_PHASE_MASK = 15, GAP_EMIT = 64, GAP_RUN = 128, GAP_CALIBRATE = 256, GAP_SEQ_SHIFT = 9 };
 enum { GAP_SAMPLE_FIRST = 15, GAP_SAMPLE_COUNT = 25 };
 
 struct gap_part {
@@ -23,6 +23,7 @@ static struct {
     uint64_t first, phase_seq;
     unsigned phase, delay, off_seconds, arm_seconds, bits;
     int enabled;
+    unsigned edge_windows;
 } gap_cfg;
 
 // A replay thread can encode multiple active command buffers, notably the
@@ -89,10 +90,11 @@ static void gap_open(void) {
     memset(&gap_cfg, 0, sizeof gap_cfg);
     atomic_fetch_add_explicit(&gap_generation, 1, memory_order_relaxed);
     const int delay = nvn_plat_flag("nvk_gap_s", 0);
-    if (delay <= 0 || nvn_plat_flag("nvk_gputime", 0) != 0) return;
+    gap_cfg.edge_windows = narrow_timing_windows();
+    if ((!gap_cfg.edge_windows && delay <= 0) || nvn_plat_flag("nvk_gputime", 0) != 0) return;
     const int arm = nvn_plat_flag("nvk_gap_seconds", 30);
     const int off = nvn_plat_flag("nvk_gap_off_seconds", 8);
-    if (arm < 3 || arm > 180 || off < 1 || off > 180) return;
+    if (!gap_cfg.edge_windows && (arm < 3 || arm > 180 || off < 1 || off > 180)) return;
     if (!isfinite(g.dev->properties.limits.timestampPeriod) || g.dev->properties.limits.timestampPeriod <= 0) return;
     uint32_t n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g.dev->physical, &n, NULL);
@@ -143,9 +145,28 @@ static void gap_buffer(const char *line) {
 
 // Called under the submit lock. The WSI submission keeps the same tag as all
 // preceding ordinary submissions. Only later submissions see the next tag.
+// In the barrier experiment, timestamps enclose just the submit and pass
+// edges of the same set of sampled frames in every treatment window.
+static void gap_narrow_edges(const struct vk_segment *s) {
+    const unsigned phase = narrow_phase();
+    if (!phase) return;
+    if (!gap_cfg.phase_seq || phase != gap_cfg.phase) {
+        gap_cfg.phase = phase;
+        gap_cfg.phase_seq = s->wsi_seq + 1;
+    }
+    const uint64_t frame = s->wsi_seq + 1;
+    const uint64_t rel = frame - gap_cfg.phase_seq;
+    const unsigned sample = phase <= gap_cfg.edge_windows &&
+        rel >= GAP_SAMPLE_FIRST && rel < GAP_SAMPLE_FIRST + GAP_SAMPLE_COUNT;
+    const uint64_t tag = (frame << GAP_SEQ_SHIFT) | GAP_RUN | (phase << GAP_PHASE_SHIFT) |
+                         (sample ? GAP_EMIT | NVK_GAP_TIME : NVK_GAP_OFF);
+    atomic_store_explicit(&gap_cfg.tag, tag, memory_order_release);
+}
+
 static void gap_wsi_time(struct vk_segment *s, uint64_t now) {
     if (!gap_cfg.enabled) return;
     s->gap_tag = atomic_load_explicit(&gap_cfg.tag, memory_order_relaxed);
+    if (gap_cfg.edge_windows) { gap_narrow_edges(s); return; }
     if (!gap_cfg.first) gap_cfg.first = now;
     const uint64_t elapsed = (now - gap_cfg.first) / UINT64_C(1000000000);
     if (elapsed < gap_cfg.delay) return;
@@ -191,6 +212,10 @@ static void gap_step(struct gap_part *p, enum nvk_gap_kind kind) {
 static void gap_begin_part(nvn_gpu_cmd c, struct gap_part *p, VkCommandBuffer cb, unsigned init) {
     *p = (struct gap_part){.cb = cb, .pool = c->gap->pool, .base = init ? GAP_PART : 0,
                            .plan.mode = (uint8_t)(c->gap_tag & 3)};
+    if (gap_cfg.edge_windows) {
+        if (init) vkCmdResetQueryPool(cb, p->pool, p->base + GAP_RANGES, 2);
+        return;
+    }
     vkCmdResetQueryPool(cb, p->pool, p->base, GAP_PART);
     if (!gap_insert(p)) c->gap->registry_lost++;
 }
@@ -374,7 +399,7 @@ static void gap_calibrate(unsigned long long seq) {
 static void gap_segment_done(const struct vk_segment *s, int failed) {
     const uint64_t tag = s->gap_tag;
     if (!(tag & GAP_RUN)) return;
-    const unsigned phase = (unsigned)(tag >> GAP_PHASE_SHIFT) & 7;
+    const unsigned phase = (unsigned)(tag >> GAP_PHASE_SHIFT) & GAP_PHASE_MASK;
     const unsigned mode = (unsigned)tag & 3;
     const unsigned long long seq = tag >> GAP_SEQ_SHIFT;
     char line[228];
@@ -403,9 +428,11 @@ static void gap_segment_done(const struct vk_segment *s, int failed) {
 #ifdef S2A_NVK_GAP_HOST_TEST
 void nvk_gap_test_present(uint64_t seq, uint64_t elapsed_seconds) {
     struct vk_segment s = {.internal = 1, .wsi_seq = seq};
+    narrow_wsi_time(&s, elapsed_seconds * UINT64_C(1000000000));
     gap_wsi_time(&s, elapsed_seconds * UINT64_C(1000000000));
     gap_segment_done(&s, 0);
     pre_wsi_tick(&s, elapsed_seconds * UINT64_C(1000000000));
     pre_finish(&s, 0);
+    narrow_finish(&s, 0);
 }
 #endif

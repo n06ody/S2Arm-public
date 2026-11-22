@@ -359,9 +359,12 @@ void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账
     g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
 
+// 弱链接[replay]：nvn_vk_narrow_submit
+void nvn_vk_narrow_submit(int begin) __attribute__((weak));
 // 弱链接[replay]：nvn_vk_nvnbar_submit
 void nvn_vk_nvnbar_submit(uint64_t now) __attribute__((weak));
 void nvn_be_sub_begin(void) {
+    if (nvn_vk_narrow_submit) nvn_vk_narrow_submit(1);
     if (nvn_vk_nvnbar_submit) nvn_vk_nvnbar_submit(0);   // 整次提交只在此处切档
     rp_buf_hold_begin();   // 回放窗口开：到 nvn_be_sub_commit 收尾之前，别的线程销毁池不当场放镜像缓冲（rp_buf.c）
     g_sub = calloc(1, sizeof *g_sub);
@@ -448,6 +451,7 @@ static void seg_cut(int next_occ) {
 static uint64_t sub_commit_body(void);
 uint64_t nvn_be_sub_commit(void) {
     const uint64_t f = sub_commit_body();
+    if (nvn_vk_narrow_submit) nvn_vk_narrow_submit(0);
     rp_buf_hold_end();   // 回放窗口关（各条返回路径都经过这里）：窗口里别的线程销毁池延后的镜像缓冲此刻才放，命令已 cmd_ref 的由后端保活
     return f;
 }

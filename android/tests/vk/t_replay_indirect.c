@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <stdalign.h>
 #include <time.h>
 extern uint64_t nvn_vk_dbg_dq_recs(void);
@@ -34,6 +35,14 @@ static int hz_flag=2;
 static int depth_ab_seconds;
 #ifdef S2A_NVK_GAP_HOST_TEST
 static int gap_fixture, gap_fixture_dq;
+static int narrow_fixture_mode;
+static unsigned narrow_edges_frames, narrow_edges_passes, narrow_edges_ranges, narrow_edges_phase8, narrow_edges_excluded;
+static struct {
+    unsigned narrow, range, scoped_ordinal, range_reads, range_writes;
+    unsigned clears, full_since_clear, second_clear_full, graphics_publish;
+} narrow_observed;
+static void narrow_fixture_log(const char *row);
+
 struct gap_counts {
     unsigned frames, segments, ranges, main_passes, main_transfers, pre_transfers, inside_gap, invalid;
     uint64_t first_end, second_begin;
@@ -45,6 +54,17 @@ static struct {
 void nvn_vk_pre_trace_pool(nvn_gpu_cmd c, int active);
 static int gap_fixture_flag(const char *name, int fallback) {
     if (!strcmp(name, "nvk_dq")) return gap_fixture_dq;
+    if (gap_fixture == 4) {
+        if (!strcmp(name, "nvk_barrier_narrow") || !strcmp(name, "nvk_barrier_narrow_s") ||
+            !strcmp(name, "nvk_barrier_narrow_ab") || !strcmp(name, "nvk_barrier_narrow_timing")) return 1;
+        return fallback;
+    }
+    if (gap_fixture == 3) {
+        if (!strcmp(name, "nvk_pre_trace_s")) return 1;
+        if (!strcmp(name, "nvk_pre_trace_arm_s")) return 0;
+        if (!strcmp(name, "nvk_barrier_narrow")) return narrow_fixture_mode;
+        return fallback;
+    }
     if (gap_fixture == 2) {
         if (!strcmp(name, "nvk_pre_trace_s") || !strcmp(name, "nvk_pre_trace_count_s") ||
             !strcmp(name, "nvk_pre_trace_arm_s")) return 1;
@@ -102,6 +122,47 @@ static unsigned long long trace_field(const char *row, const char *name) {
     const char *value = strstr(row, name);
     REQUIRE(value);
     return strtoull(value + strlen(name), NULL, 0);
+}
+
+static void narrow_fixture_log(const char *row) {
+    const int op = !strncmp(row, "op ", 3);
+    const int detail = !strncmp(row, "barrier ", 8);
+    if (!op && !detail) return;
+    const unsigned long long signal = trace_field(row, " signal=");
+    if ((signal != 3 && signal != 4) || trace_field(row, " gap=") != 1) return;
+    if (signal == 4) {
+        if (!op) return;
+        if (strstr(row, " name=vkCmdPipelineBarrier ")) {
+            const uint32_t src = (uint32_t)trace_field(row, " src_stage=");
+            const uint32_t dst = (uint32_t)trace_field(row, " dst_stage=");
+            if (src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+                narrow_observed.full_since_clear++;
+            if (src == VK_PIPELINE_STAGE_TRANSFER_BIT &&
+                (dst & VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT) && (dst & VK_PIPELINE_STAGE_VERTEX_INPUT_BIT))
+                narrow_observed.graphics_publish++;
+        } else if (strstr(row, " name=vkCmdClearColorImage ")) {
+            if (++narrow_observed.clears == 2) narrow_observed.second_clear_full = narrow_observed.full_since_clear;
+            narrow_observed.full_since_clear = 0;
+        }
+        return;
+    }
+    if (detail && strstr(row, " type=buffer ") && trace_field(row, " ordinal=") == narrow_observed.scoped_ordinal) {
+        const unsigned long long src = trace_field(row, " src_access=");
+        const unsigned long long dst = trace_field(row, " dst_access=");
+        REQUIRE(src == VK_ACCESS_TRANSFER_WRITE_BIT);
+        REQUIRE(dst == VK_ACCESS_TRANSFER_READ_BIT || dst == VK_ACCESS_TRANSFER_WRITE_BIT);
+        REQUIRE(trace_field(row, " size=") == 4 || trace_field(row, " size=") == 8);
+        REQUIRE((trace_field(row, " off=") & 3) == 0);
+        narrow_observed.range_reads += dst == VK_ACCESS_TRANSFER_READ_BIT;
+        narrow_observed.range_writes += dst == VK_ACCESS_TRANSFER_WRITE_BIT;
+    } else if (op && strstr(row, " name=vkCmdPipelineBarrier ") &&
+               trace_field(row, " src_stage=") == VK_PIPELINE_STAGE_TRANSFER_BIT &&
+               trace_field(row, " dst_stage=") == VK_PIPELINE_STAGE_TRANSFER_BIT &&
+               trace_field(row, " buffers=") > 0) {
+        narrow_observed.narrow++;
+        narrow_observed.scoped_ordinal = (unsigned)trace_field(row, " ordinal=");
+    } else if (op && strstr(row, " name=vkCmdCopyBuffer ") &&
+               trace_field(row, " regions=") == 2 && trace_field(row, " bytes=") == 8) narrow_observed.range++;
 }
 
 static void pre_fixture_log(const char *row) {
@@ -190,6 +251,27 @@ void nvn_plat_log(int l, const char *c, const char *s) {
 #ifdef S2A_NVK_GAP_HOST_TEST
     if (gap_fixture == 1 && c && s && !strcmp(c, "gap-gpu")) gap_fixture_log(s);
     if (gap_fixture == 2 && c && s && !strcmp(c, "pre-trace")) pre_fixture_log(s);
+    if (gap_fixture == 3 && c && s && !strcmp(c, "pre-trace")) narrow_fixture_log(s);
+    if (gap_fixture == 4 && c && s && !strcmp(c, "gap-gpu")) {
+        if (!strncmp(s, "frame=", 6)) {
+            REQUIRE(trace_field(s, " failed=") == 0);
+            narrow_edges_frames++;
+            narrow_edges_phase8 += trace_field(s, " phase=") == 8;
+        } else if (!strncmp(s, "pass ", 5)) {
+            REQUIRE(trace_field(s, " valid=") == 1);
+            narrow_edges_passes++;
+        } else if (!strncmp(s, "range ", 6)) narrow_edges_ranges++;
+        else REQUIRE(strncmp(s, "missing ", 8) && strncmp(s, "log_overflow ", 13));
+    }
+#endif
+#ifdef S2A_NVK_GAP_HOST_TEST
+    if (gap_fixture == 4 && c && s && !strcmp(c, "narrow-sync") && !strncmp(s, "excluded ", 9)) {
+        REQUIRE(trace_field(s, " wsi=") == 21);
+        REQUIRE(trace_field(s, " expected_phase=") == 8);
+        REQUIRE(trace_field(s, " actual_phase=") == 2);
+        REQUIRE(trace_field(s, " segments=") == 1);
+        narrow_edges_excluded++;
+    }
 #endif
     fprintf(stderr, "[%s] %s\n", c ? c : "", s ? s : "");
 }
@@ -686,6 +768,265 @@ static void run_pre_trace(struct s2a_vk_device *device, const char *dir, int dq)
     gap_fixture = 0;
 }
 
+
+static void run_narrow_trace(struct s2a_vk_device *device, const char *dir, int dq, int mode) {
+    gap_fixture = 3;
+    gap_fixture_dq = dq;
+    narrow_fixture_mode = mode;
+    memset(&narrow_observed, 0, sizeof narrow_observed);
+    nvn_gpu_open_desc od = {.host_device = device, .app_label = "narrow-copy"};
+    GPU(nvn_gpu_open(&od, &err));
+    nvn_gpu_buf pool = buffer(16, NULL), out = buffer(16, NULL);
+    nvn_gpu_tex_desc td = {0};
+    td.d.target = NVN_TEXTURE_TARGET_2D;
+    td.d.format = NVN_FORMAT_RGBA8;
+    td.d.width = td.d.height = 4;
+    td.d.depth = td.d.levels = td.d.samples = 1;
+    td.usage = NVN_GPU_TEX_RENDER;
+    nvn_gpu_tex rt;
+    nvn_gpu_view view;
+    GPU(nvn_gpu_tex_create(&td, &rt, &err));
+    GPU(nvn_gpu_view_create(rt, NULL, &view, &err));
+    nvn_gpu_shader vs = shader(dir, "depth_state.vert", NVN_GPU_SH_VS, NULL);
+    nvn_gpu_shader fs = shader(dir, "solid_green.frag", NVN_GPU_SH_FS, NULL);
+    nvn_gpu_pipe pipe = gap_fixture_pipe(vs, fs, NVN_FORMAT_RGBA8);
+
+    nvn_gpu_cmd cmd, g_pre;
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    GPU(nvn_gpu_cmd_commit(cmd, 1, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(1, 5000000000ull, &err));
+    nvk_gap_test_present(1, 1);
+    nvk_gap_test_present(2, 2);
+    nvn_gpu_cmd_desc role = {.label = "nvn submit pre"};
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    GPU(nvn_gpu_cmd_begin(&role, &g_pre, &err));
+    const uint32_t zero = 0;
+    nvn_gpu_buf_write(g_pre, pool, 0, &zero, sizeof zero);
+    gap_fixture_draw(cmd, view, 4, pipe);
+    nvn_gpu_barrier(cmd, 0);
+    static const uint32_t words[] = {0xa1, 0xb2, 0xc3};
+    for (unsigned i = 0; i < 2; ++i) {
+        nvn_vk_pre_trace_pool(cmd, 1);
+        nvn_gpu_buf_write(cmd, pool, i * sizeof(uint32_t), &words[i], sizeof(uint32_t));
+        nvn_vk_pre_trace_pool(cmd, 0);
+    }
+    // The copy must see the first pair, then the overlapping update must
+    // wait for that read. The second copy sees the new value.
+    nvn_gpu_copy_buf(cmd, pool, 0, out, 0, 8);
+    nvn_vk_pre_trace_pool(cmd, 1);
+    nvn_gpu_buf_write(cmd, pool, 0, &words[2], sizeof(uint32_t));
+    nvn_vk_pre_trace_pool(cmd, 0);
+    nvn_gpu_copy_buf(cmd, pool, 0, out, 8, 8);
+    gap_fixture_draw(cmd, view, 4, pipe);
+    GPU(nvn_gpu_cmd_commit(g_pre, 2, done, NULL, &err));
+    GPU(nvn_gpu_cmd_commit(cmd, 3, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(3, 5000000000ull, &err));
+    // Exercise an actual compute consumer, then a draw that reads both
+    // index data and GPU-authored indirect parameters. A third independent
+    // write lets the unchanged mode publish those first two writes.
+    nvn_gpu_layout_ent ce = {.cls=NVN_GPU_RES_SSBO, .access=NVN_GPU_ACC_RW,
+                             .count=1, .stages=1u << NVN_GPU_SH_CS};
+    nvn_gpu_layout cl = {.ent=&ce, .nent=1};
+    nvn_gpu_shader cs = shader(dir, "count_args.comp", NVN_GPU_SH_CS, &cl);
+    nvn_gpu_stage_desc sd = {.sh=cs};
+    nvn_gpu_pipe cp = NULL;
+    GPU(nvn_gpu_cpipe_get(&sd, NVN_GPU_PIPE_SYNC, &cp, &err));
+    const uint32_t zeros[48] = {0};
+    nvn_gpu_buf args = buffer(sizeof zeros, zeros), draw_data = buffer(96, zeros);
+    nvn_gpu_buf clear_pixels = buffer(64, NULL), draw_pixels = buffer(64, NULL);
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    gap_fixture_draw(cmd, view, 4, pipe);
+    nvn_gpu_barrier(cmd, 0);
+    nvn_gpu_clear_view(cmd, view, (float[4]){1, 0, 0, 1}, NULL, 0);
+    nvn_gpu_clear_view(cmd, view, (float[4]){0, 0, 1, 1}, NULL, 0);
+    const NVNcopyRegion full = {0, 0, 0, 4, 4, 1};
+    nvn_gpu_copy_tex_buf(cmd, rt, 0, 0, &full, clear_pixels, 0, 16, 64);
+    nvn_gpu_barrier(cmd, 0);
+    const uint32_t one = 1;
+    nvn_vk_pre_trace_pool(cmd, 1);
+    nvn_gpu_buf_write(cmd, args, 0, &one, sizeof one);
+    nvn_vk_pre_trace_pool(cmd, 0);
+    nvn_gpu_binding bind = {.cls=NVN_GPU_RES_SSBO, .u.b={.buf=args, .len=sizeof zeros}};
+    nvn_gpu_set_pipe(cmd, cp);
+    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, &bind, 1);
+    nvn_gpu_dispatch(cmd, cp, 1, 1, 1, NULL, 0);
+    nvn_gpu_barrier(cmd, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);
+
+    nvn_gpu_copy_buf(cmd, args, 32, draw_data, 0, sizeof(VkDrawIndexedIndirectCommand));
+    const uint16_t indices[] = {0, 1, 2, 0, 1, 2};
+    nvn_vk_pre_trace_pool(cmd, 1);
+    nvn_gpu_buf_write(cmd, draw_data, 24, indices, sizeof indices);
+    nvn_vk_pre_trace_pool(cmd, 0);
+    nvn_vk_pre_trace_pool(cmd, 1);
+    nvn_gpu_buf_write(cmd, draw_data, 64, &words[0], sizeof words[0]);
+    nvn_vk_pre_trace_pool(cmd, 0);
+    nvn_gpu_pass_desc pass_desc = {.w=4, .h=4, .layers=1, .ncolor=1};
+    pass_desc.color[0].view = view;
+    pass_desc.color[0].load = NVN_GPU_LOAD_CLEAR;
+    pass_desc.color[0].store = NVN_GPU_STORE_STORE;
+    nvn_gpu_draw_args indexed = {.prim=NVN_DRAW_PRIMITIVE_TRIANGLES, .count=6, .ibuf=draw_data,
+                                 .ioff=24, .itype=1, .ind=draw_data};
+    nvn_gpu_pass_begin(cmd, &pass_desc);
+    nvn_gpu_set_pipe(cmd, pipe);
+    nvn_gpu_draw(cmd, &indexed);
+    nvn_gpu_pass_end(cmd);
+    nvn_gpu_copy_tex_buf(cmd, rt, 0, 0, &full, draw_pixels, 0, 16, 64);
+    GPU(nvn_gpu_cmd_commit(cmd, 4, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(4, 5000000000ull, &err));
+    nvk_gap_test_present(3, 3);
+    const uint32_t *produced = (const uint32_t *)nvn_gpu_buf_cpu(args);
+    const uint32_t *cleared = (const uint32_t *)nvn_gpu_buf_cpu(clear_pixels);
+    const uint32_t *drawn = (const uint32_t *)nvn_gpu_buf_cpu(draw_pixels);
+    REQUIRE(produced && produced[4] == 1);
+    REQUIRE(cleared && drawn);
+    for (unsigned i = 0; i < 16; ++i) {
+        REQUIRE(cleared[i] == 0xffff0000u);
+        REQUIRE(drawn[i] == 0xff00ff00u);
+    }
+    nvn_gpu_buf_release(args, NULL, NULL);
+    nvn_gpu_buf_release(draw_data, NULL, NULL);
+    nvn_gpu_buf_release(clear_pixels, NULL, NULL);
+    nvn_gpu_buf_release(draw_pixels, NULL, NULL);
+    nvn_gpu_shader_release(cs);
+    const uint32_t expected[] = {0xa1, 0xb2, 0xc3, 0xb2};
+    const void *actual = nvn_gpu_buf_cpu(out);
+    REQUIRE(actual && !memcmp(actual, expected, sizeof expected));
+    nvn_gpu_buf_release(out, NULL, NULL);
+    nvn_gpu_buf_release(pool, NULL, NULL);
+    nvn_gpu_view_release(view);
+    nvn_gpu_tex_release(rt);
+    nvn_gpu_shader_release(vs);
+    nvn_gpu_shader_release(fs);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+    const unsigned expected_scoped = mode == 1 ? 0 : mode == 2 ? 5 : 4;
+    printf("narrow-copy dq=%d mode=%d transfer_scoped=%u src_ranges=%u dst_ranges=%u multi_region=%u "
+           "second_clear_full=%u graphics_publish=%u readback=ok\n", dq, mode, narrow_observed.narrow,
+           narrow_observed.range_reads, narrow_observed.range_writes, narrow_observed.range,
+           narrow_observed.second_clear_full, narrow_observed.graphics_publish);
+    if (narrow_observed.narrow != expected_scoped || narrow_observed.range != (mode == 3) ||
+        narrow_observed.range_reads != (mode >= 2 ? 2u : 0u) ||
+        narrow_observed.range_writes != (mode >= 2 ? 5u : 0u) ||
+        narrow_observed.clears != 2 || narrow_observed.second_clear_full != (mode == 1) ||
+        narrow_observed.graphics_publish != (mode >= 2)) failures++;
+    gap_fixture = 0;
+}
+
+static pthread_mutex_t narrow_reuse_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t narrow_reuse_cv = PTHREAD_COND_INITIALIZER;
+static VkCommandBuffer narrow_reuse_target;
+static unsigned narrow_reuse_given, narrow_reuse_taken, narrow_reuse_same, narrow_reuse_regs;
+VkCommandBuffer nvk_narrow_test_cb(nvn_gpu_cmd c);
+unsigned nvk_narrow_test_registrations(VkCommandBuffer cb);
+VkResult nvk_narrow_test_internal(nvn_gpu_cmd c, unsigned *after_end);
+
+void nvk_narrow_test_after_give(VkCommandBuffer cb) {
+    pthread_mutex_lock(&narrow_reuse_mu);
+    if (cb && cb == narrow_reuse_target && !narrow_reuse_given) {
+        narrow_reuse_given = 1;
+        pthread_cond_broadcast(&narrow_reuse_cv);
+        while (!narrow_reuse_taken) pthread_cond_wait(&narrow_reuse_cv, &narrow_reuse_mu);
+    }
+    pthread_mutex_unlock(&narrow_reuse_mu);
+}
+
+static void *narrow_reuse_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&narrow_reuse_mu);
+    while (!narrow_reuse_given) pthread_cond_wait(&narrow_reuse_cv, &narrow_reuse_mu);
+    pthread_mutex_unlock(&narrow_reuse_mu);
+    nvn_gpu_cmd c;
+    const nvn_gpu_cmd_desc desc = {.occlusion_slots=1};
+    GPU(nvn_gpu_cmd_begin(&desc, &c, &err));
+    const VkCommandBuffer cb = nvk_narrow_test_cb(c);
+    narrow_reuse_same = cb == narrow_reuse_target;
+    narrow_reuse_regs = nvk_narrow_test_registrations(cb);
+    pthread_mutex_lock(&narrow_reuse_mu);
+    narrow_reuse_taken = 1;
+    pthread_cond_broadcast(&narrow_reuse_cv);
+    pthread_mutex_unlock(&narrow_reuse_mu);
+    nvn_gpu_cmd_abort(c);
+    return NULL;
+}
+
+static void run_narrow_reuse(struct s2a_vk_device *device, int dq) {
+    gap_fixture = 3;
+    gap_fixture_dq = dq;
+    narrow_fixture_mode = 3;
+    nvn_gpu_open_desc od = {.host_device=device, .app_label="narrow-reuse"};
+    GPU(nvn_gpu_open(&od, &err));
+    nvn_gpu_cmd c;
+    GPU(nvn_gpu_cmd_begin(NULL, &c, &err));
+    pthread_mutex_lock(&narrow_reuse_mu);
+    narrow_reuse_target = nvk_narrow_test_cb(c);
+    narrow_reuse_given = narrow_reuse_taken = narrow_reuse_same = narrow_reuse_regs = 0;
+    pthread_mutex_unlock(&narrow_reuse_mu);
+    pthread_t thread;
+    REQUIRE(!pthread_create(&thread, NULL, narrow_reuse_worker, NULL));
+    unsigned after_end;
+    REQUIRE(nvk_narrow_test_internal(c, &after_end) == VK_SUCCESS);
+    REQUIRE(!pthread_join(thread, NULL));
+    GPU(nvn_gpu_close(5000000000ull, &err));
+    printf("narrow-reuse dq=%d same_cb=%u after_internal_end=%u during_reuse=%u\n",
+           dq, narrow_reuse_same, after_end, narrow_reuse_regs);
+    if (!narrow_reuse_same || after_end || narrow_reuse_regs != 1) failures++;
+    gap_fixture = 0;
+}
+
+static void run_narrow_edges(struct s2a_vk_device *device, const char *dir, int dq) {
+    gap_fixture = 4;
+    gap_fixture_dq = dq;
+    narrow_edges_frames = narrow_edges_passes = narrow_edges_ranges = narrow_edges_phase8 = narrow_edges_excluded = 0;
+    nvn_gpu_open_desc od = {.host_device=device, .app_label="narrow-edges"};
+    GPU(nvn_gpu_open(&od, &err));
+    nvn_gpu_tex_desc td = {0};
+    td.d.target = NVN_TEXTURE_TARGET_2D;
+    td.d.format = NVN_FORMAT_RGBA8;
+    td.d.width = td.d.height = 4;
+    td.d.depth = td.d.levels = td.d.samples = 1;
+    td.usage = NVN_GPU_TEX_RENDER;
+    nvn_gpu_tex rt;
+    nvn_gpu_view view;
+    GPU(nvn_gpu_tex_create(&td, &rt, &err));
+    GPU(nvn_gpu_view_create(rt, NULL, &view, &err));
+    nvn_gpu_shader vs = shader(dir, "depth_state.vert", NVN_GPU_SH_VS, NULL);
+    nvn_gpu_shader fs = shader(dir, "solid_green.frag", NVN_GPU_SH_FS, NULL);
+    nvn_gpu_pipe pipe = gap_fixture_pipe(vs, fs, NVN_FORMAT_RGBA8);
+    nvk_gap_test_present(1, 1);
+    for (unsigned i = 0; i < 2; i++) {
+        const unsigned phase = i ? 8 : 1;
+        const uint64_t start = i ? 20 : 2;
+        const uint64_t sec = i ? 9 : 2;
+        nvn_gpu_cmd stale = NULL;
+        if (i) GPU(nvn_gpu_cmd_begin(NULL, &stale, &err));
+        nvk_gap_test_present(start, sec);
+        if (stale) {
+            GPU(nvn_gpu_cmd_commit(stale, 2, done, NULL, &err));
+            GPU(nvn_gpu_fence_wait(2, 5000000000ull, &err));
+            nvk_gap_test_present(start + 1, sec);
+        }
+        nvk_gap_test_present(start + 15, sec);
+        nvn_gpu_cmd cmd;
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+        gap_fixture_draw(cmd, view, 4, pipe);
+        gap_fixture_draw(cmd, view, 4, pipe);
+        const unsigned signal = i ? 3 : 1;
+        GPU(nvn_gpu_cmd_commit(cmd, signal, done, NULL, &err));
+        GPU(nvn_gpu_fence_wait(signal, 5000000000ull, &err));
+        nvk_gap_test_present(start + 16, sec + 1);
+        if (phase == 8) nvk_gap_test_present(start + 17, sec + 1);
+    }
+    nvn_gpu_view_release(view);
+    nvn_gpu_tex_release(rt);
+    nvn_gpu_shader_release(vs);
+    nvn_gpu_shader_release(fs);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+    printf("narrow-edges dq=%d sampled=%u phase8=%u passes=%u operation_ranges=%u excluded_boundary=%u\n",
+           dq, narrow_edges_frames, narrow_edges_phase8, narrow_edges_passes, narrow_edges_ranges, narrow_edges_excluded);
+    if (narrow_edges_frames != 2 || narrow_edges_phase8 != 1 || narrow_edges_passes != 4 ||
+        narrow_edges_ranges || narrow_edges_excluded != 1) failures++;
+    gap_fixture = 0;
+}
+
 #endif
 
 #include "mirror_blit_test.h"
@@ -717,6 +1058,10 @@ int main(int argc,char **argv) {
  if(!depth_only){
   run_gap_vulkan(&d,argv[1],0);run_gap_vulkan(&d,argv[1],1);
   run_pre_trace(&d,argv[1],0);run_pre_trace(&d,argv[1],1);
+  for (int dq_mode = 0; dq_mode < 2; ++dq_mode)
+      for (int mode = 1; mode <= 3; ++mode) run_narrow_trace(&d, argv[1], dq_mode, mode);
+  run_narrow_reuse(&d, 0);run_narrow_reuse(&d, 1);
+  run_narrow_edges(&d, argv[1], 0);run_narrow_edges(&d, argv[1], 1);
  }
 #endif
  REQUIRE(!s2a_vk_device_destroy(&d,1));

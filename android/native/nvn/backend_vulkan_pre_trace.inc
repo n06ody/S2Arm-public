@@ -190,6 +190,7 @@ static void pre_origin_restore(nvn_gpu_cmd c, struct pre_origin origin) {
 // Only the common replay's actual pool mirror write calls this hook. A pool
 // resync that needs the main CB keeps its source there as well.
 void nvn_vk_pre_trace_pool(nvn_gpu_cmd c, int active) {
+    narrow_pool_source(c, active);
     if (active) pre_origin(c, PRE_POOL);
     else pre_origin_restore(c, (struct pre_origin){0});
 }
