@@ -44,7 +44,7 @@ const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] 
 struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_result values[NVN_GPU_TIMESTAMP_SLOTS]; };
 struct post { volatile uint32_t *val; uint32_t mode, v; uint64_t report; uint32_t type; struct ts_segment *ts; uint32_t slot; };   // 完成后写事件值（mode 0 写 / 1 加）；report 非 0 = 计数器报告的写回地址
 struct occ_ev { uint32_t pos; uint32_t report; uint64_t addr; };   // 遮挡计数的事件：发生时本段已经开过 pos 个槽；report 0 = 复位、1 = 报告（写回 addr）
-struct gw_ev { uint64_t pool_key, id; };   // 本段里 GPU 写进池的一段（rp_buf_gpu_write_note 的登记）
+struct gw_ev { uint64_t pool_key, id, staged_plus_one; };   // 0 表示没有暂存区，实际偏移也可以为 0
 // 段失败定位：录制侧滚动记本段最后 ≤4 笔（绘制 / 派发）实际绑上的程序阶段键。键 = rp_S.skey 的 8 字节
 // 着色器键（与具名拒收行、出包程序表同一键空间）；bm 位 = NVN 阶段号（0..2 图形、5 计算）。
 // 完成回调在 worker 线程跑：中途段 / 末段的键在提交时随段快照（mid / sub 各存一份），失败时不看还在滚动的活表。
@@ -52,7 +52,7 @@ enum { SEG_PK_MAX = 4 };
 struct seg_pk { uint8_t k[SEG_PK_MAX][6][8]; uint8_t bm[SEG_PK_MAX]; int n; };
 struct sub { struct ts_segment *ts_head, *ts_current; uint32_t refs; /* 录制者/末段回调持一引用，每个 mid 回调另持一引用。 */
              struct post *p; int n, cap, nfx; /* nfx：p 里时间戳报告以外的条数 */ uint64_t t_commit; struct occ_ev *oe; int noe, oecap; uint64_t fence; struct gw_ev *gw; int ngw, gwcap;
-    uint64_t *oc; uint32_t noc, occ_base; struct seg_pk pk; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
+    uint64_t *oc; uint32_t noc, occ_base; struct seg_pk pk; nvn_gpu_cmd land_cmd; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
 // 分时读数（上屏那边每 5 秒取走一次清零）：一次队列提交里回放花的、交给后端花的、游戏等围栏花的、段从提交到完成隔了多久
 // 回放层只从这里取时刻。宿主单测（android/tests/replay_exec_time_test.c）把本文件整个编进测试 TU 时先定义
 // S2A_RP_EXEC_TEST_CLOCK，换成测试可控的虚拟钟（否则「一帧回放花了多久」没有手算得出的期望值）；
@@ -210,6 +210,27 @@ static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
 }
 
 static void sub_release(struct sub *s);
+// 弱链接[replay]：s2a_nvk_land_readback_enabled
+// 弱链接[replay]：s2a_nvk_land_readback_record
+// 弱链接[replay]：s2a_nvk_land_readback_map
+// Vulkan 诊断钩子：槽由已提交命令持有，直到完成回调返回。只在 GPU 完成成功后读。
+int s2a_nvk_land_readback_enabled(void) __attribute__((weak));
+int s2a_nvk_land_readback_record(nvn_gpu_cmd cmd, nvn_gpu_buf_copy *copies, uint32_t count) __attribute__((weak));
+const uint8_t *s2a_nvk_land_readback_map(nvn_gpu_cmd cmd) __attribute__((weak));
+
+static void sub_record_readback(struct sub *s, nvn_gpu_cmd cmd) {
+    if (!s || !s->ngw || !s2a_nvk_land_readback_enabled || !s2a_nvk_land_readback_map ||
+        !s2a_nvk_land_readback_record || !s2a_nvk_land_readback_enabled()) return;
+    nvn_gpu_buf_copy *copies = calloc((size_t)s->ngw, sizeof *copies);
+    if (!copies) { red("%s", "回读暂存：拷贝表分配失败，使用镜像回写"); return; }
+    for (int i = 0; i < s->ngw; i++) rp_buf_gpu_write_snapshot(s->gw[i].pool_key, s->gw[i].id, &copies[i]);
+    if (s2a_nvk_land_readback_record(cmd, copies, (uint32_t)s->ngw)) {
+        s->land_cmd = cmd;
+        for (int i = 0; i < s->ngw; i++) if (copies[i].src) s->gw[i].staged_plus_one = copies[i].doff + 1;
+    }
+    free(copies);
+}
+
 static void sub_done(void *user, const nvn_gpu_done *d) {
     struct sub *s = user;
     struct nvn_wait_trace_sub trace = {.begin=nvn_wait_trace_stamp()};
@@ -219,7 +240,17 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
     if (d->status != NVN_GPU_DONE_FAILED) busy_done(s->t_commit, t_done);   // 失败段没执行：不算显卡忙
     // 先落 GPU 写，再发布事件和完成序号：等待事件的 CPU 不能先看见旧内存。
     if (trace.begin) trace.land_begin = nvn_wait_trace_stamp();
-    for (int i = 0; i < s->ngw; i++) rp_buf_gpu_write_land(s->gw[i].pool_key, s->gw[i].id, d->status != NVN_GPU_DONE_FAILED);
+    const uint8_t *readback = NULL;
+    if (s->land_cmd && d->status == NVN_GPU_DONE_OK) {
+        if (trace.begin) trace.invalidate_begin = nvn_wait_trace_stamp();
+        readback = s2a_nvk_land_readback_map(s->land_cmd);
+        if (trace.begin) trace.invalidate_end = nvn_wait_trace_stamp();
+    }
+    for (int i = 0; i < s->ngw; i++) {
+        const struct gw_ev *w = &s->gw[i];
+        const uint8_t *staged = readback && w->staged_plus_one ? readback + (w->staged_plus_one - 1) : NULL;
+        rp_buf_gpu_write_land_from(w->pool_key, w->id, d->status != NVN_GPU_DONE_FAILED, staged);
+    }
     if (trace.begin) trace.land_end = nvn_wait_trace_stamp();
     if (d->status != NVN_GPU_DONE_FAILED)   // 没执行的段不做任何成功回写
         for (int i = 0; i < s->n; i++) {
@@ -483,6 +514,7 @@ static uint64_t sub_commit_body(void) {
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
     uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; s->pk = g_seg_pk; }
+    sub_record_readback(s, c);
     if (s && (s->n || s->noe || s->ngw)) __atomic_store_n(&g_wait_effect_fence, f, __ATOMIC_RELEASE);
     if (s && (s->nfx || s->noe || s->ngw)) g_effect_fence = f;   // 这次提交做完时有东西要写回游戏内存（事件、时间戳以外的计数器报告、遮挡结果、GPU 写的缓冲）
     if (s && (s->n || s->noe || s->ngw)) { pf_add(RP_PERF_FX_SUBS, 1); pf_add(RP_PERF_FX_OCC, (uint64_t)s->noe); pf_add(RP_PERF_FX_GW, (uint64_t)s->ngw); }   // 这次提交做完时有东西要写回游戏内存（事件、计数器报告、遮挡结果、GPU 写的缓冲）
@@ -639,7 +671,7 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
             return 0;
         }
         if (merged) continue;   // 并进了本次提交已记的一条，它的落地项已在本次提交的表里
-        s->gw[s->ngw++] = (struct gw_ev){key, id};
+        s->gw[s->ngw++] = (struct gw_ev){.pool_key=key, .id=id};
     }
     return 1;
 }

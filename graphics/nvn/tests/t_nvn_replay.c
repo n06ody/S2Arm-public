@@ -322,6 +322,27 @@ int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out) {
 }
 static uint8_t *g_buf_cpu_fake;   // 用例要「GPU 写过镜像」时把它指到一块等大的内存；NULL = 这种缓冲 CPU 读不到
 uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b) { return b && b->cpu ? b->cpu : g_buf_cpu_fake; }
+static int g_readback_test, g_readback_n, g_readback_complete, g_readback_maps;
+static nvn_gpu_buf_copy g_readback_copies[2];
+static uint8_t g_readback_bytes[32];
+
+int s2a_nvk_land_readback_enabled(void) { return g_readback_test; }
+int s2a_nvk_land_readback_record(nvn_gpu_cmd c, nvn_gpu_buf_copy *v, uint32_t n) {
+    CHECK(c == &g_fake_cmd && c->live && n == 2);
+    if (n != 2) return 0;
+    CHECK(v[0].src && v[0].soff == 129 && v[0].bytes == 7);
+    CHECK(v[1].src && v[1].soff == 150 && v[1].bytes == 9);
+    v[0].doff = 0;
+    v[1].doff = 7;
+    memcpy(g_readback_copies, v, sizeof g_readback_copies);
+    g_readback_n = 2;
+    return 1;
+}
+const uint8_t *s2a_nvk_land_readback_map(nvn_gpu_cmd c) {
+    CHECK(c == &g_fake_cmd && !c->live && g_readback_complete);
+    g_readback_maps++;
+    return g_readback_complete ? g_readback_bytes : NULL;
+}
 static const void *g_rel_log[64]; static int g_rel_n;   // 放过的缓冲指针（只比对、不解引用）：「放过的句柄又被录制」用例查它（用例开头清零，指针复用只在用例内比）
 static int rel_log_has(const void *p) { for (int i = 0; i < g_rel_n; i++) if (g_rel_log[i] == p) return 1; return 0; }
 void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user) { (void)retired; (void)user; g_buf_releases++; if (g_rel_n < 64) g_rel_log[g_rel_n++] = b; free(b->cpu); free(b); }
@@ -7184,6 +7205,43 @@ static void t_pool_stats_shutdown(void) {
     CHECK(nvn_be_shutdown_session() == 0 && g_ps_n == 1);  // 收尾后已关：再收尾不重复打
 }
 
+static void t_land_readback(void) {
+    pass_fresh();
+    static uint8_t mirror[sizeof g_pmem];
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    memset(g_pmem + 128, 0x11, 32);
+    g_buf_cpu_fake = mirror;
+    g_readback_test = 1;
+    nvn_be_sub_begin();
+    CHECK(rp_post_gpu_write(base + 129, 7));
+    CHECK(rp_post_gpu_write(base + 150, 9));
+    nvn_be_sub_commit();
+    CHECK(g_readback_n == 2 && g_readback_maps == 0);
+    CHECK(g_pmem[129] == 0x11 && g_pmem[150] == 0x11);
+    // 模拟生产写、段末 GPU 拷贝和下一个生产者覆盖原镜像，完成线程最后才读。
+    memset(mirror + 129, 0x22, 7);
+    memset(mirror + 150, 0x33, 9);
+    for (int i = 0; i < g_readback_n; i++) {
+        const nvn_gpu_buf_copy *v = &g_readback_copies[i];
+        const uint8_t *src = nvn_gpu_buf_cpu(v->src);
+        memcpy(g_readback_bytes + v->doff, src + v->soff, (size_t)v->bytes);
+    }
+    memset(mirror + 128, 0x99, 32);
+    g_readback_complete = 1;
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_readback_maps == 1);
+    uint8_t expected[32];
+    memset(expected, 0x11, sizeof expected);
+    memset(expected + 1, 0x22, 7);
+    memset(expected + 22, 0x33, 9);
+    CHECK(!memcmp(g_pmem + 128, expected, sizeof expected));
+    g_buf_cpu_fake = NULL;
+    g_readback_test = g_readback_n = g_readback_complete = g_readback_maps = 0;
+    nvn_be_pool_del(g_pmem);
+    pass_fresh();
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) { g_dirtylog_dflt = g_flag_buf_dirtylog = 0; argc--; argv++; }   // 关那一档：整套用例走逐页退回路径
 #ifdef S2A_GPU_LAND_TEST
@@ -7193,6 +7251,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-merge")) { t_gpu_land_merge(); printf("gpu land merge: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
 #endif
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    if (argc > 1 && !strcmp(argv[1], "--land-readback")) { t_land_readback(); printf("land readback: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    t_land_readback();
     t_invalidated_attachment_pin();
     t_registered_view_pin();
     t_registered_view_freed_with_storage();

@@ -14,10 +14,11 @@ void s2a_nvk_wait_trace_fast(uint64_t fence, uint64_t completed, uint64_t timeou
 
 struct nvn_wait_trace_land {
     uint64_t begin, locked, copy_begin, copy_end, relocked, end;
-    uint64_t id, registered, copied, mirror, offset;
+    uint64_t id, registered, copied, mirror, offset, readback;
 };
 struct nvn_wait_trace_sub {
     uint64_t begin, land_begin, land_end, effects_end, replay_publish, end;
+    uint64_t invalidate_begin, invalidate_end;
 };
 #if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
 struct nvn_gpu_buf_s;

@@ -104,6 +104,11 @@ struct nvn_gpu_buf_s {
     struct nvn_gpu_buf_s *retire_next;   // 退休队列就地链接，队列本身不再分配
 };
 
+struct vk_land_slot {
+    struct nvn_gpu_buf_s *buf;
+    int busy;
+};
+
 struct nvn_gpu_tex_s {
     uint64_t access_id;
     VkImage image;
@@ -367,6 +372,8 @@ struct nvn_gpu_cmd_s {
     uint32_t refseen_hits;           // 本段备忘命中的次数（只给宿主用例读：nvn_gpu_vk_test_cmd_refseen_hits）
     struct vk_staging *staging;
     uint32_t nstaging, scap;
+    struct vk_land_slot *land_slot;
+    VkDeviceSize land_readback_size;
     struct nvn_gpu_buf_s *arena;
     uint64_t arena_used, arena_cap;
     VkCommandPool pool;
@@ -471,6 +478,9 @@ struct nvn_gpu_vk {
     VkPhysicalDevice phys;
     VkQueue queue;
     nvn_gpu_caps caps;
+    struct vk_land_slot land_slots[3];
+    int land_readback;
+    _Atomic unsigned land_warned;
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
     uint32_t report_bits;
     float report_period;
@@ -1935,6 +1945,13 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     }
     seg_write_clear(c);
     free(c->wrote); c->wrote = NULL; c->nwrote = c->wrote_cap = 0;
+    if (c->land_slot) {
+        // Retire calls finish_cmd only after both the real fence and the
+        // CPU consumer. Aborted commands have run neither.
+        pthread_mutex_lock(&g_mu);
+        c->land_slot->busy = 0;
+        pthread_mutex_unlock(&g_mu);
+    }
     for (uint32_t i = 0; i < c->nstaging; i++) {
         struct nvn_gpu_buf_s *b = c->staging[i].buf;
         if (!b) continue;
@@ -2491,6 +2508,12 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    if (nvn_plat_flag("nvk_land_readback", 0) == 1) {
+        const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        g.land_readback = s2a_vk_memory_type(dev, UINT32_MAX, required, NULL) != UINT32_MAX;
+        if (!g.land_readback)
+            nvn_plat_log(NVN_PLAT_LOG_WARN, "land-readback", "unavailable: no visible cached Vulkan memory type");
+    }
     nvnbar_open();
     g.pass_capture_delay = nvn_plat_flag("nvk_gputime", 0) == 2 ? nvn_plat_flag("nvk_pass_capture_s", 0) : 0;
     g.pass_draw_export = g.pass_capture_delay > 0 && nvn_plat_flag("nvk_pass_draw_export", 0) == 1;
@@ -2860,7 +2883,8 @@ static void pipe_call_test_gate(void) {
 // prefer_cached：主机可见的缓冲优先挑 HOST_CACHED 的显存类型（本机有 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED，类型 6）。
 // 暂存缓冲（每帧约 9 MB 常量缓冲 + 顶点镜像落盘）是 CPU 反复小段写的：写在缓存内存上比写在不缓存映射上快数倍，
 // 且该类型带 coherent 位、不需要显式 flush（见坑记录续 21 的带宽争用读数）。
-static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int prefer_cached, nvn_gpu_buf *out, nvn_gpu_err *err);
+enum { BUF_COHERENT, BUF_PREFER_CACHED, BUF_READBACK_CACHED };
+static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int memory_policy, nvn_gpu_buf *out, nvn_gpu_err *err);
 nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) {
     // 开关 nvk_mem_cached：所有主机可见缓冲（含池镜像）也走 HOST_CACHED 类型。缺省跟随重叠档（nvk_sync_lag≠0 时开）：
     // 默认档 A/B 中性（绑定 5.2 / 回放 33.2 / GPU 忙 39.0–39.5），而重叠档里 CPU 直写镜像 550 KB/帧与显卡抢带宽，
@@ -2869,7 +2893,7 @@ nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu
     if (all_cached < 0 || !(++k & 255)) all_cached = nvn_plat_flag("nvk_mem_cached", nvn_plat_flag("nvk_sync_lag", 0) != 0) != 0;
     return buf_create_impl(bytes, mem, init, all_cached, out, err);
 }
-static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int prefer_cached, nvn_gpu_buf *out, nvn_gpu_err *err) {
+static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int memory_policy, nvn_gpu_buf *out, nvn_gpu_err *err) {
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!g_open) return fail(err, NVN_GPU_E_STOPPED, "后端未打开");
@@ -2894,6 +2918,8 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
                VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+    const int readback = memory_policy == BUF_READBACK_CACHED;
+    if (readback) bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(g.d, &bi, NULL, &b->buffer) != VK_SUCCESS) {
         free(b);
@@ -2904,7 +2930,14 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
     VkMemoryPropertyFlags want = is_shared(mem) ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                                                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t type = UINT32_MAX;
-    if (prefer_cached && is_shared(mem))
+    if (readback) {
+        want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        uint32_t noncoherent_bits = req.memoryTypeBits;
+        for (uint32_t i = 0; i < g.dev->memory.memoryTypeCount; i++)
+            if (g.dev->memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                noncoherent_bits &= ~(1u << i);
+        type = s2a_vk_memory_type(g.dev, noncoherent_bits, want, NULL);
+    } else if (memory_policy == BUF_PREFER_CACHED && is_shared(mem))
         type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, NULL);
     if (type == UINT32_MAX) type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, want, NULL);
     if (type == UINT32_MAX) {
@@ -2938,10 +2971,10 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
             return fail(err, NVN_GPU_E_OOM, "vkMapMemory 失败");
         }
         if (init) memcpy(b->mapped, init, (size_t)bytes);
-        if (g.trace_mem_types) {
+        if (g.trace_mem_types || readback) {
             b->trace_type_bits = req.memoryTypeBits;
             b->trace_type = type;
-            b->trace_prefer_cached = prefer_cached;
+            b->trace_prefer_cached = memory_policy == BUF_PREFER_CACHED;
         }
     }
     pthread_mutex_lock(&g_mu);
@@ -3072,6 +3105,111 @@ static void full_barrier(struct nvn_gpu_cmd_s *c) {
 
 static int buf_range(const struct nvn_gpu_buf_s *b, uint64_t off, uint64_t bytes) {
     return b && off <= b->bytes && bytes <= b->bytes - off;
+}
+
+enum { LAND_SLOT_LIMIT = 64 << 20, LAND_SLOT_GRANULARITY = 1 << 20 };
+enum { LAND_WARN_SIZE = 1, LAND_WARN_BUSY = 2, LAND_WARN_ALLOC = 4, LAND_WARN_INVALIDATE = 8 };
+
+static void land_readback_warn(unsigned bit, const char *detail) {
+    if (!(atomic_fetch_or_explicit(&g.land_warned, bit, memory_order_relaxed) & bit))
+        nvn_plat_log(NVN_PLAT_LOG_WARN, "land-readback", detail);
+}
+
+static struct vk_land_slot *land_slot_take(VkDeviceSize size) {
+    struct vk_land_slot *slot = NULL;
+    pthread_mutex_lock(&g_mu);
+    for (unsigned i = 0; i < sizeof g.land_slots / sizeof g.land_slots[0]; i++) {
+        struct vk_land_slot *v = &g.land_slots[i];
+        if (v->busy) continue;
+        if (v->buf && v->buf->bytes >= size) { slot = v; break; }
+        if (!slot) slot = v;
+    }
+    if (slot) slot->busy = 1;
+    pthread_mutex_unlock(&g_mu);
+    if (!slot) {
+        land_readback_warn(LAND_WARN_BUSY, "fallback: all readback slots in use");
+        return NULL;
+    }
+    if (slot->buf && slot->buf->bytes >= size) return slot;
+    if (slot->buf) nvn_gpu_buf_release(slot->buf, NULL, NULL);
+    const VkDeviceSize capacity = (size + LAND_SLOT_GRANULARITY - 1) & ~(VkDeviceSize)(LAND_SLOT_GRANULARITY - 1);
+    nvn_gpu_err err = {0};
+    if (!nvn_gpu_ok(buf_create_impl(capacity, NVN_GPU_MEM_SHARED, NULL, BUF_READBACK_CACHED, &slot->buf, &err))) {
+        pthread_mutex_lock(&g_mu);
+        slot->busy = 0;
+        pthread_mutex_unlock(&g_mu);
+        land_readback_warn(LAND_WARN_ALLOC, err.why);
+        return NULL;
+    }
+    const struct nvn_gpu_buf_s *b = slot->buf;
+    char detail[160];
+    snprintf(detail, sizeof detail, "allocated bytes=%llu bits=0x%x type_index=%u flags=0x%x atom=%llu",
+             (unsigned long long)b->bytes, b->trace_type_bits, b->trace_type,
+             (unsigned)g.dev->memory.memoryTypes[b->trace_type].propertyFlags,
+             (unsigned long long)g.dev->properties.limits.nonCoherentAtomSize);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "land-readback", detail);
+    return slot;
+}
+
+int s2a_nvk_land_readback_enabled(void) { return g.land_readback; }
+
+int s2a_nvk_land_readback_record(nvn_gpu_cmd c, nvn_gpu_buf_copy *copies, uint32_t count) {
+    if (!g.land_readback || c->in_pass || c->land_slot || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    // One allocation per in-flight submission: ranges can share an atom
+    // inside this slot because all its GPU writes complete before CPU reads.
+    const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
+    VkDeviceSize used = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        nvn_gpu_buf_copy *copy = &copies[i];
+        if (!copy->src) continue;
+        if (!copy->bytes || copy->bytes > LAND_SLOT_LIMIT - used ||
+            !buf_range(copy->src, copy->soff, copy->bytes)) {
+            land_readback_warn(LAND_WARN_SIZE, "fallback: readback range exceeds slot or mirror");
+            return 0;
+        }
+        copy->doff = used;
+        used += copy->bytes;
+    }
+    if (!used) return 0;
+    if (!atom || atom > LAND_SLOT_LIMIT || (atom & (atom - 1))) {
+        land_readback_warn(LAND_WARN_SIZE, "fallback: invalid readback atom size");
+        return 0;
+    }
+    const VkDeviceSize invalidate_size = (used + atom - 1) & ~(atom - 1);
+    struct vk_land_slot *slot = land_slot_take(invalidate_size);
+    if (!slot) return 0;
+    c->land_slot = slot;
+    c->land_readback_size = invalidate_size;
+    for (uint32_t i = 0; i < count; i++) if (copies[i].src) cmd_ref(c, copies[i].src, REF_BUF);
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (uint32_t i = 0; i < count; i++) {
+        const nvn_gpu_buf_copy *copy = &copies[i];
+        if (!copy->src) continue;
+        const VkBufferCopy region = {copy->soff, copy->doff, copy->bytes};
+        vkCmdCopyBuffer(c->cb, copy->src->buffer, slot->buf->buffer, 1, &region);
+    }
+    // Host visibility for staging plus an execution dependency for later
+    // queue writes to mirrors that this command is still reading.
+    mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_HOST_READ_BIT);
+    return 1;
+}
+
+const uint8_t *s2a_nvk_land_readback_map(nvn_gpu_cmd c) {
+    if (!c->land_slot || !c->land_readback_size) return NULL;
+    struct nvn_gpu_buf_s *buf = c->land_slot->buf;
+    // Dedicated allocation mapped from offset zero. This prefix has already
+    // been rounded to whole atoms within the allocation.
+    const VkMappedMemoryRange range = {.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory=buf->memory,
+                                       .offset=0, .size=c->land_readback_size};
+    const VkResult result = vkInvalidateMappedMemoryRanges(g.d, 1, &range);
+    if (result == VK_SUCCESS) return buf->mapped;
+    char detail[96];
+    snprintf(detail, sizeof detail, "fallback: vkInvalidateMappedMemoryRanges failed (%d)", result);
+    land_readback_warn(LAND_WARN_INVALIDATE, detail);
+    return NULL;
 }
 
 void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void *src, uint64_t bytes) {

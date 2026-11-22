@@ -382,7 +382,24 @@ static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
     if (k1 > k0) stale_set(m, k0, (k1 < s->npages ? k1 : s->npages) - 1);
 }
 
-void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
+void rp_buf_gpu_write_snapshot(uint64_t pool_key, uint64_t id, nvn_gpu_buf_copy *out) {
+    // 调用方仍在回放窗口。镜像交给最终段引用；被合并撤销的登记按原落地路径忽略。
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &pool_key);
+    if (s) for (int i = 0; i < s->ngw; i++) {
+        const struct gpu_write *w = &s->gw[i];
+        if (w->id != id || w->landing) continue;
+        *out = (nvn_gpu_buf_copy){.src=s->m[w->mi].buf, .soff=w->off, .bytes=w->len};
+        break;
+    }
+    pthread_mutex_unlock(&g_bmu);
+}
+
+void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {
+    rp_buf_gpu_write_land_from(pool_key, id, ok, NULL);
+}
+
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
@@ -392,9 +409,12 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     if (trace.begin) trace.locked = nvn_wait_trace_stamp();
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
-        if (trace.begin) { trace.mirror = s->m[wmi].trace_id; trace.offset = off; }
+        if (ok) {
+            const uint8_t *mirror = staged ? NULL : nvn_gpu_buf_cpu(s->m[wmi].buf);
+            src = staged ? staged : (mirror ? mirror + off : NULL);
+        }
+        if (trace.begin) { trace.mirror = s->m[wmi].trace_id; trace.offset = off; trace.readback = ok && staged; }
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
         s->gw[i].landing = 1; found = 1;
         s->landing++;
@@ -414,9 +434,9 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     }
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
-    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);
+    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);
 #else
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
+    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
     if (trace.begin) {
         trace.copied = src ? len : 0;

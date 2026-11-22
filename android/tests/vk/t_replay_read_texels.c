@@ -4,11 +4,22 @@
 // 旁路段的开 / 交、取贴图、提交锁、上一个栅栏以受控替身代（核心里的这几件由 t_nvn_replay 的替身后端用例覆盖）；拷贝、提交、等完、格式判断都是真的。
 // 期望值：上传进去的字节 / 通道清成的颜色 / 上传的 BC1 原块，不经被测实现算。
 #define main backend_fixture_main
+#define nvn_plat_flag read_texels_fixture_flag
 #include "t_backend_vk.c"
+#undef nvn_plat_flag
 #undef main
 #include "rp_exec.h"
 #include "rp_res.h"
 #include "nvn_plat.h"
+
+int nvn_plat_flag(const char *name, int def) {
+    if (!strcmp(name, "nvk_land_readback")) return 1;
+    return read_texels_fixture_flag(name, def);
+}
+
+int s2a_nvk_land_readback_enabled(void);
+int s2a_nvk_land_readback_record(nvn_gpu_cmd cmd, nvn_gpu_buf_copy *copies, uint32_t count);
+const uint8_t *s2a_nvk_land_readback_map(nvn_gpu_cmd cmd);
 
 static nvn_gpu_tex g_src; static uint64_t g_sig, g_last; static int g_side_begins, g_side_commits, g_locks, g_unlocks, g_in_sub;
 static char g_un_last[64]; static int g_un_n;
@@ -103,6 +114,63 @@ static void run_formats(void) {   // 后端的 READBACK 位：拷得出 NVN 字�
           "D24S8 refused before any segment (%s), dst untouched, timeline healthy", g_un_last);
     g_un_n = n0;
 }
+
+struct land_case {
+    nvn_gpu_cmd cmd;
+    uint8_t bytes[72];
+    int mapped;
+};
+
+static void land_done(void *user, const nvn_gpu_done *done) {
+    struct land_case *test = user;
+    if (done->status != NVN_GPU_DONE_OK) return;
+    const uint8_t *mapped = s2a_nvk_land_readback_map(test->cmd);
+    if (!mapped) return;
+    memcpy(test->bytes, mapped, sizeof test->bytes);
+    test->mapped = 1;
+}
+
+static void run_land_readback(void) {
+    CHECK(s2a_nvk_land_readback_enabled(), "land readback cached type available");
+    if (!s2a_nvk_land_readback_enabled()) return;
+    nvn_gpu_err err = {0};
+    nvn_gpu_buf mirror = NULL;
+    CHECK(OK(nvn_gpu_buf_create(256, NVN_GPU_MEM_SHARED, NULL, &mirror, &err)), "land mirror: %s", err.why);
+    if (!mirror) return;
+    struct land_case cases[3] = {0};
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        nvn_gpu_cmd c = cases[i].cmd = begin_cmd();
+        nvn_gpu_fill_buf(c, mirror, 0, 128, (0x22 + i) * 0x01010101);
+        nvn_gpu_fill_buf(c, mirror, 128, 128, (0x33 + i) * 0x01010101);
+        nvn_gpu_buf_copy ranges[2] = {{.src=mirror, .soff=3, .bytes=65},
+                                      {.src=mirror, .soff=129, .bytes=7}};
+        CHECK(s2a_nvk_land_readback_record(c, ranges, 2) && ranges[0].doff == 0 && ranges[1].doff == 65,
+              "land copy ranges recorded in distinct slots");
+    }
+    // Reserving occurs before submission and must outlive both recording
+    // and fence retirement. A fourth command may not alias a reserved slot.
+    nvn_gpu_cmd extra = begin_cmd();
+    nvn_gpu_buf_copy range = {.src=mirror, .soff=3, .bytes=65};
+    CHECK(!s2a_nvk_land_readback_record(extra, &range, 1), "land readback refuses a busy slot");
+    nvn_gpu_cmd_abort(extra);
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const uint64_t f = ++g_sig;
+        CHECK(OK(nvn_gpu_cmd_commit(cases[i].cmd, f, land_done, &cases[i], &err)), "land submit: %s", err.why);
+    }
+    CHECK(OK(nvn_gpu_fence_wait(g_sig, 5000000000ull, &err)), "land wait: %s", err.why);
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint8_t expected[72];
+        memset(expected, 0x22 + i, 65);
+        memset(expected + 65, 0x33 + i, 7);
+        CHECK(cases[i].mapped && !memcmp(cases[i].bytes, expected, sizeof expected),
+              "land exact bytes from command %u", i);
+    }
+    extra = begin_cmd();
+    CHECK(s2a_nvk_land_readback_record(extra, &range, 1), "land readback reuses a retired slot");
+    nvn_gpu_cmd_abort(extra);
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+}
+
 int main(void) {
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) { printf("device failed: %s\n", why); return 2; }
@@ -112,8 +180,9 @@ int main(void) {
     run_array_upload(); run_clear(); run_3d(); run_bc1(); run_formats();
     uint64_t st[4]; nvn_be_read_texels_gpu_stats(st);
     CHECK(st[0] == 4 && g_locks == g_unlocks && g_locks == 4, "4 reads counted (%llu), locks %d/%d (the D24S8 refusal happens before the lock)", (unsigned long long)st[0], g_locks, g_unlocks);
+    run_land_readback();
     nvn_gpu_err e = {0}; CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "close: %d %s", e.rc.code, e.why);
     s2a_vk_device_destroy(&g_dev, 1);
-    printf("%s replay ReadTexels GPU: array / clear / 3D / BC1 / formats, failures=%d\n", g_fail ? "FAIL" : "PASS", g_fail);
+    printf("%s replay ReadTexels GPU: array / clear / 3D / BC1 / formats / land readback, failures=%d\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
 }
