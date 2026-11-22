@@ -54,9 +54,13 @@ static int g_memo_on = 1;        // 整套用例这一遍 nvk_desc_memo 的取�
 static int g_dq_dflt_seen = -1;     // 后端传给 nvn_plat_flag("nvk_dq", dflt) 的缺省值（C-DQ-DFLT 核它 = 1：两级回放缺省开）
 static int g_memo_dflt_seen = -1;   // 没设环境变量时后端传给 nvn_plat_flag("nvk_desc_memo", dflt) 的缺省值（C208 核它 = 1：缺省开）
 static int g_shown_timing_test;
+static int g_land_test_on;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
 static int g_compute_warm = -1;
+static int g_pipe_warm_trace;
+static unsigned g_trace_lookup_obj, g_trace_draw_obj;
+static unsigned g_trace_lookup_count, g_trace_draw_count;
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C207：诊断读数互不清零。g_c207_gputime = 1 时调试开关 nvk_gputime 读成 1（开会话之后才置，免得会话开着 GPU 时间戳）；
 // g_c207_cap = 1 时 nvn_plat_log 把「近 300 帧」读数里的描述符行存下来（g_c207_win），并核每一行「每笔读数」的每笔描述符条数 / 组数（g_c207_nlog、g_c207_badlog）。
@@ -71,9 +75,11 @@ static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的�
 static int g_pool_rec_flag = -1;    // 整池组回收 nvk_pool_rec：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的回收用例用；改完调 nvn_gpu_vk_test_pool_memo_refresh）
 static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的备忘用例用；后端每 256 次绑定重读，改完调 nvn_gpu_vk_test_pool_memo_refresh 立即作废缓存）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return 1;
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_pool_rec") && g_pool_rec_flag >= 0) return g_pool_rec_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
+    if (!strcmp(name, "nvk_pipe_warm_trace") && g_pipe_warm_trace) return 1;
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_dset_rec")) {
         if (g_dsetrec_flag >= 0) return g_dsetrec_flag;
@@ -103,6 +109,17 @@ static int g_shown_empty_logged;
 static unsigned g_msaa_log_2, g_msaa_log_8;
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)level;
+    if (cls && text && !strcmp(cls, "pipe-trace")) {
+        unsigned obj, key, warm;
+        if (sscanf(text, "lookup obj=%u key=%x warm=%u", &obj, &key, &warm) == 3 && warm) {
+            g_trace_lookup_obj = obj;
+            g_trace_lookup_count++;
+        }
+        if (sscanf(text, "draw obj=%u key=%x warm=%u", &obj, &key, &warm) == 3 && warm) {
+            g_trace_draw_obj = obj;
+            g_trace_draw_count++;
+        }
+    }
     if (text && strstr(text, "msaa_fallback:")) {
         if (strstr(text, "请求 2 重采样")) g_msaa_log_2++;
         if (strstr(text, "请求 8 重采样")) g_msaa_log_8++;
@@ -10336,10 +10353,90 @@ done:
     if (fs2) nvn_gpu_shader_release(fs2);
     free(vm); free(fm); free(vm2); free(fm2);
 }
+static void c209_warm_draw(const char *dir) {
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    void *vm = NULL, *fm = NULL;
+    if (!load_shader_pair(dir, "tri3.vert", "solid_green.frag", NULL, NULL, &vs, &fs, &vm, &fm)) {
+        CHECK(0, "C209 warm draw shaders");
+        return;
+    }
+    nvn_gpu_pipe_desc pd;
+    fill_gpipe_desc(&pd, vs, fs, 0);
+    nvn_gpu_pipe warm = NULL, probed = NULL, cold = NULL;
+    nvn_gpu_err e = {0};
+    const uint64_t start = nvn_gpu_pipe_warm_hits();
+    const uint64_t created = nvn_gpu_pipe_warm_created();
+    nvn_gpu_pipe_warm_scope(1);
+    const nvn_gpu_rc warm_rc = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &warm, &e);
+    nvn_gpu_pipe_warm_scope(0);
+    CHECK(OK(warm_rc) && warm && nvn_gpu_pipe_warm_created() == created + 1,
+          "C209 prebuild must create one warm object: %s", e.why);
+    CHECK(nvn_gpu_pipe_lookup(&pd, &probed) && probed == warm, "C209 demand lookup must return warm object");
+    CHECK(nvn_gpu_pipe_lookup(&pd, &probed) && probed == warm, "C209 repeated lookup must return same object");
+    CHECK(nvn_gpu_pipe_warm_hits() == start, "C209 lookup alone must not count as a draw");
+    nvn_gpu_pipe synced = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &synced, &e)) && synced == warm,
+          "C209 sync get must return same object: %s", e.why);
+    CHECK(nvn_gpu_pipe_warm_hits() == start, "C209 sync get alone must not count as a draw");
+    CHECK(g_trace_lookup_count == 1 && g_trace_lookup_obj && !g_trace_draw_count,
+          "C209 fingerprint must report one warm lookup, without a draw");
+
+    pd.poly.front ^= 1;
+    CHECK(!nvn_gpu_pipe_lookup(&pd, &cold) && !cold, "C209 different recipe must miss warm object");
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &cold, &e)) && cold && cold != warm,
+          "C209 cold recipe must create its own object: %s", e.why);
+    if (warm && probed == warm && cold && cold != warm) {
+        nvn_gpu_buf vb = full_vb();
+        nvn_gpu_tex tex = make_tex(64, 64, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+        nvn_gpu_view view = make_view(tex);
+        nvn_gpu_cmd cmd = begin_cmd();
+        nvn_gpu_pass_desc pass = {0};
+        pass.ncolor = pass.layers = 1; pass.w = pass.h = 64;
+        pass.color[0].view = view; pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+        nvn_gpu_pass_begin(cmd, &pass);
+        nvn_gpu_dyn dyn;
+        full_dyn(&dyn);
+        nvn_gpu_set_dyn(cmd, &dyn);
+        nvn_gpu_set_vbuf(cmd, 0, vb, 0);
+        nvn_gpu_draw_args a = {.prim = 4, .count = 3, .instances = 1};
+        nvn_gpu_set_pipe(cmd, cold);
+        nvn_gpu_draw(cmd, &a);
+        CHECK(nvn_gpu_pipe_warm_hits() == start, "C209 real cold draw must not count as warm");
+        nvn_gpu_set_pipe(cmd, probed);
+        a.count = 0;
+        nvn_gpu_draw(cmd, &a);
+        CHECK(nvn_gpu_pipe_warm_hits() == start, "C209 zero-count draw must not claim warm object");
+        a.count = 3;
+        nvn_gpu_draw(cmd, &a);
+        CHECK(nvn_gpu_pipe_warm_hits() == start + 1, "C209 first real draw must count the warm lookup object");
+        nvn_gpu_draw(cmd, &a);
+        CHECK(nvn_gpu_pipe_warm_hits() == start + 1, "C209 repeated warm draw must not count twice");
+        CHECK(g_trace_draw_count == 1 && g_trace_draw_obj == g_trace_lookup_obj,
+              "C209 fingerprint must join the only draw to the warm lookup object");
+        nvn_gpu_pass_end(cmd);
+        CHECK(OK(nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &e)), "C209 warm draw submit: %s", e.why);
+        CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "C209 warm draw fence: %s", e.why);
+        nvn_gpu_view_release(view);
+        nvn_gpu_tex_release(tex);
+        nvn_gpu_buf_release(vb, NULL, NULL);
+    }
+    nvn_gpu_shader_release(vs);
+    nvn_gpu_shader_release(fs);
+    free(vm);
+    free(fm);
+}
+
 static void c209_all(const char *dir) {
     nvn_gpu_err e = {0};
     if (!open_backend()) { CHECK(0, "C209 open"); return; }
     c209_pipe_tag(dir);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C209 close before warm draw：%d %s", e.rc.code, e.why);
+    g_trace_lookup_obj = g_trace_draw_obj = g_trace_lookup_count = g_trace_draw_count = 0;
+    g_pipe_warm_trace = 1;
+    const int opened = open_backend();
+    g_pipe_warm_trace = 0;
+    if (!opened) { CHECK(0, "C209 open with warm trace"); return; }
+    c209_warm_draw(dir);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C209 close：%d %s", e.rc.code, e.why);
     printf("C209 管线标签随对象：新对象标签为 0 / 翻倍重排后对象与标签不丢 / 指针不复用 / 同一份 SPIR-V 载入两次不合并句柄，已核对\n");
 }
@@ -10803,6 +10900,108 @@ static void gpu_deswizzle_matrix(void) {
 
 #include "t_clear_capacity.inc"
 
+#ifdef S2A_LAND_READBACK_TEST
+void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t));
+static atomic_int land_gate_release;
+static int land_force_failure;
+
+static VkResult land_wait_for_later_gpu(uint64_t signal) {
+    if (signal != 2) return VK_SUCCESS;
+    for (int i = 0; i < 500 && !atomic_load(&land_gate_release); i++) sleep_ms(10);
+    if (!atomic_load(&land_gate_release)) return VK_ERROR_UNKNOWN;
+    return land_force_failure ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+}
+
+struct land_result {
+    atomic_int called;
+    uint32_t status;
+    uint64_t bytes;
+    uint8_t data[56];
+};
+static void land_done(void *user, const nvn_gpu_done *done) {
+    struct land_result *result = user;
+    result->status = done->status;
+    result->bytes = done->readback_bytes;
+    if (done->readback && done->readback_bytes == sizeof result->data)
+        memcpy(result->data, done->readback, sizeof result->data);
+    atomic_store(&result->called, 1);
+}
+
+static void test_land_readback(int fail_invalidate) {
+    memset(&g_desc, 0, sizeof g_desc);
+    g_desc.host_device = &g_dev;
+    g_desc.app_label = "land-readback";
+    g_land_test_on = 1;
+    if (!open_backend()) {
+        g_land_test_on = 0;
+        return;
+    }
+    nvn_gpu_err err = {0};
+    nvn_gpu_buf mirror = make_buf(128, NVN_GPU_MEM_SHARED, NULL);
+    struct land_result a_result = {0}, b_result = {0};
+    const int enabled = nvn_gpu_readback_enabled();
+    CHECK(enabled, "land: no cached readback capability on test ICD");
+    if (mirror && enabled) {
+        CHECK(OK(nvn_gpu_cmd_commit(begin_cmd(), 1, on_done, NULL, &err)), "land: F-1 submit %s", err.why);
+        CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &err)), "land: F-1 initially completed");
+
+        nvn_gpu_cmd a = begin_cmd();
+        nvn_gpu_fill_buf(a, mirror, 0, 128, 0x11111111u);
+        // 两个同一源的不相邻字节范围，第二个目标起点不对齐缓存粒度。
+        nvn_gpu_readback_span spans[] = {{mirror, 5, 37, UINT64_MAX}, {mirror, 73, 19, UINT64_MAX}};
+        land_force_failure = fail_invalidate;
+        atomic_store(&land_gate_release, 0);
+        nvn_gpu_vk_test_land_gate(land_wait_for_later_gpu);
+        CHECK(nvn_gpu_readback_record(a, spans, 2) == 56 &&
+              spans[0].readback_offset == 0 && spans[1].readback_offset == 37,
+              "land: packed copy plan must preserve both source ranges");
+        CHECK(OK(nvn_gpu_cmd_commit(a, 2, land_done, &a_result, &err)), "land: A submit %s", err.why);
+
+        nvn_gpu_cmd b = begin_cmd();
+        nvn_gpu_fill_buf(b, mirror, 0, 128, 0x22222222u);
+        CHECK(OK(nvn_gpu_cmd_commit(b, 3, land_done, &b_result, &err)), "land: B submit %s", err.why);
+        // A 的 CPU 完成线程仍堵在 gate。直接排队一个 Vulkan 栅栏，证明 B 的真实 GPU 工作已经结束。
+        VkFence fence = VK_NULL_HANDLE;
+        const VkFenceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        const VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkResult status = vkCreateFence(g_dev.device, &info, NULL, &fence);
+        if (status == VK_SUCCESS) status = vkQueueSubmit(g_dev.queue, 1, &submit, fence);
+        if (status == VK_SUCCESS) status = vkWaitForFences(g_dev.device, 1, &fence, VK_TRUE, 4000000000ull);
+        CHECK(status == VK_SUCCESS, "land: native fence behind B: %d", status);
+        CHECK(!atomic_load(&a_result.called) && !atomic_load(&b_result.called), "land: software completion ran before release");
+        if (status == VK_SUCCESS) {
+            const uint8_t *mapped = nvn_gpu_buf_cpu(mirror);
+            CHECK(mapped && mapped[5] == 0x22 && mapped[73] == 0x22, "land: B did not overwrite the source mirror");
+        }
+        atomic_store(&land_gate_release, 1);
+        const int wait_rc = nvn_gpu_fence_wait(2, 5000000000ull, &err).code;
+        CHECK(wait_rc == (fail_invalidate ? NVN_GPU_E_FAILED : NVN_GPU_OK), "land: waiting A got %d", wait_rc);
+        const int b_rc = nvn_gpu_fence_wait(3, 5000000000ull, &err).code;
+        CHECK(b_rc == (fail_invalidate ? NVN_GPU_E_FAILED : NVN_GPU_OK), "land: waiting B got %d", b_rc);
+        CHECK(nvn_gpu_fence_wait(1, 0, &err).code == NVN_GPU_OK, "land: failed A hid the prior success");
+        CHECK(nvn_gpu_fence_wait(2, 0, &err).code == wait_rc, "land: query A after completion disagrees");
+        CHECK(nvn_gpu_fence_failed() == (fail_invalidate ? 2u : 0u), "land: wrong first failure value");
+        if (fence && status == VK_SUCCESS) vkDestroyFence(g_dev.device, fence, NULL);
+    }
+    if (mirror) nvn_gpu_buf_release(mirror, NULL, NULL);
+    const nvn_gpu_rc closed = nvn_gpu_close(5000000000ull, &err);
+    CHECK(OK(closed), "land: close %s", err.why);
+    if (mirror && enabled && OK(closed)) {
+        const uint32_t want = fail_invalidate ? NVN_GPU_DONE_FAILED : NVN_GPU_DONE_OK;
+        CHECK(atomic_load(&a_result.called) && a_result.status == want, "land: wrong A callback result");
+        CHECK(atomic_load(&b_result.called) && b_result.status == want, "land: wrong B callback result");
+        CHECK(a_result.bytes == (fail_invalidate ? 0u : 56u), "land: wrong A borrowed length");
+        if (!fail_invalidate) {
+            uint8_t expected[sizeof a_result.data];
+            memset(expected, 0x11, sizeof expected);
+            CHECK(!memcmp(expected, a_result.data, sizeof expected), "land: retained data must be A's writes, never B's mirror");
+        }
+    }
+    nvn_gpu_vk_test_land_gate(NULL);
+    g_land_test_on = 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -10820,6 +11019,15 @@ int main(int argc, char **argv) {
 #ifdef S2A_BACKEND_PIPE_CALL_TEST
     if (argc > 2 && !strcmp(argv[2], "--pipe-call-lifetime")) {
         pipe_call_lifetime_test();
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
+#endif
+#ifdef S2A_LAND_READBACK_TEST
+    if (argc > 2 && !strcmp(argv[2], "--land-readback")) {
+        test_land_readback(0);
+        test_land_readback(1);
+        printf("LAND_READBACK valid and invalidated paths: failures=%d\n", g_fail);
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
@@ -11444,6 +11652,10 @@ int main(int argc, char **argv) {
     c89_midrun_save(argv[1]);  // 同上；还会起子进程（被 SIGKILL 的那一局）
     c658_suite(argv[1],0);   // Independently opens/closes; absent count capability is a negative control.
     c907_retained_flush(argv[1]);   // 停局保留会话时的管线缓存落盘（#907 合入补）
+#ifdef S2A_LAND_READBACK_TEST
+    test_land_readback(0);
+    test_land_readback(1);
+#endif
     // C201：整套用例都在 nvk_fbdrop=2（自检档）下跑，视图销毁走快路之后每次再全表扫一遍；反查表漏记过的帧缓冲会在这里留下残留计数。
     CHECK(nvn_vk_dbg_view_stat(3) == 0, "C201 整套用例在自检档下跑完：视图销毁后帧缓冲缓存里扫到的残留期望 0 → %llu", (unsigned long long)nvn_vk_dbg_view_stat(3));
 

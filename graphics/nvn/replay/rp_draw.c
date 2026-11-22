@@ -37,6 +37,7 @@
 // 弱链接[replay]：nvk_fu_frame_ms
 // 弱链接[replay]：nvk_fu_item_ms
 // 弱链接[replay]：nvk_fu_unsafe_ms
+// 弱链接[replay]：nvk_pipe_warm_trace_wait
 // 弱链接[replay]：nvk_pipe_warm_note_prog
 // 弱链接[replay]：nvn_vk_pipe_demand_kick
 // 弱链接[replay]：nvn_vk_pipe_demand_mark
@@ -80,6 +81,8 @@ extern int s2a_nvn_rast_flip;   // hle_nvn.c：当前提交队列的正面光栅
 // 没有身份（失败项 / 还没算出来）就不记。np 是刚取到的后端管线：清单在它上面存一个标签，之后换回同一条
 // 管线只加计数（不序列化、不散列、不查表）。
 int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p, nvn_gpu_pipe np) __attribute__((weak));
+void nvk_pipe_warm_trace_wait(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p,
+                              uint64_t frame, uint64_t waited_ns, int result) __attribute__((weak));
 
 // 句柄放在游戏用户常量缓冲里的贴图（NVN_RB_TEXU；语义照 iOS nvn_mtl.m ubo_read / ubo_handle / ubo_packed / ubo_tex_id / ubo_samp_id / bind_sid）。
 // 一个字：常量槽 reg 的字节 off 处，编码这一刻从游戏内存读（同 NVN_RB_CBUF 绑的就是这一刻的内容）；槽没绑、越界、不在登记过的池里读作 0（iOS：空槽）
@@ -442,6 +445,8 @@ static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt
         w = nvn_vk_pipe_demand_wait(pd, ident, slice, out, err ? err->why : NULL, err ? sizeof err->why : 0);
         uint64_t waited = rp_fu_now() - t0;
         if (may_skip) s2a_fu_budget_spend(&g_fu_budget, frame, waited);
+        if (waited > 3000000ull && nvk_pipe_warm_trace_wait)
+            nvk_pipe_warm_trace_wait(pd, ident, *out, frame, waited, w);
     } while (w == 1 && !v.wait_ms);
     if (w == 0) return rp_fu_ok();
     if (w == 2 || w == 3)   // 后台失败 / 待定项消失：回退现场建（拿真实结果/错误，不丢笔，也不按未实现报红）

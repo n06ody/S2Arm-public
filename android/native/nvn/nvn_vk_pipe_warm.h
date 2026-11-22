@@ -102,7 +102,7 @@ struct nvk_pipe_warm_stats {
     uint64_t failed;      // 预热带失败的条数
     uint64_t retried;     // 返回 1（等程序发布）的次数
     uint64_t pending;     // 还没有被 take 的条数
-    uint64_t draw_hits;   // 转发 backend：真实 draw 命中「后台预建」对象的次数（验收读数）
+    uint64_t draw_hits;   // 转发 backend：图形实际录制有效 draw；计算按首次取用
     uint64_t tag_hits;    // 换管线时标签对得上、只加了计数的次数（没走序列化 / 散列 / 查表）
     uint64_t epochs;      // 满表时「本轮碰过的条目把表占满、开新一轮」的次数（见 nvk_pipe_warm_note 的淘汰规则）
 };
@@ -139,12 +139,18 @@ void nvk_pipe_warm_diag_flush(void);   // 立刻输出当前窗口一行并开�
 // ---- 后端协作（实现在 backend_vulkan.c；宿主单测不链后端，本模块按弱符号调） ----
 // 预热线程建管线的作用域：1 = 接下来的创建算「预建」，后端据此在对象上打 warm 标记并计 warm 创建数。
 void nvn_gpu_pipe_warm_scope(int on);
-uint64_t nvn_gpu_pipe_warm_hits(void);      // 真实 draw 命中预建对象的次数
+uint64_t nvn_gpu_pipe_warm_hits(void);      // 图形首次实际录制有效 draw；计算保留按首次取用计
 uint64_t nvn_gpu_pipe_warm_created(void);   // 预建出来的对象数
 // 清单标签：存在后端管线对象上的一个 64 位值（低 32 位 = 槽号 + 1，高 32 位 = 槽代号；0 = 没设过）。
 // 原子读写、不加锁；标签随管线对象一起销毁（后端局内不淘汰管线），所以不会指到别的管线。
 uint64_t nvn_gpu_pipe_warm_tag(nvn_gpu_pipe p);
 void nvn_gpu_pipe_warm_tag_set(nvn_gpu_pipe p, uint64_t tag);
+
+// 临时诊断：对象号只在同进程内对拍；recipe 摘要用于对照清单，仍以完整字节判等。
+uint32_t nvn_vk_pipe_trace_id(nvn_gpu_pipe p, unsigned *warm, uint32_t *key);
+void nvk_pipe_warm_trace_demand(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p);
+void nvk_pipe_warm_trace_wait(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p,
+                              uint64_t frame, uint64_t waited_ns, int result);
 
 #ifdef __cplusplus
 }

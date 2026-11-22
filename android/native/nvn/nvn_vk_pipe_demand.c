@@ -10,7 +10,9 @@
 #include "nvn_pipe_pend.h"
 #include "nvn_plat.h"     // nvn_plat_flag（debug.s2a.*）
 #include "rp_shader.h"    // rp_shader_prog_borrow/return / struct rp_prog
-#include "nvn_plat.h"     // 已有；nvn_plat_log / nvn_plat_flag
+// 弱链接[pipedemand]：nvk_pipe_warm_trace_demand
+// 弱链接[replay]：nvk_pipe_warm_trace_demand
+void nvk_pipe_warm_trace_demand(const nvn_gpu_pipe_desc *, const uint8_t[32], nvn_gpu_pipe) __attribute__((weak));
 // 弱链接[pipedemand]：s2a_fu_rt_reset（nvn_first_use.c 提供；android/tools/nvn_vk_pipe_demand_test.sh 不链它）
 void s2a_fu_rt_reset(void) __attribute__((weak));   // 首用 fresh/seen 历史清表（nvn_first_use.c；弱引用，宿主缺实现就跳过）
 
@@ -102,14 +104,15 @@ static void dem_build(int h) {
     nvn_gpu_pipe pipe = NULL;
     nvn_gpu_err err = {0};
     nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err);
-    rp_shader_prog_return(j.ident);
     if (nvn_gpu_ok(r) && pipe) {
         __atomic_fetch_add(&g_st.built, 1, __ATOMIC_RELAXED);
         dem_publish(j.gen, h, pipe, 0, NULL);
+        if (nvk_pipe_warm_trace_demand) nvk_pipe_warm_trace_demand(&pd, j.ident, pipe);
     } else {
         __atomic_fetch_add(&g_st.failed, 1, __ATOMIC_RELAXED);
         dem_publish(j.gen, h, NULL, r.code ? r.code : NVN_GPU_E_COMPILE, err.why[0] ? err.why : "后台建管线失败");
     }
+    rp_shader_prog_return(j.ident);
 }
 
 static void *dem_main(void *arg) {

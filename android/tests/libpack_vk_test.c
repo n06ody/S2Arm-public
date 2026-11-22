@@ -100,6 +100,13 @@ static const char *PS_SEPSAMP_JSON =
     "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
     "{\"msl_name\":\"fp_t_sepSmplr\",\"kind\":\"samp\",\"reg\":3,\"arg_id\":3},"
     "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
+// 0x1056805A: 类型 1，c2 字 90（分离贴图 #128）与 c2 字 346（分离采样器 #0）。
+static const char *PS_SEPSAMP_C2_JSON =
+    "{\"key\":\"1032547698badcfe_b\",\"stage\":\"ps\",\"dm_ctl\":\"1032547698badcfe\",\"bindings\":["
+    "{\"msl_name\":\"fp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+    "{\"msl_name\":\"fp_t_cb196610_1056805A\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+    "{\"msl_name\":\"fp_t_cb196610_1056805ASmplr\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":3},"
+    "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}";
 
 static const char *VS_BUFFER_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
@@ -433,19 +440,114 @@ int main(void) {
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     }
 
-    // 分离贴图的采样器半边：samp_tex → 槽 90、分离贴图槽 128；samp（分离采样器）→ 不给槽、解析后不挂槽
-    for (int variant = 0; variant < 2; variant++) {
-        const char *ps = variant ? PS_SEPSAMP_JSON : PS_SAMPTEX_JSON;
+    // 同字采样器仍是 v1；有真类型/来源/声明证明的独立采样器才是 v2。
+    enum { SAME_WORD, UNKNOWN_HANDLE, SEPARATE_C2, TYPE_2, MISSING_HALF, DUP_HALF, WRONG_HALF_SLOT,
+           WRONG_SET, WRONG_BINDING, DESCRIPTOR_ARRAY, EXTRA_SAMPLER, SKIPPED_KIND,
+           SUPPORT_FROM_SPV, SUPPORT_LISTED, SUPPORT_WRONG_OWNER, MIXED_V2, MIXED_V2_WRONG_SET, MIXED_V1, SUPPORT_ON_IMAGE, UNNAMED_SUPPORT_UBO, NAMED_SUPPORT_IMAGE, SEP_CASES };
+    for (int variant = SAME_WORD; variant < SEP_CASES; variant++) {
+        char reflection[1024];
+        snprintf(reflection, sizeof reflection, "%s", (variant == SAME_WORD || variant == MIXED_V1) ? PS_SAMPTEX_JSON :
+                 variant == UNKNOWN_HANDLE ? PS_SEPSAMP_JSON : PS_SEPSAMP_C2_JSON);
+        uint32_t mutated[sizeof libpack_frag_spv / sizeof(uint32_t)];
+        const uint8_t *fragment = libpack_frag_spv;
+        size_t fragment_bytes = sizeof libpack_frag_spv;
+        if (variant == TYPE_2) {
+            char *handle = strstr(reflection, "1056805A");
+            *handle = '2'; *strstr(handle + 1, "1056805A") = '2';
+        } else if (variant == MISSING_HALF || variant == DUP_HALF || variant == WRONG_HALF_SLOT) {
+            char *half = strstr(reflection, "{\"msl_name\":\"fp_t_cb196610_1056805ASmplr\"");
+            size_t half_bytes = (size_t)(strchr(half, '}') + 2 - half);
+            if (variant == MISSING_HALF) memmove(half, half + half_bytes, strlen(half + half_bytes) + 1);
+            else if (variant == DUP_HALF) memmove(half + half_bytes, half, strlen(half) + 1);
+            else strstr(half, "\"reg\":0")[6] = '1';
+        } else if (variant == WRONG_SET || variant == WRONG_BINDING) {
+            memcpy(mutated, libpack_frag_spv, fragment_bytes);
+            uint32_t target = 0;
+            size_t n = fragment_bytes / sizeof(uint32_t);
+            for (size_t i = 5; i < n; i += mutated[i] >> 16) {
+                if (mutated[i] != 0x00040047 || mutated[i + 2] != 33 || mutated[i + 3] != 10) continue;
+                target = mutated[i + 1];
+                if (variant == WRONG_BINDING) mutated[i + 3] = 12;
+            }
+            CHECK(target != 0, "fixture has descriptor binding 10");
+            if (variant == WRONG_SET) for (size_t i = 5; i < n; i += mutated[i] >> 16)
+                if (mutated[i] == 0x00040047 && mutated[i + 1] == target && mutated[i + 2] == 34) mutated[i + 3] = 1;
+            fragment = (const uint8_t *)mutated;
+        } else if (variant == DESCRIPTOR_ARRAY) {
+            fragment = (const uint8_t *)libpack_array_spv; fragment_bytes = sizeof libpack_array_spv;
+        } else if (variant == EXTRA_SAMPLER || variant == SKIPPED_KIND) {
+            fragment = (const uint8_t *)libpack_half_spv; fragment_bytes = sizeof libpack_half_spv;
+            if (variant == SKIPPED_KIND) {
+                char *half = strstr(reflection, "1056805ASmplr\"");
+                strstr(half, "\"arg_id\":3")[9] = '5';
+                snprintf(reflection + strlen(reflection) - 2, sizeof reflection - strlen(reflection) + 2,
+                         ",{\"msl_name\":\"fp_sampler_only\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":3}]}");
+            }
+        }
+        if (variant >= SUPPORT_FROM_SPV && variant <= SUPPORT_WRONG_OWNER) {
+            fragment = (const uint8_t *)libpack_support_v2_frag_spv;
+            fragment_bytes = sizeof libpack_support_v2_frag_spv;
+            if (variant != SUPPORT_FROM_SPV) {
+                const char *member = variant == SUPPORT_LISTED ?
+                    ",{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":4}]}" :
+                    ",{\"msl_name\":\"fp_c3_wrong_owner\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":4}]}";
+                size_t end = strlen(reflection) - 2;
+                snprintf(reflection + end, sizeof reflection - end, "%s", member);
+            }
+        }
+        uint32_t unnamed_support[sizeof libpack_support_v2_frag_spv / sizeof(uint32_t)];
+        if (variant == SUPPORT_ON_IMAGE || variant == NAMED_SUPPORT_IMAGE) {
+            // 只改反射的同号资源；原 SPIR-V 仍实际用 imageLoad 读取 b16。
+            size_t end = (size_t)(strstr(reflection, "{\"msl_name\":\"fp_i0\"") - reflection);
+            snprintf(reflection + end, sizeof reflection - end,
+                     "{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":2}]}");
+            if (variant == NAMED_SUPPORT_IMAGE) {
+                fragment = (const uint8_t *)libpack_named_image_spv;
+                fragment_bytes = sizeof libpack_named_image_spv;
+            }
+        } else if (variant == UNNAMED_SUPPORT_UBO) {
+            size_t end = strlen(reflection) - 2;
+            snprintf(reflection + end, sizeof reflection - end,
+                     ",{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":4}]}");
+            memcpy(unnamed_support, libpack_support_v2_frag_spv, sizeof unnamed_support);
+            for (size_t i = 5; i < sizeof unnamed_support / sizeof *unnamed_support; i += unnamed_support[i] >> 16) {
+                if (unnamed_support[i] != 0x00060005u ||
+                    strcmp((const char *)&unnamed_support[i + 2], "support_buffer")) continue;
+                unnamed_support[i + 2] ^= 0x20u;   // OpName 首字母换大写，描述符布局及用法不变。
+            }
+            fragment = (const uint8_t *)unnamed_support;
+            fragment_bytes = sizeof unnamed_support;
+        }
+        const uint8_t *vertex = libpack_vert_spv;
+        uint32_t vertex_set[sizeof libpack_vert_spv / sizeof(uint32_t)];
+        if (variant == MIXED_V2_WRONG_SET) {
+            memcpy(vertex_set, libpack_vert_spv, sizeof vertex_set);
+            for (size_t i = 5; i < sizeof vertex_set / sizeof *vertex_set; i += vertex_set[i] >> 16)
+                if (vertex_set[i] == 0x00040047 && vertex_set[i + 2] == 34) vertex_set[i + 3] = 1;
+            vertex = (const uint8_t *)vertex_set;
+        }
+        char vs_reflection[1024];
+        snprintf(vs_reflection, sizeof vs_reflection, "%s", VS_JSON);
+        if (variant == MIXED_V2 || variant == MIXED_V1) {
+            // 同号采样器行会被跳过，VS SPIR-V 仍读取 b12 的组合纹理。
+            char *kind = strstr(vs_reflection, "\"kind\":\"tex\"") + strlen("\"kind\":\"");
+            memmove(kind + 4, kind + 3, strlen(kind + 3) + 1);
+            memcpy(kind, "samp", 4);
+            uint64_t missing = 0;
+            CHECK(nvn_vk_spirv_link_ok(libpack_vert_spv, sizeof libpack_vert_spv, fragment, fragment_bytes, &missing),
+                  "mixed VS/FS modules link independently of descriptor reflection");
+        }
+        const char *ps = reflection;
         snprintf(g_dir, sizeof g_dir, "%s/sepsamp%d", tmpl, variant);
         CHECK(mkdir(g_dir, 0700) == 0, "create separate-sampler pack directory");
         struct trec rs[4] = {
-            { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(VS_JSON) },
+            { .key = 0x0123456789abcdef, .kind = 1, .len = (uint32_t)strlen(vs_reflection) },
             { .key = 0x0123456789abcdef, .kind = 52, .len = sizeof libpack_vert_spv },
             { .key = 0x1032547698badcfe, .kind = 1, .len = (uint32_t)strlen(ps) },
-            { .key = 0x1032547698badcfe, .kind = 52, .len = sizeof libpack_frag_spv },
+            { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)fragment_bytes },
         };
-        const uint8_t *pr[4] = { (const uint8_t *)VS_JSON, libpack_vert_spv, (const uint8_t *)ps, libpack_frag_spv };
-        size_t nr[4] = { strlen(VS_JSON), sizeof libpack_vert_spv, strlen(ps), sizeof libpack_frag_spv };
+        const uint8_t *pr[4] = { (const uint8_t *)vs_reflection, vertex, (const uint8_t *)ps, fragment };
+        size_t nr[4] = { strlen(vs_reflection), sizeof libpack_vert_spv, strlen(ps), fragment_bytes };
         CHECK(mk_pack(rs, 4, pr, nr, 1) == 0, "separate-sampler pack written");
         struct s2a_libpack *slp = NULL; uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
         uint8_t keys[6][8] = {{0}};
@@ -454,11 +556,54 @@ int main(void) {
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
         CHECK(s2a_libpack_open(&slp, g_dir) == 1 && slp, "open separate-sampler pack");
         int rc = slp ? s2a_libpack_program_v1(slp, keys, 3, NULL, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
-        if (variant) {
-            // samp（分离采样器槽）v1 表达不了：绑定出不了 guest 槽也没有出处字段 → 出库即 REJECT，
-            //   不再产 slot -1 死绑定让消费端再拒一遍（#1774）
-            CHECK(rc == -1 && !j && strstr(w, "no consumable guest source") && strstr(w, "fp_t_sep"),
-                  "sep-tex + samp（分离采样器）→ REJECT（不产 slot -1 死绑定）");
+        if (variant == SEPARATE_C2 || variant == SUPPORT_FROM_SPV || variant == SUPPORT_LISTED) {
+            struct fd_program parsed = {0}; char why[192] = "";
+            CHECK(rc == 0 && j && has(j, "\"schema\":\"s2a-direct-program-v2\""),
+                  "type-1 c2 separate sampler produces a v2 program");
+            int parsed_rc = j ? nvn_vk_program_parse_graphics(j, jl, &parsed, why, sizeof why) : -1;
+            const struct fd_binding *binding = NULL;
+            int sampler_half = 0, support = 0;
+            for (int i = 0; i < parsed.binding_count; i++) {
+                const struct fd_binding *b = &parsed.bindings[i];
+                if (b->binding == 10) binding = b;
+                if (b->binding == 22) sampler_half++;
+                if (b->binding == 28 && b->is_support && b->set == 0) support++;
+            }
+            if (variant == SEPARATE_C2) {
+                CHECK(parsed_rc == 0 && binding && binding->set == 0 && binding->count == 1 &&
+                      binding->tex_slot == 128 && binding->samp_slot == 0 && !sampler_half,
+                      "v2 preserves the single combined descriptor with independent sampler slot 0");
+            } else {
+                if (parsed_rc) fprintf(stderr, "graphics v2 support parse: %s\n", why);
+                CHECK(parsed_rc == 0 && binding && binding->tex_slot == 128 && binding->samp_slot == 0 && support == 1,
+                      variant == SUPPORT_LISTED ? "graphics v2 explicit support is emitted once" :
+                                                  "graphics v2 unlisted support is recovered from SPIR-V");
+            }
+            nvn_vk_program_free(&parsed);
+        } else if (variant == SUPPORT_WRONG_OWNER || variant == MIXED_V2) {
+            const char *reason = variant == SUPPORT_WRONG_OWNER ? "binding 28 is owned by support_buffer" :
+                                                               "binding 12 has no mappable";
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(w, reason),
+                  variant == SUPPORT_WRONG_OWNER ? "graphics v2 rejects guest uniform ownership of support binding" :
+                                                   "graphics v2 validates emitted descriptors across both stages");
+        } else if (variant == MIXED_V2_WRONG_SET) {
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(w, "descriptor outside set 0"),
+                  "graphics v2 rejects a known binding in the wrong set of another stage");
+        } else if (variant >= SUPPORT_ON_IMAGE) {
+            const char *reason = variant == NAMED_SUPPORT_IMAGE ? "support_buffer is not a set 0 uniform block" :
+                                 variant == UNNAMED_SUPPORT_UBO ? "binding 28 is not declared as support_buffer" :
+                                                                  "binding 16 is not declared as support_buffer";
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(w, reason),
+                  variant == SUPPORT_ON_IMAGE ? "support reflection cannot own unnamed storage image" :
+                  variant == UNNAMED_SUPPORT_UBO ? "uniform block without the support name does not establish ownership" :
+                                                    "support name cannot turn a storage image into a uniform block");
+        } else if (variant != SAME_WORD && variant != MIXED_V1) {
+            const char *reason = variant == DUP_HALF ? "duplicate sampler half" :
+                    variant >= EXTRA_SAMPLER ? "binding 22 has no" :
+                    variant >= WRONG_SET ? "single combined image sampler at set 0 binding 10" : "no consumable guest source";
+            if (rc != S2A_LIBPACK_REJECT || j || !strstr(w, reason))
+                fprintf(stderr, "separate sampler variant %d returned %d: %s\n", variant, rc, w);
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(w, reason), "invalid separate sampler shape is rejected before assembly");
         } else {
             CHECK(rc == 0 && j, "separate-sampler pack yields a v1 program");
             CHECK(has(j, "\"kind\":\"texture\",\"stage\":\"fs\",\"set\":0,\"binding\":10,\"slot\":90"),
@@ -469,9 +614,65 @@ int main(void) {
             for (int i = 0; i < parsed.binding_count; i++) if (parsed.bindings[i].binding == 10) t10 = &parsed.bindings[i];
             CHECK(parsed_rc == 0 && t10 && t10->kind == 2 && t10->tex_slot == 128 && t10->samp_slot == -1,
                   "sep-tex + samp_tex：分离贴图槽 128、采样器取同字");
+            if (variant == MIXED_V1) {
+                int vs12 = 0;
+                for (int i = 0; i < parsed.binding_count; i++) vs12 += parsed.bindings[i].binding == 12;
+                CHECK(parsed_rc == 0 && has(j, "\"schema\":\"s2a-direct-program-v1\"") && !vs12,
+                      "legacy v1 mixed fixture retains its reflection-based behavior");
+            }
             nvn_vk_program_free(&parsed);
         }
         free(j); s2a_libpack_close(slp);
+        char path[400]; snprintf(path, sizeof path, "%s/lib.idx", g_dir); unlink(path);
+        snprintf(path, sizeof path, "%s/lib.000.pak", g_dir); unlink(path); rmdir(g_dir);
+        snprintf(g_dir, sizeof g_dir, "%s", tmpl);
+    }
+
+    // 计算着色器实际读取组合纹理与支撑缓冲，分别核对反射列出和缺席两种输入。
+    for (int variant = SUPPORT_FROM_SPV; variant <= SUPPORT_WRONG_OWNER; variant++) {
+        const uint8_t key[8] = { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+        char reflection[512];
+        snprintf(reflection, sizeof reflection,
+                 "{\"key\":\"c0c1c2c3c4c5c6c7_b\",\"stage\":\"cs\",\"dm_ctl\":\"c0c1c2c3c4c5c6c7\",\"bindings\":["
+                 "{\"msl_name\":\"cp_t_cb196610_1056805A\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+                 "{\"msl_name\":\"cp_t_cb196610_1056805ASmplr\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":2},"
+                 "{\"msl_name\":\"cp_i0\",\"kind\":\"img\",\"reg\":0,\"arg_id\":4}%s]}",
+                 variant == SUPPORT_FROM_SPV ? "" : variant == SUPPORT_LISTED ?
+                 ",{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":3}" :
+                 ",{\"msl_name\":\"cp_c3_wrong_owner\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":3}");
+        snprintf(g_dir, sizeof g_dir, "%s/v2cs%d", tmpl, variant);
+        CHECK(mkdir(g_dir, 0700) == 0, "create compute v2 pack directory");
+        size_t sizes[2] = { strlen(reflection), sizeof libpack_support_v2_comp_spv };
+        const uint8_t *payloads[2] = { (const uint8_t *)reflection, (const uint8_t *)libpack_support_v2_comp_spv };
+        struct trec records[2] = {
+            { .key = 0xc0c1c2c3c4c5c6c7, .kind = 1, .len = (uint32_t)sizes[0] },
+            { .key = 0xc0c1c2c3c4c5c6c7, .kind = 52, .len = (uint32_t)sizes[1] },
+        };
+        CHECK(mk_pack(records, 2, payloads, sizes, 1) == 0, "compute v2 pack written");
+        struct s2a_libpack *cl = NULL;
+        CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute v2 pack");
+        uint8_t *j = NULL; size_t jl = 0; char why[192] = "";
+        int rc = cl ? s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, &j, &jl, why, sizeof why) : -1;
+        if (variant == SUPPORT_WRONG_OWNER) {
+            CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(why, "binding 23 is owned by support_buffer"),
+                  "compute v2 rejects guest uniform ownership of support binding");
+        } else {
+            CHECK(rc == 0 && has(j, "\"schema\":\"s2a-direct-program-v2\""), "compute separate sampler produces a v2 program");
+            static struct nvn_vk_compute_program parsed;
+            int parsed_rc = j ? nvn_vk_program_parse_compute(j, jl, &parsed, why, sizeof why) : -1;
+            int support = 0, texture = 0;
+            for (int i = 0; !parsed_rc && i < parsed.binding_count; i++) {
+                const struct fd_binding *b = &parsed.bindings[i];
+                support += b->binding == 23 && b->is_support && b->set == 0 && b->count == 1;
+                texture += b->binding == 11 && b->tex_slot == 128 && b->samp_slot == 0;
+            }
+            if (parsed_rc) fprintf(stderr, "compute v2 support parse: %s\n", why);
+            CHECK(parsed_rc == 0 && texture == 1 && support == 1,
+                  variant == SUPPORT_LISTED ? "compute v2 explicit support is emitted once" :
+                           "compute v2 unlisted support is recovered from SPIR-V");
+            if (!parsed_rc) nvn_vk_program_free_compute(&parsed);
+        }
+        free(j); s2a_libpack_close(cl);
         char path[400]; snprintf(path, sizeof path, "%s/lib.idx", g_dir); unlink(path);
         snprintf(path, sizeof path, "%s/lib.000.pak", g_dir); unlink(path); rmdir(g_dir);
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);

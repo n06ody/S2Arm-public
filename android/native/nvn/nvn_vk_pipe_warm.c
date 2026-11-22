@@ -33,6 +33,7 @@ uint64_t nvn_gpu_pipe_warm_hits(void) __attribute__((weak));
 uint64_t nvn_gpu_pipe_warm_created(void) __attribute__((weak));
 uint64_t nvn_gpu_pipe_warm_tag(nvn_gpu_pipe p) __attribute__((weak));
 void nvn_gpu_pipe_warm_tag_set(nvn_gpu_pipe p, uint64_t tag) __attribute__((weak));
+uint32_t nvn_vk_pipe_trace_id(nvn_gpu_pipe p, unsigned *warm, uint32_t *key) __attribute__((weak));
 // 程序清单（nvn_vk_prog_warm.c）：随包种子的状态与「这个身份在不在程序清单里」。宿主单测只链本模块时没有它们 = 不读管线种子。
 int nvk_prog_warm_seed_dir(char *out, size_t n) __attribute__((weak));
 int nvk_prog_warm_contains(const uint8_t identity[32]) __attribute__((weak));
@@ -632,6 +633,41 @@ uint64_t nvk_pipe_warm_hash(const struct nvk_pipe_rec *rec) {
 
 void nvk_pipe_warm_test_hash_const(int on) { __atomic_store_n(&g_hash_const, on ? 1 : 0, __ATOMIC_RELEASE); }
 
+static void pw_trace_rec(const char *event, const struct nvk_pipe_rec *rec, uint32_t obj, unsigned warm, uint32_t key) {
+    if (rec->bytes != NVK_PW_DESC_BYTES) return;
+    const uint8_t *prog = rec->prog_identity;
+    char line[128];
+    snprintf(line, sizeof line, "%s recipe=%016llx prog=%02x%02x%02x%02x obj=%u key=%08x warm=%u",
+             event, (unsigned long long)nvk_pipe_warm_hash(rec), prog[0], prog[1], prog[2], prog[3], obj, key, warm);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "pipe-trace", line);
+}
+
+static void pw_trace_desc(const char *event, const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p) {
+    unsigned warm = 0;
+    uint32_t key = 0;
+    const uint32_t obj = nvn_vk_pipe_trace_id ? nvn_vk_pipe_trace_id(p, &warm, &key) : 0;
+    if (!obj) return;
+    struct nvk_pipe_rec rec;
+    nvk_pipe_warm_rec_of(d, ident, &rec);
+    pw_trace_rec(event, &rec, obj, warm, key);
+}
+
+void nvk_pipe_warm_trace_demand(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p) {
+    pw_trace_desc("demand", d, ident, p);
+}
+
+void nvk_pipe_warm_trace_wait(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], nvn_gpu_pipe p,
+                              uint64_t frame, uint64_t waited_ns, int result) {
+    if (!nvn_plat_flag("nvk_pipe_warm_trace", 0)) return;
+    struct nvk_pipe_rec rec;
+    nvk_pipe_warm_rec_of(d, ident, &rec);
+    const uint32_t obj = nvn_vk_pipe_trace_id ? nvn_vk_pipe_trace_id(p, NULL, NULL) : 0;
+    char line[144];
+    snprintf(line, sizeof line, "wait frame=%llu recipe=%016llx obj=%u rc=%d ms=%.1f",
+             (unsigned long long)frame, (unsigned long long)nvk_pipe_warm_hash(&rec), obj, result, (double)waited_ns / 1e6);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "pipe-trace", line);
+}
+
 // ---- note（提交线程；第一次见到一条管线才走完整路径，之后按管线标签只加计数，见 nvk_pipe_warm_note_prog） ----
 // 完整路径。*tag_out（可为 NULL）= 这份配方在清单里的标签；没收下（没身份 / nspec 非 0 / 分配失败）时给 0。
 static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint64_t *tag_out, int compute) {
@@ -714,6 +750,7 @@ int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p,
         const uint64_t t = nvn_gpu_pipe_warm_tag(np);
         if (t && pw_touch_tag(t, ident)) return 1;
     }
+    pw_trace_desc("acquire", d, ident, np);
     uint64_t tag = 0;
     pw_note(d, ident, &tag, p->is_compute != 0);
     if (np && tag && nvn_gpu_pipe_warm_tag_set) nvn_gpu_pipe_warm_tag_set(np, tag);
@@ -831,6 +868,10 @@ int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
         pw_log(1, "管线预热：nvn_gpu_pipe_get 失败（%d）：%s", (int)r.code, err.why);
         goto out;
     }
+    unsigned warm = 0;
+    uint32_t key = 0;
+    const uint32_t obj = nvn_vk_pipe_trace_id ? nvn_vk_pipe_trace_id(pipe, &warm, &key) : 0;
+    if (obj) pw_trace_rec("prebuild", rec, obj, warm, key);
     __atomic_fetch_add(&g.st.built, 1, __ATOMIC_RELAXED);
     rc = 0;
 out:
@@ -1104,7 +1145,7 @@ void nvk_pipe_warm_stats(struct nvk_pipe_warm_stats *out) {
     out->pending = g.plan_i < g.plan_n ? g.plan_n - g.plan_i : 0;
     out->rejected = g.st.rejected + g.save_fail;
     pthread_mutex_unlock(&g.mu);
-    out->draw_hits = nvn_gpu_pipe_warm_hits ? nvn_gpu_pipe_warm_hits() : 0;   // 转发后端：真实 draw 命中预建对象
+    out->draw_hits = nvn_gpu_pipe_warm_hits ? nvn_gpu_pipe_warm_hits() : 0;   // 转发后端：图形实际录制有效 draw；计算按首次取用
 }
 
 // 诊断读数（用例 / 调试用）：开关关着（或还没有 note 读过开关）时全 0。
