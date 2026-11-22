@@ -6,7 +6,7 @@
 //   （绑定号已按 arg_id×6+阶段号烘焙：vs 0 / gs 3 / ps 4 / cs 5，DshVk.BindToArgIds）。
 //   几何着色器没有 Metal 对应物：_vg<t>.json 是 DshVk.CompileGeometry 照 .spv 写的同格式反射，t = 输入图元（点 0 / 线 1 / 三角 3）。
 // 命中判据：键的 _b.json 与 _b.spv 都在、_b.json 的 dm_ctl == 键 hex、stage 是本段阶段、
-//   _b.spv 是合法 SPIR-V 头；合成的 s2a-direct-program-v1 字节再走 nvn_vk_first_draw 的
+//   _b.spv 是合法 SPIR-V 头；合成的 s2a-direct-program-v1/v2 字节再走 nvn_vk_first_draw 的
 //   parse_program 同一套接受——命中不等于可绘制（与 offline_library.h 同一口径）。
 // 计数口径：hit = 全部阶段都拿到并合成通过；miss = 包不在/键不在/缺 json 或 spv/
 //   程序含 vk 库不出的阶段（tcs/tes）/ 几何程序而设备没开 geometryShader 或输入图元没有那一份（邻接）；
@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 enum {
-    S2A_LIBPACK_HIT = 0,      // 全部阶段都有，v1 字节已合成
+    S2A_LIBPACK_HIT = 0,      // 全部阶段都有，程序字节已合成
     S2A_LIBPACK_MISS = 1,     // 容器不在、某键某段不在、或阶段在库外出路（tcs/tes、没开 geometryShader 的几何）
     S2A_LIBPACK_REJECT = -1,  // 找到了但不可接受：容器坏/段坏/json 坏/键不符/绑定种类译不出
     S2A_LIBPACK_INVALID = -2, // 调用方参数错
@@ -41,10 +41,10 @@ void s2a_libpack_close(struct s2a_libpack *lp);
 int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned kind,
                     uint8_t **bytes, size_t *len, char *why, size_t why_size);
 
-// 程序命中：keys[6][8] + stages 位图（vs+fs 0x3 或 vs+fs+gs 0x7）→ 合成的 s2a-direct-program-v1 字节（malloc，调用方 free）。
+// 程序命中：keys[6][8] + stages 位图（vs+fs 0x3 或 vs+fs+gs 0x7）→ 合成的 s2a-direct-program-v1/v2 字节（malloc，调用方 free）。
 //   每阶段取 _b.json + _b.spv：绑定号 = arg_id×6+阶段号（与 .spv 内烘焙的一致），kind 桶照
 //   _b.json 的语义种类译：cbuf→uniform、tex/samp_tex→texture、img→image、sbuf 系→storage、
-//   support→support(stage="program")；…Smplr / samp* 是组合纹理的采样器半边，v1 不出行；
+//   support→support(stage="program")；…Smplr / samp* 不另出描述符行。独立 c2 采样器按 v2 附在纹理的 samp_slot；
 //   宿主辅助（uvx/lb/ubolen/sbsize/geometry/drvcb/c1）→ uniform/storage 无 guest 槽。
 //   任一键缺段/坏段 → 整个程序 MISS/REJECT（半程序不命中）。identity 段由调用方给
 //   （direct_abi/profile_hash/translator_closure——与现编 request 同源）。
@@ -66,7 +66,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
 
-// 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1（malloc，调用方 free），
+// 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1/v2（malloc，调用方 free），
 //   按 nvn_vk_program_parse_compute 的合同合成：绑定号 = arg_id×6+5、每条 count 1、storage 带 cbSlot/cbOffset
 //   出处与 rw、c0 驱动常量段挂 slot 0；c0Reads / supportReads 写 null（_b.json 给不出，解析器认可的「未知」），
 //   hasUnalignedStorageBuffer 写 false（批翻链按缺省 false 翻）。返回码与计数口径同 program_v1。
