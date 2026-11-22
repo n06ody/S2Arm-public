@@ -26,6 +26,7 @@
 #include "direct/jv.h"
 #include "direct/program_cache.h"
 #include "nvn/nvn_vk_prog_warm.h"
+#include "libpack_vk.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：出包预编库目录 b-<链>-vk 与容器头的链号
 #include <sys/stat.h>
 #include "tbuf_spirv_fixtures.h"
@@ -1682,7 +1683,7 @@ static void link_refused_test(const char *root, uint8_t keys[3][8], char hex[3][
     unsetenv("S2A_PW_TEST_DIR");
 }
 
-static int gs_libpack_test(int diagnose_refusals) {
+static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
     fake_depth_clip = 1;   // 深度 near=-w 也能用预编库（libpack_state_ok），夹具不带深度零
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
@@ -1704,11 +1705,14 @@ static int gs_libpack_test(int diagnose_refusals) {
     static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u};
     static const uint32_t spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
     char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
+    // This fixture's stages have no storage operations. The new stage contract
+    // certifies that no window-mask constant is needed in these modules.
+    const char *window = ssbo_window ? ",\"ssbo_window_abi\":1" : "";
     char jvs[160], jfs[160], jg0[200], jg3[200];
-    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
-    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[1]);
-    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
-    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]%s}", hx[0], window);
+    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]%s}", hx[1], window);
+    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]%s}", hx[2], window);
+    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]%s}", hx[2], window);
     struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
         {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
         {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv0, sizeof spv0},
@@ -1823,6 +1827,58 @@ static int gs_libpack_test(int diagnose_refusals) {
         CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == 0, "libpack VS-only: the vertex stage is the library's");
         rp_S.bser[1] = fs_serial; rp_S.bser[2] = gs_serial;
     }
+    snprintf(external_profile, sizeof external_profile, "%s", prof_on);
+    // shape 0 = 顶点 + 片元 + 几何（只核准入）；shape 1 = 顶点 + 片元（还核预热：清单落盘读回后预热线程按记下的状态取库）
+    for (int shape = 0; shape <= 1; ++shape) {
+    gs_keys_ok = shape ? 3 : 7; gs_program.nstage = shape ? 2 : 3; gs_program.serial++; bind.serial = gs_program.serial;
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "graphics SSBO window fixture rebinds (shape %d)", shape);
+    for (int unaligned = 0; unaligned <= 1; ++unaligned) {
+        rp_shader_reset(); compiler_calls = 0;
+        rp_S.ssbo[0][0].addr = 0x10000u + 4u * unaligned;
+        rp_S.ssbo[0][0].size = 64;
+        struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+        // 夹具的现编替身只会出几何程序的结果：两段程序在旧库非对齐下走现编，只核「确实去现编了」，不要求解析成功
+        const int live_only = shape && unaligned && !ssbo_window;
+        CHECK((rp_shader_resolve(&q, &p) == 0 && p) || live_only, "graphics SSBO window fixture resolves (shape %d)", shape);
+        CHECK(compiler_calls == (unaligned && !ssbo_window),
+              "graphics SSBO window admission (shape %d ABI=%d unaligned=%d): live compile calls=%d",
+              shape, ssbo_window, unaligned, compiler_calls);
+        if (!shape || live_only) continue;
+        // 预热从库取：这笔真实解析记进清单的状态（lp_ok / 窗口合同标记）经落盘读回，预热线程按它取库，窗口库命中、不现编
+        // 清单目录：每个用例一个全新的临时目录（只在这一段设环境变量，别的用例仍然「不落盘」）
+        char wd[320]; snprintf(wd, sizeof wd, "%s/pw_ssbo.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        CHECK(mkdtemp(wd) != NULL, "graphics warm temp dir");
+        char md[360], cd[360]; snprintf(md, sizeof md, "%s/manifest", wd); snprintf(cd, sizeof cd, "%s/cache", wd); mkdir(md, 0700); mkdir(cd, 0700);
+        setenv("S2A_PW_TEST_DIR", md, 1); setenv("S2A_DIRECT_CACHE_DIR", cd, 1);
+        nvk_prog_warm_save();
+        CHECK(s2a_program_cache_drain(5000) == 0, "graphics warm manifest drains");
+        rp_shader_reset(); compiler_calls = 0;
+        struct nvk_prog_rec rec = {0};
+        const int loaded = nvk_prog_warm_load(), taken = nvk_prog_warm_take(&rec);
+        CHECK(loaded == 1 && taken == 1 && rec.stage_mask == 3,
+              "graphics warm manifest survives (ABI=%d unaligned=%d loaded=%d taken=%d mask=%u)", ssbo_window, unaligned, loaded, taken, (unsigned)rec.stage_mask);
+        CHECK(rec.lp_ok == (!unaligned || ssbo_window ? 2 : 0) && rec.lp_ssbo_window == (unaligned && ssbo_window),
+              "warm record state (ABI=%d unaligned=%d): lp_ok=%u window=%u", ssbo_window, unaligned, (unsigned)rec.lp_ok, (unsigned)rec.lp_ssbo_window);
+        const int built = nvk_prog_warm_build(&rec);
+        CHECK(built == 0 && compiler_calls == (unaligned && !ssbo_window),
+              "warm build (ABI=%d unaligned=%d): rc=%d live compile calls=%d", ssbo_window, unaligned, built, compiler_calls);
+        if (!unaligned && !ssbo_window) {
+            // 清单说「要窗口合同」而本局的库是旧库（没有合同）：预热必须不取库
+            struct nvk_prog_rec want_window = rec; want_window.lp_ssbo_window = 1;
+            const uint64_t h0 = s2a_libpack_hits();
+            rp_shader_reset(); compiler_calls = 0;
+            const int refused = nvk_prog_warm_build(&want_window);
+            CHECK(s2a_libpack_hits() == h0 && (refused != 0 || compiler_calls == 1u),
+                  "warm record wants the window contract, old library: library not used (rc=%d hits+%llu compiles=%d)", refused,
+                  (unsigned long long)(s2a_libpack_hits() - h0), compiler_calls);
+        }
+        nvk_prog_warm_reset();
+        unsetenv("S2A_PW_TEST_DIR"); unsetenv("S2A_DIRECT_CACHE_DIR");
+    }
+    }
+    gs_keys_ok = 7; gs_program.nstage = 3; gs_program.serial++; bind.serial = gs_program.serial;
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "graphics SSBO window fixture restores GS program");
+    memset(&rp_S.ssbo[0][0], 0, sizeof rp_S.ssbo[0][0]);
     {
         extern void nvk_shader_test_tally_line(char *out, size_t n);
         char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
@@ -2101,8 +2157,9 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
-    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0);
-    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1);
+    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
+    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
+    if (argc == 2 && !strcmp(argv[1], "--gs-libpack-ssbo")) return gs_libpack_test(0, 1);
     if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();

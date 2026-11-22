@@ -107,7 +107,7 @@ int s2a_pack_stage(const uint8_t key[8], unsigned nvn, int topo, uint64_t finger
   struct jw stages = {0}, binds = {0}, extra = {0};
   uint32_t mask = 0, support = 0;
   int sep = 0, v2 = 0, rc = -1;
-  int status = lp_stage_from_bytes(&scratch, key, nvn, nvn == 5, topo, UINT32_MAX, json, jn, copy,
+  int status = lp_stage_from_bytes(&scratch, key, nvn, nvn == 5, topo, UINT32_MAX, NULL, 1, json, jn, copy,
                                    sn, &stages, &binds, &sep, &mask, &support, &v2, &contract,
                                    choice[0].why, sizeof choice[0].why);
   if (status && !choice[0].why[0])
