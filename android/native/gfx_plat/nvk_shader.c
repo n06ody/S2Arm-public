@@ -1341,7 +1341,7 @@ struct stair_probe { uint64_t start, fetched; const char *format; };
 static _Atomic uint64_t stair_sequence;
 static uint64_t stair_us(void) {
     struct timespec t;
-#ifdef __ANDROID__
+#ifdef CLOCK_BOOTTIME
     clock_gettime(CLOCK_BOOTTIME, &t);
 #else
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -2616,14 +2616,19 @@ int rp_shader_lib_reject(const struct rp_prog *p) {
         p->identity[0], p->identity[1], p->identity[2], p->identity[3]); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b); }
     return 1;
 }
+// Retained Android shutdown keeps the replay objects alive. Emit once, only after
+// v5 has sealed and Stop has closed shader admission and drained the publishers.
+void nvk_shader_stair_cut(void) {
+    static _Atomic int emitted;
+    if (!nvn_plat_flag("nvk_libpack_timing", 0) || !shader_stopped() || nvk_shader_inflight()) return;
+    if (atomic_exchange(&emitted, 1)) return;
+    char line[144];
+    snprintf(line, sizeof line, "S2SB_CUT seq=%llu live=%llu time=%llu",
+             (unsigned long long)atomic_load(&stair_sequence), (unsigned long long)atomic_load(&stair_exec_count),
+             (unsigned long long)stair_us());
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
 void rp_shader_reset(void) {
-    if (nvn_plat_flag("nvk_libpack_timing", 0)) {
-        char summary[144];
-        snprintf(summary, sizeof summary, "S2SB_CUT seq=%llu live=%llu time=%llu",
-                 (unsigned long long)atomic_load(&stair_sequence), (unsigned long long)atomic_load(&stair_exec_count),
-                 (unsigned long long)stair_us());
-        nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", summary);
-    }
     fact_cache_reset();
     if (g_pool_programs || g_pool_request_rejected) pool_stats("reset");
     // 后台预热一律不得越过这一步进会话收尾：先有界静默（置位后后台不再发布），再释放。
