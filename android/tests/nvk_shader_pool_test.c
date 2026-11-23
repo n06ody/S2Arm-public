@@ -133,9 +133,11 @@ int nvn_plat_flag(const char *name, int dflt) {
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
-static int gfxr_lines; static char gfxr_text[520];   // 图形现编原因日志（nvk_hitch_log 开时每支现编程序一行）
+static int gfxr_lines; static char gfxr_text[520];
+static int win_hit_lines; static char win_hit_text[260];   // 「库命中（存储缓冲窗口变体）」逐条诊断行（nvk_hitch_log 开时）   // 图形现编原因日志（nvk_hitch_log 开时每支现编程序一行）
 void nvn_plat_log(int level, const char *cls, const char *text) {
     if (!strncmp(text, "S2SB_", 5) || !strncmp(text, "S2A_LIBPAIR ", 12)) puts(text);
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "库命中（存储缓冲窗口变体）")) { win_hit_lines++; snprintf(win_hit_text, sizeof win_hit_text, "%s", text); }
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "图形现编原因：")) { gfxr_lines++; snprintf(gfxr_text, sizeof gfxr_text, "%s", text); }
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
@@ -1861,6 +1863,20 @@ static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
         CHECK(compiler_calls == (unaligned && !ssbo_window),
               "graphics SSBO window admission (shape %d ABI=%d unaligned=%d): live compile calls=%d",
               shape, ssbo_window, unaligned, compiler_calls);
+        {   // 窗口变体的库命中逐条诊断：诊断属性开时，只有「非对齐 + 窗口库」那一档（真走了窗口变体库命中）打一行，对齐库命中 / 现编都不打
+            const int window_hit = unaligned && ssbo_window && !live_only;
+            CHECK(win_hit_lines == 0, "window hit log is silent while the diagnostic property is off (shape %d unaligned=%d): %d", shape, unaligned, win_hit_lines);
+            fixture_hitch_flag = 1; win_hit_lines = 0; win_hit_text[0] = 0; rp_shader_reset(); compiler_calls = 0; p = NULL;
+            int rc2 = rp_shader_resolve(&q, &p);
+            fixture_hitch_flag = 0;
+            CHECK((rc2 == 0 && p) || live_only, "graphics SSBO window fixture resolves again with the diagnostic property on (shape %d)", shape);
+            CHECK(win_hit_lines == (window_hit ? 1 : 0), "window-variant library hit log lines (shape %d ABI=%d unaligned=%d): %d", shape, ssbo_window, unaligned, win_hit_lines);
+            if (window_hit) {
+                CHECK(strstr(win_hit_text, "阶段 0x") != NULL && strstr(win_hit_text, "身份 ") != NULL && strstr(win_hit_text, "（提交）") != NULL && strstr(win_hit_text, "键 ") != NULL,
+                      "window hit line carries keys, stage mask, identity and the submit source: %s", win_hit_text);
+            }
+            win_hit_lines = 0;
+        }
         if (!shape || live_only) continue;
         // 预热从库取：这笔真实解析记进清单的状态（lp_ok / 窗口合同标记）经落盘读回，预热线程按它取库，窗口库命中、不现编
         // 清单目录：每个用例一个全新的临时目录（只在这一段设环境变量，别的用例仍然「不落盘」）

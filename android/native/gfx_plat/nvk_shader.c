@@ -1576,6 +1576,20 @@ static void libpack_mark_bad(const uint8_t identity[32]) {
         identity[0], identity[1], identity[2], identity[3]); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b); }
 }
 static void libpack_note_hit(void) { atomic_fetch_add(&g_n_libpack, 1); }
+// 存储缓冲窗口变体的库命中逐条记一行（nvk_hitch_log 开时、前 128 条）：键（逐阶段 8 字节）+ 阶段掩码 + 身份前 4 字节 + 来源（提交 / 预热）。
+//   9000 B 局发白（石阶 / 扶栏精确 ×2、8E 不发）时累计只给「命中 400」，没有逐键：对不上是哪几支材质程序走了窗口变体。
+static void libpack_window_note(const uint8_t identity[32], const uint8_t (*keys)[8], int nst, uint32_t stages, const char *who) {
+    static _Atomic unsigned said;
+    if (!nvn_plat_flag("nvk_hitch_log", 0) || atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 128) return;
+    char ks[64] = ""; size_t o = 0;
+    for (int st = 0; st < nst && st < 3; st++) {
+        for (int b = 0; b < 8 && o + 3 < sizeof ks; b++) o += (size_t)snprintf(ks + o, sizeof ks - o, "%02x", keys[st][b]);
+        if (st + 1 < nst && st + 1 < 3 && o + 1 < sizeof ks) ks[o++] = '/';
+    }
+    char b[200]; snprintf(b, sizeof b, "库命中（存储缓冲窗口变体）：键 %s 阶段 0x%x 身份 %02x%02x%02x%02x…（%s）", ks, (unsigned)stages,
+                          identity[0], identity[1], identity[2], identity[3], who);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b);
+}
 // 程序累计一行：出包预编 / 离线库 / 跨局缓存 / 现场编 合计第 1 个和每 50 个打一次（每发布一份新程序合计正好加 1）
 static void prog_tally_text(char *b, size_t bn) {
     int bo = snprintf(b, bn, "程序累计：出包预编（库%s）命中 %llu / 没有 %llu / 坏 %llu / 不可用 %llu（删 64 位能力声明 %llu）、离线库 %llu、跨局缓存 %llu、现场编 %llu、失败 %llu",
@@ -1879,7 +1893,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         if (le) { le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
         stair_end(&probe, "fg", s->identity, s->stages, le && !le->failed);
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed) { libpack_note_hit(); if (s->lp_state == LIBPACK_SSBO_WINDOW) libpack_window_note(s->identity, (const uint8_t (*)[8])s->keys, s->nst, s->stages, "提交"); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity);
         build_failed = 1;
@@ -2017,7 +2031,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         if (le) { if (!compute) le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
         stair_end(&probe, "warm", rec->identity, rec->stage_mask, le && !le->failed);
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed) { libpack_note_hit(); if (!compute && lp_state == LIBPACK_SSBO_WINDOW) libpack_window_note(rec->identity, (const uint8_t (*)[8])rec->keys, nst, rec->stage_mask, "预热"); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(rec->identity);
     } else stair_end(&probe, "warm", rec->identity, rec->stage_mask, 0);
