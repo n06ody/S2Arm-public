@@ -25,7 +25,12 @@ void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels
 nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
-int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+// vertex_cmd 仅供普通只读顶点输入；其余范围传 NULL，保留池镜像、显卡写别名和既有顺序。
+int rp_buf_resolve_multi(nvn_gpu_cmd vertex_cmd, int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+enum rp_index_span_result { RP_INDEX_SPAN_UNKNOWN, RP_INDEX_SPAN_GPU_ARGS, RP_INDEX_SPAN_BOUNDED };
+// 用同一份 CPU 参数决定索引范围和发间接绘制。只有 BOUNDED 会填 a 与 index_bytes。
+enum rp_index_span_result rp_buf_resolve_indexed(nvn_gpu_cmd c, uint64_t ind, uint64_t ibuf, uint32_t isz,
+                                                nvn_gpu_draw_args *a, uint64_t *index_bytes);
 // 回放窗口 = 一次提交的回放（nvn_be_sub_begin → nvn_be_sub_commit，开窗口的线程是回放线程）。窗口开着时别的线程销毁池（MapVirtual 改 run、MemoryPoolFinalize），
 // 镜像缓冲不当场放（回放线程手里可能已有 rp_buf_resolve 取到、后端还没 cmd_ref 的句柄），推迟到窗口收尾；窗口外或同线程销毁照旧当场放。
 void rp_buf_hold_begin(void);
@@ -129,6 +134,8 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_TEX_UNARMED,    // CPU 贴图上传时有页加保护没落地（被并发的解保护挡住）：这次上传不算同步，下一次必重传
        RP_PERF_TEX_EPOCH_MISS, RP_PERF_TEX_CHECK_PAGES,   // CPU 贴图内容检查：本可按纪元跳过却没跳成的次数（已传过、没待重传、有跟踪句柄，但全局写代号 / 段号 / 映射代际变了）；逐页比对写代号的页数（每次调 nvn_dirty_since 记整个范围的页数，是上限：遇到脏页会提前停）
        RP_PERF_BINST_HZ, RP_PERF_BINST_ONE, RP_PERF_BINST_CUT, RP_PERF_BINST_SCAN, RP_PERF_BINST_WASTE,   // 间接绘制 base instance 拷贝：批量前移供上的笔数 / 逐笔拷的笔数 / 其中为它收了开着的通道 / 前移扫描次数 / 前移了没用上的笔数（rp_draw.c 通道级批量拷）
+       RP_PERF_IND_INDEX_BOUNDED, RP_PERF_IND_INDEX_GPU, RP_PERF_IND_INDEX_GROUP, RP_PERF_IND_INDEX_UNKNOWN,
+       RP_PERF_IND_INDEX_OFF, RP_PERF_IND_INDEX_CUT, RP_PERF_IND_INDEX_BOUNDED_CUT,   // 通道内间接索引解析及对应切通道次数
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值
        RP_PERF_GW_REG_N, RP_PERF_GW_REG_KB, RP_PERF_GW_MERGED_N, RP_PERF_GW_MERGED_KB,   // 显卡写登记：收到的登记条数 / 千字节；同段合并掉的条数 / 因重叠省下的千字节（落地拷贝按合并后的条数算，见 rp_buf.c rp_buf_gpu_write_note2）
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
@@ -190,6 +197,9 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_strid
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
+struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
+void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里

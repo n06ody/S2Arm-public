@@ -101,6 +101,7 @@ final class GameLibrary {
                 try {
                     if (!selectedTitle.matches("[0-9A-F]{16}")) throw new IOException("invalid selected titleId");
                     long phase = GameFingerprint.Timing.start(timing);
+                    GameInstall.recoverBeforeOpen(gamesDir, selectedTitle);
                     BootContract.Game boot = BootContract.open(new File(gamesDir, selectedTitle));
                     GameFingerprint.Timing.end(timing, "library_open", phase);
                     if (!selectedTitle.equals(boot.titleId)) throw new IOException("selected game identity differs from the private revision");

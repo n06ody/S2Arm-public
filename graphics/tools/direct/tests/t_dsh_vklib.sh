@@ -46,7 +46,11 @@ C=$T/fpcopy; V=$C/graphics/tools/direct/vklib
 copy() { rm -rf "$C" && mkdir -p "$C/graphics/tools/direct/dsh/batch" "$C/graphics/metal" "$C/graphics/dsx" "$C/translator" "$C/graphics/third_party" && cp "$R/graphics/tools/direct/dsh/DshVk.cs" "$C/graphics/tools/direct/dsh/" \
   && cp "$R/graphics/tools/direct/dsh/batch/PkgRead.cs" "$R/graphics/tools/direct/dsh/batch/LibPack.cs" "$C/graphics/tools/direct/dsh/batch/" \
   && cp -R "$R/graphics/tools/direct/vklib" "$V" && rm -rf "$V/bin" "$V/obj" && cp "$R"/graphics/metal/gal_abi.h "$C/graphics/metal/" && cp "$R"/graphics/dsx/dsx_abi.h "$R"/graphics/dsx/gal_spvx.[ch] "$R"/graphics/dsx/gal_spill.[ch] "$R"/graphics/dsx/gal_colorround.[ch] "$C/graphics/dsx/" \
-  && cp "$R/translator/dmsh_chain.lock" "$C/translator/" && cp -R "$R/graphics/third_party/spirv_cross" "$C/graphics/third_party/" || red "拷不出指纹输入到 $C"; }
+  && cp "$R/translator/dmsh_chain.lock" "$C/translator/" && cp -R "$R/graphics/third_party/spirv_cross" "$C/graphics/third_party/" || red "拷不出指纹输入到 $C"
+  mkdir -p "$C/android/native/direct" "$C/android/native/nvn" "$C/graphics/nvn" &&
+    cp "$R"/android/native/direct/{libpack*.c,libpack*.h,libpack_stage*.inc,jv.*,json.*,spirv_workgroup.h,spirv_storage.h,graphics.h,s2a_direct.h,sha256.*} "$C/android/native/direct/" &&
+    cp "$R"/android/native/nvn/nvn_vk_program_result.* "$C/android/native/nvn/" &&
+    cp "$R/graphics/nvn/lib_pack_core.inc" "$C/graphics/nvn/" || red "拷不出 Vulkan 阶段格式输入"; }
 copy; ck "⑦ 同一份源码拷到别的目录 → 指纹相同" "$F0" "$(fp "$C")"
 for f in graphics/tools/direct/dsh/DshVk.cs graphics/tools/direct/dsh/batch/PkgRead.cs graphics/tools/direct/dsh/batch/LibPack.cs graphics/tools/direct/vklib/VkLib.cs graphics/tools/direct/vklib/VkFp.targets graphics/tools/direct/vklib/S2A.DshVkLib.csproj graphics/dsx/gal_spill.c translator/dmsh_chain.lock graphics/third_party/spirv_cross/spirv_msl.cpp; do
   copy; case $f in *.cs|*.c|*.cpp) echo '// x' >> "$C/$f";; *.lock) echo '# x' >> "$C/$f";; *) echo '<!-- x -->' >> "$C/$f";; esac
