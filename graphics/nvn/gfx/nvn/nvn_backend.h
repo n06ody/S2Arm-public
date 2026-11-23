@@ -559,6 +559,13 @@ uint64_t nvn_gpu_fence_done(void);     // 已完成到的值（只算已调完 d
 uint64_t nvn_gpu_fence_failed(void);   // 第一个失败段的 signal F，0 = 没有失败。线程：[任意]，acquire
 // 等时间线 ≥ v。timeout_ns = 0 纯查询、不产生副作用。返回 OK / NVN_GPU_E_TIMEOUT / NVN_GPU_E_FAILED（v ≥ F）/ NVN_GPU_E_DEVICE / NVN_GPU_E_ARG（v 从没提交过）。
 // 线程：[任意]，[回调] 里调返回 NVN_GPU_E_ORDER。
+// Optional backend diagnostic. The wait result and timeout contract match fence_wait.
+enum nvn_gpu_wait_site {
+    NVN_GPU_WAIT_OTHER, NVN_GPU_WAIT_FINISH, NVN_GPU_WAIT_SYNC,
+    NVN_GPU_WAIT_READ_PRIOR, NVN_GPU_WAIT_READ_COPY, NVN_GPU_WAIT_WSI_SLOT,
+    NVN_GPU_WAIT_WSI_DRAIN, NVN_GPU_WAIT_SITES
+};
+nvn_gpu_rc nvn_gpu_fence_wait_at(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err, enum nvn_gpu_wait_site site);
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err);
 
 // ---------- 上屏（定稿 A5 / A6 / #8） ----------

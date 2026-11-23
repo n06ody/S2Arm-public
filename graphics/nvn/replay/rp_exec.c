@@ -497,10 +497,16 @@ uint64_t nvn_be_finish_publish(void) {
 }
 // Finish 的等待单独记账：WAIT_* 记的是游戏主动等同步对象（nvnSyncWait 等），FINISH 记 QueueFinish。
 // 分开才知道每帧 27–38 毫秒的等围栏里各占多少——两条路的根治法不一样（见 nvn_be_finish_publish 的开关说明）。
+// 弱链接[replay]：nvn_gpu_fence_wait_at
+#pragma weak nvn_gpu_fence_wait_at
+nvn_gpu_rc rp_fence_wait_at(uint64_t v, uint64_t timeout, nvn_gpu_err *err, enum nvn_gpu_wait_site site) {
+    if (nvn_gpu_fence_wait_at) return nvn_gpu_fence_wait_at(v, timeout, err, site);
+    return nvn_gpu_fence_wait(v, timeout, err);
+}
 void nvn_be_finish_wait(uint64_t fence) {
     if (!fence) return;
     uint64_t t0 = now_ns();
-    nvn_gpu_rc r = nvn_gpu_fence_wait(fence, 5000000000ull, NULL);
+    nvn_gpu_rc r = rp_fence_wait_at(fence, 5000000000ull, NULL, NVN_GPU_WAIT_FINISH);
     { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_FIN_N, 1); pf_add(RP_PERF_WAIT_FIN_NS, w); fl_fence(w); }
     (void)r;   // 时间线已失败时这里也等不到：失败本身已在 sub_done 报红，Finish 不因此卡游戏线程
 }
@@ -537,7 +543,7 @@ int nvn_be_wait(uint64_t fence, uint64_t timeout_ns) {
             if (__atomic_load_n(&g_wait_effect_fence, __ATOMIC_ACQUIRE) > done) allow = 0;
             if (allow) { rp_buf_frame_flip(); uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); pf_add(RP_PERF_WAIT_FAKED_N, 1); fl_fence(w); return 1; }
         } }
-    nvn_gpu_rc r = nvn_gpu_fence_wait(fence, timeout_ns, NULL);
+    nvn_gpu_rc r = rp_fence_wait_at(fence, timeout_ns, NULL, NVN_GPU_WAIT_SYNC);
     __atomic_store_n(&g_wrote_since_wait, 0, __ATOMIC_RELEASE);   // 真等过：显卡写的缓冲已经落地
     { uint64_t w = now_ns() - t0; pf_add(RP_PERF_WAIT_NS, w); pf_add(RP_PERF_WAIT_N, 1); fl_fence(w); }
     // 时间线已失败：再等也不会完成。按「已结束」放行，让游戏线程不死等；失败本身已在 sub_done 报红

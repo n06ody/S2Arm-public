@@ -5,7 +5,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-size|--negative-zero|--negative-transform|--negative-revoke) ;; *) exit 64 ;; esac
+case "$mode" in ''|--gpu-idle|--negative-size|--negative-zero|--negative-transform|--negative-revoke) ;; *) exit 64 ;; esac
 out="$repo/build/vk-wsi-extent"
 mkdir -p "$out"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
@@ -23,7 +23,7 @@ for f in android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.
     src+=("$repo/$f")
 done
 binary="$out/test"; log="$out/run.log"
-if [ -n "$mode" ]; then
+if [[ "$mode" == --negative-* ]]; then
     python3 - "$repo/android/native/nvn" "$out" "$mode" <<'PY'
 import pathlib, sys
 root, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
@@ -65,10 +65,25 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 set +e
-timeout 120 "$binary" > "$log" 2>&1
+args=(); if [ "$mode" = --gpu-idle ]; then args+=(--gpu-idle); fi
+timeout 120 "$binary" "${args[@]}" > "$log" 2>&1
 rc=$?
 set -e
 if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-|fixture failure' "$log"; then cat "$log"; exit 1; fi
+if [ "$mode" = --gpu-idle ]; then
+    cat "$log"
+    [ "$rc" = 0 ] || exit "$rc"
+    python3 - "$log" <<'PYTEST'
+import pathlib, re, sys
+rows = [line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if 'GPU 空闲账' in line]
+def total(key):
+    return sum(int(re.search(r'\b' + key + r'=(\d+)', line)[1]) for line in rows)
+assert rows and all('bits=0 ' not in line for line in rows), rows
+assert [total(k) for k in ('samples', 'frames', 'missing', 'ambiguous', 'intra', 'inter')] == [4, 1, 0, 0, 2, 1], rows
+print('PASS GPU idle: 4 stamped submissions, 2 within-frame pairs and 1 after present')
+PYTEST
+    exit 0
+fi
 if [ -n "$mode" ]; then
     expected=2; names=(zero-extent zero-restore)
     if [ "$mode" = --negative-size ]; then expected=3; names=(undefined-resize clamped-resize fixed-resize); fi
