@@ -1524,6 +1524,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
             .topology = topology, .profile_json = pc->profile_json, .profile_bytes = pc->profile_bytes,
             .storage_alignment = caps.min_ssbo_align, .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,
             .window_used = &window_used,
+            .window_tex_classes = (uint32_t)nvn_plat_flag("nvk_libpack_win_tex", 0),
         };
         struct nvk_compute_profile_facts pf = {0};
         uint8_t keys[6][8] = {{0}};

@@ -935,10 +935,38 @@ static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract
     return 0;
 }
 
+// 片元模块的贴图声明类别（见 s2a_libpack_gfx.window_tex_classes）：1 阴影（深度 + 数组的 OpTypeImage，或任一带 Dref 的采样 / 取样）、2 = 3D、4 = Cube、8 = 都不是；
+//   不是片元入口的模块返回 0（不受限）。
+static uint32_t lp_spv_tex_classes(const uint8_t *spv, size_t n) {
+    const uint32_t *w = (const uint32_t *)spv;
+    const size_t nw = n / sizeof(*w);
+    uint32_t classes = 0;
+    int fragment = 0;
+    for (size_t i = 5; i < nw; ) {
+        const uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || wc > nw - i) break;
+        if (op == 15 && wc >= 2 && w[i + 1] == 4) fragment = 1;   // OpEntryPoint Fragment
+        else if (op == 25 && wc >= 9) {   // OpTypeImage：dim = w[3]（0 1D / 1 2D / 2 3D / 3 Cube）、depth = w[4]、arrayed = w[5]
+            if (w[i + 4] == 1 && w[i + 5] == 1) classes |= 1u;
+            if (w[i + 3] == 2) classes |= 2u;
+            if (w[i + 3] == 3) classes |= 4u;
+        } else if ((op >= 89 && op <= 94) || op == 97) classes |= 1u;   // OpImageSampleDref* / OpImageSampleProjDref* / OpImageDrefGather
+        i += wc;
+    }
+    return fragment ? (classes ? classes : 8u) : 0u;
+}
+
 static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx *gfx,
                            uint8_t *spv, size_t n, char *why, size_t cap) {
     if (window.mode > LP_WINDOW_MASK || (window.mode == LP_WINDOW_MASK) != (window.id != 0))
         return lp_fail(why, cap, "invalid SSBO window mode or mask");
+    if (gfx && gfx->require_ssbo_window && gfx->window_tex_classes) {
+        const uint32_t classes = lp_spv_tex_classes(spv, n);
+        if (classes && !(classes & gfx->window_tex_classes)) {
+            if (why && cap) snprintf(why, cap, "fragment texture classes outside the diagnostic window class set");
+            return S2A_LIBPACK_MISS;
+        }
+    }
     if (window.mode != LP_WINDOW_MASK) {
         if (!gfx || !gfx->require_ssbo_window) return 0;
         if (window.mode == LP_WINDOW_FIXED) return lp_fail(why, cap, "SBUFP uses a fixed SSBO window");

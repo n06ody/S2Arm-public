@@ -61,6 +61,9 @@ struct s2a_libpack_gfx {
     uint32_t storage_alignment;
     int require_ssbo_window;
     int *window_used;   // 非 NULL：任一阶段真应用了窗口掩码（合同 mode = MASK）时置 1（只写不读；调用方据此判断「程序用到窗口补偿」）
+    // 诊断：非对齐（require_ssbo_window）时只让片元贴图声明类别命中这个位集的程序走库，其余按 MISS 退现编（0 = 不限；非片元模块不受限）。
+    //   类别：1 = 阴影（深度数组采样器 / 带深度比较的采样），2 = 3D，4 = Cube，8 = 以上都不是（普通 2D 等）。只用于二分取库问题。
+    uint32_t window_tex_classes;
 };
 int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile_bytes);
 /* 能力核（见 .c）：删掉模块用不上的 Float64 / Int64 能力声明（本后端设备从不启用 shaderFloat64 / shaderInt64），
