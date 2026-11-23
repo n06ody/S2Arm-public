@@ -176,4 +176,21 @@ static void idle_complete(struct vk_segment *s, int success) {
         }
     }
     nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", msg);
+    if (g.land_cached) {
+        // 累计量由相邻窗口做差，与上面的有效落地字节口径相同。
+        pthread_mutex_lock(&g_mu);
+        snprintf(msg, sizeof msg, "缓存镜像累计 end_mono_ns=%llu "
+                 "flush_calls/payload/aligned/ms=%llu/%llu/%llu/%.3f "
+                 "invalidate_calls/payload/aligned/ms=%llu/%llu/%llu/%.3f wait_calls/ms=%llu/%.3f",
+                 (unsigned long long)now,
+                 (unsigned long long)g.stats[STAT_MIRROR_FLUSH_N],
+                 (unsigned long long)g.stats[STAT_MIRROR_FLUSH_PAYLOAD],
+                 (unsigned long long)g.stats[STAT_MIRROR_FLUSH_BYTES], g.stats[STAT_MIRROR_FLUSH_NS] / 1e6,
+                 (unsigned long long)g.stats[STAT_MIRROR_INV_N],
+                 (unsigned long long)g.stats[STAT_MIRROR_INV_PAYLOAD],
+                 (unsigned long long)g.stats[STAT_MIRROR_INV_BYTES], g.stats[STAT_MIRROR_INV_NS] / 1e6,
+                 (unsigned long long)g.stats[STAT_MIRROR_WAIT_N], g.stats[STAT_MIRROR_WAIT_NS] / 1e6);
+        pthread_mutex_unlock(&g_mu);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "land-cached", msg);
+    }
 }

@@ -54,7 +54,7 @@ static int g_memo_on = 1;        // 整套用例这一遍 nvk_desc_memo 的取�
 static int g_dq_dflt_seen = -1;     // 后端传给 nvn_plat_flag("nvk_dq", dflt) 的缺省值（C-DQ-DFLT 核它 = 1：两级回放缺省开）
 static int g_memo_dflt_seen = -1;   // 没设环境变量时后端传给 nvn_plat_flag("nvk_desc_memo", dflt) 的缺省值（C208 核它 = 1：缺省开）
 static int g_shown_timing_test;
-static int g_land_test_on;
+static int g_land_test_on, g_land_cached_test_on;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
 static int g_compute_warm = -1;
@@ -76,6 +76,7 @@ static int g_pool_rec_flag = -1;    // 整池组回收 nvk_pool_rec：-1 = 后�
 static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的备忘用例用；后端每 256 次绑定重读，改完调 nvn_gpu_vk_test_pool_memo_refresh 立即作废缓存）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return g_land_test_on;
+    if (!strcmp(name, "nvk_land_cached") && g_land_cached_test_on) return 1;
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_pool_rec") && g_pool_rec_flag >= 0) return g_pool_rec_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
@@ -11115,6 +11116,131 @@ static void test_land_readback(int fail_invalidate, int automatic) {
     nvn_gpu_vk_test_land_gate(NULL);
     g_land_test_on = 0;
 }
+
+struct cached_land_result {
+    nvn_gpu_buf mirror;
+    atomic_int entered, release;
+    uint32_t status;
+    uint8_t landed[3];
+};
+
+static void cached_land_done(void *user, const nvn_gpu_done *done) {
+    struct cached_land_result *result = user;
+    result->status = done->status;
+    atomic_store(&result->entered, 1);
+    if (done->status == NVN_GPU_DONE_FAILED) return;
+    for (int i = 0; i < 500 && !atomic_load(&result->release); i++) sleep_ms(10);
+    const uint8_t *p = nvn_gpu_buf_cpu(result->mirror);
+    result->landed[0] = p[0];
+    result->landed[1] = p[8];
+    result->landed[2] = p[63];
+}
+
+struct cached_land_submit {
+    nvn_gpu_cmd cmd;
+    nvn_gpu_rc rc;
+    atomic_int returned;
+};
+
+static void *cached_land_submit_next(void *arg) {
+    struct cached_land_submit *next = arg;
+    next->rc = nvn_gpu_cmd_commit(next->cmd, 2, on_done, NULL, NULL);
+    atomic_store(&next->returned, 1);
+    return NULL;
+}
+
+struct cached_land_stats { uint64_t wait, invalidate, flush, stage; };
+static void cached_land_stat(void *user, const char *name, uint64_t n) {
+    struct cached_land_stats *s = user;
+    if (!strcmp(name, "mirror_wait_calls")) s->wait = n;
+    if (!strcmp(name, "mirror_invalidate_calls")) s->invalidate = n;
+    if (!strcmp(name, "mirror_flush_calls")) s->flush = n;
+    if (!strcmp(name, "land_staged_bytes")) s->stage = n;
+}
+static struct cached_land_stats cached_land_stats(void) {
+    struct cached_land_stats s = {0};
+    nvn_gpu_stats(cached_land_stat, &s, 0);
+    return s;
+}
+static VkResult cached_land_fail_invalidate(uint64_t signal) {
+    return signal == 1 ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+}
+
+static void test_land_cached_mirror(int fail_invalidate) {
+    // 手头 ICD 常只有 coherent。保留真 Vulkan 设备、类型号与内存对象，只在后端挑选用的
+    // 类型表上屏蔽 coherent，验证真实 fence、范围合法性与跨段等待。非一致旧值另由宿主夹具模拟。
+    struct s2a_vk_device dev = g_dev;
+    const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    for (uint32_t i = 0; i < dev.memory.memoryTypeCount; i++)
+        if ((dev.memory.memoryTypes[i].propertyFlags & cached) == cached)
+            dev.memory.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "cached-land"};
+    nvn_gpu_err err = {0};
+    g_land_cached_test_on = 1;
+    const nvn_gpu_rc opened = nvn_gpu_open(&desc, &err);
+    g_land_cached_test_on = 0;
+    CHECK(OK(opened), "cached land: open %s", err.why);
+    if (!OK(opened)) return;
+
+    uint8_t init[128] = {0};
+    nvn_gpu_buf mirror = make_buf(sizeof init, NVN_GPU_MEM_POOL_MIRROR, init);
+    CHECK(mirror && nvn_gpu_mirror_state(mirror) == NVN_GPU_MIRROR_CPU_IDLE &&
+          nvn_gpu_mirror_visibility_enabled(), "cached land: compatible cached-only mirror required");
+    if (!mirror || !nvn_gpu_mirror_visibility_enabled()) goto close;
+    nvn_gpu_buf_cpu(mirror)[63] = 0x9a;
+    CHECK(nvn_gpu_mirror_flush(mirror, 63, 1), "cached land: flush unaligned byte");
+    nvn_gpu_cmd cmd = begin_cmd();
+    nvn_gpu_fill_buf(cmd, mirror, 0, 4, 0x11111111);
+    nvn_gpu_fill_buf(cmd, mirror, 8, 4, 0x33333333);
+    nvn_gpu_readback_span spans[] = {{mirror, 0, 4, UINT64_MAX}, {mirror, 8, 4, UINT64_MAX}};
+    nvn_gpu_mirror_visibility_record(cmd, spans, 2);
+    struct cached_land_result result = {.mirror = mirror};
+    if (fail_invalidate) nvn_gpu_vk_test_land_gate(cached_land_fail_invalidate);
+    CHECK(OK(nvn_gpu_cmd_commit(cmd, 1, cached_land_done, &result, &err)), "cached land: submit %s", err.why);
+    if (fail_invalidate) {
+        CHECK(nvn_gpu_fence_wait(1, 5000000000ull, &err).code == NVN_GPU_E_FAILED &&
+              !nvn_gpu_fence_done(), "cached land: failed invalidate must never publish success");
+        atomic_store(&result.release, 1);
+        nvn_gpu_buf_release(mirror, NULL, NULL);
+        mirror = NULL;
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "cached land: close failure %s", err.why);
+        CHECK(atomic_load(&result.entered) && result.status == NVN_GPU_DONE_FAILED,
+              "cached land: only FAILED callback on invalidate failure");
+        nvn_gpu_vk_test_land_gate(NULL);
+        return;
+    }
+
+    for (int i = 0; i < 200 && !atomic_load(&result.entered); i++) sleep_ms(10);
+    CHECK(atomic_load(&result.entered) && !nvn_gpu_fence_done() &&
+          nvn_gpu_mirror_state(mirror) == NVN_GPU_MIRROR_GPU_BUSY,
+          "cached land: source remains busy through host callback");
+    struct cached_land_submit next = {.cmd = begin_cmd()};
+    nvn_gpu_fill_buf(next.cmd, mirror, 4, 4, 0x55555555);   // 与回写字节不相交，但同属一颗原子
+    pthread_t thread;
+    const int started = pthread_create(&thread, NULL, cached_land_submit_next, &next) == 0;
+    CHECK(started, "cached land: next commit thread");
+    if (started) {
+        for (int i = 0; i < 200 && !cached_land_stats().wait && !atomic_load(&next.returned); i++) sleep_ms(10);
+        CHECK(cached_land_stats().wait == 1 && !atomic_load(&next.returned) &&
+              nvn_gpu_fence_wait(2, 0, NULL).code == NVN_GPU_E_ARG,
+              "cached land: next generation must wait before queuing same-atom work");
+    } else nvn_gpu_cmd_abort(next.cmd);
+    atomic_store(&result.release, 1);
+    if (started) {
+        pthread_join(thread, NULL);
+        CHECK(OK(next.rc) && OK(nvn_gpu_fence_wait(2, 5000000000ull, &err)),
+              "cached land: next generation executes after host callback");
+    }
+    const struct cached_land_stats stats = cached_land_stats();
+    CHECK(result.status == NVN_GPU_DONE_OK && result.landed[0] == 0x11 && result.landed[1] == 0x33 &&
+          result.landed[2] == 0x9a, "cached land: landed bytes and flushed neighbor");
+    CHECK(stats.invalidate == 1 && stats.flush == 1 && stats.stage == 0,
+          "cached land: expected one flush, one merged invalidate and zero staged DMA bytes");
+close:
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "cached land: close %s", err.why);
+}
+
 #endif
 
 int main(int argc, char **argv) {
@@ -11161,6 +11287,8 @@ int main(int argc, char **argv) {
         test_land_readback(1,0);
         test_land_readback(0,1);
         test_land_readback(1,1);
+        test_land_cached_mirror(0);
+        test_land_cached_mirror(1);
         printf("LAND_READBACK valid and invalidated paths: failures=%d\n", g_fail);
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
@@ -11794,6 +11922,8 @@ int main(int argc, char **argv) {
     test_land_readback(1,0);
     test_land_readback(0,1);
     test_land_readback(1,1);
+    test_land_cached_mirror(0);
+    test_land_cached_mirror(1);
 #endif
     // C201：整套用例都在 nvk_fbdrop=2（自检档）下跑，视图销毁走快路之后每次再全表扫一遍；反查表漏记过的帧缓冲会在这里留下残留计数。
     CHECK(nvn_vk_dbg_view_stat(3) == 0, "C201 整套用例在自检档下跑完：视图销毁后帧缓冲缓存里扫到的残留期望 0 → %llu", (unsigned long long)nvn_vk_dbg_view_stat(3));

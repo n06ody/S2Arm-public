@@ -20,6 +20,12 @@
 #include <stdio.h>
 #include <string.h>
 
+int nvn_gpu_mirror_state(nvn_gpu_buf b) __attribute__((weak));
+int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_state
+// 弱链接[replay]：nvn_gpu_mirror_flush
+
+
 struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
@@ -165,7 +171,7 @@ static void log_drop(struct mirror *m) { free(m->stale); free(m->stale_sum); m->
 static int mirror_make(struct shadow *s, int i) {
     struct mirror *m = &s->m[i];
     nvn_gpu_buf b = NULL; nvn_gpu_err err = {0};
-    if (!nvn_gpu_ok(nvn_gpu_buf_create(s->size, NVN_GPU_MEM_SHARED, NULL, &b, &err))) {
+    if (!nvn_gpu_ok(nvn_gpu_buf_create(s->size, NVN_GPU_MEM_POOL_MIRROR, NULL, &b, &err))) {
         // 完整原因：池大小、申请字节、单次分配上限、SSBO 范围上限、错误码、后端原文。按池大小去重（同一池每笔都会走到这里）。
         nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
         static uint64_t said_size[8]; static int nsaid;
@@ -281,7 +287,7 @@ static int gw_covers_page(const struct shadow *s, int mi, uint64_t k, size_t ps,
 }
 // 把游戏内存的 [a, b)（池内偏移）传进镜像，绕开 GPU 写过、还没回写落地的那些段：
 // 那些字节镜像里的才是新的，游戏内存里是旧的（同步按页，一页里别的字节脏了不能连它一起盖回去）。
-static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct mirror *m, uint64_t a, uint64_t b) {   // direct 非空：直接写进镜像的 CPU 映射（见 rp_buf_resolve）
+static int sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct mirror *m, uint64_t a, uint64_t b, int flush) {   // direct 非空：直接写进镜像的 CPU 映射（见 rp_buf_resolve）
     while (a < b) {
         uint64_t stop = b, skip_to = 0;   // 找起点落在 [a, b) 里最靠前的一段；a 本身在某段里就先跳过去
         int inside = 0;
@@ -289,10 +295,14 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
-        if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
+        if (direct) {
+            memcpy(direct + a, s->mem + a, (size_t)(stop - a));
+            if (flush && !nvn_gpu_mirror_flush(m->buf, a, stop - a)) return 0;
+        }
         else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
         a = stop;
     }
+    return 1;
 }
 
 // GPU 往池里写（计算着色器写存储缓冲）。提交线程登记这一段，返回登记号；段完成时 rp_buf_gpu_write_land 把结果拷回游戏内存、撤掉登记。
@@ -369,6 +379,43 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
     pthread_mutex_unlock(&g_bmu);
     return hit;
 }
+// UBO 间接指针可能尚未经有序上传进入镜像。对非一致镜像从游戏内存取真值，
+// 先等早先提交的写落地。在本提交中由 GPU 刚生成、尚未落地的指针明确拒绝。
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value) {
+    if (!nvn_gpu_mirror_state || nvn_gpu_mirror_state(b) == NVN_GPU_MIRROR_COHERENT) {
+        const uint8_t *cpu = nvn_gpu_buf_cpu(b);
+        if (!cpu) return 0;
+        memcpy(value, cpu + off, sizeof *value);
+        return 1;
+    }
+
+    const uint8_t *mem; uint64_t size;
+    if (!rp_pool_find(addr, sizeof *value, &mem, &size)) return 0;
+    const uint64_t key = (uint64_t)(uintptr_t)mem;
+    const uint64_t src_off = addr - key;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint64_t fence = 0;
+        pthread_mutex_lock(&g_bmu);
+        struct shadow *s = nvn_hm_get(&g_shadow, &key);
+        int hit = 0;
+        for (int i = 0; s && i < s->ngw; i++) {
+            const struct gpu_write *w = &s->gw[i];
+            if (w->off >= src_off + sizeof *value || src_off >= w->off + w->len) continue;
+            hit = 1;
+            if (w->sub == rp_sub_serial()) { fence = 0; break; }
+            const struct mirror *m = &s->m[w->mi];
+            const uint64_t f = m->use_sub == rp_sub_serial() ? m->prev_fence : m->use_fence;
+            if (f > fence) fence = f;
+        }
+        const int found = s != NULL;
+        if (found && !hit) memcpy(value, mem + src_off, sizeof *value);
+        pthread_mutex_unlock(&g_bmu);
+        if (!hit) return found;
+        if (!fence || attempt || !nvn_gpu_ok(nvn_gpu_fence_wait(fence, 5000000000ull, NULL))) return 0;
+    }
+    return 0;
+}
+
 // 在途可以用多个登记的并集盖住一页，撤掉其中任一段就要重新检查。池首尾的半个宿主页也可能在途免同步。
 static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
     struct mirror *m = &s->m[mi];
@@ -469,7 +516,7 @@ static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
 // 逐段各抢一次全局锁时「找池取镜像」在重叠档读到 13.7–16.6 毫秒/帧（5627 次、每次约 2.4 微秒）——
 // 大头是这把锁与完成线程（落地 GPU 写）互抢，所以另给批量入口，一笔绘制只抢一次。
 // 把第 i..j 页（池内页号，含）这一串从游戏内存同步进镜像：先保护、取代号、再读；记下同步代号与所在提交（两条核对路共用）。
-static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
+static inline int sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
         const size_t ps = nvn_dirty_page_size();
         uintptr_t a = s->page0 + (uintptr_t)(i * ps), b = s->page0 + (uintptr_t)((j + 1) * ps);   // 这一串脏页，裁到池的范围
         if (a < (uintptr_t)mem) a = (uintptr_t)mem;
@@ -482,16 +529,29 @@ static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_
         int landing_hit = s->landing > s->nlr;   // 这一段里有没有正在锁外拷回的区间与 [a,b) 相交：有就只能退回录拷贝
         if (!landing_hit && s->nlr) { const uint64_t ra = a - (uintptr_t)mem, rb = b - (uintptr_t)mem;
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
+        int state = NVN_GPU_MIRROR_COHERENT;
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
-        if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        if (d && nvn_gpu_mirror_state) {
+            state = nvn_gpu_mirror_state(m->buf);
+            // 非一致的 flush 会访问整颗原子。尚有写回登记时，不在 CPU 上改这份映射。
+            if (state != NVN_GPU_MIRROR_COHERENT && (state == NVN_GPU_MIRROR_GPU_BUSY || s->ngw || !nvn_gpu_mirror_flush)) d = NULL;
+        }
+        const uint64_t lo = a - (uintptr_t)mem, hi = b - (uintptr_t)mem;
+        if (d) {
+            if (!sync_write(NULL, d, s, m, lo, hi, state == NVN_GPU_MIRROR_CPU_IDLE)) return 0;
+            last = rp_sub_serial();
+            rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024);
+        } else {
+            nvn_gpu_cmd xc = rp_xfer_cmd(&last);
+            if (!xc || !sync_write(xc, NULL, s, m, lo, hi, 0)) return 0;
+        }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
+        return 1;
 }
-static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
+static inline int sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
     if (!s->ngw || !land_noresync_on()) {
-        sync_cpu_run(s, m, mem, size, i, j);
-        return;
+        return sync_cpu_run(s, m, mem, size, i, j);
     }
     const size_t ps = nvn_dirty_page_size();
     const int mi = (int)(m - s->m);
@@ -508,9 +568,10 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         }
         const uint64_t first = k++;
         while (k <= j && !gw_covers_page(s, mi, k, ps, &bytes)) k++;
-        sync_cpu_run(s, m, mem, size, first, k - 1);
+        if (!sync_cpu_run(s, m, mem, size, first, k - 1)) return 0;
     }
     if (skipped) rp_perf_add(RP_PERF_BUF_SYNC_GW_KB, skipped / 1024);
+    return 1;
 }
 static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, int count_resolve);
 // 脏页追加日志这条路的解析（见 log_arm 一节）：不逐页比代号，只灌新事件、在旧页位图里求交。
@@ -536,7 +597,7 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
         while (bits) {   // 字内连续的旧页成一串同步
             const uint64_t i = (w << 6) + (uint64_t)__builtin_ctzll(bits);
             uint64_t j = i; while (j + 1 <= q && j + 1 < ((w + 1) << 6) && (bits >> ((j + 1) & 63) & 1)) j++;
-            sync_run(s, m, mem, size, i, j);
+            if (!sync_run(s, m, mem, size, i, j)) return 0;
             pages += j - i + 1;
             for (uint64_t k = i; k <= j; k++) {   // 此刻只读的页才清：之后的写必然进日志；被并发解保护挡住的页留着，下次再同步
                 bits &= ~(1ull << (k & 63));
@@ -578,7 +639,10 @@ static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, 
     for (uint64_t i = p; i <= q;) {
         if (page_fresh(s, m, i, tracked, gens, p, sub0)) { i++; continue; }
         uint64_t j = i; while (j + 1 <= q && !page_fresh(s, m, j + 1, tracked, gens, p, sub0)) j++;
-        sync_run(s, m, mem, size, i, j);
+        if (!sync_run(s, m, mem, size, i, j)) {
+            if (gens != stack) free(gens);
+            return 0;
+        }
         synced_pages += j - i + 1;
         i = j + 1;
     }
