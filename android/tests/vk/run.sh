@@ -363,12 +363,13 @@ bc_src=("$repo/android/tests/vk/t_bc_decode.c"
 # 与发行 APK 同一组建设备规则（android/CMakeLists.txt 的 nvn_vk 后端定义此宏）。
 cflags=(-D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
 if [[ "$mode" == --gpu-deswizzle* ]]; then cflags+=(-DS2A_GPU_DESWIZZLE_TEST=1); fi
+cflags+=(-DS2A_LAND_READBACK_TEST=1)
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
     --pipe-call-lifetime) cflags+=(-DS2A_BACKEND_PIPE_CALL_TEST=1) ;;
-    ""|--pipe-creation-feedback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--pipe-creation-feedback|--land-readback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -583,6 +584,17 @@ if [[ "$mode" == --pipe-creation-feedback* ]]; then
     exit "$rc"
 fi
 
+if [ "$mode" = "--land-readback" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        timeout 60 "$out/t_backend_vk" "$out/shaders" --land-readback 2>&1 | tee "$out/land-readback-dq${dq}.log"
+        if grep -Eq 'Validation Error|SYNC-HAZARD|VUID-' "$out/land-readback-dq${dq}.log"; then
+            echo "【红】回写暂存（录制队列 ${dq}）校验层报错"
+            exit 1
+        fi
+    done
+    exit 0
+fi
 if [ "$mode" = "--high-binding" ]; then
     timeout 120 "$out/t_backend_vk" "$out/shaders" --high-binding 2>&1 | tee "$out/high-binding.log"
     if ! grep -q 'HIGH_BINDING failures=0' "$out/high-binding.log" || grep -Eq 'Validation Error|VUID-' "$out/high-binding.log"; then

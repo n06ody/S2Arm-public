@@ -61,7 +61,7 @@ def main():
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
-                  '--live-compile-stop', '--cs-libpack')
+                  '--live-compile-stop', '--cs-libpack', '--tally')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout)
@@ -95,6 +95,13 @@ def main():
              '--live-compile-thread', 'compute first use publishes the real compiled program'),
             ('pending-marked-failed', '        return LIVE_PENDING;', '        return LIVE_ABORT;',
              '--live-compile-pending', 'exhausted safe budget must defer'),
+            # 程序累计行的节拍：停局那一行不许依赖「有变化」、定时那一行不许无视 5 秒节拍、计算现编必须计进计算分项
+            ('tally-stop-needs-change', '    if (!force) {\n        uint64_t last = atomic_load(&g_tally_last_ns);', '    if (1) {\n        uint64_t last = atomic_load(&g_tally_last_ns);',
+             '--tally', 'zero programs: the stop line is printed anyway'),
+            ('tally-no-period', '        if (last && now - last < TALLY_PERIOD_NS) return 0;', '',
+             '--tally', 'inside the 5 s period: no second line'),
+            ('tally-compute-uncounted', '            atomic_fetch_add_explicit(&g_n_compiled_cs, 1, memory_order_relaxed);\n            prog_tally_log();', '            prog_tally_log();',
+             '--cs-libpack', 'a live-compiled compute program is counted in the compute part of the tally'),
         ]
         for name, old, new, mode, expected in mutants:
             assert text.count(old) == 1, (name, 'mutation anchor')
