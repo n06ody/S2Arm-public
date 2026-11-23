@@ -173,9 +173,11 @@ static void borrow_log(int level, const char *phase, const struct borrow_snap *s
 }
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
-static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
-static _Atomic uint64_t g_n_compiled_cs, g_n_failed_cs;   // 计算的现编 / 失败各自计数（总数 g_n_compiled / g_n_failed 含计算；图形 = 总数 − 计算）
-uint64_t nvk_shader_live_compile_total(void) { return atomic_load_explicit(&g_n_compiled,memory_order_relaxed); }
+static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled_gfx, g_n_failed_gfx;
+static _Atomic uint64_t g_n_compiled_cs, g_n_failed_cs;
+uint64_t nvk_shader_live_compile_total(void) {
+    return atomic_load(&g_n_compiled_gfx) + atomic_load(&g_n_compiled_cs);
+}
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
     pthread_mutex_lock(&g_progs_mu);
@@ -1456,14 +1458,16 @@ static void libpack_mark_bad(const uint8_t identity[32], const uint8_t *ckey) {
 static void libpack_note_hit(void) { atomic_fetch_add(&g_n_libpack, 1); }
 // 程序累计一行：出包预编 / 离线库 / 跨局缓存 / 现场编 合计第 1 个和每 50 个打一次（每发布一份新程序合计正好加 1）
 static void prog_tally_text(char *b, size_t bn) {
+    // 一次现编只更新所属阶段。总数和分项复用本行读到的四个值。
+    const uint64_t gfx = atomic_load(&g_n_compiled_gfx), cs = atomic_load(&g_n_compiled_cs);
+    const uint64_t gfx_failed = atomic_load(&g_n_failed_gfx), cs_failed = atomic_load(&g_n_failed_cs);
     int bo = snprintf(b, bn, "程序累计：出包预编（库%s）命中 %llu / 没有 %llu / 坏 %llu / 不可用 %llu（删 64 位能力声明 %llu）、离线库 %llu、跨局缓存 %llu、现场编 %llu、失败 %llu",
         k_lp_state[atomic_load(&g_lp_state)], (unsigned long long)atomic_load(&g_n_libpack), (unsigned long long)s2a_libpack_misses(), (unsigned long long)s2a_libpack_rejects(),
         (unsigned long long)atomic_load(&g_n_libpack_bad), (unsigned long long)s2a_libpack_caps_stripped(), (unsigned long long)atomic_load(&g_n_offline), (unsigned long long)atomic_load(&g_n_cache),
-        (unsigned long long)atomic_load(&g_n_compiled), (unsigned long long)atomic_load(&g_n_failed));
+        (unsigned long long)(gfx + cs), (unsigned long long)(gfx_failed + cs_failed));
     if (bo > 0 && (size_t)bo < bn) {   // 现编 / 失败的图形、计算分项（总数仍是上面那两个数，已有读法不变）
-        const uint64_t c = atomic_load(&g_n_compiled), cc = atomic_load(&g_n_compiled_cs), f = atomic_load(&g_n_failed), fc = atomic_load(&g_n_failed_cs);
         const int n2 = snprintf(b + bo, bn - (size_t)bo, "；现编分项 图形 %llu / 计算 %llu；失败分项 图形 %llu / 计算 %llu",
-            (unsigned long long)(c - cc), (unsigned long long)cc, (unsigned long long)(f - fc), (unsigned long long)fc);
+            (unsigned long long)gfx, (unsigned long long)cs, (unsigned long long)gfx_failed, (unsigned long long)cs_failed);
         if (n2 > 0 && (size_t)n2 < bn - (size_t)bo) bo += n2;
     }
     if (alias_on() && bo > 0 && (size_t)bo < bn) {   // 结果合并读数（开着才出）
@@ -1481,7 +1485,7 @@ static _Atomic uint64_t g_tally_last_ns, g_tally_last_sig;
 static uint64_t prog_tally_sig(void) {
     uint64_t sig = 0x9e3779b97f4a7c15ull;
     const uint64_t v[] = { atomic_load(&g_n_libpack), s2a_libpack_misses(), s2a_libpack_rejects(), atomic_load(&g_n_libpack_bad), atomic_load(&g_n_offline),
-                           atomic_load(&g_n_cache), atomic_load(&g_n_compiled), atomic_load(&g_n_compiled_cs), atomic_load(&g_n_failed), atomic_load(&g_n_failed_cs),
+                           atomic_load(&g_n_cache), atomic_load(&g_n_compiled_gfx), atomic_load(&g_n_compiled_cs), atomic_load(&g_n_failed_gfx), atomic_load(&g_n_failed_cs),
                            atomic_load(&g_n_alias_fg), atomic_load(&g_n_alias_bg) };
     for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) sig = (sig ^ v[i]) * 0x100000001b3ull;
     return sig | 1u;   // 非 0：0 留给「还没打过」
@@ -1506,8 +1510,8 @@ int nvk_shader_test_tally_tick(uint64_t now, int force) { return prog_tally_tick
 static void prog_tally_rearm(void) { atomic_store(&g_tally_last_ns, 0); atomic_store(&g_tally_last_sig, prog_tally_sig()); }   // 新一局重新起节拍：「有变化」按本局开头的计数算
 void nvk_shader_test_tally_reset(void) { prog_tally_rearm(); }
 void nvk_shader_test_tally_add(int compute, int failed) {   // 与生产同一组计数器：failed = 1 记失败，否则记现编；compute 记计算分项
-    atomic_fetch_add(failed ? &g_n_failed : &g_n_compiled, 1);
     if (compute) atomic_fetch_add(failed ? &g_n_failed_cs : &g_n_compiled_cs, 1);
+    else atomic_fetch_add(failed ? &g_n_failed_gfx : &g_n_compiled_gfx, 1);
 }
 // 测试读数：当下的「程序累计」行（不受每 50 个打一次的节拍限制）；结果合并读头的三个计数（读头 / 没有缓存文件 / 缓存文件坏）
 void nvk_shader_test_tally_line(char *out, size_t n) { if (out && n) prog_tally_text(out, n); }
@@ -1787,7 +1791,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
             return NULL;
         }
         if (status == LIVE_REJECTED) {
-            atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_n_failed_gfx, 1, memory_order_relaxed);
             // 编译器报缺的是用户常量缓冲里的句柄事实、且学到了新坐标：resolve_slow 会带上它当场重编，这次拒绝是学习的一步，
             // 不记成「未接 compile_failed」（不然每份着色器第一次见这类句柄都多几条假红）。学不到 / 重编到上限仍失败的，下一次照常报红。
             const int learned = ubo_need_learn(oc.summary, (const uint8_t (*)[8])s->keys, s->nst, 0x7u);
@@ -1802,7 +1806,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL;
         s2a_compile_outcome_free(&oc);
         if (in.link_map_diag) link_map_note(bytes, len, ident, s->identity);
-        atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_n_compiled_gfx, 1, memory_order_relaxed);
         if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
         if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, s->identity, bytes, len);
         if (alias_on()) { sha256(bytes, len, rsha); have_res = 1; }   // 与缓存文件头里写的是同一个量（整份负载的 SHA-256）
@@ -2372,7 +2376,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f.gfx) ? 2 : 0;
     for (int st = 0; st < nst; st++) memcpy(rec.keys[st], id.keys[st], 8);
     struct entry *ne = NULL;
-    const uint64_t dg_c0 = atomic_load(&g_n_compiled);
+    const uint64_t dg_c0 = nvk_shader_live_compile_total();
     struct work_snap *snap = snap_capture(&f, &id, sha, &pc, stages, nst);
 #ifdef S2A_ANDROID_DEBUG_ENV
     if (snap && nvk_warm_capture_enabled()) {
@@ -2390,7 +2394,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
         if (claimed) inflight_abort(sha);
         return pending ? 1 : -1;
     }
-    idg_work(group, atomic_load(&g_n_compiled) > dg_c0);   // 身份粒度诊断：这份身份是现场编出来的还是读盘/离线库拿到的
+    idg_work(group, nvk_shader_live_compile_total() > dg_c0);   // 身份粒度诊断：这份身份是现场编出来的还是读盘/离线库拿到的
     idg_log();
     snap_free(snap);
     struct entry *have = NULL;
@@ -2657,7 +2661,6 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             }
             if (status == LIVE_REJECTED) {
                 atomic_fetch_add_explicit(&g_n_failed_cs, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
                 // 编译器报缺的是计算阶段用户常量缓冲里的句柄事实、且学到了新坐标：这次拒绝是学习的一步，下面带上它当场重建请求
                 // （身份随事实变，不撞这份失败项），不记成「未接 compute_compile_failed」。学不到 / 重编到上限仍失败的，照常报红。
                 const int learned = ubo_need_learn(oc.summary, (const uint8_t (*)[8])rp_S.skey, 6, 1u << 5);
@@ -2684,7 +2687,6 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL; s2a_compile_outcome_free(&oc);
             atomic_fetch_add_explicit(&g_n_compiled_cs, 1, memory_order_relaxed);
             prog_tally_log();   // 计算现编也触发累计行的节拍（原先只有图形路径打）
-            atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
             if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
             if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, rq.identity, bytes, len);
         }
