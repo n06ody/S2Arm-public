@@ -22,6 +22,21 @@
 #include <sys/mman.h>
 #include <time.h>
 
+// Record exactly the final mapped read in the real landing and ReadTexels entry points.
+static int observe_reads;
+static uint64_t obs_n[NVN_IDLE_SITES], obs_bytes[NVN_IDLE_SITES];
+static uint64_t obs_clock(void) { return 1; }
+static void observe_read(enum nvn_gpu_idle_site site, nvn_gpu_buf b, const void *src, uint64_t bytes, uint64_t ns) {
+    (void)ns;
+    if (site >= NVN_IDLE_LAND && b && src && nvn_gpu_buf_cpu(b)) {
+        obs_n[site]++;
+        obs_bytes[site] += bytes;
+    }
+}
+const struct nvn_gpu_idle_observer *nvn_gpu_idle_observer(void) {
+    static const struct nvn_gpu_idle_observer obs = {obs_clock, observe_read};
+    return observe_reads ? &obs : NULL;
+}
 static int g_fail, g_checks;
 // 红行立刻刷出：dirty_span_memo_mutation_test.py 经管道读本进程的输出，管道上 stdio 整块缓冲；变异体放行池外访问后，
 // 后面的用例可能读写池外而崩溃（崩不崩取决于平台的静态布局），没刷出的红行会随进程一起丢，脚本就看不到「红在哪条断言」。
@@ -1655,6 +1670,7 @@ static void t_read_texels_gpu(void) {
     const int cpu_auto = g_buf_cpu_auto; g_buf_cpu_auto = 1; g_auto_done = 1; g_tb_fill = 1;
     uint8_t dst[1024];
     uint64_t st0[4]; nvn_be_read_texels_gpu_stats(st0);
+    observe_reads = 1; obs_n[NVN_IDLE_READ_TEXELS] = obs_bytes[NVN_IDLE_READ_TEXELS] = 0;
     // ① 8×4 RGBA8 整块：一段旁路段、一次拷贝（层 0、宽 8 高 4、行距 32、一片 128）、提交值 = 上一个 + 64
     tex_t a = mk_tex(61, 0, NVN_FORMAT_RGBA8, 8, 4, 1, 0); rt_gpu_tex(&a);
     const uint64_t f0 = nvn_be_last_fence(); const int b0 = g_begins, c0 = g_commits, l0 = g_rt_locks; g_ntb = 0;
@@ -1672,6 +1688,7 @@ static void t_read_texels_gpu(void) {
     sent_fill(dst, sizeof dst); nvn_be_read_texels(&a, 0, 0, &sub, dst, 16, 32);
     CHECK(g_ntb == 1 && g_tb[0].w == 3 && g_tb[0].h == 2 && g_tb[0].row == 12);
     CHECK(rt_rows_are(dst, 16, 0, &sub, 12, 2) && all_sent(dst + 12, 4) && all_sent(dst + 28, sizeof dst - 28));
+    CHECK(obs_n[NVN_IDLE_READ_TEXELS] == 2 && obs_bytes[NVN_IDLE_READ_TEXELS] == 128 + 24);
     // ③ 二维数组 4×4 共 3 层：起始层 1、深度 2 → 拷第 1、2 层；片距 80（64 + 16 pad）
     tex_t b = mk_tex_tgt(62, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 4, 4, 3); rt_gpu_tex(&b);
     NVNcopyRegion two = {.width = 4, .height = 4, .depth = 2}; g_ntb = 0;
@@ -1719,7 +1736,8 @@ static void t_read_texels_gpu(void) {
         fake_complete(NVN_GPU_DONE_OK); g_auto_done = 1;
         nvn_be_sub_begin(); nvn_be_sub_commit(); CHECK(g_last_signal == fx + 128); fake_complete(NVN_GPU_DONE_OK);
     }
-    { uint64_t st[4]; nvn_be_read_texels_gpu_stats(st); CHECK(st[0] == st0[0] + 5); }   // 只数读成的：① ② ③ ④ ⑤
+    { uint64_t st[4]; nvn_be_read_texels_gpu_stats(st); CHECK(st[0] == st0[0] + 5); }
+    CHECK(obs_n[NVN_IDLE_READ_TEXELS] == 5); observe_reads = 0;   // 只数读成的：① ② ③ ④ ⑤
     nvn_be_tex_release(&a); nvn_be_tex_release(&b); nvn_be_tex_release(&e); nvn_be_tex_release(&d);
     g_buf_cpu_auto = cpu_auto; g_auto_done = 0; g_tb_fill = 0;
 }
@@ -4735,10 +4753,8 @@ static void t_dispatch(void) {
     stream s2 = {0}; dp = put(&s2, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1; end(&s2);
     submit1(&s2); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && g_cpipe_gets == 1 && g_pmem[PG + 64] == 0x22);   // 同一个程序不重建管线；失败不回写
-    g_pg_gen[1] = 107; g_dirty_now = 108; g_nbw = 0;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[PG] == 0x22 && mirror[2 * PG - 1] == 0x22);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 终态不推进已完成值。直接查撤登记，不在失败时间线上模拟下一次成功的镜像同步。
+    CHECK(rp_buf_gpu_write_pending(base + PG, PG) == 0);
     // 取不到程序：记账跳过，不派发
     g_cresolve_rc = -1; submit1(&s2); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_ndisp == 2 && nvn_unimpl_count("draw", "compute_program_unresolved") == 1);
@@ -4837,6 +4853,7 @@ static void t_gpu_land_concurrent(void) {
     if (!b || !b->cpu) return;
     memset(b->cpu + 128, 0xee, 16);
     struct land_args a = {0}; a.id = rp_buf_gpu_write_note(base + 128, 16, &a.key); CHECK(a.id && a.key == base);
+    observe_reads = 1; obs_n[NVN_IDLE_LAND] = obs_bytes[NVN_IDLE_LAND] = 0;
     pthread_t th; g_land_pause = 1; g_land_half = g_land_resume = 0;
     int started = pthread_create(&th, NULL, land_thread, &a); CHECK(started == 0);
     if (started) return;
@@ -4854,6 +4871,7 @@ static void t_gpu_land_concurrent(void) {
     rp_buf_gpu_write_land(a.key, a.id, 1);   // 同一登记的重复回调不能再次摘账或拷贝
     pthread_mutex_lock(&g_land_mu); g_land_resume = 1; pthread_cond_broadcast(&g_land_cv); pthread_mutex_unlock(&g_land_mu);
     CHECK(pthread_join(th, NULL) == 0); g_land_pause = 0;
+    CHECK(obs_n[NVN_IDLE_LAND] == 1 && obs_bytes[NVN_IDLE_LAND] == 16); observe_reads = 0;
     CHECK(!rp_buf_gpu_pending(base + 128, 16));   // 拷回结束才撤账
     // 后端写在录制时保存快照，随后 GPU 按序执行；因此先落地、再应用录好的传输。
     for (unsigned i = 0; i < PG; i++) if (g_land_mask[i]) b->cpu[i] = g_land_staged[i];
@@ -5455,10 +5473,7 @@ static void t_dispatch_ubop_rw(void) {
     stream f = {0}; put_dispatch1(&f); end(&f);
     submit1(&f); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && pmem_all(2 * PG, 4 * PG, 0x22));                                                         // 派发了、这一段失败：游戏内存还是游戏自己的
-    g_pg_gen[2] = g_pg_gen[3] = 101; g_dirty_now = 102; g_nbw = 0;                                                 // 游戏又写了这两页
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 2 * PG, 2 * PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[2 * PG + 32] == 0x22 && mirror[2 * PG + 127] == 0x22 && mirror[3 * PG + 16] == 0x22 && mirror[3 * PG + 63] == 0x22);   // 两段都重传了：登记已撤
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_buf_gpu_write_pending(base + 2 * PG, 2 * PG) == 0);   // 两段登记均已撤，失败值仍未完成
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
 }
 

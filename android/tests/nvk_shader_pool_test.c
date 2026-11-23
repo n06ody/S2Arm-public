@@ -125,12 +125,14 @@ int nvn_plat_flag(const char *name, int dflt) {
     return dflt;
 }
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
+static int tally_lines; static char last_tally[800];   // 「程序累计：」行打了几次 / 最后一条
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
 void nvn_plat_log(int level, const char *cls, const char *text) {
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "程序累计：")) { tally_lines++; snprintf(last_tally, sizeof last_tally, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "libpack_cs_unaligned_refused")) { lp_unref_lines += level == NVN_PLAT_LOG_INFO ? 1 : 1000; snprintf(last_unref, sizeof last_unref, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "libpack_cs_unaligned_refused 累计")) { lp_unref_sums++; snprintf(last_unref_sum, sizeof last_unref_sum, "%s", text); }
     if (level == NVN_PLAT_LOG_RED && !strcmp(cls, "shader")) snprintf(last_red, sizeof last_red, "%s", text);
@@ -1949,6 +1951,11 @@ static int cs_libpack_test(void) {
         rp_shader_reset(); p = NULL; calls = compiler_calls;
         CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls + 1,
               "library piece that cannot be built falls back to live compile (calls=%d)", compiler_calls);
+        {   // 计算现编也计进累计行的计算分项（原先累计行只在图形路径出、计算现编不触发）
+            extern void nvk_shader_test_tally_line(char *out, size_t n);
+            char tl[800]; nvk_shader_test_tally_line(tl, sizeof tl);
+            CHECK(strstr(tl, "现编分项 图形 0 / 计算 ") && !strstr(tl, "现编分项 图形 0 / 计算 0；"), "a live-compiled compute program is counted in the compute part of the tally: %s", tl);
+        }
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a marked-bad library program is remembered as a build failure: %s", note ? note : "(none)");
         // 现在把备忘换成别的状态（非对齐闸拒查）：命中记坏表时必须改回「build 失败」，而不是留着「非对齐」或空
@@ -1981,13 +1988,15 @@ static int diag_compile_test(void) {
     printf("compile diagnostic: %d checks, %d failures\n", checks, failures); return failures ? 1 : 0;
 }
 
-static int live_compile_thread_test(void) {
-    fixture_live_compile = -1;   // simulate an unset property and exercise the production default
+static int live_compile_thread_test(int asynchronous) {
+    fixture_live_compile = asynchronous ? 1 : -1;   // explicit opt-in or an unset property
     fixture_live_slots = 2;
     CHECK(nvk_shader_open() == 0, "open shader session");
     struct s2a_compile_worker_stats slots;
     s2a_compile_worker_stats(&slots);
-    CHECK(slots.slots == 2, "session passes its configured slot count to the compiler worker");
+    const unsigned expected_slots = asynchronous ? 2 : 0;
+    CHECK(slots.slots == expected_slots, "%s must start %u compiler workers (got %u)",
+          asynchronous ? "explicit async opt-in" : "unset async property", expected_slots, slots.slots);
     rp_state_reset(); source(); bind_pools(64);
     fake_array_count = 64;
     fake_cs_success = 1;
@@ -1996,21 +2005,25 @@ static int live_compile_thread_test(void) {
     int rc = rp_shader_resolve(&q, &graphics);
     CHECK(rc == 0 && graphics && !graphics->is_compute && compiler_calls == 1,
           "graphics first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
-    if (compiler_calls == 1)
-        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
-              "graphics live compiler ran on the submitting thread");
+    if (compiler_calls == 1) {
+        const int on_submit = pthread_equal(last_compiler_thread, pthread_self()) != 0;
+        CHECK(on_submit == !asynchronous, "graphics live compiler %s on the submitting thread",
+              on_submit ? "ran" : "did not run");
+    }
     rc = rp_shader_resolve_compute(&compute);
     CHECK(rc == 0 && compute && compute->is_compute && compiler_calls == 2,
           "compute first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
-    if (compiler_calls == 2)
-        CHECK(!pthread_equal(last_compiler_thread, pthread_self()),
-              "compute live compiler ran on the submitting thread");
+    if (compiler_calls == 2) {
+        const int on_submit = pthread_equal(last_compiler_thread, pthread_self()) != 0;
+        CHECK(on_submit == !asynchronous, "compute live compiler %s on the submitting thread",
+              on_submit ? "ran" : "did not run");
+    }
     CHECK(rp_shader_resolve(&q, &again) == 0 && again == graphics && compiler_calls == 2,
           "second graphics lookup reuses the published program");
     CHECK(rp_shader_resolve_compute(&again) == 0 && again == compute && compiler_calls == 2,
           "second compute lookup reuses the published program");
     nvk_shader_stop(); rp_shader_reset(); s2a_source_clear();
-    printf("live-compile-thread checks=%d failures=%d\n", checks, failures);
+    printf("live-compile-%s checks=%d failures=%d\n", asynchronous ? "thread" : "default", checks, failures);
     return failures ? 1 : 0;
 }
 
@@ -2074,8 +2087,42 @@ static int live_compile_pending_test(int stop) {
     return failures ? 1 : 0;
 }
 
+// 程序累计行的节拍：新进程里全是 0、只有计算现编、只有图形现编三种情形都有行；会话中每 5 秒且有变化才打，停局那一行无论变化都打。
+//   假时钟驱动（nvk_shader_test_tally_tick），计数用测试件加（与生产同一组计数器）。
+extern int nvk_shader_test_tally_tick(uint64_t now, int force);
+extern void nvk_shader_test_tally_reset(void);
+extern void nvk_shader_test_tally_add(int compute, int failed);
+static int tally_test(void) {
+    const uint64_t S = 1000000000ull;
+    // 1) 一个都没有（新进程，计数全 0）：定时不打（没变化），停局那一行照打，且分项都是 0
+    nvk_shader_test_tally_reset();
+    int before = tally_lines;
+    CHECK(nvk_shader_test_tally_tick(10 * S, 0) == 0 && tally_lines == before, "zero programs: the periodic tick prints nothing (no change)");
+    CHECK(nvk_shader_test_tally_tick(11 * S, 1) == 1 && tally_lines == before + 1, "zero programs: the stop line is printed anyway");
+    CHECK(strstr(last_tally, "现场编 0、失败 0") && strstr(last_tally, "现编分项 图形 0 / 计算 0；失败分项 图形 0 / 计算 0"), "zero line: %s", last_tally);
+    // 2) 只有计算现编：第一次有变化立即打；节拍内不重复；5 秒后再有变化再打（新一局：重新起节拍）
+    nvk_shader_test_tally_reset();
+    nvk_shader_test_tally_add(1, 0);
+    before = tally_lines;
+    CHECK(nvk_shader_test_tally_tick(12 * S, 0) == 1 && tally_lines == before + 1, "compute-only compile: a line is printed (the old code printed none)");
+    CHECK(strstr(last_tally, "现场编 1、失败 0") && strstr(last_tally, "现编分项 图形 0 / 计算 1；失败分项 图形 0 / 计算 0"), "compute-only line: %s", last_tally);
+    nvk_shader_test_tally_add(1, 0);
+    CHECK(nvk_shader_test_tally_tick(14 * S, 0) == 0, "inside the 5 s period: no second line");
+    CHECK(nvk_shader_test_tally_tick(18 * S, 0) == 1 && strstr(last_tally, "计算 2"), "after 5 s with a change: the next line");
+    CHECK(nvk_shader_test_tally_tick(30 * S, 0) == 0, "no change: no periodic line");
+    // 3) 只有图形现编（计算计数不动）与失败分项
+    nvk_shader_test_tally_add(0, 0);
+    nvk_shader_test_tally_add(1, 1);
+    CHECK(nvk_shader_test_tally_tick(40 * S, 0) == 1 && strstr(last_tally, "现编分项 图形 1 / 计算 2") && strstr(last_tally, "失败分项 图形 0 / 计算 1"), "graphics compile and a compute failure are counted separately: %s", last_tally);
+    nvk_shader_test_tally_add(0, 1);
+    CHECK(nvk_shader_test_tally_tick(50 * S, 1) == 1 && strstr(last_tally, "失败分项 图形 1 / 计算 1"), "stop line carries the graphics failure: %s", last_tally);
+    printf("nvk shader pool (program tally cadence): %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test();
+    if (argc == 2 && !strcmp(argv[1], "--tally")) return tally_test();
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
+    if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();

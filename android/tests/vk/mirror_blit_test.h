@@ -16,6 +16,9 @@ nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c) {
     nvn_gpu_view result=NULL; GPU(nvn_gpu_view_create(image,v,&result,&err));
     mirror_views[mirror_view_count++]=result; return result;
 }
+// 夹具只用非 BC 图像，原格式就是当前格式。
+nvn_gpu_tex rp_tex_resolve_plain(const tex_t *t, nvn_gpu_cmd c) { return rp_tex_resolve(t, c); }
+nvn_gpu_view rp_view_for_plain(const tex_t *t, const view_t *v, nvn_gpu_cmd c) { return rp_view_for(t, v, c); }
 static unsigned mirror_component(int x, int y, unsigned component) {
     return component==0 ? (unsigned)x&1u : component==1 ? (unsigned)y&1u :
         component==2 ? (unsigned)(x/2+y/2)&1u : 1u;

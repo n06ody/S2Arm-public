@@ -285,10 +285,17 @@ s2a_gate_step "$out/nvn-vk-format-test"
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/ts_queue_test.c" -o "$out/ts-queue-test"
 s2a_gate_step "$out/ts-queue-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    "$android_dir/tests/nvk_land_auto_test.c" -lm -o "$out/land-auto-test"
+s2a_gate_step "$out/land-auto-test"
 # #653：逐报告时间戳校准纯数学（不建 Vulkan device，不替代真机/VVL 验证）。
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/report_ts_test.c" -o "$out/report-ts-test"
 s2a_gate_step "$out/report-ts-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    -I "$android_dir/../graphics/nvn/gfx/nvn" -I "$android_dir/../graphics/nvn/gfx/nvn/include" \
+    -pthread "$android_dir/tests/nvk_gpu_idle_test.c" -o "$out/gpu-idle-test"
+s2a_gate_step "$out/gpu-idle-test"
 # VM 夹具端点核对（宿主源码级，mac 也跑）：svc_*.c 新引用的 core 符号漏登记当场红，不等 Linux 真链
 s2a_gate_step "$PY" "$android_dir/core-link/runtime-tests/vm/check_endpoints.py" --out "$out/vm-endpoints"
 # 宽屏 screen_metrics 的宿主两步（screen-widen-test / widen-loader-test）11-01 挪进合入前层：tests/android_screen_host_test.sh
