@@ -1334,22 +1334,27 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 const uint64_t cbuf_t0 = btm ? dt_now() : 0;
                 const p_bind_buf *ub = &rp_S.ubo[st][e->src_reg];
                 if (!ub->addr || !ub->size) return skip("uniform_buffer_unbound", rec);
-                // 常量缓冲一律拷进本段的暂存区再绑：就是编码这一刻的内容（按序的 OP_UPDATE_UB 之后再用自然是新值），
-                // 不经池镜像，也就没有通道内的传输。地址必须在登记过的池里。
-                if (!rp_pool_find(ub->addr, ub->size, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
-                if (ub->size > 0xffffffffull) return skip("uniform_buffer_too_large", rec);
-                rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, ub->size >> 10);
-                if (rp_buf_gpu_pending(ub->addr, ub->size)) {   // 这段有还没落地的 GPU 写（计算写、GPU 上做的拷贝 / 清除，#1022）：游戏内存里是旧内容，直接绑镜像
-                    const nvn_gpu_caps *cp = caps_cached(); const uint64_t al = cp->min_ubo_align ? cp->min_ubo_align : 256;
+                // 用户常量缓冲声明为 64 KiB（MAX_UNIFORM_BUFFER_SIZE、Ryujinx ConstantBufferSize）。
+                enum { CBUF_SHADER_BYTES = 0x10000 };
+                const uint64_t len = ub->size < CBUF_SHADER_BYTES ? ub->size : CBUF_SHADER_BYTES;
+                const nvn_gpu_caps *cp = caps_cached();
+                // 设备范围不能作为裁剪上限，否则着色器仍可能访问被截掉的字节。
+                // 在交给后端前具名跳过此笔，避免后端的范围错误使整段作废。
+                if (cp->max_ubo_range && len > cp->max_ubo_range) return skip("uniform_buffer_exceeds_device_range", rec);
+                if (!rp_pool_find(ub->addr, len, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
+                rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, len >> 10);
+                if (rp_buf_gpu_pending(ub->addr, len)) {   // 尚未落地的 GPU 写（#1022）：游戏内存是旧内容，直接绑镜像
+                    const uint64_t al = cp->min_ubo_align ? cp->min_ubo_align : 256;
                     nvn_gpu_buf mb; uint64_t mo;
-                    if ((!cp->max_ubo_range || ub->size <= cp->max_ubo_range) && rp_buf_resolve(c, ub->addr, ub->size, &mb, &mo) && !(mo & (al - 1))) {
+                    if (rp_buf_resolve(c, ub->addr, len, &mb, &mo) && !(mo & (al - 1))) {
                         rp_perf_add(RP_PERF_UBO_MIRROR_N, 1);
-                        o->u.b.buf = mb; o->u.b.off = mo; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break;
+                        o->u.b.buf = mb; o->u.b.off = mo; o->u.b.len = len; if (btm) g_bt[4] += dt_now() - cbuf_t0; break;
                     }
-                    nvn_unimpl("draw", "uniform_gpu_pending_unaligned", rec);   // 镜像偏移不满足常量缓冲对齐：照旧暂存游戏内存（旧内容），记账
+                    nvn_unimpl("draw", "uniform_gpu_pending_unaligned", rec);   // 镜像无法绑定：保留原有暂存路径并记账
                 }
-                if (!slc_get(c, ub->addr, ub->size, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
-                o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = ub->size; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
+                // 暂存编码时看到的内容，按序的 OP_UPDATE_UB 之后会取新值。
+                if (!slc_get(c, ub->addr, len, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
+                o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = len; if (btm) g_bt[4] += dt_now() - cbuf_t0; break; }
             case NVN_RB_SPILL:   // 共享内存溢出缓冲：rp_dispatch 按这次的组数分好的那一片
                 if (st != 5 || !g_spill_len) return skip("compute_spill_unallocated", rec);
                 o->u.b.buf = g_spill.buf; o->u.b.off = g_spill.off; o->u.b.len = g_spill_len; break;
