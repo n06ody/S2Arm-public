@@ -166,7 +166,7 @@ static int stage_count(uint32_t mask) {
 // 清单条目的结构合法性（不是本局有效性：那是 profile/ABI/闭包那条，在 load 里整份判）。
 static int rec_well_formed(const struct nvk_prog_rec *r) {
     if (!r || !stage_count(r->stage_mask) || (r->c1_ok & ~7u) || identity_zero(r->identity)) return 0;
-    if (r->lp_ssbo_window && (r->lp_ssbo_window != 1 || r->lp_ok != 2 || r->stage_mask == 32u)) return 0;
+    if (r->lp_ssbo_window && (r->lp_ssbo_window != 1 || r->lp_ok != 2)) return 0;
     for (int st = 0; st < NVK_PROG_REC_STAGES; st++)
         if ((r->c1_ok & (1u << st)) && (!r->c1[st] || r->c1_len[st] < NVK_PROG_REC_C1_MIN || r->c1_len[st] > NVK_PROG_REC_C1_MAX)) return 0;
     return 1;

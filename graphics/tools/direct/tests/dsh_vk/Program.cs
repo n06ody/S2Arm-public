@@ -333,8 +333,11 @@ static class Program
                 Check("不访问 SSBO 的片元仍声明窗口协议，无掩码", (int?)metadata["ssbo_window_abi"] == 1 &&
                     metadata["ssbo_window_mask"] == null);
             if (stage == "cs")
-                Check("计算出包沿用既有窗口路径", metadata["ssbo_window_abi"] == null &&
-                    metadata["ssbo_window_mask"] == null);
+                Check("计算出包携带窗口合同：协议 1、掩码参与按位与、c0 绑定在表里且入口取用",
+                    (int?)metadata["ssbo_window_abi"] == 1 && (uint?)metadata["ssbo_window_mask"] is uint cmask && cmask != 0 &&
+                    UsesStorageWindowMask(spv, cmask) &&
+                    bindings.OfType<JsonObject>().Any(o => (string)o["kind"] == "drvcb" && (int?)o["bank"] == 0 &&
+                        res.TryGetValue((string)o["msl_name"], out var driver) && driver.Used));
 
             if (stage == "ps")
             {

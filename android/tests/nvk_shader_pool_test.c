@@ -113,12 +113,14 @@ static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
+static int fixture_ssbo_window = -1;   // debug.s2a.nvk_libpack_ssbo_window（-1 = 缺省）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
     if (!strcmp(name, "fu_unsafe_ms")) return fixture_live_unsafe_ms;
     if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
+    if (!strcmp(name, "nvk_libpack_ssbo_window") && fixture_ssbo_window >= 0) return fixture_ssbo_window;
     if (!strcmp(name, "nvk_texpool_log")) { diag_queries++; return diag_enabled; }
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
     if (!strcmp(name, "nvk_link_refused_file") && record_link_refused) return 1;
@@ -1921,6 +1923,7 @@ static int cs_libpack_test(void) {
     int calls = compiler_calls, unref0 = lp_unref_lines;
     rp_S.ssbo[5][0].addr = 0x10001;   // 同键同绑定、只有对齐实况变：16 非对齐
     p = NULL;
+    fixture_ssbo_window = 0;   // 旧门（debug.s2a.nvk_libpack_ssbo_window=0）：非对齐计算在查库前被拒；窗口路径另见下面的用例
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls + 1,
           "unaligned CS storage refuses the library, falls back to live compile (calls=%d)", compiler_calls);
     CHECK(strstr(captured, "\"hasUnalignedStorageBuffer\":true") != NULL,
@@ -1936,6 +1939,7 @@ static int cs_libpack_test(void) {
     {   char want[80]; snprintf(want, sizeof want, "累计 128 次（最近一次：键 %s", khex);
         CHECK(lp_unref_sums == 2 && strstr(last_unref_sum, want) != NULL && strstr(last_unref_sum, "身份 ") != NULL,
               "141 refusals log two summary lines (64 / 128) with the latest key and identity (sums=%d): %s", lp_unref_sums, last_unref_sum); }
+    fixture_ssbo_window = -1;
     rp_S.ssbo[5][0].addr = 0x10000;   // 回到对齐：库照常出
     p = NULL; calls = compiler_calls;
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls,
@@ -2009,14 +2013,53 @@ static int cs_libpack_test(void) {
         CHECK(note && strstr(note, "build 失败"), "a marked-bad library program is remembered as a build failure: %s", note ? note : "(none)");
         // 现在把备忘换成别的状态（非对齐闸拒查）：命中记坏表时必须改回「build 失败」，而不是留着「非对齐」或空
         rp_S.ssbo[5][0].addr = 0x10001;
+        fixture_ssbo_window = 0;   // 旧门
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "非对齐"), "unaligned refuse replaces the note: %s", note ? note : "(none)");
+        fixture_ssbo_window = -1;
         rp_S.ssbo[5][0].addr = 0x10000;
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a bad-table hit is reported as a build failure, not as a stale reason or as no record: %s", note ? note : "(none)");
         cs_lib_root_rm(broot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
+    // 窗口合同（缺省开）：非对齐计算也查库，只放行带合同的库件
+    {   char wroot[256];
+        rp_S.ssbo[5][0].addr = 0x10001;   // 16 非对齐
+        // 旧库（无 ssbo_window_abi）：库层具名 MISS，退现编（不是被对齐闸拒、也不拿对齐变体跑非对齐缓冲）
+        rp_shader_reset(); p = NULL; calls = compiler_calls;
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls + 1,
+              "unaligned CS, library without the window contract: falls back to live compile (calls=%d)", compiler_calls);
+        // 带窗口合同的库件（abi 1、无存储缓冲绑定）：命中，现编 0
+        char wjson[512];
+        snprintf(wjson, sizeof wjson, "{\"key\":\"%s_b\",\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"ssbo_window_abi\":1,\"bindings\":["
+                 "{\"msl_name\":\"cp_c0\",\"kind\":\"drvcb\",\"bank\":0,\"arg_id\":0}]}", khex, khex);
+        const uint8_t *wd[2] = { (const uint8_t *)wjson, (const uint8_t *)csspv };
+        size_t wn[2] = { strlen(wjson), sizeof csspv };
+        CHECK(cs_lib_root(wroot, ck, ckind, wd, wn, 2) == 0, "window-contract compute library piece written (own root)");
+        rp_shader_reset(); p = NULL; calls = compiler_calls;
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls && p->lib_sourced,
+              "unaligned CS, library with the window contract: hit, compiler not called (calls=%d)", compiler_calls);
+        // 窗口开关关掉（旧门）：同一个库件不放行，退现编
+        fixture_ssbo_window = 0;
+        rp_shader_reset(); p = NULL; calls = compiler_calls;
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls + 1,
+              "unaligned CS, window switch off: the old gate refuses the library (calls=%d)", compiler_calls);
+        fixture_ssbo_window = -1;
+        cs_lib_root_rm(wroot);
+        // 计算的用户常量缓冲来源（sbuf_ubo）：非对齐时不放行（回放不挪这类来源的窗口，沿用旧库对齐门）
+        char ujson[640];
+        snprintf(ujson, sizeof ujson, "{\"key\":\"%s_b\",\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"ssbo_window_abi\":1,\"bindings\":["
+                 "{\"msl_name\":\"cp_c0\",\"kind\":\"drvcb\",\"bank\":0,\"arg_id\":0},"
+                 "{\"msl_name\":\"cp_s1\",\"kind\":\"sbuf_ubo\",\"index\":1,\"reg\":1,\"off\":0,\"rw\":false,\"arg_id\":1}]}", khex, khex);
+        const uint8_t *ud[2] = { (const uint8_t *)ujson, (const uint8_t *)csspv };
+        size_t un[2] = { strlen(ujson), sizeof csspv };
+        CHECK(cs_lib_root(wroot, ck, ckind, ud, un, 2) == 0, "UBO-sourced compute library piece written (own root)");
+        rp_shader_reset(); p = NULL; calls = compiler_calls;
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls + 1,
+              "unaligned CS with UBO-sourced storage: library refused by name, live compile (calls=%d)", compiler_calls);
+        cs_lib_root_rm(wroot); setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+        rp_S.ssbo[5][0].addr = 0x10000; }
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);

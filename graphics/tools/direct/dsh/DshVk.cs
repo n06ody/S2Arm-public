@@ -379,7 +379,7 @@ namespace S2A.Dsh
             var json = JsonNode.Parse(jsonText).AsObject();
             var bindings = json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings");
             byte[] spv = VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot);
-            if (stage is "vs" or "ps")
+            if (stage is "vs" or "ps" or "cs")
             {
                 StorageWindowContract(json, bindings, spv);
                 if (DshCompiler.PackOut) DshCompiler.PackFiles[jsonName] = json.ToJsonString();
@@ -407,7 +407,7 @@ namespace S2A.Dsh
             try
             {
                 var (j, _) = c.JobFor(stage, code, ctl);
-                if (stage is "vs" or "ps") j["storage_window_mask"] = true;
+                if (stage is "vs" or "ps" or "cs") j["storage_window_mask"] = true;
                 c.TranslateFirst(j);
                 string spv = Path.Combine(w, key + ".spv");
                 if (stage == "vs")

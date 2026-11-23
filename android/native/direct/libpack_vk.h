@@ -88,14 +88,16 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
 // 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1/v2（malloc，调用方 free），
 //   按 nvn_vk_program_parse_compute 的合同合成：绑定号 = arg_id×6+5、每条 count 1、storage 带 cbSlot/cbOffset
 //   出处与 rw、c0 驱动常量段挂 slot 0；c0Reads / supportReads 写 null（_b.json 给不出，解析器认可的「未知」），
-//   hasUnalignedStorageBuffer 写 false（批翻链按缺省 false 翻）。返回码与计数口径同 program_v1。
+//   hasUnalignedStorageBuffer：带窗口合同且掩码已固化的库段写 true，旧库写 false。返回码与计数口径同 program_v1。
+//   gfx（可空）：只用 storage_alignment / profile_json / require_ssbo_window——非对齐基址（require_ssbo_window）只放行带窗口合同的库段，
+//     且含用户常量缓冲来源存储（sbuf_ubo / ubo_ptr）的程序不放行；传 NULL = 按对齐基址取。
 //   shared_limit = 本设备 maxComputeSharedMemorySize：_b.json 带 spill 标记（批翻链 MSL 侧 32K 阈值溢出事实）
 //   时核 _b.spv 的 Workgroup 字节数，超出的程序出库即拒（其 .spv 未做溢出改写，建不出计算管线）。
 //   reason（可空）：没取到 / 拒收的原因码（enum s2a_libpack_why）。诊断只按码分类，why 文本只给人看、改文案不影响归类；
 //   命中（返回 S2A_LIBPACK_HIT）和「库里没有这一键」（MISS）时是 S2A_LIBPACK_WHY_NONE，只有拒收（REJECT）才带码。
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size, int *reason);
 
 uint64_t s2a_libpack_hits(void);

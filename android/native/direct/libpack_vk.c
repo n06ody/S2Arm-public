@@ -363,6 +363,7 @@ struct lp_stage_contract {
     struct lp_emitted_bindings emitted;
     struct lp_spv_bindings declared;
     char key[17], json_name[12], spv_name[12];
+    int window_fixed;   // 本段的存储缓冲窗口掩码已按设备对齐固化（程序按「基址可能不对齐」的语义翻译）
 };
 
 #define LP_NVN_STAGES 6   // NVN 阶段号 vs..cs = 0..5；s2a_libpack_program_v1 的 keys[6][8] 与逐阶段合同都按它定长
@@ -840,8 +841,8 @@ static int lp_fix_ssbo_window_mask(uint8_t *spv, size_t n, uint32_t id, uint32_t
     return -1;
 }
 
-static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx *gfx,
-                                uint8_t *spv, size_t n, const struct lp_stage_contract *contract,
+static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx *gfx, int compute,
+                                uint8_t *spv, size_t n, struct lp_stage_contract *contract,
                                 char *why, size_t why_size) {
     struct s2a_jv abi, field;
     int has_mask = !s2a_jv_obj_find(top, "ssbo_window_mask", &field);
@@ -854,6 +855,21 @@ static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx 
     uint32_t version = 0;
     if (jf_u32(top, "ssbo_window_abi", &version) || version != 1)
         return lp_fail(why, why_size, "%s %s unknown SSBO window ABI", contract->key, contract->json_name);
+    if (compute && gfx && gfx->require_ssbo_window) {
+        // 计算的用户常量缓冲来源（sbuf_ubo / ubo_ptr）：基址在运行时从常量缓冲读，对齐与否编译期和取库时都不知道，
+        //   回放对这类来源不挪窗口（不对齐的直接具名跳过）。非对齐的 SBUFP 与它们同程序时，沿用旧库的对齐门，不放行。
+        struct s2a_jv bindings;
+        if (!s2a_jv_obj_find(top, "bindings", &bindings)) {
+            int count = s2a_jv_arr_count(bindings);
+            for (int i = 0; i < count; i++) {
+                struct s2a_jv binding;
+                char kind[24];
+                if (!s2a_jv_arr_item(bindings, i, &binding) && !jf_str(binding, "kind", kind, sizeof kind) &&
+                    (!strcmp(kind, "sbuf_ubo") || !strcmp(kind, "ubo_ptr")))
+                    return lp_fail(why, why_size, "%s %s UBO-sourced storage keeps the aligned gate", contract->key, contract->json_name);
+            }
+        }
+    }
     if (!has_mask) {
         // 没有掩码 = 这一段没有会随基址低位移动的窗口读取。基址对齐时窗口起点就是 B，照用；
         //   只有本笔基址非对齐（require_ssbo_window）时，带存储缓冲的段才缺补偿、必须拒。
@@ -879,6 +895,7 @@ static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx 
         return lp_fail(why, why_size, "%s %s device/profile SSBO alignments differ", contract->key, contract->json_name);
     if (jf_u32(top, "ssbo_window_mask", &id) || lp_fix_ssbo_window_mask(spv, n, id, alignment))
         return lp_fail(why, why_size, "%s %s invalid SSBO window mask", contract->key, contract->spv_name);
+    contract->window_fixed = 1;
     return 0;
 }
 
@@ -954,8 +971,8 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             { lp_fail(why, why_size, "%s %s gs_input_topology is not %d", khex, jname, gs_topology); goto done; }
         if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
             { lp_fail_reflect(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
-        if (!compute) {
-            int window = lp_stage_ssbo_window(top, gfx, spv, sn, contract, why, why_size);
+        {
+            int window = lp_stage_ssbo_window(top, gfx, compute, spv, sn, contract, why, why_size);
             if (window != 0) { out = window; goto done; }
         }
         {   char cw[128] = ""; const size_t sn0 = sn; const uint64_t il0 = s2a_libpack_interlock_dropped();
@@ -1155,8 +1172,8 @@ out:
 
 // 计算程序：单键（rp_S.skey[5]）的 _b.json（stage "cs"）+ _b.spv → kind "compute" 的 v1/v2 结果，
 //   接受口径 = nvn_vk_program_parse_compute（与现编结果同一个 build_compute）。计算合同多出的四个顶层事实：
-//   hasUnalignedStorageBuffer：false——dsh 批翻链的翻译器（translator/dmsh_xlate）不覆写
-//     IGpuAccessor.QueryHasUnalignedStorageBuffer，接口缺省 false，这份 .spv 就是按 false 翻的（照实）；
+//   hasUnalignedStorageBuffer：库段带窗口合同且掩码已按本机对齐固化（contract.window_fixed）时写 true（这份 .spv 按「基址可能不对齐」翻译），
+//     旧库（无合同）写 false（批翻链按缺省 false 翻，照实）；非对齐基址只放行带合同的库（lp_stage_ssbo_window）；
 //   c0Reads：null——_b.json 只有 drv_reads（按 MSL 文本的 vec4 粒度 + dynamic 标），给不出合同要的
 //     字节精度读集；null 是解析器认可的「未知」，运行时按完整驱动 c0 布局填；
 //   supportReads：null——_b.json 不带 support 读集，同上按「未知」写，运行时整块按恒等值填；
@@ -1165,7 +1182,7 @@ out:
 //   绑定号 = arg_id×6 + 5。计数口径同 program_v1（hit / miss / reject 三个计数器共用）。
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size, int *reason) {
     struct s2a_libpack *lp = (struct s2a_libpack *)lp_c;
     g_lp_why = S2A_LIBPACK_WHY_NONE;
@@ -1176,15 +1193,15 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     int sep = 0, uses_v2 = 0; uint32_t got = 0;
     uint32_t csupport = 0;
     struct lp_stage_contract contract = {0};
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, NULL, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, gfx, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0 && uses_v2) rc = lp_finish_v2_bindings(&contract, &bd, &sep, 1, why, why_size);
     if (rc == 0) {
         struct jw j = {0};
         int version = uses_v2 ? 2 : 1;
         jw_fmt(&j, "{\"schema\":\"s2a-direct-program-v%d\",\"content\":{\"contract\":\"s2a-direct-program-content-v%d\",\"identity\":{\"directABI\":%u,\"translatorClosure\":\"%s\",\"profileHash\":\"%s\"},\"kind\":\"compute\","
-                   "\"hasUnalignedStorageBuffer\":false,\"c0Reads\":null,\"supportReads\":null,\"stages\":[",
-               version, version, direct_abi, translator_closure ? translator_closure : "", profile_hash ? profile_hash : "");
+                   "\"hasUnalignedStorageBuffer\":%s,\"c0Reads\":null,\"supportReads\":null,\"stages\":[",
+               version, version, direct_abi, translator_closure ? translator_closure : "", profile_hash ? profile_hash : "", contract.window_fixed ? "true" : "false");
         jw_put(&j, st.b ? (char *)st.b : "", st.n);
         jw_str(&j, "],\"bindings\":[");
         jw_put(&j, bd.b ? (char *)bd.b : "", bd.n);

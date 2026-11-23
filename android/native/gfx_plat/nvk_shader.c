@@ -1347,11 +1347,10 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
 static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, int state_ok,
                          const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
-    // 计算库还只有对齐变体，非对齐计算仍走现编。图形非对齐允许查库，逐段核对窗口合同。
-    if (!ckey && state_ok == LIBPACK_SSBO_WINDOW && !nvn_plat_flag("nvk_libpack_ssbo_window", 1)) return 0;
-    // state_ok 对计算同样生效：ckey 路径传 !unaligned（慢路）/ rec->lp_ok==2（暖路径），含义同图形 lp_ok。库件只有
-    //   对齐变体（libpack_vk.c 恒写 hasUnalignedStorageBuffer:false，c0 钳制补偿只有现编能出），非对齐 sbuf 绑定下
-    //   出库 = 无钳制的对齐码跑非对齐缓冲 → 设备越界丢局（9000 日包 DeviceLost 元凶 = cs 50c91227a1082f2c 库版此机制）。
+    // 非对齐存储缓冲允许查库（图形 / 计算同口径），逐段核对窗口合同：只有带合同的库才放行，旧库（对齐变体）在库层具名 MISS 退现编。
+    //   对齐变体跑在非对齐缓冲上会让窗口外越界读写 → 设备丢局（9000 日包 DeviceLost 元凶 = cs 50c91227a1082f2c 库版此机制），
+    //   所以不能把旧库当对齐库用。debug.s2a.nvk_libpack_ssbo_window=0 回到旧门：图形不查库，计算按「对齐闸」拒查并记账。
+    if (state_ok == LIBPACK_SSBO_WINDOW && !nvn_plat_flag("nvk_libpack_ssbo_window", 1)) { if (!ckey) return 0; state_ok = LIBPACK_OTHER_STATE; }
     if (!root || !state_ok || (!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u) || nvn_plat_flag("no_libpack", 0)) {
         // 计算侧对齐闸的拒查有界具名（程序键 + 原因）：库根在、ckey 非空、state_ok 假 = 非对齐 sbuf 拒查，
         //   真机直接看到闸生效。每次取程序都可能撞上：一行一个事件只打前 8 条防日志洪泛，之后只累计。
@@ -1393,8 +1392,15 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
                 snprintf(lw, sizeof lw, "compute profile: %s", pw[0] ? pw : "invalid");
                 lrc = S2A_LIBPACK_REJECT; lwhy = S2A_LIBPACK_WHY_OTHER;
             } else {
+                nvn_gpu_caps caps;
+                nvn_gpu_caps_get(&caps);
+                const struct s2a_libpack_gfx g = {
+                    .profile_json = pc->profile_json, .profile_bytes = pc->profile_bytes,
+                    .storage_alignment = caps.min_ssbo_align,
+                    .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,
+                };
                 lrc = s2a_libpack_compute_v1(lp, ckey, (uint32_t)pc->direct_abi, pc->profile_hash,
-                                             pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy);
+                                             pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy);
             }
         }
         else {
@@ -2373,7 +2379,8 @@ static void compute_warm_note(const struct rp_prog *p, const struct s2a_direct_c
     for (int i = 0; i < 16; i++)
         if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment &&
             rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) unaligned = 1;
-    rec.lp_ok = unaligned ? 0 : 2;
+    rec.lp_ssbo_window = unaligned && p->lib_sourced;
+    rec.lp_ok = !unaligned || rec.lp_ssbo_window ? 2 : 0;   // 非对齐且不是窗口库来的（现编出的）：预热不拿库当它的等价物
     nvk_prog_warm_note(&rec);
 }
 static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在内层；外层 rp_shader_resolve_compute 做停局准入登记（#907）
@@ -2480,7 +2487,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0) && s2a_program_cache_load(cdir, rq.identity, &bytes, &len, NULL, why, sizeof why) == 0) atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
-        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len)) {
+        if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, NULL, &pc, &bytes, &len)) {
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 1);
             free(bytes); bytes = NULL; len = 0;
             if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(); }
