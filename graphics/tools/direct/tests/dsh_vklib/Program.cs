@@ -10,7 +10,7 @@
 //      打 VKFP_SRC= / VKFP= / XFP= 三行，由 t_dsh_vklib.sh 与 VkFpPrint、按公式重算的值比（指纹随源码 / 翻译器变的核对在脚本里）；
 //   ⑩ VkLib.Pack 把三键的产物打成离线 Vulkan 库（LibPack 容器）：按宿主格式（graphics/nvn/lib_pack.inc 文件头）自己解析 lib.idx——魔数、版本 1、链号，
 //      12 条记录按 (键, 种类) 升序、_b.json 种类 1 / _b.spv 种类 52、_vg<t>.json 种类 112+t / _vg<t>.spv 种类 120+t，每段字节 = 逐键文件，
-//      头部 36–43 = 完整指纹 VkLib.Fp（u64 小端）、44–47 为 0；同一目录再打一次报红。
+//      头部 36–43 = 完整指纹 VkLib.Fp（u64 小端）、44–47 为 S2SB；同一目录再打一次报红。
 // 用法：dsh_vklib_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx>
 using S2A.Dsh;
 using S2A.DshVkLib;
@@ -142,15 +142,30 @@ static class Program
         {
             byte[] idx = File.ReadAllBytes(Path.Combine(lib, "lib.idx")), pak = File.ReadAllBytes(Path.Combine(lib, "lib.000.pak"));
             uint n = BitConverter.ToUInt32(idx, 12), ns = BitConverter.ToUInt32(idx, 16);
-            Check($"⑩ 头：魔数 S2ALIB、版本 1、链号 0123456789ab、{n} 条记录、{ns} 个分片", idx.AsSpan(0, 8).SequenceEqual("S2ALIB\0\0"u8) && BitConverter.ToUInt32(idx, 8) == 1 && Encoding.ASCII.GetString(idx, 24, 12) == "0123456789ab" && n == 12 && ns == 1 && idx.Length == 48 + 16 * ns + 24 * n);
-            Check($"⑩ 头部 36–43 = 完整指纹 {VkLib.Fp}（u64 小端）、44–47 为 0", BitConverter.ToUInt64(idx, 36) == Convert.ToUInt64(VkLib.Fp, 16) && BitConverter.ToUInt32(idx, 44) == 0);
-            var wantRec = fx.Select(f => (Key(f.Ctl), new[] { (1, "_b.json"), (52, "_b.spv") }))
-                .Append((gk, new[] { (112, "_vg0.json"), (113, "_vg1.json"), (115, "_vg3.json"), (120, "_vg0.spv"), (121, "_vg1.spv"), (123, "_vg3.spv") }))
-                .OrderBy(e => Convert.ToUInt64(e.Item1, 16)).SelectMany(e => e.Item2.Select(r => (e.Item1, r.Item1, r.Item2))).ToList();
+            Check($"⑩ 头：魔数 S2ALIB、版本 1、链号 0123456789ab、{n} 条记录、{ns} 个分片", idx.AsSpan(0, 8).SequenceEqual("S2ALIB\0\0"u8) && BitConverter.ToUInt32(idx, 8) == 1 && Encoding.ASCII.GetString(idx, 24, 12) == "0123456789ab" && n == 6 && ns == 1 && idx.Length == 48 + 16 * ns + 24 * n);
+            Check($"⑩ 头部 36–43 = 完整指纹 {VkLib.Fp}（u64 小端）、44–47 为 S2SB", BitConverter.ToUInt64(idx, 36) == Convert.ToUInt64(VkLib.Fp, 16) && idx.AsSpan(44, 4).SequenceEqual("S2SB"u8));
             var got = Enumerable.Range(0, (int)n).Select(i => 48 + 16 * (int)ns + 24 * i).Select(o => (Key: BitConverter.ToUInt64(idx, o), Kind: (int)idx[o + 8], Len: BitConverter.ToUInt32(idx, o + 12), Off: BitConverter.ToUInt64(idx, o + 16))).ToList();
-            Check("⑩ 12 条记录按 (键, 种类) 升序、_b.json 种类 1 / _b.spv 种类 52、_vg<t>.json 112+t / _vg<t>.spv 120+t、每段字节 = 逐键文件",
-                got.Count == wantRec.Count && got.Zip(wantRec).All(x => x.First.Key == Convert.ToUInt64(x.Second.Item1, 16) && x.First.Kind == x.Second.Item2
-                    && pak.AsSpan((int)x.First.Off, (int)x.First.Len).SequenceEqual(File.ReadAllBytes(Path.Combine(outDir, x.Second.Item1 + x.Second.Item3)))));
+            Check("离线记录按键和种类排序", got.SequenceEqual(got.OrderBy(r => r.Key).ThenBy(r => r.Kind)));
+            // Each ordinary stage and each emitted geometry topology gets its own binary facts
+            // and unencoded SPIR-V payload. Compare against the independent translator output.
+            var stageRecords = fx.Select(f => (Key: Key(f.Ctl), Kind: 128, Suffix: "_b.spv"))
+                .Concat(new[] { 0, 1, 3 }.Select(t => (Key: gk, Kind: 129 + t, Suffix: $"_vg{t}.spv")));
+            foreach (var stage in stageRecords)
+            {
+                var records = got.Where(r => r.Key == Convert.ToUInt64(stage.Key, 16) && r.Kind == stage.Kind).ToArray();
+                byte[] spv = File.ReadAllBytes(Path.Combine(outDir, stage.Key + stage.Suffix));
+                Check($"阶段二进制 kind {stage.Kind} 含 S2SB 头与逐字节相同的原始 SPIR-V",
+                    records.Length == 1 && records[0].Len >= 64 + spv.Length &&
+                    pak.AsSpan((int)records[0].Off, 4).SequenceEqual("S2SB"u8) &&
+                    pak.AsSpan((int)(records[0].Off + records[0].Len) - spv.Length, spv.Length).SequenceEqual(spv));
+            }
+            foreach (var record in got)
+            {
+                var bytes = pak.AsSpan((int)record.Off, (int)record.Len).ToArray();
+                byte[] digest = bytes.AsSpan(32, 32).ToArray();
+                Array.Clear(bytes, 32, 32);
+                Check($"阶段 {record.Kind} 的 SHA-256 覆盖整个记录", digest.SequenceEqual(SHA256.HashData(bytes)));
+            }
             var (pb2, _) = VkLib.Pack(outDir, lib, "0123456789ab");
             Check($"⑩ 同一目录再打一次 → 报红（{string.Join("；", pb2)}）", pb2.Count > 0);
         }

@@ -129,6 +129,60 @@ static int samp2_shape_ok(uint16_t r) {
 }
 
 static const struct rp_prog *g_prog; static nvn_gpu_pipe g_pipe; static nvn_gpu_cmd g_pipe_cmd;
+
+// ---- 程序调用榜（纯诊断，只记数）：每笔绘制按程序累计一次，每个分时窗口按次数取前 N 个打一行（rp_present.c，nvk_hitch_log 开时）----
+//   8E 第 2 班只开 C 后每帧 GPU 多 ~14 ms：改走库的 193 个程序里每帧调用最多的是哪几支、来源是库还是现编，日志里没有逐程序次数，只能猜。
+//   键 = rp_prog 指针（同一份程序同一地址）；身份前 4 字节 / 来源 / binst 位 / 阶段数在第一次记下时拷一份，窗口取走时不再碰程序对象。
+enum { RP_PC_SLOTS = 512, RP_PC_PROBE = 8 };
+static struct rp_pc { const struct rp_prog *p; uint32_t n; uint32_t cuts; uint64_t kb; uint8_t id[4], lib, binst, nst, used; } g_pc[RP_PC_SLOTS];
+static const struct rp_prog *g_pc_cur;   // 当前这笔绘制的程序（rp_pc_note 置、rp_pc_sync_note 读：把池镜像同步归到它名下）
+static void rp_pc_note(const struct rp_prog *p) {
+    g_pc_cur = p;
+    if (!p) return;
+    unsigned h = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (RP_PC_SLOTS - 1);
+    for (unsigned i = 0; i < RP_PC_PROBE; i++) {
+        struct rp_pc *e = &g_pc[(h + i) & (RP_PC_SLOTS - 1)];
+        if (e->used && e->p == p) { e->n++; return; }
+        if (!e->used) {
+            e->used = 1; e->p = p; e->n = 1; memcpy(e->id, p->identity, 4);
+            e->lib = p->lib_sourced; e->binst = p->binst_unread; e->nst = (uint8_t)(p->nent[0] + p->nent[1] + p->nent[2] ? 1 : 0);
+            return;
+        }
+    }
+}
+// 池镜像同步归账（rp_buf.c sync_run 调用，诊断）：bytes = 本串同步字节，second = 1 表示这一串是「同一提交里第二次同步」（要录成传输、结束通道，rp_xfer_cmd 的 last_sub 分支），
+//   pool = 池基址，off = 池内偏移。记在当前程序名下；第二次同步的前 24 次打一行（资源范围 / 所在池 / 程序身份），nvk_hitch_log 开时。
+void rp_pc_sync_note(uint64_t bytes, int second, uintptr_t pool, uint64_t off) {
+    const struct rp_prog *p = g_pc_cur;
+    if (!p) return;
+    unsigned h = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (RP_PC_SLOTS - 1);
+    for (unsigned i = 0; i < RP_PC_PROBE; i++) {
+        struct rp_pc *e = &g_pc[(h + i) & (RP_PC_SLOTS - 1)];
+        if (!e->used || e->p != p) continue;
+        e->kb += bytes / 1024; if (second) e->cuts++;
+        break;
+    }
+    static unsigned said;   // 提交线程独占（sync_run 在绘制路径里调用）；有界 24
+    if (second && said < 24 && nvn_plat_flag("nvk_hitch_log", 0)) { said++;
+        char b[260]; snprintf(b, sizeof b, "同提交第二次同步切通道：程序 %02x%02x%02x%02x[%s] 池 %#llx 偏移 %#llx 长 %llu KB", p->identity[0], p->identity[1], p->identity[2], p->identity[3],
+                              p->lib_sourced ? "库" : "现编", (unsigned long long)pool, (unsigned long long)off, (unsigned long long)(bytes / 1024));
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b);
+    }
+}
+// 取走并清空：按次数降序取前 top 个写成一行文本，frames = 本窗口帧数（求每帧调用）。返回写入长度，0 = 本窗口没有记录。
+size_t rp_prog_calls_take(char *out, size_t cap, double frames, unsigned top) {
+    struct rp_pc *sel[RP_PC_SLOTS]; unsigned ns = 0; uint64_t total = 0, libn = 0;
+    for (unsigned i = 0; i < RP_PC_SLOTS; i++) if (g_pc[i].used) { sel[ns++] = &g_pc[i]; total += g_pc[i].n; if (g_pc[i].lib) libn += g_pc[i].n; }
+    if (!ns || !cap) { memset(g_pc, 0, sizeof g_pc); return 0; }
+    for (unsigned i = 0; i < ns && i < top; i++) for (unsigned j = i + 1; j < ns; j++) if (sel[j]->n > sel[i]->n) { struct rp_pc *t = sel[i]; sel[i] = sel[j]; sel[j] = t; }
+    double f = frames > 0 ? frames : 1;
+    size_t o = (size_t)snprintf(out, cap, "分时（程序调用榜，每帧）：共 %u 支程序、%.1f 笔，其中库来源 %.1f 笔（%.0f%%）；前 %u：", ns, (double)total / f, (double)libn / f, total ? 100.0 * (double)libn / (double)total : 0.0, ns < top ? ns : top);
+    for (unsigned i = 0; i < ns && i < top && o < cap; i++)
+        o += (size_t)snprintf(out + o, cap - o, "%s%02x%02x%02x%02x[%s%s]%.1f（二次同步切%.1f、同步%.0fKB）", i ? "、" : "", sel[i]->id[0], sel[i]->id[1], sel[i]->id[2], sel[i]->id[3],
+                              sel[i]->lib ? "库" : "现编", sel[i]->binst ? "" : "，binst未证", (double)sel[i]->n / f, (double)sel[i]->cuts / f, (double)sel[i]->kb / f);
+    memset(g_pc, 0, sizeof g_pc);
+    return o < cap ? o : cap - 1;
+}
 static uint64_t g_draws, g_skips, g_dispatches; static uint32_t g_prim = ~0u; static int g_quads = -1, g_face = -1;   // g_quads：这笔的索引展开方式（EXP_*）
 static int g_ms_off;   // #1015：当前管线是「多重采样目标上关了多重采样」（游戏 ms.enable = 0、目标样本数 > 1）
 
@@ -588,6 +642,27 @@ static int sb_window(const p_bind_buf *sb, int align_down, uint64_t *wa, uint64_
     }
     *wa = a; *wl = l; return clamped;
 }
+// 诊断（nvk_hitch_log 开时）：每个（程序身份前 4 字节, 阶段, 槽）头 2 次记一行存储缓冲窗口——游戏绑的长度（0 = 取池剩余）、窗口起点余数与长度、池剩余、被夹标志。
+//   用来看「窗口取址的库程序」每笔向回放要多大一段存储缓冲：窗口长度 × 脏页同步量。有界（共 96 行）。
+static void sb_window_note(const struct rp_prog *pg, int st, unsigned slot, const p_bind_buf *sb, uint64_t wa, uint64_t wl, int clamped) {
+    static int on = -1; static unsigned k, lines;
+    if (on < 0 || !(++k & 1023)) on = nvn_plat_flag("nvk_hitch_log", 0) != 0;
+    if (!on || lines >= 96) return;
+    static struct { uint32_t id; uint8_t st, slot, n; } seen[256]; static unsigned nseen;
+    uint32_t id; memcpy(&id, pg->identity, 4);
+    unsigned i = 0;
+    for (; i < nseen; i++) if (seen[i].id == id && seen[i].st == st && seen[i].slot == slot) break;
+    if (i == nseen) { if (nseen == 256) return; seen[nseen].id = id; seen[nseen].st = (uint8_t)st; seen[nseen].slot = (uint8_t)slot; seen[nseen].n = 0; nseen++; }
+    if (seen[i].n >= 2) return;
+    seen[i].n++; lines++;
+    const uint8_t *pm = NULL; uint64_t ps = 0, rem = 0;
+    if (rp_pool_find(sb->addr, 1, &pm, &ps)) rem = ps - (sb->addr - (uint64_t)(uintptr_t)pm);
+    char d[240];
+    snprintf(d, sizeof d, "存储缓冲窗口 程序 %02x%02x%02x%02x 阶段 %d 槽 %u：游戏绑长度 %llu%s，窗口起点余数 %llu、窗口长度 %llu，池剩余 %llu，夹 %d（第 %u 次）",
+             pg->identity[0], pg->identity[1], pg->identity[2], pg->identity[3], st, slot, (unsigned long long)sb->size, sb->size ? "" : "（0 = 取池剩余）",
+             (unsigned long long)(sb->addr - wa), (unsigned long long)wl, (unsigned long long)rem, clamped, (unsigned)seen[i].n);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", d);
+}
 // Bounded per-session first-cause detail; bytes do not split one cause into repeated messages.
 enum { ARENA_REASON_MAX = 8 };
 static struct { int rc; char why[sizeof ((nvn_gpu_err *)0)->why]; } g_arena_reasons[ARENA_REASON_MAX];
@@ -993,7 +1068,7 @@ static void hz_build(nvn_gpu_cmd c, const void *rec, uint8_t mask) {
     // 先把全部间接记录解析完（脏页同步可能录进主段），再判旧表还能不能沿用、再录拷贝：拷贝之后不能再有同步改这些记录
     static uint64_t ra[HZ_MAX], rl[HZ_MAX], ro[HZ_MAX]; static nvn_gpu_buf rb[HZ_MAX]; static unsigned char rok[HZ_MAX];
     for (int i = 0; i < t->n; i++) { ra[i] = t->e[i].ind; rl[i] = t->e[i].indexed ? 20 : 16; }
-    if (t->n) rp_buf_resolve_multi(t->n, ra, rl, rb, ro, rok);   // 一次抢锁解析一批（同顶点流）
+    if (t->n) rp_buf_resolve_multi(NULL, t->n, ra, rl, rb, ro, rok);   // 一次抢锁解析一批（同顶点流）
     int n = 0;
     for (int i = 0; i < t->n; i++) {
         if (!rok[i] || (ro[i] & 3)) continue;   // 解析不了：这一笔到时自己按原路记未接
@@ -1567,6 +1642,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }
         if (np != g_prog) { g_prog = np; rp_pso_dirty = 1; }
     }
+    rp_pc_note(g_prog);   // 程序调用榜（诊断，只计数）
 draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置，下面按新程序重取资源与管线）
     // 仅拒绝绑定 DRV0 且未证明不读 base instance 的已解码 count 组；单条间接/#941 和 OP_MULTI_DRAW 保持原路径。
     // 组大小 1（max_draws = 1）只有一条命令，没有「别的命令的 firstInstance 被第一条顶替」的问题，语义与单条间接绘制相同：
@@ -1602,7 +1678,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         }
         if (nv) {
             nvn_gpu_buf vbuf[16];
-            rp_buf_resolve_multi(nv, vaddr, vlen, vbuf, voff, vok);
+            rp_buf_resolve_multi(c, nv, vaddr, vlen, vbuf, voff, vok);
             int k = 0;
             for (int i = 0; i < 16; i++) if (streams >> i & 1) {
                 if (!vok[k]) { skip("vertex_buffer_unresolved", rec); return; }
@@ -1625,12 +1701,13 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             if (e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) continue;
             const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
             if (!sb || !sb_len(sb, e->src_kind == NVN_RB_SBUFP)) continue;
-            uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);   // 与发绑定时同一个窗口（被夹短的记账在发绑定那边）
+            uint64_t wa, wl; const int wclamp = sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);   // 与发绑定时同一个窗口（被夹短的记账在发绑定那边）
+            if (e->src_kind == NVN_RB_SBUFP) sb_window_note(g_prog, st, e->src_reg, sb, wa, wl, wclamp);
             if (nb < SB_BATCH) { bs[nb] = st; bi[nb] = (int)i; ba[nb] = wa; bl[nb] = wl; nb++; }
             else if (rp_buf_resolve(c, wa, wl, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
         }
         if (nb) {
-            rp_buf_resolve_multi(nb, ba, bl, bb, bo, bok);
+            rp_buf_resolve_multi(NULL, nb, ba, bl, bb, bo, bok);
             for (int k = 0; k < nb; k++) if (bok[k]) { g_sb_buf[bs[k]][bi[k]] = bb[k]; g_sb_off[bs[k]][bi[k]] = bo[k]; g_sb_ok[bs[k]][bi[k]] = 1; }
         }
     }
