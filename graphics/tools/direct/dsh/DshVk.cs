@@ -377,8 +377,15 @@ namespace S2A.Dsh
                 : DshCompiler.PackFiles != null && DshCompiler.PackFiles.TryGetValue(jsonName, out var t) ? t
                 : throw new DshError("export failed", "出包模式下 PackFiles 里没有 " + jsonName);
             var json = JsonNode.Parse(jsonText).AsObject();
-            byte[] spv = BindToArgIds(VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot),
-                json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings"), stage);
+            var bindings = json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings");
+            byte[] spv = VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot);
+            if (stage is "vs" or "ps")
+            {
+                StorageWindowContract(json, bindings, spv);
+                if (DshCompiler.PackOut) DshCompiler.PackFiles[jsonName] = json.ToJsonString();
+                else File.WriteAllText(Path.Combine(outDir, jsonName), json.ToJsonString());
+            }
+            spv = BindToArgIds(spv, bindings, stage);
             if (DshCompiler.PackOut) PackSpv[spvName] = spv;
             else
             {
@@ -400,6 +407,7 @@ namespace S2A.Dsh
             try
             {
                 var (j, _) = c.JobFor(stage, code, ctl);
+                if (stage is "vs" or "ps") j["storage_window_mask"] = true;
                 c.TranslateFirst(j);
                 string spv = Path.Combine(w, key + ".spv");
                 if (stage == "vs")
@@ -472,6 +480,33 @@ namespace S2A.Dsh
             return used;
         }
 
+        // The Vulkan-only retranslation can introduce a c0 read for a base
+        // address that the aligned Metal translation did not need to read.
+        static void StorageWindowContract(JsonObject json, JsonArray bindings, byte[] spv)
+        {
+            const string maskName = "s2a_storage_window_mask";
+            uint[] words = Words(spv);
+            Info info = ReadInfo(words);
+            json["ssbo_window_abi"] = 1;
+            var masks = info.Names.Where(pair => pair.Value == maskName).Select(pair => pair.Key).ToArray();
+            if (masks.Length == 0) return;
+            if (masks.Length != 1 || !Insts(words).Any(inst => inst.Op == 50 && inst.A.Length == 3 &&
+                    inst.A[1] == masks[0] && inst.A[2] == uint.MaxValue))
+                throw new DshError("export failed", "invalid Vulkan storage window mask");
+            json["ssbo_window_mask"] = masks[0];
+            var used = UsedVars(words, info);
+            foreach (var (id, v) in info.Var)
+            {
+                if (v.Class != 2 || !used.Contains(id) || !info.Deco.TryGetValue(id, out var deco) ||
+                    !deco.ContainsKey(33) || !deco.TryGetValue(34, out uint set) || set != 0 ||
+                    !info.Names.TryGetValue(id, out string name) || !name.EndsWith("_c0", StringComparison.Ordinal))
+                    continue;
+                if (bindings.Any(binding => (string)binding["msl_name"] == name)) continue;
+                long argId = bindings.Select(binding => (long)binding["arg_id"]).DefaultIfEmpty(-1).Max() + 1;
+                bindings.Add(new JsonObject { ["msl_name"] = name, ["arg_id"] = argId, ["kind"] = "drvcb", ["bank"] = 0 });
+            }
+        }
+
         public static byte[] BindToArgIds(byte[] spv, JsonArray bindings, string stage)
         {
             if (!StageNo.TryGetValue(stage, out uint stageNo)) throw new DshError("export failed", "未知阶段 " + stage);
@@ -539,6 +574,7 @@ namespace S2A.Dsh
                     ["key"] = key + "_vg" + t, ["stage"] = "gs", ["dm_ctl"] = key, ["gs_input_topology"] = t,
                     ["resolution_scale_abi"] = res["resolution_scale_abi"]?.DeepClone(), ["notes"] = res["notes"]?.DeepClone(), ["bindings"] = bindings,
                 };
+                StorageWindowContract(json, bindings, spv);
                 outFiles[key + "_vg" + t + ".json"] = System.Text.Encoding.UTF8.GetBytes(json.ToJsonString());
                 outFiles[key + "_vg" + t + ".spv"] = BindToArgIds(spv, bindings, "gs");
             }
@@ -555,6 +591,7 @@ namespace S2A.Dsh
             {
                 var (j, _) = c.JobFor("gs", code, ctl);
                 j["gs_input_topology"] = topology;
+                j["storage_window_mask"] = true;
                 c.TranslateFirst(j);
                 return (XIo.ReadAllBytes(Path.Combine(w, key + ".spv")), JsonNode.Parse(XIo.ReadAllText(Path.Combine(w, key + ".res.json"))).AsObject());
             }
