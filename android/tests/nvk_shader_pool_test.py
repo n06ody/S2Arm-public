@@ -291,6 +291,12 @@ def main():
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
         return result.returncode
 
+    if len(sys.argv) == 6 and sys.argv[1] in ('--emit-nowindow', '--execute-nowindow', '--nowindow-arms'):
+        result = run('nowindow-real', original, args=sys.argv[1:], extra_flags=['-DS2A_ANDROID_DEBUG_ENV=1'])
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
     if len(sys.argv) == 6 and sys.argv[1] in ('--emit-high-slot', '--execute-high-slot', '--emit-reuse-texture', '--emit-reuse-rt', '--emit-reuse-inactive', '--emit-real', '--emit-real-tbuf', '--execute-tbuf', '--emit-compute-tbuf', '--execute-compute-tbuf', '--reject-graphics-tbufu', '--reject-compute-tbufu'):
         result = run('emit-real', original, args=sys.argv[1:])
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
