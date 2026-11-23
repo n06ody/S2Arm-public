@@ -42,9 +42,9 @@ static int trec_cmp(const void *a, const void *b) {
     return x->kind < y->kind ? -1 : x->kind > y->kind;
 }
 // 写 <g_dir>/lib.000.pak（段字节顺序拼接）与 lib.idx；recs[i].off 按拼接回填。
-static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
+static int mk_pack_at(const char *dir, int binary, struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
     char p[400];
-    snprintf(p, sizeof p, "%s/lib.000.pak", g_dir);
+    snprintf(p, sizeof p, "%s/lib.000.pak", dir);
     FILE *f = fopen(p, "wb");
     if (!f) return -1;
     uint64_t off = 0;
@@ -57,19 +57,27 @@ static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], siz
     wr32(idx, 1, &at); wr32(idx, n, &at); wr32(idx, nshard ? nshard : 1, &at); wr32(idx, 0, &at);
     char chain[12] = {0}; memcpy(chain, CHAIN, 12);
     wr(idx, chain, 12, &at); memset(idx + at, 0, 48 - at); at = 48;
+    if (binary) memcpy(idx + 44, "S2SB", 4);
     for (uint32_t s = 0; s < (nshard ? nshard : 1); s++) { wr64(idx, s == 0 ? off : 0, &at); wr64(idx, 0, &at); }
     for (uint32_t i = 0; i < n; i++) {
         wr64(idx, recs[i].key, &at); idx[at++] = recs[i].kind; idx[at++] = recs[i].shard;
         idx[at++] = 0; idx[at++] = 0;
         wr32(idx, recs[i].len, &at); wr64(idx, recs[i].off, &at);
     }
-    snprintf(p, sizeof p, "%s/lib.idx", g_dir);
+    snprintf(p, sizeof p, "%s/lib.idx", dir);
     f = fopen(p, "wb");
     if (!f) return -1;
     fwrite(idx, 1, at, f);
     fclose(f);
     return 0;
 }
+
+static int mk_pack(struct trec *recs, uint32_t n, const uint8_t *payloads[], size_t plens[], uint32_t nshard) {
+    return mk_pack_at(g_dir, 0, recs, n, payloads, plens, nshard);
+}
+#ifdef S2A_LIBPACK_PACKER
+#include "libpack_stage_cases.inc"
+#endif
 
 static const char *VS_JSON =
     "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
@@ -373,6 +381,53 @@ static int c0_program(const char *vs_json, const void *vs_spv, size_t vs_n, cons
     s2a_libpack_close(lp);
     return rc;
 }
+// 存储缓冲窗口准入：写一份带窗口合同（ssbo_window_abi:1，无掩码）的 vs+fs 容器，按给定绘制事实合成。返回 s2a_libpack_program_v1 的 rc。
+static int window_program(const struct s2a_libpack_gfx *gfx, uint8_t **j, size_t *jl, char *why, size_t why_size) {
+    char vs[1500], ps[600];
+    snprintf(vs, sizeof vs, "%.*s,\"ssbo_window_abi\":1}", (int)strlen(VS_JSON) - 1, VS_JSON);
+    snprintf(ps, sizeof ps, "%.*s,\"ssbo_window_abi\":1}", (int)strlen(PS_JSON) - 1, PS_JSON);
+    struct trec r[4] = {
+        { .key = 0x0123456789abcdef, .kind = 1,  .len = (uint32_t)strlen(vs) },
+        { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)sizeof libpack_vert_spv },
+        { .key = 0x1032547698badcfe, .kind = 1,  .len = (uint32_t)strlen(ps) },
+        { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)sizeof libpack_frag_spv },
+    };
+    const uint8_t *p[4] = { (const uint8_t *)vs, libpack_vert_spv, (const uint8_t *)ps, libpack_frag_spv };
+    size_t n[4] = { strlen(vs), sizeof libpack_vert_spv, strlen(ps), sizeof libpack_frag_spv };
+    uint8_t keys[6][8] = {{0}};
+    const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }, kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
+    memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
+    if (mk_pack(r, 4, p, n, 1)) return -9;
+    struct s2a_libpack *lp = NULL;
+    if (s2a_libpack_open(&lp, g_dir) != 1 || !lp) return -9;
+    *j = NULL; *jl = 0;
+    int rc = s2a_libpack_program_v1(lp, keys, 0x3, gfx, 1, "h", "c", j, jl, why, why_size);
+    s2a_libpack_close(lp);
+#ifdef S2A_LIBPACK_PACKER
+    uint8_t *records[2] = {0};
+    size_t sizes[2] = {0};
+    struct trec binary[2] = { { .key = r[0].key, .kind = 128 }, { .key = r[2].key, .kind = 128 } };
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(!s2a_pack_stage(keys[i], i, -1, 0, p[2*i], n[2*i], p[2*i+1], n[2*i+1],
+                              &records[i], &sizes[i]), "encode real window variant");
+        binary[i].len = (uint32_t)sizes[i];
+    }
+    const uint8_t *payloads[] = { records[0], records[1] };
+    lp = NULL;
+    if (records[0] && records[1] && !mk_pack_at(g_dir, 1, binary, 2, payloads, sizes, 1) &&
+        s2a_libpack_open(&lp, g_dir) == 1) {
+        struct fd_program output = {0};
+        char reason[160] = "";
+        int got = s2a_libpack_binary_program(lp, keys, 3, gfx, 0, &output, NULL, reason, sizeof reason);
+        CHECK(got == rc, "S2SB and JSON apply the same fixed SSBO window gate");
+        if (rc < 0) CHECK(strstr(reason, "fixed SSBO window") != NULL, "binary names the fixed SSBO window");
+        nvn_vk_program_free(&output);
+        s2a_libpack_close(lp);
+    } else CHECK(0, "open encoded window fixture");
+    free(records[0]); free(records[1]);
+#endif
+    return rc;
+}
 // 把 c0 片元 SPIR-V 改成「不能证实」的几种：0 = Block 改 BufferBlock（旧式存储缓冲）、1 = Uniform 存储类改 StorageBuffer、2 = 描述符集改 1、
 //   3 = 输出变量 o 也带 Binding 22（同一绑定号两个变量，指不出是哪一个）
 static void c0_patch_spv(uint32_t *w, size_t nw, int what) {
@@ -387,11 +442,57 @@ static void c0_patch_spv(uint32_t *w, size_t nw, int what) {
     }
 }
 
+// A mounted revision must keep reading the same shard after an atomic package replacement.
+static void check_shard_lifetime(const char *parent) {
+    char dir[TMPL_CAP + 16], path[400], replacement[400], index[400];
+    snprintf(dir, sizeof dir, "%s/rotation", parent);
+    snprintf(path, sizeof path, "%s/lib.000.pak", dir);
+    snprintf(replacement, sizeof replacement, "%s/new.pak", dir);
+    snprintf(index, sizeof index, "%s/lib.idx", dir);
+    const uint8_t key[8] = {0};
+    const uint8_t *payload[] = {(const uint8_t *)"old"};
+    size_t lengths[] = {3};
+    struct trec rec = {.kind = 1, .len = 3};
+    struct s2a_libpack *before = NULL, *after = NULL;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char why[160];
+    CHECK(!mkdir(dir, 0700) && !mk_pack_at(dir, 0, &rec, 1, payload, lengths, 1), "write rotation fixture");
+    CHECK(s2a_libpack_open(&before, dir) == 1, "open original revision");
+    CHECK(!s2a_libpack_get(before, key, 1, &bytes, &len, why, sizeof why) &&
+          len == 3 && !memcmp(bytes, "old", len), "original revision reads original shard");
+    free(bytes);
+    FILE *f = fopen(replacement, "wb");
+    CHECK(f != NULL, "create replacement shard");
+    if (f) {
+        CHECK(fwrite("new", 1, 3, f) == 3, "write replacement shard");
+        CHECK(!fclose(f) && !rename(replacement, path), "publish equal-size replacement shard");
+        CHECK(!s2a_libpack_get(before, key, 1, &bytes, &len, why, sizeof why) &&
+              len == 3 && !memcmp(bytes, "old", len), "open revision retains original shard after replacement");
+        free(bytes);
+        bytes = NULL;
+        CHECK(s2a_libpack_open(&after, dir) == 1 &&
+              !s2a_libpack_get(after, key, 1, &bytes, &len, why, sizeof why) &&
+              len == 3 && !memcmp(bytes, "new", len), "reopened revision reads replacement shard");
+        free(bytes);
+        CHECK(!truncate(path, 1) && s2a_libpack_get(after, key, 1, &bytes, &len, why, sizeof why) ==
+              S2A_LIBPACK_REJECT && !bytes && !len, "truncation of open shard returns a named rejection");
+    }
+    s2a_libpack_close(after);
+    s2a_libpack_close(before);
+    unlink(index);
+    unlink(path);
+    unlink(replacement);
+    rmdir(dir);
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
     char tmpl[TMPL_CAP];
     if (snprintf(tmpl, sizeof tmpl, "%s/libpack_vk_test.XXXXXX", tmp) >= (int)sizeof tmpl || !mkdtemp(tmpl)) return 1;
     snprintf(g_dir, sizeof g_dir, "%s", tmpl);
+
+    check_shard_lifetime(tmpl);
 
     // ---- 缺席目录 / 坏 lib.idx ----
     {
@@ -670,6 +771,9 @@ int main(void) {
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
         CHECK(s2a_libpack_open(&slp, g_dir) == 1 && slp, "open separate-sampler pack");
         int rc = slp ? s2a_libpack_program_v1(slp, keys, 3, NULL, 1, "h", "c", &j, &jl, w, sizeof w) : -1;
+#ifdef S2A_LIBPACK_PACKER
+        check_binary_contract(keys, 3, pr, nr, rc, j, jl, w, variant == SEPARATE_C2);
+#endif
         if (variant == SEPARATE_C2 || variant == SUPPORT_FROM_SPV || variant == SUPPORT_LISTED) {
             struct fd_program parsed = {0}; char why[192] = "";
             CHECK(rc == 0 && j && has(j, "\"schema\":\"s2a-direct-program-v2\""),
@@ -743,7 +847,8 @@ int main(void) {
     }
 
     // 计算着色器实际读取组合纹理与支撑缓冲，分别核对反射列出和缺席两种输入。
-    for (int variant = SUPPORT_FROM_SPV; variant <= SUPPORT_WRONG_OWNER; variant++) {
+    enum { COMPUTE_TYPE3_UBO = SUPPORT_WRONG_OWNER + 1 };
+    for (int variant = SUPPORT_FROM_SPV; variant <= COMPUTE_TYPE3_UBO; variant++) {
         const uint8_t key[8] = { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
         char reflection[512];
         snprintf(reflection, sizeof reflection,
@@ -754,6 +859,13 @@ int main(void) {
                  variant == SUPPORT_FROM_SPV ? "" : variant == SUPPORT_LISTED ?
                  ",{\"msl_name\":\"support_buffer\",\"kind\":\"support\",\"arg_id\":3}" :
                  ",{\"msl_name\":\"cp_c3_wrong_owner\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":3}");
+        if (variant == COMPUTE_TYPE3_UBO) {
+            snprintf(reflection, sizeof reflection,
+                     "{\"stage\":\"cs\",\"dm_ctl\":\"c0c1c2c3c4c5c6c7\",\"bindings\":["
+                     "{\"msl_name\":\"cp_t_cb5_3001C028\",\"kind\":\"tex_ubo\",\"reg\":2,\"off\":40,\"arg_id\":1},"
+                     "{\"msl_name\":\"cp_t_cb5_3001C028Smplr\",\"kind\":\"samp_id\",\"reg\":7,\"arg_id\":2},"
+                     "{\"msl_name\":\"cp_i0\",\"kind\":\"img\",\"reg\":0,\"arg_id\":4}]}");
+        }
         snprintf(g_dir, sizeof g_dir, "%s/v2cs%d", tmpl, variant);
         CHECK(mkdir(g_dir, 0700) == 0, "create compute v2 pack directory");
         size_t sizes[2] = { strlen(reflection), sizeof libpack_support_v2_comp_spv };
@@ -767,7 +879,17 @@ int main(void) {
         CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute v2 pack");
         uint8_t *j = NULL; size_t jl = 0; char why[192] = "";
         int rc = cl ? s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, &j, &jl, why, sizeof why) : -1;
-        if (variant == SUPPORT_WRONG_OWNER) {
+#ifdef S2A_LIBPACK_PACKER
+        uint8_t binary_keys[6][8] = {{0}};
+        memcpy(binary_keys[0], key, 8);
+        check_binary_contract(binary_keys, 32, payloads, sizes, rc, j, jl, why, 0);
+#endif
+        if (variant == COMPUTE_TYPE3_UBO) {
+            struct nvn_vk_compute_program parsed;
+            CHECK(!rc && j && nvn_vk_program_parse_compute(j,jl,&parsed,why,sizeof why) < 0 &&
+                  strstr(why,"compute binding has no reflected guest slot"),
+                  "current compute contract rejects type-3 guest UBO rather than reading c2");
+        } else if (variant == SUPPORT_WRONG_OWNER) {
             CHECK(rc == S2A_LIBPACK_REJECT && !j && strstr(why, "binding 23 is owned by support_buffer"),
                   "compute v2 rejects guest uniform ownership of support binding");
         } else {
@@ -1321,6 +1443,19 @@ int main(void) {
         if (rc != 0) printf("  vs c0 bank 0: rc=%d why=%s\n", rc, w);
         CHECK(rc == 0 && has(j, "\"kind\":\"uniform\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"slot\":0}"), "graphics vs c0 bank 0 → uniform binding 6 slot 0");
         free(j); j = NULL;
+        // 存储缓冲窗口准入：有合同、无掩码、带存储缓冲（vp_s0）的段——基址对齐照用，非对齐才拒（缺补偿）
+        {
+            const struct s2a_libpack_gfx aligned = { NULL, NULL, 0, 64, 0 }, unaligned = { NULL, NULL, 0, 64, 1 };
+            w[0] = 0;
+            rc = window_program(&aligned, &j, &jl, w, sizeof w);
+            if (rc != 0) printf("  window aligned: rc=%d why=%s\n", rc, w);
+            CHECK(rc == 0 && j, "ssbo window: aligned state, ABI 1, no mask, sbuf → HIT (library used as before)");
+            free(j); j = NULL;
+            w[0] = 0;
+            rc = window_program(&unaligned, &j, &jl, w, sizeof w);
+            CHECK(rc == -1 && !j && strstr(w, "SBUFP uses a fixed SSBO window"), "ssbo window: unaligned state, same library → REJECT by name (no compensation)");
+            free(j); j = NULL;
+        }
         // 负控：异 bank
         for (unsigned bank = 2; bank <= 3; bank++) {
             snprintf(ps, sizeof ps, PS_C0_FMT, bank, bank, 3u);
@@ -1435,7 +1570,7 @@ int main(void) {
         const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
         const uint8_t kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
         memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8); memset(keys[2], 0x60, 8);   // 紧排：vs / fs / gs（NVN 位序 0 / 1 / 2）
-        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx tri_on = { "Triangles", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
 
         // 命中：三段齐、gs 绑定号 = arg×6+3、宿主解析出第 2 段（gs）
@@ -1467,18 +1602,18 @@ int main(void) {
 
         // 设备没开 geometryShader（profile 同字段 false）：照旧 miss，不合成
         uint64_t m0 = s2a_libpack_misses();
-        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF) };
+        const struct s2a_libpack_gfx tri_off = { "Triangles", PROFILE_GS_OFF, strlen(PROFILE_GS_OFF), 0, 0 };
         w[0] = 0;
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &tri_off, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j
               && strstr(w, "geometryShader"), "geometryShader 没开 → MISS（原因写明）");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, NULL, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "没给绘制事实（gfx = NULL）→ 几何程序 MISS");
-        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0 };
+        const struct s2a_libpack_gfx noprof = { "Triangles", NULL, 0, 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &noprof, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "profile 读不出 → 按没开 MISS");
         // 图元：线输入没有 _vg1 → miss；邻接离线不出 → miss
-        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
-        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON) };
+        const struct s2a_libpack_gfx lines = { "Lines", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
+        const struct s2a_libpack_gfx adj = { "TrianglesAdjacency", PROFILE_GS_ON, strlen(PROFILE_GS_ON), 0, 0 };
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &lines, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,
               "线输入、库里只有三角那份 → MISS");
         CHECK(glp && s2a_libpack_program_v1(glp, keys, 0x7, &adj, 1, "h", "c", &j, &jl, w, sizeof w) == 1 && !j,

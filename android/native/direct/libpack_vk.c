@@ -6,11 +6,14 @@
 //   0x168 区 = 128+），_b.json 的 tex reg 是已解好的 NVN 纹理号 → slot = 8 + reg×2（reg<32）
 //   或 0x5A + (reg-128)×2；img 句柄在 0x120 区 → slot = 0x48 + reg×2。
 #include "libpack_vk.h"
+#include "libpack_stage_wire.h"
 #include "jv.h"   // 跨度式 JSON：_b.json 有长串字段（pos_slice 表 base64），s2a_json 短串上限吃不下
 #include "spirv_workgroup.h"   // s2a_spv_workgroup_bytes：计算出库的设备共享内存上限闸
 #include "../nvn/nvn_vk_program_result.h"   // SUPPORT_DEFAULT_BYTES：计算结果的 supportLayout.requiredSize
 
 #include <errno.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -41,7 +44,17 @@ static void s2a_lp_red(const char *fmt, ...) {
 #include "../../../graphics/nvn/lib_pack_core.inc"
 #include "../../../graphics/nvn/gfx/nvn/dmsh_chain.h"
 
-struct s2a_libpack { lp_pack p; _Atomic int caps_said, ilk_said; };   // ilk_said：本局已打过「丢掉互锁临界区」那一行红   // caps_said：本局（这次 open）已打过「删 64 位能力声明」那一行
+// Every slot owns its descriptor. Hold the slot lock through pread so another reader
+// cannot close or reuse the descriptor mid-read. Bound fd use even for large indexes.
+enum { LP_FD_SLOTS = 16 };
+struct lp_fd_slot { pthread_mutex_t lock; unsigned shard; int fd; };
+struct s2a_libpack {
+    lp_pack p;
+    struct lp_fd_slot *slots;
+    unsigned nslots;
+    _Atomic int caps_said, ilk_said;
+};
+
 
 static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped, g_interlock_dropped;
 uint64_t s2a_libpack_hits(void) { return atomic_load(&g_hits); }
@@ -55,13 +68,32 @@ int s2a_libpack_open(struct s2a_libpack **out, const char *dir) {
     struct s2a_libpack *lp = calloc(1, sizeof *lp);
     if (!lp) return -1;
     int rc = lp_open(&lp->p, dir, DMSH_CHAIN);
-    if (rc == 1) { *out = lp; return 1; }
+    if (rc == 1) {
+        unsigned n = lp->p.nshard < LP_FD_SLOTS ? lp->p.nshard : LP_FD_SLOTS;
+        if (n && !(lp->slots = calloc(n, sizeof *lp->slots))) goto broken;
+        for (; lp->nslots < n; lp->nslots++) {
+            struct lp_fd_slot *slot = &lp->slots[lp->nslots];
+            if (pthread_mutex_init(&slot->lock, NULL)) goto broken;
+            slot->fd = -1;
+        }
+        *out = lp;
+        return 1;
+    }
     free(lp);
     return rc;   // 0 none / -1 broken（lp_open 已报红）
+broken:
+    LP_RED("direct library container: cannot initialize shard reader");
+    s2a_libpack_close(lp);
+    return -1;
 }
 
 void s2a_libpack_close(struct s2a_libpack *lp) {
     if (!lp) return;
+    for (unsigned i = 0; i < lp->nslots; i++) {
+        if (lp->slots[i].fd >= 0) close(lp->slots[i].fd);
+        pthread_mutex_destroy(&lp->slots[i].lock);
+    }
+    free(lp->slots);
     if (lp->p.idx) munmap((void *)lp->p.idx, lp->p.idx_len);
     free(lp);
 }
@@ -78,38 +110,62 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
     *bytes = NULL; *len = 0;
     const lp_rec *r = lp_find(&lp->p, lp_key8(key), kind);
     if (!r) return S2A_LIBPACK_MISS;
-    if (lp_shard(r) >= lp->p.nshard || r->off + r->len > lp->p.ssize[2 * lp_shard(r)]) {
+    if (kind >= 128 && !memcmp(lp->p.idx + 44, "S2SB", 4) &&
+        r->len > NVK_PROGRAM_RESULT_MAX_BYTES + SB_HEADER + SB_SECTIONS * SB_SECTION + SB_META_WINDOW_SIZE +
+                     2 * (SB_CHOICE + FD_MAX_BINDINGS * SB_BINDING + 4)) {
+        if (why && why_size) snprintf(why, why_size, "binary stage exceeds maximum record size");
+        return S2A_LIBPACK_REJECT;
+    }
+    if (lp_shard(r) >= lp->p.nshard || r->off > lp->p.ssize[2 * lp_shard(r)] ||
+        r->len > lp->p.ssize[2 * lp_shard(r)] - r->off) {
         if (why && why_size) snprintf(why, why_size, "record points outside shard table (%u/%u off=%llu len=%u)",
                                       lp_shard(r), lp->p.nshard, (unsigned long long)r->off, r->len);
         return S2A_LIBPACK_REJECT;
     }
-    char path[1100]; snprintf(path, sizeof path, "%s/lib.%03u.pak", lp->p.dir, lp_shard(r));
-    int fd = open(path, O_RDONLY); struct stat st;
-    if (fd < 0 || fstat(fd, &st) || (uint64_t)st.st_size != lp->p.ssize[2 * lp_shard(r)]) {
-        if (why && why_size) snprintf(why, why_size, "shard %s is %s (index says %llu bytes)", path,
-                                      fd < 0 ? "missing" : "the wrong size", (unsigned long long)lp->p.ssize[2 * lp_shard(r)]);
-        if (fd >= 0) close(fd);
-        return S2A_LIBPACK_REJECT;
+    unsigned shard = lp_shard(r);
+    struct lp_fd_slot *slot = &lp->slots[shard % lp->nslots];
+    pthread_mutex_lock(&slot->lock);
+    if (slot->fd < 0 || slot->shard != shard) {
+        if (slot->fd >= 0) close(slot->fd);
+        char path[1100];
+        snprintf(path, sizeof path, "%s/lib.%03u.pak", lp->p.dir, shard);
+        slot->fd = open(path, O_RDONLY | O_CLOEXEC);
+        slot->shard = shard;
     }
-    const long ps = sysconf(_SC_PAGESIZE);   // getpagesize 已于 POSIX.1-2008 撤稿，宿主严标编译环境不给声明
-    const uint64_t pg = (uint64_t)(ps > 0 ? ps : 4096), at = r->off & ~(pg - 1), delta = r->off - at;
-    void *m = mmap(NULL, (size_t)(delta + (r->len ? r->len : 1)), PROT_READ, MAP_PRIVATE, fd, (off_t)at);
-    int e = errno;
-    close(fd);
-    if (m == MAP_FAILED) {
-        if (why && why_size) snprintf(why, why_size, "cannot map %u bytes at %#llx from %s (errno %d)",
-                                      r->len, (unsigned long long)r->off, path, e);
-        return S2A_LIBPACK_REJECT;
+    struct stat st;
+    uint8_t *out = NULL;
+    if (slot->fd < 0 || fstat(slot->fd, &st) || (uint64_t)st.st_size != lp->p.ssize[2 * shard]) {
+        if (why && why_size) snprintf(why, why_size, "shard %u is %s (index says %llu bytes)", shard,
+            slot->fd < 0 ? "unavailable" : "the wrong size", (unsigned long long)lp->p.ssize[2 * shard]);
+        goto fail_read;
     }
-    uint8_t *out = malloc(r->len ? r->len : 1);
-    if (out) memcpy(out, (const uint8_t *)m + delta, r->len);
-    munmap(m, (size_t)(delta + (r->len ? r->len : 1)));
+    out = malloc(r->len ? r->len : 1);
     if (!out) {
         if (why && why_size) snprintf(why, why_size, "out of memory for %u bytes", r->len);
-        return S2A_LIBPACK_REJECT;
+        goto fail_read;
     }
+    size_t done = 0;
+    while (done < r->len) {
+        size_t left = r->len - done;
+        ssize_t got = pread(slot->fd, out + done, left > SSIZE_MAX ? (size_t)SSIZE_MAX : left,
+                            (off_t)(r->off + done));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            if (why && why_size) snprintf(why, why_size, "shard %u read %zu of %u bytes (%s)",
+                                         shard, done, r->len, got < 0 ? strerror(errno) : "unexpected EOF");
+            goto fail_read;
+        }
+        done += (size_t)got;
+    }
+    pthread_mutex_unlock(&slot->lock);
     *bytes = out; *len = r->len;
     return S2A_LIBPACK_HIT;
+fail_read:
+    if (slot->fd >= 0) close(slot->fd);
+    slot->fd = -1;
+    pthread_mutex_unlock(&slot->lock);
+    free(out);
+    return S2A_LIBPACK_REJECT;
 }
 
 // ---------------- _b.json → s2a-direct-program-v1 ----------------
@@ -352,7 +408,10 @@ struct lp_spv_bindings {
     uint32_t number[LP_STAGE_BINDINGS];
     int count, overflow, support, support_is_ubo, uses_nonzero_set;
 };
+enum lp_window_mode { LP_WINDOW_LEGACY, LP_WINDOW_UNUSED, LP_WINDOW_FIXED, LP_WINDOW_MASK };
+struct lp_window { uint32_t mode, id; };
 struct lp_stage_contract {
+    struct lp_window window;
     struct lp_emitted_bindings emitted;
     struct lp_spv_bindings declared;
     char key[17], json_name[12], spv_name[12];
@@ -735,8 +794,8 @@ static int lp_json_has_binding(struct s2a_jv top, int stage_no, uint32_t binding
 }
 
 // 任一段使用 v2 字段时，整个程序的每段都要满足描述符合同。反射里未发出的行不能充当布局条目。
-static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct jw *binds, int *sep, int compute,
-                                 char *why, size_t why_size) {
+static int lp_check_v2_bindings(const struct lp_stage_contract *stage, int *implicit_support,
+                                char *why, size_t why_size) {
     const struct lp_emitted_bindings *emitted = &stage->emitted;
     const struct lp_spv_bindings *declared = &stage->declared;
     if (emitted->count > LP_STAGE_BINDINGS || declared->overflow)
@@ -778,8 +837,17 @@ static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct j
                            stage->key, stage->spv_name, binding, stage->json_name);
         }
     }
-    if (add_support) lp_emit_support(binds, sep, (uint32_t)declared->support, compute);
+    *implicit_support = add_support ? declared->support : -1;
     return 0;
+}
+
+static int lp_finish_v2_bindings(const struct lp_stage_contract *stage, struct jw *binds, int *sep, int compute,
+                                 char *why, size_t why_size) {
+    int implicit_support = -1;
+    int rc = lp_check_v2_bindings(stage, &implicit_support, why, why_size);
+    if (!rc && implicit_support >= 0)
+        lp_emit_support(binds, sep, (uint32_t)implicit_support, compute);
+    return rc;
 }
 // 几何程序里任一阶段写视口号 / 视口掩码（OpDecorate / OpMemberDecorate BuiltIn ViewportIndex 10、ViewportMaskNV 5253、
 //   SecondaryViewportMaskNV 5258、ViewportMaskPerViewNV 5262）：回放层没有视口数组，现编（DirectShaderCompiler ValidateSpirv
@@ -800,9 +868,99 @@ static int lp_spv_viewport_builtin(const uint8_t *spv, size_t n) {
 //   偏移 2608 起是 73 项 × 16 字节的尺寸表。安卓宿主不填这张表：按 3776 分配、回放核心整块清零，表项全 0 时着色器走旧路径
 //   （倍率恒 1，与机上现编同口径）。只按 2608 绑的话越界读到的是未定义值（设备没开 robustBufferAccess）
 #define LP_SUPPORT_ABI2_BYTES 3776u
+
+// 只固化翻译器单独分配、并在阶段合同中指出的掩码常量。
+static int lp_fix_ssbo_window_mask(uint8_t *spv, size_t n, uint32_t id, uint32_t alignment) {
+    static const char name[] = "s2a_storage_window_mask";
+    uint32_t *w = (uint32_t *)spv;
+    const size_t nw = n / sizeof(*w);
+    if (nw < 5 || !id || id >= w[3]) return -1;
+    size_t constant = 0;
+    unsigned names = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || wc > nw - i) return -1;
+        if (op == 5 && wc >= 3 && w[i + 1] == id &&
+            (wc - 2) * sizeof(*w) >= sizeof(name) && !memcmp(w + i + 2, name, sizeof(name)))
+            names++;
+        if (op == 50 && wc == 4 && w[i + 2] == id) {   // OpSpecConstant
+            if (constant || w[i + 3] != UINT32_MAX) return -1;
+            constant = i;
+        }
+        if (op == 71 && wc >= 3 && w[i + 1] == id && w[i + 2] == 1) return -1;  // SpecId
+        i += wc;
+    }
+    if (!constant || names != 1) return -1;
+    for (size_t i = 5; i < constant; i += w[i] >> 16) {
+        if (w[i] != ((4u << 16) | 21u) || w[i + 1] != w[constant + 1]) continue;   // OpTypeInt
+        if (w[i + 2] != 32 || w[i + 3] != 0) return -1;
+        w[constant] = (4u << 16) | 43u;   // OpConstant
+        w[constant + 3] = 0u - alignment;
+        return 0;
+    }
+    return -1;
+}
+
+static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract, char *why, size_t cap) {
+    struct s2a_jv field;
+    int has_mask = !s2a_jv_obj_find(top, "ssbo_window_mask", &field);
+    if (s2a_jv_obj_find(top, "ssbo_window_abi", &field)) {
+        if (has_mask) return lp_fail(why, cap, "%s mask without SSBO window ABI", contract->key);
+        return 0;
+    }
+    uint32_t abi;
+    if (jf_u32(top, "ssbo_window_abi", &abi) || abi != 1)
+        return lp_fail(why, cap, "%s unknown SSBO window ABI", contract->key);
+    if (has_mask) {
+        contract->window.mode = LP_WINDOW_MASK;
+        if (jf_u32(top, "ssbo_window_mask", &contract->window.id) || !contract->window.id)
+            return lp_fail(why, cap, "%s invalid SSBO window mask", contract->key);
+        return 0;
+    }
+    contract->window.mode = LP_WINDOW_UNUSED;
+    struct s2a_jv bindings;
+    if (!s2a_jv_obj_find(top, "bindings", &bindings)) {
+        int count = s2a_jv_arr_count(bindings);
+        for (int i = 0; i < count; i++) {
+            struct s2a_jv binding;
+            char kind[24];
+            if (!s2a_jv_arr_item(bindings, i, &binding) &&
+                !jf_str(binding, "kind", kind, sizeof kind) && !strcmp(kind, "sbuf")) {
+                contract->window.mode = LP_WINDOW_FIXED;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx *gfx,
+                           uint8_t *spv, size_t n, char *why, size_t cap) {
+    if (window.mode > LP_WINDOW_MASK || (window.mode == LP_WINDOW_MASK) != (window.id != 0))
+        return lp_fail(why, cap, "invalid SSBO window mode or mask");
+    if (window.mode != LP_WINDOW_MASK) {
+        if (!gfx || !gfx->require_ssbo_window) return 0;
+        if (window.mode == LP_WINDOW_FIXED) return lp_fail(why, cap, "SBUFP uses a fixed SSBO window");
+        if (window.mode == LP_WINDOW_LEGACY) {
+            if (why && cap) snprintf(why, cap, "stage has no SSBO window variant");
+            return S2A_LIBPACK_MISS;
+        }
+        return 0;
+    }
+    uint32_t alignment = gfx ? gfx->storage_alignment : 0, profile_alignment;
+    struct s2a_jv caps;
+    if (!alignment || (alignment & (alignment - 1)) || !gfx->profile_json ||
+        s2a_jv_obj_find((struct s2a_jv){gfx->profile_json, gfx->profile_bytes}, "capabilities", &caps) ||
+        jf_u32(caps, "storageBufferOffsetAlignment", &profile_alignment) || profile_alignment != alignment)
+        return lp_fail(why, cap, "device/profile SSBO alignments differ");
+    if (lp_fix_ssbo_window_mask(spv, n, window.id, alignment))
+        return lp_fail(why, cap, "invalid SSBO window mask");
+    return 0;
+}
+
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
-static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
-                         uint32_t shared_limit,
+static int lp_stage_from_bytes(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
+                         uint32_t shared_limit, const struct s2a_libpack_gfx *gfx, int packing, const uint8_t *jb, size_t jn, uint8_t *spv, size_t sn,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
                          uint32_t *support_bytes, int *uses_v2, struct lp_stage_contract *contract,
                          char *why, size_t why_size) {
@@ -813,16 +971,9 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
     char *khex = contract->key;
     for (int i = 0; i < 8; i++) snprintf(khex + 2 * i, 3, "%02x", key[i]);
     // 几何段：每种输入图元一份（DshVk.CompileGeometry），_vg<t>.json 种类 112+t / _vg<t>.spv 种类 120+t
-    const unsigned kjson = gs ? LP_K_VGJSON + (unsigned)gs_topology : LP_K_BJSON, kspv = gs ? LP_K_VGSPV + (unsigned)gs_topology : LP_K_BSPV;
     const char *jname = contract->json_name, *sname = contract->spv_name;
     snprintf(contract->json_name, sizeof contract->json_name, gs ? "_vg%d.json" : "_b.json", gs_topology);
     snprintf(contract->spv_name, sizeof contract->spv_name, gs ? "_vg%d.spv" : "_b.spv", gs_topology);
-    uint8_t *jb = NULL, *spv = NULL; size_t jn = 0, sn = 0;
-    char gw[192] = "";
-    int rc = s2a_libpack_get(lp, key, kjson, &jb, &jn, gw, sizeof gw);
-    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, jname, gw[0] ? gw : "absent"); free(jb); return rc; }
-    rc = s2a_libpack_get(lp, key, kspv, &spv, &sn, gw, sizeof gw);
-    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, sname, gw[0] ? gw : "absent"); free(jb); free(spv); return rc; }
     struct s2a_jv top = { (const char *)jb, jn };
     int out = -1;
     {   // 全文档语法核 + 顶层必须恰是一个对象（jv 不具现字符串，长串字段只吃跨度）
@@ -843,6 +994,11 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             { lp_fail(why, why_size, "%s %s gs_input_topology is not %d", khex, jname, gs_topology); goto done; }
         if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
             { lp_fail(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
+        if (!compute) {
+            int window = lp_window_parse(top, contract, why, why_size);
+            if (!window && !packing) window = lp_window_apply(contract->window, gfx, spv, sn, why, why_size);
+            if (window != 0) { out = window; goto done; }
+        }
         {   char cw[128] = ""; const size_t sn0 = sn; const uint64_t il0 = s2a_libpack_interlock_dropped();
             if (s2a_libpack_spv_admit_caps(spv, &sn, cw, sizeof cw)) { lp_fail(why, why_size, "%s %s %s", khex, sname, cw); goto done; }
             if (s2a_libpack_interlock_dropped() != il0 && !atomic_exchange(&lp->ilk_said, 1))   // 每局首次一行具名红，之后只计数
@@ -928,8 +1084,35 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         out = 0;
     }
 done:
-    free(jb); free(spv);
     return out;
+}
+
+static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
+                         uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
+                         struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
+                         uint32_t *support_bytes, int *uses_v2, struct lp_stage_contract *contract,
+                         char *why, size_t why_size) {
+    const char *lib_stage = lp_nvn_stage_name(nvn);
+    if (!lib_stage) return S2A_LIBPACK_MISS;
+    int gs = nvn == 2;
+    if (gs && (gs_topology < 0 || gs_topology > 4)) return S2A_LIBPACK_MISS;
+    char khex[17], jname[16], sname[16];
+    for (int i = 0; i < 8; i++) snprintf(khex + 2*i, 3, "%02x", key[i]);
+    snprintf(jname, sizeof jname, gs ? "_vg%d.json" : "_b.json", gs_topology);
+    snprintf(sname, sizeof sname, gs ? "_vg%d.spv" : "_b.spv", gs_topology);
+    unsigned kjson = gs ? LP_K_VGJSON + (unsigned)gs_topology : LP_K_BJSON;
+    unsigned kspv = gs ? LP_K_VGSPV + (unsigned)gs_topology : LP_K_BSPV;
+    uint8_t *jb = NULL, *spv = NULL; size_t jn = 0, sn = 0;
+    char gw[192] = "";
+    int rc = s2a_libpack_get(lp, key, kjson, &jb, &jn, gw, sizeof gw);
+    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, jname, gw[0] ? gw : "absent"); free(jb); return rc; }
+    rc = s2a_libpack_get(lp, key, kspv, &spv, &sn, gw, sizeof gw);
+    if (rc != S2A_LIBPACK_HIT) { if (why && why_size) snprintf(why, why_size, "%s %s: %s", khex, sname, gw[0] ? gw : "absent"); free(jb); free(spv); return rc; }
+    rc = lp_stage_from_bytes(lp, key, nvn, compute, gs_topology, shared_limit, gfx, 0, jb, jn, spv, sn,
+                             stages, binds, bind_sep, stage_mask, support_bytes, uses_v2, contract, why, why_size);
+    free(jb);
+    free(spv);
+    return rc;
 }
 
 // 绘制图元名（现编请求 graphicsState.topology 同名：nvn_vk_compile_facts.c nvk_input_topology）→ InputTopology 编号；
@@ -951,10 +1134,10 @@ int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile
     return b != 0;
 }
 
-int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6][8], uint32_t stages,
+static int lp_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6][8], uint32_t stages,
                            const struct s2a_libpack_gfx *gfx,
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint8_t **json, size_t *json_len, char *why, size_t why_size) {
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size, int account) {
     struct s2a_libpack *lp = (struct s2a_libpack *)lp_c;
     if (!lp || !lp->p.idx || !keys || !json || !json_len || !stages) return S2A_LIBPACK_INVALID;
     *json = NULL; *json_len = 0;
@@ -963,7 +1146,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     //   compute 线）本函数产不出可采纳结果，按 miss 如实回。
     if (stages != 0x1 && stages != 0x3 && stages != 0x7) {
         if (why && why_size) snprintf(why, why_size, "stages=0x%x is not a vs, vs+fs or vs+gs+fs program", stages);
-        atomic_fetch_add(&g_misses, 1);
+        if (account) atomic_fetch_add(&g_misses, 1);
         return S2A_LIBPACK_MISS;
     }
     // 几何程序：设备没开 geometryShader 照旧 miss（现编同判据：profile 的 supportsGeometryShader）；
@@ -972,13 +1155,13 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     if (stages == 0x7) {
         if (!gfx || !s2a_libpack_profile_geometry_shader(gfx->profile_json, gfx->profile_bytes)) {
             if (why && why_size) snprintf(why, why_size, "geometryShader is not enabled in the profile");
-            atomic_fetch_add(&g_misses, 1);
+            if (account) atomic_fetch_add(&g_misses, 1);
             return S2A_LIBPACK_MISS;
         }
         gs_topology = lp_input_topology(gfx->topology);
         if (gs_topology < 0) {
             if (why && why_size) snprintf(why, why_size, "geometry input topology %s has no library variant", gfx->topology ? gfx->topology : "(none)");
-            atomic_fetch_add(&g_misses, 1);
+            if (account) atomic_fetch_add(&g_misses, 1);
             return S2A_LIBPACK_MISS;
         }
     }
@@ -991,7 +1174,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     for (unsigned nvn = 0, idx = 0; nvn < sizeof contracts / sizeof contracts[0] && idx < LP_NVN_STAGES; nvn++) {
         if (!(stages & (1u << nvn))) continue;
         char sw[192] = "";
-        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, &st, &bd, &sep, &got, &support, &uses_v2,
+        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, gfx, &st, &bd, &sep, &got, &support, &uses_v2,
                                &contracts[nvn], sw, sizeof sw);
         idx++;
         if (rc == 0) continue;
@@ -1030,10 +1213,18 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     }
 out:
     free(st.b); free(bd.b);
-    if (worst == S2A_LIBPACK_HIT) atomic_fetch_add(&g_hits, 1);
-    else if (worst == S2A_LIBPACK_MISS) atomic_fetch_add(&g_misses, 1);
-    else atomic_fetch_add(&g_rejects, 1);
+    if (account) {
+        if (worst == S2A_LIBPACK_HIT) atomic_fetch_add(&g_hits, 1);
+        else if (worst == S2A_LIBPACK_MISS) atomic_fetch_add(&g_misses, 1);
+        else atomic_fetch_add(&g_rejects, 1);
+    }
     return worst;
+}
+int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6][8], uint32_t stages,
+                           const struct s2a_libpack_gfx *gfx,
+                           uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size) {
+    return lp_program_v1(lp_c, keys, stages, gfx, direct_abi, profile_hash, translator_closure, json, json_len, why, why_size, 1);
 }
 
 // 计算程序：单键（rp_S.skey[5]）的 _b.json（stage "cs"）+ _b.spv → kind "compute" 的 v1/v2 结果，
@@ -1046,10 +1237,10 @@ out:
 //   supportLayout.requiredSize：SUPPORT_DEFAULT_BYTES（2608）——dmsh_xlate 编进的是同一份 compat
 //     Ryujinx.Graphics.Shader，SupportBuffer.RequiredSize 就是它；图形库路径不写 supportLayout，解析器也按这个数。
 //   绑定号 = arg_id×6 + 5。计数口径同 program_v1（hit / miss / reject 三个计数器共用）。
-int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
+static int lp_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
                            uint32_t shared_limit,
-                           uint8_t **json, size_t *json_len, char *why, size_t why_size) {
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size, int account) {
     struct s2a_libpack *lp = (struct s2a_libpack *)lp_c;
     if (!lp || !lp->p.idx || !key || !json || !json_len) return S2A_LIBPACK_INVALID;
     *json = NULL; *json_len = 0;
@@ -1057,7 +1248,7 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     int sep = 0, uses_v2 = 0; uint32_t got = 0;
     uint32_t csupport = 0;
     struct lp_stage_contract contract = {0};
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, NULL, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0 && uses_v2) rc = lp_finish_v2_bindings(&contract, &bd, &sep, 1, why, why_size);
     if (rc == 0) {
@@ -1075,8 +1266,29 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     } else if (rc > 0) rc = S2A_LIBPACK_MISS;
     else rc = S2A_LIBPACK_REJECT;
     free(st.b); free(bd.b);
-    if (rc == S2A_LIBPACK_HIT) atomic_fetch_add(&g_hits, 1);
-    else if (rc == S2A_LIBPACK_MISS) atomic_fetch_add(&g_misses, 1);
-    else atomic_fetch_add(&g_rejects, 1);
+    if (account) {
+        if (rc == S2A_LIBPACK_HIT) atomic_fetch_add(&g_hits, 1);
+        else if (rc == S2A_LIBPACK_MISS) atomic_fetch_add(&g_misses, 1);
+        else atomic_fetch_add(&g_rejects, 1);
+    }
     return rc;
 }
+int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
+                           uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
+                           uint32_t shared_limit,
+                           uint8_t **json, size_t *json_len, char *why, size_t why_size) {
+    return lp_compute_v1(lp_c, key, direct_abi, profile_hash, translator_closure, shared_limit, json, json_len, why, why_size, 1);
+}
+
+int s2a_libpack_shadow_json(const struct s2a_libpack *lp, const uint8_t keys[6][8], uint32_t stages,
+                            const struct s2a_libpack_gfx *gfx, uint32_t abi, const char *profile,
+                            const char *closure, uint32_t shared, uint8_t **out, size_t *len, char *why, size_t cap) {
+    if (stages == 32) return lp_compute_v1(lp, keys[0], abi, profile, closure, shared, out, len, why, cap, 0);
+    return lp_program_v1(lp, keys, stages, gfx, abi, profile, closure, out, len, why, cap, 0);
+}
+
+#include "libpack_stage_read.inc"
+
+#ifdef S2A_LIBPACK_PACKER
+#include "libpack_stage_export.inc"
+#endif

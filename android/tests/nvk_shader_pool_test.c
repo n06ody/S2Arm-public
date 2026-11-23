@@ -26,6 +26,7 @@
 #include "direct/jv.h"
 #include "direct/program_cache.h"
 #include "nvn/nvn_vk_prog_warm.h"
+#include "libpack_vk.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN：出包预编库目录 b-<链>-vk 与容器头的链号
 #include <sys/stat.h>
 #include "tbuf_spirv_fixtures.h"
@@ -57,6 +58,7 @@ static int link_map_flag;   // nvk_link_map_diag 开关替身
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
+static int fixture_hitch_flag, fixture_no_libpack;   // nvk_hitch_log（图形现编原因日志的开关）/ no_libpack（出包库总闸）
 static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alias）：-1 = 取生产缺省，0 = 关
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
@@ -113,6 +115,8 @@ void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_pair_timing")) return getenv("S2A_TEST_PAIR_ON") != NULL;
+    if (!strcmp(name, "nvk_libpack_timing")) return getenv("S2SB_QA_TIMING") != NULL;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
@@ -122,12 +126,17 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (fixture_alias_flag >= 0 && !strcmp(name, "nvk_alias")) return fixture_alias_flag;
     if (!strcmp(name, "nvk_link_refused_file") && record_link_refused) return 1;
     if (!strcmp(name, "nvk_link_map_diag")) return link_map_flag;
+    if (!strcmp(name, "nvk_hitch_log")) return fixture_hitch_flag;
+    if (!strcmp(name, "no_libpack")) return fixture_no_libpack;
     return dflt;
 }
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
+static int gfxr_lines; static char gfxr_text[520];   // 图形现编原因日志（nvk_hitch_log 开时每支现编程序一行）
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (!strncmp(text, "S2SB_", 5) || !strncmp(text, "S2A_LIBPAIR ", 12)) puts(text);
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "图形现编原因：")) { gfxr_lines++; snprintf(gfxr_text, sizeof gfxr_text, "%s", text); }
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
@@ -1613,6 +1622,7 @@ static int lp_write(const char *dir, uint64_t key[], const uint8_t kind[], const
     uint8_t idx[48 + 16 + 24 * 16]; memset(idx, 0, sizeof idx);
     memcpy(idx, "S2ALIB\0\0", 8); lp_put32(idx + 8, 1); lp_put32(idx + 12, (uint32_t)n); lp_put32(idx + 16, 1);
     memcpy(idx + 24, DMSH_CHAIN, 12); lp_put64(idx + 48, at);
+    if (kind[n-1] >= 128) memcpy(idx + 44, "S2SB", 4);
     for (int i = 0; i < n; i++) {   // 调用方已按 (键, 种类) 升序给
         uint8_t *r = idx + 64 + 24 * i;
         lp_put64(r, key[i]); r[8] = kind[i]; r[9] = 0; lp_put32(r + 12, (uint32_t)len[i]); lp_put64(r + 16, off[i]);
@@ -1623,6 +1633,9 @@ static int lp_write(const char *dir, uint64_t key[], const uint8_t kind[], const
     return 0;
 }
 static uint64_t lp_key(const uint8_t k[8]) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = v << 8 | k[i]; return v; }
+#ifdef S2A_LIBPACK_PACKER
+#include "direct/libpack_vk.h"
+#endif
 // Exercise the actual warm VS/FS refusal and foreground GS refusal on the same library.
 static void link_refused_test(const char *root, uint8_t keys[3][8], char hex[3][17]) {
     char path[320];
@@ -1676,7 +1689,7 @@ static void link_refused_test(const char *root, uint8_t keys[3][8], char hex[3][
     unsetenv("S2A_PW_TEST_DIR");
 }
 
-static int gs_libpack_test(int diagnose_refusals) {
+static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
     fake_depth_clip = 1;   // 深度 near=-w 也能用预编库（libpack_state_ok），夹具不带深度零
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
@@ -1698,11 +1711,14 @@ static int gs_libpack_test(int diagnose_refusals) {
     static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u};
     static const uint32_t spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
     char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
+    // This fixture's stages have no storage operations. The new stage contract
+    // certifies that no window-mask constant is needed in these modules.
+    const char *window = ssbo_window ? ",\"ssbo_window_abi\":1" : "";
     char jvs[160], jfs[160], jg0[200], jg3[200];
-    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
-    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[1]);
-    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
-    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]%s}", hx[0], window);
+    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]%s}", hx[1], window);
+    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]%s}", hx[2], window);
+    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]%s}", hx[2], window);
     struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
         {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
         {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv0, sizeof spv0},
@@ -1737,7 +1753,52 @@ static int gs_libpack_test(int diagnose_refusals) {
         CHECK(strstr(tl, "出包预编（库不在）") != NULL, "libpack tally says the library is missing: %s", tl);
         fake_gs_success = 0;
     }
-    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written");
+    int interface_mismatch = 0;
+#ifdef S2A_LIBPACK_PACKER
+    const char *binary_mode=getenv("S2A_TEST_BINARY_STAGE");
+    const int pair_graphics = getenv("S2A_TEST_PAIR_GRAPHICS") != NULL;
+    char paired_dir[600] = "", pair_parent[400] = "";
+    if(binary_mode) {
+        interface_mismatch=!strcmp(binary_mode,"missing-varying");
+        // Only the input declaration matters to the host link checker. GS declares no user output.
+        static const uint32_t fragment_input[] = {
+            0x07230203,0x00010300,0,8,0, 0x00040047,4,30,2, 0x00030016,1,32,
+            0x00040020,3,1,1, 0x0004003b,3,4,1,
+        };
+        uint64_t stage_keys[4];
+        uint8_t stage_kind[4], *record[4]={0};
+        const uint8_t *contents[4];
+        size_t record_size[4];
+        unsigned count=0;
+        for(unsigned i=0;i<8;i++) {
+            if(kinds[i]!=1 && kinds[i]!=112 && kinds[i]!=115) continue;
+            unsigned stage=keys[i]==lp_key(k[0])?0:keys[i]==lp_key(k[1])?1:2;
+            int topo=stage==2?kinds[i]-112:-1;
+            unsigned j=0;
+            while(j<8 && (keys[j]!=keys[i] || kinds[j]!=(stage==2?120+topo:52))) j++;
+            if(j==8) { CHECK(0,"binary fixture is missing a stage source"); return 1; }
+            const uint8_t *spv=stage==1 && interface_mismatch?(const uint8_t*)fragment_input:data[j];
+            size_t size=stage==1 && interface_mismatch?sizeof fragment_input:lens[j];
+            int rc=s2a_pack_stage(k[stage],stage,topo,0,data[i],lens[i],spv,size,&record[count],&record_size[count]);
+            CHECK(!rc && record[count],"encode graphics stage via production exporter");
+            if(rc || !record[count]) return 1;
+            stage_keys[count]=keys[i];
+            stage_kind[count]=stage==2?(uint8_t)(129+topo):128;
+            contents[count]=record[count];
+            count++;
+        }
+        if (pair_graphics) {
+            CHECK(!lp_write(dir, keys, kinds, data, lens, 8), "write graphics JSON for paired lookup");
+            snprintf(pair_parent,sizeof pair_parent,"%s/shaders/direct/qa-s2sb",root);
+            snprintf(paired_dir,sizeof paired_dir,"%s/b-%s-vk",pair_parent,DMSH_CHAIN);
+            CHECK(!mkdir(pair_parent,0700) && !mkdir(paired_dir,0700), "create graphics paired directory");
+            setenv("S2A_TEST_PAIR_ON","1",1);
+        }
+        CHECK(count==4 && !lp_write(pair_graphics ? paired_dir : dir,stage_keys,stage_kind,contents,record_size,(int)count),"binary GS container written");
+        for(unsigned i=0;i<count;i++) s2a_pack_stage_free(record[i]);
+    } else
+#endif
+    { CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "libpack GS container written"); }
     static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
     static const char prof_off[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":false}}";
     snprintf(external_profile, sizeof external_profile, "%s", prof_on);
@@ -1755,7 +1816,10 @@ static int gs_libpack_test(int diagnose_refusals) {
         int rc = rp_shader_resolve(&q, &p);
         CHECK(rc == 0 && p, "libpack GS %s: program resolves", what[c]);
         CHECK(gs_loads[NVN_GPU_SH_VS] == 1 && gs_loads[NVN_GPU_SH_FS] == 1 && gs_loads[NVN_GPU_SH_GS] == 1, "libpack GS %s: three stages load", what[c]);
-        if (c < 2) {
+        if (interface_mismatch && c < 2) {
+            CHECK(compiler_calls==1 && p && !p->lib_sourced,
+                  "fragment reads unwritten location 2: packaged program rejected and live compiler called");
+        } else if (c < 2) {
             CHECK(compiler_calls == 0, "libpack GS %s: hit from the library, compiler not called (calls=%d)", what[c], compiler_calls);
             CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == sizeof spv0, "libpack GS %s: vs / fs are the library's", what[c]);
             CHECK(gs_blob_bytes[NVN_GPU_SH_GS] == (c == 0 ? sizeof spv_vg3 : sizeof spv_vg0),
@@ -1778,6 +1842,61 @@ static int gs_libpack_test(int diagnose_refusals) {
         CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == 0, "libpack VS-only: the vertex stage is the library's");
         rp_S.bser[1] = fs_serial; rp_S.bser[2] = gs_serial;
     }
+    // The missing-varying corpus has already proved that both GS topologies fall back and
+    // VS-only still hits. Its fragment cannot satisfy the linked-program window scenarios below.
+    if (interface_mismatch) goto cleanup_gs;
+    snprintf(external_profile, sizeof external_profile, "%s", prof_on);
+    // shape 0 = 顶点 + 片元 + 几何（只核准入）；shape 1 = 顶点 + 片元（还核预热：清单落盘读回后预热线程按记下的状态取库）
+    for (int shape = 0; shape <= 1; ++shape) {
+    gs_keys_ok = shape ? 3 : 7; gs_program.nstage = shape ? 2 : 3; gs_program.serial++; bind.serial = gs_program.serial;
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "graphics SSBO window fixture rebinds (shape %d)", shape);
+    for (int unaligned = 0; unaligned <= 1; ++unaligned) {
+        rp_shader_reset(); compiler_calls = 0;
+        rp_S.ssbo[0][0].addr = 0x10000u + 4u * unaligned;
+        rp_S.ssbo[0][0].size = 64;
+        struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+        // 夹具的现编替身只会出几何程序的结果：两段程序在旧库非对齐下走现编，只核「确实去现编了」，不要求解析成功
+        const int live_only = shape && unaligned && !ssbo_window;
+        CHECK((rp_shader_resolve(&q, &p) == 0 && p) || live_only, "graphics SSBO window fixture resolves (shape %d)", shape);
+        CHECK(compiler_calls == (unaligned && !ssbo_window),
+              "graphics SSBO window admission (shape %d ABI=%d unaligned=%d): live compile calls=%d",
+              shape, ssbo_window, unaligned, compiler_calls);
+        if (!shape || live_only) continue;
+        // 预热从库取：这笔真实解析记进清单的状态（lp_ok / 窗口合同标记）经落盘读回，预热线程按它取库，窗口库命中、不现编
+        // 清单目录：每个用例一个全新的临时目录（只在这一段设环境变量，别的用例仍然「不落盘」）
+        char wd[320]; snprintf(wd, sizeof wd, "%s/pw_ssbo.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+        CHECK(mkdtemp(wd) != NULL, "graphics warm temp dir");
+        char md[360], cd[360]; snprintf(md, sizeof md, "%s/manifest", wd); snprintf(cd, sizeof cd, "%s/cache", wd); mkdir(md, 0700); mkdir(cd, 0700);
+        setenv("S2A_PW_TEST_DIR", md, 1); setenv("S2A_DIRECT_CACHE_DIR", cd, 1);
+        nvk_prog_warm_save();
+        CHECK(s2a_program_cache_drain(5000) == 0, "graphics warm manifest drains");
+        rp_shader_reset(); compiler_calls = 0;
+        struct nvk_prog_rec rec = {0};
+        const int loaded = nvk_prog_warm_load(), taken = nvk_prog_warm_take(&rec);
+        CHECK(loaded == 1 && taken == 1 && rec.stage_mask == 3,
+              "graphics warm manifest survives (ABI=%d unaligned=%d loaded=%d taken=%d mask=%u)", ssbo_window, unaligned, loaded, taken, (unsigned)rec.stage_mask);
+        CHECK(rec.lp_ok == (!unaligned || ssbo_window ? 2 : 0) && rec.lp_ssbo_window == (unaligned && ssbo_window),
+              "warm record state (ABI=%d unaligned=%d): lp_ok=%u window=%u", ssbo_window, unaligned, (unsigned)rec.lp_ok, (unsigned)rec.lp_ssbo_window);
+        const int built = nvk_prog_warm_build(&rec);
+        CHECK(built == 0 && compiler_calls == (unaligned && !ssbo_window),
+              "warm build (ABI=%d unaligned=%d): rc=%d live compile calls=%d", ssbo_window, unaligned, built, compiler_calls);
+        if (!unaligned && !ssbo_window) {
+            // 清单说「要窗口合同」而本局的库是旧库（没有合同）：预热必须不取库
+            struct nvk_prog_rec want_window = rec; want_window.lp_ssbo_window = 1;
+            const uint64_t h0 = s2a_libpack_hits();
+            rp_shader_reset(); compiler_calls = 0;
+            const int refused = nvk_prog_warm_build(&want_window);
+            CHECK(s2a_libpack_hits() == h0 && (refused != 0 || compiler_calls == 1u),
+                  "warm record wants the window contract, old library: library not used (rc=%d hits+%llu compiles=%d)", refused,
+                  (unsigned long long)(s2a_libpack_hits() - h0), compiler_calls);
+        }
+        nvk_prog_warm_reset();
+        unsetenv("S2A_PW_TEST_DIR"); unsetenv("S2A_DIRECT_CACHE_DIR");
+    }
+    }
+    gs_keys_ok = 7; gs_program.nstage = 3; gs_program.serial++; bind.serial = gs_program.serial;
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "graphics SSBO window fixture restores GS program");
+    memset(&rp_S.ssbo[0][0], 0, sizeof rp_S.ssbo[0][0]);
     {
         extern void nvk_shader_test_tally_line(char *out, size_t n);
         char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
@@ -1796,6 +1915,14 @@ static int gs_libpack_test(int diagnose_refusals) {
         unlink(f2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders/direct", root2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders", root2); rmdir(d2); rmdir(root2);
     }
 cleanup_gs:
+#ifdef S2A_LIBPACK_PACKER
+    if (pair_graphics) {
+        char file[660];
+        snprintf(file,sizeof file,"%s/lib.idx",paired_dir); unlink(file);
+        snprintf(file,sizeof file,"%s/lib.000.pak",paired_dir); unlink(file);
+        rmdir(paired_dir); rmdir(pair_parent); unsetenv("S2A_TEST_PAIR_ON");
+    }
+#endif
     fake_gs_success = 0; external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
@@ -1856,9 +1983,68 @@ static int cs_libpack_test(void) {
     uint8_t ckind[2] = { 1, 52 };
     const uint8_t *cd[2] = { (const uint8_t *)csjson, (const uint8_t *)csspv };
     size_t cn[2] = { strlen(csjson), sizeof csspv };
-    CHECK(lp_write(dir, ck, ckind, cd, cn, 2) == 0, "cs libpack container written");
+#ifdef S2A_LIBPACK_PACKER
+    const char *binary_mode = getenv("S2A_TEST_BINARY_STAGE");
+    const char *pair_case = getenv("S2A_TEST_PAIR_CASE");
+    char companion[600] = "", parent[400] = "";
+    int corrupt = binary_mode && !strcmp(binary_mode,"bad-version");
+    if (binary_mode) {
+        uint8_t *record = NULL;
+        size_t record_len = 0;
+        CHECK(!s2a_pack_stage(rp_S.skey[5],5,-1,0,cd[0],cn[0],cd[1],cn[1],&record,&record_len) && record,
+              "production encoder creates binary CS fixture");
+        if (!record) return 1;
+        if (corrupt) record[4] ^= 1;
+        // Include working legacy records with the same key. A broken S2SB must select live compilation.
+        uint64_t keys[3] = {ck[0],ck[0],ck[0]};
+        const uint8_t kinds[3] = {1,52,128};
+        const uint8_t *data[3] = {cd[0],cd[1],record};
+        size_t lengths[3] = {cn[0],cn[1],record_len};
+        if (pair_case) {
+            if (!strcmp(pair_case, "bad-json")) csjson[0] = '!';
+            CHECK(!lp_write(dir,ck,ckind,cd,cn,2), "write legacy companion");
+            if (!strcmp(pair_case, "other-producer")) {
+                char index[640];
+                snprintf(index, sizeof index, "%s/lib.idx", dir);
+                FILE *f = fopen(index, "r+b");
+                CHECK(f && !fseek(f, 36, SEEK_SET) && fputc(1, f) == 1, "set distinct legacy producer");
+                if (f) fclose(f);
+            }
+            snprintf(parent,sizeof parent,"%s/shaders/direct/qa-s2sb",root);
+            snprintf(companion,sizeof companion,"%s/b-%s-vk",parent,DMSH_CHAIN);
+            CHECK(!mkdir(parent,0700) && !mkdir(companion,0700), "create paired stage directory");
+            CHECK(!lp_write(companion,keys+2,kinds+2,data+2,lengths+2,1), "write paired S2SB shard");
+        } else {
+            CHECK(!lp_write(dir,keys,kinds,data,lengths,3),"write dual-format CS test container");
+        }
+        s2a_pack_stage_free(record);
+    } else
+#endif
+    { CHECK(lp_write(dir, ck, ckind, cd, cn, 2) == 0, "cs libpack container written"); }
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
     const struct rp_prog *p = NULL;
+#ifdef S2A_LIBPACK_PACKER
+    if (pair_case) {
+        int enabled = getenv("S2A_TEST_PAIR_ON") != NULL;
+        for (int i=1;i<=2;i++) {
+            rp_shader_reset(); p = NULL;
+            CHECK(!rp_shader_resolve_compute(&p) && p, "paired fixture creates a compute program");
+            CHECK(cs_loads == i, "exactly one GPU module load per real request; JSON shadow must not load one");
+            CHECK(compiler_calls == ((enabled && corrupt) ? i : 0), "only actual S2SB failure selects live compile");
+            CHECK(p && !!p->lib_sourced == !(enabled && corrupt), "actual source follows S2SB, shadow has no vote");
+        }
+        char path[640];
+        snprintf(path,sizeof path,"%s/lib.idx",companion); unlink(path);
+        snprintf(path,sizeof path,"%s/lib.000.pak",companion); unlink(path);
+        rmdir(companion); rmdir(parent);
+        goto cs_cleanup;
+    }
+    if (corrupt) {
+        CHECK(!rp_shader_resolve_compute(&p) && p && compiler_calls==1 && !p->lib_sourced,
+              "damaged binary selects live compilation even with a working legacy pair");
+        goto cs_cleanup;
+    }
+#endif
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == 0 && cs_loads == 1,
           "aligned CS storage hits the library, compiler not called (calls=%d red=%s)", compiler_calls, last_red);
     CHECK(lp_unref_lines == 0, "aligned library hit does not log the unaligned-refuse line (got %d)", lp_unref_lines);
@@ -1909,6 +2095,9 @@ static int cs_libpack_test(void) {
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "没有这一键"), "missing key is remembered: %s", note ? note : "(none)");
         cs_lib_root_rm(sroot); cs_lib_root_rm(mroot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
+#ifdef S2A_LIBPACK_PACKER
+cs_cleanup:
+#endif
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
@@ -2022,13 +2211,125 @@ static int live_compile_pending_test(int stop) {
     return failures ? 1 : 0;
 }
 
+// ---- 图形现编原因日志（nvk_hitch_log 开时）：每支落到现编的图形程序一行，带键 / 阶段掩码 / 身份 / 三处没命中的原因 ----
+extern void nvk_shader_test_gate_text(char *out, size_t n, int has_root, unsigned state_bits, uint32_t stages, int ckey_present);
+extern const char *nvk_shader_test_cache_class(const char *why);
+static int gfx_reason_test(void) {
+    fake_depth_clip = 1; fixture_hitch_flag = 1;
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned i = 0; i < 3; i++) { gs_stages[i] = (uint8_t)i; memcpy(gs_keys[i], k[i], 8); }
+    gs_keys_ok = 7; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "reason fixture binds program");
+    bind_pools(7);
+    char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
+    char want_keys[64]; snprintf(want_keys, sizeof want_keys, "键 %s/%s/%s 阶段 0x7", hx[0], hx[1], hx[2]);
+    static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
+    snprintf(external_profile, sizeof external_profile, "%s", prof_on);
+    fake_gs_success = 1; unsetenv("S2A_DIRECT_CACHE_DIR"); unsetenv("S2A_SHADER_REVISION_ROOT");
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL;
+#define REASON_RESOLVE(tag, ...) do { gfxr_lines = 0; gfxr_text[0] = 0; rp_shader_reset(); p = NULL; \
+        CHECK(rp_shader_resolve(&q, &p) == 0 && p, tag ": live compile still resolves (behaviour unchanged)"); \
+        CHECK(gfxr_lines == 1, tag ": exactly one reason line (got %d)", gfxr_lines); \
+        const char *want_[] = {__VA_ARGS__, NULL}; for (int i_ = 0; want_[i_]; i_++) CHECK(strstr(gfxr_text, want_[i_]) != NULL, tag ": line has '%s': %s", want_[i_], gfxr_text); } while (0)
+    // 1 没有资源根：库闸无资源根；离线库 / 跨局缓存没查
+    REASON_RESOLVE("no root", want_keys, "离线库 没查", "跨局缓存 没查（关了或无目录）", "出包库 库闸：无资源根");
+    // 2 有根没有库目录
+    char root[256], dir[600];
+    snprintf(root, sizeof root, "%s/nvk_gfx_reason.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(root)) { CHECK(0, "reason temp root"); return 1; }
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+    REASON_RESOLVE("library absent", want_keys, "离线库 ", "出包库 库不在");
+    // 3 no_libpack 总闸（库目录不管在不在）
+    fixture_no_libpack = 1; REASON_RESOLVE("no_libpack", "出包库 库闸：no_libpack"); fixture_no_libpack = 0;
+    // 4 库在、没有这一键：放一份别的键
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700); snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    static const uint32_t spv0[5] = {0x07230203u, 0x00010300u, 0, 1, 0};
+    const uint8_t other[8] = {0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}; char ohx[17]; for (int b = 0; b < 8; b++) snprintf(ohx + 2 * b, 3, "%02x", other[b]);
+    char ojs[160]; snprintf(ojs, sizeof ojs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", ohx);
+    { uint64_t ks[2] = {lp_key(other), lp_key(other)}; uint8_t kd[2] = {1, 52}; const uint8_t *dd[2] = {(const uint8_t *)ojs, (const uint8_t *)spv0}; size_t ln[2] = {strlen(ojs), sizeof spv0};
+      CHECK(lp_write(dir, ks, kd, dd, ln, 2) == 0, "reason library written (other key)"); }
+    REASON_RESOLVE("library without this key", want_keys, "出包库 库里没有这一键");
+    // 5 库里有这一键但件不对（dm_ctl 与键不符）→ 被拒收（带原因文本）
+    { char path[700]; snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
+      char bad[160], jfs[160], jg0[200], jg3[200]; snprintf(bad, sizeof bad, "{\"stage\":\"vs\",\"dm_ctl\":\"0000000000000000\",\"bindings\":[]}");
+      snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[1]);
+      snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
+      snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+      static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u}, spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
+      struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
+          {lp_key(k[0]), 1, (const uint8_t *)bad, strlen(bad)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
+          {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv0, sizeof spv0},
+          {lp_key(k[2]), 112, (const uint8_t *)jg0, strlen(jg0)}, {lp_key(k[2]), 115, (const uint8_t *)jg3, strlen(jg3)},
+          {lp_key(k[2]), 120, (const uint8_t *)spv_vg0, sizeof spv_vg0}, {lp_key(k[2]), 123, (const uint8_t *)spv_vg3, sizeof spv_vg3} };
+      for (int i = 0; i < 8; i++) for (int j = i + 1; j < 8; j++) if (rec[j].key < rec[i].key || (rec[j].key == rec[i].key && rec[j].kind < rec[i].kind)) { __typeof__(rec[0]) t = rec[i]; rec[i] = rec[j]; rec[j] = t; }
+      uint64_t ks[8]; uint8_t kd[8]; const uint8_t *dd[8]; size_t ln[8]; for (int i = 0; i < 8; i++) { ks[i] = rec[i].key; kd[i] = rec[i].kind; dd[i] = rec[i].d; ln[i] = rec[i].n; }
+      char root2[256]; snprintf(root2, sizeof root2, "%s/nvk_gfx_reason2.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp"); if (!mkdtemp(root2)) return 1;
+      char d2[600]; snprintf(d2, sizeof d2, "%s/shaders", root2); mkdir(d2, 0700); snprintf(d2, sizeof d2, "%s/shaders/direct", root2); mkdir(d2, 0700); snprintf(d2, sizeof d2, "%s/shaders/direct/b-%s-vk", root2, DMSH_CHAIN); mkdir(d2, 0700);
+      CHECK(lp_write(d2, ks, kd, dd, ln, 8) == 0, "reason library written (bad piece)");
+      setenv("S2A_SHADER_REVISION_ROOT", root2, 1);
+      REASON_RESOLVE("library piece rejected", want_keys, "出包库 库件被拒收：");
+      snprintf(path, sizeof path, "%s/lib.idx", d2); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", d2); unlink(path); rmdir(d2);
+      snprintf(d2, sizeof d2, "%s/shaders/direct", root2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders", root2); rmdir(d2); rmdir(root2);
+      setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
+    // 6 跨局缓存：无文件 / 读头失败 / 坏
+    char cdir[300]; snprintf(cdir, sizeof cdir, "%s/cache", root); mkdir(cdir, 0700); setenv("S2A_DIRECT_CACHE_DIR", cdir, 1);
+    REASON_RESOLVE("cache no file", "跨局缓存 无文件"); usleep(300000);   // 异步落盘写完再动文件
+    { uint8_t id[32]; CHECK(rp_shader_prog_identity(p, id), "program identity readable"); static const uint8_t payload[64] = {1, 2, 3};
+      char why[160] = ""; CHECK(s2a_program_cache_store(cdir, id, payload, sizeof payload, why, sizeof why) == 0, "cache entry written: %s", why);
+      char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+      char path[700]; DIR *dh = opendir(cdir); struct dirent *de; path[0] = 0;
+      while (dh && (de = readdir(dh))) if (strstr(de->d_name, hex)) snprintf(path, sizeof path, "%s/%s", cdir, de->d_name);
+      if (dh) closedir(dh);
+      if (!path[0]) { char sub[700]; snprintf(sub, sizeof sub, "%s", cdir); /* 可能在分目录里 */ snprintf(path, sizeof path, "%s", sub); }
+      char cmd[1000]; snprintf(cmd, sizeof cmd, "find '%s' -type f -name '*%s*' | head -1 > '%s/found.txt'", cdir, hex + 0, root); (void)system(cmd);
+      char fpath[700] = ""; snprintf(cmd, sizeof cmd, "%s/found.txt", root); FILE *f = fopen(cmd, "r"); if (f) { if (!fgets(fpath, sizeof fpath, f)) fpath[0] = 0; fclose(f); }
+      size_t fl = strlen(fpath); while (fl && (fpath[fl - 1] == '\n')) fpath[--fl] = 0;
+      CHECK(fpath[0] != 0, "cache entry file located");
+      if (fpath[0]) {
+          // 读头失败：把文件截到 10 字节
+          usleep(300000); CHECK(truncate(fpath, 10) == 0, "truncate cache entry");
+          REASON_RESOLVE("cache header unreadable", "跨局缓存 读头失败"); usleep(300000);
+          // 坏：内容摘要不符（改回完整长度但翻一个负载字节）
+          CHECK(s2a_program_cache_store(cdir, id, payload, sizeof payload, why, sizeof why) == 0, "cache entry rewritten");
+          FILE *w = fopen(fpath, "r+b"); if (w) { fseek(w, -1, SEEK_END); int c = fgetc(w); fseek(w, -1, SEEK_END); fputc(c ^ 0xff, w); fclose(w); }
+          REASON_RESOLVE("cache corrupt", "跨局缓存 坏");
+      } }
+    // 7 状态闸的五个来源与阶段掩码（纯函数，逐位；非对齐存储缓冲不再是闸，旧库的拒因在库层）
+    { char t[200]; unsigned bits[5] = {1, 2, 4, 8, 16}; const char *nm[5] = {"深度裁剪", "y取反", "alpha测试", "alpha转覆盖", "双源混合"};
+      for (int i = 0; i < 5; i++) { nvk_shader_test_gate_text(t, sizeof t, 1, bits[i], 0x3, 0); CHECK(strstr(t, "状态闸[") && strstr(t, nm[i]), "state gate bit %u names %s: %s", bits[i], nm[i], t); }
+      nvk_shader_test_gate_text(t, sizeof t, 1, 4 | 16, 0x3, 0); CHECK(strstr(t, "alpha测试+双源混合") != NULL, "two state bits are both named: %s", t);
+      nvk_shader_test_gate_text(t, sizeof t, 1, 0, 0x2, 0); CHECK(strstr(t, "阶段掩码0x2") != NULL && !strstr(t, "状态闸"), "stage mask gate: %s", t);
+      nvk_shader_test_gate_text(t, sizeof t, 1, 0, 0x7, 0); CHECK(t[0] == 0, "no gate → empty: %s", t);
+      CHECK(!strcmp(nvk_shader_test_cache_class("未命中"), "无文件") && !strcmp(nvk_shader_test_cache_class("文件短于头部"), "读头失败") && !strcmp(nvk_shader_test_cache_class("结果内容摘要不符（字节损坏）"), "坏"), "cache why classes"); }
+    // 8 开关关时一行都不打；现编帧身份：take 取走并清空
+    unsetenv("S2A_DIRECT_CACHE_DIR");   // 异步落盘会把好文件写回，之后命中缓存就不再现编
+    { struct rp_shader_live_compile_stats drop; rp_shader_live_compile_take(&drop); }
+    fixture_hitch_flag = 0;
+    gfxr_lines = 0; setenv("S2A_SHADER_REVISION_ROOT", root, 1); rp_shader_reset(); p = NULL;
+    CHECK(rp_shader_resolve(&q, &p) == 0 && p && gfxr_lines == 0, "flag off: no reason line");
+    { struct rp_shader_live_compile_stats st; rp_shader_live_compile_take(&st); CHECK(st.ids[0] == 0, "flag off: no identities on the frame stats"); }
+    fixture_hitch_flag = 1; rp_shader_reset(); p = NULL; { struct rp_shader_live_compile_stats st0; rp_shader_live_compile_take(&st0); }
+    CHECK(rp_shader_resolve(&q, &p) == 0 && p, "flag on again resolves");
+    { struct rp_shader_live_compile_stats st; rp_shader_live_compile_take(&st); uint8_t id[32]; rp_shader_prog_identity(p, id); char want[16]; snprintf(want, sizeof want, "%02x%02x%02x%02x", id[0], id[1], id[2], id[3]);
+      CHECK(strstr(st.ids, want) != NULL, "frame stats carry the identity prefix %s: '%s'", want, st.ids);
+      rp_shader_live_compile_take(&st); CHECK(st.ids[0] == 0, "identities are cleared after take"); }
+    fake_gs_success = 0; external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT"); unsetenv("S2A_DIRECT_CACHE_DIR"); fixture_hitch_flag = 0;
+    printf("nvk shader pool (graphics live-compile reason): %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test();
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
-    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0);
-    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1);
+    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
+    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
+    if (argc == 2 && !strcmp(argv[1], "--gs-libpack-ssbo")) return gs_libpack_test(0, 1);
+    if (argc == 2 && !strcmp(argv[1], "--gfx-reason")) return gfx_reason_test();
     if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
