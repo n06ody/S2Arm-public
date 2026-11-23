@@ -173,6 +173,7 @@ int main(void) {
         CHECK(nvk_prog_warm_take(&g1) == 1 && nvk_prog_warm_take(&g2) == 1, "both lp_ok records are taken");
         struct nvk_prog_rec *ga = rec_is(&g1, 1) ? &g1 : &g2, *gb = rec_is(&g1, 1) ? &g2 : &g1;
         CHECK(rec_is(ga, 1) && ga->lp_ok == 1 && rec_is(gb, 2) && gb->lp_ok == 0, "lp_ok round-trips per record (%u, %u)", (unsigned)ga->lp_ok, (unsigned)gb->lp_ok);
+        CHECK(!ga->lp_ssbo_window && !gb->lp_ssbo_window, "zero v2 reserved bytes do not request the SSBO window");
         b.lp_ok = 1; nvk_prog_warm_note(&b);           // 旧清单读来的 0：真实 resolve 再记时刷新
         nvk_prog_warm_save();
         nvk_prog_warm_reset();
@@ -391,6 +392,7 @@ int main(void) {
             static uint8_t big[2304]; for (int k = 0; k < 2304; k++) big[k] = (uint8_t)(k * 13 + 1);
             nvk_prog_warm_reset(); dir_reset();
             struct nvk_prog_rec r = mkrec(11, 3); r.c1[1] = big; r.c1_len[1] = sizeof big;
+            r.lp_ok = 2; r.lp_ssbo_window = 1;
             nvk_prog_warm_note(&r);
             big[0] ^= 0xff;   // note 必须拷了自己的副本：调用方改自己的缓冲不影响清单
             nvk_prog_warm_save();
@@ -401,6 +403,7 @@ int main(void) {
             big[0] ^= 0xff;
             CHECK(nvk_prog_warm_take(&got) == 1 && got.c1_len[1] == 2304 && got.c1[1] && !memcmp(got.c1[1], big, 2304) && got.c1_len[0] == 0x100,
                   "long c1 round-trips whole (len=%u)", (unsigned)got.c1_len[1]);
+            CHECK(got.lp_ok == 2 && got.lp_ssbo_window == 1, "the SSBO window contract survives alongside long c1");
             nvk_prog_warm_reset(); dir_reset();
             for (int n = 1; n <= 3; n++) { struct nvk_prog_rec q = mkrec(n, 3); nvk_prog_warm_note(&q); }
             nvk_prog_warm_save();   // 后面的用例要那份 3 条的好文件

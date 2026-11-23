@@ -54,6 +54,7 @@ static int g_memo_on = 1;        // 整套用例这一遍 nvk_desc_memo 的取�
 static int g_dq_dflt_seen = -1;     // 后端传给 nvn_plat_flag("nvk_dq", dflt) 的缺省值（C-DQ-DFLT 核它 = 1：两级回放缺省开）
 static int g_memo_dflt_seen = -1;   // 没设环境变量时后端传给 nvn_plat_flag("nvk_desc_memo", dflt) 的缺省值（C208 核它 = 1：缺省开）
 static int g_shown_timing_test;
+static int g_land_test_on;
 void nvn_plat_safepoint(void) {}
 static int g_upscale_flag = -1;   // -1 = 后端缺省（关），>= 0 = 读成这个值
 static int g_compute_warm = -1;
@@ -73,7 +74,10 @@ static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = �
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 static int g_pool_rec_flag = -1;    // 整池组回收 nvk_pool_rec：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的回收用例用；改完调 nvn_gpu_vk_test_pool_memo_refresh）
 static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的备忘用例用；后端每 256 次绑定重读，改完调 nvn_gpu_vk_test_pool_memo_refresh 立即作废缓存）
+static int g_gfx_c2_flag = -1;   // nvk_libpack_gfx_c2：-1 = 读缺省（0 = 库图形程序读 c2 句柄表被挡下走现编）；0 / 1 = 用例指定（t_replay_libpack_c0）
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_gfx_c2") && g_gfx_c2_flag >= 0) return g_gfx_c2_flag;
+    if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return 1;
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_pool_rec") && g_pool_rec_flag >= 0) return g_pool_rec_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
@@ -6748,6 +6752,60 @@ done:
     nvn_gpu_err ce; memset(&ce, 0, sizeof ce);
     CHECK(OK(nvn_gpu_close(5000000000ull, &ce)), "C208 (%u,%u) close：%d %s", lim2, lim9, ce.rc.code, ce.why);
 }
+// 绑定号 ≥ 256：布局合并表（backend_vulkan.c struct merged）原先把 binding 存成 uint8_t，262 变成 6。库程序保留全部 arg_id，绑定号可到 262+，
+//   Adreno 链接时报「Bind group info mismatches the shader source」、管线建失败、整类绘制被失败表挡下（8E 全黑）。夹具里 262 与 6 同时存在（低 8 位相同，
+//   截断会把两项并成一项）：管线必须建成，两个 UBO 各自取到自己的值。
+static void t_high_binding(const char *dir) {
+    if (!open_backend()) { CHECK(0, "高绑定号 开会话失败"); return; }
+    nvn_gpu_layout_ent fe[2];
+    memset(fe, 0, sizeof fe);
+    fe[0].set = 0; fe[0].binding = 262; fe[0].cls = NVN_GPU_RES_UBO; fe[0].access = NVN_GPU_ACC_R; fe[0].count = 1; fe[0].stages = 1u << NVN_GPU_SH_FS;
+    fe[1] = fe[0]; fe[1].binding = 6;
+    nvn_gpu_layout fl;
+    memset(&fl, 0, sizeof fl);
+    fl.ent = fe; fl.nent = 2;
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    void *vm = NULL, *fm = NULL;
+    nvn_gpu_err e; memset(&e, 0, sizeof e);
+    nvn_gpu_pipe pipe = NULL;
+    struct c208_env E; memset(&E, 0, sizeof E);
+    if (!load_shader_pair(dir, "tri3.vert", "ubo_high.frag", NULL, &fl, &vs, &fs, &vm, &fm)) { CHECK(0, "高绑定号 读不到 ubo_high"); goto done; }
+    {
+        nvn_gpu_pipe_desc pd;
+        fill_gpipe_desc(&pd, vs, fs, 0);
+        CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "高绑定号 建管线：%d %s", e.rc.code, e.why);
+        if (!pipe) goto done;
+    }
+    {
+        const float va[4] = {0.2f, 0, 0, 0}, vb[4] = {0, 0.6f, 0, 0};
+        E.ba = make_buf(sizeof va, NVN_GPU_MEM_SHARED, va); E.bb = make_buf(sizeof vb, NVN_GPU_MEM_SHARED, vb);
+        E.vb = full_vb();
+        E.out = make_tex(10, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); E.ov = make_view(E.out);
+        E.rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+        nvn_gpu_cmd c; c208_begin(&c, &E, pipe);
+        c208_pixel_draw(c, 0);
+        nvn_gpu_binding bs[2];
+        memset(bs, 0, sizeof bs);
+        bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_UBO; bs[0].u.b.buf = E.ba; bs[0].u.b.len = 16;
+        bs[1].ent = 1; bs[1].cls = NVN_GPU_RES_UBO; bs[1].u.b.buf = E.bb; bs[1].u.b.len = 16;
+        nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 2);
+        c208_draw(c);
+        const uint8_t want[1][4] = {{51, 153, 0, 255}};   // 0.2 × 255、0.6 × 255
+        c208_finish(c, &E, 400, 1, want, "高绑定号 262 / 6");
+    }
+done:
+    if (E.rb) nvn_gpu_buf_release(E.rb, NULL, NULL);
+    if (E.ov) nvn_gpu_view_release(E.ov);
+    if (E.out) nvn_gpu_tex_release(E.out);
+    if (E.vb) nvn_gpu_buf_release(E.vb, NULL, NULL);
+    if (E.ba) nvn_gpu_buf_release(E.ba, NULL, NULL);
+    if (E.bb) nvn_gpu_buf_release(E.bb, NULL, NULL);
+    if (vs) nvn_gpu_shader_release(vs);
+    if (fs) nvn_gpu_shader_release(fs);
+    free(vm); free(fm);
+    nvn_gpu_err ce; memset(&ce, 0, sizeof ce);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &ce)), "高绑定号 close：%d %s", ce.rc.code, ce.why);
+}
 static void c208_dyn_ubo(const char *dir) {
     c208_arm(dir, 1, 8);   // 两条管线都超上限 1 个：全静态
     if (!getenv("S2A_TEST_DESC_MEMO"))   // 没指定环境变量：后端读 nvk_desc_memo 时传的缺省值必须是开（备忘 + 动态 UBO 缺省开，#1233；建管线时读过了）
@@ -6756,6 +6814,7 @@ static void c208_dyn_ubo(const char *dir) {
     c208_arm(dir, 2, 9);   // 两条都刚好在上限上：备忘开时全动态
     c208_arm(dir, 2, 8);   // P2 刚好 / P9 超 1 个：一动一静
     c208_arm(dir, 8, 8);   // 设备只报规范最小值 8（不少 Mali 如此，#1292 评审补）：2 个 UBO 的 P2 动态、9 个 UBO 的 P9 超 1 个保持静态；像素与全静态臂的期望相同、校验层 0 条
+    t_high_binding(dir);   // 绑定号 ≥ 256（库程序保留全部 arg_id）：布局合并表不许把 binding 截成 8 位
     printf("C208 动态 UBO 偏移（备忘%s）：四个臂（全静态 / 全动态 / 一动一静 / 上限 8）与拆分点 20 位的高位偏移已核对\n", g_memo_on ? "开" : "关，一律静态");
 }
 
@@ -10935,6 +10994,108 @@ static void gpu_deswizzle_matrix(void) {
 
 #include "t_clear_capacity.inc"
 
+#ifdef S2A_LAND_READBACK_TEST
+void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t));
+static atomic_int land_gate_release;
+static int land_force_failure;
+
+static VkResult land_wait_for_later_gpu(uint64_t signal) {
+    if (signal != 2) return VK_SUCCESS;
+    for (int i = 0; i < 500 && !atomic_load(&land_gate_release); i++) sleep_ms(10);
+    if (!atomic_load(&land_gate_release)) return VK_ERROR_UNKNOWN;
+    return land_force_failure ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+}
+
+struct land_result {
+    atomic_int called;
+    uint32_t status;
+    uint64_t bytes;
+    uint8_t data[56];
+};
+static void land_done(void *user, const nvn_gpu_done *done) {
+    struct land_result *result = user;
+    result->status = done->status;
+    result->bytes = done->readback_bytes;
+    if (done->readback && done->readback_bytes == sizeof result->data)
+        memcpy(result->data, done->readback, sizeof result->data);
+    atomic_store(&result->called, 1);
+}
+
+static void test_land_readback(int fail_invalidate) {
+    memset(&g_desc, 0, sizeof g_desc);
+    g_desc.host_device = &g_dev;
+    g_desc.app_label = "land-readback";
+    g_land_test_on = 1;
+    if (!open_backend()) {
+        g_land_test_on = 0;
+        return;
+    }
+    nvn_gpu_err err = {0};
+    nvn_gpu_buf mirror = make_buf(128, NVN_GPU_MEM_SHARED, NULL);
+    struct land_result a_result = {0}, b_result = {0};
+    const int enabled = nvn_gpu_readback_enabled();
+    CHECK(enabled, "land: no cached readback capability on test ICD");
+    if (mirror && enabled) {
+        CHECK(OK(nvn_gpu_cmd_commit(begin_cmd(), 1, on_done, NULL, &err)), "land: F-1 submit %s", err.why);
+        CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &err)), "land: F-1 initially completed");
+
+        nvn_gpu_cmd a = begin_cmd();
+        nvn_gpu_fill_buf(a, mirror, 0, 128, 0x11111111u);
+        // 两个同一源的不相邻字节范围，第二个目标起点不对齐缓存粒度。
+        nvn_gpu_readback_span spans[] = {{mirror, 5, 37, UINT64_MAX}, {mirror, 73, 19, UINT64_MAX}};
+        land_force_failure = fail_invalidate;
+        atomic_store(&land_gate_release, 0);
+        nvn_gpu_vk_test_land_gate(land_wait_for_later_gpu);
+        CHECK(nvn_gpu_readback_record(a, spans, 2) == 56 &&
+              spans[0].readback_offset == 0 && spans[1].readback_offset == 37,
+              "land: packed copy plan must preserve both source ranges");
+        CHECK(OK(nvn_gpu_cmd_commit(a, 2, land_done, &a_result, &err)), "land: A submit %s", err.why);
+
+        nvn_gpu_cmd b = begin_cmd();
+        nvn_gpu_fill_buf(b, mirror, 0, 128, 0x22222222u);
+        CHECK(OK(nvn_gpu_cmd_commit(b, 3, land_done, &b_result, &err)), "land: B submit %s", err.why);
+        // A 的 CPU 完成线程仍堵在 gate。直接排队一个 Vulkan 栅栏，证明 B 的真实 GPU 工作已经结束。
+        VkFence fence = VK_NULL_HANDLE;
+        const VkFenceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        const VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkResult status = vkCreateFence(g_dev.device, &info, NULL, &fence);
+        if (status == VK_SUCCESS) status = vkQueueSubmit(g_dev.queue, 1, &submit, fence);
+        if (status == VK_SUCCESS) status = vkWaitForFences(g_dev.device, 1, &fence, VK_TRUE, 4000000000ull);
+        CHECK(status == VK_SUCCESS, "land: native fence behind B: %d", status);
+        CHECK(!atomic_load(&a_result.called) && !atomic_load(&b_result.called), "land: software completion ran before release");
+        if (status == VK_SUCCESS) {
+            const uint8_t *mapped = nvn_gpu_buf_cpu(mirror);
+            CHECK(mapped && mapped[5] == 0x22 && mapped[73] == 0x22, "land: B did not overwrite the source mirror");
+        }
+        atomic_store(&land_gate_release, 1);
+        const int wait_rc = nvn_gpu_fence_wait(2, 5000000000ull, &err).code;
+        CHECK(wait_rc == (fail_invalidate ? NVN_GPU_E_FAILED : NVN_GPU_OK), "land: waiting A got %d", wait_rc);
+        const int b_rc = nvn_gpu_fence_wait(3, 5000000000ull, &err).code;
+        CHECK(b_rc == (fail_invalidate ? NVN_GPU_E_FAILED : NVN_GPU_OK), "land: waiting B got %d", b_rc);
+        CHECK(nvn_gpu_fence_wait(1, 0, &err).code == NVN_GPU_OK, "land: failed A hid the prior success");
+        CHECK(nvn_gpu_fence_wait(2, 0, &err).code == wait_rc, "land: query A after completion disagrees");
+        CHECK(nvn_gpu_fence_failed() == (fail_invalidate ? 2u : 0u), "land: wrong first failure value");
+        if (fence && status == VK_SUCCESS) vkDestroyFence(g_dev.device, fence, NULL);
+    }
+    if (mirror) nvn_gpu_buf_release(mirror, NULL, NULL);
+    const nvn_gpu_rc closed = nvn_gpu_close(5000000000ull, &err);
+    CHECK(OK(closed), "land: close %s", err.why);
+    if (mirror && enabled && OK(closed)) {
+        const uint32_t want = fail_invalidate ? NVN_GPU_DONE_FAILED : NVN_GPU_DONE_OK;
+        CHECK(atomic_load(&a_result.called) && a_result.status == want, "land: wrong A callback result");
+        CHECK(atomic_load(&b_result.called) && b_result.status == want, "land: wrong B callback result");
+        CHECK(a_result.bytes == (fail_invalidate ? 0u : 56u), "land: wrong A borrowed length");
+        if (!fail_invalidate) {
+            uint8_t expected[sizeof a_result.data];
+            memset(expected, 0x11, sizeof expected);
+            CHECK(!memcmp(expected, a_result.data, sizeof expected), "land: retained data must be A's writes, never B's mirror");
+        }
+    }
+    nvn_gpu_vk_test_land_gate(NULL);
+    g_land_test_on = 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
@@ -10966,6 +11127,22 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+#ifdef S2A_LAND_READBACK_TEST
+    if (argc > 2 && !strcmp(argv[2], "--land-readback")) {
+        test_land_readback(0);
+        test_land_readback(1);
+        printf("LAND_READBACK valid and invalidated paths: failures=%d\n", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
+#endif
+    if (argc > 2 && !strcmp(argv[2], "--high-binding")) {   // 只跑绑定号 ≥ 256 的布局用例（默认档里也跑）；给红 / 绿取证用
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "high-binding-test";
+        t_high_binding(argv[1]);
+        s2a_vk_device_destroy(&g_dev, 1);
+        printf("HIGH_BINDING failures=%d\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 2 && !strcmp(argv[2], "--clear-capacity")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "clear-capacity-test";
         c1501_clear_capacity(argv[1]);
@@ -11589,6 +11766,10 @@ int main(int argc, char **argv) {
     c89_midrun_save(argv[1]);  // 同上；还会起子进程（被 SIGKILL 的那一局）
     c658_suite(argv[1],0);   // Independently opens/closes; absent count capability is a negative control.
     c907_retained_flush(argv[1]);   // 停局保留会话时的管线缓存落盘（#907 合入补）
+#ifdef S2A_LAND_READBACK_TEST
+    test_land_readback(0);
+    test_land_readback(1);
+#endif
     // C201：整套用例都在 nvk_fbdrop=2（自检档）下跑，视图销毁走快路之后每次再全表扫一遍；反查表漏记过的帧缓冲会在这里留下残留计数。
     CHECK(nvn_vk_dbg_view_stat(3) == 0, "C201 整套用例在自检档下跑完：视图销毁后帧缓冲缓存里扫到的残留期望 0 → %llu", (unsigned long long)nvn_vk_dbg_view_stat(3));
 

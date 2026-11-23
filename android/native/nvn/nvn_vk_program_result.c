@@ -212,14 +212,33 @@ static int ubo_texture_parse(struct s2a_jv b, struct fd_binding *dst, char *why,
     return 0;
 }
 
-static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size);
+static int parse_graphics_fields(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size);
 int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size) {
-    return parse_graphics(bytes, length, out, 0, why, why_size);
+    return nvn_vk_program_parse_graphics_stages(bytes, length, out, 0, why, why_size);
 }
 int nvn_vk_program_parse_graphics_stages(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size) {
-    return parse_graphics(bytes, length, out, allow_vs_only, why, why_size);
+    int rc = parse_graphics_fields(bytes, length, out, why, why_size);
+    if (rc) return rc;
+    if (!out->stage[0].present) return fail(why, why_size, "program has no vertex stage");
+    if (!out->stage[1].present && !allow_vs_only) return fail(why, why_size, "program is not a vs+fs program");
+    return 0;
 }
-static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size) {
+#ifdef S2A_LIBPACK_PACKER
+// Stages are packaged independently. Validate their ordinary binding and SPIR-V
+// facts here; the replay entry point above still validates complete programs.
+int nvn_vk_pack_parse_stage(const uint8_t *bytes, size_t length, struct fd_program *out,
+                            unsigned stage, char *why, size_t why_size) {
+    int rc = parse_graphics_fields(bytes, length, out, why, why_size);
+    if (rc) return rc;
+    if (stage >= FD_MAX_STAGES) return fail(why, why_size, "invalid offline stage");
+    for (unsigned i = 0; i < FD_MAX_STAGES; i++)
+        if (out->stage[i].present != (i == stage))
+            return fail(why, why_size, "offline stage identity mismatch");
+    return 0;
+}
+#endif
+
+static int parse_graphics_fields(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size) {
     struct s2a_jv top = { (const char *)bytes, length };
     if (!s2a_jv_is_object(top)) return fail(why, why_size, "program result is not a JSON object");
     struct s2a_jv schema;
@@ -497,8 +516,6 @@ static int parse_graphics(const uint8_t *bytes, size_t length, struct fd_program
             out->support_bytes = required_v;
     }
     if (out->support_bytes < SUPPORT_DEFAULT_BYTES) return fail(why, why_size, "support layout is smaller than the compiler layout");
-    if (!out->stage[0].present) return fail(why, why_size, "program has no vertex stage");
-    if (!out->stage[1].present && !allow_vs_only) return fail(why, why_size, "program is not a vs+fs program");
     return 0;
 }
 
@@ -555,7 +572,7 @@ int nvn_vk_spirv_link_ok(const uint8_t *producer, size_t producer_bytes, const u
 }
 
 void nvn_vk_program_free(struct fd_program *p) {
-    for (int i = 0; i < FD_MAX_STAGES; i++) { free(p->stage[i].spirv); p->stage[i].spirv = NULL; }
+    for (int i = 0; i < FD_MAX_STAGES; i++) { free(p->stage[i].spirv_owner ? p->stage[i].spirv_owner : p->stage[i].spirv); p->stage[i].spirv_owner = p->stage[i].spirv = NULL; }
 }
 
 /* The graphics reader above is deliberately unchanged. Compute validates the
@@ -622,7 +639,7 @@ static int compute_spirv(struct s2a_jv v, struct fd_stage *stage) {
 }
 void nvn_vk_program_free_compute(struct nvn_vk_compute_program *p) {
     if (!p) return;
-    free(p->stage.spirv);
+    free(p->stage.spirv_owner ? p->stage.spirv_owner : p->stage.spirv);
     memset(p, 0, sizeof *p);
 }
 /* Compute-only source mapping. Do not interpret translator allocation order as an NVN slot. */
@@ -768,7 +785,7 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         uint32_t u;
         if (s2a_jv_obj_find(b, "set", &value) || compute_u32(value, &u) || u > 3) CS_FAIL("compute descriptor set invalid");
         dst->set = (int)u;
-        if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute binding number invalid");
+        if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > UINT16_MAX) CS_FAIL("compute binding number invalid or outside 16 bits");
         dst->binding = (int)u;
         if (s2a_jv_obj_find(b, "count", &value) || compute_u32(value, &u) || !u) CS_FAIL("compute binding count is invalid");
         // 整池数组（带 pool 字段）的 count 是池长，不走下面「普通数组」的上限；它的形状在后面 compute_pool_binding 里整体核

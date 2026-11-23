@@ -136,6 +136,7 @@ void nvk_prog_warm_stat_draw_hit(void) {}
 void nvk_prog_warm_stat_draw_miss(void) {}
 void nvk_prog_warm_note(const struct nvk_prog_rec *rec) { (void)rec; }
 int nvk_prog_warm_contains(const uint8_t identity[32]) { (void)identity; return 0; }
+int nvk_prog_warm_seed_dir(char *out, size_t n) { (void)out; (void)n; return 0; }   // 随包种子目录：本用例不带种子（nvk_shader.c 的非窗口补件取它）
 
 // ---- 夹具：真缓存文件 ----
 static char g_dir[128];
