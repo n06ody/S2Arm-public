@@ -959,6 +959,35 @@ static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx
 }
 
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
+// 图形阶段的 c0 读集：_b.json 的 drv_reads（按 MSL 文本的 vec4 粒度，库收录的程序读的都落在宿主能填的范围里）推出 c0Reads，
+//   回放据此判断「这个阶段不读 c0 + 0x644（base instance）」，间接绘制才可以省掉每笔的 GPU 拷贝 + 屏障。
+//   证得出才发：drv_reads 缺 / 不是对象 / bank 0 的 dynamic 非 false / vec4_offsets 不是 u32 数组 → 什么都不发（字段缺 = 未知，回放照旧拷）；
+//   没有 bank 0 = 一处 c0 都不读 → 空数组；有静态下标 → 每个 vec4 一对 [偏移, 16]（0x640 的 vec4 盖住 0x644，读就是读）。
+//   c0ReadsStatic 同值（不依赖动态下标定界的口径：这里本来就只在没有动态下标时才发）。
+static void lp_emit_c0_reads(struct jw *stages, struct s2a_jv top) {
+    struct s2a_jv drv, bank0, offsets, dyn;
+    if (s2a_jv_obj_find(top, "drv_reads", &drv) || !s2a_jv_is_object(drv)) return;
+    if (s2a_jv_obj_find(drv, "0", &bank0)) { jw_str(stages, ",\"c0Reads\":[],\"c0ReadsStatic\":[]"); return; }
+    int dynamic = 1;
+    if (!s2a_jv_is_object(bank0) || s2a_jv_obj_find(bank0, "dynamic", &dyn) || s2a_jv_bool(dyn, &dynamic) || dynamic) return;
+    if (s2a_jv_obj_find(bank0, "vec4_offsets", &offsets) || !s2a_jv_is_array(offsets)) return;
+    int n = s2a_jv_arr_count(offsets);
+    if (n < 0) return;
+    for (int i = 0; i < n; i++) {   // 先整体核：只要有一项不是 u32 就整段不发
+        struct s2a_jv item; uint32_t o = 0;
+        if (s2a_jv_arr_item(offsets, i, &item) || !item.n || item.p[0] < '0' || item.p[0] > '9' || s2a_jv_u32(item, &o)) return;   // strtoul 收 -16 / +16 / 前导空白：只认纯十进制数字开头
+    }
+    for (int k = 0; k < 2; k++) {
+        jw_str(stages, k ? ",\"c0ReadsStatic\":[" : ",\"c0Reads\":[");
+        for (int i = 0; i < n; i++) {
+            struct s2a_jv item; uint32_t o = 0;
+            (void)s2a_jv_arr_item(offsets, i, &item); (void)s2a_jv_u32(item, &o);
+            jw_fmt(stages, "%s[%u,16]", i ? "," : "", o);
+        }
+        jw_str(stages, "]");
+    }
+}
+
 static int lp_stage_from_bytes(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
                          uint32_t shared_limit, const struct s2a_libpack_gfx *gfx, int packing, const uint8_t *jb, size_t jn, uint8_t *spv, size_t sn,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
@@ -1076,6 +1105,7 @@ static int lp_stage_from_bytes(struct s2a_libpack *lp, const uint8_t key[8], uns
         jw_b64(stages, spv, sn);
         jw_str(stages, "\"");
         if (mask) jw_fmt(stages, ",\"attributeReadMask\":%u", mask);
+        if (!compute) lp_emit_c0_reads(stages, top);
         uint32_t fom = 0;
         if (!strcmp(v1_stage, "fs") && !s2a_libpack_spv_frag_outputs(spv, sn, &fom)) jw_fmt(stages, ",\"info\":{\"fragmentOutputMap\":%u}", fom);
         jw_str(stages, "}");

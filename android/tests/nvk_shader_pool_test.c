@@ -2321,6 +2321,78 @@ static int gfx_reason_test(void) {
     printf("nvk shader pool (graphics live-compile reason): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
+// ---- 库命中的图形程序：c0Reads 由 _b.json 的 drv_reads 推出，binst_unread 才不会恒 0（否则每笔间接绘制都做 base instance GPU 拷贝 + 屏障）----
+//   位 i = 阶段 i（0 vs / 1 fs / 2 gs）已证不读 c0 + 0x644。证不了（字段缺 / 非对象 / 动态下标 / 读 0x640 的 vec4 / 偏移不是 u32）一律保持 0 = 未知
+static int lib_binst_case(const char *tag, const char *drv_vs, const char *drv_fs, const char *drv_gs, unsigned want_mask) {
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned i = 0; i < 3; i++) { gs_stages[i] = (uint8_t)i; memcpy(gs_keys[i], k[i], 8); }
+    gs_keys_ok = 7; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    int ok = rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8); bind_pools(7);
+    CHECK(ok, "%s: fixture binds program", tag);
+    char root[256], dir[600];
+    snprintf(root, sizeof root, "%s/nvk_lib_binst.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(root)) { CHECK(0, "%s: temp root", tag); return 1; }
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    static const uint32_t spv0[5] = {0x07230203u, 0x00010300u, 0, 1, 0};
+    static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u};
+    static const uint32_t spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
+    char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
+    char jvs[300], jfs[300], jg0[340], jg3[340];
+    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\"%s,\"bindings\":[]}", hx[0], drv_vs);
+    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\"%s,\"bindings\":[]}", hx[1], drv_fs);
+    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0%s,\"bindings\":[]}", hx[2], drv_gs);
+    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3%s,\"bindings\":[]}", hx[2], drv_gs);
+    struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
+        {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
+        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv0, sizeof spv0},
+        {lp_key(k[2]), 112, (const uint8_t *)jg0, strlen(jg0)}, {lp_key(k[2]), 115, (const uint8_t *)jg3, strlen(jg3)},
+        {lp_key(k[2]), 120, (const uint8_t *)spv_vg0, sizeof spv_vg0}, {lp_key(k[2]), 123, (const uint8_t *)spv_vg3, sizeof spv_vg3},
+    };
+    for (int i = 0; i < 8; i++) for (int j = i + 1; j < 8; j++)
+        if (rec[j].key < rec[i].key || (rec[j].key == rec[i].key && rec[j].kind < rec[i].kind)) { __typeof__(rec[0]) t = rec[i]; rec[i] = rec[j]; rec[j] = t; }
+    uint64_t keys[8]; uint8_t kinds[8]; const uint8_t *data[8]; size_t lens[8];
+    for (int i = 0; i < 8; i++) { keys[i] = rec[i].key; kinds[i] = rec[i].kind; data[i] = rec[i].d; lens[i] = rec[i].n; }
+    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "%s: library written", tag);
+    static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
+    snprintf(external_profile, sizeof external_profile, "%s", prof_on);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
+    fake_depth_clip = 1; fake_gs_success = 1;
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL; compiler_calls = 0;
+    CHECK(rp_shader_resolve(&q, &p) == 0 && p, "%s: resolves", tag);
+    CHECK(p && p->lib_sourced && compiler_calls == 0, "%s: program comes from the library (no live compile)", tag);
+    CHECK(p && p->binst_unread == want_mask, "%s: binst_unread mask 0x%x (want 0x%x)", tag, p ? p->binst_unread : 0xffu, want_mask);
+    char path[700];
+    snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
+    rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders/direct", root); rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders", root); rmdir(dir); rmdir(root);
+    external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT"); fake_gs_success = 0;
+    return 0;
+}
+static int lib_binst_test(void) {
+#define DRV0(offs, dyn) ",\"drv_reads\":{\"0\":{\"vec4_offsets\":" offs ",\"dynamic\":" dyn "}}"
+    lib_binst_case("fields absent = unknown", "", "", "", 0x0);
+    lib_binst_case("empty drv_reads object = no c0 reads", ",\"drv_reads\":{}", ",\"drv_reads\":{}", ",\"drv_reads\":{}", 0x7);
+    lib_binst_case("only bank 2 = no c0 reads", ",\"drv_reads\":{\"2\":{\"vec4_offsets\":[0],\"dynamic\":false}}", ",\"drv_reads\":{}", ",\"drv_reads\":{}", 0x7);
+    lib_binst_case("static c0 reads elsewhere", DRV0("[272,528]", "false"), DRV0("[]", "false"), DRV0("[16]", "false"), 0x7);
+    lib_binst_case("vec4 just below 0x640", DRV0("[1584]", "false"), DRV0("[1584]", "false"), DRV0("[1584]", "false"), 0x7);
+    lib_binst_case("vec4 just above 0x640", DRV0("[1616]", "false"), DRV0("[1616]", "false"), DRV0("[1616]", "false"), 0x7);
+    lib_binst_case("vs reads the base-instance vec4", DRV0("[272,1600]", "false"), DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("fs reads the base-instance vec4", DRV0("[272]", "false"), DRV0("[1600]", "false"), DRV0("[272]", "false"), 0x5);
+    lib_binst_case("gs reads the base-instance vec4", DRV0("[272]", "false"), DRV0("[272]", "false"), DRV0("[1600]", "false"), 0x3);
+    lib_binst_case("dynamic index is unknown", DRV0("[272]", "true"), DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("dynamic missing is unknown", ",\"drv_reads\":{\"0\":{\"vec4_offsets\":[272]}}", DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("drv_reads is a string (older compiler default)", ",\"drv_reads\":\"\"", DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("offsets not an array", ",\"drv_reads\":{\"0\":{\"vec4_offsets\":\"x\",\"dynamic\":false}}", DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("offset not a u32", DRV0("[272,\"x\"]", "false"), DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("negative offset not a u32", DRV0("[-16]", "false"), DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    lib_binst_case("bank 0 is not an object", ",\"drv_reads\":{\"0\":1}", DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
+    printf("nvk shader pool (library binst_unread): %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test();
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
@@ -2329,6 +2401,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
     if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack-ssbo")) return gs_libpack_test(0, 1);
+    if (argc == 2 && !strcmp(argv[1], "--lib-binst")) return lib_binst_test();
     if (argc == 2 && !strcmp(argv[1], "--gfx-reason")) return gfx_reason_test();
     if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
