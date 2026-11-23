@@ -1068,7 +1068,7 @@ static void hz_build(nvn_gpu_cmd c, const void *rec, uint8_t mask) {
     // 先把全部间接记录解析完（脏页同步可能录进主段），再判旧表还能不能沿用、再录拷贝：拷贝之后不能再有同步改这些记录
     static uint64_t ra[HZ_MAX], rl[HZ_MAX], ro[HZ_MAX]; static nvn_gpu_buf rb[HZ_MAX]; static unsigned char rok[HZ_MAX];
     for (int i = 0; i < t->n; i++) { ra[i] = t->e[i].ind; rl[i] = t->e[i].indexed ? 20 : 16; }
-    if (t->n) rp_buf_resolve_multi(t->n, ra, rl, rb, ro, rok);   // 一次抢锁解析一批（同顶点流）
+    if (t->n) rp_buf_resolve_multi(NULL, t->n, ra, rl, rb, ro, rok);   // 一次抢锁解析一批（同顶点流）
     int n = 0;
     for (int i = 0; i < t->n; i++) {
         if (!rok[i] || (ro[i] & 3)) continue;   // 解析不了：这一笔到时自己按原路记未接
@@ -1678,7 +1678,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         }
         if (nv) {
             nvn_gpu_buf vbuf[16];
-            rp_buf_resolve_multi(nv, vaddr, vlen, vbuf, voff, vok);
+            rp_buf_resolve_multi(c, nv, vaddr, vlen, vbuf, voff, vok);
             int k = 0;
             for (int i = 0; i < 16; i++) if (streams >> i & 1) {
                 if (!vok[k]) { skip("vertex_buffer_unresolved", rec); return; }
@@ -1707,7 +1707,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             else if (rp_buf_resolve(c, wa, wl, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
         }
         if (nb) {
-            rp_buf_resolve_multi(nb, ba, bl, bb, bo, bok);
+            rp_buf_resolve_multi(NULL, nb, ba, bl, bb, bo, bok);
             for (int k = 0; k < nb; k++) if (bok[k]) { g_sb_buf[bs[k]][bi[k]] = bb[k]; g_sb_off[bs[k]][bi[k]] = bo[k]; g_sb_ok[bs[k]][bi[k]] = 1; }
         }
     }

@@ -48,6 +48,7 @@ static int g_flag_binst_hoist = -1;   // 用例设：开关 nvk_binst_hoist（-1
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值（缺省同产品：开）；每 256 次登记才重读一次，换值后要用 rp_test_gw_merge_reload() 推一下
+static int g_flag_buf_read_snapshot;
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_ub_steal = -1;   // 用例设：开关 nvk_ub_fill_steal（-1 = 缺省）；rp_draw 缓存它，换值后要 pass_fresh（会话重开清缓存）
@@ -57,6 +58,7 @@ static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
+    if (!strcmp(name, "nvk_buf_read_snapshot")) return g_flag_buf_read_snapshot;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
@@ -2480,7 +2482,7 @@ static void t_buf_multi_tail(void) {
         // Valid, zero-length and pool-tail failures on both sides of a chunk boundary.
         len[15] = len[31] = 0;
         addr[16] = addr[48] = base + sizeof g_pmem - 4;
-        CHECK(rp_buf_resolve_multi(counts[c], addr, len, buf, off, ok) == 1);
+        CHECK(rp_buf_resolve_multi(NULL, counts[c], addr, len, buf, off, ok) == 1);
         for (int i = 0; i < counts[c]; i++) {
             int valid = i != 15 && i != 16 && i != 31 && i != 48;
             CHECK(ok[i] == valid);
@@ -6204,10 +6206,10 @@ static void t_draw_mdi_binst(void) {
 }
 
 extern int rp_split_draws;
-static void t_clean_read_order(void) {
+static void t_clean_read_order(int snapshot) {
     const int old_split = rp_split_draws;
     for (int mode = 0; mode < 2; mode++) for (int split = 0; split < 2; split++) {
-        pass_fresh(); g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = mode == 1;
+        pass_fresh(); g_arena_used = 0; g_flag_buf_read_snapshot = snapshot; g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = mode == 1;
         g_log_fake_on = mode == 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++; memset(g_log_unarmed, 0, sizeof g_log_unarmed);
         g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
         memset(g_block_mem, 0x11, BLOCK_TEST_PAGES * PG); memset(g_block_mem + 100 * PG, 0x22, PG);
@@ -6217,7 +6219,7 @@ static void t_clean_read_order(void) {
         nvn_be_sub_begin(); stream warm = {0}; q_env(&warm); g_fprog.attr_mask = 1;
         p_bind_vattr *va = put(&warm, OP_BIND_VATTR, sizeof *va); va->n = 1; va_st at = {.fmt = 0x2a, .stream = 0}; memcpy(&va->st[0], &at, 4);
         p_bind_vstream *vs = put(&warm, OP_BIND_VSTREAM, sizeof *vs); vs->n = 1; vs->st[0].stride = 16;
-        p_bind_vbuf_single *vb = put(&warm, OP_BIND_VBUF, sizeof *vb); vb->first = 0; vb->size = 65 * PG; vb->addr = base - 0x1000;
+        p_bind_vbuf_single *vb = put(&warm, OP_BIND_VBUF, sizeof *vb); vb->first = 0; vb->size = snapshot ? PG : 65 * PG; vb->addr = base - 0x1000;
         q_draw(&warm); end(&warm); nvn_be_exec(warm.b); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
         g_order_active = 1; g_order_seg = g_order_n = g_order_overflow = 0; g_order_vbuf = NULL; rp_split_draws = split ? 1 : 0;
         nvn_be_sub_begin(); stream first = {0}; q_draw(&first); end(&first); nvn_be_exec(first.b);
@@ -6226,7 +6228,9 @@ static void t_clean_read_order(void) {
         fake_log_event(0, 0); g_block_gen[0] = ++g_dirty_now;
         stream copy = {0}; uint8_t *cp = put(&copy, OP_COPY_B2B, 24); uint64_t src = base + 100 * PG, dst = base, size = 4;
         memcpy(cp, &src, 8); memcpy(cp + 8, &dst, 8); memcpy(cp + 16, &size, 8); end(&copy); nvn_be_exec(copy.b);
+        uint64_t perf[RP_PERF_N]; rp_perf_take(perf);
         stream second = {0}; q_draw(&second); end(&second); nvn_be_exec(second.b); nvn_be_sub_commit();
+        rp_perf_take(perf);
         uint8_t got[2] = {0, 0}; int ndraw = 0;
         for (int seg = 1; seg <= g_order_seg; seg++) for (int pre = 1; pre >= 0; pre--) for (int i = 0; i < g_order_n; i++) {
             if (g_order_ev[i].seg != seg || g_order_ev[i].pre != pre) continue;
@@ -6239,9 +6243,16 @@ static void t_clean_read_order(void) {
         printf("C1581E mode=%d split=%d GPU draw bytes=%02x/%02x events=%d seg=%d errors=%d\n", mode, split, got[0], got[1], g_order_n, g_order_seg, g_order_overflow);
         CHECK(ndraw == 2 && got[0] == 0x11 && got[1] == 0x22 && g_order_overflow == 0);
         CHECK(!split || g_order_seg >= 2);
+        if (!split) {
+            printf("ES tracked=%s snapshot=%d cuts=%llu expected=%d read=%02x/%02x\n",
+                   mode ? "log" : "plain", snapshot, (unsigned long long)perf[RP_PERF_P_CUT_XFER],
+                   !snapshot, got[0], got[1]);
+            CHECK(perf[RP_PERF_P_CUT_XFER] == (uint64_t)!snapshot);
+        }
         g_order_active = 0; fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_block_mem);
         g_block_mem = NULL; g_flag_buf_dirtylog = g_dirtylog_dflt; g_log_fake_on = 0; g_buf_cpu_auto = 0; pass_fresh();
     }
+    g_flag_buf_read_snapshot = 0;
     rp_split_draws = old_split;
 }
 
@@ -7547,6 +7558,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-merge")) { t_gpu_land_merge(); printf("gpu land merge: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
 #endif
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    if (argc > 1 && !strcmp(argv[1], "--es-second-sync")) {
+        t_clean_read_order(0); t_clean_read_order(1);
+        printf("es-second-sync: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0;
+    }
     t_invalidated_attachment_pin();
     t_registered_view_pin();
     t_registered_view_freed_with_storage();
@@ -7653,7 +7668,8 @@ int main(int argc, char **argv) {
     t_compute_pool();
     t_compute_sources();
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
-    t_clean_read_order();
+    t_clean_read_order(0);
+    t_clean_read_order(1);
     t_clean_read_scopes();
     t_pipeline_dirty_changes();
     t_target_format_variant();
