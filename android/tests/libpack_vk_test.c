@@ -395,11 +395,57 @@ static void c0_patch_spv(uint32_t *w, size_t nw, int what) {
     }
 }
 
+// A mounted revision must keep reading the same shard after an atomic package replacement.
+static void check_shard_lifetime(const char *parent) {
+    char dir[TMPL_CAP + 16], path[400], replacement[400], index[400];
+    snprintf(dir, sizeof dir, "%s/rotation", parent);
+    snprintf(path, sizeof path, "%s/lib.000.pak", dir);
+    snprintf(replacement, sizeof replacement, "%s/new.pak", dir);
+    snprintf(index, sizeof index, "%s/lib.idx", dir);
+    const uint8_t key[8] = {0};
+    const uint8_t *payload[] = {(const uint8_t *)"old"};
+    size_t lengths[] = {3};
+    struct trec rec = {.kind = 1, .len = 3};
+    struct s2a_libpack *before = NULL, *after = NULL;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char why[160];
+    CHECK(!mkdir(dir, 0700) && !mk_pack_at(dir, 0, &rec, 1, payload, lengths, 1), "write rotation fixture");
+    CHECK(s2a_libpack_open(&before, dir) == 1, "open original revision");
+    CHECK(!s2a_libpack_get(before, key, 1, &bytes, &len, why, sizeof why) &&
+          len == 3 && !memcmp(bytes, "old", len), "original revision reads original shard");
+    free(bytes);
+    FILE *f = fopen(replacement, "wb");
+    CHECK(f != NULL, "create replacement shard");
+    if (f) {
+        CHECK(fwrite("new", 1, 3, f) == 3, "write replacement shard");
+        CHECK(!fclose(f) && !rename(replacement, path), "publish equal-size replacement shard");
+        CHECK(!s2a_libpack_get(before, key, 1, &bytes, &len, why, sizeof why) &&
+              len == 3 && !memcmp(bytes, "old", len), "open revision retains original shard after replacement");
+        free(bytes);
+        bytes = NULL;
+        CHECK(s2a_libpack_open(&after, dir) == 1 &&
+              !s2a_libpack_get(after, key, 1, &bytes, &len, why, sizeof why) &&
+              len == 3 && !memcmp(bytes, "new", len), "reopened revision reads replacement shard");
+        free(bytes);
+        CHECK(!truncate(path, 1) && s2a_libpack_get(after, key, 1, &bytes, &len, why, sizeof why) ==
+              S2A_LIBPACK_REJECT && !bytes && !len, "truncation of open shard returns a named rejection");
+    }
+    s2a_libpack_close(after);
+    s2a_libpack_close(before);
+    unlink(index);
+    unlink(path);
+    unlink(replacement);
+    rmdir(dir);
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
     char tmpl[TMPL_CAP];
     if (snprintf(tmpl, sizeof tmpl, "%s/libpack_vk_test.XXXXXX", tmp) >= (int)sizeof tmpl || !mkdtemp(tmpl)) return 1;
     snprintf(g_dir, sizeof g_dir, "%s", tmpl);
+
+    check_shard_lifetime(tmpl);
 
     // ---- 缺席目录 / 坏 lib.idx ----
     {

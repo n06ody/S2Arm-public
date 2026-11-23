@@ -34,9 +34,8 @@ struct s2a_libpack;   // 不透明句柄（lp_pack 本体在 .c 里，句柄由 
 int s2a_libpack_open(struct s2a_libpack **out, const char *dir);
 void s2a_libpack_close(struct s2a_libpack *lp);
 
-// 单段读取：键 + 种类 → malloc 的字节副本（对齐安全，调用方 free）。POSIX 段：分片按页对齐
-//   mmap 这一段、memcpy 出来、munmap——不像 Apple 段那样常驻映射（每段一份拷贝随取随放，
-//   SPIR-V 建 module / json 解析都要求字节对齐，且安卓侧段小）。
+// 单段读取：键 + 种类 → malloc 的字节副本（调用方 free）。每次核分片大小，按记录偏移 pread。
+// 同一容器按分片缓存有限个描述符，容器关闭时释放。并发读共享描述符，各自使用独立的偏移。
 // 返回 0 hit / 1 miss（键或种类不在）/ -1 reject（容器/分片/越界坏）。
 int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned kind,
                     uint8_t **bytes, size_t *len, char *why, size_t why_size);

@@ -12,6 +12,8 @@
 #include "../nvn/nvn_vk_program_result.h"   // SUPPORT_DEFAULT_BYTES：计算结果的 supportLayout.requiredSize
 
 #include <errno.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -42,7 +44,17 @@ static void s2a_lp_red(const char *fmt, ...) {
 #include "../../../graphics/nvn/lib_pack_core.inc"
 #include "../../../graphics/nvn/gfx/nvn/dmsh_chain.h"
 
-struct s2a_libpack { lp_pack p; _Atomic int caps_said, ilk_said; };   // ilk_said：本局已打过「丢掉互锁临界区」那一行红   // caps_said：本局（这次 open）已打过「删 64 位能力声明」那一行
+// Every slot owns its descriptor. Hold the slot lock through pread so another reader
+// cannot close or reuse the descriptor mid-read. Bound fd use even for large indexes.
+enum { LP_FD_SLOTS = 16 };
+struct lp_fd_slot { pthread_mutex_t lock; unsigned shard; int fd; };
+struct s2a_libpack {
+    lp_pack p;
+    struct lp_fd_slot *slots;
+    unsigned nslots;
+    _Atomic int caps_said, ilk_said;
+};
+
 
 static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped, g_interlock_dropped;
 uint64_t s2a_libpack_hits(void) { return atomic_load(&g_hits); }
@@ -56,13 +68,32 @@ int s2a_libpack_open(struct s2a_libpack **out, const char *dir) {
     struct s2a_libpack *lp = calloc(1, sizeof *lp);
     if (!lp) return -1;
     int rc = lp_open(&lp->p, dir, DMSH_CHAIN);
-    if (rc == 1) { *out = lp; return 1; }
+    if (rc == 1) {
+        unsigned n = lp->p.nshard < LP_FD_SLOTS ? lp->p.nshard : LP_FD_SLOTS;
+        if (n && !(lp->slots = calloc(n, sizeof *lp->slots))) goto broken;
+        for (; lp->nslots < n; lp->nslots++) {
+            struct lp_fd_slot *slot = &lp->slots[lp->nslots];
+            if (pthread_mutex_init(&slot->lock, NULL)) goto broken;
+            slot->fd = -1;
+        }
+        *out = lp;
+        return 1;
+    }
     free(lp);
     return rc;   // 0 none / -1 broken（lp_open 已报红）
+broken:
+    LP_RED("direct library container: cannot initialize shard reader");
+    s2a_libpack_close(lp);
+    return -1;
 }
 
 void s2a_libpack_close(struct s2a_libpack *lp) {
     if (!lp) return;
+    for (unsigned i = 0; i < lp->nslots; i++) {
+        if (lp->slots[i].fd >= 0) close(lp->slots[i].fd);
+        pthread_mutex_destroy(&lp->slots[i].lock);
+    }
+    free(lp->slots);
     if (lp->p.idx) munmap((void *)lp->p.idx, lp->p.idx_len);
     free(lp);
 }
@@ -91,33 +122,50 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
                                       lp_shard(r), lp->p.nshard, (unsigned long long)r->off, r->len);
         return S2A_LIBPACK_REJECT;
     }
-    char path[1100]; snprintf(path, sizeof path, "%s/lib.%03u.pak", lp->p.dir, lp_shard(r));
-    int fd = open(path, O_RDONLY); struct stat st;
-    if (fd < 0 || fstat(fd, &st) || (uint64_t)st.st_size != lp->p.ssize[2 * lp_shard(r)]) {
-        if (why && why_size) snprintf(why, why_size, "shard %s is %s (index says %llu bytes)", path,
-                                      fd < 0 ? "missing" : "the wrong size", (unsigned long long)lp->p.ssize[2 * lp_shard(r)]);
-        if (fd >= 0) close(fd);
-        return S2A_LIBPACK_REJECT;
+    unsigned shard = lp_shard(r);
+    struct lp_fd_slot *slot = &lp->slots[shard % lp->nslots];
+    pthread_mutex_lock(&slot->lock);
+    if (slot->fd < 0 || slot->shard != shard) {
+        if (slot->fd >= 0) close(slot->fd);
+        char path[1100];
+        snprintf(path, sizeof path, "%s/lib.%03u.pak", lp->p.dir, shard);
+        slot->fd = open(path, O_RDONLY | O_CLOEXEC);
+        slot->shard = shard;
     }
-    const long ps = sysconf(_SC_PAGESIZE);   // getpagesize 已于 POSIX.1-2008 撤稿，宿主严标编译环境不给声明
-    const uint64_t pg = (uint64_t)(ps > 0 ? ps : 4096), at = r->off & ~(pg - 1), delta = r->off - at;
-    void *m = mmap(NULL, (size_t)(delta + (r->len ? r->len : 1)), PROT_READ, MAP_PRIVATE, fd, (off_t)at);
-    int e = errno;
-    close(fd);
-    if (m == MAP_FAILED) {
-        if (why && why_size) snprintf(why, why_size, "cannot map %u bytes at %#llx from %s (errno %d)",
-                                      r->len, (unsigned long long)r->off, path, e);
-        return S2A_LIBPACK_REJECT;
+    struct stat st;
+    uint8_t *out = NULL;
+    if (slot->fd < 0 || fstat(slot->fd, &st) || (uint64_t)st.st_size != lp->p.ssize[2 * shard]) {
+        if (why && why_size) snprintf(why, why_size, "shard %u is %s (index says %llu bytes)", shard,
+            slot->fd < 0 ? "unavailable" : "the wrong size", (unsigned long long)lp->p.ssize[2 * shard]);
+        goto fail_read;
     }
-    uint8_t *out = malloc(r->len ? r->len : 1);
-    if (out) memcpy(out, (const uint8_t *)m + delta, r->len);
-    munmap(m, (size_t)(delta + (r->len ? r->len : 1)));
+    out = malloc(r->len ? r->len : 1);
     if (!out) {
         if (why && why_size) snprintf(why, why_size, "out of memory for %u bytes", r->len);
-        return S2A_LIBPACK_REJECT;
+        goto fail_read;
     }
+    size_t done = 0;
+    while (done < r->len) {
+        size_t left = r->len - done;
+        ssize_t got = pread(slot->fd, out + done, left > SSIZE_MAX ? (size_t)SSIZE_MAX : left,
+                            (off_t)(r->off + done));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            if (why && why_size) snprintf(why, why_size, "shard %u read %zu of %u bytes (%s)",
+                                         shard, done, r->len, got < 0 ? strerror(errno) : "unexpected EOF");
+            goto fail_read;
+        }
+        done += (size_t)got;
+    }
+    pthread_mutex_unlock(&slot->lock);
     *bytes = out; *len = r->len;
     return S2A_LIBPACK_HIT;
+fail_read:
+    if (slot->fd >= 0) close(slot->fd);
+    slot->fd = -1;
+    pthread_mutex_unlock(&slot->lock);
+    free(out);
+    return S2A_LIBPACK_REJECT;
 }
 
 // ---------------- _b.json → s2a-direct-program-v1 ----------------
