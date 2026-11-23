@@ -1658,7 +1658,7 @@ NVN_NOPROTO(nvnSyncInitializeFromNvRmSyncNVX, NVNboolean, NVNsync *s, NVNdevice 
 NVN_NOPROTO(nvnSyncGetNvRmSyncNVX, NVNboolean, const NVNsync *s, void *rm) {
     uint64_t fence = 0; int has = s && sync_published((const sync_t *)s, &fence), ext = 0;
     if (has && !sync_ext_wait((const sync_t *)s, UINT64_MAX, &ext) && ext) { static int n; if (n++ < 4) LOG("【红】 SyncGetNvRmSyncNVX: GL fence not reached (session ending); not exported"); return 0; }
-    if (has && fence && !nvn_be_wait(fence, UINT64_MAX)) { static int n; if (n++ < 4) LOG("【红】 SyncGetNvRmSyncNVX: GPU fence %llu not reached (session ending); not exported", (unsigned long long)fence); return 0; }
+    if (has && fence && nvn_be_wait(fence, UINT64_MAX) != 1) { static int n; if (n++ < 4) LOG("【红】 SyncGetNvRmSyncNVX: GPU fence %llu not reached (session ending); not exported", (unsigned long long)fence); return 0; }
     if (rm) { const uint32_t w[2] = {0xFFFFFFFFu, 0}; memcpy(rm, w, sizeof w); }
     static int once; if (!once++) LOG("[nvn] SyncGetNvRmSyncNVX: first call (fence %llu%s); exported as the invalid syncpoint (already signaled)", (unsigned long long)fence, has ? "" : ", none yet");
     return 1;
@@ -1720,9 +1720,13 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     { int ext = 0; if (sync_ext_wait((const sync_t *)s, 0, &ext)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
       if (ext) { if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
                  return sync_ext_wait((const sync_t *)s, timeout, &ext) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; } }
-    if (nvn_be_wait(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    int result = nvn_be_wait(fence, 0);
+    if (result > 0) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (result < 0) return NVN_SYNC_WAIT_RESULT_FAILED;
     if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
-    return nvn_be_wait(fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    result = nvn_be_wait(fence, timeout);
+    if (result > 0) return NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED;
+    return result < 0 ? NVN_SYNC_WAIT_RESULT_FAILED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }

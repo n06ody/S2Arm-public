@@ -89,15 +89,8 @@ final class GamePack {
             int nl = text.indexOf('\n', pos);
             int end = nl < 0 ? length : nl;
             if (end > pos) {
-                int t1 = text.indexOf('\t', pos), t2 = t1 < 0 ? -1 : text.indexOf('\t', t1 + 1);
-                int t3 = t2 < 0 ? -1 : text.indexOf('\t', t2 + 1);
-                if (t1 < 0 || t1 >= end || t2 < 0 || t2 >= end || (t3 >= 0 && t3 < end)
-                        || !shaColumn(text, t2 + 1, end) || !sizeColumn(text, t1 + 1, t2))
-                    throw new BadPack("index.tsv line is not path<TAB>bytes<TAB>sha256: " + text.substring(pos, end));
-                String path = text.substring(pos, t1);
-                checkPath(path);
-                if (!seen.add(path)) throw new BadPack("index.tsv lists " + path + " twice");
-                Entry e = new Entry(path, Long.parseLong(text.substring(t1 + 1, t2)), text.substring(t2 + 1, end));
+                Entry e = indexEntry(text, pos, end);
+                if (!seen.add(e.path)) throw new BadPack("index.tsv lists " + e.path + " twice");
                 total += e.size;
                 entries.add(e);
             }
@@ -109,6 +102,19 @@ final class GamePack {
                 + ") differs from index.tsv (" + entries.size() + " / " + total + "); index.tsv is authoritative");
         requireLayout(seen);
         return entries;
+    }
+
+    static Entry indexEntry(String row) throws BadPack { return indexEntry(row, 0, row.length()); }
+
+    private static Entry indexEntry(String text, int start, int end) throws BadPack {
+        int t1 = text.indexOf('\t', start), t2 = t1 < 0 ? -1 : text.indexOf('\t', t1 + 1);
+        int t3 = t2 < 0 ? -1 : text.indexOf('\t', t2 + 1);
+        if (t1 < 0 || t1 >= end || t2 < 0 || t2 >= end || (t3 >= 0 && t3 < end)
+                || !shaColumn(text, t2 + 1, end) || !sizeColumn(text, t1 + 1, t2))
+            throw new BadPack("index.tsv line is not path<TAB>bytes<TAB>sha256: " + text.substring(start, end));
+        String path = text.substring(start, t1);
+        checkPath(path);
+        return new Entry(path, Long.parseLong(text.substring(t1 + 1, t2)), text.substring(t2 + 1, end));
     }
 
     private static boolean shaColumn(String text, int from, int to) {

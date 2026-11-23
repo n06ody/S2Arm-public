@@ -13,6 +13,8 @@
     <VkFpRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../../'))</VkFpRepoRoot>
   </PropertyGroup>
   <ItemGroup>
+    <StageNativeInput Include="$(VkFpRepoRoot)android/native/direct/libpack*.c;$(VkFpRepoRoot)android/native/direct/libpack*.h;$(VkFpRepoRoot)android/native/direct/libpack_stage*.inc;$(VkFpRepoRoot)android/native/direct/jv.*;$(VkFpRepoRoot)android/native/direct/json.*;$(VkFpRepoRoot)android/native/direct/spirv_workgroup.h;$(VkFpRepoRoot)android/native/direct/spirv_storage.h;$(VkFpRepoRoot)android/native/direct/graphics.h;$(VkFpRepoRoot)android/native/direct/s2a_direct.h;$(VkFpRepoRoot)android/native/direct/sha256.*;$(VkFpRepoRoot)android/native/nvn/nvn_vk_program_result.*;$(VkFpRepoRoot)graphics/nvn/lib_pack_core.inc" />
+    <VkFpInput Include="@(StageNativeInput)" />
     <VkFpInput Include="$(MSBuildThisFileDirectory)../dsh/DshVk.cs" />
     <VkFpInput Include="$(MSBuildThisFileDirectory)**/*" Exclude="$(MSBuildThisFileDirectory)bin/**;$(MSBuildThisFileDirectory)obj/**;$(MSBuildThisFileDirectory)**/.*" />
     <VkFpInput Include="$(VkFpRepoRoot)graphics/metal/gal_abi.h;$(VkFpRepoRoot)graphics/dsx/dsx_abi.h;$(VkFpRepoRoot)graphics/dsx/gal_spvx.c;$(VkFpRepoRoot)graphics/dsx/gal_spvx.h;$(VkFpRepoRoot)graphics/dsx/gal_spill.c;$(VkFpRepoRoot)graphics/dsx/gal_spill.h;$(VkFpRepoRoot)graphics/dsx/gal_colorround.c;$(VkFpRepoRoot)graphics/dsx/gal_colorround.h" />

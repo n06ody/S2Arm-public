@@ -3,6 +3,16 @@
 
 #include <string.h>
 
+#if defined(__aarch64__) && !defined(S2A_SHA256_PORTABLE_ONLY) && (defined(__linux__) || defined(__ARM_FEATURE_SHA2))
+#define S2A_SHA256_ARM 1
+#include <arm_neon.h>
+#ifdef __linux__
+#include <asm/hwcap.h>
+#include <stdatomic.h>
+#include <sys/auxv.h>
+#endif
+#endif
+
 static const uint32_t K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -16,7 +26,7 @@ static const uint32_t K[64] = {
 
 static uint32_t ror(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
 
-static void compress_block(s2a_sha256 *ctx, const uint8_t block[64]) {
+static void compress_portable(s2a_sha256 *ctx, const uint8_t block[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++)
         w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
@@ -40,6 +50,53 @@ static void compress_block(s2a_sha256 *ctx, const uint8_t block[64]) {
     }
     ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
     ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += h;
+}
+
+#ifdef S2A_SHA256_ARM
+#if defined(__clang__)
+__attribute__((target("sha2")))
+#else
+__attribute__((target("arch=armv8-a+crypto")))
+#endif
+static void compress_sha2(s2a_sha256 *ctx, const uint8_t block[64]) {
+    uint32x4_t abcd = vld1q_u32(ctx->h), efgh = vld1q_u32(ctx->h + 4);
+    const uint32x4_t first = abcd, second = efgh;
+    uint32x4_t words[4];
+    for (unsigned i = 0; i < 4; i++)
+        words[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 16 * i)));
+    for (unsigned group = 0; group < 16; group++) {
+        unsigned i = group & 3;
+        uint32x4_t wk = vaddq_u32(words[i], vld1q_u32(K + 4 * group));
+        uint32x4_t previous = abcd;
+        abcd = vsha256hq_u32(abcd, efgh, wk);
+        efgh = vsha256h2q_u32(efgh, previous, wk);
+        if (group < 12)
+            words[i] = vsha256su1q_u32(vsha256su0q_u32(words[i], words[(i + 1) & 3]),
+                                       words[(i + 2) & 3], words[(i + 3) & 3]);
+    }
+    vst1q_u32(ctx->h, vaddq_u32(first, abcd));
+    vst1q_u32(ctx->h + 4, vaddq_u32(second, efgh));
+}
+#endif
+
+static void compress_block(s2a_sha256 *ctx, const uint8_t block[64]) {
+#ifdef S2A_SHA256_ARM
+#ifdef __linux__
+    // SHA2 is optional for the Android arm64 ABI. Only the specialized function uses it.
+    static _Atomic int supported;
+    int mode = atomic_load_explicit(&supported, memory_order_relaxed);
+    if (!mode) {
+        mode = (getauxval(AT_HWCAP) & HWCAP_SHA2) ? 2 : 1;
+        atomic_store_explicit(&supported, mode, memory_order_relaxed);
+    }
+    if (mode == 2)
+#endif
+    {
+        compress_sha2(ctx, block);
+        return;
+    }
+#endif
+    compress_portable(ctx, block);
 }
 
 void s2a_sha256_init(s2a_sha256 *ctx) {
