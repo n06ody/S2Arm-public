@@ -2259,11 +2259,25 @@ static int live_compile_pending_test(int stop) {
     return failures ? 1 : 0;
 }
 
-// 程序累计行的节拍：新进程里全是 0、只有计算现编、只有图形现编三种情形都有行；会话中每 5 秒且有变化才打，停局那一行无论变化都打。
-//   假时钟驱动（nvk_shader_test_tally_tick），计数用测试件加（与生产同一组计数器）。
 extern int nvk_shader_test_tally_tick(uint64_t now, int force);
 extern void nvk_shader_test_tally_reset(void);
 extern void nvk_shader_test_tally_add(int compute, int failed);
+static int first_compute_tally_test(void) {
+    CHECK(nvk_shader_open() == 0, "open first-compute session");
+    rp_state_reset(); source(); bind_pools(7);
+    fake_cs_success = 1;
+    const struct rp_prog *program = NULL;
+    CHECK(rp_shader_resolve_compute(&program) == 0 && program && compiler_calls == 1,
+          "first compute program is live compiled");
+    CHECK(tally_lines == 1 && strstr(last_tally, "现场编 1、失败 0") &&
+          strstr(last_tally, "现编分项 图形 0 / 计算 1；失败分项 图形 0 / 计算 0"),
+          "first compute log must count one compute and zero graphics: %s", last_tally);
+    nvk_shader_stop(); rp_shader_reset(); s2a_source_clear();
+    printf("first compute tally: %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
+// 程序累计行的节拍：新进程里全是 0、只有计算现编、只有图形现编三种情形都有行；会话中每 5 秒且有变化才打，停局那一行无论变化都打。
+//   假时钟驱动（nvk_shader_test_tally_tick），计数用测试件加（与生产同一组计数器）。
 static int tally_test(void) {
     const uint64_t S = 1000000000ull;
     // 1) 一个都没有（新进程，计数全 0）：定时不打（没变化），停局那一行照打，且分项都是 0
@@ -2292,6 +2306,7 @@ static int tally_test(void) {
     return failures ? 1 : 0;
 }
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--first-compute-tally")) return first_compute_tally_test();
     if (argc == 2 && !strcmp(argv[1], "--tally")) return tally_test();
     if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);
