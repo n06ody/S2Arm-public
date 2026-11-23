@@ -1561,7 +1561,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
             lrc = S2A_LIBPACK_MISS;
         }
         // 按顶点着色器键前缀排除（缺省 0 = 关）：9400 第 3 班 B1（part=1）发白、C1（part=2）不白，带窗口掩码那组里每帧调用最多的 6 个程序
-        //   （合计约 600 / 1070 笔）都共用 vs e109140010227d71。debug.s2a.nvk_libpack_win_skip_vs = 该键前 3 字节（十进制整数，如 e10914 = 14780692）：
+        //   （合计约 600 / 1070 笔）都共用 vs e109140010227d71。debug.s2a.nvk_libpack_win_skip_vs = 该键前 3 字节（十进制整数，如 e10914 = 14747924）：
         //   窗口状态下 VS 键前 3 字节相等的程序退回现编，其余照常走库，一局就能分开「共用 VS 家族」与「其余带掩码程序」。
         if (!ckey && g.require_ssbo_window && lrc == S2A_LIBPACK_HIT) {
             const int skip = nvn_plat_flag("nvk_libpack_win_skip_vs", 0);
