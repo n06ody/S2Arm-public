@@ -25,7 +25,9 @@ EXEC = 'graphics/nvn/replay/rp_exec.c'
 
 # (名字, 改哪份, [(旧, 新) …], 期望红行里出现的断言文字（元组 = 任一条）)
 mutations = [
-    ('不等之前交的活', INC, [('if (prior && !nvn_gpu_ok(nvn_gpu_fence_wait(prior, 5000000000ull, &err)))', 'if (0 && prior && !nvn_gpu_ok(nvn_gpu_fence_wait(prior, 5000000000ull, &err)))')],
+    ('映射读计入目标行距', INC, [('buf, src, slice * nz,', 'buf, src, row * hb * nz,')],
+     'obs_bytes[NVN_IDLE_READ_TEXELS] == 128 + 24'),
+    ('不等之前交的活', INC, [('if (prior && !nvn_gpu_ok(rp_fence_wait_at(prior, 5000000000ull, &err, NVN_GPU_WAIT_READ_PRIOR)))', 'if (0 && prior && !nvn_gpu_ok(rp_fence_wait_at(prior, 5000000000ull, &err, NVN_GPU_WAIT_READ_PRIOR)))')],
      'un_cnt("read_texels_gpu_wait") == 1'),
     ('不拿提交锁', INC, [('    nvn_hle_submit_lock();\n    const uint64_t t0 = rt_now();', '    const uint64_t t0 = rt_now();')], 'g_rt_unlocks == g_rt_locks'),
     ('按紧排写 dst（不看行距）', INC, [('memcpy(dst + (size_t)z * img + (size_t)y * row, src +', 'memcpy(dst + (size_t)z * img + (size_t)y * (size_t)wb, src +')],
@@ -35,7 +37,7 @@ mutations = [
     ('格式不查 READBACK', INC, [('if (!(nvn_gpu_format_caps((uint32_t)t->d.format) & NVN_GPU_FMT_READBACK))', 'if (0)')], 'un_cnt("read_texels_gpu_format") == 1'),
     ('块对齐不查', INC, [('if (r->xoffset % bw || r->yoffset % bh ||', 'if (0 && (r->xoffset % bw || r->yoffset % bh) &&')], 'un_cnt("read_texels_gpu_unaligned") == 1'),
     ('每层都拷起始层', INC, [('nvn_gpu_copy_tex_buf(c, g, level, first + z, &rr,', 'nvn_gpu_copy_tex_buf(c, g, level, first, &rr,')], 'g_tb[1].layer == 2'),
-    ('读回段没等完就拷', INC, [('const int ok = f && nvn_gpu_ok(nvn_gpu_fence_wait(f, 5000000000ull, &err));', 'const int ok = f != 0;')],
+    ('读回段没等完就拷', INC, [('const int ok = f && nvn_gpu_ok(rp_fence_wait_at(f, 5000000000ull, &err, NVN_GPU_WAIT_READ_COPY));', 'const int ok = f != 0;')],
      'un_cnt("read_texels_gpu_wait") == 2'),
     ('旁路段不推进栅栏', EXEC, [('    g_fence = f;   // 先推进', '    (void)0;   // 变异：不推进')], ('g_last_signal == f0 + 128', 'nvn_be_last_fence() == f0 + 64')),
     ('提交里也开旁路段', EXEC, [('if (g_in_submit || g_sub || g_cmd) {', 'if (g_in_submit) {')], 'un_cnt("side_segment_inside_submit") == 1'),

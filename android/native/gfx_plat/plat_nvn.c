@@ -33,7 +33,7 @@ static int plat_flag_read(const char *name, int *val, void *user) {
     char key[PROP_NAME_MAX + 32], v[PROP_VALUE_MAX] = {0};
     snprintf(key, sizeof key, "debug.s2a.%s", name);
     if (__system_property_get(key, v) <= 0 || !v[0]) return 0;
-    *val = atoi(v);
+    *val = fc_value(name, v);
     return 1;
 }
 int nvn_plat_flag(const char *name, int dflt) {
