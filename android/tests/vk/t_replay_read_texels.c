@@ -14,6 +14,10 @@ static nvn_gpu_tex g_src; static uint64_t g_sig, g_last; static int g_side_begin
 static char g_un_last[64]; static int g_un_n;
 uint64_t nvn_be_last_fence(void) { return g_last; }
 int rp_in_submit(void) { return g_in_sub; }
+// 本夹具直接包含 ReadTexels 实现，由真实后端执行两个带站点的等待。
+nvn_gpu_rc rp_fence_wait_at(uint64_t v, uint64_t timeout, nvn_gpu_err *err, enum nvn_gpu_wait_site site) {
+    return nvn_gpu_fence_wait_at(v, timeout, err, site);
+}
 nvn_gpu_cmd rp_side_begin(const char *label) { (void)label; g_side_begins++; return begin_cmd(); }
 static void side_done(void *u, const nvn_gpu_done *d) { (void)u; if (d->status != NVN_GPU_DONE_OK) g_fail++; }
 uint64_t rp_side_commit(nvn_gpu_cmd c) {
