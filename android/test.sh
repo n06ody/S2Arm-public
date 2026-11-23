@@ -291,7 +291,7 @@ s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/nati
 s2a_gate_step "$out/report-ts-test"
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     -I "$android_dir/../graphics/nvn/gfx/nvn" -I "$android_dir/../graphics/nvn/gfx/nvn/include" \
-    "$android_dir/tests/nvk_gpu_idle_test.c" -o "$out/gpu-idle-test"
+    -pthread "$android_dir/tests/nvk_gpu_idle_test.c" -o "$out/gpu-idle-test"
 s2a_gate_step "$out/gpu-idle-test"
 # VM 夹具端点核对（宿主源码级，mac 也跑）：svc_*.c 新引用的 core 符号漏登记当场红，不等 Linux 真链
 s2a_gate_step "$PY" "$android_dir/core-link/runtime-tests/vm/check_endpoints.py" --out "$out/vm-endpoints"

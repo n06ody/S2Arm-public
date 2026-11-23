@@ -8,6 +8,7 @@
 //    能不能拷在开段之前就判完（NVN_GPU_FMT_READBACK 与后端 copy_tex_buf 是同一个判断；块对齐同 t2b）：带粘滞错误的段会让整条时间线进失败终态，
 //    比读不到严重得多。任何一步不成：不动 dst、具名记账。
 // （两个提交锁的弱链接登记在 rp_entry.c：登记工具只扫 replay/*.c）
+#include "rp_idle.h"
 void nvn_hle_submit_lock(void) __attribute__((weak));
 void nvn_hle_submit_unlock(void) __attribute__((weak));
 static uint64_t rt_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -61,7 +62,10 @@ static void rt_gpu(const tex_t *t, unsigned level, uint32_t first, uint32_t nz, 
     nvn_hle_submit_unlock();
     if (!ok) { nvn_gpu_buf_release(buf, NULL, NULL); nvn_unimpl("be", "read_texels_gpu_wait", t); return; }
     const uint8_t *src = nvn_gpu_buf_cpu(buf);
+    const struct nvn_gpu_idle_observer *o = rp_idle_observer();
+    uint64_t begin = o ? o->clock_ns() : 0;
     for (uint32_t z = 0; z < nz; z++) for (uint64_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + (size_t)y * row, src + (size_t)z * ss + (size_t)(y * wb), (size_t)wb);
+    if (o) o->note(NVN_IDLE_READ_TEXELS, buf, src, slice * nz, o->clock_ns() - begin);
     nvn_gpu_buf_release(buf, NULL, NULL);
     rt_note(t1 - t0, rt_now() - t1, r->width, r->height);
 }

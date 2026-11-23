@@ -8,6 +8,7 @@
 // 平台有零拷贝后备（安卓 AHB）时镜像与同步都可以省掉，那是平台接口「内存池后备」一组，接它不改这里的对外形状。
 #include "rp_exec.h"
 #include "rp_res.h"
+#include "rp_idle.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_hmap.h"
@@ -380,6 +381,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
+    nvn_gpu_buf source_hint = NULL;
     const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
@@ -387,18 +389,22 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
         src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
+        source_hint = s->m[wmi].buf;
         s->gw[i].landing = 1; found = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
         break; }
     pthread_mutex_unlock(&g_bmu);
     if (!found) return;
+    const struct nvn_gpu_idle_observer *o = src ? rp_idle_observer() : NULL;
+    uint64_t begin = o ? o->clock_ns() : 0;
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
     if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);
 #else
     if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
+    if (o) o->note(NVN_IDLE_LAND, source_hint, src, len, o->clock_ns() - begin);
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }

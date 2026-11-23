@@ -560,6 +560,17 @@ uint64_t nvn_gpu_fence_failed(void);   // 第一个失败段的 signal F，0 = �
 // 等时间线 ≥ v。timeout_ns = 0 纯查询、不产生副作用。返回 OK / NVN_GPU_E_TIMEOUT / NVN_GPU_E_FAILED（v ≥ F）/ NVN_GPU_E_DEVICE / NVN_GPU_E_ARG（v 从没提交过）。
 // 线程：[任意]，[回调] 里调返回 NVN_GPU_E_ORDER。
 // Optional backend diagnostic. The wait result and timeout contract match fence_wait.
+enum nvn_gpu_idle_site {
+    NVN_IDLE_REG_LOCK, NVN_IDLE_VIEW_LOCK, NVN_IDLE_RESOLVE_LOCK,
+    NVN_IDLE_LAND, NVN_IDLE_READ_TEXELS, NVN_IDLE_SITES
+};
+// source 是实际读取的映射地址；hint 可供后端快速识别这次分配。
+struct nvn_gpu_idle_observer {
+    uint64_t (*clock_ns)(void);
+    void (*note)(enum nvn_gpu_idle_site site, nvn_gpu_buf hint, const void *source, uint64_t bytes, uint64_t ns);
+};
+const struct nvn_gpu_idle_observer *nvn_gpu_idle_observer(void);
+
 enum nvn_gpu_wait_site {
     NVN_GPU_WAIT_OTHER, NVN_GPU_WAIT_FINISH, NVN_GPU_WAIT_SYNC,
     NVN_GPU_WAIT_READ_PRIOR, NVN_GPU_WAIT_READ_COPY, NVN_GPU_WAIT_WSI_SLOT,

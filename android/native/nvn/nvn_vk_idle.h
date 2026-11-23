@@ -7,7 +7,12 @@
 #include "nvn_vk_ts_math.h"
 
 enum { IDLE_IN_FRAME, IDLE_AFTER_PRESENT, IDLE_CLASSES };
+enum idle_cache_class { IDLE_CACHED, IDLE_UNCACHED, IDLE_UNKNOWN, IDLE_CACHE_CLASSES };
+struct idle_read { uint64_t count, bytes, ns; };
 struct idle_bucket {
+    uint64_t lock_count[NVN_IDLE_LAND], lock_ns[NVN_IDLE_LAND];
+    struct idle_read read[NVN_IDLE_SITES - NVN_IDLE_LAND][IDLE_CACHE_CLASSES];
+    uint64_t bc_copies, bc_bytes;
     uint64_t gaps[IDLE_CLASSES], ticks[IDLE_CLASSES];
     uint64_t frames, samples, missing, overlap, ambiguous, submit_calls, submit_ns;
     uint64_t waits[NVN_GPU_WAIT_SITES], wait_ns[NVN_GPU_WAIT_SITES];
@@ -17,6 +22,23 @@ struct idle_account {
     uint64_t window_start, end, submit_begin;
     int have_end, after_present;
 };
+
+static inline void idle_cpu_note(struct idle_bucket *b, enum nvn_gpu_idle_site site, enum idle_cache_class cache,
+                                 uint64_t bytes, uint64_t ns) {
+    if (site < NVN_IDLE_LAND) {
+        b->lock_count[site]++;
+        b->lock_ns[site] += ns;
+    } else {
+        struct idle_read *r = &b->read[site - NVN_IDLE_LAND][cache];
+        r->count++;
+        r->bytes += bytes;
+        r->ns += ns;
+    }
+}
+
+static inline int idle_resident_due(uint64_t now, uint64_t last) {
+    return now >= last && now - last >= UINT64_C(60000000000);
+}
 
 static inline void idle_wait(struct idle_bucket *bucket, unsigned site, uint64_t ns, int first) {
     bucket->waits[site] += first;

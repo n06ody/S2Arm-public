@@ -56,7 +56,7 @@ fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
     -Wl,--wrap=vkGetPhysicalDeviceSurfaceCapabilitiesKHR -Wl,--wrap=vkCreateSwapchainKHR \
-    -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
+    -Wl,--wrap=clock_gettime -Wl,--wrap=vkAllocateMemory -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
@@ -65,7 +65,15 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 set +e
-args=(); if [ "$mode" = --gpu-idle ]; then args+=(--gpu-idle); fi
+args=()
+if [ "$mode" = --gpu-idle ]; then
+    for shader in libpack_full.vert solid_green.frag; do
+        "${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/$shader.spv" || exit 1
+    done
+    printf '#version 450\nlayout(local_size_x=1) in;\nvoid main() {}\n' |
+        "${GLSLC:-glslc}" --target-env=vulkan1.1 -fshader-stage=compute -o "$out/idle.comp.spv" - || exit 1
+    args+=(--gpu-idle "$out/libpack_full.vert.spv" "$out/solid_green.frag.spv" "$out/idle.comp.spv")
+fi
 timeout 120 "$binary" "${args[@]}" > "$log" 2>&1
 rc=$?
 set -e
@@ -80,6 +88,19 @@ def total(key):
     return sum(int(re.search(r'\b' + key + r'=(\d+)', line)[1]) for line in rows)
 assert rows and all('bits=0 ' not in line for line in rows), rows
 assert [total(k) for k in ('samples', 'frames', 'missing', 'ambiguous', 'intra', 'inter')] == [4, 1, 0, 0, 2, 1], rows
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+reads = [s for s in lines if 'GPU 映射读账' in s]
+assert reads, 'missing mapped CPU and g_rmu accounting'
+exit_rows = [s for s in lines if '管线常驻' in s and 'reason=exit' in s]
+assert len(exit_rows) == 1, 'missing pre-teardown resident sample'
+cache = next(s.split('cache=')[1] for s in lines if 'mapped fixture cache=' in s)
+for site, n in [('ReadTexels', 24), ('land', 11)]:
+    assert sum(int(re.search(r'\b' + site + r'\.' + cache + r'=\d+/(\d+)', s)[1]) for s in reads) == n, reads
+resident = [s for s in lines if '管线常驻' in s]
+assert [re.search(r'reason=(\w+)', s)[1] for s in resident] == ['periodic', 'exit'], resident
+for row in resident:
+    assert 'clock=BOOTTIME' in row and 'graphics=1 compute=2 warm_built=2' in row, row
+    assert all(int(re.search(k + r'=(\d+)', row)[1]) > 0 for k in ('ts_ns', 'VmRSS_kB', 'maps')), row
 print('PASS GPU idle: 4 stamped submissions, 2 within-frame pairs and 1 after present')
 PYTEST
     exit 0

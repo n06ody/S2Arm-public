@@ -1,4 +1,6 @@
 #include "rp_res.h"
+// 弱链接[replay]：nvn_gpu_idle_observer
+#include "rp_idle.h"
 #include "rp_exec.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -172,7 +174,7 @@ static void treg_drop_view(treg_t *r) {
 void nvn_be_set_tex_pool_n(int n) { pthread_mutex_lock(&g_rmu); g_tpool_n = n; pthread_mutex_unlock(&g_rmu); }
 void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20) || !t) return;
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_REG_LOCK);
     if (id >= g_ntreg) { int n = id + 1024;
 #ifdef S2A_TEST_TREG_SCRUB
         // 宿主单测：扩容一定换地址，旧表写满 0xA5 后留到下一次扩容才放（读旧表读到标记值而不是崩溃），让「还拿着旧表地址」可确定地测出来
@@ -773,7 +775,7 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) {
     // 分时抽样（#1103）：原先每次解析都取 3 次时钟（世界稳态每帧至少 2148 次），现在只在采样帧里计时（见 rp_exec.h 的 rp_tm）。
     const int tm_ = rp_tm();
     uint64_t r0_ = tm_ ? res_now() : 0;
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_RESOLVE_LOCK);
     uint64_t r1_ = 0;
     if (tm_) { r1_ = res_now(); rp_perf_add(RP_PERF_RES_LOCK, r1_ - r0_); }
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
@@ -922,7 +924,7 @@ int rp_tex_take_zero(const tex_t *t) {
 nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c) {
     nvn_gpu_tex g = rp_tex_resolve(t, c);
     if (!g) return NULL;
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
     nvn_gpu_view out = NULL; int slot = -1, hit = -1;
     const uint8_t km = (uint8_t)vf_key_storage();
@@ -1016,14 +1018,14 @@ static const view_t *sample_view_rec(const tex_t *t, const view_t *v, int has_v,
 
 nvn_gpu_view rp_view_by_id(int id, nvn_gpu_cmd c, tex_t *t_out) {
     if (t_out) memset(t_out, 0, sizeof *t_out);
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
     if (id < 0 || id >= g_ntreg || !g_treg[id].ok || (g_tpool_n && id >= g_tpool_n)) { pthread_mutex_unlock(&g_rmu); return NULL; }
     tex_t t = g_treg[id].t; view_t v = g_treg[id].v; int has_v = g_treg[id].has_v;
     if (t_out) *t_out = t;   // 锁内拷给调用方：登记表会被客体线程扩容换地址，不能把表内地址交出去
     pthread_mutex_unlock(&g_rmu);
     nvn_gpu_tex g = rp_tex_resolve(&t, c);   // 每次都过一遍：CPU 内容脏了要在这一段里重传
     if (!g) return NULL;
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
     nvn_gpu_view out = NULL;
     if (id < g_ntreg && g_treg[id].ok && g_treg[id].t.serial == t.serial) {
         treg_t *r = &g_treg[id];
@@ -1116,7 +1118,7 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
     //   或池容量内一个从没登记过的号：同 Ryujinx（无效描述符按未绑读 0）与 iOS（空槽读 0），绑声明类型的零贴图、不跳整笔，记一条信息计数。
     //   池容量不知道（没登记池）或号越过池容量、号为负，仍取不到 → 调用方照旧报 texture_slot_unresolved 跳笔
     if (!out && !elem && id >= 0) {
-        pthread_mutex_lock(&g_rmu);
+        rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
         const int empty = g_tpool_n && id < g_tpool_n && (id >= g_ntreg || !g_treg[id].ok);
         pthread_mutex_unlock(&g_rmu);
         if (empty && (out = decl_zero(dtt, dcls, c)) != NULL && atomic_fetch_add(&g_empty_slot_zero, 1) == 0)
@@ -1134,7 +1136,7 @@ uint64_t rp_ubo_zero_count(void) { return atomic_load(&g_ubo_zero); }
 nvn_gpu_view rp_view_by_ubo_handle_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out) {
     nvn_gpu_view out = rp_view_by_id_decl(id, dtt, dcls, 0, c, t_out);
     if (out || !dtt || (g_decl_probe && g_decl_unbridged)) return out;
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
     const int unregistered = id < 0 || id >= g_ntreg || !g_treg[id].ok;
     const int cap = g_tpool_n;
     pthread_mutex_unlock(&g_rmu);
@@ -1148,7 +1150,7 @@ nvn_gpu_view rp_view_by_ubo_handle_decl(int id, uint8_t dtt, uint8_t dcls, nvn_g
 }
 static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out) {
     if (t_out) memset(t_out, 0, sizeof *t_out);
-    pthread_mutex_lock(&g_rmu);
+    rp_idle_lock(&g_rmu, NVN_IDLE_VIEW_LOCK);
     if (id < 0 || id >= g_ntreg || !g_treg[id].ok || (g_tpool_n && id >= g_tpool_n)) {
         pthread_mutex_unlock(&g_rmu);
         return NULL;
