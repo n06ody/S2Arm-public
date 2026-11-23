@@ -73,7 +73,17 @@ static void strings(const s2a_json_field *f, const char **out, unsigned n,
     if (array(f,n)!=n) fail("wrong string array length");
     for(unsigned i=0;i<n;i++) { item(f,i,&storage[i]); out[i]=string(field(&storage[i],"v")); }
 }
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--check-canonical")) {
+        uint8_t bytes[S2A_INPUT_IDENTITY_MAX + 1];
+        size_t len = fread(bytes, 1, sizeof bytes, stdin);
+        static struct s2a_input_identity_decoded decoded;
+        char reason[192];
+        if (ferror(stdin) || len == sizeof bytes) fail("invalid canonical input length");
+        if (s2a_input_identity_decode(bytes, len, &decoded, reason, sizeof reason)) fail(reason);
+        return 0;
+    }
+    if (argc != 1) fail("usage: direct_identity_host [--check-canonical]");
     static uint8_t raw[65537]; size_t n=fread(raw,1,sizeof raw,stdin);
     if (ferror(stdin) || n==sizeof raw) fail("input read/size");
     static s2a_json_object root, gfx, stages[6], tex[64], strings_store[40], scalar;
