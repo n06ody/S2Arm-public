@@ -622,7 +622,7 @@ if [ "$mode" = "--land-readback" ]; then
         if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
         timeout 60 "$out/t_backend_vk" "$out/shaders" --land-readback 2>&1 | tee "$out/land-readback-dq${dq}.log"
         if grep -Eq 'Validation Error|SYNC-HAZARD|VUID-' "$out/land-readback-dq${dq}.log"; then
-            echo "【红】回写暂存（录制队列 $dq）校验层报错"
+            echo "【红】回写暂存（录制队列 ${dq}）校验层报错"
             exit 1
         fi
     done
