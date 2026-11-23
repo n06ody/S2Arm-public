@@ -440,6 +440,9 @@ static int run_real(const char *tag, uint32_t dev_align, uint32_t rem, int *out_
     return 0;
 }
 
+#ifdef S2A_TEST_WARM_NOWINDOW
+#define main window_suite_main
+#endif
 int main(int argc, char **argv) {
     if (argc < 3 || argc > 4) return 2;
     case_dir = argv[1];

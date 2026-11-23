@@ -67,6 +67,13 @@ def main():
         sys.stderr.write(result.stderr)
         return result.returncode
 
+    if sys.argv[1:] == ['--warm-capture']:
+        result = run('warm-capture', original, args=('--gs-libpack-ssbo',),
+                     extra_flags=['-DS2A_ANDROID_DEBUG_ENV=1'], env=dict(os.environ, TMPDIR=str(out)))
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
     if sys.argv[1:] == ['--link-refused-file']:
         for mode, flags in [('player', []), ('debug', ['-DS2A_ANDROID_DEBUG_ENV=1'])]:
             # 编译实际生产翻译单元。夹具也知道开关和文件名，整份测试可执行文件不能用于这个判据。
@@ -420,6 +427,12 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         result = subprocess.run([str(exe), *sys.argv[2:]], capture_output=True, text=True, timeout=30)
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if len(sys.argv) == 6 and sys.argv[1] in ('--emit-nowindow', '--execute-nowindow'):
+        result = run('nowindow-real', original, args=sys.argv[1:], extra_flags=['-DS2A_ANDROID_DEBUG_ENV=1'])
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
         return result.returncode
 
     if len(sys.argv) == 6 and sys.argv[1] in ('--emit-high-slot', '--execute-high-slot', '--emit-reuse-texture', '--emit-reuse-rt', '--emit-reuse-inactive', '--emit-real', '--emit-real-tbuf', '--execute-tbuf', '--emit-compute-tbuf', '--execute-compute-tbuf', '--reject-graphics-tbufu', '--reject-compute-tbufu'):

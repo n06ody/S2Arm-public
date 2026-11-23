@@ -479,6 +479,8 @@ static class Program
             var (wcode, wctl) = WindowFixture();
             string wkey = Convert.ToHexStringLower(SHA256.HashData(wctl.AsSpan(0, 0x880)))[..16], emit = args[6];
             Directory.CreateDirectory(emit);
+            // 普通编译请求从 0x50 字节的 Maxwell 阶段头开始，库工具 JobFor 另消费前面的 0x30 字节。
+            File.WriteAllBytes(Path.Combine(emit, "window_vs.bin"), wcode.AsSpan(0x30).ToArray());
             DshVk.CompileWithSpv(wkey, "vs", wcode, wctl, emit, xc, tables, true, root);
             var wj = JsonNode.Parse(File.ReadAllText(Path.Combine(emit, wkey + "_b.json")));
             byte[] wspv = File.ReadAllBytes(Path.Combine(emit, wkey + "_b.spv"));

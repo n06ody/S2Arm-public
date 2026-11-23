@@ -12,7 +12,12 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-mask-double|--negative-mask-half|--negative-window|--negative-cs-gate) ;; *) exit 64 ;; esac
+case "$mode" in ''|--warm-nowindow|--negative-mask-double|--negative-mask-half|--negative-window|--negative-cs-gate) ;; *) exit 64 ;; esac
+if [ "$mode" = --warm-nowindow ]; then
+    proof_dir=$2
+    proof_phase=$3
+    S2A_SSBO_WINDOW_STAGES="$proof_dir/stages"
+fi
 stages="${S2A_SSBO_WINDOW_STAGES:-$repo/build/libpack-ssbo-window/stages}"
 [ -f "${stages}/window_vs.key" ] || { echo "【红】缺宿主出料 ${stages}（见本脚本文件头）" >&2; exit 2; }
 out="$repo/build/vk-libpack-ssbo-window"
@@ -42,7 +47,14 @@ src=("$repo/android/tests/vk/t_replay_libpack_ssbo_window.c" "$repo/graphics/nvn
      "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c"
      "$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
 binary="$out/test"; log="$out/run.log"
-if [ -n "$mode" ]; then
+extra=()
+if [ "$mode" = --warm-nowindow ]; then
+    src[0]="$repo/android/tests/vk/t_warm_nowindow.c"
+    src+=("$repo/android/native/nvn/nvn_vk_pipe_warm.c")
+    extra+=(-DS2A_ANDROID_DEBUG_ENV=1)
+    binary="$proof_dir/test"
+    log="$proof_dir/$proof_phase.log"
+elif [ -n "$mode" ]; then
     python3 - "$repo" "$out" "$mode" <<'PY'
 import pathlib, sys
 repo, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
@@ -66,9 +78,15 @@ PY
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
 fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections \
-    -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
+    -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 ${extra[@]+"${extra[@]}"} "${inc[@]}" "${src[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+if [ "$mode" = --warm-nowindow ]; then
+    timeout 120 "$binary" "$proof_phase" "$proof_dir" "$out/shaders" 2>&1 | tee "$log"
+    grep -q 'device: llvmpipe' "$log"
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then exit 1; fi
+    exit 0
+fi
 set +e
 timeout 600 "$binary" "$out/shaders" "$stages" ${real_arg[@]+"${real_arg[@]}"} > "$log" 2>&1
 rc=$?
