@@ -37,6 +37,7 @@
 #include "backend_vulkan_bc1_astc_spv.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
+#include "nvn_vk_idle.h"
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
 #include "nvn_vk_format.h"
 #include "nvn_pipe_flight.h"   // 配方级在途表（纯逻辑）：同配方合并成一份创建，不同配方不互相排队
@@ -351,6 +352,7 @@ struct vk_segment {
     int executed;
     int embedded;   // cmd owns this record; finish_cmd frees it with cmd
     int internal;   // 后端自己的段（呈现）：不占时间线上的值，完成后只回收
+    uint64_t idle_serial, idle_submit_begin;
     uint64_t wsi_seq;   // 呈现段的序号（>0）：worker 等到它的栅栏后记进 g.wsi_done，取图复用信号量前按它等（见 backend_vulkan_wsi.inc）
     nvn_gpu_rc rc;
     char why[192];
@@ -436,7 +438,7 @@ struct nvn_gpu_cmd_s {
     struct { uint16_t w, h, draws; uint8_t ncol, ds; } tsp[TS_PASS_MAX];
     uint32_t ntsp;
     uint32_t diag_npasses, diag_pass_cap;
-    int diag_prefix;
+    uint32_t diag_prefix;
     struct gpu_pass_meta *diag_passes;
     struct fb_diag_cmd *diag_fb;
     VkCommandBuffer init_cb;                 // 本池复用的前置命令缓冲；本段需要时录入图像转布局 / 时间戳重置
@@ -530,6 +532,10 @@ struct nvn_gpu_vk {
     double ts_period;
     struct gpu_diag_frame diag_frame;  // completion worker only until close joins it
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
+    int idle_on;
+    uint32_t idle_bits;
+    uint64_t idle_serial, idle_done_serial;
+    struct idle_account idle;
     uint32_t report_bits;
     float report_period;
     int64_t report_corr_ticks;   // 自校修正（计数）：驱动校准对的 DEVICE 值与查询计数器零点不一致时从校准 GPU 值里减掉（见 report_self_calibrate）
@@ -1702,7 +1708,7 @@ static void report_timestamp_open(void) {
         (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR)vkGetInstanceProcAddr(d->instance,
             khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
     if (!domains_fn) return;
-    n = 0;
+    uint32_t n = 0;
     if (domains_fn(d->physical, &n, NULL) != VK_SUCCESS || !n || n > 64) return;
     VkTimeDomainKHR domains[64];
     if (domains_fn(d->physical, &n, domains) != VK_SUCCESS) return;
@@ -2010,6 +2016,7 @@ void nvn_vk_frame_log_gpu_frame_end(void) __attribute__((weak));
 void s2a_adpf_gpu_segment(uint64_t gpu_ns) __attribute__((weak));
 void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_device_lost.inc"
+#include "backend_vulkan_idle.inc"
 #include "backend_vulkan_gpu_diag.inc"
 
 static VkResult mirror_invalidate(struct nvn_gpu_vk *vk, const struct nvn_gpu_cmd_s *c);
@@ -2018,6 +2025,8 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int failed = s->failed;
     nvn_gpu_rc code = s->rc;
     const char *why = s->why[0] ? s->why : "段未执行";
+    uint64_t ticks[2] = {0};
+    int timed = 0;
 
     if (!failed) {
         pthread_mutex_lock(&g_mu);
@@ -2054,13 +2063,13 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             int terminal = vk->failed && s->signal >= vk->failed;
             pthread_mutex_unlock(&g_mu);
             bc_time_finish(s->cmd, 1);
-            if (vk->pass_diag || vk->fb_diag) gpu_diag_retire(vk, s);
-            if (vk->gputime && s->cmd && s->cmd->tsq && !s->internal) {   // 调试读数：这一段在 GPU 上首尾相隔多久；相邻两段之间 GPU 空了多久
+            if (vk->ts_bits) timed = gpu_diag_segment_ticks(vk, s, ticks);
+            if (vk->pass_diag || vk->fb_diag) gpu_diag_retire(vk, s, ticks, timed);
+            if (vk->gputime && timed && !s->internal) {   // 调试读数：这一段在 GPU 上首尾相隔多久；相邻两段之间 GPU 空了多久
                 const double period = vk->ts_period;
                 static uint64_t n, sum, mx, last_end, gap, t_first;
-                uint64_t ts[2] = {0, 0};
-                if (vkGetQueryPoolResults(vk->d, s->cmd->tsq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
-                    uint64_t d = (uint64_t)((double)(ts[1] - ts[0]) * period), b = (uint64_t)((double)ts[0] * period), e = (uint64_t)((double)ts[1] * period);
+                if (ticks[1] >= ticks[0]) {
+                    uint64_t d = (uint64_t)((double)(ticks[1] - ticks[0]) * period), b = (uint64_t)((double)ticks[0] * period), e = (uint64_t)((double)ticks[1] * period);
                     if (!n) t_first = b;
                     if (last_end && b > last_end) gap += b - last_end;
                     last_end = e; n++; sum += d; if (d > mx) mx = d;
@@ -2098,6 +2107,8 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             }
         }
     }
+
+    if (vk->idle_on) idle_complete(s, !failed && s->submitted, ticks, timed);
 
     char land_failure[112];
     if (!s->internal && !failed) {
@@ -2543,6 +2554,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(g_deswizzle_reasons, 0, sizeof g_deswizzle_reasons);
     if (nvn_plat_flag("nvk_gpu_deswizzle", 1) && !deswizzle_open())
         nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", "【红】GPU 解排不可用，本局采用 CPU 解排");
+    g.idle_on = nvn_plat_flag("nvk_gpu_idle", 0) != 0;
+    if (g.idle_on) g.idle.window_start = now_ns();
     bc_time_open();
     gpu_diag_open();
     report_timestamp_open();
@@ -8903,10 +8916,12 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->feedback_read_on = c->feedback_on && g.dev->load_store_op_none_enabled && nvn_plat_flag("nvk_fb_read", 0) != 0;
     c->pool_fb_on = nvn_plat_flag("nvk_pool_fb", 0) != 0;
     if (g.ts_bits) {
+        const uint32_t count = (g.gputime || g.pass_diag) ? GPU_DIAG_PREFIX_QUERY : 2;
+        const int prefix = g.pass_diag || g.idle_bits;
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GPU_DIAG_PREFIX_QUERY + (uint32_t)g.pass_diag};
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = count + (uint32_t)prefix};
         if (vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
-            vkCmdResetQueryPool(c->cb, c->tsq, 0, GPU_DIAG_PREFIX_QUERY);
+            vkCmdResetQueryPool(c->cb, c->tsq, 0, count);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
     }
@@ -9011,11 +9026,11 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(c->init_cb, &bi) != VK_SUCCESS) return 0;
-    // 已有前置缓冲时，用独立槽覆盖整段首尾；普通段用主缓冲的首戳，不额外添缓冲。
-    if (g.pass_diag && c->tsq) {
-        c->diag_prefix = 1;
-        vkCmdResetQueryPool(c->init_cb, c->tsq, GPU_DIAG_PREFIX_QUERY, 1);
-        vkCmdWriteTimestamp(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, GPU_DIAG_PREFIX_QUERY);
+    // 两项诊断共用段首尾查询；独立槽记录已有前置缓冲的首戳。
+    if ((g.pass_diag || g.idle_bits) && c->tsq) {
+        c->diag_prefix = (g.gputime || g.pass_diag) ? GPU_DIAG_PREFIX_QUERY : 2;
+        vkCmdResetQueryPool(c->init_cb, c->tsq, c->diag_prefix, 1);
+        vkCmdWriteTimestamp(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, c->diag_prefix);
     }
     // 首次报告可能在 render pass 内；reset 必须在独立前置缓冲中，不能打断通道。
     if (c->report_ts) {
@@ -9134,7 +9149,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
             if (si.commandBufferCount) {
                 atomic_store(&g.submitting, s);
-                r = vkQueueSubmit(g.queue, 1, &si, fence);
+                r = idle_submit(s, &si, fence);
             }
             if (r == VK_SUCCESS) {
                 s->fence = fence;
@@ -9215,6 +9230,11 @@ uint64_t nvn_gpu_fence_failed(void) {
 }
 
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) {
+    return nvn_gpu_fence_wait_at(v, timeout_ns, err, NVN_GPU_WAIT_OTHER);
+}
+
+nvn_gpu_rc nvn_gpu_fence_wait_at(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err, enum nvn_gpu_wait_site site) {
+    if ((unsigned)site >= NVN_GPU_WAIT_SITES) site = NVN_GPU_WAIT_OTHER;
     if (!g_open) return fail(err, NVN_GPU_E_STOPPED, "后端未打开");
     if (g_in_callback) return fail(err, NVN_GPU_E_ORDER, "回调里不许等栅栏");
     if (v == 0) return fail(err, NVN_GPU_E_ARG, "v = 0 不是提交过的值");
@@ -9238,6 +9258,7 @@ nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err)
     }
     struct timespec ts;
     deadline_after(&ts, timeout_ns);
+    int first = 1;
     while (g.completed < v) {
         if (g.failed && v >= g.failed) {
             pthread_mutex_unlock(&g_mu);
@@ -9247,7 +9268,7 @@ nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err)
             pthread_mutex_unlock(&g_mu);
             return fail(err, NVN_GPU_E_DEVICE, "设备已丢失");
         }
-        if (pthread_cond_timedwait(&g_cv, &g_mu, &ts) != 0) {
+        if (idle_cond_wait(site, &ts, &first) != 0) {
             if (g.completed < v) {
                 pthread_mutex_unlock(&g_mu);
                 return rc(NVN_GPU_E_TIMEOUT);

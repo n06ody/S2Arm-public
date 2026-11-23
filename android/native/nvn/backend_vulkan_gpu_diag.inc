@@ -6,9 +6,10 @@ static void gpu_diag_open(void) {
     g.gputime = nvn_plat_flag("nvk_gputime", 0) != 0;
     g.pass_diag = nvn_plat_flag("nvk_gpu_passes", 0) != 0;
     g.fb_diag = nvn_plat_flag("nvk_fb_snapshots", 0) != 0;
-    if (!g.gputime && !g.pass_diag) return;
+    if (!g.gputime && !g.pass_diag && !g.idle_on) return;
     g.ts_period = g.dev->properties.limits.timestampPeriod;
     if (isfinite(g.ts_period) && g.ts_period > 0) g.ts_bits = queue_timestamp_bits(g.dev);
+    if (g.idle_on) g.idle_bits = g.ts_bits;
     if (!g.ts_bits)
         nvn_plat_log(NVN_PLAT_LOG_WARN, "gpu", "nvk-pass timestamps unavailable on the selected Vulkan queue");
     else if (g.pass_diag) {
@@ -71,7 +72,7 @@ static inline void gpu_diag_pass_begin(struct nvn_gpu_cmd_s *c, const nvn_gpu_pa
             }
         }
     }
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
+    if ((g.gputime || g.pass_diag) && c->tsq && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d->w;
         c->tsp[c->ntsp].h = (uint16_t)d->h;
         c->tsp[c->ntsp].ncol = (uint8_t)(natt - has_depth);
@@ -81,7 +82,7 @@ static inline void gpu_diag_pass_begin(struct nvn_gpu_cmd_s *c, const nvn_gpu_pa
 }
 
 static inline void gpu_diag_pass_end(struct nvn_gpu_cmd_s *c) {
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
+    if ((g.gputime || g.pass_diag) && c->tsq && c->ntsp < TS_PASS_MAX) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp);
         c->ntsp++;
     }
@@ -107,16 +108,22 @@ static void gpu_diag_rank(struct gpu_diag_frame *frame, uint64_t signal, int int
     if (meta) frame->top[i].meta = *meta;
 }
 
-static void gpu_diag_pass_retire(struct nvn_gpu_vk *vk, const struct vk_segment *s, uint64_t id) {
+static int gpu_diag_segment_ticks(struct nvn_gpu_vk *vk, const struct vk_segment *s, uint64_t ticks[2]) {
+    const struct nvn_gpu_cmd_s *c = s->cmd;
+    if (!c || !c->tsq || (s->internal && !vk->pass_diag && !vk->idle_bits)) return 0;
+    if (vkGetQueryPoolResults(vk->d, c->tsq, 0, 2, 2 * sizeof ticks[0], ticks, sizeof ticks[0],
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return 0;
+    if (!c->diag_prefix) return 1;
+    return vkGetQueryPoolResults(vk->d, c->tsq, c->diag_prefix, 1, sizeof ticks[0], ticks,
+                                 sizeof ticks[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+}
+
+static void gpu_diag_pass_retire(struct nvn_gpu_vk *vk, const struct vk_segment *s, uint64_t id,
+                                 const uint64_t ticks[2], int timed_segment) {
     const struct nvn_gpu_cmd_s *c = s->cmd;
     struct gpu_diag_frame *frame = &vk->diag_frame;
-    uint64_t ts[2] = {0}, submit_ns = 0;
-    int submit_ok = 0;
-    if (c->tsq && vkGetQueryPoolResults(vk->d, c->tsq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        VkResult r = c->diag_prefix ? vkGetQueryPoolResults(vk->d, c->tsq, GPU_DIAG_PREFIX_QUERY, 1,
-            sizeof ts[0], &ts[0], sizeof ts[0], VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
-        submit_ok = r == VK_SUCCESS && gpu_diag_elapsed(vk, ts[0], ts[1], &submit_ns);
-    }
+    uint64_t submit_ns = 0;
+    const int submit_ok = timed_segment && gpu_diag_elapsed(vk, ticks[0], ticks[1], &submit_ns);
 
     uint32_t timed = 0;
     uint64_t sum = 0, pts[2 * TS_PASS_MAX];
@@ -145,7 +152,8 @@ static void gpu_diag_pass_retire(struct nvn_gpu_vk *vk, const struct vk_segment 
     snprintf(line, sizeof line, "nvk-pass-segment frame=%llu submit=%llu internal=%d passes=%u timed=%u pass_ms=%.6f "
              "submit_timed=%d prefix=%d begin_ticks=%llu end_ticks=%llu submit_ms=%.6f",
              (unsigned long long)id, (unsigned long long)s->signal, s->internal, c->diag_npasses, timed,
-             sum / 1e6, submit_ok, c->diag_prefix, (unsigned long long)ts[0], (unsigned long long)ts[1], submit_ns / 1e6);
+             sum / 1e6, submit_ok, !!c->diag_prefix,
+             (unsigned long long)ticks[0], (unsigned long long)ticks[1], submit_ns / 1e6);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
     frame->passes += c->diag_npasses;
     frame->timed += timed;
@@ -177,11 +185,11 @@ static void gpu_diag_feedback_retire(struct gpu_diag_frame *frame, const struct 
     }
 }
 
-static void gpu_diag_retire(struct nvn_gpu_vk *vk, const struct vk_segment *s) {
+static void gpu_diag_retire(struct nvn_gpu_vk *vk, const struct vk_segment *s, const uint64_t ticks[2], int timed) {
     if (!s->cmd) return;
     const uint64_t id = vk->wsi_done + 1;   // the completion worker owns wsi_done writes
     vk->diag_frame.segments++;
-    if (vk->pass_diag) gpu_diag_pass_retire(vk, s, id);
+    if (vk->pass_diag) gpu_diag_pass_retire(vk, s, id, ticks, timed);
     if (vk->fb_diag) gpu_diag_feedback_retire(&vk->diag_frame, s, id);
 }
 

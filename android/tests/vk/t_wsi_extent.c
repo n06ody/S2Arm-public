@@ -8,6 +8,7 @@
 #include "vk_device.h"
 #include "nvn_plat_vk.h"
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,7 +17,7 @@ static unsigned cases, failures, creates, presented, window_queries;
 static VkExtent2D current, minimum, maximum, window, last_extent;
 static VkSurfaceTransformFlagBitsKHR transform, last_transform;
 static VkSurfaceTransformFlagsKHR supported;
-static int suboptimal;
+static int suboptimal, idle_test, passes_test;
 static int mailbox_on;
 static enum { MODES_REAL, MODES_FIFO_ONLY, MODES_COUNT_ERROR, MODES_LIST_ERROR, MODES_INCOMPLETE } mode_probe;
 static unsigned mode_queries;
@@ -44,6 +45,8 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) {
 }
 void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_gpu_idle")) return idle_test;
+    if (!strcmp(name, "nvk_gpu_passes")) return passes_test;
     if (!strcmp(name, "nvk_pipe_cache")) return 0;
     if (!strcmp(name, "nvk_present_mailbox") && mailbox_on) return 1;
     return dflt;
@@ -241,6 +244,8 @@ static unsigned test_present_modes(VkPhysicalDevice physical) {
 }
 
 int main(int argc, char **argv) {
+    passes_test = argc == 2 && !strcmp(argv[1], "--gpu-idle-passes");
+    idle_test = passes_test || (argc == 2 && !strcmp(argv[1], "--gpu-idle"));
     struct s2a_vk_device device = {0}; char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&device, why, sizeof why));
     nvn_gpu_open_desc desc = {0}; desc.host_device = &device; desc.app_label = "wsi-extent-test";
@@ -262,6 +267,28 @@ int main(int argc, char **argv) {
         GPU(nvn_gpu_close(5000000000ull, &error)); REQUIRE(!s2a_vk_device_destroy(&device, 1));
         return bad ? 1 : 0;
     }
+    if (idle_test) {
+        // guest upload, guest, present, guest. The last gap is after the present.
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &error));
+        GPU(nvn_gpu_cmd_commit(cmd, 2, done, NULL, &error));
+        reset(0);
+        nvn_gpu_surface surface = attach(320, 180);
+        nvn_gpu_drawable drawable = {0};
+        GPU(nvn_gpu_drawable_acquire(surface, 5000000000ull, NULL, &drawable, &error));
+        nvn_gpu_present_desc p = {0}; p.src = source; p.filter = 1;
+        GPU(nvn_gpu_present(surface, &drawable, &p, 1, NULL, NULL, &error));
+        GPU(nvn_gpu_surface_detach(surface, 5000000000ull, &error));
+        struct timespec delay = {5, 100000000};
+        nanosleep(&delay, NULL);
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &error));
+        GPU(nvn_gpu_cmd_commit(cmd, 3, done, NULL, &error));
+        GPU(nvn_gpu_fence_wait_at(3, 5000000000ull, &error, NVN_GPU_WAIT_SYNC));
+        nvn_gpu_view_release(source); nvn_gpu_tex_release(tex);
+        GPU(nvn_gpu_close(5000000000ull, &error));
+        REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        return 0;
+    }
+
     reset(0); window = (VkExtent2D){640, 360}; unsigned queries = window_queries;
     nvn_gpu_surface s = attach(320, 180); window = (VkExtent2D){800, 450};
     frames("fixed-ignores-window", s, 0, 320, 180); REQUIRE(window_queries == queries);

@@ -16,6 +16,7 @@ int rp_present_lower_left(void);        // 上屏翻转：被上屏窗口建时�
 uint64_t rp_frame(void);                // 前端给的当前帧号
 // 提交之外的旁路段（rp_exec.c）：调用方持提交锁、不在提交回放里。begin 失败返回 NULL（已记账）；commit 返回这一段的栅栏值，0 = 没交成（已报红）
 int rp_in_submit(void);
+nvn_gpu_rc rp_fence_wait_at(uint64_t v, uint64_t timeout, nvn_gpu_err *err, enum nvn_gpu_wait_site site);
 nvn_gpu_cmd rp_side_begin(const char *label);
 uint64_t rp_side_commit(nvn_gpu_cmd c);
 void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels 读 GPU 内容的读数（次数 / 等之前的活共纳秒 / 最长纳秒 / 读回共纳秒）
