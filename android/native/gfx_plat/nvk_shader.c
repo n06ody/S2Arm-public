@@ -63,8 +63,11 @@ static _Atomic uint64_t g_live_enqueued, g_live_wait_ns, g_live_pending, g_live_
 // 本帧前几个现编身份（诊断属性 nvk_hitch_log 开时才写；rp_shader_live_compile_take 取走并清空）
 static char g_live_ids[72]; static _Atomic unsigned g_live_ids_n; static pthread_mutex_t g_live_ids_mu = PTHREAD_MUTEX_INITIALIZER;
 static int live_worker(void *, uint64_t, uint64_t, const char *, size_t, uint8_t **, size_t *, char *, size_t);
+static int prog_tally_tick(uint64_t now, int force);
+static void prog_tally_rearm(void);
 void nvk_shader_stop(void) {
     atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel);
+    (void)prog_tally_tick(now_ns(), 1);   // 停局那一行：程序累计无论有没有变化、全 0 也打（会话中的节拍见 prog_tally_tick）
     // 先唤醒等待者，不在 Stop 入口 join。执行 managed 的 worker 自己持准入，现有停局限时等它。
     if (g_live_compile == 1) (void)s2a_compile_worker_stop_bounded(0, NULL, 0);
 }
@@ -76,6 +79,7 @@ int nvk_shader_open(void) {
     if (atomic_compare_exchange_strong_explicit(&g_shader_admission, &expected, 0, memory_order_acq_rel, memory_order_acquire)) {
         shader_session_state_reset();   // 在途 / 静默位 / 代际清场
     } else if (expected != 0) return -1;
+    prog_tally_rearm();
     g_live_compile = 0;
     g_live_budget_frame = 0;
     g_live_spent_ns = 0;
@@ -171,6 +175,7 @@ static void borrow_log(int level, const char *phase, const struct borrow_snap *s
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
 static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
+static _Atomic uint64_t g_n_compiled_cs, g_n_failed_cs;   // 计算的现编 / 失败各自计数（总数 g_n_compiled / g_n_failed 含计算；图形 = 总数 − 计算）
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
     pthread_mutex_lock(&g_progs_mu);
@@ -1663,6 +1668,12 @@ static void prog_tally_text(char *b, size_t bn) {
         k_lp_state[atomic_load(&g_lp_state)], (unsigned long long)atomic_load(&g_n_libpack), (unsigned long long)s2a_libpack_misses(), (unsigned long long)s2a_libpack_rejects(),
         (unsigned long long)atomic_load(&g_n_libpack_bad), (unsigned long long)s2a_libpack_caps_stripped(), (unsigned long long)atomic_load(&g_n_offline), (unsigned long long)atomic_load(&g_n_cache),
         (unsigned long long)atomic_load(&g_n_compiled), (unsigned long long)atomic_load(&g_n_failed));
+    if (bo > 0 && (size_t)bo < bn) {   // 现编 / 失败的图形、计算分项（总数仍是上面那两个数，已有读法不变）
+        const uint64_t c = atomic_load(&g_n_compiled), cc = atomic_load(&g_n_compiled_cs), f = atomic_load(&g_n_failed), fc = atomic_load(&g_n_failed_cs);
+        const int n2 = snprintf(b + bo, bn - (size_t)bo, "；现编分项 图形 %llu / 计算 %llu；失败分项 图形 %llu / 计算 %llu",
+            (unsigned long long)(c - cc), (unsigned long long)cc, (unsigned long long)(f - fc), (unsigned long long)fc);
+        if (n2 > 0 && (size_t)n2 < bn - (size_t)bo) bo += n2;
+    }
     if (alias_on() && bo > 0 && (size_t)bo < bn) {   // 结果合并读数（开着才出）
         uint32_t resn = 0;
         pthread_mutex_lock(&g_progs_mu); resn = g_res_tab.n; pthread_mutex_unlock(&g_progs_mu);
@@ -1671,11 +1682,40 @@ static void prog_tally_text(char *b, size_t bn) {
             (unsigned long long)atomic_load(&g_n_alias_nores), (unsigned long long)atomic_load(&g_n_alias_nofile), (unsigned long long)atomic_load(&g_n_alias_badfile), (unsigned)resn);
     }
 }
-static void prog_tally_log(void) {
-    uint64_t n = atomic_load(&g_n_libpack) + atomic_load(&g_n_offline) + atomic_load(&g_n_cache) + atomic_load(&g_n_compiled) + atomic_load(&g_n_alias_fg);
-    if (n != 1 && (!n || n % 50)) return;
-    char b[640]; prog_tally_text(b, sizeof b);
+// 程序累计行的节拍：会话中每 5 秒、且计数有变化时打一行；停局（nvk_shader_stop）时无论有没有变化再打一行（全是 0 也打）。
+//   原先只在图形路径、第 1 个和每 50 个打，计算现编不触发、一个都没有时整行不出现，读日志的人分不清「没发生」和「没打」。
+enum { TALLY_PERIOD_NS = 5000000000ull };
+static _Atomic uint64_t g_tally_last_ns, g_tally_last_sig;
+static uint64_t prog_tally_sig(void) {
+    uint64_t sig = 0x9e3779b97f4a7c15ull;
+    const uint64_t v[] = { atomic_load(&g_n_libpack), s2a_libpack_misses(), s2a_libpack_rejects(), atomic_load(&g_n_libpack_bad), atomic_load(&g_n_offline),
+                           atomic_load(&g_n_cache), atomic_load(&g_n_compiled), atomic_load(&g_n_compiled_cs), atomic_load(&g_n_failed), atomic_load(&g_n_failed_cs),
+                           atomic_load(&g_n_alias_fg), atomic_load(&g_n_alias_bg) };
+    for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) sig = (sig ^ v[i]) * 0x100000001b3ull;
+    return sig | 1u;   // 非 0：0 留给「还没打过」
+}
+// 返回 1 = 打了一行。force = 停局那一行。线程安全：定时那一行靠 CAS 只让一个线程打。
+static int prog_tally_tick(uint64_t now, int force) {
+    const uint64_t sig = prog_tally_sig();
+    if (!force) {
+        uint64_t last = atomic_load(&g_tally_last_ns);
+        if (atomic_load(&g_tally_last_sig) == sig) return 0;   // 没变化不打（0 个的会话靠停局那一行）
+        if (last && now - last < TALLY_PERIOD_NS) return 0;
+        if (!atomic_compare_exchange_strong(&g_tally_last_ns, &last, now)) return 0;
+    } else atomic_store(&g_tally_last_ns, now);
+    atomic_store(&g_tally_last_sig, sig);
+    char b[800]; prog_tally_text(b, sizeof b);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b);
+    return 1;
+}
+static void prog_tally_log(void) { (void)prog_tally_tick(now_ns(), 0); }
+// 测试用：给定假时钟走一次节拍，返回是否打了一行（宿主用例核「0 个 / 只有计算 / 只有图形」都有累计行、节拍与停局那一行）
+int nvk_shader_test_tally_tick(uint64_t now, int force) { return prog_tally_tick(now, force); }
+static void prog_tally_rearm(void) { atomic_store(&g_tally_last_ns, 0); atomic_store(&g_tally_last_sig, prog_tally_sig()); }   // 新一局重新起节拍：「有变化」按本局开头的计数算
+void nvk_shader_test_tally_reset(void) { prog_tally_rearm(); }
+void nvk_shader_test_tally_add(int compute, int failed) {   // 与生产同一组计数器：failed = 1 记失败，否则记现编；compute 记计算分项
+    atomic_fetch_add(failed ? &g_n_failed : &g_n_compiled, 1);
+    if (compute) atomic_fetch_add(failed ? &g_n_failed_cs : &g_n_compiled_cs, 1);
 }
 // 测试读数：当下的「程序累计」行（不受每 50 个打一次的节拍限制）；结果合并读头的三个计数（读头 / 没有缓存文件 / 缓存文件坏）
 void nvk_shader_test_tally_line(char *out, size_t n) { if (out && n) prog_tally_text(out, n); }
@@ -2928,6 +2968,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 return -1;
             }
             if (status == LIVE_REJECTED) {
+                atomic_fetch_add_explicit(&g_n_failed_cs, 1, memory_order_relaxed);
                 atomic_fetch_add_explicit(&g_n_failed, 1, memory_order_relaxed);
                 // 编译器报缺的是计算阶段用户常量缓冲里的句柄事实、且学到了新坐标：这次拒绝是学习的一步，下面带上它当场重建请求
                 // （身份随事实变，不撞这份失败项），不记成「未接 compute_compile_failed」。学不到 / 重编到上限仍失败的，照常报红。
@@ -2953,6 +2994,8 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 return rc;
             }
             bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL; s2a_compile_outcome_free(&oc);
+            atomic_fetch_add_explicit(&g_n_compiled_cs, 1, memory_order_relaxed);
+            prog_tally_log();   // 计算现编也触发累计行的节拍（原先只有图形路径打）
             atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
             if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
             if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, rq.identity, bytes, len);
