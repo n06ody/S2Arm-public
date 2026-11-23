@@ -798,6 +798,7 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
 // fd_binding → 后端布局项（核心按 src_kind / src_reg 绑定）。0 = 这一项首版不支持
 static int layout_ent(const struct fd_binding *b, nvn_gpu_layout_ent *e) {
     memset(e, 0, sizeof *e);
+    if (b->binding < 0 || b->binding > UINT16_MAX) return 0;   // 布局项的绑定号是 16 位：超界不截断，按不支持的项具名拒
     e->src_reg2 = UINT16_MAX;
     e->set = (uint8_t)b->set; e->binding = (uint16_t)b->binding; e->count = 1; e->access = NVN_GPU_ACC_R;
     if (b->kind == 0) {

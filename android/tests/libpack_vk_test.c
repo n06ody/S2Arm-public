@@ -1496,6 +1496,25 @@ int main(void) {
             CHECK(rc == -1 && !j && strstr(w, "SBUFP uses a fixed SSBO window"), "ssbo window: unaligned state, same library → REJECT by name (no compensation)");
             free(j); j = NULL;
         }
+        // 绑定号 = arg_id × 6 + 阶段号 要装进 16 位（布局项 / S2SB 行 / 结果解析）：超界具名拒，不回绕、不截断。顶点段阶段号 0：arg_id 10923 → 65538 越界；
+        //   arg_id 0xFFFFFFFF 在 32 位乘法里会回绕成 0xFFFFFFFA（不查的话变成 4294967290 再被后面当别的错拒）；片元段阶段号 4：arg_id 10922 → 65536 越界
+        {
+            const struct { int ps; uint32_t arg; } cases[] = { {0, 10923u}, {0, 0xFFFFFFFFu}, {1, 10922u}, {1, 0x2AABu} };
+            for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+                char vsj[1700], psj[1200];
+                snprintf(vsj, sizeof vsj, "%s", VS_JSON); snprintf(psj, sizeof psj, "%s", PS_JSON);
+                char *bad = cases[c].ps ? psj : vsj;
+                char *at = strstr(bad, "\"bindings\":[");
+                char extra[160];
+                snprintf(extra, sizeof extra, "{\"msl_name\":\"fp_c9\",\"kind\":\"cbuf\",\"reg\":6,\"arg_id\":%u},", cases[c].arg);
+                if (at) { at += strlen("\"bindings\":["); memmove(at + strlen(extra), at, strlen(at) + 1); memcpy(at, extra, strlen(extra)); }
+                w[0] = 0;
+                rc = c0_program(vsj, libpack_vert_spv, sizeof libpack_vert_spv, psj, libpack_frag_spv, sizeof libpack_frag_spv, &j, &jl, w, sizeof w);
+                if (!(rc == -1 && !j && strstr(w, "exceeds 16 bits"))) printf("  arg_id %u (%s): rc=%d why=%s\n", cases[c].arg, cases[c].ps ? "ps" : "vs", rc, w);
+                CHECK(rc == -1 && !j && strstr(w, "exceeds 16 bits"), "binding number beyond 16 bits is refused by name (no wrap, no truncation)");
+                free(j); j = NULL;
+            }
+        }
         // 诊断开关 window_tex_classes（顶点段用不带存储缓冲的 c0 夹具，非对齐无掩码也不拒，才走到片元段的贴图类别核；本夹具的片元没有贴图声明 = 类别 8）
         {
             struct s2a_libpack_gfx tex = { NULL, NULL, 0, 64, 1, NULL, 0 };

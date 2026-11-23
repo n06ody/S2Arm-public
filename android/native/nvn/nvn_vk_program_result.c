@@ -785,7 +785,7 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
         uint32_t u;
         if (s2a_jv_obj_find(b, "set", &value) || compute_u32(value, &u) || u > 3) CS_FAIL("compute descriptor set invalid");
         dst->set = (int)u;
-        if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > INT_MAX) CS_FAIL("compute binding number invalid");
+        if (s2a_jv_obj_find(b, "binding", &value) || compute_u32(value, &u) || u > UINT16_MAX) CS_FAIL("compute binding number invalid or outside 16 bits");
         dst->binding = (int)u;
         if (s2a_jv_obj_find(b, "count", &value) || compute_u32(value, &u) || !u) CS_FAIL("compute binding count is invalid");
         // 整池数组（带 pool 字段）的 count 是池长，不走下面「普通数组」的上限；它的形状在后面 compute_pool_binding 里整体核
