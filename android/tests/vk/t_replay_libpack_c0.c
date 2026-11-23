@@ -21,6 +21,8 @@
 
 static int compile_calls;
 static const char *case_dir;
+static char g_calls_text[600];   // rp_prog_calls_take 取走的程序调用榜文本
+extern size_t rp_prog_calls_take(char *out, size_t cap, double frames, unsigned top);
 static uint64_t g_samp19;   // 非 0：FS 分离采样器槽 19 绑这个句柄（c2 驱动句柄表 0x568 + 8×19 = 0x600 处的低字）
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target; static tex_t target_tex; static nvn_gpu_view target_view; static nvn_gpu_tex target_tex_backend;
@@ -170,6 +172,7 @@ static int run_case(const char *tag, const char *fs_json_fmt, const uint8_t *vs_
     nvn_gpu_cmd cmd = begin_cmd(); p_draw draw = {0}; draw.prim = 4; draw.count = 3; draw.instances = 1;
     pass_began = 0;
     rp_draw(cmd, &draw, NULL, &draw);
+    g_calls_text[0] = 0; (void)rp_prog_calls_take(g_calls_text, sizeof g_calls_text, 1.0, 8);   // 程序调用榜（诊断）：这一笔绘制应记在库来源程序名下
     nvn_gpu_err e = {0};
     if (pass_began) {
         static uint64_t fence_no;   // 提交的信号值必须严格递增
@@ -220,6 +223,8 @@ int main(int argc, char **argv) {
     int drew = run_case("bank0", FS_BANK0, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
     CHECK(hit == 1 && rej == 0 && compile_calls == 0, "bank 0 c0: library hit (hits+%llu rejects+%llu, live compiles %d)", (unsigned long long)hit, (unsigned long long)rej, compile_calls);
     CHECK(drew, "bank 0 c0: one replay draw, none skipped");
+    CHECK(strstr(g_calls_text, "共 1 支程序、1.0 笔，其中库来源 1.0 笔（100%）") != NULL && strstr(g_calls_text, "[库") != NULL,
+          "program call table: one library-sourced program, one draw: %s", g_calls_text);
     for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
         const uint8_t want[4] = {x < 2 ? 0x20 : 0xC0, 0x40, x < 2 ? 0x80 : 0xFF, x < 2 ? 0xFF : 0x80};
         const uint8_t *v = px + 4 * (4 * y + x);

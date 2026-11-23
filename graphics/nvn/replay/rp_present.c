@@ -20,6 +20,8 @@
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：rp_shader_live_compile_take
 #pragma weak rp_shader_live_compile_take
+// 弱链接[replay]：rp_prog_calls_take
+size_t rp_prog_calls_take(char *out, size_t cap, double frames, unsigned top) __attribute__((weak));
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -304,6 +306,10 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                            (double)pf[RP_PERF_SETRT_END_NS] / 1e6 / f, (double)pf[RP_PERF_PASSEND_N] / f);
                   nvn_plat_log(NVN_PLAT_LOG_INFO, "present", lb); }
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (rp_prog_calls_take) {   // 程序调用榜：每窗口取走并清空，只在诊断属性开时打（不开也要清，免得表常驻）
+                    char pc[700]; size_t pn = rp_prog_calls_take(pc, sizeof pc, f, 8);
+                    if (pn && nvn_plat_flag("nvk_hitch_log", 0)) nvn_plat_log(NVN_PLAT_LOG_INFO, "present", pc);
+                }
                 {   // 抽样说明（另起一行、不改原有各行的格式）：绘制各步 / 开通道细分 / 贴图解析的等锁与持锁三处按计时过的帧数求每帧值（#1103）
                     char tb[260]; snprintf(tb, sizeof tb, "分时（计时抽样）：每 %u 帧完整计 1 帧，本窗口计了 %llu 帧；绘制各步、开通道细分、贴图解析的等锁与持锁按计时的帧数求每帧毫秒（nvk_tm_full=1 每帧都计）",
                                            rp_tm_stride(), (unsigned long long)pf[RP_PERF_TM_FRAMES]);
