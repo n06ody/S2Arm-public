@@ -330,6 +330,15 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f、超长通道中途先交 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f, (double)pf[RP_PERF_P_CUT_LONG] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_IND_INDEX_BOUNDED] || pf[RP_PERF_IND_INDEX_GPU] || pf[RP_PERF_IND_INDEX_GROUP] ||
+                    pf[RP_PERF_IND_INDEX_UNKNOWN] || pf[RP_PERF_IND_INDEX_OFF]) {
+                    snprintf(b, sizeof b, "分时（通道内间接索引，每帧）：有界 %.1f 笔（切通道 %.1f 次）；退池尾：GPU 参数 %.1f 笔、计数组 %.1f 笔、其它 %.1f 笔、开关关 %.1f 笔（共切通道 %.1f 次）",
+                             (double)pf[RP_PERF_IND_INDEX_BOUNDED] / f, (double)pf[RP_PERF_IND_INDEX_BOUNDED_CUT] / f,
+                             (double)pf[RP_PERF_IND_INDEX_GPU] / f, (double)pf[RP_PERF_IND_INDEX_GROUP] / f,
+                             (double)pf[RP_PERF_IND_INDEX_UNKNOWN] / f, (double)pf[RP_PERF_IND_INDEX_OFF] / f,
+                             (double)pf[RP_PERF_IND_INDEX_CUT] / f);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                }
                 if (pf[RP_PERF_BINST_HZ] || pf[RP_PERF_BINST_ONE] || pf[RP_PERF_BINST_SCAN]) {
                     snprintf(b, sizeof b, "分时（间接绘制 base instance 拷贝，每帧）：批量前移拷贝 %.1f 笔、回退逐笔 %.1f 笔（其中为它收了开着的通道 %.1f 次）、前移扫描 %.1f 次、前移了没用上 %.1f 笔",
                              (double)pf[RP_PERF_BINST_HZ] / f, (double)pf[RP_PERF_BINST_ONE] / f, (double)pf[RP_PERF_BINST_CUT] / f, (double)pf[RP_PERF_BINST_SCAN] / f, (double)pf[RP_PERF_BINST_WASTE] / f);
