@@ -231,6 +231,14 @@ int main(int argc, char **argv) {
         int ok = 1; for (int c = 0; c < 4; c++) ok &= abs((int)v[c] - (int)want[c]) <= 1;
         CHECK(ok, "bank 0 c0 pixel (%d,%d) got %02x %02x %02x %02x want %02x %02x %02x %02x", x, y, v[0], v[1], v[2], v[3], want[0], want[1], want[2], want[3]);
     }
+    // 闸缺省关（nvk_libpack_gfx_c2 = 0）：bank 2 程序取库后被挡下，库不命中、这一笔不画（夹具的现编替身出不了程序）——8E 第 3 班全黑后的保护
+    {
+        compile_calls = 0; g_gfx_c2_flag = 0; g_samp19 = 0xFF804020u;
+        drew = run_case("bank2-gate-closed", FS_BANK2, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
+        g_samp19 = 0;
+        CHECK(!drew && rej == 0, "bank 2 c2 with the gate closed: not drawn from the library (hits+%llu rejects+%llu)", (unsigned long long)hit, (unsigned long long)rej);
+    }
+    g_gfx_c2_flag = 1;   // 放闸：下面的 bank 2 正例走库
     // 正：bank 2（c2 驱动句柄表）+ 同一个 SPIR-V（binding 22 的 set 0 Uniform Block）→ 库命中、slot 2 → NVN_RB_DRV2，回放按 0xA00 句柄表供数。
     //   着色器仍读偏移 0x600 / 0x604：句柄表里 0x600 = 分离采样器槽 19 的低 4 字节 = 0xFF804020（左半屏 20 40 80 FF），0x604 没有写入 = 0（右半屏 00 00 00 00）。
     {
@@ -246,6 +254,7 @@ int main(int argc, char **argv) {
             CHECK(ok, "bank 2 c2 pixel (%d,%d) got %02x %02x %02x %02x want %02x %02x %02x %02x", x, y, v[0], v[1], v[2], v[3], want[0], want[1], want[2], want[3]);
         }
     }
+    g_gfx_c2_flag = -1;
     // 负：错绑定号（arg_id 4 → 28，SPIR-V 没有）必须出库拒、不画、不被现编兜底成成功（bank 3 的拒收在 libpack_vk_test 里，这里不再造 SPIR-V）
     struct { const char *tag, *fmt; } neg[1] = {{"arg4", FS_ARG4}};
     for (int i = 0; i < 1; i++) {
