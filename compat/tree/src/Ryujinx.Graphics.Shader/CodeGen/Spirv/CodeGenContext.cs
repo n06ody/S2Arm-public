@@ -58,6 +58,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         private readonly Dictionary<AstOperand, Instruction> _locals = new();
         private readonly Dictionary<int, Instruction> _funcArgs = new();
         private readonly Dictionary<int, (StructuredFunction, Instruction)> _functions = new();
+        private Instruction _storageWindowMask;
 
         private class BlockState
         {
@@ -227,6 +228,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 {
                     IrOperandType.Argument => GetArgument(type, operand),
                     IrOperandType.Constant => GetConstant(type, operand),
+                    IrOperandType.StorageWindowMask => GetStorageWindowMask(type),
                     IrOperandType.LocalVariable => GetLocal(type, operand),
                     IrOperandType.Undefined => GetUndefined(type),
                     _ => throw new ArgumentException($"Invalid operand type \"{operand.Type}\"."),
@@ -281,6 +283,16 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 AggregateType.U32 => Constant(TypeU32(), (uint)operand.Value),
                 _ => throw new ArgumentException($"Invalid type \"{type}\"."),
             };
+        }
+
+        private Instruction GetStorageWindowMask(AggregateType type)
+        {
+            if (_storageWindowMask == null)
+            {
+                _storageWindowMask = SpecConstant(TypeU32(), uint.MaxValue);
+                Name(_storageWindowMask, "s2a_storage_window_mask");
+            }
+            return BitcastIfNeeded(type, AggregateType.U32, _storageWindowMask);
         }
 
         public Instruction GetLocalPointer(AstOperand local)

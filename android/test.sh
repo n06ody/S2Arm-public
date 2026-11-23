@@ -318,8 +318,14 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # 几何着色器走出包预编库的负对照（正例在上面无参那一步里单独起进程跑）：撤掉接线各一处，--gs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mutants
+# 图形预编库的存储缓冲窗口（准入放行 + 预热从库取）负对照：旧状态门 / 清单丢窗口标记 / 预热无视标记，各撤一处必红在指定断言
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --ssbo-window-mutants
 # 计算程序出包预编库的非对齐闸负对照（#496085）：撤掉 state_ok 对 ckey 的生效，--cs-libpack 必红
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --binary-libpack
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --pair-libpack
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-libpack-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gfx-reason-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --win-part-mutants
 # 计算程序预热（清单记账 / 阶段 / 从缓存建 / 开关）与现场编译诊断事件（图形 / 计算）的负对照：各撤一处，对应断言必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
