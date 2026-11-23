@@ -1025,6 +1025,18 @@ static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance)
 //   ④ 按命令流顺序消费：这一笔必须是表里当前位置之后的某一项，记录里的间接地址、绑定时解析出的镜像位置都要和表里一致，阶段要被表里的掩码盖住。
 // 阶段掩码：前瞻时不知道后面每笔的程序，按「这一会话里要拷过的阶段」的并集拷（g_hz_mask）；后面某笔要的阶段不在掩码里就照旧逐笔拷。
 int rp_pass_is_open(void) __attribute__((weak));   // 只链 rp_draw.c 的隔离用例可以不给：拿不到通道状态就只在要拷的那一笔前移
+enum rp_index_span_result rp_buf_resolve_indexed(nvn_gpu_cmd, uint64_t, uint64_t, uint32_t,
+                                                nvn_gpu_draw_args *, uint64_t *) __attribute__((weak));
+static int g_read_snapshot_on = -1;
+static int read_snapshot_on(void) {
+    if (g_read_snapshot_on < 0) {
+        g_read_snapshot_on = nvn_plat_flag("nvk_buf_read_snapshot", 0) != 0;
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "buf", g_read_snapshot_on ?
+                     "段内只读快照（debug.s2a.nvk_buf_read_snapshot）=1" :
+                     "段内只读快照（debug.s2a.nvk_buf_read_snapshot）=0");
+    }
+    return g_read_snapshot_on;
+}
 const void *rp_draw_stream;
 uint64_t rp_gpu_wr_gen;
 enum { HZ_MAX = 128, HZ_SCAN = 4096 };
@@ -1678,7 +1690,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         }
         if (nv) {
             nvn_gpu_buf vbuf[16];
-            rp_buf_resolve_multi(c, nv, vaddr, vlen, vbuf, voff, vok);
+            rp_buf_resolve_multi(read_snapshot_on() ? c : NULL, nv, vaddr, vlen, vbuf, voff, vok);
             int k = 0;
             for (int i = 0; i < 16; i++) if (streams >> i & 1) {
                 if (!vok[k]) { skip("vertex_buffer_unresolved", rec); return; }
@@ -1713,10 +1725,26 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
     }
     nvn_gpu_draw_args a; memset(&a, 0, sizeof a);
     uint64_t indirect_bytes = 0, index_bytes = 0;
+    int bounded_index = 0;
     if (di && (di->itype < 0 || di->itype > 2)) { skip("index_type_invalid", rec); return; }
     if (ind) {
         const uint64_t isize = di ? 20 : 16, ispan = mdi_n ? (uint64_t)(mdi_n - 1) * mdi_stride + isize : isize;
-        if (!rp_buf_resolve(c, ind, ispan, &a.ind, &a.ind_off) || (a.ind_off & 3)) {
+        if (di && rp_pass_is_open && rp_pass_is_open()) {
+            int counter = RP_PERF_IND_INDEX_OFF;
+            if (read_snapshot_on()) {
+                if (mdi_n) counter = RP_PERF_IND_INDEX_GROUP;
+                else {
+                    const enum rp_index_span_result rc = rp_buf_resolve_indexed ?
+                        rp_buf_resolve_indexed(c, ind, di->ibuf, 1u << di->itype, &a, &index_bytes) : RP_INDEX_SPAN_UNKNOWN;
+                    bounded_index = rc == RP_INDEX_SPAN_BOUNDED;
+                    counter = bounded_index ? RP_PERF_IND_INDEX_BOUNDED :
+                              rc == RP_INDEX_SPAN_GPU_ARGS ? RP_PERF_IND_INDEX_GPU : RP_PERF_IND_INDEX_UNKNOWN;
+                    if (bounded_index && !rp_pass_is_open()) rp_perf_add(RP_PERF_IND_INDEX_BOUNDED_CUT, 1);
+                }
+            }
+            rp_perf_add(counter, 1);
+        }
+        if (!bounded_index && (!rp_buf_resolve(c, ind, ispan, &a.ind, &a.ind_off) || (a.ind_off & 3))) {
             skip("indirect_buffer_unresolved", rec); return;
         }
         indirect_bytes = ispan;
@@ -1726,16 +1754,20 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             a.max_draws = mdi_n; a.stride = (uint32_t)mdi_stride;
         }
         if (di) {
-            const uint8_t *mem = NULL; uint64_t bytes = 0;
-            const uint64_t isz = di->itype == 1 ? 2 : 4;
-            // The GPU owns firstIndex/indexCount. Resolve the registered binding tail,
-            // not a CPU-derived count, without reading index or argument bytes.
-            if (!rp_pool_find(di->ibuf, isz, &mem, &bytes)) { skip("index_buffer_unresolved", rec); return; }
-            uint64_t off = di->ibuf - (uint64_t)(uintptr_t)mem;
-            if (off > bytes || !rp_buf_resolve(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff) || (a.ioff & (isz - 1))) {
-                skip("index_buffer_unresolved", rec); return;
+            if (!bounded_index) {
+                const uint8_t *mem = NULL; uint64_t bytes = 0;
+                const uint64_t isz = 1u << di->itype;
+                // GPU 参数或范围不可证时，保留登记池尾，交给原间接命令按 GPU 可见参数读取。
+                if (!rp_pool_find(di->ibuf, isz, &mem, &bytes)) { skip("index_buffer_unresolved", rec); return; }
+                const uint64_t off = di->ibuf - (uint64_t)(uintptr_t)mem;
+                const int open = rp_pass_is_open && rp_pass_is_open();
+                if (off > bytes || !rp_buf_resolve(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff) || (a.ioff & (isz - 1))) {
+                    skip("index_buffer_unresolved", rec); return;
+                }
+                if (open && !rp_pass_is_open()) rp_perf_add(RP_PERF_IND_INDEX_CUT, 1);
+                index_bytes = bytes - off;
             }
-            a.itype = (uint32_t)di->itype; index_bytes = bytes - off;
+            a.itype = (uint32_t)di->itype;
         }
     } else if (quads) {
         uint32_t isz = di ? (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) : 0;
@@ -1766,7 +1798,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         if (!rp_buf_resolve(c, di->ibuf, (uint64_t)count * isz, &a.ibuf, &a.ioff)) { skip("index_buffer_unresolved", rec); return; }
         a.itype = (uint32_t)di->itype; a.base_vertex = di->base_vertex; index_bytes = (uint64_t)count * isz;
     } else a.first = (uint32_t)dr->first;
-    if (ind || g_hz_mask) {
+    if (!bounded_index && (ind || g_hz_mask)) {
         // 要拷的阶段：用驱动段、编译器没证明不读 c0 + 0x644
         uint8_t need = 0;
         if (ind) for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++)
@@ -1792,7 +1824,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             }
         }
     }
-    if (ind) {
+    if (ind && !bounded_index) {
         int copied = 0;
         for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
             if (g_prog->ent[st][i].src_kind != NVN_RB_DRV0 || g_ind_drv_ok[st]) continue;
@@ -2096,7 +2128,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         if (!alloc_copy(c, 16, NULL, &zs)) { skip("arena_alloc_failed", rec); goto draw_done; }
         nvn_gpu_set_vbuf(c, (uint32_t)zstream, zs.buf, zs.off);
     }
-    uint32_t base_instance = ind ? 0 : (uint32_t)(di ? di->base_instance : dr->base_instance);
+    uint32_t base_instance = bounded_index ? a.base_instance : ind ? 0 : (uint32_t)(di ? di->base_instance : dr->base_instance);
     DT(RP_PERF_D_DYN);
     // 每个阶段都要发，程序里没有的阶段发零条：后端按阶段留着上一笔的绑定，不清掉的话「上一笔有片元、这一笔只有顶点」
     // 会带着旧的片元绑定去配没有片元布局的管线，后端报布局错、整段作废
@@ -2502,6 +2534,7 @@ done:
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+    g_read_snapshot_on = -1;
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941

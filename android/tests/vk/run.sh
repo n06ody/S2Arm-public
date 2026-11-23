@@ -12,6 +12,7 @@
 #   bash android/tests/vk/run.sh --pipe-creation-feedback  # 管线创建反馈三形态
 #   bash android/tests/vk/run.sh --pipe-call-lifetime  # 在途管线调用阻止 close 拆资源，并允许超时后重试
 #   bash android/tests/vk/run.sh --feedback-core    # 附件反馈快照、VVL 与同包负控（独立夹具，见 standalone/）
+#   bash android/tests/vk/run.sh --indirect-core --dq-matrix  # 间接绘制，独立进程跑两级回放关 / 开
 #   bash android/tests/vk/run.sh --<名>            # android/tests/vk/standalone/<名>.sh 里的任一独立夹具
 # 环境：
 #   S2A_LAVAPIPE_ICD   指定 lavapipe ICD json（默认找 ~/.local / /usr/share/vulkan/icd.d）
@@ -94,13 +95,23 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
     cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
     export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
-    set +e
-    "$out/$core_test" "$out/shaders" 2>&1 | tee "$out/run.log"
-    rc=${PIPESTATUS[0]}
-    set -e
-    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$out/run.log"; then
-        echo "【红】隔离回放用例失败或有 Vulkan 校验错误（rc=${rc}）" >&2
-        exit 1
+    run_isolated_replay() {
+        local log=$1 rc
+        set +e
+        "$out/$core_test" "$out/shaders" 2>&1 | tee "$log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$log"; then
+            echo "【红】隔离回放用例失败或有 Vulkan 校验错误（rc=${rc}）" >&2
+            return 1
+        fi
+    }
+    if [ "$mode" = "--indirect-core" ] && [ "${2:-}" = "--dq-matrix" ]; then
+        # 录制线程跨会话保留；用新进程分别读开关，避免等第 64 次提交的轮询。
+        (unset S2A_REPLAY_INDIRECT_DQ; run_isolated_replay "$out/run-dq0.log")
+        (export S2A_REPLAY_INDIRECT_DQ=1; run_isolated_replay "$out/run-dq1.log")
+    else
+        run_isolated_replay "$out/run.log"
     fi
     exit 0
 fi

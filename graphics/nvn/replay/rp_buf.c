@@ -419,13 +419,12 @@ static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
     return 0;
 }
 
-// 只读顶点绑定在通道中再次取到真实新字节时，给它本段的另一份不可变内容。
+// 只读顶点 / 有界索引绑定在通道中再次取到真实新字节时，给它本段的另一份不可变内容。
 // 先前绘制仍读镜像。待落地 GPU 写（含锁外拷回）相交、跟踪不可证或暂存用完时，保留有序镜像同步。
 enum { READ_SNAPSHOT_SLOTS = 32, READ_SNAPSHOT_MAX = 2 * 1024 * 1024, READ_SNAPSHOT_BUDGET = 8 * 1024 * 1024 };
 struct readonly_range { nvn_gpu_cmd cmd; uint64_t addr, len; nvn_gpu_slice slice; };
 static struct read_snapshot { uint64_t addr, len, mapping, stamp; nvn_gpu_slice slice; } g_read_snapshots[READ_SNAPSHOT_SLOTS];
 static uint64_t g_read_snap_seg, g_read_snap_bytes;
-static int g_read_snap_on = -1;
 int rp_pass_is_open(void) __attribute__((weak));   // 隔离夹具没有通道状态时，沿用有序镜像同步。
 
 static int gpu_range_pending_locked(const struct shadow *s, uint64_t a, uint64_t b) {
@@ -604,13 +603,13 @@ static int resolve_inner(uint64_t addr, uint64_t len, const uint8_t *mem, uint64
     return resolve_part_locked(addr, len, mem, size, s, m, 1, read);   // 日志不可用（不受写跟踪 / 重叠池 / 跟踪不可靠 / 开关关）
 }
 static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size,
-                          nvn_gpu_buf *buf, uint64_t *off, nvn_gpu_cmd vertex_cmd) {
+                          nvn_gpu_buf *buf, uint64_t *off, nvn_gpu_cmd snapshot_cmd) {
     struct shadow *s = shadow_get(mem, size);
     if (!s) return 0;
     // 整段先选一次镜像：未落地的 GPU 写可能只覆盖其中一个摘要块。
     struct mirror *m = mirror_pick(s, addr - (uint64_t)(uintptr_t)mem, len, NULL);
-    struct readonly_range read = { .cmd = vertex_cmd, .addr = addr, .len = len };
-    int ok = resolve_inner(addr, len, mem, size, s, m, vertex_cmd ? &read : NULL);
+    struct readonly_range read = { .cmd = snapshot_cmd, .addr = addr, .len = len };
+    int ok = resolve_inner(addr, len, mem, size, s, m, snapshot_cmd ? &read : NULL);
     if (read.slice.buf) {
         *buf = read.slice.buf;
         *off = read.slice.off;
@@ -624,6 +623,55 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
         mirror_note_read(m, lo, hi);
     }
     return ok;
+}
+enum rp_index_span_result rp_buf_resolve_indexed(nvn_gpu_cmd c, uint64_t ind, uint64_t ibuf, uint32_t isz,
+                                                nvn_gpu_draw_args *a, uint64_t *index_bytes) {
+    // NVN 单笔索引参数依次为 indexCount / instanceCount / firstIndex / vertexOffset / firstInstance。
+    uint32_t args[5];
+    const uint8_t *params_mem, *index_mem;
+    uint64_t index_size;
+    if (!rp_pool_find(ind, sizeof args, &params_mem, NULL) || !rp_pool_find(ibuf, isz, &index_mem, &index_size))
+        return RP_INDEX_SPAN_UNKNOWN;
+    const uint64_t key = (uint64_t)(uintptr_t)params_mem, poff = ind - key;
+    const uint64_t ioff = ibuf - (uint64_t)(uintptr_t)index_mem;
+    if ((poff & 3) || (ioff & (isz - 1))) return RP_INDEX_SPAN_UNKNOWN;
+
+    enum rp_index_span_result result = RP_INDEX_SPAN_UNKNOWN;
+    pthread_mutex_lock(&g_bmu);
+    struct shadow *s = nvn_hm_get(&g_shadow, &key);
+    if (s && gpu_range_pending_locked(s, poff, poff + sizeof args)) {
+        result = RP_INDEX_SPAN_GPU_ARGS;
+        goto done;
+    }
+    const void *src = (const void *)(uintptr_t)ind;
+    const uint64_t mapping = nvn_dirty_mapping_generation();
+    const void *span = nvn_dirty_span(src, sizeof args);
+    if (!span || nvn_dirty_tracking_unreliable()) goto done;
+    nvn_dirty_protect(src, sizeof args);
+    const uint64_t stamp = nvn_dirty_now();
+    if (!snapshot_current(span, ind, sizeof args, stamp)) goto done;
+    memcpy(args, src, sizeof args);
+    if (!snapshot_current(span, ind, sizeof args, stamp) || nvn_dirty_mapping_generation() != mapping) goto done;
+
+    const uint64_t start = (uint64_t)args[2] * isz, len = (uint64_t)args[0] * isz;
+    if (!len || !args[1] || start > index_size - ioff || len > index_size - ioff - start) goto done;
+    nvn_gpu_slice sl;
+    nvn_gpu_err err = {0};
+    if (!nvn_gpu_ok(nvn_gpu_arena_alloc(c, sizeof args, 4, &sl, &err)) || !sl.cpu) goto done;
+    nvn_gpu_buf index_buf = NULL;
+    uint64_t index_off;
+    if (!resolve_locked(ibuf + start, len, index_mem, index_size, &index_buf, &index_off, c)) goto done;
+    // 把绑定起点移到 firstIndex，私有参数里的 firstIndex 归零。保留 draw 参数其它四字。
+    args[2] = 0;
+    memcpy(sl.cpu, args, sizeof args);
+    a->ind = sl.buf; a->ind_off = sl.off;
+    a->ibuf = index_buf; a->ioff = index_off;
+    a->base_instance = args[4];
+    *index_bytes = len;
+    result = RP_INDEX_SPAN_BOUNDED;
+done:
+    pthread_mutex_unlock(&g_bmu);
+    return result;
 }
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
     (void)c;
@@ -641,8 +689,6 @@ static void resolve_multi_chunk(nvn_gpu_cmd vertex_cmd, int n, const uint64_t *a
     const uint64_t w0 = (g_res_tm && n) ? res_now() : 0;
     pthread_mutex_lock(&g_bmu);
     if (w0) rp_perf_add(RP_PERF_RES_LW_NS, res_now() - w0);
-    if (vertex_cmd && g_read_snap_on < 0) g_read_snap_on = nvn_plat_flag("nvk_buf_read_snapshot", 0) != 0;
-    if (!g_read_snap_on) vertex_cmd = NULL;
     for (int i = 0; i < n; i++)
         if (mem[i]) ok[i] = (unsigned char)resolve_locked(addr[i], len[i], mem[i], size[i], &buf[i], &off[i], vertex_cmd);
     pthread_mutex_unlock(&g_bmu);
@@ -710,7 +756,6 @@ nvn_gpu_buf rp_buf_for_null_storage(void) {
 
 void rp_buf_reset(void) {
     pthread_mutex_lock(&g_bmu);
-    g_read_snap_on = -1;
     g_read_snap_seg = g_read_snap_bytes = 0;
     memset(g_read_snapshots, 0, sizeof g_read_snapshots);
     // 收尾也不能释放正在被锁外拷贝引用的镜像；等待期间表可能变化，醒来重新扫描。
