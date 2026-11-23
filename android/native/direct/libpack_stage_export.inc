@@ -14,16 +14,17 @@ struct sb_export {
   unsigned regular, count;
 };
 static void sb_export_parse(struct sb_export* out, unsigned stage, int version, unsigned support,
-                            const struct jw* st, const struct jw* bd, const struct jw* extra) {
+                            const struct jw* st, const struct jw* bd, const struct jw* extra, int unaligned_capable) {
   struct jw doc = {0};
   jw_fmt(&doc,
          "{\"schema\":\"s2a-direct-program-v%d\",\"content\":{\"contract\":\"s2a-direct-program-"
          "content-v%d\",",
          version, version);
   if (stage == 5)
-    jw_str(&doc,
-           "\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":null,"
-           "\"supportReads\":null,");
+    jw_fmt(&doc,
+           "\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":%s,\"c0Reads\":null,"
+           "\"supportReads\":null,",
+           unaligned_capable ? "true" : "false");
   jw_str(&doc, "\"stages\":[");
   jw_put(&doc, (const char*)st->b, st->n);
   jw_str(&doc, "],\"bindings\":[");
@@ -132,7 +133,8 @@ int s2a_pack_stage(const uint8_t key[8], unsigned nvn, int topo, uint64_t finger
       continue;
     }
     const struct jw empty = {0};
-    sb_export_parse(c, nvn, strict ? 2 : 1, support, &stages, &binds, strict ? &extra : &empty);
+    sb_export_parse(c, nvn, strict ? 2 : 1, support, &stages, &binds, strict ? &extra : &empty,
+                    LP_WINDOW_KIND(contract.window.mode) == LP_WINDOW_MASK);
   }
   size_t sizes[] = {contract.window.mode ? SB_META_WINDOW_SIZE : SB_META_SIZE, sb_choice_size(choice), sb_choice_size(choice + 1), sn};
   size_t off = SB_HEADER + SB_SECTIONS * SB_SECTION, offsets[SB_SECTIONS];

@@ -1556,6 +1556,122 @@ int main(void) {
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     }
 
+    // ---- 计算的存储缓冲窗口合同：出库带掩码，取库按设备对齐固化（JSON 库与 S2SB 二进制库同一套判定）----
+    {
+        static const char CS_MASK_NAME[] = "s2a_storage_window_mask";
+        enum { CW_LEGACY, CW_UNUSED, CW_MASK, CW_MASK_UBO, CW_FIXED, CW_CASES };
+        static const char *const cw_names[CW_CASES] = { "legacy (no contract)", "contract, no mask, no storage", "mask", "mask + UBO-sourced storage", "contract, sbuf, no mask" };
+        const uint8_t key[8] = { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+        const uint32_t bound = libpack_support_v2_comp_spv[3], type_id = bound, mask_id = bound + 1;
+        uint32_t cw_spv[sizeof libpack_support_v2_comp_spv / sizeof(uint32_t) + 16];
+        size_t cw_n = sizeof libpack_support_v2_comp_spv / sizeof(uint32_t);
+        memcpy(cw_spv, libpack_support_v2_comp_spv, sizeof libpack_support_v2_comp_spv);
+        cw_spv[3] = bound + 2;
+        cw_spv[cw_n++] = (8u << 16) | 5u; cw_spv[cw_n++] = mask_id;                 // OpName %mask "s2a_storage_window_mask"
+        memset(cw_spv + cw_n, 0, 6 * sizeof(uint32_t)); memcpy(cw_spv + cw_n, CS_MASK_NAME, sizeof CS_MASK_NAME); cw_n += 6;
+        cw_spv[cw_n++] = (4u << 16) | 21u; cw_spv[cw_n++] = type_id; cw_spv[cw_n++] = 32; cw_spv[cw_n++] = 0;   // OpTypeInt 32 0
+        cw_spv[cw_n++] = (4u << 16) | 50u; cw_spv[cw_n++] = type_id; cw_spv[cw_n++] = mask_id; cw_spv[cw_n++] = UINT32_MAX;   // OpSpecConstant 0xFFFFFFFF
+        static const char PROFILE[] = "{\"capabilities\":{\"storageBufferOffsetAlignment\":64}}";
+        for (int variant = 0; variant < CW_CASES; variant++) {
+            char json[900];
+            const char *extra = variant == CW_MASK_UBO ? ",{\"msl_name\":\"cp_s1\",\"kind\":\"sbuf_ubo\",\"index\":1,\"reg\":1,\"off\":0,\"rw\":false,\"arg_id\":5}" :
+                                variant == CW_FIXED ? ",{\"msl_name\":\"cp_s0\",\"kind\":\"sbuf\",\"index\":0,\"reg\":0,\"rw\":true,\"arg_id\":5}" : "";
+            char contract[96] = "";
+            if (variant == CW_MASK || variant == CW_MASK_UBO) snprintf(contract, sizeof contract, ",\"ssbo_window_abi\":1,\"ssbo_window_mask\":%u", mask_id);
+            else if (variant != CW_LEGACY) snprintf(contract, sizeof contract, ",\"ssbo_window_abi\":1");
+            snprintf(json, sizeof json,
+                     "{\"key\":\"c0c1c2c3c4c5c6c7_b\",\"stage\":\"cs\",\"dm_ctl\":\"c0c1c2c3c4c5c6c7\"%s,\"bindings\":["
+                     "{\"msl_name\":\"cp_t_cb196610_1056805A\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+                     "{\"msl_name\":\"cp_t_cb196610_1056805ASmplr\",\"kind\":\"samp\",\"reg\":0,\"arg_id\":2},"
+                     "{\"msl_name\":\"cp_i0\",\"kind\":\"img\",\"reg\":0,\"arg_id\":4}%s]}", contract, extra);
+            snprintf(g_dir, sizeof g_dir, "%s/cwin%d", tmpl, variant);
+            CHECK(mkdir(g_dir, 0700) == 0, "create compute window pack directory");
+            size_t sizes[2] = { strlen(json), cw_n * sizeof(uint32_t) };
+            const uint8_t *payloads[2] = { (const uint8_t *)json, (const uint8_t *)cw_spv };
+            struct trec records[2] = { { .key = 0xc0c1c2c3c4c5c6c7, .kind = 1, .len = (uint32_t)sizes[0] }, { .key = 0xc0c1c2c3c4c5c6c7, .kind = 52, .len = (uint32_t)sizes[1] } };
+            CHECK(mk_pack(records, 2, payloads, sizes, 1) == 0, "compute window pack written");
+            struct s2a_libpack *cl = NULL;
+            CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute window pack");
+            const struct s2a_libpack_gfx aligned = { NULL, PROFILE, sizeof PROFILE - 1, 64, 0, NULL, 0 }, unaligned = { NULL, PROFILE, sizeof PROFILE - 1, 64, 1, NULL, 0 };
+            for (int state = 0; state < 2; state++) {
+                const struct s2a_libpack_gfx *gfx = state ? &unaligned : &aligned;
+                uint8_t *j = NULL; size_t jl = 0; char why[192] = "";
+                int rc = s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, gfx, &j, &jl, why, sizeof why);
+                // 期望：对齐基址：除「掩码 + UBO 来源」「有存储缓冲」外都命中（这两类 spv 没声明对应绑定，本夹具只验到窗口闸）；
+                //   非对齐基址：只有带掩码（无 UBO 来源）和「合同、无存储缓冲」命中；旧库 MISS；有存储缓冲无掩码 / UBO 来源具名拒
+                int want_hit = state ? (variant == CW_UNUSED || variant == CW_MASK) : (variant == CW_LEGACY || variant == CW_UNUSED || variant == CW_MASK);
+                int want_miss = state && variant == CW_LEGACY;
+                if (variant == CW_MASK_UBO && !state) want_hit = 1;
+                if (rc != (want_hit ? 0 : want_miss ? S2A_LIBPACK_MISS : -1) && !(variant == CW_FIXED && !state) && !(variant == CW_MASK_UBO && !state))
+                    printf("  compute window [%s] %s: rc=%d why=%s\n", cw_names[variant], state ? "unaligned" : "aligned", rc, why);
+                if (!(variant == CW_FIXED && !state) && !(variant == CW_MASK_UBO && !state))
+                    CHECK(rc == (want_hit ? 0 : want_miss ? S2A_LIBPACK_MISS : -1) && (rc == 0) == (j != NULL), "compute window gate verdict matches the contract");
+                if (state && variant == CW_FIXED) CHECK(rc == -1 && strstr(why, "fixed SSBO window"), "compute: unaligned sbuf without a mask → named rejection");
+                if (state && variant == CW_MASK_UBO) CHECK(rc == -1 && strstr(why, "UBO-sourced storage keeps the aligned gate"), "compute: unaligned UBO-sourced storage keeps the aligned gate");
+                if (rc == 0 && j && (variant == CW_MASK || variant == CW_MASK_UBO)) {
+                    struct nvn_vk_compute_program parsed;
+                    char pw[160] = "";
+                    CHECK(nvn_vk_program_parse_compute(j, jl, &parsed, pw, sizeof pw) == 0 && parsed.has_unaligned_storage_buffer == 1,
+                          "compute with a window mask is emitted as unaligned-capable (hasUnalignedStorageBuffer)");
+                    const uint32_t *w = (const uint32_t *)parsed.stage.spirv;
+                    int fixed = 0;
+                    for (size_t i = 5; i < parsed.stage.spirv_bytes / 4; i += w[i] >> 16)
+                        if ((w[i] & 0xffff) == 43u && w[i + 2] == mask_id) fixed = w[i + 3] == (uint32_t)-64;
+                    CHECK(fixed, "compute window mask is fixed to 0 - A (A = 64)");
+                    nvn_vk_program_free_compute(&parsed);
+                } else if (rc == 0 && j) {
+                    struct nvn_vk_compute_program parsed;
+                    char pw[160] = "";
+                    const int prc = nvn_vk_program_parse_compute(j, jl, &parsed, pw, sizeof pw);
+                    if (prc != 0 || parsed.has_unaligned_storage_buffer != 0) printf("  [%s] parse rc=%d why=%s unaligned=%d\n", cw_names[variant], prc, pw, parsed.has_unaligned_storage_buffer);
+                    CHECK(prc == 0 && parsed.has_unaligned_storage_buffer == 0,
+                          "compute without a window mask keeps hasUnalignedStorageBuffer false");
+                    nvn_vk_program_free_compute(&parsed);
+                }
+#ifdef S2A_LIBPACK_PACKER
+                if (!(variant == CW_FIXED || variant == CW_MASK_UBO)) {   // 这两类的存储缓冲绑定本夹具的 spv 没有声明，装不出记录；窗口闸判定上面 JSON 路径已验
+                    uint8_t *record = NULL; size_t record_size = 0;
+                    CHECK(!s2a_pack_stage(key, 5, -1, 0, (const uint8_t *)json, strlen(json), (const uint8_t *)cw_spv, cw_n * sizeof(uint32_t), &record, &record_size),
+                          "encode compute window variant (S2SB)");
+                    struct trec binary = { .key = 0xc0c1c2c3c4c5c6c7, .kind = 128, .len = (uint32_t)record_size };
+                    const uint8_t *bp[1] = { record };
+                    size_t bs[1] = { record_size };
+                    struct s2a_libpack *bl = NULL;
+                    char bdir[400]; snprintf(bdir, sizeof bdir, "%s_s2sb%d", g_dir, state);
+                    CHECK(mkdir(bdir, 0700) == 0, "create compute window S2SB directory");
+                    char saved[400]; snprintf(saved, sizeof saved, "%s", g_dir); snprintf(g_dir, sizeof g_dir, "%s", bdir);
+                    if (record && !mk_pack_at(g_dir, 1, &binary, 1, bp, bs, 1) && s2a_libpack_open(&bl, g_dir) == 1) {
+                        uint8_t keys[6][8] = {{0}};
+                        memcpy(keys[0], key, 8);
+                        struct nvn_vk_compute_program out;
+                        char reason[160] = "";
+                        int got = s2a_libpack_binary_program(bl, keys, 32, gfx, 32768, NULL, &out, reason, sizeof reason);
+                        if (got != rc) printf("  [%s] %s: json rc=%d, S2SB rc=%d why=%s\n", cw_names[variant], state ? "unaligned" : "aligned", rc, got, reason);
+                        CHECK(got == rc, "compute: S2SB and JSON give the same window verdict");
+                        if (got == 0) {
+                            if (out.has_unaligned_storage_buffer != (variant == CW_MASK)) printf("  [%s] S2SB hasUnaligned=%d state=%d\n", cw_names[variant], out.has_unaligned_storage_buffer, state);
+                            CHECK(out.has_unaligned_storage_buffer == (variant == CW_MASK), "compute S2SB carries hasUnalignedStorageBuffer for masked stages only");
+                            if (variant == CW_MASK) {
+                                const uint32_t *w = (const uint32_t *)out.stage.spirv;
+                                int fixed = 0;
+                                for (size_t i = 5; i < out.stage.spirv_bytes / 4; i += w[i] >> 16)
+                                    if ((w[i] & 0xffff) == 43u && w[i + 2] == mask_id) fixed = w[i + 3] == (uint32_t)-64;
+                                CHECK(fixed, "compute S2SB window mask is fixed to 0 - A (A = 64)");
+                            }
+                        }
+                        s2a_libpack_close(bl);
+                    } else CHECK(0, "open encoded compute window S2SB fixture");
+                    snprintf(g_dir, sizeof g_dir, "%s", saved);
+                    free(record);
+                }
+#endif
+                free(j);
+            }
+            s2a_libpack_close(cl);
+        }
+        snprintf(g_dir, sizeof g_dir, "%s", tmpl);
+    }
+
     // ---- 计算共享内存闸：_b.json 带 spill 标记时核 .spv 的 Workgroup 字节 vs 设备 maxComputeSharedMemorySize ----
     {
         snprintf(g_dir, sizeof g_dir, "%s/wg", tmpl);

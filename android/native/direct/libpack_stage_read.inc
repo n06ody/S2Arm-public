@@ -235,13 +235,14 @@ int s2a_libpack_binary_program(struct s2a_libpack* lp, const uint8_t keys[6][8],
         rc = lp_fail(why, cap, "binary compute shared memory exceeds device limit");
         goto done;
       }
-      if (sb_u32(p + 36) != 1 || sb_u32(p + 40) != 1 || sb_u32(p + 44) != 0 ||
+      if (sb_u32(p + 36) != 1 || sb_u32(p + 40) != 1 || sb_u32(p + 44) > 1 ||
           sb_u32(p + 48) != 0) {
         rc = lp_fail(why, cap, "invalid binary compute alignment or read facts");
         goto done;
       }
       cp->support_reads_unknown = 1;
       cp->c0_reads_unknown = 1;
+      cp->has_unaligned_storage_buffer = (int)sb_u32(p + 44);
       cp->support_bytes = sb_u32(p + 12);
       for (unsigned j = 0; j < 2; j++) {
         const uint8_t* d = p + 52 + 16 * j;
