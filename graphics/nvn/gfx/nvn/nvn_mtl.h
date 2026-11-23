@@ -55,7 +55,7 @@ int nvn_be_xq_owed_wait(const void *sync, uint64_t ns);         // 等欠着的�
 void nvn_be_xq_wait_queue(void *q, void *owner);                // QueueWaitSync(q, 欠在 owner 上的栅栏)：q 之后的提交排在 owner 停住的工作后面
 
 uint64_t nvn_be_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
-int nvn_be_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout
+int nvn_be_wait(uint64_t fence, uint64_t timeout_ns);   // 1 = reached, 0 = timeout, -1 = failed
 void nvn_be_finish(void);                               // Wait for all submitted commands to complete
 uint64_t nvn_be_finish_publish(void);                   // nvnQueueFinish under the submit lock: flush this thread's upload batch, return the fence to wait for
 void nvn_be_finish_wait(uint64_t fence);                // ... then, without the lock: wait for that fence and the pending uploads

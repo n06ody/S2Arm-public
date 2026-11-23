@@ -34,9 +34,8 @@ struct s2a_libpack;   // 不透明句柄（lp_pack 本体在 .c 里，句柄由 
 int s2a_libpack_open(struct s2a_libpack **out, const char *dir);
 void s2a_libpack_close(struct s2a_libpack *lp);
 
-// 单段读取：键 + 种类 → malloc 的字节副本（对齐安全，调用方 free）。POSIX 段：分片按页对齐
-//   mmap 这一段、memcpy 出来、munmap——不像 Apple 段那样常驻映射（每段一份拷贝随取随放，
-//   SPIR-V 建 module / json 解析都要求字节对齐，且安卓侧段小）。
+// 单段读取：键 + 种类 → malloc 的字节副本（调用方 free）。每次核分片大小，按记录偏移 pread。
+// 同一容器按分片缓存有限个描述符，容器关闭时释放。并发读共享描述符，各自使用独立的偏移。
 // 返回 0 hit / 1 miss（键或种类不在）/ -1 reject（容器/分片/越界坏）。
 int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned kind,
                     uint8_t **bytes, size_t *len, char *why, size_t why_size);
@@ -51,11 +50,21 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
 /* 片元 .spv 的输出映射（同现编结果 info.fragmentOutputMap：每个颜色目标 4 位，第 c 分量 = 位 4×location + c）。
  * 0 = 推出；-1 = 读不懂（数组输出、location ≥ 8 等），调用方不出这一项（消费端按全写）。 */
 int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map);
-// 几何程序（stages 0x7 = vs|fs|gs）要的两样绘制事实；vs+fs 程序不读，可传 NULL（传 NULL 时几何程序 miss）。
+// 图形库的绘制和设备事实。旧版 VS+FS 对齐程序可传 NULL，几何与对齐补偿变体需要相应事实。
 //   topology：绘制图元名，与现编请求 graphicsState.topology 同源（nvk_input_topology：Points / Lines / Triangles / …Adjacency）；
 //   profile_json：本局 effective profile（s2a_direct_compile_context.profile_json），取 capabilities.supportsGeometryShader，
 //   与现编 profile.Caps.SupportsGeometryShader 同一判据：没开 = miss。
-struct s2a_libpack_gfx { const char *topology; const char *profile_json; size_t profile_bytes; };
+struct s2a_libpack_gfx {
+    const char *topology;
+    const char *profile_json;
+    size_t profile_bytes;
+    uint32_t storage_alignment;
+    int require_ssbo_window;
+    int *window_used;   // 非 NULL：任一阶段真应用了窗口掩码（合同 mode = MASK）时置 1（只写不读；调用方据此判断「程序用到窗口补偿」）
+    // 诊断：非对齐（require_ssbo_window）时只让片元贴图声明类别命中这个位集的程序走库，其余按 MISS 退现编（0 = 不限；非片元模块不受限）。
+    //   类别：1 = 阴影（深度数组采样器 / 带深度比较的采样），2 = 3D，4 = Cube，8 = 以上都不是（普通 2D 等）。只用于二分取库问题。
+    uint32_t window_tex_classes;
+};
 int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile_bytes);
 /* 能力核（见 .c）：删掉模块用不上的 Float64 / Int64 能力声明（本后端设备从不启用 shaderFloat64 / shaderInt64），
  * 真用到 64 位浮点 / 整型或声明 Int64Atomics 就拒。0 = 可用（*n 可能变小）；-1 = 拒，why 以具名原因开头
@@ -69,13 +78,36 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
 // 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1/v2（malloc，调用方 free），
 //   按 nvn_vk_program_parse_compute 的合同合成：绑定号 = arg_id×6+5、每条 count 1、storage 带 cbSlot/cbOffset
 //   出处与 rw、c0 驱动常量段挂 slot 0；c0Reads / supportReads 写 null（_b.json 给不出，解析器认可的「未知」），
-//   hasUnalignedStorageBuffer 写 false（批翻链按缺省 false 翻）。返回码与计数口径同 program_v1。
+//   hasUnalignedStorageBuffer：带窗口合同且掩码已固化的库段写 true，旧库写 false。返回码与计数口径同 program_v1。
+//   gfx（可空）：只用 storage_alignment / profile_json / require_ssbo_window——非对齐基址（require_ssbo_window）只放行带窗口合同的库段，
+//     且含用户常量缓冲来源存储（sbuf_ubo / ubo_ptr）的程序不放行；传 NULL = 按对齐基址取。
 //   shared_limit = 本设备 maxComputeSharedMemorySize：_b.json 带 spill 标记（批翻链 MSL 侧 32K 阈值溢出事实）
 //   时核 _b.spv 的 Workgroup 字节数，超出的程序出库即拒（其 .spv 未做溢出改写，建不出计算管线）。
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
+
+struct fd_program;
+struct nvn_vk_compute_program;
+// Diagnostic lookup excluded from logical hit/miss/reject totals.
+int s2a_libpack_shadow_json(const struct s2a_libpack *lp, const uint8_t keys[6][8], uint32_t stages,
+                            const struct s2a_libpack_gfx *gfx, uint32_t abi, const char *profile,
+                            const char *closure, uint32_t shared, uint8_t **out, size_t *len, char *why, size_t cap);
+int s2a_libpack_is_binary(const struct s2a_libpack *lp);
+// Compare the chain and producer fingerprint before interpreting paired timings.
+int s2a_libpack_same_producer(const struct s2a_libpack *a, const struct s2a_libpack *b);
+int s2a_libpack_binary_program(struct s2a_libpack *lp,const uint8_t keys[6][8],uint32_t stages,
+                               const struct s2a_libpack_gfx *gfx,uint32_t shared_limit,
+                               struct fd_program *gp,struct nvn_vk_compute_program *cp,char *why,size_t cap);
+
+#ifdef S2A_LIBPACK_PACKER
+// Host packer and fixtures only. Each result owns its encoded stage bytes.
+int s2a_pack_stage(const uint8_t key[8], unsigned stage, int topology, uint64_t fingerprint,
+                   const uint8_t *json, size_t json_size, const uint8_t *spirv, size_t spirv_size,
+                   uint8_t **record, size_t *record_size);
+void s2a_pack_stage_free(void *record);
+#endif
 
 uint64_t s2a_libpack_hits(void);
 uint64_t s2a_libpack_misses(void);

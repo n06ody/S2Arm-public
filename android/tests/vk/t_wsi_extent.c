@@ -5,9 +5,12 @@
 // Android compositor orientation. Invalid requests are intercepted strictly,
 // never made acceptable by relaxing real-driver requirements.
 #include "nvn_backend.h"
+#include "nvn_vk_pipe_warm.h"
+#include <stdatomic.h>
 #include "vk_device.h"
 #include "nvn_plat_vk.h"
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,7 +19,22 @@ static unsigned cases, failures, creates, presented, window_queries;
 static VkExtent2D current, minimum, maximum, window, last_extent;
 static VkSurfaceTransformFlagBitsKHR transform, last_transform;
 static VkSurfaceTransformFlagsKHR supported;
-static int suboptimal;
+static int suboptimal, idle_test, compute_warm;
+static _Atomic int boot_offset;
+static _Thread_local uint32_t last_alloc_type;
+extern __typeof__(clock_gettime) __real_clock_gettime;
+int __wrap_clock_gettime(clockid_t id, struct timespec *ts) {
+    int rc = __real_clock_gettime(id, ts);
+    if (!rc && id == CLOCK_BOOTTIME) ts->tv_sec += atomic_load(&boot_offset);
+    return rc;
+}
+extern __typeof__(vkAllocateMemory) __real_vkAllocateMemory;
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkAllocateMemory(VkDevice d, const VkMemoryAllocateInfo *a,
+        const VkAllocationCallbacks *cb, VkDeviceMemory *out) {
+    VkResult r = __real_vkAllocateMemory(d, a, cb, out);
+    if (r == VK_SUCCESS) last_alloc_type = a->memoryTypeIndex;
+    return r;
+}
 static nvn_gpu_view source;
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "fixture failure line %d: %s (%s)\n", __LINE__, #x, error.why); exit(2); } } while (0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
@@ -39,6 +57,8 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) {
 }
 void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *name, int dflt) {
+    if (idle_test && !strcmp(name, "nvk_compute_warm")) return compute_warm;
+    if (!strcmp(name, "nvk_gpu_idle")) return idle_test;
     if (!strcmp(name, "nvk_pipe_cache")) return 0;
     return dflt;
 }
@@ -157,7 +177,42 @@ static void zero_then_restore(int undefined) {
     GPU(nvn_gpu_surface_detach(s, 5000000000ull, &error));
     result(undefined ? "zero-window-restore" : "zero-restore", bad, 0, rebuilt);
 }
-int main(void) {
+static nvn_gpu_shader idle_shader(const char *path, nvn_gpu_stage stage) {
+    FILE *f = fopen(path, "rb");
+    REQUIRE(f && !fseek(f, 0, SEEK_END));
+    long n = ftell(f); REQUIRE(n > 0); rewind(f);
+    void *code = malloc((size_t)n);
+    REQUIRE(code && fread(code, 1, (size_t)n, f) == (size_t)n);
+    fclose(f);
+    nvn_gpu_shader_src src = {.stage = stage, .entry = "main", .kind = NVN_GPU_BLOB_SPIRV, .bytes = (size_t)n, .blob = code};
+    memset(src.key, (int)stage + 1, sizeof src.key);
+    nvn_gpu_shader sh = NULL;
+    GPU(nvn_gpu_shader_load(&src, &sh, &error));
+    free(code);
+    return sh;
+}
+static void idle_residents(char **paths) {
+    nvn_gpu_pipe_desc pd = {0};
+    pd.prim = 4; pd.samples = 1; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+    pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.color.logic_op = 3; pd.chmask.mask = 15;
+    pd.st[NVN_GPU_SH_VS].sh = idle_shader(paths[0], NVN_GPU_SH_VS);
+    pd.st[NVN_GPU_SH_FS].sh = idle_shader(paths[1], NVN_GPU_SH_FS);
+    nvn_gpu_stage_desc cs = {.sh = idle_shader(paths[2], NVN_GPU_SH_CS)};
+    nvn_gpu_pipe p, q;
+    GPU(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &p, &error)); // uncached but retained
+    compute_warm = 1;
+    nvn_gpu_pipe_warm_scope(1);
+    GPU(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &p, &error));
+    GPU(nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &q, &error)); REQUIRE(p == q);
+    GPU(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &p, &error));
+    GPU(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &q, &error)); REQUIRE(p == q);
+    nvn_gpu_pipe_warm_scope(0);
+    nvn_gpu_shader_release(cs.sh);
+    nvn_gpu_shader_release(pd.st[NVN_GPU_SH_VS].sh);
+    nvn_gpu_shader_release(pd.st[NVN_GPU_SH_FS].sh);
+}
+int main(int argc, char **argv) {
+    idle_test = argc == 5 && !strcmp(argv[1], "--gpu-idle");
     struct s2a_vk_device device = {0}; char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&device, why, sizeof why));
     nvn_gpu_open_desc desc = {0}; desc.host_device = &device; desc.app_label = "wsi-extent-test";
@@ -172,6 +227,46 @@ int main(void) {
     nvn_gpu_tex_upload(cmd, tex, 0, 0, NULL, pixels, 64 * 4, sizeof pixels);
     GPU(nvn_gpu_cmd_commit(cmd, 1, done, NULL, &error));
     GPU(nvn_gpu_fence_wait(1, 5000000000ull, &error));
+
+    if (idle_test) {
+        idle_residents(argv + 2);
+        const struct nvn_gpu_idle_observer *o = nvn_gpu_idle_observer(); REQUIRE(o);
+        nvn_gpu_buf buf = NULL;
+        GPU(nvn_gpu_buf_create(64, NVN_GPU_MEM_SHARED, pixels, &buf, &error));
+        int cached = !!(device.memory.memoryTypes[last_alloc_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        fprintf(stderr, "mapped fixture cache=%s\n", cached ? "cached" : "uncached");
+        uint8_t copy[24];
+        const uint8_t *mapped = nvn_gpu_buf_cpu(buf);
+        uint64_t begin = o->clock_ns();
+        memcpy(copy, mapped + 1, sizeof copy);
+        o->note(NVN_IDLE_READ_TEXELS, buf, mapped + 1, sizeof copy, o->clock_ns() - begin);
+        REQUIRE(!memcmp(pixels + 1, copy, sizeof copy));
+        begin = o->clock_ns();
+        memcpy(copy, mapped + 2, 11);
+        o->note(NVN_IDLE_LAND, NULL, mapped + 2, 11, o->clock_ns() - begin); // separate staged source
+        REQUIRE(!memcmp(pixels + 2, copy, 11));
+        nvn_gpu_buf_release(buf, NULL, NULL);
+        atomic_store(&boot_offset, 61);
+        // guest upload, guest, present, guest. The last gap is after the present.
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &error));
+        GPU(nvn_gpu_cmd_commit(cmd, 2, done, NULL, &error));
+        reset(0);
+        nvn_gpu_surface surface = attach(320, 180);
+        nvn_gpu_drawable drawable = {0};
+        GPU(nvn_gpu_drawable_acquire(surface, 5000000000ull, NULL, &drawable, &error));
+        nvn_gpu_present_desc p = {0}; p.src = source; p.filter = 1;
+        GPU(nvn_gpu_present(surface, &drawable, &p, 1, NULL, NULL, &error));
+        GPU(nvn_gpu_surface_detach(surface, 5000000000ull, &error));
+        struct timespec delay = {5, 100000000};
+        nanosleep(&delay, NULL);
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &error));
+        GPU(nvn_gpu_cmd_commit(cmd, 3, done, NULL, &error));
+        GPU(nvn_gpu_fence_wait_at(3, 5000000000ull, &error, NVN_GPU_WAIT_SYNC));
+        nvn_gpu_view_release(source); nvn_gpu_tex_release(tex);
+        GPU(nvn_gpu_close(5000000000ull, &error));
+        REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        return 0;
+    }
 
     reset(0); window = (VkExtent2D){640, 360}; unsigned queries = window_queries;
     nvn_gpu_surface s = attach(320, 180); window = (VkExtent2D){800, 450};
