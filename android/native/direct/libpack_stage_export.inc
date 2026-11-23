@@ -134,7 +134,7 @@ int s2a_pack_stage(const uint8_t key[8], unsigned nvn, int topo, uint64_t finger
     const struct jw empty = {0};
     sb_export_parse(c, nvn, strict ? 2 : 1, support, &stages, &binds, strict ? &extra : &empty);
   }
-  size_t sizes[] = {SB_META_SIZE, sb_choice_size(choice), sb_choice_size(choice + 1), sn};
+  size_t sizes[] = {contract.window.mode ? SB_META_WINDOW_SIZE : SB_META_SIZE, sb_choice_size(choice), sb_choice_size(choice + 1), sn};
   size_t off = SB_HEADER + SB_SECTIONS * SB_SECTION, offsets[SB_SECTIONS];
   for (unsigned i = 0; i < SB_SECTIONS; i++) {
     off = (off + 3) & ~(size_t)3;
@@ -145,7 +145,7 @@ int s2a_pack_stage(const uint8_t key[8], unsigned nvn, int topo, uint64_t finger
   if (!record)
     goto done;
   memcpy(record, "S2SB", 4);
-  sb_w32(record + 4, 1);
+  sb_w32(record + 4, contract.window.mode ? 2 : 1);
   sb_w32(record + 8, SB_HEADER);
   sb_w32(record + 16, SB_SECTIONS);
   sb_w32(record + 20, SB_HEADER);
@@ -178,6 +178,10 @@ int s2a_pack_stage(const uint8_t key[8], unsigned nvn, int topo, uint64_t finger
     }
   }
   sb_w64(m + 32, shared);
+  if (contract.window.mode) {
+    sb_w32(m + SB_META_SIZE, contract.window.mode);
+    sb_w32(m + SB_META_SIZE + 4, contract.window.id);
+  }
   sb_choice_write(record + offsets[1], choice, nvn);
   sb_choice_write(record + offsets[2], choice + 1, nvn);
   memcpy(record + offsets[3], spv, sn);

@@ -84,7 +84,13 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
 
 struct fd_program;
 struct nvn_vk_compute_program;
+// Diagnostic lookup excluded from logical hit/miss/reject totals.
+int s2a_libpack_shadow_json(const struct s2a_libpack *lp, const uint8_t keys[6][8], uint32_t stages,
+                            const struct s2a_libpack_gfx *gfx, uint32_t abi, const char *profile,
+                            const char *closure, uint32_t shared, uint8_t **out, size_t *len, char *why, size_t cap);
 int s2a_libpack_is_binary(const struct s2a_libpack *lp);
+// Compare the chain and producer fingerprint before interpreting paired timings.
+int s2a_libpack_same_producer(const struct s2a_libpack *a, const struct s2a_libpack *b);
 int s2a_libpack_binary_program(struct s2a_libpack *lp,const uint8_t keys[6][8],uint32_t stages,
                                const struct s2a_libpack_gfx *gfx,uint32_t shared_limit,
                                struct fd_program *gp,struct nvn_vk_compute_program *cp,char *why,size_t cap);

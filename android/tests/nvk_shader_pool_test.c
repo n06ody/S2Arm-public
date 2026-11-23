@@ -114,6 +114,7 @@ void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_pair_timing")) return getenv("S2A_TEST_PAIR_ON") != NULL;
     if (!strcmp(name, "nvk_libpack_timing")) return getenv("S2SB_QA_TIMING") != NULL;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
@@ -130,7 +131,7 @@ static int link_map_lines; static char last_link_map[700];   // 配对接口表�
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
 void nvn_plat_log(int level, const char *cls, const char *text) {
-    if (!strncmp(text, "S2SB_", 5)) puts(text);
+    if (!strncmp(text, "S2SB_", 5) || !strncmp(text, "S2A_LIBPAIR ", 12)) puts(text);
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
@@ -1750,6 +1751,8 @@ static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
     int interface_mismatch = 0;
 #ifdef S2A_LIBPACK_PACKER
     const char *binary_mode=getenv("S2A_TEST_BINARY_STAGE");
+    const int pair_graphics = getenv("S2A_TEST_PAIR_GRAPHICS") != NULL;
+    char paired_dir[600] = "", pair_parent[400] = "";
     if(binary_mode) {
         interface_mismatch=!strcmp(binary_mode,"missing-varying");
         // Only the input declaration matters to the host link checker. GS declares no user output.
@@ -1779,7 +1782,14 @@ static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
             contents[count]=record[count];
             count++;
         }
-        CHECK(count==4 && !lp_write(dir,stage_keys,stage_kind,contents,record_size,(int)count),"binary GS container written");
+        if (pair_graphics) {
+            CHECK(!lp_write(dir, keys, kinds, data, lens, 8), "write graphics JSON for paired lookup");
+            snprintf(pair_parent,sizeof pair_parent,"%s/shaders/direct/qa-s2sb",root);
+            snprintf(paired_dir,sizeof paired_dir,"%s/b-%s-vk",pair_parent,DMSH_CHAIN);
+            CHECK(!mkdir(pair_parent,0700) && !mkdir(paired_dir,0700), "create graphics paired directory");
+            setenv("S2A_TEST_PAIR_ON","1",1);
+        }
+        CHECK(count==4 && !lp_write(pair_graphics ? paired_dir : dir,stage_keys,stage_kind,contents,record_size,(int)count),"binary GS container written");
         for(unsigned i=0;i<count;i++) s2a_pack_stage_free(record[i]);
     } else
 #endif
@@ -1827,6 +1837,9 @@ static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
         CHECK(gs_blob_bytes[NVN_GPU_SH_VS] == sizeof spv0 && gs_blob_bytes[NVN_GPU_SH_FS] == 0, "libpack VS-only: the vertex stage is the library's");
         rp_S.bser[1] = fs_serial; rp_S.bser[2] = gs_serial;
     }
+    // The missing-varying corpus has already proved that both GS topologies fall back and
+    // VS-only still hits. Its fragment cannot satisfy the linked-program window scenarios below.
+    if (interface_mismatch) goto cleanup_gs;
     snprintf(external_profile, sizeof external_profile, "%s", prof_on);
     // shape 0 = 顶点 + 片元 + 几何（只核准入）；shape 1 = 顶点 + 片元（还核预热：清单落盘读回后预热线程按记下的状态取库）
     for (int shape = 0; shape <= 1; ++shape) {
@@ -1897,6 +1910,14 @@ static int gs_libpack_test(int diagnose_refusals, int ssbo_window) {
         unlink(f2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders/direct", root2); rmdir(d2); snprintf(d2, sizeof d2, "%s/shaders", root2); rmdir(d2); rmdir(root2);
     }
 cleanup_gs:
+#ifdef S2A_LIBPACK_PACKER
+    if (pair_graphics) {
+        char file[660];
+        snprintf(file,sizeof file,"%s/lib.idx",paired_dir); unlink(file);
+        snprintf(file,sizeof file,"%s/lib.000.pak",paired_dir); unlink(file);
+        rmdir(paired_dir); rmdir(pair_parent); unsetenv("S2A_TEST_PAIR_ON");
+    }
+#endif
     fake_gs_success = 0; external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
@@ -1959,6 +1980,8 @@ static int cs_libpack_test(void) {
     size_t cn[2] = { strlen(csjson), sizeof csspv };
 #ifdef S2A_LIBPACK_PACKER
     const char *binary_mode = getenv("S2A_TEST_BINARY_STAGE");
+    const char *pair_case = getenv("S2A_TEST_PAIR_CASE");
+    char companion[600] = "", parent[400] = "";
     int corrupt = binary_mode && !strcmp(binary_mode,"bad-version");
     if (binary_mode) {
         uint8_t *record = NULL;
@@ -1972,7 +1995,23 @@ static int cs_libpack_test(void) {
         const uint8_t kinds[3] = {1,52,128};
         const uint8_t *data[3] = {cd[0],cd[1],record};
         size_t lengths[3] = {cn[0],cn[1],record_len};
-        CHECK(!lp_write(dir,keys,kinds,data,lengths,3),"write dual-format CS test container");
+        if (pair_case) {
+            if (!strcmp(pair_case, "bad-json")) csjson[0] = '!';
+            CHECK(!lp_write(dir,ck,ckind,cd,cn,2), "write legacy companion");
+            if (!strcmp(pair_case, "other-producer")) {
+                char index[640];
+                snprintf(index, sizeof index, "%s/lib.idx", dir);
+                FILE *f = fopen(index, "r+b");
+                CHECK(f && !fseek(f, 36, SEEK_SET) && fputc(1, f) == 1, "set distinct legacy producer");
+                if (f) fclose(f);
+            }
+            snprintf(parent,sizeof parent,"%s/shaders/direct/qa-s2sb",root);
+            snprintf(companion,sizeof companion,"%s/b-%s-vk",parent,DMSH_CHAIN);
+            CHECK(!mkdir(parent,0700) && !mkdir(companion,0700), "create paired stage directory");
+            CHECK(!lp_write(companion,keys+2,kinds+2,data+2,lengths+2,1), "write paired S2SB shard");
+        } else {
+            CHECK(!lp_write(dir,keys,kinds,data,lengths,3),"write dual-format CS test container");
+        }
         s2a_pack_stage_free(record);
     } else
 #endif
@@ -1980,6 +2019,21 @@ static int cs_libpack_test(void) {
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
     const struct rp_prog *p = NULL;
 #ifdef S2A_LIBPACK_PACKER
+    if (pair_case) {
+        int enabled = getenv("S2A_TEST_PAIR_ON") != NULL;
+        for (int i=1;i<=2;i++) {
+            rp_shader_reset(); p = NULL;
+            CHECK(!rp_shader_resolve_compute(&p) && p, "paired fixture creates a compute program");
+            CHECK(cs_loads == i, "exactly one GPU module load per real request; JSON shadow must not load one");
+            CHECK(compiler_calls == ((enabled && corrupt) ? i : 0), "only actual S2SB failure selects live compile");
+            CHECK(p && !!p->lib_sourced == !(enabled && corrupt), "actual source follows S2SB, shadow has no vote");
+        }
+        char path[640];
+        snprintf(path,sizeof path,"%s/lib.idx",companion); unlink(path);
+        snprintf(path,sizeof path,"%s/lib.000.pak",companion); unlink(path);
+        rmdir(companion); rmdir(parent);
+        goto cs_cleanup;
+    }
     if (corrupt) {
         CHECK(!rp_shader_resolve_compute(&p) && p && compiler_calls==1 && !p->lib_sourced,
               "damaged binary selects live compilation even with a working legacy pair");

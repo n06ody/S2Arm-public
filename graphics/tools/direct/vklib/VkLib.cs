@@ -104,6 +104,13 @@ namespace S2A.DshVkLib
     {
         static int Main(string[] args)
         {
+            if (args.Length == 3 && args[0] == "--repack-s2sb") {
+                try { Console.WriteLine(Repack.FromLegacy(args[1], args[2])); return 0; }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or OverflowException or
+                                            System.Text.Json.JsonException or ArgumentException) {
+                    Console.Error.WriteLine(ex.Message); return 1;
+                }
+            }
             if (args.Length == 1 && args[0] == "--fp") { Console.WriteLine(VkLib.Fp); return 0; }
             var a = new Dictionary<string, string>();
             for (int i = 0; i + 1 < args.Length; i += 2) a[args[i]] = args[i + 1];

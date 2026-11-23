@@ -13,6 +13,9 @@ struct sb_view {
 int s2a_libpack_is_binary(const struct s2a_libpack* lp) {
   return lp && lp->p.idx && sb_u32(lp->p.idx + 44) != 0;
 }
+int s2a_libpack_same_producer(const struct s2a_libpack *a, const struct s2a_libpack *b) {
+  return a && b && a->p.idx && b->p.idx && !memcmp(a->p.idx + 24, b->p.idx + 24, 20);
+}
 static int sb_view_open(struct s2a_libpack* lp, const uint8_t key[8], unsigned stage, int topology,
                         struct sb_view* v, char* why, size_t cap) {
   unsigned kind = stage == 2 ? 129u + (unsigned)topology : 128u;
@@ -26,7 +29,7 @@ static int sb_view_open(struct s2a_libpack* lp, const uint8_t key[8], unsigned s
     return rc;
   }
   uint8_t* p = v->allocation;
-  if (n < SB_HEADER + SB_SECTION * SB_SECTIONS || memcmp(p, "S2SB", 4) || sb_u32(p + 4) != 1)
+  if (n < SB_HEADER + SB_SECTION * SB_SECTIONS || memcmp(p, "S2SB", 4) || (sb_u32(p + 4) != 1 && sb_u32(p + 4) != 2))
     return lp_fail(why, cap, "binary stage magic or version mismatch");
   if (sb_u32(p + 8) != SB_HEADER || sb_u32(p + 12) || sb_u32(p + 16) != SB_SECTIONS ||
       sb_u32(p + 20) != SB_HEADER || sb_u64(p + 24) != n)
@@ -54,7 +57,7 @@ static int sb_view_open(struct s2a_libpack* lp, const uint8_t key[8], unsigned s
   }
   const uint8_t* m = v->section[0];
   v->stage = stage;
-  if (end != n || v->size[0] != SB_META_SIZE || v->size[1] < SB_CHOICE || v->size[2] < SB_CHOICE ||
+  if (end != n || v->size[0] != (sb_u32(p + 4) == 2 ? SB_META_WINDOW_SIZE : SB_META_SIZE) || v->size[1] < SB_CHOICE || v->size[2] < SB_CHOICE ||
       v->size[3] < 20 || (v->size[3] & 3) || v->size[3] > NVK_PROGRAM_RESULT_MAX_BYTES)
     return lp_fail(why, cap, "invalid binary stage section sizes");
   if (memcmp(m, key, 8) || memcmp(m + 8, lp->p.idx + 36, 8) || sb_u32(m + 16) != stage ||
@@ -153,10 +156,21 @@ static int sb_rows(struct sb_view* v, unsigned begin, unsigned end, struct fd_bi
   }
   return 0;
 }
-static int sb_stage_take(struct sb_view* v, struct fd_stage* st, int geometry, char* why,
+static int sb_stage_take(struct sb_view* v, struct fd_stage* st, int geometry, const struct s2a_libpack_gfx *gfx, char* why,
                          size_t cap) {
   uint8_t* spv = v->section[3];
   size_t n = v->size[3];
+  struct lp_window window = {0};
+  if (v->size[0] == SB_META_WINDOW_SIZE) {
+    const uint8_t *ext = v->section[0] + SB_META_SIZE;
+    window.mode = sb_u32(ext);
+    window.id = sb_u32(ext + 4);
+    if (v->stage == 5 || !window.mode) return lp_fail(why, cap, "invalid binary window metadata");
+  }
+  if (v->stage != 5) {
+    int rc = lp_window_apply(window, gfx, spv, n, why, cap);
+    if (rc) return rc;
+  }
   if (s2a_libpack_spv_admit_caps(spv, &n, why, cap))
     return -1;
   if (geometry && lp_spv_viewport_builtin(spv, n))
@@ -246,7 +260,7 @@ int s2a_libpack_binary_program(struct s2a_libpack* lp, const uint8_t keys[6][8],
         goto done;
     }
   for (unsigned i = 0; i < n; i++) {
-    rc = sb_stage_take(&v[i], cs ? &cp->stage : &gp->stage[i], stages == 7, why, cap);
+    rc = sb_stage_take(&v[i], cs ? &cp->stage : &gp->stage[i], stages == 7, gfx, why, cap);
     if (rc)
       goto done;
   }

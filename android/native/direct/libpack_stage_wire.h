@@ -20,6 +20,7 @@ enum {
   SB_DATA,
   SB_SECTIONS = 4,
   SB_META_SIZE = 64,
+  SB_META_WINDOW_SIZE = SB_META_SIZE + 8,  // S2SB/2 appends the SSBO window mode and SPIR-V id.
   SB_CHOICE = 96,
   SB_BINDING = 104
 };

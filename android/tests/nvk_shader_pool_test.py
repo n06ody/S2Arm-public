@@ -83,6 +83,51 @@ def main():
                 return result.returncode
         return 0
 
+    if sys.argv[1:] == ['--pair-libpack']:
+        result = run('pair-stages', original, args=('--cs-libpack',),
+                     extra_flags=['-DS2A_LIBPACK_PACKER', '-DS2A_ANDROID_DEBUG_ENV=1'])
+        if result.returncode:
+            sys.stderr.write(result.stdout + result.stderr)
+            return result.returncode
+        for case, binary, enabled in [('valid', 'valid', True), ('valid', 'bad-version', True),
+                                      ('bad-json', 'valid', True), ('other-producer', 'valid', True),
+                                      ('valid', 'bad-version', False)]:
+            env = dict(os.environ, S2A_TEST_PAIR_CASE=case, S2A_TEST_BINARY_STAGE=binary)
+            if enabled:
+                env['S2A_TEST_PAIR_ON'] = '1'
+            else:
+                env.pop('S2A_TEST_PAIR_ON', None)
+            result = subprocess.run([str(out/'pair-stages'), '--cs-libpack'], env=env,
+                                    text=True, capture_output=True, timeout=30)
+            sys.stdout.write(result.stdout)
+            if result.returncode:
+                sys.stderr.write(result.stderr)
+                return result.returncode
+            rows = [dict(field.split('=', 1) for field in line.split()[1:])
+                    for line in result.stdout.splitlines() if line.startswith('S2A_LIBPAIR ')]
+            if len(rows) != (2 if enabled else 0):
+                raise AssertionError(f'{case}/{binary}: expected paired events, got {rows}')
+            for i, row in enumerate(rows):
+                assert row['first'] == ('json', 's2sb')[i] and row['id'] == rows[0]['id']
+                assert row['role'] == 'fg' and row['st'] == '32'
+                assert int(row['same_source']) == (case != 'other-producer')
+                assert (int(row['json_rc']) == 0) == (case != 'bad-json')
+                assert (int(row['s2sb_rc']) == 0) == (binary == 'valid')
+                assert int(row['end']) - int(row['start']) == int(row['json_us']) + int(row['s2sb_us'])
+        graphics = subprocess.run([str(out/'pair-stages'), '--gs-libpack-ssbo'],
+                                  env=dict(os.environ, S2A_TEST_PAIR_GRAPHICS='1', S2A_TEST_BINARY_STAGE='valid'),
+                                  text=True, capture_output=True, timeout=30)
+        sys.stdout.write(graphics.stdout)
+        if graphics.returncode:
+            sys.stderr.write(graphics.stderr)
+            return graphics.returncode
+        rows = [dict(field.split('=', 1) for field in line.split()[1:])
+                for line in graphics.stdout.splitlines() if line.startswith('S2A_LIBPAIR ')]
+        hits = {(r['role'], r['st']) for r in rows
+                if r['same_source'] == '1' and r['json_rc'] == '0' and r['s2sb_rc'] == '0'}
+        assert {('fg', '1'), ('fg', '3'), ('fg', '7'), ('warm', '3')} <= hits, hits
+        return 0
+
     if sys.argv[1:] == ['--binary-libpack']:
         first = run('binary-stages', original, args=('--cs-libpack',), extra_flags=['-DS2A_LIBPACK_PACKER'],
                     env=dict(os.environ, S2A_TEST_BINARY_STAGE='valid'))
@@ -91,7 +136,7 @@ def main():
         if first.returncode:
             return first.returncode
         for mode, case in (('--cs-libpack', 'bad-version'), ('--gs-libpack', 'valid'),
-                           ('--gs-libpack', 'missing-varying')):
+                           ('--gs-libpack', 'missing-varying'), ('--gs-libpack-ssbo', 'valid')):
             subprocess.run([str(out/'binary-stages'), mode], check=True, timeout=30,
                            env=dict(os.environ, S2A_TEST_BINARY_STAGE=case))
         return 0

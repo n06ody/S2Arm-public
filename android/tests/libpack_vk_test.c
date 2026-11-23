@@ -403,6 +403,29 @@ static int window_program(const struct s2a_libpack_gfx *gfx, uint8_t **j, size_t
     *j = NULL; *jl = 0;
     int rc = s2a_libpack_program_v1(lp, keys, 0x3, gfx, 1, "h", "c", j, jl, why, why_size);
     s2a_libpack_close(lp);
+#ifdef S2A_LIBPACK_PACKER
+    uint8_t *records[2] = {0};
+    size_t sizes[2] = {0};
+    struct trec binary[2] = { { .key = r[0].key, .kind = 128 }, { .key = r[2].key, .kind = 128 } };
+    for (unsigned i = 0; i < 2; i++) {
+        CHECK(!s2a_pack_stage(keys[i], i, -1, 0, p[2*i], n[2*i], p[2*i+1], n[2*i+1],
+                              &records[i], &sizes[i]), "encode real window variant");
+        binary[i].len = (uint32_t)sizes[i];
+    }
+    const uint8_t *payloads[] = { records[0], records[1] };
+    lp = NULL;
+    if (records[0] && records[1] && !mk_pack_at(g_dir, 1, binary, 2, payloads, sizes, 1) &&
+        s2a_libpack_open(&lp, g_dir) == 1) {
+        struct fd_program output = {0};
+        char reason[160] = "";
+        int got = s2a_libpack_binary_program(lp, keys, 3, gfx, 0, &output, NULL, reason, sizeof reason);
+        CHECK(got == rc, "S2SB and JSON apply the same fixed SSBO window gate");
+        if (rc < 0) CHECK(strstr(reason, "fixed SSBO window") != NULL, "binary names the fixed SSBO window");
+        nvn_vk_program_free(&output);
+        s2a_libpack_close(lp);
+    } else CHECK(0, "open encoded window fixture");
+    free(records[0]); free(records[1]);
+#endif
     return rc;
 }
 // 把 c0 片元 SPIR-V 改成「不能证实」的几种：0 = Block 改 BufferBlock（旧式存储缓冲）、1 = Uniform 存储类改 StorageBuffer、2 = 描述符集改 1、

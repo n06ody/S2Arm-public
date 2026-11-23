@@ -1330,7 +1330,7 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
         if (orc == 1) { s2a_libpack_close(lp); lp = np; snprintf(lp_root, sizeof lp_root, "%s", root); atomic_store(&g_lp_state, LP_ST_OPEN);
             char b[1300]; snprintf(b, sizeof b, "出包预编库已打开：%s", dir); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b); }
         else {
-            lp = NULL; lp_root[0] = 0; atomic_store(&g_lp_state, orc < 0 ? LP_ST_BAD : LP_ST_MISSING);
+            s2a_libpack_close(lp); lp = NULL; lp_root[0] = 0; atomic_store(&g_lp_state, orc < 0 ? LP_ST_BAD : LP_ST_MISSING);
             if (orc < 0) { if (!lp_red++) red1("libpack_container_rejected", dir); }
             else if (strcmp(said_root, root)) {   // 不在：每个资源根只说一次（之后每次取程序都还会再试开，不重复打）
                 snprintf(said_root, sizeof said_root, "%s", root);
@@ -1345,7 +1345,7 @@ static struct s2a_libpack *libpack_for_locked(const char *root) {
 //   topology：本笔绘制的输入图元名（fill_facts 的 topology()，快照里已算好——工作线程不碰 rp_S）；几何程序按它挑离线库里同图元那份，
 //   没有来源（NULL）几何程序 miss。本局 profile 的 geometryShader 没开时 libpack 照旧 miss（与现编同一字段）
 // Private diagnostic APK. Log intervals on the same boot clock as v5 present records.
-struct stair_probe { uint64_t start, fetched; const char *format; };
+struct stair_probe { uint64_t start, fetched; const char *format, *role; };
 static _Atomic uint64_t stair_sequence;
 static uint64_t stair_us(void) {
     struct timespec t;
@@ -1356,8 +1356,8 @@ static uint64_t stair_us(void) {
 #endif
     return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
 }
-static struct stair_probe stair_begin(int attempted) {
-    struct stair_probe p = {0, 0, "none"};
+static struct stair_probe stair_begin(int attempted, const char *role) {
+    struct stair_probe p = {0, 0, "none", role};
     if (attempted && nvn_plat_flag("nvk_libpack_timing", 0)) p.start = stair_us();
     return p;
 }
@@ -1371,6 +1371,92 @@ static void stair_end(struct stair_probe *p, const char *role, const uint8_t *id
              (unsigned long long)p->start, (unsigned long long)(p->fetched ? p->fetched : end), (unsigned long long)end);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
 }
+static int fetch_binary_program(struct s2a_libpack *lp, const uint8_t keys[6][8], unsigned stages,
+                                const struct s2a_libpack_gfx *gfx, uint32_t shared, int abi,
+                                union lp_prepared **ready, char *why, size_t cap) {
+    if (!lp || !s2a_libpack_is_binary(lp)) {
+        snprintf(why, cap, "missing S2SB container");
+        return S2A_LIBPACK_MISS;
+    }
+    if (!nvn_plat_flag("nvk_binary_libpack", 1)) {
+        snprintf(why, cap, "binary stage library disabled");
+        return S2A_LIBPACK_MISS;
+    }
+    if (abi != S2A_DIRECT_ABI || !(*ready = malloc(sizeof **ready))) {
+        snprintf(why, cap, "%s", abi != S2A_DIRECT_ABI ? "binary stage session ABI mismatch" : "binary stage allocation failed");
+        return S2A_LIBPACK_REJECT;
+    }
+    int rc = s2a_libpack_binary_program(lp, keys, stages, gfx, shared,
+        stages == 32 ? NULL : &(*ready)->graphics, stages == 32 ? &(*ready)->compute : NULL, why, cap);
+    if (rc) { free(*ready); *ready = NULL; }
+    return rc;
+}
+
+#ifdef S2A_ANDROID_DEBUG_ENV
+// Caller holds g_lp_mu. Opening the companion is outside both per-program intervals.
+static struct s2a_libpack *pair_binary_for_locked(const char *root) {
+    static struct s2a_libpack *binary;
+    static char previous[1024];
+    if (binary && !strcmp(previous, root)) return binary;
+    s2a_libpack_close(binary);
+    binary = NULL;
+    char dir[1200];
+    if (snprintf(dir, sizeof dir, "%s/shaders/direct/qa-s2sb/b-%s-vk", root, DMSH_CHAIN) >= (int)sizeof dir ||
+        strlen(root) >= sizeof previous) return NULL;
+    if (s2a_libpack_open(&binary, dir) != 1) return NULL;
+    snprintf(previous, sizeof previous, "%s", root);
+    return binary;
+}
+
+static int fetch_pair(struct s2a_libpack *json, struct s2a_libpack *binary, const uint8_t keys[6][8],
+                      unsigned stages, const struct s2a_libpack_gfx *gfx, uint32_t shared,
+                      const struct s2a_direct_compile_context *pc, const uint8_t identity[32], const char *role,
+                      union lp_prepared **ready, char *why, size_t cap) {
+    static uint64_t sequence;
+    uint64_t seq = ++sequence;
+    int json_first = seq & 1;
+    uint64_t t[3];
+    int json_rc = S2A_LIBPACK_MISS, bin_rc = S2A_LIBPACK_MISS;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char shadow_why[192] = "";
+    union lp_prepared *shadow = NULL;
+    t[0] = stair_us();
+    for (unsigned i = 0; i < 2; i++) {
+        if ((i == 0) == json_first) {
+            if (json && !s2a_libpack_is_binary(json))
+                json_rc = s2a_libpack_shadow_json(json, keys, stages, gfx, pc->direct_abi, pc->profile_hash,
+                    pc->translator_closure, shared, &bytes, &len, shadow_why, sizeof shadow_why);
+            if (json_rc == S2A_LIBPACK_HIT) {
+                shadow = calloc(1, sizeof *shadow);
+                if (!shadow) json_rc = S2A_LIBPACK_REJECT;
+                else if (stages == 32)
+                    json_rc = nvn_vk_program_parse_compute(bytes, len, &shadow->compute, shadow_why, sizeof shadow_why);
+                else
+                    json_rc = nvn_vk_program_parse_graphics_stages(bytes, len, &shadow->graphics, stages == 1, shadow_why, sizeof shadow_why);
+            }
+        } else {
+            bin_rc = fetch_binary_program(binary, keys, stages, gfx, shared, pc->direct_abi, ready, why, cap);
+        }
+        t[i + 1] = stair_us();
+    }
+    if (shadow) {
+        if (stages == 32) nvn_vk_program_free_compute(&shadow->compute);
+        else nvn_vk_program_free(&shadow->graphics);
+        free(shadow);
+    }
+    free(bytes);
+    char line[384], id_hex[65];
+    for (unsigned i = 0; i < 32; i++) snprintf(id_hex + 2*i, 3, "%02x", identity[i]);
+    snprintf(line, sizeof line, "S2A_LIBPAIR seq=%llu role=%s st=%u id=%s first=%s same_source=%d json_rc=%d s2sb_rc=%d json_us=%llu s2sb_us=%llu start=%llu end=%llu",
+        (unsigned long long)seq, role, stages, id_hex, json_first ? "json" : "s2sb", s2a_libpack_same_producer(json, binary), json_rc, bin_rc,
+        (unsigned long long)(json_first ? t[1]-t[0] : t[2]-t[1]), (unsigned long long)(json_first ? t[2]-t[1] : t[1]-t[0]),
+        (unsigned long long)t[0], (unsigned long long)t[2]);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+    return bin_rc;
+}
+#endif
+
 static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], uint32_t stages, const uint8_t *ckey, int state_ok,
                          const char *topology, const struct s2a_direct_compile_context *pc, uint8_t **bytes, size_t *len, union lp_prepared **ready, struct stair_probe *probe) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
@@ -1406,8 +1492,13 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     char lw[192] = ""; int lrc = S2A_LIBPACK_MISS;
     pthread_mutex_lock(&g_lp_mu);
     if (!g_lp_bad_init) { nvn_hm_init(&g_lp_bad, 32); g_lp_bad_init = 1; }
-    struct s2a_libpack *lp = nvn_hm_get(&g_lp_bad, identity) ? NULL : libpack_for_locked(root);
-    if (lp) {
+    int blocked = nvn_hm_get(&g_lp_bad, identity) != NULL;
+    struct s2a_libpack *lp = blocked ? NULL : libpack_for_locked(root);
+    int pair = 0;
+#ifdef S2A_ANDROID_DEBUG_ENV
+    pair = !blocked && nvn_plat_flag("nvk_libpack_pair_timing", 0);
+#endif
+    if (lp || pair) {
         nvn_gpu_caps caps = {0};
         if (!ckey) nvn_gpu_caps_get(&caps);
         const struct s2a_libpack_gfx g = {
@@ -1424,20 +1515,15 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
         if (ckey && nvk_compute_profile_parse(pc, &pf, profile_why, sizeof profile_why)) {
             snprintf(lw, sizeof lw, "compute profile: %s", profile_why[0] ? profile_why : "invalid");
             lrc = S2A_LIBPACK_REJECT;
+#ifdef S2A_ANDROID_DEBUG_ENV
+        } else if (pair) {
+            probe->format = "s2sb";
+            lrc = fetch_pair(lp, pair_binary_for_locked(root), keys, ckey ? 32u : stages, &g, pf.max_shared,
+                             pc, identity, probe->role, ready, lw, sizeof lw);
+#endif
         } else if (s2a_libpack_is_binary(lp)) {
-            if (!nvn_plat_flag("nvk_binary_libpack", 1)) {
-                snprintf(lw, sizeof lw, "binary stage library disabled");
-            } else if (pc->direct_abi != S2A_DIRECT_ABI) {
-                lrc = S2A_LIBPACK_REJECT;
-                snprintf(lw, sizeof lw, "binary stage session ABI mismatch");
-            } else if (!(*ready = malloc(sizeof **ready))) {
-                lrc = S2A_LIBPACK_REJECT;
-                snprintf(lw, sizeof lw, "binary stage allocation failed");
-            } else {
-                lrc = s2a_libpack_binary_program(lp, keys, ckey ? 32u : stages, &g, pf.max_shared,
-                    ckey ? NULL : &(*ready)->graphics, ckey ? &(*ready)->compute : NULL, lw, sizeof lw);
-                if (lrc) { free(*ready); *ready = NULL; }
-            }
+            lrc = fetch_binary_program(lp, keys, ckey ? 32u : stages, &g, pf.max_shared,
+                                       pc->direct_abi, ready, lw, sizeof lw);
         } else if (ckey) {
             lrc = s2a_libpack_compute_v1(lp, ckey, (uint32_t)pc->direct_abi, pc->profile_hash,
                                          pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw);
@@ -1447,7 +1533,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
         }
     }
     pthread_mutex_unlock(&g_lp_mu);
-    if (!lp) return 0;
+    if (!lp && !pair) return 0;
     if (ckey) cs_note_set(ckey, lrc == S2A_LIBPACK_HIT ? CSN_NONE : strstr(lw, "exceeds device limit") ? CSN_SHARED :
                                 lrc == S2A_LIBPACK_MISS ? CSN_MISS : CSN_REJECT);
     if (lrc != S2A_LIBPACK_HIT) {   // 没找到 / 容器里这一键坏：前几条把原因打出来（键 = 每阶段 8 字节控制键）
@@ -1691,7 +1777,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         have_res = 1;
     }
     union lp_prepared *ready = NULL;
-    struct stair_probe probe = stair_begin(!bytes);
+    struct stair_probe probe = stair_begin(!bytes, "fg");
     if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_state, s->f.gfx.topology, &s->pc, &bytes, &len, &ready, &probe)) {
         if (probe.start) probe.fetched = stair_us();
         struct entry *le = build(bytes, len, s->views, s->nst, s->identity, 1, ready);
@@ -1826,7 +1912,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
     int lp_state = rec->lp_ok == 2 ? (rec->lp_ssbo_window ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED) : LIBPACK_OTHER_STATE;
     union lp_prepared *ready = NULL;
-    struct stair_probe probe = stair_begin(!bytes);
+    struct stair_probe probe = stair_begin(!bytes, "warm");
     if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
                                 compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, lp_state, NULL, &pc, &bytes, &len, &ready, &probe)) {
         if (probe.start) probe.fetched = stair_us();
@@ -2546,7 +2632,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
         // 出包预编库：口径同图形那条（跨局缓存之后、现编之前；同一句柄、同一张不可用表）。键 = 计算阶段 8 字节控制键 rp_S.skey[5]
         struct entry *lpe = NULL;
         union lp_prepared *ready = NULL;
-        struct stair_probe probe = stair_begin(!bytes);
+        struct stair_probe probe = stair_begin(!bytes, "fg");
         if (!bytes && libpack_fetch(rq.identity, NULL, 0, rp_S.skey[5], !unaligned, NULL, &pc, &bytes, &len, &ready, &probe)) {
             if (probe.start) probe.fetched = stair_us();
             lpe = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 1, ready);

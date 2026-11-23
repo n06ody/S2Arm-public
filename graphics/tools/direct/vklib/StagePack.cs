@@ -19,6 +19,11 @@ internal static class StagePack
     {
         byte[] json = File.ReadAllBytes(Path.Combine(directory, Path.ChangeExtension(name, ".json")));
         byte[] spv = File.ReadAllBytes(Path.Combine(directory, name));
+        return Encode(name, fingerprint, json, spv);
+    }
+
+    internal static byte[] Encode(string name, ulong fingerprint, byte[] json, byte[] spv)
+    {
         using var doc = JsonDocument.Parse(json);
         uint stage = doc.RootElement.GetProperty("stage").GetString() switch {
             "vs" => 0, "ps" => 1, "gs" => 2, "cs" => 5, _ => throw new InvalidDataException("Unsupported offline shader stage")
