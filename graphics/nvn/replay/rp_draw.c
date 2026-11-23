@@ -621,6 +621,27 @@ static int sb_window(const p_bind_buf *sb, int align_down, uint64_t *wa, uint64_
     }
     *wa = a; *wl = l; return clamped;
 }
+// 诊断（nvk_hitch_log 开时）：每个（程序身份前 4 字节, 阶段, 槽）头 2 次记一行存储缓冲窗口——游戏绑的长度（0 = 取池剩余）、窗口起点余数与长度、池剩余、被夹标志。
+//   用来看「窗口取址的库程序」每笔向回放要多大一段存储缓冲：窗口长度 × 脏页同步量。有界（共 96 行）。
+static void sb_window_note(const struct rp_prog *pg, int st, unsigned slot, const p_bind_buf *sb, uint64_t wa, uint64_t wl, int clamped) {
+    static int on = -1; static unsigned k, lines;
+    if (on < 0 || !(++k & 1023)) on = nvn_plat_flag("nvk_hitch_log", 0) != 0;
+    if (!on || lines >= 96) return;
+    static struct { uint32_t id; uint8_t st, slot, n; } seen[256]; static unsigned nseen;
+    uint32_t id; memcpy(&id, pg->identity, 4);
+    unsigned i = 0;
+    for (; i < nseen; i++) if (seen[i].id == id && seen[i].st == st && seen[i].slot == slot) break;
+    if (i == nseen) { if (nseen == 256) return; seen[nseen].id = id; seen[nseen].st = (uint8_t)st; seen[nseen].slot = (uint8_t)slot; seen[nseen].n = 0; nseen++; }
+    if (seen[i].n >= 2) return;
+    seen[i].n++; lines++;
+    const uint8_t *pm = NULL; uint64_t ps = 0, rem = 0;
+    if (rp_pool_find(sb->addr, 1, &pm, &ps)) rem = ps - (sb->addr - (uint64_t)(uintptr_t)pm);
+    char d[240];
+    snprintf(d, sizeof d, "存储缓冲窗口 程序 %02x%02x%02x%02x 阶段 %d 槽 %u：游戏绑长度 %llu%s，窗口起点余数 %llu、窗口长度 %llu，池剩余 %llu，夹 %d（第 %u 次）",
+             pg->identity[0], pg->identity[1], pg->identity[2], pg->identity[3], st, slot, (unsigned long long)sb->size, sb->size ? "" : "（0 = 取池剩余）",
+             (unsigned long long)(sb->addr - wa), (unsigned long long)wl, (unsigned long long)rem, clamped, (unsigned)seen[i].n);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", d);
+}
 // Bounded per-session first-cause detail; bytes do not split one cause into repeated messages.
 enum { ARENA_REASON_MAX = 8 };
 static struct { int rc; char why[sizeof ((nvn_gpu_err *)0)->why]; } g_arena_reasons[ARENA_REASON_MAX];
@@ -1659,7 +1680,8 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             if (e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_UBOP) continue;
             const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
             if (!sb || !sb_len(sb, e->src_kind == NVN_RB_SBUFP)) continue;
-            uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);   // 与发绑定时同一个窗口（被夹短的记账在发绑定那边）
+            uint64_t wa, wl; const int wclamp = sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl);   // 与发绑定时同一个窗口（被夹短的记账在发绑定那边）
+            if (e->src_kind == NVN_RB_SBUFP) sb_window_note(g_prog, st, e->src_reg, sb, wa, wl, wclamp);
             if (nb < SB_BATCH) { bs[nb] = st; bi[nb] = (int)i; ba[nb] = wa; bl[nb] = wl; nb++; }
             else if (rp_buf_resolve(c, wa, wl, &g_sb_buf[st][i], &g_sb_off[st][i])) g_sb_ok[st][i] = 1;   // 超出一批的照旧逐段解析
         }
