@@ -132,6 +132,39 @@ PY
   -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" \
   -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" "$android/native/direct/sha256.c"
 "$tmp/t_seed"
+# Run the actual installer first so the reader sees the same relative object links as Android.
+mkdir -p "$tmp/java" "$tmp/games" "$tmp/cache"
+"$tmp/t_seed" --emit "$tmp"
+javac -encoding UTF-8 -sourcepath "$android/app/src/main/java" -d "$tmp/java" "$android/tests/GameInstallTest.java"
+java -Djava.io.tmpdir="$tmp" -cp "$tmp/java" org.s2arm.android.GameInstallTest --install-warm-seeds \
+  "$tmp/input/rev" "$tmp/games" "$tmp/revision"
+revision="$(cat "$tmp/revision")"
+"$tmp/t_seed" --installed "$revision" "$tmp/cache" 2
+# Invalid links must never turn identical valid fixture bytes into a seed.
+python3 - "$tmp" "$revision" <<'VERIFY'
+import os, pathlib, subprocess, sys
+tmp, revision = map(pathlib.Path, sys.argv[1:])
+program, = revision.glob('shaders/direct/warm-vk/*/programs-*.bin')
+pipe = program.with_name('pipes-v1-352.bin')
+def check(programs, pipes):
+    subprocess.run([tmp/'t_seed', '--installed', revision, tmp/'cache', str(programs), str(pipes)], check=True)
+for leaf, counts in [(program, (0, 0)), (pipe, (2, 0))]:
+    original = os.readlink(leaf)
+    copy = tmp/leaf.name
+    copy.write_bytes(leaf.read_bytes())
+    for target in [os.path.relpath(copy, leaf.parent), leaf.name, str(leaf.resolve())]:
+        leaf.unlink()
+        leaf.symlink_to(target)
+        check(*counts)
+        leaf.unlink()
+        leaf.symlink_to(original)
+cohort = program.parent
+saved = cohort.with_name('saved')
+cohort.rename(saved)
+cohort.symlink_to(saved.name, target_is_directory=True)
+check(0, 0)
+print('PASS: installer leaves accepted; external, cyclic, absolute and directory links rejected')
+VERIFY
 # 负对照：各撤一处，t_seed 必须红在对应断言（编译失败不算红）
 python3 - "$repo" "$tmp" <<'PY'
 import os, pathlib, subprocess, sys

@@ -21,6 +21,7 @@
 // 缺省为什么是 8192：真机同进程 45 秒里出现 4430 个不同身份；世界场景一条路线（站着、前走、折返、转视角，约 6 分钟）
 // 一局出现 6533 个。缺省 4096 时只有走动才会用到的程序排在 uses 低位被挤掉，每次走进新区域都要在回放线程上
 // 读盘 / 现场编；读数见 docs/坑记录.md「预热清单上限 4096 → 8192」一条。
+#include "direct/installed_seed.h"
 #include "nvn_vk_prog_warm.h"
 #include "nvn_vk_warm_options.h"
 
@@ -296,9 +297,9 @@ static int find_locked(const uint8_t identity[32], uint32_t *at) {
 }
 
 // ---------------- 读 ----------------
-static int read_file(const char *path, uint8_t **out, size_t *out_len) {
+static int read_file(const char *path, int installed, uint8_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); errno = EINVAL; return -1; }
@@ -347,11 +348,11 @@ int nvk_prog_warm_load(void) {
     uint8_t *buf = NULL; size_t len = 0;
     // 采集局的记录只来自本局实际绘制；历史配方不能作普通程序的管线真值。
     int capture = nvk_warm_capture_enabled();
-    int rf = capture ? -1 : read_file(path, &buf, &len);
+    int rf = capture ? -1 : read_file(path, 0, &buf, &len);
     int e = capture ? ENOENT : rf ? errno : 0;
     if (!capture && rf && e == ENOENT) {   // 本闭包还没有清单：读旧名那份（升级后第一局；闭包对得上才收，见下面的有效性检查）
         char legacy[NVK_PROG_WARM_MAX_PATH];
-        if (snprintf(legacy, sizeof legacy, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof legacy) { rf = read_file(legacy, &buf, &len); e = rf ? errno : 0; }
+        if (snprintf(legacy, sizeof legacy, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof legacy) { rf = read_file(legacy, 0, &buf, &len); e = rf ? errno : 0; }
     }
     // 首局（本机这一版翻译器连旧名清单都没有）：读随包种子。有本机清单一律用本机的，种子不读。
     // 种子是锦上添花：不在 / 读不动 / 坏 / 不属于本局，都只打一行、按「本局没有清单」走，不拦起局。
@@ -361,7 +362,7 @@ int nvk_prog_warm_load(void) {
         const char *nm = strrchr(path, '/');
         if (snprintf(seed_file, sizeof seed_file, "%s/%s", seed_dir, nm ? nm + 1 : path) < (int)sizeof seed_file) {
             uint8_t *sb = NULL; size_t sl = 0;
-            int sr = read_file(seed_file, &sb, &sl), se = sr ? errno : 0;
+            int sr = read_file(seed_file, 1, &sb, &sl), se = sr ? errno : 0;
             if (!sr) { buf = sb; len = sl; rf = 0; e = 0; from_seed = 1; }
             else if (se != ENOENT) {
                 char m[200]; snprintf(m, sizeof m, "【黄】程序清单随包种子读不动（%d），本局不用种子", se);

@@ -38,7 +38,12 @@ public final class GameInstallTest {
 
     /** A package as tools/make_pack.py writes it; romfs text varies the content root. */
     private static File pack(String romfs, long artifactTitle, boolean withArtifact) throws IOException {
-        Map<String, byte[]> files = new LinkedHashMap<>();
+        return pack(romfs, artifactTitle, withArtifact, java.util.Collections.emptyMap());
+    }
+
+    private static File pack(String romfs, long artifactTitle, boolean withArtifact,
+                             Map<String, byte[]> extra) throws IOException {
+        Map<String, byte[]> files = new LinkedHashMap<>(extra);
         files.put("exefs/main.npdm", new byte[128]);
         files.put("romfs/readme.txt", romfs.getBytes(StandardCharsets.UTF_8));
         files.put("ctl/control.nacp", nacp(0x0100000000ABCDEFL));
@@ -934,7 +939,31 @@ public final class GameInstallTest {
         }
     }
 
+    /** Feed the native warm reader the installed revision, including the actual object links. */
+    private static void installWarmSeeds(Path source, Path games, Path result) throws Exception {
+        Map<String, byte[]> extra = new LinkedHashMap<>();
+        try (java.util.stream.Stream<Path> paths = Files.walk(source)) {
+            for (Path path : (Iterable<Path>) paths.filter(Files::isRegularFile)::iterator)
+                extra.put(source.relativize(path).toString(), Files.readAllBytes(path));
+        }
+        File input = pack("native warm reader", 0x0100000000ABCDEFL, true, extra);
+        try {
+            GameInstall.Result install = GameInstall.install(games.toFile(), GameInstall.directory(input), null);
+            Path game = games.resolve(install.titleId);
+            Path revision = game.resolve(BootContract.readCurrent(game.toFile()).revisionDir);
+            for (String name : extra.keySet())
+                if (!Files.isSymbolicLink(revision.resolve(name))) throw new IOException("expected object link: " + name);
+            Files.writeString(result, revision.toString());
+        } finally {
+            GameInstall.deleteTree(input);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
+        if (args.length == 4 && "--install-warm-seeds".equals(args[0])) {
+            installWarmSeeds(Path.of(args[1]), Path.of(args[2]), Path.of(args[3]));
+            return;
+        }
         if (args.length == 3 && "--plain-kill-child".equals(args[0])) {
             plainMigrationKillChild(new File(args[1]), new File(args[2]));
             return;
