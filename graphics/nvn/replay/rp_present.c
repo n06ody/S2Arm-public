@@ -261,9 +261,10 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
             rp_shader_live_compile_take(&live);
             if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout) {
                 char b[272];
-                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
+                int o = snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu",
                          (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
                          (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout);
+                if (live.ids[0] && o > 0 && (size_t)o < sizeof b) snprintf(b + o, sizeof b - (size_t)o, "、身份 %s", live.ids);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
             }
         }

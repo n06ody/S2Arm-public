@@ -59,6 +59,8 @@ static uint32_t g_live_frame_ms, g_live_unsafe_ms;
 static uint64_t now_ns(void);
 static uint64_t g_live_budget_frame, g_live_spent_ns;   // 提交 owner 独占
 static _Atomic uint64_t g_live_enqueued, g_live_wait_ns, g_live_pending, g_live_fallback, g_live_timeout;
+// 本帧前几个现编身份（诊断属性 nvk_hitch_log 开时才写；rp_shader_live_compile_take 取走并清空）
+static char g_live_ids[72]; static _Atomic unsigned g_live_ids_n; static pthread_mutex_t g_live_ids_mu = PTHREAD_MUTEX_INITIALIZER;
 static int live_worker(void *, uint64_t, uint64_t, const char *, size_t, uint8_t **, size_t *, char *, size_t);
 void nvk_shader_stop(void) {
     atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel);
@@ -1155,6 +1157,18 @@ static void libpack_note_state(struct nvk_prog_rec *rec, const struct s2a_compil
     rec->lp_ssbo_window = state == LIBPACK_SSBO_WINDOW && prog->lib_sourced;
     rec->lp_ok = state == LIBPACK_ALIGNED || rec->lp_ssbo_window ? 2 : 0;
 }
+// 状态闸的五个来源（位）：libpack_state 不是 OTHER_STATE 就是「一位都没有」；现编原因日志按位报出是哪几个挡的。
+enum { LPG_DEPTH = 1, LPG_Y_NEGATE = 2, LPG_ALPHA_TEST = 4, LPG_A2C = 8, LPG_DUAL_SRC = 16 };
+static unsigned libpack_state_gate_bits(const struct s2a_compile_graphics_src *g) {
+    unsigned bits = 0;
+    if (g->depth_mode && !depth_clip_cap()) bits |= LPG_DEPTH;
+    if (g->y_negate) bits |= LPG_Y_NEGATE;
+    if (g->alpha_test_compare && strcmp(g->alpha_test_compare, "Always")) bits |= LPG_ALPHA_TEST;
+    if (g->alpha_to_coverage_enable) bits |= LPG_A2C;
+    if (g->dual_source_blend) bits |= LPG_DUAL_SRC;
+    // 非对齐存储缓冲不再是状态闸：带窗口合同的库照用，旧库在取库处具名拒（原因进库层的 why），所以这里没有 LPG_UNALIGNED_SSBO 这一位
+    return bits;
+}
 // 可选的直连诊断在调试包显式启用时记录每次现场编译。
 __attribute__((weak)) int s2a_direct_diag_enabled(void);
 __attribute__((weak)) uint64_t s2a_direct_diag_compile_begin(const uint8_t *, unsigned, int, int);
@@ -1287,6 +1301,9 @@ static struct work_snap *snap_capture(const struct facts *f, const struct s2a_in
 // 取到的 v1 程序走同一个 build；build 不过（绑定映射 / 解析不认）记进不可用表、退回现编——不把失败记成这份输入的终态。
 // 跨局缓存排在它前面：那是本机按现场事实编的，比出包推导的准。开关 debug.s2a.no_libpack=1 关掉（对照用）
 static pthread_mutex_t g_lp_mu = PTHREAD_MUTEX_INITIALIZER;
+// 本线程最近一次 libpack_fetch 过闸之后的结局（只作诊断，图形现编原因日志用；进函数清零）：库不在 / 记坏表 / 没有这一键 / 被拒收（带原因文本）/ 取到
+enum { LPL_UNSET, LPL_CONTAINER_MISSING, LPL_CONTAINER_BAD, LPL_BAD_TABLE, LPL_MISS, LPL_REJECT, LPL_HIT };
+static _Thread_local struct { int code; char why[192]; } g_lp_last;
 static nvn_hmap g_lp_bad; static int g_lp_bad_init;
 static _Atomic uint64_t g_n_libpack, g_n_libpack_bad, g_lp_unaligned_refused;
 // 计算程序「为什么没走出包预编库」的备忘（只作诊断，不影响取程序）：按计算阶段键记最近 64 个，回放层的 spill 派发行与调查用。
@@ -1462,6 +1479,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
     // 计算库还只有对齐变体，非对齐计算仍走现编。图形非对齐允许查库，逐段核对窗口合同。
     if (!ckey && state_ok == LIBPACK_SSBO_WINDOW && !nvn_plat_flag("nvk_libpack_ssbo_window", 1)) return 0;
+    g_lp_last.code = LPL_UNSET; g_lp_last.why[0] = 0;
     // state_ok 对计算同样生效：ckey 路径传 !unaligned（慢路）/ rec->lp_ok==2（暖路径），含义同图形 lp_ok。库件只有
     //   对齐变体（libpack_vk.c 恒写 hasUnalignedStorageBuffer:false，c0 钳制补偿只有现编能出），非对齐 sbuf 绑定下
     //   出库 = 无钳制的对齐码跑非对齐缓冲 → 设备越界丢局（9000 日包 DeviceLost 元凶 = cs 50c91227a1082f2c 库版此机制）。
@@ -1532,6 +1550,8 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
                                          pc->translator_closure, bytes, len, lw, sizeof lw);
         }
     }
+    if (!lp) g_lp_last.code = nvn_hm_get(&g_lp_bad, identity) ? LPL_BAD_TABLE : atomic_load(&g_lp_state) == LP_ST_BAD ? LPL_CONTAINER_BAD : LPL_CONTAINER_MISSING;
+    else { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT; snprintf(g_lp_last.why, sizeof g_lp_last.why, "%s", lw); }
     pthread_mutex_unlock(&g_lp_mu);
     if (!lp && !pair) return 0;
     if (ckey) cs_note_set(ckey, lrc == S2A_LIBPACK_HIT ? CSN_NONE : strstr(lw, "exceeds device limit") ? CSN_SHARED :
@@ -1675,6 +1695,12 @@ void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *s) {
     s->pending = atomic_exchange_explicit(&g_live_pending, 0, memory_order_relaxed);
     s->fallback = atomic_exchange_explicit(&g_live_fallback, 0, memory_order_relaxed);
     s->timeout = atomic_exchange_explicit(&g_live_timeout, 0, memory_order_relaxed);
+    s->ids[0] = 0;   // 本帧前几个现编身份（诊断属性开时才有）
+    if (atomic_load_explicit(&g_live_ids_n, memory_order_relaxed)) {
+        pthread_mutex_lock(&g_live_ids_mu);
+        snprintf(s->ids, sizeof s->ids, "%s", g_live_ids); g_live_ids[0] = 0; g_live_ids_n = 0;
+        pthread_mutex_unlock(&g_live_ids_mu);
+    }
 }
 
 // Worker 的键按实际请求字节（包括 c1），而非 g_progs 的较粗身份。没就绪/队满/停局均不缓存成编译器拒收。
@@ -1753,10 +1779,76 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
     return LIVE_ABORT;
 }
 
+// ---- 图形现编原因日志（只加日志，默认行为不变；诊断属性 nvk_hitch_log 开时才记 / 打）----
+// 图形取库的闸全是静默返回，跨局缓存的未命中原因也没带到日志：8E 石阶每局 1 帧 77–82 ms 是一支图形着色器现编，查不出为什么没走库。
+//   每支落到现编的图形程序打一行：程序键（逐阶段 8 字节）+ 阶段掩码 + 身份前 4 字节 + 三处没命中的原因；现编帧行再带前几个身份。
+//   原因码：库闸（无资源根 / no_libpack / 状态闸的哪几位 / 阶段掩码）、库没有这一键、库件被拒收、库件取到但 build 不过（已记坏）、
+//   记坏表命中；跨局缓存：没查（关了 / 无目录）、无文件、读头失败（文件短 / 头不全 / magic / 版本）、坏（其余：身份不符 / 长度 / 摘要）。
+static int lp_gate_text(char *out, size_t n, const char *root, int state_ok, const uint8_t *ckey, uint32_t stages, unsigned state_bits) {
+    size_t o = 0; out[0] = 0;
+    #define LPG_ADD(...) do { if (o < n) o += (size_t)snprintf(out + o, n - o, __VA_ARGS__); } while (0)
+    if (!root) LPG_ADD("%s无资源根", o ? "、" : "");
+    if (!state_ok) {
+        LPG_ADD("%s状态闸[", o ? "、" : "");
+        static const struct { unsigned bit; const char *name; } nm[] = {{LPG_DEPTH, "深度裁剪"}, {LPG_Y_NEGATE, "y取反"}, {LPG_ALPHA_TEST, "alpha测试"}, {LPG_A2C, "alpha转覆盖"}, {LPG_DUAL_SRC, "双源混合"}};
+        int first = 1;
+        for (unsigned i = 0; i < sizeof nm / sizeof nm[0]; i++) if (state_bits & nm[i].bit) { LPG_ADD("%s%s", first ? "" : "+", nm[i].name); first = 0; }
+        LPG_ADD("]");
+    }
+    if (!ckey && stages != 0x3u && stages != 0x7u) LPG_ADD("%s阶段掩码0x%x", o ? "、" : "", (unsigned)stages);
+    if (nvn_plat_flag("no_libpack", 0)) LPG_ADD("%sno_libpack", o ? "、" : "");
+    #undef LPG_ADD
+    return o != 0;
+}
+static const char *cache_why_class(const char *why) {
+    if (!strncmp(why, "未命中", strlen("未命中"))) return "无文件";
+    if (!strncmp(why, "文件短于头部", strlen("文件短于头部")) || !strncmp(why, "头部读不全", strlen("头部读不全")) ||
+        !strncmp(why, "magic", 5) || !strncmp(why, "格式版本不符", strlen("格式版本不符"))) return "读头失败";
+    return "坏";
+}
+static struct { _Atomic unsigned said; uint8_t recent[16][4]; unsigned recent_n; } g_live_reason;   // 提交线程独占（work_run 的现编分支）
+static void live_reason_note(const struct work_snap *s, const char *root, int state_ok, int offline_rc, const char *cache_state, int build_failed) {
+    if (!nvn_plat_flag("nvk_hitch_log", 0)) return;
+    {   // 现编帧行带前几个身份（每帧最多 4 个，take 时清空）
+        pthread_mutex_lock(&g_live_ids_mu);
+        unsigned n = g_live_ids_n;
+        if (n < 4) { size_t o = strlen(g_live_ids); snprintf(g_live_ids + o, sizeof g_live_ids - o, "%s%02x%02x%02x%02x", n ? "," : "", s->identity[0], s->identity[1], s->identity[2], s->identity[3]); g_live_ids_n = n + 1; }
+        pthread_mutex_unlock(&g_live_ids_mu);
+    }
+    int seen = 0;   // 同一身份再进现编（暂缓后重试）只打一次
+    for (unsigned i = 0; i < 16 && i < g_live_reason.recent_n; i++) if (!memcmp(g_live_reason.recent[i], s->identity, 4)) { seen = 1; break; }
+    if (seen) return;
+    memcpy(g_live_reason.recent[g_live_reason.recent_n % 16], s->identity, 4); g_live_reason.recent_n++;
+    unsigned k = atomic_fetch_add_explicit(&g_live_reason.said, 1, memory_order_relaxed);
+    if (k >= 128 && (k % 16)) return;   // 有界：前 128 条逐条，之后每 16 条一行
+    char keys[64] = ""; size_t o = 0;
+    for (int st = 0; st < s->nst && st < 3; st++) { for (int b = 0; b < 8 && o + 3 < sizeof keys; b++) o += (size_t)snprintf(keys + o, sizeof keys - o, "%02x", s->keys[st][b]); if (st + 1 < s->nst && o + 1 < sizeof keys) keys[o++] = '/'; }
+    char lib[256], gate[160];
+    if (lp_gate_text(gate, sizeof gate, root, state_ok, NULL, s->stages, libpack_state_gate_bits(&s->f.gfx))) snprintf(lib, sizeof lib, "库闸：%s", gate);
+    else if (build_failed) snprintf(lib, sizeof lib, "库件取到但 build 失败（已记坏、退回现编）");
+    else switch (g_lp_last.code) {
+        case LPL_CONTAINER_MISSING: snprintf(lib, sizeof lib, "库不在"); break;
+        case LPL_CONTAINER_BAD: snprintf(lib, sizeof lib, "库容器坏"); break;
+        case LPL_BAD_TABLE: snprintf(lib, sizeof lib, "记坏表命中（此前 build 失败）"); break;
+        case LPL_MISS: snprintf(lib, sizeof lib, "库里没有这一键"); break;
+        case LPL_REJECT: snprintf(lib, sizeof lib, "库件被拒收：%s", g_lp_last.why); break;
+        default: snprintf(lib, sizeof lib, "库没查"); break;
+    }
+    char b[480]; snprintf(b, sizeof b, "图形现编原因：键 %s 阶段 0x%x 身份 %02x%02x%02x%02x…：离线库 %s；跨局缓存 %s；出包库 %s", keys, (unsigned)s->stages,
+        s->identity[0], s->identity[1], s->identity[2], s->identity[3], offline_rc == -9 ? "没查" : offline_rc == S2A_OFFLINE_MISS ? "未命中" : offline_rc == S2A_OFFLINE_REJECT ? "被拒收" : "无效", cache_state, lib);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b);
+}
+// 测试用（宿主）：同一份原因文本函数
+void nvk_shader_test_gate_text(char *out, size_t n, int has_root, unsigned state_bits, uint32_t stages, int ckey_present) {
+    static const uint8_t k[8] = {0}; if (out && n) lp_gate_text(out, n, has_root ? "/r" : NULL, state_bits == 0, ckey_present ? k : NULL, stages, state_bits);
+}
+const char *nvk_shader_test_cache_class(const char *why) { return cache_why_class(why ? why : ""); }
+
 // [提交] 只吃快照：离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器。
 // 仅真实编译器拒收生成 failed entry；预算用尽和 Stop 不作永久失败缓存。
 static struct entry *work_run(const struct work_snap *s, const struct rp_shader_req *q, int *pending) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
+    int offline_rc = -9, build_failed = 0; const char *cache_state = "没查";   // 现编原因日志（只读，不改取程序顺序）
     uint8_t rsha[32]; int have_res = 0;   // 结果摘要（跨局缓存读到的已校验摘要 / 现编结果现算的）：挂在 entry 上给结果合并用，离线库 / 预编库来的不挂
     const char *root = getenv("S2A_SHADER_REVISION_ROOT"), *cdir = getenv("S2A_DIRECT_CACHE_DIR");
     if (root && s->pc.profile_hash && s->pc.profile_hash[0] && !nvn_plat_flag("no_offline", 0)) {
@@ -1766,16 +1858,19 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         oq.profile_hash = s->pc.profile_hash;
         oq.profile_declared = s->pc.offline_profile_available;
         struct s2a_offline_program op = {0};
-        if (s2a_offline_library_fetch(root, &oq, &op, why, sizeof why) == S2A_OFFLINE_HIT) {
+        offline_rc = s2a_offline_library_fetch(root, &oq, &op, why, sizeof why);
+        if (offline_rc == S2A_OFFLINE_HIT) {
             bytes = op.bytes; len = op.len;
             atomic_fetch_add_explicit(&g_n_offline, 1, memory_order_relaxed);
         }
     }
-    if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0) &&
-        s2a_program_cache_load(cdir, s->identity, &bytes, &len, rsha, why, sizeof why) == 0) {
-        atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
-        have_res = 1;
-    }
+    if (!bytes && cdir && !nvn_plat_flag("no_disk_cache", 0)) {
+        char cwhy[160] = "";
+        if (s2a_program_cache_load(cdir, s->identity, &bytes, &len, rsha, cwhy, sizeof cwhy) == 0) {
+            atomic_fetch_add_explicit(&g_n_cache, 1, memory_order_relaxed);
+            have_res = 1;
+        } else cache_state = cache_why_class(cwhy);
+    } else if (!bytes) cache_state = "没查（关了或无目录）";
     union lp_prepared *ready = NULL;
     struct stair_probe probe = stair_begin(!bytes, "fg");
     if (!bytes && libpack_fetch(s->identity, (const uint8_t (*)[8])s->keys, s->stages, NULL, s->lp_state, s->f.gfx.topology, &s->pc, &bytes, &len, &ready, &probe)) {
@@ -1787,8 +1882,10 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         if (le && !le->failed) { libpack_note_hit(); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity);
+        build_failed = 1;
     } else stair_end(&probe, "fg", s->identity, s->stages, 0);
     if (!bytes) {
+        live_reason_note(s, root, s->lp_state != LIBPACK_OTHER_STATE, offline_rc, cache_state, build_failed);
         // 现场编译只读取已捕获的请求，回到原 owner 处理事实学习和结果发布。
         static struct s2a_compile_request_input in;   // 提交线程独占
         memset(&in, 0, sizeof in);
@@ -2734,6 +2831,7 @@ void nvk_shader_stair_cut(void) {
     nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
 }
 void rp_shader_reset(void) {
+    g_live_reason.recent_n = 0; atomic_store_explicit(&g_live_reason.said, 0, memory_order_relaxed);   // 现编原因日志按会话重新计（去重 / 条数）
     fact_cache_reset();
     if (g_pool_programs || g_pool_request_rejected) pool_stats("reset");
     // 后台预热一律不得越过这一步进会话收尾：先有界静默（置位后后台不再发布），再释放。

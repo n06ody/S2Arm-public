@@ -60,7 +60,7 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
-    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack')
+    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason')
     if len(sys.argv) == 2 and sys.argv[1] in (*live_modes, '--gs-libpack', '--gs-libpack-ssbo'):
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],), env=dict(os.environ, TMPDIR=str(out)))
         sys.stdout.write(result.stdout)
@@ -269,6 +269,31 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print('PASS: 4 libpack GS negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--gfx-reason-mutants']:
+        # 负对照：图形现编原因日志的各归类撤 / 改一处，--gfx-reason 必红在对应断言
+        code = original.read_text()
+        for name, old, new, expected in (
+            ('no-root-gate', 'if (!root) LPG_ADD("%s无资源根", o ? "、" : "");', '', 'no root: line has'),
+            ('no-libpack-gate', 'if (nvn_plat_flag("no_libpack", 0)) LPG_ADD("%sno_libpack", o ? "、" : "");', '', 'no_libpack: line has'),
+            ('stage-gate-dropped', 'if (!ckey && stages != 0x3u && stages != 0x7u) LPG_ADD(', 'if (0) LPG_ADD(', 'stage mask gate'),
+            ('state-bit-unnamed', '{LPG_ALPHA_TEST, "alpha测试"}', '{LPG_ALPHA_TEST, "?"}', 'state gate bit 4 names'),
+            ('cache-miss-as-bad', 'if (!strncmp(why, "未命中", strlen("未命中"))) return "无文件";', '', 'cache no file'),
+            ('cache-header-as-bad', 'strncmp(why, "格式版本不符", strlen("格式版本不符"))) return "读头失败";', 'strncmp(why, "格式版本不符", strlen("格式版本不符"))) return "坏";', 'cache header unreadable'),
+            ('outcome-not-recorded', 'else { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT;', 'else if (0) { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT;', 'library without this key'),
+            ('absent-as-bad', 'LPL_BAD_TABLE : atomic_load(&g_lp_state) == LP_ST_BAD ? LPL_CONTAINER_BAD : LPL_CONTAINER_MISSING;', 'LPL_BAD_TABLE : LPL_CONTAINER_BAD;', 'library absent'),
+            ('flag-ignored', '    if (!nvn_plat_flag("nvk_hitch_log", 0)) return;\n    {   // 现编帧行带前几个身份', '    {   // 现编帧行带前几个身份', 'flag off: no reason line'),
+            ('ids-not-cleared', 'snprintf(s->ids, sizeof s->ids, "%s", g_live_ids); g_live_ids[0] = 0; g_live_ids_n = 0;', 'snprintf(s->ids, sizeof s->ids, "%s", g_live_ids);', 'identities are cleared after take'),
+            ('no-session-reset', '    g_live_reason.recent_n = 0; atomic_store_explicit(&g_live_reason.said, 0, memory_order_relaxed);', '    (void)0;', 'library absent'),
+        ):
+            assert code.count(old) == 1, (name, 'mutation anchor', code.count(old))
+            path = out / ('gfx-reason-mutant-' + name + '.c')
+            path.write_text(code.replace(old, new))
+            result = run('gfx-reason-' + name, path, args=('--gfx-reason',))
+            assert result.returncode != 0 and expected in result.stdout + result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print('PASS: 11 graphics live-compile reason negative controls')
         return 0
 
     if sys.argv[1:] == ['--cs-libpack-mutants']:
@@ -588,7 +613,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --cs-libpack-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --cs-libpack-mutants | --gfx-reason-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'
