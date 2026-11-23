@@ -142,6 +142,7 @@ cases = [
     ('desc-field-swap', pipe, [('    d->dfmt = pw_get32(b, &at);\n    d->sfmt = pw_get32(b, &at);', '    d->sfmt = pw_get32(b, &at);\n    d->dfmt = pw_get32(b, &at);')], 'dfmt 0x3e / sfmt 0 / samples 4'),   # 配方映射错一个字段
     ('bad-row-kept', prog, [('        if (!rec_well_formed(&s.rec)) { filtered++; continue; }', '')], '坏条目跳过：3 条收 2 条'),   # 坏行不跳过
     ('pipe-row-unchecked', pipe, [('        if (from_seed && !(nvk_prog_warm_contains && nvk_prog_warm_contains(e))) { dropped++; continue; }', '')], '管线清单从种子收下 2 条'),   # 种子里程序不在的管线条目不跳过
+    ('seed-nofollow', prog, [('int sr = read_file_opt(seed_file, 1, &sb, &sl)', 'int sr = read_file_opt(seed_file, 0, &sb, &sl)')], '符号链接形态的程序种子照样收下 2 条'),   # 种子读取又不跟随符号链接
     ('pipe-no-wait', pipe, [('        if (s < 0) return -1;', '')], '程序清单还没载入：管线 load 返回 -1 稍后重试'),   # 程序没定就当没有种子
 ]
 inc = []

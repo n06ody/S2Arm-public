@@ -264,9 +264,23 @@ static void case_other_profile(void) {
     CHECK(nvk_pipe_warm_load() == 0, "管线也不读种子");
 }
 
+// 跨资源根升级后，私有管理态修订把未变的种子文件以相对符号链接复用旧对象（GameInstall objectLink）：种子读取必须跟随符号链接
+//   （原先 O_NOFOLLOW 在 Android 上报 ELOOP = errno 40，8E 真机「程序清单随包种子读不动（40）」，种子整个不用）。本机清单仍不跟随。
+static void case_seed_symlink(void) {
+    char objdir[800], op[900], oq[900];
+    snprintf(objdir, sizeof objdir, "%s/objects", g_root); mkdir(objdir, 0700);
+    snprintf(op, sizeof op, "%s/prog.bin", objdir); snprintf(oq, sizeof oq, "%s/pipe.bin", objdir);
+    write_prog(op, k_seed_prog, k_masks, 2, g_profile, 0);
+    write_pipe(oq, k_seed_pipe, 3, 0);
+    CHECK(symlink("../../../../objects/prog.bin", g_seed_prog) == 0 && symlink("../../../../objects/pipe.bin", g_seed_pipe) == 0, "种子文件做成指向对象库的相对符号链接");
+    CHECK(nvk_prog_warm_load() == 2, "符号链接形态的程序种子照样收下 2 条（得 warn：%s）", g_warn);
+    CHECK(!strstr(g_warn, "读不动"), "不报「随包种子读不动」（%s）", g_warn);
+    CHECK(nvk_pipe_warm_load() == 2, "符号链接形态的管线种子照样收下 2 条");
+}
+
 static const struct { const char *name; void (*fn)(void); } k_cases[] = {
     {"seed_used", case_seed_used}, {"local_first", case_local_first}, {"local_prog", case_local_prog},
-    {"bad_seed", case_bad_seed}, {"bad_pipe", case_bad_pipe}, {"undecided", case_undecided}, {"other_profile", case_other_profile},
+    {"bad_seed", case_bad_seed}, {"bad_pipe", case_bad_pipe}, {"undecided", case_undecided}, {"other_profile", case_other_profile}, {"seed_symlink", case_seed_symlink},
 };
 
 int main(void) {

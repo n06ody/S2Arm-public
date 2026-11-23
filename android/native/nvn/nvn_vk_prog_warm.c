@@ -296,9 +296,11 @@ static int find_locked(const uint8_t identity[32], uint32_t *at) {
 }
 
 // ---------------- 读 ----------------
-static int read_file(const char *path, uint8_t **out, size_t *out_len) {
+// follow = 1：随包种子（只读资源目录）读取，允许路径末项是符号链接——跨资源根升级后未变的文件由私有管理态修订以相对符号链接复用旧对象（GameInstall objectLink），
+//   O_NOFOLLOW 会在这里报 ELOOP（Android errno 40）、种子整个不用。本机清单（可写的缓存目录）仍然不跟随符号链接。
+static int read_file_opt(const char *path, int follow, uint8_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = open(path, O_RDONLY | O_CLOEXEC | (follow ? 0 : O_NOFOLLOW));
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); errno = EINVAL; return -1; }
@@ -318,6 +320,7 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len) {
     *out = buf; *out_len = want;
     return 0;
 }
+static int read_file(const char *path, uint8_t **out, size_t *out_len) { return read_file_opt(path, 0, out, out_len); }
 static uint32_t get_u32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
@@ -361,7 +364,7 @@ int nvk_prog_warm_load(void) {
         const char *nm = strrchr(path, '/');
         if (snprintf(seed_file, sizeof seed_file, "%s/%s", seed_dir, nm ? nm + 1 : path) < (int)sizeof seed_file) {
             uint8_t *sb = NULL; size_t sl = 0;
-            int sr = read_file(seed_file, &sb, &sl), se = sr ? errno : 0;
+            int sr = read_file_opt(seed_file, 1, &sb, &sl), se = sr ? errno : 0;
             if (!sr) { buf = sb; len = sl; rf = 0; e = 0; from_seed = 1; }
             else if (se != ENOENT) {
                 char m[200]; snprintf(m, sizeof m, "【黄】程序清单随包种子读不动（%d），本局不用种子", se);
