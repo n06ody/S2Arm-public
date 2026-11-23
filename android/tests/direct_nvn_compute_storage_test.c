@@ -305,6 +305,15 @@ static void case_reject_storage(void) {
     binding_json(b, sizeof b, 1, 0, "\"rw\":true,\"cbSlot\":3,\"cbOffset\":64,\"uboSlot\":0");
     reject_case("[B5] uboSlot 缺 uboOffset", b, "[]", "[]", keyword);
 
+    // 绑定号是 16 位（布局项 / 线格式同宽）：65535 照收，65536 起具名拒，不截断成 0
+    struct nvn_vk_compute_program ok16;
+    binding_json(b, sizeof b, 1, 65535, "\"rw\":true,\"cbSlot\":0,\"cbOffset\":784,\"nvnSlot\":0");
+    if (accept_case("[B6] 绑定号 65535（16 位上界）照收", b, "[]", "[]", &ok16) == 0) nvn_vk_program_free_compute(&ok16);
+    binding_json(b, sizeof b, 1, 65536, "\"rw\":true,\"cbSlot\":0,\"cbOffset\":784,\"nvnSlot\":0");
+    reject_case("[B6] 绑定号 65536 越过 16 位", b, "[]", "[]", "outside 16 bits");
+    binding_json(b, sizeof b, 1, 4294967295u, "\"rw\":true,\"cbSlot\":0,\"cbOffset\":784,\"nvnSlot\":0");
+    reject_case("[B6] 绑定号 4294967295 越过 16 位", b, "[]", "[]", "outside 16 bits");
+
     binding_json(b, sizeof b, 1, 0, "\"rw\":true,\"cbSlot\":3,\"cbOffset\":64,\"uboOffset\":64");
     reject_case("[B6] uboOffset 缺 uboSlot", b, "[]", "[]", keyword);
 

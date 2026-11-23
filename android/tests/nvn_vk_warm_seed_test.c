@@ -269,7 +269,22 @@ static const struct { const char *name; void (*fn)(void); } k_cases[] = {
     {"bad_seed", case_bad_seed}, {"bad_pipe", case_bad_pipe}, {"undecided", case_undecided}, {"other_profile", case_other_profile},
 };
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--emit")) {
+        setup(argv[2], "input");
+        write_prog(g_seed_prog, k_seed_prog, k_masks, 2, g_profile, 0);
+        write_pipe(g_seed_pipe, k_seed_pipe, 3, 0);
+        return failures != 0;
+    }
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--installed")) {
+        snprintf(g_cache, sizeof g_cache, "%s", argv[3]);
+        setenv("S2A_SHADER_REVISION_ROOT", argv[2], 1);
+        int expected = atoi(argv[4]);
+        CHECK(nvk_prog_warm_load() == expected, "installed program seed: expected %d rows (%s)", expected, g_warn);
+        int pipes = argc == 6 ? atoi(argv[5]) : expected;
+        CHECK(nvk_pipe_warm_load() == pipes, "installed pipe seed: expected %d rows (%s)", pipes, g_warn);
+        return failures != 0;
+    }
     char tmpl[] = "/tmp/nvk-warm-seed-XXXXXX";
     char *base = mkdtemp(tmpl);
     if (!base) { fprintf(stderr, "FAIL: temp dir\n"); return 1; }

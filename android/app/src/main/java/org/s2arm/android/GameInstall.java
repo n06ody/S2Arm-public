@@ -8,6 +8,8 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileSystemException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -32,16 +34,16 @@ import java.util.TimeZone;
 /**
  * The install transaction for a game package (implementation plan §6.5, A0 contracts): build
  * games/&lt;title id&gt;/revisions/&lt;content root&gt;.staging, validate that revision with BootContract,
- * rename it into place, then switch current.json with a temp file and a rename. A failure or a
- * killed process at any point leaves the previous current.json and its revision as they were;
- * stale .staging directories are swept at startup. Keeps the active revision and the one it
+ * rename it into place, then switch current.json with a temp file and a rename. A failure
+ * leaves the previous current.json active. Startup recovers interrupted moves of its old
+ * payload leaves and sweeps stale .staging directories. Keeps the active revision and the one it
  * replaced (previousContentRoot, for rollback), removes older ones.
  *
  * <p>Revisions share storage: every file is stored once under its SHA-256 in
  * games/&lt;title id&gt;/objects/ after size and SHA verification. Managed revisions expose these
  * objects through relative file links, which survive the staging rename and relocation of the
  * app's data. Generic shader packs require regular files, so those entries keep a hard link or
- * checked copy. A delta from an older plain revision keeps the existing checked-copy transaction.
+ * checked copy. A delta from an older plain revision adopts its verified files by rename.
  * Objects no remaining revision references are collected under the game lock.
  *
  * <p>原地来源（installInPlace）：资源目录已经在共享存储上（玩家拷进去 / 电脑 adb push），内容文件不复制、不进
@@ -76,6 +78,9 @@ final class GameInstall {
 
     static final String ARTIFACT = GamePack.ARTIFACT;
     private static final String DELTA = "game-resource-delta.tsv";
+    private static final String PLAIN_MIGRATION = ".plain-migration";
+    private static final String MIGRATION_SOURCE = "source";
+    private static final String GENERIC_SHADERS = "shaders/vulkan/generic/";
 
     static final class Result {
         final String titleId, contentRoot, previousContentRoot;
@@ -276,13 +281,15 @@ final class GameInstall {
     }
 
     private static final class DeltaSource implements Source {
-        final Source incoming, base;
+        final Source incoming;
+        final File revision, objects;
         final List<GamePack.Entry> entries;
         final BitSet unchanged;
 
-        private DeltaSource(Source incoming, Source base, List<GamePack.Entry> entries) {
+        private DeltaSource(Source incoming, File revision, File objects, List<GamePack.Entry> entries) {
             this.incoming = incoming;
-            this.base = base;
+            this.revision = revision;
+            this.objects = objects;
             this.entries = new ArrayList<>(entries);
             this.entries.sort(Comparator.comparing(e -> e.path));
             unchanged = new BitSet(entries.size());
@@ -312,7 +319,14 @@ final class GameInstall {
 
         @Override public InputStream open(String path) throws IOException {
             InputStream in = incoming.open(path);
-            return in == null && unchanged(path) ? base.open(path) : in;
+            if (in != null) return in;
+            int prior = unchangedOrdinal(path);
+            return prior < 0 ? null : Files.newInputStream(baseFile(entries.get(prior)).toPath(), LinkOption.NOFOLLOW_LINKS);
+        }
+
+        File baseFile(GamePack.Entry entry) throws IOException {
+            File leaf = installedLeaf(revision, entry.path, null);
+            return resolveInstalledLeaf(leaf, objectPath(objects, entry.sha256));
         }
 
         @Override public boolean adopt(String path, String sha256, long size, File target) throws IOException {
@@ -354,7 +368,7 @@ final class GameInstall {
         Source base = directory(previous);
         if (!GamePack.sha256(required(base, current.artifact)).equals(current.artifactSha256))
             throw new GamePack.BadPack("game resource delta base artifact has changed");
-        DeltaSource delta = new DeltaSource(incoming, base, entries);
+        DeltaSource delta = new DeltaSource(incoming, previous, new File(gameRoot, "objects"), entries);
         MessageDigest digest = GamePack.digest();
         // Stream the old index instead of holding two potentially large indices in memory.
         try (InputStream stream = base.open("index.tsv")) {
@@ -393,6 +407,7 @@ final class GameInstall {
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
         recoverRetired(gameRoot, current);
+        recoverPlainMigration(gameRoot, current);
         String previous = current == null ? null : current.contentRoot;
         String[] proof = readDelta(source, entries, contentRoot);
         // 同一内容根、但当前是原地登记：这次是复制进私有目录，照常装（换掉原地登记）
@@ -410,26 +425,45 @@ final class GameInstall {
         Result result = new Result(info.titleId, contentRoot, contentRoot.equals(previous) ? null : previous, info, false);
         result.resourceDelta = delta != null;
         File objects = new File(gameRoot, "objects");
-        // An existing plain revision needs a separate migration. Continue its checked
-        // delta path until then. The explicit hard-link injector exercises the legacy path.
         boolean oldManaged = current != null && current.managedObjects;
-        boolean managed = linker == HARD_LINK && !contentRoot.equals(previous) && (delta == null || oldManaged);
+        boolean managed = linker == HARD_LINK && !contentRoot.equals(previous);
+        boolean migrate = managed && delta != null && !oldManaged;
+        boolean copyFallback = false;
+        GameFingerprint.Stamp[] reference = null;
         if (managed) {
-            requireRealDirectory(objects.toPath());
-            requireRealDirectory(objects.toPath().resolve("tmp"));
-            managed = canLink(objects, objectLink);
-            if (!managed && oldManaged) throw new IOException("cannot publish relative object links in this revision");
+            try {
+                requireRealDirectory(objects.toPath());
+                requireRealDirectory(objects.toPath().resolve("tmp"));
+                if (migrate) {
+                    probeLink(objects, objectLink);
+                    reference = migratePlainRevision(gameRoot, current, delta, result);
+                } else {
+                    managed = canLink(objects, objectLink);
+                    if (!managed && oldManaged) throw new IOException("cannot publish relative object links in this revision");
+                }
+            } catch (IOException | UnsupportedOperationException | SecurityException failure) {
+                String reason = migrationFallback(failure);
+                if (migrate) {
+                    try { recoverPlainMigration(gameRoot, current); }
+                    catch (IOException recovery) { failure.addSuppressed(recovery); throw failure; }
+                    if (reason == null) throw failure;
+                    System.err.println("S2Arm: plain revision migration fallback (" + reason + "): checked copy");
+                    copyFallback = true;
+                } else {
+                    throw failure;
+                }
+                managed = false;
+            }
         }
         result.managedObjects = managed;
-        GameFingerprint.Stamp[] reference = null;
-        if (managed && delta != null) {
+        if (managed && delta != null && oldManaged) {
             String oldHash = previous.substring(7);
-            reference = GameFingerprint.readSelected(new File(gameRoot, current.revisionDir), delta.entries, oldHash,
+            reference = GameFingerprint.readSelected(delta.revision, delta.entries, oldHash,
                 GameFingerprint.currentReference(gameRoot, oldHash), delta::unchangedOrdinal);
         }
         deleteTree(staging);
         if (!staging.mkdirs()) throw new IOException("cannot create " + staging);
-        result.linked = managed || canLink(objects, linker);
+        result.linked = managed || (!copyFallback && canLink(objects, linker));
         result.planMs = elapsedMs(start);
         GameFingerprint.Reference fingerprint;
         try {
@@ -460,7 +494,7 @@ final class GameInstall {
                     checked[i] = GameFingerprint.stat(out);
                     continue;
                 }
-                File object = new File(objects, e.sha256.substring(0, 2) + "/" + e.sha256);
+                File object = objectPath(objects, e.sha256);
                 boolean fresh = false;
                 if (object.isFile() && object.length() == e.size) {   // stored by an earlier install, checked then
                     result.sharedBytes += e.size;
@@ -532,6 +566,249 @@ final class GameInstall {
         }
     }
 
+    private static File objectPath(File objects, String sha) {
+        return new File(objects, sha.substring(0, 2) + "/" + sha);
+    }
+
+    /** Reject directory aliases and accept only the matching relative object link as a migrated leaf. */
+    private static File installedLeaf(File revision, String relative, Set<Path> checkedParents) throws IOException {
+        Path root = revision.toPath(), leaf = root.resolve(relative);
+        if (!leaf.startsWith(root) || leaf.equals(root)) throw new IOException("installed path escapes its revision");
+        for (Path dir = leaf.getParent(); dir.startsWith(root); dir = dir.getParent()) {
+            if (checkedParents != null && checkedParents.contains(dir)) break;
+            if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS))
+                throw new IOException("installed path has a non-directory parent: " + relative);
+            if (checkedParents != null) checkedParents.add(dir);
+        }
+        return leaf.toFile();
+    }
+
+    private static File resolveInstalledLeaf(File leaf, File object) throws IOException {
+        Path path = leaf.toPath(), target = object.toPath();
+        if (Files.isSymbolicLink(path)) {
+            if (!Files.readSymbolicLink(path).equals(path.getParent().relativize(target))
+                    || !Files.isDirectory(target.getParent(), LinkOption.NOFOLLOW_LINKS)
+                    || !Files.isDirectory(target.getParent().getParent(), LinkOption.NOFOLLOW_LINKS))
+                throw new IOException("installed leaf has an invalid object link: " + leaf.getName());
+            path = target;
+        }
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("installed leaf is missing: " + leaf.getName());
+        return path.toFile();
+    }
+
+    private interface MigrationEntry {
+        void accept(GamePack.Entry entry) throws IOException;
+    }
+
+    private static void scanMigrationIndex(File revision, BootContract.Current current, byte[] buffer,
+            MigrationEntry visit) throws IOException {
+        File index = installedLeaf(revision, "index.tsv", null);
+        if (!Files.isRegularFile(index.toPath(), LinkOption.NOFOLLOW_LINKS)
+                || !current.contentRoot.equals("sha256-" + GameFingerprint.sha256Exact(index, index.length(), buffer, null)))
+            throw new IOException("plain revision migration source index does not match its root");
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                Files.newInputStream(index.toPath(), LinkOption.NOFOLLOW_LINKS), StandardCharsets.UTF_8), 1 << 16)) {
+            for (String row; (row = reader.readLine()) != null; ) {
+                if (!row.isEmpty()) visit.accept(GamePack.indexEntry(row));
+            }
+        } catch (GamePack.BadPack badIndex) {
+            throw new IOException("plain revision migration source index is invalid", badIndex);
+        }
+    }
+
+    private static byte[] migrationSource(BootContract.Current current) {
+        return ("s2a-plain-migration-v1\t" + current.contentRoot + "\t" + current.artifactSha256 + "\n")
+            .getBytes(StandardCharsets.US_ASCII);
+    }
+
+    private static void finishMigration(File gameRoot, File journal, Set<File> leafDirs) throws IOException {
+        for (File parent : leafDirs) directorySync.sync(parent);
+        // Remove the authoritative marker only after every published leaf is durable.
+        Files.delete(journal.toPath().resolve(MIGRATION_SOURCE));
+        directorySync.sync(journal);
+        deleteTree(journal);
+        directorySync.sync(gameRoot);
+    }
+
+    /**
+     * The journal binds the only revision we may repair to its active index and artifact.
+     * A killed process can leave an absent leaf after the atomic file-to-object rename.
+     * Only a checked object with the exact indexed bytes may fill that gap.
+     */
+    private static void recoverPlainMigration(File gameRoot, BootContract.Current current) throws IOException {
+        File journal = new File(gameRoot, PLAIN_MIGRATION);
+        if (!Files.exists(journal.toPath(), LinkOption.NOFOLLOW_LINKS)) return;
+        if (!Files.isDirectory(journal.toPath(), LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("plain revision migration journal is not a directory");
+        Path marker = journal.toPath().resolve(MIGRATION_SOURCE);
+        if (!Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
+            deleteTree(journal);   // interrupted before preparation or after completion
+            return;
+        }
+        if (current == null || current.managedObjects
+                || !Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)
+                || Files.size(marker) != migrationSource(current).length
+                || !java.util.Arrays.equals(Files.readAllBytes(marker), migrationSource(current)))
+            throw new IOException("plain revision migration journal does not match the active revision");
+        File revision = new File(gameRoot, current.revisionDir);
+        File objects = new File(gameRoot, "objects");
+        File staged = new File(journal, current.contentRoot);
+        byte[] buffer = new byte[1 << 20];
+        Set<Path> checkedParents = new HashSet<>();
+        Set<File> leafDirs = new HashSet<>();
+        scanMigrationIndex(revision, current, buffer, e -> {
+            File leaf = installedLeaf(revision, e.path, checkedParents);
+            if (Files.isSymbolicLink(leaf.toPath())) {
+                resolveInstalledLeaf(leaf, objectPath(objects, e.sha256));
+                leafDirs.add(leaf.getParentFile());
+                return;
+            }
+            if (Files.isRegularFile(leaf.toPath(), LinkOption.NOFOLLOW_LINKS)) return;
+            if (Files.exists(leaf.toPath(), LinkOption.NOFOLLOW_LINKS) || e.path.startsWith(GENERIC_SHADERS))
+                throw new IOException("cannot recover plain revision migration leaf: " + e.path);
+            File object = objectPath(objects, e.sha256);
+            checkObjectParents(objects, object);
+            checkMigrationFile(object, e, buffer, null);
+            directorySync.sync(object.getParentFile());
+            File alias = prepareMigrationLeaf(staged, object, e.path);
+            Files.move(alias.toPath(), leaf.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            leafDirs.add(leaf.getParentFile());
+        });
+        finishMigration(gameRoot, journal, leafDirs);
+    }
+
+    /** Selected-game startup opens BootContract before it acquires the longer session lease. */
+    static void recoverBeforeOpen(File gamesDir, String titleId) throws IOException {
+        File root = new File(libraryDirectory(gamesDir), titleId);
+        if (!Files.exists(new File(root, PLAIN_MIGRATION).toPath(), LinkOption.NOFOLLOW_LINKS)) return;
+        try (GameStorage lease = GameStorage.acquireIn(root.getParentFile(), titleId)) {
+            BootContract.Current current = readCurrent(root);
+            recoverRetired(root, current);
+            recoverPlainMigration(root, current);
+        }
+    }
+
+    private static void checkObjectParents(File objects, File object) throws IOException {
+        if (!Files.isDirectory(objects.toPath(), LinkOption.NOFOLLOW_LINKS)
+                || !Files.isDirectory(object.getParentFile().toPath(), LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("plain revision migration object directory is missing or aliased");
+    }
+
+    private static GameFingerprint.Stamp checkMigrationFile(File file, GamePack.Entry e, byte[] buffer,
+            java.util.function.LongConsumer read) throws IOException {
+        if (!Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("plain revision migration file is missing or aliased: " + e.path);
+        GameFingerprint.Stamp before = GameFingerprint.stat(file);
+        if (file.length() != e.size || !e.sha256.equals(GameFingerprint.sha256Exact(file, e.size, buffer, read)))
+            throw new IOException("plain revision migration file fails size / SHA-256: " + e.path);
+        GameFingerprint.Stamp after = GameFingerprint.stat(file);
+        if (before != null && !before.same(after))
+            throw new IOException("plain revision migration file changed while hashing: " + e.path);
+        return after;
+    }
+
+    // Staged and live revisions have the same depth relative to the game root.
+    // The prepared link text therefore remains correct after the atomic move.
+    private static File prepareMigrationLeaf(File staged, File object, String relative) throws IOException {
+        File alias = new File(staged, relative);
+        Path parent = staged.toPath();
+        requireRealDirectory(parent);
+        for (Path part : parent.relativize(alias.getParentFile().toPath())) {
+            parent = parent.resolve(part);
+            requireRealDirectory(parent);
+        }
+        Files.deleteIfExists(alias.toPath());
+        objectLink.link(alias, object);
+        return alias;
+    }
+
+    private static GameFingerprint.Stamp[] migratePlainRevision(File gameRoot, BootContract.Current current,
+            DeltaSource delta, Result result) throws IOException {
+        File journal = new File(gameRoot, PLAIN_MIGRATION);
+        requireRealDirectory(journal.toPath());
+        File staged = new File(journal, current.contentRoot);
+        requireRealDirectory(staged.toPath());
+        File preparing = new File(journal, "source.tmp");
+        Files.createFile(preparing.toPath());
+        writeSynced(preparing, migrationSource(current));
+        Files.move(preparing.toPath(), new File(journal, MIGRATION_SOURCE).toPath(), StandardCopyOption.ATOMIC_MOVE);
+        directorySync.sync(journal);
+        directorySync.sync(gameRoot);
+        // Make the store entry durable before any old leaf can move into it.
+        directorySync.sync(delta.objects);
+
+        byte[] buffer = new byte[1 << 20];
+        Set<Path> checkedParents = new HashSet<>();
+        Set<File> leafDirs = new HashSet<>();
+        Set<File> buckets = new HashSet<>();
+        GameFingerprint.Stamp[] reference = new GameFingerprint.Stamp[delta.entries.size()];
+        scanMigrationIndex(delta.revision, current, buffer, e -> {
+            if (e.path.startsWith(GENERIC_SHADERS)) return;
+            File leaf = installedLeaf(delta.revision, e.path, checkedParents);
+            File object = objectPath(delta.objects, e.sha256);
+            File bucket = object.getParentFile();
+            if (buckets.add(bucket)) {
+                requireRealDirectory(bucket.toPath());
+                directorySync.sync(delta.objects);
+            }
+            int unchanged = delta.unchangedOrdinal(e.path);
+            java.util.function.LongConsumer read = unchanged < 0 ? null : n -> result.unchangedReadBytes += n;
+            File currentFile = resolveInstalledLeaf(leaf, object);
+            GameFingerprint.Stamp checked = checkMigrationFile(currentFile, e, buffer, read);
+            if (!currentFile.equals(object)) {
+                // Reserve the link before moving the only copy. A checked duplicate
+                // already in the store makes atomic substitution safe without a gap.
+                File alias = prepareMigrationLeaf(staged, object, e.path);
+                boolean adopted = !Files.exists(object.toPath(), LinkOption.NOFOLLOW_LINKS);
+                if (adopted) {
+                    if (!leaf.setReadOnly()) throw new IOException("cannot seal plain revision file: " + e.path);
+                    Files.move(leaf.toPath(), object.toPath(), StandardCopyOption.ATOMIC_MOVE);
+                } else if (checked == null || !checked.same(GameFingerprint.stat(object))) {
+                    checked = checkMigrationFile(object, e, buffer, read);
+                }
+                try {
+                    if (!object.setReadOnly()) throw new IOException("cannot seal migration object: " + e.path);
+                    if (adopted) {
+                        GameFingerprint.Stamp moved = GameFingerprint.stat(object);
+                        if (checked != null && !checked.same(moved))
+                            throw new IOException("plain revision migration object changed during rename: " + e.path);
+                    }
+                    directorySync.sync(bucket);
+                    Files.move(alias.toPath(), leaf.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException | RuntimeException failure) {
+                    if (adopted && !Files.exists(leaf.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                        try {
+                            Files.move(object.toPath(), leaf.toPath(), StandardCopyOption.ATOMIC_MOVE);
+                            directorySync.sync(bucket);
+                            directorySync.sync(leaf.getParentFile());
+                        } catch (IOException rollback) {
+                            failure.addSuppressed(rollback);
+                        }
+                    }
+                    throw failure;
+                }
+            }
+            if (unchanged >= 0) reference[unchanged] = checked;
+            leafDirs.add(leaf.getParentFile());
+        });
+        finishMigration(gameRoot, journal, leafDirs);
+        return reference;
+    }
+
+    private static String migrationFallback(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            String detail = cause instanceof FileSystemException ? ((FileSystemException)cause).getReason() : cause.getMessage();
+            if (detail != null && (detail.contains("ENOSPC") || detail.contains("No space left on device"))) return "ENOSPC";
+            if (cause instanceof AtomicMoveNotSupportedException) return "atomic move unavailable";
+            if (cause instanceof UnsupportedOperationException || cause instanceof SecurityException
+                    || (detail != null && (detail.contains("Operation not supported") || detail.contains("Operation not permitted")
+                        || detail.contains("Permission denied"))))
+                return "relative links unavailable";
+        }
+        return null;
+    }
+
     private static GameFingerprint.Stamp projectObject(Source source, DeltaSource delta, GamePack.Entry e, File out,
             File objects, GameFingerprint.Stamp[] reference, Set<File> objectDirs,
             byte[] buffer, Progress progress, long[] done, long total, Result result)
@@ -562,6 +839,27 @@ final class GameInstall {
             }
             result.sharedBytes += e.size;
         } else {
+            if (prior >= 0 && e.path.startsWith(GENERIC_SHADERS)) {
+                // A migrated legacy generic pack keeps its real files and has no CAS
+                // object. Share that file where possible, otherwise verify one copy.
+                File base = delta.baseFile(e);
+                try {
+                    HARD_LINK.link(out, base);
+                } catch (IOException | UnsupportedOperationException | SecurityException denied) {
+                    store(path -> Files.newInputStream(base.toPath(), LinkOption.NOFOLLOW_LINKS),
+                        e, out, new File(objects, "tmp"), buffer, null, new long[]{0}, total);
+                    result.storedBytes += e.size;
+                    result.unchangedReadBytes += e.size;
+                    result.unchangedWriteBytes += e.size;
+                    done[0] += e.size;
+                    if (progress != null) progress.update(done[0], total);
+                    return GameFingerprint.stat(out);
+                }
+                result.sharedBytes += e.size;
+                done[0] += e.size;
+                if (progress != null) progress.update(done[0], total);
+                return reference == null ? null : reference[prior];
+            }
             if (prior >= 0) throw new IOException("managed delta object is missing: " + e.path);
             put(source, e, object, new File(objects, "tmp"), buffer, progress, done, total);
             // adopt() can have renamed a fully hashed but still unflushed receive file.
@@ -571,7 +869,7 @@ final class GameInstall {
             checked = GameFingerprint.stat(object);
             result.storedBytes += e.size;
         }
-        if (e.path.startsWith("shaders/vulkan/generic/")) {
+        if (e.path.startsWith(GENERIC_SHADERS)) {
             // The generic pack validator requires every component to be free of symlinks.
             try {
                 HARD_LINK.link(out, object);
@@ -678,6 +976,7 @@ final class GameInstall {
         File active = new File(revisions, contentRoot), staging = new File(revisions, contentRoot + ".staging");
         BootContract.Current current = readCurrent(gameRoot);
         recoverRetired(gameRoot, current);
+        recoverPlainMigration(gameRoot, current);
         String previous = current == null ? null : current.contentRoot;
         String artifactSha = GamePack.sha256(artifact);
         if (current != null && contentRoot.equals(previous) && active.isDirectory()
@@ -801,8 +1100,7 @@ final class GameInstall {
         out.setReadOnly();
     }
 
-    // Whether this storage lets the app create hard links (probed once per install).
-    private static boolean canLink(File objects, Linker linker) {
+    private static void probeLink(File objects, Linker linker) throws IOException {
         File probe = new File(objects, "tmp/link-probe"), target = new File(objects, "tmp/link-target");
         try {
             probe.getParentFile().mkdirs();
@@ -810,12 +1108,19 @@ final class GameInstall {
             target.delete();
             try (FileOutputStream out = new FileOutputStream(target)) { out.write(0); }
             linker.link(probe, target);
-            return true;
-        } catch (UnsupportedOperationException | SecurityException | IOException e) {
-            return false;
         } finally {
             probe.delete();
             target.delete();
+        }
+    }
+
+    // Whether this storage lets the app create the selected link (probed once per install).
+    private static boolean canLink(File objects, Linker linker) {
+        try {
+            probeLink(objects, linker);
+            return true;
+        } catch (UnsupportedOperationException | SecurityException | IOException e) {
+            return false;
         }
     }
 
@@ -829,7 +1134,9 @@ final class GameInstall {
         if (games != null) for (File g : games) {
             // 逐款取锁：这一款正在跑 / 正在装就跳过（下次再清），不碰它的半成品
             try (GameStorage lease = GameStorage.acquireIn(gamesDir, g.getName())) {
-                recoverRetired(g, readCurrent(g));
+                BootContract.Current current = readCurrent(g);
+                recoverRetired(g, current);
+                recoverPlainMigration(g, current);
                 File[] staged = new File(g, "revisions").listFiles(f -> f.getName().endsWith(".staging"));
                 if (staged != null) for (File s : staged) { deleteTree(s); removed++; }
                 new File(g, "current.json.tmp").delete();

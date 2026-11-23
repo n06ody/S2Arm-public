@@ -28,7 +28,7 @@ cases = [
     ('one-file', [('"%s/" NVK_PROG_WARM_PREFIX "%s.bin", dir, hx', '"%s/programs-v1.bin%.0s", dir, hx')], 'manifest file exists after save'),   # 文件名回到一款一份：按闭包命名的那份根本不出现
     ('no-prune', [('    if (!rc) warm_prune(dir, path);', '    if (0) warm_prune(dir, path);')], 'the oldest (A) is pruned'),
     ('prune-keeps-legacy', [('    { char pth[NVK_PROG_WARM_MAX_PATH]; if (snprintf(pth, sizeof pth, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof pth) unlink(pth); }\n', '')], 'legacy-named file is removed'),
-    ('no-legacy-fallback', [('    if (rf && e == ENOENT) {', '    if (0 && rf && e == ENOENT) {')], 'legacy-named manifest of the same closure is accepted'),
+    ('no-legacy-fallback', [('    if (!capture && rf && e == ENOENT) {', '    if (0 && !capture && rf && e == ENOENT) {')], 'legacy-named manifest of the same closure is accepted'),
     ('mismatch-red', [('nvn_plat_log(mismatch ? NVN_PLAT_LOG_WARN : NVN_PLAT_LOG_RED, "warm", m);', 'nvn_plat_log(NVN_PLAT_LOG_RED, "warm", m);')], 'yellow line with its own reason'),
 ]
 for name, edits, expect in cases:
@@ -132,13 +132,46 @@ PY
   -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" \
   -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" "$android/native/direct/sha256.c"
 "$tmp/t_seed"
+# Run the actual installer first so the reader sees the same relative object links as Android.
+mkdir -p "$tmp/java" "$tmp/games" "$tmp/cache"
+"$tmp/t_seed" --emit "$tmp"
+javac -encoding UTF-8 -sourcepath "$android/app/src/main/java" -d "$tmp/java" "$android/tests/GameInstallTest.java"
+java -Djava.io.tmpdir="$tmp" -cp "$tmp/java" org.s2arm.android.GameInstallTest --install-warm-seeds \
+  "$tmp/input/rev" "$tmp/games" "$tmp/revision"
+revision="$(cat "$tmp/revision")"
+"$tmp/t_seed" --installed "$revision" "$tmp/cache" 2
+# Invalid links must never turn identical valid fixture bytes into a seed.
+python3 - "$tmp" "$revision" <<'VERIFY'
+import os, pathlib, subprocess, sys
+tmp, revision = map(pathlib.Path, sys.argv[1:])
+program, = revision.glob('shaders/direct/warm-vk/*/programs-*.bin')
+pipe = program.with_name('pipes-v1-352.bin')
+def check(programs, pipes):
+    subprocess.run([tmp/'t_seed', '--installed', revision, tmp/'cache', str(programs), str(pipes)], check=True)
+for leaf, counts in [(program, (0, 0)), (pipe, (2, 0))]:
+    original = os.readlink(leaf)
+    copy = tmp/leaf.name
+    copy.write_bytes(leaf.read_bytes())
+    for target in [os.path.relpath(copy, leaf.parent), leaf.name, str(leaf.resolve())]:
+        leaf.unlink()
+        leaf.symlink_to(target)
+        check(*counts)
+        leaf.unlink()
+        leaf.symlink_to(original)
+cohort = program.parent
+saved = cohort.with_name('saved')
+cohort.rename(saved)
+cohort.symlink_to(saved.name, target_is_directory=True)
+check(0, 0)
+print('PASS: installer leaves accepted; external, cyclic, absolute and directory links rejected')
+VERIFY
 # 负对照：各撤一处，t_seed 必须红在对应断言（编译失败不算红）
 python3 - "$repo" "$tmp" <<'PY'
 import os, pathlib, subprocess, sys
 repo, tmp = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 prog, pipe = repo/'android/native/nvn/nvn_vk_prog_warm.c', repo/'android/native/nvn/nvn_vk_pipe_warm.c'
 cases = [
-    ('seed-even-with-local', prog, [('    if (rf && e == ENOENT && !seed_dir_of(seed_dir', '    if (!seed_dir_of(seed_dir')], '有本机程序清单：用本机的 1 条'),   # 不判本机清单是否为空
+    ('seed-even-with-local', prog, [('    if (!capture && rf && e == ENOENT && !seed_dir_of(seed_dir', '    if (!capture && !seed_dir_of(seed_dir')], '有本机程序清单：用本机的 1 条'),   # 不判本机清单是否为空
     ('desc-field-swap', pipe, [('    d->dfmt = pw_get32(b, &at);\n    d->sfmt = pw_get32(b, &at);', '    d->sfmt = pw_get32(b, &at);\n    d->dfmt = pw_get32(b, &at);')], 'dfmt 0x3e / sfmt 0 / samples 4'),   # 配方映射错一个字段
     ('bad-row-kept', prog, [('        if (!rec_well_formed(&s.rec)) { filtered++; continue; }', '')], '坏条目跳过：3 条收 2 条'),   # 坏行不跳过
     ('pipe-row-unchecked', pipe, [('        if (from_seed && !(nvk_prog_warm_contains && nvk_prog_warm_contains(e))) { dropped++; continue; }', '')], '管线清单从种子收下 2 条'),   # 种子里程序不在的管线条目不跳过

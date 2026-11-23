@@ -334,8 +334,11 @@ final class GameFingerprint {
     /** 按索引里的大小读够就停的 SHA-256：不为确认末尾多读一次（vivo 上经共享存储 FUSE 读大文件，「读到末尾」那次 read
      *  曾一直不返回，见 GameInstall.store）。读不够 size 字节返回 null（文件比索引短）。 */
     static String sha256Exact(File file, long size, java.util.function.LongConsumer progress) throws IOException {
+        return sha256Exact(file, size, new byte[1<<20], progress);
+    }
+
+    static String sha256Exact(File file, long size, byte[] buf, java.util.function.LongConsumer progress) throws IOException {
         MessageDigest md=GamePack.digest();
-        byte[] buf=new byte[1<<20];
         long got=0;
         try (java.io.InputStream in=new java.io.FileInputStream(file)) {
             for (int n; got<size && (n=in.read(buf,0,(int)Math.min(buf.length,size-got)))>0; ) {
