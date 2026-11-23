@@ -613,9 +613,9 @@ else()
     add_test(NAME android_direct_offline_library COMMAND direct_offline_library_test)
     # #1434：LibPack（iOS 同容器）POSIX 段读器 + _b.json→s2a-direct-program-v1 适配。
     add_executable(libpack_vk_test tests/libpack_vk_test.c
-        native/direct/libpack_vk.c native/direct/json.c native/direct/jv.c native/nvn/nvn_vk_program_result.c)
+        native/direct/libpack_vk.c native/direct/json.c native/direct/jv.c native/direct/sha256.c native/nvn/nvn_vk_program_result.c)
     target_include_directories(libpack_vk_test PRIVATE native native/direct native/nvn ../runtime/include)
-    target_compile_definitions(libpack_vk_test PRIVATE _GNU_SOURCE)
+    target_compile_definitions(libpack_vk_test PRIVATE _GNU_SOURCE S2A_LIBPACK_PACKER)
     target_compile_options(libpack_vk_test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME android_libpack_vk COMMAND libpack_vk_test)
     # W2.6：编译 provider 的登记身份——同指针幂等、换指针拒绝、Activate 冻结、销毁解绑、表满不覆盖。
