@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     int drew = run_case("bank0", FS_BANK0, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
     CHECK(hit == 1 && rej == 0 && compile_calls == 0, "bank 0 c0: library hit (hits+%llu rejects+%llu, live compiles %d)", (unsigned long long)hit, (unsigned long long)rej, compile_calls);
     CHECK(drew, "bank 0 c0: one replay draw, none skipped");
-    CHECK(strstr(g_calls_text, "共 1 支程序、1.0 笔，其中库来源 1.0 笔（100%）") != NULL && strstr(g_calls_text, "[库") != NULL,
+    CHECK(strstr(g_calls_text, "共 1 支程序、1.0 笔，其中库来源 1.0 笔（100%）") != NULL && strstr(g_calls_text, "[库") != NULL && strstr(g_calls_text, "（二次同步切0.0、同步") != NULL,
           "program call table: one library-sourced program, one draw: %s", g_calls_text);
     for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
         const uint8_t want[4] = {x < 2 ? 0x20 : 0xC0, 0x40, x < 2 ? 0x80 : 0xFF, x < 2 ? 0xFF : 0x80};
