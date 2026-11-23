@@ -58,7 +58,7 @@ static int link_map_flag;   // nvk_link_map_diag 开关替身
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
-static int fixture_hitch_flag, fixture_no_libpack, fixture_win_part;   // nvk_hitch_log（图形现编原因日志的开关）/ no_libpack（出包库总闸）
+static int fixture_hitch_flag, fixture_no_libpack, fixture_win_part, fixture_gfx_c2;   // nvk_hitch_log（图形现编原因日志的开关）/ no_libpack（出包库总闸）
 static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alias）：-1 = 取生产缺省，0 = 关
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
@@ -131,6 +131,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_hitch_log")) return fixture_hitch_flag;
     if (!strcmp(name, "no_libpack")) return fixture_no_libpack;
     if (!strcmp(name, "nvk_libpack_win_part")) return fixture_win_part;
+    if (!strcmp(name, "nvk_libpack_gfx_c2")) return fixture_gfx_c2;
     return dflt;
 }
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
@@ -2491,6 +2492,61 @@ static int win_part_case(const char *tag, int vs_mask, int unaligned, int part, 
     return 0;
 }
 
+static int c2_gate_case(const char *tag, int flag, int want_lib) {
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    for (unsigned i = 0; i < 3; i++) { gs_stages[i] = (uint8_t)i; memcpy(gs_keys[i], k[i], 8); }
+    gs_keys_ok = 7; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    int ok = rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8); bind_pools(7);
+    CHECK(ok, "%s: fixture binds program", tag);
+    char root[256], dir[600];
+    snprintf(root, sizeof root, "%s/nvk_lib_binst.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    if (!mkdtemp(root)) { CHECK(0, "%s: temp root", tag); return 1; }
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    static const uint32_t spv0[5] = {0x07230203u, 0x00010300u, 0, 1, 0};
+    static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u};
+    static const uint32_t spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
+    char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
+    char jvs[300], jfs[300], jg0[340], jg3[340];
+    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
+    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[{\"msl_name\":\"fp_c2\",\"kind\":\"drvcb\",\"bank\":2,\"arg_id\":0}]}", hx[1]);
+    snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
+    snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+    // 片元 SPIR-V：set 0 / binding 4 的 Uniform Block（struct{float}）：OpDecorate %2 Block；%4 DescriptorSet 0 / Binding 4；%1 float；%2 struct；%3 ptr Uniform；%4 变量
+    static const uint32_t spv_fs_ubo[] = {0x07230203u, 0x00010300u, 0, 5, 0,
+        (3u << 16) | 71u, 2, 2, (4u << 16) | 71u, 4, 34, 0, (4u << 16) | 71u, 4, 33, 4,
+        (3u << 16) | 22u, 1, 32, (3u << 16) | 30u, 2, 1, (4u << 16) | 32u, 3, 2, 2, (4u << 16) | 59u, 3, 4, 2};
+    struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
+        {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
+        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv_fs_ubo, sizeof spv_fs_ubo},
+        {lp_key(k[2]), 112, (const uint8_t *)jg0, strlen(jg0)}, {lp_key(k[2]), 115, (const uint8_t *)jg3, strlen(jg3)},
+        {lp_key(k[2]), 120, (const uint8_t *)spv_vg0, sizeof spv_vg0}, {lp_key(k[2]), 123, (const uint8_t *)spv_vg3, sizeof spv_vg3},
+    };
+    for (int i = 0; i < 8; i++) for (int j = i + 1; j < 8; j++)
+        if (rec[j].key < rec[i].key || (rec[j].key == rec[i].key && rec[j].kind < rec[i].kind)) { __typeof__(rec[0]) t = rec[i]; rec[i] = rec[j]; rec[j] = t; }
+    uint64_t keys[8]; uint8_t kinds[8]; const uint8_t *data[8]; size_t lens[8];
+    for (int i = 0; i < 8; i++) { keys[i] = rec[i].key; kinds[i] = rec[i].kind; data[i] = rec[i].d; lens[i] = rec[i].n; }
+    CHECK(lp_write(dir, keys, kinds, data, lens, 8) == 0, "%s: library written", tag);
+    static const char prof_on[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":true}}";
+    snprintf(external_profile, sizeof external_profile, "%s", prof_on);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
+    fake_depth_clip = 1; fake_gs_success = 1; fixture_gfx_c2 = flag;
+    struct rp_shader_req q = {0}; q.prim = 4; const struct rp_prog *p = NULL; compiler_calls = 0;
+    CHECK(rp_shader_resolve(&q, &p) == 0 && p, "%s: resolves", tag);
+    CHECK(p && (want_lib ? (p->lib_sourced && compiler_calls == 0) : (!p->lib_sourced && compiler_calls >= 1)),
+          "%s: %s (lib_sourced=%d live compiles=%d)", tag, want_lib ? "program comes from the library" : "c2 gate sends it to the live compiler", p ? p->lib_sourced : -1, compiler_calls);
+    char path[700];
+    snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
+    rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders/direct", root); rmdir(dir); snprintf(dir, sizeof dir, "%s/shaders", root); rmdir(dir); rmdir(root);
+    external_profile[0] = 0; unsetenv("S2A_SHADER_REVISION_ROOT"); fake_gs_success = 0; fixture_gfx_c2 = 0;
+    return 0;
+}
+
+
 static int lib_binst_test(void) {
 #define DRV0(offs, dyn) ",\"drv_reads\":{\"0\":{\"vec4_offsets\":" offs ",\"dynamic\":" dyn "}}"
     lib_binst_case("fields absent = unknown", "", "", "", 0x0);
@@ -2510,6 +2566,13 @@ static int lib_binst_test(void) {
     lib_binst_case("negative offset not a u32", DRV0("[-16]", "false"), DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
     lib_binst_case("bank 0 is not an object", ",\"drv_reads\":{\"0\":1}", DRV0("[272]", "false"), DRV0("[272]", "false"), 0x6);
     printf("nvk shader pool (library binst_unread): %d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}
+static int c2_gate_test(void) {
+    // 图形库程序读驱动句柄表（drvcb bank 2）：debug.s2a.nvk_libpack_gfx_c2 缺省 0 = 挡下走现编（8E 第 3 班全黑的触发）；1 = 放行走库
+    c2_gate_case("c2 gate off (default) → live compile", 0, 0);
+    c2_gate_case("c2 gate open → library", 1, 1);
+    printf("nvk shader pool (library gfx c2 gate): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
 static int win_part_test(void) {
@@ -2533,6 +2596,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
     if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack-ssbo")) return gs_libpack_test(0, 1);
+    if (argc == 2 && !strcmp(argv[1], "--c2-gate")) return c2_gate_test();
     if (argc == 2 && !strcmp(argv[1], "--win-part")) return win_part_test();
     if (argc == 2 && !strcmp(argv[1], "--lib-binst")) return lib_binst_test();
     if (argc == 2 && !strcmp(argv[1], "--gfx-reason")) return gfx_reason_test();

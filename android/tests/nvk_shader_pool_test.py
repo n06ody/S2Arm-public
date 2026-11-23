@@ -60,7 +60,7 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
-    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason', '--lib-binst', '--win-part')
+    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason', '--lib-binst', '--win-part', '--c2-gate')
     if len(sys.argv) == 2 and sys.argv[1] in (*live_modes, '--gs-libpack', '--gs-libpack-ssbo'):
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],), env=dict(os.environ, TMPDIR=str(out)))
         sys.stdout.write(result.stdout)
@@ -269,6 +269,22 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print('PASS: 4 libpack GS negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--c2-gate-mutants']:
+        # 负对照：图形库 c2（DRV2）闸各撤 / 改一处，--c2-gate 必红在对应断言
+        code = original.read_text()
+        for name, old, new, expected in (
+            ('gate-removed', '!ckey && lrc == S2A_LIBPACK_HIT && !nvn_plat_flag("nvk_libpack_gfx_c2", 0)', '0', 'c2 gate off (default)'),
+            ('always-blocks', 'if (has_c2) {', 'if (1) {', 'c2 gate open'),
+            ('scan-misses-uniform', 'static const char key[] = "\\"slot\\":2}", kind[]', 'static const char key[] = "\\"slot\\":3}", kind[]', 'c2 gate off (default)'),
+        ):
+            assert code.count(old) == 1, (name, 'mutation anchor', code.count(old))
+            path = out / ('c2-gate-mutant-' + name + '.c'); path.write_text(code.replace(old, new))
+            result = run('c2-gate-' + name, path, args=('--c2-gate',))
+            assert result.returncode != 0 and 'FAIL: ' + expected in result.stdout + result.stderr, (name, result.stdout[-300:], result.stderr[-200:])
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print('PASS: 3 c2 gate negative controls')
         return 0
 
     if sys.argv[1:] == ['--win-part-mutants']:

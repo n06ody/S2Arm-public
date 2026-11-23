@@ -1560,6 +1560,31 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
             snprintf(lw, sizeof lw, "window part gate %d: %s", part, window_used ? "program uses the window mask" : "program does not use the window mask");
             lrc = S2A_LIBPACK_MISS;
         }
+        // 图形库程序读驱动句柄表（drvcb bank 2 → slot 2 → NVN_RB_DRV2）的闸（缺省关 = 回到 bank 2 映射之前的行为：这类程序走现编）。
+        //   8E 第 3 班：vs 1b347578… 配 fs 60a28f01…（第 2 班一直被库以「fp_c2 无来源」拒、走现编）第一次出库，Adreno 上建管线失败
+        //   「Bind group info mismatches the shader source for symbol fp_t_cb196610_…」，失败表挡掉 4180→5427 笔绘制，整屏全黑。
+        //   二进制库的记录是出库时已映射好的（packer 版本带 bank 2），所以取库后按「含 slot 2 的 uniform 绑定」挡；JSON 路径同样按文本挡。
+        if (!ckey && lrc == S2A_LIBPACK_HIT && !nvn_plat_flag("nvk_libpack_gfx_c2", 0)) {
+            int has_c2 = 0;
+            if (ready && *ready) {
+                const struct fd_program *gp = &(*ready)->graphics;
+                for (int i = 0; i < gp->binding_count; i++) if (gp->bindings[i].kind == 0 && gp->bindings[i].slot == 2 && !gp->bindings[i].is_support) has_c2 = 1;
+            } else if (*bytes) {   // JSON 路径：在 [bytes, bytes+len) 里找 `"slot":2}` 且同一条绑定（回溯到 '{'）的 kind 是 uniform
+                static const char key[] = "\"slot\":2}", kind[] = "\"kind\":\"uniform\"";
+                const char *base = (const char *)*bytes, *end = base + *len;
+                for (const char *q = base; q + sizeof key - 1 <= end && !has_c2; q++) {
+                    if (memcmp(q, key, sizeof key - 1)) continue;
+                    const char *b = q; while (b > base && *b != '{') b--;
+                    for (const char *k = b; k + sizeof kind - 1 <= q; k++) if (!memcmp(k, kind, sizeof kind - 1)) { has_c2 = 1; break; }
+                }
+            }
+            if (has_c2) {
+                if (*bytes) { free(*bytes); *bytes = NULL; *len = 0; }
+                if (ready && *ready) { nvn_vk_program_free(&(*ready)->graphics); free(*ready); *ready = NULL; }
+                snprintf(lw, sizeof lw, "gfx c2 gate: program reads the driver handle table (DRV2), debug.s2a.nvk_libpack_gfx_c2=0");
+                lrc = S2A_LIBPACK_MISS;
+            }
+        }
     }
     if (!lp) g_lp_last.code = nvn_hm_get(&g_lp_bad, identity) ? LPL_BAD_TABLE : atomic_load(&g_lp_state) == LP_ST_BAD ? LPL_CONTAINER_BAD : LPL_CONTAINER_MISSING;
     else { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT; snprintf(g_lp_last.why, sizeof g_lp_last.why, "%s", lw); }
@@ -1855,7 +1880,7 @@ static void live_reason_note(const struct work_snap *s, const char *root, int st
         case LPL_CONTAINER_MISSING: snprintf(lib, sizeof lib, "库不在"); break;
         case LPL_CONTAINER_BAD: snprintf(lib, sizeof lib, "库容器坏"); break;
         case LPL_BAD_TABLE: snprintf(lib, sizeof lib, "记坏表命中（此前 build 失败）"); break;
-        case LPL_MISS: if (strstr(g_lp_last.why, "window part gate")) snprintf(lib, sizeof lib, "窗口二分闸挡下：%s", g_lp_last.why); else snprintf(lib, sizeof lib, "库里没有这一键"); break;
+        case LPL_MISS: if (strstr(g_lp_last.why, "window part gate")) snprintf(lib, sizeof lib, "窗口二分闸挡下：%s", g_lp_last.why); else if (strstr(g_lp_last.why, "gfx c2 gate")) snprintf(lib, sizeof lib, "c2 句柄表闸挡下：%s", g_lp_last.why); else snprintf(lib, sizeof lib, "库里没有这一键"); break;
         case LPL_REJECT: snprintf(lib, sizeof lib, "库件被拒收：%s", g_lp_last.why); break;
         default: snprintf(lib, sizeof lib, "库没查"); break;
     }
