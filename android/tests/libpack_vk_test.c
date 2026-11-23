@@ -879,7 +879,7 @@ int main(void) {
         struct s2a_libpack *cl = NULL;
         CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute v2 pack");
         uint8_t *j = NULL; size_t jl = 0; char why[192] = "";
-        int rc = cl ? s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, &j, &jl, why, sizeof why) : -1;
+        int rc = cl ? s2a_libpack_compute_v1(cl, key, 1, "h", "c", 32768, NULL, &j, &jl, why, sizeof why) : -1;
 #ifdef S2A_LIBPACK_PACKER
         uint8_t binary_keys[6][8] = {{0}};
         memcpy(binary_keys[0], key, 8);
@@ -1181,7 +1181,7 @@ int main(void) {
         const uint8_t kc[8] = { 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
         uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
         uint64_t h0 = s2a_libpack_hits();
-        int rc = cl ? s2a_libpack_compute_v1(cl, kc, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+        int rc = cl ? s2a_libpack_compute_v1(cl, kc, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
         CHECK(rc == 0 && j && jl == strlen((const char *)j), "cs key → HIT");
         CHECK(s2a_libpack_hits() == h0 + 1, "compute hit counter +1");
         CHECK(has(j, "\"kind\":\"compute\"") && has(j, "\"hasUnalignedStorageBuffer\":false")
@@ -1223,7 +1223,7 @@ int main(void) {
         // 拿不到 guest 映射的存储（gmem_map）出库即拒：不产 slot -1 死绑定让解析器再拒（#1774）
         const uint8_t kg[8] = { 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 };
         const uint64_t rg0 = s2a_libpack_rejects();
-        rc = cl ? s2a_libpack_compute_v1(cl, kg, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+        rc = cl ? s2a_libpack_compute_v1(cl, kg, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
         CHECK(rc == -1 && !j && strstr(w, "no consumable guest source") && strstr(w, "gmem_map"),
               "gmem_map 存储无 guest 映射 → REJECT（不产 slot -1 死绑定）");
         CHECK(s2a_libpack_rejects() == rg0 + 1, "dead binding reject counted +1");
@@ -1240,7 +1240,7 @@ int main(void) {
             CHECK(mk_pack(rs, 2, ps, ns, 1) == 0, "compute support-from-spv pack written");
             CHECK(s2a_libpack_open(&cl, g_dir) == 1 && cl, "open compute support-from-spv pack");
             const uint8_t ke[8] = { 0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7 };
-            rc = cl ? s2a_libpack_compute_v1(cl, ke, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+            rc = cl ? s2a_libpack_compute_v1(cl, ke, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
             if (rc) printf("  compute_v1: %s\n", w);
             CHECK(rc == 0 && has(j, "\"kind\":\"support\",\"stage\":\"program\",\"set\":0,\"binding\":47,\"count\":1}"),
                   ".spv 声明 support_buffer b47、_b.json 不列 → 补出 support b47 count 1");
@@ -1270,7 +1270,7 @@ int main(void) {
             const uint8_t kf[8] = { 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7 };
             w[0] = 0;
             const uint64_t rj0 = s2a_libpack_rejects();
-            rc = cl ? s2a_libpack_compute_v1(cl, kf, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+            rc = cl ? s2a_libpack_compute_v1(cl, kf, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
             CHECK(rc == -1 && !j && strstr(w, "fp64_type_used") && strstr(w, "Float64"), "模块用 OpTypeFloat 64 → 计算程序 REJECT（退回现编），原因 fp64_type_used");
             CHECK(s2a_libpack_rejects() == rj0 + 1, "能力核拒收走库拒收计数 +1");
             s2a_libpack_close(cl); cl = NULL;
@@ -1280,7 +1280,7 @@ int main(void) {
         // 负控：拿图形键（stage vs）当计算键 → REJECT；缺席键 → MISS
         uint64_t r0 = s2a_libpack_rejects(), m0 = s2a_libpack_misses();
         const uint8_t ka[8] = { 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33 };
-        CHECK(cl && s2a_libpack_compute_v1(cl, ka, 1, "h", "c", 32768, &j, &jl, w, sizeof w) == 1 && !j, "缺席 cs 键 → MISS");
+        CHECK(cl && s2a_libpack_compute_v1(cl, ka, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) == 1 && !j, "缺席 cs 键 → MISS");
         CHECK(s2a_libpack_misses() == m0 + 1, "compute miss counter +1");
         s2a_libpack_close(cl);
         const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
@@ -1294,7 +1294,7 @@ int main(void) {
         size_t nv[2] = { strlen(VS_JSON), sizeof libpack_vert_spv };
         CHECK(mk_pack(rv, 2, pv, nv, 1) == 0, "vs-only pack written");
         cl = NULL; w[0] = 0;
-        CHECK(s2a_libpack_open(&cl, g_dir) == 1 && s2a_libpack_compute_v1(cl, kv, 1, "h", "c", 32768, &j, &jl, w, sizeof w) == -1 && !j
+        CHECK(s2a_libpack_open(&cl, g_dir) == 1 && s2a_libpack_compute_v1(cl, kv, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) == -1 && !j
               && strstr(w, "stage is 'vs' not 'cs'"), "vs 键当 cs 取 → stage 不符 REJECT");
         s2a_libpack_close(cl);
         CHECK(s2a_libpack_rejects() == r0 + 1, "compute reject counter +1");
@@ -1349,7 +1349,7 @@ int main(void) {
             uint64_t k64 = (uint64_t)(i + 1) * 0x0101010101010101ULL;
             uint8_t k[8]; memcpy(k, &k64, 8);
             uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
-            int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+            int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
             if (!(rc == -1 && !j && strstr(w, "no consumable guest source"))) printf("  dead binding %d: rc=%d why=%s\n", i, rc, w);
             CHECK(rc == -1 && !j && strstr(w, "no consumable guest source"), "dead binding → REJECT with named reason");
             free(j);
@@ -1358,7 +1358,7 @@ int main(void) {
             uint64_t k64 = 8 * 0x0101010101010101ULL;
             uint8_t k[8]; memcpy(k, &k64, 8);
             uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
-            int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+            int rc = dl ? s2a_libpack_compute_v1(dl, k, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
             if (rc != 0) printf("  tex36: rc=%d why=%s\n", rc, w);
             CHECK(rc == 0 && j && has(j, "\"kind\":\"texture\",\"stage\":\"cs\",\"set\":0,\"binding\":5,\"count\":1,\"slot\":80}"),
                   "tex reg36 → b5 slot 72+2×4=80");
@@ -1587,11 +1587,11 @@ int main(void) {
         const uint8_t ks[8] = { 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
         uint8_t *j = NULL; size_t jl = 0; char w[192] = "";
         // 上限 32768 < Workgroup 45056：出库即拒、原因带两边数值（退回现编由调用方做）
-        int rc = sl_ ? s2a_libpack_compute_v1(sl_, ks, 1, "h", "c", 32768, &j, &jl, w, sizeof w) : -9;
+        int rc = sl_ ? s2a_libpack_compute_v1(sl_, ks, 1, "h", "c", 32768, NULL, &j, &jl, w, sizeof w) : -9;
         if (!(rc == -1 && !j && strstr(w, "compute shared memory 45056 exceeds device limit 32768"))) printf("  spill gate: rc=%d why=%s\n", rc, w);
         CHECK(rc == -1 && !j && strstr(w, "compute shared memory 45056 exceeds device limit 32768"), "spill WG>limit → REJECT 具名");
         // 上限 65536 ≥ 45056：同一份记录照常出库（spill 是批翻链 MSL 侧事实，.spv 原样可用）
-        rc = sl_ ? s2a_libpack_compute_v1(sl_, ks, 1, "h", "c", 65536, &j, &jl, w, sizeof w) : -9;
+        rc = sl_ ? s2a_libpack_compute_v1(sl_, ks, 1, "h", "c", 65536, NULL, &j, &jl, w, sizeof w) : -9;
         CHECK(rc == 0 && j && has(j, "\"kind\":\"compute\""), "WG≤limit → HIT（spill 标记不影响可用的 .spv）");
         free(j);
         s2a_libpack_close(sl_);

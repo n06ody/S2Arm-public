@@ -39,6 +39,8 @@ static class Program
     static ulong Mov32i(int rd, uint v) => 0x0100000000000000UL | ((ulong)v << 20) | (7UL << 16) | (15UL << 12) | (ulong)rd;
     static ulong Ldc(int rd, int slot, int off, int size) => 0xef90000000000000UL | ((ulong)size << 48) | ((ulong)slot << 36) | ((ulong)off << 20) | (7UL << 16) | (255UL << 8) | (ulong)rd;   // size 4 = B32、5 = B64
     static ulong Ldg32(int rd, int ra, int off) => 0xeed4200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
+    static ulong Ldg128(int rd, int ra, int off) => 0xeed6200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;   // LDG.E.128：Rd..Rd+3
+    static ulong Stg128(int rs, int ra, int off) => 0xeede200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rs;   // STG.E.128：Rs..Rs+3
     static ulong Stg32(int rs, int ra, int off) => 0xeedc200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rs;
     // TEXS.2D Rd(仅 R 分量), Ra = x, Rb = y；TidB = 驱动常量段 c2 里的句柄字偏移（8 → 0x20 = 纹理槽 0）
     static ulong Texs2D(int rd, int ra, int rb, int tid) => 0xd800000000000000UL | (1UL << 53) | ((ulong)tid << 36) | (255UL << 28) | ((ulong)rb << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
@@ -96,6 +98,35 @@ static class Program
         var code = Bundles(Sph(1 | (3 << 5) | (1 << 10) | store, -1), new[] {
             Ldc(0, 0, 0x110, 5), Ldc(2, 3, 0, 4), Ldg32(4, 0, 0x20), Stg32(4, 0, 0x40), Stg32(2, 0, 0), EXIT });
         var ctl = new byte[0x880]; ctl[0x10] = 21;
+        return (code, ctl);
+    }
+
+    // ⑭ 片元阶段（8E 新库里 8240 个 PS 带窗口掩码、只有 440 个 VS）：存储缓冲 0 = c0+0x510、1 = c0+0x520，用户常量缓冲 0 首字 = c3[0]
+    //   [B0+0x40] = [B0+0x20]（32 位）；[B0+0x80..0x8f] = [B0+0x30..0x3f]（128 位）；[B0+0] = c3[0]；[B1+0x20] = [B1+0x10]（第二个存储缓冲）；最后写出常量颜色
+    static (byte[] Code, byte[] Ctl) WindowFixturePs()
+    {
+        const uint store = (1u << 16) | (1u << 26);
+        var code = Bundles(Sph(2 | (3 << 5) | (5 << 10) | store, 15), new[] {
+            Ldc(0, 0, 0x510, 5), Ldc(14, 0, 0x520, 5), Ldc(2, 3, 0, 4),
+            Ldg32(4, 0, 0x20), Stg32(4, 0, 0x40),
+            Ldg128(8, 0, 0x30), Stg128(8, 0, 0x80),
+            Stg32(2, 0, 0),
+            Ldg32(5, 14, 0x10), Stg32(5, 14, 0x20),
+            Mov32i(0, 0x3f800000), Mov32i(1, 0x3f000000), Mov32i(2, 0), Mov32i(3, 0x3f800000), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 22;
+        return (code, ctl);
+    }
+
+    // ⑭ 计算阶段：存储缓冲 0 = c0+0x310。[B+0x40] = [B+0x20]；[B+0x80..0x8f] = [B+0x30..0x3f]（128 位）；[B+0] = c3[0]
+    static (byte[] Code, byte[] Ctl) WindowFixtureCs()
+    {
+        var head = new byte[0x100]; BitConverter.TryWriteBytes(head.AsSpan(0), 0x12345679u);
+        var code = Bundles(head, new[] {
+            Ldc(0, 0, 0x310, 5), Ldc(3, 3, 0, 4),
+            Ldg32(2, 0, 0x20), Stg32(2, 0, 0x40),
+            Ldg128(8, 0, 0x30), Stg128(8, 0, 0x80),
+            Stg32(3, 0, 0), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 31;
         return (code, ctl);
     }
 
@@ -302,8 +333,11 @@ static class Program
                 Check("不访问 SSBO 的片元仍声明窗口协议，无掩码", (int?)metadata["ssbo_window_abi"] == 1 &&
                     metadata["ssbo_window_mask"] == null);
             if (stage == "cs")
-                Check("计算出包沿用既有窗口路径", metadata["ssbo_window_abi"] == null &&
-                    metadata["ssbo_window_mask"] == null);
+                Check("计算出包携带窗口合同：协议 1、掩码参与按位与、c0 绑定在表里且入口取用",
+                    (int?)metadata["ssbo_window_abi"] == 1 && (uint?)metadata["ssbo_window_mask"] is uint cmask && cmask != 0 &&
+                    UsesStorageWindowMask(spv, cmask) &&
+                    bindings.OfType<JsonObject>().Any(o => (string)o["kind"] == "drvcb" && (int?)o["bank"] == 0 &&
+                        res.TryGetValue((string)o["msl_name"], out var driver) && driver.Used));
 
             if (stage == "ps")
             {
@@ -452,6 +486,19 @@ static class Program
             Check("⑭ 读回夹具 VS：窗口协议 1、有掩码且参与按位与",
                 (int?)wj["ssbo_window_abi"] == 1 && wmask != 0 && UsesStorageWindowMask(wspv, wmask));
             File.WriteAllText(Path.Combine(emit, "window_vs.key"), wkey);
+            var (wpcode, wpctl) = WindowFixturePs();
+            string wpkey = Convert.ToHexStringLower(SHA256.HashData(wpctl.AsSpan(0, 0x880)))[..16];
+            DshVk.CompileWithSpv(wpkey, "ps", wpcode, wpctl, emit, xc, tables, true, root);
+            var wpj = JsonNode.Parse(File.ReadAllText(Path.Combine(emit, wpkey + "_b.json")));
+            uint wpmask = (uint?)wpj["ssbo_window_mask"] ?? 0;
+            Check("⑭ 读回夹具 PS：窗口协议 1、有掩码且参与按位与、两个存储缓冲槽",
+                (int?)wpj["ssbo_window_abi"] == 1 && wpmask != 0 && UsesStorageWindowMask(File.ReadAllBytes(Path.Combine(emit, wpkey + "_b.spv")), wpmask) &&
+                wpj["bindings"].AsArray().OfType<JsonObject>().Count(o => (string)o["kind"] == "sbuf") == 2);
+            File.WriteAllText(Path.Combine(emit, "window_ps.key"), wpkey);
+            var (ccode, cctl) = WindowFixtureCs();
+            string ckey = Convert.ToHexStringLower(SHA256.HashData(cctl.AsSpan(0, 0x880)))[..16];
+            DshVk.CompileWithSpv(ckey, "cs", ccode, cctl, emit, xc, tables, true, root);
+            File.WriteAllText(Path.Combine(emit, "window_cs.key"), ckey);
         }
         Console.WriteLine(bad == 0 ? "dsh_vk: 全过" : "dsh_vk: 有不通");
         return bad;

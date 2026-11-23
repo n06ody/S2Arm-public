@@ -122,7 +122,8 @@ static char profile_json[256];
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
     snprintf(profile_json, sizeof profile_json, "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":%u}}", profile_align);
-    c->profile_json = profile_json; c->profile_bytes = strlen(profile_json); c->profile_hash = "";
+    c->profile_json = profile_json; c->profile_bytes = strlen(profile_json);
+    c->profile_hash = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";   // 同 profile_json 里的 profileHash（计算请求核二者一致）
     c->translator_closure = "libpack-ssbo-window-test"; c->storage_buffer_offset_alignment = (uint32_t)g_dev.properties.limits.minStorageBufferOffsetAlignment; return 0;
 }
 // 现编不该被走到：出库命中不会现编；出库拒后的退路调用次数就是证据。
@@ -161,16 +162,16 @@ static uint64_t key64(const uint8_t k[8]) { uint64_t v = 0; for (int i = 0; i < 
 
 enum { V_WINDOW, V_OLD_ABI, V_BAD_MASK_ID };   // 库里的顶点段：带窗口合同 / 旧库（无合同）/ 掩码 id 指不到常量
 struct vsrc { char *json; uint8_t *spv; size_t spv_n; char key[17]; };   // 翻译器出的顶点段（_b.json / _b.spv）与它原来的程序键
-static struct vsrc syn, real;   // syn = 原创合成程序（仓内可复现）；real = 私有真实程序（可选，只在本机 build/ 下，不入仓）
-static uint8_t *fs_spv, *fs_real_spv; static size_t fs_n, fs_real_n;
+static struct vsrc syn, real, psrc, csrc;   // csrc = 原创合成计算（dsh_vk WindowFixtureCs）   // psrc = 原创合成片元（同一份翻译器出料，见 dsh_vk WindowFixturePs）   // syn = 原创合成程序（仓内可复现）；real = 私有真实程序（可选，只在本机 build/ 下，不入仓）
+static uint8_t *fs_spv, *fs_real_spv, *vs_triv_spv; static size_t fs_n, fs_real_n, vs_triv_n;
 // 判据用的不变量：读回夹具里每个字都是 xorshift 出来的伪随机数，撞上期望值的概率 2^-32
 static uint32_t rng = 0x9e3779b9u;
 static uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 static void word_put(uint64_t off, uint32_t v) { memcpy(guest + off, &v, 4); }
 
-static int load_vsrc(struct vsrc *v, const char *dir) {
+static int load_vsrc(struct vsrc *v, const char *dir, const char *keyfile) {
     char path[1100]; size_t n = 0;
-    snprintf(path, sizeof path, "%s/window_vs.key", dir); uint8_t *k = read_file(path, &n);
+    snprintf(path, sizeof path, "%s/%s", dir, keyfile); uint8_t *k = read_file(path, &n);
     if (!k || n != 16) return -1;
     memcpy(v->key, k, 16); v->key[16] = 0; free(k);
     snprintf(path, sizeof path, "%s/%s_b.json", dir, v->key); uint8_t *js = read_file(path, &n);
@@ -280,6 +281,111 @@ static struct result run_case(const char *tag, uint32_t dev_align, uint32_t prof
     return res;
 }
 
+// 片元阶段的窗口读回：库 = 无输入的全屏三角形顶点段（abi 1、无存储缓冲）+ 合成片元段（两个存储缓冲槽，32 位 / 128 位读写）。
+//   [B0+0x40] = [B0+0x20]；[B0+0x80..0x8f] = [B0+0x30..0x3f]；[B0+0] = c3[0]；[B1+0x20] = [B1+0x10]。两个缓冲各有各的基址余数。
+static void make_library_ps(const char *tag, const struct vsrc *fsv) {
+    char root[1024], dir[1100];
+    snprintf(root, sizeof root, "%s/lp-%s", case_dir, tag); mkdir(root, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    char hx[2][17], jvs[256];
+    for (int s = 0; s < 2; s++) for (int b = 0; b < 8; b++) snprintf(hx[s] + 2 * b, 3, "%02x", guest_keys[s][b]);
+    snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[],\"ssbo_window_abi\":1}", hx[0]);
+    char *jfs = malloc(strlen(fsv->json) + 32); strcpy(jfs, fsv->json);
+    for (char *p = jfs; (p = strstr(p, fsv->key)); p += 16) memcpy(p, hx[1], 16);
+    struct rec r[4] = {
+        {key64(guest_keys[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {key64(guest_keys[0]), 52, vs_triv_spv, vs_triv_n},
+        {key64(guest_keys[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {key64(guest_keys[1]), 52, fsv->spv, fsv->spv_n},
+    };
+    CHECK(write_container(dir, r, 4) == 0, "%s: library container written", tag);
+    free(jfs);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
+}
+static struct result run_ps_case(const char *tag, uint32_t dev_align, uint32_t rem0, uint32_t rem1) {
+    struct result res = {0};
+    if (!open_session(tag, dev_align, dev_align)) return res;
+    make_library_ps(tag, &psrc);
+    const uint64_t B0_off = SB_BASE + dev_align + rem0, B1_off = SB_BASE + 0x1000 + dev_align + rem1, gbase = (uint64_t)(uintptr_t)guest;
+    for (unsigned i = 0; i < GUEST_BYTES; i += 4) word_put(i, rnd());
+    const uint32_t src0 = 0xCAFEF00Du, src1 = 0xFEEDBEEFu, ubo_val = 0x12345678u;
+    word_put(B0_off + 0x20, src0); word_put(B1_off + 0x10, src1); word_put(UBO_OFF, ubo_val);
+    static uint8_t expect[GUEST_BYTES]; memcpy(expect, guest, sizeof expect);
+    memcpy(expect + B0_off + 0x40, &src0, 4); memcpy(expect + B0_off + 0, &ubo_val, 4);
+    memcpy(expect + B0_off + 0x80, guest + B0_off + 0x30, 16);   // 128 位：四个相邻的随机字原样搬
+    memcpy(expect + B1_off + 0x20, &src1, 4);
+
+    bind_program(tag);
+    p_bind_buf ubo = {1, 0, gbase + UBO_OFF, 16}, s0 = {1, 0, gbase + B0_off, SB_BOUND}, s1 = {1, 1, gbase + B1_off, SB_BOUND};   // 片元阶段（NVN 阶段 1）
+    CHECK(rp_state_op(OP_BIND_UBO, &ubo, sizeof ubo) && rp_state_op(OP_BIND_SSBO, &s0, sizeof s0) && rp_state_op(OP_BIND_SSBO, &s1, sizeof s1), "%s: FS UBO 0 / SSBO 0, 1 bound", tag);
+    rp_S.color.logic_op = 3; rp_S.chmask.mask = 15; rp_S.poly.mode = NVN_POLYGON_MODE_FILL;
+    const uint64_t h0 = s2a_libpack_hits(), j0 = s2a_libpack_rejects();
+    res.drew = draw_and_land(tag, NULL, NULL);
+    res.hit = (int)(s2a_libpack_hits() - h0); res.rej = (int)(s2a_libpack_rejects() - j0);
+    if (res.drew) {
+        for (unsigned i = 0; i < GUEST_BYTES; i++) if (guest[i] != expect[i]) {
+            if (res.mismatches < 6) printf("  %s: byte %#x (B0%+d B1%+d) got %02x want %02x\n", tag, i, (int)i - (int)B0_off, (int)i - (int)B1_off, guest[i], expect[i]);
+            res.mismatches++;
+        }
+    }
+    close_session(tag);
+    return res;
+}
+
+// 计算阶段：库 = 单个计算段（abi 1 + 掩码）。[B+0x40] = [B+0x20]；[B+0x80..0x8f] = [B+0x30..0x3f]（128 位）；[B+0] = c3[0]。
+static void make_library_cs(const char *tag, const struct vsrc *cs, int variant) {
+    char root[1024], dir[1100];
+    snprintf(root, sizeof root, "%s/lp-%s", case_dir, tag); mkdir(root, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    char hx[17];
+    for (int b = 0; b < 8; b++) snprintf(hx + 2 * b, 3, "%02x", guest_keys[0][b]);
+    char *jcs = malloc(strlen(cs->json) + 32); strcpy(jcs, cs->json);
+    for (char *p = jcs; (p = strstr(p, cs->key)); p += 16) memcpy(p, hx, 16);
+    if (variant == V_OLD_ABI) { char *p = strstr(jcs, ",\"ssbo_window_abi\""); CHECK(p != NULL, "%s: window fields present in template", tag); if (p) strcpy(p, "}"); }
+    struct rec r[2] = { {key64(guest_keys[0]), 1, (const uint8_t *)jcs, strlen(jcs)}, {key64(guest_keys[0]), 52, cs->spv, cs->spv_n} };
+    CHECK(write_container(dir, r, 2) == 0, "%s: library container written", tag);
+    free(jcs);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
+}
+static struct result run_cs_case(const char *tag, uint32_t dev_align, uint32_t rem, int variant) {
+    struct result res = {0};
+    if (!open_session(tag, dev_align, dev_align)) return res;
+    make_library_cs(tag, &csrc, variant);
+    const uint64_t B_off = SB_BASE + dev_align + rem, gbase = (uint64_t)(uintptr_t)guest;
+    for (unsigned i = 0; i < GUEST_BYTES; i += 4) word_put(i, rnd());
+    const uint32_t src0 = 0xCAFEF00Du, ubo_val = 0x12345678u;
+    word_put(B_off + 0x20, src0); word_put(UBO_OFF, ubo_val);
+    static uint8_t expect[GUEST_BYTES]; memcpy(expect, guest, sizeof expect);
+    memcpy(expect + B_off + 0x40, &src0, 4); memcpy(expect + B_off + 0, &ubo_val, 4);
+    memcpy(expect + B_off + 0x80, guest + B_off + 0x30, 16);
+
+    bind_program(tag);
+    memcpy(rp_S.skey[5], guest_keys[0], 8); rp_S.skey_ok |= 1u << 5;   // 计算阶段的程序键（生产解析按它取库）
+    p_bind_buf ubo = {5, 0, gbase + UBO_OFF, 16}, s0 = {5, 0, gbase + B_off, SB_BOUND};   // NVN 阶段 5 = 计算
+    CHECK(rp_state_op(OP_BIND_UBO, &ubo, sizeof ubo) && rp_state_op(OP_BIND_SSBO, &s0, sizeof s0), "%s: CS UBO 0 / SSBO 0 bound", tag);
+    const uint64_t h0 = s2a_libpack_hits(), j0 = s2a_libpack_rejects();
+    active = begin_cmd();
+    p_dispatch dp = {0}; dp.x = dp.y = dp.z = 1;
+    rp_dispatch(active, &dp, NULL);
+    nvn_gpu_err e = {0};
+    {
+        static uint64_t fence_no = 100000; rp_pass_flush(active);
+        nvn_gpu_rc rc = nvn_gpu_cmd_commit(active, ++fence_no, on_done, NULL, &e); CHECK(OK(rc), "%s: commit %d %s", tag, rc.code, e.why);
+        rc = nvn_gpu_fence_wait(fence_no, 5000000000ull, &e); CHECK(OK(rc), "%s: wait %d %s", tag, rc.code, e.why);
+        for (int k = 0; k < nw; k++) rp_buf_gpu_write_land(wkey[k], wid[k], 1);
+    }
+    res.hit = (int)(s2a_libpack_hits() - h0); res.rej = (int)(s2a_libpack_rejects() - j0);
+    for (unsigned i = 0; i < GUEST_BYTES; i++) if (guest[i] != expect[i]) {
+        if (res.mismatches < 6) printf("  %s: byte %#x (B%+d) got %02x want %02x\n", tag, i, (int)i - (int)B_off, guest[i], expect[i]);
+        res.mismatches++;
+    }
+    res.drew = res.mismatches == 0;
+    close_session(tag);
+    return res;
+}
+
 // 私有真实程序（一件角色布料蒙皮顶点着色器）：按实例号从存储缓冲 15 读实例数据，输出位置 / 法线 / 切线等。
 //   判据是「同一份数据放在不同基址、不同对齐档下，画出的颜色相同」：数据相对基址的布局固定（B+0 起 0x200 字节、值取 0.05..0.95 的伪随机浮点），
 //   C3 取单位矩阵、C4 / C8 取零；片元读 location 2 的输出（实例数据的函数）当颜色。基准 = 第一档（A=16 对齐基址）。
@@ -338,16 +444,21 @@ int main(int argc, char **argv) {
     if (argc < 3 || argc > 4) return 2;
     case_dir = argv[1];
     char path[1100];
-    if (load_vsrc(&syn, argv[2])) { fprintf(stderr, "stages: window_vs.key / _b.json / _b.spv missing in %s\n", argv[2]); return 2; }
+    if (load_vsrc(&syn, argv[2], "window_vs.key")) { fprintf(stderr, "stages: window_vs.key / _b.json / _b.spv missing in %s\n", argv[2]); return 2; }
     snprintf(path, sizeof path, "%s/libpack_window.frag.spv", case_dir); fs_spv = read_file(path, &fs_n);
     snprintf(path, sizeof path, "%s/libpack_window_real.frag.spv", case_dir); fs_real_spv = read_file(path, &fs_real_n);
     if (!fs_spv || !fs_real_spv) return 2;
     const char *real_dir = argc >= 4 ? argv[3] : NULL;   // 可选：私有真实程序的出料目录（同 window_vs.key 格式）
-    if (real_dir && load_vsrc(&real, real_dir)) { fprintf(stderr, "real stages missing in %s\n", real_dir); return 2; }
+    if (load_vsrc(&csrc, argv[2], "window_cs.key")) { fprintf(stderr, "stages: window_cs.key missing in %s\n", argv[2]); return 2; }
+    if (load_vsrc(&psrc, argv[2], "window_ps.key")) { fprintf(stderr, "stages: window_ps.key / _b.json / _b.spv missing in %s\n", argv[2]); return 2; }
+    snprintf(path, sizeof path, "%s/libpack_full.vert.spv", case_dir); vs_triv_spv = read_file(path, &vs_triv_n);
+    if (!vs_triv_spv) return 2;
+    if (real_dir && load_vsrc(&real, real_dir, "window_vs.key")) { fprintf(stderr, "real stages missing in %s\n", real_dir); return 2; }
     memset(&guest_program, 0, sizeof guest_program); guest_program.magic = MAGIC('P','R','O','G'); guest_program.serial = 100; guest_program.nstage = 2;
     memset(guest_stages, 0xff, sizeof guest_stages);
     for (unsigned st = 0; st < 2; st++) {
         uint8_t code[16], ctl[0x760] = {0}, digest[32]; memset(code, (int)(0x30 + st), sizeof code); put32(ctl + 0x20, sizeof ctl);
+        put32(ctl + 0x748, 8); put32(ctl + 0x74c, 2); put32(ctl + 0x750, 1); put32(ctl + 0x754, 17); put32(ctl + 0x758, 32);   // 作计算阶段用时的局部尺寸 8×2×1、共享内存等（同 nvk_shader_pool_test source()）
         s2a_sha256 h; s2a_sha256_init(&h); s2a_sha256_update(&h, ctl, sizeof ctl); s2a_sha256_update(&h, code, sizeof code); s2a_sha256_final(&h, digest);
         if (s2a_source_keep(digest, st, code, sizeof code, ctl, sizeof ctl)) return 2;
         memcpy(guest_keys[st], digest, 8); guest_stages[st] = (uint8_t)st;
@@ -370,6 +481,38 @@ int main(int argc, char **argv) {
             CHECK(r.drew, "%s one replay draw, none skipped", tag);
             CHECK(r.mismatches == 0, "%s guest bytes (read [B+0x20] -> [B+0x40], c3[0] -> [B+0]) mismatches=%d", tag, r.mismatches);
         }
+    }
+    // 片元阶段：32 位 + 128 位 + 第二个存储缓冲，两个缓冲各取不同的余数
+    for (int t = 0; t < 3; t++) {
+        const uint32_t A = tiers[t], rems[4] = {0, 4, A / 2, A - 4};
+        for (int k = 0; k < 4; k++) {
+            char tag[48]; snprintf(tag, sizeof tag, "ps-A%u-rem%u", A, rems[k]);
+            compile_calls = 0;
+            struct result r = run_ps_case(tag, A, rems[k], rems[(k + 1) % 4]);
+            CHECK(r.hit == 1 && r.rej == 0 && compile_calls == 0, "%s library hit (hits+%d rejects+%d, live compiles %d)", tag, r.hit, r.rej, compile_calls);
+            CHECK(r.drew, "%s one replay draw, none skipped", tag);
+            CHECK(r.mismatches == 0, "%s guest bytes (FS: 32-bit, 128-bit, second SSBO) mismatches=%d", tag, r.mismatches);
+        }
+    }
+    // 计算阶段：32 位 + 128 位读写，A × 余数同图形
+    for (int t = 0; t < 3; t++) {
+        const uint32_t A = tiers[t], rems[4] = {0, 4, A / 2, A - 4};
+        for (int k = 0; k < 4; k++) {
+            char tag[48]; snprintf(tag, sizeof tag, "cs-A%u-rem%u", A, rems[k]);
+            compile_calls = 0;
+            struct result r = run_cs_case(tag, A, rems[k], V_WINDOW);
+            CHECK(r.hit == 1 && r.rej == 0 && compile_calls == 0, "%s library hit (hits+%d rejects+%d, live compiles %d)", tag, r.hit, r.rej, compile_calls);
+            CHECK(r.mismatches == 0, "%s guest bytes (CS: 32-bit, 128-bit) mismatches=%d", tag, r.mismatches);
+        }
+    }
+    // 计算：旧库（无窗口合同）+ 非对齐基址 → 具名 MISS，走现编（现编桩无结果 = 不派发，客体不变）；对齐基址照用
+    {
+        compile_calls = 0;
+        struct result a = run_cs_case("cs-old-aligned", 64, 0, V_OLD_ABI);
+        CHECK(a.hit == 1 && a.mismatches == 0 && compile_calls == 0, "old CS library, aligned base: still used (hit %d mismatches %d compiles %d)", a.hit, a.mismatches, compile_calls);
+        compile_calls = 0;
+        struct result b = run_cs_case("cs-old-unaligned", 64, 4, V_OLD_ABI);
+        CHECK(b.hit == 0 && b.mismatches != 0 && compile_calls == 1, "old CS library, unaligned base: library refused, live compile requested (hit %d compiles %d)", b.hit, compile_calls);
     }
     // 门：旧库（无窗口合同）。对齐基址照旧用库；非对齐基址必须拒库、走现编（现编桩无结果 = 不画），不返回成功兜底
     {

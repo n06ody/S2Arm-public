@@ -165,9 +165,9 @@ static int sb_stage_take(struct sb_view* v, struct fd_stage* st, int geometry, c
     const uint8_t *ext = v->section[0] + SB_META_SIZE;
     window.mode = sb_u32(ext);
     window.id = sb_u32(ext + 4);
-    if (v->stage == 5 || !window.mode) return lp_fail(why, cap, "invalid binary window metadata");
+    if (!window.mode) return lp_fail(why, cap, "invalid binary window metadata");
   }
-  if (v->stage != 5) {
+  {
     int rc = lp_window_apply(window, gfx, spv, n, why, cap);
     if (rc) return rc;
   }

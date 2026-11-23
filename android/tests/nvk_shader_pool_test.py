@@ -189,8 +189,8 @@ def main():
     if sys.argv[1:] == ['--compute-warm-mutants']:
         text = original.read_text()
         mutants = [
-            ('no-record', '    rec.lp_ok = unaligned ? 0 : 2;\n    nvk_prog_warm_note(&rec);',
-             '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
+            ('no-record', '    rec.lp_ok = !unaligned || rec.lp_ssbo_window ? 2 : 0;   // 非对齐且不是窗口库来的（现编出的）：预热不拿库当它的等价物\n    nvk_prog_warm_note(&rec);',
+             '    rec.lp_ok = !unaligned || rec.lp_ssbo_window ? 2 : 0;   // 非对齐且不是窗口库来的（现编出的）：预热不拿库当它的等价物\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
             ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0, NULL) : build(bytes, len, views, nst, rec->identity, 0, NULL);',
@@ -323,9 +323,10 @@ def main():
         # 负对照：计算出库的非对齐闸撤掉（state_ok 对 ckey 不生效），--cs-libpack 必红
         code = original.read_text()
         for name, old, new, expected in (
-            ('unaligned-gate', 'if (!root || !state_ok || (!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u) || nvn_plat_flag("no_libpack", 0)) {',
-             'if (!root || (!ckey && ((stages != 0x1u && stages != 0x3u && stages != 0x7u) || !state_ok)) || nvn_plat_flag("no_libpack", 0)) {',
-             'unaligned CS storage refuses the library'),
+            ('window-gate-ignored', '.storage_alignment = caps.min_ssbo_align, .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,',
+             '.storage_alignment = caps.min_ssbo_align, .require_ssbo_window = 0,',
+             'unaligned CS, library without the window contract'),
+            ('old-gate-off', 'state_ok = LIBPACK_OTHER_STATE; }', '(void)0; }', 'unaligned refuse logs one named line with the program key'),
             # 诊断（对齐闸拒查日志 / 没走库原因备忘）：各撤一处，--cs-libpack 必红在对应断言
             ('no-summary-line', 'else if (!((n + 1) & 63)) {', 'else if (0) {', '141 refusals log two summary lines'),
             ('no-unaligned-note', '            cs_note_set(ckey, CSN_UNALIGNED);\n', '', 'unaligned refuse is remembered'),
@@ -338,7 +339,7 @@ def main():
             result = run('cs-libpack-' + name, path, args=('--cs-libpack',))
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 5 libpack CS negative controls')
+        print('PASS: 6 libpack CS negative controls')
         return 0
 
     if sys.argv[1:] == ['--graphics-image-mutants']:

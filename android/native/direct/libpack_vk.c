@@ -409,6 +409,8 @@ struct lp_spv_bindings {
     int count, overflow, support, support_is_ubo, uses_nonzero_set;
 };
 enum lp_window_mode { LP_WINDOW_LEGACY, LP_WINDOW_UNUSED, LP_WINDOW_FIXED, LP_WINDOW_MASK };
+#define LP_WINDOW_UBO 0x100u   // mode 高位：含用户常量缓冲来源存储的计算程序（见 lp_has_ubo_storage）；低 8 位是 lp_window_mode
+#define LP_WINDOW_KIND(mode) ((mode) & 0xffu)
 struct lp_window { uint32_t mode, id; };
 struct lp_stage_contract {
     struct lp_window window;
@@ -902,7 +904,23 @@ static int lp_fix_ssbo_window_mask(uint8_t *spv, size_t n, uint32_t id, uint32_t
     return -1;
 }
 
-static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract, char *why, size_t cap) {
+// 带用户常量缓冲来源存储（sbuf_ubo / ubo_ptr）的计算程序：基址在运行时从常量缓冲读，对齐与否编译期和取库时都不知道，回放对这类来源不挪窗口。
+//   非对齐时沿用旧库的对齐门、不放行：这一位随窗口 mode 存进 S2SB 记录（高位，低 8 位仍是 lp_window_mode）。
+static int lp_has_ubo_storage(struct s2a_jv top) {
+    struct s2a_jv bindings;
+    if (s2a_jv_obj_find(top, "bindings", &bindings)) return 0;
+    const int count = s2a_jv_arr_count(bindings);
+    for (int i = 0; i < count; i++) {
+        struct s2a_jv binding;
+        char kind[24];
+        if (!s2a_jv_arr_item(bindings, i, &binding) && !jf_str(binding, "kind", kind, sizeof kind) &&
+            (!strcmp(kind, "sbuf_ubo") || !strcmp(kind, "ubo_ptr")))
+            return 1;
+    }
+    return 0;
+}
+
+static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract, int compute, char *why, size_t cap) {
     struct s2a_jv field;
     int has_mask = !s2a_jv_obj_find(top, "ssbo_window_mask", &field);
     if (s2a_jv_obj_find(top, "ssbo_window_abi", &field)) {
@@ -912,13 +930,14 @@ static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract
     uint32_t abi;
     if (jf_u32(top, "ssbo_window_abi", &abi) || abi != 1)
         return lp_fail(why, cap, "%s unknown SSBO window ABI", contract->key);
+    const uint32_t ubo = compute && lp_has_ubo_storage(top) ? LP_WINDOW_UBO : 0;
     if (has_mask) {
-        contract->window.mode = LP_WINDOW_MASK;
+        contract->window.mode = LP_WINDOW_MASK | ubo;
         if (jf_u32(top, "ssbo_window_mask", &contract->window.id) || !contract->window.id)
             return lp_fail(why, cap, "%s invalid SSBO window mask", contract->key);
         return 0;
     }
-    contract->window.mode = LP_WINDOW_UNUSED;
+    contract->window.mode = LP_WINDOW_UNUSED | ubo;
     struct s2a_jv bindings;
     if (!s2a_jv_obj_find(top, "bindings", &bindings)) {
         int count = s2a_jv_arr_count(bindings);
@@ -927,7 +946,7 @@ static int lp_window_parse(struct s2a_jv top, struct lp_stage_contract *contract
             char kind[24];
             if (!s2a_jv_arr_item(bindings, i, &binding) &&
                 !jf_str(binding, "kind", kind, sizeof kind) && !strcmp(kind, "sbuf")) {
-                contract->window.mode = LP_WINDOW_FIXED;
+                contract->window.mode = LP_WINDOW_FIXED | ubo;
                 break;
             }
         }
@@ -958,7 +977,8 @@ static uint32_t lp_spv_tex_classes(const uint8_t *spv, size_t n) {
 
 static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx *gfx,
                            uint8_t *spv, size_t n, char *why, size_t cap) {
-    if (window.mode > LP_WINDOW_MASK || (window.mode == LP_WINDOW_MASK) != (window.id != 0))
+    const uint32_t kind = LP_WINDOW_KIND(window.mode);
+    if ((window.mode & ~(0xffu | LP_WINDOW_UBO)) || kind > LP_WINDOW_MASK || (kind == LP_WINDOW_MASK) != (window.id != 0))
         return lp_fail(why, cap, "invalid SSBO window mode or mask");
     if (gfx && gfx->require_ssbo_window && gfx->window_tex_classes) {
         const uint32_t classes = lp_spv_tex_classes(spv, n);
@@ -967,10 +987,12 @@ static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx
             return S2A_LIBPACK_MISS;
         }
     }
-    if (window.mode != LP_WINDOW_MASK) {
+    if ((window.mode & LP_WINDOW_UBO) && gfx && gfx->require_ssbo_window)
+        return lp_fail(why, cap, "UBO-sourced storage keeps the aligned gate");
+    if (kind != LP_WINDOW_MASK) {
         if (!gfx || !gfx->require_ssbo_window) return 0;
-        if (window.mode == LP_WINDOW_FIXED) return lp_fail(why, cap, "SBUFP uses a fixed SSBO window");
-        if (window.mode == LP_WINDOW_LEGACY) {
+        if (kind == LP_WINDOW_FIXED) return lp_fail(why, cap, "SBUFP uses a fixed SSBO window");
+        if (kind == LP_WINDOW_LEGACY) {
             if (why && cap) snprintf(why, cap, "stage has no SSBO window variant");
             return S2A_LIBPACK_MISS;
         }
@@ -1053,8 +1075,8 @@ static int lp_stage_from_bytes(struct s2a_libpack *lp, const uint8_t key[8], uns
             { lp_fail(why, why_size, "%s %s gs_input_topology is not %d", khex, jname, gs_topology); goto done; }
         if (sn < 20 || (sn & 3) || *(const uint32_t *)spv != 0x07230203u)
             { lp_fail(why, why_size, "%s %s is not a SPIR-V module", khex, sname); goto done; }
-        if (!compute) {
-            int window = lp_window_parse(top, contract, why, why_size);
+        {
+            int window = lp_window_parse(top, contract, compute, why, why_size);
             if (!window && !packing) window = lp_window_apply(contract->window, gfx, spv, sn, why, why_size);
             if (window != 0) { out = window; goto done; }
         }
@@ -1289,8 +1311,8 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
 
 // 计算程序：单键（rp_S.skey[5]）的 _b.json（stage "cs"）+ _b.spv → kind "compute" 的 v1/v2 结果，
 //   接受口径 = nvn_vk_program_parse_compute（与现编结果同一个 build_compute）。计算合同多出的四个顶层事实：
-//   hasUnalignedStorageBuffer：false——dsh 批翻链的翻译器（translator/dmsh_xlate）不覆写
-//     IGpuAccessor.QueryHasUnalignedStorageBuffer，接口缺省 false，这份 .spv 就是按 false 翻的（照实）；
+//   hasUnalignedStorageBuffer：库段带窗口掩码（取库时按本机对齐固化）时写 true（这份 .spv 按「基址可能不对齐」翻译），
+//     旧库（无合同）写 false（批翻链按缺省 false 翻，照实）；非对齐基址只放行带窗口合同的库、且不含用户常量缓冲来源存储（lp_window_apply）；
 //   c0Reads：null——_b.json 只有 drv_reads（按 MSL 文本的 vec4 粒度 + dynamic 标），给不出合同要的
 //     字节精度读集；null 是解析器认可的「未知」，运行时按完整驱动 c0 布局填；
 //   supportReads：null——_b.json 不带 support 读集，同上按「未知」写，运行时整块按恒等值填；
@@ -1299,7 +1321,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
 //   绑定号 = arg_id×6 + 5。计数口径同 program_v1（hit / miss / reject 三个计数器共用）。
 static int lp_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size, int account) {
     struct s2a_libpack *lp = (struct s2a_libpack *)lp_c;
     if (!lp || !lp->p.idx || !key || !json || !json_len) return S2A_LIBPACK_INVALID;
@@ -1308,15 +1330,15 @@ static int lp_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     int sep = 0, uses_v2 = 0; uint32_t got = 0;
     uint32_t csupport = 0;
     struct lp_stage_contract contract = {0};
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, NULL, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, gfx, &st, &bd, &sep, &got, &csupport, &uses_v2, &contract, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0 && uses_v2) rc = lp_finish_v2_bindings(&contract, &bd, &sep, 1, why, why_size);
     if (rc == 0) {
         struct jw j = {0};
         int version = uses_v2 ? 2 : 1;
         jw_fmt(&j, "{\"schema\":\"s2a-direct-program-v%d\",\"content\":{\"contract\":\"s2a-direct-program-content-v%d\",\"identity\":{\"directABI\":%u,\"translatorClosure\":\"%s\",\"profileHash\":\"%s\"},\"kind\":\"compute\","
-                   "\"hasUnalignedStorageBuffer\":false,\"c0Reads\":null,\"supportReads\":null,\"stages\":[",
-               version, version, direct_abi, translator_closure ? translator_closure : "", profile_hash ? profile_hash : "");
+                   "\"hasUnalignedStorageBuffer\":%s,\"c0Reads\":null,\"supportReads\":null,\"stages\":[",
+               version, version, direct_abi, translator_closure ? translator_closure : "", profile_hash ? profile_hash : "", LP_WINDOW_KIND(contract.window.mode) == LP_WINDOW_MASK ? "true" : "false");
         jw_put(&j, st.b ? (char *)st.b : "", st.n);
         jw_str(&j, "],\"bindings\":[");
         jw_put(&j, bd.b ? (char *)bd.b : "", bd.n);
@@ -1335,15 +1357,15 @@ static int lp_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
 }
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size) {
-    return lp_compute_v1(lp_c, key, direct_abi, profile_hash, translator_closure, shared_limit, json, json_len, why, why_size, 1);
+    return lp_compute_v1(lp_c, key, direct_abi, profile_hash, translator_closure, shared_limit, gfx, json, json_len, why, why_size, 1);
 }
 
 int s2a_libpack_shadow_json(const struct s2a_libpack *lp, const uint8_t keys[6][8], uint32_t stages,
                             const struct s2a_libpack_gfx *gfx, uint32_t abi, const char *profile,
                             const char *closure, uint32_t shared, uint8_t **out, size_t *len, char *why, size_t cap) {
-    if (stages == 32) return lp_compute_v1(lp, keys[0], abi, profile, closure, shared, out, len, why, cap, 0);
+    if (stages == 32) return lp_compute_v1(lp, keys[0], abi, profile, closure, shared, gfx, out, len, why, cap, 0);
     return lp_program_v1(lp, keys, stages, gfx, abi, profile, closure, out, len, why, cap, 0);
 }
 
