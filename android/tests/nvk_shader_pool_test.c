@@ -2492,7 +2492,7 @@ static int win_part_case(const char *tag, int vs_mask, int unaligned, int part, 
     return 0;
 }
 
-static int c2_gate_case(const char *tag, int flag, int want_lib) {
+static int c2_gate_case(const char *tag, int flag, int want_lib, int with_c2) {
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
     memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
@@ -2513,7 +2513,8 @@ static int c2_gate_case(const char *tag, int flag, int want_lib) {
     char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
     char jvs[300], jfs[300], jg0[340], jg3[340];
     snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
-    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[{\"msl_name\":\"fp_c2\",\"kind\":\"drvcb\",\"bank\":2,\"arg_id\":0}]}", hx[1]);
+    snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[%s]}", hx[1],
+             with_c2 ? "{\"msl_name\":\"fp_c2\",\"kind\":\"drvcb\",\"bank\":2,\"arg_id\":0}" : "");
     snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
     snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
     // 片元 SPIR-V：set 0 / binding 4 的 Uniform Block（struct{float}）：OpDecorate %2 Block；%4 DescriptorSet 0 / Binding 4；%1 float；%2 struct；%3 ptr Uniform；%4 变量
@@ -2522,7 +2523,7 @@ static int c2_gate_case(const char *tag, int flag, int want_lib) {
         (3u << 16) | 22u, 1, 32, (3u << 16) | 30u, 2, 1, (4u << 16) | 32u, 3, 2, 2, (4u << 16) | 59u, 3, 4, 2};
     struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
         {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
-        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv_fs_ubo, sizeof spv_fs_ubo},
+        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, with_c2 ? (const uint8_t *)spv_fs_ubo : (const uint8_t *)spv0, with_c2 ? sizeof spv_fs_ubo : sizeof spv0},
         {lp_key(k[2]), 112, (const uint8_t *)jg0, strlen(jg0)}, {lp_key(k[2]), 115, (const uint8_t *)jg3, strlen(jg3)},
         {lp_key(k[2]), 120, (const uint8_t *)spv_vg0, sizeof spv_vg0}, {lp_key(k[2]), 123, (const uint8_t *)spv_vg3, sizeof spv_vg3},
     };
@@ -2570,8 +2571,9 @@ static int lib_binst_test(void) {
 }
 static int c2_gate_test(void) {
     // 图形库程序读驱动句柄表（drvcb bank 2）：debug.s2a.nvk_libpack_gfx_c2 缺省 0 = 挡下走现编（8E 第 3 班全黑的触发）；1 = 放行走库
-    c2_gate_case("c2 gate off (default) → live compile", 0, 0);
-    c2_gate_case("c2 gate open → library", 1, 1);
+    c2_gate_case("c2 gate off (default) → live compile", 0, 0, 1);
+    c2_gate_case("c2 gate open → library", 1, 1, 1);
+    c2_gate_case("c2 gate closed, program without a handle-table binding → library", 0, 1, 0);
     printf("nvk shader pool (library gfx c2 gate): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

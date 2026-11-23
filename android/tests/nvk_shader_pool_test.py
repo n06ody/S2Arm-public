@@ -276,7 +276,7 @@ def main():
         code = original.read_text()
         for name, old, new, expected in (
             ('gate-removed', '!ckey && lrc == S2A_LIBPACK_HIT && !nvn_plat_flag("nvk_libpack_gfx_c2", 0)', '0', 'c2 gate off (default)'),
-            ('always-blocks', 'if (has_c2) {', 'if (1) {', 'c2 gate open'),
+            ('always-blocks', 'if (has_c2) {', 'if (1) {', 'c2 gate closed, program without a handle-table binding'),
             ('scan-misses-uniform', 'static const char key[] = "\\"slot\\":2}", kind[]', 'static const char key[] = "\\"slot\\":3}", kind[]', 'c2 gate off (default)'),
         ):
             assert code.count(old) == 1, (name, 'mutation anchor', code.count(old))
