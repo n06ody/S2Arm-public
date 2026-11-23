@@ -285,10 +285,17 @@ s2a_gate_step "$out/nvn-vk-format-test"
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/ts_queue_test.c" -o "$out/ts-queue-test"
 s2a_gate_step "$out/ts-queue-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    -I "$repo_dir/graphics/nvn/replay" -pthread "$android_dir/tests/nvk_land_auto_test.c" -lm -o "$out/land-auto-test"
+s2a_gate_step "$out/land-auto-test"
 # #653：逐报告时间戳校准纯数学（不建 Vulkan device，不替代真机/VVL 验证）。
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/report_ts_test.c" -o "$out/report-ts-test"
 s2a_gate_step "$out/report-ts-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    -I "$android_dir/../graphics/nvn/gfx/nvn" -I "$android_dir/../graphics/nvn/gfx/nvn/include" \
+    -pthread "$android_dir/tests/nvk_gpu_idle_test.c" -o "$out/gpu-idle-test"
+s2a_gate_step "$out/gpu-idle-test"
 # VM 夹具端点核对（宿主源码级，mac 也跑）：svc_*.c 新引用的 core 符号漏登记当场红，不等 Linux 真链
 s2a_gate_step "$PY" "$android_dir/core-link/runtime-tests/vm/check_endpoints.py" --out "$out/vm-endpoints"
 # 宽屏 screen_metrics 的宿主两步（screen-widen-test / widen-loader-test）11-01 挪进合入前层：tests/android_screen_host_test.sh
@@ -312,6 +319,8 @@ s2a_gate_step "$PY" "$android_dir/tests/direct_batch_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/direct_prepare_test.py"
 # 首局预热随包种子整理（android/tools/vk_warm_seed.py）：校验 / 配对 / 按程序身份滤管线 / 与来源先后无关；宿主读种子的用例在 nvk_warm_modules_test.sh
 s2a_gate_step "$PY" "$android_dir/tests/vk_warm_seed_test.py"
+# 普通程序（不带存储缓冲窗口）种子补件：真编译器端到端（真实请求 → 编译 → 调试采集 → 再编译 → 资源根种子）+ 补件各臂（关 / 开 / 别的 profile / 身份被改 / 摘要被改 / 文件缺失，只有「开且补件完好」免前台翻译）
+s2a_gate_step "$PY" "$android_dir/tests/vk_warm_nowindow_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链接闭包：自动补链 / 弱引用放行 / 无提供方点名红 / 替身优先
 # 新回放层：真实图形/计算请求生产入口的贴图池容量、超限与调试读数。
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"

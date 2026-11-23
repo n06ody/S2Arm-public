@@ -150,7 +150,8 @@ GEOMETRY_STAGES = ('vs', 'gs', 'fs')
 
 REQUEST_KEYS = frozenset(('request', 'schema', 'session', 'generation', 'requestId',
                           'directABI', 'translatorClosure', 'runtimeCompilerABI',
-                          'sourceParserVersion', 'kindCheck', 'profile', 'program'))
+                          'sourceParserVersion', 'kindCheck', 'profile', 'program',
+                          'requiresLinkedVaryingInterface'))
 CAPTURE_KEYS = frozenset(('schema', 'directABI', 'translatorClosure', 'sourceParserVersion',
                           'profileHash', 'entries'))
 
@@ -768,6 +769,9 @@ def validate_request(raw, what):
     if set(names) != set(expected) and not (v2 and set(names) == set(GEOMETRY_STAGES)):
         _fail(f'{what}: program.stages {sorted(names)} is not {list(expected)}'
               + (f' or {list(GEOMETRY_STAGES)}' if v2 else '') + f' for kind={kind}')
+    linked = doc.get('requiresLinkedVaryingInterface', False)
+    if not isinstance(linked, bool) or (linked and (kind != 'graphics' or tuple(names) != GRAPHICS_STAGES)):
+        _fail(f'{what}: requiresLinkedVaryingInterface requires a boolean and a VS/FS pair when enabled')
     if REQUEST_ID.fullmatch(request_id) and len(request_id) != 16 * len(names):
         _fail(f'{what}: requestId is not {len(names)} concatenated 8-byte stage keys')
 

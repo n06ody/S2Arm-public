@@ -98,7 +98,7 @@ static void wsi_consume_acquired(struct nvn_gpu_surface_s *s) {
         VkSubmitInfo si; memset(&si, 0, sizeof si);
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[i]; si.pWaitDstStageMask = &st;
         pthread_mutex_lock(&g_submit_mu);
-        VkResult r = vkQueueSubmit(g.queue, 1, &si, f);
+        VkResult r = idle_submit(NULL, &si, f);
         pthread_mutex_unlock(&g_submit_mu);
         if (r == VK_SUCCESS) s2a_vk_wait_fences(g.d, 1, &f, 2000000000ull);
         vkDestroyFence(g.d, f, NULL);
@@ -133,13 +133,13 @@ static void wsi_destroy_swapchain(struct nvn_gpu_surface_s *s) {
 static int wsi_wait_acquire_free(uint64_t seq, uint64_t timeout_ns) {
     if (!seq) return 0;
     uint64_t deadline = add_sat(now_ns(), timeout_ns);
-    int ok = 1;
+    int ok = 1, first = 1;
     pthread_mutex_lock(&g_mu);
     while (g.wsi_done < seq && !g.device_lost && !g.stop) {
         uint64_t now = now_ns();
         if (now >= deadline) { ok = 0; break; }
         struct timespec ts; deadline_after(&ts, deadline - now);
-        pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+        idle_cond_wait(NVN_GPU_WAIT_WSI_SLOT, &ts, &first);
     }
     if (g.wsi_done < seq && (g.device_lost || g.stop)) ok = 0;
     pthread_mutex_unlock(&g_mu);
@@ -149,13 +149,13 @@ static int wsi_wait_acquire_free(uint64_t seq, uint64_t timeout_ns) {
 // 等内部段与游戏段都执行完：之后销毁交换链 / 信号量才合法。0 = 等到了。
 static int wsi_wait_drained(uint64_t timeout_ns) {
     uint64_t deadline = add_sat(now_ns(), timeout_ns);
-    int ok = 1;
+    int ok = 1, first = 1;
     pthread_mutex_lock(&g_mu);
     while (g.qhead || g.busy) {
         uint64_t now = now_ns();
         if (now >= deadline) { ok = 0; break; }
         struct timespec ts; deadline_after(&ts, deadline - now);
-        pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+        idle_cond_wait(NVN_GPU_WAIT_WSI_DRAIN, &ts, &first);
     }
     pthread_mutex_unlock(&g_mu);
     return ok ? 0 : -1;
@@ -619,6 +619,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     struct vk_segment *seg = calloc(1, sizeof *seg);
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (ok && seg && g.idle_bits && c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
     VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
     pthread_mutex_lock(&g_submit_mu);
@@ -631,7 +632,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
-        r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        r = si.commandBufferCount ? idle_submit(seg, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);

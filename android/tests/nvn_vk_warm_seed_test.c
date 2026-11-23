@@ -8,6 +8,8 @@
 //   bad_pipe      程序种子好、管线种子校验和坏 → 程序照用、管线打黄一行不用
 //   undecided     程序清单还没载入时管线 load 返回 -1（稍后重试），程序载入后再 load 收下种子
 //   other_profile 种子目录名对得上但文件头是另一台设备 profile 记的 → 打黄不用
+// 另有 --emit / --installed / --installed-nowindow 三个模式，由 nvk_warm_modules_test.sh 先跑真实安装器再读：--installed-nowindow 读安装后修订里 nowindow/ 的补件（替换管线清单 + 程序结果走受控读取），
+//   库外 / 环 / 绝对链接、桶号不符与目录别名由脚本换进去，期望被拒。
 // 期望值不来自被测实现：种子文件按格式手写（程序 60 + n*600 + 8：88 字节条目头 + 两段 0x100 字节 c1、管线 32 + n*388），种子目录名由测试自己算 SHA-256，
 // 管线紧凑配方的字段偏移按 nvn_vk_pipe_warm.c pw_desc_write 的顺序手算（smask 0、cfmt 1..32、dfmt 33、sfmt 37、samples 41、
 // lmap 45..52、prim 53、patch 57、restart 61、blend 62..125、color 126、chmask 130、ms 134..143、attr 144..207、stream 208..335、
@@ -27,6 +29,7 @@
 #include "nvn_plat.h"
 #include "rp_shader.h"
 #include "direct/compile_request.h"
+#include "direct/program_cache.h"
 #include "direct/sha256.h"
 
 static int checks, failures;
@@ -39,7 +42,8 @@ static const int32_t g_abi = 7;
 static char g_warn[4096];   // 本用例所有黄行（拼起来）
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE && g_cache[0] ? g_cache : NULL; }
 const char *nvk_session_cache_dir(void) { return g_cache[0] ? g_cache : NULL; }
-int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
+static int g_nowindow = 1;   // nvk_warm_nowindow：缺省开（同产品缺省）；--installed 旧用例关掉，只测程序清单旁的种子叶子
+int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_warm_nowindow") ? g_nowindow : dflt; }
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
     if (level == NVN_PLAT_LOG_WARN && strlen(g_warn) + strlen(text) + 2 < sizeof g_warn) { strcat(g_warn, text); strcat(g_warn, "\n"); }
@@ -170,6 +174,8 @@ static void setup(const char *base, const char *name) {
 }
 static const int k_seed_prog[] = {1, 2}; static const uint32_t k_masks[] = {3, 3, 5};
 static const int k_seed_pipe[] = {1, 2, 9};   // 9：程序不在程序种子里
+static const int k_nowindow_ident = 7;
+static const uint8_t k_nowindow_result[] = "nowindow program result bytes: opaque to the cache, checked by digest only";
 
 static void case_seed_used(void) {
     write_prog(g_seed_prog, k_seed_prog, k_masks, 2, g_profile, 0);
@@ -274,9 +280,36 @@ int main(int argc, char **argv) {
         setup(argv[2], "input");
         write_prog(g_seed_prog, k_seed_prog, k_masks, 2, g_profile, 0);
         write_pipe(g_seed_pipe, k_seed_pipe, 3, 0);
+        // 非窗口补件（nowindow/）：一份普通程序结果（程序缓存格式，头 / 摘要合法）+ 一份只有 1 条的替换管线清单（与上一级的 2 条区分开）
+        char nw[800]; snprintf(nw, sizeof nw, "%s/nowindow", g_seed); mkdir(nw, 0700);
+        uint8_t id[32]; ident(k_nowindow_ident, id);
+        char why[128] = "";
+        CHECK(s2a_program_cache_store(nw, id, k_nowindow_result, sizeof k_nowindow_result, why, sizeof why) == 0, "store nowindow result (%s)", why);
+        char np[900]; snprintf(np, sizeof np, "%s/pipes-v1-352.bin", nw);
+        static const int one[] = {2};
+        write_pipe(np, one, 1, 0);
+        return failures != 0;
+    }
+    // --installed-nowindow <revision> <cache> <程序条数> <管线条数> <补件程序结果 0|1>：补件开着读，管线读 nowindow/ 的替换清单，程序结果走受控读取
+    if (argc == 7 && !strcmp(argv[1], "--installed-nowindow")) {
+        snprintf(g_cache, sizeof g_cache, "%s", argv[3]);
+        setenv("S2A_SHADER_REVISION_ROOT", argv[2], 1);
+        int progs = atoi(argv[4]), pipes = atoi(argv[5]), result = atoi(argv[6]);
+        CHECK(nvk_prog_warm_load() == progs, "installed program seed: expected %d rows (%s)", progs, g_warn);
+        CHECK(nvk_pipe_warm_load() == pipes, "installed nowindow pipe recipes: expected %d rows (%s)", pipes, g_warn);
+        char sd[600], dir[700];
+        CHECK(nvk_prog_warm_seed_dir(sd, sizeof sd) == 1, "program seed in use");
+        snprintf(dir, sizeof dir, "%s/nowindow", sd);
+        uint8_t id[32], sha_out[32], *bytes = NULL; size_t len = 0; char why[160] = "";
+        ident(k_nowindow_ident, id);
+        int rc = s2a_program_cache_load_installed(dir, id, &bytes, &len, sha_out, why, sizeof why);
+        CHECK((rc == 0) == (result != 0), "installed nowindow program result: expected %s, got rc=%d (%s)", result ? "loaded" : "rejected", rc, why);
+        if (!rc) CHECK(len == sizeof k_nowindow_result && !memcmp(bytes, k_nowindow_result, len), "installed nowindow program result bytes");
+        free(bytes);
         return failures != 0;
     }
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--installed")) {
+        g_nowindow = 0;
         snprintf(g_cache, sizeof g_cache, "%s", argv[3]);
         setenv("S2A_SHADER_REVISION_ROOT", argv[2], 1);
         int expected = atoi(argv[4]);

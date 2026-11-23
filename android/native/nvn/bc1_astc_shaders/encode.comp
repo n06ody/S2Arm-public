@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source {
+    uvec2 blocks[];
+} src;
+layout(set = 0, binding = 1, std430) buffer Target {
+    uint needs_rgba;
+    uvec4 blocks[];
+} dst;
+layout(push_constant) uniform Params {
+    uint block_count;
+} params;
+
+uvec3 rgb565(uint bits) {
+    // 像素值取到最近的 UNORM8，端点之差仍以各通道的原始量化范围计算。
+    uvec3 components = (uvec3(bits) >> uvec3(11, 5, 0)) & uvec3(31, 63, 31);
+    return (components * 255u + uvec3(15, 31, 15)) / uvec3(31, 63, 31);
+}
+
+uint color_sum(uvec3 color) {
+    return color.r + color.g + color.b;
+}
+
+uint quarter_weights(uint selectors, bool exchange) {
+    // BC1 的 0,1,2,3 分别是 ASTC 权重索引 0,3,1,2（0/21/43/64）。
+    uint levels = 0u;
+    for (uint i = 0u; i < 32u; i += 2u) {
+        uint selector = (selectors >> i) & 3u;
+        uint level = (0x9cu >> (2u * selector)) & 3u;
+        levels |= (exchange ? 3u - level : level) << i;
+    }
+    return levels;
+}
+
+uint midpoint_index(uint selector, bool exchange) {
+    // 三色模式只用索引 0,1,2。这里用三进制下标选 0/32/64 三个力点。
+    uint level = (0x18u >> (2u * selector)) & 3u;  // 0,2,1
+    return exchange ? 2u - level : level;
+}
+
+uvec2 midpoint_weights(uint selectors, bool exchange) {
+    // Khronos DF 规范的 quint 编码。反解 7 位码字并只保留三种
+    // 可达的数字 0/2/4，按第一个数字变化最快排列（权重 0/32/64）。
+    const uint quint_codes[27] = uint[27](
+          0u,   2u,   4u,  16u,  18u,  20u,   5u,  21u,   6u,
+         64u,  66u,  68u,  80u,  82u,  84u,  69u,  85u,  22u,
+        102u,  70u,  38u, 118u,  86u,  54u,  39u,  55u,   7u
+    );
+    uvec2 packed = uvec2(0);
+    for (uint i = 0u; i < 5u; i++) {
+        uint group = selectors >> (6u * i);
+        uint a = midpoint_index(group & 3u, exchange);
+        uint b = midpoint_index((group >> 2u) & 3u, exchange);
+        uint c = midpoint_index((group >> 4u) & 3u, exchange);
+        uint code = quint_codes[a + 3u * b + 9u * c];
+        packed.x |= code << (7u * i);
+        if (i == 4u) packed.y = code >> 4u;
+    }
+    // 最后一个值以三个低位存放，剩下的 quint 视为零。
+    packed.y |= (midpoint_index(selectors >> 30u, exchange) * 2u) << 3u;
+    return packed;
+}
+
+uvec4 encode_opaque(uint c0, uint c1, uint selectors) {
+    const uint RGB_DIRECT = 8u << 13u;
+    // WxH 4x4、单分区、单平面，使用规范的 Q4 或 Q5 块模式。
+    bool midpoint = c0 <= c1;
+    uint mode = midpoint ? 0x52u : 0x42u;
+    uvec3 a = rgb565(c0), b = rgb565(c1);
+    bool exchange = color_sum(a) > color_sum(b);
+    uvec3 lo = exchange ? b : a;
+    uvec3 hi = exchange ? a : b;
+    // CEM 8 按 R0/R1/G0/G1/B0/B1 编 8 位端点。按 RGB 和升序可避开蓝收缩模式。
+    uvec4 out_block = uvec4(
+        mode | RGB_DIRECT | (lo.r << 17u) | (hi.r << 25u),
+        (hi.r >> 7u) | (lo.g << 1u) | (hi.g << 9u) | (lo.b << 17u) | (hi.b << 25u),
+        hi.b >> 7u,
+        0u
+    );
+    uvec2 weights = midpoint ? midpoint_weights(selectors, exchange)
+                             : uvec2(quarter_weights(selectors, exchange), 0u);
+    out_block.z |= bitfieldReverse(weights.y);
+    out_block.w = bitfieldReverse(weights.x);
+    return out_block;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.block_count) return;
+    uvec2 bc1 = src.blocks[index];
+    uint c0 = bc1.x & 0xffffu;
+    uint c1 = bc1.x >> 16u;
+    uint selectors = bc1.y;
+    if (c0 <= c1 && ((selectors & (selectors >> 1u)) & 0x55555555u) != 0u) {
+        // 这个索引的黑色不在端点连线上。标记整张纹理走原解码；候选块用合法透明黑。
+        atomicOr(dst.needs_rgba, 1u);
+        dst.blocks[index] = uvec4(0xfffffdfcu, 0xffffffffu, 0u, 0u);
+        return;
+    }
+    dst.blocks[index] = encode_opaque(c0, c1, selectors);
+}

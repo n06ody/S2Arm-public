@@ -8,6 +8,7 @@
 // 平台有零拷贝后备（安卓 AHB）时镜像与同步都可以省掉，那是平台接口「内存池后备」一组，接它不改这里的对外形状。
 #include "rp_exec.h"
 #include "rp_res.h"
+#include "rp_idle.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_hmap.h"
@@ -376,29 +377,62 @@ static void land_restale(struct shadow *s, int mi, uint64_t off, uint64_t len) {
     const uint64_t lo = (uintptr_t)(s->mem + off) - s->page0;
     stale_set(m, lo / ps, (lo + len - 1) / ps);
 }
-void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
+// refs 按池和登记号排序。同一池只走一趟账本；已合并撤销的登记留空。
+void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans) {
+    for (uint32_t first = 0; first < count;) {
+        const uint64_t key = refs[first].pool_key;
+        uint32_t end = first + 1;
+        while (end < count && refs[end].pool_key == key) end++;
+        pthread_mutex_lock(&g_bmu);
+        const struct shadow *s = nvn_hm_get(&g_shadow, &key);
+        for (int i = 0; s && i < s->ngw; i++) {
+            const struct gpu_write *w = &s->gw[i];
+            if (w->sub != rp_sub_serial() || w->landing) continue;
+            uint32_t lo = first, hi = end;
+            while (lo < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2;
+                if (refs[mid].id < w->id) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo < end && refs[lo].id == w->id)
+                spans[refs[lo].index] = (nvn_gpu_readback_span){s->m[w->mi].buf, w->off, w->len, UINT64_MAX};
+        }
+        pthread_mutex_unlock(&g_bmu);
+        first = end;
+    }
+}
+void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {
+    rp_buf_gpu_write_land_from(pool_key, id, ok, NULL);
+}
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
+    nvn_gpu_buf source_hint = NULL;
     const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
+        const uint8_t *mirror = ok && !staged ? nvn_gpu_buf_cpu(s->m[wmi].buf) : NULL;
+        if (ok) src = staged ? staged : (mirror ? mirror + off : NULL);
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
+        source_hint = s->m[wmi].buf;
         s->gw[i].landing = 1; found = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
         break; }
     pthread_mutex_unlock(&g_bmu);
     if (!found) return;
+    const struct nvn_gpu_idle_observer *o = src ? rp_idle_observer() : NULL;
+    uint64_t begin = o ? o->clock_ns() : 0;
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
-    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);
+    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);
 #else
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
+    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
+    if (o) o->note(NVN_IDLE_LAND, source_hint, src, len, o->clock_ns() - begin);
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
@@ -800,7 +834,7 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
     uint64_t rows = ((uint32_t)o->r.height + (uint32_t)bh - 1) / (uint32_t)bh, img = o->image_stride ? o->image_stride : row * rows;
     uint32_t nz = o->r.depth > 0 ? (uint32_t)o->r.depth : 1;
     if (!in_pool(o->src, img * nz)) { nvn_unimpl("buf", "b2t_source_outside_pools", rec); return; }
-    nvn_gpu_tex g = rp_tex_resolve(t, c);
+    nvn_gpu_tex g = rp_tex_resolve_plain(t, c);
     if (!g || !c) return;
     if (t->d.target == NVN_TEXTURE_TARGET_3D && nvn_plat_flag("nvk_drawlog", 0)) {   // 调试开关下：三维贴图的每次上传打一行
         char b[200]; snprintf(b, sizeof b, "三维贴图上传 #%llu 格式 %#x 尺寸 %dx%dx%d 级 %u：区域 %d,%d,%d %dx%dx%d 行距 %llu 片距 %llu（记录里 行 %llu 片 %llu）块 %dx%d 每块 %d 字节",
@@ -843,7 +877,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             vs.set_levels = vd.set_levels = 1; vs.nlevels = vd.nlevels = 1;
             vs.set_layers = vd.set_layers = 1; vs.min_layer = (int)sz0; vd.min_layer = (int)dz0; vs.nlayers = vd.nlayers = 1;
             rp_view_pin_begin();   // 连取两个视图：取第二个时不能把第一个轮转放掉
-            nvn_gpu_view gv = rp_view_for(s, &vs, c), hv = rp_view_for(d, &vd, c);
+            nvn_gpu_view gv = rp_view_for_plain(s, &vs, c), hv = rp_view_for_plain(d, &vd, c);
             if (!gv || !hv) { rp_view_pin_end(); return; }
             NVNcopyRegion r = {0, 0, 0, s->d.width, s->d.height, 1};
             nvn_gpu_blit(c, gv, &r, hv, &r, 0);
@@ -880,7 +914,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             // 一次取源 / 目标两个视图再 blit：同一段取用窗口，第二个不许把第一个轮转淘汰（#699）。
             // 两笔连续取用本身最多推进一次轮转，但要和 pass 内多附件守同一条不变量。
             rp_view_pin_begin();
-            nvn_gpu_view gv = rp_view_for(s, &vs, c), hv = rp_view_for(d, &vd, c);
+            nvn_gpu_view gv = rp_view_for_plain(s, &vs, c), hv = rp_view_for_plain(d, &vd, c);
             if (!gv || !hv) { rp_view_pin_end(); return; }
             NVNcopyRegion a = sr, b = dr; a.zoffset = b.zoffset = 0; a.depth = b.depth = 1;
             // Ryujinx ExtentsToOffset3D 同样保留两端次序：镜像沿源矩形反向行走。
@@ -895,7 +929,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
         if (s3 != d3) { nvn_unimpl("tex", "t2t_3d_mismatch", rec); return; }
     }
     if (sr.width <= 0 || sr.height <= 0) return;
-    nvn_gpu_tex gs = rp_tex_resolve(s, c), gd = rp_tex_resolve(d, c);
+    nvn_gpu_tex gs = rp_tex_resolve_plain(s, c), gd = rp_tex_resolve_plain(d, c);
     if (!gs || !gd) return;
     int nz = sr.depth > 0 ? sr.depth : 1;
     if (s3) nvn_gpu_copy_tex(c, gs, sl, 0, &sr, gd, dl, 0, &dr);   // 三维：片在区域的深度方向上，一次拷完
