@@ -130,6 +130,11 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
 }
 void nvn_gpu_shader_release(nvn_gpu_shader s) { (void)s; g_release_calls++; }
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); }
+// 本夹具的缓存来自当局磁盘目录，没有安装种子。
+int nvk_prog_warm_seed_dir(char *out, size_t n) {
+    if (out && n) out[0] = 0;
+    return 0;
+}
 void nvk_prog_warm_reset(void) {}
 void nvk_prog_warm_stat_build(int rc) { (void)rc; }
 void nvk_prog_warm_stat_draw_hit(void) {}
