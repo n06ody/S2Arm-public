@@ -61,6 +61,7 @@ int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out)
 int rp_shader_resolve_compute(const struct rp_prog **out);
 struct rp_shader_live_compile_stats {
     uint64_t enqueued, wait_ns, pending, fallback, timeout;
+    char ids[72];   // 本帧前几个现编程序身份前 4 字节（逗号分隔；诊断属性开时才有，空串 = 没有）
 };
 void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *out);
 // 程序的内容身份（见 struct rp_prog.identity）。1 = 有；0 = 没有（p 为空 / 失败项 / 计算旧路径没记）。

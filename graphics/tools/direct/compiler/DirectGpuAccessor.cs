@@ -240,6 +240,8 @@ namespace S2A.DirectCompiler
         //   贴图缓冲 / 图像也按池编号取；没有 nvn_mtl.m TEXD 那种按槽绑的约定，答 32 会把编号 ≥ 32 的贴图缓冲 / 图像夹到第 31 项读错图
         public bool QueryS2ARuntimeState() => Record("QueryS2ARuntimeState", "", false, "direct-v1:host does not fill s2a_flags / s2a_point");
         public void RecordTexelFetch1D(int handle) => Record("RecordTexelFetch1D", "handle=" + handle, "recorded", "direct-v1:no-tbuf-as-2d host contract");
+        // 现编按本机设备对齐写死窗口掩码；「装载时固化」的模块级掩码只给出包 Vulkan 库（DshVk 重译）用，直连现编显式答假（= 接口缺省，SPIR-V 不变）
+        public bool QueryS2ALateStorageBufferAlignment() => Record("QueryS2ALateStorageBufferAlignment", "", false, "direct-v1:live compile bakes the host alignment");
         public bool QueryHostStorageWindowClamp() => Record("QueryHostStorageWindowClamp", "", false, "direct-v1:no-storage-window-instrumentation");
         public bool QueryHostStorageOobRecord() => Record("QueryHostStorageOobRecord", "", false, "direct-v1:no-storage-oob-recorder");
         // 11-01 #967 补丁（a703ee14a）新加：Mac 直连 ABI 2 由宿主给贴图尺寸表；安卓 Vulkan 直连宿主没有这张表，同上显式答假（= 接口缺省，SPIR-V 不变）
