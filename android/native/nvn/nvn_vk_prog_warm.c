@@ -47,7 +47,7 @@
                                             //   版本 1 的文件整份按「版本不符」拒收（不按新格式误读），本局照常记、落盘写成版本 2
 #define NVK_PROG_WARM_HDR_FIELDS 60u        // magic4 版本4 条目头大小4 条数4 profile32 ABI4 闭包摘要8
 #define NVK_PROG_WARM_SUM 8u                // 末尾 FNV-1a 64
-#define NVK_PROG_WARM_ENTRY 88u             // 条目头：identity32 mask4 keys24 c1_ok1 lp_ok1 pad2 c1_len 3×4 uses4 last_use8；其后按阶段 0..2 依次接有效阶段的 c1 整段（各补齐到 4 字节）
+#define NVK_PROG_WARM_ENTRY 88u             // 条目头：identity32 mask4 keys24 c1_ok1 lp_ok1 lp_ssbo_window1 pad1 c1_len 3×4 uses4 last_use8；其后按阶段 0..2 依次接有效阶段的 c1 整段（各补齐到 4 字节）
 #define NVK_PROG_WARM_FILE_MAX (64u << 20)  // 读文件的体积硬顶（8192 条 × 平均 c1 约 1 KB ≈ 9 MB；硬顶留余量，超了整份拒）
 #define NVK_PROG_WARM_ABS_MAX 16384u        // 上限的硬顶（flag 调再大也不超过它）
 #define NVK_PROG_WARM_DEFAULT_MAX 8192      // 缺省上限（真机走一圈 6533 个身份；一条约 0.9 KB，约 7 MB）
@@ -166,6 +166,7 @@ static int stage_count(uint32_t mask) {
 // 清单条目的结构合法性（不是本局有效性：那是 profile/ABI/闭包那条，在 load 里整份判）。
 static int rec_well_formed(const struct nvk_prog_rec *r) {
     if (!r || !stage_count(r->stage_mask) || (r->c1_ok & ~7u) || identity_zero(r->identity)) return 0;
+    if (r->lp_ssbo_window && (r->lp_ssbo_window != 1 || r->lp_ok != 2)) return 0;
     for (int st = 0; st < NVK_PROG_REC_STAGES; st++)
         if ((r->c1_ok & (1u << st)) && (!r->c1[st] || r->c1_len[st] < NVK_PROG_REC_C1_MIN || r->c1_len[st] > NVK_PROG_REC_C1_MAX)) return 0;
     return 1;
@@ -455,7 +456,8 @@ int nvk_prog_warm_load(void) {
         s.rec.stage_mask = get_u32(e + 32);
         memcpy(s.rec.keys, e + 36, sizeof s.rec.keys);
         s.rec.c1_ok = e[60];
-        s.rec.lp_ok = e[61];   // 2 = 按含「存储缓冲不对齐」的规则判可用；旧清单里的 1 当不可用
+        s.rec.lp_ok = e[61];
+        s.rec.lp_ssbo_window = e[62];   // 旧 v2 清单的保留字节为 0，只可尝试对齐的库合同
         for (int st = 0; st < NVK_PROG_REC_STAGES; st++) {
             if (!(s.rec.c1_ok & (1u << st))) continue;
             s.rec.c1_len[st] = get_u32(e + 64 + 4 * st); s.rec.c1[st] = buf + eoff; eoff += pad4(s.rec.c1_len[st]);
@@ -580,6 +582,7 @@ void nvk_prog_warm_note(const struct nvk_prog_rec *rec_in) {
         if (s->rec.uses != 0xFFFFFFFFu) s->rec.uses++;
         s->last_use_rank = rank;
         s->rec.stage_mask = rec->stage_mask; s->rec.lp_ok = rec->lp_ok;   // 同身份即同状态：旧清单读来的 0 在这里刷新
+        s->rec.lp_ssbo_window = rec->lp_ssbo_window;
         memcpy(s->rec.keys, rec->keys, sizeof s->rec.keys);
         // c1 只在这次快照确实带回来时才覆盖（真实 resolve 有视图；清单加载来的记录没有新视图）。
         for (int st = 0; st < NVK_PROG_REC_STAGES; st++)
@@ -734,7 +737,7 @@ void nvk_prog_warm_save(void) {
             memcpy(p, s->rec.identity, 32); p += 32;
             put_u32(&p, s->rec.stage_mask);
             memcpy(p, s->rec.keys, sizeof s->rec.keys); p += sizeof s->rec.keys;
-            put_u8(&p, s->rec.c1_ok); put_u8(&p, s->rec.lp_ok); put_u8(&p, 0); put_u8(&p, 0);   // 保留
+            put_u8(&p, s->rec.c1_ok); put_u8(&p, s->rec.lp_ok); put_u8(&p, s->rec.lp_ssbo_window); put_u8(&p, 0);
             for (int st = 0; st < NVK_PROG_REC_STAGES; st++) put_u32(&p, (s->rec.c1_ok & (1u << st)) ? s->rec.c1_len[st] : 0);
             put_u32(&p, s->rec.uses);
             put_u64(&p, s->last_use_rank);

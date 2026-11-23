@@ -129,6 +129,39 @@ static int samp2_shape_ok(uint16_t r) {
 }
 
 static const struct rp_prog *g_prog; static nvn_gpu_pipe g_pipe; static nvn_gpu_cmd g_pipe_cmd;
+
+// ---- 程序调用榜（纯诊断，只记数）：每笔绘制按程序累计一次，每个分时窗口按次数取前 N 个打一行（rp_present.c，nvk_hitch_log 开时）----
+//   8E 第 2 班只开 C 后每帧 GPU 多 ~14 ms：改走库的 193 个程序里每帧调用最多的是哪几支、来源是库还是现编，日志里没有逐程序次数，只能猜。
+//   键 = rp_prog 指针（同一份程序同一地址）；身份前 4 字节 / 来源 / binst 位 / 阶段数在第一次记下时拷一份，窗口取走时不再碰程序对象。
+enum { RP_PC_SLOTS = 512, RP_PC_PROBE = 8 };
+static struct rp_pc { const struct rp_prog *p; uint32_t n; uint8_t id[4], lib, binst, nst, used; } g_pc[RP_PC_SLOTS];
+static void rp_pc_note(const struct rp_prog *p) {
+    if (!p) return;
+    unsigned h = (unsigned)(((uintptr_t)p >> 4) * 2654435761u) & (RP_PC_SLOTS - 1);
+    for (unsigned i = 0; i < RP_PC_PROBE; i++) {
+        struct rp_pc *e = &g_pc[(h + i) & (RP_PC_SLOTS - 1)];
+        if (e->used && e->p == p) { e->n++; return; }
+        if (!e->used) {
+            e->used = 1; e->p = p; e->n = 1; memcpy(e->id, p->identity, 4);
+            e->lib = p->lib_sourced; e->binst = p->binst_unread; e->nst = (uint8_t)(p->nent[0] + p->nent[1] + p->nent[2] ? 1 : 0);
+            return;
+        }
+    }
+}
+// 取走并清空：按次数降序取前 top 个写成一行文本，frames = 本窗口帧数（求每帧调用）。返回写入长度，0 = 本窗口没有记录。
+size_t rp_prog_calls_take(char *out, size_t cap, double frames, unsigned top) {
+    struct rp_pc *sel[RP_PC_SLOTS]; unsigned ns = 0; uint64_t total = 0, libn = 0;
+    for (unsigned i = 0; i < RP_PC_SLOTS; i++) if (g_pc[i].used) { sel[ns++] = &g_pc[i]; total += g_pc[i].n; if (g_pc[i].lib) libn += g_pc[i].n; }
+    if (!ns || !cap) { memset(g_pc, 0, sizeof g_pc); return 0; }
+    for (unsigned i = 0; i < ns && i < top; i++) for (unsigned j = i + 1; j < ns; j++) if (sel[j]->n > sel[i]->n) { struct rp_pc *t = sel[i]; sel[i] = sel[j]; sel[j] = t; }
+    double f = frames > 0 ? frames : 1;
+    size_t o = (size_t)snprintf(out, cap, "分时（程序调用榜，每帧）：共 %u 支程序、%.1f 笔，其中库来源 %.1f 笔（%.0f%%）；前 %u：", ns, (double)total / f, (double)libn / f, total ? 100.0 * (double)libn / (double)total : 0.0, ns < top ? ns : top);
+    for (unsigned i = 0; i < ns && i < top && o < cap; i++)
+        o += (size_t)snprintf(out + o, cap - o, "%s%02x%02x%02x%02x[%s%s]%.1f", i ? "、" : "", sel[i]->id[0], sel[i]->id[1], sel[i]->id[2], sel[i]->id[3],
+                              sel[i]->lib ? "库" : "现编", sel[i]->binst ? "" : "，binst未证", (double)sel[i]->n / f);
+    memset(g_pc, 0, sizeof g_pc);
+    return o < cap ? o : cap - 1;
+}
 static uint64_t g_draws, g_skips, g_dispatches; static uint32_t g_prim = ~0u; static int g_quads = -1, g_face = -1;   // g_quads：这笔的索引展开方式（EXP_*）
 static int g_ms_off;   // #1015：当前管线是「多重采样目标上关了多重采样」（游戏 ms.enable = 0、目标样本数 > 1）
 
@@ -1567,6 +1600,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }
         if (np != g_prog) { g_prog = np; rp_pso_dirty = 1; }
     }
+    rp_pc_note(g_prog);   // 程序调用榜（诊断，只计数）
 draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置，下面按新程序重取资源与管线）
     // 仅拒绝绑定 DRV0 且未证明不读 base instance 的已解码 count 组；单条间接/#941 和 OP_MULTI_DRAW 保持原路径。
     // 组大小 1（max_draws = 1）只有一条命令，没有「别的命令的 firstInstance 被第一条顶替」的问题，语义与单条间接绘制相同：

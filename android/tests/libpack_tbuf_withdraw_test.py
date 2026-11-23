@@ -14,7 +14,7 @@ mutant = out / 'nvn_vk_program_result.c'
 mutant.write_text(parser.replace(old, 'out->texel_buffer = 0;'))
 exe = out / 'libpack-test'
 native = root / 'android/native'
-sources = [root/'android/tests/libpack_vk_test.c', native/'direct/libpack_vk.c',
+sources = [root/'android/tests/libpack_vk_test.c', native/'direct/libpack_vk.c', native/'direct/sha256.c',
            native/'direct/json.c', native/'direct/jv.c', mutant]
 flags = ['-std=c11', '-D_GNU_SOURCE', '-Wall', '-Wextra', '-Werror']
 includes = [native, native/'direct', native/'nvn', root/'runtime/include']

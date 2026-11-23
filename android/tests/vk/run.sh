@@ -107,9 +107,18 @@ fi
 if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
     exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
+# 存储缓冲窗口读回夹具（standalone/libpack-ssbo-window.sh）的料：翻译器出库的合成顶点段，要 dotnet，只能在宿主出（容器里没有）。
+#   默认档与 --libpack-ssbo-window 都先出；已在容器里（S2A_VULKAN_IMAGE_ID）就用宿主出好的那份。
+prep_ssbo_window_stages() {
+    if [ -n "${S2A_VULKAN_IMAGE_ID:-}" ]; then return 0; fi
+    if [ -n "$mode" ] && [ "$mode" != "--libpack-ssbo-window" ]; then return 0; fi
+    rm -rf "$repo/build/libpack-ssbo-window/stages"
+    S2A_DSH_VK_EMIT_DIR="$repo/build/libpack-ssbo-window/stages" bash "$repo/graphics/tools/direct/tests/t_dsh_vk.sh"
+}
 if [ "$(uname -s)" = Darwin ]; then
     export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
     if [ -z "$mode" ]; then python3 "$repo/android/tests/gs_compiler_chain_test.py"; fi
+    prep_ssbo_window_stages
     exec bash "$repo/tests/vulkan/run.sh" android/tests/vk/run.sh "$@"
 fi
 # 以下是 Linux：在宿主上（原生跑；缺原生工具时转容器，见下），或已在 tests/vulkan/run.sh 起的离线容器里（带 S2A_VULKAN_IMAGE_ID）。
@@ -131,6 +140,7 @@ if [ -z "$mode" ] && [ ! -f "$repo/build/696-real-compiler/compiled/program.json
     fi
     python3 "$repo/android/tests/gs_compiler_chain_test.py"
 fi
+prep_ssbo_window_stages
 
 find_icd() {
     if [ -n "${S2A_LAVAPIPE_ICD:-}" ]; then printf '%s\n' "$S2A_LAVAPIPE_ICD"; return; fi
@@ -363,12 +373,13 @@ bc_src=("$repo/android/tests/vk/t_bc_decode.c"
 # 与发行 APK 同一组建设备规则（android/CMakeLists.txt 的 nvn_vk 后端定义此宏）。
 cflags=(-D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -DS2A_ANDROID_VK_BACKEND_NVN_VK=1)
 if [[ "$mode" == --gpu-deswizzle* ]]; then cflags+=(-DS2A_GPU_DESWIZZLE_TEST=1); fi
+cflags+=(-DS2A_LAND_READBACK_TEST=1)
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
     --pipe-call-lifetime) cflags+=(-DS2A_BACKEND_PIPE_CALL_TEST=1) ;;
-    ""|--pipe-creation-feedback|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--pipe-creation-feedback|--land-readback|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -583,6 +594,17 @@ if [[ "$mode" == --pipe-creation-feedback* ]]; then
     exit "$rc"
 fi
 
+if [ "$mode" = "--land-readback" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        timeout 60 "$out/t_backend_vk" "$out/shaders" --land-readback 2>&1 | tee "$out/land-readback-dq${dq}.log"
+        if grep -Eq 'Validation Error|SYNC-HAZARD|VUID-' "$out/land-readback-dq${dq}.log"; then
+            echo "【红】回写暂存（录制队列 $dq）校验层报错"
+            exit 1
+        fi
+    done
+    exit 0
+fi
 if [ "$mode" = "--cmdpool-only" ] || [ "$mode" = "--cmdpool-neg" ]; then
     bad=0
     for dq in 0 1; do

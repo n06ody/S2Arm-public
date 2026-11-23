@@ -32,6 +32,7 @@ struct fd_stage {
     int present;
     uint8_t *spirv;
     size_t spirv_bytes;
+    uint8_t *spirv_owner;         // Binary stage record containing spirv; NULL for a standalone allocation.
     uint32_t attr_mask;
     uint32_t fragment_output_map;   // 片元阶段：每个颜色目标 4 位（RGBA）= 着色器写了哪些输出分量；读不到为全 1
     int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知

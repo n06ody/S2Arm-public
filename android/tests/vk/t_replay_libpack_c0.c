@@ -1,4 +1,4 @@
-// 图形 LibPack 的 FS c0 驱动常量缓冲（drvcb bank 0）：出包预编库的真实容器 → 生产取库合成（libpack_vk.c）→ 生产解析 /
+// 图形 LibPack 的 FS c0 / c2 驱动常量缓冲（drvcb bank 0 / 2）：出包预编库的真实容器 → 生产取库合成（libpack_vk.c）→ 生产解析 /
 // 布局（nvk_shader.c layout_ent：slot 0 → NVN_RB_DRV0）→ 回放绘制核心（rp_draw.c 按 0xA00 驱动段供数）→ Vulkan（lavapipe + 校验层）。
 // 片元着色器读 c0 的 0x600（槽 15 存储地址的低字）/ 0x604（高字）当颜色：像素对上绑定的存储缓冲地址字节才算读对。
 #define main backend_fixture_main
@@ -21,6 +21,9 @@
 
 static int compile_calls;
 static const char *case_dir;
+static char g_calls_text[600];   // rp_prog_calls_take 取走的程序调用榜文本
+extern size_t rp_prog_calls_take(char *out, size_t cap, double frames, unsigned top);
+static uint64_t g_samp19;   // 非 0：FS 分离采样器槽 19 绑这个句柄（c2 驱动句柄表 0x568 + 8×19 = 0x600 处的低字）
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target; static tex_t target_tex; static nvn_gpu_view target_view; static nvn_gpu_tex target_tex_backend;
 int g_s2a_logfd = 2; int s2a_nvn_rast_flip;
@@ -158,6 +161,10 @@ static int run_case(const char *tag, const char *fs_json_fmt, const uint8_t *vs_
     CHECK(rp_state_op(OP_SET_TEX_POOL, &t, sizeof t) && rp_state_op(OP_SET_SAMP_POOL, &s, sizeof s), "%s: descriptor pools accepted", tag);
     p_bind_buf ssbo = {1, 15, ssbo_addr, 256};   // 片元阶段（NVN 阶段 1）的存储缓冲槽 15：DRV0 的 0x510 + 16×15 = 0x600 处放地址、0x608 处放长度
     CHECK(rp_state_op(OP_BIND_SSBO, &ssbo, sizeof ssbo), "%s: FS storage slot 15 bound", tag);
+    if (g_samp19) {   // c2 句柄表：分离采样器槽 19 → 0x568 + 8×19 = 0x600（低 4 字节 = 句柄），0x604（高字）恒 0
+        p_bind_handles sh; memset(&sh, 0, sizeof sh); sh.stage = 1; sh.first = 19; sh.n = 1; sh.h[0] = g_samp19;
+        CHECK(rp_state_op(OP_BIND_SAMP, &sh, sizeof sh), "%s: FS separate sampler slot 19 bound", tag);
+    }
     const uint64_t h0 = s2a_libpack_hits(), j0 = s2a_libpack_rejects();
     uint64_t d0 = 0, k0 = 0; rp_draw_stats(&d0, &k0);
     nvn_gpu_buf rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
@@ -165,6 +172,7 @@ static int run_case(const char *tag, const char *fs_json_fmt, const uint8_t *vs_
     nvn_gpu_cmd cmd = begin_cmd(); p_draw draw = {0}; draw.prim = 4; draw.count = 3; draw.instances = 1;
     pass_began = 0;
     rp_draw(cmd, &draw, NULL, &draw);
+    g_calls_text[0] = 0; (void)rp_prog_calls_take(g_calls_text, sizeof g_calls_text, 1.0, 8);   // 程序调用榜（诊断）：这一笔绘制应记在库来源程序名下
     nvn_gpu_err e = {0};
     if (pass_began) {
         static uint64_t fence_no;   // 提交的信号值必须严格递增
@@ -215,15 +223,32 @@ int main(int argc, char **argv) {
     int drew = run_case("bank0", FS_BANK0, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
     CHECK(hit == 1 && rej == 0 && compile_calls == 0, "bank 0 c0: library hit (hits+%llu rejects+%llu, live compiles %d)", (unsigned long long)hit, (unsigned long long)rej, compile_calls);
     CHECK(drew, "bank 0 c0: one replay draw, none skipped");
+    CHECK(strstr(g_calls_text, "共 1 支程序、1.0 笔，其中库来源 1.0 笔（100%）") != NULL && strstr(g_calls_text, "[库") != NULL,
+          "program call table: one library-sourced program, one draw: %s", g_calls_text);
     for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
         const uint8_t want[4] = {x < 2 ? 0x20 : 0xC0, 0x40, x < 2 ? 0x80 : 0xFF, x < 2 ? 0xFF : 0x80};
         const uint8_t *v = px + 4 * (4 * y + x);
         int ok = 1; for (int c = 0; c < 4; c++) ok &= abs((int)v[c] - (int)want[c]) <= 1;
         CHECK(ok, "bank 0 c0 pixel (%d,%d) got %02x %02x %02x %02x want %02x %02x %02x %02x", x, y, v[0], v[1], v[2], v[3], want[0], want[1], want[2], want[3]);
     }
-    // 负：bank 2（句柄表）/ 错绑定号（arg_id 4 → 28，SPIR-V 没有）都必须出库拒、不画、不被现编兜底成成功
-    struct { const char *tag, *fmt; } neg[2] = {{"bank2", FS_BANK2}, {"arg4", FS_ARG4}};
-    for (int i = 0; i < 2; i++) {
+    // 正：bank 2（c2 驱动句柄表）+ 同一个 SPIR-V（binding 22 的 set 0 Uniform Block）→ 库命中、slot 2 → NVN_RB_DRV2，回放按 0xA00 句柄表供数。
+    //   着色器仍读偏移 0x600 / 0x604：句柄表里 0x600 = 分离采样器槽 19 的低 4 字节 = 0xFF804020（左半屏 20 40 80 FF），0x604 没有写入 = 0（右半屏 00 00 00 00）。
+    {
+        compile_calls = 0; g_samp19 = 0xFF804020u;
+        drew = run_case("bank2", FS_BANK2, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
+        g_samp19 = 0;
+        CHECK(hit == 1 && rej == 0 && compile_calls == 0, "bank 2 c2: library hit (hits+%llu rejects+%llu, live compiles %d)", (unsigned long long)hit, (unsigned long long)rej, compile_calls);
+        CHECK(drew, "bank 2 c2: one replay draw, none skipped");
+        for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+            const uint8_t want[4] = {x < 2 ? 0x20 : 0x00, x < 2 ? 0x40 : 0x00, x < 2 ? 0x80 : 0x00, x < 2 ? 0xFF : 0x00};
+            const uint8_t *v = px + 4 * (4 * y + x);
+            int ok = 1; for (int c = 0; c < 4; c++) ok &= abs((int)v[c] - (int)want[c]) <= 1;
+            CHECK(ok, "bank 2 c2 pixel (%d,%d) got %02x %02x %02x %02x want %02x %02x %02x %02x", x, y, v[0], v[1], v[2], v[3], want[0], want[1], want[2], want[3]);
+        }
+    }
+    // 负：错绑定号（arg_id 4 → 28，SPIR-V 没有）必须出库拒、不画、不被现编兜底成成功（bank 3 的拒收在 libpack_vk_test 里，这里不再造 SPIR-V）
+    struct { const char *tag, *fmt; } neg[1] = {{"arg4", FS_ARG4}};
+    for (int i = 0; i < 1; i++) {
         compile_calls = 0;
         drew = run_case(neg[i].tag, neg[i].fmt, vs_spv, vs_n, fs_spv, fs_n, addr, px, &rej, &hit);
         CHECK(!drew && hit == 0 && rej == 1, "%s: library rejects (hits+%llu rejects+%llu), draw not made", neg[i].tag, (unsigned long long)hit, (unsigned long long)rej);
