@@ -401,6 +401,10 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
         uint32_t arg_id = 0;
         if (jf_str(b, "msl_name", msl, sizeof msl) || jf_str(b, "kind", kind, sizeof kind) || jf_u32(b, "arg_id", &arg_id))
             return lp_fail(why, why_size, "%s bindings[%u] missing msl_name/kind/arg_id", lib_stage, i);
+        // 绑定号 = arg_id × 6 + 阶段号，要装进布局项 / 线格式的 16 位（nvn_gpu_layout_ent.binding、S2SB 行、结果解析都按 16 位）。arg_id 是翻译器输出里
+        //   SPIRV-Cross 参数块的 [[id(N)]]，上限由着色器自己的资源数定（没有固定上限），所以超界要具名拒，不能回绕（32 位乘法）、也不能截成 16 位。
+        if (arg_id > (UINT16_MAX - (uint32_t)stage_no) / 6)
+            return lp_fail(why, why_size, "%s bindings[%u] arg_id %u: binding number exceeds 16 bits", lib_stage, i, arg_id);
         uint32_t binding = arg_id * 6 + (uint32_t)stage_no;
         // 采样器半边：组合纹理在 .spv 只留一个合并变量、吃 texture 成员的号（dsh_vk ②）——v1 不出行
         size_t ml = strlen(msl);
