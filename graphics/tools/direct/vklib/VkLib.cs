@@ -81,7 +81,9 @@ namespace S2A.DshVkLib
             Directory.CreateDirectory(libDir);
             var vg = new System.Text.RegularExpressions.Regex(@"_vg\d\.(json|spv)\z", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
             var names = Directory.EnumerateFiles(keysDir).Select(Path.GetFileName).Where(n => !n.StartsWith("._", StringComparison.Ordinal) && (n.EndsWith("_b.json", StringComparison.Ordinal) || n.EndsWith("_b.spv", StringComparison.Ordinal) || vg.IsMatch(n))).ToList();
-            return LibPack.PackFiles(names, n => File.ReadAllBytes(Path.Combine(keysDir, n)), libDir, chain, Fp);
+            string fp = Fp;
+            return LibPack.PackFiles(names, n => File.ReadAllBytes(Path.Combine(keysDir, n)), libDir, chain, fp,
+                vkStage: n => StagePack.Read(keysDir, n, Convert.ToUInt64(fp, 16)));
         }
 
         /// <summary>汇总行：指纹、键数、ok / skipped（按阶段分列，如「gs 3, hs 1」，看覆盖面用）/ failed</summary>
@@ -102,6 +104,13 @@ namespace S2A.DshVkLib
     {
         static int Main(string[] args)
         {
+            if (args.Length == 3 && args[0] == "--repack-s2sb") {
+                try { Console.WriteLine(Repack.FromLegacy(args[1], args[2])); return 0; }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or OverflowException or
+                                            System.Text.Json.JsonException or ArgumentException) {
+                    Console.Error.WriteLine(ex.Message); return 1;
+                }
+            }
             if (args.Length == 1 && args[0] == "--fp") { Console.WriteLine(VkLib.Fp); return 0; }
             var a = new Dictionary<string, string>();
             for (int i = 0; i + 1 < args.Length; i += 2) a[args[i]] = args[i + 1];

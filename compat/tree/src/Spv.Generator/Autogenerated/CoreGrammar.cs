@@ -663,7 +663,8 @@ namespace Spv.Generator
             Instruction result = NewInstruction(Op.OpSpecConstant, GetNewId(), resultType);
 
             result.AddOperand(value);
-            AddToFunctionDefinitions(result);
+            // Specialization constants are module declarations with independent IDs.
+            _globals.Add(result);
 
             return result;
         }
