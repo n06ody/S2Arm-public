@@ -7,9 +7,13 @@
 //   R4 = [B+0x20]；[B+0x40] = R4；[B+0] = c3[0]。期望字节手算：[B+0] = 0x12345678、[B+0x40] = 初始 [B+0x20]，客体内存其余每个字节不变。
 // 对齐档 A = 16 / 64 / 256：设备真对齐 16，其余档位把后端取到的能力改大（描述符偏移取 A 的倍数同样满足真设备的 16）。
 //   基址 B = 池内 +0x4000 + A + 余数，余数 ∈ {0, 4, A/2, A-4}：B 的位 A 与位 A/2 都有取值，错的掩码（A/2、2A）总有一档读错地址。
+#define nvn_plat_log backend_fixture_log
+#define nvn_plat_flag backend_fixture_flag
 #define main backend_fixture_main
 #include "t_backend_vk.c"
 #undef main
+#undef nvn_plat_log
+#undef nvn_plat_flag
 #include "rp_shader.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -30,6 +34,18 @@
 void rp_buf_reset(void);
 
 static int compile_calls;
+static int pair_binst;
+static unsigned binst_copies, paired_hits;
+void nvn_plat_log(int level, const char *cls, const char *message) {
+    if (message && !strncmp(message, "S2A_LIBPAIR ", 12) && strstr(message, "same_source=1 json_rc=0 s2sb_rc=0"))
+        paired_hits++;
+    backend_fixture_log(level, cls, message);
+}
+int nvn_plat_flag(const char *name, int dflt) {
+    return !strcmp(name, "nvk_libpack_pair_timing") ? pair_binst : backend_fixture_flag(name, dflt);
+}
+const char *nvn_plat_dir(int which) { (void)which; return NULL; }
+
 static const char *case_dir;
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target; static tex_t target_tex; static nvn_gpu_view target_view; static nvn_gpu_tex target_tex_backend;
@@ -44,7 +60,9 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
 }
 int rp_depth_zero(void) { return 0; }
 int rp_origin_lower_left(void) { return 0; }
-void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }
+void rp_perf_add(int index, uint64_t value) {
+    if (index == RP_PERF_BINST_ONE || index == RP_PERF_BINST_HZ) binst_copies += (unsigned)value;
+}
 uint64_t rp_frame(void) { return 1; }
 uint64_t rp_seg_serial(void) { return serial_no; }
 uint64_t rp_sub_serial(void) { return serial_no; }
@@ -148,6 +166,7 @@ static int write_container(const char *dir, struct rec *r, int n) {
     if (fclose(f)) return -1;
     uint8_t idx[64 + 24 * 8]; memset(idx, 0, sizeof idx);
     memcpy(idx, "S2ALIB\0\0", 8); put32(idx + 8, 1); put32(idx + 12, (uint32_t)n); put32(idx + 16, 1);
+    if (r[0].kind == 128) memcpy(idx + 44, "S2SB", 4);
     memcpy(idx + 24, DMSH_CHAIN, 12); put64(idx + 48, at);
     for (int i = 0; i < n; i++) {
         uint8_t *p = idx + 64 + 24 * i;
@@ -160,7 +179,7 @@ static int write_container(const char *dir, struct rec *r, int n) {
 }
 static uint64_t key64(const uint8_t k[8]) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = v << 8 | k[i]; return v; }
 
-enum { V_WINDOW, V_OLD_ABI, V_BAD_MASK_ID };   // 库里的顶点段：带窗口合同 / 旧库（无合同）/ 掩码 id 指不到常量
+enum { V_WINDOW, V_OLD_ABI, V_BAD_MASK_ID, V_PAIR_UNUSED, V_PAIR_READ };   // 库里的顶点段：带窗口合同 / 旧库（无合同）/ 掩码 id 指不到常量
 struct vsrc { char *json; uint8_t *spv; size_t spv_n; char key[17]; };   // 翻译器出的顶点段（_b.json / _b.spv）与它原来的程序键
 static struct vsrc syn, real, psrc, csrc;   // csrc = 原创合成计算（dsh_vk WindowFixtureCs）   // psrc = 原创合成片元（同一份翻译器出料，见 dsh_vk WindowFixturePs）   // syn = 原创合成程序（仓内可复现）；real = 私有真实程序（可选，只在本机 build/ 下，不入仓）
 static uint8_t *fs_spv, *fs_real_spv, *vs_triv_spv; static size_t fs_n, fs_real_n, vs_triv_n;
@@ -189,7 +208,18 @@ static void make_library(const char *tag, const struct vsrc *v, int variant, con
     snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
     char hx[2][17], jfs[256];
     for (int s = 0; s < 2; s++) for (int b = 0; b < 8; b++) snprintf(hx[s] + 2 * b, 3, "%02x", guest_keys[s][b]);
-    char *jvs = malloc(strlen(v->json) + 32); strcpy(jvs, v->json);
+    char *jvs = malloc(strlen(v->json) + 128); strcpy(jvs, v->json);
+    if (variant == V_PAIR_READ) {
+        // Conservative bank-0 contract: the vec4 at 0x640 includes the base-instance word.
+        const char from[] = "\"drv_reads\":{}";
+        const char to[] = "\"drv_reads\":{\"0\":{\"vec4_offsets\":[1600],\"dynamic\":false}}";
+        char *reads = strstr(jvs, from);
+        CHECK(reads != NULL, "%s: compiler fixture has an empty driver-read set", tag);
+        if (reads) {
+            memmove(reads + sizeof to - 1, reads + sizeof from - 1, strlen(reads + sizeof from - 1) + 1);
+            memcpy(reads, to, sizeof to - 1);
+        }
+    }
     for (char *p = jvs; (p = strstr(p, v->key)); p += 16) memcpy(p, hx[0], 16);   // 同长度：原键换成本夹具的程序键
     if (variant == V_OLD_ABI) { char *p = strstr(jvs, ",\"ssbo_window_abi\""); CHECK(p != NULL, "%s: window fields present in template", tag); if (p) strcpy(p, "}"); }
     if (variant == V_BAD_MASK_ID) { char *p = strstr(jvs, "\"ssbo_window_mask\":"); CHECK(p != NULL, "%s: mask field present in template", tag); if (p) strcpy(p, "\"ssbo_window_mask\":99999}"); }
@@ -199,6 +229,24 @@ static void make_library(const char *tag, const struct vsrc *v, int variant, con
         {key64(guest_keys[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {key64(guest_keys[1]), 52, fs, fsn},
     };
     CHECK(write_container(dir, r, 4) == 0, "%s: library container written", tag);
+    if (pair_binst) {
+        snprintf(dir, sizeof dir, "%s/shaders/direct/qa-s2sb", root); mkdir(dir, 0700);
+        snprintf(dir, sizeof dir, "%s/shaders/direct/qa-s2sb/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+        const uint8_t *reflection[] = { (const uint8_t *)jvs, (const uint8_t *)jfs };
+        const uint8_t *spirv[] = { v->spv, fs };
+        const size_t sizes[] = { v->spv_n, fsn };
+        struct rec binary[2] = {{0}};
+        uint8_t *records[2] = {0};
+        size_t bytes[2] = {0};
+        for (unsigned st = 0; st < 2; st++) {
+            int rc = s2a_pack_stage(guest_keys[st], st, -1, 0, reflection[st], strlen((const char *)reflection[st]),
+                                    spirv[st], sizes[st], &records[st], &bytes[st]);
+            CHECK(rc == 0 && records[st], "%s: encode S2SB stage %u", tag, st);
+            binary[st] = (struct rec){key64(guest_keys[st]), 128, records[st], bytes[st]};
+        }
+        CHECK(records[0] && records[1] && !write_container(dir, binary, 2), "%s: paired S2SB container written", tag);
+        for (unsigned st = 0; st < 2; st++) s2a_pack_stage_free(records[st]);
+    }
     free(jvs);
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
 }
@@ -233,6 +281,7 @@ static int draw_and_land(const char *tag, uint8_t *pixels, uint64_t *drawn) {
     uint64_t d0 = 0, k0 = 0; rp_draw_stats(&d0, &k0);
     nvn_gpu_buf rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL); memset(buf_cpu(rb), 0xEE, 64);
     active = begin_cmd(); p_draw draw = {0}; draw.prim = 4; draw.count = 3; draw.instances = 1;
+    if (pair_binst) draw.ind = (uint64_t)(uintptr_t)(guest + 0x2000);
     rp_draw(active, &draw, NULL, &draw);
     uint64_t d1 = 0, k1 = 0; rp_draw_stats(&d1, &k1);
     nvn_gpu_err e = {0};
@@ -261,6 +310,10 @@ static struct result run_case(const char *tag, uint32_t dev_align, uint32_t prof
     for (unsigned i = 0; i < GUEST_BYTES; i += 4) word_put(i, rnd());
     const uint32_t src_val = 0xCAFEF00Du, ubo_val = 0x12345678u;
     word_put(B_off + 0x20, src_val); word_put(UBO_OFF, ubo_val);
+    if (pair_binst) {
+        const uint32_t args[] = {3, 1, 0, 0};
+        memcpy(guest + 0x2000, args, sizeof args);
+    }
     static uint8_t expect[GUEST_BYTES]; memcpy(expect, guest, sizeof expect);
     memcpy(expect + B_off + 0x40, &src_val, 4); memcpy(expect + B_off + 0, &ubo_val, 4);
 
@@ -514,6 +567,18 @@ int main(int argc, char **argv) {
         struct result b = run_cs_case("cs-old-unaligned", 64, 4, V_OLD_ABI);
         CHECK(b.hit == 0 && b.mismatches != 0 && compile_calls == 1, "old CS library, unaligned base: library refused, live compile requested (hit %d compiles %d)", b.hit, compile_calls);
     }
+    // Same non-aligned window draw and S2SB delivery, with and without proof for c0+0x644.
+    pair_binst = 1;
+    for (unsigned reads = 0; reads <= 1; reads++) {
+        const char *tag = reads ? "pair-binst-read" : "pair-binst-unread";
+        compile_calls = 0; binst_copies = paired_hits = 0;
+        struct result r = run_case(tag, 64, 64, 4, reads ? V_PAIR_READ : V_PAIR_UNUSED);
+        CHECK(paired_hits == 1 && r.hit == 1 && r.rej == 0 && compile_calls == 0 && r.drew && !r.mismatches,
+              "%s: S2SB window library hits, indirect draw runs and guest writes land", tag);
+        printf("%s: hits=%d draws=%d base-instance copies=%u\n", tag, r.hit, r.drew, binst_copies);
+        CHECK(binst_copies == reads, "%s: base-instance copies %u, expected %u", tag, binst_copies, reads);
+    }
+    pair_binst = 0;
     // 门：旧库（无窗口合同）。对齐基址照旧用库；非对齐基址必须拒库、走现编（现编桩无结果 = 不画），不返回成功兜底
     {
         compile_calls = 0;

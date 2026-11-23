@@ -1006,7 +1006,11 @@ static void record_link_refusal(const struct s2a_source_entry_view views[3], int
     ssize_t wrote;
     do { wrote = write(fd, row, (size_t)len); } while (wrote < 0 && errno == EINTR);
     if (wrote != len) {
-        if (wrote > 0) (void)ftruncate(fd, st.st_size);
+        if (wrote > 0) {
+            int rc;
+            do { rc = ftruncate(fd, st.st_size); } while (rc < 0 && errno == EINTR);
+            if (rc < 0) warning = "预编接口拒绝清单短写且未能回退，末行可能不完整";
+        }
         goto failed;
     }
     close(fd);

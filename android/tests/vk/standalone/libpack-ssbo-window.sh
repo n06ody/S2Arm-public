@@ -12,7 +12,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-mask-double|--negative-mask-half|--negative-window|--negative-cs-gate) ;; *) exit 64 ;; esac
+case "$mode" in ''|--negative-stale-packer|--negative-mask-double|--negative-mask-half|--negative-window|--negative-cs-gate) ;; *) echo "unknown window fixture mode: $mode" >&2; exit 64 ;; esac
 stages="${S2A_SSBO_WINDOW_STAGES:-$repo/build/libpack-ssbo-window/stages}"
 [ -f "${stages}/window_vs.key" ] || { echo "【红】缺宿主出料 ${stages}（见本脚本文件头）" >&2; exit 2; }
 out="$repo/build/vk-libpack-ssbo-window"
@@ -42,11 +42,17 @@ src=("$repo/android/tests/vk/t_replay_libpack_ssbo_window.c" "$repo/graphics/nvn
      "$repo/android/native/direct/offline_library.c" "$repo/android/native/direct/program_cache.c" "$repo/runtime/src/direct_host.c"
      "$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
 binary="$out/test"; log="$out/run.log"
+# Reproduce the shipped stale S2SB first: JSON still has the current read set.
+if [ -z "$mode" ]; then bash "$0" --negative-stale-packer; fi
 if [ -n "$mode" ]; then
     python3 - "$repo" "$out" "$mode" <<'PY'
 import pathlib, sys
 repo, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
-if mode == '--negative-cs-gate':
+if mode == '--negative-stale-packer':
+    path, name = repo / 'android/native/direct/libpack_vk.c', 'libpack_mutant.c'
+    before = 'if (!compute) lp_emit_c0_reads(stages, top);'
+    after = 'if (!compute && !packing) lp_emit_c0_reads(stages, top);'
+elif mode == '--negative-cs-gate':
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
     before = 'unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, NULL, &pc, &bytes, &len, &ready, &probe)'
     after = 'unaligned ? LIBPACK_OTHER_STATE : LIBPACK_ALIGNED, NULL, &pc, &bytes, &len, &ready, &probe)'
@@ -66,13 +72,23 @@ PY
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
 fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections \
-    -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
+    -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_ANDROID_DEBUG_ENV=1 -DS2A_LIBPACK_PACKER "${inc[@]}" "${src[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 set +e
 timeout 600 "$binary" "$out/shaders" "$stages" ${real_arg[@]+"${real_arg[@]}"} > "$log" 2>&1
 rc=$?
 set -e
+if [ "$mode" = --negative-stale-packer ]; then
+    if [ "$rc" = 0 ] || ! grep -q 'pair-binst-unread: hits=1 draws=1 base-instance copies=1' "$log" ||
+       ! grep -q 'pair-binst-read: hits=1 draws=1 base-instance copies=1' "$log" ||
+       ! grep -q 'FAIL .*pair-binst-unread: base-instance copies 1, expected 0' "$log" ||
+       [ "$(grep -c '^FAIL ' "$log")" != 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
+        cat "$log"; exit 1
+    fi
+    echo 'libpack stale packer: both window draws hit; only the proven-unread draw unexpectedly copies'
+    exit 0
+fi
 if [ -n "$mode" ]; then
     # 撤改后必须红在字节断言上（不是编译 / 设备 / 校验层错），而且不能全红：对齐且余数 0 的用例里错掩码仍可能碰巧对，所以只要求有断言红
     if [ "$mode" = --negative-cs-gate ]; then pat='FAIL .*: cs-A[0-9]+-rem[0-9]+ library hit'; what='library hit'; else pat='FAIL .*: A[0-9]+-rem[0-9]+ guest bytes'; what='guest bytes'; fi
