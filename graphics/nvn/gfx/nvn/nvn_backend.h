@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 20   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 21   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -114,6 +114,7 @@ enum {
                                                //   其余视图剥掉存储用途）。Vulkan（1.1+）置位；Metal 不置位，核心照旧按「不可写」跳过
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
+    NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // 后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -212,6 +213,7 @@ enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不
     NVN_GPU_TEX_VIEW_FMT = 1u << 4,   // 会建不同格式的视图（PixelFormatView / MUTABLE_FORMAT）
     NVN_GPU_TEX_CPU_UPLOAD = 1u << 5, // 内容来自游戏内存，会经 nvn_gpu_tex_upload* 更新
     NVN_GPU_TEX_TRANSIENT = 1u << 6,  // 只活在一个通道里（memoryless / LAZILY_ALLOCATED）
+    NVN_GPU_TEX_BC1_OPAQUE = 1u << 7, // 初始完整压缩快照已证无透明索引，允许宿主选 ASTC 存储。
 };
 typedef struct {
     nvn_texdesc d;             // NVN 描述原样
@@ -225,6 +227,14 @@ typedef struct { uint32_t w, h, depth, levels, layers, samples; uint32_t nvn_for
 // 出错：NVN_GPU_E_UNSUPPORTED（格式 / 用途组合不支持，why 写格式号与用途位）、NVN_GPU_E_OOM。
 nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err);
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out);   // 实际尺寸与格式（宽屏挂点读宿主宽高）。线程：[任意]
+// 可选：整张 CPU 块线性快照上传时为已证不透明的 BC1 选宿主压缩存储。
+// 返回 1 = 已录完整上传，0 = 沿用普通上传，-1 = 失败（命令段报错）。
+// 替换存储时 *replacement 为新句柄，由回放更新视图和释放旧句柄。
+int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size, uint64_t serial, nvn_gpu_tex *replacement);
+// 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
+// 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
+int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+
 void nvn_gpu_tex_release(nvn_gpu_tex t);
 // 视图：v 为 NVN 视图记录原样，NULL = 默认视图。视图让贴图存储活到视图 release。线程：[任意]。出错：格式不兼容或缺 VIEW_FMT → NVN_GPU_E_ARG。
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err);
@@ -447,6 +457,14 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf
 //   线程：[提交]。出错：粘滞 ORDER（通道内）/ ARG（越界、长度不是 4 的倍数）。
 typedef struct { nvn_gpu_buf src; uint64_t soff; nvn_gpu_buf dst; uint64_t doff; uint64_t bytes; } nvn_gpu_buf_copy;
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages);
+// 可选的后端自管回写暂存。只对不适合直接 CPU 回读的源录拷贝，未暂存项返回 offset=UINT64_MAX。
+// [提交]，在通道外调用，最后一段里所有源写之后。返回 0 表示未录复制，仍可走原镜像回写；已录制的副作用只通过 done 交付。
+typedef struct { nvn_gpu_buf src; uint64_t offset, bytes, readback_offset; } nvn_gpu_readback_span;
+int nvn_gpu_readback_enabled(void);
+// 本段是否需要候选范围；auto 在 R0 同样观察负载，实际模式在开段时锁存。
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c);
+uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count);
+
 // 32 位样式填充（NVN ClearBuffer）：bytes 是 4 的倍数，每 4 字节按小端写 value；不是按字节 memset（用例 C01 用 0x11223344 区分）。
 void nvn_gpu_fill_buf(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, uint64_t bytes, uint32_t value);
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
@@ -539,6 +557,7 @@ typedef struct {
     uint64_t gpu_dur_ns, gpu_t0, gpu_t1;   // 不可信的字段为 0，0 不表示「零耗时」，看 time_kind
     const nvn_gpu_timestamp_result *timestamps; uint32_t ntimestamps; // 回调期间只读；FAILED 无有效槽，FAULT 仅消费 valid 槽
     const uint64_t *occlusion; uint32_t nocclusion;   // 各槽样本数（只在回调期间有效；FAILED 时为 NULL）
+    const uint8_t *readback; uint64_t readback_bytes;   // CPU 可见，只在本回调有效。已录但数据不可信时整段 FAILED；FAILED 不附数据。
 } nvn_gpu_done;
 typedef void (*nvn_gpu_done_fn)(void *user, const nvn_gpu_done *d);
 // 提交一段。
@@ -559,6 +578,24 @@ uint64_t nvn_gpu_fence_done(void);     // 已完成到的值（只算已调完 d
 uint64_t nvn_gpu_fence_failed(void);   // 第一个失败段的 signal F，0 = 没有失败。线程：[任意]，acquire
 // 等时间线 ≥ v。timeout_ns = 0 纯查询、不产生副作用。返回 OK / NVN_GPU_E_TIMEOUT / NVN_GPU_E_FAILED（v ≥ F）/ NVN_GPU_E_DEVICE / NVN_GPU_E_ARG（v 从没提交过）。
 // 线程：[任意]，[回调] 里调返回 NVN_GPU_E_ORDER。
+// Optional backend diagnostic. The wait result and timeout contract match fence_wait.
+enum nvn_gpu_idle_site {
+    NVN_IDLE_REG_LOCK, NVN_IDLE_VIEW_LOCK, NVN_IDLE_RESOLVE_LOCK,
+    NVN_IDLE_LAND, NVN_IDLE_READ_TEXELS, NVN_IDLE_SITES
+};
+// source 是实际读取的映射地址；hint 可供后端快速识别这次分配。
+struct nvn_gpu_idle_observer {
+    uint64_t (*clock_ns)(void);
+    void (*note)(enum nvn_gpu_idle_site site, nvn_gpu_buf hint, const void *source, uint64_t bytes, uint64_t ns);
+};
+const struct nvn_gpu_idle_observer *nvn_gpu_idle_observer(void);
+
+enum nvn_gpu_wait_site {
+    NVN_GPU_WAIT_OTHER, NVN_GPU_WAIT_FINISH, NVN_GPU_WAIT_SYNC,
+    NVN_GPU_WAIT_READ_PRIOR, NVN_GPU_WAIT_READ_COPY, NVN_GPU_WAIT_WSI_SLOT,
+    NVN_GPU_WAIT_WSI_DRAIN, NVN_GPU_WAIT_SITES
+};
+nvn_gpu_rc nvn_gpu_fence_wait_at(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err, enum nvn_gpu_wait_site site);
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err);
 
 // ---------- 上屏（定稿 A5 / A6 / #8） ----------

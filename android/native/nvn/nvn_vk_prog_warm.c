@@ -23,6 +23,7 @@
 // 读盘 / 现场编；读数见 docs/坑记录.md「预热清单上限 4096 → 8192」一条。
 #include "direct/installed_seed.h"
 #include "nvn_vk_prog_warm.h"
+#include "nvn_vk_warm_options.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -344,8 +345,11 @@ int nvk_prog_warm_load(void) {
         return 0;
     }
     uint8_t *buf = NULL; size_t len = 0;
-    int rf = read_file(path, 0, &buf, &len), e = rf ? errno : 0;
-    if (rf && e == ENOENT) {   // 本闭包还没有清单：读旧名那份（升级后第一局；闭包对得上才收，见下面的有效性检查）
+    // 采集局的记录只来自本局实际绘制；历史配方不能作普通程序的管线真值。
+    int capture = nvk_warm_capture_enabled();
+    int rf = capture ? -1 : read_file(path, 0, &buf, &len);
+    int e = capture ? ENOENT : rf ? errno : 0;
+    if (!capture && rf && e == ENOENT) {   // 本闭包还没有清单：读旧名那份（升级后第一局；闭包对得上才收，见下面的有效性检查）
         char legacy[NVK_PROG_WARM_MAX_PATH];
         if (snprintf(legacy, sizeof legacy, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof legacy) { rf = read_file(legacy, 0, &buf, &len); e = rf ? errno : 0; }
     }
@@ -353,7 +357,7 @@ int nvk_prog_warm_load(void) {
     // 种子是锦上添花：不在 / 读不动 / 坏 / 不属于本局，都只打一行、按「本局没有清单」走，不拦起局。
     int from_seed = 0;
     char seed_dir[NVK_PROG_WARM_MAX_PATH] = "", seed_file[NVK_PROG_WARM_MAX_PATH] = "";
-    if (rf && e == ENOENT && !seed_dir_of(seed_dir, sizeof seed_dir, closure_sha, profile_sha)) {
+    if (!capture && rf && e == ENOENT && !seed_dir_of(seed_dir, sizeof seed_dir, closure_sha, profile_sha)) {
         const char *nm = strrchr(path, '/');
         if (snprintf(seed_file, sizeof seed_file, "%s/%s", seed_dir, nm ? nm + 1 : path) < (int)sizeof seed_file) {
             uint8_t *sb = NULL; size_t sl = 0;
