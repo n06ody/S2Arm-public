@@ -36,6 +36,8 @@
 #include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
+#include "nvn_vk_land_auto.h"
+#include <unistd.h>
 #include "nvn_plat.h"   // 调试开关与一行日志（上屏段的调试色、GPU 时间读数）
 #include "nvn_vk_format.h"
 #include "nvn_pipe_flight.h"   // 配方级在途表（纯逻辑）：同配方合并成一份创建，不同配方不互相排队
@@ -296,6 +298,9 @@ enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
+    int land_mode, land_observe, land_tracked, land_epoch;
+    uint32_t land_eligible, land_direct;
+    uint64_t land_eligible_bytes;
     struct vk_land_slot *land_slot;
     VkDeviceSize land_bytes, land_invalidate_bytes;
     const struct nvn_gpu_pipe_s *loss_programs[LOSS_PROGRAMS_PER_SEGMENT], *loss_last_pipe;
@@ -463,7 +468,10 @@ struct nvn_gpu_vk {
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
     struct vk_land_slot land_slots[3];
-    int land_readback;
+    int land_readback, land_auto, land_arm_prev;
+    _Atomic int land_reported;
+    unsigned land_prior_live, land_live_count;
+    struct la_trial land_trial;
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
@@ -1809,6 +1817,8 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.inc
 
+#include "backend_vulkan_land_auto.inc"
+
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
@@ -1834,6 +1844,10 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     }
     free(c->newimg); c->newimg = NULL; c->n_newimg = 0;
     for (uint32_t i = 0; i < c->nrefs; i++) unref_locked(&g, c->refs[i].obj, c->refs[i].type);
+    if (c->land_tracked) {
+        g.land_live_count--;
+        if (c->land_epoch != g.land_trial.epoch) g.land_prior_live--;
+    }
     if (c->land_slot) c->land_slot->busy = 0;   // GPU 已结束，done 已归还借用，或段已丢弃
     pthread_mutex_unlock(&g_mu);
     for (uint32_t i = 0; i < c->nstaging; i++) {
@@ -1897,6 +1911,13 @@ void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_device_lost.inc"
 
 #ifdef S2A_LAND_READBACK_TEST
+// The policy fixture drives full windows. Here only inject its requested mode to
+// exercise switching with real outstanding submissions, borrowed slots and fences.
+void nvn_gpu_vk_test_land_mode(int on) {
+    pthread_mutex_lock(&g_mu);
+    g.land_trial.mode = on;
+    pthread_mutex_unlock(&g_mu);
+}
 static VkResult (*g_land_test_gate)(uint64_t);
 void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t)) { g_land_test_gate = gate; }
 #endif
@@ -1938,6 +1959,11 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         while (!vk->stop && !vk->device_lost) {
             r = vkWaitForFences(vk->d, 1, &s->fence, VK_TRUE, 50ull * 1000ull * 1000ull);
             if (r != VK_TIMEOUT) break;
+            if (vk->land_auto && !atomic_load_explicit(&vk->land_reported, memory_order_relaxed)) {
+                pthread_mutex_lock(&g_mu);
+                land_auto_deadline_locked(now_ns());
+                pthread_mutex_unlock(&g_mu);
+            }
         }
         // 测试钩子：真实栅栏必须先完成（否则 fence / command buffer 还在途，不能销毁），
         // 完成后再把它当成失败，走真实的失败终止路径。
@@ -2037,6 +2063,20 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         // 发布顺序：先 done（核心回写），done 返回后才推进已完成值。
         segment_done(s, NVN_GPU_DONE_OK, NVN_GPU_OK, NULL);
         pthread_mutex_lock(&g_mu);
+        // Count work only after invalidate and the successful landing callback.
+        if (s->cmd && s->cmd->land_observe && !vk->land_trial.reason &&
+            s->cmd->land_epoch == vk->land_trial.epoch) {
+            struct nvn_gpu_cmd_s *c = s->cmd;
+            struct la_counts *l = &vk->land_trial.counts;
+            l->bytes += c->land_eligible_bytes;
+            l->spans += c->land_eligible;
+            l->subs += c->land_eligible != 0;
+            l->direct += c->land_direct;
+            if (c->land_slot) {
+                l->staged += c->land_eligible;
+                l->staged_bytes += c->land_bytes;
+            }
+        }
         if (s->signal > 0 && s->signal > vk->completed) vk->completed = s->signal;
         submitted_compact_locked(vk);
         vk->stats[STAT_DONE_OK]++;
@@ -2053,6 +2093,8 @@ static void *worker_main(void *arg) {
     struct nvn_gpu_vk *vk = arg;
     pthread_mutex_lock(&g_mu);
     for (;;) {
+        if (vk->land_auto && vk->land_trial.armed && !vk->land_trial.reason)
+            land_auto_deadline_locked(now_ns());
         if (vk->rhead) {
             struct nvn_gpu_buf_s *b = vk->rhead;
             vk->rhead = b->retire_next;
@@ -2402,7 +2444,10 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(&g, 0, sizeof g);
     g.dev = dev;
     pipe_creation_open(dev);
-    if (nvn_plat_flag("nvk_land_readback", 0) == 1) {
+    const int land_setting = nvn_plat_flag("nvk_land_readback", 0);
+    g.land_auto = land_setting == 2;
+    if (g.land_auto) g.land_arm_prev = nvn_plat_flag("nvk_land_arm", 0);
+    if (land_setting == 1 || g.land_auto) {
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         g.land_readback = s2a_vk_memory_type(dev, UINT32_MAX, want, NULL) != UINT32_MAX;
         if (!g.land_readback)
@@ -2548,6 +2593,10 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     if (g.close_active) {
         pthread_mutex_unlock(&g_mu);
         return fail(err, NVN_GPU_E_ORDER, "另一个线程正在 close");
+    }
+    if (g.land_auto && !g.land_trial.reason) {
+        la_lock(&g.land_trial,0,g.land_trial.armed ? "session_end" : "not_armed");
+        land_auto_log_locked();
     }
     g.close_active = 1;
     g.closing = 1;
@@ -3014,6 +3063,11 @@ static struct vk_land_slot *land_slot_take(VkDeviceSize size) {
         nvn_plat_log(NVN_PLAT_LOG_WARN, "land-readback", err.why);
         return NULL;
     }
+    if (g.land_auto) {
+        pthread_mutex_lock(&g_mu);
+        g.land_trial.counts.allocs++;
+        pthread_mutex_unlock(&g_mu);
+    }
     char message[128];
     snprintf(message, sizeof message, "暂存 %llu 字节，实际内存标志 0x%x，非一致粒度 %llu",
              (unsigned long long)slot->buf->bytes, (unsigned)slot->buf->memory_flags,
@@ -3030,10 +3084,11 @@ static int compare_land_src(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-int nvn_gpu_readback_enabled(void) { return g_open && g.land_readback; }
+int nvn_gpu_readback_enabled(void) { return g_open && g.land_readback && !g.land_auto; }
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c) { return c && (c->land_mode || c->land_observe); }
 
 uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count) {
-    if (!nvn_gpu_readback_enabled() || !c || c->in_pass || c->land_slot || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    if (!nvn_gpu_readback_cmd_enabled(c) || c->in_pass || c->land_slot || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
 
     const VkMemoryPropertyFlags direct = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
@@ -3064,6 +3119,12 @@ uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, ui
         used += s->bytes;
         staged++;
     }
+    if (c->land_observe) {
+        c->land_eligible = staged;
+        c->land_eligible_bytes = used;
+        c->land_direct = cached;
+    }
+    if (!c->land_mode) return 0;
     if (cached) land_stat(STAT_LAND_DIRECT, cached);
     if (!staged) return 0;
 
@@ -8622,6 +8683,16 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         free(c);
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
+    if (g.land_auto) {
+        if (g.land_trial.armed && !g.land_trial.reason) land_auto_deadline_locked(now_ns());
+        c->land_mode = g.land_trial.mode;
+        c->land_observe = g.land_trial.armed && !g.land_trial.reason;
+        if (!g.land_trial.reason) {
+            c->land_tracked = 1;
+            c->land_epoch = g.land_trial.epoch;
+            g.land_live_count++;
+        }
+    } else c->land_mode = g.land_readback;
     c->live_next = g.live;
     g.live = c;
     pthread_mutex_unlock(&g_mu);

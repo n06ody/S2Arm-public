@@ -285,6 +285,9 @@ s2a_gate_step "$out/nvn-vk-format-test"
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/ts_queue_test.c" -o "$out/ts-queue-test"
 s2a_gate_step "$out/ts-queue-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    "$android_dir/tests/nvk_land_auto_test.c" -lm -o "$out/land-auto-test"
+s2a_gate_step "$out/land-auto-test"
 # #653：逐报告时间戳校准纯数学（不建 Vulkan device，不替代真机/VVL 验证）。
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/report_ts_test.c" -o "$out/report-ts-test"

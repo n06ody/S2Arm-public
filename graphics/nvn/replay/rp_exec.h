@@ -168,6 +168,7 @@ int rp_fence_done(uint64_t f);       // 栅栏值 f 及之前交出去的活显�
 extern int rp_split_draws;       // 中途交段：每段的笔数（见 rp_exec.c）
 extern int rp_split_pass_draws, rp_split_pass_max;   // 超长通道中途先交：每段笔数、每次提交最多切几次（见 rp_exec.c pass_split）
 uint64_t rp_seg_serial(void);   // 第几个后端段：段里的暂存内容（arena 切片）只在同一段里能复用
+uint64_t rp_present_draw_count(void);
 void rp_exec_totals(uint64_t *exec_ns, uint64_t *subs);   // 进程累计：最外层回放用时 / 提交次数（与帧级账同源，只读）
 void rp_pool_stats_frame(void);   // [上屏] 帧边界：读一次开关；开着时每 1024 帧打一行 S2A_POOLSTATS
 void rp_pool_stats_end(void);     // 会话收尾：开着就再打一行（why=end）并关掉

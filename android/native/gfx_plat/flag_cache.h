@@ -11,7 +11,17 @@
 // 做法：每个线程一张小表（无锁），按开关名记「读到的值 / 没设」，TTL 之内直接返回；过期了重读，所以运行中 adb setprop
 // 改开关仍然生效（延迟不超过 TTL）。没设时返回的是「这次调用传的缺省」，不是缓存里的某个缺省（同一个开关在不同调用点缺省可以不同）。
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+// Only the readback switch has an explicit named third mode.
+static inline int fc_value(const char *name, const char *value) {
+    if (!strcmp(name, "nvk_land_readback")) {
+        if (!strcmp(value, "auto")) return 2;
+        return atoi(value) == 1;
+    }
+    return atoi(value);
+}
 
 enum { FC_SLOTS = 64, FC_PROBE = 4, FC_NAME_MAX = 40 };   // FC_SLOTS 必须是 2 的幂；名字长到 FC_NAME_MAX 个字节以上的不进表
 

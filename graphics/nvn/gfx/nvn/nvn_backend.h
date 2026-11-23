@@ -451,6 +451,8 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_
 // [提交]，在通道外调用，最后一段里所有源写之后。返回 0 表示未录复制，仍可走原镜像回写；已录制的副作用只通过 done 交付。
 typedef struct { nvn_gpu_buf src; uint64_t offset, bytes, readback_offset; } nvn_gpu_readback_span;
 int nvn_gpu_readback_enabled(void);
+// 本段是否需要候选范围；auto 在 R0 同样观察负载，实际模式在开段时锁存。
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c);
 uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count);
 
 // 32 位样式填充（NVN ClearBuffer）：bytes 是 4 的倍数，每 4 字节按小端写 value；不是按字节 memset（用例 C01 用 0x11223344 区分）。

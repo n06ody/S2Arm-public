@@ -173,6 +173,8 @@ static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
 }
 
 // 弱链接[replay]：nvn_gpu_readback_enabled
+// 弱链接[replay]：nvn_gpu_readback_cmd_enabled
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_readback_record
 int nvn_gpu_readback_enabled(void) __attribute__((weak));
 uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count) __attribute__((weak));
@@ -183,7 +185,9 @@ static int compare_write_ref(const void *a, const void *b) {
     return (x->id > y->id) - (x->id < y->id);
 }
 static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
-    if (!s || !s->ngw || !nvn_gpu_readback_enabled || !nvn_gpu_readback_record || !nvn_gpu_readback_enabled()) return;
+    if (!s || !s->ngw || !nvn_gpu_readback_record) return;
+    if (nvn_gpu_readback_cmd_enabled ? !nvn_gpu_readback_cmd_enabled(c) :
+        (!nvn_gpu_readback_enabled || !nvn_gpu_readback_enabled())) return;
     const uint32_t count = (uint32_t)s->ngw;
     struct rp_gpu_write_ref local_refs[16];
     nvn_gpu_readback_span local_spans[16] = {0};
@@ -703,6 +707,7 @@ void rp_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs) {
     *exec_ns = ns - last_ns; *draws = dr - last_dr; *subs = sb - last_sb;
     last_ns = ns; last_dr = dr; last_sb = sb;
 }
+uint64_t rp_present_draw_count(void) { return __atomic_load_n(&g_fr_draws, __ATOMIC_RELAXED); }
 void rp_exec_totals(uint64_t *exec_ns, uint64_t *subs) { *exec_ns = __atomic_load_n(&g_fr_exec_ns, __ATOMIC_RELAXED); *subs = __atomic_load_n(&g_fr_subs, __ATOMIC_RELAXED); }
 // 长帧行：既有格式一字不动，末尾追一句「本帧」分项（只在 nvk_hitch_log 打开且帧间隔超阈值时由 [上屏] 调）。
 // gap_ns：这一帧的帧间隔；exec_ns / draws / subs：上一帧的回放账（rp_frame_take）；fr：上一帧的分项（rp_fr_perf_take）。

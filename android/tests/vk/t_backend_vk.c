@@ -77,7 +77,7 @@ static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 
 static int g_gfx_c2_flag = -1;   // nvk_libpack_gfx_c2：-1 = 读缺省（0 = 库图形程序读 c2 句柄表被挡下走现编）；0 / 1 = 用例指定（t_replay_libpack_c0）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_libpack_gfx_c2") && g_gfx_c2_flag >= 0) return g_gfx_c2_flag;
-    if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return 1;
+    if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return g_land_test_on;
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_pool_rec") && g_pool_rec_flag >= 0) return g_pool_rec_flag;
     if (!strcmp(name, "nvk_compute_warm")) return g_compute_warm < 0 ? dflt : g_compute_warm;
@@ -10995,6 +10995,7 @@ static void gpu_deswizzle_matrix(void) {
 #include "t_clear_capacity.inc"
 
 #ifdef S2A_LAND_READBACK_TEST
+void nvn_gpu_vk_test_land_mode(int on);
 void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t));
 static atomic_int land_gate_release;
 static int land_force_failure;
@@ -11021,11 +11022,11 @@ static void land_done(void *user, const nvn_gpu_done *done) {
     atomic_store(&result->called, 1);
 }
 
-static void test_land_readback(int fail_invalidate) {
+static void test_land_readback(int fail_invalidate, int automatic) {
     memset(&g_desc, 0, sizeof g_desc);
     g_desc.host_device = &g_dev;
     g_desc.app_label = "land-readback";
-    g_land_test_on = 1;
+    g_land_test_on = automatic ? 2 : 1;
     if (!open_backend()) {
         g_land_test_on = 0;
         return;
@@ -11033,7 +11034,16 @@ static void test_land_readback(int fail_invalidate) {
     nvn_gpu_err err = {0};
     nvn_gpu_buf mirror = make_buf(128, NVN_GPU_MEM_SHARED, NULL);
     struct land_result a_result = {0}, b_result = {0};
-    const int enabled = nvn_gpu_readback_enabled();
+    int enabled = nvn_gpu_readback_enabled();
+    if (automatic) {
+        CHECK(!enabled, "auto starts with forced path disabled");
+        nvn_gpu_cmd unarmed=begin_cmd();
+        CHECK(!nvn_gpu_readback_cmd_enabled(unarmed), "unarmed segment must stay off");
+        nvn_gpu_vk_test_land_mode(1);
+        CHECK(!nvn_gpu_readback_cmd_enabled(unarmed), "already open segment changed mode");
+        nvn_gpu_cmd_abort(unarmed);
+        enabled=1;
+    }
     CHECK(enabled, "land: no cached readback capability on test ICD");
     if (mirror && enabled) {
         CHECK(OK(nvn_gpu_cmd_commit(begin_cmd(), 1, on_done, NULL, &err)), "land: F-1 submit %s", err.why);
@@ -11046,12 +11056,14 @@ static void test_land_readback(int fail_invalidate) {
         land_force_failure = fail_invalidate;
         atomic_store(&land_gate_release, 0);
         nvn_gpu_vk_test_land_gate(land_wait_for_later_gpu);
+        if (automatic) nvn_gpu_vk_test_land_mode(0);
         CHECK(nvn_gpu_readback_record(a, spans, 2) == 56 &&
               spans[0].readback_offset == 0 && spans[1].readback_offset == 37,
               "land: packed copy plan must preserve both source ranges");
         CHECK(OK(nvn_gpu_cmd_commit(a, 2, land_done, &a_result, &err)), "land: A submit %s", err.why);
 
         nvn_gpu_cmd b = begin_cmd();
+        if (automatic) CHECK(!nvn_gpu_readback_record(b, spans, 2), "new R0 segment must use mirror");
         nvn_gpu_fill_buf(b, mirror, 0, 128, 0x22222222u);
         CHECK(OK(nvn_gpu_cmd_commit(b, 3, land_done, &b_result, &err)), "land: B submit %s", err.why);
         // A 的 CPU 完成线程仍堵在 gate。直接排队一个 Vulkan 栅栏，证明 B 的真实 GPU 工作已经结束。
@@ -11129,8 +11141,10 @@ int main(int argc, char **argv) {
 #endif
 #ifdef S2A_LAND_READBACK_TEST
     if (argc > 2 && !strcmp(argv[2], "--land-readback")) {
-        test_land_readback(0);
-        test_land_readback(1);
+        test_land_readback(0,0);
+        test_land_readback(1,0);
+        test_land_readback(0,1);
+        test_land_readback(1,1);
         printf("LAND_READBACK valid and invalidated paths: failures=%d\n", g_fail);
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
@@ -11767,8 +11781,10 @@ int main(int argc, char **argv) {
     c658_suite(argv[1],0);   // Independently opens/closes; absent count capability is a negative control.
     c907_retained_flush(argv[1]);   // 停局保留会话时的管线缓存落盘（#907 合入补）
 #ifdef S2A_LAND_READBACK_TEST
-    test_land_readback(0);
-    test_land_readback(1);
+    test_land_readback(0,0);
+    test_land_readback(1,0);
+    test_land_readback(0,1);
+    test_land_readback(1,1);
 #endif
     // C201：整套用例都在 nvk_fbdrop=2（自检档）下跑，视图销毁走快路之后每次再全表扫一遍；反查表漏记过的帧缓冲会在这里留下残留计数。
     CHECK(nvn_vk_dbg_view_stat(3) == 0, "C201 整套用例在自检档下跑完：视图销毁后帧缓冲缓存里扫到的残留期望 0 → %llu", (unsigned long long)nvn_vk_dbg_view_stat(3));
