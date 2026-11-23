@@ -10994,6 +10994,7 @@ static void gpu_deswizzle_matrix(void) {
 
 #ifdef S2A_LAND_READBACK_TEST
 void nvn_gpu_vk_test_land_mode(int on);
+uint64_t nvn_gpu_vk_test_land_eligible_bytes(nvn_gpu_cmd c);
 void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t));
 static atomic_int land_gate_release;
 static int land_force_failure;
@@ -11035,11 +11036,21 @@ static void test_land_readback(int fail_invalidate, int automatic) {
     int enabled = nvn_gpu_readback_enabled();
     if (automatic) {
         CHECK(!enabled, "auto starts with forced path disabled");
-        nvn_gpu_cmd unarmed=begin_cmd();
-        CHECK(!nvn_gpu_readback_cmd_enabled(unarmed), "unarmed segment must stay off");
+        // Force an eligible candidate even on a software ICD with only cached mappings.
+        nvn_gpu_vk_test_land_gate(land_wait_for_later_gpu);
+        nvn_gpu_cmd r0 = begin_cmd();
+        nvn_gpu_readback_span probe = {mirror, 5, 19, UINT64_MAX};
+        CHECK(nvn_gpu_readback_cmd_enabled(r0), "auto R0 must collect candidate ranges");
+        CHECK(nvn_gpu_readback_record(r0, &probe, 1) == 0 &&
+              nvn_gpu_vk_test_land_eligible_bytes(r0) == 19,
+              "auto R0 must observe 19 eligible bytes without recording a copy");
         nvn_gpu_vk_test_land_mode(1);
-        CHECK(!nvn_gpu_readback_cmd_enabled(unarmed), "already open segment changed mode");
-        nvn_gpu_cmd_abort(unarmed);
+        probe.bytes = 37;
+        CHECK(nvn_gpu_readback_record(r0, &probe, 1) == 0 &&
+              nvn_gpu_vk_test_land_eligible_bytes(r0) == 37,
+              "open R0 must still observe 37 eligible bytes without staging after a switch to R1");
+        nvn_gpu_cmd_abort(r0);
+        nvn_gpu_vk_test_land_gate(NULL);
         enabled=1;
     }
     CHECK(enabled, "land: no cached readback capability on test ICD");

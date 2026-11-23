@@ -1945,6 +1945,10 @@ void nvn_gpu_vk_test_land_mode(int on) {
     g.land_trial.mode = on;
     pthread_mutex_unlock(&g_mu);
 }
+// Called by the recording thread before commit or abort.
+uint64_t nvn_gpu_vk_test_land_eligible_bytes(nvn_gpu_cmd c) {
+    return c ? c->land_eligible_bytes : 0;
+}
 static VkResult (*g_land_test_gate)(uint64_t);
 void nvn_gpu_vk_test_land_gate(VkResult (*gate)(uint64_t)) { g_land_test_gate = gate; }
 #endif
