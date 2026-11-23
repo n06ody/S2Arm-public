@@ -15,6 +15,19 @@ enum {
   LA_MAX_FRAMES = 2048,
   LA_MIN_FRAMES = 50
 };
+// Decision log ABI, shared with the field-run parser.
+#define LA_REASON_ON_PAIRED_GAIN "paired_gain"
+#define LA_REASON_OFF_INSUFFICIENT_SAMPLES "insufficient_samples"
+#define LA_REASON_OFF_NO_CACHED_TYPE "no_cached_type"
+#define LA_REASON_OFF_COVERAGE "coverage"
+#define LA_REASON_OFF_AA_WORKLOAD "AA_workload"
+#define LA_REASON_OFF_NO_COMPLETED_STAGING "no_completed_staging"
+#define LA_REASON_OFF_STAGING_GROWTH "staging_growth"
+#define LA_REASON_OFF_CHANGED_WORKLOAD "changed_workload"
+#define LA_REASON_OFF_FPS_WITHIN_NOISE "fps_within_noise"
+#define LA_REASON_OFF_TAIL_FPS "tail_fps"
+#define LA_REASON_OFF_PRESENT_PRESSURE "present_pressure"
+#define LA_REASON_OFF_FRAME_TAIL "frame_tail"
 #define LA_SECOND UINT64_C(1000000000)
 enum la_metric {
   LA_FPS,
@@ -49,19 +62,31 @@ struct la_trial {
   double noise[LA_METRICS];
   struct la_frame frames[LA_MAX_FRAMES];
   struct la_counts counts, initial;
-  uint64_t arm, start, prev, draws, life, compile;
-  int thermal, target, index, armed, mode, rejected, epoch;
+  uint64_t start, prev, draws, life, compile, decision_boottime_ns;
+  int thermal, target, index, environment_set, mode, recovering, rejected, qualified, epoch;
   unsigned n;
   const char* reason;
 };
-static inline int la_arm_edge(int previous, int signal, int pid) {
-  return pid > 0 && previous != pid && signal == pid;
-}
 static inline void la_lock(struct la_trial* t, int on, const char* reason) {
   if (t->reason)
     return;
   t->mode = on;
   t->reason = reason;
+}
+static inline void la_end(struct la_trial* t) {
+  la_lock(t, 0, LA_REASON_OFF_INSUFFICIENT_SAMPLES);
+}
+// A sparse on-window cannot keep staging active indefinitely. Re-enter the same
+// trial slot after a qualified off-window and a drain of prior in-flight work.
+static inline void la_discard(struct la_trial* t) {
+  t->n = 0;
+  t->start = 0;
+  t->rejected++;
+  if (t->mode) {
+    t->mode = 0;
+    t->recovering = 1;
+    t->epoch++;
+  }
 }
 static inline int la_on_window(int index) {
   return index >= LA_WARM && index <= LA_ON2;
@@ -84,7 +109,7 @@ static inline const char* la_calibrate(struct la_trial* t) {
   for (int i = 0; i < LA_AA; i += 2) {
     const struct la_window *a = &t->windows[i], *b = a + 1;
     if (!la_comparable(a, b))
-      return "AA_workload";
+      return LA_REASON_OFF_AA_WORKLOAD;
     for (unsigned k = 0; k < LA_METRICS; k++) {
       double delta = fabs(a->m[k] - b->m[k]);
       if (k == LA_FPS)
@@ -98,16 +123,16 @@ static inline const char* la_calibrate(struct la_trial* t) {
 static inline const char* la_compare(const struct la_window* off, const struct la_window* on,
                                      const double* noise) {
   if (!on->work.staged || !on->work.staged_bytes)
-    return "no_completed_staging";
+    return LA_REASON_OFF_NO_COMPLETED_STAGING;
   if (!la_comparable(off, on))
-    return "changed_workload";
+    return LA_REASON_OFF_CHANGED_WORKLOAD;
   if (on->m[LA_FPS] <= off->m[LA_FPS] * (1 + fmax(.05, noise[LA_FPS])))
-    return "fps_within_noise";
+    return LA_REASON_OFF_FPS_WITHIN_NOISE;
   if (off->m[LA_TAIL_FPS] - on->m[LA_TAIL_FPS] > noise[LA_TAIL_FPS])
-    return "tail_fps";
+    return LA_REASON_OFF_TAIL_FPS;
   for (unsigned k = LA_P99; k < LA_METRICS; k++)
     if (on->m[k] - off->m[k] > noise[k])
-      return k >= LA_ACQ ? "present_pressure" : "frame_tail";
+      return k >= LA_ACQ ? LA_REASON_OFF_PRESENT_PRESSURE : LA_REASON_OFF_FRAME_TAIL;
   return NULL;
 }
 static inline void la_finish_window(struct la_trial* t, uint64_t now, uint64_t draws) {
@@ -133,7 +158,8 @@ static inline void la_finish_window(struct la_trial* t, uint64_t now, uint64_t d
     v[i] = f.dt;
   }
   if (tail == n || !tail_ns || draws < t->draws) {
-    la_lock(t, 0, "tail_coverage");
+    memset(w, 0, sizeof *w);
+    la_discard(t);
     return;
   }
   qsort(v + tail, n - tail, sizeof *v, la_cmp);
@@ -169,24 +195,25 @@ static inline void la_finish_window(struct la_trial* t, uint64_t now, uint64_t d
   LA_DELTA(direct);
   LA_DELTA(allocs);
 #undef LA_DELTA
+  t->qualified++;
   const char* reason = NULL;
   if (t->index == LA_AA - 1)
     reason = la_calibrate(t);
   if (t->index == LA_WARM && !w->work.staged)
-    reason = "no_completed_staging";
+    reason = LA_REASON_OFF_NO_COMPLETED_STAGING;
   if ((t->index == LA_ON1 || t->index == LA_ON2) && w->work.allocs)
-    reason = "staging_growth";
+    reason = LA_REASON_OFF_STAGING_GROWTH;
   if (t->index == LA_OFF2) {
     for (unsigned i = 0; i < LA_AA; i++)
       if (!la_comparable(&t->windows[i], &t->windows[LA_BASE]))
-        reason = "AA_workload";
+        reason = LA_REASON_OFF_AA_WORKLOAD;
     if (!la_comparable(&t->windows[LA_BASE], w))
-      reason = "changed_workload";
+      reason = LA_REASON_OFF_CHANGED_WORKLOAD;
     if (!reason)
       reason = la_compare(&t->windows[LA_BASE], &t->windows[LA_ON1], t->noise);
     if (!reason)
       reason = la_compare(w, &t->windows[LA_ON2], t->noise);
-    la_lock(t, !reason, reason ? reason : "paired_gain");
+    la_lock(t, !reason, reason ? reason : LA_REASON_ON_PAIRED_GAIN);
   } else if (reason)
     la_lock(t, 0, reason);
   else {
@@ -198,11 +225,11 @@ static inline void la_finish_window(struct la_trial* t, uint64_t now, uint64_t d
 }
 static inline void la_frame(struct la_trial* t, uint64_t now, uint64_t acquire, uint64_t present,
                             uint64_t draws, int stale) {
-  if (!t->armed || t->reason)
+  if (t->reason)
     return;
-  if (now < t->arm || now - t->arm >= 60 * LA_SECOND) {
-    la_lock(t, 0, "budget");
-    return;
+  if (t->prev && now > t->prev && now - t->prev >= 5 * LA_SECOND) {
+    la_discard(t);
+    t->prev = 0;
   }
   if (stale) {
     t->start = 0;
@@ -217,16 +244,20 @@ static inline void la_frame(struct la_trial* t, uint64_t now, uint64_t acquire, 
     return;
   }
   if (now <= t->prev || t->n >= LA_MAX_FRAMES) {
-    la_lock(t, 0, "coverage");
+    la_lock(t, 0, LA_REASON_OFF_COVERAGE);
     return;
   }
   t->frames[t->n++] = (struct la_frame){now - t->prev, acquire, present};
   t->prev = now;
   if (now - t->start < 5 * LA_SECOND)
     return;
-  if (t->n < LA_MIN_FRAMES)
-    t->rejected++;
-  else
+  if (t->n < LA_MIN_FRAMES || draws <= t->draws || t->counts.bytes <= t->initial.bytes)
+    la_discard(t);
+  else if (t->recovering) {
+    t->recovering = 0;
+    t->mode = 1;
+    t->epoch++;
+  } else
     la_finish_window(t, now, draws);
   t->start = 0;
   t->n = 0;

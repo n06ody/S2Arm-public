@@ -488,7 +488,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
     struct vk_land_slot land_slots[3];
-    int land_readback, land_auto, land_arm_prev;
+    int land_readback, land_auto;
     _Atomic int land_reported;
     unsigned land_prior_live, land_live_count;
     struct la_trial land_trial;
@@ -1989,7 +1989,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             if (vk->idle_on && idle_resident_due(resident_clock(), vk->resident_last)) resident_emit("periodic");
             if (vk->land_auto && !atomic_load_explicit(&vk->land_reported, memory_order_relaxed)) {
                 pthread_mutex_lock(&g_mu);
-                land_auto_deadline_locked(now_ns());
+                land_auto_check_gap_locked(now_ns());
                 pthread_mutex_unlock(&g_mu);
             }
         }
@@ -2128,8 +2128,8 @@ static void *worker_main(void *arg) {
             resident_emit("periodic");
             pthread_mutex_lock(&g_mu);
         }
-        if (vk->land_auto && vk->land_trial.armed && !vk->land_trial.reason)
-            land_auto_deadline_locked(now_ns());
+        if (vk->land_auto && vk->land_trial.mode && !vk->land_trial.reason)
+            land_auto_check_gap_locked(now_ns());
         if (vk->rhead) {
             struct nvn_gpu_buf_s *b = vk->rhead;
             vk->rhead = b->retire_next;
@@ -2481,7 +2481,6 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     pipe_creation_open(dev);
     const int land_setting = nvn_plat_flag("nvk_land_readback", 0);
     g.land_auto = land_setting == 2;
-    if (g.land_auto) g.land_arm_prev = nvn_plat_flag("nvk_land_arm", 0);
     if (land_setting == 1 || g.land_auto) {
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         g.land_readback = s2a_vk_memory_type(dev, UINT32_MAX, want, NULL) != UINT32_MAX;
@@ -2637,10 +2636,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         pthread_mutex_unlock(&g_mu);
         return fail(err, NVN_GPU_E_ORDER, "另一个线程正在 close");
     }
-    if (g.land_auto && !g.land_trial.reason) {
-        la_lock(&g.land_trial,0,g.land_trial.armed ? "session_end" : "not_armed");
-        land_auto_log_locked();
-    }
+    land_auto_exit_locked();
     g.close_active = 1;
     g.closing = 1;
     pthread_mutex_unlock(&g_mu);
@@ -8775,9 +8771,9 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
     if (g.land_auto) {
-        if (g.land_trial.armed && !g.land_trial.reason) land_auto_deadline_locked(now_ns());
+        if (g.land_trial.mode && !g.land_trial.reason) land_auto_check_gap_locked(now_ns());
         c->land_mode = g.land_trial.mode;
-        c->land_observe = g.land_trial.armed && !g.land_trial.reason;
+        c->land_observe = !g.land_trial.reason;
         if (!g.land_trial.reason) {
             c->land_tracked = 1;
             c->land_epoch = g.land_trial.epoch;

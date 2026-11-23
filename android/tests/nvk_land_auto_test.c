@@ -9,6 +9,80 @@
       return 1;                                       \
     }                                                 \
   } while (0)
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include "nvn_plat.h"
+
+static struct {
+  int closing, land_auto, land_readback;
+  unsigned land_prior_live, land_live_count;
+  _Atomic int land_reported;
+  struct la_trial land_trial;
+} g;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+#include "../native/nvn/backend_vulkan_land_auto.inc"
+
+static char decision[4096];
+static unsigned lines;
+int dm_thermal_now(void) { return 0; }
+int s2a_android_host_lifecycle(uint64_t* life) { *life = 1; return 1; }
+uint64_t nvk_shader_live_compile_total(void) { return 0; }
+void nvn_plat_log(int level, const char* cls, const char* text) {
+  if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "land-readback")) {
+    snprintf(decision, sizeof decision, "%s", text);
+    lines++;
+  }
+}
+static int session_logs(int stop_at) {
+  memset(&g, 0, sizeof g);
+  g.land_auto = g.land_readback = 1;
+  lines = 0;
+  uint64_t now = LA_SECOND, draws = 0;
+  for (unsigned i = 0; i < 70; i++) {
+    now += LA_SECOND;
+    nvn_gpu_land_auto_present(now, 1, 1, 0, 1);
+  }
+  CHECK(!lines && g.land_trial.qualified == 0 && !g.land_trial.mode);
+  now += 6 * LA_SECOND;
+  for (int i = 0; i < 2000 && g.land_trial.qualified < stop_at; i++) {
+    int on = g.land_trial.mode;
+    now += on ? 40000000 : 50000000;
+    draws += 100;
+    g.land_trial.counts.bytes += 100;
+    if (on) {
+      g.land_trial.counts.staged++;
+      g.land_trial.counts.staged_bytes += 100;
+    }
+    land_auto_check_gap_locked(now);
+    nvn_gpu_land_auto_present(now, 1, 1, draws, 1);
+  }
+  CHECK(g.land_trial.qualified == stop_at);
+  if (stop_at == LA_WINDOWS) {
+    CHECK(lines == 1 && strstr(decision, "phase=lock mode=1 reason=paired_gain"));
+  } else {
+    CHECK(!lines && g.land_trial.mode == (stop_at == LA_WARM));  // Zero samples, or a provisional on-window.
+  }
+  uint64_t locked = g.land_trial.decision_boottime_ns;
+  land_auto_exit_locked();
+  unsigned after_exit = lines;
+  land_auto_exit_locked();
+  CHECK(lines == after_exit && lines == (stop_at == LA_WINDOWS ? 2u : 1u));
+  const char* stamp = strstr(decision, " decision_boottime_ns=");
+  CHECK(stamp && strtoull(stamp + strlen(" decision_boottime_ns="), NULL, 10) == g.land_trial.decision_boottime_ns);
+#ifdef CLOCK_BOOTTIME
+  CHECK(g.land_trial.decision_boottime_ns > 0);
+#endif
+  if (stop_at == LA_WINDOWS) {
+    CHECK(strstr(decision, "phase=exit mode=1 reason=paired_gain") &&
+          strstr(decision, "qualified_windows=11 ") && strstr(decision, "w8R1=125/") &&
+          locked == g.land_trial.decision_boottime_ns);
+  } else {
+    CHECK(strstr(decision, "phase=exit mode=0 reason=insufficient_samples") &&
+          strstr(decision, stop_at ? "qualified_windows=7 " : "qualified_windows=0 ") && !g.land_trial.mode);
+  }
+  return 0;
+}
 enum scenario {
   GAIN,
   LOSS,
@@ -27,9 +101,19 @@ enum scenario {
 static int run(enum scenario scenario, const char* reason) {
   struct la_trial t = {0};
   uint64_t now = LA_SECOND, draws = 0;
-  t.arm = now;
-  t.armed = 1;
-  while (!t.reason && now - t.arm < 61 * LA_SECOND) {
+  // Cold start: sparse load presents for over a minute, then a full-rate black window.
+  for (unsigned i = 0; i < 71; i++) {
+    t.counts.bytes += 100;
+    la_frame(&t, now += LA_SECOND, 1, 1, ++draws, 0);
+  }
+  CHECK(t.rejected > 0 && !t.qualified && !t.reason);
+  la_frame(&t, now, 0, 0, draws, 1);
+  for (unsigned i = 0; i < 301; i++)
+    la_frame(&t, now += 20000000, 1, 1, draws, 0);
+  CHECK(t.rejected > 0 && t.index == 0 && t.mode == 0 && !t.reason);
+  la_frame(&t, now, 0, 0, draws, 1);  // Drain between the loading and field workload.
+  const uint64_t gameplay = now;
+  while (!t.reason && now - gameplay < 62 * LA_SECOND) {
     int on = t.mode;
     uint64_t dt = on ? 40000000 : 50000000, pressure = 1000000;
     if (scenario == NOISE)
@@ -57,12 +141,14 @@ static int run(enum scenario scenario, const char* reason) {
     }
     la_frame(&t, now, pressure, pressure, draws, scenario == STALE && on);
   }
+  if (!t.reason) la_end(&t);
   if (!t.reason || strcmp(t.reason, reason))
     fprintf(stderr, "case %d: expected %s got %s (index %d)\n", scenario, reason,
             t.reason ? t.reason : "none", t.index);
   CHECK(t.reason && !strcmp(t.reason, reason));
   CHECK(t.mode == (scenario == GAIN));
   if (scenario == GAIN) {
+    CHECK(t.qualified == LA_WINDOWS);
     CHECK(t.windows[LA_BASE].frames == 100 && t.windows[LA_ON1].frames == 125);
     CHECK(t.windows[LA_BASE].m[LA_FPS] == 20 && t.windows[LA_ON1].m[LA_FPS] == 25);
     CHECK(t.windows[LA_WARM].work.staged && t.windows[LA_ON2].work.staged);
@@ -73,14 +159,17 @@ static int run(enum scenario scenario, const char* reason) {
   return 0;
 }
 int main(void) {
-  CHECK(la_arm_edge(0, 141, 141));
-  CHECK(!la_arm_edge(141, 141, 141) && !la_arm_edge(0, 142, 141) && !la_arm_edge(0, 0, 141));
   CHECK(fc_value("nvk_land_readback", "auto") == 2 && fc_value("nvk_land_readback", "1") == 1);
   CHECK(fc_value("nvk_land_readback", "0") == 0 && fc_value("nvk_land_readback", "2") == 0);
   CHECK(fc_value("unrelated", "auto") == 0 && fc_value("unrelated", "12") == 12);
   struct la_trial t = {0};
   la_frame(&t, 90000000000ull, 0, 0, 0, 0);
-  CHECK(!t.armed && !t.mode && !t.reason);
+  CHECK(t.start == 90000000000ull && !t.mode && !t.reason);
+  la_end(&t);
+  CHECK(!t.mode && !strcmp(t.reason, "insufficient_samples") && t.qualified == 0);
+  CHECK(!session_logs(0));
+  CHECK(!session_logs(LA_WINDOWS));
+  CHECK(!session_logs(LA_WARM));
   CHECK(!run(GAIN, "paired_gain"));
   CHECK(!run(LOSS, "fps_within_noise"));
   CHECK(!run(NO_GAIN, "fps_within_noise"));
@@ -91,11 +180,11 @@ int main(void) {
   CHECK(!run(PRESSURE, "present_pressure"));
   CHECK(!run(SECOND_LOSS, "fps_within_noise"));
   CHECK(!run(WORKLOAD, "changed_workload"));
-  CHECK(!run(SHORT_WINDOW, "budget"));
+  CHECK(!run(SHORT_WINDOW, "insufficient_samples"));
   CHECK(!run(TAIL, "tail_fps"));
-  CHECK(!run(STALE, "budget"));
+  CHECK(!run(STALE, "insufficient_samples"));
   puts(
-      "PASS land auto: arm gate, both pairs, AA noise, frame coverage, actual staging, tail, WSI, "
-      "load and budget");
+      "PASS land auto: cold start, both pairs, AA noise, frame coverage, actual staging, tail, WSI, "
+      "loading, qualified windows and insufficient samples");
   return 0;
 }
