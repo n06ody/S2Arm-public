@@ -58,7 +58,7 @@ static int link_map_flag;   // nvk_link_map_diag 开关替身
 static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
-static int fixture_hitch_flag, fixture_no_libpack, fixture_win_part, fixture_gfx_c2;   // nvk_hitch_log（图形现编原因日志的开关）/ no_libpack（出包库总闸）
+static int fixture_hitch_flag, fixture_no_libpack, fixture_win_part, fixture_gfx_c2, fixture_win_skip;   // nvk_hitch_log（图形现编原因日志的开关）/ no_libpack（出包库总闸）
 static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alias）：-1 = 取生产缺省，0 = 关
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
@@ -132,6 +132,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "no_libpack")) return fixture_no_libpack;
     if (!strcmp(name, "nvk_libpack_win_part")) return fixture_win_part;
     if (!strcmp(name, "nvk_libpack_gfx_c2")) return fixture_gfx_c2;
+    if (!strcmp(name, "nvk_libpack_win_skip_vs")) return fixture_win_skip;
     return dflt;
 }
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
@@ -2587,6 +2588,11 @@ static int win_part_test(void) {
     win_part_case("part 2, no mask → library", 0, 1, 2, 1);
     win_part_case("part 1, aligned state ignores the gate (no mask)", 0, 0, 1, 1);
     win_part_case("part 2, aligned state ignores the gate (mask)", 1, 0, 2, 1);
+    // 按顶点键前缀排除（夹具 VS 键前 3 字节 f5d9fa = 16111098）：窗口状态下前缀相等退回现编，不等照常走库，对齐状态不生效
+    fixture_win_skip = 0xf5d9fa; win_part_case("vs-skip matching prefix → live", 1, 1, 0, 0);
+    fixture_win_skip = 0x123456; win_part_case("vs-skip other prefix → library", 1, 1, 0, 1);
+    fixture_win_skip = 0xf5d9fa; win_part_case("vs-skip matching prefix, aligned state ignores it", 1, 0, 0, 1);
+    fixture_win_skip = 0;
     printf("nvk shader pool (library window part): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

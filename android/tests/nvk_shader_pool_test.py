@@ -296,6 +296,7 @@ def main():
             ('gate-off', 'if ((part == 1 && !window_used) || (part == 2 && window_used)) {', 'if (0) {', 'part 1, no mask', False),
             ('parts-swapped', '(part == 1 && !window_used) || (part == 2 && window_used)', '(part == 2 && !window_used) || (part == 1 && window_used)', 'part 1, mask', False),
             ('applies-when-aligned', 'const int part = !ckey && g.require_ssbo_window && lrc == S2A_LIBPACK_HIT', 'const int part = !ckey && lrc == S2A_LIBPACK_HIT', 'part 1, aligned state ignores the gate', False),
+            ('vs-skip-removed', 'if (skip && ((int)((gkeys[0][0] << 16) | (gkeys[0][1] << 8) | gkeys[0][2]) == skip)) {', 'if (0) {', 'vs-skip matching prefix', False),
             ('mask-never-reported', 'if (gfx && gfx->window_used && gfx->require_ssbo_window) *gfx->window_used = 1;', '(void)0;', 'part 1, mask', True),
         ):
             src = vk_code if in_vk else code
@@ -307,7 +308,7 @@ def main():
                 result = run('win-part-' + name, path, args=('--win-part',))
             assert result.returncode != 0 and 'FAIL: ' + expected in result.stdout + result.stderr, (name, result.stdout[-400:], result.stderr[-200:])
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 4 window-part negative controls')
+        print('PASS: 5 window-part negative controls')
         return 0
 
     if sys.argv[1:] == ['--gfx-reason-mutants']:

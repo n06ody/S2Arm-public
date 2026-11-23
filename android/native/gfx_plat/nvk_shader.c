@@ -1560,6 +1560,18 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
             snprintf(lw, sizeof lw, "window part gate %d: %s", part, window_used ? "program uses the window mask" : "program does not use the window mask");
             lrc = S2A_LIBPACK_MISS;
         }
+        // 按顶点着色器键前缀排除（缺省 0 = 关）：9400 第 3 班 B1（part=1）发白、C1（part=2）不白，带窗口掩码那组里每帧调用最多的 6 个程序
+        //   （合计约 600 / 1070 笔）都共用 vs e109140010227d71。debug.s2a.nvk_libpack_win_skip_vs = 该键前 3 字节（十进制整数，如 e10914 = 14780692）：
+        //   窗口状态下 VS 键前 3 字节相等的程序退回现编，其余照常走库，一局就能分开「共用 VS 家族」与「其余带掩码程序」。
+        if (!ckey && g.require_ssbo_window && lrc == S2A_LIBPACK_HIT) {
+            const int skip = nvn_plat_flag("nvk_libpack_win_skip_vs", 0);
+            if (skip && ((int)((gkeys[0][0] << 16) | (gkeys[0][1] << 8) | gkeys[0][2]) == skip)) {
+                if (*bytes) { free(*bytes); *bytes = NULL; *len = 0; }
+                if (ready && *ready) { nvn_vk_program_free(&(*ready)->graphics); free(*ready); *ready = NULL; }
+                snprintf(lw, sizeof lw, "window part gate vs-skip: vertex key prefix %06x excluded (debug.s2a.nvk_libpack_win_skip_vs)", skip);
+                lrc = S2A_LIBPACK_MISS;
+            }
+        }
         // 图形库程序读驱动句柄表（drvcb bank 2 → slot 2 → NVN_RB_DRV2）的闸（缺省关 = 回到 bank 2 映射之前的行为：这类程序走现编）。
         //   8E 第 3 班：vs 1b347578… 配 fs 60a28f01…（第 2 班一直被库以「fp_c2 无来源」拒、走现编）第一次出库，Adreno 上建管线失败
         //   「Bind group info mismatches the shader source for symbol fp_t_cb196610_…」，失败表挡掉 4180→5427 笔绘制，整屏全黑。
