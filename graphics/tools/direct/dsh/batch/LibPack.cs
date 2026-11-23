@@ -258,13 +258,13 @@ static partial class LibPack
     /// <summary>
     /// lib_pack.pack_files：按键文件 → &lt;d&gt;/lib.NNN.pak + lib.idx（d 已存在、里面没有 lib.idx）。names：文件名清单；get(名) → 字节或 null（可取 names 以外的名字）。
     /// → (红行, 汇总行)；有红行时 d 里不留任何临时文件。lib.idx 小端：头 48 字节 + 分片表 nshard×16 + 记录 n×24（u64 键、u8 种类、u8 分片、u16 0、u32 长、u64 偏移），段起点 16 字节对齐
-    /// vkfp（#783 合入线 11-03 答 ①）：给了 = Vulkan 库，16 位小写十六进制的 Vulkan 侧指纹按 u64 写进头部 36–43（44–47 仍为 0），只收 _b.json / _b.spv；
+    /// vkfp（#783 合入线 11-03 答 ①）：给了 = Vulkan 库，16 位小写十六进制的 Vulkan 侧指纹按 u64 写进头部 36–43（44–47 在组合阶段库中为 S2SB），只收 _b.json / _b.spv；
     ///   不给 = Metal 库，头部 36–47 全 0、不收 _b.spv（与改前逐字节相同）
     /// </summary>
     /// ident（可无）：名字 → 它那份字节的存储身份（同身份 = 同一份字节，见 ISharedBytes）；同身份的第二个起不再读、不再算摘要，直接指向第一个落的段。
     ///   产物与不给 ident 逐字节相同（原先同字节的段也只存一次，只是每个都读一遍、算一遍才认出来）
     /// guest（可无，只收 Metal 库）：客体输入块（GuestBlocks），每个键一条种类 56 记录、同块的键指向同一段
-    public static (List<string> Bad, string Line) PackFiles(IEnumerable<string> names, Func<string, byte[]> get, string d, string chain, string vkfp = null, Func<string, string> ident = null, Guest guest = null)
+    public static (List<string> Bad, string Line) PackFiles(IEnumerable<string> names, Func<string, byte[]> get, string d, string chain, string vkfp = null, Func<string, string> ident = null, Guest guest = null, Func<string, byte[]> vkStage = null)
     {
         if (!CHAIN.IsMatch(chain)) return (new() { $"链版本 {chain} 不对（至多 12 位）" }, "");
         if (vkfp != null && !VKFP.IsMatch(vkfp)) return (new() { $"Vulkan 侧指纹 {vkfp} 不对（16 位小写十六进制）" }, "");
@@ -294,6 +294,19 @@ static partial class LibPack
         if (vkfp == null && ents.Any(e => e.K != 1 && VkKind(e.K))) return (new() { $"有 {ents.First(e => e.K != 1 && VkKind(e.K)).N}（Vulkan 库的种类）却没给 Vulkan 侧指纹" }, "");
         if (vkfp != null && ents.Any(e => !VkKind(e.K))) return (new() { $"给了 Vulkan 侧指纹却混进了 Metal 段（如 {ents.First(e => !VkKind(e.K)).N}；Vulkan 库只收 _b.json / _b.spv / _vg<t>.json / _vg<t>.spv）" }, "");
         if (ents.Count == 0) return (new() { $"{d} 一个键文件都没有" }, "");
+        if (vkStage != null)
+        {
+            if (vkfp == null) return (new() { "binary Vulkan stages require a Vulkan fingerprint" }, "");
+            var inputs = ents.Select(e => e.N).ToHashSet();
+            foreach (var ent in ents)
+            {
+                string peer = Path.ChangeExtension(ent.N, ent.N.EndsWith(".spv", StringComparison.Ordinal) ? ".json" : ".spv");
+                if (!inputs.Contains(peer)) return (new() { "missing Vulkan stage input " + peer }, "");
+            }
+            ents = ents.Where(e => e.K == K_SPV || e.K >= K_VGSPV).Select(e =>
+                (e.Key, e.K == K_SPV ? 128 : 129 + e.K - K_VGSPV, e.N)).ToList();
+            get = vkStage;
+        }
         // A network's layers must all execute, or all use the old stand-in. Per-key opt-in would
         // mix newly translated missing keys with old packaged scalar layers and read unwritten buffers.
         bool tensorNative = vkfp == null, anyCompute = false;
@@ -387,7 +400,8 @@ static partial class LibPack
             var w = idx.AsSpan();
             MAGIC.CopyTo(w); W32(w, 8, VER); W32(w, 12, (uint)recs.Count); W32(w, 16, (uint)shards.Count); W32(w, 20, tensorNative ? 1u : 0u);
             Encoding.ASCII.GetBytes(chain).CopyTo(w[24..]);   // 12 字节链版本，不足补 0；36–47 为 0
-            if (vkfp != null) W64(w, 36, Convert.ToUInt64(vkfp, 16));   // Vulkan 库：36–43 = Vulkan 侧指纹（u64），44–47 仍为 0
+            if (vkfp != null) W64(w, 36, Convert.ToUInt64(vkfp, 16));   // Vulkan 库：36–43 = Vulkan 侧指纹（u64）
+            if (vkStage != null) "S2SB"u8.CopyTo(w[44..]);
             for (int i = 0; i < shards.Count; i++) W64(w, 48 + 16 * i, (ulong)sizes[i]);
             int o = 48 + 16 * shards.Count;
             foreach (var r in recs) { W64(w, o, r.Key); w[o + 8] = (byte)r.K; w[o + 9] = (byte)(r.S & 0xff); W16(w, o + 10, (ushort)(r.S >> 8)); W32(w, o + 12, r.Len); W64(w, o + 16, r.Off); o += 24; }

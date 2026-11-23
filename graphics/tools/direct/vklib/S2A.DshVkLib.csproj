@@ -9,7 +9,14 @@
     <AssemblyName>dsh_vklib</AssemblyName>
     <RootNamespace>S2A.DshVkLib</RootNamespace>
   </PropertyGroup>
+  <PropertyGroup>
+    <StageNativeName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libs2astage.dylib</StageNativeName>
+    <StageNativeName Condition="'$(StageNativeName)' == ''">libs2astage.so</StageNativeName>
+    <StageNativeFile>$(BaseIntermediateOutputPath)stagepack/$(Configuration)/$(StageNativeName)</StageNativeFile>
+  </PropertyGroup>
   <ItemGroup>
+    <None Include="$(StageNativeFile)" Link="$(StageNativeName)" CopyToOutputDirectory="PreserveNewest" />
+
     <ProjectReference Include="../dsh/S2A.Dsh.csproj" />
     <!-- 读包 / 读表与 dsh_batch 共用一份（#1419 直连缺陷线审 2）：只引这一个文件，不引 dsh_batch 工程 -->
     <Compile Include="../dsh/batch/PkgRead.cs" Link="PkgRead.cs" />
@@ -18,4 +25,7 @@
   </ItemGroup>
   <!-- Vulkan 侧指纹（DshVk.cs + 本目录），生成 VkFp.V -->
   <Import Project="VkFp.targets" />
+  <Target Name="BuildNativeStagePacker" BeforeTargets="PrepareForBuild" Inputs="@(VkFpInput)" Outputs="$(StageNativeFile)">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/build_stage_pack.sh&quot; &quot;$(StageNativeFile)&quot;" />
+  </Target>
 </Project>

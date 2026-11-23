@@ -47,6 +47,20 @@ public final class GameSessionTest {
         BootSpec spec = spec(root); GameSession s = new GameSession(spec, root.toFile());
         Path state = Path.of(s.stateDir);
         check(Files.isDirectory(state), "persistent state created");
+        Path cache = Files.createDirectories(state.resolve("direct-cache/nvn-vk"));
+        Path program = Files.write(cache.resolve("programs-v1-test.bin"), new byte[]{1});
+        Path pipe = Files.write(cache.resolve("pipes-v1-352.bin"), new byte[]{2});
+        Path saved = Files.write(state.resolve("retained.bin"), new byte[]{3});
+        try (GameSession keep = new GameSession(spec, root.toFile())) {
+            check(Files.exists(program) && Files.exists(pipe), "cache retained with clear disabled");
+        }
+        GameSession.clearDirectCache = true;
+        try (GameSession cold = new GameSession(spec, root.toFile())) {
+            check(!Files.exists(cache) && Files.exists(saved), "cold launch removes only direct-cache/nvn-vk");
+        } finally {
+            GameSession.clearDirectCache = false;
+        }
+        System.out.println("PASS cold session clears both program and pipeline sentinels; saved sentinel retained");
         check(s.begin(false,true,1280,720,320,60,BootSpec.ConsoleMode.HANDHELD) == null, "background no admission");
         check(s.begin(true,false,1280,720,320,60,BootSpec.ConsoleMode.HANDHELD) == null, "missing surface no admission");
         check(s.begin(true,true,0,720,320,60,BootSpec.ConsoleMode.HANDHELD) == null, "zero extent no admission");
