@@ -138,6 +138,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_IND_INDEX_OFF, RP_PERF_IND_INDEX_CUT, RP_PERF_IND_INDEX_BOUNDED_CUT,   // 通道内间接索引解析及对应切通道次数
        RP_PERF_TM_FRAMES,      // 分时抽样：窗口里逐步计时过的帧数（#1103）；绘制各步 / 开通道细分 / 贴图解析等锁持锁按它求每帧值
        RP_PERF_GW_REG_N, RP_PERF_GW_REG_KB, RP_PERF_GW_MERGED_N, RP_PERF_GW_MERGED_KB,   // 显卡写登记：收到的登记条数 / 千字节；同段合并掉的条数 / 因重叠省下的千字节（落地拷贝按合并后的条数算，见 rp_buf.c rp_buf_gpu_write_note2）
+       RP_PERF_BUF_SYNC_GW_KB,   // 已登记 GPU 写覆盖整页，在途免同步的 KB
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。

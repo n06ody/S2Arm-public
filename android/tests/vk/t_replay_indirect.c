@@ -29,7 +29,8 @@ int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)
 void nvn_plat_safepoint(void){}
 static int hz_flag=2, snapshot_flag;
 static unsigned snapshot_armed;
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_buf_read_snapshot"))return snapshot_flag;if(!strcmp(n,"nvk_opt_layout"))return !!getenv("S2A_REPLAY_INDIRECT_OPT_LAYOUT");if(!strcmp(n,"nvk_binst_hoist"))return hz_flag;return !strcmp(n,"nvk_dq")?!!getenv("S2A_REPLAY_INDIRECT_DQ"):d;}
+static int land_noresync_flag=-1;
+int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_land_noresync"))return land_noresync_flag<0?d:land_noresync_flag;if(!strcmp(n,"nvk_buf_read_snapshot"))return snapshot_flag;if(!strcmp(n,"nvk_opt_layout"))return !!getenv("S2A_REPLAY_INDIRECT_OPT_LAYOUT");if(!strcmp(n,"nvk_binst_hoist"))return hz_flag;return !strcmp(n,"nvk_dq")?!!getenv("S2A_REPLAY_INDIRECT_DQ"):d;}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 static void retirement(void *u){(void)u;atomic_fetch_add(&retired,1);}
@@ -419,6 +420,62 @@ static void run_second_sync(struct s2a_vk_device *d, const char *dir, int indexe
  nvn_gpu_view_release(target_view); nvn_gpu_tex_release(tex); nvn_gpu_buf_release(rb,NULL,NULL);
  GPU(nvn_gpu_close(5000000000ull,&err));
 }
+// The GPU supplies an entire tracked page before draw. A new CPU generation
+// makes the page look stale, but the retained GPU registration owns every byte.
+static void run_land_noresync(struct s2a_vk_device *d, const char *dir, int enabled) {
+ nvn_gpu_open_desc od={0}; od.host_device=d; od.app_label="real-replay-land-noresync"; GPU(nvn_gpu_open(&od,&err));
+ memset(&prog,0,sizeof prog);
+ prog.sh[0]=shader(dir,"quad.vert",NVN_GPU_SH_VS,NULL);
+ prog.sh[1]=shader(dir,"quad.frag",NVN_GPU_SH_FS,NULL);
+ prog.attr_mask=3; prog.color_out_mask=15;
+ static const float pos[6][2]={{-1,-1},{1,-1},{-1,1},{-1,1},{1,-1},{1,1}};
+ float vertices[6][8]={{0}};
+ for (unsigned i=0;i<6;i++) {
+  vertices[i][0]=pos[i][0]; vertices[i][1]=pos[i][1]; vertices[i][3]=1;
+  vertices[i][4]=vertices[i][7]=1;
+ }
+ uint8_t gpu_page[4096]={0};
+ REQUIRE(nvn_dirty_page_size()==sizeof gpu_page);
+ memcpy(gpu_page,vertices,sizeof vertices);
+ memset(guest,0,sizeof gpu_page);   // guest 上没有有效顶点，读错即整屏像素红
+ nvn_gpu_tex_desc td={0}; td.d.target=NVN_TEXTURE_TARGET_2D; td.d.format=NVN_FORMAT_RGBA8;
+ td.d.width=td.d.height=64; td.d.depth=td.d.levels=1; td.usage=NVN_GPU_TEX_RENDER;
+ nvn_gpu_tex tex=NULL; GPU(nvn_gpu_tex_create(&td,&tex,&err)); GPU(nvn_gpu_view_create(tex,NULL,&target_view,&err));
+ nvn_gpu_buf rb=buffer(16384,NULL);
+ memset(&target_tex,0,sizeof target_tex); target_tex.d=td.d; target_tex.serial=1;
+ memset(&target,0,sizeof target); target.n=1; target.color[0]=&target_tex;
+ rp_state_reset(); rp_draw_reset(); nvn_unimpl_reset();
+ rp_S.nattr=2; rp_S.nstream=1; rp_S.attr[0].fmt=rp_S.attr[1].fmt=NVN_FORMAT_RGBA32F;
+ rp_S.attr[1].offset=16; rp_S.stream[0].stride=32;
+ const uint64_t base=(uint64_t)(uintptr_t)guest;
+ rp_S.vbuf[0].address=base; rp_S.vbuf[0].size=sizeof vertices;
+ rp_S.color.logic_op=3; rp_S.chmask.mask=15; rp_S.poly.mode=NVN_POLYGON_MODE_FILL;
+ g_track=1; land_noresync_flag=enabled;
+ GPU(nvn_gpu_cmd_begin(NULL,&active,&err)); serial++;
+ nvn_gpu_buf mirror=NULL; uint64_t off=0, key=0;
+ REQUIRE(rp_buf_resolve(active,base,sizeof gpu_page,&mirror,&off));
+ const uint64_t id=rp_buf_gpu_write_note(base,sizeof gpu_page,&key); REQUIRE(id);
+ nvn_gpu_buf_write(active,mirror,off,gpu_page,sizeof gpu_page);
+ pass(active,1);
+ p_draw draw={0}; draw.prim=4; draw.count=6; draw.instances=1;
+ rp_draw(active,&draw,NULL,&draw);
+ dirty_guest_page(0);
+ cut_count_on=1; cuts=0;
+ rp_draw(active,&draw,NULL,&draw);
+ cut_count_on=0;
+ rp_pass_flush(active); nvn_gpu_copy_tex_buf(active,tex,0,0,NULL,rb,0,256,16384);
+ GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err)); GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));
+ const uint8_t *out=nvn_gpu_buf_cpu(rb); unsigned bad=0;
+ for (unsigned i=0;i<4096;i++) if (out[4*i]!=255 || out[4*i+1] || out[4*i+2] || out[4*i+3]!=255) bad++;
+ rp_buf_gpu_write_land(key,id,1);
+ const int landed=!memcmp(guest,gpu_page,sizeof gpu_page);
+ printf("land-noresync Vulkan enabled=%d cuts=%u expected=%d wrong-pixels=%u landed=%d\n",enabled,cuts,!enabled,bad,landed);
+ if (bad || cuts!=(unsigned)!enabled || !landed || nvn_unimpl_kinds()) failures++;
+ g_track=0; land_noresync_flag=-1; rp_draw_reset(); rp_buf_reset();
+ nvn_gpu_shader_release(prog.sh[0]); nvn_gpu_shader_release(prog.sh[1]);
+ nvn_gpu_view_release(target_view); nvn_gpu_tex_release(tex); nvn_gpu_buf_release(rb,NULL,NULL);
+ GPU(nvn_gpu_close(5000000000ull,&err));
+}
 #include "mirror_blit_test.h"
 int main(int argc,char **argv) {
  int depth_only=argc==3&&!strcmp(argv[2],"--depth-only");
@@ -430,6 +487,7 @@ int main(int argc,char **argv) {
  if(hoist_only){for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
  if(mirror_only){run_color_mirror(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
  if(!depth_only){
+  for(int enabled=0;enabled<2;enabled++)run_land_noresync(&d,argv[1],enabled);
   for(int indexed=0;indexed<2;indexed++)
    for(int m=0;m<3;m++)run_second_sync(&d,argv[1],indexed,m);
   for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);   // 通道级批量拷（rp_draw.c nvk_binst_hoist）
