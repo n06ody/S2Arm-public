@@ -130,7 +130,8 @@ PY
 "$cc" -std=gnu11 -O1 -Wall -Wextra -Werror -pthread -D_GNU_SOURCE \
   -I "$android/native" -I "$android/native/nvn" -I "$android/native/direct" \
   -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" \
-  -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" "$android/native/direct/sha256.c"
+  -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" \
+  "$android/native/nvn/nvn_warm.c" "$android/native/direct/sha256.c"
 "$tmp/t_seed"
 # 负对照：各撤一处，t_seed 必须红在对应断言（编译失败不算红）
 python3 - "$repo" "$tmp" <<'PY'
@@ -156,7 +157,7 @@ for name, src, edits, expect in cases:
     others = [str(m) if s == src else str(s) for s in (prog, pipe)]
     exe = tmp / f't_seed_{name}'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror', '-pthread', '-D_GNU_SOURCE', *inc, '-o', str(exe),
-                    str(repo/'android/tests/nvn_vk_warm_seed_test.c'), *others, str(repo/'android/native/direct/sha256.c')], check=True)
+                    str(repo/'android/tests/nvn_vk_warm_seed_test.c'), *others, str(repo/'android/native/nvn/nvn_warm.c'), str(repo/'android/native/direct/sha256.c')], check=True)
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode != 0 and expect in r.stderr, (name, r.stdout[-400:], r.stderr[-800:])
     print(f'随包种子 负对照 {name}：红在「{expect}」')

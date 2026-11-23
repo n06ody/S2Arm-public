@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from vk_warm_seed_test import pipe_file, prog_file, sha8
+
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('android_make_pack', HERE.parent / 'tools/make_pack.py')
 pack = importlib.util.module_from_spec(spec)
@@ -133,6 +135,25 @@ class DirectPackTest(unittest.TestCase):
         self.assertNotIn('requiredFeatures', artifact)
         self.assertNotIn('extensions', artifact)
         self.assertFalse((self.out / pack.GRAPHICS_MANIFEST).exists())
+
+    def test_vulkan_warm_seed_bytes_reach_android_resource_index(self):
+        programs, name = prog_file([1, 2], window=1)
+        recipes = pipe_file([1, 2])
+        capture = self.base / 'capture'
+        capture.mkdir()
+        (capture / name).write_bytes(programs)
+        (capture / 'pipes-v1-352.bin').write_bytes(recipes)
+        warm_dir = self.root / 'shaders/direct/warm-vk'
+        subprocess.run([sys.executable, str(HERE.parent / 'tools/vk_warm_seed.py'), str(warm_dir),
+                        TITLE, str(capture)], check=True, capture_output=True)
+        with patch.dict(os.environ, {'S2A_ANDROID_SKIP_APPLE_ARTIFACTS': '1'}):
+            self.build(self.write_descriptor())
+        index = dict(row.split('\t', 1) for row in (self.out / 'index.tsv').read_text().splitlines())
+        key = f'{sha8("closure-A").hex()}-{sha8("profile-A").hex()}'
+        for filename, payload in ((name, programs), ('pipes-v1-352.bin', recipes)):
+            rel = f'shaders/direct/warm-vk/{key}/{filename}'
+            self.assertEqual((self.out / rel).read_bytes(), payload)
+            self.assertEqual(index.get(rel), f'{len(payload)}\t{hashlib.sha256(payload).hexdigest()}')
 
     def test_direct_pack_declares_feature_and_packs_descriptor(self):
         path = self.write_descriptor()

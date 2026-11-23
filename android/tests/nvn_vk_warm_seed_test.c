@@ -2,6 +2,8 @@
 // 覆盖（合同见 nvn_vk_prog_warm.h / nvn_vk_pipe_warm.h「随包种子」）：
 //   seed_used     本机清单为空 → 程序清单读 <revision>/shaders/direct/warm-vk/<闭包>-<profile>/ 的种子、管线清单读同目录种子并预建；
 //                 种子里程序身份不在程序清单里的管线条目不收；建出的管线描述与手写字节逐字段对上；落盘写本机路径、种子文件不动
+//   background    生产预热线程从空缓存载入种子，先发布两条程序再后台预建两条管线
+//   missing/version 种子缺席 / 程序版本不符 → 预建为 0
 //   local_first   本机有程序清单与管线清单 → 两边都用本机的，种子不读
 //   local_prog    本机只有程序清单（没有管线清单）→ 管线也不读种子（种子只跟着程序种子走）
 //   bad_seed      程序种子校验和坏 → 打黄一行、本局不用种子、管线不读种子；坏条目（阶段掩码非法）逐条跳过不崩
@@ -15,16 +17,19 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "nvn_vk_prog_warm.h"
 #include "nvn_vk_pipe_warm.h"
 #include "nvn_plat.h"
+#include "nvn_warm.h"
 #include "rp_shader.h"
 #include "direct/compile_request.h"
 #include "direct/sha256.h"
@@ -36,12 +41,23 @@ static int checks, failures;
 static char g_cache[512];
 static const char *g_profile = "profile-A", *g_closure = "closure-A";
 static const int32_t g_abi = 7;
+static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
+static int g_done;
+static pthread_t g_foreground;
+static int g_require_publication, g_published[2], g_frontend_builds;
 static char g_warn[4096];   // 本用例所有黄行（拼起来）
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE && g_cache[0] ? g_cache : NULL; }
 const char *nvk_session_cache_dir(void) { return g_cache[0] ? g_cache : NULL; }
 int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
+    if (strstr(text, "nvk warm 清单完成:")) {
+        pthread_mutex_lock(&g_done_mu);
+        g_done = 1;
+        pthread_cond_signal(&g_done_cv);
+        pthread_mutex_unlock(&g_done_mu);
+    }
     if (level == NVN_PLAT_LOG_WARN && strlen(g_warn) + strlen(text) + 2 < sizeof g_warn) { strcat(g_warn, text); strcat(g_warn, "\n"); }
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *out) {
@@ -60,7 +76,11 @@ static struct rp_prog g_progs[2];
 static int g_borrow_n;
 int rp_shader_prog_identity(const struct rp_prog *p, uint8_t out[32]) { if (!p) return 0; memcpy(out, p->identity, 32); return 1; }
 int rp_shader_prog_by_identity(const uint8_t identity[32], const struct rp_prog **out) {
-    for (int i = 0; i < 2; i++) if (!memcmp(identity, g_progs[i].identity, 32)) { if (out) *out = &g_progs[i]; return 1; }
+    for (int i = 0; i < 2; i++) {
+        if ((g_require_publication && !g_published[i]) || memcmp(identity, g_progs[i].identity, 32)) continue;
+        if (out) *out = &g_progs[i];
+        return 1;
+    }
     if (out) *out = NULL;
     return 0;
 }
@@ -71,10 +91,27 @@ int rp_shader_prog_borrow(const uint8_t identity[32], const struct rp_prog **out
 }
 void rp_shader_prog_return(const uint8_t identity[32]) { (void)identity; if (g_borrow_n > 0) g_borrow_n--; }
 int rp_shader_prog_borrowed(void) { return g_borrow_n; }
+int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
+    g_frontend_builds += pthread_equal(pthread_self(), g_foreground) != 0;
+    for (int i = 0; i < 2; i++) {
+        if (memcmp(rec->identity, g_progs[i].identity, 32)) continue;
+        g_published[i] = 1;
+        nvk_prog_warm_stat_build(0);
+        return 0;
+    }
+    nvk_prog_warm_stat_build(-1);
+    return -1;
+}
+int nvk_shader_warm_quiesce(uint32_t budget_ms) { (void)budget_ms; return 0; }
+enum nvk_pipe_feedback_mode nvn_vk_pipe_creation_stats(struct nvk_pipe_creation_stats out[NVK_PIPE_CREATION_BUCKETS]) {
+    memset(out, 0, sizeof(*out) * NVK_PIPE_CREATION_BUCKETS);
+    return NVK_PIPE_FEEDBACK_UNAVAILABLE;
+}
 static int g_pipe_get_calls;
 static nvn_gpu_pipe_desc g_last_desc;
 nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     (void)mode; (void)err;
+    if (g_require_publication) g_frontend_builds += pthread_equal(pthread_self(), g_foreground) != 0;
     g_pipe_get_calls++; g_last_desc = *d;
     *out = (nvn_gpu_pipe)(uintptr_t)0x9001;
     return (nvn_gpu_rc){NVN_GPU_OK};
@@ -97,11 +134,11 @@ static int write_file(const char *path, const uint8_t *b, size_t n) {
 }
 static long file_size(const char *path) { struct stat st; return stat(path, &st) ? -1 : (long)st.st_size; }
 // 程序清单文件：ids[i] 的身份 + masks[i]（3 = 顶点 + 片元；5 是非法掩码，用来造坏条目），uses = 10 - i
-static void write_prog(const char *path, const int *ids, const uint32_t *masks, int n, const char *profile, int corrupt) {
+static void write_prog_version(const char *path, const int *ids, const uint32_t *masks, int n, const char *profile, int corrupt, uint32_t version) {
     size_t len = 60 + (size_t)n * 600 + 8;   // 条目 = 88 字节头 + 顶点 / 片元两段 c1 各 0x100
     uint8_t *b = calloc(1, len);
     uint8_t ps[32], cs[32]; sha(profile, ps); sha(g_closure, cs);
-    w32(b, 0x31575053u); w32(b + 4, 2); w32(b + 8, 88); w32(b + 12, (uint32_t)n);
+    w32(b, 0x31575053u); w32(b + 4, version); w32(b + 8, 88); w32(b + 12, (uint32_t)n);
     memcpy(b + 16, ps, 32); w32(b + 48, (uint32_t)g_abi); memcpy(b + 52, cs, 8);
     for (int i = 0; i < n; i++) {
         uint8_t *e = b + 60 + (size_t)i * 600;
@@ -115,6 +152,9 @@ static void write_prog(const char *path, const int *ids, const uint32_t *masks, 
     w64(b + len - 8, fnv(b, len - 8) ^ (corrupt ? 1u : 0u));
     CHECK(write_file(path, b, len) == 0, "write %s", path);
     free(b);
+}
+static void write_prog(const char *path, const int *ids, const uint32_t *masks, int n, const char *profile, int corrupt) {
+    write_prog_version(path, ids, masks, n, profile, corrupt, 2);
 }
 // 一条手写紧凑配方：每条只填几样，值随 tag 变（tag 1 / 2 / 9 三条互不相同）
 static void mkdesc(uint8_t d[352], int tag) {
@@ -264,13 +304,60 @@ static void case_other_profile(void) {
     CHECK(nvk_pipe_warm_load() == 0, "管线也不读种子");
 }
 
+static void check_background_counts(unsigned expected) {
+    g_foreground = pthread_self();
+    g_require_publication = 1;
+    nvk_warm_start();
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 3;
+    pthread_mutex_lock(&g_done_mu);
+    while (!g_done && !pthread_cond_timedwait(&g_done_cv, &g_done_mu, &deadline)) {}
+    int done = g_done;
+    pthread_mutex_unlock(&g_done_mu);
+    CHECK(done, "预热线程完成冻结清单");
+    int stopped = nvk_warm_stop() == 0;
+    CHECK(stopped, "预热线程正常收尾");
+    if (!done || !stopped) return;
+    struct nvk_warm_totals totals;
+    nvk_warm_totals(&totals);
+    CHECK(totals.prog_built == expected && !totals.prog_failed, "成功预建 %u 条程序（得 %llu）",
+          expected, (unsigned long long)totals.prog_built);
+    CHECK(totals.pipe_built == expected && !totals.pipe_failed && (unsigned)g_pipe_get_calls == expected,
+          "成功预建 %u 条管线（得 %llu，后端调用 %d）",
+          expected, (unsigned long long)totals.pipe_built, g_pipe_get_calls);
+    CHECK(!g_frontend_builds, "所有预建均由后台线程执行");
+}
+
+static void case_background(void) {
+    write_prog(g_seed_prog, k_seed_prog, k_masks, 2, g_profile, 0);
+    write_pipe(g_seed_pipe, k_seed_pipe, 2, 0);
+    check_background_counts(2);
+}
+
+static void case_missing(void) {
+    check_background_counts(0);
+    CHECK(nvk_prog_warm_seed_dir(NULL, 0) == 0, "种子缺席，按空清单启动");
+}
+
+static void case_version(void) {
+    write_prog_version(g_seed_prog, k_seed_prog, k_masks, 2, g_profile, 0, 99);
+    write_pipe(g_seed_pipe, k_seed_pipe, 2, 0);
+    check_background_counts(0);
+    CHECK(strstr(g_warn, "程序清单随包种子不用：版本不符"), "版本不匹配，按空清单启动（%s）", g_warn);
+}
+
 static const struct { const char *name; void (*fn)(void); } k_cases[] = {
     {"seed_used", case_seed_used}, {"local_first", case_local_first}, {"local_prog", case_local_prog},
+    {"background", case_background}, {"missing", case_missing}, {"version", case_version},
     {"bad_seed", case_bad_seed}, {"bad_pipe", case_bad_pipe}, {"undecided", case_undecided}, {"other_profile", case_other_profile},
 };
 
 int main(void) {
-    char tmpl[] = "/tmp/nvk-warm-seed-XXXXXX";
+    const char *tmpdir = getenv("TMPDIR");
+    char tmpl[448];
+    if (snprintf(tmpl, sizeof tmpl, "%s/nvk-warm-seed-XXXXXX", tmpdir ? tmpdir : "/tmp") >= (int)sizeof tmpl)
+        return 1;
     char *base = mkdtemp(tmpl);
     if (!base) { fprintf(stderr, "FAIL: temp dir\n"); return 1; }
     int bad = 0, n = (int)(sizeof k_cases / sizeof k_cases[0]);
@@ -286,7 +373,12 @@ int main(void) {
         int st = 0; waitpid(pid, &st, 0);
         if (!WIFEXITED(st) || WEXITSTATUS(st)) { bad++; fprintf(stderr, "FAIL: 用例 %s 没过（状态 %d）\n", k_cases[i].name, st); }
     }
-    char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}
+    pid_t cleanup = fork();
+    if (cleanup == 0) {
+        execlp("rm", "rm", "-rf", base, (char *)NULL);
+        _exit(1);
+    }
+    if (cleanup > 0) (void)waitpid(cleanup, NULL, 0);
     if (bad) { fprintf(stderr, "FAIL: 随包种子 %d/%d 个用例没过\n", bad, n); return 1; }
     printf("PASS: 随包种子 %d 个用例全过\n", n);
     return 0;

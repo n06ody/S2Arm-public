@@ -16,7 +16,8 @@ seen.tsv 的 R 行只有 8 字节阶段键和 Metal 侧状态，算不出这个�
 校验与宿主同一口径（不符的整份不收，打一行说明）：程序清单 magic / 版本 / 条目大小 / 条数 / 长度 / FNV-1a，文件名里的闭包摘要 = 文件头；
 管线清单 magic / 格式 / 描述版本 / 条目大小 / 条数 / 长度 / FNV-1a。管线条目只收程序身份在配对程序清单里的（宿主同规则：
 不在的那条首局等不到程序发布，只会白占重试槽），过滤后整份重写（条数与校验和重算）。
-同一目录名（同闭包同 profile）多份来源时取程序条目多的那份，一样多取程序清单 SHA-256 小的；输出只与来源内容有关（与路径、修改时间、来源先后无关）。
+同一目录名（同闭包同 profile）多份来源时优先取配对后图形管线条目最多的一份，再比较程序条目数、两份清单的 SHA-256。
+同一来源的程序和管线成对选择，程序 v2 的窗口合同字节与 C1 原样保留。输出与路径、修改时间、来源先后无关。
 不存在的来源跳过；没有任何可用来源时输出目录是空的（= 包里不带种子，首局照常首遇现建）。最后一行是汇总。
 """
 import hashlib
@@ -30,8 +31,10 @@ PROG_C1_MIN, PROG_C1_MAX = 0x100, 0x10000   # NVK_PROG_REC_C1_MIN / MAX
 PIPE_MAGIC, PIPE_FORMAT, PIPE_DESC, PIPE_HDR = b'S2APW1\0\0', 1, 352, 32
 PIPE_ENTRY = 32 + PIPE_DESC + 4
 PIPE_NAME = f'pipes-v{PIPE_FORMAT}-{PIPE_DESC}.bin'
+PIPE_COMPUTE_MASK = 0x80   # nvn_vk_pipe_warm.c：计算管线的紧凑配方首字节
 PROG_PREFIX = 'programs-v1-'
 PROG_MAX, PIPE_MAX = 16384, 8192   # 宿主硬顶（NVK_PROG_WARM_ABS_MAX / NVK_PW_MAX_HARD）
+PROG_FILE_MAX = 64 << 20   # NVK_PROG_WARM_FILE_MAX：整份 v2 清单，含变长 C1
 
 
 def read(path):
@@ -48,6 +51,7 @@ def fnv1a64(b):
 def prog_check(name, b):
     """程序清单 → (闭包 hex16, profile hex16, 身份集合)；坏了抛 ValueError（原因）"""
     if len(b) < PROG_HDR + 8: raise ValueError('文件太短')
+    if len(b) > PROG_FILE_MAX: raise ValueError('文件超过体积硬顶')
     magic, ver, ent, cnt = struct.unpack_from('<IIII', b, 0)
     if magic != PROG_MAGIC: raise ValueError('magic 不符')
     if ver != PROG_VERSION: raise ValueError('版本不符')
@@ -127,12 +131,14 @@ def build(out, srcs, log=print):
             b = read(os.path.join(d, n))
             try: closure, profile, ids = prog_check(n, b)
             except ValueError as e: log(f'【黄】{os.path.join(d, n)} 不收：{e}'); continue
-            pb, kept, dropped = None, 0, 0
+            pb, kept, dropped, graphics = None, 0, 0, 0
             if pipe_entries is not None:
                 keep = [e for e in pipe_entries if e[:32] in ids]
                 kept, dropped = len(keep), len(pipe_entries) - len(keep)
+                graphics = sum(entry[32] != PIPE_COMPUTE_MASK for entry in keep)
                 if keep: pb = pipe_bytes(keep)
-            key, rank = f'{closure}-{profile}', (-len(ids), hashlib.sha256(b).digest())
+            key = f'{closure}-{profile}'
+            rank = (-graphics, -len(ids), hashlib.sha256(b).digest(), hashlib.sha256(pb or b'').digest())
             if key not in pick or rank < pick[key][0]:
                 pick[key] = (rank, n, b, pb, kept, dropped)
     shutil.rmtree(out, ignore_errors=True)
@@ -153,7 +159,7 @@ def main(argv):
     pick = build(out, srcs)
     if not pick:
         print(f'安卓首局预热种子：空（{tid} 没有安卓真机清单来源：首局首遇现建）'); return 0
-    print('安卓首局预热种子：' + '；'.join(f'{k} 程序 {-v[0][0]} 条、管线 {v[4]} 条（程序不在的管线 {v[5]} 条不收）' for k, v in sorted(pick.items())))
+    print('安卓首局预热种子：' + '；'.join(f'{k} 程序 {-v[0][1]} 条、管线 {v[4]} 条（程序不在的管线 {v[5]} 条不收）' for k, v in sorted(pick.items())))
     return 0
 
 
