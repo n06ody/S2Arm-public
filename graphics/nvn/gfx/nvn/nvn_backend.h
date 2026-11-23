@@ -114,6 +114,7 @@ enum {
                                                //   其余视图剥掉存储用途）。Vulkan（1.1+）置位；Metal 不置位，核心照旧按「不可写」跳过
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
+    NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // 后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -212,6 +213,7 @@ enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不
     NVN_GPU_TEX_VIEW_FMT = 1u << 4,   // 会建不同格式的视图（PixelFormatView / MUTABLE_FORMAT）
     NVN_GPU_TEX_CPU_UPLOAD = 1u << 5, // 内容来自游戏内存，会经 nvn_gpu_tex_upload* 更新
     NVN_GPU_TEX_TRANSIENT = 1u << 6,  // 只活在一个通道里（memoryless / LAZILY_ALLOCATED）
+    NVN_GPU_TEX_BC1_OPAQUE = 1u << 7, // 初始完整压缩快照已证无透明索引，允许宿主选 ASTC 存储。
 };
 typedef struct {
     nvn_texdesc d;             // NVN 描述原样
@@ -225,6 +227,14 @@ typedef struct { uint32_t w, h, depth, levels, layers, samples; uint32_t nvn_for
 // 出错：NVN_GPU_E_UNSUPPORTED（格式 / 用途组合不支持，why 写格式号与用途位）、NVN_GPU_E_OOM。
 nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err);
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out);   // 实际尺寸与格式（宽屏挂点读宿主宽高）。线程：[任意]
+// 可选：整张 CPU 块线性快照上传时为已证不透明的 BC1 选宿主压缩存储。
+// 返回 1 = 已录完整上传，0 = 沿用普通上传，-1 = 失败（命令段报错）。
+// 替换存储时 *replacement 为新句柄，由回放更新视图和释放旧句柄。
+int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size, uint64_t serial, nvn_gpu_tex *replacement);
+// 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
+// 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
+int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+
 void nvn_gpu_tex_release(nvn_gpu_tex t);
 // 视图：v 为 NVN 视图记录原样，NULL = 默认视图。视图让贴图存储活到视图 release。线程：[任意]。出错：格式不兼容或缺 VIEW_FMT → NVN_GPU_E_ARG。
 nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex t, const view_t *v, nvn_gpu_view *out, nvn_gpu_err *err);
