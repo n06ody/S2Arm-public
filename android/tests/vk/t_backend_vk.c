@@ -6750,6 +6750,60 @@ done:
     nvn_gpu_err ce; memset(&ce, 0, sizeof ce);
     CHECK(OK(nvn_gpu_close(5000000000ull, &ce)), "C208 (%u,%u) close：%d %s", lim2, lim9, ce.rc.code, ce.why);
 }
+// 绑定号 ≥ 256：布局合并表（backend_vulkan.c struct merged）原先把 binding 存成 uint8_t，262 变成 6。库程序保留全部 arg_id，绑定号可到 262+，
+//   Adreno 链接时报「Bind group info mismatches the shader source」、管线建失败、整类绘制被失败表挡下（8E 全黑）。夹具里 262 与 6 同时存在（低 8 位相同，
+//   截断会把两项并成一项）：管线必须建成，两个 UBO 各自取到自己的值。
+static void t_high_binding(const char *dir) {
+    if (!open_backend()) { CHECK(0, "高绑定号 开会话失败"); return; }
+    nvn_gpu_layout_ent fe[2];
+    memset(fe, 0, sizeof fe);
+    fe[0].set = 0; fe[0].binding = 262; fe[0].cls = NVN_GPU_RES_UBO; fe[0].access = NVN_GPU_ACC_R; fe[0].count = 1; fe[0].stages = 1u << NVN_GPU_SH_FS;
+    fe[1] = fe[0]; fe[1].binding = 6;
+    nvn_gpu_layout fl;
+    memset(&fl, 0, sizeof fl);
+    fl.ent = fe; fl.nent = 2;
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    void *vm = NULL, *fm = NULL;
+    nvn_gpu_err e; memset(&e, 0, sizeof e);
+    nvn_gpu_pipe pipe = NULL;
+    struct c208_env E; memset(&E, 0, sizeof E);
+    if (!load_shader_pair(dir, "tri3.vert", "ubo_high.frag", NULL, &fl, &vs, &fs, &vm, &fm)) { CHECK(0, "高绑定号 读不到 ubo_high"); goto done; }
+    {
+        nvn_gpu_pipe_desc pd;
+        fill_gpipe_desc(&pd, vs, fs, 0);
+        CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e)), "高绑定号 建管线：%d %s", e.rc.code, e.why);
+        if (!pipe) goto done;
+    }
+    {
+        const float va[4] = {0.2f, 0, 0, 0}, vb[4] = {0, 0.6f, 0, 0};
+        E.ba = make_buf(sizeof va, NVN_GPU_MEM_SHARED, va); E.bb = make_buf(sizeof vb, NVN_GPU_MEM_SHARED, vb);
+        E.vb = full_vb();
+        E.out = make_tex(10, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); E.ov = make_view(E.out);
+        E.rb = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+        nvn_gpu_cmd c; c208_begin(&c, &E, pipe);
+        c208_pixel_draw(c, 0);
+        nvn_gpu_binding bs[2];
+        memset(bs, 0, sizeof bs);
+        bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_UBO; bs[0].u.b.buf = E.ba; bs[0].u.b.len = 16;
+        bs[1].ent = 1; bs[1].cls = NVN_GPU_RES_UBO; bs[1].u.b.buf = E.bb; bs[1].u.b.len = 16;
+        nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 2);
+        c208_draw(c);
+        const uint8_t want[1][4] = {{51, 153, 0, 255}};   // 0.2 × 255、0.6 × 255
+        c208_finish(c, &E, 400, 1, want, "高绑定号 262 / 6");
+    }
+done:
+    if (E.rb) nvn_gpu_buf_release(E.rb, NULL, NULL);
+    if (E.ov) nvn_gpu_view_release(E.ov);
+    if (E.out) nvn_gpu_tex_release(E.out);
+    if (E.vb) nvn_gpu_buf_release(E.vb, NULL, NULL);
+    if (E.ba) nvn_gpu_buf_release(E.ba, NULL, NULL);
+    if (E.bb) nvn_gpu_buf_release(E.bb, NULL, NULL);
+    if (vs) nvn_gpu_shader_release(vs);
+    if (fs) nvn_gpu_shader_release(fs);
+    free(vm); free(fm);
+    nvn_gpu_err ce; memset(&ce, 0, sizeof ce);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &ce)), "高绑定号 close：%d %s", ce.rc.code, ce.why);
+}
 static void c208_dyn_ubo(const char *dir) {
     c208_arm(dir, 1, 8);   // 两条管线都超上限 1 个：全静态
     if (!getenv("S2A_TEST_DESC_MEMO"))   // 没指定环境变量：后端读 nvk_desc_memo 时传的缺省值必须是开（备忘 + 动态 UBO 缺省开，#1233；建管线时读过了）
@@ -6758,6 +6812,7 @@ static void c208_dyn_ubo(const char *dir) {
     c208_arm(dir, 2, 9);   // 两条都刚好在上限上：备忘开时全动态
     c208_arm(dir, 2, 8);   // P2 刚好 / P9 超 1 个：一动一静
     c208_arm(dir, 8, 8);   // 设备只报规范最小值 8（不少 Mali 如此，#1292 评审补）：2 个 UBO 的 P2 动态、9 个 UBO 的 P9 超 1 个保持静态；像素与全静态臂的期望相同、校验层 0 条
+    t_high_binding(dir);   // 绑定号 ≥ 256（库程序保留全部 arg_id）：布局合并表不许把 binding 截成 8 位
     printf("C208 动态 UBO 偏移（备忘%s）：四个臂（全静态 / 全动态 / 一动一静 / 上限 8）与拆分点 20 位的高位偏移已核对\n", g_memo_on ? "开" : "关，一律静态");
 }
 
@@ -11079,6 +11134,13 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+    if (argc > 2 && !strcmp(argv[2], "--high-binding")) {   // 只跑绑定号 ≥ 256 的布局用例（默认档里也跑）；给红 / 绿取证用
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "high-binding-test";
+        t_high_binding(argv[1]);
+        s2a_vk_device_destroy(&g_dev, 1);
+        printf("HIGH_BINDING failures=%d\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 2 && !strcmp(argv[2], "--clear-capacity")) {
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "clear-capacity-test";
         c1501_clear_capacity(argv[1]);
