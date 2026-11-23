@@ -60,6 +60,7 @@ struct s2a_libpack_gfx {
     size_t profile_bytes;
     uint32_t storage_alignment;
     int require_ssbo_window;
+    int *window_used;   // 非 NULL：任一阶段真应用了窗口掩码（合同 mode = MASK）时置 1（只写不读；调用方据此判断「程序用到窗口补偿」）
 };
 int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile_bytes);
 /* 能力核（见 .c）：删掉模块用不上的 Float64 / Int64 能力声明（本后端设备从不启用 shaderFloat64 / shaderInt64），

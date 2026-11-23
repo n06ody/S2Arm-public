@@ -1519,9 +1519,11 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
     if (lp || pair) {
         nvn_gpu_caps caps = {0};
         if (!ckey) nvn_gpu_caps_get(&caps);
+        int window_used = 0;   // 本次取库有没有阶段真用了窗口掩码（nvk_libpack_win_part 二分诊断用）
         const struct s2a_libpack_gfx g = {
             .topology = topology, .profile_json = pc->profile_json, .profile_bytes = pc->profile_bytes,
             .storage_alignment = caps.min_ssbo_align, .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,
+            .window_used = &window_used,
         };
         struct nvk_compute_profile_facts pf = {0};
         uint8_t keys[6][8] = {{0}};
@@ -1548,6 +1550,15 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
         } else {
             lrc = s2a_libpack_program_v1(lp, keys, stages, &g, (uint32_t)pc->direct_abi, pc->profile_hash,
                                          pc->translator_closure, bytes, len, lw, sizeof lw);
+        }
+        // 窗口状态程序的二分诊断（缺省 0 = 关，行为不变）：1 = 只让用了窗口掩码的程序走库（没用到的退回现编）；2 = 只让没用到窗口掩码的走库。
+        //   9000 / 9400（Mali）发白、8E（Adreno）不发：窗口变体命中里 71% 的程序两个阶段都不带掩码，先分清嫌疑在哪一组。
+        const int part = !ckey && g.require_ssbo_window && lrc == S2A_LIBPACK_HIT ? nvn_plat_flag("nvk_libpack_win_part", 0) : 0;
+        if ((part == 1 && !window_used) || (part == 2 && window_used)) {
+            if (*bytes) { free(*bytes); *bytes = NULL; *len = 0; }
+            if (ready && *ready) { nvn_vk_program_free(&(*ready)->graphics); free(*ready); *ready = NULL; }
+            snprintf(lw, sizeof lw, "window part gate %d: %s", part, window_used ? "program uses the window mask" : "program does not use the window mask");
+            lrc = S2A_LIBPACK_MISS;
         }
     }
     if (!lp) g_lp_last.code = nvn_hm_get(&g_lp_bad, identity) ? LPL_BAD_TABLE : atomic_load(&g_lp_state) == LP_ST_BAD ? LPL_CONTAINER_BAD : LPL_CONTAINER_MISSING;
@@ -1576,11 +1587,11 @@ static void libpack_mark_bad(const uint8_t identity[32]) {
         identity[0], identity[1], identity[2], identity[3]); nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", b); }
 }
 static void libpack_note_hit(void) { atomic_fetch_add(&g_n_libpack, 1); }
-// 存储缓冲窗口变体的库命中逐条记一行（nvk_hitch_log 开时、前 128 条）：键（逐阶段 8 字节）+ 阶段掩码 + 身份前 4 字节 + 来源（提交 / 预热）。
+// 存储缓冲窗口变体的库命中逐条记一行（nvk_hitch_log 开时、前 512 条）：键（逐阶段 8 字节）+ 阶段掩码 + 身份前 4 字节 + 来源（提交 / 预热）。
 //   9000 B 局发白（石阶 / 扶栏精确 ×2、8E 不发）时累计只给「命中 400」，没有逐键：对不上是哪几支材质程序走了窗口变体。
 static void libpack_window_note(const uint8_t identity[32], const uint8_t (*keys)[8], int nst, uint32_t stages, const char *who) {
     static _Atomic unsigned said;
-    if (!nvn_plat_flag("nvk_hitch_log", 0) || atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 128) return;
+    if (!nvn_plat_flag("nvk_hitch_log", 0) || atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) >= 512) return;
     char ks[64] = ""; size_t o = 0;
     for (int st = 0; st < nst && st < 3; st++) {
         for (int b = 0; b < 8 && o + 3 < sizeof ks; b++) o += (size_t)snprintf(ks + o, sizeof ks - o, "%02x", keys[st][b]);
@@ -1844,7 +1855,7 @@ static void live_reason_note(const struct work_snap *s, const char *root, int st
         case LPL_CONTAINER_MISSING: snprintf(lib, sizeof lib, "库不在"); break;
         case LPL_CONTAINER_BAD: snprintf(lib, sizeof lib, "库容器坏"); break;
         case LPL_BAD_TABLE: snprintf(lib, sizeof lib, "记坏表命中（此前 build 失败）"); break;
-        case LPL_MISS: snprintf(lib, sizeof lib, "库里没有这一键"); break;
+        case LPL_MISS: if (strstr(g_lp_last.why, "window part gate")) snprintf(lib, sizeof lib, "窗口二分闸挡下：%s", g_lp_last.why); else snprintf(lib, sizeof lib, "库里没有这一键"); break;
         case LPL_REJECT: snprintf(lib, sizeof lib, "库件被拒收：%s", g_lp_last.why); break;
         default: snprintf(lib, sizeof lib, "库没查"); break;
     }

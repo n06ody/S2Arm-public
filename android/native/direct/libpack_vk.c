@@ -956,6 +956,7 @@ static int lp_window_apply(struct lp_window window, const struct s2a_libpack_gfx
         return lp_fail(why, cap, "device/profile SSBO alignments differ");
     if (lp_fix_ssbo_window_mask(spv, n, window.id, alignment))
         return lp_fail(why, cap, "invalid SSBO window mask");
+    if (gfx && gfx->window_used && gfx->require_ssbo_window) *gfx->window_used = 1;
     return 0;
 }
 

@@ -325,6 +325,7 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --binary-libpac
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --pair-libpack
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-libpack-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gfx-reason-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --win-part-mutants
 # 计算程序预热（清单记账 / 阶段 / 从缓存建 / 开关）与现场编译诊断事件（图形 / 计算）的负对照：各撤一处，对应断言必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants

@@ -60,7 +60,7 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
-    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason', '--lib-binst')
+    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason', '--lib-binst', '--win-part')
     if len(sys.argv) == 2 and sys.argv[1] in (*live_modes, '--gs-libpack', '--gs-libpack-ssbo'):
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],), env=dict(os.environ, TMPDIR=str(out)))
         sys.stdout.write(result.stdout)
@@ -269,6 +269,29 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print('PASS: 4 libpack GS negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--win-part-mutants']:
+        # 负对照：窗口二分闸各撤 / 改一处，--win-part 必红在对应断言
+        code = original.read_text()
+        vk_path = ROOT/'android/native/direct/libpack_vk.c'
+        vk_code = vk_path.read_text()
+        for name, old, new, expected, in_vk in (
+            ('gate-off', 'if ((part == 1 && !window_used) || (part == 2 && window_used)) {', 'if (0) {', 'part 1, no mask', False),
+            ('parts-swapped', '(part == 1 && !window_used) || (part == 2 && window_used)', '(part == 2 && !window_used) || (part == 1 && window_used)', 'part 1, mask', False),
+            ('applies-when-aligned', 'const int part = !ckey && g.require_ssbo_window && lrc == S2A_LIBPACK_HIT', 'const int part = !ckey && lrc == S2A_LIBPACK_HIT', 'part 1, aligned state ignores the gate', False),
+            ('mask-never-reported', 'if (gfx && gfx->window_used && gfx->require_ssbo_window) *gfx->window_used = 1;', '(void)0;', 'part 1, mask', True),
+        ):
+            src = vk_code if in_vk else code
+            assert src.count(old) == 1, (name, 'mutation anchor', src.count(old))
+            path = out / ('win-part-mutant-' + name + '.c'); path.write_text(src.replace(old, new))
+            if in_vk:
+                result = run('win-part-' + name, original, extra_libs=[*libs, path], args=('--win-part',))   # libpack_vk.c 平时由 host_link 自动补链；变异版显式给，自动补链就不再补
+            else:
+                result = run('win-part-' + name, path, args=('--win-part',))
+            assert result.returncode != 0 and 'FAIL: ' + expected in result.stdout + result.stderr, (name, result.stdout[-400:], result.stderr[-200:])
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print('PASS: 4 window-part negative controls')
         return 0
 
     if sys.argv[1:] == ['--gfx-reason-mutants']:
