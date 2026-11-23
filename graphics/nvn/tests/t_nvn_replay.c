@@ -110,7 +110,13 @@ static struct nvn_gpu_cmd_s g_fake_cmd, g_fake_pre;   // 主段 / 前置段各�
 // 只供读写顺序夹具：编码时保存写入快照和绘制所用缓冲，最后按各段「前置、主段」顺序模拟 GPU 执行。
 static int g_order_active, g_order_seg, g_order_n, g_order_overflow;
 static nvn_gpu_buf g_order_vbuf; static uint64_t g_order_voff;
-static struct { int seg, pre, draw; nvn_gpu_buf buf; uint64_t off, len; uint8_t data[4096]; } g_order_ev[16];
+static struct {
+    int seg, pre, draw;
+    nvn_gpu_buf buf;
+    uint64_t off, len;
+    nvn_gpu_draw_args indexed;
+    uint8_t data[4096];
+} g_order_ev[16];
 
 static int g_aborts;
 static int g_begins, g_commits;
@@ -588,8 +594,13 @@ void nvn_gpu_bind(nvn_gpu_cmd c, nvn_gpu_stage st, const nvn_gpu_binding *b, uin
     int i = (int)st; g_bind_calls[i]++; g_nfb[i] = n; memcpy(g_fb[i], b, (n < 16 ? n : 16) * sizeof *b); }
 void nvn_gpu_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *a) {
     if (g_order_active) {
-        if (g_order_n >= 16 || !g_order_vbuf) g_order_overflow++;
-        else { int i = g_order_n++; g_order_ev[i].seg = g_order_seg; g_order_ev[i].pre = c->is_pre; g_order_ev[i].draw = 1; g_order_ev[i].buf = g_order_vbuf; g_order_ev[i].off = g_order_voff; }
+        if (g_order_n >= 16 || (g_order_active == 1 && !g_order_vbuf)) g_order_overflow++;
+        else {
+            int i = g_order_n++;
+            g_order_ev[i].seg = g_order_seg; g_order_ev[i].pre = c->is_pre; g_order_ev[i].draw = 1;
+            g_order_ev[i].buf = g_order_vbuf; g_order_ev[i].off = g_order_voff;
+            g_order_ev[i].indexed = *a;
+        }
     }
     g_gdraws++; g_last_da = *a; if (!g_pass_open) g_draw_outside++;
     if (g_dd_on && g_ndd < 64) { for (int st = 0; st < 2; st++) { g_dd[g_ndd].b[st] = g_fb[st][0].u.b.buf; g_dd[g_ndd].off[st] = g_fb[st][0].u.b.off; } }
@@ -6261,6 +6272,79 @@ static void t_clean_read_order(int snapshot) {
     rp_split_draws = old_split;
 }
 
+static void t_indirect_index_read_order(void) {
+    for (int mode = 0; mode < 3; mode++) {
+        pass_fresh(); g_arena_used = 0; g_flag_buf_read_snapshot = mode != 0;
+        g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = 1;
+        g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
+        memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+        g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+        memset(g_block_mem, 0x11, BLOCK_TEST_PAGES * PG);
+        memset(g_block_mem + PG, 0x77, PG);  // CPU 旧参数指向此页，GPU 生产者改指下一页。
+        memset(g_block_gen, 0, sizeof g_block_gen);
+        g_dirty_now = 100; ++g_dirty_map; g_block_unreliable = 0;
+        const uint64_t base = (uint64_t)(uintptr_t)g_block_mem;
+        const uint32_t cpu_args[5] = {3, 1, 8, (uint32_t)-2, 7}, gpu_args[5] = {3, 1, PG / 2 + 8, (uint32_t)-2, 7};
+        memcpy(g_block_mem, cpu_args, sizeof cpu_args);
+        if (mode != 2) memset(g_block_mem + PG, 0x11, PG);
+        nvn_be_pool_add(g_block_mem, BLOCK_TEST_PAGES * PG);
+        stream warm = {0}; q_env(&warm);
+        p_draw_idx *i = put(&warm, OP_DRAW_IDX, sizeof *i);
+        i->prim = 4; i->itype = 1; i->ibuf = base + PG; i->ind = base;
+        end(&warm); submit1(&warm); fake_complete(NVN_GPU_DONE_OK);
+        stream again = {0}; i = put(&again, OP_DRAW_IDX, sizeof *i);
+        i->prim = 4; i->itype = 1; i->ibuf = base + PG; i->ind = base; end(&again);
+        g_order_active = 2; g_order_seg = g_order_n = g_order_overflow = 0;
+        nvn_be_sub_begin();
+        uint64_t gpu_key = 0, gpu_id = 0;
+        if (mode == 2) {
+            nvn_gpu_buf b = NULL; uint64_t off = 0;
+            CHECK(rp_buf_resolve(&g_fake_cmd, base, sizeof gpu_args, &b, &off));
+            gpu_id = rp_buf_gpu_write_note(base, sizeof gpu_args, &gpu_key); CHECK(gpu_id);
+            nvn_gpu_buf_write(&g_fake_cmd, b, off, gpu_args, sizeof gpu_args);
+        }
+        nvn_be_exec(again.b);
+        fake_log_write(mode == 2 ? 2 : 1, 0x22);
+        uint64_t perf[RP_PERF_N]; rp_perf_take(perf);
+        nvn_be_exec(again.b); nvn_be_sub_commit(); rp_perf_take(perf);
+        uint8_t got[2] = {0}; int ndraw = 0;
+        for (int pre = 1; pre >= 0; pre--) for (int j = 0; j < g_order_n; j++) {
+            if (g_order_ev[j].pre != pre) continue;
+            if (g_order_ev[j].draw) {
+                const nvn_gpu_draw_args *a = &g_order_ev[j].indexed;
+                if (!a->ind || !a->ind->cpu || a->ind_off + 20 > a->ind->bytes ||
+                    !a->ibuf || !a->ibuf->cpu) { g_order_overflow++; continue; }
+                uint32_t args[5]; memcpy(args, a->ind->cpu + a->ind_off, sizeof args);
+                const uint64_t off = a->ioff + 2ull * args[2];
+                if (args[0] != 3 || args[1] != 1 || args[3] != (uint32_t)-2 || args[4] != 7 ||
+                    off + 6 > a->ibuf->bytes) { g_order_overflow++; continue; }
+                if (ndraw < 2) got[ndraw] = a->ibuf->cpu[off];
+                ndraw++;
+            } else {
+                nvn_gpu_buf b = g_order_ev[j].buf;
+                const uint64_t off = g_order_ev[j].off, n = g_order_ev[j].len;
+                if (b && b->cpu && off <= b->bytes && n <= b->bytes - off)
+                    memcpy(b->cpu + off, g_order_ev[j].data, (size_t)n);
+                else g_order_overflow++;
+            }
+        }
+        const int want = mode != 1;
+        printf("ES indirect mode=%d cuts=%llu expected=%d index=%02x/%02x errors=%d\n", mode,
+               (unsigned long long)perf[RP_PERF_P_CUT_XFER], want, got[0], got[1], g_order_overflow);
+        CHECK(ndraw == 2 && got[0] == 0x11 && got[1] == 0x22 && g_order_overflow == 0);
+        CHECK(perf[RP_PERF_P_CUT_XFER] == (uint64_t)want);
+        CHECK(perf[RP_PERF_IND_INDEX_OFF] == (uint64_t)(mode == 0) &&
+              perf[RP_PERF_IND_INDEX_BOUNDED] == (uint64_t)(mode == 1) &&
+              perf[RP_PERF_IND_INDEX_GPU] == (uint64_t)(mode == 2) &&
+              perf[RP_PERF_IND_INDEX_CUT] == (uint64_t)want);
+        g_order_active = 0; fake_complete(NVN_GPU_DONE_OK);
+        if (gpu_id) rp_buf_gpu_write_land(gpu_key, gpu_id, 0);
+        nvn_be_pool_del(g_block_mem); g_block_mem = NULL; g_flag_buf_dirtylog = g_dirtylog_dflt;
+        g_log_fake_on = g_buf_cpu_auto = 0; pass_fresh();
+    }
+    g_flag_buf_read_snapshot = 0;
+}
+
 // 区间不相交、提交结束和桶碰撞都不能改变读写语义；传输替身检查命令段与快照。
 static void t_clean_read_scopes(void) {
     pass_fresh(); g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = 0;
@@ -7563,6 +7647,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-merge")) { t_gpu_land_merge(); printf("gpu land merge: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
 #endif
     if (argc > 1 && !strcmp(argv[1], "--sync-reuse")) { t_sync_reuse_after_gpu_write(); printf("sync reuse: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    if (argc > 1 && !strcmp(argv[1], "--es-indirect-index")) {
+        t_indirect_index_read_order();
+        printf("es-indirect-index: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--es-second-sync")) {
         t_clean_read_order(0); t_clean_read_order(1);
         printf("es-second-sync: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0;
@@ -7675,6 +7763,7 @@ int main(int argc, char **argv) {
     t_depth_copy_scaled(); t_front_origin_matrix(); t_color_copy_mirror(); t_copy_t2t();
     t_clean_read_order(0);
     t_clean_read_order(1);
+    t_indirect_index_read_order();
     t_clean_read_scopes();
     t_pipeline_dirty_changes();
     t_target_format_variant();
