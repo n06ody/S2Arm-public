@@ -430,6 +430,21 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     descriptor_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
     VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_enabled = {0};
     descriptor_enabled.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+    const int want_eds1 = prop_int("debug.s2a.nvk_eds1", 0) == 1;
+    const int want_eds2 = prop_int("debug.s2a.nvk_eds2", 0) == 1;
+    const int want_vi = prop_int("debug.s2a.nvk_vertex_input", 0) == 1;
+    const int query_eds1 = want_eds1 && has_device_extension(out->physical, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    const int query_eds2 = want_eds2 && has_device_extension(out->physical, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    const int query_vi = want_vi && has_device_extension(out->physical, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds1 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    };
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+    };
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vi = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+    };
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border = {0};
     border.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
     {
@@ -454,6 +469,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
             query.pNext = &border;
         }
         if (descriptor_query) { descriptor_supported.pNext = query.pNext; query.pNext = &descriptor_supported; }
+        if (query_eds1) { eds1.pNext = query.pNext; query.pNext = &eds1; }
+        if (query_eds2) { eds2.pNext = query.pNext; query.pNext = &eds2; }
+        if (query_vi) { vi.pNext = query.pNext; query.pNext = &vi; }
         vkGetPhysicalDeviceFeatures2(out->physical, &query);
         if (descriptor_query) {
             out->descriptor_indexing_runtime = descriptor_supported.runtimeDescriptorArray == VK_TRUE;
@@ -486,8 +504,14 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     const int descriptor_enable = descriptor_query && out->descriptor_indexing_runtime &&
                                   out->descriptor_indexing_partial && out->descriptor_indexing_sampled_nonuniform &&
                                   out->descriptor_indexing_storage_nonuniform;
-    const char *device_ext[24];
+    const char *device_ext[28];
     uint32_t device_ext_count = 0;
+    const int enable_eds1 = query_eds1 && eds1.extendedDynamicState == VK_TRUE;
+    const int enable_eds2 = query_eds2 && eds2.extendedDynamicState2 == VK_TRUE;
+    const int enable_vi = query_vi && vi.vertexInputDynamicState == VK_TRUE;
+    if (enable_eds1) device_ext[device_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
+    if (enable_eds2) device_ext[device_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+    if (enable_vi) device_ext[device_ext_count++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
     // 反馈没有独立的 feature 位。实例仍申请 1.1，物理设备报 1.3 也须实际启用 EXT。
     const int pipe_feedback_core = s2a_vk_effective_api(out->properties.apiVersion) >= VK_API_VERSION_1_3;
     const int pipe_feedback_ext = !pipe_feedback_core &&
@@ -719,8 +743,42 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         descriptor_enabled.pNext = (void *)device_info.pNext;
         device_info.pNext = &descriptor_enabled;
     }
+    if (enable_eds1) {
+        eds1.pNext = (void *)device_info.pNext;
+        device_info.pNext = &eds1;
+    }
+    if (enable_eds2) {
+        eds2.extendedDynamicState2LogicOp = VK_FALSE;
+        eds2.extendedDynamicState2PatchControlPoints = VK_FALSE;
+        eds2.pNext = (void *)device_info.pNext;
+        device_info.pNext = &eds2;
+    }
+    if (enable_vi) {
+        vi.pNext = (void *)device_info.pNext;
+        device_info.pNext = &vi;
+    }
     if (vkCreateDevice(out->physical, &device_info, NULL, &out->device) != VK_SUCCESS)
         return fail(why, why_size, "vkCreateDevice failed");
+    out->eds1_enabled = enable_eds1;
+    out->eds2_enabled = enable_eds2;
+    out->vertex_input_dynamic_enabled = enable_vi;
+#define LOAD_EDS1(name) \
+    out->name = (PFN_##name)vkGetDeviceProcAddr(out->device, #name); \
+    out->eds1_enabled &= out->name != NULL;
+#define LOAD_EDS2(name) \
+    out->name = (PFN_##name)vkGetDeviceProcAddr(out->device, #name); \
+    out->eds2_enabled &= out->name != NULL;
+    if (enable_eds1) { S2A_VK_EDS1_COMMANDS(LOAD_EDS1) }
+    if (enable_eds2) { S2A_VK_EDS2_COMMANDS(LOAD_EDS2) }
+#undef LOAD_EDS1
+#undef LOAD_EDS2
+    if (enable_vi) {
+        out->vkCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(out->device, "vkCmdSetVertexInputEXT");
+        out->vertex_input_dynamic_enabled = out->vkCmdSetVertexInputEXT != NULL;
+    }
+    if (want_eds1 || want_eds2 || want_vi)
+        fprintf(stderr, "[s2a] vk pipeline dynamic state: eds1=%d/%d eds2=%d/%d vertex_input=%d/%d (enabled/requested)\n",
+                out->eds1_enabled, want_eds1, out->eds2_enabled, want_eds2, out->vertex_input_dynamic_enabled, want_vi);
     out->pipeline_creation_feedback_enabled = pipe_feedback_core || pipe_feedback_ext;
     out->descriptor_indexing_enabled = descriptor_enable;
     S2A_DLOG("[s2a] vk descriptor indexing: ext_state=%d queried=%d runtime=%d partial=%d sampled_nonuniform=%d "
