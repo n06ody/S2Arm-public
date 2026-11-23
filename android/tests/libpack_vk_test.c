@@ -1364,13 +1364,13 @@ int main(void) {
             free(j);
         }
         s2a_libpack_close(dl);
-        // 图形侧：drvcb bank 2（句柄表，图形只映射 bank 0）与 img reg≥8 同样出库即拒——用 vs 塞死绑定 + 正常 fs 的程序对验证整程序 REJECT
+        // 图形侧：drvcb bank 3（非 c0 / c2 的驱动常量段，图形只映射 bank 0 / 2）与 img reg≥8 同样出库即拒——用 vs 塞死绑定 + 正常 fs 的程序对验证整程序 REJECT
         static const char *VS_DRVCB_JSON =
             "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
             "{\"msl_name\":\"vp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
-            "{\"msl_name\":\"vp_cb\",\"kind\":\"drvcb\",\"bank\":2,\"arg_id\":1},"
+            "{\"msl_name\":\"vp_cb\",\"kind\":\"drvcb\",\"bank\":3,\"arg_id\":1},"
             "{\"msl_name\":\"vp_t0\",\"kind\":\"tex\",\"reg\":0,\"arg_id\":2},"
-            "{\"msl_name\":\"vp_c4\",\"kind\":\"cbuf\",\"reg\":1,\"arg_id\":4}]}";   // 绑定 12/24 各有覆盖——死点只剩 drvcb bank 2
+            "{\"msl_name\":\"vp_c4\",\"kind\":\"cbuf\",\"reg\":1,\"arg_id\":4}]}";   // 绑定 12/24 各有覆盖——死点只剩 drvcb bank 3
         static const char *VS_IMG9_JSON =
             "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
             "{\"msl_name\":\"vp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
@@ -1406,7 +1406,8 @@ int main(void) {
     // ---- 图形 c0 驱动常量段（drvcb bank 0）：_b.json 出处（bank 0）+ .spv 证实（同一绑定号是 set 0 的 Uniform Block）才映射成 slot 0（消费端 NVN_RB_DRV0）----
     // 期望（手算）：fp_c0 arg_id 3 → 绑定 3×6+4 = 22；vp_c0 arg_id 1 → 绑定 1×6+0 = 6。
     //   正例：出 {kind uniform, stage fs, binding 22, slot 0}，解析后 slot 0、非 support。
-    //   负控：bank 2 / bank 3（图形只映射 bank 0）→ REJECT「no consumable guest source」；arg_id 4（绑定 28，.spv 没有）、
+    //   bank 2（c2 句柄表，同一套 .spv 证实）→ {kind uniform, binding 22, slot 2}（消费端 NVN_RB_DRV2）；
+    //   负控：bank 3 / 4（图形只映射 bank 0 / 2）→ REJECT「no consumable guest source」；bank 0 / 2 的 arg_id 4（绑定 28，.spv 没有）、
     //   StorageBuffer 存储类、BufferBlock（非 Block）、描述符集 1、同一绑定号两个变量 → REJECT「not a set 0 Uniform Block」；都不出半个程序。
     {
         snprintf(g_dir, sizeof g_dir, "%s/c0", tmpl);
@@ -1443,6 +1444,44 @@ int main(void) {
         if (rc != 0) printf("  vs c0 bank 0: rc=%d why=%s\n", rc, w);
         CHECK(rc == 0 && has(j, "\"kind\":\"uniform\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"slot\":0}"), "graphics vs c0 bank 0 → uniform binding 6 slot 0");
         free(j); j = NULL;
+        // bank 2（c2 驱动句柄表）：_b.json 出处 + .spv 证实 set 0 Uniform Block → slot 2（消费端 NVN_RB_DRV2，rp_draw 按完整 0xA00 句柄表供数）
+        {
+            static const char *VS_C2_JSON =
+                "{\"key\":\"0123456789abcdef_b\",\"stage\":\"vs\",\"dm_ctl\":\"0123456789abcdef\",\"bindings\":["
+                "{\"msl_name\":\"vp_c2\",\"kind\":\"drvcb\",\"bank\":2,\"arg_id\":1}]}";
+            snprintf(ps, sizeof ps, PS_C0_FMT, 2u, 2u, 3u);
+            w[0] = 0;
+            rc = c0_program(VS_JSON, libpack_vert_spv, sizeof libpack_vert_spv, ps, libpack_c0_frag_spv, sizeof libpack_c0_frag_spv, &j, &jl, w, sizeof w);
+            if (rc != 0) printf("  fs c2 bank 2: rc=%d why=%s\n", rc, w);
+            CHECK(rc == 0 && j, "graphics fs c2 bank 2 + Uniform Block at binding 22 → HIT");
+            CHECK(has(j, "\"kind\":\"uniform\",\"stage\":\"fs\",\"set\":0,\"binding\":22,\"slot\":2}"), "fs c2 → uniform binding 22 slot 2");
+            if (j) {
+                struct fd_program prog; char pw[192] = ""; memset(&prog, 0, sizeof prog);
+                int found = 0;
+                CHECK(nvn_vk_program_parse_graphics(j, jl, &prog, pw, sizeof pw) == 0, "fs c2 program parses");
+                for (int i = 0; i < prog.binding_count; i++)
+                    if (prog.bindings[i].binding == 22) {
+                        found = 1;
+                        CHECK(prog.bindings[i].kind == 0 && prog.bindings[i].slot == 2 && !prog.bindings[i].is_support &&
+                              !strcmp(prog.bindings[i].stage, "fs"), "parsed c2 binding: uniform, slot 2 (→ NVN_RB_DRV2), fs, not support");
+                    }
+                CHECK(found, "parsed program has the c2 binding 22");
+                nvn_vk_program_free(&prog);
+            }
+            free(j); j = NULL;
+            w[0] = 0;
+            rc = c0_program(VS_C2_JSON, libpack_c0_vert_spv, sizeof libpack_c0_vert_spv, PS_JSON, libpack_frag_spv, sizeof libpack_frag_spv, &j, &jl, w, sizeof w);
+            if (rc != 0) printf("  vs c2 bank 2: rc=%d why=%s\n", rc, w);
+            CHECK(rc == 0 && has(j, "\"kind\":\"uniform\",\"stage\":\"vs\",\"set\":0,\"binding\":6,\"slot\":2}"), "graphics vs c2 bank 2 → uniform binding 6 slot 2");
+            free(j); j = NULL;
+            // 错绑定号：bank 2 同样要 .spv 证实（arg_id 4 = 绑定 28，.spv 没有）
+            snprintf(ps, sizeof ps, PS_C0_FMT, 2u, 2u, 4u);
+            w[0] = 0;
+            rc = c0_program(VS_JSON, libpack_vert_spv, sizeof libpack_vert_spv, ps, libpack_c0_frag_spv, sizeof libpack_c0_frag_spv, &j, &jl, w, sizeof w);
+            if (!(rc == -1 && !j && strstr(w, "drvcb bank 2") && strstr(w, "not a set 0 Uniform Block"))) printf("  c2 wrong binding: rc=%d why=%s\n", rc, w);
+            CHECK(rc == -1 && !j && strstr(w, "drvcb bank 2") && strstr(w, "not a set 0 Uniform Block"), "c2 at a binding the SPIR-V does not declare → REJECT by name");
+            free(j); j = NULL;
+        }
         // 存储缓冲窗口准入：有合同、无掩码、带存储缓冲（vp_s0）的段——基址对齐照用，非对齐才拒（缺补偿）
         {
             const struct s2a_libpack_gfx aligned = { NULL, NULL, 0, 64, 0 }, unaligned = { NULL, NULL, 0, 64, 1 };
@@ -1457,12 +1496,12 @@ int main(void) {
             free(j); j = NULL;
         }
         // 负控：异 bank
-        for (unsigned bank = 2; bank <= 3; bank++) {
+        for (unsigned bank = 3; bank <= 4; bank++) {
             snprintf(ps, sizeof ps, PS_C0_FMT, bank, bank, 3u);
             w[0] = 0;
             rc = c0_program(VS_JSON, libpack_vert_spv, sizeof libpack_vert_spv, ps, libpack_c0_frag_spv, sizeof libpack_c0_frag_spv, &j, &jl, w, sizeof w);
             if (!(rc == -1 && !j && strstr(w, "no consumable guest source"))) printf("  fs drvcb bank %u: rc=%d why=%s\n", bank, rc, w);
-            CHECK(rc == -1 && !j && strstr(w, "no consumable guest source"), "graphics drvcb bank != 0 → REJECT (no consumable guest source)");
+            CHECK(rc == -1 && !j && strstr(w, "no consumable guest source"), "graphics drvcb bank other than 0 / 2 → REJECT (no consumable guest source)");
             free(j); j = NULL;
         }
         // 负控：错绑定号（_b.json 说 arg_id 4 = 绑定 28，.spv 在 28 没有声明）

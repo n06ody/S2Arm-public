@@ -437,7 +437,7 @@ static int lp_spv_binding_is_set0_ubo(const uint8_t *spv, size_t n, uint32_t bin
 // 一个键的 _b.json bindings[] → content.bindings[]（追加进 jw；sep 管逗号）。
 // stage_no = 本段 StageNo（绑定号换算用它），v1_stage = v1 阶段名标签
 // compute = 1：计算结果合同（nvn_vk_program_parse_compute）比图形严——每条带 count、storage 带
-//   cbSlot/cbOffset 出处、c0 驱动常量段（drvcb bank 0）挂 slot 0；图形输出逐字节不变。
+//   cbSlot/cbOffset 出处、c0 驱动常量段（drvcb bank 0）挂 slot 0；图形另映射 bank 2（c2 句柄表，slot 2）。
 static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_stage,
                             int stage_no, const char *v1_stage, int compute, const uint8_t *spv, size_t spv_size,
                             int *sep, struct lp_emitted_bindings *emitted, char *why, size_t why_size) {
@@ -534,14 +534,15 @@ static int lp_emit_bindings(struct jw *j, struct s2a_jv top, const char *lib_sta
             uint32_t bank = 0;
             int has_bank = !jf_u32(b, "bank", &bank);
             if (compute && has_bank && (bank == 0 || bank == 2)) { slot = bank; has_slot = 1; }
-            // 图形：只映射 bank 0（c0 = 驱动常量段，消费端 layout_ent 同样 slot 0 → NVN_RB_DRV0，rp_draw 按完整 0xA00 驱动段供数：
-            //   各阶段存储缓冲表 + 0x610 / 0x644 等宿主字）。出处（_b.json drvcb bank 0）之外还要 .spv 证实同一绑定号是 set 0 的
-            //   Uniform Block，对不上就具名拒、不出死绑定；bank 2（句柄表）等其余 bank 照旧无槽、落到下面的「无来源」拒。
-            else if (!compute && has_bank && bank == 0) {
+            // 图形：映射 bank 0 与 bank 2。bank 0 = c0 驱动常量段（消费端 layout_ent slot 0 → NVN_RB_DRV0，rp_draw 按完整 0xA00 驱动段供数：
+            //   各阶段存储缓冲表 + 0x610 / 0x644 等宿主字）；bank 2 = c2 驱动句柄表（着色器自己从表里读句柄，slot 2 → NVN_RB_DRV2，
+            //   rp_draw 按完整 0xA00 句柄表供数：组合槽 / 图像 / 分离贴图 / 分离采样器，同现编结果同号）。出处（_b.json drvcb bank 0 / 2）之外
+            //   还要 .spv 证实同一绑定号是 set 0 的 Uniform Block，对不上就具名拒、不出死绑定；其余 bank（3…）照旧无槽、落到下面的「无来源」拒。
+            else if (!compute && has_bank && (bank == 0 || bank == 2)) {
                 if (!lp_spv_binding_is_set0_ubo(spv, spv_size, binding))
-                    return lp_fail(why, why_size, "%s bindings[%u] %s drvcb bank 0 binding %u is not a set 0 Uniform Block in the SPIR-V",
-                                   lib_stage, i, msl, binding);
-                slot = 0; has_slot = 1;
+                    return lp_fail(why, why_size, "%s bindings[%u] %s drvcb bank %u binding %u is not a set 0 Uniform Block in the SPIR-V",
+                                   lib_stage, i, msl, bank, binding);
+                slot = bank; has_slot = 1;
             }
         } else if (!strcmp(kind, "geometry") || !strcmp(kind, "sbuf") || !strcmp(kind, "sbuf_ubo")
                    || !strcmp(kind, "ubo_ptr") || !strcmp(kind, "gmem_map") || !strcmp(kind, "gmem_log") || !strcmp(kind, "sbuf_push")) {
