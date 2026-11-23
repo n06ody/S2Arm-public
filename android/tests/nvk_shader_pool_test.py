@@ -60,9 +60,9 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
-    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack')
-    if len(sys.argv) == 2 and sys.argv[1] in live_modes:
-        result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
+    live_modes = ('--live-compile-thread', '--live-compile-pending', '--live-compile-stop', '--cs-libpack', '--gfx-reason')
+    if len(sys.argv) == 2 and sys.argv[1] in (*live_modes, '--gs-libpack', '--gs-libpack-ssbo'):
+        result = run(sys.argv[1][2:], original, args=(sys.argv[1],), env=dict(os.environ, TMPDIR=str(out)))
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         return result.returncode
@@ -103,6 +103,29 @@ def main():
             assert result.returncode == 1 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print(f'PASS: {len(mutants)} live compile negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--ssbo-window-mutants']:
+        # 存储缓冲窗口的准入与预热：各撤一处，对应断言必红（红在被修的那一处，不是编译 / 链接错）
+        text = original.read_text()
+        mutants = [
+            ('old-state-gate', 'return g->has_unaligned_ssbo && g->unaligned_ssbo ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED;',
+             'return g->has_unaligned_ssbo && g->unaligned_ssbo ? LIBPACK_OTHER_STATE : LIBPACK_ALIGNED;',
+             '--gs-libpack-ssbo', 'graphics SSBO window admission (shape 0 ABI=1 unaligned=1): live compile calls=1'),
+            ('record-forgets-window', 'rec->lp_ssbo_window = state == LIBPACK_SSBO_WINDOW && prog->lib_sourced;',
+             'rec->lp_ssbo_window = 0;', '--gs-libpack-ssbo', 'warm record state (ABI=1 unaligned=1)'),
+            ('warm-ignores-window', 'rec->lp_ok == 2 ? (rec->lp_ssbo_window ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED) : LIBPACK_OTHER_STATE',
+             'rec->lp_ok == 2 ? LIBPACK_ALIGNED : LIBPACK_OTHER_STATE', '--gs-libpack',
+             'warm record wants the window contract, old library: library not used'),
+        ]
+        for name, old, new, mode, expected in mutants:
+            assert text.count(old) == 1, (name, 'mutation anchor')
+            path = out / ('ssbo-window-mutant-' + name + '.c')
+            path.write_text(text.replace(old, new))
+            result = run('ssbo-window-' + name, path, args=(mode,), env=dict(os.environ, TMPDIR=str(out)))
+            assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print(f'PASS: {len(mutants)} SSBO window negative controls')
         return 0
 
     if sys.argv[1:] == ['--compute-warm-mutants']:
@@ -171,8 +194,8 @@ def main():
         for name, old, new, expected in (
             ('mask-0x3', 'lrc = s2a_libpack_program_v1(lp, keys, stages, &g,', 'lrc = s2a_libpack_program_v1(lp, keys, 0x3, &g,',
              'hit from the library, compiler not called'),
-            ('no-topology', 'const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };',
-             'const struct s2a_libpack_gfx g = { NULL, pc->profile_json, pc->profile_bytes }; (void)topology;',
+            ('no-topology', '.topology = topology, .profile_json = pc->profile_json,',
+             '.topology = NULL, .profile_json = pc->profile_json,',
              'hit from the library, compiler not called'),
             # 取库入口的闸（nvk_shader.c libpack_fetch）：放 0x1 / 0x3 / 0x7。去掉 0x7u：三段（含几何）程序被挡在库外，必须红；
             #   去掉 0x1u：只有顶点的深度程序被挡在库外，必须红在 VS-only 那一例
@@ -188,6 +211,31 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         print('PASS: 4 libpack GS negative controls')
+        return 0
+
+    if sys.argv[1:] == ['--gfx-reason-mutants']:
+        # 负对照：图形现编原因日志的各归类撤 / 改一处，--gfx-reason 必红在对应断言
+        code = original.read_text()
+        for name, old, new, expected in (
+            ('no-root-gate', 'if (!root) LPG_ADD("%s无资源根", o ? "、" : "");', '', 'no root: line has'),
+            ('no-libpack-gate', 'if (nvn_plat_flag("no_libpack", 0)) LPG_ADD("%sno_libpack", o ? "、" : "");', '', 'no_libpack: line has'),
+            ('stage-gate-dropped', 'if (!ckey && stages != 0x3u && stages != 0x7u) LPG_ADD(', 'if (0) LPG_ADD(', 'stage mask gate'),
+            ('state-bit-unnamed', '{LPG_ALPHA_TEST, "alpha测试"}', '{LPG_ALPHA_TEST, "?"}', 'state gate bit 4 names'),
+            ('cache-miss-as-bad', 'if (!strncmp(why, "未命中", strlen("未命中"))) return "无文件";', '', 'cache no file'),
+            ('cache-header-as-bad', 'strncmp(why, "格式版本不符", strlen("格式版本不符"))) return "读头失败";', 'strncmp(why, "格式版本不符", strlen("格式版本不符"))) return "坏";', 'cache header unreadable'),
+            ('outcome-not-recorded', 'else { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT;', 'else if (0) { g_lp_last.code = lrc == S2A_LIBPACK_HIT ? LPL_HIT : lrc == S2A_LIBPACK_MISS ? LPL_MISS : LPL_REJECT;', 'library without this key'),
+            ('absent-as-bad', 'LPL_BAD_TABLE : atomic_load(&g_lp_state) == LP_ST_BAD ? LPL_CONTAINER_BAD : LPL_CONTAINER_MISSING;', 'LPL_BAD_TABLE : LPL_CONTAINER_BAD;', 'library absent'),
+            ('flag-ignored', '    if (!nvn_plat_flag("nvk_hitch_log", 0)) return;\n    {   // 现编帧行带前几个身份', '    {   // 现编帧行带前几个身份', 'flag off: no reason line'),
+            ('ids-not-cleared', 'snprintf(s->ids, sizeof s->ids, "%s", g_live_ids); g_live_ids[0] = 0; g_live_ids_n = 0;', 'snprintf(s->ids, sizeof s->ids, "%s", g_live_ids);', 'identities are cleared after take'),
+            ('no-session-reset', '    g_live_reason.recent_n = 0; atomic_store_explicit(&g_live_reason.said, 0, memory_order_relaxed);', '    (void)0;', 'library absent'),
+        ):
+            assert code.count(old) == 1, (name, 'mutation anchor', code.count(old))
+            path = out / ('gfx-reason-mutant-' + name + '.c')
+            path.write_text(code.replace(old, new))
+            result = run('gfx-reason-' + name, path, args=('--gfx-reason',))
+            assert result.returncode != 0 and expected in result.stdout + result.stderr, (name, result.stdout, result.stderr)
+            print(f'{name}: expected assertion failure: {expected}', flush=True)
+        print('PASS: 11 graphics live-compile reason negative controls')
         return 0
 
     if sys.argv[1:] == ['--cs-libpack-mutants']:
@@ -507,7 +555,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --cs-libpack-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --gs-libpack-mutants | --cs-libpack-mutants | --gfx-reason-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'
@@ -545,6 +593,9 @@ def main():
     # 三段程序（vs + fs + gs）查出包预编库：环境变量与深度能力缓存是进程级的，单独起一个进程
     gsl = run('test-gs-libpack', original, args=('--gs-libpack',))
     sys.stdout.write(gsl.stdout); sys.stderr.write(gsl.stderr)
+    # 同一份夹具再带一份有窗口合同的库（存储缓冲窗口：准入放行 + 预热从库取），同样进程级
+    gss = run('test-gs-libpack-ssbo', original, args=('--gs-libpack-ssbo',))
+    sys.stdout.write(gss.stdout); sys.stderr.write(gss.stderr)
     # 计算程序查出包预编库的非对齐闸（#496085）：库根环境变量进程级，单独起一个进程
     csl2 = run('test-cs-libpack', original, args=('--cs-libpack',))
     sys.stdout.write(csl2.stdout); sys.stderr.write(csl2.stderr)
@@ -562,7 +613,7 @@ def main():
         env.update(S2A_COMPUTE_WARM='0', S2A_DIRECT_CACHE_DIR=str(cache_off))
         cs_off = run('test-compute-warm-off', original, args=('--compute-warm-off',), env=env)
         sys.stdout.write(cs_off.stdout); sys.stderr.write(cs_off.stderr)
-    return result.returncode or live_rc or gsl.returncode or csl2.returncode or off.returncode or on.returncode or cs_off.returncode
+    return result.returncode or live_rc or gsl.returncode or gss.returncode or csl2.returncode or off.returncode or on.returncode or cs_off.returncode
 
 if __name__ == '__main__':
     raise SystemExit(main())
