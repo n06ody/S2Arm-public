@@ -1412,6 +1412,7 @@ static int libpack_fetch(const uint8_t identity[32], const uint8_t (*gkeys)[8], 
                 .topology = topology, .profile_json = pc->profile_json, .profile_bytes = pc->profile_bytes,
                 .storage_alignment = caps.min_ssbo_align,
                 .require_ssbo_window = state_ok == LIBPACK_SSBO_WINDOW,
+                .window_tex_classes = (uint32_t)nvn_plat_flag("nvk_libpack_win_tex", 0),
             };
             lrc = s2a_libpack_program_v1(lp, keys, stages, &g, (uint32_t)pc->direct_abi, pc->profile_hash, pc->translator_closure, bytes, len, lw, sizeof lw);
         }

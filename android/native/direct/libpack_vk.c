@@ -841,6 +841,24 @@ static int lp_fix_ssbo_window_mask(uint8_t *spv, size_t n, uint32_t id, uint32_t
     return -1;
 }
 
+// 片元模块的贴图声明类别（见 s2a_libpack_gfx.window_tex_classes）：1 阴影（深度 + 数组的 OpTypeImage，或任一带 Dref 的采样 / 取样）、2 = 3D、4 = Cube、8 = 都不是。
+static uint32_t lp_spv_tex_classes(const uint8_t *spv, size_t n) {
+    const uint32_t *w = (const uint32_t *)spv;
+    const size_t nw = n / sizeof(*w);
+    uint32_t classes = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || wc > nw - i) break;
+        if (op == 25 && wc >= 9) {   // OpTypeImage：dim = w[3]（0 1D / 1 2D / 2 3D / 3 Cube）、depth = w[4]、arrayed = w[5]
+            if (w[i + 4] == 1 && w[i + 5] == 1) classes |= 1u;
+            if (w[i + 3] == 2) classes |= 2u;
+            if (w[i + 3] == 3) classes |= 4u;
+        } else if ((op >= 89 && op <= 94) || op == 97) classes |= 1u;   // OpImageSampleDref* / OpImageSampleProjDref* / OpImageDrefGather
+        i += wc;
+    }
+    return classes ? classes : 8u;
+}
+
 static int lp_stage_ssbo_window(struct s2a_jv top, const struct s2a_libpack_gfx *gfx, int compute,
                                 uint8_t *spv, size_t n, struct lp_stage_contract *contract,
                                 char *why, size_t why_size) {
@@ -974,6 +992,10 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
         {
             int window = lp_stage_ssbo_window(top, gfx, compute, spv, sn, contract, why, why_size);
             if (window != 0) { out = window; goto done; }
+        }
+        if (!compute && nvn == 1 && gfx && gfx->require_ssbo_window && gfx->window_tex_classes && !(lp_spv_tex_classes(spv, sn) & gfx->window_tex_classes)) {
+            if (why && why_size) snprintf(why, why_size, "%s %s fragment texture classes outside the diagnostic window class set", khex, jname);
+            out = S2A_LIBPACK_MISS; goto done;
         }
         {   char cw[128] = ""; const size_t sn0 = sn; const uint64_t il0 = s2a_libpack_interlock_dropped();
             if (s2a_libpack_spv_admit_caps(spv, &sn, cw, sizeof cw)) { lp_fail_reflect(why, why_size, "%s %s %s", khex, sname, cw); goto done; }
