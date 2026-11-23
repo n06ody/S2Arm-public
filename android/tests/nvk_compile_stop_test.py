@@ -60,11 +60,12 @@ static _Atomic int g_stop_published, g_session_active;
 #define ANDROID_LOG_ERROR 6
 static int __android_log_print(int level, const char *tag, const char *fmt, ...) { (void)level; (void)tag; (void)fmt; return 0; }
 void nvk_shader_stop(void);
+void nvk_shader_stair_cut(void);
 static void nvk_session_request_stop(void) { nvk_shader_stop(); }
 static void ctl_wake_stop(void) {}
 static void ctl_wake(void) {}
 static int stop_window_lock(void) { return pthread_mutex_lock(&g_window_mu); }
-static int nvk_session_wait_compiles(void) { return 0; } // timing exercised separately
+static int nvk_session_wait_compiles(void) { return getenv("S2SB_WAIT_TIMEOUT") ? -1 : 0; } // timing exercised separately
 static void nvk_session_flush_pipe_cache(void) {}
 static void set_window_error(struct provider_context *c, const char *s) { snprintf(c->window_error, sizeof c->window_error, "%s", s); }
 static pthread_mutex_t stop_test_mu = PTHREAD_MUTEX_INITIALIZER;

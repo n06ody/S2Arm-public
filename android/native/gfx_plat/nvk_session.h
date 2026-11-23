@@ -15,6 +15,7 @@ struct s2a_vk_device;
 int nvk_session_prepare(void);
 void nvk_session_request_stop(void);
 int nvk_session_wait_compiles(void);
+void nvk_shader_stair_cut(void);
 uint64_t nvk_session_stop_deadline(void);
 void nvk_shader_stop(void);
 unsigned nvk_shader_inflight(void);

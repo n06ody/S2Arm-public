@@ -19,6 +19,14 @@ int main(int argc, char **argv) {
     snprintf(ctx.profile_hash, sizeof ctx.profile_hash, "%s", phash); snprintf(ctx.closure, sizeof ctx.closure, "%s", "closure-test");
     g_active_context = &ctx; atomic_store(&g_stop_published, 0); atomic_store(&g_session_active, 1);
     if (frame_test) {
+        if (getenv("S2SB_QA_STOP_FIXTURE")) {
+            stop_test_mode = 0;
+            rp_state_reset(); s2a_source_clear(); source(); bind_pools(7);
+            struct rp_shader_req q = {.prim=4}; const struct rp_prog *out = NULL;
+            (void)rp_shader_resolve(&q, &out);
+            if (!compiler_calls) { fprintf(stderr, "FAIL: fixture did not actually compile a program\n"); return 2; }
+            // r1 never called rp_shader_reset on its retained stop.
+        }
         if (strcmp(argv[1], "frame-empty")) {
             s2a_frame_log_present_timed(3000, 7000);
             nvn_vk_frame_log_fence_wait(2500000);
