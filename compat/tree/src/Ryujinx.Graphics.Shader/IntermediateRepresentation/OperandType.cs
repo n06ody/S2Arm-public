@@ -9,5 +9,6 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
         LocalVariable,
         Register,
         Undefined,
+        StorageWindowMask,
     }
 }

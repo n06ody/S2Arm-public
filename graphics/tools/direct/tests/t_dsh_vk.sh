@@ -30,4 +30,6 @@ make -s -C "$R/graphics/dsx" "$LIB" > "$T/make.log" 2>&1 || red "libdsx 编不�
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 "$DN" build "$H/dsh_vk/S2A.DshVkTest.csproj" -c Release -p:ArtifactsPath="$T/art" -p:NuGetAudit=false --verbosity quiet > "$T/build.log" 2>&1 \
   || red "测试工程编不过：$(grep -m1 ' error ' "$T/build.log" | cut -c1-200)"
-"$DN" "$T/art/bin/S2A.DshVkTest/release/S2A.DshVkTest.dll" "$XC" "$VAL" "$T/work" --dsx "$LIB"
+# S2A_DSH_VK_EMIT_DIR：另出存储缓冲窗口读回夹具料（见 dsh_vk/Program.cs ⑭）；目录必须在仓库检出里（容器里的夹具按仓库路径读）
+EMIT=(); [ -z "${S2A_DSH_VK_EMIT_DIR:-}" ] || EMIT=(--emit "$S2A_DSH_VK_EMIT_DIR")
+"$DN" "$T/art/bin/S2A.DshVkTest/release/S2A.DshVkTest.dll" "$XC" "$VAL" "$T/work" --dsx "$LIB" ${EMIT[@]+"${EMIT[@]}"}
