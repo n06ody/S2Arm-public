@@ -56,7 +56,7 @@ fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
     -Wl,--wrap=vkGetPhysicalDeviceSurfaceCapabilitiesKHR -Wl,--wrap=vkCreateSwapchainKHR \
-    -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
+    -Wl,--wrap=vkGetPhysicalDeviceSurfacePresentModesKHR -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
@@ -83,4 +83,13 @@ cat "$log"
 [ "$rc" = 0 ] || exit "$rc"
 grep -q 'wsi-extent cases=13 failures=0' "$log"
 echo '【绿】WSI extent: 13 cases, real swapchains/presents, validation 0 errors'
+set +e
+timeout 60 "$binary" --present-modes > "$out/present-modes.log" 2>&1
+mode_rc=$?
+set -e
+cat "$out/present-modes.log"
+[ "$mode_rc" = 0 ] || exit "$mode_rc"
+if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-|fixture failure' "$out/present-modes.log"; then exit 1; fi
+grep -q 'wsi-present-mode cases=7 failures=0 real_presents=9' "$out/present-modes.log"
+
 for mutant in size zero transform revoke; do bash "$0" "--negative-$mutant"; done

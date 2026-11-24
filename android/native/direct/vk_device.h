@@ -20,6 +20,15 @@ VkResult s2a_vk_wait_fences(VkDevice device, uint32_t n, const VkFence *fences, 
 extern "C" {
 #endif
 
+// EXT 入口按 Vulkan 1.1 显式协商，设备和录制队列共用同一份真头文件声明。
+#define S2A_VK_EDS1_COMMANDS(X) \
+    X(vkCmdSetCullModeEXT) X(vkCmdSetFrontFaceEXT) X(vkCmdSetPrimitiveTopologyEXT) \
+    X(vkCmdSetDepthTestEnableEXT) X(vkCmdSetDepthWriteEnableEXT) X(vkCmdSetDepthCompareOpEXT) \
+    X(vkCmdSetStencilTestEnableEXT) X(vkCmdSetStencilOpEXT) X(vkCmdBindVertexBuffers2EXT)
+#define S2A_VK_EDS2_COMMANDS(X) \
+    X(vkCmdSetRasterizerDiscardEnableEXT) X(vkCmdSetDepthBiasEnableEXT) X(vkCmdSetPrimitiveRestartEnableEXT)
+#define S2A_VK_VERTEX_INPUT_COMMANDS(X) X(vkCmdSetVertexInputEXT)
+
 struct s2a_vk_device {
     VkInstance instance;
     VkPhysicalDevice physical;
@@ -46,6 +55,12 @@ struct s2a_vk_device {
     // max_vertex_attrib_divisor 是设备上限（未启用时为 0）。
     int vertex_divisor_enabled;
     uint32_t max_vertex_attrib_divisor;
+    int eds1_enabled, eds2_enabled, vertex_input_dynamic_enabled;
+#define S2A_VK_PROC(name) PFN_##name name;
+    S2A_VK_EDS1_COMMANDS(S2A_VK_PROC)
+    S2A_VK_EDS2_COMMANDS(S2A_VK_PROC)
+    S2A_VK_VERTEX_INPUT_COMMANDS(S2A_VK_PROC)
+#undef S2A_VK_PROC
     PFN_vkCmdDrawIndirectCountKHR draw_indirect_count;
     PFN_vkCmdDrawIndexedIndirectCountKHR draw_indexed_indirect_count;
     int shader_draw_parameters_enabled;

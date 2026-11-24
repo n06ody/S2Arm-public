@@ -170,6 +170,46 @@ static void wsi_close_locked(void) {   // nvn_gpu_close 在在途段清空后调
     free(s);
 }
 
+struct wsi_present_mode {
+    VkPresentModeKHR mode;
+    VkResult query_result;
+    const char *reason;
+};
+
+static struct wsi_present_mode wsi_pick_present_mode(VkSurfaceKHR surface) {
+    struct wsi_present_mode pick = {VK_PRESENT_MODE_FIFO_KHR, VK_SUCCESS, "开关关闭"};
+    if (!nvn_plat_flag("nvk_present_mailbox", 0)) return pick;
+
+    uint32_t count = 0;
+    pick.reason = "呈现模式计数查询失败";
+    pick.query_result = vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, surface, &count, NULL);
+    if (pick.query_result != VK_SUCCESS) return pick;
+    if (!count) { pick.reason = "呈现模式列表为空"; return pick; }
+
+    VkPresentModeKHR *modes = calloc(count, sizeof *modes);
+    if (!modes) {
+        pick.reason = "呈现模式列表分配失败";
+        pick.query_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return pick;
+    }
+    const uint32_t capacity = count;
+    pick.query_result = vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, surface, &count, modes);
+    pick.reason = "呈现模式列表查询失败";
+    if (count <= capacity && (pick.query_result == VK_SUCCESS || pick.query_result == VK_INCOMPLETE)) {
+        pick.reason = pick.query_result == VK_INCOMPLETE ? "呈现模式枚举不完整，MAILBOX 未证"
+                                                        : "表面未报告 MAILBOX";
+        // 不完整枚举中的已返回项仍是驱动确认的模式。FIFO 是有效表面必支持的基线。
+        for (uint32_t i = 0; i < count; i++) {
+            if (modes[i] != VK_PRESENT_MODE_MAILBOX_KHR) continue;
+            pick.mode = modes[i];
+            pick.reason = "表面支持 MAILBOX";
+            break;
+        }
+    }
+    free(modes);
+    return pick;
+}
+
 static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, s->surface, &caps) != VK_SUCCESS) return fail(err, NVN_GPU_E_REVOKED, "取不到表面能力（窗口已不在）");
@@ -184,6 +224,9 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     VkExtent2D ext;
     nvn_gpu_rc geometry = wsi_geometry(s, &caps, &ext, err);
     if (!nvn_gpu_ok(geometry)) return geometry;
+    const struct wsi_present_mode present = wsi_pick_present_mode(s->surface);
+    if (present.query_result == VK_ERROR_SURFACE_LOST_KHR)
+        return fail(err, NVN_GPU_E_REVOKED, "查询呈现模式时表面已丢失");
     uint32_t n = caps.minImageCount == UINT32_MAX ? UINT32_MAX : caps.minImageCount + 1; if (n < 3) n = 3;
     { int extra = nvn_plat_flag("nvk_swap_extra", 0); if (extra > 0 && extra <= 4 && n <= UINT32_MAX - (uint32_t)extra) n += (uint32_t)extra;   // 诊断：多要几张窗口图，看取图的等待是不是交换链反压
       if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
@@ -199,7 +242,7 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1));
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR; ci.clipped = VK_TRUE;
+    ci.presentMode = present.mode; ci.clipped = VK_TRUE;
     ci.oldSwapchain = s->swapchain;
     VkSwapchainKHR nsc = VK_NULL_HANDLE;
     VkResult r = vkCreateSwapchainKHR(g.d, &ci, NULL, &nsc);
@@ -234,6 +277,11 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     for (uint32_t i = 0; i < ni; i++) if (!s->rendered[i] && vkCreateSemaphore(g.d, &si, NULL, &s->rendered[i]) != VK_SUCCESS) { wsi_destroy_swapchain(s); return fail(err, NVN_GPU_E_OOM, "信号量创建失败"); }
     s->held = -1; s->outdated = 0; s->acquire_next = 0;
     s->built_transform = caps.currentTransform; s->subopt_n = 0;
+    char mode_line[160];
+    snprintf(mode_line, sizeof mode_line, "交换链呈现模式=%s，%s（VkResult=%d）",
+             present.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO",
+             present.reason, (int)present.query_result);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", mode_line);
     wsi_timing_init(&s->timing, g.d, nvn_plat_flag("display_timing", 0) == 1, g.dev->has_display_timing);
     return rc(NVN_GPU_OK);
 }
