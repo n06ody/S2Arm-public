@@ -660,6 +660,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); } }
     }
     int ok = wsi_compose_selected(c, s, idx, st, d, &fp, encode, target, elig, &upscaled);
+    if (ok && g.pass_diag && c->tsq)
+        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
     // 内部段：摘出活动表，自己提交（等取图信号量、发呈现信号量），交给完成线程只做回收
     pthread_mutex_lock(&g_mu);
     { struct nvn_gpu_cmd_s **pp = &g.live; while (*pp && *pp != c) pp = &(*pp)->live_next; if (*pp) *pp = c->live_next; }

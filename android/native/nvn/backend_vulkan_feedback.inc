@@ -74,8 +74,8 @@ static void feedback_pool_skip_note(const struct nvn_gpu_cmd_s *c, const struct 
     if (!__atomic_exchange_n(&g_fb_skip_full, 1u, __ATOMIC_RELAXED))
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", "整池数组免拷快照：不同（管线、图）已记满，之后不再逐条记（计数见分时行 pskip）");
 }
-static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set,
-                        uint16_t writes, uint16_t *read_mask, int from_pool, int *skipped) {
+static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t stage,
+                        const nvn_gpu_layout_ent *ent, uint16_t writes, uint16_t *read_mask, int from_pool, int *skipped) {
     uint16_t attached = 0;
     const nvn_gpu_pass_desc *d = &c->pass_desc;
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
@@ -87,12 +87,17 @@ static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint3
         *read_mask |= attached;
         return 1;
     }
-    c->desc_dirty |= 1u << set;
+    c->desc_dirty |= 1u << ent->set;
     for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (f->source == v) return 1;
-    struct feedback_copy *f = calloc(1, sizeof *f);
+    struct feedback_copy *f = calloc(1, sizeof *f + (c->diag_fb ? sizeof f->diag[0] : 0));
     if (!f) { set_sticky(c, NVN_GPU_E_OOM, "feedback snapshot list allocation failed"); return 0; }
     f->source = v; f->next = c->feedback; c->feedback = f;
+    if (c->diag_fb) {
+        // A view shared by bindings is copied once per draw. Credit the first
+        // binding that requested the copy, matching feedback_add's deduplication.
+        f->diag[0] = (struct fb_binding_site){(uint16_t)stage, ent->set, ent->binding, (uint16_t)from_pool};
+    }
     return 1;
 }
 // 同一段里同一张源图已经有过快照：复用那张图（重新拷一遍），不再每笔新建。快照图由本段的 REF_TEX 保活到 fence，
@@ -172,6 +177,69 @@ void nvn_vk_fbpool_stat(uint64_t out[5]) {
     for (int i = 0; i < 3; i++) out[i] = __atomic_load_n(&g_fbpool_cnt[i], __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_mu); out[3] = g_fbpool_n; out[4] = g_fbpool_bytes; pthread_mutex_unlock(&g_mu);
 }
+static uint32_t fmt_bpp(VkFormat f);
+
+// Logical bytes described by the emitted VkImageCopy, not allocation size or
+// hardware traffic. Count depth and stencil separately for packed formats.
+static uint64_t feedback_copy_bytes(const struct nvn_gpu_tex_s *tex, const VkImageCopy *copy) {
+    uint32_t bw = 1, bh = 1, bytes = 0;
+    switch (copy->srcSubresource.aspectMask) {
+    case VK_IMAGE_ASPECT_STENCIL_BIT:
+        bytes = 1;
+        break;
+    case VK_IMAGE_ASPECT_DEPTH_BIT:
+        bytes = tex->format == VK_FORMAT_D16_UNORM || tex->format == VK_FORMAT_D16_UNORM_S8_UINT ? 2 : 4;
+        break;
+    case VK_IMAGE_ASPECT_COLOR_BIT: {
+        bytes = fmt_bpp(tex->format);
+        nvn_fmt_info info;
+        if (!bytes && !tex->bc_decoded && !nvn_fmt_expand_target(tex->nvn_format, NULL, NULL) &&
+                nvn_fmt_info_of(tex->nvn_format, &info)) {
+            bw = info.bw;
+            bh = info.bh;
+            bytes = info.bytes;
+        }
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (!bytes || !bw || !bh) return 0;
+    const uint64_t blocks_x = ((uint64_t)copy->extent.width + bw - 1) / bw;
+    const uint64_t blocks_y = ((uint64_t)copy->extent.height + bh - 1) / bh;
+    return blocks_x * blocks_y * copy->extent.depth * copy->srcSubresource.layerCount * tex->samples * bytes;
+}
+
+static void feedback_diag_add(struct fb_diag_totals *to, const struct fb_diag_totals *from) {
+    to->snapshots += from->snapshots;
+    to->regions += from->regions;
+    to->bytes += from->bytes;
+    to->unknown += from->unknown;
+}
+
+static void feedback_diag_record(struct nvn_gpu_cmd_s *c, const struct feedback_copy *f, struct fb_diag_totals *sample) {
+    struct fb_diag_cmd *diag = c->diag_fb;
+    sample->snapshots = 1;
+    feedback_diag_add(&diag->total, sample);
+    const uint32_t pipe = c->pipe->hash;
+    for (uint32_t i = 0; i < diag->nsites; i++) {
+        struct fb_diag_site *site = &diag->sites[i];
+        if (site->pipe == pipe && site->stage == f->diag[0].stage && site->set == f->diag[0].set &&
+                site->binding == f->diag[0].binding && site->pool == f->diag[0].pool) {
+            feedback_diag_add(&site->total, sample);
+            return;
+        }
+    }
+    if (diag->nsites == FB_DIAG_SITES) {
+        diag->unattributed++;
+        return;
+    }
+    diag->sites[diag->nsites++] = (struct fb_diag_site){
+        .pipe = pipe, .stage = f->diag[0].stage, .set = f->diag[0].set, .binding = f->diag[0].binding,
+        .pool = f->diag[0].pool, .total = *sample,
+    };
+}
+
 static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     struct nvn_gpu_view_s *v = f->source;
     struct nvn_gpu_tex_s *s = v->tex;
@@ -213,6 +281,9 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (!rc_is(c->sticky, NVN_GPU_OK)) { if (fresh) nvn_gpu_tex_release(t); return 0; }
+    const int diag_on = c->diag_fb != NULL;
+    struct fb_diag_totals diag_sample;
+    if (diag_on) diag_sample = (struct fb_diag_totals){0};
     for (uint32_t lv = v->base_level; lv < v->base_level + v->levels; lv++) {
         // 3D 图像的 arrayLayer 必须为 0；范围位于 z，保留整级的全部切片。
         const int image3d = s->target == NVN_TEXTURE_TARGET_3D;
@@ -226,8 +297,15 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
             vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[1], 1, __ATOMIC_RELAXED);
+            if (diag_on) {
+                const uint64_t bytes = feedback_copy_bytes(s, &copy);
+                diag_sample.regions++;
+                diag_sample.bytes += bytes;
+                diag_sample.unknown += bytes == 0;
+            }
         }
     }
+    if (diag_on && diag_sample.regions) feedback_diag_record(c, f, &diag_sample);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     if (fresh) nvn_gpu_tex_release(t); // cmd 引用保活到 fence；raw view 在 finish_cmd 中先释放
@@ -295,15 +373,15 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             if (e->cls != b->cls) continue;
             struct nvn_gpu_view_s *v = b->cls == NVN_GPU_RES_TEX_SAMP ? b->u.ts.view :
                 (b->cls == NVN_GPU_RES_TEX || b->cls == NVN_GPU_RES_IMAGE) ? b->u.view : NULL;
-            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, writes, &read_mask, 0, &pool_skipped)) return 0;
+            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, st, e, writes, &read_mask, 0, &pool_skipped)) return 0;
         }
         if (c->pool_active) for (uint32_t i = 0; i < c->pipe->stage_nent[st] && i < 64; i++) {
             nvn_gpu_pool_table t = c->pool_binds[st][i];
             if (!t || t->kind != NVN_GPU_POOL_IMAGE) continue;
-            const uint32_t set = c->pipe->stage_ents[st][i].set;
+            const nvn_gpu_layout_ent *e = &c->pipe->stage_ents[st][i];
             if (!t->ikey) {   // 没有按图索引的表：逐项扫
                 for (uint32_t j = 0; j <= t->count; j++)
-                    if (!feedback_add(c, t->objects[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->objects[j], st, e, writes, &read_mask, 1, &pool_skipped)) return 0;
                 continue;
             }
             // 有索引：只看和本通道附件同一张图的视图（附件至多 9 个，深度与模板常同图，查过的图不重复查）
@@ -317,7 +395,7 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
                 uint32_t q = 0; while (q < k && !(att[q]->tex && (uint64_t)(uintptr_t)att[q]->tex->image == img)) q++;
                 if (!img || q < k) continue;
                 for (uint32_t j = pool_img_first(t, img); j != UINT32_MAX; j = t->unext[j])
-                    if (!feedback_add(c, t->uviews[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->uviews[j], st, e, writes, &read_mask, 1, &pool_skipped)) return 0;
             }
         }
     }
