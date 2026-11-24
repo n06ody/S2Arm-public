@@ -38,6 +38,7 @@
 // 弱链接[replay]：nvk_fu_item_ms
 // 弱链接[replay]：nvk_fu_unsafe_ms
 // 弱链接[replay]：nvk_pipe_warm_note_prog
+// 弱链接[replay]：nvn_vk_set_draw_pipe
 // 弱链接[replay]：nvk_shader_cs_lib_note
 // 弱链接[replay]：nvn_vk_pipe_demand_kick
 // 弱链接[replay]：nvn_vk_pipe_demand_mark
@@ -81,6 +82,7 @@ extern int s2a_nvn_rast_flip;   // hle_nvn.c：当前提交队列的正面光栅
 // 没有身份（失败项 / 还没算出来）就不记。np 是刚取到的后端管线：清单在它上面存一个标签，之后换回同一条
 // 管线只加计数（不序列化、不散列、不查表）。
 int nvk_pipe_warm_note_prog(const nvn_gpu_pipe_desc *d, const struct rp_prog *p, nvn_gpu_pipe np) __attribute__((weak));
+void nvn_vk_set_draw_pipe(nvn_gpu_cmd, nvn_gpu_pipe, const nvn_gpu_pipe_desc *) __attribute__((weak));
 const char *nvk_shader_cs_lib_note(const uint8_t key[8]) __attribute__((weak));   // 计算阶段键没走出包预编库的原因（诊断；苹果侧没有这个符号）
 
 // 句柄放在游戏用户常量缓冲里的贴图（NVN_RB_TEXU；语义照 iOS nvn_mtl.m ubo_read / ubo_handle / ubo_packed / ubo_tex_id / ubo_samp_id / bind_sid）。
@@ -2050,7 +2052,9 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         if (pf_have) rp_pfail_ok(&pfk);
         g_pipe = np; g_pipe_cmd = c;
         if (recipe_new && nvk_pipe_warm_note_prog) nvk_pipe_warm_note_prog(&pd, g_prog, np);   // 下一局按这份配方提前建（验收看后端 warm 命中）；np 带清单标签，已记过的管线只加计数
-        nvn_gpu_set_pipe(c, g_pipe); g_pipe_set = 1;
+        if (nvn_vk_set_draw_pipe) nvn_vk_set_draw_pipe(c, g_pipe, &pd);
+        else nvn_gpu_set_pipe(c, g_pipe);
+        g_pipe_set = 1;
         if (tm_) rp_perf_add(RP_PERF_D_PGET, dt_now() - pg0_);   // 后端取管线 + 设管线（含在取管线那一项里）
         // 换管线：只有绑定布局（set / binding / 类别 / 数量）变了的阶段才立脏重发；布局没变时后端按管线布局自己判描述符组归属。
         for (int st = 0; st < RP_PROG_STAGES; st++) if (!prog_layout_same(g_lb[st].ok ? g_lb[st].pg : NULL, g_prog, st)) rp_args_dirty[st] = 1;

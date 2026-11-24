@@ -190,6 +190,7 @@ struct nvn_gpu_pipe_s {
     uint32_t stage_nent[6];
     uint32_t stage_push_off[6], stage_push_bytes[6];
     nvn_gpu_pipe_desc key;
+    unsigned dynamic_mask;    // Vulkan 动态状态集与键使用同一能力决议
     uint32_t actual_samples; // 主机实际管线样本数；key 保留请求以匹配预热与查找。
     uint8_t warm;          // 1 = 这份对象是预热带 / 预热线程建的，真实 draw 第一次命中时计数（见 nvn_gpu_pipe_get）
     uint64_t warm_tag;     // 管线预热清单的标签（槽号 + 槽代号，见 nvn_vk_pipe_warm.h）；0 = 没设过。原子读写，随对象销毁
@@ -324,6 +325,15 @@ struct nvn_gpu_cmd_s {
     struct dset_use *dsu;                    // 本段从按布局回收表取过的描述符组：段完成时整批放回（放弃的段改为还给池）
     uint32_t ndsu, dsu_cap, dsu_gen;         // dsu_gen：取第一组时的回收表代际（g_dset_gen）；放回时代际变了 = 表和池都已随会话销毁，不能再碰
     struct nvn_gpu_pipe_s *pipe;
+    struct {
+        ds_st ds;
+        poly_st poly;
+        uint32_t prim;
+        uint8_t discard, restart;
+        va_st attr[16];
+        vs_st stream[16];
+        uint16_t used_streams;
+    } draw_pipe;
     struct pass_rec *passes;
     struct desc_memo *memo;   // 这一段里写过的描述符组：内容 → 组（见 bind_descriptor_groups）；懒分配，随段释放
     uint32_t memo_n;
@@ -381,6 +391,10 @@ struct nvn_gpu_cmd_s {
         uint8_t vp_ok, sc_ok, bc_ok, st_ok, db_ok, ib_ok;
         VkViewport vp; VkRect2D sc; float bc[4]; uint32_t st[2][3]; float db[3];
         uint16_t vb_ok; VkBuffer vb[16]; VkDeviceSize vboff[16];
+        uint16_t stride_ok;
+        VkDeviceSize stride[16];
+        uint8_t input_ok, ext_ok;
+        a_ext_state ext;
         VkBuffer ib; VkDeviceSize ioff; VkIndexType it;
         uint8_t push_ok[6]; VkPipelineLayout push_layout[6]; uint32_t push_off[6], push_bytes[6], push_gen[6];
     } es;
@@ -454,6 +468,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    _Atomic uint8_t vertex_format_support[NVN_FMT_MAX + 1]; // 0 未读，1 不支持，2 支持
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
@@ -2369,6 +2384,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         }
     }
     g.d = dev->device;
+    vk_dq_dynamic_init(dev);
     vk_dq_init(g.d);
     g.phys = dev->physical;
     g.queue = dev->queue;
@@ -3806,6 +3822,85 @@ static int eff_restart(const nvn_gpu_pipe_desc *d) {
                                t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY);
 }
 
+enum {
+    PIPE_EDS1 = 1u << 0,
+    PIPE_EDS2 = 1u << 1,
+    PIPE_VERTEX_INPUT = 1u << 2,
+    PIPE_VERTEX_STRIDE = 1u << 3,
+};
+
+// EDS1 不保证跨拓扑类。GS 另有输入图元契约，保留完整拓扑。
+static uint32_t pipe_prim_key(const nvn_gpu_pipe_desc *d, unsigned mask) {
+    if (!(mask & PIPE_EDS1) || d->st[NVN_GPU_SH_GS].sh) return d->prim;
+    switch (d->prim) {
+    case 0x3: return 0x1;
+    case 0x5: case 0x6: return 0x4;
+    default: return d->prim;
+    }
+}
+
+static int vertex_format_supported(uint32_t nvf) {
+    const uint32_t f = nvn_vattr_fmt_canon(nvf);
+    if (f > NVN_FMT_MAX || nvn_vattr_must_cpu_decode(nvf)) return 0;
+    uint8_t supported = atomic_load_explicit(&g.vertex_format_support[f], memory_order_relaxed);
+    if (!supported) {
+        VkFormatProperties props = {0};
+        uint8_t map[4];
+        const VkFormat vkf = nvn_vk_format(f);
+        if (vkf != VK_FORMAT_UNDEFINED && !nvn_vk_format_chanmap(f, map))
+            vkGetPhysicalDeviceFormatProperties(g.phys, vkf, &props);
+        supported = (props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 2 : 1;
+        atomic_store_explicit(&g.vertex_format_support[f], supported, memory_order_relaxed);
+    }
+    return supported == 2;
+}
+
+static unsigned pipe_dynamic_mask(const nvn_gpu_pipe_desc *d) {
+    if (!g.dev) return 0;
+    unsigned mask = (g.dev->eds1_enabled ? PIPE_EDS1 : 0) | (g.dev->eds2_enabled ? PIPE_EDS2 : 0);
+    if (!g.dev->vertex_input_dynamic_enabled && !(mask & PIPE_EDS1)) return mask;
+    int stride_ok = (mask & PIPE_EDS1) != 0;
+    int vertex_input_ok = g.dev->vertex_input_dynamic_enabled;
+    const VkPhysicalDeviceLimits *limits = &g.dev->properties.limits;
+    for (unsigned i = 0; i < 16; i++) {
+        const va_st a = d->attr[i];
+        if (!a.fmt) continue;
+        if (a.stream >= 16 || a.stream >= limits->maxVertexInputBindings ||
+            i >= limits->maxVertexInputAttributes || a.offset > limits->maxVertexInputAttributeOffset)
+            return mask;
+        const vs_st v = d->stream[a.stream];
+        if (v.stride > limits->maxVertexInputBindingStride ||
+            (v.divisor > 1 && (!g.dev->vertex_divisor_enabled || v.divisor > g.dev->max_vertex_attrib_divisor)))
+            return mask;
+        if (vertex_input_ok && !vertex_format_supported(a.fmt)) vertex_input_ok = 0;
+        // BindVertexBuffers2EXT requires a nonzero stride to cover every fetched attribute.
+        // Overlapping layouts are legal with static or full dynamic vertex input.
+        nvn_fmt_info info;
+        if (stride_ok && v.stride &&
+            (!nvn_fmt_info_of(nvn_vattr_fmt_canon(a.fmt), &info) || v.stride < a.offset + info.bytes))
+            stride_ok = 0;
+    }
+    if (vertex_input_ok) return mask | PIPE_VERTEX_INPUT;
+    return stride_ok ? mask | PIPE_VERTEX_STRIDE : mask;
+}
+
+struct pipe_state_key {
+    uint32_t prim, restart, dynamic_mask;
+    uint8_t discard, cull, front, offset;
+};
+
+static struct pipe_state_key pipe_state_key(const nvn_gpu_pipe_desc *d, unsigned mask) {
+    return (struct pipe_state_key){
+        .prim = pipe_prim_key(d, mask),
+        .restart = (mask & PIPE_EDS2) ? 0 : (uint32_t)eff_restart(d),
+        .dynamic_mask = mask,
+        .discard = (mask & PIPE_EDS2) ? 0 : d->rast_discard,
+        .cull = (mask & PIPE_EDS1) ? 0 : d->poly.cull,
+        .front = (mask & PIPE_EDS1) ? 0 : d->poly.front,
+        .offset = (mask & PIPE_EDS2) ? 0 : d->poly.offset_en,
+    };
+}
+
 // 散列把 same_pipe_desc 比的全部字段都算进来：着色器句柄、特化常量（只比到 nspec 条）、图元 / 格式 / 采样数 / patch_size、光栅丢弃 / 负一裁剪 /
 // 窗口原点 / 深度夹取、颜色格式、通道重映射、混合、颜色状态、写掩码、多重采样、顶点属性与顶点流两张表、深度模板、多边形。原先的散列只算了其中一部分：
 // 同着色器同状态、只差特化常量 / 顶点布局 / 通道重映射的管线全落在同一个桶里，要靠逐字段比才分得开。
@@ -3818,7 +3913,7 @@ static inline uint64_t pipe_mix(uint64_t h, const void *p, size_t n) {
     if (n) { uint64_t w = 0; memcpy(&w, b, n); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
     return h;
 }
-static uint32_t pipe_hash(const nvn_gpu_pipe_desc *d) {
+static uint32_t pipe_hash(const nvn_gpu_pipe_desc *d, unsigned mask) {
     uint64_t h = 0x9e3779b97f4a7c15ull;
     uintptr_t sh[5]; for (int i = 0; i < 5; i++) sh[i] = (uintptr_t)d->st[i].sh;
     h = pipe_mix(h, sh, sizeof sh);
@@ -3827,18 +3922,25 @@ static uint32_t pipe_hash(const nvn_gpu_pipe_desc *d) {
         h = pipe_mix(h, &ns, sizeof ns);
         if (ns && ns <= NVN_GPU_SPEC_MAX) h = pipe_mix(h, d->st[i].spec, (size_t)ns * sizeof d->st[i].spec[0]);
     }
-    const uint32_t v[6] = {(uint32_t)d->prim, (uint32_t)d->dfmt, (uint32_t)d->sfmt, (uint32_t)d->samples, (uint32_t)d->patch_size,
-                           (uint32_t)eff_restart(d)};   // #1102：same_pipe_desc 按实际生效的图元重启比
+    const struct pipe_state_key state = pipe_state_key(d, mask);
+    h = pipe_mix(h, &state, sizeof state);
+    const uint32_t v[] = {d->dfmt, d->sfmt, d->samples, d->patch_size};
     h = pipe_mix(h, v, sizeof v);
-    const uint8_t fl[4] = {d->rast_discard, d->clip_neg1, d->origin_ll, d->depth_clamp};
+    const uint8_t fl[] = {d->clip_neg1, d->origin_ll, d->depth_clamp, d->poly.mode};
     h = pipe_mix(h, fl, sizeof fl);
     h = pipe_mix(h, d->cfmt, sizeof d->cfmt); h = pipe_mix(h, d->lmap, sizeof d->lmap);
     h = pipe_mix(h, d->blend, sizeof d->blend); h = pipe_mix(h, &d->color, sizeof d->color);
-    h = pipe_mix(h, &d->chmask, sizeof d->chmask); h = pipe_mix(h, &d->ms, sizeof d->ms); h = pipe_mix(h, &d->ds, sizeof d->ds);
-    h = pipe_mix(h, d->attr, sizeof d->attr); h = pipe_mix(h, d->stream, sizeof d->stream);
-    {   // poly_st 的位域只占部分对象位；散列和相等判定都不能依赖填充位。
-        const uint8_t poly[] = {d->poly.cull, d->poly.front, d->poly.mode, d->poly.offset_en};
-        h = pipe_mix(h, poly, sizeof poly);
+    h = pipe_mix(h, &d->chmask, sizeof d->chmask); h = pipe_mix(h, &d->ms, sizeof d->ms);
+    if (!(mask & PIPE_EDS1)) h = pipe_mix(h, &d->ds, sizeof d->ds);
+    if (!(mask & PIPE_VERTEX_INPUT)) {
+        h = pipe_mix(h, d->attr, sizeof d->attr);
+        if (mask & PIPE_VERTEX_STRIDE) {
+            uint32_t divisors[16];
+            for (unsigned i = 0; i < 16; i++) divisors[i] = d->stream[i].divisor;
+            h = pipe_mix(h, divisors, sizeof divisors);
+        } else {
+            h = pipe_mix(h, d->stream, sizeof d->stream);
+        }
     }
     h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ull; h ^= h >> 33;
     return (uint32_t)(h ^ h >> 32);
@@ -3867,10 +3969,18 @@ static void pipe_ht_add(struct nvn_gpu_pipe_s *p) {
     p->hnext = g_pipe_ht[b]; g_pipe_ht[b] = p;
 }
 
-static int same_pipe_desc(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b) {
-    if (a->prim != b->prim || a->patch_size != b->patch_size || a->dfmt != b->dfmt || a->sfmt != b->sfmt ||
-        a->samples != b->samples || a->rast_discard != b->rast_discard || a->clip_neg1 != b->clip_neg1 ||
-        eff_restart(a) != eff_restart(b))
+static int same_pipe_vertex_input(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b, unsigned mask) {
+    if (mask & PIPE_VERTEX_INPUT) return 1;
+    if (memcmp(a->attr, b->attr, sizeof a->attr)) return 0;
+    if (!(mask & PIPE_VERTEX_STRIDE)) return !memcmp(a->stream, b->stream, sizeof a->stream);
+    for (unsigned i = 0; i < 16; i++) if (a->stream[i].divisor != b->stream[i].divisor) return 0;
+    return 1;
+}
+
+static int same_pipe_desc(const nvn_gpu_pipe_desc *a, unsigned am, const nvn_gpu_pipe_desc *b, unsigned bm) {
+    const struct pipe_state_key ak = pipe_state_key(a, am), bk = pipe_state_key(b, bm);
+    if (memcmp(&ak, &bk, sizeof ak) || a->patch_size != b->patch_size || a->dfmt != b->dfmt ||
+        a->sfmt != b->sfmt || a->samples != b->samples || a->clip_neg1 != b->clip_neg1)
         return 0;
     for (int i = 0; i < 5; i++)
         if (!same_spec(&a->st[i], &b->st[i])) return 0;
@@ -3881,12 +3991,10 @@ static int same_pipe_desc(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b
            memcmp(&a->color, &b->color, sizeof a->color) == 0 &&
            memcmp(&a->chmask, &b->chmask, sizeof a->chmask) == 0 &&
            memcmp(&a->ms, &b->ms, sizeof a->ms) == 0 &&
-           memcmp(a->attr, b->attr, sizeof a->attr) == 0 &&
-           memcmp(a->stream, b->stream, sizeof a->stream) == 0 &&
-           memcmp(&a->ds, &b->ds, sizeof a->ds) == 0 &&
-           a->poly.cull == b->poly.cull && a->poly.front == b->poly.front &&
-           a->poly.mode == b->poly.mode && a->poly.offset_en == b->poly.offset_en &&
-           a->origin_ll == b->origin_ll && a->depth_clamp == b->depth_clamp;
+           ((am & PIPE_EDS1) || memcmp(&a->ds, &b->ds, sizeof a->ds) == 0) &&
+           same_pipe_vertex_input(a, b, am) &&
+           a->poly.mode == b->poly.mode && a->origin_ll == b->origin_ll &&
+           a->depth_clamp == b->depth_clamp;
 }
 // 用例读写（android/tests/vk）：stat 的 which：0 散列桶数、1 图形管线数、2 累计逐字段比了的条数、3 累计取管线命中次数、4 累计链上走过的条数；
 // hash / same 是 pipe_hash / same_pipe_desc 的对外口子（「相等 ⇒ 散列相等」的性质用例用）；test_mode 的位见 g_pipe_ht_test。
@@ -3900,8 +4008,8 @@ uint64_t nvn_vk_dbg_pipe_stat(int which) {
     default: return 0;
     }
 }
-uint32_t nvn_vk_dbg_pipe_hash(const nvn_gpu_pipe_desc *d) { return pipe_hash(d); }
-int nvn_vk_dbg_pipe_same(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b) { return same_pipe_desc(a, b); }
+uint32_t nvn_vk_dbg_pipe_hash(const nvn_gpu_pipe_desc *d) { return pipe_hash(d, pipe_dynamic_mask(d)); }
+int nvn_vk_dbg_pipe_same(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b) { return same_pipe_desc(a, pipe_dynamic_mask(a), b, pipe_dynamic_mask(b)); }
 void nvn_vk_dbg_pipe_test_mode(int m) { g_pipe_ht_test = m; }
 
 // 创建管线的并发边界（P1：原先在 g_create_mu 下跑完整个 pipe_build，后台预热一条配方时，无关配方的
@@ -3995,10 +4103,9 @@ enum nvk_pipe_feedback_mode nvn_vk_pipe_creation_stats(struct nvk_pipe_creation_
 uint64_t nvn_gpu_pipe_warm_tag(nvn_gpu_pipe p) { return p ? __atomic_load_n(&((struct nvn_gpu_pipe_s *)p)->warm_tag, __ATOMIC_RELAXED) : 0; }
 void nvn_gpu_pipe_warm_tag_set(nvn_gpu_pipe p, uint64_t tag) { if (p) __atomic_store_n(&((struct nvn_gpu_pipe_s *)p)->warm_tag, tag, __ATOMIC_RELAXED); }
 
-// 缓存里按配方找一条图形管线（调用方持 g_mu）。散列只取描述里一部分字段（都是 same_pipe_desc 比的），
-// 相等与否仍由 same_pipe_desc 定。
-static struct nvn_gpu_pipe_s *pipe_find_locked(const nvn_gpu_pipe_desc *d) {
-    const uint32_t ph = pipe_hash(d);
+// 缓存里按配方找图形管线（调用方持 g_mu）。预热配方与现场绘制都按本设备实际的动态状态集比较。
+static struct nvn_gpu_pipe_s *pipe_find_locked(const nvn_gpu_pipe_desc *d, unsigned mask) {
+    const uint32_t ph = pipe_hash(d, mask);
     static int scan = -1; static uint32_t scan_n;   // 诊断开关 nvk_pipe_scan=1：走原来的整表逐条比（同一局里对比用），每 256 次取管线读一次
     if (scan < 0 || !(++scan_n & 255)) scan = nvn_plat_flag("nvk_pipe_scan", 0) != 0;
     const int walk_all = scan || !g_pipe_ht_n || (g_pipe_ht_test & 1);   // 表建不出来（内存不够）时退回整表逐条比：慢，答案不变
@@ -4009,7 +4116,7 @@ static struct nvn_gpu_pipe_s *pipe_find_locked(const nvn_gpu_pipe_desc *d) {
         steps++;
         if (q->hash != ph) continue;   // 存下的散列不同一定不同：不去碰 q->key 那一大块（计算管线的 hash 恒为 0，整表逐条比时也靠它跳过）
         cmp++;
-        if (same_pipe_desc(&q->key, d)) {
+        if (same_pipe_desc(&q->key, q->dynamic_mask, d, mask)) {
             if (g_draw_tm) { struct timespec lk1; clock_gettime(CLOCK_MONOTONIC, &lk1);   // 诊断读数：查找这一段用了多久、走了多少条、逐字段比了多少条
               __atomic_fetch_add(&g_pl_ns, (uint64_t)(lk1.tv_sec - lk0.tv_sec) * 1000000000ull + (uint64_t)lk1.tv_nsec - (uint64_t)lk0.tv_nsec, __ATOMIC_RELAXED); }
             __atomic_fetch_add(&g_pl_n, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_pl_steps, steps, __ATOMIC_RELAXED); __atomic_fetch_add(&g_pl_cmp, cmp, __ATOMIC_RELAXED);
@@ -4034,9 +4141,14 @@ static struct nvn_gpu_pipe_s *pipe_find_locked(const nvn_gpu_pipe_desc *d) {
 // nvn_gpu_pipe_desc，同一配方的判据与缓存一致（same_pipe_desc）。
 static nvk_pf g_pi;
 static pthread_once_t g_pi_once = PTHREAD_ONCE_INIT;
-static void pi_init(void) { nvk_pf_init(&g_pi, sizeof(nvn_gpu_pipe_desc)); }
+struct pipe_flight_key { nvn_gpu_pipe_desc desc; unsigned dynamic_mask; };
+_Static_assert(sizeof(struct pipe_flight_key) <= NVK_PF_KEY_MAX, "graphics flight key capacity");
+static void pi_init(void) { nvk_pf_init(&g_pi, sizeof(struct pipe_flight_key)); }
 static void pi_ensure(void) { pthread_once(&g_pi_once, pi_init); }
-static int pi_eq(const void *a, const void *b) { return same_pipe_desc((const nvn_gpu_pipe_desc *)a, (const nvn_gpu_pipe_desc *)b); }
+static int pi_eq(const void *a, const void *b) {
+    const struct pipe_flight_key *ka = a, *kb = b;
+    return same_pipe_desc(&ka->desc, ka->dynamic_mask, &kb->desc, kb->dynamic_mask);
+}
 
 static void destroy_pipe_objects(struct nvn_gpu_pipe_s *p) {
     if (!p) return;
@@ -4144,7 +4256,28 @@ static int pipe_vk_res_code(VkResult r, int fixed) {
     if (r == VK_ERROR_DEVICE_LOST) return NVN_GPU_E_DEVICE;
     return fixed;
 }
-static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
+static VkCullModeFlags pipe_cull(poly_st poly) {
+    // NVN 面位和 Vulkan 的 FRONT/BACK 位取值一致，这里仍显式转换。
+    return (poly.cull & NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : 0) |
+           (poly.cull & NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : 0);
+}
+
+static VkFrontFace pipe_front(poly_st poly, int origin_ll) {
+    // NVN 的正面绕序是 NDC y 朝上；Vulkan 按帧缓冲坐标判，视口未翻时绕序相反。
+    return ((poly.front != 0) != (origin_ll != 0)) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+}
+
+static VkStencilOpState pipe_stencil(ds_st ds, int back) {
+    return (VkStencilOpState){
+        .failOp = vk_stencil_op(back ? ds.fail_b : ds.fail_f),
+        .passOp = vk_stencil_op(back ? ds.zpass_b : ds.zpass_f),
+        .depthFailOp = vk_stencil_op(back ? ds.zfail_b : ds.zfail_f),
+        .compareOp = vk_depth_func(back ? ds.sf_b : ds.sf_f),
+        .compareMask = 0xff, .writeMask = 0xff,
+    };
+}
+
+static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, unsigned mask, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
     *out = NULL;
     const nvn_gpu_pipe_desc *requested = d;
     nvn_gpu_pipe_desc normalized;
@@ -4287,10 +4420,12 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         return fail(err, NVN_GPU_E_UNSUPPORTED, "管线 render pass 创建失败（附件格式 / 采样数）");
     }
 
+    // 静态丢弃不声明片元阶段（VUID-pStages-06894）；动态丢弃可以在下一笔恢复光栅化。
+    const int discard_static = !(mask & PIPE_EDS2) && d->rast_discard;
     VkPipelineShaderStageCreateInfo stages[5];
     uint32_t ns = 0;
     for (int st = 0; st < 5; st++) {
-        if (!d->st[st].sh) continue;
+        if (!d->st[st].sh || (discard_static && st == NVN_GPU_SH_FS)) continue;
         memset(&stages[ns], 0, sizeof stages[ns]);
         stages[ns].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[ns].stage = vk_shader_stage((nvn_gpu_stage)st);
@@ -4328,6 +4463,10 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
             return bad;
         }
         uint32_t stream = d->attr[i].stream;
+        if (stream >= 16) {
+            destroy_pipe_objects(p);
+            return fail(err, NVN_GPU_E_ARG, "顶点流 %u 越界", stream);
+        }
         int found = 0;
         for (uint32_t k = 0; k < nvb; k++) if (vb[k].binding == stream) found = 1;
         if (!found) {
@@ -4406,16 +4545,12 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     memset(&rs, 0, sizeof rs);
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = d->poly.mode == 0 ? VK_POLYGON_MODE_POINT : d->poly.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-    rs.cullMode = d->poly.cull == 1 ? VK_CULL_MODE_FRONT_BIT : d->poly.cull == 2 ? VK_CULL_MODE_BACK_BIT
-                 : d->poly.cull == 3 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE;
-    // 正面绕序（契约 v6）：poly.front 是 y 朝上的规范化设备坐标里的绕序。Vulkan 在帧缓冲坐标（y 朝下）里判正面：
-    // 视口不翻（原点左下，见 nvn_gpu_draw）时帧缓冲里看到的绕序与它相反；视口翻了（原点左上，负高度）时相同。
-    { int ccw_ndc = d->poly.front != 0, ccw_fb = d->origin_ll ? !ccw_ndc : ccw_ndc;
-      rs.frontFace = ccw_fb ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE; }
+    rs.cullMode = pipe_cull(d->poly);
+    rs.frontFace = pipe_front(d->poly, d->origin_ll);
     rs.lineWidth = 1.0f;
     rs.depthClampEnable = d->depth_clamp ? VK_TRUE : VK_FALSE;   // 设备特性 depthClamp 是必需项（vk_device.c）
     rs.depthBiasEnable = (d->poly.offset_en & (1u << d->poly.mode)) ? VK_TRUE : VK_FALSE;   // NVN 点 / 线 / 填充偏移位分别为 1 / 2 / 4
-    rs.rasterizerDiscardEnable = d->rast_discard ? VK_TRUE : VK_FALSE;
+    rs.rasterizerDiscardEnable = discard_static ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo ms;
     memset(&ms, 0, sizeof ms);
@@ -4435,8 +4570,8 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     }
     if (d->sfmt && d->ds.st) {   // 模板：比较函数与三种操作进管线；读掩码 / 写掩码 / 参考值是动态状态（apply_dyn）。通道没有模板附件时测试恒过，不开
         ds.stencilTestEnable = VK_TRUE;
-        ds.front = (VkStencilOpState){vk_stencil_op(d->ds.fail_f), vk_stencil_op(d->ds.zpass_f), vk_stencil_op(d->ds.zfail_f), vk_depth_func(d->ds.sf_f), 0xff, 0xff, 0};
-        ds.back = (VkStencilOpState){vk_stencil_op(d->ds.fail_b), vk_stencil_op(d->ds.zpass_b), vk_stencil_op(d->ds.zfail_b), vk_depth_func(d->ds.sf_b), 0xff, 0xff, 0};
+        ds.front = pipe_stencil(d->ds, 0);
+        ds.back = pipe_stencil(d->ds, 1);
     }
 
     VkLogicOp logic_op = vk_logic_op(d->color.logic_op);
@@ -4500,13 +4635,30 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     cbs.attachmentCount = ncb;
     cbs.pAttachments = cb;
 
-    VkDynamicState dyn[7] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+    VkDynamicState dyn[20] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
                              VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
                              VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dyns;
     memset(&dyns, 0, sizeof dyns);
     dyns.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dyns.dynamicStateCount = 7;
+    if (mask & PIPE_EDS1) {
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_OP_EXT;
+    }
+    if (mask & PIPE_EDS2) {
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE_EXT;
+        dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT;
+    }
+    if (mask & PIPE_VERTEX_INPUT) dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
+    if (mask & PIPE_VERTEX_STRIDE) dyn[dyns.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT;
     dyns.pDynamicStates = dyn;
 
     VkGraphicsPipelineCreateInfo gp;
@@ -4514,7 +4666,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gp.stageCount = ns;
     gp.pStages = stages;
-    gp.pVertexInputState = &vin;
+    gp.pVertexInputState = (mask & PIPE_VERTEX_INPUT) ? NULL : &vin;
     gp.pInputAssemblyState = &ia;
     gp.pViewportState = &vp;
     gp.pRasterizationState = &rs;
@@ -4584,6 +4736,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         }
     }
     p->actual_samples = d->samples > 1 ? d->samples : 1;
+    p->dynamic_mask = mask;
     p->key = *requested;   // 以原请求查找：预热、在途表与缓存使用同一身份。
     *out = p;
     return rc(NVN_GPU_OK);
@@ -4596,7 +4749,8 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
 //   destroy → 已有同配方的另一份时销毁这份新建的（不能出现两份同配方管线）
 static void *install_find(void *ctx, const void *key, size_t key_bytes) {
     (void)ctx; (void)key_bytes;
-    return pipe_find_locked((const nvn_gpu_pipe_desc *)key);
+    const struct nvn_gpu_pipe_s *fresh = key;
+    return pipe_find_locked(&fresh->key, fresh->dynamic_mask);
 }
 static void install_link(void *ctx, void *fresh) {
     (void)ctx;
@@ -4605,7 +4759,7 @@ static void install_link(void *ctx, void *fresh) {
         if (p->key.st[st].sh) p->key.st[st].sh->refs++;   // 管线持有
     p->all_next = g.pipes;
     g.pipes = p;
-    p->hash = pipe_hash(&p->key);
+    p->hash = pipe_hash(&p->key, p->dynamic_mask);
     pipe_ht_add(p);
     if (t_warm_scope) {   // 预热线程建的：打 warm 标记，等真实 draw 第一次命中
         p->warm = 1;
@@ -4623,7 +4777,7 @@ static void install_destroy(void *ctx, void *fresh) {
 static struct nvn_gpu_pipe_s *pipe_install_locked(struct nvn_gpu_pipe_s *fresh) {
     nvk_pipe_once_ops ops = { NULL, install_find, install_link, install_destroy };
     void *out = NULL;
-    int r = nvk_pipe_once_adopt(&ops, &fresh->key, sizeof fresh->key, fresh, &out);
+    int r = nvk_pipe_once_adopt(&ops, fresh, sizeof *fresh, fresh, &out);
     if (r < 0) {   // 不该发生（三个回调都在）：如实失败，调用方报红，不返回假成功
         destroy_pipe_objects(fresh);
         return NULL;
@@ -4646,8 +4800,9 @@ static void pipe_hit_note_locked(struct nvn_gpu_pipe_s *hit) {
 int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
     if (out) *out = NULL;
     if (!out || !d || !session_accepting()) return 0;
+    const unsigned mask = pipe_dynamic_mask(d);
     pthread_mutex_lock(&g_mu);
-    struct nvn_gpu_pipe_s *hit = pipe_find_locked(d);
+    struct nvn_gpu_pipe_s *hit = pipe_find_locked(d, mask);
     pthread_mutex_unlock(&g_mu);
     if (!hit) return 0;
     *out = hit;   // 后端缓存持有，核心不 release
@@ -4674,10 +4829,11 @@ static nvn_gpu_rc pipe_get_inner(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_p
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!d) return fail(err, NVN_GPU_E_ARG, "管线描述为空");
+    const unsigned mask = pipe_dynamic_mask(d);
 
     // ① 缓存命中（短锁）
     pthread_mutex_lock(&g_mu);
-    struct nvn_gpu_pipe_s *hit = pipe_find_locked(d);
+    struct nvn_gpu_pipe_s *hit = pipe_find_locked(d, mask);
     if (hit) {
         pipe_hit_note_locked(hit);
         pthread_mutex_unlock(&g_mu);
@@ -4689,7 +4845,8 @@ static nvn_gpu_rc pipe_get_inner(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_p
     // ② 在途表：同配方合并成一份创建；不同配方互不等待（逻辑在 nvn_pipe_flight.c）
     pi_ensure();
     int handle = -1;
-    const int role = nvk_pf_enter(&g_pi, d, pi_eq, &handle);   // 1 = 我是建者 / 2 = 等别人 / 0 = 表满或停用
+    const struct pipe_flight_key flight = {*d, mask};
+    const int role = nvk_pf_enter(&g_pi, &flight, pi_eq, &handle);   // 1 = 我是建者 / 2 = 等别人 / 0 = 表满或停用
     if (role == 2) {
         void *got = NULL;
         char gwhy[NVK_PF_WHY];
@@ -4711,7 +4868,7 @@ static nvn_gpu_rc pipe_get_inner(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_p
 
     // ③ 认领后复检缓存（只拿 g_mu 看一眼；锁顺序固定为「先缓存、后表」）
     pthread_mutex_lock(&g_mu);
-    struct nvn_gpu_pipe_s *late = pipe_find_locked(d);
+    struct nvn_gpu_pipe_s *late = pipe_find_locked(d, mask);
     if (late) {
         pipe_hit_note_locked(late);
         pthread_mutex_unlock(&g_mu);
@@ -4731,10 +4888,10 @@ static nvn_gpu_rc pipe_get_inner(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_p
     nvn_gpu_rc br;
     if (pipe_serial_on()) {
         pthread_mutex_lock(&g_create_mu);
-        br = pipe_build(d, &fresh, err);
+        br = pipe_build(d, mask, &fresh, err);
         pthread_mutex_unlock(&g_create_mu);
     } else {
-        br = pipe_build(d, &fresh, err);
+        br = pipe_build(d, mask, &fresh, err);
     }
     if (!nvn_gpu_ok(br)) {
         if (own) nvk_pf_publish(&g_pi, handle, NULL, br.code, err ? err->why : NULL);   // 同配方的等待者拿到同一个错误
@@ -5668,7 +5825,7 @@ static int ensure_push_capacity(struct nvn_gpu_cmd_s *c, int st, uint32_t requir
     return 1;
 }
 
-void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
+static void set_draw_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph, const nvn_gpu_pipe_desc *desc) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     struct nvn_gpu_pipe_s *p = ph;
@@ -5685,6 +5842,33 @@ void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
     }
     if (c->pipe != ph && c->pool_active) { memset(c->pool_binds, 0, sizeof c->pool_binds); c->pool_active = 0; }
     c->pipe = ph;
+    if (!p->dynamic_mask) return;
+    const nvn_gpu_pipe_desc *d = desc ? desc : &p->key;
+    c->draw_pipe.ds = d->ds;
+    c->draw_pipe.poly = d->poly;
+    c->draw_pipe.prim = d->prim;
+    c->draw_pipe.discard = d->rast_discard;
+    c->draw_pipe.restart = (uint8_t)eff_restart(d);
+    if ((p->dynamic_mask & (PIPE_VERTEX_INPUT | PIPE_VERTEX_STRIDE)) &&
+        (memcmp(c->draw_pipe.attr, d->attr, sizeof d->attr) ||
+         memcmp(c->draw_pipe.stream, d->stream, sizeof d->stream))) {
+        memcpy(c->draw_pipe.attr, d->attr, sizeof d->attr);
+        memcpy(c->draw_pipe.stream, d->stream, sizeof d->stream);
+        c->draw_pipe.used_streams = 0;
+        for (unsigned i = 0; i < 16; i++) {
+            if (d->attr[i].fmt) c->draw_pipe.used_streams |= (uint16_t)(1u << d->attr[i].stream);
+        }
+        c->es.input_ok = 0;
+    }
+}
+
+void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
+    set_draw_pipe(ch, ph, NULL);
+}
+
+// The pipeline object may have been built from another draw or an older warm recipe.
+void nvn_vk_set_draw_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph, const nvn_gpu_pipe_desc *desc) {
+    set_draw_pipe(ch, ph, desc);
 }
 
 void nvn_gpu_set_dyn(nvn_gpu_cmd ch, const nvn_gpu_dyn *d) {
@@ -6267,6 +6451,10 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
 // 开通道时 pass_flush_pending 已经把「附件布局」都转成只读采样布局，所以通道里采样不需要迁移；
 // 重叠采样先走快照；同图不重叠的采样仍要共享整图布局，退到 GENERAL。
 // 存储图像要 GENERAL 而它现在是只读布局时，也在通道外迁移（见 pass_reopen）。
+static ds_st draw_depth_stencil(const struct nvn_gpu_cmd_s *c) {
+    return (c->pipe->dynamic_mask & PIPE_EDS1) ? c->draw_pipe.ds : c->pipe->key.ds;
+}
+
 #include "backend_vulkan_feedback.inc"
 
 static int prepare_bind_layouts(struct nvn_gpu_cmd_s *c, int compute) {
@@ -6319,6 +6507,72 @@ static inline int diag_draw_mode(void) {
     if (__builtin_expect(dm != 1, 1)) { call; if (__builtin_expect(dm == 2, 0)) { call; } } \
 } while (0)
 
+static void emit_vertex_input(struct nvn_gpu_cmd_s *c) {
+    VkVertexInputBindingDescription2EXT bindings[16];
+    VkVertexInputAttributeDescription2EXT attributes[16];
+    uint32_t nb = 0, na = 0;
+    for (unsigned slot = 0; slot < 16; slot++) {
+        if (c->draw_pipe.used_streams >> slot & 1u) {
+            const vs_st stream = c->draw_pipe.stream[slot];
+            bindings[nb++] = (VkVertexInputBindingDescription2EXT){
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+                .binding = slot, .stride = stream.stride,
+                .inputRate = stream.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
+                .divisor = stream.divisor ? stream.divisor : 1,
+            };
+        }
+        const va_st attr = c->draw_pipe.attr[slot];
+        if (attr.fmt) {
+            attributes[na++] = (VkVertexInputAttributeDescription2EXT){
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .location = slot, .binding = attr.stream, .offset = attr.offset,
+                .format = nvn_vk_format(nvn_vattr_fmt_canon(attr.fmt)),
+            };
+        }
+    }
+    w_ext_input(c->cb, nb, bindings, na, attributes);
+    c->es.input_ok = 1;
+}
+
+static int pipe_discards_statically(const struct nvn_gpu_pipe_s *p) {
+    return !(p->dynamic_mask & PIPE_EDS2) && p->key.rast_discard;
+}
+
+static void emit_extended_draw_state(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p) {
+    const unsigned mask = p->dynamic_mask;
+    a_ext_state ext = {0};
+    const poly_st poly = c->draw_pipe.poly;
+    if (mask & PIPE_EDS1) {
+        const ds_st ds = c->draw_pipe.ds;
+        ext.groups |= DQ_EDS_RASTER;
+        ext.cull = pipe_cull(poly);
+        ext.front = pipe_front(poly, p->key.origin_ll);
+        ext.topology = vk_topology(c->draw_pipe.prim);
+        // 静态丢弃的管线没有片元状态，VVL 不会把这些项识别为动态声明。
+        if (!pipe_discards_statically(p)) {
+            ext.groups |= DQ_EDS_DS;
+            ext.depth_test = p->key.dfmt && ds.dt;
+            ext.depth_write = p->key.dfmt && ds.dw;
+            ext.depth_compare = vk_depth_func(ds.df);
+            ext.stencil_test = p->key.sfmt && ds.st;
+            ext.stencil[0] = pipe_stencil(ds, 0);
+            ext.stencil[1] = pipe_stencil(ds, 1);
+        }
+    }
+    if (mask & PIPE_EDS2) {
+        ext.groups |= DQ_EDS_BASE2;
+        ext.discard = c->draw_pipe.discard != 0;
+        ext.bias = (poly.offset_en & (1u << poly.mode)) != 0;
+        ext.restart = c->draw_pipe.restart != 0;
+    }
+    if (ext.groups && (!c->es.ext_ok || memcmp(&c->es.ext, &ext, sizeof ext))) {
+        w_ext_state(c->cb, &ext);
+        c->es.ext = ext;
+        c->es.ext_ok = 1;
+    }
+    if ((mask & PIPE_VERTEX_INPUT) && !c->es.input_ok) emit_vertex_input(c);
+}
+
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     draw_tm_init();   // 诊断：这笔绘制各段用时（nvk_gputime 开着才计）
     const int dtm = g_draw_tm; const uint64_t dt0 = dtm ? now_ns() : 0;
@@ -6349,8 +6603,9 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "图元 %u 未实现（线环 / quads 等）", a->prim); return;
     }
     struct nvn_gpu_pipe_s *p = c->pipe;
-    if (a->prim != p->key.prim) {
-        set_sticky(c, NVN_GPU_E_ARG, "draw prim %u 与管线拓扑 %u 不一致", a->prim, p->key.prim);
+    const uint32_t prim = (p->dynamic_mask & PIPE_EDS1) ? c->draw_pipe.prim : p->key.prim;
+    if (a->prim != prim) {
+        set_sticky(c, NVN_GPU_E_ARG, "draw prim %u 与管线拓扑 %u 不一致", a->prim, prim);
         return;
     }
     if (!prepare_bind_layouts(c, 0)) return;   // 采样 / 存储图的布局先到位（可能拆通道），再写描述符
@@ -6367,70 +6622,100 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
             c->es.push_bytes[st] = p->stage_push_bytes[st]; c->es.push_gen[st] = c->push_gen[st]; c->es_count[ES_PUSH]++;
         }
     if (c->has_dyn && (c->dyn.origin_ll != 0) != (p->key.origin_ll != 0)) { set_sticky(c, NVN_GPU_E_ARG, "绘制时的窗口原点（左下 = %d）与管线描述里的不一致", (int)c->dyn.origin_ll); return; }
-    // 换游戏管线不动动态状态：所有游戏管线声明的动态状态是同一组（见建管线处的 dyn[7]），按规范切换时保留；
-    // 只声明了一部分的管线（矩形清除的）用过之后整份影子作废（nvn_gpu_clear_rect）。
-    if (!c->es.gpipe || c->es.gpipe != p->pipe) { vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe); c->es.gpipe = p->pipe; c->es_count[ES_PIPE]++; }
-    VkViewport vp;
-    if (c->has_dyn && c->dyn.nvp) {
-        vp = (VkViewport){c->dyn.vp[0][0], c->dyn.vp[0][1], c->dyn.vp[0][2], c->dyn.vp[0][3], c->dyn.vp[0][4], c->dyn.vp[0][5]};
-    } else {
-        vp = (VkViewport){0, 0, (float)c->pass_w, (float)c->pass_h, 0.0f, 1.0f};
+    if (c->es.gpipe != p->pipe) {
+        vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
+        c->es.gpipe = p->pipe;
+        c->es_count[ES_PIPE]++;
+        // Some recipes retain static vertex input. Re-establish extended state after a bind.
+        c->es.ext_ok = c->es.input_ok = 0;
+        c->es.stride_ok = 0;
     }
-    // NVN 窗口原点在左上时，裁剪空间 +y 落在图的上方（行号小的一边）；Vulkan 的 +y 朝下（行号大的一边）：用负高度的视口翻过来。
-    // 原点在左下（NVN 默认）时两边的行号方向一致，不翻；那种图是自下而上存的，由呈现时翻（present_desc.flip_y）。
-    if (c->has_dyn && !c->dyn.origin_ll) { vp.y += vp.height; vp.height = -vp.height; }
-    VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
-    if (c->has_dyn && c->dyn.has_sc)
-        sc = (VkRect2D){{c->dyn.sc[0], c->dyn.sc[1]}, {(uint32_t)c->dyn.sc[2], (uint32_t)c->dyn.sc[3]}};
-    // 浮点按位比（memcmp）：-0 与 +0、NaN 各按自己的位，宁可多发不漏发
-    if (!c->es.vp_ok || memcmp(&c->es.vp, &vp, sizeof vp)) { vkCmdSetViewport(c->cb, 0, 1, &vp); c->es.vp = vp; c->es.vp_ok = 1; c->es_count[ES_VP]++; }
-    if (!c->es.sc_ok || memcmp(&c->es.sc, &sc, sizeof sc)) { vkCmdSetScissor(c->cb, 0, 1, &sc); c->es.sc = sc; c->es.sc_ok = 1; c->es_count[ES_SC]++; }
-    const float bc[4] = {c->dyn.blend_color[0], c->dyn.blend_color[1], c->dyn.blend_color[2], c->dyn.blend_color[3]};
-    if (!c->es.bc_ok || memcmp(c->es.bc, bc, sizeof bc)) { vkCmdSetBlendConstants(c->cb, bc); memcpy(c->es.bc, bc, sizeof bc); c->es.bc_ok = 1; c->es_count[ES_BC]++; }
-    // 模板的三个动态量：下标 0 = 正面、1 = 背面（NVN 的面位）。没发过动态状态时用 NVN 缺省（掩码全开、参考值 0）
-    {
-        uint32_t stv[2][3];
-        for (int f = 0; f < 2; f++) {
-            stv[f][0] = c->has_dyn ? c->dyn.st_vmask[f] & 0xffu : 0xffu;
-            stv[f][1] = c->has_dyn ? c->dyn.st_wmask[f] & 0xffu : 0xffu;
-            stv[f][2] = c->has_dyn ? c->dyn.st_ref[f] & 0xffu : 0u;
+    if (p->dynamic_mask) emit_extended_draw_state(c, p);
+    if (!pipe_discards_statically(p)) {
+        VkViewport vp;
+        if (c->has_dyn && c->dyn.nvp) {
+            vp = (VkViewport){c->dyn.vp[0][0], c->dyn.vp[0][1], c->dyn.vp[0][2], c->dyn.vp[0][3], c->dyn.vp[0][4], c->dyn.vp[0][5]};
+        } else {
+            vp = (VkViewport){0, 0, (float)c->pass_w, (float)c->pass_h, 0.0f, 1.0f};
         }
-        if (!c->es.st_ok || memcmp(c->es.st, stv, sizeof stv)) {
+        // NVN 窗口原点在左上时，裁剪空间 +y 落在图的上方（行号小的一边）；Vulkan 的 +y 朝下（行号大的一边）：用负高度的视口翻过来。
+        // 原点在左下（NVN 默认）时两边的行号方向一致，不翻；那种图是自下而上存的，由呈现时翻（present_desc.flip_y）。
+        if (c->has_dyn && !c->dyn.origin_ll) { vp.y += vp.height; vp.height = -vp.height; }
+        VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
+        if (c->has_dyn && c->dyn.has_sc)
+            sc = (VkRect2D){{c->dyn.sc[0], c->dyn.sc[1]}, {(uint32_t)c->dyn.sc[2], (uint32_t)c->dyn.sc[3]}};
+        // 浮点按位比（memcmp）：-0 与 +0、NaN 各按自己的位，宁可多发不漏发
+        if (!c->es.vp_ok || memcmp(&c->es.vp, &vp, sizeof vp)) { vkCmdSetViewport(c->cb, 0, 1, &vp); c->es.vp = vp; c->es.vp_ok = 1; c->es_count[ES_VP]++; }
+        if (!c->es.sc_ok || memcmp(&c->es.sc, &sc, sizeof sc)) { vkCmdSetScissor(c->cb, 0, 1, &sc); c->es.sc = sc; c->es.sc_ok = 1; c->es_count[ES_SC]++; }
+        const float bc[4] = {c->dyn.blend_color[0], c->dyn.blend_color[1], c->dyn.blend_color[2], c->dyn.blend_color[3]};
+        if (!c->es.bc_ok || memcmp(c->es.bc, bc, sizeof bc)) { vkCmdSetBlendConstants(c->cb, bc); memcpy(c->es.bc, bc, sizeof bc); c->es.bc_ok = 1; c->es_count[ES_BC]++; }
+        // 模板的三个动态量：下标 0 = 正面、1 = 背面（NVN 的面位）。没发过动态状态时用 NVN 缺省（掩码全开、参考值 0）
+        {
+            uint32_t stv[2][3];
             for (int f = 0; f < 2; f++) {
-                VkStencilFaceFlags face = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
-                vkCmdSetStencilCompareMask(c->cb, face, stv[f][0]);
-                vkCmdSetStencilWriteMask(c->cb, face, stv[f][1]);
-                vkCmdSetStencilReference(c->cb, face, stv[f][2]);
+                stv[f][0] = c->has_dyn ? c->dyn.st_vmask[f] & 0xffu : 0xffu;
+                stv[f][1] = c->has_dyn ? c->dyn.st_wmask[f] & 0xffu : 0xffu;
+                stv[f][2] = c->has_dyn ? c->dyn.st_ref[f] & 0xffu : 0u;
             }
-            memcpy(c->es.st, stv, sizeof stv); c->es.st_ok = 1; c->es_count[ES_ST]++;
+            if (!c->es.st_ok || memcmp(c->es.st, stv, sizeof stv)) {
+                for (int f = 0; f < 2; f++) {
+                    VkStencilFaceFlags face = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+                    vkCmdSetStencilCompareMask(c->cb, face, stv[f][0]);
+                    vkCmdSetStencilWriteMask(c->cb, face, stv[f][1]);
+                    vkCmdSetStencilReference(c->cb, face, stv[f][2]);
+                }
+                memcpy(c->es.st, stv, sizeof stv); c->es.st_ok = 1; c->es_count[ES_ST]++;
+            }
         }
-    }
-    // 深度偏移（NVN SetPolygonOffsetClamp：factor 乘斜率、units 乘最小可分辨深度差、clamp 限幅）。管线没开偏移时这三个量不起作用，照发 0。
-    {
-        const p_poly_offset *po = &c->dyn.po;
-        int on = c->has_dyn && (p->key.poly.offset_en & (1u << p->key.poly.mode));
-        if (on && po->clamp != 0.0f && !g.dev->core_features.depthBiasClamp) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度偏移带限幅（clamp=%g），设备没有 depthBiasClamp", (double)po->clamp); return; }
-        const float db[3] = {on ? po->units : 0.0f, on ? po->clamp : 0.0f, on ? po->factor : 0.0f};
-        if (!c->es.db_ok || memcmp(c->es.db, db, sizeof db)) { vkCmdSetDepthBias(c->cb, db[0], db[1], db[2]); memcpy(c->es.db, db, sizeof db); c->es.db_ok = 1; c->es_count[ES_DB]++; }
+        // 深度偏移（NVN SetPolygonOffsetClamp：factor 乘斜率、units 乘最小可分辨深度差、clamp 限幅）。管线没开偏移时这三个量不起作用，照发 0。
+        {
+            const p_poly_offset *po = &c->dyn.po;
+            const poly_st poly = (p->dynamic_mask & PIPE_EDS2) ? c->draw_pipe.poly : p->key.poly;
+            int on = c->has_dyn && (poly.offset_en & (1u << poly.mode));
+            if (on && po->clamp != 0.0f && !g.dev->core_features.depthBiasClamp) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度偏移带限幅（clamp=%g），设备没有 depthBiasClamp", (double)po->clamp); return; }
+            const float db[3] = {on ? po->units : 0.0f, on ? po->clamp : 0.0f, on ? po->factor : 0.0f};
+            if (!c->es.db_ok || memcmp(c->es.db, db, sizeof db)) { vkCmdSetDepthBias(c->cb, db[0], db[1], db[2]); memcpy(c->es.db, db, sizeof db); c->es.db_ok = 1; c->es_count[ES_DB]++; }
+        }
+    } else {
+        // 静态丢弃期间没有使用这些状态；恢复光栅化的首笔重新发出。
+        c->es.vp_ok = c->es.sc_ok = c->es.bc_ok = c->es.st_ok = c->es.db_ok = 0;
     }
     const uint64_t dt2 = dtm ? now_ns() : 0;
-    uint32_t changed_vbuf = 0;
-    for (uint32_t s = 0; s < 16; s++) {
-        if (!c->vbuf[s].buf) continue;
-        VkBuffer vb = c->vbuf[s].buf->buffer;
-        VkDeviceSize off = c->vbuf[s].off;
-        if ((c->es.vb_ok >> s & 1) && c->es.vb[s] == vb && c->es.vboff[s] == off) continue;
-        c->es.vb[s] = vb; c->es.vboff[s] = off; c->es.vb_ok |= (uint16_t)(1u << s);
-        changed_vbuf |= 1u << s;
+    uint32_t changed_vbuf = 0, changed_stride = 0;
+    const uint32_t dynamic_strides = (p->dynamic_mask & PIPE_VERTEX_STRIDE) ? c->draw_pipe.used_streams : 0;
+    for (uint32_t slot = 0; slot < 16; slot++) {
+        if (!c->vbuf[slot].buf) continue;
+        const uint32_t bit = 1u << slot;
+        const VkBuffer vb = c->vbuf[slot].buf->buffer;
+        const VkDeviceSize off = c->vbuf[slot].off;
+        const int changed = !(c->es.vb_ok & bit) || c->es.vb[slot] != vb || c->es.vboff[slot] != off;
+        if (dynamic_strides & bit) {
+            const VkDeviceSize stride = c->draw_pipe.stream[slot].stride;
+            if (changed || !(c->es.stride_ok & bit) || c->es.stride[slot] != stride) {
+                c->es.stride[slot] = stride;
+                c->es.stride_ok |= (uint16_t)bit;
+                changed_stride |= bit;
+            }
+        } else {
+            if (!changed) continue;
+            changed_vbuf |= bit;
+        }
+        c->es.vb[slot] = vb;
+        c->es.vboff[slot] = off;
+        c->es.vb_ok |= (uint16_t)bit;
     }
-    // 只发送连续的变化槽。位图仅低 16 位，按首槽右移后取反必非零，可数出这一段的连续 1。
-    // 两级录制入队时复制数组，保活仍由 nvn_gpu_set_vbuf 按缓冲登记。
-    while (changed_vbuf) {
-        uint32_t first = (uint32_t)__builtin_ctz(changed_vbuf);
-        uint32_t count = g.vbuf_batch ? (uint32_t)__builtin_ctz(~(changed_vbuf >> first)) : 1;
-        vkCmdBindVertexBuffers(c->cb, first, count, c->es.vb + first, c->es.vboff + first);
+    // Each call covers only contiguous changed slots. The DQ retains copies of the arrays.
+    while (changed_vbuf || changed_stride) {
+        const uint32_t first = (uint32_t)__builtin_ctz(changed_vbuf | changed_stride);
+        const int stride = (changed_stride >> first) & 1u;
+        uint32_t *changed = stride ? &changed_stride : &changed_vbuf;
+        const uint32_t count = g.vbuf_batch ? (uint32_t)__builtin_ctz(~(*changed >> first)) : 1;
+        if (stride)
+            w_ext_stride(c->cb, first, count, c->es.vb + first, c->es.vboff + first, c->es.stride + first);
+        else
+            vkCmdBindVertexBuffers(c->cb, first, count, c->es.vb + first, c->es.vboff + first);
         c->es_count[ES_VB]++;
-        changed_vbuf &= ~(((1u << count) - 1) << first);
+        *changed &= ~(((1u << count) - 1) << first);
     }
     uint32_t inst = a->instances ? a->instances : 1;
     uint32_t draws = a->max_draws ? a->max_draws : 1;

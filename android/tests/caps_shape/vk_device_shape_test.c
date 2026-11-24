@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    EXPECT(!d.eds1_enabled && !d.eds2_enabled && !d.vertex_input_dynamic_enabled,
+           "动态状态三项必须缺省关");
     // 格式列表（C2，保 Adreno UBWC 那条）：设备列出 VK_KHR_image_format_list 才走列表模式，没列出走自由 MUTABLE
     const int fmt_list = cs_has_ext(s, "VK_KHR_image_format_list");
     EXPECT(d.image_format_list_enabled == fmt_list, "image_format_list_enabled=%d，形态档列出扩展=%d", d.image_format_list_enabled, fmt_list);
