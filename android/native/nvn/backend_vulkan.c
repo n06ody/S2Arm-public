@@ -8775,6 +8775,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
     if (g.land_auto) {
+        if (g.land_reported == 2) la_end(&g.land_trial);  // 保留退出后迟到的段也按已报决策取模式
         if (g.land_trial.mode && !g.land_trial.reason) land_auto_check_gap_locked(now_ns());
         c->land_mode = g.land_trial.mode;
         c->land_observe = !g.land_trial.reason;

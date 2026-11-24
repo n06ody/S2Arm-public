@@ -5,10 +5,15 @@ extern int dm_thermal_now(void);
 extern int s2a_android_host_lifecycle(uint64_t*);
 extern uint64_t nvk_shader_live_compile_total(void) __attribute__((weak));
 
+// Present and the worker take this after g_mu when changing report fields.
+// Retained Stop/Destroy can read the last complete windows without waiting on
+// a renderer or Vulkan driver call. No path takes g_mu while holding this lock.
+static pthread_mutex_t land_report_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void land_auto_log_locked(int exiting) {
   struct la_trial* t = &g.land_trial;
   int phase = exiting ? 2 : 1;
-  if (!t->reason || g.land_reported >= phase)
+  if (g.land_reported >= phase || (!exiting && !t->reason))
     return;
   if (!g.land_reported) {
 #ifdef CLOCK_BOOTTIME
@@ -17,6 +22,8 @@ static void land_auto_log_locked(int exiting) {
       t->decision_boottime_ns = (uint64_t)stamp.tv_sec * LA_SECOND + stamp.tv_nsec;
 #endif
   }
+  const char* reason = t->reason ? t->reason : LA_REASON_OFF_INSUFFICIENT_SAMPLES;
+  int mode = t->reason ? t->mode : 0;
   g.land_reported = phase;
   char msg[3900];
   int pos = snprintf(
@@ -24,7 +31,7 @@ static void land_auto_log_locked(int exiting) {
       "回写自动决策 phase=%s mode=%d reason=%s decision_boottime_ns=%llu qualified_windows=%d invalid=%d AA_pairs=%d gain_gate=%.3f "
       "window=frames/fps/p99ms/tailfps/tailp99ms/acqMean,p95,p99ms/presentMean,p95,p99ms/"
       "eligibleB,spans,subs/staged,bytes/direct/allocs/drawsPerFrame/long33,long100,tail33,tail100",
-      exiting ? "exit" : "lock", t->mode, t->reason, (unsigned long long)t->decision_boottime_ns, t->qualified, t->rejected, t->windows[LA_AA - 1].frames ? LA_AA / 2 : 0,
+      exiting ? "exit" : "lock", mode, reason, (unsigned long long)t->decision_boottime_ns, t->qualified, t->rejected, t->windows[LA_AA - 1].frames ? LA_AA / 2 : 0,
       fmax(.05, t->noise[LA_FPS]));
   for (int i = 0; i < LA_WINDOWS; i++) {
     const struct la_window* w = &t->windows[i];
@@ -45,16 +52,27 @@ static void land_auto_log_locked(int exiting) {
   }
   nvn_plat_log(NVN_PLAT_LOG_INFO, "land-readback", msg);
 }
+void nvn_vk_land_auto_report_exit(void) {
+  if (!g.land_auto)
+    return;
+  pthread_mutex_lock(&land_report_mu);
+  land_auto_log_locked(1);
+  pthread_mutex_unlock(&land_report_mu);
+}
 static void land_auto_exit_locked(void) {
   if (g.land_auto) {
+    pthread_mutex_lock(&land_report_mu);
     la_end(&g.land_trial);
     land_auto_log_locked(1);
+    pthread_mutex_unlock(&land_report_mu);
   }
 }
 static void land_auto_check_gap_locked(uint64_t now) {
   struct la_trial* t = &g.land_trial;
   if (!t->reason && t->mode && t->prev && now > t->prev && now - t->prev >= 5 * LA_SECOND) {
+    pthread_mutex_lock(&land_report_mu);
     la_discard(t);
+    pthread_mutex_unlock(&land_report_mu);
     t->prev = 0;
     g.land_prior_live = g.land_live_count;
   }
@@ -69,7 +87,9 @@ void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present,
   uint64_t compile = nvk_shader_live_compile_total ? nvk_shader_live_compile_total() : 0;
   pthread_mutex_lock(&g_mu);
   struct la_trial* t = &g.land_trial;
-  if (g.closing || t->reason) {
+  pthread_mutex_lock(&land_report_mu);
+  if (g.closing || g.land_reported) {
+    pthread_mutex_unlock(&land_report_mu);
     pthread_mutex_unlock(&g_mu);
     return;
   }
@@ -89,6 +109,7 @@ void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present,
       memset(t->noise, 0, sizeof t->noise);
       t->epoch++;
     }
+    t->empty_windows = 0;
     t->environment_set = 0;
   } else {
     t->environment_set = 1;
@@ -101,5 +122,6 @@ void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present,
   if (t->epoch != previous_epoch)
     g.land_prior_live = g.land_live_count;
   land_auto_log_locked(0);
+  pthread_mutex_unlock(&land_report_mu);
   pthread_mutex_unlock(&g_mu);
 }

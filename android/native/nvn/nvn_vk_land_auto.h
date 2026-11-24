@@ -15,6 +15,9 @@ enum {
   LA_MAX_FRAMES = 2048,
   LA_MIN_FRAMES = 50
 };
+// Active provider retirement bypasses backend close. Safe with a live renderer.
+void nvn_vk_land_auto_report_exit(void);
+
 // Decision log ABI, shared with the field-run parser.
 #define LA_REASON_ON_PAIRED_GAIN "paired_gain"
 #define LA_REASON_OFF_INSUFFICIENT_SAMPLES "insufficient_samples"
@@ -64,7 +67,7 @@ struct la_trial {
   struct la_counts counts, initial;
   uint64_t start, prev, draws, life, compile, decision_boottime_ns;
   int thermal, target, index, environment_set, mode, recovering, rejected, qualified, epoch;
-  unsigned n;
+  unsigned n, empty_windows;
   const char* reason;
 };
 static inline void la_lock(struct la_trial* t, int on, const char* reason) {
@@ -81,6 +84,7 @@ static inline void la_end(struct la_trial* t) {
 static inline void la_discard(struct la_trial* t) {
   t->n = 0;
   t->start = 0;
+  t->empty_windows = 0;
   t->rejected++;
   if (t->mode) {
     t->mode = 0;
@@ -232,11 +236,14 @@ static inline void la_frame(struct la_trial* t, uint64_t now, uint64_t acquire, 
     t->prev = 0;
   }
   if (stale) {
+    t->empty_windows = 0;
     t->start = 0;
     t->n = 0;
     return;
   }
   if (!t->start) {
+    if (t->counts.bytes != t->initial.bytes)
+      t->empty_windows = 0;
     t->start = t->prev = now;
     t->draws = draws;
     t->initial = t->counts;
@@ -251,9 +258,19 @@ static inline void la_frame(struct la_trial* t, uint64_t now, uint64_t acquire, 
   t->prev = now;
   if (now - t->start < 5 * LA_SECOND)
     return;
-  if (t->n < LA_MIN_FRAMES || draws <= t->draws || t->counts.bytes <= t->initial.bytes)
+  int covered = t->n >= LA_MIN_FRAMES && draws > t->draws;
+  if (!covered || t->counts.bytes <= t->initial.bytes) {
+    // A cached, coherent mapping lands directly even during sustained gameplay.
+    // Keep these windows out of the A/B samples but bound the time spent probing.
+    unsigned empty = covered && t->counts.bytes == t->initial.bytes ? t->empty_windows + 1 : 0;
     la_discard(t);
-  else if (t->recovering) {
+    t->empty_windows = empty;
+    if (empty >= LA_WINDOWS)
+      la_lock(t, 0, LA_REASON_OFF_NO_COMPLETED_STAGING);
+    return;
+  }
+  t->empty_windows = 0;
+  if (t->recovering) {
     t->recovering = 0;
     t->mode = 1;
     t->epoch++;

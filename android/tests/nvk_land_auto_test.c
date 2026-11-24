@@ -9,31 +9,8 @@
       return 1;                                       \
     }                                                 \
   } while (0)
-#include <stdatomic.h>
-#include <pthread.h>
-#include <time.h>
-#include "nvn_plat.h"
+#include "nvk_land_auto_fixture.h"
 
-static struct {
-  int closing, land_auto, land_readback;
-  unsigned land_prior_live, land_live_count;
-  _Atomic int land_reported;
-  struct la_trial land_trial;
-} g;
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-#include "../native/nvn/backend_vulkan_land_auto.inc"
-
-static char decision[4096];
-static unsigned lines;
-int dm_thermal_now(void) { return 0; }
-int s2a_android_host_lifecycle(uint64_t* life) { *life = 1; return 1; }
-uint64_t nvk_shader_live_compile_total(void) { return 0; }
-void nvn_plat_log(int level, const char* cls, const char* text) {
-  if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "land-readback")) {
-    snprintf(decision, sizeof decision, "%s", text);
-    lines++;
-  }
-}
 static int session_logs(int stop_at) {
   memset(&g, 0, sizeof g);
   g.land_auto = g.land_readback = 1;
@@ -64,7 +41,7 @@ static int session_logs(int stop_at) {
     CHECK(!lines && g.land_trial.mode == (stop_at == LA_WARM));  // Zero samples, or a provisional on-window.
   }
   uint64_t locked = g.land_trial.decision_boottime_ns;
-  land_auto_exit_locked();
+  nvn_vk_land_auto_report_exit();
   unsigned after_exit = lines;
   land_auto_exit_locked();
   CHECK(lines == after_exit && lines == (stop_at == LA_WINDOWS ? 2u : 1u));
@@ -81,6 +58,56 @@ static int session_logs(int stop_at) {
     CHECK(strstr(decision, "phase=exit mode=0 reason=insufficient_samples") &&
           strstr(decision, stop_at ? "qualified_windows=7 " : "qualified_windows=0 ") && !g.land_trial.mode);
   }
+  return 0;
+}
+enum interrupt { NONE, ELIGIBLE, NO_DRAW, SPARSE, GAP, STALE_EPOCH, BOUNDARY_BYTES, THERMAL };
+static int direct_only(enum interrupt interruption) {
+  memset(&g, 0, sizeof g);
+  g.land_auto = g.land_readback = 1;
+  lines = thermal = 0;
+  uint64_t now = LA_SECOND, draws = 0;
+  int expected_window = 10;  // Zero-based index of the eleventh full direct-only window.
+  if (interruption != NONE) {
+    // A whole eligible, drawless or sparse window at index 10 cannot count.
+    expected_window += interruption == ELIGIBLE || interruption == NO_DRAW || interruption == SPARSE ? 11 : 10;
+  }
+  for (int window = 0; window <= expected_window; window++) {
+    int interrupt = window == 10 ? interruption : NONE;
+    if (interrupt == GAP)
+      now += 5 * LA_SECOND;
+    if (interrupt == THERMAL || interrupt == STALE_EPOCH) {
+      thermal += interrupt == THERMAL;
+      g.land_prior_live = interrupt == STALE_EPOCH;
+      nvn_gpu_land_auto_present(++now, 1, 1, draws, 1);
+      g.land_prior_live = 0;
+    }
+    if (interrupt == BOUNDARY_BYTES)
+      g.land_trial.counts.bytes += 8192;  // Completed between the previous end and this baseline.
+    int intervals = interrupt == SPARSE ? 25 : 300;
+    for (int frame = 0; frame <= intervals; frame++) {
+      now += (5 * LA_SECOND + intervals - 1) / intervals;
+      draws += interrupt == NO_DRAW ? 0 : 1000;
+      g.land_trial.counts.direct++;
+      if (interrupt == ELIGIBLE)
+        g.land_trial.counts.bytes += 8192;
+      nvn_gpu_land_auto_present(now, 1, 1, draws, 1);
+    }
+    if (window < expected_window)
+      CHECK(!lines && !g.land_trial.reason);
+    else
+      CHECK(lines == 1 && strstr(decision, "phase=lock mode=0 reason=no_completed_staging "));
+  }
+  CHECK(g.land_trial.qualified == (interruption == ELIGIBLE ? 1 : 0));
+  while (now < 1800 * LA_SECOND) {
+    now += 16666667;
+    nvn_gpu_land_auto_present(now, 1, 1, ++draws, 1);
+  }
+  CHECK(lines == 1 && !g.land_trial.mode);
+  uint64_t locked = g.land_trial.decision_boottime_ns;
+  nvn_vk_land_auto_report_exit();
+  land_auto_exit_locked();
+  CHECK(lines == 2 && strstr(decision, "phase=exit mode=0 reason=no_completed_staging "));
+  CHECK(g.land_trial.decision_boottime_ns == locked);
   return 0;
 }
 enum scenario {
@@ -167,6 +194,8 @@ int main(void) {
   CHECK(t.start == 90000000000ull && !t.mode && !t.reason);
   la_end(&t);
   CHECK(!t.mode && !strcmp(t.reason, "insufficient_samples") && t.qualified == 0);
+  for (int i = NONE; i <= THERMAL; i++)
+    CHECK(!direct_only((enum interrupt)i));
   CHECK(!session_logs(0));
   CHECK(!session_logs(LA_WINDOWS));
   CHECK(!session_logs(LA_WARM));
@@ -185,6 +214,6 @@ int main(void) {
   CHECK(!run(STALE, "insufficient_samples"));
   puts(
       "PASS land auto: cold start, both pairs, AA noise, frame coverage, actual staging, tail, WSI, "
-      "loading, qualified windows and insufficient samples");
+      "loading, 11 consecutive direct-only windows, retained exit and insufficient samples");
   return 0;
 }
