@@ -73,7 +73,7 @@ static int fixture_live_compile, fixture_live_slots;
 static int fixture_live_frame_ms = 100, fixture_live_unsafe_ms = 10000;
 static pthread_mutex_t live_gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t live_gate_cv = PTHREAD_COND_INITIALIZER;
-static int live_gate_hold, live_gate_entered;
+static int live_gate_hold, live_gate_entered, hold_shader_load;
 static void live_gate_pause(void) {
     pthread_mutex_lock(&live_gate_mu);
     if (live_gate_hold) {
@@ -350,6 +350,7 @@ static int fixture_parallel_compile;
 s2a_direct_compile_fn s2a_direct_bound_compile_any(void) { return fixture_parallel_compile ? fake_parallel_compile : fake_compile; }
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, nvn_gpu_err *e) {
     (void)e;
+    if (hold_shader_load) live_gate_pause();
     if (fake_gs_success && (unsigned)s->stage < 6) {
         shader_load_count++; gs_loads[s->stage]++; gs_blob_bytes[s->stage] = s->bytes; *o = (nvn_gpu_shader)(uintptr_t)(s->stage + 1); return (nvn_gpu_rc){NVN_GPU_OK};
     }
@@ -1857,6 +1858,48 @@ static void test_nowindow_seed(const char *root, const char *manifest, const str
     fake_gs_result_mode = 0;
 }
 
+struct warm_hitch_fixture {
+    const struct nvk_prog_rec *rec;
+    int rc;
+};
+static void *warm_hitch_build(void *arg) {
+    struct warm_hitch_fixture *fixture = arg;
+    fixture->rc = nvk_prog_warm_build(fixture->rec);
+    return NULL;
+}
+static void *warm_hitch_release(void *unused) {
+    (void)unused;
+    const struct timespec delay = {.tv_nsec = 100000000};
+    nanosleep(&delay, NULL);
+    live_gate_release();
+    return NULL;
+}
+static void warm_hitch_wait(const struct nvk_prog_rec *rec, const struct rp_shader_req *q) {
+    struct warm_hitch_fixture fixture = {.rec = rec, .rc = -1};
+    live_gate_entered = 0;
+    live_gate_hold = hold_shader_load = 1;
+    pthread_t warm, release;
+    int started = pthread_create(&warm, NULL, warm_hitch_build, &fixture) == 0;
+    CHECK(started, "start warm publisher");
+    if (started) {
+        CHECK(live_gate_wait(1), "publisher holds the identity while creating shader modules");
+        int releasing = pthread_create(&release, NULL, warm_hitch_release, NULL) == 0;
+        CHECK(releasing, "start publisher release");
+        if (!releasing) live_gate_release();
+        const struct rp_prog *out = NULL;
+        int rc = rp_shader_resolve(q, &out);
+        CHECK(rc == 0 && out && !memcmp(out->identity, rec->identity, 32),
+              "foreground adopts the published program for this identity");
+        CHECK(q->hitch->inflight_ns > 0 && q->hitch->compile_ns == 0 && q->hitch->worker_ns == 0 &&
+              q->hitch->candidates == 1 && compiler_calls == 0,
+              "foreground records a real in-flight wait without duplicate compilation");
+        if (releasing) pthread_join(release, NULL);
+        pthread_join(warm, NULL);
+        CHECK(fixture.rc == 0, "warm publisher completed");
+    }
+    hold_shader_load = live_gate_hold = 0;
+}
+
 static int gs_libpack_test(int diagnose_refusals, int numeric) {
     fake_depth_clip = 1;   // 深度 near=-w 也能用预编库（libpack_state_ok），夹具不带深度零
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
@@ -1940,11 +1983,15 @@ static int gs_libpack_test(int diagnose_refusals, int numeric) {
             sampled_fixture_format = formats[i];
             rp_shader_reset(); compiler_calls = 0;
             setenv("S2A_SHADER_REVISION_ROOT", root, 1);
-            struct rp_shader_req q = {0}; q.prim = 4;
+            struct rp_shader_hitch trace = {0};
+            struct rp_shader_req q = {.prim = 4, .hitch = &trace};
             const struct rp_prog *pg = NULL;
             int rc = rp_shader_resolve(&q, &pg);
             CHECK(!rc && pg && pg->lib_sourced == (i == 0) && compiler_calls == (i != 0),
                   "cold sampled numeric admission format %u, rc=%d translations=%d", formats[i], rc, compiler_calls);
+            CHECK(i == 0 ? trace.hits == 1 && trace.rejects == 0 && trace.compile_ns == 0
+                         : trace.hits == 0 && trace.rejects == 1 && trace.compile_ns > 0,
+                  "cold numeric admission records the library hit or rejection plus live compilation");
             // 旧清单从一次普通编译取得；独立池长让它不会命中上面冷路径刚写的拒收表。
             bind_pools(101); rp_shader_reset(); fixture_no_libpack = 1;
             rc = rp_shader_resolve(&q, &pg); fixture_no_libpack = 0;
@@ -1954,9 +2001,20 @@ static int gs_libpack_test(int diagnose_refusals, int numeric) {
             rec.stage_mask = 3; rec.lp_ok = 2; memcpy(rec.keys, k, 16);
             rp_shader_reset(); compiler_calls = 0;
             CHECK(!nvk_prog_warm_build(&rec), "warm candidate built before request facts");
+            memset(&trace, 0, sizeof trace);
             pg = NULL; rc = rp_shader_resolve(&q, &pg);
             CHECK(!rc && pg && pg->lib_sourced == (i == 0) && compiler_calls == (i != 0),
                   "warm sampled numeric admission format %u, rc=%d translations=%d", formats[i], rc, compiler_calls);
+            CHECK(trace.hits == 1 && trace.candidates == (i == 0 ? 1u : 2u) &&
+                  (i == 0 ? trace.rejects == 0 && trace.compile_ns == 0
+                          : trace.rejects > 0 && trace.compile_ns > 0),
+                  "published hit and numeric retry: format=%u hits=%u rejects=%u candidates=%u hit_ns=%llu reject_ns=%llu compile_ns=%llu",
+                  formats[i], trace.hits, trace.rejects, trace.candidates, (unsigned long long)trace.hit_ns,
+                  (unsigned long long)trace.reject_ns, (unsigned long long)trace.compile_ns);
+            if (i == 0) {
+                rp_shader_reset(); compiler_calls = 0; memset(&trace, 0, sizeof trace);
+                warm_hitch_wait(&rec, &q);
+            }
         }
         goto cleanup_gs;
     }
@@ -2211,11 +2269,20 @@ static int live_compile_thread_test(int asynchronous) {
     rp_state_reset(); source(); bind_pools(64);
     fake_array_count = 64;
     fake_cs_success = 1;
-    struct rp_shader_req q = {.prim = 4};
+    struct rp_shader_hitch trace = {0};
+    struct rp_shader_req q = {.prim = 4, .hitch = &trace};
     const struct rp_prog *graphics = NULL, *compute = NULL, *again = NULL;
     int rc = rp_shader_resolve(&q, &graphics);
     CHECK(rc == 0 && graphics && !graphics->is_compute && compiler_calls == 1,
           "graphics first use publishes the real compiled program (rc=%d calls=%d)", rc, compiler_calls);
+    CHECK(graphics && trace.candidates == 1 &&
+          !memcmp(trace.first_identity, graphics->identity, 32) &&
+          !memcmp(trace.last_identity, graphics->identity, 32),
+          "slow path records the canonical identity of the resolved program");
+    CHECK(trace.build_ns > 0 && trace.inflight_ns == 0 &&
+          (asynchronous ? trace.worker_ns > 0 && trace.compile_ns == 0
+                        : trace.compile_ns > 0 && trace.worker_ns == 0),
+          "first resolve attributes synchronous compilation or worker wall time separately");
     if (compiler_calls == 1) {
         const int on_submit = pthread_equal(last_compiler_thread, pthread_self()) != 0;
         CHECK(on_submit == !asynchronous, "graphics live compiler %s on the submitting thread",
@@ -2229,8 +2296,12 @@ static int live_compile_thread_test(int asynchronous) {
         CHECK(on_submit == !asynchronous, "compute live compiler %s on the submitting thread",
               on_submit ? "ran" : "did not run");
     }
+    memset(&trace, 0, sizeof trace);
     CHECK(rp_shader_resolve(&q, &again) == 0 && again == graphics && compiler_calls == 2,
           "second graphics lookup reuses the published program");
+    CHECK(trace.hits == 1 && trace.candidates == 0 && trace.rejects == 0 && trace.compile_ns == 0 &&
+          trace.inflight_ns == 0 && trace.worker_ns == 0 && trace.build_ns == 0,
+          "warm fast lookup does not run slow-path work");
     CHECK(rp_shader_resolve_compute(&again) == 0 && again == compute && compiler_calls == 2,
           "second compute lookup reuses the published program");
     nvk_shader_stop(); rp_shader_reset(); s2a_source_clear();
