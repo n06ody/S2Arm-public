@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/system_properties.h>
 #include <time.h>
+#include <unistd.h>
 #include "debug_gate.h"
 #include "flag_cache.h"
 
@@ -17,10 +18,21 @@ const char *nvk_session_cache_dir(void);
 
 void nvn_plat_log(int level, const char *cls, const char *text) {
     int prio = level == NVN_PLAT_LOG_RED ? ANDROID_LOG_ERROR : level == NVN_PLAT_LOG_WARN ? ANDROID_LOG_WARN : ANDROID_LOG_INFO;
-    __android_log_print(prio, "S2Arm", "%snvk %s: %s", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "");
+    char identity[96] = "";
+#if defined(__ANDROID__)
+    if (text && (!strncmp(text, "S2A_HITCH_PROGRAM ", sizeof "S2A_HITCH_PROGRAM " - 1) ||
+                 !strncmp(text, "S2A_HITCH_REPLAY ", sizeof "S2A_HITCH_REPLAY " - 1))) {
+        // 与本局 host.log 首行和帧日志的 UUID 同源。取证端用已验证的本局 APK 摘要与它们联结。
+        char uuid[PROP_VALUE_MAX] = "";
+        if (__system_property_get("debug.s2a.session_uuid", uuid) != 32 ||
+            strspn(uuid, "0123456789abcdef") != 32) strcpy(uuid, "-");
+        snprintf(identity, sizeof identity, " uuid=%.32s pid=%ld tid=%ld", uuid, (long)getpid(), (long)gettid());
+    }
+#endif
+    __android_log_print(prio, "S2Arm", "%snvk %s: %s%s", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "", identity);
     // 调试入口开着时同一行也写进本局的宿主日志文件（标准错误已接到 host-*.log）。系统日志在真机上会整段丢掉某个进程的行
     // （一晚上遇到五次「游戏在跑、logcat 里这个进程 0 行」，宿主日志文件完好），读数不能只押在它上面。
-    if (s2a_debug_entries_open()) fprintf(stderr, "[s2a] %snvk %s: %s\n", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "");
+    if (s2a_debug_entries_open()) fprintf(stderr, "[s2a] %snvk %s: %s%s\n", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "", identity);
 }
 
 #if defined(S2A_ANDROID_DEBUG_ENV) && defined(__ANDROID__)   // 与 debug_gate.h 的第一道门同一个条件：玩家包里 s2a_debug_entries_open() 编译期恒假，下面整段不存在

@@ -1552,12 +1552,48 @@ void rp_tm_frame_end(void) {   // 每次上屏调一次：刚结束的是采样�
     g_tm_n = g_tm_n + 1 >= s ? 0 : g_tm_n + 1;
     __atomic_store_n(&rp_tm_on, g_tm_n == 0, __ATOMIC_RELAXED);
 }
+// 单笔阈值与上屏帧间隔阈值独立。记录的是本次绘制从入口到资源准备的 CPU 墙钟。
+static const uint64_t prog_hitch_ns = 8000000;
+static void prog_hitch_identity(char hex[65], const uint8_t *identity) {
+    static const char digits[] = "0123456789abcdef";
+    static const uint8_t empty[32];
+    if (!identity || !memcmp(identity, empty, sizeof empty)) { strcpy(hex, "-"); return; }
+    for (size_t i = 0; i < sizeof empty; i++) {
+        hex[2 * i] = digits[identity[i] >> 4];
+        hex[2 * i + 1] = digits[identity[i] & 15];
+    }
+    hex[64] = 0;
+}
+static void prog_hitch_log(uint64_t start, uint64_t before, uint64_t after, uint64_t end,
+                          int indexed, int rc, const struct rp_prog *prog, const struct rp_shader_hitch *h) {
+    char program[65], first[65], last[65], line[768];
+    prog_hitch_identity(program, prog ? prog->identity : NULL);
+    prog_hitch_identity(first, h->first_identity);
+    prog_hitch_identity(last, h->last_identity);
+    snprintf(line, sizeof line,
+        "S2A_HITCH_PROGRAM v=1 mono_ns=%llu start_ns=%llu frame=%llu submit=%llu op=%s"
+        " called=%d rc=%d program=%s first=%s last=%s candidates=%u"
+        " pre_ns=%llu resolve_ns=%llu post_ns=%llu hits=%u rejects=%u hit_ns=%llu reject_ns=%llu"
+        " inflight_ns=%llu compile_ns=%llu worker_ns=%llu build_ns=%llu",
+        (unsigned long long)end, (unsigned long long)start, (unsigned long long)rp_frame(),
+        (unsigned long long)rp_sub_serial(), indexed ? "OP_DRAW_IDX" : "OP_DRAW",
+        before != 0, rc, program, first, last, h->candidates,
+        (unsigned long long)((before ? before : end) - start),
+        (unsigned long long)(after - before), (unsigned long long)(after ? end - after : 0),
+        h->hits, h->rejects, (unsigned long long)h->hit_ns, (unsigned long long)h->reject_ns,
+        (unsigned long long)h->inflight_ns, (unsigned long long)h->compile_ns,
+        (unsigned long long)h->worker_ns, (unsigned long long)h->build_ns);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "hitch-program", line);
+}
+
 #define DT(step) do { if (tm_) { uint64_t n_ = dt_now(); rp_perf_add(step, n_ - dt_); dt_ = n_; } } while (0)
 void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec) {
     if (!c) return;
-    memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok);
     const int tm_ = rp_tm();   // 采样帧才逐步计时：非采样帧不取时钟、不做原子加
+    const int hitch = tm_ && rp_hitch_enabled();
     uint64_t dt_ = tm_ ? dt_now() : 0;
+    const uint64_t prog_start = hitch ? dt_ : 0;
+    memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok);
     uint32_t prim = (uint32_t)(di ? di->prim : dr->prim);
     const uint64_t ind = di ? di->ind : dr->ind;
     const uint64_t mcnt = di ? di->mdi_cnt : dr->mdi_cnt;
@@ -1619,13 +1655,23 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
       if (face != g_face) { g_face = face; rp_pso_dirty = 1; } }   // 图元在绘制记录里，不在状态块里：换了图元就是换管线
     int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];
     int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
+    uint64_t prog_before = 0, prog_after = 0;
+    struct rp_shader_hitch prog_trace;
+    if (hitch) memset(&prog_trace, 0, sizeof prog_trace);
     if (!g_prog || rp_pso_dirty || args_dirty) {
         struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
         for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
         q.compile_defer_frame = rp_live_compile_defer_frame;
+        q.hitch = hitch ? &prog_trace : NULL;
         const struct rp_prog *np = NULL;
+        if (hitch) prog_before = dt_now();
         int sr = rp_shader_resolve(&q, &np);
-        if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }
+        if (hitch) prog_after = dt_now();
+        if (sr) {
+            if (hitch && prog_after - prog_start > prog_hitch_ns)
+                prog_hitch_log(prog_start, prog_before, prog_after, prog_after, di != NULL, sr, NULL, &prog_trace);
+            skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return;
+        }
         if (np != g_prog) { g_prog = np; rp_pso_dirty = 1; }
     }
 draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置，下面按新程序重取资源与管线）
@@ -1639,7 +1685,15 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
                     skip("indirect_count_driver_base_instance", rec); return;
                 }
     }
-    DT(RP_PERF_D_PROG);
+    if (hitch && !lib_retry) {
+        const uint64_t end = dt_now();
+        rp_perf_add(RP_PERF_D_PROG, end - dt_);
+        dt_ = end;
+        if (end - prog_start > prog_hitch_ns) {
+            prog_hitch_log(prog_start, prog_before, prog_after, end, di != NULL, 0, g_prog, &prog_trace);
+            dt_ = dt_now();   // 打日志的时间不计进下一段资源准备。
+        }
+    } else DT(RP_PERF_D_PROG);
     // 先把这笔要用的资源都取好：池镜像同步、贴图上传是传输，不能出现在通道里，必须在开通道之前做完
     nvn_gpu_buf vb_buf[16]; uint64_t vb_off[16]; uint32_t streams = 0;
     // #977：着色器读了但游戏没设格式的属性（属性表外 / 格式 0）不取它的流；由核心补一条 RGBA32F、步长 0、内容全 0 的属性
