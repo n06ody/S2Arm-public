@@ -31,12 +31,15 @@
 #define DQ_SYNC(X) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkQueueSubmit) X(vkQueuePresentKHR) X(vkQueueWaitIdle) X(vkDeviceWaitIdle) \
     X(vkDestroyCommandPool) X(vkFreeCommandBuffers) X(vkResetCommandBuffer)
 #define DQ_REAL(f) static PFN_##f r_##f;
+S2A_VK_EDS1_COMMANDS(DQ_REAL)
+S2A_VK_EDS2_COMMANDS(DQ_REAL)
+S2A_VK_VERTEX_INPUT_COMMANDS(DQ_REAL)
 DQ_CMDS(DQ_REAL)   // 命令缓冲之外的那几个入口（提交、呈现、池）直接调符号：它们没有版本 / 扩展的问题，宿主用例对其中几个打了桩
 #define DQ_OP(f) OP_##f,
-enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
+enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_EXT_STATE, OP_EXT_INPUT, OP_EXT_STRIDE, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
 // 诊断读数：每类调用经过包装多少次（不管开关开没开）。backend_vulkan_wsi.inc 随「对象读数」每 300 帧打一行。
 #define DQ_NAME(f) #f,
-static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill" };
+static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill", "extended state", "vertex input", "vertex stride" };
 static uint64_t g_dq_cnt[OP_N];
 #define DQ_COUNT(op) __atomic_fetch_add(&g_dq_cnt[op], 1, __ATOMIC_RELAXED)
 
@@ -230,6 +233,42 @@ static int dq_fill_take(uint64_t t) {
     return 2;
 }
 
+enum { DQ_EDS_RASTER = 1, DQ_EDS_DS = 2, DQ_EDS_BASE2 = 4 };
+typedef struct {
+    uint32_t groups;
+    VkCullModeFlags cull;
+    VkFrontFace front;
+    VkPrimitiveTopology topology;
+    VkBool32 depth_test, depth_write, stencil_test;
+    VkCompareOp depth_compare;
+    VkStencilOpState stencil[2];
+    VkBool32 discard, bias, restart;
+} a_ext_state;
+
+static void r_ext_state(VkCommandBuffer cb, const a_ext_state *a) {
+    if (a->groups & DQ_EDS_RASTER) {
+        r_vkCmdSetCullModeEXT(cb, a->cull);
+        r_vkCmdSetFrontFaceEXT(cb, a->front);
+        r_vkCmdSetPrimitiveTopologyEXT(cb, a->topology);
+    }
+    if (a->groups & DQ_EDS_DS) {
+        r_vkCmdSetDepthTestEnableEXT(cb, a->depth_test);
+        r_vkCmdSetDepthWriteEnableEXT(cb, a->depth_write);
+        r_vkCmdSetDepthCompareOpEXT(cb, a->depth_compare);
+        r_vkCmdSetStencilTestEnableEXT(cb, a->stencil_test);
+        for (int f = 0; f < 2; ++f) {
+            const VkStencilOpState *st = &a->stencil[f];
+            r_vkCmdSetStencilOpEXT(cb, f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT,
+                                 st->failOp, st->passOp, st->depthFailOp, st->compareOp);
+        }
+    }
+    if (a->groups & DQ_EDS_BASE2) {
+        r_vkCmdSetRasterizerDiscardEnableEXT(cb, a->discard);
+        r_vkCmdSetDepthBiasEnableEXT(cb, a->bias);
+        r_vkCmdSetPrimitiveRestartEnableEXT(cb, a->restart);
+    }
+}
+
 static void dq_run(const dq_rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
     switch (h->op) {
@@ -291,6 +330,21 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdBeginQuery: { const a_query *a = (const void *)p; r_vkCmdBeginQuery(cb, a->p, a->q, a->fl); break; }
     case OP_vkCmdEndQuery: { const a_query *a = (const void *)p; r_vkCmdEndQuery(cb, a->p, a->q); break; }
     case OP_FILL: dq_fill_run((const a_memfill *)(const void *)p); break;
+    case OP_EXT_STATE: r_ext_state(cb, (const void *)p); break;
+    case OP_EXT_INPUT: {
+        const a_range *a = (const void *)p;
+        const VkVertexInputBindingDescription2EXT *b = (const void *)(a + 1);
+        const VkVertexInputAttributeDescription2EXT *v = (const void *)(b + a->first);
+        r_vkCmdSetVertexInputEXT(cb, a->first, a->first ? b : NULL, a->n, a->n ? v : NULL);
+        break;
+    }
+    case OP_EXT_STRIDE: {
+        const a_range *a = (const void *)p;
+        const VkBuffer *b = (const void *)(a + 1);
+        const VkDeviceSize *o = (const void *)(b + a->n);
+        r_vkCmdBindVertexBuffers2EXT(cb, a->first, a->n, b, o, NULL, o + a->n);
+        break;
+    }
     default: break;
     }
 }
@@ -369,6 +423,58 @@ static DQ_U uint64_t vk_dq_fill_wait(uint64_t t) {
 // ---- the wrappers (the producer) ----
 #define DQ_DIRECT(f, ...) do { vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_##f(__VA_ARGS__); } while (0)
 #define DQ_BEGIN(op, T, extra) DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
+static DQ_U void w_ext_state(VkCommandBuffer cb, const a_ext_state *state) {
+    {
+        DQ_BEGIN(OP_EXT_STATE, a_ext_state, 0);
+        *a = *state;
+        (void)at_;
+        dq_rec_end(base_);
+        return;
+    }
+direct:
+    DQ_DIRECT(ext_state, cb, state);
+}
+
+// These descriptions are built by the backend with null pNext.
+static DQ_U void w_ext_input(VkCommandBuffer cb, uint32_t nb, const VkVertexInputBindingDescription2EXT *b,
+                             uint32_t nv, const VkVertexInputAttributeDescription2EXT *v) {
+    {
+        const size_t bb = nb * sizeof *b, vb = nv * sizeof *v;
+        DQ_BEGIN(OP_EXT_INPUT, a_range, bb + vb);
+        *a = (a_range){nb, nv};
+        dq_put(&at_, b, bb);
+        dq_put(&at_, v, vb);
+        dq_rec_end(base_);
+        return;
+    }
+direct:
+    DQ_DIRECT(vkCmdSetVertexInputEXT, cb, nb, nb ? b : NULL, nv, nv ? v : NULL);
+}
+
+static DQ_U void w_ext_stride(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *b,
+                              const VkDeviceSize *o, const VkDeviceSize *stride) {
+    {
+        const size_t bb = n * sizeof *b, ob = n * sizeof *o;
+        DQ_BEGIN(OP_EXT_STRIDE, a_range, bb + 2 * ob);
+        *a = (a_range){first, n};
+        dq_put(&at_, b, bb);
+        dq_put(&at_, o, ob);
+        dq_put(&at_, stride, ob);
+        dq_rec_end(base_);
+        return;
+    }
+direct:
+    DQ_DIRECT(vkCmdBindVertexBuffers2EXT, cb, first, n, b, o, NULL, stride);
+}
+
+static DQ_U void vk_dq_dynamic_init(const struct s2a_vk_device *dev) {
+#define DQ_EXT(name) r_##name = dev->name;
+    S2A_VK_EDS1_COMMANDS(DQ_EXT)
+    S2A_VK_EDS2_COMMANDS(DQ_EXT)
+    S2A_VK_VERTEX_INPUT_COMMANDS(DQ_EXT)
+#undef DQ_EXT
+}
+
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t nm, const VkMemoryBarrier *m,
                                                          uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
     for (uint32_t i = 0; i < nm; i++) if (m[i].pNext) goto direct;
