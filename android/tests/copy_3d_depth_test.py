@@ -66,6 +66,26 @@ bc_upload_stub = bc_upload_signature + r''' {
     bc_upload_calls++; set_sticky(c, NVN_GPU_E_UNSUPPORTED, "BC upload not implemented by bounds fixture");
 }
 '''
+# 这里只模拟一致映射。非一致区间登记由 Vulkan 回写专项执行生产实现。
+mirror_src = (root / 'android/native/nvn/backend_vulkan_mirror.inc').read_text()
+
+
+def mirror_signature(name):
+    match = re.search(r'^static (?:int|void) ' + name + r'\([^{};]*\)(?=\s*{)', mirror_src, re.MULTILINE)
+    if not match:
+        raise RuntimeError(f'production {name} signature not found')
+    return match.group(0)
+
+
+mirror_stubs = mirror_signature('mirror_is_noncoherent') + r''' {
+    (void)b;
+    return 0;
+}
+''' + mirror_signature('mirror_write_rows') + r''' {
+    (void)b; (void)off; (void)packed; (void)pitch; (void)rows; (void)slice_rows; (void)slices;
+    set_sticky(c, NVN_GPU_E_UNSUPPORTED, "non-coherent path outside 3D copy bounds fixture");
+}
+'''
 # #1581 K：一个拷贝区域只取一个面——面选择（copy_face_aspect）与 copy_buf_tex_impl 的 face 取值（COPY_FACE_*）在函数外，一起切出来
 match = re.search(r'enum \{ COPY_FACE_DEFAULT[^}]*\};', src)
 if not match:
@@ -128,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix='copy-3d-depth-') as path:
         if (sysinc / name).exists(): (inc / name).symlink_to(sysinc / name)
     def run(name, stub, body, expected=None):
         c_file = d / (name + '.c'); exe = d / name
-        c_file.write_text(preamble + stub + bc_upload_stub + body + main)
+        c_file.write_text(preamble + stub + bc_upload_stub + mirror_stubs + body + main)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-I' + str(inc), '-I' + str(root/'graphics/nvn/gfx/nvn'),
                         '-I' + str(root/'graphics/nvn/gfx/nvn/include'),

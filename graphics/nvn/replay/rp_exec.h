@@ -4,6 +4,8 @@
 #include "nvn_obj.h"
 #include "nvn_backend.h"
 #include "nvn2_cmd.h"   // p_multi_draw
+#include "nvn_plat.h"
+#include <time.h>
 
 const char *rp_op_name(uint32_t op);   // 录制命令名（"OP_DRAW" …）；范围外返回 "OP_?"
 int rp_pool_count(void);                // 已登记的内存池个数
@@ -16,6 +18,7 @@ int rp_present_lower_left(void);        // 上屏翻转：被上屏窗口建时�
 uint64_t rp_frame(void);                // 前端给的当前帧号
 // 提交之外的旁路段（rp_exec.c）：调用方持提交锁、不在提交回放里。begin 失败返回 NULL（已记账）；commit 返回这一段的栅栏值，0 = 没交成（已报红）
 int rp_in_submit(void);
+nvn_gpu_rc rp_fence_wait_at(uint64_t v, uint64_t timeout, nvn_gpu_err *err, enum nvn_gpu_wait_site site);
 nvn_gpu_cmd rp_side_begin(const char *label);
 uint64_t rp_side_commit(nvn_gpu_cmd c);
 void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels 读 GPU 内容的读数（次数 / 等之前的活共纳秒 / 最长纳秒 / 读回共纳秒）
@@ -120,6 +123,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_BUF_LOG_EV, RP_PERF_BUF_LOG_WORDS, RP_PERF_BUF_LOG_REBUILD,   // 脏页追加日志（nvk_buf_dirtylog）：灌进镜像的事件数 / 求交时看的位图字数 / 日志不可用、按逐页代号重建的次数
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
+       RP_PERF_LAND_CACHED_BYTES, RP_PERF_LAND_CACHED_NS, RP_PERF_LAND_UNCACHED_BYTES, RP_PERF_LAND_UNCACHED_NS,
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
@@ -133,8 +137,27 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_GW_REG_N, RP_PERF_GW_REG_KB, RP_PERF_GW_MERGED_N, RP_PERF_GW_MERGED_KB,   // 显卡写登记：收到的登记条数 / 千字节；同段合并掉的条数 / 因重叠省下的千字节（落地拷贝按合并后的条数算，见 rp_buf.c rp_buf_gpu_write_note2）
        RP_PERF_P_CUT_BAR,      // 通道里有着色器写、其后游戏发了带顺序位的屏障，因此在下一笔绘制前结束的通道数（见 rp_pass.c rp_pass_barrier）
        RP_PERF_BUF_SYNC_GW_KB,   // 已登记 GPU 写覆盖整页，在途免同步的 KB
+       RP_PERF_HITCH_DISP_PIPE, RP_PERF_HITCH_BIND_BE, RP_PERF_HITCH_ALLOC, RP_PERF_HITCH_COPY, RP_PERF_HITCH_FILL,
+       RP_PERF_HITCH_MIRROR_NEW, RP_PERF_HITCH_MIRROR_WRITE, RP_PERF_HITCH_HASH_GROW,
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
+// 隔离夹具只链接本文件用到的回放单元，不依赖 rp_exec.c 的实现。开关在进程启动前配置。
+static inline int rp_hitch_enabled(void) {
+    static int enabled = -1;
+    int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+    if (value < 0) {
+        value = nvn_plat_flag("nvk_hitch_log", 0) != 0;
+        __atomic_store_n(&enabled, value, __ATOMIC_RELAXED);
+    }
+    return value;
+}
+static inline uint64_t rp_hitch_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static inline uint64_t rp_hitch_start(void) { return rp_hitch_enabled() ? rp_hitch_clock() : 0; }
+static inline void rp_hitch_end(int slot, uint64_t start) { if (start) rp_perf_add(slot, rp_hitch_clock() - start); }
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。
 // 改成每 rp_tm_stride() 帧只完整计 1 帧（缺省 32）：采样帧里逐步计时照旧，其余帧一次时钟都不取；纯计数的项不动、每帧都记。
 // 「分时」里这几项按采样帧数（RP_PERF_TM_FRAMES）求每帧值，读数行的格式和含义不变。
@@ -170,7 +193,20 @@ void rp_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs);   // 取
 // 这一组只在帧边界由上屏线程取走一次（取即清零），累计点与 rp_perf 的 D_* 同源（见 rp_exec.c 的 fr_perf_project）。
 // 口径：取程序 / 开通道 / 取管线 / 绑定 / 后端绘制 / 收尾各占一笔绘制里的一段；「后端取与设」「管线缓存写盘」
 // 嵌套在取管线里，只细分显示、不再加进合计。
-enum { RP_FR_PROG, RP_FR_PASS, RP_FR_PIPE, RP_FR_PGET, RP_FR_BIND, RP_FR_DRAW, RP_FR_TAIL, RP_FR_PLC, RP_FR_N };
+enum {
+    RP_FR_PROG, RP_FR_PASS, RP_FR_PIPE, RP_FR_PGET, RP_FR_BIND, RP_FR_DRAW, RP_FR_TAIL, RP_FR_PLC,
+    RP_FR_PREP, RP_FR_TEX, RP_FR_DYN, RP_FR_PASS_VIEW, RP_FR_PASS_BAR, RP_FR_PASS_BE,
+    RP_FR_TEX_LOCK, RP_FR_TEX_NEW, RP_FR_TEX_SCAN, RP_FR_TEX_UP, RP_FR_TEX_ZERO,
+    RP_FR_DISP_SHADER, RP_FR_DISP_RES, RP_FR_DISP_FLUSH, RP_FR_DISP_IND, RP_FR_DISP_BIND, RP_FR_DISP_PIPE,
+    RP_FR_BIND_BE, RP_FR_ARENA_ALLOC, RP_FR_ARENA_COPY, RP_FR_ARENA_FILL, RP_FR_MIRROR_NEW, RP_FR_MIRROR_WRITE, RP_FR_HASH_GROW,
+    RP_FR_N
+};
+enum { RP_HITCH_COUNT_FLUSH = OP_NVN2_END_, RP_HITCH_OP_N };
+struct rp_hitch_op { uint64_t ns, max_ns, count; };
+void rp_hitch_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs,
+                         uint64_t stages[RP_FR_N], struct rp_hitch_op out[RP_HITCH_OP_N]);
+void rp_hitch_detail_line(char *b, size_t n, uint64_t now_ns, uint64_t exec_ns,
+                          const uint64_t fr[RP_FR_N], const struct rp_hitch_op ops[RP_HITCH_OP_N]);
 int rp_fr_perf_on(void);   // 开关（nvk_hitch_log，进程内缓存一次，与长帧日志同一个值）：关着时帧级分项不做任何累计
 void rp_fr_perf_take(uint64_t out[RP_FR_N]);   // [上屏] 取走本帧分项并清零；每帧只调一次（与 rp_frame_take 同一个帧边界）
 int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t draws, uint64_t subs, const uint64_t fr[RP_FR_N]);   // 长帧行（见 rp_exec.c）
@@ -191,6 +227,9 @@ int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value);
+struct gw_ev { uint64_t pool_key, id; };   // 提交里 GPU 写池的一笔登记
+void rp_buf_gpu_write_snapshot(const struct gw_ev *refs, uint32_t count, nvn_gpu_mirror_span *spans);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);

@@ -118,6 +118,15 @@ static int easu_module(const uint32_t *words, size_t bytes, VkShaderModule *out)
 // 调用者持 g_easu_mu。渲染通道只带一个颜色附件、开时清黑。
 // 注意 LOAD_OP_CLEAR 只作用于渲染区：渲染区之外的边框由调用方先整张清黑。
 // 首末布局都用 COLOR_ATTACHMENT_OPTIMAL：present 自己负责 UNDEFINED→附件、附件→PRESENT。
+static VkAttachmentDescription easu_attachment(VkFormat fmt) {
+    return (VkAttachmentDescription){
+        .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    };
+}
+
 static int easu_pipelines_locked(VkFormat fmt) {
     if (g_easu.failed) return 0;
     easu_q_init_locked();
@@ -151,11 +160,7 @@ static int easu_pipelines_locked(VkFormat fmt) {
         if (vkCreateSampler(g.d, &ci, NULL, &g_easu.sampler) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
     }
     if (!g_easu.pass) {
-        VkAttachmentDescription a; memset(&a, 0, sizeof a);
-        a.format = fmt; a.samples = VK_SAMPLE_COUNT_1_BIT;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        a.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; a.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentDescription a = easu_attachment(fmt);
         VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkSubpassDescription sp; memset(&sp, 0, sizeof sp);
         sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.colorAttachmentCount = 1; sp.pColorAttachments = &ref;
@@ -332,6 +337,15 @@ static int easu_compose(struct nvn_gpu_cmd_s *c, VkImage dstImg, VkExtent2D dstE
         vkCmdResetQueryPool(c->cb, qp, qs * 2u, 2);
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, qs * 2u);
     }
+    if (g.pass_diag) {
+        struct gpu_pass_meta *meta = gpu_diag_record_pass(c, sc.extent.width, sc.extent.height, 1);
+        if (meta) {
+            VkAttachmentDescription att = easu_attachment(dstfmt);
+            gpu_diag_attachment(meta, 0, &att, dstExtent.width, dstExtent.height);
+        }
+        if (c->tsq && c->ntsp < TS_PASS_MAX)
+            vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
+    }
     vkCmdBeginRenderPass(c->cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.pipe);
     vkCmdSetViewport(c->cb, 0, 1, &vp);
@@ -340,6 +354,7 @@ static int easu_compose(struct nvn_gpu_cmd_s *c, VkImage dstImg, VkExtent2D dstE
     vkCmdPushConstants(c->cb, g_easu.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
     vkCmdDraw(c->cb, 3, 1, 0, 0);
     vkCmdEndRenderPass(c->cb);
+    if (g.pass_diag) gpu_diag_pass_end(c);
     if (qp) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, qs * 2u + 1u);
         g_easu_q.slot++;

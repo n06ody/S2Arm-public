@@ -14,7 +14,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 20, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 21, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
@@ -71,6 +71,11 @@ SIG(nvn_gpu_buf_wrap, nvn_gpu_rc (*)(void *, uint64_t, nvn_gpu_buf *, nvn_gpu_er
 SIG(nvn_gpu_buf_create, nvn_gpu_rc (*)(uint64_t, int, const void *, nvn_gpu_buf *, nvn_gpu_err *));
 SIG(nvn_gpu_buf_va, uint64_t (*)(nvn_gpu_buf));
 SIG(nvn_gpu_buf_cpu, uint8_t *(*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_state, int (*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_flush, int (*)(nvn_gpu_buf, uint64_t, uint64_t));
+SIG(nvn_gpu_mirror_visibility_enabled, int (*)(void));
+SIG(nvn_gpu_mirror_memory_cached, int (*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_visibility_record, void (*)(nvn_gpu_cmd, const nvn_gpu_mirror_span *, uint32_t));
 SIG(nvn_gpu_buf_release, void (*)(nvn_gpu_buf, nvn_gpu_retired_fn, void *));
 SIG(nvn_gpu_buf_use, void (*)(nvn_gpu_cmd, nvn_gpu_buf));
 SIG(nvn_gpu_buf_write, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, const void *, uint64_t));
@@ -80,6 +85,8 @@ SIG(nvn_gpu_arena_fill_wait, uint64_t (*)(uint64_t));
 SIG(nvn_gpu_arena_fill_take, int (*)(uint64_t));
 SIG(nvn_gpu_tex_create, nvn_gpu_rc (*)(const nvn_gpu_tex_desc *, nvn_gpu_tex *, nvn_gpu_err *));
 SIG(nvn_gpu_tex_info_get, void (*)(nvn_gpu_tex, nvn_gpu_tex_info *));
+SIG(nvn_gpu_tex_bc1_snapshot, int (*)(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, uint64_t, nvn_gpu_tex *));
+SIG(nvn_gpu_tex_bc1_unwrap, int (*)(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *));
 SIG(nvn_gpu_tex_release, void (*)(nvn_gpu_tex));
 SIG(nvn_gpu_view_create, nvn_gpu_rc (*)(nvn_gpu_tex, const view_t *, nvn_gpu_view *, nvn_gpu_err *));
 SIG(nvn_gpu_view_create_buf, nvn_gpu_rc (*)(nvn_gpu_buf, uint64_t, uint64_t, uint32_t, nvn_gpu_view *, nvn_gpu_err *));
@@ -128,6 +135,7 @@ SIG(nvn_gpu_cmd_commit, nvn_gpu_rc (*)(nvn_gpu_cmd, uint64_t, nvn_gpu_done_fn, v
 SIG(nvn_gpu_fence_done, uint64_t (*)(void));
 SIG(nvn_gpu_fence_failed, uint64_t (*)(void));
 SIG(nvn_gpu_fence_wait, nvn_gpu_rc (*)(uint64_t, uint64_t, nvn_gpu_err *));
+SIG(nvn_gpu_fence_wait_at, nvn_gpu_rc (*)(uint64_t, uint64_t, nvn_gpu_err *, enum nvn_gpu_wait_site));
 SIG(nvn_gpu_surface_attach, nvn_gpu_rc (*)(void *, nvn_gpu_surface *, nvn_gpu_err *));
 SIG(nvn_gpu_surface_rebuild, nvn_gpu_rc (*)(nvn_gpu_surface, nvn_gpu_err *));
 SIG(nvn_gpu_surface_gen, uint64_t (*)(nvn_gpu_surface));
@@ -141,7 +149,7 @@ SIG(nvn_vsync_start, int (*)(uint32_t, nvn_vsync_fn, void *, char *, size_t));
 SIG(nvn_vsync_stop, void (*)(void));
 // #968 消费审查定稿 ①（10-30）：组合采样项 view 与 samp 同时装得下、互不重叠（原稿两者在同一个 union 里，只能放一个）
 _Static_assert(offsetof(nvn_gpu_binding, u.ts.samp) >= offsetof(nvn_gpu_binding, u.ts.view) + sizeof(nvn_gpu_view), "TEX_SAMP 的 view 与 samp 重叠");
-#define N_SIG 74   // 上面 SIG 的条数：nvn_gpu_* 72 + nvn_vsync_* 2（.mk 核对声明数）
+#define N_SIG 84   // nvn_gpu_* 82 + nvn_vsync_* 2（.mk 核对声明数）
 
 int main(void) {
     // 运行期只做一件不依赖实现的事：典型调用点的结构体能按契约填出来（零初始化 + 字段可写），证明头文件里的类型完整可用

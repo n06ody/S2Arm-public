@@ -42,7 +42,7 @@ static void rt_gpu(const tex_t *t, unsigned level, uint32_t first, uint32_t nz, 
     const uint64_t t0 = rt_now();
     nvn_gpu_err err = {0};
     const uint64_t prior = nvn_be_last_fence();
-    if (prior && !nvn_gpu_ok(nvn_gpu_fence_wait(prior, 5000000000ull, &err))) { nvn_hle_submit_unlock(); nvn_unimpl("be", "read_texels_gpu_wait", t); return; }
+    if (prior && !nvn_gpu_ok(rp_fence_wait_at(prior, 5000000000ull, &err, NVN_GPU_WAIT_READ_PRIOR))) { nvn_hle_submit_unlock(); nvn_unimpl("be", "read_texels_gpu_wait", t); return; }
     const uint64_t t1 = rt_now();
     nvn_gpu_buf buf = NULL;
     if (!nvn_gpu_ok(nvn_gpu_buf_create(total, NVN_GPU_MEM_SHARED, NULL, &buf, &err)) || !buf || !nvn_gpu_buf_cpu(buf)) {
@@ -57,7 +57,7 @@ static void rt_gpu(const tex_t *t, unsigned level, uint32_t first, uint32_t nz, 
     NVNcopyRegion rr = *r; rr.zoffset = 0; rr.depth = 1;
     for (uint32_t z = 0; z < nz; z++) nvn_gpu_copy_tex_buf(c, g, level, first + z, &rr, buf, (uint64_t)z * ss, wb, slice);
     const uint64_t f = rp_side_commit(c);
-    const int ok = f && nvn_gpu_ok(nvn_gpu_fence_wait(f, 5000000000ull, &err));
+    const int ok = f && nvn_gpu_ok(rp_fence_wait_at(f, 5000000000ull, &err, NVN_GPU_WAIT_READ_COPY));
     nvn_hle_submit_unlock();
     if (!ok) { nvn_gpu_buf_release(buf, NULL, NULL); nvn_unimpl("be", "read_texels_gpu_wait", t); return; }
     const uint8_t *src = nvn_gpu_buf_cpu(buf);
