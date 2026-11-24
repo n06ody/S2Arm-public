@@ -1544,7 +1544,7 @@ int main(void) {
         snprintf(g_dir, sizeof g_dir, "%s", tmpl);
     }
 
-    // ---- s2a_libpack_stage_sbuf_slots：图形阶段键用到哪几个存储缓冲槽（引擎据此判断「非对齐的绑定」会不会影响这个程序） ----
+    // ---- s2a_libpack_stage_sbuf_slots：阶段键用到哪几个存储缓冲槽（引擎据此判断「非对齐的绑定」会不会影响这个程序） ----
     // 判据：一律与 program_v1 的合成同口径——整份 json 语法完整、dm_ctl == 键、stage == 本阶段；sbuf 的 reg（NVN 槽，0..15）进集合；
     //   已知的非存储种类跳过；其余（别的存储种类 / 不认得的种类 / 缺字段 / 槽号越界 / 库里没有这一份）一律「说不准」，不许当成「没用存储」。
     //   说不准时 *slots 清零、返回 1；只读，不动 hits / misses / rejects 计数。
@@ -1620,6 +1620,11 @@ int main(void) {
             /* 36 */ { "gs", 3, 115, NULL, SB("sbuf", 1, 0), NULL, SV_PSB_FIRST, EX_NONE },
             /* 37 */ { "gs", 3, 115, NULL, SB("sbuf", 1, 0), NULL, SV_CLEAN, EX_PSB_B },
             /* 38 */ { "vs", 0, 1, NULL, SB("sbuf", 2, 0), NULL, SV_CLEAN, EX_PSB_VG3 },
+            /* 39 */ { "cs", 0, 1, NULL, SB("sbuf", 15, 0) "," SB("sbuf", 0, 1), NULL, SV_CLEAN, EX_NONE },
+            /* 40 */ { "cs", 0, 1, NULL, "", NULL, SV_CLEAN, EX_NONE },
+            /* 41 */ { "cs", 0, 1, NULL, SB("ubo_ptr", 2, 0), NULL, SV_CLEAN, EX_NONE },
+            /* 42 */ { "cs", 0, 1, NULL, "", NULL, SV_PSB_FIRST, EX_NONE },
+            /* 43 */ { "cs", 0, 1, NULL, "", NULL, SV_NONE, EX_NONE },
         };
         enum { NC = (int)(sizeof C / sizeof C[0]) };
         enum { NREC = 3 * NC + 4 };   // 每个用例至多 json + spv + 一份别种 spv；末尾 4 条是标准夹具
@@ -1720,7 +1725,12 @@ int main(void) {
             { 38, 0, NULL,      0x4u, 0, "顶点段只看 _b.spv：同键的 _vg3.spv 带该能力也不影响 → 读到 0x4" },
             { 0,  3, NULL,  0u, 1, "细分控制段 → 说不准" },
             { 0,  4, NULL,  0u, 1, "细分求值段 → 说不准" },
-            { 0,  5, NULL,  0u, 1, "计算段不走这里 → 说不准" },
+            {  0, 5, NULL,      0u, 1, "把顶点库件当计算段 → 说不准" },
+            { 39, 5, NULL, 0x8001u, 0, "计算段使用 NVN 槽 0 和 15 → 0x8001" },
+            { 40, 5, NULL,      0u, 0, "计算段明确没有存储槽 → 已知零掩码" },
+            { 41, 5, NULL,      0u, 1, "计算段经 UBO 指针访问存储 → 说不准" },
+            { 42, 5, NULL,      0u, 2, "计算段声明按地址访问内存 → 不信零掩码" },
+            { 43, 5, NULL,      0u, 1, "计算段缺 SPIR-V → 不信零掩码" },
             { 0, 99, NULL,  0u, 1, "阶段号越界 → 说不准" },
         };
         for (size_t q = 0; q < sizeof Q / sizeof Q[0]; q++) {

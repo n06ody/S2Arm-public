@@ -61,7 +61,7 @@ def main():
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
-                  '--live-compile-stop', '--cs-libpack', '--lp-gate')
+                  '--live-compile-stop', '--cs-libpack', '--cs-used-slots', '--lp-gate')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout)
@@ -551,8 +551,8 @@ def main():
              '{ (void)rp_S.skey[5]; }', 1, 'changed CS source key recompiles'),
             ('cs-ubo-use-omitted', '{ uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; MIX(m); }',
              '{ (void)rp_S.ubo[5]; }', 1, 'changed CS constant-buffer use recompiles'),
-            ('cs-unaligned-omitted', 'rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un);',
-             'rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un & 0);', 1, 'unaligned CS storage address recompiles'),
+            ('cs-unaligned-omitted', 'MIX(unaligned); MIX(pc->storage_buffer_offset_alignment);',
+             'MIX(unaligned & 0); MIX(pc->storage_buffer_offset_alignment);', 1, 'unaligned CS storage address recompiles'),
             ('cs-pool-omitted', 'MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tex_base);',
              'MIX(0);', 1, 'CS pool size update recompiles'),
             ('cs-combined-omitted', 'MIX(combined_fact_sig(5));', '(void)0;', 1, 'changed CS texture fact recompiles'),
