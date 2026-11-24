@@ -66,44 +66,61 @@ static uint64_t plc_save_ns_frame(void) {
     g_plc_ns_last = rd.ns;
     return d;
 }
-static const char *const mirror_metrics[] = {
-    "mirror_flush_calls", "mirror_flush_payload", "mirror_flush_bytes", "mirror_flush_ns",
-    "mirror_invalidate_calls", "mirror_invalidate_payload", "mirror_invalidate_bytes", "mirror_invalidate_ns",
-    "mirror_wait_calls", "mirror_wait_ns",
+enum {
+    LAND_FLUSH_N, LAND_FLUSH_PAYLOAD, LAND_FLUSH_BYTES, LAND_FLUSH_NS,
+    LAND_INV_N, LAND_INV_PAYLOAD, LAND_INV_BYTES, LAND_INV_NS,
+    LAND_WAIT_N, LAND_WAIT_NS, LAND_WAIT_UPLOAD, LAND_WAIT_TRANSFER, LAND_WAIT_STORAGE, LAND_WAIT_INDIRECT,
+    LAND_WAIT_LAST_SEGMENT, LAND_METRIC_N,
 };
-static uint64_t g_mirror_metrics_last[sizeof mirror_metrics / sizeof mirror_metrics[0]];
+static const char *const mirror_metrics[LAND_METRIC_N] = {
+    [LAND_FLUSH_N] = "mirror_flush_calls", [LAND_FLUSH_PAYLOAD] = "mirror_flush_payload",
+    [LAND_FLUSH_BYTES] = "mirror_flush_bytes", [LAND_FLUSH_NS] = "mirror_flush_ns",
+    [LAND_INV_N] = "mirror_invalidate_calls", [LAND_INV_PAYLOAD] = "mirror_invalidate_payload",
+    [LAND_INV_BYTES] = "mirror_invalidate_bytes", [LAND_INV_NS] = "mirror_invalidate_ns",
+    [LAND_WAIT_N] = "mirror_wait_calls", [LAND_WAIT_NS] = "mirror_wait_ns",
+    [LAND_WAIT_UPLOAD] = "mirror_wait_upload_calls", [LAND_WAIT_TRANSFER] = "mirror_wait_transfer_calls",
+    [LAND_WAIT_STORAGE] = "mirror_wait_storage_calls", [LAND_WAIT_INDIRECT] = "mirror_wait_indirect_calls",
+    [LAND_WAIT_LAST_SEGMENT] = "mirror_wait_last_segment",
+};
+static uint64_t g_mirror_metrics_last[LAND_WAIT_LAST_SEGMENT];
 
 static void mirror_metric(void *user, const char *name, uint64_t value) {
     uint64_t *stats = user;
-    for (size_t i = 0; i < sizeof mirror_metrics / sizeof mirror_metrics[0]; i++)
+    for (size_t i = 0; i < LAND_METRIC_N; i++)
         if (!strcmp(name, mirror_metrics[i])) { stats[i] = value; return; }
 }
 
 static void land_profile(const uint64_t pf[RP_PERF_N], uint64_t frames, uint64_t now) {
     if (!nvn_gpu_stats || !frames) return;
-    uint64_t stats[sizeof g_mirror_metrics_last / sizeof g_mirror_metrics_last[0]] = {0};
+    uint64_t stats[LAND_METRIC_N] = {0};
     nvn_gpu_stats(mirror_metric, stats, 0);
     int active = pf[RP_PERF_LAND_CACHED_BYTES] || pf[RP_PERF_LAND_UNCACHED_BYTES];
-    for (size_t i = 0; i < sizeof stats / sizeof stats[0]; i++) {
+    for (size_t i = 0; i < LAND_WAIT_LAST_SEGMENT; i++) {
         const uint64_t previous = g_mirror_metrics_last[i];
         g_mirror_metrics_last[i] = stats[i];
         if (stats[i] >= previous) stats[i] -= previous;
         active |= stats[i] != 0;
     }
     if (!active) return;
+    // 原因按窗口计数，被等段为这个窗口最近一笔等待的信号值。
+    const uint64_t waited = stats[LAND_WAIT_N] ? stats[LAND_WAIT_LAST_SEGMENT] : 0;
     const double f = (double)frames;
-    char b[512];
+    char b[640];
     snprintf(b, sizeof b,
              "落地镜像 mono_ns=%llu presents=%llu 每上屏："
              "land.cached=%.0f B %.4f ms land.uncached=%.0f B %.4f ms "
              "flush=%.2f 次 %.0f B 有效/%.0f B 对齐 %.4f ms "
-             "invalidate=%.2f 次 %.0f B 有效/%.0f B 对齐 %.4f ms wait=%.2f 次 %.4f ms",
+             "invalidate=%.2f 次 %.0f B 有效/%.0f B 对齐 %.4f ms wait=%.2f 次 %.4f ms "
+             "wait_reason=upload:%llu,transfer:%llu,storage:%llu,indirect:%llu waited_segment=%llu",
              (unsigned long long)now, (unsigned long long)frames,
              pf[RP_PERF_LAND_CACHED_BYTES] / f, pf[RP_PERF_LAND_CACHED_NS] / 1e6 / f,
              pf[RP_PERF_LAND_UNCACHED_BYTES] / f, pf[RP_PERF_LAND_UNCACHED_NS] / 1e6 / f,
-             stats[0] / f, stats[1] / f, stats[2] / f, stats[3] / 1e6 / f,
-             stats[4] / f, stats[5] / f, stats[6] / f, stats[7] / 1e6 / f,
-             stats[8] / f, stats[9] / 1e6 / f);
+             stats[LAND_FLUSH_N] / f, stats[LAND_FLUSH_PAYLOAD] / f, stats[LAND_FLUSH_BYTES] / f, stats[LAND_FLUSH_NS] / 1e6 / f,
+             stats[LAND_INV_N] / f, stats[LAND_INV_PAYLOAD] / f, stats[LAND_INV_BYTES] / f, stats[LAND_INV_NS] / 1e6 / f,
+             stats[LAND_WAIT_N] / f, stats[LAND_WAIT_NS] / 1e6 / f,
+             (unsigned long long)stats[LAND_WAIT_UPLOAD], (unsigned long long)stats[LAND_WAIT_TRANSFER],
+             (unsigned long long)stats[LAND_WAIT_STORAGE], (unsigned long long)stats[LAND_WAIT_INDIRECT],
+             (unsigned long long)waited);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
 }
 
