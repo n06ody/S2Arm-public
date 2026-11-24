@@ -33,6 +33,16 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 printf 'feedback validation: sync=1 shader_accesses_heuristic=1 settings=%s\n' "$VK_LAYER_SETTINGS_PATH"
+if [[ ${S2A_TEST_PASS_DIAG_ONLY:-} == 1 ]]; then
+    for dq in 0 1; do
+        for arm in ${S2A_TEST_PASS_DIAG_ARMS:-off pass snapshot both}; do
+            log="$out/pass-diag-dq$dq-$arm.log"
+            S2A_TEST_PASS_DIAG="$arm" timeout 120 "$out/test" "$out/shaders" "$dq" 0 1 1 2>&1 | tee "$log"
+            python3 "$repo/android/tests/vk/check_pass_diag.py" "$arm" "$log"
+        done
+    done
+    exit 0
+fi
 failed=0
 # 案例数：0–11（12）+ 深度 2 + 中止 1 + 16 / 17 + 守卫 18 + 整池组回收 20 = 19；opt=0 另有 15 / 19（要求池里的图都是 GENERAL），共 21；opt=1 共 19。
 cases_want() { echo $((21 - 2 * $1)); }

@@ -44,12 +44,21 @@ struct rp_prog {
     // 用它跨会话定位「同一份程序」；全 0 = 没有身份（失败项 / 还没算出来），这种程序不进任何清单。
     uint8_t identity[32];
 };
+// 可选的单笔诊断，由调用方清零，解析期间只由当前提交线程写。
+struct rp_shader_hitch {
+    // 互不重叠的 CPU 墙钟区间。命中/拒收覆盖已知结果，普通 miss 留在 resolve 总耗时中。
+    // inflight 是等待同身份程序发布，worker 是等待实时编译队列，compile 是当前线程同步编译。
+    uint64_t hit_ns, reject_ns, inflight_ns, compile_ns, worker_ns, build_ns;
+    uint8_t first_identity[32], last_identity[32];
+    unsigned candidates, hits, rejects;
+};
 struct rp_shader_req {
     uint32_t prim;              // NVNdrawPrimitive
     int rt_count;               // 当前颜色目标个数
     uint32_t rt_format[8];      // 各颜色目标的 NVN 格式（视图改了格式的取视图的）；0 = 空槽
     // 仅在提交线程发现现编结果尚未就绪时调用。可暂缓则返回 1 并写入预算所属帧。
     int (*compile_defer_frame)(uint64_t *frame);
+    struct rp_shader_hitch *hitch;
 };
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。

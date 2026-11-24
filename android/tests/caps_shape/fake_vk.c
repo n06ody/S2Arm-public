@@ -115,6 +115,12 @@ static const char *feature_struct_bad(int st, const struct cs_shape *s) {
         return cs_any_ext(s, "VK_EXT_vertex_attribute_divisor", "VK_KHR_vertex_attribute_divisor") || eff >= VK_API_VERSION_1_4 ? NULL : "vertex_attribute_divisor 特性结构（VK_EXT/KHR_vertex_attribute_divisor）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
         return cs_any_ext(s, "VK_EXT_swapchain_maintenance1", "VK_KHR_swapchain_maintenance1") ? NULL : "swapchain_maintenance1 特性结构（VK_EXT/KHR_swapchain_maintenance1）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) ? NULL : "EDS1 特性结构缺扩展";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME) ? NULL : "EDS2 特性结构缺扩展";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) ? NULL : "动态顶点输入特性结构缺扩展";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
         return cs_has_ext(s, "VK_KHR_timeline_semaphore") || eff >= VK_API_VERSION_1_2 ? NULL : "timeline 特性结构（1.2 核心 / VK_KHR_timeline_semaphore）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES:
@@ -133,6 +139,18 @@ static void features_chain(void *next, int for_create, const struct cs_shape *s)
         switch ((int)b->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
             BIT(((VkPhysicalDeviceShaderDrawParametersFeatures *)b)->shaderDrawParameters, s->shaderDrawParameters, "shaderDrawParameters"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *)b)->extendedDynamicState,
+                s->extendedDynamicState, "extendedDynamicState"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: {
+            VkPhysicalDeviceExtendedDynamicState2FeaturesEXT *eds2 = (void *)b;
+            BIT(eds2->extendedDynamicState2, s->extendedDynamicState2, "extendedDynamicState2");
+            BIT(eds2->extendedDynamicState2LogicOp, s->extendedDynamicState2LogicOp, "extendedDynamicState2LogicOp");
+            BIT(eds2->extendedDynamicState2PatchControlPoints, s->extendedDynamicState2PatchControlPoints,
+                "extendedDynamicState2PatchControlPoints"); break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT *)b)->vertexInputDynamicState,
+                s->vertexInputDynamicState, "vertexInputDynamicState"); break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
             BIT(((VkPhysicalDeviceTimelineSemaphoreFeatures *)b)->timelineSemaphore, s->timelineSemaphore && cs_has_ext(s, "VK_KHR_timeline_semaphore"), "timelineSemaphore"); break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT:

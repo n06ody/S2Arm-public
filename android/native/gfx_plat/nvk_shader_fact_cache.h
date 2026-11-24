@@ -109,9 +109,15 @@ static nvn_hmap g_fact_variants = {.klen = 32};
 static nvn_hmap g_fact_aliases = {.klen = 32};
 
 static const struct rp_prog *fact_cache_find(const struct s2a_input_identity *id, const uint8_t base[32]) {
+    struct rp_shader_hitch *h = g_fact_hitch;
+    const uint64_t start = shader_hitch_start(h);
     for (struct fact_variant *v = nvn_hm_get(&g_fact_variants, base); v; v = v->next) {
         uint8_t key[32];
         if (fact_cache_hash(id, v->mask, key) && !memcmp(key, v->key, 32)) {
+            if (h) {
+                const int bad = v->prog->lib_bad;
+                shader_hitch_lookup(h, start, !bad, bad);
+            }
             return v->prog;
         }
     }

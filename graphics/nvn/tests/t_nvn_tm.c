@@ -13,13 +13,18 @@
 #define main replay_fixture_main
 #define nvn_plat_flag fixture_plat_flag
 #define nvn_plat_log fixture_plat_log
+#define plat_now_ns fixture_plat_now_ns
+#define rp_shader_resolve fixture_shader_resolve
 #include "t_nvn_replay.c"
+#undef rp_shader_resolve
+#undef plat_now_ns
 #undef nvn_plat_log
 #undef nvn_plat_flag
 #undef main
+#include <errno.h>
 #include <limits.h>
-#if defined(__linux__)
 #include <time.h>
+#if defined(__linux__)
 #include <unistd.h>
 #include <sys/syscall.h>
 #endif
@@ -27,16 +32,46 @@
 // ---------- 开关与日志替身 ----------
 static int g_tm_stride_flag = INT_MIN;   // INT_MIN = 没设（取产品缺省 32）
 static int g_tm_full_flag;
+static int g_hitch_flag, g_hitch_threshold_reads;
+static uint64_t g_present_mono_ns = 5000000000ull;
+uint64_t plat_now_ns(void) { return g_present_mono_ns; }
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tm_stride") && g_tm_stride_flag != INT_MIN) return g_tm_stride_flag;
     if (!strcmp(name, "nvk_tm_full")) return g_tm_full_flag;
+    if (!strcmp(name, "nvk_hitch_log")) return g_hitch_flag;
+    if (!strcmp(name, "hitch_ms")) { g_hitch_threshold_reads++; return 25; }
     return fixture_plat_flag(name, dflt);
 }
 // 抓「分时」里要比对的几行（INFO 级；每个前缀留最后一条）
 enum { L_DRAW, L_PASS, L_RES, L_NOTE, L_N };
 static const char *const k_line_prefix[L_N] = {"分时（绘制各步，每帧毫秒）：", "分时（开通道与取管线细分，每帧毫秒）：", "分时（贴图解析，每帧）：", "分时（计时抽样）："};
 static char g_line[L_N][1400];
+static unsigned g_hitch_rows, g_hitch_details;
+static char g_hitch_text[1280], g_hitch_detail[1280];
+static unsigned g_hitch_program_rows;
+static char g_hitch_program[1280];
+static int g_delay_resolve;
+int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out) {
+    if (g_delay_resolve) {
+        struct timespec delay = {.tv_nsec = 35000000};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    }
+    return fixture_shader_resolve(q, out);
+}
 void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (level == NVN_PLAT_LOG_INFO && !strncmp(text, "S2A_HITCH_PROGRAM ", sizeof "S2A_HITCH_PROGRAM " - 1)) {
+        g_hitch_program_rows++;
+        snprintf(g_hitch_program, sizeof g_hitch_program, "%s", text);
+    }
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "present")) {
+        if (!strncmp(text, "长帧 ", strlen("长帧 "))) {
+            g_hitch_rows++;
+            snprintf(g_hitch_text, sizeof g_hitch_text, "%s", text);
+        } else if (!strncmp(text, "S2A_HITCH_REPLAY ", strlen("S2A_HITCH_REPLAY "))) {
+            g_hitch_details++;
+            snprintf(g_hitch_detail, sizeof g_hitch_detail, "%s", text);
+        }
+    }
     if (level == NVN_PLAT_LOG_INFO) for (int i = 0; i < L_N; i++) if (!strncmp(text, k_line_prefix[i], strlen(k_line_prefix[i]))) { snprintf(g_line[i], sizeof g_line[i], "%s", text); break; }
     fixture_plat_log(level, cls, text);
 }
@@ -238,8 +273,100 @@ static void t_tm_lines(void) {
 }
 #endif
 
+static int t_tm_hitch(int enabled) {
+    g_hitch_flag = enabled;
+    pass_fresh();
+    rp_present_reset();
+    set_tm(32, 0);
+    CHECK(rp_tm_stride() == (enabled ? 1u : 32u));
+    rp_present_set_surface(&g_fake_surf, 120);
+    tex_t rt = mk_tex(953, 0, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+    CHECK(nvn_be_present(&rt, 0, NULL) == 1);
+    g_present_mono_ns += 24000000;
+    CHECK(nvn_be_present(&rt, 0, NULL) == 2);
+    g_present_mono_ns += 25000000;
+    CHECK(nvn_be_present(&rt, 0, NULL) == 3);
+    CHECK(g_hitch_rows == 0 && g_hitch_details == 0);
+    stream replay = {0};
+    end(&replay);
+    submit1(&replay);
+    fake_complete(NVN_GPU_DONE_OK);
+    g_present_mono_ns += 25000001;
+    CHECK(nvn_be_present(&rt, 0, NULL) == 4);
+    CHECK(g_hitch_rows == (unsigned)enabled && g_hitch_details == (unsigned)enabled);
+    if (enabled) {
+        CHECK(strstr(g_hitch_text, "提交 1 次") != NULL);
+        CHECK(strstr(g_hitch_detail, "S2A_HITCH_REPLAY v=1 mono_ns=5074000001 ") == g_hitch_detail);
+    }
+    g_present_mono_ns += 25000000;
+    CHECK(nvn_be_present(&rt, 0, NULL) == 5);
+    CHECK(g_hitch_rows == (unsigned)enabled && g_hitch_details == (unsigned)enabled);
+    CHECK(g_fl_presents == 5 && g_hitch_threshold_reads == enabled);
+    if (g_hitch_details) puts(g_hitch_detail);
+    printf("t_nvn_tm hitch=%d: %d checks, %d failures\n", enabled, g_checks, g_fail);
+    return g_fail ? 1 : 0;
+}
+
+static int t_tm_hitch_program(int enabled) {
+    g_hitch_flag = enabled;
+    pass_fresh();
+    set_tm(32, 0);
+    stream s = {0};
+    q_env(&s);
+    memset(g_fprog.identity, 0x7a, sizeof g_fprog.identity);
+    q_draw(&s);
+    end(&s);
+
+    nvn_be_set_frame(46);
+    int draws = g_gdraws;
+    submit1(&s);
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == draws + 1 && g_hitch_program_rows == 0);
+
+    rp_draw_reset();                         // 下一笔必须重新进入程序解析
+    nvn_be_set_frame(47);
+    g_delay_resolve = 1;
+    submit1(&s);
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == draws + 2);
+    CHECK(g_hitch_program_rows == (unsigned)enabled);
+    if (enabled) {
+        CHECK(strstr(g_hitch_program, " frame=47 ") != NULL);
+        CHECK(strstr(g_hitch_program, " program=7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a ") != NULL);
+        const char *pre = strstr(g_hitch_program, " pre_ns=");
+        const char *resolve = strstr(g_hitch_program, " resolve_ns=");
+        const char *post = strstr(g_hitch_program, " post_ns=");
+        CHECK(pre && resolve && post);
+        CHECK(resolve && strtoull(resolve + sizeof " resolve_ns=" - 1, NULL, 10) >= 35000000);
+        unsigned long long start = 0, end = 0;
+        CHECK(sscanf(g_hitch_program, "S2A_HITCH_PROGRAM v=1 mono_ns=%llu start_ns=%llu", &end, &start) == 2);
+        CHECK(pre && resolve && post && start > 0 && end > start &&
+              end - start == strtoull(pre + sizeof " pre_ns=" - 1, NULL, 10) +
+                             strtoull(resolve + sizeof " resolve_ns=" - 1, NULL, 10) +
+                             strtoull(post + sizeof " post_ns=" - 1, NULL, 10));
+    }
+    if (g_hitch_program_rows) puts(g_hitch_program);
+
+    rp_draw_reset();
+    nvn_be_set_frame(48);
+    g_resolve_rc = 1;
+    submit1(&s);
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_gdraws == draws + 2 && g_hitch_program_rows == 2u * (unsigned)enabled);
+    if (enabled) {
+        CHECK(strstr(g_hitch_program, " frame=48 ") != NULL);
+        CHECK(strstr(g_hitch_program, " called=1 rc=1 program=- ") != NULL);
+        CHECK(strstr(g_hitch_program, " post_ns=0 ") != NULL);
+    }
+    printf("t_nvn_tm hitch-program=%d: %d checks, %d failures\n", enabled, g_checks, g_fail);
+    return g_fail ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    if (argc == 2 && !strcmp(argv[1], "--hitch-program-on")) return t_tm_hitch_program(1);
+    if (argc == 2 && !strcmp(argv[1], "--hitch-program-off")) return t_tm_hitch_program(0);
+    if (argc == 2 && !strcmp(argv[1], "--hitch-on")) return t_tm_hitch(1);
+    if (argc == 2 && !strcmp(argv[1], "--hitch-off")) return t_tm_hitch(0);
     t_tm_flag();
     t_tm_frames();
 #if HAVE_FAKE_CLOCK

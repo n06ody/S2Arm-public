@@ -13,6 +13,8 @@ struct cs_shape {
         vertexAttributeInstanceRateDivisor, vertexAttributeInstanceRateZeroDivisor,
         formatA4B4G4R4, formatA4R4G4B4, depthClipControl, swapchainMaintenance1,
         diRuntimeArray, diPartiallyBound, diSampledNonUniform, diStorageNonUniform, diVariableCount, diSampledUpdateAfterBind;
+    int extendedDynamicState, extendedDynamicState2, extendedDynamicState2LogicOp,
+        extendedDynamicState2PatchControlPoints, vertexInputDynamicState;
     int driver_id;
     const char *driver_name;
     uint64_t max_alloc, host_align;
