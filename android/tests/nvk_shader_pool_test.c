@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <time.h>
 #include "nvn.h"
+#include "libpack_texture_spirv.h"
 #include "rp_shader.h"
 #include "rp_state.h"
 #include "rp_res.h"
@@ -115,8 +116,9 @@ static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
-static int fixture_warm_nowindow, fixture_warm_capture;
+static int fixture_warm_nowindow, fixture_warm_capture, fixture_no_libpack;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "no_libpack") && fixture_no_libpack) return 1;
     if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
     if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
@@ -177,10 +179,12 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
 }
 static uint32_t fixture_ssbo_align;   // 设备 minStorageBufferOffsetAlignment（非窗口补件夹具要非对齐的存储缓冲基址，请求才带 hasUnalignedStorageBuffer）
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
+static uint32_t sampled_fixture_format;
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     // 77：带视图（改目标为 RECTANGLE）；78 / 79：同一组格式 / 目标 / 深度的两个不同句柄（快路按事实认，不按句柄认）。
     if (!separate_fixture || (id != 77 && id != 78 && id != 79 && !(separate_fixture == 2 && id == 0))) return 0;
     memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
+    if (sampled_fixture_format && id == 78) t->d.format = sampled_fixture_format;
     if (separate_fixture == 3) t->d.target = NVN_TEXTURE_TARGET_BUFFER;
     if (separate_fixture == 4) t->d.format = NVN_FORMAT_RGBA8_UI2F;   // 登记了，但 UI2F 不出编译事实
     if (separate_fixture == 5 && id != 77) { t->d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t->d.depth = id == 78 ? 2 : 8; }   // 78 / 79：二维数组贴图，层数 2 / 8（事实里的 array_length）
@@ -1853,7 +1857,7 @@ static void test_nowindow_seed(const char *root, const char *manifest, const str
     fake_gs_result_mode = 0;
 }
 
-static int gs_libpack_test(int diagnose_refusals) {
+static int gs_libpack_test(int diagnose_refusals, int numeric) {
     fake_depth_clip = 1;   // 深度 near=-w 也能用预编库（libpack_state_ok），夹具不带深度零
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     uint8_t k[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, k[st]);
@@ -1875,14 +1879,19 @@ static int gs_libpack_test(int diagnose_refusals) {
     static const uint32_t spv_vg0[6] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u};
     static const uint32_t spv_vg3[7] = {0x07230203u, 0x00010300u, 0, 1, 0, 0x00010000u, 0x00010000u};
     char hx[3][17]; for (int st = 0; st < 3; st++) for (int b = 0; b < 8; b++) snprintf(hx[st] + 2 * b, 3, "%02x", k[st][b]);
-    char jvs[160], jfs[160], jg0[200], jg3[200];
+    char jvs[160], jfs[512], jg0[200], jg3[200];
     snprintf(jvs, sizeof jvs, "{\"stage\":\"vs\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[0]);
     snprintf(jfs, sizeof jfs, "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":[]}", hx[1]);
     snprintf(jg0, sizeof jg0, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":0,\"bindings\":[]}", hx[2]);
     snprintf(jg3, sizeof jg3, "{\"stage\":\"gs\",\"dm_ctl\":\"%s\",\"gs_input_topology\":3,\"bindings\":[]}", hx[2]);
+    if (numeric) snprintf(jfs, sizeof jfs,
+        "{\"stage\":\"ps\",\"dm_ctl\":\"%s\",\"bindings\":["
+        "{\"msl_name\":\"fp_c3\",\"kind\":\"cbuf\",\"reg\":0,\"arg_id\":0},"
+        "{\"msl_name\":\"fp_t_sep\",\"kind\":\"tex\",\"reg\":128,\"arg_id\":1},"
+        "{\"msl_name\":\"fp_i0\",\"kind\":\"img\",\"reg\":2,\"arg_id\":2}]}", hx[1]);
     struct { uint64_t key; uint8_t kind; const uint8_t *d; size_t n; } rec[8] = {
         {lp_key(k[0]), 1, (const uint8_t *)jvs, strlen(jvs)}, {lp_key(k[0]), 52, (const uint8_t *)spv0, sizeof spv0},
-        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, (const uint8_t *)spv0, sizeof spv0},
+        {lp_key(k[1]), 1, (const uint8_t *)jfs, strlen(jfs)}, {lp_key(k[1]), 52, numeric ? libpack_frag_spv : (const uint8_t *)spv0, numeric ? sizeof libpack_frag_spv : sizeof spv0},
         {lp_key(k[2]), 112, (const uint8_t *)jg0, strlen(jg0)}, {lp_key(k[2]), 115, (const uint8_t *)jg3, strlen(jg3)},
         {lp_key(k[2]), 120, (const uint8_t *)spv_vg0, sizeof spv_vg0}, {lp_key(k[2]), 123, (const uint8_t *)spv_vg3, sizeof spv_vg3},
     };
@@ -1919,6 +1928,38 @@ static int gs_libpack_test(int diagnose_refusals) {
     static const char prof_off[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16,\"supportsGeometryShader\":false}}";
     snprintf(external_profile, sizeof external_profile, "%s", prof_on);
     fake_gs_success = 1;
+    if (numeric) {
+        rp_S.bser[2] = 0;
+        bind_pools(100);
+        rp_S.tex[1][128] = 78;
+        separate_fixture = 1;
+        fake_gs_result_mode = 1;
+        const uint32_t formats[] = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA8UI, NVN_FORMAT_RGBA8I};
+        for (unsigned i = 0; i < 3; i++) {
+            bind_pools(100);
+            sampled_fixture_format = formats[i];
+            rp_shader_reset(); compiler_calls = 0;
+            setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+            struct rp_shader_req q = {0}; q.prim = 4;
+            const struct rp_prog *pg = NULL;
+            int rc = rp_shader_resolve(&q, &pg);
+            CHECK(!rc && pg && pg->lib_sourced == (i == 0) && compiler_calls == (i != 0),
+                  "cold sampled numeric admission format %u, rc=%d translations=%d", formats[i], rc, compiler_calls);
+            // 旧清单从一次普通编译取得；独立池长让它不会命中上面冷路径刚写的拒收表。
+            bind_pools(101); rp_shader_reset(); fixture_no_libpack = 1;
+            rc = rp_shader_resolve(&q, &pg); fixture_no_libpack = 0;
+            CHECK(!rc && pg && !pg->lib_sourced, "obtain the warm identity from ordinary compilation");
+            if (rc || !pg) continue;
+            struct nvk_prog_rec rec = {0}; memcpy(rec.identity, pg->identity, 32);
+            rec.stage_mask = 3; rec.lp_ok = 2; memcpy(rec.keys, k, 16);
+            rp_shader_reset(); compiler_calls = 0;
+            CHECK(!nvk_prog_warm_build(&rec), "warm candidate built before request facts");
+            pg = NULL; rc = rp_shader_resolve(&q, &pg);
+            CHECK(!rc && pg && pg->lib_sourced == (i == 0) && compiler_calls == (i != 0),
+                  "warm sampled numeric admission format %u, rc=%d translations=%d", formats[i], rc, compiler_calls);
+        }
+        goto cleanup_gs;
+    }
     if (diagnose_refusals) {
         link_refused_test(root,k,hx);
         goto cleanup_gs;
@@ -2548,8 +2589,9 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-stop")) return live_compile_pending_test(1);
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
-    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0);
-    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1);
+    if (argc == 2 && !strcmp(argv[1], "--lp-numeric")) return gs_libpack_test(0, 1);
+    if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
+    if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
     if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
