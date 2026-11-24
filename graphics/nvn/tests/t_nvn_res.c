@@ -431,9 +431,95 @@ static void t_res_tex_window_gpu(void) {
     }
 }
 
+// 只替代物理存储选择，实际资源表、脏页核对、pin 与视图重建仍走回放入口。
+static unsigned g_bc1_snapshots;
+static int fixture_bc1_replace(nvn_gpu_tex old, int opaque, nvn_gpu_tex *out) {
+    nvn_gpu_tex_desc d = old->d;
+    d.usage &= ~NVN_GPU_TEX_BC1_OPAQUE;
+    if (opaque) d.usage |= NVN_GPU_TEX_BC1_OPAQUE;
+    if (d.usage == old->d.usage) return 0;
+    nvn_gpu_err err = {0};
+    return nvn_gpu_ok(nvn_gpu_tex_create(&d, out, &err)) ? 1 : -1;
+}
+
+int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex tex, const void *bytes, uint64_t size,
+                            uint64_t serial, nvn_gpu_tex *out) {
+    *out = NULL;
+    CHECK(c && serial == 9390 && tex->d.d.width == 4 && tex->d.d.height == 4 && tex->d.d.levels == 1);
+    uint32_t words[2] = {0};
+    nvn_texlayout layout;
+    nvn_tex_layout(&tex->d.d, &layout);
+    CHECK(size == layout.size && nvn_deswizzle(&tex->d.d, 0, 0, bytes, words, sizeof words) == 0);
+    const uint32_t selectors = words[1] & (words[1] >> 1) & UINT32_C(0x55555555);
+    const int opaque = (words[0] & 0xffff) > (words[0] >> 16) || !selectors;
+    g_bc1_snapshots++;
+    return fixture_bc1_replace(tex, opaque, out) < 0 ? -1 : 1;
+}
+
+int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex tex, nvn_gpu_tex *out) {
+    CHECK(c);
+    *out = NULL;
+    return fixture_bc1_replace(tex, 0, out);
+}
+
+static void t_res_bc1_rebind(void) {
+    res_fresh();
+    g_caps_extra |= NVN_GPU_CAP_BC1_SNAPSHOT;
+    g_bc1_snapshots = 0;
+    const uint32_t opaque[] = {0x07e0f800, 0xe4e4e4e4}, punch[] = {0xf80007e0, 0xc0000000};
+    tex_t t = mk_tex(9390, 0, NVN_FORMAT_RGBA_DXT1, 4, 4, 1, 0);
+    t.mem = g_pmem;
+    memset(t.mem, 0, t.L.size);
+    memcpy(t.mem, opaque, sizeof opaque);
+    nvn_be_reg_tex(3, &t, NULL);
+    nvn_be_sub_begin();
+    rp_view_pin_begin();
+    nvn_gpu_view old = rp_view_by_id(3, &g_fake_cmd, NULL);
+    nvn_gpu_view unregistered = rp_view_for(&t, NULL, &g_fake_cmd);
+    CHECK(old && unregistered && (old->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    const int old_id = old ? old->rid : 0;
+    const int unregistered_id = unregistered ? unregistered->rid : 0;
+    const uint64_t gen = rp_tex_reg_gen();
+    CHECK(g_bc1_snapshots == 1);
+
+    // 只翻一个 BC1 选择码就须整图换回。热登记视图和按对象取视图都须取到新版。
+    memcpy(t.mem, punch, sizeof punch);
+    nvn_be_tex_cpu_written(&t);
+    CHECK(rp_tex_cpu_written(t.serial) == 1);
+    nvn_gpu_view next = rp_view_by_id(3, &g_fake_cmd, NULL);
+    nvn_gpu_view next_unregistered = rp_view_for(&t, NULL, &g_fake_cmd);
+    CHECK(next && next->rid != old_id && !(next->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    CHECK(next_unregistered && next_unregistered->rid != unregistered_id && next && next_unregistered->of == next->of);
+    CHECK(g_bc1_snapshots == 2 && rp_tex_reg_gen() == gen + 1);
+    CHECK(!was_view_released(old_id));
+    rp_view_pin_end();
+    CHECK(was_view_released(old_id));
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+
+    memcpy(t.mem, opaque, sizeof opaque);
+    nvn_be_tex_cpu_written(&t);
+    CHECK(rp_tex_cpu_written(t.serial) == 1);
+    nvn_be_sub_begin();
+    nvn_gpu_tex packed = rp_tex_resolve(&t, &g_fake_cmd);
+    CHECK(packed && (packed->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    nvn_gpu_tex plain = rp_tex_resolve_plain(&t, &g_fake_cmd);
+    CHECK(plain && !(plain->d.usage & NVN_GPU_TEX_BC1_OPAQUE) && rp_tex_resolve(&t, &g_fake_cmd) == plain);
+    CHECK(g_bc1_snapshots == 3);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&t);
+    g_caps_extra &= ~NVN_GPU_CAP_BC1_SNAPSHOT;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     if (argc > 1 && !strcmp(argv[1], "--gpu-window")) { t_res_tex_window_gpu(); return g_fail ? 1 : 0; }
+    t_res_bc1_rebind();
+    if (argc > 1 && !strcmp(argv[1], "--bc1-rebind")) {
+        printf("BC1 view rebind: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     t_res_tex_epoch();
     t_res_tex_epoch_unrelated();
     t_res_tex_unarmed();
