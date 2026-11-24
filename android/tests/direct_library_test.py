@@ -246,7 +246,7 @@ def make_result(request, request_id=None, corrupt=None):
     requested = {stage['stage']: stage for stage in request['program']['stages'] if stage is not None}
     cb_use = {name: stage['constantBufferUse'] for name, stage in requested.items()}
     # the compiler writes graphics stages in pipeline order (vs, gs, fs)
-    order = (['vs', 'gs', 'fs'] if 'gs' in requested else ['vs', 'fs']) if kind == 'graphics' else ['cs']
+    order = [stage for stage in ('vs', 'gs', 'fs', 'cs') if stage in requested]
     stages = []
     for name in order:
         spirv_sha = '0' * 64 if corrupt == 'spirv_sha' else sha256(SPIRV)
@@ -385,6 +385,22 @@ class LibraryTest(unittest.TestCase):
         return direct_library.read_index(Path(pack) / 'index.tsv')
 
     # -- 原生几何：v2 请求（五个 NVN 槽）与 vs / gs / fs 结果 -----------------------------
+    def test_vertex_only_request_result(self):
+        request = make_request(request_id='vertex-only')
+        request['program']['stages'] = request['program']['stages'][:1]
+        parsed = direct_library.validate_request(json.dumps(request).encode(), 'vertex request')
+        self.assertEqual(parsed['_stages'], ['vs'])
+        direct_library.validate_result(make_result(request), 'vertex result', request=parsed)
+        request['requiresLinkedVaryingInterface'] = True
+        with self.assertRaisesRegex(direct_library.LibraryError, 'VS/FS pair'):
+            direct_library.validate_request(json.dumps(request).encode(), 'linked vertex')
+        request.pop('requiresLinkedVaryingInterface')
+        request['program']['stages'][0]['stage'] = 'fs'
+        with self.assertRaisesRegex(direct_library.LibraryError, 'program.stages'):
+            direct_library.validate_request(json.dumps(request).encode(), 'fragment only')
+        with self.assertRaisesRegex(direct_library.LibraryError, 'content.stages'):
+            direct_library.validate_result(make_result(request), 'fragment only')
+
     def test_geometry_program_request_result_and_build(self):
         request = make_geometry_request()
         parsed = direct_library.validate_request(json.dumps(request).encode(), 'gs request')

@@ -14,7 +14,9 @@
 #include "rp_shader.h"
 #include "rp_access.h"
 #include "nvn_unimpl.h"
+#define NVN_HM_HITCH_PROBE
 #include "nvn_hmap.h"
+#undef NVN_HM_HITCH_PROBE
 #include "nvn_plat.h"
 #include "nvn_refl.h"
 #include "nvn_fmt_info.h"
@@ -636,12 +638,18 @@ static uint64_t g_bt[8];   // 分段计时累加（正式定义在后面，这�
 static int alloc_copy(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice *sl) {
     const uint32_t align = caps_cached()->min_ubo_align ? caps_cached()->min_ubo_align : 256;
     nvn_gpu_err err = {0};
-    const uint64_t a0 = g_btm ? dt_now() : 0;
+    const int hitch = rp_hitch_enabled();
+    const uint64_t a0 = g_btm || hitch ? dt_now() : 0;
     nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, n, align, sl, &err);
-    const uint64_t a1 = g_btm ? dt_now() : 0;
+    const uint64_t a1 = a0 ? dt_now() : 0;
+    if (hitch) rp_perf_add(RP_PERF_HITCH_ALLOC, a1 - a0);
     if (!nvn_gpu_ok(rc) || !sl->cpu) { arena_fail_detail(rc, &err, n); return 0; }
     if (src) memcpy(sl->cpu, src, (size_t)n); else memset(sl->cpu, 0, (size_t)n);
-    if (a0) { const uint64_t a2 = dt_now(); g_bt[6] += a1 - a0; g_bt[7] += a2 - a1; }
+    if (a0) {
+        const uint64_t copy = dt_now() - a1;
+        if (g_btm) { g_bt[6] += a1 - a0; g_bt[7] += copy; }
+        if (hitch) rp_perf_add(RP_PERF_HITCH_COPY, copy);
+    }
     return 1;
 }
 
@@ -688,9 +696,11 @@ static int alloc_fill(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice 
     if (n < UBF_MIN || !ubf_on()) return alloc_copy(c, n, src, sl);
     const uint32_t align = caps_cached()->min_ubo_align ? caps_cached()->min_ubo_align : 256;
     nvn_gpu_err err = {0};
-    const uint64_t a0 = g_btm ? dt_now() : 0;
+    const int hitch = rp_hitch_enabled();
+    const uint64_t a0 = g_btm || hitch ? dt_now() : 0;
     nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, n, align, sl, &err);
-    const uint64_t a1 = g_btm ? dt_now() : 0;
+    const uint64_t a1 = a0 ? dt_now() : 0;
+    if (hitch) rp_perf_add(RP_PERF_HITCH_ALLOC, a1 - a0);
     if (!nvn_gpu_ok(rc) || !sl->cpu) { arena_fail_detail(rc, &err, n); return 0; }
     const uint64_t t = nvn_gpu_arena_fill(c, sl, src, n);
     if (t) {
@@ -701,7 +711,11 @@ static int alloc_fill(nvn_gpu_cmd c, uint64_t n, const void *src, nvn_gpu_slice 
         g_ubf[i].lo = (uint64_t)(uintptr_t)src; g_ubf[i].hi = g_ubf[i].lo + n; g_ubf[i].t = t;
         rp_perf_add(RP_PERF_UBO_FILL_N, 1);
     }
-    if (a0) { const uint64_t a2 = dt_now(); g_bt[6] += a1 - a0; g_bt[7] += a2 - a1; }
+    if (a0) {
+        const uint64_t fill = dt_now() - a1;
+        if (g_btm) { g_bt[6] += a1 - a0; g_bt[7] += fill; }
+        if (hitch) rp_perf_add(RP_PERF_HITCH_FILL, fill);
+    }
     return 1;
 }
 
@@ -1437,15 +1451,23 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
         memcpy(g_lb[pi].b, b, (size_t)n * sizeof *b);
     }
     const nvn_gpu_stage gst = st == 5 ? NVN_GPU_SH_CS : (nvn_gpu_stage)st;   // 普通绑定与池表绑定同一阶段
-    { const uint64_t bb = btm ? dt_now() : 0;
+    { const int hitch = rp_hitch_enabled();
+      const uint64_t bb = btm || hitch ? dt_now() : 0;
       nvn_gpu_bind(c, gst, b, n);
-      if (btm) { const uint64_t be = dt_now(); g_bt[1] += be - bb; g_bt[2]++; g_bt[0] += be - btm0; } }
+      if (bb) {
+          const uint64_t be = dt_now();
+          if (btm) { g_bt[1] += be - bb; g_bt[2]++; g_bt[0] += be - btm0; }
+          if (hitch) rp_perf_add(RP_PERF_HITCH_BIND_BE, be - bb);
+      } }
     if (npool) {   // 整池数组：后端按布局项把整张池表绑上（快照由后端引用到命令段完成）
         for (uint32_t i = 0; i < pg->nent[pi]; i++) {
             const nvn_gpu_layout_ent *e = &pg->ent[pi][i];
             if (e->src_kind != NVN_RB_TEXP && e->src_kind != NVN_RB_SAMPP) continue;
             nvn_gpu_err err = {0};
-            if (!nvn_gpu_ok(nvn_gpu_pool_bind(c, gst, i, g_ptd[pool_row(st)][i], &err))) {
+            const uint64_t hitch = rp_hitch_start();
+            nvn_gpu_rc rc = nvn_gpu_pool_bind(c, gst, i, g_ptd[pool_row(st)][i], &err);
+            rp_hitch_end(RP_PERF_HITCH_BIND_BE, hitch);
+            if (!nvn_gpu_ok(rc)) {
                 if (nvn_unimpl("draw", "pool_bind_failed", rec) == 1 && err.why[0]) nvn_plat_log(NVN_PLAT_LOG_RED, "draw", err.why);
                 return 0;
             }
@@ -1515,7 +1537,8 @@ int rp_tm_on;                  // 1 = 当前这一帧要逐步计时（上屏所
 static unsigned g_tm_stride;   // 抽样间隔（帧）；0 = 还没读开关
 static unsigned g_tm_n;        // 离上一个采样帧过了几帧（上屏所在线程独占）
 void rp_tm_reset(void) {       // 会话重开：重读开关。nvk_tm_full=1 压过 nvk_tm_stride
-    const int full = nvn_plat_flag("nvk_tm_full", 0) != 0, v = nvn_plat_flag("nvk_tm_stride", 32);
+    // 直到帧结束才知道间隔是否超阈值，长帧诊断需要每一帧的 CPU 分项。
+    const int full = rp_hitch_enabled() || nvn_plat_flag("nvk_tm_full", 0) != 0, v = nvn_plat_flag("nvk_tm_stride", 32);
     const unsigned s = full || v < 1 ? 1u : v > 1024 ? 1024u : (unsigned)v;
     g_tm_stride = s; g_tm_n = 0;
     __atomic_store_n(&rp_tm_on, s == 1, __ATOMIC_RELAXED);   // 每帧都计：从头就开着；否则第一个采样帧在第 s 帧
@@ -2440,7 +2463,9 @@ cs_rebind:
         uint64_t bkey[2] = {(uint64_t)(uintptr_t)pg, (uint64_t)(uintptr_t)pg->sh[0]};
         if (nvn_hm_get(&g_cpipe_bad, bkey)) { nvn_unimpl("gpu", "compute_pipeline", rec); g_skips++; goto done; }
         nvn_gpu_stage_desc cs; memset(&cs, 0, sizeof cs); cs.sh = pg->sh[0]; nvn_gpu_err err = {0};
+        const uint64_t hitch = rp_hitch_start();
         nvn_gpu_rc cr = nvn_gpu_cpipe_get(&cs, NVN_GPU_PIPE_SYNC, &cp, &err);
+        rp_hitch_end(RP_PERF_HITCH_DISP_PIPE, hitch);
         if (!nvn_gpu_ok(cr) || !cp) {
             if (nvn_unimpl("gpu", "compute_pipeline", rec) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why);
             if (cr.code != NVN_GPU_E_STOPPED) {   // 会话关闭中不算确定失败

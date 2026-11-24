@@ -68,27 +68,39 @@ static uint64_t plc_save_ns_frame(void) {
 }
 static void frame_gap_note(void) {
     uint64_t now = plat_now_ns(), d = g_gap_last ? now - g_gap_last : 0; g_gap_last = now;
-    if (!d) return;
-    int k = d < 29000000ull ? 0 : d < 37500000ull ? 1 : d < 46000000ull ? 2 : d < 54000000ull ? 3 : 4;
-    __atomic_fetch_add(&g_gap_bucket[k], 1, __ATOMIC_RELAXED);
-    uint32_t ms = (uint32_t)(d / 1000000ull); if (ms > 255) ms = 255;
-    __atomic_fetch_add(&g_gap_hist[ms], 1, __ATOMIC_RELAXED);
-    if (d > 33333333ull) __atomic_fetch_add(&g_gap_over33, 1, __ATOMIC_RELAXED);
-    // 长帧日志（缺省关，排查顿卡时开）：一次超过 80 毫秒就把上一帧的账打出来——回放花了多久、画了多少笔、提交几次，
+    if (d) {
+        int k = d < 29000000ull ? 0 : d < 37500000ull ? 1 : d < 46000000ull ? 2 : d < 54000000ull ? 3 : 4;
+        __atomic_fetch_add(&g_gap_bucket[k], 1, __ATOMIC_RELAXED);
+        uint32_t ms = (uint32_t)(d / 1000000ull); if (ms > 255) ms = 255;
+        __atomic_fetch_add(&g_gap_hist[ms], 1, __ATOMIC_RELAXED);
+        if (d > 33333333ull) __atomic_fetch_add(&g_gap_over33, 1, __ATOMIC_RELAXED);
+    }
+    // 长帧日志（缺省关）：间隔超过 hitch_ms（缺省 80 毫秒）才打印上一帧的回放耗时、绘制和提交数，
     // 以及本帧回放各分项花在哪（分项账见 rp_exec.c「逐帧分项账」；每帧只取一次、取即清零）。
     // 开关与逐帧分项账共用 rp_fr_perf_on() 缓存的那一个值（nvk_hitch_log）。
     static int hl = -1;
-    uint64_t ex = 0, dr = 0, sb = 0; rp_frame_take(&ex, &dr, &sb);   // 每帧都取（不清账时相邻两帧会累加，读数会虚高）
-    if (hl < 0) hl = rp_fr_perf_on();
-    if (hl) {
-        uint64_t fr[RP_FR_N]; rp_fr_perf_take(fr);   // 本帧分项：与回放账同一个帧边界，每帧只取一次
-        fr[RP_FR_PLC] = plc_save_ns_frame();          // 管线缓存写盘：后端统计项的帧差分
-        if (d > 80000000ull) {
-            char lb[512];
-            rp_hitch_line(lb, sizeof lb, d, ex, dr, sb, fr);
-            nvn_plat_log(NVN_PLAT_LOG_INFO, "present", lb);
+    static uint64_t hitch_threshold_ns;
+    uint64_t ex = 0, dr = 0, sb = 0;
+    if (hl < 0) {
+        hl = rp_fr_perf_on();
+        if (hl) {
+            const int ms = nvn_plat_flag("hitch_ms", 80);
+            hitch_threshold_ns = (uint64_t)(ms > 0 ? ms : 80) * 1000000ull;
         }
     }
+    if (hl) {
+        struct rp_hitch_op ops[RP_HITCH_OP_N];
+        uint64_t fr[RP_FR_N];
+        rp_hitch_frame_take(&ex, &dr, &sb, fr, ops);   // 首次上屏没有间隔，也先取走启动账
+        fr[RP_FR_PLC] = plc_save_ns_frame();          // 管线缓存写盘：后端统计项的帧差分
+        if (d > hitch_threshold_ns) {
+            char lb[1280];
+            rp_hitch_line(lb, sizeof lb, d, ex, dr, sb, fr);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "present", lb);
+            rp_hitch_detail_line(lb, sizeof lb, now, ex, fr, ops);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "present", lb);
+        }
+    } else if (d) rp_frame_take(&ex, &dr, &sb);
 }
 static void rp_frame_gap_take(uint64_t out[5]) { for (int i = 0; i < 5; i++) out[i] = __atomic_exchange_n(&g_gap_bucket[i], 0, __ATOMIC_RELAXED); }
 // 取走直方图并算 p50 / p99 / 最长 / >33 毫秒帧数（毫秒；空窗口返回 0）

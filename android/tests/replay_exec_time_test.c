@@ -171,6 +171,7 @@ static void check_attr(const char *tag, const uint64_t fr[RP_FR_N]) {
 
 int main(int argc, char **argv) {
     g_tm = argc > 1 && !strcmp(argv[1], "tm");   // 第二遍运行：打开逐命令计时（第一次回放时生效）
+    g_hitch = argc <= 1 || strcmp(argv[1], "hitch-off");
 
     // ① 三层 OP_CALL 嵌套：每层先干 1 毫秒自己的活，再调下一层。
     //    L2 = [干活][END]，L1 = [干活][CALL→L2][END]，L0 = [干活][CALL→L1][END]。
@@ -179,6 +180,17 @@ int main(int argc, char **argv) {
     put_work(l2, OP_UPDATE_UB); put_end(l2 + 8);
     put_work(l1, OP_UPDATE_UB); put_call(l1 + 8, l2); put_end(l1 + 24);
     put_work(l0, OP_UPDATE_UB); put_call(l0 + 8, l1); put_end(l0 + 24);
+    if (!g_hitch) {
+        uint64_t ex = 0, dr = 0, sb = 0, fr[RP_FR_N];
+        struct rp_hitch_op ops[RP_HITCH_OP_N];
+        nvn_be_exec(l0);
+        rp_hitch_frame_take(&ex, &dr, &sb, fr, ops);
+        CHECK(ex == 3 * MS);
+        for (unsigned i = 0; i < RP_HITCH_OP_N; i++) CHECK(ops[i].count == 0 && ops[i].ns == 0 && ops[i].max_ns == 0);
+        for (unsigned i = 0; i < RP_FR_N; i++) CHECK(fr[i] == 0);
+        printf("replay_exec_time(hitch-off)：%d 项检查，%d 红\n", g_checks, g_fail);
+        return g_fail != 0;
+    }
     uint64_t draws = 0, subs = 0, op_update_before = g_op_ns[OP_UPDATE_UB], op_call_before = g_op_ns[OP_CALL];
     uint64_t ex = run_frame(l0, &draws, &subs);
     // 逐命令账只取 ① 这一段（后面的用例还会往 OP_UPDATE_UB 上加数）：子列表一共干了 3 毫秒，OP_CALL 自身应当是 0。
@@ -295,6 +307,24 @@ int main(int argc, char **argv) {
         CHECK(draws == 0);
         CHECK(zero);
     }
+
+    // 同一帧内三层 CALL 下的各条命令，只记本层开销。旧分时开关关闭时也能取到。
+    struct rp_hitch_op ops[RP_HITCH_OP_N];
+    rp_hitch_frame_take(&ex, &draws, &subs, fr, ops);
+    g_draw_n = 0;
+    nvn_be_exec(d0);
+    rp_hitch_frame_take(&ex, &draws, &subs, fr, ops);
+    CHECK(ex == 13 * MS && draws == 3);
+    CHECK(ops[OP_DRAW].count == 3 && ops[OP_DRAW].ns == 11 * MS && ops[OP_DRAW].max_ns == 5 * MS);
+    CHECK(ops[OP_UPDATE_UB].count == 2 && ops[OP_UPDATE_UB].ns == 2 * MS && ops[OP_UPDATE_UB].max_ns == MS);
+    CHECK(ops[OP_CALL].count == 2 && ops[OP_CALL].ns == 0 && ops[OP_CALL].max_ns == 0);
+    check_attr("hitch 同帧取账", fr);
+    char detail[1280];
+    rp_hitch_detail_line(detail, sizeof detail, 456, ex, fr, ops);
+    CHECK(strstr(detail, "mono_ns=456 exec_ms=13.000 ops_ms=13.000 loop_ms=0.000 peak=OP_DRAW/5.000"));
+    CHECK(strstr(detail, "OP_DRAW/11.000/3/5.000,OP_UPDATE_UB/2.000/2/1.000"));
+    rp_hitch_frame_take(&ex, &draws, &subs, fr, ops);
+    CHECK(ex == 0 && draws == 0 && ops[OP_DRAW].count == 0 && fr[RP_FR_BIND] == 0);
 
     CHECK(g_red == 0);   // 这些路径不该报红行
     if (g_red) printf("      最近一条红行：%s\n", g_last_red);

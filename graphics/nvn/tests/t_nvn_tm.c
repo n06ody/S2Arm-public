@@ -27,9 +27,11 @@
 // ---------- 开关与日志替身 ----------
 static int g_tm_stride_flag = INT_MIN;   // INT_MIN = 没设（取产品缺省 32）
 static int g_tm_full_flag;
+static int g_hitch_flag;
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_tm_stride") && g_tm_stride_flag != INT_MIN) return g_tm_stride_flag;
     if (!strcmp(name, "nvk_tm_full")) return g_tm_full_flag;
+    if (!strcmp(name, "nvk_hitch_log")) return g_hitch_flag;
     return fixture_plat_flag(name, dflt);
 }
 // 抓「分时」里要比对的几行（INFO 级；每个前缀留最后一条）
@@ -238,8 +240,21 @@ static void t_tm_lines(void) {
 }
 #endif
 
+static int t_tm_hitch(int enabled) {
+    g_hitch_flag = enabled;
+    set_tm(32, 0);
+    CHECK(rp_tm_stride() == (enabled ? 1u : 32u));
+    for (int f = 0; f < 3; f++) {
+        CHECK(rp_tm() == enabled);
+        rp_tm_frame_end();
+    }
+    printf("t_nvn_tm hitch=%d: %d checks, %d failures\n", enabled, g_checks, g_fail);
+    return g_fail ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    if (argc == 2 && !strcmp(argv[1], "--hitch-on")) return t_tm_hitch(1);
+    if (argc == 2 && !strcmp(argv[1], "--hitch-off")) return t_tm_hitch(0);
     t_tm_flag();
     t_tm_frames();
 #if HAVE_FAKE_CLOCK

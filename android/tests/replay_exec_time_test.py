@@ -6,10 +6,11 @@
 C 文件把 graphics/nvn/replay/rp_exec.c 整个编进自己的 TU（被测的就是生产源；测试在 include 前定义
 S2A_RP_EXEC_TEST_CLOCK 把 now_ns 换成虚拟钟），所以编译命令里不能再列 rp_exec.c，否则符号重复。
 
-跑两遍，任一遍非 0 即失败：
+跑三遍，任一遍非 0 即失败：
   · 缺省：nvk_exec_tm 关（生产缺省），验帧级「回放耗时」、绘制笔数与长帧归因分项（分项各记一次、
     分项和 ≤ 帧回放、三层 OP_CALL 嵌套不重复、取走即清零、长帧行格式）；
-  · tm：再打开逐命令计时，另验 g_op_ns[OP_CALL] 只记递归自身开销、不含子列表。
+  · tm：再打开逐命令计时，另验 g_op_ns[OP_CALL] 只记递归自身开销、不含子列表；
+  · hitch-off：确认长帧诊断关闭时只有原有帧级总账。
 """
 import shutil
 import subprocess
@@ -103,7 +104,7 @@ def main():
                                        text=True, cwd=REPO).split() if sys.platform == 'darwin' else []
         cmd += [str(wrapper), *weak, '-lm', '-o', str(binary)]
         subprocess.run(cmd, check=True, cwd=REPO)
-        for args in ([], ['tm']):
+        for args in ([], ['tm'], ['hitch-off']):
             r = subprocess.run([str(binary), *args], text=True, capture_output=True, timeout=60)
             sys.stdout.write(r.stdout)
             if r.returncode:
