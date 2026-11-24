@@ -35,12 +35,18 @@ static inline void *nvn_hm_get(const nvn_hmap *m, const void *k) {
 }
 static inline void *nvn_hm_put(nvn_hmap *m, const void *k, void *v);
 static inline void nvn_hm_grow(nvn_hmap *m) {
+#ifdef NVN_HM_HITCH_PROBE
+    const uint64_t start = rp_hitch_start();
+#endif
     nvn_hmap o = *m;
     m->cap = o.cap ? o.cap * 2 : 64; m->n = 0;
     m->keys = malloc((size_t)m->cap * m->klen); m->vals = calloc(m->cap, sizeof *m->vals);
     if (!m->keys || !m->vals) abort();
     for (uint32_t i = 0; i < o.cap; i++) if (o.vals[i]) nvn_hm_put(m, o.keys + (size_t)i * o.klen, o.vals[i]);
     free(o.keys); free(o.vals);
+#ifdef NVN_HM_HITCH_PROBE
+    rp_hitch_end(RP_PERF_HITCH_HASH_GROW, start);
+#endif
 }
 // v must not be NULL; returns the old value for the same key (NULL if none)
 static inline void *nvn_hm_put(nvn_hmap *m, const void *k, void *v) {

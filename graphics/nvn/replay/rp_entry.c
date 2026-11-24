@@ -9,7 +9,9 @@
 #include "nvn_plat.h"
 #include "nvn_backend.h"
 #include "nvn_mtl.h"
+#define NVN_HM_HITCH_PROBE
 #include "nvn_hmap.h"
+#undef NVN_HM_HITCH_PROBE
 
 void rp_res_tex_gone(uint64_t serial);   // rp_res.c
 void rp_res_reset(void);
