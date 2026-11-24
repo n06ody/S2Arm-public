@@ -66,6 +66,7 @@ static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alia
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
 static int fixture_gate_probe;   // nvk_gate_probe：只读探测开关（缺省 0）
+static int fixture_cs_used_slots = -1;
 static int fixture_used_slots = -1;   // nvk_lp_used_slots：-1 = 取生产缺省（关 = 「任何一个非对齐绑定都算」的旧口径），0 / 1 = 读成这个值（缺省关之后，新口径的用例要显式设 1，就像调试包设属性）
 static int fake_cs_success, cs_loads;
 int g_s2a_logfd = 2;
@@ -133,6 +134,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_link_refused_file") && record_link_refused) return 1;
     if (!strcmp(name, "nvk_link_map_diag")) return link_map_flag;
     if (!strcmp(name, "nvk_gate_probe")) return fixture_gate_probe;
+    if (fixture_cs_used_slots >= 0 && !strcmp(name, "nvk_lp_cs_used_slots")) return fixture_cs_used_slots;
     if (fixture_used_slots >= 0 && !strcmp(name, "nvk_lp_used_slots")) return fixture_used_slots;
     if (fixture_fact_wide >= 0 && !strcmp(name, "nvk_fact_wide")) return fixture_fact_wide;
     return dflt;
@@ -2169,7 +2171,158 @@ static void cs_lib_root_rm(const char *root) {
     snprintf(path, sizeof path, "%s/shaders", root); rmdir(path); rmdir(root);
 }
 const char *nvk_shader_cs_lib_note(const uint8_t key[8]);   // nvk_shader.c：计算阶段键没走出包预编库的原因（诊断）
-static int cs_libpack_test(void) {
+static void cs_used_slots_contract(const char *khex, uint64_t key[2], const uint8_t kind[2]) {
+    // glslang -V --target-env vulkan1.1, spirv-val clean:
+    // layout(local_size_x=1) in;
+    // layout(set=0,binding=5,std430) buffer Slot { uint data[]; } slot;
+    // void main() { slot.data[gl_GlobalInvocationID.x] += 1u; }
+    // 库元数据把 arg_id=0 / VK binding 5 映到 NVN 槽 15，区分描述符绑定号与槽号。
+    static const uint32_t slot_spv[] = {
+        0x07230203u, 0x00010300u, 0x0008000bu, 0x0000001bu, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+        0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
+        0x0006000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000fu, 0x00060010u, 0x00000004u,
+        0x00000011u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00030003u, 0x00000002u, 0x000001c2u, 0x00040005u,
+        0x00000004u, 0x6e69616du, 0x00000000u, 0x00040005u, 0x00000008u, 0x746f6c53u, 0x00000000u, 0x00050006u,
+        0x00000008u, 0x00000000u, 0x61746164u, 0x00000000u, 0x00040005u, 0x0000000au, 0x746f6c73u, 0x00000000u,
+        0x00080005u, 0x0000000fu, 0x475f6c67u, 0x61626f6cu, 0x766e496cu, 0x7461636fu, 0x496e6f69u, 0x00000044u,
+        0x00040047u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00030047u, 0x00000008u, 0x00000002u, 0x00050048u,
+        0x00000008u, 0x00000000u, 0x00000023u, 0x00000000u, 0x00040047u, 0x0000000au, 0x00000021u, 0x00000005u,
+        0x00040047u, 0x0000000au, 0x00000022u, 0x00000000u, 0x00040047u, 0x0000000fu, 0x0000000bu, 0x0000001cu,
+        0x00040047u, 0x0000001au, 0x0000000bu, 0x00000019u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u,
+        0x00000002u, 0x00040015u, 0x00000006u, 0x00000020u, 0x00000000u, 0x0003001du, 0x00000007u, 0x00000006u,
+        0x0003001eu, 0x00000008u, 0x00000007u, 0x00040020u, 0x00000009u, 0x0000000cu, 0x00000008u, 0x0004003bu,
+        0x00000009u, 0x0000000au, 0x0000000cu, 0x00040015u, 0x0000000bu, 0x00000020u, 0x00000001u, 0x0004002bu,
+        0x0000000bu, 0x0000000cu, 0x00000000u, 0x00040017u, 0x0000000du, 0x00000006u, 0x00000003u, 0x00040020u,
+        0x0000000eu, 0x00000001u, 0x0000000du, 0x0004003bu, 0x0000000eu, 0x0000000fu, 0x00000001u, 0x0004002bu,
+        0x00000006u, 0x00000010u, 0x00000000u, 0x00040020u, 0x00000011u, 0x00000001u, 0x00000006u, 0x0004002bu,
+        0x00000006u, 0x00000014u, 0x00000001u, 0x00040020u, 0x00000015u, 0x0000000cu, 0x00000006u, 0x0006002cu,
+        0x0000000du, 0x0000001au, 0x00000014u, 0x00000014u, 0x00000014u, 0x00050036u, 0x00000002u, 0x00000004u,
+        0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x00050041u, 0x00000011u, 0x00000012u, 0x0000000fu,
+        0x00000010u, 0x0004003du, 0x00000006u, 0x00000013u, 0x00000012u, 0x00060041u, 0x00000015u, 0x00000016u,
+        0x0000000au, 0x0000000cu, 0x00000013u, 0x0004003du, 0x00000006u, 0x00000017u, 0x00000016u, 0x00050080u,
+        0x00000006u, 0x00000018u, 0x00000017u, 0x00000014u, 0x00060041u, 0x00000015u, 0x00000019u, 0x0000000au,
+        0x0000000cu, 0x00000013u, 0x0003003eu, 0x00000019u, 0x00000018u, 0x000100fdu, 0x00010038u,
+    };
+    char csjson[512], root[256];
+    snprintf(csjson, sizeof csjson, "{\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"bindings\":["
+             "{\"msl_name\":\"slot\",\"kind\":\"sbuf\",\"reg\":15,\"rw\":true,\"arg_id\":0}]}", khex);
+    const uint8_t *data[2] = {(const uint8_t *)csjson, (const uint8_t *)slot_spv};
+    size_t len[2] = {strlen(csjson), sizeof slot_spv};
+    int written = cs_lib_root(root, key, kind, data, len, 2) == 0;
+    CHECK(written, "write CS SBUFP fixture");
+    if (!written) return;
+
+    // 先从冷状态取非对齐槽 0（未用）的版本，再改槽 0 的地址，覆盖慢路及快键。
+    const struct rp_prog *p = NULL, *again = NULL;
+    rp_shader_reset();
+    compiler_calls = 0;
+    const char *tmp = getenv("TMPDIR");
+    char warm_dir[256];
+    snprintf(warm_dir, sizeof warm_dir, "%s/nvk_cs_warm.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    int have_warm = mkdtemp(warm_dir) != NULL;
+    CHECK(have_warm, "create CS warm manifest directory");
+    if (have_warm) {
+        setenv("S2A_PW_TEST_DIR", warm_dir, 1);
+        setenv("S2A_COMPUTE_WARM", "1", 1);
+    }
+    rp_S.ssbo[5][15].addr = 0x11000;
+    rp_S.ssbo[5][15].size = 256;
+    rp_S.ssbo[5][0].addr = 0x10001;
+    CHECK(!rp_shader_resolve_compute(&p) && p && p->lib_sourced && compiler_calls == 0,
+          "unaligned unused slot 0 with aligned live slot 15 hits the library");
+    if (p) {
+        int mapped = 0;
+        for (unsigned i = 0; i < p->nent[0]; i++)
+            if (p->ent[0][i].src_kind == NVN_RB_SBUFP && p->ent[0][i].src_reg == 15) mapped = 1;
+        CHECK(mapped, "the admitted CS binds live NVN storage slot 15");
+        uint8_t id[32]; memcpy(id, p->identity, sizeof id);
+        const uint64_t hits = nvk_shader_cs_fast_hits();
+        rp_S.ssbo[5][0].addr = 0x10000;
+        CHECK(!rp_shader_resolve_compute(&again) && again == p && compiler_calls == 0 &&
+              nvk_shader_cs_fast_hits() == hits + 1, "unused CS slot alignment preserves the fast-key hit");
+        rp_S.ssbo[5][0].addr = 0x10001;
+        CHECK(!rp_shader_resolve_compute(&again) && again == p &&
+              nvk_shader_cs_fast_hits() == hits + 2, "taking the same fast path refreshes the warm fact");
+        if (have_warm) {
+            nvk_prog_warm_save();
+            rp_shader_reset();
+            struct nvk_prog_rec rec = {0};
+            CHECK(nvk_prog_warm_load() == 1 && nvk_prog_warm_take(&rec) &&
+                  rec.stage_mask == 32 && rec.lp_ok == 2 && !memcmp(rec.identity, id, sizeof id),
+                  "CS warm record keeps the narrowed identity and remains eligible across sessions");
+            CHECK(nvk_prog_warm_build(&rec) == 0, "CS warm record builds the LibPack item");
+            const struct rp_prog *warm = NULL;
+            CHECK(rp_shader_prog_borrow(id, &warm) == 1 && warm && warm->lib_sourced,
+                  "prewarm publishes the library CS under the same identity");
+            if (warm) rp_shader_prog_return(id);
+            CHECK(!rp_shader_resolve_compute(&again) && again == warm && compiler_calls == 0,
+                  "live resolve adopts prewarmed CS with only unused slot unaligned");
+            p = again;
+        }
+        rp_S.ssbo[5][15].addr++;
+        again = NULL;
+        CHECK(!rp_shader_resolve_compute(&again) && again && again != p && !again->lib_sourced &&
+              compiler_calls == 1 && strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+              "unaligned used slot 15 still refuses LibPack and live-compiles a hardened variant");
+        rp_S.ssbo[5][15].addr--;
+    }
+    if (have_warm) {
+        unsetenv("S2A_COMPUTE_WARM");
+        unsetenv("S2A_PW_TEST_DIR");
+        alias_rmdir(warm_dir);
+    }
+
+    // CS 开关显式关和缺省都保留旧闸。打开图形开关不改变 CS 的缺省。
+    fixture_used_slots = 1;
+    for (int flag = -1; flag <= 0; flag++) {
+        fixture_cs_used_slots = flag;
+        rp_shader_reset();
+        compiler_calls = 0; captured[0] = 0; p = NULL;
+        CHECK(!rp_shader_resolve_compute(&p) && p && !p->lib_sourced && compiler_calls == 1 &&
+              strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+              "disabled or unset CS flag still checks every bound storage slot (flag=%d)", flag);
+    }
+    fixture_used_slots = -1;
+    fixture_cs_used_slots = 1;
+    cs_lib_root_rm(root);
+
+    static const uint32_t psb[] = {0x07230203u, 0x00010500u, 0, 3, 0, 0x00020011u, 5347u}; // 能力扫描夹具
+    static const uint32_t bad[] = {0x07230203u, 0x00010500u, 0, 3, 0, 0x00050011u, 1u};
+    const struct {
+        const char *name, *bindings;
+        const uint32_t *spv;
+        size_t bytes;
+        int json_only;
+    } cases[] = {
+        {"unknown storage source", "{\"kind\":\"ubo_ptr\",\"reg\":0}", slot_spv, sizeof slot_spv, 0},
+        {"physical address access", "", psb, sizeof psb, 0},
+        {"malformed module", "", bad, sizeof bad, 0},
+        {"missing SPIR-V", "", NULL, 0, 1},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        snprintf(csjson, sizeof csjson, "{\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"bindings\":[%s]}", khex, cases[i].bindings);
+        data[1] = (const uint8_t *)cases[i].spv; len[0] = strlen(csjson); len[1] = cases[i].bytes;
+        if (cs_lib_root(root, key, kind, data, len, cases[i].json_only ? 1 : 2)) {
+            CHECK(0, "write fallback fixture: %s", cases[i].name);
+            continue;
+        }
+        rp_shader_reset();
+        compiler_calls = 0; captured[0] = 0; p = NULL;
+        CHECK(!rp_shader_resolve_compute(&p) && p && !p->lib_sourced && compiler_calls == 1 &&
+              strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+              "CS retains full-slot protection for %s", cases[i].name);
+        cs_lib_root_rm(root);
+    }
+    unsetenv("S2A_SHADER_REVISION_ROOT");
+    rp_shader_reset();
+    compiler_calls = 0; captured[0] = 0; p = NULL;
+    CHECK(!rp_shader_resolve_compute(&p) && p && !p->lib_sourced && compiler_calls == 1 &&
+          strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+          "absent LibPack retains full-slot protection");
+}
+
+static int cs_libpack_test(int used_slots) {
+    fixture_cs_used_slots = used_slots ? 1 : -1;
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     source(); fake_cs_success = 1; compiler_calls = cs_loads = 0; captured[0] = last_red[0] = 0;
     bind_pools(100);
@@ -2204,6 +2357,24 @@ static int cs_libpack_test(void) {
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == 0 && cs_loads == 1,
           "aligned CS storage hits the library, compiler not called (calls=%d red=%s)", compiler_calls, last_red);
     CHECK(lp_unref_lines == 0, "aligned library hit does not log the unaligned-refuse line (got %d)", lp_unref_lines);
+    if (used_slots) {
+        uint8_t aligned_identity[32];
+        int have_id = p && rp_shader_prog_identity(p, aligned_identity);
+        CHECK(have_id, "aligned CS fixture has a program identity");
+        if (!have_id) goto cleanup_cs;
+        // 该库件的绑定表没有 SBUFP，任何绑定槽的对齐都不影响它。
+        rp_S.ssbo[5][0].addr = 0x10001;
+        rp_shader_reset();
+        p = NULL;
+        CHECK(rp_shader_resolve_compute(&p) == 0 && p,
+              "cold CS resolve with unused unaligned storage succeeds");
+        CHECK(p && p->lib_sourced && compiler_calls == 0,
+              "known unused unaligned CS slot still hits LibPack (calls=%d)", compiler_calls);
+        CHECK(p && !memcmp(p->identity, aligned_identity, 32),
+              "changing only unused CS slot alignment preserves program identity");
+        cs_used_slots_contract(khex, ck, ckind);
+        goto cleanup_cs;
+    }
     int calls = compiler_calls, unref0 = lp_unref_lines;
     rp_S.ssbo[5][0].addr = 0x10001;   // 同键同绑定、只有对齐实况变：16 非对齐
     p = NULL;
@@ -2303,6 +2474,7 @@ static int cs_libpack_test(void) {
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a bad-table hit is reported as a build failure, not as a stale reason or as no record: %s", note ? note : "(none)");
         cs_lib_root_rm(broot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
+cleanup_cs:
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
     snprintf(path, sizeof path, "%s/lib.idx", dir); unlink(path); snprintf(path, sizeof path, "%s/lib.000.pak", dir); unlink(path);
@@ -2715,7 +2887,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--diag-compile")) return diag_compile_test();
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0);
     if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1);
-    if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
+    if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test(0);
+    if (argc == 2 && !strcmp(argv[1], "--cs-used-slots")) return cs_libpack_test(1);
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
     if (argc == 2 && !strcmp(argv[1], "--legacy-bytes")) {

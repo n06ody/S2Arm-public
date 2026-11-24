@@ -992,7 +992,7 @@ int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp_c, const uint8_t k
     if (slots) *slots = 0;
     if (!lp || !lp->p.idx || !key || !slots) return 1;
     const char *lib_stage = lp_nvn_stage_name(nvn);
-    if (!lib_stage || !strcmp(lib_stage, "cs")) return 1;   // 图形三段（vs / ps / gs）；计算不走这里
+    if (!lib_stage) return 1;   // 库里只有 vs / ps / gs / cs
     const int gs = !strcmp(lib_stage, "gs");
     int gt = -1;
     if (gs && (gt = lp_input_topology(topology)) < 0) return 1;   // 邻接 / 没有来源：库里没有那一份

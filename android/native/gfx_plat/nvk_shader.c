@@ -2708,6 +2708,22 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
     return e;
 }
 
+// CS 与图形各自灰度。客体存储槽的对齐事实由提交线程算一次，快键、慢路和预热清单都用同一个值。
+static int g_cs_sbu_on = -1;
+static int compute_ssbo_unaligned(uint32_t alignment) {
+    if (!alignment) return 0;   // 保留 provider 未给对齐值时的既有口径
+    uint32_t bound_unaligned = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        const uint64_t addr = rp_S.ssbo[5][i].addr;
+        if (addr && addr % alignment) bound_unaligned |= 1u << i;
+    }
+    if (!bound_unaligned) return 0;
+    if (g_cs_sbu_on < 0) g_cs_sbu_on = nvn_plat_flag("nvk_lp_cs_used_slots", 0) != 0;
+    if (!g_cs_sbu_on || nvn_plat_flag("no_libpack", 0)) return 1;
+    uint32_t used = 0;
+    return sbu_stage_slots(rp_S.skey[5], 5, 0, &used) != SBU_KNOWN || (bound_unaligned & used) != 0;
+}
+
 // 计算程序的快路：与图形那条（input_sig + g_last_tab）同一套做法——先算「编译请求的全部输入」的摘要，命中就直接返回上次的 rp_prog*。
 // 为什么值得：一款每帧 20 多个计算派发（GPU 剔除 / 后处理）的游戏，每次派发都走完整请求——32 + 128 个组合贴图槽逐槽取快照、
 // 建编译请求（含整份 profile 的 JSON 解析与 SHA-256）、算身份、查表，真机上约 130 微秒 / 次、一帧 2.5 毫秒。
@@ -2716,13 +2732,13 @@ static struct entry *build_compute(const uint8_t *bytes, size_t len, const struc
 // 之前的键带着每次派发都不同的地址和句柄，再加每帧都推进的贴图登记代号，等于从不命中。
 // 摘要只含「会进请求」的输入，所以同一个着色器换了绑定地址、换了同样格式的贴图，请求与身份逐字节不变，直接复用。
 // 计算与图形共用 g_last_tab：摘要首项是计算专用的域标记，两边的摘要不会碰；rp_shader_reset 一并释放。
-static uint64_t compute_input_sig(const struct s2a_direct_compile_context *pc) {
+static uint64_t compute_input_sig(const struct s2a_direct_compile_context *pc, int unaligned) {
     uint64_t h = 1469598103934665603ull;
     #define MIX(v) do { h ^= (uint64_t)(v); h *= 1099511628211ull; } while (0)
     MIX(0xC5C5C5C5C5C5C5C5ull); MIX(s2a_source_epoch());   // 来源登记冲突会毒化短键并推进代际；命中快表前也必须失效。
     { uint64_t k; memcpy(&k, rp_S.skey[5], 8); MIX(k); }
     { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; MIX(m); }
-    { int un = 0; for (int i = 0; i < 16; i++) if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment && rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un); MIX(pc->storage_buffer_offset_alignment); }
+    MIX(unaligned); MIX(pc->storage_buffer_offset_alignment);
     MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tex_base);
     MIX(combined_fact_sig(5)); MIX(sep_fact_sig(5));
     { uint32_t m = 0; for (int i = 0; i < 8; i++) if (rp_S.img[5][i]) m |= 1u << i; MIX(m); MIX(rp_tex_fact_sig(rp_S.img[5], 8, rp_S.tex_base, rp_S.tex_pool_n)); }   // 图像事实（同请求：只出已绑的槽）
@@ -2730,18 +2746,14 @@ static uint64_t compute_input_sig(const struct s2a_direct_compile_context *pc) {
     #undef MIX
     return h;
 }
-static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp);
+static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp, int unaligned);
 // 记录实际计算程序；按与 libpack 同一口径保留存储缓冲对齐事实。
-static void compute_warm_note(const struct rp_prog *p, const struct s2a_direct_compile_context *pc) {
+static void compute_warm_note(const struct rp_prog *p, int unaligned) {
     if (!nvn_plat_flag("nvk_compute_warm", 0)) return;
     struct nvk_prog_rec rec = {0};
     memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;
     memcpy(rec.keys[0], rp_S.skey[5], 8);
     if (p->c1_ok & 1) (void)rec_c1_put(&rec, 0, p->c1[0], p->c1_len[0]);
-    int unaligned = 0;
-    for (int i = 0; i < 16; i++)
-        if (rp_S.ssbo[5][i].addr && pc->storage_buffer_offset_alignment &&
-            rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) unaligned = 1;
     rec.lp_ok = unaligned ? 0 : 2;
     nvk_prog_warm_note(&rec);
 }
@@ -2753,27 +2765,28 @@ static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在�
     if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) { nvn_unimpl("shader", "no_compile_context", NULL); return -1; }
     const int logging = cache_log_on();
     const uint64_t t0 = logging ? now_ns() : 0;
-    const uint64_t key = compute_input_sig(&pc);
+    const int unaligned = compute_ssbo_unaligned(pc.storage_buffer_offset_alignment);
+    const uint64_t key = compute_input_sig(&pc, unaligned);
     static int check = -1, fast = -1;   // 两个调试开关只读一次（平台开关在进程内不变）：nvk_resolve_check 命中时再走慢路对账；nvk_cs_fast=0 关掉快路（真机 A/B 的「对照臂」，缺省开）
     if (check < 0) { check = nvn_plat_flag("nvk_resolve_check", 0); fast = nvn_plat_flag("nvk_cs_fast", 1) != 0; }
     struct last_ent *le = fast ? last_find(key, pc.session, pc.generation) : NULL;
     if (le && le->prog->lib_bad) le = NULL;   // 绑定核对拒收的出库版：快路不落命中，走慢路取现编
     if (le) {   // 不清任何状态：调用方只用 *out
         *out = le->prog;
-        compute_warm_note(*out, &pc);
-        if (check) { const struct rp_prog *chk = NULL; int rc = resolve_compute_slow(&chk, &pc); if (rc || chk != le->prog) red1("resolve_fast_path_mismatch", "快路径给的程序与慢路径不一致"); }
+        compute_warm_note(*out, unaligned);
+        if (check) { const struct rp_prog *chk = NULL; int rc = resolve_compute_slow(&chk, &pc, unaligned); if (rc || chk != le->prog) red1("resolve_fast_path_mismatch", "快路径给的程序与慢路径不一致"); }
         g_cs_hits++;
         if (logging) { g_cs_hit_ns += now_ns() - t0; if (!((g_cs_hits + g_cs_misses) & 255)) cs_cache_log(); }
         return 0;
     }
-    int rc = resolve_compute_slow(out, &pc);
+    int rc = resolve_compute_slow(out, &pc, unaligned);
     if (!rc && fast) last_put(key, pc.session, pc.generation, *out);
-    if (!rc && *out) compute_warm_note(*out, &pc);
+    if (!rc && *out) compute_warm_note(*out, unaligned);
     g_cs_misses++;
     if (logging) { g_cs_miss_ns += now_ns() - t0; if (!((g_cs_hits + g_cs_misses) & 255)) cs_cache_log(); }
     return rc;
 }
-static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp) {
+static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp, int unaligned) {
     struct s2a_direct_compile_context pc = *pcp;
     *out = NULL;
     static struct s2a_record_dispatch_state st; memset(&st, 0, sizeof st);
@@ -2821,8 +2834,6 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
     //   没学过任何坐标时（绝大多数计算着色器）不走这一步。读不到 / 没登记照图形口径处理（具名报告 / 默认事实），不猜类型。
     if (g_ubo_need_n) ntex = ubo_facts_into(5, tex, tfmt, tsmp, ntex, CS_TEX_N);
     struct nvk_compute_texture_facts tf = {tex, ntex, 1};
-    int unaligned = 0;
-    for (int i = 0; i < 16; i++) if (rp_S.ssbo[5][i].addr && pc.storage_buffer_offset_alignment && rp_S.ssbo[5][i].addr % pc.storage_buffer_offset_alignment) unaligned = 1;
     char ident[24]; { int o = 0; for (int b = 0; b < 8; b++) o += snprintf(ident + o, sizeof ident - (size_t)o, "%02x", rp_S.skey[5][b]); }
     static struct nvk_compute_request rq; memset(&rq, 0, sizeof rq); char why[256] = "";
     if (nvk_compute_request_prepare(&st, &pc, &tf, 1, unaligned, ident, &rq, why, sizeof why)) {
@@ -2884,7 +2895,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
                 static int depth;   // 只提交线程进这里；每轮至少多学一个坐标、每份着色器至多 UBO_NEED_COORDS 个，深度有界（图形那条同款）
                 if (!learned || depth >= UBO_NEED_COORDS) return -1;
                 depth++;
-                const int rc = resolve_compute_slow(out, pcp);
+                const int rc = resolve_compute_slow(out, pcp, unaligned);
                 depth--;
                 return rc;
             }
@@ -2985,7 +2996,7 @@ void rp_shader_reset(void) {
     free(g_last_tab); g_last_tab = NULL;
     memset(g_comb_sig, 0, sizeof g_comb_sig);
     memset(g_high_sig, 0, sizeof g_high_sig);
-    free(g_sbu); g_sbu = NULL; g_sbu_cap = g_sbu_n = 0; g_sbu_on = -1;   // 「阶段键 → 用到的存储缓冲槽」缓存：随库走，换局 / 换库根不留旧答案；开关下一局重读
+    free(g_sbu); g_sbu = NULL; g_sbu_cap = g_sbu_n = 0; g_sbu_on = g_cs_sbu_on = -1;   // 「阶段键 → 用到的存储缓冲槽」缓存：随库走，换局 / 换库根不留旧答案；开关下一局重读
     memset(g_ubo_need, 0, sizeof g_ubo_need); g_ubo_need_n = 0; g_ubo_learned = 0; atomic_store(&g_ubo_default_fact, 0);
     memset(g_idg, 0, sizeof g_idg); memset(g_idg_set, 0, sizeof g_idg_set);
     g_idg_groups = g_idg_idents = g_idg_resolves = g_idg_compiles = g_idg_loads = g_idg_multi = 0; g_idg_last_ns = 0;

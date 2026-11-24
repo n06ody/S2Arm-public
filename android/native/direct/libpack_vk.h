@@ -79,16 +79,16 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp, const uint8_t keys[6][8
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size);
 
-// 一个图形阶段用到的存储缓冲槽（调用方据此把「存储缓冲绑定不对齐」收窄到程序真用到的那几个槽）。
-//   nvn = NVN 阶段号（vs 0 / fs 1 / gs 2）；topology = 本笔绘制的输入图元名（Points / Lines / Triangles，几何段按它挑 _vg<t>.json，
-//   口径同 s2a_libpack_program_v1；vs / fs 不看，可传 NULL）。
+// 一个阶段用到的存储缓冲槽（调用方据此把「存储缓冲绑定不对齐」收窄到程序真用到的那几个槽）。
+//   nvn = NVN 阶段号（vs 0 / fs 1 / gs 2 / cs 5）；topology = 本笔绘制的输入图元名（Points / Lines / Triangles，几何段按它挑 _vg<t>.json，
+//   口径同 s2a_libpack_program_v1；vs / fs / cs 不看，可传 NULL）。
 //   返回 0 = 读到了，*slots 的位 i = 这一段用 NVN 存储缓冲槽 i（0..15），0 位 = 一个存储缓冲都没用；
 //   返回 1 = 说不准，*slots 清零、调用方不许把它当「一个槽都没用」：库里没有这一键 / 这一段读不出 / dm_ctl 或阶段对不上 /
 //   有 sbuf 以外的存储种类（或库不认得的绑定种类）/ sbuf 槽号 ≥ 16 / 几何输入图元没有那一份 / 这一段的 .spv 取不到或读不懂。
 //   返回 2 = 同样说不准（*slots 清零，调用方照 1 处理），原因单列：这一段的 .spv 声明了 PhysicalStorageBufferAddresses 能力
 //   （着色器可以按 64 位地址直接读写内存，不经描述符，也就不经 rp_S.ssbo 的槽，_b.json 的绑定表不是它碰得到的全部存储）。
-//   依据：图形库件只认 kind "sbuf"（libpack_vk.c lp_emit_bindings：别的存储种类图形侧没有消费端认的出处，整份拒收、走现编），
-//   所以 sbuf 的 reg 集合 = 合成出的 storage 绑定的 nvnSlot 集合 = rp_draw 按 rp_S.ssbo[阶段][槽] 绑的那几个槽。
+//   依据：lp_emit_bindings 把 "sbuf" 的 reg 转为 storage 的 nvnSlot，对应 rp_draw 按 rp_S.ssbo[阶段][槽] 绑的槽。
+//   CS 也能消费 UBO 来源的存储缓冲；遇到这些来源时不能只用 nvnSlot 证明全程序的访问范围。
 //   只读：不动 hits / misses / rejects 三个计数（它们只记真正的合成）。
 int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, const char *topology, uint32_t *slots);
 
