@@ -32,6 +32,7 @@
 #include "s2a_direct_host.h"
 #include "nvn/nvn_vk_program_result.h"
 #include "nvn/nvn_vk_compute_request.h"
+#include "nvn/nvn_vk_warm_options.h"
 #include "nvn/nvn_vk_prog_warm.h"   // 跨会话程序清单（note / stats；build 与 quiesce 在本文件实现）
 #include <pthread.h>
 #include <stdarg.h>
@@ -111,7 +112,7 @@ static int shader_compile_admit(void) {
     }
 }
 
-struct entry { struct rp_prog prog; int failed; int warm; int warm_hit; uint8_t fact_ok; uint32_t fact_mask[4]; uint8_t res_ok; uint8_t res_key[32]; uint8_t seen; };   // res_key：这份程序的结果合并比对键（结果摘要 / 负载长度 / 阶段数 / c1 的 SHA-256，见 alias_key_hash；结果合并 #1355）；seen：rp_shader_reset 按「同一 entry 只释放一次」去重时的临时标记   // fact_*：结果字节里读出的「编译器实际读了哪些绑定事实」（nvk_shader_fact_cache.h），work_run 里算好，发布后由提交线程入表   // warm：预热带发布；warm_hit：已被真实 draw 采用过一次（验收计数口径）
+struct entry { struct rp_prog prog; int failed; int warm; int warm_hit; uint8_t nowindow_seed; uint8_t fact_ok; uint32_t fact_mask[4]; uint8_t res_ok; uint8_t res_key[32]; uint8_t seen; };   // res_key：这份程序的结果合并比对键（结果摘要 / 负载长度 / 阶段数 / c1 的 SHA-256，见 alias_key_hash；结果合并 #1355）；seen：rp_shader_reset 按「同一 entry 只释放一次」去重时的临时标记   // fact_*：结果字节里读出的「编译器实际读了哪些绑定事实」（nvk_shader_fact_cache.h），work_run 里算好，发布后由提交线程入表   // warm：预热带发布；warm_hit：已被真实 draw 采用过一次（验收计数口径）
 static nvn_hmap g_progs = {.klen = 32};   // 内容身份（SHA-256）→ struct entry *。结果合并后，同一份结果的多个身份指向同一个 entry（拥有者只有一个，见 rp_shader_reset）
 // 结果合并（#1355）：比对键（见 alias_key_hash：缓存文件头里的结果摘要 + 负载长度 + 阶段数 + c1）→ struct entry *（只借用；g_progs_mu 下读写；整表随 rp_shader_reset 清）。
 // 同一份编译结果的不同身份共用一个 entry（一份着色器句柄，管线缓存按句柄比，所以管线也合并）。缺省打开；debug.s2a.nvk_alias=0 关闭（只有调试包读，出包版恒走缺省）。
@@ -242,6 +243,14 @@ static struct entry *progs_get_adopted_locked(const uint8_t identity[32], int *f
     if (adopted) *adopted = 0;
     if (e && !e->failed && e->warm && !e->warm_hit) { e->warm_hit = 1; if (adopted) *adopted = 1; }
     return e;
+}
+static void note_warm_adoption(const struct entry *e, const uint8_t identity[32]) {
+    nvk_prog_warm_stat_draw_hit();
+    if (e->nowindow_seed) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "非窗口种子程序首绘采用 %02x%02x%02x%02x", identity[0], identity[1], identity[2], identity[3]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", msg);
+    }
 }
 static struct inflight_ent *inflight_find_locked(const uint8_t identity[32]) {
     for (unsigned i = 0; i < INFLIGHT_MAX; i++) if (g_inflight[i].used && !memcmp(g_inflight[i].identity, identity, 32)) return &g_inflight[i];
@@ -392,7 +401,7 @@ static int await_inflight(const uint8_t identity[32], struct entry **out) {
         struct entry *e = progs_get_adopted_locked(identity, NULL, &adopted);
         if (e) {
             pthread_mutex_unlock(&g_progs_mu);
-            if (adopted) nvk_prog_warm_stat_draw_hit();   // 等到的正是预建对象：这份程序第一次被真实 draw 采用
+            if (adopted) note_warm_adoption(e, identity);   // 等到的正是预建对象：这份程序第一次被真实 draw 采用
             *out = e;
             return 1;
         }
@@ -1015,7 +1024,8 @@ static void record_link_refusal(const struct s2a_source_entry_view views[3], int
     ssize_t wrote;
     do { wrote = write(fd, row, (size_t)len); } while (wrote < 0 && errno == EINTR);
     if (wrote != len) {
-        if (wrote > 0) (void)ftruncate(fd, st.st_size);
+        if (wrote > 0 && ftruncate(fd, st.st_size) != 0)
+            warning = "预编接口拒绝清单回滚失败，末行可能不完整";
         goto failed;
     }
     close(fd);
@@ -1219,6 +1229,10 @@ static void diag_end(uint64_t token, int success) {
     if (token && s2a_direct_diag_compile_end) s2a_direct_diag_compile_end(token, success);
 }
 struct work_snap {
+#ifdef S2A_ANDROID_DEBUG_ENV
+    uint8_t *preimage;
+    size_t preimage_len;
+#endif
     uint64_t epoch;
     uint32_t stages;
     int nst;
@@ -1236,6 +1250,9 @@ struct work_snap {
 static void snap_free(struct work_snap *s) {
     if (!s) return;
     if (s->acquired) for (int st = 0; st < s->nst; st++) s2a_source_release(s->views[st].ref);
+#ifdef S2A_ANDROID_DEBUG_ENV
+    free(s->preimage);
+#endif
     free(s->profile_json); free(s->closure); free(s->profile_hash);
     free(s);
 }
@@ -1614,10 +1631,47 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
     return LIVE_ABORT;
 }
 
+#ifdef S2A_ANDROID_DEBUG_ENV
+// 一次发布完整请求与身份原文；内容摘要让宿主核对重编的输出，排除传输字段的影响。
+static int capture_warm_request(const struct work_snap *s, const char *json, size_t len,
+                                const uint8_t *result, size_t result_len) {
+    struct s2a_jv content;
+    if (s2a_jv_obj_find((struct s2a_jv){(const char *)result, result_len}, "content", &content)) return -1;
+    const char *root = nvn_plat_dir(NVN_PLAT_DIR_CACHE);
+    char dir[1024], path[sizeof dir + 75], tmp[sizeof dir + 24], hex[65];
+    if (!root || !*root || snprintf(dir, sizeof dir, "%s/warm-nowindow-capture", root) >= (int)sizeof dir) return -1;
+    if (mkdir(dir, 0700) && errno != EEXIST) return -1;
+    s2a_sha256_hex(s->identity, hex);
+    snprintf(path, sizeof path, "%s/%s.request", dir, hex);
+    snprintf(tmp, sizeof tmp, "%s/.capture-XXXXXX", dir);
+    int fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    FILE *out = fdopen(fd, "wb");
+    if (!out) { close(fd); unlink(tmp); return -1; }
+    uint8_t header[76] = "S2AWREQ1";
+    for (int i = 0; i < 4; ++i) header[8+i] = (uint8_t)(s->preimage_len >> (8*i));
+    sha256(content.p, content.n, header + 12);
+    s2a_sha256 hash;
+    s2a_sha256_init(&hash);
+    s2a_sha256_update(&hash, header, 44);
+    s2a_sha256_update(&hash, s->preimage, s->preimage_len);
+    s2a_sha256_update(&hash, json, len);
+    s2a_sha256_final(&hash, header + 44);
+    int ok = fwrite(header, 1, sizeof header, out) == sizeof header &&
+             fwrite(s->preimage, 1, s->preimage_len, out) == s->preimage_len &&
+             fwrite(json, 1, len, out) == len;
+    if (fclose(out) || !ok || rename(tmp, path)) { unlink(tmp); return -1; }
+    return 0;
+}
+#endif
 // [提交] 只吃快照：离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器。
 // 仅真实编译器拒收生成 failed entry；预算用尽和 Stop 不作永久失败缓存。
 static struct entry *work_run(const struct work_snap *s, const struct rp_shader_req *q, int *pending) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
+#ifdef S2A_ANDROID_DEBUG_ENV
+    char *capture_json = NULL;
+    size_t capture_len = 0;
+#endif
     uint8_t rsha[32]; int have_res = 0;   // 结果摘要（跨局缓存读到的已校验摘要 / 现编结果现算的）：挂在 entry 上给结果合并用，离线库 / 预编库来的不挂
     const char *root = getenv("S2A_SHADER_REVISION_ROOT"), *cdir = getenv("S2A_DIRECT_CACHE_DIR");
     if (root && s->pc.profile_hash && s->pc.profile_hash[0] && !nvn_plat_flag("no_offline", 0)) {
@@ -1678,6 +1732,13 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         if (s2a_compile_request_build(&in, &json, &jl, gaps, sizeof gaps)) { red1("request_build_failed", gaps); return NULL; }
         struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
         enum live_status status = live_compile(in.session, in.generation, json, jl, s->identity, s->stages, q, &oc);
+#ifdef S2A_ANDROID_DEBUG_ENV
+        if (status == LIVE_OK && oc.bytes && s->preimage) {
+            capture_json = json;
+            capture_len = jl;
+            json = NULL;
+        }
+#endif
         free(json);
         if (status == LIVE_PENDING || status == LIVE_ABORT) {
             *pending = status == LIVE_PENDING;
@@ -1707,6 +1768,14 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
     }
     if (!bytes) return NULL;
     struct entry *e = build(bytes, len, s->views, s->nst, s->identity, 0);
+#ifdef S2A_ANDROID_DEBUG_ENV
+    if (capture_json && e && !e->failed) {
+        int rc = capture_warm_request(s, capture_json, capture_len, bytes, len);
+        nvn_plat_log(rc ? NVN_PLAT_LOG_RED : NVN_PLAT_LOG_INFO, "warm",
+                     rc ? "非窗口采集失败：无法发布完整请求" : "非窗口采集：普通程序请求已落盘");
+    }
+    free(capture_json);
+#endif
     if (e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, s->nst);
     // 事实复用（#1187 nvk_shader_fact_cache.h）：结果字节在这里释放，掩码先算好挂在 entry 上（纯函数，后台线程也能算）
     if (e && !e->failed) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);
@@ -1729,6 +1798,20 @@ static void warm_diag(const char *fmt, ...) {
     nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", b);
 }
 static struct entry *build_compute(const uint8_t *, size_t, const struct s2a_source_entry_view *, const uint8_t[32], const uint8_t[8], int lib);
+
+static int nowindow_result_matches(const uint8_t *bytes, size_t len, const struct s2a_direct_compile_context *pc) {
+    struct s2a_jv content, id, field;
+    uint32_t abi;
+    char closure[256], profile[96];
+    return pc->translator_closure && pc->profile_hash &&
+        !s2a_jv_obj_find((struct s2a_jv){(const char *)bytes, len}, "content", &content) &&
+        !s2a_jv_obj_find(content, "identity", &id) &&
+        !s2a_jv_obj_find(id, "directABI", &field) && !s2a_jv_u32(field, &abi) && abi == (uint32_t)pc->direct_abi &&
+        !s2a_jv_obj_find(id, "translatorClosure", &field) && !s2a_jv_str(field, closure, sizeof closure) &&
+        !strcmp(closure, pc->translator_closure) &&
+        !s2a_jv_obj_find(id, "profileHash", &field) && !s2a_jv_str(field, profile, sizeof profile) &&
+        !strcmp(profile, pc->profile_hash);
+}
 
 static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
@@ -1776,6 +1859,23 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         if (le) entry_free(le);
         libpack_mark_bad(rec->identity, compute ? rec->keys[0] : NULL);
     }
+    int nowindow_seed = 0;
+    if (!bytes && !compute && nvk_warm_nowindow_enabled()) {
+        char cohort[1024], dir[sizeof cohort + sizeof "/nowindow"];
+        if (nvk_prog_warm_seed_dir(cohort, sizeof cohort) == 1) {
+            snprintf(dir, sizeof dir, "%s/nowindow", cohort);
+            if (!s2a_program_cache_load_installed(dir, rec->identity, &bytes, &len, rsha, why, sizeof why)) {
+                if (nowindow_result_matches(bytes, len, &pc)) {
+                    have_res = 1;
+                    nowindow_seed = 1;
+                } else {
+                    free(bytes);
+                    bytes = NULL;
+                    snprintf(why, sizeof why, "非窗口种子结果的闭包、profile 或 ABI 不符");
+                }
+            }
+        }
+    }
     if (!bytes) {
         warm_diag("程序预热：结果字节取不到（身份 %02x%02x%02x%02x…，离线库 %s，跨局缓存 %s「%s」，缓存目录 %s）",
                   rec->identity[0], rec->identity[1], rec->identity[2], rec->identity[3],
@@ -1787,6 +1887,23 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
     }
     // c1 随清单落盘（开局 source_store 是空的）：views 在上面按清单填好、传给 build()，逐位与真实解析一致。
     struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);
+    if (nowindow_seed && (!e || e->failed)) {
+        // 补件的字节过了读入核对、build() 却失败（缺阶段 / 绑定号超 16 位 / 贴图缓冲类型未证…）：不发布。发布出去的失败项会让前台对这个身份直接返回失败、
+        //   不再现编，这局里这份程序的绘制全被跳过；丢掉它，让调用方 inflight_abort，留给前台现编。
+        if (e) entry_free(e);
+        free(bytes);
+        char msg[112];
+        snprintf(msg, sizeof msg, "非窗口种子程序建失败，不发布、留给前台现编 %02x%02x%02x%02x",
+                 rec->identity[0], rec->identity[1], rec->identity[2], rec->identity[3]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", msg);
+        return NULL;
+    }
+    if (nowindow_seed && e && !e->failed) {
+        e->nowindow_seed = 1;
+        char msg[96];
+        snprintf(msg, sizeof msg, "非窗口种子程序建成 %02x%02x%02x%02x", rec->identity[0], rec->identity[1], rec->identity[2], rec->identity[3]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", msg);
+    }
     if (!compute && e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, nst);
     // 结果合并命中时前台要把事实复用（#1187）登记到这份程序上，登记要用「编译器实际读了哪些绑定事实」的掩码：
     // 前台自己建的（work_run）本来就算好了，预热带建的也要算（纯函数，后台线程能算）。关着开关时保持原样不算。
@@ -2133,7 +2250,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     pthread_mutex_lock(&g_progs_mu);
     struct entry *e = progs_get_adopted_locked(sha, &e_failed, &e_adopted);
     pthread_mutex_unlock(&g_progs_mu);
-    if (e_adopted) nvk_prog_warm_stat_draw_hit();   // 预建对象第一次被真实 draw 采用（每份一次）
+    if (e_adopted) note_warm_adoption(e, sha);   // 预建对象第一次被真实 draw 采用（每份一次）
     if (e && e->prog.lib_bad) e = NULL;   // 绑定核对拒收的出库版：不落命中，下去取现编
     if (e) {
         if (e_failed) return -1;
@@ -2153,7 +2270,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     if (alias_on()) {
         int a_adopted = 0;
         struct entry *ae = alias_try_fg(sha, &id, nst, &a_adopted);
-        if (a_adopted) nvk_prog_warm_stat_draw_hit();   // 合并到的正是预热带建的那份：第一次被真实 draw 采用
+        if (a_adopted) note_warm_adoption(ae, sha);   // 合并到的正是预热带建的那份：第一次被真实 draw 采用
         if (ae && !ae->prog.lib_bad) {   // 合并到的是绑定核对拒收的出库版：不采用，下去取现编
             *out = &ae->prog;
             // 与下面「正常发布后」同一处登记：合并命中的身份也进事实复用表。否则只靠前台建过的程序登记事实，合并之后前台几乎不建了，
@@ -2216,6 +2333,15 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     struct entry *ne = NULL;
     const uint64_t dg_c0 = atomic_load(&g_n_compiled);
     struct work_snap *snap = snap_capture(&f, &id, sha, &pc, stages, nst);
+#ifdef S2A_ANDROID_DEBUG_ENV
+    if (snap && nvk_warm_capture_enabled()) {
+        snap->preimage = malloc(idlen);
+        if (snap->preimage) {
+            memcpy(snap->preimage, idbuf, idlen);
+            snap->preimage_len = idlen;
+        } else nvn_plat_log(NVN_PLAT_LOG_RED, "warm", "非窗口采集失败：无法保存身份原文");
+    }
+#endif
     g_ubo_learned = 0;
     int pending = 0;
     if (!snap || !(ne = work_run(snap, q, &pending))) {

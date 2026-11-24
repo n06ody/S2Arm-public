@@ -27,6 +27,10 @@ int s2a_program_cache_dir(const char *state_dir, char *out, size_t out_size,
 int s2a_program_cache_load(const char *dir, const uint8_t identity[32],
                            uint8_t **bytes, size_t *len,
                            uint8_t result_sha[32], char *why, size_t why_size);
+// 同 s2a_program_cache_load，但 dir 是随包种子目录（已冻结的修订里的文件）：按 installed_seed.h 的叶子规则受控打开，库外链接 / 绝对路径 / 目录别名一律拒（未命中）。
+int s2a_program_cache_load_installed(const char *dir, const uint8_t identity[32],
+                                     uint8_t **bytes, size_t *len,
+                                     uint8_t result_sha[32], char *why, size_t why_size);
 
 // 只读文件头（88 字节）：命中返回 0，给出头里记的结果摘要和负载长度；不读负载、也不重算摘要。
 // 用途：调用方只想知道「这个身份的结果是不是某份已常驻的结果」，是的话不必把整份读进来再建一遍。

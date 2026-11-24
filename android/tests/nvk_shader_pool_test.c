@@ -112,7 +112,10 @@ static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
+static int fixture_warm_nowindow, fixture_warm_capture;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
+    if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
@@ -167,7 +170,8 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
     memcpy(keys, gs_keys, sizeof gs_keys); memcpy(stage, gs_stages, sizeof gs_stages); *ok = gs_keys_ok;
     return &gs_program;
 }
-void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
+static uint32_t fixture_ssbo_align;   // 设备 minStorageBufferOffsetAlignment（非窗口补件夹具要非对齐的存储缓冲基址，请求才带 hasUnalignedStorageBuffer）
+void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
     // 77：带视图（改目标为 RECTANGLE）；78 / 79：同一组格式 / 目标 / 深度的两个不同句柄（快路按事实认，不按句柄认）。
     if (!separate_fixture || (id != 77 && id != 78 && id != 79 && !(separate_fixture == 2 && id == 0))) return 0;
@@ -287,6 +291,11 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
         if (fake_gs_fact_deps) snprintf(depbuf, sizeof depbuf,
             ",\"contract\":\"s2a-direct-program-content-v1\",\"dependencies\":[{\"source\":\"code:sha256:synthetic\",\"method\":\"GetCode\"},{\"source\":\"%s\",\"method\":\"QuerySamplerType\"},{\"source\":\"texture-fact:fs:10:2\",\"method\":\"QueryTextureCoordNormalized\"},{\"source\":\"code:sha256:synthetic#cbUse\",\"method\":\"QueryConstantBufferUse\",\"arguments\":\"stage=vs\"}]", source);
         if (fake_gs_result_tag) { size_t dn = strlen(depbuf); snprintf(depbuf + dn, sizeof depbuf - dn, ",\"fixtureTag\":%d", fake_gs_result_tag); }
+        if (fixture_warm_capture) {
+            size_t used = strlen(depbuf);
+            snprintf(depbuf + used, sizeof depbuf - used,
+                     ",\"identity\":{\"directABI\":1,\"translatorClosure\":\"closure-test\",\"profileHash\":\"%s\"}", phash);
+        }
         const char *deps = depbuf;
         // 请求带 linkMapDiag 时照编译器口径在信封外层附 linkMap（VS 写逻辑 0/3/7、FS 读 3/7 → 压缩后宿主 0/1/2 与 1/2）
         const char *link_map = strstr(captured, "\"linkMapDiag\":true") ? ",\"linkMap\":{\"vs\":[[0,0],[3,1],[7,2]],\"fs\":[[3,1],[7,2]]}" : "";
@@ -711,6 +720,11 @@ static void last_table_test(void) {
     CHECK(!nvk_shader_last_allocated(), "fast table is released at session retirement");
     CHECK(nvk_shader_last_test_find(keys[0]) == NULL, "entries holding rp_prog pointers do not survive session retirement");
 }
+// 普通 VS/FS 冷局：先交出真实前台请求，再把宿主编译器的原样结果送回同一入口。
+static int emit_nowindow_pair, execute_nowindow_pair;
+static const char *arms_root, *arms_manifest;   // --nowindow-arms：种子目录树根 / 程序清单目录（非空 = 执行完后接着跑补件各臂）
+static void test_nowindow_seed(const char *root, const char *manifest, const struct rp_shader_req *q);
+
 static int emit_real_request(const char *profile_path, const char *closure, const char *dir, const char *output, int tbuf) {
     FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
     size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
@@ -722,8 +736,9 @@ static int emit_real_request(const char *profile_path, const char *closure, cons
     //   有这项能力时现编不改写 z（nvk_shader.c fill_facts），所以这里同样报有（设备没有时 t_replay_gs 的逐字节比对会直接红）
     fake_depth_clip = tbuf == 0 || tbuf >= 3;   // GS 整链的基准（0）、执行复用（3）、三种宽松输入（4–6）同一口径，内容才可比；贴图缓冲链（1 / 2）不变
     rp_state_reset(); rp_shader_reset(); s2a_source_clear();
+    unsigned stages = emit_nowindow_pair || execute_nowindow_pair ? 2 : 3;
     uint8_t keys[3][8];
-    for (unsigned st = 0; st < 3; st++) {
+    for (unsigned st = 0; st < stages; st++) {
         char path[1024]; snprintf(path, sizeof path, "%s/%s.bin", dir, (const char *const[]){"vs","fs","gs"}[st]);
         FILE *f = fopen(path, "rb"); if (!f) return 1;
         uint8_t code[4096], ctl[0x760] = {0}, digest[32]; size_t n = fread(code, 1, sizeof code, f);
@@ -733,15 +748,22 @@ static int emit_real_request(const char *profile_path, const char *closure, cons
         if (s2a_source_keep(digest, st, code, (uint32_t)n, ctl, sizeof ctl)) return 1;
         memcpy(keys[st], digest, 8);
     }
-    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = 3;
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G'); gs_program.serial = 101; gs_program.nstage = stages;
     memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
-    for (unsigned st = 0; st < 3; st++) { gs_stages[st] = (uint8_t)st; memcpy(gs_keys[st], keys[st], 8); }
-    gs_keys_ok = 7; p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    for (unsigned st = 0; st < stages; st++) { gs_stages[st] = (uint8_t)st; memcpy(gs_keys[st], keys[st], 8); }
+    gs_keys_ok = (uint8_t)((1u << stages) - 1); p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
     if (!rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8)) return 1;
     bind_pools(tbuf == 1 || tbuf == 2 || tbuf == 7 || tbuf >= 8 ? 100 : 7);
     if (tbuf >= 8) { separate_fixture = 1; rp_S.img[1][0] = 78; }
     if (tbuf == 1 || tbuf == 2 || tbuf == 7) { separate_fixture = 3; bind_separate(1, 0, 1, 77); }
-    if (tbuf == 2 || tbuf == 3 || tbuf == 7 || tbuf == 9) { fake_compile_file = output; fake_gs_success = 1; nvn_unimpl_reset(); memset(gs_loads, 0, sizeof gs_loads); }
+    if (stages == 2) {   // 普通 VS/FS：存储缓冲基址取非对齐的，请求带 hasUnalignedStorageBuffer
+        fixture_ssbo_align = 16;
+        fixture_warm_capture = execute_nowindow_pair;
+        rp_S.ssbo[0][0].addr = 0x10004;
+        rp_S.ssbo[0][0].size = 64;
+        if (execute_nowindow_pair && nvk_prog_warm_load() != 0) return 1;
+    }
+    if (execute_nowindow_pair || tbuf == 2 || tbuf == 3 || tbuf == 7 || tbuf == 9) { fake_compile_file = output; fake_gs_success = 1; nvn_unimpl_reset(); memset(gs_loads, 0, sizeof gs_loads); }
     else capture_output = output;
     if (tbuf == 4) rp_S.tex[0][0] = 99;
     if (tbuf == 6) rp_S.ubo[5][15].size = 16;
@@ -749,6 +771,15 @@ static int emit_real_request(const char *profile_path, const char *closure, cons
     struct rp_shader_req q = {0}; q.prim = 0; q.rt_count = 1; q.rt_format[0] = NVN_FORMAT_RGBA8;
     if (tbuf == 5) { q.rt_count=2; q.rt_format[1]=NVN_FORMAT_RGBA8; }
     const struct rp_prog *prog = NULL; int rc = rp_shader_resolve(&q, &prog);
+    if (execute_nowindow_pair) {
+        if (rc || !prog || compiler_calls != 1 || prog->lib_sourced) return 1;
+        nvk_prog_warm_save();
+        if (arms_root) {
+            CHECK(s2a_program_cache_drain(5000) == 0, "ordinary draw manifest drains");
+            test_nowindow_seed(arms_root, arms_manifest, &q);
+        }
+        return failures != 0;
+    }
     if (tbuf == 7) {
         int rejected = rc == -1 && !prog && compiler_calls == 1 &&
             nvn_unimpl_count("shader", "texture_buffer_replay_unsupported") == 1 && gs_loads[1] == 0;
@@ -1676,6 +1707,147 @@ static void link_refused_test(const char *root, uint8_t keys[3][8], char hex[3][
     unsetenv("S2A_PW_TEST_DIR");
 }
 
+// 采集：成功的冷局普通绘制落盘一份完整请求（调试包才有；玩家包永不记录着色器请求）。
+static void check_warm_capture(const char *dir, const uint8_t identity[32], const char *hex) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/warm-nowindow-capture/%s.request", dir, hex);
+    FILE *f = fopen(path, "rb");
+#ifdef S2A_ANDROID_DEBUG_ENV
+    CHECK(f != NULL, "successful cold ordinary draw publishes one record");
+    if (!f) return;
+    uint8_t header[76], preimage[S2A_INPUT_IDENTITY_MAX], digest[32];
+    int valid = fread(header, 1, sizeof header, f) == sizeof header && !memcmp(header, "S2AWREQ1", 8);
+    size_t n = valid ? (size_t)header[8] | (size_t)header[9] << 8 |
+                       (size_t)header[10] << 16 | (size_t)header[11] << 24 : 0;
+    valid = n && n <= sizeof preimage && fread(preimage, 1, n, f) == n;
+    CHECK(valid, "capture contains complete identity preimage");
+    if (valid) {
+        s2a_sha256 h;
+        s2a_sha256_init(&h); s2a_sha256_update(&h, preimage, n); s2a_sha256_final(&h, digest);
+        CHECK(!memcmp(digest, identity, 32), "all 32 bytes of the identity match the preimage");
+        size_t len = strlen(captured);
+        char *raw = malloc(len + 1);
+        CHECK(raw && fread(raw, 1, len, f) == len && !memcmp(raw, captured, len) && fgetc(f) == EOF,
+              "capture contains the exact request passed to the foreground compiler");
+        s2a_sha256_init(&h); s2a_sha256_update(&h, header, 44);
+        s2a_sha256_update(&h, preimage, n); s2a_sha256_update(&h, captured, len);
+        s2a_sha256_final(&h, digest);
+        CHECK(!memcmp(digest, header + 44, 32), "request, preimage and result digest bound together");
+        free(raw);
+    }
+#else
+    (void)identity;
+    CHECK(f == NULL, "player build never records shader requests");
+#endif
+    if (f) fclose(f);
+}
+// 种子补件各臂：同一份完整身份，关 / 开 / 别的 profile / 内部身份被改 / 摘要被改 / 文件缺失。只有「开且补件完好」一臂免前台翻译。
+//   donor = 一次真实冷局落下的程序清单（nvk_prog_warm_save）；捐出来放进「闭包-profile」种子目录，补件放在它的 nowindow/ 子目录。
+static void test_nowindow_seed(const char *root, const char *manifest, const struct rp_shader_req *q) {
+    DIR *dir = opendir(manifest);
+    CHECK(dir != NULL, "open donor program manifest");
+    if (!dir) return;
+    char name[80] = "";
+    struct dirent *de;
+    while ((de = readdir(dir))) {
+        if (strncmp(de->d_name, "programs-v1-", 12) == 0 && strlen(de->d_name) < sizeof name)
+            strcpy(name, de->d_name);
+    }
+    closedir(dir);
+    char donor[560], parent[640], cohort[680], shipped[780], companion[720];
+    snprintf(donor, sizeof donor, "%s/%s", manifest, name);
+    FILE *f = fopen(donor, "rb");
+    uint8_t header[60];
+    int valid = f && fread(header, 1, sizeof header, f) == sizeof header;
+    if (f) fclose(f);
+    CHECK(valid, "read donor seed header");
+    if (!valid) return;
+    char profile[17], closure[17];
+    for (int i = 0; i < 8; i++) {
+        snprintf(profile + 2*i, 3, "%02x", header[16+i]);
+        snprintf(closure + 2*i, 3, "%02x", header[52+i]);
+    }
+    snprintf(parent, sizeof parent, "%s/shaders/direct/warm-vk", root);
+    snprintf(cohort, sizeof cohort, "%s/%s-%s", parent, closure, profile);
+    snprintf(shipped, sizeof shipped, "%s/%s", cohort, name);
+    snprintf(companion, sizeof companion, "%s/nowindow", cohort);
+    CHECK(!mkdir(parent, 0700) && !mkdir(cohort, 0700) && !mkdir(companion, 0700) &&
+          !rename(donor, shipped), "install the original seed");
+    fake_gs_result_mode = 1;  // The real draw has VS + FS.
+    rp_shader_reset();
+    setenv("S2A_DIRECT_CACHE_DIR", companion, 1);
+    fixture_warm_capture = 1;
+#ifdef S2A_ANDROID_DEBUG_ENV
+    struct nvk_prog_rec prior = {0};
+    CHECK(!nvk_prog_warm_load() && !nvk_prog_warm_take(&prior), "capture ignores shipped historical recipes");
+#endif
+    compiler_calls = 0;
+    const struct rp_prog *ordinary = NULL;
+    CHECK(!rp_shader_resolve(q, &ordinary) && ordinary && !ordinary->lib_sourced && compiler_calls == 1,
+          "record one ordinary nonaligned program");
+    uint8_t ordinary_id[32];
+    if (!ordinary) return;
+    memcpy(ordinary_id, ordinary->identity, sizeof ordinary_id);
+    CHECK(!s2a_program_cache_drain(5000), "finish writing donor bytes");
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    char hex[65], program[sizeof companion + 75];
+    for (unsigned i = 0; i < sizeof ordinary_id; ++i)
+        snprintf(hex + 2*i, 3, "%02x", ordinary_id[i]);
+    check_warm_capture(manifest, ordinary_id, hex);
+    fixture_warm_capture = 0;
+    snprintf(program, sizeof program, "%s/%s.program", companion, hex);
+    // 完好补件的字节留一份：BUILD_FAIL 一臂要在「摘要按改后内容重算」下改坏阶段（过得了读入核对、过不了 build）
+    uint8_t *good = NULL; size_t good_len = 0; uint8_t good_sha[32]; char gwhy[128] = "";
+    CHECK(!s2a_program_cache_load(companion, ordinary_id, &good, &good_len, good_sha, gwhy, sizeof gwhy), "keep the intact companion bytes: %s", gwhy);
+    enum { DISABLED, VALID, OTHER_PROFILE, WRONG_ID, BAD_DIGEST, ABSENT, BUILD_FAIL };
+    for (int arm = DISABLED; arm <= BUILD_FAIL; ++arm) {
+        fixture_warm_nowindow = arm != DISABLED;
+        if (arm == WRONG_ID || arm == BAD_DIGEST) {
+            FILE *file = fopen(program, "r+b");
+            CHECK(file != NULL, "open companion to exercise integrity checks");
+            if (!file) return;
+            // Internal identity occupies bytes 16..47. Preserve its prefix so
+            // the first control detects any accidental short-identity lookup.
+            int changed = !fseek(file, 47, SEEK_SET) &&
+                          fputc(ordinary_id[31] ^ (arm == WRONG_ID), file) != EOF;
+            if (arm == BAD_DIGEST) {
+                int last = EOF;
+                if (!fseek(file, -1, SEEK_END)) last = fgetc(file);
+                changed = changed && last != EOF && !fseek(file, -1, SEEK_END) &&
+                          fputc(last ^ 1, file) != EOF;
+            }
+            CHECK(!fclose(file) && changed, "prepare control %d", arm);
+        } else if (arm == ABSENT) {
+            CHECK(!unlink(program), "remove companion for missing-file control");
+        } else if (arm == BUILD_FAIL && good) {
+            // 把 FS 的阶段名改成不认识的（等长，摘要由 store 按改后的内容重算）：读入核对照过，build() 解析失败
+            char *fs = memmem(good, good_len, "\"stage\":\"fs\"", 12);
+            CHECK(fs != NULL, "find the FS stage in the intact companion");
+            if (fs) fs[10] = 'x';
+            s2a_program_cache_store_async(companion, ordinary_id, good, good_len);
+            CHECK(!s2a_program_cache_drain(5000), "write the stage-broken companion");
+        }
+        rp_shader_reset();
+        compiler_calls = 0;
+        struct nvk_prog_rec rec = {0};
+        CHECK(nvk_prog_warm_load() == 1 && nvk_prog_warm_take(&rec) &&
+              !memcmp(rec.identity, ordinary_id, 32), "load the same full identity");
+        if (arm == OTHER_PROFILE) strcpy(external_profile_hash, "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        int built = nvk_prog_warm_build(&rec);
+        external_profile_hash[0] = 0;
+        const struct rp_prog *adopted = NULL;
+        int rc = rp_shader_resolve(q, &adopted);
+        int expected_calls = arm == VALID ? 0 : 1;   // BUILD_FAIL：补件建失败不发布，前台现编 1 次、绘制不被跳过（rc == 0 且拿到程序）
+        CHECK((built == 0) == (arm == VALID) && !rc && adopted && !adopted->lib_sourced &&
+              compiler_calls == expected_calls,
+              "non-window companion arm=%d: warm rc=%d, first resolve rc=%d, foreground translations=%d (expected %d)",
+              arm, built, rc, compiler_calls, expected_calls);
+    }
+    free(good);
+    fixture_warm_nowindow = 0;
+    fake_gs_result_mode = 0;
+}
+
 static int gs_libpack_test(int diagnose_refusals) {
     fake_depth_clip = 1;   // 深度 near=-w 也能用预编库（libpack_state_ok），夹具不带深度零
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
@@ -2121,6 +2293,23 @@ int main(int argc, char **argv) {
         return emit_real_request(argv[2], argv[3], argv[4], argv[5], 7);
     if (argc == 6 && !strcmp(argv[1], "--reject-compute-tbufu"))
         return emit_compute_request(argv[2], argv[3], argv[4], argv[5], 2);
+    if (argc == 6 && (!strcmp(argv[1], "--emit-nowindow") || !strcmp(argv[1], "--execute-nowindow") || !strcmp(argv[1], "--nowindow-arms"))) {
+        emit_nowindow_pair = !strcmp(argv[1], "--emit-nowindow");
+        execute_nowindow_pair = !emit_nowindow_pair;
+        char wd[320], root[400], manifest[400], cache[400];
+        if (!strcmp(argv[1], "--nowindow-arms")) {   // 自带临时目录：种子树、程序清单、跨局缓存各一个，不碰调用方的目录
+            snprintf(wd, sizeof wd, "%s/nowindow_arms.XXXXXX", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+            if (!mkdtemp(wd)) return 1;
+            snprintf(root, sizeof root, "%s/root", wd); snprintf(manifest, sizeof manifest, "%s/manifest", wd); snprintf(cache, sizeof cache, "%s/cache", wd);
+            char sh[420], direct[440];
+            snprintf(sh, sizeof sh, "%s/shaders", root); snprintf(direct, sizeof direct, "%s/direct", sh);
+            if (mkdir(root, 0700) || mkdir(sh, 0700) || mkdir(direct, 0700) || mkdir(manifest, 0700) || mkdir(cache, 0700)) return 1;
+            setenv("S2A_PW_TEST_DIR", manifest, 1);
+            setenv("S2A_SHADER_REVISION_ROOT", root, 1);   // 随包种子目录 = <这个根>/shaders/direct/warm-vk/<闭包>-<profile>（nvk_prog_warm 的 seed_dir_of）
+            arms_root = root; arms_manifest = manifest;
+        }
+        return emit_real_request(argv[2], argv[3], argv[4], argv[5], 0);
+    }
     if (argc == 6 && (!strcmp(argv[1], "--emit-real") || !strcmp(argv[1], "--emit-real-tbuf") || !strcmp(argv[1], "--execute-tbuf")))
         return emit_real_request(argv[2], argv[3], argv[4], argv[5], !strcmp(argv[1], "--execute-tbuf") ? 2 : !strcmp(argv[1], "--emit-real-tbuf"));
     if (argc == 6 && (!strcmp(argv[1], "--emit-compute-tbuf") || !strcmp(argv[1], "--execute-compute-tbuf")))

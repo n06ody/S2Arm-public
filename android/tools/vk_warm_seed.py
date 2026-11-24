@@ -45,7 +45,7 @@ def fnv1a64(b):
     return h
 
 
-def prog_check(name, b):
+def prog_check(name, b, records=None):
     """程序清单 → (闭包 hex16, profile hex16, 身份集合)；坏了抛 ValueError（原因）"""
     if len(b) < PROG_HDR + 8: raise ValueError('文件太短')
     magic, ver, ent, cnt = struct.unpack_from('<IIII', b, 0)
@@ -57,6 +57,7 @@ def prog_check(name, b):
     for _ in range(cnt):   # 变长条目：逐条走，c1 长度与有效位相符、在 [MIN, MAX]、合计正好落到校验和之前
         if off + PROG_ENTRY > end: raise ValueError('长度与条数不符')
         e = b[off:off + PROG_ENTRY]; off += PROG_ENTRY; ids.add(e[:32])
+        c1_start = off
         for st in range(3):
             cl = struct.unpack_from('<I', e, 64 + 4 * st)[0]
             if not (e[60] >> st) & 1:
@@ -64,6 +65,9 @@ def prog_check(name, b):
                 continue
             if not PROG_C1_MIN <= cl <= PROG_C1_MAX: raise ValueError('条目 c1 长度越界')
             off += (cl + 3) & ~3
+        if records is not None:
+            if e[:32] in records: raise ValueError('程序身份重复')
+            records[e[:32]] = (e, b[c1_start:off])
     if off != end: raise ValueError('长度与条数不符')
     if struct.unpack_from('<Q', b, len(b) - 8)[0] != fnv1a64(b[:-8]): raise ValueError('FNV 校验不符')
     closure, profile = b[52:60].hex(), b[16:24].hex()
@@ -115,7 +119,7 @@ def program_id(a):   # 程序号：同 graphics/tools/direct/run_knowledge.py pr
 
 def build(out, srcs, log=print):
     """→ {目录名: (排序键, 程序文件名, 程序清单字节, 管线字节或 None, 管线收下条数, 滤掉条数)}，并写出到 out"""
-    pick = {}
+    pick, companions = {}, {}
     for d in source_dirs(srcs):
         names = sorted(os.listdir(d))
         pipe_entries = None
@@ -133,7 +137,10 @@ def build(out, srcs, log=print):
                 kept, dropped = len(keep), len(pipe_entries) - len(keep)
                 if keep: pb = pipe_bytes(keep)
             key, rank = f'{closure}-{profile}', (-len(ids), hashlib.sha256(b).digest())
-            if key not in pick or rank < pick[key][0]:
+            companion = os.path.join(d, 'nowindow')
+            present = os.path.isdir(companion)
+            if key not in pick or rank < pick[key][0] or (rank == pick[key][0] and present and not companions[key]):
+                companions[key] = companion if present else None
                 pick[key] = (rank, n, b, pb, kept, dropped)
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out, exist_ok=True)
@@ -143,6 +150,9 @@ def build(out, srcs, log=print):
         with open(os.path.join(out, key, n), 'wb') as f: f.write(b)
         if pb:
             with open(os.path.join(out, key, PIPE_NAME), 'wb') as f: f.write(pb)
+        if companions[key]:
+            from vk_warm_nowindow import stage_companion
+            stage_companion(companions[key], os.path.join(out, key, 'nowindow'), n, b, pb)
     return pick
 
 
