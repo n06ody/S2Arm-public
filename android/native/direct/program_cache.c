@@ -11,6 +11,7 @@
 //
 // 头里同时带 identity 和 result 两份摘要：identity 只证明“这是谁的结果”，result 才能发现
 // 同一身份下的字节损坏。两个都要比，不能只比文件名。
+#include "installed_seed.h"
 #include "program_cache.h"
 
 #include <errno.h>
@@ -147,9 +148,11 @@ static int entry_path(const char *dir, const uint8_t identity[32], char *out, si
     return (w > 0 && (size_t)w < n) ? 0 : -1;
 }
 
-int s2a_program_cache_load(const char *dir, const uint8_t identity[32],
-                           uint8_t **bytes, size_t *len,
-                           uint8_t result_sha[32], char *why, size_t why_size) {
+// installed = 1：随包种子目录里的文件，按已冻结修订的叶子规则受控打开（常规文件，或恰一条指向本游戏 objects 库的规范相对链接，见 installed_seed.h）；
+//   0 = 本机跨局缓存（可写目录），普通 open。
+static int program_cache_load(const char *dir, const uint8_t identity[32],
+                              uint8_t **bytes, size_t *len,
+                              uint8_t result_sha[32], char *why, size_t why_size, int installed) {
     if (bytes) *bytes = NULL;
     if (len) *len = 0;
     if (result_sha) memset(result_sha, 0, 32);
@@ -157,7 +160,7 @@ int s2a_program_cache_load(const char *dir, const uint8_t identity[32],
     char path[PCACHE_PATH];
     if (entry_path(dir, identity, path, sizeof path)) { setwhy(why, why_size, "缓存路径过长"); return -1; }
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         atomic_fetch_add(&g_misses, 1);
         setwhy(why, why_size, errno == ENOENT ? "未命中" : "打开失败：%s", strerror(errno));
@@ -237,6 +240,16 @@ int s2a_program_cache_load(const char *dir, const uint8_t identity[32],
     *bytes = buf;
     *len = (size_t)n;
     return 0;
+}
+int s2a_program_cache_load(const char *dir, const uint8_t identity[32],
+                           uint8_t **bytes, size_t *len,
+                           uint8_t result_sha[32], char *why, size_t why_size) {
+    return program_cache_load(dir, identity, bytes, len, result_sha, why, why_size, 0);
+}
+int s2a_program_cache_load_installed(const char *dir, const uint8_t identity[32],
+                                     uint8_t **bytes, size_t *len,
+                                     uint8_t result_sha[32], char *why, size_t why_size) {
+    return program_cache_load(dir, identity, bytes, len, result_sha, why, why_size, 1);
 }
 
 int s2a_program_cache_probe(const char *dir, const uint8_t identity[32],

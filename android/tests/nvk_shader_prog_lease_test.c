@@ -120,6 +120,18 @@ int s2a_program_cache_load(const char *dir, const uint8_t identity[32], uint8_t 
     *len = sizeof g_payload;
     return 0;
 }
+// 本夹具没有安装种子。越过目录判据读取种子缓存时，用例必须报红。
+int s2a_program_cache_load_installed(const char *dir, const uint8_t identity[32],
+                                     uint8_t **bytes, size_t *len, uint8_t result_sha[32],
+                                     char *why, size_t why_size) {
+    (void)dir; (void)identity;
+    if (bytes) *bytes = NULL;
+    if (len) *len = 0;
+    if (result_sha) memset(result_sha, 0, 32);
+    if (why && why_size) snprintf(why, why_size, "no installed seed");
+    CHECK(0, "installed cache read without an active seed");
+    return -1;
+}
 // 结果合并（#1355）读头：这个夹具没有缓存目录，永远「没有可合并的」；结果合并本身由 nvk_shader_alias_test 覆盖。
 int s2a_program_cache_probe(const char *dir, const uint8_t identity[32], uint8_t result_sha[32], uint64_t *len,
                             char *why, size_t why_size) {
@@ -172,6 +184,10 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
 }
 void nvn_gpu_shader_release(nvn_gpu_shader s) { (void)s; g_release_calls++; }
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); }   // 建程序时问深度裁剪能力（nvk_shader.c depth_clip_cap）：本用例只管借用，报「没有」
+int nvk_prog_warm_seed_dir(char *out, size_t n) {
+    if (out && n) out[0] = 0;
+    return 0;
+}
 void nvk_prog_warm_reset(void) {}
 void nvk_prog_warm_stat_build(int rc) { (void)rc; }
 void nvk_prog_warm_stat_draw_hit(void) {}

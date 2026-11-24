@@ -28,7 +28,7 @@ cases = [
     ('one-file', [('"%s/" NVK_PROG_WARM_PREFIX "%s.bin", dir, hx', '"%s/programs-v1.bin%.0s", dir, hx')], 'manifest file exists after save'),   # 文件名回到一款一份：按闭包命名的那份根本不出现
     ('no-prune', [('    if (!rc) warm_prune(dir, path);', '    if (0) warm_prune(dir, path);')], 'the oldest (A) is pruned'),
     ('prune-keeps-legacy', [('    { char pth[NVK_PROG_WARM_MAX_PATH]; if (snprintf(pth, sizeof pth, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof pth) unlink(pth); }\n', '')], 'legacy-named file is removed'),
-    ('no-legacy-fallback', [('    if (rf && e == ENOENT) {', '    if (0 && rf && e == ENOENT) {')], 'legacy-named manifest of the same closure is accepted'),
+    ('no-legacy-fallback', [('    if (!capture && rf && e == ENOENT) {', '    if (0 && rf && e == ENOENT) {')], 'legacy-named manifest of the same closure is accepted'),
     ('mismatch-red', [('nvn_plat_log(mismatch ? NVN_PLAT_LOG_WARN : NVN_PLAT_LOG_RED, "warm", m);', 'nvn_plat_log(NVN_PLAT_LOG_RED, "warm", m);')], 'yellow line with its own reason'),
 ]
 for name, edits, expect in cases:
@@ -130,7 +130,7 @@ PY
 "$cc" -std=gnu11 -O1 -Wall -Wextra -Werror -pthread -D_GNU_SOURCE \
   -I "$android/native" -I "$android/native/nvn" -I "$android/native/direct" \
   -I "$repo/graphics/nvn/replay" -I "$repo/graphics/nvn/gfx/nvn" -I "$repo/graphics/nvn/gfx/nvn/include" -I "$repo/graphics/nvn/gfx/tex" \
-  -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" "$android/native/direct/sha256.c"
+  -o "$tmp/t_seed" "$android/tests/nvn_vk_warm_seed_test.c" "$android/native/nvn/nvn_vk_prog_warm.c" "$android/native/nvn/nvn_vk_pipe_warm.c" "$android/native/direct/program_cache.c" "$android/native/direct/sha256.c"
 "$tmp/t_seed"
 # Run the actual installer first so the reader sees the same relative object links as Android.
 mkdir -p "$tmp/java" "$tmp/games" "$tmp/cache"
@@ -226,13 +226,108 @@ cohort.symlink_to(saved.name, target_is_directory=True)
 check(0, 0)
 print('PASS: installer leaves accepted; external, cyclic, absolute and directory links rejected')
 VERIFY
+# nowindow/ 补件走同一套受控读取：程序结果（s2a_program_cache_load_installed）与管线配方（pw_read_file installed=1）。
+# 安装器放下的叶子要能载入（跨资源根换包后补件仍可用）；库外链接 / 环 / 绝对路径 / 目录别名 / 桶不符一律拒；
+# 然后各撤一处（受控读取改回普通 open / 管线读退回普通 open），整套必须红在对应用例（编译失败不算红）。
+python3 - "$repo" "$tmp" "$revision" <<'NOWINDOW'
+import os, pathlib, subprocess, sys
+from contextlib import contextmanager
+repo, tmp, revision = map(pathlib.Path, sys.argv[1:])
+warm_vk = revision/'shaders/direct/warm-vk'
+for entry in list(warm_vk.iterdir()):   # 上一段把 cohort 目录换成了别名链接（真目录改名 saved）：还原后再测补件
+    if entry.is_symlink():
+        entry.unlink()
+        (warm_vk/'saved').rename(entry)
+seed_dir, = warm_vk.iterdir()
+nw = seed_dir/'nowindow'
+nw_prog, = nw.glob('*.program')
+nw_pipe = nw/'pipes-v1-352.bin'
+assert nw_prog.is_symlink() and nw_pipe.is_symlink(), 'installer must publish nowindow leaves as object links'
+
+class Red(Exception):
+    pass
+
+def check(exe, case, progs, pipes, results):
+    r = subprocess.run([str(exe), '--installed-nowindow', str(revision), str(tmp/'cache'), str(progs), str(pipes), str(results)],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise Red(f'{case}: {r.stderr.strip()[-300:]}')
+
+@contextmanager
+def replaced(path, make):
+    saved = path.with_name(path.name + '.saved')
+    path.rename(saved)
+    try:
+        make()
+        yield
+    finally:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+        saved.rename(path)
+
+def scenario(exe):
+    check(exe, 'installer leaves', 2, 1, 1)      # 安装器放下的补件：程序结果载入、替换管线清单（1 条，不是上一级的 2 条）
+    for leaf, expect in ((nw_prog, (2, 1, 0)), (nw_pipe, (2, 0, 1))):
+        original = os.readlink(leaf)
+        copy = tmp/('copy-' + leaf.name)
+        copy.write_bytes(leaf.read_bytes())
+        digest = pathlib.Path(original).name
+        wrong = '00' if pathlib.Path(original).parent.name != '00' else '01'
+        for case, target in [('external relative link', os.path.relpath(copy, leaf.parent)),
+                             ('cyclic link', leaf.name),
+                             ('absolute link', str(copy)),
+                             ('bucket mismatch', original.rsplit('/', 2)[0] + '/' + wrong + '/' + digest)]:
+            with replaced(leaf, lambda t=target: leaf.symlink_to(t)):
+                check(exe, f'{leaf.name[-12:]} {case}', *expect)
+    saved = nw.with_name('nowindow.saved')
+    with replaced(nw, lambda: nw.symlink_to(saved.name, target_is_directory=True)):
+        check(exe, 'aliased nowindow directory', 2, 0, 0)
+    check(exe, 'restored leaves', 2, 1, 1)
+
+scenario(tmp/'t_seed')
+print('PASS: nowindow installer leaves accepted; external, cyclic, absolute, bucket and directory aliases rejected', flush=True)
+
+prog_cache, pipe_warm = repo/'android/native/direct/program_cache.c', repo/'android/native/nvn/nvn_vk_pipe_warm.c'
+cases = [   # (名字, 被改文件, 改动, 必须出现在红因里的片段)
+    ('program-plain-open', prog_cache, [('int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC);', 'int fd = installed ? open(path, O_RDONLY | O_CLOEXEC) : open(path, O_RDONLY | O_CLOEXEC);')],
+     'program result: expected rejected'),     # 程序结果改回普通 open：库外 / 绝对链接照收
+    ('pipe-plain-read', pipe_warm, [('int rc = pw_read_file(seed_path, 1, &buf, &bytes, &se);', 'int rc = pw_read_file(seed_path, 0, &buf, &bytes, &se);')],
+     'installer leaves'),                       # 管线读退回普通 open：碰到安装器相对链接的 ELOOP，补件整份读不到
+    ('pipe-follows-links', pipe_warm, [('int rc = pw_read_file(seed_path, 1, &buf, &bytes, &se);', 'int rc = pw_read_file(seed_path, 0, &buf, &bytes, &se);'),
+                                       ('O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);\n    if (fd < 0) { if (errno == ENOENT)', 'O_RDONLY | O_CLOEXEC | O_NONBLOCK);\n    if (fd < 0) { if (errno == ENOENT)')],
+     'recipes: expected'),                      # 普通 open 且跟随任意链接：安装器叶子能读，库外 / 绝对链接也照收
+]
+inc = []
+for d in ('android/native', 'android/native/nvn', 'android/native/direct', 'graphics/nvn/replay', 'graphics/nvn/gfx/nvn', 'graphics/nvn/gfx/nvn/include', 'graphics/nvn/gfx/tex'):
+    inc += ['-I', str(repo/d)]
+for name, src, edits, expect in cases:
+    text = src.read_text()
+    for old, new in edits:
+        assert text.count(old) == 1, (name, 'mutation anchor', old[:70])
+        text = text.replace(old, new)
+    m = tmp/f'nowindow_{name}_{src.name}'; m.write_text(text)
+    srcs = [str(m) if s == src else str(s) for s in (repo/'android/native/nvn/nvn_vk_prog_warm.c', pipe_warm, prog_cache)]
+    exe = tmp/f't_seed_nowindow_{name}'
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror', '-pthread', '-D_GNU_SOURCE', *inc, '-o', str(exe),
+                    str(repo/'android/tests/nvn_vk_warm_seed_test.c'), *srcs, str(repo/'android/native/direct/sha256.c')], check=True)
+    try:
+        scenario(exe)
+    except Red as red:
+        assert expect in str(red), (name, expect, str(red))
+        print(f'nowindow 负对照 {name}：红在「{red}」'[:420])
+    else:
+        raise SystemExit(f'nowindow mutant {name} stayed green')
+print(f'PASS: nowindow 受控读取负对照 {len(cases)} 项全部变红')
+NOWINDOW
 # 负对照：各撤一处，t_seed 必须红在对应断言（编译失败不算红）
 python3 - "$repo" "$tmp" <<'PY'
 import os, pathlib, subprocess, sys
 repo, tmp = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 prog, pipe = repo/'android/native/nvn/nvn_vk_prog_warm.c', repo/'android/native/nvn/nvn_vk_pipe_warm.c'
 cases = [
-    ('seed-even-with-local', prog, [('    if (rf && e == ENOENT && !seed_dir_of(seed_dir', '    if (!seed_dir_of(seed_dir')], '有本机程序清单：用本机的 1 条'),   # 不判本机清单是否为空
+    ('seed-even-with-local', prog, [('    if (!capture && rf && e == ENOENT && !seed_dir_of(seed_dir', '    if (!capture && !seed_dir_of(seed_dir')], '有本机程序清单：用本机的 1 条'),   # 不判本机清单是否为空
     ('desc-field-swap', pipe, [('    d->dfmt = pw_get32(b, &at);\n    d->sfmt = pw_get32(b, &at);', '    d->sfmt = pw_get32(b, &at);\n    d->dfmt = pw_get32(b, &at);')], 'dfmt 0x3e / sfmt 0 / samples 4'),   # 配方映射错一个字段
     ('bad-row-kept', prog, [('        if (!rec_well_formed(&s.rec)) { filtered++; continue; }', '')], '坏条目跳过：3 条收 2 条'),   # 坏行不跳过
     ('pipe-row-unchecked', pipe, [('        if (from_seed && !(nvk_prog_warm_contains && nvk_prog_warm_contains(e))) { dropped++; continue; }', '')], '管线清单从种子收下 2 条'),   # 种子里程序不在的管线条目不跳过
@@ -250,7 +345,7 @@ for name, src, edits, expect in cases:
     others = [str(m) if s == src else str(s) for s in (prog, pipe)]
     exe = tmp / f't_seed_{name}'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror', '-pthread', '-D_GNU_SOURCE', *inc, '-o', str(exe),
-                    str(repo/'android/tests/nvn_vk_warm_seed_test.c'), *others, str(repo/'android/native/direct/sha256.c')], check=True)
+                    str(repo/'android/tests/nvn_vk_warm_seed_test.c'), *others, str(repo/'android/native/direct/program_cache.c'), str(repo/'android/native/direct/sha256.c')], check=True)
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     assert r.returncode != 0 and expect in r.stderr, (name, r.stdout[-400:], r.stderr[-800:])
     print(f'随包种子 负对照 {name}：红在「{expect}」')
