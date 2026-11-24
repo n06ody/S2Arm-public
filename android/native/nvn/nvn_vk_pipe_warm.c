@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "nvn_vk_warm_options.h"
 #include "nvn_plat.h"     // nvn_plat_flag / nvn_plat_log
 #include "rp_shader.h"    // struct rp_prog / rp_shader_prog_identity
 
@@ -898,6 +899,9 @@ static int pw_write_atomic(const char *path, const uint8_t *buf, size_t bytes) {
 }
 
 // 整份读（有界）。*enoent = 1 表示目录里还没有旧文件（不是错误）。
+// installed = 1：随包种子（含 nowindow/ 补件）。跨资源根换包后这些叶子是指向游戏对象库的相对链接，普通 open 会撞 ELOOP、种子整份读不到；
+//   经 s2a_installed_seed_open 只放行常规文件或恰一条规范的库内相对链接，库外 / 环 / 绝对链接、目录别名一律拒（拒收 ≠ 缺文件：不退回上一级清单）。
+//   installed = 0：本机清单（可写目录），仍禁止跟链。
 static int pw_read_file(const char *path, int installed, uint8_t **out, size_t *bytes, int *enoent) {
     *out = NULL; *bytes = 0; *enoent = 0;
     int fd = installed ? s2a_installed_seed_open(path) : open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -930,8 +934,9 @@ int nvk_pipe_warm_load(void) {
 
     uint8_t *buf = NULL;
     size_t bytes = 0;
-    int enoent = 0;
-    if (pw_read_file(path, 0, &buf, &bytes, &enoent) != 0) {
+    int capture = nvk_warm_capture_enabled();
+    int enoent = capture;
+    if (!capture && pw_read_file(path, 0, &buf, &bytes, &enoent) != 0) {
         pw_log(1, "管线预热清单读失败：%s", path);
         return -1;   // 读不动：让预热线程稍后重试，不把「读失败」当「清单是空的」
     }
@@ -939,13 +944,24 @@ int nvk_pipe_warm_load(void) {
     // 管线种子没有自己的有效性头：只认和已收下的程序种子同一目录（目录名 = 闭包 + profile），条目再逐条核程序身份在程序清单里。
     int from_seed = 0;
     char seed_path[sizeof g.path + 64];
-    if (enoent) {
+    if (!capture && enoent) {
         char sd[sizeof g.path];
         int s = nvk_prog_warm_seed_dir ? nvk_prog_warm_seed_dir(sd, sizeof sd) : 0;
         if (s < 0) return -1;   // 程序清单本局还没定（它先载入）：稍后重试，不把「还不知道」当「没有种子」
-        if (s == 1 && snprintf(seed_path, sizeof seed_path, "%s/pipes-v%u-%u.bin", sd, (unsigned)NVK_PW_FORMAT, (unsigned)NVK_PW_DESC_BYTES) < (int)sizeof seed_path) {
+        if (s == 1) {
+            // 普通翻译和窗口库的管线状态可以不同（如 clip_neg1）。关窗补件带完整替换清单。
+            const int alternate = nvk_warm_nowindow_enabled();
+            const char *subdir = alternate ? "/nowindow" : "";
+            snprintf(seed_path, sizeof seed_path, "%s%s/pipes-v%u-%u.bin", sd, subdir,
+                     (unsigned)NVK_PW_FORMAT, (unsigned)NVK_PW_DESC_BYTES);
             int se = 0;
-            if (pw_read_file(seed_path, 1, &buf, &bytes, &se) != 0) pw_log(2, "【黄】管线预热清单随包种子读不动：%s，本局不用种子", seed_path);
+            int rc = pw_read_file(seed_path, 1, &buf, &bytes, &se);
+            if (!rc && se && alternate) {
+                snprintf(seed_path, sizeof seed_path, "%s/pipes-v%u-%u.bin", sd,
+                         (unsigned)NVK_PW_FORMAT, (unsigned)NVK_PW_DESC_BYTES);
+                rc = pw_read_file(seed_path, 1, &buf, &bytes, &se);
+            }
+            if (rc) pw_log(2, "【黄】管线预热清单随包种子读不动：%s，本局不用种子", seed_path);
             else if (!se) { from_seed = 1; enoent = 0; }
         }
     }

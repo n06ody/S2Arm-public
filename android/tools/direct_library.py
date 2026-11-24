@@ -150,7 +150,8 @@ GEOMETRY_STAGES = ('vs', 'gs', 'fs')
 
 REQUEST_KEYS = frozenset(('request', 'schema', 'session', 'generation', 'requestId',
                           'directABI', 'translatorClosure', 'runtimeCompilerABI',
-                          'sourceParserVersion', 'kindCheck', 'profile', 'program'))
+                          'sourceParserVersion', 'kindCheck', 'profile', 'program',
+                          'requiresLinkedVaryingInterface'))
 CAPTURE_KEYS = frozenset(('schema', 'directABI', 'translatorClosure', 'sourceParserVersion',
                           'profileHash', 'entries'))
 
@@ -765,9 +766,15 @@ def validate_request(raw, what):
         constant_buffer_use[name] = _integer(stage.get('constantBufferUse', 0),
                                              f'{where}.constantBufferUse', 0, 0xFFFFFFFF)
     expected = GRAPHICS_STAGES if kind == 'graphics' else COMPUTE_STAGES
-    if set(names) != set(expected) and not (v2 and set(names) == set(GEOMETRY_STAGES)):
+    # 生产编译器支持单顶点（只写深度）程序；请求与结果两端的阶段校验要用同一约定，否则单 VS 请求在这里被误拒。
+    vertex_only = kind == 'graphics' and names == ['vs']
+    if not vertex_only and set(names) != set(expected) and not (v2 and set(names) == set(GEOMETRY_STAGES)):
         _fail(f'{what}: program.stages {sorted(names)} is not {list(expected)}'
+              + (" or ['vs']" if kind == 'graphics' else '')
               + (f' or {list(GEOMETRY_STAGES)}' if v2 else '') + f' for kind={kind}')
+    linked = doc.get('requiresLinkedVaryingInterface', False)
+    if not isinstance(linked, bool) or (linked and (kind != 'graphics' or tuple(names) != GRAPHICS_STAGES)):
+        _fail(f'{what}: requiresLinkedVaryingInterface requires a boolean and a VS/FS pair when enabled')
     if REQUEST_ID.fullmatch(request_id) and len(request_id) != 16 * len(names):
         _fail(f'{what}: requestId is not {len(names)} concatenated 8-byte stage keys')
 
@@ -849,9 +856,9 @@ def validate_result(raw, what, request=None, descriptor=None, expected_profile=N
         }
         constant_buffer_use[name] = _integer(stage.get('constantBufferUse', 0),
                                              f'{where}.constantBufferUse', 0, 0xFFFFFFFF)
-    if tuple(names) != expected and not (kind == 'graphics' and tuple(names) == GEOMETRY_STAGES):
+    if tuple(names) != expected and not (kind == 'graphics' and tuple(names) in (('vs',), GEOMETRY_STAGES)):
         _fail(f'{what}: content.stages is {names}, expected {list(expected)}'
-              + (f' or {list(GEOMETRY_STAGES)}' if kind == 'graphics' else '') + f' for kind={kind}')
+              + (f" or ['vs'] or {list(GEOMETRY_STAGES)}" if kind == 'graphics' else '') + f' for kind={kind}')
     support = _object(content.get('supportLayout'), f'{what}.content.supportLayout')
     support_hash = _content_root(support.get('hash'), f'{what}.content.supportLayout.hash')
     bindings = _array(content.get('bindings'), f'{what}.content.bindings')

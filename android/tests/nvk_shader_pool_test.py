@@ -91,7 +91,8 @@ def main():
              '--live-compile-default', 'unset async property must start 0 compiler workers'),
             ('inline', '    if (g_live_compile != 1) {', '    if (1) {',
              '--live-compile-thread', 'compiler ran on the submitting thread'),
-            ('request-bytes-ignored', '    s2a_sha256_update(&hash, json, len);', '    (void)json; (void)len;',
+            ('request-bytes-ignored', '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    s2a_sha256_update(&hash, json, len);',
+             '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    (void)json; (void)len;',
              '--live-compile-thread', 'compute first use publishes the real compiled program'),
             ('pending-marked-failed', '        return LIVE_PENDING;', '        return LIVE_ABORT;',
              '--live-compile-pending', 'exhausted safe budget must defer'),
@@ -290,6 +291,12 @@ def main():
         host_link.run(base + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         result = subprocess.run([str(exe), *sys.argv[2:]], capture_output=True, text=True, timeout=30)
         sys.stdout.write(result.stdout); sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if len(sys.argv) == 6 and sys.argv[1] in ('--emit-nowindow', '--execute-nowindow', '--nowindow-arms'):
+        result = run('nowindow-real', original, args=sys.argv[1:], extra_flags=['-DS2A_ANDROID_DEBUG_ENV=1'])
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
         return result.returncode
 
     if len(sys.argv) == 6 and sys.argv[1] in ('--emit-high-slot', '--execute-high-slot', '--emit-reuse-texture', '--emit-reuse-rt', '--emit-reuse-inactive', '--emit-real', '--emit-real-tbuf', '--execute-tbuf', '--emit-compute-tbuf', '--execute-compute-tbuf', '--reject-graphics-tbufu', '--reject-compute-tbufu'):
