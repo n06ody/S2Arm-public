@@ -17,6 +17,11 @@ static VkExtent2D current, minimum, maximum, window, last_extent;
 static VkSurfaceTransformFlagBitsKHR transform, last_transform;
 static VkSurfaceTransformFlagsKHR supported;
 static int suboptimal;
+static int mailbox_on;
+static enum { MODES_REAL, MODES_FIFO_ONLY, MODES_COUNT_ERROR, MODES_LIST_ERROR, MODES_INCOMPLETE } mode_probe;
+static unsigned mode_queries;
+static VkSurfaceKHR last_surface;
+static VkPresentModeKHR last_mode;
 static nvn_gpu_view source;
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "fixture failure line %d: %s (%s)\n", __LINE__, #x, error.why); exit(2); } } while (0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
@@ -40,6 +45,7 @@ int nvn_plat_window_size(void *native, uint32_t *w, uint32_t *h) {
 void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_pipe_cache")) return 0;
+    if (!strcmp(name, "nvk_present_mailbox") && mailbox_on) return 1;
     return dflt;
 }
 void nvn_plat_log(int level, const char *cls, const char *text) {
@@ -49,6 +55,7 @@ static void done(void *u, const nvn_gpu_done *d) { (void)u; (void)d; }
 
 // Names, declarations and pointer types are checked against NDK 29 headers.
 extern __typeof__(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) __real_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+extern __typeof__(vkGetPhysicalDeviceSurfacePresentModesKHR) __real_vkGetPhysicalDeviceSurfacePresentModesKHR;
 extern __typeof__(vkCreateSwapchainKHR) __real_vkCreateSwapchainKHR;
 extern __typeof__(vkQueuePresentKHR) __real_vkQueuePresentKHR;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -63,10 +70,28 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
     c->currentTransform = transform; c->supportedTransforms = supported;
     return r;
 }
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkGetPhysicalDeviceSurfacePresentModesKHR(
+        VkPhysicalDevice p, VkSurfaceKHR s, uint32_t *n, VkPresentModeKHR *modes) {
+    mode_queries++;
+    if (mode_probe == MODES_REAL)
+        return __real_vkGetPhysicalDeviceSurfacePresentModesKHR(p, s, n, modes);
+    if (!modes) {
+        if (mode_probe == MODES_COUNT_ERROR) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *n = 1;
+        return VK_SUCCESS;
+    }
+    if (mode_probe == MODES_LIST_ERROR) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!*n) return VK_INCOMPLETE;
+    modes[0] = VK_PRESENT_MODE_FIFO_KHR;
+    *n = 1;
+    return mode_probe == MODES_INCOMPLETE ? VK_INCOMPLETE : VK_SUCCESS;
+}
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR *c,
         const VkAllocationCallbacks *a, VkSwapchainKHR *s) {
     creates++; last_extent = c->imageExtent; last_transform = c->preTransform;
-    if (!c->imageExtent.width || !c->imageExtent.height ||
+    last_surface = c->surface; last_mode = c->presentMode;
+    if ((mode_probe == MODES_FIFO_ONLY && c->presentMode != VK_PRESENT_MODE_FIFO_KHR) ||
+        !c->imageExtent.width || !c->imageExtent.height ||
         c->imageExtent.width < minimum.width || c->imageExtent.width > maximum.width ||
         c->imageExtent.height < minimum.height || c->imageExtent.height > maximum.height ||
         !(supported & c->preTransform) || c->preTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
@@ -80,6 +105,7 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkQueuePresentKHR(VkQueue q, const VkPrese
     return r;
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR), PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR), "NDK caps signature");
+_Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkGetPhysicalDeviceSurfacePresentModesKHR), PFN_vkGetPhysicalDeviceSurfacePresentModesKHR), "NDK present modes signature");
 _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkCreateSwapchainKHR), PFN_vkCreateSwapchainKHR), "NDK swapchain signature");
 _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkQueuePresentKHR), PFN_vkQueuePresentKHR), "NDK present signature");
 
@@ -157,7 +183,64 @@ static void zero_then_restore(int undefined) {
     GPU(nvn_gpu_surface_detach(s, 5000000000ull, &error));
     result(undefined ? "zero-window-restore" : "zero-restore", bad, 0, rebuilt);
 }
-int main(void) {
+static unsigned expect_mode(const char *name, VkPresentModeKHR expected, unsigned queries, int queried) {
+    const unsigned calls = mode_queries - queries;
+    const unsigned bad = last_mode != expected || (calls != 0) != queried;
+    printf("wsi-present-mode case=%s bad=%u expected=%u actual=%u queries=%u\n",
+           name, bad, (unsigned)expected, (unsigned)last_mode, calls);
+    return bad;
+}
+
+static void present_one(nvn_gpu_surface s, uint64_t id) {
+    nvn_gpu_drawable drawable = {0};
+    GPU(nvn_gpu_drawable_acquire(s, 5000000000ull, NULL, &drawable, &error));
+    const nvn_gpu_present_desc p = {.src = source, .filter = 1};
+    GPU(nvn_gpu_present(s, &drawable, &p, id, NULL, NULL, &error));
+}
+
+static unsigned test_present_modes(VkPhysicalDevice physical) {
+    reset(0);
+    suboptimal = 0;
+    unsigned queries = mode_queries;
+    nvn_gpu_surface s = attach(320, 180);
+    unsigned bad = expect_mode("default-fifo", VK_PRESENT_MODE_FIFO_KHR, queries, 0);
+
+    // 正向枚举和建链都由真实 ICD 完成。负控只从驱动事实里隐藏可选模式，仍向真实 driver 建 FIFO。
+    VkPresentModeKHR modes[32];
+    uint32_t n = 32;
+    REQUIRE(__real_vkGetPhysicalDeviceSurfacePresentModesKHR(physical, last_surface, &n, modes) == VK_SUCCESS);
+    int has_mailbox = 0;
+    for (uint32_t i = 0; i < n; i++) has_mailbox |= modes[i] == VK_PRESENT_MODE_MAILBOX_KHR;
+    REQUIRE(has_mailbox);
+    GPU(nvn_gpu_surface_detach(s, 5000000000ull, &error));
+
+    mailbox_on = 1;
+    queries = mode_queries;
+    s = attach(320, 180);
+    bad += expect_mode("advertised-mailbox", VK_PRESENT_MODE_MAILBOX_KHR, queries, 1);
+    for (uint64_t id = 1; id <= 4; id++) present_one(s, id);
+
+    queries = mode_queries;
+    mode_probe = MODES_FIFO_ONLY;
+    GPU(nvn_gpu_surface_rebuild(s, &error));
+    bad += expect_mode("rebuild-fifo-only", VK_PRESENT_MODE_FIFO_KHR, queries, 1);
+    present_one(s, 5);
+    GPU(nvn_gpu_surface_detach(s, 5000000000ull, &error));
+
+    const char *const names[] = {"missing-mailbox", "count-error", "list-error", "incomplete-without-mailbox"};
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        mode_probe = MODES_FIFO_ONLY + i;
+        queries = mode_queries;
+        s = attach(320, 180);
+        bad += expect_mode(names[i], VK_PRESENT_MODE_FIFO_KHR, queries, 1);
+        present_one(s, 6 + i);
+        GPU(nvn_gpu_surface_detach(s, 5000000000ull, &error));
+    }
+    printf("wsi-present-mode cases=7 failures=%u real_presents=%u\n", bad, presented);
+    return bad;
+}
+
+int main(int argc, char **argv) {
     struct s2a_vk_device device = {0}; char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&device, why, sizeof why));
     nvn_gpu_open_desc desc = {0}; desc.host_device = &device; desc.app_label = "wsi-extent-test";
@@ -173,6 +256,12 @@ int main(void) {
     GPU(nvn_gpu_cmd_commit(cmd, 1, done, NULL, &error));
     GPU(nvn_gpu_fence_wait(1, 5000000000ull, &error));
 
+    if (argc == 2 && !strcmp(argv[1], "--present-modes")) {
+        const unsigned bad = test_present_modes(device.physical);
+        nvn_gpu_view_release(source); nvn_gpu_tex_release(tex);
+        GPU(nvn_gpu_close(5000000000ull, &error)); REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        return bad ? 1 : 0;
+    }
     reset(0); window = (VkExtent2D){640, 360}; unsigned queries = window_queries;
     nvn_gpu_surface s = attach(320, 180); window = (VkExtent2D){800, 450};
     frames("fixed-ignores-window", s, 0, 320, 180); REQUIRE(window_queries == queries);
