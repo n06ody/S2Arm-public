@@ -22,7 +22,16 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
+static int diag_pass, diag_snapshot;
+int nvn_plat_flag(const char *n,int d){
+    if(!strcmp(n,"nvk_gpu_passes"))return diag_pass;
+    if(!strcmp(n,"nvk_fb_snapshots"))return diag_snapshot;
+    if(!strcmp(n,"nvk_dq"))return dq_mode;
+    if(!strcmp(n,"nvk_opt_layout"))return opt_mode;
+    if(!strcmp(n,"nvk_fb_copy"))return copy_mode;
+    if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;
+    return d;
+}
 static unsigned skip_logs;   // 「整池数组免拷快照」逐条日志的条数（限流：每个（管线、图）首次一行；不含「已记满」那一句）
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");if(s&&strstr(s,"整池数组免拷快照（"))__atomic_fetch_add(&skip_logs,1u,__ATOMIC_RELAXED);}
 static void done(void *u,const nvn_gpu_done *d){(void)u;REQUIRE(d->status==NVN_GPU_DONE_OK);}
@@ -243,6 +252,18 @@ int main(int argc,char **argv) {
     observed_on_begin=on_begin;
     struct s2a_vk_device device;char why[256];
     if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
+    const char *diag = getenv("S2A_TEST_PASS_DIAG");
+    if (diag) {
+        diag_pass = !strcmp(diag, "pass") || !strcmp(diag, "both");
+        diag_snapshot = !strcmp(diag, "snapshot") || !strcmp(diag, "both");
+        run_case(&device, argv[1], 0);  // 3 passes, no self-sampling
+        run_case(&device, argv[1], 3);  // 5 passes, 2 RGBA8 copies of 4 x 4
+        run_depth(&device, argv[1], NVN_FORMAT_DEPTH32F_STENCIL8, 13);
+        run_case(&device, argv[1], 14); // records a copy but aborts before submission
+        REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        printf("feedback cases=%u failures=%u\n", ncases, failures);
+        return failures ? 1 : 0;
+    }
     // 守卫探针先跑（只录制不提交）：免拷的前提（GENERAL 档、没开旧行为开关）被撤掉时，在后面真执行的案例把驱动跑崩之前就按读数变红。
     run_case(&device,argv[1],18);
     if(failures&&copy_mode){printf("feedback cases=%u failures=%u\n",ncases,failures);return 1;}   // 快照整条路径关掉的负控（copy_mode=0）要继续跑到真执行的案例，不在这里收

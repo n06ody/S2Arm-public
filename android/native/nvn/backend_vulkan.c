@@ -257,6 +257,42 @@ struct dset_bin;
 struct dset_use { struct dset_bin *bin; VkDescriptorSet set; VkDescriptorPool pool; };   // 本段从按布局回收的表项里取的一组（见「描述符组按布局回收」）；bin = 取用时的表项，放回时直接放回它
 struct bc_temp { VkImage image; VkDeviceMemory memory; struct nvn_vk_bcdec_rec rec; struct bc_temp *next; };   // rec：缓冲 → BC 贴图录进段里的解码资源（#697）
 enum { TS_PASS_MAX = 250 };   // 调试读数：一段里逐个计时的通道数上限
+enum { GPU_DIAG_PREFIX_QUERY = 2 + 2 * TS_PASS_MAX, GPU_DIAG_TOP = 10, FB_DIAG_SITES = 64 };
+struct gpu_diag_att {
+    uint32_t slot, w, h, samples;
+    VkFormat format;
+    VkAttachmentLoadOp load, stencil_load;
+    VkAttachmentStoreOp store, stencil_store;
+};
+struct gpu_pass_meta {
+    uint32_t w, h, layers, natt;
+    struct gpu_diag_att att[9];
+};
+struct gpu_diag_rank {
+    uint64_t ns, signal;
+    uint32_t index;
+    int internal;
+    struct gpu_pass_meta meta;
+};
+struct fb_diag_totals { uint64_t snapshots, regions, bytes, unknown; };
+struct fb_diag_site {
+    uint32_t pipe, stage, set, binding, pool;
+    struct fb_diag_totals total;
+};
+struct fb_diag_cmd {
+    struct fb_diag_totals total;
+    uint64_t unattributed;
+    uint32_t nsites;
+    struct fb_diag_site sites[FB_DIAG_SITES];
+};
+struct gpu_diag_frame {
+    uint64_t segments, submit_timed, submit_ns, passes, timed, pass_ns;
+    uint64_t fb_missing, fb_unattributed;
+    struct fb_diag_totals fb;
+    uint32_t ntop;
+    struct gpu_diag_rank top[GPU_DIAG_TOP];
+};
+
 enum { OCC_CHUNK = 256, OCC_QUERY_SPARE_MAX = 65536 };   // 遮挡查询的续段槽按块给：一块 = 一个 OCC_CHUNK 槽的查询池，用到哪块才要哪块；OCC_QUERY_SPARE_MAX = 一个声明槽名下最多几个续段槽（保险丝：防失控，不是预期用量）
 
 // 冗余状态消除的计数下标（见 nvn_gpu_cmd_s.es）
@@ -279,11 +315,14 @@ struct vk_segment {
     char why[192];
 };
 
+struct fb_binding_site { uint16_t stage, set, binding, pool; };
+
 struct feedback_copy {
     struct feedback_copy *next;
     struct nvn_gpu_view_s *source;
     VkImageView view;
     struct nvn_gpu_tex_s *snap, *snap_src; // 快照图（本段 REF_TEX 保活到 fence）与它照的源图；同段同源复用，见 feedback_make
+    struct fb_binding_site diag[];  // only allocated when nvk_fb_snapshots is active
 };
 
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
@@ -336,9 +375,13 @@ struct nvn_gpu_cmd_s {
     VkQueryPool report_ts;
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
-    VkQueryPool tsq;                         // 调试读数 nvk_gputime：段首尾各一个 GPU 时间戳，后面每个通道首尾各一个（没开就是空）
+    VkQueryPool tsq;                         // nvk_gputime / nvk_gpu_passes: submission and pass timestamp pairs
     struct { uint16_t w, h, draws; uint8_t ncol, ds; } tsp[TS_PASS_MAX];
     uint32_t ntsp;
+    uint32_t diag_npasses, diag_pass_cap;
+    int diag_prefix;
+    struct gpu_pass_meta *diag_passes;
+    struct fb_diag_cmd *diag_fb;
     VkCommandBuffer init_cb;                 // 本池复用的前置命令缓冲；本段需要时录入图像转布局 / 时间戳重置
     struct nvn_gpu_tex_s **newimg;           // 上面那个命令缓冲转的图像（各持一份引用，段完成时归还；段没执行则放回待转表）
     uint32_t n_newimg;
@@ -419,6 +462,10 @@ struct nvn_gpu_vk {
     VkPhysicalDevice phys;
     VkQueue queue;
     nvn_gpu_caps caps;
+    int gputime, pass_diag, fb_diag;
+    uint32_t ts_bits;
+    double ts_period;
+    struct gpu_diag_frame diag_frame;  // completion worker only until close joins it
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
     uint32_t report_bits;
     float report_period;
@@ -1565,25 +1612,30 @@ out:
     if (qp) vkDestroyQueryPool(g.d, qp, NULL);
     if (pool) vkDestroyCommandPool(g.d, pool, NULL);
 }
+static uint32_t queue_timestamp_bits(const struct s2a_vk_device *d) {
+    uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(d->physical, &n, NULL);
+    if (d->queue_family >= n) return 0;
+    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
+    if (!q) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(d->physical, &n, q);
+    uint32_t bits = d->queue_family < n ? q[d->queue_family].timestampValidBits : 0;
+    free(q);
+    return bits <= 64 ? bits : 0;
+}
+
 static void report_timestamp_open(void) {
     struct s2a_vk_device *d = g.dev;
     if (!d->calibrated_timestamps || !d->properties.limits.timestampComputeAndGraphics ||
         !isfinite(d->properties.limits.timestampPeriod) || d->properties.limits.timestampPeriod <= 0) return;
-    uint32_t n = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(d->physical, &n, NULL);
-    if (d->queue_family >= n) return;
-    VkQueueFamilyProperties *q = calloc(n, sizeof *q);
-    if (!q) return;
-    vkGetPhysicalDeviceQueueFamilyProperties(d->physical, &n, q);
-    uint32_t bits = d->queue_family < n ? q[d->queue_family].timestampValidBits : 0;
-    free(q);
-    if (!bits || bits > 64) return;
+    const uint32_t bits = g.ts_bits ? g.ts_bits : queue_timestamp_bits(d);
+    if (!bits) return;
     int khr = d->calibrated_timestamps == 1;
     PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR domains_fn =
         (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR)vkGetInstanceProcAddr(d->instance,
             khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
     if (!domains_fn) return;
-    n = 0;
+    uint32_t n = 0;
     if (domains_fn(d->physical, &n, NULL) != VK_SUCCESS || !n || n > 64) return;
     VkTimeDomainKHR domains[64];
     if (domains_fn(d->physical, &n, domains) != VK_SUCCESS) return;
@@ -1849,6 +1901,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->report_ts) vkDestroyQueryPool(g.d, c->report_ts, NULL);
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+    free(c->diag_passes);
+    free(c->diag_fb);
         seg_give_q(c->qpool, c->qcount);
     for (uint32_t k = 0; k < c->qnchunk; k++) seg_give_q(c->qchunk[k], OCC_CHUNK);   // 续段块：同大小的池回收表里再用
     free(c->qchunk); free(c->q_owner);
@@ -1880,6 +1934,7 @@ void nvn_vk_frame_log_gpu_frame_end(void) __attribute__((weak));
 void s2a_adpf_gpu_segment(uint64_t gpu_ns) __attribute__((weak));
 void s2a_adpf_gpu_frame_end(void) __attribute__((weak));
 #include "backend_vulkan_device_lost.inc"
+#include "backend_vulkan_gpu_diag.inc"
 
 static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int failed = s->failed;
@@ -1920,9 +1975,10 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
             vk->active_segment = NULL;
             int terminal = vk->failed && s->signal >= vk->failed;
             pthread_mutex_unlock(&g_mu);
-            if (s->cmd && s->cmd->tsq && !s->internal) {   // 调试读数：这一段在 GPU 上首尾相隔多久；相邻两段之间 GPU 空了多久
-                static double period; static uint64_t n, sum, mx, last_end, gap, t_first;
-                if (period == 0) { VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(g.phys, &pp); period = pp.limits.timestampPeriod > 0 ? pp.limits.timestampPeriod : 1; }
+            if (vk->pass_diag || vk->fb_diag) gpu_diag_retire(vk, s);
+            if (vk->gputime && s->cmd && s->cmd->tsq && !s->internal) {   // 调试读数：这一段在 GPU 上首尾相隔多久；相邻两段之间 GPU 空了多久
+                const double period = vk->ts_period;
+                static uint64_t n, sum, mx, last_end, gap, t_first;
                 uint64_t ts[2] = {0, 0};
                 if (vkGetQueryPoolResults(vk->d, s->cmd->tsq, 0, 2, sizeof ts, ts, sizeof ts[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
                     uint64_t d = (uint64_t)((double)(ts[1] - ts[0]) * period), b = (uint64_t)((double)ts[0] * period), e = (uint64_t)((double)ts[1] * period);
@@ -1965,6 +2021,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     }
 
     if (s->internal) {   // 呈现段：没有回调、不动时间线
+        if (vk->pass_diag || vk->fb_diag) gpu_diag_frame_end(vk, s->wsi_seq, failed);
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2389,6 +2446,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(g_deswizzle_reasons, 0, sizeof g_deswizzle_reasons);
     if (nvn_plat_flag("nvk_gpu_deswizzle", 1) && !deswizzle_open())
         nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", "【红】GPU 解排不可用，本局采用 CPU 解排");
+    gpu_diag_open();
     report_timestamp_open();
     fill_caps(&g, d);
     g_ref_n = g_ref_hit = 0;
@@ -2532,6 +2590,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     g.worker_started = 0;
+    if ((g.pass_diag || g.fb_diag) && g.diag_frame.segments) gpu_diag_frame_end(&g, g.wsi_done + 1, 1);
 
     // 在途段都完成了、不会再有新管线：把驱动管线缓存写盘（失败只记日志）再销毁它。放在销毁管线之前，后面的拆除出事也不丢这一局的编译结果。
     // 在飞的局中写（#868）要先等它收尾，等多久算进这次 close 的截止时间；到点没写完就放弃收尾这次写，不拖 close。
@@ -5386,8 +5445,9 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) { d.color[i].load = NVN_GPU_LOAD_LOAD; d.color[i].store = NVN_GPU_STORE_STORE; }
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
-    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
+    if (!g.pass_diag) gpu_diag_pass_end(c);  // nvk_gputime 原口径
     vkCmdEndRenderPass(c->cb);
+    if (g.pass_diag) gpu_diag_pass_end(c);
     c->in_pass = 0;
     c->pass_occl = 0;
     pass_read_sync(c);
@@ -5426,11 +5486,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(&d, pass, fb, natt, has_depth, &bi, clear);
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
-        c->tsp[c->ntsp].w = (uint16_t)d.w; c->tsp[c->ntsp].h = (uint16_t)d.h; c->tsp[c->ntsp].draws = 0;
-        c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
-        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
-    }
+    gpu_diag_pass_begin(c, &d, att, natt, has_depth);
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
@@ -5522,10 +5578,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(d, pass, fb, natt, has_depth, &bi, clear);
-    if (c->tsq && c->ntsp < TS_PASS_MAX) {
-        c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
-        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
-    }
+    gpu_diag_pass_begin(c, d, att, natt, has_depth);
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     PBP_STEP(3);
     c->in_pass = 1;
@@ -5564,11 +5617,12 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
+    if (g.pass_diag) gpu_diag_pass_end(c);
     c->in_pass = 0;
     c->pass_natt = 0;
     pass_read_sync(c);
     c->feedback_read_mask = 0;
-    if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
+    if (!g.pass_diag) gpu_diag_pass_end(c);  // nvk_gputime 原口径
     // 附件在通道里用的布局由 make_pass 定（缺省全程 GENERAL，开 nvk_opt_layout 时用附件专用布局），通道内不迁移：
     // 出通道后本段第一次用到它时按需迁移（采样 / 存储 / 传输 / 再当附件），段末统一转回 GENERAL（lay_rest_at_commit）。
     // render pass / framebuffer 被已录制的命令引用，等 cmd 真正完成后再销毁（finish_cmd）。
@@ -6325,7 +6379,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!c->in_pass || !c->pipe || !a) { set_sticky(c, NVN_GPU_E_ORDER, "draw 缺通道 / 管线 / 参数"); return; }
-    if (c->tsq && c->ntsp < TS_PASS_MAX) c->tsp[c->ntsp].draws++;
+    if (g.gputime && c->tsq && c->ntsp < TS_PASS_MAX) c->tsp[c->ntsp].draws++;
     if (a->cnt) {
         if (!(g.caps.caps & NVN_GPU_CAP_INDIRECT_COUNT)) {
             set_sticky(c, NVN_GPU_E_UNSUPPORTED, "draw_indirect_count：设备未启用 KHR count / multiDrawIndirect / firstInstance"); return;
@@ -8378,22 +8432,24 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->feedback_on = nvn_plat_flag("nvk_fb_copy", 1) != 0; // 0 仅供回退诊断，不保证反馈采样正确
     c->feedback_read_on = c->feedback_on && g.dev->load_store_op_none_enabled && nvn_plat_flag("nvk_fb_read", 0) != 0;
     c->pool_fb_on = nvn_plat_flag("nvk_pool_fb", 0) != 0;
-    {   // 调试读数（debug 开关 nvk_gputime）：段首尾各写一个 GPU 时间戳，完成时算这一段在 GPU 上从开始到结束用了多久
-        static int on = -1; if (on < 0) on = nvn_plat_flag("nvk_gputime", 0);
-        VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
-        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = 2 + 2 * TS_PASS_MAX;
-        if (on && vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
-            vkCmdResetQueryPool(c->cb, c->tsq, 0, 2 + 2 * TS_PASS_MAX);
+    if (g.ts_bits) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GPU_DIAG_PREFIX_QUERY + (uint32_t)g.pass_diag};
+        if (vkCreateQueryPool(g.d, &qi, NULL, &c->tsq) == VK_SUCCESS) {
+            vkCmdResetQueryPool(c->cb, c->tsq, 0, GPU_DIAG_PREFIX_QUERY);
             vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, 0);
         } else c->tsq = VK_NULL_HANDLE;
     }
+    if (g.fb_diag) c->diag_fb = calloc(1, sizeof *c->diag_fb);
     if (d && d->occlusion_slots) {   // 查询池：整池重置只能在通道外，放在段的最开头
         VkQueryPoolCreateInfo qi; memset(&qi, 0, sizeof qi);
         qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO; qi.queryType = VK_QUERY_TYPE_OCCLUSION; qi.queryCount = d->occlusion_slots;
         c->q_used = calloc(d->occlusion_slots, 1);
         if (c->q_used && seg_reuse_on()) c->qpool = seg_take_q(d->occlusion_slots);
         if (!c->q_used || (!c->qpool && vkCreateQueryPool(g.d, &qi, NULL, &c->qpool) != VK_SUCCESS)) {
-            free(c->q_used); vkDestroyCommandPool(g.d, c->pool, NULL); free(c);
+            vkDestroyCommandPool(g.d, c->pool, NULL);
+            if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+            free(c->diag_fb); free(c->q_used); free(c);
             return fail(err, NVN_GPU_E_OOM, "遮挡查询池（%u 槽）创建失败", d->occlusion_slots);
         }
         c->qcount = d->occlusion_slots;
@@ -8403,6 +8459,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     if (g.closing) {
         pthread_mutex_unlock(&g_mu);
         if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
+        free(c->diag_fb);
         if (c->qpool) vkDestroyQueryPool(g.d, c->qpool, NULL);
         free(c->q_used);
         vkDestroyCommandPool(g.d, c->pool, NULL);
@@ -8484,6 +8541,12 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(c->init_cb, &bi) != VK_SUCCESS) return 0;
+    // 已有前置缓冲时，用独立槽覆盖整段首尾；普通段用主缓冲的首戳，不额外添缓冲。
+    if (g.pass_diag && c->tsq) {
+        c->diag_prefix = 1;
+        vkCmdResetQueryPool(c->init_cb, c->tsq, GPU_DIAG_PREFIX_QUERY, 1);
+        vkCmdWriteTimestamp(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->tsq, GPU_DIAG_PREFIX_QUERY);
+    }
     // 首次报告可能在 render pass 内；reset 必须在独立前置缓冲中，不能打断通道。
     if (c->report_ts) {
         vkCmdResetQueryPool(c->init_cb, c->report_ts, 0, NVN_GPU_TIMESTAMP_SLOTS);
