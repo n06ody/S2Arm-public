@@ -14,14 +14,22 @@ inc=()
 for d in android/tests/vkhost build/c883-ndk graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do
     inc+=(-I "$repo/$d")
 done
-backend="$repo/android/native/nvn"
+cat > "$out/backend-lock-probe.c" <<'C'
+#include "backend_vulkan.c"
+
+int s2a_land_fixture_queue_lock_available(void) {
+    if (pthread_mutex_trylock(&g_submit_mu) != 0) return 0;
+    pthread_mutex_unlock(&g_submit_mu);
+    return 1;
+}
+C
 src=()
 for f in android/tests/vk/t_land_cached.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do
     src+=("$repo/$f")
 done
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 \
-    "${inc[@]}" "${src[@]}" "$backend/backend_vulkan.c" -Wl,--gc-sections \
+    "${inc[@]}" "${src[@]}" "$out/backend-lock-probe.c" -Wl,--gc-sections \
     -Wl,--wrap=vkInvalidateMappedMemoryRanges -lvulkan -lpthread -lm -o "$out/test"
 
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
@@ -41,4 +49,4 @@ for dq in 0 1; do
     fi
     grep '^land-cached ' "$log"
 done
-echo 'RESULT: PASS（缓存镜像：12 个 Vulkan 场景，开启同步校验）'
+echo 'RESULT: PASS（缓存镜像：16 个 Vulkan 场景，开启同步校验）'

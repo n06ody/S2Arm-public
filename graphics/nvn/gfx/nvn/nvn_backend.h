@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 21   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 22   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -195,6 +195,10 @@ int nvn_gpu_mirror_state(nvn_gpu_buf b);
 int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes);
 int nvn_gpu_mirror_visibility_enabled(void);
 int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b);
+// 可选：允许镜像分代时返回此缓冲的非一致原子字节数，否则返回 0。
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b);
+// 可选：在两个镜像代之间按同一偏移继承 GPU 字节。偏移和长度可非 4 B 的倍数，命令持有两代缓冲。
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes);
 typedef struct { nvn_gpu_buf src; uint64_t offset, bytes; } nvn_gpu_mirror_span;
 // 非一致镜像随段持有到完成回调返回。count 非零、spans 为空表示快照失败，本段粘滞失败。
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count);

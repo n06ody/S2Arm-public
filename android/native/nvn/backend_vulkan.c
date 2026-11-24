@@ -519,6 +519,7 @@ struct nvn_gpu_vk {
     uint64_t stats[STAT_N];
     _Atomic uint8_t vertex_format_support[NVN_FMT_MAX + 1]; // 0 未读，1 不支持，2 支持
     int land_cached;   // 会话内固定
+    int land_upload_versions;
     _Atomic int mirror_noncoherent_seen;
     VkResult mirror_flush_error;
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
@@ -689,6 +690,7 @@ static int g_plcw_failed;                    // 最近一次后台写失败了�
 static uint64_t g_plcw_started, g_plcw_ok, g_plcw_fail, g_plcw_same;   // 读数（进程累计，不随会话清零）：交给后台写的次数 / 成功 / 失败 / 与上次一致没写
 static uint64_t g_plcw_get_ns;   // 触发线程上「查大小 + 取数据 + 拷字节」的累计纳秒（后台写盘不算；长帧归因读它）
 static pthread_mutex_t g_submit_mu = PTHREAD_MUTEX_INITIALIZER; // 提交串行化：校验 signal、vkQueueSubmit、入队
+static pthread_mutex_t g_guest_commit_mu = PTHREAD_MUTEX_INITIALIZER; // 分代档：等待回写时守客体提交顺序，WSI 不取此锁
 static pthread_cond_t g_cv;
 static int g_cv_ready;
 static _Thread_local int g_in_callback;   // [回调] 线程：只许调 [任意] 函数
@@ -2443,6 +2445,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     pipe_creation_open(dev);
     atomic_init(&g.mirror_noncoherent_seen, 0);
     g.land_cached = nvn_plat_flag("nvk_land_cached", 0) != 0;
+    g.land_upload_versions = g.land_cached && nvn_plat_flag("nvk_land_upload_versions", 0) != 0;
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
@@ -3137,14 +3140,13 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     pthread_mutex_unlock(&g_mu);
 }
 
-void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
-    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
-    if (!ch) return;
-    struct nvn_gpu_cmd_s *c = ch;
-    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+static void copy_buf(struct nvn_gpu_cmd_s *c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff,
+                     uint64_t bytes, int mirror_span) {
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "传输操作在通道内"); return; }
     struct nvn_gpu_buf_s *s = src, *d = dst;
     if (!s || !d || !buf_range(s, soff, bytes) || !buf_range(d, doff, bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 越界"); return; }
-    if (bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
+    if (!mirror_span && (bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
     if (bytes == 0) return;
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
@@ -3156,6 +3158,19 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
     pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    copy_buf(ch, src, soff, dst, doff, bytes, 0);
+}
+
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes) {
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (src == dst || !nvn_gpu_mirror_version_atom(src) || !nvn_gpu_mirror_version_atom(dst)) {
+        set_sticky(c, NVN_GPU_E_ARG, "继承范围必须来自不同的缓存镜像代");
+        return;
+    }
+    copy_buf(c, src, off, dst, off, bytes, 1);
 }
 
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
@@ -9127,7 +9142,10 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     c->live_next = NULL;
     g.commit_active++;
     pthread_mutex_unlock(&g_mu);
+    const int versions = g.land_upload_versions;
+    if (versions) pthread_mutex_lock(&g_guest_commit_mu);
     nvn_gpu_rc r = commit_impl(ch, signal, done, user, err);
+    if (versions) pthread_mutex_unlock(&g_guest_commit_mu);
     pthread_mutex_lock(&g_mu);
     g.commit_active--;
     pthread_cond_broadcast(&g_cv);

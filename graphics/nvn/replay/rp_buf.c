@@ -21,10 +21,14 @@
 
 int nvn_gpu_mirror_state(nvn_gpu_buf b) __attribute__((weak));
 int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b) __attribute__((weak));
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b) __attribute__((weak));
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_memory_cached
 static uint64_t res_now(void);
 int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_state
+// 弱链接[replay]：nvn_gpu_mirror_version_atom
+// 弱链接[replay]：nvn_gpu_mirror_copy_span
 // 弱链接[replay]：nvn_gpu_mirror_flush
 
 
@@ -50,6 +54,8 @@ struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen
 // 真机表现为走路一顿一顿（池镜像同步 4.2 MB/帧、其中直接写只剩 0.2 MB，见坑记录续 33）。
 struct land_rng { uint64_t off, len; };
 struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing;
+                uint64_t version_atom, version_sub;
+                int version_mi;
                 int log_on;
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
@@ -212,15 +218,62 @@ static struct shadow *shadow_get(const uint8_t *mem, uint64_t size) {
     // 脏页追加日志：开关开着、写跟踪给这个池起了日志（nvk_session 在登记任何池之前配置）才用；整池的范围句柄在这里取一次
     if (nvn_plat_flag("nvk_buf_dirtylog", 1) && (s->span = nvn_dirty_span(mem, (size_t)size))) { uint64_t id, cur; s->log_on = nvn_dirty_log_open(s->span, &id, &cur); }
     if (!mirror_make(s, 0)) { s->failed = 1; s->untracked = 0; nvn_hm_put(&g_shadow, &k, s); nvn_unimpl("gpu", "buf_create_pool_mirror", mem); return NULL; }
+    if (nvn_gpu_mirror_version_atom && nvn_gpu_mirror_copy_span)
+        s->version_atom = nvn_gpu_mirror_version_atom(s->m[0].buf);
     if (s->untracked) __atomic_add_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
     nvn_hm_put(&g_shadow, &k, s);
     return s;
 }
-// [off, off + len) 这一段该用哪一份镜像：显卡写过、还没回写落地的段只在写它的那一份里有；其余用当前这一份。
-// 顺带记下「这次提交用到了它」。第二份建不出来就退回第一份（显卡还在用它时按序拷，结果照样对）。
-static struct mirror *mirror_pick(struct shadow *s, uint64_t off, uint64_t len, int *mi) {
+static int gw_covers(const struct shadow *s, int mi, uint64_t a, uint64_t b);
+static void pages_invalidate_locked(struct shadow *s, uint64_t off, uint64_t len, int skip_mi);
+
+// 上传跳过 GPU 写的字节，但相邻字节只要同属一个非一致原子，仍会挡住提交。
+// 先看整个池的待回写边界。首个绑定即使在别页，后续别名仍需使用同一份镜像。
+static int mirror_upload_overlaps(const struct shadow *s) {
+    const uint64_t atom = s->version_atom;
+    for (int i = 0; i < s->ngw; i++) {
+        const struct gpu_write *w = &s->gw[i];
+        if (w->mi != s->version_mi) continue;
+        const uint64_t a = w->off, b = a + w->len;
+        const uint64_t atom_lo = a & ~(atom - 1);
+        const uint64_t pad = (0 - b) & (atom - 1);
+        const uint64_t atom_hi = b + (pad < s->size - b ? pad : s->size - b);
+        if (atom_lo < a && !gw_covers(s, w->mi, atom_lo, a)) return 1;
+        if (b < atom_hi && !gw_covers(s, w->mi, b, atom_hi)) return 1;
+    }
+    return 0;
+}
+
+static int mirror_index(struct shadow *s, uint64_t off, uint64_t len) {
+    if (s->version_atom) {
+        const uint64_t sub = rp_sub_serial();
+        if (s->version_sub == sub) return s->version_mi;
+        s->version_sub = sub;
+        if (!mirror_upload_overlaps(s)) return s->version_mi;
+        const int next = s->version_mi ^ 1;
+        struct mirror *m = &s->m[next];
+        if ((!m->buf && !mirror_make(s, next)) || nvn_gpu_mirror_version_atom(m->buf) != s->version_atom ||
+            (m->use_fence && nvn_gpu_mirror_state(m->buf) != NVN_GPU_MIRROR_CPU_IDLE))
+            return s->version_mi;
+        // 旧代在 GPU 与回写回调中仍在使用。新代上的旧页先作废，按需继承旧代还没回写的字节。
+        m->seen_ok = 0;
+        const uint64_t page = nvn_dirty_page_size();
+        for (int i = 0; i < s->ngw; i++) {
+            const struct gpu_write *w = &s->gw[i];
+            const uint64_t a = (uintptr_t)s->mem + w->off - s->page0;
+            pages_invalidate_locked(s, w->off, w->len, next ^ 1);
+            if (m->path == MP_LOG) stale_set(m, a / page, (a + w->len - 1) / page);
+        }
+        return s->version_mi = next;
+    }
     int i = g_mirror_cur;
     for (int k = 0; k < s->ngw; k++) if (s->gw[k].off < off + len && off < s->gw[k].off + s->gw[k].len) { i = s->gw[k].mi; break; }
+    return i;
+}
+
+// 默认把未落地的 GPU 字节绑定回原镜像。记录每份物理镜像自己的使用栅栏。
+static struct mirror *mirror_pick(struct shadow *s, uint64_t off, uint64_t len, int *mi) {
+    int i = mirror_index(s, off, len);
     if (!s->m[i].buf && !mirror_make(s, i)) i = 0;
     struct mirror *m = &s->m[i]; const uint64_t sub = rp_sub_serial();
     if (m->use_sub != sub) { m->prev_fence = m->use_fence; m->use_sub = sub; m->use_fence = rp_sub_fence(); }
@@ -295,9 +348,22 @@ static int sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct 
     while (a < b) {
         uint64_t stop = b, skip_to = 0;   // 找起点落在 [a, b) 里最靠前的一段；a 本身在某段里就先跳过去
         int inside = 0;
+        const struct gpu_write *newest = NULL;
         for (int i = 0; i < s->ngw; i++) { uint64_t g0 = s->gw[i].off, g1 = g0 + s->gw[i].len;
-            if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
+            if (g0 <= a && a < g1) {
+                inside = 1;
+                if (g1 > skip_to) skip_to = g1;
+                if (s->version_atom && (!newest || s->gw[i].sub > newest->sub)) newest = &s->gw[i];
+            }
             else if (g0 > a && g0 < stop) stop = g0; }
+        if (newest) {
+            const uint64_t end = newest->off + newest->len;
+            if (end < stop) stop = end;
+            struct mirror *src = &s->m[newest->mi];
+            if (src != m) nvn_gpu_mirror_copy_span(xc, src->buf, m->buf, a, stop - a);
+            a = stop;
+            continue;
+        }
         if (inside) { a = skip_to; continue; }
         if (direct) {
             memcpy(direct + a, s->mem + a, (size_t)(stop - a));
@@ -329,8 +395,7 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
         const uint64_t off = addr - (uint64_t)(uintptr_t)mem, sub = rp_sub_serial();
         rp_perf_add(RP_PERF_GW_REG_N, 1); rp_perf_add(RP_PERF_GW_REG_KB, len / 1024);
         if (merged && merge_on) {
-            int mi = g_mirror_cur;   // 与 mirror_pick 同一规则（不带它记账的副作用）：与任一未落地登记相交就跟着那一条的镜像，否则用当前这一份
-            for (int k = 0; k < s->ngw; k++) if (s->gw[k].off < off + len && off < s->gw[k].off + s->gw[k].len) { mi = s->gw[k].mi; break; }
+            const int mi = mirror_index(s, off, len);
             // 同一份镜像、同一次提交、没开始落地的登记之间两两互不相接（每次登记都经过这里合并），所以与这一段相接的记录只可能直接与这一段相接，单遍扫描即可。
             // 那一份镜像还没建出来 = 不可能有记在它上面的登记，也就没有可并的：走下面的老路（mirror_pick 会建它）。
             int hit = -1; uint64_t lo = off, hi = off + len, old_sum = 0;   // 并集 [lo, hi)；old_sum = 被并掉的旧记录原长度之和

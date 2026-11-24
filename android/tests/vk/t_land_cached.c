@@ -16,7 +16,8 @@
 #define GPU(x) do { nvn_gpu_rc result_ = (x); if (!nvn_gpu_ok(result_)) { fprintf(stderr, "FAIL %d: %s: %s\n", __LINE__, #x, err.why); exit(1); } } while (0)
 #define WAIT_NS 5000000000ull
 
-static int dq, enabled, fail_invalidate;
+static int dq, enabled, fail_invalidate, versioned;
+int s2a_land_fixture_queue_lock_available(void);
 
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n) { *n = 0; return NULL; }
 VkResult nvn_plat_vk_surface_create(VkInstance i, void *w, VkSurfaceKHR *s) {
@@ -28,6 +29,7 @@ void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *key, int fallback) {
     if (!strcmp(key, "nvk_dq")) return dq;
     if (!strcmp(key, "nvk_land_cached")) return enabled;
+    if (!strcmp(key, "nvk_land_upload_versions")) return versioned;
     return fallback;
 }
 void nvn_plat_log(int level, const char *category, const char *line) {
@@ -87,13 +89,14 @@ static void *submit_next(void *arg) {
 }
 
 struct mirror_stats {
-    uint64_t waits, last_wait, transfer_waits, storage_waits;
+    uint64_t waits, last_wait, upload_waits, transfer_waits, storage_waits;
     uint64_t invalidates, invalidated_bytes, invalidated_payload, flushes, buffers;
 };
 static void stat(void *user, const char *name, uint64_t n) {
     struct mirror_stats *s = user;
     if (!strcmp(name, "mirror_wait_calls")) s->waits = n;
     if (!strcmp(name, "mirror_wait_last_segment")) s->last_wait = n;
+    if (!strcmp(name, "mirror_wait_upload_calls")) s->upload_waits = n;
     if (!strcmp(name, "mirror_wait_transfer_calls")) s->transfer_waits = n;
     if (!strcmp(name, "mirror_wait_storage_calls")) s->storage_waits = n;
     if (!strcmp(name, "mirror_invalidate_calls")) s->invalidates = n;
@@ -197,10 +200,14 @@ static void wait_callback(const struct land_result *land) {
 
 static void require_no_wait(const struct next_submit *next) {
     for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&next->returned); i++) tick();
-    if (!atomic_load(&next->returned) || stats().waits)
-        fprintf(stderr, "disjoint write or read-only segment blocked on mirror callback: signal=%llu waits=%llu\n",
-                (unsigned long long)next->signal, (unsigned long long)stats().waits);
-    REQUIRE(atomic_load(&next->returned) && !stats().waits && nvn_gpu_ok(next->rc));
+    const int returned = atomic_load(&next->returned);
+    const uint64_t waits = stats().waits;
+    if (!returned || waits || !nvn_gpu_ok(next->rc)) {
+        fprintf(stderr, "mirror submit signal=%llu returned=%d waits=%llu\n",
+                (unsigned long long)next->signal, returned, (unsigned long long)waits);
+        if (returned) fprintf(stderr, "mirror submit rc=%d: %s\n", next->rc.code, next->err.why);
+    }
+    REQUIRE(returned && !waits && nvn_gpu_ok(next->rc));
 }
 
 static void test_land_overlap(const struct s2a_vk_device *physical) {
@@ -342,6 +349,81 @@ static void test_land_storage(const struct s2a_vk_device *physical, const char *
             (unsigned long long)observed.storage_waits, (unsigned long long)observed.last_wait);
 }
 
+static void test_land_upload_version(const struct s2a_vk_device *physical, int reuse_old) {
+    struct s2a_vk_device dev = cached_device(physical, 1, 0);
+    const uint64_t atom = dev.properties.limits.nonCoherentAtomSize;
+    REQUIRE(atom >= 32);
+    enabled = versioned = 1;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-upload-version"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    nvn_gpu_buf old = NULL, fresh = NULL;
+    GPU(nvn_gpu_buf_create(atom, NVN_GPU_MEM_POOL_MIRROR, NULL, &old, &err));
+    GPU(nvn_gpu_buf_create(atom, NVN_GPU_MEM_POOL_MIRROR, NULL, &fresh, &err));
+    // 只有一个内存类型的 lavapipe 上，整表屏蔽 HOST_COHERENT 会让 256 KiB 上传暂存返回 NVN_GPU_E_OOM。
+    // 两份镜像创建时已保存非一致属性。录命令前恢复真表，让暂存使用物理设备的 coherent 类型。
+    dev.memory = physical->memory;
+    REQUIRE(nvn_gpu_mirror_version_atom(old) == atom && nvn_gpu_mirror_version_atom(fresh) == atom);
+
+    struct land_result first = {.mirror = old};
+    const nvn_gpu_mirror_span original = {old, 0, 20};
+    nvn_gpu_cmd cmd = NULL;
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    nvn_gpu_fill_buf(cmd, old, 0, 20, 0xa7a7a7a7);
+    nvn_gpu_mirror_visibility_record(cmd, &original, 1);
+    GPU(nvn_gpu_cmd_commit(cmd, 1, land_done, &first, &err));
+    wait_callback(&first);
+
+    const uint8_t upload[] = {0xb8, 0xb8, 0xb8, 0xb8};
+    struct land_result second = {.mirror = fresh, .offset = 1, .release = 1};
+    struct next_submit next = {.signal = 2};
+    GPU(nvn_gpu_cmd_begin(NULL, &next.cmd, &err));
+    if (reuse_old) {
+        nvn_gpu_buf_write(next.cmd, old, 20, upload, sizeof upload);
+    } else {
+        nvn_gpu_fill_buf(next.cmd, fresh, 0, 20, 0x55555555);
+        nvn_gpu_mirror_copy_span(next.cmd, old, fresh, 1, 3);
+        nvn_gpu_buf_write(next.cmd, fresh, 8, upload, sizeof upload);
+        const nvn_gpu_mirror_span copied = {fresh, 0, 20};
+        nvn_gpu_mirror_visibility_record(next.cmd, &copied, 1);
+        next.done = land_done;
+        next.user = &second;
+    }
+
+    pthread_t thread;
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &next));
+    if (reuse_old) {
+        for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&next.returned); i++) tick();
+        REQUIRE(stats().upload_waits == 1 && !atomic_load(&next.returned));
+        REQUIRE(nvn_gpu_fence_wait(2, 0, NULL).code == NVN_GPU_E_ARG);
+        int lock_available = 0;
+        for (int i = 0; i < 500 && !(lock_available = s2a_land_fixture_queue_lock_available()); i++) tick();
+        REQUIRE(lock_available && !atomic_load(&next.returned));
+    } else {
+        require_no_wait(&next);
+        REQUIRE(nvn_gpu_fence_wait(2, 0, NULL).code == NVN_GPU_E_TIMEOUT);
+    }
+    REQUIRE(!nvn_gpu_fence_done());
+    atomic_store(&first.release, 1);
+    REQUIRE(!pthread_join(thread, NULL));
+    GPU(next.rc);
+    GPU(nvn_gpu_fence_wait(2, WAIT_NS, &err));
+    REQUIRE(first.landed[0] == 0xa7 && first.landed[1] == 0xa7);
+    if (!reuse_old) {
+        const uint8_t inherited[] = {0x55, 0xa7, 0xa7, 0xa7, 0x55};
+        REQUIRE(!memcmp(nvn_gpu_buf_cpu(fresh), inherited, sizeof inherited));
+        REQUIRE(second.landed[0] == 0xa7 && second.landed[1] == 0xb8 && second.landed[2] == 0x55);
+    }
+    REQUIRE(stats().waits == (uint64_t)reuse_old);
+    printf("land-cached upload-version dq=%d reuse-old=%d wait=%llu: %s\n",
+           dq, reuse_old, (unsigned long long)stats().waits,
+           reuse_old ? "queue lock available during wait" : "3 inherited bytes, both sentinels and staged upload verified");
+    nvn_gpu_buf_release(fresh, NULL, NULL);
+    nvn_gpu_buf_release(old, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    versioned = 0;
+}
+
 int main(int argc, char **argv) {
     REQUIRE(argc == 3);
     dq = atoi(argv[1]);
@@ -356,6 +438,8 @@ int main(int argc, char **argv) {
     test_land(&dev, 1, 1, 0);
     test_land_overlap(&dev);
     test_land_storage(&dev, argv[2]);
+    test_land_upload_version(&dev, 0);
+    test_land_upload_version(&dev, 1);
     s2a_vk_device_destroy(&dev, 1);
     return 0;
 }

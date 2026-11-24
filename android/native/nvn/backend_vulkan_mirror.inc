@@ -10,6 +10,11 @@ static int mirror_is_noncoherent(nvn_gpu_buf b) {
            !(b->memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b) {
+    if (!g.land_upload_versions || !mirror_is_noncoherent(b)) return 0;
+    return g.dev->properties.limits.nonCoherentAtomSize;
+}
+
 static uint32_t mirror_memory_type(const struct s2a_vk_device *dev, const VkMemoryRequirements *req) {
     const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -248,7 +253,10 @@ static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
 
     const uint64_t t0 = now_ns();
     nvn_gpu_err err = {0};
+    // 客体提交顺序仍由 g_guest_commit_mu 保证。回写未完成时允许无关的 WSI 提交。
+    if (g.land_upload_versions) pthread_mutex_unlock(&g_submit_mu);
     const nvn_gpu_rc result = nvn_gpu_fence_wait(fence, 5000000000ull, &err);
+    if (g.land_upload_versions) pthread_mutex_lock(&g_submit_mu);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_MIRROR_WAIT_NS] += now_ns() - t0;
     pthread_mutex_unlock(&g_mu);

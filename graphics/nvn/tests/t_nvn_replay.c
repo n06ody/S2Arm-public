@@ -56,7 +56,9 @@ static int g_flag_split_pass = -1, g_flag_diag_load_dc, g_flag_diag_store_dc;   
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_flag_land_upload_versions;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_land_upload_versions")) return g_flag_land_upload_versions;
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "nvk_land_noresync")) return g_flag_land_noresync < 0 ? dflt : g_flag_land_noresync;
@@ -301,6 +303,21 @@ nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu
 }
 
 int nvn_gpu_mirror_visibility_enabled(void) { return g_mirror_fixture; }
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b) {
+    return b && b->device && g_flag_land_upload_versions ? MIRROR_TEST_ATOM : 0;
+}
+static unsigned g_version_copies;
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes) {
+    const int valid = c && c->live && src != dst &&
+        nvn_gpu_mirror_version_atom(src) && nvn_gpu_mirror_version_atom(dst) &&
+        off <= src->bytes && off <= dst->bytes && bytes <= src->bytes - off && bytes <= dst->bytes - off;
+    CHECK(valid);
+    if (!valid) return;
+    // The fixture has already supplied the preceding segment's GPU bytes.
+    // Its completion callback is withheld independently, as in the Vulkan fixture.
+    memcpy(dst->device + off, src->device + off, (size_t)bytes);
+    g_version_copies++;
+}
 int nvn_gpu_mirror_state(nvn_gpu_buf b) {
     if (!b || !b->device) return NVN_GPU_MIRROR_COHERENT;
     return g_mirror_busy ? NVN_GPU_MIRROR_GPU_BUSY : NVN_GPU_MIRROR_CPU_IDLE;
@@ -2863,6 +2880,81 @@ out:
 cleanup:
     nvn_be_pool_del(g_pmem);
     g_mirror_fixture = g_buf_cpu_auto = g_mirror_inv_fail = 0;
+    pass_fresh();
+}
+
+static void t_land_upload_versions(int enabled, int dirtylog) {
+    pass_fresh();
+    g_flag_land_upload_versions = enabled;
+    g_mirror_fixture = g_buf_cpu_auto = 1;
+    g_flag_buf_dirtylog = dirtylog;
+    const uint64_t log_reads = g_alog_reads;
+    g_pg_gen[0] = g_dirty_now = 100;
+    g_version_copies = 0;
+    memset(g_pmem, 0x11, sizeof g_pmem);
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_gpu_buf old = NULL, next = NULL, alias = NULL;
+
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &old, NULL) && old && old->device);
+    CHECK(rp_post_gpu_write(base, 4));
+    memset(old->device, 0xa7, 4);
+    const uint64_t first = nvn_be_sub_commit();
+    CHECK(!rp_fence_done(first) && g_pmem[0] == 0x11);
+    CHECK(g_npend == 1 && g_pend[0].mirror_count == 1 && g_pend[0].mirror[0].src == old);
+
+    nvn_be_sub_begin();
+    nvn_gpu_buf disjoint = NULL;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, 4, &disjoint, NULL) && disjoint);
+    memset(g_pmem + 32, 0xb8, 4);
+    g_pg_gen[0] = ++g_dirty_now;
+    rp_write_note(base + 32, 4);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &next, NULL) && next);
+    // The page upload overlaps the atom still owned by the preceding segment.
+    CHECK(enabled ? next != old : next == old);
+    CHECK(disjoint == next);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &alias, NULL) && alias == next);
+    if (enabled) {
+        CHECK(g_version_copies == 1 && next->device[0] == 0xa7 && next->device[3] == 0xa7);
+        CHECK(rp_post_gpu_write(base + 1, 3));
+        memset(next->device + 1, 0xc9, 3);
+        CHECK(old->device[1] == 0xa7);
+    }
+    const uint64_t second = nvn_be_sub_commit();
+    CHECK(second > first && !rp_fence_done(first) && !rp_fence_done(second));
+    uint64_t last = second;
+    if (enabled) {
+        nvn_be_sub_begin();
+        g_mirror_busy = 1;
+        nvn_gpu_buf busy = NULL;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &busy, NULL) && busy == next);
+        g_mirror_busy = 0;
+        last = nvn_be_sub_commit();
+        CHECK(!rp_fence_done(first) && !rp_fence_done(last));
+    }
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_fence_done(last) && g_pmem[0] == 0xa7 && g_pmem[32] == 0xb8);
+    if (enabled) {
+        CHECK(g_pmem[1] == 0xc9 && g_pmem[3] == 0xc9);
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &alias, NULL) && alias == next);
+        CHECK(rp_post_gpu_write(base + 32, 4));
+        memset(next->device + 32, 0xd4, 4);
+        const uint64_t producer = nvn_be_sub_commit();
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &alias, NULL) && alias == old);
+        CHECK(alias && alias->device && alias->device[32] == 0xd4);
+        CHECK(!rp_fence_done(producer) && g_pmem[32] == 0xb8);
+        last = nvn_be_sub_commit();
+        fake_complete(NVN_GPU_DONE_OK);
+        CHECK(rp_fence_done(last) && g_pmem[32] == 0xd4);
+    }
+
+    nvn_be_pool_del(g_pmem);
+    CHECK((g_alog_reads != log_reads) == dirtylog);
+    g_flag_land_upload_versions = g_mirror_fixture = g_buf_cpu_auto = 0;
+    g_flag_buf_dirtylog = g_dirtylog_dflt;
     pass_fresh();
 }
 
@@ -7980,6 +8072,12 @@ static void t_graphics_cbuf_prep_before_pass(void) {
 
 
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "--land-upload-versions") || !strcmp(argv[1], "--land-upload-versions-off") ||
+                     !strcmp(argv[1], "--land-upload-versions-log"))) {
+        t_land_upload_versions(strcmp(argv[1], "--land-upload-versions-off") != 0, !strcmp(argv[1], "--land-upload-versions-log"));
+        printf("land upload versions: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail != 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--land-cached-mirror")) {
         t_land_cached_mirror();
         printf("land cached mirror: %d checks, %d failures\n", g_checks, g_fail);
@@ -8052,6 +8150,8 @@ int main(int argc, char **argv) {
     t_buf_mirror_fail_once();
     t_buf_multi_tail();
     t_land_cached_mirror();
+    t_land_upload_versions(0, g_dirtylog_dflt != 0);
+    t_land_upload_versions(1, g_dirtylog_dflt != 0);
     t_buf_ops();
     t_copy_b2t();
     t_pass_shared_extent();
