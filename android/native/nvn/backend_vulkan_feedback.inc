@@ -17,23 +17,24 @@ static int feedback_attached(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v) 
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (feedback_overlap(v, d->color[i].view)) return 1;
     return feedback_overlap(v, d->depth.view) || feedback_overlap(v, d->stencil.view);
 }
-// 采用实际建管线的写状态，不把「本笔没有产生像素」猜成只读。
+// 采用当前绘制的有效写状态，「本笔没有产生像素」也不能证明只读。
 // 深度模板两面共享一个物理附件；任一面可能写，都不能用 NONE 豁免另一面。
 static uint16_t feedback_writes(struct nvn_gpu_cmd_s *c) {
     const nvn_gpu_pipe_desc *p = &c->pipe->key;
+    const ds_st ds = draw_depth_stencil(c);
     uint16_t writes = 0;
     for (uint32_t i = 0; i < 8; i++)
         if (p->cfmt[i] && ((p->chmask.mask >> (4 * i)) & 15)) writes |= 1u << i;
-    if (p->dfmt && p->ds.dt && p->ds.dw) writes |= 1u << 8;
-    if (p->sfmt && p->ds.st) {
+    if (p->dfmt && ds.dt && ds.dw) writes |= 1u << 8;
+    if (p->sfmt && ds.st) {
         uint32_t front = c->has_dyn ? c->dyn.st_wmask[0] & 255 : 255;
         uint32_t back = c->has_dyn ? c->dyn.st_wmask[1] & 255 : 255;
-        if ((front && (vk_stencil_op(p->ds.fail_f) != VK_STENCIL_OP_KEEP ||
-                       vk_stencil_op(p->ds.zfail_f) != VK_STENCIL_OP_KEEP ||
-                       vk_stencil_op(p->ds.zpass_f) != VK_STENCIL_OP_KEEP)) ||
-            (back && (vk_stencil_op(p->ds.fail_b) != VK_STENCIL_OP_KEEP ||
-                      vk_stencil_op(p->ds.zfail_b) != VK_STENCIL_OP_KEEP ||
-                      vk_stencil_op(p->ds.zpass_b) != VK_STENCIL_OP_KEEP))) writes |= 1u << 8;
+        if ((front && (vk_stencil_op(ds.fail_f) != VK_STENCIL_OP_KEEP ||
+                       vk_stencil_op(ds.zfail_f) != VK_STENCIL_OP_KEEP ||
+                       vk_stencil_op(ds.zpass_f) != VK_STENCIL_OP_KEEP)) ||
+            (back && (vk_stencil_op(ds.fail_b) != VK_STENCIL_OP_KEEP ||
+                      vk_stencil_op(ds.zfail_b) != VK_STENCIL_OP_KEEP ||
+                      vk_stencil_op(ds.zpass_b) != VK_STENCIL_OP_KEEP))) writes |= 1u << 8;
     }
     return writes;
 }
@@ -172,6 +173,7 @@ void nvn_vk_fbpool_stat(uint64_t out[5]) {
     pthread_mutex_lock(&g_mu); out[3] = g_fbpool_n; out[4] = g_fbpool_bytes; pthread_mutex_unlock(&g_mu);
 }
 static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
+    fr_gap(c,"feedback_snapshot");
     struct nvn_gpu_view_s *v = f->source;
     struct nvn_gpu_tex_s *s = v->tex;
     struct nvn_gpu_tex_s *t = feedback_snap_reuse(c, f, s);

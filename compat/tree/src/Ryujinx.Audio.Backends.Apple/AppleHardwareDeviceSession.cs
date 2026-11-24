@@ -83,9 +83,10 @@ namespace Ryujinx.Audio.Backends.Apple
         //   所以中断期间不停交还：停掉真队列（在途的收回、照常记作播完），之后泵照常把声音交出来但不进 AudioQueue，按采样率在墙钟上逐块
         //   「交还」（送数线程 PaceLoop 到点置 _returnedMask，与设备回调同一条路），游戏看到的播放节奏与有设备时一样，只是没声。
         //   中断结束 / 媒体服务重置走原来的重启（S2ARecover 在停泵期间退出无设备播放、收回其在途块，再交真队列开播）。
-        //   进入：看门狗见「中断开始」通知（≤250 ms）；漏了通知时兜底见「设备 1 秒不回调且系统中断中」。
+        //   进入：看门狗见「中断开始」通知（≤250 ms）；任何原因（11-23 起不限系统中断：路由切换、失焦未冻结……）设备超过 VirtualAfterMs 不回调都进。
         //   退出也不只靠「中断结束」通知（会漏）：无设备期间每 10 秒试一次重新激活音频会话，成功即重启真队列；中断还在时激活失败、不动
         private bool _virtual;
+        private bool _virtualForInterrupt;   // 这次无设备播放是不是因系统中断进的：是就等「中断结束」/ 每 10 秒试重新激活，不是就 VirtualProbeMs 后试回设备
         private readonly object _virtualLock = new();
         private readonly int[] _virtualSlot = new int[NumBuffers];
         private readonly long[] _virtualDue = new long[NumBuffers];   // 这块按采样率播完的时刻（Stopwatch）
@@ -134,11 +135,17 @@ namespace Ryujinx.Audio.Backends.Apple
         // S2Arm: underrun counters / S2A_AUDIO_WAV capture, see S2AOutputDiag
         private readonly S2AOutputDiag _diag;
 
-        // S2Arm (10-23 维护者 塞尔达「杂音后没声」): 输出流自愈。开着播、在途有数据，设备却超过 StallMs 不回调 = 设备停了
+        // S2Arm (10-23 维护者 塞尔达「杂音后没声」): 输出流自愈。开着播、在途有数据，设备却超过 VirtualAfterMs 不回调 = 设备停了
         //   （系统停了队列：会话被打断 / 路由切换 / 媒体服务重置……，我们不会收到任何通知，之前就此永久没声）：
         //   iOS 重新激活音频会话 → 同步停队列 → 收回在途缓冲 → 重新排进去 → 开播。看门狗线程每 250 ms 查一次已登记会话。
         //   S2A_AUDIO_HEAL=0 关（同包 A/B）；S2A_AUDIO_TEST_STALL_AT=<秒>：开播后到点暂停一次队列（模拟系统停播，测试用）
-        private const int StallMs = 1000;
+        // S2Arm (11-23 D-GJCX / D-4T8M 宝可梦剑中止)：交还永不停。Switch 的声音硬件从不停交还；游戏在跑、设备却不回调时（系统中断、路由切换、
+        //   失焦而客机还没冻结……），游戏约 0.8–1 秒收不到交还就自己关掉音频输出再重开，有的游戏重开路径不销毁上一个 SystemEvent，
+        //   nn::audio::OpenDefaultAudioOut 查到事件已初始化就中止（sdk：注册缓冲事件后 ldrb [事件+0x28] 非 0 → Abort；CloseAudioOut 不碰这个事件，
+        //   销毁归游戏，真机上这条重开路径走不到）。所以不论原因，设备超过 VirtualAfterMs 不回调就改走无设备播放（按采样率照常交还），
+        //   远早于游戏的阈值；系统中断时等「中断结束」/ 每 10 秒试重新激活，其余原因 VirtualProbeMs 后就试回设备，回不去再进无设备播放
+        private const int VirtualAfterMs = 200;
+        private const int VirtualProbeMs = 500;
         private const int HealBackoffMs = 2000;
         // #1921：队列时钟越过交付量多少帧算真跑前（10 ms @48k；正常播放时时钟不会越过交付量，留一点读数时差）
         private const long AheadToleranceFrames = 480;
@@ -434,6 +441,18 @@ namespace Ryujinx.Audio.Backends.Apple
         // 无设备播放中（见 _virtual）：每 10 秒试一次重新激活音频会话（「中断结束」通知会漏）。中断还在时激活失败、不动；成功即回到设备
         private void S2AVirtualProbe(long now)
         {
+            // 不是因系统中断进的（路由切换、失焦未冻结、设备悄悄停播……）：设备多半马上能用，VirtualProbeMs 后就试回设备；回不去（重新开播失败 /
+            //   随后又不回调）再进无设备播放，游戏这期间一直收到交还
+            if (!_virtualForInterrupt)
+            {
+                if (now - _lastHealTicks >= (long)VirtualProbeMs * Stopwatch.Frequency / 1000)
+                {
+                    S2ARecover($"无设备播放 {(now - _lastHealTicks) * 1000 / Stopwatch.Frequency} ms 后试回设备（不在系统中断里，最近系统通知 {S2AAudioNotes.Last}）", false, now, false);
+                }
+
+                return;
+            }
+
             if (now - _lastHealTicks < (long)HealBackoffMs * 5 * Stopwatch.Frequency / 1000)
             {
                 return;
@@ -461,7 +480,7 @@ namespace Ryujinx.Audio.Backends.Apple
             return frozen || (thawTicks != 0 && now - thawTicks < (long)ThawGraceMs * freq / 1000);
         }
 
-        // 兜底：开着播、在途有数据，设备却超过 StallMs 不回调。每次触发都打【红】，带上最近一条系统通知，免得悄悄盖住别的毛病
+        // 兜底：开着播、在途有数据，设备却超过 VirtualAfterMs 不回调 → 无设备播放（见 VirtualAfterMs）。日志带上最近一条系统通知，免得悄悄盖住别的毛病
         private void S2ACheckStall(long now)
         {
             int zero = Interlocked.Exchange(ref _zeroReturns, 0);
@@ -557,7 +576,7 @@ namespace Ryujinx.Audio.Backends.Apple
 
             long stall = now - Volatile.Read(ref _lastCallbackTicks);
 
-            if (stall < (long)StallMs * Stopwatch.Frequency / 1000 || _pump.InFlightBytes == 0)
+            if (stall < (long)VirtualAfterMs * Stopwatch.Frequency / 1000 || _pump.InFlightBytes == 0)
             {
                 return;
             }
@@ -572,21 +591,6 @@ namespace Ryujinx.Audio.Backends.Apple
                 return;
             }
 
-            // 系统中断期间（见过 began、没见 ended）声音在别人手里，重启多半失败：改走无设备播放，游戏照常收到交还（见 _virtual）
-            if (S2AAudioNotes.Interrupted)
-            {
-                S2AEnterVirtual($"兜底：设备 {stall * 1000 / Stopwatch.Frequency} ms 没有回调（系统中断中，最近系统通知 {S2AAudioNotes.Last}）");
-
-                return;
-            }
-
-            int backoff = HealBackoffMs;
-
-            if (now - _lastHealTicks < (long)backoff * Stopwatch.Frequency / 1000)
-            {
-                return;
-            }
-
             // Full thread dumps suspend every other thread while collecting stacks.
             // Opt in explicitly for diagnosis; normal audio recovery must not pause the game.
             if (s_stallDumpOn && Interlocked.Increment(ref s_stallDumps) <= 3)
@@ -597,12 +601,13 @@ namespace Ryujinx.Audio.Backends.Apple
                 }
                 catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
                 {
-                    // 宿主之外（服务层单测直接跑托管代码）没有原生库：现场只是诊断，不影响下面的自愈
+                    // 宿主之外（服务层单测直接跑托管代码）没有原生库：现场只是诊断，不影响下面的无设备播放
                     Console.Error.WriteLine($"[声] 全线程现场不可用（{e.GetType().Name}）");
                 }
             }
 
-            S2ARecover($"兜底：设备 {stall * 1000 / Stopwatch.Frequency} ms 没有回调{(S2AAudioNotes.Interrupted ? "（系统中断中）" : "")}，最近系统通知 {S2AAudioNotes.Last}", false, now, true);
+            // 交还永不停（见 VirtualAfterMs）：不论系统中断、路由切换还是别的原因，先改走无设备播放让游戏照常收到交还，回设备交给 S2AVirtualProbe
+            S2AEnterVirtual($"兜底：设备 {stall * 1000 / Stopwatch.Frequency} ms 没有回调{(S2AAudioNotes.Interrupted ? "（系统中断中）" : "")}，最近系统通知 {S2AAudioNotes.Last}");
         }
 
         private static readonly bool s_stallDumpOn = Environment.GetEnvironmentVariable("S2A_AUDIO_STALL_DUMP") == "1";
@@ -769,10 +774,10 @@ namespace Ryujinx.Audio.Backends.Apple
                     $"{((OperatingSystem.IsIOS() || OperatingSystem.IsTvOS()) ? $"重新激活音频会话 {(active ? "成功" : "失败")}、" : "")}停队列 rc={stopRc}、收回 {reclaimed / _bytesPerFrame} 帧" +   // 平台例外：tvOS 与 iOS 走同一分支
                     $"{(rebuild ? $"、新建队列 rc={newRc}" : "")}、重新开播 rc={startRc}{(startRc == 0 ? "" : "（没开播：游戏停着或开播失败，下一笔声音到时再试）")}");
 
-                // 开播失败而系统中断还在：回到无设备播放，别让游戏等交还（见 _virtual）
-                if (_started && startRc != 0 && S2AAudioNotes.Interrupted)
+                // 开播失败（系统中断还在、路由还没切好……）：回到无设备播放，别让游戏等交还（见 VirtualAfterMs）
+                if (_started && startRc != 0)
                 {
-                    S2AEnterVirtual("重新开播失败、系统中断中");
+                    S2AEnterVirtual($"重新开播失败（rc={startRc}{(S2AAudioNotes.Interrupted ? "，系统中断中" : "")}）");
                 }
             }
         }
@@ -1170,6 +1175,7 @@ namespace Ryujinx.Audio.Backends.Apple
                         Interlocked.Exchange(ref _enqueuedFrames, 0);
                         S2AVirtualClearLocked();
                         _virtualFrames = 0;
+                        _virtualForInterrupt = S2AAudioNotes.Interrupted;
                         Volatile.Write(ref _virtual, true);
                     }
 
@@ -1200,7 +1206,7 @@ namespace Ryujinx.Audio.Backends.Apple
 
                 _paceEvent.Set();
                 Console.Error.WriteLine($"[声] 输出 #{_diag.Index}：{why}（在途 {inFlightFrames} 帧）→ 停输出队列、收回 {reclaimed / _bytesPerFrame} 帧，改走无设备播放" +
-                    "（游戏的声音按采样率当作播完交还，没声；中断结束再回到设备）");
+                    "（游戏的声音按采样率当作播完交还，没声；设备能用了再回到设备）");
             }
         }
 

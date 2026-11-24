@@ -3,11 +3,25 @@
 // 原创灰阶经生产呈现路径读回交换链；期望为输入编码字节，UNORM 是负对照。
 #define vkCreateImage fixture_CreateImage
 #define vkDestroyImage fixture_DestroyImage
+#define nvn_plat_flag present_fixture_flag
+#define nvn_plat_log present_fixture_log
 #define main unused_fixture_main
 #define vkGetSwapchainImagesKHR fixture_GetSwapchainImagesKHR
 #define vkQueuePresentKHR fixture_QueuePresentKHR
 #include "t_backend_vk.c"
 #undef main
+#undef nvn_plat_flag
+#undef nvn_plat_log
+static int frame_test_target;
+static char frame_test_log[256];
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_draw_frame")) return frame_test_target;
+    return present_fixture_flag(name, dflt);
+}
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (!strcmp(cls, "draw-frame")) snprintf(frame_test_log, sizeof frame_test_log, "%s", text);
+    present_fixture_log(level, cls, text);
+}
 #undef vkCreateImage
 #undef vkDestroyImage
 #undef vkGetSwapchainImagesKHR
@@ -114,9 +128,16 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q,const VkPresentInfoKH
     if(probe_active) probe_readback(q,probe_images[pi->pImageIndices[0]]);
     return fixture_QueuePresentKHR(q,pi);
 }
-int main(void) {
+#include "t_draw_frame.inc"
+
+int main(int argc, char **argv) {
     char why[256]={0};if(s2a_vk_device_create(&g_dev,why,sizeof why)) {fprintf(stderr,"device %s\n",why);return 2;}
     memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="original-present-grayscale";
+    if (argc == 3) {
+        int result = test_draw_frame(argv[1], argv[2]);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return result;
+    }
     if(!open_backend())return 2;
     nvn_gpu_err e={0};nvn_gpu_surface sf=NULL;CHECK(OK(nvn_gpu_surface_attach((void *)1,&sf,&e)),"attach %s",e.why);
     if(!sf)return 2;

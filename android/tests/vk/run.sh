@@ -832,6 +832,38 @@ if [ "$mode" = "--stencil8-only" ]; then
 fi
 
 if [ "$mode" = "--present-only" ]; then
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/replay_front_face.vert" -o "$out/shaders/replay_front_face.vert.spv"
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/feedback_pool_phantom.frag" -o "$out/shaders/feedback_pool_phantom.frag.spv"
+    "$glslc" --target-env=vulkan1.1 -DSAMPLE_ELEMENT=1 "$repo/android/tests/vk/shaders/feedback_pool_phantom.frag" -o "$out/shaders/frame_pool_one.frag.spv"
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/feedback_pool_dyn.frag" -o "$out/shaders/feedback_pool_dyn.frag.spv"
+    "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/frame_roi.frag" -o "$out/shaders/frame_roi.frag.spv"
+    resource_rc=0
+    for arm in res-control res-mip res-layer res-overwrite res-pool res-pool-one res-pool-dynamic res-choice res-choice-stale res-roi res-roi-flip res-roi-upload res-roi-upload-other; do
+        if ! S2A_FRAME_LOG_DIR="$out" timeout 60 "$out/t_backend_vk" "$out/shaders" "$arm" 2>&1 | tee "$out/frame-$arm.log"; then resource_rc=1; fi
+        if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/frame-$arm.log"; then resource_rc=1; fi
+        if [ "$resource_rc" = 0 ]; then
+            leaf=$(sed -n "s/^resource-file arm=$arm file=\(sf-[^ ]*\.done\)$/\1/p" "$out/frame-$arm.log")
+            test -n "$leaf"
+            case "$arm" in
+                res-roi*) python3 "$repo/android/tests/vk/frame_roi_pixels.py" "$arm" "$out/$leaf" ;;
+            esac
+            printf 'RESOURCE_FIXTURE_%s=' "$arm"
+            base64 -w 0 "$out/$leaf"
+            echo
+        fi
+    done
+    if [ "$resource_rc" != 0 ]; then exit 1; fi
+    for arm in off absent observed pid birth session nonce switched collision ticket seq module cross; do
+        S2A_FRAME_LOG_DIR="$out" timeout 60 "$out/t_backend_vk" "$out/shaders" "$arm" 2>&1 | tee "$out/frame-$arm.log"
+        if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/frame-$arm.log"; then exit 1; fi
+        if [ "$arm" = observed ]; then
+            leaf=$(sed -n 's/^draw-frame arm=observed failures=0 receipt=seq=12 file=\(sf-[^ ]*\.done\) rows=1 display=unproven$/\1/p' "$out/frame-$arm.log")
+            test -n "$leaf"
+            printf 'DRAW_FRAME_FIXTURE_BASE64='
+            base64 -w 0 "$out/$leaf"
+            echo
+        fi
+    done
     for order in rgba bgra; do
     if [ "$order" = bgra ]; then export S2A_TEST_PRESENT_BGRA=1; else unset S2A_TEST_PRESENT_BGRA; fi
     set +e

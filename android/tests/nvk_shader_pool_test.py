@@ -61,7 +61,7 @@ def main():
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
-                  '--live-compile-stop', '--cs-libpack', '--lp-gate')
+                  '--live-compile-stop', '--cs-libpack', '--lp-gate', '--lp-numeric', '--choice-reuse')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout)
@@ -200,7 +200,22 @@ def main():
             result = run('gs-libpack-' + name, path, args=('--gs-libpack',))
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 4 libpack GS negative controls')
+        guard = 'if (!e->prog.lib_sourced || e->numeric_checked) return 1;'
+        assert code.count(guard) == 1
+        path = out / 'gs-libpack-mutant-sampled-numeric.c'
+        path.write_text(code.replace(guard, 'if (e->prog.lib_sourced || e->numeric_checked) return 1;'))
+        result = run('gs-libpack-sampled-numeric', path, args=('--lp-numeric',))
+        failures = [line for line in result.stderr.splitlines() if line.startswith('FAIL:')]
+        expected = {f'FAIL: {path_kind} sampled numeric admission format {fmt}'
+                    for path_kind in ('cold', 'warm') for fmt in (39, 40)}
+        for fmt in (39, 40):
+            expected.update(f'FAIL: {label} for format {fmt}' for label in (
+                'cold choice joins complete request to requested stage keys and final source',
+                'cold choice identifies rejected scalar class and FS c2 word 90',
+                "warm choice retains rejected candidate's c2 slot across ordinary fallback"))
+        assert result.returncode == 1 and len(failures) == len(expected) and {
+            line.split(',')[0] for line in failures} == expected, (result.stdout, result.stderr)
+        print('PASS: 5 libpack graphics negative controls, including cold and warm integer admission')
         return 0
 
     if sys.argv[1:] == ['--lp-gate-mutants']:

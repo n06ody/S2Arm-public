@@ -1,6 +1,6 @@
 # 上屏设置矩阵的链接清单：由 graphics/nvn/tests/t_present_settings_closure.py 按链接器实算生成，不要手改（改了也会被构建核对拦住）。
 # 构建（t_present_settings.sh）只编、只链 src 行；门禁按本清单的路径算 present_settings_test / present_settings_env_test 的输入。
-# 候选 104 个源文件，闭包 94 个。
+# 候选 104 个源文件，闭包 95 个。
 src graphics/track/glue.c
 src graphics/track/track.c
 src ios/ldn_lan.m
@@ -63,6 +63,7 @@ src runtime/src/loadprog.c
 src runtime/src/logcap.c
 src runtime/src/logcon.c
 src runtime/src/lowva.c
+src runtime/src/mac_slot_hold.c
 src runtime/src/msample.c
 src runtime/src/nrodefer.c
 src runtime/src/nvos_trace.c
@@ -113,6 +114,7 @@ hdr macos/joycon_imu.h
 hdr macos/motion_power.h
 hdr macos/ns2_controller.h
 hdr macos/ns2_relay.h
+hdr macos/pad_activity.h
 hdr macos/xbox_gip_relay.h
 hdr platform/plat.h
 hdr platform/plat_asm.h

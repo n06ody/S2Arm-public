@@ -44,12 +44,25 @@ struct rp_prog {
     // 用它跨会话定位「同一份程序」；全 0 = 没有身份（失败项 / 还没算出来），这种程序不进任何清单。
     uint8_t identity[32];
 };
+// 弱链接[replay]：nvn_gpu_draw_observation_enabled
+int nvn_gpu_draw_observation_enabled(void) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_draw_observation_drop
+void nvn_gpu_draw_observation_drop(uint64_t ticket) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_draw_choices_enabled
+int nvn_gpu_draw_choices_enabled(void) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_program_choice_note
+uint32_t nvn_gpu_program_choice_note(const uint8_t request[32], const uint8_t owner[32],
+                                     nvn_gpu_shader fs, int status, const struct rp_shader_choice *choice)
+                                     __attribute__((weak));
 struct rp_shader_req {
     uint32_t prim;              // NVNdrawPrimitive
     int rt_count;               // 当前颜色目标个数
     uint32_t rt_format[8];      // 各颜色目标的 NVN 格式（视图改了格式的取视图的）；0 = 空槽
     // 仅在提交线程发现现编结果尚未就绪时调用。可暂缓则返回 1 并写入预算所属帧。
     int (*compile_defer_frame)(uint64_t *frame);
+    struct rp_shader_choice *choice; // optional diagnostic output for this resolve
+    uint8_t *observed_request;   // optional 32-byte output, before program aliasing
+
 };
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。

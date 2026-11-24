@@ -99,12 +99,13 @@ import UniformTypeIdentifiers
         if let appID = SigningIdentity.current { NSLog("S2Arm 游戏来源：【黄】签名的 App ID %@ 与包名不一致，系统可能不肯交出选的文件夹", appID) }
         let picker = CloudFolderPicker.makePicker()
         let me = GameSourcePicker(); me.picked = picked; current = me; picker.delegate = me
-        topController()?.present(picker, animated: true)
+        CloudFolderPicker.presentLogged(picker, from: topController(), who: "game-source")
     }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         defer { Self.current = nil }
+        NSLog("[s2a] 选文件界面：结束（game-source），选了 %d 项", urls.count)
         if let url = urls.first { picked?(url) }
     }
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { Self.current = nil }
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { NSLog("[s2a] 选文件界面：结束（game-source），取消"); Self.current = nil }
 }
 #endif

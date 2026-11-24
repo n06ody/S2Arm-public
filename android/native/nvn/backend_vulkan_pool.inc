@@ -502,6 +502,7 @@ static int prs_apply(struct nvn_gpu_cmd_s *c, const struct prs_plan *pl, uint32_
             m++;
         }
         vkUpdateDescriptorSets(g.d, m, w, 0, NULL);
+        if (c->resources) fr_writes(c,m,w);
         u->patch = pp; u->npatch = m;
         __atomic_fetch_add(&g_pool_n[PN_RPATCH], m, __ATOMIC_RELAXED);
     }
@@ -596,6 +597,7 @@ static int pool_write_sets(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s 
     if (n) {
         const int tm = g_draw_tm; const uint64_t t0 = tm ? now_ns() : 0;
         vkUpdateDescriptorSets(g.d, n, writes, 0, NULL);
+        if (c->resources) fr_writes(c,n,writes);
         if (tm) __atomic_fetch_add(&g_pool_ns[1], now_ns() - t0, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_pool_n[PN_ELEMS], elems, __ATOMIC_RELAXED);
     }

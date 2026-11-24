@@ -66,6 +66,64 @@ static uint64_t plc_save_ns_frame(void) {
     g_plc_ns_last = rd.ns;
     return d;
 }
+enum {
+    LAND_FLUSH_N, LAND_FLUSH_PAYLOAD, LAND_FLUSH_BYTES, LAND_FLUSH_NS,
+    LAND_INV_N, LAND_INV_PAYLOAD, LAND_INV_BYTES, LAND_INV_NS,
+    LAND_WAIT_N, LAND_WAIT_NS, LAND_WAIT_UPLOAD, LAND_WAIT_TRANSFER, LAND_WAIT_STORAGE, LAND_WAIT_INDIRECT,
+    LAND_WAIT_LAST_SEGMENT, LAND_METRIC_N,
+};
+static const char *const mirror_metrics[LAND_METRIC_N] = {
+    [LAND_FLUSH_N] = "mirror_flush_calls", [LAND_FLUSH_PAYLOAD] = "mirror_flush_payload",
+    [LAND_FLUSH_BYTES] = "mirror_flush_bytes", [LAND_FLUSH_NS] = "mirror_flush_ns",
+    [LAND_INV_N] = "mirror_invalidate_calls", [LAND_INV_PAYLOAD] = "mirror_invalidate_payload",
+    [LAND_INV_BYTES] = "mirror_invalidate_bytes", [LAND_INV_NS] = "mirror_invalidate_ns",
+    [LAND_WAIT_N] = "mirror_wait_calls", [LAND_WAIT_NS] = "mirror_wait_ns",
+    [LAND_WAIT_UPLOAD] = "mirror_wait_upload_calls", [LAND_WAIT_TRANSFER] = "mirror_wait_transfer_calls",
+    [LAND_WAIT_STORAGE] = "mirror_wait_storage_calls", [LAND_WAIT_INDIRECT] = "mirror_wait_indirect_calls",
+    [LAND_WAIT_LAST_SEGMENT] = "mirror_wait_last_segment",
+};
+static uint64_t g_mirror_metrics_last[LAND_WAIT_LAST_SEGMENT];
+
+static void mirror_metric(void *user, const char *name, uint64_t value) {
+    uint64_t *stats = user;
+    for (size_t i = 0; i < LAND_METRIC_N; i++)
+        if (!strcmp(name, mirror_metrics[i])) { stats[i] = value; return; }
+}
+
+static void land_profile(const uint64_t pf[RP_PERF_N], uint64_t frames, uint64_t now) {
+    if (!nvn_gpu_stats || !frames) return;
+    uint64_t stats[LAND_METRIC_N] = {0};
+    nvn_gpu_stats(mirror_metric, stats, 0);
+    int active = pf[RP_PERF_LAND_CACHED_BYTES] || pf[RP_PERF_LAND_UNCACHED_BYTES];
+    for (size_t i = 0; i < LAND_WAIT_LAST_SEGMENT; i++) {
+        const uint64_t previous = g_mirror_metrics_last[i];
+        g_mirror_metrics_last[i] = stats[i];
+        if (stats[i] >= previous) stats[i] -= previous;
+        active |= stats[i] != 0;
+    }
+    if (!active) return;
+    // 原因按窗口计数，被等段为这个窗口最近一笔等待的信号值。
+    const uint64_t waited = stats[LAND_WAIT_N] ? stats[LAND_WAIT_LAST_SEGMENT] : 0;
+    const double f = (double)frames;
+    char b[640];
+    snprintf(b, sizeof b,
+             "落地镜像 mono_ns=%llu presents=%llu 每上屏："
+             "land.cached=%.0f B %.4f ms land.uncached=%.0f B %.4f ms "
+             "flush=%.2f 次 %.0f B 有效/%.0f B 对齐 %.4f ms "
+             "invalidate=%.2f 次 %.0f B 有效/%.0f B 对齐 %.4f ms wait=%.2f 次 %.4f ms "
+             "wait_reason=upload:%llu,transfer:%llu,storage:%llu,indirect:%llu waited_segment=%llu",
+             (unsigned long long)now, (unsigned long long)frames,
+             pf[RP_PERF_LAND_CACHED_BYTES] / f, pf[RP_PERF_LAND_CACHED_NS] / 1e6 / f,
+             pf[RP_PERF_LAND_UNCACHED_BYTES] / f, pf[RP_PERF_LAND_UNCACHED_NS] / 1e6 / f,
+             stats[LAND_FLUSH_N] / f, stats[LAND_FLUSH_PAYLOAD] / f, stats[LAND_FLUSH_BYTES] / f, stats[LAND_FLUSH_NS] / 1e6 / f,
+             stats[LAND_INV_N] / f, stats[LAND_INV_PAYLOAD] / f, stats[LAND_INV_BYTES] / f, stats[LAND_INV_NS] / 1e6 / f,
+             stats[LAND_WAIT_N] / f, stats[LAND_WAIT_NS] / 1e6 / f,
+             (unsigned long long)stats[LAND_WAIT_UPLOAD], (unsigned long long)stats[LAND_WAIT_TRANSFER],
+             (unsigned long long)stats[LAND_WAIT_STORAGE], (unsigned long long)stats[LAND_WAIT_INDIRECT],
+             (unsigned long long)waited);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+}
+
 static void frame_gap_note(void) {
     uint64_t now = plat_now_ns(), d = g_gap_last ? now - g_gap_last : 0; g_gap_last = now;
     if (!d) return;
@@ -118,6 +176,8 @@ int nvn_be_display_hz(void) { pthread_mutex_lock(&g_pmu); int r = g_hz; pthread_
 
 static void on_shown(void *user, const nvn_gpu_shown *s) {   // 持 g_pmu 的 present 里被后端回调，或后端的回调线程：只写自己的槽
     (void)user;
+    if (s->status == NVN_GPU_SHOWN_DROPPED && nvn_gpu_draw_observation_drop)
+        nvn_gpu_draw_observation_drop(s->ticket);
     double at = s->status == NVN_GPU_SHOWN_AT ? s->at : s->status == NVN_GPU_SHOWN_UNKNOWN ? (double)plat_now_ns() / 1e9 : -1;
     __atomic_store(&g_shown[s->ticket % PT_RING], &at, __ATOMIC_RELEASE);
 }
@@ -228,6 +288,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
         return ticket;
     }
     nvn_gpu_present_desc d; memset(&d, 0, sizeof d);
+    if (nvn_gpu_draw_observation_enabled && nvn_gpu_draw_observation_enabled()) d.observation_seq = rp_frame();
     d.src = v; d.filter = 1;
     // 窗口原点在左下（NVN 默认）时窗口图是自下而上存的：呈现时翻过来。裁剪按存储的行号给，不用换算
     d.flip_y = (uint8_t)(rp_present_lower_left() != 0);   // 被上屏窗口建时的原点（rp_entry.c）
@@ -277,6 +338,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
                 { char pb[1024]; if (rp_pipe_fail_summary(pb, sizeof pb)) nvn_plat_log(NVN_PLAT_LOG_INFO, "present", pb); }   // 图形管线失败分类：有新失败 / 新挡下的窗口才打
                 uint64_t fr = g_n_shown + 1 - n_last; double sec = (double)(now - t_last) / 1e9, f = fr ? (double)fr : 1.0;
+                land_profile(pf, fr, now);
                 const double fs = pf[RP_PERF_TM_FRAMES] ? (double)pf[RP_PERF_TM_FRAMES] : 1.0;   // 逐步计时那几项只在采样帧里计：按计时过的帧数求每帧值（#1103）
                 char b[768]; snprintf(b, sizeof b, "分时：%.1f 秒上屏 %llu 帧（每秒 %.1f）；每帧：绘制 %.0f 笔、队列提交 %.1f 次共 %.1f 毫秒（其中交后端 %.1f）、等围栏 %.1f 次共 %.1f 毫秒（其中等同步 %.1f 次 %.1f 毫秒、Finish %.1f 次 %.1f 毫秒）；段从提交到完成平均 %.1f 毫秒；回放分三段：开段 %.1f / 回放 %.1f / 收尾 %.1f 毫秒、等已完成 %.1f 次、没真等 %.1f 次；GPU 忙 %.1f 毫秒；通道 %.1f 个、交上屏 %.1f 毫秒",
                                       sec, (unsigned long long)fr, (double)fr / sec, (double)(nd - d_last) / f, (double)pf[RP_PERF_SUBS] / f, (double)pf[RP_PERF_SUBMIT_NS] / 1e6 / f, (double)pf[RP_PERF_COMMIT_NS] / 1e6 / f,
@@ -442,4 +504,6 @@ void rp_present_tc_take(uint64_t out[4]) {
 void rp_present_stats(uint64_t *shown, uint64_t *dropped) { pthread_mutex_lock(&g_pmu); if (shown) *shown = g_n_shown; if (dropped) *dropped = g_n_dropped; pthread_mutex_unlock(&g_pmu); }
 void rp_present_reset(void) { atomic_store(&g_adpf_seq, 0);
     pthread_mutex_lock(&g_tc_mu); g_tc_have = 0; g_tc_wall = g_tc_cpu = g_tc_n = g_tc_cross = 0; pthread_mutex_unlock(&g_tc_mu);   // 新会话不与上一局的最后一次上屏配对
-    pthread_mutex_lock(&g_pmu); g_surf = NULL; g_hz = 0; g_ticket = 0; g_n_shown = g_n_dropped = 0; memset(g_shown, 0, sizeof g_shown); memset(&g_fseg, 0, sizeof g_fseg); pthread_mutex_unlock(&g_pmu); }
+    pthread_mutex_lock(&g_pmu);
+    memset(g_mirror_metrics_last, 0, sizeof g_mirror_metrics_last);
+    g_surf = NULL; g_hz = 0; g_ticket = 0; g_n_shown = g_n_dropped = 0; memset(g_shown, 0, sizeof g_shown); memset(&g_fseg, 0, sizeof g_fseg); pthread_mutex_unlock(&g_pmu); }

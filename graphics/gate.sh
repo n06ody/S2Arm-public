@@ -205,9 +205,9 @@ REDLOGS=; FNRED=
 #   不按修改时间猜：并行跑的子项日志会被算到别人头上（11-01 首版把 900/900 全过的 fps_limit 列成红项）
 redlog() { [ "$1" = 0 ] || FNRED="$FNRED $2"; }
 ev() { local rc=$1 lf; shift; if [ "$rc" != 0 ]; then for lf in "$@" $FNRED; do case " $REDLOGS " in *" $lf "*) ;; *) REDLOGS="$REDLOGS $lf";; esac; done; fi; FNRED=; return "$rc"; }
-# 先列全文里的判红行（✗ / 不通 / FAIL / error / Traceback / AssertionError，前 20 条）再给末 30 行：判红行打得早时末 30 行里看不到（11-01 审计 P2-54）
+# 先列全文里的判红行（✗ / 不通 / FAIL / error / Traceback / AssertionError，前 20 条）再给末 30 行：判红行打得早时末 30 行里看不到（11-01 审计 P2-54）；✗ 行可带缩进（子项用例脚本的「  ✗ ⑦ …」，原先只认行首、整段只剩末 30 行的 ✓）
 evidence() { local lf k; for lf in $REDLOGS; do echo "  ┊ 红项日志 $(cd "$(dirname "$lf")" && pwd)/$(basename "$lf")："
-  k=$(grep -anE '^(✗ |不通 |FAIL)|: (fatal )?error:|^Traceback|AssertionError|^ld: |Undefined symbols' "$lf" | head -20)
+  k=$(grep -anE '^[[:space:]]*(✗ |不通 |FAIL)|: (fatal )?error:|^Traceback|AssertionError|^ld: |Undefined symbols' "$lf" | head -20)
   [ -n "$k" ] && { echo "  ┊   判红行（行号:内容，前 20 条）："; sed 's/^/  ┊   /' <<< "$k"; }
   echo "  ┊   末 30 行："; tail -30 "$lf" | sed 's/^/  ┊   /'; done; }
 reg() { ev "$1" "${@:3}"; [ "$1" = 0 ] || { REGOK=0; REGBAD="${REGBAD:+${REGBAD}；}$(cut -c1-200 <<< "$2")"; }; REGS="$REGS / $2"; }   # REGBAD：判红的项原文，总判行点名（10-30 维护者：红藏在结果段里要人翻）

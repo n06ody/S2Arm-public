@@ -60,6 +60,7 @@ static nvn_gpu_rc deswizzle_fallback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex
 }
 nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const nvn_texlayout *L,
                                           const void *src, uint64_t bytes) {
+    fr_gap(ch,"blocklinear_upload");
     struct nvn_gpu_cmd_s *c = ch; struct nvn_gpu_tex_s *t = th;
     if (!c) return (nvn_gpu_rc){ .code = NVN_GPU_E_ARG };
     if (!rc_is(c->sticky, NVN_GPU_OK)) return c->sticky;

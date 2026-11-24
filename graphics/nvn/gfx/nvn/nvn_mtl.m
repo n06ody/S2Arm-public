@@ -801,7 +801,7 @@ static void pidx_removing(int i) {   // before g_pools[i] = g_pools[--g_npool]: 
 //   块之间重叠，GPU 地址跨块不连续，所以查找要说读多远；不知道（长度 1：间接绘制的索引缓冲、原始存储地址）给 BIG_UNKNOWN。原始全局内存表（着色器自己查池表）要整池：big_full（gmem_map）。
 //   只为 CPU 读（addr_cpu）或只问在不在（pool_known）的查询不建块：块是 GPU 用的
 enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 32 };
-typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; uint64_t dead; uint64_t made; int nofull; } big_pool;   // made：给这个池建过的零拷贝缓冲长度合计（块、加长替下的旧块都算：都活到池走）；nofull：整池缓冲建不出来过，不再试   // dead：游戏已释放、到这次提交序号才回收（同池条目的 dead，pool_reap）   // chunk：步长 → g_pools 下标 + 1；full：整池那条 + 1；old：被加长替换下来的缓冲，随池走
+typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; uint64_t dead; uint64_t made; int nofull; uint64_t old_dead; } big_pool;   // made：给这个池建过的零拷贝缓冲长度合计（块、加长替下的旧块都算：都活到池走）；nofull：整池缓冲建不出来过，不再试   // dead：游戏已释放、到这次提交序号才回收（同池条目的 dead，pool_reap）   // chunk：步长 → g_pools 下标 + 1；full：整池那条 + 1；old：被加长替换下来的缓冲，随池走
 static big_pool g_big[BIG_MAX]; static int g_nbig; static uint64_t g_big_chunks;   // g_big_chunks：建过的块（读数）
 // 池表删一条时（gone 走、末尾那条 from 改名为 gone）大池块表里的下标跟着改：块表记的是池表下标，别的池被删、挪进空位的若是某个大池的块，
 //   不改就指着别人的条目（GPU 地址落到别的缓冲上）；走的若正是块，块表那格清掉（下次查到再包）。调用方持 g_mu
@@ -1312,6 +1312,11 @@ static void pool_remove_at(int i);
 static void pool_reap(uintptr_t olo, uintptr_t ohi) {   // 调用方持 g_mu：到期的待删条目（ohi > olo 时另删与 [olo, ohi) 重叠的待删条目）
     for (int i = 0; i < g_npool; i++)
         if (g_pools[i].dead && (g_sub_serial >= g_pools[i].dead || (ohi > olo && g_pools[i].lo < ohi && olo < g_pools[i].hi))) { pool_remove_at(i); i = -1; }
+    for (int k = 0; k < g_nbig; k++) { big_pool *b = &g_big[k];   // 改整池时到期的旧块（old_dead，见 big_lookup）：同下面池走时的放法
+        if (!b->old_dead || g_sub_serial < b->old_dead) continue;
+        for (id<MTLBuffer> ob in b->old) { for (int i = 0; i < g_npool; i++) if (g_pools[i].alias && g_pools[i].buf == ob) { pool_unlist(i); i--; }
+            if (!xq_buf_hold_retire((__bridge void *)ob)) defer_obj_release(ob); }
+        [b->old removeAllObjects]; b->old_dead = 0; }
     for (int k = 0; k < g_nbig; k++) { big_pool *b = &g_big[k];   // 大池记录同样到期才走：块已随上面走（同 key、同 dead）；加长替下的旧块缓冲不在池表里，指着它们的别名（#1143 虚拟池别名）这里一并下表，再延后放
         if (!b->dead || !(g_sub_serial >= b->dead || (ohi > olo && b->lo < ohi && olo < b->hi))) continue;
         for (id<MTLBuffer> ob in b->old) { for (int i = 0; i < g_npool; i++) if (g_pools[i].alias && g_pools[i].buf == ob) { pool_unlist(i); i--; }
@@ -1378,7 +1383,14 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     //   不改的三种：整池超过单个缓冲上限（包不住）；游戏已释放、等回收的池（至多再活两次提交）；整池缓冲建不出来过（只试一次，记一条红，之后照旧建块、没有上限）
     if (!b->nofull && !b->dead && b->made + (end - lo) > (uint64_t)(b->b - b->a) / 2 && (uint64_t)(b->b - b->a) <= ((uint64_t)g_dev.maxBufferLength & ~(uint64_t)(getpagesize() - 1))) {
         uint64_t had = b->made; int w = big_new(b, b->a, b->b, b->b);
-        if (w >= 0) { b->full = w + 1; MLOG("memory pool %p+%llu MB: its chunks came to %llu MB (they overlap and each counts in full), one buffer over the whole pool from here on", b->mem, (unsigned long long)((b->hi - b->lo) >> 20), (unsigned long long)(had >> 20)); return w; }
+        if (w >= 0) {
+            // 改整池之后块与旧块不再有人查（查找都落到整池那个）：块条目按池注销同一口径到期（dead = 下下次提交，pool_reap 走延后释放），旧块同时到期（old_dead）。
+            //   已编进之前提交的命令照用它们到那时为止。原先它们活到整池释放：合计到池长 1.5 倍、一直记在 GPU 已分配里（D-3N8R iPhone 17 Pro 5 个池 4988 MB，
+            //   峰值越过建议上限 8192 MB 报内存不足安全停；整池一个缓冲的 0.5.8 峰值 7.3 GB 不报）。到期后这个池只剩整池一个缓冲，合计 = 池长
+            size_t nk = ((b->b - b->a) >> 24) + 1;
+            for (size_t q = 0; q < nk; q++) { int c = b->chunk[q] - 1; if (c >= 0 && c != w) g_pools[c].dead = g_sub_serial + 2; b->chunk[q] = 0; }
+            if (b->old.count) b->old_dead = g_sub_serial + 2;
+            b->full = w + 1; MLOG("memory pool %p+%llu MB: its chunks came to %llu MB (they overlap and each counts in full), one buffer over the whole pool from here on (the chunks and old buffers go after two more submissions)", b->mem, (unsigned long long)((b->hi - b->lo) >> 20), (unsigned long long)(had >> 20)); return w; }
         b->nofull = 1;
         MLOG("【红】 memory pool %p+%llu MB: its chunks came to %llu MB and the one buffer over the whole pool could not be made: chunks go on without a cap (GPU allocated counts each of them in full)", b->mem, (unsigned long long)((b->hi - b->lo) >> 20), (unsigned long long)(had >> 20));
     }

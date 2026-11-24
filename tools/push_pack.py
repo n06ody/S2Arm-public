@@ -625,7 +625,16 @@ def plan(dev, pack, work, full=False, say=print):
             redo = [r for r in cut_img if r not in done]
             if redo: say(f"上次传 {redo[0]} 被打断，这次重传")
             have = {r: h for r, h in have.items() if r not in redo}
-    want = [w for w in (l.split("\t") for l in (pack / "index.tsv").read_text(encoding="utf-8").splitlines()) if len(w) == 3]
+        elif cut_img and getattr(dev, "head", None):   # .applied 不空也要核镜像在机上、长度对（#2161：账上记着 game.img、机上没了，抽查不看大文件，
+            #   原先这里不核，每次推 0 个 / 只推小文件，App 解完核对缺 game.img 报 -8、不改账，循环下去）。判据同 App 解包核对（index_check_core：在且长度 = index.tsv）；
+            #   读不了长度（工具太旧）照旧信账
+            size = {w[0]: w[1] for w in (l.split("\t") for l in (pack / "index.tsv").read_text(encoding="utf-8").splitlines()) if len(w) == 3}
+            for r in cut_img:
+                got = dev.head(f"{rp(dev)}/{r}", 0)
+                if got is None or str(got[0]) == size.get(r): continue
+                say(f"已应用索引记着 {r}，机上{'没有' if got[0] < 0 else f'长度 {got[0]} 字节、应为 {size.get(r)} 字节'}：这次重传")
+                have.pop(r, None)
+    want =[w for w in (l.split("\t") for l in (pack / "index.tsv").read_text(encoding="utf-8").splitlines()) if len(w) == 3]
     acct = {**have, **pushed}
     todo = [w for w in want if acct.get(w[0]) != w[2]]
     direct = [w for w in todo if is_direct(w[0])]

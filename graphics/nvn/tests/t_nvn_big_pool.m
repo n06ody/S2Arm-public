@@ -22,6 +22,9 @@
 //   ㉒ ㉓ 一个大池的零拷贝缓冲合计有上限（子进程）：块互相重叠、加长替下的旧缓冲也活着，设备的 GPU 已分配对每个按整块长度记。再建一块就超过池长一半时改包整池一个缓冲。
 //      ㉒ 896 MB 池 56 个步长跳着各查一次（长度 1）：4 块 + 整池 = 1280 MB；㉓ 640 MB 池同一步长读 16、32 … 480 MB：块 128 + 整池 640 + 旧缓冲 192 = 960 MB。
 //      反证：去掉 big_lookup 里改整池那段 → ㉒ 56 个 5136 MB、㉓ 480 + 3360 MB，两项红
+//   ㉔ 改整池后块与旧块按两次提交到期（D-3N8R）：过两次提交（g_sub_serial += 2、pool_reap）后 ㉒ ㉓ 两个池各只剩整池一个缓冲（896 / 640 MB）、旧缓冲 0，
+//      被放掉的 4 块 + 1 块 + 3 个旧缓冲 = 8 个进延后释放队列；查找照常落到整池缓冲。到期前（刚改整池）照旧 5 个 / 2 个 + 旧缓冲（㉒ ㉓ 本身）。
+//      反证：去掉 big_lookup 里改整池时标块到期、旧块 old_dead 那两行 → ㉔ 红（5 个 1280 MB、2 个 768 MB + 192 MB，延后释放 0）
 //   反证：s2a_gpu_alloc_bytes 改回只读 currentAllocatedSize → ⑬ ⑮ 红（涨 96 / 48 MB）；nocopy_buf 的 deallocator 不减 → ⑭ ⑮ 红；hle_vk.m 改回直接建 → ⑯ 红
 //   反证：去掉 nvn_be_pool_add_body 里登记大池那段 → ① ② ③ ④ 红（整池一个缓冲）；去掉注销时把旧块缓冲算进被放掉的那两行 → ⑨ 注销后 1 条红；去掉 big_new 建块前的 dm_guest_write_prepare → ⑫ 红
 #include "../gfx/nvn/nvn_mtl.m"
@@ -67,6 +70,18 @@ static int child(int chunks) {
         //   读 112 MB 建 128 MB（合计 32 + 64 + 96 + 128 = 320，没超过一半 320，照建）；读 144 MB 要 160 MB、到 480 > 320 → 改整池。
         //   留在表里：128 MB 的块 + 整池 640 = 768 MB；旧缓冲 32 + 64 + 96 = 192 MB；合计 960 MB = 池的 1.5 倍（正好压在上限：块的取整规则一动这里就变）
         CHECK(!miss && !wrong && sum == 768*MB && olds == 192*MB && n == 2 && full,"㉓ 640 MB 池同一步长读 16、32 … 480 MB：查不到 %d、不对 %d；缓冲 %d 个合计 %llu MB + 旧缓冲 %llu MB、整池缓冲 %s（期望 2 个 768 MB + 192 MB、有；不设上限是 480 + 3360 MB）；设备总量涨 %llu MB",miss,wrong,n,(unsigned long long)(sum/MB),(unsigned long long)(olds/MB),full?"有":"无",(unsigned long long)(dd/MB));
+        // ㉔ 过两次提交：改整池时到期的块与旧块走了，只剩整池缓冲
+        pthread_mutex_lock(&g_deferred_mu); unsigned long d0 = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+        pthread_mutex_lock(&g_mu); g_sub_serial += 2; pool_reap(0, 0); pthread_mutex_unlock(&g_mu);
+        pthread_mutex_lock(&g_deferred_mu); unsigned long d1 = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+        uint64_t s1 = 0, s2 = 0, o1 = 0, o2 = 0; int n1 = 0, n2 = 0; pthread_mutex_lock(&g_mu);
+        for (int i=0;i<g_npool;i++) { if (g_pools[i].key==m) { n1++; s1 += g_pools[i].buf.length; } if (g_pools[i].key==m2) { n2++; s2 += g_pools[i].buf.length; } }
+        for (int q=0;q<g_nbig;q++) { for (id<MTLBuffer> o in g_big[q].old) { if (g_big[q].mem==m) o1 += o.length; if (g_big[q].mem==m2) o2 += o.length; } } pthread_mutex_unlock(&g_mu);
+        int hit1 = mtl_gpu_addr((uint64_t)(uintptr_t)m + 700*MB, 64, &bp, &off, &gpu) && ((__bridge id<MTLBuffer>)bp).length == P && off == 700*MB;
+        int hit2 = mtl_gpu_addr((uint64_t)(uintptr_t)m2 + 16, 64, &bp, &off, &gpu) && ((__bridge id<MTLBuffer>)bp).length == P2 && off == 16;
+        CHECK(n1 == 1 && s1 == P && o1 == 0 && n2 == 1 && s2 == P2 && o2 == 0 && d1 - d0 == 8 && hit1 && hit2,
+              "㉔ 过两次提交：896 MB 池 %d 个 %llu MB + 旧 %llu MB、640 MB 池 %d 个 %llu MB + 旧 %llu MB、进延后释放 %lu 个、查找落到整池 %d %d（期望 1 个 896 + 0、1 个 640 + 0、8、1 1；不放是 5 个 1280、2 个 768 + 192、0）",
+              n1,(unsigned long long)(s1/MB),(unsigned long long)(o1/MB),n2,(unsigned long long)(s2/MB),(unsigned long long)(o2/MB),d1 - d0,hit1,hit2);
         printf("%s t_nvn_big_pool 子进程（缓冲合计上限）：%u 项，%u 项失败\n",failures?"✗":"✓",checks,failures); return failures!=0;
     }
     if (chunks == 2) {   // ⑱ 状态表（快照 gfx_state.bin / 帧录 state.bin）存取大池：存整池一条、不存块

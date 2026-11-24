@@ -130,6 +130,7 @@ static VkPipeline dtx_pipe_get(struct nvn_gpu_cmd_s *c, const struct dtx_key *k,
 }
 
 void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
+    fr_gap(ch,"draw_texture");
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "draw_tex 在通道外"); return; }
