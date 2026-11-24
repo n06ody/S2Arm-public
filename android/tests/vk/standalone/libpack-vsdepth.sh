@@ -7,7 +7,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-synth|--negative-fetch) ;; *) exit 64 ;; esac
+case "$mode" in ''|--negative-synth|--negative-fetch|--negative-output) ;; *) exit 64 ;; esac
 out="$repo/build/vk-libpack-vsdepth"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
@@ -15,6 +15,20 @@ glslc_bin=${GLSLC:-glslc}
 for s in libpack_depth.vert libpack_support.frag; do
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
+for kind in float uint; do
+    variant=0; if [[ $kind == uint ]]; then variant=1; fi
+    "$glslc_bin" --target-env=vulkan1.1 "-DMRT_CLASS=$variant" "$repo/android/tests/vk/shaders/libpack_mrt_outputs.frag" -o "$out/shaders/mrt-$kind.spv"
+done
+python3 - "$out/shaders" <<'PYMRT'
+import base64, json, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+def stage(name, path):
+    return dict(stage=name, spirv=base64.b64encode((root/path).read_bytes()).decode())
+program=dict(contract='s2a-direct-program-content-v1',kind='graphics',c0Reads=[],supportReads=[],
+             stages=[stage('vs','libpack_depth.vert.spv'),stage('fs','mrt-uint.spv')],bindings=[])
+(root/'mrt-ordinary.json').write_text(json.dumps(dict(schema='s2a-direct-program-v1',content=program)))
+PYMRT
 inc=()
 for d in android/native/gfx_plat android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/tex \
          graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do
@@ -38,6 +52,9 @@ repo, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv
 if mode == '--negative-synth':
     path, name = repo / 'android/native/direct/libpack_vk.c', 'libpack_mutant.c'
     before, after = 'if (stages != 0x1 && stages != 0x3 && stages != 0x7) {', 'if (stages != 0x3 && stages != 0x7) {'
+elif mode == '--negative-output':
+    path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
+    before, after = 'uint32_t written = f->color_writes & e->outputs.components;', 'uint32_t written = 0;'
 else:
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
     before, after = '(!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u)', '(!ckey && stages != 0x3u && stages != 0x7u)'
@@ -53,12 +70,15 @@ cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-p
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 set +e
-timeout 120 "$binary" "$out/shaders" > "$log" 2>&1
+args=()
+if [[ $mode == --negative-output ]]; then args=(mrt-float); fi
+timeout 120 "$binary" "$out/shaders" "${args[@]}" > "$log" 2>&1
 rc=$?
 set -e
 if [ -n "$mode" ]; then
     # 撤改后必须红在断言上（不是编译 / 设备 / 校验层错）：期望的断言名对不上就不算击中
     expect='vs-only: library hit'
+    if [[ $mode == --negative-output ]]; then expect='MRT admission: compatible=0 rc=0 compiler=0'; fi
     if [ "$rc" = 0 ] || ! grep -q 'device: llvmpipe' "$log" || ! grep -q "FAIL .*: $expect" "$log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
     echo "libpack-vsdepth $mode: PASS（撤改后红在「${expect}」）"
     exit 0
@@ -68,4 +88,10 @@ if [ "$rc" != 0 ] || ! grep -q 'device: llvmpipe' "$log" || ! grep -q 'libpack v
     echo '【红】图形 LibPack 只有 vs 的深度程序回放失败或有 Vulkan 校验错误' >&2; exit 1
 fi
 echo '【绿】图形 LibPack 只有 vs 的深度程序：取库命中、深度读回 0.5、前一笔的片元绑定不带过来，validation 0 条'
-for mutant in synth fetch; do bash "$0" "--negative-$mutant"; done
+for kind in float uint; do
+    log="$out/mrt-$kind.log"
+    timeout 120 "$binary" "$out/shaders" "mrt-$kind" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
+    grep '^libpack MRT .*integer_pixels=48 failures=0$' "$log"
+done
+for mutant in synth fetch output; do bash "$0" "--negative-$mutant"; done

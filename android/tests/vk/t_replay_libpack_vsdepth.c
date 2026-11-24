@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 
 static int compile_calls;
+static int test_outputs;
 static const char *case_dir;
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target_color, target_depth; static tex_t color_tex, depth_tex; static nvn_gpu_view color_view, depth_view;
@@ -104,7 +105,13 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
 }
 // 现编不该被走到：出库命中（或出库拒后的退路）都不会有结果；调用次数就是证据。
 static int32_t compiled_result(uint64_t session, uint64_t generation, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
-    (void)session; (void)generation; (void)req; (void)emit; (void)sink; compile_calls++; return -1;
+    (void)session; (void)generation; (void)req; compile_calls++;
+    if (!test_outputs) return -1;
+    char path[1100]; size_t n=0;
+    snprintf(path,sizeof path,"%s/mrt-ordinary.json",case_dir);
+    uint8_t *data=read_file(path,&n);
+    if (!data) return -1;
+    int rc=emit(sink,(s2a_direct_bytes){data,n}); free(data); return rc;
 }
 s2a_direct_compile_fn s2a_direct_bound_compile_any(void) { return compiled_result; }
 
@@ -158,13 +165,16 @@ static void make_library(const char *tag, const uint8_t *vs_spv, size_t vs_n, co
     setenv("S2A_SHADER_REVISION_ROOT", root, 1); unsetenv("S2A_DIRECT_CACHE_DIR");
 }
 
+#include "t_libpack_mrt.inc"
+
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    test_outputs = argc == 3;
+    if (argc != 2 && !test_outputs) return 2;
     case_dir = argv[1];
     char path[1100];
     size_t vs_n = 0, fs_n = 0;
     snprintf(path, sizeof path, "%s/libpack_depth.vert.spv", argv[1]); uint8_t *vs_spv = read_file(path, &vs_n);
-    snprintf(path, sizeof path, "%s/libpack_support.frag.spv", argv[1]); uint8_t *fs_spv = read_file(path, &fs_n);
+    snprintf(path, sizeof path, "%s/%s.spv", argv[1], test_outputs ? argv[2] : "libpack_support.frag"); uint8_t *fs_spv = read_file(path, &fs_n);
     if (!vs_spv || !fs_spv) return 2;
     memset(&guest_program, 0, sizeof guest_program); guest_program.magic = MAGIC('P','R','O','G'); guest_program.serial = 100; guest_program.nstage = 2;
     memset(guest_stages, 0xff, sizeof guest_stages);
@@ -178,6 +188,16 @@ int main(int argc, char **argv) {
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
     memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "libpack-vsdepth";
     if (!open_backend()) return 1;
+    make_library("vsonly", vs_spv, vs_n, fs_spv, fs_n);
+    rp_shader_reset(); rp_state_reset();
+    p_bind_program_id bind = {&guest_program, guest_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "OP_BIND_PROGRAM accepted");
+    dpool_t tp = {0}, sp = {0}; tp.n = 7; sp.n = 9; p_set_pool t = {&tp}, sm = {&sp};
+    CHECK(rp_state_op(OP_SET_TEX_POOL, &t, sizeof t) && rp_state_op(OP_SET_SAMP_POOL, &sm, sizeof sm), "descriptor pools accepted");
+    if (test_outputs) {
+        free(vs_spv); free(fs_spv);
+        return test_mrt(!strcmp(argv[2], "mrt-uint"));
+    }
     nvn_gpu_tex ctex = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER); color_view = make_view(ctex);
     nvn_gpu_tex dtex = make_tex(4, 4, NVN_FORMAT_DEPTH32F, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED); depth_view = make_view(dtex);
     memset(&color_tex, 0, sizeof color_tex); color_tex.d.target = NVN_TEXTURE_TARGET_2D; color_tex.d.format = NVN_FORMAT_RGBA8;
@@ -187,12 +207,6 @@ int main(int argc, char **argv) {
     memset(&target_color, 0, sizeof target_color); target_color.n = 1; target_color.color[0] = &color_tex;
     memset(&target_depth, 0, sizeof target_depth); target_depth.depth = &depth_tex;
 
-    make_library("vsonly", vs_spv, vs_n, fs_spv, fs_n);
-    rp_shader_reset(); rp_state_reset();
-    p_bind_program_id bind = {&guest_program, guest_program.serial, 0x1f, 0};
-    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "OP_BIND_PROGRAM accepted");
-    dpool_t tp = {0}, sp = {0}; tp.n = 7; sp.n = 9; p_set_pool t = {&tp}, sm = {&sp};
-    CHECK(rp_state_op(OP_SET_TEX_POOL, &t, sizeof t) && rp_state_op(OP_SET_SAMP_POOL, &sm, sizeof sm), "descriptor pools accepted");
     ds_st ds = {0}; ds.dt = 1; ds.dw = 1; ds.df = 8;   // 深度测试开、写深度、ALWAYS（同后端 C76）
     p_bind_state bs = {5, {0}}; memcpy(bs.bytes, &ds, sizeof ds);
     CHECK(rp_state_op(OP_BIND_STATE, &bs, sizeof bs), "depth state accepted");

@@ -323,6 +323,7 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --fact-wide-mutants
 # 几何着色器走出包预编库的负对照（正例在上面无参那一步里单独起进程跑）：撤掉接线各一处，--gs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --lp-output
 # 计算程序出包预编库的非对齐闸负对照（#496085）：撤掉 state_ok 对 ckey 的生效，--cs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-libpack-mutants
 # 图形程序出包预编库的六条状态闸与读数（正例 --lp-gate 在上面无参那一步里单独起进程跑）：六条闸各撤一位、直方图两处累加 / 快照落位 / 并列顺序各改一处，--lp-gate 必红；

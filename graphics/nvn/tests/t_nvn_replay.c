@@ -3414,24 +3414,31 @@ static void t_fmt_filter_blend(void) {
     pass_fresh();
 }
 
-// 图形片元采样（真机出事的那条路）：库版声明二维、实绑三维 → 标坏换现编版同一笔画出去，片元绑的是这张贴图，不记「类型不符」
-static void t_draw_tex_lib_fallback(void) {
+static void t_draw_tex_lib_fallback(int target, int format, int lib_cls, int actual_cls, int fallback_missing) {
     pass_fresh(); g_resolve_rc = g_cresolve_rc = 0; g_gresolve_next = NULL; g_lib_reject_calls = 0;
     int g0 = g_gdraws; uint64_t mm0 = nvn_unimpl_count("tex", "decl_type_mismatch");
-    tex_t a = mk_tex(673, 0, NVN_FORMAT_RGBA8, 16, 16, 4, 0); a.d.target = NVN_TEXTURE_TARGET_3D;
+    tex_t a = mk_tex(673, 0, format, 16, 16, target == NVN_TEXTURE_TARGET_3D ? 4 : 1, 0); a.d.target = target;
     samp_par sp; memset(&sp, 0, sizeof sp); nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
     stream s = {0}; q_env(&s);
     g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 5;
-    g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1; g_fprog.lib_sourced = 1;                    // 库版声明二维
-    memcpy(&g_gprog2, &g_fprog, sizeof g_fprog); g_gprog2.lib_sourced = 0; g_gprog2.dtt[1][0] = NVN_TEXTURE_TARGET_3D + 1;   // 现编版声明三维
+    g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1; g_fprog.lib_sourced = 1; g_fprog.dcls[1][0] = lib_cls;
+    memcpy(&g_gprog2, &g_fprog, sizeof g_fprog); g_gprog2.lib_sourced = 0; g_gprog2.dtt[1][0] = target + 1; g_gprog2.dcls[1][0] = actual_cls;
     p_bind_handles *bh = put(&s, OP_BIND_TEX, sizeof *bh); bh->stage = 1; bh->first = 5; bh->n = 1; bh->h[0] = 7 | 3 << 20;
     q_draw(&s); end(&s);
+    if (fallback_missing) {
+        g_resolve_seq[0] = &g_fprog; g_resolve_seq[1] = NULL;
+        g_resolve_seq_i = 0; g_resolve_seq_n = 2;
+    }
     submit1(&s); fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_lib_reject_calls == 1 && g_fprog.lib_bad && g_gdraws == g0 + 1);
-    CHECK(g_nfb[1] == 1 && g_fb[1][0].u.ts.view && ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.target == NVN_TEXTURE_TARGET_3D &&
+    g_resolve_seq_n = 0;
+    const int retry = target != NVN_TEXTURE_TARGET_2D || lib_cls != actual_cls;
+    CHECK(g_lib_reject_calls == retry && g_fprog.lib_bad == retry && g_gdraws == g0 + !fallback_missing);
+    CHECK(nvn_unimpl_count("tex", "sampled_single_numeric_mismatch") == (uint64_t)(lib_cls != actual_cls));
+    CHECK(nvn_unimpl_count("draw", "sampled_numeric_fallback_failed") == (uint64_t)fallback_missing);
+    if (!fallback_missing) CHECK(g_nfb[1] == 1 && g_fb[1][0].u.ts.view && ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.target == target &&
           ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.width == 16);
     CHECK(nvn_unimpl_count("tex", "decl_type_mismatch") == mm0);
-    g_gresolve_next = NULL; g_lib_reject_calls = 0; g_fprog.lib_sourced = 0; g_fprog.lib_bad = 0; pass_fresh();
+    g_gresolve_next = NULL; g_lib_reject_calls = 0; g_fprog.lib_sourced = 0; g_fprog.lib_bad = 0; g_fprog.dcls[1][0] = 0; pass_fresh();
 }
 
 static void t_pass_clear_park_read(void) {   // 被读之前必须落地（正确性红线）：清 A 后把 A 当采样贴图用，绘制路径先落地再开通道
@@ -7969,7 +7976,13 @@ int main(int argc, char **argv) {
     t_compute_image_class();
     t_compute_image_lib_fallback();
     t_compute_tex_lib_fallback();
-    t_draw_tex_lib_fallback();
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 0, 0, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 0, 1, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8I, 1, 2, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 2, 0, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 1, 1, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH32F, 3, 3, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 0, 1, 1);
     t_graphics_image();
     t_compute_tex_from_image();
     t_drv2_table();
