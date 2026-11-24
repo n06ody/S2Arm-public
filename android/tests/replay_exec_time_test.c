@@ -106,6 +106,10 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) { (void)c
 // OP_MULTI_DRAW（main 新增的整段间接计数多绘）在 rp_draw.c：本测试不测它，给个空实现闭合链接。
 void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) { (void)c; (void)m; (void)rec; }
 void rp_debug_dump_poll(uint64_t *fence) { (void)fence; }
+void rp_res_xfer_aborted(uint64_t sub) {
+    (void)sub;
+    CHECK(0);   // 计时夹具不创建前置上传段，因而没有待撤回的贴图上传。
+}
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) { (void)addr; (void)len; if (pool_key) *pool_key = 0; return 0; }
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged) { (void)addr; (void)len; if (pool_key) *pool_key = 0; if (merged) *merged = 0; return 0; }   // 同段合并的登记入口（rp_post_gpu_write_rows 用）：本测试只测计时，不登记
 // 这个计时夹具没有池缓冲，也不会启用缓存镜像的可见性接口。
