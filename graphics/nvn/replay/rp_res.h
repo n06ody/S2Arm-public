@@ -22,8 +22,9 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
 // 其余同 rp_view_by_id_decl（elem = 0）。信息计数 rp_ubo_zero_count（换局清零）。
 nvn_gpu_view rp_view_by_ubo_handle_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out);
 // 出库程序（出包预编库，声明是出包时推的）的绑定核对：begin 之后的 rp_view_by_id_decl / rp_view_by_ubo_handle_decl 遇到
-//   「登记过、在池里、声明目标桥接不了」的贴图，不绑零贴图、不记未接，返回 NULL；end 返回 1 = 遇到过（调用方换现编版重绑）。
+//   「登记过、在池里、声明目标桥接不了」的贴图，不绑零贴图、不记未接，返回 NULL；end 返回 1；单张数值类不符返回 RP_DECL_NUMERIC_MISMATCH。调用方换现编版重绑。
 //   不另取锁：判据就是取视图时那一次。线程：[提交]
+enum { RP_DECL_NUMERIC_MISMATCH = 2 };   // 单张视图数值类不符，重取程序失败必须跳过该笔
 void rp_decl_probe_begin(void);
 int rp_decl_probe_end(void);
 // 一维 / 一维数组折成二维 / 二维数组（同 iOS nvn_mtl.m tex_desc_fit，#1810）：后端建不出目标 0 / 3，翻译后的着色器也一律按二维采样

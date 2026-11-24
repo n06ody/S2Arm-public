@@ -1079,11 +1079,20 @@ static nvn_gpu_view decl_zero(uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c) {
     return view;
 }
 
-static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out);
+static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, tex_t *t_out);
 // 出库程序的绑定核对（rp_res.h rp_decl_probe_begin）。只在提交线程读写
 static int g_decl_probe, g_decl_unbridged;
 void rp_decl_probe_begin(void) { g_decl_probe = 1; g_decl_unbridged = 0; }
 int rp_decl_probe_end(void) { const int r = g_decl_unbridged; g_decl_probe = g_decl_unbridged = 0; return r; }
+// 返回采样视图的标量类，深度面可用于普通浮点采样或深度比较。
+static int sampled_view_class(const tex_t *t, const view_t *v, int has_v, int *depth) {
+    nvn_fmt_info fi;
+    uint32_t fmt = has_v && v->set_format ? v->format : (uint32_t)t->d.format;
+    if (!nvn_fmt_info_of(fmt, &fi)) return -1;
+    int stencil = fi.stencil && (!fi.depth || sample_stencil_mode(t, v, has_v));
+    *depth = fi.depth && !stencil;
+    return stencil || fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
+}
 static _Atomic uint64_t g_empty_slot_zero;   // 空槽绑零贴图的次数（#1147；信息计数，不是未接）
 uint64_t rp_empty_slot_zero_count(void) { return atomic_load(&g_empty_slot_zero); }
 nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, tex_t *t_out) {
@@ -1091,24 +1100,20 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
     if (elem) {
         tex_t t; view_t v; int has_v;
         if (rp_tex_snap_by_id(id, &t, &v, &has_v)) {
-            nvn_fmt_info fi;
-            uint32_t fmt = has_v && v.set_format ? v.format : (uint32_t)t.d.format;
-            if (nvn_fmt_info_of(fmt, &fi)) {
-                int stencil = fi.stencil && (!fi.depth || sample_stencil_mode(&t, &v, has_v));
-                int cls = stencil || fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
-                if (cls && cls != dcls) {
-                    // 数组各元素共用一个声明的数值类型，这个元素登记的是另一类（整数贴图进了声明成浮点的数组等）：登记的视图不能交给后端。
-                    //   止血（#1803 第 4 条）：这一个元素绑声明类型的零贴图，整笔照画，不再让调用方按 texture_slot_unresolved 整笔跳过；
-                    //   仍具名记账（每个不匹配的元素一次），读数里看得见。着色器从这个元素读到的是 0，不是游戏的贴图：按实际元素数值型出变体是另一件事。
-                    //   零贴图建不出来（没有命令段等）时返回空，调用方照旧跳笔。
-                    if (t_out) memset(t_out, 0, sizeof *t_out);   // 调用方持有的快照：不是登记的那张，清零
-                    nvn_unimpl("tex", "sampled_array_numeric_mismatch", NULL);
-                    return decl_zero(dtt, dcls, c);
-                }
+            int depth = 0;
+            int cls = sampled_view_class(&t, &v, has_v, &depth);
+            if (cls > 0 && cls != dcls) {
+                // 数组各元素共用一个声明的数值类型，这个元素登记的是另一类（整数贴图进了声明成浮点的数组等）：登记的视图不能交给后端。
+                //   止血（#1803 第 4 条）：这一个元素绑声明类型的零贴图，整笔照画，不再让调用方按 texture_slot_unresolved 整笔跳过；
+                //   仍具名记账（每个不匹配的元素一次），读数里看得见。着色器从这个元素读到的是 0，不是游戏的贴图：按实际元素数值型出变体是另一件事。
+                //   零贴图建不出来（没有命令段等）时返回空，调用方照旧跳笔。
+                if (t_out) memset(t_out, 0, sizeof *t_out);   // 调用方持有的快照：不是登记的那张，清零
+                nvn_unimpl("tex", "sampled_array_numeric_mismatch", NULL);
+                return decl_zero(dtt, dcls, c);
             }
         }
     }
-    nvn_gpu_view out = view_by_id_decl(id, dtt, dcls, c, t_out);
+    nvn_gpu_view out = view_by_id_decl(id, dtt, dcls, elem, c, t_out);
     if (g_decl_probe && g_decl_unbridged) return NULL;   // 核对中且声明桥接不了：不往下补零贴图，交调用方换现编版
     // 贴图数组里取不到的元素：描述符数组每项都要有效，用声明类型的零贴图顶上（类型与声明一致，不再拿别的元素凑）
     if (!out && elem) out = decl_zero(dtt, dcls, c);
@@ -1146,7 +1151,7 @@ nvn_gpu_view rp_view_by_ubo_handle_decl(int id, uint8_t dtt, uint8_t dcls, nvn_g
     }
     return out;
 }
-static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out) {
+static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn_gpu_cmd c, tex_t *t_out) {
     if (t_out) memset(t_out, 0, sizeof *t_out);
     pthread_mutex_lock(&g_rmu);
     if (id < 0 || id >= g_ntreg || !g_treg[id].ok || (g_tpool_n && id >= g_tpool_n)) {
@@ -1156,6 +1161,15 @@ static nvn_gpu_view view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_c
     tex_t t = g_treg[id].t; view_t v = g_treg[id].v; int has_v = g_treg[id].has_v;
     if (t_out) *t_out = t;
     pthread_mutex_unlock(&g_rmu);
+    if (!elem && g_decl_probe) {
+        int depth = 0;
+        int cls = sampled_view_class(&t, &v, has_v, &depth);
+        if (cls >= 0 && (dcls == 3 ? !depth : cls != dcls)) {
+            g_decl_unbridged = RP_DECL_NUMERIC_MISMATCH;
+            nvn_unimpl("tex", "sampled_single_numeric_mismatch", NULL);
+            return NULL;
+        }
+    }
     const int want = dtt - 1, have = has_v && v.set_target ? v.target : t.d.target;   // NVN 原目标：下面的分支与日志都按原目标（一维折成二维只在 rp_decl_view_target 里比较，#1810）
     int planned = rp_decl_view_target(&t, &v, has_v, dtt);
     if (!planned) return rp_view_by_id(id, c, t_out);

@@ -8,7 +8,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-synth|--negative-fetch|--negative-clip-control) ;; *) exit 64 ;; esac
+case "$mode" in ''|--negative-synth|--negative-fetch|--negative-clip-control|--negative-output) ;; *) exit 64 ;; esac
 out="$repo/build/vk-libpack-vsdepth"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
@@ -16,6 +16,20 @@ glslc_bin=${GLSLC:-glslc}
 for s in libpack_depth.vert libpack_clip_control.vert libpack_support.frag; do
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
+for kind in float uint; do
+    variant=0; if [[ $kind == uint ]]; then variant=1; fi
+    "$glslc_bin" --target-env=vulkan1.1 "-DMRT_CLASS=$variant" "$repo/android/tests/vk/shaders/libpack_mrt_outputs.frag" -o "$out/shaders/mrt-$kind.spv"
+done
+python3 - "$out/shaders" <<'PYMRT'
+import base64, json, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+def stage(name, path):
+    return dict(stage=name, spirv=base64.b64encode((root/path).read_bytes()).decode())
+program=dict(contract='s2a-direct-program-content-v1',kind='graphics',c0Reads=[],supportReads=[],
+             stages=[stage('vs','libpack_depth.vert.spv'),stage('fs','mrt-uint.spv')],bindings=[])
+(root/'mrt-ordinary.json').write_text(json.dumps(dict(schema='s2a-direct-program-v1',content=program)))
+PYMRT
 inc=()
 for d in android/native/gfx_plat android/tests/vkhost graphics/nvn/third_party/vulkan-headers/include graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/tex \
          graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do
@@ -40,6 +54,9 @@ repo, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv
 if mode == '--negative-synth':
     path, name = repo / 'android/native/direct/libpack_vk.c', 'libpack_mutant.c'
     before, after = 'if (stages != 0x1 && stages != 0x3 && stages != 0x7) {', 'if (stages != 0x3 && stages != 0x7) {'
+elif mode == '--negative-output':
+    path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
+    before, after = 'uint32_t written = f->color_writes & e->outputs.components;', 'uint32_t written = 0;'
 elif mode == '--negative-fetch':
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
     before, after = '(!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u)', '(!ckey && stages != 0x3u && stages != 0x7u)'
@@ -53,6 +70,7 @@ PY
     case "$mode" in
         --negative-synth) src[6]="$out/libpack_mutant.c" ;;
         --negative-fetch) src[4]="$out/nvk_shader_mutant.c" ;;
+        --negative-output) src[4]="$out/nvk_shader_mutant.c"; args=(mrt-float) ;;
         --negative-clip-control) src[1]="$out/rp_draw_mutant.c"; args=(--clip-control) ;;
     esac
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
@@ -75,6 +93,7 @@ if [ -n "$mode" ]; then
         expect='clipControl pass 1 depth pixels differ'
         if ! grep -qx 'libpack clip control: failures=1' "$log"; then cat "$log"; exit 1; fi
     fi
+    if [[ $mode == --negative-output ]]; then expect='MRT admission: compatible=0 rc=0 compiler=0'; fi
     if [ "$rc" = 0 ] || ! grep -q 'device: llvmpipe' "$log" || ! grep -q "FAIL .*: $expect" "$log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
     echo '【负对照开始】'
     echo "libpack-vsdepth $mode: PASS（撤改后红在「${expect}」）"
@@ -88,4 +107,10 @@ if [ "$rc" != 0 ] || ! grep -q 'device: llvmpipe' "$log" || ! grep -q 'libpack v
 fi
 echo '【绿】图形 LibPack 只有 vs 的深度程序：取库命中、深度读回 0.5、前一笔的片元绑定不带过来，validation 0 条'
 echo '【绿】同段只切近裁模式的深度读回 1/0.25/1，只切深度夹取的对照为 1/0/1'
-for mutant in synth fetch clip-control; do bash "$0" "--negative-$mutant"; done
+for kind in float uint; do
+    log="$out/mrt-$kind.log"
+    timeout 120 "$binary" "$out/shaders" "mrt-$kind" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
+    grep '^libpack MRT .*integer_pixels=48 failures=0$' "$log"
+done
+for mutant in synth fetch clip-control output; do bash "$0" "--negative-$mutant"; done
