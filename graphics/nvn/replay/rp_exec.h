@@ -16,6 +16,7 @@ int rp_present_lower_left(void);        // 上屏翻转：被上屏窗口建时�
 uint64_t rp_frame(void);                // 前端给的当前帧号
 // 提交之外的旁路段（rp_exec.c）：调用方持提交锁、不在提交回放里。begin 失败返回 NULL（已记账）；commit 返回这一段的栅栏值，0 = 没交成（已报红）
 int rp_in_submit(void);
+nvn_gpu_rc rp_fence_wait_at(uint64_t v, uint64_t timeout, nvn_gpu_err *err, enum nvn_gpu_wait_site site);
 nvn_gpu_cmd rp_side_begin(const char *label);
 uint64_t rp_side_commit(nvn_gpu_cmd c);
 void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels 读 GPU 内容的读数（次数 / 等之前的活共纳秒 / 最长纳秒 / 读回共纳秒）
@@ -120,6 +121,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_BUF_LOG_EV, RP_PERF_BUF_LOG_WORDS, RP_PERF_BUF_LOG_REBUILD,   // 脏页追加日志（nvk_buf_dirtylog）：灌进镜像的事件数 / 求交时看的位图字数 / 日志不可用、按逐页代号重建的次数
        RP_PERF_RES_FIND_NS, RP_PERF_RES_FAST_NS, RP_PERF_RES_SLOW_NS, RP_PERF_RES_N,   // 缓冲解析三段耗时：找池与取镜像 / 快路逐页核对 / 慢路同步（开关 nvk_res_tm）
        RP_PERF_RES_LW_NS, RP_PERF_RES_LA_NS,   // 批量解析里：抢锁等待 / 持锁解析（开关 nvk_res_tm）
+       RP_PERF_LAND_CACHED_BYTES, RP_PERF_LAND_CACHED_NS, RP_PERF_LAND_UNCACHED_BYTES, RP_PERF_LAND_UNCACHED_NS,
        RP_PERF_LAND_KB, RP_PERF_LAND_N, RP_PERF_MIRROR_N,   // 落地（GPU 写回游戏内存）的千字节 / 次数；新建镜像次数
        RP_PERF_KEEP_OK, RP_PERF_KEEP_F_CMD, RP_PERF_KEEP_F_SEG, RP_PERF_KEEP_F_GEN, RP_PERF_KEEP_F_REG,   // 「整组沿用」成立次数与失败原因（命令变 / 段变 / 全局写代号变 / 贴图登记代号变）
        RP_PERF_KEEP_F_PG, RP_PERF_KEEP_F_BI, RP_PERF_KEEP_F_PIPESET, RP_PERF_KEEP_F_ITEMS,               // 继续：程序变 / base_instance 变 / 换过管线 / 逐项校验不过
@@ -191,6 +193,9 @@ int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value);
+struct gw_ev { uint64_t pool_key, id; };   // 提交里 GPU 写池的一笔登记
+void rp_buf_gpu_write_snapshot(const struct gw_ev *refs, uint32_t count, nvn_gpu_mirror_span *spans);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);

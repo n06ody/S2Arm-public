@@ -423,6 +423,9 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
     f->index_u8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT;
     f->f4444.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT;
     f->dcc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT;
+    f->eds1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+    f->eds2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
+    f->vi.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT;
     f->border.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
     f->di.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
     f->vdiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
@@ -439,6 +442,10 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
         if ((f->have_index_u8 = listed(f, "VK_EXT_index_type_uint8") || listed(f, "VK_KHR_index_type_uint8"))) LINK(chain, &f->index_u8);   // KHR 版同一结构
         if ((f->have_4444 = listed(f, "VK_EXT_4444_formats"))) LINK(chain, &f->f4444);
         if ((f->have_dcc = listed(f, "VK_EXT_depth_clip_control"))) LINK(chain, &f->dcc);
+        // 这里记录物理支持位，独立于本会话是否请求或启用扩展。
+        if ((f->have_eds1 = listed(f, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME))) LINK(chain, &f->eds1);
+        if ((f->have_eds2 = listed(f, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME))) LINK(chain, &f->eds2);
+        if ((f->have_vi = listed(f, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))) LINK(chain, &f->vi);
         if ((f->have_placed = listed(f, "VK_EXT_map_memory_placed"))) LINK(chain, &placed);
         if ((f->have_border = listed(f, "VK_EXT_custom_border_color"))) LINK(chain, &f->border);
         if ((f->have_di = listed(f, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->di);
@@ -692,6 +699,13 @@ static void emit_vulkan(struct jw *w, const struct s2a_dev_facts *f) {
         if (f->have_index_u8) B("indexTypeUint8", f->index_u8.indexTypeUint8);
         if (f->have_4444) { B("formatA4B4G4R4", f->f4444.formatA4B4G4R4); B("formatA4R4G4B4", f->f4444.formatA4R4G4B4); }
         if (f->have_dcc) B("depthClipControl", f->dcc.depthClipControl);
+        if (f->have_eds1) B("extendedDynamicState", f->eds1.extendedDynamicState == VK_TRUE);
+        if (f->have_eds2) {
+            B("extendedDynamicState2", f->eds2.extendedDynamicState2 == VK_TRUE);
+            B("extendedDynamicState2LogicOp", f->eds2.extendedDynamicState2LogicOp == VK_TRUE);
+            B("extendedDynamicState2PatchControlPoints", f->eds2.extendedDynamicState2PatchControlPoints == VK_TRUE);
+        }
+        if (f->have_vi) B("vertexInputDynamicState", f->vi.vertexInputDynamicState == VK_TRUE);
         if (f->have_placed) { B("memoryMapPlaced", f->placed_map); B("memoryMapRangePlaced", f->placed_range); B("memoryUnmapReserve", f->placed_unmap_reserve); }
         if (f->have_border) { B("customBorderColors", f->border.customBorderColors); B("customBorderColorWithoutFormat", f->border.customBorderColorWithoutFormat); }
         if (f->have_di) {

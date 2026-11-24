@@ -98,7 +98,7 @@ static void wsi_consume_acquired(struct nvn_gpu_surface_s *s) {
         VkSubmitInfo si; memset(&si, 0, sizeof si);
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[i]; si.pWaitDstStageMask = &st;
         pthread_mutex_lock(&g_submit_mu);
-        VkResult r = vkQueueSubmit(g.queue, 1, &si, f);
+        VkResult r = idle_submit(NULL, &si, f);
         pthread_mutex_unlock(&g_submit_mu);
         if (r == VK_SUCCESS) s2a_vk_wait_fences(g.d, 1, &f, 2000000000ull);
         vkDestroyFence(g.d, f, NULL);
@@ -133,13 +133,13 @@ static void wsi_destroy_swapchain(struct nvn_gpu_surface_s *s) {
 static int wsi_wait_acquire_free(uint64_t seq, uint64_t timeout_ns) {
     if (!seq) return 0;
     uint64_t deadline = add_sat(now_ns(), timeout_ns);
-    int ok = 1;
+    int ok = 1, first = 1;
     pthread_mutex_lock(&g_mu);
     while (g.wsi_done < seq && !g.device_lost && !g.stop) {
         uint64_t now = now_ns();
         if (now >= deadline) { ok = 0; break; }
         struct timespec ts; deadline_after(&ts, deadline - now);
-        pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+        idle_cond_wait(NVN_GPU_WAIT_WSI_SLOT, &ts, &first);
     }
     if (g.wsi_done < seq && (g.device_lost || g.stop)) ok = 0;
     pthread_mutex_unlock(&g_mu);
@@ -149,13 +149,13 @@ static int wsi_wait_acquire_free(uint64_t seq, uint64_t timeout_ns) {
 // 等内部段与游戏段都执行完：之后销毁交换链 / 信号量才合法。0 = 等到了。
 static int wsi_wait_drained(uint64_t timeout_ns) {
     uint64_t deadline = add_sat(now_ns(), timeout_ns);
-    int ok = 1;
+    int ok = 1, first = 1;
     pthread_mutex_lock(&g_mu);
     while (g.qhead || g.busy) {
         uint64_t now = now_ns();
         if (now >= deadline) { ok = 0; break; }
         struct timespec ts; deadline_after(&ts, deadline - now);
-        pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+        idle_cond_wait(NVN_GPU_WAIT_WSI_DRAIN, &ts, &first);
     }
     pthread_mutex_unlock(&g_mu);
     return ok ? 0 : -1;
@@ -168,6 +168,46 @@ static void wsi_close_locked(void) {   // nvn_gpu_close 在在途段清空后调
     if (s->surface) vkDestroySurfaceKHR(g.dev->instance, s->surface, NULL);
     g_surface = NULL;
     free(s);
+}
+
+struct wsi_present_mode {
+    VkPresentModeKHR mode;
+    VkResult query_result;
+    const char *reason;
+};
+
+static struct wsi_present_mode wsi_pick_present_mode(VkSurfaceKHR surface) {
+    struct wsi_present_mode pick = {VK_PRESENT_MODE_FIFO_KHR, VK_SUCCESS, "开关关闭"};
+    if (!nvn_plat_flag("nvk_present_mailbox", 0)) return pick;
+
+    uint32_t count = 0;
+    pick.reason = "呈现模式计数查询失败";
+    pick.query_result = vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, surface, &count, NULL);
+    if (pick.query_result != VK_SUCCESS) return pick;
+    if (!count) { pick.reason = "呈现模式列表为空"; return pick; }
+
+    VkPresentModeKHR *modes = calloc(count, sizeof *modes);
+    if (!modes) {
+        pick.reason = "呈现模式列表分配失败";
+        pick.query_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        return pick;
+    }
+    const uint32_t capacity = count;
+    pick.query_result = vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, surface, &count, modes);
+    pick.reason = "呈现模式列表查询失败";
+    if (count <= capacity && (pick.query_result == VK_SUCCESS || pick.query_result == VK_INCOMPLETE)) {
+        pick.reason = pick.query_result == VK_INCOMPLETE ? "呈现模式枚举不完整，MAILBOX 未证"
+                                                        : "表面未报告 MAILBOX";
+        // 不完整枚举中的已返回项仍是驱动确认的模式。FIFO 是有效表面必支持的基线。
+        for (uint32_t i = 0; i < count; i++) {
+            if (modes[i] != VK_PRESENT_MODE_MAILBOX_KHR) continue;
+            pick.mode = modes[i];
+            pick.reason = "表面支持 MAILBOX";
+            break;
+        }
+    }
+    free(modes);
+    return pick;
 }
 
 static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
@@ -184,6 +224,9 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     VkExtent2D ext;
     nvn_gpu_rc geometry = wsi_geometry(s, &caps, &ext, err);
     if (!nvn_gpu_ok(geometry)) return geometry;
+    const struct wsi_present_mode present = wsi_pick_present_mode(s->surface);
+    if (present.query_result == VK_ERROR_SURFACE_LOST_KHR)
+        return fail(err, NVN_GPU_E_REVOKED, "查询呈现模式时表面已丢失");
     uint32_t n = caps.minImageCount == UINT32_MAX ? UINT32_MAX : caps.minImageCount + 1; if (n < 3) n = 3;
     { int extra = nvn_plat_flag("nvk_swap_extra", 0); if (extra > 0 && extra <= 4 && n <= UINT32_MAX - (uint32_t)extra) n += (uint32_t)extra;   // 诊断：多要几张窗口图，看取图的等待是不是交换链反压
       if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
@@ -199,7 +242,7 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1));
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR; ci.clipped = VK_TRUE;
+    ci.presentMode = present.mode; ci.clipped = VK_TRUE;
     ci.oldSwapchain = s->swapchain;
     VkSwapchainKHR nsc = VK_NULL_HANDLE;
     VkResult r = vkCreateSwapchainKHR(g.d, &ci, NULL, &nsc);
@@ -234,6 +277,11 @@ static nvn_gpu_rc wsi_build(struct nvn_gpu_surface_s *s, nvn_gpu_err *err) {
     for (uint32_t i = 0; i < ni; i++) if (!s->rendered[i] && vkCreateSemaphore(g.d, &si, NULL, &s->rendered[i]) != VK_SUCCESS) { wsi_destroy_swapchain(s); return fail(err, NVN_GPU_E_OOM, "信号量创建失败"); }
     s->held = -1; s->outdated = 0; s->acquire_next = 0;
     s->built_transform = caps.currentTransform; s->subopt_n = 0;
+    char mode_line[160];
+    snprintf(mode_line, sizeof mode_line, "交换链呈现模式=%s，%s（VkResult=%d）",
+             present.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO",
+             present.reason, (int)present.query_result);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", mode_line);
     wsi_timing_init(&s->timing, g.d, nvn_plat_flag("display_timing", 0) == 1, g.dev->has_display_timing);
     return rc(NVN_GPU_OK);
 }
@@ -612,6 +660,8 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); } }
     }
     int ok = wsi_compose_selected(c, s, idx, st, d, &fp, encode, target, elig, &upscaled);
+    if (ok && (g.pass_diag || g.idle_bits) && c->tsq)
+        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
     // 内部段：摘出活动表，自己提交（等取图信号量、发呈现信号量），交给完成线程只做回收
     pthread_mutex_lock(&g_mu);
     { struct nvn_gpu_cmd_s **pp = &g.live; while (*pp && *pp != c) pp = &(*pp)->live_next; if (*pp) *pp = c->live_next; }
@@ -631,7 +681,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
-        r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        r = si.commandBufferCount ? idle_submit(seg, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);

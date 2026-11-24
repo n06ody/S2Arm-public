@@ -56,7 +56,9 @@ static int g_flag_split_pass = -1, g_flag_diag_load_dc, g_flag_diag_store_dc;   
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_flag_land_upload_versions;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_land_upload_versions")) return g_flag_land_upload_versions;
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "nvk_land_noresync")) return g_flag_land_noresync < 0 ? dflt : g_flag_land_noresync;
@@ -120,7 +122,17 @@ void nvn_hle_submit_lock(void) { g_rt_locks++; CHECK(g_rt_locks == g_rt_unlocks 
 void nvn_hle_submit_unlock(void) { g_rt_unlocks++; CHECK(g_rt_unlocks == g_rt_locks); }
 static uint8_t gpu_byte(uint32_t layer, uint32_t level, int yo, int xo, uint64_t y, uint64_t i) { return (uint8_t)(0x40 + layer * 17 + level * 5 + ((uint64_t)yo + y) * 3 + ((uint64_t)xo + i)); }
 static void fake_complete(uint32_t status);   // 定义在本文件后面
-static struct { nvn_gpu_done_fn fn; void *user; uint64_t signal; uint32_t nts; nvn_gpu_timestamp_result ts[64]; } g_pend[72]; static int g_npend, g_main_commits;
+enum { MIRROR_TEST_SPANS = 8, MIRROR_TEST_ATOM = 64 };
+static int g_mirror_fixture, g_mirror_busy, g_mirror_inv_fail;
+static uint64_t g_mirror_landing_fence;
+static nvn_gpu_mirror_span g_mirror_spans[MIRROR_TEST_SPANS];
+static uint32_t g_mirror_span_count;
+static struct {
+    nvn_gpu_done_fn fn; void *user; uint64_t signal;
+    uint32_t nts; nvn_gpu_timestamp_result ts[64];
+    uint32_t mirror_count; nvn_gpu_mirror_span mirror[MIRROR_TEST_SPANS];
+} g_pend[72];
+static int g_npend, g_main_commits;
 static int g_gdraws, g_ncd, g_cd[16];   // g_cd：每个主段提交时累计画了几笔（超长通道中途先交的用例看每段的笔数）   // g_pend：一次提交最多 64 个中间值 + 主段；g_main_commits：不算前置段
 static uint64_t g_fdone;
 static uint32_t g_occ_slots_decl; static int g_occ_log[32], g_nocc_log; static int g_rcond;
@@ -166,7 +178,14 @@ int nvn_gpu_arena_fill_take(uint64_t t) {
     return 0; }
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c) { fill_run_to(UINT64_MAX); c->live = 0; g_aborts++; }
 nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn done, void *user, nvn_gpu_err *err) {
-    (void)err; fill_run_to(UINT64_MAX); c->live = 0; g_commits++; g_last_signal = signal; if (!c->is_pre) { g_main_commits++; if (g_ncd < 16) g_cd[g_ncd++] = g_gdraws; } g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_pend[g_npend].nts = c->nts; memcpy(g_pend[g_npend].ts, c->ts, sizeof c->ts); g_npend++; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    (void)err; fill_run_to(UINT64_MAX); c->live = 0; g_commits++; g_last_signal = signal; if (!c->is_pre) { g_main_commits++; if (g_ncd < 16) g_cd[g_ncd++] = g_gdraws; } g_pend[g_npend].fn = done; g_pend[g_npend].user = user; g_pend[g_npend].signal = signal; g_pend[g_npend].nts = c->nts; memcpy(g_pend[g_npend].ts, c->ts, sizeof c->ts);
+    g_pend[g_npend].mirror_count = g_mirror_span_count;
+    if (g_mirror_span_count)
+        memcpy(g_pend[g_npend].mirror, g_mirror_spans, g_mirror_span_count * sizeof g_mirror_spans[0]);
+    g_mirror_span_count = 0;
+    g_npend++;
+    return (nvn_gpu_rc){NVN_GPU_OK};
+}
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)timeout_ns; (void)err; if (g_auto_done && v > g_fdone && g_npend) fake_complete(NVN_GPU_DONE_OK); return (nvn_gpu_rc){v <= g_fdone ? NVN_GPU_OK : NVN_GPU_E_TIMEOUT}; }
 // 贴图 / 视图 / 采样器 / 上传：只记账
 struct nvn_gpu_tex_s { nvn_gpu_tex_desc d; uint64_t access_id; int ord; uint32_t px[4][4]; int views, released; }; struct nvn_gpu_view_s { nvn_gpu_tex of; int has_v; int rid; view_t v; nvn_gpu_buf buf; uint64_t off, bytes; uint32_t format; }; struct nvn_gpu_samp_s { int x; };   // ord：后端贴图的递增序号；px：像素替身（4 个 mip × 4 层各一个 32 位字）；v：建视图时收到的视图记录
@@ -258,16 +277,64 @@ uint64_t nvn_dirty_now(void) { return g_dirty_now; }
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { (void)addr; (void)len; return g_dirty_written > stamp; }
 
 // 缓冲替身：记每次按 GPU 顺序的写（偏移、长度、首 8 字节）
-struct nvn_gpu_buf_s { uint64_t bytes, access_id; uint8_t *cpu; };
+struct nvn_gpu_buf_s { uint64_t bytes, access_id; uint8_t *cpu, *device; };
 static int g_buf_cpu_auto;   // 1 = 新建的缓冲各带一块自己的 CPU 可见内存（两份池镜像要分得开的用例用）
-static int g_buf_creates, g_buf_releases; static uint64_t g_buf_bytes;
+static int g_buf_creates, g_buf_releases, g_buf_last_mem; static uint64_t g_buf_bytes;
 static struct { uint64_t off, len; uint8_t head[8]; int pre; } g_bw[32]; static int g_nbw;
 #ifdef S2A_GPU_LAND_TEST
 static int g_land_capture;
 static uint8_t g_land_staged[4096], g_land_mask[4096];
 #endif
 static uint64_t g_buf_fail_bytes;   // 非 0：建这个大小的缓冲时失败（池镜像建不出来的用例用）
-nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) { (void)mem; (void)init; (void)err; g_buf_creates++; g_buf_bytes = bytes; if (g_buf_fail_bytes && bytes == g_buf_fail_bytes) { *out = NULL; return (nvn_gpu_rc){NVN_GPU_E_OOM}; } *out = calloc(1, sizeof **out); (*out)->bytes = bytes; if (g_buf_cpu_auto) (*out)->cpu = calloc(1, bytes); return (nvn_gpu_rc){NVN_GPU_OK}; }
+nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) {
+    (void)init; (void)err;
+    g_buf_last_mem = mem;
+    g_buf_creates++;
+    g_buf_bytes = bytes;
+    if (g_buf_fail_bytes && bytes == g_buf_fail_bytes) {
+        *out = NULL;
+        return (nvn_gpu_rc){NVN_GPU_E_OOM};
+    }
+    *out = calloc(1, sizeof **out);
+    (*out)->bytes = bytes;
+    if (g_buf_cpu_auto) (*out)->cpu = calloc(1, bytes);
+    if (g_mirror_fixture && mem == NVN_GPU_MEM_POOL_MIRROR) (*out)->device = calloc(1, bytes);
+    return (nvn_gpu_rc){NVN_GPU_OK};
+}
+
+int nvn_gpu_mirror_visibility_enabled(void) { return g_mirror_fixture; }
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b) {
+    return b && b->device && g_flag_land_upload_versions ? MIRROR_TEST_ATOM : 0;
+}
+static unsigned g_version_copies;
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes) {
+    const int valid = c && c->live && src != dst &&
+        nvn_gpu_mirror_version_atom(src) && nvn_gpu_mirror_version_atom(dst) &&
+        off <= src->bytes && off <= dst->bytes && bytes <= src->bytes - off && bytes <= dst->bytes - off;
+    CHECK(valid);
+    if (!valid) return;
+    // The fixture has already supplied the preceding segment's GPU bytes.
+    // Its completion callback is withheld independently, as in the Vulkan fixture.
+    memcpy(dst->device + off, src->device + off, (size_t)bytes);
+    g_version_copies++;
+}
+int nvn_gpu_mirror_state(nvn_gpu_buf b) {
+    if (!b || !b->device) return NVN_GPU_MIRROR_COHERENT;
+    return g_mirror_busy ? NVN_GPU_MIRROR_GPU_BUSY : NVN_GPU_MIRROR_CPU_IDLE;
+}
+int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes) {
+    CHECK(nvn_gpu_mirror_state(b) == NVN_GPU_MIRROR_CPU_IDLE && off <= b->bytes && bytes <= b->bytes - off);
+    if (nvn_gpu_mirror_state(b) != NVN_GPU_MIRROR_CPU_IDLE || off > b->bytes || bytes > b->bytes - off) return 0;
+    memcpy(b->device + off, b->cpu + off, bytes);
+    return 1;
+}
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
+    CHECK(c == &g_fake_cmd && g_mirror_fixture && spans && count <= MIRROR_TEST_SPANS && !g_mirror_span_count);
+    if (!spans || count > MIRROR_TEST_SPANS) return;
+    for (uint32_t i = 0; i < count; i++)
+        if (spans[i].src && spans[i].src->device) g_mirror_spans[g_mirror_span_count++] = spans[i];
+}
+
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out) { memset(out, 0, sizeof *out); (void)t; }   // 调试读回用；用例不开那个开关
 static struct { nvn_gpu_tex s, d; uint32_t sl, sy, dl, dy; NVNcopyRegion sr, dr; } g_ct[8]; static int g_nct;
 void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t slayer, const NVNcopyRegion *sr, nvn_gpu_tex dst, uint32_t dlevel, uint32_t dlayer, const NVNcopyRegion *dr) {
@@ -329,7 +396,7 @@ static uint8_t *g_buf_cpu_fake;   // 用例要「GPU 写过镜像」时把它指
 uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b) { return b && b->cpu ? b->cpu : g_buf_cpu_fake; }
 static const void *g_rel_log[64]; static int g_rel_n;   // 放过的缓冲指针（只比对、不解引用）：「放过的句柄又被录制」用例查它（用例开头清零，指针复用只在用例内比）
 static int rel_log_has(const void *p) { for (int i = 0; i < g_rel_n; i++) if (g_rel_log[i] == p) return 1; return 0; }
-void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user) { (void)retired; (void)user; g_buf_releases++; if (g_rel_n < 64) g_rel_log[g_rel_n++] = b; free(b->cpu); free(b); }
+void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user) { (void)retired; (void)user; g_buf_releases++; if (g_rel_n < 64) g_rel_log[g_rel_n++] = b; free(b->device); free(b->cpu); free(b); }
 void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes) {
     if (g_order_active) {
         if (g_order_n >= 16 || bytes > sizeof g_order_ev[0].data) g_order_overflow++;
@@ -620,8 +687,19 @@ nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nv
 static const uint64_t *g_fake_occ; static uint32_t g_fake_nocc;   // 下一次完成时交给回调的各槽样本数
 static void fake_complete(uint32_t status) {
     for (int i = 0; i < g_npend; i++) { nvn_gpu_done d = {0}; d.signal = g_pend[i].signal; d.status = status; d.why = "替身失败";
-        if (status != NVN_GPU_DONE_FAILED) { d.occlusion = g_fake_occ; d.nocclusion = g_fake_nocc; d.timestamps = g_pend[i].ts; d.ntimestamps = g_pend[i].nts; }
-        g_pend[i].fn(g_pend[i].user, &d); if (status != NVN_GPU_DONE_FAILED) g_fdone = g_pend[i].signal; }
+        if (d.status != NVN_GPU_DONE_FAILED && g_pend[i].mirror_count) {
+            if (g_mirror_inv_fail) d.status = NVN_GPU_DONE_FAILED;
+            else for (uint32_t j = 0; j < g_pend[i].mirror_count; j++) {
+                const nvn_gpu_mirror_span *span = &g_pend[i].mirror[j];
+                nvn_gpu_buf b = span->src;
+                const uint64_t lo = span->offset & ~(uint64_t)(MIRROR_TEST_ATOM - 1);
+                uint64_t hi = (span->offset + span->bytes + MIRROR_TEST_ATOM - 1) & ~(uint64_t)(MIRROR_TEST_ATOM - 1);
+                if (hi > b->bytes) hi = b->bytes;
+                memcpy(b->cpu + lo, b->device + lo, hi - lo);
+            }
+        }
+        if (d.status != NVN_GPU_DONE_FAILED) { d.occlusion = g_fake_occ; d.nocclusion = g_fake_nocc; d.timestamps = g_pend[i].ts; d.ntimestamps = g_pend[i].nts; }
+        g_pend[i].fn(g_pend[i].user, &d); if (d.status != NVN_GPU_DONE_FAILED) g_fdone = g_pend[i].signal; }
     g_npend = 0; g_fake_occ = NULL; g_fake_nocc = 0;
 }
 
@@ -2753,6 +2831,133 @@ static void put_set_rt(stream *s, const tex_t *color, const tex_t *depth) {   //
 }
 static void pass_fresh(void) { nvn_be_shutdown_session(); res_fresh(); nvn_unimpl_reset(); g_npd = g_pass_ends = g_ncr = 0; g_barrier_bits = 0; g_barrier_at = -1; g_nbar = 0; }
 
+static void t_land_cached_mirror(void) {
+    pass_fresh();
+    g_mirror_fixture = g_buf_cpu_auto = 1;
+    memset(g_pmem, 0x11, sizeof g_pmem);
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    nvn_be_sub_begin();
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_gpu_buf mirror = NULL;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &mirror, NULL));
+    CHECK(g_buf_last_mem == NVN_GPU_MEM_POOL_MIRROR && mirror && mirror->device);
+    if (!mirror || !mirror->device) goto out;
+    CHECK(mirror->device[1] == 0x11 && mirror->device[63] == 0x11);   // CPU 写已 flush 给 GPU
+
+    const uint64_t ptr = 0x1234567890abcdefull;
+    uint64_t actual = 0;
+    memcpy(g_pmem + 16, &ptr, sizeof ptr);
+    CHECK(rp_buf_read_pointer(mirror, 16, base + 16, &actual) && actual == ptr);
+
+    CHECK(rp_post_gpu_write(base + 1, 1));
+    CHECK(rp_post_gpu_write(base + 16, sizeof ptr));
+    mirror->device[1] = 0xa7;
+    memset(mirror->device + 16, 0x22, sizeof ptr);
+    CHECK(!rp_buf_read_pointer(mirror, 16, base + 16, &actual));    // 本提交 GPU 指针不可提前读
+    g_pmem[63] = 0xb8;      // 同一 64B 原子，未登记的邻字节必须保留
+    const uint64_t f = nvn_be_sub_commit();
+    CHECK(!rp_fence_done(f) && g_pmem[1] == 0x11);
+    nvn_be_sub_begin();
+    g_auto_done = 1;
+    g_mirror_landing_fence = f;
+    CHECK(rp_buf_read_pointer(mirror, 16, base + 16, &actual) && actual == 0x2222222222222222ull);
+    g_auto_done = 0;
+    g_mirror_landing_fence = 0;
+    CHECK(rp_fence_done(f) && g_pmem[1] == 0xa7 && g_pmem[63] == 0xb8);
+
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &mirror, NULL));
+    CHECK(rp_post_gpu_write(base + 1, 1));
+    mirror->device[1] = 0xc9;
+    g_mirror_inv_fail = 1;
+    const uint64_t failed = nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    // 回放层会把已失败的段视为已结束；后端成功时间线和游戏内存均不得前进。
+    CHECK(g_fdone < failed && g_pmem[1] == 0xa7);
+    goto cleanup;
+out:
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+cleanup:
+    nvn_be_pool_del(g_pmem);
+    g_mirror_fixture = g_buf_cpu_auto = g_mirror_inv_fail = 0;
+    pass_fresh();
+}
+
+static void t_land_upload_versions(int enabled, int dirtylog) {
+    pass_fresh();
+    g_flag_land_upload_versions = enabled;
+    g_mirror_fixture = g_buf_cpu_auto = 1;
+    g_flag_buf_dirtylog = dirtylog;
+    const uint64_t log_reads = g_alog_reads;
+    g_pg_gen[0] = g_dirty_now = 100;
+    g_version_copies = 0;
+    memset(g_pmem, 0x11, sizeof g_pmem);
+    nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    const uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_gpu_buf old = NULL, next = NULL, alias = NULL;
+
+    nvn_be_sub_begin();
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &old, NULL) && old && old->device);
+    CHECK(rp_post_gpu_write(base, 4));
+    memset(old->device, 0xa7, 4);
+    const uint64_t first = nvn_be_sub_commit();
+    CHECK(!rp_fence_done(first) && g_pmem[0] == 0x11);
+    CHECK(g_npend == 1 && g_pend[0].mirror_count == 1 && g_pend[0].mirror[0].src == old);
+
+    nvn_be_sub_begin();
+    nvn_gpu_buf disjoint = NULL;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, 4, &disjoint, NULL) && disjoint);
+    memset(g_pmem + 32, 0xb8, 4);
+    g_pg_gen[0] = ++g_dirty_now;
+    rp_write_note(base + 32, 4);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &next, NULL) && next);
+    // The page upload overlaps the atom still owned by the preceding segment.
+    CHECK(enabled ? next != old : next == old);
+    CHECK(disjoint == next);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, 64, &alias, NULL) && alias == next);
+    if (enabled) {
+        CHECK(g_version_copies == 1 && next->device[0] == 0xa7 && next->device[3] == 0xa7);
+        CHECK(rp_post_gpu_write(base + 1, 3));
+        memset(next->device + 1, 0xc9, 3);
+        CHECK(old->device[1] == 0xa7);
+    }
+    const uint64_t second = nvn_be_sub_commit();
+    CHECK(second > first && !rp_fence_done(first) && !rp_fence_done(second));
+    uint64_t last = second;
+    if (enabled) {
+        nvn_be_sub_begin();
+        g_mirror_busy = 1;
+        nvn_gpu_buf busy = NULL;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &busy, NULL) && busy == next);
+        g_mirror_busy = 0;
+        last = nvn_be_sub_commit();
+        CHECK(!rp_fence_done(first) && !rp_fence_done(last));
+    }
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_fence_done(last) && g_pmem[0] == 0xa7 && g_pmem[32] == 0xb8);
+    if (enabled) {
+        CHECK(g_pmem[1] == 0xc9 && g_pmem[3] == 0xc9);
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &alias, NULL) && alias == next);
+        CHECK(rp_post_gpu_write(base + 32, 4));
+        memset(next->device + 32, 0xd4, 4);
+        const uint64_t producer = nvn_be_sub_commit();
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 32, 4, &alias, NULL) && alias == old);
+        CHECK(alias && alias->device && alias->device[32] == 0xd4);
+        CHECK(!rp_fence_done(producer) && g_pmem[32] == 0xb8);
+        last = nvn_be_sub_commit();
+        fake_complete(NVN_GPU_DONE_OK);
+        CHECK(rp_fence_done(last) && g_pmem[32] == 0xd4);
+    }
+
+    nvn_be_pool_del(g_pmem);
+    CHECK((g_alog_reads != log_reads) == dirtylog);
+    g_flag_land_upload_versions = g_mirror_fixture = g_buf_cpu_auto = 0;
+    g_flag_buf_dirtylog = g_dirtylog_dflt;
+    pass_fresh();
+}
+
 static void t_pass_clear_fold(void) {   // 整屏清除不单独编码：折进通道的 load；没有绘制时提交末为它开一个只清除的通道
     pass_fresh();
     tex_t a = mk_tex(61, 0, NVN_FORMAT_RGBA8, 64, 32, 1, 0), z = mk_tex(62, 0x4000, NVN_FORMAT_DEPTH24_STENCIL8, 64, 32, 1, 0);
@@ -3414,24 +3619,31 @@ static void t_fmt_filter_blend(void) {
     pass_fresh();
 }
 
-// 图形片元采样（真机出事的那条路）：库版声明二维、实绑三维 → 标坏换现编版同一笔画出去，片元绑的是这张贴图，不记「类型不符」
-static void t_draw_tex_lib_fallback(void) {
+static void t_draw_tex_lib_fallback(int target, int format, int lib_cls, int actual_cls, int fallback_missing) {
     pass_fresh(); g_resolve_rc = g_cresolve_rc = 0; g_gresolve_next = NULL; g_lib_reject_calls = 0;
     int g0 = g_gdraws; uint64_t mm0 = nvn_unimpl_count("tex", "decl_type_mismatch");
-    tex_t a = mk_tex(673, 0, NVN_FORMAT_RGBA8, 16, 16, 4, 0); a.d.target = NVN_TEXTURE_TARGET_3D;
+    tex_t a = mk_tex(673, 0, format, 16, 16, target == NVN_TEXTURE_TARGET_3D ? 4 : 1, 0); a.d.target = target;
     samp_par sp; memset(&sp, 0, sizeof sp); nvn_be_reg_tex(7, &a, NULL); nvn_be_reg_samp(3, &sp);
     stream s = {0}; q_env(&s);
     g_fprog.nent[1] = 1; g_fprog.ent[1][0].cls = NVN_GPU_RES_TEX_SAMP; g_fprog.ent[1][0].src_kind = NVN_RB_TEX; g_fprog.ent[1][0].src_reg = 5;
-    g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1; g_fprog.lib_sourced = 1;                    // 库版声明二维
-    memcpy(&g_gprog2, &g_fprog, sizeof g_fprog); g_gprog2.lib_sourced = 0; g_gprog2.dtt[1][0] = NVN_TEXTURE_TARGET_3D + 1;   // 现编版声明三维
+    g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1; g_fprog.lib_sourced = 1; g_fprog.dcls[1][0] = lib_cls;
+    memcpy(&g_gprog2, &g_fprog, sizeof g_fprog); g_gprog2.lib_sourced = 0; g_gprog2.dtt[1][0] = target + 1; g_gprog2.dcls[1][0] = actual_cls;
     p_bind_handles *bh = put(&s, OP_BIND_TEX, sizeof *bh); bh->stage = 1; bh->first = 5; bh->n = 1; bh->h[0] = 7 | 3 << 20;
     q_draw(&s); end(&s);
+    if (fallback_missing) {
+        g_resolve_seq[0] = &g_fprog; g_resolve_seq[1] = NULL;
+        g_resolve_seq_i = 0; g_resolve_seq_n = 2;
+    }
     submit1(&s); fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_lib_reject_calls == 1 && g_fprog.lib_bad && g_gdraws == g0 + 1);
-    CHECK(g_nfb[1] == 1 && g_fb[1][0].u.ts.view && ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.target == NVN_TEXTURE_TARGET_3D &&
+    g_resolve_seq_n = 0;
+    const int retry = target != NVN_TEXTURE_TARGET_2D || lib_cls != actual_cls;
+    CHECK(g_lib_reject_calls == retry && g_fprog.lib_bad == retry && g_gdraws == g0 + !fallback_missing);
+    CHECK(nvn_unimpl_count("tex", "sampled_single_numeric_mismatch") == (uint64_t)(lib_cls != actual_cls));
+    CHECK(nvn_unimpl_count("draw", "sampled_numeric_fallback_failed") == (uint64_t)fallback_missing);
+    if (!fallback_missing) CHECK(g_nfb[1] == 1 && g_fb[1][0].u.ts.view && ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.target == target &&
           ((const struct nvn_gpu_view_s *)g_fb[1][0].u.ts.view)->of->d.d.width == 16);
     CHECK(nvn_unimpl_count("tex", "decl_type_mismatch") == mm0);
-    g_gresolve_next = NULL; g_lib_reject_calls = 0; g_fprog.lib_sourced = 0; g_fprog.lib_bad = 0; pass_fresh();
+    g_gresolve_next = NULL; g_lib_reject_calls = 0; g_fprog.lib_sourced = 0; g_fprog.lib_bad = 0; g_fprog.dcls[1][0] = 0; pass_fresh();
 }
 
 static void t_pass_clear_park_read(void) {   // 被读之前必须落地（正确性红线）：清 A 后把 A 当采样贴图用，绘制路径先落地再开通道
@@ -4820,6 +5032,7 @@ static void *pool_del_thread(void *p) {
 }
 static int g_land_copies; static uint64_t g_land_copied;   // 落地拷贝统计：次数 / 累计字节（同段合并用例核对「合并后只拷一遍」）
 void rp_test_land_copy(void *dst, const void *src, size_t len) {
+    if (g_mirror_landing_fence) CHECK(!rp_fence_done(g_mirror_landing_fence));
     g_land_copies++; g_land_copied += len;
     if (!g_land_pause) { memcpy(dst, src, len); return; }
     size_t half = len / 2; memcpy(dst, src, half);
@@ -7859,6 +8072,17 @@ static void t_graphics_cbuf_prep_before_pass(void) {
 
 
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "--land-upload-versions") || !strcmp(argv[1], "--land-upload-versions-off") ||
+                     !strcmp(argv[1], "--land-upload-versions-log"))) {
+        t_land_upload_versions(strcmp(argv[1], "--land-upload-versions-off") != 0, !strcmp(argv[1], "--land-upload-versions-log"));
+        printf("land upload versions: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail != 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--land-cached-mirror")) {
+        t_land_cached_mirror();
+        printf("land cached mirror: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail != 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) { g_dirtylog_dflt = g_flag_buf_dirtylog = 0; argc--; argv++; }   // 关那一档：整套用例走逐页退回路径
 #ifdef S2A_GPU_LAND_TEST
     if (argc > 1 && !strcmp(argv[1], "--land-noresync")) { t_land_noresync(); printf("land noresync: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
@@ -7925,6 +8149,9 @@ int main(int argc, char **argv) {
     t_buf_untracked_once();
     t_buf_mirror_fail_once();
     t_buf_multi_tail();
+    t_land_cached_mirror();
+    t_land_upload_versions(0, g_dirtylog_dflt != 0);
+    t_land_upload_versions(1, g_dirtylog_dflt != 0);
     t_buf_ops();
     t_copy_b2t();
     t_pass_shared_extent();
@@ -7969,7 +8196,13 @@ int main(int argc, char **argv) {
     t_compute_image_class();
     t_compute_image_lib_fallback();
     t_compute_tex_lib_fallback();
-    t_draw_tex_lib_fallback();
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 0, 0, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 0, 1, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8I, 1, 2, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 2, 0, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 1, 1, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH32F, 3, 3, 0);
+    t_draw_tex_lib_fallback(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8UI, 0, 1, 1);
     t_graphics_image();
     t_compute_tex_from_image();
     t_drv2_table();
