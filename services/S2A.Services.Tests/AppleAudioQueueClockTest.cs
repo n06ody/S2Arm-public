@@ -19,7 +19,7 @@ namespace S2A.Services.Tests
     // ① 判定纯函数：时钟 1000 / 交付 1000 / 容差 480 → 不算跑前；1481 / 1000 → 跑前；500 / 1000 → 不算
     // ② 开播后（在途始终有数据）：时钟 − 交付量 = −（队列手上没播的帧）在 [−96000, 0]：不越过交付量；泵 32 槽最多交 1.6 秒 = 76800 帧，加设备延迟取 2 秒为界
     //   （11-21 首跑实测 −77549：在途满 32 槽）
-    // ③ 钩子 S2A_AUDIO_TEST_STALL_AT=1（开播第 1 秒外部暂停 → 没回调兜底重启），重启后再播 1.5 秒声音：仍在 [−96000, 0]。
+    // ③ 钩子 S2A_AUDIO_TEST_STALL_AT=1（开播第 1 秒外部暂停 → 没回调先无设备播放、再试回设备重启），重启后再播 1.5 秒声音：仍在 [−96000, 0]。
     //   等法（11-22 门禁偶发红）：「再播 1.5 秒」按队列自己播完的帧数涨 72000 判，不按墙钟睡 1.5 秒——本机负载高时（门禁里各模式并行、同用一个声卡）
     //   重启后迟迟才重新开播，墙钟 1.5 秒里队列实际播得很少，读到的是调度。重启等 15 秒、再播等 15 秒为卡死上限
     //   若停队列后时间轴不归零，这时时钟 − 交付量 ≈ 重启前后已播的约 2.7 秒 − 满在途 1.6 秒 ≈ +52000 帧，判红
@@ -88,7 +88,7 @@ namespace S2A.Services.Tests
             while (sw2.ElapsedMilliseconds < 15000 && (session.GetPlayedSampleCount() < 4800 || (p2 = Past()) == long.MinValue)) Thread.Sleep(10);
             Row("② 开播后正常播", "时钟 − 交付量 在 [−96000, 0]", past == null ? "会话上没有 S2AQueuePastSubmitted" : $"{p2} 帧", p2 != long.MinValue && p2 <= 0 && p2 >= -96000);
 
-            bool healed = WaitLog("没有回调", 15000);
+            bool healed = WaitLog("没有回调", 15000) && WaitLog("试回设备", 5000);   // 11-23 起没回调先改走无设备播放（队列停着、读不到时钟），500 ms 后「试回设备」才是这次重启
             ulong q0 = session.GetPlayedSampleCount();
             var sw3 = Stopwatch.StartNew();
             while (healed && session.GetPlayedSampleCount() - q0 < 72000 && sw3.ElapsedMilliseconds < 15000) Thread.Sleep(20);

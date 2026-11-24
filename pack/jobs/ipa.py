@@ -613,8 +613,11 @@ def to_img(c, gid, root, pack_dir):
     mark = layout.ios_work(c, gid) / CONSUME_MARK
     if consume:
         mark.write_text(c.task, encoding="utf-8")   # 进程被杀、来不及走下面的清理时，下次出包靠它认出产物根已残缺（drop_half_consumed）
+    # --work 给整个出包缓存 build/（不是 build/ios）：共用解包 build/extract 也在里面，它的 romfs.std 和产物根那份是硬链接（NTFS）/ 克隆（APFS），
+    #   不删它边写边腾腾不出空间——#2164：Windows 上镜像硬链接数 2，img.py 退回从头整份拷，峰值多一整份 RomFS（25 GB），空间预检按「不另占」放行后写满盘。
+    #   build/ 下这些出包成功本来整个删（prune_build），失败 / 被杀也整个清（clear_build / drop_half_consumed），提前删不丢东西
     try:   # 走 c.run：它每秒读 S2A_PROGRESS，img.py 按已写字节报进度，出包页这一步有进度条（几十 GB 要写一两分钟）
-        c.run([os.sys.executable, "-X", "utf8", "pack/img.py", "convert", str(root), str(pack_dir), "--gid", gid.upper(), *(["--consume", "--work", str(layout.ios_work(c, gid))] if consume else [])],
+        c.run([os.sys.executable, "-X", "utf8", "pack/img.py", "convert", str(root), str(pack_dir), "--gid", gid.upper(), *(["--consume", "--work", str(layout.build_dir(c, gid))] if consume else [])],
               log, c.env(), cwd=c.engine)
     except BaseException as e:
         # 解包已删了一部分：清掉整个出包工作目录（同出包成功的收尾），重试从解包重做，不拿残缺的产物根接着出。

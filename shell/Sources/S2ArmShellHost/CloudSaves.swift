@@ -185,7 +185,7 @@ import UniformTypeIdentifiers
         let show = {
             let picker = makePicker()
             let me = CloudFolderPicker(); me.picked = picked; current = me; picker.delegate = me
-            (host ?? topController())?.present(picker, animated: true)
+            presentLogged(picker, from: host ?? topController(), who: "cloud-folder")
         }
         // 签名身份对不上（#968）：先说原因和改法，点「继续选择」照样打开选择器
         guard let appID = SigningIdentity.current, let bundle = Bundle.main.bundleIdentifier else { show(); return }
@@ -203,13 +203,46 @@ import UniformTypeIdentifiers
         picker.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         return picker
     }
+    /// 弹出并记日志，同 ios/picker_present.h（#1939）那套：弹出、弹完耗时、起始目录大小 / 文件数（#1842：iPad 上选择界面整片空白，
+    ///   这两个 Swift 选择框原先一行日志都没有）；选完 / 取消由各自的回调记「结束」
+    static func presentLogged(_ picker: UIDocumentPickerViewController, from host: UIViewController?, who: String) {
+        let t0 = Date()
+        NSLog("[s2a] 选文件界面：弹出（%@），呈现方 %@，设备 %@", who, host.map { String(describing: type(of: $0)) } ?? "无",
+              UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone")
+        guard let host else { NSLog("[s2a] 【红】选文件界面：没有可呈现的界面（%@），没弹", who); return }
+        logDirStats(picker.directoryURL, who: who)
+        host.present(picker, animated: true) {
+            NSLog("[s2a] 选文件界面：弹完（%@）%.0f ms，视图 %.0fx%.0f、在窗口里 %d", who, Date().timeIntervalSince(t0) * 1000,
+                  picker.view.bounds.width, picker.view.bounds.height, picker.view.window != nil ? 1 : 0)
+        }
+    }
+    /// 同 s2a_picker_dir_stats：后台数起始目录，最多 3 秒
+    nonisolated static func logDirStats(_ dir: URL?, who: String) {
+        guard let dir else { NSLog("[s2a] 选文件界面：起始目录（%@）没指定，系统落在「最近项目」", who); return }
+        DispatchQueue.global(qos: .utility).async {
+            let t0 = Date(); var files = 0, bytes: Int64 = 0, cut = false
+            let fm = FileManager.default
+            let top = (try? fm.contentsOfDirectory(atPath: dir.path))?.count ?? 0
+            let keys: [URLResourceKey] = [.isRegularFileKey, .totalFileAllocatedSizeKey]
+            if let e = fm.enumerator(at: dir, includingPropertiesForKeys: keys) {
+                for case let u as URL in e {
+                    if Date().timeIntervalSince(t0) > 3 { cut = true; break }
+                    guard let v = try? u.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+                    files += 1; bytes += Int64(v.totalFileAllocatedSize ?? 0)
+                }
+            }
+            NSLog("[s2a] 选文件界面：起始目录（%@）%@：顶层 %d 项，共 %d 个文件、%.0f MB（数了 %.0f ms%@）", who, dir.path, top, files,
+                  Double(bytes) / 1048576, Date().timeIntervalSince(t0) * 1000, cut ? "，超 3 秒截断、实际更多" : "")
+        }
+    }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         defer { Self.current = nil }
+        NSLog("[s2a] 选文件界面：结束（cloud-folder），选了 %d 项", urls.count)
         guard let url = urls.first else { return }
         NSLog("S2Arm 云存档：选了文件夹 %@（书签%@）", url.lastPathComponent, CloudSaves.remember(url) ? "已存" : "没存上，这次照常用")
         picked?(url)
     }
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { Self.current = nil }
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { NSLog("[s2a] 选文件界面：结束（cloud-folder），取消"); Self.current = nil }
 }
 
 /// 测试开关 S2A_TEST_PICKER=cloud（ios/app.m test_picker）：弹出和库设置「云存档 → 选择文件夹…」同一个选择器

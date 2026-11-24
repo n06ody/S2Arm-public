@@ -97,6 +97,21 @@ int main(void) {
     fake_now = at + 1; wsi_timing_poll(&t, VK_NULL_HANDLE, VK_NULL_HANDLE);
     wsi_timing_report(&t, 26000000000ull);
     CHECK(strstr(logline, "样本=10") && strstr(logline, "间隔>100ms=2；"), "two gaps strictly over 100 ms (150 / 250; 100 itself not counted)");
+    // 30 档实际显示读数：150 个间隔跨约 5 秒，只从已回收的时间戳得出。
+    wsi_timing_init(&t, VK_NULL_HANDLE, 1, 1);
+    const uint64_t start_30 = 30000000000ull;
+    t.start = start_30;
+    for (uint32_t i = 0; i <= 150; i++) {
+        const uint32_t id30 = wsi_timing_id(&t);
+        wsi_timing_submitted(&t, id30);
+        fake_now = start_30 + i * 33333333ull;
+        queue_record(VK_NULL_HANDLE, id30, fake_now);
+        wsi_timing_poll(&t, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    }
+    wsi_timing_report(&t, start_30 + 5000000000ull);
+    CHECK(strstr(logline, "帧率=30.00") && strstr(logline, "间隔中位=33.33ms") &&
+          strstr(logline, "样本=151"), "30 Hz display-timing samples report 30 fps and a 33.33 ms interval");
+    if (!nfail) printf("shown timing 30 Hz: %s\n", logline);
     printf("shown timing: failures=%u\n", nfail);
     return nfail ? 1 : 0;
 }

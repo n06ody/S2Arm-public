@@ -17,6 +17,27 @@ static inline void s2a_picker_watch(__weak UIViewController *wp, const char *who
         s2a_picker_watch(wp, who, t0, n + 1, bad);
     });
 }
+// 起始目录记大小、文件数（11-23 #1842：iPad 上选择界面整片空白、左栏连「位置」都不出，11-11 同类是起始目录太大、系统先枚举它）。
+//   后台数，最多数 3 秒（超了标「截断」，实际更多）；没给起始目录记一句（系统落在「最近项目」，要汇总整机开了文件共享的 App）
+static inline void s2a_picker_dir_stats(NSURL *dir, const char *who) {
+    if (!dir) { LOG("选文件界面：起始目录（%s）没指定，系统落在「最近项目」", who); return; }
+    const char *name = strdup(who);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent(); long long bytes = 0; long files = 0, top = 0; int cut = 0;
+        top = (long)[NSFileManager.defaultManager contentsOfDirectoryAtPath:dir.path error:nil].count;
+        NSDirectoryEnumerator *e = [NSFileManager.defaultManager enumeratorAtURL:dir includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLTotalFileAllocatedSizeKey] options:0 errorHandler:nil];
+        for (NSURL *u in e) {
+            if (CFAbsoluteTimeGetCurrent() - t0 > 3) { cut = 1; break; }
+            NSNumber *reg = nil, *size = nil;
+            [u getResourceValue:&reg forKey:NSURLIsRegularFileKey error:nil];
+            if (!reg.boolValue) continue;
+            files++; [u getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:nil]; bytes += size.longLongValue;
+        }
+        LOG("选文件界面：起始目录（%s）%s：顶层 %ld 项，共 %ld 个文件、%.0f MB（数了 %.0f ms%s）", name, dir.path.UTF8String, top, files,
+            bytes / 1048576.0, (CFAbsoluteTimeGetCurrent() - t0) * 1000, cut ? "，超 3 秒截断、实际更多" : "");
+        free((void *)name);
+    });
+}
 static inline void s2a_present_picker(UIViewController *host, UIViewController *p, const char *who) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     UIView *hv = host.view; CGSize hs = hv.bounds.size;
@@ -28,6 +49,9 @@ static inline void s2a_present_picker(UIViewController *host, UIViewController *
         who, host ? NSStringFromClass(host.class).UTF8String : "无", hs.width, hs.height, hv.window != nil, host.presentedViewController != nil,
         (long)p.modalPresentationStyle, io, UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad ? "iPad" : "iPhone");
     if (!host) { LOG("【红】选文件界面：没有可呈现的界面（%s），没弹", who); return; }
+#if !TARGET_OS_TV   // tvOS 没有 UIDocumentPickerViewController
+    if ([p isKindOfClass:UIDocumentPickerViewController.class]) s2a_picker_dir_stats(((UIDocumentPickerViewController *)p).directoryURL, who);
+#endif
     __weak UIViewController *wp = p;
     [host presentViewController:p animated:YES completion:^{
         UIViewController *q = wp; CGSize s = q.view.bounds.size;

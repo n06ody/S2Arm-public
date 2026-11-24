@@ -2546,6 +2546,7 @@ def owner_for_push(c, udid, key):
     选好自动重推。判出来不是 choose：清掉过时的 pendingChoice"""
     rec = layout.load_device(c, key)
     who, bid = s2arm_owner(c, udid, rec)
+    rec = forget_gone_shell(c, key, rec, (getattr(c, "_s2arm_apps", None) or {}).get(udid) if who is not None else None)   # 现查时已列过，不再调设备
     if who == "choose":
         cands = s2arm_candidates(c, udid, rec)
         layout.save_device(c, key, dict(rec, pendingChoice=dict(candidates=cands, at=time.time())))
@@ -3299,6 +3300,24 @@ def phone_identity_meta(c, udid, bid):
     return got if isinstance(got, dict) else None
 
 
+def forget_gone_shell(c, key, rec, apps):
+    """连着手机列出了已装的 S2Arm（apps，installed_s2arm_on 的结果）时核设备记录：这台电脑装的那份（shellId + bundleId）已不在手机上
+    （D-KBN6：玩家删了 Impactor 装的、改用 AltStore 装导出的 S2Arm.ipa）→ 去掉 shellId 写回，返回新记录；否则原样返回 rec。
+    原先记录永远停在「启动器装的、壳是旧版」：游戏库一直亮「更新 iPhone 上的 S2Arm」、两分钟一轮的自动更新一直按 Apple ID 去签，玩家换了装法也甩不掉。
+    shellId 的含义就是「手机上有这台电脑装的这一版壳」，App 不在了它就不成立；bundleId 留着（同一账号下次自装还是这个包名，覆盖前备份用）。
+    手机上恰好还剩一个 S2Arm（别的工具装的）→ 同推送时一样记 externalBundleId，没连着时总控台照记录也认得出是它（host_update.phone_overview 的回退）。
+    列不出（None）或那份还在 → 不动"""
+    own = str(rec.get("bundleId") or "").lower() if rec.get("shellId") else ""
+    if not own or apps is None or any(a["bundleId"].lower() == own for a in apps):
+        return rec
+    new = {k: v for k, v in rec.items() if k != "shellId"}
+    if len(apps) == 1:
+        new.update(externalBundleId=apps[0]["bundleId"], externalAt=time.time())
+    layout.save_device(c, key, new)
+    trace(c, f"设备记录：这台电脑装的 S2Arm（{own}）已不在手机上，去掉壳号 {rec.get('shellId')}；手机上的 S2Arm：{[a['bundleId'] for a in apps]}")  # 非玩家句
+    return new
+
+
 def external_s2arm(c, udid, rec):
     """别的工具装的那个 S2Arm 的包名（s2arm_owner 判 external）；启动器装的 / 一个都没装 / 列不出 → None（照旧走启动器那条路）"""
     who, bid = s2arm_owner(c, udid, rec)
@@ -3939,10 +3958,15 @@ def signer_kind(c, ph):
 def shell_outdated(c, rec, sid, games=None):
     """这台手机（设备记录 rec）上的 S2Arm 壳比本版旧时 → {from, to, games, stale}；不旧 / 没装过 → None。
     stale = 新壳认不得、要按新版重新出包的款（ipa.usable_kit 为 None：HOST_ABI 或直连链号变了）；游戏库里已删的款不列（组装时本来就不带）。
-    games 缺省取记录里的各款（游戏库页检测用，不连手机）；update_phone 传手机上实际有的"""
+    games 缺省取记录里的各款（游戏库页检测用，不连手机）；update_phone 传手机上实际有的。
+    玩家在总控台选用的是别的工具装的那份（chosenBundleId 不是这台电脑装的包名，D-KBN6）→ None：手机上用的不是这份壳，旧不旧与玩家无关，
+      不出「更新 iPhone 上的 S2Arm」、不自动去签（那份 App 的更新走总控台「导出 S2Arm.ipa」、用当初装它的工具重装，external_app_outdated）"""
     import ipa as packer
     games = sorted(games if games is not None else (rec.get("games") or {}))
     if not games or not rec.get("shellId") or rec.get("shellId") == sid:
+        return None
+    chosen = str(rec.get("chosenBundleId") or "").lower()
+    if chosen and chosen != str(rec.get("bundleId") or "").lower():
         return None
     names = {g["id"].upper(): g.get("name") or g["id"] for g in c.catalog()["games"]}
     games = [g for g in games if g in names]
@@ -4190,6 +4214,8 @@ def _kept_pull_on(c, ph):
     #   有要重出的款 → shellUpdate 为假、stale 列出来，留给游戏库顶栏「更新 iPhone」按钮问（11-16 启动器升级顺带更新 iPhone App）
     import ipa as packer
     st = shell_outdated(c, rec, packer.current_shell_id(c))
+    if st and forget_gone_shell(c, ph.key, rec, installed_s2arm_on(c, getattr(ph, "udid", None), rec)) is not rec:   # 记录说壳旧了：先核那份还在不在手机上（D-KBN6），不在就不是「要更新」
+        st = None
     stale = [s["gameId"] for s in (st or {}).get("stale", [])]
     shell_update = bool(st)   # 装壳不碰各款：壳旧了就能直接更新；新壳认不得的款更新后在总控台标「建议更新」、玩家推一次就好
     running = False

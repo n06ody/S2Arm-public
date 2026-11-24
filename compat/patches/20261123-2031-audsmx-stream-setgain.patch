@@ -1,0 +1,110 @@
+diff --git a/src/Ryujinx.Horizon/Sdk/Audio/Detail/AudioSystemMixer.cs b/src/Ryujinx.Horizon/Sdk/Audio/Detail/AudioSystemMixer.cs
+index f77c03804e73dfc29298a12029f229a172626f2e..a3e519e51366b1ec6c597fbdc5181636f093939a 100644
+--- a/src/Ryujinx.Horizon/Sdk/Audio/Detail/AudioSystemMixer.cs
++++ b/src/Ryujinx.Horizon/Sdk/Audio/Detail/AudioSystemMixer.cs
+@@ -47,6 +47,7 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+         bool IsAttached { get; }
+         AudioEvent DataEvent { get; set; }
+         void Open(StreamFormat format, int frameCount);
++        void SetGain(float gain, long fadeNs);
+         void Attach();
+         void Detach();
+         void Close();
+@@ -134,6 +135,9 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+         private bool _broken;
+         private Thread _pump;
+         private volatile bool _stopPump;
++        // 增益（IExternalStreamSession 4 SetGain）：线性倍数，缺省 1；渐变按墙钟线性走，搬运线程每拍推进（见 StepGainLocked）
++        private float _gainFrom = 1f, _gainTo = 1f, _gainApplied = 1f;
++        private long _gainStartNs, _gainFadeNs;
+ 
+         public ulong Buffer { get; }
+         public ulong Size { get; }
+@@ -206,6 +210,43 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+                 _chunkFrames = format.SampleRate * PumpPeriodMs / 1000;
+                 _read = 0;
+                 _queued = 0;
++                _gainApplied = GainAtLocked(PerformanceCounter.ElapsedNanoseconds);
++                _output.SetVolume(_gainApplied);
++            }
++        }
++
++        // SetGain：从此刻的增益起，fadeNs 内线性走到 gain（0 = 立即）。客户端（sysmix::SetStreamGain）已限定 0 ≤ gain ≤ 128、fade ≤ 5 秒
++        public void SetGain(float gain, long fadeNs)
++        {
++            lock (_lock)
++            {
++                long now = PerformanceCounter.ElapsedNanoseconds;
++                _gainFrom = GainAtLocked(now);
++                _gainTo = gain;
++                _gainStartNs = now;
++                _gainFadeNs = Math.Max(0, fadeNs);
++                StepGainLocked(now);
++            }
++        }
++
++        private float GainAtLocked(long now)
++        {
++            if (_gainFadeNs <= 0 || now - _gainStartNs >= _gainFadeNs)
++            {
++                return _gainTo;
++            }
++
++            return _gainFrom + (_gainTo - _gainFrom) * (float)((double)(now - _gainStartNs) / _gainFadeNs);
++        }
++
++        private void StepGainLocked(long now)
++        {
++            float gain = GainAtLocked(now);
++
++            if (_output != null && gain != _gainApplied)
++            {
++                _gainApplied = gain;
++                _output.SetVolume(gain);
+             }
+         }
+ 
+@@ -293,6 +334,7 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+                     return;
+                 }
+ 
++                StepGainLocked(PerformanceCounter.ElapsedNanoseconds);
+                 CollectReleased();
+ 
+                 uint write = _memory.Read<uint>(Buffer + ClientBlockOffset + IndexOffset);
+@@ -460,6 +502,12 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+             }
+         }
+ 
++        // 输入流的 SetGain：SDK 里只见输出流调（OutputStreamImpl::SetGain → sysmix::SetStreamGain）；输入流语义不知道，报红
++        public void SetGain(float gain, long fadeNs)
++        {
++            throw new NotImplementedException($"audsmx:u IExternalStreamSession 4（输入流）：增益 {gain}、渐变 {fadeNs} ns（只见输出流调，输入流语义不知道）");
++        }
++
+         public void Attach()
+         {
+             lock (_lock)
+@@ -777,6 +825,22 @@ namespace Ryujinx.Horizon.Sdk.Audio.Detail
+             return Result.Success;
+         }
+ 
++        // 4 SetGain：in f32 增益 @0、s64 渐变时长 ns @8（TimeSpan）；只回结果码。OutputStreamImpl::SetGain → sysmix::SetStreamGain：
++        //   客户端先拒 gain < 0、gain > 128、fade > 5 秒，再经代理 vtable +0x40 发命令 4（11-23 Switch 2 sdk 反汇编：0x26f20c 打包 w1 = 增益位、x2 = 渐变）。
++        //   返回错游戏就 Abort（D-KY7F）
++        [CmifCommand(4)]
++        public Result SetGain(float gain, long fadeNs)
++        {
++            if (!_impl.IsOpen)
++            {
++                throw new NotImplementedException($"audsmx:u IExternalStreamSession 4：流没打开就设增益 {gain}（不知道真机回哪个结果码）");
++            }
++
++            _impl.SetGain(gain, fadeNs);
++
++            return Result.Success;
++        }
++
+         // 7 AcquireStreamDataEvent：in u32 通知方式 @0、s32 @4（OutputStreamImpl::Open 传游戏给的第 2 个帧数，游戏都给「缓冲帧数 − 1~5 ms」）；回复制句柄 1 个。
+         //   方式 2 的确切触发条件不知道（可写帧数到阈值？每消费阈值帧？）。本实现：服务端每推进一次读指针就触发——是任一种真机条件的超集：
+         //   等它的游戏（时之笛音频框架线程无超时 WaitSystemEvent 后查可写帧数）只会多醒、不会少醒。输入流同样发方式 2（InputStreamImpl::Open 0x1f69c0），

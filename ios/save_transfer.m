@@ -413,7 +413,9 @@ S2A_VERTICAL_BAR_OFF
     NSString *warning = [self clearImport];
     if (warning) fprintf(stderr, "[S2A 存档] 上次的临时副本没删掉，照常继续：%s\n", warning.UTF8String);
     // #2070：其他工具的存档常是一个文件夹，文件夹也能选（服务层按存档位置的同一套规则认）
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeFolder] asCopy:YES];
+    // asCopy 必须是 NO：YES 时系统不让选文件夹（右上「打开」一直是灰的，0.6.9 iPad 报修「打不开存档文件夹」），
+    //   NO 给的是带授权的原地址，下面 didPick 里 startAccessing 后自己拷进 imports/ 临时副本，选文件也照旧
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeFolder] asCopy:NO];
     picker.directoryURL = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
     picker.allowsMultipleSelection = NO; picker.delegate = self;
     s2a_present_picker(self, picker, "save-import");

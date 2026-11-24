@@ -41,6 +41,9 @@ struct s2a_dev_facts {
     int have_4444; VkPhysicalDevice4444FormatsFeaturesEXT f4444;   // 列了 VK_EXT_4444_formats：特性结构只在这时挂链（1.3 只转正了格式，特性结构没转正）
     int have_4444_fmt;                         // 列了扩展或设备 ≥ 1.3：A4B4G4R4 格式可以查
     int have_dcc; VkPhysicalDeviceDepthClipControlFeaturesEXT dcc;
+    int have_eds1; VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds1;
+    int have_eds2; VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2;
+    int have_vi; VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vi;
     int have_placed; VkBool32 placed_map, placed_range, placed_unmap_reserve; VkDeviceSize placed_align;
     int have_border; VkPhysicalDeviceCustomBorderColorFeaturesEXT border; uint32_t border_max;
     int have_di; VkPhysicalDeviceDescriptorIndexingFeaturesEXT di;

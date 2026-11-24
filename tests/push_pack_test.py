@@ -789,6 +789,28 @@ class GameImgResume(Base):
         self.assertEqual(push.plan(self.dev, self.pk, self.w, say=self.log.append), (0, 0, 0))
         self.assertEqual((self.w / "direct_img.tsv").read_text(), "")
 
+    def applied_phone(self, img_bytes):   # 机上已应用本包（index.applied.tsv 全对、.applied 非空），game.img 换成给定内容（None = 不在）
+        (self.pk / "manifest.json").write_text('{"version": 3, "format": "img", "imgFile": "game.img", "index_sha256": "x"}')
+        sc = mock.patch.object(push, "spot_check", lambda dev, pack, work, have, say: have); sc.start(); self.addCleanup(sc.stop)   # 真包 game.img 数 GB、抽查不取（只取 < 4 MB）；这里的假镜像 64 KB 会被抽到，按真情形跳过抽查
+        dev = self.device(img_bytes)
+        dev.files.update({f"{RP}/manifest.json": '{"version": 3, "format": "img"}', f"{RP}/index.applied.tsv": (self.pk / "index.tsv").read_text(), f"{RP}/.applied": "x", f"{RP}/b": b"BB"})
+        return dev
+
+    def test_applied_ledger_image_gone_is_pushed_again(self):   # #2161：账上记着 game.img、机上没有 → 这次重传（原先 0 个文件，App 每次核对缺 game.img）
+        self.dev = self.applied_phone(None)
+        self.assertEqual(push.plan(self.dev, self.pk, self.w, say=self.log.append)[1], 1)
+        self.assertEqual((self.w / "direct_img.tsv").read_text().split("\t")[0], "game.img")
+        self.assertTrue(any("已应用索引记着 game.img，机上没有" in l for l in self.log), self.log)
+
+    def test_applied_ledger_image_short_is_pushed_again(self):
+        self.dev = self.applied_phone(self.local[:-1])
+        self.assertEqual(push.plan(self.dev, self.pk, self.w, say=self.log.append)[1], 1)
+        self.assertTrue(any(f"长度 {len(self.local) - 1} 字节、应为 {len(self.local)} 字节" in l for l in self.log), self.log)
+
+    def test_applied_ledger_image_whole_pushes_nothing(self):   # 在且长度对：照旧一个都不推
+        self.dev = self.applied_phone(self.local)
+        self.assertEqual(push.plan(self.dev, self.pk, self.w, say=self.log.append), (0, 0, 0))
+
     def test_full_write_checks_length_on_phone(self):   # 整份写完也核机上总长（11-11「传完并校验即成功」）：短一个字节不记账、说清长度
         dev = self.device()
         def short_write(src, rel): dev.big.append(rel); dev.files[rel] = Path(src).read_bytes()[:-1]

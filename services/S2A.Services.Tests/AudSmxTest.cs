@@ -117,6 +117,12 @@ namespace S2A.Services.Tests
                 Reply osr = D(Msg.Cmif(0, Bytes(2u, 2, 48000, SmxFrames, 0, 0u)), streamObj);
                 Check("audsmx IExternalStreamSession 0 OpenStream（PcmInt16 / 2 声道 / 48 kHz / 960 帧）", "结果 0x0", $"结果 0x{osr.Result:X}");
 
+                // 外部流 4 SetGain（同 OutputStreamImpl::SetGain：f32 增益 @0、s64 渐变 ns @8）：D-KY7F 生化危机 4 起局即调，回错就 Abort
+                Reply sgr = D(Msg.Cmif(4, Bytes(BitConverter.SingleToUInt32Bits(0.5f), 0u, 0L)), streamObj);
+                Check("audsmx IExternalStreamSession 4 SetGain（0.5、立即）", "结果 0x0", $"结果 0x{sgr.Result:X}");
+                Reply sgf = D(Msg.Cmif(4, Bytes(BitConverter.SingleToUInt32Bits(1f), 0u, 100_000_000L)), streamObj);
+                Check("audsmx IExternalStreamSession 4 SetGain（1.0、渐变 100 ms）", "结果 0x0", $"结果 0x{sgf.Result:X}");
+
                 // 外部流 7 AcquireStreamDataEvent（方式 2、阈值 = 缓冲 − 1 ms）
                 Reply aer = D(Msg.Cmif(7, Bytes(2u, SmxFrames - 48)), streamObj);
                 uint dataEvent = aer.Copy.Count == 1 ? aer.Copy[0] : 0;
@@ -269,6 +275,17 @@ namespace S2A.Services.Tests
             Check("audsmx 外部流样本交到宿主输出：收到帧数 / 逐帧相同 / 读指针", $"{Total}、{Total}、{Total % SmxCapacity}",
                 $"{cap.Frames}、{same}、{*(uint*)(work + 0x44)}");
 
+            // SetGain 落到宿主输出音量：立即 0.5 → 0.5；100 ms 渐变到 1.0：约 50 ms 时在 (0.5, 1) 之间，150 ms 后 = 1.0
+            stream.SetGain(0.5f, 0);
+            float g0 = cap.Volume;
+            stream.SetGain(1f, 100_000_000L);
+            Thread.Sleep(50); stream.Pump();
+            float gMid = cap.Volume;
+            Thread.Sleep(100); stream.Pump();
+            float gEnd = cap.Volume;
+            Check("audsmx SetGain 落到宿主输出音量：立即 / 渐变一半 / 渐变结束", "0.5、0.5–1 之间、1",
+                $"{g0}、{(gMid > 0.5f && gMid < 1f ? "0.5–1 之间" : gMid.ToString())}、{gEnd}");
+
             stream.Detach();
             stream.Close();
         }
@@ -312,8 +329,8 @@ namespace S2A.Services.Tests
                 }
 
                 public override bool WasBufferFullyConsumed(Ryujinx.Audio.Common.AudioBuffer buffer) => true;
-                public override void SetVolume(float volume) { }
-                public override float GetVolume() => 1f;
+                public override void SetVolume(float volume) => _drv.Volume = volume;
+                public override float GetVolume() => _drv.Volume;
                 public override ulong GetPlayedSampleCount() => _played;
                 public override void Start() { }
                 public override void Stop() { }

@@ -686,3 +686,5 @@
 20261123-0822-applet-open-stall-watch.patch
 20261123-0947-audio-ns2-input-stream.patch
 20261123-1530-audout-flush-release-ring.patch
+20261123-1339-audio-returns-never-stop.patch
+20261123-2031-audsmx-stream-setgain.patch
