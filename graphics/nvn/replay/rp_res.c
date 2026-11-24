@@ -2,7 +2,9 @@
 #include "rp_exec.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
+#define NVN_HM_HITCH_PROBE
 #include "nvn_hmap.h"
+#undef NVN_HM_HITCH_PROBE
 #include "nvn_dirty.h"
 #include "nvn_fmt_info.h"
 #include "nvn_deswizzle.h"

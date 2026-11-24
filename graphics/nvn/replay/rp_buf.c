@@ -10,7 +10,9 @@
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
+#define NVN_HM_HITCH_PROBE
 #include "nvn_hmap.h"
+#undef NVN_HM_HITCH_PROBE
 #include "nvn_fmt_info.h"
 #include "nvn_dirty.h"
 #include "nvn_mtl.h"
@@ -164,7 +166,10 @@ static void log_drop(struct mirror *m) { free(m->stale); free(m->stale_sum); m->
 static int mirror_make(struct shadow *s, int i) {
     struct mirror *m = &s->m[i];
     nvn_gpu_buf b = NULL; nvn_gpu_err err = {0};
-    if (!nvn_gpu_ok(nvn_gpu_buf_create(s->size, NVN_GPU_MEM_SHARED, NULL, &b, &err))) {
+    const uint64_t start = rp_hitch_start();
+    nvn_gpu_rc rc = nvn_gpu_buf_create(s->size, NVN_GPU_MEM_SHARED, NULL, &b, &err);
+    rp_hitch_end(RP_PERF_HITCH_MIRROR_NEW, start);
+    if (!nvn_gpu_ok(rc)) {
         // 完整原因：池大小、申请字节、单次分配上限、SSBO 范围上限、错误码、后端原文。按池大小去重（同一池每笔都会走到这里）。
         nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);
         static uint64_t said_size[8]; static int nsaid;
@@ -288,8 +293,10 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
+        const uint64_t start = rp_hitch_start();
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
         else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        rp_hitch_end(RP_PERF_HITCH_MIRROR_WRITE, start);
         a = stop;
     }
 }

@@ -62,18 +62,10 @@ static void pf_add(int i, uint64_t v) { __atomic_fetch_add(&g_pf[i], v, __ATOMIC
 
 // ---------- 逐帧分项账（长帧归因，开关 nvk_hitch_log） ----------
 // 5 秒窗口的 g_pf 混了多帧，回答不了「这一帧的 227 毫秒花在哪」。这里另起一组只在帧边界由 [上屏] 取走的计数器，
-// 累计点就是 rp_perf_add 的同一批（见 fr_slot_of：取程序 / 开通道 / 取管线 / 绑定 / 后端绘制 / 收尾）。
-// 只投影「每笔绘制的每一步已经各记一次」的那几项，不在 OP_CALL 递归 / 通道 / 收尾这些嵌套层再做汇总——
-// 子步骤的时间已经记在各自的项里，再汇总一次就是重复统计（与 W1 帧级回放耗时同一条规矩）。
-// 开关是 nvk_hitch_log（与长帧行同一个值，进程内缓存一次）：关着时每次 rp_perf_add 只多一次缓存判断，
-// 不取时刻、不分配、不写。
+// 复用 rp_perf_add 的累计点，只归入命令列表重放期间的分项。嵌套观测只显示，不能与独占命令耗时或绘制各步相加。
 static uint64_t g_fr_perf[RP_FR_N];
-static int g_fr_perf_state = -1;   // -1 = 开关还没读；0 = 关；1 = 开
-static int fr_perf_on(void) {
-    if (g_fr_perf_state < 0) g_fr_perf_state = nvn_plat_flag("nvk_hitch_log", 0) != 0;
-    return g_fr_perf_state;
-}
-int rp_fr_perf_on(void) { return fr_perf_on(); }
+static _Thread_local uint64_t *g_hitch_stages;
+int rp_fr_perf_on(void) { return rp_hitch_enabled(); }
 void rp_fr_perf_take(uint64_t out[RP_FR_N]) {
     for (int i = 0; i < RP_FR_N; i++) out[i] = __atomic_exchange_n(&g_fr_perf[i], 0, __ATOMIC_RELAXED);
 }
@@ -87,6 +79,30 @@ static int fr_slot_of(int i) {
         case RP_PERF_D_BIND: return RP_FR_BIND;   // 绑定
         case RP_PERF_D_DRAW: return RP_FR_DRAW;   // 后端绘制
         case RP_PERF_D_TAIL: return RP_FR_TAIL;   // 收尾
+        case RP_PERF_D_PREP: return RP_FR_PREP;
+        case RP_PERF_D_TEX: return RP_FR_TEX;
+        case RP_PERF_D_DYN: return RP_FR_DYN;
+        case RP_PERF_PB_VIEW: return RP_FR_PASS_VIEW;
+        case RP_PERF_PB_BAR: return RP_FR_PASS_BAR;
+        case RP_PERF_PB_BE: return RP_FR_PASS_BE;
+        case RP_PERF_RES_LOCK: return RP_FR_TEX_LOCK;
+        case RP_PERF_RES_MAKE: return RP_FR_TEX_NEW;
+        case RP_PERF_RES_SCAN: return RP_FR_TEX_SCAN;
+        case RP_PERF_RES_UP: return RP_FR_TEX_UP;
+        case RP_PERF_RES_ZERO: return RP_FR_TEX_ZERO;
+        case RP_PERF_DISP_SHADER_NS: return RP_FR_DISP_SHADER;
+        case RP_PERF_DISP_RESOLVE_NS: return RP_FR_DISP_RES;
+        case RP_PERF_DISP_FLUSH_NS: return RP_FR_DISP_FLUSH;
+        case RP_PERF_DISP_IND_NS: return RP_FR_DISP_IND;
+        case RP_PERF_DISP_BIND_NS: return RP_FR_DISP_BIND;
+        case RP_PERF_HITCH_DISP_PIPE: return RP_FR_DISP_PIPE;
+        case RP_PERF_HITCH_BIND_BE: return RP_FR_BIND_BE;
+        case RP_PERF_HITCH_ALLOC: return RP_FR_ARENA_ALLOC;
+        case RP_PERF_HITCH_COPY: return RP_FR_ARENA_COPY;
+        case RP_PERF_HITCH_FILL: return RP_FR_ARENA_FILL;
+        case RP_PERF_HITCH_MIRROR_NEW: return RP_FR_MIRROR_NEW;
+        case RP_PERF_HITCH_MIRROR_WRITE: return RP_FR_MIRROR_WRITE;
+        case RP_PERF_HITCH_HASH_GROW: return RP_FR_HASH_GROW;
         default: return -1;
     }
 }
@@ -94,9 +110,9 @@ static int fr_slot_of(int i) {
 // 这里不取时刻、不做任何汇总，只把同一个数抄进帧级槽；
 // 嵌套层（OP_CALL / 通道 / 收尾）不在这里重算——子步骤已经各记一次，再汇总就是重复统计。
 static void fr_perf_project(int i, uint64_t v) {
-    if (!fr_perf_on()) return;   // 开关关着：一次缓存判断，之后什么也不做
+    if (!rp_hitch_enabled() || !g_hitch_stages) return;
     int k = fr_slot_of(i);
-    if (k >= 0) __atomic_fetch_add(&g_fr_perf[k], v, __ATOMIC_RELAXED);
+    if (k >= 0) g_hitch_stages[k] += v;
 }
 // 逐帧帧日志的 fence 字段（nvn_vk_frame_log.c，#1501 D①）：每次同步等待 / Finish 等待记一次，口径同 RP_PERF_WAIT_N + RP_PERF_WAIT_FIN_N
 //   （含「进等待时已完成」与放行的那几次）。弱引用：宿主单测 / 鸿蒙不链帧日志。开关关着时函数里只判一次缓存标志。
@@ -620,6 +636,22 @@ static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_N
 
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
+static pthread_mutex_t g_hitch_ops_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct rp_hitch_op g_hitch_ops[RP_HITCH_OP_N];
+void rp_hitch_frame_take(uint64_t *exec_ns, uint64_t *draws, uint64_t *subs,
+                         uint64_t stages[RP_FR_N], struct rp_hitch_op out[RP_HITCH_OP_N]) {
+    pthread_mutex_lock(&g_hitch_ops_mu);
+    rp_frame_take(exec_ns, draws, subs);
+    rp_fr_perf_take(stages);
+    memcpy(out, g_hitch_ops, sizeof g_hitch_ops);
+    memset(g_hitch_ops, 0, sizeof g_hitch_ops);
+    pthread_mutex_unlock(&g_hitch_ops_mu);
+}
+static void hitch_op_note(struct rp_hitch_op *op, uint64_t ns) {
+    op->ns += ns;
+    op->count++;
+    if (ns > op->max_ns) op->max_ns = ns;
+}
 void rp_exec_dump_ops(char *b, size_t n) {
     if (!n || !b) return;
     size_t o = 0; b[0] = 0;
@@ -660,7 +692,73 @@ int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t
         (double)fr[RP_FR_BIND] / 1e6, (double)fr[RP_FR_DRAW] / 1e6, (double)fr[RP_FR_TAIL] / 1e6,
         (double)sum / 1e6, (double)exec_ns / 1e6 - (double)sum / 1e6);
 }
-// 回放一条命令列表；返回这次调用花的时间（纳秒：只有 nvk_exec_tm 打开时才有值，给父层的 OP_CALL 账扣子列表用）。
+static const char *hitch_op_name(unsigned op) {
+    return op == RP_HITCH_COUNT_FLUSH ? "count_flush" : rp_op_name(op);
+}
+// 用同一帧的独占命令账对总回放，细项是嵌套观测。取总耗时最高的六类，并单列全帧最慢的一次。
+void rp_hitch_detail_line(char *b, size_t n, uint64_t mono_ns, uint64_t exec_ns,
+                          const uint64_t fr[RP_FR_N], const struct rp_hitch_op ops[RP_HITCH_OP_N]) {
+    static const struct { int slot; const char *name; } fields[] = {
+        {RP_FR_PREP, "draw_prep"},
+        {RP_FR_TEX, "draw_tex"},
+        {RP_FR_DYN, "draw_dyn"},
+        {RP_FR_PASS_VIEW, "pass_view"},
+        {RP_FR_PASS_BAR, "pass_bar"},
+        {RP_FR_PASS_BE, "pass_be"},
+        {RP_FR_TEX_LOCK, "tex_lock"},
+        {RP_FR_TEX_NEW, "tex_new"},
+        {RP_FR_TEX_SCAN, "tex_scan"},
+        {RP_FR_TEX_UP, "tex_up"},
+        {RP_FR_TEX_ZERO, "tex_zero"},
+        {RP_FR_DISP_SHADER, "cs_shader"},
+        {RP_FR_DISP_RES, "cs_res"},
+        {RP_FR_DISP_FLUSH, "cs_flush"},
+        {RP_FR_DISP_IND, "cs_ind"},
+        {RP_FR_DISP_PIPE, "cs_pipe"},
+        {RP_FR_DISP_BIND, "cs_bind_and_dispatch"},
+        {RP_FR_BIND_BE, "bind_enqueue"},
+        {RP_FR_ARENA_ALLOC, "arena_alloc"},
+        {RP_FR_ARENA_COPY, "arena_copy"},
+        {RP_FR_ARENA_FILL, "arena_fill_call"},
+        {RP_FR_MIRROR_NEW, "mirror_new"},
+        {RP_FR_MIRROR_WRITE, "mirror_write"},
+        {RP_FR_HASH_GROW, "hash_grow"},
+    };
+    uint64_t total = 0, shown = 0;
+    unsigned peak = 0;
+    _Static_assert(RP_HITCH_OP_N <= 64, "hitch command mask too small");
+    for (unsigned i = 0; i < RP_HITCH_OP_N; i++) {
+        total += ops[i].ns;
+        if (ops[i].max_ns > ops[peak].max_ns) peak = i;
+    }
+    int used = snprintf(b, n,
+        "S2A_HITCH_REPLAY v=1 mono_ns=%llu exec_ms=%.3f ops_ms=%.3f loop_ms=%.3f peak=%s/%.3f",
+        (unsigned long long)mono_ns, exec_ns / 1e6, total / 1e6,
+        ((double)exec_ns - (double)total) / 1e6, total ? hitch_op_name(peak) : "none", ops[peak].max_ns / 1e6);
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0] && used >= 0 && (size_t)used < n; i++) {
+        int len = snprintf(b + used, n - (size_t)used, " %s_ms=%.3f", fields[i].name, fr[fields[i].slot] / 1e6);
+        if (len < 0) return;
+        used += len;
+    }
+    if (used < 0 || (size_t)used >= n) return;
+    int len = snprintf(b + used, n - (size_t)used, " top(total_ms/count/max_ms)=");
+    if (len < 0) return;
+    used += len;
+    for (unsigned rank = 0; rank < 6 && (size_t)used < n; rank++) {
+        int best = -1;
+        for (unsigned i = 0; i < RP_HITCH_OP_N; i++) {
+            if (!(shown & (1ull << i)) && ops[i].ns && (best < 0 || ops[i].ns > ops[best].ns)) best = (int)i;
+        }
+        if (best < 0) break;
+        shown |= 1ull << best;
+        const struct rp_hitch_op *op = &ops[best];
+        len = snprintf(b + used, n - (size_t)used, "%s%s/%.3f/%llu/%.3f", rank ? "," : "",
+                       hitch_op_name((unsigned)best), op->ns / 1e6, (unsigned long long)op->count, op->max_ns / 1e6);
+        if (len < 0) return;
+        used += len;
+    }
+}
+// 回放一条命令列表；命令计时时返回整份列表的耗时，给 OP_CALL 的父层扣掉子列表时间。
 // 语义：帧级回放耗时（长帧日志的「回放 xx 毫秒」）只在最外层（g_ret_n == 0，即 nvn_be_submit 直接调进来的那一次）
 //   取一次时刻、在唯一出口（下面 out:）累加一次：OP_END 与坏记录（rec_bad）都走同一个出口，不会每层各加一次
 //   （N 层放大 N 倍），也不会像修前 rec_bad 那条路漏计。里层的 OP_CALL 子列表不动帧级账——它的时间已经包括在
@@ -677,6 +775,15 @@ static void count_flush(struct rp_count_group *g, int tm) {
     rp_draw_count_batch(g_cmd, g->indexed ? NULL : &g->dr, g->indexed ? &g->di : NULL, g->rec, g->n, g->stride);
     if (tm) pf_add(RP_PERF_EXEC_DRAW_NS, now_ns() - t);
     g->n = 0;
+}
+static void count_flush_between_ops(struct rp_count_group *g, int tm, struct rp_hitch_op *ops) {
+    if (!g->n) return;
+    if (!ops) { count_flush(g, tm); return; }
+    const uint64_t start = now_ns();
+    count_flush(g, 0);
+    const uint64_t elapsed = now_ns() - start;
+    hitch_op_note(&ops[RP_HITCH_COUNT_FLUSH], elapsed);
+    if (tm) pf_add(RP_PERF_EXEC_DRAW_NS, elapsed);
 }
 static void count_feed(struct rp_count_group *g, const p_draw *dr, const p_draw_idx *di, const void *rec, int tm) {
     (void)tm;
@@ -700,7 +807,7 @@ static void count_feed(struct rp_count_group *g, const p_draw *dr, const p_draw_
 #ifdef S2A_RP_EXEC_TEST_COUNT_EXIT
 void s2a_rp_test_count_exit(uint32_t pending);
 #endif
-static uint64_t exec_list(const uint8_t *p) {
+static uint64_t exec_list_inner(const uint8_t *p, struct rp_hitch_op *ops) {
     static int inited; if (!inited) { inited = 1; rp_state_reset(); }
     struct rp_count_group count_group = {0};
     if (!p) {
@@ -715,14 +822,16 @@ static uint64_t exec_list(const uint8_t *p) {
     if (tm < 0) tm = nvn_plat_flag("nvk_exec_tm", 0) != 0;
     const int outer = g_ret_n == 0;   // 最外层：帧级账只在这里记
     // 最外层为帧级账取时刻；里层只在逐命令计时打开时取，用来自报本层耗时（父层 OP_CALL 要扣掉子列表）。
-    const int timed = outer || tm;
+    const int cmd_timed = tm || ops;
+    const int timed = outer || cmd_timed;
     const uint64_t t0 = timed ? now_ns() : 0;
     for (;;) {
         nvn_plat_safepoint();   // 一次提交可连续回放数秒：让平台的停世界事务在命令之间越过本线程（nvn_plat.h）
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (rec_bad(h)) { count_flush(&count_group, tm); nvn_unimpl("rec", "bad_record", p); break; }   // 按这条列表的 END 处理：走下面唯一的出口
-        if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush(&count_group, tm);
-        uint64_t t_cmd = tm ? now_ns() : 0;
+        if (rec_bad(h)) { count_flush_between_ops(&count_group, tm, ops); nvn_unimpl("rec", "bad_record", p); break; }
+        if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush_between_ops(&count_group, tm, ops);
+        uint64_t t_cmd = cmd_timed ? now_ns() : 0;
+        uint64_t child_ns = 0;
         const void *a = p + 8;
         switch (h.op) {
             case OP_END: goto out;   // 唯一出口：帧级账在那边按「是否最外层」累加一次
@@ -735,12 +844,10 @@ static uint64_t exec_list(const uint8_t *p) {
                     if (ck < 0) { static unsigned n; if (n++ < 8) { char m[200]; snprintf(m, sizeof m, "command-list call into reused host blocks: target %#llx is no recording's handle, call skipped (depth %d)", (unsigned long long)t, g_ret_n);
                         nvn_plat_log(NVN_PLAT_LOG_RED, "replay", m); } break; }
                 }
-                g_ret_n++; uint64_t sub = exec_list((const uint8_t *)(uintptr_t)t); g_ret_n--;
+                g_ret_n++; child_ns = exec_list_inner((const uint8_t *)(uintptr_t)t, ops); g_ret_n--;
                 // 逐命令账：OP_CALL 只记这个记录自身的递归开销（取参数、压 / 弹一层），子列表里每条命令已经在子层各自记过；
                 // 记整段会把同一批命令算两遍（与帧级账那条是同一个毛病的两半）。t_cmd 在子列表开始前取、now 在它返回后取，
                 // 单调钟下 now - t_cmd 一定大于 sub，不会回绕。
-                if (tm) { uint64_t dns = now_ns() - t_cmd - sub;
-                    pf_add(RP_PERF_EXEC_OTHER_NS, dns); if (h.op < 64) __atomic_fetch_add(&g_op_ns[h.op], dns, __ATOMIC_RELAXED); }
                 break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
                 if (m & NVN_EV_WAIT) nvn_unimpl("op", "OP_SIGNAL_EVENT+WAIT", p);   // GPU 侧等事件：跨队列顺序接上时做
@@ -792,11 +899,14 @@ static uint64_t exec_list(const uint8_t *p) {
                 if (!rp_state_op(h.op, a, h.size)) nvn_unimpl("op", rp_op_name(h.op), p);
                 break;
         }
-        if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) __atomic_fetch_add(&g_fr_draws, 1, __ATOMIC_RELAXED);   // 帧级账：这一帧画了多少笔
-        // OP_CALL 不在这里记：它只记递归自身的开销（见上面的 case），子列表各自记过
-        if (tm && h.op != OP_CALL) {
-            uint64_t dns = now_ns() - t_cmd;
-            if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) pf_add(RP_PERF_EXEC_DRAW_NS, dns); else { pf_add(RP_PERF_EXEC_OTHER_NS, dns); if (h.op < 64) __atomic_fetch_add(&g_op_ns[h.op], dns, __ATOMIC_RELAXED); }
+        if (!ops && (h.op == OP_DRAW || h.op == OP_DRAW_IDX)) __atomic_fetch_add(&g_fr_draws, 1, __ATOMIC_RELAXED);
+        if (cmd_timed) {
+            const uint64_t dns = now_ns() - t_cmd - child_ns;
+            if (ops) hitch_op_note(&ops[h.op], dns);
+            if (tm) {
+                if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) pf_add(RP_PERF_EXEC_DRAW_NS, dns);
+                else { pf_add(RP_PERF_EXEC_OTHER_NS, dns); if (h.op < 64) __atomic_fetch_add(&g_op_ns[h.op], dns, __ATOMIC_RELAXED); }
+            }
         }
         p += h.size;
     }
@@ -808,9 +918,31 @@ out:
     {
         const uint64_t t1 = timed ? now_ns() : 0;
         // 帧级账只由最外层累加一次：里层的时间已经包括在外层的墙钟里，再记一层就是重复统计。
-        if (outer) __atomic_fetch_add(&g_fr_exec_ns, t1 - t0, __ATOMIC_RELAXED);
-        return tm ? t1 - t0 : 0;   // 子列表耗时交给父层的 OP_CALL 账
+        if (outer && !ops) __atomic_fetch_add(&g_fr_exec_ns, t1 - t0, __ATOMIC_RELAXED);
+        return cmd_timed ? t1 - t0 : 0;   // 子列表耗时交给父层的 OP_CALL 账
     }
+}
+
+static uint64_t exec_list(const uint8_t *p) {
+    if (!p || !rp_fr_perf_on()) return exec_list_inner(p, NULL);
+    // 同一份列表的嵌套命令在栈上累计。交接只在整份列表完成后加锁，避免上屏线程同时读到半份命令统计。
+    struct rp_hitch_op ops[RP_HITCH_OP_N] = {0};
+    uint64_t stages[RP_FR_N] = {0};
+    g_hitch_stages = stages;
+    const uint64_t elapsed = exec_list_inner(p, ops);
+    g_hitch_stages = NULL;
+    pthread_mutex_lock(&g_hitch_ops_mu);
+    __atomic_fetch_add(&g_fr_exec_ns, elapsed, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_fr_draws, ops[OP_DRAW].count + ops[OP_DRAW_IDX].count, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < RP_FR_N; i++) if (stages[i]) __atomic_fetch_add(&g_fr_perf[i], stages[i], __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < RP_HITCH_OP_N; i++) {
+        if (!ops[i].count) continue;
+        g_hitch_ops[i].ns += ops[i].ns;
+        g_hitch_ops[i].count += ops[i].count;
+        if (ops[i].max_ns > g_hitch_ops[i].max_ns) g_hitch_ops[i].max_ns = ops[i].max_ns;
+    }
+    pthread_mutex_unlock(&g_hitch_ops_mu);
+    return elapsed;
 }
 
 // 前端（hle_nvn.c → nvn_be_submit）的唯一入口：每次提交的每条命令列表调一次，g_ret_n 为 0，也就是「最外层」。
