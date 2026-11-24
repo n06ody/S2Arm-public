@@ -42,7 +42,6 @@ const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] 
 struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_result values[NVN_GPU_TIMESTAMP_SLOTS]; };
 struct post { volatile uint32_t *val; uint32_t mode, v; uint64_t report; uint32_t type; struct ts_segment *ts; uint32_t slot; };   // 完成后写事件值（mode 0 写 / 1 加）；report 非 0 = 计数器报告的写回地址
 struct occ_ev { uint32_t pos; uint32_t report; uint64_t addr; };   // 遮挡计数的事件：发生时本段已经开过 pos 个槽；report 0 = 复位、1 = 报告（写回 addr）
-struct gw_ev { uint64_t pool_key, id; };   // 本段里 GPU 写进池的一段（rp_buf_gpu_write_note 的登记）
 struct sub { struct ts_segment *ts_head, *ts_current; uint32_t refs; /* 录制者/末段回调持一引用，每个 mid 回调另持一引用。 */
              struct post *p; int n, cap, nfx; /* nfx：p 里时间戳报告以外的条数 */ uint64_t t_commit; struct occ_ev *oe; int noe, oecap; uint64_t fence; struct gw_ev *gw; int ngw, gwcap;
     uint64_t *oc; uint32_t noc, occ_base; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
@@ -169,6 +168,36 @@ static void ts_capture(struct ts_segment *t, const nvn_gpu_done *d) {
 }
 static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
     while (t) { struct ts_segment *next = t->next; free(t); t = next; }
+}
+
+int nvn_gpu_mirror_visibility_enabled(void) __attribute__((weak));
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_visibility_enabled
+// 弱链接[replay]：nvn_gpu_mirror_visibility_record
+
+static int compare_write_ref(const void *a, const void *b) {
+    const struct gw_ev *x = a, *y = b;
+    if (x->pool_key != y->pool_key) return x->pool_key < y->pool_key ? -1 : 1;
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static void sub_record_mirrors(const struct sub *s, nvn_gpu_cmd c) {
+    if (!s || !s->ngw || !nvn_gpu_mirror_visibility_record ||
+        !nvn_gpu_mirror_visibility_enabled || !nvn_gpu_mirror_visibility_enabled()) return;
+    const uint32_t count = (uint32_t)s->ngw;
+    struct gw_ev local_refs[16];
+    nvn_gpu_mirror_span local_spans[16] = {0};
+    struct gw_ev *refs = count <= 16 ? local_refs : malloc((size_t)count * sizeof *refs);
+    nvn_gpu_mirror_span *spans = count <= 16 ? local_spans : calloc(count, sizeof *spans);
+    if (refs && spans) {
+        // 完成回调按原顺序发布，排序只作用于快照用的副本。
+        memcpy(refs, s->gw, count * sizeof *refs);
+        qsort(refs, count, sizeof *refs, compare_write_ref);
+        rp_buf_gpu_write_snapshot(refs, count, spans);
+    }
+    nvn_gpu_mirror_visibility_record(c, refs ? spans : NULL, count);
+    if (spans != local_spans) free(spans);
+    if (refs != local_refs) free(refs);
 }
 
 static void sub_release(struct sub *s);
@@ -435,6 +464,7 @@ static uint64_t sub_commit_body(void) {
     if (s && (s->nfx || s->noe || s->ngw)) g_effect_fence = f;   // 这次提交做完时有东西要写回游戏内存（事件、时间戳以外的计数器报告、遮挡结果、GPU 写的缓冲）
     if (s && (s->n || s->noe || s->ngw)) { pf_add(RP_PERF_FX_SUBS, 1); pf_add(RP_PERF_FX_OCC, (uint64_t)s->noe); pf_add(RP_PERF_FX_GW, (uint64_t)s->ngw); }   // 这次提交做完时有东西要写回游戏内存（事件、计数器报告、遮挡结果、GPU 写的缓冲）
     rc_commit(f);
+    sub_record_mirrors(s, c);
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, sub_done, s, &err))) red("提交失败：%s", err.why);
     pf_add(RP_PERF_COMMIT_NS, now_ns() - t0); pf_add(RP_PERF_SUBS, 1);
     g_fence = f;
