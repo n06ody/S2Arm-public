@@ -81,12 +81,15 @@ static void deswizzle_close(void);
 enum { STAT_BUFS = 0, STAT_SUBMITS, STAT_DONE_OK, STAT_DONE_FAILED, STAT_RETIRED, STAT_WRITES, STAT_FILLS, STAT_COPIES,
        STAT_MIRROR_FLUSH_N, STAT_MIRROR_FLUSH_PAYLOAD, STAT_MIRROR_FLUSH_BYTES, STAT_MIRROR_FLUSH_NS,
        STAT_MIRROR_INV_N, STAT_MIRROR_INV_PAYLOAD, STAT_MIRROR_INV_BYTES, STAT_MIRROR_INV_NS,
-       STAT_MIRROR_WAIT_N, STAT_MIRROR_WAIT_NS, STAT_N };
+       STAT_MIRROR_WAIT_N, STAT_MIRROR_WAIT_NS, STAT_MIRROR_WAIT_LAST_SEGMENT,
+       STAT_MIRROR_WAIT_UPLOAD, STAT_MIRROR_WAIT_TRANSFER, STAT_MIRROR_WAIT_STORAGE, STAT_MIRROR_WAIT_INDIRECT,
+       STAT_N };
 static const char *const stat_names[STAT_N] = {
     "bufs_created", "submits", "segments_done", "segments_failed", "bufs_retired", "buf_writes", "buf_fills", "buf_copies",
     "mirror_flush_calls", "mirror_flush_payload", "mirror_flush_bytes", "mirror_flush_ns",
     "mirror_invalidate_calls", "mirror_invalidate_payload", "mirror_invalidate_bytes", "mirror_invalidate_ns",
-    "mirror_wait_calls", "mirror_wait_ns",
+    "mirror_wait_calls", "mirror_wait_ns", "mirror_wait_last_segment",
+    "mirror_wait_upload_calls", "mirror_wait_transfer_calls", "mirror_wait_storage_calls", "mirror_wait_indirect_calls",
 };
 
 struct nvn_gpu_buf_s {
@@ -99,7 +102,8 @@ struct nvn_gpu_buf_s {
     int mem_kind;
     VkMemoryPropertyFlags memory_flags;
     VkDeviceSize allocation_bytes;   // 专用分配：绑定在 0，映射覆盖整个 allocation
-    uint64_t mirror_use_fence, mirror_land_fence;   // g_mu 下维护。land 包含 invalidate 和回写回调。
+    uint64_t mirror_use_fence;   // g_mu：CPU 直写仍需等此镜像的所有 GPU 访问。
+    struct vk_mirror_range *mirror_land;   // g_mu：尚未归还给 GPU 的回写范围列表。
     int released;
     int refs;
     nvn_gpu_retired_fn retired;
@@ -108,7 +112,25 @@ struct nvn_gpu_buf_s {
     struct nvn_gpu_buf_s *retire_next;   // 退休队列就地链接，队列本身不再分配
 };
 
-struct vk_mirror_range { nvn_gpu_buf buf; VkMappedMemoryRange range; };
+struct vk_mirror_range {
+    nvn_gpu_buf buf;
+    VkMappedMemoryRange range;
+    uint64_t signal;
+    struct vk_mirror_range *next, **link;
+};
+
+// 取值就是等回写时归账的统计项。
+enum mirror_write_kind {
+    MIRROR_UPLOAD = STAT_MIRROR_WAIT_UPLOAD,
+    MIRROR_TRANSFER = STAT_MIRROR_WAIT_TRANSFER,
+    MIRROR_STORAGE = STAT_MIRROR_WAIT_STORAGE,
+    MIRROR_INDIRECT = STAT_MIRROR_WAIT_INDIRECT,
+};
+struct vk_mirror_write {
+    nvn_gpu_buf buf;
+    VkDeviceSize lo, hi;   // [lo, hi)，按非一致原子对齐。
+    enum mirror_write_kind kind;
+};
 
 struct nvn_gpu_tex_s {
     uint64_t access_id;
@@ -325,6 +347,9 @@ struct nvn_gpu_cmd_s {
     struct vk_mirror_range *mirror_ranges;
     uint32_t mirror_range_count;
     uint64_t mirror_payload_bytes;
+    struct vk_mirror_write *mirror_writes;
+    uint32_t mirror_write_count, mirror_write_cap;
+    int mirror_bindings_dirty;
     uint64_t *refseen;               // 本段已引用句柄的备忘（#1194）：直接映射，槽里 = 句柄指针 | 类型；第一次引用时懒分配，随段释放
     uint64_t refseen_epoch;          // 备忘建表（或上次清空）时的 g_rel_epoch；与现在不一致就整表作废
     uint32_t refseen_hits;           // 本段备忘命中的次数（只给宿主用例读：nvn_gpu_vk_test_cmd_refseen_hits）
@@ -1826,6 +1851,7 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.inc
+static void mirror_unlink_locked(struct nvn_gpu_cmd_s *c);   // backend_vulkan_mirror.inc
 
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
@@ -1851,6 +1877,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         unref_locked(&g, c->newimg[i], REF_TEX);
     }
     free(c->newimg); c->newimg = NULL; c->n_newimg = 0;
+    mirror_unlink_locked(c);   // 回调已经返回。先摘范围，再放掉缓冲与视图的引用。
     for (uint32_t i = 0; i < c->nrefs; i++) unref_locked(&g, c->refs[i].obj, c->refs[i].type);
     pthread_mutex_unlock(&g_mu);
     for (uint32_t i = 0; i < c->nstaging; i++) {
@@ -1871,6 +1898,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     }
     for (uint32_t i = 0; i < c->pool_ndpools; i++) vkDestroyDescriptorPool(g.d, c->pool_dpools[i], NULL);
     free(c->mirror_ranges);
+    free(c->mirror_writes);
     free(c->pool_dpools);
     free(c->passes);
     free(c->lay);
@@ -2917,7 +2945,9 @@ void nvn_gpu_buf_release(nvn_gpu_buf bh, nvn_gpu_retired_fn retired, void *user)
 
 void nvn_gpu_buf_use(nvn_gpu_cmd ch, nvn_gpu_buf bh) {
     if (!ch || !bh) return;
-    cmd_ref((struct nvn_gpu_cmd_s *)ch, bh, REF_BUF);
+    cmd_ref(ch, bh, REF_BUF);
+    // 显式声明 GPU 裸地址引用时没有访问范围和读写方向信息。
+    if (rc_is(ch->sticky, NVN_GPU_OK)) mirror_write(ch, bh, 0, bh->bytes, MIRROR_INDIRECT);
 }
 
 // ---------------------------------------------------------------- arena
@@ -3058,6 +3088,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     }
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
+    mirror_write(c, b, off, bytes, MIRROR_UPLOAD);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
     pthread_mutex_unlock(&g_mu);
@@ -3077,6 +3108,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
+    mirror_write(c, b, off, bytes, MIRROR_TRANSFER);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
     pthread_mutex_unlock(&g_mu);
@@ -3097,6 +3129,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
+    mirror_write(c, d, doff, bytes, MIRROR_TRANSFER);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
     pthread_mutex_unlock(&g_mu);
@@ -3125,6 +3158,8 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32
         while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
         vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
         cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
+        if (mirror_is_noncoherent(d))
+            for (uint32_t j = 0; j < k; j++) mirror_write(c, d, r[j].dstOffset, r[j].size, MIRROR_TRANSFER);
     }
     mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
@@ -5924,7 +5959,10 @@ static void set_draw_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph, const nvn_gpu_pipe_de
         if (c->push_data[st] && end > UINT32_MAX) { set_sticky(c, NVN_GPU_E_ARG, "push 范围溢出"); return; }
         if (c->push_data[st] && !ensure_push_capacity(c, st, (uint32_t)end)) return;
     }
-    if (c->pipe != ph && c->pool_active) { memset(c->pool_binds, 0, sizeof c->pool_binds); c->pool_active = 0; }
+    if (c->pipe != ph) {
+        c->mirror_bindings_dirty = 1;
+        if (c->pool_active) { memset(c->pool_binds, 0, sizeof c->pool_binds); c->pool_active = 0; }
+    }
     c->pipe = ph;
     if (!p->dynamic_mask) return;
     const nvn_gpu_pipe_desc *d = desc ? desc : &p->key;
@@ -6073,6 +6111,7 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
         count++;
     }
     c->nbinds[st] = count;
+    c->mirror_bindings_dirty = 1;
 }
 
 // 测试读数：各类状态命令实际录了几次（下标同 ES_*：管线、视口、裁剪、混合常量、模板、深度偏移、顶点缓冲、索引缓冲、push）
@@ -6366,6 +6405,13 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     }
     // A descriptor-free pipeline ignores bindings left by the previous pipeline.
     if (!p->nset) return 1;
+    if (c->mirror_bindings_dirty) {
+        c->mirror_bindings_dirty = 0;
+        if (nvn_gpu_mirror_visibility_enabled()) {
+            mirror_storage_writes(c, p, compute);
+            if (!rc_is(c->sticky, NVN_GPU_OK)) return 0;
+        }
+    }
     uint32_t pool_mask = 0; struct pool_set_info pinfo[4] = {{0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}};   // 带整池数组的组；每组里各池绑定（绑定号, 池快照序号）的混合和，进备忘 / 回收的键
     if (c->pool_active && !pool_set_mask(c, p, compute, &pool_mask, pinfo)) return 0;
     uint32_t dirty = c->desc_dirty & ((1u << p->nset) - 1u);
@@ -6926,6 +6972,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     if (!p || p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 缺计算管线"); return; }
     if (ind && x | y | z) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 与计数不能同时给"); return; }
     if (ind) { if (!buf_range(ind, off, 12)) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 参数越界"); return; } }
+    if (c->pipe != p) c->mirror_bindings_dirty = 1;
     c->pipe = p;
     if (!prepare_bind_layouts(c, 1)) return;
     if (!bind_descriptor_groups(c, p, 1)) return;
@@ -7984,6 +8031,12 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageSubresource = (VkImageSubresourceLayers){copy_face_aspect(t), level, t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};   // 深度模板贴图只回读深度面（#1581 K）
     bc.imageOffset = o;
     bc.imageExtent = e;
+    if (mirror_is_noncoherent(b)) {
+        const uint64_t packed = ((uint64_t)e.width + blk_w - 1) / blk_w * blk;
+        const uint64_t pitch = (uint64_t)(bc.bufferRowLength / blk_w) * blk;
+        const uint32_t rows = (e.height - 1) / blk_h + 1;
+        mirror_write_rows(c, b, off, packed, pitch, rows, bc.bufferImageHeight / blk_h, e.depth);
+    }
     vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
@@ -8149,6 +8202,8 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     uint64_t src = loff + (uint64_t)slice * sp + (uint64_t)(o.y / 4) * rp + (uint64_t)(o.x / 4) * (uint32_t)bb;
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){src + y * rp, off + y * row_bytes, packed_row};
     full_barrier(c);
+    if (mirror_is_noncoherent(b))
+        mirror_write_rows(c, b, off, packed_row, row_bytes, (uint32_t)bh, (uint32_t)bh, 1);
     vkCmdCopyBuffer(c->cb, t->bc_sbuf, b->buffer, (uint32_t)bh, rg);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
@@ -8922,7 +8977,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     if (c->in_pass) set_sticky(c, NVN_GPU_E_ORDER, "commit 时通道还开着");
     if (flush_error != VK_SUCCESS)
         set_sticky(c, NVN_GPU_E_FAILED, "缓存镜像 flush 失败（VkResult %d）", (int)flush_error);
-    if (nvn_gpu_mirror_visibility_enabled() && rc_is(c->sticky, NVN_GPU_OK) && !closing && !lost && !inject && !failed_state) {
+    if (c->mirror_write_count && rc_is(c->sticky, NVN_GPU_OK) && !closing && !lost && !inject && !failed_state) {
         mirror_wait_for_landing(c);
         pthread_mutex_lock(&g_mu);
         closing = g.closing;

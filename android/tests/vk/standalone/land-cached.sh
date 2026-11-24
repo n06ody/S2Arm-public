@@ -9,6 +9,7 @@ mkdir -p "$out"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}"
 : "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
+"${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/compute_read_args.comp" -o "$out/storage.comp.spv"
 inc=()
 for d in android/tests/vkhost build/c883-ndk graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do
     inc+=(-I "$repo/$d")
@@ -32,7 +33,7 @@ SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 for dq in 0 1; do
     log="$out/dq$dq.log"
-    if ! timeout 30 "$out/test" "$dq" > "$log" 2>&1 ||
+    if ! timeout 30 "$out/test" "$dq" "$out/storage.comp.spv" > "$log" 2>&1 ||
        grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
         echo "【红】land-cached dq=$dq" >&2
         cat "$log" >&2
@@ -40,4 +41,4 @@ for dq in 0 1; do
     fi
     grep '^land-cached ' "$log"
 done
-echo 'RESULT: PASS（缓存镜像：8 个 Vulkan 场景，开启同步校验）'
+echo 'RESULT: PASS（缓存镜像：12 个 Vulkan 场景，开启同步校验）'

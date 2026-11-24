@@ -44,6 +44,74 @@ static int mirror_range(nvn_gpu_buf b, VkDeviceSize off, VkDeviceSize bytes, VkM
     return 1;
 }
 
+static void mirror_write(struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, VkDeviceSize off, VkDeviceSize bytes,
+                         enum mirror_write_kind kind) {
+    if (!mirror_is_noncoherent(b) || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    VkMappedMemoryRange range;
+    if (!mirror_range(b, off, bytes, &range)) {
+        set_sticky(c, NVN_GPU_E_ARG, "缓存镜像写入范围越界");
+        return;
+    }
+    const VkDeviceSize lo = range.offset, hi = lo + range.size;
+    if (c->mirror_write_count) {
+        struct vk_mirror_write *last = &c->mirror_writes[c->mirror_write_count - 1];
+        if (last->buf == b && last->kind == kind && lo <= last->hi && hi >= last->lo) {
+            if (lo < last->lo) last->lo = lo;
+            if (hi > last->hi) last->hi = hi;
+            return;
+        }
+    }
+    if (c->mirror_write_count == c->mirror_write_cap) {
+        const size_t cap = c->mirror_write_cap ? (size_t)c->mirror_write_cap * 2 : 8;
+        struct vk_mirror_write *writes = cap <= UINT32_MAX && cap <= SIZE_MAX / sizeof *writes
+            ? realloc(c->mirror_writes, cap * sizeof *writes) : NULL;
+        if (!writes) { set_sticky(c, NVN_GPU_E_OOM, "缓存镜像写入范围分配失败"); return; }
+        c->mirror_writes = writes;
+        c->mirror_write_cap = (uint32_t)cap;
+    }
+    c->mirror_writes[c->mirror_write_count++] = (struct vk_mirror_write){b, lo, hi, kind};
+}
+
+// 按 Vulkan 实际编码的行长和切片高记写集。行间填充从未由设备写入。
+static void mirror_write_rows(struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, uint64_t off, uint64_t packed,
+                              uint64_t pitch, uint32_t rows, uint32_t slice_rows, uint32_t slices) {
+    if (!rows || !slices || !packed || packed > pitch || rows > slice_rows ||
+        off > b->bytes || packed > b->bytes - off ||
+        (uint64_t)(slices - 1) * slice_rows + (rows - 1) > (b->bytes - off - packed) / pitch) {
+        set_sticky(c, NVN_GPU_E_ARG, "缓存镜像图像读回范围越界");
+        return;
+    }
+    if (packed == pitch && (rows == slice_rows || slices == 1)) {
+        mirror_write(c, b, off, packed * rows * slices, MIRROR_TRANSFER);
+        return;
+    }
+    for (uint32_t z = 0; z < slices; z++) {
+        const uint64_t row = (uint64_t)z * slice_rows;
+        for (uint32_t y = 0; y < rows; y++)
+            mirror_write(c, b, off + (row + y) * pitch, packed, MIRROR_TRANSFER);
+    }
+}
+
+static void mirror_storage_writes(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute) {
+    const int first = compute ? NVN_GPU_SH_CS : NVN_GPU_SH_VS;
+    const int end = compute ? NVN_GPU_SH_CS + 1 : NVN_GPU_SH_CS;
+    for (int st = first; st < end; st++) {
+        for (uint32_t i = 0; i < c->nbinds[st]; i++) {
+            const nvn_gpu_binding *b = &c->binds[st][i].b;
+            if ((b->cls != NVN_GPU_RES_SSBO && b->cls != NVN_GPU_RES_IMAGE_TBUF) ||
+                b->ent >= p->stage_nent[st]) continue;
+            const nvn_gpu_layout_ent *entry = &p->stage_ents[st][b->ent];
+            if (entry->cls != b->cls || entry->access == NVN_GPU_ACC_R) continue;
+            if (b->cls == NVN_GPU_RES_SSBO) {
+                mirror_write(c, b->u.b.buf, b->u.b.off, b->u.b.len, MIRROR_STORAGE);
+            } else if (b->u.view) {
+                const struct nvn_gpu_view_s *v = b->u.view;
+                mirror_write(c, v->buf, v->buffer_off, v->buffer_bytes, MIRROR_STORAGE);
+            }
+        }
+    }
+}
+
 int nvn_gpu_mirror_visibility_enabled(void) {
     return g_open && atomic_load_explicit(&g.mirror_noncoherent_seen, memory_order_relaxed);
 }
@@ -153,18 +221,30 @@ static nvn_gpu_buf mirror_ref(struct vk_ref ref) {
     return NULL;
 }
 
-// 按镜像独占，含纹素视图。提交线程等软件完成值，原生 fence 到达后 CPU 仍要 invalidate 和落地。
+// 依 vkMapMemory 的访问约束，主机 invalidate 与拷贝会读取非一致原子。
+// 后继只读可与它并行，写同一原子的段须等回调返回。
+// 列表可能同时有多个前驱。用最大的相交信号等待，队列内更早的相交段也会先完成。
 static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
     uint64_t fence = 0;
+    enum mirror_write_kind reason = MIRROR_INDIRECT;
     pthread_mutex_lock(&g_mu);
-    for (uint32_t i = 0; i < c->nrefs; i++) {
-        nvn_gpu_buf b = mirror_ref(c->refs[i]);
-        if (mirror_is_noncoherent(b) && b->mirror_land_fence > fence) fence = b->mirror_land_fence;
+    for (uint32_t i = 0; i < c->mirror_write_count; i++) {
+        const struct vk_mirror_write *w = &c->mirror_writes[i];
+        for (const struct vk_mirror_range *r = w->buf->mirror_land; r; r = r->next) {
+            if (r->signal <= g.completed || r->signal <= fence) break;
+            if (w->lo >= r->range.offset + r->range.size || r->range.offset >= w->hi) continue;
+            fence = r->signal;
+            reason = w->kind;
+            break;
+        }
     }
-    const int wait = fence > g.completed;
-    if (wait) g.stats[STAT_MIRROR_WAIT_N]++;
+    if (fence) {
+        g.stats[STAT_MIRROR_WAIT_N]++;
+        g.stats[STAT_MIRROR_WAIT_LAST_SEGMENT] = fence;
+        g.stats[reason]++;
+    }
     pthread_mutex_unlock(&g_mu);
-    if (!wait) return;
+    if (!fence) return;
 
     const uint64_t t0 = now_ns();
     nvn_gpu_err err = {0};
@@ -182,6 +262,22 @@ static void mirror_mark_submitted(struct nvn_gpu_cmd_s *c, uint64_t signal) {
         nvn_gpu_buf b = mirror_ref(c->refs[i]);
         if (mirror_is_noncoherent(b)) b->mirror_use_fence = signal;
     }
-    for (uint32_t i = 0; i < c->mirror_range_count; i++) c->mirror_ranges[i].buf->mirror_land_fence = signal;
+    for (uint32_t i = 0; i < c->mirror_range_count; i++) {
+        struct vk_mirror_range *r = &c->mirror_ranges[i];
+        r->signal = signal;
+        r->link = &r->buf->mirror_land;
+        r->next = *r->link;
+        if (r->next) r->next->link = &r->next;
+        *r->link = r;
+    }
     pthread_mutex_unlock(&g_mu);
+}
+
+static void mirror_unlink_locked(struct nvn_gpu_cmd_s *c) {
+    for (uint32_t i = 0; i < c->mirror_range_count; i++) {
+        struct vk_mirror_range *r = &c->mirror_ranges[i];
+        if (!r->link) continue;   // 未提交的段从未把范围挂到缓冲。
+        *r->link = r->next;
+        if (r->next) r->next->link = r->link;
+    }
 }
