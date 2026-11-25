@@ -277,7 +277,7 @@ static void occ_report(nvn_gpu_cmd c, uint64_t addr) { g_occ_used = 1; occ_stop(
 // 游戏拿两条计数器报告的计数值做条件（相等 / 不等才画）。回放时这些报告还没被 GPU 做到，内存里是旧值：
 // 时间戳类的计数值真机上是 0（本次提交里录到的、已提交还没完成的，都按 0 算）；别的计数器（遮挡查询等）写过的地址当「不知道」，照画——
 // 遮挡剔除只是省工作量。判成不画的那一段里，绘制和清除都丢掉。两张表都不许丢项（丢了条件会读到 CPU 写的旧值）。
-static int g_rc_skip;
+static int g_rc_skip, g_rc_active;
 static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;
 typedef struct { uint64_t addr, fence; } rc_sub;
 static rc_sub *g_rc_sub; static uint32_t g_rc_nsub, g_rc_scap;
@@ -312,21 +312,30 @@ static int rc_value(uint64_t a, uint64_t *v) {   // 0 = 回放这一刻不知道
     memcpy(v, (const void *)(uintptr_t)a, 8); return 1;
 }
 static void rc_cond(const p_render_cond *rc) {
+    g_rc_active = rc->mode != 2;
     if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; return; }
     uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
     g_rc_skip = known && (rc->mode ? x == y : x != y);
 }
 
+// Called only inside the replay submission lock. The returned pre segment
+// is recorded before the current main segment is sent to the same queue.
+int rp_cold_submit_scope(nvn_gpu_cmd cmd, nvn_gpu_cmd *pre) {
+    if (!g_sub || !cmd || cmd != g_cmd || g_rc_active || g_occ_counting || g_occ_seg) return 0;
+    *pre = g_pre;
+    return 1;
+}
+
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
-    g_rc_skip = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
+    g_rc_skip = g_rc_active = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
 }
 
 void nvn_be_sub_begin(void) {
     rp_buf_hold_begin();   // 回放窗口开：到 nvn_be_sub_commit 收尾之前，别的线程销毁池不当场放镜像缓冲（rp_buf.c）
     g_sub = calloc(1, sizeof *g_sub);
     if (g_sub) g_sub->refs = 1;
-    rc_retire(); g_rc_npend = 0; g_rc_skip = 0;
+    rc_retire(); g_rc_npend = 0; g_rc_skip = g_rc_active = 0;
     g_occ_seg = g_occ_used; g_occ_next = 0; g_occ_base = 0; g_occ_cur = -1; g_occ_pass = 0;
     nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
     g_cmd = NULL; g_pre = NULL; g_sub_serial++; g_seg_serial++; g_mid = 0; g_pass_cuts = 0; { uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns); g_split_base = nd; }

@@ -18,6 +18,13 @@ struct rp_uword { uint8_t reg, sid, pair, pair_sid, pair_reg; uint16_t off, pair
 //                    与 NVN_RB_SAMPU 读出的句柄高 12 位、c2 常量采样器（布局项 src_reg2 的 NVN_GPU_SAMP2_CONST）同口径。
 struct rp_usrc { struct rp_uword tex, samp; uint8_t samp_kind; uint16_t samp_reg; uint8_t samp_pool; };
 enum { RP_PROG_USRC_MAX = 64 };
+// Optional verified fragment specialization. Its owner is the shader source.
+struct rp_cold_proof {
+    nvn_gpu_shader fragment;
+    uint8_t variant_sha[32];
+    uint32_t fragment_ent, first_word, stride_words, count;
+    uint32_t prefix_ent, prefix_byte, prefix_mask;
+};
 struct rp_prog {
     nvn_gpu_shader sh[RP_PROG_STAGES];                        // 0 顶点 1 片元 2 几何
     nvn_gpu_layout_ent ent[RP_PROG_STAGES][RP_PROG_ENT_MAX];  // 与交给后端装载的布局同一份：核心按 src_kind / src_reg 逐项绑定
@@ -43,6 +50,7 @@ struct rp_prog {
     // 内容身份：S2AI1 v3 规范输入的 SHA-256，也就是来源缓存（g_progs）的键。管线配方与跨会话预热清单
     // 用它跨会话定位「同一份程序」；全 0 = 没有身份（失败项 / 还没算出来），这种程序不进任何清单。
     uint8_t identity[32];
+    const struct rp_cold_proof *cold;
 };
 struct rp_shader_req {
     uint32_t prim;              // NVNdrawPrimitive

@@ -255,6 +255,10 @@ static int noatt_extent(uint32_t *w, uint32_t *h) {
 }
 static int noatt_ok(void) { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp); return (cp.caps & NVN_GPU_CAP_NO_ATTACH_PASS) != 0; }
 int rp_pass_slot_attached(int i) { return P.has_rt && i >= 0 && i < P.rt.n && i < 8 && (P.colors >> i & 1) && P.rt.color[i] && slot_kind(i, NULL, NULL) >= 0; }
+int rp_pass_slot_planned(int i) {
+    return P.has_rt && i >= 0 && i < P.rt.n && i < 8 && (P.want_colors >> i & 1) &&
+           P.rt.color[i] && slot_kind(i, NULL, NULL) >= 0;
+}
 
 // 同一组目标（对齐 nvn_mtl.m rt_same @10955）：颜色 / 深度个数、每张图的序号、视图记录逐字节相同就算同一组。
 // 不比对象指针：游戏会按值拷贴图对象，指针不可信（同一个序号才是同一张图）。
