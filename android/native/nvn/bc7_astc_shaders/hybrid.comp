@@ -267,22 +267,17 @@ void main() {
         if (mode == 5) w |= q4_code(d.alpha_weight) << 2u;
         set_code(c, i, w);
     }
-    if (direct && passes(c, samples)) {
-        dst.blocks[index] = encode(c);
-        return;
-    }
-
-    c = fit(samples, 0u, opaque);
-    if (!passes(c, samples)) {
-        c = fit(samples, first, opaque);
-        if (!passes(c, samples)) {
-            c = fit(samples, second, opaque);
-            if (!passes(c, samples)) {
-                dst.blocks[index] = uvec4(0);
-                atomicOr(dst.needs_rgba, 1u);
-                return;
-            }
+    // 一个调用点复用拟合、误差判断和打包，避免驱动为每个候选重复编译整个函数。
+    for (uint attempt = direct ? 0u : 1u; attempt < 4u; ++attempt) {
+        if (attempt != 0u) {
+            uint partition_code = attempt == 1u ? 0u : (attempt == 2u ? first : second);
+            c = fit(samples, partition_code, opaque);
+        }
+        if (passes(c, samples)) {
+            dst.blocks[index] = encode(c);
+            return;
         }
     }
-    dst.blocks[index] = encode(c);
+    dst.blocks[index] = uvec4(0);
+    atomicOr(dst.needs_rgba, 1u);
 }

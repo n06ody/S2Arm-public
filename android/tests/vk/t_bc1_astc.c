@@ -14,8 +14,11 @@
 #include "backend_vulkan_bc7_hybrid_spv.h"
 #include "bc7_astc_shaders/inspect.h"
 #include "nvn_deswizzle.h"
+#include <inttypes.h>
 #include <math.h>
 #include "nvn_bcdec.h"
+
+static uint64_t fixture_wait_ns = 5000000000ull;
 
 static unsigned bc_timed_dispatches, bc_missing_dispatches;
 static struct bc7_counts {
@@ -131,10 +134,16 @@ static int encode(nvn_gpu_pipe pipe, unsigned nblocks, size_t source_bytes, nvn_
     nvn_gpu_push(cmd, NVN_GPU_SH_CS, 0, &nblocks, sizeof nblocks);
     nvn_gpu_dispatch(cmd, pipe, (nblocks + 63) / 64, 1, 1, NULL, 0);
     nvn_gpu_err e = {0};
-    const int ok = OK(nvn_gpu_cmd_commit(cmd, serial, on_done, NULL, &e)) &&
-                   OK(nvn_gpu_fence_wait(serial, 5000000000ull, &e));
-    CHECK(ok, "BC1 ASTC fixture submit: %s", e.why);
-    return ok;
+    const double start = c89_now_ms();
+    const nvn_gpu_rc commit = nvn_gpu_cmd_commit(cmd, serial, on_done, NULL, &e);
+    const double submitted = c89_now_ms();
+    CHECK(OK(commit), "BC ASTC commit signal=%" PRIu64 " rc=%d: %s", serial, commit.code, e.why);
+    if (!OK(commit)) return 0;
+    const nvn_gpu_rc wait = nvn_gpu_fence_wait(serial, fixture_wait_ns, &e);
+    CHECK(OK(wait), "BC ASTC fence signal=%" PRIu64 " blocks=%u rc=%d: %s", serial, nblocks, wait.code, e.why);
+    printf("BC ASTC dispatch signal=%" PRIu64 " blocks=%u submit_ms=%.2f wait_ms=%.2f rc=%d\n",
+           serial, nblocks, submitted - start, c89_now_ms() - submitted, wait.code);
+    return OK(wait);
 }
 
 // 同版宿主无 ASTC，仍可通过实际纹理入口核 RGBA8 回落路径与原压缩字节。
@@ -199,10 +208,11 @@ static void transparent_fallback(void) {
 #include "t_bc7_hybrid.inc"
 
 int main(int argc, char **argv) {
+    const int timeout_probe = argc == 2 && !strcmp(argv[1], "--fence-timeout");
     const int hybrid = argc >= 2 && !strcmp(argv[1], "--bc7-hybrid");
     const int bc7 = hybrid || (argc >= 2 && !strcmp(argv[1], "--bc7"));
     if (argc > 2 + bc7) return 2;
-    const char *shader_dir = argc == 2 + bc7 ? argv[1 + bc7] : NULL;
+    const char *shader_dir = argc == 2 + bc7 && !timeout_probe ? argv[1 + bc7] : NULL;
     char why[256];
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) {
         fprintf(stderr, "BC1 ASTC fixture device: %s\n", why);
@@ -238,8 +248,24 @@ int main(int argc, char **argv) {
     if (!shader) return 2;
     nvn_gpu_pipe pipe = NULL;
     const nvn_gpu_stage_desc stage = {.sh = shader};
+    const double pipeline_start = c89_now_ms();
     CHECK(OK(nvn_gpu_cpipe_get(&stage, NVN_GPU_PIPE_SYNC, &pipe, &pipe_err)), "BC1 pipeline: %s", pipe_err.why);
     if (!pipe) return 2;
+    printf("BC ASTC pipeline_ms=%.2f\n", c89_now_ms() - pipeline_start);
+
+    if (timeout_probe) {
+        // 已提交段在完成线程前保留，稳定命中 fence 与 close 的超时，避免依赖某驱动有多慢。
+        fill_opaque();
+        nvn_gpu_buf in = make_buf(sizeof source, NVN_GPU_MEM_SHARED, source);
+        nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
+        if (!in || !out) return 2;
+        fixture_wait_ns = 20000000ull;
+        nvn_gpu_vk_test_delay_segment(1, 500);
+        encode(pipe, 1, sizeof source, in, out, 1);
+        nvn_gpu_buf_release(out, NULL, NULL);
+        nvn_gpu_buf_release(in, NULL, NULL);
+        goto close;
+    }
 
     if (bc7) {
         if (hybrid) hybrid_codec(pipe);
@@ -278,7 +304,13 @@ int main(int argc, char **argv) {
 close:
     nvn_gpu_shader_release(shader);
     nvn_gpu_err err = {0};
-    CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "BC1 ASTC fixture close: %s", err.why);
+    const nvn_gpu_rc closed = nvn_gpu_close(fixture_wait_ns, &err);
+    if (!OK(closed)) {
+        CHECK(0, "BC ASTC fixture close rc=%d: %s", closed.code, err.why);
+        // close 超时保留后端和在途资源。进程退出交给系统回收，不能先销毁仍被 worker 使用的设备。
+        fflush(NULL);
+        _Exit(1);
+    }
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "BC1 ASTC fixture device destroy");
     if (bc7 && !hybrid && !shader_dir) {
         CHECK(bc7_only56.snapshots == 2 && bc7_only56.rgba_bytes == 320 && bc7_only56.bc_bytes == 96,

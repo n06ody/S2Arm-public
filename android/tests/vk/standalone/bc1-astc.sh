@@ -24,6 +24,18 @@ cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-p
     -Wl,--gc-sections -L"$out" -Wl,-rpath,"$out" -lastcdecode -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 set +e
+timeout 20 "$out/test" --fence-timeout > "$out/fence-timeout.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 1 ] || ! grep -q 'FAIL .*BC ASTC fence signal=1 blocks=1' "$out/fence-timeout.log" ||
+   ! grep -q 'FAIL .*BC ASTC fixture close rc=' "$out/fence-timeout.log" ||
+   grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/fence-timeout.log"; then
+    cat "$out/fence-timeout.log"
+    echo "【红】BC ASTC fence/close 超时退出夹具 rc=$rc" >&2
+    exit 1
+fi
+echo '【绿】BC ASTC fence/close 超时保留在途设备，失败退出无 VUID'
+set +e
 timeout 180 "$out/test" 2>&1 | tee "$out/run.log"
 rc=${PIPESTATUS[0]}
 set -e
