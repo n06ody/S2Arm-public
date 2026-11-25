@@ -2,6 +2,7 @@
 """Real new-layer shader producer and REQUEST builders; synthetic source/compiler boundary."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,8 +61,22 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
+    if sys.argv[1:] == ['--lp-output']:
+        shader = ROOT/'android/tests/vk/shaders/libpack_mrt_outputs.frag'
+        compiler = shutil.which('glslc')
+        rc = 0
+        for numeric_class in (0, 1, 2):
+            binary = out/f'mrt-{numeric_class}.spv'
+            cmd = [compiler, '--target-env=vulkan1.1'] if compiler else ['glslangValidator', '-V', '--target-env', 'vulkan1.1']
+            subprocess.run([*cmd, f'-DMRT_CLASS={numeric_class}', str(shader), '-o', str(binary)], check=True)
+            result = run('lp-output', original, args=('--lp-output', str(binary), str(numeric_class)))
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            rc |= result.returncode
+        return rc
+
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
-                  '--live-compile-stop', '--cs-libpack', '--lp-gate')
+                  '--live-compile-stop', '--cs-libpack', '--cs-used-slots', '--lp-gate', '--lp-numeric')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
         sys.stdout.write(result.stdout)
@@ -200,7 +215,17 @@ def main():
             result = run('gs-libpack-' + name, path, args=('--gs-libpack',))
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
-        print('PASS: 4 libpack GS negative controls')
+        guard = 'if (!e->prog.lib_sourced || e->numeric_checked) return 1;'
+        assert code.count(guard) == 1
+        path = out / 'gs-libpack-mutant-sampled-numeric.c'
+        path.write_text(code.replace(guard, 'if (e->prog.lib_sourced || e->numeric_checked) return 1;'))
+        result = run('gs-libpack-sampled-numeric', path, args=('--lp-numeric',))
+        failures = [line for line in result.stderr.splitlines() if line.startswith('FAIL:')]
+        expected = {f'FAIL: {path_kind} sampled numeric admission format {fmt}'
+                    for path_kind in ('cold', 'warm') for fmt in (39, 40)}
+        assert result.returncode == 1 and len(failures) == 4 and {
+            line.split(',')[0] for line in failures} == expected, (result.stdout, result.stderr)
+        print('PASS: 5 libpack graphics negative controls, including cold and warm integer admission')
         return 0
 
     if sys.argv[1:] == ['--lp-gate-mutants']:
@@ -551,8 +576,8 @@ def main():
              '{ (void)rp_S.skey[5]; }', 1, 'changed CS source key recompiles'),
             ('cs-ubo-use-omitted', '{ uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; MIX(m); }',
              '{ (void)rp_S.ubo[5]; }', 1, 'changed CS constant-buffer use recompiles'),
-            ('cs-unaligned-omitted', 'rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un);',
-             'rp_S.ssbo[5][i].addr % pc->storage_buffer_offset_alignment) un = 1; MIX(un & 0);', 1, 'unaligned CS storage address recompiles'),
+            ('cs-unaligned-omitted', 'MIX(unaligned); MIX(pc->storage_buffer_offset_alignment);',
+             'MIX(unaligned & 0); MIX(pc->storage_buffer_offset_alignment);', 1, 'unaligned CS storage address recompiles'),
             ('cs-pool-omitted', 'MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tex_base);',
              'MIX(0);', 1, 'CS pool size update recompiles'),
             ('cs-combined-omitted', 'MIX(combined_fact_sig(5));', '(void)0;', 1, 'changed CS texture fact recompiles'),

@@ -285,10 +285,17 @@ s2a_gate_step "$out/nvn-vk-format-test"
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/ts_queue_test.c" -o "$out/ts-queue-test"
 s2a_gate_step "$out/ts-queue-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    -I "$repo_dir/graphics/nvn/replay" -pthread "$android_dir/tests/nvk_land_auto_test.c" -lm -o "$out/land-auto-test"
+s2a_gate_step "$out/land-auto-test"
 # #653：逐报告时间戳校准纯数学（不建 Vulkan device，不替代真机/VVL 验证）。
 s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
     "$android_dir/tests/report_ts_test.c" -o "$out/report-ts-test"
 s2a_gate_step "$out/report-ts-test"
+s2a_gate_step "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I "$android_dir/native/nvn" \
+    -I "$android_dir/../graphics/nvn/gfx/nvn" -I "$android_dir/../graphics/nvn/gfx/nvn/include" \
+    -pthread "$android_dir/tests/nvk_gpu_idle_test.c" -o "$out/gpu-idle-test"
+s2a_gate_step "$out/gpu-idle-test"
 # VM 夹具端点核对（宿主源码级，mac 也跑）：svc_*.c 新引用的 core 符号漏登记当场红，不等 Linux 真链
 s2a_gate_step "$PY" "$android_dir/core-link/runtime-tests/vm/check_endpoints.py" --out "$out/vm-endpoints"
 # 宽屏 screen_metrics 的宿主两步（screen-widen-test / widen-loader-test）11-01 挪进合入前层：tests/android_screen_host_test.sh
@@ -323,6 +330,7 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --fact-wide-mutants
 # 几何着色器走出包预编库的负对照（正例在上面无参那一步里单独起进程跑）：撤掉接线各一处，--gs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --lp-output
 # 计算程序出包预编库的非对齐闸负对照（#496085）：撤掉 state_ok 对 ckey 的生效，--cs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-libpack-mutants
 # 图形程序出包预编库的六条状态闸与读数（正例 --lp-gate 在上面无参那一步里单独起进程跑）：六条闸各撤一位、直方图两处累加 / 快照落位 / 并列顺序各改一处，--lp-gate 必红；

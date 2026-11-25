@@ -54,7 +54,6 @@ android/tests/vk/standalone/feedback-core.sh	11-23 存量，待加标记
 android/tests/vk/standalone/feedback-snap-pool.sh	11-23 存量，待加标记
 android/tests/vk/standalone/image-tbuf-core.sh	11-23 存量，待加标记
 android/tests/vk/standalone/libpack-c0.sh	11-23 存量，待加标记
-android/tests/vk/standalone/libpack-vsdepth.sh	11-23 存量，待加标记
 android/tests/vk/standalone/wsi-extent.sh	11-23 存量，待加标记
 android/tests/vk/workgroup.sh	11-23 存量，待加标记
 android/tests/vk_api_floor_test.sh	11-23 存量，待加标记

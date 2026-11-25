@@ -636,39 +636,73 @@ static int lp_spv_read_bindings(const uint8_t *spv, size_t n, struct lp_spv_bind
 // 片元输出映射（同现编结果 info.fragmentOutputMap：每个颜色目标 4 位，第 c 分量 = 位 4×location + c）：按 .spv 的 Output 变量推。
 //   缺了这一项消费端按全 1（不屏蔽）处理，着色器没写的颜色目标也会被写入未定义值（延迟渲染的 G 缓冲被冲掉，王国之泪整屏发暗）。
 //   0 = 推出；-1 = 读不懂（数组输出、location ≥ 8、没 Location 的非内建输出等），调用方不出这一项
-int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map) {
+int s2a_libpack_spv_frag_interface(const uint8_t *spv, size_t n, struct s2a_frag_outputs *out) {
     const uint32_t *w = (const uint32_t *)spv; size_t nw = n / 4;
     if (nw < 5 || !w[3] || w[3] > (1u << 22)) return -1;
     uint32_t bound = w[3];
     // 每个 id：低 8 位 location+1（0 = 没有）、8..15 位 component、位 16 = 内建；类型表：分量数（0 = 不是可用的标量 / 向量）
     uint32_t *dec = calloc(bound, sizeof *dec), *ncomp = calloc(bound, sizeof *ncomp), *ptr_to = calloc(bound, sizeof *ptr_to);
-    int rc = -1; uint32_t m = 0;
+    int rc = -1, has_entry = 0, has_main = 0;
+    struct s2a_frag_outputs outputs = {0};
     if (!dec || !ncomp || !ptr_to) goto out;
     for (size_t i = 5; i < nw; ) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
         if (!wc || i + wc > nw) goto out;
-        if (op == 71 && wc >= 3 && w[i + 1] < bound) {                       // OpDecorate
+        if (op == 15) { // OpEntryPoint: only the selected fragment main supplies color outputs.
+            has_entry = 1;
+            if (wc < 4) goto out;
+            const char *name = (const char *)&w[i+3];
+            const char *end = memchr(name, 0, (wc-3)*4);
+            if (!end) goto out;
+            if (w[i+1] == 4 && !strcmp(name, "main")) {
+                if (has_main) goto out;
+                has_main = 1;
+                for (size_t j = 3 + ((size_t)(end-name)+4)/4; j < wc; j++) {
+                    if (w[i+j] >= bound) goto out;
+                    dec[w[i+j]] |= 1u << 17;
+                }
+            }
+        } else if (op == 71 && wc >= 3 && w[i + 1] < bound) {                       // OpDecorate
             uint32_t id = w[i + 1], d = w[i + 2];
             if (d == 30 && wc >= 4) { if (w[i + 3] >= 255) goto out; dec[id] = (dec[id] & ~0xffu) | (w[i + 3] + 1); }   // Location
             else if (d == 31 && wc >= 4) { if (w[i + 3] > 3) goto out; dec[id] = (dec[id] & ~0xff00u) | (w[i + 3] << 8); }   // Component
             else if (d == 11) dec[id] |= 1u << 16;                                // BuiltIn
-        } else if ((op == 21 || op == 22) && wc >= 2 && w[i + 1] < bound) ncomp[w[i + 1]] = 1;   // OpTypeInt / OpTypeFloat
-        else if (op == 23 && wc >= 4 && w[i + 1] < bound && w[i + 2] < bound && ncomp[w[i + 2]] == 1 && w[i + 3] <= 4) ncomp[w[i + 1]] = w[i + 3];   // OpTypeVector
+        } else if ((op == 21 || op == 22) && wc >= (op == 21 ? 4u : 3u) && w[i+1] < bound) {
+            // Low byte: component count. High byte: 0 float, 1 unsigned, 2 signed.
+            ncomp[w[i+1]] = 1 | (op == 21 ? (w[i+3] ? 2u : 1u) << 8 : 0);
+        } else if (op == 23 && wc >= 4 && w[i+1] < bound && w[i+2] < bound &&
+                   (ncomp[w[i+2]] & 255) == 1 && w[i+3] >= 2 && w[i+3] <= 4) {
+            ncomp[w[i+1]] = (ncomp[w[i+2]] & ~255u) | w[i+3];
+        }
         else if (op == 32 && wc >= 4 && w[i + 1] < bound) ptr_to[w[i + 1]] = w[i + 2] == 3 ? w[i + 3] + 1 : 0;   // OpTypePointer Output → 指向类型 +1
         else if (op == 59 && wc >= 4 && w[i + 3] == 3) {                     // OpVariable … Output
             uint32_t ty = w[i + 1], id = w[i + 2];
             if (ty >= bound || id >= bound || !ptr_to[ty]) goto out;
+            if (has_entry && !(dec[id] & (1u << 17))) { i += wc; continue; }
             if (dec[id] >> 16 & 1) { i += wc; continue; }                        // 内建（FragDepth / SampleMask）不占颜色目标
-            uint32_t loc = dec[id] & 0xff, comp = dec[id] >> 8 & 0xff, val = ptr_to[ty] - 1, k = val < bound ? ncomp[val] : 0;
+            uint32_t loc = dec[id] & 0xff, comp = dec[id] >> 8 & 0xff, val = ptr_to[ty] - 1, type = val < bound ? ncomp[val] : 0, k = type & 255;
             if (!loc || loc - 1 >= 8 || !k || comp + k > 4) goto out;
-            m |= ((1u << k) - 1u) << (4 * (loc - 1) + comp);
+            unsigned bit = 1u << (loc-1), kind = type >> 8;
+            if ((outputs.components >> (4*(loc-1)) & 15u) &&
+                (((outputs.uint_locations & bit) != 0) != (kind == 1) ||
+                 ((outputs.sint_locations & bit) != 0) != (kind == 2))) goto out;
+            outputs.components |= ((1u << k) - 1u) << (4 * (loc - 1) + comp);
+            if (kind == 1) outputs.uint_locations |= bit;
+            if (kind == 2) outputs.sint_locations |= bit;
         }
         i += wc;
     }
-    *map = m; rc = 0;
+    if (has_entry && !has_main) goto out;
+    *out = outputs; rc = 0;
 out:
     free(dec); free(ncomp); free(ptr_to);
     return rc;
+}
+int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map) {
+    struct s2a_frag_outputs outputs;
+    if (s2a_libpack_spv_frag_interface(spv, n, &outputs)) return -1;
+    *map = outputs.components;
+    return 0;
 }
 // 能力核：离线库的 .spv 是批翻链（translator/dmsh_xlate）按它自己的宿主口径翻的，不是按本机 profile——那边
 //   QueryHostSupportsShaderFloat64 缺省答「有」（Metal 只在模块真用到 double 时重翻），所以几乎每个模块都带 OpCapability Float64。
@@ -992,7 +1026,7 @@ int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp_c, const uint8_t k
     if (slots) *slots = 0;
     if (!lp || !lp->p.idx || !key || !slots) return 1;
     const char *lib_stage = lp_nvn_stage_name(nvn);
-    if (!lib_stage || !strcmp(lib_stage, "cs")) return 1;   // 图形三段（vs / ps / gs）；计算不走这里
+    if (!lib_stage) return 1;   // 库里只有 vs / ps / gs / cs
     const int gs = !strcmp(lib_stage, "gs");
     int gt = -1;
     if (gs && (gt = lp_input_topology(topology)) < 0) return 1;   // 邻接 / 没有来源：库里没有那一份

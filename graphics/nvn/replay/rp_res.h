@@ -8,6 +8,9 @@
 
 // 贴图对象 → 后端贴图。首次使用时建；内容来自游戏内存的，在 c 这一段里上传 / 脏了重传。NULL = 取不到（已经 nvn_unimpl 记账）。线程：[提交]。
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
+// 拷贝端点必须保留源格式语义，调用方已结束通道。
+nvn_gpu_tex rp_tex_resolve_plain(const tex_t *t, nvn_gpu_cmd c);
+void rp_res_xfer_aborted(uint64_t sub);
 // 宿主整段读贴图存储的入口：整段在它的内存池里 → t->mem；伸出池子（真机：存储偏移 -1）→ 副本，池内照拷、池外按 0，*part 交调用方 free。
 //   NULL = 副本分配失败。线程：任意（不取锁）。
 const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);
@@ -22,8 +25,9 @@ nvn_gpu_view rp_view_by_id_decl(int id, uint8_t dtt, uint8_t dcls, int elem, nvn
 // 其余同 rp_view_by_id_decl（elem = 0）。信息计数 rp_ubo_zero_count（换局清零）。
 nvn_gpu_view rp_view_by_ubo_handle_decl(int id, uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c, tex_t *t_out);
 // 出库程序（出包预编库，声明是出包时推的）的绑定核对：begin 之后的 rp_view_by_id_decl / rp_view_by_ubo_handle_decl 遇到
-//   「登记过、在池里、声明目标桥接不了」的贴图，不绑零贴图、不记未接，返回 NULL；end 返回 1 = 遇到过（调用方换现编版重绑）。
+//   「登记过、在池里、声明目标桥接不了」的贴图，不绑零贴图、不记未接，返回 NULL；end 返回 1；单张数值类不符返回 RP_DECL_NUMERIC_MISMATCH。调用方换现编版重绑。
 //   不另取锁：判据就是取视图时那一次。线程：[提交]
+enum { RP_DECL_NUMERIC_MISMATCH = 2 };   // 单张视图数值类不符，重取程序失败必须跳过该笔
 void rp_decl_probe_begin(void);
 int rp_decl_probe_end(void);
 // 一维 / 一维数组折成二维 / 二维数组（同 iOS nvn_mtl.m tex_desc_fit，#1810）：后端建不出目标 0 / 3，翻译后的着色器也一律按二维采样
@@ -47,7 +51,21 @@ static inline uint32_t rp_tex_layer_count(const tex_t *t) {
 static inline int rp_decl_view_target(const tex_t *t, view_t *v, int has_v, uint8_t dtt) {
     if (!dtt) return 0;
     int want = rp_fold_1d_target(dtt - 1), have = rp_fold_1d_target(has_v && v->set_target ? v->target : t->d.target);
-    if (want == have) return 0;
+    if (want == have) {
+        if (want != NVN_TEXTURE_TARGET_CUBEMAP && want != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) return 0;
+        const uint32_t total = rp_tex_layer_count(t);
+        const int explicit_layers = has_v && v->set_layers;
+        const uint32_t base = explicit_layers ? v->min_layer : 0;
+        const uint32_t count = explicit_layers ? (v->nlayers ? v->nlayers : 1) : total;
+        // 后端可以把不完整的立方层范围当二维视图用，采样绑定必须保留着色器的声明维度。
+        if (base >= total || count > total - base || count < 6 || count % 6) return -1;
+        if (want == NVN_TEXTURE_TARGET_CUBEMAP) return count == 6 ? 0 : -1;
+        // 单组六面默认会落成立方体；显式指定目标才能保留一组立方体的数组视图。
+        if (count != 6 || (has_v && v->set_target)) return 0;
+        if (!has_v) memset(v, 0, sizeof *v);
+        v->set_target = 1; v->target = NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+        return 1;
+    }
     uint32_t layers = rp_tex_layer_count(t);
     if (has_v && v->set_layers) layers = v->nlayers ? v->nlayers : (layers > v->min_layer ? layers - v->min_layer : 1);
     uint32_t n = 0;
@@ -74,6 +92,7 @@ uint64_t rp_empty_slot_zero_count(void);   // 空贴图槽绑零贴图的次数�
 uint64_t rp_ubo_zero_count(void);          // 常量缓冲句柄指向没登记的号、绑零贴图的次数（#1594 片 4；信息计数，换局清零）
 // 贴图对象 + 视图记录（NULL = 默认视图）→ 视图：渲染目标、拷贝端点用。线程：[提交]。
 nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
+nvn_gpu_view rp_view_for_plain(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
 // 当颜色附件取视图。刚建、初始内容该是全零的单级单层颜色图：不在 CPU 上填零，记成「待清零」，
 // 由调用方在开通道前用 rp_tex_take_zero 取走并把这个附件的载入方式改成清零（显卡做，CPU 不搬一整张零）。
 // 没被取走的待清零，下一次任何别的用途取它时照旧填零。
