@@ -33,6 +33,8 @@
 #include "nvn/nvn_vk_program_result.h"
 #include "nvn/nvn_vk_compute_request.h"
 #include "nvn/nvn_vk_warm_options.h"
+#include "nvn/nvn_vk_cold_asset.h"
+#include "nvn/nvn_vk_cold_guard.h"
 #include "nvn/nvn_vk_prog_warm.h"   // 跨会话程序清单（note / stats；build 与 quiesce 在本文件实现）
 #include <pthread.h>
 #include <stdarg.h>
@@ -219,6 +221,10 @@ static uint64_t mono_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONI
 static void entry_free(struct entry *e) {
     if (!e) return;
     for (int st = 0; st < RP_PROG_STAGES; st++) if (e->prog.sh[st]) { nvn_gpu_shader_release(e->prog.sh[st]); e->prog.sh[st] = NULL; }
+    if (e->prog.cold) {
+        nvn_gpu_shader_release(e->prog.cold->fragment);
+        free((void *)e->prog.cold);
+    }
     for (int st = 0; st < RP_PROG_STAGES; st++) free((void *)e->prog.c1[st]);
     free(e);
 }
@@ -1050,6 +1056,65 @@ failed:
 }
 #endif
 
+// Android APK AssetManager 在隔离宿主用例里没有实现。
+int s2a_android_read_native_asset(const char *, size_t, void **, size_t *) __attribute__((weak));
+int nvn_vk_cold_guard_mode(void) __attribute__((weak));
+int nvn_vk_cold_shader_digest(nvn_gpu_shader, uint8_t[32]) __attribute__((weak));
+
+static void load_cold_fragment(struct rp_prog *p, const nvn_gpu_shader_src *source) {
+    if (!s2a_android_read_native_asset || !nvn_vk_cold_guard_mode || !nvn_vk_cold_shader_digest) return;
+    const int mode = nvn_vk_cold_guard_mode();
+    if (!mode) return;
+    uint8_t original_sha[32], raw_sha[32];
+    if (!nvn_vk_cold_shader_digest(p->sh[NVN_GPU_SH_FS], original_sha)) return;
+    cold_asset_digest(source->blob, source->bytes, raw_sha);
+    if (memcmp(original_sha, raw_sha, sizeof raw_sha)) return;  // backend rewrote the module
+    char identity[65], path[96];
+    s2a_sha256_hex(p->identity, identity);
+    snprintf(path, sizeof path, "s2a-cold-guard-v1/%s.bin", identity);
+    void *buf = NULL;
+    size_t bytes = 0;
+    if (!s2a_android_read_native_asset(path, COLD_ASSET_MAX, &buf, &bytes)) return;
+    struct nvk_cold_asset file;
+    if (!nvk_cold_asset_parse(buf, bytes, p->identity, original_sha, source->layout, &file)) {
+        free(buf);
+        return;
+    }
+    struct rp_cold_proof *cold = calloc(1, sizeof *cold);
+    if (!cold) { free(buf); return; }
+    nvn_gpu_shader_src variant = *source;
+    if (mode == 1) {
+        variant.blob = file.variant;
+        variant.bytes = file.variant_size;
+    }
+    const uint8_t *expected_sha = mode == 1 ? file.variant_sha : original_sha;
+    nvn_gpu_err err = {0};
+    uint8_t variant_sha[32];
+    if (nvn_gpu_ok(nvn_gpu_shader_load(&variant, &cold->fragment, &err)) &&
+        nvn_vk_cold_shader_digest(cold->fragment, variant_sha) &&
+        !memcmp(variant_sha, expected_sha, sizeof variant_sha)) {
+        memcpy(cold->variant_sha, variant_sha, sizeof variant_sha);
+        cold->fragment_ent = file.recipe.fragment_ent;
+        cold->first_word = file.recipe.first_word;
+        cold->stride_words = file.recipe.stride_words;
+        cold->count = file.recipe.count;
+        cold->prefix_ent = file.recipe.prefix_ent;
+        cold->prefix_byte = file.recipe.prefix_byte;
+        cold->prefix_mask = file.recipe.prefix_mask;
+        p->cold = cold;
+        char original[65], modified[65], line[240];
+        s2a_sha256_hex(original_sha, original);
+        s2a_sha256_hex(variant_sha, modified);
+        snprintf(line, sizeof line, "nvk-cold-guard asset mode=%d program=%s original=%s variant=%s",
+                 mode, identity, original, modified);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+    } else {
+        if (cold->fragment) nvn_gpu_shader_release(cold->fragment);
+        free(cold);
+    }
+    free(buf);
+}
+
 // lib = 这份结果字节来自出包预编库（shader_src.precompiled=1）：装载闸对表外声明按拒收，
 //   调用方照旧 mark_bad 退回现编。离线库 / 跨局缓存 / 现编结果传 0。
 static _Atomic uint64_t g_lp_link_refused;   // 出包预编程序因两段接口对不上退回现编的份数（本局）
@@ -1147,6 +1212,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
         nvn_gpu_err err = {0};
         nvn_gpu_rc lr = nvn_gpu_shader_load(&src, &e->prog.sh[st], &err);
         if (!nvn_gpu_ok(lr)) { red_load(lr, &src, "shader_load_failed", err.why); e->failed = 1; }
+        else if (st == NVN_GPU_SH_FS && nst == 2) load_cold_fragment(&e->prog, &src);
         prog_c1_take(&e->prog, st, views[st].c1, views[st].c1_bytes);
     }
     nvn_vk_program_free(&fp);
