@@ -604,9 +604,14 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
 // 用来构造「准备阶段给不出镜像」这条只能靠故障注入覆盖的路径。
 int rp_test_buf_resolve_block(void) __attribute__((weak));
 
+// 弱链接[replay]：rp_tex_clear_active
+// 弱链接[replay]：rp_pass_tex_clear_before_buf
+#pragma weak rp_tex_clear_active
+#pragma weak rp_pass_tex_clear_before_buf
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
     if (rp_test_buf_resolve_block && rp_test_buf_resolve_block()) return 0;
-    (void)c;
+    if (c && rp_pass_tex_clear_before_buf && &rp_tex_clear_active && rp_tex_clear_active)
+        rp_pass_tex_clear_before_buf(c, addr, len);
     const uint8_t *mem; uint64_t size;
     if (!len || !rp_pool_find(addr, len, &mem, &size)) { nvn_unimpl("buf", "address_outside_pools", (const void *)(uintptr_t)addr); return 0; }
     pthread_mutex_lock(&g_bmu);
@@ -625,6 +630,9 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
 // 批量：一次抢锁解析多段（顶点流 / 存储缓冲），成功写 1、失败写 0。
 static void resolve_multi_chunk(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
     const uint8_t *mem[16]; uint64_t size[16];
+    // 批量入口只在回放线程解析本笔绑定，当前段由挂起项记录。
+    if (rp_pass_tex_clear_before_buf && &rp_tex_clear_active && rp_tex_clear_active)
+        for (int i = 0; i < n && rp_tex_clear_active; i++) rp_pass_tex_clear_before_buf(NULL, addr[i], len[i]);
     for (int i = 0; i < n; i++) { mem[i] = NULL; size[i] = 0; ok[i] = 0; if (len[i]) rp_pool_find(addr[i], len[i], &mem[i], &size[i]); }
     const uint64_t w0 = (g_res_tm && n) ? res_now() : 0;
     pthread_mutex_lock(&g_bmu);

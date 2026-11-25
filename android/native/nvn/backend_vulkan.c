@@ -2595,6 +2595,9 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     // 走计算解码的块压缩格式：能力是照「解码后的格式」查的，但它只能被采样——建图入口不收渲染 / 存储用途。
     // 把解码后格式的「可存储」原样报出去，核心会给带 IMAGE 标志的压缩贴图加存储用途，建图就被拒（#697：Mali 上 5 种格式的贴图全建不出来，背景全黑）。
     if (bcdec) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER | NVN_GPU_FMT_READBACK;   // 回读照样是原压缩块字节（copy_tex_buf → bc_readback）
+    if (!bcdec && !(out & NVN_GPU_FMT_SUBST) &&
+        (o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && (o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
+        out |= NVN_GPU_FMT_CLEAR_FOLD;
     // 通道映射补分量位置的退回格式：存储字节的分量顺序不是 NVN 的，回读也就不是 NVN 字节（下一行连 READBACK 一起去掉）
     // #975：16 位打包格式走退回格式时，分量位置靠采样视图的通道映射补回；渲染 / 存储 / 顶点取数不经通道映射，不报这些能力。
     { uint8_t map[4]; if (nvn_vk_format_chanmap(nvn_format, map)) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER; }
@@ -8063,7 +8066,13 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     cmd_ref(c, d, REF_TEX);
 }
 
-void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], const uint32_t u4[4], int is_int) {
+int nvn_gpu_cmd_keep_clear_view(nvn_gpu_cmd c, nvn_gpu_view v) {
+    if (!c || c->in_pass || !v || !v->tex || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    cmd_ref(c, v, REF_VIEW);
+    return rc_is(c->sticky, NVN_GPU_OK);
+}
+
+static void clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], const uint32_t u4[4], int is_int, int kept) {
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -8106,7 +8115,15 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
-    cmd_ref(c, t, REF_TEX);
+    if (!kept) cmd_ref(c, t, REF_TEX);
+}
+
+void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t u4[4], int is_int) {
+    clear_view(c, v, rgba, u4, is_int, 0);
+}
+
+void nvn_gpu_clear_kept_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t u4[4], int is_int) {
+    clear_view(c, v, rgba, u4, is_int, 1);
 }
 
 // 现解贴图（bc_decoded）的压缩原数据影子：显存里存的是解码后的格式，游戏按压缩字节回读（贴图 → 缓冲拷贝）时要的是原字节。

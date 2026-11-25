@@ -845,8 +845,14 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
     }
 }
 
+// 弱链接[replay]：rp_tex_clear_active
+// 弱链接[replay]：rp_pass_tex_clear_before_tex
+#pragma weak rp_tex_clear_active
+#pragma weak rp_pass_tex_clear_before_tex
 static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
     if (!t || !t->serial) return NULL;
+    if (c && rp_pass_tex_clear_before_tex && &rp_tex_clear_active && rp_tex_clear_active)
+        rp_pass_tex_clear_before_tex(c, t);
     // 分时抽样（#1103）：原先每次解析都取 3 次时钟（世界稳态每帧至少 2148 次），现在只在采样帧里计时（见 rp_exec.h 的 rp_tm）。
     const int tm_ = rp_tm();
     uint64_t r0_ = tm_ ? res_now() : 0;
