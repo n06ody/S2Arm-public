@@ -13,6 +13,7 @@ enum {
   LA_OFF2 = 10,
   LA_WINDOWS = 11,
   LA_MAX_FRAMES = 2048,
+  LA_MAX_RESTARTS = 2,
   LA_MIN_FRAMES = 50
 };
 // Active provider retirement bypasses backend close. Safe with a live renderer.
@@ -67,7 +68,8 @@ struct la_trial {
   struct la_counts counts, initial;
   uint64_t start, prev, draws, life, compile, decision_boottime_ns;
   int thermal, target, index, environment_set, mode, recovering, rejected, qualified, epoch;
-  unsigned n, empty_windows;
+  double period_s;  // Effective presentation period; zero means no known cap.
+  unsigned n, empty_windows, capped_windows, restarts;
   const char* reason;
 };
 static inline void la_lock(struct la_trial* t, int on, const char* reason) {
@@ -78,6 +80,25 @@ static inline void la_lock(struct la_trial* t, int on, const char* reason) {
 }
 static inline void la_end(struct la_trial* t) {
   la_lock(t, 0, LA_REASON_OFF_INSUFFICIENT_SAMPLES);
+}
+// Drop both arms and their calibrated noise. Advancing epoch fences out completions
+// from segments recorded before this restart, even if both sides selected R0.
+static inline void la_reset_samples(struct la_trial* t) {
+  t->start = t->prev = 0;
+  t->n = t->empty_windows = 0;
+  t->qualified = t->index = t->recovering = t->mode = 0;
+  memset(t->windows, 0, sizeof t->windows);
+  memset(t->noise, 0, sizeof t->noise);
+  t->epoch++;
+}
+static inline void la_restart(struct la_trial* t, const char* reason) {
+  if (t->restarts == LA_MAX_RESTARTS) {
+    la_lock(t, 0, reason);
+    return;
+  }
+  t->restarts++;
+  t->rejected++;
+  la_reset_samples(t);
 }
 // A sparse on-window cannot keep staging active indefinitely. Re-enter the same
 // trial slot after a qualified off-window and a drain of prior in-flight work.
@@ -217,10 +238,15 @@ static inline void la_finish_window(struct la_trial* t, uint64_t now, uint64_t d
       reason = la_compare(&t->windows[LA_BASE], &t->windows[LA_ON1], t->noise);
     if (!reason)
       reason = la_compare(w, &t->windows[LA_ON2], t->noise);
-    la_lock(t, !reason, reason ? reason : LA_REASON_ON_PAIRED_GAIN);
-  } else if (reason)
-    la_lock(t, 0, reason);
-  else {
+    if (!reason)
+      la_lock(t, 1, LA_REASON_ON_PAIRED_GAIN);
+  }
+  if (reason) {
+    if (!strcmp(reason, LA_REASON_OFF_AA_WORKLOAD) || !strcmp(reason, LA_REASON_OFF_CHANGED_WORKLOAD))
+      la_restart(t, reason);
+    else
+      la_lock(t, 0, reason);
+  } else if (!t->reason) {
     t->index++;
     int mode = la_on_window(t->index);
     t->mode = mode;
@@ -270,7 +296,14 @@ static inline void la_frame(struct la_trial* t, uint64_t now, uint64_t acquire, 
     return;
   }
   t->empty_windows = 0;
-  if (t->recovering) {
+  // Only R0 must have room to demonstrate the required gain. A successful R1
+  // may itself hit the cap. Check after the direct-only budget, before sorting.
+  double gain = 1 + fmax(.05, t->noise[LA_FPS]);
+  if (!t->mode && t->period_s > 0 && t->n * t->period_s * gain >= (now - t->start) / 1e9) {
+    t->capped_windows++;
+    if (t->index)
+      la_restart(t, LA_REASON_OFF_CHANGED_WORKLOAD);
+  } else if (t->recovering) {
     t->recovering = 0;
     t->mode = 1;
     t->epoch++;

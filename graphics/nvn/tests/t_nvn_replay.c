@@ -6898,6 +6898,11 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
 // ADPF 帧负载上报接在新层出图点：出图前对本帧报 frame_end（目标 = 游戏周期），出图后对下一帧开 work_begin；没有显示面时关会话、不报。
 //   期望（手算）：无显示面出图 → invisible 1 次、frame_end / work_begin 0 次；有显示面、周期 1/30 s：
 //   第 1 次 → frame_end(33333333, 1)、work_begin(2)；第 2 次 → frame_end(33333333, 2)、work_begin(3)。
+static double g_land_period;
+void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present, uint64_t draws, int target, double period_s) {
+    (void)now; (void)acquire; (void)present; (void)draws; (void)target;
+    g_land_period = period_s;
+}
 static void t_present_adpf(void) {
     pass_fresh(); rp_present_reset(); memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = 0;
     g_adpf_begin_n = g_adpf_end_n = g_adpf_invis_n = 0; g_adpf_begin_seq = g_adpf_end_seq = 0; g_adpf_end_target = 0;
@@ -6907,6 +6912,7 @@ static void t_present_adpf(void) {
     CHECK(g_adpf_invis_n == 1 && g_adpf_end_n == 0 && g_adpf_begin_n == 0);
     rp_present_set_surface(&g_fake_surf, 60);
     nvn_be_present(&t, 1.0 / 30, NULL);
+    CHECK(g_land_period == 1.0 / 30);   // 60 Hz 显示面上的实际 30 fps 呈现上限
     CHECK(g_adpf_end_n == 1 && g_adpf_end_seq == 1 && g_adpf_end_target == 33333333 && g_adpf_begin_n == 1 && g_adpf_begin_seq == 2);
     nvn_be_present(&t, 1.0 / 30, NULL);
     CHECK(g_adpf_end_n == 2 && g_adpf_end_seq == 2 && g_adpf_begin_n == 2 && g_adpf_begin_seq == 3 && g_adpf_invis_n == 1);

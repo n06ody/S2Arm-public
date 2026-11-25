@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     if (frame_test) {
         g.land_auto = g.land_readback = 1;
         land_auto_check_gap_locked(LA_SECOND);
-        nvn_gpu_land_auto_present(LA_SECOND, 1, 1, 1, 1);
+        nvn_gpu_land_auto_present(LA_SECOND, 1, 1, 1, 1, 1.0 / 60);
         if (strcmp(argv[1], "frame-empty")) {
             s2a_frame_log_present_timed(3000, 7000);
             nvn_vk_frame_log_fence_wait(2500000);

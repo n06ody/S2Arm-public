@@ -28,11 +28,11 @@ static void land_auto_log_locked(int exiting) {
   char msg[3900];
   int pos = snprintf(
       msg, sizeof msg,
-      "回写自动决策 phase=%s mode=%d reason=%s decision_boottime_ns=%llu qualified_windows=%d invalid=%d AA_pairs=%d gain_gate=%.3f "
+      "回写自动决策 phase=%s mode=%d reason=%s decision_boottime_ns=%llu qualified_windows=%d invalid=%d AA_pairs=%d gain_gate=%.3f capped=%u restarts=%u "
       "window=frames/fps/p99ms/tailfps/tailp99ms/acqMean,p95,p99ms/presentMean,p95,p99ms/"
       "eligibleB,spans,subs/staged,bytes/direct/allocs/drawsPerFrame/long33,long100,tail33,tail100",
       exiting ? "exit" : "lock", mode, reason, (unsigned long long)t->decision_boottime_ns, t->qualified, t->rejected, t->windows[LA_AA - 1].frames ? LA_AA / 2 : 0,
-      fmax(.05, t->noise[LA_FPS]));
+      fmax(.05, t->noise[LA_FPS]), t->capped_windows, t->restarts);
   for (int i = 0; i < LA_WINDOWS; i++) {
     const struct la_window* w = &t->windows[i];
     const double* m = w->m;
@@ -78,7 +78,7 @@ static void land_auto_check_gap_locked(uint64_t now) {
   }
 }
 void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present, uint64_t draws,
-                               int target) {
+                               int target, double period_s) {
   if (!g.land_auto || atomic_load_explicit(&g.land_reported, memory_order_relaxed))
     return;
   uint64_t life = 0;
@@ -98,16 +98,12 @@ void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present,
     la_lock(t, 0, LA_REASON_OFF_NO_CACHED_TYPE);
   } else if (foreground != 1 || thermal < 0 || !nvk_shader_live_compile_total ||
              (t->environment_set && (life != t->life || thermal != t->thermal ||
-                                    compile != t->compile || target != t->target))) {
+                                    compile != t->compile || target != t->target || period_s != t->period_s))) {
     // Drop observations across a lifecycle, frequency-class, compile or pacing
     // change. Previous paired windows cannot be compared across that boundary.
     if (t->start || t->qualified || t->recovering) {
       t->rejected++;
-      t->start = t->prev = t->n = 0;
-      t->qualified = t->index = t->recovering = t->mode = 0;
-      memset(t->windows, 0, sizeof t->windows);
-      memset(t->noise, 0, sizeof t->noise);
-      t->epoch++;
+      la_reset_samples(t);
     }
     t->empty_windows = 0;
     t->environment_set = 0;
@@ -117,6 +113,7 @@ void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present,
     t->thermal = thermal;
     t->compile = compile;
     t->target = target;
+    t->period_s = period_s;
     la_frame(t, now, acquire, present, draws, g.land_prior_live != 0);
   }
   if (t->epoch != previous_epoch)

@@ -18,7 +18,7 @@ static int session_logs(int stop_at) {
   uint64_t now = LA_SECOND, draws = 0;
   for (unsigned i = 0; i < 70; i++) {
     now += LA_SECOND;
-    nvn_gpu_land_auto_present(now, 1, 1, 0, 1);
+    nvn_gpu_land_auto_present(now, 1, 1, 0, 1, 1.0 / 60);
   }
   CHECK(!lines && g.land_trial.qualified == 0 && !g.land_trial.mode);
   now += 6 * LA_SECOND;
@@ -32,7 +32,7 @@ static int session_logs(int stop_at) {
       g.land_trial.counts.staged_bytes += 100;
     }
     land_auto_check_gap_locked(now);
-    nvn_gpu_land_auto_present(now, 1, 1, draws, 1);
+    nvn_gpu_land_auto_present(now, 1, 1, draws, 1, 1.0 / 60);
   }
   CHECK(g.land_trial.qualified == stop_at);
   if (stop_at == LA_WINDOWS) {
@@ -78,19 +78,19 @@ static int direct_only(enum interrupt interruption) {
     if (interrupt == THERMAL || interrupt == STALE_EPOCH) {
       thermal += interrupt == THERMAL;
       g.land_prior_live = interrupt == STALE_EPOCH;
-      nvn_gpu_land_auto_present(++now, 1, 1, draws, 1);
+      nvn_gpu_land_auto_present(++now, 1, 1, draws, 1, 1.0 / 60);
       g.land_prior_live = 0;
     }
     if (interrupt == BOUNDARY_BYTES)
       g.land_trial.counts.bytes += 8192;  // Completed between the previous end and this baseline.
-    int intervals = interrupt == SPARSE ? 25 : 300;
+    int intervals = interrupt == SPARSE ? 25 : interrupt == ELIGIBLE ? 150 : 300;
     for (int frame = 0; frame <= intervals; frame++) {
       now += (5 * LA_SECOND + intervals - 1) / intervals;
       draws += interrupt == NO_DRAW ? 0 : 1000;
       g.land_trial.counts.direct++;
       if (interrupt == ELIGIBLE)
         g.land_trial.counts.bytes += 8192;
-      nvn_gpu_land_auto_present(now, 1, 1, draws, 1);
+      nvn_gpu_land_auto_present(now, 1, 1, draws, 1, 1.0 / 60);
     }
     if (window < expected_window)
       CHECK(!lines && !g.land_trial.reason);
@@ -100,7 +100,7 @@ static int direct_only(enum interrupt interruption) {
   CHECK(g.land_trial.qualified == (interruption == ELIGIBLE ? 1 : 0));
   while (now < 1800 * LA_SECOND) {
     now += 16666667;
-    nvn_gpu_land_auto_present(now, 1, 1, ++draws, 1);
+    nvn_gpu_land_auto_present(now, 1, 1, ++draws, 1, 1.0 / 60);
   }
   CHECK(lines == 1 && !g.land_trial.mode);
   uint64_t locked = g.land_trial.decision_boottime_ns;
@@ -110,6 +110,84 @@ static int direct_only(enum interrupt interruption) {
   CHECK(g.land_trial.decision_boottime_ns == locked);
   return 0;
 }
+// Five seconds of eligible readbacks. Count work at completion as the backend does.
+static uint64_t probe_time, probe_draws;
+static void probe_start(void) {
+  memset(&g, 0, sizeof g);
+  g.land_auto = g.land_readback = 1;
+  probe_time = LA_SECOND;
+  probe_draws = lines = thermal = 0;
+}
+static void probe_window(unsigned fps, unsigned draws_per_frame, int cap_hz) {
+  const uint64_t dt = (LA_SECOND + fps - 1) / fps;
+  for (unsigned i = 0; i <= 5 * fps; i++) {
+    probe_time += dt;
+    probe_draws += draws_per_frame;
+    g.land_trial.counts.bytes += 512;
+    if (g.land_trial.mode) {
+      g.land_trial.counts.staged++;
+      g.land_trial.counts.staged_bytes += 512;
+    }
+    nvn_gpu_land_auto_present(probe_time, 1000, 1000, probe_draws, 1, 1.0 / cap_hz);
+  }
+}
+static int menu_then_play(int cap_hz) {
+  probe_start();
+  for (int i = 0; i < 36; i++) {
+    probe_window(i == 5 ? cap_hz - 1 : cap_hz, i == 0 ? 25 : 30, cap_hz);
+    CHECK(!lines && !g.land_trial.mode && g.land_trial.qualified == 0);
+  }
+  CHECK(g.land_trial.capped_windows == 36 && !g.land_trial.restarts);
+  for (int i = 0; i < LA_WINDOWS; i++)
+    probe_window(g.land_trial.mode ? cap_hz : cap_hz / 2, 1069, cap_hz);
+  CHECK(lines == 1 && g.land_trial.mode && !strcmp(g.land_trial.reason, "paired_gain"));
+  return 0;
+}
+static int cap_after_start(void) {
+  probe_start();
+  for (int i = 0; i < LA_WARM; i++)
+    probe_window(20, 100, 60);
+  CHECK(g.land_trial.mode && g.land_trial.index == LA_WARM);
+  // An interrupted R1 first recovers in R0; a capped recovery must not re-enable it.
+  la_discard(&g.land_trial);
+  const int epoch = g.land_trial.epoch;
+  g.land_live_count = 1;
+  probe_window(60, 30, 60);
+  CHECK(!g.land_trial.mode && !g.land_trial.recovering && !g.land_trial.index &&
+        g.land_trial.restarts == 1 && g.land_trial.epoch > epoch && g.land_prior_live == 1);
+  probe_window(20, 100, 60);
+  CHECK(!g.land_trial.qualified);  // Old-epoch work still active.
+  g.land_live_count = g.land_prior_live = 0;
+  for (int i = 0; i < LA_WINDOWS; i++)
+    probe_window(20, 100, 60);
+  CHECK(lines == 1 && !strcmp(g.land_trial.reason, "fps_within_noise") &&
+        strstr(decision, "capped=1 restarts=1 "));
+  return 0;
+}
+
+static int workload_restart(int changed_pair, int exhaust) {
+  probe_start();
+  for (int attempt = 0; attempt < (exhaust ? 3 : 1); attempt++) {
+    const int windows = changed_pair ? LA_WINDOWS : LA_AA;
+    for (int i = 0; i < windows; i++) {
+      int changed = changed_pair ? i == LA_ON1 : i == 0;
+      probe_window(g.land_trial.mode ? 25 : 20, changed ? 250 : 100, 60);
+    }
+    if (attempt < 2) {
+      CHECK(!lines && !g.land_trial.mode && g.land_trial.index == 0);
+      CHECK(!g.land_trial.qualified && !g.land_trial.windows[0].frames && !g.land_trial.noise[LA_FPS]);
+    }
+  }
+  if (exhaust)
+    CHECK(lines == 1 && !g.land_trial.mode && !strcmp(g.land_trial.reason, changed_pair ? "changed_workload" : "AA_workload"));
+  else {
+    for (int i = 0; i < LA_WINDOWS; i++)
+      probe_window(g.land_trial.mode ? 25 : 20, 100, 60);
+    CHECK(lines == 1 && g.land_trial.mode && !strcmp(g.land_trial.reason, "paired_gain"));
+  }
+  return 0;
+}
+
 enum scenario {
   GAIN,
   LOSS,
@@ -140,7 +218,7 @@ static int run(enum scenario scenario, const char* reason) {
   CHECK(t.rejected > 0 && t.index == 0 && t.mode == 0 && !t.reason);
   la_frame(&t, now, 0, 0, draws, 1);  // Drain between the loading and field workload.
   const uint64_t gameplay = now;
-  while (!t.reason && now - gameplay < 62 * LA_SECOND) {
+  while (!t.reason && now - gameplay < (scenario == WORKLOAD ? 180 : 62) * LA_SECOND) {
     int on = t.mode;
     uint64_t dt = on ? 40000000 : 50000000, pressure = 1000000;
     if (scenario == NOISE)
@@ -194,6 +272,14 @@ int main(void) {
   CHECK(t.start == 90000000000ull && !t.mode && !t.reason);
   la_end(&t);
   CHECK(!t.mode && !strcmp(t.reason, "insufficient_samples") && t.qualified == 0);
+  CHECK(!menu_then_play(60));
+  CHECK(!menu_then_play(30));
+  CHECK(!menu_then_play(120));
+  CHECK(!cap_after_start());
+  CHECK(!workload_restart(0, 0));
+  CHECK(!workload_restart(1, 0));
+  CHECK(!workload_restart(0, 1));
+  CHECK(!workload_restart(1, 1));
   for (int i = NONE; i <= THERMAL; i++)
     CHECK(!direct_only((enum interrupt)i));
   CHECK(!session_logs(0));
@@ -213,7 +299,7 @@ int main(void) {
   CHECK(!run(TAIL, "tail_fps"));
   CHECK(!run(STALE, "insufficient_samples"));
   puts(
-      "PASS land auto: cold start, both pairs, AA noise, frame coverage, actual staging, tail, WSI, "
+      "PASS land auto: capped menu to gameplay at 30/60/120 Hz, bounded workload restarts, stale epoch drain, cold start, both pairs, AA noise, frame coverage, actual staging, tail, WSI, "
       "loading, 11 consecutive direct-only windows, retained exit and insufficient samples");
   return 0;
 }
