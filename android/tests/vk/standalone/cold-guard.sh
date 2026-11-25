@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 门禁间接：android/tests/vk/run.sh 默认档按 standalone/*.sh 通配逐个跑，可单跑 --cold-guard。
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 S2Arm contributors
 set -euo pipefail
