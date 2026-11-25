@@ -193,6 +193,24 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
     pthread_mutex_unlock(&g_mu);
     return hit;
 }
+// NULL 取池表代际；非空要求整份镜像的后备恰由一个池登记覆盖，含嵌套、同起点池在内的别名都不作证明。
+uint64_t rp_pool_mirror_epoch(const uint8_t *mem, uint64_t size) {
+    if (!mem) return __atomic_load_n(&g_pool_epoch, __ATOMIC_ACQUIRE);
+    const uint64_t base = (uintptr_t)mem;
+    if (size > UINT64_MAX - base || pthread_mutex_trylock(&g_mu)) return 0;
+    int lo = 0, hi = g_npool;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if ((uintptr_t)g_pool[mid].mem < base) lo = mid + 1;
+        else hi = mid;
+    }
+    const int unique = lo < g_npool && g_pool[lo].mem == mem && g_pool[lo].size == size &&
+                       (lo == 0 || g_pool_maxend[lo - 1] <= base) &&
+                       (lo + 1 == g_npool || (uintptr_t)g_pool[lo + 1].mem >= base + size);
+    const uint64_t epoch = unique ? __atomic_load_n(&g_pool_epoch, __ATOMIC_RELAXED) : 0;
+    pthread_mutex_unlock(&g_mu);
+    return epoch;
+}
 int rp_pool_count(void) { pthread_mutex_lock(&g_mu); int n = g_npool; pthread_mutex_unlock(&g_mu); return n; }
 uint64_t rp_pool_fast_hits(void) { return g_pool_tls.fast_hits; }
 void nvn_be_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // 原始全局内存表：翻译器的裸地址访问接上时用
