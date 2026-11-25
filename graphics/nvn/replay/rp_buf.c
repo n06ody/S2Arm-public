@@ -14,12 +14,14 @@
 #include "nvn_fmt_info.h"
 #include "nvn_dirty.h"
 #include "nvn_mtl.h"
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
-struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
+struct write_origin { uint64_t n, bytes, selected; unsigned ops, stages, slots; };
+struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; struct write_origin origin; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
 // use_sub / use_fence：最近一次用到这份镜像的提交（序号、栅栏值）；prev_fence：再往前一次用到它的提交的栅栏值——
@@ -40,7 +42,7 @@ struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen
 // 以前按整份池禁止，走路时剔除数据每帧都在落地，于是几乎每次解析都退回「录成 GPU 拷贝 + 全屏障」，
 // 真机表现为走路一顿一顿（池镜像同步 4.2 MB/帧、其中直接写只剩 0.2 MB，见坑记录续 33）。
 struct land_rng { uint64_t off, len; };
-struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing;
+struct shadow { const uint8_t *mem; uint64_t size; struct mirror m[2]; uint64_t npages; uintptr_t page0; struct gpu_write *gw; int ngw, cgw; int landing; uint64_t origin_pool;
                 int log_on;
                 int untracked;      // 整个池不在写跟踪里（nvn_dirty_span 取不到）：没有页代号可比，页新旧靠「本次提交里同步过」加「回放自己登记的写」判，见 page_fresh
                 const void *span;   // log_on 时：整个池在写跟踪里的范围句柄（日志按它读）
@@ -100,8 +102,14 @@ static void mirror_free(struct mirror *m, int defer) {
     if (m->buf && !(defer && limbo_push(m->buf))) nvn_gpu_buf_release(m->buf, NULL, NULL);
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
-static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
-                                                       mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s); }
+#include "rp_land_origin.inc"
+
+static void shadow_free(struct shadow *s, int defer) {
+    if (s->origin_pool) for (int i = 0; i < s->ngw; i++) origin_close(s, &s->gw[i], 0);
+    if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE);
+    if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
+    mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s);
+}
 // 镜像映射代号：新建镜像、换镜像都会让「同一段地址解析出的 (缓冲, 偏移)」变掉。回放核心的解析结果缓存按它作废。
 
 // ---------- 脏页追加日志（nvk_buf_dirtylog，#1501 A②）----------
@@ -301,7 +309,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
 // 为什么：落地是段完成时按登记逐条把镜像拷回游戏内存，一条登记就是一次整段 memcpy。同一块存储缓冲被多个派发反复绑定写、每次都登记整段绑定范围时，
 // 重叠的几条拷的是同一份镜像里同一段字节（段完成时镜像里已是最终内容），拷一次与拷多次结果相同。
 // 只并「相交 / 首尾相接」的：并集里没有任何没被写过的字节。中间有空隙的不桥接——空隙里的镜像字节可能比游戏内存里的旧，落地会把新内容盖掉。
-uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged) {
+uint64_t rp_buf_gpu_write_note_from(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged, struct rp_write_source source) {
     static uint64_t next_id;
     const uint8_t *mem; uint64_t size;
     if (merged) *merged = 0;
@@ -312,6 +320,10 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
     struct shadow *s = shadow_get(mem, size); uint64_t id = 0;
     if (s) {
         const uint64_t off = addr - (uint64_t)(uintptr_t)mem, sub = rp_sub_serial();
+        const int trace = origin_on();
+        struct write_origin provenance = {0};
+        if (trace) provenance = origin_raw(source, len);
+        const int selected = provenance.selected != 0;
         rp_perf_add(RP_PERF_GW_REG_N, 1); rp_perf_add(RP_PERF_GW_REG_KB, len / 1024);
         if (merged && merge_on) {
             int mi = g_mirror_cur;   // 与 mirror_pick 同一规则（不带它记账的副作用）：与任一未落地登记相交就跟着那一条的镜像，否则用当前这一份
@@ -325,6 +337,10 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
                 if (g->off < lo) lo = g->off;
                 if (g->off + g->len > hi) hi = g->off + g->len;
                 old_sum += g->len;
+                if (trace) {
+                    if (hit >= 0 && g->origin.selected) origin_absorb(s->origin_pool, g->id, id);
+                    origin_union(&provenance, &g->origin);
+                }
                 if (hit < 0) { hit = k; id = g->id; }
                 else {   // 又一条与并集相接：吸进第一条，自己撤掉（它的登记号还在本次提交的落地表里，迟到的落地按「找不到」忽略）
                     rp_perf_add(RP_PERF_GW_MERGED_N, 1);
@@ -336,6 +352,10 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
                 g->off = lo; g->len = hi - lo;
+                if (trace) {
+                    g->origin = provenance;
+                    origin_accept(s, id, sub, off, len, source, selected);
+                }
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
                 rp_perf_add(RP_PERF_GW_MERGED_KB, (len > grow ? len - grow : 0) / 1024);
@@ -347,10 +367,17 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
             id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
+            if (trace) {
+                s->gw[s->ngw - 1].origin = provenance;
+                origin_accept(s, id, sub, off, len, source, selected);
+            }
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
     pthread_mutex_unlock(&g_bmu);
     return id;
+}
+uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged) {
+    return rp_buf_gpu_write_note_from(addr, len, pool_key, merged, (struct rp_write_source){.op = RP_W_UNKNOWN});
 }
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) { return rp_buf_gpu_write_note2(addr, len, pool_key, NULL); }   // 不合并的老入口（单测与只登记一条的调用方）
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
@@ -428,7 +455,9 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
     pthread_mutex_lock(&g_bmu);
-    for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
+    for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) {
+        if (s->origin_pool) origin_close(s, &s->gw[i], src != NULL);
+        s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
     // 登记撤掉之后同一段改用当前那份镜像：不受写跟踪的池里，那份镜像此前同步这些页时按登记跳过了这段字节，落地的内容它没有——作废这几页，下次使用重新同步。
     // 写它的那一份镜像里本来就是新的，不动（受跟踪的池里落地的 memcpy 自己会让页变脏）。
@@ -714,6 +743,11 @@ void rp_buf_reset(void) {
     if (g_null_storage) nvn_gpu_buf_release(g_null_storage, NULL, NULL);
     g_null_storage = NULL;
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
+    origin_report_locked(1);
+    origin_enabled = origin_frame = -1;
+    origin_frame_done = 0;
+    origin_capture = (struct origin_counts){0};
+    origin_selected_closed = origin_cross_frame = 0;
     g_land_noresync = -1;
     pthread_mutex_unlock(&g_bmu);
 }
@@ -768,8 +802,8 @@ int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
 // 三条 CPU 改游戏内存的命令遇到还没落地的 GPU 写（#1022、#697）：CPU 现在读写游戏内存，读到的是 GPU 写之前的旧内容；写进去的又会被稍后的落地盖掉。
 // 这时改在 GPU 上按提交顺序做（照 iOS mtl_sub_copy / mtl_sub_fill）：在镜像里拷 / 填 / 写，目标登记成本次提交的 GPU 写——镜像同步跳过它、段完成时落回游戏内存；
 // 常量缓冲绑到这段时直接绑镜像（rp_draw.c）。不相交就返回 0，调用方照旧在 CPU 上做（绝大多数情况，零额外开销）。
-static int gpu_dst_done(uint64_t d, uint64_t n, const char *what, const void *rec) {
-    if (!rp_post_gpu_write(d, n)) nvn_unimpl("buf", what, rec);   // 登记不上：结果留在镜像里、落不回游戏内存（记账，不静默）
+static int gpu_dst_done(uint64_t d, uint64_t n, enum rp_write_op op, const char *what, const void *rec) {
+    if (!rp_post_gpu_write_from(d, n, (struct rp_write_source){.op = op})) nvn_unimpl("buf", what, rec);   // 登记不上：结果留在镜像里、落不回游戏内存（记账，不静默）
     rp_cpu_write_gen++; rp_write_note(d, n); rp_gpu_wr_gen++;   // 目标内容变了（游戏内存要到落地才变）：段内切片表、整组沿用、base instance 批量表按它作废
     rp_perf_add(RP_PERF_BUF_GPU_ORDER_N, 1);
     return 1;
@@ -781,7 +815,7 @@ int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, d, n, &db, &off)) return 0;
     nvn_gpu_buf_write(c, db, off, (const uint8_t *)a + 16, n);
-    return gpu_dst_done(d, n, "update_gpu_write_note_failed", rec);
+    return gpu_dst_done(d, n, RP_W_UPDATE, "update_gpu_write_note_failed", rec);
 }
 int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
@@ -791,7 +825,7 @@ int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec) {
     nvn_gpu_buf sb, db; uint64_t so, doff;
     if (!rp_buf_resolve(c, s, n, &sb, &so) || !rp_buf_resolve(c, d, n, &db, &doff)) return 0;
     nvn_gpu_copy_buf(c, sb, so, db, doff, n);
-    return gpu_dst_done(d, n, "copy_gpu_write_note_failed", rec);
+    return gpu_dst_done(d, n, RP_W_COPY, "copy_gpu_write_note_failed", rec);
 }
 int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec) {
     if (!c || !cb->size || !in_pool(cb->addr, cb->size) || !rp_buf_gpu_pending(cb->addr, cb->size)) return 0;
@@ -800,7 +834,7 @@ int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec) {
     nvn_gpu_buf db; uint64_t off;
     if (!rp_buf_resolve(c, cb->addr, cb->size, &db, &off)) return 0;
     nvn_gpu_fill_buf(c, db, off, cb->size, cb->value);
-    return gpu_dst_done(cb->addr, cb->size, "clear_gpu_write_note_failed", rec);
+    return gpu_dst_done(cb->addr, cb->size, RP_W_FILL, "clear_gpu_write_note_failed", rec);
 }
 void rp_op_update_ub(const void *a, const void *rec) {
     uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);

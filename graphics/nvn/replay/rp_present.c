@@ -279,6 +279,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
             { const uint64_t cpu = tc_thread_cpu_ns(); if (cpu) rp_present_tc_note(now, cpu); }
             fseg_frame(&g_fseg, now, atomic_load_explicit(&g_tgt_itv, memory_order_relaxed), atomic_load_explicit(&g_tgt_set_ns, memory_order_relaxed));
             if (now - t_last >= 5000000000ull) {
+                rp_land_origin_report();
                 uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
                 { char pb[1024]; if (rp_pipe_fail_summary(pb, sizeof pb)) nvn_plat_log(NVN_PLAT_LOG_INFO, "present", pb); }   // 图形管线失败分类：有新失败 / 新挡下的窗口才打
                 uint64_t fr = g_n_shown + 1 - n_last; double sec = (double)(now - t_last) / 1e9, f = fr ? (double)fr : 1.0;
