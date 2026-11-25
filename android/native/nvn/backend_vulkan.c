@@ -57,10 +57,11 @@
 #include "vk_device.h"
 #include "spirv_storage.h"   // 顶点阶段的存储写检查（与直连接纳同一份，按 Vulkan 规范的 NonWritable 判）
 #include "spirv_workgroup.h" // 最终 SPIR-V 的实际计算工作组尺寸（含 WorkgroupSize 的优先级）
+#include "spirv_write_bound.h"
 #include "spirv_compliance.h"   // #1865 统一装载闸：能力 / 扩展 / 存储类字节声明扫描
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 24, "核对 Vulkan 后端与新版 NVN GPU 契约");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 25, "核对 Vulkan 后端与新版 NVN GPU 契约");
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -184,6 +185,7 @@ struct nvn_gpu_shader_s {
     const char *missing_vertex_feature;   // #1072：顶点阶段写存储 / 写裁剪、剔除距离要的特性设备没启用（特性名）；NULL = 不缺
     nvn_gpu_stage stage;
     uint8_t precompiled;
+    struct s2a_write_bound *write_bounds;  // immutable, indexed by the shader layout entry
     uint8_t stage_key[8], spirv_digest[32];  // 库阶段键与实际交给 Vulkan 的模块摘要
     uint8_t src_key[8];          // 装载时调用方给的阶段键（现编 / 出库都有，只作日志；stage_key 只在出库件上填）
     nvn_gpu_layout_ent *ents;
@@ -2627,6 +2629,9 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     // 走计算解码的块压缩格式：能力是照「解码后的格式」查的，但它只能被采样——建图入口不收渲染 / 存储用途。
     // 把解码后格式的「可存储」原样报出去，核心会给带 IMAGE 标志的压缩贴图加存储用途，建图就被拒（#697：Mali 上 5 种格式的贴图全建不出来，背景全黑）。
     if (bcdec) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER | NVN_GPU_FMT_READBACK;   // 回读照样是原压缩块字节（copy_tex_buf → bc_readback）
+    if (!bcdec && !(out & NVN_GPU_FMT_SUBST) &&
+        (o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && (o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
+        out |= NVN_GPU_FMT_CLEAR_FOLD;
     // 通道映射补分量位置的退回格式：存储字节的分量顺序不是 NVN 的，回读也就不是 NVN 字节（下一行连 READBACK 一起去掉）
     // #975：16 位打包格式走退回格式时，分量位置靠采样视图的通道映射补回；渲染 / 存储 / 顶点取数不经通道映射，不报这些能力。
     { uint8_t map[4]; if (nvn_vk_format_chanmap(nvn_format, map)) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER; }
@@ -2741,6 +2746,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         if (sh->mod) vkDestroyShaderModule(g.d, sh->mod, NULL);
         free(sh->ents);
         free(sh->tfmt);
+        free(sh->write_bounds);
         free(sh);
         sh = sn;
     }
@@ -3705,6 +3711,7 @@ static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s
     if (sh->mod) vkDestroyShaderModule(vk->d, sh->mod, NULL);
     free(sh->ents);
     free(sh->tfmt);
+    free(sh->write_bounds);
     free(sh);
 }
 
@@ -4026,6 +4033,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
             s2a_sha256_final(&hash, sh->spirv_digest);
         }
+        if (module_result == VK_SUCCESS && sh->stage == NVN_GPU_SH_CS && nvn_plat_flag("nvk_land_bound", 0))
+            sh->write_bounds = s2a_spirv_write_bounds(ci.pCode, ci.codeSize, sh->entry, sh->ents, sh->nent);
         free(array_code);
         if (module_result != VK_SUCCESS) {
             free(sh->tfmt); free(sh->ents); free(sh);
@@ -4047,6 +4056,13 @@ int nvn_vk_cold_shader_digest(nvn_gpu_shader shader, uint8_t sha[32]) {
     if (!g.cold_enabled || !shader || shader->stage != NVN_GPU_SH_FS || !shader->mod) return 0;
     memcpy(sha, shader->spirv_digest, 32);
     return 1;
+}
+
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader sh, unsigned index, unsigned set, unsigned binding, uint32_t groups_x) {
+    if (!sh || !sh->write_bounds || index >= sh->nent || !groups_x ||
+        sh->ents[index].set != set || sh->ents[index].binding != binding) return 0;
+    struct s2a_write_bound b = sh->write_bounds[index];
+    return (uint64_t)(groups_x - 1) * b.group_stride + b.end_first_group;
 }
 
 void nvn_gpu_shader_release(nvn_gpu_shader sh) {
@@ -8124,7 +8140,13 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     cmd_ref(c, d, REF_TEX);
 }
 
-void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], const uint32_t u4[4], int is_int) {
+int nvn_gpu_cmd_keep_clear_view(nvn_gpu_cmd c, nvn_gpu_view v) {
+    if (!c || c->in_pass || !v || !v->tex || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    cmd_ref(c, v, REF_VIEW);
+    return rc_is(c->sticky, NVN_GPU_OK);
+}
+
+static void clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], const uint32_t u4[4], int is_int, int kept) {
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -8167,7 +8189,15 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
-    cmd_ref(c, t, REF_TEX);
+    if (!kept) cmd_ref(c, t, REF_TEX);
+}
+
+void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t u4[4], int is_int) {
+    clear_view(c, v, rgba, u4, is_int, 0);
+}
+
+void nvn_gpu_clear_kept_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t u4[4], int is_int) {
+    clear_view(c, v, rgba, u4, is_int, 1);
 }
 
 // 现解贴图（bc_decoded）的压缩原数据影子：显存里存的是解码后的格式，游戏按压缩字节回读（贴图 → 缓冲拷贝）时要的是原字节。
@@ -9461,6 +9491,7 @@ void nvn_gpu_vk_test_close_pipe_only(void) {
         if (sh->mod) vkDestroyShaderModule(g.d, sh->mod, NULL);
         free(sh->ents);
         free(sh->tfmt);
+        free(sh->write_bounds);
         free(sh);
         sh = sn;
     }
