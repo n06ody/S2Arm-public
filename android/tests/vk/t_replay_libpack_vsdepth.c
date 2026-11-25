@@ -3,7 +3,9 @@
 // 同一条命令里先画一笔 vs+fs（片元带支撑缓冲绑定，写颜色），再解绑片元、换成只有深度附件的通道画一笔只有 vs 的（z = 0.5，深度测试 ALWAYS、写深度），
 // 读回深度。第二笔取到的必须是库里的真 vs（不造 fs），且前一笔留在后端的片元绑定不能带过来（坑记录「程序里没有的阶段不发绑定」）。
 #define main backend_fixture_main
+#define nvn_plat_flag backend_fixture_flag
 #include "t_backend_vk.c"
+#undef nvn_plat_flag
 #undef main
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -18,10 +20,26 @@
 #include "direct/jv.h"
 #include "dmsh_chain.h"
 #include "direct/libpack_vk.h"
+#include "direct/program_cache.h"
+#include "nvn_plat.h"
+#include "nvn_vk_pipe_warm.h"
+#include "nvn_vk_prog_warm.h"
 #include <sys/stat.h>
 
 static int compile_calls;
 static int test_outputs;
+enum warm_mode { WARM_NONE, WARM_DONOR, WARM_REUSE, WARM_LATE, WARM_ALIGNED, WARM_DIFFERENT };
+static enum warm_mode warm_mode;
+static const char profile_hash[] = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+static const char translator_closure[] = "libpack-c0-test";
+static char warm_cache[1024], warm_manifest[1024];
+int nvn_plat_flag(const char *name, int dflt) {
+    if (warm_mode && !strcmp(name, "nvk_lp_used_slots")) return warm_mode != WARM_DONOR;
+    if (warm_mode && !strcmp(name, "nvk_resolve_check")) return 1;
+    return backend_fixture_flag(name, dflt);
+}
+const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE && warm_cache[0] ? warm_cache : NULL; }
+const char *nvk_session_cache_dir(void) { return nvn_plat_dir(NVN_PLAT_DIR_CACHE); }
 static const char *case_dir;
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target_color, target_depth; static tex_t color_tex, depth_tex; static nvn_gpu_view color_view, depth_view;
@@ -101,15 +119,15 @@ void rp_pass_flush(nvn_gpu_cmd c) { nvn_gpu_pass_end(c); }
 static const char profile_json[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
-    c->profile_json = profile_json; c->profile_bytes = sizeof profile_json - 1; c->profile_hash = "";
-    c->translator_closure = "libpack-c0-test"; c->storage_buffer_offset_alignment = 16; return 0;
+    c->profile_json = profile_json; c->profile_bytes = sizeof profile_json - 1; c->profile_hash = warm_mode ? profile_hash : "";
+    c->translator_closure = translator_closure; c->storage_buffer_offset_alignment = 16; return 0;
 }
 // 现编不该被走到：出库命中（或出库拒后的退路）都不会有结果；调用次数就是证据。
 static int32_t compiled_result(uint64_t session, uint64_t generation, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
     (void)session; (void)generation; (void)req; compile_calls++;
-    if (!test_outputs) return -1;
+    if (!test_outputs && !warm_mode) return -1;
     char path[1100]; size_t n=0;
-    snprintf(path,sizeof path,"%s/mrt-ordinary.json",case_dir);
+    snprintf(path, sizeof path, "%s/%s", case_dir, warm_mode ? "warm-ordinary.json" : "mrt-ordinary.json");
     uint8_t *data=read_file(path,&n);
     if (!data) return -1;
     int rc=emit(sink,(s2a_direct_bytes){data,n}); free(data); return rc;
@@ -208,10 +226,136 @@ static void clip_control_draws(nvn_gpu_tex depth, uint64_t signal, int clamp_onl
 
 #include "t_libpack_mrt.inc"
 
+// Record the same depth draw once on the old route, then start with empty local
+// state and load both shipped lists through the production warm entry points.
+static int warm_paths(void) {
+    if (warm_mode != WARM_DONOR) {
+        int n = snprintf(warm_cache, sizeof warm_cache, "%s/local", case_dir);
+        if (n < 0 || (size_t)n >= sizeof warm_cache) return -1;
+        return mkdir(warm_cache, 0700) && errno != EEXIST ? -1 : 0;
+    }
+    uint8_t digest[32];
+    char closure[65], profile[65], parent[768], cohort[900];
+    s2a_sha256 h;
+    s2a_sha256_init(&h); s2a_sha256_update(&h, translator_closure, strlen(translator_closure)); s2a_sha256_final(&h, digest);
+    s2a_sha256_hex(digest, closure);
+    s2a_sha256_init(&h); s2a_sha256_update(&h, profile_json, sizeof profile_json - 1); s2a_sha256_final(&h, digest);
+    s2a_sha256_hex(digest, profile);
+    const char *root = getenv("S2A_SHADER_REVISION_ROOT");
+    if (!root) return -1;
+    int n = snprintf(parent, sizeof parent, "%s/shaders/direct/warm-vk", root);
+    if (n < 0 || (size_t)n >= sizeof parent) return -1;
+    snprintf(cohort, sizeof cohort, "%s/%.16s-%.16s", parent, closure, profile);
+    snprintf(warm_cache, sizeof warm_cache, "%s/nowindow", cohort);
+    snprintf(warm_manifest, sizeof warm_manifest, "%s/programs-v1-%.16s.bin", cohort, closure);
+    return mkdir(parent, 0700) || mkdir(cohort, 0700) || mkdir(warm_cache, 0700) ||
+        setenv("S2A_DIRECT_CACHE_DIR", warm_cache, 1) ? -1 : 0;
+}
+
+static void test_warm_depth(nvn_gpu_tex depth) {
+    p_bind_program_id unbind = {NULL, 0, 0x2, 0};
+    p_bind_buf storage = {0, 0, warm_mode == WARM_ALIGNED ? 0x1000 : 0x1001, 32};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &unbind, sizeof unbind + 8) &&
+          rp_state_op(OP_BIND_SSBO, &storage, sizeof storage), "warm depth: program and SSBO state");
+    if (warm_paths()) { CHECK(0, "warm depth: prepare the seed directories"); return; }
+
+    const int donor = warm_mode == WARM_DONOR;
+    const int late = warm_mode == WARM_LATE;
+    const int reuse = warm_mode == WARM_REUSE;
+    struct nvk_prog_rec seed = {0};
+    struct nvk_pipe_rec recipe = {0};
+    const struct rp_prog *prebuilt = NULL;
+    const unsigned before = __atomic_load_n(&g_plc_rec.gp, __ATOMIC_RELAXED);
+    if (!donor) {
+        if (nvk_prog_warm_load() != 1 || nvk_prog_warm_seed_dir(NULL, 0) != 1 ||
+            !nvk_prog_warm_take(&seed) || nvk_pipe_warm_load() != 1 ||
+            !nvk_pipe_warm_take(&recipe) || memcmp(seed.identity, recipe.prog_identity, 32)) {
+            CHECK(0, "warm depth: load the paired program and pipe seed"); return;
+        }
+        if (!late) {
+            CHECK(!nvk_prog_warm_build(&seed) && rp_shader_prog_by_identity(seed.identity, &prebuilt) &&
+                  prebuilt && !prebuilt->lib_sourced, "warm depth: publish ordinary seed program");
+            CHECK(!nvk_pipe_warm_build(&recipe), "warm depth: build the seed pipe");
+            CHECK(__atomic_load_n(&g_plc_rec.gp, __ATOMIC_RELAXED) - before == 1,
+                  "warm depth: the seed alone creates one real Vulkan pipe");
+        }
+    }
+    if (warm_mode == WARM_DIFFERENT) {
+        dpool_t different = {.n = 8};
+        p_set_pool set = {&different};
+        CHECK(rp_state_op(OP_SET_TEX_POOL, &set, sizeof set), "warm depth: change the request's texture facts");
+    }
+
+    pass_mode = 1;
+    nvn_gpu_buf readback = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    memset(buf_cpu(readback), 0xEE, 64);
+    nvn_gpu_cmd cmd = begin_cmd();
+    p_draw draw = {.prim = 4, .count = 3, .instances = 1};
+    const uint64_t hits = nvn_gpu_pipe_warm_hits();
+    rp_draw(cmd, &draw, NULL, &draw);
+    CHECK(pass_began == 1, "warm depth: replay drew one depth pass");
+    nvn_gpu_pass_end(cmd);
+    nvn_gpu_copy_tex_buf(cmd, depth, 0, 0, NULL, readback, 0, 16, 64);
+    nvn_gpu_err e = {0};
+    CHECK(OK(nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &e)), "warm depth: commit %s", e.why);
+    CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &e)), "warm depth: wait %s", e.why);
+    for (int i = 0; i < 16; i++) {
+        float f;
+        memcpy(&f, buf_cpu(readback) + 4 * i, sizeof f);
+        CHECK(f == 0.5f, "warm depth: pixel %d got %g want 0.5", i, (double)f);
+    }
+    nvn_gpu_buf_release(readback, NULL, NULL);
+    const unsigned created = __atomic_load_n(&g_plc_rec.gp, __ATOMIC_RELAXED) - before;
+    const unsigned expected = donor || late || reuse ? 1 : 2;
+    CHECK(created == expected, "warm depth: real Vk graphics creates %u, expected %u", created, expected);
+    CHECK(nvn_gpu_pipe_warm_hits() - hits == (uint64_t)reuse, "warm depth: replay hit the exact warm pipe only for reuse");
+
+    const struct rp_shader_req q = {.prim = 4};
+    const struct rp_prog *active = NULL;
+    CHECK(!rp_shader_resolve(&q, &active) && active && (donor || reuse ? !active->lib_sourced : active->lib_sourced),
+          "warm depth: selected the expected program source");
+    if (reuse) {
+        CHECK(active == prebuilt, "warm depth: replay uses the seed program object");
+        const struct rp_prog *aligned = NULL, *again = NULL;
+        storage.addr = 0x1000;
+        CHECK(rp_state_op(OP_BIND_SSBO, &storage, sizeof storage) &&
+              !rp_shader_resolve(&q, &aligned) && aligned && aligned != prebuilt && aligned->lib_sourced,
+              "warm depth: real alignment keeps its own LibPack choice");
+        storage.addr = 0x1001;
+        CHECK(rp_state_op(OP_BIND_SSBO, &storage, sizeof storage) &&
+              !rp_shader_resolve(&q, &again) && again == prebuilt,
+              "warm depth: the unused slot keeps the seed choice after an aligned resolve");
+    }
+    if (late) {
+        const struct rp_prog *again = NULL;
+        CHECK(!nvk_prog_warm_build(&seed), "warm depth: publish the late seed program");
+        CHECK(!rp_shader_resolve(&q, &again) && again == active, "warm depth: late seed keeps the resolved program");
+    }
+    if (donor) {
+        CHECK(compile_calls == 1 && !s2a_program_cache_drain(5000), "warm depth: ordinary result saved");
+        nvk_prog_warm_save();
+        nvk_pipe_warm_save();
+        const char *name = strrchr(warm_manifest, '/');
+        char original[sizeof warm_cache + 80];
+        snprintf(original, sizeof original, "%s%s", warm_cache, name);
+        CHECK(!rename(original, warm_manifest), "warm depth: install program list next to nowindow");
+    } else {
+        CHECK(compile_calls == 0, "warm depth: no live translation");
+    }
+    printf("libpack warm mode=%d creates=%u depth_pixels=16 failures=%d\n", warm_mode, created, g_fail);
+}
+
 int main(int argc, char **argv) {
     const int clip_control = argc == 3 && !strcmp(argv[2], "--clip-control");
-    test_outputs = argc == 3 && !clip_control;
-    if (argc != 2 && !clip_control && !test_outputs) return 2;
+    if (argc != 2 && argc != 3) return 2;
+    if (argc == 3 && !clip_control) {
+        if (!strcmp(argv[2], "warm-donor")) warm_mode = WARM_DONOR;
+        else if (!strcmp(argv[2], "warm-reuse")) warm_mode = WARM_REUSE;
+        else if (!strcmp(argv[2], "warm-late")) warm_mode = WARM_LATE;
+        else if (!strcmp(argv[2], "warm-aligned")) warm_mode = WARM_ALIGNED;
+        else if (!strcmp(argv[2], "warm-different")) warm_mode = WARM_DIFFERENT;
+        else test_outputs = 1;
+    }
     case_dir = argv[1];
     char path[1100];
     size_t vs_n = 0, fs_n = 0;
@@ -269,6 +413,18 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         free(vs_spv); free(fs_spv);
         printf("libpack clip control: failures=%d\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
+
+    if (warm_mode) {
+        test_warm_depth(dtex);
+        nvn_gpu_view_release(color_view); nvn_gpu_view_release(depth_view);
+        nvn_gpu_tex_release(ctex); nvn_gpu_tex_release(dtex);
+        rp_draw_reset(); rp_shader_reset();
+        nvn_gpu_err err = {0};
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "warm depth: close session");
+        s2a_vk_device_destroy(&g_dev, 1);
+        free(vs_spv); free(fs_spv);
         return g_fail ? 1 : 0;
     }
 
