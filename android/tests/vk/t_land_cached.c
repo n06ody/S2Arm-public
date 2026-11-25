@@ -5,6 +5,8 @@
 #include "nvn_plat_vk.h"
 #include "nvn_fmt_info.h"
 #include "vk_device.h"
+#include "nvn_vk_land_cached_auto.h"
+#include "direct/sha256.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -12,12 +14,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 #define GPU(x) do { nvn_gpu_rc result_ = (x); if (!nvn_gpu_ok(result_)) { fprintf(stderr, "FAIL %d: %s: %s\n", __LINE__, #x, err.why); exit(1); } } while (0)
 #define WAIT_NS 5000000000ull
 
-static int dq, enabled, fail_invalidate, wait_yield, wait_probe;
+static int dq, enabled, fail_invalidate, wait_yield, wait_probe, readback;
 static atomic_int presented_submits, guest_submits;
 static atomic_int fail_next_flush, device_loss_gate, release_device_loss;
 
@@ -43,6 +46,7 @@ int nvn_plat_flag(const char *key, int fallback) {
     if (!strcmp(key, "nvk_land_cached")) return enabled;
     if (!strcmp(key, "nvk_land_wait_yield_wsi")) return wait_yield;
     if (!strcmp(key, "nvk_land_wait_probe")) return wait_probe;
+    if (!strcmp(key, "nvk_land_readback")) return readback;
     return fallback;
 }
 void nvn_plat_log(int level, const char *category, const char *line) {
@@ -147,6 +151,7 @@ struct mirror_stats {
     uint64_t invalidates, invalidated_bytes, invalidated_payload, flushes, buffers;
     uint64_t wsi_locks, wsi_lock_ns, wsi_during_wait, wsi_overtakes;
     uint64_t sampled, dropped, atoms, edge_atoms, edge_waits;
+    uint64_t auto_already_cached, auto_trial_open;
 };
 static void stat(void *user, const char *name, uint64_t n) {
     struct mirror_stats *s = user;
@@ -168,6 +173,8 @@ static void stat(void *user, const char *name, uint64_t n) {
     if (!strcmp(name, "mirror_probe_atoms")) s->atoms = n;
     if (!strcmp(name, "mirror_probe_edge_atoms")) s->edge_atoms = n;
     if (!strcmp(name, "mirror_probe_edge_waits")) s->edge_waits = n;
+    if (!strcmp(name, "mirror_auto_already_cached")) s->auto_already_cached = n;
+    if (!strcmp(name, "mirror_auto_trial_open")) s->auto_trial_open = n;
 }
 static struct mirror_stats stats(void) {
     struct mirror_stats s = {0};
@@ -596,8 +603,70 @@ static void test_wait_error(const struct s2a_vk_device *physical, enum wait_erro
     printf("land-cached wait-error dq=%d fault=%d: failed=%d callbacks=1/1\n", dq, fault, next.rc.code);
 }
 
+static void test_auto_coherent(const struct s2a_vk_device *physical) {
+    // lavapipe 的原路径已选一致且缓存的映射，与 8E 的可观测能力相同。
+    struct s2a_vk_device dev = *physical;
+    enabled = 2;
+    wait_yield = wait_probe = 0;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-auto-coherent"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    const uint8_t init[256] = {0};
+    nvn_gpu_buf mirror;
+    GPU(nvn_gpu_buf_create(sizeof init, NVN_GPU_MEM_POOL_MIRROR, init, &mirror, &err));
+    const struct mirror_stats observed = stats();
+    REQUIRE(nvn_gpu_mirror_memory_cached(mirror));
+    REQUIRE(nvn_gpu_mirror_state(mirror) == NVN_GPU_MIRROR_COHERENT);
+    REQUIRE(!nvn_gpu_mirror_visibility_enabled() && observed.buffers == 1);
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    REQUIRE(observed.auto_already_cached == 1);
+    printf("land-cached auto dq=%d: original_coherent_cached=1 mirrors=1\n", dq);
+}
+
+static void test_auto_receipt(struct s2a_vk_device *dev, const char *cache_dir) {
+    enabled = 2;
+    wait_yield = wait_probe = 0;
+    const struct mirror_auto_window window = {
+        .frame_ms = 33, .p99_ms = 51, .copy_ms = 10, .shadow_wait_ms = 2,
+        .draws = 1000, .submits = 7, .sync_bytes = 3e6, .land_bytes = 20e6, .target_ns = 16666667,
+    };
+    struct mirror_auto_receipt receipt = {
+        .version = MIRROR_AUTO_VERSION, .created = (uint64_t)time(NULL), .baseline = {window, window},
+    };
+    s2a_sha256 hash;
+    const int flags[] = {-1, 0};
+    s2a_sha256_init(&hash);
+    s2a_sha256_update(&hash, dev->properties.pipelineCacheUUID, sizeof dev->properties.pipelineCacheUUID);
+    s2a_sha256_update(&hash, &dev->properties.limits.nonCoherentAtomSize,
+                      sizeof dev->properties.limits.nonCoherentAtomSize);
+    s2a_sha256_update(&hash, dev->memory.memoryTypes, dev->memory.memoryTypeCount * sizeof *dev->memory.memoryTypes);
+    s2a_sha256_update(&hash, flags, sizeof flags);
+    s2a_sha256_final(&hash, receipt.compatibility);
+    char path[512];
+    const int n = snprintf(path, sizeof path, "%s/land-cached-trial.v1", cache_dir);
+    REQUIRE(n > 0 && n < (int)sizeof path);
+    FILE *file = fopen(path, "wb");
+    REQUIRE(file && fwrite(&receipt, sizeof receipt, 1, file) == 1 && fclose(file) == 0);
+
+    const nvn_gpu_open_desc desc = {.host_device = dev, .app_label = "land-auto-receipt", .cache_dir = cache_dir};
+    nvn_gpu_err err = {0};
+    readback = 2;
+    GPU(nvn_gpu_open(&desc, &err));
+    REQUIRE(!stats().auto_trial_open && access(path, F_OK) == 0);   // R auto 独占，凭证未消费。
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    readback = 0;
+    GPU(nvn_gpu_open(&desc, &err));
+    REQUIRE(stats().auto_trial_open == 1 && access(path, F_OK) != 0);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    GPU(nvn_gpu_open(&desc, &err));
+    REQUIRE(!stats().auto_trial_open);   // 试测没有净收益证据，干净打开仍走 A。
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    printf("land-cached auto receipt dq=%d: readback preserved token, consumed once, no retained trial\n", dq);
+}
+
 int main(int argc, char **argv) {
-    REQUIRE(argc == 3);
+    REQUIRE(argc == 4);
     dq = atoi(argv[1]);
     struct s2a_vk_device dev;
     char why[256] = {0};
@@ -615,6 +684,8 @@ int main(int argc, char **argv) {
     test_wait_error(&dev, WAIT_CLOSE);
     test_wait_error(&dev, WAIT_ASYNC_FLUSH);
     test_wait_error(&dev, WAIT_DEVICE_LOST);
+    test_auto_coherent(&dev);
+    test_auto_receipt(&dev, argv[3]);
     s2a_vk_device_destroy(&dev, 1);
     return 0;
 }

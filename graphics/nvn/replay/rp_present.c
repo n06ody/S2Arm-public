@@ -20,6 +20,8 @@
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：rp_shader_live_compile_take
 #pragma weak rp_shader_live_compile_take
+void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *sample) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_auto_sample
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -282,7 +284,6 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     return ticket;
 }
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]) {
-    (void)period_s;
     rp_pool_stats_frame();   // 池统计（开关 pool_stats；关着每帧只读一次开关，回放与池查找路径不动）
     rp_tm_frame_end();   // 一帧结束：刚结束的是采样帧就记一帧，再定下一帧要不要逐步计时（分时抽样，#1103）
     pthread_mutex_lock(&g_pmu);
@@ -335,12 +336,16 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
       clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        static uint64_t mirror_acquire_ns;
+        static int mirror_compiling;
+        if (nvn_gpu_mirror_auto_sample) mirror_acquire_ns += acquire_ns;
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         if (rp_shader_live_compile_take) {
             struct rp_shader_live_compile_stats live;
             rp_shader_live_compile_take(&live);
             if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout || live.compiled) {
+                mirror_compiling = 1;
                 char b[400];
                 snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
                          (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
@@ -354,6 +359,10 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
             if (!t_last) t_last = now;
             { const uint64_t cpu = tc_thread_cpu_ns(); if (cpu) rp_present_tc_note(now, cpu); }
             fseg_frame(&g_fseg, now, atomic_load_explicit(&g_tgt_itv, memory_order_relaxed), atomic_load_explicit(&g_tgt_set_ns, memory_order_relaxed));
+            if (g_n_shown < n_last) {
+                t_last = now; n_last = d_last = 0;
+                mirror_acquire_ns = 0; mirror_compiling = 0;
+            }
             if (now - t_last >= 5000000000ull) {
                 uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
                 { char pb[1024]; if (rp_pipe_fail_summary(pb, sizeof pb)) nvn_plat_log(NVN_PLAT_LOG_INFO, "present", pb); }   // 图形管线失败分类：有新失败 / 新挡下的窗口才打
@@ -374,7 +383,8 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     uint64_t tc[4]; rp_present_tc_take(tc); const double tn = tc[2] ? (double)tc[2] : 1.0;
                     snprintf(b, sizeof b, "分时（上屏线程 CPU，每帧）：两次上屏之间墙钟 %.1f 毫秒、本线程 CPU %.1f 毫秒（占 %.0f%%）；同线程样本 %llu、跨线程样本 %llu（不计）",
                              (double)tc[0] / 1e6 / tn, (double)tc[1] / 1e6 / tn, tc[0] ? 100.0 * (double)tc[1] / (double)tc[0] : 0.0, (unsigned long long)tc[2], (unsigned long long)tc[3]);
-                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                }
                 snprintf(b, sizeof b, "分时（绘制各步，每帧毫秒）：取程序 %.1f、顶点流与索引 %.1f、取贴图视图 %.1f、开通道与取管线 %.1f、动态状态与顶点缓冲 %.1f、绑定 %.1f、后端绘制 %.1f、收尾 %.1f；回放按命令分：绘制类 %.1f、其余 %.1f",
                          (double)pf[RP_PERF_D_PROG] / 1e6 / fs, (double)pf[RP_PERF_D_PREP] / 1e6 / fs, (double)pf[RP_PERF_D_TEX] / 1e6 / fs, (double)(pf[RP_PERF_D_PASS] + pf[RP_PERF_D_PIPE]) / 1e6 / fs, (double)pf[RP_PERF_D_DYN] / 1e6 / fs, (double)pf[RP_PERF_D_BIND] / 1e6 / fs, (double)pf[RP_PERF_D_DRAW] / 1e6 / fs, (double)pf[RP_PERF_D_TAIL] / 1e6 / fs,
                           (double)pf[RP_PERF_EXEC_DRAW_NS] / 1e6 / f, (double)pf[RP_PERF_EXEC_OTHER_NS] / 1e6 / f);
@@ -434,7 +444,24 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     double p50 = 0, p99 = 0, mx = 0; uint64_t ov = 0; rp_frame_hist_take(&p50, &p99, &mx, &ov);
                     snprintf(b, sizeof b, "分时（帧间隔）：p50 %.1f 毫秒、p99 %.1f 毫秒、最长 %.1f 毫秒、超过 33 毫秒 %.0f 帧（占 %.0f%%）",
                              p50, p99, mx, (double)ov, 100.0 * (double)ov / (double)f);
-                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b); }
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    if (nvn_gpu_mirror_auto_sample) {
+                        const uint64_t target_set = atomic_load_explicit(&g_tgt_set_ns, memory_order_relaxed);
+                        const struct rp_mirror_auto_sample sample = {
+                            .elapsed_ns = now - t_last, .frames = fr, .draws = nd >= d_last ? nd - d_last : 0,
+                            .submits = pf[RP_PERF_SUBS], .target_ns = period_s > 0 && period_s <= 1.0
+                                ? (uint64_t)(period_s * 1e9 + 0.5) : 0,
+                            .cached_bytes = pf[RP_PERF_LAND_CACHED_BYTES], .uncached_bytes = pf[RP_PERF_LAND_UNCACHED_BYTES],
+                            .cached_ns = pf[RP_PERF_LAND_CACHED_NS], .uncached_ns = pf[RP_PERF_LAND_UNCACHED_NS],
+                            .sync_kib = pf[RP_PERF_BUF_SYNC_KB], .direct_kib = pf[RP_PERF_BUF_SYNC_DIRECT_KB],
+                            .acquire_ns = mirror_acquire_ns, .present_ns = pf[RP_PERF_PRESENT_NS],
+                            .p99_ms = p99, .compiling = mirror_compiling || !rp_shader_live_compile_take,
+                            .target_changed = target_set > t_last,
+                        };
+                        nvn_gpu_mirror_auto_sample(&sample);
+                        mirror_acquire_ns = 0; mirror_compiling = 0;
+                    }
+                }
                 snprintf(b, sizeof b, "分时（上传，每帧）：贴图整张上传 %.1f 次共 %.0f KB；池镜像同步 %.0f KB（其中直接写 %.0f KB）；缓冲解析：快路 %.0f 次、逐页慢路 %.0f 次（共查 %.0f 页）、不受写跟踪 %.0f 次（其中本次提交已同步免传 %.0f 次）", (double)pf[RP_PERF_TEX_UP_N] / f, (double)pf[RP_PERF_TEX_UP_KB] / f, (double)pf[RP_PERF_BUF_SYNC_KB] / f, (double)pf[RP_PERF_BUF_SYNC_DIRECT_KB] / f,
                          (double)pf[RP_PERF_BUF_FAST_N] / f, (double)pf[RP_PERF_BUF_SLOW_N] / f, (double)pf[RP_PERF_BUF_PAGES_N] / f, (double)pf[RP_PERF_BUF_NOSPAN_N] / f, (double)pf[RP_PERF_BUF_NOSPAN_FRESH_N] / f);
                 if (pf[RP_PERF_BUF_LOG_EV] || pf[RP_PERF_BUF_LOG_WORDS] || pf[RP_PERF_BUF_LOG_REBUILD])   // 脏页追加日志（nvk_buf_dirtylog）开着才有
