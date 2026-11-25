@@ -89,6 +89,13 @@ static void bc7_codec(nvn_gpu_pipe pipe) {
     if (in) nvn_gpu_buf_release(in, NULL, NULL);
 }
 
+#ifdef S2A_BC7_ASYNC_TEST
+static int bc7_commit_fixture(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_err *e) {
+    return OK(nvn_gpu_cmd_commit(c, signal, on_done, NULL, e)) &&
+           OK(nvn_gpu_fence_wait(signal, 5000000000ull, e));
+}
+#endif
+
 static void bc7_storage(void) {
     const uint32_t saved_mask = g_dev.bc_decode_mask;
     const VkBool32 saved_bc = g_dev.core_features.textureCompressionBC;
@@ -114,18 +121,42 @@ static void bc7_storage(void) {
     if (tex && source_storage && result) {
         nvn_gpu_cmd cmd = begin_cmd();
         static const uint8_t mode4[16] = {0x10};
-        const uint8_t *source = (const uint8_t *)bc7_source;
+        uint8_t source[48];
+        memcpy(source, bc7_source, sizeof source);
+        memset(source + 32, 0, 16);
+        source[32] = 0x40;
         CHECK(nvn_swizzle(&desc.d, 0, 0, source, 32, source_storage) == 0, "BC7 source level 0 swizzle");
         CHECK(nvn_swizzle(&desc.d, 1, 0, mode4, 16, source_storage) == 0, "BC7 source level 1 swizzle");
-        CHECK(!nvn_gpu_tex_bc7_snapshot(cmd, tex, source_storage, layout.size, 1, 1, &compressed) && !compressed,
-              "BC7 unsupported mip must keep ordinary storage");
+        CHECK(!nvn_gpu_tex_bc7_snapshot(cmd, tex, source_storage, layout.size, 1, 0, &compressed) && !compressed,
+              "BC7 diagnostic mip must keep ordinary storage");
         CHECK(nvn_swizzle(&desc.d, 1, 0, source + 32, 16, source_storage) == 0, "BC7 compatible mip swizzle");
         CHECK(!nvn_gpu_tex_bc7_snapshot(cmd, tex, source_storage, layout.size - 1, 1, 1, &compressed) && !compressed,
               "BC7 truncated snapshot must keep ordinary storage");
         CHECK(!nvn_gpu_tex_bc7_snapshot(cmd, tex, source_storage, layout.size, 1, 0, &compressed) && !compressed,
               "BC7 diagnostics-only snapshot must keep ordinary storage");
         int rc = nvn_gpu_tex_bc7_snapshot(cmd, tex, source_storage, layout.size, 1, 1, &compressed);
-        CHECK(rc == can_astc && !!compressed == can_astc, "BC7 capability path snapshot rc=%d ASTC=%d", rc, can_astc);
+        CHECK(rc == can_astc && !compressed, "BC7 first upload must remain RGBA8 rc=%d ASTC=%d", rc, can_astc);
+        uint64_t signal = 3;
+#ifdef S2A_BC7_ASYNC_TEST
+        if (can_astc) {
+            extern void nvn_vk_test_bc7_present(void);
+            CHECK(bc7_commit_fixture(cmd, signal++, &e), "BC7 first RGBA8 upload: %s", e.why);
+            // The next ordinary signal also guarantees upload retirement before the first candidate chunk.
+            CHECK(bc7_commit_fixture(begin_cmd(), signal++, &e), "BC7 upload retirement: %s", e.why);
+            CHECK(!nvn_gpu_tex_bc7_take(tex), "BC7 cannot publish before fitting");
+            for (unsigned level = 0; level < 2; level++) {
+                nvn_vk_test_bc7_present();
+                cmd = begin_cmd();
+                nvn_gpu_bc7_step(cmd);
+                CHECK(bc7_commit_fixture(cmd, signal++, &e), "BC7 candidate chunk %u: %s", level, e.why);
+                CHECK(bc7_commit_fixture(begin_cmd(), signal++, &e), "BC7 candidate retirement: %s", e.why);
+                if (level == 0) CHECK(!nvn_gpu_tex_bc7_take(tex), "BC7 incomplete mip chain cannot publish");
+            }
+            compressed = nvn_gpu_tex_bc7_take(tex);
+            CHECK(compressed != NULL, "BC7 complete ASTC image must publish after the natural fence");
+            cmd = begin_cmd();
+        }
+#endif
         if (compressed) {
             CHECK(OK(nvn_gpu_view_create(compressed, NULL, &old_view, &e)), "BC7 old view creation: %s", e.why);
             nvn_gpu_copy_tex_buf(cmd, compressed, 0, 0, NULL, result, 0, 32, 32);
@@ -146,8 +177,8 @@ static void bc7_storage(void) {
         nvn_gpu_tex_upload(cmd, target, 0, 0, &update, mode4, 16, 16);
         nvn_gpu_copy_tex_buf(cmd, target, 0, 0, NULL, result, 48, 32, 32);
         nvn_gpu_copy_tex_buf(cmd, target, 1, 0, NULL, result, 80, 16, 16);
-        int ok = OK(nvn_gpu_cmd_commit(cmd, 3, on_done, NULL, &e)) &&
-                 OK(nvn_gpu_fence_wait(3, 5000000000ull, &e));
+        int ok = OK(nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &e)) &&
+                 OK(nvn_gpu_fence_wait(signal, 5000000000ull, &e));
         CHECK(ok, "BC7 storage submit: %s", e.why);
         if (ok) {
             const uint8_t *bytes = buf_cpu(result);

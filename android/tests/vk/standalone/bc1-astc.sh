@@ -20,7 +20,7 @@ for f in android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.
     src+=("$repo/$f")
 done
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
-    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
+    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_BC7_ASYNC_TEST=1 "${inc[@]}" "${src[@]}" \
     -Wl,--gc-sections -L"$out" -Wl,-rpath,"$out" -lastcdecode -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 set +e
@@ -103,4 +103,53 @@ for variant in weights rotation bise alpha; do
         exit 1
     fi
     echo "【绿】BC7 ASTC $variant 负控命中"
+done
+
+hybrid_tables="$out/bc7-hybrid-tables"
+python3 -B "$encoder/generate_hybrid.py" --tables-only --out "$hybrid_tables"
+timeout 180 "$out/test" --bc7-hybrid 2>&1 | tee "$out/bc7-hybrid.log"
+if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/bc7-hybrid.log"; then
+    echo '【红】BC7 hybrid validation' >&2
+    exit 1
+fi
+
+python3 - "$encoder/hybrid.comp" "$out" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+mutations = {
+    "peak": ("any(greaterThan(d.rgb, uvec3(8u * 257u))) || ", ""),
+    "rms": ("return sum <= 48u * (3u * 257u) * (3u * 257u);", "return true;"),
+    "alpha": ("uvec4 a = c.lo[p], b = c.hi[p];", "uvec4 a = c.lo[p], b = c.hi[p];\n        a.a = b.a = 0u;"),
+    "partition": ("put(bits, 13u, 10u, c.partition_code);", "put(bits, 13u, 10u, c.partition_code ^ 1u);"),
+    "reject": ("atomicOr(dst.needs_rgba, 1u);", ""),
+}
+for name, (anchor, replacement) in mutations.items():
+    assert source.count(anchor) == (2 if name == "reject" else 1), name
+    directory = Path(sys.argv[2]) / ("bc7-hybrid-negative-" + name)
+    directory.mkdir(exist_ok=True)
+    (directory / "encode.comp").write_text(source.replace(anchor, replacement))
+PY
+for variant in peak rms alpha partition reject; do
+    dir="$out/bc7-hybrid-negative-$variant"
+    "${GLSLC:-glslc}" --target-env=vulkan1.1 -O -I "$hybrid_tables" -I "$repo/graphics/nvn/third_party/granite/decode" \
+        "$dir/encode.comp" -o "$dir/encode.comp.spv"
+    set +e
+    timeout 180 "$out/test" --bc7-hybrid "$dir" > "$dir/run.log" 2>&1
+    rc=$?
+    set -e
+    case "$variant" in
+        peak) expected='RGB L-infinity outliers' ;;
+        rms) expected='RGB RMS outliers' ;;
+        alpha) expected='alpha outliers' ;;
+        partition) expected='RGB L-infinity outliers|invalid ASTC blocks' ;;
+        reject) expected='rejected blocks must mark the entire image' ;;
+    esac
+    if [ "$rc" -ne 1 ] || ! grep -qE "FAIL .*(${expected})" "$dir/run.log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$dir/run.log"; then
+        cat "$dir/run.log"
+        echo "【红】BC7 hybrid $variant 负控未命中 rc=$rc" >&2
+        exit 1
+    fi
+    echo "【绿】BC7 hybrid $variant 负控命中"
 done

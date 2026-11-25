@@ -514,8 +514,16 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, u
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_tex_bc7_snapshot
 // 弱链接[replay]：nvn_gpu_tex_bc7_unwrap
+// 弱链接[replay]：nvn_gpu_bc7_step
+// 弱链接[replay]：nvn_gpu_tex_bc7_take
 int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, uint64_t, int, nvn_gpu_tex *) __attribute__((weak));
 int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *) __attribute__((weak));
+int nvn_gpu_bc7_step(nvn_gpu_cmd) __attribute__((weak));
+nvn_gpu_tex nvn_gpu_tex_bc7_take(nvn_gpu_tex) __attribute__((weak));
+
+void rp_tex_async_step(nvn_gpu_cmd c) {
+    if (nvn_gpu_bc7_step && nvn_gpu_bc7_step(c)) __atomic_add_fetch(&g_treg_gen, 1, __ATOMIC_RELEASE);
+}
 
 // 只换物理资源，保留逻辑串号和别名。旧视图走原有 pin 与后端在途引用保活。
 static void tex_replace_storage(struct rp_tex *x, nvn_gpu_tex next) {
@@ -938,6 +946,15 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 if (success) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_vgen = vg0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_vgen = vg0; x->check_dirty = 0; }
+        }
+    }
+    if (c && !x->prefer_plain && !x->check_dirty && t->d.format == NVN_FORMAT_BPTC_UNORM && nvn_gpu_tex_bc7_take) {
+        nvn_gpu_tex next = nvn_gpu_tex_bc7_take(x->g);
+        if (next) {
+            uint64_t wlo, whi;
+            tex_window(t, &wlo, &whi);
+            if (rp_buf_gpu_pending((uint64_t)(uintptr_t)(t->mem + wlo), whi - wlo)) nvn_gpu_tex_release(next);
+            else tex_replace_storage(x, next);
         }
     }
     nvn_gpu_tex g = x->g;

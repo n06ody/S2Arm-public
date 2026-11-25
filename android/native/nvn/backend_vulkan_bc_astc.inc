@@ -63,7 +63,8 @@ static int bc_astc_storage(uint32_t nvn_format, const nvn_gpu_tex_desc *d, VkIma
         if (!(d->usage & NVN_GPU_TEX_BC7_VALIDATED) || !g.bc7_astc_on) return 0;
     } else if (!(d->usage & NVN_GPU_TEX_BC1_OPAQUE) || !g.bc1_astc_on ||
                (nvn_format != NVN_FORMAT_RGBA_DXT1 && nvn_format != NVN_FORMAT_RGBA_DXT1_SRGB)) return 0;
-    if (!d->d.width || !d->d.height || !bc_astc_can_encode(((uint64_t)d->d.width + 3) / 4 * (((uint64_t)d->d.height + 3) / 4))) return 0;
+    if (!d->d.width || !d->d.height ||
+        (!bc7 && !bc_astc_can_encode(((uint64_t)d->d.width + 3) / 4 * (((uint64_t)d->d.height + 3) / 4)))) return 0;
     const VkFormat astc = nvn_format == NVN_FORMAT_RGBA_DXT1_SRGB ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (d->usage & NVN_GPU_TEX_VIEW_FMT) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -76,8 +77,8 @@ static int bc_astc_storage(uint32_t nvn_format, const nvn_gpu_tex_desc *d, VkIma
         (uint32_t)d->d.width > props.maxExtent.width || (uint32_t)d->d.height > props.maxExtent.height ||
         (uint32_t)d->d.levels > props.maxMipLevels || layers > props.maxArrayLayers) return 0;
     struct bc_astc_pipeline *pipeline = bc7 ? &g_bc7_astc : &g_bc1_astc;
-    const uint32_t *code = bc7 ? nvk_bc7_astc_spv : nvk_bc1_astc_spv;
-    const size_t size = bc7 ? sizeof nvk_bc7_astc_spv : sizeof nvk_bc1_astc_spv;
+    const uint32_t *code = bc7 ? nvk_bc7_hybrid_spv : nvk_bc1_astc_spv;
+    const size_t size = bc7 ? sizeof nvk_bc7_hybrid_spv : sizeof nvk_bc1_astc_spv;
     pthread_mutex_lock(&g_submit_mu);
     int ready = pipeline->pipe || bc_astc_open(pipeline, code, size);
     pthread_mutex_unlock(&g_submit_mu);
@@ -115,7 +116,7 @@ static uint32_t bc_astc_alignment(void) {
 static int bc_astc_encode(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkBuffer src, uint64_t offset,
                            uint64_t blocks, uint32_t block_bytes, uint32_t level, uint32_t layer,
                           VkOffset3D off, VkExtent3D ext) {
-    const struct bc_astc_pipeline *pipeline = block_bytes == 16 ? &g_bc7_astc : &g_bc1_astc;
+    const struct bc_astc_pipeline *pipeline = &g_bc1_astc;
     nvn_gpu_slice output;
     nvn_gpu_err err = {0};
     if (!bc_astc_can_encode(blocks) ||

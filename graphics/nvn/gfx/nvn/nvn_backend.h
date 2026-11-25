@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 23   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 24   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -215,7 +215,7 @@ enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不
     NVN_GPU_TEX_CPU_UPLOAD = 1u << 5, // 内容来自游戏内存，会经 nvn_gpu_tex_upload* 更新
     NVN_GPU_TEX_TRANSIENT = 1u << 6,  // 只活在一个通道里（memoryless / LAZILY_ALLOCATED）
     NVN_GPU_TEX_BC1_OPAQUE = 1u << 7, // 初始完整压缩快照已证无透明索引，允许宿主选 ASTC 存储。
-    NVN_GPU_TEX_BC7_VALIDATED = 1u << 8, // 完整 BC7 UNORM 快照通过模式与 alpha 准入。
+    NVN_GPU_TEX_BC7_VALIDATED = 1u << 8, // 后端私有候选，完成质量检查前不得发布。
 };
 typedef struct {
     nvn_texdesc d;             // NVN 描述原样
@@ -236,10 +236,14 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, ui
 // 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
 // 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
-// 同上，BC7 UNORM。allow_astc=0 仅记录快照统计，保留普通存储。
+// 同上，BC7 UNORM 首次完整上传保持 RGBA8。allow_astc=1 可排队准备异步候选。
 int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size,
                             uint64_t serial, int allow_astc, nvn_gpu_tex *replacement);
 int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+// 可选 [提交]：正常段末录制有限转码。返回 1 通知回放重验缓存的贴图表。
+int nvn_gpu_bc7_step(nvn_gpu_cmd c);
+// 可选 [提交]：只有整图质量、自然栅栏和源代际均已确认才移交新存储的所有权。
+nvn_gpu_tex nvn_gpu_tex_bc7_take(nvn_gpu_tex t);
 
 void nvn_gpu_tex_release(nvn_gpu_tex t);
 // 视图：v 为 NVN 视图记录原样，NULL = 默认视图。视图让贴图存储活到视图 release。线程：[任意]。出错：格式不兼容或缺 VIEW_FMT → NVN_GPU_E_ARG。

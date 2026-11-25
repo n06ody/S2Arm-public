@@ -10,6 +10,8 @@ static nvn_gpu_rc bc_new_storage(struct nvn_gpu_tex_s *old, uint32_t astc_usage,
     return nvn_gpu_tex_create(&desc, tex, err);
 }
 
+#include "backend_vulkan_bc7_async.inc"
+
 // 收齐各级各层的同一份 CPU 快照。准入检查和录制使用完全相同的压缩块。
 static int bc_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, uint64_t size,
                        uint64_t serial, int bc7, int allow_astc, nvn_gpu_tex *replacement) {
@@ -44,36 +46,61 @@ static int bc_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, uint64_
         rgba_bytes += w * h * layers * 4;
     }
     // 纯统计一次只保留一个层面的反交织数据。
-    const int keep = transcode || was_astc;
+    const int keep = !bc7 && (transcode || was_astc);
     uint8_t *snapshot = malloc((size_t)(keep ? total : max_plane));
     if (!snapshot) return 0;
     int opaque = 1;
     uint64_t modes[NVK_BC7_MODES] = {0};
+    uint64_t partitions[8][64];
+    if (bc7 && g.bc_time_on) memset(partitions, 0, sizeof partitions);
+    nvn_gpu_tex target = t;
+    const int upload_bc7 = bc7 && (transcode || was_astc);
+    if (bc7 && was_astc) {
+        nvn_gpu_err err = {0};
+        if (!rc_is(bc_new_storage(t, 0, &target, &err), NVN_GPU_OK)) {
+            free(snapshot);
+            set_sticky(c, err.rc.code, "BC7 ASTC 恢复 RGBA8 失败：%s", err.why);
+            return -1;
+        }
+    }
     for (uint32_t l = 0; l < t->levels; l++) {
         const struct span s = level[l];
         for (uint32_t layer = 0; layer < t->layers; layer++) {
             uint8_t *data = keep ? snapshot + s.offset + (uint64_t)layer * s.plane : snapshot;
             if (nvn_deswizzle(&t->original_desc, l, layer, src, data, (size_t)s.row)) {
                 free(snapshot);
+                if (target != t) nvn_gpu_tex_release(target);
                 return 0;
             }
             if (!bc7) {
                 if (opaque) opaque = bc1_astc_opaque(data, s.plane);
                 continue;
             }
-            for (uint64_t at = 0; at < s.plane; at += 16) {
+            if (upload_bc7 && rc_is(c->sticky, NVN_GPU_OK))
+                bc_upload(c, target, l, layer, NULL, data, s.row, s.plane, 1);
+            if (g.bc_time_on) for (uint64_t at = 0; at < s.plane; at += 16) {
                 const unsigned mode = nvk_bc7_mode(data[at]);
-                if (g.bc_time_on) modes[mode]++;
-                if (transcode && !nvk_bc7_astc_block_eligible(data + at, mode))
-                    transcode = 0;
-                if (!transcode && !g.bc_time_on && !was_astc) {
-                    free(snapshot);
-                    return 0;
+                modes[mode]++;
+                if (mode <= 3 || mode == 7) {
+                    const uint16_t prefix = (uint16_t)data[at] | ((uint16_t)data[at + 1] << 8);
+                    const unsigned part = (prefix >> (mode + 1)) & (mode == 0 ? 15 : 63);
+                    partitions[mode][part]++;
                 }
             }
         }
     }
-    if (bc7 && g.bc_time_on) bc7_stat_snapshot(modes, rgba_bytes, total);
+    if (bc7) {
+        if (g.bc_time_on) bc7_stat_snapshot(modes, partitions, rgba_bytes, total);
+        free(snapshot);
+        if (!upload_bc7) return 0;
+        if (!rc_is(c->sticky, NVN_GPU_OK)) {
+            if (target != t) nvn_gpu_tex_release(target);
+            return -1;
+        }
+        if (transcode) bc7_note_upload(c, target);
+        if (target != t) *replacement = target;
+        return 1;
+    }
     if (!bc7 && g.bc_time_on) {
         char line[160];
         snprintf(line, sizeof line, "snapshot serial=%llu format=%#x alpha=%s blocks=%llu",
@@ -81,7 +108,7 @@ static int bc_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, uint64_
                  (unsigned long long)(total / 8));
         nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
     }
-    transcode &= bc7 || opaque;
+    transcode &= opaque;
     if (!transcode && !was_astc) {
         free(snapshot);
         return 0;   // 当前布局已经正确，沿用普通传输
@@ -90,10 +117,9 @@ static int bc_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, uint64_
         free(snapshot);
         return -1;
     }
-    nvn_gpu_tex target = t;
     if (transcode != was_astc) {
         nvn_gpu_err err = {0};
-        const uint32_t astc_usage = !transcode ? 0 : bc7 ? NVN_GPU_TEX_BC7_VALIDATED : NVN_GPU_TEX_BC1_OPAQUE;
+        const uint32_t astc_usage = transcode ? NVN_GPU_TEX_BC1_OPAQUE : 0;
         if (!rc_is(bc_new_storage(t, astc_usage, &target, &err), NVN_GPU_OK)) {
             free(snapshot);
             if (!was_astc) return 0;
@@ -179,5 +205,6 @@ int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacemen
 
 int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement) {
     if (t && t->nvn_format != NVN_FORMAT_BPTC_UNORM) { *replacement = NULL; return 0; }
+    if (t && g.bc7_astc_on) bc7_invalidate(t);
     return bc_astc_unwrap(c, t, 16, replacement);
 }
