@@ -106,6 +106,8 @@ struct nvn_gpu_buf_s {
 };
 
 struct nvn_gpu_tex_s {
+    uint64_t account_write, account_last_write, account_gap;  // g_submit_mu
+    uint8_t account_seen, account_bc_reason;
     uint64_t access_id;
     VkImage image;
     VkDeviceMemory memory;
@@ -290,6 +292,7 @@ struct vk_segment {
 struct feedback_copy {
     struct feedback_copy *next;
     struct nvn_gpu_view_s *source;
+    uint8_t account_draw_writes, account_pool;
     VkImageView view;
     struct nvn_gpu_tex_s *snap, *snap_src; // 快照图（本段 REF_TEX 保活到 fence）与它照的源图；同段同源复用，见 feedback_make
 };
@@ -311,6 +314,9 @@ struct nvn_gpu_cmd_s {
     struct dtx_pipe_temp *dtx_pipes;     // DrawTexture 管线缓存满后的段自有管线（backend_vulkan_draw_tex.inc），同上回收
     struct feedback_copy *feedback, *feedback_stop; // 本笔 [feedback, stop)，历史项活到 fence
     struct fb_copy_counts fb_copy_counts;           // 只在诊断开启时更新，成功提交后才入本局总账
+    struct account_event *account_events;
+    uint32_t account_n, account_cap;
+    int account_gap;
     int feedback_on;
     int feedback_read_on;
     int pool_fb_on;              // nvk_pool_fb：1 = 整池数组里和「本笔写着的附件」重叠的视图也拷快照（旧行为，A/B 与回退诊断用）；缺省 0 = 不拷（见 feedback_add）
@@ -471,6 +477,9 @@ struct nvn_gpu_vk {
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
     int fb_copy_count_on;
+    int accounts_on;
+    uint64_t account_at_present, account_hist[3], account_versions[4], account_gap;
+    unsigned account_source_lines;  // 同上，物理源明细的会话上限
     struct fb_copy_counts fb_copy_counts;            // g_submit_mu：只累计 vkQueueSubmit 已接受的段
     uint64_t fb_copy_frames;                         // g_submit_mu：写入同一队列的成功呈现次数
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
@@ -650,6 +659,7 @@ static int g_plcw_failed;                    // 最近一次后台写失败了�
 static uint64_t g_plcw_started, g_plcw_ok, g_plcw_fail, g_plcw_same;   // 读数（进程累计，不随会话清零）：交给后台写的次数 / 成功 / 失败 / 与上次一致没写
 static uint64_t g_plcw_get_ns;   // 触发线程上「查大小 + 取数据 + 拷字节」的累计纳秒（后台写盘不算；长帧归因读它）
 static pthread_mutex_t g_submit_mu = PTHREAD_MUTEX_INITIALIZER; // 提交串行化：校验 signal、vkQueueSubmit、入队
+#include "backend_vulkan_accounts.inc"
 static pthread_cond_t g_cv;
 static int g_cv_ready;
 static _Thread_local int g_in_callback;   // [回调] 线程：只许调 [任意] 函数
@@ -1902,6 +1912,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->refs);
     free(c->refseen);
     free(c->staging);
+    free(c->account_events);
     free(c);
 }
 
@@ -2380,7 +2391,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
-    g.fb_copy_count_on = nvn_plat_flag("nvk_fb_copy_count", 0) != 0;
+    g.accounts_on = nvn_plat_flag("nvk_gpu_accounts", 0) != 0;
+    g.fb_copy_count_on = g.accounts_on || nvn_plat_flag("nvk_fb_copy_count", 0) != 0;
     pipe_creation_open(dev);
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
@@ -2572,6 +2584,11 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         pthread_mutex_lock(&g_bc_time_mu);
         bc_time_log_window(now_ns(), 1);
         pthread_mutex_unlock(&g_bc_time_mu);
+    }
+
+    if (g.accounts_on) {
+        account_bc_log("session", g.fb_copy_frames);
+        account_fb_log("session");
     }
 
     // 在途段都完成了、不会再有新管线：把驱动管线缓存写盘（失败只记日志）再销毁它。放在销毁管线之前，后面的拆除出事也不丢这一局的编译结果。
@@ -5593,6 +5610,16 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     c->pass_layers = fi.layers;
     c->pass_ds_aspect = (d->depth.view ? d->depth.view->tex->aspect & VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (d->stencil.view ? d->stencil.view->tex->aspect & VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     c->pass_desc = *d;
+    if (g.accounts_on) {
+        const uint16_t none = c->feedback_read_mask;
+        for (uint32_t i = 0; i < c->pass_ncolor; i++)
+            if (d->color[i].view && d->color[i].load != NVN_GPU_LOAD_LOAD && !(none & (1u << i)))
+                account_write(c, d->color[i].view->tex);
+        if (!(none & (1u << 8))) {
+            if (d->depth.view && d->depth.load != NVN_GPU_LOAD_LOAD) account_write(c, d->depth.view->tex);
+            if (d->stencil.view && d->stencil.load != NVN_GPU_LOAD_LOAD) account_write(c, d->stencil.view->tex);
+        }
+    }
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) {
         if (!d->color[i].view) continue;
         cmd_ref(c, d->color[i].view, REF_VIEW);   // 附件 view（连带贴图）保活到本段完成
@@ -5616,6 +5643,17 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
+    if (g.accounts_on) {
+        const nvn_gpu_pass_desc *d = &c->pass_desc;
+        const uint16_t none = c->feedback_read_mask;
+        for (uint32_t i = 0; i < c->pass_ncolor; i++)
+            if (d->color[i].view && d->color[i].store != NVN_GPU_STORE_STORE && !(none & (1u << i)))
+                account_write(c, d->color[i].view->tex);
+        if (!(none & (1u << 8))) {
+            if (d->depth.view && d->depth.store != NVN_GPU_STORE_STORE) account_write(c, d->depth.view->tex);
+            if (d->stencil.view && d->stencil.store != NVN_GPU_STORE_STORE) account_write(c, d->stencil.view->tex);
+        }
+    }
     c->in_pass = 0;
     c->pass_natt = 0;
     pass_read_sync(c);
@@ -6562,7 +6600,13 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         DIAG_DRAW(vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance));
     }
-    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) loss_note_program(c, p);
+    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) {
+        loss_note_program(c, p);
+        if (g.accounts_on) {
+            account_attachment_writes(c, feedback_writes(c));
+            account_storage_writes(c, NVN_GPU_SH_VS, NVN_GPU_SH_CS);
+        }
+    }
     if (dtm) { const uint64_t dt3 = now_ns(); __atomic_fetch_add(&g_draw_ns[0], dt1 - dt0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[1], dt2 - dt1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[2], dt3 - dt2, __ATOMIC_RELAXED);
         // 每 5 秒一次：把后端逐笔的三段（描述符 / 状态 / 顶点索引与绘制调用）摊到每笔上打印，
         // 找到后端这笔 5 微秒里到底是谁（真机读数见坑记录续 27）。
@@ -6626,6 +6670,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     } else {
         vkCmdDispatch(c->cb, x, y, z);
     }
+    if (g.accounts_on) account_storage_writes(c, NVN_GPU_SH_CS, NVN_GPU_SH_CS + 1);
     loss_note_program(c, p);
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
@@ -6976,6 +7021,13 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     t->format = fmt;
     t->sample_format = sample_fmt;
     t->bc_decoded = bc_decoded;
+    if (g.accounts_on && bc_decoded) {
+        const int candidate = d->d.format == NVN_FORMAT_RGBA_DXT1 || d->d.format == NVN_FORMAT_RGBA_DXT1_SRGB;
+        t->account_bc_reason = !candidate ? ACCOUNT_BC_FORMAT : !g.bc1_astc_on ? ACCOUNT_BC_OFF :
+            g.dev->core_features.textureCompressionBC || !g.dev->core_features.textureCompressionASTC_LDR ? ACCOUNT_BC_CAPS :
+            fmt == VK_FORMAT_ASTC_4x4_UNORM_BLOCK || fmt == VK_FORMAT_ASTC_4x4_SRGB_BLOCK ? ACCOUNT_BC_ASTC :
+            d->usage & NVN_GPU_TEX_BC1_OPAQUE ? ACCOUNT_BC_ADMISSION : ACCOUNT_BC_NO_SNAPSHOT;
+    }
     t->original_usage = d->usage;
     t->aspect = fmt_aspect(fmt);
     t->original_desc = d->d;
@@ -7610,6 +7662,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
     bc.imageOffset = o;
     bc.imageExtent = e;
     vkCmdCopyBufferToImage(c->cb, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    account_write(c, t);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);   // 之后按采样 / 存储使用；本段统一用 GENERAL
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
@@ -7728,6 +7781,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     ic.dstOffset = dof;
     ic.extent = se;
     vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    account_write(c, d);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, s, REF_TEX);
@@ -7776,6 +7830,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         }
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
+    account_write(c, t);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
 }
@@ -8209,6 +8264,11 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     if (c->feedback_read_mask && !feedback_restart(c, 0, 0)) return;
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
+    if (g.accounts_on) {
+        uint16_t mask = d->color >= 0 ? 1u << d->color : 0;
+        if (d->depth || d->stencil) mask |= 1u << 8;
+        account_attachment_writes(c, mask);
+    }
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
 }
 
@@ -8309,6 +8369,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
         ir.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1};
         ir.srcOffset = so; ir.dstOffset = dof; ir.extent = se;
         vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir);
+        account_write(c, d);
         image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
         cmd_ref(c, s, REF_TEX); cmd_ref(c, d, REF_TEX);
         return;
@@ -8350,6 +8411,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if (flip_y) { int32_t y = ib.srcOffsets[0].y; ib.srcOffsets[0].y = ib.srcOffsets[1].y; ib.srcOffsets[1].y = y; }
     ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, 1};
     vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    account_write(c, d);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, s, REF_TEX);
@@ -8672,6 +8734,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 s->fence = fence;
                 s->submitted = 1;
                 s->executed = 1;
+                if (g.accounts_on) account_commit(c);
                 if (g.fb_copy_count_on && c->fb_copy_counts.splits) {
                     g.fb_copy_counts.draws += c->fb_copy_counts.draws;
                     g.fb_copy_counts.splits += c->fb_copy_counts.splits;
