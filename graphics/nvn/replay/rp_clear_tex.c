@@ -51,6 +51,7 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
     if (!mask) return;
     int whole = !o->r.xoffset && !o->r.yoffset && (uint32_t)o->r.width == w && (uint32_t)o->r.height == h && mask == active;
     if (!whole && !(nvn_gpu_format_caps(fmt) & NVN_GPU_FMT_RENDER)) { nvn_unimpl("tex", "clear_not_renderable", rec); return; }
+    rp_tex_upload_note_clear(t);
     nvn_gpu_clear cl = {0}; cl.color = 0; cl.color_mask = (uint8_t)mask; cl.stencil_mask = 0xff;
     cl.x = o->r.xoffset; cl.y = o->r.yoffset; cl.w = (uint32_t)o->r.width; cl.h = (uint32_t)o->r.height;
     clear_value(o, fi.kind, &cl);

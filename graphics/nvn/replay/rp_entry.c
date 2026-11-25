@@ -232,7 +232,9 @@ void nvn_be_tex_release(tex_t *t) {
 }
 int rp_tex_live_n(void) { pthread_mutex_lock(&g_mu); int n = g_tex_live_inited ? (int)g_tex_live.n : 0; pthread_mutex_unlock(&g_mu); return n; }
 void nvn_be_tex_counters(uint64_t *init, uint64_t *rel) { if (init) *init = atomic_load(&g_tex_init_n); if (rel) *rel = atomic_load(&g_tex_rel_n); }
-void nvn_be_tex_tick(uint64_t frame) { (void)frame; }
+void nvn_be_tex_tick(uint64_t frame) {
+    if (frame && !(frame % 300)) rp_tex_upload_ledger_flush(frame, 0);
+}
 int nvn_be_tex_from_gl(void *t, uint32_t gl_name) { (void)t; (void)gl_name; UN("tex_from_gl"); return 0; }
 void nvn_be_xv_window_tex(uint64_t serial) { (void)serial; }   // 跨提交有效性账本随通道规划接
 

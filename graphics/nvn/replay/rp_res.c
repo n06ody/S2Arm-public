@@ -91,6 +91,8 @@ static void note_tex_upload(struct rp_tex *x) {
     x->ever_uploaded = 1;
 }
 
+#include "rp_tex_upload_ledger.inc"
+
 static int tex_window(const tex_t *t, uint64_t *lo, uint64_t *hi);
 const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);
 
@@ -243,14 +245,20 @@ static int tex_epoch_on(void) {
 
 // ---------- 内容归属 ----------
 void nvn_be_pool_gpu_written(const void *pool) { uint64_t k = (uint64_t)(uintptr_t)pool; pthread_mutex_lock(&g_rmu); nvn_hm_put(&g_pool_gpu, &k, (void *)1); pthread_mutex_unlock(&g_rmu); }
-void nvn_be_tex_cpu_written(const tex_t *t) {
+void nvn_be_tex_cpu_mark_from(const tex_t *t, enum nvn_tex_cpu_source source) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_rmu);
     nvn_hm_put(&g_cpu_ser, &t->serial, (void *)1);
+    if (upload_ledger_enabled()) {
+        struct upload_history *h = upload_history_note(t->serial);
+        h->cpu_seq = ++g_upload_event;
+        h->cpu_source = source;
+    }
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
     if (x) { x->cpu = 1; x->gpu_written = 0; x->uploaded = 0; x->check_epoch = 0; x->check_seg = 0; x->check_dirty = 1; }   // 游戏刚用 CPU 写了它：下次使用整张重传（纪元清零 = 强制重查）
     pthread_mutex_unlock(&g_rmu);
 }
+void nvn_be_tex_cpu_written(const tex_t *t) { nvn_be_tex_cpu_mark_from(t, NVN_TEX_CPU_OTHER); }
 void nvn_be_tex_cpu_inferred(const tex_t *t) { nvn_be_tex_cpu_written(t); }
 // 调试取证：这个序号的存储现在的归属（位 0 当 CPU 贴图、位 1 传过、位 2 GPU 写过、位 3 有存储），没建过 = 0
 int rp_tex_debug_state(uint64_t serial) {
@@ -489,22 +497,23 @@ static int tex_pages_armed(const struct rp_tex *x, const tex_t *t) {
 struct tex_log_q { uintptr_t a, b; uint64_t ev; int hit; };
 static void tex_log_event(void *u, uintptr_t a, uintptr_t b) { struct tex_log_q *q = u; q->ev++; if (a < q->b && b > q->a) q->hit = 1; }
 // 内容自上次上传后是否被写过：有日志游标先读日志（按事件数付钱）；日志不可用 / 环绕 / 换底 / 句柄变了 → 计一次退回，
-//   重起游标后照旧整张逐页比代号（逐页比的结论对新游标同样成立：取游标之后的写都会进日志）。返回 1 = 脏。
-static int tex_content_dirty(struct rp_tex *x, const tex_t *t) {
+//   重起游标后照旧整张逐页比代号（逐页比的结论对新游标同样成立：取游标之后的写都会进日志）。返回 UP_CLEAN 或触发重传的核对路径。
+static enum tex_upload_reason tex_content_dirty(struct rp_tex *x, const tex_t *t) {
     uint64_t wlo, whi; tex_window(t, &wlo, &whi);   // 只看池里那段：池外字节恒按 0（rp_tex_src），不会被写
     const uintptr_t a = (uintptr_t)t->mem + wlo; const uint64_t n = whi - wlo;
     if (x->log_ok) {
         struct tex_log_q q = { a, a + n, 0, 0 };
         if (x->log_span == x->span && nvn_dirty_log_read(x->log_span, x->log_id, &x->log_cur, tex_log_event, &q)) {
             rp_perf_add(RP_PERF_TEX_LOG_N, 1); rp_perf_add(RP_PERF_TEX_LOG_EV, q.ev);
-            return q.hit;
+            return q.hit ? UP_DIRTY_LOG : UP_CLEAN;
         }
         rp_perf_add(RP_PERF_TEX_LOG_FALLBACK, 1);
         tex_log_arm(x, t);
     }
     const size_t pg = nvn_dirty_page_size();
     rp_perf_add(RP_PERF_TEX_CHECK_PAGES, n ? ((a + n - 1) / pg - a / pg + 1) : 0);   // nvn_dirty_since 要逐页比的页数（上限）
-    return nvn_dirty_since((const void *)a, n, x->stamp);
+    if (!nvn_dirty_since((const void *)a, n, x->stamp)) return UP_CLEAN;
+    return x->span ? UP_DIRTY_SCAN : UP_NO_SPAN;
 }
 
 static void vf_drop_of(const struct rp_tex *x);   // 按目标取视图的表里指着这份存储的项（定义在那张表后面）
@@ -834,6 +843,11 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
                     more = 0;
                     for (uint32_t q = 0; q < g_by_serial.cap; q++) if (g_by_serial.vals[q] == x) {
                         uint64_t sk; memcpy(&sk, g_by_serial.keys + (size_t)q * g_by_serial.klen, sizeof sk);
+                        if (upload_ledger_enabled()) {
+                            struct upload_history *h = upload_history_note(sk);
+                            h->alias_seq = ++g_upload_event;
+                            h->alias_uid = x->uid;
+                        }
                         nvn_hm_del(&g_by_serial, &sk); nvn_hm_del(&g_cpu_ser, &sk); more = 1; break; }
                 }
                 x->users = 0; g_alias_dead++;
@@ -886,7 +900,13 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
             if (xc) {   // 三段分别计时：扫存储定来源 / 整张上传 / 整张填零
                 uint64_t i0_ = res_now(); int from = init_from_storage(t); uint64_t i1_ = res_now(); rp_perf_add(RP_PERF_RES_SCAN, i1_ - i0_);
                 int zero = !from;
-                if (from) { zero = upload_all(t, x, xc, 0); uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_;
+                if (from) {
+                    const int ledger = upload_ledger_enabled();
+                    struct upload_input in;
+                    if (ledger) in = upload_ledger_input(x, UP_STORAGE_INIT, 0, 0, 0);
+                    zero = upload_all(t, x, xc, 0);
+                    uint64_t i2_ = res_now(); rp_perf_add(RP_PERF_RES_UP, i2_ - i1_); rp_perf_add(RP_PERF_RES_UPN, 1); i1_ = i2_;
+                    if (ledger) upload_ledger_note(t, x, in, zero);
                     if (zero == -2) { x->need_init = 1; pthread_mutex_unlock(&g_rmu); return NULL; } }
                 if (zero && g_attach_intent && zero_deferrable(t)) { x->zero_pending = 1; rp_perf_add(RP_PERF_RES_ZDEFER, 1); }
                 else if (zero) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERO, res_now() - i1_); rp_perf_add(RP_PERF_RES_ZERON, 1); }
@@ -912,14 +932,24 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 uint64_t wlo, whi; tex_window(t, &wlo, &whi);   // 同 upload_all：只跟踪池里那段
                 x->span = nvn_dirty_span(t->mem + wlo, whi - wlo);   // 换底 / 重新登记后重取句柄（NULL = 不再被跟踪，照旧每次都查）
             }
-            if (!x->uploaded || x->check_dirty || (x->sparse ? !sparse_clean(x, t) : tex_content_dirty(x, t))) {
+            const enum tex_upload_reason reason = !x->uploaded ? UP_NOT_UPLOADED :
+                x->check_dirty ? (x->unarmed ? UP_UNARMED : UP_RETRY) :
+                x->sparse ? (sparse_clean(x, t) ? UP_CLEAN : UP_SPARSE) : tex_content_dirty(x, t);
+            if (reason != UP_CLEAN) {
                 nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);   // 上传是传输：录进前置段（本次提交里第二次上传才回主段）
                 if (g_texdiag_on < 0) g_texdiag_on = nvn_plat_flag("nvk_tex_reupload_diag", 0) != 0;
                 const int diag = xc && g_texdiag_on, first = !x->uploaded;
                 const char *trigger = NULL; texdiag_sample sample = {0};
                 if (diag) { trigger = first ? "first" : x->check_dirty ? "retry" : !x->span ? "untracked" : nvn_dirty_tracking_unreliable() ? "unreliable" : "dirty"; sample = texdiag_begin(t); }
                 int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
-                int ur = xc && pr < 0 ? upload_all(t, x, xc, 1) : 0;
+                int ur = 0;
+                if (xc && pr < 0) {
+                    const int ledger = upload_ledger_enabled();
+                    struct upload_input in;
+                    if (ledger) in = upload_ledger_input(x, reason, now0, map0, vg0);
+                    ur = upload_all(t, x, xc, 1);
+                    if (ledger) upload_ledger_note(t, x, in, ur);
+                }
                 int success = xc && (pr == 0 || (pr < 0 && ur == 0));
                 if (diag) texdiag_end(&sample, t, x, first, trigger, success);   // 先收尾：回收快照、记事件（-2 延迟也按 unknown_upload 记）
                 if (ur == -2) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
@@ -1509,6 +1539,7 @@ static void pool_cache_reset(void) {
 }
 
 void rp_res_reset(void) {
+    rp_tex_upload_ledger_flush(rp_frame(), 1);
     pool_cache_reset();   // 池快照先放（引用着零贴图 / 视图 / 采样器）
     pthread_mutex_lock(&g_rmu);
     for (int i = 0; i < g_ntreg; i++) treg_drop_view(&g_treg[i]);
@@ -1542,6 +1573,10 @@ void rp_res_reset(void) {
         nvn_plat_log(NVN_PLAT_LOG_INFO, "tex-reupload-summary", line);
     }
     g_texdiag_events = g_texdiag_first = g_texdiag_same = g_texdiag_changed = g_texdiag_initial = g_texdiag_unknown = 0;
+    if (atomic_exchange_explicit(&g_upload_ledger_on, -1, memory_order_relaxed) == 1) {
+        memset(g_upload_history, 0, sizeof g_upload_history);
+        g_upload_event = 0;
+    }
     g_built = 0; g_bc1_upload_sub = 0; g_ser_gen++; g_texdiag_on = -1;
     pthread_mutex_unlock(&g_rmu);
 }
