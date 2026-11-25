@@ -15,12 +15,24 @@ static void *load(const char *name) { void *entry = h_nvnBootstrapLoader(name); 
 #define API(name) ((NVNT_##name)load(#name))
 enum { POOL = 1 << 20, OFF = 0x10000, LEN = 4096 };
 
+// Observe what the real HLE initializer passes to the backend.
+extern void nvn_be_pool_add(const void *, uint64_t);
+static const void *registered_mem;
+static int64_t registered_flags;
+static uint64_t registered_size;
+void nvn_be_pool_add_flags(const void *mem, uint64_t size, int64_t flags) {
+    registered_mem = mem; registered_flags = flags; registered_size = size;
+    nvn_be_pool_add(mem, size);
+}
+
 static void one(NVNdevice *dev, int flags, int none, const char *what) {
     void *mem = NULL; CHECK(posix_memalign(&mem, 65536, POOL) == 0, "分配存储"); memset(mem, 0, POOL);
     NVNmemoryPool pool; NVNmemoryPoolBuilder pb; memset(&pool, 0, sizeof pool); memset(&pb, 0, sizeof pb);
     API(nvnMemoryPoolBuilderSetDefaults)(&pb); API(nvnMemoryPoolBuilderSetDevice)(&pb, dev);
     API(nvnMemoryPoolBuilderSetStorage)(&pb, mem, POOL); API(nvnMemoryPoolBuilderSetFlags)(&pb, flags);
+    registered_mem = NULL; registered_flags = -1; registered_size = 0;
     CHECK(API(nvnMemoryPoolInitialize)(&pool, &pb), "%s：池初始化", what);
+    CHECK(registered_mem == mem && registered_size == POOL && registered_flags == flags, "%s：后端收到真实建池标志和存储", what);
     NVNbuffer buf; NVNbufferBuilder bb; memset(&buf, 0, sizeof buf); memset(&bb, 0, sizeof bb);
     API(nvnBufferBuilderSetDefaults)(&bb); API(nvnBufferBuilderSetDevice)(&bb, dev); API(nvnBufferBuilderSetStorage)(&bb, &pool, OFF, LEN);
     CHECK(API(nvnBufferInitialize)(&buf, &bb), "%s：缓冲初始化", what);

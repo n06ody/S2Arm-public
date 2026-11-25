@@ -15,6 +15,7 @@
 #include "nvn_dirty.h"
 #include "nvn_mtl.h"
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -105,7 +106,7 @@ static void mirror_free(struct mirror *m, int defer) {
 #include "rp_land_origin.inc"
 
 static void shadow_free(struct shadow *s, int defer) {
-    if (s->origin_pool) for (int i = 0; i < s->ngw; i++) origin_close(s, &s->gw[i], 0);
+    if (s->origin_pool) for (int i = 0; i < s->ngw; i++) origin_close(s, &s->gw[i], 0, 0);
     if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE);
     if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
     mirror_free(&s->m[0], defer); mirror_free(&s->m[1], defer); free(s->gw); free(s);
@@ -313,14 +314,20 @@ uint64_t rp_buf_gpu_write_note_from(uint64_t addr, uint64_t len, uint64_t *pool_
     static uint64_t next_id;
     const uint8_t *mem; uint64_t size;
     if (merged) *merged = 0;
-    if (!len || !rp_pool_find(addr, len, &mem, &size)) return 0;
+    if (!len) return 0;
+    const int trace = origin_on();
+    int64_t flags = -1;
+    // 弱链接[replay]：rp_pool_find_flags（隔离后端夹具只实现地址表，没有 NVN 标志）
+    extern int rp_pool_find_flags(uint64_t, uint64_t, const uint8_t **, uint64_t *, int64_t *) __attribute__((weak));
+    if (trace && rp_frame() == (uint64_t)origin_frame && rp_pool_find_flags) {
+        if (!rp_pool_find_flags(addr, len, &mem, &size, &flags)) return 0;
+    } else if (!rp_pool_find(addr, len, &mem, &size)) return 0;
     if (g_gw_merge_on < 0 || !(++g_gw_merge_k & 255)) g_gw_merge_on = nvn_plat_flag("nvk_land_merge", 1) != 0;   // 开关：每 256 次登记重读一次
     const int merge_on = g_gw_merge_on;
     pthread_mutex_lock(&g_bmu);
     struct shadow *s = shadow_get(mem, size); uint64_t id = 0;
     if (s) {
         const uint64_t off = addr - (uint64_t)(uintptr_t)mem, sub = rp_sub_serial();
-        const int trace = origin_on();
         struct write_origin provenance = {0};
         if (trace) provenance = origin_raw(source, len);
         const int selected = provenance.selected != 0;
@@ -354,7 +361,7 @@ uint64_t rp_buf_gpu_write_note_from(uint64_t addr, uint64_t len, uint64_t *pool_
                 g->off = lo; g->len = hi - lo;
                 if (trace) {
                     g->origin = provenance;
-                    origin_accept(s, id, sub, off, len, source, selected);
+                    origin_accept(s, id, sub, off, len, source, selected, flags);
                 }
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
@@ -369,7 +376,7 @@ uint64_t rp_buf_gpu_write_note_from(uint64_t addr, uint64_t len, uint64_t *pool_
             id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
             if (trace) {
                 s->gw[s->ngw - 1].origin = provenance;
-                origin_accept(s, id, sub, off, len, source, selected);
+                origin_accept(s, id, sub, off, len, source, selected, flags);
             }
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
@@ -427,6 +434,7 @@ void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t cou
         first = end;
     }
 }
+static uint64_t res_now(void);
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {
     rp_buf_gpu_write_land_from(pool_key, id, ok, NULL);
 }
@@ -434,7 +442,7 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
-    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
+    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0, time_copy = 0;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
@@ -442,21 +450,24 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
         const uint8_t *mirror = ok && !staged ? nvn_gpu_buf_cpu(s->m[wmi].buf) : NULL;
         if (ok) src = staged ? staged : (mirror ? mirror + off : NULL);
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
+        time_copy = src && s->gw[i].origin.selected;
         s->gw[i].landing = 1; found = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
         break; }
     pthread_mutex_unlock(&g_bmu);
     if (!found) return;
+    const uint64_t begin = time_copy ? res_now() : 0;
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
     if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);
 #else
     if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
+    uint64_t copy_ns = time_copy ? res_now() - begin : 0;
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) {
-        if (s->origin_pool) origin_close(s, &s->gw[i], src != NULL);
+        if (s->origin_pool) origin_close(s, &s->gw[i], src != NULL, copy_ns);
         s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
     // 登记撤掉之后同一段改用当前那份镜像：不受写跟踪的池里，那份镜像此前同步这些页时按登记跳过了这段字节，落地的内容它没有——作废这几页，下次使用重新同步。

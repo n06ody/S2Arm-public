@@ -4141,6 +4141,9 @@ static void t_sbuf_window(void) {
         g_buf_cpu_fake = mirror; nvn_be_sub_begin();
         rp_S.ssbo[5][1].addr = base + 3 * PG; rp_S.ssbo[5][1].size = 0;
         p_dispatch dp; memset(&dp, 0, sizeof dp); dp.x = dp.y = dp.z = 1;
+        dp.x = 3; dp.y = 5; dp.z = 7;
+        memcpy(rp_S.skey[5], (uint8_t[]){0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0}, 8);
+        rp_S.skey_ok |= 1u << 5;
         rp_dispatch(&g_fake_cmd, &dp, NULL);
         CHECK(g_ndisp == 1 && g_ncb == 1 && g_cb[0].u.b.len == (NPG - 3) * PG);
         memset(mirror + 3 * PG + PG, 0x5a, 16);   // 显卡写在槽起点后一页（槽长度 0 时只有按池剩余登记才够得着）
@@ -5050,9 +5053,14 @@ static void *pool_del_thread(void *p) {
     pthread_mutex_lock(&g_land_mu); g_destroy_done = 1; pthread_cond_broadcast(&g_land_cv); pthread_mutex_unlock(&g_land_mu);
     return NULL;
 }
+static int g_land_timed_fixture;
 static int g_land_copies; static uint64_t g_land_copied;   // 落地拷贝统计：次数 / 累计字节（同段合并用例核对「合并后只拷一遍」）
 void rp_test_land_copy(void *dst, const void *src, size_t len) {
     g_land_copies++; g_land_copied += len;
+    if (g_land_timed_fixture) {
+        struct timespec delay = {.tv_nsec = 2000000};
+        nanosleep(&delay, NULL);
+    }
     if (!g_land_pause) { memcpy(dst, src, len); return; }
     size_t half = len / 2; memcpy(dst, src, half);
     pthread_mutex_lock(&g_land_mu); g_land_half = 1; pthread_cond_broadcast(&g_land_cv);
@@ -5209,7 +5217,7 @@ static void t_land_origin(void) {
         g_buf_cpu_auto = 1; g_flag_land_merge = 1; rp_test_gw_merge_reload();
         nvn_be_set_frame(57);
         uint64_t base = (uint64_t)(uintptr_t)g_pmem;
-        nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        nvn_be_pool_add_flags(g_pmem, sizeof g_pmem, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
         nvn_be_sub_begin();
         nvn_gpu_buf b;
         CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
@@ -5218,10 +5226,11 @@ static void t_land_origin(void) {
         g_gx_rec = 1; g_ngx = 0;
         CHECK(rp_op_clear_buf_gpu(&g_fake_cmd, &clear, NULL));
         g_gx_rec = 0;
-        g_land_copied = 0;
+        g_land_copied = 0; g_land_timed_fixture = enabled;
         nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
-        CHECK(g_land_copied == 24);
-        nvn_be_pool_del(g_pmem); nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        g_land_timed_fixture = 0; CHECK(g_land_copied == 24);
+        nvn_be_pool_del(g_pmem);
+        nvn_be_pool_add_flags(g_pmem, sizeof g_pmem, NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
         nvn_be_sub_begin();
         CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
         CHECK(rp_post_gpu_write(base + 64, 4));
@@ -5230,6 +5239,16 @@ static void t_land_origin(void) {
         nvn_be_shutdown_session();
         if (enabled) {
             CHECK(origin_matches("segment ", "off=64 bytes=24 copied=24") == 1);
+            CHECK(origin_matches("raw frame=57", "pool_flags=0x22 virtual=0") == 3);
+            CHECK(origin_matches("raw frame=57", "pool_flags=0x201 virtual=1") == 1);
+            uint64_t elapsed = 0;
+            for (int i = 0; i < origin_n; i++) {
+                const char *time = strstr(origin_lines[i], " copy_ns=");
+                if (time && strstr(origin_lines[i], "copied=24 ")) elapsed = strtoull(time + 9, NULL, 10);
+            }
+            CHECK(elapsed >= 2000000);
+            CHECK(origin_matches("segment ", "copy_ns=") == 2);
+            CHECK(origin_matches("copied=0 ", "copy_ns=0") == 1);
             CHECK(origin_matches("source=mixed", "raw=3/32") == 1);
             CHECK(origin_matches("segment ", "off=64 bytes=4 copied=0") == 1);
             CHECK(origin_matches("source=all", "raw=4/36 merged=2/28 copied=1/24 discarded=1/4") == 1);
@@ -5254,8 +5273,8 @@ static void t_land_origin_masks(void) {
     nvn_gpu_buf b;
     CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
     for (int i = 0; i < 3; i++) {
-        const struct rp_write_source first = {RP_W_SSBO, 0, 2};
-        const struct rp_write_source next = {RP_W_SSBO, i == 1 ? 5 : 0, i == 2 ? 3 : 2};
+        const struct rp_write_source first = {.op=RP_W_SSBO, .stage=0, .slot=2};
+        const struct rp_write_source next = {.op=RP_W_SSBO, .stage=i == 1 ? 5 : 0, .slot=i == 2 ? 3 : 2};
         CHECK(rp_post_gpu_write_from(base + 32 * i, 8, first));
         CHECK(rp_post_gpu_write_from(base + 32 * i, 8, next));
     }
@@ -5293,6 +5312,23 @@ static void t_land_origin_producers(void) {
     origin_mode = 1; origin_n = 0;
     t_sbuf_window();
     CHECK(origin_matches("raw frame=57", "op=ssbo stage=5 slot=1") == 1);
+    CHECK(origin_matches("op=ssbo stage=5 slot=1", "pool_flags=unknown virtual=-1") == 1);
+    CHECK(origin_matches("op=ssbo stage=5 slot=1", "cs_key=123456789abcdef0 dispatch=direct gx=3 gy=5 gz=7") == 1);
+    // An indirect GPU argument buffer can contain a newer value than the CPU mapping.
+    // Exercise the actual dispatch path with an invalidated key and CPU-side decoy XYZ.
+    pass_fresh(); origin_mode = 1; origin_n = 0;
+    nvn_be_pool_add_flags(g_pmem, sizeof g_pmem, NVN_MEMORY_POOL_FLAGS_CPU_CACHED);
+    nvn_be_sub_begin();
+    uint64_t addr = (uint64_t)(uintptr_t)g_pmem;
+    memset(&g_cprog, 0, sizeof g_cprog); g_cprog.is_compute = 1; g_cprog.sh[0] = &g_fsh[0];
+    g_cprog.nent[0] = 1; g_cprog.ent[0][0] = (nvn_gpu_layout_ent){.cls=NVN_GPU_RES_SSBO,
+        .src_kind=NVN_RB_SBUFP, .src_reg=1, .access=NVN_GPU_ACC_W};
+    rp_S.ssbo[5][1] = (p_bind_buf){5, 1, addr + PG, 64};
+    rp_S.skey_ok &= ~(1u << 5);
+    p_dispatch indirect = {.ind=addr + 2 * PG, .x=11, .y=13, .z=17};
+    rp_dispatch(&g_fake_cmd, &indirect, NULL);
+    CHECK(origin_matches("pool_flags=0x4 virtual=0", "cs_key=unknown dispatch=indirect gx=? gy=? gz=?") == 1);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_pool_del(g_pmem);
     origin_n = 0; t_bufops_gpu_order();
     CHECK(origin_matches("raw frame=57", "op=ubo_ptr stage=5 slot=2") == 3);
     CHECK(origin_matches("raw frame=57", "op=copy stage=-1 slot=-1") == 1);

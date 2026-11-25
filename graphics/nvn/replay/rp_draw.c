@@ -826,7 +826,7 @@ static int skip(const char *why, const void *rec) {
 }
 void rp_draw_log_arm(int lines) { g_log_left = lines; }
 static const char *image_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, uint32_t i, int stage, nvn_gpu_view *out, tex_t *snapout);
-static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, uint32_t i, int stage, nvn_gpu_view *out);
+static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, uint32_t i, int stage, nvn_gpu_view *out, const p_dispatch *dp);
 // 图形阶段存储图像：这一笔解析出的登记快照（调用方持有；登记表会扩容换地址），画成后按写访问登记 GPU 写
 static tex_t g_gimg_snap[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static const tex_t *g_gimg[RP_PROG_STAGES][RP_PROG_ENT_MAX];
 
@@ -1174,11 +1174,11 @@ static const char *pool_table_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, i
     g_ptd[row][i] = rp_pool_table(c, sp, sp ? rp_S.samp_base : rp_S.tex_base, pn, pg->dtt[pi][i], pg->dcls[pi][i], &why);
     return g_ptd[row][i] ? NULL : why ? why : "pool_table_unresolved";
 }
-static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec);
+static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec, const p_dispatch *dp);
 static nvn_gpu_slice g_spill; static uint64_t g_spill_len;   // 本次派发的共享内存溢出缓冲（rp_dispatch 分配，绑定时用；0 = 没有）
 static int g_spill_on = -1, g_spill_said;   // 平台开关 nvk_spill（缺省开；关时 spill 程序的派发报名跳过，真机 A/B 用）；会话内前 64 次 spill 派发各记一行
-static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec); }
-static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) {
+static int bind_stage(nvn_gpu_cmd c, const struct rp_prog *pg, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec) { return bind_stage_at(c, pg, st, st, base_instance, tv, ts, rec, NULL); }
+static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec, const p_dispatch *dp) {
     nvn_gpu_binding b[RP_PROG_ENT_MAX]; uint32_t n = 0;
     int has_tbuf = 0, npool = 0;
     // 沿用上一笔：只限图形两个阶段；存储缓冲（要同步镜像、登记 GPU 写）和贴图（视图会轮转）每笔照取
@@ -1244,7 +1244,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (clamped & 2) nvn_unimpl("draw", "storage_buffer_past_pool_end_clamped", rec);   // 伸出池尾的部分没有存储：照画，具名记账
                 // 回写只登记游戏绑定的那一段（窗口前补的余数字节不是这个缓冲的，回写会盖掉相邻内容）
                 if (e->access & NVN_GPU_ACC_W) { const uint64_t reach = wa + wl - sb->addr;   // 窗口里属于这个缓冲的长度（余数 < 对齐 ≤ 256，上限 ≥ 128 MiB，不会为负）
-                    struct rp_write_source source = {sbufp ? RP_W_SSBO : RP_W_UBOP, st, e->src_reg};
+                    struct rp_write_source source = {sbufp ? RP_W_SSBO : RP_W_UBOP, st, e->src_reg, dp,
+                        dp && (rp_S.skey_ok & (1u << 5)) ? rp_S.skey[5] : NULL};
                     rp_post_gpu_write_from(sb->addr, reach < blen ? reach : blen, source); }
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
@@ -1829,7 +1830,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             continue;
         }
         if (e->src_kind == NVN_RB_IMG && e->cls == NVN_GPU_RES_IMAGE_TBUF) {   // 图形阶段 imageBuffer：缓冲视图（见 image_tbuf_resolve）
-            const char *why = image_tbuf_resolve(c, g_prog, st, i, st, &tv[st][i]);
+            const char *why = image_tbuf_resolve(c, g_prog, st, i, st, &tv[st][i], NULL);
             if (why) { skip(why, rec); goto draw_done; }
             continue;
         }
@@ -2275,7 +2276,7 @@ static const char *image_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi
 // 图像槽里的缓冲贴图（imageBuffer，布局类别 IMAGE_TBUF）：按槽句柄取登记的 BUFFER 贴图，按声明选视图格式（同 image_resolve 的 image_view_format：
 //   声明了格式就用声明的，Eden / Ryujinx 同样取着色器的显式格式），在池镜像上建存储纹素缓冲视图（texel_bind，不对齐时走对齐副本）。
 //   着色器会写的这一段登记 GPU 写（段完成后回写游戏内存，同可写存储缓冲）。成功返回 NULL，*out 为本笔临时视图（调用方释放）
-static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, uint32_t i, int stage, nvn_gpu_view *out) {
+static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, uint32_t i, int stage, nvn_gpu_view *out, const p_dispatch *dp) {
     static const char *const nm[2][6] = {
         {"compute_image_tbuf_shape", "compute_image_tbuf_unresolved", "compute_image_tbuf_texture_shape", "compute_image_tbuf_format_unsupported", "compute_image_tbuf_buffer_unresolved", "compute_image_tbuf_decl_type_mismatch"},
         {"graphics_image_tbuf_shape", "graphics_image_tbuf_unresolved", "graphics_image_tbuf_texture_shape", "graphics_image_tbuf_format_unsupported", "graphics_image_tbuf_buffer_unresolved", "graphics_image_tbuf_decl_type_mismatch"}};
@@ -2301,7 +2302,8 @@ static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, i
     const int write = (e->access & NVN_GPU_ACC_W) != 0;
     const char *why = texel_bind(c, buf, off, bytes, base.bytes, vfmt, gfx ? 2 : 1, write, out);
     if (why) return why;
-    if (write) rp_post_gpu_write_from((uint64_t)(uintptr_t)t.mem, bytes, (struct rp_write_source){RP_W_IMAGE_TBUF, stage, e->src_reg});
+    if (write) rp_post_gpu_write_from((uint64_t)(uintptr_t)t.mem, bytes, (struct rp_write_source){RP_W_IMAGE_TBUF, stage, e->src_reg, dp,
+        dp && (rp_S.skey_ok & (1u << 5)) ? rp_S.skey[5] : NULL});
     return NULL;
 }
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
@@ -2331,7 +2333,7 @@ cs_rebind:
             continue;
         }
         if (e->src_kind == NVN_RB_IMG && e->cls == NVN_GPU_RES_IMAGE_TBUF) {   // 计算 imageBuffer：缓冲视图（见 image_tbuf_resolve）；写过的对齐副本派发后拷回
-            const char *why = image_tbuf_resolve(c, pg, 0, i, 5, &tv[i]);
+            const char *why = image_tbuf_resolve(c, pg, 0, i, 5, &tv[i], dp);
             if (why) { skip(why, rec); goto done; }
             continue;
         }
@@ -2460,7 +2462,7 @@ cs_rebind:
     g_pipe = NULL; g_pipe_cmd = NULL; rp_dirty_all();   // 后端的当前管线换成了计算管线：下一笔绘制全部重发
     g_disp_dim[0] = dp->ind ? 0 : (uint32_t)dp->x; g_disp_dim[1] = dp->ind ? 0 : (uint32_t)dp->y; g_disp_dim[2] = dp->ind ? 0 : (uint32_t)dp->z;
     g_ndispatch_access = 0;
-    if (!bind_stage_at(c, pg, 0, 5, 0, tv, ts, rec)) goto done;
+    if (!bind_stage_at(c, pg, 0, 5, 0, tv, ts, rec, dp)) goto done;
     for (uint32_t i = 0; i < pg->nent[0]; i++) if (images[i] && (pg->ent[0][i].access & NVN_GPU_ACC_W)) rp_tex_mark_gpu_written(images[i]);
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);

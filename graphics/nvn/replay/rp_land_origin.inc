@@ -9,7 +9,8 @@ struct origin_pair { uint64_t n, bytes; };
 struct origin_counts { struct origin_pair raw, merged, copied, discarded, settled; };
 static struct origin_counts origin_window[ORIGIN_ALL + 1], origin_capture;
 static struct origin_pair origin_pending;
-static int origin_enabled = -1, origin_frame = -1, origin_frame_done;
+static _Atomic int origin_enabled = -1, origin_frame = -1;
+static int origin_frame_done;
 static uint64_t origin_next_pool, origin_cross_frame, origin_selected_closed;
 
 static void origin_add(struct origin_pair *p, uint64_t n, uint64_t bytes) {
@@ -17,11 +18,16 @@ static void origin_add(struct origin_pair *p, uint64_t n, uint64_t bytes) {
     p->bytes += bytes;
 }
 static int origin_on(void) {
+    int enabled = atomic_load_explicit(&origin_enabled, memory_order_acquire);
+    if (enabled >= 0) return enabled;
+    pthread_mutex_lock(&g_bmu);
     if (origin_enabled < 0) {
-        origin_enabled = nvn_plat_flag("nvk_land_origin", 0) != 0;
-        if (origin_enabled) origin_frame = nvn_plat_flag("nvk_land_origin_frame", -1);
-    }
-    return origin_enabled;
+        enabled = nvn_plat_flag("nvk_land_origin", 0) != 0;
+        if (enabled) origin_frame = nvn_plat_flag("nvk_land_origin_frame", -1);
+        origin_enabled = enabled;
+    } else enabled = origin_enabled;
+    pthread_mutex_unlock(&g_bmu);
+    return enabled;
 }
 static int origin_shader(enum rp_write_op op) {
     return op == RP_W_SSBO || op == RP_W_UBOP || op == RP_W_IMAGE_TBUF;
@@ -37,7 +43,7 @@ static void origin_union(struct write_origin *dst, const struct write_origin *sr
     dst->ops |= src->ops; dst->stages |= src->stages; dst->slots |= src->slots;
 }
 static void origin_accept(struct shadow *s, uint64_t id, uint64_t sub, uint64_t off, uint64_t len,
-                          struct rp_write_source src, int selected) {
+                          struct rp_write_source src, int selected, int64_t pool_flags) {
     if (!s->origin_pool) s->origin_pool = ++origin_next_pool;
     origin_add(&origin_window[src.op].raw, 1, len);
     origin_add(&origin_window[ORIGIN_ALL].raw, 1, len);
@@ -45,10 +51,21 @@ static void origin_accept(struct shadow *s, uint64_t id, uint64_t sub, uint64_t 
     if (selected) {
         origin_add(&origin_capture.raw, 1, len);
         int shader = origin_shader(src.op);
-        char line[256];
+        char flags[24] = "unknown", cs[128] = "";
+        if (pool_flags >= 0) snprintf(flags, sizeof flags, "0x%x", (unsigned)pool_flags);
+        if (src.dispatch) {
+            char key[18] = "unknown";
+            if (src.compute_key) for (int i = 0; i < 8; i++)
+                snprintf(key + 2 * i, 3, "%02x", src.compute_key[i]);
+            if (src.dispatch->ind) snprintf(cs, sizeof cs, " cs_key=%s dispatch=indirect gx=? gy=? gz=?", key);
+            else snprintf(cs, sizeof cs, " cs_key=%s dispatch=direct gx=%d gy=%d gz=%d",
+                          key, src.dispatch->x, src.dispatch->y, src.dispatch->z);
+        }
+        char line[448];
         snprintf(line, sizeof line, "raw frame=%d pool=%" PRIu64 " write=%" PRIu64 " sub=%" PRIu64
-                 " off=%" PRIu64 " bytes=%" PRIu64 " op=%s stage=%d slot=%d", origin_frame, s->origin_pool,
-                 id, sub, off, len, origin_names[src.op], shader ? src.stage : -1, shader ? src.slot : -1);
+                 " off=%" PRIu64 " bytes=%" PRIu64 " op=%s stage=%d slot=%d pool_flags=%s virtual=%d%s", origin_frame, s->origin_pool,
+                 id, sub, off, len, origin_names[src.op], shader ? src.stage : -1, shader ? src.slot : -1,
+                 flags, pool_flags < 0 ? -1 : !!(pool_flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL), cs);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "land-origin", line);
     }
 }
@@ -64,7 +81,7 @@ static void origin_close_counts(struct origin_counts *c, const struct gpu_write 
     origin_add(copied ? &c->copied : &c->discarded, 1, g->len);
 }
 static int origin_multiple(unsigned mask) { return (mask & (mask - 1)) != 0; }
-static void origin_close(const struct shadow *s, const struct gpu_write *g, int copied) {
+static void origin_close(const struct shadow *s, const struct gpu_write *g, int copied, uint64_t copy_ns) {
     const struct write_origin *w = &g->origin;
     if (!w->n) return;
     int group = ORIGIN_MIXED;
@@ -80,9 +97,9 @@ static void origin_close(const struct shadow *s, const struct gpu_write *g, int 
         char line[352];
         snprintf(line, sizeof line, "segment frame=%d pool=%" PRIu64 " write=%" PRIu64 " sub=%" PRIu64
                  " off=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " source=%s ops=%x stages=%x slots=%x"
-                 " raw=%" PRIu64 "/%" PRIu64 " selected=%" PRIu64, origin_frame, s->origin_pool, g->id, g->sub,
+                 " raw=%" PRIu64 "/%" PRIu64 " selected=%" PRIu64 " copy_ns=%" PRIu64, origin_frame, s->origin_pool, g->id, g->sub,
                  g->off, g->len, copied ? g->len : UINT64_C(0), origin_names[group], w->ops, w->stages, w->slots,
-                 w->n, w->bytes, w->selected);
+                 w->n, w->bytes, w->selected, copy_ns);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "land-origin", line);
     }
 }

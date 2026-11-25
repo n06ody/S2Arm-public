@@ -34,7 +34,7 @@ void mtl_init(void) {}
 
 // ---------- 内存池登记：按地址判断「这段在不在某个池里」----------
 enum { RP_NPOOL = 4096 };
-static struct { const uint8_t *mem; uint64_t size; } g_pool[RP_NPOOL];
+static struct { const uint8_t *mem; uint64_t size; int64_t flags; } g_pool[RP_NPOOL];
 static uint64_t g_pool_maxend[RP_NPOOL];   // prefix max of pool end addresses (ranges may nest; prunes the walk-back)
 static int g_npool;
 // 池表按起点升序（插入时挪位）。查找走二分 + 「上次命中的池」快路：
@@ -94,7 +94,7 @@ static void pool_maxend_recompute(void) {   // caller holds g_mu; O(n) on add/de
     uint64_t m = 0;
     for (int i = 0; i < g_npool; i++) { uint64_t e = (uint64_t)(uintptr_t)g_pool[i].mem + g_pool[i].size; if (e > m) m = e; g_pool_maxend[i] = m; }
 }
-static int pool_find_locked(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *size) {
+static int pool_find_locked(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *size, int64_t *flags) {
     int lo = 0, hi = g_npool - 1, cand = -1;
     while (lo <= hi) { int mid = (lo + hi) / 2; if ((uint64_t)(uintptr_t)g_pool[mid].mem <= addr) { cand = mid; lo = mid + 1; } else hi = mid - 1; }
     if (cand < 0) return 0;
@@ -118,6 +118,7 @@ static int pool_find_locked(uint64_t addr, uint64_t len, const uint8_t **mem, ui
         if (ke > alo) alo = ke;
     }
     uint64_t lim = cand + 1 < g_npool ? (uint64_t)(uintptr_t)g_pool[cand + 1].mem : UINT64_MAX;
+    if (flags) *flags = g_pool[ci].flags;
     if (mem) *mem = g_pool[ci].mem;
     if (size) *size = sz;
     const uint64_t ep = __atomic_load_n(&g_pool_epoch, __ATOMIC_RELAXED);
@@ -148,7 +149,7 @@ static int pool_find_fast(pool_tls *const t, uint64_t addr, uint64_t len, const 
     t->fast_hits++;
     return 1;
 }
-void nvn_be_pool_add(const void *mem, uint64_t size) {
+void nvn_be_pool_add_flags(const void *mem, uint64_t size, int64_t flags) {
     if (!mem || !size) return;
     pthread_mutex_lock(&g_mu);
     if (g_npool < RP_NPOOL) {
@@ -156,7 +157,7 @@ void nvn_be_pool_add(const void *mem, uint64_t size) {
         int at = g_npool;
         for (int i = 0; i < g_npool; i++) if ((uint64_t)(uintptr_t)g_pool[i].mem > b) { at = i; break; }
         if (at != g_npool) memmove(&g_pool[at + 1], &g_pool[at], (size_t)(g_npool - at) * sizeof g_pool[0]);
-        g_pool[at] = (__typeof__(g_pool[0])){mem, size};
+        g_pool[at] = (__typeof__(g_pool[0])){mem, size, flags};
         g_npool++;
         pool_maxend_recompute();
         __atomic_add_fetch(&g_pool_epoch, 1, __ATOMIC_RELEASE);
@@ -164,6 +165,7 @@ void nvn_be_pool_add(const void *mem, uint64_t size) {
     else { pthread_mutex_unlock(&g_mu); nvn_unimpl("limit", "pool_table_full_4096", mem); return; }
     pthread_mutex_unlock(&g_mu);
 }
+void nvn_be_pool_add(const void *mem, uint64_t size) { nvn_be_pool_add_flags(mem, size, -1); }
 // 池上伸出池尾的缓冲对象（D-6VG6，同 nvn_mtl.m nvn_be_pool_cover）：把这个池在本后端的登记扩到 [mem, mem + need)，越过池尾的访问落在池存储之后同一处内存（真机语义）。
 //   本表注销只删第一个同起点的条目，所以原地加长那一条，不另登记。池尾之后那段须整段映射着（mincore 每页都认），否则不扩、记一笔（读写会 SIGSEGV）
 void nvn_be_pool_cover(const void *mem, uint64_t size, uint64_t need) {
@@ -193,7 +195,7 @@ int nvn_be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     int hit = pool_find_memo(t, addr, len, &mem, &size) || pool_find_fast(t, addr, len, &mem, &size);
     if (!hit) {
         pthread_mutex_lock(&g_mu);
-        hit = pool_find_locked(addr, len, &mem, &size);
+        hit = pool_find_locked(addr, len, &mem, &size, NULL);
         pthread_mutex_unlock(&g_mu);
     }
     if (hit) { if (buf) *buf = (void *)(uintptr_t)mem; if (off) *off = addr - (uint64_t)(uintptr_t)mem; }
@@ -203,7 +205,14 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
     pool_tls *const t = &g_pool_tls;
     if (pool_find_memo(t, addr, len, mem, size) || pool_find_fast(t, addr, len, mem, size)) return 1;
     pthread_mutex_lock(&g_mu);
-    int hit = pool_find_locked(addr, len, mem, size);
+    int hit = pool_find_locked(addr, len, mem, size, NULL);
+    pthread_mutex_unlock(&g_mu);
+    return hit;
+}
+// Selected frame only. Resolve flags and storage from the same table entry under the same lock.
+int rp_pool_find_flags(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *size, int64_t *flags) {
+    pthread_mutex_lock(&g_mu);
+    int hit = pool_find_locked(addr, len, mem, size, flags);
     pthread_mutex_unlock(&g_mu);
     return hit;
 }

@@ -190,7 +190,12 @@ void rp_occl_pause(nvn_gpu_cmd c);      // 通道里按矩形清之前
 void rp_occl_draw(nvn_gpu_cmd c);       // 每笔绘制之前
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec);   // 计算派发（rp_draw.c）
 enum rp_write_op { RP_W_UNKNOWN, RP_W_SSBO, RP_W_UBOP, RP_W_IMAGE_TBUF, RP_W_UPDATE, RP_W_COPY, RP_W_FILL, RP_W_T2B, RP_W_COUNT };
-struct rp_write_source { enum rp_write_op op; int stage, slot; };  // stage/slot 只对着色器来源有效
+struct rp_write_source {
+    enum rp_write_op op;
+    int stage, slot;   // 只对着色器来源有效
+    const p_dispatch *dispatch;
+    const uint8_t *compute_key;   // 计算阶段绑定的 8 字节键；两个指针只供同步登记消费
+};
 int rp_post_gpu_write_from(uint64_t addr, uint64_t len, struct rp_write_source source);
 int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登记单段；1 = 登记成功，段完成后回写
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images, struct rp_write_source source);

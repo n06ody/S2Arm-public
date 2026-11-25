@@ -424,6 +424,12 @@ static inline uint64_t pool_ga(const pool_t *o) { pool_mark_addressed(o); return
 #define GA(a) nvn_ga2ca(a)
 
 static uint8_t *vpool_reserve(const pool_t *o); static void vpool_release(const pool_t *o);   // sparse virtual pools, see MapVirtual
+// Metal and legacy backends only need the address and size. Replay overrides this
+// entry so the diagnostic can identify the exact registration, including virtual runs.
+__attribute__((weak)) void nvn_be_pool_add_flags(const void *mem, uint64_t size, int64_t flags) {
+    (void)flags;
+    nvn_be_pool_add(mem, size);
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->nvmap = ((const pool_builder_x *)b)->native;   // native：构建器给的 nvmap 句柄（SetNativeHandleNVX），MemoryPoolGetNativeHandleNVX 回它
@@ -431,7 +437,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     if (((const pool_builder_x *)b)->native) LOG("【红】 MemoryPoolInitialize: 池 %p 由 nvmap 句柄 %d 建（SetNativeHandleNVX）：本层不导入 nvmap 内存，池没有存储", (void *)p, ((const pool_builder_x *)b)->native);
     if (((const pool_builder_x *)b)->res_pitch) { static int once; if (!once++) LOG("【红】 MemoryPoolInitialize: 池 %p 预留了线性 GPU 地址 %#llx（SetPitchAddressNVX），本层 GPU 地址自己分配、不按预留值", (void *)p, (unsigned long long)((const pool_builder_x *)b)->res_pitch); }
     if (!o->mem && (o->flags & 0x200)) o->mem = vpool_reserve(o);   // every virtual pool: its own address range, a page table over physical pools (see MapVirtual)
-    else if (o->mem) { nvn_be_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    else if (o->mem) { nvn_be_pool_add_flags(o->mem, o->size, o->flags); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】 MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     // Switch 2（NVN2）：池建在 gsv GPU 可访问内存上，那段内存的 GPU 虚拟地址就是它的 CPU 虚拟地址，缓冲区地址 = 存储的 CPU 地址；游戏会拿 GetBufferAddress 的结果加偏移直接用 CPU 读写
     //   （#351：给窗口地址时 CPU 读 0xC086D00000 一带非法地址崩）。所以 NVN2 不另分窗口地址，pool_ga 回存储地址，nvn_ga2ca 对它原样过。窗口只给 Switch 1（大页对齐语义，见上）
@@ -4825,10 +4831,10 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
         if (b < lo || a > hi || (!mapped && (b == lo || a == hi))) { nl[nn++] = (struct vrun){a, b}; continue; }   // untouched (an unmap leaves adjacent runs alone)
         nvn_be_pool_del(v->base + a);
         if (mapped) { if (a < mlo) mlo = a; if (b > mhi) mhi = b; continue; }   // joins the new run
-        if (a < lo) { nl[nn++] = (struct vrun){a, lo}; nvn_be_pool_add(v->base + a, lo - a); }   // what the unmap leaves on either side
-        if (b > hi) { nl[nn++] = (struct vrun){hi, b}; nvn_be_pool_add(v->base + hi, b - hi); }
+        if (a < lo) { nl[nn++] = (struct vrun){a, lo}; nvn_be_pool_add_flags(v->base + a, lo - a, v->pool->flags); }   // what the unmap leaves on either side
+        if (b > hi) { nl[nn++] = (struct vrun){hi, b}; nvn_be_pool_add_flags(v->base + hi, b - hi, v->pool->flags); }
     }
-    if (mapped) { nl[nn++] = (struct vrun){mlo, mhi}; nvn_be_pool_add(v->base + mlo, mhi - mlo); }
+    if (mapped) { nl[nn++] = (struct vrun){mlo, mhi}; nvn_be_pool_add_flags(v->base + mlo, mhi - mlo, v->pool->flags); }
     for (int a = 1; a < nn; a++) for (int b = a; b > 0 && nl[b].lo < nl[b - 1].lo; b--) { struct vrun t = nl[b]; nl[b] = nl[b - 1]; nl[b - 1] = t; }
     free(v->run); v->run = nl; v->nrun = nn;
 }
