@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 S2Arm contributors
+# 门禁间接：android/tests/vk/run.sh 默认档按 standalone/*.sh 通配逐个跑。
 # run.sh --replay-pass-area：真实回放、Vk 开遍参数、整面像素与逐守卫撤回。
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
