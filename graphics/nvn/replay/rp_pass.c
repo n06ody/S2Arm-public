@@ -260,19 +260,11 @@ int rp_pass_slot_attached(int i) { return P.has_rt && i >= 0 && i < P.rt.n && i 
 // 不比对象指针：游戏会按值拷贴图对象，指针不可信（同一个序号才是同一张图）。
 // 这一遍可证的像素区域：裁剪矩形（设了才有）按目标尺寸裁。只收裁剪、不看视口：后端把裁剪原样交给 Vulkan，
 // 像素一定落在它里面；视口带窗口原点翻转，要按原点翻 y 才能用，等真机验证过再接。返回 0 = 不能收缩（整张）。
-static int pass_area(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) {
+static int pass_area(p_scissor *sc) {
     uint32_t tw = 0, th = 0;
     for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) { level_size(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &tw, &th); break; }
     if (!tw && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &tw, &th);
-    if (!tw || !th || !rp_R.has_sc) return 0;
-    int64_t x0 = 0, y0 = 0, x1 = tw, y1 = th;
-    if (rp_R.sc.x > x0) x0 = rp_R.sc.x;
-    if (rp_R.sc.y > y0) y0 = rp_R.sc.y;
-    if ((int64_t)rp_R.sc.x + rp_R.sc.w < x1) x1 = (int64_t)rp_R.sc.x + rp_R.sc.w;
-    if ((int64_t)rp_R.sc.y + rp_R.sc.h < y1) y1 = (int64_t)rp_R.sc.y + rp_R.sc.h;
-    if (x1 <= x0 || y1 <= y0) return 0;
-    *x = (int32_t)x0; *y = (int32_t)y0; *w = (uint32_t)(x1 - x0); *h = (uint32_t)(y1 - y0);
-    return 1;
+    return rp_R.has_sc && rp_clip_scissor(&rp_R.sc, tw, th, sc);
 }
 static int rt_same(const p_set_rt *a, const p_set_rt *b) {
     if (a->n != b->n || (!a->depth) != (!b->depth) || (a->depth && a->depth->serial != b->depth->serial) || a->has_dview != b->has_dview) return 0;
@@ -492,8 +484,12 @@ void rp_pass_end(nvn_gpu_cmd c) { (void)pass_end_checked(c); }
 // 开通道（已开着直接回 1）。0 = 开不了（已记账）：调用方跳过这笔绘制。
 static uint64_t pb_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 #define PB(step) do { if (tm_) { uint64_t n_ = pb_now(); rp_perf_add(step, n_ - pb_); pb_ = n_; } } while (0)
-// 绘制前调（rp_draw 在 rp_pass_begin 之前）：把这一笔要求的像素区域交给下一步开通道；通道已经开着而这一笔超出当前区域，
-// 收通道并按并集重开（重开用 LOAD：上一遍只保存过它自己的区域，区域外内容本来就是原样；带清除负载的通道区域必是整张，走不到这里）。
+static int pass_area_contains(int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    return x >= P.ax && y >= P.ay && (int64_t)x + w <= (int64_t)P.ax + P.aw &&
+           (int64_t)y + h <= (int64_t)P.ay + P.ah;
+}
+// 局部遍只续接已知落在区域内的命令。扩大或失去范围证明时整面 LOAD 重开，
+// 既保留已经画出的内容，也限制同一遍因连续扩大剪裁而反复重开。
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     if (P.open && P.sw_split) { rp_perf_add(RP_PERF_P_CUT_BAR, 1); rp_pass_end(c); }   // 通道里的着色器写之后游戏发过屏障：这一笔另开通道（见 rp_pass_barrier）
     uint8_t wanted = 0;
@@ -509,17 +505,13 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
         uint32_t w = 0, h = 0;
         if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) rp_pass_end(c);
     }
-    if (!nvn_plat_flag("nvk_pass_area", 0)) return;
-    int32_t x, y; uint32_t w, h;
-    if (!pass_area(&x, &y, &w, &h)) return;               // 没有裁剪矩形：整张，不缩
-    if (!P.open) { P.area_want = 1; P.wx = x; P.wy = y; P.ww = w; P.wh = h; return; }
-    if (!P.area_on) return;                                // 当前通道本来就是整张：这一笔一定在里面
-    if (x >= P.ax && y >= P.ay && (int64_t)x + w <= (int64_t)P.ax + P.aw && (int64_t)y + h <= (int64_t)P.ay + P.ah) return;
-    int32_t nx = x < P.ax ? x : P.ax, ny = y < P.ay ? y : P.ay;
-    int32_t nx1 = ((int32_t)x + (int32_t)w) > ((int32_t)P.ax + (int32_t)P.aw) ? (int32_t)x + (int32_t)w : (int32_t)P.ax + (int32_t)P.aw;
-    int32_t ny1 = ((int32_t)y + (int32_t)h) > ((int32_t)P.ay + (int32_t)P.ah) ? (int32_t)y + (int32_t)h : (int32_t)P.ay + (int32_t)P.ah;
-    rp_pass_end(c);
-    P.area_want = 1; P.wx = nx; P.wy = ny; P.ww = (uint32_t)(nx1 - nx); P.wh = (uint32_t)(ny1 - ny);
+    p_scissor sc;
+    const int known = nvn_plat_flag("nvk_pass_area", 0) && !rp_occl_want() && pass_area(&sc);
+    if (P.open) {
+        if (P.area_on && (!known || !pass_area_contains(sc.x, sc.y, (uint32_t)sc.w, (uint32_t)sc.h))) rp_pass_end(c);
+        return;
+    }
+    if (known) { P.area_want = 1; P.wx = sc.x; P.wy = sc.y; P.ww = (uint32_t)sc.w; P.wh = (uint32_t)sc.h; }
 }
 // 大附件的整张清除不能折进较小公共区域：先用原视图单独清整张，再让公共通道 LOAD。
 // 不经 pass_begin_colors 递归，不换逻辑目标；影子附件沿用本次视图，最终由 rp_pass_end 拷回。
@@ -561,6 +553,20 @@ static int trim_clear_attachment(const tex_t *t, const view_t *view, const tex_t
     return 1;
 }
 
+static int area_attachment_safe(const tex_t *t, const tex_t *const *others, int count) {
+    if (!t->serial || !t->mem || !t->L.size || t->d.target != NVN_TEXTURE_TARGET_2D ||
+        t->d.depth != 1 || t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) ||
+        !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    const uintptr_t address = (uintptr_t)t->mem;
+    for (int i = 0; i < count; i++) {
+        const tex_t *p = others[i];
+        const uintptr_t other = (uintptr_t)p->mem;
+        if (p->serial == t->serial ||
+            (address <= other ? other - address < t->L.size : address - other < p->L.size)) return 0;
+    }
+    return 1;
+}
+
 static int trim_park_clear(nvn_gpu_pass_desc *d, const uint32_t cw[8], const uint32_t ch[8], uint32_t dw, uint32_t dh) {
     if (d->layers != 1 || d->occlusion) return 0;
     const tex_t *seen[9];
@@ -589,7 +595,29 @@ static int trim_park_clear(nvn_gpu_pass_desc *d, const uint32_t cw[8], const uin
     return 1;
 }
 
+static int pass_area_safe(const nvn_gpu_pass_desc *d, const uint32_t cw[8], const uint32_t ch[8],
+                          uint32_t dw, uint32_t dh) {
+    if (d->layers != 1 || d->occlusion) return 0;
+    const tex_t *seen[8];
+    int count = 0;
+    for (uint32_t i = 0; i < d->ncolor; i++) {
+        if (!d->color[i].view) continue;
+        if (d->color[i].load != NVN_GPU_LOAD_LOAD || d->color[i].store != NVN_GPU_STORE_STORE ||
+            g_shu[i].base || cw[i] != d->w || ch[i] != d->h ||
+            !area_attachment_safe(P.rt.color[i], seen, count)) return 0;
+        seen[count++] = P.rt.color[i];
+    }
+    if (d->depth.view || d->stencil.view) {
+        return dw == d->w && dh == d->h && area_attachment_safe(P.rt.depth, seen, count) &&
+            (!d->depth.view || (d->depth.load == NVN_GPU_LOAD_LOAD && d->depth.store == NVN_GPU_STORE_STORE)) &&
+            (!d->stencil.view || (d->stencil.load == NVN_GPU_LOAD_LOAD && d->stencil.store == NVN_GPU_STORE_STORE));
+    }
+    return count != 0;
+}
+
 static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int clear_only) {
+    const int area_want = P.area_want;
+    P.area_want = 0;   // 只给下一次开遍，解析附件失败也不能遗留给独立清除。
     colors = select_colors(colors);
     layered = layered != 0;
     if (P.open && P.colors == colors && P.layered == layered) return 1;
@@ -680,6 +708,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         nvn_plat_flag("nvk_clear_only_attachments", 0) && trim_park_clear(&d, cw, ch, dw, dh);
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0; P.sw_pend = P.sw_split = 0;
     if (!trimmed && color_loads) rp_perf_add(RP_PERF_P_LOADC, color_loads);
+    const int use_area = !clear_only && area_want && !diag_load && !diag_store && pass_area_safe(&d, cw, ch, dw, dh);
     for (int i = 0; i < P.rt.n && i < 8; i++)
         if (d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR && (cw[i] > d.w || ch[i] > d.h))
             pass_land_full(c, &d, i, cw[i], ch[i], P.rt.color[i]);
@@ -700,27 +729,16 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     // 渲染区域（开关 debug.s2a.nvk_pass_area）：本遍有清除负载（清除要覆盖整张附件）时不缩；否则用 rp_pass_prepare_draw 给的区域，
     // 没有就给整张。后端按它设 renderArea：附件只在区域内载入 / 保存，区域外保持原内容。
     P.area_on = 0;
-    if (nvn_plat_flag("nvk_pass_area", 0) && P.area_want) {
-        int any_clear = 0;
-        for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        if (d.depth.view && d.depth.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        if (d.stencil.view && d.stencil.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        int32_t x = P.wx, y = P.wy; uint32_t w = P.ww, h = P.wh;
-        if (!any_clear && w && h) {
-            if (x < 0) { w = (uint32_t)((int32_t)w + x); x = 0; }
-            if (y < 0) { h = (uint32_t)((int32_t)h + y); y = 0; }
-            if ((uint32_t)x < d.w && (uint32_t)y < d.h) {
-                if ((uint32_t)x + w > d.w) w = d.w - (uint32_t)x;
-                if ((uint32_t)y + h > d.h) h = d.h - (uint32_t)y;
-                if (w && h && !(x == 0 && y == 0 && w == d.w && h == d.h)) {
-                    d.area_x = x; d.area_y = y; d.area_w = w; d.area_h = h;
-                    P.ax = x; P.ay = y; P.aw = w; P.ah = h; P.area_on = 1;
-                    rp_perf_add(RP_PERF_P_AREA, 1); rp_perf_add(RP_PERF_P_AREA_KPIX, (uint64_t)w * h / 1000);
-                }
-            }
+    if (use_area && (uint32_t)P.wx < d.w && (uint32_t)P.wy < d.h) {
+        const uint32_t w = P.ww < d.w - (uint32_t)P.wx ? P.ww : d.w - (uint32_t)P.wx;
+        const uint32_t h = P.wh < d.h - (uint32_t)P.wy ? P.wh : d.h - (uint32_t)P.wy;
+        if (P.wx || P.wy || w != d.w || h != d.h) {
+            d.area_x = P.ax = P.wx; d.area_y = P.ay = P.wy;
+            d.area_w = P.aw = w; d.area_h = P.ah = h; P.area_on = 1;
+            rp_perf_add(RP_PERF_P_AREA, 1);
+            rp_perf_add(RP_PERF_P_AREA_KPIX, (uint64_t)w * h / 1000);
         }
     }
-    P.area_want = 0;
     P.pass_w = d.w; P.pass_h = d.h;
     nvn_gpu_pass_begin(c, &d);
     // 大附件已单独落地；剩下的 CLEAR 尺寸等于公共范围，开通道后才可标 fresh。
@@ -839,6 +857,15 @@ static void clear_remainder_failed(const char *why, const nvn_gpu_clear *cl) {
     }
 }
 static void pass_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *cl) {
+    if (P.area_on && !pass_area_contains(cl->x, cl->y, cl->w, cl->h)) {
+        const uint8_t colors = P.colors;
+        const int layered = P.layered;
+        rp_pass_end(c);
+        if (!pass_begin_colors(c, colors, layered, 0)) {
+            clear_remainder_failed("clear_rect_reopen_failed", cl);
+            return;
+        }
+    }
     int64_t x0 = cl->x, y0 = cl->y, x1 = x0 + cl->w, y1 = y0 + cl->h;
     int64_t ax = P.area_on ? P.ax : 0, ay = P.area_on ? P.ay : 0;
     int64_t ax1 = ax + (P.area_on ? P.aw : P.pass_w), ay1 = ay + (P.area_on ? P.ah : P.pass_h);

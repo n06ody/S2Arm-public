@@ -242,6 +242,7 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     const int cont_ok = occ >= 0 && occl_spare_reserve(c, occ, &cont);
     if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[2], 1, __ATOMIC_RELAXED);
     nvn_gpu_pass_desc d = c->pass_desc;
+    d.area_w = d.area_h = 0;
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) {
         d.color[i].load = NVN_GPU_LOAD_LOAD;
     }
@@ -322,6 +323,9 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
     }
     if (pool_skipped && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[3], 1, __ATOMIC_RELAXED);
     if (read_mask && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[0], 1, __ATOMIC_RELAXED);
-    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) return 1;
+    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) {
+        if (pool_skipped) return pass_ensure_area(c, (VkRect2D){{0, 0}, {c->pass_w, c->pass_h}});
+        return 1;
+    }
     return feedback_restart(c, read_mask, 1);
 }

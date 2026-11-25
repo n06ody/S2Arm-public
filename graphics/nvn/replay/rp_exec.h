@@ -59,6 +59,16 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec);
 void rp_pass_barrier(uint32_t bits);   // 游戏的屏障：记下位，下一个通道前交给后端；带「顺序」位、且开着的通道里已有着色器写的，下一笔绘制前结束该通道（见 rp_pass.c）
 uint32_t rp_pass_take_barrier(void);   // 通道外的计算派发前调：取走待发的游戏屏障位（取完清零），由调用方交给后端
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask);   // 有效颜色写掩码（含片元输出映射）与像素区域；附件集合变了或区域超出时重开
+// 各绘制路径和开遍用同一个半开矩形；先加宽，客体宽高或起点异常时也不会回绕。
+static inline int rp_clip_scissor(const p_scissor *in, uint32_t w, uint32_t h, p_scissor *out) {
+    int64_t x0 = in->x > 0 ? in->x : 0, y0 = in->y > 0 ? in->y : 0;
+    int64_t x1 = (int64_t)in->x + in->w, y1 = (int64_t)in->y + in->h;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    *out = (p_scissor){(int32_t)x0, (int32_t)y0, (int32_t)(x1 - x0), (int32_t)(y1 - y0)};
+    return 1;
+}
 int rp_pass_begin(nvn_gpu_cmd c);     // 绘制前调：1 = 通道开着；0 = 开不了（已记账），跳过这笔
 void rp_pass_want_layered(nvn_gpu_cmd c, int layered);   // 绘制前调（prepare_draw 之前）：程序的顶点 / 几何阶段写层号 = 1，按分层通道开；与开着的通道不同就收掉重开
 // 开通道之前，落地实际绑定的贴图（含整池快照）上的待折清除。按宿主底图匹配，不限级 / 层。

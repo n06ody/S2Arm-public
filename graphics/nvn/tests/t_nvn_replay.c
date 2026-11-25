@@ -3241,6 +3241,70 @@ static void t_pass_shared_explicit_rect(void) {
     }
 }
 
+static void area_scissor(stream *s, int x, int y, int w, int h) {
+    p_scissor *sc = put(s, OP_SCISSOR, sizeof *sc);
+    *sc = (p_scissor){.x = x, .y = y, .w = w, .h = h};
+}
+
+static void t_pass_area_guards(void) {
+    enum { WITHIN, GROW, NO_SCISSOR, CLEAR_CROSSES, ZERO, ALIAS, MSAA, OFF };
+    const int old_area = g_flag_pass_area;
+    for (int kind = WITHIN; kind <= OFF; kind++) {
+        pass_fresh();
+        g_flag_pass_area = kind != OFF;
+        g_resolve_rc = 0;
+        nvn_be_sub_begin();
+        stream first = {0};
+        q_env(&first);
+        const int before = g_gdraws;
+        tex_t alias = mk_tex(792, 4096, NVN_FORMAT_RGBA8, 64, 36, 1, 0);
+        if (kind == ALIAS) {
+            const p_set_rt rt = {.n = 2, .color = {&g_qrt, &alias}};
+            uint8_t *a = put(&first, OP_SET_RT, set_rt_size(&rt));
+            set_rt_put(a, &rt);
+            CHECK(alias.mem < g_qrt.mem + g_qrt.L.size);
+            memset(alias.mem, 0x55, alias.L.size);
+        }
+        if (kind == MSAA) {
+            g_qrt.d.samples = 4;
+            nvn_tex_layout(&g_qrt.d, &g_qrt.L);
+            put_set_rt(&first, &g_qrt, NULL);
+        }
+        if (kind != ZERO) memset(g_qrt.mem, 0x66, g_qrt.L.size);
+        area_scissor(&first, 3, 5, 16, 12);
+        q_draw(&first); end(&first); nvn_be_exec(first.b);
+        const int local = kind <= CLEAR_CROSSES;
+        printf("PASS_AREA start=%d width=%u\n", kind, g_pd[0].area_w);
+        CHECK(g_npd == 1 && g_gdraws == before + 1);
+        CHECK(g_pd[0].area_w == (local ? 16u : 0u));
+        CHECK(!local || (g_pd[0].area_x == 3 && g_pd[0].area_y == 5 && g_pd[0].area_h == 12));
+        if (kind == ZERO) CHECK(g_pd[0].color[0].load == NVN_GPU_LOAD_CLEAR);
+        if (kind <= CLEAR_CROSSES) {
+            stream second = {0};
+            if (kind == WITHIN) area_scissor(&second, 6, 7, 8, 4);
+            if (kind == GROW) area_scissor(&second, 15, 10, 24, 14);
+            if (kind == NO_SCISSOR) rp_R.has_sc = 0; // 下一笔恢复帧缓冲默认裁剪
+            if (kind == CLEAR_CROSSES) {
+                area_scissor(&second, 15, 10, 24, 14);
+                p_clear_color *clear = put(&second, OP_CLEAR_COLOR, sizeof *clear);
+                clear->mask = 1; clear->rgba[0] = 1;
+            } else {
+                q_draw(&second);
+            }
+            end(&second); nvn_be_exec(second.b);
+            printf("PASS_AREA case=%d passes=%d first=%u next=%u clears=%d\n",
+                   kind, g_npd, g_pd[0].area_w, g_npd > 1 ? g_pd[1].area_w : 0, g_ncr);
+            CHECK(g_npd == (kind == WITHIN ? 1 : 2));
+            if (kind != WITHIN) CHECK(g_pd[1].area_w == 0 && g_pd[1].color[0].load == NVN_GPU_LOAD_LOAD);
+            CHECK(g_gdraws == before + (kind == CLEAR_CROSSES ? 1 : 2));
+            if (kind == CLEAR_CROSSES) CHECK(g_ncr == 1 && g_cr[0].npd == 2 && g_cr[0].d.w == 24);
+        }
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    }
+    g_flag_pass_area = old_area;
+    pass_fresh();
+}
+
 static void put_set_rt_v(stream *s, const tex_t *color, const view_t *cv);
 // 连续绘制只改一项状态：后端必须拿到该次绘制的管线描述；不变的命令不额外重取。
 static void dirty_strip(stream *s, uint64_t base) {
@@ -4444,6 +4508,43 @@ static void t_pass_clear_only_attachments(void) {
         printf("clear-only attachments case=%d expected_trim=%d attached_b=%d gpu_owned_b=%d\n",
                mode, trim, p->color[1].view != NULL, nvn_be_tex_gpu_owned(b.serial));
     }
+    g_flag_clear_only_attachments = 0;
+    pass_fresh();
+}
+
+static void t_pass_area_then_clear_only(void) {
+    const int old_area = g_flag_pass_area;
+    for (int area = 0; area <= 1; area++) for (int trim = 0; trim <= 1; trim++) {
+        pass_fresh();
+        g_flag_pass_area = area;
+        g_flag_clear_only_attachments = trim;
+        g_resolve_rc = 0;
+        tex_t a = mk_tex(944, 0x4000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
+        tex_t b = mk_tex(945, 0x8000, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
+        memset(a.mem, 0x7e, a.L.size);
+        memset(b.mem, 0x7e, b.L.size);
+        stream s = {0};
+        q_env(&s);
+        const tex_t *colors[] = {&a, &b};
+        put_set_rt_n(&s, colors, 2, NULL);
+        p_scissor *crop = put(&s, OP_SCISSOR, sizeof *crop);
+        *crop = (p_scissor){2, 2, 4, 4};
+        q_draw(&s);
+        p_scissor *full = put(&s, OP_SCISSOR, sizeof *full);
+        *full = (p_scissor){0, 0, 16, 16};
+        p_clear_color *clear = put(&s, OP_CLEAR_COLOR, sizeof *clear);
+        clear->index = 0; clear->mask = 0xf; clear->rgba[2] = 1;
+        end(&s);
+        submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_npd == 2 && g_pass_ends == 2);
+        CHECK(g_pd[0].area_w == (area ? 4u : 0u) && g_pd[0].color[0].load == NVN_GPU_LOAD_LOAD);
+        CHECK(g_pd[1].w == 16 && g_pd[1].h == 16 && g_pd[1].area_w == 0 && g_pd[1].area_h == 0);
+        CHECK(g_pd[1].color[0].load == NVN_GPU_LOAD_CLEAR && g_pd[1].color[0].clear.f[2] == 1);
+        CHECK((g_pd[1].color[1].view == NULL) == trim);
+        printf("clear-only after draw: area=%d trim=%d draw_area=%u clear_area=%u attached_b=%d\n",
+               area, trim, g_pd[0].area_w, g_pd[1].area_w, g_pd[1].color[1].view != NULL);
+    }
+    g_flag_pass_area = old_area;
     g_flag_clear_only_attachments = 0;
     pass_fresh();
 }
@@ -8158,6 +8259,7 @@ int main(int argc, char **argv) {
     t_pass_shared_extent();
     t_pass_shared_pending_clear();
     t_pass_shared_explicit_rect();
+    t_pass_area_guards();
     t_pass_clear_fold();
     t_draw_tex();
     t_pass_depth_shadow();
@@ -8177,6 +8279,7 @@ int main(int argc, char **argv) {
     t_pass_clear_park();
     t_pass_clear_park_tail();
     t_pass_clear_only_attachments();
+    t_pass_area_then_clear_only();
     t_pass_clear_park_read();
     t_pass_clear_park_sample();
     t_drawlog_unreadable_tex_mem();
