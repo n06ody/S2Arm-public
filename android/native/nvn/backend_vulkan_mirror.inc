@@ -165,7 +165,8 @@ static void mirror_record_edge(struct nvn_gpu_cmd_s *c, nvn_gpu_buf buf, VkDevic
         c->mirror_edges[c->mirror_edge_count++] = (struct vk_mirror_edge){buf, lo};
 }
 
-void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
+static void mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count,
+                                     int copy_callback) {
     if (!c || !count || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!spans || c->mirror_ranges || c->in_pass) {
         set_sticky(c, spans ? NVN_GPU_E_ORDER : NVN_GPU_E_OOM, "缓存镜像回写快照不可用");
@@ -180,8 +181,9 @@ void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *
         return;
     }
     c->mirror_ranges = ranges;
-    // 仅诊断，分配失败或超过上限时仍按原路径回写，探针记为缺样。
-    if (g.land_wait_probe && needed <= MIRROR_PROBE_SPANS)
+    c->mirror_edge_copy = g.land_edge_snapshot && copy_callback;
+    // 边界元数据不可用时保留所有原映射的 invalidate 和等待。
+    if ((g.land_wait_probe || c->mirror_edge_copy) && needed <= MIRROR_PROBE_SPANS)
         c->mirror_edges = malloc((size_t)2 * needed * sizeof *c->mirror_edges);
     uint32_t n = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -223,21 +225,228 @@ void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *
     c->mirror_range_count = used;
 }
 
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
+    mirror_visibility_record(c, spans, count, 0);
+}
+
+void nvn_gpu_mirror_visibility_record_copy(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
+    mirror_visibility_record(c, spans, count, 1);
+}
+
+static uint32_t mirror_edge_lower_bound(const struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, VkDeviceSize off) {
+    const struct vk_mirror_edge key = {b, off};
+    uint32_t first = 0, end = c->mirror_edge_count;
+    while (first < end) {
+        const uint32_t mid = first + (end - first) / 2;
+        if (compare_mirror_edge(&c->mirror_edges[mid], &key) < 0) first = mid + 1;
+        else end = mid;
+    }
+    return first;
+}
+
+static void mirror_slot_destroy(struct vk_mirror_slot *slot) {
+    if (slot->mapped) vkUnmapMemory(g.d, slot->memory);
+    if (slot->buffer) vkDestroyBuffer(g.d, slot->buffer, NULL);
+    if (slot->memory) vkFreeMemory(g.d, slot->memory, NULL);
+    *slot = (struct vk_mirror_slot){0};
+}
+
+static void mirror_slots_close(void) {
+    for (uint32_t i = 0; i < MIRROR_EDGE_SLOTS; i++) mirror_slot_destroy(&g.mirror_slots[i]);
+}
+
+static VkResult mirror_slot_create(struct vk_mirror_slot *slot, int *over_budget) {
+    const VkBufferCreateInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MIRROR_EDGE_SLOT_BYTES,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(g.d, &bi, NULL, &buffer);
+    if (r != VK_SUCCESS) return r;
+    slot->buffer = buffer;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g.d, slot->buffer, &req);
+    if (req.size > MIRROR_EDGE_SLOT_BYTES) {
+        *over_budget = 1;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const VkMemoryPropertyFlags choices[] = {visible | cached | coherent, visible | cached, visible | coherent, visible};
+    uint32_t type = UINT32_MAX;
+    for (size_t i = 0; i < sizeof choices / sizeof choices[0] && type == UINT32_MAX; i++)
+        type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, choices[i], NULL);
+    if (type == UINT32_MAX) return VK_ERROR_FEATURE_NOT_PRESENT;
+    slot->coherent = (g.dev->memory.memoryTypes[type].propertyFlags & coherent) != 0;
+    const VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type,
+    };
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    r = vkAllocateMemory(g.d, &ai, NULL, &memory);
+    if (r != VK_SUCCESS) return r;
+    slot->memory = memory;
+    r = vkBindBufferMemory(g.d, slot->buffer, slot->memory, 0);
+    if (r != VK_SUCCESS) return r;
+    void *mapped = NULL;
+    r = vkMapMemory(g.d, slot->memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (r == VK_SUCCESS) slot->mapped = mapped;
+    return r;
+}
+
+// 仅从旧段末尾拷贝候选边界。本段拥有槽到完成回调结束，后继段无法改写这些数据。
+static void mirror_record_snapshot(struct nvn_gpu_cmd_s *c) {
+    const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
+    if (!c->mirror_edges || !c->mirror_edge_count) {
+        pthread_mutex_lock(&g_mu);
+        g.stats[c->mirror_edges ? STAT_MIRROR_EDGE_NO_EDGE : STAT_MIRROR_EDGE_UNKNOWN]++;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    if (atom < 4 || c->mirror_edge_count > MIRROR_EDGE_REGIONS ||
+        atom > MIRROR_EDGE_SLOT_BYTES / c->mirror_edge_count) {
+        pthread_mutex_lock(&g_mu);
+        g.stats[STAT_MIRROR_EDGE_BUDGET]++;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+
+    struct vk_mirror_slot *slot = NULL;
+    pthread_mutex_lock(&g_mu);
+    for (uint32_t i = 0; i < MIRROR_EDGE_SLOTS; i++) {
+        if (g.mirror_slots[i].busy) continue;
+        slot = &g.mirror_slots[i];
+        slot->busy = 1;
+        slot->first_skip_ns = 0;
+        break;
+    }
+    if (!slot) g.stats[STAT_MIRROR_EDGE_FULL]++;
+    pthread_mutex_unlock(&g_mu);
+    if (!slot) return;
+    c->mirror_edge_reused = slot->buffer != VK_NULL_HANDLE;
+    if (!c->mirror_edge_reused) {
+        struct vk_mirror_slot fresh = {0};
+        int over_budget = 0;
+        VkResult r = mirror_slot_create(&fresh, &over_budget);
+        if (r != VK_SUCCESS) {
+            mirror_slot_destroy(&fresh);
+            pthread_mutex_lock(&g_mu);
+            slot->busy = 0;
+            g.stats[over_budget ? STAT_MIRROR_EDGE_BUDGET : STAT_MIRROR_EDGE_ALLOC]++;
+            pthread_mutex_unlock(&g_mu);
+            if (r == VK_ERROR_DEVICE_LOST) set_sticky(c, NVN_GPU_E_DEVICE, "缓存镜像边界快照分配时设备丢失");
+            return;
+        }
+        fresh.busy = 1;
+        pthread_mutex_lock(&g_mu);
+        *slot = fresh;
+        pthread_mutex_unlock(&g_mu);
+    }
+    c->mirror_slot = slot;
+
+    mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferCopy copies[MIRROR_EDGE_REGIONS];
+    for (uint32_t i = 0; i < c->mirror_edge_count;) {
+        const nvn_gpu_buf b = c->mirror_edges[i].buf;
+        uint32_t ncopy = 0;
+        do {
+            const VkDeviceSize off = c->mirror_edges[i].off;
+            if (ncopy && copies[ncopy - 1].srcOffset + copies[ncopy - 1].size == off)
+                copies[ncopy - 1].size += atom;
+            else
+                copies[ncopy++] = (VkBufferCopy){off, i * atom, atom};
+            i++;
+        } while (i < c->mirror_edge_count && c->mirror_edges[i].buf == b);
+        vkCmdCopyBuffer(c->cb, b->buffer, slot->buffer, ncopy, copies);
+    }
+    // 显式 WAR 执行依赖：后继同队列的上传、传输或着色器写必须排在旧段快照读之后。
+    // 段尾既有 ALL_COMMANDS -> HOST 屏障另负责槽的写入对 CPU 可见。
+    mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0);
+}
+
+int nvn_gpu_mirror_copy(const nvn_gpu_done *done, nvn_gpu_buf b, uint64_t off, uint64_t bytes, void *dst) {
+    const struct nvn_gpu_cmd_s *c = done->mirror_copy_context;
+    if (!c) return 0;
+    const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
+    uint32_t i = mirror_edge_lower_bound(c, b, off - off % atom);
+    if (i == c->mirror_edge_count || c->mirror_edges[i].buf != b || c->mirror_edges[i].off >= off + bytes)
+        return 0;
+
+    uint8_t *data = dst;
+    const VkDeviceSize end = off + bytes;
+    while (i < c->mirror_edge_count && c->mirror_edges[i].buf == b && c->mirror_edges[i].off < end) {
+        const VkDeviceSize edge = c->mirror_edges[i].off;
+        if (off < edge) {
+            memcpy(data, b->mapped + off, edge - off);
+            data += edge - off;
+            off = edge;
+        }
+        const VkDeviceSize size = (end < edge + atom ? end : edge + atom) - off;
+        memcpy(data, c->mirror_slot->mapped + i * atom + off - edge, size);
+        data += size;
+        off += size;
+        i++;
+    }
+    if (off < end) memcpy(data, b->mapped + off, end - off);
+    return 1;
+}
+
+static int mirror_next_direct_range(const struct nvn_gpu_cmd_s *c, uint32_t *index, VkDeviceSize *cursor,
+                                    VkMappedMemoryRange *out) {
+    const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
+    while (*index < c->mirror_range_count) {
+        const struct vk_mirror_range *r = &c->mirror_ranges[*index];
+        *out = r->range;
+        if (!c->mirror_slot) {
+            ++*index;
+            return 1;
+        }
+        const VkDeviceSize end = r->range.offset + r->range.size;
+        VkDeviceSize lo = *cursor ? *cursor : r->range.offset;
+        uint32_t i = mirror_edge_lower_bound(c, r->buf, lo);
+        while (lo < end && i < c->mirror_edge_count && c->mirror_edges[i].buf == r->buf && c->mirror_edges[i].off == lo) {
+            lo += atom;
+            i++;
+        }
+        VkDeviceSize hi = end;
+        if (i < c->mirror_edge_count && c->mirror_edges[i].buf == r->buf && c->mirror_edges[i].off < end)
+            hi = c->mirror_edges[i].off;
+        *cursor = hi == end ? 0 : hi;
+        if (!*cursor) ++*index;
+        if (lo < hi) {
+            out->offset = lo;
+            out->size = hi - lo;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static VkResult mirror_invalidate(struct nvn_gpu_vk *vk, const struct nvn_gpu_cmd_s *c) {
     if (!c || !c->mirror_range_count) return VK_SUCCESS;
     const uint64_t t0 = now_ns();
     uint64_t bytes = 0, calls = 0;
     VkResult result = VK_SUCCESS;
+    VkDeviceSize cursor = 0;
     for (uint32_t i = 0; i < c->mirror_range_count;) {
         VkMappedMemoryRange batch[32];
         uint32_t n = 0;
-        while (i < c->mirror_range_count && n < sizeof batch / sizeof batch[0]) {
-            batch[n] = c->mirror_ranges[i++].range;
+        while (n < sizeof batch / sizeof batch[0] && mirror_next_direct_range(c, &i, &cursor, &batch[n]))
             bytes += batch[n++].size;
-        }
+        if (!n) break;
         result = vkInvalidateMappedMemoryRanges(vk->d, n, batch);
         calls++;
         if (result != VK_SUCCESS) break;
+    }
+    if (result == VK_SUCCESS && c->mirror_slot && !c->mirror_slot->coherent) {
+        const VkMappedMemoryRange slot = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = c->mirror_slot->memory,
+            .size = c->mirror_edge_count * g.dev->properties.limits.nonCoherentAtomSize,
+        };
+        result = vkInvalidateMappedMemoryRanges(vk->d, 1, &slot);
+        calls++;
+        bytes += slot.size;
     }
     pthread_mutex_lock(&g_mu);
     vk->stats[STAT_MIRROR_INV_N] += calls;
@@ -324,19 +533,44 @@ incomplete:
     return 0;
 }
 
+static int mirror_edge_covers(const struct vk_mirror_range *r, VkDeviceSize lo, VkDeviceSize hi) {
+    const struct nvn_gpu_cmd_s *c = r->owner;
+    if (!c->mirror_slot) return 0;
+    const VkDeviceSize atom = g.dev->properties.limits.nonCoherentAtomSize;
+    if ((hi - lo) % atom) return 0;   // 分配末尾不满的原子仍从原映射读取。
+    const VkDeviceSize count = (hi - lo) / atom;
+    const uint32_t i = mirror_edge_lower_bound(c, r->buf, lo);
+    if (count > c->mirror_edge_count - i) return 0;
+    const struct vk_mirror_edge *first = &c->mirror_edges[i], *last = first + count - 1;
+    // 已按物理缓冲和原子排序且去重；两端位置和个数相等才可能没有洞。
+    return first->buf == r->buf && first->off == lo && last->buf == r->buf && last->off == hi - atom;
+}
+
 // 依 vkMapMemory 的访问约束，主机 invalidate 与拷贝会读取非一致原子。
 // 后继只读可与它并行，写同一原子的段须等回调返回。
 // 列表可能同时有多个前驱。用最大的相交信号等待，队列内更早的相交段也会先完成。
 static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
     uint64_t fence = 0;
     int edge_wait = 0;
+    uint64_t skipped_fence = 0;
+    struct vk_mirror_slot *skipped = NULL;
     enum mirror_write_kind reason = MIRROR_INDIRECT;
     pthread_mutex_lock(&g_mu);
     for (uint32_t i = 0; i < c->mirror_write_count; i++) {
         const struct vk_mirror_write *w = &c->mirror_writes[i];
         for (const struct vk_mirror_range *r = w->buf->mirror_land; r; r = r->next) {
             if (r->signal <= g.completed || r->signal <= fence) break;
-            if (w->lo >= r->range.offset + r->range.size || r->range.offset >= w->hi) continue;
+            const VkDeviceSize end = r->range.offset + r->range.size;
+            const VkDeviceSize lo = w->lo > r->range.offset ? w->lo : r->range.offset;
+            const VkDeviceSize hi = w->hi < end ? w->hi : end;
+            if (lo >= hi) continue;
+            if (mirror_edge_covers(r, lo, hi)) {
+                if (r->signal > skipped_fence) {
+                    skipped_fence = r->signal;
+                    skipped = r->owner->mirror_slot;
+                }
+                continue;
+            }
             fence = r->signal;
             reason = w->kind;
             break;
@@ -350,6 +584,9 @@ static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
             edge_wait = mirror_probe_wait(c);
             atomic_store(&g.mirror_wait_signal, fence);
         }
+    } else if (skipped) {
+        g.stats[STAT_MIRROR_EDGE_WAIT_ELIDED]++;
+        if (!skipped->first_skip_ns) skipped->first_skip_ns = now_ns();
     }
     pthread_mutex_unlock(&g_mu);
     if (!fence) return;
@@ -374,6 +611,10 @@ static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
 
 static void mirror_mark_submitted(struct nvn_gpu_cmd_s *c, uint64_t signal) {
     pthread_mutex_lock(&g_mu);
+    if (c->mirror_slot) {
+        g.stats[STAT_MIRROR_EDGE_BYTES] += c->mirror_edge_count * g.dev->properties.limits.nonCoherentAtomSize;
+        g.stats[STAT_MIRROR_EDGE_REUSE] += c->mirror_edge_reused;
+    }
     for (uint32_t i = 0; i < c->nrefs; i++) {
         nvn_gpu_buf b = mirror_ref(c->refs[i]);
         if (mirror_is_noncoherent(b)) b->mirror_use_fence = signal;
@@ -396,4 +637,5 @@ static void mirror_unlink_locked(struct nvn_gpu_cmd_s *c) {
         *r->link = r->next;
         if (r->next) r->next->link = r->link;
     }
+    if (c->mirror_slot) c->mirror_slot->busy = 0;
 }

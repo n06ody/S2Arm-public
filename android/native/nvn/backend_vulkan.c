@@ -87,6 +87,9 @@ enum { STAT_BUFS = 0, STAT_SUBMITS, STAT_DONE_OK, STAT_DONE_FAILED, STAT_RETIRED
        STAT_MIRROR_WSI_DURING_WAIT, STAT_MIRROR_WSI_OVERTAKES,
        STAT_MIRROR_PROBE_SAMPLED, STAT_MIRROR_PROBE_DROPPED, STAT_MIRROR_PROBE_ATOMS, STAT_MIRROR_PROBE_EDGE_ATOMS,
        STAT_MIRROR_PROBE_EDGE_WAITS, STAT_MIRROR_PROBE_EDGE_WAIT_NS,
+       STAT_MIRROR_EDGE_BYTES, STAT_MIRROR_EDGE_REUSE, STAT_MIRROR_EDGE_WAIT_ELIDED, STAT_MIRROR_EDGE_LAG_NS,
+       STAT_MIRROR_EDGE_NO_EDGE, STAT_MIRROR_EDGE_UNKNOWN, STAT_MIRROR_EDGE_BUDGET,
+       STAT_MIRROR_EDGE_FULL, STAT_MIRROR_EDGE_ALLOC,
        STAT_N };
 static const char *const stat_names[STAT_N] = {
     "bufs_created", "submits", "segments_done", "segments_failed", "bufs_retired", "buf_writes", "buf_fills", "buf_copies",
@@ -98,6 +101,9 @@ static const char *const stat_names[STAT_N] = {
     "mirror_wsi_during_wait", "mirror_wsi_overtakes",
     "mirror_probe_sampled", "mirror_probe_dropped", "mirror_probe_atoms", "mirror_probe_edge_atoms",
     "mirror_probe_edge_waits", "mirror_probe_edge_wait_ns",
+    "mirror_edge_bytes", "mirror_edge_slot_reuse", "mirror_edge_wait_elided", "mirror_edge_retire_lag_ns",
+    "mirror_edge_fallback_no_edge", "mirror_edge_fallback_unknown", "mirror_edge_fallback_budget",
+    "mirror_edge_fallback_full", "mirror_edge_fallback_alloc",
 };
 
 struct nvn_gpu_buf_s {
@@ -294,6 +300,14 @@ struct vk_ref { void *obj; int type; };
 enum { REF_BUF = 1, REF_TEX, REF_VIEW, REF_SAMP, REF_POOL };
 
 struct vk_staging { struct nvn_gpu_buf_s *buf; };
+enum { MIRROR_EDGE_SLOTS = 4, MIRROR_EDGE_SLOT_BYTES = 1024 * 1024, MIRROR_EDGE_REGIONS = 256 };
+struct vk_mirror_slot {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    uint8_t *mapped;
+    int coherent, busy;
+    uint64_t first_skip_ns;   // g_mu：本次占槽第一次消除等待的时刻。
+};
 
 struct pass_rec { VkRenderPass rp; VkFramebuffer fb; };
 // 本段里一张图当前在哪：第一次碰到按 GENERAL（段首约定），之后按本段记的（见「图像布局」）
@@ -360,8 +374,10 @@ struct nvn_gpu_cmd_s {
     struct vk_mirror_range *mirror_ranges;
     uint32_t mirror_range_count;
     uint64_t mirror_payload_bytes;
-    struct vk_mirror_edge *mirror_edges;   // 探针用的原始区间边缘；NULL 表示未采全。
+    struct vk_mirror_edge *mirror_edges;   // 去重后的候选边界；NULL 表示缺少候选元数据。
     uint32_t mirror_edge_count;
+    int mirror_edge_copy, mirror_edge_reused;
+    struct vk_mirror_slot *mirror_slot;
     struct vk_mirror_write *mirror_writes;
     uint32_t mirror_write_count, mirror_write_cap;
     int mirror_bindings_dirty;
@@ -512,6 +528,8 @@ struct nvn_gpu_vk {
     int land_cached;   // 会话内固定
     int land_wait_yield_wsi;
     int land_wait_probe;
+    int land_edge_snapshot;
+    struct vk_mirror_slot mirror_slots[MIRROR_EDGE_SLOTS];
     _Atomic uint64_t mirror_wait_signal;  // 真等候期间的旧客体信号，0 表示无采样等待。
     _Atomic int mirror_noncoherent_seen;
     VkResult mirror_flush_error;
@@ -1776,6 +1794,7 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
     d.time_kind = NVN_GPU_TIME_NONE;
     d.occlusion = NULL;
     d.nocclusion = 0;
+    if (status == NVN_GPU_DONE_OK && s->cmd && s->cmd->mirror_slot) d.mirror_copy_context = s->cmd;
     // 遮挡结果：段已完成，用过的槽都有结果；没用过的槽读作 0（不等待，取不到的项保持预置的 0）
     uint64_t *occ = NULL;
     if (status == NVN_GPU_DONE_OK && s->cmd && s->cmd->qpool && s->cmd->qmax_used && (occ = calloc(s->cmd->qcount, sizeof *occ))) {
@@ -1857,6 +1876,7 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.inc
 static void mirror_unlink_locked(struct nvn_gpu_cmd_s *c);   // backend_vulkan_mirror.inc
+static void mirror_slots_close(void);
 
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
@@ -2066,6 +2086,9 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         // 发布顺序：先 done（核心回写），done 返回后才推进已完成值。
         segment_done(s, NVN_GPU_DONE_OK, NVN_GPU_OK, NULL);
         pthread_mutex_lock(&g_mu);
+        const struct vk_mirror_slot *slot = s->cmd ? s->cmd->mirror_slot : NULL;
+        if (slot && slot->first_skip_ns)
+            vk->stats[STAT_MIRROR_EDGE_LAG_NS] += now_ns() - slot->first_skip_ns;
         if (s->signal > 0 && s->signal > vk->completed) vk->completed = s->signal;
         submitted_compact_locked(vk);
         vk->stats[STAT_DONE_OK]++;
@@ -2436,6 +2459,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g.land_cached = nvn_plat_flag("nvk_land_cached", 0) != 0;
     g.land_wait_yield_wsi = g.land_cached && nvn_plat_flag("nvk_land_wait_yield_wsi", 0) != 0;
     g.land_wait_probe = g.land_cached && nvn_plat_flag("nvk_land_wait_probe", 0) != 0;
+    g.land_edge_snapshot = g.land_cached && nvn_plat_flag("nvk_land_edge_snapshot", 0) != 0;
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
@@ -2621,6 +2645,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     g.worker_started = 0;
+    mirror_slots_close();
 
     // 在途段都完成了、不会再有新管线：把驱动管线缓存写盘（失败只记日志）再销毁它。放在销毁管线之前，后面的拆除出事也不丢这一局的编译结果。
     // 在飞的局中写（#868）要先等它收尾，等多久算进这次 close 的截止时间；到点没写完就放弃收尾这次写，不拖 close。
@@ -2786,6 +2811,8 @@ static void pipe_call_test_gate(void) {
 // 暂存缓冲（每帧约 9 MB 常量缓冲 + 顶点镜像落盘）是 CPU 反复小段写的：写在缓存内存上比写在不缓存映射上快数倍，
 // 且该类型带 coherent 位、不需要显式 flush（见坑记录续 21 的带宽争用读数）。
 enum { BUF_COHERENT, BUF_PREFER_CACHED, BUF_MIRROR_CACHED };
+static void mem_barrier(struct nvn_gpu_cmd_s *c, VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                        VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
 #include "backend_vulkan_mirror.inc"
 static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int memory_policy, nvn_gpu_buf *out, nvn_gpu_err *err);
 nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) {
@@ -8728,6 +8755,8 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
         if (flush_error != VK_SUCCESS)
             set_sticky(c, NVN_GPU_E_FAILED, "缓存镜像 flush 失败（VkResult %d）", (int)flush_error);
     }
+    if (done && c->mirror_edge_copy && rc_is(c->sticky, NVN_GPU_OK) && !closing && !lost && !inject && !failed_state)
+        mirror_record_snapshot(c);
     nvn_gpu_rc sticky = c->sticky;
     if (!rc_is(sticky, NVN_GPU_OK) || closing || lost || inject || failed_state) {
         nvn_gpu_rc code = !rc_is(sticky, NVN_GPU_OK) ? sticky

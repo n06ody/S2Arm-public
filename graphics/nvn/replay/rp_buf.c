@@ -453,15 +453,20 @@ void rp_buf_gpu_write_snapshot(const struct gw_ev *refs, uint32_t count, nvn_gpu
     }
 }
 
-void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程：[完成回调]
+int nvn_gpu_mirror_copy(const nvn_gpu_done *, nvn_gpu_buf, uint64_t, uint64_t, void *) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_copy
+
+static void gpu_write_land(uint64_t pool_key, uint64_t id, int ok, const nvn_gpu_done *done) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
     const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0, cached = 0;
+    nvn_gpu_buf buf = NULL;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
+        buf = s->m[s->gw[i].mi].buf;
+        src = ok ? nvn_gpu_buf_cpu(buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
         cached = s->m[wmi].cached;
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
@@ -472,12 +477,16 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     pthread_mutex_unlock(&g_bmu);
     if (!found) return;
     const uint64_t copy_begin = src && nvn_gpu_mirror_memory_cached ? res_now() : 0;
+    uint8_t *dst = (uint8_t *)(uintptr_t)(mem + off);
+    if (src && !(done && done->mirror_copy_context && nvn_gpu_mirror_copy &&
+                 nvn_gpu_mirror_copy(done, buf, off, len, dst))) {
 #ifdef S2A_GPU_LAND_TEST
-    extern void rp_test_land_copy(void *, const void *, size_t);
-    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);
+        extern void rp_test_land_copy(void *, const void *, size_t);
+        rp_test_land_copy(dst, src + off, (size_t)len);
 #else
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
+        memcpy(dst, src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
+    }
     if (copy_begin) {
         const uint64_t copy_ns = res_now() - copy_begin;
         rp_perf_add(cached ? RP_PERF_LAND_CACHED_BYTES : RP_PERF_LAND_UNCACHED_BYTES, len);
@@ -494,6 +503,14 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     __atomic_sub_fetch(&g_gw_live, 1, __ATOMIC_RELEASE);   // 锁内撤登记与计数保持一致
     if (!s->landing) pthread_cond_broadcast(&g_land_cv);   // 池销毁 / 会话收尾可安全解除目标映射
     pthread_mutex_unlock(&g_bmu);
+}
+
+void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {
+    gpu_write_land(pool_key, id, ok, NULL);
+}
+
+void rp_buf_gpu_write_land_done(uint64_t pool_key, uint64_t id, const nvn_gpu_done *done) {
+    gpu_write_land(pool_key, id, done->status != NVN_GPU_DONE_FAILED, done);
 }
 
 // 每次成功解析只写一个桶，不逐页扫描；碰撞合并包络不会漏掉已读范围。

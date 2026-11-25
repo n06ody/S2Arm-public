@@ -17,9 +17,11 @@
 #define GPU(x) do { nvn_gpu_rc result_ = (x); if (!nvn_gpu_ok(result_)) { fprintf(stderr, "FAIL %d: %s: %s\n", __LINE__, #x, err.why); exit(1); } } while (0)
 #define WAIT_NS 5000000000ull
 
-static int dq, enabled, fail_invalidate, wait_yield, wait_probe;
+static int dq, enabled, fail_invalidate, wait_yield, wait_probe, edge_snapshot;
 static atomic_int presented_submits, guest_submits;
 static atomic_int fail_next_flush, device_loss_gate, release_device_loss;
+static atomic_int fail_next_submit;
+static _Atomic VkFence edge_last_fence;
 
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n) {
     static const char *const exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME};
@@ -43,6 +45,7 @@ int nvn_plat_flag(const char *key, int fallback) {
     if (!strcmp(key, "nvk_land_cached")) return enabled;
     if (!strcmp(key, "nvk_land_wait_yield_wsi")) return wait_yield;
     if (!strcmp(key, "nvk_land_wait_probe")) return wait_probe;
+    if (!strcmp(key, "nvk_land_edge_snapshot")) return edge_snapshot;
     return fallback;
 }
 void nvn_plat_log(int level, const char *category, const char *line) {
@@ -61,8 +64,10 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkInvalidateMappe
 extern __typeof__(vkQueueSubmit) __real_vkQueueSubmit;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkQueueSubmit(VkQueue queue, uint32_t count,
                                                    const VkSubmitInfo *info, VkFence fence) {
+    if (atomic_exchange(&fail_next_submit, 0)) return VK_ERROR_OUT_OF_HOST_MEMORY;
     const VkResult result = __real_vkQueueSubmit(queue, count, info, fence);
     if (result == VK_SUCCESS) {
+        if (edge_snapshot && fence) atomic_store(&edge_last_fence, fence);
         for (uint32_t i = 0; i < count; i++) {
             if (info[i].signalSemaphoreCount) atomic_fetch_add(&presented_submits, 1);
             else atomic_fetch_add(&guest_submits, 1);
@@ -147,6 +152,7 @@ struct mirror_stats {
     uint64_t invalidates, invalidated_bytes, invalidated_payload, flushes, buffers;
     uint64_t wsi_locks, wsi_lock_ns, wsi_during_wait, wsi_overtakes;
     uint64_t sampled, dropped, atoms, edge_atoms, edge_waits;
+    uint64_t snapshot_bytes, snapshot_waits_elided, snapshot_full;
 };
 static void stat(void *user, const char *name, uint64_t n) {
     struct mirror_stats *s = user;
@@ -168,6 +174,9 @@ static void stat(void *user, const char *name, uint64_t n) {
     if (!strcmp(name, "mirror_probe_atoms")) s->atoms = n;
     if (!strcmp(name, "mirror_probe_edge_atoms")) s->edge_atoms = n;
     if (!strcmp(name, "mirror_probe_edge_waits")) s->edge_waits = n;
+    if (!strcmp(name, "mirror_edge_bytes")) s->snapshot_bytes = n;
+    if (!strcmp(name, "mirror_edge_wait_elided")) s->snapshot_waits_elided = n;
+    if (!strcmp(name, "mirror_edge_fallback_full")) s->snapshot_full = n;
 }
 static struct mirror_stats stats(void) {
     struct mirror_stats s = {0};
@@ -415,6 +424,286 @@ static void test_land_storage(const struct s2a_vk_device *physical, const char *
             (unsigned long long)observed.storage_waits, (unsigned long long)observed.last_wait);
 }
 
+// The edge optimization introduces a callback-scoped copy source. Weak lookup lets this
+// same fixture run on the old backend and reach the behavior assertion without a link error.
+extern int nvn_gpu_mirror_copy(const nvn_gpu_done *, nvn_gpu_buf, uint64_t, uint64_t, void *)
+    __attribute__((weak));
+extern void nvn_gpu_mirror_visibility_record_copy(nvn_gpu_cmd, const nvn_gpu_mirror_span *, uint32_t)
+    __attribute__((weak));
+
+struct edge_land {
+    nvn_gpu_buf mirror;
+    uint64_t off;
+    atomic_int entered, release;
+    unsigned callbacks, status;
+    uint8_t guest[16];
+};
+
+static void edge_done(void *user, const nvn_gpu_done *done) {
+    struct edge_land *land = user;
+    land->callbacks++;
+    land->status = done->status;
+    atomic_store(&land->entered, 1);
+    if (done->status == NVN_GPU_DONE_FAILED) return;
+    for (int i = 0; i < 4000 && !atomic_load(&land->release); i++) tick();
+    REQUIRE(atomic_load(&land->release));
+    for (unsigned i = 3; i <= 11; i += 8) {
+        if (!nvn_gpu_mirror_copy || !nvn_gpu_mirror_copy(done, land->mirror, land->off + i, 3, land->guest + i))
+            memcpy(land->guest + i, nvn_gpu_buf_cpu(land->mirror) + land->off + i, 3);
+    }
+}
+
+static void wait_edge_callback(const struct edge_land *land) {
+    for (int i = 0; i < 1500 && !atomic_load(&land->entered); i++) tick();
+    REQUIRE(atomic_load(&land->entered));
+}
+
+static void edge_record(nvn_gpu_cmd cmd, struct edge_land *land, uint32_t pattern) {
+    memset(land->guest, 0x7e, sizeof land->guest);
+    nvn_gpu_fill_buf(cmd, land->mirror, land->off, 16, pattern);
+    const nvn_gpu_mirror_span spans[] = {{land->mirror, land->off + 3, 3}, {land->mirror, land->off + 11, 3}};
+    if (nvn_gpu_mirror_visibility_record_copy) nvn_gpu_mirror_visibility_record_copy(cmd, spans, 2);
+    else nvn_gpu_mirror_visibility_record(cmd, spans, 2);
+}
+
+static void edge_expected(const struct edge_land *land, uint8_t pattern) {
+    const uint8_t expected[] = {0x7e, 0x7e, 0x7e, pattern, pattern, pattern, 0x7e, 0x7e,
+                                0x7e, 0x7e, 0x7e, pattern, pattern, pattern, 0x7e, 0x7e};
+    REQUIRE(land->callbacks == 1 && land->status == NVN_GPU_DONE_OK);
+    REQUIRE(memcmp(land->guest, expected, sizeof expected) == 0);
+}
+
+static void test_edge_snapshot(const struct s2a_vk_device *physical, int on) {
+    struct s2a_vk_device dev = cached_device(physical, 1, 0);
+    const VkDeviceSize atom = dev.properties.limits.nonCoherentAtomSize;
+    REQUIRE(atom >= 16 && atom <= 2048);
+    enabled = 1;
+    edge_snapshot = on;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-edge-snapshot"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    nvn_gpu_buf mirror;
+    uint8_t initial[4096] = {0};
+    GPU(nvn_gpu_buf_create(sizeof initial, NVN_GPU_MEM_POOL_MIRROR, initial, &mirror, &err));
+    REQUIRE(nvn_gpu_mirror_state(mirror) == NVN_GPU_MIRROR_CPU_IDLE);
+    // The buffer retains its noncoherent flag. Restore the real types for the upload arena,
+    // which requires coherent memory even on lavapipe with a single memory type.
+    dev.memory = physical->memory;
+
+    nvn_gpu_cmd cmd;
+    struct edge_land first = {.mirror = mirror};
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    edge_record(cmd, &first, 0x11111111);
+    GPU(nvn_gpu_cmd_commit(cmd, 1, edge_done, &first, &err));
+    wait_edge_callback(&first);
+
+    struct next_submit disjoint = {.signal = 2};
+    GPU(nvn_gpu_cmd_begin(NULL, &disjoint.cmd, &err));
+    nvn_gpu_fill_buf(disjoint.cmd, mirror, atom, 4, 0x22222222);
+    pthread_t thread;
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &disjoint));
+    require_no_wait(&disjoint);
+    REQUIRE(!pthread_join(thread, NULL));
+
+    struct edge_land second = {.mirror = mirror, .release = 1};
+    struct next_submit next = {.signal = 3, .done = edge_done, .user = &second};
+    GPU(nvn_gpu_cmd_begin(NULL, &next.cmd, &err));
+    edge_record(next.cmd, &second, 0x33333333);  // 后继 GPU 写与旧段覆盖同一颗 atom。
+    const uint32_t upload = 0x44444444;
+    nvn_gpu_buf_write(next.cmd, mirror, 0, &upload, sizeof upload);  // 同颗 atom 的主机上传。
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &next));
+    for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&next.returned); i++) tick();
+    if (atomic_load(&next.returned) && !nvn_gpu_ok(next.rc))
+        fprintf(stderr, "land-edge-snapshot: successor failed before submission: %s\n", next.err.why);
+    if (on) {
+        if (stats().waits)
+            fprintf(stderr, "land-edge-snapshot: fully covered atom still waited for callback (dq=%d)\n", dq);
+        REQUIRE(atomic_load(&next.returned) && !stats().waits && nvn_gpu_ok(next.rc));
+        // 旧、后两段同时在途，第三次 GPU 写同一 atom。
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+        nvn_gpu_fill_buf(cmd, mirror, 0, 16, 0x55555555);
+        GPU(nvn_gpu_cmd_commit(cmd, 4, NULL, NULL, &err));
+        REQUIRE(nvn_gpu_fence_wait(4, 0, &err).code == NVN_GPU_E_TIMEOUT);
+        // 等真驱动写完后再放行旧回调，强制回写取旧快照，消除快驱动碰巧没覆盖的假绿。
+        const VkFence written = atomic_load(&edge_last_fence);
+        REQUIRE(written && __real_vkWaitForFences(dev.device, 1, &written, VK_TRUE, WAIT_NS) == VK_SUCCESS);
+    } else {
+        REQUIRE(stats().waits == 1 && !atomic_load(&next.returned));
+    }
+    REQUIRE(!nvn_gpu_fence_done());
+    atomic_store(&first.release, 1);
+    REQUIRE(!pthread_join(thread, NULL) && nvn_gpu_ok(next.rc));
+    GPU(nvn_gpu_fence_wait(on ? 4 : 3, WAIT_NS, &err));
+    edge_expected(&first, 0x11);
+    const uint8_t expected[16] = {0x7e, 0x7e, 0x7e, 0x44, 0x33, 0x33, 0x7e, 0x7e,
+                                  0x7e, 0x7e, 0x7e, 0x33, 0x33, 0x33, 0x7e, 0x7e};
+    REQUIRE(second.callbacks == 1 && second.status == NVN_GPU_DONE_OK);
+    REQUIRE(!memcmp(second.guest, expected, sizeof expected));
+    const struct mirror_stats observed = stats();
+    REQUIRE(observed.snapshot_bytes == (on ? 2 * atom : 0));
+    REQUIRE(observed.snapshot_waits_elided == (on ? 2 : 0));
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    edge_snapshot = 0;
+    printf("land-cached edge dq=%d on=%d: disjoint=0 same_atom=%d exact=1\n", dq, on, !on);
+}
+
+static void test_edge_snapshot_full(const struct s2a_vk_device *physical) {
+    struct s2a_vk_device dev = cached_device(physical, 1, 0);
+    const VkDeviceSize atom = dev.properties.limits.nonCoherentAtomSize;
+    REQUIRE(atom >= 16 && atom <= 2048);
+    enabled = edge_snapshot = 1;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-edge-full"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    uint8_t initial[10240] = {0};
+    nvn_gpu_buf mirror;
+    GPU(nvn_gpu_buf_create(sizeof initial, NVN_GPU_MEM_POOL_MIRROR, initial, &mirror, &err));
+    struct edge_land pending[5] = {0};
+    nvn_gpu_cmd cmd;
+    for (unsigned i = 0; i < 5; i++) {
+        pending[i].mirror = mirror;
+        pending[i].off = i * atom;
+        atomic_init(&pending[i].release, i != 0);
+        GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+        edge_record(cmd, &pending[i], 0x66666666);
+        GPU(nvn_gpu_cmd_commit(cmd, i + 1, edge_done, &pending[i], &err));
+        if (!i) wait_edge_callback(&pending[0]);
+    }
+
+    pthread_t thread;
+    struct next_submit covered = {.signal = 6};
+    GPU(nvn_gpu_cmd_begin(NULL, &covered.cmd, &err));
+    nvn_gpu_fill_buf(covered.cmd, mirror, 0, 16, 0x44444444);
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &covered));
+    require_no_wait(&covered);
+    REQUIRE(!pthread_join(thread, NULL));
+
+    struct next_submit fallback = {.signal = 7};
+    GPU(nvn_gpu_cmd_begin(NULL, &fallback.cmd, &err));
+    nvn_gpu_fill_buf(fallback.cmd, mirror, 4 * atom, 16, 0x44444444);
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &fallback));
+    for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&fallback.returned); i++) tick();
+    REQUIRE(stats().waits == 1 && stats().last_wait == 5 && !atomic_load(&fallback.returned));
+    atomic_store(&pending[0].release, 1);
+    REQUIRE(!pthread_join(thread, NULL) && nvn_gpu_ok(fallback.rc));
+    GPU(nvn_gpu_fence_wait(7, WAIT_NS, &err));
+    for (unsigned i = 0; i < 5; i++) edge_expected(&pending[i], 0x66);
+    const struct mirror_stats observed = stats();
+    REQUIRE(observed.snapshot_bytes == 4 * atom && observed.snapshot_full == 1);
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    edge_snapshot = 0;
+    printf("land-cached edge-full dq=%d: five pending segments, fallback on fifth\n", dq);
+}
+
+struct mixed_land {
+    nvn_gpu_buf mirror;
+    VkDeviceSize bytes;
+    atomic_int entered, release;
+    uint8_t guest[6144];
+};
+
+static void mixed_done(void *user, const nvn_gpu_done *done) {
+    struct mixed_land *land = user;
+    REQUIRE(done->status == NVN_GPU_DONE_OK);
+    atomic_store(&land->entered, 1);
+    for (int i = 0; i < 4000 && !atomic_load(&land->release); i++) tick();
+    REQUIRE(atomic_load(&land->release));
+    if (!nvn_gpu_mirror_copy || !nvn_gpu_mirror_copy(done, land->mirror, 3, land->bytes - 6, land->guest + 3))
+        memcpy(land->guest + 3, nvn_gpu_buf_cpu(land->mirror) + 3, land->bytes - 6);
+}
+
+static void test_edge_mixed(const struct s2a_vk_device *physical) {
+    struct s2a_vk_device dev = cached_device(physical, 1, 0);
+    const VkDeviceSize atom = dev.properties.limits.nonCoherentAtomSize;
+    REQUIRE(atom >= 16 && atom <= 2048);
+    enabled = edge_snapshot = 1;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-edge-mixed"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    struct mixed_land first = {.bytes = 3 * atom};
+    memset(first.guest, 0x7e, sizeof first.guest);
+    GPU(nvn_gpu_buf_create(first.bytes, NVN_GPU_MEM_POOL_MIRROR, NULL, &first.mirror, &err));
+    nvn_gpu_cmd cmd;
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    nvn_gpu_fill_buf(cmd, first.mirror, 0, first.bytes, 0x11111111);
+    const nvn_gpu_mirror_span span = {first.mirror, 3, first.bytes - 6};
+    if (nvn_gpu_mirror_visibility_record_copy) nvn_gpu_mirror_visibility_record_copy(cmd, &span, 1);
+    else nvn_gpu_mirror_visibility_record(cmd, &span, 1);
+    GPU(nvn_gpu_cmd_commit(cmd, 1, mixed_done, &first, &err));
+    for (int i = 0; i < 1500 && !atomic_load(&first.entered); i++) tick();
+    REQUIRE(atomic_load(&first.entered));
+
+    pthread_t thread;
+    struct next_submit edges = {.signal = 2};
+    GPU(nvn_gpu_cmd_begin(NULL, &edges.cmd, &err));
+    nvn_gpu_fill_buf(edges.cmd, first.mirror, 0, atom, 0x22222222);
+    nvn_gpu_fill_buf(edges.cmd, first.mirror, 2 * atom, atom, 0x33333333);
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &edges));
+    require_no_wait(&edges);
+    REQUIRE(!pthread_join(thread, NULL));
+
+    struct next_submit interior = {.signal = 3};
+    GPU(nvn_gpu_cmd_begin(NULL, &interior.cmd, &err));
+    nvn_gpu_fill_buf(interior.cmd, first.mirror, atom, atom, 0x44444444);
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &interior));
+    for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&interior.returned); i++) tick();
+    REQUIRE(stats().waits == 1 && stats().last_wait == 1 && !atomic_load(&interior.returned));
+    atomic_store(&first.release, 1);
+    REQUIRE(!pthread_join(thread, NULL) && nvn_gpu_ok(interior.rc));
+    GPU(nvn_gpu_fence_wait(3, WAIT_NS, &err));
+    for (VkDeviceSize i = 0; i < first.bytes; i++)
+        REQUIRE(first.guest[i] == (i >= 3 && i < first.bytes - 3 ? 0x11 : 0x7e));
+    const struct mirror_stats observed = stats();
+    REQUIRE(observed.snapshot_bytes == 2 * atom && observed.snapshot_waits_elided == 1);
+    nvn_gpu_buf_release(first.mirror, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    edge_snapshot = 0;
+    printf("land-cached edge-mixed dq=%d: two edges elided, interior waited, exact bytes\n", dq);
+}
+
+static void test_edge_snapshot_close(const struct s2a_vk_device *physical) {
+    struct s2a_vk_device dev = cached_device(physical, 1, 0);
+    enabled = edge_snapshot = 1;
+    const nvn_gpu_open_desc desc = {.host_device = &dev, .app_label = "land-edge-close"};
+    nvn_gpu_err err = {0};
+    GPU(nvn_gpu_open(&desc, &err));
+    uint8_t initial[4096] = {0};
+    nvn_gpu_buf mirror;
+    GPU(nvn_gpu_buf_create(sizeof initial, NVN_GPU_MEM_POOL_MIRROR, initial, &mirror, &err));
+    struct edge_land first = {.mirror = mirror}, failed = {.mirror = mirror};
+    nvn_gpu_cmd cmd;
+    GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
+    edge_record(cmd, &first, 0x11111111);
+    GPU(nvn_gpu_cmd_commit(cmd, 1, edge_done, &first, &err));
+    wait_edge_callback(&first);
+
+    struct next_submit next = {.signal = 2, .done = edge_done, .user = &failed};
+    GPU(nvn_gpu_cmd_begin(NULL, &next.cmd, &err));
+    edge_record(next.cmd, &failed, 0x33333333);
+    atomic_store(&fail_next_submit, 1);
+    pthread_t thread;
+    REQUIRE(!pthread_create(&thread, NULL, submit_next, &next));
+    for (int i = 0; i < 1500 && !stats().waits && !atomic_load(&next.returned); i++) tick();
+    REQUIRE(atomic_load(&next.returned) && !stats().waits && !atomic_load(&fail_next_submit));
+    REQUIRE(!pthread_join(thread, NULL) && next.rc.code == NVN_GPU_E_DEVICE);
+    REQUIRE(stats().snapshot_bytes == dev.properties.limits.nonCoherentAtomSize);
+    REQUIRE(nvn_gpu_close(0, &err).code == NVN_GPU_E_TIMEOUT);
+    atomic_store(&first.release, 1);
+    REQUIRE(nvn_gpu_fence_wait(2, WAIT_NS, &err).code == NVN_GPU_E_FAILED);
+    nvn_gpu_buf_release(mirror, NULL, NULL);
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    edge_expected(&first, 0x11);
+    REQUIRE(failed.callbacks == 1 && failed.status == NVN_GPU_DONE_FAILED);
+    for (unsigned i = 0; i < sizeof failed.guest; i++) REQUIRE(failed.guest[i] == 0x7e);
+    GPU(nvn_gpu_open(&desc, &err));
+    REQUIRE(!nvn_gpu_fence_done() && !nvn_gpu_fence_failed());
+    GPU(nvn_gpu_close(WAIT_NS, &err));
+    edge_snapshot = 0;
+    printf("land-cached edge-close dq=%d: failed submit, callback race, clean reopen\n", dq);
+}
+
 struct present_submit {
     nvn_gpu_surface surface;
     nvn_gpu_drawable drawable;
@@ -512,7 +801,11 @@ static void test_wait_yield(const struct s2a_vk_device *physical, int yield) {
         fprintf(stderr, "WSI did not reach the Vulkan queue while the old writeback was gated: yield=%d submit=%d\n",
                 yield, crossed);
     REQUIRE(crossed == yield);
-    REQUIRE(observed.wsi_locks == 1 && observed.wsi_lock_ns && observed.wsi_during_wait == 1);
+    if (observed.wsi_locks != 1 || observed.wsi_during_wait != 1)
+        fprintf(stderr, "WSI probe lock=%llu ns=%llu during_wait=%llu\n",
+                (unsigned long long)observed.wsi_locks, (unsigned long long)observed.wsi_lock_ns,
+                (unsigned long long)observed.wsi_during_wait);
+    REQUIRE(observed.wsi_locks == 1 && observed.wsi_during_wait == 1);
     REQUIRE(observed.wsi_overtakes == (unsigned)crossed && observed.buffers == 1);
     REQUIRE(observed.sampled == 1 && !observed.dropped && observed.atoms == 1 &&
             observed.edge_atoms == 1 && observed.edge_waits == 1);
@@ -597,13 +890,24 @@ static void test_wait_error(const struct s2a_vk_device *physical, enum wait_erro
 }
 
 int main(int argc, char **argv) {
-    REQUIRE(argc == 3);
+    REQUIRE(argc == 3 || argc == 4);
     dq = atoi(argv[1]);
     struct s2a_vk_device dev;
     char why[256] = {0};
     const int open = s2a_vk_device_create(&dev, why, sizeof why);
     if (open) fprintf(stderr, "create device: %s\n", why);
     REQUIRE(!open);
+    if (argc == 4) {
+        const char *scenario = argv[3];
+        if (!strcmp(scenario, "edge-off")) test_edge_snapshot(&dev, 0);
+        else if (!strcmp(scenario, "edge-on")) test_edge_snapshot(&dev, 1);
+        else if (!strcmp(scenario, "edge-full")) test_edge_snapshot_full(&dev);
+        else if (!strcmp(scenario, "edge-mixed")) test_edge_mixed(&dev);
+        else if (!strcmp(scenario, "edge-close")) test_edge_snapshot_close(&dev);
+        else REQUIRE(0);
+        s2a_vk_device_destroy(&dev, 1);
+        return 0;
+    }
     test_land(&dev, 0, 0, 0);
     test_land(&dev, 1, 0, 1);
     test_land(&dev, 1, 0, 0);

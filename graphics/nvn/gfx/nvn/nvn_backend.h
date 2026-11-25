@@ -197,6 +197,8 @@ int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b);
 typedef struct { nvn_gpu_buf src; uint64_t offset, bytes; } nvn_gpu_mirror_span;
 // 非一致镜像随段持有到完成回调返回。count 非零、spans 为空表示快照失败，本段粘滞失败。
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count);
+// 只供完成回调用 mirror_copy 回写登记区间的调用方。普通登记仍允许直接读镜像。
+void nvn_gpu_mirror_visibility_record_copy(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count);
 // 释放。retired 可为 NULL；非 NULL 时在最后一次使用（总则 ①–④）结束后恰好调一次。线程：[任意]。NULL 句柄无操作。
 void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user);
 // 本 cmd 会经 GPU 地址间接用到 b（总则 ④）：后端保活到该 cmd 完成，并保证执行时驻留（Metal 驻留集 / useResource；Vulkan 只保活）。线程：[提交]。
@@ -554,8 +556,11 @@ typedef struct {
     uint64_t gpu_dur_ns, gpu_t0, gpu_t1;   // 不可信的字段为 0，0 不表示「零耗时」，看 time_kind
     const nvn_gpu_timestamp_result *timestamps; uint32_t ntimestamps; // 回调期间只读；FAILED 无有效槽，FAULT 仅消费 valid 槽
     const uint64_t *occlusion; uint32_t nocclusion;   // 各槽样本数（只在回调期间有效；FAILED 时为 NULL）
+    const void *mirror_copy_context; // 可选，只在成功回调期间有效
 } nvn_gpu_done;
 typedef void (*nvn_gpu_done_fn)(void *user, const nvn_gpu_done *d);
+// 拷贝且仅拷贝指定的登记字节，混合段末快照和已失效的原映射。返回 0 时仍应按原路径拷贝。
+int nvn_gpu_mirror_copy(const nvn_gpu_done *done, nvn_gpu_buf b, uint64_t offset, uint64_t bytes, void *dst);
 // 提交一段。
 // 成功路径的发布顺序：GPU 完成 → 后端调 done（核心在这里做完成后才可见的 CPU 副作用：事件值、计数器、遮挡结果写回游戏内存）→ done 返回后，
 //   后端以 release 语义把已完成值推进到 signal；fence_done / fence_wait 以 acquire 语义读——等到 signal 的线程一定看得到 done 里的写。

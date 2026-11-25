@@ -172,8 +172,10 @@ static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
 
 int nvn_gpu_mirror_visibility_enabled(void) __attribute__((weak));
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) __attribute__((weak));
+void nvn_gpu_mirror_visibility_record_copy(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_visibility_enabled
 // 弱链接[replay]：nvn_gpu_mirror_visibility_record
+// 弱链接[replay]：nvn_gpu_mirror_visibility_record_copy
 
 static int compare_write_ref(const void *a, const void *b) {
     const struct gw_ev *x = a, *y = b;
@@ -195,7 +197,8 @@ static void sub_record_mirrors(const struct sub *s, nvn_gpu_cmd c) {
         qsort(refs, count, sizeof *refs, compare_write_ref);
         rp_buf_gpu_write_snapshot(refs, count, spans);
     }
-    nvn_gpu_mirror_visibility_record(c, refs ? spans : NULL, count);
+    if (nvn_gpu_mirror_visibility_record_copy) nvn_gpu_mirror_visibility_record_copy(c, refs ? spans : NULL, count);
+    else nvn_gpu_mirror_visibility_record(c, refs ? spans : NULL, count);
     if (spans != local_spans) free(spans);
     if (refs != local_refs) free(refs);
 }
@@ -208,7 +211,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
     if (s->t_commit) { pf_add(RP_PERF_DONE_NS, t_done - s->t_commit); pf_add(RP_PERF_DONE_N, 1); }
     if (d->status != NVN_GPU_DONE_FAILED) busy_done(s->t_commit, t_done);   // 失败段没执行：不算显卡忙
     // 先落 GPU 写，再发布事件和完成序号：等待事件的 CPU 不能先看见旧内存。
-    for (int i = 0; i < s->ngw; i++) rp_buf_gpu_write_land(s->gw[i].pool_key, s->gw[i].id, d->status != NVN_GPU_DONE_FAILED);
+    for (int i = 0; i < s->ngw; i++) rp_buf_gpu_write_land_done(s->gw[i].pool_key, s->gw[i].id, d);
     if (d->status != NVN_GPU_DONE_FAILED)   // 没执行的段不做任何成功回写
         for (int i = 0; i < s->n; i++) {
             if (s->p[i].report) {   // 计数器记录 = {计数值, 时间}（各 8 字节）。时间戳类优先取报告位置的校准 GPU 时刻；

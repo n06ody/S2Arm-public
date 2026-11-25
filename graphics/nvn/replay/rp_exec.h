@@ -196,6 +196,7 @@ int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *va
 struct gw_ev { uint64_t pool_key, id; };   // 提交里 GPU 写池的一笔登记
 void rp_buf_gpu_write_snapshot(const struct gw_ev *refs, uint32_t count, nvn_gpu_mirror_span *spans);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
+void rp_buf_gpu_write_land_done(uint64_t pool_key, uint64_t id, const nvn_gpu_done *done);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里

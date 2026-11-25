@@ -32,14 +32,21 @@ khronos_validation.validate_sync = true
 khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
+failed=0
 for dq in 0 1; do
-    log="$out/dq$dq.log"
-    if ! timeout 30 "$out/test" "$dq" "$out/storage.comp.spv" > "$log" 2>&1 ||
-       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
-        echo "【红】land-cached dq=$dq" >&2
-        cat "$log" >&2
-        exit 1
-    fi
-    grep '^land-cached ' "$log"
+    for scenario in base edge-off edge-on edge-full edge-mixed edge-close; do
+        log="$out/dq$dq-$scenario.log"
+        args=()
+        if [ "$scenario" != base ]; then args=("$scenario"); fi
+        if ! timeout 30 "$out/test" "$dq" "$out/storage.comp.spv" "${args[@]}" > "$log" 2>&1 ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
+            echo "【红】land-cached dq=$dq $scenario" >&2
+            cat "$log" >&2
+            failed=1
+        else
+            grep '^land-cached ' "$log"
+        fi
+    done
 done
-echo 'RESULT: PASS（缓存镜像：22 个 Vulkan 场景，开启同步校验）'
+[ "$failed" -eq 0 ] || exit 1
+echo 'RESULT: PASS（缓存镜像：32 个 Vulkan 场景，开启同步校验）'

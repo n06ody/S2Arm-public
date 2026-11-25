@@ -73,6 +73,8 @@ enum {
     LAND_WAIT_RELOCK_NS, LAND_WSI_LOCK_N, LAND_WSI_LOCK_NS, LAND_WSI_DURING_WAIT, LAND_WSI_OVERTAKES,
     LAND_PROBE_SAMPLED, LAND_PROBE_DROPPED, LAND_PROBE_ATOMS, LAND_PROBE_EDGE_ATOMS,
     LAND_PROBE_EDGE_WAITS, LAND_PROBE_EDGE_WAIT_NS,
+    LAND_EDGE_BYTES, LAND_EDGE_REUSE, LAND_EDGE_WAIT_ELIDED, LAND_EDGE_LAG_NS,
+    LAND_EDGE_NO_EDGE, LAND_EDGE_UNKNOWN, LAND_EDGE_BUDGET, LAND_EDGE_FULL, LAND_EDGE_ALLOC,
     LAND_WAIT_LAST_SEGMENT, LAND_METRIC_N,
 };
 static const char *const mirror_metrics[LAND_METRIC_N] = {
@@ -89,6 +91,11 @@ static const char *const mirror_metrics[LAND_METRIC_N] = {
     [LAND_PROBE_SAMPLED] = "mirror_probe_sampled", [LAND_PROBE_DROPPED] = "mirror_probe_dropped",
     [LAND_PROBE_ATOMS] = "mirror_probe_atoms", [LAND_PROBE_EDGE_ATOMS] = "mirror_probe_edge_atoms",
     [LAND_PROBE_EDGE_WAITS] = "mirror_probe_edge_waits", [LAND_PROBE_EDGE_WAIT_NS] = "mirror_probe_edge_wait_ns",
+    [LAND_EDGE_BYTES] = "mirror_edge_bytes", [LAND_EDGE_REUSE] = "mirror_edge_slot_reuse",
+    [LAND_EDGE_WAIT_ELIDED] = "mirror_edge_wait_elided", [LAND_EDGE_LAG_NS] = "mirror_edge_retire_lag_ns",
+    [LAND_EDGE_NO_EDGE] = "mirror_edge_fallback_no_edge", [LAND_EDGE_UNKNOWN] = "mirror_edge_fallback_unknown",
+    [LAND_EDGE_BUDGET] = "mirror_edge_fallback_budget", [LAND_EDGE_FULL] = "mirror_edge_fallback_full",
+    [LAND_EDGE_ALLOC] = "mirror_edge_fallback_alloc",
     [LAND_WAIT_LAST_SEGMENT] = "mirror_wait_last_segment",
 };
 static uint64_t g_mirror_metrics_last[LAND_WAIT_LAST_SEGMENT];
@@ -131,6 +138,20 @@ static void land_profile(const uint64_t pf[RP_PERF_N], uint64_t frames, uint64_t
              (unsigned long long)stats[LAND_WAIT_STORAGE], (unsigned long long)stats[LAND_WAIT_INDIRECT],
              (unsigned long long)waited);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+    if (stats[LAND_EDGE_BYTES] || stats[LAND_EDGE_WAIT_ELIDED] || stats[LAND_EDGE_LAG_NS] ||
+        stats[LAND_EDGE_NO_EDGE] || stats[LAND_EDGE_UNKNOWN] || stats[LAND_EDGE_BUDGET] ||
+        stats[LAND_EDGE_FULL] || stats[LAND_EDGE_ALLOC]) {
+        // 同一旧段只计首笔免等待提交到回写结束的墙钟差；不同旧段仍可能重叠。
+        snprintf(b, sizeof b,
+                 "落地边界快照 mono_ns=%llu presents=%llu bytes=%llu slot_reuse=%llu wait_elided=%llu "
+                 "retire_lag_ms=%.3f fallback=no_edge:%llu,unknown:%llu,budget:%llu,full:%llu,alloc:%llu",
+                 (unsigned long long)now, (unsigned long long)frames, (unsigned long long)stats[LAND_EDGE_BYTES],
+                 (unsigned long long)stats[LAND_EDGE_REUSE], (unsigned long long)stats[LAND_EDGE_WAIT_ELIDED],
+                 stats[LAND_EDGE_LAG_NS] / 1e6, (unsigned long long)stats[LAND_EDGE_NO_EDGE],
+                 (unsigned long long)stats[LAND_EDGE_UNKNOWN], (unsigned long long)stats[LAND_EDGE_BUDGET],
+                 (unsigned long long)stats[LAND_EDGE_FULL], (unsigned long long)stats[LAND_EDGE_ALLOC]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+    }
     if (stats[LAND_WSI_LOCK_N] || stats[LAND_PROBE_SAMPLED] || stats[LAND_PROBE_DROPPED]) {
         snprintf(b, sizeof b,
                  "回写队列锁 mono_ns=%llu presents=%llu wsi_locks=%llu wsi_lock_ms=%.3f "
