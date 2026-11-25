@@ -64,7 +64,7 @@ nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){*last=1;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
 // GPU 写回登记：同 rp_exec.c 交给 rp_buf 的排除表；收尾不回写游戏内存
 static uint64_t wkey[4],wid[4];static int nw;
-int rp_post_gpu_write(uint64_t a,uint64_t n){if(nw>=4){return 0;}wid[nw]=rp_buf_gpu_write_note(a,n,&wkey[nw]);if(!wid[nw]){return 0;}nw++;return 1;}
+int rp_post_gpu_write_from(uint64_t a,uint64_t n, struct rp_write_source source) { if(nw>=4){return 0;}wid[nw]=rp_buf_gpu_write_note_from(a,n,&wkey[nw],NULL,source);if(!wid[nw]){return 0;}nw++;return 1;}
 int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t base=(uint64_t)(uintptr_t)guest;if(a<base||n>sizeof guest||a-base>sizeof guest-n)return 0;if(m)*m=guest;if(s)*s=sizeof guest;return 1;}
 // 缺省：受写跟踪、游戏之后没再写的池：首次解析直接写进镜像，之后的解析走快路，不录同步拷贝，
 // 传输写和派发之间只有被测的那道屏障（同步拷贝开头的全屏障会把缺的那道盖掉）。

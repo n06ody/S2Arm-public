@@ -20,13 +20,14 @@ void s2a_fu_rt_reset(void) __attribute__((weak));   // 首用 fresh/seen 历史�
 // 待定键：管线描述（阶段着色器句柄置空）＋ 程序内容身份。必须带身份，见头文件「关键」。
 struct dem_key {
     nvn_gpu_pipe_desc desc;
-    uint8_t ident[32];
+    uint8_t ident[32], variant_sha[32];
 };
 struct dem_job {
     int used;
     nvn_gpu_pipe_desc desc;   // st[].sh 置空；后台线程用借到的程序填
     uint8_t ident[32];
-    uint8_t stagemask;
+    uint8_t stagemask, cold;
+    uint8_t variant_sha[32];
     uint64_t gen;             // 入队时的会话代号：停局后迟到的结果按它丢弃
 };
 
@@ -79,6 +80,7 @@ uint32_t nvk_fu_frame_ms(void)  { static int v = -2; if (v == -2) v = nvn_plat_f
 uint32_t nvk_fu_unsafe_ms(void) { static int v = -2; if (v == -2) v = nvn_plat_flag("fu_unsafe_ms", 10000); return v > 0 ? (uint32_t)v : 0; }
 
 static void dem_key(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], struct dem_key *k) {
+    memset(k, 0, sizeof *k);
     k->desc = *d;
     for (int st = 0; st < DEM_STAGES; st++) k->desc.st[st].sh = NULL;
     memcpy(k->ident, ident, 32);
@@ -100,8 +102,15 @@ static void dem_build(int h) {
         dem_publish(j.gen, h, NULL, NVN_GPU_E_STOPPED, "程序借用不可用（停局 / 借用表满）");
         return;
     }
+    if (j.cold && (!prog->cold || memcmp(prog->cold->variant_sha, j.variant_sha, sizeof j.variant_sha))) {
+        rp_shader_prog_return(j.ident);
+        __atomic_fetch_add(&g_st.failed, 1, __ATOMIC_RELAXED);
+        dem_publish(j.gen, h, NULL, NVN_GPU_E_COMPILE, "cold fragment identity changed");
+        return;
+    }
     nvn_gpu_pipe_desc pd = j.desc;
     for (int st = 0; st < DEM_STAGES; st++) pd.st[st].sh = (j.stagemask >> st & 1u) ? prog->sh[st] : NULL;
+    if (j.cold) pd.st[NVN_GPU_SH_FS].sh = prog->cold->fragment;
     nvn_gpu_pipe pipe = NULL;
     nvn_gpu_err err = {0};
     nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err);
@@ -266,7 +275,8 @@ void nvn_vk_pipe_demand_test_unlock_lifecycle(void) {
 }
 #endif
 
-int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], nvn_gpu_pipe *cached) {
+static int dem_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32],
+                    const uint8_t *variant_sha, nvn_gpu_pipe *cached) {
     if (cached) *cached = NULL;
     if (!d || !prog_identity) return NVK_DEMAND_NONE;
     if (nvn_gpu_pipe_lookup(d, cached)) return NVK_DEMAND_READY;
@@ -284,6 +294,7 @@ int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_ident
     if (mask & ~0x7u) { pthread_mutex_unlock(&g_life_mu); return NVK_DEMAND_NONE; }
 
     struct dem_key key; dem_key(d, prog_identity, &key);
+    if (variant_sha) memcpy(key.variant_sha, variant_sha, sizeof key.variant_sha);
     int h = -1;
     int r = nvk_pp_enter(&g_pp, &key, dem_eq, &h);
     if (r == NVK_PP_ENTER_FOLLOW) {
@@ -304,10 +315,12 @@ int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_ident
     for (int st = 0; st < DEM_STAGES; st++) j->desc.st[st].sh = NULL;
     memcpy(j->ident, prog_identity, 32);
     j->stagemask = (uint8_t)(mask & 0x7u);
+    j->cold = variant_sha != NULL;
+    memcpy(j->variant_sha, key.variant_sha, sizeof j->variant_sha);
     j->gen = atomic_load_explicit(&g_gen, memory_order_acquire);
 
     pthread_mutex_lock(&g_q_mu);
-    if (qn == DEM_MAX) {
+    if (qn == DEM_MAX || (variant_sha && qn >= 8)) {
         pthread_mutex_unlock(&g_q_mu);
         nvk_pp_abandon(&g_pp, h);
         j->used = 0;
@@ -322,6 +335,15 @@ int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_ident
     __atomic_fetch_add(&g_st.kicked, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_life_mu);
     return NVK_DEMAND_PENDING;
+}
+
+int nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], nvn_gpu_pipe *cached) {
+    return dem_kick(d, prog_identity, NULL, cached);
+}
+
+int nvn_vk_pipe_demand_cold_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32],
+                                const uint8_t variant_sha[32], nvn_gpu_pipe *cached) {
+    return variant_sha ? dem_kick(d, prog_identity, variant_sha, cached) : NVK_DEMAND_NONE;
 }
 
 int nvn_vk_pipe_demand_state(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], nvn_gpu_pipe *cached) {

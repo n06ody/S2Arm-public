@@ -44,6 +44,12 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec);
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec);
+void rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park);
+int rp_pass_park_tex_clear(nvn_gpu_cmd c, const tex_t *t, const view_t *v, nvn_gpu_view gpu, const nvn_gpu_clear *value, int is_int);
+extern int rp_tex_clear_active;
+void rp_pass_land_tex_clear(nvn_gpu_cmd c);
+void rp_pass_tex_clear_before_tex(nvn_gpu_cmd c, const tex_t *t);
+void rp_pass_tex_clear_before_buf(nvn_gpu_cmd c, uint64_t addr, uint64_t len);
 void rp_op_draw_tex(nvn_gpu_cmd c, const p_draw_tex *o, const void *rec);   // OP_DRAW_TEX（rp_draw_tex.c，#1452）：后端有 NVN_GPU_CAP_DRAW_TEX 才画，否则记未接
 
 // 会话四件套（前端按名字调，上沿头文件里没有声明）
@@ -59,6 +65,16 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec);
 void rp_pass_barrier(uint32_t bits);   // 游戏的屏障：记下位，下一个通道前交给后端；带「顺序」位、且开着的通道里已有着色器写的，下一笔绘制前结束该通道（见 rp_pass.c）
 uint32_t rp_pass_take_barrier(void);   // 通道外的计算派发前调：取走待发的游戏屏障位（取完清零），由调用方交给后端
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask);   // 有效颜色写掩码（含片元输出映射）与像素区域；附件集合变了或区域超出时重开
+// 各绘制路径和开遍用同一个半开矩形；先加宽，客体宽高或起点异常时也不会回绕。
+static inline int rp_clip_scissor(const p_scissor *in, uint32_t w, uint32_t h, p_scissor *out) {
+    int64_t x0 = in->x > 0 ? in->x : 0, y0 = in->y > 0 ? in->y : 0;
+    int64_t x1 = (int64_t)in->x + in->w, y1 = (int64_t)in->y + in->h;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    *out = (p_scissor){(int32_t)x0, (int32_t)y0, (int32_t)(x1 - x0), (int32_t)(y1 - y0)};
+    return 1;
+}
 int rp_pass_begin(nvn_gpu_cmd c);     // 绘制前调：1 = 通道开着；0 = 开不了（已记账），跳过这笔
 void rp_pass_want_layered(nvn_gpu_cmd c, int layered);   // 绘制前调（prepare_draw 之前）：程序的顶点 / 几何阶段写层号 = 1，按分层通道开；与开着的通道不同就收掉重开
 // 开通道之前，落地实际绑定的贴图（含整池快照）上的待折清除。按宿主底图匹配，不限级 / 层。
@@ -134,6 +150,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_P_CUT_BAR,      // 通道里有着色器写、其后游戏发了带顺序位的屏障，因此在下一笔绘制前结束的通道数（见 rp_pass.c rp_pass_barrier）
        RP_PERF_BUF_SYNC_GW_KB,   // 已登记 GPU 写覆盖整页，在途免同步的 KB
        RP_PERF_WAIT_EFX_TS, RP_PERF_WAIT_EFX_FX, RP_PERF_WAIT_EFX_GW, RP_PERF_WAIT_EFX_LATER,   // 本可放行、因待落地回写改成真等的 SyncWait：所等区间里带时间戳 / 带事件·别的计数器·遮挡 / 带显卡写缓冲的次数（一次可记多类）；所等区间里没有、只有之后的提交带回写的次数
+       RP_PERF_MIRROR_HOIST, RP_PERF_MIRROR_OVERLAP, RP_PERF_MIRROR_FALLBACK,   // 原本会关遍的镜像同步：前移、确认重叠、不具备前移条件
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。
@@ -189,8 +206,16 @@ void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);
 void rp_occl_pause(nvn_gpu_cmd c);      // 通道里按矩形清之前
 void rp_occl_draw(nvn_gpu_cmd c);       // 每笔绘制之前
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec);   // 计算派发（rp_draw.c）
+enum rp_write_op { RP_W_UNKNOWN, RP_W_SSBO, RP_W_UBOP, RP_W_IMAGE_TBUF, RP_W_UPDATE, RP_W_COPY, RP_W_FILL, RP_W_T2B, RP_W_COUNT };
+struct rp_write_source {
+    enum rp_write_op op;
+    int stage, slot;   // 只对着色器来源有效
+    const p_dispatch *dispatch;
+    const uint8_t *compute_key;   // 计算阶段绑定的 8 字节键；两个指针只供同步登记消费
+};
+int rp_post_gpu_write_from(uint64_t addr, uint64_t len, struct rp_write_source source);
 int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登记单段；1 = 登记成功，段完成后回写
-int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
+int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images, struct rp_write_source source);
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
@@ -198,6 +223,8 @@ struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
 void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
 void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
+void rp_land_origin_report(void);
+uint64_t rp_buf_gpu_write_note_from(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged, struct rp_write_source source);
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里
 enum { RP_NOTE_DS = 1, RP_NOTE_SHADER_WRITE = 2 };   // rp_pass_note_draw 的位

@@ -94,12 +94,9 @@ void rp_op_draw_tex(nvn_gpu_cmd c, const p_draw_tex *o, const void *rec) {
     // 裁剪夹到颜色 0 的范围（同 fill_dyn）：交集为空就什么都画不出，不发
     uint32_t tw = 1, th = 1; rp_pass_slot_size(0, &tw, &th);
     if (rp_R.has_sc) {
-        int64_t sx0 = rp_R.sc.x < 0 ? 0 : rp_R.sc.x, sy0 = rp_R.sc.y < 0 ? 0 : rp_R.sc.y;
-        int64_t sx1 = (int64_t)rp_R.sc.x + rp_R.sc.w, sy1 = (int64_t)rp_R.sc.y + rp_R.sc.h;
-        if (sx1 > (int64_t)tw) sx1 = tw;
-        if (sy1 > (int64_t)th) sy1 = th;
-        if (sx1 <= sx0 || sy1 <= sy0) { rp_view_pin_end(); return; }
-        d.has_sc = 1; d.sc[0] = (int32_t)sx0; d.sc[1] = (int32_t)sy0; d.sc[2] = (int32_t)(sx1 - sx0); d.sc[3] = (int32_t)(sy1 - sy0);
+        p_scissor sc;
+        if (!rp_clip_scissor(&rp_R.sc, tw, th, &sc)) { rp_view_pin_end(); return; }
+        d.has_sc = 1; d.sc[0] = sc.x; d.sc[1] = sc.y; d.sc[2] = sc.w; d.sc[3] = sc.h;
     }
     rp_occl_draw(c);
     nvn_gpu_draw_tex(c, &d);

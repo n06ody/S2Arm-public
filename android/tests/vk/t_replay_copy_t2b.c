@@ -16,7 +16,8 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
     if (addr < base || len > sizeof g_guest || addr - base > sizeof g_guest - len) return 0;
     *buf = g_dst; *off = addr - base; memcpy(nvn_gpu_buf_cpu(g_dst), g_guest, sizeof g_guest); return 1;
 }
-int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images, struct rp_write_source source) {
+    if (source.op != RP_W_T2B) g_fail++;
     g_write.addr = addr; g_write.bytes = bytes; g_write.row = row; g_write.image = image; g_write.rows = rows; g_write.images = images; g_write_n++; return 1;
 }
 uint64_t nvn_unimpl_count(const char *cls, const char *name) { (void)cls; (void)name; return 0; }

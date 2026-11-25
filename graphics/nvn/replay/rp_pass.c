@@ -255,24 +255,20 @@ static int noatt_extent(uint32_t *w, uint32_t *h) {
 }
 static int noatt_ok(void) { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp); return (cp.caps & NVN_GPU_CAP_NO_ATTACH_PASS) != 0; }
 int rp_pass_slot_attached(int i) { return P.has_rt && i >= 0 && i < P.rt.n && i < 8 && (P.colors >> i & 1) && P.rt.color[i] && slot_kind(i, NULL, NULL) >= 0; }
+int rp_pass_slot_planned(int i) {
+    return P.has_rt && i >= 0 && i < P.rt.n && i < 8 && (P.want_colors >> i & 1) &&
+           P.rt.color[i] && slot_kind(i, NULL, NULL) >= 0;
+}
 
 // 同一组目标（对齐 nvn_mtl.m rt_same @10955）：颜色 / 深度个数、每张图的序号、视图记录逐字节相同就算同一组。
 // 不比对象指针：游戏会按值拷贴图对象，指针不可信（同一个序号才是同一张图）。
 // 这一遍可证的像素区域：裁剪矩形（设了才有）按目标尺寸裁。只收裁剪、不看视口：后端把裁剪原样交给 Vulkan，
 // 像素一定落在它里面；视口带窗口原点翻转，要按原点翻 y 才能用，等真机验证过再接。返回 0 = 不能收缩（整张）。
-static int pass_area(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) {
+static int pass_area(p_scissor *sc) {
     uint32_t tw = 0, th = 0;
     for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) { level_size(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], &tw, &th); break; }
     if (!tw && P.rt.depth) level_size(P.rt.depth, &P.rt.dview, P.rt.has_dview, &tw, &th);
-    if (!tw || !th || !rp_R.has_sc) return 0;
-    int64_t x0 = 0, y0 = 0, x1 = tw, y1 = th;
-    if (rp_R.sc.x > x0) x0 = rp_R.sc.x;
-    if (rp_R.sc.y > y0) y0 = rp_R.sc.y;
-    if ((int64_t)rp_R.sc.x + rp_R.sc.w < x1) x1 = (int64_t)rp_R.sc.x + rp_R.sc.w;
-    if ((int64_t)rp_R.sc.y + rp_R.sc.h < y1) y1 = (int64_t)rp_R.sc.y + rp_R.sc.h;
-    if (x1 <= x0 || y1 <= y0) return 0;
-    *x = (int32_t)x0; *y = (int32_t)y0; *w = (uint32_t)(x1 - x0); *h = (uint32_t)(y1 - y0);
-    return 1;
+    return rp_R.has_sc && rp_clip_scissor(&rp_R.sc, tw, th, sc);
 }
 static int rt_same(const p_set_rt *a, const p_set_rt *b) {
     if (a->n != b->n || (!a->depth) != (!b->depth) || (a->depth && a->depth->serial != b->depth->serial) || a->has_dview != b->has_dview) return 0;
@@ -320,6 +316,109 @@ static struct {                        // 目标组：附件表 + 快照（照 P
 } g_pkg[PK_GRP];
 static uint64_t g_pk_seq;
 static int park_on(void) { return nvn_plat_flag("nvk_clear_park", 1) != 0; }
+
+// 同段互不重叠的清除可等待同一次开遍。表内按录制顺序保存，原视图由本段保活。
+enum { TEX_CLEAR_SLOTS = 8 };
+typedef struct {
+    tex_t tex;
+    nvn_gpu_view view;
+    nvn_gpu_tex image;
+    nvn_gpu_clear value;
+    uint32_t level, layer;
+    int is_int;
+} parked_tex_clear;
+static parked_tex_clear g_tex_clear[TEX_CLEAR_SLOTS];
+static nvn_gpu_cmd g_tex_clear_cmd;
+int rp_tex_clear_active;   // 表中项数，仅回放线程读写
+
+// 弱链接[replay]：nvn_gpu_cmd_keep_clear_view
+#pragma weak nvn_gpu_cmd_keep_clear_view
+// 弱链接[replay]：nvn_gpu_clear_kept_view
+#pragma weak nvn_gpu_clear_kept_view
+
+static void tex_clear_emit(nvn_gpu_cmd c, const parked_tex_clear *p) {
+    const nvn_gpu_clear *cl = &p->value;
+    nvn_gpu_clear_kept_view(c, p->view, cl->value.f, cl->value.u, p->is_int);
+}
+
+static void tex_clear_land(nvn_gpu_cmd c, unsigned mask) {
+    if (!mask || !rp_tex_clear_active || c != g_tex_clear_cmd) return;
+    int kept = 0;
+    for (int i = 0; i < rp_tex_clear_active; i++) {
+        if (mask & (1u << i)) tex_clear_emit(c, &g_tex_clear[i]);
+        else {
+            if (kept != i) g_tex_clear[kept] = g_tex_clear[i];
+            kept++;
+        }
+    }
+    rp_tex_clear_active = kept;
+}
+
+void rp_pass_land_tex_clear(nvn_gpu_cmd c) { tex_clear_land(c, ~0u); }
+
+static int tex_clear_same_texture(const tex_t *t, const tex_t *s) {
+    return t->serial == s->serial && t->mem == s->mem && t->pool == s->pool &&
+           t->off == s->off && t->L.size == s->L.size && !memcmp(&t->d, &s->d, sizeof t->d);
+}
+
+// 同一存储的部分重叠、两个池映到重叠地址和未证明的范围都走原传输。
+static int tex_clear_overlap(const tex_t *t, const tex_t *s) {
+    if (!t) return 0;
+    if (t->serial == s->serial || !t->mem || !t->L.size || !t->pool ||
+        (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) return 1;
+    uintptr_t a = (uintptr_t)t->mem, b = (uintptr_t)s->mem;
+    return a <= b ? b - a < t->L.size : a - b < s->L.size;
+}
+
+void rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park) {
+    if (!rp_tex_clear_active || c != g_tex_clear_cmd) return;
+    if (!can_park) { rp_pass_land_tex_clear(c); return; }
+    unsigned conflicts = 0;
+    for (int i = 0; i < rp_tex_clear_active; i++)
+        if (tex_clear_overlap(t, &g_tex_clear[i].tex)) conflicts |= 1u << i;
+    if (!conflicts && rp_tex_clear_active == TEX_CLEAR_SLOTS) conflicts = 1u;   // 最早项先兑现
+    tex_clear_land(c, conflicts);
+}
+
+int rp_pass_park_tex_clear(nvn_gpu_cmd c, const tex_t *t, const view_t *v, nvn_gpu_view gpu,
+                          const nvn_gpu_clear *value, int is_int) {
+    if (P.open || P.barrier_bits || rp_tex_clear_active >= TEX_CLEAR_SLOTS ||
+        (rp_tex_clear_active && c != g_tex_clear_cmd) ||
+        !nvn_gpu_cmd_keep_clear_view || !nvn_gpu_clear_kept_view) return 0;
+    nvn_gpu_tex image = nvn_gpu_view_texture(gpu);
+    if (!image || !nvn_gpu_cmd_keep_clear_view(c, gpu)) return 0;
+    unsigned conflicts = 0;
+    for (int i = 0; i < rp_tex_clear_active; i++)
+        if (image == g_tex_clear[i].image) conflicts |= 1u << i;
+    tex_clear_land(c, conflicts);
+    g_tex_clear_cmd = c;
+    g_tex_clear[rp_tex_clear_active++] = (parked_tex_clear){
+        .tex = *t, .view = gpu, .image = image, .value = *value,
+        .level = v->base_level, .layer = v->min_layer, .is_int = is_int,
+    };
+    return 1;
+}
+
+void rp_pass_tex_clear_before_tex(nvn_gpu_cmd c, const tex_t *t) {
+    if (c != g_tex_clear_cmd) return;
+    unsigned conflicts = 0;
+    for (int i = 0; i < rp_tex_clear_active; i++) {
+        const tex_t *s = &g_tex_clear[i].tex;
+        if (tex_clear_overlap(t, s) && !tex_clear_same_texture(t, s)) conflicts |= 1u << i;
+    }
+    tex_clear_land(c, conflicts);
+}
+
+void rp_pass_tex_clear_before_buf(nvn_gpu_cmd c, uint64_t addr, uint64_t len) {
+    if (!len || (c && c != g_tex_clear_cmd)) return;
+    unsigned conflicts = 0;
+    for (int i = 0; i < rp_tex_clear_active; i++) {
+        const tex_t *s = &g_tex_clear[i].tex;
+        const uint64_t base = (uintptr_t)s->mem;
+        if (addr <= base ? base - addr < len : addr - base < s->L.size) conflicts |= 1u << i;
+    }
+    tex_clear_land(g_tex_clear_cmd, conflicts);
+}
 
 // 槽的子资源身份：贴图序号 + 级 + 层
 static void slot_id(const tex_t *t, int has_v, const view_t *v, uint64_t *ser, uint32_t *lv, uint32_t *ly) {
@@ -462,6 +561,16 @@ static void park_land_alias_targets(nvn_gpu_cmd c, const p_set_rt *next) {
 
 void rp_pass_land_reads(nvn_gpu_cmd c, const rp_pass_read *reads, int n) {
     if (!c || n <= 0) return;
+    if (rp_tex_clear_active) {
+        unsigned conflicts = 0;
+        for (int i = 0; i < n; i++) {
+            // 整池快照可能含按不同描述建立的别名，后端贴图身份不足以排除。
+            if (reads[i].pool) { conflicts = ~0u; break; }
+            for (int j = 0; j < rp_tex_clear_active; j++)
+                if (reads[i].tex == g_tex_clear[j].image) conflicts |= 1u << j;
+        }
+        tex_clear_land(c, conflicts);
+    }
     unsigned groups = 0;
     for (int e = 0; e < PK_ENT; e++) {
         if (!g_pk[e].used) continue;
@@ -492,8 +601,12 @@ void rp_pass_end(nvn_gpu_cmd c) { (void)pass_end_checked(c); }
 // 开通道（已开着直接回 1）。0 = 开不了（已记账）：调用方跳过这笔绘制。
 static uint64_t pb_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 #define PB(step) do { if (tm_) { uint64_t n_ = pb_now(); rp_perf_add(step, n_ - pb_); pb_ = n_; } } while (0)
-// 绘制前调（rp_draw 在 rp_pass_begin 之前）：把这一笔要求的像素区域交给下一步开通道；通道已经开着而这一笔超出当前区域，
-// 收通道并按并集重开（重开用 LOAD：上一遍只保存过它自己的区域，区域外内容本来就是原样；带清除负载的通道区域必是整张，走不到这里）。
+static int pass_area_contains(int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    return x >= P.ax && y >= P.ay && (int64_t)x + w <= (int64_t)P.ax + P.aw &&
+           (int64_t)y + h <= (int64_t)P.ay + P.ah;
+}
+// 局部遍只续接已知落在区域内的命令。扩大或失去范围证明时整面 LOAD 重开，
+// 既保留已经画出的内容，也限制同一遍因连续扩大剪裁而反复重开。
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     if (P.open && P.sw_split) { rp_perf_add(RP_PERF_P_CUT_BAR, 1); rp_pass_end(c); }   // 通道里的着色器写之后游戏发过屏障：这一笔另开通道（见 rp_pass_barrier）
     uint8_t wanted = 0;
@@ -509,17 +622,13 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
         uint32_t w = 0, h = 0;
         if (noatt_extent(&w, &h) && (w > P.na_w || h > P.na_h)) rp_pass_end(c);
     }
-    if (!nvn_plat_flag("nvk_pass_area", 0)) return;
-    int32_t x, y; uint32_t w, h;
-    if (!pass_area(&x, &y, &w, &h)) return;               // 没有裁剪矩形：整张，不缩
-    if (!P.open) { P.area_want = 1; P.wx = x; P.wy = y; P.ww = w; P.wh = h; return; }
-    if (!P.area_on) return;                                // 当前通道本来就是整张：这一笔一定在里面
-    if (x >= P.ax && y >= P.ay && (int64_t)x + w <= (int64_t)P.ax + P.aw && (int64_t)y + h <= (int64_t)P.ay + P.ah) return;
-    int32_t nx = x < P.ax ? x : P.ax, ny = y < P.ay ? y : P.ay;
-    int32_t nx1 = ((int32_t)x + (int32_t)w) > ((int32_t)P.ax + (int32_t)P.aw) ? (int32_t)x + (int32_t)w : (int32_t)P.ax + (int32_t)P.aw;
-    int32_t ny1 = ((int32_t)y + (int32_t)h) > ((int32_t)P.ay + (int32_t)P.ah) ? (int32_t)y + (int32_t)h : (int32_t)P.ay + (int32_t)P.ah;
-    rp_pass_end(c);
-    P.area_want = 1; P.wx = nx; P.wy = ny; P.ww = (uint32_t)(nx1 - nx); P.wh = (uint32_t)(ny1 - ny);
+    p_scissor sc;
+    const int known = nvn_plat_flag("nvk_pass_area", 0) && !rp_occl_want() && pass_area(&sc);
+    if (P.open) {
+        if (P.area_on && (!known || !pass_area_contains(sc.x, sc.y, (uint32_t)sc.w, (uint32_t)sc.h))) rp_pass_end(c);
+        return;
+    }
+    if (known) { P.area_want = 1; P.wx = sc.x; P.wy = sc.y; P.ww = (uint32_t)sc.w; P.wh = (uint32_t)sc.h; }
 }
 // 大附件的整张清除不能折进较小公共区域：先用原视图单独清整张，再让公共通道 LOAD。
 // 不经 pass_begin_colors 递归，不换逻辑目标；影子附件沿用本次视图，最终由 rp_pass_end 拷回。
@@ -561,6 +670,20 @@ static int trim_clear_attachment(const tex_t *t, const view_t *view, const tex_t
     return 1;
 }
 
+static int area_attachment_safe(const tex_t *t, const tex_t *const *others, int count) {
+    if (!t->serial || !t->mem || !t->L.size || t->d.target != NVN_TEXTURE_TARGET_2D ||
+        t->d.depth != 1 || t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) ||
+        !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    const uintptr_t address = (uintptr_t)t->mem;
+    for (int i = 0; i < count; i++) {
+        const tex_t *p = others[i];
+        const uintptr_t other = (uintptr_t)p->mem;
+        if (p->serial == t->serial ||
+            (address <= other ? other - address < t->L.size : address - other < p->L.size)) return 0;
+    }
+    return 1;
+}
+
 static int trim_park_clear(nvn_gpu_pass_desc *d, const uint32_t cw[8], const uint32_t ch[8], uint32_t dw, uint32_t dh) {
     if (d->layers != 1 || d->occlusion) return 0;
     const tex_t *seen[9];
@@ -589,7 +712,53 @@ static int trim_park_clear(nvn_gpu_pass_desc *d, const uint32_t cw[8], const uin
     return 1;
 }
 
+static int pass_area_safe(const nvn_gpu_pass_desc *d, const uint32_t cw[8], const uint32_t ch[8],
+                          uint32_t dw, uint32_t dh) {
+    if (d->layers != 1 || d->occlusion) return 0;
+    const tex_t *seen[8];
+    int count = 0;
+    for (uint32_t i = 0; i < d->ncolor; i++) {
+        if (!d->color[i].view) continue;
+        if (d->color[i].load != NVN_GPU_LOAD_LOAD || d->color[i].store != NVN_GPU_STORE_STORE ||
+            g_shu[i].base || cw[i] != d->w || ch[i] != d->h ||
+            !area_attachment_safe(P.rt.color[i], seen, count)) return 0;
+        seen[count++] = P.rt.color[i];
+    }
+    if (d->depth.view || d->stencil.view) {
+        return dw == d->w && dh == d->h && area_attachment_safe(P.rt.depth, seen, count) &&
+            (!d->depth.view || (d->depth.load == NVN_GPU_LOAD_LOAD && d->depth.store == NVN_GPU_STORE_STORE)) &&
+            (!d->stencil.view || (d->stencil.load == NVN_GPU_LOAD_LOAD && d->stencil.store == NVN_GPU_STORE_STORE));
+    }
+    return count != 0;
+}
+
+static int tex_clear_slot(const parked_tex_clear *p, const nvn_gpu_pass_desc *d, int layered) {
+    if (layered || d->layers != 1 || d->occlusion ||
+        d->w != p->value.w || d->h != p->value.h ||
+        tex_clear_overlap(P.rt.depth, &p->tex)) return -1;
+    int found = -1;
+    for (uint32_t i = 0; i < d->ncolor; i++) {
+        if (!d->color[i].view) continue;
+        const tex_t *t = P.rt.color[i];
+        const nvn_gpu_tex image = nvn_gpu_view_texture(d->color[i].view);
+        if (!tex_clear_overlap(t, &p->tex) && image != p->image) continue;
+        const int hv = P.rt.has_cview[i];
+        const view_t *v = &P.rt.cview[i];
+        const uint32_t level = hv && v->set_levels ? v->base_level : 0;
+        const uint32_t layer = hv && v->set_layers ? v->min_layer : 0;
+        if (found >= 0 || !tex_clear_same_texture(t, &p->tex) || d->color[i].load != NVN_GPU_LOAD_LOAD ||
+            g_shu[i].base || image != p->image ||
+            level != p->level || layer != p->layer ||
+            (hv && (v->set_swizzle || (v->set_format && v->format != (uint32_t)t->d.format) ||
+                    (v->set_target && v->target != t->d.target)))) return -1;
+        found = (int)i;
+    }
+    return found;
+}
+
 static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int clear_only) {
+    const int area_want = P.area_want;
+    P.area_want = 0;   // 只给下一次开遍，解析附件失败也不能遗留给独立清除。
     colors = select_colors(colors);
     layered = layered != 0;
     if (P.open && P.colors == colors && P.layered == layered) return 1;
@@ -626,6 +795,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         if (!(P.colors >> i & 1)) continue;   // 零写掩码 / 去重后的空槽，不能进入帧缓冲或被记成 GPU 写过
         uint32_t sbytes = 0; const char *why = NULL; int kind = slot_kind(i, &sbytes, &why);
         if (kind < 0) { nvn_unimpl("pass", why, t); continue; }   // 深度 / 块压缩格式的图挂在颜色槽、又走不了影子：当空槽（画到这个槽的内容丢掉）
+        if (kind && rp_tex_clear_active) rp_pass_land_tex_clear(c);
         int pk = park_color(i);   // 这个槽挂着待折清除：载入时清成挂起值
         view_t av;
         uint64_t sh0_ = kind ? pb_now() : 0;
@@ -676,6 +846,30 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         if (d.color[i].view && rp_tex_take_zero(P.rt.color[i]) && d.color[i].load != NVN_GPU_LOAD_CLEAR) { d.color[i].load = NVN_GPU_LOAD_CLEAR; memset(&d.color[i].clear, 0, sizeof d.color[i].clear); }
     const int diag_load = nvn_plat_flag("nvk_diag_load_dontcare", 0);
     const int diag_store = nvn_plat_flag("nvk_diag_store_dontcare", 0);
+    // 先按原有载存选区域。局部遍外的像素也要被整图清掉，所以局部遍前用传输兑现整图清除。
+    if (!clear_only && area_want && !diag_load && !diag_store &&
+        (uint32_t)P.wx < d.w && (uint32_t)P.wy < d.h && pass_area_safe(&d, cw, ch, dw, dh)) {
+        const uint32_t w = P.ww < d.w - (uint32_t)P.wx ? P.ww : d.w - (uint32_t)P.wx;
+        const uint32_t h = P.wh < d.h - (uint32_t)P.wy ? P.wh : d.h - (uint32_t)P.wy;
+        if (P.wx || P.wy || w != d.w || h != d.h) {
+            d.area_x = P.wx; d.area_y = P.wy; d.area_w = w; d.area_h = h;
+        }
+    }
+    unsigned folded_tex = 0;
+    if (rp_tex_clear_active) {
+        // 纯清除遍可能裁掉附件。在开遍前兑现所有无法折叠的清除，并清空表。
+        const int fold = !clear_only && !diag_load && !diag_store && !d.area_w;
+        for (int i = 0; i < rp_tex_clear_active; i++) {
+            const parked_tex_clear *p = &g_tex_clear[i];
+            const int slot = fold ? tex_clear_slot(p, &d, layered) : -1;
+            if (slot < 0) { tex_clear_emit(c, p); continue; }
+            d.color[slot].load = NVN_GPU_LOAD_CLEAR;
+            memcpy(&d.color[slot].clear, &p->value.value, sizeof d.color[slot].clear);
+            folded_tex |= 1u << slot;
+            color_loads--;
+        }
+        rp_tex_clear_active = 0;
+    }
     const int trimmed = clear_only && !diag_load && !diag_store &&
         nvn_plat_flag("nvk_clear_only_attachments", 0) && trim_park_clear(&d, cw, ch, dw, dh);
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0; P.sw_pend = P.sw_split = 0;
@@ -697,30 +891,13 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         if (d.depth.view) d.depth.store = NVN_GPU_STORE_DONTCARE;
         if (d.stencil.view) d.stencil.store = NVN_GPU_STORE_DONTCARE;
     }
-    // 渲染区域（开关 debug.s2a.nvk_pass_area）：本遍有清除负载（清除要覆盖整张附件）时不缩；否则用 rp_pass_prepare_draw 给的区域，
-    // 没有就给整张。后端按它设 renderArea：附件只在区域内载入 / 保存，区域外保持原内容。
-    P.area_on = 0;
-    if (nvn_plat_flag("nvk_pass_area", 0) && P.area_want) {
-        int any_clear = 0;
-        for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        if (d.depth.view && d.depth.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        if (d.stencil.view && d.stencil.load == NVN_GPU_LOAD_CLEAR) any_clear = 1;
-        int32_t x = P.wx, y = P.wy; uint32_t w = P.ww, h = P.wh;
-        if (!any_clear && w && h) {
-            if (x < 0) { w = (uint32_t)((int32_t)w + x); x = 0; }
-            if (y < 0) { h = (uint32_t)((int32_t)h + y); y = 0; }
-            if ((uint32_t)x < d.w && (uint32_t)y < d.h) {
-                if ((uint32_t)x + w > d.w) w = d.w - (uint32_t)x;
-                if ((uint32_t)y + h > d.h) h = d.h - (uint32_t)y;
-                if (w && h && !(x == 0 && y == 0 && w == d.w && h == d.h)) {
-                    d.area_x = x; d.area_y = y; d.area_w = w; d.area_h = h;
-                    P.ax = x; P.ay = y; P.aw = w; P.ah = h; P.area_on = 1;
-                    rp_perf_add(RP_PERF_P_AREA, 1); rp_perf_add(RP_PERF_P_AREA_KPIX, (uint64_t)w * h / 1000);
-                }
-            }
-        }
+    P.area_on = d.area_w != 0;
+    if (P.area_on) {
+        P.ax = d.area_x; P.ay = d.area_y;
+        P.aw = d.area_w; P.ah = d.area_h;
+        rp_perf_add(RP_PERF_P_AREA, 1);
+        rp_perf_add(RP_PERF_P_AREA_KPIX, (uint64_t)d.area_w * d.area_h / 1000);
     }
-    P.area_want = 0;
     P.pass_w = d.w; P.pass_h = d.h;
     nvn_gpu_pass_begin(c, &d);
     // 大附件已单独落地；剩下的 CLEAR 尺寸等于公共范围，开通道后才可标 fresh。
@@ -728,7 +905,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         uint64_t ff = rp_frame();
         if (!P.area_on) {
             for (uint32_t i = 0; i < d.ncolor && i < 8; i++)
-                if (d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR && P.rt.color[i])
+                if (!(folded_tex & (1u << i)) && d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR && P.rt.color[i])
                     s2a_fu_rt_mark_fresh(P.rt.color[i]->serial, ff);
             if (d.depth.view && d.depth.load == NVN_GPU_LOAD_CLEAR && P.rt.depth) s2a_fu_rt_mark_fresh(P.rt.depth->serial, ff);
             if (d.stencil.view && d.stencil.load == NVN_GPU_LOAD_CLEAR && P.rt.depth) s2a_fu_rt_mark_fresh(P.rt.depth->serial, ff);
@@ -772,6 +949,7 @@ void rp_pass_want_layered(nvn_gpu_cmd c, int layered) {
 // 结束当前通道；还挂着的待折清除各自落地（一组目标开一个只做清除的通道）
 void rp_pass_flush(nvn_gpu_cmd c) {
     rp_pass_end(c);              // 先收当前通道：落地要另开通道
+    if (rp_tex_clear_active) rp_pass_land_tex_clear(c);
     if (c) park_land_all(c);     // 挂起到这里还没被任何通道吃掉的：提交收尾落地（同旧行为的一次落地，只是可能多组一起）
     else park_drop_all();        // 没有段：清除无处落，丢弃（提交已按失败处理）
 }
@@ -787,6 +965,19 @@ static int rt_shader_same(const p_set_rt *a, const p_set_rt *b) {
     return 1;
 }
 void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
+    if (rp_tex_clear_active) {
+        unsigned conflicts = 0;
+        for (int i = 0; i < rp_tex_clear_active; i++) {
+            const tex_t *s = &g_tex_clear[i].tex;
+            int alias = tex_clear_overlap(r->depth, s);
+            for (int j = 0; j < r->n && j < 8 && !alias; j++) {
+                const tex_t *t = r->color[j];
+                alias = tex_clear_overlap(t, s) && !tex_clear_same_texture(t, s);
+            }
+            if (alias) conflicts |= 1u << i;
+        }
+        tex_clear_land(c, conflicts);
+    }
     if (!P.has_rt || !rt_shader_same(&P.rt, r)) rp_pso_dirty = 1;
     // 同目标续接（对齐 nvn_mtl.m:15060 的 g_enc && g_enc_mode != 1 && !pend && R.has_rt && rt_same → 只换逻辑目标）：
     // 通道开着、没有待折清除、这组目标与当前的一致 → 只更新目标快照，不结束 / 不重开通道。游戏常在一帧里反复重设同一组目标
@@ -811,7 +1002,11 @@ void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
           // 换到共用底图的另一个序号：先用旧附件视图兑现清除。否则 A→B→A 的最后一次清色可能被 B 的旧组盖掉；
           // 直接把旧清色折进 B 的通道，也可能按 B 的其它视图格式换算。
           park_land_alias_targets(c, r);
-      } else rp_pass_flush(c);
+      } else {
+          rp_pass_end(c);
+          if (c) park_land_all(c);
+          else park_drop_all();
+      }
       struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1); uint64_t s1 = (uint64_t)ts1.tv_sec * 1000000000ull + (uint64_t)ts1.tv_nsec;
       rp_perf_add(RP_PERF_SETRT_END_NS, s1 - s0); }
     P.rt = *r; P.has_rt = 1;
@@ -839,6 +1034,15 @@ static void clear_remainder_failed(const char *why, const nvn_gpu_clear *cl) {
     }
 }
 static void pass_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *cl) {
+    if (P.area_on && !pass_area_contains(cl->x, cl->y, cl->w, cl->h)) {
+        const uint8_t colors = P.colors;
+        const int layered = P.layered;
+        rp_pass_end(c);
+        if (!pass_begin_colors(c, colors, layered, 0)) {
+            clear_remainder_failed("clear_rect_reopen_failed", cl);
+            return;
+        }
+    }
     int64_t x0 = cl->x, y0 = cl->y, x1 = x0 + cl->w, y1 = y0 + cl->h;
     int64_t ax = P.area_on ? P.ax : 0, ay = P.area_on ? P.ay : 0;
     int64_t ax1 = ax + (P.area_on ? P.aw : P.pass_w), ay1 = ay + (P.area_on ? P.ah : P.pass_h);
@@ -939,11 +1143,12 @@ uint32_t rp_pass_take_barrier(void) { uint32_t b = P.barrier_bits; P.barrier_bit
 
 // 现在挂着几条待折清除。绘制路径拿它做快路的门：0 时不必为「读之前落地」收集这一笔的贴图（稳态下几乎总是 0）。
 int rp_pass_parked(void) {
-    if (!park_on()) return 0;
-    int n = 0; for (int e = 0; e < PK_ENT; e++) if (g_pk[e].used) n++;
+    int n = rp_tex_clear_active;
+    if (park_on()) for (int e = 0; e < PK_ENT; e++) if (g_pk[e].used) n++;
     return n;
 }
 void rp_pass_reset(void) {
+    rp_tex_clear_active = 0;
     memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all();
     P.want_colors = 0xff;
     for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }

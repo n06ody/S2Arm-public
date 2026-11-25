@@ -22,7 +22,7 @@ mutations = [
      'g_fb[1][0].u.b.off == g[k].want_off && g_fb[1][0].u.b.len == g[k].want_len'),
     ('统一缓冲来源（UBOP）长度 0 也补池剩余长度', [('    if (sb->size || !sbufp) return sb->size;', '    if (sb->size) return sb->size;')],
      'nvn_unimpl_count("draw", "storage_buffer_unbound") == ub0 + 1'),
-    ('可写长度 0 的回写仍按槽里的 0 登记', [('rp_post_gpu_write(sb->addr, reach < blen ? reach : blen); }', 'rp_post_gpu_write(sb->addr, reach < sb->size ? reach : sb->size); }')],
+    ('可写长度 0 的回写仍按槽里的 0 登记', [('rp_post_gpu_write_from(sb->addr, reach < blen ? reach : blen, source); }', 'rp_post_gpu_write_from(sb->addr, reach < sb->size ? reach : sb->size, source); }')],
      'g_pmem[4 * PG] == 0x5a'),
     ('统一缓冲当存储（UBOP）也走空缓冲', [('if (sb && e->src_kind == NVN_RB_SBUFP && sb_unmapped(sb)) {', 'if (sb && sb_unmapped(sb)) {')],
      'nvn_unimpl_count("draw", "storage_buffer_unbound") == unbound + 1'),
