@@ -20,14 +20,18 @@
 extern uint64_t nvn_vk_dbg_dq_recs(void);
 static nvn_gpu_err err;
 static unsigned failures, cases;
-static int dq_mode;
+static int dq_mode, noatt_mode = -1;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"assertion failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){return !strcmp(n,"nvk_dq")?dq_mode:d;}
+int nvn_plat_flag(const char *n,int d){
+    if(!strcmp(n,"nvk_dq"))return dq_mode;
+    if(noatt_mode>=0 && !strcmp(n,"nvk_noatt"))return noatt_mode;
+    return d;
+}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 void rp_buf_reset(void);
@@ -114,6 +118,55 @@ static void draw_mask(uint32_t mask) {
 static unsigned attached(unsigned p) {
     REQUIRE(p<npass);unsigned mask=0;for(unsigned i=0;i<8;i++)if(passes[p].color[i].view)mask|=1u<<i;return mask;
 }
+// Same fullscreen draw and SSBO in both arms, with no guest render targets.
+static void run_noatt(struct s2a_vk_device *device,const char *dir,int mode) {
+    enum {W=32,H=24};
+    noatt_mode=mode;
+    nvn_gpu_open_desc od={0};od.host_device=device;od.app_label="replay-no-attachment";
+    GPU(nvn_gpu_open(&od,&err));
+    nvn_gpu_caps caps;nvn_gpu_caps_get(&caps);
+    REQUIRE(caps.atomic_stages & (1u<<NVN_GPU_SH_FS));
+
+    rp_pass_reset();rp_draw_reset();rp_state_reset();nvn_unimpl_reset();
+    memset(guest,0,sizeof guest);memset(&prog,0,sizeof prog);write_id=0;
+    nvn_gpu_layout_ent *e=&prog.ent[1][0];
+    e->cls=NVN_GPU_RES_SSBO;e->src_kind=NVN_RB_SBUFP;e->count=1;
+    e->access=NVN_GPU_ACC_RW;e->stages=1u<<NVN_GPU_SH_FS;prog.nent[1]=1;
+    nvn_gpu_layout layout={.ent=e,.nent=1};
+    prog.sh[0]=shader(dir,"depth_state.vert",NVN_GPU_SH_VS,NULL);
+    prog.sh[1]=shader(dir,"no_attachment_side_effect.frag",NVN_GPU_SH_FS,&layout);
+
+    completed=0;GPU(nvn_gpu_cmd_begin(NULL,&active,&err));serial++;
+    npass=0;unsigned before=emitted;
+    p_set_rt target={0};rp_pass_set_rt(active,&target);
+    rp_S.poly.mode=NVN_POLYGON_MODE_FILL;rp_S.color.logic_op=NVN_LOGIC_OP_COPY;
+    rp_S.has_vp=1;rp_S.vp[0][2]=W;rp_S.vp[0][3]=H;rp_S.vp[0][5]=1.0f;
+    rp_S.ssbo[NVN_GPU_SH_FS][0]=(p_bind_buf){.addr=(uint64_t)(uintptr_t)guest,.size=16};
+    nvn_gpu_buf mirror=NULL;uint64_t mirror_off=0;
+    REQUIRE(rp_buf_resolve(active,(uint64_t)(uintptr_t)guest,16,&mirror,&mirror_off));
+
+    draw_mask(0);rp_pass_flush(active);
+    GPU(nvn_gpu_cmd_commit(active,1,done,NULL,&err));
+    GPU(nvn_gpu_fence_wait(1,5000000000ull,&err));completed=1;
+    uint32_t fragments=0;memcpy(&fragments,(const uint8_t*)nvn_gpu_buf_cpu(mirror)+mirror_off,4);
+    uint64_t skipped=nvn_unimpl_count("pass","no_attachment");
+    printf("no-attachment dq=%d mode=%d draws=%u passes=%u fragments=%u skipped=%llu\n",
+           dq_mode,mode,emitted-before,npass,fragments,(unsigned long long)skipped);
+    fflush(stdout);
+    REQUIRE(fragments==(mode?W*H:0));
+    REQUIRE(emitted-before==(unsigned)mode && npass==(unsigned)mode);
+    REQUIRE(skipped==(uint64_t)!mode && nvn_unimpl_count("draw","pass_begin_failed")==skipped);
+    REQUIRE(!!(caps.caps & NVN_GPU_CAP_NO_ATTACH_PASS)==mode);
+    if(mode){
+        REQUIRE(!attached(0) && !passes[0].depth.view && !passes[0].stencil.view);
+        REQUIRE(passes[0].w==W && passes[0].h==H && write_id);
+        rp_buf_gpu_write_land(write_key,write_id,0);write_id=0;
+    }
+    rp_pass_reset();rp_draw_reset();rp_buf_reset();
+    nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);
+    GPU(nvn_gpu_close(5000000000ull,&err));
+    noatt_mode=-1;
+}
 static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
     enum {W=64,H=36,BYTES=W*H*4};
     nvn_gpu_open_desc od={0};od.host_device=device;od.app_label="replay-zero-mask";GPU(nvn_gpu_open(&od,&err));
@@ -190,13 +243,19 @@ static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
     nvn_gpu_buf_release(readback,NULL,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
 int main(int argc,char **argv) {
-    if(argc!=3)return 2;
+    const int noatt=argc==4 && !strcmp(argv[3],"no-attachment");
+    if(argc!=3 && !noatt)return 2;
     dq_mode=atoi(argv[2]);REQUIRE(dq_mode==0||dq_mode==1);
     struct s2a_vk_device device;char why[256];
     if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
-    for(int c=0;c<7;c++)run_case(&device,argv[1],c);
+    if(noatt){
+        run_noatt(&device,argv[1],0);
+        run_noatt(&device,argv[1],1);
+    }else{
+        for(int c=0;c<7;c++)run_case(&device,argv[1],c);
+    }
     uint64_t records=nvn_vk_dbg_dq_recs();REQUIRE(dq_mode?records>0:records==0);
     REQUIRE(!s2a_vk_device_destroy(&device,1));
-    printf("zero-mask cases=%u pixel-failures=%u dq-records=%llu\n",cases,failures,(unsigned long long)records);
+    if(!noatt)printf("zero-mask cases=%u pixel-failures=%u dq-records=%llu\n",cases,failures,(unsigned long long)records);
     return failures?1:0;
 }

@@ -231,7 +231,22 @@ static const view_t *att_view_n(const tex_t *t, int has_v, const view_t *v, view
     tmp->set_target = 1; tmp->target = NVN_TEXTURE_TARGET_2D_ARRAY;
     return tmp;
 }
-void rp_pass_note_draw(int note) { P.ndraw++; if (note & RP_NOTE_DS) P.ds_used = 1; if (note & RP_NOTE_SHADER_WRITE) P.sw_pend = 1; }
+// #697 诊断：记录已经交给后端的笔。成功执行须结合该提交的完成状态判断。
+static uint64_t g_noatt_draws;
+void rp_pass_note_draw(int note) {
+    P.ndraw++;
+    if (note & RP_NOTE_DS) P.ds_used = 1;
+    if (note & RP_NOTE_SHADER_WRITE) P.sw_pend = 1;
+    if (P.na_w && nvn_plat_flag("nvk_noatt", 0) == 1 && ++g_noatt_draws <= 64) {
+        unsigned targets = 0;
+        for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) targets |= 1u << i;
+        char line[200];
+        snprintf(line, sizeof line, "noatt: draw=%llu frame=%llu source=%s size=%ux%u color_slots=%d original_targets=0x%x shader_write=%d",
+                 (unsigned long long)g_noatt_draws, (unsigned long long)rp_frame(),
+                 targets ? "slots_dropped" : "rt_none", P.na_w, P.na_h, P.rt.n, targets, !!(note & RP_NOTE_SHADER_WRITE));
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "pass", line);
+    }
+}
 void rp_pass_slot_size(int i, uint32_t *w, uint32_t *h) { level_size(P.rt.color[i], &P.rt.cview[i], P.rt.has_cview[i], w, h); }
 void rp_pass_noatt_size(uint32_t *w, uint32_t *h) { if (P.na_w && P.na_h) { *w = P.na_w; *h = P.na_h; } }
 
@@ -971,6 +986,12 @@ int rp_pass_parked(void) {
     return n;
 }
 void rp_pass_reset(void) {
+    if (g_noatt_draws) {
+        char line[96];
+        snprintf(line, sizeof line, "noatt: summary recorded_draws=%llu", (unsigned long long)g_noatt_draws);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "pass", line);
+        g_noatt_draws = 0;
+    }
     memset(&P, 0, sizeof P); memset(g_shu, 0, sizeof g_shu); park_drop_all();
     P.want_colors = 0xff;
     for (int i = 0; i < 8; i++) { if (g_sh[i].v) nvn_gpu_view_release(g_sh[i].v); if (g_sh[i].g) nvn_gpu_tex_release(g_sh[i].g); }

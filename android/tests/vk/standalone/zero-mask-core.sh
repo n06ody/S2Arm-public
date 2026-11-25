@@ -11,7 +11,7 @@ mkdir -p "$out/shaders"
 : "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
 glslc=${GLSLC:-glslc}
-for shader in zero_mask_mrt.frag zero_mask_side_effect.frag; do
+for shader in zero_mask_mrt.frag zero_mask_side_effect.frag no_attachment_side_effect.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
 "$glslc" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/depth_state.vert.spv"
@@ -32,5 +32,19 @@ for dq in 0 1; do
     if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$out/dq$dq.log" ||
        ! grep -q 'zero-mask cases=7 pixel-failures=0' "$out/dq$dq.log"; then
         echo "【红】zero-mask DQ=$dq rc=$rc or validation failure" >&2; exit 1
+    fi
+    # Keep the no-output shader on its own run. The existing MRT fixture deliberately
+    # leaves declared outputs unbound and can produce unused-output warnings.
+    log="$out/no-attachment-dq$dq.log"
+    set +e
+    timeout 120 "$out/test" "$out/shaders" "$dq" no-attachment 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation (Error|Warning)|VUID-|SYNC-HAZARD' "$log" ||
+       ! grep -qx "no-attachment dq=$dq mode=0 draws=0 passes=0 fragments=0 skipped=1" "$log" ||
+       ! grep -qx "no-attachment dq=$dq mode=1 draws=1 passes=1 fragments=768 skipped=0" "$log" ||
+       ! grep -q 'noatt: requested=1 enabled=1' "$log" ||
+       ! grep -q 'noatt: summary recorded_draws=1$' "$log"; then
+        echo "【红】no-attachment DQ=$dq rc=$rc or validation failure" >&2; exit 1
     fi
 done
