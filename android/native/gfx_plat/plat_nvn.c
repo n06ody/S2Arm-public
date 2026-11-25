@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <errno.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/system_properties.h>
@@ -20,7 +23,20 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     __android_log_print(prio, "S2Arm", "%snvk %s: %s", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "");
     // 调试入口开着时同一行也写进本局的宿主日志文件（标准错误已接到 host-*.log）。系统日志在真机上会整段丢掉某个进程的行
     // （一晚上遇到五次「游戏在跑、logcat 里这个进程 0 行」，宿主日志文件完好），读数不能只押在它上面。
-    if (s2a_debug_entries_open()) fprintf(stderr, "[s2a] %snvk %s: %s\n", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "");
+    if (s2a_debug_entries_open()) {
+        // 托管层也往同一个 fd 写。stdio 能把一条长行分段；让头、正文和换行共用一次追加。
+        const char *prefix = level == NVN_PLAT_LOG_RED ? "[s2a] 【红】nvk " : "[s2a] nvk ";
+        struct iovec parts[] = {
+            {(void *)prefix, strlen(prefix)}, {(void *)cls, cls ? strlen(cls) : 0},
+            {(void *)": ", 2}, {(void *)text, text ? strlen(text) : 0}, {(void *)"\n", 1}
+        };
+        ssize_t n;
+        do {
+            n = writev(STDERR_FILENO, parts, 5);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0 || (size_t)n != parts[0].iov_len + parts[1].iov_len + parts[3].iov_len + 3)
+            __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "nvk: 宿主日志行写入不完整");
+    }
 }
 
 #if defined(S2A_ANDROID_DEBUG_ENV) && defined(__ANDROID__)   // 与 debug_gate.h 的第一道门同一个条件：玩家包里 s2a_debug_entries_open() 编译期恒假，下面整段不存在
@@ -33,7 +49,7 @@ static int plat_flag_read(const char *name, int *val, void *user) {
     char key[PROP_NAME_MAX + 32], v[PROP_VALUE_MAX] = {0};
     snprintf(key, sizeof key, "debug.s2a.%s", name);
     if (__system_property_get(key, v) <= 0 || !v[0]) return 0;
-    *val = atoi(v);
+    *val = fc_value(name, v);
     return 1;
 }
 int nvn_plat_flag(const char *name, int dflt) {

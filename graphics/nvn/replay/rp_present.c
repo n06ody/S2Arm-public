@@ -173,6 +173,8 @@ void rp_pool_stats_end(void) {
 // 逐帧帧日志（android/native/nvn/nvn_vk_frame_log.c，debug.s2a.frame_log，缺省关；#1501 D①）：成功上屏记一条，带取图 / 交上屏的 CPU 耗时。
 //   原先只有旧层（mtl_vk_shim.c）在上屏点调，新回放层这里不调，nvk 直连下帧日志整份是空的。
 //   弱引用：回放核心宿主单测与鸿蒙不链帧日志，地址为空就不调；开关关着时函数里只判一次缓存标志。
+// 弱链接[replay]：nvn_gpu_land_auto_present
+void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present, uint64_t draws, int target, double period_s) __attribute__((weak));
 // 弱链接[replay]：s2a_frame_log_present_timed
 void s2a_frame_log_present_timed(uint64_t acquire_ns, uint64_t present_ns) __attribute__((weak));
 // ADPF 帧负载上报（android/native/adpf_hint.c；原先只接在旧层 mtl_vk_shim.c，缺省的新回放层构建不编它，CPU 调度器一直拿不到帧负载）：
@@ -201,7 +203,6 @@ uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     return ticket;
 }
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]) {
-    (void)period_s;
     rp_pool_stats_frame();   // 池统计（开关 pool_stats；关着每帧只读一次开关，回放与池查找路径不动）
     rp_tm_frame_end();   // 一帧结束：刚结束的是采样帧就记一帧，再定下一帧要不要逐步计时（分时抽样，#1103）
     pthread_mutex_lock(&g_pmu);
@@ -270,6 +271,10 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
         }
         {   // 分时读数：每 5 秒一行（帧率低的时候「每 600 帧」等不到）
             static uint64_t t_last, n_last, d_last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            if (nvn_gpu_land_auto_present) {
+                nvn_gpu_land_auto_present(now, acquire_ns, present_ns, rp_present_draw_count(),
+                                          atomic_load_explicit(&g_tgt_itv, memory_order_relaxed), period_s);
+            }
             if (!t_last) t_last = now;
             { const uint64_t cpu = tc_thread_cpu_ns(); if (cpu) rp_present_tc_note(now, cpu); }
             fseg_frame(&g_fseg, now, atomic_load_explicit(&g_tgt_itv, memory_order_relaxed), atomic_load_explicit(&g_tgt_set_ns, memory_order_relaxed));

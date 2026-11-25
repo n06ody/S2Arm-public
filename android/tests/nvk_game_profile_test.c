@@ -5,6 +5,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include "debug_gate.h"
+static bool host_log;
+#define s2a_debug_entries_open() host_log
 #ifndef PROFILE_SOURCE
 #define PROFILE_SOURCE "../native/gfx_plat/plat_nvn.c"
 #endif
@@ -16,6 +21,7 @@ char *profile_strdup(const char *s) { return getenv("PROFILE_FAIL_ROOT") ? NULL 
 static int logs;
 int __android_log_print(int priority, const char *tag, const char *format, ...) {
     (void)priority; (void)tag;
+    if (host_log) return 0;  // logcat and the host file are separate sinks.
     va_list ap; va_start(ap, format); vfprintf(stderr, format, ap); va_end(ap);
     fputc('\n', stderr); logs++; return 0;
 }
@@ -24,6 +30,19 @@ const char *nvk_session_cache_dir(void) { return NULL; }
 static void *read_profile(void *unused) { (void)unused; return (void *)s2a_nvn_prof(); }
 int main(int argc, char **argv) {
     assert(argc == 3);
+    if (!strcmp(argv[2], "host-log")) {
+        // A C stream may split long lines. The owner writes to fd 2 independently
+        // of stdio, so a FILE lock cannot keep those pieces together.
+        static char buffer[1024], payload[2001];
+        assert(setvbuf(stderr, buffer, _IOFBF, sizeof buffer) == 0);
+        memset(payload, 'x', sizeof payload - 1);
+        host_log = true;
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "land-readback", payload);
+        static const char owner[] = "[s2a] direct owner loop exited: stopped\n";
+        assert(write(STDERR_FILENO, owner, sizeof owner - 1) == (ssize_t)sizeof owner - 1);
+        assert(fflush(stderr) == 0);
+        return 0;
+    }
     if (strcmp(argv[1], "unset")) setenv("S2A_SHADER_REVISION_ROOT", argv[1], 1);
     else unsetenv("S2A_SHADER_REVISION_ROOT");
     if (!strcmp(argv[2], "oom")) setenv("PROFILE_FAIL_ROOT", "1", 1);

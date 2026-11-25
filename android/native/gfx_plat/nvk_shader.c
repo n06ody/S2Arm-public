@@ -1787,6 +1787,8 @@ static int live_worker(void *ctx, uint64_t session, uint64_t generation, const c
 }
 
 enum live_status { LIVE_OK, LIVE_REJECTED, LIVE_PENDING, LIVE_ABORT };
+uint64_t nvk_shader_live_compile_total(void) { return atomic_load_explicit(&g_n_compiled,memory_order_relaxed); }
+
 void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *s) {
     s->enqueued = atomic_exchange_explicit(&g_live_enqueued, 0, memory_order_relaxed);
     s->wait_ns = atomic_exchange_explicit(&g_live_wait_ns, 0, memory_order_relaxed);

@@ -15,6 +15,7 @@
 #include "direct/vk_device.h"
 #include "gfx_plat/nvk_session.h"
 #include "nvn/nvn_vk_frame_log.h"
+#include "nvk_land_auto_fixture.h"
 #include "provider_context.h"
 #define TAG "test"
 #define ANDROID_LOG_INFO 4
@@ -61,7 +62,13 @@ int main(int argc, char **argv) {
     struct provider_context *ctx = calloc(1, sizeof *ctx); if (!ctx) return 2;
     ctx->state = S2A_DIRECT_ACTIVE; ctx->engine_ok = !strcmp(argv[1], "active"); ctx->device_ok = 1; g_active_context = ctx;
     if (ctx->engine_ok) {
+        g.land_auto = g.land_readback = 1;
+        pthread_mutex_lock(&g_mu);  // A retained renderer may still own the backend lock.
         int rc = destroy_impl(ctx);
+        pthread_mutex_unlock(&g_mu);
+        if (lines != 1 || !strstr(decision, "phase=exit mode=0 reason=insufficient_samples ")) {
+            fprintf(stderr, "FAIL: retained destroy must emit the auto exit decision\n"); return 1;
+        }
         printf("active: rc=%d close=%d idle=%d destroy=%d free=%d retained=%d\n", rc, atomic_load(&close_calls), atomic_load(&idle_entered), atomic_load(&device_destroys), atomic_load(&frees), g_retained_context == ctx);
         if (rc != S2A_DIRECT_RES_RETIREMENT || atomic_load(&close_calls) || atomic_load(&idle_entered) || atomic_load(&device_destroys) || atomic_load(&frees) || g_retained_context != ctx) {
             fprintf(stderr, "FAIL: active session must retain backend and device until process exit\n"); return 1;

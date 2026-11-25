@@ -24,6 +24,13 @@ class ProfileTest(unittest.TestCase):
             if 'clang' not in subprocess.check_output([cmd[0], '--version'], text=True).lower():
                 cmd += ['-Wno-format-truncation']  # Existing profiler snprintf, unrelated to this test.
             subprocess.run(cmd + [str(ROOT / 'android/tests/nvk_game_profile_test.c'), '-ldl', '-o', str(exe)], check=True)
+            host_log = temp / 'host.log'
+            with host_log.open('ab') as sink:
+                subprocess.run([str(exe), '', 'host-log'], stderr=sink, check=True)
+            self.assertEqual(host_log.read_bytes().splitlines(), [
+                b'[s2a] nvk land-readback: ' + b'x' * 2000,
+                b'[s2a] direct owner loop exited: stopped',
+            ])
             profile = temp / 'shaders/direct/game.tsv'
             profile.parent.mkdir(parents=True)
             (temp / 'unreadable/shaders/direct/game.tsv').mkdir(parents=True)
