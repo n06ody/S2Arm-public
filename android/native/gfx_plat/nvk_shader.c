@@ -1102,7 +1102,7 @@ static void load_cold_fragment(struct rp_prog *p, const nvn_gpu_shader_src *sour
         cold->prefix_byte = file.recipe.prefix_byte;
         cold->prefix_mask = file.recipe.prefix_mask;
         p->cold = cold;
-        char original[65], modified[65], line[240];
+        char original[65], modified[65], line[272];
         s2a_sha256_hex(original_sha, original);
         s2a_sha256_hex(variant_sha, modified);
         snprintf(line, sizeof line, "nvk-cold-guard asset mode=%d program=%s original=%s variant=%s",
