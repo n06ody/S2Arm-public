@@ -222,6 +222,52 @@ static int seed_dir_of(char *out, size_t n, const uint8_t closure_sha[32], const
     for (int i = 0; i < 8; i++) { snprintf(c + 2 * i, 3, "%02x", closure_sha[i]); snprintf(p + 2 * i, 3, "%02x", profile_sha[i]); }
     return snprintf(out, n, "%s/shaders/direct/warm-vk/%s-%s", root, c, p) >= (int)n ? -1 : 0;
 }
+static int seed_key_valid(const char *name) {
+    const char *hex = "0123456789abcdef";
+    return strspn(name, hex) == 16 && name[16] == '-' && strspn(name + 17, hex) == 16 && !name[33];
+}
+
+// 仅作缺件归因。须在其他合法目录找到可安全打开的程序清单，才把这次 ENOENT 记为随包失配。
+static void seed_missing_warning(const char *seed_dir) {
+    const char *live_key = strrchr(seed_dir, '/') + 1;   // seed_dir_of 的最后一段
+    char root[NVK_PROG_WARM_MAX_PATH];
+    const size_t root_len = (size_t)(live_key - seed_dir - 1);
+    memcpy(root, seed_dir, root_len);
+    root[root_len] = 0;
+    int fd = s2a_installed_seed_open_dir(root);
+    if (fd < 0) return;
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return; }
+
+    struct stat exact;
+    const int have_exact_dir = !fstatat(fd, live_key, &exact, AT_SYMLINK_NOFOLLOW) && S_ISDIR(exact.st_mode);
+    char sibling[34] = "";
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *key = entry->d_name;
+        if (!seed_key_valid(key) || !strcmp(key, live_key)) continue;
+        const int same_closure = !strncmp(live_key, key, 16);
+        if (sibling[0] && !same_closure) continue;
+        char candidate[NVK_PROG_WARM_MAX_PATH];
+        int n = snprintf(candidate, sizeof candidate, "%s/%s/" NVK_PROG_WARM_PREFIX "%.16s.bin", root, key, key);
+        if (n < 0 || n >= (int)sizeof candidate) continue;
+        int program = s2a_installed_seed_open(candidate);
+        if (program < 0) continue;
+        close(program);
+        memcpy(sibling, key, sizeof sibling);
+        if (same_closure || have_exact_dir) break;
+    }
+    closedir(dir);
+    if (!sibling[0]) return;
+
+    const char *reason = "warm_seed_closure_mismatch 仅找到其他翻译器闭包的种子";
+    if (have_exact_dir) reason = "warm_seed_program_missing 精确目录内程序清单缺失";
+    else if (!strncmp(sibling, live_key, 16)) reason = "warm_seed_profile_mismatch 同闭包随包种子的 profile 不符";
+    char message[288];
+    snprintf(message, sizeof message, "【黄】程序清单随包种子不用：%s（本局 %s，包内 %s）", reason, live_key, sibling);
+    nvn_plat_log(NVN_PLAT_LOG_WARN, "warm", message);
+}
+
 static int warm_name_is_ours(const char *name) {   // programs-v1-<16 位小写 hex>.bin
     const size_t pl = sizeof NVK_PROG_WARM_PREFIX - 1;
     if (strncmp(name, NVK_PROG_WARM_PREFIX, pl) || strlen(name) != pl + 16 + 4 || strcmp(name + pl + 16, ".bin")) return 0;
@@ -354,8 +400,8 @@ int nvk_prog_warm_load(void) {
         if (snprintf(legacy, sizeof legacy, "%s/%s", dir, NVK_PROG_WARM_FILE) < (int)sizeof legacy) { rf = read_file(legacy, 0, &buf, &len); e = rf ? errno : 0; }
     }
     // 首局（本机这一版翻译器连旧名清单都没有）：读随包种子。有本机清单一律用本机的，种子不读。
-    // 种子是锦上添花：不在 / 读不动 / 坏 / 不属于本局，都只打一行、按「本局没有清单」走，不拦起局。
-    int from_seed = 0;
+    // 读不动、坏或不属于本局要给原因，按「本局没有清单」继续。包内没有种子走常规提示。
+    int from_seed = 0, missing_seed = 0;
     char seed_dir[NVK_PROG_WARM_MAX_PATH] = "", seed_file[NVK_PROG_WARM_MAX_PATH] = "";
     if (!capture && rf && e == ENOENT && !seed_dir_of(seed_dir, sizeof seed_dir, closure_sha, profile_sha)) {
         const char *nm = strrchr(path, '/');
@@ -363,7 +409,8 @@ int nvk_prog_warm_load(void) {
             uint8_t *sb = NULL; size_t sl = 0;
             int sr = read_file(seed_file, 1, &sb, &sl), se = sr ? errno : 0;
             if (!sr) { buf = sb; len = sl; rf = 0; e = 0; from_seed = 1; }
-            else if (se != ENOENT) {
+            else if (se == ENOENT) missing_seed = 1;
+            else {
                 char m[200]; snprintf(m, sizeof m, "【黄】程序清单随包种子读不动（%d），本局不用种子", se);
                 nvn_plat_log(NVN_PLAT_LOG_WARN, "warm", m);
             }
@@ -371,11 +418,13 @@ int nvk_prog_warm_load(void) {
     }
     if (rf) {
         pthread_mutex_lock(&g.mu);
+        const int report_seed_miss = missing_seed && g.reset_seq == reset_seq && g.seed_state < 0;
         if (g.reset_seq == reset_seq && !g.have_facts) {
             g.have_facts = 1; memcpy(g.profile_sha, profile_sha, 32); g.direct_abi = pc_abi; memcpy(g.closure_sha, closure_sha, 32);
         }
         if (g.reset_seq == reset_seq) g.seed_state = 0;
         pthread_mutex_unlock(&g.mu);
+        if (report_seed_miss) seed_missing_warning(seed_dir);
         if (e == ENOENT) {
             const char *nm = strrchr(path, '/');
             char m[200]; snprintf(m, sizeof m, "程序清单：目录里还没有这一版翻译器的清单 %.48s（保留本局记录）", nm ? nm + 1 : path);

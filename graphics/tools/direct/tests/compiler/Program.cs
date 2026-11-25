@@ -570,7 +570,7 @@ internal static unsafe class Program
     }
 
     private static byte[] CapsJson(bool geometry = false, bool interlock = false, uint sampledImages = 64,
-        string schema = null, string duplicateField = null, bool gsOccQuery = false)
+        string schema = null, string duplicateField = null, bool gsOccQuery = false, ulong deviceLocalBytes = 12884901888UL)
     {
         using var stream = new MemoryStream();
         using (var w = new Utf8JsonWriter(stream))
@@ -633,7 +633,7 @@ internal static unsafe class Program
             w.WriteBoolean("scaledVertex", true);
             w.WriteEndObject();
             w.WriteStartObject("memory");
-            w.WriteNumber("deviceLocalBytes", 12884901888UL);
+            w.WriteNumber("deviceLocalBytes", deviceLocalBytes);
             w.WriteNumber("heapCount", 1);
             w.WriteNumber("memoryTypeCount", 3);
             w.WriteBoolean("deviceLocalHostVisible", true);
@@ -1274,6 +1274,29 @@ internal static unsafe class Program
             }
             Check(composed.SequenceEqual(DirectProfileComposer.Compose(CapsJson(), closure)),
                 "same caps compose the same profile bytes");
+            // Two heap sizes reported by the same 9400 in the warm-seed incident.
+            const ulong firstHeap = 16157020160UL, secondHeap = 16157024256UL;
+            byte[] firstHeapProfile = DirectProfileComposer.Compose(CapsJson(deviceLocalBytes: firstHeap), closure);
+            byte[] secondHeapProfile = DirectProfileComposer.Compose(CapsJson(deviceLocalBytes: secondHeap), closure);
+            byte[] fewerTexturesProfile = DirectProfileComposer.Compose(
+                CapsJson(sampledImages: 32, deviceLocalBytes: firstHeap), closure);
+            using (JsonDocument first = JsonDocument.Parse(firstHeapProfile))
+            using (JsonDocument second = JsonDocument.Parse(secondHeapProfile))
+            using (JsonDocument fewerTextures = JsonDocument.Parse(fewerTexturesProfile))
+            {
+                string profileHash = first.RootElement.GetProperty("profileHash").GetString();
+                byte[] seedHash = SHA256.HashData(firstHeapProfile);
+                Check(first.RootElement.GetProperty("capabilities").GetProperty("maximumGpuMemory").GetUInt64() == 0,
+                    "compiler profile v1 keeps maximumGpuMemory at zero");
+                Check(firstHeapProfile.SequenceEqual(secondHeapProfile), "heap-size drift preserves exact profile bytes");
+                Check(profileHash == second.RootElement.GetProperty("profileHash").GetString(),
+                    "heap-size drift preserves offline profileHash");
+                Check(seedHash.SequenceEqual(SHA256.HashData(secondHeapProfile)),
+                    "heap-size drift preserves the full profile digest used by warm seeds");
+                Check(profileHash != fewerTextures.RootElement.GetProperty("profileHash").GetString() &&
+                      !seedHash.SequenceEqual(SHA256.HashData(fewerTexturesProfile)),
+                    "a changed descriptor limit still changes both profile digests");
+            }
             byte[] gsEnabled = DirectProfileComposer.Compose(CapsJson(geometry: true), closure);
             Check(!composed.SequenceEqual(gsEnabled), "enabled geometry changes the profile");
             using (JsonDocument enabled = JsonDocument.Parse(gsEnabled))

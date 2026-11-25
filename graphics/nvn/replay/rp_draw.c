@@ -136,7 +136,7 @@ static int samp2_shape_ok(uint16_t r) {
 }
 
 static const struct rp_prog *g_prog; static nvn_gpu_pipe g_pipe; static nvn_gpu_cmd g_pipe_cmd;
-static uint64_t g_draws, g_skips, g_dispatches; static uint32_t g_prim = ~0u; static int g_quads = -1, g_face = -1;   // g_quads：这笔的索引展开方式（EXP_*）
+static uint64_t g_draws, g_skips, g_dispatches; static uint32_t g_prim = ~0u; static int g_quads = -1, g_raster = -1;   // g_quads：这笔的索引展开方式（EXP_*）
 static int g_ms_off;   // #1015：当前管线是「多重采样目标上关了多重采样」（游戏 ms.enable = 0、目标样本数 > 1）
 
 // ---- 首用管线异步：后台建 + 可恢复的首次缺画（iOS pso_pend / first_skip_ok 的 Vulkan 新回放版）----
@@ -230,7 +230,7 @@ static nvn_gpu_view sampled_view(const struct rp_prog *p, int lib_retry, int *un
     const int probe = p->lib_sourced && !lib_retry && dtt;
     if (probe) rp_decl_probe_begin();
     nvn_gpu_view v = ubo ? rp_view_by_ubo_handle_decl(id, dtt, dcls, c, t_out) : rp_view_by_id_decl(id, dtt, dcls, elem, c, t_out);
-    *unbridged = probe && rp_decl_probe_end();
+    *unbridged = probe ? rp_decl_probe_end() : 0;
     return v;
 }
 
@@ -1256,9 +1256,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 uint64_t paddr = ub->addr + e->src_off;
                 nvn_gpu_buf gb; uint64_t go;
                 if (!rp_buf_resolve(c, paddr, 8, &gb, &go)) return skip("uniform_buffer_unresolved", rec);
-                uint8_t *cpu = nvn_gpu_buf_cpu(gb);
-                if (!cpu) return skip("uniform_buffer_not_host_readable", rec);
-                uint64_t target = 0; memcpy(&target, cpu + go, 8);
+                uint64_t target;
+                if (!rp_buf_read_pointer(gb, go, paddr, &target)) return skip("uniform_buffer_not_host_readable", rec);
                 target = nvn_ga2ca(target);
                 if (!target) return skip("compute_storage_indirect_null", rec);
                 const uint8_t *pmem = NULL; uint64_t psz = 0;
@@ -1591,8 +1590,10 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     }
     if (rst_rewrite && ind) { skip("indirect_restart_index_not_all_ones", rec); return; }
     if (prim != g_prim || quads != g_quads) { g_prim = prim; g_quads = quads; rp_pso_dirty = 1; }
-    { int face = (rp_origin_lower_left() != 0) | (s2a_nvn_rast_flip != 0) << 1;   // 窗口原点与光栅翻转位不在状态块里，但进管线描述（正面绕序）：变了就是换管线
-      if (face != g_face) { g_face = face; rp_pso_dirty = 1; } }   // 图元在绘制记录里，不在状态块里：换了图元就是换管线
+    // 窗口原点、光栅翻转和近裁模式都在状态块之外。近裁模式还会改变着色器变体，须在程序复用前检查。
+    const int clip_neg1 = !rp_depth_zero();
+    const int raster = (rp_origin_lower_left() != 0) | ((s2a_nvn_rast_flip != 0) << 1) | (clip_neg1 << 2);
+    if (raster != g_raster) { g_raster = raster; rp_pso_dirty = 1; }
     int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];
     int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
     if (!g_prog || rp_pso_dirty || args_dirty) {
@@ -1809,6 +1810,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             if (unb) {
                 const struct rp_prog *np = lib_fallback_graphics(g_prog, &lib_retry, prim, rt);
                 if (np) { g_prog = np; rp_pso_dirty = 1; goto draw_rebind; }
+                if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto draw_done; }
                 tv[st][i] = rp_view_by_ubo_handle_decl(tid, g_prog->dtt[st][i], g_prog->dcls[st][i], c, NULL);
             }   // 没登记的号绑零贴图（Ryujinx null 贴图），不跳整笔
             // 立即数采样器池下标（#1594 片 3）：号没登记 = Ryujinx 的空采样器，绑默认采样器、整笔照画（片 6，不拿别的已登记采样器顶替）；
@@ -1871,6 +1873,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
           if (unb) {
               const struct rp_prog *np = lib_fallback_graphics(g_prog, &lib_retry, prim, rt);
               if (np) { g_prog = np; rp_pso_dirty = 1; goto draw_rebind; }
+              if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto draw_done; }
               tv[st][i] = rp_view_by_id_decl(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, g_prog->dtt[st][i], g_prog->dcls[st][i], 0, c, tt);
           } }
         if (tt && tn < sizeof tl - 56) {
@@ -2007,7 +2010,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         pd.origin_ll = (uint8_t)(rp_origin_lower_left() != 0);
         pd.poly.front = (((rp_S.poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0)) != (pd.origin_ll != 0)) ? NVN_FRONT_FACE_CCW : NVN_FRONT_FACE_CW;
         pd.depth_clamp = (uint8_t)(rp_S.depth_clamp != 0);
-        pd.clip_neg1 = (uint8_t)(g_prog->z_raw && !rp_depth_zero());   // 程序没做 near = -w 的深度改写：交给管线（只在 CAP_DEPTH_CLIP_CTL 时会出这种程序）
+        pd.clip_neg1 = (uint8_t)(g_prog->z_raw && clip_neg1);   // 程序没做 near = -w 的深度改写：交给管线（只在 CAP_DEPTH_CLIP_CTL 时会出这种程序）
         nvn_gpu_pipe np = NULL; nvn_gpu_err err = {0};
         const uint64_t pg0_ = tm_ ? dt_now() : 0;
         // 失败表（见 rp_pfail_kind）：表空时不算摘要；在表里 / 还在退避期的不交后端，跳过这笔
@@ -2366,6 +2369,7 @@ cs_rebind:
           if (unb) {
               const struct rp_prog *np = lib_fallback_compute(pg, &lib_retry);
               if (np) { pg = np; goto cs_rebind; }
+              if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto done; }
               tv[i] = rp_view_by_id_decl(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, pg->dtt[0][i], pg->dcls[0][i], 0, c, NULL);
           } }
         if (cs_const) {
@@ -2482,4 +2486,4 @@ void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     memset(g_hzt, 0, sizeof g_hzt); g_hzi = 0; g_hz_mask = 0; g_hz_on = hz_mode(nvn_plat_flag("nvk_binst_hoist", 2));   // 批量拷开关会话打开时读定
-    free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); free(g_cpipe_bad.keys); free(g_cpipe_bad.vals); nvn_hm_init(&g_cpipe_bad, 16); rp_pfail_reset(); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_face = -1; g_ms_off = 0; }
+    free(g_cpipes.keys); free(g_cpipes.vals); nvn_hm_init(&g_cpipes, 8); free(g_cpipe_bad.keys); free(g_cpipe_bad.vals); nvn_hm_init(&g_cpipe_bad, 16); rp_pfail_reset(); g_prog = NULL; g_pipe = NULL; g_pipe_cmd = NULL; g_draws = g_skips = 0; g_prim = ~0u; g_quads = -1; g_raster = -1; g_ms_off = 0; }

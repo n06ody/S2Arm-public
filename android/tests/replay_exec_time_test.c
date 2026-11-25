@@ -108,7 +108,61 @@ void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) { (voi
 void rp_debug_dump_poll(uint64_t *fence) { (void)fence; }
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) { (void)addr; (void)len; if (pool_key) *pool_key = 0; return 0; }
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged) { (void)addr; (void)len; if (pool_key) *pool_key = 0; if (merged) *merged = 0; return 0; }   // 同段合并的登记入口（rp_post_gpu_write_rows 用）：本测试只测计时，不登记
+// 计时流没有池缓冲。联合落地用例单独注入回写记录。
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) { (void)pool_key; (void)id; (void)ok; }
+// 计时流不登记 GPU 写，也不制造提交失败。误入回写或传输撤销路径要让用例报红。
+static int landing_test_mode;
+static uint32_t landing_snapshot_calls, landing_mirror_count;
+static int landing_pool;
+
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c) { (void)c; return landing_test_mode != 0; }
+int nvn_gpu_mirror_visibility_enabled(void) { return landing_test_mode != 0; }
+
+void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans) {
+    CHECK(landing_test_mode && count == 2);
+    landing_snapshot_calls++;
+    for (uint32_t i = 0; i < count; i++) {
+        spans[refs[i].index] = (nvn_gpu_readback_span){
+            (nvn_gpu_buf)&landing_pool, 64 * refs[i].id, 32, UINT64_MAX,
+        };
+    }
+}
+
+uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count) {
+    (void)c;
+    CHECK(count == 2 && spans[0].offset == 128 && spans[1].offset == 64);
+    spans[1].readback_offset = 0;
+    // 槽分配失败时暂存表已有候选偏移，但返回 0，完成回调必须继续读镜像。
+    return landing_test_mode == 1 ? 32 : 0;
+}
+
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
+    (void)c;
+    landing_mirror_count = count;
+    CHECK(spans && count && spans[0].src == (nvn_gpu_buf)&landing_pool && spans[0].offset == 128);
+    if (landing_test_mode == 2) CHECK(count == 2 && spans[1].offset == 64);
+}
+
+static void check_landing_routes(void) {
+    for (int mode = 0; mode <= 2; mode++) {
+        struct gw_ev writes[] = {{1, 2, 0}, {1, 1, 0}};
+        struct sub s = {.gw = writes, .ngw = 2};
+        landing_snapshot_calls = 0;
+        landing_mirror_count = 0;
+        landing_test_mode = mode;
+        sub_record_landing(&s, NULL);
+        CHECK(landing_snapshot_calls == (mode != 0));
+        CHECK(landing_mirror_count == (uint32_t)mode);
+        CHECK(s.readback_bytes == (mode == 1 ? 32u : 0u));
+        CHECK(writes[0].readback_plus_one == 0 && writes[1].readback_plus_one == (mode == 1));
+    }
+    landing_test_mode = 0;
+    puts("落地联合分流：双关无快照、暂存成功只失效直接读区间、暂存失败两个区间均回落镜像");
+}
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {
+    (void)pool_key; (void)id; (void)ok; (void)staged; CHECK(0);
+}
+void rp_res_xfer_aborted(uint64_t sub) { (void)sub; CHECK(0); }
 void rp_buf_frame_flip(void) {}
 void rp_buf_hold_begin(void) {}   // 本测试只测计时：回放窗口（池销毁的镜像缓冲延后放）在 t_nvn_replay / 隔离夹具里测
 void rp_buf_hold_end(void) {}
@@ -296,6 +350,7 @@ int main(int argc, char **argv) {
         CHECK(zero);
     }
 
+    check_landing_routes();
     CHECK(g_red == 0);   // 这些路径不该报红行
     if (g_red) printf("      最近一条红行：%s\n", g_last_red);
 

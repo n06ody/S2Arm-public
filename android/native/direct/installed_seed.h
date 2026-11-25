@@ -41,7 +41,7 @@ static inline int seed_open_object(int game, int parent, const char *leaf, size_
     return seed_close_parent(shard, openat(shard, bucket + 3, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
 }
 
-static inline int s2a_installed_seed_open(const char *path) {
+static inline int seed_open_path(const char *path, int directory) {
     const char *root = getenv("S2A_SHADER_REVISION_ROOT");
     if (!root || root[0] != '/' || !path) { errno = EINVAL; return -1; }
     size_t len = strlen(root);
@@ -77,8 +77,11 @@ static inline int s2a_installed_seed_open(const char *path) {
         if (slash) *slash = 0;
         if (!*part || !strcmp(part, ".") || !strcmp(part, "..")) { errno = EINVAL; break; }
         if (!slash) {
-            fd = openat(parent, part, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
-            if (fd < 0 && errno == ELOOP && game >= 0) fd = seed_open_object(game, parent, part, levels);
+            if (directory) fd = openat(parent, part, dirs);
+            else {
+                fd = openat(parent, part, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+                if (fd < 0 && errno == ELOOP && game >= 0) fd = seed_open_object(game, parent, part, levels);
+            }
             break;
         }
         parent = seed_close_parent(parent, openat(parent, part, dirs));
@@ -87,10 +90,19 @@ static inline int s2a_installed_seed_open(const char *path) {
     }
     if (parent >= 0) seed_close_parent(parent, fd);
     if (game >= 0) seed_close_parent(game, fd);
-    if (fd >= 0) {
+    if (fd >= 0 && !directory) {
         struct stat st;
         if (fstat(fd, &st) < 0) return seed_close_parent(fd, -1);
         if (!S_ISREG(st.st_mode)) { close(fd); errno = EINVAL; return -1; }
     }
     return fd;
+}
+
+static inline int s2a_installed_seed_open(const char *path) {
+    return seed_open_path(path, 0);
+}
+
+// Directory diagnostics use the same revision walk and never follow directory aliases.
+static inline int s2a_installed_seed_open_dir(const char *path) {
+    return seed_open_path(path, 1);
 }

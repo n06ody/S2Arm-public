@@ -8,6 +8,7 @@
 //   bad_pipe      程序种子好、管线种子校验和坏 → 程序照用、管线打黄一行不用
 //   undecided     程序清单还没载入时管线 load 返回 -1（稍后重试），程序载入后再 load 收下种子
 //   other_profile 种子目录名对得上但文件头是另一台设备 profile 记的 → 打黄不用
+//   seed 查无精确件 → 区分其他 profile、其他闭包、精确目录缺件和无随包种子，始终不读其他种子
 // 另有 --emit / --installed / --installed-nowindow 三个模式，由 nvk_warm_modules_test.sh 先跑真实安装器再读：--installed-nowindow 读安装后修订里 nowindow/ 的补件（替换管线清单 + 程序结果走受控读取），
 //   库外 / 环 / 绝对链接、桶号不符与目录别名由脚本换进去，期望被拒。
 // 期望值不来自被测实现：种子文件按格式手写（程序 60 + n*600 + 8：88 字节条目头 + 两段 0x100 字节 c1、管线 32 + n*388），种子目录名由测试自己算 SHA-256，
@@ -40,13 +41,19 @@ static char g_cache[512];
 static const char *g_profile = "profile-A", *g_closure = "closure-A";
 static const int32_t g_abi = 7;
 static char g_warn[4096];   // 本用例所有黄行（拼起来）
+static int g_warnings, g_no_local_info;
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE && g_cache[0] ? g_cache : NULL; }
 const char *nvk_session_cache_dir(void) { return g_cache[0] ? g_cache : NULL; }
 static int g_nowindow = 1;   // nvk_warm_nowindow：缺省开（同产品缺省）；--installed 旧用例关掉，只测程序清单旁的种子叶子
 int nvn_plat_flag(const char *name, int dflt) { return !strcmp(name, "nvk_warm_nowindow") ? g_nowindow : dflt; }
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
-    if (level == NVN_PLAT_LOG_WARN && strlen(g_warn) + strlen(text) + 2 < sizeof g_warn) { strcat(g_warn, text); strcat(g_warn, "\n"); }
+    if (level == NVN_PLAT_LOG_WARN) {
+        g_warnings++;
+        if (strlen(g_warn) + strlen(text) + 2 < sizeof g_warn) { strcat(g_warn, text); strcat(g_warn, "\n"); }
+    }
+    if (level == NVN_PLAT_LOG_INFO && strstr(text, "程序清单：目录里还没有这一版翻译器的清单"))
+        g_no_local_info++;
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *out) {
     memset(out, 0, sizeof *out);
@@ -185,6 +192,7 @@ static void case_seed_used(void) {
     char sd[800]; int s = nvk_prog_warm_seed_dir(sd, sizeof sd);
     CHECK(s == 1 && !strcmp(sd, g_seed), "种子目录 = 手算的 <闭包>-<profile>（得 %d %s）", s, sd);
     CHECK(nvk_pipe_warm_load() == 2, "管线清单从种子收下 2 条（身份 9 的程序不在程序清单里，不收）");
+    CHECK(!g_warnings, "matching installed seeds emit no warnings (%s)", g_warn);
     struct nvk_pipe_warm_stats qs; nvk_pipe_warm_stats(&qs);
     CHECK(qs.rejected == 1, "不收的 1 条计入 rejected（得 %llu）", (unsigned long long)qs.rejected);
     struct nvk_pipe_rec r; int n = 0, saw1 = 0;
@@ -270,9 +278,90 @@ static void case_other_profile(void) {
     CHECK(nvk_pipe_warm_load() == 0, "管线也不读种子");
 }
 
+static void write_other_seed(const char *closure, const char *profile, char key[34]) {
+    uint8_t cs[32], ps[32];
+    char c16[17], p16[17], dir[700], program[800], pipe[800];
+    sha(closure, cs); sha(profile, ps); hex8(cs, c16); hex8(ps, p16);
+    snprintf(key, 34, "%s-%s", c16, p16);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/warm-vk/%s", g_root, key);
+    CHECK(mkdir(dir, 0700) == 0, "create a different seed directory");
+    snprintf(program, sizeof program, "%s/programs-v1-%s.bin", dir, c16);
+    snprintf(pipe, sizeof pipe, "%s/pipes-v1-352.bin", dir);
+    const char *expected_closure = g_closure;
+    g_closure = closure;
+    write_prog(program, k_seed_prog, k_masks, 2, profile, 0);
+    g_closure = expected_closure;
+    write_pipe(pipe, k_seed_pipe, 3, 0);
+}
+
+static void check_seed_not_loaded(void) {
+    CHECK(nvk_prog_warm_load() == 0, "no program seed adopted for the live key");
+    CHECK(nvk_prog_warm_seed_dir(NULL, 0) == 0, "no seed directory published for the live key");
+    CHECK(nvk_pipe_warm_load() == 0, "no pipeline seed adopted for the live key");
+}
+
+static void case_seed_profile_mismatch(void) {
+    char sibling[34], other_closure[34];
+    CHECK(rmdir(g_seed) == 0, "remove exact cohort");
+    write_other_seed("closure-B", "profile-B", other_closure);
+    write_other_seed(g_closure, "profile-B", sibling);
+    check_seed_not_loaded();
+    CHECK(nvk_prog_warm_load() == 0, "same session repeated load still adopts no seed");
+    const char *live_key = strrchr(g_seed, '/') + 1;
+    CHECK(g_warnings == 1 && strstr(g_warn, "warm_seed_profile_mismatch") &&
+          strstr(g_warn, live_key) && strstr(g_warn, sibling),
+          "missing exact seed emits one profile mismatch with live and sibling keys (%s)", g_warn);
+}
+
+static void case_seed_closure_mismatch(void) {
+    char sibling[34];
+    CHECK(rmdir(g_seed) == 0, "remove exact cohort");
+    write_other_seed("closure-B", g_profile, sibling);
+    check_seed_not_loaded();
+    CHECK(g_warnings == 1 && strstr(g_warn, "warm_seed_closure_mismatch") && strstr(g_warn, sibling),
+          "only another closure emits one closure mismatch (%s)", g_warn);
+}
+
+static void case_seed_program_missing(void) {
+    char sibling[34];
+    write_other_seed(g_closure, "profile-B", sibling);
+    write_pipe(g_seed_pipe, k_seed_pipe, 3, 0);
+    check_seed_not_loaded();
+    CHECK(g_warnings == 1 && strstr(g_warn, "warm_seed_program_missing"),
+          "exact cohort without the program file emits one missing-program warning (%s)", g_warn);
+}
+
+static void case_no_seed_candidates(void) {
+    char warm_root[700], candidate[800], path[900], alias_target[700], alias_key[34];
+    CHECK(rmdir(g_seed) == 0, "remove exact cohort");
+    snprintf(warm_root, sizeof warm_root, "%s/shaders/direct/warm-vk", g_root);
+    snprintf(candidate, sizeof candidate, "%s/1111111111111111-2222222222222222", warm_root);
+    CHECK(mkdir(candidate, 0700) == 0, "create an empty unrelated directory");
+    snprintf(path, sizeof path, "%s/pipes-v1-352.bin", candidate);
+    write_pipe(path, k_seed_pipe, 3, 0);
+    write_other_seed("closure-B", "profile-B", alias_key);
+    snprintf(candidate, sizeof candidate, "%s/%s", warm_root, alias_key);
+    snprintf(alias_target, sizeof alias_target, "%s/aliased-cohort", g_cache);
+    CHECK(rename(candidate, alias_target) == 0, "move valid seeds out of the package");
+    CHECK(symlink(alias_target, candidate) == 0, "create a cohort directory alias with usable seed bytes");
+    check_seed_not_loaded();
+    CHECK(!g_warnings && g_no_local_info == 1, "an empty or aliased cohort never triggers a mismatch warning (%s)", g_warn);
+}
+
+static void case_no_seed_root(void) {
+    char warm_root[700];
+    CHECK(rmdir(g_seed) == 0, "remove exact cohort");
+    snprintf(warm_root, sizeof warm_root, "%s/shaders/direct/warm-vk", g_root);
+    CHECK(rmdir(warm_root) == 0, "remove the warm-vk root");
+    check_seed_not_loaded();
+    CHECK(!g_warnings && g_no_local_info == 1, "a package without seeds keeps the normal info path (%s)", g_warn);
+}
+
 static const struct { const char *name; void (*fn)(void); } k_cases[] = {
     {"seed_used", case_seed_used}, {"local_first", case_local_first}, {"local_prog", case_local_prog},
     {"bad_seed", case_bad_seed}, {"bad_pipe", case_bad_pipe}, {"undecided", case_undecided}, {"other_profile", case_other_profile},
+    {"seed_profile_mismatch", case_seed_profile_mismatch}, {"seed_closure_mismatch", case_seed_closure_mismatch},
+    {"seed_program_missing", case_seed_program_missing}, {"no_seed_candidates", case_no_seed_candidates}, {"no_seed_root", case_no_seed_root},
 };
 
 int main(int argc, char **argv) {
@@ -318,7 +407,10 @@ int main(int argc, char **argv) {
         CHECK(nvk_pipe_warm_load() == pipes, "installed pipe seed: expected %d rows (%s)", pipes, g_warn);
         return failures != 0;
     }
-    char tmpl[] = "/tmp/nvk-warm-seed-XXXXXX";
+    const char *tmpdir = getenv("TMPDIR");
+    char tmpl[400];
+    if (snprintf(tmpl, sizeof tmpl, "%s/nvk-warm-seed-XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp") >= (int)sizeof tmpl)
+        return 1;
     char *base = mkdtemp(tmpl);
     if (!base) { fprintf(stderr, "FAIL: temp dir\n"); return 1; }
     int bad = 0, n = (int)(sizeof k_cases / sizeof k_cases[0]);
@@ -334,7 +426,11 @@ int main(int argc, char **argv) {
         int st = 0; waitpid(pid, &st, 0);
         if (!WIFEXITED(st) || WEXITSTATUS(st)) { bad++; fprintf(stderr, "FAIL: 用例 %s 没过（状态 %d）\n", k_cases[i].name, st); }
     }
-    char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", base); if (system(cmd)) {}
+    pid_t cleanup = fork();
+    if (cleanup == 0) { execlp("rm", "rm", "-rf", "--", base, (char *)NULL); _exit(1); }
+    int cleanup_status = 0;
+    if (cleanup < 0 || waitpid(cleanup, &cleanup_status, 0) != cleanup || !WIFEXITED(cleanup_status) || WEXITSTATUS(cleanup_status))
+        return 1;
     if (bad) { fprintf(stderr, "FAIL: 随包种子 %d/%d 个用例没过\n", bad, n); return 1; }
     printf("PASS: 随包种子 %d 个用例全过\n", n);
     return 0;

@@ -158,7 +158,9 @@ namespace S2A.DirectCompiler
                 storageBufferOffsetAlignment: (int)Math.Min(c.MinStorageBufferOffsetAlignment, 65536u),
                 textureBufferOffsetAlignment: (int)Math.Min(c.MinTexelBufferOffsetAlignment, 65536u),
                 gatherBiasPrecision: 0,
-                maximumGpuMemory: c.DeviceLocalBytes,
+                // Retain the v1 field. Heap capacity is a runtime budget input, not a
+                // translation capability. Raw heap bytes still belong to device caps.
+                maximumGpuMemory: 0,
                 s2aVertexPull: false,
                 // Device facts are global; linked policy belongs to an individual request.
                 requiresLinkedVaryingInterface: false,

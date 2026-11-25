@@ -39,10 +39,10 @@ def main():
     inc=out/'include'; inc.mkdir(exist_ok=True)
     for name in ('vulkan','vk_video'):
         if (sysinc/name).exists() and not (inc/name).exists(): (inc/name).symlink_to(sysinc/name)
-    cc=[os.environ.get('CC','cc'),'-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-pthread', '-I'+str(out),'-I'+str(inc),'-I'+str(ROOT/'android/native'),'-I'+str(ROOT/'android/native/nvn')]
+    cc=[os.environ.get('CC','cc'),'-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-pthread', '-I'+str(out),'-I'+str(inc),'-I'+str(ROOT/'android/native'),'-I'+str(ROOT/'android/native/nvn'),'-I'+str(ROOT/'graphics/nvn/replay')]
     if helper: cc+=['-DHAS_IDLE_WORKER']
     exe=out/('baseline' if baseline else 'current')
-    subprocess.run(cc+[str(ROOT/'android/tests/nvk_device_idle_test.c'),'-o',str(exe)],check=True,timeout=30)
+    subprocess.run(cc+[str(ROOT/'android/tests/nvk_device_idle_test.c'),'-lm','-o',str(exe)],check=True,timeout=30)
     rc=0
     for mode in ('control','blocked','unbind','active'):
         r=subprocess.run([str(exe),mode],capture_output=True,text=True,timeout=15)
