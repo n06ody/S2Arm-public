@@ -657,6 +657,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        if (g.bc7_astc_on) atomic_fetch_add(&g.bc7_present, 1);
         uint64_t tnow = now_ns();
         if (!s->timing.start) s->timing.start = tnow;
         wsi_timing_submitted(&s->timing, timing_id);

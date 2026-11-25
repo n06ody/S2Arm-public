@@ -37,7 +37,7 @@
 #include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"
 #include "backend_vulkan_deswizzle_spv.h"
 #include "backend_vulkan_bc1_astc_spv.h"
-#include "backend_vulkan_bc7_astc_spv.h"
+#include "backend_vulkan_bc7_hybrid_spv.h"
 #include "bc7_astc_shaders/inspect.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_report_ts.h"
@@ -132,6 +132,9 @@ struct nvn_gpu_tex_s {
     uint8_t ext_usage;   // 建图带了 EXTENDED_USAGE（存储用途配本身不能存储的格式，见 NVN_GPU_CAP_STORAGE_SRGB_ALIAS）：每个视图按自己的格式剥用途
     uint64_t bc_shadow_mem_size;   // 实际影子缓冲分配，在 g_mu 下发布
     VkBuffer bc_sbuf; VkDeviceMemory bc_smem;   // bc_decoded 贴图的压缩原数据影子（GPU 缓冲，按级、按层 / 3D 切片、行紧排；见 bc_shadow_layout）
+    uint64_t bc7_generation, bc7_present;
+    struct nvn_gpu_cmd_s *bc7_upload;
+    int bc7_ready;
     uint8_t fb_sample;   // 同一通道里既当附件又被采样过（反馈环）：这张图以后当附件一律 GENERAL（见「图像布局」）
     uint16_t swz;   // 存储自带的通道映射（tex_builder_t.swz 打包法，0 = 恒等）：视图没自己设映射时用它
     // 反馈快照图（feedback_make 建的私有图）跨段复用（见 backend_vulkan_feedback.inc 的快照池）：
@@ -304,6 +307,7 @@ struct feedback_copy {
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
+    int bc7_uploaded, bc7_work;
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     const struct nvn_gpu_pipe_s *loss_programs[LOSS_PROGRAMS_PER_SEGMENT], *loss_last_pipe;
     uint8_t loss_nprograms, loss_programs_truncated;
@@ -446,6 +450,19 @@ struct nvn_gpu_vk {
     struct s2a_vk_device *dev;
     struct nvn_vk_bcdec *bc;
     int bc1_astc_on, bc7_astc_on, bc_time_on;
+    _Atomic uint64_t bc7_present;
+    _Atomic(nvn_gpu_tex) bc7_promotable;
+    uint64_t bc7_last_step;
+    nvn_gpu_buf bc7_input, bc7_output;
+    VkDescriptorPool bc7_pool;
+    VkDescriptorSet bc7_set;
+    struct bc7_job {
+        nvn_gpu_tex src, dst;
+        uint64_t generation, present;
+        uint32_t level, layer, row;
+        int announced;
+        enum { BC7_IDLE, BC7_SUBMITTED, BC7_COMPLETE, BC7_REJECTED } state;
+    } bc7_job; // g_mu；同一会话至多一张候选图
     uint32_t bc_time_bits;
     VkDevice d;
     VkPhysicalDevice phys;
@@ -1841,6 +1858,8 @@ static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.
 
 #include "backend_vulkan_bc_time.inc"
 
+static void bc7_finish_locked(struct nvn_gpu_cmd_s *c, int executed);
+
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
@@ -1863,6 +1882,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         free(f);
     }
     pthread_mutex_lock(&g_mu);
+    if (c->bc7_uploaded || c->bc7_work) bc7_finish_locked(c, executed);
     for (uint32_t i = 0; i < c->n_newimg; i++) {   // 段没执行：图像还是 UNDEFINED，放回待转表（放不回就留给下面的归还：没人再用它）
         if (!executed && !c->newimg[i]->released) newimg_add_locked(c->newimg[i]);
         unref_locked(&g, c->newimg[i], REF_TEX);
@@ -2680,6 +2700,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     if (g.bc) nvn_vk_bcdec_destroy(g.dev, g.bc);
     deswizzle_close();
     bc_astc_close(&g_bc1_astc);
+    if (g.bc7_pool) vkDestroyDescriptorPool(g.d, g.bc7_pool, NULL);
     bc_astc_close(&g_bc7_astc);
     free(g.submitted);
     g.submitted = NULL;
@@ -7965,13 +7986,12 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     cold_note_write(c, b, off, (bh - 1) * row_bytes + packed_row, 0, 0);
 }
 
-// 第一次上传时建压缩影子缓冲（大小按 bc_shadow_layout 的总长）。失败置粘滞。
-static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint64_t total) {
+static int bc_shadow_create(struct nvn_gpu_tex_s *t, uint64_t total) {
     if (t->bc_sbuf) return 1;
     VkBufferCreateInfo bi = {0}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size = total ? total : 4;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkMemoryRequirements req;
-    if (vkCreateBuffer(g.d, &bi, NULL, &buf) != VK_SUCCESS) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子缓冲建不出（%llu 字节）", (unsigned long long)total); return 0; }
+    if (vkCreateBuffer(g.d, &bi, NULL, &buf) != VK_SUCCESS) return 0;
     vkGetBufferMemoryRequirements(g.d, buf, &req);
     uint32_t type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
     if (type == UINT32_MAX) type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, 0, NULL);
@@ -7979,15 +7999,25 @@ static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, ui
     if (type == UINT32_MAX || vkAllocateMemory(g.d, &ai, NULL, &mem) != VK_SUCCESS || vkBindBufferMemory(g.d, buf, mem, 0) != VK_SUCCESS) {
         if (mem) vkFreeMemory(g.d, mem, NULL);
         vkDestroyBuffer(g.d, buf, NULL);
-        set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子显存分配失败（%llu 字节）", (unsigned long long)total); return 0;
+        return 0;
     }
     t->bc_sbuf = buf; t->bc_smem = mem;
     // 影子是否占显存与时间戳诊断无关。
     pthread_mutex_lock(&g_mu);
     t->bc_shadow_mem_size = req.size;
     pthread_mutex_unlock(&g_mu);
+    return 1;
+}
+
+// 第一次上传时建压缩影子缓冲（大小按 bc_shadow_layout 的总长）。失败置粘滞。
+static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint64_t total) {
+    if (t->bc_sbuf) return 1;
+    if (!bc_shadow_create(t, total)) {
+        set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子分配失败（%llu 字节）", (unsigned long long)total);
+        return 0;
+    }
     full_barrier(c);
-    vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0);   // 没上传过的区域回读为零，不留上一块显存的旧内容
+    vkCmdFillBuffer(c->cb, t->bc_sbuf, 0, VK_WHOLE_SIZE, 0);   // 没上传过的区域回读为零，不留上一块显存的旧内容
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     return 1;
 }
@@ -8037,6 +8067,8 @@ static int bc_src_check(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
 }
 
 #include "backend_vulkan_bc_astc.inc"
+
+static void bc7_invalidate(nvn_gpu_tex t);
 
 // 解码用的临时图：解出来的像素先落在这里（带 STORAGE 的可变格式），再按区域拷进目标贴图（bc_upload 与缓冲 → BC 贴图共用）。
 static struct bc_temp *bc_temp_image(const struct nvn_gpu_tex_s *t, VkExtent3D ext) {
@@ -8118,6 +8150,7 @@ static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_
 // 失败置粘滞，返回 0。
 static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkBuffer sb, uint64_t soff, uint64_t bh, uint64_t packed_row,
                            uint64_t shadow_dst, uint64_t sh_rp, uint32_t level, uint32_t layer, VkOffset3D off, VkExtent3D ext, uint32_t z) {
+    if (g.bc7_astc_on && t->nvn_format == NVN_FORMAT_BPTC_UNORM) bc7_invalidate(t);
     char why[192] = {0};
     VkBufferCopy *rg = calloc((size_t)bh, sizeof *rg);
     if (!rg) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子拷贝表分配失败"); return 0; }
@@ -8127,8 +8160,7 @@ static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
     if (bc_astc_image(t)) {
-        const uint32_t block_bytes = t->nvn_format == NVN_FORMAT_BPTC_UNORM ? 16 : 8;
-        return bc_astc_encode(c, t, sb, soff, bh * (packed_row / block_bytes), block_bytes, level, layer, off, ext);
+        return bc_astc_encode(c, t, sb, soff, bh * (packed_row / 8), 8, level, layer, off, ext);
     }
     struct bc_temp *tmp = bc_temp_image(t, ext);
     if (!tmp) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：临时图分配失败"); return 0; }
@@ -8166,6 +8198,10 @@ static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t
         set_sticky(c, NVN_GPU_E_ARG, "BC 上传：压缩影子布局溢出"); return;
     }
     const int astc = bc_astc_image(t);
+    if (astc && t->nvn_format == NVN_FORMAT_BPTC_UNORM) {
+        set_sticky(c, NVN_GPU_E_ORDER, "BC7 上传需要先换回 RGBA8");
+        return;
+    }
     if (!bc_shadow_ensure(c, t, sh_total) || (!astc && !bc_decoder_ready(c))) return;
     for (uint32_t z = 0; z < ext.depth; z++) {
         uint32_t s = t->target == NVN_TEXTURE_TARGET_3D ? (uint32_t)off.z + z : layer;
@@ -8177,8 +8213,7 @@ static void bc_upload(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32_t
         }
         for (uint64_t y = 0; y < bh; y++)
             memcpy((uint8_t *)ss.cpu + y * packed_row, (const uint8_t *)src + (uint64_t)z * slice_stride + y * row_bytes, (size_t)packed_row);
-        if (astc && !trusted_snapshot &&
-            (t->nvn_format == NVN_FORMAT_BPTC_UNORM || !bc1_astc_opaque(ss.cpu, bytes))) {
+        if (astc && !trusted_snapshot && !bc1_astc_opaque(ss.cpu, bytes)) {
             set_sticky(c, NVN_GPU_E_ARG, "BC ASTC 上传缺少适用快照，需要先换回 RGBA8");
             return;
         }

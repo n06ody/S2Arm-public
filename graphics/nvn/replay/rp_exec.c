@@ -453,6 +453,7 @@ static uint64_t sub_commit_body(void) {
     nvn_gpu_err err = {0}; uint64_t f = g_fence + SUB_STEP;
     submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
+    rp_tex_async_step(c);
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
     uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; }
     if (s && (s->n || s->noe || s->ngw)) __atomic_store_n(&g_wait_effect_fence, f, __ATOMIC_RELEASE);

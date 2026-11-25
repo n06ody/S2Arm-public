@@ -111,6 +111,7 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) { (void)pool_key; (void)id; (void)ok; }
 // 计时夹具不录贴图上传，若收到前置段撤销通知应报红。
 void rp_res_xfer_aborted(uint64_t sub) { (void)sub; CHECK(0); }
+void rp_tex_async_step(nvn_gpu_cmd c) { (void)c; }
 void rp_buf_frame_flip(void) {}
 void rp_buf_hold_begin(void) {}   // 本测试只测计时：回放窗口（池销毁的镜像缓冲延后放）在 t_nvn_replay / 隔离夹具里测
 void rp_buf_hold_end(void) {}
