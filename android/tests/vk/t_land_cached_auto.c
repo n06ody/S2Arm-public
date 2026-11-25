@@ -6,7 +6,41 @@
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2) {
+        // 同 P0 包 708df6d8 原局日志的活动窗量级。重叠项用已知合成区间独立测算。
+        struct mirror_auto_window candidate = {
+            .frame_ms = 25.063, .p99_ms = 38.0, .present_ms = 0.6, .acquire_ms = 0.2,
+            .land_bytes = 29294272, .draws = 1050, .submits = 7, .sync_bytes = 3e6,
+            .copy_ms = 15.860, .shadow_wait_ms = 9.134, .target_ns = 16666666, .thermal = 0,
+        };
+        if (!strcmp(argv[1], "--retire-overlap")) {
+            struct mirror_auto_window gpu_wait = candidate;
+            CHECK(mirror_auto_observe(&gpu_wait, 0, 0) != NULL);
+            CHECK(mirror_auto_observe(&candidate, 0, 7.0) == NULL);
+            CHECK(fabs(candidate.shadow_wait_ms - 5.634) < 0.001);
+            CHECK(mirror_auto_overlap_ns(10, 25, 12, 20) == 5);
+            CHECK(mirror_auto_overlap_ns(10, 25, 26, 20) == 0);
+            CHECK(mirror_auto_overlap_ns(10, 25, 12, 25) == 0);
+            struct mirror_auto_window expensive = candidate;
+            expensive.copy_ms = 28.29;
+            expensive.shadow_wait_ms = 32.926;
+            CHECK(mirror_auto_observe(&expensive, 0, 28.29) != NULL);
+        } else {
+            CHECK(!strcmp(argv[1], "--direct-upload"));
+            candidate.shadow_wait_ms = 5.634;
+            struct mirror_auto_window heavy = candidate;
+            CHECK(mirror_auto_observe(&heavy, 2600, 0) != NULL);
+            CHECK(mirror_auto_observe(&candidate, 121.80, 0) == NULL);
+            CHECK(fabs(candidate.shadow_wait_ms - 5.769) < 0.001);
+            heavy = candidate;
+            heavy.sync_bytes = 64 * 1024;
+            CHECK(mirror_auto_observe(&heavy, 121.80, 0) != NULL);
+        }
+        puts("land-cached auto observe model: passed");
+        return 0;
+    }
+    CHECK(argc == 1);
     const struct mirror_auto_window baseline = {
         .frame_ms = 29.3, .p99_ms = 47.2, .present_ms = 0.9, .acquire_ms = 0.2,
         .land_bytes = 21e6, .draws = 1050, .submits = 7, .sync_bytes = 3e6,
@@ -21,6 +55,9 @@ int main(void) {
     memcpy(receipt.compatibility, compatibility, sizeof compatibility);
     receipt.baseline[0] = receipt.baseline[1] = baseline;
     CHECK(mirror_auto_receipt_valid(&receipt, compatibility, 900));
+    receipt.version = 1;
+    CHECK(!mirror_auto_receipt_valid(&receipt, compatibility, 900));
+    receipt.version = MIRROR_AUTO_VERSION;
     CHECK(!mirror_auto_receipt_valid(&receipt, compatibility, 599));
     CHECK(!mirror_auto_receipt_valid(&receipt, compatibility, 600 + MIRROR_AUTO_RECEIPT_SEC + 1));
     receipt.compatibility[0] = 0;

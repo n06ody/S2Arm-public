@@ -94,6 +94,7 @@ enum { STAT_BUFS = 0, STAT_SUBMITS, STAT_DONE_OK, STAT_DONE_FAILED, STAT_RETIRED
        STAT_MIRROR_PROBE_EDGE_WAITS, STAT_MIRROR_PROBE_EDGE_WAIT_NS,
        STAT_MIRROR_AUTO_ALREADY_CACHED,
        STAT_MIRROR_AUTO_SHADOW_N, STAT_MIRROR_AUTO_SHADOW_NS, STAT_MIRROR_AUTO_SHADOW_BYTES, STAT_MIRROR_AUTO_SHADOW_MISSED,
+       STAT_MIRROR_AUTO_SHADOW_COPY_NS,
        STAT_MIRROR_AUTO_TRIAL_BUFFERS, STAT_MIRROR_AUTO_TRIAL_OPEN,
        STAT_N };
 static const char *const stat_names[STAT_N] = {
@@ -108,6 +109,7 @@ static const char *const stat_names[STAT_N] = {
     "mirror_probe_edge_waits", "mirror_probe_edge_wait_ns",
     "mirror_auto_already_cached",
     "mirror_auto_shadow_calls", "mirror_auto_shadow_ns", "mirror_auto_shadow_bytes", "mirror_auto_shadow_missed",
+    "mirror_auto_shadow_copy_ns",
     "mirror_auto_trial_buffers", "mirror_auto_trial_open",
 };
 
@@ -153,7 +155,7 @@ struct mirror_auto_session {
     uint64_t life;
     int thermal;
     int window_started;
-    uint64_t last_shadow_ns, last_shadow_bytes, last_missed, last_maintenance_ns, last_wait_ns;
+    uint64_t last_shadow_ns, last_shadow_bytes, last_shadow_copy_ns, last_missed, last_maintenance_ns, last_wait_ns;
     _Atomic int finished;
 };
 
@@ -540,6 +542,7 @@ struct nvn_gpu_vk {
     int mirror_shadow_mode;
     _Atomic int mirror_shadow_seen;
     uint64_t mirror_shadow_fence, mirror_shadow_start_ns;   // g_mu；多个重叠候选只计一段等待。
+    uint64_t mirror_shadow_window_ns;   // g_mu；上次窗口截止时间。
     int land_wait_yield_wsi;
     int land_wait_probe;
     _Atomic uint64_t mirror_wait_signal;  // 真等候期间的旧客体信号，0 表示无采样等待。

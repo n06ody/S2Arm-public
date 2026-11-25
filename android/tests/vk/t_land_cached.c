@@ -519,7 +519,7 @@ static void test_wait_yield(const struct s2a_vk_device *physical, int yield) {
         fprintf(stderr, "WSI did not reach the Vulkan queue while the old writeback was gated: yield=%d submit=%d\n",
                 yield, crossed);
     REQUIRE(crossed == yield);
-    REQUIRE(observed.wsi_locks == 1 && observed.wsi_lock_ns && observed.wsi_during_wait == 1);
+    REQUIRE(observed.wsi_locks == 1 && observed.wsi_during_wait == 1);   // 两次时钟刻度可相同。
     REQUIRE(observed.wsi_overtakes == (unsigned)crossed && observed.buffers == 1);
     REQUIRE(observed.sampled == 1 && !observed.dropped && observed.atoms == 1 &&
             observed.edge_atoms == 1 && observed.edge_waits == 1);

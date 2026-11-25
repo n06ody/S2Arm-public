@@ -194,6 +194,8 @@ int nvn_gpu_mirror_state(nvn_gpu_buf b);
 int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes);
 int nvn_gpu_mirror_visibility_enabled(void);
 int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b);
+// 可选观察接口，报告完成回调实际 memcpy 的单调时钟区间。
+void nvn_gpu_mirror_auto_landing(nvn_gpu_buf b, uint64_t begin_ns, uint64_t end_ns);
 typedef struct { nvn_gpu_buf src; uint64_t offset, bytes; } nvn_gpu_mirror_span;
 // 非一致镜像随段持有到完成回调返回。count 非零、spans 为空表示快照失败，本段粘滞失败。
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count);

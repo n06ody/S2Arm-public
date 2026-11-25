@@ -14,7 +14,7 @@ struct mirror_auto_window {
     int thermal;
 };
 
-enum { MIRROR_AUTO_VERSION = 1, MIRROR_AUTO_RECEIPT_SEC = 1800 };
+enum { MIRROR_AUTO_VERSION = 2, MIRROR_AUTO_RECEIPT_SEC = 1800 };
 struct mirror_auto_receipt {
     uint64_t version, created;
     uint8_t compatibility[32];
@@ -42,12 +42,35 @@ static inline int mirror_auto_match(const struct mirror_auto_window *a, const st
            mirror_auto_close(a->sync_bytes, b->sync_bytes);
 }
 
-// 只准入试测：即使把 shadow 等候按原软件完成延迟全计，仍需给 B 的缓存维护与上传留余量。
+// 只准入试测；影子压力仍需给 B 的真实缓存维护与未知开销留余量。
 static inline int mirror_auto_screen(const struct mirror_auto_window *a) {
     return mirror_auto_valid(a) && a->land_bytes >= 64 * 1024 &&
            a->frame_ms > 1.05 * (a->target_ns / 1e6) &&
            a->copy_ms >= fmax(1.0, 0.05 * a->frame_ms) &&
            a->shadow_wait_ms < 0.5 * a->copy_ms;
+}
+
+static inline uint64_t mirror_auto_overlap_ns(uint64_t begin, uint64_t end, uint64_t wait_begin,
+                                               uint64_t window_begin) {
+    if (begin < wait_begin) begin = wait_begin;
+    if (begin < window_begin) begin = window_begin;
+    return end > begin ? end - begin : 0;
+}
+
+static inline const char *mirror_auto_observe(struct mirror_auto_window *w, double direct_kib,
+                                               double overlap_ms) {
+    const double direct_bytes = direct_kib * 1024.0;
+    if (!mirror_auto_valid(w) || !isfinite(overlap_ms) || overlap_ms < 0)
+        return "insufficient_headroom";
+    if (!isfinite(direct_bytes) || direct_bytes < 0 || direct_bytes > w->sync_bytes ||
+        direct_bytes > 0.10 * w->land_bytes) return "unmodeled_direct_upload";
+    if (!w->land_bytes) return "insufficient_headroom";
+    // 仅估算试测资格。对可能改走有序上传的字节，按原回写每字节耗时收两遍成本。
+    const double upload_ms = 2.0 * (direct_bytes / w->land_bytes) * w->copy_ms;
+    // 只给测到与等待重叠的旧映射 memcpy 折半。GPU 等待和回调其他时间照全额计。
+    const double measured_overlap = fmin(overlap_ms, fmin(w->shadow_wait_ms, w->copy_ms));
+    w->shadow_wait_ms += upload_ms - 0.5 * measured_overlap;
+    return mirror_auto_screen(w) ? NULL : "insufficient_headroom";
 }
 
 static inline int mirror_auto_receipt_valid(const struct mirror_auto_receipt *record,

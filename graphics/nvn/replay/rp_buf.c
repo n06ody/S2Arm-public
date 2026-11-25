@@ -22,6 +22,8 @@
 int nvn_gpu_mirror_state(nvn_gpu_buf b) __attribute__((weak));
 int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_memory_cached
+void nvn_gpu_mirror_auto_landing(nvn_gpu_buf b, uint64_t begin_ns, uint64_t end_ns) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_auto_landing
 static uint64_t res_now(void);
 int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_state
@@ -458,10 +460,12 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
     const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0, cached = 0;
+    nvn_gpu_buf buf = NULL;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
+        buf = s->m[s->gw[i].mi].buf;
+        src = ok ? nvn_gpu_buf_cpu(buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
         cached = s->m[wmi].cached;
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
@@ -479,9 +483,11 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
     if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src + off, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
     if (copy_begin) {
-        const uint64_t copy_ns = res_now() - copy_begin;
+        const uint64_t copy_end = res_now();
+        const uint64_t copy_ns = copy_end - copy_begin;
         rp_perf_add(cached ? RP_PERF_LAND_CACHED_BYTES : RP_PERF_LAND_UNCACHED_BYTES, len);
         rp_perf_add(cached ? RP_PERF_LAND_CACHED_NS : RP_PERF_LAND_UNCACHED_NS, copy_ns);
+        if (!cached && nvn_gpu_mirror_auto_landing) nvn_gpu_mirror_auto_landing(buf, copy_begin, copy_end);
     }
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }

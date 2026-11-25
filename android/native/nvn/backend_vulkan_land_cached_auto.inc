@@ -107,6 +107,15 @@ static void mirror_auto_save(const struct mirror_auto_session *a) {
     pthread_detach(thread);
 }
 
+void nvn_gpu_mirror_auto_landing(nvn_gpu_buf b, uint64_t begin_ns, uint64_t end_ns) {
+    if (!g.mirror_shadow_mode || !b->mirror_candidate || atomic_load(&g.mirror_auto.finished)) return;
+    pthread_mutex_lock(&g_mu);
+    if (g.mirror_shadow_fence)
+        g.stats[STAT_MIRROR_AUTO_SHADOW_COPY_NS] +=
+            mirror_auto_overlap_ns(begin_ns, end_ns, g.mirror_shadow_start_ns, g.mirror_shadow_window_ns);
+    pthread_mutex_unlock(&g_mu);
+}
+
 void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
     struct mirror_auto_session *a = &g.mirror_auto;
     if (!g.land_cached_auto || a->lock_fd < 0 || atomic_load(&a->finished) || !s->frames) return;
@@ -115,8 +124,10 @@ void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
     const int foreground = s2a_android_host_lifecycle ? s2a_android_host_lifecycle(&life) : -1;
     const int thermal = dm_thermal_now ? dm_thermal_now() : -1;
     pthread_mutex_lock(&g_mu);
+    g.mirror_shadow_window_ns = now_ns();
     const uint64_t shadow_ns = g.stats[STAT_MIRROR_AUTO_SHADOW_NS] +
-        (g.mirror_shadow_fence ? now_ns() - g.mirror_shadow_start_ns : 0);
+        (g.mirror_shadow_fence ? g.mirror_shadow_window_ns - g.mirror_shadow_start_ns : 0);
+    const uint64_t shadow_copy_ns = g.stats[STAT_MIRROR_AUTO_SHADOW_COPY_NS];
     const uint64_t shadow_bytes = g.stats[STAT_MIRROR_AUTO_SHADOW_BYTES];
     const uint64_t missed = g.stats[STAT_MIRROR_AUTO_SHADOW_MISSED];
     const uint64_t maintenance = g.stats[STAT_MIRROR_FLUSH_NS] + g.stats[STAT_MIRROR_INV_NS];
@@ -126,13 +137,15 @@ void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
     pthread_mutex_unlock(&g_mu);
     const uint64_t measured_bytes = shadow_bytes - a->last_shadow_bytes;
     const int missed_window = missed != a->last_missed;
-    const struct mirror_auto_window w = {
+    const double raw_wait_ms = (shadow_ns - a->last_shadow_ns) / 1e6 / f;
+    const double overlap_ms = (shadow_copy_ns - a->last_shadow_copy_ns) / 1e6 / f;
+    struct mirror_auto_window w = {
         .frame_ms = s->elapsed_ns / 1e6 / f, .p99_ms = s->p99_ms,
         .present_ms = s->present_ns / 1e6 / f, .acquire_ms = s->acquire_ns / 1e6 / f,
         .land_bytes = (s->uncached_bytes + s->cached_bytes) / f, .draws = s->draws / f, .submits = s->submits / f,
         .sync_bytes = 1024.0 * s->sync_kib / f, .target_ns = s->target_ns, .thermal = thermal,
         .copy_ms = (s->uncached_ns + s->cached_ns) / 1e6 / f,
-        .shadow_wait_ms = (shadow_ns - a->last_shadow_ns) / 1e6 / f,
+        .shadow_wait_ms = raw_wait_ms,
         .maintenance_ms = (maintenance - a->last_maintenance_ns) / 1e6 / f,
         .wait_ms = (wait - a->last_wait_ns) / 1e6 / f,
     };
@@ -142,6 +155,7 @@ void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
     a->window_started = 1;
     a->last_shadow_ns = shadow_ns;
     a->last_shadow_bytes = shadow_bytes;
+    a->last_shadow_copy_ns = shadow_copy_ns;
     a->last_missed = missed;
     a->last_maintenance_ns = maintenance;
     a->last_wait_ns = wait;
@@ -155,25 +169,25 @@ void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
         s->compiling || s->target_changed || !mirror_auto_valid(&w) || w.land_bytes < 64 * 1024) {
         reject = "window_unqualified";
     } else if (!a->trial) {
-        // 证据覆盖不足或大批 CPU 直写可能改走暂存时，影子账太乐观，放弃该窗。
+        // 没采全真实冲突原子或候选不是原映射读回的大头时，不能比较模型里的两条路径。
         if (missed_window || measured_bytes < 0.9 * (s->uncached_bytes + s->cached_bytes) ||
             s->uncached_bytes < 0.9 * (s->uncached_bytes + s->cached_bytes)) reject = "shadow_coverage";
-        else if (s->direct_kib > fmin(64.0 * f, 0.01 * s->sync_kib)) reject = "unmodeled_direct_upload";
-        else if (!mirror_auto_screen(&w)) reject = "insufficient_headroom";
+        else reject = mirror_auto_observe(&w, s->direct_kib / f, overlap_ms);
     } else if (s->cached_bytes < 0.9 * (s->uncached_bytes + s->cached_bytes) ||
                !mirror_auto_match(&a->receipt.baseline[a->n], &w)) {
         reject = "trial_workload";
     }
     if (!reject && a->n && !mirror_auto_match(&a->windows[0], &w)) reject = "window_workload";
-    char window_line[400];
+    char window_line[512];
     snprintf(window_line, sizeof window_line,
              "缓存镜像自动采样 phase=%s result=%s frames=%llu thermal=%d target_ns=%llu "
              "frame_ms=%.3f p99_ms=%.3f land_bytes=%.0f shadow_bytes=%.0f direct_kib=%.2f "
-             "copy_ms=%.3f shadow_wait_ms=%.3f maintenance_ms=%.3f wait_ms=%.3f",
+             "copy_ms=%.3f shadow_wait_ms=%.3f maintenance_ms=%.3f wait_ms=%.3f "
+             "shadow_copy_overlap_ms=%.3f screen_pressure_ms=%.3f",
              a->trial ? "trial" : "observe", reject ? reject : "eligible",
              (unsigned long long)s->frames, thermal, (unsigned long long)w.target_ns, w.frame_ms, w.p99_ms,
              w.land_bytes, measured_bytes / f, s->direct_kib / f,
-             w.copy_ms, w.shadow_wait_ms, w.maintenance_ms, w.wait_ms);
+             w.copy_ms, raw_wait_ms, w.maintenance_ms, w.wait_ms, overlap_ms, w.shadow_wait_ms);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "land-cached", window_line);
     if (reject) {
         a->n = 0;
@@ -186,7 +200,7 @@ void nvn_gpu_mirror_auto_sample(const struct rp_mirror_auto_sample *s) {
     const int keep = !a->trial || mirror_auto_accept(a->receipt.baseline, a->windows);
     char line[320];
     snprintf(line, sizeof line, "缓存镜像自动决策 phase=%s result=%s frame_ms=%.3f/%.3f "
-             "copy_ms=%.3f/%.3f shadow_wait_ms=%.3f/%.3f wait_ms=%.3f/%.3f",
+             "copy_ms=%.3f/%.3f screen_pressure_ms=%.3f/%.3f wait_ms=%.3f/%.3f",
              a->trial ? "trial" : "observe", keep ? (a->trial ? "paired_gain" : "trial_next_open") : "no_paired_gain",
              a->windows[0].frame_ms, a->windows[1].frame_ms, a->windows[0].copy_ms, a->windows[1].copy_ms,
              a->windows[0].shadow_wait_ms, a->windows[1].shadow_wait_ms, a->windows[0].wait_ms, a->windows[1].wait_ms);

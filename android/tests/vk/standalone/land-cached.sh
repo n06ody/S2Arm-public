@@ -18,6 +18,8 @@ backend="$repo/android/native/nvn"
 cc -std=c11 -O1 -Wall -Wextra -Werror -I "$backend" "$repo/android/tests/vk/t_land_cached_auto.c" \
     -lm -o "$out/policy"
 "$out/policy"
+"$out/policy" --retire-overlap
+"$out/policy" --direct-upload
 src=()
 for f in android/tests/vk/t_land_cached.c graphics/nvn/replay/nvn_unimpl.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c android/native/nvn/nvn_vk_format.c graphics/nvn/gfx/nvn/nvn_fmt_expand.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c android/native/direct/sha256.c; do
     src+=("$repo/$f")
