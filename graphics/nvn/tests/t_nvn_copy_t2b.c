@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
 // 真实回放与池镜像账本；GPU 拷贝在完成前由夹具按记录的行距写入镜像。
+#define S2A_T2B_ORIGIN_TEST 1
 #define main replay_fixture_main
 #define nvn_gpu_copy_tex_buf fixture_copy_tex_buf
 #define nvn_gpu_buf_cpu fixture_buf_cpu
@@ -34,6 +35,7 @@ static void fresh(void) {
 }
 static void finish(void) { nvn_be_pool_del(g_pmem); g_buf_cpu_fake = NULL; pass_fresh(); }
 static void test_layered_complete(void) {
+    origin_mode = 1; origin_n = 0; nvn_be_set_frame(57);
     fresh(); tex_t t = mk_tex(810, 0, NVN_FORMAT_RGBA8, 8, 8, 2, 0);
     t.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t.d.depth = 4; nvn_tex_layout(&t.d, &t.L);
     stream s = {0}; p_copy_b2t *p = put_t2b(&s, &t, (uint64_t)(uintptr_t)g_pmem + 64);
@@ -71,6 +73,9 @@ static void test_layered_complete(void) {
         CHECK(g_pmem[64 + i] == want);   // 每行和每层尾部间隙保持原样。
     }
     CHECK(g_pmem[63] == 0x11 && g_pmem[160] == 0x11); finish();
+    CHECK(origin_matches("raw frame=57", "bytes=12 op=t2b stage=-1 slot=-1") == 4);
+    CHECK(origin_matches("window source=t2b", "raw=4/48 merged=4/48 copied=4/48") == 1);
+    origin_mode = 0;
 }
 static void test_failed_segment(void) {
     fresh(); tex_t t = mk_tex(811, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0);
@@ -90,7 +95,7 @@ static void test_reject(void) {
 }
 static void test_registration_rollback(void) {
     fresh(); uint64_t base = (uint64_t)(uintptr_t)g_pmem; nvn_be_sub_begin();
-    CHECK(!rp_post_gpu_write_rows(base + sizeof g_pmem - 4, 4, 8, 8, 2, 1));
+    CHECK(!rp_post_gpu_write_rows(base + sizeof g_pmem - 4, 4, 8, 8, 2, 1, (struct rp_write_source){.op = RP_W_T2B}));
     g_pmem[sizeof g_pmem - 4] = 0x44;
     CHECK(rp_buf_resolve(&g_fake_cmd, base + sizeof g_pmem - 4, 4, NULL, NULL));
     CHECK(mirror[sizeof g_pmem - 4] == 0x44);   // 第二行登记失败，第一行不能残留「GPU 在途」。

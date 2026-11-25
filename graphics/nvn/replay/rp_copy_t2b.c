@@ -66,7 +66,7 @@ void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         nvn_unimpl("tex", "t2b_alignment", rec); return;
     }
     if (!nvn_gpu_buf_cpu(buf)) { nvn_unimpl("buf", "t2b_mirror_not_cpu_visible", rec); return; }
-    if (!rp_post_gpu_write_rows(o->src, bytes, row, img, rows, (uint32_t)nz)) { nvn_unimpl("buf", "t2b_write_registration", rec); return; }
+    if (!rp_post_gpu_write_rows(o->src, bytes, row, img, rows, (uint32_t)nz, (struct rp_write_source){.op = RP_W_T2B})) { nvn_unimpl("buf", "t2b_write_registration", rec); return; }
     NVNcopyRegion r = o->r; r.zoffset = 0; r.depth = 1;
     for (int32_t z = 0; z < nz; z++) {
         uint32_t layer = l0 + (uint32_t)o->r.zoffset + (uint32_t)z;

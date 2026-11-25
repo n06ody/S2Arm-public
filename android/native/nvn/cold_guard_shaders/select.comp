@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+
+// 一个工作组读完调用方已证明可见且不会被并发覆盖的整个域。
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Counters { uint words[]; } counters;
+layout(std430, set = 0, binding = 1) writeonly buffer Draws { uvec4 args[2]; } draws;
+layout(push_constant) uniform Selection {
+    uint first_word;
+    uint stride_words;
+    uint count;
+    uint vertex_count;
+    uint first_vertex;
+} selection;
+
+shared uint bits[64];
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint value = 0;
+    for (uint i = lane; i < selection.count; i += 64)
+        value |= counters.words[selection.first_word + i * selection.stride_words];
+
+    bits[lane] = value;
+    barrier();
+    for (uint n = 32; n > 0; n >>= 1) {
+        if (lane < n) bits[lane] |= bits[lane + n];
+        barrier();
+    }
+
+    if (lane == 0) {
+        // VkDrawIndirectCommand 的四个字段。两次独立 draw 仅其中一笔有实例。
+        uint original = uint(bits[0] != 0);
+        draws.args[0] = uvec4(selection.vertex_count, original, selection.first_vertex, 0);
+        draws.args[1] = uvec4(selection.vertex_count, 1 - original, selection.first_vertex, 0);
+    }
+}

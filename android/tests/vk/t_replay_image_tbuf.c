@@ -35,7 +35,7 @@ uint64_t rp_sub_serial(void) { return 1; }
 uint64_t rp_sub_fence(void) { return 1; }
 int rp_fence_done(uint64_t f) { return f == 0; }
 void rp_occl_draw(nvn_gpu_cmd c) { (void)c; }
-int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
+int rp_post_gpu_write_from(uint64_t a, uint64_t n, struct rp_write_source source) { (void)source; (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) {
     uint64_t start = (uint64_t)(uintptr_t)guest;
     if (a < start || n > sizeof guest || a - start > sizeof guest - n) return 0;
