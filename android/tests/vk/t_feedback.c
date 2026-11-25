@@ -20,6 +20,7 @@ static unsigned long long histogram[4];
 static unsigned copy_count_lines;
 static unsigned long long copy_count[7];
 static unsigned failures,begins,ncases;
+static int pass_time_case;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"fixture failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 #include "feedback_observer.h"
@@ -43,7 +44,7 @@ int nvn_plat_window_size(void *w, uint32_t *x, uint32_t *y) {
     return accounts_mode;
 }
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_fb_copy_count"))return copy_count_mode;if(!strcmp(n,"nvk_gpu_accounts"))return accounts_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
+int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_gpu_pass_time")&&pass_time_case)return 1;if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_fb_copy_count"))return copy_count_mode;if(!strcmp(n,"nvk_gpu_accounts"))return accounts_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
 static unsigned skip_logs;   // 「整池数组免拷快照」逐条日志的条数（限流：每个（管线、图）首次一行；不含「已记满」那一句）
 void nvn_plat_log(int l,const char *c,const char *s){
     (void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");
@@ -368,6 +369,7 @@ int main(int argc,char **argv) {
     copy_mode=atoi(argv[4]);REQUIRE(copy_mode==0||copy_mode==1);
     pool_fb_mode=atoi(argv[5]);REQUIRE(pool_fb_mode==0||pool_fb_mode==1);
     observed_on_begin=on_begin;
+    pass_time_case = getenv("S2A_TEST_FEEDBACK_PASS_TIME") != NULL;
     accounts_mode = getenv("S2A_GPU_ACCOUNTS_FIXTURE") != NULL;
     if (accounts_mode) REQUIRE(!setenv("S2A_VK_BC_DECODE", "force", 1));
     struct s2a_vk_device device;char why[256];
@@ -381,6 +383,12 @@ int main(int argc,char **argv) {
         run_case(&device, argv[1], 16);
         REQUIRE(!s2a_vk_device_destroy(&device,1));
         printf("feedback accounts cases=%u failures=%u\n", ncases, failures);
+        return failures ? 1 : 0;
+    }
+    if (pass_time_case) {
+        run_case(&device, argv[1], 3);
+        REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        printf("feedback cases=%u failures=%u\n", ncases, failures);
         return failures ? 1 : 0;
     }
     // 守卫探针先跑（只录制不提交）：免拷的前提（GENERAL 档、没开旧行为开关）被撤掉时，在后面真执行的案例把驱动跑崩之前就按读数变红。

@@ -33,6 +33,20 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 printf 'feedback validation: sync=1 shader_accesses_heuristic=1 settings=%s\n' "$VK_LAYER_SETTINGS_PATH"
+if [ "${1:-}" = --gpu-pass-time ]; then
+    for dq in 0 1; do
+        log="$out/gpu-pass-time-dq$dq.log"
+        if ! S2A_TEST_FEEDBACK_PASS_TIME=1 timeout 120 "$out/test" "$out/shaders" "$dq" 0 1 1 > "$log" 2>&1 ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+           ! grep -q 'case=3 draws=2 live-overlap=0 copies=2 copy-bad=0 begins=5 begins-bad=0 overlap-bad=0 pixel-bad=0' "$log"; then
+            cat "$log"
+            exit 1
+        fi
+        python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" feedback
+        echo "gpu-pass-time feedback: dq=$dq snapshots=2 draws=2 physical_passes=5 pixel-bad=0 VUID=0 SYNC-HAZARD=0"
+    done
+    exit 0
+fi
 failed=0
 # 案例数：0–11（12）+ 深度 2 + 中止 1 + 16 / 17 + 守卫 18 + 整池组回收 20 = 19；opt=0 另有 15 / 19（要求池里的图都是 GENERAL），共 21；opt=1 共 19。
 cases_want() { echo $((21 - 2 * $1)); }

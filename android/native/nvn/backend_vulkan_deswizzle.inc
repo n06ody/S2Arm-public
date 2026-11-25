@@ -122,7 +122,7 @@ nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_deswizzle.pipe);
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_deswizzle.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g_deswizzle.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, params);
-    vkCmdDispatch(c->cb, (uint32_t)groups, 1, 1);
+    GPU_PT_RECORD(c, GPU_PT_OTHER_COMPUTE, vkCmdDispatch(c->cb, (uint32_t)groups, 1, 1));
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.buffer = output.buf->buffer; barrier.offset = output.off; barrier.size = padded;
     vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
