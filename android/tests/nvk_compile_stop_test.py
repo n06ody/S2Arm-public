@@ -65,6 +65,8 @@ static void ctl_wake_stop(void) {}
 static void ctl_wake(void) {}
 static int stop_window_lock(void) { return pthread_mutex_lock(&g_window_mu); }
 static int nvk_session_wait_compiles(void) { return 0; } // timing exercised separately
+#define LAND_TEST_LINKED_SHADER
+#include "nvk_land_auto_fixture.h"
 static void nvk_session_flush_pipe_cache(void) {}
 static void set_window_error(struct provider_context *c, const char *s) { snprintf(c->window_error, sizeof c->window_error, "%s", s); }
 static pthread_mutex_t stop_test_mu = PTHREAD_MUTEX_INITIALIZER;

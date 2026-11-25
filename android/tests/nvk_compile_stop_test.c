@@ -19,6 +19,9 @@ int main(int argc, char **argv) {
     snprintf(ctx.profile_hash, sizeof ctx.profile_hash, "%s", phash); snprintf(ctx.closure, sizeof ctx.closure, "%s", "closure-test");
     g_active_context = &ctx; atomic_store(&g_stop_published, 0); atomic_store(&g_session_active, 1);
     if (frame_test) {
+        g.land_auto = g.land_readback = 1;
+        land_auto_check_gap_locked(LA_SECOND);
+        nvn_gpu_land_auto_present(LA_SECOND, 1, 1, 1, 1, 1.0 / 60);
         if (strcmp(argv[1], "frame-empty")) {
             s2a_frame_log_present_timed(3000, 7000);
             nvn_vk_frame_log_fence_wait(2500000);
@@ -29,6 +32,15 @@ int main(int argc, char **argv) {
         nvn_vk_frame_log_fence_wait(13000000);
         s2a_frame_log_present_timed(17000, 19000);
         int second = request_stop_impl(&ctx);
+        if (lines != 1 || !strstr(decision, "phase=exit mode=0 reason=insufficient_samples ")) {
+            fprintf(stderr, "FAIL: retained Stop must report the auto decision on entry to retirement\n");
+            return 1;
+        }
+        land_auto_exit_locked();
+        if (lines != 1) {
+            fprintf(stderr, "FAIL: close after retained Stop repeated the auto exit decision\n");
+            return 1;
+        }
         if (first != S2A_DIRECT_RES_RETIREMENT || second != first || g_retained_context != &ctx) {
             fprintf(stderr, "FAIL: frame dump Stop must retain the session\n");
             return 1;

@@ -4863,10 +4863,8 @@ static void t_dispatch(void) {
     stream s2 = {0}; dp = put(&s2, OP_DISPATCH, sizeof *dp); dp->x = 1; dp->y = 1; dp->z = 1; end(&s2);
     submit1(&s2); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && g_cpipe_gets == 1 && g_pmem[PG + 64] == 0x22);   // 同一个程序不重建管线；失败不回写
-    g_pg_gen[1] = 107; g_dirty_now = 108; g_nbw = 0;
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[PG] == 0x22 && mirror[2 * PG - 1] == 0x22);
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    // 终态不推进已完成值。直接查撤登记，不在失败时间线上模拟下一次成功的镜像同步。
+    CHECK(rp_buf_gpu_write_pending(base + PG, PG) == 0);
     // 取不到程序：记账跳过，不派发
     g_cresolve_rc = -1; submit1(&s2); fake_complete(NVN_GPU_DONE_OK);
     CHECK(g_ndisp == 2 && nvn_unimpl_count("draw", "compute_program_unresolved") == 1);
@@ -5583,10 +5581,7 @@ static void t_dispatch_ubop_rw(void) {
     stream f = {0}; put_dispatch1(&f); end(&f);
     submit1(&f); fake_complete(NVN_GPU_DONE_FAILED);
     CHECK(g_ndisp == 2 && pmem_all(2 * PG, 4 * PG, 0x22));                                                         // 派发了、这一段失败：游戏内存还是游戏自己的
-    g_pg_gen[2] = g_pg_gen[3] = 101; g_dirty_now = 102; g_nbw = 0;                                                 // 游戏又写了这两页
-    nvn_be_sub_begin();
-    CHECK(rp_buf_resolve(&g_fake_cmd, base + 2 * PG, 2 * PG, NULL, NULL) == 1 && g_nbw == 0 && mirror[2 * PG + 32] == 0x22 && mirror[2 * PG + 127] == 0x22 && mirror[3 * PG + 16] == 0x22 && mirror[3 * PG + 63] == 0x22);   // 两段都重传了：登记已撤
-    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    CHECK(rp_buf_gpu_write_pending(base + 2 * PG, 2 * PG) == 0);   // 两段登记均已撤，失败值仍未完成
     g_buf_cpu_fake = NULL; nvn_be_pool_del(g_pmem); pass_fresh();
 }
 
@@ -6903,6 +6898,11 @@ static void t_bind_reuse(void) {   // 按脏位少发绑定：没变的阶段不
 // ADPF 帧负载上报接在新层出图点：出图前对本帧报 frame_end（目标 = 游戏周期），出图后对下一帧开 work_begin；没有显示面时关会话、不报。
 //   期望（手算）：无显示面出图 → invisible 1 次、frame_end / work_begin 0 次；有显示面、周期 1/30 s：
 //   第 1 次 → frame_end(33333333, 1)、work_begin(2)；第 2 次 → frame_end(33333333, 2)、work_begin(3)。
+static double g_land_period;
+void nvn_gpu_land_auto_present(uint64_t now, uint64_t acquire, uint64_t present, uint64_t draws, int target, double period_s) {
+    (void)now; (void)acquire; (void)present; (void)draws; (void)target;
+    g_land_period = period_s;
+}
 static void t_present_adpf(void) {
     pass_fresh(); rp_present_reset(); memset(g_acq_script, 0, sizeof g_acq_script); g_acq_i = 0;
     g_adpf_begin_n = g_adpf_end_n = g_adpf_invis_n = 0; g_adpf_begin_seq = g_adpf_end_seq = 0; g_adpf_end_target = 0;
@@ -6912,6 +6912,7 @@ static void t_present_adpf(void) {
     CHECK(g_adpf_invis_n == 1 && g_adpf_end_n == 0 && g_adpf_begin_n == 0);
     rp_present_set_surface(&g_fake_surf, 60);
     nvn_be_present(&t, 1.0 / 30, NULL);
+    CHECK(g_land_period == 1.0 / 30);   // 60 Hz 显示面上的实际 30 fps 呈现上限
     CHECK(g_adpf_end_n == 1 && g_adpf_end_seq == 1 && g_adpf_end_target == 33333333 && g_adpf_begin_n == 1 && g_adpf_begin_seq == 2);
     nvn_be_present(&t, 1.0 / 30, NULL);
     CHECK(g_adpf_end_n == 2 && g_adpf_end_seq == 2 && g_adpf_begin_n == 2 && g_adpf_begin_seq == 3 && g_adpf_invis_n == 1);
