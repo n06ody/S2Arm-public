@@ -1244,7 +1244,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (clamped & 2) nvn_unimpl("draw", "storage_buffer_past_pool_end_clamped", rec);   // 伸出池尾的部分没有存储：照画，具名记账
                 // 回写只登记游戏绑定的那一段（窗口前补的余数字节不是这个缓冲的，回写会盖掉相邻内容）
                 if (e->access & NVN_GPU_ACC_W) { const uint64_t reach = wa + wl - sb->addr;   // 窗口里属于这个缓冲的长度（余数 < 对齐 ≤ 256，上限 ≥ 128 MiB，不会为负）
-                    rp_post_gpu_write(sb->addr, reach < blen ? reach : blen); }
+                    struct rp_write_source source = {sbufp ? RP_W_SSBO : RP_W_UBOP, st, e->src_reg};
+                    rp_post_gpu_write_from(sb->addr, reach < blen ? reach : blen, source); }
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
                 // 指针字节必须当前：先按写的来源解析那 8 字节（池镜像里 GPU 写过的部分不会被旧 guest 字节盖掉），
@@ -2300,7 +2301,7 @@ static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, i
     const int write = (e->access & NVN_GPU_ACC_W) != 0;
     const char *why = texel_bind(c, buf, off, bytes, base.bytes, vfmt, gfx ? 2 : 1, write, out);
     if (why) return why;
-    if (write) rp_post_gpu_write((uint64_t)(uintptr_t)t.mem, bytes);
+    if (write) rp_post_gpu_write_from((uint64_t)(uintptr_t)t.mem, bytes, (struct rp_write_source){RP_W_IMAGE_TBUF, stage, e->src_reg});
     return NULL;
 }
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {

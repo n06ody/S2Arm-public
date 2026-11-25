@@ -65,7 +65,7 @@ void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
 int rp_occl_want(void){return 0;}void rp_occl_pass_opened(int d){REQUIRE(!d);}
 void rp_occl_pass_closed(void){}void rp_occl_pause(nvn_gpu_cmd c){(void)c;}
 static uint64_t write_key,write_id;
-int rp_post_gpu_write(uint64_t a,uint64_t n){REQUIRE(!write_id);write_id=rp_buf_gpu_write_note(a,n,&write_key);REQUIRE(write_id);return 1;}
+int rp_post_gpu_write_from(uint64_t a,uint64_t n, struct rp_write_source source) { REQUIRE(!write_id);write_id=rp_buf_gpu_write_note_from(a,n,&write_key,NULL,source);REQUIRE(write_id);return 1;}
 int rp_pool_find(uint64_t a,uint64_t n,const uint8_t **m,uint64_t *s){uint64_t base=(uint64_t)(uintptr_t)guest;if(a<base||n>sizeof guest||a-base>sizeof guest-n)return 0;if(m)*m=guest;if(s)*s=sizeof guest;return 1;}
 // Deliberately untracked pool: use the replay core's conservative synchronization.
 size_t nvn_dirty_page_size(void){return 4096;}uint64_t nvn_dirty_now(void){return 1;}

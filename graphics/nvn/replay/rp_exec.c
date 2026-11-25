@@ -570,7 +570,7 @@ static void post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
 // 仅登记真正写到的行，不把行间 / 片间填充覆盖回游戏内存。
 // 数据相关重叠（nvk_sync_lag=4）：这一栅栏之后是否有「显卡会写游戏缓冲」的活。有 → 真等（游戏接下来要读它）；
 // 没有（只画不写）→ 放行，让 CPU 回放与显卡执行重叠。计算派发写存储缓冲 / 存储图像时走 rp_post_gpu_write* 登记，这里就是信号源。
-int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images, struct rp_write_source source) {
     __atomic_store_n(&g_wrote_since_wait, 1, __ATOMIC_RELEASE);
     struct sub *s = g_sub; uint64_t count = (uint64_t)rows * images;
     if (!s || !bytes || !count || count > (uint64_t)(INT_MAX - s->ngw)) return 0;
@@ -587,7 +587,7 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
     // 只有单笔（存储缓冲写）才允许并进本次提交里已有的登记：多行的失败回滚只能撤掉「这一次新记的」，已有那条被扩大后缩不回去
     // （扩出去的字节从没被显卡写过，落地会拿镜像里可能偏旧的内容盖掉游戏内存）。
     for (uint32_t z = 0; z < images; z++) for (uint32_t y = 0; y < rows; y++) {
-        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note2(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, &key, count == 1 ? &merged : NULL);
+        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note_from(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, &key, count == 1 ? &merged : NULL, source);
         if (!id) {
             while (s->ngw > start) { struct gw_ev v = s->gw[--s->ngw]; rp_buf_gpu_write_land(v.pool_key, v.id, 0); }
             return 0;
@@ -597,7 +597,12 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
     }
     return 1;
 }
-int rp_post_gpu_write(uint64_t addr, uint64_t len) { return rp_post_gpu_write_rows(addr, len, len, len, 1, 1); }
+int rp_post_gpu_write_from(uint64_t addr, uint64_t len, struct rp_write_source source) {
+    return rp_post_gpu_write_rows(addr, len, len, len, 1, 1, source);
+}
+int rp_post_gpu_write(uint64_t addr, uint64_t len) {
+    return rp_post_gpu_write_from(addr, len, (struct rp_write_source){.op = RP_W_UNKNOWN});
+}
 
 static void post_report(uint64_t addr, uint32_t type) {
     struct sub *s = g_sub; if (!s || !addr) return;

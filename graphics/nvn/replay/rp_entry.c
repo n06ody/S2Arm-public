@@ -299,10 +299,10 @@ void nvn_be_set_origin_lower_left(int on) { g_origin_ll = on; }
 static int g_present_ll = -1;
 void nvn_be_set_present_lower_left(int on) { g_present_ll = on; }
 int rp_present_lower_left(void) { return g_present_ll >= 0 ? g_present_ll : g_origin_ll; }
-void nvn_be_set_frame(uint64_t f) { g_frame = f; }
+void nvn_be_set_frame(uint64_t f) { __atomic_store_n(&g_frame, f, __ATOMIC_RELAXED); }
 int rp_depth_zero(void) { return g_depth_zero; }
 int rp_origin_lower_left(void) { return g_origin_ll; }
-uint64_t rp_frame(void) { return g_frame; }
+uint64_t rp_frame(void) { return __atomic_load_n(&g_frame, __ATOMIC_RELAXED); }
 
 // ---------- 事件 / 跨队列：GPU 侧等事件未接（OP_SIGNAL_EVENT+WAIT），所以没有停住的队列 ----------
 void nvn_be_event_written(volatile uint32_t *val) { (void)val; }

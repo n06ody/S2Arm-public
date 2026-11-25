@@ -40,7 +40,22 @@ static int g_dl_unread, g_dl_lines;   // 逐笔日志（cls "draw"）：含「�
 static int g_mm_lines; static char g_mm_last[200];   // #1810：「贴图类型不符」行数与最近一行
 static char g_spill_line[300]; static const char *g_cs_note_stub;   // spill 派发日志行（回放层，cls "replay"）/ 后端给的「没走出库」原因替身
 const char *nvk_shader_cs_lib_note(const uint8_t key[8]) { (void)key; return g_cs_note_stub; }   // 弱符号的真实现在 nvk_shader.c；这里给回放核心用例一个可控替身
-void nvn_plat_log(int level, const char *cls, const char *text) { if (cls && text && !strcmp(cls, "replay") && strstr(text, "spill 派发")) snprintf(g_spill_line, sizeof g_spill_line, "%s", text); if (cls && text && !strcmp(cls, "tex") && strstr(text, "贴图类型不符")) { g_mm_lines++; snprintf(g_mm_last, sizeof g_mm_last, "%s", text); } if (cls && text && !strcmp(cls, "draw")) { if (strstr(text, "读不到")) g_dl_unread++; if (strstr(text, " 存")) g_dl_lines++; } if (cls && !strcmp(cls, "tex-reupload-summary")) { snprintf(g_tdiag_summary, sizeof g_tdiag_summary, "%s", text); g_tdiag_summaries++; return; } if (cls && !strcmp(cls, "tex-reupload")) { if (g_tdiag_n < 32) snprintf(g_tdiag_lines[g_tdiag_n], 320, "%s", text); g_tdiag_n++; return; } if (level == NVN_PLAT_LOG_INFO && text && strstr(text, "类型 3 句柄的采样器号")) { g_csd_lines++; snprintf(g_csd_line, sizeof g_csd_line, "%s", text); } if (level == NVN_PLAT_LOG_INFO && text && strstr(text, "常量缓冲句柄指向没登记的贴图号")) { g_ubo_zero_lines++; snprintf(g_ubo_zero_line, sizeof g_ubo_zero_line, "%s", text); } if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED && text && strstr(text, "图形管线建失败")) { g_pf_red++; snprintf(g_pf_last, sizeof g_pf_last, "%s", text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
+static int origin_mode, origin_n;
+static char origin_lines[64][512];
+#if defined(S2A_GPU_LAND_TEST) || defined(S2A_T2B_ORIGIN_TEST)
+static int origin_matches(const char *a, const char *b) {
+    int hits = 0;
+    for (int i = 0; i < origin_n; i++)
+        if (strstr(origin_lines[i], a) && strstr(origin_lines[i], b)) hits++;
+    return hits;
+}
+#endif
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (cls && !strcmp(cls, "land-origin")) {
+        if (origin_n < 64) snprintf(origin_lines[origin_n++], sizeof origin_lines[0], "%s", text);
+        return;
+    }
+ if (cls && text && !strcmp(cls, "replay") && strstr(text, "spill 派发")) snprintf(g_spill_line, sizeof g_spill_line, "%s", text); if (cls && text && !strcmp(cls, "tex") && strstr(text, "贴图类型不符")) { g_mm_lines++; snprintf(g_mm_last, sizeof g_mm_last, "%s", text); } if (cls && text && !strcmp(cls, "draw")) { if (strstr(text, "读不到")) g_dl_unread++; if (strstr(text, " 存")) g_dl_lines++; } if (cls && !strcmp(cls, "tex-reupload-summary")) { snprintf(g_tdiag_summary, sizeof g_tdiag_summary, "%s", text); g_tdiag_summaries++; return; } if (cls && !strcmp(cls, "tex-reupload")) { if (g_tdiag_n < 32) snprintf(g_tdiag_lines[g_tdiag_n], 320, "%s", text); g_tdiag_n++; return; } if (level == NVN_PLAT_LOG_INFO && text && strstr(text, "类型 3 句柄的采样器号")) { g_csd_lines++; snprintf(g_csd_line, sizeof g_csd_line, "%s", text); } if (level == NVN_PLAT_LOG_INFO && text && strstr(text, "常量缓冲句柄指向没登记的贴图号")) { g_ubo_zero_lines++; snprintf(g_ubo_zero_line, sizeof g_ubo_zero_line, "%s", text); } if (cls && !strcmp(cls, "poolstats")) { if (g_ps_n < 8) snprintf(g_ps_lines[g_ps_n], 320, "%s", text); g_ps_n++; return; } if(level == NVN_PLAT_LOG_RED && strstr(text,"后续不同原因详情省略（最多8）"))g_arena_truncated_lines++; if (level == NVN_PLAT_LOG_RED && strstr(text,"arena_alloc_failed rc=")) { if(g_arena_detail_lines<32)snprintf(g_arena697_lines[g_arena_detail_lines],256,"%s",text); g_arena_detail_lines++; snprintf(g_arena_detail,sizeof g_arena_detail,"%s",text); } if (level == NVN_PLAT_LOG_RED && text && strstr(text, "图形管线建失败")) { g_pf_red++; snprintf(g_pf_last, sizeof g_pf_last, "%s", text); } if (level == NVN_PLAT_LOG_RED) { g_red_lines++; snprintf(g_last_red, sizeof g_last_red, "%s", text); } }
 static int g_flag_finish_lag;   // 用例设：开关 nvk_finish_lag 的值
 static int g_flag_spill = 1;    // 用例设：开关 nvk_spill（缺省同产品：开）
 static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产品缺省 1＝允许一格在飞；用例固定 0，测的是「真等」这条契约）
@@ -58,6 +73,9 @@ static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产�
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_land_origin")) return origin_mode;
+    if (!strcmp(name, "nvk_land_origin_frame")) return 57;
+
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "nvk_land_noresync")) return g_flag_land_noresync < 0 ? dflt : g_flag_land_noresync;
@@ -5185,6 +5203,121 @@ static void t_gpu_land_count_cleanup(void) {
     CHECK(rp_test_gw_live() == 0);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); g_pg_tracked = 1; g_buf_cpu_auto = 0; pass_fresh();
 }
+extern void rp_test_gw_merge_reload(void);
+static void t_land_origin(void) {
+    for (int enabled = 0; enabled <= 1; enabled++) {
+        pass_fresh();
+        origin_mode = enabled; origin_n = 0;
+        g_buf_cpu_auto = 1; g_flag_land_merge = 1; rp_test_gw_merge_reload();
+        nvn_be_set_frame(57);
+        uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+        nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        nvn_be_sub_begin();
+        nvn_gpu_buf b;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+        CHECK(rp_post_gpu_write(base + 64, 8) && rp_post_gpu_write(base + 80, 8));
+        p_clear_buf clear = {.addr = base + 68, .size = 16};
+        g_gx_rec = 1; g_ngx = 0;
+        CHECK(rp_op_clear_buf_gpu(&g_fake_cmd, &clear, NULL));
+        g_gx_rec = 0;
+        g_land_copied = 0;
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        CHECK(g_land_copied == 24);
+        nvn_be_pool_del(g_pmem); nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+        CHECK(rp_post_gpu_write(base + 64, 4));
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_FAILED);
+        nvn_be_set_frame(58);
+        nvn_be_shutdown_session();
+        if (enabled) {
+            CHECK(origin_matches("segment ", "off=64 bytes=24 copied=24") == 1);
+            CHECK(origin_matches("source=mixed", "raw=3/32") == 1);
+            CHECK(origin_matches("segment ", "off=64 bytes=4 copied=0") == 1);
+            CHECK(origin_matches("source=all", "raw=4/36 merged=2/28 copied=1/24 discarded=1/4") == 1);
+            CHECK(origin_matches("raw frame=57", "op=fill stage=-1 slot=-1") == 1);
+            CHECK(origin_matches("absorb frame=57", " into=") == 1);
+            CHECK(origin_matches("frame=57 closed=4 cross_frame=0 status=complete", "source=frame raw=4/36 merged=2/28 copied=1/24 discarded=1/4") == 1);
+            unsigned long long pool[2] = {0}, write[2] = {0};
+            int n = 0;
+            for (int i = 0; i < origin_n && n < 2; i++)
+                if (sscanf(origin_lines[i], "segment frame=57 pool=%llu write=%llu", &pool[n], &write[n]) == 2) n++;
+            CHECK(n == 2 && pool[0] && pool[1] != pool[0] && write[0] && write[1] != write[0]);
+        } else CHECK(origin_n == 0);
+    }
+    origin_mode = 0; g_buf_cpu_auto = 0;
+}
+// 同 op 的不同槽、不同阶段仍是 mixed。跨五秒窗记录已接收的原始登记和稍后撤账的并集。
+static void t_land_origin_masks(void) {
+    pass_fresh(); origin_mode = 1; origin_n = 0; g_buf_cpu_auto = 1;
+    nvn_be_set_frame(57);
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem, key = 0;
+    nvn_be_pool_add(g_pmem, sizeof g_pmem); nvn_be_sub_begin();
+    nvn_gpu_buf b;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+    for (int i = 0; i < 3; i++) {
+        const struct rp_write_source first = {RP_W_SSBO, 0, 2};
+        const struct rp_write_source next = {RP_W_SSBO, i == 1 ? 5 : 0, i == 2 ? 3 : 2};
+        CHECK(rp_post_gpu_write_from(base + 32 * i, 8, first));
+        CHECK(rp_post_gpu_write_from(base + 32 * i, 8, next));
+    }
+    rp_land_origin_report();
+    CHECK(origin_matches("window source=all", "raw=6/48 merged=0/0 copied=0/0") == 1);
+    CHECK(origin_matches("pending ", "raw=6/48") == 1);
+    nvn_be_set_frame(58); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    rp_land_origin_report();
+    CHECK(origin_matches("segment ", "source=ssbo ops=2 stages=1 slots=4") == 1);
+    CHECK(origin_matches("segment ", "source=mixed ops=2 stages=21 slots=4") == 1);
+    CHECK(origin_matches("segment ", "source=mixed ops=2 stages=1 slots=c") == 1);
+    CHECK(origin_matches("source=all raw=0/0 merged=3/24 copied=3/24", "settled=6/48") == 1);
+    CHECK(origin_matches("closed=6 cross_frame=0 status=complete", "source=frame raw=6/48 merged=3/24") == 1);
+    // 同址新池带着新登记；旧池迟到的成功回调不得挪用新登记。
+    nvn_be_sub_begin();
+    uint64_t old = rp_buf_gpu_write_note(base + 8, 3, &key);
+    nvn_be_pool_del(g_pmem); nvn_be_pool_add(g_pmem, sizeof g_pmem);
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+    uint64_t current = rp_buf_gpu_write_note(base + 8, 5, &key);
+    CHECK(old && current && old != current);
+    rp_buf_gpu_write_land(key, old, 1);
+    rp_buf_gpu_write_land(key, current, 1);
+    rp_land_origin_report();
+    CHECK(origin_matches("window source=all", "raw=2/8 merged=2/8 copied=1/5 discarded=1/3") == 1);
+    CHECK(origin_matches("raw frame=", "frame=58 ") == 0);
+    CHECK(origin_matches("segment ", "frame=58 ") == 0);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_pool_del(g_pmem); pass_fresh(); origin_mode = 0; g_buf_cpu_auto = 0;
+}
+static void t_bufops_gpu_order(void);
+static void t_image_tbuf_replay(void);
+static void t_land_origin_producers(void) {
+    uint64_t saved_frame = rp_frame();
+    nvn_be_set_frame(57);
+    origin_mode = 1; origin_n = 0;
+    t_sbuf_window();
+    CHECK(origin_matches("raw frame=57", "op=ssbo stage=5 slot=1") == 1);
+    origin_n = 0; t_bufops_gpu_order();
+    CHECK(origin_matches("raw frame=57", "op=ubo_ptr stage=5 slot=2") == 3);
+    CHECK(origin_matches("raw frame=57", "op=copy stage=-1 slot=-1") == 1);
+    CHECK(origin_matches("raw frame=57", "op=fill stage=-1 slot=-1") == 1);
+    CHECK(origin_matches("raw frame=57", "op=update") == 0); // 此例的 update 走 CPU
+    origin_n = 0; t_image_tbuf_replay();
+    CHECK(origin_matches("raw frame=57", "op=image_tbuf stage=5 slot=2") == 2);
+    origin_n = 0; g_buf_cpu_auto = 1;
+    uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+    nvn_be_pool_add(g_pmem, sizeof g_pmem); nvn_be_sub_begin();
+    nvn_gpu_buf b;
+    CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &b, NULL));
+    CHECK(rp_post_gpu_write(base + 64, 8));
+    uint64_t update[3] = {base + 64, 8, 42};
+    CHECK(rp_op_update_ub_gpu(&g_fake_cmd, update, NULL));
+    nvn_be_set_frame(58);
+    CHECK(rp_post_gpu_write(base + 64, 8)); // 同一提交跨帧合并，单帧总量必须标出边界
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); rp_land_origin_report();
+    CHECK(origin_matches("raw frame=57", "op=update stage=-1 slot=-1") == 1);
+    CHECK(origin_matches("frame=57 closed=2 cross_frame=1 status=cross_frame", "merged=1/8 copied=1/8") == 1);
+    nvn_be_pool_del(g_pmem); pass_fresh();
+    origin_mode = 0; g_buf_cpu_auto = 0; nvn_be_set_frame(saved_frame);
+}
 // 同段合并（开关 nvk_land_merge）：同一次提交里与已登记的显卡写相交 / 首尾相接的登记并成一条，落地只拷一遍（真机 3D 那款标题每帧 ~170 条、共 ~920 MB 在落地线程上拷）。
 // 期望值全部手算：池 g_pmem 镜像初值 0x11，「显卡写」的内容用例自己放（0xCC）。
 //   ① 同一段再登记 / 被包含 / 向后重叠 / 首尾相接 → 并成同一条（返回同一登记号，*merged = 1），区间 [64,104) → [64,112)；
@@ -5253,7 +5386,7 @@ static void t_gpu_land_merge(void) {
     CHECK(bad == 0 && g_pmem[599] == 0x11 && g_pmem[640] == 0x11);
     // 多行登记（读回 / 图像写，一次登记几行）不并：失败回滚只能撤掉「这一次新记的」，已有那条被扩大后缩不回。两行 [800,816) 与 [808,824) 相交也各记一条
     nvn_be_sub_begin();
-    CHECK(rp_post_gpu_write_rows(base + 800, 16, 8, 0, 2, 1) && rp_test_gw_live() == 2);
+    CHECK(rp_post_gpu_write_rows(base + 800, 16, 8, 0, 2, 1, (struct rp_write_source){.op = RP_W_T2B}) && rp_test_gw_live() == 2);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     CHECK(rp_test_gw_live() == 0);
     g_flag_land_merge = 0; rp_test_gw_merge_reload();                                                       // 同样三笔，开关关：三条、落地 3 次共 56 字节
@@ -8081,6 +8214,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-count")) { t_gpu_land_count_cleanup(); printf("gpu land count: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-destroy")) { t_gpu_land_destroy(); printf("gpu land destroy: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land")) { t_gpu_land_concurrent(); printf("gpu land: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
+    if (argc > 1 && !strcmp(argv[1], "--land-origin")) {
+        t_land_origin(); t_land_origin_masks(); t_land_origin_producers();
+        printf("land origin: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-merge")) { t_gpu_land_merge(); printf("gpu land merge: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
 #endif
     if (argc > 1 && !strcmp(argv[1], "--cbuf-device-range")) { t_cbuf_device_range(); printf("CBUF range: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
@@ -8135,6 +8272,7 @@ int main(int argc, char **argv) {
     t_land_noresync();
     t_gpu_land_count_cleanup();
     t_gpu_land_merge();
+    t_land_origin(); t_land_origin_masks(); t_land_origin_producers();
 #endif
     t_pool_gone_hold();
     t_buf_mirror();

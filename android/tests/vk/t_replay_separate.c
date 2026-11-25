@@ -25,7 +25,7 @@ void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }
 uint64_t rp_frame(void) { return 1; }   // #996：rp_draw 首用策略按帧号判（rp_entry.c 的替身）
 uint64_t rp_seg_serial(void) { return segment; }
 void rp_occl_draw(nvn_gpu_cmd c) { (void)c; }
-int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
+int rp_post_gpu_write_from(uint64_t a, uint64_t n, struct rp_write_source source) { (void)source; (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) { (void)a; (void)n; (void)m; (void)s; return 0; }
 // 本夹具没有存储缓冲声明；空存储语义由真实 rp_buf GPU 用例验证。
 nvn_gpu_buf rp_buf_for_null_storage(void) { return NULL; }
