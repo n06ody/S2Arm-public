@@ -24,12 +24,22 @@ assert int(window["presents"]) == 2, window
 assert int(window["measured_segments"]) == 5, window
 assert int(window["missing_queries"]) == int(window["missing_gaps"]) == 0, window
 assert int(window["gap_pairs"]) == 4, window
+fixture, = [row(line) for line in lines if "gpu-pass-time fixture " in line]
+assert abs(float(window["segment_ms"]) + float(window["gap_ms"]) -
+           float(window["overlap_ms"]) - float(window["total_ms"])) < 0.000003
+if sys.argv[2] == "light":
+    assert window["mode"] == "segment", window
+    assert "residual_ms" not in window and "render_ms" not in window and not tops, window
+    writes = int(fixture["writes"])
+    assert int(fixture["reads"]) == 5 and 11 <= writes <= 15, fixture
+    assert int(fixture["resets"]) == writes, fixture
+    sys.exit(0)
+assert window["mode"] == "full", window
 cap = sys.argv[2] == "cap"
 assert int(window["render_spans"]) == (258 if cap else 6), window
 assert int(window["cap_dropped"]) == (6 if cap else 0), window
 assert int(window["missing_spans"]) == 0, window
 assert int(window["mirror_sync_spans"]) == (1 if cap else 2), window
-fixture, = [row(line) for line in lines if "gpu-pass-time fixture " in line]
 assert 1 <= int(fixture["pools"]) <= 3 and int(fixture["writes"]) > 0, fixture
 assert float(window["render_ms"]) > 0, window
 assert float(window["blit_ms"]) > 0, window
@@ -41,5 +51,12 @@ assert abs(sum(float(top["ms_per_present"]) for top in tops) - float(window["ren
 buckets = ("render", "guest_compute", "bc_decode", "astc_encode", "transfer", "copy", "blit",
            "fb_copy", "clear", "mirror_sync", "other_compute", "residual")
 assert abs(sum(float(window[key + "_ms"]) for key in buckets) - float(window["segment_ms"])) < 0.00002
-assert abs(float(window["segment_ms"]) + float(window["gap_ms"]) -
-           float(window["overlap_ms"]) - float(window["total_ms"])) < 0.000003
+clears = ("clear_wsi", "clear_texture", "clear_buffer", "clear_bc_shadow")
+assert sum(int(window[bucket + "_spans"]) for bucket in clears) == int(window["clear_spans"]), window
+assert abs(sum(float(window[bucket + "_ms"]) for bucket in clears) - float(window["clear_ms"])) < 0.000003
+if sys.argv[2] == "sources":
+    assert [int(window[bucket + "_spans"]) for bucket in clears] == [2, 6, 2, 1], window
+    usage, = [row(line) for line in lines if "nvk-gpu-pass-time clear-first-use " in line]
+    assert [int(usage[key]) for key in ("tracked", "attachment", "transfer_read", "tail", "cap_dropped")] == [
+        6, 2, 2, 2, 0,
+    ], usage

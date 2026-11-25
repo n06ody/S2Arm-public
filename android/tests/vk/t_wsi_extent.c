@@ -20,8 +20,9 @@ static VkSurfaceTransformFlagsKHR supported;
 static int suboptimal;
 static nvn_gpu_view source;
 static const char *pass_time_mode;
-static atomic_uint timestamp_pools, timestamp_reads, timestamp_writes;
+static atomic_uint timestamp_pools, timestamp_reads, timestamp_writes, timestamp_resets;
 static int drop_timestamp_results;
+static int pass_time_light, pass_time_sources;
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "fixture failure line %d: %s (%s)\n", __LINE__, #x, error.why); exit(2); } } while (0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 
@@ -45,7 +46,7 @@ void nvn_plat_safepoint(void) {}
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_pipe_cache")) return 0;
     if (pass_time_mode && !strcmp(name, "nvk_dq")) return atoi(getenv("S2A_TEST_DQ"));
-    if (pass_time_mode && !strcmp(name, "nvk_gpu_pass_time") && strcmp(pass_time_mode, "off")) return 1;
+    if (pass_time_mode && !strcmp(name, "nvk_gpu_pass_time") && strcmp(pass_time_mode, "off")) return pass_time_light ? 2 : 1;
     return dflt;
 }
 void nvn_plat_log(int level, const char *cls, const char *text) {
@@ -94,14 +95,17 @@ extern __typeof__(vkCreateQueryPool) __real_vkCreateQueryPool;
 extern __typeof__(vkGetQueryPoolResults) __real_vkGetQueryPoolResults;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateQueryPool(VkDevice d, const VkQueryPoolCreateInfo *info,
         const VkAllocationCallbacks *a, VkQueryPool *pool) {
-    if (info->queryType == VK_QUERY_TYPE_TIMESTAMP && info->queryCount > 1)
+    if (info->queryType == VK_QUERY_TYPE_TIMESTAMP && info->queryCount > 1) {
+        if (pass_time_light) REQUIRE(info->queryCount == 3);
         atomic_fetch_add(&timestamp_pools, 1);
+    }
     return __real_vkCreateQueryPool(d, info, a, pool);
 }
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkGetQueryPoolResults(VkDevice d, VkQueryPool pool, uint32_t first,
         uint32_t count, size_t size, void *out, VkDeviceSize stride, VkQueryResultFlags flags) {
     if (pass_time_mode && count > 1) {
         REQUIRE(!(flags & VK_QUERY_RESULT_WAIT_BIT));
+        if (pass_time_light) REQUIRE(first == 0 && count == 2);
         atomic_fetch_add(&timestamp_reads, 1);
         if (drop_timestamp_results) return VK_NOT_READY;
     }
@@ -114,10 +118,17 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkGetQueryPoolRes
 // both DQ modes while forwarding the original driver entry.
 extern __typeof__(vkGetDeviceProcAddr) __real_vkGetDeviceProcAddr;
 static PFN_vkCmdWriteTimestamp timestamp_write;
+static PFN_vkCmdResetQueryPool timestamp_reset;
 VKAPI_ATTR void VKAPI_CALL record_timestamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage,
         VkQueryPool pool, uint32_t index) {
+    if (pass_time_light) REQUIRE(index < 3);
     atomic_fetch_add(&timestamp_writes, 1);
     timestamp_write(cb, stage, pool, index);
+}
+VKAPI_ATTR void VKAPI_CALL record_query_reset(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t count) {
+    if (pass_time_light) REQUIRE(count <= 2 && first + count <= 3);
+    atomic_fetch_add(&timestamp_resets, count);
+    timestamp_reset(cb, pool, first, count);
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vkGetDeviceProcAddr(VkDevice d, const char *name) {
     PFN_vkVoidFunction fn = __real_vkGetDeviceProcAddr(d, name);
@@ -125,8 +136,13 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vkGetDeviceProcAddr(VkDevice d, 
         timestamp_write = (PFN_vkCmdWriteTimestamp)fn;
         return (PFN_vkVoidFunction)record_timestamp;
     }
+    if (pass_time_mode && fn && !strcmp(name, "vkCmdResetQueryPool")) {
+        timestamp_reset = (PFN_vkCmdResetQueryPool)fn;
+        return (PFN_vkVoidFunction)record_query_reset;
+    }
     return fn;
 }
+_Static_assert(__builtin_types_compatible_p(__typeof__(&record_query_reset), PFN_vkCmdResetQueryPool), "NDK query reset signature");
 _Static_assert(__builtin_types_compatible_p(__typeof__(&record_timestamp), PFN_vkCmdWriteTimestamp), "NDK timestamp signature");
 _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_vkGetDeviceProcAddr), PFN_vkGetDeviceProcAddr), "NDK loader signature");
 
@@ -220,6 +236,7 @@ static void run_pass_time(nvn_gpu_tex tex) {
         pass.color[0].load = NVN_GPU_LOAD_CLEAR;
         pass.color[0].store = NVN_GPU_STORE_STORE;
         pass.color[0].clear.f[0] = pass.color[0].clear.f[3] = 1.0f;
+        if (pass_time_sources) nvn_gpu_clear_view(cmd, source, pass.color[0].clear.f, NULL, 0);
         const int clears = cap && signal == 2 ? 258 : 2;
         for (int i = 0; i < clears; i++) {
             nvn_gpu_pass_begin(cmd, &pass);
@@ -228,7 +245,12 @@ static void run_pass_time(nvn_gpu_tex tex) {
         pass.color[0].load = NVN_GPU_LOAD_LOAD;
         nvn_gpu_pass_begin(cmd, &pass);
         nvn_gpu_pass_end(cmd);
+        if (pass_time_sources) nvn_gpu_clear_view(cmd, source, pass.color[0].clear.f, NULL, 0);
         nvn_gpu_copy_tex_buf(cmd, tex, 0, 0, NULL, readback, 0, 64 * 4, 64 * 64 * 4);
+        if (pass_time_sources) {
+            nvn_gpu_clear_view(cmd, source, pass.color[0].clear.f, NULL, 0); // WSI reads in another segment.
+            nvn_gpu_fill_buf(cmd, mirror, 0, 4, 0xabcdef01);
+        }
         const uint32_t word = (uint32_t)signal;
         nvn_gpu_buf_write_mirror(cmd, mirror, 0, &word, sizeof word);
         GPU(nvn_gpu_cmd_commit(cmd, signal, done, NULL, &error));
@@ -255,11 +277,16 @@ static void run_pass_time(nvn_gpu_tex tex) {
 int main(void) {
     pass_time_mode = getenv("S2A_TEST_PASS_TIME");
     drop_timestamp_results = pass_time_mode && !strcmp(pass_time_mode, "unavailable");
+    pass_time_light = pass_time_mode && !strcmp(pass_time_mode, "light");
+    pass_time_sources = pass_time_mode && !strcmp(pass_time_mode, "sources");
+    if (pass_time_sources) REQUIRE(!setenv("S2A_VK_BC_DECODE", "force", 1));
     struct s2a_vk_device device = {0}; char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&device, why, sizeof why));
     nvn_gpu_open_desc desc = {0}; desc.host_device = &device; desc.app_label = "wsi-extent-test";
     GPU(nvn_gpu_open(&desc, &error));
-    atomic_store(&timestamp_writes, 0); // Independent startup calibration is excluded.
+    // Independent startup calibration is excluded.
+    atomic_store(&timestamp_writes, 0);
+    atomic_store(&timestamp_resets, 0);
     nvn_gpu_tex_desc td = {0}; td.d.target = NVN_TEXTURE_TARGET_2D; td.d.format = NVN_FORMAT_RGBA8;
     td.d.width = 64; td.d.height = 64; td.d.depth = 1; td.d.levels = 1;
     td.usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER | NVN_GPU_TEX_CPU_UPLOAD;
@@ -268,6 +295,18 @@ int main(void) {
     unsigned char pixels[64 * 64 * 4]; memset(pixels, 128, sizeof pixels);
     nvn_gpu_cmd cmd = NULL; GPU(nvn_gpu_cmd_begin(NULL, &cmd, &error));
     nvn_gpu_tex_upload(cmd, tex, 0, 0, NULL, pixels, 64 * 4, sizeof pixels);
+    if (pass_time_sources) {
+        const nvn_gpu_tex_desc bc_desc = {
+            .d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA_DXT1,
+                  .width = 4, .height = 4, .depth = 1, .levels = 1},
+            .usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD,
+        };
+        const uint8_t block[8] = {0};
+        nvn_gpu_tex bc = NULL;
+        GPU(nvn_gpu_tex_create(&bc_desc, &bc, &error));
+        nvn_gpu_tex_upload(cmd, bc, 0, 0, NULL, block, sizeof block, sizeof block);
+        nvn_gpu_tex_release(bc);
+    }
     GPU(nvn_gpu_cmd_commit(cmd, 1, done, NULL, &error));
     GPU(nvn_gpu_fence_wait(1, 5000000000ull, &error));
 
@@ -277,8 +316,9 @@ int main(void) {
         nvn_gpu_tex_release(tex);
         GPU(nvn_gpu_close(5000000000ull, &error));
         REQUIRE(!s2a_vk_device_destroy(&device, 1));
-        printf("gpu-pass-time fixture presents=%u pixels=ok pools=%u reads=%u writes=%u\n", presented,
-               atomic_load(&timestamp_pools), atomic_load(&timestamp_reads), atomic_load(&timestamp_writes));
+        printf("gpu-pass-time fixture presents=%u pixels=ok pools=%u reads=%u writes=%u resets=%u\n", presented,
+               atomic_load(&timestamp_pools), atomic_load(&timestamp_reads), atomic_load(&timestamp_writes),
+               atomic_load(&timestamp_resets));
         return 0;
     }
 

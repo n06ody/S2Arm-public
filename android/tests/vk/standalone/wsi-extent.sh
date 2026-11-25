@@ -54,7 +54,7 @@ PY
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
 fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
-    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
+    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_BCDEC_HOST_TEST=1 "${inc[@]}" "${src[@]}" \
     -Wl,--wrap=vkGetPhysicalDeviceSurfaceCapabilitiesKHR -Wl,--wrap=vkCreateSwapchainKHR \
     -Wl,--wrap=vkCreateQueryPool -Wl,--wrap=vkGetQueryPoolResults -Wl,--wrap=vkGetDeviceProcAddr \
     -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
@@ -68,7 +68,7 @@ export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 if [ "$mode" = --gpu-pass-time ]; then
     status=0
     for dq in 0 1; do
-        for arm in off on unavailable cap; do
+        for arm in off on unavailable cap light sources; do
             log="$out/gpu-pass-time-dq$dq-$arm.log"
             if ! S2A_TEST_DQ="$dq" S2A_TEST_PASS_TIME="$arm" timeout 120 "$binary" > "$log" 2>&1 ||
                grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
@@ -77,7 +77,7 @@ if [ "$mode" = --gpu-pass-time ]; then
                 exit 2
             fi
             if [ "$arm" = off ]; then
-                grep -q 'presents=2 pixels=ok pools=0 reads=0 writes=0$' "$log"
+                grep -q 'presents=2 pixels=ok pools=0 reads=0 writes=0 resets=0$' "$log"
                 if grep -q 'nvk-gpu-pass-time ' "$log"; then exit 2; fi
             elif ! grep -q 'nvk-gpu-pass-time window .*presents=2 ' "$log"; then
                 echo "gpu-pass-time backend missing ledger: dq=$dq arm=$arm real_presents=2 pixels=ok VUID=0 SYNC-HAZARD=0"

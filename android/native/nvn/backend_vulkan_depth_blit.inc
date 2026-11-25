@@ -151,6 +151,8 @@ static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].depth);
     vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255); vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
     vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push);
+    const VkImageSubresourceRange range = {ds, sv->base_level, 1, sv->base_layer, 1};
+    gpu_pt_clear_use(c, s, &range, GPU_PT_USE_READ);
     gpu_pt_draw(c);
     vkCmdDraw(c->cb, 3, 1, 0, 0);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].stencil);

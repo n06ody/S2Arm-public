@@ -206,6 +206,7 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
     vkCmdSetScissor(c->cb, 0, 1, &sc);
     vkCmdSetBlendConstants(c->cb, d->blend_color);
     vkCmdPushConstants(c->cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, d->uv);
+    gpu_pt_clear_view_use(c, v, GPU_PT_USE_SAMPLED);
     gpu_pt_draw(c);
     vkCmdDraw(c->cb, 4, 1, 0, 0);
     account_write(c, c->pass_desc.color[0].view->tex);

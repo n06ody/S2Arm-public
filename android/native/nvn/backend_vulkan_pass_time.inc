@@ -6,16 +6,18 @@
 
 enum gpu_pt_kind {
     GPU_PT_RENDER, GPU_PT_GUEST_COMPUTE, GPU_PT_BC_DECODE, GPU_PT_ASTC_ENCODE, GPU_PT_TRANSFER, GPU_PT_COPY,
-    GPU_PT_BLIT, GPU_PT_FB_COPY, GPU_PT_CLEAR, GPU_PT_MIRROR_SYNC, GPU_PT_OTHER_COMPUTE,
+    GPU_PT_BLIT, GPU_PT_FB_COPY, GPU_PT_CLEAR_WSI, GPU_PT_CLEAR_TEXTURE, GPU_PT_CLEAR_BUFFER,
+    GPU_PT_CLEAR_BC_SHADOW, GPU_PT_MIRROR_SYNC, GPU_PT_OTHER_COMPUTE,
     GPU_PT_KINDS
 };
 static const char *const gpu_pt_names[] = {
     "render", "guest_compute", "bc_decode", "astc_encode", "transfer", "copy", "blit",
-    "fb_copy", "clear", "mirror_sync", "other_compute",
+    "fb_copy", "clear_wsi", "clear_texture", "clear_buffer", "clear_bc_shadow", "mirror_sync", "other_compute",
 };
 enum {
     GPU_PT_SPANS = 255, GPU_PT_POOL_CAP = 32, GPU_PT_KEYS = 256, GPU_PT_TOP = 8,
     GPU_PT_PRESENTS = 60, GPU_PT_PREFIX = 2 * GPU_PT_SPANS + 2, GPU_PT_QUERIES = GPU_PT_PREFIX + 1,
+    GPU_PT_LIGHT_PREFIX = 2, GPU_PT_CLEAR_PENDING = 64,
 };
 enum { GPU_PT_FB_END = 1, GPU_PT_FB_BEGIN = 2, GPU_PT_LAYOUT_REOPEN = 4, GPU_PT_EASU = 8 };
 struct gpu_pt_att {
@@ -29,12 +31,28 @@ struct gpu_pt_span {
     enum gpu_pt_kind kind;
     struct gpu_pt_key key;
 };
+// First recorded possible use of overlapping subresources in the same segment.
+// Pool indexing and accesses across a segment boundary remain explicit unknowns.
+enum gpu_pt_clear_use {
+    GPU_PT_USE_ATTACHMENT, GPU_PT_USE_SAMPLED, GPU_PT_USE_STORAGE, GPU_PT_USE_POOL,
+    GPU_PT_USE_READ, GPU_PT_USE_WRITE, GPU_PT_USE_RECLEAR, GPU_PT_USE_UNRESOLVED, GPU_PT_USES
+};
+static const char *const gpu_pt_use_names[] = {
+    "attachment", "sampled", "storage", "pool_possible", "transfer_read", "transfer_write", "reclear", "pool_unknown",
+};
+struct gpu_pt_pending_clear {
+    const struct nvn_gpu_tex_s *tex;
+    VkImageSubresourceRange range;
+};
 struct gpu_pt_cmd {
     struct gpu_pt_cmd *next;
     VkQueryPool pool;
     uint32_t count, dropped, next_pass_flags;
-    int open, prefix;
-    struct gpu_pt_span spans[GPU_PT_SPANS];
+    int open, prefix, light;
+    uint32_t clear_count, clear_dropped;
+    uint32_t clear_uses[GPU_PT_USES];
+    struct gpu_pt_pending_clear clears[GPU_PT_CLEAR_PENDING];
+    struct gpu_pt_span spans[];
 };
 struct gpu_pt_rank {
     struct gpu_pt_key key;
@@ -44,12 +62,14 @@ struct gpu_pt_window {
     uint64_t segments, measured, presents, rejected, missing_queries, missing_spans, dropped;
     uint64_t missing_gaps, gaps, gap_ticks, overlap_ticks, segment_ticks, residual_ticks;
     uint64_t ticks[GPU_PT_KINDS], counts[GPU_PT_KINDS], unranked;
+    uint64_t clear_uses[GPU_PT_USES], clear_tail, clear_dropped;
     uint32_t keys;
     struct gpu_pt_rank ranks[GPU_PT_KEYS];
 };
 struct gpu_pt_session {
     struct gpu_pt_cmd *free;
     uint32_t allocated, bits;
+    int light;
     double period;
     uint64_t queued; // g_submit_mu
     uint64_t done, end, end_submit, window_id; // completion worker
@@ -59,7 +79,9 @@ struct gpu_pt_session {
 static pthread_mutex_t g_gpu_pt_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void gpu_pt_open(void) {
-    if (!nvn_plat_flag("nvk_gpu_pass_time", 0)) return;
+    // 0 = disabled, 1 = full ledger, 2 = only segment/queue intervals.
+    const int mode = nvn_plat_flag("nvk_gpu_pass_time", 0);
+    if (!mode) return;
     struct s2a_vk_device *dev = g.dev;
     uint32_t n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(dev->physical, &n, NULL);
@@ -82,6 +104,7 @@ static void gpu_pt_open(void) {
     }
     g.gpu_pt->bits = bits;
     g.gpu_pt->period = period;
+    g.gpu_pt->light = mode == 2;
 }
 
 static void gpu_pt_start(struct nvn_gpu_cmd_s *c) {
@@ -92,9 +115,9 @@ static void gpu_pt_start(struct nvn_gpu_cmd_s *c) {
     if (q) {
         p->free = q->next;
     } else if (p->allocated < GPU_PT_POOL_CAP) {
-        q = calloc(1, sizeof *q);
+        q = calloc(1, sizeof *q + (p->light ? 0 : GPU_PT_SPANS * sizeof q->spans[0]));
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GPU_PT_QUERIES};
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = p->light ? GPU_PT_LIGHT_PREFIX + 1 : GPU_PT_QUERIES};
         if (q && vkCreateQueryPool(g.d, &qi, NULL, &q->pool) != VK_SUCCESS) {
             free(q);
             q = NULL;
@@ -105,8 +128,13 @@ static void gpu_pt_start(struct nvn_gpu_cmd_s *c) {
     if (!q) return; // The worker records a missing segment. Submission continues normally.
     q->count = q->dropped = q->next_pass_flags = 0;
     q->open = q->prefix = 0;
+    q->light = p->light;
+    if (!q->light) {
+        q->clear_count = q->clear_dropped = 0;
+        memset(q->clear_uses, 0, sizeof q->clear_uses);
+    }
     c->gpu_pt = q;
-    vkCmdResetQueryPool(c->cb, q->pool, 0, GPU_PT_PREFIX);
+    vkCmdResetQueryPool(c->cb, q->pool, 0, q->light ? GPU_PT_LIGHT_PREFIX : GPU_PT_PREFIX);
     vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q->pool, 0);
 }
 
@@ -121,7 +149,7 @@ static void gpu_pt_release(struct nvn_gpu_cmd_s *c) {
 
 static inline int gpu_pt_begin(struct nvn_gpu_cmd_s *c, enum gpu_pt_kind kind) {
     struct gpu_pt_cmd *q = c->gpu_pt;
-    if (!q) return 0;
+    if (!q || q->light) return 0;
     if (q->count == GPU_PT_SPANS) { q->dropped++; return 0; }
     q->spans[q->count].kind = kind;
     q->open = 1;
@@ -151,9 +179,92 @@ static inline void gpu_pt_last(struct nvn_gpu_cmd_s *c) {
 static inline void gpu_pt_prefix(struct nvn_gpu_cmd_s *c) {
     if (!c->gpu_pt) return;
     struct gpu_pt_cmd *q = c->gpu_pt;
-    q->prefix = 1;
-    vkCmdResetQueryPool(c->init_cb, q->pool, GPU_PT_PREFIX, 1);
-    vkCmdWriteTimestamp(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q->pool, GPU_PT_PREFIX);
+    q->prefix = q->light ? GPU_PT_LIGHT_PREFIX : GPU_PT_PREFIX;
+    vkCmdResetQueryPool(c->init_cb, q->pool, (uint32_t)q->prefix, 1);
+    vkCmdWriteTimestamp(c->init_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q->pool, (uint32_t)q->prefix);
+}
+
+static int gpu_pt_clear_overlap(const VkImageSubresourceRange *a, const VkImageSubresourceRange *b) {
+    return (a->aspectMask & b->aspectMask) &&
+        a->baseMipLevel < b->baseMipLevel + b->levelCount &&
+        b->baseMipLevel < a->baseMipLevel + a->levelCount &&
+        a->baseArrayLayer < b->baseArrayLayer + b->layerCount &&
+        b->baseArrayLayer < a->baseArrayLayer + a->layerCount;
+}
+
+static void gpu_pt_clear_consume(struct gpu_pt_cmd *q, uint32_t i, enum gpu_pt_clear_use use) {
+    q->clear_uses[use]++;
+    q->clears[i] = q->clears[--q->clear_count];
+}
+
+static inline void gpu_pt_clear_use(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_tex_s *t,
+        const VkImageSubresourceRange *range, enum gpu_pt_clear_use use) {
+    struct gpu_pt_cmd *q = c->gpu_pt;
+    if (!q || !q->clear_count || !t) return;
+    for (uint32_t i = 0; i < q->clear_count;) {
+        const struct gpu_pt_pending_clear *p = &q->clears[i];
+        if (p->tex == t && (!range || gpu_pt_clear_overlap(&p->range, range))) gpu_pt_clear_consume(q, i, use);
+        else i++;
+    }
+}
+
+static inline void gpu_pt_clear_view_use(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_view_s *v,
+        enum gpu_pt_clear_use use) {
+    if (!v || !c->gpu_pt || !c->gpu_pt->clear_count) return;
+    const VkImageSubresourceRange r = {v->aspect, v->base_level, v->levels, v->base_layer, v->layers};
+    gpu_pt_clear_use(c, v->tex, &r, use);
+}
+
+static inline void gpu_pt_clear_layers_use(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_tex_s *t,
+        const VkImageSubresourceLayers *layer, enum gpu_pt_clear_use use) {
+    if (!c->gpu_pt || !c->gpu_pt->clear_count) return;
+    const VkImageSubresourceRange r = {layer->aspectMask, layer->mipLevel, 1,
+        layer->baseArrayLayer, layer->layerCount};
+    gpu_pt_clear_use(c, t, &r, use);
+}
+
+static inline void gpu_pt_record_clear_texture(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_tex_s *t,
+        const VkImageSubresourceRange *range) {
+    struct gpu_pt_cmd *q = c->gpu_pt;
+    if (!q || q->light) return;
+    gpu_pt_clear_use(c, t, range, GPU_PT_USE_RECLEAR);
+    if (q->clear_count == GPU_PT_CLEAR_PENDING) { q->clear_dropped++; return; }
+    q->clears[q->clear_count++] = (struct gpu_pt_pending_clear){t, *range};
+}
+
+static void gpu_pt_clear_attachment_use(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_view_s *v,
+        VkImageAspectFlags aspect, uint32_t layers) {
+    if (!v) return;
+    const VkImageSubresourceRange range = {aspect, v->base_level, 1, v->att_layer, layers ? layers : 1};
+    gpu_pt_clear_use(c, v->tex, &range, GPU_PT_USE_ATTACHMENT);
+}
+
+static inline void gpu_pt_clear_bound_use(struct nvn_gpu_cmd_s *c, unsigned start, unsigned end) {
+    struct gpu_pt_cmd *q = c->gpu_pt;
+    if (!q || !q->clear_count) return;
+    for (unsigned st = start; st < end && q->clear_count; st++) {
+        const uint32_t count = c->pipe->stage_nent[st];
+        for (uint32_t i = 0; i < c->nbinds[st] && q->clear_count; i++) {
+            const nvn_gpu_binding *b = &c->binds[st][i].b;
+            if (b->ent >= count || b->cls != c->pipe->stage_ents[st][b->ent].cls) continue;
+            switch (b->cls) {
+            case NVN_GPU_RES_TEX: gpu_pt_clear_view_use(c, b->u.view, GPU_PT_USE_SAMPLED); break;
+            case NVN_GPU_RES_TEX_SAMP: gpu_pt_clear_view_use(c, b->u.ts.view, GPU_PT_USE_SAMPLED); break;
+            case NVN_GPU_RES_IMAGE: gpu_pt_clear_view_use(c, b->u.view, GPU_PT_USE_STORAGE); break;
+            default: break;
+            }
+        }
+        for (uint32_t e = 0; e < count && q->clear_count && e < 64; e++) {
+            const nvn_gpu_pool_table pool = c->pool_binds[st][e];
+            if (!pool || pool->kind != NVN_GPU_POOL_IMAGE) continue;
+            for (uint32_t i = 0; i < q->clear_count;) {
+                if (!pool->ikey) gpu_pt_clear_consume(q, i, GPU_PT_USE_UNRESOLVED);
+                else if (nvn_gpu_pool_has_texture(pool, (nvn_gpu_tex)q->clears[i].tex))
+                    gpu_pt_clear_consume(q, i, GPU_PT_USE_POOL);
+                else i++;
+            }
+        }
+    }
 }
 
 static void gpu_pt_attachment(struct gpu_pt_key *key, uint32_t slot, const VkAttachmentDescription *att) {
@@ -164,6 +275,12 @@ static void gpu_pt_attachment(struct gpu_pt_key *key, uint32_t slot, const VkAtt
 static inline void gpu_pt_pass_begin(struct nvn_gpu_cmd_s *c, const nvn_gpu_pass_desc *d,
         const VkAttachmentDescription *att, uint32_t colors, int has_depth, uint32_t flags) {
     if (!c->gpu_pt) return;
+    if (c->gpu_pt->clear_count) {
+        for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
+            gpu_pt_clear_attachment_use(c, d->color[i].view, VK_IMAGE_ASPECT_COLOR_BIT, d->layers);
+        gpu_pt_clear_attachment_use(c, d->depth.view, VK_IMAGE_ASPECT_DEPTH_BIT, d->layers);
+        gpu_pt_clear_attachment_use(c, d->stencil.view, VK_IMAGE_ASPECT_STENCIL_BIT, d->layers);
+    }
     flags |= c->gpu_pt->next_pass_flags;
     c->gpu_pt->next_pass_flags = 0;
     if (!gpu_pt_begin(c, GPU_PT_RENDER)) return;
@@ -216,22 +333,47 @@ static void gpu_pt_report(struct gpu_pt_session *p, int partial) {
     const uint64_t id = ++p->window_id;
     char line[1900];
     int len = snprintf(line, sizeof line,
-        "nvk-gpu-pass-time window id=%llu partial=%d end_mono_ns=%llu presents=%llu rejected=%llu units=%s bits=%u "
+        "nvk-gpu-pass-time window id=%llu partial=%d end_mono_ns=%llu mode=%s presents=%llu rejected=%llu units=%s bits=%u "
         "segments=%llu measured_segments=%llu missing_queries=%llu missing_spans=%llu cap_dropped=%llu "
         "unranked=%llu missing_gaps=%llu gap_pairs=%llu segment_ms=%.8f gap_ms=%.8f overlap_ms=%.8f "
-        "total_ms=%.8f residual_ms=%.8f",
-        (unsigned long long)id, partial, (unsigned long long)now_ns(),
+        "total_ms=%.8f",
+        (unsigned long long)id, partial, (unsigned long long)now_ns(), p->light ? "segment" : "full",
         (unsigned long long)w->presents, (unsigned long long)w->rejected,
         w->presents ? "ms/present" : "ms/session-tail", p->bits, (unsigned long long)w->segments,
         (unsigned long long)w->measured, (unsigned long long)w->missing_queries, (unsigned long long)w->missing_spans,
         (unsigned long long)w->dropped, (unsigned long long)w->unranked,
         (unsigned long long)w->missing_gaps, (unsigned long long)w->gaps,
         w->segment_ticks * per, w->gap_ticks * per, w->overlap_ticks * per,
-        (w->segment_ticks + w->gap_ticks - w->overlap_ticks) * per, w->residual_ticks * per);
+        (w->segment_ticks + w->gap_ticks - w->overlap_ticks) * per);
+    if (p->light) {
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+        memset(w, 0, sizeof *w);
+        return;
+    }
+    uint64_t clear_ticks = 0, clear_spans = 0;
+    for (unsigned k = GPU_PT_CLEAR_WSI; k <= GPU_PT_CLEAR_BC_SHADOW; k++) {
+        clear_ticks += w->ticks[k];
+        clear_spans += w->counts[k];
+    }
+    len += snprintf(line + len, sizeof line - (size_t)len, " residual_ms=%.8f clear_ms=%.8f clear_spans=%llu",
+        w->residual_ticks * per, clear_ticks * per, (unsigned long long)clear_spans);
     for (unsigned k = 0; k < GPU_PT_KINDS; k++)
         len += snprintf(line + len, sizeof line - (size_t)len, " %s_ms=%.8f %s_spans=%llu",
             gpu_pt_names[k], w->ticks[k] * per, gpu_pt_names[k], (unsigned long long)w->counts[k]);
     nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+
+    uint64_t tracked = w->clear_tail;
+    for (unsigned k = 0; k < GPU_PT_USES; k++) tracked += w->clear_uses[k];
+    if (tracked || w->clear_dropped) {
+        len = snprintf(line, sizeof line,
+            "nvk-gpu-pass-time clear-first-use window=%llu scope=segment tracked=%llu tail=%llu cap_dropped=%llu",
+            (unsigned long long)id, (unsigned long long)tracked, (unsigned long long)w->clear_tail,
+            (unsigned long long)w->clear_dropped);
+        for (unsigned k = 0; k < GPU_PT_USES; k++)
+            len += snprintf(line + len, sizeof line - (size_t)len, " %s=%llu",
+                gpu_pt_use_names[k], (unsigned long long)w->clear_uses[k]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
+    }
 
     for (uint32_t i = 0; i < w->keys && i < GPU_PT_TOP; i++) {
         uint32_t best = i;
@@ -262,7 +404,12 @@ static int gpu_pt_read(struct nvn_gpu_vk *vk, const struct vk_segment *s) {
     struct gpu_pt_window *w = &p->window;
     const struct gpu_pt_cmd *q = s->cmd->gpu_pt;
     if (!q) return 0;
-    w->dropped += q->dropped;
+    if (!q->light) {
+        w->dropped += q->dropped;
+        w->clear_tail += q->clear_count;
+        w->clear_dropped += q->clear_dropped;
+        for (unsigned k = 0; k < GPU_PT_USES; k++) w->clear_uses[k] += q->clear_uses[k];
+    }
     const uint64_t completed = now_ns();
     if (!nvk_pass_time_host_bound(s->gpu_pt_submit_ns, completed, p->bits, p->period)) return 0;
 
@@ -273,7 +420,7 @@ static int gpu_pt_read(struct nvn_gpu_vk *vk, const struct vk_segment *s) {
     if (vkGetQueryPoolResults(vk->d, q->pool, 0, n, n * sizeof raw[0], raw, sizeof raw[0],
                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return 0;
     start = raw[0];
-    if (q->prefix && vkGetQueryPoolResults(vk->d, q->pool, GPU_PT_PREFIX, 1, sizeof start, &start,
+    if (q->prefix && vkGetQueryPoolResults(vk->d, q->pool, (uint32_t)q->prefix, 1, sizeof start, &start,
                                           sizeof start, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return 0;
     const uint64_t end = raw[n - 1];
     const int64_t duration = s2a_ts_wrap_diff(end, start, p->bits);
@@ -294,6 +441,7 @@ static int gpu_pt_read(struct nvn_gpu_vk *vk, const struct vk_segment *s) {
     p->have_end = 1;
     w->measured++;
     w->segment_ticks += (uint64_t)duration;
+    if (q->light) return 1;
     uint64_t attributed = 0, offset = 0;
     for (uint32_t i = 0; i < q->count; i++) {
         uint64_t elapsed;

@@ -3057,7 +3057,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
                                                   (unsigned long long)off, (unsigned long long)bytes); return; }
     if (bytes == 0) return;
     full_barrier(c);
-    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value));
+    GPU_PT_RECORD(c, GPU_PT_CLEAR_BUFFER, vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -6433,7 +6433,8 @@ static inline int diag_draw_mode(void) {
     return g_diag_draw_mode;
 }
 #define DIAG_DRAW(call) do { \
-    if (__builtin_expect(dm != 1, 1)) { gpu_pt_draw(c); call; \
+    if (__builtin_expect(dm != 1, 1)) { \
+        gpu_pt_clear_bound_use(c, 0, NVN_GPU_SH_CS); gpu_pt_draw(c); call; \
         if (__builtin_expect(dm == 2, 0)) { gpu_pt_draw(c); call; } } \
 } while (0)
 
@@ -6692,6 +6693,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     // 之前录过缓冲作目标的传输（核心的池镜像同步、缓冲写 / 填 / 拷贝、贴图→缓冲）：契约说之后的读看到新值（nvn_backend.h buf_write），
     // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
     if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
+    gpu_pt_clear_bound_use(c, NVN_GPU_SH_CS, NVN_GPU_SH_CS + 1);
     if (ind) {
         GPU_PT_RECORD(c, GPU_PT_GUEST_COMPUTE, vkCmdDispatchIndirect(c->cb, ind->buffer, off));
         cmd_ref(c, ind, REF_BUF);
@@ -7689,6 +7691,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
                                                      t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};
     bc.imageOffset = o;
     bc.imageExtent = e;
+    gpu_pt_clear_layers_use(c, t, &bc.imageSubresource, GPU_PT_USE_WRITE);
     GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBufferToImage(c->cb, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc));
     account_write(c, t);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);   // 之后按采样 / 存储使用；本段统一用 GENERAL
@@ -7750,6 +7753,7 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageSubresource = (VkImageSubresourceLayers){copy_face_aspect(t), level, t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};   // 深度模板贴图只回读深度面（#1581 K）
     bc.imageOffset = o;
     bc.imageExtent = e;
+    gpu_pt_clear_layers_use(c, t, &bc.imageSubresource, GPU_PT_USE_READ);
     GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
@@ -7808,6 +7812,8 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     ic.dstSubresource = (VkImageSubresourceLayers){d->aspect, dlevel, dlayer, 1};
     ic.dstOffset = dof;
     ic.extent = se;
+    gpu_pt_clear_layers_use(c, s, &ic.srcSubresource, GPU_PT_USE_READ);
+    gpu_pt_clear_layers_use(c, d, &ic.dstSubresource, GPU_PT_USE_WRITE);
     GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic));
     account_write(c, d);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
@@ -7846,7 +7852,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         VkClearDepthStencilValue ds;
         ds.depth = rgba ? rgba[0] : 1.0f;
         ds.stencil = 0;
-        GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearDepthStencilImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ds, 1, &range));
+        GPU_PT_RECORD(c, GPU_PT_CLEAR_TEXTURE, vkCmdClearDepthStencilImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ds, 1, &range));
     } else {
         VkClearColorValue col;
         memset(&col, 0, sizeof col);
@@ -7856,8 +7862,9 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
             if (is_int) col.uint32[fmap[i]] = u4 ? u4[i] : 0;
             else col.float32[fmap[i]] = rgba ? rgba[i] : 0.0f;
         }
-        GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range));
+        GPU_PT_RECORD(c, GPU_PT_CLEAR_TEXTURE, vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range));
     }
+    gpu_pt_record_clear_texture(c, t, &range);
     account_write(c, t);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
@@ -7947,7 +7954,7 @@ static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, ui
         pthread_mutex_unlock(&g_mu);
     }
     full_barrier(c);
-    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0));   // 没上传过的区域回读为零，不留上一块显存的旧内容
+    GPU_PT_RECORD(c, GPU_PT_CLEAR_BC_SHADOW, vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0));   // 没上传过的区域回读为零，不留上一块显存的旧内容
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     return 1;
 }
@@ -8396,6 +8403,8 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
         ir.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, sv->base_level, sv->base_layer, 1};
         ir.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1};
         ir.srcOffset = so; ir.dstOffset = dof; ir.extent = se;
+        gpu_pt_clear_layers_use(c, s, &ir.srcSubresource, GPU_PT_USE_READ);
+        gpu_pt_clear_layers_use(c, d, &ir.dstSubresource, GPU_PT_USE_WRITE);
         GPU_PT_RECORD(c, GPU_PT_BLIT, vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir));
         account_write(c, d);
         image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
@@ -8438,6 +8447,8 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if (flip_x) { int32_t x = ib.srcOffsets[0].x; ib.srcOffsets[0].x = ib.srcOffsets[1].x; ib.srcOffsets[1].x = x; }
     if (flip_y) { int32_t y = ib.srcOffsets[0].y; ib.srcOffsets[0].y = ib.srcOffsets[1].y; ib.srcOffsets[1].y = y; }
     ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, 1};
+    gpu_pt_clear_layers_use(c, s, &ib.srcSubresource, GPU_PT_USE_READ);
+    gpu_pt_clear_layers_use(c, d, &ib.dstSubresource, GPU_PT_USE_WRITE);
     GPU_PT_RECORD(c, GPU_PT_BLIT, vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST));
     account_write(c, d);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
