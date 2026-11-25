@@ -2,8 +2,8 @@
 // Copyright 2026 S2Arm contributors
 #version 450
 #extension GL_GOOGLE_include_directive : require
-#include "bc7_decode.glsl"
 #include "hybrid_tables.glsl"
+#include "bc7_decode.glsl"
 
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer Source {
@@ -32,7 +32,7 @@ struct Candidate {
 
 uint color_symbol(uint level, uint value) {
     uint i = value >> 1u;
-    uint word = level == 48u ? q48[i] : (level == 40u ? q40[i] : q16[i]);
+    uint word = level == 48u ? q48(i) : (level == 40u ? q40(i) : q16(i));
     return (word >> (16u * (value & 1u))) & 65535u;
 }
 
@@ -139,7 +139,7 @@ uvec4 encode(Candidate c) {
             uint index = 0u;
             for (uint j = 0u; j < 5u && base + j < 8u; ++j)
                 index += (symbols[base + j] >> 4u) * powers[j];
-            uint code = trits[index >> 2u] >> ((index & 3u) * 8u);
+            uint code = trits(index >> 2u) >> ((index & 3u) * 8u);
             for (uint j = 0u; j < 5u && base + j < 8u; ++j) {
                 put(bits, offset, 4u, symbols[base + j]);
                 put(bits, offset + 4u, widths[j], code >> shifts[j]);
@@ -152,7 +152,7 @@ uvec4 encode(Candidate c) {
         for (uint base = 0u; base < 12u; base += 3u) {
             uint index = (symbols[base] >> 3u) + 5u * (symbols[base + 1u] >> 3u) +
                          25u * (symbols[base + 2u] >> 3u);
-            uint code = quints[index >> 2u] >> ((index & 3u) * 8u);
+            uint code = quints(index >> 2u) >> ((index & 3u) * 8u);
             for (uint j = 0u; j < 3u; ++j) {
                 put(bits, offset, 3u, symbols[base + j]);
                 put(bits, offset + 3u, widths[j], code >> shifts[j]);
@@ -234,9 +234,9 @@ void main() {
     uvec4 samples[16];
     bool opaque = true;
     uint bc_part = uint(extract_bits(block, mode + 1, 6));
-    uint first = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap[bc_part * 2u] : axis_partitions[0];
-    uint second = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap[bc_part * 2u + 1u] : axis_partitions[1];
-    uint bc_mask = uint(partition_table2[bc_part]);
+    uint first = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap(bc_part * 2u) : axis_partitions(0u);
+    uint second = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap(bc_part * 2u + 1u) : axis_partitions(1u);
+    uint bc_mask = uint(partition_table2(int(bc_part)));
     bool exact = mode == 3 && ((first >> 10u) == bc_mask || (first >> 10u) == (bc_mask ^ 65535u));
     bool direct = exact || mode == 5 || mode == 6;
     Candidate c;

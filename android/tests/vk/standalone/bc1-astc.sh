@@ -119,7 +119,12 @@ done
 
 hybrid_tables="$out/bc7-hybrid-tables"
 python3 -B "$encoder/generate_hybrid.py" --tables-only --out "$hybrid_tables"
-timeout 180 "$out/test" --bc7-hybrid 2>&1 | tee "$out/bc7-hybrid.log"
+run_cold_hybrid() {
+    local cache
+    cache=$(mktemp -d "$out/bc7-hybrid-cache.XXXXXX")
+    MESA_SHADER_CACHE_DIR="$cache" timeout 180 "$out/test" --bc7-hybrid "$@"
+}
+run_cold_hybrid 2>&1 | tee "$out/bc7-hybrid.log"
 if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/bc7-hybrid.log"; then
     echo '【红】BC7 hybrid validation' >&2
     exit 1
@@ -147,7 +152,7 @@ for variant in peak rms alpha partition reject; do
     "${GLSLC:-glslc}" --target-env=vulkan1.1 -O -I "$hybrid_tables" -I "$repo/graphics/nvn/third_party/granite/decode" \
         "$dir/encode.comp" -o "$dir/encode.comp.spv"
     set +e
-    timeout 180 "$out/test" --bc7-hybrid "$dir" > "$dir/run.log" 2>&1
+    run_cold_hybrid "$dir" > "$dir/run.log" 2>&1
     rc=$?
     set -e
     case "$variant" in

@@ -9,13 +9,14 @@ static void bc_astc_close(struct bc_astc_pipeline *pipeline) {
     memset(pipeline, 0, sizeof *pipeline);
 }
 
-static int bc_astc_open(struct bc_astc_pipeline *pipeline, const uint32_t *code, size_t size) {
+static int bc_astc_open(struct bc_astc_pipeline *pipeline, const uint32_t *code, size_t size, int has_tables) {
     const VkDescriptorSetLayoutBinding bindings[] = {
         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
     };
     const VkDescriptorSetLayoutCreateInfo di = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings,
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = has_tables ? 3u : 2u, .pBindings = bindings,
     };
     VkShaderModule shader = VK_NULL_HANDLE;
     if (vkCreateDescriptorSetLayout(g.d, &di, NULL, &pipeline->dsl) != VK_SUCCESS) goto fail;
@@ -80,7 +81,7 @@ static int bc_astc_storage(uint32_t nvn_format, const nvn_gpu_tex_desc *d, VkIma
     const uint32_t *code = bc7 ? nvk_bc7_hybrid_spv : nvk_bc1_astc_spv;
     const size_t size = bc7 ? sizeof nvk_bc7_hybrid_spv : sizeof nvk_bc1_astc_spv;
     pthread_mutex_lock(&g_submit_mu);
-    int ready = pipeline->pipe || bc_astc_open(pipeline, code, size);
+    int ready = pipeline->pipe || bc_astc_open(pipeline, code, size, bc7);
     pthread_mutex_unlock(&g_submit_mu);
     if (!ready) {
         nvn_plat_log(NVN_PLAT_LOG_RED, "tex", "BC ASTC 计算管线创建失败，使用原 RGBA8 解码");

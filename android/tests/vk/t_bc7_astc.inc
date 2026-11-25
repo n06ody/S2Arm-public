@@ -76,12 +76,12 @@ static void bc7_codec(nvn_gpu_pipe pipe) {
     nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
     if (in && out) {
         memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-        if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, 1)) {
+        if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, NULL, 1)) {
             const uint8_t *data = buf_cpu(out);
             CHECK(*(const uint32_t *)data == 0, "BC7 supported modes must sum to zero unsupported flags");
             bc7_compare(data + 16);
             buf_cpu(in)[(BLOCKS - 1) * 16] = 0x10;
-            if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, 2))
+            if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, NULL, 2))
                 CHECK(*(const uint32_t *)data == 1, "BC7 last block in unsupported mode must reject whole image");
         }
     }
