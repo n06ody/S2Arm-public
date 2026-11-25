@@ -22,7 +22,7 @@ wrap=()
 for fn in vkCreateImageView vkCreateFramebuffer vkCmdBeginRenderPass vkUpdateDescriptorSets vkCmdBindDescriptorSets vkCmdDraw vkCmdCopyImage vkGetDeviceProcAddr vkDestroyImageView vkWaitForFences; do wrap+=(-Wl,--wrap="$fn"); done
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 \
-    -DS2A_NVK_POOL_HOST_TEST=1 "${inc[@]}" "${src[@]}" "${wrap[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/test"
+    -DS2A_NVK_POOL_HOST_TEST=1 -DS2A_BCDEC_HOST_TEST=1 "${inc[@]}" "${src[@]}" "${wrap[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/test"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 # run.sh 在调用此独立入口之后才开同步校验，不能依赖父进程或本地包装器。
 # 同计算写入负控一样同时打开 shader 访问启发式；仅加载 validation 层不够。
@@ -33,6 +33,20 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 printf 'feedback validation: sync=1 shader_accesses_heuristic=1 settings=%s\n' "$VK_LAYER_SETTINGS_PATH"
+if [ "${1:-}" = --gpu-pass-time ]; then
+    for dq in 0 1; do
+        log="$out/gpu-pass-time-dq$dq.log"
+        if ! S2A_TEST_FEEDBACK_PASS_TIME=1 timeout 120 "$out/test" "$out/shaders" "$dq" 0 1 1 > "$log" 2>&1 ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+           ! grep -q 'case=3 draws=2 live-overlap=0 copies=2 copy-bad=0 begins=5 begins-bad=0 overlap-bad=0 pixel-bad=0' "$log"; then
+            cat "$log"
+            exit 1
+        fi
+        python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" feedback
+        echo "gpu-pass-time feedback: dq=$dq snapshots=2 draws=2 physical_passes=5 pixel-bad=0 VUID=0 SYNC-HAZARD=0"
+    done
+    exit 0
+fi
 failed=0
 # 案例数：0–11（12）+ 深度 2 + 中止 1 + 16 / 17 + 守卫 18 + 整池组回收 20 = 19；opt=0 另有 15 / 19（要求池里的图都是 GENERAL），共 21；opt=1 共 19。
 cases_want() { echo $((21 - 2 * $1)); }
@@ -139,7 +153,7 @@ pathlib.Path(sys.argv[2]).write_text(s.replace(a, 'if (1) { free(u->patch); u->p
 PYMUT
 msrc=(); for f in "${src[@]}"; do [ "$f" = "$repo/android/native/nvn/backend_vulkan.c" ] && f="$mut/backend_vulkan.c"; msrc+=("$f"); done
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
-    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_NVK_POOL_HOST_TEST=1 \
+    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_NVK_POOL_HOST_TEST=1 -DS2A_BCDEC_HOST_TEST=1 \
     "${inc[@]}" "${msrc[@]}" "${wrap[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$out/test-mut"
 set +e
 timeout 120 "$out/test-mut" "$out/shaders" 0 0 1 1 > "$out/rec-restore-neg.log" 2>&1
@@ -173,5 +187,12 @@ elif ! echo "$rep" | grep -q '^case=3: '; then
     echo '【红】feedback 白名单负控：判红了，但报错行里没有案例 3' >&2; echo "$rep" | head -n 6 >&2; failed=1
 else
     echo "feedback whitelist negative: PASS ($(echo "$rep" | grep -c '^case=') 条白名单之外的冒险被判红，含案例 3)"
+fi
+# 诊断只跑五个用例，真 WSI 覆盖每两次成功呈现间 0 / 1 / 多个快照。
+if ! S2A_GPU_ACCOUNTS_FIXTURE=1 timeout 30 "$out/test" "$out/shaders" 0 0 1 1 > "$out/accounts.log" 2>&1 ||
+   grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/accounts.log"; then
+    cat "$out/accounts.log"; failed=1
+else
+    grep -E 'feedback accounts cases=' "$out/accounts.log"
 fi
 exit "$failed"
