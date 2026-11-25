@@ -16,7 +16,7 @@ for d in android/tests/vkhost graphics/nvn graphics/nvn/replay graphics/nvn/gfx/
     inc+=(-I "$repo/$d")
 done
 src=("$repo/android/tests/vk/t_replay_cube_view.c")
-for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/nvn_unimpl.c graphics/nvn/gfx/nvn/nvn_dirty.c \
+for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c graphics/nvn/gfx/nvn/nvn_dirty.c \
          android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c \
          android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c \
          android/native/nvn/nvn_vk_format.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c \

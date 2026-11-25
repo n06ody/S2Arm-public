@@ -3,6 +3,7 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
@@ -382,13 +383,23 @@ static void pass_split(void) {
     { uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns); g_split_base = nd; }
     seg_cut(0);
 }
+static void submit_pre(nvn_gpu_err *err) {
+    if (!g_pre) return;
+    nvn_gpu_cmd pc = g_pre;
+    g_pre = NULL;
+    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), err))) {
+        rp_res_xfer_aborted(g_sub_serial);
+        red("前置段提交失败：%s", err->why);
+    }
+}
+
 // 中途交段本体（sub_split、pass_split 与第一次遮挡复位共用）：先交当前段，再开新段。交出去的这一段进不进 mids 看它自己声明没声明槽（g_occ_seg），
 // next_occ 是新段要不要声明槽。调用方保证 g_cmd / g_sub 在、通道已收、中间值没用完。
 static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
     if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
     if (g_occ_seg && !g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc);
@@ -414,7 +425,11 @@ static uint64_t sub_commit_body(void) {
     rp_pass_flush(g_cmd);   // 打开的通道与待折清除不跨提交
     if (!g_cmd) {   // 没有段（开段失败，或中途交段之后开新段失败）：副作用无处挂，按失败丢弃（不写假成功）
         if (s) sub_orphan(s);
-        if (g_pre) { nvn_gpu_cmd_abort(g_pre); g_pre = NULL; }
+        if (g_pre) {
+            nvn_gpu_cmd_abort(g_pre);
+            g_pre = NULL;
+            rp_res_xfer_aborted(g_sub_serial);
+        }
         // 时间线照样往前走一格：这次提交里的同步对象已经按 g_fence + SUB_STEP 发布（OP_FENCE_SYNC），中途交出去的段也已经用掉了这一格里的中间值。
         // 不走的话，下一次提交会把同一批值再用一遍（后端要求严格递增）。
         // 这一格还要有人点亮（审计 P1-174）：再开一个空段、以这一格的值提交，做完时完成值推到这一格，等它的游戏线程不必等下一次提交；
@@ -427,7 +442,7 @@ static uint64_t sub_commit_body(void) {
         return g_fence;
     }
     nvn_gpu_err err = {0}; uint64_t f = g_fence + SUB_STEP;
-    if (g_pre) { nvn_gpu_cmd pc = g_pre; g_pre = NULL; if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), &err))) red("前置段提交失败：%s", err.why); }
+    submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
     uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; }
