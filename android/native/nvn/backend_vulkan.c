@@ -290,6 +290,8 @@ struct feedback_copy {
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
+    struct pass_edge_trace *pass_edge;
+    uint8_t pass_edge_frame, pass_edge_pre, pass_edge_oom;
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     const struct nvn_gpu_pipe_s *loss_programs[LOSS_PROGRAMS_PER_SEGMENT], *loss_last_pipe;
     uint8_t loss_nprograms, loss_programs_truncated;
@@ -462,6 +464,8 @@ struct nvn_gpu_vk {
     uint32_t test_delay_ms;
     uint64_t wsi_seq;    // 已提交的呈现段序号（g_submit_mu 下分配，与入队同序）
     uint64_t wsi_done;   // worker 已等到栅栏的最后一个呈现段序号（g_mu 下改；段按入队顺序处理，单调）
+    unsigned pass_edge_target, pass_edge_present;
+    unsigned pass_edge_rows, pass_edge_submits, pass_edge_missing, pass_edge_dropped;
 };
 
 // Stop 可在后端还在 open 时报告；计数清零也走原子操作，不与 g 的 memset 共用内存。
@@ -484,6 +488,7 @@ static void pipe_creation_open(const struct s2a_vk_device *dev) {
 }
 
 static struct nvn_gpu_vk g;
+#include "backend_vulkan_pass_edge.inc"
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
@@ -1870,6 +1875,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     free(c->refs);
     free(c->refseen);
     free(c->staging);
+    free(c->pass_edge);
     free(c);
 }
 
@@ -2348,6 +2354,8 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     memset(&g, 0, sizeof g);
     g.dev = dev;
     pipe_creation_open(dev);
+    int trace_present = nvn_plat_flag("nvk_pass_edge_trace", 0);
+    g.pass_edge_target = trace_present > 0 ? (unsigned)trace_present : 0;
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
@@ -3677,6 +3685,10 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
         if (module_result == VK_SUCCESS && s->precompiled) {
             sh->precompiled = 1;
             memcpy(sh->stage_key, s->key, sizeof sh->stage_key);
+        }
+        if (module_result == VK_SUCCESS && (s->precompiled ||
+            (g.pass_edge_target && s->stage == NVN_GPU_SH_FS &&
+             __atomic_load_n(&g.pass_edge_present, __ATOMIC_RELAXED) < g.pass_edge_target))) {
             s2a_sha256 hash;
             s2a_sha256_init(&hash);
             s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
@@ -5444,6 +5456,10 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     vkCmdEndRenderPass(c->cb);
+    if (c->pass_edge) {
+        nvn_gpu_pass_edge_reason(c, "sample_layout");
+        pass_edge_end(c);
+    }
     c->in_pass = 0;
     c->pass_occl = 0;
     pass_read_sync(c);
@@ -5488,6 +5504,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    if (c->pass_edge_frame) pass_edge_begin(c, &d);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
     c->pass_desc.area_w = c->pass_desc.area_h = 0;
@@ -5604,6 +5621,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    if (c->pass_edge_frame) pass_edge_begin(c, d);
     PBP_STEP(3);
     c->in_pass = 1;
     c->pass_occl = d->occlusion;
@@ -5648,6 +5666,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
+    if (c->pass_edge) pass_edge_end(c);
     c->in_pass = 0;
     c->pass_natt = 0;
     pass_read_sync(c);
@@ -6595,7 +6614,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         DIAG_DRAW(vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance));
     }
-    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) loss_note_program(c, p);
+    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) {
+        loss_note_program(c, p);
+        if (c->pass_edge) pass_edge_draw(c, p, &vp, &sc);
+    }
     if (dtm) { const uint64_t dt3 = now_ns(); __atomic_fetch_add(&g_draw_ns[0], dt1 - dt0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[1], dt2 - dt1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[2], dt3 - dt2, __ATOMIC_RELAXED);
         // 每 5 秒一次：把后端逐笔的三段（描述符 / 状态 / 顶点索引与绘制调用）摊到每笔上打印，
         // 找到后端这笔 5 微秒里到底是谁（真机读数见坑记录续 27）。
@@ -8498,6 +8520,8 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     }
     c->live_next = g.live;
     g.live = c;
+    c->pass_edge_frame = pass_edge_next();
+    c->pass_edge_pre = c->pass_edge_frame && d && d->label && !strcmp(d->label, "nvn submit pre");
     pthread_mutex_unlock(&g_mu);
     *out = c;
     return rc(NVN_GPU_OK);
@@ -8683,6 +8707,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 s->fence = fence;
                 s->submitted = 1;
                 s->executed = 1;
+                if (g.pass_edge_target) pass_edge_commit(c, signal);
                 publish_signal(signal, 0);
                 enqueue_segment(&g, s);   // 此后 cmd 归 worker（finish_cmd 负责摘链）
                 pthread_mutex_unlock(&g_submit_mu);
