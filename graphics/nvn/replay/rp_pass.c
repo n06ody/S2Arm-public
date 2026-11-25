@@ -484,6 +484,7 @@ void rp_pass_end(nvn_gpu_cmd c) { (void)pass_end_checked(c); }
 // 开通道（已开着直接回 1）。0 = 开不了（已记账）：调用方跳过这笔绘制。
 static uint64_t pb_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 #define PB(step) do { if (tm_) { uint64_t n_ = pb_now(); rp_perf_add(step, n_ - pb_); pb_ = n_; } } while (0)
+// 弱链接[replay]：nvn_gpu_pass_edge_reason
 static int pass_area_contains(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     return x >= P.ax && y >= P.ay && (int64_t)x + w <= (int64_t)P.ax + P.aw &&
            (int64_t)y + h <= (int64_t)P.ay + P.ah;
@@ -508,7 +509,10 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     p_scissor sc;
     const int known = nvn_plat_flag("nvk_pass_area", 0) && !rp_occl_want() && pass_area(&sc);
     if (P.open) {
-        if (P.area_on && (!known || !pass_area_contains(sc.x, sc.y, (uint32_t)sc.w, (uint32_t)sc.h))) rp_pass_end(c);
+        if (P.area_on && (!known || !pass_area_contains(sc.x, sc.y, (uint32_t)sc.w, (uint32_t)sc.h))) {
+            rp_pass_edge(c, known ? "area_grow" : "area_unknown");
+            rp_pass_end(c);
+        }
         return;
     }
     if (known) { P.area_want = 1; P.wx = sc.x; P.wy = sc.y; P.ww = (uint32_t)sc.w; P.wh = (uint32_t)sc.h; }
@@ -808,6 +812,7 @@ static void pass_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *cl) {
     if (P.area_on && !pass_area_contains(cl->x, cl->y, cl->w, cl->h)) {
         const uint8_t colors = P.colors;
         const int layered = P.layered;
+        rp_pass_edge(c, "area_clear");
         rp_pass_end(c);
         if (!pass_begin_colors(c, colors, layered)) {
             clear_remainder_failed("clear_rect_reopen_failed", cl);

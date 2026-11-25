@@ -24,6 +24,7 @@ static pool_t pool;
 int rp_tm_on;
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_pass_area")) return enabled;
+    if (!strcmp(name, "nvk_pass_edge_trace") && getenv("S2A_TEST_AREA_TRACE")) return 1;
     return backend_fixture_flag(name, dflt);
 }
 void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }

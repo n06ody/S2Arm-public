@@ -54,6 +54,18 @@ for dq in 0 1; do
     done
 done
 
+# 第一笔 scissor 不是整遍的覆盖。从真实提交中核第二笔扩展的外包和另一遍的清除账。
+S2A_TEST_AREA_TRACE=1 timeout 90 "$out/test" "$out/shaders" 0 1 > "$out/trace-union.log" 2>&1
+S2A_TEST_AREA_TRACE=1 timeout 90 "$out/test" "$out/shaders" 1 3 > "$out/trace-clear.log" 2>&1
+grep -qE 'nvk-pass-edge pass .* draws=2 .* sc=11,9,11,10 .* ra=0,0,64,64 sc_union=11,9,34,25 clear_union=0,0,0,0 builtin_draws=0 clear_calls=0 ops=0:1/0/0$' "$out/trace-union.log"
+grep -qE 'nvk-pass-edge pass .* end=area_clear .* ra=[^ ]+ sc_union=11,9,11,10 clear_union=0,0,0,0 .* ops=0:1/0/0$' "$out/trace-clear.log"
+grep -qE 'nvk-pass-edge pass .* ra=0,0,64,64 sc_union=0,0,0,0 clear_union=18,14,27,20 builtin_draws=0 clear_calls=1 ops=0:1/0/0$' "$out/trace-clear.log"
+if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out"/trace-{union,clear}.log; then
+    cat "$out"/trace-{union,clear}.log
+    exit 1
+fi
+echo 'pass-area trace: actual area, all-draw union, clear union, real attachment operations'
+
 # 编译同一份源码的撤回版本，逐局只撤一条守卫。有两层保护的用例，两处一起撤。
 python3 - "$rp" "$vk" "$out" <<'PY'
 import sys

@@ -5504,7 +5504,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    if (c->pass_edge_frame) pass_edge_begin(c, &d);
+    if (c->pass_edge_frame) pass_edge_begin(c, &d, bi.renderArea, att);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
     c->pass_desc.area_w = c->pass_desc.area_h = 0;
@@ -5527,6 +5527,7 @@ static int pass_ensure_area(struct nvn_gpu_cmd_s *c, VkRect2D rect) {
     if (bottom > d->h) bottom = d->h;
     if (right > left && bottom > top && left >= d->area_x && top >= d->area_y &&
         right <= (int64_t)d->area_x + d->area_w && bottom <= (int64_t)d->area_y + d->area_h) return 1;
+    if (c->pass_edge) nvn_gpu_pass_edge_reason(c, "area_bounds");
     if (pass_reopen(c, NULL, 0)) return 1;
     if (rc_is(c->sticky, NVN_GPU_OK)) set_sticky(c, NVN_GPU_E_ORDER, "局部通道：需要整区，无法重开");
     return 0;
@@ -5621,7 +5622,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    if (c->pass_edge_frame) pass_edge_begin(c, d);
+    if (c->pass_edge_frame) pass_edge_begin(c, d, bi.renderArea, att);
     PBP_STEP(3);
     c->in_pass = 1;
     c->pass_occl = d->occlusion;
@@ -8242,6 +8243,8 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     if (!pass_ensure_area(c, (VkRect2D){{d->x, d->y}, {d->w, d->h}})) return;
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
+    if (c->pass_edge && rc_is(c->sticky, NVN_GPU_OK))
+        pass_edge_builtin(c, (VkRect2D){{d->x, d->y}, {d->w, d->h}}, 1);
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
 }
 

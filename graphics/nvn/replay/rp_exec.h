@@ -76,7 +76,6 @@ typedef struct rp_pass_read { nvn_gpu_tex tex; nvn_gpu_pool_table pool; } rp_pas
 void rp_pass_land_reads(nvn_gpu_cmd c, const rp_pass_read *reads, int n);
 int rp_pass_parked(void);   // 现在挂着几条待折清除（绘制路径的快路门：0 = 不必为读路径收集贴图）
 void rp_pass_end(nvn_gpu_cmd c);
-// 弱链接[replay]：nvn_gpu_pass_edge_reason
 void nvn_gpu_pass_edge_reason(nvn_gpu_cmd c, const char *reason) __attribute__((weak));
 static inline void rp_pass_edge(nvn_gpu_cmd c, const char *reason) {
     if (nvn_gpu_pass_edge_reason) nvn_gpu_pass_edge_reason(c, reason);
