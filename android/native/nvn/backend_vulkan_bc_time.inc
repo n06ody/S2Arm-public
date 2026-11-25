@@ -22,6 +22,9 @@ static struct bc_time_bucket {
     double ns;
 } g_bc_time[BC_TIME_PATHS][BC_TIME_FORMATS];
 static uint64_t g_bc_time_start;
+static struct bc7_stat_bucket {
+    uint64_t snapshots, rgba_bytes, bc_bytes, mode_blocks;
+} g_bc7_mode[NVK_BC7_MODES], g_bc7_image[4];
 
 static void bc_time_log_window(uint64_t now, int final) {
     if (!g_bc_time_start || (!final && now - g_bc_time_start < UINT64_C(5000000000))) return;
@@ -54,8 +57,53 @@ static void bc_time_log_window(uint64_t now, int final) {
                  (unsigned long long)shadow[path]);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
     }
+    static const char *const buckets[] = {"only6", "only5_6", "only4_5_6", "other"};
+    for (unsigned i = 0; i < 4; i++) {
+        const struct bc7_stat_bucket b = g_bc7_image[i];
+        if (!b.snapshots) continue;
+        snprintf(line, sizeof line, "bc7-images eligible=%s snapshots=%llu rgba_bytes=%llu bc_bytes=%llu",
+                 buckets[i], (unsigned long long)b.snapshots, (unsigned long long)b.rgba_bytes,
+                 (unsigned long long)b.bc_bytes);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
+    }
+    for (unsigned i = 0; i < NVK_BC7_MODES; i++) {
+        const struct bc7_stat_bucket b = g_bc7_mode[i];
+        if (!b.snapshots) continue;
+        snprintf(line, sizeof line, "bc7-mode mode=%u blocks=%llu snapshots=%llu rgba_bytes=%llu bc_bytes=%llu",
+                 i, (unsigned long long)b.mode_blocks, (unsigned long long)b.snapshots,
+                 (unsigned long long)b.rgba_bytes, (unsigned long long)b.bc_bytes);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
+    }
+    memset(g_bc7_mode, 0, sizeof g_bc7_mode);
+    memset(g_bc7_image, 0, sizeof g_bc7_image);
     memset(g_bc_time, 0, sizeof g_bc_time);
     g_bc_time_start = final ? 0 : now;
+}
+
+static void bc7_stat_add(struct bc7_stat_bucket *b, uint64_t rgba_bytes, uint64_t bc_bytes, uint64_t blocks) {
+    b->snapshots++;
+    b->rgba_bytes += rgba_bytes;
+    b->bc_bytes += bc_bytes;
+    b->mode_blocks += blocks;
+}
+
+// 按完整快照计上传次数；同一张图重传再计一次。字节是整图紧排大小，非实际分配量。
+static void bc7_stat_snapshot(const uint64_t modes[NVK_BC7_MODES], uint64_t rgba_bytes, uint64_t bc_bytes) {
+    unsigned mask = 0;
+    pthread_mutex_lock(&g_bc_time_mu);
+    const uint64_t now = now_ns();
+    if (!g_bc_time_start) g_bc_time_start = now;
+    bc_time_log_window(now, 0);
+    for (unsigned i = 0; i < NVK_BC7_MODES; i++) {
+        if (!modes[i]) continue;
+        mask |= 1u << i;
+        bc7_stat_add(&g_bc7_mode[i], rgba_bytes, bc_bytes, modes[i]);
+    }
+    // 前三档为累积条件；其他档含任何 4/5/6 之外的块。
+    if (mask == (1u << 6)) bc7_stat_add(&g_bc7_image[0], rgba_bytes, bc_bytes, 0);
+    if (!(mask & ~0x60u)) bc7_stat_add(&g_bc7_image[1], rgba_bytes, bc_bytes, 0);
+    bc7_stat_add(&g_bc7_image[(mask & ~0x70u) ? 3 : 2], rgba_bytes, bc_bytes, 0);
+    pthread_mutex_unlock(&g_bc_time_mu);
 }
 
 static void bc_time_event(uint32_t path, uint32_t format, uint64_t blocks, int valid, double ns) {
@@ -76,6 +124,7 @@ static void bc_time_event(uint32_t path, uint32_t format, uint64_t blocks, int v
 
 static void bc_time_open(void) {
     g.bc1_astc_on = nvn_plat_flag("nvk_bc1_astc", 0) != 0;
+    g.bc7_astc_on = nvn_plat_flag("nvk_bc7_astc", 0) != 0;
     g.bc_time_on = nvn_plat_flag("nvk_bc_upload_time", 0) != 0;
     if (!g.bc_time_on) return;
     const VkPhysicalDeviceLimits *limits = &g.dev->properties.limits;

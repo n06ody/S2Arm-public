@@ -54,3 +54,53 @@ if [ "$rc" -ne 1 ] || ! grep -q 'FAIL .*BC1 transparent block must mark the text
     exit 1
 fi
 echo '【绿】BC1 ASTC 计算编码、透明黑保底、原 BC 回读；撤透明标记负控命中'
+
+# 同一 Vulkan/VVL 设备运行 BC7 的真实计算与 Arm astcenc 浮点采样对拍。
+cc -std=c11 -Wall -Wextra -Werror -I "$repo/android/native/nvn" \
+    "$repo/android/tests/vk/t_bc7_astc_inspect.c" -o "$out/bc7-inspect"
+"$out/bc7-inspect"
+set +e
+timeout 180 "$out/test" --bc7 2>&1 | tee "$out/bc7.log"
+rc=${PIPESTATUS[0]}
+set -e
+if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/bc7.log"; then
+    echo "【红】BC7 ASTC fixture rc=$rc" >&2
+    exit 1
+fi
+
+encoder="$repo/android/native/nvn/bc7_astc_shaders"
+python3 "$encoder/generate.py" --check --tables-only --out "$out/bc7-tables"
+python3 - "$encoder/encode.comp" "$out" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+mutations = {
+    "weights": ("        weights = ~weights;", ""),
+    "rotation": ("colors.y | (ccs << 30u)", "colors.y | (((ccs + 1u) & 3u) << 30u)"),
+    "bise": ("uint code = trits[index >> 2u] >> (8u * (index & 3u));",
+             "uint code = (trits[index >> 2u] >> (8u * (index & 3u))) ^ 1u;"),
+    "alpha": ("bool exchange = rgb_sum(ep0)", "ep0.a = ep1.a = 0u;\n    bool exchange = rgb_sum(ep0)"),
+}
+for name, (anchor, replacement) in mutations.items():
+    assert source.count(anchor) == 1, name
+    directory = Path(sys.argv[2]) / ("bc7-negative-" + name)
+    directory.mkdir(exist_ok=True)
+    (directory / "encode.comp").write_text(source.replace(anchor, replacement))
+PY
+for variant in weights rotation bise alpha; do
+    dir="$out/bc7-negative-$variant"
+    "${GLSLC:-glslc}" --target-env=vulkan1.1 -O -I "$out/bc7-tables" "$dir/encode.comp" -o "$dir/encode.comp.spv"
+    set +e
+    timeout 180 "$out/test" --bc7 "$dir" > "$dir/run.log" 2>&1
+    rc=$?
+    set -e
+    expected='BC7 channel error limit'
+    if [ "$variant" = alpha ]; then expected='BC7 alpha endpoint/coverage preservation'; fi
+    if [ "$rc" -ne 1 ] || ! grep -q "FAIL .*$expected" "$dir/run.log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$dir/run.log"; then
+        cat "$dir/run.log"
+        echo "【红】BC7 ASTC $variant 负控未命中 rc=$rc" >&2
+        exit 1
+    fi
+    echo "【绿】BC7 ASTC $variant 负控命中"
+done
