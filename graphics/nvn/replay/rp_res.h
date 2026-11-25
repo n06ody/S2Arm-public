@@ -138,6 +138,8 @@ int rp_tex_is_read(const tex_t *t, const struct rp_pass_read *reads, int n);
 int rp_tex_storage_aliases(const tex_t *a, const tex_t *b);
 // 会话收尾：放掉全部后端对象、清表。
 void rp_res_reset(void);
+void rp_tex_upload_note_clear(const tex_t *t);
+void rp_tex_upload_ledger_flush(uint64_t frame, int final);
 // 读数（单测 / 内存账）
 int rp_res_tex_built(void);      // 已建的后端贴图个数
 int rp_res_tex_serials(void);    // 已解析的贴图对象个数（多个对象可共用一份存储）

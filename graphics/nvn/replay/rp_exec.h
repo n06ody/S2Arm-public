@@ -44,6 +44,12 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec);
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec);
+void rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park);
+int rp_pass_park_tex_clear(nvn_gpu_cmd c, const tex_t *t, const view_t *v, nvn_gpu_view gpu, const nvn_gpu_clear *value, int is_int);
+extern int rp_tex_clear_active;
+void rp_pass_land_tex_clear(nvn_gpu_cmd c);
+void rp_pass_tex_clear_before_tex(nvn_gpu_cmd c, const tex_t *t);
+void rp_pass_tex_clear_before_buf(nvn_gpu_cmd c, uint64_t addr, uint64_t len);
 void rp_op_draw_tex(nvn_gpu_cmd c, const p_draw_tex *o, const void *rec);   // OP_DRAW_TEX（rp_draw_tex.c，#1452）：后端有 NVN_GPU_CAP_DRAW_TEX 才画，否则记未接
 
 // 会话四件套（前端按名字调，上沿头文件里没有声明）
@@ -144,6 +150,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_P_CUT_BAR,      // 通道里有着色器写、其后游戏发了带顺序位的屏障，因此在下一笔绘制前结束的通道数（见 rp_pass.c rp_pass_barrier）
        RP_PERF_BUF_SYNC_GW_KB,   // 已登记 GPU 写覆盖整页，在途免同步的 KB
        RP_PERF_WAIT_EFX_TS, RP_PERF_WAIT_EFX_FX, RP_PERF_WAIT_EFX_GW, RP_PERF_WAIT_EFX_LATER,   // 本可放行、因待落地回写改成真等的 SyncWait：所等区间里带时间戳 / 带事件·别的计数器·遮挡 / 带显卡写缓冲的次数（一次可记多类）；所等区间里没有、只有之后的提交带回写的次数
+       RP_PERF_MIRROR_HOIST, RP_PERF_MIRROR_OVERLAP, RP_PERF_MIRROR_FALLBACK,   // 原本会关遍的镜像同步：前移、确认重叠、不具备前移条件
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。

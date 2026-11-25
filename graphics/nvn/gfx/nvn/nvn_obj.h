@@ -366,6 +366,10 @@ void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v);
 void nvn_be_unreg_tex_range(int base, int n);   // 贴图池销毁时清它那段编号的登记（hle_nvn.c dpool_finalize）
 // textures written by WriteTexels (recorded by serial): the replay layer treats them like packaged textures, uploaded from guest memory and re-uploaded on dirty pages
 void nvn_be_tex_cpu_written(const tex_t *t);
+enum nvn_tex_cpu_source {
+    NVN_TEX_CPU_OTHER = 1, NVN_TEX_CPU_WRITE_TEXELS, NVN_TEX_CPU_FLUSH, NVN_TEX_CPU_POLL, NVN_TEX_CPU_FIRST_USE
+};
+void nvn_be_tex_cpu_mark_from(const tex_t *t, enum nvn_tex_cpu_source source);
 int nvn_be_tex_gpu_owned(uint64_t serial);                                  // its host texture is a render target or shader-writable: GPU content, never re-uploaded from guest memory
 // A program's per-stage shader key (hle_nvn.c): the first 8 bytes of sha256(first 0x880 bytes of the control section (its own length when shorter; two volatile spans zeroed, nvn_key.h) + code area);
 //   an old package keyed without the zeroing gets its old key (keys_hash). Computed at SetShaders (NVN lets the caller free the control section once it returns, and Unity does);

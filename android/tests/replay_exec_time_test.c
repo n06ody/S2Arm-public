@@ -88,6 +88,8 @@ int rp_pass_draws(void) { return 0; }
 int rp_pass_split_ok(void) { return 0; }
 void rp_pass_end(nvn_gpu_cmd c) { (void)c; }
 void rp_pass_flush(nvn_gpu_cmd c) { (void)c; }
+int rp_tex_clear_active;   // 本隔离夹具没有待清除的附件
+void rp_pass_land_tex_clear(nvn_gpu_cmd c) { (void)c; abort(); }
 void rp_pass_barrier(uint32_t bits) { (void)bits; }
 void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec) { (void)c; (void)cc; (void)rec; }
 void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) { (void)c; (void)cd; (void)rec; }

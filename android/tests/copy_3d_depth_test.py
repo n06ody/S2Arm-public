@@ -19,6 +19,11 @@ match = re.search(r'static void bc_copy_from_buf\([^;]+\);', src)
 if not match:
     raise RuntimeError('production bc_copy_from_buf declaration not found')
 bc_upload_signature = match.group(0)[:-1]
+ledger = (root / 'android/native/nvn/backend_vulkan_cold_ledger.inc').read_text()
+match = re.search(r'static void cold_note_write\([^)]*\) \{', ledger)
+if not match:
+    raise RuntimeError('production cold_note_write definition not found')
+cold_write_signature = match.group(0)
 def function(signature):
     start = src.index(signature)
     brace = src.index('{', start)
@@ -42,6 +47,14 @@ struct nvn_gpu_tex_s { uint32_t w,h,depth,levels,target,layers,format,nvn_format
 struct nvn_gpu_buf_s { VkBuffer buffer; uint64_t size; };
 struct nvn_gpu_cmd_s { int sticky,in_pass,xfer_dirty; VkCommandBuffer cb; };
 static int copies, bc_calls, bc_upload_calls; static VkBufferImageCopy last;
+static unsigned cold_writes;
+static struct {
+    nvn_gpu_cmd cmd;
+    nvn_gpu_buf buf;
+    uint64_t off, bytes;
+    unsigned writer;
+    int exact;
+} last_cold_write;
 static int nvn_vk_format_substituted(uint32_t f) { (void)f; return 0; }   /* #398 D24 换 D32：本测试的贴图都不换存储 */
 static int rc_is(int got, int expected) { return got == expected; }
 static void set_sticky(struct nvn_gpu_cmd_s *c, int rc, const char *why, ...) { (void)why; c->sticky = rc; }
@@ -66,6 +79,17 @@ bc_upload_stub = bc_upload_signature + r''' {
     bc_upload_calls++; set_sticky(c, NVN_GPU_E_UNSUPPORTED, "BC upload not implemented by bounds fixture");
 }
 '''
+# Record production's handoff to the write ledger at the fixture boundary.
+cold_write_stub = cold_write_signature + r'''
+    cold_writes++;
+    last_cold_write.cmd = c;
+    last_cold_write.buf = buf;
+    last_cold_write.off = off;
+    last_cold_write.bytes = bytes;
+    last_cold_write.writer = writer;
+    last_cold_write.exact = exact;
+}
+'''
 # #1581 K：一个拷贝区域只取一个面——面选择（copy_face_aspect）与 copy_buf_tex_impl 的 face 取值（COPY_FACE_*）在函数外，一起切出来
 match = re.search(r'enum \{ COPY_FACE_DEFAULT[^}]*\};', src)
 if not match:
@@ -80,9 +104,9 @@ main = r'''
 static int check_case(int direction, unsigned layer, const NVNcopyRegion *region, int expected, const char *name) {
     struct nvn_gpu_tex_s t = {.w=4,.h=4,.depth=4,.levels=3,.target=NVN_TEXTURE_TARGET_3D,.layers=1};
     struct nvn_gpu_buf_s b = {.size=128}; struct nvn_gpu_cmd_s c = {0};
-    copies = 0; memset(&last, 0, sizeof last);
-    if (direction == 0) nvn_gpu_copy_buf_tex(&c, &b, 0, 8, 32, &t, 1, layer, region);
-    else nvn_gpu_copy_tex_buf(&c, &t, 1, layer, region, &b, 0, 8, 32);
+    copies = 0; cold_writes = 0; memset(&last, 0, sizeof last);
+    if (direction == 0) nvn_gpu_copy_buf_tex(&c, &b, 4, 8, 32, &t, 1, layer, region);
+    else nvn_gpu_copy_tex_buf(&c, &t, 1, layer, region, &b, 4, 8, 32);
     if (expected) {
         if (c.sticky != NVN_GPU_OK || copies != 1 || last.imageOffset.z != (int)layer ||
             last.imageExtent.width != 2 || last.imageExtent.height != 2 ||
@@ -91,6 +115,13 @@ static int check_case(int direction, unsigned layer, const NVNcopyRegion *region
         }
     } else if (c.sticky != NVN_GPU_E_ARG || copies != 0) {
         fprintf(stderr, "%s direction=%d: expected E_ARG and no Vulkan copy, sticky=%d calls=%d\n", name, direction, c.sticky, copies); return 1;
+    }
+    unsigned expected_writes = expected && direction == 1;
+    if (cold_writes != expected_writes ||
+        (expected_writes && (last_cold_write.cmd != &c || last_cold_write.buf != &b ||
+         last_cold_write.off != 4 || last_cold_write.bytes != 32 ||
+         last_cold_write.writer != 0 || last_cold_write.exact))) {
+        fprintf(stderr, "%s direction=%d: copy write ledger does not match the destination span\n", name, direction); return 1;
     }
     return 0;
 }
@@ -128,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix='copy-3d-depth-') as path:
         if (sysinc / name).exists(): (inc / name).symlink_to(sysinc / name)
     def run(name, stub, body, expected=None):
         c_file = d / (name + '.c'); exe = d / name
-        c_file.write_text(preamble + stub + bc_upload_stub + body + main)
+        c_file.write_text(preamble + stub + bc_upload_stub + cold_write_stub + body + main)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-I' + str(inc), '-I' + str(root/'graphics/nvn/gfx/nvn'),
                         '-I' + str(root/'graphics/nvn/gfx/nvn/include'),
@@ -151,3 +182,7 @@ with tempfile.TemporaryDirectory(prefix='copy-3d-depth-') as path:
     assert production.count(original) == 1
     run('withdraw-depth-bounds', bc_stub, production.replace(original, 'if (0 && (off->z < 0 || (uint32_t)off->z >= d || ext->depth > d - (uint32_t)off->z)) return -1;'),
         'expected E_ARG and no Vulkan copy')
+    original = 'cold_note_write(c, b, off, image_bytes, 0, 0);'
+    assert production.count(original) == 1
+    run('move-ledger-span', bc_stub, production.replace(original, 'cold_note_write(c, b, off + 4, image_bytes, 0, 0);'),
+        'copy write ledger does not match the destination span')

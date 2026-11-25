@@ -6,10 +6,12 @@
 #define main replay_fixture_main
 #define rp_shader_resolve fixture_shader_resolve
 #define nvn_plat_flag fixture_plat_flag
+#define nvn_plat_log fixture_plat_log
 #define nvn_dirty_since fixture_dirty_since
 #include "t_nvn_replay.c"
 #undef nvn_dirty_since
 #undef nvn_plat_flag
+#undef nvn_plat_log
 #undef rp_shader_resolve
 #undef main
 #include <stdio.h>
@@ -31,7 +33,20 @@ static int res_flags_off(void) {
     if (v < 0 || !(++k & 255)) { const char *e = getenv("T_NVN_RES_FLAGS_OFF"); v = e && *e && *e != '0'; }
     return v;
 }
+static int g_upload_ledger, g_ledger_rows, g_ledger_windows;
+static char g_ledger_row[1024], g_ledger_window[320];
+void nvn_plat_log(int level, const char *cls, const char *text) {
+    if (cls && !strcmp(cls, "tex-upload-ledger")) {
+        g_ledger_rows++;
+        snprintf(g_ledger_row, sizeof g_ledger_row, "%s", text);
+    } else if (cls && !strcmp(cls, "tex-upload-ledger-window")) {
+        g_ledger_windows++;
+        snprintf(g_ledger_window, sizeof g_ledger_window, "%s", text);
+    }
+    fixture_plat_log(level, cls, text);
+}
 int nvn_plat_flag(const char *name, int dflt) {
+    if (g_upload_ledger && !strcmp(name, "nvk_tex_upload_ledger")) return 1;
     if (res_flags_off() && (!strcmp(name, "nvk_bind_fast") || !strcmp(name, "nvk_drv_memo") || !strcmp(name, "nvk_tex_epoch"))) return 0;
     return fixture_plat_flag(name, dflt);
 }
@@ -512,7 +527,67 @@ static void t_res_bc1_rebind(void) {
     g_caps_extra &= ~NVN_GPU_CAP_BC1_SNAPSHOT;
 }
 
+static void t_res_upload_ledger(void) {
+    for (int enabled = 0; enabled <= 1; enabled++) {
+        g_upload_ledger = enabled;
+        g_ledger_rows = g_ledger_windows = 0;
+        res_fresh();
+        nvn_be_set_frame(1);
+        nvn_be_sub_begin();
+        g_tp.mem = g_pmem;
+        g_tp.size = sizeof g_pmem;
+        tex_t t = mk_tex(903, 0, NVN_FORMAT_RGBA8, 32, 32, 1, 0);
+        t.mem = g_pmem;
+        memset(t.mem, 0x51, t.L.size);
+        CHECK(t.L.size == 4096);
+        const int protects = g_protects;
+        nvn_be_tex_cpu_mark_from(&t, NVN_TEX_CPU_WRITE_TEXELS);
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 1);
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 1);
+        p_clear_tex clear = {.tex = &t, .r = {.width = 16, .height = 16, .depth = 1},
+                             .mask = 15, .value_type = CLEAR_TEX_FLOAT};
+        rp_op_clear_tex(&g_fake_cmd, &clear, &clear);
+        CHECK(nvn_be_tex_gpu_owned(t.serial));
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 1);  // GPU 拥有期间照旧不传
+        nvn_be_tex_cpu_mark_from(&t, NVN_TEX_CPU_FLUSH);
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 2);
+        g_dirty_written = ++g_dirty_now;
+        g_pg_gen[0] = g_dirty_written;
+        g_dirty_now++;
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == 3);
+        CHECK(g_protects - protects == 3);  // 诊断两臂的保护调用数与实际上传次数相同
+        nvn_be_sub_commit();
+        fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_tex_release(&t);  // 纹理释放后仍能读到账本
+        nvn_be_tex_tick(299);
+        CHECK(g_ledger_windows == 0);
+        nvn_be_tex_tick(300);
+        CHECK(g_ledger_windows == enabled && g_ledger_rows == enabled);
+        if (enabled) {
+            CHECK(strstr(g_ledger_row, "ser=903 ") && strstr(g_ledger_row, "attempts=3 bytes=12288 "));
+            CHECK(strstr(g_ledger_row, "recorded=3 repeat=2 "));
+            CHECK(strstr(g_ledger_row, "not_uploaded=2 "));
+            CHECK(strstr(g_ledger_row, g_flag_buf_dirtylog ? "dirty_log=1 " : "dirty_scan=1 "));
+            CHECK(strstr(g_ledger_row, "clear_replay_seq=2 cpu_seq=3 cpu_source=FlushMappedRange "));
+            CHECK(strstr(g_ledger_window, "omitted_attempts=0 omitted_bytes=0"));
+        }
+        nvn_be_set_frame(301);
+        nvn_be_tex_tick(301);
+        CHECK(g_ledger_windows == enabled);
+        res_fresh();
+        CHECK(g_ledger_windows == 2 * enabled);
+        if (enabled) CHECK(strstr(g_ledger_window, "through_frame=301 final=1 rows=0 attempts=0"));
+    }
+    g_upload_ledger = 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "--upload-ledger") || !strcmp(argv[1], "--upload-ledger-dirtylog-off"))) {
+        if (!strcmp(argv[1], "--upload-ledger-dirtylog-off")) g_flag_buf_dirtylog = 0;
+        t_res_upload_ledger();
+        printf("texture upload ledger: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     if (argc > 1 && !strcmp(argv[1], "--gpu-window")) { t_res_tex_window_gpu(); return g_fail ? 1 : 0; }
     t_res_bc1_rebind();
@@ -521,6 +596,7 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
     t_res_tex_epoch();
+    t_res_upload_ledger();
     t_res_tex_epoch_unrelated();
     t_res_tex_unarmed();
     t_res_bind_fast();

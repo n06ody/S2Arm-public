@@ -207,6 +207,24 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
     pthread_mutex_unlock(&g_mu);
     return hit;
 }
+// NULL 取池表代际；非空要求整份镜像的后备恰由一个池登记覆盖，含嵌套、同起点池在内的别名都不作证明。
+uint64_t rp_pool_mirror_epoch(const uint8_t *mem, uint64_t size) {
+    if (!mem) return __atomic_load_n(&g_pool_epoch, __ATOMIC_ACQUIRE);
+    const uint64_t base = (uintptr_t)mem;
+    if (size > UINT64_MAX - base || pthread_mutex_trylock(&g_mu)) return 0;
+    int lo = 0, hi = g_npool;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if ((uintptr_t)g_pool[mid].mem < base) lo = mid + 1;
+        else hi = mid;
+    }
+    const int unique = lo < g_npool && g_pool[lo].mem == mem && g_pool[lo].size == size &&
+                       (lo == 0 || g_pool_maxend[lo - 1] <= base) &&
+                       (lo + 1 == g_npool || (uintptr_t)g_pool[lo + 1].mem >= base + size);
+    const uint64_t epoch = unique ? __atomic_load_n(&g_pool_epoch, __ATOMIC_RELAXED) : 0;
+    pthread_mutex_unlock(&g_mu);
+    return epoch;
+}
 int rp_pool_count(void) { pthread_mutex_lock(&g_mu); int n = g_npool; pthread_mutex_unlock(&g_mu); return n; }
 uint64_t rp_pool_fast_hits(void) { return g_pool_tls.fast_hits; }
 void nvn_be_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // 原始全局内存表：翻译器的裸地址访问接上时用
@@ -232,7 +250,9 @@ void nvn_be_tex_release(tex_t *t) {
 }
 int rp_tex_live_n(void) { pthread_mutex_lock(&g_mu); int n = g_tex_live_inited ? (int)g_tex_live.n : 0; pthread_mutex_unlock(&g_mu); return n; }
 void nvn_be_tex_counters(uint64_t *init, uint64_t *rel) { if (init) *init = atomic_load(&g_tex_init_n); if (rel) *rel = atomic_load(&g_tex_rel_n); }
-void nvn_be_tex_tick(uint64_t frame) { (void)frame; }
+void nvn_be_tex_tick(uint64_t frame) {
+    if (frame && !(frame % 300)) rp_tex_upload_ledger_flush(frame, 0);
+}
 int nvn_be_tex_from_gl(void *t, uint32_t gl_name) { (void)t; (void)gl_name; UN("tex_from_gl"); return 0; }
 void nvn_be_xv_window_tex(uint64_t serial) { (void)serial; }   // 跨提交有效性账本随通道规划接
 

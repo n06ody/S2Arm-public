@@ -1163,6 +1163,31 @@ extern "C" __attribute__((visibility("default"))) long s2a_android_text_input(
 #endif
 }
 
+// An optional native asset is read from the APK's AssetManager. The caller
+// checks all section sizes and exact content identities before publication.
+extern "C" int s2a_android_read_native_asset(const char *name, size_t max, void **out, size_t *size) {
+    *out = nullptr;
+    *size = 0;
+#ifdef S2A_ANDROID_GAME_RUNTIME
+    if (!g_game_host || !g_game_host->assets || !name || !*name) return 0;
+    AAsset *asset = AAssetManager_open(g_game_host->assets, name, AASSET_MODE_BUFFER);
+    if (!asset) return 0;
+    off64_t length = AAsset_getLength64(asset);
+    const void *data = length > 0 && static_cast<uint64_t>(length) <= max ? AAsset_getBuffer(asset) : nullptr;
+    if (data) {
+        *out = malloc(static_cast<size_t>(length));
+        if (*out) {
+            memcpy(*out, data, static_cast<size_t>(length));
+            *size = static_cast<size_t>(length);
+        }
+    }
+    AAsset_close(asset);
+#else
+    (void)name; (void)max;
+#endif
+    return *out != nullptr;
+}
+
 extern "C" __attribute__((visibility("default"))) long long s2a_android_copy_asset(const char *name, const char *path) {
 #ifdef S2A_ANDROID_GAME_RUNTIME
     if (!g_game_host || !g_game_host->assets || !name || !*name || !path || !*path) return -1;
