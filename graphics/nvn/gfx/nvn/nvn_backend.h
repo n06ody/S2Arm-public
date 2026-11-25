@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 21   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 22   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -451,6 +451,14 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf
 //   线程：[提交]。出错：粘滞 ORDER（通道内）/ ARG（越界、长度不是 4 的倍数）。
 typedef struct { nvn_gpu_buf src; uint64_t soff; nvn_gpu_buf dst; uint64_t doff; uint64_t bytes; } nvn_gpu_buf_copy;
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages);
+// 可选的后端自管回写暂存。只对不适合直接 CPU 回读的源录拷贝，未暂存项返回 offset=UINT64_MAX。
+// [提交]，在通道外调用，最后一段里所有源写之后。返回 0 表示未录复制，仍可走原镜像回写；已录制的副作用只通过 done 交付。
+typedef struct { nvn_gpu_buf src; uint64_t offset, bytes, readback_offset; } nvn_gpu_readback_span;
+int nvn_gpu_readback_enabled(void);
+// 本段是否需要候选范围；auto 在 R0 同样观察负载，实际模式在开段时锁存。
+int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c);
+uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count);
+
 // 32 位样式填充（NVN ClearBuffer）：bytes 是 4 的倍数，每 4 字节按小端写 value；不是按字节 memset（用例 C01 用 0x11223344 区分）。
 void nvn_gpu_fill_buf(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, uint64_t bytes, uint32_t value);
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
@@ -543,6 +551,7 @@ typedef struct {
     uint64_t gpu_dur_ns, gpu_t0, gpu_t1;   // 不可信的字段为 0，0 不表示「零耗时」，看 time_kind
     const nvn_gpu_timestamp_result *timestamps; uint32_t ntimestamps; // 回调期间只读；FAILED 无有效槽，FAULT 仅消费 valid 槽
     const uint64_t *occlusion; uint32_t nocclusion;   // 各槽样本数（只在回调期间有效；FAILED 时为 NULL）
+    const uint8_t *readback; uint64_t readback_bytes;   // CPU 可见，只在本回调有效。已录但数据不可信时整段 FAILED；FAILED 不附数据。
 } nvn_gpu_done;
 typedef void (*nvn_gpu_done_fn)(void *user, const nvn_gpu_done *d);
 // 提交一段。

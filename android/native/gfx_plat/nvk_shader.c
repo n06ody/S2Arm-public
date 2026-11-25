@@ -177,6 +177,7 @@ static void borrow_log(int level, const char *phase, const struct borrow_snap *s
 static struct { uint64_t session, generation; uint8_t sha[32]; int ok; } g_profile;
 // 后台也会读/加：跨局缓存 / 离线库命中数（日志与统计用）。
 static _Atomic uint64_t g_n_offline, g_n_cache, g_n_compiled, g_n_failed;
+uint64_t nvk_shader_live_compile_total(void) { return atomic_load_explicit(&g_n_compiled,memory_order_relaxed); }
 // 会话级在途 / 静默 / 代际清场（nvk_shader_open 用它；定义放在状态变量之后）。
 static void shader_session_state_reset(void) {
     pthread_mutex_lock(&g_progs_mu);
