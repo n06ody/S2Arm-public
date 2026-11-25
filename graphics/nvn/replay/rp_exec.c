@@ -147,9 +147,14 @@ int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c：CALL 目标
 
 // 缓冲 512：最长的中文前缀约 150 字节 + 原因串最多 191 字节；256 时 gcc -O2 -Werror=format-truncation 在 Linux 容器编译红
 static void red(const char *fmt, const char *why) { char b[512]; snprintf(b, sizeof b, fmt, why); nvn_plat_log(NVN_PLAT_LOG_RED, "replay", b); }
+// 弱链接[replay]：rp_res_byte_upload_failed
+#pragma weak rp_res_byte_upload_failed
 static void pre_done(void *user, const nvn_gpu_done *d) {
     struct pre_note *p = user;
-    if (d->status == NVN_GPU_DONE_FAILED) red("前置段失败：%s", d->why ? d->why : "?");
+    if (d->status == NVN_GPU_DONE_FAILED) {
+        if (rp_res_byte_upload_failed) rp_res_byte_upload_failed();
+        red("前置段失败：%s", d->why ? d->why : "?");
+    }
     else if (p) busy_done(p->t_commit, now_ns());
     free(p);
 }
@@ -216,6 +221,7 @@ static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
 
 static void sub_release(struct sub *s);
 static void sub_done(void *user, const nvn_gpu_done *d) {
+    if (d->status == NVN_GPU_DONE_FAILED && rp_res_byte_upload_failed) rp_res_byte_upload_failed();
     struct sub *s = user;
     if (!s) return;
     nvn_gpu_done failure;
@@ -408,7 +414,10 @@ struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counte
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
     struct mid *m = user;
     if (m) ts_capture(m->ts, d);
-    if (d->status == NVN_GPU_DONE_FAILED) red("中途交的段失败：%s", d->why ? d->why : "?");
+    if (d->status == NVN_GPU_DONE_FAILED) {
+        if (rp_res_byte_upload_failed) rp_res_byte_upload_failed();
+        red("中途交的段失败：%s", d->why ? d->why : "?");
+    }
     else { if (m) busy_done(m->t_commit, now_ns());
         if (m && m->s->oc && d->occlusion) { for (uint32_t i = 0; i < d->nocclusion && m->base + i < 2048; i++) m->s->oc[m->base + i] = d->occlusion[i];
             uint32_t end = m->base + d->nocclusion < 2048 ? m->base + d->nocclusion : 2048; if (end > m->s->noc) m->s->noc = end; } }
