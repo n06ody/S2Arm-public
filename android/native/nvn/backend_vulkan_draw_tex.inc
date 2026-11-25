@@ -162,6 +162,9 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
             if (f4[k] >= 0x10 && f4[k] <= 0x13) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "draw_tex 双源混合因子（内置片元只有一个输出）"); return; }
     }
     if (c->feedback_read_mask && !feedback_restart(c, 0, 0)) return;
+    VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
+    if (d->has_sc) sc = (VkRect2D){{d->sc[0], d->sc[1]}, {(uint32_t)d->sc[2], (uint32_t)d->sc[3]}};
+    if (!pass_ensure_area(c, sc)) return;
     // 源的布局：nvk_opt_layout=1 时本段里它可能还停在附件布局，Vulkan 通道内不能迁，按通道边界重开迁好（同 prepare_bind_layouts）
     if (c->opt) {
         const VkImageLayout cur = lay_cur(c, t), want = sample_layout_for(t);
@@ -200,8 +203,6 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
     VkViewport vp = {d->dst[0], d->dst[1], d->dst[2], d->dst[3], 0.0f, 1.0f};
     if (!d->origin_ll) { vp.y += vp.height; vp.height = -vp.height; }   // 同普通绘制（apply 视口那段）：原点在左上时裁剪空间 +y 落在行号小的一边
-    VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
-    if (d->has_sc) sc = (VkRect2D){{d->sc[0], d->sc[1]}, {(uint32_t)d->sc[2], (uint32_t)d->sc[3]}};
     vkCmdSetViewport(c->cb, 0, 1, &vp);
     vkCmdSetScissor(c->cb, 0, 1, &sc);
     vkCmdSetBlendConstants(c->cb, d->blend_color);
