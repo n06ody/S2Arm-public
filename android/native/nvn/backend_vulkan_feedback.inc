@@ -171,6 +171,38 @@ void nvn_vk_fbpool_stat(uint64_t out[5]) {
     for (int i = 0; i < 3; i++) out[i] = __atomic_load_n(&g_fbpool_cnt[i], __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_mu); out[3] = g_fbpool_n; out[4] = g_fbpool_bytes; pthread_mutex_unlock(&g_mu);
 }
+static uint32_t fmt_bpp(VkFormat f);
+
+// 只算 VkImageCopy 描述的逻辑数据量，深度与模板面分别计。GPU 压缩、行距和实际总线流量不在这里估算。
+static uint64_t feedback_copy_bytes(const struct nvn_gpu_tex_s *tex, const VkImageCopy *copy) {
+    uint32_t bw = 1, bh = 1, bytes = 0;
+    switch (copy->srcSubresource.aspectMask) {
+    case VK_IMAGE_ASPECT_STENCIL_BIT:
+        bytes = 1;
+        break;
+    case VK_IMAGE_ASPECT_DEPTH_BIT:
+        bytes = tex->format == VK_FORMAT_D16_UNORM || tex->format == VK_FORMAT_D16_UNORM_S8_UINT ? 2 : 4;
+        break;
+    case VK_IMAGE_ASPECT_COLOR_BIT: {
+        bytes = fmt_bpp(tex->format);
+        nvn_fmt_info info;
+        if (!bytes && !tex->bc_decoded && !nvn_fmt_expand_target(tex->nvn_format, NULL, NULL) &&
+            nvn_fmt_info_of(tex->nvn_format, &info)) {
+            bw = info.bw;
+            bh = info.bh;
+            bytes = info.bytes;
+        }
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (!bytes || !bw || !bh) return 0;
+    const uint64_t blocks_x = ((uint64_t)copy->extent.width + bw - 1) / bw;
+    const uint64_t blocks_y = ((uint64_t)copy->extent.height + bh - 1) / bh;
+    return blocks_x * blocks_y * copy->extent.depth * copy->srcSubresource.layerCount * tex->samples * bytes;
+}
+
 static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     struct nvn_gpu_view_s *v = f->source;
     struct nvn_gpu_tex_s *s = v->tex;
@@ -212,6 +244,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (!rc_is(c->sticky, NVN_GPU_OK)) { if (fresh) nvn_gpu_tex_release(t); return 0; }
+    if (g.fb_copy_count_on) c->fb_copy_counts.snapshots++;
     for (uint32_t lv = v->base_level; lv < v->base_level + v->levels; lv++) {
         // 3D 图像的 arrayLayer 必须为 0；范围位于 z，保留整级的全部切片。
         const int image3d = s->target == NVN_TEXTURE_TARGET_3D;
@@ -225,6 +258,12 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
             vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[1], 1, __ATOMIC_RELAXED);
+            if (g.fb_copy_count_on) {
+                const uint64_t bytes = feedback_copy_bytes(s, &copy);
+                c->fb_copy_counts.regions++;
+                c->fb_copy_counts.bytes += bytes;
+                c->fb_copy_counts.unknown += bytes == 0;
+            }
         }
     }
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
@@ -248,6 +287,7 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
     if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
     nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始（活动的遮挡查询在这里结束）
+    if (g.fb_copy_count_on) c->fb_copy_counts.splits++;
     if (cont_ok) occl_spare_reset(c, &cont);   // 通道外：新要的续段块整块重置（重置只能在通道外）
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (!feedback_make(c, f)) return 0;
@@ -322,6 +362,8 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
     }
     if (pool_skipped && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[3], 1, __ATOMIC_RELAXED);
     if (read_mask && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[0], 1, __ATOMIC_RELAXED);
-    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) return 1;
+    const int has_snapshot = c->feedback != c->feedback_stop;
+    if (!has_snapshot && read_mask == c->feedback_read_mask) return 1;
+    if (has_snapshot && g.fb_copy_count_on) c->fb_copy_counts.draws++;
     return feedback_restart(c, read_mask, 1);
 }

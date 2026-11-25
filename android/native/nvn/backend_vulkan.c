@@ -293,6 +293,10 @@ struct feedback_copy {
     struct nvn_gpu_tex_s *snap, *snap_src; // 快照图（本段 REF_TEX 保活到 fence）与它照的源图；同段同源复用，见 feedback_make
 };
 
+struct fb_copy_counts {
+    uint64_t draws, splits, snapshots, regions, bytes, unknown;
+};
+
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
@@ -305,6 +309,7 @@ struct nvn_gpu_cmd_s {
     struct clr_pipe_temp *clear_pipes;   // 清除缓存满后的段自有管线，完成 / 放弃时回收
     struct dtx_pipe_temp *dtx_pipes;     // DrawTexture 管线缓存满后的段自有管线（backend_vulkan_draw_tex.inc），同上回收
     struct feedback_copy *feedback, *feedback_stop; // 本笔 [feedback, stop)，历史项活到 fence
+    struct fb_copy_counts fb_copy_counts;           // 只在诊断开启时更新，成功提交后才入本局总账
     int feedback_on;
     int feedback_read_on;
     int pool_fb_on;              // nvk_pool_fb：1 = 整池数组里和「本笔写着的附件」重叠的视图也拷快照（旧行为，A/B 与回退诊断用）；缺省 0 = 不拷（见 feedback_add）
@@ -464,6 +469,9 @@ struct nvn_gpu_vk {
     struct nvn_gpu_shader_s *shaders;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
+    int fb_copy_count_on;
+    struct fb_copy_counts fb_copy_counts;            // g_submit_mu：只累计 vkQueueSubmit 已接受的段
+    uint64_t fb_copy_frames;                         // g_submit_mu：写入同一队列的成功呈现次数
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
@@ -493,6 +501,15 @@ static void pipe_creation_open(const struct s2a_vk_device *dev) {
 }
 
 static struct nvn_gpu_vk g;
+static void fb_copy_count_log(const char *scope, uint64_t frames, const struct fb_copy_counts *c) {
+    char msg[320];
+    snprintf(msg, sizeof msg, "nvk-fb-copy scope=%s frames=%llu draws=%llu splits=%llu snapshots=%llu regions=%llu bytes=%llu unknown=%llu",
+             scope, (unsigned long long)frames, (unsigned long long)c->draws, (unsigned long long)c->splits,
+             (unsigned long long)c->snapshots, (unsigned long long)c->regions, (unsigned long long)c->bytes,
+             (unsigned long long)c->unknown);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", msg);
+}
+
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
@@ -2362,6 +2379,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    g.fb_copy_count_on = nvn_plat_flag("nvk_fb_copy_count", 0) != 0;
     pipe_creation_open(dev);
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
@@ -2643,6 +2661,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     free(g.submitted);
     g.submitted = NULL;
     g.nsub = g.capsub = 0;
+    if (g.fb_copy_count_on) fb_copy_count_log("session", g.fb_copy_frames, &g.fb_copy_counts);
     g.closed = 1;
     g.close_active = 0;
     g_open = 0;
@@ -8643,6 +8662,14 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 s->fence = fence;
                 s->submitted = 1;
                 s->executed = 1;
+                if (g.fb_copy_count_on && c->fb_copy_counts.splits) {
+                    g.fb_copy_counts.draws += c->fb_copy_counts.draws;
+                    g.fb_copy_counts.splits += c->fb_copy_counts.splits;
+                    g.fb_copy_counts.snapshots += c->fb_copy_counts.snapshots;
+                    g.fb_copy_counts.regions += c->fb_copy_counts.regions;
+                    g.fb_copy_counts.bytes += c->fb_copy_counts.bytes;
+                    g.fb_copy_counts.unknown += c->fb_copy_counts.unknown;
+                }
                 publish_signal(signal, 0);
                 enqueue_segment(&g, s);   // 此后 cmd 归 worker（finish_cmd 负责摘链）
                 pthread_mutex_unlock(&g_submit_mu);

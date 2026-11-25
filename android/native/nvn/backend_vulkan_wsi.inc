@@ -654,9 +654,16 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkPresentTimesInfoGOOGLE pts = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi.pNext, 1, &pt };
     if (timing_id) pi.pNext = &pts;
     r = vkQueuePresentKHR(g.queue, &pi);
+    const int presented_ok = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+    // 与游戏段提交共用队列锁，在相邻累计行之间按成功呈现次数换算每帧。
+    const int report_fb_copy = presented_ok && g.fb_copy_count_on && ++g.fb_copy_frames % 300 == 0;
+    uint64_t fb_copy_frames;
+    struct fb_copy_counts fb_copy_counts;
+    if (report_fb_copy) { fb_copy_frames = g.fb_copy_frames; fb_copy_counts = g.fb_copy_counts; }
     pthread_mutex_unlock(&g_submit_mu);
+    if (report_fb_copy) fb_copy_count_log("period", fb_copy_frames, &fb_copy_counts);
     s->presents++;
-    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+    if (presented_ok) {
         uint64_t tnow = now_ns();
         if (!s->timing.start) s->timing.start = tnow;
         wsi_timing_submitted(&s->timing, timing_id);
