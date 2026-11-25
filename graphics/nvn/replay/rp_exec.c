@@ -171,8 +171,10 @@ static void ts_free(struct sub *s) { struct ts_segment *t = s->ts_head;
 }
 
 int nvn_gpu_mirror_visibility_enabled(void) __attribute__((weak));
+int nvn_gpu_mirror_observing(void) __attribute__((weak));
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_mirror_visibility_enabled
+// 弱链接[replay]：nvn_gpu_mirror_observing
 // 弱链接[replay]：nvn_gpu_mirror_visibility_record
 
 static int compare_write_ref(const void *a, const void *b) {
@@ -182,9 +184,14 @@ static int compare_write_ref(const void *a, const void *b) {
 }
 
 static void sub_record_mirrors(const struct sub *s, nvn_gpu_cmd c) {
-    if (!s || !s->ngw || !nvn_gpu_mirror_visibility_record ||
-        !nvn_gpu_mirror_visibility_enabled || !nvn_gpu_mirror_visibility_enabled()) return;
+    if (!s || !s->ngw || !nvn_gpu_mirror_visibility_record) return;
+    const int visibility = nvn_gpu_mirror_visibility_enabled && nvn_gpu_mirror_visibility_enabled();
+    if (!visibility && !(nvn_gpu_mirror_observing && nvn_gpu_mirror_observing())) return;
     const uint32_t count = (uint32_t)s->ngw;
+    if (!visibility && count > RP_MIRROR_SHADOW_SPANS) {
+        nvn_gpu_mirror_visibility_record(c, NULL, count);   // 观察上限缺样，原提交继续。
+        return;
+    }
     struct gw_ev local_refs[16];
     nvn_gpu_mirror_span local_spans[16] = {0};
     struct gw_ev *refs = count <= 16 ? local_refs : malloc((size_t)count * sizeof *refs);

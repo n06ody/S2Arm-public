@@ -10,6 +10,17 @@ static int mirror_is_noncoherent(nvn_gpu_buf b) {
            !(b->memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
+static int mirror_tracks_writes(nvn_gpu_buf b) {
+    return mirror_is_noncoherent(b) || (b && b->mirror_candidate && !atomic_load(&g.mirror_auto.finished));
+}
+
+static void mirror_record_error(nvn_gpu_cmd c, int code, const char *why) {
+    if (g.mirror_shadow_mode) c->mirror_shadow_missed = 1;
+    else set_sticky(c, code, "%s", why);
+}
+
+enum { MIRROR_SHADOW_CHECKS = 8192 };
+
 static uint32_t mirror_memory_type(const struct s2a_vk_device *dev, const VkMemoryRequirements *req) {
     const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     const VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -46,10 +57,10 @@ static int mirror_range(nvn_gpu_buf b, VkDeviceSize off, VkDeviceSize bytes, VkM
 
 static void mirror_write(struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, VkDeviceSize off, VkDeviceSize bytes,
                          enum mirror_write_kind kind) {
-    if (!mirror_is_noncoherent(b) || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (!mirror_tracks_writes(b) || !rc_is(c->sticky, NVN_GPU_OK) || c->mirror_shadow_missed) return;
     VkMappedMemoryRange range;
     if (!mirror_range(b, off, bytes, &range)) {
-        set_sticky(c, NVN_GPU_E_ARG, "缓存镜像写入范围越界");
+        mirror_record_error(c, NVN_GPU_E_ARG, "缓存镜像写入范围越界");
         return;
     }
     const VkDeviceSize lo = range.offset, hi = lo + range.size;
@@ -61,11 +72,15 @@ static void mirror_write(struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, VkDeviceSize of
             return;
         }
     }
+    if (g.mirror_shadow_mode && c->mirror_write_count >= RP_MIRROR_SHADOW_SPANS) {
+        c->mirror_shadow_missed = 1;
+        return;
+    }
     if (c->mirror_write_count == c->mirror_write_cap) {
         const size_t cap = c->mirror_write_cap ? (size_t)c->mirror_write_cap * 2 : 8;
         struct vk_mirror_write *writes = cap <= UINT32_MAX && cap <= SIZE_MAX / sizeof *writes
             ? realloc(c->mirror_writes, cap * sizeof *writes) : NULL;
-        if (!writes) { set_sticky(c, NVN_GPU_E_OOM, "缓存镜像写入范围分配失败"); return; }
+        if (!writes) { mirror_record_error(c, NVN_GPU_E_OOM, "缓存镜像写入范围分配失败"); return; }
         c->mirror_writes = writes;
         c->mirror_write_cap = (uint32_t)cap;
     }
@@ -78,7 +93,7 @@ static void mirror_write_rows(struct nvn_gpu_cmd_s *c, nvn_gpu_buf b, uint64_t o
     if (!rows || !slices || !packed || packed > pitch || rows > slice_rows ||
         off > b->bytes || packed > b->bytes - off ||
         (uint64_t)(slices - 1) * slice_rows + (rows - 1) > (b->bytes - off - packed) / pitch) {
-        set_sticky(c, NVN_GPU_E_ARG, "缓存镜像图像读回范围越界");
+        mirror_record_error(c, NVN_GPU_E_ARG, "缓存镜像图像读回范围越界");
         return;
     }
     if (packed == pitch && (rows == slice_rows || slices == 1)) {
@@ -114,6 +129,11 @@ static void mirror_storage_writes(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
 
 int nvn_gpu_mirror_visibility_enabled(void) {
     return g_open && atomic_load_explicit(&g.mirror_noncoherent_seen, memory_order_relaxed);
+}
+
+int nvn_gpu_mirror_observing(void) {
+    return g_open && atomic_load_explicit(&g.mirror_shadow_seen, memory_order_relaxed) &&
+           !atomic_load(&g.mirror_auto.finished);
 }
 
 int nvn_gpu_mirror_state(nvn_gpu_buf b) {
@@ -168,15 +188,19 @@ static void mirror_record_edge(struct nvn_gpu_cmd_s *c, nvn_gpu_buf buf, VkDevic
 void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count) {
     if (!c || !count || !rc_is(c->sticky, NVN_GPU_OK)) return;
     if (!spans || c->mirror_ranges || c->in_pass) {
-        set_sticky(c, spans ? NVN_GPU_E_ORDER : NVN_GPU_E_OOM, "缓存镜像回写快照不可用");
+        mirror_record_error(c, spans ? NVN_GPU_E_ORDER : NVN_GPU_E_OOM, "缓存镜像回写快照不可用");
         return;
     }
     uint32_t needed = 0;
-    for (uint32_t i = 0; i < count; i++) needed += mirror_is_noncoherent(spans[i].src);
+    for (uint32_t i = 0; i < count; i++) needed += mirror_tracks_writes(spans[i].src);
     if (!needed) return;
+    if (g.mirror_shadow_mode && needed > RP_MIRROR_SHADOW_SPANS) {
+        c->mirror_shadow_missed = 1;
+        return;
+    }
     struct vk_mirror_range *ranges = calloc(needed, sizeof *ranges);
     if (!ranges) {
-        set_sticky(c, NVN_GPU_E_OOM, "缓存镜像回写范围分配失败");
+        mirror_record_error(c, NVN_GPU_E_OOM, "缓存镜像回写范围分配失败");
         return;
     }
     c->mirror_ranges = ranges;
@@ -186,9 +210,9 @@ void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *
     uint32_t n = 0;
     for (uint32_t i = 0; i < count; i++) {
         const nvn_gpu_mirror_span *s = &spans[i];
-        if (!mirror_is_noncoherent(s->src)) continue;
+        if (!mirror_tracks_writes(s->src)) continue;
         if (!mirror_range(s->src, s->offset, s->bytes, &ranges[n].range)) {
-            set_sticky(c, NVN_GPU_E_ARG, "缓存镜像回写范围越界");
+            mirror_record_error(c, NVN_GPU_E_ARG, "缓存镜像回写范围越界");
             return;
         }
         ranges[n].buf = s->src;
@@ -224,7 +248,7 @@ void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *
 }
 
 static VkResult mirror_invalidate(struct nvn_gpu_vk *vk, const struct nvn_gpu_cmd_s *c) {
-    if (!c || !c->mirror_range_count) return VK_SUCCESS;
+    if (vk->mirror_shadow_mode || !c || !c->mirror_range_count) return VK_SUCCESS;
     const uint64_t t0 = now_ns();
     uint64_t bytes = 0, calls = 0;
     VkResult result = VK_SUCCESS;
@@ -328,19 +352,36 @@ incomplete:
 // 后继只读可与它并行，写同一原子的段须等回调返回。
 // 列表可能同时有多个前驱。用最大的相交信号等待，队列内更早的相交段也会先完成。
 static void mirror_wait_for_landing(struct nvn_gpu_cmd_s *c) {
+    if (g.mirror_shadow_mode && atomic_load(&g.mirror_auto.finished)) return;
     uint64_t fence = 0;
     int edge_wait = 0;
+    uint32_t checks = 0;
     enum mirror_write_kind reason = MIRROR_INDIRECT;
     pthread_mutex_lock(&g_mu);
     for (uint32_t i = 0; i < c->mirror_write_count; i++) {
         const struct vk_mirror_write *w = &c->mirror_writes[i];
         for (const struct vk_mirror_range *r = w->buf->mirror_land; r; r = r->next) {
+            if (g.mirror_shadow_mode && ++checks > MIRROR_SHADOW_CHECKS) {
+                g.stats[STAT_MIRROR_AUTO_SHADOW_MISSED]++;
+                pthread_mutex_unlock(&g_mu);
+                return;
+            }
             if (r->signal <= g.completed || r->signal <= fence) break;
             if (w->lo >= r->range.offset + r->range.size || r->range.offset >= w->hi) continue;
             fence = r->signal;
             reason = w->kind;
             break;
         }
+    }
+    // A 档只估算原时间线上的潜在等待。最长信号覆盖重叠期间，不暂停客体或 WSI。
+    if (g.mirror_shadow_mode) {
+        if (fence) {
+            g.stats[STAT_MIRROR_AUTO_SHADOW_N]++;
+            if (!g.mirror_shadow_fence) g.mirror_shadow_start_ns = now_ns();
+            if (fence > g.mirror_shadow_fence) g.mirror_shadow_fence = fence;
+        }
+        pthread_mutex_unlock(&g_mu);
+        return;
     }
     if (fence) {
         g.stats[STAT_MIRROR_WAIT_N]++;

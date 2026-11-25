@@ -177,6 +177,17 @@ void rp_fr_perf_take(uint64_t out[RP_FR_N]);   // [上屏] 取走本帧分项并
 int rp_hitch_line(char *b, size_t n, uint64_t gap_ns, uint64_t exec_ns, uint64_t draws, uint64_t subs, const uint64_t fr[RP_FR_N]);   // 长帧行（见 rp_exec.c）
 uint64_t rp_sub_serial(void);   // 第几次提交（一次提交内可复用的暂存内容按它判）
 void rp_perf_take(uint64_t out[RP_PERF_N]);
+
+// 给可选后端策略的同窗读数。原生栅栏、热档和分配真值仍由后端提供。
+struct rp_mirror_auto_sample {
+    uint64_t elapsed_ns, frames, draws, submits, target_ns;
+    uint64_t cached_bytes, uncached_bytes, cached_ns, uncached_ns;
+    uint64_t sync_kib, direct_kib, acquire_ns, present_ns;
+    double p99_ms;
+    int compiling, target_changed;
+};
+
+enum { RP_MIRROR_SHADOW_SPANS = 2048 };
 void rp_draw_reset(void);
 void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳过的）各出一行日志；0 = 关
 
