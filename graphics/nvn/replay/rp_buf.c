@@ -289,7 +289,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        else nvn_gpu_buf_write_mirror(xc, m->buf, a, s->mem + a, stop - a);
         a = stop;
     }
 }

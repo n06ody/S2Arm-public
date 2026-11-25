@@ -274,6 +274,8 @@ struct vk_segment {
     int executed;
     int embedded;   // cmd owns this record; finish_cmd frees it with cmd
     int internal;   // 后端自己的段（呈现）：不占时间线上的值，完成后只回收
+    uint64_t gpu_pt_serial, gpu_pt_submit_ns;
+    int gpu_pt_presented;
     uint64_t wsi_seq;   // 呈现段的序号（>0）：worker 等到它的栅栏后记进 g.wsi_done，取图复用信号量前按它等（见 backend_vulkan_wsi.inc）
     nvn_gpu_rc rc;
     char why[192];
@@ -333,6 +335,7 @@ struct nvn_gpu_cmd_s {
     uint32_t pass_color_mask;                // 哪些颜色槽有附件（位 i = 槽 i；空位为 0）
     uint32_t pass_cfmt[8], pass_dsfmt, pass_samples;   // 当前通道各槽的 NVN 格式（空位 0）、深度模板格式、采样数（带掩码的清除建管线用）
     VkImageAspectFlags pass_ds_aspect;       // 当前通道深度模板附件有的面（0 = 没有该附件）
+    struct gpu_pt_cmd *gpu_pt;
     VkQueryPool report_ts;
     uint64_t report_used, report_begin_ns;
     uint32_t report_count;
@@ -413,6 +416,7 @@ struct pipe_creation_counters {
 };
 
 struct nvn_gpu_vk {
+    struct gpu_pt_session *gpu_pt;
     struct s2a_vk_device *dev;
     struct nvn_vk_bcdec *bc;
     VkDevice d;
@@ -1783,6 +1787,8 @@ static void segment_done(struct vk_segment *s, int status, int code, const char 
     free(occ);
 }
 
+#include "backend_vulkan_pass_time.inc"
+
 static void detach_live(struct nvn_gpu_cmd_s *c) {
     pthread_mutex_lock(&g_mu);
     struct nvn_gpu_cmd_s **pp = &g.live;
@@ -1866,6 +1872,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     clr_cmd_free(c);   // 先解除旧命令的管线依赖，再把命令池交给另一线程复用
     dtx_cmd_free(c);
     seg_give_cmd(c->pool, c->cb, c->init_cb);
+    gpu_pt_release(c);
     free(c->refs);
     free(c->refseen);
     free(c->staging);
@@ -1988,6 +1995,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         pthread_cond_broadcast(&g_cv);
         pthread_mutex_unlock(&g_mu);
     }
+    gpu_pt_complete(vk, s, !failed);
     if (s->fence) vkDestroyFence(vk->d, s->fence, NULL);
     int embedded = s->embedded;
     finish_cmd(s->cmd, s->executed);
@@ -2396,6 +2404,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     if (pthread_create(&g.worker, NULL, worker_main, &g) != 0)
         return fail(err, NVN_GPU_E_DEVICE, "worker 线程创建失败");
     g.worker_started = 1;
+    gpu_pt_open();
     pthread_mutex_lock(&g_seg_mu); g_seg_closed = 0;
     g_seg_stg_std = nvn_plat_flag("nvk_stg_std", 1) != 0; g_seg_stg_hit = g_seg_stg_miss = g_seg_stg_kept = g_seg_stg_rej = g_seg_stg_full = 0;
     for (int i = 0; i < 6; i++) __atomic_store_n(&g_stg_wr[i], 0, __ATOMIC_RELAXED);
@@ -2532,6 +2541,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     g.worker_started = 0;
+    gpu_pt_close();
 
     // 在途段都完成了、不会再有新管线：把驱动管线缓存写盘（失败只记日志）再销毁它。放在销毁管线之前，后面的拆除出事也不丢这一局的编译结果。
     // 在飞的局中写（#868）要先等它收尾，等多久算进这次 close 的截止时间；到点没写完就放弃收尾这次写，不拖 close。
@@ -2923,7 +2933,8 @@ static uint64_t arena_room(const struct nvn_gpu_cmd_s *c, uint32_t align) {   //
     return off < c->arena_cap ? c->arena_cap - off : 0;
 }
 
-void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void *src, uint64_t bytes) {
+static void buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void *src, uint64_t bytes,
+        enum gpu_pt_kind kind) {
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch) return;
     struct nvn_gpu_cmd_s *c = ch;
@@ -2938,6 +2949,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     __atomic_add_fetch(&g_stg_wr[0], 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_stg_wr[1], bytes, __ATOMIC_RELAXED);
     if (bytes > STG_CHUNK) __atomic_add_fetch(&g_stg_wr[3], 1, __ATOMIC_RELAXED);
     full_barrier(c);   // 一笔写只在第一条拷贝之前来一次：各条拷贝的目标段互不相交，彼此之间没有先后依赖
+    gpu_pt_begin(c, kind);
     for (uint64_t done = 0; done < bytes;) {
         uint64_t n = bytes - done;
         if (n > STG_CHUNK) {
@@ -2956,12 +2968,23 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
         __atomic_add_fetch(&g_stg_wr[2], 1, __ATOMIC_RELAXED);
         done += n;
     }
+    gpu_pt_end(c);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
     pthread_mutex_unlock(&g_mu);
 }
+
+void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes) {
+    buf_write(c, dst, off, src, bytes, GPU_PT_TRANSFER);
+}
+
+#if defined(S2A_ANDROID_VK_BACKEND_NVN_VK) && S2A_ANDROID_VK_BACKEND_NVN_VK
+void nvn_gpu_buf_write_mirror(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes) {
+    buf_write(c, dst, off, src, bytes, GPU_PT_MIRROR_SYNC);
+}
+#endif
 
 void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t bytes, uint32_t value) {
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
@@ -2974,7 +2997,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
                                                   (unsigned long long)off, (unsigned long long)bytes); return; }
     if (bytes == 0) return;
     full_barrier(c);
-    vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
+    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     pthread_mutex_lock(&g_mu);
@@ -2993,7 +3016,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     if (bytes == 0) return;
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
-    vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc);
+    GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, 1, &bc));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
@@ -3023,7 +3046,7 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32
     for (uint32_t i = 0; i < n;) {
         struct nvn_gpu_buf_s *s = v[i].src, *d = v[i].dst; uint32_t k = 0;
         while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
-        vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
+        GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r));
         cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
     }
     mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
@@ -5388,6 +5411,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     vkCmdEndRenderPass(c->cb);
+    gpu_pt_end(c);
     c->in_pass = 0;
     c->pass_occl = 0;
     pass_read_sync(c);
@@ -5426,6 +5450,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(&d, pass, fb, natt, has_depth, &bi, clear);
+    gpu_pt_pass_begin(c, &d, att, natt - has_depth, has_depth, GPU_PT_LAYOUT_REOPEN);
     if (c->tsq && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d.w; c->tsp[c->ntsp].h = (uint16_t)d.h; c->tsp[c->ntsp].draws = 0;
         c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
@@ -5522,6 +5547,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
     pass_begin_info(d, pass, fb, natt, has_depth, &bi, clear);
+    gpu_pt_pass_begin(c, d, att, natt - has_depth, has_depth, 0);
     if (c->tsq && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
@@ -5564,6 +5590,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
     vkCmdEndRenderPass(c->cb);
+    gpu_pt_end(c);
     c->in_pass = 0;
     c->pass_natt = 0;
     pass_read_sync(c);
@@ -6316,7 +6343,8 @@ static inline int diag_draw_mode(void) {
     return g_diag_draw_mode;
 }
 #define DIAG_DRAW(call) do { \
-    if (__builtin_expect(dm != 1, 1)) { call; if (__builtin_expect(dm == 2, 0)) { call; } } \
+    if (__builtin_expect(dm != 1, 1)) { gpu_pt_draw(c); call; \
+        if (__builtin_expect(dm == 2, 0)) { gpu_pt_draw(c); call; } } \
 } while (0)
 
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
@@ -6569,10 +6597,10 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     // 传输自己只在开头带屏障，这里补一道再派发；连续派发之间不加（NVN 不保证无屏障的派发之间的顺序，游戏屏障另走 nvn_gpu_barrier）
     if (c->xfer_dirty && !g_test_no_xfer_bar) full_barrier(c);
     if (ind) {
-        vkCmdDispatchIndirect(c->cb, ind->buffer, off);
+        GPU_PT_RECORD(c, GPU_PT_GUEST_COMPUTE, vkCmdDispatchIndirect(c->cb, ind->buffer, off));
         cmd_ref(c, ind, REF_BUF);
     } else {
-        vkCmdDispatch(c->cb, x, y, z);
+        GPU_PT_RECORD(c, GPU_PT_GUEST_COMPUTE, vkCmdDispatch(c->cb, x, y, z));
     }
     loss_note_program(c, p);
 }
@@ -7555,7 +7583,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
                                                      t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};
     bc.imageOffset = o;
     bc.imageExtent = e;
-    vkCmdCopyBufferToImage(c->cb, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBufferToImage(c->cb, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);   // 之后按采样 / 存储使用；本段统一用 GENERAL
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
@@ -7615,7 +7643,7 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageSubresource = (VkImageSubresourceLayers){copy_face_aspect(t), level, t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};   // 深度模板贴图只回读深度面（#1581 K）
     bc.imageOffset = o;
     bc.imageExtent = e;
-    vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc);
+    GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
@@ -7673,7 +7701,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     ic.dstSubresource = (VkImageSubresourceLayers){d->aspect, dlevel, dlayer, 1};
     ic.dstOffset = dof;
     ic.extent = se;
-    vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic));
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, s, REF_TEX);
@@ -7710,7 +7738,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         VkClearDepthStencilValue ds;
         ds.depth = rgba ? rgba[0] : 1.0f;
         ds.stencil = 0;
-        vkCmdClearDepthStencilImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ds, 1, &range);
+        GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearDepthStencilImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ds, 1, &range));
     } else {
         VkClearColorValue col;
         memset(&col, 0, sizeof col);
@@ -7720,7 +7748,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
             if (is_int) col.uint32[fmap[i]] = u4 ? u4[i] : 0;
             else col.float32[fmap[i]] = rgba ? rgba[i] : 0.0f;
         }
-        vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
+        GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range));
     }
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
@@ -7780,7 +7808,7 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     uint64_t src = loff + (uint64_t)slice * sp + (uint64_t)(o.y / 4) * rp + (uint64_t)(o.x / 4) * (uint32_t)bb;
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){src + y * rp, off + y * row_bytes, packed_row};
     full_barrier(c);
-    vkCmdCopyBuffer(c->cb, t->bc_sbuf, b->buffer, (uint32_t)bh, rg);
+    GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyBuffer(c->cb, t->bc_sbuf, b->buffer, (uint32_t)bh, rg));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
     cmd_ref(c, b, REF_BUF);
@@ -7805,7 +7833,7 @@ static int bc_shadow_ensure(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, ui
     }
     t->bc_sbuf = buf; t->bc_smem = mem;
     full_barrier(c);
-    vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0);   // 没上传过的区域回读为零，不留上一块显存的旧内容
+    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdFillBuffer(c->cb, buf, 0, VK_WHOLE_SIZE, 0));   // 没上传过的区域回读为零，不留上一块显存的旧内容
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     return 1;
 }
@@ -7889,7 +7917,7 @@ static void bc_temp_to_tex(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, str
     VkImageCopy cp = {0}; cp.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cp.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1}; cp.dstOffset = off; cp.dstOffset.z += (int32_t)z;
     cp.extent = (VkExtent3D){ext.width, ext.height, 1};
-    vkCmdCopyImage(c->cb, tmp->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImage(c->cb, tmp->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL); cmd_ref(c, t, REF_TEX);
 }
 
@@ -7907,7 +7935,7 @@ static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_
     cp.bufferOffset = src_off;
     cp.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     cp.imageExtent = (VkExtent3D){rec->bw, rec->bh, 1};
-    vkCmdCopyBufferToImage(c->cb, src, rec->in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBufferToImage(c->cb, src, rec->in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp));
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -7921,7 +7949,7 @@ static void bc_record_decode(struct nvn_gpu_cmd_s *c, const struct nvn_vk_bcdec_
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, rec->pl, 0, 1, &rec->ds, 0, NULL);
     int32_t res[2] = { (int32_t)w, (int32_t)h };
     vkCmdPushConstants(c->cb, rec->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, res);
-    vkCmdDispatch(c->cb, (w + 7) / 8, (h + 7) / 8, 1);
+    GPU_PT_RECORD(c, GPU_PT_BC_DECODE, vkCmdDispatch(c->cb, (w + 7) / 8, (h + 7) / 8, 1));
     // 结果交给 bc_temp_to_tex 的屏障（COMPUTE 写 → TRANSFER 读，同时转 TRANSFER_SRC）
 }
 
@@ -7937,7 +7965,7 @@ static int bc_record_slice(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
     if (!rg) { set_sticky(c, NVN_GPU_E_OOM, "BC 上传：压缩影子拷贝表分配失败"); return 0; }
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){soff + y * packed_row, shadow_dst + y * sh_rp, packed_row};
     full_barrier(c);   // 暂存此前在本段里的写（缓冲 → BC 的源拷贝）对影子拷贝和解码输入可见
-    vkCmdCopyBuffer(c->cb, sb, t->bc_sbuf, (uint32_t)bh, rg);
+    GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBuffer(c->cb, sb, t->bc_sbuf, (uint32_t)bh, rg));
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
     struct bc_temp *tmp = bc_temp_image(t, ext);
@@ -8017,7 +8045,7 @@ static void bc_copy_from_buf(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, u
         }
         full_barrier(c);   // 源缓冲此前在本段里的写（如回读）对拷贝可见
         for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){boff + (uint64_t)z * slice_stride + y * row_bytes, ss.off + y * packed_row, packed_row};
-        vkCmdCopyBuffer(c->cb, b->buffer, ss.buf->buffer, (uint32_t)bh, rg);
+        GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBuffer(c->cb, b->buffer, ss.buf->buffer, (uint32_t)bh, rg));
         c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
         uint64_t dst = sh_loff + (uint64_t)s * sh_sp + (uint64_t)(off.y / 4) * sh_rp + (uint64_t)(off.x / 4) * (uint32_t)bb;
         if (!bc_record_slice(c, t, ss.buf->buffer, ss.off, bh, packed_row, dst, sh_rp, level, layer, off, ext, z)) break;
@@ -8233,7 +8261,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
         ir.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, sv->base_level, sv->base_layer, 1};
         ir.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1};
         ir.srcOffset = so; ir.dstOffset = dof; ir.extent = se;
-        vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir);
+        GPU_PT_RECORD(c, GPU_PT_BLIT, vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir));
         image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
         cmd_ref(c, s, REF_TEX); cmd_ref(c, d, REF_TEX);
         return;
@@ -8274,7 +8302,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if (flip_x) { int32_t x = ib.srcOffsets[0].x; ib.srcOffsets[0].x = ib.srcOffsets[1].x; ib.srcOffsets[1].x = x; }
     if (flip_y) { int32_t y = ib.srcOffsets[0].y; ib.srcOffsets[0].y = ib.srcOffsets[1].y; ib.srcOffsets[1].y = y; }
     ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, 1};
-    vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    GPU_PT_RECORD(c, GPU_PT_BLIT, vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST));
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, s, REF_TEX);
@@ -8410,6 +8438,7 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
         free(c);
         return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭");
     }
+    gpu_pt_start(c);
     c->live_next = g.live;
     g.live = c;
     pthread_mutex_unlock(&g_mu);
@@ -8485,6 +8514,7 @@ static uint32_t submit_cbs(struct nvn_gpu_cmd_s *c, VkCommandBuffer cbs[2]) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(c->init_cb, &bi) != VK_SUCCESS) return 0;
+    gpu_pt_prefix(c);
     // 首次报告可能在 render pass 内；reset 必须在独立前置缓冲中，不能打断通道。
     if (c->report_ts) {
         vkCmdResetQueryPool(c->init_cb, c->report_ts, 0, NVN_GPU_TIMESTAMP_SLOTS);
@@ -8573,6 +8603,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT);
     if (c->tsq) vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 1);
+    gpu_pt_last(c);
     // 结束录制并提交。
     VkResult r = vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) {
@@ -8591,7 +8622,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
             if (si.commandBufferCount) {
                 atomic_store(&g.submitting, s);
-                r = vkQueueSubmit(g.queue, 1, &si, fence);
+                r = gpu_pt_submit(s, &si, fence);
             }
             if (r == VK_SUCCESS) {
                 s->fence = fence;

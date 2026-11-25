@@ -150,12 +150,16 @@ static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.layout, 0, 1, &set, 0, NULL);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].depth);
     vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255); vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
-    vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
+    vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push);
+    gpu_pt_draw(c);
+    vkCmdDraw(c->cb, 3, 1, 0, 0);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dsb.p[slot].stencil);
     vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 255);
     for (unsigned bit = 0; bit < 8; bit++) {
         push.bit = 1u << bit; vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, push.bit);
-        vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
+        vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push);
+        gpu_pt_draw(c);
+        vkCmdDraw(c->cb, 3, 1, 0, 0);
     }
     nvn_gpu_pass_end(c); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL); full_barrier(c);
     // 抽象绑定/动态状态仍属于调用方；物理命令缓冲被辅助绘制改过，下一笔须全部重发。
