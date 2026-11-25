@@ -1467,11 +1467,9 @@ static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
       else if (sw) nvn_unimpl("gpu", "viewport_swizzle", rec); }
     // 裁剪矩形夹到目标范围内（原生接口不收负的起点；宽高是游戏给的任意数）
     if (rp_R.has_sc) {
-        int64_t x0 = rp_R.sc.x < 0 ? 0 : rp_R.sc.x, y0 = rp_R.sc.y < 0 ? 0 : rp_R.sc.y, x1 = (int64_t)rp_R.sc.x + rp_R.sc.w, y1 = (int64_t)rp_R.sc.y + rp_R.sc.h;
-        if (x1 > (int64_t)tw) x1 = tw;
-        if (y1 > (int64_t)th) y1 = th;
-        if (x1 <= x0 || y1 <= y0) return 0;
-        d->has_sc = 1; d->sc[0] = (int32_t)x0; d->sc[1] = (int32_t)y0; d->sc[2] = (int32_t)(x1 - x0); d->sc[3] = (int32_t)(y1 - y0);
+        p_scissor sc;
+        if (!rp_clip_scissor(&rp_R.sc, tw, th, &sc)) return 0;
+        d->has_sc = 1; d->sc[0] = sc.x; d->sc[1] = sc.y; d->sc[2] = sc.w; d->sc[3] = sc.h;
     }
     d->origin_ll = (uint8_t)rp_origin_lower_left(); d->depth_clamp = (uint8_t)(rp_S.depth_clamp != 0);
     d->po = rp_S.po;
