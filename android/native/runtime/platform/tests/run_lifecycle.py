@@ -39,9 +39,11 @@ def main():
         assert result.returncode == expect, (name, result.returncode, expect, output)
         return output, elapsed
 
-    def build(path, name, helper=helper):
+    def build(path, name, helper=helper, gen=False):
         binary = out / name
+        gen_flags = ["-DS2A_ANDROID_PGO_GEN=1"] if gen else []
         command([os.environ.get("CC", "cc"), "-D_GNU_SOURCE", "-D__ANDROID__", "-DS2A_UNIT_TEST",
+                 *gen_flags,
                  "-ffunction-sections", "-fdata-sections", "-fvisibility=hidden",
                  "-Wall", "-Wextra", "-Werror", "-I" + str(ROOT),
                  "-I" + str(ROOT / "android/tests/hostvk"),
@@ -139,9 +141,18 @@ def main():
     assert "S2A_CancelWaits" not in symbols  # Exactly the static archive visibility boundary.
     def marks(log):
         return [line for line in log.splitlines() if line and not line.startswith("[")]
+    pgo = build(source, "lifecycle-pgo-gen", gen=True)
+    for mode in ("normal", "signal", "normal-threaded"):
+        log, _ = command([pgo, mode], "pgo-" + mode)
+        events = marks(log)
+        assert events.count("pgo-write") == 1 and events.index("cleanup-result") < events.index("pgo-write") < events.index("summary"), log
+    for mode, code in (("writers-fail", 125), ("cleanup-fail", 125), ("error-stop", 86), ("hang", 124)):
+        log, _ = command([pgo, mode], "pgo-" + mode, code)
+        assert "pgo-write" not in marks(log), log
     for mode in ("normal", "signal"):
         # 单线程（基线）：地址余量在取消之前、不限时，没有原生进度行与黄
         log, _ = command([binary, mode], mode)
+        assert "pgo-write" not in marks(log), log
         assert marks(log)[:8] == ["unfreeze", "vk-drain", "vm-low", "cancel", "park", "writers", "cs-shutdown", "cleanup-result"], log
         assert log.count("cs-shutdown") == 1 and "优雅退出完成" in log and "收局进度" not in log and "【黄】" not in log, log
         # 拆线程：地址余量在服务层 Cleanup / 结果确认之后，带读 maps 用时

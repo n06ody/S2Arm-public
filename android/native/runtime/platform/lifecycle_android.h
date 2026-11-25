@@ -11,6 +11,10 @@ int s2a_android_guest_writers_begin(void);
 void s2a_android_guest_host_wait_begin(void);
 void s2a_android_guest_host_wait_end(void);
 int s2a_android_runtime_shutdown_result(void);
+#ifdef S2A_ANDROID_PGO_GEN
+// 只在正常停局线程调用。客体访存与 GPU 回放须已停稳。
+void s2a_android_pgo_write(void);
+#endif
 // 拆线程开着（托管运行时经 s2a_android_host_set_threaded 设）：收局诊断按拆线程的位置 / 限时走；单线程保持基线
 int s2a_android_shutdown_threaded(void);
 // 收局地址余量（s2a_vm_low("收局")）放到独立线程里有界地跑：等 SHUTDOWN_VM_LOW_MS，超时只打一行黄、不等（读 /proc/self/maps 可能被 mmap_lock 卡住）

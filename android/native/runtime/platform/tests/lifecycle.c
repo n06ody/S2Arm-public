@@ -12,6 +12,7 @@
 #include <time.h>
 
 void s2a_host_shutdown(const char *why);
+void s2a_host_exit_code(int code);
 void s2a_term_install(void);
 // 宿主没有 logcat；保留生产失败诊断到 stderr，不替换生命周期实现或退出码。
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
@@ -106,6 +107,9 @@ int s2a_android_runtime_shutdown_result(void) {
     mark("cleanup-result\n");
     return !strcmp(mode, "cleanup-fail") ? EIO : 0;
 }
+#ifdef S2A_ANDROID_PGO_GEN
+void s2a_android_pgo_write(void) { mark("pgo-write\n"); }
+#endif
 void s2a_widen_scan(void) { mark("summary\n"); }
 void s2a_svc_red_summary(void) {}
 void s2a_det_summary(void) {}
@@ -169,6 +173,7 @@ int main(int argc, char **argv) {
         dup2(pipe_fd[1], STDERR_FILENO);
         // 保留读端但从不读：共享 LOG 将真堵塞，watchdog 必须独立退出。
     }
+    if (!strcmp(mode, "error-stop")) s2a_host_exit_code(86);
     s2a_host_shutdown("fixture shutdown");
     return 91;
 }

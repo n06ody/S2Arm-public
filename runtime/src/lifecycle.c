@@ -176,6 +176,12 @@ void s2a_host_shutdown(const char *why) {
           _exit(125);
       } }
     S2A_SHUTDOWN_STAGE("清理结果核验", t0);
+#ifdef S2A_ANDROID_PGO_GEN
+    if (atomic_load(&g_exit_code) == 0) {
+        s2a_android_pgo_write();   // 收局调用 _exit，Clang 的 atexit 写盘不会执行。
+        S2A_SHUTDOWN_STAGE("PGO 写盘", t0);
+    }
+#endif
 #endif
 #if (defined(__ANDROID__) || defined(__OHOS__))
     // 拆线程：地址余量要读 /proc/self/maps（拿 mmap_lock 读锁），收局前段游戏 / GPU 线程还在 mprotect / mmap，真机 9000 读了 862 ms、

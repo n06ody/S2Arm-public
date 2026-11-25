@@ -137,6 +137,11 @@ if(ANDROID)
         endforeach()
         s2a_android_game_sources(game_sources)
         target_sources(s2arm_android PRIVATE ${game_sources})
+        if(S2A_ANDROID_PGO STREQUAL "GEN")
+            target_sources(s2arm_android PRIVATE native/runtime/platform/pgo_android.c)
+            set_property(SOURCE "${S2A_ANDROID_RUNTIME_ROOT}/runtime/src/lifecycle.c" APPEND PROPERTY
+                COMPILE_DEFINITIONS S2A_ANDROID_PGO_GEN=1)
+        endif()
         # 游戏 sdk 里的 SDK 主版本 / 自带驱动报的 NVN API 版本（与苹果宿主共用 nvn_drvinfo.inc）：
         # 要装载器的模块表（game 模式才有）和共用前端（VK 引擎才编）都在，所以放在这里而不是前端源列表。
         if(S2A_ANDROID_VK_ENGINE)

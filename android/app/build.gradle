@@ -114,6 +114,8 @@ def thirdPartyLicenseAssets = tasks.register('thirdPartyLicenseAssets', ThirdPar
 // and its rewritten modules as assets. Unset: org.s2arm.android; nativeMode=game can consume imported revisions.
 def gameDirName = project.findProperty('s2arm.gameDir') ?: System.getenv('S2ARM_ANDROID_GAME_DIR')
 def nativeMode = project.findProperty('s2arm.nativeMode') ?: 'diagnostic'
+def pgoMode = project.findProperty('s2arm.pgo')
+def pgoProfile = project.findProperty('s2arm.pgoProfile')
 def vammLayout = project.findProperty('s2arm.vammLayout') ?: 'alias'
 if (!(vammLayout in ['alias', 'balanced'])) throw new GradleException('s2arm.vammLayout must be alias or balanced')
 if (!(nativeMode in ['diagnostic', 'game'])) throw new GradleException('s2arm.nativeMode must be diagnostic or game')
@@ -224,6 +226,9 @@ android {
         ndk { abiFilters 'arm64-v8a' }
         externalNativeBuild { cmake {
             arguments "-DS2A_ANDROID_NATIVE_MODE=${nativeMode}"
+            // Opt-in native PGO for the game provider. CMake validates the mode and profile.
+            if (pgoMode != null) arguments "-DS2A_ANDROID_PGO=${pgoMode}"
+            if (pgoProfile != null) arguments "-DS2A_ANDROID_PGO_PROFILE=${file(pgoProfile).absolutePath}"
             arguments "-DS2A_ANDROID_VAMM_LAYOUT=${vammLayout}"
             arguments "-DS2A_ANDROID_REWRITER=${rewriterEnabled ? 'ON' : 'OFF'}"
             if (rewriterEnabled) {
