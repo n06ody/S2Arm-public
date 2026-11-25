@@ -12,12 +12,14 @@
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
-static int enabled, watching;
+static int enabled, watching, fold_mode;
 static nvn_gpu_pass_desc observed[2];
-static unsigned passes;
+static unsigned passes, transfer_clears;
 
 int nvn_plat_flag(const char *name, int dflt) {
-    if (!strcmp(name, "nvk_clear_only_attachments")) return enabled ? 1 : dflt;
+    if (!strcmp(name, "nvk_clear_only_attachments")) return !fold_mode && enabled ? 1 : dflt;
+    if (!strcmp(name, "nvk_clear_tex_fold")) return fold_mode && enabled;
+    if (!strcmp(name, "nvk_pass_area")) return fold_mode;
     return backend_fixture_flag(name, dflt);
 }
 void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }
@@ -43,6 +45,18 @@ void __wrap_nvn_gpu_pass_begin(nvn_gpu_cmd c, const nvn_gpu_pass_desc *d) {
     __real_nvn_gpu_pass_begin(c, d);
 }
 
+extern __typeof__(nvn_gpu_clear_view) __real_nvn_gpu_clear_view, __wrap_nvn_gpu_clear_view;
+extern __typeof__(nvn_gpu_clear_kept_view) __real_nvn_gpu_clear_kept_view, __wrap_nvn_gpu_clear_kept_view;
+void __wrap_nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float *f, const uint32_t *u, int is_int) {
+    if (watching) transfer_clears++;
+    __real_nvn_gpu_clear_view(c, v, f, u, is_int);
+}
+void __wrap_nvn_gpu_clear_kept_view(nvn_gpu_cmd c, nvn_gpu_view v, const float *f, const uint32_t *u, int is_int) {
+    if (watching) transfer_clears++;
+    __real_nvn_gpu_clear_kept_view(c, v, f, u, is_int);
+}
+
+static uint64_t case_signal;
 enum { W = 64, H = 64, DS = NVN_FORMAT_DEPTH32F_STENCIL8 };
 enum shape { TRIM, MIXED, ALIAS, ZERO, DEPTH, STENCIL };
 static uint8_t storage[262144];
@@ -178,12 +192,11 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
         pv = make_view(probe);
         rd = check_ds_pixels(dv, dir, shape, probe, pv);
     }
-    static uint64_t signal;
     nvn_gpu_err err = {0};
-    ++signal;
-    const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, signal, on_done, NULL, &err);
+    ++case_signal;
+    const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, case_signal, on_done, NULL, &err);
     CHECK(OK(committed), "submit shape %d: %s", shape, err.why);
-    const nvn_gpu_rc retired = OK(committed) ? nvn_gpu_fence_wait(signal, 5000000000ull, &err) : committed;
+    const nvn_gpu_rc retired = OK(committed) ? nvn_gpu_fence_wait(case_signal, 5000000000ull, &err) : committed;
     CHECK(OK(retired), "retire shape %d: %s", shape, err.why);
     active = NULL;
     if (OK(retired)) {
@@ -202,18 +215,126 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
     rp_res_reset();
 }
 
+enum fold_case { MRT, FOLD_ALIAS, RECT, SMALL_FB, ATTACH_FMT, FOLD_CASES };
+
+static void run_fold(enum fold_case scenario, int expect_fold) {
+    static const uint8_t blue[4] = {0, 0, 255, 255};
+    static const uint8_t colors[4][4] = {
+        {64, 0, 0, 255}, {0, 255, 0, 255}, {255, 255, 0, 255}, {255, 255, 255, 255},
+    };
+
+    memset(storage, 0, sizeof storage);
+    pool = (pool_t){.mem = storage, .size = sizeof storage, .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS};
+    tex_t tex[4];
+    nvn_gpu_tex image[4];
+    nvn_gpu_buf readback[4];
+    active = begin_cmd();
+    for (unsigned i = 0; i < 4; i++) {
+        const unsigned width = scenario == SMALL_FB && i == 3 ? W / 2 : W;
+        tex[i] = guest_texture(i + 1, i * 65536, width, NVN_FORMAT_RGBA8);
+        fill_rgba(&tex[i], blue);
+        image[i] = rp_tex_resolve(&tex[i], active);
+        CHECK(image[i], "preload fold texture %u", i);
+        readback[i] = make_buf(width * H * 4, NVN_GPU_MEM_SHARED, NULL);
+    }
+    p_set_rt rt = {.n = 4, .color = {&tex[0], &tex[1], &tex[2], &tex[3]}};
+    tex_t alias = tex[0];
+    if (scenario == FOLD_ALIAS) {
+        alias.serial = 5;
+        CHECK(rp_tex_resolve(&alias, active) == image[0], "alias must use the same real GPU image");
+        rt.color[0] = &alias;
+    }
+    if (scenario == ATTACH_FMT) {
+        rt.has_cview[0] = 1;
+        rt.cview[0] = (view_t){.set_format=1, .format=NVN_FORMAT_RGBA8_SRGB};
+    }
+
+    watching = 1;
+    passes = transfer_clears = 0;
+    memset(observed, 0, sizeof observed);
+    for (unsigned i = 0; i < 4; i++) {
+        const unsigned width = scenario == RECT && i == 0 ? W / 2 : tex[i].d.width;
+        p_clear_tex clear = {
+            .tex=&tex[i], .r={0, 0, 0, width, H, 1}, .mask=15, .value_type=CLEAR_TEX_FLOAT,
+        };
+        for (unsigned j = 0; j < 4; j++) clear.c.f[j] = (float)colors[i][j] / 255.0f;
+        rp_op_clear_tex(active, &clear, NULL);
+    }
+    rp_pass_set_rt(active, &rt);
+    rp_R.has_sc = 1; rp_R.sc = (p_scissor){2, 2, 4, 4};
+    rp_pass_prepare_draw(active, 0xffffu);
+    CHECK(rp_pass_begin(active), "open real MRT pass");
+    rp_pass_flush(active);
+    watching = 0;
+
+    const unsigned total_passes = scenario == RECT ? 2 : 1;
+    const nvn_gpu_pass_desc *desc = &observed[total_passes - 1];
+    unsigned attached = 0;
+    unsigned mask = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        if (!desc->color[i].view) continue;
+        attached |= 1u << i;
+        if (desc->color[i].load == NVN_GPU_LOAD_CLEAR) mask |= 1u << i;
+    }
+    CHECK(attached == 0xf, "fold MRT attachment mask case=%d attached=%#x", scenario, attached);
+    const unsigned expected_mask = !expect_fold ? 0 :
+        scenario == MRT ? 0xf : scenario == SMALL_FB ? 0x8 : 0xe;
+    const unsigned expected_transfers = !expect_fold ? (scenario == RECT ? 3 : 4) :
+        scenario == MRT || scenario == RECT ? 0 : scenario == SMALL_FB ? 3 : 1;
+    CHECK(passes == total_passes && desc->ncolor == 4 &&
+          mask == expected_mask && transfer_clears == expected_transfers,
+          "fold routes case=%d passes=%u load_clear=%#x transfer=%u", scenario, passes, mask, transfer_clears);
+    if (mask) CHECK(!desc->area_w && !desc->area_h, "fold must cover the whole framebuffer");
+
+    for (unsigned i = 0; i < 4; i++) {
+        const uint32_t row_bytes = tex[i].d.width * 4;
+        nvn_gpu_copy_tex_buf(active, image[i], 0, 0, NULL, readback[i], 0, row_bytes, row_bytes * H);
+    }
+    nvn_gpu_err err = {0};
+    ++case_signal;
+    const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, case_signal, on_done, NULL, &err);
+    CHECK(OK(committed), "submit fold case=%d: %s", scenario, err.why);
+    const nvn_gpu_rc retired = OK(committed) ? nvn_gpu_fence_wait(case_signal, 5000000000ull, &err) : committed;
+    CHECK(OK(retired), "retire fold case=%d: %s", scenario, err.why);
+    active = NULL;
+    if (OK(retired)) for (unsigned i = 0; i < 4; i++) {
+        const uint8_t *pixels = buf_cpu(readback[i]);
+        const unsigned width = tex[i].d.width;
+        unsigned good = 0;
+        if (pixels) for (unsigned j = 0; j < width * H; j++) {
+            const uint8_t *need = scenario == RECT && i == 0 && j % width >= W / 2 ? blue : colors[i];
+            good += !memcmp(pixels + j * 4, need, 4);
+        }
+        CHECK(good == width * H, "fold pixels case=%d slot=%u good=%u/%u", scenario, i, good, width * H);
+    }
+    printf("clear-fold Vulkan case=%d passes=%u load_clear=%#x transfer=%u\n",
+           scenario, passes, mask, transfer_clears);
+    for (unsigned i = 0; i < 4; i++) nvn_gpu_buf_release(readback[i], NULL, NULL);
+    rp_pass_reset();
+    rp_res_reset();
+    rp_R.has_sc = 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
+    if (argc != 4 && (argc != 5 || strcmp(argv[4], "fold"))) return 2;
+    fold_mode = argc == 5;
     enabled = atoi(argv[2]);
-    const int expect_trim = atoi(argv[3]);
+    const int expected = atoi(argv[3]);
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) { fprintf(stderr, "device: %s\n", why); return 2; }
     g_desc = (nvn_gpu_open_desc){.host_device = &g_dev, .app_label = "replay-clear-only"};
     if (!open_backend()) return 2;
-    for (enum shape s = TRIM; s <= STENCIL; s++) run_clear(argv[1], s, expect_trim);
+    if (fold_mode) for (enum fold_case s = MRT; s < FOLD_CASES; s++) run_fold(s, expected);
+    else for (enum shape s = TRIM; s <= STENCIL; s++) run_clear(argv[1], s, expected);
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
+    if (fold_mode) {
+        if (!open_backend()) return 2;
+        t21b_clear_load_bits();
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close typed clears: %s", err.why);
+    }
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "destroy device");
-    printf("clear-only Vulkan cases=6 failures=%d\n", g_fail);
+    if (fold_mode) printf("clear-fold Vulkan cases=%d failures=%d\n", FOLD_CASES, g_fail);
+    else printf("clear-only Vulkan cases=6 failures=%d\n", g_fail);
     return g_fail ? 1 : 0;
 }

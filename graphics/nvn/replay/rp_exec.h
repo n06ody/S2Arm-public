@@ -44,6 +44,12 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec);
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec);
+void rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park);
+int rp_pass_park_tex_clear(nvn_gpu_cmd c, const tex_t *t, const view_t *v, nvn_gpu_view gpu, const nvn_gpu_clear *value, int is_int);
+extern int rp_tex_clear_active;
+void rp_pass_land_tex_clear(nvn_gpu_cmd c);
+void rp_pass_tex_clear_before_tex(nvn_gpu_cmd c, const tex_t *t);
+void rp_pass_tex_clear_before_buf(nvn_gpu_cmd c, uint64_t addr, uint64_t len);
 void rp_op_draw_tex(nvn_gpu_cmd c, const p_draw_tex *o, const void *rec);   // OP_DRAW_TEX（rp_draw_tex.c，#1452）：后端有 NVN_GPU_CAP_DRAW_TEX 才画，否则记未接
 
 // 会话四件套（前端按名字调，上沿头文件里没有声明）

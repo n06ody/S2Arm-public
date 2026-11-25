@@ -16,7 +16,7 @@ for d in android/tests/vkhost graphics/nvn graphics/nvn/replay graphics/nvn/gfx/
     inc+=(-I "$repo/$d")
 done
 src=("$repo/android/tests/vk/t_replay_clear_only.c")
-for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_pass.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c graphics/nvn/gfx/nvn/nvn_dirty.c \
+for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_pass.c graphics/nvn/replay/rp_clear_tex.c graphics/nvn/replay/rp_state.c graphics/nvn/replay/nvn_unimpl.c graphics/nvn/gfx/nvn/nvn_dirty.c \
          android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.c android/native/nvn/nvn_vk_pipe_once.c \
          android/native/direct/vk_device.c android/native/direct/gs_path.c android/native/capprobe/capprobe_host.c \
          android/native/nvn/nvn_vk_format.c android/native/nvn/nvn_vk_bcdec.c android/native/nvn/nvn_vk_driver_cache.c \
@@ -25,7 +25,7 @@ for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_pass.c graphics/nvn
 done
 cc -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
-    -Wl,--gc-sections -Wl,--wrap=nvn_gpu_pass_begin -lvulkan -lpthread -lm -o "$out/test"
+    -Wl,--gc-sections -Wl,--wrap=nvn_gpu_pass_begin -Wl,--wrap=nvn_gpu_clear_view -Wl,--wrap=nvn_gpu_clear_kept_view -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
@@ -44,6 +44,15 @@ for dq in 0 1; do
             exit 1
         fi
         echo "clear-only Vulkan: DQ=$dq arm=$arm cases=6 VUID=0 SYNC-HAZARD=0"
+        log="$out/fold-dq$dq-arm$arm.log"
+        if ! timeout 90 "$out/test" "$out/shaders" "$arm" "$arm" fold > "$log" 2>&1 ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+           ! grep -q 'clear-fold Vulkan cases=5 failures=0' "$log"; then
+            cat "$log"
+            exit 1
+        fi
+        grep '^clear-fold Vulkan case=' "$log"
+        echo "clear-fold Vulkan: DQ=$dq arm=$arm cases=5 VUID=0 SYNC-HAZARD=0"
     done
 done
 # Withdraw the optimization while preserving the workload, pixels and expectations.
@@ -58,3 +67,16 @@ if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/withd
     exit 1
 fi
 echo '【绿】纯清除 Vulkan 裁减/回退，双 DQ 读回及撤回负控，VVL 同步校验零错误'
+
+# 关闭贴图折叠后重跑同一图像，必须在录制路径断言报红，读回仍逐像素一致。
+echo '【负对照开始】'
+rc=0
+timeout 90 "$out/test" "$out/shaders" 0 1 fold > "$out/fold-withdrawn.log" 2>&1 || rc=$?
+if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/fold-withdrawn.log" ||
+   [ "$(grep -c 'fold routes case=' "$out/fold-withdrawn.log")" -ne 5 ] ||
+   ! grep -q 'clear-fold Vulkan cases=5 failures=5' "$out/fold-withdrawn.log"; then
+    cat "$out/fold-withdrawn.log"
+    exit 1
+fi
+echo '【负对照结束】'
+echo '【绿】贴图整面清除 MRT 折叠与别名、矩形、覆盖和重解释回退，双 DQ 及同步校验'
