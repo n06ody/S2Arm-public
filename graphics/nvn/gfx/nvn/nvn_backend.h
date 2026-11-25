@@ -357,9 +357,8 @@ typedef struct {
     nvn_gpu_att depth, stencil;
     float clear_depth; uint32_t clear_stencil;
     uint32_t w, h, layers;
-    // 渲染区域（像素，左上原点；w 或 h 为 0 = 整个目标）。附件只在区域内载入 / 保存，区域外保持原内容（Vulkan 的 renderArea 语义）：
-    // 核心按这一遍会碰到的视口 / 裁剪矩形给出实际区域，小目标 / 阴影分块这类小遍的载入与保存就不必按整张附件算。
-    // 区域内必须盖住本通道所有绘制的像素（核心保证：有绘制超出就结束通道、按并集重开）。
+    // 渲染区域（像素，左上原点；w 或 h 为 0 = 整个目标）。载入 / 保存的逻辑效果在区域内。
+    // 局部区必须包含所有实际绘制与清除；超出已开局部区时以 LOAD 整面重开。后端可按实际粒度外扩。
     int32_t area_x, area_y; uint32_t area_w, area_h;
     uint8_t occlusion;    // 本通道会计数遮挡查询
     uint8_t fb_fetch;     // 本通道有片元读本像素颜色（各颜色附件格式须有 NVN_GPU_FMT_FB_FETCH）
