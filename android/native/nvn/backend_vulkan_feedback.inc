@@ -91,6 +91,10 @@ static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint3
         if (f->source == v) return 1;
     struct feedback_copy *f = calloc(1, sizeof *f);
     if (!f) { set_sticky(c, NVN_GPU_E_OOM, "feedback snapshot list allocation failed"); return 0; }
+    if (g.accounts_on) {
+        f->account_draw_writes = (attached & writes) != 0;
+        f->account_pool = from_pool != 0;
+    }
     f->source = v; f->next = c->feedback; c->feedback = f;
     return 1;
 }
@@ -245,6 +249,11 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (!rc_is(c->sticky, NVN_GPU_OK)) { if (fresh) nvn_gpu_tex_release(t); return 0; }
     if (g.fb_copy_count_on) c->fb_copy_counts.snapshots++;
+    if (g.accounts_on) {
+        const struct account_event e = {.tex = s, .source = v, .pipeline = c->pipe->hash,
+            .draw_writes = f->account_draw_writes, .pool = f->account_pool};
+        account_record(c, &e);
+    }
     for (uint32_t lv = v->base_level; lv < v->base_level + v->levels; lv++) {
         // 3D 图像的 arrayLayer 必须为 0；范围位于 z，保留整级的全部切片。
         const int image3d = s->target == NVN_TEXTURE_TARGET_3D;

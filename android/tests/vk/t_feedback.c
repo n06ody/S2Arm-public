@@ -13,7 +13,10 @@ extern uint64_t nvn_gpu_vk_test_prs(int which);          // 回收：0 现存组
 #endif
 static nvn_gpu_err err;
 static int dq_mode,opt_mode,copy_mode=1,pool_fb_mode=1;   // pool_fb_mode：nvk_pool_fb（1 = 整池数组也为写着的附件拷快照，旧行为；0 = 缺省，不拷）
-static int copy_count_mode;
+static int copy_count_mode, accounts_mode;
+static unsigned source_same, source_changed, source_first, source_write, source_lines;
+static unsigned bc1_off, bc7_format, histogram_lines;
+static unsigned long long histogram[4];
 static unsigned copy_count_lines;
 static unsigned long long copy_count[7];
 static unsigned failures,begins,ncases;
@@ -21,11 +24,26 @@ static unsigned failures,begins,ncases;
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 #include "feedback_observer.h"
 static void on_begin(const VkRenderPassBeginInfo *p){(void)p;begins++;}   // 物理渲染通道的开始次数（反馈重开会多一次）
-const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
-VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
-int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
+const char *const *nvn_plat_vk_instance_exts(uint32_t *n) {
+    static const char *const exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME};
+    *n = accounts_mode ? 2 : 0;
+    return accounts_mode ? exts : NULL;
+}
+VkResult nvn_plat_vk_surface_create(VkInstance i, void *w, VkSurfaceKHR *s) {
+    (void)w;
+    *s = VK_NULL_HANDLE;
+    PFN_vkCreateHeadlessSurfaceEXT create = (PFN_vkCreateHeadlessSurfaceEXT)vkGetInstanceProcAddr(i, "vkCreateHeadlessSurfaceEXT");
+    if (!create) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    const VkHeadlessSurfaceCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
+    return create(i, &ci, NULL, s);
+}
+int nvn_plat_window_size(void *w, uint32_t *x, uint32_t *y) {
+    (void)w;
+    *x = *y = 64;
+    return accounts_mode;
+}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_fb_copy_count"))return copy_count_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
+int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_fb_copy_count"))return copy_count_mode;if(!strcmp(n,"nvk_gpu_accounts"))return accounts_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
 static unsigned skip_logs;   // 「整池数组免拷快照」逐条日志的条数（限流：每个（管线、图）首次一行；不含「已记满」那一句）
 void nvn_plat_log(int l,const char *c,const char *s){
     (void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");
@@ -33,10 +51,31 @@ void nvn_plat_log(int l,const char *c,const char *s){
     if(s&&sscanf(s,"nvk-fb-copy scope=session frames=%llu draws=%llu splits=%llu snapshots=%llu regions=%llu bytes=%llu unknown=%llu",
         &copy_count[0],&copy_count[1],&copy_count[2],&copy_count[3],&copy_count[4],&copy_count[5],&copy_count[6])==7)
         copy_count_lines++;
+    if (s && !strncmp(s, "nvk-fb-source ", 14)) {
+        source_lines++;
+        source_same += strstr(s, " unchanged=1 ") != NULL;
+        source_changed += strstr(s, " unchanged=0 ") != NULL;
+        source_first += strstr(s, " unchanged=first ") != NULL;
+        source_write += strstr(s, " draw_writes=1 ") != NULL;
+    }
+    if (s && sscanf(s, "nvk-fb-present scope=session frames=%llu zero=%llu one=%llu multi=%llu",
+                    &histogram[0], &histogram[1], &histogram[2], &histogram[3]) == 4)
+        histogram_lines++;
+    unsigned nvn;
+    int vk;
+    char reason[32];
+    unsigned long long textures, bytes, shadow;
+    if (s && sscanf(s, "nvk-bc-live scope=session frames=%*u nvn=%x vk=%d reason=%31s textures=%llu image_bytes=%llu shadow_bytes=%llu",
+                    &nvn, &vk, reason, &textures, &bytes, &shadow) == 6 &&
+        vk == VK_FORMAT_R8G8B8A8_UNORM && textures == 1 && bytes >= 16 * 16 * 4 && !shadow) {
+        bc1_off += nvn == NVN_FORMAT_RGBA_DXT1 && !strcmp(reason, "off");
+        bc7_format += nvn == NVN_FORMAT_BPTC_UNORM && !strcmp(reason, "format");
+    }
 }
 static void check_copy_count(int which,unsigned draws,unsigned copies,unsigned bytes){
     if(!copy_mode)return;  // 快照路径关闭的原有负控继续只看绘制与同步校验。
-    const unsigned long long want[]={0,draws,draws,copies,copies,bytes,0};  // 本夹具无 WSI，每份快照只复制一级一面。
+    const unsigned frames = accounts_mode && (which == 0 || which == 1 || which == 3) ? 2 : 0;
+    const unsigned long long want[]={frames,draws,draws,copies,copies,bytes,0};  // 每份快照只复制一级一面。
     unsigned bad=copy_count_lines!=(unsigned)copy_count_mode ||
         (copy_count_mode&&memcmp(copy_count,want,sizeof want));
     if(bad)fprintf(stderr,"FAIL feedback copy-count case=%d lines=%u want=%d draws=%llu splits=%llu snapshots=%llu regions=%llu bytes=%llu unknown=%llu expected-draws=%u expected-copies=%u expected-bytes=%u\n",
@@ -56,7 +95,20 @@ static void begin_pass(nvn_gpu_cmd c,nvn_gpu_view view,int load,unsigned size) {
     p.color[0].store=NVN_GPU_STORE_STORE;p.color[0].clear.f[0]=.25f;p.color[0].clear.f[3]=1;
     p.w=p.h=size;p.layers=1;nvn_gpu_pass_begin(c,&p);
 }
+static void present_two(nvn_gpu_view view) {
+    nvn_gpu_surface surface = NULL;
+    GPU(nvn_gpu_surface_attach((void *)1, &surface, &err));
+    for (uint64_t i = 1; i <= 2; i++) {
+        nvn_gpu_drawable drawable = {0};
+        GPU(nvn_gpu_drawable_acquire(surface, 5000000000ull, NULL, &drawable, &err));
+        const nvn_gpu_present_desc d = {.src = view};
+        GPU(nvn_gpu_present(surface, &drawable, &d, i, NULL, NULL, &err));
+    }
+    GPU(nvn_gpu_surface_detach(surface, 5000000000ull, &err));
+}
 static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
+    source_same = source_changed = source_first = source_write = source_lines = histogram_lines = 0;
+    const int do_present = accounts_mode && (which == 0 || which == 1 || which == 3);
     copy_count_mode=which!=18;copy_count_lines=0;memset(copy_count,0,sizeof copy_count);
     observer_reset();begins=0;skip_logs=0;ncases++;nvn_gpu_open_desc od={0};od.host_device=device;od.app_label="feedback-isolation";GPU(nvn_gpu_open(&od,&err));
     printf("feedback begin dq=%d opt=%d pool_fb=%d case=%d\n",dq_mode,opt_mode,pool_fb_mode,which);   // 校验层的报错夹在两个 begin 之间，脚本按它归到案例（白名单按案例放行）
@@ -118,14 +170,19 @@ static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
     if(pool)nvn_gpu_pool_release(pool);
     if(other)nvn_gpu_view_release(other);
     nvn_gpu_samp_release(sampler);nvn_gpu_view_release(sample);
-    for(unsigned i=0;i<2;i++){nvn_gpu_view_release(views[i]);nvn_gpu_tex_release(images[i]);}
+    for(unsigned i=0;i<2;i++){
+        if (do_present && i == 1) continue;
+        nvn_gpu_view_release(views[i]);nvn_gpu_tex_release(images[i]);
+    }
     if(which==14){
         observed_aborted=1;nvn_gpu_cmd_abort(cmd); // no GPU work; queued DQ recording still must finish before destruction
         REQUIRE(observed_draws==1);REQUIRE(nvn_gpu_fence_done()==0&&nvn_gpu_fence_failed()==0);
         failures+=observed_overlap+(observed_copies!=1);
         printf("feedback abort dq=%d opt=%d draws=%u live-overlap=%u copies=%u\n",dq_mode,opt_mode,observed_draws,observed_overlap,observed_copies);
         nvn_gpu_buf_release(rb,NULL,NULL);nvn_gpu_shader_release(vs);nvn_gpu_shader_release(fs);GPU(nvn_gpu_close(5000000000ull,&err));
-        check_copy_count(which,0,0,0);return;
+        check_copy_count(which,0,0,0);
+        if (source_lines) { fprintf(stderr, "FAIL feedback accounts counted an aborted snapshot\n"); failures++; }
+        return;
     }
     if(which==18){   // 免拷守卫探针：只录制不提交（中止）。断言「免拷只在 GENERAL 档（opt=0）且没开旧行为开关（pool_fb=0）时发生」——
                      // opt=1 / pool_fb=1 必须照旧拷快照、拆通道。守卫被撤掉时这里按读数变红，不靠驱动崩溃才发现，也不把无效布局提交给驱动。
@@ -160,9 +217,34 @@ static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
     printf("feedback dq=%d opt=%d pool_fb=%d case=%d draws=%u live-overlap=%u copies=%u copy-bad=%u begins=%u begins-bad=%u overlap-bad=%u pixel-bad=%u skip-logs=%u logs-bad=%u\n",dq_mode,opt_mode,pool_fb_mode,which,draws,observed_overlap,observed_copies,copy_bad,begins,begins_bad,overlap_bad,pixels_bad,skip_logs,logs_bad);
     failures+=overlap_bad+copy_bad+begins_bad+pixels_bad+logs_bad;
     nvn_gpu_buf_release(rb,NULL,NULL);
+    if (do_present) {
+        present_two(views[1]);
+        nvn_gpu_view_release(views[1]);nvn_gpu_tex_release(images[1]);
+    }
     nvn_gpu_shader_release(vs);nvn_gpu_shader_release(fs);GPU(nvn_gpu_close(5000000000ull,&err));
     check_copy_count(which,which==17?draws:copy_want,copy_want,copy_want*4*4*4);
     REQUIRE(observed_early_destroy==0);
+    if (do_present) {
+        const unsigned long long want[] = {2, which == 0 ? 2 : 1, which == 1, which == 3};
+        if (histogram_lines != 1 || memcmp(histogram, want, sizeof want)) {
+            fprintf(stderr, "FAIL feedback accounts present hist case=%d lines=%u frames=%llu zero=%llu one=%llu multi=%llu\n",
+                    which, histogram_lines, histogram[0], histogram[1], histogram[2], histogram[3]);
+            failures++;
+        }
+    }
+    if (which == 0 || which == 3 || which == 16) {
+        const unsigned copies = accounts_mode && which != 0 ? 2 : 0;
+        const unsigned writes = accounts_mode && which == 3 ? 2 : 0;
+        const unsigned same = accounts_mode && which == 16;
+        const unsigned changed = accounts_mode && which == 3;
+        if (source_lines != copies || source_first != (copies != 0) || source_same != same ||
+            source_changed != changed || source_write != writes) {
+            fprintf(stderr, "FAIL feedback accounts case=%d lines=%u first=%u same=%u changed=%u writes=%u expected=%u/%u/%u/%u/%u\n",
+                    which, source_lines, source_first, source_same, source_changed, source_write,
+                    copies, copies != 0, same, changed, writes);
+            failures++;
+        }
+    }
 }
 static void run_depth(struct s2a_vk_device *device,const char *dir,unsigned format,int which) {
     copy_count_mode=1;copy_count_lines=0;memset(copy_count,0,sizeof copy_count);
@@ -260,6 +342,25 @@ static void run_rec_restore(struct s2a_vk_device *device,const char *dir) {
     REQUIRE(observed_early_destroy==0);
 }
 #endif
+static void run_bc_accounts(struct s2a_vk_device *device) {
+    nvn_gpu_open_desc open = {.host_device = device, .app_label = "bc-accounts"};
+    GPU(nvn_gpu_open(&open, &err));
+    nvn_gpu_tex_desc d = {.usage = NVN_GPU_TEX_SAMPLED};
+    d.d.target = NVN_TEXTURE_TARGET_2D;
+    d.d.width = d.d.height = 16;
+    d.d.depth = d.d.levels = 1;
+    const unsigned formats[] = {NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_BPTC_UNORM};
+    for (unsigned i = 0; i < 2; i++) {
+        d.d.format = formats[i];
+        nvn_gpu_tex t = NULL;
+        GPU(nvn_gpu_tex_create(&d, &t, &err));
+    }
+    GPU(nvn_gpu_close(5000000000ull, &err));
+    if (bc1_off != 1 || bc7_format != 1) {
+        fprintf(stderr, "FAIL BC accounts bc1_off=%u bc7_format=%u\n", bc1_off, bc7_format);
+        failures++;
+    }
+}
 int main(int argc,char **argv) {
     if(argc!=6)return 2;
     setvbuf(stdout,NULL,_IOLBF,0);   // 行缓冲：校验层的报错和 begin / 结果行按真实先后进同一份日志（脚本按 begin 行把报错归到案例）
@@ -267,8 +368,21 @@ int main(int argc,char **argv) {
     copy_mode=atoi(argv[4]);REQUIRE(copy_mode==0||copy_mode==1);
     pool_fb_mode=atoi(argv[5]);REQUIRE(pool_fb_mode==0||pool_fb_mode==1);
     observed_on_begin=on_begin;
+    accounts_mode = getenv("S2A_GPU_ACCOUNTS_FIXTURE") != NULL;
+    if (accounts_mode) REQUIRE(!setenv("S2A_VK_BC_DECODE", "force", 1));
     struct s2a_vk_device device;char why[256];
     if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
+    if (accounts_mode) {
+        run_bc_accounts(&device);
+        run_case(&device, argv[1], 0);
+        run_case(&device, argv[1], 1);
+        run_case(&device, argv[1], 3);
+        run_case(&device, argv[1], 14);
+        run_case(&device, argv[1], 16);
+        REQUIRE(!s2a_vk_device_destroy(&device,1));
+        printf("feedback accounts cases=%u failures=%u\n", ncases, failures);
+        return failures ? 1 : 0;
+    }
     // 守卫探针先跑（只录制不提交）：免拷的前提（GENERAL 档、没开旧行为开关）被撤掉时，在后面真执行的案例把驱动跑崩之前就按读数变红。
     run_case(&device,argv[1],18);
     if(failures&&copy_mode){printf("feedback cases=%u failures=%u\n",ncases,failures);return 1;}   // 快照整条路径关掉的负控（copy_mode=0）要继续跑到真执行的案例，不在这里收

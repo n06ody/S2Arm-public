@@ -23,6 +23,7 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, u
     struct nvn_gpu_tex_s *t = tex;
     *replacement = NULL;
     if (!c || !t || !src || c->in_pass || !bc1_snapshot_eligible(t)) return 0;
+    if (!bc1_astc_image(t)) account_bc_reason(t, ACCOUNT_BC_SOURCE);
     if (!nvn_tex_layout || !nvn_deswizzle) return 0;
     nvn_texlayout layout;
     nvn_tex_layout(&t->original_desc, &layout);
@@ -61,6 +62,7 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, u
     }
     opaque &= g.bc1_astc_on;
     if (!opaque && !bc1_astc_image(t)) {
+        account_bc_reason(t, ACCOUNT_BC_PUNCH);
         free(snapshot);
         return 0;   // 当前布局已经正确，沿用普通传输
     }
@@ -73,11 +75,15 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, u
         nvn_gpu_err err = {0};
         if (!rc_is(bc1_new_storage(t, opaque, &target, &err), NVN_GPU_OK)) {
             free(snapshot);
-            if (!bc1_astc_image(t)) return 0;
+            if (!bc1_astc_image(t)) {
+                account_bc_reason(t, ACCOUNT_BC_ADMISSION);
+                return 0;
+            }
             set_sticky(c, err.rc.code, "BC1 恢复 RGBA8 失败：%s", err.why);
             return -1;
         }
         if (opaque && !bc1_astc_image(target)) {
+            account_bc_reason(t, ACCOUNT_BC_ADMISSION);
             nvn_gpu_tex_release(target);
             free(snapshot);
             return 0;
@@ -93,7 +99,10 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, u
         if (target != t) nvn_gpu_tex_release(target);
         return -1;
     }
-    if (target != t) *replacement = target;
+    if (target != t) {
+        if (!opaque) account_bc_reason(target, ACCOUNT_BC_PUNCH);
+        *replacement = target;
+    }
     return 1;
 }
 
@@ -135,6 +144,7 @@ int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd ch, nvn_gpu_tex tex, nvn_gpu_tex *replace
         nvn_gpu_tex_release(target);
         return -1;
     }
+    account_bc_reason(target, ACCOUNT_BC_PLAIN);
     *replacement = target;
     return 1;
 }

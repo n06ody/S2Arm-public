@@ -656,12 +656,17 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     r = vkQueuePresentKHR(g.queue, &pi);
     const int presented_ok = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     // 与游戏段提交共用队列锁，在相邻累计行之间按成功呈现次数换算每帧。
+    if (presented_ok && g.accounts_on) account_present();
     const int report_fb_copy = presented_ok && g.fb_copy_count_on && ++g.fb_copy_frames % 300 == 0;
+    if (report_fb_copy && g.accounts_on) account_fb_log("period");
     uint64_t fb_copy_frames;
     struct fb_copy_counts fb_copy_counts;
     if (report_fb_copy) { fb_copy_frames = g.fb_copy_frames; fb_copy_counts = g.fb_copy_counts; }
     pthread_mutex_unlock(&g_submit_mu);
-    if (report_fb_copy) fb_copy_count_log("period", fb_copy_frames, &fb_copy_counts);
+    if (report_fb_copy) {
+        fb_copy_count_log("period", fb_copy_frames, &fb_copy_counts);
+        if (g.accounts_on) account_bc_log("period", fb_copy_frames);
+    }
     s->presents++;
     if (presented_ok) {
         uint64_t tnow = now_ns();
