@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 22   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 24   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -115,6 +115,7 @@ enum {
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
+    NVN_GPU_CAP_BC7_SNAPSHOT      = 1u << 26,  // v23：可接收完整 BC7 UNORM 快照，选择存储或统计模式
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -214,6 +215,7 @@ enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不
     NVN_GPU_TEX_CPU_UPLOAD = 1u << 5, // 内容来自游戏内存，会经 nvn_gpu_tex_upload* 更新
     NVN_GPU_TEX_TRANSIENT = 1u << 6,  // 只活在一个通道里（memoryless / LAZILY_ALLOCATED）
     NVN_GPU_TEX_BC1_OPAQUE = 1u << 7, // 初始完整压缩快照已证无透明索引，允许宿主选 ASTC 存储。
+    NVN_GPU_TEX_BC7_VALIDATED = 1u << 8, // 后端私有候选，完成质量检查前不得发布。
 };
 typedef struct {
     nvn_texdesc d;             // NVN 描述原样
@@ -234,6 +236,14 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, ui
 // 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
 // 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+// 同上，BC7 UNORM 首次完整上传保持 RGBA8。allow_astc=1 可排队准备异步候选。
+int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size,
+                            uint64_t serial, int allow_astc, nvn_gpu_tex *replacement);
+int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+// 可选 [提交]：正常段末录制有限转码。返回 1 通知回放重验缓存的贴图表。
+int nvn_gpu_bc7_step(nvn_gpu_cmd c);
+// 可选 [提交]：只有整图质量、自然栅栏和源代际均已确认才移交新存储的所有权。
+nvn_gpu_tex nvn_gpu_tex_bc7_take(nvn_gpu_tex t);
 
 void nvn_gpu_tex_release(nvn_gpu_tex t);
 // 视图：v 为 NVN 视图记录原样，NULL = 默认视图。视图让贴图存储活到视图 release。线程：[任意]。出错：格式不兼容或缺 VIEW_FMT → NVN_GPU_E_ARG。
@@ -367,9 +377,8 @@ typedef struct {
     nvn_gpu_att depth, stencil;
     float clear_depth; uint32_t clear_stencil;
     uint32_t w, h, layers;
-    // 渲染区域（像素，左上原点；w 或 h 为 0 = 整个目标）。附件只在区域内载入 / 保存，区域外保持原内容（Vulkan 的 renderArea 语义）：
-    // 核心按这一遍会碰到的视口 / 裁剪矩形给出实际区域，小目标 / 阴影分块这类小遍的载入与保存就不必按整张附件算。
-    // 区域内必须盖住本通道所有绘制的像素（核心保证：有绘制超出就结束通道、按并集重开）。
+    // 渲染区域（像素，左上原点；w 或 h 为 0 = 整个目标）。载入 / 保存的逻辑效果在区域内。
+    // 局部区必须包含所有实际绘制与清除；超出已开局部区时以 LOAD 整面重开。后端可按实际粒度外扩。
     int32_t area_x, area_y; uint32_t area_w, area_h;
     uint8_t occlusion;    // 本通道会计数遮挡查询
     uint8_t fb_fetch;     // 本通道有片元读本像素颜色（各颜色附件格式须有 NVN_GPU_FMT_FB_FETCH）
@@ -522,6 +531,21 @@ typedef struct {
 } nvn_gpu_access_span;
 int nvn_gpu_buf_access_span(nvn_gpu_buf b, uint64_t off, uint64_t bytes, nvn_gpu_access_span *out);
 int nvn_gpu_view_access_span(nvn_gpu_view v, nvn_gpu_access_span *out);
+// A dynamic prefix comes from the same segment-owned CPU DRV0 slice the
+// fragment shader will bind. A null buffer describes a constant prefix.
+struct nvn_gpu_cold_prefix {
+    nvn_gpu_buf buf;
+    nvn_gpu_access_span binding;
+    uint32_t fragment_ent, byte, mask;
+};
+struct nvn_gpu_cold_domain {
+    nvn_gpu_buf buf;
+    nvn_gpu_access_span binding;
+    uint32_t first_word, stride_words, count;
+    uint32_t fragment_ent;
+    struct nvn_gpu_cold_prefix prefix;
+};
+
 // 通道外：此前计算写入对后续间接参数 / 索引 / 顶点 / 图形着色器读取可见；不包含附件载入、计算或传输，不分段、不等待。
 // 由核心仅在图形实际读到计算写过的范围时调用；全体计算写对这些读阶段发布，所以核心可一起撤掉待发布表。
 void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c);

@@ -43,6 +43,10 @@ void nvn_vk_pipe_demand_test_unlock_lifecycle(void);
 int  nvn_vk_pipe_demand_on(void);
 
 int  nvn_vk_pipe_demand_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], nvn_gpu_pipe *cached);
+// Optional cold fragment variant. Results share the worker and lifetime
+// budget, but have a separate demand identity and never wait on the caller.
+int  nvn_vk_pipe_demand_cold_kick(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32],
+                                 const uint8_t variant_sha[32], nvn_gpu_pipe *cached);
 int  nvn_vk_pipe_demand_state(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], nvn_gpu_pipe *cached);
 int  nvn_vk_pipe_demand_wait(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint32_t wait_ms, nvn_gpu_pipe *out, char *why, size_t why_cap);
 void nvn_vk_pipe_demand_mark(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], int is_stuck);

@@ -13,6 +13,7 @@ with the rewritten modules inside the APK.
       warn and leave the APK on its default launcher icon. With --shader-pack <make_pack shader bake
       output root> (android/tools/bake_shaders.py <out>/pack, #1574) it also writes the
       deterministic assets/game/shaders.zip the runtime extracts as the offline shader pack.
+      Indexed shaders/s2a-cold-guard-v1/*.bin records are optional debug APK assets.
       Default out: build/android-game/<title id>.
       Build it with  S2ARM_ANDROID_GAME_DIR=<out, relative to the repo> bash android/docker/build.sh.
 
@@ -49,6 +50,7 @@ import direct_library   # noqa: E402  F5.2：直连描述的文件清单只按�
 sys.path.insert(1, os.path.join(REPO, 'pack'))
 import display_name   # noqa: E402  桌面标签与 iPhone 同一函数：「<游戏自带 nacp 标题> S2Arm」（11-04 维护者）
 GRAPHICS_FEATURE = direct_library.GRAPHICS_FEATURE
+COLD_GUARD_PREFIX = 'shaders/s2a-cold-guard-v1/'
 REFRESH_PAYLOAD = ('manifest.json', 'index.tsv', 'game-build-artifact.json', 'ctl/control.nacp')
 
 
@@ -274,6 +276,16 @@ def write_shader_zip(pack_dir, destination):
                 shutil.copyfileobj(stream, member)
 
 
+def cold_guard_assets(rows):
+    """APK-only destination names for the optional indexed shader records."""
+    for rel in sorted(p for p in rows if p.startswith(COLD_GUARD_PREFIX)):
+        name = rel[len(COLD_GUARD_PREFIX):]
+        size, _ = rows[rel]
+        if not re.fullmatch('[0-9a-f]{64}[.]bin', name) or not 184 < size <= 16 * 1024 * 1024:
+            raise ValueError(f'invalid cold guard asset index row: {rel}')
+        yield rel, 'assets/s2a-cold-guard-v1/' + name
+
+
 def previous_package(path, out, pack):
     """(directory, {path: (size, sha256)}) of an earlier resource package to link files from, or None.
     Only an optimisation: whatever makes it unusable is reported and the package is built with plain copies."""
@@ -335,6 +347,7 @@ def resources(pack, apk, out, refresh_existing=False, reuse_from=None):
         except direct_library.LibraryError as error:
             sys.exit(f'{pack}: {error}')
     modules = sorted(p for p in rows if p.startswith('modules/'))
+    guard_assets = list(cold_guard_assets(rows))
     with zipfile.ZipFile(apk) as z:
         props = dict(line.split('=', 1) for line in z.read('assets/game/game.properties').decode('ascii').splitlines() if '=' in line)
         if props.get('titleId') != title_id:
@@ -343,7 +356,14 @@ def resources(pack, apk, out, refresh_existing=False, reuse_from=None):
             member = 'assets/' + ASSET_ROOT + '/' + p[len('modules/'):]
             if member not in z.namelist() or hashlib.sha256(z.read(member)).hexdigest() != rows[p][1]:
                 sys.exit(f'{apk}: {member} is missing or differs from the package')
+        for rel, member in guard_assets:
+            expected_size, expected_sha = rows[rel]
+            if (member not in z.namelist() or z.getinfo(member).file_size != expected_size
+                    or hashlib.sha256(z.read(member)).hexdigest() != expected_sha):
+                raise ValueError(f'APK cold guard asset missing or differs: {member}')
     package, version_code, debug = apk_identity(apk)
+    if guard_assets and not debug:
+        raise ValueError('cold guard assets require a debug APK')
     validate_apk_package(title_id, package, debug)
     if version_code != int(props.get('versionCode', '1')):
         raise ValueError('APK manifest versionCode differs from game.properties')
@@ -454,6 +474,16 @@ def main():
     os.makedirs(os.path.join(assets, 'modules'))
     for p in modules:
         shutil.copyfile(os.path.join(pack, p), os.path.join(assets, p))
+    for rel, member in cold_guard_assets(rows):
+        expected_size, expected_sha = rows[rel]
+        with open(os.path.join(pack, rel), 'rb') as stream:
+            data = stream.read(expected_size + 1)
+        if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
+            raise ValueError(f'cold guard asset does not match index.tsv: {rel}')
+        dest = os.path.join(out, member)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, 'wb') as stream:
+            stream.write(data)
     if shader_pack is not None:
         write_shader_zip(shader_pack, os.path.join(assets, 'shaders.zip'))
     for density, data in rendered_icon or ():

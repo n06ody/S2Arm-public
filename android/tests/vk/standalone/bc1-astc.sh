@@ -20,9 +20,21 @@ for f in android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.
     src+=("$repo/$f")
 done
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
-    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
+    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_BC7_ASYNC_TEST=1 "${inc[@]}" "${src[@]}" \
     -Wl,--gc-sections -L"$out" -Wl,-rpath,"$out" -lastcdecode -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+set +e
+timeout 20 "$out/test" --fence-timeout > "$out/fence-timeout.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 1 ] || ! grep -q 'FAIL .*BC ASTC fence signal=1 blocks=1' "$out/fence-timeout.log" ||
+   ! grep -q 'FAIL .*BC ASTC fixture close rc=' "$out/fence-timeout.log" ||
+   grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/fence-timeout.log"; then
+    cat "$out/fence-timeout.log"
+    echo "【红】BC ASTC fence/close 超时退出夹具 rc=$rc" >&2
+    exit 1
+fi
+echo '【绿】BC ASTC fence/close 超时保留在途设备，失败退出无 VUID'
 set +e
 timeout 180 "$out/test" 2>&1 | tee "$out/run.log"
 rc=${PIPESTATUS[0]}
@@ -54,3 +66,107 @@ if [ "$rc" -ne 1 ] || ! grep -q 'FAIL .*BC1 transparent block must mark the text
     exit 1
 fi
 echo '【绿】BC1 ASTC 计算编码、透明黑保底、原 BC 回读；撤透明标记负控命中'
+
+# 同一 Vulkan/VVL 设备运行 BC7 的真实计算与 Arm astcenc 浮点采样对拍。
+cc -std=c11 -Wall -Wextra -Werror -I "$repo/android/native/nvn" \
+    "$repo/android/tests/vk/t_bc7_astc_inspect.c" -o "$out/bc7-inspect"
+"$out/bc7-inspect"
+set +e
+timeout 180 "$out/test" --bc7 2>&1 | tee "$out/bc7.log"
+rc=${PIPESTATUS[0]}
+set -e
+if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/bc7.log"; then
+    echo "【红】BC7 ASTC fixture rc=$rc" >&2
+    exit 1
+fi
+
+encoder="$repo/android/native/nvn/bc7_astc_shaders"
+python3 "$encoder/generate.py" --check --tables-only --out "$out/bc7-tables"
+python3 - "$encoder/encode.comp" "$out" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+mutations = {
+    "weights": ("        weights = ~weights;", ""),
+    "rotation": ("colors.y | (ccs << 30u)", "colors.y | (((ccs + 1u) & 3u) << 30u)"),
+    "bise": ("uint code = trits[index >> 2u] >> (8u * (index & 3u));",
+             "uint code = (trits[index >> 2u] >> (8u * (index & 3u))) ^ 1u;"),
+    "alpha": ("bool exchange = rgb_sum(ep0)", "ep0.a = ep1.a = 0u;\n    bool exchange = rgb_sum(ep0)"),
+}
+for name, (anchor, replacement) in mutations.items():
+    assert source.count(anchor) == 1, name
+    directory = Path(sys.argv[2]) / ("bc7-negative-" + name)
+    directory.mkdir(exist_ok=True)
+    (directory / "encode.comp").write_text(source.replace(anchor, replacement))
+PY
+for variant in weights rotation bise alpha; do
+    dir="$out/bc7-negative-$variant"
+    "${GLSLC:-glslc}" --target-env=vulkan1.1 -O -I "$out/bc7-tables" "$dir/encode.comp" -o "$dir/encode.comp.spv"
+    set +e
+    timeout 180 "$out/test" --bc7 "$dir" > "$dir/run.log" 2>&1
+    rc=$?
+    set -e
+    expected='BC7 channel error limit'
+    if [ "$variant" = alpha ]; then expected='BC7 alpha endpoint/coverage preservation'; fi
+    if [ "$rc" -ne 1 ] || ! grep -q "FAIL .*$expected" "$dir/run.log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$dir/run.log"; then
+        cat "$dir/run.log"
+        echo "【红】BC7 ASTC $variant 负控未命中 rc=$rc" >&2
+        exit 1
+    fi
+    echo "【绿】BC7 ASTC $variant 负控命中"
+done
+
+hybrid_tables="$out/bc7-hybrid-tables"
+python3 -B "$encoder/generate_hybrid.py" --tables-only --out "$hybrid_tables"
+run_cold_hybrid() {
+    local cache
+    cache=$(mktemp -d "$out/bc7-hybrid-cache.XXXXXX")
+    MESA_SHADER_CACHE_DIR="$cache" timeout 180 "$out/test" --bc7-hybrid "$@"
+}
+run_cold_hybrid 2>&1 | tee "$out/bc7-hybrid.log"
+if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/bc7-hybrid.log"; then
+    echo '【红】BC7 hybrid validation' >&2
+    exit 1
+fi
+
+python3 - "$encoder/hybrid.comp" "$out" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+mutations = {
+    "peak": ("any(greaterThan(d.rgb, uvec3(8u * 257u))) || ", ""),
+    "rms": ("return sum <= 48u * (3u * 257u) * (3u * 257u);", "return true;"),
+    "alpha": ("uvec4 a = c.lo[p], b = c.hi[p];", "uvec4 a = c.lo[p], b = c.hi[p];\n        a.a = b.a = 0u;"),
+    "partition": ("put(bits, 13u, 10u, c.partition_code);", "put(bits, 13u, 10u, c.partition_code ^ 1u);"),
+    "reject": ("atomicOr(dst.needs_rgba, 1u);", ""),
+}
+for name, (anchor, replacement) in mutations.items():
+    assert source.count(anchor) == (2 if name == "reject" else 1), name
+    directory = Path(sys.argv[2]) / ("bc7-hybrid-negative-" + name)
+    directory.mkdir(exist_ok=True)
+    (directory / "encode.comp").write_text(source.replace(anchor, replacement))
+PY
+for variant in peak rms alpha partition reject; do
+    dir="$out/bc7-hybrid-negative-$variant"
+    "${GLSLC:-glslc}" --target-env=vulkan1.1 -O -I "$hybrid_tables" -I "$repo/graphics/nvn/third_party/granite/decode" \
+        "$dir/encode.comp" -o "$dir/encode.comp.spv"
+    set +e
+    run_cold_hybrid "$dir" > "$dir/run.log" 2>&1
+    rc=$?
+    set -e
+    case "$variant" in
+        peak) expected='RGB L-infinity outliers' ;;
+        rms) expected='RGB RMS outliers' ;;
+        alpha) expected='alpha outliers' ;;
+        partition) expected='RGB L-infinity outliers|invalid ASTC blocks' ;;
+        reject) expected='rejected blocks must mark the entire image' ;;
+    esac
+    if [ "$rc" -ne 1 ] || ! grep -qE "FAIL .*(${expected})" "$dir/run.log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$dir/run.log"; then
+        cat "$dir/run.log"
+        echo "【红】BC7 hybrid $variant 负控未命中 rc=$rc" >&2
+        exit 1
+    fi
+    echo "【绿】BC7 hybrid $variant 负控命中"
+done
