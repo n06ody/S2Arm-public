@@ -2387,6 +2387,72 @@ static void t21_clear_int(void) {
 }
 
 
+// 转移清除和附件载入清除必须在存储中留下相同的位，包括大整数的低位。
+static void t21b_clear_load_bits(void) {
+    const struct {
+        uint32_t fmt, bpp;
+        int is_int;
+        nvn_gpu_pass_desc desc;
+        uint32_t expected[4];
+    } cases[] = {
+        {NVN_FORMAT_RGBA8, 4, 0, {.color = {{.clear.f = {0.0f, 51.0f/255.0f, 204.0f/255.0f, 1.0f}}}},
+         {0xffcc3300u}},
+        {NVN_FORMAT_RGBA32UI, 16, 1, {.color = {{.clear.u = {UINT32_MAX, 0x10000001u, 0x80000001u, 1}}}},
+         {UINT32_MAX, 0x10000001u, 0x80000001u, 1}},
+        {NVN_FORMAT_RGBA32I, 16, 1, {.color = {{.clear.i = {INT32_MIN, -0x10000001, INT32_MAX, 1}}}},
+         {0x80000000u, 0xefffffffu, 0x7fffffffu, 1}},
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const uint32_t fmt = cases[i].fmt, bpp = cases[i].bpp, bytes = 16 * bpp;
+        if (!(nvn_gpu_format_caps(fmt) & NVN_GPU_FMT_CLEAR_FOLD)) {
+            printf("【未证】clear-load bits：格式 %u 缺整图清除或颜色附件能力\n", fmt);
+            continue;
+        }
+        nvn_gpu_tex a = make_tex(4, 4, fmt, NVN_GPU_TEX_RENDER);
+        nvn_gpu_tex b = make_tex(4, 4, fmt, NVN_GPU_TEX_RENDER);
+        nvn_gpu_view va = make_view(a), vb = make_view(b);
+        nvn_gpu_buf read = make_buf(2 * bytes, NVN_GPU_MEM_SHARED, NULL);
+        nvn_gpu_cmd c = begin_cmd();
+        nvn_gpu_pass_desc pass = cases[i].desc;
+        pass.w = pass.h = 4; pass.layers = pass.ncolor = 1;
+        pass.color[0].view = vb;
+        pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+
+        // 同段一起保活两张图。缓存归还各自的视图，其中一张也归还贴图后，再逐项兑现。
+        nvn_gpu_tex retired = make_tex(4, 4, fmt, NVN_GPU_TEX_RENDER);
+        nvn_gpu_view vr = make_view(retired);
+        CHECK(nvn_gpu_cmd_keep_clear_view(c, va), "待清视图保活：格式 %u", fmt);
+        CHECK(nvn_gpu_cmd_keep_clear_view(c, vr), "第二张待清贴图保活：格式 %u", fmt);
+        nvn_gpu_view_release(va);
+        nvn_gpu_view_release(vr);
+        nvn_gpu_tex_release(retired);
+        nvn_gpu_clear_kept_view(c, va, pass.color[0].clear.f, pass.color[0].clear.u, cases[i].is_int);
+        nvn_gpu_clear_kept_view(c, vr, pass.color[0].clear.f, pass.color[0].clear.u, cases[i].is_int);
+        nvn_gpu_pass_begin(c, &pass);
+        nvn_gpu_pass_end(c);
+        nvn_gpu_copy_tex_buf(c, a, 0, 0, NULL, read, 0, 4 * bpp, bytes);
+        nvn_gpu_copy_tex_buf(c, b, 0, 0, NULL, read, bytes, 4 * bpp, bytes);
+
+        nvn_gpu_err e = {0};
+        const uint64_t signal = i + 1;
+        nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, signal, on_done, NULL, &e);
+        CHECK(OK(rc), "clear-load bits commit：格式 %u %d %s", fmt, rc.code, e.why);
+        if (OK(rc)) {
+            rc = nvn_gpu_fence_wait(signal, 2000000000ull, &e);
+            CHECK(OK(rc), "clear-load bits wait：格式 %u %d %s", fmt, rc.code, e.why);
+        }
+        if (OK(rc)) {
+            const uint8_t *data = buf_cpu(read);
+            CHECK(!memcmp(data, data + bytes, bytes), "两条清除路径像素不等：格式 %u", fmt);
+            for (uint32_t k = 0; k < 16; k++)
+                CHECK(!memcmp(data + k * bpp, cases[i].expected, bpp), "清除值不等：格式 %u 像素 %u", fmt, k);
+        }
+        nvn_gpu_view_release(vb);
+        nvn_gpu_tex_release(a); nvn_gpu_tex_release(b);
+        nvn_gpu_buf_release(read, NULL, NULL);
+    }
+}
+
 // C27b：视图覆盖格式的 clear 明确不支持（Vulkan 按 image 格式解释 clear 值）。
 static void t22_clear_view_fmt(void) {
     // 带存储用途：自由可改格式（跨类原始位视图只在存储图上保留；普通颜色图走格式列表保 UBWC，见 t22b）
@@ -11367,6 +11433,9 @@ int main(int argc, char **argv) {
     t21_clear_int();
     nvn_gpu_err e5;
     CHECK(OK(nvn_gpu_close(5000000000ull, &e5)), "t21 close：%d %s", e5.rc.code, e5.why);
+    if (!open_backend()) return 1;
+    t21b_clear_load_bits();
+    CHECK(OK(nvn_gpu_close(5000000000ull, &e5)), "t21b close：%d %s", e5.rc.code, e5.why);
     if (!open_backend()) return 1;
     t22_clear_view_fmt();
     t22b_ubwc_format_list();

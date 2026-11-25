@@ -155,6 +155,8 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     if (!g_cmd) return NULL;
+    // 资源同步是清除兑现边界。这里可能仍持资源锁，原视图由命令段保活。
+    if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd);
     if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
@@ -399,6 +401,7 @@ static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
     if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
+    if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd);
     submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
@@ -633,6 +636,23 @@ void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
 
+// 只跨逻辑目标与纯状态。所有新命令默认是兑现边界，报告、传输、同步、
+// 递归和跳转也不借尚未核明的顺序继续挂起。
+static int tex_clear_can_cross(uint32_t op) {
+    switch (op) {
+        case OP_SET_RT: case OP_SCISSOR: case OP_VIEWPORTS: case OP_DEPTH_RANGE:
+        case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
+        case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
+        case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG:
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_STENCIL: case OP_POLY_OFFSET:
+        case OP_BLEND_COLOR: case OP_RAST_DISCARD: case OP_PRIM_RESTART: case OP_SET_PATCH_SIZE:
+        case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_DRAW: case OP_DRAW_IDX: case OP_CLEAR_TEX:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
 void rp_exec_dump_ops(char *b, size_t n) {
@@ -735,8 +755,14 @@ static uint64_t exec_list(const uint8_t *p) {
     for (;;) {
         nvn_plat_safepoint();   // 一次提交可连续回放数秒：让平台的停世界事务在命令之间越过本线程（nvn_plat.h）
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (rec_bad(h)) { count_flush(&count_group, tm); nvn_unimpl("rec", "bad_record", p); break; }   // 按这条列表的 END 处理：走下面唯一的出口
+        if (rec_bad(h)) {
+            count_flush(&count_group, tm);
+            if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd);
+            nvn_unimpl("rec", "bad_record", p);
+            break;
+        }
         if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush(&count_group, tm);
+        if (rp_tex_clear_active && !tex_clear_can_cross(h.op)) rp_pass_land_tex_clear(g_cmd);
         uint64_t t_cmd = tm ? now_ns() : 0;
         const void *a = p + 8;
         switch (h.op) {
@@ -768,15 +794,31 @@ static uint64_t exec_list(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(g_cmd); break; }   // 其余计数器的报告值本来就写 0，复位无事可做
             case OP_RENDER_COND: rc_cond(a); break;
-            case OP_DRAW: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_draw t; rp_draw_stream = p; count_feed(&count_group, draw_rec(a, h.size, &t), NULL, p, tm); rp_draw_stream = NULL; break; }
-            case OP_DRAW_IDX: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_draw_idx t; rp_draw_stream = p; count_feed(&count_group, NULL, draw_idx_rec(a, h.size, &t), p, tm); rp_draw_stream = NULL; break; }
+            case OP_DRAW: {
+                if (g_rc_skip) break;
+                if (!count_group.n) pass_split();
+                p_draw t; const p_draw *dr = draw_rec(a, h.size, &t);
+                if (rp_tex_clear_active && (dr->ind || dr->tfc)) rp_pass_land_tex_clear(g_cmd);
+                rp_draw_stream = p; count_feed(&count_group, dr, NULL, p, tm); rp_draw_stream = NULL;
+                break; }
+            case OP_DRAW_IDX: {
+                if (g_rc_skip) break;
+                if (!count_group.n) pass_split();
+                p_draw_idx t; const p_draw_idx *di = draw_idx_rec(a, h.size, &t);
+                if (rp_tex_clear_active && di->ind) rp_pass_land_tex_clear(g_cmd);
+                rp_draw_stream = p; count_feed(&count_group, NULL, di, p, tm); rp_draw_stream = NULL;
+                break; }
             case OP_MULTI_DRAW: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); rp_multi_draw(g_cmd, &m, p); break; }
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); rp_pass_barrier((uint32_t)bits); break; }
             case OP_COPY_T2B: rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
-            case OP_CLEAR_TEX: rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
+            case OP_CLEAR_TEX:
+                // 贴图清除只有在收通道、兑现旧附件待清后才能入表。表非空说明已做过这一步。
+                if (!rp_tex_clear_active) rp_pass_flush(g_cmd);
+                rp_op_clear_tex(g_cmd, a, p);
+                break;
             case OP_DRAW_TEX: { if (g_rc_skip) break; p_draw_tex t; if (h.size - 8 < sizeof t) { nvn_unimpl("rec", "draw_tex_short", p); break; } memcpy(&t, a, sizeof t); rp_op_draw_tex(g_cmd, &t, p); break; }   // 通道内画，不收通道
             case OP_COPY_B2T: rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
             case OP_COPY_T2T: rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标
