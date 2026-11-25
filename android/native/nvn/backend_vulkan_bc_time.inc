@@ -25,6 +25,7 @@ static uint64_t g_bc_time_start;
 static struct bc7_stat_bucket {
     uint64_t snapshots, rgba_bytes, bc_bytes, mode_blocks;
 } g_bc7_mode[NVK_BC7_MODES], g_bc7_image[4];
+static uint64_t g_bc7_partitions[8][64];
 
 static void bc_time_log_window(uint64_t now, int final) {
     if (!g_bc_time_start || (!final && now - g_bc_time_start < UINT64_C(5000000000))) return;
@@ -76,6 +77,16 @@ static void bc_time_log_window(uint64_t now, int final) {
     }
     memset(g_bc7_mode, 0, sizeof g_bc7_mode);
     memset(g_bc7_image, 0, sizeof g_bc7_image);
+    for (unsigned mode = 0; mode < 8; mode++) {
+        for (unsigned part = 0; part < 64; part++) {
+            const uint64_t blocks = g_bc7_partitions[mode][part];
+            if (!blocks) continue;
+            snprintf(line, sizeof line, "bc7-partition mode=%u partition=%u blocks=%llu",
+                     mode, part, (unsigned long long)blocks);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
+        }
+    }
+    memset(g_bc7_partitions, 0, sizeof g_bc7_partitions);
     memset(g_bc_time, 0, sizeof g_bc_time);
     g_bc_time_start = final ? 0 : now;
 }
@@ -88,7 +99,8 @@ static void bc7_stat_add(struct bc7_stat_bucket *b, uint64_t rgba_bytes, uint64_
 }
 
 // 按完整快照计上传次数；同一张图重传再计一次。字节是整图紧排大小，非实际分配量。
-static void bc7_stat_snapshot(const uint64_t modes[NVK_BC7_MODES], uint64_t rgba_bytes, uint64_t bc_bytes) {
+static void bc7_stat_snapshot(const uint64_t modes[NVK_BC7_MODES], const uint64_t partitions[8][64],
+                              uint64_t rgba_bytes, uint64_t bc_bytes) {
     unsigned mask = 0;
     pthread_mutex_lock(&g_bc_time_mu);
     const uint64_t now = now_ns();
@@ -98,6 +110,8 @@ static void bc7_stat_snapshot(const uint64_t modes[NVK_BC7_MODES], uint64_t rgba
         if (!modes[i]) continue;
         mask |= 1u << i;
         bc7_stat_add(&g_bc7_mode[i], rgba_bytes, bc_bytes, modes[i]);
+        if (i < 8) for (unsigned part = 0; part < 64; part++)
+            g_bc7_partitions[i][part] += partitions[i][part];
     }
     // 前三档为累积条件；其他档含任何 4/5/6 之外的块。
     if (mask == (1u << 6)) bc7_stat_add(&g_bc7_image[0], rgba_bytes, bc_bytes, 0);

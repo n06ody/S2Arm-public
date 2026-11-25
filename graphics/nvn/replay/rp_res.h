@@ -8,6 +8,7 @@
 
 // 贴图对象 → 后端贴图。首次使用时建；内容来自游戏内存的，在 c 这一段里上传 / 脏了重传。NULL = 取不到（已经 nvn_unimpl 记账）。线程：[提交]。
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
+void rp_tex_async_step(nvn_gpu_cmd c);
 // 拷贝端点必须保留源格式语义，调用方已结束通道。
 nvn_gpu_tex rp_tex_resolve_plain(const tex_t *t, nvn_gpu_cmd c);
 void rp_res_xfer_aborted(uint64_t sub);

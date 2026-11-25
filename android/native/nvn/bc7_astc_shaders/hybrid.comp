@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "bc7_decode.glsl"
+#include "hybrid_tables.glsl"
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source {
+    uvec4 blocks[];
+} src;
+layout(set = 0, binding = 1, std430) buffer Target {
+    uint needs_rgba;
+    uvec4 blocks[];
+} dst;
+layout(push_constant) uniform Params {
+    uint block_count;
+} params;
+
+const uint weight4[4] = uint[](0, 21, 43, 64);
+const uint weight16[16] = uint[](0, 4, 8, 12, 17, 21, 25, 29, 35, 39, 43, 47, 52, 56, 60, 64);
+const uint no_plane = 4u;
+
+struct Candidate {
+    uvec4 lo[2];
+    uvec4 hi[2];
+    uvec2 weights;
+    uint partition_code; // 低 10 位是 ASTC seed，高 16 位记录实际分区标签。单分区为 0。
+    uint plane;
+    bool opaque;
+};
+
+uint color_symbol(uint level, uint value) {
+    uint i = value >> 1u;
+    uint word = level == 48u ? q48[i] : (level == 40u ? q40[i] : q16[i]);
+    return (word >> (16u * (value & 1u))) & 65535u;
+}
+
+uvec4 endpoint(Candidate c, uvec4 value) {
+    uint level = c.partition_code == 0u ? 48u : (c.opaque ? 40u : 16u);
+    return uvec4(color_symbol(level, value.r), color_symbol(level, value.g),
+                 color_symbol(level, value.b), color_symbol(level, value.a));
+}
+
+uint subset(Candidate c, uint i) {
+    return (c.partition_code >> (10u + i)) & 1u;
+}
+
+uint weight_bits(Candidate c) {
+    return c.partition_code != 0u ? 2u : 4u;
+}
+
+uint texel_code(Candidate c, uint i) {
+    uint bits = weight_bits(c);
+    return bitfieldExtract(c.weights[(i * bits) >> 5u], int((i * bits) & 31u), int(bits));
+}
+
+void set_code(inout Candidate c, uint i, uint code) {
+    uint bits = weight_bits(c);
+    uint offset = i * bits;
+    c.weights[offset >> 5u] |= code << (offset & 31u);
+}
+
+bool passes(Candidate c, uvec4 samples[16]) {
+    uint sum = 0u;
+    for (uint i = 0u; i < 16u; ++i) {
+        uint part = subset(c, i);
+        uint code = texel_code(c, i);
+        uvec4 w = uvec4(c.partition_code != 0u ? weight4[code] :
+                        (c.plane == no_plane ? weight16[code] : weight4[code & 3u]));
+        if (c.plane != no_plane) w[c.plane] = weight4[code >> 2u];
+        uvec4 a = c.lo[part] >> 8u, b = c.hi[part] >> 8u;
+        if (c.partition_code != 0u && c.opaque) a.a = b.a = 255u;
+        uvec4 v = (257u * (a * (64u - w) + b * w) + 32u) >> 6u;
+        // 同时覆盖 UNORM8 截取与线性 LDR FP16 解码。后者最多损失 33 个 16 位码值。
+        ivec4 expected = ivec4(samples[i] * 257u);
+        uvec4 d8 = uvec4(abs(ivec4((v >> 8u) * 257u) - expected));
+        uvec4 d16 = uvec4(abs(ivec4(v) - expected)) + 33u;
+        uvec4 d = max(d8, d16);
+        if (any(greaterThan(d.rgb, uvec3(8u * 257u))) || d.a > 4u * 257u) return false;
+        sum += d.r * d.r + d.g * d.g + d.b * d.b;
+        if (samples[i].a == 0u || samples[i].a == 255u) {
+            if (v.a != samples[i].a * 257u) return false;
+        } else {
+            if (v.a < 257u || v.a > 254u * 257u) return false;
+            if ((samples[i].a >= 128u) ? v.a < 32801u : v.a >= 32768u) return false;
+        }
+    }
+    return sum <= 48u * (3u * 257u) * (3u * 257u);
+}
+
+void put(inout uvec4 bits, uint offset, uint width, uint value) {
+    uint word = offset >> 5u, shift = offset & 31u;
+    value &= (1u << width) - 1u;
+    bits[word] |= value << shift;
+    if (shift + width > 32u) bits[word + 1u] |= value >> (32u - shift);
+}
+
+uint rgb_sum(uvec4 ep) {
+    uvec3 rgb = ep.rgb >> 8u;
+    return rgb.r + rgb.g + rgb.b;
+}
+
+uvec4 encode(Candidate c) {
+    bool split = c.partition_code != 0u;
+    bool dual = c.plane != no_plane;
+    uint cem = split && c.opaque ? 8u : 12u;
+    uint parts = split ? 2u : 1u;
+    uint channels = cem == 8u ? 3u : 4u;
+    uint mode = split ? 0x042u : (dual ? 0x442u : 0x242u);
+    uvec4 bits = uvec4(mode, 0u, 0u, 0u);
+    if (split) {
+        put(bits, 11u, 2u, 1u);
+        put(bits, 13u, 10u, c.partition_code);
+        put(bits, 25u, 4u, cem);
+    } else {
+        put(bits, 13u, 4u, cem);
+        if (dual) put(bits, 62u, 2u, c.plane);
+    }
+
+    bool swapped[2] = bool[2](false, false);
+    uint symbols[16];
+    for (uint p = 0u; p < parts; ++p) {
+        uvec4 a = c.lo[p], b = c.hi[p];
+        // CEM8/CEM12 的蓝收缩由 RGB 和的次序决定。换端点时同步反转本分区的权重。
+        swapped[p] = rgb_sum(a) > rgb_sum(b);
+        for (uint j = 0u; j < channels; ++j) {
+            uint k = 2u * (p * channels + j);
+            symbols[k] = (swapped[p] ? b[j] : a[j]) & 255u;
+            symbols[k + 1u] = (swapped[p] ? a[j] : b[j]) & 255u;
+        }
+    }
+    uint offset = split ? 29u : 17u;
+    if (!split) {
+        const uint widths[5] = uint[](2, 2, 1, 2, 1);
+        const uint shifts[5] = uint[](0, 2, 4, 5, 7);
+        const uint powers[5] = uint[](1, 3, 9, 27, 81);
+        for (uint base = 0u; base < 8u; base += 5u) {
+            uint index = 0u;
+            for (uint j = 0u; j < 5u && base + j < 8u; ++j)
+                index += (symbols[base + j] >> 4u) * powers[j];
+            uint code = trits[index >> 2u] >> ((index & 3u) * 8u);
+            for (uint j = 0u; j < 5u && base + j < 8u; ++j) {
+                put(bits, offset, 4u, symbols[base + j]);
+                put(bits, offset + 4u, widths[j], code >> shifts[j]);
+                offset += 4u + widths[j];
+            }
+        }
+    } else if (c.opaque) {
+        const uint widths[3] = uint[](3, 2, 2);
+        const uint shifts[3] = uint[](0, 3, 5);
+        for (uint base = 0u; base < 12u; base += 3u) {
+            uint index = (symbols[base] >> 3u) + 5u * (symbols[base + 1u] >> 3u) +
+                         25u * (symbols[base + 2u] >> 3u);
+            uint code = quints[index >> 2u] >> ((index & 3u) * 8u);
+            for (uint j = 0u; j < 3u; ++j) {
+                put(bits, offset, 3u, symbols[base + j]);
+                put(bits, offset + 3u, widths[j], code >> shifts[j]);
+                offset += 3u + widths[j];
+            }
+        }
+    } else {
+        for (uint j = 0u; j < 16u; ++j) put(bits, offset + 4u * j, 4u, symbols[j]);
+    }
+
+    uint stride = weight_bits(c);
+    uint mask = (1u << stride) - 1u;
+    for (uint i = 0u; i < 16u; ++i) {
+        uint code = texel_code(c, i);
+        if (swapped[subset(c, i)]) code ^= mask;
+        put(bits, 128u - (i + 1u) * stride, stride, bitfieldReverse(code) >> (32u - stride));
+    }
+    return bits;
+}
+
+uint q4_code(uint w) {
+    return (3u * w + 32u) >> 6u;
+}
+
+uint q16_code(uint w) {
+    return (15u * w + 32u) >> 6u;
+}
+
+Candidate fit(uvec4 samples[16], uint partition_code, bool opaque) {
+    Candidate c;
+    c.partition_code = partition_code;
+    c.plane = no_plane;
+    c.opaque = opaque;
+    c.weights = uvec2(0);
+    for (uint p = 0u; p < (partition_code == 0u ? 1u : 2u); ++p) {
+        uvec4 min_color = uvec4(255u), max_color = uvec4(0);
+        for (uint i = 0u; i < 16u; ++i) {
+            if (p != subset(c, i)) continue;
+            min_color = min(min_color, samples[i]);
+            max_color = max(max_color, samples[i]);
+        }
+        uvec4 range = max_color - min_color;
+        uint axis = 0u;
+        for (uint j = 1u; j < 4u; ++j)
+            if (range[j] > range[axis]) axis = j;
+        uvec4 a = uvec4(255u), b = uvec4(0);
+        for (uint i = 0u; i < 16u; ++i) {
+            if (p != subset(c, i)) continue;
+            if (samples[i][axis] <= a[axis]) a = samples[i];
+            if (samples[i][axis] >= b[axis]) b = samples[i];
+        }
+        c.lo[p] = endpoint(c, a);
+        c.hi[p] = endpoint(c, b);
+        ivec4 origin = ivec4(c.lo[p] >> 8u);
+        ivec4 delta = ivec4(c.hi[p] >> 8u) - origin;
+        int length2 = max(1, delta.r * delta.r + delta.g * delta.g + delta.b * delta.b + delta.a * delta.a);
+        for (uint i = 0u; i < 16u; ++i) {
+            if (p != subset(c, i)) continue;
+            ivec4 rel = ivec4(samples[i]) - origin;
+            int projection = rel.r * delta.r + rel.g * delta.g + rel.b * delta.b + rel.a * delta.a;
+            uint w = uint((clamp(projection, 0, length2) * 64 + length2 / 2) / length2);
+            set_code(c, i, partition_code == 0u ? q16_code(w) : q4_code(w));
+        }
+    }
+    return c;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.block_count) return;
+    uvec4 block = src.blocks[index];
+    int mode = findLSB(block.x & 255u);
+    if (mode < 0) {
+        dst.blocks[index] = uvec4(0);
+        atomicOr(dst.needs_rgba, 1u);
+        return;
+    }
+
+    uvec4 samples[16];
+    bool opaque = true;
+    uint bc_part = uint(extract_bits(block, mode + 1, 6));
+    uint first = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap[bc_part * 2u] : axis_partitions[0];
+    uint second = (mode == 1 || mode == 3 || mode == 7) ? bc7_remap[bc_part * 2u + 1u] : axis_partitions[1];
+    uint bc_mask = uint(partition_table2[bc_part]);
+    bool exact = mode == 3 && ((first >> 10u) == bc_mask || (first >> 10u) == (bc_mask ^ 65535u));
+    bool direct = exact || mode == 5 || mode == 6;
+    Candidate c;
+    c.partition_code = exact ? first : 0u;
+    c.opaque = exact;
+    c.weights = uvec2(0);
+    c.plane = mode == 5 ? (uint(extract_bits(block, 6, 2)) + 3u) & 3u : no_plane;
+    bool first_in_part[2] = bool[2](true, true);
+    for (uint i = 0u; i < 16u; ++i) {
+        DecodedInterpolation d = decode_bc7(block, mode, int(i));
+        samples[i] = interpolate_endpoint(d);
+        opaque = opaque && samples[i].a == 255u;
+        if (!direct) continue;
+        uint p = subset(c, i);
+        if (first_in_part[p]) {
+            if (c.plane != no_plane) {
+                uint a = d.ep0.a, b = d.ep1.a;
+                d.ep0.a = d.ep0[c.plane];
+                d.ep1.a = d.ep1[c.plane];
+                d.ep0[c.plane] = a;
+                d.ep1[c.plane] = b;
+            }
+            c.lo[p] = endpoint(c, d.ep0);
+            c.hi[p] = endpoint(c, d.ep1);
+            first_in_part[p] = false;
+        }
+        uint w = mode == 6 ? q16_code(d.color_weight) : q4_code(d.color_weight);
+        if (mode == 5) w |= q4_code(d.alpha_weight) << 2u;
+        set_code(c, i, w);
+    }
+    if (direct && passes(c, samples)) {
+        dst.blocks[index] = encode(c);
+        return;
+    }
+
+    c = fit(samples, 0u, opaque);
+    if (!passes(c, samples)) {
+        c = fit(samples, first, opaque);
+        if (!passes(c, samples)) {
+            c = fit(samples, second, opaque);
+            if (!passes(c, samples)) {
+                dst.blocks[index] = uvec4(0);
+                atomicOr(dst.needs_rgba, 1u);
+                return;
+            }
+        }
+    }
+    dst.blocks[index] = encode(c);
+}

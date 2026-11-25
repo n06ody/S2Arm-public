@@ -14,7 +14,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 23, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 24, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
@@ -84,6 +84,8 @@ SIG(nvn_gpu_tex_bc1_snapshot, int (*)(nvn_gpu_cmd, nvn_gpu_tex, const void *, ui
 SIG(nvn_gpu_tex_bc1_unwrap, int (*)(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *));
 SIG(nvn_gpu_tex_bc7_snapshot, int (*)(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, uint64_t, int, nvn_gpu_tex *));
 SIG(nvn_gpu_tex_bc7_unwrap, int (*)(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *));
+SIG(nvn_gpu_bc7_step, int (*)(nvn_gpu_cmd));
+SIG(nvn_gpu_tex_bc7_take, nvn_gpu_tex (*)(nvn_gpu_tex));
 SIG(nvn_gpu_tex_release, void (*)(nvn_gpu_tex));
 SIG(nvn_gpu_view_create, nvn_gpu_rc (*)(nvn_gpu_tex, const view_t *, nvn_gpu_view *, nvn_gpu_err *));
 SIG(nvn_gpu_view_create_buf, nvn_gpu_rc (*)(nvn_gpu_buf, uint64_t, uint64_t, uint32_t, nvn_gpu_view *, nvn_gpu_err *));

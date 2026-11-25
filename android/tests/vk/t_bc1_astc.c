@@ -11,6 +11,7 @@
 #include "astcenc.h"
 #include "backend_vulkan_bc1_astc_spv.h"
 #include "backend_vulkan_bc7_astc_spv.h"
+#include "backend_vulkan_bc7_hybrid_spv.h"
 #include "bc7_astc_shaders/inspect.h"
 #include "nvn_deswizzle.h"
 #include <math.h>
@@ -195,9 +196,11 @@ static void transparent_fallback(void) {
 }
 
 #include "t_bc7_astc.inc"
+#include "t_bc7_hybrid.inc"
 
 int main(int argc, char **argv) {
-    const int bc7 = argc >= 2 && !strcmp(argv[1], "--bc7");
+    const int hybrid = argc >= 2 && !strcmp(argv[1], "--bc7-hybrid");
+    const int bc7 = hybrid || (argc >= 2 && !strcmp(argv[1], "--bc7"));
     if (argc > 2 + bc7) return 2;
     const char *shader_dir = argc == 2 + bc7 ? argv[1 + bc7] : NULL;
     char why[256];
@@ -223,6 +226,10 @@ int main(int argc, char **argv) {
         .blob = bc7 ? nvk_bc7_astc_spv : nvk_bc1_astc_spv,
         .bytes = bc7 ? sizeof nvk_bc7_astc_spv : sizeof nvk_bc1_astc_spv, .layout = &layout,
     };
+    if (hybrid) {
+        src.blob = nvk_bc7_hybrid_spv;
+        src.bytes = sizeof nvk_bc7_hybrid_spv;
+    }
     if (shader_dir) {
         shader = load_one_shader(shader_dir, "encode.comp", NVN_GPU_SH_CS, &layout);
     } else {
@@ -235,8 +242,11 @@ int main(int argc, char **argv) {
     if (!pipe) return 2;
 
     if (bc7) {
-        bc7_codec(pipe);
-        if (!shader_dir) bc7_storage();
+        if (hybrid) hybrid_codec(pipe);
+        else {
+            bc7_codec(pipe);
+            if (!shader_dir) bc7_storage();
+        }
         goto close;
     }
 
@@ -270,7 +280,7 @@ close:
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "BC1 ASTC fixture close: %s", err.why);
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "BC1 ASTC fixture device destroy");
-    if (bc7 && !shader_dir) {
+    if (bc7 && !hybrid && !shader_dir) {
         CHECK(bc7_only56.snapshots == 2 && bc7_only56.rgba_bytes == 320 && bc7_only56.bc_bytes == 96,
               "BC7 diagnosis must count compatible complete snapshots and logical bytes");
         CHECK(bc7_only456.snapshots == 3 && bc7_only456.rgba_bytes == 480 && bc7_only456.bc_bytes == 144,
