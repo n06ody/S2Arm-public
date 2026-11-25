@@ -495,14 +495,14 @@ static uint64_t pb_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC
 // 绘制前调（rp_draw 在 rp_pass_begin 之前）：把这一笔要求的像素区域交给下一步开通道；通道已经开着而这一笔超出当前区域，
 // 收通道并按并集重开（重开用 LOAD：上一遍只保存过它自己的区域，区域外内容本来就是原样；带清除负载的通道区域必是整张，走不到这里）。
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
-    if (P.open && P.sw_split) { rp_perf_add(RP_PERF_P_CUT_BAR, 1); rp_pass_end(c); }   // 通道里的着色器写之后游戏发过屏障：这一笔另开通道（见 rp_pass_barrier）
+    if (P.open && P.sw_split) { rp_perf_add(RP_PERF_P_CUT_BAR, 1); rp_pass_edge(c, "shader_write_barrier"); rp_pass_end(c); }   // 通道里的着色器写之后游戏发过屏障：这一笔另开通道（见 rp_pass_barrier）
     uint8_t wanted = 0;
     for (int i = 0; i < 8; i++) if (color_write_mask >> (4 * i) & 0xf) wanted |= (uint8_t)(1u << i);
     wanted = select_colors(wanted);
     // 后端没声明无附件通道时，全零且无深度仍须保留原目标，不能把原本可执行的片元副作用 / 查询变成跳过。
     // 部分槽被筛掉、有深度、或后端明确支持无附件通道时，才真的移除全部零掩码颜色槽。
     if (!wanted && !P.rt.depth && !noatt_ok()) wanted = select_colors(0xff);
-    if (P.open && P.colors != wanted) rp_pass_end(c);
+    if (P.open && P.colors != wanted) { rp_pass_edge(c, "color_mask"); rp_pass_end(c); }
     P.want_colors = wanted;
     P.area_want = 0;
     if (P.open && P.na_w && !P.na_from_rt) {   // 真无目标通道按视口定；零掩码留下的逻辑目标尺寸不能随视口扩大
@@ -711,7 +711,7 @@ int rp_pass_begin(nvn_gpu_cmd c) { return pass_begin_colors(c, P.want_colors, P.
 // 分层通道里没写层号的图元一律落第 0 层，结果相同，但只为写层号的程序付多层帧缓冲的代价。
 void rp_pass_want_layered(nvn_gpu_cmd c, int layered) {
     layered = layered != 0;
-    if (P.open && P.layered != layered) rp_pass_end(c);
+    if (P.open && P.layered != layered) { rp_pass_edge(c, "layers"); rp_pass_end(c); }
     P.want_layered = (uint8_t)layered;
 }
 
@@ -748,7 +748,7 @@ void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) {
         rp_perf_add(RP_PERF_P_CONT, 1);
         return;
     }
-    if (P.open) rp_perf_add(RP_PERF_P_CUT_RT, 1);
+    if (P.open) { rp_perf_add(RP_PERF_P_CUT_RT, 1); rp_pass_edge(c, "set_rt"); }
     rp_perf_add(RP_PERF_SETRT_N, 1);
     { struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0); uint64_t s0 = (uint64_t)ts0.tv_sec * 1000000000ull + (uint64_t)ts0.tv_nsec;
       // 开关开着（缺省）：只收当前通道，待折清除挂起（等下一个把它当附件的通道吃掉，见 park 段）；关着 = 旧行为：先落地再换目标
@@ -844,7 +844,7 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         pass_clear_rect(c, &cl);
         return;
     }
-    if (P.open) rp_perf_add(RP_PERF_P_CUT_CLEAR, 1);
+    if (P.open) { rp_perf_add(RP_PERF_P_CUT_CLEAR, 1); rp_pass_edge(c, "clear"); }
     if (P.open) rp_pass_end(c);   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
     park_put_color(c, i, cc->rgba);   // 挂起：下一个把这个槽当附件的通道载入时清成这个值
 }

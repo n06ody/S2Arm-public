@@ -278,9 +278,13 @@ static int gw_covers_page(const struct shadow *s, int mi, uint64_t k, size_t ps,
     *bytes = end - a;
     return gw_covers(s, mi, a - base, end - base);
 }
+// 弱链接[replay]：nvn_gpu_pass_edge_mirror
+void nvn_gpu_pass_edge_mirror(nvn_gpu_cmd c, unsigned ranges, uint64_t bytes) __attribute__((weak));
 // 把游戏内存的 [a, b)（池内偏移）传进镜像，绕开 GPU 写过、还没回写落地的那些段：
 // 那些字节镜像里的才是新的，游戏内存里是旧的（同步按页，一页里别的字节脏了不能连它一起盖回去）。
 static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct mirror *m, uint64_t a, uint64_t b) {   // direct 非空：直接写进镜像的 CPU 映射（见 rp_buf_resolve）
+    unsigned ranges = 0;
+    uint64_t bytes = 0;
     while (a < b) {
         uint64_t stop = b, skip_to = 0;   // 找起点落在 [a, b) 里最靠前的一段；a 本身在某段里就先跳过去
         int inside = 0;
@@ -289,9 +293,14 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        else {
+            nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+            ranges++;
+            bytes += stop - a;
+        }
         a = stop;
     }
+    if (nvn_gpu_pass_edge_mirror && ranges) nvn_gpu_pass_edge_mirror(xc, ranges, bytes);
 }
 
 // GPU 往池里写（计算着色器写存储缓冲）。提交线程登记这一段，返回登记号；段完成时 rp_buf_gpu_write_land 把结果拷回游戏内存、撤掉登记。
@@ -450,7 +459,10 @@ static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_
             for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
         uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
         if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
-        else { nvn_gpu_cmd xc = rp_xfer_cmd(&last); if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); }
+        else {
+            nvn_gpu_cmd xc = rp_xfer_cmd_mirror ? rp_xfer_cmd_mirror(&last) : rp_xfer_cmd(&last);
+            if (xc) sync_write(xc, NULL, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem);
+        }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }

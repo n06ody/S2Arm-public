@@ -174,4 +174,11 @@ elif ! echo "$rep" | grep -q '^case=3: '; then
 else
     echo "feedback whitelist negative: PASS ($(echo "$rep" | grep -c '^case=') 条白名单之外的冒险被判红，含案例 3)"
 fi
+if ! S2A_PASS_EDGE_FIXTURE=1 timeout 30 "$out/test" "$out/shaders" 0 0 1 1 > "$out/pass-edge.log" 2>&1 ||
+   grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/pass-edge.log"; then
+    cat "$out/pass-edge.log"
+    failed=1
+else
+    grep '^pass edge fixture failures=0$' "$out/pass-edge.log"
+fi
 exit "$failed"

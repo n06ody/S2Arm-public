@@ -66,6 +66,11 @@ typedef struct rp_pass_read { nvn_gpu_tex tex; nvn_gpu_pool_table pool; } rp_pas
 void rp_pass_land_reads(nvn_gpu_cmd c, const rp_pass_read *reads, int n);
 int rp_pass_parked(void);   // 现在挂着几条待折清除（绘制路径的快路门：0 = 不必为读路径收集贴图）
 void rp_pass_end(nvn_gpu_cmd c);
+// 弱链接[replay]：nvn_gpu_pass_edge_reason
+void nvn_gpu_pass_edge_reason(nvn_gpu_cmd c, const char *reason) __attribute__((weak));
+static inline void rp_pass_edge(nvn_gpu_cmd c, const char *reason) {
+    if (nvn_gpu_pass_edge_reason) nvn_gpu_pass_edge_reason(c, reason);
+}
 void rp_pass_flush(nvn_gpu_cmd c);    // 提交前 / 通道外操作前：落地待折清除并结束通道
 void rp_pass_reset(void);
 int rp_pass_is_open(void);
@@ -181,6 +186,8 @@ void rp_draw_log_arm(int lines);   // 接下来的 lines 笔绘制（含被跳�
 
 // 资源同步用的段（见 rp_exec.c）：通常是先于主段提交的前置段；同一资源本次提交里第二次同步时结束当前通道、回到主段。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub);
+// 弱链接[replay]：rp_xfer_cmd_mirror（隔离夹具可沿用普通传输入口）
+nvn_gpu_cmd rp_xfer_cmd_mirror(uint64_t *last_sub) __attribute__((weak));
 // 遮挡计数（rp_exec.c）：通道与绘制那边的接入点
 int rp_occl_want(void);                 // 开通道时：要不要声明遮挡计数
 void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);

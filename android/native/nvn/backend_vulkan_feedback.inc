@@ -247,6 +247,7 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     }
     if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
     if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
+    nvn_gpu_pass_edge_reason(c, copy ? "feedback_copy" : "feedback_layout");
     nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始（活动的遮挡查询在这里结束）
     if (cont_ok) occl_spare_reset(c, &cont);   // 通道外：新要的续段块整块重置（重置只能在通道外）
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)

@@ -654,6 +654,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkPresentTimesInfoGOOGLE pts = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi.pNext, 1, &pt };
     if (timing_id) pi.pNext = &pts;
     r = vkQueuePresentKHR(g.queue, &pi);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) pass_edge_presented();
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {

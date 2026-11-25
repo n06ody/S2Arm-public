@@ -152,14 +152,22 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 前提是「同步的内容对本次提交里每个使用点都成立」：回放发生在游戏提交之后，游戏对池内存的写在提交前已经做完，这个前提成立；
 // 例外是同一资源在本次提交里已经同步过又变了（命令流里按序的写、别的线程正在写下一帧）：那一次必须排在已录的绘制之后，
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
-nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
+static nvn_gpu_cmd xfer_cmd(uint64_t *last_sub, const char *reason) {
     if (!g_cmd) return NULL;
-    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; }
+    if (*last_sub == g_sub_serial) {
+        if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1);
+        rp_pass_edge(g_cmd, reason);
+        rp_pass_end(g_cmd);
+        rp_gpu_wr_gen++;
+        return g_cmd;
+    }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
-        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; } }
+        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_edge(g_cmd, "pre_unavailable"); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; } }
     return g_pre;
 }
+nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) { return xfer_cmd(last_sub, "texture_sync"); }
+nvn_gpu_cmd rp_xfer_cmd_mirror(uint64_t *last_sub) { return xfer_cmd(last_sub, "mirror_sync"); }
 
 static uint64_t g_ts_fallbacks;
 uint64_t rp_timestamp_fallback_take(void) { return __atomic_exchange_n(&g_ts_fallbacks, 0, __ATOMIC_RELAXED); }
@@ -265,6 +273,7 @@ static int g_pass_cuts;   // 这次提交里已在通道中途切过几次（pas
 static nvn_gpu_cmd occ_first_reset_cut(nvn_gpu_cmd c) {
     if (g_occ_seg || !g_sub || !c || c != g_cmd) return c;
     if (g_mid >= SUB_STEP - 4) { nvn_unimpl("occl", "first_reset_not_counted", NULL); return c; }
+    rp_pass_edge(c, "occlusion_reset");
     rp_pass_flush(c);
     seg_cut(1);
     return g_cmd;
@@ -377,6 +386,7 @@ static void pass_split(void) {
     if (!g_cmd || !g_sub || g_mid >= SUB_STEP - 4 || g_pass_cuts >= rp_split_pass_max || g_occ_used || g_occ_seg) return;
     int thr = nvn_plat_flag("nvk_split_pass", rp_split_pass_draws);
     if (thr <= 0 || rp_pass_draws() < thr || !rp_pass_split_ok()) return;
+    rp_pass_edge(g_cmd, "draw_limit");
     rp_pass_end(g_cmd);
     pf_add(RP_PERF_P_CUT_LONG, 1); g_pass_cuts++;
     { uint64_t nd = 0, ns = 0; rp_draw_stats(&nd, &ns); g_split_base = nd; }
@@ -411,6 +421,7 @@ uint64_t nvn_be_sub_commit(void) {
 }
 static uint64_t sub_commit_body(void) {
     struct sub *s = g_sub; g_sub = NULL;
+    rp_pass_edge(g_cmd, "submit");
     rp_pass_flush(g_cmd);   // 打开的通道与待折清除不跨提交
     if (!g_cmd) {   // 没有段（开段失败，或中途交段之后开新段失败）：副作用无处挂，按失败丢弃（不写假成功）
         if (s) sub_orphan(s);
