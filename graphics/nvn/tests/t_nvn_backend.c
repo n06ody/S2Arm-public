@@ -14,7 +14,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 22, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 23, "契约版本变了：同批更新本签名表");
 
 // 句柄：指针大小、两两不同
 _Static_assert(sizeof(nvn_gpu_buf) == sizeof(void *), "句柄应为指针");
@@ -41,8 +41,8 @@ enum { CAPS_OR = NVN_GPU_CAP_HOST_IMPORT | NVN_GPU_CAP_GPU_VA | NVN_GPU_CAP_TILE
        | NVN_GPU_CAP_DEPTH_CLIP_CTL | NVN_GPU_CAP_GEOMETRY | NVN_GPU_CAP_TESSELLATION | NVN_GPU_CAP_XFB | NVN_GPU_CAP_INDIRECT_COUNT | NVN_GPU_CAP_LINKED_PIPE
        | NVN_GPU_CAP_TEX_BC | NVN_GPU_CAP_TEX_ASTC | NVN_GPU_CAP_GPU_DURATION | NVN_GPU_CAP_GPU_TIME_HOST | NVN_GPU_CAP_SHOWN_TIME
        | NVN_GPU_CAP_DYN_DEPTH_STENCIL | NVN_GPU_CAP_DYN_RASTER | NVN_GPU_CAP_BLIT_SCALED | NVN_GPU_CAP_GPU_DESWIZZLE | NVN_GPU_CAP_BLIT_DEPTH_STENCIL
-       | NVN_GPU_CAP_NO_ATTACH_PASS | NVN_GPU_CAP_REPORT_TIMESTAMP | NVN_GPU_CAP_STORAGE_SRGB_ALIAS | NVN_GPU_CAP_DRAW_TEX | NVN_GPU_CAP_BC1_SNAPSHOT };
-_Static_assert(CAPS_OR == (1u << 26) - 1, "能力位应为连续且不重叠的 26 位");
+       | NVN_GPU_CAP_NO_ATTACH_PASS | NVN_GPU_CAP_REPORT_TIMESTAMP | NVN_GPU_CAP_STORAGE_SRGB_ALIAS | NVN_GPU_CAP_DRAW_TEX | NVN_GPU_CAP_BC1_SNAPSHOT | NVN_GPU_CAP_BC7_SNAPSHOT };
+_Static_assert(CAPS_OR == (1u << 27) - 1, "能力位应为连续且不重叠的 27 位");
 
 // 错误域（定稿 A7）：与安卓 native–NativeAOT 会话 ABI 不相交。会话 ABI 码值抄自 android/native/direct/s2a_direct.h
 //   enum s2a_direct_result（#868 头 642ec4574 / android/868-land-1029@ac3d6ec23，DirectAbi.cs 同值）：OK 0、PENDING +1、ARGUMENT -1 … INTERNAL -9。
@@ -82,6 +82,8 @@ SIG(nvn_gpu_tex_create, nvn_gpu_rc (*)(const nvn_gpu_tex_desc *, nvn_gpu_tex *, 
 SIG(nvn_gpu_tex_info_get, void (*)(nvn_gpu_tex, nvn_gpu_tex_info *));
 SIG(nvn_gpu_tex_bc1_snapshot, int (*)(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, uint64_t, nvn_gpu_tex *));
 SIG(nvn_gpu_tex_bc1_unwrap, int (*)(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *));
+SIG(nvn_gpu_tex_bc7_snapshot, int (*)(nvn_gpu_cmd, nvn_gpu_tex, const void *, uint64_t, uint64_t, int, nvn_gpu_tex *));
+SIG(nvn_gpu_tex_bc7_unwrap, int (*)(nvn_gpu_cmd, nvn_gpu_tex, nvn_gpu_tex *));
 SIG(nvn_gpu_tex_release, void (*)(nvn_gpu_tex));
 SIG(nvn_gpu_view_create, nvn_gpu_rc (*)(nvn_gpu_tex, const view_t *, nvn_gpu_view *, nvn_gpu_err *));
 SIG(nvn_gpu_view_create_buf, nvn_gpu_rc (*)(nvn_gpu_buf, uint64_t, uint64_t, uint32_t, nvn_gpu_view *, nvn_gpu_err *));
@@ -157,6 +159,6 @@ int main(void) {
     nvn_gpu_pass_desc ps = {.ncolor = 1, .w = 1280, .h = 720, .layers = 1};
     ps.color[0].load = NVN_GPU_LOAD_CLEAR; ps.color[0].store = NVN_GPU_STORE_STORE;
     int ok = pd.st[0].spec[0].id == 1000 && b.u.va == 0x1000 && ts.u.ts.view == (nvn_gpu_view)(uintptr_t)0x10 && ts.u.ts.samp == (nvn_gpu_samp)(uintptr_t)0x20 && le.binding == 5 && !nvn_gpu_ok(rc) && rc.code == -1007 && ps.color[0].load == NVN_GPU_LOAD_CLEAR && sizeof(nvn_gpu_dyn) > 0;
-    printf("nvn_backend.h 契约 v%d：签名 %d 项、句柄 8 类、能力位 26 位、错误码 14 个（区间 [-1099,-1000]，与会话 ABI [-9,1] 不相交），编译期全部钉住；运行期填表 %s\n", NVN_GPU_CONTRACT_VERSION, N_SIG, ok ? "通过" : "失败");
+    printf("nvn_backend.h 契约 v%d：签名 %d 项、句柄 8 类、能力位 27 位、错误码 14 个（区间 [-1099,-1000]，与会话 ABI [-9,1] 不相交），编译期全部钉住；运行期填表 %s\n", NVN_GPU_CONTRACT_VERSION, N_SIG, ok ? "通过" : "失败");
     return ok ? 0 : 1;
 }

@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 22   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 23   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -115,6 +115,7 @@ enum {
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
+    NVN_GPU_CAP_BC7_SNAPSHOT      = 1u << 26,  // v23：可接收完整 BC7 UNORM 快照，选择存储或统计模式
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -214,6 +215,7 @@ enum {   // 用途创建时给全（Vulkan 的 usage 与可变格式事后补不
     NVN_GPU_TEX_CPU_UPLOAD = 1u << 5, // 内容来自游戏内存，会经 nvn_gpu_tex_upload* 更新
     NVN_GPU_TEX_TRANSIENT = 1u << 6,  // 只活在一个通道里（memoryless / LAZILY_ALLOCATED）
     NVN_GPU_TEX_BC1_OPAQUE = 1u << 7, // 初始完整压缩快照已证无透明索引，允许宿主选 ASTC 存储。
+    NVN_GPU_TEX_BC7_VALIDATED = 1u << 8, // 完整 BC7 UNORM 快照通过模式与 alpha 准入。
 };
 typedef struct {
     nvn_texdesc d;             // NVN 描述原样
@@ -234,6 +236,10 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, ui
 // 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
 // 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
+// 同上，BC7 UNORM。allow_astc=0 仅记录快照统计，保留普通存储。
+int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size,
+                            uint64_t serial, int allow_astc, nvn_gpu_tex *replacement);
+int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
 
 void nvn_gpu_tex_release(nvn_gpu_tex t);
 // 视图：v 为 NVN 视图记录原样，NULL = 默认视图。视图让贴图存储活到视图 release。线程：[任意]。出错：格式不兼容或缺 VIEW_FMT → NVN_GPU_E_ARG。
