@@ -453,7 +453,7 @@ struct nvn_gpu_vk {
     _Atomic uint64_t bc7_present;
     _Atomic(nvn_gpu_tex) bc7_promotable;
     uint64_t bc7_last_step;
-    nvn_gpu_buf bc7_input, bc7_output;
+    nvn_gpu_buf bc7_input, bc7_output, bc7_tables;
     VkDescriptorPool bc7_pool;
     VkDescriptorSet bc7_set;
     struct bc7_job {

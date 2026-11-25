@@ -76,7 +76,10 @@ static int bc7_scratch(void) {
         return 0;
     if (!g.bc7_output && !rc_is(buf_create_impl(bytes + 16, NVN_GPU_MEM_SHARED, NULL, 1, &g.bc7_output, &err), NVN_GPU_OK))
         return 0;
-    const VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    if (!g.bc7_tables && !rc_is(buf_create_impl(sizeof nvk_bc7_hybrid_tables, NVN_GPU_MEM_SHARED,
+                                               nvk_bc7_hybrid_tables, 1, &g.bc7_tables, &err), NVN_GPU_OK))
+        return 0;
+    const VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
     const VkDescriptorPoolCreateInfo pool = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &size,
@@ -94,15 +97,16 @@ static int bc7_scratch(void) {
     }
     const VkDescriptorBufferInfo buffers[] = {
         {g.bc7_input->buffer, 0, bytes}, {g.bc7_output->buffer, 0, bytes + 16},
+        {g.bc7_tables->buffer, 0, sizeof nvk_bc7_hybrid_tables},
     };
-    VkWriteDescriptorSet writes[2] = {0};
-    for (uint32_t i = 0; i < 2; i++) {
+    VkWriteDescriptorSet writes[3] = {0};
+    for (uint32_t i = 0; i < 3; i++) {
         writes[i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g.bc7_set, .dstBinding = i,
             .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &buffers[i],
         };
     }
-    vkUpdateDescriptorSets(g.d, 2, writes, 0, NULL);
+    vkUpdateDescriptorSets(g.d, 3, writes, 0, NULL);
     return 1;
 }
 

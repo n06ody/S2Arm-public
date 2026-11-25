@@ -103,11 +103,12 @@ static void hybrid_codec(nvn_gpu_pipe pipe) {
                         WIDTH, HEIGHT, expected, WIDTH * 4) == 0, "BC7 hybrid reference decode");
     nvn_gpu_buf in = make_buf(sizeof bc7_source, NVN_GPU_MEM_SHARED, bc7_source);
     nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
-    if (in && out) {
+    nvn_gpu_buf tables = make_buf(sizeof nvk_bc7_hybrid_tables, NVN_GPU_MEM_SHARED, nvk_bc7_hybrid_tables);
+    if (in && out && tables) {
         memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-        if (encode(pipe, 16, sizeof bc7_source, in, out, 1)) {
+        if (encode(pipe, 16, sizeof bc7_source, in, out, tables, 1)) {
             CHECK(*(const uint32_t *)buf_cpu(out) == 0, "BC7 hybrid known fits must leave fallback clear");
-            if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, 2)) {
+            if (encode(pipe, BLOCKS, sizeof bc7_source, in, out, tables, 2)) {
                 const uint8_t *data = buf_cpu(out);
                 CHECK(*(const uint32_t *)data == 1, "BC7 hybrid rejected blocks must mark the entire image");
                 hybrid_compare(data + 16);
@@ -116,6 +117,7 @@ static void hybrid_codec(nvn_gpu_pipe pipe) {
     }
     if (out) nvn_gpu_buf_release(out, NULL, NULL);
     if (in) nvn_gpu_buf_release(in, NULL, NULL);
+    if (tables) nvn_gpu_buf_release(tables, NULL, NULL);
 #ifdef S2A_BC7_ASYNC_TEST
     extern int nvn_vk_test_bc7_completion(int, unsigned, int);
     CHECK(nvn_vk_test_bc7_completion(1, 0, 0) == 1, "BC7 hybrid natural completion must unlock ready storage");

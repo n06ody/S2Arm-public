@@ -123,14 +123,16 @@ static void sample_comparison(const uint8_t *astc, enum astcenc_profile profile)
     astcenc_context_free(ctx);
 }
 
-static int encode(nvn_gpu_pipe pipe, unsigned nblocks, size_t source_bytes, nvn_gpu_buf in, nvn_gpu_buf out, uint64_t serial) {
+static int encode(nvn_gpu_pipe pipe, unsigned nblocks, size_t source_bytes, nvn_gpu_buf in, nvn_gpu_buf out,
+                  nvn_gpu_buf tables, uint64_t serial) {
     nvn_gpu_cmd cmd = begin_cmd();
-    nvn_gpu_binding b[2] = {
+    nvn_gpu_binding b[] = {
         {.ent = 0, .cls = NVN_GPU_RES_SSBO, .u.b = {in, 0, source_bytes}},
         {.ent = 1, .cls = NVN_GPU_RES_SSBO, .u.b = {out, 0, (BLOCKS + 1) * 16}},
+        {.ent = 2, .cls = NVN_GPU_RES_SSBO, .u.b = {tables, 0, sizeof nvk_bc7_hybrid_tables}},
     };
     nvn_gpu_set_pipe(cmd, pipe);
-    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, b, 2);
+    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, b, tables ? 3u : 2u);
     nvn_gpu_push(cmd, NVN_GPU_SH_CS, 0, &nblocks, sizeof nblocks);
     nvn_gpu_dispatch(cmd, pipe, (nblocks + 63) / 64, 1, 1, NULL, 0);
     nvn_gpu_err e = {0};
@@ -227,8 +229,9 @@ int main(int argc, char **argv) {
     const nvn_gpu_layout_ent entries[] = {
         {.binding = 0, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_R, .count = 1, .stages = cs},
         {.binding = 1, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_RW, .count = 1, .stages = cs},
+        {.binding = 2, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_R, .count = 1, .stages = cs},
     };
-    const nvn_gpu_layout layout = {.ent = entries, .nent = 2, .push_bytes = 4};
+    const nvn_gpu_layout layout = {.ent = entries, .nent = hybrid ? 3u : 2u, .push_bytes = 4};
     nvn_gpu_err pipe_err = {0};
     nvn_gpu_shader shader = NULL;
     nvn_gpu_shader_src src = {
@@ -261,7 +264,7 @@ int main(int argc, char **argv) {
         if (!in || !out) return 2;
         fixture_wait_ns = 20000000ull;
         nvn_gpu_vk_test_delay_segment(1, 500);
-        encode(pipe, 1, sizeof source, in, out, 1);
+        encode(pipe, 1, sizeof source, in, out, NULL, 1);
         nvn_gpu_buf_release(out, NULL, NULL);
         nvn_gpu_buf_release(in, NULL, NULL);
         goto close;
@@ -283,7 +286,7 @@ int main(int argc, char **argv) {
     nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
     if (!in || !out) return 2;
     memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-    if (!encode(pipe, BLOCKS, sizeof source, in, out, 1)) return 2;
+    if (!encode(pipe, BLOCKS, sizeof source, in, out, NULL, 1)) return 2;
     const uint8_t *data = buf_cpu(out);
     CHECK(*(const uint32_t *)data == 0, "Opaque aggregate must allow ASTC publication");
     sample_comparison(data + 16, ASTCENC_PRF_LDR);
@@ -294,7 +297,7 @@ int main(int argc, char **argv) {
     words[2 * BLOCKS - 2] = 0xf80007e0u;
     words[2 * BLOCKS - 1] = 0xc0000000u;
     memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-    if (!encode(pipe, BLOCKS, sizeof source, in, out, 2)) return 2;
+    if (!encode(pipe, BLOCKS, sizeof source, in, out, NULL, 2)) return 2;
     CHECK(*(const uint32_t *)data == 1, "BC1 transparent block must mark the texture for RGBA8");
 
     transparent_fallback();
