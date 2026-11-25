@@ -161,6 +161,10 @@ static int log_arm(struct shadow *s, struct mirror *m) {
 }
 // 日志不可用且重建不了：这份镜像改走逐页路径（synced 一直按同步时刻记着，逐页路径接得上；checked 没维护，关掉它的快路一次）
 static void log_drop(struct mirror *m) { free(m->stale); free(m->stale_sum); m->stale = m->stale_sum = NULL; m->path = MP_PLAIN; m->seen_ok = 0; }
+// 弱链接[replay]：nvn_vk_cold_mirror_track
+// 弱链接[replay]：nvn_vk_cold_mirror_host_write
+void nvn_vk_cold_mirror_track(nvn_gpu_buf) __attribute__((weak));
+void nvn_vk_cold_mirror_host_write(nvn_gpu_buf, uint64_t, uint64_t) __attribute__((weak));
 static int mirror_make(struct shadow *s, int i) {
     struct mirror *m = &s->m[i];
     nvn_gpu_buf b = NULL; nvn_gpu_err err = {0};
@@ -176,6 +180,7 @@ static int mirror_make(struct shadow *s, int i) {
             nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", t); }
         return 0; }
     m->buf = b;
+    if (nvn_vk_cold_mirror_track) nvn_vk_cold_mirror_track(b);
     rp_perf_add(RP_PERF_MIRROR_N, 1);
     m->synced = calloc(s->npages ? s->npages : 1, sizeof *m->synced);
     m->sub = calloc(s->npages ? s->npages : 1, sizeof *m->sub);
@@ -288,9 +293,11 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
             if (g0 <= a && a < g1) { inside = 1; if (g1 > skip_to) skip_to = g1; }
             else if (g0 > a && g0 < stop) stop = g0; }
         if (inside) { a = skip_to; continue; }
+        const uint64_t begin = a;
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
         else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
         a = stop;
+        if (direct && nvn_vk_cold_mirror_host_write) nvn_vk_cold_mirror_host_write(m->buf, begin, stop - begin);
     }
 }
 

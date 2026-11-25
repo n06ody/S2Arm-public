@@ -32,6 +32,8 @@
 #include <time.h>
 
 #include "nvn_backend.h"
+#include "nvn_vk_cold_guard.h"
+#include "nvn_refl.h"
 #include "../../../graphics/nvn/gfx/tex/nvn_deswizzle.h"
 #include "backend_vulkan_deswizzle_spv.h"
 #include "nvn_unimpl.h"
@@ -85,6 +87,8 @@ static const char *const stat_names[STAT_N] = {
 };
 
 struct nvn_gpu_buf_s {
+    struct cold_ledger *cold_ledger;
+    uint64_t cold_generation;
     uint64_t access_id;   // 供共用层认存储生命周期，不以可复用的指针充当身份
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -398,6 +402,20 @@ struct nvn_gpu_cmd_s {
     VkQueryPool q_active_pool; uint32_t q_active_idx;
     VkQueryPool *qchunk; uint32_t qnchunk, qchunk_cap;   // 续段块表（按需增长）
     uint32_t *q_owner, qspare_used, qspare_cap, q_run_start;   // 续段槽归属表（按需增长）
+    struct {
+        nvn_gpu_pipe original, variant;
+        struct nvn_gpu_cold_domain domain;
+        nvn_gpu_draw_args draw;
+        nvn_gpu_slice result;
+        uint32_t prefix_value;
+        uint64_t source_generation;
+    } cold;
+    VkDescriptorPool cold_pool;
+    uint32_t cold_sets;
+    uint64_t cold_barriers;
+    struct cold_event *cold_events;
+    unsigned cold_nevents, cold_cap;
+    int cold_events_lost;
     struct nvn_gpu_cmd_s *live_next;
 };
 
@@ -420,6 +438,13 @@ struct nvn_gpu_vk {
     VkPhysicalDevice phys;
     VkQueue queue;
     nvn_gpu_caps caps;
+    VkPipeline cold_pipe;
+    VkPipelineLayout cold_layout;
+    VkDescriptorSetLayout cold_dsl;
+    int cold_enabled, cold_failed, cold_writes_lost;
+    uint64_t cold_epoch;
+    _Atomic uint64_t cold_attempts, cold_armed, cold_pairs;
+    _Atomic uint32_t cold_present_count;
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
     uint32_t report_bits;
     float report_period;
@@ -1429,6 +1454,7 @@ static void retire_one(struct nvn_gpu_vk *vk, struct nvn_gpu_buf_s *b) {
     b->buffer = VK_NULL_HANDLE;
     b->memory = VK_NULL_HANDLE;
     b->mapped = NULL;
+    free(b->cold_ledger);
     free(b);
     pthread_mutex_lock(&g_mu);
     vk->stats[STAT_RETIRED]++;
@@ -1804,6 +1830,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     prs_release(c, executed);   // 回收的整池组：先把反馈补丁写回正典再放回（要在下面销毁快照视图、归还表引用之前：补丁的正典内容引用着表里的视图）
     // 布局按段跟踪（c->lay）：段不执行时命令缓冲里什么都没跑，没有要回滚的；t->layout 只做诊断。
     detach_live(c);   // 已提交的 cmd 在 commit 时已摘下，这里兜底
+    if (c->cold_pool) vkDestroyDescriptorPool(g.d, c->cold_pool, NULL);
+    free(c->cold_events);
     // 放弃 / 提交前失败的段仍可能有 DQ 待录命令引用快照；先排空录制，再销毁。
     if (c->feedback && !executed) vk_dq_drain();
     while (c->feedback) { // 必须先销毁快照视图，再归还下面持有的图像引用
@@ -2349,6 +2377,9 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g.dev = dev;
     pipe_creation_open(dev);
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
+    // 0 = direct A, 1 = guarded A/B, 2 = guarded A/A overhead control.
+    const int cold_mode = nvn_plat_flag("nvk_cold_guard", 0);
+    g.cold_enabled = cold_mode == 1 || cold_mode == 2 ? cold_mode : 0;
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
@@ -2480,6 +2511,7 @@ static void wsi_close_locked(void);   // backend_vulkan_wsi.inc
 static void clr_close(void);          // backend_vulkan_clear.inc
 static void dtx_close(void);          // backend_vulkan_draw_tex.inc
 static void depth_blit_close(void);   // backend_vulkan_depth_blit.inc
+static void cold_guard_close(void);
 static void easu_close(void);   // backend_vulkan_easu.inc
 nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     if (!g_open) return rc(NVN_GPU_OK);
@@ -2549,6 +2581,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         if (b->mapped) vkUnmapMemory(g.d, b->memory);
         if (b->buffer) vkDestroyBuffer(g.d, b->buffer, NULL);
         if (b->memory) vkFreeMemory(g.d, b->memory, NULL);
+        free(b->cold_ledger);
         free(b);
         b = next;
     }
@@ -2558,6 +2591,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     dset_close();   // 在途段都完成了：增长池整池销毁（组随池一起没了；布局只在会话收尾销毁，下面销毁完管线之后才轮到它，所以回收表不用跟着布局摘表）
     prs_close();    // 整池组回收的空闲组：连池销毁
     easu_close();
+    cold_guard_close();
     struct nvn_gpu_pipe_s *p = g.pipes;
     g.pipes = NULL;
     free(g_pipe_ht); g_pipe_ht = NULL; g_pipe_ht_n = 0; g_pipe_cnt = 0;
@@ -2902,12 +2936,15 @@ static void full_barrier(struct nvn_gpu_cmd_s *c) {
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     c->xfer_dirty = 0;
+    if (g.cold_enabled) c->cold_barriers++;
 }
 
 
 static int buf_range(const struct nvn_gpu_buf_s *b, uint64_t off, uint64_t bytes) {
     return b && off <= b->bytes && bytes <= b->bytes - off;
 }
+
+#include "backend_vulkan_cold_ledger.inc"
 
 // ---- stg_chunk：暂存写按标准块切开
 // 池镜像同步（graphics/nvn/replay/rp_buf.c sync_write）在镜像正被显卡用着时，把游戏内存里的脏页一段一段交给 nvn_gpu_buf_write：
@@ -2959,6 +2996,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     }
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
+    cold_note_write(c, b, off, bytes, COLD_READ_TRANSFER, 1);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
     pthread_mutex_unlock(&g_mu);
@@ -2978,6 +3016,7 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     vkCmdFillBuffer(c->cb, b->buffer, off, bytes, value);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
+    cold_note_write(c, b, off, bytes, COLD_READ_TRANSFER, 1);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
     pthread_mutex_unlock(&g_mu);
@@ -2998,6 +3037,7 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
+    cold_note_write(c, d, doff, bytes, 0, 0);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
     pthread_mutex_unlock(&g_mu);
@@ -3026,6 +3066,8 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32
         while (i < n && k < RUN && v[i].src == s && v[i].dst == d) { r[k].srcOffset = v[i].soff; r[k].dstOffset = v[i].doff; r[k].size = v[i].bytes; k++; i++; }
         vkCmdCopyBuffer(c->cb, s->buffer, d->buffer, k, r);
         cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
+        if (g.cold_enabled) for (uint32_t j = 0; j < k; j++)
+            cold_note_write(c, d, r[j].dstOffset, r[j].size, 0, 0);
     }
     mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
@@ -3673,6 +3715,12 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
                 }
             }
         }
+        if (g.cold_enabled && !s->precompiled && s->stage == NVN_GPU_SH_FS) {
+            s2a_sha256 hash;
+            s2a_sha256_init(&hash);
+            s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
+            s2a_sha256_final(&hash, sh->spirv_digest);
+        }
         VkResult module_result = vkCreateShaderModule(g.d, &ci, NULL, &sh->mod);
         if (module_result == VK_SUCCESS && s->precompiled) {
             sh->precompiled = 1;
@@ -3695,6 +3743,14 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
     pthread_mutex_unlock(&g_mu);
     *out = sh;
     return rc(NVN_GPU_OK);
+}
+
+int nvn_vk_cold_guard_mode(void) { return g.cold_enabled; }
+
+int nvn_vk_cold_shader_digest(nvn_gpu_shader shader, uint8_t sha[32]) {
+    if (!g.cold_enabled || !shader || shader->stage != NVN_GPU_SH_FS || !shader->mod) return 0;
+    memcpy(sha, shader->spirv_digest, 32);
+    return 1;
 }
 
 void nvn_gpu_shader_release(nvn_gpu_shader sh) {
@@ -6550,6 +6606,9 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
             w_t0 = now; w_n = 0;
         }
     }
+    if (g.cold_enabled && dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count))
+        for (unsigned stage = 0; stage < NVN_GPU_SH_CS; stage++)
+            cold_track_shader_writes(c, p, stage, COLD_READ_GRAPHICS);
 }
 
 // 本段未实现的区域：一律粘滞 UNSUPPORTED / 返回 UNSUPPORTED，不空实现。
@@ -6585,6 +6644,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
         vkCmdDispatch(c->cb, x, y, z);
     }
     loss_note_program(c, p);
+    if (g.cold_enabled) cold_track_shader_writes(c, p, NVN_GPU_SH_CS, COLD_READ_COMPUTE);
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
 
@@ -7630,6 +7690,7 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
     cmd_ref(c, b, REF_BUF);
+    cold_note_write(c, b, off, image_bytes, 0, 0);
 }
 
 // 压缩图的偏移按块对齐；尺寸若不足一块，只允许落在对应 mip 的边缘。
@@ -7795,6 +7856,7 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     free(rg);
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
+    cold_note_write(c, b, off, (bh - 1) * row_bytes + packed_row, 0, 0);
 }
 
 // 第一次上传时建压缩影子缓冲（大小按 bc_shadow_layout 的总长）。失败置粘滞。
@@ -8204,6 +8266,7 @@ void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
     full_barrier(c);
 }
 
+#include "backend_vulkan_cold_guard.inc"
 #include "backend_vulkan_depth_blit.inc"
 #include "backend_vulkan_easu.inc"
 
@@ -8608,6 +8671,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 s->submitted = 1;
                 s->executed = 1;
                 publish_signal(signal, 0);
+                if (g.cold_enabled) cold_commit_writes(c);
                 enqueue_segment(&g, s);   // 此后 cmd 归 worker（finish_cmd 负责摘链）
                 pthread_mutex_unlock(&g_submit_mu);
                 return rc(NVN_GPU_OK);

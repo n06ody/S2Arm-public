@@ -131,6 +131,46 @@ static int demand_events_safe(const enum demand_event *events, size_t count) {
     return active == 0;
 }
 
+static int wait_cold(const nvn_gpu_pipe_desc *desc, const uint8_t id[32], const uint8_t shader[32],
+                     nvn_gpu_pipe *out) {
+    for (uint64_t end = mono_ns() + 2000000000ull; mono_ns() < end;) {
+        int state = nvn_vk_pipe_demand_cold_kick(desc, id, shader, out);
+        if (state != NVK_DEMAND_PENDING) return state;
+        const struct timespec delay = {0, 1000000L};
+        nanosleep(&delay, NULL);
+    }
+    return NVK_DEMAND_PENDING;
+}
+
+static void check_cold_pair(void) {
+    static const struct rp_cold_proof variant = {
+        .fragment = (nvn_gpu_shader)(uintptr_t)0x62, .variant_sha = {0x71},
+    };
+    uint8_t id[32], stale[32];
+    set_ident(id, 0x63);
+    set_ident(stale, 0x72);
+    g_prog.sh[0] = (nvn_gpu_shader)(uintptr_t)0x60;
+    g_prog.sh[1] = (nvn_gpu_shader)(uintptr_t)0x61;
+    g_prog.cold = &variant;
+    nvn_gpu_pipe_desc a = {0};
+    a.st[0].sh = g_prog.sh[0];
+    a.st[1].sh = g_prog.sh[1];
+    a.prim = 4;
+    nvn_gpu_pipe_desc b = a;
+    b.st[1].sh = variant.fragment;
+    nvn_gpu_pipe orig = NULL, pruned = NULL, again = NULL;
+    CHECK(nvn_vk_pipe_demand_kick(&a, id, &orig) == NVK_DEMAND_PENDING, "original queues");
+    CHECK(nvn_vk_pipe_demand_wait(&a, id, 2000, &orig, NULL, 0) == 0 && orig, "original is ready");
+    CHECK(wait_cold(&b, id, variant.variant_sha, &pruned) == NVK_DEMAND_READY && pruned && pruned != orig,
+          "same program and PSO recipe preserve a disjoint cold handle");
+    CHECK(nvn_vk_pipe_demand_kick(&a, id, &again) == NVK_DEMAND_READY && again == orig,
+          "the pure A demand key still resolves after building B");
+    CHECK(nvn_gpu_pipe_lookup(&b, &again) && again == pruned, "worker compiled the exact variant shader");
+    b.prim = 3;
+    CHECK(wait_cold(&b, id, stale, &again) == NVK_DEMAND_FAILED && !again,
+          "a mismatched variant cannot produce a pipeline");
+}
+
 int main(void) {
     const enum demand_event safe_order[] = {DEMAND_WORKER_START, DEMAND_WORKER_EXIT, DEMAND_BACKEND_RELEASE};
     const enum demand_event release_while_active[] = {DEMAND_WORKER_START, DEMAND_BACKEND_RELEASE, DEMAND_WORKER_EXIT};
@@ -325,6 +365,7 @@ int main(void) {
     pthread_mutex_lock(&g_mu); g_fail_next = 0; pthread_mutex_unlock(&g_mu);
     CHECK(nvn_vk_pipe_demand_kick(&next, idNext, &cached) == NVK_DEMAND_PENDING, "restart after reap accepts new work");
     CHECK(nvn_vk_pipe_demand_wait(&next, idNext, 2000, &out, why, sizeof why) == 0 && out != NULL, "restarted generation builds successfully");
+    check_cold_pair();
     nvn_vk_pipe_demand_stop();
     CHECK(nvn_vk_pipe_demand_quiescent(), "final stop leaves no joinable worker");
     CHECK(nvn_vk_pipe_demand_worker_count() == 0, "final stop leaves no active worker");
