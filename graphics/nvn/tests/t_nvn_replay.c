@@ -40,7 +40,7 @@ static int g_dl_unread, g_dl_lines;   // 逐笔日志（cls "draw"）：含「�
 static int g_mm_lines; static char g_mm_last[200];   // #1810：「贴图类型不符」行数与最近一行
 static char g_spill_line[300]; static const char *g_cs_note_stub;   // spill 派发日志行（回放层，cls "replay"）/ 后端给的「没走出库」原因替身
 const char *nvk_shader_cs_lib_note(const uint8_t key[8]) { (void)key; return g_cs_note_stub; }   // 弱符号的真实现在 nvk_shader.c；这里给回放核心用例一个可控替身
-static int origin_mode, origin_n;
+static int origin_mode, origin_n, sentinel_mode;
 static char origin_lines[64][512];
 #if defined(S2A_GPU_LAND_TEST) || defined(S2A_T2B_ORIGIN_TEST)
 static int origin_matches(const char *a, const char *b) {
@@ -73,6 +73,7 @@ static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产�
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_land_sentinel")) return sentinel_mode;
     if (!strcmp(name, "nvk_land_origin")) return origin_mode;
     if (!strcmp(name, "nvk_land_origin_frame")) return 57;
 
@@ -5204,6 +5205,50 @@ static void t_gpu_land_count_cleanup(void) {
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); g_pg_tracked = 1; g_buf_cpu_auto = 0; pass_fresh();
 }
 extern void rp_test_gw_merge_reload(void);
+#include "nvn_land_probe.h"
+static unsigned sentinel_pre, sentinel_post;
+static volatile uint32_t *sentinel_event;
+static uint64_t sentinel_pool, sentinel_write;
+void nvn_probe_before(const void *addr, size_t n, uint64_t pool, uint64_t write) {
+    if (!write) return; // pool teardown
+    CHECK(sentinel_event && *sentinel_event == 0);
+    CHECK(addr == g_pmem + 64 && n == 8 && g_pmem[64] == 0x11);
+    sentinel_pre++; sentinel_pool = pool; sentinel_write = write;
+}
+void nvn_probe_after(const void *addr, size_t n, uint64_t off, uint64_t pool, uint64_t write, int overlap, struct nvn_probe_source source) {
+    CHECK(sentinel_event && *sentinel_event == 0);
+    CHECK(addr == g_pmem + 64 && n == 8 && off == 64 && g_pmem[64] == 0xd6);
+    CHECK(!overlap && pool && pool == sentinel_pool && write && write == sentinel_write);
+    CHECK(source.submission && (origin_mode ? source.ops != 0 : source.ops == 0));
+    sentinel_post++;
+}
+uint64_t nvn_probe_drain(nvn_probe_emit emit) { (void)emit; return 0; }
+static void t_land_sentinel_order(void) {
+    for (int mode = 0; mode < 4; mode++) {
+        pass_fresh(); origin_mode = mode == 3; sentinel_mode = mode != 0;
+        volatile uint32_t event = 0; sentinel_event = &event;
+        sentinel_pre = sentinel_post = 0; g_buf_cpu_auto = 1;
+        memset(g_pmem, 0x11, sizeof g_pmem); nvn_be_pool_add(g_pmem, sizeof g_pmem);
+        uint64_t base = (uint64_t)(uintptr_t)g_pmem;
+        nvn_be_sub_begin();
+        nvn_gpu_buf buf;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, PG, &buf, NULL));
+        CHECK(rp_post_gpu_write(base + 64, 8));
+        memset(buf->cpu + 64, 0xd6, 8);
+        stream signals = {0};
+        uint8_t *arg = put(&signals, OP_SIGNAL_EVENT, 16);
+        uint32_t mode_store = 0, value = 13;
+        memcpy(arg, &sentinel_event, 8); memcpy(arg + 8, &mode_store, 4); memcpy(arg + 12, &value, 4);
+        end(&signals); nvn_be_exec(signals.b);
+        nvn_be_sub_commit();
+        fake_complete(mode == 2 ? NVN_GPU_DONE_FAILED : NVN_GPU_DONE_OK);
+        CHECK(event == (mode == 2 ? 0u : 13u));
+        CHECK(g_pmem[64] == (mode == 2 ? 0x11 : 0xd6));
+        CHECK(sentinel_pre == (mode == 1 || mode == 3) && sentinel_post == (mode == 1 || mode == 3));
+        nvn_be_pool_del(g_pmem); pass_fresh(); sentinel_event = NULL;
+    }
+    sentinel_mode = origin_mode = 0; g_buf_cpu_auto = 0;
+}
 static void t_land_origin(void) {
     for (int enabled = 0; enabled <= 1; enabled++) {
         pass_fresh();
@@ -8215,7 +8260,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-destroy")) { t_gpu_land_destroy(); printf("gpu land destroy: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land")) { t_gpu_land_concurrent(); printf("gpu land: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--land-origin")) {
-        t_land_origin(); t_land_origin_masks(); t_land_origin_producers();
+        t_land_origin(); t_land_origin_masks(); t_land_origin_producers(); t_land_sentinel_order();
         printf("land origin: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-merge")) { t_gpu_land_merge(); printf("gpu land merge: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
@@ -8272,7 +8317,7 @@ int main(int argc, char **argv) {
     t_land_noresync();
     t_gpu_land_count_cleanup();
     t_gpu_land_merge();
-    t_land_origin(); t_land_origin_masks(); t_land_origin_producers();
+    t_land_origin(); t_land_origin_masks(); t_land_origin_producers(); t_land_sentinel_order();
 #endif
     t_pool_gone_hold();
     t_buf_mirror();

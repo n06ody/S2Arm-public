@@ -21,7 +21,7 @@
 #include <string.h>
 
 struct write_origin { uint64_t n, bytes, selected; unsigned ops, stages, slots; };
-struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; struct write_origin origin; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
+struct gpu_write { uint64_t off, len, id; uint8_t mi, landing, probe_overlap; uint64_t sub; struct write_origin origin; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
 // use_sub / use_fence：最近一次用到这份镜像的提交（序号、栅栏值）；prev_fence：再往前一次用到它的提交的栅栏值——
@@ -103,8 +103,20 @@ static void mirror_free(struct mirror *m, int defer) {
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); memset(m, 0, sizeof *m);
 }
 #include "rp_land_origin.inc"
+// 弱链接[replay]：nvn_probe_before
+// 弱链接[replay]：nvn_probe_after
+// 弱链接[replay]：nvn_probe_drain
+#include "rp_land_sentinel.inc"
+
+void rp_land_origin_report(void) {
+    pthread_mutex_lock(&g_bmu);
+    origin_report_locked(0);
+    sentinel_report();
+    pthread_mutex_unlock(&g_bmu);
+}
 
 static void shadow_free(struct shadow *s, int defer) {
+    if (sentinel_enabled == 1 && s->origin_pool) nvn_probe_before(s->mem, s->size, s->origin_pool, 0);
     if (s->origin_pool) for (int i = 0; i < s->ngw; i++) origin_close(s, &s->gw[i], 0);
     if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE);
     if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
@@ -414,6 +426,7 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
         src = ok ? nvn_gpu_buf_cpu(s->m[s->gw[i].mi].buf) : NULL;
         mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
         rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
+        if (src && sentinel_on()) sentinel_start(s, &s->gw[i]);
         s->gw[i].landing = 1; found = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
@@ -428,6 +441,11 @@ void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {   // 线程
 #endif
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) {
+        if (src && sentinel_enabled == 1) {
+            const struct gpu_write *g = &s->gw[i];
+            struct nvn_probe_source from = {g->sub, g->origin.ops, g->origin.stages, g->origin.slots};
+            nvn_probe_after(mem + off, len, off, s->origin_pool, id, g->probe_overlap, from);
+        }
         if (s->origin_pool) origin_close(s, &s->gw[i], src != NULL);
         s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }
@@ -715,6 +733,7 @@ void rp_buf_reset(void) {
     if (g_null_storage) nvn_gpu_buf_release(g_null_storage, NULL, NULL);
     g_null_storage = NULL;
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
+    sentinel_report(); sentinel_enabled = -1;
     origin_report_locked(1);
     origin_enabled = origin_frame = -1;
     origin_frame_done = 0;

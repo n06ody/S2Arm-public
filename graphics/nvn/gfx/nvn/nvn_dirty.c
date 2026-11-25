@@ -3,6 +3,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "nvn_land_probe.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -64,6 +65,7 @@ typedef struct dirty_log {
     struct { _Atomic uint64_t seq; _Atomic uintptr_t a, b; } ev[];
 } dirty_log;
 typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live;
+                 _Atomic uint64_t probe_life;
                  _Atomic(dirty_log *) log;
                  _Atomic uint64_t last; } range_t;   // last: the largest write generation of any page in the range (CAS max next to every gen store): a range not written since a stamp answers without its page scan
 static inline void last_max(range_t *r, uint64_t g) { uint64_t c = atomic_load(&r->last); while (c < g && !atomic_compare_exchange_weak(&r->last, &c, g)) {} }   // async-signal-safe: atomics only
@@ -242,7 +244,9 @@ static _Atomic int g_hooks_on;
 static _Atomic int g_busy_red;
 // All guest fault handlers and graphics callbacks have been joined before this
 // entry. Old protections belong to the native window that is remapped next.
+static void probe_reset(void);
 void nvn_dirty_reset_session(void) {
+    probe_reset();
     pthread_mutex_lock(&g_slot_mu);
     table_write_begin();
     span_reset();
@@ -278,6 +282,16 @@ static int busy_wait(range_t *r, uintptr_t p) {
     return 1;
 }
 static int live_at(int i) { return atomic_load_explicit(&rg(i)->live, memory_order_acquire); }
+#include "nvn_land_probe.inc"
+static void probe_reset(void) {
+    (void)nvn_probe_drain(NULL);
+    pthread_mutex_lock(&g_slot_mu);
+    probe_dropped = probe_n = 0;
+    memset(rotations, 0, sizeof rotations);
+    memset(retry_table, 0, sizeof retry_table);
+    atomic_store(&probe_ever, 0);
+    pthread_mutex_unlock(&g_slot_mu);
+}
 // The registered range that holds all of [a, a+len) (used for a texture's tracking / protection / dirty check)
 static range_t *find_span_scan(uintptr_t a, size_t len) {
     int n = atomic_load(&g_nr);
@@ -365,9 +379,13 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
 static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
+        if (st >= PROBE_BASE) {
+            if (probe_release(r, k, st, NVN_PROBE_ALIAS, 0, NULL) >= 0) continue;
+            // Route failure through the ordinary rollback of already claimed pages.
+        }
         if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; }
         else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
-        else if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
+        else if (st >= PROBE_BASE || !busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
             for (uintptr_t j = first; j < k; j++) {
                 uint8_t js = atomic_load(&r->state[j]);
                 if (js == PG_BUSY) atomic_store(&r->state[j], PG_PROT);
@@ -407,7 +425,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = atomic_load(&r->state[p]);
         if (st == PG_NONE) return atomic_load(&r->gen[p]) != 0;   // already writable (another thread just unprotected it) -> re-execute; pages never protected are not ours
-        if (st == PG_PROT) {
+        if (st == PG_PROT || st >= PROBE_BASE) {
             if (!unprotect_chunk(r, p)) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
             if (count) atomic_fetch_add(count, 1);
             return 1;
@@ -416,11 +434,33 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     }
 }
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
-    if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+    const int probe = atomic_load(&probe_ever);
+    if (!is_write && !probe) return 0;
+    uintptr_t a = (uintptr_t)addr;
+    int ours = 0, n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || a < r->base || a >= r->end) continue;
+        uintptr_t k = (a - r->base) >> g_shift;
+        if (probe) {
+            if (!busy_wait(r, k)) return 0;
+            uint8_t st = atomic_load(&r->state[k]);
+            if (st >= PROBE_BASE) {
+                int done = probe_release(r, k, st, is_write ? NVN_PROBE_WRITE_FIRST : 0, a, uc);
+                if (done < 0) return 0;
+                if (!is_write && done) { probe_last_retry = 0; return 1; }
+                if (done && atomic_load(&r->state[k]) == PG_NONE) ours = 1;
+            }
+            if (!is_write) {
+                struct probe_retry *e = probe_retry_entry(a & ~(g_pg - 1), 0);
+                if (e && atomic_load(&e->life) == atomic_load(&r->probe_life)) {
+                    uint64_t version = atomic_load(&e->write);
+                    if (version && version != probe_last_retry) { probe_last_retry = version; return 1; }
+                }
+            }
+        }
+        if (is_write) ours |= release_page(r, k, &g_faults);
+    }
     return ours;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
@@ -484,6 +524,8 @@ int nvn_dirty_replace_range(const void *mem, size_t size) {
     int n = atomic_load(&g_nr);
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);
     if (!r) { table_write_end(); pthread_mutex_unlock(&g_slot_mu); return 0; }
+    probe_retire_range(r->base, r->end, 0, 0);
+    atomic_store(&r->probe_life, ++next_range_life);
     // 换底长度/对齐与登记时不同：旧的页状态数组按旧 end 分配，不能按旧 end 重加只读（会保护到新映射之外）。
     // 报红并走「删除 + 重新登记」，由 add_range 按新长度重新分配页状态（维护方审 11-04 第 8 条）。
     const uintptr_t nbase = (uintptr_t)mem & ~(g_pg - 1);
@@ -610,6 +652,8 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
             if (ol && base < other->end && other->base < end) atomic_store(&ol->bad, 1);
         }
     }
+    probe_retire_range(base, end, 0, 0);
+    atomic_store(&r->probe_life, ++next_range_life);
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; atomic_store(&r->last, 0);   // every gen is 0 here (calloc / memset above)
     atomic_store_explicit(&r->log, lg, memory_order_release);
     if (slot == n) atomic_store(&g_nr, n + 1);
@@ -624,7 +668,7 @@ void nvn_dirty_remove_range(const void *mem) {
     table_write_begin();
     range_t *r = NULL; int n = atomic_load(&g_nr), slot = -1;
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) { r = rg(i); slot = i; }   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); span_remove(r->base, (uint32_t)slot); }
+    if (r) { probe_retire_range(r->base, r->end, 0, 0); prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); span_remove(r->base, (uint32_t)slot); }
     table_write_end();
     pthread_mutex_unlock(&g_slot_mu);
 }
@@ -645,6 +689,12 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     for (uintptr_t i = fp; i <= lq + 1; i++) {
         uint8_t st = PG_NONE;
         int took = i <= lq && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+        if (!took && i <= lq && st >= PROBE_BASE) {
+            if (probe_release(r, i, st, NVN_PROBE_ALIAS, 0, NULL) >= 0) {
+                st = PG_NONE;
+                took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+            }
+        }
         if (took && !open) { run = i; open = 1; }
         if (!took && open) {
             // 只有整段成功才记 PG_PROT；失败则记未跟踪并置“跟踪不可靠”，让查询走保守路径。
@@ -735,7 +785,8 @@ int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void 
 int nvn_dirty_page_armed(const void *span, const void *addr) {
     range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a >= r->end || atomic_load(&g_track_unreliable)) return 0;
-    return atomic_load(&r->state[(a - r->base) >> g_shift]) == PG_PROT;
+    uint8_t st = atomic_load(&r->state[(a - r->base) >> g_shift]);
+    return st == PG_PROT; // 暂时禁止读取的样本不作为连续写保护的证据
 }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;

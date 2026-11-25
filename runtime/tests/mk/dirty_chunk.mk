@@ -5,4 +5,6 @@ native-test-dirty_chunk:   # 写跟踪分块保护：不需要 GPU / 游戏
 	@mkdir -p $(BUILD)/tests
 	$(CC) $(CFLAGS) -Iruntime/include -o $(BUILD)/tests/t_dirty_chunk graphics/nvn/tests/t_dirty_chunk.c graphics/nvn/gfx/nvn/nvn_dirty.c
 	$(BUILD)/tests/t_dirty_chunk
+	$(CC) $(CFLAGS) -DS2A_LAND_PROBE_TEST -Iruntime/include -o $(BUILD)/tests/t_land_probe graphics/nvn/tests/t_land_probe.c graphics/nvn/gfx/nvn/nvn_dirty.c -lpthread
+	$(BUILD)/tests/t_land_probe
 TEST_TARGETS += native-test-dirty_chunk

@@ -114,8 +114,3 @@ static void origin_report_locked(int final) {
         origin_frame_done = 1;
     }
 }
-void rp_land_origin_report(void) {
-    pthread_mutex_lock(&g_bmu);
-    origin_report_locked(0);
-    pthread_mutex_unlock(&g_bmu);
-}
