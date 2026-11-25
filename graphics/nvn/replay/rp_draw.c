@@ -230,7 +230,7 @@ static nvn_gpu_view sampled_view(const struct rp_prog *p, int lib_retry, int *un
     const int probe = p->lib_sourced && !lib_retry && dtt;
     if (probe) rp_decl_probe_begin();
     nvn_gpu_view v = ubo ? rp_view_by_ubo_handle_decl(id, dtt, dcls, c, t_out) : rp_view_by_id_decl(id, dtt, dcls, elem, c, t_out);
-    *unbridged = probe && rp_decl_probe_end();
+    *unbridged = probe ? rp_decl_probe_end() : 0;
     return v;
 }
 
@@ -1256,9 +1256,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 uint64_t paddr = ub->addr + e->src_off;
                 nvn_gpu_buf gb; uint64_t go;
                 if (!rp_buf_resolve(c, paddr, 8, &gb, &go)) return skip("uniform_buffer_unresolved", rec);
-                uint8_t *cpu = nvn_gpu_buf_cpu(gb);
-                if (!cpu) return skip("uniform_buffer_not_host_readable", rec);
-                uint64_t target = 0; memcpy(&target, cpu + go, 8);
+                uint64_t target;
+                if (!rp_buf_read_pointer(gb, go, paddr, &target)) return skip("uniform_buffer_not_host_readable", rec);
                 target = nvn_ga2ca(target);
                 if (!target) return skip("compute_storage_indirect_null", rec);
                 const uint8_t *pmem = NULL; uint64_t psz = 0;
@@ -1809,6 +1808,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             if (unb) {
                 const struct rp_prog *np = lib_fallback_graphics(g_prog, &lib_retry, prim, rt);
                 if (np) { g_prog = np; rp_pso_dirty = 1; goto draw_rebind; }
+                if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto draw_done; }
                 tv[st][i] = rp_view_by_ubo_handle_decl(tid, g_prog->dtt[st][i], g_prog->dcls[st][i], c, NULL);
             }   // 没登记的号绑零贴图（Ryujinx null 贴图），不跳整笔
             // 立即数采样器池下标（#1594 片 3）：号没登记 = Ryujinx 的空采样器，绑默认采样器、整笔照画（片 6，不拿别的已登记采样器顶替）；
@@ -1871,6 +1871,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
           if (unb) {
               const struct rp_prog *np = lib_fallback_graphics(g_prog, &lib_retry, prim, rt);
               if (np) { g_prog = np; rp_pso_dirty = 1; goto draw_rebind; }
+              if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto draw_done; }
               tv[st][i] = rp_view_by_id_decl(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, g_prog->dtt[st][i], g_prog->dcls[st][i], 0, c, tt);
           } }
         if (tt && tn < sizeof tl - 56) {
@@ -2366,6 +2367,7 @@ cs_rebind:
           if (unb) {
               const struct rp_prog *np = lib_fallback_compute(pg, &lib_retry);
               if (np) { pg = np; goto cs_rebind; }
+              if (unb == RP_DECL_NUMERIC_MISMATCH) { skip("sampled_numeric_fallback_failed", rec); goto done; }
               tv[i] = rp_view_by_id_decl(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, pg->dtt[0][i], pg->dcls[0][i], 0, c, NULL);
           } }
         if (cs_const) {

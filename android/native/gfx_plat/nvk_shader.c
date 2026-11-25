@@ -113,7 +113,7 @@ static int shader_compile_admit(void) {
     }
 }
 
-struct entry { struct rp_prog prog; int failed; int warm; int warm_hit; uint8_t nowindow_seed; uint8_t fact_ok; uint32_t fact_mask[4]; uint8_t res_ok; uint8_t res_key[32]; uint8_t seen; };   // res_key：这份程序的结果合并比对键（结果摘要 / 负载长度 / 阶段数 / c1 的 SHA-256，见 alias_key_hash；结果合并 #1355）；seen：rp_shader_reset 按「同一 entry 只释放一次」去重时的临时标记   // fact_*：结果字节里读出的「编译器实际读了哪些绑定事实」（nvk_shader_fact_cache.h），work_run 里算好，发布后由提交线程入表   // warm：预热带发布；warm_hit：已被真实 draw 采用过一次（验收计数口径）
+struct entry { struct rp_prog prog; int failed; int warm; int warm_hit; uint8_t nowindow_seed; uint8_t nowindow_reused; uint8_t numeric_checked; struct s2a_frag_outputs outputs; uint8_t outputs_unknown; uint8_t fact_ok; uint32_t fact_mask[4]; uint8_t res_ok; uint8_t res_key[32]; uint8_t seen; };   // res_key：这份程序的结果合并比对键（结果摘要 / 负载长度 / 阶段数 / c1 的 SHA-256，见 alias_key_hash；结果合并 #1355）；seen：rp_shader_reset 按「同一 entry 只释放一次」去重时的临时标记   // fact_*：结果字节里读出的「编译器实际读了哪些绑定事实」（nvk_shader_fact_cache.h），work_run 里算好，发布后由提交线程入表   // warm：预热带发布；warm_hit：已被真实 draw 采用过一次（验收计数口径）
 static nvn_hmap g_progs = {.klen = 32};   // 内容身份（SHA-256）→ struct entry *。结果合并后，同一份结果的多个身份指向同一个 entry（拥有者只有一个，见 rp_shader_reset）
 // 结果合并（#1355）：比对键（见 alias_key_hash：缓存文件头里的结果摘要 + 负载长度 + 阶段数 + c1）→ struct entry *（只借用；g_progs_mu 下读写；整表随 rp_shader_reset 清）。
 // 同一份编译结果的不同身份共用一个 entry（一份着色器句柄，管线缓存按句柄比，所以管线也合并）。缺省打开；debug.s2a.nvk_alias=0 关闭（只有调试包读，出包版恒走缺省）。
@@ -602,6 +602,8 @@ enum { IMGF_GIVEN = 0, IMGF_UNBOUND, IMGF_NO_TEXTURE, IMGF_NO_FACT };
 struct img_miss { uint8_t why; int32_t id; uint32_t handle, fmt, target, layers; };
 struct facts {
     struct s2a_compile_graphics_src gfx;
+    uint32_t color_writes; // channel masks of bound attachments only
+    int unused_unaligned_ssbo;  // 旧口径有非对齐绑定，槽证明后才清掉
     struct s2a_compile_texture_src tex[S2A_COMPILE_TEXTURE_MAX]; int ntex;
     char tfmt[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_FORMAT_MAX], tsmp[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_SAMPLER_MAX];
     uint32_t ubo_use[6];
@@ -735,12 +737,14 @@ static uint64_t ubo_fact_sig(int st) {
 }
 
 static int depth_clip_cap(void);
-static void gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any, int *un);
+static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any, int *un);
 static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
     memset(f, 0, sizeof *f);
     struct s2a_compile_graphics_src *g = &f->gfx;
     g->topology = topology(q->prim);
     g->rt_count = q->rt_count;
+    for (int i = 0; i < q->rt_count && i < 8; i++)
+        if (q->rt_format[i]) f->color_writes |= rp_S.chmask.mask & (15u << (4*i));
     g->has_alpha_test = 1; g->alpha_test_compare = alpha_op(rp_S.color.alpha_func);
     g->has_alpha_to_coverage = 1; g->alpha_to_coverage_enable = rp_S.ms.a2c ? 1 : 0; g->alpha_to_coverage_dither = rp_S.ms.a2c_dither ? 1 : 0;
     g->has_blend = 1;
@@ -757,7 +761,7 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
     // 参考值是绘制时的状态（OP_ALPHA_REF）。测试没开（函数是 ALWAYS）时固定给 0：不让同一个程序因为一个用不到的数拆成多份
     g->has_alpha_test_reference = 1; g->alpha_test_reference = rp_S.color.alpha_func >= 1 && rp_S.color.alpha_func <= 7 ? rp_S.alpha_ref : 0.0f;
     int any_ssbo = 0, unaligned = 0;
-    gfx_ssbo_align(q, pc, nst, 1, &any_ssbo, &unaligned);   // 非对齐只看这个程序真用到的槽（口径见 gfx_ssbo_align）；input_sig 读同一份答案
+    f->unused_unaligned_ssbo = gfx_ssbo_align(q, pc, nst, 1, &any_ssbo, &unaligned);   // 非对齐只看这个程序真用到的槽（口径见 gfx_ssbo_align）；input_sig 读同一份答案
     if (!any_ssbo || pc->storage_buffer_offset_alignment) { g->has_unaligned_ssbo = 1; g->unaligned_ssbo = unaligned; }
     for (int i = 0; i < 32; i++) g->attribute_types[i] = num_type(i < rp_S.nattr && i < 16 ? rp_S.attr[i].fmt : 0, 1);
     for (int i = 0; i < 8; i++) g->fragment_output_types[i] = i < q->rt_count && q->rt_format[i] ? num_type(q->rt_format[i], 0) : "Float";
@@ -1088,6 +1092,7 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     //   位置，驱动按规范拒建管线（Adreno：input v_locN not declared in output from previous stage）。这份不用库，调用方
     //   libpack_mark_bad 后走现编——同「状态 / 声明对得上才用预编库」。
     if (lib && nst >= 2) {
+        e->outputs_unknown = s2a_libpack_spv_frag_interface(fp.stage[1].spirv, fp.stage[1].spirv_bytes, &e->outputs) != 0;
         const struct fd_stage *pre = nst >= 3 && fp.stage[2].present ? &fp.stage[2] : &fp.stage[0];
         uint64_t miss = 0;
         if (!nvn_vk_spirv_link_ok(pre->spirv, pre->spirv_bytes, fp.stage[1].spirv, fp.stage[1].spirv_bytes, &miss)) {
@@ -1502,7 +1507,7 @@ static void lp_gate_probe(const struct work_snap *s) {
 //   用到的槽取自出包预编库里这个阶段键的 _b.json（s2a_libpack_stage_sbuf_slots）。任何一段说不准（库里没有这个键 / 读不出 / 有别的存储种类 /
 //   几何输入图元没有那一份 / 这一段的 SPIR-V 带 PhysicalStorageBufferAddresses 能力（按地址直接访问内存，不经槽）/ 库被关掉）就退回旧口径——不猜。
 //   只有真有非对齐绑定的阶段才查：这个阶段的绑定全对齐，它用哪些槽都不受影响。
-//   用到的槽是阶段键的函数（同键同槽集），哪些槽对齐则进了程序身份的事实位，所以「身份」仍然唯一决定「这一笔该用现编码还是库件」。
+//   槽集按阶段键取，归一后的非对齐位进编译身份。快路还记是否因槽证明清位，以区分旧种采用和真正对齐。
 //   只在旧口径说「有非对齐」时才查（其余情形答案本来就是「没有」）。开关 debug.s2a.nvk_lp_used_slots 缺省关（= 旧口径，玩家包就是这样）；
 //   调试包设 1 才走新口径。缺省开要等 Mali 9000 / 9400 整局零致命读数到齐（#2145 条件 (c)）。
 // 提交线程独占（同 g_comb_sig 的约定）：缓存不加锁；读库那一下在 g_lp_mu 下（和工作线程共用容器句柄）。
@@ -1570,7 +1575,8 @@ static int ssbo_used_slots_on(void) {
 }
 // any = 阶段 0..4 里有没有绑过存储缓冲；un = 这个程序的编译结果会不会受存储缓冲非对齐影响（口径见上）。
 // nst = 程序的图形阶段数（vs / vs+fs / vs+fs+gs），阶段号即 NVN 阶段号；count 非 0 时记读数（只有 fill_facts 记）。
-static void gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any_out, int *un_out) {
+// 返回 1 表示非对齐位因槽证明而清除，前台用它区分真正对齐的请求。
+static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any_out, int *un_out) {
     const uint32_t al = pc->storage_buffer_offset_alignment;
     int any = 0, un = 0; uint32_t um[5] = {0, 0, 0, 0, 0};   // um[阶段]：这个阶段上地址非 0 又不对齐的槽位集合
     for (int st = 0; st < 5; st++) for (int i = 0; i < 16; i++) if (rp_S.ssbo[st][i].addr) {
@@ -1578,6 +1584,7 @@ static void gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direc
         if (al && rp_S.ssbo[st][i].addr % al) { un = 1; um[st] |= 1u << i; }
     }
     *any_out = any;
+    const int was_unaligned = un;
     if (un && ssbo_used_slots_on()) {
         int used_unaligned = 0, unknown = 0, by_addr = 0;
         for (int st = 0; st < nst && st < 3 && !used_unaligned && !unknown; st++) {
@@ -1599,6 +1606,7 @@ static void gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direc
         }
     }
     *un_out = un;
+    return was_unaligned && !un;
 }
 // 读数一行（与「状态闸」同一节拍；没有一份「旧口径说有非对齐」的新程序就不打）：返回 0 = 没有读数。
 static uint64_t lp_ssbo_text(char *b, size_t bn) {
@@ -1907,6 +1915,82 @@ static int capture_warm_request(const struct work_snap *s, const char *json, siz
     return 0;
 }
 #endif
+static int lib_outputs_ok(const struct entry *e, const struct facts *f) {
+    if (e->outputs_unknown && f->color_writes) {
+        nvn_unimpl("shader", "lib_output_numeric_unproven", NULL);
+        return 0;
+    }
+    uint32_t written = f->color_writes & e->outputs.components;
+    for (unsigned location = 0; written; location++, written >>= 4) {
+        if (!(written & 15)) continue;
+        unsigned bit = 1u << location;
+        const char *declared = e->outputs.uint_locations & bit ? "Uint" :
+                               e->outputs.sint_locations & bit ? "Sint" : "Float";
+        const char *required = f->gfx.fragment_output_types[location];
+        if (!required || strcmp(declared, required)) {
+            nvn_unimpl("shader", "lib_output_numeric_mismatch", NULL);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Compare ordinary textures and texel buffers to the request, separately from descriptor arrays.
+static int lib_sampled_numeric_ok(struct entry *e, const struct facts *f) {
+    if (!e->prog.lib_sourced || e->numeric_checked) return 1;
+    const struct rp_prog *p = &e->prog;
+    for (int st = 0; st < RP_PROG_STAGES; st++) {
+        for (uint32_t i = 0; i < p->nent[st]; i++) {
+            const nvn_gpu_layout_ent *b = &p->ent[st][i];
+            if (b->count != 1) continue;
+            uint32_t word;
+            int bank = -1;
+            if (b->src_kind == NVN_RB_TEX || b->src_kind == NVN_RB_TBUF) {
+                if (b->src_reg < 40) word = 8 + 2 * b->src_reg;
+                else if (b->src_reg >= 128 && b->src_reg < 256) {
+                    bank = 2; word = 90 + 2 * (b->src_reg - 128);
+                } else goto unproven;
+            } else if (b->src_kind == NVN_RB_TEXU || b->src_kind == NVN_RB_TBUFU) {
+                if (b->src_reg2 >= p->nusrc) goto unproven;
+                const struct rp_uword *u = &p->usrc[b->src_reg2].tex;
+                if (u->pair || u->sid || u->off % 4) goto unproven;
+                bank = u->reg + 3; word = u->off / 4;
+            } else continue;
+            if (!p->dtt[st][i]) goto unproven;
+            const char *format = NULL;
+            for (int j = 0; j < f->ntex; j++) {
+                const struct s2a_compile_texture_src *t = &f->tex[j];
+                if (t->handle == word && t->cbuf_slot == bank && !strcmp(t->stage, ubo_st_name(st))) {
+                    if (format && strcmp(format, t->format)) goto unproven;
+                    format = t->format;
+                }
+            }
+            if (!format) goto unproven;
+            // 请求生成器的 Format 枚举与 TextureFormat.GetComponentType 同源。
+            // 显式 Unknown（如 BC）按普通编译的 FP32；缺少该槽的事实则不采用库件。
+            uint16_t index;
+            uint32_t nvn;
+            if (s2a_nvn_texture_format_index(format, &index) ||
+                s2a_nvn_texture_format_at(index, &nvn, NULL)) goto unproven;
+            nvn_fmt_info fi;
+            int cls = 0;
+            if (nvn != S2A_NVN_FORMAT_UNKNOWN) {
+                if (!nvn_fmt_info_of(nvn, &fi)) goto unproven;
+                cls = fi.kind == NVN_FMT_UINT ? 1 : fi.kind == NVN_FMT_SINT ? 2 : 0;
+            }
+            if (cls != (p->dcls[st][i] == 3 ? 0 : p->dcls[st][i])) {
+                nvn_unimpl("shader", "lib_sampled_numeric_mismatch", NULL);
+                return 0;
+            }
+        }
+    }
+    e->numeric_checked = 1;
+    return 1;
+unproven:
+    nvn_unimpl("shader", "lib_sampled_numeric_unproven", NULL);
+    return 0;
+}
+
 // [提交] 只吃快照：离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器。
 // 仅真实编译器拒收生成 failed entry；预算用尽和 Stop 不作永久失败缓存。
 static struct entry *work_run(const struct work_snap *s, const struct rp_shader_req *q, int *pending) {
@@ -1938,7 +2022,7 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         struct entry *le = build(bytes, len, s->views, s->nst, s->identity, 1);
         if (le) { le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
         free(bytes); bytes = NULL; len = 0;
-        if (le && !le->failed) { libpack_note_hit(); return le; }
+        if (le && !le->failed && lib_outputs_ok(le, &s->f) && lib_sampled_numeric_ok(le, &s->f)) { libpack_note_hit(); return le; }
         if (le) entry_free(le);
         libpack_mark_bad(s->identity, NULL);
     }
@@ -2290,13 +2374,15 @@ static uint64_t input_sig(const struct rp_shader_req *q, const struct s2a_direct
     #define MIX(v) do { h ^= (uint64_t)(v); h *= 1099511628211ull; } while (0)
     // 来源登记冲突会毒化短键并推进代际；命中快表前也必须失效。
     MIX(s2a_source_epoch());
-    MIX(stages); MIX(q->prim); MIX(q->rt_count); for (int i = 0; i < 8; i++) MIX(q->rt_format[i]);
+    MIX(stages); MIX(rp_S.chmask.mask); MIX(q->prim); MIX(q->rt_count); for (int i = 0; i < 8; i++) MIX(q->rt_format[i]);
     for (int st = 0; st < ((stages & 4u) ? 3 : 2); st++) { uint64_t k; memcpy(&k, stage_key((unsigned)st), 8); MIX(k); }
     MIX(rp_S.color.alpha_func); { uint32_t ar; float r = rp_S.color.alpha_func >= 1 && rp_S.color.alpha_func <= 7 ? rp_S.alpha_ref : 0.0f; memcpy(&ar, &r, 4); MIX(ar); }
     MIX(rp_S.ms.a2c ? 1 : 0); MIX(rp_S.ms.a2c_dither ? 1 : 0);
     { int dual = 0; for (int i = 0; i < 8; i++) if (src1(rp_S.blend[i].src_rgb) || src1(rp_S.blend[i].dst_rgb) || src1(rp_S.blend[i].src_a) || src1(rp_S.blend[i].dst_a)) dual = 1; MIX(dual); }
     MIX(rp_depth_zero()); MIX(rp_origin_lower_left()); MIX(pc->shader_draw_parameters);
-    { int any = 0, un = 0; gfx_ssbo_align(q, pc, stages == 7u ? 3 : stages == 3u ? 2 : 1, 0, &any, &un); MIX(any); MIX(un); MIX(pc->storage_buffer_offset_alignment); }   // 与 fill_facts 同一份答案（快路摘要不许和程序身份各算各的）
+    { int any = 0, un = 0;
+      const int unused = gfx_ssbo_align(q, pc, stages == 7u ? 3 : stages == 3u ? 2 : 1, 0, &any, &un);
+      MIX(any); MIX(un | (unused << 1)); MIX(pc->storage_buffer_offset_alignment); }   // 真对齐与未用槽放行可能选用不同程序
     MIX(rp_S.nattr); for (int i = 0; i < 16; i++) MIX(i < rp_S.nattr ? rp_S.attr[i].fmt : 0);
     for (int st = 0; st < 3; st++) if (stages & (1u << st)) { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[st][i].size) m |= 1u << i; MIX(m); }
     MIX(rp_S.tex_pool_n); MIX(rp_S.samp_pool_n); MIX(rp_S.tf_on); MIX(rp_S.tex_base);
@@ -2440,8 +2526,8 @@ static struct entry *alias_try_fg(const uint8_t sha[32], const struct s2a_input_
 // 清单里这条就永远 c1_ok=0；下一局预热按它建出来的程序也 c1_ok=0，而 rp_draw 对带 C1 绑定的绘制
 // （火把/粒子等用 BRX 跳表的着色器）直接跳过 → 光消失、画面发黑。程序对象里就有 c1，直接抄过来即可。
 // 「已发布命中」与「结果合并命中」（#1355）共用这一份。
-static void prog_note_use(const uint8_t sha[32], uint32_t stages, int nst, const struct s2a_input_identity *id, const struct facts *f, const struct rp_prog *prog) {
-    struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f->gfx) ? 2 : 0;
+static void prog_note_use(const uint8_t sha[32], uint32_t stages, int nst, const struct s2a_input_identity *id, const struct rp_prog *prog) {
+    struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(id->gfx) ? 2 : 0;
     for (int st = 0; st < nst; st++) memcpy(rec.keys[st], id->keys[st], 8);
     for (int st = 0; st < nst; st++)
         if (prog->c1_ok & (1u << st)) (void)rec_c1_put(&rec, st, prog->c1[st], prog->c1_len[st]);
@@ -2462,17 +2548,64 @@ static void prog_note_use(const uint8_t sha[32], uint32_t stages, int nst, const
     for (int st = 0; st < RP_PROG_STAGES; st++) if (held[st]) s2a_source_release(v[st].ref);
 }
 
+// 暖种的 c1 来自清单。采用前把清单带的整段与本笔源快照核对；缺少必需 c1 的种子在发布前已拒收。
+static int nowindow_c1_matches(const struct rp_prog *prog, const struct s2a_input_identity *id, int nst) {
+    for (int st = 0; st < nst; st++) {
+        if (!(prog->c1_ok & (1u << st))) continue;
+        struct s2a_source_entry_view src;
+        if (!s2a_source_acquire(id->keys[st], &src)) return 0;
+        const int same = src.complete && !memcmp(src.content_sha, id->source_sha[st], 32) &&
+            src.c1 && src.c1_bytes == prog->c1_len[st] && !memcmp(src.c1, prog->c1[st], src.c1_bytes);
+        s2a_source_release(src.ref);
+        if (!same) return 0;
+    }
+    return 1;
+}
+
+// 槽证明只改了一个编译事实。随包 nowindow 程序及管线仍按旧的保守身份预建，
+// 用同一快照恢复该位即可定位整份旧身份。前台先遇、旧种尚未就绪时，照旧走归一身份。
+static const struct rp_prog *nowindow_for_unused_ssbo(const struct s2a_input_identity *id, const uint8_t sha[32],
+        int nst, uint8_t idbuf[S2A_INPUT_IDENTITY_MAX]) {
+    struct s2a_compile_graphics_src gfx = *id->gfx;
+    gfx.unaligned_ssbo = 1;
+    struct s2a_input_identity old = *id;
+    old.gfx = &gfx;
+    size_t len;
+    uint8_t old_sha[32];
+    if (s2a_input_identity_encode(&old, idbuf, S2A_INPUT_IDENTITY_MAX, &len)) return NULL;
+    sha256(idbuf, len, old_sha);
+
+    // 真对齐的请求仍可单独发布归一身份。这个槽情形一旦采用旧种，就保留该选择，避免后来另一次描述命中而换管线。
+    const struct rp_prog *alias = nvn_hm_get(&g_fact_aliases, sha);
+    pthread_mutex_lock(&g_progs_mu);
+    struct entry *seed = progs_get_locked(old_sha);
+    const int reused = seed && seed->nowindow_reused;
+    const int eligible = seed && seed->nowindow_seed && !seed->failed && !seed->prog.lib_sourced &&
+        !memcmp(seed->prog.identity, old_sha, sizeof old_sha) &&
+        (reused || (!progs_get_locked(sha) && !inflight_find_locked(sha) && (!alias || alias->lib_bad)));
+    pthread_mutex_unlock(&g_progs_mu);
+    if (!eligible || (!reused && !nowindow_c1_matches(&seed->prog, &old, nst))) return NULL;
+
+    int adopted;
+    pthread_mutex_lock(&g_progs_mu);
+    seed->nowindow_reused = 1;
+    (void)progs_get_adopted_locked(old_sha, NULL, &adopted);
+    pthread_mutex_unlock(&g_progs_mu);
+    if (adopted) note_warm_adoption(seed, old_sha);
+    prog_note_use(old_sha, old.stage_mask, nst, &old, &seed->prog);
+    return &seed->prog;
+}
+
 // [提交线程] 三段式的第二、三段：先查已发布与在途（不重复准备），否则捕获快照 → 工作 → 发布。
-static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pcp,
-                        uint32_t stages, int nst, uint64_t group) {
+static int resolve_candidate(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pcp,
+                        uint32_t stages, int nst, uint64_t group, struct facts *f) {
     struct s2a_direct_compile_context pc = *pcp;
     *out = NULL;
     if (!g_profile.ok || g_profile.session != pc.session || g_profile.generation != pc.generation) {
         sha256(pc.profile_json, pc.profile_bytes, g_profile.sha);
         g_profile.session = pc.session; g_profile.generation = pc.generation; g_profile.ok = 1;
     }
-    static struct facts f;   // 提交线程独占；结构大，不放栈上
-    fill_facts(q, &pc, &f, nst);
+    fill_facts(q, &pc, f, nst);
     struct s2a_input_identity id; memset(&id, 0, sizeof id);
     id.direct_abi = (int)pc.direct_abi; id.translator_closure = pc.translator_closure; memcpy(id.profile_sha, g_profile.sha, 32);
     id.stage_mask = stages;
@@ -2482,13 +2615,18 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
         if (s2a_source_identity(stage_key((unsigned)st), id.source_sha[st], &id.source_code_bytes[st], &id.source_control_bytes[st])) { nvn_unimpl("shader", "source_snapshot_missing", NULL); return -1; }
         id.source_present |= (uint8_t)(1u << st);
     }
-    memcpy(id.ubo_use, f.ubo_use, sizeof id.ubo_use);
+    memcpy(id.ubo_use, f->ubo_use, sizeof id.ubo_use);
     id.texture_array_length = (uint32_t)rp_S.tex_pool_n; id.sampler_array_length = (uint32_t)rp_S.samp_pool_n; id.transform_feedback_enabled = rp_S.tf_on;
-    id.gfx = &f.gfx; id.textures = f.tex; id.texture_count = f.ntex;
+    id.gfx = &f->gfx; id.textures = f->tex; id.texture_count = f->ntex;
     static uint8_t idbuf[S2A_INPUT_IDENTITY_MAX]; size_t idlen = 0; uint8_t sha[32];
     if (s2a_input_identity_encode(&id, idbuf, sizeof idbuf, &idlen)) { nvn_unimpl("shader", "identity_encode_failed", NULL); return -1; }
     sha256(idbuf, idlen, sha);
     idg_note_ident(group, sha);   // 身份粒度诊断：这份身份第一次被用到（group=0 时空转）
+
+    if (f->unused_unaligned_ssbo) {
+        *out = nowindow_for_unused_ssbo(&id, sha, nst, idbuf);
+        if (*out) return 0;
+    }
 
     // 1) 已发布：直接命中。命中路径只多一次锁和一次热点 ++（不填快照、不 pin 源）。
     int e_failed = 0, e_adopted = 0;
@@ -2500,7 +2638,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     if (e) {
         if (e_failed) return -1;
         *out = &e->prog;
-        prog_note_use(sha, stages, nst, &id, &f, &e->prog);
+        prog_note_use(sha, stages, nst, &id, &e->prog);
         return 0;
     }
     // 1b) 事实复用（#1187）：编译器只读了一部分绑定事实，事实相同的另一份身份可以直接用同一个程序。
@@ -2525,7 +2663,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
             // 与下面「正常发布后」同一处登记：合并命中的身份也进事实复用表。否则只靠前台建过的程序登记事实，合并之后前台几乎不建了，
             // 「只差编译器没读的贴图事实」的新身份（盘上没有它的文件）就失去复用、退回现场编（真机一局 3 → 198 次）。
             if (reusable && ae->fact_ok) fact_cache_keep_mask(&id, fact_base, ae->fact_mask, &ae->prog);
-            prog_note_use(sha, stages, nst, &id, &f, &ae->prog);
+            prog_note_use(sha, stages, nst, &id, &ae->prog);
             prog_tally_log();
             return 0;
         }
@@ -2538,7 +2676,7 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
         if (win->failed) return -1;
         *out = &win->prog;   // 预建对象的采用计数在 await_inflight 的锁内记（每份一次）
         // 同一处的 c1 记账（原因见 prog_note_use）：预建对象里有 c1 就记进清单。
-        { struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f.gfx) ? 2 : 0;
+        { struct nvk_prog_rec rec; memset(&rec, 0, sizeof rec); memcpy(rec.identity, sha, 32); rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f->gfx) ? 2 : 0;
           for (int st = 0; st < nst; st++) memcpy(rec.keys[st], id.keys[st], 8);
           for (int st = 0; st < nst; st++)
               if (win->prog.c1_ok & (1u << st)) (void)rec_c1_put(&rec, st, win->prog.c1[st], win->prog.c1_len[st]);
@@ -2577,11 +2715,11 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     struct nvk_prog_rec rec;
     memset(&rec, 0, sizeof rec);
     memcpy(rec.identity, sha, 32);
-    rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f.gfx) ? 2 : 0;
+    rec.stage_mask = stages; rec.lp_ok = libpack_state_ok(&f->gfx) ? 2 : 0;
     for (int st = 0; st < nst; st++) memcpy(rec.keys[st], id.keys[st], 8);
     struct entry *ne = NULL;
     const uint64_t dg_c0 = atomic_load(&g_n_compiled);
-    struct work_snap *snap = snap_capture(&f, &id, sha, &pc, stages, nst);
+    struct work_snap *snap = snap_capture(f, &id, sha, &pc, stages, nst);
 #ifdef S2A_ANDROID_DEBUG_ENV
     if (snap && nvk_warm_capture_enabled()) {
         snap->preimage = malloc(idlen);
@@ -2627,6 +2765,21 @@ static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **ou
     nvk_prog_warm_note(&rec);   // 真实 resolve 成功：记身份 + uses（含 c1 整段）
     prog_tally_log();
     return 0;
+}
+
+// 旧预热清单只有身份和阶段键，后台可预建，但首次真正采用时才有完整的请求事实。
+static int resolve_slow(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pc,
+                        uint32_t stages, int nst, uint64_t group) {
+    static struct facts f;   // 提交线程独占；结构大，不放栈上
+    int rc = resolve_candidate(q, out, pc, stages, nst, group, &f);
+    if (rc || !(*out)->lib_sourced) return rc;
+    // entry 的首成员是其拥有的 rp_prog。库件不参与跨身份的事实或结果别名。
+    if (lib_outputs_ok((struct entry *)*out, &f) && lib_sampled_numeric_ok((struct entry *)*out, &f)) return 0;
+    rp_shader_lib_reject(*out);
+    *out = NULL;
+    rc = resolve_candidate(q, out, pc, stages, nst, group, &f);
+    if (!rc && (*out)->lib_sourced) { *out = NULL; return -1; }
+    return rc;
 }
 
 // ---------- 计算程序 ----------

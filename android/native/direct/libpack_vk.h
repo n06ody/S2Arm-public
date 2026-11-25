@@ -63,6 +63,11 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
 //   （direct_abi/profile_hash/translator_closure——与现编 request 同源）。
 /* 片元 .spv 的输出映射（同现编结果 info.fragmentOutputMap：每个颜色目标 4 位，第 c 分量 = 位 4×location + c）。
  * 0 = 推出；-1 = 读不懂（数组输出、location ≥ 8 等），调用方不出这一项（消费端按全写）。 */
+struct s2a_frag_outputs {
+    uint32_t components; // nibble per location
+    uint8_t uint_locations, sint_locations;
+};
+int s2a_libpack_spv_frag_interface(const uint8_t *spv, size_t n, struct s2a_frag_outputs *out);
 int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map);
 // 几何程序（stages 0x7 = vs|fs|gs）要的两样绘制事实；vs+fs 程序不读，可传 NULL（传 NULL 时几何程序 miss）。
 //   topology：绘制图元名，与现编请求 graphicsState.topology 同源（nvk_input_topology：Points / Lines / Triangles / …Adjacency）；
