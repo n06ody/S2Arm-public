@@ -172,7 +172,8 @@ void nvn_gpu_caps_get(nvn_gpu_caps *out);   // 打开后不变（display_max_hz 
 uint32_t nvn_gpu_format_caps(uint32_t nvn_format);   // NVN_GPU_FMT_*。线程：[任意]。不认识的格式返回 0，不猜
 
 // ---------- 缓冲与内存池（定稿 #2：脏页 / 内容身份在核心，后端只给同步原语） ----------
-enum { NVN_GPU_MEM_SHARED = 0, NVN_GPU_MEM_DEVICE = 1 };   // SHARED：CPU 可写、一致；DEVICE：只给 GPU
+enum { NVN_GPU_MEM_SHARED = 0, NVN_GPU_MEM_DEVICE = 1, NVN_GPU_MEM_POOL_MIRROR = 2 };
+// POOL_MIRROR 保留 SHARED 的缓冲用途。后端可选非一致映射，由镜像专用可见性接口管理。
 typedef struct { nvn_gpu_buf buf; uint64_t off; uint8_t *cpu; uint64_t va; } nvn_gpu_slice;   // cpu：DEVICE 内存为 NULL；va：无 CAP_GPU_VA 为 0
 // 最后一次使用结束时的通知（只调一次，在 [回调]）：核心在这之后才允许宿主解除 / 复用这段 backing。
 typedef void (*nvn_gpu_retired_fn)(void *user);
@@ -182,10 +183,20 @@ typedef void (*nvn_gpu_retired_fn)(void *user);
 // 线程：[任意]。生命周期：池 Finalize 时核心调 nvn_gpu_buf_release(b, retired, …)；后端持有这段包装与宿主页，直到最后一次使用结束才解除并调 retired。
 // 出错：NVN_GPU_E_UNSUPPORTED / NVN_GPU_E_OOM（驱动拒绝，后端可有界重试，nvn_mtl.m 现为约 2 s），why 带区间。
 nvn_gpu_rc nvn_gpu_buf_wrap(void *host, uint64_t bytes, nvn_gpu_buf *out, nvn_gpu_err *err);
-// 新建缓冲。init 非 NULL 时拷入 bytes 字节（只对 SHARED）。线程：[任意]。出错：NVN_GPU_E_OOM / NVN_GPU_E_ARG（bytes 为 0 或超上限）。
+// 新建缓冲。init 非 NULL 时拷入 bytes 字节（仅 CPU 可见的类型）。线程：[任意]。出错：NVN_GPU_E_OOM / NVN_GPU_E_ARG（bytes 为 0 或超上限）。
 nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err);
 uint64_t nvn_gpu_buf_va(nvn_gpu_buf b);    // GPU 地址（无 CAP_GPU_VA 为 0）。线程：[任意]
 uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b);   // CPU 地址（DEVICE 为 NULL）。线程：[任意]
+enum { NVN_GPU_MIRROR_COHERENT, NVN_GPU_MIRROR_CPU_IDLE, NVN_GPU_MIRROR_GPU_BUSY };
+// 可选镜像可见性接口。IDLE 的非一致映射仅可在提交线程写，写后立即 flush。
+// flush 失败不确认页同步，并使后端下一段提交失败。GPU 写后只可从完成回调读镜像。
+int nvn_gpu_mirror_state(nvn_gpu_buf b);
+int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes);
+int nvn_gpu_mirror_visibility_enabled(void);
+int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b);
+typedef struct { nvn_gpu_buf src; uint64_t offset, bytes; } nvn_gpu_mirror_span;
+// 非一致镜像随段持有到完成回调返回。count 非零、spans 为空表示快照失败，本段粘滞失败。
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_mirror_span *spans, uint32_t count);
 // 释放。retired 可为 NULL；非 NULL 时在最后一次使用（总则 ①–④）结束后恰好调一次。线程：[任意]。NULL 句柄无操作。
 void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user);
 // 本 cmd 会经 GPU 地址间接用到 b（总则 ④）：后端保活到该 cmd 完成，并保证执行时驻留（Metal 驻留集 / useResource；Vulkan 只保活）。线程：[提交]。

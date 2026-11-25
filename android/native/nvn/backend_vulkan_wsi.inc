@@ -621,7 +621,12 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
+    const int measure_lock = g.land_wait_probe && r == VK_SUCCESS;
+    const uint64_t lock_start = measure_lock ? now_ns() : 0;
+    const uint64_t wait_at_request = measure_lock ? atomic_load(&g.mirror_wait_signal) : 0;
     pthread_mutex_lock(&g_submit_mu);
+    const uint64_t lock_ns = measure_lock ? now_ns() - lock_start : 0;
+    const uint64_t wait_at_submit = measure_lock ? atomic_load(&g.mirror_wait_signal) : 0;
     if (r == VK_SUCCESS) {
         VkPipelineStageFlags wait_stage = upscaled
             ? (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)   // 先清场再画
@@ -632,6 +637,17 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
         r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (measure_lock) {
+        pthread_mutex_lock(&g_mu);
+        g.stats[STAT_MIRROR_WSI_LOCK_N]++;
+        g.stats[STAT_MIRROR_WSI_LOCK_NS] += lock_ns;
+        g.stats[STAT_MIRROR_WSI_DURING_WAIT] += wait_at_request != 0;
+        // 只有驱动接受了内部段，且同一回写仍未完成，才算一次实际越过。
+        if (r == VK_SUCCESS && wait_at_submit && wait_at_submit == atomic_load(&g.mirror_wait_signal) &&
+            wait_at_submit > g.completed && !g.device_lost && (!g.failed || wait_at_submit < g.failed))
+            g.stats[STAT_MIRROR_WSI_OVERTAKES]++;
+        pthread_mutex_unlock(&g_mu);
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);
