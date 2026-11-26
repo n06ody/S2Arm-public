@@ -188,6 +188,39 @@ void s2a_adpf_frame_end(int64_t target_ns, uint64_t seq) __attribute__((weak));
 // 弱链接[replay]：s2a_adpf_invisible
 void s2a_adpf_invisible(void) __attribute__((weak));
 static _Atomic uint64_t g_adpf_seq;
+static void tex_fold_log_window(void) {
+    uint64_t counts[RP_TF_N];
+    if (!rp_tex_fold_stats_take(counts)) return;
+    uint64_t rejected = 0, fallback = 0;
+    for (int i = RP_TF_DISABLED; i < RP_TF_FALL_ALIAS; i++) rejected += counts[i];
+    for (int i = RP_TF_FALL_ALIAS; i < RP_TF_N; i++) fallback += counts[i];
+    const uint64_t hit = counts[RP_TF_HIT];
+    char line[1024];
+    // 原路径整图清除在通道外，固定录一个 full_barrier，不另开通道。
+    // 这里记回放计划实际替掉的命令，不估算 GPU 执行耗时或全帧净屏障数。
+    snprintf(line, sizeof line,
+             "window attempts=%llu parked=%llu hit=%llu rejected=%llu fallback=%llu "
+             "saved_clear=%llu saved_full_barrier=%llu saved_pass=0 "
+             "disabled=%llu shape=%llu storage=%llu view_policy=%llu format_value=%llu "
+             "view_failed=%llu park_order=%llu park_ref=%llu "
+             "alias=%llu capacity=%llu clear_boundary=%llu read=%llu buffer=%llu transfer=%llu "
+             "barrier=%llu boundary=%llu list_end=%llu area=%llu pass_mode=%llu target=%llu",
+             (unsigned long long)(hit + rejected + fallback), (unsigned long long)(hit + fallback),
+             (unsigned long long)hit, (unsigned long long)rejected, (unsigned long long)fallback,
+             (unsigned long long)hit, (unsigned long long)hit,
+             (unsigned long long)counts[RP_TF_DISABLED], (unsigned long long)counts[RP_TF_SHAPE],
+             (unsigned long long)counts[RP_TF_STORAGE], (unsigned long long)counts[RP_TF_VIEW_POLICY],
+             (unsigned long long)counts[RP_TF_FORMAT_VALUE], (unsigned long long)counts[RP_TF_VIEW_FAILED],
+             (unsigned long long)counts[RP_TF_PARK_ORDER], (unsigned long long)counts[RP_TF_PARK_REF],
+             (unsigned long long)counts[RP_TF_FALL_ALIAS], (unsigned long long)counts[RP_TF_FALL_FULL],
+             (unsigned long long)counts[RP_TF_FALL_CLEAR], (unsigned long long)counts[RP_TF_FALL_READ],
+             (unsigned long long)counts[RP_TF_FALL_BUFFER], (unsigned long long)counts[RP_TF_FALL_TRANSFER],
+             (unsigned long long)counts[RP_TF_FALL_BARRIER], (unsigned long long)counts[RP_TF_FALL_BOUNDARY],
+             (unsigned long long)counts[RP_TF_FALL_END], (unsigned long long)counts[RP_TF_FALL_AREA],
+             (unsigned long long)counts[RP_TF_FALL_PASS], (unsigned long long)counts[RP_TF_FALL_TARGET]);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "tex-clear-fold", line);
+}
+
 static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4]);
 uint64_t nvn_be_present(const tex_t *t, double period_s, const int crop[4]) {
     pthread_mutex_lock(&g_pmu); const int surf = g_surf != NULL; pthread_mutex_unlock(&g_pmu);
@@ -380,6 +413,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK]);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 }
+                tex_fold_log_window();
                 if (pf[RP_PERF_TEX_BYTE_EQUAL] || pf[RP_PERF_TEX_BYTE_CHANGED] || nvn_plat_flag("nvk_tex_byte_equal", 0)) {
                     snprintf(b, sizeof b, "窗口合计 byte_equal_skipped=%llu byte_changed=%llu skipped_bytes=%llu",
                              (unsigned long long)pf[RP_PERF_TEX_BYTE_EQUAL], (unsigned long long)pf[RP_PERF_TEX_BYTE_CHANGED],
