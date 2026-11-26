@@ -220,6 +220,9 @@ fi
 if standalone_mode; then
     exec bash "$repo/android/tests/vk/standalone/${mode#--}.sh"
 fi
+if [ "$mode" = --clear-tex-core ]; then
+    exec bash "$repo/android/tests/vk/run_replay_clear_tex.sh"
+fi
 if [ -z "$mode" ]; then
     for f in "$repo"/android/tests/vk/standalone/*.sh; do bash "$f"; done
 fi
