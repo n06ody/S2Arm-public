@@ -47,6 +47,7 @@ static int g_flag_sync_lag;     // 用例设：开关 nvk_sync_lag 的值（产�
 static int g_flag_binst_hoist = -1;   // 用例设：开关 nvk_binst_hoist（-1 = 缺省）
 static int g_flag_clear_only_attachments;
 static int g_flag_mirror_disjoint = -1;
+static int g_flag_mirror_disjoint_v2;
 static int g_flag_state_keep = 1, g_flag_rt_cont = 1, g_flag_clear_park = 1, g_flag_pass_area = 1;   // 用例设：开关 nvk_state_keep / nvk_rt_cont / nvk_clear_park / nvk_pass_area 的值（缺省同产品：都开）
 static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（缺省同产品：开）；备忘每 4096 次查找才重读一次，换值后要用 pm_flag() 推一下
 static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值（缺省同产品：开）；每 256 次登记才重读一次，换值后要用 rp_test_gw_merge_reload() 推一下
@@ -80,6 +81,7 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_diag_store_dontcare")) return g_flag_diag_store_dc;
     if (!strcmp(name, "nvk_binst_hoist")) return g_flag_binst_hoist < 0 ? dflt : g_flag_binst_hoist;
     if (!strcmp(name, "nvk_mirror_disjoint")) return g_flag_mirror_disjoint < 0 ? dflt : g_flag_mirror_disjoint;
+    if (!strcmp(name, "nvk_mirror_disjoint_v2")) return g_flag_mirror_disjoint_v2;
     return dflt;
 }
 const char *nvn_plat_dir(int which) { (void)which; return NULL; }
@@ -6862,14 +6864,27 @@ static void mirror_draw_at(stream *s, uint64_t addr) {
 }
 
 static void t_mirror_disjoint(void) {
-    enum { DEFAULT_OFF, GAP, OVERLAP, PENDING, UNKNOWN, ALIAS, OVERFLOW, REMAP, PRE_OOM, NCASE };
-    static const char *const names[NCASE] = {"default", "gap", "overlap", "pending", "unknown", "alias", "overflow", "remap", "pre-oom"};
+    enum { DEFAULT_OFF, GAP, OVERLAP, PENDING, UNKNOWN, ALIAS, OVERFLOW, REMAP, PRE_OOM,
+           V2_GROWN_GAP, V2_GROWN_HIT, V2_PENDING_GAP, V2_PENDING_HIT,
+#ifdef S2A_GPU_LAND_TEST
+           V2_LANDING_GAP, V2_LANDING_HIT,
+#endif
+           NCASE };
+    static const char *const names[NCASE] = {
+        "default", "gap", "overlap", "pending", "unknown", "alias", "overflow", "remap", "pre-oom",
+        "v2-grown-gap", "v2-grown-hit", "v2-pending-gap", "v2-pending-hit",
+#ifdef S2A_GPU_LAND_TEST
+        "v2-landing-gap", "v2-landing-hit",
+#endif
+    };
     const int old_split = rp_split_draws;
     for (int log = 0; log <= (g_dirtylog_dflt != 0); log++) for (int kind = DEFAULT_OFF; kind < NCASE; kind++) {
         pass_fresh(); g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = log;
         g_log_fake_on = log; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
         memset(g_log_unarmed, 0, sizeof g_log_unarmed);
-        g_flag_mirror_disjoint = kind == DEFAULT_OFF ? -1 : 1; rp_split_draws = 0;
+        g_flag_mirror_disjoint = kind == DEFAULT_OFF ? -1 : 1;
+        g_flag_mirror_disjoint_v2 = kind >= V2_GROWN_GAP;
+        rp_split_draws = 0;
         g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
         memset(g_block_mem, 0x11, BLOCK_TEST_PAGES * PG); memset(g_block_gen, 0, sizeof g_block_gen);
         g_dirty_now = 100; ++g_dirty_map; g_block_unreliable = 0;
@@ -6878,9 +6893,24 @@ static void t_mirror_disjoint(void) {
         nvn_be_pool_add(g_block_mem, BLOCK_TEST_PAGES * PG);
         // The small pool overlaps the upload, but cannot satisfy the draw's entire binding.
         if (kind == ALIAS) nvn_be_pool_add(g_block_mem + 3 * PG + 160, 16);
+        int landing = 0, landing_overlap = 0;
+#ifdef S2A_GPU_LAND_TEST
+        landing = kind == V2_LANDING_GAP || kind == V2_LANDING_HIT;
+        landing_overlap = kind == V2_LANDING_HIT;
+#endif
+        uint64_t key = 0, pending = 0;
+        const int pending_overlap = kind == V2_PENDING_HIT || landing_overlap;
         nvn_gpu_buf b = NULL;
         nvn_be_sub_begin(); CHECK(rp_buf_resolve(&g_fake_cmd, base, 8 * PG, &b, NULL) && b && b->cpu);
         stream warm = {0}; q_env(&warm); q_draw(&warm); end(&warm); nvn_be_exec(warm.b);
+        if (kind == V2_PENDING_GAP || kind == V2_PENDING_HIT || landing) {
+            // Keep an earlier submission's write outstanding (or land it via
+            // the paused callback below). The current range union cannot see it.
+            // Test adjacency and an overlap outside the new draw's binding.
+            const uint64_t write_at = target + PG - (pending_overlap ? 16 : 0);
+            pending = rp_buf_gpu_write_note(write_at, 16, &key);
+            CHECK(pending != 0);
+        }
         nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 
         g_order_active = 1; g_order_seg = g_order_n = g_order_overflow = 0; g_order_vbuf = NULL;
@@ -6893,18 +6923,37 @@ static void t_mirror_disjoint(void) {
         if (kind == OVERLAP) mirror_draw_at(&first, target);   // 同一页的另一段，仍被随整页上传覆盖
         end(&first); nvn_be_exec(first.b);
         CHECK(rp_pass_is_open());
-        uint64_t key = 0, pending = 0;
         if (kind == PENDING) {
             pending = rp_buf_gpu_write_note(base + 5 * PG, 16, &key);
             CHECK(pending != 0);
         }
         if (kind == UNKNOWN) CHECK(!rp_buf_resolve(&g_fake_cmd, 1, 16, &b, NULL));
-        if (kind == OVERFLOW) {
-            for (int i = 0; i < 80; i++) CHECK(rp_buf_resolve(&g_fake_cmd, base + PG + 2 * (uint64_t)i, 1, &b, NULL));
+        if (kind == OVERFLOW || kind == V2_GROWN_GAP || kind == V2_GROWN_HIT) {
+            // Two separated clusters span the target page but leave it untouched.
+            // Their union still exceeds the original capacity. Add the overlap last.
+            for (unsigned i = 0; i < 40; i++) {
+                CHECK(rp_buf_resolve(&g_fake_cmd, base + PG + 2 * i, 1, &b, NULL));
+                CHECK(rp_buf_resolve(&g_fake_cmd, base + 5 * PG + 2 * i, 1, &b, NULL));
+            }
+            if (kind == V2_GROWN_HIT) CHECK(rp_buf_resolve(&g_fake_cmd, target + PG - 1, 1, &b, NULL));
         }
         if (kind == REMAP) ++g_dirty_map;
         g_pre_fail_once = kind == PRE_OOM;
         fake_log_write(3, 0x22);
+#ifdef S2A_GPU_LAND_TEST
+        pthread_t landing_thread;
+        struct land_args land = {key, pending};
+        if (landing) {
+            g_land_pause = 1; g_land_half = g_land_resume = 0;
+            if (pthread_create(&landing_thread, NULL, land_thread, &land) != 0) {
+                CHECK(0 && "start landing thread");
+                return;
+            }
+            pthread_mutex_lock(&g_land_mu);
+            while (!g_land_half) pthread_cond_wait(&g_land_cv, &g_land_mu);
+            pthread_mutex_unlock(&g_land_mu);
+        }
+#endif
         g_nbw = 0;
         uint64_t perf[RP_PERF_N]; rp_perf_take(perf);
         const int before = g_npd;
@@ -6912,11 +6961,23 @@ static void t_mirror_disjoint(void) {
         rp_perf_take(perf);
         const int passes = g_npd - before;
         const int pre = g_nbw == 1 && g_bw[0].pre;
-        CHECK(g_nbw == 1 && g_bw[0].off == 3 * PG && g_bw[0].len == PG);
-        CHECK(perf[RP_PERF_MIRROR_HOIST] == (kind == GAP));
-        CHECK(perf[RP_PERF_MIRROR_OVERLAP] == (kind == OVERLAP));
-        CHECK(perf[RP_PERF_MIRROR_FALLBACK] == (kind >= PENDING));
-        CHECK(perf[RP_PERF_P_CUT_XFER] == (kind != GAP));
+        const int hoisted = kind == GAP || kind == V2_GROWN_GAP || kind == V2_PENDING_GAP ||
+                            (landing && !landing_overlap);
+        const int known_overlap = kind == OVERLAP || kind == V2_GROWN_HIT || pending_overlap;
+        CHECK(g_nbw == 1 && g_bw[0].off == 3 * PG && g_bw[0].len == (pending_overlap ? PG - 16 : PG));
+        CHECK(perf[RP_PERF_MIRROR_HOIST] == (uint64_t)hoisted);
+        CHECK(perf[RP_PERF_MIRROR_OVERLAP] == (uint64_t)known_overlap);
+        CHECK(perf[RP_PERF_MIRROR_FALLBACK] == (kind >= PENDING && kind <= PRE_OOM));
+        CHECK(perf[RP_PERF_P_CUT_XFER] == !hoisted);
+#ifdef S2A_GPU_LAND_TEST
+        if (landing) {
+            pthread_mutex_lock(&g_land_mu);
+            g_land_resume = 1; pthread_cond_broadcast(&g_land_cv);
+            pthread_mutex_unlock(&g_land_mu);
+            CHECK(pthread_join(landing_thread, NULL) == 0);
+            g_land_pause = 0; pending = 0;
+        }
+#endif
         if (kind == GAP) CHECK((perf[RP_PERF_BUF_LOG_EV] != 0) == log);
         CHECK(!g_pre_fail_once); g_pre_fail_once = 0;
         nvn_be_sub_commit();
@@ -6937,7 +6998,7 @@ static void t_mirror_disjoint(void) {
         const int overlap = kind == OVERLAP;
         printf("mirror log=%d %s: pre=%d reopened=%d draw bytes=%02x/%02x/%02x/%02x\n",
                log, names[kind], pre, passes, observed[0], observed[1], observed[2], observed[3]);
-        CHECK(pre == (kind == GAP) && passes == (kind != GAP));
+        CHECK(pre == hoisted && passes == !hoisted);
         CHECK(g_order_seg == 1 && g_order_overflow == 0 && draws == 3 + overlap);
         CHECK(observed[0] == 0x11 && observed[1] == 0x11 && observed[2 + overlap] == 0x22);
         CHECK(!overlap || observed[2] == 0x11);
@@ -6947,6 +7008,7 @@ static void t_mirror_disjoint(void) {
         nvn_be_pool_del(g_block_mem); g_block_mem = NULL; pass_fresh();
     }
     g_buf_cpu_auto = 0; g_log_fake_on = 0; g_flag_buf_dirtylog = g_dirtylog_dflt; g_flag_mirror_disjoint = -1;
+    g_flag_mirror_disjoint_v2 = 0;
     rp_split_draws = old_split;
 }
 

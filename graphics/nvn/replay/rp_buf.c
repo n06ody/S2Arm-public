@@ -27,10 +27,15 @@ struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; }; 
 // path：这份镜像走哪条核对路（建镜像时定，之后不变）：MP_LOG = 脏页追加日志（缺省，开关 nvk_buf_dirtylog=0 可关）；MP_PLAIN = 逐页（日志不可用时的退回路径）。
 // 脏页追加日志（#1501 A②）：stale 每页一位 =「这份镜像里这页是旧的」，stale_sum 每位汇总 stale 的一个字（一位管 64 页，一个字管 4096 页）；
 // log_cur / log_id：这份镜像在池的追加日志里读到哪（nvn_dirty_log_*）。两份镜像各有一套，互不影响。
-enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32, EXACT_RANGES = 64 };
+enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32, EXACT_INITIAL_RANGES = 64 };
 struct read_range { uint64_t sub, lo, hi; };   // 页区间 [lo, hi]；同桶碰撞取包络，宁可多走有序传输
 struct byte_range { uint64_t lo, hi; };        // 镜像内半开区间 [lo, hi)
-struct mirror_exact { uint64_t sub; unsigned n; struct byte_range ranges[EXACT_RANGES]; };
+struct mirror_exact {
+    uint64_t sub;
+    size_t n, capacity;
+    int incomplete;
+    struct byte_range ranges[];
+};
 struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
                 uint64_t *stale, *stale_sum; uint64_t log_cur, log_id;
                 struct read_range reads[READ_BUCKETS]; struct mirror_exact *exact; };
@@ -56,7 +61,7 @@ static uint64_t g_sync_bytes, g_sync_runs;
 static nvn_gpu_buf g_null_storage;
 static int g_gw_live;   // 所有池的未落地登记数（含正在落地的项）
 static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数（原子读写）：为 0（受跟踪的游戏全程如此）时 rp_write_note 不多走一步
-static int g_exact_on, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
+static int g_exact_on, g_exact_v2, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
 static uint64_t g_exact_mapping, g_exact_pool;
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
 static int g_land_noresync = -1;   // g_bmu 内按会话锁定
@@ -292,27 +297,64 @@ static int gw_covers_page(const struct shadow *s, int mi, uint64_t k, size_t ps,
     *bytes = end - a;
     return gw_covers(s, mi, a - base, end - base);
 }
-// 读写在同一份镜像里共用一张表。只并重叠或接邻的区间，保留空隙；溢出则整份镜像退回原顺序。
+// Range ends increase with their starts. For insertion, include adjacency;
+// for a half-open overlap query, skip ranges ending at the query start.
+static size_t exact_first_range(const struct mirror_exact *x, uint64_t lo, int adjacent) {
+    size_t first = 0, end = x->n;
+    while (first < end) {
+        const size_t mid = first + (end - first) / 2;
+        const uint64_t hi = x->ranges[mid].hi;
+        if (hi < lo || (hi == lo && !adjacent)) first = mid + 1;
+        else end = mid;
+    }
+    return first;
+}
+
+// Keep a per-submission union without filling holes. Reuse its high-water
+// allocation across submissions; failure invalidates the proof for this mirror.
 static inline void mirror_touch(struct mirror *m, uint64_t lo, uint64_t hi) {
-    if (!g_exact_on || g_exact_unknown) return;
+    if (!g_exact_on || g_exact_unknown || lo >= hi) return;
     const uint64_t sub = rp_sub_serial();
     if (!m->exact) {
-        m->exact = calloc(1, sizeof *m->exact);
+        m->exact = calloc(1, sizeof *m->exact + EXACT_INITIAL_RANGES * sizeof(struct byte_range));
         if (!m->exact) { g_exact_unknown = 1; return; }
+        m->exact->capacity = EXACT_INITIAL_RANGES;
     }
     struct mirror_exact *x = m->exact;
-    if (x->sub != sub) { x->sub = sub; x->n = 0; }
-    if (x->n > EXACT_RANGES) return;
-    for (unsigned i = 0; i < x->n;) {
-        const struct byte_range r = x->ranges[i];
-        if (r.lo <= lo && hi <= r.hi) return;
-        if (r.hi < lo || hi < r.lo) { i++; continue; }
-        if (r.lo < lo) lo = r.lo;
-        if (r.hi > hi) hi = r.hi;
-        x->ranges[i] = x->ranges[--x->n];
+    if (x->sub != sub) {
+        x->sub = sub;
+        x->n = 0;
+        x->incomplete = 0;
     }
-    if (x->n == EXACT_RANGES) { x->n++; return; }
-    x->ranges[x->n++] = (struct byte_range){lo, hi};
+    if (x->incomplete) return;
+
+    const size_t first = exact_first_range(x, lo, 1);
+    size_t next = first;
+    while (next < x->n && x->ranges[next].lo <= hi) {
+        if (x->ranges[next].lo < lo) lo = x->ranges[next].lo;
+        if (x->ranges[next].hi > hi) hi = x->ranges[next].hi;
+        next++;
+    }
+    const size_t n = x->n - (next - first) + 1;
+    const size_t limit = g_exact_v2 ? x->capacity : EXACT_INITIAL_RANGES;
+    if (n > limit) {
+        if (!g_exact_v2 || x->capacity > (SIZE_MAX - sizeof *x) / sizeof *x->ranges / 2) {
+            x->incomplete = 1;
+            return;
+        }
+        const size_t capacity = x->capacity * 2;
+        struct mirror_exact *grown = realloc(x, sizeof *x + capacity * sizeof *x->ranges);
+        if (!grown) {
+            x->incomplete = 1;
+            return;
+        }
+        x = m->exact = grown;
+        x->capacity = capacity;
+    }
+    if (next != first + 1 && next < x->n)
+        memmove(&x->ranges[first + 1], &x->ranges[next], (x->n - next) * sizeof *x->ranges);
+    x->ranges[first] = (struct byte_range){lo, hi};
+    x->n = n;
 }
 
 static void mirror_unknown_address(void) {
@@ -511,15 +553,32 @@ static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
 
 static int mirror_sync_class(const struct shadow *s, const struct mirror *m, uint64_t lo, uint64_t hi) {
     const struct mirror_exact *x = m->exact;
-    if (g_exact_unknown || !x || x->sub != rp_sub_serial() || x->n > EXACT_RANGES ||
-        s->ngw || s->landing || s->untracked || nvn_dirty_tracking_unreliable() ||
+    if (g_exact_unknown || !x || x->sub != rp_sub_serial() || x->incomplete ||
+        s->untracked || nvn_dirty_tracking_unreliable() ||
         g_exact_mapping != nvn_dirty_mapping_generation() ||
         !g_exact_pool || g_exact_pool != rp_pool_mirror_epoch(s->mem, s->size))
         return RP_PERF_MIRROR_FALLBACK;
-    for (unsigned i = 0; i < x->n; i++) {
-        const struct byte_range r = x->ranges[i];
-        if (r.lo < hi && lo < r.hi) return RP_PERF_MIRROR_OVERLAP;
+    if (!g_exact_v2 && (s->ngw || s->landing))
+        return RP_PERF_MIRROR_FALLBACK;
+
+    // The write ledger retains every landing entry during the unlocked copy.
+    // Its byte bounds also cover the host source being copied into the mirror;
+    // the smaller landing cache can omit entries and cannot prove disjointness.
+    int landing = 0;
+    for (int i = 0; i < s->ngw; i++) {
+        const struct gpu_write *w = &s->gw[i];
+        if (!w->len || w->off > s->size || w->len > s->size - w->off)
+            return RP_PERF_MIRROR_FALLBACK;
+        if (w->off < hi && lo < w->off + w->len)
+            return RP_PERF_MIRROR_OVERLAP;
+        landing += w->landing != 0;
     }
+    if (landing != s->landing)
+        return RP_PERF_MIRROR_FALLBACK;
+
+    const size_t first = exact_first_range(x, lo, 0);
+    if (first < x->n && x->ranges[first].lo < hi)
+        return RP_PERF_MIRROR_OVERLAP;
     return RP_PERF_MIRROR_HOIST;
 }
 
@@ -761,9 +820,10 @@ void rp_buf_pool_gone(const void *mem) {
 }
 void rp_buf_hold_begin(void) {
     const int exact = rp_pass_is_open && rp_pool_mirror_epoch && nvn_plat_flag("nvk_mirror_disjoint", 0) != 0;
+    const int exact_v2 = exact && nvn_plat_flag("nvk_mirror_disjoint_v2", 0) != 0;
     pthread_mutex_lock(&g_bmu);
     g_hold = 1; g_hold_tid = pthread_self();
-    g_exact_on = exact; g_exact_unknown = 0;
+    g_exact_on = exact; g_exact_v2 = exact_v2; g_exact_unknown = 0;
     if (exact) {
         g_exact_pool = rp_pool_mirror_epoch(NULL, 0);
         g_exact_mapping = nvn_dirty_mapping_generation();

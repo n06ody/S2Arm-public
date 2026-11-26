@@ -10,10 +10,13 @@
 __typeof__(backend_fixture_flag) nvn_plat_flag;
 #include "rp_exec.c"
 #include "nvn_dirty.h"
+#include <signal.h>
+#include <unistd.h>
 
 static nvn_gpu_err test_err;
-static int hoist, pass_open, passes;
+static int hoist, hoist_v2, pass_open, passes;
 static void (*prepare_write)(void *, size_t);
+static int (*dirty_fault)(void *, int, void *);
 
 #define REQUIRE(expr) do { if (!(expr)) { \
     fprintf(stderr, "mirror fixture line %d: %s (%d %s)\n", __LINE__, #expr, test_err.rc.code, test_err.why); \
@@ -22,10 +25,21 @@ static void (*prepare_write)(void *, size_t);
 
 int nvn_plat_flag(const char *key, int dflt) {
     if (!strcmp(key, "nvk_mirror_disjoint")) return hoist;
+    if (!strcmp(key, "nvk_mirror_disjoint_v2")) return hoist_v2;
     return backend_fixture_flag(key, dflt);
 }
 
-void dm_fault_hook_register(int (*fn)(void *, int, void *)) { REQUIRE(fn != NULL); }
+void dm_fault_hook_register(int (*fn)(void *, int, void *)) { REQUIRE(fn != NULL); dirty_fault = fn; }
+
+// On the overlap arm, recording the later upload protects the landing page
+// again. Route its write fault through the real dirty-page tracker.
+static void handle_dirty_fault(int sig, siginfo_t *info, void *context) {
+    // The CI container can report MAPERR for a tracked, protected page.
+    // Only the dirty tracker can claim its address and release the page.
+    if (info->si_code > 0 && dirty_fault && dirty_fault(info->si_addr, 1, context))
+        return;
+    _exit(128 + sig);
+}
 void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { prepare_write = fn; }
 
 // 本夹具不录计数器报告、调试转储或贴图快照。若意外进入其失败/回落路径，直接报错。
@@ -96,10 +110,14 @@ int main(int argc, char **argv) {
     REQUIRE(argc == 3);
     const char *arm = argv[2];
     const int overlap = !strcmp(arm, "overlap");
-    const int pending = !strcmp(arm, "pending");
+    const int pending_gap = !strcmp(arm, "v2-pending-gap");
+    const int pending_hit = !strcmp(arm, "v2-pending-hit");
+    const int grown_gap = !strcmp(arm, "v2-grown-gap");
+    const int pending = !strcmp(arm, "pending") || pending_gap || pending_hit;
     const int off = !strcmp(arm, "off");
-    REQUIRE(overlap || pending || off || !strcmp(arm, "gap"));
+    REQUIRE(overlap || pending || grown_gap || off || !strcmp(arm, "gap"));
     hoist = !off;
+    hoist_v2 = pending_gap || pending_hit || grown_gap;
     char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&g_dev, why, sizeof why));
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
@@ -109,6 +127,8 @@ int main(int argc, char **argv) {
 
     const size_t page = nvn_dirty_page_size(), bytes = 8 * page;
     uint8_t *guest = NULL;
+    struct sigaction fault = {.sa_sigaction = handle_dirty_fault, .sa_flags = SA_SIGINFO};
+    REQUIRE(sigemptyset(&fault.sa_mask) == 0 && sigaction(SIGSEGV, &fault, NULL) == 0);
     REQUIRE(!posix_memalign((void **)&guest, page, bytes));
     memset(guest, 0, bytes);
     REQUIRE(nvn_dirty_log_configure(1));
@@ -133,8 +153,8 @@ int main(int argc, char **argv) {
     nvn_gpu_buf readback = make_buf(pixel_bytes, NVN_GPU_MEM_SHARED, NULL);
     REQUIRE(pipe && tex && view && readback);
     nvn_be_sub_begin();
+    const uint64_t gpu_off = pending_hit ? 4 * page - sizeof(uint32_t) : 5 * page;
     if (pending) {
-        const uint64_t gpu_off = 5 * page;
         const uint32_t marker = 0xdecafbad;
         // 完成回调在宿主写回；把目标页开放给它，回写数据仍必须来自 GPU。
         prepare_write(guest + gpu_off, sizeof marker);
@@ -145,12 +165,21 @@ int main(int argc, char **argv) {
     // [第 0 页，第 6 页] 的老桶包络罩住第 3 页。overlap 臂再让第一笔真实读取第 3 页。
     draw_column(view, pipe, overlap ? target : guest, 0);
     draw_column(view, pipe, guest + 6 * page, 1);
+    if (grown_gap) {
+        for (unsigned i = 0; i < 40; i++) {
+            REQUIRE(rp_buf_resolve(g_cmd, (uint64_t)(uintptr_t)(guest + page + 2 * i), 1, &mirror, NULL));
+            REQUIRE(rp_buf_resolve(g_cmd, (uint64_t)(uintptr_t)(guest + 5 * page + 2 * i), 1, &mirror, NULL));
+        }
+    }
     if (overlap) write_vertices(target, 1);
     write_vertices(target + 128, 1);
     draw_column(view, pipe, target + 128, 2);
     const int pre = g_pre != NULL;
     rp_pass_end(g_cmd);
     nvn_gpu_copy_tex_buf(g_cmd, tex, 0, 0, NULL, readback, 0, WIDTH * 4, pixel_bytes);
+    const void *landing_span = pending_hit ? nvn_dirty_span(guest + gpu_off, sizeof(uint32_t)) : NULL;
+    REQUIRE(!pending_hit || (landing_span && nvn_dirty_page_armed(landing_span, guest + gpu_off)));
+    const uint64_t before_landing = nvn_dirty_now();
     commit_mirror();
 
     static const uint8_t row[WIDTH][4] = {{255, 0, 0, 255}, {255, 0, 0, 255},
@@ -161,13 +190,15 @@ int main(int argc, char **argv) {
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++) bad += memcmp(pixels + 4 * (y * WIDTH + x), row[x], 4) != 0;
     uint32_t landed = 0;
-    memcpy(&landed, guest + 5 * page, sizeof landed);
+    memcpy(&landed, guest + gpu_off, sizeof landed);
     printf("MIRROR_HOIST arm=%s pre=%d passes=%d draw1=%02x%02x%02x%02x bad_pixels=%u landed=%08x\n",
            arm, pre, passes, pixels[0], pixels[1], pixels[2], pixels[3], bad, landed);
-    const int want_pre = !off && !overlap && !pending;
+    const int want_pre = !off && !overlap && (!pending || pending_gap);
     CHECK(pre == want_pre && passes == 2 - want_pre, "%s: wrong pre-submit placement / pass count", arm);
     CHECK(!bad, "%s: rendered bytes changed", arm);
     CHECK(landed == (pending ? 0xdecafbadu : 0), "%s: GPU writeback changed", arm);
+    CHECK(!pending_hit || nvn_dirty_since_span(landing_span, guest + gpu_off, sizeof landed, before_landing),
+          "%s: landing did not dirty the protected page", arm);
     CHECK(!nvn_unimpl_kinds(), "%s: replay reported unsupported calls", arm);
 
     nvn_gpu_buf_release(readback, NULL, NULL);
