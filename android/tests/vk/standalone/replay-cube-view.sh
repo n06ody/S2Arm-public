@@ -8,9 +8,11 @@ out="$repo/build/vk-replay-cube-view"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
-for shader in tri.vert cube.frag cubearr.frag arr.frag compute_read_image.comp; do
+for shader in tri.vert cube.frag cubearr.frag arr.frag compute_read_image.comp audit_storage_read.comp; do
     "${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
+"${GLSLC:-glslc}" --target-env=vulkan1.1 -DS2A_TEST_DYNAMIC_IMAGE_READ=1 \
+    "$repo/android/tests/vk/shaders/audit_storage_read.comp" -o "$out/shaders/audit_storage_read_dynamic.comp.spv"
 inc=(-I "$repo/build/c883-ndk")
 for d in android/tests/vkhost graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include graphics/nvn/gfx/tex android/native android/native/nvn android/native/direct runtime/include; do
     inc+=(-I "$repo/$d")
@@ -50,3 +52,28 @@ grep -q 'kind=segment reason=segment_failed/rc=-1003 .*fence=1024' "$out/audit.l
 for phase in progress final; do
     grep -qE "phase=$phase presents=300 distinct=64 repeats=[1-9][0-9]* overflow=[1-9][0-9]* empty=2 " "$out/audit.log"
 done
+timeout 90 "$out/test" "$out/shaders" read-audit 2>&1 | tee "$out/read-off.log"
+S2A_TEST_RENDER_AUDIT=1 timeout 90 "$out/test" "$out/shaders" read-audit 2>&1 | tee "$out/read-audit.log"
+for log in "$out/read-off.log" "$out/read-audit.log"; do
+    grep -q 'read audit workload failures=0' "$log"
+    grep -q 'storage writer outcome: completed_owner=1 failed_owner=0' "$log"
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then exit 1; fi
+done
+if grep -q 'S2A_RENDER_AUDIT' "$out/read-off.log"; then exit 1; fi
+grep -q 'reason=copy_texture_to_buffer .*submit=17 .*fence=1' "$out/read-audit.log"
+for reason in copy_texture_to_buffer attachment_load storage_image_read; do
+    count=$(grep -c "kind=read_undefined reason=$reason " "$out/read-audit.log" || true)
+    if [ "$count" -ne 1 ]; then
+        echo "FAIL read-before-defined $reason expected=1 actual=$count" >&2
+        audit_failed=1
+    fi
+done
+grep -q 'kind=potential_read reason=storage_image_candidate .*coverage=unwritten' "$out/read-audit.log" || {
+    echo 'FAIL dynamically addressed storage read was not classified as potential' >&2
+    audit_failed=1
+}
+grep -q 'phase=final .*read_undefined=3 potential_read=1$' "$out/read-audit.log" || {
+    echo 'FAIL read-before-defined totals include a no-op, defined value, or missing candidate' >&2
+    audit_failed=1
+}
+exit "${audit_failed:-0}"

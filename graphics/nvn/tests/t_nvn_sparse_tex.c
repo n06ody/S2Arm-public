@@ -404,11 +404,13 @@ static void t_sp_packaged(void) {
     seg_next();
     CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && ups() == u0 + 3);
     nvn_be_tex_release(&a);
-    // (e) 范围：同样随包 + SPARSE + 虚拟池，但未压缩：不走页表（这一类原本就不在页表读的范围里，行为不动）
+    // (e) 随包 + SPARSE + 虚拟池的未压缩布局仍不走页表。读端必须收到明确的准备失败。
     { tex_t u = sp_tex(9172, 0x100000, NVN_FORMAT_RGBA8, 64, 64, 1, NVN_TEXTURE_FLAGS_SPARSE); pkg(&u);
       vmap(sp_v0(&u), sp_pages(&u), NULL);
       const int cc = g_spc.copy_calls, pc = g_spc.prot_calls;
-      CHECK(rp_tex_resolve(&u, &g_fake_cmd) != NULL && g_spc.copy_calls == cc && g_spc.prot_calls == pc);
+      const uint64_t rejected = nvn_unimpl_count("tex", "linear_sparse_unsupported");
+      CHECK(rp_tex_resolve(&u, &g_fake_cmd) == NULL && g_spc.copy_calls == cc && g_spc.prot_calls == pc &&
+            nvn_unimpl_count("tex", "linear_sparse_unsupported") == rejected + 1);
       nvn_be_tex_release(&u); }
     // (f) 随包布局 + 压缩 + 普通池（不是虚拟池）：照旧直接读池里的字节（flags 0），不走页表
     { tex_t n = mk_tex(9173, 0x10000, NVN_FORMAT_RGBA_ASTC_6x6, 64, 64, 1, 0); pkg(&n); memset(n.mem, 0x6C, n.L.size);

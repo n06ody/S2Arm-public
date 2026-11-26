@@ -193,6 +193,10 @@ struct nvn_gpu_shader_s {
     nvn_gpu_stage stage;
     uint8_t precompiled;
     struct s2a_write_bound *write_bounds;  // immutable, indexed by the shader layout entry
+#if NVN_RENDER_AUDIT_SUPPORTED
+    uint32_t def_read_count;
+    struct { uint32_t set, binding, x, y; } def_reads[8];
+#endif
     uint8_t stage_key[8], spirv_digest[32];  // 库阶段键与实际交给 Vulkan 的模块摘要
     uint8_t src_key[8];          // 装载时调用方给的阶段键（现编 / 出库都有，只作日志；stage_key 只在出库件上填）
     nvn_gpu_layout_ent *ents;
@@ -321,6 +325,9 @@ enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     nvn_gpu_cmd_effect *effects;
+#if NVN_RENDER_AUDIT_SUPPORTED
+    struct def_batch *definition;
+#endif
     int land_mode, land_observe, land_tracked, land_epoch;
     uint32_t land_eligible, land_direct;
     uint64_t land_eligible_bytes;
@@ -735,6 +742,10 @@ static void retire_effects(nvn_gpu_cmd c, int completed) {
         g_in_callback--;
     }
 }
+
+#if NVN_RENDER_AUDIT_SUPPORTED
+#include "backend_vulkan_definition.inc"
+#endif
 
 static uint64_t add_sat(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 
@@ -1807,6 +1818,7 @@ static uint32_t occl_read(VkQueryPool pool, uint32_t first, uint32_t n, uint64_t
 
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     NVN_RA_IF(if (status == NVN_GPU_DONE_FAILED) nvn_render_audit_segment(code, s->signal, why));
+    NVN_RA_IF(if (s->cmd && s->cmd->definition) s->cmd->definition->fence = s->signal);
     retire_effects(s->cmd, status != NVN_GPU_DONE_FAILED);
     if (!s->done) return;
     nvn_gpu_done d;
@@ -2142,6 +2154,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     }
 
     if (s->internal) {   // 呈现段：没有回调、不动时间线
+        NVN_RA_IF(retire_effects(s->cmd, !failed));
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2607,6 +2620,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_seg_mu);
     plc_open(d->cache_dir);   // 缓存是加速不是前提：里面任何一步失败都落到「不带缓存」，不让 open 失败
     NVN_RA_BEGIN(nvn_plat_flag("nvk_render_audit", 0));
+    NVN_RA_IF(def_reset());
     g_open = 1;
     return rc(NVN_GPU_OK);
 }
@@ -4079,6 +4093,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
         }
         if (module_result == VK_SUCCESS && sh->stage == NVN_GPU_SH_CS && nvn_plat_flag("nvk_land_bound", 0))
             sh->write_bounds = s2a_spirv_write_bounds(ci.pCode, ci.codeSize, sh->entry, sh->ents, sh->nent);
+        NVN_RA_IF(if (module_result == VK_SUCCESS && sh->stage == NVN_GPU_SH_CS) def_spirv_reads(sh, ci.pCode, ci.codeSize));
         free(array_code);
         if (module_result != VK_SUCCESS) {
             free(sh->tfmt); free(sh->ents); free(sh);
@@ -5895,6 +5910,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
+    NVN_RA_IF(def_pass_rest(c, 1));
     vkCmdEndRenderPass(c->cb);
     c->in_pass = 0;
     c->pass_occl = 0;
@@ -5939,6 +5955,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
         c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
+    NVN_RA_IF(def_pass_begin(c, &d, att, bi.renderArea));
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
@@ -6055,6 +6072,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
     }
+    NVN_RA_IF(def_pass_begin(c, d, att, bi.renderArea));
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     PBP_STEP(3);
     c->in_pass = 1;
@@ -6099,6 +6117,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     if (!c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "pass_end 时不在通道里"); return; }
     if (c->q_active >= 0) { vkCmdEndQuery(c->cb, c->q_active_pool, c->q_active_idx); c->q_active = -1; }   // 查询不跨通道（后端内部拆通道要接着数的，由 occl_spare_* 在新通道里续上）
     c->pass_occl = 0;
+    NVN_RA_IF(def_pass_rest(c, 1));
     vkCmdEndRenderPass(c->cb);
     c->in_pass = 0;
     c->pass_natt = 0;
@@ -7082,7 +7101,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         DIAG_DRAW(vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance));
     }
-    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) loss_note_program(c, p);
+    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) {
+        loss_note_program(c, p);
+        NVN_RA_IF(def_shader(c, 0, 0); def_pass_rest(c, 0));
+    }
     if (dtm) { const uint64_t dt3 = now_ns(); __atomic_fetch_add(&g_draw_ns[0], dt1 - dt0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[1], dt2 - dt1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[2], dt3 - dt2, __ATOMIC_RELAXED);
         // 每 5 秒一次：把后端逐笔的三段（描述符 / 状态 / 顶点索引与绘制调用）摊到每笔上打印，
         // 找到后端这笔 5 微秒里到底是谁（真机读数见坑记录续 27）。
@@ -7150,6 +7172,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
         vkCmdDispatch(c->cb, x, y, z);
     }
     loss_note_program(c, p);
+    NVN_RA_IF(def_shader(c, 1, !ind));
     if (g.cold_enabled) cold_track_shader_writes(c, p, NVN_GPU_SH_CS, COLD_READ_COMPUTE);
 }
 // ---------------------------------------------------------------- 贴图 / 视图 / 采样器
@@ -8152,6 +8175,7 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
     bc.imageOffset = o;
     bc.imageExtent = e;
     vkCmdCopyBufferToImage(c->cb, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    NVN_RA_IF(def_transfer(c, DEF_WRITE, NULL, t, &bc));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);   // 之后按采样 / 存储使用；本段统一用 GENERAL
     cmd_ref(c, b, REF_BUF);
     cmd_ref(c, t, REF_TEX);
@@ -8211,6 +8235,7 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageSubresource = (VkImageSubresourceLayers){copy_face_aspect(t), level, t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};   // 深度模板贴图只回读深度面（#1581 K）
     bc.imageOffset = o;
     bc.imageExtent = e;
+    NVN_RA_IF(def_transfer(c, DEF_READ, "copy_texture_to_buffer", t, &bc));
     vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
@@ -8270,6 +8295,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     ic.dstSubresource = (VkImageSubresourceLayers){d->aspect, dlevel, dlayer, 1};
     ic.dstOffset = dof;
     ic.extent = se;
+    NVN_RA_IF(def_copy(c, "copy_texture", def_image(s, ic.srcSubresource, so, se), def_image(d, ic.dstSubresource, dof, de)));
     vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
@@ -8319,6 +8345,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         }
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
+    NVN_RA_IF(def_range_write(c, t, range));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
 }
@@ -8495,6 +8522,8 @@ static void bc_temp_to_tex(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, str
     cp.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1}; cp.dstOffset = off; cp.dstOffset.z += (int32_t)z;
     cp.extent = (VkExtent3D){ext.width, ext.height, 1};
     vkCmdCopyImage(c->cb, tmp->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    NVN_RA_IF(def_record(c, (struct def_op){.kind = DEF_WRITE,
+        .src = def_image(t, cp.dstSubresource, cp.dstOffset, cp.extent)}));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL); cmd_ref(c, t, REF_TEX);
 }
 
@@ -8760,6 +8789,19 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     if (!pass_ensure_area(c, (VkRect2D){{d->x, d->y}, {d->w, d->h}})) return;
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
+    NVN_RA_IF(
+        if (rc_is(c->sticky, NVN_GPU_OK)) {
+            const VkRect2D area = {{d->x, d->y}, {d->w, d->h}};
+            if (d->color >= 0)
+                def_attachment(c, cm == 0xf ? DEF_WRITE : DEF_MAY_WRITE, c->pass_desc.color[d->color].view,
+                               VK_IMAGE_ASPECT_COLOR_BIT, c->pass_layers, area, d->color);
+            if (d->depth)
+                def_attachment(c, DEF_WRITE, c->pass_desc.depth.view, VK_IMAGE_ASPECT_DEPTH_BIT, c->pass_layers, area, 8);
+            if (d->stencil)
+                def_attachment(c, sm == 0xff ? DEF_WRITE : DEF_MAY_WRITE, c->pass_desc.stencil.view,
+                               VK_IMAGE_ASPECT_STENCIL_BIT, c->pass_layers, area, 8);
+        }
+    );
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
 }
 
@@ -8860,6 +8902,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
         ir.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, sv->base_level, sv->base_layer, 1};
         ir.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1};
         ir.srcOffset = so; ir.dstOffset = dof; ir.extent = se;
+        NVN_RA_IF(def_copy(c, "resolve_image", def_image(s, ir.srcSubresource, so, se), def_image(d, ir.dstSubresource, dof, de)));
         vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir);
         image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
         cmd_ref(c, s, REF_TEX); cmd_ref(c, d, REF_TEX);
@@ -8901,6 +8944,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if (flip_x) { int32_t x = ib.srcOffsets[0].x; ib.srcOffsets[0].x = ib.srcOffsets[1].x; ib.srcOffsets[1].x = x; }
     if (flip_y) { int32_t y = ib.srcOffsets[0].y; ib.srcOffsets[0].y = ib.srcOffsets[1].y; ib.srcOffsets[1].y = y; }
     ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, 1};
+    NVN_RA_IF(def_copy(c, "blit_image", def_image(s, ib.srcSubresource, so, se), def_image(d, ib.dstSubresource, dof, de)));
     vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);

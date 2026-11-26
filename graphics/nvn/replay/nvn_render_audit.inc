@@ -4,7 +4,7 @@
 enum { AUDIT_KEYS = 64, AUDIT_REASON_BYTES = 64, AUDIT_PRESENT_INTERVAL = 300 };
 
 static const char *const audit_kind_names[NVN_RA_KIND_COUNT] = {
-    "descriptor", "view", "attachment", "skip", "unimpl", "sticky", "segment"
+    "descriptor", "view", "attachment", "skip", "unimpl", "sticky", "segment", "read_undefined", "potential_read"
 };
 static const struct nvn_render_audit_binding audit_no_binding = {
     .stage = -1, .set = -1, .binding = -1, .element = -1
@@ -17,7 +17,7 @@ static struct {
     } keys[AUDIT_KEYS];
     uint64_t total[NVN_RA_KIND_COUNT];
     uint64_t presents, repeats, overflow, empty;
-    unsigned key_count;
+    unsigned key_count, potential_keys;
 } audit;
 static pthread_mutex_t audit_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local struct { uint64_t submit; unsigned op; } audit_context;
@@ -31,13 +31,15 @@ static int audit_same_binding(const struct nvn_render_audit_binding *a, const st
 
 static void audit_format_summary(char *line, size_t cap, const char *phase) {
     snprintf(line, cap,
-             "S2A_RENDER_AUDIT phase=%s presents=%llu distinct=%u repeats=%llu overflow=%llu empty=%llu descriptor=%llu view=%llu attachment=%llu skip=%llu unimpl=%llu sticky=%llu segment=%llu",
+             "S2A_RENDER_AUDIT phase=%s presents=%llu distinct=%u repeats=%llu overflow=%llu empty=%llu descriptor=%llu view=%llu attachment=%llu skip=%llu unimpl=%llu sticky=%llu segment=%llu read_undefined=%llu potential_read=%llu",
              phase, (unsigned long long)audit.presents, audit.key_count, (unsigned long long)audit.repeats,
              (unsigned long long)audit.overflow, (unsigned long long)audit.empty,
              (unsigned long long)audit.total[NVN_RA_DESCRIPTOR], (unsigned long long)audit.total[NVN_RA_VIEW],
              (unsigned long long)audit.total[NVN_RA_ATTACHMENT], (unsigned long long)audit.total[NVN_RA_SKIP],
              (unsigned long long)audit.total[NVN_RA_UNIMPL], (unsigned long long)audit.total[NVN_RA_STICKY],
-             (unsigned long long)audit.total[NVN_RA_SEGMENT]);
+             (unsigned long long)audit.total[NVN_RA_SEGMENT],
+             (unsigned long long)audit.total[NVN_RA_UNDEFINED_READ],
+             (unsigned long long)audit.total[NVN_RA_POTENTIAL_READ]);
 }
 
 void nvn_render_audit_begin(int enabled) {
@@ -50,7 +52,7 @@ void nvn_render_audit_begin(int enabled) {
 }
 
 void nvn_render_audit_end(void) {
-    char line[320];
+    char line[480];
     pthread_mutex_lock(&audit_mu);
     __atomic_store_n(&nvn_render_audit_enabled, 0, __ATOMIC_RELEASE);
     audit_format_summary(line, sizeof line, "final");
@@ -63,8 +65,13 @@ void nvn_render_audit_context(uint64_t submit, unsigned op) {
     audit_context.op = op;
 }
 
+void nvn_render_audit_get_context(uint64_t *submit, unsigned *op) {
+    *submit = audit_context.submit;
+    *op = audit_context.op;
+}
+
 void nvn_render_audit_present(void) {
-    char line[320];
+    char line[480];
     pthread_mutex_lock(&audit_mu);
     int tick = nvn_render_audit_on() && !(++audit.presents % AUDIT_PRESENT_INTERVAL);
     if (tick) audit_format_summary(line, sizeof line, "progress");
@@ -94,12 +101,13 @@ static void audit_note(enum nvn_render_audit_kind kind, const char *reason,
             return;
         }
     }
-    if (audit.key_count == AUDIT_KEYS) {
+    if (audit.key_count == AUDIT_KEYS || (kind == NVN_RA_POTENTIAL_READ && audit.potential_keys == 16)) {
         audit.overflow++;
         pthread_mutex_unlock(&audit_mu);
         return;
     }
     struct audit_key *key = &audit.keys[audit.key_count++];
+    if (kind == NVN_RA_POTENTIAL_READ) audit.potential_keys++;
     key->kind = kind;
     key->binding = *binding;
     snprintf(key->reason, sizeof key->reason, "%s", reason);
@@ -113,12 +121,18 @@ static void audit_note(enum nvn_render_audit_kind kind, const char *reason,
              (unsigned long long)fence, (unsigned long long)binding->program, binding->stage, binding->set,
              binding->binding, binding->element, binding->format, binding->target, binding->aspect,
              binding->level, binding->layer, detail ? detail : "");
-    nvn_plat_log(NVN_PLAT_LOG_RED, "render_audit", line);
+    nvn_plat_log(kind == NVN_RA_POTENTIAL_READ ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_RED, "render_audit", line);
 }
 
 void nvn_render_audit_event(enum nvn_render_audit_kind kind, const char *reason,
                             const struct nvn_render_audit_binding *binding, const char *detail) {
     audit_note(kind, reason, binding, detail, audit_context.submit, audit_context.op, 0);
+}
+
+void nvn_render_audit_event_at(enum nvn_render_audit_kind kind, const char *reason,
+                               const struct nvn_render_audit_binding *binding, const char *detail,
+                               uint64_t submit, unsigned op, uint64_t fence) {
+    audit_note(kind, reason, binding, detail, submit, op, fence);
 }
 
 void nvn_render_audit_segment(int code, uint64_t fence, const char *detail) {

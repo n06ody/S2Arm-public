@@ -222,6 +222,8 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
             copy.srcSubresource = (VkImageSubresourceLayers){aspect, lv, image3d ? 0 : v->base_layer, image3d ? 1 : v->layers};
             copy.dstSubresource = copy.srcSubresource;
             copy.extent = (VkExtent3D){w ? w : 1, h ? h : 1, z ? z : 1};
+            NVN_RA_IF(def_copy(c, "feedback_copy", def_image(s, copy.srcSubresource, copy.srcOffset, copy.extent),
+                             def_image(t, copy.dstSubresource, copy.dstOffset, copy.extent)));
             vkCmdCopyImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[1], 1, __ATOMIC_RELAXED);

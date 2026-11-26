@@ -62,6 +62,7 @@ static int wb_index(struct wb_module* m) {
     switch (op) {
       case SpvOpTypeInt:
       case SpvOpTypePointer:
+      case SpvOpTypeVector:
         result = 1;
         min = 4;
         break;
@@ -77,11 +78,16 @@ static int wb_index(struct wb_module* m) {
         break;
       case SpvOpVariable:
       case SpvOpConstant:
+      case SpvOpConstantComposite:
       case SpvOpLoad:
       case SpvOpBitcast:
       case SpvOpCopyObject:
         result = 2;
         min = 4;
+        break;
+      case SpvOpConstantNull:
+        result = 2;
+        min = 3;
         break;
       case SpvOpAccessChain:
       case SpvOpInBoundsAccessChain:

@@ -400,6 +400,8 @@ static int wsi_compose_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
         bl.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.dstOffsets[0] = (VkOffset3D){dx, dy, 0}; bl.dstOffsets[1] = (VkOffset3D){dx + dw, dy + dh, 1};
         VkFilter filt = d->filter && (fp->optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        NVN_RA_IF(def_explicit_read(c, "present_source", def_image(st, bl.srcSubresource,
+            (VkOffset3D){sx, sy, 0}, (VkExtent3D){(uint32_t)sw, (uint32_t)sh, 1})));
         vkCmdBlitImage(c->cb, st->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, filt);
     }
     if (encode) {
@@ -436,6 +438,9 @@ static int wsi_compose_easu(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
     if (fit != EASU_RECT_ATTEMPT ||
         !easu_compose(c, s->images[idx], s->extent, 0, s->format, d->src, &rect, d->flip_y, s->gen, encode))
         return 0;
+    NVN_RA_IF(def_explicit_read(c, "present_source", def_image(d->src->tex,
+        (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, d->src->base_level, d->src->base_layer, 1},
+        (VkOffset3D){rect.sx, rect.sy, 0}, (VkExtent3D){(uint32_t)rect.sw, (uint32_t)rect.sh, 1})));
     wsi_swap_barrier(c->cb, s->images[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);

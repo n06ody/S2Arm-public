@@ -539,13 +539,153 @@ static void check_empty_and_unavailable(const char *dir, const tex_t *cube) {
     CHECK(table == NULL, "registered pool sampler failure was replaced with an empty sampler");
 }
 
+static void record_storage_access(nvn_gpu_cmd cmd, const char *dir, const char *file, nvn_gpu_view view, int write) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.spv", dir, file);
+    size_t bytes = 0;
+    void *blob = read_file(path, &bytes);
+    CHECK(blob != NULL, "read audit shader loaded: %s", file);
+    if (!blob) return;
+    const nvn_gpu_layout_ent entries[] = {
+        {.binding = 0, .cls = NVN_GPU_RES_IMAGE, .access = write ? NVN_GPU_ACC_W : NVN_GPU_ACC_R, .count = 1, .stages = 1u << NVN_GPU_SH_CS},
+        {.binding = 1, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_W, .count = 1, .stages = 1u << NVN_GPU_SH_CS},
+    };
+    const nvn_gpu_layout layout = {.ent = entries, .nent = write ? 1 : 2};
+    const nvn_gpu_shader_src src = {
+        .stage = NVN_GPU_SH_CS, .kind = NVN_GPU_BLOB_SPIRV, .blob = blob, .bytes = bytes, .entry = "main", .layout = &layout,
+    };
+    nvn_gpu_shader shader = NULL;
+    nvn_gpu_err err = {0};
+    const nvn_gpu_rc loaded = nvn_gpu_shader_load(&src, &shader, &err);
+    free(blob);
+    CHECK(OK(loaded), "read audit shader: %s", err.why);
+    if (!OK(loaded)) return;
+    const nvn_gpu_stage_desc stage = {.sh = shader};
+    nvn_gpu_pipe pipe = NULL;
+    const nvn_gpu_rc built = nvn_gpu_cpipe_get(&stage, NVN_GPU_PIPE_SYNC, &pipe, &err);
+    CHECK(OK(built), "read audit compute pipeline: %s", err.why);
+    if (OK(built)) {
+        nvn_gpu_buf output = write ? NULL : make_buf(16, NVN_GPU_MEM_SHARED, NULL);
+        const nvn_gpu_binding bind[] = {
+            {.ent = 0, .cls = NVN_GPU_RES_IMAGE, .u.view = view},
+            {.ent = 1, .cls = NVN_GPU_RES_SSBO, .u.b = {.buf = output, .len = 16}},
+        };
+        nvn_gpu_set_pipe(cmd, pipe);
+        nvn_gpu_bind(cmd, NVN_GPU_SH_CS, bind, layout.nent);
+        nvn_gpu_dispatch(cmd, pipe, 0, 1, 1, NULL, 0);  // Legal no-op with real bindings.
+        nvn_gpu_dispatch(cmd, pipe, 1, 1, 1, NULL, 0);
+        if (output) nvn_gpu_buf_release(output, NULL, NULL);
+    }
+    nvn_gpu_shader_release(shader);
+}
+
+static void check_read_definition(const char *dir) {
+    const uint32_t usage = NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE;
+    nvn_gpu_tex fresh = make_tex(1, 1, NVN_FORMAT_RGBA8, usage);
+    nvn_gpu_tex black = make_tex(1, 1, NVN_FORMAT_RGBA8, usage);
+    nvn_gpu_view fresh_view = make_view(fresh), black_view = make_view(black);
+    const uint8_t poison[8] = {0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd};
+    nvn_gpu_buf read = make_buf(sizeof poison, NVN_GPU_MEM_SHARED, poison);
+    const float black_rgba[4] = {0};
+    const uint32_t black_uint[4] = {0};
+    nvn_gpu_cmd discarded = begin_cmd();
+    nvn_gpu_clear_view(discarded, fresh_view, black_rgba, black_uint, 0);
+    nvn_gpu_cmd_abort(discarded);  // A recorded but abandoned clear never defined the image.
+    nvn_gpu_cmd cmd = begin_cmd();
+    NVN_RA_IF(nvn_render_audit_context(17, OP_COPY_T2B));
+
+    // The first copy consumes uninitialized pixels. Its result is unspecified;
+    // only the diagnostic is asserted. The readback below asserts real black.
+    nvn_gpu_copy_tex_buf(cmd, fresh, 0, 0, NULL, read, 0, 4, 4);
+    nvn_gpu_pass_desc load = {.ncolor = 1, .w = 1, .h = 1, .layers = 1};
+    load.color[0].view = fresh_view;
+    load.color[0].load = NVN_GPU_LOAD_LOAD;
+    load.color[0].store = NVN_GPU_STORE_STORE;
+    nvn_gpu_pass_begin(cmd, &load);
+    nvn_gpu_pass_end(cmd);
+    NVN_RA_IF(nvn_render_audit_context(17, OP_DISPATCH));
+    record_storage_access(cmd, dir, "audit_storage_read.comp", fresh_view, 0);
+    record_storage_access(cmd, dir, "audit_storage_read_dynamic.comp", fresh_view, 0);
+
+    nvn_gpu_clear_view(cmd, black_view, black_rgba, black_uint, 0);
+    load.color[0].view = black_view;
+    nvn_gpu_pass_begin(cmd, &load);
+    nvn_gpu_pass_end(cmd);
+    record_storage_access(cmd, dir, "audit_storage_read.comp", black_view, 0);
+    nvn_gpu_copy_tex_buf(cmd, black, 0, 0, NULL, read, 4, 4, 4);
+    finish(cmd);
+
+    const uint8_t *actual = buf_cpu(read);
+    const uint8_t zero[4] = {0};
+    CHECK(actual && !memcmp(actual + 4, zero, sizeof zero), "defined black must read back exactly zero");
+    nvn_gpu_buf_release(read, NULL, NULL);
+    nvn_gpu_view_release(fresh_view);
+    nvn_gpu_view_release(black_view);
+    nvn_gpu_tex_release(fresh);
+    nvn_gpu_tex_release(black);
+}
+
+static void check_storage_write_outcome(const char *dir) {
+    tex_t previous = {.serial = 100, .d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
+        .width = 1, .height = 1, .depth = 1, .levels = 1, .flags = NVN_TEXTURE_FLAGS_IMAGE}};
+    nvn_tex_layout(&previous.d, &previous.L);
+    tex_t rejected = previous;
+    rejected.serial++;
+    active = begin_cmd();
+    nvn_gpu_view view = rp_view_for(&previous, NULL, active);
+    CHECK(view, "replay storage write view");
+    if (!view) { nvn_gpu_cmd_abort(active); active = NULL; return; }
+    nvn_gpu_buf read = make_buf(4, NVN_GPU_MEM_SHARED, NULL);
+    record_storage_access(active, dir, "compute_read_image.comp", view, 1);
+    CHECK(nvn_gpu_cmd_record_ok(active), "record valid storage producer");
+    rp_tex_mark_gpu_written(active, &previous);
+    nvn_gpu_copy_tex_buf(active, nvn_gpu_view_texture(view), 0, 0, NULL, read, 0, 4, 4);
+    finish(active);
+    const uint8_t green[4] = {0, 255, 0, 255};
+    const void *actual = buf_cpu(read);
+    CHECK(actual && !memcmp(actual, green, sizeof green), "successful storage producer wrote the shader's green texel");
+    nvn_gpu_buf_release(read, NULL, NULL);
+
+    active = begin_cmd();
+    view = rp_view_for(&rejected, NULL, active);
+    CHECK(view, "storage write view for failed segment");
+    if (!view) { nvn_gpu_cmd_abort(active); active = NULL; return; }
+    record_storage_access(active, dir, "compute_read_image.comp", view, 1);
+    CHECK(nvn_gpu_cmd_record_ok(active), "failed segment actually recorded the storage producer");
+    rp_tex_mark_gpu_written(active, &rejected);
+    CHECK(nvn_be_tex_gpu_owned(rejected.serial), "same recording sees its storage writer");
+    const int done_before = atomic_load(&g_ndone);
+    const uint64_t failed_signal = ++fixture_signal;
+    nvn_gpu_err err = {0};
+    nvn_gpu_vk_test_set_fault(1);
+    CHECK(nvn_gpu_cmd_commit(active, failed_signal, on_done, NULL, &err).code == NVN_GPU_E_DEVICE,
+          "storage producer segment was rejected: %s", err.why);
+    const struct done_rec *done = wait_signal(failed_signal, done_before, 5000);
+    CHECK(done && done->status == NVN_GPU_DONE_FAILED, "failed storage producer retired");
+    const int previous_owned = nvn_be_tex_gpu_owned(previous.serial), rejected_owned = nvn_be_tex_gpu_owned(rejected.serial);
+    CHECK(previous_owned && !rejected_owned, "storage write ownership survived only for the completed segment");
+    printf("storage writer outcome: completed_owner=%d failed_owner=%d\n", previous_owned, rejected_owned);
+    active = NULL;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    const int read_audit = argc == 3 && !strcmp(argv[2], "read-audit");
+    if (argc != 2 && !read_audit) return 2;
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) { fprintf(stderr, "device: %s\n", why); return 2; }
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
     g_desc = (nvn_gpu_open_desc){.host_device = &g_dev, .app_label = "replay-cube-view"};
     if (!open_backend()) return 2;
+    if (read_audit) {
+        check_read_definition(argv[1]);
+        check_storage_write_outcome(argv[1]);
+        rp_res_reset();
+        nvn_gpu_err err = {0};
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close read audit: %s", err.why);
+        s2a_vk_device_destroy(&g_dev, 1);
+        printf("read audit workload failures=%d\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     for (unsigned i = 0; i < 12; i++) {
         colors[i][0] = 17 + 11 * i;
         colors[i][1] = 31 + 13 * i;

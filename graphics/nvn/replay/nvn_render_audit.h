@@ -5,7 +5,8 @@
 
 enum nvn_render_audit_kind {
     NVN_RA_DESCRIPTOR, NVN_RA_VIEW, NVN_RA_ATTACHMENT, NVN_RA_SKIP,
-    NVN_RA_UNIMPL, NVN_RA_STICKY, NVN_RA_SEGMENT, NVN_RA_KIND_COUNT
+    NVN_RA_UNIMPL, NVN_RA_STICKY, NVN_RA_SEGMENT,
+    NVN_RA_UNDEFINED_READ, NVN_RA_POTENTIAL_READ, NVN_RA_KIND_COUNT
 };
 
 struct nvn_render_audit_binding {
@@ -28,9 +29,13 @@ void nvn_render_audit_begin(int enabled) NVN_RA_OPTIONAL;
 void nvn_render_audit_end(void) NVN_RA_OPTIONAL;
 void nvn_render_audit_present(void) NVN_RA_OPTIONAL;
 void nvn_render_audit_context(uint64_t submit, unsigned op) NVN_RA_OPTIONAL;
+void nvn_render_audit_get_context(uint64_t *submit, unsigned *op) NVN_RA_OPTIONAL;
 void nvn_render_audit_empty(uint32_t count) NVN_RA_OPTIONAL;
 void nvn_render_audit_event(enum nvn_render_audit_kind kind, const char *reason,
                             const struct nvn_render_audit_binding *binding, const char *detail) NVN_RA_OPTIONAL;
+void nvn_render_audit_event_at(enum nvn_render_audit_kind kind, const char *reason,
+                               const struct nvn_render_audit_binding *binding, const char *detail,
+                               uint64_t submit, unsigned op, uint64_t fence) NVN_RA_OPTIONAL;
 void nvn_render_audit_segment(int code, uint64_t fence, const char *detail) NVN_RA_OPTIONAL;
 #undef NVN_RA_OPTIONAL
 

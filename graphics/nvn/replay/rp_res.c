@@ -130,7 +130,8 @@ static void restore_tex_content(struct rp_tex *x, const struct tex_snapshot *old
     x->uploaded = same_storage && old->uploaded;
     x->need_init = !same_storage || old->need_init;
     x->zero_pending = same_storage && old->zero_pending;
-    x->init_retry = old->init_retry || (!x->gpu_written && !x->uploaded);
+    x->init_retry = old->init_retry || !same_storage || old->need_init || old->zero_pending ||
+        (old->cpu && !old->gpu_written && !old->uploaded);
     x->wrote = same_storage ? old->wrote : 0;
     x->stamp = old->stamp;
     x->vgen = old->vgen;

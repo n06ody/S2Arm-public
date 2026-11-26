@@ -157,6 +157,9 @@ static void depth_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *sv, const
         push.bit = 1u << bit; vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, push.bit);
         vkCmdPushConstants(c->cb, g_dsb.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36, &push); vkCmdDraw(c->cb, 3, 1, 0, 0);
     }
+    NVN_RA_IF(def_copy(c, "depth_stencil_copy",
+        def_image(s, (VkImageSubresourceLayers){ds, sv->base_level, sv->base_layer, 1}, so, se),
+        def_image(d, (VkImageSubresourceLayers){ds, dv->base_level, dv->base_layer, 1}, dof, de)));
     nvn_gpu_pass_end(c); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL); full_barrier(c);
     // 抽象绑定/动态状态仍属于调用方；物理命令缓冲被辅助绘制改过，下一笔须全部重发。
     es_reset(c); memset(c->dsh_ok, 0, sizeof c->dsh_ok); c->desc_point = 0;

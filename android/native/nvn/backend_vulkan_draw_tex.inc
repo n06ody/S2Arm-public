@@ -208,5 +208,11 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
     vkCmdSetBlendConstants(c->cb, d->blend_color);
     vkCmdPushConstants(c->cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, d->uv);
     vkCmdDraw(c->cb, 4, 1, 0, 0);
+    NVN_RA_IF(
+        def_record(c, (struct def_op){.kind = DEF_MAY_READ, .reason = "draw_texture_source",
+            .src = def_full(v->tex, (VkImageSubresourceLayers){v->aspect, v->base_level, v->base_layer, 1}),
+            .binding = {.stage = NVN_GPU_SH_FS, .set = 0, .binding = 0, .element = 0}});
+        def_pass_rest(c, 0);
+    );
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 改绑了描述符组：下一笔全部重建（同 clear_rect）
 }

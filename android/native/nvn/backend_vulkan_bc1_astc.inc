@@ -153,6 +153,7 @@ static int bc1_astc_encode(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
     };
     vkCmdCopyBufferToImage(c->cb, output.buf->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    NVN_RA_IF(def_transfer(c, DEF_WRITE, NULL, t, &copy));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     es_reset(c);
     c->desc_layout = VK_NULL_HANDLE;

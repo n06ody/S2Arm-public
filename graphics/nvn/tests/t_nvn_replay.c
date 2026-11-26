@@ -1509,11 +1509,12 @@ static void t_view_storage_pixels(void) {
 static void t_alias(void) {   // 同池同偏移同描述的对象共用一份存储；只差用途标志也算同一份；偏移不同是两份
     nvn_be_sub_begin();
     res_fresh(); int c0 = g_tex_creates, r0 = g_tex_releases;
+    const uint64_t uploads = rp_res_uploads();
     tex_t a = mk_tex(1, 0, NVN_FORMAT_RGBA8, 32, 32, 1, 0), b = mk_tex(2, 0, NVN_FORMAT_RGBA8, 32, 32, 1, NVN_TEXTURE_FLAGS_IMAGE), c = mk_tex(3, 0x4000, NVN_FORMAT_RGBA8, 32, 32, 1, 0);
     nvn_gpu_tex ga = rp_tex_resolve(&a, &g_fake_cmd), gb = rp_tex_resolve(&b, &g_fake_cmd), gc = rp_tex_resolve(&c, &g_fake_cmd);
     CHECK(ga && ga == gb && gc && gc != ga);
     CHECK(g_tex_creates - c0 == 2 && rp_res_tex_built() == 2 && rp_res_tex_serials() == 3);
-    CHECK(rp_res_uploads() == 0);                                   // 存储全 0：不是 CPU 内容，不当 CPU 贴图传
+    CHECK(rp_res_uploads() == uploads);                             // 存储全 0：不是 CPU 内容，不增加 CPU 贴图上传
     { static const uint8_t zero[64]; CHECK(g_nup == 2 && g_up[0].img == 32 * 32 * 4 && g_up[1].img == 32 * 32 * 4 && !memcmp(g_up[0].first, zero, 64) && !memcmp(g_up[1].first, zero, 64)); }   // 新建的两份存储各清零一次（共用的那份只清一次）
     CHECK(g_last_usage & NVN_GPU_TEX_RENDER);                       // 能当附件的格式建图时就带附件用途
     tex_t sw = mk_tex(4, 0x8000, NVN_FORMAT_RGBA8, 32, 32, 1, 0); sw.set_swz = 1; sw.swz = 2 | 3 << 3 | 4 << 6 | 5 << 9;
