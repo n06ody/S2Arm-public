@@ -5325,6 +5325,19 @@ static void t_gpu_land_merge(void) {
     CHECK(bad == 0 && g_pmem[63] == 0x11 && g_pmem[128] == 0x11);
     rp_buf_gpu_write_land(key, id5, 1);                                                                     // 被吞掉那条的登记号迟到落地
     CHECK(g_land_copies == 1 && g_land_copied == 64 && rp_test_gw_live() == 0);
+    // 先登记右侧写，再从左侧并入：镜像的原区间保留，两次写的有效前缀都要落地。
+    uint64_t partial = rp_buf_gpu_write_note_prefix(base + 160, 48, 8, &key, &m);
+    CHECK(partial && !m);
+    CHECK(rp_buf_gpu_write_note_prefix(base + 144, 32, 4, &key, &m) == partial && m);
+    CHECK(rp_test_gw_get(key, 0, &o, &l) == 1 && o == 144 && l == 64);
+    struct rp_gpu_write_ref ref = {.pool_key=key, .id=partial, .index=0};
+    nvn_gpu_readback_span staged = {0};
+    rp_buf_gpu_write_snapshot(&ref, 1, &staged);
+    CHECK(staged.src == b && staged.offset == 144 && staged.bytes == 24);
+    memset(b->cpu + 144, 0xcd, 64);
+    g_land_copied = 0;
+    rp_buf_gpu_write_land(key, partial, 1);
+    CHECK(g_land_copied == 24 && g_pmem[167] == 0xcd && g_pmem[168] == 0x11);
     // ④ 负对照 a：不同提交的登记不并（上一次提交的登记还没落地——显卡还在做——这一次的相接也不能并进去）
     uint64_t ia = rp_buf_gpu_write_note2(base + 200, 16, &key, &m); CHECK(ia && m == 0);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_sub_begin();

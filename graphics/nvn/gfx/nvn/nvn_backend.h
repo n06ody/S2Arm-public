@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 24   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 25   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -304,6 +304,8 @@ typedef struct {
 // 装载一个阶段的代码与布局（布局被后端拷走）。线程：[任意]（含 [后台] 预取）。生命周期：到 release；管线持有它用到的着色器。
 // 出错：NVN_GPU_E_COMPILE（why 带编译器原文）、NVN_GPU_E_LAYOUT（布局与 blob 不符，why 写第一处不符的项）、NVN_GPU_E_UNSUPPORTED（不收这种 blob）。
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err);
+// [提交] 可选反射：直接计算派发写该描述符的保守字节末端（相对窗口）；0 表示未知。
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader sh, unsigned index, unsigned set, unsigned binding, uint32_t groups_x);
 void nvn_gpu_shader_release(nvn_gpu_shader s);
 
 // ---------- 管线 ----------
