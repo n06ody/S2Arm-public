@@ -9,6 +9,7 @@
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
+#include "rp_roi_history.h"
 #include "nvn_mtl.h"
 #include "nvn_hmap.h"
 
@@ -149,6 +150,7 @@ static int pool_find_fast(pool_tls *const t, uint64_t addr, uint64_t len, const 
     return 1;
 }
 void nvn_be_pool_add(const void *mem, uint64_t size) {
+    RP_HISTORY(NULL,NULL,"event=pool action=add backing=%p bytes=%llu",mem,(unsigned long long)size);
     if (!mem || !size) return;
     pthread_mutex_lock(&g_mu);
     if (g_npool < RP_NPOOL) {
@@ -177,6 +179,7 @@ void nvn_be_pool_cover(const void *mem, uint64_t size, uint64_t need) {
     pthread_mutex_unlock(&g_mu);
 }
 void nvn_be_pool_del(const void *mem) {
+    RP_HISTORY(NULL,NULL,"event=pool action=del backing=%p",mem);
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) {
         memmove(&g_pool[i], &g_pool[i + 1], (size_t)(g_npool - i - 1) * sizeof g_pool[0]);
@@ -234,6 +237,7 @@ static nvn_hmap g_tex_live; static int g_tex_live_inited;
 static _Atomic uint64_t g_tex_init_n, g_tex_rel_n;
 void nvn_be_tex_init(const tex_t *t) {
     if (!t->serial) return;
+    rp_history_texture(NULL,NULL,t,0,"init");
     atomic_fetch_add(&g_tex_init_n, 1);
     pthread_mutex_lock(&g_mu);
     if (!g_tex_live_inited) { nvn_hm_init(&g_tex_live, 8); g_tex_live_inited = 1; }
@@ -242,6 +246,7 @@ void nvn_be_tex_init(const tex_t *t) {
 }
 void nvn_be_tex_release(tex_t *t) {
     if (!t || !t->serial) return;
+    rp_history_texture(NULL,NULL,t,0,"release");
     atomic_fetch_add(&g_tex_rel_n, 1);
     pthread_mutex_lock(&g_mu);
     if (g_tex_live_inited) nvn_hm_del(&g_tex_live, &t->serial);

@@ -11,6 +11,7 @@
 #define nvn_gpu_cmd_commit fixture_gpu_cmd_commit
 #define nvn_gpu_tex_upload_blocklinear fixture_upload_blocklinear
 #include "t_nvn_replay.c"
+#include "../replay/rp_bc7.h"
 #undef nvn_gpu_tex_upload_blocklinear
 #undef nvn_gpu_cmd_commit
 #undef nvn_dirty_protect
@@ -140,10 +141,13 @@ static struct scene tex_log_scene(int log_on, int write_tex3, int wrap) {
     g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
     memset(g_block_gen, 0, sizeof g_block_gen);
     nvn_be_sub_begin();
+    g_tp.mem = g_block_mem;
+    g_tp.size = BLOCK_TEST_PAGES * PG;
     tex_t t[SC_N];
     for (int i = 0; i < SC_N; i++) {
         t[i] = mk_tex(950 + (uint64_t)i, 0, NVN_FORMAT_RGBA8, SC_W, SC_H, 1, 0);
-        t[i].mem = g_block_mem + (size_t)i * t[i].L.size;   // 各占 16 页：贴图 i 在第 16i..16i+15 页
+        t[i].off = (int64_t)(i * t[i].L.size);
+        t[i].mem = g_tp.mem + t[i].off;   // 各占 16 页：贴图 i 在第 16i..16i+15 页
         memset(t[i].mem, 0x30 + i, t[i].L.size);
         const size_t up = (size_t)i * (t[i].L.size / PG) + 2;
         if (g_sc_unarmed && i == 4) { g_log_unarmed[up] = 1; if (g_sc_unarmed == 2) g_block_gen[up] = g_dirty_now; }
@@ -440,11 +444,14 @@ static void t_res_tex_window_gpu(void) {
 }
 
 // 只替代物理存储选择，实际资源表、脏页核对、pin 与视图重建仍走回放入口。
-static unsigned g_bc1_snapshots;
-static int fixture_bc1_replace(nvn_gpu_tex old, int opaque, nvn_gpu_tex *out) {
+static unsigned g_bc_snapshots;
+static nvn_gpu_tex g_bc7_staged;
+static int g_bc7_finished, g_bc7_on;
+int nvn_gpu_bc7_enabled(void) { return g_bc7_on; }
+static int fixture_bc_replace(nvn_gpu_tex old, uint32_t bit, int transcode, nvn_gpu_tex *out) {
     nvn_gpu_tex_desc d = old->d;
-    d.usage &= ~NVN_GPU_TEX_BC1_OPAQUE;
-    if (opaque) d.usage |= NVN_GPU_TEX_BC1_OPAQUE;
+    d.usage &= ~bit;
+    if (transcode) d.usage |= bit;
     if (d.usage == old->d.usage) return 0;
     nvn_gpu_err err = {0};
     return nvn_gpu_ok(nvn_gpu_tex_create(&d, out, &err)) ? 1 : -1;
@@ -460,64 +467,161 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex tex, const void *bytes, 
     CHECK(size == layout.size && nvn_deswizzle(&tex->d.d, 0, 0, bytes, words, sizeof words) == 0);
     const uint32_t selectors = words[1] & (words[1] >> 1) & UINT32_C(0x55555555);
     const int opaque = (words[0] & 0xffff) > (words[0] >> 16) || !selectors;
-    g_bc1_snapshots++;
-    return fixture_bc1_replace(tex, opaque, out) < 0 ? -1 : 1;
+    g_bc_snapshots++;
+    return fixture_bc_replace(tex, NVN_GPU_TEX_BC1_OPAQUE, opaque, out) < 0 ? -1 : 1;
 }
 
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex tex, nvn_gpu_tex *out) {
     CHECK(c);
     *out = NULL;
-    return fixture_bc1_replace(tex, 0, out);
+    return fixture_bc_replace(tex, NVN_GPU_TEX_BC1_OPAQUE, 0, out);
+}
+
+int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex tex, const void *bytes, uint64_t size,
+                            uint64_t serial, int allow_astc, nvn_gpu_tex *out) {
+    *out = NULL;
+    CHECK(c && serial == 9391 && tex->d.d.format == NVN_FORMAT_BPTC_UNORM);
+    uint8_t block[16] = {0};
+    nvn_texlayout layout;
+    nvn_tex_layout(&tex->d.d, &layout);
+    CHECK(size == layout.size && nvn_deswizzle(&tex->d.d, 0, 0, bytes, block, sizeof block) == 0);
+    if (!allow_astc && !(tex->d.usage & NVN_GPU_TEX_BC7_VALIDATED)) return 0;
+    g_bc_snapshots++;
+    if (fixture_bc_replace(tex, NVN_GPU_TEX_BC7_VALIDATED, 0, out) < 0) return -1;
+    g_bc7_finished = 0;
+    g_bc7_staged = allow_astc && block[0] == 0x40 ? (*out ? *out : tex) : NULL;
+    return 1;
+}
+
+int nvn_gpu_tex_bc7_unwrap(nvn_gpu_cmd c, nvn_gpu_tex tex, nvn_gpu_tex *out) {
+    CHECK(c);
+    *out = NULL;
+    if (g_bc7_staged == tex) g_bc7_staged = NULL;
+    return fixture_bc_replace(tex, NVN_GPU_TEX_BC7_VALIDATED, 0, out);
+}
+
+int nvn_gpu_tex_bc7_ready(nvn_gpu_tex tex) { return g_bc7_finished && g_bc7_staged == tex; }
+
+nvn_gpu_tex nvn_gpu_tex_bc7_take(nvn_gpu_tex tex) {
+    nvn_gpu_tex out = NULL;
+    if (g_bc7_finished && g_bc7_staged == tex) {
+        CHECK(fixture_bc_replace(tex, NVN_GPU_TEX_BC7_VALIDATED, 1, &out) == 1);
+        g_bc7_staged = NULL;
+    }
+    return out;
+}
+
+static void t_res_bc7_async(void) {
+    res_fresh();
+    g_bc7_on = 1;
+    g_bc7_staged = NULL;
+    g_bc7_finished = 0;
+    tex_t t = mk_tex(9391, 0, NVN_FORMAT_BPTC_UNORM, 4, 4, 1, 0);
+    t.mem = g_pmem;
+    memset(t.mem, 0, t.L.size);
+    t.mem[0] = 0x40;
+    nvn_be_reg_tex(3, &t, NULL);
+    nvn_be_sub_begin();
+    rp_view_pin_begin();
+    nvn_gpu_view first = rp_view_by_id(3, &g_fake_cmd, NULL);
+    nvn_gpu_view first_object = rp_view_for(&t, NULL, &g_fake_cmd);
+    CHECK(first && first_object && !(first->of->d.usage & NVN_GPU_TEX_BC7_VALIDATED));
+    if (!first || !first_object) return;
+    const int first_id = first->rid, object_id = first_object->rid;
+    const uint64_t gen = rp_tex_reg_gen();
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    g_bc7_finished = 1;
+    nvn_be_sub_begin();
+    nvn_gpu_view packed = rp_view_by_id(3, &g_fake_cmd, NULL);
+    nvn_gpu_view packed_object = rp_view_for(&t, NULL, &g_fake_cmd);
+    CHECK(packed && packed->rid != first_id && (packed->of->d.usage & NVN_GPU_TEX_BC7_VALIDATED));
+    CHECK(packed_object && packed_object->rid != object_id && packed && packed_object->of == packed->of);
+    CHECK(rp_tex_reg_gen() == gen + 1 && !was_view_released(first_id));
+    rp_view_pin_end();
+    CHECK(was_view_released(first_id));
+
+    t.mem[0] = 0x10;
+    nvn_be_tex_cpu_written(&t);
+    nvn_gpu_tex plain = rp_tex_resolve(&t, &g_fake_cmd);
+    CHECK(plain && !(plain->d.usage & NVN_GPU_TEX_BC7_VALIDATED));
+    t.mem[0] = 0x40;
+    nvn_be_tex_cpu_written(&t);
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == plain && !g_bc7_staged);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    g_bc7_finished = 1;
+    nvn_be_sub_begin();
+    // A new CPU write lands before view resolution can take the prior candidate.
+    t.mem[0] = 0x10;
+    nvn_be_tex_cpu_written(&t);
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == plain && !g_bc7_staged);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&t);
+    g_bc7_on = 0;
+    const unsigned off_snapshots = g_bc_snapshots;
+    res_fresh();
+    g_bc7_finished = 0;
+    nvn_be_sub_begin();
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+    CHECK(!g_bc7_staged && g_bc_snapshots == off_snapshots);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&t);
 }
 
 static void t_res_bc1_rebind(void) {
     res_fresh();
-    g_caps_extra |= NVN_GPU_CAP_BC1_SNAPSHOT;
-    g_bc1_snapshots = 0;
-    const uint32_t opaque[] = {0x07e0f800, 0xe4e4e4e4}, punch[] = {0xf80007e0, 0xc0000000};
+    const uint32_t cap = NVN_GPU_CAP_BC1_SNAPSHOT;
+    const uint32_t bit = NVN_GPU_TEX_BC1_OPAQUE;
+    g_caps_extra |= cap;
+    g_bc_snapshots = 0;
+    const uint32_t eligible[2] = {0x07e0f800, 0xe4e4e4e4};
+    const uint32_t excluded[2] = {0xf80007e0, 0xc0000000};
+    const size_t bytes = sizeof eligible;
     tex_t t = mk_tex(9390, 0, NVN_FORMAT_RGBA_DXT1, 4, 4, 1, 0);
     t.mem = g_pmem;
     memset(t.mem, 0, t.L.size);
-    memcpy(t.mem, opaque, sizeof opaque);
+    memcpy(t.mem, eligible, bytes);
     nvn_be_reg_tex(3, &t, NULL);
     nvn_be_sub_begin();
     rp_view_pin_begin();
     nvn_gpu_view old = rp_view_by_id(3, &g_fake_cmd, NULL);
     nvn_gpu_view unregistered = rp_view_for(&t, NULL, &g_fake_cmd);
-    CHECK(old && unregistered && (old->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    CHECK(old && unregistered && (old->of->d.usage & bit));
     const int old_id = old ? old->rid : 0;
     const int unregistered_id = unregistered ? unregistered->rid : 0;
     const uint64_t gen = rp_tex_reg_gen();
-    CHECK(g_bc1_snapshots == 1);
+    CHECK(g_bc_snapshots == 1);
 
-    // 只翻一个 BC1 选择码就须整图换回。热登记视图和按对象取视图都须取到新版。
-    memcpy(t.mem, punch, sizeof punch);
+    // 不合格的单个块须整图换回。热登记视图和按对象取视图都须取到新版。
+    memcpy(t.mem, excluded, bytes);
     nvn_be_tex_cpu_written(&t);
     CHECK(rp_tex_cpu_written(t.serial) == 1);
     nvn_gpu_view next = rp_view_by_id(3, &g_fake_cmd, NULL);
     nvn_gpu_view next_unregistered = rp_view_for(&t, NULL, &g_fake_cmd);
-    CHECK(next && next->rid != old_id && !(next->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    CHECK(next && next->rid != old_id && !(next->of->d.usage & bit));
     CHECK(next_unregistered && next_unregistered->rid != unregistered_id && next && next_unregistered->of == next->of);
-    CHECK(g_bc1_snapshots == 2 && rp_tex_reg_gen() == gen + 1);
+    CHECK(g_bc_snapshots == 2 && rp_tex_reg_gen() == gen + 1);
     CHECK(!was_view_released(old_id));
     rp_view_pin_end();
     CHECK(was_view_released(old_id));
     nvn_be_sub_commit();
     fake_complete(NVN_GPU_DONE_OK);
 
-    memcpy(t.mem, opaque, sizeof opaque);
+    memcpy(t.mem, eligible, bytes);
     nvn_be_tex_cpu_written(&t);
     CHECK(rp_tex_cpu_written(t.serial) == 1);
     nvn_be_sub_begin();
     nvn_gpu_tex packed = rp_tex_resolve(&t, &g_fake_cmd);
-    CHECK(packed && (packed->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    CHECK(packed && (packed->d.usage & bit));
     nvn_gpu_tex plain = rp_tex_resolve_plain(&t, &g_fake_cmd);
-    CHECK(plain && !(plain->d.usage & NVN_GPU_TEX_BC1_OPAQUE) && rp_tex_resolve(&t, &g_fake_cmd) == plain);
-    CHECK(g_bc1_snapshots == 3);
+    CHECK(plain && !(plain->d.usage & bit) && rp_tex_resolve(&t, &g_fake_cmd) == plain);
+    CHECK(g_bc_snapshots == 3);
     nvn_be_sub_commit();
     fake_complete(NVN_GPU_DONE_OK);
     nvn_be_tex_release(&t);
-    g_caps_extra &= ~NVN_GPU_CAP_BC1_SNAPSHOT;
+    g_caps_extra &= ~cap;
 }
 
 // 真写块的一处，跟踪记录整个 64 页块，随后同块内的写不再追加事件。
@@ -661,14 +765,14 @@ static void t_res_bc_byte_equal(int enabled) {
     const uint32_t opaque[] = {0x07e0f800, 0xe4e4e4e4};
     memset(bc1.mem, 0, bc1.L.size);
     memcpy(bc1.mem, opaque, sizeof opaque);
-    const unsigned snapshots = g_bc1_snapshots;
+    const unsigned snapshots = g_bc_snapshots;
     g_caps_extra |= NVN_GPU_CAP_BC1_SNAPSHOT;
     nvn_be_sub_begin();
-    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc1_snapshots == snapshots + 1);
+    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc_snapshots == snapshots + 1);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     nvn_be_sub_begin();
     bc_neighbor_write(0, 10, 0x4c);
-    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc1_snapshots == snapshots + 1);
+    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc_snapshots == snapshots + 1);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     // 同一个字节版本遇到在途 GPU 写，不能走相等快路。等它撤销后沿正常重试上传。
     nvn_be_sub_begin();
@@ -677,9 +781,9 @@ static void t_res_bc_byte_equal(int enabled) {
     const uint64_t pending = rp_buf_gpu_write_note((uintptr_t)bc1.mem, sizeof opaque, &pool_key);
     CHECK(pending != 0);
     bc_neighbor_write(0, 10, 0x4d);
-    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) == NULL && g_bc1_snapshots == snapshots + 1);
+    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) == NULL && g_bc_snapshots == snapshots + 1);
     rp_buf_gpu_write_land(pool_key, pending, 0);
-    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc1_snapshots == snapshots + 2);
+    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc_snapshots == snapshots + 2);
     g_buf_cpu_auto = 0;
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 
@@ -688,7 +792,7 @@ static void t_res_bc_byte_equal(int enabled) {
     g_dirty_map++;
     g_log_ident++;
     bc_neighbor_write(0, 10, 0x4e);
-    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc1_snapshots == snapshots + 3);
+    CHECK(rp_tex_resolve(&bc1, &g_fake_cmd) != NULL && g_bc_snapshots == snapshots + 3);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     g_caps_extra &= ~NVN_GPU_CAP_BC1_SNAPSHOT;
     rp_perf_take(perf);
@@ -697,6 +801,38 @@ static void t_res_bc_byte_equal(int enabled) {
         CHECK(perf[RP_PERF_TEX_BYTE_SKIPPED] == t.L.size + bc1.L.size);
     }
     nvn_be_tex_release(&bc1);
+    if (enabled) {
+        g_bc7_on = 1;
+        g_bc7_staged = NULL;
+        g_bc7_finished = 0;
+        tex_t stable = mk_tex(9391, 12 * PG, NVN_FORMAT_BPTC_UNORM, 4, 4, 1, 0);
+        stable.mem = g_tp.mem + stable.off;
+        memset(stable.mem, 0x40, stable.L.size);
+        nvn_be_sub_begin();
+        nvn_gpu_tex initial = rp_tex_resolve(&stable, &g_fake_cmd);
+        CHECK(initial && initial == g_bc7_staged);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_sub_begin();
+        const unsigned initial_uploads = g_bc_snapshots;
+        bc_neighbor_write(0, 10, 0x70);
+        CHECK(rp_tex_resolve(&stable, &g_fake_cmd) == initial && g_bc7_staged == initial);
+        CHECK(g_bc_snapshots == initial_uploads);
+        g_bc7_finished = 1;
+        nvn_gpu_tex promoted = rp_tex_resolve(&stable, &g_fake_cmd);
+        CHECK(promoted && (promoted->d.usage & NVN_GPU_TEX_BC7_VALIDATED));
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_sub_begin();
+        bc_neighbor_write(0, 10, 0x71);
+        CHECK(rp_tex_resolve(&stable, &g_fake_cmd) == promoted && g_bc_snapshots == initial_uploads);
+        nvn_gpu_tex partial = rp_tex_resolve_plain(&stable, &g_fake_cmd);
+        CHECK(partial && !(partial->d.usage & NVN_GPU_TEX_BC7_VALIDATED));
+        stable.mem[7] ^= 1;
+        nvn_be_tex_cpu_written(&stable);
+        CHECK(rp_tex_resolve(&stable, &g_fake_cmd) == partial && !g_bc7_staged);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_tex_release(&stable);
+        g_bc7_on = 0;
+    }
     nvn_be_pool_del(g_tp.mem);
     g_block_mem = NULL;
     g_log_fake_on = 0;
@@ -713,11 +849,14 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     if (argc > 1 && !strcmp(argv[1], "--gpu-window")) { t_res_tex_window_gpu(); return g_fail ? 1 : 0; }
-    t_res_bc1_rebind();
-    if (argc > 1 && !strcmp(argv[1], "--bc1-rebind")) {
-        printf("BC1 view rebind: %d checks, %d failures\n", g_checks, g_fail);
+    if (argc > 1 && (!strcmp(argv[1], "--bc1-rebind") || !strcmp(argv[1], "--bc7-rebind"))) {
+        const int bc7 = !strcmp(argv[1], "--bc7-rebind");
+        if (bc7) t_res_bc7_async(); else t_res_bc1_rebind();
+        printf("BC%d view rebind: %d checks, %d failures\n", bc7 ? 7 : 1, g_checks, g_fail);
         return g_fail ? 1 : 0;
     }
+    t_res_bc1_rebind();
+    t_res_bc7_async();
     t_res_tex_epoch();
     t_res_bc_byte_equal(1);
     t_res_tex_epoch_unrelated();
