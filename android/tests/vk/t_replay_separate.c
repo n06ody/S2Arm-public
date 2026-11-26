@@ -29,11 +29,12 @@ int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) { (void)a; (void)n; (void)m; (void)s; return 0; }
 // 本夹具没有存储缓冲声明；空存储语义由真实 rp_buf GPU 用例验证。
 nvn_gpu_buf rp_buf_for_null_storage(void) { return NULL; }
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64_t *o) { (void)c; (void)a; (void)n; (void)b; (void)o; return 0; }
+int rp_buf_resolve_binding(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64_t *o, enum rp_buf_binding binding) {
+    (void)binding; (void)c; (void)a; (void)n; (void)b; (void)o; return 0; }
 int rp_buf_gpu_pending(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }   // 本夹具没有 GPU 写回：恒无还没落地的写
 // #958 批量解析：逐段转给上面的单段替身（口径一致）
-int rp_buf_resolve_multi(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_buf *b, uint64_t *o, unsigned char *ok) {
-    for (int i = 0; i < n; i++) ok[i] = l[i] && rp_buf_resolve(NULL, a[i], l[i], &b[i], &o[i]);
+int rp_buf_resolve_multi_binding(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_buf *b, uint64_t *o, unsigned char *ok, enum rp_buf_binding binding) {
+    for (int i = 0; i < n; i++) ok[i] = l[i] && rp_buf_resolve_binding(NULL, a[i], l[i], &b[i], &o[i], binding);
     return 1;
 }
 void rp_view_pin_begin(void) {}

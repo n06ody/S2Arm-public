@@ -35,6 +35,7 @@ static struct {
     uint32_t barrier_bits;    // 游戏发过的屏障位：下一个通道前交给后端
     int sw_pend, sw_split;    // 当前通道里有绘制的着色器写了存储缓冲 / 存储图像；其后游戏发过带顺序位的屏障 = 下一笔绘制前要结束通道（见 rp_pass_barrier）
     int has_ds, ds_used, ndraw;   // 当前通道：挂了深度模板附件、有绘制 / 清除用到它、绘制笔数（读数用）
+    uint8_t attachments;        // 实际通道中的颜色附件槽 + 共享的深度模板视图
     uint32_t cur_kpix;            // 当前通道的千像素（读数用：0–1 笔通道各吃掉多少像素）
     // 渲染区域（开关 debug.s2a.nvk_pass_area）：附件只在区域内载入 / 保存。区域只按「裁剪矩形」收缩——后端把裁剪矩形原样交给
     // Vulkan，光栅出来的像素一定在它里面，所以收缩一定安全；视口带原点翻转，先不参与（要按窗口原点翻 y，等有真机验证再加）。
@@ -760,6 +761,11 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     rp_view_pin_end();
     rp_occl_pass_opened(d.occlusion);
     rp_perf_add(RP_PERF_PASSES, 1);
+    if (trimmed) {
+        nattached = 0;
+        for (int i = 0; i < P.rt.n; i++) nattached += d.color[i].view != NULL;
+    }
+    P.attachments = (uint8_t)(nattached + P.has_ds);
     for (int i = 0; i < P.rt.n; i++) if (d.color[i].view) rp_tex_mark_gpu_written(P.rt.color[i]);
     if (P.rt.depth && (!trimmed || P.has_ds)) rp_tex_mark_gpu_written(P.rt.depth);
     PB(RP_PERF_PB_MARK);
@@ -981,6 +987,7 @@ void rp_pass_reset(void) {
     memset(g_sh, 0, sizeof g_sh);
 }
 int rp_pass_is_open(void) { return P.open; }
+unsigned rp_pass_attachment_count(void) { return P.attachments; }
 int rp_pass_draws(void) { return P.open ? P.ndraw : 0; }
 // 当前通道能不能在两笔之间切开、下一笔按 LOAD 续开（rp_exec.c pass_split）。存储恒为 STORE、续开时没有清除负载才算；
 // 影子附件、多重采样目标即使正确也不划算，一并不切。

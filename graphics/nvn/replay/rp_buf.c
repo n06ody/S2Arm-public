@@ -15,11 +15,13 @@
 #include "nvn_dirty.h"
 #include "nvn_mtl.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
-struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub; };   // GPU 写进镜像、还没回写到游戏内存的一段；mi = 写进了哪一份镜像；已有字段（off / len / id / mi / landing）的含义与顺序不变，sub 是追加在末尾的新字段：登记时的提交序号（同段合并按它认「同一次提交」）
+// off/len 是镜像持有的完整区间；copy_len 是从 off 起需要回写到客体的字节数。只在同次提交、同一镜像内合并。
+struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, copy_len; };
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
 // use_sub / use_fence：最近一次用到这份镜像的提交（序号、栅栏值）；prev_fence：再往前一次用到它的提交的栅栏值——
@@ -58,6 +60,18 @@ static int g_gw_live;   // 所有池的未落地登记数（含正在落地的�
 static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数（原子读写）：为 0（受跟踪的游戏全程如此）时 rp_write_note 不多走一步
 static int g_exact_on, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
 static uint64_t g_exact_mapping, g_exact_pool;
+// Nonnegative results name the first guard that rejected the proof.
+enum mirror_sync_result {
+    MIRROR_DISJOINT = -2, MIRROR_OVERLAP = -1,
+    MIRROR_UNKNOWN_ACCESS, MIRROR_NO_INTERVALS, MIRROR_STALE_INTERVALS, MIRROR_INTERVAL_OVERFLOW,
+    MIRROR_GPU_WRITE_POOL, MIRROR_LANDING_POOL, MIRROR_UNTRACKED, MIRROR_TRACKING_UNRELIABLE,
+    MIRROR_MAPPING_CHANGED, MIRROR_POOL_EPOCH_MISSING, MIRROR_POOL_UNPROVEN, MIRROR_POOL_EPOCH_CHANGED,
+    MIRROR_PRE_SEGMENT_FAILED, MIRROR_FALLBACK_REASONS,
+};
+// Eight color slots and one shared depth/stencil view. Zero attachments is valid.
+enum { MIRROR_ATTACHMENT_UNKNOWN = 10, MIRROR_ATTACHMENT_BINS = MIRROR_ATTACHMENT_UNKNOWN + 1 };
+static _Atomic int g_mirror_fallback_diag = -1;
+static uint64_t g_mirror_fallback[MIRROR_FALLBACK_REASONS][RP_BUF_BINDING_COUNT][MIRROR_ATTACHMENT_BINS];
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
 static int g_land_noresync = -1;   // g_bmu 内按会话锁定
 static int land_noresync_on(void) {
@@ -85,6 +99,8 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
 // 只链接镜像的后端夹具可能没有回放通道或池表。缺少任一证明时保留原同步顺序。
 // 弱链接[replay]：rp_pass_is_open
 int rp_pass_is_open(void) __attribute__((weak));
+// 弱链接[replay]：rp_pass_attachment_count
+unsigned rp_pass_attachment_count(void) __attribute__((weak));
 // 弱链接[replay]：rp_pool_mirror_epoch
 uint64_t rp_pool_mirror_epoch(const uint8_t *mem, uint64_t size) __attribute__((weak));
 
@@ -347,11 +363,11 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
 // 为什么：落地是段完成时按登记逐条把镜像拷回游戏内存，一条登记就是一次整段 memcpy。同一块存储缓冲被多个派发反复绑定写、每次都登记整段绑定范围时，
 // 重叠的几条拷的是同一份镜像里同一段字节（段完成时镜像里已是最终内容），拷一次与拷多次结果相同。
 // 只并「相交 / 首尾相接」的：并集里没有任何没被写过的字节。中间有空隙的不桥接——空隙里的镜像字节可能比游戏内存里的旧，落地会把新内容盖掉。
-uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged) {
+uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged) {
     static uint64_t next_id;
     const uint8_t *mem; uint64_t size;
     if (merged) *merged = 0;
-    if (!len) return 0;
+    if (!copy_len || copy_len > len) return 0;
     if (!rp_pool_find(addr, len, &mem, &size)) { mirror_unknown_address(); return 0; }
     if (g_gw_merge_on < 0 || !(++g_gw_merge_k & 255)) g_gw_merge_on = nvn_plat_flag("nvk_land_merge", 1) != 0;   // 开关：每 256 次登记重读一次
     const int merge_on = g_gw_merge_on;
@@ -365,12 +381,13 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
             for (int k = 0; k < s->ngw; k++) if (s->gw[k].off < off + len && off < s->gw[k].off + s->gw[k].len) { mi = s->gw[k].mi; break; }
             // 同一份镜像、同一次提交、没开始落地的登记之间两两互不相接（每次登记都经过这里合并），所以与这一段相接的记录只可能直接与这一段相接，单遍扫描即可。
             // 那一份镜像还没建出来 = 不可能有记在它上面的登记，也就没有可并的：走下面的老路（mirror_pick 会建它）。
-            int hit = -1; uint64_t lo = off, hi = off + len, old_sum = 0;   // 并集 [lo, hi)；old_sum = 被并掉的旧记录原长度之和
+            int hit = -1; uint64_t lo = off, hi = off + len, copy_hi = off + copy_len, old_sum = 0;   // 并集 [lo, hi)；old_sum = 被并掉的旧记录原长度之和
             for (int k = 0; s->m[mi].buf && k < s->ngw; k++) {
                 struct gpu_write *g = &s->gw[k];
                 if (k == hit || g->sub != sub || g->mi != mi || g->landing || g->off > hi || lo > g->off + g->len) continue;   // 相交或首尾相接才并
                 if (g->off < lo) lo = g->off;
                 if (g->off + g->len > hi) hi = g->off + g->len;
+                if (g->off + g->copy_len > copy_hi) copy_hi = g->off + g->copy_len;
                 old_sum += g->len;
                 if (hit < 0) { hit = k; id = g->id; }
                 else {   // 又一条与并集相接：吸进第一条，自己撤掉（它的登记号还在本次提交的落地表里，迟到的落地按「找不到」忽略）
@@ -382,7 +399,7 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
             }
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
-                g->off = lo; g->len = hi - lo;
+                g->off = lo; g->len = hi - lo; g->copy_len = copy_hi - lo;
                 mirror_touch(&s->m[mi], off, off + len);
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
@@ -394,13 +411,16 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key,
         }
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
-            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
+            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
             mirror_touch(&s->m[mi], off, off + len);
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
     if (!id) g_exact_unknown = 1;
     pthread_mutex_unlock(&g_bmu);
     return id;
+}
+uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *key, int *merged) {
+    return rp_buf_gpu_write_note_prefix(addr, len, len, key, merged);
 }
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) { return rp_buf_gpu_write_note2(addr, len, pool_key, NULL); }   // 不合并的老入口（单测与只登记一条的调用方）
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
@@ -444,7 +464,7 @@ void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t cou
                 else hi = mid;
             }
             if (lo < end && refs[lo].id == w->id)
-                spans[refs[lo].index] = (nvn_gpu_readback_span){s->m[w->mi].buf, w->off, w->len, UINT64_MAX};
+                spans[refs[lo].index] = (nvn_gpu_readback_span){s->m[w->mi].buf, w->off, w->copy_len, UINT64_MAX};
         }
         pthread_mutex_unlock(&g_bmu);
         first = end;
@@ -457,14 +477,14 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
-    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
+    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0, copy_len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
+        mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi; copy_len = s->gw[i].copy_len;
         const uint8_t *mirror = ok && !staged ? nvn_gpu_buf_cpu(s->m[wmi].buf) : NULL;
         if (ok) src = staged ? staged : (mirror ? mirror + off : NULL);
-        rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, len / 1024);
+        rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, copy_len / 1024);
         s->gw[i].landing = 1; found = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
@@ -473,9 +493,9 @@ void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const ui
     if (!found) return;
 #ifdef S2A_GPU_LAND_TEST
     extern void rp_test_land_copy(void *, const void *, size_t);
-    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);
+    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)copy_len);
 #else
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)len);   // 游戏内存是真值：GPU 的结果回到它那里
+    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)copy_len);   // 游戏内存是真值：GPU 的结果回到它那里
 #endif
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
@@ -509,25 +529,75 @@ static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
     return 0;
 }
 
-static int mirror_sync_class(const struct shadow *s, const struct mirror *m, uint64_t lo, uint64_t hi) {
+static enum mirror_sync_result mirror_sync_class(const struct shadow *s, const struct mirror *m,
+                                                  uint64_t lo, uint64_t hi) {
     const struct mirror_exact *x = m->exact;
-    if (g_exact_unknown || !x || x->sub != rp_sub_serial() || x->n > EXACT_RANGES ||
-        s->ngw || s->landing || s->untracked || nvn_dirty_tracking_unreliable() ||
-        g_exact_mapping != nvn_dirty_mapping_generation() ||
-        !g_exact_pool || g_exact_pool != rp_pool_mirror_epoch(s->mem, s->size))
-        return RP_PERF_MIRROR_FALLBACK;
+    if (g_exact_unknown) return MIRROR_UNKNOWN_ACCESS;
+    if (!x) return MIRROR_NO_INTERVALS;
+    if (x->sub != rp_sub_serial()) return MIRROR_STALE_INTERVALS;
+    if (x->n > EXACT_RANGES) return MIRROR_INTERVAL_OVERFLOW;
+    // The existing guard is pool-wide. Separate an active landing from an
+    // outstanding GPU write without inspecting or relaxing their byte ranges.
+    if (s->ngw || s->landing) return s->landing ? MIRROR_LANDING_POOL : MIRROR_GPU_WRITE_POOL;
+    if (s->untracked) return MIRROR_UNTRACKED;
+    if (nvn_dirty_tracking_unreliable()) return MIRROR_TRACKING_UNRELIABLE;
+    if (g_exact_mapping != nvn_dirty_mapping_generation()) return MIRROR_MAPPING_CHANGED;
+    if (!g_exact_pool) return MIRROR_POOL_EPOCH_MISSING;
+    const uint64_t epoch = rp_pool_mirror_epoch(s->mem, s->size);
+    if (!epoch) return MIRROR_POOL_UNPROVEN;
+    if (g_exact_pool != epoch) return MIRROR_POOL_EPOCH_CHANGED;
     for (unsigned i = 0; i < x->n; i++) {
         const struct byte_range r = x->ranges[i];
-        if (r.lo < hi && lo < r.hi) return RP_PERF_MIRROR_OVERLAP;
+        if (r.lo < hi && lo < r.hi) return MIRROR_OVERLAP;
     }
-    return RP_PERF_MIRROR_HOIST;
+    return MIRROR_DISJOINT;
+}
+
+void rp_buf_mirror_fallback_report(uint64_t *perf, void (*take)(uint64_t *), uint64_t window_end_ns) {
+    if (atomic_load_explicit(&g_mirror_fallback_diag, memory_order_relaxed) != 1) {
+        take(perf);
+        return;
+    }
+    static const char *const reasons[MIRROR_FALLBACK_REASONS] = {
+        [MIRROR_UNKNOWN_ACCESS] = "unknown_access", [MIRROR_NO_INTERVALS] = "no_intervals",
+        [MIRROR_STALE_INTERVALS] = "stale_intervals", [MIRROR_INTERVAL_OVERFLOW] = "interval_overflow",
+        [MIRROR_GPU_WRITE_POOL] = "gpu_write_pool", [MIRROR_LANDING_POOL] = "landing_pool",
+        [MIRROR_UNTRACKED] = "untracked_pool", [MIRROR_TRACKING_UNRELIABLE] = "tracking_unreliable",
+        [MIRROR_MAPPING_CHANGED] = "mapping_changed", [MIRROR_POOL_EPOCH_MISSING] = "pool_epoch_missing",
+        [MIRROR_POOL_UNPROVEN] = "pool_unproven", [MIRROR_POOL_EPOCH_CHANGED] = "pool_epoch_changed",
+        [MIRROR_PRE_SEGMENT_FAILED] = "pre_segment_failed",
+    };
+    static const char *const bindings[RP_BUF_BINDING_COUNT] = {
+        [RP_BUF_OTHER] = "other", [RP_BUF_VERTEX] = "vertex", [RP_BUF_INDEX] = "index",
+        [RP_BUF_INDIRECT] = "indirect", [RP_BUF_UNIFORM] = "uniform", [RP_BUF_STORAGE] = "storage",
+        [RP_BUF_TEXEL] = "texel",
+    };
+    uint64_t counts[MIRROR_FALLBACK_REASONS][RP_BUF_BINDING_COUNT][MIRROR_ATTACHMENT_BINS];
+    pthread_mutex_lock(&g_bmu);
+    take(perf);   // Existing mirror totals and detail are recorded under this same lock.
+    memcpy(counts, g_mirror_fallback, sizeof counts);
+    memset(g_mirror_fallback, 0, sizeof g_mirror_fallback);
+    pthread_mutex_unlock(&g_bmu);
+    for (int reason = 0; reason < MIRROR_FALLBACK_REASONS; reason++)
+        for (int binding = 0; binding < RP_BUF_BINDING_COUNT; binding++)
+            for (int attachments = 0; attachments < MIRROR_ATTACHMENT_BINS; attachments++) {
+                const uint64_t count = counts[reason][binding][attachments];
+                if (!count) continue;
+                char line[160];
+                snprintf(line, sizeof line, "reason=%s binding=%s attachments=%d count=%llu window_end_ns=%llu",
+                         reasons[reason], bindings[binding],
+                         attachments == MIRROR_ATTACHMENT_UNKNOWN ? -1 : attachments,
+                         (unsigned long long)count, (unsigned long long)window_end_ns);
+                nvn_plat_log(NVN_PLAT_LOG_INFO, "mirror-fallback", line);
+            }
 }
 
 // 锁内版：调用方已持有 g_bmu，mem/size 是调用方查好的池。一笔绘制常要解析 3~4 段（顶点流 + 存储缓冲），
 // 逐段各抢一次全局锁时「找池取镜像」在重叠档读到 13.7–16.6 毫秒/帧（5627 次、每次约 2.4 微秒）——
 // 大头是这把锁与完成线程（落地 GPU 写）互抢，所以另给批量入口，一笔绘制只抢一次。
 // 把第 i..j 页（池内页号，含）这一串从游戏内存同步进镜像：先保护、取代号、再读；记下同步代号与所在提交（两条核对路共用）。
-static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
+static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size,
+                                uint64_t i, uint64_t j, enum rp_buf_binding binding) {
         const size_t ps = nvn_dirty_page_size();
         uintptr_t a = s->page0 + (uintptr_t)(i * ps), b = s->page0 + (uintptr_t)((j + 1) * ps);   // 这一串脏页，裁到池的范围
         if (a < (uintptr_t)mem) a = (uintptr_t)mem;
@@ -546,24 +616,36 @@ static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_
             const uint64_t lo = a - (uintptr_t)mem, hi = b - (uintptr_t)mem;
             // 证明针对实际写入的整组裁剪页，不能只看当前绑定请求的字节。
             const int classify = g_exact_on && last == rp_sub_serial() && rp_pass_is_open();
-            int result = classify ? mirror_sync_class(s, m, lo, hi) : RP_PERF_MIRROR_FALLBACK;
-            if (result == RP_PERF_MIRROR_HOIST) last = 0;   // 仍走 GPU 传输，只移到前置段
+            enum mirror_sync_result result = MIRROR_UNKNOWN_ACCESS;
+            unsigned attachments = MIRROR_ATTACHMENT_UNKNOWN;
+            const int diagnose = classify && atomic_load_explicit(&g_mirror_fallback_diag, memory_order_relaxed) == 1;
+            if (classify) {
+                result = mirror_sync_class(s, m, lo, hi);
+                if (diagnose && result != MIRROR_OVERLAP && rp_pass_attachment_count)
+                    attachments = rp_pass_attachment_count();
+                if (result == MIRROR_DISJOINT) last = 0;   // 仍走 GPU 传输，只移到前置段
+            }
             nvn_gpu_cmd xc = rp_xfer_cmd(&last);
             if (xc) sync_write(xc, NULL, s, m, lo, hi);
             if (classify) {
-                if (result == RP_PERF_MIRROR_HOIST && !rp_pass_is_open()) {
+                if (result == MIRROR_DISJOINT && !rp_pass_is_open()) {
                     rp_perf_add(RP_PERF_P_CUT_XFER, 1);   // 前置段分配失败，主段仍然收了通道
-                    result = RP_PERF_MIRROR_FALLBACK;
+                    result = MIRROR_PRE_SEGMENT_FAILED;
                 }
-                rp_perf_add(result, 1);
+                if (result >= 0) {
+                    if (diagnose) g_mirror_fallback[result][binding][attachments]++;
+                    rp_perf_add(RP_PERF_MIRROR_FALLBACK, 1);
+                } else {
+                    rp_perf_add(result == MIRROR_DISJOINT ? RP_PERF_MIRROR_HOIST : RP_PERF_MIRROR_OVERLAP, 1);
+                }
             }
         }
         for (uint64_t k = i; k <= j; k++) { m->synced[k] = st; m->sub[k] = last; }
         g_sync_bytes += b - a; g_sync_runs++; rp_perf_add(RP_PERF_BUF_SYNC_KB, (b - a) / 1024);
 }
-static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j) {
+static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *mem, uint64_t size, uint64_t i, uint64_t j, enum rp_buf_binding binding) {
     if (!s->ngw || !land_noresync_on()) {
-        sync_cpu_run(s, m, mem, size, i, j);
+        sync_cpu_run(s, m, mem, size, i, j, binding);
         return;
     }
     const size_t ps = nvn_dirty_page_size();
@@ -581,18 +663,18 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
         }
         const uint64_t first = k++;
         while (k <= j && !gw_covers_page(s, mi, k, ps, &bytes)) k++;
-        sync_cpu_run(s, m, mem, size, first, k - 1);
+        sync_cpu_run(s, m, mem, size, first, k - 1, binding);
     }
     if (skipped) rp_perf_add(RP_PERF_BUF_SYNC_GW_KB, skipped / 1024);
 }
-static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, int count_resolve);
+static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, int count_resolve, enum rp_buf_binding binding);
 // 脏页追加日志这条路的解析（见 log_arm 一节）：不逐页比代号，只灌新事件、在旧页位图里求交。
-static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m) {
+static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, enum rp_buf_binding binding) {
     rp_perf_add(RP_PERF_RES_N, 1);
     struct log_fill f = {s, m, 0};
     if (!nvn_dirty_log_read(s->span, m->log_id, &m->log_cur, log_event, &f)) {
         rp_perf_add(RP_PERF_BUF_LOG_EV, f.n);
-        if (!log_rebuild(s, m)) { log_drop(m); return resolve_part_locked(addr, len, mem, size, s, m, 0); }
+        if (!log_rebuild(s, m)) { log_drop(m); return resolve_part_locked(addr, len, mem, size, s, m, 0, binding); }
     } else rp_perf_add(RP_PERF_BUF_LOG_EV, f.n);
     const size_t ps = nvn_dirty_page_size();
     const uint64_t p = ((uintptr_t)addr - s->page0) / ps, q = ((uintptr_t)addr + len - 1 - s->page0) / ps;
@@ -609,7 +691,7 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
         while (bits) {   // 字内连续的旧页成一串同步
             const uint64_t i = (w << 6) + (uint64_t)__builtin_ctzll(bits);
             uint64_t j = i; while (j + 1 <= q && j + 1 < ((w + 1) << 6) && (bits >> ((j + 1) & 63) & 1)) j++;
-            sync_run(s, m, mem, size, i, j);
+            sync_run(s, m, mem, size, i, j, binding);
             pages += j - i + 1;
             for (uint64_t k = i; k <= j; k++) {   // 此刻只读的页才清：之后的写必然进日志；被并发解保护挡住的页留着，下次再同步
                 bits &= ~(1ull << (k & 63));
@@ -626,7 +708,7 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
 static int g_res_tm = -1; static unsigned g_res_tmk;
 static uint64_t res_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size,
-                               struct shadow *s, struct mirror *m, int count_resolve) {
+                               struct shadow *s, struct mirror *m, int count_resolve, enum rp_buf_binding binding) {
     if (g_res_tm < 0 || !(++g_res_tmk & 255)) g_res_tm = nvn_plat_flag("nvk_res_tm", 0) != 0;
     const uint64_t q0 = g_res_tm ? res_now() : 0;
     if (count_resolve) rp_perf_add(RP_PERF_RES_N, 1);
@@ -651,7 +733,7 @@ static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, 
     for (uint64_t i = p; i <= q;) {
         if (page_fresh(s, m, i, tracked, gens, p, sub0)) { i++; continue; }
         uint64_t j = i; while (j + 1 <= q && !page_fresh(s, m, j + 1, tracked, gens, p, sub0)) j++;
-        sync_run(s, m, mem, size, i, j);
+        sync_run(s, m, mem, size, i, j, binding);
         synced_pages += j - i + 1;
         i = j + 1;
     }
@@ -662,16 +744,16 @@ static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, 
     if (q0) rp_perf_add(RP_PERF_RES_LA_NS, res_now() - q0);
     return 1;
 }
-static int resolve_inner(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m) {
-    if (m->path == MP_LOG) return resolve_log(addr, len, mem, size, s, m);
-    return resolve_part_locked(addr, len, mem, size, s, m, 1);   // 日志不可用（不受写跟踪 / 重叠池 / 跟踪不可靠 / 开关关）
+static int resolve_inner(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, enum rp_buf_binding binding) {
+    if (m->path == MP_LOG) return resolve_log(addr, len, mem, size, s, m, binding);
+    return resolve_part_locked(addr, len, mem, size, s, m, 1, binding);   // 日志不可用（不受写跟踪 / 重叠池 / 跟踪不可靠 / 开关关）
 }
-static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size) {
+static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, enum rp_buf_binding binding) {
     struct shadow *s = shadow_get(mem, size);
     if (!s) { g_exact_unknown = 1; return 0; }
     // 整段先选一次镜像：未落地的 GPU 写可能只覆盖其中一个摘要块。
     struct mirror *m = mirror_pick(s, addr - (uint64_t)(uintptr_t)mem, len, NULL);
-    int ok = resolve_inner(addr, len, mem, size, s, m);
+    int ok = resolve_inner(addr, len, mem, size, s, m, binding);
     if (ok) {
         const size_t ps = nvn_dirty_page_size();
         uint64_t lo = ((uintptr_t)addr - s->page0) / ps, hi = ((uintptr_t)addr + len - 1 - s->page0) / ps;
@@ -686,7 +768,7 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
 // 用来构造「准备阶段给不出镜像」这条只能靠故障注入覆盖的路径。
 int rp_test_buf_resolve_block(void) __attribute__((weak));
 
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
+int rp_buf_resolve_binding(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off, enum rp_buf_binding binding) {
     if (rp_test_buf_resolve_block && rp_test_buf_resolve_block()) { mirror_unknown_address(); return 0; }
     (void)c;
     const uint8_t *mem; uint64_t size;
@@ -696,7 +778,7 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
         return 0;
     }
     pthread_mutex_lock(&g_bmu);
-    int r = resolve_locked(addr, len, mem, size);
+    int r = resolve_locked(addr, len, mem, size, binding);
     if (r) {
         struct shadow *s = shadow_get(mem, size);
         if (s) {
@@ -709,7 +791,7 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
     return r;
 }
 // 批量：一次抢锁解析多段（顶点流 / 存储缓冲），成功写 1、失败写 0。
-static void resolve_multi_chunk(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
+static void resolve_multi_chunk(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, enum rp_buf_binding binding) {
     const uint8_t *mem[16]; uint64_t size[16];
     for (int i = 0; i < n; i++) { mem[i] = NULL; size[i] = 0; ok[i] = 0; if (len[i]) rp_pool_find(addr[i], len[i], &mem[i], &size[i]); }
     const uint64_t w0 = (g_res_tm && n) ? res_now() : 0;
@@ -719,18 +801,18 @@ static void resolve_multi_chunk(int n, const uint64_t *addr, const uint64_t *len
         if (!mem[i]) { if (len[i]) g_exact_unknown = 1; continue; }
         struct shadow *s = shadow_get(mem[i], size[i]);
         if (!s) { g_exact_unknown = 1; continue; }
-        if (!resolve_locked(addr[i], len[i], mem[i], size[i])) continue;
+        if (!resolve_locked(addr[i], len[i], mem[i], size[i], binding)) continue;
         struct mirror *m = mirror_pick(s, addr[i] - (uint64_t)(uintptr_t)mem[i], len[i], NULL);
         buf[i] = m->buf; off[i] = addr[i] - (uint64_t)(uintptr_t)mem[i]; ok[i] = 1;
     }
     pthread_mutex_unlock(&g_bmu);
 }
-int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok) {
+int rp_buf_resolve_multi_binding(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok, enum rp_buf_binding binding) {
     // Storage bindings can exceed the 16 vertex streams. Resolve every item;
     // the fixed scratch arrays bound each lock acquisition, not the request.
     while (n > 0) {
         int count = n < 16 ? n : 16;
-        resolve_multi_chunk(count, addr, len, buf, off, ok);
+        resolve_multi_chunk(count, addr, len, buf, off, ok, binding);
         n -= count; addr += count; len += count; buf += count; off += count; ok += count;
     }
     return 1;
@@ -767,6 +849,9 @@ void rp_buf_hold_begin(void) {
     if (exact) {
         g_exact_pool = rp_pool_mirror_epoch(NULL, 0);
         g_exact_mapping = nvn_dirty_mapping_generation();
+        if (atomic_load_explicit(&g_mirror_fallback_diag, memory_order_relaxed) < 0)
+            atomic_store_explicit(&g_mirror_fallback_diag, nvn_plat_flag("nvk_mirror_fallback_diag", 0) == 1,
+                                  memory_order_relaxed);
     }
     pthread_mutex_unlock(&g_bmu);
 }
@@ -812,6 +897,9 @@ void rp_buf_reset(void) {
     g_null_storage = NULL;
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
     g_land_noresync = -1;
+    if (atomic_load_explicit(&g_mirror_fallback_diag, memory_order_relaxed) == 1)
+        memset(g_mirror_fallback, 0, sizeof g_mirror_fallback);
+    atomic_store_explicit(&g_mirror_fallback_diag, -1, memory_order_relaxed);
     pthread_mutex_unlock(&g_bmu);
 }
 void rp_buf_stats(uint64_t *bytes, uint64_t *runs) { pthread_mutex_lock(&g_bmu); if (bytes) *bytes = g_sync_bytes; if (runs) *runs = g_sync_runs; pthread_mutex_unlock(&g_bmu); }

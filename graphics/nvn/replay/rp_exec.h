@@ -24,8 +24,24 @@ void nvn_be_read_texels_gpu_stats(uint64_t out[4]);   // rp_entry.c：ReadTexels
 // 合法但未绑定的 NVN 存储槽：内部 64 KiB 缓冲（初始全零），不登记 guest 池；会话收尾释放。
 nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
-int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+// Kind of the consumer that triggered a mirror synchronization.
+enum rp_buf_binding {
+    RP_BUF_OTHER, RP_BUF_VERTEX, RP_BUF_INDEX, RP_BUF_INDIRECT, RP_BUF_UNIFORM,
+    RP_BUF_STORAGE, RP_BUF_TEXEL, RP_BUF_BINDING_COUNT,
+};
+int rp_buf_resolve_binding(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf,
+                           uint64_t *off, enum rp_buf_binding binding);
+int rp_buf_resolve_multi_binding(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf,
+                                 uint64_t *off, unsigned char *ok, enum rp_buf_binding binding);
+static inline int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
+    return rp_buf_resolve_binding(c, addr, len, buf, off, RP_BUF_OTHER);
+}
+static inline int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf,
+                                       uint64_t *off, unsigned char *ok) {
+    return rp_buf_resolve_multi_binding(n, addr, len, buf, off, ok, RP_BUF_OTHER);
+}
+// Drain perf and the optional mirror histogram at the same window boundary.
+void rp_buf_mirror_fallback_report(uint64_t *perf, void (*take)(uint64_t *), uint64_t window_end_ns);
 // 回放窗口 = 一次提交的回放（nvn_be_sub_begin → nvn_be_sub_commit，开窗口的线程是回放线程）。窗口开着时别的线程销毁池（MapVirtual 改 run、MemoryPoolFinalize），
 // 镜像缓冲不当场放（回放线程手里可能已有 rp_buf_resolve 取到、后端还没 cmd_ref 的句柄），推迟到窗口收尾；窗口外或同线程销毁照旧当场放。
 void rp_buf_hold_begin(void);
@@ -79,6 +95,7 @@ void rp_pass_end(nvn_gpu_cmd c);
 void rp_pass_flush(nvn_gpu_cmd c);    // 提交前 / 通道外操作前：落地待折清除并结束通道
 void rp_pass_reset(void);
 int rp_pass_is_open(void);
+unsigned rp_pass_attachment_count(void);   // 当前物理通道的颜色槽与 DS 视图数
 int rp_pass_draws(void);      // 当前通道已画的笔数（通道没开 = 0）
 int rp_pass_split_ok(void);   // 当前通道能否在两笔之间切开续开（见 rp_pass.c）
 const p_set_rt *rp_pass_target(void); // 当前目标（没设过 NULL）
@@ -145,6 +162,7 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_BUF_SYNC_GW_KB,   // 已登记 GPU 写覆盖整页，在途免同步的 KB
        RP_PERF_WAIT_EFX_TS, RP_PERF_WAIT_EFX_FX, RP_PERF_WAIT_EFX_GW, RP_PERF_WAIT_EFX_LATER,   // 本可放行、因待落地回写改成真等的 SyncWait：所等区间里带时间戳 / 带事件·别的计数器·遮挡 / 带显卡写缓冲的次数（一次可记多类）；所等区间里没有、只有之后的提交带回写的次数
        RP_PERF_MIRROR_HOIST, RP_PERF_MIRROR_OVERLAP, RP_PERF_MIRROR_FALLBACK,   // 原本会关遍的镜像同步：前移、确认重叠、不具备前移条件
+       RP_PERF_TEX_BYTE_EQUAL, RP_PERF_TEX_BYTE_CHANGED, RP_PERF_TEX_BYTE_SKIPPED,
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。
@@ -209,6 +227,9 @@ struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
 void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
 void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
+// len owns the full mirror interval; copy_len only limits staging and guest materialization.
+uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged);
+int rp_post_gpu_write_prefix(uint64_t addr, uint64_t len, uint64_t copy_len);
 uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *pool_key, int *merged);
 int rp_rc_skip(void);                   // 条件渲染判成不画的那一段里
 enum { RP_NOTE_DS = 1, RP_NOTE_SHADER_WRITE = 2 };   // rp_pass_note_draw 的位

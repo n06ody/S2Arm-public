@@ -11,7 +11,8 @@ static nvn_gpu_tex g_src; static nvn_gpu_buf g_dst; static uint8_t g_guest[256];
 static struct { uint64_t addr, bytes, row, image; uint32_t rows, images; } g_write;
 static int g_write_n, g_unimpl;
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c) { (void)t; (void)c; return g_src; }
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off) {
+int rp_buf_resolve_binding(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off, enum rp_buf_binding binding) {
+    (void)binding;
     (void)c; uint64_t base = (uint64_t)(uintptr_t)g_guest;
     if (addr < base || len > sizeof g_guest || addr - base > sizeof g_guest - len) return 0;
     *buf = g_dst; *off = addr - base; memcpy(nvn_gpu_buf_cpu(g_dst), g_guest, sizeof g_guest); return 1;

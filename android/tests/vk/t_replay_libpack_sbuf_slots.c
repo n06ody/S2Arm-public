@@ -67,7 +67,8 @@ static uint64_t slot_addr(int st, int j) { return (st ? 0x4000000000ull : 0x5000
 static uint32_t slot_color(int st, int j) {   // RGBA8 字节 = (0x30 + 3j + 0x50st, 0x80 - 5j + 0x20st, 0x10 + 11j, 0xFF)：32 个槽两两不同
     return (uint32_t)(0x30 + 3 * j + 0x50 * st) | (uint32_t)(0x80 - 5 * j + 0x20 * st) << 8 | (uint32_t)(0x10 + 11 * j) << 16 | 0xFF000000u;
 }
-int rp_buf_resolve(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64_t *o) {
+int rp_buf_resolve_binding(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64_t *o, enum rp_buf_binding binding) {
+    (void)binding;
     (void)c; (void)n;
     for (int st = 0; st < 2; st++) for (int j = 0; j < 16; j++) {
         const uint64_t base = slot_addr(st, j);
@@ -77,8 +78,8 @@ int rp_buf_resolve(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64
 }
 int rp_buf_gpu_pending(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }   // 本夹具没有 GPU 写回：恒无还没落地的写
 // #958 批量解析：逐段转给上面的单段替身（口径一致）
-int rp_buf_resolve_multi(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_buf *b, uint64_t *o, unsigned char *ok) {
-    for (int i = 0; i < n; i++) ok[i] = l[i] && rp_buf_resolve(NULL, a[i], l[i], &b[i], &o[i]);
+int rp_buf_resolve_multi_binding(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_buf *b, uint64_t *o, unsigned char *ok, enum rp_buf_binding binding) {
+    for (int i = 0; i < n; i++) ok[i] = l[i] && rp_buf_resolve_binding(NULL, a[i], l[i], &b[i], &o[i], binding);
     return 1;
 }
 void rp_view_pin_begin(void) {}
