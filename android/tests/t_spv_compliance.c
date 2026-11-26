@@ -36,6 +36,8 @@ static void case_caps_table(void) {
     CHECK(s2a_spv_cap_req(SpvCapabilityImageGatherExtended) == SPV_REQ_IMAGE_GATHER_EXT);
     CHECK(s2a_spv_cap_req(SpvCapabilityImageCubeArray) == SPV_REQ_CUBE_ARRAY);
     CHECK(s2a_spv_cap_req(SpvCapabilityMultiViewport) == SPV_REQ_MULTI_VIEWPORT);
+    CHECK(s2a_spv_cap_req(SpvCapabilityShaderViewportIndexLayerEXT) == SPV_REQ_VIEWPORT_INDEX_LAYER);
+    CHECK(s2a_spv_cap_req(SpvCapabilityShaderLayer) == SPV_REQ_SHADER_LAYER);
     CHECK(s2a_spv_cap_req(SpvCapabilityStorageImageReadWithoutFormat) == SPV_REQ_STORAGE_READ_WOF);
     CHECK(s2a_spv_cap_req(SpvCapabilityStorageImageWriteWithoutFormat) == SPV_REQ_STORAGE_WRITE_WOF);
     CHECK(s2a_spv_cap_req(SpvCapabilityGroupNonUniformBallot) == SPV_REQ_API_1_1);
@@ -52,6 +54,7 @@ static void case_caps_table(void) {
     CHECK(s2a_spv_req_name(SPV_REQ_INT16) && strstr(s2a_spv_req_name(SPV_REQ_INT16), "Int16"));
     // 扩展表
     CHECK(s2a_spv_ext_req("SPV_KHR_shader_draw_parameters") == SPV_REQ_DRAW_PARAMETERS);
+    CHECK(s2a_spv_ext_req("SPV_EXT_shader_viewport_index_layer") == SPV_REQ_VIEWPORT_INDEX_LAYER);
     CHECK(s2a_spv_ext_req("SPV_KHR_16bit_storage") == SPV_REQ_16BIT_STORAGE);
     CHECK(s2a_spv_ext_req("SPV_EXT_descriptor_indexing") == SPV_REQ_DESCRIPTOR_INDEXING);
     CHECK(s2a_spv_ext_req("SPV_KHR_storage_buffer_storage_class") == SPV_REQ_SBC_CLASS);

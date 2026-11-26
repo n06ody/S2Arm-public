@@ -49,6 +49,7 @@ struct s2a_vk_device {
     PFN_vkCmdDrawIndirectCountKHR draw_indirect_count;
     PFN_vkCmdDrawIndexedIndirectCountKHR draw_indexed_indirect_count;
     int shader_draw_parameters_enabled;
+    int shader_viewport_index_layer_enabled; // Vulkan 1.1 下顶点阶段输出 Layer 走已启用的 EXT。
     // VK_KHR_sampler_mirror_clamp_to_edge 已启用：采样器可用 MIRROR_CLAMP_TO_EDGE（实例按 1.1 建，用不到 1.2 核心里的同名特性）。
     int sampler_mirror_clamp_enabled;
     // Vulkan 1.1 下显式启用 EXT；只读附件用 STORE_OP_NONE 避免隐式写。

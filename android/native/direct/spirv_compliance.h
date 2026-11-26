@@ -38,6 +38,7 @@ enum s2a_spv_req {
     SPV_REQ_DESCRIPTOR_INDEXING, SPV_REQ_SBC_CLASS, SPV_REQ_POST_DEPTH,
     SPV_REQ_MULTIVIEW, SPV_REQ_STENCIL_EXPORT, SPV_REQ_SHADING_RATE,
     SPV_REQ_VARIABLE_POINTERS, SPV_REQ_BUFFER_DEVICE_ADDRESS,
+    SPV_REQ_VIEWPORT_INDEX_LAYER, SPV_REQ_SHADER_LAYER,
 };
 static inline const char *s2a_spv_req_name(int req) {
     switch (req) {
@@ -75,6 +76,8 @@ static inline const char *s2a_spv_req_name(int req) {
     case SPV_REQ_SHADING_RATE: return "VK_KHR_fragment_shading_rate";
     case SPV_REQ_VARIABLE_POINTERS: return "VK_KHR_variable_pointers";
     case SPV_REQ_BUFFER_DEVICE_ADDRESS: return "VK_KHR_buffer_device_address";
+    case SPV_REQ_VIEWPORT_INDEX_LAYER: return "VK_EXT_shader_viewport_index_layer";
+    case SPV_REQ_SHADER_LAYER: return "shaderOutputLayer (Vulkan 1.2)";
     default: return "?";
     }
 }
@@ -110,6 +113,8 @@ static inline int s2a_spv_cap_req(uint32_t cap) {
     case SpvCapabilityCullDistance: return SPV_REQ_CULL_DIST;
     case SpvCapabilityImageCubeArray: return SPV_REQ_CUBE_ARRAY;
     case SpvCapabilityMultiViewport: return SPV_REQ_MULTI_VIEWPORT;
+    case SpvCapabilityShaderViewportIndexLayerEXT: return SPV_REQ_VIEWPORT_INDEX_LAYER;
+    case SpvCapabilityShaderLayer: return SPV_REQ_SHADER_LAYER;
     case SpvCapabilityStorageImageReadWithoutFormat: return SPV_REQ_STORAGE_READ_WOF;
     case SpvCapabilityStorageImageWriteWithoutFormat: return SPV_REQ_STORAGE_WRITE_WOF;
     case SpvCapabilitySubgroupDispatch: case SpvCapabilityDeviceGroup:
@@ -150,6 +155,7 @@ static inline int s2a_spv_cap_req(uint32_t cap) {
 // OpExtension literal name → required enabling. Same two-tier rule as caps.
 static inline int s2a_spv_ext_req(const char *name) {
     if (!strcmp(name, "SPV_KHR_shader_draw_parameters")) return SPV_REQ_DRAW_PARAMETERS;
+    if (!strcmp(name, "SPV_EXT_shader_viewport_index_layer")) return SPV_REQ_VIEWPORT_INDEX_LAYER;
     if (!strcmp(name, "SPV_KHR_16bit_storage")) return SPV_REQ_16BIT_STORAGE;
     if (!strcmp(name, "SPV_KHR_8bit_storage")) return SPV_REQ_8BIT_STORAGE;
     if (!strcmp(name, "SPV_KHR_multiview")) return SPV_REQ_MULTIVIEW;

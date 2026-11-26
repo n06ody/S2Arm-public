@@ -4646,7 +4646,7 @@ static void t_split_long_pass(void) {
 // 3D 贴图的深度切片当渲染目标：NVN 视图的层号在 3D 贴图上是深度切片（nvn_mtl.m attach() 落到 depthPlane）；Vulkan 的 3D 视图起点只能是 0，
 // 子范围只能用 2D（阵列）视图（nvn_vk_texview.h 文件头与 plan_make 的错误信息都这么说）。所以 3D 附件带层号时核心向后端请求 2D 阵列目标；
 // 游戏自己设了 3D 目标的同样请求 2D 阵列（Vulkan 的 3D 视图本身不能当附件，不管起点是不是 0；真机上有游戏对 3D 贴图的第 k 片显式设「3D 目标 + 层号 k」，#724）；
-// 游戏设的是 2D / 2D 阵列等附件合法目标的、没带层号的（首片）、不是 3D 的贴图，视图记录原样递下去。
+// 单切片视图已选 2D / 2D 阵列目标时保留原样；整屏清除未指定层范围时覆盖该 mip 的全部切片。
 // 期望值手算：32 层的 3D 取第 5 层 → set_target = 1、target = 2D_ARRAY、min_layer = 5、nlayers = 1，其余字段与游戏给的一致。
 // 颜色槽、深度槽各一例；请求出来的视图只当附件用（采样 3D 贴图的视图不经这里，记录原样）。
 static tex_t mk_tex_tgt(uint64_t serial, int target, int fmt, uint32_t w, uint32_t h, uint32_t depth) {
@@ -4679,12 +4679,15 @@ static void t_pass_3d_slice_view(void) {
     // ② 带层号的第 0 层：规则一致，同样请求 2D 阵列目标（不特判 0）
     v.min_layer = 0; slice_pass(&v3, &v);
     CHECK(g_npd == 1 && g_vw_last_has == 1 && g_vw_last.set_target == 1 && g_vw_last.target == NVN_TEXTURE_TARGET_2D_ARRAY && g_vw_last.min_layer == 0);
-    // ③ 没带视图 / 视图没带层号（首片）：原样（没带视图就是没带）
+    // ③ 没有指定层范围，整屏清除覆盖 0..31，构造只取 mip 0 的二维阵列附件。
+    const view_t all = {.set_target = 1, .target = NVN_TEXTURE_TARGET_2D_ARRAY,
+                        .set_levels = 1, .nlevels = 1, .set_layers = 1, .nlayers = 32};
     slice_pass(&v3, NULL);
-    CHECK(g_npd == 1 && g_vw_last_has == 0);
+    CHECK(g_npd == 1 && g_pd[0].layers == 32 && g_pd[0].color[0].load == NVN_GPU_LOAD_CLEAR);
+    CHECK(g_vw_last_has == 1 && !memcmp(&g_vw_last, &all, sizeof all));
     view_t nl; memset(&nl, 0, sizeof nl); nl.set_levels = 1;
     slice_pass(&v3, &nl);
-    CHECK(g_npd == 1 && g_vw_last_has == 1 && !memcmp(&g_vw_last, &nl, sizeof nl));
+    CHECK(g_npd == 1 && g_pd[0].layers == 32 && g_vw_last_has == 1 && !memcmp(&g_vw_last, &all, sizeof all));
     // ④ 游戏自己设了附件合法的目标（2D / 2D 阵列）：原样
     view_t own = v; own.min_layer = 7; own.set_target = 1; own.target = NVN_TEXTURE_TARGET_2D;
     slice_pass(&v3, &own);
@@ -4703,9 +4706,12 @@ static void t_pass_3d_slice_view(void) {
     CHECK(g_vw_last.set_format == 1 && g_vw_last.format == NVN_FORMAT_RGBA8 && g_vw_last.set_swizzle == 1 && !memcmp(g_vw_last.swz, real3.swz, sizeof real3.swz));
     real3.min_layer = 0; slice_pass(&v3, &real3);   // 第 0 片：规则一致，不特判 0
     CHECK(g_npd == 1 && g_vw_last_has == 1 && g_vw_last.set_target == 1 && g_vw_last.target == NVN_TEXTURE_TARGET_2D_ARRAY && g_vw_last.min_layer == 0);
-    view_t real3_nl = real3; real3_nl.set_layers = 0; real3_nl.min_layer = 0; real3_nl.nlayers = 0;   // 显式 3D 目标但没带层号（首片）：原样，本条不动
+    view_t real3_nl = real3; real3_nl.set_layers = 0; real3_nl.min_layer = 0; real3_nl.nlayers = 0;
     slice_pass(&v3, &real3_nl);
-    CHECK(g_npd == 1 && g_vw_last_has == 1 && !memcmp(&g_vw_last, &real3_nl, sizeof real3_nl));
+    CHECK(g_npd == 1 && g_pd[0].layers == 32 && g_vw_last_has == 1 &&
+          g_vw_last.target == NVN_TEXTURE_TARGET_2D_ARRAY && g_vw_last.nlayers == 32 &&
+          g_vw_last.set_format && g_vw_last.format == real3.format &&
+          g_vw_last.set_swizzle && !memcmp(g_vw_last.swz, real3.swz, sizeof real3.swz));
     tex_t a2_ = mk_tex_tgt(75, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 32, 32, 8);   // 不是 3D 的贴图上游戏设 3D 目标：不归这里管，原样
     real3.min_layer = 3; slice_pass(&a2_, &real3);
     CHECK(g_npd == 1 && g_vw_last_has == 1 && !memcmp(&g_vw_last, &real3, sizeof real3));

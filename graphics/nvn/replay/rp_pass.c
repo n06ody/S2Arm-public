@@ -1,7 +1,8 @@
 // 渲染目标与通道（对齐 nvn_mtl.m：OP_SET_RT @14565、OP_CLEAR_COLOR @14578、OP_CLEAR_DS @14599、rp_begin_ex @5100 一带、rp_flush @5232）。
 //   · OP_SET_RT 只换目标，不开通道；通道在下一笔绘制时才开。
-//   · 整屏、全通道的清除不编码任何东西：记成「待折清除」，开通道时落成该附件的 load = CLEAR。
+//   · 单层附件的整屏、全通道清除记成「待折清除」，开通道时落成该附件的 load = CLEAR。
 //     一直没有绘制：换目标或提交时为它开一个只做清除的通道。
+//   · 多层附件的整屏清除用独立通道，覆盖视图指定的整段层范围。
 //   · 目标绑定跨命令缓冲、跨提交保留（记录内的贴图快照拷一份自己留着）；打开的通道与待折清除不跨提交。
 //   · 带裁剪或带写掩码的清除（裁剪矩形盖不满目标 / 只写部分颜色通道 / 只写部分模板位）：像绘制一样开通道（待折清除先落），
 //     在通道里按矩形清（后端 nvn_gpu_clear_rect，写掩码一并交给它）。清完后端的管线与动态状态不保证，下一笔绘制前全部重发。
@@ -209,16 +210,19 @@ static const view_t *att_view(const tex_t *t, int has_v, const view_t *v, view_t
 //   视图显式设了层数的不超过它（NVN 视图的层范围就是这张目标可写的层）。
 static uint32_t att_layers_avail(const tex_t *t, int has_v, const view_t *v) {
     const uint32_t lv = has_v && v->set_levels ? v->base_level : 0, from = has_v && v->set_layers ? v->min_layer : 0;
+    if (lv >= 32 || (lv && lv >= (uint32_t)t->d.levels)) return 0;
     uint32_t all;
     switch (t->d.target) {
     case NVN_TEXTURE_TARGET_3D: all = (uint32_t)t->d.depth >> lv; break;
     case NVN_TEXTURE_TARGET_2D_ARRAY: case NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: all = (uint32_t)t->d.depth; break;
     case NVN_TEXTURE_TARGET_CUBEMAP: all = 6; break;
-    default: return 1;
+    default: all = 1; break;
     }
-    uint32_t n = all > from ? all - from : 1;
-    if (has_v && v->set_layers && v->nlayers && v->nlayers < n) n = v->nlayers;
-    return n;
+    if (!all) all = 1;
+    if (from >= all) return 0;
+    const uint32_t remaining = all - from;
+    if (!has_v || !v->set_layers || !v->nlayers) return remaining;
+    return v->nlayers <= remaining ? v->nlayers : 0;
 }
 // 分层通道的附件视图：起始层起 nl 层的二维阵列视图（3D 贴图的深度切片在 Vulkan 里只能经二维阵列视图当附件，见 att_view；
 //   附件只取一级）。nl <= 1 照旧走 att_view。tmp 由调用方给，生命期同这次取视图。
@@ -643,7 +647,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     int nattached = 0;
     int taken[9], ntake = 0;   // 这个通道吃掉的挂起项（开通道成功后才移出表：开不了要留着下次落地）
     // 分层通道的层数：各附件从挂接层起能给的层数取最小（iOS nvn_mtl.m 同取法）；影子附件（块压缩 / 深度当颜色）只有一层。
-    //   只有一层可给时就是普通通道：写到更高层的图元按 Vulkan 规则丢弃，与 NVN 目标只有一层时一致。
+    //   着色器输出的层号必须落在通道范围内；这里检查附件声明的范围。
     uint32_t lay_n = 1;
     if (layered) {
         uint32_t m = UINT32_MAX;
@@ -654,7 +658,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
             if (a < m) m = a;
         }
         if (P.rt.depth) { const uint32_t a = att_layers_avail(P.rt.depth, P.rt.has_dview, &P.rt.dview); if (a < m) m = a; }
-        if (m != UINT32_MAX && m > 1) lay_n = m;
+        if (!m) { rp_view_pin_end(); nvn_unimpl("pass", "layered_attachment_range", NULL); return 0; }
+        if (m != UINT32_MAX) lay_n = m;
     }
     for (int i = 0; i < P.rt.n; i++) {
         const tex_t *t = P.rt.color[i];
@@ -920,6 +925,29 @@ static void pass_clear_rect(nvn_gpu_cmd c, const nvn_gpu_clear *cl) {
     rp_dirty_all();
 }
 
+// 整屏清除覆盖绑定视图的全部层。独立落地可保留先清部分重叠视图、再清当前视图的次序；
+// 挂起表的身份只有起始层，而绘制通道的层数还会受其它附件限制（iOS layer_clears）。
+static void pass_clear_layers(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, const tex_t *t,
+                              int has_view, const view_t *v, int slot, const void *rec) {
+    if (!c) return;
+    rp_pass_flush(c);
+    if (!rp_cmd_record_ok(c)) return;
+    if (P.barrier_bits) { nvn_gpu_barrier(c, P.barrier_bits); P.barrier_bits = 0; }
+    rp_view_pin_begin();
+    view_t av;
+    nvn_gpu_view view = rp_view_for(t, att_view_n(t, has_view, v, &av, d->layers), c);
+    if (view) {
+        level_size(t, v, has_view, &d->w, &d->h);
+        if (slot >= 0) { d->ncolor = (uint32_t)slot + 1; d->color[slot].view = view; }
+        else {
+            if (d->depth.store == NVN_GPU_STORE_STORE) d->depth.view = view;
+            if (d->stencil.store == NVN_GPU_STORE_STORE) d->stencil.view = view;
+        }
+        pass_land_full(c, d, slot, d->w, d->h, t);
+    } else nvn_unimpl("pass", "layered_clear_view", rec);
+    rp_view_pin_end();
+}
+
 void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec) {
     if (!P.has_rt || cc->index < 0 || cc->index >= P.rt.n || cc->index >= 8 || !P.rt.color[cc->index]) { nvn_unimpl("pass", "clear_color_no_target", rec); return; }
     if (!(cc->mask & 0xf)) return;
@@ -933,7 +961,20 @@ void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec
         pass_clear_rect(c, &cl);
         return;
     }
+    const tex_t *t = P.rt.color[i];
+    const int has_view = P.rt.has_cview[i];
+    const view_t *v = &P.rt.cview[i];
+    const uint32_t layers = att_layers_avail(t, has_view, v);
+    if (!layers) { nvn_unimpl("pass", "layered_attachment_range", rec); return; }
     if (P.open) rp_perf_add(RP_PERF_P_CUT_CLEAR, 1);
+    if (layers > 1 && slot_kind(i, NULL, NULL) == 0) {
+        nvn_gpu_pass_desc d = {.layers = layers};
+        d.color[i].load = NVN_GPU_LOAD_CLEAR;
+        d.color[i].store = NVN_GPU_STORE_STORE;
+        color_value(i, cc->rgba, &d.color[i].clear);
+        pass_clear_layers(c, &d, t, has_view, v, i, rec);
+        return;
+    }
     if (P.open) rp_pass_end(c);   // 通道中的整屏清除：结束这一通道，清除挂到下一个通道开头（其余附件照常 LOAD）
     park_put_color(c, i, cc->rgba);   // 挂起：下一个把这个槽当附件的通道载入时清成这个值
 }
@@ -952,6 +993,26 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) {
         if (!c || (!P.open && !pass_begin_colors(c, 0xff, 0, 0))) { if (c) nvn_unimpl("pass", "clear_rect_pass_begin_failed", rec); return; }
         cl.depth = (uint8_t)do_d; cl.stencil = (uint8_t)do_s; cl.depth_value = depth_value(cd->depth); cl.stencil_value = (uint32_t)cd->stencil & 0xff;
         pass_clear_rect(c, &cl);
+        return;
+    }
+    const tex_t *t = P.rt.depth;
+    const int has_view = P.rt.has_dview;
+    const view_t *v = &P.rt.dview;
+    const uint32_t layers = att_layers_avail(t, has_view, v);
+    if (!layers) { nvn_unimpl("pass", "layered_attachment_range", rec); return; }
+    if (layers > 1) {
+        nvn_gpu_pass_desc d = {.layers = layers, .clear_depth = depth_value(cd->depth),
+                               .clear_stencil = (uint32_t)cd->stencil & 0xff,
+                               .depth.store = NVN_GPU_STORE_DONTCARE, .stencil.store = NVN_GPU_STORE_DONTCARE};
+        if (!ok || fi.depth) {
+            d.depth.load = do_d ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD;
+            d.depth.store = NVN_GPU_STORE_STORE;
+        }
+        if (ok && fi.stencil) {
+            d.stencil.load = do_s ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD;
+            d.stencil.store = NVN_GPU_STORE_STORE;
+        }
+        pass_clear_layers(c, &d, t, has_view, v, -1, rec);
         return;
     }
     if (P.open) rp_pass_end(c);

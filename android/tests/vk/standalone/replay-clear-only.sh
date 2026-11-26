@@ -8,11 +8,12 @@ out="$repo/build/vk-replay-clear-only"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
-for shader in tri3.vert solid_green.frag; do
+for shader in tri3.vert solid_green.frag layer_id.vert layer_id.frag layer_id.geom; do
     "${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
+"${GLSLC:-glslc}" --target-env=vulkan1.1 -DWRITE_LAYER "$repo/android/tests/vk/shaders/layer_id.vert" -o "$out/shaders/layer_vs.vert.spv"
 inc=(-I "$repo/build/c883-ndk")
-for d in android/tests/vkhost graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include graphics/nvn/gfx/tex android/native android/native/nvn android/native/direct runtime/include; do
+for d in android/tests/vkhost graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include graphics/nvn/gfx/tex android/native android/native/nvn android/native/direct android/native/gfx_plat runtime/include; do
     inc+=(-I "$repo/$d")
 done
 src=("$repo/android/tests/vk/t_replay_clear_only.c")
@@ -34,17 +35,19 @@ khronos_validation.validate_sync = true
 khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
+printf '%s\n' '{"source":"fixture","gs_occlusion":"supported"}' > "$out/gs-probe.json"
+export S2A_CAPPROBE_RESULT="$out/gs-probe.json"
 for dq in 0 1; do
     if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
     for arm in 0 1; do
         log="$out/dq$dq-arm$arm.log"
         if ! timeout 90 "$out/test" "$out/shaders" "$arm" "$arm" > "$log" 2>&1 ||
            grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
-           ! grep -q 'clear-only Vulkan cases=6 failures=0' "$log"; then
+           ! grep -q 'clear-only Vulkan cases=13 failures=0' "$log"; then
             cat "$log"
             exit 1
         fi
-        echo "clear-only Vulkan: DQ=$dq arm=$arm cases=6 VUID=0 SYNC-HAZARD=0"
+        echo "clear-only Vulkan: DQ=$dq arm=$arm cases=13 VUID=0 SYNC-HAZARD=0"
     done
 done
 # Withdraw the optimization while preserving the workload, pixels and expectations.
@@ -54,7 +57,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/withdrawn.log" ||
    [ "$(grep -c 'clear-only attachment behavior' "$out/withdrawn.log")" -ne 3 ] ||
-   ! grep -q 'clear-only Vulkan cases=6 failures=3' "$out/withdrawn.log"; then
+   ! grep -q 'clear-only Vulkan cases=13 failures=3' "$out/withdrawn.log"; then
     cat "$out/withdrawn.log"
     exit 1
 fi

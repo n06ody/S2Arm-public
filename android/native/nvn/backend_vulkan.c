@@ -3867,6 +3867,7 @@ static int spv_req_have(int req) {
     case SPV_REQ_CULL_DIST: return f->shaderCullDistance;
     case SPV_REQ_CUBE_ARRAY: return f->imageCubeArray;
     case SPV_REQ_MULTI_VIEWPORT: return f->multiViewport;
+    case SPV_REQ_VIEWPORT_INDEX_LAYER: return g.dev->shader_viewport_index_layer_enabled;
     case SPV_REQ_STORAGE_READ_WOF: return f->shaderStorageImageReadWithoutFormat;
     case SPV_REQ_STORAGE_WRITE_WOF: return f->shaderStorageImageWriteWithoutFormat;
     case SPV_REQ_DRAW_PARAMETERS: return g.dev->shader_draw_parameters_enabled;
@@ -3877,6 +3878,7 @@ static int spv_req_have(int req) {
     case SPV_REQ_SBC_CLASS: case SPV_REQ_POST_DEPTH: case SPV_REQ_MULTIVIEW:
     case SPV_REQ_STENCIL_EXPORT: case SPV_REQ_SHADING_RATE:
     case SPV_REQ_VARIABLE_POINTERS: case SPV_REQ_BUFFER_DEVICE_ADDRESS:
+    case SPV_REQ_SHADER_LAYER:
         return 0;   // 设备从未启用对应扩展 / 特性（vk_device.c 的启用清单里没有）
     default: return 0;
     }
@@ -5425,14 +5427,30 @@ static const void *view_usage_next(const struct nvn_gpu_tex_s *t, VkFormat vf, V
 // level / slice，没设就是首级首层）。采样用的视图可以是多级 / 多层 / 立方体 / 只取深度面，都不能直接挂到帧缓冲上：
 // 第一次当附件时另建一个，随视图销毁。建不出来回空。
 // nl = 所在通道的层数（nvn_gpu_pass_desc.layers）。分层通道（nl > 1，程序的顶点 / 几何阶段写层号）要起始层起 nl 层的 2D 阵列视图，
-// 图元按层号落到对应层（3D 贴图：深度切片，要 2D_ARRAY_COMPATIBLE）；单层形态只有第 0 层，写到更高层的图元全丢（八方旅人调色 LUT 32 片只剩第 0 片）。
+// 图元按层号落到对应层（3D 贴图：深度切片，要 2D_ARRAY_COMPATIBLE）；程序输出的层号必须在通道层数内。
 // 视图自己的层数不够 nl 时回空（回放核心按附件可给的层数定 nl，正常走不到）。
 static VkImageView view_attachment(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t nl, VkResult *result) {
     struct nvn_gpu_tex_s *t = v->tex;
     if (v->p16_remap) return VK_NULL_HANDLE;   // #975：恒等形态会按退回格式的分量顺序写，调用方具名报红
-    int image3d = t->target == NVN_TEXTURE_TARGET_3D && t->depth > 1;
+    if (!nl) nl = 1;
+    if (nl == 1 && !v->swizzled && v->levels == 1 && v->layers == 1 &&
+        v->type == VK_IMAGE_VIEW_TYPE_2D && v->aspect == t->aspect) return v->view;
+    const int image3d = t->target == NVN_TEXTURE_TARGET_3D;
+    const uint32_t first = image3d ? v->att_layer : v->base_layer;
+    if (v->layers < nl || nl > UINT16_MAX) {
+        set_sticky(c, NVN_GPU_E_ARG, "附件要求 %u 层，视图只有 %u 层（mip=%u，起始层=%u）",
+                   nl, v->layers, v->base_level, first);
+        return VK_NULL_HANDLE;
+    }
+    const view_t range = {.set_levels = 1, .base_level = v->base_level, .nlevels = 1,
+                          .set_layers = 1, .min_layer = first, .nlayers = nl};
+    struct nvn_vk_texview_plan plan;
+    nvn_vk_texview_plan_make(t->target, t->depth, t->layers, t->levels, &range, 1, t->array_compatible, &plan);
+    if (!plan.ok) {
+        set_sticky(c, NVN_GPU_E_ARG, "%s", plan.why);
+        return VK_NULL_HANDLE;
+    }
     if (nl > 1) {
-        if (v->layers < nl || (image3d && !t->array_compatible)) return VK_NULL_HANDLE;
         gmu_lock_rt();
         struct layered_attachment *form = v->att_n;
         if (!form || form->layers != nl) {
@@ -5446,9 +5464,9 @@ static VkImageView view_attachment(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_
             memset(&ci, 0, sizeof ci);
             ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             ci.image = t->image;
-            ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            ci.viewType = plan.type;
             ci.format = v->format ? v->format : t->format;
-            ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, nl};
+            ci.subresourceRange = (VkImageSubresourceRange){t->aspect, plan.base_level, plan.nlevels, plan.base_layer, plan.nlayers};
             VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
             OC(OC_VIEW);
             { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &next->view); LIFE_ADD(4); }
@@ -5469,16 +5487,15 @@ static VkImageView view_attachment(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_
         pthread_mutex_unlock(&g_mu);
         return cmd_ref_append(c, form, REF_LAYERED_VIEW) ? form->view : VK_NULL_HANDLE;
     }
-    if (!v->swizzled && v->levels == 1 && v->layers == 1 && v->type == VK_IMAGE_VIEW_TYPE_2D && v->aspect == t->aspect) return v->view;
     gmu_lock_rt();
-    if (!v->att && !(image3d && !t->array_compatible)) {
+    if (!v->att) {
         VkImageViewCreateInfo ci;
         memset(&ci, 0, sizeof ci);
         ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         ci.image = t->image;
-        ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ci.viewType = plan.type;
         ci.format = v->format ? v->format : t->format;
-        ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, 1};
+        ci.subresourceRange = (VkImageSubresourceRange){t->aspect, plan.base_level, plan.nlevels, plan.base_layer, plan.nlayers};
         VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
         OC(OC_VIEW);
         { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &v->att); LIFE_ADD(4); }
@@ -6013,6 +6030,10 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
 #define PBP_STEP(i) do { struct timespec z_; clock_gettime(CLOCK_MONOTONIC, &z_); uint64_t n_ = (uint64_t)z_.tv_sec * 1000000000ull + (uint64_t)z_.tv_nsec; pass_prof(i, pbp_t); pbp_t = n_; } while (0)
     es_reset(c);   // 冗余状态消除：新通道先保守地全部重发（#708）
     if (!d || !d->w || !d->h) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 参数非法（尺寸为 0）"); return; }   // 一个附件都没有也合法（NVN_GPU_CAP_NO_ATTACH_PASS）：帧缓冲按 w / h
+    if (d->layers > g.dev->properties.limits.maxFramebufferLayers) {
+        set_sticky(c, NVN_GPU_E_ARG, "帧缓冲要求 %u 层，上限 %u", d->layers, g.dev->properties.limits.maxFramebufferLayers);
+        return;
+    }
     if (d->depth.view && d->stencil.view && d->depth.view != d->stencil.view) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 的深度与模板必须是同一个视图"); return; }
     uint32_t attachment_samples = 0;
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (d->color[i].view) {

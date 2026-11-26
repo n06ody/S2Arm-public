@@ -86,6 +86,21 @@ int main(void) {
               "3D slice sampling with 2D_ARRAY target type=%d layer=%u+%u: %s",
               (int)p.type, p.base_layer, p.nlayers, p.why);
     }
+    {
+        view_t v = view_levels_layers(1, 1, 2, 2);
+        v.set_target = 1; v.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+        struct nvn_vk_texview_plan p = plan(NVN_TEXTURE_TARGET_3D, 8, 1, 2, &v, 1, 1);
+        CHECK(p.ok && p.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY && p.base_layer == 2 && p.nlayers == 2,
+              "valid 3D mip 1 layered attachment rejected: %s", p.why);
+        v.min_layer = 3;
+        p = plan(NVN_TEXTURE_TARGET_3D, 8, 1, 2, &v, 0, 1);
+        CHECK(!p.ok && strstr(p.why, "layer 3+2 of 4"),
+              "3D slice view exceeded the selected mip: ok=%d why=%s", p.ok, p.why);
+    }
+    {
+        struct nvn_vk_texview_plan p = plan(NVN_TEXTURE_TARGET_3D, 1, 1, 1, NULL, 0, 1);
+        CHECK(p.ok && p.type == VK_IMAGE_VIEW_TYPE_3D, "depth-one 3D sampling type=%d: %s", (int)p.type, p.why);
+    }
 
     // ---- 2D array：单层视图可建；越界仍拒 ----
     {
@@ -161,7 +176,7 @@ int main(void) {
         }
     }
 
-    // ---- 单 mip / 单层约束、默认附件范围 ----
+    // ---- 单 mip 约束、默认附件范围 ----
     {
         struct nvn_vk_texview_plan p = plan(NVN_TEXTURE_TARGET_2D, 1, 1, 3, NULL, 1, 1);
         CHECK(p.ok && p.base_level == 0 && p.nlevels == 1 && p.type == VK_IMAGE_VIEW_TYPE_2D,
@@ -171,8 +186,8 @@ int main(void) {
     {
         view_t v = view_levels_layers(0, 2, 0, 2);
         struct nvn_vk_texview_plan p = plan(NVN_TEXTURE_TARGET_2D_ARRAY, 1, 2, 2, &v, 1, 1);
-        CHECK(!p.ok && strstr(p.why, "exactly one mip and one layer"),
-              "multi-layer attachment not rejected: ok=%d why=%s", p.ok, p.why);
+        CHECK(!p.ok && strstr(p.why, "exactly one mip"),
+              "multi-mip attachment not rejected: ok=%d why=%s", p.ok, p.why);
     }
     {
         view_t v = view_levels_layers(2, 1, 0, 1);
@@ -181,6 +196,6 @@ int main(void) {
               "mip out of range not rejected: ok=%d why=%s", p.ok, p.why);
     }
 
-    if (!failures) printf("nvn-vk-texview-plan: ok (3D slice/array/cube single-layer bounds)\n");
+    if (!failures) printf("nvn-vk-texview-plan: ok (3D mip slices and array/cube attachment bounds)\n");
     return failures ? 1 : 0;
 }

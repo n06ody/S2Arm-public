@@ -493,6 +493,10 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     const int pipe_feedback_ext = !pipe_feedback_core &&
         has_device_extension(out->physical, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     if (pipe_feedback_ext) device_ext[device_ext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
+    out->shader_viewport_index_layer_enabled = enabled_features.multiViewport &&
+        has_device_extension(out->physical, VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+    if (out->shader_viewport_index_layer_enabled)
+        device_ext[device_ext_count++] = VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME;
     // apiVersion=1.1，不能拿物理设备支持 1.3 当作应用已启用核心 NONE。
     // 此扩展没有额外 feature 位；缺失时仍走独立快照，不能用 DONT_CARE 假代 NONE。
     out->load_store_op_none_enabled = has_device_extension(out->physical, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);

@@ -9,6 +9,7 @@
 #include "rp_res.h"
 #include "rp_state.h"
 #include "nvn_tex.h"
+#include "spirv_layer_out.h"
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
@@ -227,6 +228,203 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
     rp_res_reset();
 }
 
+static void check_layer_clear(uint32_t target, unsigned depth, unsigned mip,
+                              unsigned layers, unsigned first, unsigned count) {
+    const uint8_t zero[4] = {0}, red[4] = {255, 0, 0, 255};
+    memset(storage, 0, sizeof storage);
+    pool = (pool_t){.mem = storage, .size = sizeof storage, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    tex_t layered = {.d = {.target = target, .format = NVN_FORMAT_RGBA8,
+                            .width = 16, .height = 16, .depth = depth, .levels = mip + 1},
+                     .serial = 1, .pool = &pool, .mem = storage};
+    nvn_tex_layout(&layered.d, &layered.L);
+    CHECK(layered.L.size > 0 && layered.L.size <= 131072, "layered guest storage bounds");
+    tex_t single = guest_texture(2, 131072, W, NVN_FORMAT_RGBA8);
+    const p_set_rt rt = {.n = 2, .color = {&layered, &single}, .has_cview = {mip || first || count != layers},
+                         .cview = {{.set_levels = 1, .base_level = mip, .nlevels = 1,
+                                    .set_layers = 1, .min_layer = first, .nlayers = count}}};
+    const unsigned edge = 16 >> mip, bytes = edge * edge * 4;
+    nvn_gpu_buf read = make_buf(bytes * layers, NVN_GPU_MEM_SHARED, NULL);
+    active = begin_cmd();
+    nvn_gpu_tex tex = rp_tex_resolve(&layered, active);
+    if (target == NVN_TEXTURE_TARGET_3D) {
+        nvn_gpu_view invalid = NULL;
+        nvn_gpu_err failure = {0};
+        const view_t beyond_mip = {.set_levels = 1, .base_level = mip, .nlevels = 1,
+                                   .set_layers = 1, .min_layer = layers - 1, .nlayers = 2,
+                                   .set_target = 1, .target = NVN_TEXTURE_TARGET_2D_ARRAY};
+        const nvn_gpu_rc bad = nvn_gpu_view_create(tex, &beyond_mip, &invalid, &failure);
+        CHECK(bad.code == NVN_GPU_E_ARG && !invalid && strstr(failure.why, "layer 3+2 of 4"),
+              "out-of-range 3D mip view rejected: %d %s", bad.code, failure.why);
+        if (invalid) nvn_gpu_view_release(invalid);
+    }
+    rp_pass_set_rt(active, &rt);
+    const p_clear_color clear = {.index = 0, .mask = 0xf, .rgba = {1, 0, 0, 1}};
+    rp_pass_clear_color(active, &clear, NULL);
+    rp_pass_flush(active);
+    for (unsigned layer = 0; layer < layers; layer++)
+        nvn_gpu_copy_tex_buf(active, tex, mip, layer, NULL, read, layer * bytes, edge * 4, bytes);
+    nvn_gpu_err err = {0};
+    const uint64_t signal = ++submit_serial + 100;
+    const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, signal, on_done, NULL, &err);
+    CHECK(OK(committed), "layered clear submit target=%u: %s", target, err.why);
+    const nvn_gpu_rc retired = OK(committed) ? nvn_gpu_fence_wait(signal, 5000000000ull, &err) : committed;
+    CHECK(OK(retired), "layered clear retire target=%u: %s", target, err.why);
+    active = NULL;
+    if (OK(retired)) {
+        const uint8_t *data = buf_cpu(read);
+        for (unsigned layer = 0; layer < layers; layer++) {
+            const int selected = layer >= first && layer < first + count;
+            const uint8_t *expected = selected ? red : zero;
+            unsigned good = 0;
+            if (data) for (unsigned off = 0; off < bytes; off += 4)
+                good += !memcmp(data + layer * bytes + off, expected, 4);
+            CHECK(good == bytes / 4, "layered clear pixels target=%u mip=%u layer=%u expected=%s pixels=%u/%u",
+                  target, mip, layer, selected ? "red" : "zero", good, bytes / 4);
+        }
+        printf("layered clear target=%u mip=%u cleared=%u zero=%u\n", target, mip, count, layers - count);
+    }
+    nvn_gpu_buf_release(read, NULL, NULL);
+    rp_pass_reset();
+    rp_res_reset();
+}
+
+static void check_layer_draw(const char *dir, uint32_t target, unsigned layers, unsigned first,
+                             unsigned span, unsigned depth_limit) {
+    const int gs = target == NVN_TEXTURE_TARGET_3D;
+    const char *path_tag = gs ? "GS" : "VS";
+    const char *names[] = {gs ? "layer_id.vert" : "layer_vs.vert", "layer_id.frag", "layer_id.geom"};
+    nvn_gpu_shader sh[3] = {0};
+    int writes_layer = 0;
+    nvn_gpu_err err = {0};
+    for (int st = 0; st < (gs ? 3 : 2); st++) {
+        char path[512];
+        size_t bytes;
+        snprintf(path, sizeof path, "%s/%s.spv", dir, names[st]);
+        void *blob = read_file(path, &bytes);
+        CHECK(blob, "%s draw shader %s exists", path_tag, names[st]);
+        if (!blob) goto release;
+        if (st != NVN_GPU_SH_FS) {
+            const int writes = s2a_spirv_writes_layer(blob, bytes);
+            CHECK(writes == (st == (gs ? NVN_GPU_SH_GS : NVN_GPU_SH_VS)), "%s layer output stage %d", path_tag, st);
+            writes_layer |= writes;
+        }
+        const nvn_gpu_layout layout = {0};
+        const nvn_gpu_shader_src src = {.kind = NVN_GPU_BLOB_SPIRV, .stage = (nvn_gpu_stage)st, .entry = "main",
+                                        .blob = blob, .bytes = bytes, .layout = &layout, .precompiled = 1};
+        if (!gs && st == NVN_GPU_SH_VS) {
+            // 仅撤装载闸的设备能力输入，失败必须发生在调用 Vulkan 之前。
+            const int enabled_before = g_dev.shader_viewport_index_layer_enabled;
+            nvn_gpu_shader rejected = NULL;
+            g_dev.shader_viewport_index_layer_enabled = 0;
+            const nvn_gpu_rc absent = nvn_gpu_shader_load(&src, &rejected, &err);
+            g_dev.shader_viewport_index_layer_enabled = enabled_before;
+            CHECK(absent.code == NVN_GPU_E_UNSUPPORTED && !rejected && strstr(err.why, "VK_EXT_shader_viewport_index_layer"),
+                  "VS layer output rejected without the enabled extension: %d %s", absent.code, err.why);
+            if (rejected) nvn_gpu_shader_release(rejected);
+        }
+        const nvn_gpu_rc loaded = nvn_gpu_shader_load(&src, &sh[st], &err);
+        free(blob);
+        CHECK(OK(loaded), "%s layered draw shader load %s: %s", path_tag, names[st], err.why);
+        if (!OK(loaded)) goto release;
+    }
+    nvn_gpu_pipe_desc pd;
+    fill_gpipe_desc(&pd, sh[0], sh[1], depth_limit ? NVN_FORMAT_DEPTH16 : 0);
+    pd.st[NVN_GPU_SH_GS].sh = sh[NVN_GPU_SH_GS];
+    nvn_gpu_pipe pipe = NULL;
+    CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err)), "%s layered draw pipeline: %s", path_tag, err.why);
+    if (!pipe) goto release;
+
+    enum { EDGE = 32, BYTES = EDGE * EDGE * 4 };
+    const unsigned count = depth_limit && depth_limit < span ? depth_limit : span;
+    memset(storage, 0, sizeof storage);
+    pool = (pool_t){.mem = storage, .size = sizeof storage, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    tex_t t = {.d = {.target = target, .format = NVN_FORMAT_RGBA8, .width = EDGE, .height = EDGE,
+                    .depth = target == NVN_TEXTURE_TARGET_CUBEMAP ? 1 : layers, .levels = 1},
+               .serial = 1, .pool = &pool, .mem = storage};
+    nvn_tex_layout(&t.d, &t.L);
+    CHECK(t.L.size && t.L.size <= sizeof storage, "%s layered draw guest storage bounds", path_tag);
+    tex_t depth = {.d = {.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = NVN_FORMAT_DEPTH16,
+                        .width = EDGE, .height = EDGE, .depth = depth_limit, .levels = 1},
+                   .serial = 2, .pool = &pool, .off = 131072, .mem = storage + 131072};
+    if (depth_limit) nvn_tex_layout(&depth.d, &depth.L);
+    const p_set_rt rt = {.n = 1, .color = {&t}, .depth = depth_limit ? &depth : NULL,
+                         .has_cview = {first || span != layers},
+                         .cview = {{.set_layers = 1, .min_layer = first, .nlayers = span}}};
+    nvn_gpu_buf read = make_buf(BYTES * layers, NVN_GPU_MEM_SHARED, NULL), vb = full_vb();
+    const uint64_t signal = ++submit_serial + 100;
+    active = begin_cmd();
+    nvn_gpu_tex tex = rp_tex_resolve(&t, active);
+    rp_pass_set_rt(active, &rt);
+    nvn_gpu_tex depth_tex = NULL;
+    nvn_gpu_buf depth_read = NULL;
+    if (depth_limit) {
+        const p_clear_ds clear = {.depth = 1, .depth_mask = 1};
+        rp_pass_clear_ds(active, &clear, NULL);
+        depth_tex = rp_tex_resolve(&depth, active);
+        depth_read = make_buf(BYTES / 2 * depth_limit, NVN_GPU_MEM_SHARED, NULL);
+    }
+    rp_pass_want_layered(active, writes_layer);
+    passes = 0;
+    watching = 1;
+    const int opened = rp_pass_begin(active);
+    watching = 0;
+    CHECK(opened && passes == 1 && observed[0].layers == count,
+          "%s replay framebuffer layers expected=%u actual=%u", path_tag, count, opened ? observed[0].layers : 0);
+    if (opened) {
+        nvn_gpu_set_pipe(active, pipe);
+        nvn_gpu_dyn dyn;
+        full_dyn(&dyn);
+        dyn.vp[0][2] = dyn.vp[0][3] = EDGE;
+        dyn.sc[2] = dyn.sc[3] = EDGE;
+        nvn_gpu_set_dyn(active, &dyn);
+        nvn_gpu_set_vbuf(active, 0, vb, 0);
+        const nvn_gpu_draw_args draw = {.prim = 4, .count = 3, .instances = count - 1};
+        nvn_gpu_draw(active, &draw);
+    }
+    rp_pass_flush(active);
+    for (unsigned i = 0; i < layers; i++)
+        nvn_gpu_copy_tex_buf(active, tex, 0, i, NULL, read, i * BYTES, EDGE * 4, BYTES);
+    for (unsigned i = 0; i < depth_limit; i++)
+        nvn_gpu_copy_tex_buf(active, depth_tex, 0, i, NULL, depth_read, i * BYTES / 2, EDGE * 2, BYTES / 2);
+    const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, signal, on_done, NULL, &err);
+    CHECK(OK(committed), "%s layered draw submit: %s", path_tag, err.why);
+    const nvn_gpu_rc retired = OK(committed) ? nvn_gpu_fence_wait(signal, 5000000000ull, &err) : committed;
+    CHECK(OK(retired), "%s layered draw retire: %s", path_tag, err.why);
+    active = NULL;
+    if (OK(retired)) {
+        const uint8_t *data = buf_cpu(read);
+        for (unsigned i = 0; i < layers; i++) {
+            const int written = i >= first && i < first + count - 1;
+            const uint8_t expected[4] = {written ? i - first + 1 : 0, 0, 0, written ? 255 : 0};
+            unsigned good = 0;
+            if (data) for (unsigned off = 0; off < BYTES; off += 4)
+                good += !memcmp(data + i * BYTES + off, expected, 4);
+            CHECK(good == EDGE * EDGE, "%s draw target=%u layer=%u expected R=%u A=%u pixels=%u/%u",
+                  path_tag, target, i, expected[0], expected[3], good, EDGE * EDGE);
+        }
+        printf("layered draw %s target=%u: framebuffer layers=%u written=%u zero=%u\n",
+               path_tag, target, count, count - 1, layers - count + 1);
+        if (depth_read) {
+            const uint8_t *data = buf_cpu(depth_read);
+            for (unsigned i = 0; i < depth_limit; i++) {
+                unsigned good = 0;
+                if (data) for (unsigned pixel = 0; pixel < EDGE * EDGE; pixel++) {
+                    const unsigned off = i * BYTES / 2 + pixel * 2;
+                    good += data[off] == 0xff && data[off + 1] == 0xff;
+                }
+                CHECK(good == EDGE * EDGE, "layered depth clear layer=%u pixels=%u/%u", i, good, EDGE * EDGE);
+            }
+        }
+    }
+    if (depth_read) nvn_gpu_buf_release(depth_read, NULL, NULL);
+    nvn_gpu_buf_release(vb, NULL, NULL);
+    nvn_gpu_buf_release(read, NULL, NULL);
+    rp_pass_reset();
+    rp_res_reset();
+release:
+    for (int i = 0; i < 3; i++) if (sh[i]) nvn_gpu_shader_release(sh[i]);
+}
+
 static void check_init_retry(void) {
     const uint8_t color[4] = {13, 49, 97, 255}, zero[4] = {0}, red[4] = {255, 0, 0, 255};
     memset(storage, 0, sizeof storage);
@@ -362,11 +560,18 @@ int main(int argc, char **argv) {
     g_desc = (nvn_gpu_open_desc){.host_device = &g_dev, .app_label = "replay-clear-only"};
     if (!open_backend()) return 2;
     for (enum shape s = TRIM; s <= STENCIL; s++) run_clear(argv[1], s, expect_trim);
+    check_layer_clear(NVN_TEXTURE_TARGET_2D_ARRAY, 4, 0, 4, 0, 4);
+    check_layer_clear(NVN_TEXTURE_TARGET_CUBEMAP, 1, 0, 6, 1, 3);
+    check_layer_clear(NVN_TEXTURE_TARGET_3D, 8, 1, 4, 1, 2);
+    check_layer_draw(argv[1], NVN_TEXTURE_TARGET_3D, 32, 0, 32, 0);
+    check_layer_draw(argv[1], NVN_TEXTURE_TARGET_CUBEMAP_ARRAY, 12, 5, 6, 0);
+    check_layer_draw(argv[1], NVN_TEXTURE_TARGET_CUBEMAP, 6, 0, 6, 0);
+    check_layer_draw(argv[1], NVN_TEXTURE_TARGET_2D_ARRAY, 6, 1, 4, 3);
     check_init_retry();
     check_failed_segment_publication();
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "destroy device");
-    printf("clear-only Vulkan cases=6 failures=%d\n", g_fail);
+    printf("clear-only Vulkan cases=13 failures=%d\n", g_fail);
     return g_fail ? 1 : 0;
 }

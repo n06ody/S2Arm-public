@@ -3,8 +3,8 @@
 // NVN 的视图层号在 3D 纹理上表示深度切片（Apple 路线 nvn_mtl.m 的 attach()：
 // target == 3D 时 min_layer 落到 MTLRenderPassAttachmentDescriptor.depthPlane）。
 // Vulkan 的 3D 图像不能建 baseArrayLayer != 0 的 3D 视图，也不能把 3D 视图当
-// framebuffer 附件；单切片只能用 VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT 建出的
-// 2D 视图（v != 0 时 baseArrayLayer = 切片号，layerCount = 1）。
+// framebuffer 附件；单切片用 2D 视图，多切片用 2D_ARRAY 视图，
+// 都需要 VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT。切片范围按所选 mip 验证。
 //
 // 这里把“请求范围是否越界 / 视图类型 / 实际 base/n 范围”集中成一条可测规则：
 //   - 越界仍准确失败（不钳位），错误里带目标、深度、层数；
@@ -39,8 +39,11 @@ static inline void nvn_vk_texview_plan_make(uint32_t target, uint32_t depth, uin
     // has_v && set_levels/set_layers 才写 level/slice，否则用描述符默认值）。
     if (attachment && !(v && v->set_levels)) { bl = 0; nl = 1; }
     if (attachment && !(v && v->set_layers)) { by = 0; ny = 1; }
-    const int image3d = target == NVN_TEXTURE_TARGET_3D && depth > 1;
-    const uint32_t layer_cap = image3d ? depth : (layers ? layers : 1);
+    const int image3d = target == NVN_TEXTURE_TARGET_3D;
+    const int slices = image3d && (attachment || (v && v->set_target && v->target != NVN_TEXTURE_TARGET_3D));
+    const uint32_t slice_depth = bl < 32 ? depth >> bl : 0;
+    const uint32_t layer_cap = slices ? (slice_depth ? slice_depth : 1) :
+                               image3d ? (depth ? depth : 1) : (layers ? layers : 1);
     p->base_level = bl; p->nlevels = nl; p->base_layer = by; p->nlayers = ny;
     if (!nl || !ny || bl + nl > (levels ? levels : 1) || by + ny > layer_cap) {
         snprintf(p->why, sizeof p->why,
@@ -49,10 +52,9 @@ static inline void nvn_vk_texview_plan_make(uint32_t target, uint32_t depth, uin
                  bl, nl, levels, by, ny, layer_cap, target, depth, levels);
         return;
     }
-    if (attachment && (nl != 1 || ny != 1)) {
+    if (attachment && nl != 1) {
         snprintf(p->why, sizeof p->why,
-                 "attachment view must select exactly one mip and one layer (got mip %u+%u, layer %u+%u); "
-                 "multi-layer framebuffer attachments are not bridged", bl, nl, by, ny);
+                 "attachment view must select exactly one mip (got mip %u+%u, layer %u+%u)", bl, nl, by, ny);
         return;
     }
     VkImageViewType type;
@@ -82,7 +84,7 @@ static inline void nvn_vk_texview_plan_make(uint32_t target, uint32_t depth, uin
         else type = VK_IMAGE_VIEW_TYPE_2D;
     }
     if (attachment) {
-        // 附件只能是 2D/2D_ARRAY：cube 单面、3D 单切片都落成 2D 视图。
+        // 附件只能是 2D/2D_ARRAY：cube 各面、3D 各切片都用相同的连续层编号。
         if (image3d) {
             if (!array_compatible) {
                 snprintf(p->why, sizeof p->why,
@@ -90,10 +92,8 @@ static inline void nvn_vk_texview_plan_make(uint32_t target, uint32_t depth, uin
                          "VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT (device does not advertise it)", by, ny);
                 return;
             }
-            type = VK_IMAGE_VIEW_TYPE_2D;
-        } else if (type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
-            type = VK_IMAGE_VIEW_TYPE_2D;
         }
+        type = ny > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     } else if (image3d) {
         if (type == VK_IMAGE_VIEW_TYPE_3D) {
             // Vulkan：3D 视图必须 baseArrayLayer=0、layerCount=1。NVN/苹果路线对 3D 采样视图的
