@@ -45,14 +45,33 @@ khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 for dq in 0 1; do
-    for enabled in 0 1; do
-        log="$out/dq$dq-enabled$enabled.log"
-        timeout 30 "$out/test" "$out" "$dq" "$enabled" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    for mode in 0 1 2; do
+        log="$out/dq$dq-enabled$mode.log"
+        timeout 30 "$out/test" "$out" "$dq" "$mode" > "$log" 2>&1 || { cat "$log"; exit 1; }
         if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
             cat "$log"
             exit 1
         fi
         grep '^cold-guard ' "$log"
+        if [ "$mode" = 2 ]; then
+            first=$(sed -nE 's/.*nvk-cold-guard-diag first reason=publication_gap record=([1-9][0-9]*) presents_before=0$/\1/p' "$log")
+            if [ -z "$first" ] || ! grep -Eq "nvk-cold-guard-diag segment record=$first signal=[1-9][0-9]* submitted=1$" "$log"; then
+                echo "cold-guard diag FAIL dq=$dq: missing first publication_gap with committed segment/present" >&2
+                exit 1
+            fi
+            grep -E 'nvk-cold-guard-diag count reason=publication_gap count=5$' "$log" ||
+                { echo "cold-guard diag FAIL dq=$dq: publication-gap count differs" >&2; exit 1; }
+            for reason in main_events_lost committed_event_limit session_writes_lost; do
+                grep -E "nvk-cold-guard-diag count reason=$reason count=1$" "$log" ||
+                    { echo "cold-guard diag FAIL dq=$dq: $reason count differs" >&2; exit 1; }
+            done
+            grep -E 'nvk-cold-guard-diag summary final=1 .*select_a=8 select_b=2 invalid=0 unread=0$' "$log" ||
+                { echo "cold-guard diag FAIL dq=$dq: choice readback differs" >&2; exit 1; }
+        elif grep -q 'nvk-cold-guard-diag ' "$log"; then
+            echo "cold-guard diag FAIL dq=$dq: disabled arm emitted diagnostics" >&2
+            exit 1
+        fi
+        python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" "cold-$((mode != 0))"
     done
 done
 

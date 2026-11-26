@@ -332,14 +332,25 @@ static int easu_compose(struct nvn_gpu_cmd_s *c, VkImage dstImg, VkExtent2D dstE
         vkCmdResetQueryPool(c->cb, qp, qs * 2u, 2);
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, qs * 2u);
     }
+    const int measure_render = gpu_pt_begin(c, GPU_PT_RENDER);
+    if (measure_render) {
+        struct gpu_pt_key *key = gpu_pt_current_pass(c);
+        *key = (struct gpu_pt_key){.w = (uint32_t)dw, .h = (uint32_t)dh, .layers = 1,
+            .area = rp.renderArea, .colors = 1, .flags = GPU_PT_EASU};
+        key->att[0] = (struct gpu_pt_att){dstfmt, VK_SAMPLE_COUNT_1_BIT,
+            VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE};
+    }
     vkCmdBeginRenderPass(c->cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.pipe);
     vkCmdSetViewport(c->cb, 0, 1, &vp);
     vkCmdSetScissor(c->cb, 0, 1, &sc);
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g_easu.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+    if (measure_render) gpu_pt_draw(c, NULL);
     vkCmdDraw(c->cb, 3, 1, 0, 0);
     vkCmdEndRenderPass(c->cb);
+    if (measure_render) gpu_pt_end(c);
     if (qp) {
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, qs * 2u + 1u);
         g_easu_q.slot++;

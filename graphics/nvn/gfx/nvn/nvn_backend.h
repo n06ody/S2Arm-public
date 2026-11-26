@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 24   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 25   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -151,6 +151,7 @@ enum {
     NVN_GPU_FMT_SUBST = 1u << 9,      // 有对应但不是同一种存储（BGRA 换 RGBA、D24 换 D32）：读写语义同，逐字节拷贝要核心换算
     NVN_GPU_FMT_READBACK = 1u << 10,  // nvn_gpu_copy_tex_buf 拷出来的就是 NVN 的逐字节内容（ReadTexels 读 GPU 内容的前提）。不含：SUBST 的、深度模板合一的
                                       //   （只拷得出深度面）、D24（深度面高 8 位未定义）。后端 copy_tex_buf 拒收的格式一定没有这一位（两处用同一个判断）
+    NVN_GPU_FMT_CLEAR_FOLD = 1u << 11, // 清色图与同格式附件载入清除使用相同分量顺序和数值转换
 };
 typedef struct {
     void *host_device;       // 平台层已建好的设备（定稿 A2：后端不另建设备）。Apple：平台给的 MTLDevice 指针；安卓：Prepare 按 profile 建好的设备上下文（含 enabled 记录）
@@ -194,6 +195,12 @@ void nvn_gpu_buf_use(nvn_gpu_cmd c, nvn_gpu_buf b);
 // 同步原语：在本 cmd 的 GPU 顺序里把 src 的 bytes 字节写进 dst+off（之前的命令读旧值，之后的读新值）；src 调用返回后即可释放。
 // 线程：[提交]，通道外。出错：粘滞 NVN_GPU_E_ARG / NVN_GPU_E_ORDER。
 void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes);
+// 与 buf_write 同一契约；Vulkan 时间账单独归类镜像脏页上传。
+#if defined(S2A_ANDROID_VK_BACKEND_NVN_VK) && S2A_ANDROID_VK_BACKEND_NVN_VK
+void nvn_gpu_buf_write_mirror(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes);
+#else
+#define nvn_gpu_buf_write_mirror nvn_gpu_buf_write
+#endif
 // 本 cmd 的临时上传区（参数块、内嵌常量、宽屏改写副本、support 缓冲大块）：内容有效到该 cmd 完成。线程：[提交]。出错：NVN_GPU_E_OOM，*out 清零。
 nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nvn_gpu_slice *out, nvn_gpu_err *err);
 // 把 src 的 bytes 字节填进本 cmd 的临时上传片 sl（sl->cpu 起，bytes ≤ 申请时的长度）。后端可以把这次拷贝交给别的线程做（Vulkan：两级回放的录制线程，
@@ -304,6 +311,8 @@ typedef struct {
 // 装载一个阶段的代码与布局（布局被后端拷走）。线程：[任意]（含 [后台] 预取）。生命周期：到 release；管线持有它用到的着色器。
 // 出错：NVN_GPU_E_COMPILE（why 带编译器原文）、NVN_GPU_E_LAYOUT（布局与 blob 不符，why 写第一处不符的项）、NVN_GPU_E_UNSUPPORTED（不收这种 blob）。
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err);
+// [提交] 可选反射：直接计算派发写该描述符的保守字节末端（相对窗口）；0 表示未知。
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader sh, unsigned index, unsigned set, unsigned binding, uint32_t groups_x);
 void nvn_gpu_shader_release(nvn_gpu_shader s);
 
 // ---------- 管线 ----------
@@ -481,6 +490,11 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t 
 // 另一端为 offset+extent；后端先校验归一化矩形，再保留端点次序。目标仍为正尺寸。
 // 该约定不扩展多采样解析、深度模板复制及三维复制。
 void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear);   // 要 CAP_BLIT_SCALED
+// v24：为当前段保活待录的整图清除视图，须有 NVN_GPU_FMT_CLEAR_FOLD。成功返 1；未能保活返 0。
+// 可在同段保活多张视图，引用在段完成或放弃时归还。线程：[提交]。
+int nvn_gpu_cmd_keep_clear_view(nvn_gpu_cmd c, nvn_gpu_view v);
+// 仅用于已通过 keep_clear_view 在同段保活的视图。即使调用者已归还原句柄，仍可兑现原清除。
+void nvn_gpu_clear_kept_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t uint4[4], int is_int);
 void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t uint4[4], int is_int);
 // v4：通道内把当前通道的附件按矩形清成给定值（NVN 带裁剪或带写掩码的 ClearColor / ClearDepthStencil；整屏全掩码的清除由核心折成 load = CLEAR，不走这里）。
 // v5：带写掩码——color_mask 是要写的颜色通道（r=1 g=2 b=4 a=8），stencil_mask 是要写的模板位；没点到的通道 / 位保持原值。

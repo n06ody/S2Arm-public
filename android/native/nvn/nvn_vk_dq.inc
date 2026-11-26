@@ -367,8 +367,14 @@ static DQ_U uint64_t vk_dq_fill_wait(uint64_t t) {
 }
 
 // ---- the wrappers (the producer) ----
-#define DQ_DIRECT(f, ...) do { vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_##f(__VA_ARGS__); } while (0)
-#define DQ_BEGIN(op, T, extra) DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
+#ifndef NVK_DQ_WRITE_BOUNDARY
+#define NVK_DQ_WRITE_BOUNDARY() ((void)0)
+#define NVK_DQ_SEGMENT_BOUNDARY() ((void)0)
+#endif
+// 查询时间戳只写独立查询池，不访问缓冲。其它录制命令保守结束暂存写串。
+#define DQ_WRITE_BOUNDARY(op) do { if ((op) != OP_vkCmdWriteTimestamp) NVK_DQ_WRITE_BOUNDARY(); } while (0)
+#define DQ_DIRECT(f, ...) do { DQ_WRITE_BOUNDARY(OP_##f); vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_##f(__VA_ARGS__); } while (0)
+#define DQ_BEGIN(op, T, extra) DQ_COUNT(op); uint8_t *base_ = DQ_ON() ? dq_rec_begin(op, cb, sizeof(T) + (extra)) : NULL; if (!base_) goto direct; DQ_WRITE_BOUNDARY(op); T *a = (T *)base_; uint8_t *at_ = base_ + sizeof(T)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, uint32_t nm, const VkMemoryBarrier *m,
                                                          uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
     for (uint32_t i = 0; i < nm; i++) if (m[i].pNext) goto direct;
@@ -428,7 +434,7 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRendering(VkCommandBuffer cb,
       dq_put(&at_, ri->pColorAttachments, DQ_ARR(VkRenderingAttachmentInfo, ri->pColorAttachments, ri->colorAttachmentCount)); dq_rec_end(base_); return; }
 direct: DQ_DIRECT(vkCmdBeginRendering, cb, ri);
 }
-#define W_NOARG(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { DQ_COUNT(OP_##f); void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; if (!a) { DQ_DIRECT(f, cb); return; } dq_rec_end(a); }
+#define W_NOARG(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb) { DQ_COUNT(OP_##f); void *a = DQ_ON() ? dq_rec_begin(OP_##f, cb, 0) : NULL; if (!a) { DQ_DIRECT(f, cb); return; } DQ_WRITE_BOUNDARY(OP_##f); dq_rec_end(a); }
 W_NOARG(vkCmdEndRenderPass) W_NOARG(vkCmdEndRendering)
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pl) {
     { DQ_BEGIN(OP_vkCmdBindPipeline, a_bindpipe, 0); *a = (a_bindpipe){bp, pl}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdBindPipeline, cb, bp, pl); }
@@ -489,8 +495,8 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdEndQuery(VkCommandBuffer cb, VkQue
 
 // 占着命令池或队列的调用：先等队列里的调用全做完
 static void dq_poll(void);
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) { vk_dq_drain(); return vkBeginCommandBuffer(cb, bi); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) { vk_dq_drain(); return vkEndCommandBuffer(cb); }
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) { NVK_DQ_SEGMENT_BOUNDARY(); vk_dq_drain(); return vkBeginCommandBuffer(cb, bi); }
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) { NVK_DQ_SEGMENT_BOUNDARY(); vk_dq_drain(); return vkEndCommandBuffer(cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb) { vk_dq_drain(); return vkAllocateCommandBuffers(d, ai, cb); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) { vk_dq_drain(); return vkResetCommandPool(d, p, f); }
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { vk_dq_drain(); dq_poll(); return vkQueueSubmit(q, n, si, f); }
@@ -499,7 +505,7 @@ static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) { vk_dq_
 static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) { vk_dq_drain(); return vkDeviceWaitIdle(d); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) { vk_dq_drain(); vkDestroyCommandPool(d, p, a); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkFreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, const VkCommandBuffer *cb) { vk_dq_drain(); vkFreeCommandBuffers(d, p, n, cb); }
-static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags f) { vk_dq_drain(); return vkResetCommandBuffer(cb, f); }
+static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags f) { NVK_DQ_SEGMENT_BOUNDARY(); vk_dq_drain(); return vkResetCommandBuffer(cb, f); }
 
 // 录制线程等活的调试开关（见 g_dq_spin 处）：开会话时读一次，之后跟着 dq_poll 每 64 次提交再读（用例也靠这个在运行中切）
 static void dq_tune(void) {
@@ -617,6 +623,15 @@ int nvn_vk_dbg_dq_thread_cpu_ns(uint64_t *ns) {   // 用例读：录制线程至
 #define vkCmdBindIndexBuffer w_vkCmdBindIndexBuffer
 #define vkCmdBeginRenderPass w_vkCmdBeginRenderPass
 #define vkCmdBeginQuery w_vkCmdBeginQuery
+#define vkCmdUpdateBuffer w_vkCmdUpdateBuffer
+#define vkCmdClearAttachments w_vkCmdClearAttachments
+#define vkCmdBeginRendering w_vkCmdBeginRendering
+#define vkCmdEndRendering w_vkCmdEndRendering
+#define vkCmdBindTransformFeedbackBuffersEXT w_vkCmdBindTransformFeedbackBuffersEXT
+#define vkCmdBeginTransformFeedbackEXT w_vkCmdBeginTransformFeedbackEXT
+#define vkCmdEndTransformFeedbackEXT w_vkCmdEndTransformFeedbackEXT
+#define vkCmdDrawIndirectByteCountEXT w_vkCmdDrawIndirectByteCountEXT
+#define vkCmdSetLineWidth w_vkCmdSetLineWidth
 #define vkDestroyBuffer w_vkDestroyBuffer
 #define vkDestroyImage w_vkDestroyImage
 #define vkDestroyImageView w_vkDestroyImageView

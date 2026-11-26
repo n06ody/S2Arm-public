@@ -2,7 +2,7 @@
 // Copyright 2026 S2Arm contributors
 #include "backend_vulkan_cold_guard_spv.h"
 
-enum { COLD_SETS_PER_SEGMENT = 64, COLD_WORDS_MAX = 65536 };
+enum { COLD_WORDS_MAX = 65536 };
 struct cold_push {
     uint32_t first_word, stride_words, count, vertex_count, first_vertex;
 };
@@ -108,29 +108,33 @@ static int cold_guard_prefix(const struct nvn_gpu_cmd_s *c, const struct nvn_gpu
     return 0;
 }
 
-static int cold_guard_coverage(const struct nvn_gpu_cold_domain *d, uint64_t first_word,
-                               const struct nvn_vk_cold_publication *pub, uint32_t n,
-                               VkPipelineStageFlags *stages, VkAccessFlags *access,
-                               VkDeviceSize *first, VkDeviceSize *bytes) {
+static enum cold_diag_reason cold_guard_coverage(const struct nvn_gpu_cold_domain *d, uint64_t first_word,
+                                                const struct nvn_vk_cold_publication *pub, uint32_t n,
+                                                VkPipelineStageFlags *stages, VkAccessFlags *access,
+                                                VkDeviceSize *first, VkDeviceSize *bytes) {
     nvn_gpu_access_span bound;
     if (!d || !d->buf || !d->buf->memory || !d->count || d->count > COLD_WORDS_MAX ||
-        !d->stride_words || !pub || !n || d->binding.aspects ||
+        !d->stride_words || d->binding.aspects ||
         !nvn_gpu_buf_access_span(d->buf, d->binding.off, d->binding.bytes, &bound) ||
         bound.storage != d->binding.storage || bound.bytes > g.caps.max_ssbo_range ||
-        bound.off % g.dev->properties.limits.minStorageBufferOffsetAlignment) return 0;
+        bound.off % g.dev->properties.limits.minStorageBufferOffsetAlignment) return COLD_DIAG_SSBO_BOUNDS;
     const uint64_t last = first_word + (uint64_t)(d->count - 1) * d->stride_words;
-    if (last > UINT32_MAX || (last + 1) * sizeof(uint32_t) > bound.bytes) return 0;
+    if (last > UINT32_MAX || (last + 1) * sizeof(uint32_t) > bound.bytes) return COLD_DIAG_SSBO_BOUNDS;
+    if (!n) return COLD_DIAG_PUBLICATION_GAP;
+    if (!pub) return COLD_DIAG_PUBLICATION_INVALID;
     *first = bound.off + first_word * sizeof(uint32_t);
     const uint64_t end = bound.off + (last + 1) * sizeof(uint32_t);
     *bytes = end - *first;
     uint64_t cursor = *first;
     for (uint32_t i = 0; i < n && cursor < end; i++) {
         const nvn_gpu_access_span *s = &pub[i].span;
-        if (s->storage != bound.storage || s->aspects || !s->bytes || !buf_range(d->buf, s->off, s->bytes)) return 0;
+        if (s->storage != bound.storage || s->aspects || !s->bytes || !buf_range(d->buf, s->off, s->bytes))
+            return COLD_DIAG_PUBLICATION_INVALID;
         if (s->off + s->bytes <= cursor) continue;
-        if (s->off > cursor) return 0;
+        if (s->off > cursor) return COLD_DIAG_PUBLICATION_GAP;
         const unsigned writer = pub[i].writers;
-        if (!writer || (writer & ~(COLD_READ_HOST | COLD_READ_TRANSFER | COLD_READ_COMPUTE | COLD_READ_GRAPHICS))) return 0;
+        if (!writer || (writer & ~(COLD_READ_HOST | COLD_READ_TRANSFER | COLD_READ_COMPUTE | COLD_READ_GRAPHICS)))
+            return COLD_DIAG_PUBLICATION_INVALID;
         if (writer & COLD_READ_HOST) {
             *stages |= VK_PIPELINE_STAGE_HOST_BIT;
             *access |= VK_ACCESS_HOST_WRITE_BIT;
@@ -149,7 +153,7 @@ static int cold_guard_coverage(const struct nvn_gpu_cold_domain *d, uint64_t fir
         }
         cursor = s->off + s->bytes;
     }
-    return cursor >= end;
+    return cursor >= end ? COLD_DIAG_OK : COLD_DIAG_PUBLICATION_GAP;
 }
 
 static VkDescriptorSet cold_guard_descriptors(struct nvn_gpu_cmd_s *c) {
@@ -175,20 +179,29 @@ static VkDescriptorSet cold_guard_descriptors(struct nvn_gpu_cmd_s *c) {
 static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const nvn_gpu_draw_args *draw,
                           const struct nvn_gpu_cold_domain *d, const struct nvn_vk_cold_publication *pub,
                           uint32_t n) {
-    if (!c || !g.cold_enabled || !rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    if (!c || !g.cold_enabled) return 0;
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return cold_diag_reject(c, COLD_DIAG_CMD_ERROR);
     c->cold.original = NULL;
-    if (!d || c->in_pass || c->qpool || diag_draw_mode() ||
-        !cold_guard_direct(draw) || !cold_guard_pipes(a, b, d->fragment_ent) ||
-        draw->prim != a->key.prim) return 0;
+    if (!d) return cold_diag_reject(c, COLD_DIAG_DOMAIN);
+    if (c->in_pass) return cold_diag_reject(c, COLD_DIAG_PASS_STATE);
+    if (c->qpool) return cold_diag_reject(c, COLD_DIAG_QUERY);
+    if (diag_draw_mode()) return cold_diag_reject(c, COLD_DIAG_DRAW_DIAG);
+    if (!cold_guard_direct(draw)) return cold_diag_reject(c, COLD_DIAG_DRAW_SHAPE);
+    if (!cold_guard_pipes(a, b, d->fragment_ent) || draw->prim != a->key.prim)
+        return cold_diag_reject(c, COLD_DIAG_PIPELINES);
     uint32_t prefix_value;
-    if (!cold_guard_prefix(c, a, &d->prefix, &prefix_value) || d->buf == d->prefix.buf) return 0;
+    if (!cold_guard_prefix(c, a, &d->prefix, &prefix_value) || d->buf == d->prefix.buf)
+        return cold_diag_reject(c, COLD_DIAG_PREFIX);
     const uint64_t first_word = d->first_word + (uint64_t)prefix_value / 4;
     VkPipelineStageFlags producer_stages = 0;
     VkAccessFlags producer_access = 0;
     VkDeviceSize first, bytes;
-    if (!cold_guard_coverage(d, first_word, pub, n, &producer_stages, &producer_access, &first, &bytes) ||
-        !cold_guard_open()) return 0;
-    if (g.dev->properties.limits.minStorageBufferOffsetAlignment > UINT32_MAX) return 0;
+    const enum cold_diag_reason coverage =
+        cold_guard_coverage(d, first_word, pub, n, &producer_stages, &producer_access, &first, &bytes);
+    if (coverage != COLD_DIAG_OK) return cold_diag_reject(c, coverage);
+    if (!cold_guard_open()) return cold_diag_reject(c, COLD_DIAG_SELECTOR);
+    if (g.dev->properties.limits.minStorageBufferOffsetAlignment > UINT32_MAX)
+        return cold_diag_reject(c, COLD_DIAG_ALIGNMENT);
     const uint32_t align = (uint32_t)g.dev->properties.limits.minStorageBufferOffsetAlignment;
     // Rebase the private descriptor to the smallest aligned interval that
     // contains every scanned word. Publish that same interval, including any
@@ -198,11 +211,12 @@ static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const 
     const VkDeviceSize result_bytes = 2 * sizeof(VkDrawIndirectCommand);
     nvn_gpu_slice result;
     nvn_gpu_err err;
-    if (!nvn_gpu_ok(nvn_gpu_arena_alloc(c, result_bytes, align > 4 ? align : 4, &result, &err))) return 0;
+    if (!nvn_gpu_ok(nvn_gpu_arena_alloc(c, result_bytes, align > 4 ? align : 4, &result, &err)))
+        return cold_diag_reject(c, COLD_DIAG_ARENA);
     VkDescriptorSet set = cold_guard_descriptors(c);
-    if (!set) return 0;
+    if (!set) return cold_diag_reject(c, COLD_DIAG_DESCRIPTORS);
     cmd_ref(c, d->buf, REF_BUF);
-    if (!rc_is(c->sticky, NVN_GPU_OK)) return 0;
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return cold_diag_reject(c, COLD_DIAG_CMD_ERROR);
 
     const VkDescriptorBufferInfo buffers[] = {
         {d->buf->buffer, read_off, read_bytes},
@@ -221,14 +235,15 @@ static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const 
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = d->buf->buffer, .offset = read_off, .size = read_bytes,
     };
-    vkCmdPipelineBarrier(c->cb, producer_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &read, 0, NULL);
+    GPU_PT_RECORD(c, GPU_PT_COLD_GUARD_DEP,
+        vkCmdPipelineBarrier(c->cb, producer_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &read, 0, NULL));
     const struct cold_push push = {(uint32_t)((first - read_off) / 4), d->stride_words, d->count, draw->count, draw->first};
     es_reset(c);
     if (c->desc_point == 2) c->desc_layout = VK_NULL_HANDLE;
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.cold_pipe);
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.cold_layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g.cold_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
-    vkCmdDispatch(c->cb, 1, 1, 1);
+    GPU_PT_RECORD(c, GPU_PT_COLD_GUARD_COMPUTE, vkCmdDispatch(c->cb, 1, 1, 1));
     const VkBufferMemoryBarrier indirect = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
@@ -237,8 +252,9 @@ static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const 
     };
     // The execution dependency also orders any later writes to the scanned
     // source after the compute read, including when the result is abandoned.
-    vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 0, NULL, 1, &indirect, 0, NULL);
+    GPU_PT_RECORD(c, GPU_PT_COLD_GUARD_DEP,
+        vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 1, &indirect, 0, NULL));
     c->cold.original = a;
     c->cold.variant = b;
     c->cold.domain = *d;
@@ -254,11 +270,18 @@ int nvn_vk_cold_guard_auto(nvn_gpu_cmd c, nvn_gpu_cmd pre, nvn_gpu_pipe a, nvn_g
     if (!g.cold_enabled || !c) return 0;
     atomic_fetch_add_explicit(&g.cold_attempts, 1, memory_order_relaxed);
     c->cold.original = NULL;
-    if (!d || !d->buf || !d->buf->cold_ledger || c == pre ||
-        c->cold_events_lost || (pre && (pre->cold_events_lost || !rc_is(pre->sticky, NVN_GPU_OK)))) return 0;
+    if (!d || !d->buf) return cold_diag_reject(c, COLD_DIAG_DOMAIN);
+    if (!d->buf->cold_ledger) return cold_diag_reject(c, COLD_DIAG_UNTRACKED);
+    if (c == pre) return cold_diag_reject(c, COLD_DIAG_PRE_IS_MAIN);
+    if (c->cold_events_lost) return cold_diag_reject(c, COLD_DIAG_MAIN_EVENTS_LOST);
+    if (pre && pre->cold_events_lost) return cold_diag_reject(c, COLD_DIAG_PRE_EVENTS_LOST);
+    if (pre && !rc_is(pre->sticky, NVN_GPU_OK)) return cold_diag_reject(c, COLD_DIAG_PRE_ERROR);
     struct cold_ledger snapshot;
     pthread_mutex_lock(&g_submit_mu);
-    if (g.cold_writes_lost) { pthread_mutex_unlock(&g_submit_mu); return 0; }
+    if (g.cold_writes_lost) {
+        pthread_mutex_unlock(&g_submit_mu);
+        return cold_diag_reject(c, COLD_DIAG_SESSION_WRITES_LOST);
+    }
     snapshot = *d->buf->cold_ledger;
     const uint64_t epoch = g.cold_epoch;
     pthread_mutex_unlock(&g_submit_mu);
@@ -296,14 +319,18 @@ int nvn_vk_cold_guard_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *draw) {
     c->cold.original = NULL;
     if (!rc_is(c->sticky, NVN_GPU_OK) || !cold_guard_direct(draw) || !c->in_pass ||
         c->q_active >= 0 || c->pass_occl || c->pipe != a || draw->prim != c->cold.draw.prim ||
-        draw->first != c->cold.draw.first || draw->count != c->cold.draw.count) return 0;
+        draw->first != c->cold.draw.first || draw->count != c->cold.draw.count)
+        return cold_diag_reject(c, COLD_DIAG_DRAW_STATE);
     const struct nvn_gpu_cold_domain *d = &c->cold.domain;
-    if (c->cold.source_generation != __atomic_load_n(&d->buf->cold_generation, __ATOMIC_RELAXED)) return 0;
-    if (!cold_guard_has_binding(c, d->fragment_ent, NVN_GPU_RES_SSBO, d->buf, &d->binding)) return 0;
+    if (c->cold.source_generation != __atomic_load_n(&d->buf->cold_generation, __ATOMIC_RELAXED))
+        return cold_diag_reject(c, COLD_DIAG_SOURCE_CHANGED);
+    if (!cold_guard_has_binding(c, d->fragment_ent, NVN_GPU_RES_SSBO, d->buf, &d->binding))
+        return cold_diag_reject(c, COLD_DIAG_SSBO_CHANGED);
     if (d->prefix.buf) {
         uint32_t prefix_value;
         if (!cold_guard_has_binding(c, d->prefix.fragment_ent, NVN_GPU_RES_UBO, d->prefix.buf, &d->prefix.binding) ||
-            !cold_guard_prefix(c, a, &d->prefix, &prefix_value) || prefix_value != c->cold.prefix_value) return 0;
+            !cold_guard_prefix(c, a, &d->prefix, &prefix_value) || prefix_value != c->cold.prefix_value)
+            return cold_diag_reject(c, COLD_DIAG_PREFIX_CHANGED);
     }
     nvn_gpu_draw_args act = *draw;
     act.ind = c->cold.result.buf;
@@ -317,9 +344,11 @@ int nvn_vk_cold_guard_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *draw) {
     vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, b->pipe);
     c->es.gpipe = b->pipe;
     c->es_count[ES_PIPE]++;
+    gpu_pt_draw(c, b);
     vkCmdDrawIndirect(c->cb, act.ind->buffer, act.ind_off + act.stride, 1, act.stride);
     loss_note_program(c, b);
     atomic_fetch_add_explicit(&g.cold_pairs, 1, memory_order_relaxed);
+    if (g.cold_diag_enabled) cold_diag_enqueue_choice(c, draw);
     return 1;
 }
 
