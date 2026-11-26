@@ -309,6 +309,26 @@ struct feedback_copy {
 
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
+enum { COLD_SETS_PER_SEGMENT = 64 };
+enum cold_diag_reason {
+    COLD_DIAG_OK,
+    COLD_DIAG_DOMAIN, COLD_DIAG_UNTRACKED, COLD_DIAG_PRE_IS_MAIN,
+    COLD_DIAG_MAIN_EVENTS_LOST, COLD_DIAG_PRE_EVENTS_LOST, COLD_DIAG_PRE_ERROR,
+    COLD_DIAG_SESSION_WRITES_LOST, COLD_DIAG_EVENT_LIMIT, COLD_DIAG_EVENT_OOM,
+    COLD_DIAG_HOST_SPAN_LIMIT, COLD_DIAG_COMMITTED_SPAN_LIMIT, COLD_DIAG_SNAPSHOT_SPAN_LIMIT,
+    COLD_DIAG_CMD_ERROR, COLD_DIAG_PASS_STATE, COLD_DIAG_QUERY, COLD_DIAG_DRAW_DIAG,
+    COLD_DIAG_DRAW_SHAPE, COLD_DIAG_PIPELINES, COLD_DIAG_PREFIX,
+    COLD_DIAG_SSBO_BOUNDS, COLD_DIAG_PUBLICATION_INVALID, COLD_DIAG_PUBLICATION_GAP,
+    COLD_DIAG_SELECTOR, COLD_DIAG_ALIGNMENT, COLD_DIAG_ARENA, COLD_DIAG_DESCRIPTORS,
+    COLD_DIAG_DRAW_STATE, COLD_DIAG_SOURCE_CHANGED, COLD_DIAG_SSBO_CHANGED, COLD_DIAG_PREFIX_CHANGED,
+    COLD_DIAG_REASONS,
+};
+enum cold_event_loss { COLD_EVENTS_OK, COLD_EVENTS_LIMIT, COLD_EVENTS_OOM };
+struct cold_diag_choice {
+    const void *mapped;
+    uint32_t vertex_count, first_vertex;
+};
+
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     int land_mode, land_observe, land_tracked, land_epoch;
@@ -437,7 +457,10 @@ struct nvn_gpu_cmd_s {
     uint64_t cold_barriers;
     struct cold_event *cold_events;
     unsigned cold_nevents, cold_cap;
-    int cold_events_lost;
+    enum cold_event_loss cold_events_lost;
+    uint64_t cold_diag_record;
+    struct cold_diag_choice *cold_diag_choices;
+    uint32_t cold_diag_nchoices;
     struct nvn_gpu_cmd_s *live_next;
 };
 
@@ -469,6 +492,9 @@ struct nvn_gpu_vk {
     uint64_t cold_epoch;
     _Atomic uint64_t cold_attempts, cold_armed, cold_pairs;
     _Atomic uint32_t cold_present_count;
+    int cold_diag_enabled;
+    _Atomic uint64_t cold_diag_records, cold_diag_counts[COLD_DIAG_REASONS], cold_diag_unread;
+    uint64_t cold_diag_a, cold_diag_b, cold_diag_invalid, cold_diag_through_signal;
     PFN_vkGetCalibratedTimestampsKHR report_calibrate;
     uint32_t report_bits;
     float report_period;
@@ -1859,6 +1885,7 @@ static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.
 
 #include "backend_vulkan_bc_time.inc"
 #include "backend_vulkan_land_auto.inc"
+#include "backend_vulkan_cold_diag.inc"
 
 static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     if (!c) return;
@@ -1871,6 +1898,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     detach_live(c);   // 已提交的 cmd 在 commit 时已摘下，这里兜底
     if (c->cold_pool) vkDestroyDescriptorPool(g.d, c->cold_pool, NULL);
     free(c->cold_events);
+    if (c->cold_diag_record || c->cold_diag_choices) cold_diag_retire(c);
     // 放弃 / 提交前失败的段仍可能有 DQ 待录命令引用快照；先排空录制，再销毁。
     if (c->feedback && !executed) vk_dq_drain();
     while (c->feedback) { // 必须先销毁快照视图，再归还下面持有的图像引用
@@ -2080,6 +2108,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
 
     char land_failure[112];
     if (!s->internal && !failed) {
+        if (s->cmd->cold_diag_nchoices) cold_diag_finish(s->cmd, s->signal);
         const VkResult r = land_readback_invalidate(vk, s->cmd, s->signal);
         if (r != VK_SUCCESS) {
             snprintf(land_failure, sizeof land_failure, "回写暂存失效操作失败（VkResult %d）", (int)r);
@@ -2095,6 +2124,8 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     }
 
     if (s->internal) {   // 呈现段：没有回调、不动时间线
+        if (g.cold_diag_enabled && !failed && s->wsi_seq % 120 == 0)
+            cold_diag_report(s->wsi_seq, 0);
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
         pthread_mutex_lock(&g_mu);
@@ -2505,6 +2536,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     // 0 = direct A, 1 = guarded A/B, 2 = guarded A/A overhead control.
     const int cold_mode = nvn_plat_flag("nvk_cold_guard", 0);
     g.cold_enabled = cold_mode == 1 || cold_mode == 2 ? cold_mode : 0;
+    g.cold_diag_enabled = g.cold_enabled && nvn_plat_flag("nvk_cold_guard_diag", 0) != 0;
     g.vbuf_batch = nvn_plat_flag("nvk_replay_cpu_cuts", 1) != 0;
     {   // 诊断（nvk_mem_types，缺省 0）：打印显存类型表，判「有没有 HOST_CACHED 的可见类型」——
         // CPU 写映射内存与显卡抢带宽的那条路（见坑记录续 21）要不要改走 cached 暂存，取决于这张表。
@@ -2692,6 +2724,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     g.worker_started = 0;
+    if (g.cold_diag_enabled) cold_diag_report(g.wsi_done, 1);
     if (g.bc_time_on) {
         pthread_mutex_lock(&g_bc_time_mu);
         bc_time_log_window(now_ns(), 1);

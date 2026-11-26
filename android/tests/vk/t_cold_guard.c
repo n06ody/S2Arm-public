@@ -18,9 +18,10 @@ void nvn_vk_cold_mirror_track(nvn_gpu_buf) __attribute__((weak));
 void nvn_vk_cold_mirror_host_write(nvn_gpu_buf, uint64_t, uint64_t) __attribute__((weak));
 void nvn_gpu_vk_test_cold_overwrite(nvn_gpu_cmd, nvn_gpu_buf, uint64_t) __attribute__((weak));
 void nvn_gpu_vk_test_cold_args(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off) __attribute__((weak));
+void nvn_gpu_vk_test_cold_event_limit(unsigned limit) __attribute__((weak));
 
 static nvn_gpu_err err;
-static int dq, enabled = 1;
+static int dq, enabled = 1, diag;
 static unsigned dispatches, indirects, binds, epoch_binds, bad;
 static VkPipeline last_bind;
 static PFN_vkCmdDispatch real_dispatch;
@@ -75,6 +76,7 @@ void nvn_plat_log(int l, const char *cat, const char *line) { fprintf(stderr, "[
 int nvn_plat_flag(const char *name, int def) {
     if (!strcmp(name, "nvk_dq")) return dq;
     if (enabled && !strcmp(name, "nvk_cold_guard")) return 1;
+    if (!strcmp(name, "nvk_cold_guard_diag")) return diag;
     return def;
 }
 static void done(void *user, const nvn_gpu_done *d) { REQUIRE(d->status == NVN_GPU_DONE_OK); }
@@ -314,7 +316,10 @@ static void check(const char *tag, struct comparison r, const struct comparison 
 
 int main(int argc, char **argv) {
     REQUIRE(argc == 4);
-    dq = atoi(argv[2]); enabled = atoi(argv[3]);
+    const int mode = atoi(argv[3]);
+    dq = atoi(argv[2]);
+    enabled = mode != 0;
+    diag = mode == 2;
     struct s2a_vk_device dev;
     char why[256];
     if (s2a_vk_device_create(&dev, why, sizeof why)) { fprintf(stderr, "%s\n", why); return 2; }
@@ -388,6 +393,12 @@ int main(int argc, char **argv) {
         check("auto-missing-tail", run_case(a, b, producer, AUTO_MISSING_TAIL, data, &signal), &ref, 0, 0, data);
         check("auto-aborted-pre", run_case(a, b, producer, AUTO_ABORT, data, &signal), &ref, 0, 0, data);
         check("auto-changed-source", run_case(a, b, producer, AUTO_CHANGED, data, &signal), &ref, enabled, 0, data);
+    }
+    if (diag && nvn_gpu_vk_test_cold_event_limit) {
+        nvn_gpu_vk_test_cold_event_limit(1);
+        check("auto-event-loss", run_case(a, b, producer, AUTO, 2, &signal), NULL, 0, 0, 2);
+        nvn_gpu_vk_test_cold_event_limit(0);
+        check("auto-session-loss", run_case(a, b, producer, AUTO, 2, &signal), NULL, 0, 0, 2);
     }
     for (unsigned i = 0; i < 3; i++) nvn_gpu_shader_release(fs[i]);
     nvn_gpu_shader_release(vs);

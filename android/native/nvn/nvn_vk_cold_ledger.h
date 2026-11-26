@@ -38,8 +38,9 @@ static inline int cold_interval_add(struct cold_ledger *ledger, uint64_t lo, uin
 // store can cover only some bytes, so it preserves prior producers and never
 // fills a hole. A possible overlap with a previous unordered GPU write drops
 // the proof for that overlap. An unsupported write invalidates its footprint.
-static inline void cold_ledger_write(struct cold_ledger *ledger, uint64_t lo, uint64_t hi,
-                                     uint64_t epoch, unsigned writer, int exact) {
+// Return zero when the bounded table cannot represent the resulting proof.
+static inline int cold_ledger_write(struct cold_ledger *ledger, uint64_t lo, uint64_t hi,
+                                    uint64_t epoch, unsigned writer, int exact) {
     struct cold_ledger next = {0};
     uint64_t cursor = lo;
     for (unsigned i = 0; i < ledger->n; i++) {
@@ -64,7 +65,8 @@ static inline void cold_ledger_write(struct cold_ledger *ledger, uint64_t lo, ui
     }
     if (!cold_interval_add(&next, cursor, hi, epoch, exact ? writer : 0)) goto unknown;
     *ledger = next;
-    return;
+    return 1;
 unknown:
     ledger->n = 0;
+    return 0;
 }
