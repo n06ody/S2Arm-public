@@ -61,7 +61,12 @@
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
 _Static_assert(NVN_GPU_CONTRACT_VERSION == 24, "核对 Vulkan 后端与新版 NVN GPU 契约");
+#include "backend_vulkan_buf_write_run.inc"
+#define NVK_DQ_WRITE_BOUNDARY() bw_end(BW_INTERVENING)
+#define NVK_DQ_SEGMENT_BOUNDARY() bw_end(BW_SEGMENT)
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
+#undef NVK_DQ_WRITE_BOUNDARY
+#undef NVK_DQ_SEGMENT_BOUNDARY
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
 // 弱链接[androiddraw]：nvn_deswizzle
@@ -108,6 +113,7 @@ struct nvn_gpu_buf_s {
     uint64_t va;
     int mem_kind;
     VkMemoryPropertyFlags memory_flags;   // 实际分配的类型，回写按这个判断直接读或暂存
+    int arena_source;   // 可被暂存写用作读取源，不能当已证无别名的目标。
     int released;
     int refs;
     nvn_gpu_retired_fn retired;
@@ -2526,6 +2532,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         }
     }
     g.d = dev->device;
+    bw_open();
     vk_dq_init(g.d);
     g.phys = dev->physical;
     g.queue = dev->queue;
@@ -3003,6 +3010,7 @@ static struct nvn_gpu_buf_s *new_staging(struct nvn_gpu_cmd_s *c, uint64_t cap) 
     static int cached_on = -1; if (cached_on < 0) cached_on = nvn_plat_flag("nvk_stage_cached", 1) != 0;
     if (!b) {
         if (!rc_is(buf_create_impl(cap, NVN_GPU_MEM_SHARED, NULL, cached_on, &b, &e), NVN_GPU_OK)) return NULL;
+        b->arena_source = 1;
         __atomic_add_fetch(&g_stg_wr[4], 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_stg_wr[5], cap, __ATOMIC_RELAXED);   // 新建的暂存块（表里没取到）
     }
     if (c->nstaging == c->scap) {
@@ -3271,7 +3279,10 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     // 一段映射内存，memcpy 逐页缺页；切成标准块之后走回收表，页一直是驻留的。
     __atomic_add_fetch(&g_stg_wr[0], 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_stg_wr[1], bytes, __ATOMIC_RELAXED);
     if (bytes > STG_CHUNK) __atomic_add_fetch(&g_stg_wr[3], 1, __ATOMIC_RELAXED);
-    full_barrier(c);   // 一笔写只在第一条拷贝之前来一次：各条拷贝的目标段互不相交，彼此之间没有先后依赖
+    // buf_create_impl 为每个普通缓冲独立分配 VkDeviceMemory，并以偏移 0 绑定。
+    const int coalesce = g_bw_enabled;
+    const int skip = coalesce && bw_before(c->cb, b->buffer, b->arena_source ? VK_NULL_HANDLE : b->memory, off, bytes);
+    if (!skip) full_barrier(c);
     for (uint64_t done = 0; done < bytes;) {
         uint64_t n = bytes - done;
         if (n > STG_CHUNK) {
@@ -3290,6 +3301,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
         __atomic_add_fetch(&g_stg_wr[2], 1, __ATOMIC_RELAXED);
         done += n;
     }
+    if (coalesce) bw_after(skip);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     cold_note_write(c, b, off, bytes, COLD_READ_TRANSFER, 1);
@@ -8909,7 +8921,10 @@ void nvn_gpu_cmd_abort(nvn_gpu_cmd ch) {
         owned = 1;   // 摘链与销毁所有权原子完成；并发 abort / close 不会重复释放
     }
     pthread_mutex_unlock(&g_mu);
-    if (owned) finish_cmd(c, 0);   // 不执行、不回调、不推进时间线；引用随即解除
+    if (owned) {
+        bw_end(BW_SEGMENT);
+        finish_cmd(c, 0);   // 不执行、不回调、不推进时间线；引用随即解除
+    }
 }
 
 static void enqueue_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
@@ -8997,6 +9012,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     struct vk_segment *s = &c->segment;
     s->embedded = 1;
     s->cmd = c;
+    bw_end(BW_SEGMENT);
     s->signal = signal;
     s->done = done;
     s->user = user;
@@ -9219,6 +9235,8 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "dset_pools", ds_pools);   // 增长池个数
     fn(user, "dset_bins", ds_bins);     // 表项数（本会话登记过的布局结构数）
     fn(user, "dset_idle", ds_idle);     // 空闲串里现有的组
+    if (atomic_load_explicit(&g_bw_diagnostic, memory_order_relaxed))
+        for (unsigned i = 0; i < BW_N; i++) fn(user, g_bw_names[i], atomic_load_explicit(&g_bw_counts[i], memory_order_relaxed));
     fn(user, "dset_sigmiss", ds_sigmiss);   // 这一笔的写法和表项里定下的不同、退回老路径的次数（稳态应为 0 或很少）
     fn(user, "dset_capped", ds_capped);     // 向驱动要组时已到总量上限、退回老路径的次数（稳态应为 0）
     // 会话级读数（开会话起累计，不随 take 清零）：驱动管线缓存（#822）
