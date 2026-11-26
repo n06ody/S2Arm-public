@@ -82,6 +82,17 @@ int rp_pass_is_open(void);
 int rp_pass_draws(void);      // 当前通道已画的笔数（通道没开 = 0）
 int rp_pass_split_ok(void);   // 当前通道能否在两笔之间切开续开（见 rp_pass.c）
 const p_set_rt *rp_pass_target(void); // 当前目标（没设过 NULL）
+typedef struct {
+    p_set_rt rt;
+    tex_t textures[9];
+    uint32_t barriers;
+    int has_rt;
+} rp_pass_state;
+void rp_pass_save(rp_pass_state *state);
+void rp_pass_restore(const rp_pass_state *state);
+void rp_xq_request_stop(void);
+void rp_xq_stop(void);
+void rp_xq_start(void);
 
 // ---------- 上屏（rp_present.c）----------
 void rp_present_set_surface(nvn_gpu_surface s, int display_hz);   // 平台件：窗口挂上（s 非空）/ 摘下（NULL）

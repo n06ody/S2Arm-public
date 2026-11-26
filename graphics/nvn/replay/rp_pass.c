@@ -991,3 +991,21 @@ int rp_pass_split_ok(void) {
     return 1;
 }
 const p_set_rt *rp_pass_target(void) { return P.has_rt ? &P.rt : NULL; }
+
+// 只保存已冲掉通道和待折清除之后的逻辑状态；不带后端句柄、视图缓存或未完成的通道。
+void rp_pass_save(rp_pass_state *s) {
+    s->has_rt = P.has_rt;
+    s->rt = P.rt;
+    memcpy(s->textures, P.kept, sizeof s->textures);
+    s->barriers = rp_pass_take_barrier();
+}
+
+void rp_pass_restore(const rp_pass_state *s) {
+    P.has_rt = s->has_rt;
+    P.rt = s->rt;
+    memcpy(P.kept, s->textures, sizeof P.kept);
+    for (int i = 0; i < 8; i++) if (P.rt.color[i]) P.rt.color[i] = &P.kept[i];
+    if (P.rt.depth) P.rt.depth = &P.kept[8];
+    P.barrier_bits = s->barriers;
+    P.shape_ok = 0;
+}

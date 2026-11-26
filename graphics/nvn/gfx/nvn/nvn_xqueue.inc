@@ -234,10 +234,12 @@ int nvn_be_xq_owed_wait(const void *s, uint64_t ns) {
     pthread_mutex_unlock(&g_xq_mu); return r;
 }
 // QueueWaitSync(q, s) with s owed by owner: q's later submissions go behind owner's parked work
-void nvn_be_xq_wait_queue(void *q, void *owner) {
-    if (q == owner || !xq_busy_q(owner)) return;
+int nvn_be_xq_wait_queue(void *q, void *owner, const void *sync) {
+    (void)sync;
+    if (q == owner || !xq_busy_q(owner)) return 1;
     xq_t *e = xq_find(q);
-    if (e && (e->ncont || e->parked)) return;   // already behind its own parked work, which is replayed in order
+    if (e && (e->ncont || e->parked)) return 1;   // already behind its own parked work, which is replayed in order
     if (!e) { if (g_nxq == XQ_MAX) MDIE("cross-queue park: more than %d queues", XQ_MAX); pthread_mutex_lock(&g_xq_mu); e = &g_xq[g_nxq++]; memset(e, 0, sizeof *e); e->q = q; pthread_mutex_unlock(&g_xq_mu); }
     e->parked = 2; e->dep = owner; e->since = g_xq_subs; g_xq_deps++;
+    return 1;
 }

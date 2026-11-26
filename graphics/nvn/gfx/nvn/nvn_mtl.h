@@ -53,7 +53,13 @@ void nvn_be_xq_flush(void *q, const char *why);                // CPU 要这条�
 int nvn_be_xq_fence(void *q, void *sync);                       // QueueFenceSync：q 有停住的工作 → 回 1，这个栅栏欠着，那部分回放提交时再发布
 int nvn_be_xq_owed(const void *sync, void **q);                 // 这个同步对象的栅栏是否欠着（q = 欠它的队列）
 int nvn_be_xq_owed_wait(const void *sync, uint64_t ns);         // 等欠着的栅栏发布，最多 ns 纳秒；1 = 已发布
-void nvn_be_xq_wait_queue(void *q, void *owner);                // QueueWaitSync(q, 欠在 owner 上的栅栏)：q 之后的提交排在 owner 停住的工作后面
+int nvn_be_xq_wait_queue(void *q, void *owner, const void *sync); // QueueWaitSync on a fence owed by another logical queue.
+// Optional replay-core hooks. The frontend holds the submit lock for discard,
+// and releases it before waiting for another logical queue to make progress.
+void nvn_be_xq_discard(void *q) __attribute__((weak));
+void nvn_be_xq_sync_discard(const void *sync) __attribute__((weak));
+int nvn_be_xq_wait_idle(void *q, uint64_t timeout_ns) __attribute__((weak));
+void nvn_be_event_signal(volatile uint32_t *event, uint32_t mode, uint32_t value) __attribute__((weak));
 
 uint64_t nvn_be_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
 int nvn_be_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout

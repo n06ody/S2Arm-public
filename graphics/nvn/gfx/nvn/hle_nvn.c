@@ -1688,10 +1688,17 @@ NVN_NOPROTO(nvnSyncGetNvRmSyncNVX, NVNboolean, const NVNsync *s, void *rm) {
     static int once; if (!once++) LOG("[nvn] SyncGetNvRmSyncNVX: first call (fence %llu%s); exported as the invalid syncpoint (already signaled)", (unsigned long long)fence, has ? "" : ", none yet");
     return 1;
 }
-NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
+static void xq_lock(void), xq_unlock(void);   // 提交锁 g_sub_mu（定义在 nvnQueueSubmitCommands 前）
+NVN(nvnSyncFinalize, void, NVNsync *s) {
+    if (nvn_be_xq_sync_discard) { xq_lock(); nvn_be_xq_sync_discard(s); xq_unlock(); }
+    ((sync_t *)s)->magic = 0;
+}
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-static void xq_lock(void), xq_unlock(void);   // 提交锁 g_sub_mu（定义在 nvnQueueSubmitCommands 前）
+// 弱链接[nvntest]：nvn_be_xq_discard
+// 弱链接[nvntest]：nvn_be_xq_sync_discard
+// 弱链接[nvntest]：nvn_be_xq_wait_idle
+// 弱链接[nvntest]：nvn_be_event_signal
 // 这条队列有停在跨队列等待上的工作（nvn_mtl.m nvn_xqueue.inc）时，栅栏要等那部分回放提交后才算：欠着，由后端回放那部分时发布
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
     (void)c; (void)f; xq_lock(); int owed = nvn_be_xq_fence(q, s); if (!owed) sync_publish((sync_t *)s, nvn_be_last_fence()); xq_unlock();
@@ -1703,6 +1710,16 @@ NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f)
 uint64_t g_nvn_qws_n, g_nvn_qws_unfenced;   // 非 static：单测 t_nvn_audit1534_probes 直接读
 NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
     __atomic_fetch_add(&g_nvn_qws_n, 1, __ATOMIC_RELAXED);
+    if (nvn_be_xq_wait_idle) {
+        xq_lock();
+        void *owner = NULL;
+        if (nvn_be_xq_owed(s, &owner)) {
+            int queued = nvn_be_xq_wait_queue(q, owner, s);
+            xq_unlock();
+            return queued;
+        }
+        xq_unlock();
+    }
     // 审计 #1646 P1-23：没打栅栏的同步对象，宿主不等（单 Metal 队列，等也无从挂到 GPU 上），所以不回成功：回假、报红一次（11-07 质量线：最近约 300 份 host.log
     //   的 P1-23 探针「on a sync not fenced yet」全是 0，没有款走到这一支；不在 CPU 上阻塞等别的线程打栅栏——同一线程「先等后打」会死锁，真机上等的是 GPU）
     if (!sync_published((const sync_t *)s, NULL)) {
@@ -1710,7 +1727,10 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
             LOG("【红】[nvn] QueueWaitSync: the sync object has no fence yet; the host cannot wait for it, returns false (first case: queue %p, sync %p; audit #1646 P1-23)", (void *)q, (const void *)s);
         return 0;
     }
-    { void *owner = NULL; if (nvn_be_xq_owed(s, &owner)) { xq_lock(); nvn_be_xq_wait_queue(q, owner); xq_unlock(); } }   // 等别的队列欠着的栅栏：这条队列之后的提交排在那条队列停住的工作后面
+    if (!nvn_be_xq_wait_idle) {
+        void *owner = NULL;
+        if (nvn_be_xq_owed(s, &owner)) { xq_lock(); nvn_be_xq_wait_queue(q, owner, s); xq_unlock(); }
+    }
     sync_ext_queue_wait((const sync_t *)s); return 1;
 }
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
@@ -1734,7 +1754,13 @@ uint64_t s2a_nvn_syncwait_blocks(void) { return atomic_load_explicit(&g_syncwait
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t fence;
     { void *owner = NULL;
-      if (nvn_be_xq_owed(s, &owner)) {
+      if (nvn_be_xq_owed(s, &owner) && nvn_be_xq_wait_idle) {
+          uint64_t start = now_ns();
+          if (timeout) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
+          if (!nvn_be_xq_owed_wait(s, timeout)) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+          uint64_t elapsed = now_ns() - start;
+          if (timeout != UINT64_MAX) timeout = elapsed < timeout ? timeout - elapsed : 0;
+      } else if (owner) {
           uint64_t first = timeout < 100000000ull ? timeout : 100000000ull;
           if (first) atomic_fetch_add_explicit(&g_syncwait_blocks, 1, memory_order_relaxed);
           if (!nvn_be_xq_owed_wait(s, first)) {
@@ -1765,7 +1791,12 @@ NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetMemoryPool, const NVNmemoryPool *, const NVNevent *e) { return (const NVNmemoryPool *)((const ev_t *)e)->pool; }
 NVN(nvnEventGetMemoryOffset, int64_t, const NVNevent *e) { return ((const ev_t *)e)->off; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
-static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; nvn_be_event_written(e->val); }   // 写后复查在等这个值的 GPU 等待（nvn_mtl.m ev_wait；安卓 nvn_be_android.c）
+static void ev_signal(const ev_t *e, int mode, uint32_t v) {
+    if (nvn_be_event_signal) { nvn_be_event_signal(e->val, (uint32_t)mode, v); return; }
+    if (mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, v, __ATOMIC_RELEASE);
+    else __atomic_store_n(e->val, v, __ATOMIC_RELEASE);
+    nvn_be_event_written(e->val);
+}
 NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
 
 // ---------- Queue ----------
@@ -1828,7 +1859,10 @@ NVN(nvnQueueGetTotalComputeMemoryUsed, size_t, NVNqueue *q) { return (size_t)((c
 NVN(nvnQueueResetMemoryUsageCounts, void, NVNqueue *q) {
     queue_t *o = (queue_t *)q; o->cmd_bytes = o->ctl_bytes = o->comp_bytes = 0;
 }
-NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
+NVN(nvnQueueFinalize, void, NVNqueue *q) {
+    if (nvn_be_xq_discard) { xq_lock(); nvn_be_xq_discard(q); xq_unlock(); }
+    ((queue_t *)q)->magic = 0;
+}
 // 审计 1101 18:00 P2-6：本层有 GPU 执行错误记录（nvnDeviceWaitForError 交出的那份）时仍按无错误回——如实上报会让轮询的游戏走进自己的出错分支，
 //   没有现场读数前不改语义，只在「有记录却报无错」时打一次红线，作为定语义的读数
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
@@ -1840,7 +1874,15 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
 static void queue_finish(void);   // 持提交锁（g_sub_mu，定义在 nvnQueueSubmitCommands 前）
-NVN(nvnQueueFinish, void, NVNqueue *q) { xq_lock(); nvn_be_xq_flush(q, "QueueFinish on it"); xq_unlock(); queue_finish(); }   // 停在跨队列等待上的工作先放行（nvn_xqueue.inc）
+NVN(nvnQueueFinish, void, NVNqueue *q) {
+    if (nvn_be_xq_wait_idle) {
+        if (!nvn_be_xq_wait_idle(q, 5000000000ull)) {
+            LOG("【红】 QueueFinish: logical queue still waits on an event");
+            return;
+        }
+    } else { xq_lock(); nvn_be_xq_flush(q, "QueueFinish on it"); xq_unlock(); }
+    queue_finish();
+}
 
 // ---------- Command buffer: records go to host shadow blocks; the game's command memory is only each recording's identity and anchor ----------
 // The game's command memory used to hold the host records themselves, and GetCommandMemoryUsed reported host record bytes, 5-10 times the real device's commands. Games that read
@@ -1982,6 +2024,7 @@ static void shd_kill(const srec *r) {   // g_sh_mu held：只删仍指向这条�
     uintptr_t d = r->dev0; if ((uintptr_t)nvn_hm_get(&g_shl, &d) == (uintptr_t)r->begin) nvn_hm_del(&g_shl, &d);
 }
 static srec *g_sh_qhead, *g_sh_qtail; static uint64_t g_sh_qbytes;
+static nvn_hmap g_sh_replay_holds = {.klen = sizeof(uintptr_t)};
 static uint64_t g_sh_nlive, g_sh_live_bytes, g_sh_unanchored;
 typedef struct { uint64_t h; uint32_t len; struct sblk *b; } sintern;
 static sintern *g_sh_it; static size_t g_sh_itcap, g_sh_itn; static uint64_t g_sh_shared_n;   // interned recordings (sh_intern)
@@ -2047,12 +2090,58 @@ static void sh_free_rec(srec *r) {   // g_sh_mu held: blocks back to their class
     if (r->iv != r->ivs) free(r->iv);
     free(r);
 }
+static int sh_replay_held(const srec *r) {
+    if (!g_sh_replay_holds.n) return 0;
+    for (const sblk *b = r->blk; b; b = b->next) {
+        uintptr_t key = (uintptr_t)b;
+        if (nvn_hm_get(&g_sh_replay_holds, &key)) return 1;
+    }
+    return 0;
+}
+
 static void sh_pump(void) {   // g_sh_mu held: reuse the blocks of recordings released long enough ago
     uint64_t f = dm_nvn_frame_count();
-    while (g_sh_qhead && (g_sh_qhead->frame + SH_QUAR_FRAMES <= f || g_sh_qbytes > SH_QUAR_CAP)) {
-        srec *r = g_sh_qhead; g_sh_qhead = r->next; if (!g_sh_qhead) g_sh_qtail = NULL;
-        g_sh_qbytes -= r->bytes; sh_free_rec(r);
+    srec *prev = NULL, **link = &g_sh_qhead;
+    while (*link && ((*link)->frame + SH_QUAR_FRAMES <= f || g_sh_qbytes > SH_QUAR_CAP)) {
+        srec *r = *link;
+        if (sh_replay_held(r)) {
+            prev = r;
+            link = &r->next;
+            continue;
+        }
+        *link = r->next;
+        if (!*link) g_sh_qtail = prev;
+        g_sh_qbytes -= r->bytes;
+        sh_free_rec(r);
     }
+}
+
+// A continuation can be inside any block of a recording, including past a JUMP.
+// Holding one block keeps the entire recording and its in-record pointers alive.
+uintptr_t nvn_cmd_replay_hold(uint64_t address) {
+    uintptr_t key = 0;
+    pthread_mutex_lock(&g_sh_mu);
+    for (int i = 0; i < g_sh_nchunk; i++) {
+        const schunk *chunk = &g_sh_chunk[i];
+        const uintptr_t base = (uintptr_t)chunk->mem;
+        size_t bytes = (size_t)1 << (SH_CLS0 + chunk->cls);
+        if (address < base || address - base >= chunk->carved * bytes) continue;
+        key = base + ((address - base) & ~(bytes - 1));
+        uintptr_t refs = (uintptr_t)nvn_hm_get(&g_sh_replay_holds, &key);
+        nvn_hm_put(&g_sh_replay_holds, &key, (void *)(refs + 1));
+        break;
+    }
+    pthread_mutex_unlock(&g_sh_mu);
+    return key;
+}
+
+void nvn_cmd_replay_release(uintptr_t key) {
+    if (!key) return;
+    pthread_mutex_lock(&g_sh_mu);
+    uintptr_t refs = (uintptr_t)nvn_hm_get(&g_sh_replay_holds, &key);
+    if (refs > 1) nvn_hm_put(&g_sh_replay_holds, &key, (void *)(refs - 1));
+    else nvn_hm_del(&g_sh_replay_holds, &key);
+    pthread_mutex_unlock(&g_sh_mu);
 }
 void s2a_hle_cmdshadow_quarantine_flush(void) {   // 单测：隔离区里的录制立即放回块池（同隔离期满）
     pthread_mutex_lock(&g_sh_mu);
@@ -2116,6 +2205,8 @@ static void sh_shutdown(void) {   // session end: every recording and chunk goes
     for (int i = 0; i < g_sh_nchunk; i++) sh_chunk_unmap(g_sh_chunk[i].mem);
     free(g_sh_chunk); g_sh_chunk = NULL; g_sh_nchunk = g_sh_cchunk = 0;
     free(g_shh.keys); free(g_shh.vals); nvn_hm_init(&g_shh, 8);
+    free(g_sh_replay_holds.keys); free(g_sh_replay_holds.vals);
+    nvn_hm_init(&g_sh_replay_holds, sizeof(uintptr_t));
     free(g_shd.keys); free(g_shd.vals); nvn_hm_init(&g_shd, 8); free(g_shl.keys); free(g_shl.vals); nvn_hm_init(&g_shl, 8);
     memset(g_sh_carving, 0, sizeof g_sh_carving); memset(g_sh_free, 0, sizeof g_sh_free); memset(g_sh_bkt, 0, sizeof g_sh_bkt);
     g_sh_all.next = g_sh_all.prev = &g_sh_all; g_sh_qhead = g_sh_qtail = NULL; g_sh_qbytes = g_sh_nlive = g_sh_live_bytes = g_sh_unanchored = 0; free(g_sh_it); g_sh_it = NULL; g_sh_itcap = g_sh_itn = 0; g_sh_shared_n = 0;
@@ -4336,7 +4427,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (dm_gfx_session_stopping()) return;
     win_t *o = (win_t *)w; o->presents++; nat_itv_sync(o);
     win_clock_fresh(o);   // 读档后没取图先上屏（读档前已取在手里的那张）同样先清，不然节拍器拿旧目标排槽
-    if (q) { pthread_mutex_lock(&g_sub_mu); nvn_be_xq_flush(q, "a present on it"); pthread_mutex_unlock(&g_sub_mu); }   // 上屏排在这条队列的工作后面：停在跨队列等待上的部分先放行（nvn_xqueue.inc）
+    if (q && nvn_be_xq_wait_idle) {
+        if (!nvn_be_xq_wait_idle(q, 5000000000ull)) {
+            LOG("【红】 QueuePresentTexture: logical queue still waits on an event");
+            return;
+        }
+    } else if (q) { pthread_mutex_lock(&g_sub_mu); nvn_be_xq_flush(q, "a present on it"); pthread_mutex_unlock(&g_sub_mu); }
     nvn_be_set_present_lower_left(o->present_ll);   // 这扇窗口建时的原点定上屏翻转（见 nvnWindowInitialize）
     if (q && dev_ok(((queue_t *)q)->dev) && atomic_load(&g_cur_dev) != ((queue_t *)q)->dev) { pthread_mutex_lock(&g_sub_mu); dev_follow(((queue_t *)q)->dev); pthread_mutex_unlock(&g_sub_mu); }   // 上屏翻转跟上屏队列的设备
     {   // 节拍主人：被上屏这张的取图线程（取图线程未知 = 上屏线程自己）；连续 PACE_SWITCH 次同一个才换

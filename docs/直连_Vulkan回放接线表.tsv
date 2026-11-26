@@ -3,7 +3,7 @@
 1	OP_JUMP	控制流	14519	（跳转）	已接	t_jump_call	否
 2	OP_BEGIN	控制流	14518	（不再录制，判坏记录）	已接（判坏记录）	无	否
 3	OP_CALL	控制流	14520	（递归）	已接	t_jump_call	否
-4	OP_SIGNAL_EVENT	同步 / 查询	14525	mtl_sub_event / ev_wait	部分：信号已接；等待（NVN_EV_WAIT）未接	t_event_after_done	否
+4	OP_SIGNAL_EVENT	同步 / 查询	20027	mtl_sub_event / ev_wait	已接：段完成后写信号，未满足的 NVN_EV_WAIT 停靠逻辑队列	t_event_after_done / t_nvn_replay_wait_event	否
 5	OP_REPORT_COUNTER	同步 / 查询	14530	mtl_sub_counter / post	部分：时间戳类与管线统计类在段完成后写回（时间取完成时刻的游戏时钟，同一段的多条报告同值）；遮挡计数（SAMPLES_PASSED）未接	t_report_counter	0100633007D48000
 6	OP_COPY_B2B	拷贝 / 填充	14559	mtl_sub_copy	已接（同上）	t_buf_ops	0100633007D48000
 7	OP_UPDATE_UB	拷贝 / 填充	14561	mtl_sub_update	已接（改游戏内存，使用点按页同步镜像）	t_buf_ops	0100633007D48000

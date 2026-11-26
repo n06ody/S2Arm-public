@@ -36,6 +36,7 @@ static int g_checks, g_fail;
 // 状态类命令都走 rp_state_op 替身，内容不参与这里的计时判断。
 struct rp_state rp_S;
 struct rp_target rp_R;
+uint64_t rp_tex_sep_gen[6];
 
 static uint64_t g_vt;   // 虚拟钟（纳秒）：只有「干活」替身推进它，回放实现自己不许动
 static int g_tm;        // 1 = 打开 debug.s2a.nvk_exec_tm（第二遍运行）；rp_exec.c 在第一次回放时读一次
@@ -126,6 +127,9 @@ void rp_buf_hold_end(void) {}
 //   回放实现无论嵌套几层都不许让时间自己走，所以「时间过了多少」就是「干了几件活」。
 void rp_op_update_ub(const void *a, const void *rec) { (void)a; (void)rec; g_vt += MS; }
 void rp_pass_set_rt(nvn_gpu_cmd c, const p_set_rt *r) { (void)c; (void)r; g_vt += MS; }
+void rp_pass_save(rp_pass_state *s) { (void)s; CHECK(0); }
+void rp_pass_restore(const rp_pass_state *s) { (void)s; CHECK(0); }
+void nvn_gpu_barrier(nvn_gpu_cmd cmd, uint32_t bits) { (void)cmd; (void)bits; CHECK(0); }
 // 长帧归因用例的绘制替身：按生产 rp_draw 的先后顺序、用同一个 rp_perf_add 记各步，虚拟钟推进多少就记多少
 // （所以「分项和 ≤ 帧回放」是手算得出的）。g_draw_plan：0 = 前面的计时用例（一笔 1 毫秒、不记分项）；
 // 1 = 归因用例，3 笔：第 1 笔含 1 次开通道（1 毫秒）与 1 次取管线（1 毫秒，其中后端取与设 0.5 毫秒）。

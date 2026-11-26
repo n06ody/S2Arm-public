@@ -337,14 +337,8 @@ int rp_depth_zero(void) { return g_depth_zero; }
 int rp_origin_lower_left(void) { return g_origin_ll; }
 uint64_t rp_frame(void) { return g_frame; }
 
-// ---------- 事件 / 跨队列：GPU 侧等事件未接（OP_SIGNAL_EVENT+WAIT），所以没有停住的队列 ----------
-void nvn_be_event_written(volatile uint32_t *val) { (void)val; }
+// 回放器对所有未满足的事件用逻辑队列停靠，不靠录制时猜测写入端。
 void nvn_be_event_gpu_recorded(volatile uint32_t *val) { (void)val; }
-void nvn_be_xq_flush(void *q, const char *why) { (void)q; (void)why; }
-int nvn_be_xq_fence(void *q, void *s) { (void)q; (void)s; return 0; }
-int nvn_be_xq_owed(const void *s, void **q) { (void)s; (void)q; return 0; }
-int nvn_be_xq_owed_wait(const void *s, uint64_t ns) { (void)s; (void)ns; return 1; }
-void nvn_be_xq_wait_queue(void *q, void *owner) { (void)q; (void)owner; }
 
 // ---------- 等完成 ----------
 void nvn_be_finish(void) { uint64_t f = nvn_be_last_fence(); if (f) nvn_be_wait(f, 5000000000ull); }
@@ -356,11 +350,11 @@ int nvn_be_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void
 void nvn_be_ub_present(double iv_ms) { (void)iv_ms; }
 
 // ---------- 会话 ----------
-void nvn_be_begin_session(void) {}
-int nvn_be_request_stop(void) { return 0; }
-int nvn_be_drain_session(void) { nvn_be_finish(); return 0; }
+void nvn_be_begin_session(void) { rp_xq_start(); }
+int nvn_be_request_stop(void) { rp_xq_request_stop(); return 0; }
+int nvn_be_drain_session(void) { rp_xq_stop(); nvn_be_finish(); return 0; }
 void rp_exec_reset(void);
-int nvn_be_shutdown_session(void) { rp_pool_stats_end(); rp_exec_reset(); rp_draw_reset(); rp_shader_reset(); rp_pass_reset(); rp_res_reset(); rp_buf_reset(); rp_state_reset(); return 0; }   // 上屏面由平台件摘（rp_present_set_surface）
+int nvn_be_shutdown_session(void) { rp_xq_stop(); rp_pool_stats_end(); rp_exec_reset(); rp_draw_reset(); rp_shader_reset(); rp_pass_reset(); rp_res_reset(); rp_buf_reset(); rp_state_reset(); rp_xq_start(); return 0; }   // 上屏面由平台件摘（rp_present_set_surface）
 
 // 长帧行在呈现线程作差，两个来源都按进程累计，读取不清零。
 void nvn_be_create_stats(uint64_t *lib, uint64_t *pso) {

@@ -47,6 +47,8 @@ void rp_pass_end(nvn_gpu_cmd c) {
     if (pass_open) { nvn_gpu_pass_end(c); pass_open = 0; }
 }
 void rp_pass_flush(nvn_gpu_cmd c) { rp_pass_end(c); }
+void rp_pass_save(rp_pass_state *s) { (void)s; REQUIRE(0); }
+void rp_pass_restore(const rp_pass_state *s) { (void)s; REQUIRE(0); }
 
 enum { WIDTH = 4, HEIGHT = 4 };
 static void write_vertices(uint8_t *dst, int green) {

@@ -42,6 +42,8 @@ static unsigned siblings[7];
 int nvn_be_shutdown_session(void);
 void rp_pool_stats_end(void) { siblings[0]++; }
 void rp_exec_reset(void) { siblings[1]++; }
+void rp_xq_stop(void) {}
+void rp_xq_start(void) {}
 void rp_draw_reset(void) { siblings[2]++; }
 void rp_pass_reset(void) { siblings[3]++; }
 void rp_res_reset(void) { siblings[4]++; }

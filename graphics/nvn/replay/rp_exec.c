@@ -1,5 +1,5 @@
 // 回放主循环与提交（对齐 nvn_mtl.m：nvn_be_exec @14491、nvn_be_sub_begin @1171、nvn_be_sub_commit @2210、nvn_xqueue.inc xq_piece @106）。
-// 一次游戏提交 = 一段后端命令 = 一个栅栏值；绘制攒在段里，不逐笔提交，CPU 不等完成。
+// 绘制攒在后端段里；逻辑队列的事件等待之后由 rp_xqueue.inc 续跑。
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
@@ -17,6 +17,12 @@
 
 void nvn_hle_queue_enter(void *q);   // hle_nvn.c
 void nvn_hle_piece_begun(void);
+void nvn_hle_submit_lock(void) __attribute__((weak));
+void nvn_hle_submit_unlock(void) __attribute__((weak));
+// 弱链接[replay]：nvn_cmd_replay_hold
+// 弱链接[replay]：nvn_cmd_replay_release
+uintptr_t nvn_cmd_replay_hold(uint64_t address) __attribute__((weak));
+void nvn_cmd_replay_release(uintptr_t hold) __attribute__((weak));
 int s2a_guest_tick_from_host_ns(uint64_t host_ns, uint64_t *out);
 uint64_t s2a_guest_tick(void);       // 运行时：游戏的系统计数器（与游戏自己读到的同一个钟）
 
@@ -143,6 +149,12 @@ enum { SUB_STEP = 64 };       // 一次提交在时间线上占 64 个值：最�
 static uint32_t g_mid;         // 这次提交已经用掉几个中间值
 static uint64_t g_split_base;  // 上次中途交段时的累计绘制笔数
 static int g_ret_n;            // OP_CALL 嵌套深度
+enum { RP_CALL_MAX = 64 };
+static const uint8_t *g_xq_resume[RP_CALL_MAX + 1];
+static unsigned g_xq_nresume;
+static void *g_xq_active;
+static int xq_event_wait(volatile uint32_t *event, uint32_t mode, uint32_t value, const void *rec);
+static void xq_signal_event(volatile uint32_t *event, uint32_t mode, uint32_t value);
 int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c：CALL 目标解析（0 照执行，2 跳到同设备地址的新录制，1 隔离中，-1 块已复用）
 
 // 缓冲 512：最长的中文前缀约 150 字节 + 原因串最多 191 字节；256 时 gcc -O2 -Werror=format-truncation 在 Linux 容器编译红
@@ -267,8 +279,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
                 memcpy((void *)(uintptr_t)s->p[i].report, rec, sizeof rec);
                 continue;
             }
-            if (s->p[i].mode & 1) __atomic_fetch_add((uint32_t *)s->p[i].val, s->p[i].v, __ATOMIC_SEQ_CST);
-            else __atomic_store_n((uint32_t *)s->p[i].val, s->p[i].v, __ATOMIC_SEQ_CST);
+            xq_signal_event(s->p[i].val, s->p[i].mode, s->p[i].v);
         }
     else if (backend_failed || !prior_violation)
         red("提交段失败，本段的事件 / 计数器不回写：%s", d->why ? d->why : "?");
@@ -844,7 +855,7 @@ static uint64_t exec_list(const uint8_t *p) {
             case OP_END: goto out;   // 唯一出口：帧级账在那边按「是否最外层」累加一次
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8);
-                if (g_ret_n >= 64) { nvn_unimpl("rec", "call_depth_over_64", p); break; }
+                if (g_ret_n >= RP_CALL_MAX) { nvn_unimpl("rec", "call_depth_over_64", p); break; }
                 {   // #768338 安全阀（同 nvn_mtl.m OP_CALL，判据在 hle_nvn.c nvn_cmd_call_target）：目标落在命令记录区却不是任何录制的句柄
                     //   （它的录制被覆盖、块已被别的录制复用）→ 记红、跳过这次调用，不执行不相干的内容；还在隔离区的旧录制照常执行
                     uint64_t to; int ck = nvn_cmd_call_resolve(t, &to); if (ck == 2) { t = to; ck = 0; }   // 同一设备地址上有新录制：跳到它（同真机，#768338 根修）
@@ -857,9 +868,13 @@ static uint64_t exec_list(const uint8_t *p) {
                 // 单调钟下 now - t_cmd 一定大于 sub，不会回绕。
                 if (tm) { uint64_t dns = now_ns() - t_cmd - sub;
                     pf_add(RP_PERF_EXEC_OTHER_NS, dns); if (h.op < 64) __atomic_fetch_add(&g_op_ns[h.op], dns, __ATOMIC_RELAXED); }
+                if (g_xq_nresume) { g_xq_resume[g_xq_nresume++] = p + h.size; goto out; }
                 break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
-                if (m & NVN_EV_WAIT) nvn_unimpl("op", "OP_SIGNAL_EVENT+WAIT", p);   // GPU 侧等事件：跨队列顺序接上时做
+                if (m & NVN_EV_WAIT) {
+                    int wait = xq_event_wait(val, m & ~NVN_EV_WAIT, v, p);
+                    if (wait) { g_xq_resume[g_xq_nresume++] = p + h.size; goto out; }
+                }
                 else post_event(val, m, v);
                 break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
@@ -930,25 +945,6 @@ out:
 }
 
 // 前端（hle_nvn.c → nvn_be_submit）的唯一入口：每次提交的每条命令列表调一次，g_ret_n 为 0，也就是「最外层」。
-void nvn_be_exec(const uint8_t *p) { (void)exec_list(p); }
+void nvn_be_exec(const uint8_t *p) { (void)exec_list(p); g_xq_nresume = 0; }
 
-// 一次 NVN 队列提交（hle_nvn.c nvnQueueSubmitCommands）。跨队列停靠（等别的队列还没回放的信号）未接：见 OP_SIGNAL_EVENT+WAIT。
-void nvn_be_submit(void *q, const uint64_t *h, int n) {
-    __atomic_fetch_add(&g_fr_subs, 1, __ATOMIC_RELAXED);   // 帧级账：这一帧提交了几次
-    g_in_submit = 1;
-    nvn_hle_queue_enter(q);
-    uint64_t t0 = now_ns();
-    // 一次提交拆三段记账（SUBMIT_NS 仍是含三段的整段）：开段（cmd_begin + 状态重发） / 主回放循环 / 收尾交后端
-    // （收尾里含 rp_pass_flush、前置段与主段的 nvn_gpu_cmd_commit）。三段加起来与 SUBMIT_NS 的差额是取时刻本身的开销。
-    nvn_be_sub_begin(); nvn_hle_piece_begun();
-    uint64_t t1 = now_ns();
-    nvn_be_sub_index(h, n);
-    for (int i = 0; i < n; i++) { nvn_be_exec_rest(h + i + 1, n - i - 1); nvn_be_exec((const uint8_t *)(uintptr_t)h[i]); }
-    nvn_be_exec_rest(NULL, 0);
-    uint64_t t2 = now_ns();
-    nvn_be_sub_commit();
-    uint64_t t3 = now_ns();
-    pf_add(RP_PERF_SUB_PRE_NS, t1 - t0); pf_add(RP_PERF_SUB_EXEC_NS, t2 - t1); pf_add(RP_PERF_SUB_POST_NS, t3 - t2);
-    pf_add(RP_PERF_SUBMIT_NS, t3 - t0);
-    g_in_submit = 0;
-}
+#include "rp_xqueue.inc"

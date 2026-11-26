@@ -57,6 +57,14 @@ native-test-nvn_wait_sync:
 	timeout 30 $(BUILD)/tests/t_nvn_wait_sync
 TEST_TARGETS += native-test-nvn_wait_sync
 
+.PHONY: native-test-nvn_replay_wait_event
+native-test-nvn_replay_wait_event:
+	@mkdir -p $(BUILD)/tests
+	$(CC) $(CFLAGS) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -I. -Igraphics/nvn/gfx/nvn -Igraphics/nvn/gfx/nvn/include -Igraphics/nvn/gfx/tex -I$(NVN_REPLAY_DIR) \
+	  -o $(BUILD)/tests/t_nvn_replay_wait_event graphics/nvn/tests/t_nvn_replay_wait_event.c graphics/nvn/tests/nvn_clear_view_unused.c $(NVN_REPLAY_CORE) $(NVN_REPLAY_WEAK) -lm
+	timeout 30 $(BUILD)/tests/t_nvn_replay_wait_event
+TEST_TARGETS += native-test-nvn_replay_wait_event
+
 .PHONY: native-test-nvn_copy_t2b
 native-test-nvn_copy_t2b:
 	@mkdir -p $(BUILD)/tests
