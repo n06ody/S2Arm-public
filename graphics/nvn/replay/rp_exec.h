@@ -166,6 +166,10 @@ void rp_bind_tm_take3(uint64_t *alloc, uint64_t *copy);   // 暂存：申请 / �
 // 回放线程要在 CPU 上改游戏内存 [addr, addr+len) 之前调：还没填完、来源与它相交的常量缓冲暂存先填完（代拷或等）（rp_draw.c，见 nvn_gpu_arena_fill）
 void rp_ub_fill_fence(uint64_t addr, uint64_t len);
 int rp_buf_gpu_pending(uint64_t addr, uint64_t len);   // 这段与还没落地的 GPU 写相交（rp_buf.c）
+// Like rp_buf_gpu_pending, with a nonzero version when one pending mirror covers the whole range.
+int rp_buf_gpu_pending_version(uint64_t addr, uint64_t len, uint64_t *version);
+// Read ordered 8-byte GPU values at the current replay position. May replace *cmd.
+int rp_readback_u64(nvn_gpu_cmd *cmd, const nvn_gpu_readback_span *reads, uint32_t count, uint64_t *values);
 // 改 / 拷游戏内存的三条命令遇到还没落地的 GPU 写时改在 GPU 上按提交顺序做（#1022）；返回 0 = 不需要 / 做不了，调用方照旧走 CPU 版
 int rp_op_update_ub_gpu(nvn_gpu_cmd c, const void *a, const void *rec); int rp_op_copy_b2b_gpu(nvn_gpu_cmd c, const void *a, const void *rec); int rp_op_clear_buf_gpu(nvn_gpu_cmd c, const p_clear_buf *cb, const void *rec);
 uint64_t rp_sub_fence(void);        // 正在回放的这次提交最后一段的栅栏值

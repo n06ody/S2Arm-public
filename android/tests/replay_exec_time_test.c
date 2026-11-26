@@ -65,6 +65,18 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn do
     (void)c; (void)signal; (void)done; (void)user; (void)err; return ok_rc();
 }
 nvn_gpu_rc nvn_gpu_fence_wait(uint64_t v, uint64_t timeout_ns, nvn_gpu_err *err) { (void)v; (void)timeout_ns; (void)err; return ok_rc(); }
+// The timing fixture records no buffer readback. Fail if it starts doing so.
+nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) {
+    (void)bytes; (void)mem; (void)init; (void)out; (void)err; CHECK(0);
+    return (nvn_gpu_rc){NVN_GPU_E_ARG};
+}
+uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b) { (void)b; CHECK(0); return NULL; }
+void nvn_gpu_buf_release(nvn_gpu_buf b, void (*retired)(void *), void *user) {
+    (void)b; (void)retired; (void)user; CHECK(0);
+}
+void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    (void)c; (void)src; (void)soff; (void)dst; (void)doff; (void)bytes; CHECK(0);
+}
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot) { (void)c; (void)slot; }
 // 本用例不发 ReportCounter；无时间戳能力，误走采样 / 换钟路径必须报红。
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); }

@@ -20,7 +20,7 @@
 #include <string.h>
 
 // off/len 是镜像持有的完整区间；copy_len 是从 off 起需要回写到客体的字节数。只在同次提交、同一镜像内合并。
-struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, copy_len; };
+struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, copy_len, version; };
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
 // use_sub / use_fence：最近一次用到这份镜像的提交（序号、栅栏值）；prev_fence：再往前一次用到它的提交的栅栏值——
@@ -349,7 +349,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
 // 重叠的几条拷的是同一份镜像里同一段字节（段完成时镜像里已是最终内容），拷一次与拷多次结果相同。
 // 只并「相交 / 首尾相接」的：并集里没有任何没被写过的字节。中间有空隙的不桥接——空隙里的镜像字节可能比游戏内存里的旧，落地会把新内容盖掉。
 uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged) {
-    static uint64_t next_id;
+    static uint64_t next_id, write_version;
     const uint8_t *mem; uint64_t size;
     if (merged) *merged = 0;
     if (!copy_len || copy_len > len) return 0;
@@ -384,7 +384,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
             }
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
-                g->off = lo; g->len = hi - lo; g->copy_len = copy_hi - lo;
+                g->off = lo; g->len = hi - lo; g->copy_len = copy_hi - lo; g->version = ++write_version;
                 mirror_touch(&s->m[mi], off, off + len);
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
@@ -396,7 +396,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
         }
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
-            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
+            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .sub = sub, .version = ++write_version}; *pool_key = (uint64_t)(uintptr_t)mem;
             mirror_touch(&s->m[mi], off, off + len);
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
@@ -851,20 +851,39 @@ int rp_write_touched(uint64_t mark, uint64_t a, uint64_t n) {
     return 0;
 }
 // [addr, addr+len) 与还没落地的 GPU 写相交吗（登记着的、正在锁外拷回的；表满说不清的按相交算）。线程：[提交]
-int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
+int rp_buf_gpu_pending_version(uint64_t addr, uint64_t len, uint64_t *version) {
+    if (version) *version = 0;
     if (!len || !__atomic_load_n(&g_gw_live, __ATOMIC_ACQUIRE)) return 0;
-    const uint8_t *mem; uint64_t size;
-    if (!rp_pool_find(addr, len, &mem, &size)) return 0;
-    uint64_t k = (uint64_t)(uintptr_t)mem, a = addr - k, b = a + len; int hit = 0;
+    const uint8_t *mem;
+    if (!rp_pool_find(addr, len, &mem, NULL)) return 0;
+    const uint64_t key = (uint64_t)(uintptr_t)mem, a = addr - key, b = a + len;
+    int hit = 0;
     pthread_mutex_lock(&g_bmu);
-    struct shadow *s = nvn_hm_get(&g_shadow, &k);
+    const struct shadow *s = nvn_hm_get(&g_shadow, &key);
     if (s) {
-        for (int i = 0; i < s->ngw && !hit; i++) hit = s->gw[i].off < b && a < s->gw[i].off + s->gw[i].len;
+        int mi = -1;
+        uint64_t latest = 0;
+        for (int i = 0; i < s->ngw; i++) {
+            const struct gpu_write *w = &s->gw[i];
+            if (w->off >= b || a >= w->off + w->len) continue;
+            hit = 1;
+            if (!version) break;
+            if (mi < 0) mi = w->mi;
+            if (w->version > latest) latest = w->version;
+        }
+        // An uncovered byte can be edited on the CPU while the rest is still
+        // on the GPU. Reuse a snapshot only while one mirror covers all bytes.
+        if (version && mi >= 0 && gw_covers(s, mi, a, b)) *version = latest;
         if (!hit) hit = s->landing > s->nlr;
-        for (int i = 0; i < s->nlr && !hit; i++) hit = s->lr[i].off < b && a < s->lr[i].off + s->lr[i].len;
+        for (int i = 0; i < s->nlr && !hit; i++)
+            if (s->lr[i].off < b && a < s->lr[i].off + s->lr[i].len) hit = 1;
     }
     pthread_mutex_unlock(&g_bmu);
     return hit;
+}
+
+int rp_buf_gpu_pending(uint64_t addr, uint64_t len) {
+    return rp_buf_gpu_pending_version(addr, len, NULL);
 }
 
 // 三条 CPU 改游戏内存的命令遇到还没落地的 GPU 写（#1022、#697）：CPU 现在读写游戏内存，读到的是 GPU 写之前的旧内容；写进去的又会被稍后的落地盖掉。

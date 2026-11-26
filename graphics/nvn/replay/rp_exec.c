@@ -493,6 +493,29 @@ static void seg_cut(int next_occ) {
     rp_dirty_all();
 }
 
+// A CPU descriptor needs the value before recording its consumer. Preserve
+// this logical submission's callbacks and public fence on the final segment.
+int rp_readback_u64(nvn_gpu_cmd *cmd, const nvn_gpu_readback_span *reads, uint32_t count, uint64_t *values) {
+    if (!*cmd || *cmd != g_cmd || !g_sub || g_mid >= SUB_STEP - 2) return 0;
+    const uint64_t bytes = (uint64_t)count * sizeof *values;
+    nvn_gpu_buf staging = NULL;
+    if (!nvn_gpu_ok(nvn_gpu_buf_create(bytes, NVN_GPU_MEM_SHARED, NULL, &staging, NULL))) return 0;
+    const uint8_t *map = nvn_gpu_buf_cpu(staging);
+    if (!map) { nvn_gpu_buf_release(staging, NULL, NULL); return 0; }
+    rp_pass_flush(g_cmd);
+    for (uint32_t i = 0; i < count; i++)
+        nvn_gpu_copy_buf(g_cmd, reads[i].src, reads[i].offset, staging, (uint64_t)i * sizeof *values, sizeof *values);
+
+    const uint32_t before = g_mid;
+    seg_cut(g_occ_seg);
+    *cmd = g_cmd;
+    int ok = g_cmd && g_mid > before &&
+             nvn_gpu_ok(nvn_gpu_fence_wait(g_fence + g_mid, 5000000000ull, NULL));
+    if (ok) memcpy(values, map, (size_t)bytes);
+    nvn_gpu_buf_release(staging, NULL, NULL);
+    return ok;
+}
+
 static uint64_t sub_commit_body(void);
 uint64_t nvn_be_sub_commit(void) {
     const uint64_t f = sub_commit_body();

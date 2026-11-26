@@ -1201,6 +1201,93 @@ static const char *pool_table_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, i
     g_ptd[row][i] = rp_pool_table(c, sp, sp ? rp_S.samp_base : rp_S.tex_base, pn, pg->dtt[pi][i], pg->dcls[pi][i], &why);
     return g_ptd[row][i] ? NULL : why ? why : "pool_table_unresolved";
 }
+// Keep Vulkan descriptor preparation on the CPU, but take GPU-produced pointer
+// bytes in command order, before any attachment pass or descriptor binding.
+struct uboa_binding {
+    nvn_gpu_buf buf;
+    uint64_t off, len;
+    uint64_t pointer_addr, pointer_version, pointer_value;
+};
+static struct uboa_binding g_uboa[RP_PROG_STAGES + 1][RP_PROG_ENT_MAX];
+
+// 弱链接[replay]：rp_buf_gpu_pending_version
+int rp_buf_gpu_pending_version(uint64_t, uint64_t, uint64_t *) __attribute__((weak));
+// 弱链接[replay]：rp_readback_u64
+int rp_readback_u64(nvn_gpu_cmd *, const nvn_gpu_readback_span *, uint32_t, uint64_t *) __attribute__((weak));
+
+static const char *uboa_prepare(nvn_gpu_cmd *c, const struct rp_prog *pg, int compute) {
+    enum { MAX_READS = RP_PROG_STAGES * RP_PROG_ENT_MAX };
+    static nvn_gpu_readback_span reads[MAX_READS];
+    static uint64_t values[MAX_READS];
+    static struct uboa_input {
+        struct uboa_binding *binding;
+        uint64_t addr, version, value;
+    } inputs[MAX_READS];
+    static uint32_t positions[MAX_READS];
+    uint32_t n = 0, gpu_count = 0;
+    const int stages = compute ? 1 : RP_PROG_STAGES;
+    for (int pi = 0; pi < stages; pi++) {
+        const int st = compute ? NVN_GPU_SH_CS : pi;
+        for (uint32_t i = 0; i < pg->nent[pi]; i++) {
+            const nvn_gpu_layout_ent *e = &pg->ent[pi][i];
+            if (e->src_kind != NVN_RB_UBOA) continue;
+            const p_bind_buf *ub = e->src_reg < 16 ? &rp_S.ubo[st][e->src_reg] : NULL;
+            if (!ub || !ub->addr || !ub->size) return "uniform_buffer_unbound";
+            if ((uint64_t)e->src_off + sizeof(uint64_t) > ub->size ||
+                ub->addr > UINT64_MAX - e->src_off) return "uniform_buffer_indirect_offset_outside";
+            if (e->access & NVN_GPU_ACC_W) return "compute_storage_indirect_writable_unknown";
+            const uint64_t addr = ub->addr + e->src_off;
+            if (!rp_pool_find(addr, sizeof(uint64_t), NULL, NULL)) return "uniform_buffer_unresolved";
+            struct uboa_binding *b = &g_uboa[compute ? RP_PROG_STAGES : pi][i];
+            struct uboa_input *in = &inputs[n];
+            *in = (struct uboa_input){.binding = b, .addr = addr};
+            const int pending = rp_buf_gpu_pending_version
+                ? rp_buf_gpu_pending_version(addr, sizeof in->value, &in->version)
+                : rp_buf_gpu_pending(addr, sizeof in->value);
+            if (!pending) {
+                memcpy(&in->value, (const void *)(uintptr_t)addr, sizeof in->value);
+            } else if (in->version && b->pointer_addr == addr && b->pointer_version == in->version) {
+                in->value = b->pointer_value;
+            } else {
+                nvn_gpu_readback_span *r = &reads[gpu_count];
+                if (!rp_buf_resolve(*c, addr, sizeof in->value, &r->src, &r->offset))
+                    return "uniform_buffer_unresolved";
+                positions[gpu_count++] = n;
+            }
+            n++;
+        }
+    }
+    if (gpu_count) {
+        if (!rp_readback_u64 || !rp_readback_u64(c, reads, gpu_count, values))
+            return "uniform_buffer_indirect_readback_failed";
+        for (uint32_t i = 0; i < gpu_count; i++) {
+            struct uboa_input *in = &inputs[positions[i]];
+            struct uboa_binding *b = in->binding;
+            in->value = values[i];
+            b->pointer_addr = in->addr;
+            b->pointer_version = in->version;
+            b->pointer_value = in->value;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        struct uboa_binding *b = inputs[i].binding;
+        const uint64_t target = nvn_ga2ca(inputs[i].value);
+        if (!target) return "compute_storage_indirect_null";
+        const uint8_t *mem;
+        uint64_t size;
+        if (!rp_pool_find(target, 1, &mem, &size)) return "storage_buffer_outside_pools";
+        uint64_t len = size - (target - (uint64_t)(uintptr_t)mem);
+        const nvn_gpu_caps *caps = caps_cached();
+        if (caps->max_ssbo_range && len > caps->max_ssbo_range) len = caps->max_ssbo_range;
+        if (!len) return "storage_buffer_indirect_empty";
+        if (!rp_buf_resolve(*c, target, len, &b->buf, &b->off)) return "storage_buffer_unresolved";
+        const uint32_t align = caps->min_ssbo_align;
+        if (align > 1 && (b->off & (align - 1))) return "storage_buffer_offset_unaligned";
+        b->len = len;
+    }
+    return NULL;
+}
+
 static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st, uint32_t base_instance, const nvn_gpu_view *tv, const nvn_gpu_samp *ts, const void *rec);
 static nvn_gpu_slice g_spill; static uint64_t g_spill_len;   // 本次派发的共享内存溢出缓冲（rp_dispatch 分配，绑定时用；0 = 没有）
 static int g_spill_on = -1, g_spill_said;   // 平台开关 nvk_spill（缺省开；关时 spill 程序的派发报名跳过，真机 A/B 用）；会话内前 64 次 spill 派发各记一行
@@ -1247,7 +1334,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
         }
         nvn_gpu_binding *o = &b[n]; memset(o, 0, sizeof *o); o->ent = (uint16_t)i; o->cls = e->cls;
         nvn_gpu_slice sl;
-        if (keep && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_TEXU && e->src_kind != NVN_RB_IMG && e->src_kind != NVN_RB_TBUF) { *o = g_lb[pi].b[n]; n++; continue; }
+        if (keep && e->src_kind != NVN_RB_UBOA && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_TEXU && e->src_kind != NVN_RB_IMG && e->src_kind != NVN_RB_TBUF) { *o = g_lb[pi].b[n]; n++; continue; }
         switch (e->src_kind) {
             case NVN_RB_SBUFP: case NVN_RB_UBOP: {   // 存储缓冲：取地址、绑池镜像里的那一段；可写的登记一次 GPU 写（完成后回写游戏内存）。两种来源只差在哪张表给地址：
                 // SBUFP 按 NVN 存储缓冲槽（rp_S.ssbo）；UBOP 按计算阶段的用户 UBO 槽（rp_S.ubo；反射映射 NVK_STORAGE_UBO_PTR），段的范围就是这个 UBO 绑定的地址与大小
@@ -1282,31 +1369,9 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                     if (copy_bytes < bytes) rp_post_gpu_write_prefix(sb->addr, bytes, copy_bytes);
                     else rp_post_gpu_write(sb->addr, bytes); }
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
-            case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
-                // 指针字节必须当前：先按写的来源解析那 8 字节（池镜像里 GPU 写过的部分不会被旧 guest 字节盖掉），
-                // 再从镜像的 CPU 映射读数；目标长度按所在池的余量，并夹到 SSBO 描述符范围上限。
-                const p_bind_buf *ub = e->src_reg < 16 ? &rp_S.ubo[st][e->src_reg] : NULL;
-                if (!ub || !ub->addr || !ub->size) return skip("uniform_buffer_unbound", rec);
-                if ((uint64_t)e->src_off + 8 > ub->size) return skip("uniform_buffer_indirect_offset_outside", rec);
-                if (e->access & NVN_GPU_ACC_W) return skip("compute_storage_indirect_writable_unknown", rec);   // 长度未知的可写绑定会把回写扩到相邻分配：准确拒绝
-                uint64_t paddr = ub->addr + e->src_off;
-                nvn_gpu_buf gb; uint64_t go;
-                if (!rp_buf_resolve(c, paddr, 8, &gb, &go)) return skip("uniform_buffer_unresolved", rec);
-                uint8_t *cpu = nvn_gpu_buf_cpu(gb);
-                if (!cpu) return skip("uniform_buffer_not_host_readable", rec);
-                uint64_t target = 0; memcpy(&target, cpu + go, 8);
-                target = nvn_ga2ca(target);
-                if (!target) return skip("compute_storage_indirect_null", rec);
-                const uint8_t *pmem = NULL; uint64_t psz = 0;
-                if (!rp_pool_find(target, 1, &pmem, &psz)) return skip("storage_buffer_outside_pools", rec);
-                uint64_t extent = psz - (target - (uint64_t)(uintptr_t)pmem);
-                { nvn_gpu_caps cp; nvn_gpu_caps_get(&cp);   // 本函数作用域里没有外层 caps：这里自己取一次
-                  if (cp.max_ssbo_range && extent > cp.max_ssbo_range) extent = cp.max_ssbo_range; }
-                if (!extent) return skip("storage_buffer_indirect_empty", rec);
-                if (!rp_buf_resolve(c, target, extent, &gb, &go)) return skip("storage_buffer_unresolved", rec);
-                const uint32_t al = caps_cached()->min_ssbo_align;
-                if (al > 1 && (go & (al - 1))) return skip("storage_buffer_offset_unaligned", rec);
-                o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = extent; break; }
+            case NVN_RB_UBOA: {
+                const struct uboa_binding *p = &g_uboa[st == NVN_GPU_SH_CS ? RP_PROG_STAGES : st][i];
+                o->u.b.buf = p->buf; o->u.b.off = p->off; o->u.b.len = p->len; break; }
             case NVN_RB_SUPPORT: {
                 uint32_t flags = (rp_depth_zero() ? 0u : 1u) | 2u;   // 位 0：深度 −1..1；位 1：base vertex / instance 取内建（后端基线要求 shaderDrawParameters）
                 // 这块内容只取决于长度与这两位：同一次提交的同一段里填过一份就接着用（每笔每阶段新建一份 2.6 KB 是回放里的固定开销）
@@ -1749,6 +1814,8 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
                     skip("indirect_count_driver_base_instance", rec); return;
                 }
     }
+    const char *uboa_error = uboa_prepare(&c, g_prog, 0);
+    if (uboa_error) { skip(uboa_error, rec); return; }
     DT(RP_PERF_D_PROG);
     // 先把这笔要用的资源都取好：池镜像同步、贴图上传是传输，不能出现在通道里，必须在开通道之前做完
     nvn_gpu_buf vb_buf[16]; uint64_t vb_off[16]; uint32_t streams = 0;
@@ -2073,6 +2140,9 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
                 const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
                 if (g_sb_ok[st][i] && sb) { uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl); ACCESS_READ(compute_read_buf(g_sb_buf[st][i], g_sb_off[st][i], wl)); }
                 else if (sb && sb_unmapped(sb) && e->src_kind == NVN_RB_SBUFP) ACCESS_READ(compute_read_buf(rp_buf_for_null_storage(), 0, 0x10000));
+            } else if (e->src_kind == NVN_RB_UBOA) {
+                const struct uboa_binding *b = &g_uboa[st][i];
+                ACCESS_READ(compute_read_buf(b->buf, b->off, b->len));
             } else if (e->src_kind == NVN_RB_TEX || e->src_kind == NVN_RB_TEXU || texel_tmp(e)) {
                 if (e->count > 1) { for (uint32_t k = 0; k < e->count && !need; k++) ACCESS_READ(compute_read_view(g_av[st][k])); }
                 else ACCESS_READ(compute_read_view(tv[st][i]));
@@ -2421,7 +2491,10 @@ void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     static tex_t img_snap[RP_PROG_ENT_MAX];   // 存储图像的登记快照（调用方持有；登记表会扩容换地址）
     const tex_t *images[RP_PROG_ENT_MAX];
     int lib_retry = 0;   // 出库版绑定核对失败只回退现编一次：现编版再失败照旧具名跳过
+    const char *uboa_error;
 cs_rebind:
+    uboa_error = uboa_prepare(&c, pg, 1);
+    if (uboa_error) { skip(uboa_error, rec); return; }
     g_ntwb = 0;
     memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts); memset(images, 0, sizeof images);
     struct timespec tr0; clock_gettime(CLOCK_MONOTONIC, &tr0); uint64_t r0 = (uint64_t)tr0.tv_sec * 1000000000ull + (uint64_t)tr0.tv_nsec;

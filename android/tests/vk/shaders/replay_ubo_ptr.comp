@@ -1,0 +1,11 @@
+#version 450
+layout(local_size_x = 1) in;
+#if PRODUCER
+layout(set = 0, binding = 0, std430) writeonly buffer Destination { uvec2 pointerWords; } dst;
+layout(push_constant) uniform PointerValue { uvec2 words; } value;
+void main() { dst.pointerWords = value.words; }
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Source { uvec4 color; } src;
+layout(set = 0, binding = 1, std430) writeonly buffer Destination { uvec4 color; } dst;
+void main() { dst.color = src.color; }
+#endif
