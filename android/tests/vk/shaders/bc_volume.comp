@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) uniform sampler3D volume;
+layout(std430, set = 0, binding = 1) writeonly buffer Samples {
+    vec4 texels[];
+};
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint mipIndex = index;
+    for (int mip = 0; mip < textureQueryLevels(volume); ++mip) {
+        uvec3 size = uvec3(textureSize(volume, mip));
+        uint count = size.x * size.y * size.z;
+        if (mipIndex < count) {
+            uvec3 xyz = uvec3(mipIndex % size.x, (mipIndex / size.x) % size.y, mipIndex / (size.x * size.y));
+#ifdef S2A_BC_TEST_WRONG_SLICE
+            xyz.z = (xyz.z + 1u) % size.z;
+#endif
+            texels[index] = texelFetch(volume, ivec3(xyz), mip);
+            return;
+        }
+        mipIndex -= count;
+    }
+}
