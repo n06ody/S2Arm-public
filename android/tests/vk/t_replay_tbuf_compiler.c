@@ -83,7 +83,7 @@ int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
 }
 uint64_t rp_tex_reg_gen(void) { return 1; }
 uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) { (void)h; (void)n; (void)b; return (uint64_t)count; }
-void rp_tex_mark_gpu_written(const tex_t *t) { (void)t; }
+void rp_tex_mark_gpu_written(nvn_gpu_cmd c, const tex_t *t) { (void)c; (void)t; }
 int rp_tex_debug_state(uint64_t s) { (void)s; return 0; }
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s) { (void)s; return NULL; }
 const p_set_rt *rp_pass_target(void) { return &target; }

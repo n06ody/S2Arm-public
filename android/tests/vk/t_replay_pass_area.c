@@ -238,7 +238,7 @@ static void run_case(enum scenario kind, uint64_t signal) {
             d.depth.load = d.stencil.load = NVN_GPU_LOAD_CLEAR;
             d.clear_depth = 0.75f; d.clear_stencil = 17;
             nvn_gpu_pass_begin(active, &d); nvn_gpu_pass_end(active);
-            rp_tex_mark_gpu_written(&z);
+            rp_tex_mark_gpu_written(active, &z);
         }
         const p_set_rt rt = {.n = kind == ALIAS ? 2 : 1, .color = {&a, kind == ALIAS ? &b : NULL},
                              .depth = kind == DS_CROSSES ? &z : NULL};

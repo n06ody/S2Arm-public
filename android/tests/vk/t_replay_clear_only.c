@@ -15,6 +15,9 @@ static nvn_gpu_cmd active;
 static int enabled, watching;
 static nvn_gpu_pass_desc observed[2];
 static unsigned passes;
+static uint64_t submit_serial = 1;
+static _Thread_local size_t fail_realloc_size, fail_calloc_size;
+static unsigned rejected_upload_allocs, rejected_zero_allocs;
 
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_clear_only_attachments")) return enabled ? 1 : dflt;
@@ -22,8 +25,8 @@ int nvn_plat_flag(const char *name, int dflt) {
 }
 void rp_perf_add(int index, uint64_t value) { (void)index; (void)value; }
 uint64_t rp_frame(void) { return 0; }
-uint64_t rp_seg_serial(void) { return 1; }
-uint64_t rp_sub_serial(void) { return 1; }
+uint64_t rp_seg_serial(void) { return submit_serial; }
+uint64_t rp_sub_serial(void) { return submit_serial; }
 int rp_occl_want(void) { return 0; }
 void rp_occl_pass_opened(int declared) { CHECK(!declared, "unexpected occlusion"); }
 void rp_occl_pass_closed(void) {}
@@ -32,6 +35,28 @@ int rp_buf_gpu_pending(uint64_t addr, uint64_t size) { (void)addr; (void)size; r
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     *last_sub = rp_sub_serial();
     return active;
+}
+
+extern __typeof__(realloc) __real_realloc;
+void *__wrap_realloc(void *ptr, size_t size) {
+    if (!ptr && fail_realloc_size && size == fail_realloc_size) {
+        fail_realloc_size = 0;
+        rejected_upload_allocs++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_realloc(ptr, size);
+}
+
+extern __typeof__(calloc) __real_calloc;
+void *__wrap_calloc(size_t count, size_t size) {
+    if (count == 1 && fail_calloc_size && size == fail_calloc_size) {
+        fail_calloc_size = 0;
+        rejected_zero_allocs++;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_calloc(count, size);
 }
 
 extern __typeof__(nvn_gpu_pass_begin) __real_nvn_gpu_pass_begin;
@@ -144,7 +169,7 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
         init.depth.store = init.stencil.store = NVN_GPU_STORE_STORE;
         nvn_gpu_pass_begin(active, &init);
         nvn_gpu_pass_end(active);
-        rp_tex_mark_gpu_written(&ds);
+        rp_tex_mark_gpu_written(active, &ds);
     }
     const p_set_rt rt = {.n = 2, .color = {&a, &b}, .depth = partial_ds ? &ds : NULL};
     rp_pass_set_rt(active, &rt);
@@ -202,6 +227,132 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
     rp_res_reset();
 }
 
+static void check_init_retry(void) {
+    const uint8_t color[4] = {13, 49, 97, 255}, zero[4] = {0}, red[4] = {255, 0, 0, 255};
+    memset(storage, 0, sizeof storage);
+    pool = (pool_t){.mem = storage, .size = sizeof storage, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    tex_t upload = guest_texture(10, 0, W, NVN_FORMAT_RGBA8);
+    tex_t zeroed = guest_texture(11, 65536, W, NVN_FORMAT_RGBA8);
+    tex_t overwrite = guest_texture(12, 131072, W, NVN_FORMAT_RGBA8);
+    upload.d.flags = NVN_TEXTURE_FLAGS_LINEAR;  // Linear guest data necessarily uses CPU staging.
+    overwrite.d.flags = NVN_TEXTURE_FLAGS_LINEAR;
+    nvn_tex_layout(&upload.d, &upload.L);
+    nvn_tex_layout(&overwrite.d, &overwrite.L);
+    fill_rgba(&upload, color);
+    fill_rgba(&overwrite, color);
+
+    active = begin_cmd();
+    const size_t bytes = W * H * 4;
+    fail_realloc_size = bytes;
+    nvn_gpu_tex rejected_source = rp_tex_resolve(&upload, active);
+    CHECK(rejected_upload_allocs == 1, "CPU texture staging allocation fault was injected");
+    CHECK(!rejected_source, "failed first upload exposed the texture to a reader");
+    fail_realloc_size = 0;
+    nvn_gpu_tex source = rp_tex_resolve(&upload, active);
+    CHECK(source, "first upload is retryable");
+
+    fail_calloc_size = bytes;
+    nvn_gpu_tex rejected_zero = rp_tex_resolve(&zeroed, active);
+    CHECK(rejected_zero_allocs == 1, "zero staging allocation fault was injected");
+    CHECK(!rejected_zero, "failed zero initialization exposed the texture to a reader");
+    fail_calloc_size = 0;
+    nvn_gpu_tex cleared = rp_tex_resolve(&zeroed, active);
+    CHECK(cleared, "zero initialization is retryable");
+
+    fail_realloc_size = bytes;
+    CHECK(!rp_tex_resolve(&overwrite, active), "the future clear target has a failed initial upload");
+    const p_set_rt rt = {.n = 1, .color = {&overwrite}};
+    const p_clear_color clear = {.index = 0, .mask = 0xf, .rgba = {1, 0, 0, 1}};
+    fail_realloc_size = bytes;
+    rp_pass_set_rt(active, &rt);
+    rp_pass_clear_color(active, &clear, NULL);
+    rp_pass_flush(active);
+    CHECK(fail_realloc_size == bytes, "full clear renewed no source upload");
+    fail_realloc_size = 0;
+    nvn_gpu_tex rewritten = rp_tex_resolve(&overwrite, active);
+    CHECK(rewritten && nvn_be_tex_gpu_owned(overwrite.serial), "full clear defined the rejected texture");
+
+    const uint8_t poison[4] = {0xdd, 0xdd, 0xdd, 0xdd};
+    uint8_t fill[W * H * 4];
+    memset(fill, poison[0], sizeof fill);
+    nvn_gpu_buf rsource = make_buf(bytes, NVN_GPU_MEM_SHARED, fill);
+    nvn_gpu_buf rzero = make_buf(bytes, NVN_GPU_MEM_SHARED, fill);
+    nvn_gpu_buf rclear = make_buf(bytes, NVN_GPU_MEM_SHARED, fill);
+    if (source) nvn_gpu_copy_tex_buf(active, source, 0, 0, NULL, rsource, 0, W * 4, bytes);
+    if (cleared && !rejected_zero) nvn_gpu_copy_tex_buf(active, cleared, 0, 0, NULL, rzero, 0, W * 4, bytes);
+    if (rewritten) nvn_gpu_copy_tex_buf(active, rewritten, 0, 0, NULL, rclear, 0, W * 4, bytes);
+    nvn_gpu_err err = {0};
+    const uint64_t signal = 1024;
+    const nvn_gpu_rc submitted = nvn_gpu_cmd_commit(active, signal, on_done, NULL, &err);
+    CHECK(OK(submitted), "retry submit: %s", err.why);
+    if (OK(submitted) && OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err))) {
+        check_rgba(rsource, W * H, color, "retried CPU upload");
+        if (!rejected_zero) check_rgba(rzero, W * H, zero, "retried zero initialization");
+        check_rgba(rclear, W * H, red, "full overwrite after failed initialization");
+    } else CHECK(0, "retry segment must complete: %s", err.why);
+    printf("resource init retry: upload_exposed=%d zero_exposed=%d upload_recovered=%d zero_recovered=%d\n",
+           rejected_source != NULL, rejected_zero != NULL, source != NULL, cleared != NULL);
+    nvn_gpu_buf_release(rsource, NULL, NULL);
+    nvn_gpu_buf_release(rzero, NULL, NULL);
+    nvn_gpu_buf_release(rclear, NULL, NULL);
+    active = NULL;
+    rp_pass_reset();
+    rp_res_reset();
+}
+
+static void check_failed_segment_publication(void) {
+    memset(storage, 0, sizeof storage);
+    pool = (pool_t){.mem = storage, .size = sizeof storage, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    tex_t upload = guest_texture(20, 0, W, NVN_FORMAT_RGBA8);
+    tex_t clear = guest_texture(21, 65536, W, NVN_FORMAT_RGBA8);
+    tex_t preserved = guest_texture(22, 131072, W, NVN_FORMAT_RGBA8);
+    const uint8_t color[4] = {27, 63, 101, 255};
+    fill_rgba(&upload, color);
+
+    submit_serial++;
+    active = begin_cmd();
+    const p_set_rt prior = {.n = 1, .color = {&preserved}};
+    const p_clear_color prior_clear = {.index = 0, .mask = 0xf, .rgba = {0, 1, 0, 1}};
+    rp_pass_set_rt(active, &prior);
+    rp_pass_clear_color(active, &prior_clear, NULL);
+    rp_pass_flush(active);
+    nvn_gpu_err err = {0};
+    CHECK(OK(nvn_gpu_cmd_commit(active, 1025, on_done, NULL, &err)), "preceding submit: %s", err.why);
+    CHECK(OK(nvn_gpu_fence_wait(1025, 5000000000ull, &err)), "preceding clear completes: %s", err.why);
+
+    submit_serial++;
+    active = begin_cmd();
+    CHECK(rp_tex_resolve(&upload, active), "same recording can consume its preceding texture upload");
+    const p_set_rt rt = {.n = 2, .color = {&clear, &preserved}};
+    const p_clear_color cmd = {.index = 0, .mask = 0xf, .rgba = {1, 0, 0, 1}};
+    rp_pass_set_rt(active, &rt);
+    rp_pass_clear_color(active, &cmd, NULL);
+    const p_clear_color later = {.index = 1, .mask = 0xf, .rgba = {0, 0, 1, 1}};
+    rp_pass_clear_color(active, &later, NULL);
+    rp_pass_flush(active);
+    CHECK((rp_tex_debug_state(upload.serial) & 2) != 0, "ordinary upload was recorded before segment failure");
+    CHECK(nvn_be_tex_gpu_owned(clear.serial), "attachment clear was recorded before segment failure");
+
+    const uint64_t signal = 1026;
+    const int done_before = atomic_load(&g_ndone);
+    nvn_gpu_vk_test_set_fault(1);
+    const nvn_gpu_rc result = nvn_gpu_cmd_commit(active, signal, on_done, NULL, &err);
+    CHECK(result.code == NVN_GPU_E_DEVICE, "Vulkan segment submit failure was injected: %d %s", result.code, err.why);
+    const struct done_rec *done = wait_signal(signal, done_before, 5000);
+    CHECK(done && done->status == NVN_GPU_DONE_FAILED, "failed segment retirement must report FAILED");
+    submit_serial++;
+    const int uploaded = (rp_tex_debug_state(upload.serial) & 2) != 0;
+    const int owned = nvn_be_tex_gpu_owned(clear.serial);
+    CHECK(!uploaded, "next segment still sees an ordinary upload from a failed segment");
+    CHECK(!owned, "next segment still sees GPU ownership from a failed attachment clear");
+    CHECK(nvn_be_tex_gpu_owned(preserved.serial), "earlier completed clear lost its GPU ownership");
+    printf("failed resource segment: next_upload=%d next_clear_owner=%d preserved_clear_owner=%d\n",
+           uploaded, owned, nvn_be_tex_gpu_owned(preserved.serial));
+    active = NULL;
+    rp_pass_reset();
+    rp_res_reset();
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     enabled = atoi(argv[2]);
@@ -211,6 +362,8 @@ int main(int argc, char **argv) {
     g_desc = (nvn_gpu_open_desc){.host_device = &g_dev, .app_label = "replay-clear-only"};
     if (!open_backend()) return 2;
     for (enum shape s = TRIM; s <= STENCIL; s++) run_clear(argv[1], s, expect_trim);
+    check_init_retry();
+    check_failed_segment_publication();
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "destroy device");

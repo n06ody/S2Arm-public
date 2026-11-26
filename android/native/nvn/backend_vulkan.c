@@ -314,6 +314,7 @@ enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
+    nvn_gpu_cmd_effect *effects;
     int land_mode, land_observe, land_tracked, land_epoch;
     uint32_t land_eligible, land_direct;
     uint64_t land_eligible_bytes;
@@ -708,6 +709,25 @@ static void set_sticky(struct nvn_gpu_cmd_s *c, int code, const char *fmt, ...) 
     vsnprintf(c->why, sizeof c->why, fmt, ap);
     va_end(ap);
     NVN_RA_IF(nvn_render_audit_event(NVN_RA_STICKY, fmt, NULL, c->why));
+}
+
+void nvn_gpu_cmd_attach_effect(nvn_gpu_cmd c, nvn_gpu_cmd_effect *effect) {
+    effect->next = c->effects;
+    c->effects = effect;
+}
+
+int nvn_gpu_cmd_record_ok(nvn_gpu_cmd c) { return c && rc_is(c->sticky, NVN_GPU_OK); }
+
+void nvn_gpu_cmd_record_oom(nvn_gpu_cmd c, const char *what) { set_sticky(c, NVN_GPU_E_OOM, "%s", what); }
+
+static void retire_effects(nvn_gpu_cmd c, int completed) {
+    while (c && c->effects) {
+        nvn_gpu_cmd_effect *effect = c->effects;
+        c->effects = effect->next;
+        g_in_callback++;
+        effect->retire(effect, completed);
+        g_in_callback--;
+    }
 }
 
 static uint64_t add_sat(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
@@ -1767,6 +1787,7 @@ static uint32_t occl_read(VkQueryPool pool, uint32_t first, uint32_t n, uint64_t
 
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
     NVN_RA_IF(if (status == NVN_GPU_DONE_FAILED) nvn_render_audit_segment(code, s->signal, why));
+    retire_effects(s->cmd, status != NVN_GPU_DONE_FAILED);
     if (!s->done) return;
     nvn_gpu_done d;
     memset(&d, 0, sizeof d);
@@ -1870,6 +1891,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
     // 先整队清空再归还 / 销毁下面这些资源。执行过的段已经过了 GPU 完成，记录早就做完了
     if (!executed) vk_dq_drain();
+    retire_effects(c, executed);
     if (c->bc_first_time) bc_time_finish(c, 0);
     prs_release(c, executed);   // 回收的整池组：先把反馈补丁写回正典再放回（要在下面销毁快照视图、归还表引用之前：补丁的正典内容引用着表里的视图）
     // 布局按段跟踪（c->lay）：段不执行时命令缓冲里什么都没跑，没有要回滚的；t->layout 只做诊断。
@@ -8611,11 +8633,10 @@ static void upload_d24s8_stencil(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level,
     copy_buf_tex_impl(ch, sl.buf, sl.off, ew, (uint64_t)ew * eh, th, level, layer, r, COPY_FACE_STENCIL, 0);
 }
 
-void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
-                        const void *src, uint64_t row_bytes, uint64_t image_bytes) {
-    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
-    struct nvn_gpu_cmd_s *c = ch;
-    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+static void tex_upload(struct nvn_gpu_cmd_s *c, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
+                       const void *src, uint64_t row_bytes, uint64_t image_bytes) {
+    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "传输操作在通道内"); return; }
     if (!src) { set_sticky(c, NVN_GPU_E_ARG, "tex_upload src 为空"); return; }
     struct nvn_gpu_tex_s *t = th;
     if (!t) { set_sticky(c, NVN_GPU_E_ARG, "tex_upload 贴图为空"); return; }
@@ -8648,7 +8669,7 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t
     uint32_t align = 4;
     { nvn_fmt_info bi; uint32_t bb = expand ? (uint32_t)ebpp : nvn_fmt_info_of(t->nvn_format, &bi) ? bi.bytes : 0;
       if (bb > 4 && !(bb & (bb - 1))) align = bb; }
-    if (!rc_is(nvn_gpu_arena_alloc(ch, need, align, &sl, &e), NVN_GPU_OK)) {
+    if (!rc_is(nvn_gpu_arena_alloc(c, need, align, &sl, &e), NVN_GPU_OK)) {
         set_sticky(c, e.rc.code, "tex_upload 暂存：%s", e.why);
         return;
     }
@@ -8658,20 +8679,27 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t
             set_sticky(c, NVN_GPU_E_ARG, "tex_upload 展开失败（格式 0x%x）", t->nvn_format);
             return;
         }
-        nvn_gpu_copy_buf_tex(ch, sl.buf, sl.off, out_row, out_bytes, th, level, layer, r);
+        nvn_gpu_copy_buf_tex(c, sl.buf, sl.off, out_row, out_bytes, th, level, layer, r);
     } else if (nvn_vk_format_substituted(t->nvn_format)) {
         // #398：D24 换成 D32 存储。按原 D24 深度面口径（每纹素 4 字节，低 24 位 UNORM）换成 float 再传深度面。
         if (row_bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "tex_upload D24 行宽未 4 对齐"); return; }
         memcpy(sl.cpu, src, (size_t)image_bytes);
         nvn_vk_depth24_to_f32(sl.cpu, (size_t)image_bytes / 4);
-        copy_buf_tex_impl(ch, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEPTH_F32, 0);
-        if (t->nvn_format == NVN_FORMAT_DEPTH24_STENCIL8) upload_d24s8_stencil(ch, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);   // 换存储后模板面照样要传
+        copy_buf_tex_impl(c, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEPTH_F32, 0);
+        if (t->nvn_format == NVN_FORMAT_DEPTH24_STENCIL8) upload_d24s8_stencil(c, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);   // 换存储后模板面照样要传
     } else {
         memcpy(sl.cpu, src, (size_t)image_bytes);
-        nvn_gpu_copy_buf_tex(ch, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r);   // 深度模板贴图：这一区只有深度面（copy_face_aspect）
+        nvn_gpu_copy_buf_tex(c, sl.buf, sl.off, row_bytes, image_bytes, th, level, layer, r);   // 深度模板贴图：这一区只有深度面（copy_face_aspect）
         if (t->nvn_format == NVN_FORMAT_DEPTH24_STENCIL8 && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
-            upload_d24s8_stencil(ch, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);
+            upload_d24s8_stencil(c, th, level, layer, r, src, row_bytes, image_bytes, ew, eh);
     }
+}
+
+nvn_gpu_rc nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
+                             const void *src, uint64_t row_bytes, uint64_t image_bytes) {
+    if (!c) return rc(NVN_GPU_E_ARG);
+    tex_upload(c, t, level, layer, r, src, row_bytes, image_bytes);
+    return c->sticky;
 }
 
 #include "backend_vulkan_clear.inc"

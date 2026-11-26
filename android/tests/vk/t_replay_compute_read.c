@@ -95,7 +95,7 @@ nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 uint32_t rp_fmt_caps(uint32_t f){return nvn_gpu_format_caps(f);}
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){if(i<0||i>=4||!resources[i].valid)return 0;*t=resources[i].tex;*v=resources[i].desc;*h=resources[i].has_view;return 1;}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
-void rp_tex_mark_gpu_written(const tex_t *t){(void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
+void rp_tex_mark_gpu_written(nvn_gpu_cmd c, const tex_t *t) { (void)c; (void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){(void)s;return NULL;}
 static p_set_rt target;static tex_t target_tex;static nvn_gpu_view target_view;static int pass_open;
 const p_set_rt *rp_pass_target(void){return &target;}int rp_pass_slot_attached(int i){return i==0;}

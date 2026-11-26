@@ -112,13 +112,13 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
 }
 // 上传捕获：每次上传的整块字节取散列（FNV-1a），记级 / 层 / 字节数 / 有没有非零字节；仍转给替身记账
 static struct { uint32_t level, layer; uint64_t bytes, hash; int nz; } g_cap[96]; static int g_ncap;
-void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
+nvn_gpu_rc nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
     if (g_ncap < 96) {
         uint64_t h = 1469598103934665603ull; int nz = 0; const uint8_t *p = src;
         for (uint64_t i = 0; i < image_bytes; i++) { h = (h ^ p[i]) * 1099511628211ull; nz |= p[i] != 0; }
         g_cap[g_ncap].level = level; g_cap[g_ncap].layer = layer; g_cap[g_ncap].bytes = image_bytes; g_cap[g_ncap].hash = h; g_cap[g_ncap].nz = nz; g_ncap++;
     }
-    fixture_gpu_tex_upload(c, t, level, layer, r, src, row_bytes, image_bytes);
+    return fixture_gpu_tex_upload(c, t, level, layer, r, src, row_bytes, image_bytes);
 }
 
 // ---------- 用例辅助 ----------

@@ -235,13 +235,15 @@ uint32_t nvn_gpu_format_caps(uint32_t f) { if (f == g_caps_nosample) return 0;
 static int g_window_capture; static uint8_t g_window_linear[512], g_window_raw[512];
 static uint64_t g_dirty_now = 100, g_dirty_written; static int g_protects, g_tdiag_race; static const void *g_prot_addr; static size_t g_prot_len;   // 最近一次保护的范围
 static const void *g_prot_log[8]; static size_t g_prot_llen[8]; static int g_prot_n;   // 每次保护的范围（前 8 次），用例核「都只罩池内窗口」
-void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
-    (void)t; if (g_nup == 16) return;
+nvn_gpu_rc nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r, const void *src, uint64_t row_bytes, uint64_t image_bytes) {
+    (void)t; if (g_nup == 16) return (nvn_gpu_rc){.code = NVN_GPU_OK};
     g_up[g_nup].pre = c->is_pre; g_up[g_nup].level = level; g_up[g_nup].layer = layer; g_up[g_nup].pitch = row_bytes; g_up[g_nup].img = image_bytes; g_up[g_nup].y = r->yoffset; g_up[g_nup].w = r->width; g_up[g_nup].h = r->height;
     memcpy(g_up[g_nup].first, src, image_bytes < 64 ? image_bytes : 64);
     if (g_window_capture && image_bytes == sizeof g_window_linear) memcpy(g_window_linear, src, sizeof g_window_linear);
     g_nup++;
-    if (g_tdiag_race) { g_dirty_written = ++g_dirty_now; g_tdiag_race = 0; } }
+    if (g_tdiag_race) { g_dirty_written = ++g_dirty_now; g_tdiag_race = 0; }
+    return (nvn_gpu_rc){.code = NVN_GPU_OK};
+}
 // 块线性上传替身：快照调用参数；能力开时回放必须传原始存储，不应先在线程解排。
 static int g_block_uploads;
 static struct { uint32_t level, layer; uint64_t bytes; const void *src; nvn_texlayout layout; } g_block_call[16];
@@ -1284,18 +1286,18 @@ static void t_alias_take_over(void) {
     nvn_be_sub_begin();
     tex_t p = mk_tex(300, 0, NVN_FORMAT_RGBA8, 64, 64, 1, 0);
     nvn_gpu_tex gp = rp_tex_resolve(&p, &g_fake_cmd); CHECK(gp != NULL);
-    rp_tex_mark_gpu_written(&p);
+    rp_tex_mark_gpu_written(&g_fake_cmd, &p);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     subs_pass(20);
     nvn_be_sub_begin();
     tex_t q = mk_tex(301, 0, NVN_FORMAT_RGBA8, 60, 60, 1, 0);
     CHECK(rp_tex_resolve(&q, &g_fake_cmd) != NULL);
     CHECK(rp_res_tex_built() == 2 && g_tex_releases == r0);          // q 还没写：p 没被盖，留着
-    rp_tex_mark_gpu_written(&q);
+    rp_tex_mark_gpu_written(&g_fake_cmd, &q);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     subs_pass(20);
     nvn_be_sub_begin();
-    rp_tex_mark_gpu_written(&q);                                      // q 一直在用
+    rp_tex_mark_gpu_written(&g_fake_cmd, &q);                                      // q 一直在用
     tex_t r = mk_tex(302, 0, NVN_FORMAT_RGBA8, 56, 56, 1, 0);
     CHECK(rp_tex_resolve(&r, &g_fake_cmd) != NULL);
     CHECK(rp_res_tex_built() == 2 && g_tex_releases - r0 == 1);      // p 放了（q、r 在）
@@ -1481,7 +1483,7 @@ static void t_view_storage_pixels(void) {
                 if (j == 3) vj.base_level = 1;
                 if (j == 4) { vj.base_level = 2; vj.format = 7; }
                 if (j == 2) vj.swz[1] = 3;
-                nvn_gpu_view w = rp_view_for_attach(&t, j == 5 ? NULL : &vj, &g_fake_cmd);
+                nvn_gpu_view w = rp_view_for_attach(&t, j == 5 ? NULL : &vj, &g_fake_cmd, 0);
                 CHECK(w != NULL);
                 const uint32_t val = (uint32_t)(f * 8 + j + 1);
                 struct nvn_gpu_view_s want = {0}; want.has_v = j != 5; if (j != 5) want.v = vj;
@@ -1661,7 +1663,7 @@ static void t_read_texels_gpu_owned(void) {
     CHECK(rp_tex_resolve(&k, &g_fake_cmd) != NULL);
     sent_fill(dst, sizeof dst); nvn_be_read_texels(&k, 0, 0, &one, dst, 16, 64);         // 建好、没被 GPU 写：随包，读游戏内存
     CHECK(!memcmp(dst, lin, 64) && un_cnt("read_texels") == 0);
-    rp_tex_mark_gpu_written(&k);
+    rp_tex_mark_gpu_written(&g_fake_cmd, &k);
     CHECK(nvn_be_tex_gpu_owned(52) == 1);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);   // 读回在提交之外（旁路段要拿提交锁）
     // GPU 写过：不读游戏内存里更旧的字节，读的是 GPU 的内容（替身 copy_tex_buf 写的 gpu_byte）
@@ -1683,7 +1685,7 @@ static void t_read_texels_gpu_owned(void) {
 //   读不了的（格式没有 READBACK、块没对齐、在提交里、之前的活 / 读回等不到）：一段都不开（或开了也交掉）、不动 dst、具名记账，提交锁一定放回。
 static tex_t mk_tex3d(uint64_t serial, int fmt, uint32_t w, uint32_t h, uint32_t depth, uint32_t levels);   // 定义在本文件后面
 static tex_t mk_tex_tgt(uint64_t serial, int target, int fmt, uint32_t w, uint32_t h, uint32_t depth);
-static void rt_gpu_tex(tex_t *t) { nvn_be_sub_begin(); CHECK(rp_tex_resolve(t, &g_fake_cmd) != NULL); rp_tex_mark_gpu_written(t); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); }
+static void rt_gpu_tex(tex_t *t) { nvn_be_sub_begin(); CHECK(rp_tex_resolve(t, &g_fake_cmd) != NULL); rp_tex_mark_gpu_written(&g_fake_cmd, t); nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); }
 static int rt_rows_are(const uint8_t *dst, size_t row, uint32_t layer, const NVNcopyRegion *r, uint64_t wb, uint64_t hb) {   // 每行 wb 字节是 GPU 内容
     for (uint64_t y = 0; y < hb; y++) for (uint64_t i = 0; i < wb; i++) if (dst[y * row + i] != gpu_byte(layer, 0, r->yoffset, r->xoffset, y, i)) return 0;
     return 1;
@@ -1796,7 +1798,7 @@ static void t_cpu_upload(void) {   // 存储里是 CPU 写的数据：首次使�
     g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 2);   // 游戏写过：重传
     CHECK(nvn_be_tex_gpu_owned(5) == 0);
-    rp_tex_mark_gpu_written(&t); g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    rp_tex_mark_gpu_written(&g_fake_cmd, &t); g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && rp_res_uploads() - u0 == 2);   // 内容已归 GPU：不再从游戏内存传
     CHECK(nvn_be_tex_gpu_owned(5) == 1);
     nvn_be_tex_cpu_written(&t);                                                     // 游戏又 WriteTexels 了
@@ -1984,7 +1986,7 @@ static void t_linear_upload(void) {
       CHECK(ok && g_protects == p1 && rp_res_uploads() == u1); }                    // 稳定内容：不传、不重新保护
     // 映射换底后的失效判定（全局代际 / 范围句柄）尚未接入：换底时 nvn_dirty_replace_range 会把该范围的页代际抬到旧 stamp 之后，
     // 常规换底已由 nvn_dirty_since 判脏；remove+add 路径的漏判留作后续（见 docs 对照表）。
-    rp_tex_mark_gpu_written(&t); g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
+    rp_tex_mark_gpu_written(&g_fake_cmd, &t); g_dirty_written = g_dirty_now + 1; g_dirty_now += 2;
     CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == n0 + 2);              // 内容归 GPU：不再从游戏内存传
     nvn_be_tex_release(&t);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
@@ -2074,10 +2076,13 @@ static int g_pool_creates, g_pool_releases, g_pool_binds; static nvn_gpu_pool_it
 nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *out, nvn_gpu_err *err) {
     (void)err; g_pool_creates++; g_pool_last_n = d->count; g_pool_last_kind = d->kind;
     for (uint32_t i = 0; i < d->count && i < 16; i++) g_pool_last[i] = d->items[i];
+    *out = NULL;
+    for (uint32_t i = 0; i < d->count; i++)
+        if (d->items[i].state == NVN_GPU_POOL_UNAVAILABLE) return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
     size_t nv = d->kind == NVN_GPU_POOL_IMAGE ? d->count : 0;
     *out = calloc(1, sizeof **out + nv * sizeof(nvn_gpu_view)); (*out)->kind = d->kind; (*out)->count = d->count;
     for (size_t i = 0; i < nv; i++)
-        if (d->items[i].state == NVN_GPU_POOL_READY) (*out)->views[i] = d->items[i].resource.view;
+        (*out)->views[i] = d->items[i].state == NVN_GPU_POOL_READY ? d->items[i].resource.view : d->dummy.view;
     return (nvn_gpu_rc){NVN_GPU_OK};
 }
 // 每次绑表的记录（阶段、布局项号、表指针与它的种类 / 项数）：用例把 g_pool_bind_n 清零后读
@@ -2101,7 +2106,7 @@ int nvn_gpu_pool_has_texture(nvn_gpu_pool_table t, nvn_gpu_tex tex) {
 }
 
 // 整池数组的池快照（rp_pool_table）：
-//   期望（手算）：贴图池起点 0、池长 8，号 2 登记了一张 2D 贴图、其余没登记 → 8 项全 READY（没登记的给声明类型零贴图），号 2 是它自己的视图；
+//   期望（手算）：贴图池起点 0、池长 8，号 2 登记一张 2D 贴图 → 1 项 READY、7 项 EMPTY（表创建时绑声明类型的零贴图）；
 //   同键同纪元再取：不重建（建表次数不变）；登记表一变（重登记号 5）：重建一次、旧表放掉；采样器池：登记了的 READY、没登记的 EMPTY
 static void t_pool_table(void) {
     nvn_be_sub_begin(); res_fresh(); nvn_unimpl_reset();
@@ -2112,7 +2117,8 @@ static void t_pool_table(void) {
     nvn_gpu_pool_table t1 = rp_pool_table(&g_fake_cmd, 0, 0, 8, NVN_TEXTURE_TARGET_2D + 1, 0, &why);
     CHECK(t1 && !why && g_pool_creates - c0 == 1 && g_pool_last_kind == NVN_GPU_POOL_IMAGE && g_pool_last_n == 8);
     int ready = 0; for (int i = 0; i < 8; i++) ready += g_pool_last[i].state == NVN_GPU_POOL_READY;
-    CHECK(ready == 8 && g_pool_last[2].resource.view && g_pool_last[2].resource.view->of && g_pool_last[2].resource.view != g_pool_last[3].resource.view);
+    CHECK(ready == 1 && g_pool_last[2].resource.view && g_pool_last[2].resource.view->of && g_pool_last[3].state == NVN_GPU_POOL_EMPTY);
+    CHECK(t1 && t1->views[2] && t1->views[3] && t1->views[2] != t1->views[3]);
     CHECK(rp_pool_table(&g_fake_cmd, 0, 0, 8, NVN_TEXTURE_TARGET_2D + 1, 0, &why) == t1 && g_pool_creates - c0 == 1);   // 同键同纪元：沿用
     nvn_be_reg_tex(5, &b, NULL);
     nvn_gpu_pool_table t2 = rp_pool_table(&g_fake_cmd, 0, 0, 8, NVN_TEXTURE_TARGET_2D + 1, 0, &why);
@@ -6145,8 +6151,8 @@ static void t_compute_pool(void) {
     nvn_be_sub_begin(); rp_dispatch(&g_fake_cmd, &dp, NULL);   // ① 只有贴图池项
     CHECK(g_ndisp == n + 1 && g_pool_creates - cr == 1 && g_pool_binds - pb == 1 && g_pool_bind_n == 1);
     CHECK(g_pool_bind_log[0].st == NVN_GPU_SH_CS && g_pool_bind_log[0].ent == 0 && g_pool_bind_log[0].kind == NVN_GPU_POOL_IMAGE && g_pool_bind_log[0].count == 8);
-    CHECK(g_pool_last_kind == NVN_GPU_POOL_IMAGE && g_pool_last_n == 8 && g_pool_last[2].resource.view && g_pool_last[3].resource.view &&
-          g_pool_last[2].resource.view != g_pool_last[3].resource.view);   // 贴图池按贴图池起点 0 取：号 2 是登记的那张
+    CHECK(g_pool_last_kind == NVN_GPU_POOL_IMAGE && g_pool_last_n == 8 && g_pool_last[2].state == NVN_GPU_POOL_READY &&
+          g_pool_last[2].resource.view && g_pool_last[3].state == NVN_GPU_POOL_EMPTY);   // 贴图池按贴图池起点 0 取：号 2 是登记的那张
     g_cprog.nent[0] = 2; g_pool_bind_n = 0; rp_dispatch(&g_fake_cmd, &dp, NULL);   // ② 再加采样器池项：贴图表沿用
     CHECK(g_ndisp == n + 2 && g_pool_creates - cr == 2 && g_pool_binds - pb == 3 && g_pool_bind_n == 2);
     CHECK(g_pool_bind_log[0].st == NVN_GPU_SH_CS && g_pool_bind_log[0].ent == 0 && g_pool_bind_log[0].kind == NVN_GPU_POOL_IMAGE && g_pool_bind_log[0].count == 8);

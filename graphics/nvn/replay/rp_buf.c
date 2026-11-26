@@ -948,9 +948,9 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         // 第几层 / 第几片都经 layer 交给后端（三维贴图的 layer 就是深度方向的片号；视图的起始层只对分层贴图有意义）
         uint32_t layer = (uint32_t)o->r.zoffset + z + (t->d.target == NVN_TEXTURE_TARGET_3D ? 0 : layer0);
         r.zoffset = 0;
-        nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
+        if (!nvn_gpu_ok(nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img))) return;
     }
-    rp_tex_mark_gpu_written(t);   // 这张贴图的内容从此不再从它自己的存储重传
+    rp_tex_mark_gpu_written(c, t);   // 这张贴图的内容从此不再从它自己的存储重传
 }
 
 // 贴图 → 贴图的拷贝（nvn_mtl.m copy_t2t_ @14049）。源 / 目标各按自己视图的级与起始层；同尺寸、同格式、不镜像的逐层直接拷（三维的一次拷若干片）；
@@ -983,7 +983,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             NVNcopyRegion r = {0, 0, 0, s->d.width, s->d.height, 1};
             nvn_gpu_blit(c, gv, &r, hv, &r, 0);
             rp_view_pin_end();
-            rp_tex_mark_gpu_written(d);
+            rp_tex_mark_gpu_written(c, d);
             return;
         }
         if (ss != ds || sfmt != dfmt || s->d.width != d->d.width || s->d.height != d->d.height) { nvn_unimpl("tex", ss > 1 && ds == 1 ? "t2t_multisample_resolve" : "t2t_downsample_case", rec); return; }
@@ -1023,7 +1023,7 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
             if (mirror & NVN_COPY_FLAGS_MIRROR_Y_BIT) { a.yoffset += a.height; a.height = -a.height; }
             nvn_gpu_blit(c, gv, &a, hv, &b, (o->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) != 0);
             rp_view_pin_end();
-            rp_tex_mark_gpu_written(d);
+            rp_tex_mark_gpu_written(c, d);
             return;
         }
         if (nz != dnz) { nvn_unimpl("tex", "t2t_scaled", rec); return; }
@@ -1038,5 +1038,5 @@ void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec) {
         NVNcopyRegion a = sr, b = dr; a.zoffset = b.zoffset = 0; a.depth = b.depth = 1;
         nvn_gpu_copy_tex(c, gs, sl, sz0 + (uint32_t)sr.zoffset + (uint32_t)z, &a, gd, dl, dz0 + (uint32_t)dr.zoffset + (uint32_t)z, &b);
     }
-    rp_tex_mark_gpu_written(d);   // 目标的内容从此以 GPU 为准
+    rp_tex_mark_gpu_written(c, d);   // 目标的内容从此以 GPU 为准
 }

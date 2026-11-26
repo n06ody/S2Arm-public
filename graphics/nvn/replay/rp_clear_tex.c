@@ -59,7 +59,8 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
     for (int32_t z = 0; z < nz; z++) {
         view_t v = {0}; v.set_levels = 1; v.base_level = (uint8_t)lv; v.nlevels = 1;
         v.set_layers = 1; v.min_layer = (uint16_t)(l0 + (uint32_t)o->r.zoffset + (uint32_t)z); v.nlayers = 1;
-        rp_view_pin_begin(); nvn_gpu_view gpu = rp_view_for(t, &v, c);
+        rp_view_pin_begin();
+        nvn_gpu_view gpu = whole ? rp_view_for_attach(t, &v, c, 1) : rp_view_for(t, &v, c);
         if (!gpu) { rp_view_pin_end(); return; }
         if (whole) nvn_gpu_clear_view(c, gpu, cl.value.f, cl.value.u, is_int);
         else {
@@ -67,6 +68,6 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
             d.color[0].view = gpu; d.color[0].load = NVN_GPU_LOAD_LOAD; d.color[0].store = NVN_GPU_STORE_STORE;
             nvn_gpu_pass_begin(c, &d); nvn_gpu_clear_rect(c, &cl); nvn_gpu_pass_end(c); rp_dirty_all();
         }
-        rp_view_pin_end(); rp_tex_mark_gpu_written(t);
+        rp_view_pin_end(); rp_tex_mark_gpu_written(c, t);
     }
 }

@@ -250,9 +250,10 @@ nvn_gpu_tex nvn_gpu_view_texture(nvn_gpu_view v);
 // 采样器：samp_par 原样。归约 / LOD 偏置不原生时照建一个不带它们的采样器——模拟在核心选的 _se 变体里（能力位已如实报），去重缓存在核心。
 nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err);
 void nvn_gpu_samp_release(nvn_gpu_samp s);
-// 线性内容上传（解排布 / 解压已由核心做完）：在本 cmd 的 GPU 顺序里生效，src 调用返回后即可释放。线程：[提交]，通道外。出错：粘滞 ORDER / ARG。
-void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
-                        const void *src, uint64_t row_bytes, uint64_t image_bytes);
+// 线性内容上传（解排布 / 解压已由核心做完）：返回录制结果，成功写入本 cmd 的 GPU 顺序，src 返回后即可释放。
+// 线程：[提交]，通道外。失败保留本段的粘滞首错。
+nvn_gpu_rc nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
+                             const void *src, uint64_t row_bytes, uint64_t image_bytes);
 // 块线性原始字节上传，由后端在 GPU 上解排布（要 CAP_GPU_DESWIZZLE）；L 为 NVN 排布（nvn_tex_layout 的结果）。
 // 返回 NVN_GPU_OK：本张贴图已进 GPU（含后端内部 CPU 回退）；非 0：本张贴图没传（布局 / 几何 / 越界校验或暂存分配失败，
 //   后端日志带原因，不粘滞命令缓冲），调用方应照原样走 CPU 上传路径；顺序违规仍粘滞（契约 bug）。
@@ -356,6 +357,17 @@ typedef struct { uint32_t occlusion_slots; const char *label; } nvn_gpu_cmd_desc
 nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gpu_err *err);
 // 丢弃一段未提交的命令（Stop / OOM / 核心放弃本次提交）：不执行、不调 done、不推进时间线；它对句柄的引用（总则 ①）随即解除。线程：[提交]。
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c);
+
+// An intrusive record owned by the caller until attached, then delivered once
+// before done or when the recording is abandoned. The callback may free it.
+// Register and query on the recording thread. No GPU or wait calls in retire.
+typedef struct nvn_gpu_cmd_effect {
+    struct nvn_gpu_cmd_effect *next;
+    void (*retire)(struct nvn_gpu_cmd_effect *effect, int completed);
+} nvn_gpu_cmd_effect;
+void nvn_gpu_cmd_attach_effect(nvn_gpu_cmd c, nvn_gpu_cmd_effect *effect);
+int nvn_gpu_cmd_record_ok(nvn_gpu_cmd c);
+void nvn_gpu_cmd_record_oom(nvn_gpu_cmd c, const char *what);
 
 enum { NVN_GPU_LOAD_LOAD = 0, NVN_GPU_LOAD_CLEAR = 1, NVN_GPU_LOAD_DONTCARE = 2 };
 enum { NVN_GPU_STORE_STORE = 0, NVN_GPU_STORE_DONTCARE = 1, NVN_GPU_STORE_RESOLVE = 2, NVN_GPU_STORE_STORE_RESOLVE = 3 };

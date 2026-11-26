@@ -468,7 +468,7 @@ static void submit_pre(nvn_gpu_err *err) {
     nvn_gpu_cmd pc = g_pre;
     g_pre = NULL;
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), err))) {
-        rp_res_xfer_aborted(g_sub_serial);
+        if (!nvn_gpu_cmd_attach_effect) rp_res_xfer_aborted(g_sub_serial);
         red("前置段提交失败：%s", err->why);
     }
 }
@@ -508,7 +508,7 @@ static uint64_t sub_commit_body(void) {
         if (g_pre) {
             nvn_gpu_cmd_abort(g_pre);
             g_pre = NULL;
-            rp_res_xfer_aborted(g_sub_serial);
+            if (!nvn_gpu_cmd_attach_effect) rp_res_xfer_aborted(g_sub_serial);
         }
         // 时间线照样往前走一格：这次提交里的同步对象已经按 g_fence + SUB_STEP 发布（OP_FENCE_SYNC），中途交出去的段也已经用掉了这一格里的中间值。
         // 不走的话，下一次提交会把同一批值再用一遍（后端要求严格递增）。

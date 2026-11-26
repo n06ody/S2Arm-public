@@ -16,9 +16,13 @@ nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c) {
     if (out && g_nviews < 8) g_views[g_nviews++] = out;
     return out;
 }
+nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c, int whole_clear) {
+    (void)whole_clear;
+    return rp_view_for(t, v, c);
+}
 void rp_view_pin_begin(void) {}
 void rp_view_pin_end(void) {}
-void rp_tex_mark_gpu_written(const tex_t *t) { (void)t; g_writes++; }
+void rp_tex_mark_gpu_written(nvn_gpu_cmd c, const tex_t *t) { (void)c; (void)t; g_writes++; }
 void rp_dirty_all(void) {}
 uint64_t nvn_unimpl_count(const char *cls, const char *name) { (void)cls; (void)name; return 0; }
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) {

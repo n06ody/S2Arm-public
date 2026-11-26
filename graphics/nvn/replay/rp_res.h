@@ -6,6 +6,12 @@
 #include "nvn_backend.h"
 #include <string.h>
 
+// The legacy host-only replay fixtures have no physical Vulkan command segment.
+#pragma weak nvn_gpu_cmd_attach_effect
+#pragma weak nvn_gpu_cmd_record_ok
+#pragma weak nvn_gpu_cmd_record_oom
+static inline int rp_cmd_record_ok(nvn_gpu_cmd c) { return c && (!nvn_gpu_cmd_record_ok || nvn_gpu_cmd_record_ok(c)); }
+
 // 贴图对象 → 后端贴图。首次使用时建；内容来自游戏内存的，在 c 这一段里上传 / 脏了重传。NULL = 取不到（已经 nvn_unimpl 记账）。线程：[提交]。
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
 // 拷贝端点必须保留源格式语义，调用方已结束通道。
@@ -95,10 +101,10 @@ uint64_t rp_ubo_zero_count(void);          // 常量缓冲句柄指向没登记�
 nvn_gpu_view rp_view_for(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
 nvn_gpu_view rp_view_for_plain(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
 // 当颜色附件取视图。刚建、初始内容该是全零的单级单层颜色图：不在 CPU 上填零，记成「待清零」，
-// 由调用方在开通道前用 rp_tex_take_zero 取走并把这个附件的载入方式改成清零（显卡做，CPU 不搬一整张零）。
+// 调用方用 rp_tex_pending_zero 检查并安排清零；成功录制通道后随 GPU 写一并消费。
 // 没被取走的待清零，下一次任何别的用途取它时照旧填零。
-nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
-int rp_tex_take_zero(const tex_t *t);   // 1 = 这张图待清零，已取走：调用方必须让它在这个通道里整张清成零
+nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c, int whole_clear);
+int rp_tex_pending_zero(const tex_t *t);
 // 上屏用的默认视图：不经可淘汰的视图缓存（上屏线程与提交线程共用一份环会互相淘汰；
 // iOS 的 present 直接拿贴图对象，没有这层缓存）。调用方用完即 release，后端段按引用保活。
 nvn_gpu_view rp_present_view(const tex_t *t);
@@ -127,7 +133,7 @@ nvn_gpu_samp rp_sampler_for_query(void);
 // 整池数组（NVN_RB_TEXP / SAMPP）的池快照：按键缓存、登记纪元变了才重建；NULL = 建不出，*why 是具名跳过的原因。线程：[提交]，开通道前
 nvn_gpu_pool_table rp_pool_table(nvn_gpu_cmd c, int samp, int base, uint32_t n, uint8_t dtt, uint8_t dcls, const char **why);
 // 这张贴图的内容从此以 GPU 为准（当了渲染目标 / 被拷贝写 / 被着色器写）：不再从游戏内存重传。
-void rp_tex_mark_gpu_written(const tex_t *t);
+void rp_tex_mark_gpu_written(nvn_gpu_cmd c, const tex_t *t);
 // 只读查询：这个序号被前端标过「CPU 写过」（nvn_be_tex_cpu_written：WriteTexels、刷新范围盖到、导出等）。同步读回判内容在不在游戏内存里用。线程：任意。
 int rp_tex_cpu_written(uint64_t serial);
 // 调试：序号 → 后端贴图（没建过 = NULL）。

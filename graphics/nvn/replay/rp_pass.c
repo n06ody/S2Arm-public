@@ -530,9 +530,10 @@ static void pass_land_full(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, int color,
         one.clear_depth = d->clear_depth; one.clear_stencil = d->clear_stencil;
     }
     nvn_gpu_pass_begin(c, &one);
+    if (!rp_cmd_record_ok(c)) return;
     nvn_gpu_pass_end(c);
     rp_perf_add(RP_PERF_PASSES, 1);
-    rp_tex_mark_gpu_written(t);
+    rp_tex_mark_gpu_written(c, t);
     if (rp_pass_fu_enabled()) s2a_fu_rt_mark_fresh(t->serial, rp_frame());
     if (color >= 0) d->color[color].load = NVN_GPU_LOAD_LOAD;
     else { d->depth.load = NVN_GPU_LOAD_LOAD; d->stencil.load = NVN_GPU_LOAD_LOAD; }
@@ -626,7 +627,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     layered = layered != 0;
     if (P.open && P.colors == colors && P.layered == layered) return 1;
     if (P.open) rp_pass_end(c);
-    if (!c || !P.has_rt) { if (c) nvn_unimpl("pass", "draw_without_target", NULL); return 0; }
+    if (!rp_cmd_record_ok(c)) return 0;
+    if (!P.has_rt) { nvn_unimpl("pass", "draw_without_target", NULL); return 0; }
     P.colors = colors;
     int any_color = 0; for (int i = 0; i < P.rt.n && i < 8; i++) if (P.rt.color[i]) any_color = 1;
     if (P.rt.n < 0 || P.rt.n > 8) { nvn_unimpl("pass", "no_attachment", NULL); return 0; }
@@ -636,6 +638,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     uint64_t pb_ = tm_ ? pb_now() : 0;   // 四段计时：取附件视图 / 屏障 / 后端开通道 / 记 GPU 写过
     nvn_gpu_pass_desc d; memset(&d, 0, sizeof d);
     uint32_t cw[8] = {0}, ch[8] = {0}, dw = 0, dh = 0;
+    const int diag_load = nvn_plat_flag("nvk_diag_load_dontcare", 0);
+    const int diag_store = nvn_plat_flag("nvk_diag_store_dontcare", 0);
     int nattached = 0;
     int taken[9], ntake = 0;   // 这个通道吃掉的挂起项（开通道成功后才移出表：开不了要留着下次落地）
     // 分层通道的层数：各附件从挂接层起能给的层数取最小（iOS nvn_mtl.m 同取法）；影子附件（块压缩 / 深度当颜色）只有一层。
@@ -661,7 +665,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
         int pk = park_color(i);   // 这个槽挂着待折清除：载入时清成挂起值
         view_t av;
         uint64_t sh0_ = kind ? pb_now() : 0;
-        nvn_gpu_view v = kind ? shadow_attach(c, i, t, sbytes, pk >= 0) : rp_view_for_attach(t, att_view_n(t, P.rt.has_cview[i], &P.rt.cview[i], &av, lay_n), c);
+        nvn_gpu_view v = kind ? shadow_attach(c, i, t, sbytes, pk >= 0) :
+            rp_view_for_attach(t, att_view_n(t, P.rt.has_cview[i], &P.rt.cview[i], &av, lay_n), c, pk >= 0 && !diag_load && !diag_store);
         if (kind) { rp_perf_add(RP_PERF_PB_SHADOW, pb_now() - sh0_); rp_perf_add(RP_PERF_P_SHADOW, 1); }   // 影子附件（深度/块压缩图经颜色视图当目标）：拷贝通道是我们加的，单独计数
         if (!v) { memset(g_shu, 0, sizeof g_shu); rp_view_pin_end(); return 0; }
         nattached++;
@@ -705,9 +710,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     for (int i = 0; i < P.rt.n && i < 8; i++)
         color_loads += d.color[i].view && d.color[i].load == NVN_GPU_LOAD_LOAD;
     for (int i = 0; i < P.rt.n && i < 8; i++)   // 刚建、该是全零的目标：不在 CPU 上搬一整张零，这个通道载入时清成零（已有整屏清除的照它的值清）
-        if (d.color[i].view && rp_tex_take_zero(P.rt.color[i]) && d.color[i].load != NVN_GPU_LOAD_CLEAR) { d.color[i].load = NVN_GPU_LOAD_CLEAR; memset(&d.color[i].clear, 0, sizeof d.color[i].clear); }
-    const int diag_load = nvn_plat_flag("nvk_diag_load_dontcare", 0);
-    const int diag_store = nvn_plat_flag("nvk_diag_store_dontcare", 0);
+        if (d.color[i].view && rp_tex_pending_zero(P.rt.color[i]) && d.color[i].load != NVN_GPU_LOAD_CLEAR) { d.color[i].load = NVN_GPU_LOAD_CLEAR; memset(&d.color[i].clear, 0, sizeof d.color[i].clear); }
     const int trimmed = clear_only && !diag_load && !diag_store &&
         nvn_plat_flag("nvk_clear_only_attachments", 0) && trim_park_clear(&d, cw, ch, dw, dh);
     P.has_ds = d.depth.view || d.stencil.view; P.ds_used = pcd || pcs; P.ndraw = 0; P.sw_pend = P.sw_split = 0;
@@ -745,6 +748,7 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     }
     P.pass_w = d.w; P.pass_h = d.h;
     nvn_gpu_pass_begin(c, &d);
+    if (!rp_cmd_record_ok(c)) { memset(g_shu, 0, sizeof g_shu); rp_view_pin_end(); return 0; }
     // 大附件已单独落地；剩下的 CLEAR 尺寸等于公共范围，开通道后才可标 fresh。
     if (rp_pass_fu_enabled()) {
         uint64_t ff = rp_frame();
@@ -760,8 +764,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
     rp_view_pin_end();
     rp_occl_pass_opened(d.occlusion);
     rp_perf_add(RP_PERF_PASSES, 1);
-    for (int i = 0; i < P.rt.n; i++) if (d.color[i].view) rp_tex_mark_gpu_written(P.rt.color[i]);
-    if (P.rt.depth && (!trimmed || P.has_ds)) rp_tex_mark_gpu_written(P.rt.depth);
+    for (int i = 0; i < P.rt.n; i++) if (d.color[i].view) rp_tex_mark_gpu_written(c, P.rt.color[i]);
+    if (P.rt.depth && (!trimmed || P.has_ds)) rp_tex_mark_gpu_written(c, P.rt.depth);
     PB(RP_PERF_PB_MARK);
     for (int k = 0; k < ntake; k++) g_pk[taken[k]].used = 0;   // 开通道成功了：吃掉的挂起项移出表
     if (pdpk >= 0) g_pk[pdpk].used = 0;

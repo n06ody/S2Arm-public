@@ -88,14 +88,14 @@ nvn_gpu_samp rp_sampler_for_query(void) { return NULL; }
 uint32_t rp_fmt_caps(uint32_t f) { return nvn_gpu_format_caps(f); }
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){(void)i;(void)t;(void)v;(void)h;return 0;}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
-void rp_tex_mark_gpu_written(const tex_t *t){(void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
+void rp_tex_mark_gpu_written(nvn_gpu_cmd c, const tex_t *t) { (void)c; (void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){for(int i=0;i<3;i++)if(textures[i].serial==s)return images[i];return NULL;}
 int rp_tex_is_read(const tex_t *t,const rp_pass_read *reads,int n){(void)t;(void)reads;(void)n;REQUIRE(0);return 0;} // 此夹具没有采样或图像绑定。
 int rp_tex_storage_aliases(const tex_t *a,const tex_t *b){(void)a;(void)b;return 0;}
 nvn_gpu_tex rp_tex_resolve(const tex_t *t,nvn_gpu_cmd c){(void)c;REQUIRE(t);nvn_gpu_tex g=rp_tex_backend_by_serial(t->serial);REQUIRE(g);return g;}
 nvn_gpu_view rp_view_for(const tex_t *t,const view_t *v,nvn_gpu_cmd c){(void)c;REQUIRE(t && !v);for(int i=0;i<3;i++)if(textures[i].serial==t->serial)return views[i];REQUIRE(0);return NULL;}
-nvn_gpu_view rp_view_for_attach(const tex_t *t,const view_t *v,nvn_gpu_cmd c){return rp_view_for(t,v,c);}
-int rp_tex_take_zero(const tex_t *t){(void)t;return 0;}
+nvn_gpu_view rp_view_for_attach(const tex_t *t,const view_t *v,nvn_gpu_cmd c,int whole_clear){(void)whole_clear;return rp_view_for(t,v,c);}
+int rp_tex_pending_zero(const tex_t *t){(void)t;return 0;}
 int nvn_dirty_log_open(const void *s, uint64_t *i, uint64_t *c) { (void)s; (void)i; (void)c; return 0; }   // 本夹具没有脏页追加日志：回放核心走原路径
 int nvn_dirty_log_read(const void *s, uint64_t i, uint64_t *c, void (*f)(void *, uintptr_t, uintptr_t), void *u) { (void)s; (void)i; (void)c; (void)f; (void)u; return 0; }
 int nvn_dirty_page_armed(const void *s, const void *a) { (void)s; (void)a; return 0; }
