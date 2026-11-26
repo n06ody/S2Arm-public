@@ -1205,6 +1205,8 @@ static nvn_gpu_view decl_zero(uint8_t dtt, uint8_t dcls, nvn_gpu_cmd c) {
         if (nvn_unimpl("tex", "decl_zero_view", NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "tex", err.why);
         return NULL;
     }
+    extern void nvn_vk_roi_mark_zero(nvn_gpu_view) __attribute__((weak));
+    if (nvn_vk_roi_mark_zero) nvn_vk_roi_mark_zero(view);
     g_zero[want][dcls].tex = tex; g_zero[want][dcls].view = view;
     return view;
 }

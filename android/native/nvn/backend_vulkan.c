@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -149,6 +150,7 @@ struct nvn_gpu_tex_s {
 };
 
 struct nvn_gpu_view_s {
+    uint8_t roi_zero;
     VkImageView view;
     struct nvn_gpu_tex_s *tex;
     VkBufferView buffer_view;
@@ -312,6 +314,7 @@ struct feedback_copy {
 enum { LOSS_PROGRAMS_PER_SEGMENT = 16 };
 
 struct nvn_gpu_cmd_s {
+    struct roi_cmd *roi;
     struct vk_segment segment; // reserve before recording: commit cannot lose done to allocation failure
     int land_mode, land_observe, land_tracked, land_epoch;
     uint32_t land_eligible, land_direct;
@@ -540,6 +543,19 @@ static void pipe_creation_open(const struct s2a_vk_device *dev) {
 }
 
 static struct nvn_gpu_vk g;
+static int roi_target, roi_x, roi_y;
+static _Atomic unsigned roi_next, roi_pass;
+#if defined(__ANDROID__) && !defined(S2A_ANDROID_DEBUG_ENV)
+#define ROI_CONFIGURED 0
+#define ROI_ACTIVE(c) 0
+#else
+#define ROI_CONFIGURED (roi_target > 0)
+#define ROI_ACTIVE(c) ((c)->roi != NULL)
+#endif
+// Private replay diagnostic hook; the portable GPU contract is unchanged.
+void nvn_vk_roi_mark_zero(nvn_gpu_view v) { if (ROI_CONFIGURED && v) v->roi_zero=1; }
+static void roi_report(nvn_gpu_cmd c, int ok, uint64_t signal);
+static void roi_dispose(nvn_gpu_cmd c);
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
@@ -1867,6 +1883,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     // 放弃的段（abort / 带粘滞错误不提交）没走过 vkEndCommandBuffer 的清空：两级回放队列里可能还有它的记录（往上传片里填、引用它的暂存缓冲 / 管线），
     // 先整队清空再归还 / 销毁下面这些资源。执行过的段已经过了 GPU 完成，记录早就做完了
     if (!executed) vk_dq_drain();
+    if (ROI_ACTIVE(c)) roi_dispose(c);
     if (c->bc_first_time) bc_time_finish(c, 0);
     prs_release(c, executed);   // 回收的整池组：先把反馈补丁写回正典再放回（要在下面销毁快照视图、归还表引用之前：补丁的正典内容引用着表里的视图）
     // 布局按段跟踪（c->lay）：段不执行时命令缓冲里什么都没跑，没有要回滚的；t->layout 只做诊断。
@@ -2096,6 +2113,7 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
         }
     }
 
+    if (s->cmd && ROI_ACTIVE(s->cmd)) roi_report(s->cmd,!failed,s->signal);
     if (s->internal) {   // 呈现段：没有回调、不动时间线
         if (nvn_vk_frame_log_gpu_frame_end) nvn_vk_frame_log_gpu_frame_end();   // 本帧各段都排在上屏段之前完成：在这里结一帧
         if (s2a_adpf_gpu_frame_end) s2a_adpf_gpu_frame_end();
@@ -2494,6 +2512,13 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
 
     memset(&g, 0, sizeof g);
     g.dev = dev;
+    roi_target = nvn_plat_flag("nvk_roi_probe",0)==1 ? nvn_plat_flag("nvk_roi_frame",0) : 0;
+    if (ROI_CONFIGURED) {
+        roi_x=nvn_plat_flag("nvk_roi_x",-1); roi_y=nvn_plat_flag("nvk_roi_y",-1);
+        if (roi_x<0 || roi_y<0) { nvn_plat_log(NVN_PLAT_LOG_RED,"roi","event=gap reason=invalid_coordinates"); roi_target=0; }
+        atomic_store(&roi_next,1);
+        atomic_store(&roi_pass,0);
+    }
     pipe_creation_open(dev);
     const int land_setting = nvn_plat_flag("nvk_land_readback", 0);
     g.land_auto = land_setting == 2;
@@ -4015,7 +4040,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
                 }
             }
         }
-        if (g.cold_enabled && !s->precompiled && s->stage == NVN_GPU_SH_FS) {
+        if ((g.cold_enabled || ROI_CONFIGURED) && !s->precompiled && s->stage == NVN_GPU_SH_FS) {
             s2a_sha256 hash;
             s2a_sha256_init(&hash);
             s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
@@ -5800,10 +5825,12 @@ static void pass_flush_pending(struct nvn_gpu_cmd_s *c) {
     }
 }
 
-static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uint32_t nfx) {
+#include "backend_vulkan_roi.inc"
+
+static int pass_reopen_at(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uint32_t nfx,const char *site) {
     if (!c->in_pass || c->q_active >= 0) return 0;   // 查询不能跨通道；声明了 occlusion 的通道从开头就用整区
     nvn_gpu_pass_desc d = c->pass_desc;
-    d.area_w = d.area_h = 0;
+    if (!site) d.area_w = d.area_h = 0;
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) { d.color[i].load = NVN_GPU_LOAD_LOAD; d.color[i].store = NVN_GPU_STORE_STORE; }
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
     if (d.stencil.view) { d.stencil.load = NVN_GPU_LOAD_LOAD; d.stencil.store = NVN_GPU_STORE_STORE; }
@@ -5812,6 +5839,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     c->in_pass = 0;
     c->pass_occl = 0;
     pass_read_sync(c);
+    if (ROI_ACTIVE(c)) roi_attachments(c,site ? site : "reopen");
     VkImageView fb_views[9];
     VkAttachmentDescription att[9];
     VkAttachmentReference col[8];
@@ -5855,11 +5883,21 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     vkCmdBeginRenderPass(c->cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     c->in_pass = 1;   // 通道的其它状态（尺寸 / 格式 / 颜色槽 / 层数）与原来一致，不重设
     c->pass_occl = d.occlusion;
-    c->pass_desc.area_w = c->pass_desc.area_h = 0;
+    if (!site) c->pass_desc.area_w = c->pass_desc.area_h = 0;
+    if (ROI_ACTIVE(c)) roi_physical(c,&d,att,bi.renderArea);
     c->pass_natt = natt;
     for (uint32_t i = 0; i < natt; i++) c->pass_tex[i] = att_tex[i];
     if (!pass_rec_add(c, g_pc_use ? VK_NULL_HANDLE : pass, fb_cached ? VK_NULL_HANDLE : fb)) { set_sticky(c, NVN_GPU_E_OOM, "通道列表分配失败"); return 0; }
     return 1;
+}
+
+static int pass_reopen(nvn_gpu_cmd c,const struct reopen_fix *fx,uint32_t nfx) {
+    return pass_reopen_at(c,fx,nfx,NULL);
+}
+static void roi_after_clear(nvn_gpu_cmd c) {
+    if (roi_can_split(c)) {
+        if (!pass_reopen_at(c,NULL,0,"clear")) roi_gap(c,"clear_reopen");
+    } else roi_gap(c,"clear_split_not_preservable");
 }
 
 // 用真实 VkScissor 或清除矩形作最后一道检查。回放前端可能比实际对齐后的区域更保守；
@@ -6003,6 +6041,17 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     PBP_STEP(4);
     pass_prof(-1, 0);
     if (!pass_rec_add(c, g_pc_use ? VK_NULL_HANDLE : pass, fb_cached ? VK_NULL_HANDLE : fb)) { set_sticky(c, NVN_GPU_E_OOM, "通道列表分配失败"); return; }
+    if (ROI_ACTIVE(c)) {
+        c->roi->pass=atomic_fetch_add(&roi_pass,1)+1;
+        c->roi->draws=0;
+        roi_physical(c,d,att,bi.renderArea);
+        for (unsigned i=0;i<natt;i++) {
+            if (att[i].loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR || att[i].stencilLoadOp==VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                roi_after_clear(c);
+                break;
+            }
+        }
+    }
 #undef PBP_STEP
 }
 
@@ -6016,6 +6065,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     c->in_pass = 0;
     c->pass_natt = 0;
     pass_read_sync(c);
+    if (ROI_ACTIVE(c)) roi_attachments(c,"pass_end");
     c->feedback_read_mask = 0;
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     // 附件在通道里用的布局由 make_pass 定（缺省全程 GENERAL，开 nvk_opt_layout 时用附件专用布局），通道内不迁移：
@@ -6768,6 +6818,34 @@ static inline int diag_draw_mode(void) {
     if (__builtin_expect(dm != 1, 1)) { call; if (__builtin_expect(dm == 2, 0)) { call; } } \
 } while (0)
 
+static void roi_draw(nvn_gpu_cmd c,nvn_gpu_pipe p) {
+    unsigned draw=++c->roi->draws;
+    const nvn_gpu_shader fs=p->key.st[NVN_GPU_SH_FS].sh;
+    char module[65]="none";
+    if (fs) for (unsigned i=0;i<32;i++) snprintf(module+2*i,3,"%02x",fs->spirv_digest[i]);
+    roi_message("event=draw frame=%d pass=%u draw=%u pipeline=%u fs=%s depthTest=%u depthWrite=%u depthCompareOp=%d depthClamp=%u depthClip=%u negativeOneToOne=%u",
+                roi_target,c->roi->pass,draw,p->hash,module,p->key.dfmt && p->key.ds.dt,p->key.dfmt && p->key.ds.dw,p->key.dfmt?vk_depth_func(p->key.ds.df):VK_COMPARE_OP_NEVER,
+                p->key.depth_clamp,!p->key.depth_clamp,p->key.clip_neg1);
+    for (unsigned st=0;st<5;st++) {
+        for (unsigned i=0;i<c->nbinds[st];i++) {
+            const nvn_gpu_binding *b=&c->binds[st][i].b;
+            nvn_gpu_view v=b->cls==NVN_GPU_RES_TEX?b->u.view:b->cls==NVN_GPU_RES_TEX_SAMP?b->u.ts.view:NULL;
+            if(!v || !v->tex || b->ent>=p->stage_nent[st]) continue;
+            const nvn_gpu_layout_ent *e=&p->stage_ents[st][b->ent];
+            if (b->ent<64 && c->pool_binds[st][b->ent]) continue;
+            nvn_gpu_tex sampled=v->tex;
+            VkImageView effective=feedback_view(c,v);
+            if (effective!=v->view) for(struct feedback_copy *f=c->feedback; f!=c->feedback_stop; f=f->next)
+                if (f->source==v) { sampled=f->snap; break; }
+            roi_message("event=binding frame=%d pass=%u draw=%u stage=%u set=%u binding=%u elem=%u image=%llu view=%llu type=%d format=%d mip=%u+%u layer=%u+%u zero=%u feedback=%d",
+                        roi_target,c->roi->pass,draw,st,e->set,e->binding,b->elem,(unsigned long long)access_id(&sampled->access_id),
+                        (unsigned long long)(uintptr_t)effective,v->type,v->format,v->base_level,v->levels,v->base_layer,v->layers,v->roi_zero,effective!=v->view);
+        }
+        for(unsigned ent=0;ent<p->stage_nent[st] && ent<64;ent++) if(c->pool_binds[st][ent])
+            roi_message("event=pool frame=%d pass=%u draw=%u stage=%u entry=%u count=%u selection=dynamic",
+                        roi_target,c->roi->pass,draw,st,ent,c->pool_binds[st][ent]->count);
+    }
+}
 void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     draw_tm_init();   // 诊断：这笔绘制各段用时（nvk_gputime 开着才计）
     const int dtm = g_draw_tm; const uint64_t dt0 = dtm ? now_ns() : 0;
@@ -6960,7 +7038,10 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     } else {
         DIAG_DRAW(vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance));
     }
-    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) loss_note_program(c, p);
+    if (dm != 1 && (a->ind ? !a->cnt || a->max_draws : a->count)) {
+        loss_note_program(c,p);
+        if (ROI_ACTIVE(c)) roi_draw(c,p);
+    }
     if (dtm) { const uint64_t dt3 = now_ns(); __atomic_fetch_add(&g_draw_ns[0], dt1 - dt0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[1], dt2 - dt1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_draw_ns[2], dt3 - dt2, __ATOMIC_RELAXED);
         // 每 5 秒一次：把后端逐笔的三段（描述符 / 状态 / 顶点索引与绘制调用）摊到每笔上打印，
         // 找到后端这笔 5 微秒里到底是谁（真机读数见坑记录续 27）。
@@ -8179,6 +8260,17 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
         }
         vkCmdClearColorImage(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1, &range);
     }
+    if (ROI_ACTIVE(c) && (v->aspect & (VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT))) {
+        unsigned saved=c->roi->pass;
+        c->roi->pass=atomic_fetch_add(&roi_pass,1)+1;
+        c->roi->draws=0;
+        for (uint32_t mip=range.baseMipLevel; mip<range.baseMipLevel+range.levelCount; mip++) {
+            uint32_t n=range.layerCount;
+            if (t->target==NVN_TEXTURE_TARGET_3D) { n=t->depth>>mip; if(!n) n=1; }
+            for(uint32_t l=0;l<n;l++) roi_pixel(c,"clear_view",v,0,ds_img,mip,range.baseArrayLayer+l);
+        }
+        c->roi->pass=saved;
+    }
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     cmd_ref(c, t, REF_TEX);
 }
@@ -8614,6 +8706,7 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     if (!pass_ensure_area(c, (VkRect2D){{d->x, d->y}, {d->w, d->h}})) return;
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);
+    if (ROI_ACTIVE(c) && nvn_gpu_ok(c->sticky)) roi_after_clear(c);
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 内部清除改绑状态：下一笔全部重建
 }
 
@@ -8905,6 +8998,10 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
     c->live_next = g.live;
     g.live = c;
     pthread_mutex_unlock(&g_mu);
+    if (ROI_CONFIGURED && atomic_load(&roi_next)==(unsigned)roi_target) {
+        c->roi=calloc(1,sizeof *c->roi);
+        if (!c->roi) nvn_plat_log(NVN_PLAT_LOG_RED,"roi","event=gap reason=segment_allocation");
+    }
     *out = c;
     return rc(NVN_GPU_OK);
 }
@@ -8926,6 +9023,11 @@ void nvn_gpu_cmd_abort(nvn_gpu_cmd ch) {
 }
 
 static void enqueue_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
+    if (ROI_CONFIGURED && s->cmd) {
+        uint64_t frame=s->internal?s->wsi_seq:vk->wsi_seq+1;
+        if (ROI_ACTIVE(s->cmd) && frame!=(unsigned)roi_target) s->cmd->roi->invalid=1;
+        if (!ROI_ACTIVE(s->cmd) && frame==(unsigned)roi_target) nvn_plat_log(NVN_PLAT_LOG_RED,"roi","event=gap reason=segment_started_before_boundary");
+    }
     pthread_mutex_lock(&g_mu);
     if (atomic_load(&vk->submitting) == s) atomic_store(&vk->submitting, NULL);
     if (vk->qtail) vk->qtail->next = s;

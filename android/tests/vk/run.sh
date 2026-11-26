@@ -369,7 +369,7 @@ case "$mode" in
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
     --pipe-call-lifetime) cflags+=(-DS2A_BACKEND_PIPE_CALL_TEST=1) ;;
-    ""|--pipe-creation-feedback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--pipe-creation-feedback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--roi-probe|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -543,6 +543,12 @@ pc_wrap=(-Wl,--wrap=vkCreatePipelineCache -Wl,--wrap=vkGetPipelineCacheData
          -Wl,--wrap=vkCreateGraphicsPipelines -Wl,--wrap=vkCreateComputePipelines)
 case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) pc_wrap=() ;; esac
 # t_backend_vk.c 也被多个独立夹具直接包含。枚举替身定义与链接参数只在运行三形态时成对加入。
+if [ "$mode" = "--roi-probe" ]; then
+    cflags+=(-DS2A_ROI_FIXTURE=1 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections)
+    inc=(-I "$repo/build/c883-ndk" "${inc[@]}")
+    pc_wrap+=(-Wl,--wrap=vkGetDeviceProcAddr -Wl,--wrap=vkUpdateDescriptorSets)
+    src+=("$repo/graphics/nvn/replay/rp_res.c" "$repo/graphics/nvn/replay/rp_state.c" "$repo/graphics/nvn/gfx/nvn/nvn_dirty.c")
+fi
 case "$mode" in
     ""|--pipe-creation-feedback*) cflags+=(-DS2A_PIPE_CREATION_FEEDBACK_TEST=1); pc_wrap+=(-Wl,--wrap=vkEnumerateDeviceExtensionProperties) ;;
 esac
@@ -624,6 +630,23 @@ if [ "$mode" = "--cmdpool-only" ] || [ "$mode" = "--cmdpool-neg" ]; then
     done
     [ "$bad" -eq 0 ] || exit 1
     echo "【绿】C1581 $mode DQ 开/关，validation 0 条"; exit 0
+fi
+
+if [ "$mode" = "--roi-probe" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        for arm in 0 1; do
+            log="$out/roi-dq$dq-$arm.log"
+            timeout 120 "$out/t_backend_vk" --roi-probe "$arm" "$out/shaders" > "$log" 2>&1 || { tail -40 "$log"; exit 1; }
+            if grep -Eq 'Validation Error|VUID-|SYNC-HAZARD' "$log"; then
+                grep -E 'Validation Error|VUID-|SYNC-HAZARD' "$log" | head -12
+                exit 1
+            fi
+            grep -E 'ROI oracle|ROI Vulkan 1x1 copies' "$log"
+        done
+        python3 "$repo/android/tests/vk/check_roi_probe.py" "$out/roi-dq$dq-0.log" "$out/roi-dq$dq-1.log"
+    done
+    exit
 fi
 
 # 上屏 EASU 开/关夹具（--present-upscale）：独立进程跑一次，避开 surface 单例与 C71 的提交信号序列。
