@@ -10214,6 +10214,7 @@ static void c205_fields(const nvn_gpu_pipe_desc *base) {
             C205_MUTB(b_.st[i].nspec = NVN_GPU_SPEC_MAX, ((uint8_t *)m_.st[i].spec)[k] ^= 1, nm);
         }
     C205_MUT(m_.prim ^= 1, "prim");
+    C205_MUT(m_.extended_dynamic = 1, "extended_dynamic");
     C205_MUT(m_.patch_size ^= 1, "patch_size");
     C205_MUT(m_.dfmt ^= 1, "dfmt");
     C205_MUT(m_.sfmt ^= 1, "sfmt");
@@ -10295,7 +10296,7 @@ static void c205_pipe_ht(const char *dir) {
         uint32_t rs = 0x2051u; int viol = 0, fixture = 0;
         for (int it = 0; it < 4000; it++) {
             nvn_gpu_pipe_desc a, b; c205_rand_desc(&a, &rs); b = a;
-            b.prim_restart = a.prim_restart ? (uint8_t)(1 + c205_rng(&rs) % 255) : 0;   /* 只变原始字节值、不翻开关：same_pipe_desc 按实际生效的重启比（#1102）*/ for (int k = 0; k < 3; k++) b._rsv_prim[k] = (uint8_t)c205_rng(&rs);
+            b.prim_restart = a.prim_restart ? (uint8_t)(1 + c205_rng(&rs) % 255) : 0;   /* 只变原始字节值、不翻开关：same_pipe_desc 按实际生效的重启比（#1102）*/ for (int k = 0; k < (int)sizeof b._rsv_prim; k++) b._rsv_prim[k] = (uint8_t)c205_rng(&rs);
             { uint32_t w; memcpy(&w, &b.poly, sizeof w); w ^= 0xFFFFFF00u & (uint32_t)c205_rng(&rs); memcpy(&b.poly, &w, sizeof w); }
             for (int i = 0; i < 5; i++) for (uint32_t k = b.st[i].nspec; k < NVN_GPU_SPEC_MAX; k++) { uint8_t *sp = (uint8_t *)&b.st[i].spec[k]; for (size_t j = 0; j < sizeof b.st[i].spec[k]; j++) sp[j] = (uint8_t)c205_rng(&rs); }
             if (!nvn_vk_dbg_pipe_same(&a, &b)) { fixture++; continue; }

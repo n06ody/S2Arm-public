@@ -36,6 +36,27 @@ static int prop_int(const char *name, int def) {
 #endif
 }
 
+// Vulkan 1.1/1.2 的核心命令表不含 EDS：显式启用两个 EXT 后只取 EXT 入口。
+static void load_eds(struct s2a_vk_device *dev, int core) {
+    struct s2a_vk_eds *eds = &dev->eds;
+#define EDS(member, command) do { \
+    eds->member = (PFN_##command)vkGetDeviceProcAddr(dev->device, core ? #command : #command "EXT"); \
+    if (!eds->member) { memset(eds, 0, sizeof *eds); return; } \
+} while (0)
+    EDS(cull_mode, vkCmdSetCullMode);
+    EDS(front_face, vkCmdSetFrontFace);
+    EDS(topology, vkCmdSetPrimitiveTopology);
+    EDS(depth_test, vkCmdSetDepthTestEnable);
+    EDS(depth_write, vkCmdSetDepthWriteEnable);
+    EDS(depth_compare, vkCmdSetDepthCompareOp);
+    EDS(stencil_test, vkCmdSetStencilTestEnable);
+    EDS(stencil_op, vkCmdSetStencilOp);
+    EDS(depth_bias, vkCmdSetDepthBiasEnable);
+    EDS(restart, vkCmdSetPrimitiveRestartEnable);
+    EDS(discard, vkCmdSetRasterizerDiscardEnable);
+#undef EDS
+}
+
 static int fail(char *why, size_t n, const char *text) {
     if (why && n) snprintf(why, n, "%s", text);
     return -1;
@@ -384,6 +405,17 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     out->has_swapchain = has_device_extension(out->physical, "VK_KHR_swapchain");
     out->has_swapchain_maintenance1 = has_device_extension(out->physical, "VK_EXT_swapchain_maintenance1");
     const int has_timeline = has_device_extension(out->physical, "VK_KHR_timeline_semaphore");
+    const int want_eds = prop_int("debug.s2a.nvk_eds", 1) != 0;
+    const int eds_core = want_eds && s2a_vk_effective_api(out->properties.apiVersion) >= VK_API_VERSION_1_3;
+    const int eds_query = want_eds && !eds_core &&
+        has_device_extension(out->physical, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) &&
+        has_device_extension(out->physical, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds1 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    };
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
+    };
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance = {0};
     maintenance.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline = {0};
@@ -454,6 +486,11 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
             query.pNext = &border;
         }
         if (descriptor_query) { descriptor_supported.pNext = query.pNext; query.pNext = &descriptor_supported; }
+        if (eds_query) {
+            eds2.pNext = query.pNext;
+            eds1.pNext = &eds2;
+            query.pNext = &eds1;
+        }
         vkGetPhysicalDeviceFeatures2(out->physical, &query);
         if (descriptor_query) {
             out->descriptor_indexing_runtime = descriptor_supported.runtimeDescriptorArray == VK_TRUE;
@@ -488,6 +525,11 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
                                   out->descriptor_indexing_storage_nonuniform;
     const char *device_ext[24];
     uint32_t device_ext_count = 0;
+    const int eds_ext = eds_query && eds1.extendedDynamicState && eds2.extendedDynamicState2;
+    if (eds_ext) {
+        device_ext[device_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
+        device_ext[device_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+    }
     // 反馈没有独立的 feature 位。实例仍申请 1.1，物理设备报 1.3 也须实际启用 EXT。
     const int pipe_feedback_core = s2a_vk_effective_api(out->properties.apiVersion) >= VK_API_VERSION_1_3;
     const int pipe_feedback_ext = !pipe_feedback_core &&
@@ -719,8 +761,17 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         descriptor_enabled.pNext = (void *)device_info.pNext;
         device_info.pNext = &descriptor_enabled;
     }
+    if (eds_ext) {
+        eds2.extendedDynamicState2LogicOp = VK_FALSE;
+        eds2.extendedDynamicState2PatchControlPoints = VK_FALSE;
+        eds2.pNext = (void *)device_info.pNext;
+        device_info.pNext = &eds1;
+    }
     if (vkCreateDevice(out->physical, &device_info, NULL, &out->device) != VK_SUCCESS)
         return fail(why, why_size, "vkCreateDevice failed");
+    if (eds_core || eds_ext) load_eds(out, eds_core);
+    S2A_DLOG("[s2a] vk extended dynamic state: requested=%d ext=%d core=%d commands=%d\n",
+             want_eds, eds_ext, eds_core, out->eds.cull_mode != NULL);
     out->pipeline_creation_feedback_enabled = pipe_feedback_core || pipe_feedback_ext;
     out->descriptor_indexing_enabled = descriptor_enable;
     S2A_DLOG("[s2a] vk descriptor indexing: ext_state=%d queried=%d runtime=%d partial=%d sampled_nonuniform=%d "

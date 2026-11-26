@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 25   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 26   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -115,6 +115,7 @@ enum {
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
+    NVN_GPU_CAP_EXTENDED_DYN      = 1u << 26,  // 可用逐笔剔除、绕序、同类拓扑、深度模板、偏移启用、重启和光栅丢弃
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -321,7 +322,8 @@ typedef struct {
     uint8_t lmap[8];                 // 合并通道的颜色槽重映射
     uint32_t prim, patch_size;
     uint8_t prim_restart;            // NVN 条带重启；重启值 = 索引类型的最大值（u8 0xFF / u16 0xFFFF / u32 0xFFFFFFFF）
-    uint8_t _rsv_prim[3];
+    uint8_t extended_dynamic;        // 调用方在 CAP_EXTENDED_DYN 下选择逐笔提供这些状态
+    uint8_t _rsv_prim[2];
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms;
     va_st attr[16]; vs_st stream[16];
     /* 定稿 #4：静态状态一直带在 desc 里；只在实际启用了对应动态能力（CAP_DYN_DEPTH_STENCIL / CAP_DYN_RASTER）时后端才从自己的键里省略。
@@ -392,6 +394,7 @@ typedef struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     float blend_color[4];
     ds_st ds; poly_st poly;          // 见定稿 #4
+    uint8_t prim_restart, rast_discard; // CAP_EXTENDED_DYN，真实拓扑由 draw_args 提供
 } nvn_gpu_dyn;
 void nvn_gpu_set_pipe(nvn_gpu_cmd c, nvn_gpu_pipe p);       // 线程：[提交]，通道内
 void nvn_gpu_set_dyn(nvn_gpu_cmd c, const nvn_gpu_dyn *d);   // 线程：[提交]，通道内

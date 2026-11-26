@@ -1,5 +1,6 @@
 // 首用管线后台构建（安卓新回放层）。合同见 nvn_vk_pipe_demand.h。
 #include "nvn_vk_pipe_demand.h"
+#include "nvn_vk_eds_key.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -82,6 +83,7 @@ uint32_t nvk_fu_unsafe_ms(void) { static int v = -2; if (v == -2) v = nvn_plat_f
 static void dem_key(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], struct dem_key *k) {
     memset(k, 0, sizeof *k);
     k->desc = *d;
+    nvk_eds_normalize(&k->desc);
     for (int st = 0; st < DEM_STAGES; st++) k->desc.st[st].sh = NULL;
     memcpy(k->ident, ident, 32);
 }

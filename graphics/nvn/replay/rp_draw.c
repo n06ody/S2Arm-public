@@ -1497,8 +1497,20 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
     return 1;
 }
 
+// 先按队列 flip 计算 Vulkan 帧缓冲绕序，再消去后端按窗口原点做的 NDC 转换。
+static poly_st replay_polygon(int origin_ll) {
+    poly_st poly = rp_S.poly;
+    const int ccw = ((poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0)) != origin_ll;
+    poly.front = ccw ? NVN_FRONT_FACE_CCW : NVN_FRONT_FACE_CW;
+    return poly;
+}
+
+static uint8_t replay_restart(int quads) {
+    return rp_S.restart.on != 0 && !quads;   // 展开图元已处理了重启
+}
+
 // 绘制时的动态状态（对照 nvn_mtl.m @12740–12776）。返回 0 = 裁剪矩形与目标没有交集：这笔什么都画不出，不发（iOS 同样跳过，不算未接）
-static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
+static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, int quads, const void *rec) {
     memset(d, 0, sizeof *d);
     d->nvp = 1;
     if (rp_S.has_vp) { memcpy(d->vp[0], rp_S.vp[0], 16); } else { d->vp[0][2] = (float)tw; d->vp[0][3] = (float)th; }
@@ -1517,7 +1529,10 @@ static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
     d->po = rp_S.po;
     memcpy(d->st_vmask, rp_S.st_vmask, sizeof d->st_vmask); memcpy(d->st_wmask, rp_S.st_wmask, sizeof d->st_wmask); memcpy(d->st_ref, rp_S.st_ref, sizeof d->st_ref);
     memcpy(d->blend_color, rp_S.blend_color, sizeof d->blend_color);
-    d->ds = rp_S.ds; d->poly = rp_S.poly;
+    d->ds = rp_S.ds;
+    d->poly = (caps_cached()->caps & NVN_GPU_CAP_EXTENDED_DYN) ? replay_polygon(d->origin_ll != 0) : rp_S.poly;
+    d->prim_restart = replay_restart(quads);
+    d->rast_discard = rp_S.rast_discard != 0;
     return 1;
 }
 
@@ -1578,7 +1593,8 @@ static nvn_gpu_pipe_desc replay_pipe_desc(const p_set_rt *rt, uint32_t prim, int
     if (rt->depth) { nvn_fmt_info fi; uint32_t f = (uint32_t)rt->depth->d.format; int ok = nvn_fmt_info_of(f, &fi); if (!ok || fi.depth) pd.dfmt = f; if (ok && fi.stencil) pd.sfmt = f; }
     const tex_t *c0 = NULL; for (int i = 0; i < rt->n && i < 8 && !c0; i++) c0 = rt->color[i];   // 第一个有图的颜色槽
     pd.samples = c0 ? (uint32_t)c0->d.samples : rt->depth ? (uint32_t)rt->depth->d.samples : 0;
-    pd.prim = prim; pd.patch_size = (uint32_t)rp_S.patch_size; pd.prim_restart = (uint8_t)(rp_S.restart.on != 0 && !quads);   // 要展开的图元，重启在展开时已经处理掉
+    pd.prim = prim; pd.patch_size = (uint32_t)rp_S.patch_size; pd.prim_restart = replay_restart(quads);
+    pd.extended_dynamic = (caps_cached()->caps & NVN_GPU_CAP_EXTENDED_DYN) != 0;
     memcpy(pd.blend, rp_S.blend, sizeof pd.blend); pd.color = rp_S.color; pd.chmask = rp_S.chmask; pd.ms = rp_S.ms;
     // 归一化（对照 nvn_mtl.m pso_key_norm / pso_desc，docs/对照_iOS回放层语义.md 第 1 段）：
     //   · 片元着色器没写的输出分量不落帧缓冲：写掩码与着色器的输出映射相与（硬件只写着色器输出表里的；宿主上没写的输出是未定义值）；
@@ -1609,12 +1625,12 @@ static nvn_gpu_pipe_desc replay_pipe_desc(const p_set_rt *rt, uint32_t prim, int
         for (int i = 0; i < 16; i++) if (zattr >> i & 1) { pd.attr[i].fmt = NVN_FORMAT_RGBA32F; pd.attr[i].offset = 0; pd.attr[i].stream = (uint32_t)zstream; }
         pd.stream[zstream].stride = 0; pd.stream[zstream].divisor = 0;
     }
-    pd.ds = rp_S.ds; pd.poly = rp_S.poly; pd.rast_discard = (uint8_t)(rp_S.rast_discard != 0);
+    pd.ds = rp_S.ds; pd.rast_discard = (uint8_t)(rp_S.rast_discard != 0);
     // Ryujinx StateUpdater.UpdateFrontFace 与 EnumConversion 合成后，Vulkan 帧缓冲绕序 = API 值 XOR 队列 flip。
     // nvn_mtl 的同一表达式也是帧缓冲绕序，不能直接当本接口的 NDC 绕序。
     // 后端 C80 会按当前窗口原点转换 NDC → 帧缓冲；这里先消去这次转换，保留建队列时固定的 flip。
     pd.origin_ll = (uint8_t)(rp_origin_lower_left() != 0);
-    pd.poly.front = (((rp_S.poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0)) != (pd.origin_ll != 0)) ? NVN_FRONT_FACE_CCW : NVN_FRONT_FACE_CW;
+    pd.poly = replay_polygon(pd.origin_ll);
     pd.depth_clamp = (uint8_t)(rp_S.depth_clamp != 0);
     pd.clip_neg1 = (uint8_t)(g_prog->z_raw && clip_neg1);   // 程序没做 near = -w 的深度改写：交给管线（只在 CAP_DEPTH_CLIP_CTL 时会出这种程序）
     return pd;
@@ -2171,7 +2187,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
       if (!tw) tw = 1;
       if (!th) th = 1; }
     DT(RP_PERF_D_PIPE);
-    nvn_gpu_dyn dyn; if (!fill_dyn(&dyn, tw, th, rec)) goto draw_done;
+    nvn_gpu_dyn dyn; if (!fill_dyn(&dyn, tw, th, quads, rec)) goto draw_done;
     nvn_gpu_set_dyn(c, &dyn);
     for (int i = 0; i < 16; i++) if (streams >> i & 1) nvn_gpu_set_vbuf(c, (uint32_t)i, vb_buf[i], vb_off[i]);
     if (zattr) {   // 零属性的流：每笔从暂存区取 16 字节全 0

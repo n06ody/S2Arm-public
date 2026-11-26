@@ -61,6 +61,7 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *out) 
     out->direct_abi = (uint32_t)g_abi; out->translator_closure = g_closure;
     return 0;
 }
+void nvn_gpu_caps_get(nvn_gpu_caps *out) { if (out) *out = (nvn_gpu_caps){0}; }
 void nvn_gpu_pipe_warm_scope(int on) { (void)on; }
 uint64_t nvn_gpu_pipe_warm_hits(void) { return 0; }
 uint64_t nvn_gpu_pipe_warm_created(void) { return 0; }

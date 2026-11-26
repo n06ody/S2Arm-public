@@ -8,6 +8,7 @@
 #define _GNU_SOURCE 1
 #include "direct/installed_seed.h"
 #include "nvn_vk_pipe_warm.h"
+#include "nvn_vk_eds_key.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -136,6 +137,12 @@ static uint64_t pw_get64(const uint8_t *b, size_t *at) {
 // 一条管线描述 → 紧凑字节。st[].sh / nspec / spec / _rsv_prim 不进记录：sh 由程序身份还原，
 // nspec 恒 0（note 处已挡），spec 是它的空参数区，_rsv_prim 是保留位。
 static void pw_desc_write(const nvn_gpu_pipe_desc *d, uint8_t *o) {
+    nvn_gpu_pipe_desc normalized;
+    if (d->extended_dynamic) {
+        normalized = *d;
+        nvk_eds_normalize(&normalized);
+        d = &normalized;
+    }
     size_t at = 0;
     uint8_t smask = 0;
     for (int st = 0; st < 5; st++) if (d->st[st].sh) smask |= (uint8_t)(1u << st);
@@ -823,6 +830,10 @@ int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
         goto out;
     }
     for (int st = 0; st < 3; st++) pd.st[st].sh = prog->sh[st];
+    // 现役模式解释新旧配方：352 字节格式保持可读，旧静态种子也能预热 EDS 对象。
+    nvn_gpu_caps caps;
+    nvn_gpu_caps_get(&caps);
+    pd.extended_dynamic = (caps.caps & NVN_GPU_CAP_EXTENDED_DYN) != 0;
     if (nvn_gpu_pipe_warm_scope) nvn_gpu_pipe_warm_scope(1);
     nvn_gpu_pipe pipe = NULL;
     nvn_gpu_err err = {0};

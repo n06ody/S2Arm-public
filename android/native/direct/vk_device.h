@@ -3,7 +3,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <vulkan/vulkan.h>
+#include "vk_eds.h"
 
 // 直连实例申请的 Vulkan 版本（VkApplicationInfo.apiVersion）。用更高核心版本才有的物理设备功能，要应用申请的版本和设备版本都够：
 //   有效版本 = 两者较低者；不够就只认对应扩展（Khronos：VkApplicationInfo 描述、初始化一章的 physical-device 扩展段）。
@@ -46,6 +46,7 @@ struct s2a_vk_device {
     // max_vertex_attrib_divisor 是设备上限（未启用时为 0）。
     int vertex_divisor_enabled;
     uint32_t max_vertex_attrib_divisor;
+    struct s2a_vk_eds eds;   // 完整命令表才可用（cull_mode 非空）
     PFN_vkCmdDrawIndirectCountKHR draw_indirect_count;
     PFN_vkCmdDrawIndexedIndirectCountKHR draw_indexed_indirect_count;
     int shader_draw_parameters_enabled;

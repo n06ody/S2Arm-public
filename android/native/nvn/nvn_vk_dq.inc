@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include "../direct/vk_eds.h"
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -33,10 +34,10 @@
 #define DQ_REAL(f) static PFN_##f r_##f;
 DQ_CMDS(DQ_REAL)   // 命令缓冲之外的那几个入口（提交、呈现、池）直接调符号：它们没有版本 / 扩展的问题，宿主用例对其中几个打了桩
 #define DQ_OP(f) OP_##f,
-enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
+enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_EDS, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
 // 诊断读数：每类调用经过包装多少次（不管开关开没开）。backend_vulkan_wsi.inc 随「对象读数」每 300 帧打一行。
 #define DQ_NAME(f) #f,
-static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill" };
+static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill", "eds" };
 static uint64_t g_dq_cnt[OP_N];
 #define DQ_COUNT(op) __atomic_fetch_add(&g_dq_cnt[op], 1, __ATOMIC_RELAXED)
 
@@ -230,6 +231,36 @@ static int dq_fill_take(uint64_t t) {
     return 2;
 }
 
+struct dq_eds {
+    const struct s2a_vk_eds *dispatch;   // 设备 owner 在队列清空后才释放
+    struct nvk_eds_values values;
+    uint32_t changed;
+};
+
+static void dq_eds_run(VkCommandBuffer cb, const struct dq_eds *a) {
+    const struct s2a_vk_eds *e = a->dispatch;
+    const struct nvk_eds_values *v = &a->values;
+    const uint32_t changes = a->changed;
+    if (changes & EDS_DISCARD) e->discard(cb, v->discard);
+    if (changes & EDS_CULL) e->cull_mode(cb, v->cull_mode);
+    if (changes & EDS_FRONT) e->front_face(cb, v->front_face);
+    if (changes & EDS_TOPOLOGY) e->topology(cb, v->topology);
+    if (changes & EDS_DEPTH_TEST) e->depth_test(cb, v->depth_test);
+    if (changes & EDS_DEPTH_WRITE) e->depth_write(cb, v->depth_write);
+    if (changes & EDS_DEPTH_COMPARE) e->depth_compare(cb, v->depth_compare);
+    if (changes & EDS_STENCIL_TEST) e->stencil_test(cb, v->stencil_test);
+    if (changes & (EDS_STENCIL_FRONT | EDS_STENCIL_BACK)) {
+        for (unsigned i = 0; i < 2; i++) {
+            if (!(changes & (EDS_STENCIL_FRONT << i))) continue;
+            const VkStencilOpState *s = &v->stencil[i];
+            e->stencil_op(cb, i ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT,
+                          s->failOp, s->passOp, s->depthFailOp, s->compareOp);
+        }
+    }
+    if (changes & EDS_BIAS) e->depth_bias(cb, v->depth_bias);
+    if (changes & EDS_RESTART) e->restart(cb, v->restart);
+}
+
 static void dq_run(const dq_rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
     switch (h->op) {
@@ -290,6 +321,7 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdDrawIndirectByteCountEXT: { const a_bytecount *a = (const void *)p; r_vkCmdDrawIndirectByteCountEXT(cb, a->inst, a->first_inst, a->b, a->off, a->ctr_off, a->stride); break; }
     case OP_vkCmdBeginQuery: { const a_query *a = (const void *)p; r_vkCmdBeginQuery(cb, a->p, a->q, a->fl); break; }
     case OP_vkCmdEndQuery: { const a_query *a = (const void *)p; r_vkCmdEndQuery(cb, a->p, a->q); break; }
+    case OP_EDS: dq_eds_run(cb, (const void *)p); break;
     case OP_FILL: dq_fill_run((const a_memfill *)(const void *)p); break;
     default: break;
     }
@@ -446,6 +478,20 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetBlendConstants(VkCommandBuffer 
 #define W_STENCIL(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, VkStencilFaceFlags fl, uint32_t v) { \
     { DQ_BEGIN(OP_##f, a_stencil, 0); *a = (a_stencil){fl, v}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(f, cb, fl, v); }
 W_STENCIL(vkCmdSetStencilReference) W_STENCIL(vkCmdSetStencilCompareMask) W_STENCIL(vkCmdSetStencilWriteMask)
+static DQ_U void vk_dq_eds(VkCommandBuffer cb, const struct dq_eds *state) {
+    {
+        DQ_BEGIN(OP_EDS, struct dq_eds, 0);
+        *a = *state;
+        (void)at_;
+        dq_rec_end(base_);
+        return;
+    }
+direct:
+    vk_dq_drain();
+    __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED);
+    dq_eds_run(cb, state);
+}
+
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetDepthBias(VkCommandBuffer cb, float c, float clamp, float slope) {
     { DQ_BEGIN(OP_vkCmdSetDepthBias, a_bias, 0); *a = (a_bias){c, clamp, slope}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdSetDepthBias, cb, c, clamp, slope); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetLineWidth(VkCommandBuffer cb, float w) {

@@ -23,6 +23,7 @@ static struct rp_prog g_prog;          // 假程序：身份 + 三个阶段句�
 static int g_pipe_get_calls;
 static nvn_gpu_pipe_desc g_last_desc;  // 假 nvn_gpu_pipe_get 收到的描述
 static int g_pipe_fail;
+static int g_eds;
 static uint64_t g_fake_hits = 12345;
 
 int nvn_plat_flag(const char *name, int dflt) {
@@ -73,6 +74,9 @@ const char *nvk_session_cache_dir(void) { return getenv("S2A_PW_DIR"); }
 // 程序清单的随包种子（nvn_vk_prog_warm.c；本单测只链管线模块）：本局没用种子 = 管线也不读种子（种子用例在 nvn_vk_warm_seed_test.c）
 int nvk_prog_warm_seed_dir(char *out, size_t n) { if (out && n) out[0] = 0; return 0; }
 int nvk_prog_warm_contains(const uint8_t identity[32]) { (void)identity; return 0; }
+void nvn_gpu_caps_get(nvn_gpu_caps *out) {
+    if (out) *out = (nvn_gpu_caps){.caps = g_eds ? NVN_GPU_CAP_EXTENDED_DYN : 0};
+}
 void nvn_gpu_pipe_warm_scope(int on) { (void)on; }
 uint64_t nvn_gpu_pipe_warm_hits(void) { return g_fake_hits; }
 uint64_t nvn_gpu_pipe_warm_created(void) { return 0; }
@@ -339,6 +343,24 @@ static int mode_fields(void) {
             CHECK(0, "expected desc %s matched %d times (want exactly 1)", i == 0 ? "base" : k_muts[i - 1].name, seen[i]);
         }
     }
+    // Decode a legacy recipe in both modes. The build mode is selected by the current backend.
+    nvn_gpu_pipe_desc legacy = base;
+    legacy.prim = NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP;
+    legacy.prim_restart = 1;
+    nvk_pipe_warm_rec_of(&legacy, id, &rec);
+    CHECK(nvk_pipe_warm_build(&rec) == 0 && !g_last_desc.extended_dynamic &&
+          g_last_desc.prim == NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP && g_last_desc.prim_restart,
+          "static backend keeps the legacy strip and restart state");
+    g_eds = 1;
+    CHECK(nvk_pipe_warm_build(&rec) == 0 && g_last_desc.extended_dynamic,
+          "EDS backend prebuilds a legacy recipe in its current mode");
+    // A captured EDS recipe can also be decoded by a static backend.
+    legacy.extended_dynamic = 1;
+    nvk_pipe_warm_rec_of(&legacy, id, &rec);
+    g_eds = 0;
+    CHECK(nvk_pipe_warm_build(&rec) == 0 && !g_last_desc.extended_dynamic &&
+          g_last_desc.prim == NVN_DRAW_PRIMITIVE_TRIANGLES && !g_last_desc.prim_restart,
+          "static backend reads the canonical EDS recipe as a valid representative");
     return g_fail;
 }
 
