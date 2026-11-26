@@ -6,8 +6,16 @@
 #include "rp_state.h"
 #include "nvn_unimpl.h"
 #include "nvn_fmt_info.h"
+#include "nvn_plat.h"
 #include <math.h>
 #include <string.h>
+
+// 弱链接[replay]：rp_pass_park_tex_clear
+#pragma weak rp_pass_park_tex_clear
+// 弱链接[replay]：rp_pass_prepare_tex_clear
+#pragma weak rp_pass_prepare_tex_clear
+// 弱链接[replay]：rp_tex_fold_count
+#pragma weak rp_tex_fold_count
 
 static void clear_value(const p_clear_tex *o, int kind, nvn_gpu_clear *cl) {
     for (int k = 0; k < 4; k++) {
@@ -17,6 +25,26 @@ static void clear_value(const p_clear_tex *o, int kind, nvn_gpu_clear *cl) {
         else if (kind == NVN_FMT_SINT) cl->value.i[k] = isnan(v) ? 0 : v <= -2147483648.0 ? INT32_MIN : v >= 2147483647.0 ? INT32_MAX : (int32_t)v;
         else cl->value.f[k] = (float)v;
     }
+}
+
+static int fold_clear_value(uint32_t fmt, const nvn_fmt_info *fi, const nvn_gpu_clear *cl) {
+    if (fi->kind != NVN_FMT_UINT && fi->kind != NVN_FMT_SINT) {
+        for (unsigned i = 0; i < fi->channels; i++) if (!isfinite(cl->value.f[i])) return 0;
+        return 1;
+    }
+    unsigned bits = 8u * fi->bytes / fi->channels;
+    if (fmt != NVN_FORMAT_RGB10A2UI && fmt != NVN_FORMAT_RGB10A2I &&
+        (fi->bytes % fi->channels || (bits != 8 && bits != 16 && bits != 32))) return 0;
+    for (unsigned i = 0; i < fi->channels; i++) {
+        if (fmt == NVN_FORMAT_RGB10A2UI || fmt == NVN_FORMAT_RGB10A2I) bits = i == 3 ? 2 : 10;
+        if (fi->kind == NVN_FMT_UINT) {
+            if (cl->value.u[i] >= (UINT64_C(1) << bits)) return 0;
+        } else {
+            const int64_t limit = INT64_C(1) << (bits - 1);
+            if (cl->value.i[i] < -limit || cl->value.i[i] >= limit) return 0;
+        }
+    }
+    return 1;
 }
 
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
@@ -55,12 +83,40 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
     cl.x = o->r.xoffset; cl.y = o->r.yoffset; cl.w = (uint32_t)o->r.width; cl.h = (uint32_t)o->r.height;
     clear_value(o, fi.kind, &cl);
     int is_int = fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT;
+    enum rp_tex_fold_result result = RP_TF_N;
+    if (!whole || nz != 1) result = RP_TF_SHAPE;
+    else if (!rp_pass_park_tex_clear || !nvn_plat_flag("nvk_clear_tex_fold", 0)) result = RP_TF_DISABLED;
+    else if (!t->serial || !t->mem || !t->L.size || !t->pool ||
+             (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) ||
+             t->off < 0 || (uint64_t)t->off > t->pool->size || t->L.size > t->pool->size - (uint64_t)t->off)
+        result = RP_TF_STORAGE;
+    else if (o->has_view && (o->view.set_swizzle || (o->view.set_target && o->view.target != t->d.target)))
+        result = RP_TF_VIEW_POLICY;
+    else if (!(nvn_gpu_format_caps(fmt) & NVN_GPU_FMT_CLEAR_FOLD) || !fold_clear_value(fmt, &fi, &cl))
+        result = RP_TF_FORMAT_VALUE;
+    const int can_park = result == RP_TF_N;
+    const int diag = rp_pass_prepare_tex_clear && rp_pass_prepare_tex_clear(c, t, can_park);
+    if (diag && !can_park) rp_tex_fold_count(result);
     // 后端附件只支持一级一层：每一层独立建视图和通道，避免把数组层数交给单层附件。
     for (int32_t z = 0; z < nz; z++) {
         view_t v = {0}; v.set_levels = 1; v.base_level = (uint8_t)lv; v.nlevels = 1;
         v.set_layers = 1; v.min_layer = (uint16_t)(l0 + (uint32_t)o->r.zoffset + (uint32_t)z); v.nlayers = 1;
         rp_view_pin_begin(); nvn_gpu_view gpu = rp_view_for(t, &v, c);
-        if (!gpu) { rp_view_pin_end(); return; }
+        if (!gpu) {
+            if (diag && can_park) rp_tex_fold_count(RP_TF_VIEW_FAILED);
+            rp_view_pin_end();
+            return;
+        }
+        if (can_park) {
+            result = rp_pass_park_tex_clear(c, t, &v, gpu, &cl, is_int);
+            if (result == RP_TF_N) {
+                // 与即时清除相同的资源所有权时刻；命令段已保活原视图。
+                rp_view_pin_end(); rp_tex_mark_gpu_written(t);
+                return;
+            }
+            if (diag) rp_tex_fold_count(result);
+            if (rp_pass_prepare_tex_clear) rp_pass_prepare_tex_clear(c, NULL, 0);
+        }
         if (whole) nvn_gpu_clear_view(c, gpu, cl.value.f, cl.value.u, is_int);
         else {
             nvn_gpu_pass_desc d = {0}; d.ncolor = 1; d.w = w; d.h = h; d.layers = 1;
