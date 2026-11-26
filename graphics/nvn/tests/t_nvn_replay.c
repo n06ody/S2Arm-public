@@ -6875,10 +6875,13 @@ static void mirror_draw_at(stream *s, uint64_t addr) {
 }
 
 static void t_mirror_disjoint(void) {
-    enum { DEFAULT_OFF, GAP, OVERLAP, PENDING, UNKNOWN, ALIAS, OVERFLOW, REMAP, PRE_OOM, NCASE };
-    static const char *const names[NCASE] = {"default", "gap", "overlap", "pending", "unknown", "alias", "overflow", "remap", "pre-oom"};
+    enum { DEFAULT_OFF, GAP, OVERLAP, PENDING, LANDING, UNKNOWN, ALIAS, OVERFLOW, REMAP, PRE_OOM, NCASE };
+    static const char *const names[NCASE] = {"default", "gap", "overlap", "pending", "landing", "unknown", "alias", "overflow", "remap", "pre-oom"};
     const int old_split = rp_split_draws;
     for (int log = 0; log <= (g_dirtylog_dflt != 0); log++) for (int kind = DEFAULT_OFF; kind < NCASE; kind++) {
+#ifndef S2A_GPU_LAND_TEST
+        if (kind == LANDING) continue;
+#endif
         pass_fresh(); g_pg_tracked = 1; g_buf_cpu_auto = 1; g_flag_buf_dirtylog = log;
         g_log_fake_on = log; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
         memset(g_log_unarmed, 0, sizeof g_log_unarmed);
@@ -6907,10 +6910,28 @@ static void t_mirror_disjoint(void) {
         end(&first); nvn_be_exec(first.b);
         CHECK(rp_pass_is_open());
         uint64_t key = 0, pending = 0;
-        if (kind == PENDING) {
+        if (kind == PENDING || kind == LANDING) {
             pending = rp_buf_gpu_write_note(base + 5 * PG, 16, &key);
             CHECK(pending != 0);
         }
+#ifdef S2A_GPU_LAND_TEST
+        pthread_t landing_thread;
+        struct land_args land = {.key = key, .id = pending};
+        int landing_started = 0;
+        if (kind == LANDING) {
+            memset(b->cpu + 5 * PG, 0xee, 16);
+            g_land_pause = 1;
+            g_land_half = g_land_resume = 0;
+            landing_started = pthread_create(&landing_thread, NULL, land_thread, &land) == 0;
+            CHECK(landing_started);
+            if (landing_started) {
+                pthread_mutex_lock(&g_land_mu);
+                while (!g_land_half) pthread_cond_wait(&g_land_cv, &g_land_mu);
+                pthread_mutex_unlock(&g_land_mu);
+                CHECK(g_block_mem[5 * PG] == 0xee && g_block_mem[5 * PG + 15] == 0x11);
+            }
+        }
+#endif
         if (kind == UNKNOWN) CHECK(!rp_buf_resolve(&g_fake_cmd, 1, 16, &b, NULL));
         if (kind == OVERFLOW) {
             for (int i = 0; i < 80; i++) CHECK(rp_buf_resolve(&g_fake_cmd, base + PG + 2 * (uint64_t)i, 1, &b, NULL));
@@ -6926,10 +6947,12 @@ static void t_mirror_disjoint(void) {
         const int passes = g_npd - before;
         const int pre = g_nbw == 1 && g_bw[0].pre;
         CHECK(g_nbw == 1 && g_bw[0].off == 3 * PG && g_bw[0].len == PG);
-        CHECK(perf[RP_PERF_MIRROR_HOIST] == (kind == GAP));
+        const int want_pre = kind == GAP || kind == PENDING || kind == LANDING;
+        CHECK(perf[RP_PERF_MIRROR_HOIST] == (uint64_t)want_pre);
+        CHECK(perf[RP_PERF_MIRROR_GPU_HOIST] == (uint64_t)(kind == PENDING || kind == LANDING));
         CHECK(perf[RP_PERF_MIRROR_OVERLAP] == (kind == OVERLAP));
-        CHECK(perf[RP_PERF_MIRROR_FALLBACK] == (kind >= PENDING));
-        CHECK(perf[RP_PERF_P_CUT_XFER] == (kind != GAP));
+        CHECK(perf[RP_PERF_MIRROR_FALLBACK] == (kind > LANDING));
+        CHECK(perf[RP_PERF_P_CUT_XFER] == !want_pre);
         if (kind == GAP) CHECK((perf[RP_PERF_BUF_LOG_EV] != 0) == log);
         CHECK(!g_pre_fail_once); g_pre_fail_once = 0;
         nvn_be_sub_commit();
@@ -6950,10 +6973,22 @@ static void t_mirror_disjoint(void) {
         const int overlap = kind == OVERLAP;
         printf("mirror log=%d %s: pre=%d reopened=%d draw bytes=%02x/%02x/%02x/%02x\n",
                log, names[kind], pre, passes, observed[0], observed[1], observed[2], observed[3]);
-        CHECK(pre == (kind == GAP) && passes == (kind != GAP));
+        CHECK(pre == want_pre && passes == !want_pre);
         CHECK(g_order_seg == 1 && g_order_overflow == 0 && draws == 3 + overlap);
         CHECK(observed[0] == 0x11 && observed[1] == 0x11 && observed[2 + overlap] == 0x22);
         CHECK(!overlap || observed[2] == 0x11);
+#ifdef S2A_GPU_LAND_TEST
+        if (landing_started) {
+            pthread_mutex_lock(&g_land_mu);
+            g_land_resume = 1;
+            pthread_cond_broadcast(&g_land_cv);
+            pthread_mutex_unlock(&g_land_mu);
+            CHECK(pthread_join(landing_thread, NULL) == 0);
+            CHECK(g_block_mem[5 * PG + 15] == 0xee);
+            pending = 0;
+        }
+        g_land_pause = 0;
+#endif
         g_order_active = 0; fake_complete(NVN_GPU_DONE_OK);
         if (pending) rp_buf_gpu_write_land(key, pending, 0);   // 用例只登记在途状态，收尾撤掉
         if (kind == ALIAS) nvn_be_pool_del(g_block_mem + 3 * PG + 160);

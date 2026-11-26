@@ -36,7 +36,7 @@ export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 failed=0
 for dq in 0 1; do
     if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
-    for arm in off gap overlap pending; do
+    for arm in off gap overlap overlap-exact pending pending-same-page pending-off; do
         log="$out/dq$dq-$arm.log"
         rc=0
         timeout 20 "$out/test" "$out/shaders" "$arm" > "$log" 2>&1 || rc=$?

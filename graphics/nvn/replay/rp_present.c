@@ -375,9 +375,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 if (pf[RP_PERF_MIRROR_HOIST] || pf[RP_PERF_MIRROR_OVERLAP] || pf[RP_PERF_MIRROR_FALLBACK]) {
-                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu",
+                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu gpu_disjoint_hoisted=%llu",
                              (unsigned long long)pf[RP_PERF_MIRROR_HOIST], (unsigned long long)pf[RP_PERF_MIRROR_OVERLAP],
-                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK]);
+                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK], (unsigned long long)pf[RP_PERF_MIRROR_GPU_HOIST]);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
                 }
                 if (pf[RP_PERF_TEX_BYTE_EQUAL] || pf[RP_PERF_TEX_BYTE_CHANGED] || nvn_plat_flag("nvk_tex_byte_equal", 0)) {

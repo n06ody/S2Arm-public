@@ -12,7 +12,7 @@ __typeof__(backend_fixture_flag) nvn_plat_flag;
 #include "nvn_dirty.h"
 
 static nvn_gpu_err test_err;
-static int hoist, pass_open, passes;
+static int hoist, gpu_ranges, pass_open, passes;
 static void (*prepare_write)(void *, size_t);
 
 #define REQUIRE(expr) do { if (!(expr)) { \
@@ -22,6 +22,7 @@ static void (*prepare_write)(void *, size_t);
 
 int nvn_plat_flag(const char *key, int dflt) {
     if (!strcmp(key, "nvk_mirror_disjoint")) return hoist;
+    if (!strcmp(key, "nvk_mirror_gpu_disjoint")) return gpu_ranges;
     return backend_fixture_flag(key, dflt);
 }
 
@@ -95,11 +96,15 @@ static void commit_mirror(void) {
 int main(int argc, char **argv) {
     REQUIRE(argc == 3);
     const char *arm = argv[2];
-    const int overlap = !strcmp(arm, "overlap");
-    const int pending = !strcmp(arm, "pending");
+    const int overlap_exact = !strcmp(arm, "overlap-exact");
+    const int overlap = overlap_exact || !strcmp(arm, "overlap");
+    const int pending_page = !strcmp(arm, "pending-same-page");
+    const int pending_off = !strcmp(arm, "pending-off");
+    const int pending = pending_page || pending_off || !strcmp(arm, "pending");
     const int off = !strcmp(arm, "off");
     REQUIRE(overlap || pending || off || !strcmp(arm, "gap"));
     hoist = !off;
+    gpu_ranges = !pending_off;
     char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&g_dev, why, sizeof why));
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
@@ -133,8 +138,8 @@ int main(int argc, char **argv) {
     nvn_gpu_buf readback = make_buf(pixel_bytes, NVN_GPU_MEM_SHARED, NULL);
     REQUIRE(pipe && tex && view && readback);
     nvn_be_sub_begin();
+    const uint64_t gpu_off = pending_page ? 3 * page + 256 : 5 * page;
     if (pending) {
-        const uint64_t gpu_off = 5 * page;
         const uint32_t marker = 0xdecafbad;
         // 完成回调在宿主写回；把目标页开放给它，回写数据仍必须来自 GPU。
         prepare_write(guest + gpu_off, sizeof marker);
@@ -147,9 +152,15 @@ int main(int argc, char **argv) {
     draw_column(view, pipe, guest + 6 * page, 1);
     if (overlap) write_vertices(target, 1);
     write_vertices(target + 128, 1);
-    draw_column(view, pipe, target + 128, 2);
+    uint64_t perf[RP_PERF_N];
+    rp_perf_take(perf);
+    draw_column(view, pipe, overlap_exact ? target : target + 128, 2);
+    rp_perf_take(perf);
     const int pre = g_pre != NULL;
     rp_pass_end(g_cmd);
+    // Last sync can protect this page again. The isolated fixture exposes the
+    // runtime's pre-write hook in place of installing its SIGSEGV handler.
+    if (pending) prepare_write(guest + gpu_off, sizeof(uint32_t));
     nvn_gpu_copy_tex_buf(g_cmd, tex, 0, 0, NULL, readback, 0, WIDTH * 4, pixel_bytes);
     commit_mirror();
 
@@ -161,11 +172,19 @@ int main(int argc, char **argv) {
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++) bad += memcmp(pixels + 4 * (y * WIDTH + x), row[x], 4) != 0;
     uint32_t landed = 0;
-    memcpy(&landed, guest + 5 * page, sizeof landed);
-    printf("MIRROR_HOIST arm=%s pre=%d passes=%d draw1=%02x%02x%02x%02x bad_pixels=%u landed=%08x\n",
-           arm, pre, passes, pixels[0], pixels[1], pixels[2], pixels[3], bad, landed);
-    const int want_pre = !off && !overlap && !pending;
+    memcpy(&landed, guest + gpu_off, sizeof landed);
+    printf("MIRROR_HOIST arm=%s pre=%d passes=%d draw1=%02x%02x%02x%02x bad_pixels=%u landed=%08x hoisted=%llu overlap=%llu fallback=%llu cuts=%llu gpu_hoisted=%llu\n",
+           arm, pre, passes, pixels[0], pixels[1], pixels[2], pixels[3], bad, landed,
+           (unsigned long long)perf[RP_PERF_MIRROR_HOIST], (unsigned long long)perf[RP_PERF_MIRROR_OVERLAP],
+           (unsigned long long)perf[RP_PERF_MIRROR_FALLBACK], (unsigned long long)perf[RP_PERF_P_CUT_XFER],
+           (unsigned long long)perf[RP_PERF_MIRROR_GPU_HOIST]);
+    const int want_pre = !off && !overlap && !pending_page && !pending_off;
     CHECK(pre == want_pre && passes == 2 - want_pre, "%s: wrong pre-submit placement / pass count", arm);
+    CHECK(perf[RP_PERF_MIRROR_HOIST] == (uint64_t)want_pre, "%s: disjoint mirror must hoist", arm);
+    CHECK(perf[RP_PERF_MIRROR_GPU_HOIST] == (uint64_t)(want_pre && pending), "%s: GPU disjoint subset count", arm);
+    CHECK(perf[RP_PERF_MIRROR_OVERLAP] == (uint64_t)overlap, "%s: overlap count", arm);
+    CHECK(perf[RP_PERF_MIRROR_FALLBACK] == (uint64_t)(pending_page || pending_off), "%s: fallback count", arm);
+    CHECK(perf[RP_PERF_P_CUT_XFER] == (uint64_t)!want_pre, "%s: actual transfer cut count", arm);
     CHECK(!bad, "%s: rendered bytes changed", arm);
     CHECK(landed == (pending ? 0xdecafbadu : 0), "%s: GPU writeback changed", arm);
     CHECK(!nvn_unimpl_kinds(), "%s: replay reported unsupported calls", arm);
