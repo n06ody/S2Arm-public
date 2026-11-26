@@ -114,6 +114,7 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
         } else {
             struct nvn_gpu_samp_s *s = state == NVN_GPU_POOL_READY ? pool_live_samp(d->items[i].resource.samp) : ds;
             if (!s) { error = NVN_GPU_E_ARG; reason = "pool sampler handle invalid or released"; goto failed; }
+            if (!d->sampler_integer && s->reduction) t->has_reduction = 1;
             t->objects[i] = s; ref_bump(s, REF_SAMP); t->images[i].sampler = d->sampler_integer ? s->int_sampler : s->sampler;
         }
     }
@@ -261,8 +262,10 @@ static inline uint64_t pool_key_mix2(uint32_t binding, uint64_t uid) {
 }
 
 // 本笔哪些组带整池数组（mask），以及每组的键与第一张池快照（info[set]；组内同一池绑定被多个阶段共用只算一次）。
-static int pool_set_mask(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute, uint32_t *mask, struct pool_set_info *info) {
-    *mask = 0; for (int s = 0; s < 4; s++) { info[s].k1 = info[s].k2 = 0; info[s].own = NULL; }
+static int pool_set_mask(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute,
+                         uint32_t *mask, uint32_t *reduction, struct pool_set_info *info) {
+    *mask = *reduction = 0;
+    for (int s = 0; s < 4; s++) { info[s].k1 = info[s].k2 = 0; info[s].own = NULL; }
     nvn_gpu_pool_table seen[4][32] = {{0}}; uint32_t bind[4][32] = {{0}}, n[4] = {0};
     for (int st = compute ? NVN_GPU_SH_CS : 0; st < (compute ? NVN_GPU_SH_CS + 1 : 5); st++) {
         for (uint32_t i = 0; i < 64; i++) {
@@ -281,6 +284,7 @@ static int pool_set_mask(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p
                 if (!info[e->set].own) info[e->set].own = t;
             } else if (seen[e->set][k] != t) { set_sticky(c, NVN_GPU_E_LAYOUT, "shared pool binding differs across stages"); return 0; }
             *mask |= 1u << e->set;
+            if (t->has_reduction) *reduction |= 1u << e->set;
         }
     }
     return 1;
@@ -589,15 +593,24 @@ static int pool_write_sets(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s 
             w.dstSet = c->desc_sets[e->set]; w.dstBinding = e->binding; w.descriptorCount = t->count + 1;
             w.descriptorType = t->kind == NVN_GPU_POOL_IMAGE ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
             w.pImageInfo = t->images;
-            if (t->kind == NVN_GPU_POOL_IMAGE && c->feedback != c->feedback_stop && !(canon & (1u << e->set))) {
+            const int feedback = t->kind == NVN_GPU_POOL_IMAGE && c->feedback != c->feedback_stop && !(canon & (1u << e->set));
+            if (feedback || t->has_reduction) {
                 VkDescriptorImageInfo *images = malloc(((size_t)t->count + 1) * sizeof *images);
                 if (!images) {
-                    for (uint32_t k = 0; k < n; k++) free(copies[k]);
-                    set_sticky(c, NVN_GPU_E_OOM, "feedback pool descriptors allocation failed"); return 0;
+                    set_sticky(c, NVN_GPU_E_OOM, "derived pool descriptors allocation failed");
+                    goto failed;
                 }
                 memcpy(images, t->images, ((size_t)t->count + 1) * sizeof *images);
-                for (uint32_t k = 0; k <= t->count; k++) images[k].imageView = feedback_view(c, t->objects[k]);
                 copies[n] = images; w.pImageInfo = images;
+                for (uint32_t k = 0; k <= t->count; k++) {
+                    if (feedback) images[k].imageView = feedback_view(c, t->objects[k]);
+                    else {
+                        struct nvn_gpu_samp_s *s = t->objects[k];
+                        if (!s->reduction) continue;
+                        images[k].sampler = sep_reduction_sampler(c, p, compute, e, (uint16_t)k, s);
+                        if (!images[k].sampler) { n++; goto failed; }
+                    }
+                }
             }
             elems += w.descriptorCount;
             writes[n++] = w;
@@ -611,6 +624,9 @@ static int pool_write_sets(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s 
     }
     for (uint32_t k = 0; k < n; k++) free(copies[k]);
     return 1;
+failed:
+    for (uint32_t k = 0; k < n; k++) free(copies[k]);
+    return 0;
 }
 static int pool_check_layouts(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int compute) {
     (void)p;

@@ -159,6 +159,7 @@ struct nvn_gpu_view_s {
     uint32_t buffer_caps;
     uint32_t nvn_format;   // 视图的有效 NVN 格式（可从贴图覆盖）；clear 的 is_int 按它判
     VkFormat format;       // 视图自己的原生格式：当附件时渲染通道按它声明（视图换了格式，硬件就按视图的格式写，比如经 sRGB 视图写线性存储）
+    uint8_t sep_filter_caps;  // 分离归约首次使用时查询，格式与 aspect 随视图固定
     uint32_t base_level, levels, base_layer, layers;
     int released, refs;
     int swizzled;   // 通道映射非恒等：只能采样，不能当附件
@@ -186,6 +187,8 @@ struct nvn_gpu_shader_s {
     nvn_gpu_stage stage;
     uint8_t precompiled;
     struct s2a_write_bound *write_bounds;  // immutable, indexed by the shader layout entry
+    struct sep_pair *sep_pairs;
+    uint32_t nsep_pairs;
     uint8_t stage_key[8], spirv_digest[32];  // 库阶段键与实际交给 Vulkan 的模块摘要
     uint8_t src_key[8];          // 装载时调用方给的阶段键（现编 / 出库都有，只作日志；stage_key 只在出库件上填）
     nvn_gpu_layout_ent *ents;
@@ -210,6 +213,7 @@ struct nvn_gpu_pipe_s {
     uint8_t dyn_all;         // 整条管线布局里动态描述符总数（≤ 设备 maxDescriptorSetUniformBuffersDynamic 且 ≤ 32）；0 = 这条管线的 UBO 都是静态的
     VkFormat *stage_tfmt[6];
     int8_t texel_binds;   // 有没有纹素缓冲类的绑定项：0 还没数，1 有，-1 没有（见 bind_descriptor_groups）
+    uint8_t sep_image_sets, sep_sampler_sets;
     uint32_t stage_nent[6];
     uint32_t stage_push_off[6], stage_push_bytes[6];
     nvn_gpu_pipe_desc key;
@@ -246,6 +250,7 @@ static void prs_close(void);
 struct nvn_gpu_pool_table_s {
     uint32_t kind, count;
     int released, refs;
+    uint8_t has_reduction, sep_filter_caps;
     uint64_t uid;               // 建表时取的序号（全进程单调增、不复用）：备忘 / 回收的键用它而不是指针——表销毁后地址会被新表复用，按指针会误命中旧组
     void **objects;
     VkDescriptorImageInfo *images;
@@ -382,6 +387,7 @@ struct nvn_gpu_cmd_s {
     struct { nvn_gpu_buf buf; uint64_t off; } vbuf[16];
     struct { nvn_gpu_binding b; } binds[6][64];   // 每阶段一张表，bind 只替换该阶段
     uint32_t nbinds[6];
+    uint8_t sep_reduction_stages;
     uint8_t pool_active;
     nvn_gpu_pool_table pool_binds[6][64];  // 各阶段布局项上的池快照，cmd_ref 保活
     VkDescriptorPool *pool_dpools; uint32_t pool_ndpools, pool_dpool_cap;
@@ -2744,6 +2750,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         free(sh->ents);
         free(sh->tfmt);
         free(sh->write_bounds);
+        free(sh->sep_pairs);
         free(sh);
         sh = sn;
     }
@@ -3701,6 +3708,8 @@ static nvn_gpu_rc spv_texel_formats(const void *blob, size_t bytes,
     return r;
 }
 
+#include "backend_vulkan_sep_sampler.inc"
+
 static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s *sh) {
     struct nvn_gpu_shader_s **pp = &vk->shaders;
     while (*pp && *pp != sh) pp = &(*pp)->all_next;
@@ -3709,6 +3718,7 @@ static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s
     free(sh->ents);
     free(sh->tfmt);
     free(sh->write_bounds);
+    free(sh->sep_pairs);
     free(sh);
 }
 
@@ -4032,6 +4042,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
         }
         if (module_result == VK_SUCCESS && sh->stage == NVN_GPU_SH_CS && nvn_plat_flag("nvk_land_bound", 0))
             sh->write_bounds = s2a_spirv_write_bounds(ci.pCode, ci.codeSize, sh->entry, sh->ents, sh->nent);
+        if (module_result == VK_SUCCESS && g.dev->sampler_minmax_enabled && g.dev->minmax_image_mapping)
+            sep_spv_pairs(sh, ci.pCode, ci.codeSize);
         free(array_code);
         if (module_result != VK_SUCCESS) {
             free(sh->tfmt); free(sh->ents); free(sh);
@@ -6222,6 +6234,7 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
         }
     }
     uint32_t count = 0;
+    int separate_reduction = 0;
     for (uint32_t i = 0; i < n && i < 64; i++) {
         if (b[i].ent < 64 && c->pool_binds[st][b[i].ent]) {
             set_sticky(c, NVN_GPU_E_LAYOUT, "普通绑定与池表使用相同布局项"); return;
@@ -6245,7 +6258,11 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
             cmd_ref(c, b[i].u.ts.view, REF_VIEW);
             cmd_ref(c, b[i].u.ts.samp, REF_SAMP);
         } else if (b[i].cls == NVN_GPU_RES_TEX && b[i].u.view) cmd_ref(c, b[i].u.view, REF_VIEW);
-        else if (b[i].cls == NVN_GPU_RES_SAMP && b[i].u.samp) cmd_ref(c, b[i].u.samp, REF_SAMP);
+        else if (b[i].cls == NVN_GPU_RES_SAMP && b[i].u.samp) {
+            cmd_ref(c, b[i].u.samp, REF_SAMP);
+            if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+            separate_reduction |= b[i].u.samp->reduction != 0;
+        }
         else if (b[i].cls == NVN_GPU_RES_IMAGE && b[i].u.view) cmd_ref(c, b[i].u.view, REF_VIEW);
         else if (b[i].cls == NVN_GPU_RES_TBUF || b[i].cls == NVN_GPU_RES_IMAGE_TBUF) {
             if (!cmd_ref_texel_view(c, b[i].u.view, b[i].cls)) return;
@@ -6254,6 +6271,8 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
         count++;
     }
     c->nbinds[st] = count;
+    c->sep_reduction_stages &= (uint8_t)~(1u << st);
+    if (separate_reduction) c->sep_reduction_stages |= 1u << st;
 }
 
 // 测试读数：各类状态命令实际录了几次（下标同 ES_*：管线、视口、裁剪、混合常量、模板、深度偏移、顶点缓冲、索引缓冲、push）
@@ -6399,6 +6418,126 @@ static VkSampler samp_separate_average(struct nvn_gpu_samp_s *s) {
     return sampler;
 }
 
+enum {
+    SEP_FILTER_AVERAGE = 1, SEP_FILTER_MINMAX = 2, SEP_FILTER_INT = 4,
+    SEP_FILTER_ALL = SEP_FILTER_AVERAGE | SEP_FILTER_MINMAX | SEP_FILTER_INT,
+    SEP_FILTER_CHECKED = 8
+};
+
+// These caches are populated on the descriptor writer, with the views held by the command.
+static unsigned sep_view_caps(struct nvn_gpu_view_s *view) {
+    if (!view) return 0;
+    if (!(view->sep_filter_caps & SEP_FILTER_CHECKED)) {
+        nvn_fmt_info fi;
+        unsigned caps = SEP_FILTER_CHECKED;
+        if (view->aspect == VK_IMAGE_ASPECT_STENCIL_BIT ||
+            (nvn_fmt_info_of(view->nvn_format, &fi) && (fi.kind == NVN_FMT_UINT || fi.kind == NVN_FMT_SINT))) {
+            caps |= SEP_FILTER_INT;
+        } else if (view->aspect == VK_IMAGE_ASPECT_COLOR_BIT || view->aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(g.phys, view->format, &fp);
+            if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+                caps |= SEP_FILTER_AVERAGE;
+            if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT)
+                caps |= SEP_FILTER_MINMAX;
+        }
+        view->sep_filter_caps = (uint8_t)caps;
+    }
+    return view->sep_filter_caps & SEP_FILTER_ALL;
+}
+
+static unsigned sep_pool_image_caps(struct nvn_gpu_pool_table_s *t, uint16_t elem) {
+    if (elem != SEP_ANY_ELEMENT) return elem <= t->count ? sep_view_caps(t->objects[elem]) : 0;
+    if (!(t->sep_filter_caps & SEP_FILTER_CHECKED)) {
+        unsigned caps = SEP_FILTER_ALL;
+        for (uint32_t i = 0; i <= t->count && caps; i++) caps &= sep_view_caps(t->objects[i]);
+        t->sep_filter_caps = (uint8_t)(SEP_FILTER_CHECKED | caps);
+    }
+    return t->sep_filter_caps & SEP_FILTER_ALL;
+}
+
+static int sep_same_binding(const nvn_gpu_layout_ent *a, const nvn_gpu_layout_ent *b) {
+    return a->set == b->set && a->binding == b->binding && a->cls == b->cls;
+}
+
+static unsigned sep_image_caps(const struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p,
+                               int st0, int st1, const nvn_gpu_layout_ent *image, uint16_t elem) {
+    // An entire pool write follows the ordinary descriptor writes. Shared pools have already
+    // been checked for identity. Ordinary slots use the last write in stage order.
+    const uint32_t count = image->count ? image->count : 1;
+    struct nvn_gpu_view_s *views[64] = {0};
+    for (int st = st0; st < st1; st++) {
+        if (c->pool_active) {
+            for (uint32_t i = 0; i < p->stage_nent[st] && i < 64; i++) {
+                nvn_gpu_pool_table table = c->pool_binds[st][i];
+                if (table && sep_same_binding(image, &p->stage_ents[st][i]))
+                    return sep_pool_image_caps(table, elem);
+            }
+        }
+        for (uint32_t i = 0; i < c->nbinds[st]; i++) {
+            const nvn_gpu_binding *b = &c->binds[st][i].b;
+            if (b->cls != NVN_GPU_RES_TEX || b->ent >= p->stage_nent[st] ||
+                !sep_same_binding(image, &p->stage_ents[st][b->ent])) continue;
+            if (elem == SEP_ANY_ELEMENT) {
+                if (b->elem < 64) views[b->elem] = b->u.view;
+            } else if (b->elem == elem) views[0] = b->u.view;
+        }
+    }
+    if (elem != SEP_ANY_ELEMENT) return sep_view_caps(views[0]);
+    if (count > 64) return 0;
+    unsigned caps = SEP_FILTER_ALL;
+    for (uint32_t i = 0; i < count && caps; i++) caps &= sep_view_caps(views[i]);
+    return caps;
+}
+
+static VkSampler sep_reduction_sampler(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p,
+                                       int compute, const nvn_gpu_layout_ent *sampler, uint16_t elem,
+                                       struct nvn_gpu_samp_s *s) {
+    const int st0 = compute ? NVN_GPU_SH_CS : 0, st1 = compute ? NVN_GPU_SH_CS + 1 : NVN_GPU_SH_CS;
+    unsigned caps = SEP_FILTER_ALL;
+    int unknown = 0;
+    for (int st = st0; st < st1; st++) {
+        const struct nvn_gpu_shader_s *sh = compute ? p->cshader : p->key.st[st].sh;
+        if (!sh) continue;
+        if (sh->sep_pairs) {
+            for (uint32_t i = 0; i < sh->nsep_pairs; i++) {
+                const struct sep_pair *pair = &sh->sep_pairs[i];
+                if ((pair->sampler_elem == elem || pair->sampler_elem == SEP_ANY_ELEMENT) &&
+                    sep_same_binding(sampler, &sh->ents[pair->sampler]))
+                    caps &= sep_image_caps(c, p, st0, st1, &sh->ents[pair->image], pair->image_elem);
+            }
+            continue;
+        }
+        int uses_binding = 0;
+        for (uint32_t i = 0; i < sh->nent; i++) uses_binding |= sep_same_binding(sampler, &sh->ents[i]);
+        if (!uses_binding) continue;
+        // Unknown flow can use any separate image in this stage. Average only if every
+        // possible image supports it; an unknown pair never authorizes native reduction.
+        unknown = 1;
+        unsigned candidate = 0;
+        for (uint32_t i = 0; i < sh->nent; i++) {
+            if (sh->ents[i].cls != NVN_GPU_RES_TEX) continue;
+            candidate = 1;
+            caps &= sep_image_caps(c, p, st0, st1, &sh->ents[i], SEP_ANY_ELEMENT);
+        }
+        if (!candidate) caps = 0;
+    }
+    if (!unknown && (caps & SEP_FILTER_MINMAX)) return s->sampler;
+    if (!unknown && (caps & SEP_FILTER_INT)) return s->int_sampler;
+    if (!(caps & SEP_FILTER_AVERAGE)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_separate_view_format: no common legal filter for set %u binding %u element %u",
+                   sampler->set, sampler->binding, elem);
+        return VK_NULL_HANDLE;
+    }
+    VkSampler average = samp_separate_average(s);
+    if (!average) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduce_average_separate_create：无法建立平均采样器");
+        return VK_NULL_HANDLE;
+    }
+    nvn_unimpl("gpu", unknown ? "sampler_reduce_average_separate_unknown_format" : "sampler_reduce_average_separate_view_format", NULL);
+    return average;
+}
+
 // 把某阶段本笔绑定写进 wr/ii/bi；返回写入条数，出错置粘滞返回 -1。
 // 缺成员的新类别（IMAGE / TBUF / IMAGE_TBUF）报 E_LAYOUT；老类别保持 NULL 句柄空资源写法不变。
 // 只写 dirty 里的组（没变的组沿用上一笔的描述符集对象，不重写）。纹素缓冲的格式核对取决于管线，
@@ -6448,12 +6587,8 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
             memset(im, 0, sizeof *im);
             im->sampler = b->u.samp ? b->u.samp->sampler : VK_NULL_HANDLE;
             if (b->u.samp && b->u.samp->reduction) {
-                im->sampler = samp_separate_average(b->u.samp);
-                if (!im->sampler) {
-                    set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_average_separate_create：无法建立平均采样器");
-                    return -1;
-                }
-                nvn_unimpl("gpu", "sampler_reduce_average_separate_unknown_format", NULL);
+                im->sampler = sep_reduction_sampler(c, p, st == NVN_GPU_SH_CS, e, b->elem, b->u.samp);
+                if (!im->sampler) return -1;
             }
             w->pImageInfo = im;
             break;
@@ -6526,7 +6661,7 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
 
 // 带整池数组的组的键：各池绑定（绑定号, 池快照序号）的两路无序混合和（进段内备忘 / 回收的键）；own = 这一组里按（阶段, 条目）顺序遇到的第一张池快照（NULL = 这一组没有池绑定）。
 struct pool_set_info { uint64_t k1, k2; nvn_gpu_pool_table own; };
-static int pool_set_mask(struct nvn_gpu_cmd_s *, const struct nvn_gpu_pipe_s *, int, uint32_t *, struct pool_set_info *);
+static int pool_set_mask(struct nvn_gpu_cmd_s *, const struct nvn_gpu_pipe_s *, int, uint32_t *, uint32_t *, struct pool_set_info *);
 static int pool_alloc_set(struct nvn_gpu_cmd_s *, const struct nvn_gpu_pipe_s *, uint32_t, VkDescriptorSet *);
 static int pool_write_sets(struct nvn_gpu_cmd_s *, const struct nvn_gpu_pipe_s *, int, uint32_t, uint32_t);
 // 整池组回收（见 backend_vulkan_pool.inc 的 prs_*）。反馈拷贝在用时，这一笔整池（图像池）里要换成快照的项：
@@ -6547,17 +6682,29 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     }
     // A descriptor-free pipeline ignores bindings left by the previous pipeline.
     if (!p->nset) return 1;
-    uint32_t pool_mask = 0; struct pool_set_info pinfo[4] = {{0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}};   // 带整池数组的组；每组里各池绑定（绑定号, 池快照序号）的混合和，进备忘 / 回收的键
-    if (c->pool_active && !pool_set_mask(c, p, compute, &pool_mask, pinfo)) return 0;
+    uint32_t pool_mask = 0, reduction_pools = 0;
+    struct pool_set_info pinfo[4] = {{0}};   // 带整池数组的组；各池绑定（绑定号, 池快照序号）进备忘 / 回收的键
+    if (c->pool_active && !pool_set_mask(c, p, compute, &pool_mask, &reduction_pools, pinfo)) return 0;
     uint32_t dirty = c->desc_dirty & ((1u << p->nset) - 1u);
     // 哪一组都没变、布局和绑定点也没换：命令缓冲里绑着的就是这几组，不用重写也不用重绑。
     // 纹素缓冲的格式核对随管线变（见 write_binds），有这类绑定的管线不走这条近路。
     struct nvn_gpu_pipe_s *pm = (struct nvn_gpu_pipe_s *)(uintptr_t)p;
     if (!pm->texel_binds) {
         int8_t has = -1;
-        for (int st = 0; st <= NVN_GPU_SH_CS; st++) for (uint32_t i = 0; i < p->stage_nent[st]; i++)
-            if (p->stage_ents[st][i].cls == NVN_GPU_RES_TBUF || p->stage_ents[st][i].cls == NVN_GPU_RES_IMAGE_TBUF) has = 1;
+        for (int st = 0; st <= NVN_GPU_SH_CS; st++) for (uint32_t i = 0; i < p->stage_nent[st]; i++) {
+            const nvn_gpu_layout_ent *e = &p->stage_ents[st][i];
+            if (e->cls == NVN_GPU_RES_TBUF || e->cls == NVN_GPU_RES_IMAGE_TBUF) has = 1;
+            if (e->cls == NVN_GPU_RES_TEX) pm->sep_image_sets |= 1u << e->set;
+            if (e->cls == NVN_GPU_RES_SAMP) pm->sep_sampler_sets |= 1u << e->set;
+        }
         pm->texel_binds = has;
+    }
+    // The effective VkSampler is part of the ordinary memo key. If the paired image
+    // changed in another set, rebuild the sampler write before looking up that key.
+    if (dirty & p->sep_image_sets) {
+        const unsigned active_stages = compute ? 1u << NVN_GPU_SH_CS : (1u << NVN_GPU_SH_CS) - 1u;
+        if (c->sep_reduction_stages & active_stages) dirty |= p->sep_sampler_sets;
+        dirty |= reduction_pools;
     }
     if (!dirty && !c->dyn_dirty && p->texel_binds < 0) return 1;
     const uint8_t dynd = c->dyn_dirty;   // 只有动态 UBO 偏移变了：不重写组，下面只用新偏移重绑
@@ -6578,7 +6725,9 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     const int memo = memo_cur && dirty && (!pool_dirty || (g_pmemo_cur && !pool_fb));
     // 整池组回收（nvk_pool_rec，见 backend_vulkan_pool.inc 的 prs_*）：反馈拷贝在用时先算「整池里要换成快照的项」（补丁），太多就这一笔整个走老路径。
     struct prs_plan plan; plan.n = 0;
-    const int rec = g_prs_cur && pool_dirty && (!pool_fb || prs_plan(c, p, compute, pool_dirty, &plan));
+    // A reduction pool depends on the actual image bindings, beyond the immutable pool key.
+    uint32_t recyclable = g_prs_cur ? pool_dirty & ~reduction_pools : 0;
+    if (recyclable && pool_fb && !prs_plan(c, p, compute, recyclable, &plan)) recyclable = 0;
     uint32_t rec_mask = 0, valid_mask = 0, uidx[4] = {0, 0, 0, 0};   // 回收取到的组 / 其中整池内容已就绪的组 / 它们在本段取用记录里的下标
     if (pool_dirty) {
         const uint64_t np = (uint64_t)__builtin_popcount(pool_dirty);
@@ -6606,7 +6755,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
             if (dirty & (1u << set)) {
                 if (pool_mask & (1u << set)) {
                     int v = 0;
-                    if (rec && prs_take(c, p, set, sig[set], pinfo + set, c->desc_sets + set, &v, uidx + set)) { rec_mask |= 1u << set; if (v) valid_mask |= 1u << set; }
+                    if ((recyclable >> set & 1u) && prs_take(c, p, set, sig[set], pinfo + set, c->desc_sets + set, &v, uidx + set)) { rec_mask |= 1u << set; if (v) valid_mask |= 1u << set; }
                     else if (!pool_alloc_set(c, p, set, c->desc_sets + set)) return 0;
                 }
                 else if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set, pm, set, sig[set])) return 0;
@@ -6636,7 +6785,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
         for (uint32_t set = 0; set < p->nset; set++) {
             if (!(dirty & (1u << set))) continue;
             struct desc_memo *slot = NULL; int found = 0;
-            if (c->memo) for (uint32_t q = 0; q < 16; q++) {
+            if (c->memo && !(reduction_pools >> set & 1u)) for (uint32_t q = 0; q < 16; q++) {
                 struct desc_memo *m = &c->memo[(h1[set] + q) % DESC_MEMO_N];
                 if (!m->set) { slot = m; break; }
                 if (m->h1 == h1[set] && m->h2 == h2[set] && m->dsl == p->dsl[set]) { c->desc_sets[set] = m->set; found = 1; break; }
@@ -6644,7 +6793,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
             if (found) { hit |= 1u << set; continue; }
             if (pool_dirty >> set & 1) {
                 int v = 0;
-                if (rec && prs_take(c, p, set, sig[set], pinfo + set, c->desc_sets + set, &v, uidx + set)) { rec_mask |= 1u << set; if (v) valid_mask |= 1u << set; }   // 回收的整池组
+                if ((recyclable >> set & 1u) && prs_take(c, p, set, sig[set], pinfo + set, c->desc_sets + set, &v, uidx + set)) { rec_mask |= 1u << set; if (v) valid_mask |= 1u << set; }   // 回收的整池组
                 else if (!pool_alloc_set(c, p, set, c->desc_sets + set)) return 0;   // 整池组：单组专用池（和不备忘时同一条路）
             } else if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set, pm, set, sig[set])) return 0;
             if (slot && c->memo_n < DESC_MEMO_N * 3 / 4) { slot->h1 = h1[set]; slot->h2 = h2[set]; slot->dsl = p->dsl[set]; slot->set = c->desc_sets[set]; c->memo_n++; }
@@ -9475,6 +9624,7 @@ void nvn_gpu_vk_test_close_pipe_only(void) {
         free(sh->ents);
         free(sh->tfmt);
         free(sh->write_bounds);
+        free(sh->sep_pairs);
         free(sh);
         sh = sn;
     }

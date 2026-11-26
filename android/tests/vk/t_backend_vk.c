@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "nvn_backend.h"
+#include "nvn_refl.h"
 #include "nvn_unimpl.h"
 #include "nvn_vk_format.h"
 #include "nvn_vk_bcdec.h"
@@ -5533,75 +5534,166 @@ static void c976r_reduction(const char *dir) {
         if (samp) nvn_gpu_samp_release(samp);
         nvn_gpu_tex_release(ct);
     } else printf("C976r 边框 + min：设备缺所需能力，组合像素未测\n");
-    // 分离图像 / 采样器：配对格式未知，绘制必须实际走平均采样并只记一次降级。
-    if (g_dev.sampler_minmax_enabled && g_dev.minmax_image_mapping) {
-        nvn_gpu_layout_ent ents[2] = {{0}};
-        ents[0].cls = NVN_GPU_RES_TEX; ents[0].access = NVN_GPU_ACC_R; ents[0].binding = 0; ents[0].count = 2; ents[0].stages = 1u << NVN_GPU_SH_FS;
-        ents[1].cls = NVN_GPU_RES_SAMP; ents[1].access = NVN_GPU_ACC_R; ents[1].binding = 1; ents[1].count = 1; ents[1].stages = 1u << NVN_GPU_SH_FS;
-        nvn_gpu_layout fl = {0}; fl.ent = ents; fl.nent = 2;
-        nvn_gpu_shader vs = NULL, fs = NULL; void *vm = NULL, *fm = NULL;
-        if (load_shader_pair(dir, "tri3.vert", "arr2.frag", NULL, &fl, &vs, &fs, &vm, &fm)) {
-            nvn_gpu_pipe_desc pd; fill_gpipe_desc(&pd, vs, fs, 0);
-            nvn_gpu_pipe pipe = NULL; memset(&e, 0, sizeof e);
-            r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &e);
-            CHECK(OK(r) && pipe, "C976r 分离采样：管线 %d %s", r.code, e.why);
-            samp_par sp = {0}; sp.minf = NVN_MIN_FILTER_LINEAR; sp.magf = NVN_MAG_FILTER_LINEAR;
-            sp.ws = sp.wt = sp.wr = NVN_WRAP_MODE_CLAMP_TO_EDGE; sp.reduction = NVN_SAMPLER_REDUCTION_MIN;
-            nvn_gpu_samp samp = NULL; r = nvn_gpu_samp_create(&sp, &samp, &e);
-            CHECK(OK(r) && samp, "C976r 分离采样：建采样器 %d %s", r.code, e.why);
-            const uint8_t sep_texels[16] = {64,0,0,255, 192,0,0,255, 64,0,0,255, 192,0,0,255};
-            nvn_gpu_tex tex = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
-            nvn_gpu_view view = make_view(tex);
-            nvn_gpu_tex tex0 = make_tex(2, 2, NVN_FORMAT_RGBA8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
-            nvn_gpu_view view0 = make_view(tex0);
-            nvn_gpu_tex out = make_tex(64, 64, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED);
-            nvn_gpu_view ov = make_view(out);
-            nvn_gpu_buf rb = make_buf(64 * 64 * 4, NVN_GPU_MEM_SHARED, NULL), vb = full_vb();
-            if (pipe && samp && view && view0 && ov && rb && vb) {
-                uint64_t before = nvn_unimpl_count("gpu", "sampler_reduce_average_separate_unknown_format");
-                c = begin_cmd(); nvn_gpu_tex_upload(c, tex, 0, 0, NULL, sep_texels, 8, 16);
-                nvn_gpu_tex_upload(c, tex0, 0, 0, NULL, sep_texels, 8, 16);
-                nvn_gpu_pass_desc pass = {0};
-                pass.ncolor = 1; pass.color[0].view = ov; pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
-                pass.w = 64; pass.h = 64; pass.layers = 1;
-                nvn_gpu_pass_begin(c, &pass); nvn_gpu_set_pipe(c, pipe);
-                nvn_gpu_dyn dyn; full_dyn(&dyn); nvn_gpu_set_dyn(c, &dyn); nvn_gpu_set_vbuf(c, 0, vb, 0);
-                nvn_gpu_binding bs[3] = {{0}};
-                bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_TEX; bs[0].u.view = view0;
-                bs[1].ent = 0; bs[1].elem = 1; bs[1].cls = NVN_GPU_RES_TEX; bs[1].u.view = view;
-                bs[2].ent = 1; bs[2].cls = NVN_GPU_RES_SAMP; bs[2].u.samp = samp;
-                nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 3);
-                nvn_gpu_draw_args da = {0}; da.prim = 4; da.count = 3; da.instances = 1; nvn_gpu_draw(c, &da);
-                nvn_gpu_pass_end(c); nvn_gpu_copy_tex_buf(c, out, 0, 0, NULL, rb, 0, 64 * 4, 64 * 64 * 4);
-                memset(&e, 0, sizeof e); r = nvn_gpu_cmd_commit(c, ++signal, on_done, NULL, &e);
-                CHECK(OK(r), "C976r 分离采样：期望绘制成功 → rc=%d why=%s", r.code, e.why);
-                if (OK(r)) {
-                    r = nvn_gpu_fence_wait(signal, 5000000000ull, &e);
-                    CHECK(OK(r), "C976r 分离采样 wait：%s", e.why);
-                    if (OK(r)) {
-                        const uint8_t *pixel = (const uint8_t *)buf_cpu(rb) + (32 * 64 + 32) * 4;
-                        CHECK(pixel[0] >= 127 && pixel[0] <= 128, "C976r 分离采样：期望平均 0.5（127/128）→ %u", pixel[0]);
-                        printf("C976r 分离采样：期望平均 0.5（127/128）→ %u\n", pixel[0]);
-                    }
-                }
-                CHECK(nvn_unimpl_count("gpu", "sampler_reduce_average_separate_unknown_format") == before + 1,
-                      "C976r 分离采样：期望具名降级记录一次");
-            }
-            if (vb) nvn_gpu_buf_release(vb, NULL, NULL);
-            if (rb) nvn_gpu_buf_release(rb, NULL, NULL);
-            if (ov) nvn_gpu_view_release(ov);
-            if (out) nvn_gpu_tex_release(out);
-            if (view) nvn_gpu_view_release(view);
-            if (view0) nvn_gpu_view_release(view0);
-            if (tex) nvn_gpu_tex_release(tex);
-            if (tex0) nvn_gpu_tex_release(tex0);
-            if (samp) nvn_gpu_samp_release(samp);
-            if (vs) nvn_gpu_shader_release(vs);
-            if (fs) nvn_gpu_shader_release(fs);
-            free(vm); free(fm);
-        } else CHECK(0, "C976r 分离采样：着色器读取失败");
-    }
 
+}
+
+enum sep_test { SEP_TEST_ORDINARY, SEP_TEST_POOL, SEP_TEST_SPECIALIZED, SEP_TEST_DEPTH };
+
+// Keep the sampler bound while changing the image set. With a literal index only
+// element 0 is reachable. A specialization index requires checking both elements.
+static void c976r_separate(const char *dir, enum sep_test mode) {
+    if (!g_dev.sampler_minmax_enabled || !g_dev.minmax_image_mapping) return;
+    const int specialized = mode == SEP_TEST_SPECIALIZED;
+    const int depth = mode == SEP_TEST_DEPTH;
+    const int pooled = mode == SEP_TEST_POOL || specialized;
+    VkFormatProperties good, other;
+    vkGetPhysicalDeviceFormatProperties(g_dev.physical, depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R32_SFLOAT, &good);
+    vkGetPhysicalDeviceFormatProperties(g_dev.physical, VK_FORMAT_R32G32B32A32_SFLOAT, &other);
+    if (!(good.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT)) {
+        printf("C976r separate: %s lacks FILTER_MINMAX\n", depth ? "D32F" : "R32F");
+        return;
+    }
+    if (pooled && !g_dev.descriptor_indexing_enabled) {
+        printf("C976r separate pool: descriptor indexing unavailable\n");
+        return;
+    }
+    const int fallback = (other.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
+                         !(other.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT);
+    const nvn_gpu_layout_ent ents[] = {
+        {.cls = NVN_GPU_RES_TEX, .src_kind = pooled ? NVN_RB_TEXP : 0, .access = NVN_GPU_ACC_R,
+         .binding = 0, .count = 2, .stages = 1u << NVN_GPU_SH_FS},
+        {.cls = NVN_GPU_RES_SAMP, .src_kind = pooled ? NVN_RB_SAMPP : 0, .access = NVN_GPU_ACC_R,
+         .set = 1, .binding = 1, .count = 1, .stages = 1u << NVN_GPU_SH_FS},
+    };
+    const nvn_gpu_layout fl = {.ent = ents, .nent = 2};
+    nvn_gpu_shader vs = NULL, fs = NULL;
+    void *vm = NULL, *fm = NULL;
+    const char *const fragment = specialized ? "sep_minmax_spec.frag" : "sep_minmax.frag";
+    if (!load_shader_pair(dir, "tri3.vert", fragment, NULL, &fl, &vs, &fs, &vm, &fm)) {
+        CHECK(0, "C976r separate shader load");
+        return;
+    }
+    nvn_gpu_pipe_desc pd;
+    fill_gpipe_desc(&pd, vs, fs, 0);
+    pd.cfmt[0] = NVN_FORMAT_RGBA32F;
+    nvn_gpu_pipe pipe = NULL;
+    nvn_gpu_err err = {0};
+    nvn_gpu_rc r = nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err);
+    CHECK(OK(r) && pipe, "C976r separate pipeline: %d %s", r.code, err.why);
+    const float texels[4] = {0.125f, 0.375f, 0.625f, 0.875f};
+    const float rgba[4][4] = {{0.125f, 0, 0, 1}, {0.375f, 0, 0, 1},
+                             {0.625f, 0, 0, 1}, {0.875f, 0, 0, 1}};
+    const uint32_t usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD;
+    const uint32_t format = depth ? NVN_FORMAT_DEPTH32F : NVN_FORMAT_R32F;
+    nvn_gpu_tex tex[2] = {make_tex(2, 2, format, usage),
+                         make_tex(2, 2, fallback ? NVN_FORMAT_RGBA32F : format, usage)};
+    nvn_gpu_view view[2] = {make_view(tex[0]), make_view(tex[1])};
+    nvn_gpu_tex out = make_tex(64, 64, NVN_FORMAT_RGBA32F, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view ov = make_view(out);
+    enum { ROW_BYTES = 64 * 4 * sizeof(float), IMAGE_BYTES = ROW_BYTES * 64 };
+    nvn_gpu_buf readback = make_buf(4 * IMAGE_BYTES, NVN_GPU_MEM_SHARED, NULL), vb = full_vb();
+    nvn_gpu_samp samp[2] = {0};
+    nvn_gpu_pool_table images[2] = {0}, samplers[2] = {0};
+    samp_par sp = {.minf = NVN_MIN_FILTER_LINEAR, .magf = NVN_MAG_FILTER_LINEAR,
+                   .ws = NVN_WRAP_MODE_CLAMP_TO_EDGE, .wt = NVN_WRAP_MODE_CLAMP_TO_EDGE,
+                   .wr = NVN_WRAP_MODE_CLAMP_TO_EDGE};
+    for (unsigned i = 0; i < 2; i++) {
+        sp.reduction = i ? NVN_SAMPLER_REDUCTION_MAX : NVN_SAMPLER_REDUCTION_MIN;
+        r = nvn_gpu_samp_create(&sp, &samp[i], &err);
+        CHECK(OK(r) && samp[i], "C976r separate sampler: %d %s", r.code, err.why);
+        if (pooled) {
+            const nvn_gpu_pool_item item = {.state = NVN_GPU_POOL_READY, .resource.view = view[i]};
+            const nvn_gpu_pool_desc image_desc = {.kind = NVN_GPU_POOL_IMAGE, .count = 1,
+                                                  .items = &item, .dummy.view = view[1]};
+            r = nvn_gpu_pool_create(&image_desc, &images[i], &err);
+            CHECK(OK(r) && images[i], "C976r image table: %d %s", r.code, err.why);
+            const nvn_gpu_pool_desc sampler_desc = {.kind = NVN_GPU_POOL_SAMPLER, .dummy.samp = samp[i]};
+            r = nvn_gpu_pool_create(&sampler_desc, &samplers[i], &err);
+            CHECK(OK(r) && samplers[i], "C976r sampler table: %d %s", r.code, err.why);
+        }
+    }
+    if (!pipe || !view[0] || !view[1] || !ov || !readback || !vb || !samp[0] || !samp[1] ||
+        (pooled && (!images[0] || !images[1] || !samplers[0] || !samplers[1]))) goto done;
+
+    static const char *const names[] = {"ordinary", "pool", "pool specialization index", "depth"};
+    const char *const kind = names[mode];
+    const char *const label[] = {"min", "fallback", "min again", "max"};
+    const float expected[] = {0.125f, 0.5f, 0.125f, 0.875f};
+    const uint64_t bad_format = nvn_unimpl_count("gpu", "sampler_reduce_average_separate_view_format");
+    const uint64_t unknown = nvn_unimpl_count("gpu", "sampler_reduce_average_separate_unknown_format");
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_tex_upload(c, tex[0], 0, 0, NULL, texels, 2 * sizeof(float), sizeof texels);
+    nvn_gpu_tex_upload(c, tex[1], 0, 0, NULL, fallback ? (const void *)rgba : texels,
+                       fallback ? 2 * sizeof rgba[0] : 2 * sizeof(float), fallback ? sizeof rgba : sizeof texels);
+    nvn_gpu_pass_desc pass = {.ncolor = 1, .w = 64, .h = 64, .layers = 1};
+    pass.color[0] = (nvn_gpu_att){.view = ov, .load = NVN_GPU_LOAD_CLEAR, .store = NVN_GPU_STORE_STORE};
+    nvn_gpu_dyn dyn;
+    full_dyn(&dyn);
+    const nvn_gpu_draw_args draw = {.prim = 4, .count = 3, .instances = 1};
+    for (unsigned i = 0; i < 4; i++) {
+        if (i == 1 && !fallback) continue;
+        nvn_gpu_pass_begin(c, &pass);
+        nvn_gpu_set_pipe(c, pipe);
+        nvn_gpu_set_dyn(c, &dyn);
+        nvn_gpu_set_vbuf(c, 0, vb, 0);
+        if (pooled) {
+            r = nvn_gpu_pool_bind(c, NVN_GPU_SH_FS, 0, images[i == 1], &err);
+            CHECK(OK(r), "C976r bind image table: %d %s", r.code, err.why);
+            if (i == 0 || i == 3) {
+                r = nvn_gpu_pool_bind(c, NVN_GPU_SH_FS, 1, samplers[i == 3], &err);
+                CHECK(OK(r), "C976r bind sampler table: %d %s", r.code, err.why);
+            }
+        } else {
+            const nvn_gpu_binding bs[] = {
+                {.ent = 0, .cls = NVN_GPU_RES_TEX, .u.view = view[i == 1]},
+                {.ent = 0, .elem = 1, .cls = NVN_GPU_RES_TEX, .u.view = view[1]},
+                {.ent = 1, .cls = NVN_GPU_RES_SAMP, .u.samp = samp[i == 3]},
+            };
+            nvn_gpu_bind(c, NVN_GPU_SH_FS, bs, 3);
+        }
+        nvn_gpu_draw(c, &draw);
+        nvn_gpu_pass_end(c);
+        nvn_gpu_copy_tex_buf(c, out, 0, 0, NULL, readback, IMAGE_BYTES * i, ROW_BYTES, IMAGE_BYTES);
+    }
+    const uint64_t signal = 10000 + mode;
+    r = nvn_gpu_cmd_commit(c, signal, on_done, NULL, &err);
+    if (OK(r)) r = nvn_gpu_fence_wait(signal, 5000000000ull, &err);
+    CHECK(OK(r), "C976r separate %s readback: %s", kind, err.why);
+    if (OK(r) && buf_cpu(readback)) {
+        const float *pixels = (const float *)(const void *)buf_cpu(readback);
+        for (unsigned i = 0; i < 4; i++) {
+            if (i == 1 && !fallback) continue;
+            const float *p = pixels + (IMAGE_BYTES * i) / sizeof(float);
+            const float want[4] = {specialized && fallback ? 0.5f : expected[i], 0, 0, 1};
+            unsigned bad = 0;
+            for (unsigned j = 0; j < 64 * 64; j++) bad += memcmp(p + 4 * j, want, sizeof want) != 0;
+            printf("C976r separate %s %s expected=%g actual=%g pixels=%u/4096\n",
+                   kind, label[i], want[0], p[0], 4096 - bad);
+            CHECK(!bad, "C976r separate %s %s expected %g got %g, %u pixels differ",
+                  kind, label[i], want[0], p[0], bad);
+        }
+    }
+    const unsigned expected_fallbacks = fallback ? (specialized ? 4 : 1) : 0;
+    CHECK(nvn_unimpl_count("gpu", "sampler_reduce_average_separate_view_format") - bad_format == expected_fallbacks,
+          "C976r separate %s: expect %u named format fallbacks", kind, expected_fallbacks);
+    CHECK(nvn_unimpl_count("gpu", "sampler_reduce_average_separate_unknown_format") == unknown,
+          "C976r separate %s: shader proves the descriptor relation", kind);
+done:
+    if (vb) nvn_gpu_buf_release(vb, NULL, NULL);
+    if (readback) nvn_gpu_buf_release(readback, NULL, NULL);
+    if (ov) nvn_gpu_view_release(ov);
+    if (out) nvn_gpu_tex_release(out);
+    for (unsigned i = 0; i < 2; i++) {
+        if (images[i]) nvn_gpu_pool_release(images[i]);
+        if (samplers[i]) nvn_gpu_pool_release(samplers[i]);
+        if (view[i]) nvn_gpu_view_release(view[i]);
+        if (tex[i]) nvn_gpu_tex_release(tex[i]);
+        if (samp[i]) nvn_gpu_samp_release(samp[i]);
+    }
+    nvn_gpu_shader_release(vs);
+    nvn_gpu_shader_release(fs);
+    free(vm);
+    free(fm);
 }
 
 // C976r 格式负控：RGBA32F 不支持 FILTER_MINMAX 时，在真实的组合描述符路径具名拒绝。
@@ -11400,6 +11492,10 @@ int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[2], "--sampler-minmax-only")) {
         if (!open_backend()) return 1;
         c976r_reduction(argv[1]);
+        c976r_separate(argv[1], SEP_TEST_ORDINARY);
+        c976r_separate(argv[1], SEP_TEST_POOL);
+        c976r_separate(argv[1], SEP_TEST_SPECIALIZED);
+        c976r_separate(argv[1], SEP_TEST_DEPTH);
         nvn_gpu_err e = {0};
         CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "C976r close：%s", e.why);
         if (!open_backend()) return 1;
@@ -11747,8 +11843,12 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;   // 自己一个会话：围栏号 1..6，配额计数从 0 起
     c976b_border_color(argv[1]);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976b close：%d %s", e18.rc.code, e18.why);
-    if (!open_backend()) return 1;   // 自己一个会话：围栏号 1–4
+    if (!open_backend()) return 1;   // 自己一个会话：组合、普通分离描述符和整池分离描述符
     c976r_reduction(argv[1]);
+    c976r_separate(argv[1], SEP_TEST_ORDINARY);
+    c976r_separate(argv[1], SEP_TEST_POOL);
+    c976r_separate(argv[1], SEP_TEST_SPECIALIZED);
+    c976r_separate(argv[1], SEP_TEST_DEPTH);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C976r close：%d %s", e18.rc.code, e18.why);
     if (!open_backend()) return 1;
     c976r_bad_format(argv[1]);

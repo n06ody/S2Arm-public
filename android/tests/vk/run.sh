@@ -270,10 +270,11 @@ out=$(mktemp -d "$TMPDIR/s2a-nvn-vk.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 mkdir -p "$out/shaders"
 if [ "$mode" != "--pipe-call-lifetime" ]; then
-for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert msaa_read.frag count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag ubo_dyn.frag ubo_dyn9.frag ubo_dyn34.frag ubo_high.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp img_rgba8.comp tsamp.comp arr2.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
+for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert msaa_read.frag count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag ubo_dyn.frag ubo_dyn9.frag ubo_dyn34.frag ubo_high.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp img_rgba8.comp tsamp.comp arr2.frag sep_minmax.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
 "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/tbuf_replay.frag" -o "$out/shaders/tbuf_replay.frag.spv"
+"$glslc" --target-env=vulkan1.1 -DSPECIALIZE_IMAGE "$repo/android/tests/vk/shaders/sep_minmax.frag" -o "$out/shaders/sep_minmax_spec.frag.spv"
 fi
 
 inc=(-I "$repo/android/tests/vkhost"
@@ -748,13 +749,22 @@ if [[ "$mode" == --clear-capacity* ]]; then
 fi
 
 if [ "$mode" = "--sampler-minmax-only" ]; then
-    set +e
-    timeout 120 "$out/t_backend_vk" "$out/shaders" --sampler-minmax-only 2>&1 | tee "$out/sampler-minmax-log"
-    rc=${PIPESTATUS[0]}
-    set -e
-    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/sampler-minmax-log"; then
-        echo "【红】sampler minmax: rc=$rc or Vulkan validation error" >&2; exit 1
+    if [ "${VK_LAYER_VALIDATE_SYNC:-}" = 1 ] && [ -n "${VK_LAYER_SETTINGS_PATH:-}" ]; then
+        unset VK_LAYER_ENABLES  # Use the parity runner's nondeprecated sync settings.
     fi
+    for memo in 1 0; do
+        if [ "$memo" = 1 ]; then unset S2A_TEST_NVK_DQ; else export S2A_TEST_NVK_DQ=1; fi
+        export S2A_TEST_DESC_MEMO="$memo"
+        log="$out/sampler-minmax-memo-$memo.log"
+        echo "C976r mode: memo=$memo; deferred recording=${S2A_TEST_NVK_DQ:-0}"
+        set +e
+        timeout 120 "$out/t_backend_vk" "$out/shaders" --sampler-minmax-only 2>&1 | tee "$log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -ne 0 ] || rg -q 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
+            echo "【红】sampler minmax (memo=$memo): rc=$rc or Vulkan validation error" >&2; exit 1
+        fi
+    done
     exit 0
 fi
 
