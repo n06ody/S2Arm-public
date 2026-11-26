@@ -1112,6 +1112,17 @@ static int compute_read_view(nvn_gpu_view v) {
     if (!nvn_gpu_view_access_span(v, &span)) return -1;
     return rp_access_read(&g_compute_access, &span);
 }
+// 弱链接[replay]：nvn_gpu_shader_write_end
+// 弱链接[replay]：rp_post_gpu_write_prefix
+// Optional backend reflection for the final compute module. Zero means no proven endpoint.
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader, unsigned, unsigned, unsigned, uint32_t) __attribute__((weak));
+int rp_post_gpu_write_prefix(uint64_t, uint64_t, uint64_t) __attribute__((weak));
+// 首个会话直接派发；退出时只清缓存，以便下个会话使用自己的属性值。
+static int g_land_bound = -1;
+static int land_bound_on(void) {
+    if (g_land_bound < 0) g_land_bound = nvn_plat_flag("nvk_land_bound", 0) != 0;
+    return g_land_bound;
+}
 static uint32_t g_disp_dim[3];   // 这次派发的组数（计算阶段的驱动段 c0 里要有）
 
 // 两个省重开关（缺省开；正式包里 nvn_plat_flag 只返回缺省值）：
@@ -1260,7 +1271,16 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (clamped & 2) nvn_unimpl("draw", "storage_buffer_past_pool_end_clamped", rec);   // 伸出池尾的部分没有存储：照画，具名记账
                 // 回写只登记游戏绑定的那一段（窗口前补的余数字节不是这个缓冲的，回写会盖掉相邻内容）
                 if (e->access & NVN_GPU_ACC_W) { const uint64_t reach = wa + wl - sb->addr;   // 窗口里属于这个缓冲的长度（余数 < 对齐 ≤ 256，上限 ≥ 128 MiB，不会为负）
-                    rp_post_gpu_write(sb->addr, reach < blen ? reach : blen); }
+                    const uint64_t bytes = reach < blen ? reach : blen;
+                    uint64_t copy_bytes = bytes;
+                    if (st == 5 && sbufp && !g_disp_ind && g_disp_dim[0] &&
+                        g_disp_dim[1] && g_disp_dim[2] && land_bound_on() && nvn_gpu_shader_write_end && rp_post_gpu_write_prefix) {
+                        uint64_t end = nvn_gpu_shader_write_end(pg->sh[pi], i, e->set, e->binding, g_disp_dim[0]);
+                        uint64_t padding = sb->addr - wa;
+                        if (end > padding && end - padding < bytes) copy_bytes = end - padding;
+                    }
+                    if (copy_bytes < bytes) rp_post_gpu_write_prefix(sb->addr, bytes, copy_bytes);
+                    else rp_post_gpu_write(sb->addr, bytes); }
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
                 // 指针字节必须当前：先按写的来源解析那 8 字节（池镜像里 GPU 写过的部分不会被旧 guest 字节盖掉），
@@ -2566,7 +2586,7 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { g_land_bound = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941

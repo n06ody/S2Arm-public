@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "encoding_tables.glsl"
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source {
+    uvec4 blocks[];
+} src;
+layout(set = 0, binding = 1, std430) buffer Target {
+    uint needs_rgba;
+    uvec4 blocks[];
+} dst;
+layout(push_constant) uniform Params {
+    uint block_count;
+} params;
+
+uint extract(uvec4 block, uint offset, uint width) {
+    uint word = offset >> 5u;
+    uint shift = offset & 31u;
+    uint value = block[word] >> shift;
+    if (shift + width > 32u) value |= block[word + 1u] << (32u - shift);
+    return value & ((1u << width) - 1u);
+}
+
+uint quantize(uint value) {
+    return (q48[value >> 1u] >> (16u * (value & 1u))) & 0xffffu;
+}
+
+uint rgb_sum(uvec4 ep) {
+    return (ep.r >> 8u) + (ep.g >> 8u) + (ep.b >> 8u);
+}
+
+void put_color(inout uvec2 bits, uint offset, uint width, uint value) {
+    uint word = offset >> 5u;
+    uint shift = offset & 31u;
+    value &= (1u << width) - 1u;
+    bits[word] |= value << shift;
+    if (shift + width > 32u) bits[word + 1u] |= value >> (32u - shift);
+}
+
+// Q48 = 4 个二进制低位加 1 个 trit。按 ASTC BISE 的位数在每组符号间穿插 trit。
+uvec2 endpoint_bits(uvec4 ep0, uvec4 ep1) {
+    uint symbol[10] = uint[10](ep0.r, ep1.r, ep0.g, ep1.g, ep0.b, ep1.b, ep0.a, ep1.a, 0u, 0u);
+    const uint widths[5] = uint[5](2u, 2u, 1u, 2u, 1u);
+    const uint shifts[5] = uint[5](0u, 2u, 4u, 5u, 7u);
+    const uint powers[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+    uvec2 bits = uvec2(0u);
+    uint offset = 17u;
+    for (uint group = 0u; group < 2u; group++) {
+        uint index = 0u;
+        for (uint i = 0u; i < 5u; i++) index += ((symbol[group * 5u + i] >> 4u) & 3u) * powers[i];
+        uint code = trits[index >> 2u] >> (8u * (index & 3u));
+        for (uint i = 0u; i < (group == 0u ? 5u : 3u); i++) {
+            put_color(bits, offset, 4u, symbol[group * 5u + i]);
+            put_color(bits, offset + 4u, widths[i], code >> shifts[i]);
+            offset += 4u + widths[i];
+        }
+    }
+    return bits;
+}
+
+// 把 8 个两位权重扩成 8 个四位槽，给第二平面留位。
+uint spread(uint weights) {
+    weights &= 0xffffu;
+    weights = (weights | (weights << 8u)) & 0x00ff00ffu;
+    weights = (weights | (weights << 4u)) & 0x0f0f0f0fu;
+    return (weights | (weights << 2u)) & 0x33333333u;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.block_count) return;
+    uvec4 block = src.blocks[index];
+    bool mode6 = (block.x & 127u) == 64u;
+    bool mode5 = (block.x & 63u) == 32u;
+    if (!mode6 && !mode5) {
+        atomicOr(dst.needs_rgba, 1u);
+        return;
+    }
+
+    uvec4 ep0, ep1;
+    uint ccs = 0u;
+    uvec2 weights;
+    if (mode6) {
+        ep0 = uvec4(extract(block, 7u, 7u), extract(block, 21u, 7u),
+                    extract(block, 35u, 7u), extract(block, 49u, 7u)) * 2u + (block.y >> 31u);
+        ep1 = uvec4(extract(block, 14u, 7u), extract(block, 28u, 7u),
+                    extract(block, 42u, 7u), extract(block, 56u, 7u)) * 2u + (block.z & 1u);
+        weights = uvec2((block.z & ~15u) | ((block.z >> 1u) & 7u), block.w);
+    } else {
+        ep0 = uvec4(extract(block, 8u, 7u), extract(block, 22u, 7u),
+                    extract(block, 36u, 7u), extract(block, 50u, 8u));
+        ep1 = uvec4(extract(block, 15u, 7u), extract(block, 29u, 7u),
+                    extract(block, 43u, 7u), extract(block, 58u, 8u));
+        ep0.rgb = (ep0.rgb << 1u) | (ep0.rgb >> 6u);
+        ep1.rgb = (ep1.rgb << 1u) | (ep1.rgb >> 6u);
+        uint rotation = (block.x >> 6u) & 3u;
+        ccs = (rotation + 3u) & 3u;
+        if (rotation != 0u) {
+            uint a0 = ep0.a, a1 = ep1.a;
+            ep0.a = ep0[ccs];
+            ep1.a = ep1[ccs];
+            ep0[ccs] = a0;
+            ep1[ccs] = a1;
+        }
+        uint primary = ((block.z >> 2u) & 1u) | ((block.z & ~7u) >> 1u) | (block.w << 31u);
+        uint secondary = (block.w & ~3u) | ((block.w >> 1u) & 1u);
+        weights = uvec2(spread(primary) | (spread(secondary) << 2u),
+                        spread(primary >> 16u) | (spread(secondary >> 16u) << 2u));
+    }
+    ep0 = uvec4(quantize(ep0.r), quantize(ep0.g), quantize(ep0.b), quantize(ep0.a));
+    ep1 = uvec4(quantize(ep1.r), quantize(ep1.g), quantize(ep1.b), quantize(ep1.a));
+    // CEM12 的解码以量化后 RGB 和判定蓝收缩。换端点时，两平面的权重都要反向。
+    bool exchange = rgb_sum(ep0) > rgb_sum(ep1);
+    if (exchange) {
+        uvec4 swap = ep0;
+        ep0 = ep1;
+        ep1 = swap;
+        weights = ~weights;
+    }
+    uvec2 colors = endpoint_bits(ep0, ep1);
+
+    uint header = (mode6 ? 0x242u : 0x442u) | (12u << 13u);
+    dst.blocks[index] = uvec4(colors.x | header, colors.y | (ccs << 30u),
+                              bitfieldReverse(weights.y), bitfieldReverse(weights.x));
+}

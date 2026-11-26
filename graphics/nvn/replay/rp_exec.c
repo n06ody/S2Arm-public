@@ -165,6 +165,8 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     if (!g_cmd) return NULL;
+    // 资源同步是清除兑现边界。这里可能仍持资源锁，原视图由命令段保活。
+    if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd, RP_TF_FALL_TRANSFER);
     if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
@@ -478,6 +480,7 @@ static void seg_cut(int next_occ) {
     struct mid *m = calloc(1, sizeof *m);
     if (!m) { nvn_unimpl("timestamp", "segment_context_oom", NULL); return; } // 保留当前段，不丢捕获入口
     nvn_gpu_err err = {0};
+    if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd, RP_TF_FALL_BOUNDARY);
     submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
     if (m) { m->s = g_sub; m->ts = g_sub->ts_current; m->base = g_occ_base; m->t_commit = now_ns(); }
@@ -523,6 +526,7 @@ static uint64_t sub_commit_body(void) {
     nvn_gpu_err err = {0}; uint64_t f = g_fence + SUB_STEP;
     submit_pre(&err);
     nvn_gpu_cmd c = g_cmd; g_cmd = NULL;
+    rp_tex_async_step(c);
     // 契约：无论成败 done 恰好调一次（失败以 FAILED 调），所以 s 一定由 sub_done 释放
     uint64_t t0 = now_ns(); if (s) { s->t_commit = t0; s->fence = f; s->occ_base = g_occ_base; }
     if (s && (s->n || s->noe || s->ngw)) {
@@ -664,7 +668,7 @@ static void post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
 // 仅登记真正写到的行，不把行间 / 片间填充覆盖回游戏内存。
 // 数据相关重叠（nvk_sync_lag=4）：这一栅栏之后是否有「显卡会写游戏缓冲」的活。有 → 真等（游戏接下来要读它）；
 // 没有（只画不写）→ 放行，让 CPU 回放与显卡执行重叠。计算派发写存储缓冲 / 存储图像时走 rp_post_gpu_write* 登记，这里就是信号源。
-int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+static int post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t copy_bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
     __atomic_store_n(&g_wrote_since_wait, 1, __ATOMIC_RELEASE);
     struct sub *s = g_sub; uint64_t count = (uint64_t)rows * images;
     if (!s || !bytes || !count || count > (uint64_t)(INT_MAX - s->ngw)) return 0;
@@ -681,7 +685,7 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
     // 只有单笔（存储缓冲写）才允许并进本次提交里已有的登记：多行的失败回滚只能撤掉「这一次新记的」，已有那条被扩大后缩不回去
     // （扩出去的字节从没被显卡写过，落地会拿镜像里可能偏旧的内容盖掉游戏内存）。
     for (uint32_t z = 0; z < images; z++) for (uint32_t y = 0; y < rows; y++) {
-        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note2(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, &key, count == 1 ? &merged : NULL);
+        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note_prefix(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, copy_bytes, &key, count == 1 ? &merged : NULL);
         if (!id) {
             while (s->ngw > start) { struct gw_ev v = s->gw[--s->ngw]; rp_buf_gpu_write_land(v.pool_key, v.id, 0); }
             return 0;
@@ -690,6 +694,12 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
         s->gw[s->ngw++] = (struct gw_ev){.pool_key = key, .id = id};
     }
     return 1;
+}
+int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+    return post_gpu_write_rows(addr, bytes, bytes, row, image, rows, images);
+}
+int rp_post_gpu_write_prefix(uint64_t addr, uint64_t len, uint64_t copy_len) {
+    return post_gpu_write_rows(addr, len, copy_len, len, len, 1, 1);
 }
 int rp_post_gpu_write(uint64_t addr, uint64_t len) { return rp_post_gpu_write_rows(addr, len, len, len, 1, 1); }
 
@@ -726,6 +736,23 @@ void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
+
+// 只跨逻辑目标与纯状态。所有新命令默认是兑现边界，报告、传输、同步、
+// 递归和跳转也不借尚未核明的顺序继续挂起。
+static int tex_clear_can_cross(uint32_t op) {
+    switch (op) {
+        case OP_SET_RT: case OP_SCISSOR: case OP_VIEWPORTS: case OP_DEPTH_RANGE:
+        case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
+        case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
+        case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG:
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_STENCIL: case OP_POLY_OFFSET:
+        case OP_BLEND_COLOR: case OP_RAST_DISCARD: case OP_PRIM_RESTART: case OP_SET_PATCH_SIZE:
+        case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_DRAW: case OP_DRAW_IDX: case OP_CLEAR_TEX:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
@@ -830,8 +857,21 @@ static uint64_t exec_list(const uint8_t *p) {
     for (;;) {
         nvn_plat_safepoint();   // 一次提交可连续回放数秒：让平台的停世界事务在命令之间越过本线程（nvn_plat.h）
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (rec_bad(h)) { count_flush(&count_group, tm); nvn_unimpl("rec", "bad_record", p); break; }   // 按这条列表的 END 处理：走下面唯一的出口
+        if (rec_bad(h)) {
+            count_flush(&count_group, tm);
+            if (rp_tex_clear_active) rp_pass_land_tex_clear(g_cmd, RP_TF_FALL_BOUNDARY);
+            nvn_unimpl("rec", "bad_record", p);
+            break;
+        }
         if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush(&count_group, tm);
+        if (rp_tex_clear_active && !tex_clear_can_cross(h.op)) {
+            enum rp_tex_fold_result reason = RP_TF_FALL_BOUNDARY;
+            if (h.op == OP_END) reason = RP_TF_FALL_END;
+            else if (h.op == OP_BARRIER) reason = RP_TF_FALL_BARRIER;
+            else if (h.op == OP_COPY_T2T || h.op == OP_COPY_B2T || h.op == OP_COPY_T2B)
+                reason = RP_TF_FALL_TRANSFER;
+            rp_pass_land_tex_clear(g_cmd, reason);
+        }
         uint64_t t_cmd = tm ? now_ns() : 0;
         const void *a = p + 8;
         switch (h.op) {
@@ -863,15 +903,31 @@ static uint64_t exec_list(const uint8_t *p) {
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(g_cmd); break; }   // 其余计数器的报告值本来就写 0，复位无事可做
             case OP_RENDER_COND: rc_cond(a); break;
-            case OP_DRAW: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_draw t; rp_draw_stream = p; count_feed(&count_group, draw_rec(a, h.size, &t), NULL, p, tm); rp_draw_stream = NULL; break; }
-            case OP_DRAW_IDX: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_draw_idx t; rp_draw_stream = p; count_feed(&count_group, NULL, draw_idx_rec(a, h.size, &t), p, tm); rp_draw_stream = NULL; break; }
+            case OP_DRAW: {
+                if (g_rc_skip) break;
+                if (!count_group.n) pass_split();
+                p_draw t; const p_draw *dr = draw_rec(a, h.size, &t);
+                if (rp_tex_clear_active && (dr->ind || dr->tfc)) rp_pass_land_tex_clear(g_cmd, RP_TF_FALL_READ);
+                rp_draw_stream = p; count_feed(&count_group, dr, NULL, p, tm); rp_draw_stream = NULL;
+                break; }
+            case OP_DRAW_IDX: {
+                if (g_rc_skip) break;
+                if (!count_group.n) pass_split();
+                p_draw_idx t; const p_draw_idx *di = draw_idx_rec(a, h.size, &t);
+                if (rp_tex_clear_active && di->ind) rp_pass_land_tex_clear(g_cmd, RP_TF_FALL_READ);
+                rp_draw_stream = p; count_feed(&count_group, NULL, di, p, tm); rp_draw_stream = NULL;
+                break; }
             case OP_MULTI_DRAW: { if (g_rc_skip) break; if (!count_group.n) pass_split(); p_multi_draw m; if (h.size - 8 < sizeof m) { nvn_unimpl("rec", "multi_draw_short", p); break; } memcpy(&m, a, sizeof m); rp_multi_draw(g_cmd, &m, p); break; }
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); rp_pass_barrier((uint32_t)bits); break; }
             case OP_COPY_T2B: rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
-            case OP_CLEAR_TEX: rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
+            case OP_CLEAR_TEX:
+                // 贴图清除只有在收通道、兑现旧附件待清后才能入表。表非空说明已做过这一步。
+                if (!rp_tex_clear_active) rp_pass_flush(g_cmd);
+                rp_op_clear_tex(g_cmd, a, p);
+                break;
             case OP_DRAW_TEX: { if (g_rc_skip) break; p_draw_tex t; if (h.size - 8 < sizeof t) { nvn_unimpl("rec", "draw_tex_short", p); break; } memcpy(&t, a, sizeof t); rp_op_draw_tex(g_cmd, &t, p); break; }   // 通道内画，不收通道
             case OP_COPY_B2T: rp_pass_flush(g_cmd); rp_op_copy_b2t(g_cmd, a, p); break;   // 传输在通道外
             case OP_COPY_T2T: rp_pass_flush(g_cmd); rp_op_copy_t2t(g_cmd, a, p); break;   // 先落地待折清除：拷贝可能读写那些目标

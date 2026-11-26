@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x = 16) in;
+layout(set = 0, binding = 0, std430) buffer Output { uint words[]; } result;
+#ifdef DRIVER_BASE
+layout(set = 0, binding = 1, std140) uniform Driver { uvec4 table[50]; } driver;
+#endif
+void main() {
+    uint lane = gl_GlobalInvocationID.x;
+#ifdef DRIVER_BASE
+    uint base = driver.table[49].x;
+    uint index = (lane * 80u + 60u + base - (base & ~63u)) >> 2u;
+#else
+    uint index = 20u * lane + 15u;
+#endif
+#if defined(DATA_INDEX) || defined(ATOMIC_WRITE)
+    // A provable store in the same slot must not hide the second unproven writer.
+    result.words[640u + lane] = lane + 1u;
+#endif
+#ifdef DATA_INDEX
+    index = result.words[900u + lane];
+#endif
+#ifdef ATOMIC_WRITE
+    atomicAdd(result.words[index], lane + 1u);
+#else
+    result.words[index] = lane + 1u;
+#endif
+}

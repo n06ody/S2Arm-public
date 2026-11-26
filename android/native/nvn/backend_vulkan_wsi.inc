@@ -482,6 +482,20 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         // 留存读数（#1118）：视图表按存储认视图后，存储在共用表里留着时名下的视图与帧缓冲也留着；看它们在一局里是否有界（取这一刻的现存数，不是窗口平均）
         snprintf(b, sizeof b, "留存读数（取这一刻）：现存后端视图 %llu 个、帧缓冲缓存 %llu / %u 项", (unsigned long long)nvn_vk_dbg_view_stat(0), (unsigned long long)nvn_vk_dbg_view_stat(2), (unsigned)PC_FB_N);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+        if (atomic_load_explicit(&g_bw_diagnostic, memory_order_relaxed)) {
+            uint64_t bw[BW_N];
+            // 单独的窗口基线，既能看窗口增长，也不影响 nvn_gpu_stats 的累计值。
+            for (unsigned i = 0; i < BW_N; i++) {
+                const uint64_t total = atomic_load_explicit(&g_bw_counts[i], memory_order_relaxed);
+                bw[i] = total - g_bw_last_present[i];
+                g_bw_last_present[i] = total;
+            }
+            snprintf(b, sizeof b, "write-barriers window=300 skipped=%llu overlap=%llu capacity=%llu unknown=%llu intervening=%llu segment=%llu",
+                     (unsigned long long)bw[BW_SKIP], (unsigned long long)bw[BW_OVERLAP],
+                     (unsigned long long)bw[BW_CAPACITY], (unsigned long long)bw[BW_UNKNOWN],
+                     (unsigned long long)bw[BW_INTERVENING], (unsigned long long)bw[BW_SEGMENT]);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
+        }
         // 驱动调用数（每帧）：经过两级回放包装的各类 vkCmd*，按次数从多到少列前 10 类和总数
         { uint64_t c[OP_N], tot = 0; int idx[OP_N];
           for (int i = 0; i < OP_N; i++) { c[i] = __atomic_exchange_n(&g_dq_cnt[i], 0, __ATOMIC_RELAXED); tot += c[i]; idx[i] = i; }
@@ -657,6 +671,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        if (g.bc7_astc_on) atomic_fetch_add(&g.bc7_present, 1);
         uint64_t tnow = now_ns();
         if (!s->timing.start) s->timing.start = tnow;
         wsi_timing_submitted(&s->timing, timing_id);
