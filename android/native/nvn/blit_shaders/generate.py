@@ -17,9 +17,9 @@ lines = ['// SPDX-License-Identifier: Apache-2.0', '// Copyright 2026 S2Arm cont
          '#pragma once']
 
 
-def emit(directory, source, name, out, prefix):
+def emit(directory, source, name, out, prefix, *defines):
     target = Path(directory) / 'shader.spv'
-    subprocess.run([args.glslc, '--target-env=vulkan1.1', '-O', str(here/source), '-o', str(target)], check=True)
+    subprocess.run([args.glslc, '--target-env=vulkan1.1', '-O', *defines, str(here/source), '-o', str(target)], check=True)
     data = target.read_bytes()
     words = struct.unpack('<'+'I'*(len(data)//4), data)
     out.append('static const uint32_t '+prefix+name+'[] = {')
@@ -31,6 +31,8 @@ def emit(directory, source, name, out, prefix):
 with tempfile.TemporaryDirectory(prefix='s2a-depth-shaders-') as directory:
     for source, name in [('fullscreen.vert', 'vs'), ('depth.frag', 'depth'), ('stencil.frag', 'stencil')]:
         emit(directory, source, name, lines, 'k_dsb_')
+    for source, name in [('depth.frag', 'depth_msaa'), ('stencil.frag', 'stencil_msaa')]:
+        emit(directory, source, name, lines, 'k_dsb_', '-DBLIT_MSAA')
 (here.parent/'backend_vulkan_depth_blit_spv.h').write_text('\n'.join(lines)+'\n')
 
 # EASU present-pass shader (AMD FidelityFX FSR1, MIT). Kept in its own header so the

@@ -8107,7 +8107,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
         (fmt_bpp(s->format) || nvn_vk_format_is_depth(s->format) || compressed);
     VkOffset3D so, dof;
     VkExtent3D se, de;
-    if (!fmt_ok || slayer >= s->layers || dlayer >= d->layers ||
+    if (!fmt_ok || s->samples != d->samples || slayer >= s->layers || dlayer >= d->layers ||
         slevel >= s->levels || dlevel >= d->levels || slevel >= 32 || dlevel >= 32 ||
         copy_region(s, slevel, sr, &so, &se) || copy_region(d, dlevel, dr, &dof, &de) ||
         se.width != de.width || se.height != de.height || se.depth != de.depth ||
@@ -8678,9 +8678,134 @@ void nvn_gpu_barrier(nvn_gpu_cmd ch, uint32_t nvn_bits) {
 #include "backend_vulkan_depth_blit.inc"
 #include "backend_vulkan_easu.inc"
 
-// 带缩放 / 换格式的贴图拷贝。源、目标都取视图的第一级第一层；区域按各自那一级的像素给。
-// 颜色采用原生 blit；同格式 D24S8/D32FS8 最近点缩放采用辅助绘制，不依赖深度 BLIT 格式位。
-// 其它不支持的格式对报 UNSUPPORTED。sRGB 目标按 sRGB 编码（同颜色附件写入）。
+static uint32_t blit_mip_size(uint32_t size, uint32_t level) {
+    const uint32_t at_level = size >> level;
+    return at_level ? at_level : 1;
+}
+
+static int blit_scratch(struct nvn_gpu_cmd_s *c, uint32_t fmt, const NVNcopyRegion *region,
+                        int render, nvn_gpu_tex *image, nvn_gpu_view *view) {
+    const uint32_t caps = nvn_gpu_format_caps(fmt);
+    const uint32_t usage = (caps & NVN_GPU_FMT_SAMPLE ? NVN_GPU_TEX_SAMPLED : 0) |
+        (render && (caps & (NVN_GPU_FMT_DEPTH | NVN_GPU_FMT_RENDER)) ? NVN_GPU_TEX_RENDER : 0);
+    const nvn_gpu_tex_desc td = {
+        .d = {.target = NVN_TEXTURE_TARGET_2D, .format = fmt, .width = region->width,
+              .height = region->height, .depth = 1, .levels = 1, .samples = 1}, .usage = usage,
+    };
+    nvn_gpu_err err = {0};
+    nvn_gpu_rc rc = nvn_gpu_tex_create(&td, image, &err);
+    if (nvn_gpu_ok(rc)) rc = nvn_gpu_view_create(*image, NULL, view, &err);
+    if (nvn_gpu_ok(rc)) return 1;
+    set_sticky(c, rc.code, "blit 二维暂存：%s", err.why);
+    return 0;
+}
+
+// Vulkan 1.1 的三维 blit 两端 baseArrayLayer 必须为 0。绘制也不能把三维切片当作二维采样器。
+// 有此限制时只暂存所涉二维矩形，复制和绘制各自持有命令段引用。
+static void blit_stage_slices(struct nvn_gpu_cmd_s *c, nvn_gpu_view sv, const NVNcopyRegion *sr,
+                              const NVNcopyRegion *source_box, nvn_gpu_view dv, const NVNcopyRegion *dr,
+                              int linear, int stage_src, int stage_dst) {
+    nvn_gpu_tex images[2] = {NULL, NULL};
+    nvn_gpu_view views[2] = {NULL, NULL};
+    NVNcopyRegion a = *sr, b = *dr, box = *source_box;
+    if (stage_src) {
+        // 对线性过滤保留矩形边缘可能读到的相邻纹素。
+        if (linear && box.xoffset + box.width < (int)blit_mip_size(sv->tex->w, sv->base_level)) box.width++;
+        if (linear && box.yoffset + box.height < (int)blit_mip_size(sv->tex->h, sv->base_level)) box.height++;
+        if (linear && box.xoffset) { box.xoffset--; box.width++; }
+        if (linear && box.yoffset) { box.yoffset--; box.height++; }
+        a.xoffset -= box.xoffset; a.yoffset -= box.yoffset; a.zoffset = 0;
+    }
+    if (stage_dst) b.xoffset = b.yoffset = b.zoffset = 0;
+    const nvn_gpu_view original[2] = {sv, dv};
+    const NVNcopyRegion *regions[2] = {&box, &b};
+    for (unsigned i = 0; i < 2; i++) {
+        if (i == 0 ? !stage_src : !stage_dst) continue;
+        if (!blit_scratch(c, original[i]->tex->nvn_format, regions[i], i == 1, &images[i], &views[i])) goto release;
+    }
+    if (stage_src) {
+        const NVNcopyRegion tmp = {0, 0, 0, box.width, box.height, 1};
+        nvn_gpu_copy_tex(c, sv->tex, sv->base_level, 0, &box, images[0], 0, 0, &tmp);
+    }
+    nvn_gpu_blit(c, stage_src ? views[0] : sv, &a, stage_dst ? views[1] : dv, &b, linear);
+    if (stage_dst) nvn_gpu_copy_tex(c, images[1], 0, 0, &b, dv->tex, dv->base_level, 0, dr);
+release:
+    for (unsigned i = 0; i < 2; i++) {
+        if (views[i]) nvn_gpu_view_release(views[i]);
+        if (images[i]) nvn_gpu_tex_release(images[i]);
+    }
+}
+
+static void blit_resolve_color(struct nvn_gpu_cmd_s *c, nvn_gpu_view sv, nvn_gpu_view dv,
+                                VkOffset3D so, VkOffset3D dest, VkExtent3D extent) {
+    struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
+    const VkImageResolve region = {
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, sv->base_level, sv->base_layer, 1},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1},
+        .srcOffset = so, .dstOffset = dest, .extent = extent,
+    };
+    full_barrier(c);
+    image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    image_barrier(c, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
+    image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
+    cmd_ref(c, s, REF_TEX);
+    cmd_ref(c, d, REF_TEX);
+}
+
+static void blit_draw_color(struct nvn_gpu_cmd_s *c, nvn_gpu_view sv, const NVNcopyRegion *sr,
+                            nvn_gpu_view dv, const NVNcopyRegion *dr, int linear) {
+    struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
+    if (sv->p16_remap || dv->p16_remap || !(s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        !(d->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "颜色绘制拷贝：源缺采样用途、目标缺附件用途或使用 16 位退回格式");
+        return;
+    }
+    nvn_gpu_err err = {0};
+    const view_t selected = {.set_levels = 1, .base_level = sv->base_level, .nlevels = 1,
+                             .set_layers = 1, .min_layer = sv->base_layer, .nlayers = 1,
+                             .set_target = 1, .target = NVN_TEXTURE_TARGET_2D,
+                             .set_swizzle = 1, .swz = {2, 3, 4, 5}};
+    nvn_gpu_view sample_view = NULL;
+    const nvn_gpu_rc viewed = nvn_gpu_view_create(s, &selected, &sample_view, &err);
+    if (!nvn_gpu_ok(viewed)) { set_sticky(c, viewed.code, "颜色绘制拷贝源视图：%s", err.why); return; }
+    const samp_par params = {.minf = linear ? NVN_MIN_FILTER_LINEAR : NVN_MIN_FILTER_NEAREST,
+                             .magf = linear ? NVN_MAG_FILTER_LINEAR : NVN_MAG_FILTER_NEAREST,
+                             .ws = NVN_WRAP_MODE_CLAMP_TO_EDGE, .wt = NVN_WRAP_MODE_CLAMP_TO_EDGE,
+                             .wr = NVN_WRAP_MODE_CLAMP_TO_EDGE, .aniso = 1};
+    nvn_gpu_samp sampler = NULL;
+    const nvn_gpu_rc sampled = nvn_gpu_samp_create(&params, &sampler, &err);
+    if (!nvn_gpu_ok(sampled)) {
+        set_sticky(c, sampled.code, "颜色绘制拷贝采样器：%s", err.why);
+        nvn_gpu_view_release(sample_view);
+        return;
+    }
+    const float sw = (float)blit_mip_size(s->w, sv->base_level), sh = (float)blit_mip_size(s->h, sv->base_level);
+    const nvn_gpu_draw_tex_desc draw = {
+        .src = sample_view, .samp = sampler, .color_mask = 0xf,
+        .dst = {dr->xoffset, dr->yoffset, dr->width, dr->height},
+        .uv = {sr->xoffset / sw, sr->yoffset / sh, (sr->xoffset + sr->width) / sw, (sr->yoffset + sr->height) / sh},
+        .sc = {dr->xoffset, dr->yoffset, dr->width, dr->height}, .has_sc = 1,
+    };
+    nvn_gpu_pass_desc pass = {.w = blit_mip_size(d->w, dv->base_level), .h = blit_mip_size(d->h, dv->base_level),
+                              .layers = 1, .ncolor = 1};
+    pass.color[0].view = dv;
+    pass.color[0].load = NVN_GPU_LOAD_LOAD;
+    pass.color[0].store = NVN_GPU_STORE_STORE;
+    full_barrier(c);
+    image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
+    nvn_gpu_pass_begin(c, &pass);
+    if (rc_is(c->sticky, NVN_GPU_OK)) {
+        nvn_gpu_draw_tex(c, &draw);
+        nvn_gpu_pass_end(c);
+    }
+    nvn_gpu_view_release(sample_view);
+    nvn_gpu_samp_release(sampler);
+}
+
+// 取视图的首级首层。颜色的缩放和解析优先走原生传输，深度用绘制保证解析取样本 0。
 void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_gpu_view dv, const NVNcopyRegion *dr, int linear) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -8691,70 +8816,95 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if ((sv->p16_remap || dv->p16_remap) && s->nvn_format != d->nvn_format) {   // #975：按分量换算，退回格式的分量位置与 NVN 不同
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：16 位打包格式 0x%x → 0x%x 有一边走退回格式，按分量换算会错位", s->nvn_format, d->nvn_format); return;
     }
-    if (s->samples > 1 && d->samples == 1) {
-        nvn_fmt_info f;
-        if (linear || s->w != d->w || s->h != d->h || s->format != d->format || s->nvn_format != d->nvn_format ||
-            s->aspect != VK_IMAGE_ASPECT_COLOR_BIT || d->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
-            !nvn_fmt_info_of(s->nvn_format, &f) || f.kind == NVN_FMT_UINT || f.kind == NVN_FMT_SINT || f.depth || f.stencil ||
-            s->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_3D) {
-            // resolve 直接用 VkImage + 子资源范围画，不用采样视图的通道映射：视图带映射（游戏设的 / 没有 alpha 的格式把 a 钉成 ONE）不影响
-            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "resolve：只支持同格式非整数颜色二维贴图"); return;
-        }
-        VkOffset3D so, dof; VkExtent3D se, de;
-        if (sr->width <= 0 || sr->height <= 0 || dr->width <= 0 || dr->height <= 0 ||
-            sr->depth != 1 || dr->depth != 1 || sr->zoffset || dr->zoffset || copy_region(s, sv->base_level, sr, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) ||
-            sv->base_layer >= s->layers || dv->base_layer >= d->layers ||
-            se.width != de.width || se.height != de.height || se.depth != 1 || de.depth != 1 || so.z || dof.z) {
-            set_sticky(c, NVN_GPU_E_ARG, "resolve：区域越界或尺寸不相同"); return;
-        }
-        full_barrier(c);
-        image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        image_barrier(c, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkImageResolve ir = {0};
-        ir.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, sv->base_level, sv->base_layer, 1};
-        ir.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, dv->base_level, dv->base_layer, 1};
-        ir.srcOffset = so; ir.dstOffset = dof; ir.extent = se;
-        vkCmdResolveImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ir);
-        image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL); image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);
-        cmd_ref(c, s, REF_TEX); cmd_ref(c, d, REF_TEX);
+    if (s == d || d->samples != 1) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：须不同图像及单采样目标"); return;
+    }
+    if (s->bc_decoded || d->bc_decoded || nvn_vk_format_is_compressed(s->format) || nvn_vk_format_is_compressed(d->format)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：压缩格式不能缩放、镜像或换格式"); return;
+    }
+    // copy_region 的非正宽高有「整张」含义，先显式验证反向区域、普通区域和子资源。
+    const int flip_x = sr->width < 0, flip_y = sr->height < 0;
+    const int s3 = s->target == NVN_TEXTURE_TARGET_3D, d3 = d->target == NVN_TEXTURE_TARGET_3D;
+    const int64_t x = (int64_t)sr->xoffset + (flip_x ? sr->width : 0);
+    const int64_t y = (int64_t)sr->yoffset + (flip_y ? sr->height : 0);
+    const int64_t w = flip_x ? -(int64_t)sr->width : sr->width;
+    const int64_t h = flip_y ? -(int64_t)sr->height : sr->height;
+    if (x < 0 || x > INT32_MAX || y < 0 || y > INT32_MAX || w <= 0 || h <= 0 || w > INT32_MAX || h > INT32_MAX ||
+        dr->width <= 0 || dr->height <= 0 || (!s3 && sr->zoffset) || (!d3 && dr->zoffset) ||
+        sr->depth != 1 || dr->depth != 1) {
+        set_sticky(c, NVN_GPU_E_ARG, "blit 区域非法"); return;
+    }
+    const NVNcopyRegion normalized = {(int)x, (int)y, sr->zoffset, (int)w, (int)h, 1};
+    VkOffset3D so, dof; VkExtent3D se, de;
+    if (copy_region(s, sv->base_level, &normalized, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) ||
+        sv->base_layer >= s->layers || dv->base_layer >= d->layers) {
+        set_sticky(c, NVN_GPU_E_ARG, "blit 区域越界"); return;
+    }
+    if (nvn_vk_format_is_depth(s->format) || nvn_vk_format_is_depth(d->format)) {
+        if (linear) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "深度拷贝：只支持最近点过滤"); return; }
+        if (s3 || d3) blit_stage_slices(c, sv, sr, &normalized, dv, dr, linear, s3, d3);
+        else depth_blit(c, sv, sr, dv, dr);
         return;
     }
-    if (nvn_vk_format_is_depth(s->format) || nvn_vk_format_is_depth(d->format)) { depth_blit(c, sv, sr, dv, dr, linear); return; }
-    if (s->samples > 1 || d->samples > 1) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：多重采样没接"); return; }
-    { nvn_fmt_info a, b; int ai = nvn_fmt_info_of(s->nvn_format, &a) && (a.kind == NVN_FMT_UINT || a.kind == NVN_FMT_SINT), bi = nvn_fmt_info_of(d->nvn_format, &b) && (b.kind == NVN_FMT_UINT || b.kind == NVN_FMT_SINT);
-      if (ai || bi) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：整数格式没接"); return; } }
-    VkFormatProperties fs, fd; s2a_vk_format_properties(g.phys, s->format, &fs); s2a_vk_format_properties(g.phys, d->format, &fd);
-    if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
-        (linear && !(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：设备不支持这对格式（%d → %d，线性 %d）", (int)s->format, (int)d->format, linear); return; }
-    // copy_region 的非正宽高有「整张」含义，不能直接把反向区域交给它。
-    NVNcopyRegion normalized = *sr;
-    int flip_x = sr->width < 0, flip_y = sr->height < 0;
-    // 不扩展同图自拷贝；不同 NVN 身份可能仍别名到同一个后端图像。
-    if ((flip_x || flip_y) && s == d) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：同图镜像没接"); return; }
-    if (flip_x || flip_y) {
-        int64_t x = sr->xoffset, y = sr->yoffset, w = sr->width, h = sr->height;
-        if (flip_x) { x += w; w = -w; }
-        if (flip_y) { y += h; h = -h; }
-        if (x < 0 || y < 0 || x > INT32_MAX || y > INT32_MAX || w <= 0 || h <= 0 ||
-            w > INT32_MAX || h > INT32_MAX || sr->zoffset || sr->depth != 1 || dr->width <= 0 || dr->height <= 0 ||
-            s->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_3D) {
-            set_sticky(c, NVN_GPU_E_ARG, "blit 反向源区域非法"); return;
+    if (s->samples > 1) {
+        if (s3 || d3 || flip_x || flip_y || s->format != d->format ||
+            s->nvn_format != d->nvn_format ||
+            s->aspect != VK_IMAGE_ASPECT_COLOR_BIT || d->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "resolve：需要同格式颜色二维图像，区域不得反向"); return;
         }
-        normalized.xoffset = (int)x; normalized.yoffset = (int)y;
-        normalized.width = (int)w; normalized.height = (int)h;
+        if (se.width == de.width && se.height == de.height) {
+            if (linear) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "resolve：等尺寸解析无需过滤"); return; }
+            blit_resolve_color(c, sv, dv, so, dof, se);
+        } else {
+            // 原生解析按目标纹素同尺寸写出。缩放前只解析源区域到单采样图。
+            const NVNcopyRegion region = {0, 0, 0, (int)se.width, (int)se.height, 1};
+            nvn_gpu_tex image = NULL;
+            nvn_gpu_view view = NULL;
+            if (blit_scratch(c, s->nvn_format, &region, 0, &image, &view)) {
+                blit_resolve_color(c, sv, view, so, (VkOffset3D){0, 0, 0}, se);
+                nvn_gpu_blit(c, view, &region, dv, dr, linear);
+                nvn_gpu_view_release(view);
+            }
+            if (image) nvn_gpu_tex_release(image);
+        }
+        return;
     }
-    VkOffset3D so, dof; VkExtent3D se, de;
-    if (copy_region(s, sv->base_level, &normalized, &so, &se) || copy_region(d, dv->base_level, dr, &dof, &de) || sv->base_layer >= s->layers || dv->base_layer >= d->layers) { set_sticky(c, NVN_GPU_E_ARG, "blit 区域越界"); return; }
+    nvn_fmt_info a = {0}, b = {0};
+    if (!nvn_fmt_info_of(s->nvn_format, &a) || !nvn_fmt_info_of(d->nvn_format, &b)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：未知格式"); return;
+    }
+    const int ai = a.kind == NVN_FMT_UINT || a.kind == NVN_FMT_SINT;
+    const int bi = b.kind == NVN_FMT_UINT || b.kind == NVN_FMT_SINT;
+    if ((ai || bi) && (linear || a.kind != b.kind)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：整数须同数值类型及最近点过滤"); return;
+    }
+    VkFormatProperties fs, fd; s2a_vk_format_properties(g.phys, s->format, &fs); s2a_vk_format_properties(g.phys, d->format, &fd);
+    if (linear && !(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+        set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：源格式 %d 不支持线性过滤", (int)s->format); return;
+    }
+    const int native = (fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+                       (fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    // 3D 目的切片用 maintenance1 的逐片直拷落地。CI 驱动的混维原生
+    // blit 即使通过校验也曾写错切片（48 像素中 32 个与预期不符）。
+    if (d3 || (s3 && (!native || dv->base_layer))) {
+        blit_stage_slices(c, sv, sr, &normalized, dv, dr, linear, s3 && (!native || dv->base_layer), d3);
+        return;
+    }
+    if (!native) {
+        if (ai || bi) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：整数格式缺原生 blit 能力"); return; }
+        blit_draw_color(c, sv, sr, dv, dr, linear);
+        return;
+    }
     full_barrier(c);
     image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageBlit ib; memset(&ib, 0, sizeof ib);
     ib.srcSubresource = (VkImageSubresourceLayers){s->aspect, sv->base_level, sv->base_layer, 1};
     ib.dstSubresource = (VkImageSubresourceLayers){d->aspect, dv->base_level, dv->base_layer, 1};
-    ib.srcOffsets[0] = so; ib.srcOffsets[1] = (VkOffset3D){so.x + (int32_t)se.width, so.y + (int32_t)se.height, 1};
+    ib.srcOffsets[0] = so; ib.srcOffsets[1] = (VkOffset3D){so.x + (int32_t)se.width, so.y + (int32_t)se.height, so.z + 1};
     if (flip_x) { int32_t x = ib.srcOffsets[0].x; ib.srcOffsets[0].x = ib.srcOffsets[1].x; ib.srcOffsets[1].x = x; }
     if (flip_y) { int32_t y = ib.srcOffsets[0].y; ib.srcOffsets[0].y = ib.srcOffsets[1].y; ib.srcOffsets[1].y = y; }
-    ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, 1};
+    ib.dstOffsets[0] = dof; ib.dstOffsets[1] = (VkOffset3D){dof.x + (int32_t)de.width, dof.y + (int32_t)de.height, dof.z + 1};
     vkCmdBlitImage(c->cb, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ib, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, d, VK_IMAGE_LAYOUT_GENERAL);

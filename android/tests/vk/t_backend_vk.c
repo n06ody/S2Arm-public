@@ -8141,10 +8141,13 @@ static void c87_resolve_reject(int k) {
     CHECK(OK(nvn_gpu_tex_create(&td, &a, &e)), "C87 拒绝源创建：%s", e.why);
     td.d.samples = k == 4 ? 4 : 1;
     if (k == 1) td.d.format = NVN_FORMAT_BGRA8;
-    if (k == 7) td.d.width = 8;
+    if (k == 2) td.d.format = NVN_FORMAT_R32I;   // 整数异类仍拒绝；同类型解析另有逐像素夹具。
     CHECK(OK(nvn_gpu_tex_create(&td, &b, &e)), "C87 拒绝目标创建：%s", e.why);
     nvn_gpu_view av = make_view(a), bv = make_view(b); nvn_gpu_cmd c = begin_cmd();
-    NVNcopyRegion sr = {0, 0, 0, 4, 4, 1}, dr = sr; if (k == 0) dr.width = 2; if (k == 5) dr.width = 0;
+    NVNcopyRegion sr = {0, 0, 0, 4, 4, 1}, dr = sr;
+    if (k == 0) dr.width = 5;
+    if (k == 5) dr.width = 0;
+    if (k == 7) { sr.xoffset = 4; sr.width = -4; }
     nvn_gpu_blit(c, av, &sr, bv, &dr, k == 6);
     nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
     CHECK(rc.code == ((k == 0 || k == 5) ? NVN_GPU_E_ARG : NVN_GPU_E_UNSUPPORTED), "C87 拒绝 %d：%d %s", k, rc.code, e.why);

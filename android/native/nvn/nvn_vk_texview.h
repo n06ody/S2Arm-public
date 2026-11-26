@@ -39,7 +39,7 @@ static inline void nvn_vk_texview_plan_make(uint32_t target, uint32_t depth, uin
     // has_v && set_levels/set_layers 才写 level/slice，否则用描述符默认值）。
     if (attachment && !(v && v->set_levels)) { bl = 0; nl = 1; }
     if (attachment && !(v && v->set_layers)) { by = 0; ny = 1; }
-    const int image3d = target == NVN_TEXTURE_TARGET_3D && depth > 1;
+    const int image3d = target == NVN_TEXTURE_TARGET_3D;
     const uint32_t layer_cap = image3d ? depth : (layers ? layers : 1);
     p->base_level = bl; p->nlevels = nl; p->base_layer = by; p->nlayers = ny;
     if (!nl || !ny || bl + nl > (levels ? levels : 1) || by + ny > layer_cap) {

@@ -280,8 +280,14 @@ void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out) { memset(out, 0,
 static struct { nvn_gpu_tex s, d; uint32_t sl, sy, dl, dy; NVNcopyRegion sr, dr; } g_ct[8]; static int g_nct;
 void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t slayer, const NVNcopyRegion *sr, nvn_gpu_tex dst, uint32_t dlevel, uint32_t dlayer, const NVNcopyRegion *dr) {
     (void)c; if (g_nct < 8) { g_ct[g_nct].s = src; g_ct[g_nct].d = dst; g_ct[g_nct].sl = slevel; g_ct[g_nct].sy = slayer; g_ct[g_nct].dl = dlevel; g_ct[g_nct].dy = dlayer; g_ct[g_nct].sr = *sr; g_ct[g_nct].dr = *dr; } g_nct++; }
-static struct { nvn_gpu_view s, d; NVNcopyRegion sr, dr; int linear; } g_bl[4]; static int g_nbl;
-void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view s, const NVNcopyRegion *sr, nvn_gpu_view d, const NVNcopyRegion *dr, int linear) { (void)c; if (g_nbl < 4) { g_bl[g_nbl].s = s; g_bl[g_nbl].d = d; g_bl[g_nbl].sr = *sr; g_bl[g_nbl].dr = *dr; g_bl[g_nbl].linear = linear; } g_nbl++; }
+static struct { nvn_gpu_view s, d; NVNcopyRegion sr, dr; int linear; } g_bl[8]; static int g_nbl;
+void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view s, const NVNcopyRegion *sr, nvn_gpu_view d, const NVNcopyRegion *dr, int linear) {
+    (void)c;
+    if ((size_t)g_nbl < sizeof g_bl / sizeof g_bl[0]) {
+        g_bl[g_nbl].s = s; g_bl[g_nbl].d = d; g_bl[g_nbl].sr = *sr; g_bl[g_nbl].dr = *dr; g_bl[g_nbl].linear = linear;
+    }
+    g_nbl++;
+}
 // 贴图 ↔ 缓冲的拷贝：按发生的先后记一条（to_tex：1 = 缓冲到贴图；at_pass：这时已经开过几个通道 / 结束过几个）
 static struct { int to_tex; nvn_gpu_tex t; uint32_t level, layer; int w, h; uint64_t row, img; int begun, ended; } g_tb[8]; static int g_ntb;
 static int g_npd_now(void); static int g_ends_now(void);
@@ -6368,12 +6374,14 @@ static void t_color_copy_mirror(void) {
         pass_fresh(); g_nbl = g_nct = 0;
         tex_t a = mk_tex(302, 0, bad == 2 ? NVN_FORMAT_DEPTH24_STENCIL8 : bad == 3 ? NVN_FORMAT_R32UI : NVN_FORMAT_RGBA8, 16, 16, 1, 0), b = a;
         b.serial = bad == 10 ? a.serial : 303;
+        if (bad == 3) b.d.format = NVN_FORMAT_R32I;
         if (bad == 4) a.d.target = b.d.target = NVN_TEXTURE_TARGET_3D;
         if (bad == 6) a.d.samples = b.d.samples = 4;
         stream s = {0}; p_copy_t2t *o = put_t2t(&s, &a, &b); o->sr = (NVNcopyRegion){0, 0, 0, 8, 8, 1}; o->dr = o->sr;
         o->flags = NVN_COPY_FLAGS_MIRROR_Y_BIT;
         if (bad == 0) g_caps_remove = NVN_GPU_CAP_BLIT_SCALED;
         if (bad == 1) o->flags |= NVN_COPY_FLAGS_MIRROR_Z_BIT;
+        if (bad == 4) o->dr.zoffset = 1;   // 深度为 1 的三维目标没有这个切片
         if (bad == 5) o->sr.depth = o->dr.depth = 2;
         if (bad == 7) o->sr.width = 0;
         if (bad == 8) o->sr.xoffset = INT32_MAX;
@@ -6388,8 +6396,9 @@ static void t_copy_t2t(void) {
     pass_fresh(); g_nct = 0; g_nbl = 0;
     tex_t a = mk_tex(71, 0, NVN_FORMAT_RGBA8, 64, 32, 3, 0), b = mk_tex(72, 0x8000, NVN_FORMAT_RGBA8, 32, 16, 1, 0), f = mk_tex(73, 0xC000, NVN_FORMAT_R11G11B10F, 32, 16, 1, 0);
     a.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; a.d.depth = 4; nvn_tex_layout(&a.d, &a.L);
+    b.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; b.d.depth = 2; nvn_tex_layout(&b.d, &b.L);
     stream s = {0};
-    // 源：数组贴图的第 1 级、视图从第 1 层起，区域里再从第 1 层起拷 2 层；目标：单张的第 0 级
+    // 源：数组贴图第 1 级的两层；目标：双层数组的第 0 级
     p_copy_t2t *o = put_t2t(&s, &a, &b); o->has_sv = 1; o->sv.set_levels = 1; o->sv.base_level = 1; o->sv.set_layers = 1; o->sv.min_layer = 1;
     o->sr = (NVNcopyRegion){4, 2, 1, 16, 8, 2}; o->dr = (NVNcopyRegion){8, 4, 0, 16, 8, 2};
     o = put_t2t(&s, &a, &b); o->sr = (NVNcopyRegion){0, 0, 0, 32, 16, 1}; o->dr = (NVNcopyRegion){0, 0, 0, 16, 8, 1}; o->flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT;   // 缩放：后端的缩放拷贝，线性过滤
@@ -6399,7 +6408,7 @@ static void t_copy_t2t(void) {
     o = put_t2t(&s, &b, &b); o->sr = (NVNcopyRegion){0, 0, 0, 32, 16, 1}; o->dr = o->sr; o->flags = (int32_t)DM_COPY_RESOLVE;                         // 降采样记录、两边采样数相同：整张拷贝
     { tex_t ms = mk_tex(75, 0, NVN_FORMAT_RGBA8, 32, 16, 1, 0); ms.d.samples = 4; ms.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
       o = put_t2t(&s, &ms, &b); o->flags = DM_COPY_RESOLVE; }
-    // 整数、深度、缩放、反向采样转换仍记账，不能误走解析。
+    // 整数和深度可解析，较小目标取源角；反向采样转换仍明确拒绝。
     for (int k = 0; k < 4; k++) {
         tex_t ms = mk_tex(76 + k * 2, 0, k == 0 ? NVN_FORMAT_R32UI : k == 1 ? NVN_FORMAT_DEPTH32F : NVN_FORMAT_RGBA8, 32, 16, 1, 0);
         tex_t dst = ms; dst.serial++; ms.d.samples = 4; ms.d.target = NVN_TEXTURE_TARGET_2D_MULTISAMPLE;
@@ -6413,11 +6422,13 @@ static void t_copy_t2t(void) {
     CHECK(g_ct[0].sl == 1 && g_ct[0].sy == 2 && g_ct[0].dl == 0 && g_ct[0].dy == 0 && g_ct[0].sr.xoffset == 4 && g_ct[0].sr.width == 16 && g_ct[0].sr.depth == 1 && g_ct[0].sr.zoffset == 0 && g_ct[0].dr.xoffset == 8 && g_ct[0].dr.yoffset == 4);
     CHECK(g_ct[1].sy == 3 && g_ct[1].dy == 1 && g_ct[0].s != g_ct[0].d);
     CHECK(g_ct[2].sr.width == 32 && g_ct[2].sr.height == 16 && g_ct[2].s == g_ct[2].d);
-    CHECK(g_nbl == 3 && g_bl[0].linear == 1 && g_bl[0].sr.width == 32 && g_bl[0].dr.width == 16 && g_bl[0].dr.height == 8 && g_bl[0].s && g_bl[0].d && g_bl[0].s != g_bl[0].d);
+    CHECK(g_nbl == 6 && g_bl[0].linear == 1 && g_bl[0].sr.width == 32 && g_bl[0].dr.width == 16 && g_bl[0].dr.height == 8 && g_bl[0].s && g_bl[0].d && g_bl[0].s != g_bl[0].d);
     CHECK(g_bl[1].linear == 0 && g_bl[1].sr.width == 16 && g_bl[1].dr.width == 16);
     CHECK(g_bl[2].linear == 0 && g_bl[2].sr.width == 32 && g_bl[2].sr.height == 16 && g_bl[2].dr.width == 32 && g_bl[2].dr.depth == 1);
-    CHECK(nvn_unimpl_count("tex", "t2t_format_change") == 1 && nvn_unimpl_count("tex", "t2t_mirror") == 1 && nvn_unimpl_kinds() == 4);
-    CHECK(nvn_unimpl_count("tex", "t2t_multisample_resolve") == 3 && nvn_unimpl_count("tex", "t2t_downsample_case") == 1);
+    CHECK(nvn_unimpl_count("tex", "t2t_format_change") == 1 && nvn_unimpl_count("tex", "t2t_mirror") == 1 && nvn_unimpl_kinds() == 3);
+    CHECK(g_bl[3].sr.width == 32 && g_bl[4].sr.width == 32 && !g_bl[3].linear && !g_bl[4].linear);
+    CHECK(g_bl[5].sr.width == 16 && g_bl[5].dr.width == 16 && !g_bl[5].linear);
+    CHECK(nvn_unimpl_count("tex", "t2t_multisample_resolve") == 0 && nvn_unimpl_count("tex", "t2t_downsample_case") == 1);
     CHECK(nvn_be_tex_gpu_owned(72) == 1 && nvn_be_tex_gpu_owned(73) == 1 && nvn_be_tex_gpu_owned(71) == 0);
     pass_fresh();
 }

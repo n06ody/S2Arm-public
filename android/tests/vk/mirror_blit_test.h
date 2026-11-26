@@ -2,6 +2,7 @@
 // Copyright 2026 S2Arm contributors
 // Original pixels; real rp_op_copy_t2t and Vulkan transfers. Resource lookup is
 // a fixture mapping, not a test of the production texture registry/allocator.
+#include "nvn_tex.h"
 static const tex_t *mirror_objects[2];
 static nvn_gpu_tex mirror_images[2];
 static nvn_gpu_view mirror_views[2];
@@ -34,6 +35,7 @@ static void run_color_mirror(struct s2a_vk_device *device) {
         tex_t source={0},destination={0};source.d=desc.d;source.serial=1000+cases*2;
         GPU(nvn_gpu_tex_create(&desc,&mirror_images[0],&err));desc.d.format=NVN_FORMAT_RGBA8;
         destination.d=desc.d;destination.serial=source.serial+1;GPU(nvn_gpu_tex_create(&desc,&mirror_images[1],&err));
+        nvn_tex_layout(&source.d,&source.L);nvn_tex_layout(&destination.d,&destination.L);
         mirror_objects[0]=&source;mirror_objects[1]=&destination;mirror_view_count=0;
         uint32_t input[144],initial[144],spare[144];
         for(int y=0;y<12;y++)for(int x=0;x<12;x++) {

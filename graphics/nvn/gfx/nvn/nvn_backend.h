@@ -481,7 +481,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd c, nvn_gpu_tex src, uint32_t slevel, uint32_t 
                       nvn_gpu_tex dst, uint32_t dlevel, uint32_t dlayer, const NVNcopyRegion *dr);
 // 颜色 blit 的源区域可用负 width/height 表示反向端点：xoffset/yoffset 是起点，
 // 另一端为 offset+extent；后端先校验归一化矩形，再保留端点次序。目标仍为正尺寸。
-// 该约定不扩展多采样解析、深度模板复制及三维复制。
+// 三维视图取首级，区域 zoffset 选一个深度切片，depth 必须为 1。二维视图取首级首层，zoffset 为 0。
 void nvn_gpu_blit(nvn_gpu_cmd c, nvn_gpu_view src, const NVNcopyRegion *sr, nvn_gpu_view dst, const NVNcopyRegion *dr, int linear);   // 要 CAP_BLIT_SCALED
 void nvn_gpu_clear_view(nvn_gpu_cmd c, nvn_gpu_view v, const float rgba[4], const uint32_t uint4[4], int is_int);
 // v4：通道内把当前通道的附件按矩形清成给定值（NVN 带裁剪或带写掩码的 ClearColor / ClearDepthStencil；整屏全掩码的清除由核心折成 load = CLEAR，不走这里）。

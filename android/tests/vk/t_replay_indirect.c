@@ -353,13 +353,16 @@ static void run_land_noresync(struct s2a_vk_device *d, const char *dir, int enab
  GPU(nvn_gpu_close(5000000000ull,&err));
 }
 #include "mirror_blit_test.h"
+#include "copy_t2t_test.h"
 int main(int argc,char **argv) {
  int depth_only=argc==3&&!strcmp(argv[2],"--depth-only");
  int hoist_only=(argc==3&&!strcmp(argv[2],"--hoist-only"))||(argc==2&&getenv("S2A_REPLAY_INDIRECT_HOIST_ONLY"));   // 只跑通道级批量拷五例（变异负控用）
  int mirror_only=argc==3&&!strcmp(argv[2],"--mirror-only");
- if(argc!=2&&!depth_only&&!mirror_only&&!hoist_only)return 2;
+ int copy_only=argc==3&&!strcmp(argv[2],"--copy-t2t-only");
+ if(argc!=2&&!depth_only&&!mirror_only&&!hoist_only&&!copy_only)return 2;
  struct s2a_vk_device d;char why[256];
  if(s2a_vk_device_create(&d,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
+ if(copy_only){int result=run_copy_t2t(&d,argv[1]);check_copy_rejections(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return result;}
  if(hoist_only){for(int m=0;m<5;m++)run_hoist(&d,argv[1],m);REQUIRE(!s2a_vk_device_destroy(&d,1));printf("binst-hoist only: pixel-failures%u\n",failures);return failures?1:0;}
  if(mirror_only){run_color_mirror(&d);REQUIRE(!s2a_vk_device_destroy(&d,1));return 0;}
  if(!depth_only){
