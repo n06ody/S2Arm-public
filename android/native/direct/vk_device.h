@@ -28,6 +28,7 @@ struct s2a_vk_device {
     VkDevice device;
     VkQueue queue;
     uint32_t queue_family;
+    VkQueue sparse_queue;
     VkCommandPool command_pool;
     char driver_name[128];
     char driver_info[128];

@@ -114,6 +114,7 @@ enum {
                                                //   其余视图剥掉存储用途）。Vulkan（1.1+）置位；Metal 不置位，核心照旧按「不可写」跳过
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
+    NVN_GPU_CAP_TEX_SPARSE        = 1u << 26,  // 后端可创建已绑定驻留页的只读稀疏图像
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
@@ -226,6 +227,18 @@ typedef struct { uint32_t w, h, depth, levels, layers, samples; uint32_t nvn_for
 // 建贴图存储。内容未定义。身份（serial、别名、同池同偏移复用）全在核心，后端不缓存贴图。线程：[任意]。
 // 出错：NVN_GPU_E_UNSUPPORTED（格式 / 用途组合不支持，why 写格式号与用途位）、NVN_GPU_E_OOM。
 nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err);
+// 可选稀疏快照接口。每项覆盖一个客体页或一个客体尾级，两者都用像素区域表示。
+// resident 为 0 的项默认不上传。后端若将它落在物理尾级，设置 upload，调用方写零。
+// 后端负责建立绑定和初始化共享零块。其余 upload 项由调用方录制，用完不允许作为写入目标。
+typedef struct {
+    NVNcopyRegion region;
+    uint32_t level, layer;
+    uint8_t resident, upload;
+} nvn_gpu_sparse_region;
+nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
+    nvn_gpu_sparse_region *regions, uint32_t count, nvn_gpu_tex *out, nvn_gpu_err *err);
+nvn_gpu_rc nvn_gpu_tex_sparse_upload(nvn_gpu_cmd c, nvn_gpu_tex t, const nvn_gpu_sparse_region *region,
+    const void *bytes, uint64_t pitch, uint64_t size);
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out);   // 实际尺寸与格式（宽屏挂点读宿主宽高）。线程：[任意]
 // 可选：整张 CPU 块线性快照上传时为已证不透明的 BC1 选宿主压缩存储。
 // 返回 1 = 已录完整上传，0 = 沿用普通上传，-1 = 失败（命令段报错）。

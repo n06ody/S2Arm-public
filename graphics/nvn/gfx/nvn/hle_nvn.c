@@ -6000,21 +6000,40 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
 // Metal 稀疏贴图（nvn_mtl.m sp_upload）：[a, a+n) 按 64 KB 页出位图（bits 第 k 位 = 第 k 页 16 个 4 KB 小页全有物理页），一次加锁走完；
 //   没映射过的 2 MB 叶整块跳过。返回有映射的页数。a 须 64 KB 对齐（稀疏贴图存储按页对齐）
-uint64_t nvn_sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
-    uint64_t np = (n + 0xFFFF) >> 16, got = 0; memset(bits, 0, (size_t)((np + 7) >> 3));
+static uint64_t sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits, int require_all) {
+    const uint64_t np = (n + 0xFFFF) >> 16;
+    uint64_t got = 0;
+    memset(bits, 0, (size_t)((np + 7) >> 3));
     vp_lock(); struct vpool *v = vpool_at(pool, a);
     if (!v) { vp_unlock(); return 0; }
-    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
+    const uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
     for (uint64_t k = 0; k < np; k++) {
-        uint64_t o = o0 + (k << 16); int ok = 1;
-        for (uint64_t q = 0; q < 0x10000 && ok; q += 0x1000) {
-            const vpte *e = o + q < v->size ? vpt_get(v, o + q) : NULL;
-            if (!e) { ok = 0; uint64_t leaf_end = ((o + q) | ((2u << 20) - 1)) + 1; uint64_t kk = (leaf_end - o0) >> 16; if (kk > k + 1) k = kk - 1; break; }   // 向下取整：跨叶边界的那页照样逐个查   // 整个 2 MB 叶没映射：跳到叶尾
-            ok = e->phys != NULL;
+        const uint64_t o = o0 + (k << 16);
+        int mapped = require_all;
+        for (uint64_t q = 0; q < 0x10000; q += 0x1000) {
+            const uint64_t at = o + q;
+            const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
+            if (!e) {
+                const uint64_t leaf_end = (at | ((2u << 20) - 1)) + 1;
+                const uint64_t next = (leaf_end - o0) >> 16;
+                if (next > k + 1) k = next - 1;   // Skip complete guest pages in an absent leaf.
+                if (require_all) { mapped = 0; break; }
+                if (leaf_end >= o + 0x10000) break;
+                continue;
+            }
+            const int present = e->phys != NULL;
+            if (present != require_all) { mapped = present; break; }
         }
-        if (ok) { bits[k >> 3] |= (uint8_t)(1u << (k & 7)); got++; }
+        if (mapped) { bits[k >> 3] |= (uint8_t)(1u << (k & 7)); got++; }
     }
     vp_unlock(); return got;
+}
+uint64_t nvn_sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
+    return sparse_map_bits(pool, a, n, bits, 1);
+}
+// Replay snapshots keep partial guest pages and zero their missing 4 KiB portions on upload.
+uint64_t nvn_sparse_map_any_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
+    return sparse_map_bits(pool, a, n, bits, 0);
 }
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, GA(ib), GA(ind)});

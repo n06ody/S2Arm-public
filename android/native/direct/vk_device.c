@@ -239,6 +239,15 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     for (uint32_t i = 0; i < family_count; i++)
         if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
             families[i].queueCount > 0) { out->queue_family = i; found = 1; break; }
+    uint32_t sparse_family = UINT32_MAX;
+    if (found && (families[out->queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT))
+        sparse_family = out->queue_family;
+    else for (uint32_t i = 0; i < family_count; i++) {
+        if (families[i].queueCount && (families[i].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT)) {
+            sparse_family = i;
+            break;
+        }
+    }
     free(families);
     if (!found) return fail(why, why_size, "no graphics+compute queue family");
 
@@ -306,9 +315,9 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     enabled_features.variableMultisampleRate = features.variableMultisampleRate;
     enabled_features.shaderFloat64 = VK_FALSE;
     enabled_features.shaderInt64 = VK_FALSE;
-    enabled_features.sparseBinding = VK_FALSE;
-    enabled_features.sparseResidencyBuffer = VK_FALSE;
-    enabled_features.sparseResidencyImage2D = VK_FALSE;
+    enabled_features.sparseBinding = sparse_family != UINT32_MAX && features.sparseBinding && features.sparseResidencyImage2D;
+    enabled_features.sparseResidencyImage2D = enabled_features.sparseBinding;
+    enabled_features.sparseResidencyAliased = enabled_features.sparseBinding && features.sparseResidencyAliased;
     // #1456：与通用侧同一个能力位——capprobe 结果文件判 gs_occlusion 可用才启用 GS；
     // 名单/探测/运行时回写说不行（或无结果文件）就关，走已验证的转计算。
     // 直连执行层首版不建 GS 管线，此位只决定设备特性是否启用并如实进入 caps JSON。
@@ -656,15 +665,20 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
     }
 
     float priority = 1.0f;
-    VkDeviceQueueCreateInfo queue_info = {0};
-    queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_info.queueFamilyIndex = out->queue_family;
-    queue_info.queueCount = 1;
-    queue_info.pQueuePriorities = &priority;
+    VkDeviceQueueCreateInfo queues[2] = {
+        { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = out->queue_family,
+          .queueCount = 1, .pQueuePriorities = &priority },
+    };
+    uint32_t queue_count = 1;
+    if (enabled_features.sparseBinding && sparse_family != out->queue_family) {
+        queues[1] = queues[0];
+        queues[1].queueFamilyIndex = sparse_family;
+        queue_count++;
+    }
     VkDeviceCreateInfo device_info = {0};
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount = queue_count;
+    device_info.pQueueCreateInfos = queues;
     device_info.pEnabledFeatures = &enabled_features;
     device_info.enabledExtensionCount = device_ext_count;
     device_info.ppEnabledExtensionNames = device_ext;
@@ -738,6 +752,7 @@ int s2a_vk_device_create(struct s2a_vk_device *out, char *why, size_t why_size) 
         out->draw_indirect_count_enabled = out->draw_indirect_count && out->draw_indexed_indirect_count;
     }
     vkGetDeviceQueue(out->device, out->queue_family, 0, &out->queue);
+    if (enabled_features.sparseBinding) vkGetDeviceQueue(out->device, sparse_family, 0, &out->sparse_queue);
     VkCommandPoolCreateInfo pool = {0};
     pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

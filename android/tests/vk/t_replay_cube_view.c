@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // 声明与登记目标相同时，用真实回放资源、Vulkan 视图和采样读回检查立方体的范围。
 #define main backend_fixture_main
+#define nvn_plat_flag fixture_base_flag
 #include "t_backend_vk.c"
 #undef main
+#undef nvn_plat_flag
 #include "rp_exec.h"
 #include "rp_res.h"
 #include "nvn_tex.h"
+
+static int fixture_sparse_native;
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_sparse_native_mb")) return fixture_sparse_native < 0 ? -1 : fixture_sparse_native ? 0 : dflt;
+    return fixture_base_flag(name, dflt);
+}
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
@@ -36,13 +44,16 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImageView(
     return rc;
 }
 
-static void finish(nvn_gpu_cmd cmd) {
+static void finish_expected(nvn_gpu_cmd cmd, int want) {
     static uint64_t signal;
     nvn_gpu_err err = {0};
     ++signal;
-    CHECK(OK(nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err)), "submit: %s", err.why);
-    CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
+    const nvn_gpu_rc result = nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err);
+    CHECK(result.code == want, "submit code=%d expected=%d: %s", result.code, want, err.why);
+    if (want == NVN_GPU_OK) CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
+    else CHECK(strstr(err.why, "sparse_snapshot_write"), "sparse write must give a named rejection: %s", err.why);
 }
+static void finish(nvn_gpu_cmd cmd) { finish_expected(cmd, NVN_GPU_OK); }
 
 static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t pixels[64 * 64 * 4]) {
     const nvn_gpu_layout_ent ents[] = {
@@ -156,6 +167,8 @@ static void check_sample(const char *dir, const char *label, int id, int want, c
     printf("%s pixels=%u/%d\n", label, matched, n);
 }
 
+#include "sparse_residency_test.h"
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     char why[256] = {0};
@@ -208,6 +221,10 @@ int main(int argc, char **argv) {
     check_sample(argv[1], "five-layer 2D array control", 7, NVN_TEXTURE_TARGET_2D_ARRAY, "arr.frag",
                  VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 5, 1);
     rp_res_reset();
+    const int sparse_native_supported = sparse_fixture_probe();
+    check_sparse_residency(0);
+    if (sparse_native_supported) check_sparse_residency(1);
+    check_large_sparse(sparse_native_supported);
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
     s2a_vk_device_destroy(&g_dev, 1);

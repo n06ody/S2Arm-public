@@ -123,6 +123,7 @@ struct nvn_gpu_tex_s {
     uint64_t access_id;
     VkImage image;
     VkDeviceMemory memory;
+    VkDeviceSize sparse_address_bytes;  // 保留的稀疏虚拟地址空间，物理分配另记 mem_size
     VkDeviceSize mem_size; uint32_t mem_type;   // 这块显存向驱动要的大小和内存类型（还回 texmem 池时用）
     VkImageView view;
     VkFormat format, sample_format;
@@ -499,6 +500,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_cmd_s *live;
     struct nvn_gpu_buf_s *bufs;
     struct nvn_gpu_tex_s *texs;
+    VkDeviceSize sparse_address_bytes;   // g_mu
     struct nvn_gpu_view_s *views;
     struct nvn_gpu_samp_s *samps;
     struct nvn_gpu_pool_table_s *pools;
@@ -1241,7 +1243,10 @@ static void destroy_tex_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t) {
     pc_drop_view(t->view); LIFE_ADD(6);
     if (t->view) vkDestroyImageView(vk->d, t->view, NULL);
     if (t->image) vkDestroyImage(vk->d, t->image, NULL);
-    texmem_give(vk->d, t->memory, t->mem_size, t->mem_type);
+    if (t->sparse_address_bytes) {
+        vk->sparse_address_bytes -= t->sparse_address_bytes;
+        if (t->memory) vkFreeMemory(vk->d, t->memory, NULL);
+    } else texmem_give(vk->d, t->memory, t->mem_size, t->mem_type);
     LIFE_ADD(7);
     if (t->bc_sbuf) vkDestroyBuffer(vk->d, t->bc_sbuf, NULL);
     if (t->bc_smem) vkFreeMemory(vk->d, t->bc_smem, NULL);
@@ -1723,6 +1728,7 @@ static void fill_caps(struct nvn_gpu_vk *vk, const nvn_gpu_open_desc *d) {
     if (vk->bc_time_on || (vk->bc1_astc_on && !f.textureCompressionBC && f.textureCompressionASTC_LDR))
         c->caps |= NVN_GPU_CAP_BC1_SNAPSHOT;
     if (g_deswizzle.pipe) c->caps |= NVN_GPU_CAP_GPU_DESWIZZLE;
+    if (vk->dev->sparse_queue) c->caps |= NVN_GPU_CAP_TEX_SPARSE;
     c->caps |= NVN_GPU_CAP_BLIT_SCALED;   // vkCmdBlitImage；具体格式对行不行在 nvn_gpu_blit 里逐次按格式特性判
     c->caps |= NVN_GPU_CAP_BLIT_DEPTH_STENCIL; // 辅助绘制拷贝；具体格式仍须有采样与深度模板附件能力
     // 不声明 NVN_GPU_CAP_NO_ATTACH_PASS（11-15 撤回，#697）：零附件通道在 Mali-G710 r32p1 上让一款大作标题页 / 场景整片发红（d1c76bd63 起，
@@ -5912,7 +5918,9 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     if (d->depth.view && d->stencil.view && d->depth.view != d->stencil.view) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 的深度与模板必须是同一个视图"); return; }
     uint32_t attachment_samples = 0;
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (d->color[i].view) {
-        uint32_t n = d->color[i].view->tex->samples;
+        const struct nvn_gpu_tex_s *t = d->color[i].view->tex;
+        if (t->sparse_address_bytes) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: attachment"); return; }
+        const uint32_t n = t->samples;
         if (attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 颜色附件样本数不一致"); return; }
         attachment_samples = n;
     }
@@ -6476,6 +6484,10 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
             break;
         case NVN_GPU_RES_IMAGE:
             if (!b->u.view) { set_sticky(c, NVN_GPU_E_LAYOUT, "IMAGE 绑定缺 view"); return -1; }
+            if (b->u.view->tex->sparse_address_bytes) {
+                set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: storage image");
+                return -1;
+            }
             if (b->u.view->p16_remap) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "IMAGE 绑定：16 位打包格式 0x%x 在本设备走退回格式，不能当存储图像", b->u.view->nvn_format); return -1; }
             memset(im, 0, sizeof *im);
             im->imageView = view_image_form(b->u.view);   // 带通道映射的视图不能当存储图像用：另建恒等形态
@@ -7260,7 +7272,22 @@ static int tex_fmt_allowed(const struct nvn_gpu_tex_s *t, VkFormat f) {
     return 0;
 }
 
-nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err) {
+#include "backend_vulkan_sparse.inc"
+
+static void tex_create_discard(struct nvn_gpu_tex_s *t) {
+    if (t->view) vkDestroyImageView(g.d, t->view, NULL);
+    if (t->image) vkDestroyImage(g.d, t->image, NULL);
+    if (t->memory) vkFreeMemory(g.d, t->memory, NULL);
+    if (t->sparse_address_bytes) {
+        pthread_mutex_lock(&g_mu);
+        g.sparse_address_bytes -= t->sparse_address_bytes;
+        pthread_mutex_unlock(&g_mu);
+    }
+    free(t);
+}
+
+static nvn_gpu_rc tex_create(const nvn_gpu_tex_desc *d, struct sparse_image *sp,
+                            nvn_gpu_tex *out, nvn_gpu_err *err) {
     const uint64_t tc_t0 = now_ns();
     if (!session_accepting()) return fail(err, NVN_GPU_E_STOPPED, "会话正在关闭 / 未打开");
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
@@ -7326,6 +7353,20 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     }
     if (d->usage & NVN_GPU_TEX_STORAGE) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (bc_decoded && bc1_astc_storage((uint32_t)d->d.format, d, itype, layers, iflags, &fmt)) sample_fmt = fmt;
+    const int alias_holes = sp && !g.dev->properties.sparseProperties.residencyNonResidentStrict &&
+                            g.dev->core_features.sparseResidencyAliased;
+    if (sp) {
+        if (!g.dev->sparse_queue || itype != VK_IMAGE_TYPE_2D || samples != 1 || bc_decoded ||
+            nvn_vk_format_is_depth(fmt) || nvn_fmt_expand_target(d->d.format, NULL, NULL) ||
+            (d->usage & (NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE)))
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse sampled image usage/format");
+        iflags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+        if (alias_holes) iflags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        uint32_t layouts = 0;
+        vkGetPhysicalDeviceSparseImageFormatProperties(g.phys, fmt, itype, VK_SAMPLE_COUNT_1_BIT, usage,
+                                                       VK_IMAGE_TILING_OPTIMAL, &layouts, NULL);
+        if (!layouts) return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse image format/usage");
+    }
     // 可改格式的三种（见 tex_fmt_allowed 上的说明）：any_fmt = 自由 MUTABLE；fmt_list = MUTABLE + 格式列表；都不是 = 不开 MUTABLE
     const int want_view = (d->usage & NVN_GPU_TEX_VIEW_FMT) != 0;
     const int plain = want_view && !bc_decoded && sample_fmt == fmt && !(usage & VK_IMAGE_USAGE_STORAGE_BIT);
@@ -7423,30 +7464,58 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
         fl.viewFormatCount = t->fmt_n; fl.pViewFormats = t->fmt_list;
         fl.pNext = ci.pNext; ci.pNext = &fl;
     }
+    if (sp) {
+        VkImageFormatProperties ip = {0};
+        if (vkGetPhysicalDeviceImageFormatProperties(g.phys, fmt, itype, ci.tiling, usage, ci.flags, &ip) != VK_SUCCESS ||
+            ci.extent.width > ip.maxExtent.width || ci.extent.height > ip.maxExtent.height ||
+            levels > ip.maxMipLevels || layers > ip.maxArrayLayers) {
+            tex_create_discard(t);
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse image extent/usage");
+        }
+    }
     LIFE_T0;
     t->usage = ci.usage;
-    if (vkCreateImage(g.d, &ci, NULL, &t->image) != VK_SUCCESS) {
+    const VkResult created = vkCreateImage(g.d, &ci, NULL, &t->image);
+    if (created != VK_SUCCESS) {
         free(t);
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateImage 拒绝（格式 0x%x / usage 0x%x / %ux%u）", d->d.format, usage, d->d.width, d->d.height);
+        return fail(err, pipe_vk_res_code(created, NVN_GPU_E_UNSUPPORTED),
+                    "vkCreateImage 拒绝（格式 0x%x / usage 0x%x / %ux%u，%s）", d->d.format, usage,
+                    d->d.width, d->d.height, pipe_vk_res_name(created));
     }
     LIFE_ADD(0);
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(g.d, t->image, &req);
     uint32_t type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
     if (type == UINT32_MAX) type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, 0, NULL);
-    VkMemoryAllocateInfo ai;
-    memset(&ai, 0, sizeof ai);
-    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = type;
-    t->mem_size = req.size; t->mem_type = type;
-    if (type != UINT32_MAX && texmem_on()) t->memory = texmem_take(req.size, type, &t->mem_size);
-    if (type == UINT32_MAX || (!t->memory && vkAllocateMemory(g.d, &ai, NULL, &t->memory) != VK_SUCCESS) ||
-        vkBindImageMemory(g.d, t->image, t->memory, 0) != VK_SUCCESS) {
-        if (t->memory) vkFreeMemory(g.d, t->memory, NULL);
-        vkDestroyImage(g.d, t->image, NULL);
-        free(t);
-        return fail(err, NVN_GPU_E_OOM, "贴图显存分配失败（%ux%u，%u 级）", d->d.width, d->d.height, levels);
+    if (sp) {
+        if (type == UINT32_MAX) {
+            tex_create_discard(t);
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse image memory type");
+        }
+        pthread_mutex_lock(&g_mu);
+        const VkDeviceSize limit = g.dev->properties.limits.sparseAddressSpaceSize;
+        if (req.size && req.size <= limit - g.sparse_address_bytes) {
+            t->sparse_address_bytes = req.size;
+            g.sparse_address_bytes += req.size;
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (!t->sparse_address_bytes) {
+            tex_create_discard(t);
+            return fail(err, NVN_GPU_E_OOM, "sparse image address space");
+        }
+        const nvn_gpu_rc bound = sparse_image_bind(t, &req, type, sp, alias_holes, err);
+        if (!nvn_gpu_ok(bound)) { tex_create_discard(t); return bound; }
+    } else {
+        const VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size, .memoryTypeIndex = type};
+        t->mem_size = req.size;
+        t->mem_type = type;
+        if (type != UINT32_MAX && texmem_on()) t->memory = texmem_take(req.size, type, &t->mem_size);
+        if (type == UINT32_MAX || (!t->memory && vkAllocateMemory(g.d, &ai, NULL, &t->memory) != VK_SUCCESS) ||
+            vkBindImageMemory(g.d, t->image, t->memory, 0) != VK_SUCCESS) {
+            tex_create_discard(t);
+            return fail(err, NVN_GPU_E_OOM, "贴图显存分配失败（%ux%u，%u 级）", d->d.width, d->d.height, levels);
+        }
     }
     LIFE_ADD(1);
     VkImageViewCreateInfo vi;
@@ -7458,9 +7527,7 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     VkImageViewUsageCreateInfo vu; vi.pNext = view_usage_next(t, sample_fmt, &vu);
     vi.subresourceRange = (VkImageSubresourceRange){(t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : t->aspect, 0, levels, 0, itype == VK_IMAGE_TYPE_3D ? 1 : layers};   // 深度模板格式：采样只取深度面
     if (vkCreateImageView(g.d, &vi, NULL, &t->view) != VK_SUCCESS) {
-        vkFreeMemory(g.d, t->memory, NULL);
-        vkDestroyImage(g.d, t->image, NULL);
-        free(t);
+        tex_create_discard(t);
         return fail(err, NVN_GPU_E_OOM, "默认贴图视图创建失败");
     }
     LIFE_ADD(2);
@@ -7468,15 +7535,16 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     if (!newimg_add_locked(t)) {
         pthread_mutex_unlock(&g_mu);
         pc_drop_view(t->view);
-        vkDestroyImageView(g.d, t->view, NULL);
-        vkFreeMemory(g.d, t->memory, NULL);
-        vkDestroyImage(g.d, t->image, NULL);
-        free(t);
+        tex_create_discard(t);
         return fail(err, NVN_GPU_E_OOM, "待转布局表分配失败");
     }
     t->all_next = g.texs;
     g.texs = t;
     pthread_mutex_unlock(&g_mu);
+    if (sp) {
+        const nvn_gpu_rc init = sparse_image_zero(sp, t, err);
+        if (!nvn_gpu_ok(init)) { nvn_gpu_tex_release(t); return init; }
+    }
     *out = t;
     if (d->d.samples > 1 && samples != (uint32_t)d->d.samples)
         msaa_notice_once((uint32_t)d->d.format, (uint32_t)d->d.samples, samples);
@@ -7484,6 +7552,17 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
       static int slowt = -1; if (slowt < 0) slowt = nvn_plat_flag("nvk_hitch_log", 0) != 0;
       if (slowt && dt > 3000000ull) { char b[160]; snprintf(b, sizeof b, "建贴图 %.1f 毫秒（%ux%u）", (double)dt / 1e6, d->d.width, d->d.height); nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", b); } }
     return rc(NVN_GPU_OK);
+}
+
+nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err) {
+    return tex_create(d, NULL, out, err);
+}
+
+nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
+    nvn_gpu_sparse_region *regions, uint32_t count, nvn_gpu_tex *out, nvn_gpu_err *err) {
+    if (!c || !regions || !count) return fail(err, NVN_GPU_E_ARG, "sparse image regions or command missing");
+    struct sparse_image sp = {.cmd = c, .regions = regions, .count = count};
+    return tex_create(d, &sp, out, err);
 }
 
 void nvn_gpu_tex_info_get(nvn_gpu_tex th, nvn_gpu_tex_info *out) {
@@ -8019,7 +8098,27 @@ static void copy_buf_tex_impl(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint
 
 void nvn_gpu_copy_buf_tex(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t row_bytes, uint64_t image_bytes,
                           nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r) {
+    if (th && th->sparse_address_bytes) {
+        if (ch) set_sticky(ch, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: buffer copy");
+        return;
+    }
     copy_buf_tex_impl(ch, bh, off, row_bytes, image_bytes, th, level, layer, r, COPY_FACE_DEFAULT, 0);
+}
+
+nvn_gpu_rc nvn_gpu_tex_sparse_upload(nvn_gpu_cmd c, nvn_gpu_tex t, const nvn_gpu_sparse_region *region,
+                                    const void *bytes, uint64_t pitch, uint64_t size) {
+    if (!c || !t || !t->sparse_address_bytes || !region || !bytes || !size) return rc(NVN_GPU_E_ARG);
+    if (!nvn_gpu_ok(c->sticky)) return c->sticky;
+    nvn_fmt_info fmt;
+    if (!nvn_fmt_info_of(t->nvn_format, &fmt)) return rc(NVN_GPU_E_ARG);
+    const uint32_t alignment = fmt.bytes > 4 && !(fmt.bytes & (fmt.bytes - 1)) ? fmt.bytes : 4;
+    nvn_gpu_slice sl;
+    nvn_gpu_err err;
+    const nvn_gpu_rc alloc = nvn_gpu_arena_alloc(c, size, alignment, &sl, &err);
+    if (!nvn_gpu_ok(alloc)) { set_sticky(c, alloc.code, "sparse upload staging: %s", err.why); return alloc; }
+    memcpy(sl.cpu, bytes, (size_t)size);
+    copy_buf_tex_impl(c, sl.buf, sl.off, pitch, size, t, region->level, region->layer, &region->region, COPY_FACE_DEFAULT, 0);
+    return c->sticky;
 }
 
 void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
@@ -8096,6 +8195,7 @@ void nvn_gpu_copy_tex(nvn_gpu_cmd ch, nvn_gpu_tex sh, uint32_t slevel, uint32_t 
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
     struct nvn_gpu_tex_s *s = sh, *d = dh;
+    if (d && d->sparse_address_bytes) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: image copy"); return; }
     // 两边同一 VkFormat 才拷；D32S8 不在 fmt_bpp 表里（每纹素两个面），同格式深度模板整面拷贝合法，
     // 一并放行（#398：D24S8 换成 D32S8 后贴图间拷贝照旧可用）。
     nvn_fmt_info si = {0}, di = {0};
@@ -8144,6 +8244,7 @@ void nvn_gpu_clear_view(nvn_gpu_cmd ch, nvn_gpu_view vh, const float rgba[4], co
     struct nvn_gpu_view_s *v = vh;
     if (!v) { set_sticky(c, NVN_GPU_E_ARG, "clear_view 视图为空"); return; }
     struct nvn_gpu_tex_s *t = v->tex;
+    if (t->sparse_address_bytes) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: clear"); return; }
     if (v->nvn_format != t->nvn_format) {
         // vkCmdClearColorImage 按 image 格式解释 clear 值，无法按 view 的覆盖格式生效
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "clear_view 不支持视图覆盖格式");
@@ -8687,6 +8788,7 @@ void nvn_gpu_blit(nvn_gpu_cmd ch, nvn_gpu_view sv, const NVNcopyRegion *sr, nvn_
     if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "传输操作在通道内"); return; }
     if (!sv || !dv || !sv->tex || !dv->tex || !sr || !dr) { set_sticky(c, NVN_GPU_E_ARG, "blit 参数为空"); return; }
     struct nvn_gpu_tex_s *s = sv->tex, *d = dv->tex;
+    if (d->sparse_address_bytes) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: blit"); return; }
     if (sv->format != s->format || dv->format != d->format) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：视图换了格式（拷贝按存储的格式做）"); return; }
     if ((sv->p16_remap || dv->p16_remap) && s->nvn_format != d->nvn_format) {   // #975：按分量换算，退回格式的分量位置与 NVN 不同
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "blit：16 位打包格式 0x%x → 0x%x 有一边走退回格式，按分量换算会错位", s->nvn_format, d->nvn_format); return;
