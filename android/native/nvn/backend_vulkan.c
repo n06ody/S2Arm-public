@@ -7303,10 +7303,10 @@ nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_g
     int bc_decoded = d->d.format >= 0x41 && d->d.format <= 0x50 &&
                      ((g.dev->bc_decode_mask >> ((uint32_t)d->d.format - 0x41)) & 1u);
     VkFormat sample_fmt = fmt;
-    // BC4 3D 按 z 片解码到私有 2D 图；2D → 3D 拷贝依赖 Vulkan 1.1 的 maintenance1 语义。
+    // 各 BC 路线都按 z 片解码到私有 2D 图；拷到 3D 同格式存储需要 Vulkan 1.1 的 maintenance1 语义。
+    const int bc_3d = itype == VK_IMAGE_TYPE_3D && s2a_vk_effective_api(g.dev->properties.apiVersion) >= VK_API_VERSION_1_1;
     if (bc_decoded && (!nvn_vk_bcdec_route((uint32_t)d->d.format, NULL, &sample_fmt, &fmt, NULL, NULL) ||
-                       (itype != VK_IMAGE_TYPE_2D && !(itype == VK_IMAGE_TYPE_3D && d->d.format == NVN_FORMAT_RGTC1_UNORM &&
-                                                    g.dev->properties.apiVersion >= VK_API_VERSION_1_1)) ||
+                       (itype != VK_IMAGE_TYPE_2D && !bc_3d) ||
                        (d->usage & (NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE))))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "BC format 0x%x decode: 不支持此用途或维度", d->d.format);
     if (!d->d.width || !d->d.height) return fail(err, NVN_GPU_E_ARG, "尺寸为 0");
