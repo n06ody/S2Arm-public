@@ -48,6 +48,7 @@ int rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park);   //
 extern int rp_tex_clear_active;
 // 每条通过原清除校验的指令只记一个终局：未入表、折叠或在某个边界兑现。
 // 清除可能跨统计窗等到终局，按终局所属窗口计数。
+// 保留旧日志的 view_policy 列。源视图的采样元数据不再作为拒绝理由。
 enum rp_tex_fold_result {
     RP_TF_HIT, RP_TF_DISABLED, RP_TF_SHAPE, RP_TF_STORAGE, RP_TF_VIEW_POLICY,
     RP_TF_FORMAT_VALUE, RP_TF_VIEW_FAILED, RP_TF_PARK_ORDER, RP_TF_PARK_REF,

@@ -216,7 +216,10 @@ static void run_clear(const char *dir, enum shape shape, int expect_trim) {
     rp_res_reset();
 }
 
-enum fold_case { MRT, FOLD_ALIAS, RECT, SMALL_FB, ATTACH_FMT, FOLD_LOCAL, FOLD_CASES };
+enum fold_case {
+    MRT, FOLD_ALIAS, RECT, SMALL_FB, ATTACH_FMT, FOLD_LOCAL,
+    SOURCE_VIEW, ATTACH_IDENTITY, ATTACH_SWIZZLE, FOLD_CASES,
+};
 
 static void run_fold(enum fold_case scenario, int expect_fold) {
     static const uint8_t blue[4] = {0, 0, 255, 255};
@@ -233,6 +236,12 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
     for (unsigned i = 0; i < 4; i++) {
         const unsigned width = scenario == SMALL_FB && i == 3 ? W / 2 : W;
         tex[i] = guest_texture(i + 1, i * 65536, width, NVN_FORMAT_RGBA8);
+        if (scenario == SOURCE_VIEW && i == 0) {
+            tex[i].d.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+            tex[i].d.depth = 2;
+            nvn_tex_layout(&tex[i].d, &tex[i].L);
+            CHECK(tex[i].L.size && tex[i].L.size <= 65536, "source view array storage bounds");
+        }
         fill_rgba(&tex[i], blue);
         image[i] = rp_tex_resolve(&tex[i], active);
         CHECK(image[i], "preload fold texture %u", i);
@@ -249,6 +258,21 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
         rt.has_cview[0] = 1;
         rt.cview[0] = (view_t){.set_format=1, .format=NVN_FORMAT_RGBA8_SRGB};
     }
+    if (scenario == SOURCE_VIEW) {
+        rt.has_cview[0] = 1;
+        rt.cview[0] = (view_t){.set_layers = 1, .min_layer = 1, .nlayers = 1};
+    }
+    if (scenario == ATTACH_IDENTITY || scenario == ATTACH_SWIZZLE) {
+        rt.has_cview[0] = 1;
+        rt.cview[0] = (view_t){.set_swizzle = 1, .swz = {
+            NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A,
+        }};
+        if (scenario == ATTACH_SWIZZLE) {
+            rt.cview[0].swz[0] = NVN_TEXTURE_SWIZZLE_B;
+            rt.cview[0].swz[2] = NVN_TEXTURE_SWIZZLE_R;
+        }
+    }
+    nvn_gpu_buf untouched = scenario == SOURCE_VIEW ? make_buf(W * H * 4, NVN_GPU_MEM_SHARED, NULL) : NULL;
 
     watching = 1;
     passes = transfer_clears = transfers_at_first_pass = 0;
@@ -258,6 +282,13 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
         p_clear_tex clear = {
             .tex=&tex[i], .r={0, 0, 0, width, H, 1}, .mask=15, .value_type=CLEAR_TEX_FLOAT,
         };
+        if (scenario == SOURCE_VIEW && i == 0) {
+            clear.has_view = 1;
+            clear.view = (view_t){.set_layers = 1, .min_layer = 1, .nlayers = 1,
+                .set_target = 1, .target = NVN_TEXTURE_TARGET_2D, .set_swizzle = 1, .swz = {
+                    NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_A,
+                }};
+        }
         for (unsigned j = 0; j < 4; j++) clear.c.f[j] = (float)colors[i][j] / 255.0f;
         rp_op_clear_tex(active, &clear, NULL);
     }
@@ -287,10 +318,10 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
         if (desc->color[i].load == NVN_GPU_LOAD_CLEAR) mask |= 1u << i;
     }
     CHECK(attached == 0xf, "fold MRT attachment mask case=%d attached=%#x", scenario, attached);
-    const unsigned expected_mask = !expect_fold || local ? 0 :
-        scenario == MRT ? 0xf : scenario == SMALL_FB ? 0x8 : 0xe;
+    const int full_fold = scenario == MRT || scenario == SOURCE_VIEW || scenario == ATTACH_IDENTITY;
+    const unsigned expected_mask = !expect_fold || local ? 0 : full_fold ? 0xf : scenario == SMALL_FB ? 0x8 : 0xe;
     const unsigned expected_transfers = !expect_fold || local ? (scenario == RECT ? 3 : 4) :
-        scenario == MRT || scenario == RECT ? 0 : scenario == SMALL_FB ? 3 : 1;
+        full_fold || scenario == RECT ? 0 : scenario == SMALL_FB ? 3 : 1;
     CHECK(passes == total_passes && desc->ncolor == 4 &&
           mask == expected_mask && transfer_clears == expected_transfers,
           "fold routes case=%d passes=%u load_clear=%#x transfer=%u", scenario, passes, mask, transfer_clears);
@@ -304,8 +335,10 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
 
     for (unsigned i = 0; i < 4; i++) {
         const uint32_t row_bytes = tex[i].d.width * 4;
-        nvn_gpu_copy_tex_buf(active, image[i], 0, 0, NULL, readback[i], 0, row_bytes, row_bytes * H);
+        const unsigned layer = scenario == SOURCE_VIEW && i == 0 ? 1 : 0;
+        nvn_gpu_copy_tex_buf(active, image[i], 0, layer, NULL, readback[i], 0, row_bytes, row_bytes * H);
     }
+    if (untouched) nvn_gpu_copy_tex_buf(active, image[0], 0, 0, NULL, untouched, 0, W * 4, W * H * 4);
     nvn_gpu_err err = {0};
     ++case_signal;
     const nvn_gpu_rc committed = nvn_gpu_cmd_commit(active, case_signal, on_done, NULL, &err);
@@ -326,9 +359,11 @@ static void run_fold(enum fold_case scenario, int expect_fold) {
         }
         CHECK(good == width * H, "fold pixels case=%d slot=%u good=%u/%u", scenario, i, good, width * H);
     }
+    if (OK(retired) && untouched) check_rgba(untouched, W * H, blue, "uncleared array layer");
     printf("clear-fold Vulkan case=%d passes=%u load_clear=%#x transfer=%u area=%ux%u before_first=%u\n",
            scenario, passes, mask, transfer_clears, desc->area_w, desc->area_h, transfers_at_first_pass);
     for (unsigned i = 0; i < 4; i++) nvn_gpu_buf_release(readback[i], NULL, NULL);
+    if (untouched) nvn_gpu_buf_release(untouched, NULL, NULL);
     rp_pass_reset();
     rp_res_reset();
     rp_R.has_sc = 0;

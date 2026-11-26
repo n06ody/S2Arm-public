@@ -134,9 +134,9 @@ static void test_levels_layers_and_types(void) {
 }
 static void t_clear_tex_fold(void) {
     enum {
-        UNORM, UINT, SINT, SUBRESOURCE, NO_COLOR_PARK,
+        UNORM, UINT, SINT, SUBRESOURCE, SOURCE_SWIZZLE, SOURCE_TARGET, IDENTITY_ATTACH, NO_COLOR_PARK,
         BARRIER, REPORT, COPY, SAMPLED, SAMPLED_ALIAS, ALIAS, SMALL_FB, SMALL_FB_COLD, WRONG_MIP, WRONG_LAYER,
-        NON_RENDERABLE, TAIL, PARTIAL, REINTERPRET, OFF,
+        SWIZZLED_ATTACH, SWIZZLED_TEXTURE, NON_RENDERABLE, TAIL, PARTIAL, REINTERPRET, OFF,
     };
     const int old_park = g_flag_clear_park, old_area = g_flag_pass_area;
     for (int kind = UNORM; kind <= OFF; kind++) {
@@ -152,8 +152,13 @@ static void t_clear_tex_fold(void) {
         q_env(&s);
         const uint32_t fmt = kind == UINT ? NVN_FORMAT_RGBA32UI : kind == SINT ? NVN_FORMAT_RGBA32I :
                              kind == NON_RENDERABLE ? NVN_FORMAT_RGBA8UI : NVN_FORMAT_RGBA8;
-        const int sub = kind == SUBRESOURCE || kind == WRONG_MIP || kind == WRONG_LAYER;
+        const int sub = kind == SUBRESOURCE || kind == SOURCE_TARGET || kind == WRONG_MIP || kind == WRONG_LAYER;
         tex_t t = mk_tex(601, 0x20000, (int)fmt, 16, 16, sub ? 2 : 1, 0);
+        if (kind == SWIZZLED_TEXTURE) {
+            t.set_swz = 1;
+            t.swz = NVN_TEXTURE_SWIZZLE_B | NVN_TEXTURE_SWIZZLE_G << 3 |
+                    NVN_TEXTURE_SWIZZLE_R << 6 | NVN_TEXTURE_SWIZZLE_A << 9;
+        }
         if (sub) {
             t.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t.d.depth = 2;
             nvn_tex_layout(&t.d, &t.L);
@@ -179,6 +184,16 @@ static void t_clear_tex_fold(void) {
             op->view.set_levels = op->view.set_layers = 1;
             op->view.base_level = op->view.nlevels = 1;
             op->view.min_layer = op->view.nlayers = 1;
+        }
+        if (kind == SOURCE_TARGET) {
+            op->view.set_target = 1;
+            op->view.target = NVN_TEXTURE_TARGET_2D;
+        }
+        if (kind == SOURCE_SWIZZLE) {
+            op->has_view = 1;
+            op->view = (view_t){.set_swizzle = 1, .swz = {
+                NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A,
+            }};
         }
         if (kind == REINTERPRET) {
             op->has_view = 1; op->view.set_format = 1; op->view.format = NVN_FORMAT_RGBA8UI;
@@ -216,8 +231,16 @@ static void t_clear_tex_fold(void) {
             if (kind == SMALL_FB || kind == SMALL_FB_COLD) { rt.n = 2; rt.color[1] = &other; }
             if (sub) {
                 rt.has_cview[0] = 1; rt.cview[0] = op->view;
+                rt.cview[0].set_target = 0;
                 if (kind == WRONG_MIP) rt.cview[0].base_level = 0;
                 if (kind == WRONG_LAYER) rt.cview[0].min_layer = 0;
+            }
+            if (kind == IDENTITY_ATTACH || kind == SWIZZLED_ATTACH) {
+                rt.has_cview[0] = 1;
+                rt.cview[0] = (view_t){.set_swizzle = 1, .swz = {
+                    NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A,
+                }};
+                if (kind == SWIZZLED_ATTACH) rt.cview[0].swz[0] = NVN_TEXTURE_SWIZZLE_B;
             }
             set_rt_put(put(&s, OP_SET_RT, set_rt_size(&rt)), &rt);
             if (kind == UNORM) area_scissor(&s, 0, 0, 16, 16);
@@ -249,13 +272,18 @@ static void t_clear_tex_fold(void) {
         CHECK(rp_tex_fold_stats_take(counts) == (kind != NO_COLOR_PARK));
         const enum rp_tex_fold_result expected[] = {
             [UNORM] = RP_TF_HIT, [UINT] = RP_TF_HIT, [SINT] = RP_TF_HIT, [SUBRESOURCE] = RP_TF_HIT,
+            [SOURCE_SWIZZLE] = RP_TF_HIT, [SOURCE_TARGET] = RP_TF_HIT, [IDENTITY_ATTACH] = RP_TF_HIT,
             [BARRIER] = RP_TF_FALL_BARRIER, [REPORT] = RP_TF_FALL_BOUNDARY, [COPY] = RP_TF_FALL_TRANSFER,
             [SAMPLED] = RP_TF_FALL_READ, [SAMPLED_ALIAS] = RP_TF_FALL_ALIAS, [ALIAS] = RP_TF_FALL_ALIAS,
             [SMALL_FB] = RP_TF_FALL_TARGET, [SMALL_FB_COLD] = RP_TF_FALL_TRANSFER,
             [WRONG_MIP] = RP_TF_FALL_TARGET, [WRONG_LAYER] = RP_TF_FALL_TARGET,
+            [SWIZZLED_ATTACH] = RP_TF_FALL_TARGET, [SWIZZLED_TEXTURE] = RP_TF_FALL_TARGET,
             [NON_RENDERABLE] = RP_TF_FORMAT_VALUE, [TAIL] = RP_TF_FALL_END, [PARTIAL] = RP_TF_SHAPE,
             [OFF] = RP_TF_DISABLED,
         };
+        printf("CLEAR_TEX_FOLD_RESULT case=%d hit=%llu view_policy=%llu fall_target=%llu\n", kind,
+               (unsigned long long)counts[RP_TF_HIT], (unsigned long long)counts[RP_TF_VIEW_POLICY],
+               (unsigned long long)counts[RP_TF_FALL_TARGET]);
         for (int i = 0; i < RP_TF_N; i++) {
             const uint64_t want = kind != NO_COLOR_PARK && kind != REINTERPRET && i == (int)expected[kind];
             CHECK(counts[i] == want);

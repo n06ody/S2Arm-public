@@ -47,12 +47,12 @@ for dq in 0 1; do
         log="$out/fold-dq$dq-arm$arm.log"
         if ! timeout 90 "$out/test" "$out/shaders" "$arm" "$arm" fold > "$log" 2>&1 ||
            grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
-           ! grep -q 'clear-fold Vulkan cases=6 failures=0' "$log"; then
+           ! grep -q 'clear-fold Vulkan cases=9 failures=0' "$log"; then
             cat "$log"
             exit 1
         fi
         grep '^clear-fold Vulkan case=' "$log"
-        echo "clear-fold Vulkan: DQ=$dq arm=$arm cases=6 VUID=0 SYNC-HAZARD=0"
+        echo "clear-fold Vulkan: DQ=$dq arm=$arm cases=9 VUID=0 SYNC-HAZARD=0"
     done
 done
 # Withdraw the optimization while preserving the workload, pixels and expectations.
@@ -73,10 +73,10 @@ echo '【负对照开始】'
 rc=0
 timeout 90 "$out/test" "$out/shaders" 0 1 fold > "$out/fold-withdrawn.log" 2>&1 || rc=$?
 if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/fold-withdrawn.log" ||
-   [ "$(grep -c 'fold routes case=' "$out/fold-withdrawn.log")" -ne 5 ] ||
-   ! grep -q 'clear-fold Vulkan cases=6 failures=5' "$out/fold-withdrawn.log"; then
+   [ "$(grep -c 'fold routes case=' "$out/fold-withdrawn.log")" -ne 8 ] ||
+   ! grep -q 'clear-fold Vulkan cases=9 failures=8' "$out/fold-withdrawn.log"; then
     cat "$out/fold-withdrawn.log"
     exit 1
 fi
 echo '【负对照结束】'
-echo '【绿】贴图整面清除 MRT 折叠与别名、矩形、覆盖、重解释和局部遍回退，双 DQ 及同步校验'
+echo '【绿】贴图整面清除 MRT 折叠，核对源视图、恒等附件和别名、矩形、非恒等、重解释、局部遍回退，双 DQ 及同步校验'

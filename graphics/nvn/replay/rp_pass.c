@@ -762,6 +762,19 @@ static int pass_area_safe(const nvn_gpu_pass_desc *d, const uint32_t cw[8], cons
     return count != 0;
 }
 
+static int tex_clear_attachment_identity(const tex_t *t, const view_t *v) {
+    if (v && ((v->set_format && v->format != (uint32_t)t->d.format) ||
+              (v->set_target && v->target != t->d.target))) return 0;
+    // 视图的通道映射取代纹理自带的映射。只折叠明确保持 RGBA 顺序的附件。
+    const uint8_t rgba[4] = {NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G,
+                             NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A};
+    if (v && v->set_swizzle) return !memcmp(v->swz, rgba, sizeof rgba);
+    if (!t->set_swz) return 1;
+    for (unsigned i = 0; i < 4; i++)
+        if (((t->swz >> (3 * i)) & 7u) != rgba[i]) return 0;
+    return 1;
+}
+
 static int tex_clear_slot(const parked_tex_clear *p, const nvn_gpu_pass_desc *d) {
     if (d->w != p->value.w || d->h != p->value.h ||
         tex_clear_overlap(P.rt.depth, &p->tex)) return -1;
@@ -778,8 +791,7 @@ static int tex_clear_slot(const parked_tex_clear *p, const nvn_gpu_pass_desc *d)
         if (found >= 0 || !tex_clear_same_texture(t, &p->tex) || d->color[i].load != NVN_GPU_LOAD_LOAD ||
             g_shu[i].base || image != p->image ||
             level != p->level || layer != p->layer ||
-            (hv && (v->set_swizzle || (v->set_format && v->format != (uint32_t)t->d.format) ||
-                    (v->set_target && v->target != t->d.target)))) return -1;
+            !tex_clear_attachment_identity(t, hv ? v : NULL)) return -1;
         found = (int)i;
     }
     return found;

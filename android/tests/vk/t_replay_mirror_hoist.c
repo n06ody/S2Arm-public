@@ -47,6 +47,12 @@ void rp_pass_end(nvn_gpu_cmd c) {
     if (pass_open) { nvn_gpu_pass_end(c); pass_open = 0; }
 }
 void rp_pass_flush(nvn_gpu_cmd c) { rp_pass_end(c); }
+// 夹具只录绘制和镜像传输，通道替身没有待兑现的贴图清除。
+int rp_tex_clear_active;
+void rp_pass_land_tex_clear(nvn_gpu_cmd c, enum rp_tex_fold_result reason) {
+    (void)c; (void)reason;
+    REQUIRE(0);
+}
 
 enum { WIDTH = 4, HEIGHT = 4 };
 static void write_vertices(uint8_t *dst, int green) {

@@ -90,14 +90,14 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
              (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) ||
              t->off < 0 || (uint64_t)t->off > t->pool->size || t->L.size > t->pool->size - (uint64_t)t->off)
         result = RP_TF_STORAGE;
-    else if (o->has_view && (o->view.set_swizzle || (o->view.set_target && o->view.target != t->d.target)))
-        result = RP_TF_VIEW_POLICY;
     else if (!(nvn_gpu_format_caps(fmt) & NVN_GPU_FMT_CLEAR_FOLD) || !fold_clear_value(fmt, &fi, &cl))
         result = RP_TF_FORMAT_VALUE;
     const int can_park = result == RP_TF_N;
     const int diag = rp_pass_prepare_tex_clear && rp_pass_prepare_tex_clear(c, t, can_park);
     if (diag && !can_park) rp_tex_fold_count(result);
-    // 后端附件只支持一级一层：每一层独立建视图和通道，避免把数组层数交给单层附件。
+    // 源视图只用来选清除的级和层。即时清图与待折叠清图共用下面的子资源视图，
+    // 两者都按存储格式写入，源视图的采样通道映射与目标类型不会参与清除。
+    // 每一层独立建视图，避免把数组层数交给单层附件。
     for (int32_t z = 0; z < nz; z++) {
         view_t v = {0}; v.set_levels = 1; v.base_level = (uint8_t)lv; v.nlevels = 1;
         v.set_layers = 1; v.min_layer = (uint16_t)(l0 + (uint32_t)o->r.zoffset + (uint32_t)z); v.nlayers = 1;
