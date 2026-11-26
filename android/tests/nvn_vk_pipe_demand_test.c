@@ -19,6 +19,8 @@ static int g_has_inst;
 static int g_fail_next;
 static int g_build_calls;
 static int g_gate_hold, g_gate_entered;
+static uint32_t g_gate_prim;   // 0 = 闸挡所有构建；其余只挡点名的管线
+static int g_pipe_workers = 1, g_pipe_serial;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 
 int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
@@ -34,14 +36,14 @@ void nvk_pipe_demand_worker_enter(void) { demand_worker = 1; }
 nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     (void)mode;
     pthread_mutex_lock(&g_mu);
-    g_build_calls++;
-    while (g_gate_hold) {
-        g_gate_entered = 1;
+    const int build = ++g_build_calls;
+    if (g_gate_hold && (!g_gate_prim || g_gate_prim == d->prim)) {
+        g_gate_entered++;
         pthread_cond_broadcast(&g_cv);
-        pthread_cond_wait(&g_cv, &g_mu);
+        while (g_gate_hold) pthread_cond_wait(&g_cv, &g_mu);
     }
     int fail = g_fail_next || !demand_worker;
-    nvn_gpu_pipe built = (nvn_gpu_pipe)(uintptr_t)(0x9000 + g_build_calls);
+    nvn_gpu_pipe built = (nvn_gpu_pipe)(uintptr_t)(0x9000 + build);
     if (!fail) { g_inst_desc = *d; g_installed = built; g_has_inst = 1; }
     if (out) *out = fail ? NULL : built;
     pthread_mutex_unlock(&g_mu);
@@ -49,7 +51,12 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     if (fail && err) snprintf(err->why, sizeof err->why, "fake compile fail");
     return r;
 }
-int nvn_plat_flag(const char *name, int dflt) { if (!strcmp(name, "nvk_pipe_async")) return 1; return dflt; }
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_pipe_async")) return 1;
+    if (!strcmp(name, "nvk_pipe_workers")) return g_pipe_workers;
+    if (!strcmp(name, "nvk_pipe_serial")) return g_pipe_serial;
+    return dflt;
+}
 static _Atomic int g_start_denial_logs;
 static char g_last_start_denial[160];
 void nvn_plat_log(int level, const char *cls, const char *text) {
@@ -58,8 +65,17 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     atomic_fetch_add_explicit(&g_start_denial_logs, 1, memory_order_release);
 }
 static struct rp_prog g_prog;
-int rp_shader_prog_borrow(const uint8_t identity[32], const struct rp_prog **out) { (void)identity; if (out) *out = &g_prog; return 1; }
-void rp_shader_prog_return(const uint8_t identity[32]) { (void)identity; }
+static _Atomic int g_program_borrows;
+int rp_shader_prog_borrow(const uint8_t identity[32], const struct rp_prog **out) {
+    (void)identity;
+    atomic_fetch_add(&g_program_borrows, 1);
+    if (out) *out = &g_prog;
+    return 1;
+}
+void rp_shader_prog_return(const uint8_t identity[32]) {
+    (void)identity;
+    atomic_fetch_sub(&g_program_borrows, 1);
+}
 
 static int fails;
 #define CHECK(c, m) do { if (!(c)) { printf("FAIL: %s (line %d)\n", m, __LINE__); fails++; } } while (0)
@@ -69,13 +85,13 @@ static void set_ident(uint8_t *id, uint8_t v) { memset(id, v, 32); }
 // 负载再重也只会让等待变长、不会让它误红；「有没有排进第二次等待」「是不是走了超时返回」这类上沿一律按事件计数判。
 enum { HANG_MS = 60000 };
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
-static int wait_gate_entered(uint32_t ms) {
+static int wait_gate_count(int count, uint32_t ms) {
     struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
     until.tv_sec += (time_t)(ms / 1000); until.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&g_mu);
-    while (!g_gate_entered) if (pthread_cond_timedwait(&g_cv, &g_mu, &until) != 0) break;
-    int entered = g_gate_entered;
+    while (g_gate_entered < count) if (pthread_cond_timedwait(&g_cv, &g_mu, &until) != 0) break;
+    int entered = g_gate_entered >= count;
     pthread_mutex_unlock(&g_mu);
     return entered;
 }
@@ -169,6 +185,74 @@ static void check_cold_pair(void) {
     b.prim = 3;
     CHECK(wait_cold(&b, id, stale, &again) == NVK_DEMAND_FAILED && !again,
           "a mismatched variant cannot produce a pipeline");
+}
+
+static void check_pool_progress(void) {
+    g_pipe_workers = 2;
+    nvn_vk_pipe_demand_start();
+    nvn_gpu_pipe_desc slow = {0}, fast = {0};
+    slow.st[0].sh = fast.st[0].sh = g_prog.sh[0];
+    slow.prim = 4; fast.prim = 5;
+    const uint8_t id[32] = {0x80};
+    pthread_mutex_lock(&g_mu);
+    g_has_inst = 0; g_fail_next = 0;
+    g_gate_hold = 1; g_gate_prim = slow.prim; g_gate_entered = 0;
+    pthread_mutex_unlock(&g_mu);
+    nvn_gpu_pipe a = NULL, b = NULL;
+    CHECK(nvn_vk_pipe_demand_kick(&slow, id, &a) == NVK_DEMAND_PENDING, "pool queues first pipeline");
+    if (wait_gate_count(1, HANG_MS)) {
+        CHECK(nvn_vk_pipe_demand_kick(&fast, id, &b) == NVK_DEMAND_PENDING, "pool queues independent second pipeline");
+        int ready = nvn_vk_pipe_demand_wait(&fast, id, 2000, &b, NULL, 0) == 0 && b;
+        printf("pool: second READY while first is held = %d\n", ready);
+        CHECK(ready, "independent pipeline becomes READY while first driver call is held");
+        CHECK(nvn_vk_pipe_demand_state(&slow, id, &a) == NVK_DEMAND_PENDING && !a, "first pipeline is still held");
+    } else CHECK(0, "first pool pipeline reaches driver");
+    gate_release();
+    CHECK(nvn_vk_pipe_demand_wait(&slow, id, 2000, &a, NULL, 0) == 0 && a, "released pipeline becomes READY");
+    nvn_vk_pipe_demand_stop();
+    CHECK(wait_demand_idle(HANG_MS) && nvn_vk_pipe_demand_worker_count() == 0, "pool stop joins every worker");
+}
+
+static void check_pool_stop_and_serial_policy(void) {
+    g_pipe_workers = 99;
+    nvn_vk_pipe_demand_start();
+    CHECK(nvn_vk_pipe_demand_worker_count() == 4, "worker override is capped at four");
+    pthread_mutex_lock(&g_mu);
+    g_has_inst = 0; g_fail_next = 0; g_gate_hold = 1; g_gate_prim = 0; g_gate_entered = 0;
+    const int start_builds = g_build_calls;
+    pthread_mutex_unlock(&g_mu);
+    nvn_gpu_pipe_desc desc = {.prim = 4, .st = {{.sh = g_prog.sh[0]}}};
+    nvn_gpu_pipe cached = NULL;
+    for (int i = 0; i < 5; i++) {
+        const uint8_t id[32] = {(uint8_t)(0x91 + i)};
+        desc.poly.cull = (uint32_t)i & 3u;
+        desc.poly.front = (uint32_t)i >> 2;
+        CHECK(nvn_vk_pipe_demand_kick(&desc, id, &cached) == NVK_DEMAND_PENDING, "pool accepts bounded queued jobs");
+    }
+    CHECK(wait_gate_count(4, 2000), "four independent driver calls enter together");
+    CHECK(atomic_load(&g_program_borrows) == 4, "four held driver calls own only their own borrows");
+    const uint64_t timeouts = nvn_vk_pipe_demand_test_stop_timeouts();
+    nvn_vk_pipe_demand_stop();
+    CHECK(nvn_vk_pipe_demand_test_stop_timeouts() == timeouts + 1, "four held workers share one bounded stop");
+    nvn_vk_pipe_demand_start();
+    CHECK(!nvn_vk_pipe_demand_quiescent() && nvn_vk_pipe_demand_worker_count() == 4,
+          "restart cannot replace any worker of a live generation");
+    gate_release();
+    CHECK(wait_demand_idle(HANG_MS), "all expired workers join after releasing the driver calls");
+    struct nvn_pipe_demand_stats st;
+    nvn_vk_pipe_demand_stats(&st);
+    CHECK(g_build_calls == start_builds + 4 && st.published == 0, "stopped pool discards queued job and all late results");
+    CHECK(atomic_load(&g_program_borrows) == 0, "stopped pool returns every program borrow");
+
+    g_pipe_serial = 1;
+    for (int repeat = 0; repeat < 5; repeat++) {
+        nvn_vk_pipe_demand_start();
+        CHECK(nvn_vk_pipe_demand_worker_count() == 1, "serial backend policy overrides pool size");
+        nvn_vk_pipe_demand_stop();
+        CHECK(nvn_vk_pipe_demand_quiescent(), "repeated stop reaps the preceding generation");
+    }
+    g_pipe_serial = 0;
+    puts("pool lifecycle: 4 held, 1 discarded, 0 late results, 5 serial start/stop rounds");
 }
 
 int main(void) {
@@ -267,7 +351,7 @@ int main(void) {
     pthread_mutex_lock(&g_mu); g_fail_next = 0; g_has_inst = 0; g_gate_hold = 1; g_gate_entered = 0; pthread_mutex_unlock(&g_mu);
     k = nvn_vk_pipe_demand_kick(&slow, idSlow, &cached);
     CHECK(k == NVK_DEMAND_PENDING, "gated build kick PENDING");
-    if (!wait_gate_entered(HANG_MS)) {
+    if (!wait_gate_count(1, HANG_MS)) {
         CHECK(0, "fake build reaches deterministic gate");
         gate_release(); nvn_vk_pipe_demand_stop(); wait_demand_idle(HANG_MS);
         printf("%s (%d failures, builds=%d)\n", fails ? "RED" : "GREEN", fails, g_build_calls);
@@ -369,6 +453,8 @@ int main(void) {
     nvn_vk_pipe_demand_stop();
     CHECK(nvn_vk_pipe_demand_quiescent(), "final stop leaves no joinable worker");
     CHECK(nvn_vk_pipe_demand_worker_count() == 0, "final stop leaves no active worker");
+    check_pool_progress();
+    check_pool_stop_and_serial_policy();
     printf("%s (%d failures, builds=%d)\n", fails ? "RED" : "GREEN", fails, g_build_calls);
     return fails ? 1 : 0;
 }

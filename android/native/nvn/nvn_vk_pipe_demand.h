@@ -2,7 +2,7 @@
 //
 // 分工：
 //   提交线程  nvn_vk_pipe_demand_kick(desc, 程序身份)：缓存命中→READY；否则登记 COMPILING 并入有界队列→PENDING。
-//   后台线程  rp_shader_prog_borrow(身份) 拿正式借用 → 用程序阶段句柄填 desc.st[].sh → nvn_gpu_pipe_get(SYNC)
+//   后台池    rp_shader_prog_borrow(身份) 拿正式借用 → 用程序阶段句柄填 desc.st[].sh → nvn_gpu_pipe_get(SYNC)
 //             （装进后端缓存）→ 归还借用 → 发布 READY/FAILED。程序寿命由 P1-1 借用合同保护，不裸指针跨线程。
 //   提交线程  nvn_vk_pipe_demand_wait(desc, 身份, wait_ms)：命中/等到 READY→对象；超时→PENDING；FAILED 带原文。
 //
@@ -12,7 +12,9 @@
 //
 // 开关：debug.s2a.nvk_pipe_async（缺省 1；release 包属性门关着→读不到→缺省开；调试包设 0 退回同步建）。三档上限沿用 iOS DM_NVN_PSO_*：
 //    debug.s2a.fu_item_ms（2000）/ fu_frame_ms（100）/ fu_unsafe_ms（10000）。
-// 生命周期：会话 open 后 start；Stop/close 前 stop（有界等待；超时后保留 joinable worker，直到退出后回收）。
+// 池：debug.s2a.nvk_pipe_workers=0 按在线核数选 2–4，少于 4 核 / 查询不到 / nvk_pipe_serial=1 用单路。
+//    显式 1–4 可覆盖自动值，串行驱动策略仍优先。创建不足时沿用已启动的线程。
+// 生命周期：会话 open 后 start；Stop/close 前 stop（所有线程共用一次有界等待，退出后整代回收）。
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -28,7 +30,7 @@ enum { NVK_DEMAND_NONE = 0, NVK_DEMAND_PENDING = 1, NVK_DEMAND_READY = 2, NVK_DE
 void nvk_pipe_demand_worker_enter(void);   // 标记本线程后续创建为后台首用，和预热分开
 void nvn_vk_pipe_demand_start(void);
 void nvn_vk_pipe_demand_stop(void);
-/* Private session guard: returns false conservatively when lifecycle locks are busy; only reaps a worker already marked done, never waits for an active worker. */
+/* Private session guard: returns false conservatively when lifecycle locks are busy; only reaps a pool whose workers have exited, never waits for an active worker. */
 int  nvn_vk_pipe_demand_quiescent(void);
 #if defined(S2A_NVN_PIPE_DEMAND_TEST)
 int  nvn_vk_pipe_demand_worker_count(void);
