@@ -757,7 +757,7 @@ static int slc_get_x(nvn_gpu_cmd c, uint64_t k0, uint64_t k1, const void *src, n
     return 1;
 }
 static int slc_get(nvn_gpu_cmd c, uint64_t k0, uint64_t k1, const void *src, nvn_gpu_slice *sl) { return slc_get_x(c, k0, k1, src, sl, 0); }
-static struct { nvn_gpu_cmd c; uint64_t seg, gen, reg_gen; const struct rp_prog *pg; uint32_t base_instance, n; int ok; uint16_t bof[RP_PROG_ENT_MAX]; nvn_gpu_binding b[RP_PROG_ENT_MAX]; } g_lb[RP_PROG_STAGES];
+static struct { nvn_gpu_cmd c; uint64_t seg, gen, reg_gen; const struct rp_prog *pg; uint32_t base_instance, n; int ok; uint16_t bof[RP_PROG_ENT_MAX]; uint8_t gpu_cbuf[RP_PROG_ENT_MAX]; nvn_gpu_binding b[RP_PROG_ENT_MAX]; } g_lb[RP_PROG_STAGES];
 
 // B3：驱动段暂存的按内容缓存。DRV0（2.5 KB）/ DRV2（0.29 KB）的整段内容只由下面这些输入决定，
 // 同一段里内容相同就复用同一片 slice，省掉每笔每阶段的 memset + 拷贝。段号（rp_seg_serial）进键：段内暂存随段回收，跨段不能复用。
@@ -948,13 +948,67 @@ static int tbuf_prepare(nvn_gpu_cmd c, const nvn_gpu_layout_ent *e, int st,
 
 // 一个阶段的全部绑定。0 = 有取不到的资源（已记账），这笔不画
 // pi：程序里的阶段下标（0 顶点 / 计算，1 片元）；st：NVN 阶段号（回放状态按它取：0 顶点、1 片元、5 计算）
+int rp_pass_is_open(void) __attribute__((weak));   // 隔离测试可只提供通道的开始与结束
 static nvn_gpu_buf g_disp_ind; static uint64_t g_disp_ind_off;
 // 本笔绘制在开通道之前解析好的图形阶段存储缓冲（[阶段][布局项]）；只在 rp_draw 里填、在同一笔的发绑定里用
 static nvn_gpu_buf g_sb_buf[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static uint64_t g_sb_off[RP_PROG_STAGES][RP_PROG_ENT_MAX];
 static uint8_t g_sb_ok[RP_PROG_STAGES][RP_PROG_ENT_MAX];
-// 常量缓冲的 GPU 待写回镜像：同存储缓冲，开通道之前解析好，发绑定只消费结果（见 rp_draw 的准备阶段）。
-static nvn_gpu_buf g_ub_buf[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static uint64_t g_ub_off[RP_PROG_STAGES][RP_PROG_ENT_MAX];
-static uint8_t g_ub_ok[RP_PROG_STAGES][RP_PROG_ENT_MAX];
+// 本笔处于 GPU 所有权的常量缓冲。准备完成后，绑定只消费镜像或段内对齐切片。
+static struct cbuf_gpu_binding { nvn_gpu_buf buf; uint64_t off; uint8_t staged; } g_ub[NVN_GPU_SH_CS + 1][RP_PROG_ENT_MAX];
+
+static int prepare_cbufs(nvn_gpu_cmd c, const struct rp_prog *pg, int compute, const void *rec) {
+    static nvn_gpu_buf_copy copies[RP_PROG_STAGES * RP_PROG_ENT_MAX];
+    uint32_t ncopy = 0, stages = 0;
+    const nvn_gpu_caps *caps = caps_cached();
+    const uint32_t align = caps->min_ubo_align ? caps->min_ubo_align : 256;
+    const int first = compute ? NVN_GPU_SH_CS : 0, last = compute ? NVN_GPU_SH_CS + 1 : RP_PROG_STAGES;
+    for (int st = first; st < last; st++) {
+        const int pi = compute ? 0 : st;
+        const uint32_t nent = pg->nent[pi] < RP_PROG_ENT_MAX ? pg->nent[pi] : RP_PROG_ENT_MAX;
+        memset(g_ub[st], 0, nent * sizeof g_ub[st][0]);
+        for (uint32_t i = 0; i < nent; i++) {
+            const nvn_gpu_layout_ent *e = &pg->ent[pi][i];
+            if (e->src_kind != NVN_RB_CBUF || e->src_reg >= 16) continue;
+            const p_bind_buf *ub = &rp_S.ubo[st][e->src_reg];
+            if (!ub->addr || !ub->size) continue;
+            const uint64_t len = cbuf_len(ub);
+            if (caps->max_ubo_range && len > caps->max_ubo_range) continue;   // 绑定阶段已有具名拒绝
+            if (!rp_buf_gpu_pending(ub->addr, len)) continue;
+            nvn_gpu_buf buf = NULL;
+            uint64_t off = 0;
+            if (!rp_buf_resolve(c, ub->addr, len, &buf, &off) || !buf)
+                return skip("uniform_gpu_pending_unprepared", rec);
+            const int staged = (off & (align - 1)) != 0;
+            if (staged) {
+                nvn_gpu_slice sl;
+                nvn_gpu_err err = {0};
+                nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, len, align, &sl, &err);
+                if (!nvn_gpu_ok(rc)) {
+                    arena_fail_detail(rc, &err, len);
+                    return skip("uniform_gpu_pending_staging_failed", rec);
+                }
+                copies[ncopy++] = (nvn_gpu_buf_copy){buf, off, sl.buf, sl.off, len};
+                stages |= 1u << st;
+                buf = sl.buf;
+                off = sl.off;
+            }
+            g_ub[st][i] = (struct cbuf_gpu_binding){buf, off, staged};
+        }
+    }
+    if (ncopy) {
+        // 镜像同步已经绕开在途 GPU 写并合入已知 CPU 字节。副本必须排在主段中已有的写之后。
+        if (!compute && rp_pass_is_open && rp_pass_is_open()) rp_perf_add(RP_PERF_P_CUT_XFER, 1);
+        rp_pass_flush(c);
+        nvn_gpu_copy_bufs_uniform(c, copies, ncopy, stages);
+    }
+    return 1;
+}
+
+static int cbuf_keep(int st, uint32_t i, const nvn_gpu_binding *old) {
+    const struct cbuf_gpu_binding *p = &g_ub[st][i];
+    if (!p->buf) return !g_lb[st].gpu_cbuf[i];
+    return g_lb[st].gpu_cbuf[i] && p->buf == old->u.b.buf && p->off == old->u.b.off;
+}
 // 存储缓冲槽「没有可绑的真实内存」：地址 0，或地址不在任何池里（sb_len 返回 0）。绑 64 KiB 空缓冲、这一笔照画（不是整笔跳过）。
 //   「地址有效、长度 0」不在此列：按硬件语义绑到真实内存（见 sb_len）。只管 NVN 存储缓冲槽（SBUFP）；
 //   计算阶段把统一缓冲当存储读（UBOP）的没绑仍具名跳过。
@@ -986,7 +1040,6 @@ static void fill_graphics_drv(nvn_gpu_slice *sl, int st, uint32_t base_instance)
 //   ③ 段（rp_seg_serial）或命令缓冲换了：切片是那一段的暂存，作废。
 //   ④ 按命令流顺序消费：这一笔必须是表里当前位置之后的某一项，记录里的间接地址、绑定时解析出的镜像位置都要和表里一致，阶段要被表里的掩码盖住。
 // 阶段掩码：前瞻时不知道后面每笔的程序，按「这一会话里要拷过的阶段」的并集拷（g_hz_mask）；后面某笔要的阶段不在掩码里就照旧逐笔拷。
-int rp_pass_is_open(void) __attribute__((weak));   // 只链 rp_draw.c 的隔离用例可以不给：拿不到通道状态就只在要拷的那一笔前移
 const void *rp_draw_stream;
 uint64_t rp_gpu_wr_gen;
 enum { HZ_MAX = 128, HZ_SCAN = 4096 };
@@ -1149,6 +1202,10 @@ static int fast_items_ok(const struct rp_prog *pg, int pi, int st, const nvn_gpu
             if (e->access & NVN_GPU_ACC_W) return 0;
             if (i >= RP_PROG_ENT_MAX || !g_sb_ok[st][i]) return 0;
             break;
+        case NVN_RB_CBUF: {
+            const uint32_t at = g_lb[pi].bof[i];
+            if (at >= g_lb[pi].n || !cbuf_keep(st, i, &g_lb[pi].b[at])) return 0;
+            break; }
         case NVN_RB_UBOA: return 0;
         case NVN_RB_TBUF: return 0;  // 临时缓冲视图每笔重新建并绑定
         case NVN_RB_TEXP: case NVN_RB_SAMPP: return 0;   // 池快照不在 b[] 里，每笔在普通绑定之后重发 pool_bind
@@ -1247,7 +1304,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
         }
         nvn_gpu_binding *o = &b[n]; memset(o, 0, sizeof *o); o->ent = (uint16_t)i; o->cls = e->cls;
         nvn_gpu_slice sl;
-        if (keep && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_TEXU && e->src_kind != NVN_RB_IMG && e->src_kind != NVN_RB_TBUF) { *o = g_lb[pi].b[n]; n++; continue; }
+        if (keep && e->src_kind != NVN_RB_SBUFP && e->src_kind != NVN_RB_TEX && e->src_kind != NVN_RB_TEXU && e->src_kind != NVN_RB_IMG && e->src_kind != NVN_RB_TBUF &&
+            (e->src_kind != NVN_RB_CBUF || cbuf_keep(st, i, &g_lb[pi].b[n]))) { *o = g_lb[pi].b[n]; n++; continue; }
         switch (e->src_kind) {
             case NVN_RB_SBUFP: case NVN_RB_UBOP: {   // 存储缓冲：取地址、绑池镜像里的那一段；可写的登记一次 GPU 写（完成后回写游戏内存）。两种来源只差在哪张表给地址：
                 // SBUFP 按 NVN 存储缓冲槽（rp_S.ssbo）；UBOP 按计算阶段的用户 UBO 槽（rp_S.ubo；反射映射 NVK_STORAGE_UBO_PTR），段的范围就是这个 UBO 绑定的地址与大小
@@ -1395,6 +1453,7 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 o->u.b.buf = sl.buf; o->u.b.off = sl.off; o->u.b.len = c1n; break; }
             case NVN_RB_CBUF: {
                 const uint64_t cbuf_t0 = btm ? dt_now() : 0;
+                if (e->src_reg >= 16) return skip("uniform_buffer_unbound", rec);
                 const p_bind_buf *ub = &rp_S.ubo[st][e->src_reg];
                 if (!ub->addr || !ub->size) return skip("uniform_buffer_unbound", rec);
                 // 用户常量缓冲声明为 64 KiB（MAX_UNIFORM_BUFFER_SIZE、Ryujinx ConstantBufferSize）。
@@ -1405,26 +1464,13 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (cp->max_ubo_range && len > cp->max_ubo_range) return skip("uniform_buffer_exceeds_device_range", rec);
                 if (!rp_pool_find(ub->addr, len, NULL, NULL)) return skip("uniform_buffer_outside_pools", rec);
                 rp_perf_add(RP_PERF_UBO_N, 1); rp_perf_add(RP_PERF_UBO_KB, len >> 10);
-                if (rp_buf_gpu_pending(ub->addr, len)) {   // 尚未落地的 GPU 写（#1022）：游戏内存是旧内容，直接绑镜像
-                    const uint64_t al = cp->min_ubo_align ? cp->min_ubo_align : 256;
-                    nvn_gpu_buf mb; uint64_t mo;
-                    const int have = st < RP_PROG_STAGES && i < RP_PROG_ENT_MAX && g_ub_ok[st][i];
-                    int mok = 0;
-                    if (have) { mb = g_ub_buf[st][i]; mo = g_ub_off[st][i]; mok = 1; }   // 图形：开通道前已解析，这里不再解析
-                    else if (st >= RP_PROG_STAGES) {                                   // 计算：本来就在通道外，现场解析安全
-                        mok = rp_buf_resolve(c, ub->addr, len, &mb, &mo);
-                    } else {
-                        // 图形阶段而准备阶段没给出镜像：**绝不在这里解析**——同一次提交里的第二次同步要录成传输
-                        // （rp_xfer_cmd），那个函数结束当前通道，绑定与绘制就落在通道外（真机：整屏黑、每帧 2 笔）。
-                        // 照旧走下面的暂存路径（内容是游戏内存里的旧值）并记账；不具名跳过是因为这一笔本身是合法绘制，
-                        // 缺一段常量比缺整笔轻，也与相邻的「镜像偏移不对齐」那条保持同一处置。
-                        nvn_unimpl("draw", "uniform_gpu_pending_unprepared", rec);
-                    }
-                    if (mok && !(mo & (al - 1))) {
-                        rp_perf_add(RP_PERF_UBO_MIRROR_N, 1);
-                        o->u.b.buf = mb; o->u.b.off = mo; o->u.b.len = len; if (btm) g_bt[4] += dt_now() - cbuf_t0; break;
-                    }
-                    nvn_unimpl("draw", "uniform_gpu_pending_unaligned", rec);   // 镜像无法绑定：保留原有暂存路径并记账
+                const struct cbuf_gpu_binding *gpu = &g_ub[st][i];
+                if (st < RP_PROG_STAGES) g_lb[pi].gpu_cbuf[i] = gpu->buf != NULL;
+                if (gpu->buf) {
+                    if (!gpu->staged) rp_perf_add(RP_PERF_UBO_MIRROR_N, 1);
+                    o->u.b.buf = gpu->buf; o->u.b.off = gpu->off; o->u.b.len = len;
+                    if (btm) g_bt[4] += dt_now() - cbuf_t0;
+                    break;
                 }
                 // 暂存编码时看到的内容，按序的 OP_UPDATE_UB 之后会取新值。
                 if (!slc_get(c, ub->addr, len, (const void *)(uintptr_t)ub->addr, &sl)) return skip("arena_alloc_failed", rec);
@@ -1805,24 +1851,6 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             for (int k = 0; k < nb; k++) if (bok[k]) { g_sb_buf[bs[k]][bi[k]] = bb[k]; g_sb_off[bs[k]][bi[k]] = bo[k]; g_sb_ok[bs[k]][bi[k]] = 1; }
         }
     }
-    // 常量缓冲（NVN_RB_CBUF）的 GPU 待写回镜像同理，而且这条比存储缓冲更要命：
-    // 在发绑定阶段才发现「有 GPU 待写回」再解析，会同步池页；同一次提交里第二次同步要录成传输（rp_xfer_cmd），
-    // 那个函数会结束当前通道——通道一结束，这一笔后面的绑定与绘制就落在通道外，后端置首错
-    // 「bind 在通道外（非计算管线）」→ 整段提交失败 → 时间线失败终态（真机表现：起局整屏黑，每帧 2 笔重复帧）。
-    // 这里的解析发生在开通道之前，绑定阶段只消费结果（不解析、不传输、不切通道）。
-    memset(g_ub_ok, 0, sizeof g_ub_ok);
-    for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st] && i < RP_PROG_ENT_MAX; i++) {
-        const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
-        if (e->src_kind != NVN_RB_CBUF || e->src_reg >= 16) continue;
-        const p_bind_buf *ub = &rp_S.ubo[st][e->src_reg];
-        if (!ub->addr || !ub->size) continue;
-        const uint64_t len = cbuf_len(ub);   // 与发绑定同一口径（#2125：声明 64 KiB，超出按它截短）
-        const nvn_gpu_caps *cp = caps_cached();
-        if (cp->max_ubo_range && len > cp->max_ubo_range) continue;   // 这一笔在 bind_stage_at 开头会被具名跳过，不用预解析
-        if (!rp_buf_gpu_pending(ub->addr, len)) continue;   // 没有 GPU 待写回：照旧暂存，不需要镜像
-        nvn_gpu_buf mb; uint64_t mo;
-        if (rp_buf_resolve(c, ub->addr, len, &mb, &mo)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }
-    }
     nvn_gpu_draw_args a; memset(&a, 0, sizeof a);
     uint64_t indirect_bytes = 0, index_bytes = 0;
     if (di && (di->itype < 0 || di->itype > 2)) { skip("index_type_invalid", rec); return; }
@@ -2058,6 +2086,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             }
         rp_pass_land_reads(c, rd, nr);
     }
+    if (!prepare_cbufs(c, g_prog, 0, rec)) goto draw_done;
     if (g_compute_access.n) {
         int need = 0;
         // 只碰本笔真正读取的绑定：不按派发次数、通道次数或某个着色器键加屏障。
@@ -2073,6 +2102,8 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
                 const p_bind_buf *sb = e->src_reg < 16 ? (e->src_kind == NVN_RB_UBOP ? &rp_S.ubo[st][e->src_reg] : &rp_S.ssbo[st][e->src_reg]) : NULL;
                 if (g_sb_ok[st][i] && sb) { uint64_t wa, wl; (void)sb_window(sb, e->src_kind == NVN_RB_SBUFP, &wa, &wl); ACCESS_READ(compute_read_buf(g_sb_buf[st][i], g_sb_off[st][i], wl)); }
                 else if (sb && sb_unmapped(sb) && e->src_kind == NVN_RB_SBUFP) ACCESS_READ(compute_read_buf(rp_buf_for_null_storage(), 0, 0x10000));
+            } else if (e->src_kind == NVN_RB_CBUF && e->src_reg < 16 && g_ub[st][i].buf) {
+                ACCESS_READ(compute_read_buf(g_ub[st][i].buf, g_ub[st][i].off, cbuf_len(&rp_S.ubo[st][e->src_reg])));
             } else if (e->src_kind == NVN_RB_TEX || e->src_kind == NVN_RB_TEXU || texel_tmp(e)) {
                 if (e->count > 1) { for (uint32_t k = 0; k < e->count && !need; k++) ACCESS_READ(compute_read_view(g_av[st][k])); }
                 else ACCESS_READ(compute_read_view(tv[st][i]));
@@ -2559,6 +2590,7 @@ cs_rebind:
         nvn_hm_put(&g_cpipes, &key, cp);
     }
     struct timespec tsd; clock_gettime(CLOCK_MONOTONIC, &tsd); uint64_t b0 = (uint64_t)tsd.tv_sec * 1000000000ull + (uint64_t)tsd.tv_nsec;
+    if (!prepare_cbufs(c, pg, 1, rec)) goto done;
     nvn_gpu_set_pipe(c, cp);
     g_pipe = NULL; g_pipe_cmd = NULL; rp_dirty_all();   // 后端的当前管线换成了计算管线：下一笔绘制全部重发
     g_disp_dim[0] = dp->ind ? 0 : (uint32_t)dp->x; g_disp_dim[1] = dp->ind ? 0 : (uint32_t)dp->y; g_disp_dim[2] = dp->ind ? 0 : (uint32_t)dp->z;

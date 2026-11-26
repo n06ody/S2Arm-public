@@ -8276,8 +8276,7 @@ static void t_graphics_cbuf_prep_before_pass(void) {
     CHECK(g_gdraws == 2);
     CHECK(nvn_unimpl_count("draw", "uniform_gpu_pending_unprepared") == 0);   // 准备阶段给了镜像
 
-    // 兜底：准备阶段解析失败（替身钩子）时，图形阶段不许在通道内解析，只能暂存 + 具名记账。
-    // 修前的写法会在这里现场解析，兜底场景就没有这笔账了。
+    // GPU 所有权且镜像解析失败时，具名跳过，保留当前通道与此前的绘制。
     {   g_gdraws = 0; g_bind_outside = 0; g_draw_outside = 0; g_pass_ends = 0; g_arena_used = 0;
         pass_fresh(); memset(g_pmem, 0, sizeof g_pmem); nvn_be_pool_add(g_pmem, sizeof g_pmem);
         memset(g_pmem + PG, 0x11, 512);
@@ -8292,7 +8291,8 @@ static void t_graphics_cbuf_prep_before_pass(void) {
         submit1(&s);
         g_block_buf_resolve = 0;
         fake_complete(NVN_GPU_DONE_OK);
-        CHECK(nvn_unimpl_count("draw", "uniform_gpu_pending_unprepared") == 1);   // 具名记账：图形阶段不现场解析
+        CHECK(nvn_unimpl_count("draw", "uniform_gpu_pending_unprepared") == 1);
+        CHECK(g_gdraws == 0);   // 未准备的 GPU 常量不能用旧 guest 字节画出来
         CHECK(g_bind_outside == 0 && g_draw_outside == 0); }
 
     g_snap_prog = NULL; pass_fresh();
