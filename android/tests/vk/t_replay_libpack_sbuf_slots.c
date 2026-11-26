@@ -31,9 +31,11 @@
 
 // 调试开关 nvk_lp_used_slots 缺省关（玩家包走旧口径：任何一个非对齐绑定都挡库）。本夹具对账的是新口径（只看程序真用到的槽），
 // 所以像调试包设了 debug.s2a.nvk_lp_used_slots=1 那样读成 1；其余开关照后端夹具原样。「属性没设走旧口径」由 nvk_shader_pool_test.c --lp-gate 管。
+static int cs_slots_enabled;
 int nvn_plat_flag(const char *name, int dflt);
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_lp_used_slots")) return 1;
+    if (!strcmp(name, "nvk_cs_used_slots") && cs_slots_enabled) return 1;
     return backend_fixture_plat_flag(name, dflt);
 }
 static int compile_calls;
@@ -121,10 +123,11 @@ int rp_pass_begin(nvn_gpu_cmd c) {
     pass.w = pass.h = 4; pass.layers = 1; nvn_gpu_pass_begin(c, &pass); return 1;
 }
 void rp_pass_flush(nvn_gpu_cmd c) { nvn_gpu_pass_end(c); }
-static const char profile_json[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
+#define FIXTURE_PROFILE_HASH "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+static const char profile_json[] = "{\"schema\":\"s2a-direct-profile-v1\",\"profileHash\":\"" FIXTURE_PROFILE_HASH "\",\"capabilities\":{\"storageBufferOffsetAlignment\":16}}";
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
-    c->profile_json = profile_json; c->profile_bytes = sizeof profile_json - 1; c->profile_hash = "";
+    c->profile_json = profile_json; c->profile_bytes = sizeof profile_json - 1; c->profile_hash = FIXTURE_PROFILE_HASH;
     c->translator_closure = "libpack-sbuf-slots-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 // 现编没有结果：被它叫到的次数就是「引擎没把库件给这一笔」的证据。
@@ -236,14 +239,117 @@ static void run_case(const char *tag, int fs_unaligned, int vs_unaligned, const 
     out->drew = d1 - d0 == 1 && k1 - k0 == 0;
 }
 
+// 跑真实 LibPack CS 模块，使用取库时生成的布局绑定一块共享缓冲，再读 GPU 写回。
+static void run_cs_cases(const uint8_t *spv, size_t spv_bytes) {
+    uint8_t code[16] = {0x55}, ctl[0x760] = {0}, key[32];
+    put32(ctl + 0x20, sizeof ctl);
+    // 与 libpack_sbuf.comp 一致的 1×1×1 本地尺寸，无共享和局部内存。
+    put32(ctl + 0x748, 1);
+    put32(ctl + 0x74c, 1);
+    put32(ctl + 0x750, 1);
+    s2a_sha256 hash;
+    s2a_sha256_init(&hash);
+    s2a_sha256_update(&hash, ctl, sizeof ctl);
+    s2a_sha256_update(&hash, code, sizeof code);
+    s2a_sha256_final(&hash, key);
+    const int keep = s2a_source_keep(key, 5, code, sizeof code, ctl, sizeof ctl);
+    CHECK(keep == 0, "CS source registered");
+    if (keep) return;
+
+    char root[1024], dir[1100], hex[17], json[400];
+    snprintf(root, sizeof root, "%s/lp-cs", case_dir);
+    mkdir(root, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct", root); mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/shaders/direct/b-%s-vk", root, DMSH_CHAIN); mkdir(dir, 0700);
+    for (int b = 0; b < 8; b++) snprintf(hex + 2 * b, 3, "%02x", key[b]);
+    snprintf(json, sizeof json, "{\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"bindings\":["
+             "{\"msl_name\":\"entry_data\",\"kind\":\"sbuf\",\"reg\":0,\"arg_id\":0,\"rw\":true}]}", hex);
+    struct rec r[] = {
+        {key64(key), 1, (const uint8_t *)json, strlen(json)},
+        {key64(key), 52, spv, spv_bytes},
+    };
+    const int written = write_container(dir, r, 2);
+    CHECK(!written, "CS library container written");
+    if (written) return;
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+
+    const struct {
+        const char *label;
+        int enabled, unaligned_slot, should_hit;
+    } cases[] = {
+        {"unused-unaligned", 1, 7, 1},
+        {"used-unaligned", 1, 0, 0},
+        {"default", 0, 7, 0},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        rp_shader_reset();
+        rp_state_reset();
+        cs_slots_enabled = cases[i].enabled;
+        compile_calls = 0;
+        memcpy(rp_S.skey[5], key, 8);
+        rp_S.skey_ok = 1u << 5;
+        rp_S.tex_pool_n = rp_S.samp_pool_n = 4;
+        rp_S.ssbo[5][0] = (p_bind_buf){.addr = slot_addr(0, 0), .size = 256};
+        rp_S.ssbo[5][7] = (p_bind_buf){.addr = slot_addr(0, 7), .size = 256};
+        rp_S.ssbo[5][cases[i].unaligned_slot].addr += 4;
+
+        const struct rp_prog *program = NULL;
+        const int rc = rp_shader_resolve_compute(&program);
+        if (!cases[i].should_hit) {
+            CHECK(rc && !program && compile_calls == 1, "CS %s: library refused and compile requested", cases[i].label);
+            continue;
+        }
+        CHECK(!rc && program && program->lib_sourced && compile_calls == 0,
+              "CS %s: actual Vulkan library module loaded", cases[i].label);
+        if (rc || !program) continue;
+        const nvn_gpu_layout_ent *entry = &program->ent[0][0];
+        CHECK(program->nent[0] == 1 && entry->src_kind == NVN_RB_SBUFP &&
+              entry->src_reg == 0 && entry->cls == NVN_GPU_RES_SSBO && entry->binding == 5,
+              "CS layout refers to NVN slot 0 and Vulkan binding 5");
+        if (program->nent[0] != 1 || entry->src_reg >= 16) continue;
+        nvn_gpu_err e = {0};
+        nvn_gpu_pipe pipe = NULL;
+        nvn_gpu_stage_desc stage = {.sh = program->sh[0]};
+        const nvn_gpu_rc built = nvn_gpu_cpipe_get(&stage, NVN_GPU_PIPE_SYNC, &pipe, &e);
+        CHECK(OK(built), "CS pipeline: %d %s", built.code, e.why);
+        if (!OK(built)) continue;
+        nvn_gpu_cmd cmd = begin_cmd();
+        nvn_gpu_binding binding = {.cls = entry->cls};
+        const p_bind_buf *bound = &rp_S.ssbo[5][entry->src_reg];
+        int resolved = rp_buf_resolve(cmd, bound->addr, bound->size, &binding.u.b.buf, &binding.u.b.off);
+        CHECK(resolved, "CS declared slot resolves to its backing buffer");
+        if (!resolved) { nvn_gpu_cmd_abort(cmd); continue; }
+        binding.u.b.len = bound->size;
+        nvn_gpu_set_pipe(cmd, pipe);
+        nvn_gpu_bind(cmd, NVN_GPU_SH_CS, &binding, 1);
+        nvn_gpu_dispatch(cmd, pipe, 1, 1, 1, NULL, 0);
+        const nvn_gpu_rc committed = nvn_gpu_cmd_commit(cmd, 100, on_done, NULL, &e);
+        CHECK(OK(committed), "CS commit: %d %s", committed.code, e.why);
+        if (!OK(committed)) continue;
+        const nvn_gpu_rc waited = nvn_gpu_fence_wait(100, 5000000000ull, &e);
+        CHECK(OK(waited), "CS wait: %d %s", waited.code, e.why);
+        if (OK(waited)) {
+            uint32_t written, untouched;
+            memcpy(&written, buf_cpu(slot_buf[0][0]) + sizeof written, sizeof written);
+            memcpy(&untouched, buf_cpu(slot_buf[0][7]) + sizeof untouched, sizeof untouched);
+            CHECK(written == slot_color(0, 0) + 3, "CS GPU writes the declared slot: %#x", written);
+            CHECK(untouched == 0, "CS leaves the unrelated unaligned slot untouched");
+            printf("CS GPU readback slot0=%#x slot7=%#x\n", written, untouched);
+        }
+    }
+    rp_shader_reset();
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     case_dir = argv[1];
     char path[1100];
-    size_t vs_n = 0, fs_n = 0;
+    size_t vs_n = 0, fs_n = 0, cs_n = 0;
     snprintf(path, sizeof path, "%s/libpack_full.vert.spv", argv[1]); uint8_t *vs_spv = read_file(path, &vs_n);
     snprintf(path, sizeof path, "%s/libpack_sbuf.frag.spv", argv[1]); uint8_t *fs_spv = read_file(path, &fs_n);
-    if (!vs_spv || !fs_spv) return 2;
+    snprintf(path, sizeof path, "%s/libpack_sbuf.comp.spv", argv[1]); uint8_t *cs_spv = read_file(path, &cs_n);
+    if (!vs_spv || !fs_spv || !cs_spv) return 2;
     memset(&guest_program, 0, sizeof guest_program); guest_program.magic = MAGIC('P','R','O','G'); guest_program.serial = 100; guest_program.nstage = 2;
     memset(guest_stages, 0xff, sizeof guest_stages);
     for (unsigned st = 0; st < 2; st++) {
@@ -308,10 +414,11 @@ int main(int argc, char **argv) {
             CHECK(!o.drew, "gate %s: draw not made without a program", tag);
         }
     }
+    run_cs_cases(cs_spv, cs_n);
     nvn_gpu_err e = {0};
     for (int st = 0; st < 2; st++) for (int j = 0; j < 16; j++) nvn_gpu_buf_release(slot_buf[st][j], NULL, NULL);
     nvn_gpu_view_release(target_view); nvn_gpu_tex_release(tex);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "close session"); s2a_vk_device_destroy(&g_dev, 1);
-    free(vs_spv); free(fs_spv);
+    free(vs_spv); free(fs_spv); free(cs_spv);
     printf("libpack sbuf slots numbering: failures=%d\n", g_fail); return g_fail ? 1 : 0;
 }

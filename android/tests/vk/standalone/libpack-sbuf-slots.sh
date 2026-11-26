@@ -18,7 +18,7 @@ out="$repo/build/vk-libpack-sbuf-slots"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
 glslc_bin=${GLSLC:-glslc}
-for s in libpack_full.vert libpack_sbuf.frag; do
+for s in libpack_full.vert libpack_sbuf.frag libpack_sbuf.comp; do
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
 inc=()

@@ -39,9 +39,6 @@ namespace Ryujinx.Graphics.Shader
         /// </summary>
         bool QueryBindlessPhiSeeThrough() => false;
 
-        /// <summary>Whether the host can look up a dynamically loaded guest uniform handle in the descriptor pools.</summary>
-        bool QueryHostSupportsBindlessUniformHandles() => false;
-
         /// <summary>
         /// S2A：特化状态运行时化（点大小、DepthMode、alpha 测试、绘制参数来源、贴图坐标归一化改读支持缓冲 s2a_flags / s2a_point）。缺省 = 进程开关
         /// TranslatorContext.S2ARuntimeState（通用模式，S2A_RUNTIME_STATE=0 关）；直连翻译器答假：直连宿主不填这几个字段，编成运行时判断只会多读多分支。

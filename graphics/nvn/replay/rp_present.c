@@ -8,6 +8,7 @@
 #include "rp_fps_seg.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
+#include "nvn_render_audit.h"
 #include "nvn_plat.h"
 #include "nvn_dirty.h"
 #include "nvn_present_fit.h"
@@ -428,6 +429,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
         }
     } else g_n_dropped++;
     pthread_mutex_unlock(&g_pmu);
+    NVN_RA_IF(if (nvn_gpu_ok(r)) nvn_render_audit_present());
     if (!nvn_gpu_ok(r) && r.code != NVN_GPU_E_OUTDATED && nvn_unimpl("present", "present_failed", t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "present", err.why);
     return ticket;
 }

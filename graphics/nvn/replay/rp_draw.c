@@ -14,8 +14,10 @@
 #include "rp_shader.h"
 #include "rp_access.h"
 #include "nvn_unimpl.h"
+#include "nvn_render_audit.h"
 #include "nvn_hmap.h"
 #include "nvn_plat.h"
+#include "rp_roi_history.h"
 #include "nvn_refl.h"
 #include "nvn_fmt_info.h"
 #include "nvn_dirty.h"   // 写跟踪：暂存片的逐页写代号（nvk_slc_gen 用）
@@ -834,7 +836,12 @@ static void hist_note(uint64_t target, const uint64_t *tex, int ntex) {
     for (int k = 0; k < ntex && k < HIST_TEX; k++) g_hist[i].tex[k] = tex[k];
 }
 static int g_log_left;   // 逐笔日志还剩几行（调试开关 nvk_drawlog：上屏每 600 帧给下一帧开一次，见 rp_draw_log_arm）
+static _Thread_local nvn_gpu_cmd history_cs_cmd;
+static _Thread_local unsigned long long history_cs_request;
+static _Thread_local const char *history_cs_result;
 static int skip(const char *why, const void *rec) {
+    NVN_RA_IF(nvn_render_audit_event(NVN_RA_SKIP, why, NULL, NULL));
+    if (history_cs_cmd) history_cs_result = why;
     nvn_unimpl("draw", why, rec); g_skips++;
     if (g_log_left) { g_log_left--; char b[96]; snprintf(b, sizeof b, "跳过一笔：%s", why); nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b); }
     return 0;
@@ -2343,6 +2350,9 @@ static const char *image_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, int pi
     uint64_t h = rp_S.img[stage][e->src_reg];
     tex_t snap; view_t view; int has_view;
     if (!rp_tex_snap_by_id((int)(h & 0xFFFFF), &snap, &view, &has_view)) return IMGW(1);
+    if (!gfx && history_cs_cmd && snap.d.target == NVN_TEXTURE_TARGET_3D)
+        RP_HISTORY(c,NULL,"event=cs_candidate request=%llu slot=%u set=%u binding=%u serial=%llu handle=%u",
+                   history_cs_request,e->src_reg,e->set,e->binding,(unsigned long long)snap.serial,(unsigned)(h & 0xfffff));
     uint32_t format = has_view && view.set_format ? (uint32_t)view.format : (uint32_t)snap.d.format, vfmt;
     { const char *why = image_view_format(format, pg->dtt[pi][i], pg->dcls[pi][i], pg->difmt[pi][i], &vfmt); if (why) return gfx ? image_why_graphics(why) : why; }
     { uint32_t a = rp_storage_srgb_alias(vfmt); if (a) vfmt = a; }   // sRGB 贴图按同位宽 UNORM 视图写（后端能力位见 rp_storage_srgb_alias）
@@ -2407,7 +2417,7 @@ static const char *image_tbuf_resolve(nvn_gpu_cmd c, const struct rp_prog *pg, i
     if (write) rp_post_gpu_write((uint64_t)(uintptr_t)t.mem, bytes);
     return NULL;
 }
-void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
+static void dispatch_impl(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
     if (!c) return;
     rp_perf_add(RP_PERF_DISP_N, 1);   // 派发次数（其余命令里最贵的一项，看它到底多少次）
     struct timespec tsa; clock_gettime(CLOCK_MONOTONIC, &tsa); uint64_t t_disp0 = (uint64_t)tsa.tv_sec * 1000000000ull + (uint64_t)tsa.tv_nsec;
@@ -2568,6 +2578,7 @@ cs_rebind:
     // 游戏屏障（#978）：派发在通道外，等不到下一个通道开头，这里取走待发位交给后端；间接参数的那道合在同一次里
     uint32_t bar = rp_pass_take_barrier() | (g_disp_ind ? NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT : 0);
     if (bar) { nvn_gpu_barrier(c, bar); g_compute_access.n = 0; }
+    if (history_cs_cmd) history_cs_result = "backend_called";
     nvn_gpu_dispatch(c, cp, g_disp_dim[0], g_disp_dim[1], g_disp_dim[2], g_disp_ind, g_disp_ind_off);
     texel_wb_flush(c);   // imageBuffer 的对齐副本：派发写完拷回池镜像
     for (size_t i = 0; i < g_ndispatch_access; i++) rp_access_write(&g_compute_access, &g_dispatch_access[i]);
@@ -2583,6 +2594,35 @@ done:
         if (texel_tmp(&pg->ent[0][i]) && tv[i]) nvn_gpu_view_release(tv[i]);
     rp_view_pin_end();
     { struct timespec tsc; clock_gettime(CLOCK_MONOTONIC, &tsc); rp_perf_add(RP_PERF_DISP_TOT_NS, (uint64_t)tsc.tv_sec * 1000000000ull + (uint64_t)tsc.tv_nsec - t_disp0); }
+}
+
+void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec) {
+    if (!c || !RP_HISTORY_ON() || !nvn_vk_history_request) {
+        dispatch_impl(c, dp, rec);
+        return;
+    }
+    history_cs_cmd = c;
+    history_cs_request = nvn_vk_history_request(c);
+    history_cs_result = !dp->ind && (dp->x <= 0 || dp->y <= 0 || dp->z <= 0) ? "zero_groups" : "replay_early_exit";
+    uint64_t key = 0;
+    for (unsigned i = 0; i < 8; ++i) key = (key << 8) | rp_S.skey[5][i];
+    RP_HISTORY(c,NULL,"event=cs_request request=%llu key=%016llx key_valid=%u groups=%d,%d,%d indirect=%llu",
+               history_cs_request,(unsigned long long)key,(unsigned)(rp_S.skey_ok >> 5 & 1),
+               (int)dp->x,(int)dp->y,(int)dp->z,(unsigned long long)dp->ind);
+    dispatch_impl(c,dp,rec);
+    if (strcmp(history_cs_result, "backend_called")) {
+        // On failed resolution these are the bound candidates, not proven outputs.
+        for (unsigned slot = 0; slot < 32; ++slot) {
+            uint64_t handle = rp_S.img[5][slot];
+            tex_t t; view_t v; int has_view;
+            if (handle && rp_tex_snap_by_id((int)(handle & 0xfffff), &t, &v, &has_view) &&
+                t.d.target == NVN_TEXTURE_TARGET_3D)
+                RP_HISTORY(c,NULL,"event=cs_skip_bound request=%llu slot=%u serial=%llu",
+                           history_cs_request,slot,(unsigned long long)t.serial);
+        }
+    }
+    RP_HISTORY(c,NULL,"event=cs_result request=%llu result=%s",history_cs_request,history_cs_result);
+    history_cs_cmd = NULL;
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }

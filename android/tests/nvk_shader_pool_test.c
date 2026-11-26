@@ -67,6 +67,10 @@ static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alia
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
 static int fixture_gate_probe;   // nvk_gate_probe：只读探测开关（缺省 0）
+static int fixture_cs_resolve_check;
+static int cs_used_slots_lines;
+static char cs_used_slots_summary[256];
+static int fixture_cs_used_slots = -1;
 static int fixture_used_slots = -1;   // nvk_lp_used_slots：-1 = 取生产缺省（关 = 「任何一个非对齐绑定都算」的旧口径），0 / 1 = 读成这个值（缺省关之后，新口径的用例要显式设 1，就像调试包设属性）
 static int fake_cs_success, cs_loads;
 int g_s2a_logfd = 2;
@@ -135,6 +139,8 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_link_refused_file") && record_link_refused) return 1;
     if (!strcmp(name, "nvk_link_map_diag")) return link_map_flag;
     if (!strcmp(name, "nvk_gate_probe")) return fixture_gate_probe;
+    if (fixture_cs_resolve_check && !strcmp(name, "nvk_resolve_check")) return 1;
+    if (fixture_cs_used_slots >= 0 && !strcmp(name, "nvk_cs_used_slots")) return fixture_cs_used_slots;
     if (fixture_used_slots >= 0 && !strcmp(name, "nvk_lp_used_slots")) return fixture_used_slots;
     if (fixture_fact_wide >= 0 && !strcmp(name, "nvk_fact_wide")) return fixture_fact_wide;
     return dflt;
@@ -145,6 +151,10 @@ static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   //
 void nvn_plat_log(int level, const char *cls, const char *text) {
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "CS used slots phase=")) {
+        cs_used_slots_lines++;
+        snprintf(cs_used_slots_summary, sizeof cs_used_slots_summary, "%s", text);
+    }
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
     if (!strcmp(cls, "shader") && strstr(text, "libpack_cs_unaligned_refused")) { lp_unref_lines += level == NVN_PLAT_LOG_INFO ? 1 : 1000; snprintf(last_unref, sizeof last_unref, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "libpack_cs_unaligned_refused 累计")) { lp_unref_sums++; snprintf(last_unref_sum, sizeof last_unref_sum, "%s", text); }
@@ -2430,6 +2440,112 @@ static int cs_libpack_test(void) {
     printf("nvk shader pool (libpack CS unaligned gate): %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
+static int cs_used_slots_test(const char *spv_path, int opt_in) {
+    uint32_t spv[1024];
+    FILE *file = fopen(spv_path, "rb");
+    if (!file) return 2;
+    size_t spv_bytes = fread(spv, 1, sizeof spv, file);
+    int complete = feof(file) && !ferror(file);
+    fclose(file);
+    if (!spv_bytes || !complete) return 2;
+
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    source(); bind_pools(100);
+    fake_cs_success = 1;
+    fixture_cs_used_slots = opt_in ? 1 : -1;
+    fixture_cs_resolve_check = opt_in;
+    rp_S.ssbo[5][0] = (p_bind_buf){.addr = 0x10000, .size = 256};
+    rp_S.ssbo[5][7] = (p_bind_buf){.addr = 0x20001, .size = 256};
+
+    char hex[17];
+    for (int b = 0; b < 8; b++) snprintf(hex + 2 * b, 3, "%02x", rp_S.skey[5][b]);
+    char json[512];
+    snprintf(json, sizeof json,
+             "{\"dm_ctl\":\"%s\",\"stage\":\"cs\",\"bindings\":["
+             "{\"msl_name\":\"entry_data\",\"kind\":\"sbuf\",\"reg\":0,\"arg_id\":0,\"rw\":true}]}", hex);
+    uint64_t keys[] = {lp_key(rp_S.skey[5]), lp_key(rp_S.skey[5])};
+    const uint8_t kinds[] = {1, 52};
+    const uint8_t *data[] = {(const uint8_t *)json, (const uint8_t *)spv};
+    const size_t sizes[] = {strlen(json), spv_bytes};
+    char root[256];
+    if (cs_lib_root(root, keys, kinds, data, sizes, 2)) return 2;
+
+    compiler_calls = 0;
+    const struct rp_prog *unused = NULL;
+    int rc = rp_shader_resolve_compute(&unused);
+    if (opt_in) {
+        CHECK(!rc && unused && unused->lib_sourced && compiler_calls == 0,
+              "CS unused unaligned slot admits the single-slot library (compiler calls=%d)", compiler_calls);
+        CHECK(unused && unused->nent[0] == 1 && unused->ent[0][0].src_kind == NVN_RB_SBUFP &&
+              unused->ent[0][0].src_reg == 0, "CS admission uses the one reflected NVN storage slot");
+    } else {
+        CHECK(!rc && unused && !unused->lib_sourced && compiler_calls == 1 && !lp_open_lines,
+              "CS used slots default performs no library probe or admission (compiler calls=%d, opens=%d)",
+              compiler_calls, lp_open_lines);
+    }
+
+    if (opt_in) {
+        const struct rp_prog *used = NULL;
+        const struct rp_prog *again = NULL;
+        rp_S.ssbo[5][0].addr++;
+        rc = rp_shader_resolve_compute(&used);
+        CHECK(!rc && used && !used->lib_sourced && compiler_calls == 1 &&
+              strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+              "CS reflected unaligned slot bypasses the prior fast hit and compiles hardened");
+        CHECK(used && unused && memcmp(used->identity, unused->identity, 32),
+              "CS admitted library and hardened live program carry distinct identities");
+        rp_S.ssbo[5][0].addr--;
+        CHECK(!rp_shader_resolve_compute(&again) && again == unused && compiler_calls == 1,
+              "CS realigning the declared slot restores the prior library program");
+
+        CHECK(!strstr(last_red, "resolve_fast_path_mismatch"), "CS fast and slow resolve agree after alignment changes");
+        CHECK(rp_shader_lib_reject(unused), "CS can reject the narrowed library at binding time");
+        CHECK(!rp_shader_resolve_compute(&again) && again == used && compiler_calls == 1,
+              "CS rejected narrowed library falls back to the existing hardened identity");
+        rp_shader_reset();
+        CHECK(strstr(cs_used_slots_summary, "phase=final attempts=2 rescued=1 used_unaligned=1 unknown=0 library_rejected=0"),
+              "CS summary counts real library attempts and ignores fast hits: %s", cs_used_slots_summary);
+
+        // Drop the source record and bind the same slots against a fresh pack.
+        char missing_root[256];
+        uint64_t other[] = {keys[0] ^ 1u, keys[1] ^ 1u};
+        if (cs_lib_root(missing_root, other, kinds, data, sizes, 2)) return 2;
+        compiler_calls = lp_unref_lines = 0;
+        again = NULL;
+        rc = rp_shader_resolve_compute(&again);
+        CHECK(!rc && again && !again->lib_sourced && compiler_calls == 1 &&
+              lp_unref_lines == 1 && strstr(captured, "\"hasUnalignedStorageBuffer\":true"),
+              "CS missing reflection falls back to the full unaligned gate");
+        rp_shader_reset();
+        CHECK(strstr(cs_used_slots_summary, "phase=final attempts=1 rescued=0 used_unaligned=0 unknown=1 library_rejected=0"),
+              "CS summary counts missing reflection conservatively: %s", cs_used_slots_summary);
+        cs_lib_root_rm(missing_root);
+
+        // A nominal compute stage without any proven storage slot is also unknown.
+        const uint8_t *empty_data[] = {(const uint8_t *)json, (const uint8_t *)spv};
+        snprintf(json, sizeof json, "{\"dm_ctl\":\"%s\",\"stage\":\"cs\",\"bindings\":[]}", hex);
+        const size_t empty_sizes[] = {strlen(json), spv_bytes};
+        char empty_root[256];
+        if (cs_lib_root(empty_root, keys, kinds, empty_data, empty_sizes, 2)) return 2;
+        compiler_calls = cs_loads = 0;
+        CHECK(!rp_shader_resolve_compute(&again) && again && !again->lib_sourced &&
+              compiler_calls == 1 && cs_loads == 1, "CS empty reflection falls back without loading a library shader");
+        rp_shader_reset();
+        CHECK(strstr(cs_used_slots_summary, "phase=final attempts=1 rescued=0 used_unaligned=0 unknown=1 library_rejected=0"),
+              "CS zero reflected slots count as unknown: %s", cs_used_slots_summary);
+        cs_lib_root_rm(empty_root);
+    } else {
+        rp_shader_reset();
+        CHECK(!cs_used_slots_lines, "CS used slots default emits no diagnostic or final summary");
+    }
+
+    unsetenv("S2A_SHADER_REVISION_ROOT");
+    cs_lib_root_rm(root);
+    printf("CS used slots (%s): %d checks, %d failures\n", opt_in ? "on" : "default", checks, failures);
+    return failures ? 1 : 0;
+}
+
 static int diag_compile_test(void) {
     trace_on = 1; trace_begin_count = trace_end_count = 0; fake_gs_success = 0;
     gs_request_test();
@@ -2843,6 +2959,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--lp-numeric")) return gs_libpack_test(0, 1);
     if (argc == 2 && !strcmp(argv[1], "--gs-libpack")) return gs_libpack_test(0, 0);
     if (argc == 2 && !strcmp(argv[1], "--link-refused-file")) return gs_libpack_test(1, 0);
+    if (argc == 4 && !strcmp(argv[1], "--cs-used-slots"))
+        return cs_used_slots_test(argv[2], !strcmp(argv[3], "on"));
     if (argc == 2 && !strcmp(argv[1], "--cs-libpack")) return cs_libpack_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm")) return compute_warm_test();
     if (argc == 2 && !strcmp(argv[1], "--compute-warm-off")) return compute_warm_off_test();
