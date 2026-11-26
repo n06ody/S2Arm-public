@@ -15,6 +15,13 @@ void rp_res_byte_upload_failed(void);
 // 宿主整段读贴图存储的入口：整段在它的内存池里 → t->mem；伸出池子（真机：存储偏移 -1）→ 副本，池内照拷、池外按 0，*part 交调用方 free。
 //   NULL = 副本分配失败。线程：任意（不取锁）。
 const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);
+// Guest linear render-target storage describes one row pitch, one level and one layer.
+static inline int rp_linear_rt_layout(const tex_t *t) {
+    int bw = 0, bh = 0;
+    return t->d.target == NVN_TEXTURE_TARGET_2D && t->d.width && t->d.height &&
+           t->d.levels <= 1 && t->L.layers <= 1 && t->d.samples <= 1 &&
+           nvn_fmt_bpb(t->d.format, &bw, &bh) && bw == 1 && bh == 1;
+}
 // 贴图号 → 视图（登记时带视图记录的按它建，否则默认视图）。号没登记 / 池外 → NULL。线程：[提交]。
 // t_out 可为 NULL；非 NULL 时取到登记就在锁内把登记快照拷进调用方的 *t_out，没取到清零（serial 为 0）。
 //   不交出登记表内地址：客体线程登记更大的号会让表扩容换地址（#1581）。

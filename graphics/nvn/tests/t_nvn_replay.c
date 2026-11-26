@@ -1688,6 +1688,49 @@ static int rt_rows_are(const uint8_t *dst, size_t row, uint32_t layer, const NVN
     for (uint64_t y = 0; y < hb; y++) for (uint64_t i = 0; i < wb; i++) if (dst[y * row + i] != gpu_byte(layer, 0, r->yoffset, r->xoffset, y, i)) return 0;
     return 1;
 }
+static void t_read_texels_linear_rt(void) {
+    const int cpu_auto = g_buf_cpu_auto;
+    const NVNcopyRegion r = {.xoffset = 1, .yoffset = 1, .width = 2, .height = 2, .depth = 1};
+    for (unsigned both = 0; both < 2; both++) {
+        res_fresh(); nvn_unimpl_reset();
+        const uint32_t flags = NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | (both ? NVN_TEXTURE_FLAGS_LINEAR : 0);
+        tex_t t = mk_tex(601 + both, 0x4000, NVN_FORMAT_RGBA8, 4, 4, 1, flags);
+        t.d.stride = 24;
+        nvn_tex_layout(&t.d, &t.L);
+        memset(t.mem, 0x5a, t.L.size);
+        for (unsigned y = 0; y < 4; y++) for (unsigned i = 0; i < 16; i++)
+            t.mem[y * 24 + i] = (uint8_t)(y * 16 + i);
+        nvn_be_tex_cpu_written(&t);
+        uint8_t out[40]; sent_fill(out, sizeof out);
+        nvn_be_read_texels(&t, 0, 0, &r, out, 12, sizeof out);
+        CHECK(!memcmp(out, t.mem + 28, 8) && !memcmp(out + 12, t.mem + 52, 8));
+        CHECK(all_sent(out + 8, 4) && all_sent(out + 20, sizeof out - 20));
+        CHECK(un_cnt("read_texels") == 0);
+        rt_gpu_tex(&t);
+        g_buf_cpu_auto = 1; g_auto_done = 1; g_tb_fill = 1;
+        sent_fill(out, sizeof out);
+        nvn_be_read_texels(&t, 0, 0, &r, out, 12, sizeof out);
+        CHECK(rt_rows_are(out, 12, 0, &r, 8, 2));
+        CHECK(all_sent(out + 8, 4) && all_sent(out + 20, sizeof out - 20) && nvn_be_tex_gpu_owned(t.serial));
+        g_buf_cpu_auto = cpu_auto; g_auto_done = 0; g_tb_fill = 0;
+        sent_fill(out, sizeof out);
+        nvn_be_read_texels(&t, 1, 0, &r, out, 12, sizeof out);
+        nvn_be_read_texels(&t, 0, 1, &r, out, 12, sizeof out);
+        CHECK(all_sent(out, sizeof out) && un_cnt("read_texels_bad_region") == 2);
+        nvn_be_tex_release(&t);
+
+        tex_t mip = mk_tex(603 + both, 0x4000, NVN_FORMAT_RGBA8, 4, 4, 2, flags);
+        tex_t array = mk_tex_tgt(605 + both, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 4, 4, 2);
+        array.d.flags = flags;
+        nvn_tex_layout(&array.d, &array.L);
+        nvn_be_sub_begin();
+        CHECK(rp_tex_resolve(&mip, &g_fake_cmd) == NULL);
+        CHECK(rp_tex_resolve(&array, &g_fake_cmd) == NULL);
+        CHECK(nvn_unimpl_count("tex", "linear_render_target_shape") == 2);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_tex_release(&array); nvn_be_tex_release(&mip);
+    }
+}
 static void t_read_texels_gpu(void) {
     res_fresh(); nvn_unimpl_reset(); g_ft_hit = 0;
     const int cpu_auto = g_buf_cpu_auto; g_buf_cpu_auto = 1; g_auto_done = 1; g_tb_fill = 1;
@@ -8334,6 +8377,7 @@ int main(int argc, char **argv) {
     t_alias_take_over();
     t_read_texels_guest();
     t_read_texels_gpu_owned();
+    t_read_texels_linear_rt();
     t_read_texels_gpu();
     t_create_stats();
     t_cpu_upload();

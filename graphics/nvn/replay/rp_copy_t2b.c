@@ -20,7 +20,11 @@ void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         target != NVN_TEXTURE_TARGET_CUBEMAP && target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) {
         nvn_unimpl("tex", "t2b_target", rec); return;
     }
-    if (t->d.samples > 1 || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ||
+    const int linear_rt = (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) != 0;
+    if (linear_rt && !rp_linear_rt_layout(t)) {
+        nvn_unimpl("tex", "linear_render_target_shape", rec); return;
+    }
+    if (t->d.samples > 1 || (!linear_rt && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR)) ||
         (o->flags & ~(NVN_COPY_FLAGS_ENGINE_2D_BIT | NVN_COPY_FLAGS_LINEAR_FILTER_BIT))) {
         nvn_unimpl("tex", "t2b_mode", rec); return;
     }

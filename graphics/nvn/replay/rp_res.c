@@ -336,7 +336,7 @@ const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part) {
 // for_upload = 1：upload_all 真要传这张图。LINEAR_RENDER_TARGET 也按线性排布逐行拷——同苹果端 nvn_mtl.m 上传口径
 //   （LINEAR / LINEAR_RENDER_TARGET 一概「线性排布只有 CPU 逐行拷」）。线性渲染目标只会经「WriteTexels 写过」（cpu_content 首句）走到这里：
 //   游戏明确用 CPU 写了它。原先在这里拒掉、报红，内容一次都传不上去（11-21 一款 2D-HD 游戏带存档加载后每帧约 2 张、整屏黑）。
-//   for_upload = 0（cpu_content 判「要不要当 CPU 贴图持续跟踪」、upload_linear_dirty 判「能不能按脏行传」）照旧：只有 LINEAR_RENDER_TARGET 的内容归 GPU。
+//   LINEAR_RENDER_TARGET 沿用渲染目标归属：只有明确的 CPU 写入才上传客体内容。
 static int linear_class(const tex_t *t, const char **why, int initial) {
     *why = NULL;
     if (!(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))) return 0;
@@ -350,8 +350,6 @@ static int linear_class(const tex_t *t, const char **why, int initial) {
             return 0;
         }
     } else {
-        if (!(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR)) { *why = "linear_render_target_unsupported"; return -1; }   // 只有 LINEAR_RENDER_TARGET：内容通常归 GPU
-        if (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) { *why = "linear_render_target_and_linear_unsupported"; return -1; }
         if (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) { *why = "linear_sparse_unsupported"; return -1; }
     }
     if (!t->mem || !t->pool) { *why = "linear_no_cpu_memory"; return -1; }
@@ -452,6 +450,7 @@ static int cpu_content(const tex_t *t, int *sparse) {
     if (!t->mem || !t->pool || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
     if (nvn_hm_get(&g_cpu_ser, &t->serial)) return 1;   // WriteTexels 写过（字节写在游戏看得到的地址上，照旧直接读）
     if (sparse_cpu_tex(t)) { *sparse = 1; return 1; }   // 虚拟池里的压缩贴图：内容在映射到那里的物理页里（上传时按页表读，见上）；随包布局的也走这里，所以先于下一行
+    if (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) return 0;
     if (t->has_layout) return 1;   // 随包贴图
     uint64_t pk = (uint64_t)(uintptr_t)t->pool;
     int unc = !fmt_compressed(t->d.format) && t->d.target != NVN_TEXTURE_TARGET_3D;
@@ -459,9 +458,7 @@ static int cpu_content(const tex_t *t, int *sparse) {
     if (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
     { const char *why = NULL; int lc = linear_class(t, &why, 0);
         if (lc > 0) return 1;                 // 线性准入：初始全零也进入持续观察（首用之后 CPU 再写也会被脏页跟踪接住）
-        if (lc < 0) {
-            if (!strcmp(why, "linear_render_target_unsupported")) return 0;   // 只有 LINEAR_RENDER_TARGET：内容归 GPU（可能由 copy_b2t 写入），不按 CPU 内容传、不报红
-            nvn_unimpl("tex", why, t); return 0; } }   // 线性族里第一批不收的：准确报红，不猜内容
+        if (lc < 0) { nvn_unimpl("tex", why, t); return 0; } }   // 线性族里第一批不收的：准确报红，不猜内容
     if ((t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !fmt_compressed(t->d.format))) return 0;
     uint64_t lo, hi; tex_window(t, &lo, &hi);   // 只扫池里那段：池外按 0（rp_tex_src）
     return mem_any(t->mem + lo, hi - lo);
@@ -687,7 +684,8 @@ done:
 //   返回 0 = 已按行传完；-1 = 不适用（没传过 / 不是线性单级二维 / 不被跟踪 / 脏行过半），调用方整张传；1 = 失败。
 static int upload_linear_dirty(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
     const char *why = NULL;
-    if (!x->uploaded || !x->span || t->d.levels > 1 || t->L.layers > 1 || t->d.target != NVN_TEXTURE_TARGET_2D || linear_class(t, &why, 0) <= 0) return -1;
+    if (!x->uploaded || !x->span || (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) ||
+        t->d.levels > 1 || t->L.layers > 1 || t->d.target != NVN_TEXTURE_TARGET_2D || linear_class(t, &why, 0) <= 0) return -1;
     int bw = 1, bh = 1; int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (bpb <= 0 || bw != 1 || bh != 1) return -1;
     const uint32_t w = t->d.width, rows = t->d.height;
@@ -892,6 +890,11 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
     if (tm_) { r1_ = res_now(); rp_perf_add(RP_PERF_RES_LOCK, r1_ - r0_); }
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
     if (!x) {
+        if ((t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) && !rp_linear_rt_layout(t)) {
+            pthread_mutex_unlock(&g_rmu);
+            nvn_unimpl("tex", "linear_render_target_shape", t);
+            return NULL;
+        }
         rp_perf_add(RP_PERF_RES_NEW, 1); new_size_note(t->d.width, t->d.height);
         int sp = 0, cpu = cpu_content(t, &sp);
         alias_key k; alias_key_of(&k, t);

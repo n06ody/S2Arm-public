@@ -259,7 +259,7 @@ void nvn_be_xv_window_tex(uint64_t serial) { (void)serial; }   // 跨提交有�
 // ① 游戏内存里就是内容（随包 / WriteTexels 或刷新写过 / 脏页追踪发现被 CPU 写过）：就地反交织，按调用方给的区域 / 行距 / 片距逐行拷进 dst；
 //    不碰 GPU、不建宿主贴图，任何线程都能调。
 // ② 内容归 GPU（渲染 / 拷贝 / 计算写过）：rt_gpu 从宿主贴图读回（片 1：二维 / 二维数组 / 立方体 / 三维，NVN_GPU_FMT_READBACK 的格式）。
-// 别的（线性 / 稀疏 / 多重采样 / 缓冲贴图、没人写过的、读回不了的格式）照旧具名记账、不动 dst，不返回假结果。
+// 线性渲染目标复用这两条路径：客体按线性行距解包，宿主按实际渲染存储读回。
 int nvn_ft_written(const tex_t *t) __attribute__((weak));   // hle_nvn.c：脏页追踪（档案开关在它里面判），命中时它自己记 nvn_be_tex_cpu_written；没有它的构建当「没写过」
 static int tex_content_in_guest_memory(const tex_t *t) {
     if (!t->mem) return 0;
@@ -274,8 +274,12 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     if (!t || !r || !dst) { nvn_unimpl("be", "read_texels_bad_args", __builtin_return_address(0)); return; }
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { nvn_unimpl("fmt", "read_texels_unknown_format", t); return; }
-    // 存储不是块线性的（线性 / 稀疏 / 多重采样 / 缓冲贴图）：反交织管不了，等读回路径
-    if ((t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) { UN("read_texels"); return; }
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) { UN("read_texels"); return; }
+    if (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) {
+        if (!rp_linear_rt_layout(t)) {
+            nvn_unimpl("tex", "linear_render_target_shape", t); return;
+        }
+    } else if (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) { UN("read_texels"); return; }
     // 区域按块折算（x / y 按块宽高除，宽高向上取整到块）。级、层、片、区域、行距、片距任一不成立都拒绝：不读存储之外的字节，
     // 也不写互相覆盖的输出（iOS 不查）。这些检查都是纯的，排在可能改归属的 nvn_ft_written 之前
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
