@@ -14,6 +14,7 @@
 #include "rp_shader.h"
 #include "rp_access.h"
 #include "nvn_unimpl.h"
+#include "nvn_render_audit.h"
 #include "nvn_hmap.h"
 #include "nvn_plat.h"
 #include "nvn_refl.h"
@@ -835,6 +836,7 @@ static void hist_note(uint64_t target, const uint64_t *tex, int ntex) {
 }
 static int g_log_left;   // 逐笔日志还剩几行（调试开关 nvk_drawlog：上屏每 600 帧给下一帧开一次，见 rp_draw_log_arm）
 static int skip(const char *why, const void *rec) {
+    NVN_RA_IF(nvn_render_audit_event(NVN_RA_SKIP, why, NULL, NULL));
     nvn_unimpl("draw", why, rec); g_skips++;
     if (g_log_left) { g_log_left--; char b[96]; snprintf(b, sizeof b, "跳过一笔：%s", why); nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b); }
     return 0;

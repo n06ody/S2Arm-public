@@ -611,6 +611,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           snprintf(b, sizeof b, "上屏放大读数：开关=%d 适用=%d（源格式=%d 交换链=%d）", up, elig, (int)st->format, (int)s->format);
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); } }
     }
+    if (ROI_ACTIVE(c)) roi_pixel(c,"present",d->src,0,0,d->src->base_level,d->src->base_layer);
     int ok = wsi_compose_selected(c, s, idx, st, d, &fp, encode, target, elig, &upscaled);
     // 内部段：摘出活动表，自己提交（等取图信号量、发呈现信号量），交给完成线程只做回收
     pthread_mutex_lock(&g_mu);
@@ -645,6 +646,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     s->acquire_pending[sem] = 0;   // 这把信号量已交给呈现段去等
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
+    if (ROI_CONFIGURED) atomic_store(&roi_next,(unsigned)seg->wsi_seq+1);
     enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];
@@ -655,8 +657,11 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     if (timing_id) pi.pNext = &pts;
     r = vkQueuePresentKHR(g.queue, &pi);
     pthread_mutex_unlock(&g_submit_mu);
+    if (ROI_CONFIGURED && atomic_load(&roi_next)==(unsigned)roi_target+1)
+        roi_message("event=present_result frame=%d ticket=%llu result=%d",roi_target,(unsigned long long)ticket,(int)r);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        if (g.bc7_astc_on) atomic_fetch_add(&g.bc7_present, 1);
         uint64_t tnow = now_ns();
         if (!s->timing.start) s->timing.start = tnow;
         wsi_timing_submitted(&s->timing, timing_id);

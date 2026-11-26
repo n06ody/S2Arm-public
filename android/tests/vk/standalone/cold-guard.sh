@@ -56,6 +56,10 @@ for dq in 0 1; do
     done
 done
 
+cc -std=c11 -O2 -Wall -Wextra -Werror -I "$repo/android/native/nvn" \
+    "$repo/android/tests/vk/t_cold_ledger.c" -o "$out/ledger"
+"$out/ledger"
+
 # The shared replay must form this exact plan before opening a physical pass,
 # then bind the identical SSBO and driver slice via the normal draw path.
 replay_src=("$repo/android/tests/vk/t_cold_replay.c" "$repo/graphics/nvn/tests/nvn_clear_view_unused.c")

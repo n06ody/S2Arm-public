@@ -1026,7 +1026,7 @@ int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp_c, const uint8_t k
     if (slots) *slots = 0;
     if (!lp || !lp->p.idx || !key || !slots) return 1;
     const char *lib_stage = lp_nvn_stage_name(nvn);
-    if (!lib_stage || !strcmp(lib_stage, "cs")) return 1;   // 图形三段（vs / ps / gs）；计算不走这里
+    if (!lib_stage) return 1;
     const int gs = !strcmp(lib_stage, "gs");
     int gt = -1;
     if (gs && (gt = lp_input_topology(topology)) < 0) return 1;   // 邻接 / 没有来源：库里没有那一份
@@ -1057,6 +1057,8 @@ int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp_c, const uint8_t k
             if (jf_u32(b, "reg", &reg) || reg >= 16) goto done;
             mask |= 1u << reg;
         }
+        // 计算首次接入只采用非空槽集。零槽反射仍按旧闸处理。
+        if (nvn == 5 && !mask) goto done;
         // 不经描述符的内存访问：这一段的 SPIR-V 声明了 PhysicalStorageBufferAddresses = 着色器可以按 64 位地址直接读写内存，
         //   那条路不走 rp_S.ssbo 的槽，_b.json 的绑定表就不是它碰得到的全部存储 → 说不准（返回 2，与别的「说不准」分开计数）。
         //   .spv 取不到 / 读不懂同样说不准（返回 1）：没有 .spv 的键本来也合成不出库程序。

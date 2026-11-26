@@ -114,7 +114,8 @@ enum { WIDTH = 8, HEIGHT = 4, IMAGE_BYTES = WIDTH * HEIGHT * 4, OFF = 256, FIELD
        FIRST_WORD = FIELD_WORD + DRIVER_VALUE / 4, STRIDE = 5, COUNT = 65,
        WORDS = FIRST_WORD + (COUNT - 1) * STRIDE + 1, TRANSFER_BYTES = (WORDS - 1) * 4 };
 enum mode { BASE, AA, AB, MISSING_FRONT, MISSING_TAIL, SHORT, BIND_CHANGED, PREFIX_CHANGED,
-            AUTO, AUTO_HOST, AUTO_MISSING_FRONT, AUTO_MISSING_TAIL, AUTO_PRE, AUTO_COMMITTED, AUTO_ABORT, AUTO_CHANGED };
+            AUTO, AUTO_HOST, AUTO_MISSING_FRONT, AUTO_MISSING_TAIL, AUTO_PRE, AUTO_COMMITTED, AUTO_ABORT, AUTO_CHANGED,
+            AUTO_FRAGMENTED_PRE, AUTO_FRAGMENTED_COMMITTED };
 static const uint32_t formats[] = {NVN_FORMAT_RGBA8, NVN_FORMAT_RGBA8UI};
 
 static nvn_gpu_pipe make_pipe(nvn_gpu_shader vs, nvn_gpu_shader fs) {
@@ -172,7 +173,8 @@ static struct comparison run_case(nvn_gpu_pipe a, nvn_gpu_pipe b, nvn_gpu_pipe p
         words[WORDS - 2] = words[WORDS - 1];
     }
     nvn_gpu_cmd pre = NULL;
-    if (mode == AUTO_PRE || mode == AUTO_COMMITTED || mode == AUTO_ABORT) {
+    const int fragmented = mode == AUTO_FRAGMENTED_PRE || mode == AUTO_FRAGMENTED_COMMITTED;
+    if (mode == AUTO_PRE || mode == AUTO_COMMITTED || mode == AUTO_ABORT || fragmented) {
         const nvn_gpu_cmd_desc pd = {.label = "nvn submit pre"};
         GPU(nvn_gpu_cmd_begin(&pd, &pre, &err));
     }
@@ -181,10 +183,15 @@ static struct comparison run_case(nvn_gpu_pipe a, nvn_gpu_pipe b, nvn_gpu_pipe p
     if (mode == AUTO_HOST) {
         memcpy(nvn_gpu_buf_cpu(src) + OFF, words, sizeof words);
         if (nvn_vk_cold_mirror_host_write) nvn_vk_cold_mirror_host_write(src, OFF, sizeof words);
+    } else if (fragmented) {
+        // Over 96 contiguous exact writes, each preceded by the normal
+        // transfer write barrier and its own publication epoch.
+        for (size_t at = 0; at < sizeof words; at += sizeof(uint32_t))
+            nvn_gpu_buf_write(pre, src, OFF + at, (const uint8_t *)words + at, sizeof(uint32_t));
     } else {
         nvn_gpu_buf_write(pre ? pre : c, src, OFF + skip_front, (uint8_t *)words + skip_front, init_end - skip_front);
     }
-    if (mode == AUTO_COMMITTED || mode == AUTO_ABORT) {
+    if (mode == AUTO_COMMITTED || mode == AUTO_ABORT || mode == AUTO_FRAGMENTED_COMMITTED) {
         if (mode == AUTO_ABORT) nvn_gpu_cmd_abort(pre);
         else GPU(nvn_gpu_cmd_commit(pre, ++*signal, done, NULL, &err));
         pre = NULL;
@@ -374,6 +381,12 @@ int main(int argc, char **argv) {
         check("direct", ref, NULL, 0, 0, data);
         check("A/A", run_case(a, aa, producer, AA, data, &signal), &ref, enabled, enabled, data);
         check("A/B", run_case(a, b, producer, AB, data, &signal), &ref, enabled, enabled, data);
+        if (data == 0) {
+            check("auto-fragmented-pre", run_case(a, b, producer, AUTO_FRAGMENTED_PRE, data, &signal),
+                  &ref, enabled, enabled, data);
+            check("auto-fragmented-committed", run_case(a, b, producer, AUTO_FRAGMENTED_COMMITTED, data, &signal),
+                  &ref, enabled, enabled, data);
+        }
         if (data != 2) continue;
         check("missing-front", run_case(a, b, producer, MISSING_FRONT, data, &signal), &ref, 0, 0, data);
         check("missing-tail", run_case(a, b, producer, MISSING_TAIL, data, &signal), &ref, 0, 0, data);

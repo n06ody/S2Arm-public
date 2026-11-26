@@ -84,6 +84,7 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
     t->images = calloc((size_t)d->count + 1, sizeof *t->images);
     if (!t->objects || !t->images) { free(t->objects); free(t->images); free(t); return fail(err, NVN_GPU_E_OOM, "pool entries allocation failed"); }
     int error = 0; const char *reason = NULL;
+    uint32_t element = UINT32_MAX;
     pthread_mutex_lock(&g_mu);
     if (g.closing) { error = NVN_GPU_E_STOPPED; reason = "pool session closing"; goto failed; }
     struct nvn_gpu_view_s *dv = NULL; struct nvn_gpu_samp_s *ds = NULL; int cls = -1;
@@ -95,6 +96,7 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
         if (!ds) { error = NVN_GPU_E_ARG; reason = "pool dummy sampler invalid"; goto failed; }
     }
     for (uint32_t i = 0; i <= d->count; i++) {
+        element = i;
         uint32_t state = i == d->count ? NVN_GPU_POOL_EMPTY : d->items[i].state;
         if (state == NVN_GPU_POOL_UNAVAILABLE) { error = NVN_GPU_E_UNSUPPORTED; reason = "pool registered resource unavailable"; goto failed; }
         if (state != NVN_GPU_POOL_EMPTY && state != NVN_GPU_POOL_READY) { error = NVN_GPU_E_ARG; reason = "pool item state invalid"; goto failed; }
@@ -114,7 +116,9 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
         } else {
             struct nvn_gpu_samp_s *s = state == NVN_GPU_POOL_READY ? pool_live_samp(d->items[i].resource.samp) : ds;
             if (!s) { error = NVN_GPU_E_ARG; reason = "pool sampler handle invalid or released"; goto failed; }
-            t->objects[i] = s; ref_bump(s, REF_SAMP); t->images[i].sampler = d->sampler_integer ? s->int_sampler : s->sampler;
+            VkSampler sampler = d->sampler_integer ? s->int_sampler : s->sampler;
+            if (!sampler) { error = NVN_GPU_E_LAYOUT; reason = "pool sampler unavailable"; goto failed; }
+            t->objects[i] = s; ref_bump(s, REF_SAMP); t->images[i].sampler = sampler;
         }
     }
     if (d->kind == NVN_GPU_POOL_IMAGE) pool_build_index(t);
@@ -125,6 +129,8 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
 failed:
     pool_destroy_locked(t);
     pthread_mutex_unlock(&g_mu);
+    if (element != UINT32_MAX)
+        return fail(err, error, "%s: kind=%u element=%u", reason, d->kind, element);
     return fail(err, error, "%s", reason);
 }
 

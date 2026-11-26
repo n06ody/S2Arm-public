@@ -208,5 +208,11 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
     vkCmdSetBlendConstants(c->cb, d->blend_color);
     vkCmdPushConstants(c->cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, d->uv);
     vkCmdDraw(c->cb, 4, 1, 0, 0);
+    if (ROI_ACTIVE(c)) {
+        unsigned draw=++c->roi->draws;
+        roi_message("event=draw_texture frame=%d pass=%u draw=%u image=%llu view=%llu type=%d format=%d mip=%u+%u layer=%u+%u zero=%u",
+                    roi_target,c->roi->pass,draw,(unsigned long long)access_id(&v->tex->access_id),
+                    (unsigned long long)(uintptr_t)ii.imageView,v->type,v->format,v->base_level,v->levels,v->base_layer,v->layers,v->roi_zero);
+    }
     c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;   // 改绑了描述符组：下一笔全部重建（同 clear_rect）
 }
