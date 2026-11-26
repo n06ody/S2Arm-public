@@ -75,6 +75,7 @@ void nvn_plat_log(int l, const char *cat, const char *line) { fprintf(stderr, "[
 int nvn_plat_flag(const char *name, int def) {
     if (!strcmp(name, "nvk_dq")) return dq;
     if (enabled && !strcmp(name, "nvk_cold_guard")) return 1;
+    if (!strcmp(name, "nvk_gpu_pass_time")) return 1;
     return def;
 }
 static void done(void *user, const nvn_gpu_done *d) { REQUIRE(d->status == NVN_GPU_DONE_OK); }

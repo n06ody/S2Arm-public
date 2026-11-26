@@ -333,7 +333,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
         if (inside) { a = skip_to; continue; }
         const uint64_t begin = a;
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
-        else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
+        else nvn_gpu_buf_write_mirror(xc, m->buf, a, s->mem + a, stop - a);
         mirror_touch(m, a, stop);
         a = stop;
         if (direct && nvn_vk_cold_mirror_host_write) nvn_vk_cold_mirror_host_write(m->buf, begin, stop - begin);

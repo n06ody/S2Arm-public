@@ -98,7 +98,7 @@ static void wsi_consume_acquired(struct nvn_gpu_surface_s *s) {
         VkSubmitInfo si; memset(&si, 0, sizeof si);
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[i]; si.pWaitDstStageMask = &st;
         pthread_mutex_lock(&g_submit_mu);
-        VkResult r = vkQueueSubmit(g.queue, 1, &si, f);
+        VkResult r = gpu_pt_submit(NULL, &si, f);
         pthread_mutex_unlock(&g_submit_mu);
         if (r == VK_SUCCESS) s2a_vk_wait_fences(g.d, 1, &f, 2000000000ull);
         vkDestroyFence(g.d, f, NULL);
@@ -383,7 +383,7 @@ static int wsi_compose_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
     { static int bars = -1; if (bars < 0) bars = nvn_plat_flag("nvk_bars", 0);   // 调试：黑边改成品红，截图上一眼分清「没呈现」和「呈现了一张黑图」
       if (bars) { black.float32[0] = 1.0f; black.float32[2] = 1.0f; } }
     VkImageSubresourceRange whole = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);   // 目标矩形外是黑的
+    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearColorImage(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole));   // 目标矩形外是黑的
     wsi_swap_barrier(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);   // 清与贴是对同一张图的两次写：之间要有屏障
     // 源：crop（宽高为 0 = 整个视图的首级）；目标：dst（宽高为 0 = 整张交换链图）。裁到各自范围内。
@@ -400,7 +400,7 @@ static int wsi_compose_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
         bl.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.dstOffsets[0] = (VkOffset3D){dx, dy, 0}; bl.dstOffsets[1] = (VkOffset3D){dx + dw, dy + dh, 1};
         VkFilter filt = d->filter && (fp->optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        vkCmdBlitImage(c->cb, st->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, filt);
+        GPU_PT_RECORD(c, GPU_PT_BLIT, vkCmdBlitImage(c->cb, st->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, filt));
     }
     if (encode) {
         wsi_swap_barrier(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -408,7 +408,7 @@ static int wsi_compose_blit(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
         VkImageCopy copy = {0};
         copy.srcSubresource = copy.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.extent = (VkExtent3D){s->extent.width, s->extent.height, 1};
-        vkCmdCopyImage(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        GPU_PT_RECORD(c, GPU_PT_COPY, vkCmdCopyImage(c->cb, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy));
     }
     wsi_swap_barrier(c->cb, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -429,7 +429,7 @@ static int wsi_compose_easu(struct nvn_gpu_cmd_s *c, struct nvn_gpu_surface_s *s
     VkClearColorValue black; memset(&black, 0, sizeof black); black.float32[3] = 1.0f;
     if (nvn_plat_flag("nvk_bars", 0)) { black.float32[0] = 1.0f; black.float32[2] = 1.0f; }
     VkImageSubresourceRange whole = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(c->cb, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole);
+    GPU_PT_RECORD(c, GPU_PT_CLEAR, vkCmdClearColorImage(c->cb, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &whole));
     wsi_swap_barrier(c->cb, s->images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -619,6 +619,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     struct vk_segment *seg = calloc(1, sizeof *seg);
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fi; memset(&fi, 0, sizeof fi); fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (ok && seg) gpu_pt_last(c);
     VkResult r = !ok ? VK_ERROR_UNKNOWN : !seg ? VK_ERROR_OUT_OF_HOST_MEMORY : vkEndCommandBuffer(c->cb);
     if (r == VK_SUCCESS) r = vkCreateFence(g.d, &fi, NULL, &fence);
     pthread_mutex_lock(&g_submit_mu);
@@ -631,7 +632,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = submit_cbs(c, cbs); si.pCommandBuffers = cbs;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s->acquire[sem]; si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s->rendered[idx];
-        r = si.commandBufferCount ? vkQueueSubmit(g.queue, 1, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
+        r = si.commandBufferCount ? gpu_pt_submit(seg, &si, fence) : VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (r != VK_SUCCESS) {
         pthread_mutex_unlock(&g_submit_mu);
@@ -645,7 +646,7 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     s->acquire_pending[sem] = 0;   // 这把信号量已交给呈现段去等
     seg->cmd = c; seg->cb = c->cb; seg->fence = fence; seg->submitted = 1; seg->executed = 1; seg->internal = 1;
     seg->wsi_seq = s->acquire_waiter[sem] = ++g.wsi_seq;   // 持 g_submit_mu：序号与入队同序
-    enqueue_segment(&g, seg);
+    if (!g.gpu_pt) enqueue_segment(&g, seg);
     VkPresentInfoKHR pi; memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s->rendered[idx];
     pi.swapchainCount = 1; pi.pSwapchains = &s->swapchain; pi.pImageIndices = &idx;
@@ -654,6 +655,12 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     VkPresentTimesInfoGOOGLE pts = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, pi.pNext, 1, &pt };
     if (timing_id) pi.pNext = &pts;
     r = vkQueuePresentKHR(g.queue, &pi);
+    const int presented_ok = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+    if (g.gpu_pt) {
+        // Publish the outcome before the worker may close a timing window.
+        seg->gpu_pt_presented = presented_ok;
+        enqueue_segment(&g, seg);
+    }
     pthread_mutex_unlock(&g_submit_mu);
     s->presents++;
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {

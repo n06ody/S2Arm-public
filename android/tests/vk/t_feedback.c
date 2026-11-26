@@ -14,6 +14,7 @@ extern uint64_t nvn_gpu_vk_test_prs(int which);          // 回收：0 现存组
 static nvn_gpu_err err;
 static int dq_mode,opt_mode,copy_mode=1,pool_fb_mode=1;   // pool_fb_mode：nvk_pool_fb（1 = 整池数组也为写着的附件拷快照，旧行为；0 = 缺省，不拷）
 static unsigned failures,begins,ncases;
+static int pass_time_case;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"fixture failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 #include "feedback_observer.h"
@@ -22,7 +23,7 @@ const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
+int nvn_plat_flag(const char *n,int d){if(!strcmp(n,"nvk_gpu_pass_time")&&pass_time_case)return 1;if(pass_time_case&&(!strcmp(n,"nvk_gpu_pass_width")||!strcmp(n,"nvk_gpu_pass_height")))return 4;if(!strcmp(n,"nvk_dq"))return dq_mode;if(!strcmp(n,"nvk_opt_layout"))return opt_mode;if(!strcmp(n,"nvk_fb_copy"))return copy_mode;if(!strcmp(n,"nvk_pool_fb"))return pool_fb_mode;return d;}
 static unsigned skip_logs;   // 「整池数组免拷快照」逐条日志的条数（限流：每个（管线、图）首次一行；不含「已记满」那一句）
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");if(s&&strstr(s,"整池数组免拷快照（"))__atomic_fetch_add(&skip_logs,1u,__ATOMIC_RELAXED);}
 static void done(void *u,const nvn_gpu_done *d){(void)u;REQUIRE(d->status==NVN_GPU_DONE_OK);}
@@ -31,6 +32,7 @@ static nvn_gpu_shader shader(const char *dir,const char *name,nvn_gpu_stage stag
     FILE *f=fopen(path,"rb");REQUIRE(f);REQUIRE(!fseek(f,0,SEEK_END));long n=ftell(f);REQUIRE(n>0);rewind(f);
     void *data=malloc((size_t)n);REQUIRE(data);REQUIRE(fread(data,1,(size_t)n,f)==(size_t)n);fclose(f);
     nvn_gpu_shader_src s={0};s.stage=stage;s.kind=NVN_GPU_BLOB_SPIRV;s.entry="main";s.blob=data;s.bytes=(size_t)n;s.layout=layout;
+    if (pass_time_case) s.key[0] = (uint8_t)(0x50 + stage);
     nvn_gpu_shader h=NULL;GPU(nvn_gpu_shader_load(&s,&h,&err));free(data);return h;
 }
 static void begin_pass(nvn_gpu_cmd c,nvn_gpu_view view,int load,unsigned size) {
@@ -241,8 +243,15 @@ int main(int argc,char **argv) {
     copy_mode=atoi(argv[4]);REQUIRE(copy_mode==0||copy_mode==1);
     pool_fb_mode=atoi(argv[5]);REQUIRE(pool_fb_mode==0||pool_fb_mode==1);
     observed_on_begin=on_begin;
+    pass_time_case = getenv("S2A_TEST_FEEDBACK_PASS_TIME") != NULL;
     struct s2a_vk_device device;char why[256];
     if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
+    if (pass_time_case) {
+        run_case(&device, argv[1], 3);
+        REQUIRE(!s2a_vk_device_destroy(&device, 1));
+        printf("feedback cases=%u failures=%u\n", ncases, failures);
+        return failures ? 1 : 0;
+    }
     // 守卫探针先跑（只录制不提交）：免拷的前提（GENERAL 档、没开旧行为开关）被撤掉时，在后面真执行的案例把驱动跑崩之前就按读数变红。
     run_case(&device,argv[1],18);
     if(failures&&copy_mode){printf("feedback cases=%u failures=%u\n",ncases,failures);return 1;}   // 快照整条路径关掉的负控（copy_mode=0）要继续跑到真执行的案例，不在这里收

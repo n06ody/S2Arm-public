@@ -194,6 +194,12 @@ void nvn_gpu_buf_use(nvn_gpu_cmd c, nvn_gpu_buf b);
 // 同步原语：在本 cmd 的 GPU 顺序里把 src 的 bytes 字节写进 dst+off（之前的命令读旧值，之后的读新值）；src 调用返回后即可释放。
 // 线程：[提交]，通道外。出错：粘滞 NVN_GPU_E_ARG / NVN_GPU_E_ORDER。
 void nvn_gpu_buf_write(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes);
+// 与 buf_write 同一契约；Vulkan 时间账单独归类镜像脏页上传。
+#if defined(S2A_ANDROID_VK_BACKEND_NVN_VK) && S2A_ANDROID_VK_BACKEND_NVN_VK
+void nvn_gpu_buf_write_mirror(nvn_gpu_cmd c, nvn_gpu_buf dst, uint64_t off, const void *src, uint64_t bytes);
+#else
+#define nvn_gpu_buf_write_mirror nvn_gpu_buf_write
+#endif
 // 本 cmd 的临时上传区（参数块、内嵌常量、宽屏改写副本、support 缓冲大块）：内容有效到该 cmd 完成。线程：[提交]。出错：NVN_GPU_E_OOM，*out 清零。
 nvn_gpu_rc nvn_gpu_arena_alloc(nvn_gpu_cmd c, uint64_t bytes, uint32_t align, nvn_gpu_slice *out, nvn_gpu_err *err);
 // 把 src 的 bytes 字节填进本 cmd 的临时上传片 sl（sl->cpu 起，bytes ≤ 申请时的长度）。后端可以把这次拷贝交给别的线程做（Vulkan：两级回放的录制线程，
