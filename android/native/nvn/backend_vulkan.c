@@ -149,6 +149,12 @@ struct nvn_gpu_tex_s {
     struct nvn_gpu_tex_s *all_next;
 };
 
+struct layered_attachment {
+    VkImageView view;
+    struct nvn_gpu_tex_s *texture;
+    uint32_t layers, refs;    // 一份来自当前缓存，每个录制使用另持一份
+};
+
 struct nvn_gpu_view_s {
     VkImageView view;
     struct nvn_gpu_tex_s *tex;
@@ -169,7 +175,7 @@ struct nvn_gpu_view_s {
     VkComponentMapping components; // 反馈快照保持采样视图的通道映射
     uint32_t att_layer;          // 当附件时取的层 / 3D 深度切片（视图没设层范围 = 0）
     VkImageView att;             // 附件形态（一级一层的 2D 视图），第一次当附件时建（view_attachment）
-    VkImageView att_n; uint32_t att_nl;   // 分层通道的附件形态（起始层起 att_nl 层的 2D 阵列视图，一级），第一次当分层附件时建
+    struct layered_attachment *att_n;   // 当前分层形态；换层数后旧形态由引用它的段持有
     VkImageView img;             // 图像形态（恒等通道映射），第一次当存储图像时建：存储图像视图必须恒等映射（view_image_form）
     VkImageView depth_blit[2];   // 辅助深度模板拷贝的恒等单级单层采样视图，随本视图保活与释放
     // 反查表：这个视图当过附件的帧缓冲（帧缓冲缓存槽位 + 代 + 句柄）。视图销毁时只拆这几项，
@@ -268,7 +274,7 @@ static inline uint32_t pool_img_first(const struct nvn_gpu_pool_table_s *t, uint
     return UINT32_MAX;
 }
 struct vk_ref { void *obj; int type; };
-enum { REF_BUF = 1, REF_TEX, REF_VIEW, REF_SAMP, REF_POOL };
+enum { REF_BUF = 1, REF_TEX, REF_VIEW, REF_SAMP, REF_POOL, REF_LAYERED_VIEW };
 
 struct vk_staging { struct nvn_gpu_buf_s *buf; };
 
@@ -1304,14 +1310,26 @@ static void view_unlink_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_view_s *v) 
 // 诊断读数（nvk_gputime 开着才计）：销毁视图的次数、整个函数的用时、其中摘链的用时；见 nvn_gpu_present 里的「视图销毁」那一行。
 static uint64_t g_dv_ns[2], g_dv_n;
 
+// 持 g_mu。缓存的 framebuffer 也引用具体的分层句柄；只在最后一份引用退掉后销毁。
+static void layered_attachment_unref_locked(struct nvn_gpu_vk *vk, struct layered_attachment *a,
+                                            int drop_framebuffers) {
+    if (!a || --a->refs) return;
+    if (drop_framebuffers) pc_drop_view(a->view);
+    vkDestroyImageView(vk->d, a->view, NULL);
+    unref_locked(vk, a->texture, REF_TEX);
+    free(a);
+}
+
 static void destroy_view_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_view_s *v) {
     const uint64_t dv0 = g_draw_tm ? now_ns() : 0;
     view_unlink_locked(vk, v);
     const uint64_t dv1 = g_draw_tm ? now_ns() : 0;
     LIFE_T0;
-    pc_drop_view_fast(v, v->att); pc_drop_view_fast(v, v->img); pc_drop_view_fast(v, v->view); LIFE_ADD(6);
+    pc_drop_view_fast(v, v->att); pc_drop_view_fast(v, v->img); pc_drop_view_fast(v, v->view);
+    if (v->att_n) pc_drop_view_fast(v, v->att_n->view);
+    LIFE_ADD(6);
     if (v->att) vkDestroyImageView(vk->d, v->att, NULL);
-    if (v->att_n) vkDestroyImageView(vk->d, v->att_n, NULL);
+    layered_attachment_unref_locked(vk, v->att_n, 0);
     if (v->img) vkDestroyImageView(vk->d, v->img, NULL);
     for (unsigned i = 0; i < 2; i++) if (v->depth_blit[i]) vkDestroyImageView(vk->d, v->depth_blit[i], NULL);
     if (v->view) vkDestroyImageView(vk->d, v->view, NULL);
@@ -1399,7 +1417,8 @@ static int cmd_ref_append(struct nvn_gpu_cmd_s *c, void *obj, int type) {
         struct vk_ref *p = realloc(c->refs, (size_t)cap * sizeof *p);
         if (!p) {   // 记录失败视为 OOM：整段不提交；刚加的引用要当场归还
             pthread_mutex_lock(&g_mu);
-            ref_drop(obj, type);
+            if (type == REF_LAYERED_VIEW) unref_locked(&g, obj, type);
+            else ref_drop(obj, type);
             pthread_mutex_unlock(&g_mu);
             set_sticky(c, NVN_GPU_E_OOM, "引用表分配失败");
             return 0;
@@ -1456,6 +1475,7 @@ static int fbpool_put_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t);   
 static void fbpool_drain_locked(struct nvn_gpu_vk *vk);
 // 调用方持 g_mu。
 static void unref_locked(struct nvn_gpu_vk *vk, void *obj, int type) {
+    if (type == REF_LAYERED_VIEW) { layered_attachment_unref_locked(vk, obj, 1); return; }
     if (!obj) return;
     if (type == REF_BUF) {
         struct nvn_gpu_buf_s *b = obj;
@@ -1908,6 +1928,11 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         if (executed && f->snap) f->snap->fb_ready = 1;
         free(f);
     }
+    for (uint32_t i = 0; i < c->npasses; i++) {
+        if (c->passes[i].fb) vkDestroyFramebuffer(g.d, c->passes[i].fb, NULL);
+        if (c->passes[i].rp) vkDestroyRenderPass(g.d, c->passes[i].rp, NULL);
+    }
+    free(c->passes);
     pthread_mutex_lock(&g_mu);
     for (uint32_t i = 0; i < c->n_newimg; i++) {   // 段没执行：图像还是 UNDEFINED，放回待转表（放不回就留给下面的归还：没人再用它）
         if (!executed && !c->newimg[i]->released) newimg_add_locked(c->newimg[i]);
@@ -1933,13 +1958,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         if (b->memory) vkFreeMemory(g.d, b->memory, NULL);
         free(b);
     }
-    for (uint32_t i = 0; i < c->npasses; i++) {
-        if (c->passes[i].fb) vkDestroyFramebuffer(g.d, c->passes[i].fb, NULL);
-        if (c->passes[i].rp) vkDestroyRenderPass(g.d, c->passes[i].rp, NULL);
-    }
     for (uint32_t i = 0; i < c->pool_ndpools; i++) vkDestroyDescriptorPool(g.d, c->pool_dpools[i], NULL);
     free(c->pool_dpools);
-    free(c->passes);
     free(c->lay);
     free(c->memo);
     for (int i = 0; i < 6; i++) free(c->push_data[i]);
@@ -2790,7 +2810,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     while (vw) {
         struct nvn_gpu_view_s *vn = vw->all_next;
         if (vw->att) vkDestroyImageView(g.d, vw->att, NULL);
-        if (vw->att_n) vkDestroyImageView(g.d, vw->att_n, NULL);
+        if (vw->att_n) { vkDestroyImageView(g.d, vw->att_n->view, NULL); free(vw->att_n); }
         if (vw->view) vkDestroyImageView(g.d, vw->view, NULL);
         free(vw);
         vw = vn;
@@ -5392,15 +5412,21 @@ static const void *view_usage_next(const struct nvn_gpu_tex_s *t, VkFormat vf, V
 // nl = 所在通道的层数（nvn_gpu_pass_desc.layers）。分层通道（nl > 1，程序的顶点 / 几何阶段写层号）要起始层起 nl 层的 2D 阵列视图，
 // 图元按层号落到对应层（3D 贴图：深度切片，要 2D_ARRAY_COMPATIBLE）；单层形态只有第 0 层，写到更高层的图元全丢（八方旅人调色 LUT 32 片只剩第 0 片）。
 // 视图自己的层数不够 nl 时回空（回放核心按附件可给的层数定 nl，正常走不到）。
-static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl, VkResult *result) {
+static VkImageView view_attachment(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t nl, VkResult *result) {
     struct nvn_gpu_tex_s *t = v->tex;
     if (v->p16_remap) return VK_NULL_HANDLE;   // #975：恒等形态会按退回格式的分量顺序写，调用方具名报红
     int image3d = t->target == NVN_TEXTURE_TARGET_3D && t->depth > 1;
     if (nl > 1) {
         if (v->layers < nl || (image3d && !t->array_compatible)) return VK_NULL_HANDLE;
         gmu_lock_rt();
-        if (v->att_n && v->att_nl != nl) { pc_drop_view(v->att_n); vkDestroyImageView(g.d, v->att_n, NULL); v->att_n = VK_NULL_HANDLE; }
-        if (!v->att_n) {
+        struct layered_attachment *form = v->att_n;
+        if (!form || form->layers != nl) {
+            struct layered_attachment *next = calloc(1, sizeof *next);
+            if (!next) {
+                pthread_mutex_unlock(&g_mu);
+                set_sticky(c, NVN_GPU_E_OOM, "分层附件状态分配失败");
+                return VK_NULL_HANDLE;
+            }
             VkImageViewCreateInfo ci;
             memset(&ci, 0, sizeof ci);
             ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -5410,13 +5436,23 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl, VkResu
             ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, nl};
             VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
             OC(OC_VIEW);
-            { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &v->att_n); LIFE_ADD(4); }
-            if (*result != VK_SUCCESS) v->att_n = VK_NULL_HANDLE;
-            v->att_nl = v->att_n ? nl : 0;
+            { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &next->view); LIFE_ADD(4); }
+            if (*result != VK_SUCCESS) {
+                free(next);
+                pthread_mutex_unlock(&g_mu);
+                return VK_NULL_HANDLE;
+            }
+            next->layers = nl;
+            next->refs = 1;
+            next->texture = t;
+            ref_bump(t, REF_TEX);
+            // 同一个逻辑视图的旧层数仍可能在录制或在途；只放缓存自己的引用。
+            layered_attachment_unref_locked(&g, form, 1);
+            v->att_n = form = next;
         }
-        VkImageView r = v->att_n;
+        form->refs++;
         pthread_mutex_unlock(&g_mu);
-        return r;
+        return cmd_ref_append(c, form, REF_LAYERED_VIEW) ? form->view : VK_NULL_HANDLE;
     }
     if (!v->swizzled && v->levels == 1 && v->layers == 1 && v->type == VK_IMAGE_VIEW_TYPE_2D && v->aspect == t->aspect) return v->view;
     gmu_lock_rt();
@@ -5623,7 +5659,7 @@ static int pass_p16_reject(struct nvn_gpu_cmd_s *c, const nvn_gpu_pass_desc *d) 
 static VkImageView pass_attachment_view(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v,
                                         uint32_t layers, int slot) {
     VkResult result = VK_SUCCESS;
-    const VkImageView view = view_attachment(v, layers, &result);
+    const VkImageView view = view_attachment(c, v, layers, &result);
     if (!view) {
         const char *reason = result == VK_SUCCESS ? "incompatible attachment view" : "vkCreateImageView";
         set_sticky(c, pipe_vk_res_code(result, NVN_GPU_E_UNSUPPORTED),

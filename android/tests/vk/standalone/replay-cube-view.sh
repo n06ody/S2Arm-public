@@ -27,6 +27,7 @@ cc -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -We
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
     -Wl,--gc-sections -Wl,--wrap=vkCreateImageView -Wl,--wrap=vkCreateSampler \
     -Wl,--wrap=vkUpdateDescriptorSets -Wl,--wrap=vkCmdDispatch -Wl,--wrap=vkGetDeviceProcAddr \
+    -Wl,--wrap=vkCreateFramebuffer -Wl,--wrap=vkDestroyFramebuffer \
     -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_VALIDATE_SYNC=1

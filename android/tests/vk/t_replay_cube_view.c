@@ -2,7 +2,11 @@
 // 声明与登记目标相同时，用真实回放资源、Vulkan 视图和采样读回检查立方体的范围。
 #define main backend_fixture_main
 #define nvn_plat_flag backend_fixture_plat_flag
+#define vkQueueSubmit backend_fixture_queue_submit
+#define vkDestroyImageView backend_fixture_destroy_image_view
 #include "t_backend_vk.c"
+#undef vkDestroyImageView
+#undef vkQueueSubmit
 #undef nvn_plat_flag
 #undef main
 #include "rp_exec.h"
@@ -28,6 +32,16 @@ nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
 
 static VkImageViewType seen_type;
 static uint32_t seen_base, seen_count;
+static VkImageView seen_view;
+
+static _Atomic(VkImageView) guarded_view;
+static _Atomic(VkFramebuffer) guarded_fb;
+static atomic_uint early_views, early_fbs;
+static atomic_int layer_change_pending, retired_views, retired_fbs;
+static int watch_framebuffer;
+static VkFramebuffer seen_framebuffer;
+static VkSemaphore submit_gate;
+static VkFence gated_fence;
 
 static int fail_next_view, failed_views, fail_next_sampler, failed_samplers;
 static int watch_descriptor_writes, invalid_descriptor_writes, dispatches;
@@ -45,11 +59,59 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImageView(
     }
     const VkResult rc = __real_vkCreateImageView(device, info, allocator, view);
     if (rc == VK_SUCCESS) {
+        seen_view = *view;
         seen_type = info->viewType;
         seen_base = info->subresourceRange.baseArrayLayer;
         seen_count = info->subresourceRange.layerCount;
     }
     return rc;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks *alloc) {
+    if (view && view == atomic_load(&guarded_view)) {
+        if (atomic_load(&layer_change_pending)) { atomic_fetch_add(&early_views, 1); return; }
+        atomic_fetch_add(&retired_views, 1);
+    }
+    backend_fixture_destroy_image_view(device, view, alloc);
+}
+
+extern __typeof__(vkCreateFramebuffer) __real_vkCreateFramebuffer;
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *info,
+                                                          const VkAllocationCallbacks *alloc, VkFramebuffer *fb) {
+    const VkResult result = __real_vkCreateFramebuffer(device, info, alloc, fb);
+    if (watch_framebuffer && result == VK_SUCCESS && info->layers == 2) seen_framebuffer = *fb;
+    return result;
+}
+
+extern __typeof__(vkDestroyFramebuffer) __real_vkDestroyFramebuffer;
+VKAPI_ATTR void VKAPI_CALL __wrap_vkDestroyFramebuffer(VkDevice device, VkFramebuffer fb, const VkAllocationCallbacks *alloc) {
+    if (fb && fb == atomic_load(&guarded_fb)) {
+        if (atomic_load(&layer_change_pending)) { atomic_fetch_add(&early_fbs, 1); return; }
+        atomic_fetch_add(&retired_fbs, 1);
+    }
+    __real_vkDestroyFramebuffer(device, fb, alloc);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *info, VkFence fence) {
+    if (!submit_gate) return backend_fixture_queue_submit(queue, count, info, fence);
+    const VkSemaphore gate = submit_gate;
+    submit_gate = VK_NULL_HANDLE;
+    if (count != 1 || info->pNext || info->waitSemaphoreCount || info->signalSemaphoreCount) {
+        CHECK(0, "layer test needs one plain Vulkan submit");
+        return backend_fixture_queue_submit(queue, count, info, fence);
+    }
+    const uint64_t one = 1;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkTimelineSemaphoreSubmitInfo timeline = {
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &one,
+    };
+    VkSubmitInfo delayed = *info;
+    delayed.pNext = &timeline;
+    delayed.waitSemaphoreCount = 1;
+    delayed.pWaitSemaphores = &gate;
+    delayed.pWaitDstStageMask = &stage;
+    gated_fence = fence;
+    return backend_fixture_queue_submit(queue, 1, &delayed, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateSampler(
@@ -120,12 +182,101 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vkGetDeviceProcAddr(VkDevice dev
     return __real_vkGetDeviceProcAddr(device, name);
 }
 
+static uint64_t fixture_signal;
 static void finish(nvn_gpu_cmd cmd) {
-    static uint64_t signal;
+    const uint64_t signal = ++fixture_signal;
     nvn_gpu_err err = {0};
-    ++signal;
     CHECK(OK(nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err)), "submit: %s", err.why);
     CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
+}
+
+static void layered_clear(nvn_gpu_cmd cmd, nvn_gpu_view view, uint32_t layers, unsigned channel) {
+    nvn_gpu_pass_desc pass = {.ncolor = 1, .w = 1, .h = 1, .layers = layers};
+    pass.color[0].view = view;
+    pass.color[0].load = NVN_GPU_LOAD_CLEAR;
+    pass.color[0].store = NVN_GPU_STORE_STORE;
+    pass.color[0].clear.f[channel] = pass.color[0].clear.f[3] = 1.f;
+    nvn_gpu_pass_begin(cmd, &pass);
+    nvn_gpu_pass_end(cmd);
+}
+
+static void check_layered_attachment_retirement(int inflight) {
+    nvn_gpu_tex tex = make_tex_target(1, 1, 4, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_view view = make_view(tex);
+    nvn_gpu_cmd first = begin_cmd(), second = begin_cmd();
+    nvn_gpu_buf read = make_buf(6 * 4, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_err err = {0};
+    const uint64_t first_signal = fixture_signal + 1;
+    fixture_signal += 2;
+    const uint8_t green[4] = {0, 255, 0, 255};
+    CHECK(OK(nvn_gpu_tex_upload(first, tex, 0, 3, NULL, green, 4, 4)), "initialize untouched fourth layer");
+    seen_framebuffer = VK_NULL_HANDLE;
+    watch_framebuffer = 1;
+    layered_clear(first, view, 2, 0);
+    watch_framebuffer = 0;
+    VkImageView original = seen_view;
+    VkFramebuffer framebuffer = seen_framebuffer;
+    CHECK(original && framebuffer && seen_count == 2, "original two-layer view and framebuffer were created");
+    for (uint32_t layer = 0; layer < 2; layer++) nvn_gpu_copy_tex_buf(first, tex, 0, layer, NULL, read, layer * 4, 4, 4);
+
+    VkSemaphore gate = VK_NULL_HANDLE;
+    if (inflight) {
+        CHECK(g_dev.timeline_semaphore_enabled, "live submission test needs timeline semaphores");
+        const VkSemaphoreTypeCreateInfo type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        const VkSemaphoreCreateInfo create = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+        CHECK(vkCreateSemaphore(g_dev.device, &create, NULL, &gate) == VK_SUCCESS, "create live submission gate");
+        submit_gate = gate;
+        gated_fence = VK_NULL_HANDLE;
+        CHECK(OK(nvn_gpu_cmd_commit(first, first_signal, on_done, NULL, &err)), "submit gated pass: %s", err.why);
+        CHECK(gated_fence && vkGetFenceStatus(g_dev.device, gated_fence) == VK_NOT_READY, "first pass is pending on the real GPU queue");
+    }
+
+    atomic_store(&early_views, 0);
+    atomic_store(&early_fbs, 0);
+    atomic_store(&retired_views, 0);
+    atomic_store(&retired_fbs, 0);
+    atomic_store(&layer_change_pending, 1);
+    atomic_store(&guarded_view, original);
+    atomic_store(&guarded_fb, framebuffer);
+    layered_clear(second, view, 3, 2);
+    atomic_store(&layer_change_pending, 0);
+    for (uint32_t layer = 0; layer < 4; layer++)
+        nvn_gpu_copy_tex_buf(second, tex, 0, layer, NULL, read, (layer + 2) * 4, 4, 4);
+    const unsigned view_attempts = atomic_load(&early_views), fb_attempts = atomic_load(&early_fbs);
+    CHECK(!view_attempts && !fb_attempts, "%s layer change tried to destroy live view=%u framebuffer=%u",
+          inflight ? "in-flight" : "recorded", view_attempts, fb_attempts);
+
+    if (inflight && gate) {
+        PFN_vkSignalSemaphoreKHR signal = (PFN_vkSignalSemaphoreKHR)vkGetDeviceProcAddr(g_dev.device, "vkSignalSemaphoreKHR");
+        const VkSemaphoreSignalInfo info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = gate, .value = 1};
+        CHECK(signal && signal(g_dev.device, &info) == VK_SUCCESS, "unblock live submission");
+    } else if (!inflight) {
+        CHECK(OK(nvn_gpu_cmd_commit(first, first_signal, on_done, NULL, &err)), "submit recorded pre-change pass: %s", err.why);
+    }
+    CHECK(OK(nvn_gpu_cmd_commit(second, first_signal + 1, on_done, NULL, &err)), "submit post-change pass: %s", err.why);
+    CHECK(OK(nvn_gpu_fence_wait(first_signal + 1, 5000000000ull, &err)), "retire both layered passes: %s", err.why);
+    const uint8_t expected[24] = {
+        255, 0, 0, 255, 255, 0, 0, 255,
+        0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+        0, 255, 0, 255,
+    };
+    const void *actual = buf_cpu(read);
+    CHECK(actual && !memcmp(actual, expected, sizeof expected), "both layer extents and untouched layer read back independently");
+    if (!view_attempts && !fb_attempts) {
+        CHECK(wait_until(&retired_views, 1, 5000) && atomic_load(&retired_views) == 1 && atomic_load(&retired_fbs) == 1,
+              "old layered view and cached framebuffer each retired once before releasing the logical view");
+    }
+    atomic_store(&guarded_view, VK_NULL_HANDLE);
+    atomic_store(&guarded_fb, VK_NULL_HANDLE);
+    // On a failing baseline the spies withheld the invalid destroys. Free the
+    // resulting test-owned handles only after the real queue has retired them.
+    if (fb_attempts) __real_vkDestroyFramebuffer(g_dev.device, framebuffer, NULL);
+    if (view_attempts) backend_fixture_destroy_image_view(g_dev.device, original, NULL);
+    if (gate) vkDestroySemaphore(g_dev.device, gate, NULL);
+    nvn_gpu_buf_release(read, NULL, NULL);
+    nvn_gpu_view_release(view);
+    nvn_gpu_tex_release(tex);
+    printf("layer lifetime %s early_views=%u early_framebuffers=%u\n", inflight ? "in-flight" : "recorded", view_attempts, fb_attempts);
 }
 
 static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t pixels[64 * 64 * 4]) {
@@ -440,6 +591,8 @@ int main(int argc, char **argv) {
     check_sample(argv[1], "five-layer 2D array control", 7, NVN_TEXTURE_TARGET_2D_ARRAY, "arr.frag",
                  VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 5, 1);
     check_empty_and_unavailable(argv[1], &cube);
+    check_layered_attachment_retirement(0);
+    check_layered_attachment_retirement(1);
     check_attachment_view_failure();
     check_storage_view_failure(argv[1]);
     exercise_audit_budget();
