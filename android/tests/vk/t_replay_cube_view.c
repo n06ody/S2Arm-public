@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // 声明与登记目标相同时，用真实回放资源、Vulkan 视图和采样读回检查立方体的范围。
 #define main backend_fixture_main
+#define nvn_plat_flag backend_fixture_plat_flag
 #include "t_backend_vk.c"
+#undef nvn_plat_flag
 #undef main
 #include "rp_exec.h"
 #include "rp_res.h"
 #include "nvn_tex.h"
+#include "nvn_render_audit.h"
+
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_render_audit") && getenv("S2A_TEST_RENDER_AUDIT")) return 1;
+    return backend_fixture_plat_flag(name, dflt);
+}
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
@@ -21,12 +29,20 @@ nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
 static VkImageViewType seen_type;
 static uint32_t seen_base, seen_count;
 
+static int fail_next_view, failed_views, fail_next_sampler, failed_samplers;
+static int watch_descriptor_writes, invalid_descriptor_writes, dispatches;
+
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateImageView(
     VkDevice device, const VkImageViewCreateInfo *info,
     const VkAllocationCallbacks *allocator, VkImageView *view);
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImageView(
     VkDevice device, const VkImageViewCreateInfo *info,
     const VkAllocationCallbacks *allocator, VkImageView *view) {
+    if (fail_next_view) {
+        fail_next_view = 0;
+        failed_views++;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     const VkResult rc = __real_vkCreateImageView(device, info, allocator, view);
     if (rc == VK_SUCCESS) {
         seen_type = info->viewType;
@@ -34,6 +50,74 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImageView(
         seen_count = info->subresourceRange.layerCount;
     }
     return rc;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateSampler(
+    VkDevice device, const VkSamplerCreateInfo *info,
+    const VkAllocationCallbacks *allocator, VkSampler *sampler);
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateSampler(
+    VkDevice device, const VkSamplerCreateInfo *info,
+    const VkAllocationCallbacks *allocator, VkSampler *sampler) {
+    if (fail_next_sampler) {
+        fail_next_sampler = 0;
+        failed_samplers++;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return __real_vkCreateSampler(device, info, allocator, sampler);
+}
+
+VKAPI_ATTR void VKAPI_CALL __real_vkUpdateDescriptorSets(
+    VkDevice device, uint32_t writes, const VkWriteDescriptorSet *write,
+    uint32_t copies, const VkCopyDescriptorSet *copy);
+VKAPI_ATTR void VKAPI_CALL __wrap_vkUpdateDescriptorSets(
+    VkDevice device, uint32_t writes, const VkWriteDescriptorSet *write,
+    uint32_t copies, const VkCopyDescriptorSet *copy) {
+    if (watch_descriptor_writes) {
+        const int before = invalid_descriptor_writes;
+        for (uint32_t i = 0; i < writes; i++) {
+            for (uint32_t j = 0; j < write[i].descriptorCount; j++) {
+                switch (write[i].descriptorType) {
+                case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                    if (!write[i].pImageInfo[j].sampler) invalid_descriptor_writes++;
+                    /* fall through */
+                case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                    if (!write[i].pImageInfo[j].imageView) invalid_descriptor_writes++;
+                    break;
+                case VK_DESCRIPTOR_TYPE_SAMPLER:
+                    if (!write[i].pImageInfo[j].sampler) invalid_descriptor_writes++;
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    if (!write[i].pBufferInfo[j].buffer) invalid_descriptor_writes++;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        // Baseline probes the call boundary and stops before delivering an invalid write to Vulkan.
+        if (invalid_descriptor_writes != before) return;
+    }
+    __real_vkUpdateDescriptorSets(device, writes, write, copies, copy);
+}
+
+VKAPI_ATTR void VKAPI_CALL __real_vkCmdDispatch(
+    VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z);
+VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdDispatch(
+    VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z) {
+    if (watch_descriptor_writes) {
+        dispatches++;
+        if (invalid_descriptor_writes) return;
+    }
+    __real_vkCmdDispatch(cmd, x, y, z);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __real_vkGetDeviceProcAddr(VkDevice device, const char *name);
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL __wrap_vkGetDeviceProcAddr(VkDevice device, const char *name) {
+    if (!strcmp(name, "vkCmdDispatch")) return (PFN_vkVoidFunction)__wrap_vkCmdDispatch;
+    return __real_vkGetDeviceProcAddr(device, name);
 }
 
 static void finish(nvn_gpu_cmd cmd) {
@@ -156,6 +240,154 @@ static void check_sample(const char *dir, const char *label, int id, int want, c
     printf("%s pixels=%u/%d\n", label, matched, n);
 }
 
+static void check_attachment_view_failure(void) {
+    nvn_gpu_tex tex = make_tex(1, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    const view_t swizzle = {.set_swizzle = 1, .swz = {4, 3, 2, 5}};
+    nvn_gpu_view view = NULL;
+    nvn_gpu_err err = {0};
+    const nvn_gpu_rc result = nvn_gpu_view_create(tex, &swizzle, &view, &err);
+    CHECK(OK(result), "color view for attachment replacement: %s", err.why);
+    if (OK(result)) {
+        nvn_gpu_cmd cmd = begin_cmd();
+        nvn_gpu_pass_desc pass = {.ncolor = 1, .w = 1, .h = 1, .layers = 1};
+        pass.color[0].view = view;
+        pass.color[0].load = NVN_GPU_LOAD_CLEAR;
+        pass.color[0].store = NVN_GPU_STORE_STORE;
+        const int before = failed_views;
+        fail_next_view = 1;
+        nvn_gpu_pass_begin(cmd, &pass);
+        fail_next_view = 0;
+        CHECK(failed_views == before + 1, "identity color attachment view failure was injected");
+        nvn_gpu_cmd_abort(cmd);
+        nvn_gpu_view_release(view);
+    }
+    nvn_gpu_tex_release(tex);
+}
+
+static void check_storage_view_failure(const char *dir) {
+    const nvn_gpu_layout_ent entry = {
+        .cls = NVN_GPU_RES_IMAGE, .access = NVN_GPU_ACC_W, .count = 1, .stages = 1u << NVN_GPU_SH_CS,
+    };
+    const nvn_gpu_layout layout = {.ent = &entry, .nent = 1};
+    char path[512];
+    snprintf(path, sizeof path, "%s/compute_read_image.comp.spv", dir);
+    size_t bytes = 0;
+    void *blob = read_file(path, &bytes);
+    CHECK(blob != NULL, "storage failure shader loaded from fixture");
+    if (!blob) return;
+    const nvn_gpu_shader_src src = {
+        .stage = NVN_GPU_SH_CS, .kind = NVN_GPU_BLOB_SPIRV, .blob = blob, .bytes = bytes,
+        .entry = "main", .layout = &layout,
+    };
+    nvn_gpu_err err = {0};
+    nvn_gpu_shader shader = NULL;
+    const nvn_gpu_rc loaded = nvn_gpu_shader_load(&src, &shader, &err);
+    CHECK(OK(loaded), "storage failure shader: %s", err.why);
+    free(blob);
+    if (!OK(loaded)) return;
+    const nvn_gpu_stage_desc stage = {.sh = shader};
+    nvn_gpu_pipe pipe = NULL;
+    const nvn_gpu_rc built = nvn_gpu_cpipe_get(&stage, NVN_GPU_PIPE_SYNC, &pipe, &err);
+    CHECK(OK(built), "storage failure pipeline: %s", err.why);
+    if (OK(built)) {
+        nvn_gpu_tex tex = make_tex(1, 1, NVN_FORMAT_RGBA8, NVN_GPU_TEX_STORAGE);
+        nvn_gpu_view plain = make_view(tex);
+        nvn_gpu_cmd good = begin_cmd();
+        nvn_gpu_set_pipe(good, pipe);
+        const nvn_gpu_binding valid = {.cls = NVN_GPU_RES_IMAGE, .u.view = plain};
+        nvn_gpu_bind(good, NVN_GPU_SH_CS, &valid, 1);
+        watch_descriptor_writes = 1;
+        nvn_gpu_dispatch(good, pipe, 1, 1, 1, NULL, 0);
+        watch_descriptor_writes = 0;
+        CHECK(dispatches == 1 && invalid_descriptor_writes == 0, "valid storage dispatch passed the call spies");
+        finish(good);
+        nvn_gpu_view_release(plain);
+
+        const view_t swizzle = {.set_swizzle = 1, .swz = {4, 3, 2, 5}};
+        nvn_gpu_view view = NULL;
+        const nvn_gpu_rc viewed = nvn_gpu_view_create(tex, &swizzle, &view, &err);
+        CHECK(OK(viewed), "sampled view for identity replacement: %s", err.why);
+        if (OK(viewed)) {
+            nvn_gpu_cmd cmd = begin_cmd();
+            nvn_gpu_set_pipe(cmd, pipe);
+            const nvn_gpu_binding binding = {.cls = NVN_GPU_RES_IMAGE, .u.view = view};
+            nvn_gpu_bind(cmd, NVN_GPU_SH_CS, &binding, 1);
+            const int before = failed_views;
+            const int dispatches_before = dispatches, done_before = atomic_load(&g_ndone);
+            fail_next_view = watch_descriptor_writes = 1;
+            nvn_gpu_dispatch(cmd, pipe, 1, 1, 1, NULL, 0);
+            watch_descriptor_writes = fail_next_view = 0;
+            CHECK(failed_views == before + 1, "identity storage view failure was injected");
+            CHECK(invalid_descriptor_writes == 0, "failed identity storage view reached vkUpdateDescriptorSets");
+            CHECK(dispatches == dispatches_before, "failed identity storage view reached vkCmdDispatch");
+            const uint64_t signal = 1024;
+            const nvn_gpu_rc committed = nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err);
+            CHECK(committed.code == NVN_GPU_E_OOM && strstr(err.why, "resource=storage_image") &&
+                  strstr(err.why, "set=0 binding=0 element=0") && strstr(err.why, "VkResult=-1"),
+                  "failed identity storage view preserved VkResult and binding: %d %s", committed.code, err.why);
+            const struct done_rec *done = wait_signal(signal, done_before, 5000);
+            CHECK(done && done->status == NVN_GPU_DONE_FAILED && done->code == NVN_GPU_E_OOM,
+                  "failed identity storage view retired as a failed segment");
+            printf("storage view fault: null writes=%d fault dispatches=%d result=%d %s\n",
+                   invalid_descriptor_writes, dispatches - dispatches_before, committed.code, err.why);
+            nvn_gpu_view_release(view);
+        }
+        nvn_gpu_tex_release(tex);
+    }
+    nvn_gpu_shader_release(shader);
+}
+
+static void exercise_audit_budget(void) {
+    NVN_RA_IF(
+        struct nvn_render_audit_binding site = {.stage = NVN_GPU_SH_CS, .set = 1};
+        nvn_render_audit_event(NVN_RA_DESCRIPTOR, "fixture_repeat", &site, NULL);
+        nvn_render_audit_event(NVN_RA_DESCRIPTOR, "fixture_repeat", &site, NULL);
+        site.binding = 1;
+        nvn_render_audit_event(NVN_RA_DESCRIPTOR, "fixture_repeat", &site, NULL);
+        for (int i = 0; i < 80; i++) {
+            site.binding = i;
+            nvn_render_audit_event(NVN_RA_DESCRIPTOR, "fixture_unique", &site, NULL);
+        }
+        for (int i = 0; i < 300; i++) nvn_render_audit_present();
+    );
+}
+
+static void check_empty_and_unavailable(const char *dir, const tex_t *cube) {
+    nvn_be_set_tex_pool_n(16);
+    active = begin_cmd();
+    nvn_gpu_view empty = rp_view_by_id_decl(10, NVN_TEXTURE_TARGET_CUBEMAP + 1, 0, 1, active, NULL);
+    CHECK(empty != NULL, "unregistered array slot has a valid typed zero view");
+    if (empty) {
+        uint8_t pixels[64 * 64 * 4];
+        sample(dir, "cube.frag", empty, pixels);
+        static const uint8_t zero[4];
+        CHECK(memcmp(pixels + (16 * 64 + 10) * 4, zero, sizeof zero) == 0, "legitimate empty slot reads zero");
+    } else { nvn_gpu_cmd_abort(active); active = NULL; }
+
+    nvn_be_reg_tex(9, cube, NULL);
+    active = begin_cmd();
+    const int before = failed_views;
+    fail_next_view = 1;
+    nvn_gpu_view failed = rp_view_by_id_decl(9, NVN_TEXTURE_TARGET_CUBEMAP + 1, 0, 1, active, NULL);
+    fail_next_view = 0;
+    CHECK(failed_views == before + 1, "registered view creation failure was injected");
+    CHECK(failed == NULL, "registered array texture failure was replaced with a zero texture");
+    nvn_gpu_cmd_abort(active);
+    active = NULL;
+
+    const samp_par params = {0};
+    nvn_be_reg_samp(8, &params);
+    CHECK(rp_sampler_for_query() != NULL, "pool dummy sampler initialized");
+    const char *why = NULL;
+    nvn_gpu_pool_table table = rp_pool_table(NULL, 1, 9, 1, 0, 0, &why);
+    CHECK(table != NULL, "empty sampler pool slot uses the valid dummy: %s", why ? why : "");
+    fail_next_sampler = 1;
+    table = rp_pool_table(NULL, 1, 8, 1, 0, 0, &why);
+    fail_next_sampler = 0;
+    CHECK(failed_samplers == 1, "registered sampler creation failure was injected");
+    CHECK(table == NULL, "registered pool sampler failure was replaced with an empty sampler");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     char why[256] = {0};
@@ -207,6 +439,10 @@ int main(int argc, char **argv) {
                  VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 0, 6, 0);
     check_sample(argv[1], "five-layer 2D array control", 7, NVN_TEXTURE_TARGET_2D_ARRAY, "arr.frag",
                  VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 5, 1);
+    check_empty_and_unavailable(argv[1], &cube);
+    check_attachment_view_failure();
+    check_storage_view_failure(argv[1]);
+    exercise_audit_budget();
     rp_res_reset();
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);

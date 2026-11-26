@@ -38,6 +38,7 @@
 #include "backend_vulkan_deswizzle_spv.h"
 #include "backend_vulkan_bc1_astc_spv.h"
 #include "nvn_unimpl.h"
+#include "nvn_render_audit.h"
 #include "nvn_vk_report_ts.h"
 #include "nvn_vk_land_auto.h"
 #include <unistd.h>
@@ -706,6 +707,7 @@ static void set_sticky(struct nvn_gpu_cmd_s *c, int code, const char *fmt, ...) 
     va_start(ap, fmt);
     vsnprintf(c->why, sizeof c->why, fmt, ap);
     va_end(ap);
+    NVN_RA_IF(nvn_render_audit_event(NVN_RA_STICKY, fmt, NULL, c->why));
 }
 
 static uint64_t add_sat(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
@@ -1764,6 +1766,7 @@ static uint32_t occl_read(VkQueryPool pool, uint32_t first, uint32_t n, uint64_t
 }
 
 static void segment_done(struct vk_segment *s, int status, int code, const char *why) {
+    NVN_RA_IF(if (status == NVN_GPU_DONE_FAILED) nvn_render_audit_segment(code, s->signal, why));
     if (!s->done) return;
     nvn_gpu_done d;
     memset(&d, 0, sizeof d);
@@ -2561,6 +2564,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     for (int i = 0; i < 6; i++) __atomic_store_n(&g_stg_wr[i], 0, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_seg_mu);
     plc_open(d->cache_dir);   // 缓存是加速不是前提：里面任何一步失败都落到「不带缓存」，不让 open 失败
+    NVN_RA_BEGIN(nvn_plat_flag("nvk_render_audit", 0));
     g_open = 1;
     return rc(NVN_GPU_OK);
 }
@@ -2791,6 +2795,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     free(g.submitted);
     g.submitted = NULL;
     g.nsub = g.capsub = 0;
+    NVN_RA_IF(nvn_render_audit_end());
     g.closed = 1;
     g.close_active = 0;
     g_open = 0;
@@ -5365,7 +5370,7 @@ static const void *view_usage_next(const struct nvn_gpu_tex_s *t, VkFormat vf, V
 // nl = 所在通道的层数（nvn_gpu_pass_desc.layers）。分层通道（nl > 1，程序的顶点 / 几何阶段写层号）要起始层起 nl 层的 2D 阵列视图，
 // 图元按层号落到对应层（3D 贴图：深度切片，要 2D_ARRAY_COMPATIBLE）；单层形态只有第 0 层，写到更高层的图元全丢（八方旅人调色 LUT 32 片只剩第 0 片）。
 // 视图自己的层数不够 nl 时回空（回放核心按附件可给的层数定 nl，正常走不到）。
-static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl) {
+static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl, VkResult *result) {
     struct nvn_gpu_tex_s *t = v->tex;
     if (v->p16_remap) return VK_NULL_HANDLE;   // #975：恒等形态会按退回格式的分量顺序写，调用方具名报红
     int image3d = t->target == NVN_TEXTURE_TARGET_3D && t->depth > 1;
@@ -5383,7 +5388,8 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl) {
             ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, nl};
             VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
             OC(OC_VIEW);
-            { LIFE_T0; if (vkCreateImageView(g.d, &ci, NULL, &v->att_n) != VK_SUCCESS) v->att_n = VK_NULL_HANDLE; LIFE_ADD(4); }
+            { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &v->att_n); LIFE_ADD(4); }
+            if (*result != VK_SUCCESS) v->att_n = VK_NULL_HANDLE;
             v->att_nl = v->att_n ? nl : 0;
         }
         VkImageView r = v->att_n;
@@ -5402,7 +5408,8 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl) {
         ci.subresourceRange = (VkImageSubresourceRange){t->aspect, v->base_level, 1, image3d ? v->att_layer : v->base_layer, 1};
         VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
         OC(OC_VIEW);
-        { LIFE_T0; if (vkCreateImageView(g.d, &ci, NULL, &v->att) != VK_SUCCESS) v->att = VK_NULL_HANDLE; LIFE_ADD(4); }
+        { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &v->att); LIFE_ADD(4); }
+        if (*result != VK_SUCCESS) v->att = VK_NULL_HANDLE;
     }
     VkImageView r = v->att;
     pthread_mutex_unlock(&g_mu);
@@ -5411,7 +5418,7 @@ static VkImageView view_attachment(struct nvn_gpu_view_s *v, uint32_t nl) {
 
 // 图像形态的视图：存储图像视图必须用恒等通道映射（Vulkan 规定 image 视图不参与通道映射），而采样视图可能带着
 // 通道映射（游戏设的，或没有 alpha 的格式把 a 钉成 ONE）。第一次当存储图像时另建一个，随视图销毁。
-static VkImageView view_image_form(struct nvn_gpu_view_s *v) {
+static VkImageView view_image_form(struct nvn_gpu_view_s *v, VkResult *result) {
     if (v->p16_remap) return VK_NULL_HANDLE;   // #975：同 view_attachment
     if (!v->swizzled) return v->view;
     pthread_mutex_lock(&g_mu);
@@ -5425,7 +5432,8 @@ static VkImageView view_image_form(struct nvn_gpu_view_s *v) {
         ci.subresourceRange = (VkImageSubresourceRange){v->aspect, v->base_level, v->levels, v->base_layer, v->layers};
         VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(v->tex, ci.format, &vu);
         OC(OC_VIEW);
-        { LIFE_T0; if (vkCreateImageView(g.d, &ci, NULL, &v->img) != VK_SUCCESS) v->img = VK_NULL_HANDLE; LIFE_ADD(4); }
+        { LIFE_T0; *result = vkCreateImageView(g.d, &ci, NULL, &v->img); LIFE_ADD(4); }
+        if (*result != VK_SUCCESS) v->img = VK_NULL_HANDLE;
     }
     VkImageView r = v->img;
     pthread_mutex_unlock(&g_mu);
@@ -5590,7 +5598,28 @@ static int pass_p16_reject(struct nvn_gpu_cmd_s *c, const nvn_gpu_pass_desc *d) 
 }
 // 渲染通道的附件描述：布局按「这张图这一段用什么布局」定（见「图像布局」）。
 // att_tex / att_lay 回填各附件的贴图与这一段用的布局；att_tex 可能重复（同一张图的不同级 / 层挂在不同槽）。
-static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9], VkAttachmentDescription att[9],
+static VkImageView pass_attachment_view(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v,
+                                        uint32_t layers, int slot) {
+    VkResult result = VK_SUCCESS;
+    const VkImageView view = view_attachment(v, layers, &result);
+    if (!view) {
+        const char *reason = result == VK_SUCCESS ? "incompatible attachment view" : "vkCreateImageView";
+        set_sticky(c, pipe_vk_res_code(result, NVN_GPU_E_UNSUPPORTED),
+                   "%s: usage=attachment slot=%d format=%d aspect=%#x mip=%u layer=%u layers=%u VkResult=%d",
+                   reason, slot, (int)v->format, v->aspect, v->base_level, v->base_layer, layers, (int)result);
+        NVN_RA_IF(
+            const struct nvn_render_audit_binding site = {
+                .stage = -1, .set = -1, .binding = slot, .element = -1,
+                .format = v->nvn_format, .target = (uint32_t)v->type,
+                .aspect = v->aspect, .level = v->base_level, .layer = v->base_layer,
+            };
+            nvn_render_audit_event(NVN_RA_ATTACHMENT, reason, &site, c->why);
+        );
+    }
+    return view;
+}
+
+static VkRenderPass make_pass(struct nvn_gpu_cmd_s *c, const nvn_gpu_pass_desc *d, VkImageView fb_views[9], VkAttachmentDescription att[9],
                               VkAttachmentReference col[8], VkAttachmentReference *dref, uint32_t *natt_out, int *has_depth,
                               struct nvn_gpu_tex_s *att_tex[9], VkImageLayout att_lay[9], int opt, int feedback, uint16_t read_mask,
                               VkExtent2D *granularity) {
@@ -5637,7 +5666,7 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
         att[a].finalLayout = att_lay[a];
         col[ncol].attachment = a;
         col[ncol].layout = att_lay[a];
-        fb_views[a] = view_attachment(v, d->layers);
+        fb_views[a] = pass_attachment_view(c, v, d->layers, (int)i);
         if (!fb_views[a]) return VK_NULL_HANDLE;
         ncol++; a++;
     }
@@ -5664,7 +5693,7 @@ static VkRenderPass make_pass(const nvn_gpu_pass_desc *d, VkImageView fb_views[9
         att[a].finalLayout = att_lay[a];
         dref->attachment = a;
         dref->layout = att_lay[a];
-        fb_views[a] = view_attachment(v, d->layers);
+        fb_views[a] = pass_attachment_view(c, v, d->layers, 8);
         if (!fb_views[a]) return VK_NULL_HANDLE;
         *has_depth = 1;
         a++;
@@ -5821,7 +5850,7 @@ static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uin
     int has_depth = 0;
     g_pc_use = pc_on();
     if (pass_p16_reject(c, &d)) return 0;
-    VkRenderPass pass = make_pass(&d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on, c->feedback_read_mask, NULL);
+    VkRenderPass pass = make_pass(c, &d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on, c->feedback_read_mask, NULL);
     if (!pass) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "通道重开：渲染通道创建失败"); return 0; }
     for (uint32_t i = 0; i < natt; i++) {   // 新布局（fb_sample 置位的附件变成 GENERAL），要在开新通道之前转完
         image_barrier(c, att_tex[i], att_lay[i]);
@@ -5930,7 +5959,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     g_pc_use = pc_on();
     if (pass_p16_reject(c, d)) return;
     VkExtent2D granularity = {0};
-    VkRenderPass pass = make_pass(d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on,
+    VkRenderPass pass = make_pass(c, d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on,
                                   c->feedback_read_mask, d->area_w && d->area_h ? &granularity : NULL);
     PBP_STEP(0);
     if (!pass) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "渲染通道创建失败（附件格式 / 采样数）"); return; }
@@ -6386,10 +6415,12 @@ static VkImageLayout bind_image_layout(struct nvn_gpu_cmd_s *c, struct nvn_gpu_v
 }
 // 仅在分离绑定时按需建立平均采样器，组合绑定仍使用原归约采样器。
 // s 已被命令引用保活；g_mu 同时保护创建、边框配额和销毁。
-static VkSampler samp_separate_average(struct nvn_gpu_samp_s *s) {
+static VkSampler samp_separate_average(struct nvn_gpu_samp_s *s, VkResult *result) {
     pthread_mutex_lock(&g_mu);
     if (!s->average_sampler && (!s->average_custom || g.border_live < g.dev->custom_border_max)) {
-        if (vkCreateSampler(g.d, &s->average_info, NULL, &s->average_sampler) == VK_SUCCESS && s->average_custom) {
+        *result = vkCreateSampler(g.d, &s->average_info, NULL, &s->average_sampler);
+        if (*result != VK_SUCCESS) s->average_sampler = VK_NULL_HANDLE;
+        else if (s->average_custom) {
             g.border_live++;
             s->border_slots++;
         }
@@ -6400,7 +6431,9 @@ static VkSampler samp_separate_average(struct nvn_gpu_samp_s *s) {
 }
 
 // 把某阶段本笔绑定写进 wr/ii/bi；返回写入条数，出错置粘滞返回 -1。
-// 缺成员的新类别（IMAGE / TBUF / IMAGE_TBUF）报 E_LAYOUT；老类别保持 NULL 句柄空资源写法不变。
+// 未绑定的客体空槽应由回放层提供有效代用品。Vulkan 不接受空实际资源句柄。
+// f9cddc462 的宿主故障注入：恒等 storage view 建立失败时，逻辑句柄还在，空 VkImageView 仍会进入更新。
+// 在组写入前核实际句柄；丢弃这一笔并把底层错误交给命令段回执。
 // 只写 dirty 里的组（没变的组沿用上一笔的描述符集对象，不重写）。纹素缓冲的格式核对取决于管线，
 // 组没变、管线换了也要核，所以这两类不在脏组里也走一遍核对，只是不写。
 // sig[组]：把这一笔写进该组的每一条（binding 与数组项号）的散列加进去，求和与顺序无关；取组时按它挑回收表的表项（见 dset_take）。
@@ -6410,6 +6443,28 @@ static inline uint64_t dset_sig_mix(uint32_t binding, uint32_t elem) {
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
     return x ^ (x >> 31);
 }
+static int descriptor_missing(struct nvn_gpu_cmd_s *c, int stage, const nvn_gpu_layout_ent *e,
+                              uint32_t element, const struct nvn_gpu_view_s *view,
+                              const char *resource, VkResult result) {
+    set_sticky(c, pipe_vk_res_code(result, NVN_GPU_E_LAYOUT),
+               "descriptor_unavailable: resource=%s stage=%d set=%u binding=%u element=%u class=%u format=%d view_type=%d VkResult=%d",
+               resource, stage, e->set, e->binding, element, e->cls,
+               view ? (int)view->format : 0, view ? (int)view->type : 0, (int)result);
+    NVN_RA_IF(
+        struct nvn_render_audit_binding site = {
+            .stage = stage, .set = e->set, .binding = e->binding, .element = (int)element,
+            .format = view ? view->nvn_format : 0, .target = view ? (uint32_t)view->type : 0,
+            .aspect = view ? view->aspect : 0, .level = view ? view->base_level : 0,
+            .layer = view ? view->base_layer : 0,
+        };
+        const nvn_gpu_shader sh = !c->pipe ? NULL :
+            stage == NVN_GPU_SH_CS ? c->pipe->cshader : c->pipe->key.st[stage].sh;
+        if (sh) for (unsigned i = 0; i < sizeof sh->src_key; i++) site.program = (site.program << 8) | sh->src_key[i];
+        nvn_render_audit_event(NVN_RA_DESCRIPTOR, resource, &site, c->why);
+    );
+    return -1;
+}
+
 static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int st, uint32_t dirty,
                        const VkDescriptorSet *sets, VkWriteDescriptorSet *wr,
                        VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi, uint64_t *sig) {
@@ -6441,6 +6496,7 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
         case NVN_GPU_RES_TEX:
             memset(im, 0, sizeof *im);
             im->imageView = feedback_view(c, b->u.view);
+            if (!im->imageView) return descriptor_missing(c, st, e, b->elem, b->u.view, "sampled_image", VK_SUCCESS);
             im->imageLayout = bind_image_layout(c, b->u.view);
             w->pImageInfo = im;
             break;
@@ -6448,17 +6504,17 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
             memset(im, 0, sizeof *im);
             im->sampler = b->u.samp ? b->u.samp->sampler : VK_NULL_HANDLE;
             if (b->u.samp && b->u.samp->reduction) {
-                im->sampler = samp_separate_average(b->u.samp);
-                if (!im->sampler) {
-                    set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sampler_reduction_average_separate_create：无法建立平均采样器");
-                    return -1;
-                }
+                VkResult result = VK_SUCCESS;
+                im->sampler = samp_separate_average(b->u.samp, &result);
+                if (!im->sampler) return descriptor_missing(c, st, e, b->elem, NULL, "sampler_reduction_average_separate_create", result);
                 nvn_unimpl("gpu", "sampler_reduce_average_separate_unknown_format", NULL);
             }
+            if (!im->sampler) return descriptor_missing(c, st, e, b->elem, NULL, "sampler", VK_SUCCESS);
             w->pImageInfo = im;
             break;
         case NVN_GPU_RES_TEX_SAMP:
-            if (!b->u.ts.view || !b->u.ts.samp) { set_sticky(c, NVN_GPU_E_LAYOUT, "TEX_SAMP 绑定缺 view 或 samp"); return -1; }
+            if (!b->u.ts.view || !b->u.ts.samp)
+                return descriptor_missing(c, st, e, b->elem, b->u.ts.view, "combined_image_sampler", VK_SUCCESS);
             memset(im, 0, sizeof *im);
             im->imageView = feedback_view(c, b->u.ts.view);
             { nvn_fmt_info vfi; int vint = nvn_fmt_info_of(b->u.ts.view->nvn_format, &vfi) && (vfi.kind == NVN_FMT_UINT || vfi.kind == NVN_FMT_SINT);
@@ -6471,21 +6527,29 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
                       return -1;
                   }
               } }
+            if (!im->imageView || !im->sampler)
+                return descriptor_missing(c, st, e, b->elem, b->u.ts.view, "combined_image_sampler", VK_SUCCESS);
             im->imageLayout = bind_image_layout(c, b->u.ts.view);
             w->pImageInfo = im;
             break;
-        case NVN_GPU_RES_IMAGE:
-            if (!b->u.view) { set_sticky(c, NVN_GPU_E_LAYOUT, "IMAGE 绑定缺 view"); return -1; }
+        case NVN_GPU_RES_IMAGE: {
+            if (!b->u.view) return descriptor_missing(c, st, e, b->elem, NULL, "storage_image", VK_SUCCESS);
             if (b->u.view->p16_remap) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "IMAGE 绑定：16 位打包格式 0x%x 在本设备走退回格式，不能当存储图像", b->u.view->nvn_format); return -1; }
             memset(im, 0, sizeof *im);
-            im->imageView = view_image_form(b->u.view);   // 带通道映射的视图不能当存储图像用：另建恒等形态
+            VkResult result = VK_SUCCESS;
+            im->imageView = view_image_form(b->u.view, &result);
+            if (!im->imageView) return descriptor_missing(c, st, e, b->elem, b->u.view, "storage_image", result);
             im->imageLayout = VK_IMAGE_LAYOUT_GENERAL;   // 存储图像一律 GENERAL（Vulkan 要求），迁移见 prepare_bind_layouts
             w->pImageInfo = im;
             break;
+        }
         case NVN_GPU_RES_UBO:
         case NVN_GPU_RES_SSBO:
             memset(bf, 0, sizeof *bf);
             bf->buffer = b->u.b.buf ? b->u.b.buf->buffer : VK_NULL_HANDLE;
+            if (!bf->buffer)
+                return descriptor_missing(c, st, e, b->elem, NULL,
+                                          e->cls == NVN_GPU_RES_UBO ? "uniform_buffer" : "storage_buffer", VK_SUCCESS);
             bf->offset = dynb ? (b->u.b.off & ~g_dyn_lo_mask) : b->u.b.off;
             bf->range = b->u.b.len;
             if (e->cls == NVN_GPU_RES_UBO && b->u.b.len > g.caps.max_ubo_range) {   // UBO 没有 WHOLE_SIZE 例外：超过范围上限只能准确拒绝
@@ -7624,9 +7688,23 @@ nvn_gpu_rc nvn_gpu_view_create(nvn_gpu_tex th, const view_t *v, nvn_gpu_view *ou
     }
     VkImageViewUsageCreateInfo vu; ci.pNext = view_usage_next(t, ci.format, &vu);
     OC(OC_VIEW);
-    if (vkCreateImageView(g.d, &ci, NULL, &o->view) != VK_SUCCESS) {
+    const VkResult result = vkCreateImageView(g.d, &ci, NULL, &o->view);
+    if (result != VK_SUCCESS) {
         free(o);
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateImageView 拒绝（格式 / 范围）");
+        nvn_gpu_rc failure = fail(err, pipe_vk_res_code(result, NVN_GPU_E_UNSUPPORTED),
+                    "vkCreateImageView: usage=view format=%d type=%d aspect=%#x mip=%u+%u layer=%u+%u VkResult=%d",
+                    (int)fmt, (int)type, ci.subresourceRange.aspectMask, base_level, levels, base_layer, layers, (int)result);
+        NVN_RA_IF(
+            const struct nvn_render_audit_binding site = {
+                .stage = -1, .set = -1, .binding = -1, .element = -1,
+                .format = (uint32_t)fmt, .target = (uint32_t)type,
+                .aspect = ci.subresourceRange.aspectMask, .level = base_level, .layer = base_layer,
+            };
+            char detail[40];
+            if (!err) snprintf(detail, sizeof detail, "usage=view VkResult=%d", (int)result);
+            nvn_render_audit_event(NVN_RA_VIEW, "vkCreateImageView", &site, err ? err->why : detail);
+        );
+        return failure;
     }
     o->tex = t;
     o->components = ci.components;
@@ -7888,10 +7966,12 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
             s->average_info.pNext = &s->average_border;
         }
     }
-    if (vkCreateSampler(g.d, &ci, NULL, &s->sampler) != VK_SUCCESS) {
+    VkResult result = vkCreateSampler(g.d, &ci, NULL, &s->sampler);
+    if (result != VK_SUCCESS) {
         samp_border_unreserve(s);
         free(s);
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateSampler 拒绝（可能缺少 samplerAnisotropy）");
+        return fail(err, pipe_vk_res_code(result, NVN_GPU_E_UNSUPPORTED),
+                    "vkCreateSampler: usage=sampler VkResult=%d", (int)result);
     }
     {   // 整数格式视图用的那一个：过滤全改最近点、关各向异性、边界色换整数的同名值
         VkSamplerCreateInfo ii = ci;
@@ -7903,9 +7983,11 @@ nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err
             cbi.pNext = ii.pNext == &cb ? cb.pNext : ii.pNext;   // 换掉浮点那份，链上其余结构不动
             ii.pNext = &cbi;
         }
-        if (vkCreateSampler(g.d, &ii, NULL, &s->int_sampler) != VK_SUCCESS) {
+        result = vkCreateSampler(g.d, &ii, NULL, &s->int_sampler);
+        if (result != VK_SUCCESS) {
             vkDestroySampler(g.d, s->sampler, NULL); samp_border_unreserve(s); free(s);
-            return fail(err, NVN_GPU_E_UNSUPPORTED, "vkCreateSampler 拒绝（整数格式用的最近点采样器）");
+            return fail(err, pipe_vk_res_code(result, NVN_GPU_E_UNSUPPORTED),
+                        "vkCreateSampler: usage=integer_sampler VkResult=%d", (int)result);
         }
     }
     pthread_mutex_lock(&g_mu);

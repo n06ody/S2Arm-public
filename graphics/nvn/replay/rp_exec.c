@@ -5,6 +5,7 @@
 #include "rp_state.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
+#include "nvn_render_audit.h"
 #include "nvn_plat.h"
 #include "nvn_backend.h"
 #include "nvn_mtl.h"   // 上沿声明（nvn_be_* 与 NVN_EV_WAIT；文件名是历史名，内容与 Metal 无关）
@@ -840,6 +841,7 @@ static uint64_t exec_list(const uint8_t *p) {
         if ((h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_JUMP) || g_rc_skip) count_flush(&count_group, tm);
         uint64_t t_cmd = tm ? now_ns() : 0;
         const void *a = p + 8;
+        NVN_RA_IF(nvn_render_audit_context(g_sub_serial, h.op));
         switch (h.op) {
             case OP_END: goto out;   // 唯一出口：帧级账在那边按「是否最外层」累加一次
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
