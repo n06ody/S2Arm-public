@@ -13,6 +13,12 @@ mkdir -p "$out/shaders"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
 glslc=${GLSLC:-glslc}
 "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/feedback_image.frag" -o "$out/shaders/feedback_image.frag.spv"
+for case in read snapshot; do
+    args=()
+    if [ "$case" = snapshot ]; then args=(-DWRITE_STORAGE=1); fi
+    "$glslc" --target-env=vulkan1.1 "${args[@]}" "$repo/android/tests/vk/shaders/feedback_image_mixed.frag" \
+        -o "$out/shaders/feedback_image_$case.frag.spv"
+done
 "$glslc" --target-env=vulkan1.1 "$repo/android/native/nvn/blit_shaders/fullscreen.vert" -o "$out/shaders/fullscreen.vert.spv"
 inc=()
 for d in android/tests/vkhost build/c883-ndk graphics/nvn graphics/nvn/replay graphics/nvn/gfx/nvn graphics/nvn/gfx/nvn/include android/native android/native/nvn android/native/direct runtime/include; do inc+=(-I "$repo/$d"); done
@@ -46,6 +52,18 @@ for dq in 0 1; do
            ! grep -q "feedback-image dq=$dq opt=$opt skips=2 commit-bad=0 wait-bad=0 fence-failed-bad=0 done-bad=0 count-bad=0 pixel-bad=0 guard-bad=0" "$out/dq$dq-opt$opt.log"; then
             echo "【红】feedback-image DQ=$dq OPT=$opt rc=$rc 或校验报错 / 读数不符" >&2; failed=1
         fi
+        for case in storage-only storage-read storage-snapshot; do
+            log="$out/$case-dq$dq-opt$opt.log"
+            set +e
+            timeout 120 "$out/test" "$out/shaders" "$dq" "$opt" "$case" 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+               ! grep -q "feedback-image $case cases=1 failures=0" "$log"; then
+                echo "【红】feedback-image $case DQ=$dq OPT=$opt rc=$rc" >&2
+                failed=1
+            fi
+        done
     done
 done
 # 改坏项：同一份夹具，只改后端这一处（复制一份 backend_vulkan.c / backend_vulkan_feedback.inc 到 ${mut}，include 先找本目录）。

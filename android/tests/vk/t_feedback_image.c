@@ -66,7 +66,13 @@ static unsigned px_bad(const unsigned char *img, unsigned x, unsigned y, unsigne
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
+    if (argc != 4 && argc != 5) return 2;
+    const char *mode = argc == 5 ? argv[4] : "";
+    const int legal = !strcmp(mode, "storage-only");
+    const int storage_read = !strcmp(mode, "storage-read");
+    const int storage_snapshot = !strcmp(mode, "storage-snapshot");
+    const int mixed = storage_read || storage_snapshot;
+    if (argc == 5 && !legal && !mixed) return 2;
     setvbuf(stdout, NULL, _IOLBF, 0);
     dq_mode = atoi(argv[2]); opt_mode = atoi(argv[3]);
     REQUIRE((dq_mode == 0 || dq_mode == 1) && (opt_mode == 0 || opt_mode == 1));
@@ -79,17 +85,31 @@ int main(int argc, char **argv) {
     GPU(nvn_gpu_open(&od, &err));
     printf("feedback-image begin dq=%d opt=%d\n", dq_mode, opt_mode);
 
-    nvn_gpu_layout_ent ent = {0};
-    ent.cls = NVN_GPU_RES_IMAGE; ent.access = NVN_GPU_ACC_R | NVN_GPU_ACC_W; ent.count = 1; ent.stages = 1u << NVN_GPU_SH_FS;
+    if (storage_read) REQUIRE(device.load_store_op_none_enabled);
+    nvn_gpu_layout_ent ent[2] = {0};
+    ent[0].cls = NVN_GPU_RES_IMAGE; ent[0].access = storage_read ? NVN_GPU_ACC_R : NVN_GPU_ACC_RW;
+    ent[0].count = 1; ent[0].stages = 1u << NVN_GPU_SH_FS;
+    ent[1].cls = NVN_GPU_RES_TEX_SAMP; ent[1].access = NVN_GPU_ACC_R; ent[1].binding = 1;
+    ent[1].count = 1; ent[1].stages = 1u << NVN_GPU_SH_FS;
     nvn_gpu_layout layout = {0};
-    layout.ent = &ent; layout.nent = 1;
+    layout.ent = ent; layout.nent = storage_snapshot ? 2 : 1;
     nvn_gpu_shader vs = shader(argv[1], "fullscreen.vert", NVN_GPU_SH_VS, NULL);
-    nvn_gpu_shader fs = shader(argv[1], "feedback_image.frag", NVN_GPU_SH_FS, &layout);
+    const char *fragment = storage_read ? "feedback_image_read.frag" :
+                           storage_snapshot ? "feedback_image_snapshot.frag" : "feedback_image.frag";
+    nvn_gpu_shader fs = shader(argv[1], fragment, NVN_GPU_SH_FS, &layout);
     nvn_gpu_pipe_desc pd = {0};
-    pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.color.logic_op = 3; pd.prim = 4; pd.samples = 1; pd.chmask.mask = 15;
-    pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs; pd.cfmt[0] = NVN_FORMAT_RGBA8;
+    pd.poly.mode = NVN_POLYGON_MODE_FILL; pd.color.logic_op = NVN_LOGIC_OP_COPY; pd.prim = 4; pd.samples = 1;
+    pd.chmask.mask = mixed ? 0xf0 : 0xf;
+    pd.st[NVN_GPU_SH_VS].sh = vs; pd.st[NVN_GPU_SH_FS].sh = fs;
+    pd.cfmt[0] = NVN_FORMAT_RGBA8;
+    if (mixed) pd.cfmt[1] = NVN_FORMAT_RGBA8;
     nvn_gpu_pipe pipe = NULL;
     GPU(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err));
+    nvn_gpu_pipe storage_only = NULL;
+    if (legal) {
+        pd.chmask.mask = 0;
+        GPU(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &storage_only, &err));
+    }
 
     // A：本通道的颜色附件，同时能当存储图像；B：只当存储图像用的另一张图（通道外先清成同一个初值）
     nvn_gpu_tex img[2] = {0};
@@ -109,19 +129,39 @@ int main(int argc, char **argv) {
     nvn_gpu_cmd cmd = NULL;
     GPU(nvn_gpu_cmd_begin(NULL, &cmd, &err));
     for (unsigned i = 0; i < 2; i++) { begin_pass(cmd, view[i], NVN_GPU_LOAD_CLEAR); nvn_gpu_pass_end(cmd); }
-    begin_pass(cmd, view[0], NVN_GPU_LOAD_LOAD);
-    nvn_gpu_set_pipe(cmd, pipe);
     nvn_gpu_draw_args a = {0};
     a.prim = 4; a.count = 3; a.instances = 1;
-    for (unsigned col = 0; col < 4; col++) {
-        nvn_gpu_dyn dyn = {0};
-        dyn.nvp = 1; dyn.vp[0][2] = dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
-        dyn.has_sc = 1; dyn.sc[0] = (int32_t)col; dyn.sc[2] = 1; dyn.sc[3] = 4;
-        nvn_gpu_set_dyn(cmd, &dyn);
-        nvn_gpu_binding b = {0};
-        b.cls = NVN_GPU_RES_IMAGE; b.u.view = view[col & 1 ? 1 : 0];   // 偶数列：附件 A 自己；奇数列：另一张图 B
-        nvn_gpu_bind(cmd, NVN_GPU_SH_FS, &b, 1);
+    nvn_gpu_samp sampler = NULL;
+    if (mixed) {
+        nvn_gpu_pass_desc pass = {.ncolor = 2, .w = 4, .h = 4, .layers = 1};
+        pass.color[0].view = view[0];
+        pass.color[1].view = view[1];
+        nvn_gpu_pass_begin(cmd, &pass);
+        nvn_gpu_set_pipe(cmd, pipe);
+        nvn_gpu_binding bindings[2] = {0};
+        bindings[0].cls = NVN_GPU_RES_IMAGE; bindings[0].u.view = view[0];
+        if (storage_snapshot) {
+            samp_par sp = {0};
+            GPU(nvn_gpu_samp_create(&sp, &sampler, &err));
+            bindings[1].cls = NVN_GPU_RES_TEX_SAMP; bindings[1].ent = 1;
+            bindings[1].u.ts.view = view[0]; bindings[1].u.ts.samp = sampler;
+        }
+        nvn_gpu_bind(cmd, NVN_GPU_SH_FS, bindings, storage_snapshot ? 2 : 1);
         nvn_gpu_draw(cmd, &a);
+    } else {
+        begin_pass(cmd, view[0], NVN_GPU_LOAD_LOAD);
+        for (unsigned col = 0; col < 4; col++) {
+            nvn_gpu_set_pipe(cmd, legal && !(col & 1) ? storage_only : pipe);
+            nvn_gpu_dyn dyn = {0};
+            dyn.nvp = 1; dyn.vp[0][2] = dyn.vp[0][3] = 4; dyn.vp[0][5] = 1;
+            dyn.has_sc = 1; dyn.sc[0] = (int32_t)col; dyn.sc[2] = 1; dyn.sc[3] = 4;
+            nvn_gpu_set_dyn(cmd, &dyn);
+            nvn_gpu_binding b = {0};
+            b.cls = NVN_GPU_RES_IMAGE; b.u.view = view[col & 1 ? 1 : 0];   // 偶数列：附件 A 自己；奇数列：另一张图 B
+            nvn_gpu_bind(cmd, NVN_GPU_SH_FS, &b, 1);
+            nvn_gpu_draw(cmd, &a);
+            if (legal && !(col & 1)) nvn_gpu_draw(cmd, &a);  // 同一子资源的下一笔读取上一笔实际写入
+        }
     }
     nvn_gpu_pass_end(cmd);
     nvn_gpu_copy_tex_buf(cmd, img[0], 0, 0, NULL, rb, 0, 16, 64);
@@ -135,15 +175,20 @@ int main(int argc, char **argv) {
     const unsigned commit_bad = !nvn_gpu_ok(rc_commit), wait_bad = !nvn_gpu_ok(rc_wait);
     const unsigned fenced_bad = nvn_gpu_fence_failed() != 0, done_bad = done_status != NVN_GPU_DONE_OK;
     const uint64_t skips = nvn_unimpl_count("draw", "graphics_image_feedback_overlap");
-    const unsigned count_bad = skips != 2;
+    const unsigned count_bad = skips != ((legal || mixed) ? 0u : 2u);
 
     const unsigned char *px = nvn_gpu_buf_cpu(rb);
     unsigned pixel_bad = 0;
     for (unsigned y = 0; y < 4; y++)
         for (unsigned x = 0; x < 4; x++) {
-            const int redrawn = x & 1;   // 奇数列是真画了的
-            pixel_bad += redrawn ? px_bad(px, x, y, 0, 255, 0, 255) : px_bad(px, x, y, 64, 0, 0, 255);   // A：画了 = 绿，跳过 = 清屏值
-            pixel_bad += redrawn ? px_bad(px + 64, x, y, 128, 0, 0, 255) : px_bad(px + 64, x, y, 64, 0, 0, 255);   // B：画了 = 红 64→128，没画 = 清屏值
+            if (mixed) {
+                pixel_bad += px_bad(px, x, y, storage_snapshot ? 128 : 64, 0, 0, 255);
+                pixel_bad += px_bad(px + 64, x, y, 64, 255, 0, 255);
+            } else {
+                const int redrawn = x & 1;
+                pixel_bad += redrawn ? px_bad(px, x, y, 0, 255, 0, 255) : px_bad(px, x, y, legal ? 192 : 64, 0, 0, 255);
+                pixel_bad += px_bad(px + 64, x, y, redrawn ? 128 : 64, 0, 0, 255);
+            }
         }
     unsigned guard_bad = 0;
     for (unsigned i = 128; i < sizeof sentinel; i++) if (px[i] != 0xa5) guard_bad++;   // 越界哨兵不动
@@ -151,9 +196,10 @@ int main(int argc, char **argv) {
     printf("feedback-image dq=%d opt=%d skips=%llu commit-bad=%u wait-bad=%u fence-failed-bad=%u done-bad=%u count-bad=%u pixel-bad=%u guard-bad=%u\n",
            dq_mode, opt_mode, (unsigned long long)skips, commit_bad, wait_bad, fenced_bad, done_bad, count_bad, pixel_bad, guard_bad);
     nvn_gpu_buf_release(rb, NULL, NULL);
+    if (sampler) nvn_gpu_samp_release(sampler);
     nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
     GPU(nvn_gpu_close(5000000000ull, &err));
     REQUIRE(!s2a_vk_device_destroy(&device, 1));
-    printf("feedback-image cases=1 failures=%u\n", failures);
+    printf("feedback-image %s%scases=1 failures=%u\n", mode, *mode ? " " : "", failures);
     return failures ? 1 : 0;
 }

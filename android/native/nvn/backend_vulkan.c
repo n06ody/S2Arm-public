@@ -330,6 +330,7 @@ struct nvn_gpu_cmd_s {
     int feedback_read_on;
     int pool_fb_on;              // nvk_pool_fb：1 = 整池数组里和「本笔写着的附件」重叠的视图也拷快照（旧行为，A/B 与回退诊断用）；缺省 0 = 不拷（见 feedback_add）
     uint16_t feedback_read_mask; // 颜色 bit0..7、深度模板物理附件 bit8：本物理通道 LOAD / NONE
+    uint16_t feedback_detached;  // 写 storage 的颜色槽只从物理通道移除，逻辑通道保留
     int recording;
     int in_pass;
     // 上一道全屏障之后录过「缓冲作目标」的传输：传输只在开头带屏障，绘制有渲染通道开头的外部依赖兜着，
@@ -5772,8 +5773,8 @@ static int pass_attached(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t) {
 static void image_barrier(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkImageLayout to);   // 下面「贴图 / 视图 / 采样器」一节
 
 static void pass_read_sync(struct nvn_gpu_cmd_s *c) {
-    if (!c->feedback_read_mask) return;
-    // NONE 没有隐式 store 写，须覆盖图形采样读到后续写的执行依赖。
+    if (!(c->feedback_read_mask | c->feedback_detached)) return;
+    // NONE 与摘槽都没有隐式 store，通道外同步图形读取和实际 storage 写。
     // 放在通道外：不能只改实际 pass 的依赖，否则不再兼容建管线的 pass 模板。
     mem_barrier(c, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -5784,6 +5785,11 @@ static void pass_read_sync(struct nvn_gpu_cmd_s *c) {
 // 把要改的图在通道外迁好，再按 LOAD / STORE 重开同一组附件。只在 nvk_opt_layout=1 时才会走到；
 // 开通道前能迁的都在 pass_begin / pass_flush_pending 里迁完了，这里只兜通道里新出现的绑定。
 struct reopen_fix { struct nvn_gpu_tex_s *t; VkImageLayout want; };
+
+static void pass_detach_colors(nvn_gpu_pass_desc *d, uint16_t detached) {
+    for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
+        if (detached & (1u << i)) d->color[i].view = NULL;
+}
 
 // 进通道之前：本段里还停在「附件布局」、又不是本通道附件的图，一律先转成只读采样布局（在通道外转）。
 // 这样通道里采样任何图都不用再迁布局，也顺带拿到 SHADER_READ_ONLY 的语义；下一段还要当附件时，
@@ -5803,6 +5809,7 @@ static void pass_flush_pending(struct nvn_gpu_cmd_s *c) {
 static int pass_reopen(struct nvn_gpu_cmd_s *c, const struct reopen_fix *fx, uint32_t nfx) {
     if (!c->in_pass || c->q_active >= 0) return 0;   // 查询不能跨通道；声明了 occlusion 的通道从开头就用整区
     nvn_gpu_pass_desc d = c->pass_desc;
+    pass_detach_colors(&d, c->feedback_detached);
     d.area_w = d.area_h = 0;
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) { d.color[i].load = NVN_GPU_LOAD_LOAD; d.color[i].store = NVN_GPU_STORE_STORE; }
     if (d.depth.view) { d.depth.load = NVN_GPU_LOAD_LOAD; d.depth.store = NVN_GPU_STORE_STORE; }
@@ -5929,8 +5936,15 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     int has_depth = 0;
     g_pc_use = pc_on();
     if (pass_p16_reject(c, d)) return;
+    nvn_gpu_pass_desc physical;
+    const nvn_gpu_pass_desc *attachments = d;
+    if (c->feedback_detached) {
+        physical = *d;
+        pass_detach_colors(&physical, c->feedback_detached);
+        attachments = &physical;
+    }
     VkExtent2D granularity = {0};
-    VkRenderPass pass = make_pass(d, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on,
+    VkRenderPass pass = make_pass(attachments, fb_views, att, col, &dref, &natt, &has_depth, att_tex, att_lay, c->opt, c->feedback_on,
                                   c->feedback_read_mask, d->area_w && d->area_h ? &granularity : NULL);
     PBP_STEP(0);
     if (!pass) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "渲染通道创建失败（附件格式 / 采样数）"); return; }
@@ -5963,7 +5977,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     }
     VkRenderPassBeginInfo bi;
     VkClearValue clear[9];
-    pass_begin_info(d, pass, fb, natt, has_depth, &bi, clear, granularity);
+    pass_begin_info(attachments, pass, fb, natt, has_depth, &bi, clear, granularity);
     if (c->tsq && c->ntsp < TS_PASS_MAX) {
         c->tsp[c->ntsp].w = (uint16_t)d->w; c->tsp[c->ntsp].h = (uint16_t)d->h; c->tsp[c->ntsp].draws = 0; c->tsp[c->ntsp].ncol = (uint8_t)(has_depth ? natt - 1 : natt); c->tsp[c->ntsp].ds = (uint8_t)has_depth;
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 2 + 2 * c->ntsp);
@@ -5998,7 +6012,7 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
         struct nvn_gpu_view_s *dsv = d->depth.view ? d->depth.view : d->stencil.view;
         cmd_ref(c, dsv, REF_VIEW);
     }
-    pc_fb_note_desc(d, fbsl, fbgen, fb);
+    pc_fb_note_desc(attachments, fbsl, fbgen, fb);
     // 记在段上的只有「段做完要销毁」的：没进缓存的帧缓冲、缓存关着时的渲染通道对象
     PBP_STEP(4);
     pass_prof(-1, 0);
@@ -6017,6 +6031,7 @@ void nvn_gpu_pass_end(nvn_gpu_cmd ch) {
     c->pass_natt = 0;
     pass_read_sync(c);
     c->feedback_read_mask = 0;
+    c->feedback_detached = 0;
     if (c->tsq && c->ntsp < TS_PASS_MAX) { vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->tsq, 3 + 2 * c->ntsp); c->ntsp++; }
     // 附件在通道里用的布局由 make_pass 定（缺省全程 GENERAL，开 nvk_opt_layout 时用附件专用布局），通道内不迁移：
     // 出通道后本段第一次用到它时按需迁移（采样 / 存储 / 传输 / 再当附件），段末统一转回 GENERAL（lay_rest_at_commit）。
@@ -6807,6 +6822,7 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         sc = (VkRect2D){{c->dyn.sc[0], c->dyn.sc[1]}, {(uint32_t)c->dyn.sc[2], (uint32_t)c->dyn.sc[3]}};
     if (!pass_ensure_area(c, sc)) return;
     if (!prepare_bind_layouts(c, 0)) return;   // 采样 / 存储图的布局先到位（可能拆通道），再写描述符
+    if (c->feedback_detached && !feedback_detached_pipe(c, &p)) return;
     if (!bind_descriptor_groups(c, p, 0)) return;
     const uint64_t dt1 = dtm ? now_ns() : 0;
     // 以下各项只在和上次真正录进去的不同时才录（#708；影子见 nvn_gpu_cmd_s.es）
@@ -8610,7 +8626,7 @@ void nvn_gpu_clear_rect(nvn_gpu_cmd ch, const nvn_gpu_clear *d) {
     }
     uint32_t cm = d->color >= 0 ? d->color_mask & 0xfu : 0xfu, sm = d->stencil ? d->stencil_mask : 0xffu;
     if (!cm || !sm) { set_sticky(c, NVN_GPU_E_ARG, "clear_rect 写掩码为 0（颜色 %#x 模板 %#x）", (unsigned)d->color_mask, (unsigned)d->stencil_mask); return; }
-    if (c->feedback_read_mask && !feedback_restart(c, 0, 0)) return;
+    if ((c->feedback_read_mask | c->feedback_detached) && !feedback_restart(c, 0, 0, 0)) return;
     if (!pass_ensure_area(c, (VkRect2D){{d->x, d->y}, {d->w, d->h}})) return;
     // 一律画一笔整屏三角形（backend_vulkan_clear.inc：不用附件清除命令，理由见那里）。颜色、深度、模板同一笔做
     clr_draw(c, d->color, cm, &d->value, d->depth != 0, d->stencil ? sm : 0, d->stencil_value, d);

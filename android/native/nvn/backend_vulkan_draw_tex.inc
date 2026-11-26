@@ -161,7 +161,7 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
         for (int k = 0; k < 4; k++)
             if (f4[k] >= 0x10 && f4[k] <= 0x13) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "draw_tex 双源混合因子（内置片元只有一个输出）"); return; }
     }
-    if (c->feedback_read_mask && !feedback_restart(c, 0, 0)) return;
+    if ((c->feedback_read_mask | c->feedback_detached) && !feedback_restart(c, 0, 0, 0)) return;
     VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
     if (d->has_sc) sc = (VkRect2D){{d->sc[0], d->sc[1]}, {(uint32_t)d->sc[2], (uint32_t)d->sc[3]}};
     if (!pass_ensure_area(c, sc)) return;

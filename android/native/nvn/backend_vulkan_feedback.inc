@@ -3,19 +3,26 @@
 // 同一次绘制读写附件：GENERAL 不是像素级反馈保证。照 iOS fb_prepare，
 // 在 draw 前把采样范围存成独立图像；同一逻辑通道下一笔重新取快照。
 // 此处在 nvn_gpu_* 契约之下，使用真实 VkImage / 子资源范围与段完成寿命。
-static int feedback_overlap(struct nvn_gpu_view_s *v, struct nvn_gpu_view_s *a) {
-    if (!v || !a || !v->tex || !a->tex || v->tex->image != a->tex->image ||
-        !(v->aspect & a->tex->aspect) || a->base_level < v->base_level ||
-        (uint64_t)a->base_level >= (uint64_t)v->base_level + v->levels) return 0;
-    // view_attachment 挂的是一级一层的 2D 形态；3D 采样形态覆盖该级全部 z。
+static int feedback_same_image(struct nvn_gpu_view_s *v, struct nvn_gpu_view_s *a) {
+    return v && a && v->tex && a->tex && v->tex->image == a->tex->image;
+}
+
+static int feedback_overlap(struct nvn_gpu_view_s *v, struct nvn_gpu_view_s *a, uint32_t layers) {
+    if (!feedback_same_image(v, a) || !(v->aspect & a->tex->aspect) ||
+        a->base_level < v->base_level || (uint64_t)a->base_level >= (uint64_t)v->base_level + v->levels) return 0;
+    // view_attachment 挂一级、framebuffer.layers 层；3D 视图覆盖该级全部 z。
     if (v->type == VK_IMAGE_VIEW_TYPE_3D) return 1;
     uint32_t layer = a->tex->target == NVN_TEXTURE_TARGET_3D && a->tex->depth > 1 ? a->att_layer : a->base_layer;
-    return layer >= v->base_layer && (uint64_t)layer < (uint64_t)v->base_layer + v->layers;
+    return (uint64_t)layer + (layers ? layers : 1) > v->base_layer &&
+           (uint64_t)layer < (uint64_t)v->base_layer + v->layers;
 }
-static int feedback_attached(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v) {
-    const nvn_gpu_pass_desc *d = &c->pass_desc;
-    for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (feedback_overlap(v, d->color[i].view)) return 1;
-    return feedback_overlap(v, d->depth.view) || feedback_overlap(v, d->stencil.view);
+
+static uint16_t feedback_attached(const nvn_gpu_pass_desc *d, struct nvn_gpu_view_s *v) {
+    uint16_t attached = 0;
+    for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
+        if (feedback_overlap(v, d->color[i].view, d->layers)) attached |= 1u << i;
+    if (feedback_overlap(v, d->depth.view, d->layers) || feedback_overlap(v, d->stencil.view, d->layers)) attached |= 1u << 8;
+    return attached;
 }
 // 采用实际建管线的写状态，不把「本笔没有产生像素」猜成只读。
 // 深度模板两面共享一个物理附件；任一面可能写，都不能用 NONE 豁免另一面。
@@ -74,15 +81,18 @@ static void feedback_pool_skip_note(const struct nvn_gpu_cmd_s *c, const struct 
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", "整池数组免拷快照：不同（管线、图）已记满，之后不再逐条记（计数见分时行 pskip）");
 }
 static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set,
-                        uint16_t writes, uint16_t *read_mask, int from_pool, int *skipped) {
-    uint16_t attached = 0;
+                        uint16_t writes, uint16_t detached, uint16_t *read_mask, int from_pool, int *skipped) {
     const nvn_gpu_pass_desc *d = &c->pass_desc;
-    for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
-        if (feedback_overlap(v, d->color[i].view)) attached |= 1u << i;
-    if (feedback_overlap(v, d->depth.view) || feedback_overlap(v, d->stencil.view)) attached |= 1u << 8;
-    if (!attached) return 1;
-    if (from_pool && (attached & writes) && feedback_pool_skip_allowed(c)) { feedback_pool_skip_note(c, v); *skipped = 1; return 1; }
-    if (c->feedback_read_on && !(attached & writes)) {
+    const uint16_t attached = feedback_attached(d, v);
+    // 同笔 storage 写时，采样仍读笔前快照。写的 view 与采样 view 可以覆盖摘槽以外不同的级或层。
+    int storage_snapshot = 0;
+    for (uint16_t mask = detached; mask; mask &= mask - 1)
+        if (feedback_same_image(v, d->color[__builtin_ctz(mask)].view)) { storage_snapshot = 1; break; }
+    if (!attached && !storage_snapshot) return 1;
+    if (!storage_snapshot && from_pool && (attached & writes) && feedback_pool_skip_allowed(c)) {
+        feedback_pool_skip_note(c, v); *skipped = 1; return 1;
+    }
+    if (!storage_snapshot && c->feedback_read_on && !(attached & writes)) {
         *read_mask |= attached;
         return 1;
     }
@@ -232,7 +242,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     if (fresh) nvn_gpu_tex_release(t); // cmd 引用保活到 fence；raw view 在 finish_cmd 中先释放
     return rc_is(c->sticky, NVN_GPU_OK);
 }
-static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int copy) {
+static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, uint16_t detached, int copy) {
     // 同一个 Vulkan 查询不能跨 VkRenderPass，NVN 的遮挡计数可以：活动的查询在旧通道末尾（nvn_gpu_pass_end）结束，新通道里换一个续段槽接着数，
     // 读回时并回原槽（occl_spare_*），样本数连续。不截断查询后假报成功：续段槽要不到（保险丝到顶 / 分配或建池失败）时，
     // 只这一个查询续不下去（occl_spare_reserve 已记下，它的读数按未完成处理），拆通道照做、整段不失败。
@@ -252,40 +262,73 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     if (cont_ok) occl_spare_reset(c, &cont);   // 通道外：新要的续段块整块重置（重置只能在通道外）
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (!feedback_make(c, f)) return 0;
+    if (detached) {
+        full_barrier(c);
+        for (uint16_t mask = detached; mask; mask &= mask - 1) {
+            struct nvn_gpu_tex_s *t = d.color[__builtin_ctz(mask)].view->tex;
+            image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
+            // 同一个 VkImage 仍可能以另一 mip/层挂在物理通道。布局跟踪按整图。
+            if (c->opt) for (uint32_t i = 0; i < d.ncolor && i < 8; i++)
+                if (!(detached & (1u << i)) && d.color[i].view && d.color[i].view->tex == t) t->fb_sample = 1;
+        }
+    }
     c->feedback_read_mask = read_mask;
+    c->feedback_detached = detached;
     nvn_gpu_pass_begin(c, &d);
     if (cont_ok && rc_is(c->sticky, NVN_GPU_OK)) occl_spare_begin(c, occ, &cont);   // 新通道里接着数
     return rc_is(c->sticky, NVN_GPU_OK);
 }
-// 这一笔绑着的存储图像（图形阶段）与本通道的某个附件是同一张图的同一段子资源？只看当前管线布局认得的绑定，口径同 feedback_prepare 的主循环。
-// 一笔绘制表达不了这种读写：存储写进采样快照等于丢掉，直接用原图则存储访问与附件写的先后没有定义。放在主循环之前单独扫一遍：
-// 命中就在动任何快照链表之前整笔跳过，同一段里后面的笔接着用没被动过的状态。
-static int feedback_image_overlap(struct nvn_gpu_cmd_s *c) {
+// 写 storage 时移除没有颜色写入的物理附件。VUID 06537 不允许直接写仍挂着的附件，
+// 即使它的颜色掩码为零。真实附件写、深度模板测试及 resolve 无法靠摘槽保留语义。
+static int feedback_image_conflict(struct nvn_gpu_cmd_s *c, uint16_t writes, uint16_t *read_mask, uint16_t *detached) {
+    const nvn_gpu_pass_desc *d = &c->pass_desc;
     for (int st = 0; st < 5; st++)
         for (uint32_t i = 0; i < c->nbinds[st]; i++) {
             const nvn_gpu_binding *b = &c->binds[st][i].b;
             if (b->cls != NVN_GPU_RES_IMAGE || b->ent >= c->pipe->stage_nent[st]) continue;
-            if (c->pipe->stage_ents[st][b->ent].cls != b->cls) continue;
-            if (feedback_attached(c, b->u.view)) return 1;
+            const nvn_gpu_layout_ent *e = &c->pipe->stage_ents[st][b->ent];
+            if (e->cls != b->cls) continue;
+            uint16_t attached = feedback_attached(d, b->u.view);
+            for (uint32_t j = 0; j < d->ncolor && j < 8; j++) {
+                if (feedback_overlap(b->u.view, d->color[j].resolve, d->layers)) return 1;
+                if ((attached & (1u << j)) && d->color[j].resolve) return 1;
+            }
+            if (feedback_overlap(b->u.view, d->depth.resolve, d->layers) ||
+                feedback_overlap(b->u.view, d->stencil.resolve, d->layers)) return 1;
+            if (!attached) continue;
+            if (!c->feedback_on || (attached & writes) || d->fb_fetch) return 1;
+            if (e->access == NVN_GPU_ACC_R && g.dev->load_store_op_none_enabled) {
+                *read_mask |= attached;
+                continue;
+            }
+            if ((attached & (1u << 8)) || c->pass_samples != 1) return 1;
+            *detached |= attached;
         }
+    *read_mask &= ~*detached;
     return 0;
 }
+
+static int feedback_detached_pipe(struct nvn_gpu_cmd_s *c, nvn_gpu_pipe *pipe) {
+    nvn_gpu_pipe_desc key = (*pipe)->key;
+    for (uint16_t mask = c->feedback_detached; mask; mask &= mask - 1) key.cfmt[__builtin_ctz(mask)] = 0;
+    nvn_gpu_err err = {0};
+    if (nvn_gpu_ok(nvn_gpu_pipe_get(&key, NVN_GPU_PIPE_SYNC, pipe, &err))) return 1;
+    set_sticky(c, err.rc.code, "storage image pass pipeline: %s", err.why);
+    return 0;
+}
+
 static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
     // 退出反馈或进入计算时，恢复原视图描述符。原绑定表永不被快照改写。
     if (c->feedback != c->feedback_stop) c->desc_dirty = 0xfu;
     c->feedback_stop = c->feedback;
-    if (compute || !c->feedback_on || !c->in_pass) return 1;
-    // 图形阶段的存储图像与附件重叠：具名跳过这一笔并计数（同 graphics_image_unresolved 一类），不设粘性错误——粘性错误会让整段提交失败、
-    // 时间线进终态，而这里只是这一笔画不了；同一段里后面的笔照常画。真正支持这种重叠（附件与存储写共用 GENERAL 加同步，
-    // 或反馈环布局）另立卡（#999）。
-    if (feedback_image_overlap(c)) {
+    if (compute || !c->in_pass) return 1;
+    const uint16_t writes = feedback_writes(c);
+    uint16_t read_mask = 0, detached = 0;
+    if (feedback_image_conflict(c, writes, &read_mask, &detached)) {
         nvn_unimpl("draw", "graphics_image_feedback_overlap", NULL);
         return 0;
     }
-    uint16_t writes = feedback_writes(c);
-    // 每笔由实际采样集合重建：不再采样（包括没有描述符组）就退出 NONE。
-    // 不遗留旧槽位的只读状态，避免另一附件别名到同一范围并开始写时漏恢复。
-    uint16_t read_mask = 0;
+    if (!c->feedback_on) return 1;
     int pool_skipped = 0;   // 这一笔里整池数组与写着的附件重叠而免拷的视图有没有（读数）
     for (int st = 0; st < 5; st++) {
         for (uint32_t i = 0; i < c->nbinds[st]; i++) {
@@ -295,7 +338,7 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             if (e->cls != b->cls) continue;
             struct nvn_gpu_view_s *v = b->cls == NVN_GPU_RES_TEX_SAMP ? b->u.ts.view :
                 (b->cls == NVN_GPU_RES_TEX || b->cls == NVN_GPU_RES_IMAGE) ? b->u.view : NULL;
-            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, writes, &read_mask, 0, &pool_skipped)) return 0;
+            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, writes, detached, &read_mask, 0, &pool_skipped)) return 0;
         }
         if (c->pool_active) for (uint32_t i = 0; i < c->pipe->stage_nent[st] && i < 64; i++) {
             nvn_gpu_pool_table t = c->pool_binds[st][i];
@@ -303,7 +346,7 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             const uint32_t set = c->pipe->stage_ents[st][i].set;
             if (!t->ikey) {   // 没有按图索引的表：逐项扫
                 for (uint32_t j = 0; j <= t->count; j++)
-                    if (!feedback_add(c, t->objects[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->objects[j], set, writes, detached, &read_mask, 1, &pool_skipped)) return 0;
                 continue;
             }
             // 有索引：只看和本通道附件同一张图的视图（附件至多 9 个，深度与模板常同图，查过的图不重复查）
@@ -317,15 +360,16 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
                 uint32_t q = 0; while (q < k && !(att[q]->tex && (uint64_t)(uintptr_t)att[q]->tex->image == img)) q++;
                 if (!img || q < k) continue;
                 for (uint32_t j = pool_img_first(t, img); j != UINT32_MAX; j = t->unext[j])
-                    if (!feedback_add(c, t->uviews[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->uviews[j], set, writes, detached, &read_mask, 1, &pool_skipped)) return 0;
             }
         }
     }
     if (pool_skipped && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[3], 1, __ATOMIC_RELAXED);
     if (read_mask && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[0], 1, __ATOMIC_RELAXED);
-    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) {
+    // 连续两笔写同一个 storage 时也切遍，给上一笔的 shader 写加通道外依赖。
+    if (!(detached | c->feedback_detached) && c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) {
         if (pool_skipped) return pass_ensure_area(c, (VkRect2D){{0, 0}, {c->pass_w, c->pass_h}});
         return 1;
     }
-    return feedback_restart(c, read_mask, 1);
+    return feedback_restart(c, read_mask, detached, 1);
 }
