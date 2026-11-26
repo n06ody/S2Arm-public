@@ -317,6 +317,12 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                          (double)pf[RP_PERF_D_PASS] / 1e6 / fs, (double)pf[RP_PERF_D_PIPE] / 1e6 / fs, (double)pf[RP_PERF_D_PGET] / 1e6 / fs,
                          (double)pf[RP_PERF_PB_VIEW] / 1e6 / fs, (double)pf[RP_PERF_PB_BAR] / 1e6 / fs, (double)pf[RP_PERF_PB_BE] / 1e6 / fs, (double)pf[RP_PERF_PB_MARK] / 1e6 / fs);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (pf[RP_PERF_TEX_PAIR_TRY]) {
+                    snprintf(b, sizeof b, "分时（普通采样对，抽样帧）：命中 %llu / 尝试 %llu，总探测 %.3f 毫秒/抽样帧",
+                             (unsigned long long)pf[RP_PERF_TEX_PAIR_HIT], (unsigned long long)pf[RP_PERF_TEX_PAIR_TRY],
+                             (double)pf[RP_PERF_TEX_PAIR_NS] / 1e6 / fs);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                }
                 snprintf(b, sizeof b, "分时（贴图解析，每帧）：等锁 %.2f 毫秒、持锁 %.2f 毫秒、没见过的序号 %.1f 个、新建视图 %.1f 个、内容检查按纪元跳过 %.0f 次；影子附件 %.2f 毫秒；新贴图：后端建 %.2f 毫秒、扫存储 %.2f 毫秒、上传 %.1f 张 %.2f 毫秒、填零 %.1f 张 %.2f 毫秒、改由通道清零 %.1f 张",
                          (double)pf[RP_PERF_RES_LOCK] / 1e6 / fs, (double)pf[RP_PERF_RES_INIT] / 1e6 / fs, (double)pf[RP_PERF_RES_NEW] / f, (double)pf[RP_PERF_RES_VIEWMAKE] / f, (double)pf[RP_PERF_TEX_EPOCH] / f, (double)pf[RP_PERF_PB_SHADOW] / 1e6 / f,
                          (double)pf[RP_PERF_RES_MAKE] / 1e6 / f, (double)pf[RP_PERF_RES_SCAN] / 1e6 / f, (double)pf[RP_PERF_RES_UPN] / f, (double)pf[RP_PERF_RES_UP] / 1e6 / f, (double)pf[RP_PERF_RES_ZERON] / f, (double)pf[RP_PERF_RES_ZERO] / 1e6 / f, (double)pf[RP_PERF_RES_ZDEFER] / f);

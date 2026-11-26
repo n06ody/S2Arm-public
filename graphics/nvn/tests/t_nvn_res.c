@@ -212,6 +212,67 @@ static void t_res_tex_unarmed(void) {
     }
 }
 
+// 登记的二维数组在同一段内借出视图/采样器。核对后端真正收到的子资源、对象和上传字节。
+static void t_sampled_pair_invalidation(void) {
+    res_fresh();
+    g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+    g_tp.mem = g_block_mem; g_tp.size = BLOCK_TEST_PAGES * PG;
+    g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
+    const uint64_t previous_page_gen = g_block_gen[0];
+    g_block_gen[0] = 0;
+    memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+    tex_t t = mk_tex(9672, 0, NVN_FORMAT_RGBA8, 8, 8, 2, 0);
+    t.mem = g_block_mem; t.d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t.d.depth = 2;
+    nvn_tex_layout(&t.d, &t.L);
+    memset(t.mem, 0x31, t.L.size);
+    const uint8_t dtt = NVN_TEXTURE_TARGET_2D_ARRAY + 1;
+    samp_par sp = {.ws = NVN_WRAP_MODE_REPEAT};
+    view_t v = {.set_levels = 1, .nlevels = 1, .set_layers = 1, .nlayers = 1};
+    nvn_be_sub_begin(); rp_view_pin_begin();
+    nvn_be_reg_samp(3, &sp);
+    nvn_gpu_samp sm = rp_samp_by_id(3);
+    nvn_gpu_view view = NULL;
+    for (int n = 0; n < 3; n++) {
+        if (n == 1) v.base_level = 1;
+        if (n == 2) v.min_layer = 1;
+        nvn_be_reg_tex(7, &t, &v);
+        CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+        nvn_gpu_view expected = rp_view_by_id_decl(7, dtt, 0, 0, &g_fake_cmd, NULL);
+        CHECK(rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+        CHECK(view && view == expected && view->v.base_level == v.base_level && view->v.min_layer == v.min_layer);
+    }
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 1, &view, &sm));  // RGBA8 不能拿已验证的浮点声明给整型声明
+    int releases = g_samp_releases;
+    sp.ws = NVN_WRAP_MODE_CLAMP_TO_EDGE; nvn_be_reg_samp(3, &sp);
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm) && g_samp_releases == releases);
+    nvn_gpu_samp newer = rp_samp_for_tex(3, 7);
+    CHECK(rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm) && sm && sm == newer && sm->x == NVN_WRAP_MODE_CLAMP_TO_EDGE);
+
+    fake_log_write(0, 0x52);
+    g_log_unarmed[0] = 1;   // 第一次上传的该页仍可写
+    int uploads = g_nup;
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+    CHECK(rp_view_by_id(7, &g_fake_cmd, NULL) && g_nup > uploads && g_up[uploads].first[0] == 0x52);
+    uploads = g_nup;
+    t.mem[0] = 0x76;       // 页仍可写，这次真实写没有新事件或纪元
+    g_log_unarmed[0] = 0;
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+    CHECK(rp_view_by_id(7, &g_fake_cmd, NULL) && g_nup > uploads && g_up[uploads].first[0] == 0x76);
+    CHECK(rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+
+    int old_storage = view ? view->of->ord : -1;
+    nvn_be_tex_release(&t); nvn_be_alias_drop_pool(&g_tp);   // 登记号不变，存储换底
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+    CHECK(rp_view_by_id(7, &g_fake_cmd, NULL));
+    CHECK(rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm) && view && view->of->ord != old_storage);
+    rp_view_pin_end();
+    CHECK(g_samp_releases == releases + 1);
+    CHECK(!rp_sampled_pair_try(7, 3, dtt, 0, &view, &sm));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    res_fresh(); g_block_mem = NULL; g_log_fake_on = 0;
+    g_block_gen[0] = previous_page_gen;
+}
+
 // ---------- ② B1 整组沿用 + B3 驱动段按内容命中（rp_draw.c）----------
 // 连续四笔同一程序、同一 base_instance：
 //   ① 首次：三个阶段各发一次绑定（完整构造）；
@@ -487,6 +548,12 @@ static void t_res_bc1_rebind(void) {
     CHECK(old && unregistered && (old->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
     const int old_id = old ? old->rid : 0;
     const int unregistered_id = unregistered ? unregistered->rid : 0;
+    samp_par params = {.ws = NVN_WRAP_MODE_REPEAT};
+    nvn_be_reg_samp(2, &params);
+    nvn_gpu_samp sampler = rp_samp_by_id(2);
+    nvn_gpu_view pair = NULL;
+    const uint8_t dtt = NVN_TEXTURE_TARGET_2D + 1;
+    CHECK(rp_sampled_pair_try(3, 2, dtt, 0, &pair, &sampler) && pair == old);
     const uint64_t gen = rp_tex_reg_gen();
     CHECK(g_bc1_snapshots == 1);
 
@@ -494,11 +561,13 @@ static void t_res_bc1_rebind(void) {
     memcpy(t.mem, punch, sizeof punch);
     nvn_be_tex_cpu_written(&t);
     CHECK(rp_tex_cpu_written(t.serial) == 1);
+    CHECK(!rp_sampled_pair_try(3, 2, dtt, 0, &pair, &sampler));
     nvn_gpu_view next = rp_view_by_id(3, &g_fake_cmd, NULL);
     nvn_gpu_view next_unregistered = rp_view_for(&t, NULL, &g_fake_cmd);
     CHECK(next && next->rid != old_id && !(next->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
     CHECK(next_unregistered && next_unregistered->rid != unregistered_id && next && next_unregistered->of == next->of);
     CHECK(g_bc1_snapshots == 2 && rp_tex_reg_gen() == gen + 1);
+    CHECK(rp_sampled_pair_try(3, 2, dtt, 0, &pair, &sampler) && pair == next);
     CHECK(!was_view_released(old_id));
     rp_view_pin_end();
     CHECK(was_view_released(old_id));
@@ -722,6 +791,7 @@ int main(int argc, char **argv) {
     t_res_bc_byte_equal(1);
     t_res_tex_epoch_unrelated();
     t_res_tex_unarmed();
+    t_sampled_pair_invalidation();
     t_res_bind_fast();
     t_res_pipe_layout();
     t_res_tex_before_pool();

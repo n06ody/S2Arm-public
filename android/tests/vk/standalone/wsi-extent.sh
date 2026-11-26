@@ -5,7 +5,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-size|--negative-zero|--negative-transform|--negative-revoke) ;; *) exit 64 ;; esac
+case "$mode" in ''|--gpu-pass-time|--negative-size|--negative-zero|--negative-transform|--negative-revoke) ;; *) exit 64 ;; esac
 out="$repo/build/vk-wsi-extent"
 mkdir -p "$out"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
@@ -23,7 +23,7 @@ for f in android/native/nvn/backend_vulkan.c android/native/nvn/nvn_pipe_flight.
     src+=("$repo/$f")
 done
 binary="$out/test"; log="$out/run.log"
-if [ -n "$mode" ]; then
+if [[ "$mode" == --negative-* ]]; then
     python3 - "$repo/android/native/nvn" "$out" "$mode" <<'PY'
 import pathlib, sys
 root, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
@@ -54,8 +54,9 @@ PY
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
 fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
-    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
+    -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 -DS2A_LAND_READBACK_TEST "${inc[@]}" "${src[@]}" \
     -Wl,--wrap=vkGetPhysicalDeviceSurfaceCapabilitiesKHR -Wl,--wrap=vkCreateSwapchainKHR \
+    -Wl,--wrap=vkCreateQueryPool -Wl,--wrap=vkGetQueryPoolResults -Wl,--wrap=vkGetDeviceProcAddr \
     -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
@@ -64,6 +65,35 @@ khronos_validation.validate_sync = true
 khronos_validation.syncval_shader_accesses_heuristic = true
 SETTINGS
 export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
+if [ "$mode" = --gpu-pass-time ]; then
+    status=0
+    for dq in 0 1; do
+        for arm in off on unavailable cap; do
+            log="$out/gpu-pass-time-dq$dq-$arm.log"
+            if ! S2A_TEST_DQ="$dq" S2A_TEST_PASS_TIME="$arm" timeout 120 "$binary" > "$log" 2>&1 ||
+               grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+               ! grep -q 'gpu-pass-time fixture presents=2 pixels=ok' "$log"; then
+                cat "$log"
+                exit 2
+            fi
+            if [ "$arm" = off ]; then
+                grep -q 'presents=2 pixels=ok pools=0 reads=0 writes=0$' "$log"
+                if grep -q 'nvk-gpu-pass-time ' "$log"; then exit 2; fi
+            elif ! grep -q 'nvk-gpu-pass-time window .*presents=2 ' "$log"; then
+                echo "gpu-pass-time backend missing ledger: dq=$dq arm=$arm real_presents=2 pixels=ok VUID=0 SYNC-HAZARD=0"
+                status=1
+                continue
+            elif [ "$arm" != unavailable ]; then
+                python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" "$arm" || status=1
+            else
+                grep -qE 'nvk-gpu-pass-time window .*measured_segments=0 missing_queries=5 .*missing_gaps=4 gap_pairs=0 ' "$log"
+                if grep -q 'nvk-gpu-pass-time top ' "$log"; then exit 2; fi
+            fi
+            echo "gpu-pass-time fixture pass: dq=$dq arm=$arm $(tail -n 1 "$log") VUID=0 SYNC-HAZARD=0"
+        done
+    done
+    exit "$status"
+fi
 set +e
 timeout 120 "$binary" > "$log" 2>&1
 rc=$?

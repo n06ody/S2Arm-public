@@ -137,7 +137,7 @@ static int bc1_astc_encode(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_bc1_astc.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g_bc1_astc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof count, &count);
     int time_query = bc_time_begin(c, BC_TIME_ASTC, t->nvn_format, blocks);
-    vkCmdDispatch(c->cb, (count + 63) / 64, 1, 1);
+    GPU_PT_RECORD(c, GPU_PT_ASTC_ENCODE, vkCmdDispatch(c->cb, (count + 63) / 64, 1, 1));
     bc_time_end(c, time_query);
     const VkBufferMemoryBarrier barrier = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -152,7 +152,7 @@ static int bc1_astc_encode(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, VkB
         .bufferOffset = output.off + 16, .imageOffset = off, .imageExtent = ext,
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
     };
-    vkCmdCopyBufferToImage(c->cb, output.buf->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    GPU_PT_RECORD(c, GPU_PT_TRANSFER, vkCmdCopyBufferToImage(c->cb, output.buf->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy));
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     es_reset(c);
     c->desc_layout = VK_NULL_HANDLE;

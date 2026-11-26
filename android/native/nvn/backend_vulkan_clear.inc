@@ -263,5 +263,6 @@ static void clr_draw(struct nvn_gpu_cmd_s *c, int slot, uint32_t cmask, const vo
     vkCmdSetStencilWriteMask(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, smask & 0xffu);
     vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, sval & 0xffu);
     if (slot >= 0) vkCmdPushConstants(c->cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, value16);
+    gpu_pt_draw(c, NULL);
     vkCmdDraw(c->cb, 3, 1, 0, 0);
 }

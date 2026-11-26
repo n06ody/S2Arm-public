@@ -43,6 +43,9 @@
 // 弱链接[replay]：nvn_vk_pipe_demand_mark
 // 弱链接[replay]：nvn_vk_pipe_demand_marks
 // 弱链接[replay]：nvn_vk_pipe_demand_on
+// 只链接绘制层的夹具没有资源登记表，沿用逐项解析。
+// 弱链接[replay]：rp_sampled_pair_try
+int rp_sampled_pair_try(int, int, uint8_t, uint8_t, nvn_gpu_view *, nvn_gpu_samp *) __attribute__((weak));
 // 弱链接[replay]：rp_shader_lib_reject
 // 弱链接[replay]：nvn_vk_pipe_demand_wait
 // 弱链接[replay]：s2a_fu_budget_left_ms
@@ -833,6 +836,7 @@ static void hist_note(uint64_t target, const uint64_t *tex, int ntex) {
     uint32_t i = g_hist_n++ % HIST_N; g_hist[i].target = target; memset(g_hist[i].tex, 0, sizeof g_hist[i].tex);
     for (int k = 0; k < ntex && k < HIST_TEX; k++) g_hist[i].tex[k] = tex[k];
 }
+static int g_tex_view_fast = -1;   // 提交线程独用，换会话按当前属性重读
 static int g_log_left;   // 逐笔日志还剩几行（调试开关 nvk_drawlog：上屏每 600 帧给下一帧开一次，见 rp_draw_log_arm）
 static int skip(const char *why, const void *rec) {
     nvn_unimpl("draw", why, rec); g_skips++;
@@ -1112,6 +1116,17 @@ static int compute_read_view(nvn_gpu_view v) {
     if (!nvn_gpu_view_access_span(v, &span)) return -1;
     return rp_access_read(&g_compute_access, &span);
 }
+// 弱链接[replay]：nvn_gpu_shader_write_end
+// 弱链接[replay]：rp_post_gpu_write_prefix
+// Optional backend reflection for the final compute module. Zero means no proven endpoint.
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader, unsigned, unsigned, unsigned, uint32_t) __attribute__((weak));
+int rp_post_gpu_write_prefix(uint64_t, uint64_t, uint64_t) __attribute__((weak));
+// 首个会话直接派发；退出时只清缓存，以便下个会话使用自己的属性值。
+static int g_land_bound = -1;
+static int land_bound_on(void) {
+    if (g_land_bound < 0) g_land_bound = nvn_plat_flag("nvk_land_bound", 0) != 0;
+    return g_land_bound;
+}
 static uint32_t g_disp_dim[3];   // 这次派发的组数（计算阶段的驱动段 c0 里要有）
 
 // 两个省重开关（缺省开；正式包里 nvn_plat_flag 只返回缺省值）：
@@ -1260,7 +1275,16 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 if (clamped & 2) nvn_unimpl("draw", "storage_buffer_past_pool_end_clamped", rec);   // 伸出池尾的部分没有存储：照画，具名记账
                 // 回写只登记游戏绑定的那一段（窗口前补的余数字节不是这个缓冲的，回写会盖掉相邻内容）
                 if (e->access & NVN_GPU_ACC_W) { const uint64_t reach = wa + wl - sb->addr;   // 窗口里属于这个缓冲的长度（余数 < 对齐 ≤ 256，上限 ≥ 128 MiB，不会为负）
-                    rp_post_gpu_write(sb->addr, reach < blen ? reach : blen); }
+                    const uint64_t bytes = reach < blen ? reach : blen;
+                    uint64_t copy_bytes = bytes;
+                    if (st == 5 && sbufp && !g_disp_ind && g_disp_dim[0] &&
+                        g_disp_dim[1] && g_disp_dim[2] && land_bound_on() && nvn_gpu_shader_write_end && rp_post_gpu_write_prefix) {
+                        uint64_t end = nvn_gpu_shader_write_end(pg->sh[pi], i, e->set, e->binding, g_disp_dim[0]);
+                        uint64_t padding = sb->addr - wa;
+                        if (end > padding && end - padding < bytes) copy_bytes = end - padding;
+                    }
+                    if (copy_bytes < bytes) rp_post_gpu_write_prefix(sb->addr, bytes, copy_bytes);
+                    else rp_post_gpu_write(sb->addr, bytes); }
                 o->u.b.buf = gb; o->u.b.off = go; o->u.b.len = wl; break; }
             case NVN_RB_UBOA: {   // 计算存储缓冲来自「用户 UBO 槽 r 内 src_off 处的 8 字节 guest 裸指针」（map 3，NVK_STORAGE_UBO_ADDRESS）：
                 // 指针字节必须当前：先按写的来源解析那 8 字节（池镜像里 GPU 写过的部分不会被旧 guest 字节盖掉），
@@ -1907,6 +1931,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
     char tl[520]; size_t tn = 0; tl[0] = 0;   // 逐笔日志用：这笔采样的贴图
     int narr[RP_PROG_STAGES] = {0};
     DT(RP_PERF_D_PREP);
+    if (g_tex_view_fast < 0) g_tex_view_fast = rp_sampled_pair_try && nvn_plat_flag("nvk_tex_view_fast", 0);
     rp_view_pin_begin();
     for (int st = 0; st < RP_PROG_STAGES; st++) for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
         const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
@@ -1918,6 +1943,9 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             if (e->count != 1 || e->src_reg2 >= g_prog->nusrc) { skip("uniform_handle_shape", rec); goto draw_done; }
             int tid = 0, sid = 0; const char *bad = usrc_ids(st, &g_prog->usrc[e->src_reg2], &tid, &sid);
             if (bad) { skip(bad, rec); goto draw_done; }
+            if (g_tex_view_fast && !g_log_left &&
+                rp_sampled_pair_try(tid, sid, g_prog->dtt[st][i], g_prog->dcls[st][i], &tv[st][i], &ts[st][i]))
+                continue;
             int unb = 0;
             tv[st][i] = sampled_view(g_prog, lib_retry, &unb, 1, tid, g_prog->dtt[st][i], g_prog->dcls[st][i], 0, c, NULL);
             if (unb) {
@@ -1980,6 +2008,10 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             continue;
         }
         uint64_t h = graphics_tex_handle(st, e->src_reg);
+        if (g_tex_view_fast && !g_log_left && e->count == 1 && e->src_reg2 == UINT16_MAX &&
+            rp_sampled_pair_try(h ? (int)(h & 0xFFFFF) : rp_S.tex_base, h ? (int)(h >> 20) : rp_S.samp_base,
+                                g_prog->dtt[st][i], g_prog->dcls[st][i], &tv[st][i], &ts[st][i]))
+            continue;
         tex_t tsnap, *tt = g_log_left ? &tsnap : NULL;   // 登记快照只给逐笔日志用：日志关时不拷
         { int unb = 0;
           tv[st][i] = sampled_view(g_prog, lib_retry, &unb, 0, h ? (int)(h & 0xFFFFF) : rp_S.tex_base, g_prog->dtt[st][i], g_prog->dcls[st][i], 0, c, tt);
@@ -2566,8 +2598,9 @@ done:
 }
 
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
-void rp_draw_reset(void) { rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
+void rp_draw_reset(void) { g_land_bound = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
+    g_tex_view_fast = -1;
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     memset(g_hzt, 0, sizeof g_hzt); g_hzi = 0; g_hz_mask = 0; g_hz_on = hz_mode(nvn_plat_flag("nvk_binst_hoist", 2));   // 批量拷开关会话打开时读定

@@ -52,16 +52,20 @@ static int g_flag_pool_memo = 1;   // 用例设：开关 nvk_pool_memo 的值（
 static int g_flag_land_merge = 1;  // 用例设：开关 nvk_land_merge 的值（缺省同产品：开）；每 256 次登记才重读一次，换值后要用 rp_test_gw_merge_reload() 推一下
 static int g_flag_buf_dirtylog = -1, g_dirtylog_dflt = -1;   // 用例设：开关 nvk_buf_dirtylog（-1 = 没设，取产品写的缺省；--dirtylog-off 整套以 0 跑一遍）。受跟踪的池都有替身日志，见「脏页追加日志替身」
 static int g_flag_land_noresync = -1;
+static int g_flag_buf_gw_batch = -1;
 static int g_flag_vf_key = 1;      // 用例设：开关 nvk_vf_key 的值（缺省同产品：视图表按存储认视图）；每 256 次取视图重读一次，换值后要用 vf_push() 推一下
 static int g_flag_ub_steal = -1;   // 用例设：开关 nvk_ub_fill_steal（-1 = 缺省）；rp_draw 缓存它，换值后要 pass_fresh（会话重开清缓存）
 static int g_flag_split_pass = -1, g_flag_diag_load_dc, g_flag_diag_store_dc;   // 用例设：开关 nvk_split_pass（-1 = 缺省）、诊断开关 nvk_diag_load_dontcare / nvk_diag_store_dontcare
 static int g_flag_pool_stats;   // 用例设：开关 pool_stats（缺省同产品：关）
 static int g_diag_frames;
 void s2a_direct_diag_frame(void) { g_diag_frames++; }
+static int g_flag_tex_pair;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_tex_view_fast") && g_flag_tex_pair) return 1;
     if (!strcmp(name, "nvk_tex_reupload_diag")) return g_flag_tdiag;
     if (!strcmp(name, "nvk_buf_dirtylog")) return g_flag_buf_dirtylog < 0 ? dflt : g_flag_buf_dirtylog;
     if (!strcmp(name, "nvk_land_noresync")) return g_flag_land_noresync < 0 ? dflt : g_flag_land_noresync;
+    if (!strcmp(name, "nvk_buf_gw_batch")) return g_flag_buf_gw_batch < 0 ? dflt : g_flag_buf_gw_batch;
     if (!strcmp(name, "pool_stats")) return g_flag_pool_stats;
     if (!strcmp(name, "nvk_spill")) return g_flag_spill;
     if (!strcmp(name, "nvk_pool_memo")) return g_flag_pool_memo;
@@ -3507,6 +3511,51 @@ static void t_pass_clear_park_tail(void) {   // 挂起到提交收尾：清 A �
     pass_fresh();
 }
 
+// 重放三笔相同的普通标量采样，第一笔负责建视图和采样器。
+static void t_draw_sampled_pair(void) {
+    for (int mode = 0; mode < 3; mode++) {
+        const int on = mode != 0, from_ubo = mode == 2;
+        g_flag_tex_pair = on;
+        pass_fresh();
+        g_resolve_rc = 0;
+        tex_t t = mk_tex(679, 0x8000, NVN_FORMAT_RGBA8, 8, 8, 1, 0);
+        t.mem = g_pmem;
+        samp_par sp = {.ws = NVN_WRAP_MODE_REPEAT};
+        nvn_be_reg_tex(7, &t, NULL);
+        nvn_be_reg_samp(3, &sp);
+        stream s = {0}; q_env(&s);
+        g_fprog.nent[1] = 1;
+        g_fprog.ent[1][0] = (nvn_gpu_layout_ent){.cls = NVN_GPU_RES_TEX_SAMP, .src_kind = NVN_RB_TEX,
+            .src_reg = 5, .src_reg2 = UINT16_MAX, .count = 1};
+        g_fprog.dtt[1][0] = NVN_TEXTURE_TARGET_2D + 1;
+        if (from_ubo) {
+            nvn_be_pool_add(g_pmem, sizeof g_pmem);
+            uint32_t tid = 7; memcpy(g_pmem + PG, &tid, sizeof tid);
+            nvn_gpu_layout_ent *e = &g_fprog.ent[1][0];
+            e->src_kind = NVN_RB_TEXU; e->src_reg = 2; e->src_reg2 = 0;
+            g_fprog.nusrc = 1;
+            g_fprog.usrc[0] = (struct rp_usrc){.tex = {.reg = 2}, .samp_kind = NVN_RB_SAMPI, .samp_reg = 3, .samp_pool = 1};
+            p_bind_buf *ub = put(&s, OP_BIND_UBO, sizeof *ub);
+            ub->stage = 1; ub->index = 2; ub->addr = (uintptr_t)(g_pmem + PG); ub->size = 64;
+        } else {
+            p_bind_handles *bh = put(&s, OP_BIND_TEX, sizeof *bh);
+            bh->stage = 1; bh->first = 5; bh->n = 1; bh->h[0] = 7 | 3 << 20;
+        }
+        q_draw(&s); q_draw(&s); q_draw(&s); end(&s);
+        int draws = g_gdraws;
+        uint64_t pf[RP_PERF_N]; rp_perf_take(pf);
+        rp_tm_on = 1;
+        submit1(&s); fake_complete(NVN_GPU_DONE_OK);
+        rp_perf_take(pf);
+        CHECK(g_gdraws == draws + 3 && g_fb[1][0].u.ts.view && g_fb[1][0].u.ts.view->of->d.d.width == 8 &&
+              g_fb[1][0].u.ts.samp && g_fb[1][0].u.ts.samp->x == NVN_WRAP_MODE_REPEAT);
+        CHECK(on ? pf[RP_PERF_TEX_PAIR_HIT] > 0 : pf[RP_PERF_TEX_PAIR_TRY] == 0);
+        if (from_ubo) nvn_be_pool_del(g_pmem);
+    }
+    g_flag_tex_pair = 0;
+    pass_fresh();
+}
+
 // #1072：格式不能线性过滤 / 不能混合时照常用是未定义行为（G710 的 RGBA16 不能过滤、R32F 不能混合等）。
 // 期望：线性采样器配这种格式时改用同参数的最近点采样器，记 tex / filter_unsupported_fmt_0x..；这种格式当颜色目标时关混合，记 draw / blend_unsupported_fmt_0x..。
 // 负对照：能过滤 / 能混合时不改；整数格式本来就走最近点，不记。
@@ -5184,8 +5233,10 @@ static void t_gpu_land_concurrent(void) {
 // 在开着的通道里解析两页。单段从锁外 memcpy 拷到一半时解析，另测两段
 // 在同一页内首尾拼接，以及一页未完全归 GPU 时必须同步的 CPU 字节。
 static void t_land_noresync(void) {
-    for (int log = 0; log < 2; log++) for (int scene = 0; scene < 4; scene++) {
+    for (int batch = 0; batch < 2; batch++) for (int log = 0; log < 2; log++) for (int scene = 0; scene < 5; scene++) {
+        if (scene == 4 && !log) continue;
         pass_fresh(); g_buf_cpu_auto = g_pg_tracked = 1; g_flag_buf_dirtylog = log;
+        g_flag_buf_gw_batch = batch;
         g_flag_land_noresync = scene == 0 ? 0 : -1;
         g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
         memset(g_log_unarmed, 0, sizeof g_log_unarmed);
@@ -5227,14 +5278,18 @@ static void t_land_noresync(void) {
         const uint64_t sb = sync_bytes_now(); const int prot = g_protects;
         uint64_t pf[RP_PERF_N]; rp_perf_take(pf);
         g_nbw = 0;
+        extern uint64_t rp_test_gw_page_probes(void);
+        const uint64_t probes_before = rp_test_gw_page_probes();
+        if (scene == 4) g_block_unreliable = 1;
         nvn_gpu_buf actual = NULL;
         CHECK(rp_buf_resolve(&g_fake_cmd, base + offset, 2 * PG, &actual, NULL) && actual == mirror);
+        if (scene == 4) CHECK(rp_test_gw_page_probes() - probes_before == 2);
         rp_perf_take(pf);
         const uint64_t moved = sync_bytes_now() - sb, cuts = pf[RP_PERF_P_CUT_XFER];
         const uint64_t expected_bytes = scene == 0 ? 2 * PG : scene == 3 ? PG : 0;
         const uint64_t expected_cuts = scene == 0 || scene == 3;
-        printf("land in-flight %s scene=%d moved=%llu cuts=%llu protects=%d expected=%llu/%llu\n",
-               log ? "log" : "plain", scene, (unsigned long long)moved, (unsigned long long)cuts,
+        printf("land in-flight %s batch=%d scene=%d moved=%llu cuts=%llu protects=%d expected=%llu/%llu\n",
+               log ? "log" : "plain", batch, scene, (unsigned long long)moved, (unsigned long long)cuts,
                g_protects - prot, (unsigned long long)expected_bytes, (unsigned long long)expected_cuts);
         CHECK(moved == expected_bytes && cuts == expected_cuts);
         CHECK(pf[RP_PERF_BUF_SYNC_GW_KB] == (2 * PG - expected_bytes) / 1024);
@@ -5261,15 +5316,132 @@ static void t_land_noresync(void) {
         nvn_be_sub_begin();
         const uint64_t after = sync_bytes_now();
         CHECK(rp_buf_resolve(&g_fake_cmd, base + offset, 2 * PG, &actual, NULL));
-        if (scene == 1 || scene == 2 || (log && scene == 3)) CHECK(sync_bytes_now() - after == 2 * PG);
+        if (scene == 1 || scene == 2 || (log && scene >= 3)) CHECK(sync_bytes_now() - after == 2 * PG);
         fake_log_write(64, 0x6e);
         nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
         nvn_be_sub_begin();
         CHECK(rp_buf_resolve(&g_fake_cmd, base + 64 * PG, PG, &actual, NULL) && actual->cpu[64 * PG] == 0x6e);
         nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
         nvn_be_pool_del(g_block_mem); g_block_mem = NULL;
-        g_flag_buf_dirtylog = g_dirtylog_dflt; g_flag_land_noresync = -1;
+        g_block_unreliable = 0;
+        g_flag_buf_dirtylog = g_dirtylog_dflt; g_flag_land_noresync = g_flag_buf_gw_batch = -1;
         g_log_fake_on = g_buf_cpu_auto = 0; pass_fresh();
+    }
+}
+static void t_buf_gw_batch(void) {
+    extern uint64_t rp_test_gw_page_probes(void);
+    // The two touching writes cover the page at their join. Neither partial
+    // edge nor the uncovered page between the two components may be cleared.
+    static const struct { size_t lo, hi; } writes[] = {
+        {68 * PG + 128, 131 * PG - 128}, {63 * PG + PG / 2, 67 * PG},
+        {PG + 128, 63 * PG + PG / 2},
+    };
+    for (int batch = 0; batch <= 1; batch++) {
+        pass_fresh(); g_flag_buf_gw_batch = batch ? 1 : -1; g_flag_buf_dirtylog = 1;
+        g_buf_cpu_auto = g_pg_tracked = 1; g_block_unreliable = 0;
+        g_log_fake_on = 1; g_log_fake_bad = 0; g_log_head = 0; g_log_ident++;
+        memset(g_log_unarmed, 0, sizeof g_log_unarmed);
+        g_block_mem = (uint8_t *)(((uintptr_t)g_block_arena + BLOCK_TEST_ALIGN - 1) & ~(uintptr_t)(BLOCK_TEST_ALIGN - 1));
+        memset(g_block_mem, 0x11, BLOCK_TEST_PAGES * PG);
+        memset(g_block_gen, 0, sizeof g_block_gen);
+        g_dirty_now = 100; ++g_dirty_map;
+        const uint64_t base = (uintptr_t)g_block_mem;
+        nvn_be_pool_add(g_block_mem, BLOCK_TEST_PAGES * PG);
+        nvn_be_sub_begin();
+        nvn_gpu_buf mirror = NULL;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base, BLOCK_TEST_PAGES * PG, &mirror, NULL) && mirror && mirror->cpu);
+        if (!mirror || !mirror->cpu) return;
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+
+        fake_log_event(1, 130);
+        memset(g_block_mem + PG, 0x77, 130 * PG);
+        fake_log_write(134, 0x5e);   // Outside the resolve, in the same dirty word as the last page.
+        nvn_be_sub_begin();
+        uint64_t key = 0, ids[sizeof writes / sizeof writes[0]];
+        for (size_t k = 0; k < sizeof writes / sizeof writes[0]; k++) {
+            const size_t lo = writes[k].lo, len = writes[k].hi - lo;
+            ids[k] = rp_buf_gpu_write_note(base + lo, len, &key);
+            CHECK(ids[k] && key == base);
+            memset(mirror->cpu + lo, 0xd4, len);
+        }
+        const uint64_t probes_before = rp_test_gw_page_probes();
+        const uint64_t bytes_before = sync_bytes_now();
+        uint64_t perf[RP_PERF_N];
+        rp_perf_take(perf);
+        nvn_gpu_buf actual = NULL;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, 130 * PG, &actual, NULL) && actual == mirror);
+        rp_perf_take(perf);
+        const uint64_t probes = rp_test_gw_page_probes() - probes_before;
+        unsigned bad = 0;
+        for (size_t off = 0; off < BLOCK_TEST_PAGES * PG; off++) {
+            const int gpu = (off >= PG + 128 && off < 67 * PG) ||
+                            (off >= 68 * PG + 128 && off < 131 * PG - 128);
+            const uint8_t want = gpu ? 0xd4 : (off >= PG && off < 131 * PG ? 0x77 : 0x11);
+            bad += mirror->cpu[off] != want;
+        }
+        printf("gw batch=%d probes=%llu skipped=%llu KiB moved=%llu bad_bytes=%u\n", batch,
+               (unsigned long long)probes, (unsigned long long)perf[RP_PERF_BUF_SYNC_GW_KB],
+               (unsigned long long)(sync_bytes_now() - bytes_before), bad);
+        CHECK(!bad && sync_bytes_now() - bytes_before == 4 * PG);
+        CHECK(perf[RP_PERF_BUF_SYNC_GW_KB] == 126 * PG / 1024);
+        CHECK(perf[RP_PERF_BUF_PAGES_N] == 130);
+        CHECK(batch ? probes <= 4 : probes >= 130);
+
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + 134 * PG, PG, &actual, NULL));
+        CHECK(mirror->cpu[134 * PG] == 0x5e);
+        for (size_t k = 0; k < sizeof ids / sizeof ids[0]; k++) rp_buf_gpu_write_land(key, ids[k], 1);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_sub_begin();
+        const uint64_t landed_before = sync_bytes_now();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + PG, 130 * PG, &actual, NULL));
+        CHECK(sync_bytes_now() - landed_before == 129 * PG);   // 未登记 GPU 写的第 67 页已经同步。
+        CHECK(memcmp(actual->cpu + PG, g_block_mem + PG, 130 * PG) == 0);
+
+        // 两份镜像各持有半页，不能跨镜像拼成一页。未落地的字节也不能互相覆盖。
+        const size_t page = 8 * PG;
+        ids[0] = rp_buf_gpu_write_note(base + page, PG / 2, &key);
+        CHECK(ids[0] && key == base);
+        memset(mirror->cpu + page, 0x36, PG / 2);
+        rp_buf_frame_flip();
+        nvn_gpu_buf second = NULL;
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + page + PG / 2, PG / 2, &second, NULL) && second && second != mirror);
+        if (!second || second == mirror) return;
+        ids[1] = rp_buf_gpu_write_note(base + page + PG / 2, PG / 2, &key);
+        CHECK(ids[1] && key == base);
+        memset(second->cpu + page + PG / 2, 0x92, PG / 2);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        fake_log_write(8, 0xa2);
+        g_log_unarmed[8] = 1;
+        nvn_be_sub_begin();
+        rp_perf_take(perf);
+        const uint64_t mixed_before = sync_bytes_now();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + page, PG, &actual, NULL) && actual == mirror);
+        rp_perf_take(perf);
+        CHECK(sync_bytes_now() - mixed_before == PG && perf[RP_PERF_BUF_SYNC_GW_KB] == 0);
+        bad = 0;
+        for (size_t k = 0; k < PG; k++) {
+            bad += mirror->cpu[page + k] != (k < PG / 2 ? 0x36 : 0xd4);
+            if (k >= PG / 2) bad += second->cpu[page + k] != 0x92;
+        }
+        CHECK(!bad);
+        // 后半页先落地。页仍可写，因此这次落地不会另发脏页事件。
+        rp_buf_gpu_write_land(key, ids[1], 1);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_sub_begin();
+        CHECK(rp_buf_resolve(&g_fake_cmd, base + page, PG, &actual, NULL) && actual == mirror);
+        bad = 0;
+        for (size_t k = 0; k < PG; k++) bad += mirror->cpu[page + k] != (k < PG / 2 ? 0x36 : 0x92);
+        CHECK(!bad);
+
+        rp_buf_gpu_write_land(key, ids[0], 1);
+        bad = 0;
+        for (size_t k = 0; k < PG; k++) bad += g_block_mem[page + k] != (k < PG / 2 ? 0x36 : 0x92);
+        CHECK(!bad);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_pool_del(g_block_mem); g_block_mem = NULL;
+        g_flag_buf_gw_batch = -1; g_log_fake_on = g_buf_cpu_auto = 0;
+        g_flag_buf_dirtylog = g_dirtylog_dflt;
+        pass_fresh();
     }
 }
 extern int rp_test_gw_live(void);
@@ -5325,6 +5497,19 @@ static void t_gpu_land_merge(void) {
     CHECK(bad == 0 && g_pmem[63] == 0x11 && g_pmem[128] == 0x11);
     rp_buf_gpu_write_land(key, id5, 1);                                                                     // 被吞掉那条的登记号迟到落地
     CHECK(g_land_copies == 1 && g_land_copied == 64 && rp_test_gw_live() == 0);
+    // 先登记右侧写，再从左侧并入：镜像的原区间保留，两次写的有效前缀都要落地。
+    uint64_t partial = rp_buf_gpu_write_note_prefix(base + 160, 48, 8, &key, &m);
+    CHECK(partial && !m);
+    CHECK(rp_buf_gpu_write_note_prefix(base + 144, 32, 4, &key, &m) == partial && m);
+    CHECK(rp_test_gw_get(key, 0, &o, &l) == 1 && o == 144 && l == 64);
+    struct rp_gpu_write_ref ref = {.pool_key=key, .id=partial, .index=0};
+    nvn_gpu_readback_span staged = {0};
+    rp_buf_gpu_write_snapshot(&ref, 1, &staged);
+    CHECK(staged.src == b && staged.offset == 144 && staged.bytes == 24);
+    memset(b->cpu + 144, 0xcd, 64);
+    g_land_copied = 0;
+    rp_buf_gpu_write_land(key, partial, 1);
+    CHECK(g_land_copied == 24 && g_pmem[167] == 0xcd && g_pmem[168] == 0x11);
     // ④ 负对照 a：不同提交的登记不并（上一次提交的登记还没落地——显卡还在做——这一次的相接也不能并进去）
     uint64_t ia = rp_buf_gpu_write_note2(base + 200, 16, &key, &m); CHECK(ia && m == 0);
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK); nvn_be_sub_begin();
@@ -8289,6 +8474,7 @@ static void t_graphics_cbuf_prep_before_pass(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) { g_dirtylog_dflt = g_flag_buf_dirtylog = 0; argc--; argv++; }   // 关那一档：整套用例走逐页退回路径
 #ifdef S2A_GPU_LAND_TEST
+    if (argc > 1 && !strcmp(argv[1], "--buf-gw-batch")) { t_buf_gw_batch(); printf("gw batch: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--land-noresync")) { t_land_noresync(); printf("land noresync: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-count")) { t_gpu_land_count_cleanup(); printf("gpu land count: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
     if (argc > 1 && !strcmp(argv[1], "--gpu-land-destroy")) { t_gpu_land_destroy(); printf("gpu land destroy: %d checks, %d failures\n", g_checks, g_fail); return g_fail != 0; }
@@ -8346,6 +8532,7 @@ int main(int argc, char **argv) {
     t_gpu_land_concurrent();
     t_gpu_land_destroy();
     t_land_noresync();
+    t_buf_gw_batch();
     t_gpu_land_count_cleanup();
     t_gpu_land_merge();
 #endif
@@ -8384,6 +8571,7 @@ int main(int argc, char **argv) {
     t_pass_clear_park_read();
     t_pass_clear_park_sample();
     t_drawlog_unreadable_tex_mem();
+    t_draw_sampled_pair();
     t_fmt_filter_blend();
     t_clear_rect();
     t_report_counter();

@@ -113,6 +113,8 @@ int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *has_v);
 uint32_t rp_storage_srgb_alias(uint32_t f);
 // 采样器号 → 后端采样器（首次取用时建）。没登记 → NULL。线程：[提交]。
 nvn_gpu_samp rp_samp_by_id(int id);
+// 提交线程在绘制 pin 窗口内借两项。返回 0 时输出未改，调用方走原解析。
+int rp_sampled_pair_try(int tid, int sid, uint8_t dtt, uint8_t dcls, nvn_gpu_view *view, nvn_gpu_samp *samp);
 // #1072：同上，但贴图 tid 的有效格式不能线性过滤时给同参数的最近点采样器（具名记账）。
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid);
 // 类型 3 句柄（常量采样器；c2 分离表 / 游戏常量缓冲两种形态）的采样器：登记号 sid 没登记 → 同 Ryujinx 的空采样器，绑最近点 / Repeat 的

@@ -53,6 +53,7 @@ for dq in 0 1; do
             exit 1
         fi
         grep '^cold-guard ' "$log"
+        python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" "cold-$enabled"
     done
 done
 

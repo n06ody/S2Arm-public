@@ -59,7 +59,7 @@ static void alias_key_of(alias_key *k, const tex_t *t) { memset(k, 0, sizeof *k)
 // Reserve the retirement node when creating a registered view, not when it is
 // invalidated: pinning an already borrowed handle must never require allocation.
 struct registered_view { nvn_gpu_view view; struct registered_view *next; };
-typedef struct { tex_t t; view_t v; uint8_t ok, has_v; nvn_gpu_view view; struct registered_view *owned; struct rp_tex *of; uint64_t gen; } treg_t;
+typedef struct { tex_t t; view_t v; uint8_t ok, has_v, decl_valid, decl_target, decl_class; nvn_gpu_view view; struct registered_view *owned; struct rp_tex *of; uint64_t gen; } treg_t;
 typedef struct { samp_par p; uint8_t ok; nvn_gpu_samp s, sn; } sreg_t;   // sn：同参数的最近点采样器（#1072，配不能线性过滤的格式时用），用到才建
 static nvn_gpu_samp g_query_sampler;
 
@@ -207,6 +207,7 @@ void nvn_be_reg_tex(int id, const tex_t *t, const view_t *v) {
     treg_t *r = &g_treg[id];
     int same = r->ok && r->t.serial == t->serial && r->has_v == (v != NULL) && (!v || !memcmp(&r->v, v, sizeof *v));
     if (!same) treg_drop_view(r);
+    r->decl_valid = 0;
     r->t = *t; r->has_v = v != NULL; if (v) r->v = *v; else memset(&r->v, 0, sizeof r->v); r->ok = 1;   // 只存快照：不建图、不建视图
     __atomic_fetch_add(&g_treg_gen, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_rmu);
@@ -882,6 +883,12 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
     }
 }
 
+static int tex_epoch_matches(const struct rp_tex *x, uint64_t epoch, uint64_t map, uint64_t seg, uint64_t sparse_gen) {
+    return tex_epoch_on() && x->uploaded && (x->span || x->sparse) && !x->check_dirty &&
+           x->check_epoch == epoch && x->check_seg == seg && x->check_map == map &&
+           x->check_vgen == sparse_gen && !nvn_dirty_tracking_unreliable();
+}
+
 static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
     if (!t || !t->serial) return NULL;
     // 分时抽样（#1103）：原先每次解析都取 3 次时钟（世界稳态每帧至少 2148 次），现在只在采样帧里计时（见 rp_exec.h 的 rp_tm）。
@@ -946,8 +953,7 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         // 映射代际进键：换底 / 重新登记后旧句柄与保护状态都不作数（同 rp_buf 的 seen_map）。
         // 虚拟池贴图（x->sparse）没有自己的跟踪区间；映射代号也进键：只映射、没写任何页时写代号不动，但贴图的内容已经变了。
         const uint64_t now0 = nvn_dirty_now(), map0 = nvn_dirty_mapping_generation(), seg0 = rp_seg_serial(), vg0 = x->sparse ? nvn_sparse_gen() : 0;
-        if (tex_epoch_on() && x->uploaded && (x->span || x->sparse) && !x->check_dirty && x->check_epoch == now0 && x->check_seg == seg0 && x->check_map == map0
-            && x->check_vgen == vg0 && !nvn_dirty_tracking_unreliable()) {
+        if (tex_epoch_matches(x, now0, map0, seg0, vg0)) {
             rp_perf_add(RP_PERF_TEX_EPOCH, 1);
         } else {
             if (x->uploaded && (x->span || x->sparse) && !x->check_dirty) rp_perf_add(RP_PERF_TEX_EPOCH_MISS, 1);   // 具备纪元快路条件但未命中
@@ -1417,6 +1423,55 @@ static int samp_linear(const samp_par *p) {
     return p->magf == NVN_MAG_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST ||
            p->minf == NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR || p->aniso > 1.0f;
 }
+// 只借当前登记项已有的两个对象。两者都由绘制的 pin 窗口保活，退出锁后不保留登记表地址。
+int rp_sampled_pair_try(int tid, int sid, uint8_t dtt, uint8_t dcls, nvn_gpu_view *view, nvn_gpu_samp *samp) {
+    const int timed = rp_tm();
+    const uint64_t start = timed ? res_now() : 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_rmu);
+    if (!g_pin_depth || tid < 0 || tid >= g_ntreg || (g_tpool_n && tid >= g_tpool_n) || sid < 0 || sid >= g_nsreg)
+        goto done;
+    treg_t *r = &g_treg[tid];
+    const sreg_t *sr = &g_sreg[sid];
+    const struct rp_tex *x = r->of;
+    if (!r->ok || !r->view || r->gen != g_ser_gen || !sr->ok || !sr->s || !x || x->need_init || x->zero_pending)
+        goto done;
+    if (x->cpu && !x->gpu_written) {
+        if (!r->t.mem || x->sparse || (x->byte_upload_sub && x->byte_upload_epoch != tex_bytes_failure_epoch()) ||
+            !tex_epoch_matches(x, nvn_dirty_now(), nvn_dirty_mapping_generation(), rp_seg_serial(), 0))
+            goto done;
+    }
+    // 只记原样视图的声明匹配；桥接、零图和出库声明不符仍由原入口处理。重登记时清证据。
+    if (dtt && (!r->decl_valid || r->decl_target != dtt || r->decl_class != dcls)) {
+        view_t v = r->v;
+        int depth = 0;
+        int cls = sampled_view_class(&r->t, &v, r->has_v, &depth);
+        if (cls < 0 || (dcls == 3 ? !depth : cls != dcls) || rp_decl_view_target(&r->t, &v, r->has_v, dtt))
+            goto done;
+        r->decl_valid = 1;
+        r->decl_target = dtt;
+        r->decl_class = dcls;
+    }
+    // 只接受已证能线性过滤的格式；未知能力或需最近点替代者走旧路，保留原诊断与失败。
+    if (samp_linear(&sr->p)) {
+        uint32_t fmt = r->has_v && r->v.set_format ? r->v.format : (uint32_t)r->t.d.format;
+        if (fmt >= sizeof g_fmt_caps / sizeof g_fmt_caps[0] ||
+            !(__atomic_load_n(&g_fmt_caps[fmt], __ATOMIC_ACQUIRE) & NVN_GPU_FMT_FILTER))
+            goto done;
+    }
+    *view = r->view;
+    *samp = sr->s;
+    hit = 1;
+done:
+    pthread_mutex_unlock(&g_rmu);
+    if (timed) {
+        rp_perf_add(RP_PERF_TEX_PAIR_NS, res_now() - start);
+        rp_perf_add(RP_PERF_TEX_PAIR_TRY, 1);
+        if (hit) rp_perf_add(RP_PERF_TEX_PAIR_HIT, 1);
+    }
+    return hit;
+}
+
 // 采样器配上这张贴图：贴图的有效格式不能线性过滤（G710 的 RGBA16 UNORM、Adreno 830 的 D32S8 等）而采样器要线性过滤 / 级间插值 / 各向异性时，
 // 照常绑是未定义行为。改用同参数的最近点采样器（级间也取最近、关各向异性），按格式具名记 tex / filter_unsupported_fmt_0x..。整数格式本来就走最近点，不管。
 nvn_gpu_samp rp_samp_for_tex(int sid, int tid) {
