@@ -195,16 +195,21 @@ static void rp_fu_skip_note(int kind) {
         nvn_plat_log(NVN_PLAT_LOG_INFO, "draw", b);
     }
 }
-// 本笔是否写 storage（无反射 rw 位，保守口径）：transform feedback / 绑了 SSBO / 程序声明了存储图像 → 不可丢。
+// 裸 SSBO 绑定、写入或未知访问的反射资源都可能改变后续绘制看到的存储。
 static int rp_fu_storage_write(void) {
     if (rp_S.tf_on) return 1;
     for (int st = 0; st < 6; st++)
         for (int i = 0; i < 16; i++)
             if (rp_S.ssbo[st][i].addr) return 1;   // 地址有效、长度 0 的槽也写真实内存（见 sb_len）
-    if (g_prog)
+    if (g_prog) {
         for (int st = 0; st < RP_PROG_STAGES; st++)
-            for (uint32_t i = 0; i < g_prog->nent[st]; i++)
-                if (g_prog->ent[st][i].src_kind == NVN_RB_IMG) return 1;
+            for (uint32_t i = 0; i < g_prog->nent[st]; i++) {
+                const nvn_gpu_layout_ent *e = &g_prog->ent[st][i];
+                if (e->src_kind == NVN_RB_IMG ||
+                    (e->access != NVN_GPU_ACC_R && (e->cls == NVN_GPU_RES_SSBO ||
+                     e->cls == NVN_GPU_RES_IMAGE || e->cls == NVN_GPU_RES_IMAGE_TBUF))) return 1;
+            }
+    }
     return 0;
 }
 // 程序的着色器会不会写存储缓冲 / 存储图像（布局项的写访问位；同 iOS nvn_mtl.m swrite_note 的判据）。回放层按它记「通道里有着色器写」（rp_pass_note_draw），
@@ -247,6 +252,34 @@ static nvn_gpu_view sampled_view(const struct rp_prog *p, int lib_retry, int *un
     nvn_gpu_view v = ubo ? rp_view_by_ubo_handle_decl(id, dtt, dcls, c, t_out) : rp_view_by_id_decl(id, dtt, dcls, elem, c, t_out);
     *unbridged = probe ? rp_decl_probe_end() : 0;
     return v;
+}
+
+// The freshness ledger is keyed by texture serial. Admit only full, single-level,
+// single-layer render targets where that record also proves freshness of this view.
+static int rp_fu_large_target(const tex_t *t, const view_t *v) {
+    if (!t->serial || t->d.target != NVN_TEXTURE_TARGET_2D || t->d.levels > 1 ||
+        t->L.layers > 1 || t->d.samples > 1) return 0;
+    if (v && ((v->set_levels && v->base_level) || (v->set_layers && v->min_layer))) return 0;
+    int bw = 0, bh = 0;
+    return (uint64_t)t->d.width * t->d.height >= 640u * 360u &&
+           nvn_fmt_bpb(t->d.format, &bw, &bh) && bw == 1 && bh == 1;
+}
+
+static int rp_fu_mesh_draw(const p_set_rt *rt, uint32_t prim, uint32_t count) {
+    // Indirect draws supply 0 here because only the GPU knows the guest count.
+    // Check small vertex/index counts even when depth testing is enabled.
+    if (count <= 6 || prim < NVN_DRAW_PRIMITIVE_TRIANGLES ||
+        prim > NVN_DRAW_PRIMITIVE_TRIANGLE_FAN || !rt || !rt->depth ||
+        !rp_S.ds.dt || rp_S.rast_discard || rp_S.tf_on ||
+        !rp_occl_want || rp_occl_want()) return 0;
+    if (!rp_fu_large_target(rt->depth, rt->has_dview ? &rt->dview : NULL)) return 0;
+    int colors = 0;
+    for (int i = 0; i < rt->n && i < 8; i++) {
+        if (!rt->color[i]) continue;
+        if (!rp_fu_large_target(rt->color[i], rt->has_cview[i] ? &rt->cview[i] : NULL)) return 0;
+        colors++;
+    }
+    return colors > 0;
 }
 
 static int rp_fu_skip_safe(const p_set_rt *rt) {
@@ -444,9 +477,10 @@ int rp_pipe_fail_class(unsigned c, const char **reason, uint64_t *fails, uint64_
     return 1;
 }
 
-// 首用取管线：kick→PENDING 时按 iOS pso_pend_take 的判定限时等/跳；可安全丢才跳，否则按 unsafe 上限等一次后标 stuck。
+// 首用取管线：kick→PENDING 时按 iOS pso_pend_take 的判定限时等。仅可恢复的笔允许跳过，受保护的笔到点转 SYNC。
 // 返回 rc；*skip 非 0 = 本笔要跳过（此时 *out 为 NULL）。NONE/FAILED/ABSENT 都回退现场 SYNC 建。
-static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt *rt, nvn_gpu_pipe *out, nvn_gpu_err *err, int *skip) {
+static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt *rt, uint32_t guest_count,
+                                     nvn_gpu_pipe *out, nvn_gpu_err *err, int *skip) {
     *skip = 0; *out = NULL;
     uint8_t ident[32];
     int have_id = 0;
@@ -460,15 +494,19 @@ static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt
     if (k != RP_FU_DEMAND_PENDING)   // NONE / FAILED：回退现场建（拿真实结果/错误，与关闭开关同义）
         return nvn_gpu_pipe_get(pd, NVN_GPU_PIPE_SYNC, out, err);
     const uint64_t frame = rp_frame();
-    const int may_skip = rp_fu_skip_safe(rt);
+    const int may_skip = rp_fu_mesh_draw(rt, pd->prim, guest_count) && rp_fu_skip_safe(rt);
     int late = 0, stuck = 0;
     if (nvn_vk_pipe_demand_marks) nvn_vk_pipe_demand_marks(pd, ident, &late, &stuck);
     uint32_t item_ms = nvk_fu_item_ms ? nvk_fu_item_ms() : 2000;
-    uint32_t frame_ms = nvk_fu_frame_ms ? nvk_fu_frame_ms() : 100;
+    uint32_t frame_ms = nvk_fu_frame_ms ? nvk_fu_frame_ms() : 8;
     uint32_t unsafe_ms = nvk_fu_unsafe_ms ? nvk_fu_unsafe_ms() : 10000;
     int64_t left = s2a_fu_budget_left_ms(&g_fu_budget, frame, frame_ms);
     struct s2a_fu_verdict v = s2a_fu_wait_decide(0, late, stuck, may_skip, item_ms, frame_ms, left, unsafe_ms);
-    if (v.action == S2A_FU_SKIP) { *skip = v.timeout; return rp_fu_ok(); }
+    if (v.action == S2A_FU_SKIP) {
+        if (!may_skip) return nvn_gpu_pipe_get(pd, NVN_GPU_PIPE_SYNC, out, err);
+        *skip = v.timeout;
+        return rp_fu_ok();
+    }
     // wait_ms == 0 = 不设限（nvn_first_use.h；fu_unsafe_ms = 0）：按 250 ms 分片一直等到有结果，分片超时不当终局。
     const uint32_t slice = v.wait_ms ? v.wait_ms : 250;
     int w;
@@ -479,12 +517,10 @@ static nvn_gpu_rc rp_draw_pipe_async(const nvn_gpu_pipe_desc *pd, const p_set_rt
         if (may_skip) s2a_fu_budget_spend(&g_fu_budget, frame, waited);
     } while (w == 1 && !v.wait_ms);
     if (w == 0) return rp_fu_ok();
-    if (w == 2 || w == 3)   // 后台失败 / 待定项消失：回退现场建（拿真实结果/错误，不丢笔，也不按未实现报红）
-        return nvn_gpu_pipe_get(pd, NVN_GPU_PIPE_SYNC, out, err);
-    // w == 1：本片超时。只有 late/stuck 打项标（iOS：BUDGET 不打，预算裁短的超时下一帧还能再等）。
-    if (v.timeout == S2A_FU_T_LATE || v.timeout == S2A_FU_T_STUCK) {
-        if (nvn_vk_pipe_demand_mark) nvn_vk_pipe_demand_mark(pd, ident, v.timeout == S2A_FU_T_STUCK);
-    }
+    // A protected draw that exhausts the async wait still needs a real pipeline.
+    // SYNC joins the same backend flight if it is already in the driver.
+    if (!may_skip || w == 2 || w == 3) return nvn_gpu_pipe_get(pd, NVN_GPU_PIPE_SYNC, out, err);
+    if (v.timeout == S2A_FU_T_LATE && nvn_vk_pipe_demand_mark) nvn_vk_pipe_demand_mark(pd, ident, 0);
     *skip = v.timeout ? v.timeout : S2A_FU_T_LATE;
     return rp_fu_ok();
 }
@@ -1700,6 +1736,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     uint32_t count = (uint32_t)(di ? di->count : dr->count);
     if (!count && !ind) return;
     if (ind) count = 0;   // GPU parameters, not stale direct fields, own the draw count.
+    const uint32_t guest_count = count;   // 扩展四边形 / 条带前的顶点或索引数
     // 没有原生对应的图元：换成能画的图元号，要展开索引的记下展开方式（quads），索引在取资源那一步展开
     int restart = di && rp_S.restart.on;
     int quads = EXP_NONE;
@@ -1732,7 +1769,8 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     if (!g_prog || rp_pso_dirty || args_dirty) {
         struct rp_shader_req q; memset(&q, 0, sizeof q); q.prim = prim; q.rt_count = rt->n;
         for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) q.rt_format[i] = (uint32_t)(rt->has_cview[i] && rt->cview[i].set_format ? rt->cview[i].format : rt->color[i]->d.format);
-        q.compile_defer_frame = rp_live_compile_defer_frame;
+        if (rp_fu_enabled() && rp_fu_mesh_draw(rt, prim, guest_count))
+            q.compile_defer_frame = rp_live_compile_defer_frame;
         const struct rp_prog *np = NULL;
         int sr = rp_shader_resolve(&q, &np);
         if (sr) { skip(sr > 0 ? "program_not_ready" : "program_unresolved", rec); g_prog = NULL; return; }
@@ -2123,7 +2161,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         if (pf_have && rp_pfail_hit(&pfk)) { nvn_unimpl("gpu", "pipe_get_cached_fail", rec); g_skips++; g_pipe = NULL; goto draw_done; }
         const poly_st pf_poly0 = pd.poly;   // 点 / 线退回填充重试会改描述；失败表的键按本笔原样算
         int fu_skip = 0;
-        nvn_gpu_rc r = rp_fu_enabled() ? rp_draw_pipe_async(&pd, rt, &np, &err, &fu_skip)
+        nvn_gpu_rc r = rp_fu_enabled() ? rp_draw_pipe_async(&pd, rt, guest_count, &np, &err, &fu_skip)
                                        : nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &np, &err);
         if (!fu_skip && r.code == NVN_GPU_E_UNSUPPORTED && rp_S.poly.mode != NVN_POLYGON_MODE_FILL) {   // 设备没有点 / 线填充模式：记一笔，照旧按填充画（不让这笔绘制消失）
             nvn_unimpl("gpu", "polygon_mode_not_fill", rec);
@@ -2588,6 +2626,7 @@ done:
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { if (draws) *draws = g_draws; if (skips) *skips = g_skips; }
 void rp_draw_reset(void) { g_land_bound = -1; rp_access_reset(&g_compute_access); g_compute_access_on = -1; g_ndispatch_access = 0; g_caps_ok = 0; g_ubf_w = 0; memset(g_ubf, 0, sizeof g_ubf); g_ubf_steal = -1; g_arena_reason_n = 0; g_arena_reason_full = 0;   // 会话重开：能力表重新取
     g_spill_on = -1; g_spill_said = 0;
+    g_fu_budget = (struct s2a_fu_budget){0};
     rp_tm_reset();   // 分时抽样的开关也重新读（#1103）
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok); memset(g_ind_drv, 0, sizeof g_ind_drv); memset(g_lb, 0, sizeof g_lb);   // #941
     memset(g_hzt, 0, sizeof g_hzt); g_hzi = 0; g_hz_mask = 0; g_hz_on = hz_mode(nvn_plat_flag("nvk_binst_hoist", 2));   // 批量拷开关会话打开时读定

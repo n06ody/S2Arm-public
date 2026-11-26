@@ -92,7 +92,7 @@ int nvn_vk_pipe_demand_on(void) {
     return g_on;
 }
 uint32_t nvk_fu_item_ms(void)   { static int v = -2; if (v == -2) v = nvn_plat_flag("fu_item_ms", 2000); return v > 0 ? (uint32_t)v : 0; }
-uint32_t nvk_fu_frame_ms(void)  { static int v = -2; if (v == -2) v = nvn_plat_flag("fu_frame_ms", 100); return v > 0 ? (uint32_t)v : 0; }
+uint32_t nvk_fu_frame_ms(void)  { static int v = -2; if (v == -2) v = nvn_plat_flag("fu_frame_ms", 8); return v > 0 ? (uint32_t)v : 0; }
 uint32_t nvk_fu_unsafe_ms(void) { static int v = -2; if (v == -2) v = nvn_plat_flag("fu_unsafe_ms", 10000); return v > 0 ? (uint32_t)v : 0; }
 
 static void dem_key(const nvn_gpu_pipe_desc *d, const uint8_t ident[32], struct dem_key *k) {

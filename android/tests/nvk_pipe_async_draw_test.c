@@ -36,9 +36,9 @@ int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out);
 // ---------- 开关：两组值（进程参数选） ----------
 static int g_item_ms = 20, g_frame_ms = 100, g_unsafe_ms = 300;
 int nvn_plat_flag(const char *name, int dflt) {
-    if (!strcmp(name, "nvk_pipe_async")) return 1;
+    if (!strcmp(name, "nvk_pipe_async") || !strcmp(name, "nvk_pipe_workers")) return 1;
     if (!strcmp(name, "fu_item_ms")) return g_item_ms;
-    if (!strcmp(name, "fu_frame_ms")) return g_frame_ms;
+    if (!strcmp(name, "fu_frame_ms")) return g_frame_ms < 0 ? dflt : g_frame_ms;
     if (!strcmp(name, "fu_unsafe_ms")) return g_unsafe_ms;
     return fixture_plat_flag(name, dflt);
 }
@@ -53,6 +53,7 @@ static struct fpipe g_p[MAXP]; static int g_np;
 static pthread_mutex_t g_bmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_bcv = PTHREAD_COND_INITIALIZER;
 static int g_gate[MAXP];          // 第 k 次后台建（从 0 数）的闸；缺省放行
 static int g_bg_builds, g_fg_builds, g_bg_entered;
+static const nvn_gpu_pipe_desc *g_driver_recipe;   // 单后台线程夹具，受 g_bmu 保护
 static int g_session = 1;         // 当前「后端会话」号：建出的管线带上它，设管线时核不能用上一局的
 static pthread_t g_main;
 static void gate_reset(void) { pthread_mutex_lock(&g_bmu); memset(g_gate, 0, sizeof g_gate); g_bg_builds = g_fg_builds = g_bg_entered = 0; pthread_mutex_unlock(&g_bmu); }
@@ -65,11 +66,21 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     const int bg = !pthread_equal(pthread_self(), g_main);
     pthread_mutex_lock(&g_bmu);
     const int sess = g_session;   // 开建时的会话：卡在闸里跨过停局的那条仍属于上一局（真后端里它用的是上一局的着色器与设备对象）
-    if (bg) { int k = g_bg_entered++; while (k < MAXP && g_gate[k] == GATE_HOLD) pthread_cond_wait(&g_bcv, &g_bmu); g_bg_builds++; }
-    else g_fg_builds++;
+    if (bg) {
+        int k = g_bg_entered++;
+        g_driver_recipe = d;
+        while (k < MAXP && g_gate[k] == GATE_HOLD) pthread_cond_wait(&g_bcv, &g_bmu);
+        g_bg_builds++;
+    } else {
+        g_fg_builds++;
+        pthread_cond_broadcast(&g_bcv);
+        // 同真实 nvn_pipe_flight：同步调用遇同键在途要等其结果，不能建第二次。
+        while (g_driver_recipe && same_desc(d, g_driver_recipe)) pthread_cond_wait(&g_bcv, &g_bmu);
+    }
     struct fpipe *p = NULL;
     for (int i = 0; i < g_np && !p; i++) if (g_p[i].session == sess && same_desc(&g_p[i].d, d)) p = &g_p[i];
     if (!p && g_np < MAXP) { p = &g_p[g_np++]; p->d = *d; p->session = sess; }
+    if (bg) { g_driver_recipe = NULL; pthread_cond_broadcast(&g_bcv); }
     pthread_mutex_unlock(&g_bmu);
     *out = p ? &p->s : NULL;
     return (nvn_gpu_rc){p ? NVN_GPU_OK : NVN_GPU_E_OOM};
@@ -91,26 +102,88 @@ void nvn_gpu_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *a) {
 
 // ---------- 程序借用替身：只认当前程序的身份 ----------
 static int g_borrows, g_returns;
+static const uint8_t g_prog_identity[32] = {0x5a, [31] = 0xa5};
+static const struct rp_prog g_borrow_prog = {.sh = {&g_fsh[0], &g_fsh[1]}};
 int rp_shader_prog_borrow(const uint8_t identity[32], const struct rp_prog **out) {
-    if (memcmp(identity, g_fprog.identity, 32)) { *out = NULL; return 0; }
-    __atomic_fetch_add(&g_borrows, 1, __ATOMIC_RELAXED); *out = &g_fprog; return 1;
+    if (memcmp(identity, g_prog_identity, sizeof g_prog_identity)) { *out = NULL; return 0; }
+    __atomic_fetch_add(&g_borrows, 1, __ATOMIC_RELAXED); *out = &g_borrow_prog; return 1;
 }
 void rp_shader_prog_return(const uint8_t identity[32]) { (void)identity; __atomic_fetch_add(&g_returns, 1, __ATOMIC_RELAXED); }
 
 // ---------- 一帧：清目标（可选）→ 可选绑 SSBO / 开 TF → 若干笔绘制；返回这次提交的墙钟（毫秒） ----------
-enum { F_CLEAR = 1, F_SSBO = 2, F_TF = 4 };
+enum {
+    F_CLEAR = 1, F_SSBO = 2, F_TF = 4, F_MESH = 8, F_SMALL = 16,
+    F_TINY = 32, F_IMG = 64, F_DISCARD = 128, F_INDEXED = 256,
+    F_D24 = 512, F_STENCIL_ONLY = 1024, F_DEPTH_ONLY = 2048,
+};
+static tex_t g_mesh_depth, g_img;
+static uint16_t g_indices[6] = {0, 1, 2, 2, 3, 0};
 static int prim_count(int prim) { return prim == 0 ? 1 : (prim == 1 || prim == 3) ? 2 : 3; }
 static double run_frame(uint64_t frame, int flags, const int *prims, int n) {
     nvn_be_set_frame(frame);
     stream s = {0}; q_env(&s);
-    memset(g_fprog.identity, 0, sizeof g_fprog.identity); g_fprog.identity[0] = 0x5a; g_fprog.identity[31] = 0xa5;   // 有内容身份才走异步
+    if (flags & F_MESH) {
+        const uint32_t w = flags & F_SMALL ? 320 : 640, h = flags & F_SMALL ? 240 : 360;
+        g_qrt = mk_tex(91, 0, NVN_FORMAT_RGBA8, w, h, 1, 0);
+        const int depth_fmt = flags & F_D24 ? NVN_FORMAT_DEPTH24_STENCIL8 : NVN_FORMAT_DEPTH32F;
+        g_mesh_depth = mk_tex(92, 0x180000, depth_fmt, w, h, 1, 0);
+        put_set_rt(&s, &g_qrt, &g_mesh_depth);
+        p_viewports *vp = put(&s, OP_VIEWPORTS, sizeof *vp);
+        vp->n = 1; vp->v[0][2] = (float)w; vp->v[0][3] = (float)h;
+        ds_st ds = {.dt = 1, .dw = 1, .df = NVN_DEPTH_FUNC_LESS};
+        if (flags & F_D24) {
+            ds.st = 1;
+            ds.sf_f = ds.sf_b = NVN_STENCIL_FUNC_ALWAYS;
+            ds.zpass_f = ds.zpass_b = NVN_STENCIL_OP_REPLACE;
+        }
+        put_state(&s, 5, &ds, sizeof ds);
+        if (flags & F_CLEAR) {
+            p_clear_ds *dc = put(&s, OP_CLEAR_DS, sizeof *dc);
+            dc->depth = 1.0f;
+            dc->depth_mask = !(flags & F_STENCIL_ONLY);
+            dc->stencil_mask = (flags & F_D24) && !(flags & F_DEPTH_ONLY) ? 0xff : 0;
+        }
+    }
+    memcpy(g_fprog.identity, g_prog_identity, sizeof g_prog_identity);
     if (flags & F_CLEAR) { p_clear_color *cc = put(&s, OP_CLEAR_COLOR, sizeof *cc); cc->index = 0; cc->mask = 0xf; cc->rgba[3] = 1; }
     if (flags & F_SSBO) { p_bind_buf *b = put(&s, OP_BIND_SSBO, sizeof *b); b->stage = 1; b->index = 0; b->addr = 0x10000; b->size = 64; }
     if (flags & F_TF) { p_tf_state *t = put(&s, OP_TF_STATE, sizeof *t); t->what = 0; }
-    for (int i = 0; i < n; i++) { p_draw *d = put(&s, OP_DRAW, sizeof *d); d->prim = (uint32_t)prims[i]; d->count = (uint32_t)prim_count(prims[i]); d->instances = 1; }
+    if (flags & F_DISCARD) {
+        p_rast_discard *r = put(&s, OP_RAST_DISCARD, sizeof *r);
+        r->on = 1;
+    }
+    if (flags & F_IMG) {
+        g_img = mk_tex(93, 0x300000, NVN_FORMAT_RGBA8, 8, 8, 1, NVN_TEXTURE_FLAGS_IMAGE);
+        nvn_be_reg_tex(3, &g_img, NULL);
+        nvn_be_set_tex_pool_n(8);
+        g_fprog.nent[1] = 1;
+        g_fprog.ent[1][0] = (nvn_gpu_layout_ent){
+            .cls = NVN_GPU_RES_IMAGE, .src_kind = NVN_RB_IMG, .src_reg = 2,
+            .access = NVN_GPU_ACC_RW, .count = 1, .src_reg2 = UINT16_MAX,
+        };
+        rp_S.img[1][2] = 3;  // 同 t_graphics_image 的真实回放绑定槽口径
+    }
+    if (flags & F_INDEXED) nvn_be_pool_add(g_indices, sizeof g_indices);
+    for (int i = 0; i < n; i++) {
+        const int prim = prims[i] & 15;
+        if (flags & F_MESH) {
+            poly_st poly = {.cull = (uint32_t)prims[i] >> 4, .mode = NVN_POLYGON_MODE_FILL};
+            put_state(&s, 4, &poly, sizeof poly);
+        }
+        if (flags & F_INDEXED) {
+            p_draw_idx *d = put(&s, OP_DRAW_IDX, sizeof *d);
+            d->prim = (uint32_t)prim; d->count = 6; d->instances = 1; d->itype = 1;
+            d->ibuf = (uint64_t)(uintptr_t)g_indices;
+        } else {
+            p_draw *d = put(&s, OP_DRAW, sizeof *d);
+            d->prim = (uint32_t)prim; d->instances = 1;
+            d->count = (flags & F_TINY) ? 6u : (flags & F_MESH) ? 24u : (uint32_t)prim_count(prim);
+        }
+    }
     end(&s);
     const uint64_t t0 = now_ns(); submit1(&s); const double ms = (double)(now_ns() - t0) / 1e6;
     fake_complete(NVN_GPU_DONE_OK);
+    if (flags & F_INDEXED) nvn_be_pool_del(g_indices);
     return ms;
 }
 static const int TRI[] = {4};
@@ -135,7 +208,7 @@ static void *rel_main(void *a) { struct rel *r = a; sleep_ms(r->ms); gate_open(r
 static pthread_t release_after(struct rel *r) { pthread_t t; pthread_create(&t, NULL, rel_main, r); return t; }
 static void session_begin(void) {
     pass_fresh(); g_gdraws = 0; g_bad_draw = 0; g_last_set = NULL; gate_reset();
-    pthread_mutex_lock(&g_bmu); g_session++; pthread_mutex_unlock(&g_bmu);
+    pthread_mutex_lock(&g_bmu); g_session++; g_np = 0; pthread_mutex_unlock(&g_bmu);
     nvn_vk_pipe_demand_start();
     CHECK(nvn_vk_pipe_demand_worker_count() == 1);   // 前提：本局后台 worker 真起来了（没起来时被测的笔会走前台同步建，后面的断言全错位）
 }
@@ -147,8 +220,8 @@ static void session_end(void) {
 }
 // 目标先画两帧（三角形，后台建、闸开着）：第 3 帧起这张目标「近两帧画过」
 static void steady_target(void) {
-    CHECK(run_frame(1, F_CLEAR, TRI, 1) >= 0 && g_gdraws == 1);
-    CHECK(run_frame(2, F_CLEAR, TRI, 1) >= 0 && g_gdraws == 2);
+    CHECK(run_frame(1, F_CLEAR | F_MESH, TRI, 1) >= 0 && g_gdraws == 1);
+    CHECK(run_frame(2, F_CLEAR | F_MESH, TRI, 1) >= 0 && g_gdraws == 2);
 }
 static int g_case_fail;
 #define CASE_BEGIN() int f0_ = g_fail
@@ -159,16 +232,16 @@ static int g_case_fail;
 static void c_steady_skip(void) {
     CASE_BEGIN(); session_begin(); steady_target();
     const int k = bg_entered(); gate_hold(k);
-    const int pts2[] = {0, 0};
+    const int strip2[] = {5, 5};
     const uint64_t to0 = demand_timeouts();
-    const double ms = run_frame(3, F_CLEAR, pts2, 2);
+    const double ms = run_frame(3, F_CLEAR | F_MESH, strip2, 2);
     CHECK(g_gdraws == 2);                                         // 两笔都跳了
     CHECK(ms >= g_item_ms - 2);                                   // 第一笔等满单项上限（下界：负载只会更长）
     CHECK(demand_timeouts() == to0 + 1);                          // 第二笔 late、不再等：只有第一笔那一次超时
     CHECK(open_and_wait_published(k));
     const int fg0 = g_fg_builds;
-    const int pts1[] = {0};
-    run_frame(4, F_CLEAR, pts1, 1);
+    const int strip[] = {5};
+    run_frame(4, F_CLEAR | F_MESH, strip, 1);
     CHECK(g_gdraws == 3 && g_bad_draw == 0 && g_fg_builds == fg0);
     session_end(); CASE_END("可跳的笔：等满单项上限后跳过、late 后同管线直接跳、建好后下一帧照画");
 }
@@ -189,7 +262,7 @@ static void c_ssbo_waits(void) {
     const int k = bg_entered(); gate_hold(k);
     struct rel r = {k, 60}; pthread_t t = release_after(&r);
     const int pts1[] = {0};
-    const double ms = run_frame(3, F_CLEAR | F_SSBO, pts1, 1);
+    const double ms = run_frame(3, F_CLEAR | F_MESH | F_SSBO, pts1, 1);
     pthread_join(t, NULL);
     CHECK(g_gdraws == 3 && g_bad_draw == 0);
     CHECK(ms >= 55);
@@ -213,41 +286,57 @@ static void c_tf_not_fu_skip(void) {
 static void c_frame_budget(void) {
     CASE_BEGIN(); session_begin(); steady_target();
     { const int b = bg_entered(); for (int k = b; k < b + 8; k++) gate_hold(k); }
-    const int five[] = {0, 1, 3, 5, 6};
+    const int five[] = {5, 6, 5 | (1 << 4), 6 | (1 << 4), 5 | (2 << 4)};
     const uint64_t to0 = demand_timeouts();
-    const double ms = run_frame(3, F_CLEAR, five, 5);
+    const double ms = run_frame(3, F_CLEAR | F_MESH, five, 5);
     CHECK(g_gdraws == 2);
     CHECK(ms >= g_frame_ms - 3);                                  // 5 笔各可等 item、合计超过预算：预算一定用满（下界）
     // 预算 frame = 100、单项 item = 30：至多前 4 笔真等（30 + 30 + 30 + 剩下的 10），第 5 笔没预算不等；预算失效时 5 笔都等 = 5 次。
     //   负载高时单笔等得更久、预算更早用完，超时只会更少，所以判「≤ 4」
     CHECK(demand_timeouts() - to0 <= 4);
-    const int last[] = {6};
+    const int last[] = {5 | (2 << 4)};
     const uint64_t to1 = demand_timeouts();
-    const double ms2 = run_frame(4, F_CLEAR, last, 1);           // 第 5 条在上一帧是「预算用完」跳的，不打 late：新一帧照常等满单项上限
+    const double ms2 = run_frame(4, F_CLEAR | F_MESH, last, 1);           // 第 5 条在上一帧是「预算用完」跳的，不打 late：新一帧照常等满单项上限
     CHECK(g_gdraws == 2 && ms2 >= g_item_ms - 2 && demand_timeouts() == to1 + 1);
     session_end(); CASE_END("帧预算：单调钟扣、用完即跳、下一帧重置");
 }
-// 6) 不可跳的笔按 unsafe 上限等，等满就跳并打 stuck；同管线再来一笔（同样不可跳）立即跳；放闸建好后下一帧画出来。
-static void c_stuck_cap(void) {
+// 6) 不可跳的笔耗完后台等待后转同步，同键仍由原后台构建完成。
+struct cap_release { int gate, done, followed; };
+static void *release_on_sync(void *opaque) {
+    struct cap_release *r = opaque;
+    pthread_mutex_lock(&g_bmu);
+    while (!g_fg_builds && !r->done) pthread_cond_wait(&g_bcv, &g_bmu);
+    r->followed = g_fg_builds && g_driver_recipe;
+    pthread_mutex_unlock(&g_bmu);
+    gate_open(r->gate);
+    return NULL;
+}
+static void c_unsafe_sync(void) {
     CASE_BEGIN(); session_begin();
     const int k = bg_entered(); gate_hold(k);
+    struct cap_release r = {.gate = k};
+    pthread_t t;
+    if (pthread_create(&t, NULL, release_on_sync, &r) != 0) {
+        CHECK(0); session_end(); CASE_END("创建同步等待夹具"); return;
+    }
     const int tri2[] = {4, 4};
     const uint64_t to0 = demand_timeouts();
-    const double ms = run_frame(1, F_CLEAR, tri2, 2);
-    CHECK(g_gdraws == 0);
-    CHECK(ms >= g_unsafe_ms - 3);                                 // 第一笔等满上限（下界）
-    CHECK(demand_timeouts() == to0 + 1);                          // 第二笔 stuck、不再等：只有第一笔那一次超时
-    CHECK(open_and_wait_published(k));
-    run_frame(2, F_CLEAR, TRI, 1);
-    CHECK(g_gdraws == 1 && g_bad_draw == 0);
-    session_end(); CASE_END("不可跳的笔：等满 unsafe 上限后跳过、stuck 后同管线直接跳、建好后照画");
+    run_frame(1, F_CLEAR, tri2, 2);
+    pthread_mutex_lock(&g_bmu); r.done = 1; pthread_cond_broadcast(&g_bcv); pthread_mutex_unlock(&g_bmu);
+    pthread_join(t, NULL);
+    CHECK(demand_timeouts() == to0 + 1 && r.followed);
+    CHECK(g_gdraws == 2 && g_bad_draw == 0 && bg_entered() == k + 1);
+    CHECK(g_bg_builds == 1 && g_fg_builds == 1);
+    session_end(); CASE_END("不可跳的笔：耗完 unsafe 等待，跟随同键构建并提交两笔");
 }
 // 7) 停局时在途构建超出有界等待：旧 worker 保持归属，不能启动下一局 worker；旧线程退出后才允许重启。
 static void c_stop_discards(void) {
-    CASE_BEGIN(); session_begin();
+    CASE_BEGIN(); session_begin(); steady_target();
     const int k0 = bg_entered(); gate_hold(k0);
-    run_frame(1, F_CLEAR, TRI, 1);
-    CHECK(g_gdraws == 0);
+    const int strip[] = {5};
+    run_frame(3, F_CLEAR | F_MESH, strip, 1);
+    CHECK(g_gdraws == 2);
+    const uint64_t published = demand_published();
     nvn_vk_pipe_demand_stop();
     CHECK(!nvn_vk_pipe_demand_quiescent());                        // 超时仍保留旧的可 join worker
     CHECK(nvn_vk_pipe_demand_worker_count() == 1);
@@ -257,10 +346,11 @@ static void c_stop_discards(void) {
     gate_open(k0);
     while (!nvn_vk_pipe_demand_quiescent()) sleep_ms(1);            // 按事件等旧 worker 退出，不设墙钟上限
     CHECK(nvn_vk_pipe_demand_worker_count() == 0);
+    CHECK(demand_published() == published);
     pass_fresh(); g_gdraws = 0; g_bad_draw = 0; g_last_set = NULL;
     pthread_mutex_lock(&g_bmu); g_session++; pthread_mutex_unlock(&g_bmu);
     nvn_vk_pipe_demand_start();
-    run_frame(1, F_CLEAR, TRI, 1);
+    run_frame(1, F_CLEAR | F_MESH, strip, 1);
     CHECK(g_gdraws == 1 && g_bad_draw == 0);
     CHECK(bg_entered() == k0 + 2);                                 // 旧 worker 退出后才构建新一代
     session_end(); CASE_END("停局：旧 worker 未退出前不重启，回收后下一局再建");
@@ -277,13 +367,71 @@ static void c_unbounded(void) {
     session_end(); CASE_END("unsafe 上限 0（不设限）：一直等到建好再画");
 }
 
+static void c_default_budget(int fmt_flags) {
+    CASE_BEGIN(); session_begin();
+    const int flags = F_CLEAR | F_MESH | fmt_flags;
+    run_frame(1, flags, TRI, 1);
+    run_frame(2, flags, TRI, 1);
+    CHECK(g_gdraws == 2 && g_bad_draw == 0);
+    const int k = bg_entered();
+    gate_hold(k); gate_hold(k + 1);
+    const int pending[] = {5, 6};
+    const uint64_t to0 = demand_timeouts();
+    const double waited = run_frame(3, flags, pending, 2);
+    const uint64_t timeouts = demand_timeouts() - to0;
+    printf("default mesh budget (%s): %u ms, timeouts=%llu, submit=%.1f ms\n",
+           fmt_flags & F_D24 ? "D24S8" : "D32F", nvk_fu_frame_ms(), (unsigned long long)timeouts, waited);
+    CHECK(nvk_fu_frame_ms() == 8);
+    CHECK(timeouts == 1 && g_gdraws == 2);
+    session_end();
+    CASE_END("常规大深度网格：缺省最多等一次帧预算，其他待编笔立即交后台");
+}
+
+static void c_protected_draws(void) {
+    static const struct { const char *name; int flags; int clear; } cases[] = {
+        {"小附件", F_SMALL, F_CLEAR},
+        {"6 顶点", F_TINY, F_CLEAR},
+        {"6 索引", F_INDEXED, F_CLEAR},
+        {"SSBO", F_SSBO, F_CLEAR},
+        {"imageStore", F_IMG, F_CLEAR},
+        {"关闭光栅化", F_DISCARD, F_CLEAR},
+        {"持久附件", 0, 0},
+        {"只清模板：深度仍持久", F_D24 | F_STENCIL_ONLY, F_CLEAR},
+        {"只清深度：模板仍持久", F_D24 | F_DEPTH_ONLY, F_CLEAR},
+    };
+    const int alternate[] = {5};
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        CASE_BEGIN(); session_begin();
+        const int warm = F_CLEAR | F_MESH | (cases[i].flags & (F_SMALL | F_D24));
+        run_frame(1, warm, TRI, 1);
+        run_frame(2, warm, TRI, 1);
+        CHECK(g_gdraws == 2);
+        const int k = bg_entered();
+        const uint64_t timeouts = demand_timeouts();
+        gate_hold(k);
+        struct rel r = {k, 60};
+        pthread_t t = release_after(&r);
+        run_frame(3, F_MESH | cases[i].clear | cases[i].flags, alternate, 1);
+        pthread_join(t, NULL);
+        CHECK(g_gdraws == 3 && !g_bad_draw && demand_timeouts() == timeouts);
+        if (cases[i].flags & F_IMG) CHECK(rp_tex_debug_state(g_img.serial) & 4);
+        session_end(); CASE_END(cases[i].name);
+    }
+}
+
 int main(int argc, char **argv) {
     g_main = pthread_self();
     const char *mode = argc > 1 ? argv[1] : "main";
-    if (!strcmp(mode, "unbounded")) { g_item_ms = 20; g_frame_ms = 100; g_unsafe_ms = 0; c_unbounded(); }
+    if (!strcmp(mode, "default")) {
+        g_item_ms = 40; g_frame_ms = -1;
+        c_default_budget(0);
+        c_default_budget(F_D24);
+    }
+    else if (!strcmp(mode, "protected")) { g_item_ms = 20; g_frame_ms = 8; c_protected_draws(); }
+    else if (!strcmp(mode, "unbounded")) { g_item_ms = 20; g_frame_ms = 100; g_unsafe_ms = 0; c_unbounded(); }
     else {
         g_item_ms = 30; g_frame_ms = 100; g_unsafe_ms = 300;
-        c_steady_skip(); c_first_frame_waits(); c_ssbo_waits(); c_tf_not_fu_skip(); c_frame_budget(); c_stuck_cap(); c_stop_discards();
+        c_steady_skip(); c_first_frame_waits(); c_ssbo_waits(); c_tf_not_fu_skip(); c_frame_budget(); c_unsafe_sync(); c_stop_discards();
     }
     CHECK(g_borrows == g_returns);
     printf("nvk_pipe_async_draw（%s）：%d 项检查，%d 项红，%d 个用例红\n", mode, g_checks, g_fail, g_case_fail);

@@ -517,6 +517,13 @@ void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask) {
     }
     if (known) { P.area_want = 1; P.wx = sc.x; P.wy = sc.y; P.ww = (uint32_t)sc.w; P.wh = (uint32_t)sc.h; }
 }
+// 深度和模板共用一个纹理 serial，所有存在的面都清除后才可按整张新鲜处理。
+static int pass_depth_fresh(const nvn_gpu_pass_desc *d) {
+    return (d->depth.view || d->stencil.view) &&
+           (!d->depth.view || d->depth.load == NVN_GPU_LOAD_CLEAR) &&
+           (!d->stencil.view || d->stencil.load == NVN_GPU_LOAD_CLEAR);
+}
+
 // 大附件的整张清除不能折进较小公共区域：先用原视图单独清整张，再让公共通道 LOAD。
 // 不经 pass_begin_colors 递归，不换逻辑目标；影子附件沿用本次视图，最终由 rp_pass_end 拷回。
 static void pass_land_full(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, int color,
@@ -533,7 +540,8 @@ static void pass_land_full(nvn_gpu_cmd c, nvn_gpu_pass_desc *d, int color,
     nvn_gpu_pass_end(c);
     rp_perf_add(RP_PERF_PASSES, 1);
     rp_tex_mark_gpu_written(t);
-    if (rp_pass_fu_enabled()) s2a_fu_rt_mark_fresh(t->serial, rp_frame());
+    if (rp_pass_fu_enabled() && (color >= 0 || pass_depth_fresh(&one)))
+        s2a_fu_rt_mark_fresh(t->serial, rp_frame());
     if (color >= 0) d->color[color].load = NVN_GPU_LOAD_LOAD;
     else { d->depth.load = NVN_GPU_LOAD_LOAD; d->stencil.load = NVN_GPU_LOAD_LOAD; }
     rp_dirty_all();
@@ -752,8 +760,8 @@ static int pass_begin_colors(nvn_gpu_cmd c, uint8_t colors, int layered, int cle
             for (uint32_t i = 0; i < d.ncolor && i < 8; i++)
                 if (d.color[i].view && d.color[i].load == NVN_GPU_LOAD_CLEAR && P.rt.color[i])
                     s2a_fu_rt_mark_fresh(P.rt.color[i]->serial, ff);
-            if (d.depth.view && d.depth.load == NVN_GPU_LOAD_CLEAR && P.rt.depth) s2a_fu_rt_mark_fresh(P.rt.depth->serial, ff);
-            if (d.stencil.view && d.stencil.load == NVN_GPU_LOAD_CLEAR && P.rt.depth) s2a_fu_rt_mark_fresh(P.rt.depth->serial, ff);
+            if (P.rt.depth && pass_depth_fresh(&d))
+                s2a_fu_rt_mark_fresh(P.rt.depth->serial, ff);
         }
     }
     PB(RP_PERF_PB_BE);

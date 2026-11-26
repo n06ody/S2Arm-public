@@ -10,8 +10,8 @@
 //   管线（backend same_pipe_desc/pipe_hash 都比 st[].sh），只按状态/格式作键会把「状态相同、着色器不同」的两套
 //   配方合并成一条，第二套拿到第一套的对象（错管线上屏）。所有操作（state/wait/mark/marks）都要带同一身份。
 //
-// 开关：debug.s2a.nvk_pipe_async（缺省 1；release 包属性门关着→读不到→缺省开；调试包设 0 退回同步建）。三档上限沿用 iOS DM_NVN_PSO_*：
-//    debug.s2a.fu_item_ms（2000）/ fu_frame_ms（100）/ fu_unsafe_ms（10000）。
+// 开关：debug.s2a.nvk_pipe_async（缺省 1；release 包属性门关着→读不到→缺省开；调试包设 0 退回同步建）。三档上限的单位与 iOS DM_NVN_PSO_* 相同：
+//    debug.s2a.fu_item_ms（2000）/ fu_frame_ms（8；0 = 无帧预算）/ fu_unsafe_ms（10000；到点回退同步，0 = 一直等后台）。
 // 池：debug.s2a.nvk_pipe_workers=0 按在线核数选 2–4，少于 4 核 / 查询不到 / nvk_pipe_serial=1 用单路。
 //    显式 1–4 可覆盖自动值，串行驱动策略仍优先。创建不足时沿用已启动的线程。
 // 生命周期：会话 open 后 start；Stop/close 前 stop（所有线程共用一次有界等待，退出后整代回收）。
