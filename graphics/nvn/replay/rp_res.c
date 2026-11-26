@@ -841,16 +841,25 @@ static void tex_unref(struct rp_tex *x) {
 // 每个宽高是一个并存的贴图对象、表里一个新条目，只进不出——标题画面一分钟后端贴图 297 → 2299 张、显存 8.7 GB，手机内存吃光、游戏被杀。
 // iOS 的同类事故：一款游戏的阴影图几乎每帧换尺寸，同一偏移 429 张深度贴图。持 g_rmu。
 enum { ALIAS_IDLE = 16 };
-static int alias_overwritten(const alias_key *a, const struct rp_tex *self, uint64_t since) {   // 与 a 存储重叠的别的条目里，有没有在 since 之后被 GPU 写过的
-    const int64_t lo = a->off, hi = a->off + (int64_t)self->size;
+static int alias_overwritten(const alias_key *a, uint64_t size, uint64_t since) {   // 重叠区间在 since 之后是否有 GPU 写
+    const int64_t lo = a->off, hi = a->off + (int64_t)size;
     for (uint32_t i = 0; i < g_alias.cap; i++) {
         const struct rp_tex *y = g_alias.vals[i];
-        if (!y || y == self) continue;
+        if (!y || y->wrote <= since) continue;
         alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
         if (k.pool != a->pool || k.off >= hi || k.off + (int64_t)y->size <= lo) continue;
-        if (y->wrote > since) return 1;
+        return 1;
     }
     return 0;
+}
+// 普通线性采样图可以和渲染目标住在同一个池里。共用表继续按存储找图，
+// 只给尚无 GPU 写入的区间启用客体行上传及后续脏页跟踪。
+static int mixed_pool_linear_source(const tex_t *t, const alias_key *k) {
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) ||
+        fmt_depth(t->d.format)) return 0;
+    const char *why;
+    return linear_class(t, &why, 0) > 0 && !alias_overwritten(k, t->L.size, 0);
 }
 static void alias_take_over(const alias_key *nk, uint64_t nsize) {
     if (!nsize) return;
@@ -866,7 +875,7 @@ static void alias_take_over(const alias_key *nk, uint64_t nsize) {
             if (x->seen && now - x->seen < ALIAS_IDLE) continue;
             if (x->users > 0) {   // ②
                 const uint64_t last = x->seen > x->wrote ? x->seen : x->wrote;
-                if ((x->wrote && now - x->wrote < ALIAS_IDLE) || !alias_overwritten(&k, x, last)) continue;
+                if ((x->wrote && now - x->wrote < ALIAS_IDLE) || !alias_overwritten(&k, x->size, last)) continue;
                 for (int more = 1; more;) {   // 指着它的序号都出表：对象下次用到时重建
                     more = 0;
                     for (uint32_t q = 0; q < g_by_serial.cap; q++) if (g_by_serial.vals[q] == x) {
@@ -893,11 +902,13 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
     if (!x) {
         rp_perf_add(RP_PERF_RES_NEW, 1); new_size_note(t->d.width, t->d.height);
+        int track_linear = 0;
         int sp = 0, cpu = cpu_content(t, &sp);
         alias_key k; alias_key_of(&k, t);
         if (!cpu && t->pool) { x = nvn_hm_get(&g_alias, &k); if (x) x->seen = rp_sub_serial() + 1; }   // 同存储同描述的另一个对象已经建过：共用
         if (!x) {
-            nvn_gpu_tex_desc d = {0}; d.d = t->d; d.usage = usage_of(t, cpu); d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
+            track_linear = !cpu && mixed_pool_linear_source(t, &k);
+            nvn_gpu_tex_desc d = {0}; d.d = t->d; d.usage = usage_of(t, cpu || track_linear); d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
             rp_fold_1d_desc(&d.d);   // 后端没有一维目标：一维 → 高 1 的二维，一维数组 → 二维数组（#1810）
             nvn_gpu_tex g = NULL; nvn_gpu_err err = {0};
             uint64_t mk0_ = res_now(); nvn_gpu_rc mkr_ = nvn_gpu_tex_create(&d, &g, &err); rp_perf_add(RP_PERF_RES_MAKE, res_now() - mk0_);
@@ -910,6 +921,7 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
             if (!cpu && t->pool) { alias_take_over(&k, t->L.size); nvn_hm_put(&g_alias, &k, x); x->in_alias = 1; x->seen = rp_sub_serial() + 1; }
         }
         x->users++;
+        if (track_linear) x->cpu = 1;
         nvn_hm_put(&g_by_serial, &t->serial, x); g_ser_gen++;
     }
     if (plain && c && bc1_replay_format(t->d.format) && nvn_gpu_tex_bc1_unwrap) {
@@ -935,6 +947,14 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
     if (x->cpu && !x->gpu_written && c && t->mem) {
+        // 池镜像有在途的缓冲写时，客体字节还没回写。下一次使用再取，避免上传旧值。
+        if (x->in_alias && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) &&
+            rp_buf_gpu_pending((uintptr_t)t->mem, t->L.size)) {
+            x->check_dirty = 1;
+            nvn_unimpl("tex", "linear_pending_pool_write", t);
+            pthread_mutex_unlock(&g_rmu);
+            return NULL;
+        }
         if (x->byte_upload_sub && x->byte_upload_epoch != tex_bytes_failure_epoch()) {
             // 淘汰了字节缓存也要重试这份可能未录成的内容。
             x->byte_upload_sub = 0;

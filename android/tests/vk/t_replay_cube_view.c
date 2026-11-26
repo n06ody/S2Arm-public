@@ -6,6 +6,14 @@
 #include "rp_exec.h"
 #include "rp_res.h"
 #include "nvn_tex.h"
+#include "nvn_dirty.h"
+#include "host/dm.h"
+#include <sys/mman.h>
+#include <unistd.h>
+
+static void (*prepare_write)(void *, size_t);
+void dm_fault_hook_register(int (*fn)(void *, int, void *)) { CHECK(fn != NULL, "dirty fault hook"); }
+void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { prepare_write = fn; }
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
@@ -44,7 +52,8 @@ static void finish(nvn_gpu_cmd cmd) {
     CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
 }
 
-static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t pixels[64 * 64 * 4]) {
+static void sample(const char *dir, const char *frag, nvn_gpu_view sv, int format, void *pixels) {
+    const size_t row = 64 * (format == NVN_FORMAT_RG32F ? 8 : 4);
     const nvn_gpu_layout_ent ents[] = {
         {.binding = 0, .cls = NVN_GPU_RES_TEX, .access = NVN_GPU_ACC_R, .count = 1, .stages = 1u << NVN_GPU_SH_FS},
         {.binding = 1, .cls = NVN_GPU_RES_SAMP, .access = NVN_GPU_ACC_R, .count = 1, .stages = 1u << NVN_GPU_SH_FS},
@@ -55,7 +64,7 @@ static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t p
     CHECK(load_shader_pair(dir, "tri.vert", frag, NULL, &fl, &vs, &fs, &vsm, &fsm), "%s shaders", frag);
     nvn_gpu_pipe_desc pd = {
         .poly.mode = NVN_POLYGON_MODE_FILL, .origin_ll = 1, .color.logic_op = NVN_LOGIC_OP_COPY,
-        .cfmt[0] = NVN_FORMAT_RGBA8, .samples = 1, .prim = 4, .chmask.mask = 15,
+        .cfmt[0] = format, .samples = 1, .prim = 4, .chmask.mask = 15,
         .attr = {{.fmt = NVN_FORMAT_RG32F}, {.fmt = NVN_FORMAT_RG32F, .offset = 8}},
         .stream[0].stride = 16,
     };
@@ -69,8 +78,8 @@ static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t p
     CHECK(OK(nvn_gpu_samp_create(&sp, &samp, &err)), "%s sampler: %s", frag, err.why);
     const float verts[3][4] = {{-1, -1, 0, 0}, {3, -1, 2, 0}, {-1, 3, 0, 2}};
     nvn_gpu_buf vb = make_buf(sizeof verts, NVN_GPU_MEM_SHARED, verts);
-    nvn_gpu_buf rb = make_buf(64 * 64 * 4, NVN_GPU_MEM_SHARED, NULL);
-    nvn_gpu_tex out = make_tex(64, 64, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER);
+    nvn_gpu_buf rb = make_buf(row * 64, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_tex out = make_tex(64, 64, format, NVN_GPU_TEX_RENDER);
     nvn_gpu_view ov = make_view(out);
     nvn_gpu_pass_desc pass = {.ncolor = 1, .w = 64, .h = 64, .layers = 1};
     pass.color[0].view = ov;
@@ -91,10 +100,10 @@ static void sample(const char *dir, const char *frag, nvn_gpu_view sv, uint8_t p
     const nvn_gpu_draw_args draw = {.prim = 4, .count = 3, .instances = 1};
     nvn_gpu_draw(active, &draw);
     nvn_gpu_pass_end(active);
-    nvn_gpu_copy_tex_buf(active, out, 0, 0, NULL, rb, 0, 256, 16384);
+    nvn_gpu_copy_tex_buf(active, out, 0, 0, NULL, rb, 0, row, row * 64);
     finish(active);
     active = NULL;
-    memcpy(pixels, buf_cpu(rb), 64 * 64 * 4);
+    memcpy(pixels, buf_cpu(rb), row * 64);
     nvn_gpu_view_release(ov);
     nvn_gpu_tex_release(out);
     nvn_gpu_buf_release(vb, NULL, NULL);
@@ -137,7 +146,7 @@ static void check_sample(const char *dir, const char *label, int id, int want, c
         return;
     }
     uint8_t pixels[64 * 64 * 4];
-    sample(dir, frag, view, pixels);
+    sample(dir, frag, view, NVN_FORMAT_RGBA8, pixels);
     static const uint8_t zero[4] = {0};
     const int n = type == VK_IMAGE_VIEW_TYPE_CUBE ? 6 : type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ? 2 : 4;
     unsigned matched = 0;
@@ -154,6 +163,63 @@ static void check_sample(const char *dir, const char *label, int id, int want, c
               expected[0], expected[1], expected[2], expected[3], pixel[0], pixel[1], pixel[2], pixel[3]);
     }
     printf("%s pixels=%u/%d\n", label, matched, n);
+}
+
+// Read back the fragment output in the source format so exposure above 1 is
+// preserved. Each CPU store uses the write-preparation hook from nvn_dirty.
+static void sample_mixed_pool(const char *dir) {
+    const size_t page = (size_t)getpagesize(), size = 3 * page;
+    uint8_t *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mem != MAP_FAILED, "mixed pool mmap");
+    if (mem == MAP_FAILED) return;
+    pool_t pool = {.mem = mem, .size = size, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    nvn_dirty_add_range(mem, size);
+    nvn_be_pool_gpu_written(&pool);
+    tex_t rt = {.serial = 100, .pool = &pool, .mem = mem,
+                .d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
+                      .width = 1, .height = 1, .depth = 1, .levels = 1}};
+    nvn_tex_layout(&rt.d, &rt.L);
+    active = begin_cmd();
+    nvn_gpu_pass_desc pass = {.ncolor = 1, .w = 1, .h = 1, .layers = 1};
+    pass.color[0].view = rp_view_for_attach(&rt, NULL, active);
+    pass.color[0].load = NVN_GPU_LOAD_CLEAR; pass.color[0].store = NVN_GPU_STORE_STORE;
+    pass.color[0].clear.f[3] = 1;
+    CHECK(pass.color[0].view != NULL, "mixed pool color target");
+    if (pass.color[0].view) {
+        nvn_gpu_pass_begin(active, &pass);
+        nvn_gpu_pass_end(active);
+        rp_tex_mark_gpu_written(&rt);
+    }
+    finish(active);
+    const float exposure[][2] = {{1.175f, 0.880f}, {0.625f, 1.25f}};
+    const uint8_t color[][4] = {{51, 102, 153, 255}, {16, 32, 64, 128}};
+    for (int kind = 0; kind < 2; ++kind) {
+        tex_t src = rt;
+        src.serial = 101 + kind; src.off = page * (kind + 1); src.mem = mem + src.off;
+        src.d.format = kind == 0 ? NVN_FORMAT_RG32F : NVN_FORMAT_RGBA8;
+        src.d.flags = NVN_TEXTURE_FLAGS_LINEAR; src.d.stride = 32;
+        nvn_tex_layout(&src.d, &src.L);
+        const size_t bytes = kind == 0 ? sizeof exposure[0] : sizeof color[0];
+        for (int phase = 0; phase < 2; ++phase) {
+            const void *want = kind == 0 ? (const void *)exposure[phase] : (const void *)color[phase];
+            CHECK(prepare_write != NULL, "mixed pool write preparation registered");
+            if (!prepare_write) break;
+            prepare_write(src.mem, bytes);
+            memcpy(src.mem, want, bytes);
+            active = begin_cmd();
+            nvn_gpu_view view = rp_view_for(&src, NULL, active);
+            CHECK(view != NULL, "mixed pool sample view");
+            if (!view) { finish(active); break; }
+            uint8_t pixels[64 * 64 * 8];
+            sample(dir, "tri.frag", view, src.d.format, pixels);
+            unsigned matched = 0;
+            for (size_t i = 0; i < 64 * 64; ++i) matched += !memcmp(pixels + i * bytes, want, bytes);
+            CHECK(matched == 4096, "mixed pool format=%u phase=%d pixels=%u/4096", src.d.format, phase, matched);
+            printf("mixed pool format=%u phase=%d pixels=%u/4096\n", src.d.format, phase, matched);
+        }
+    }
+    rp_res_reset();
+    nvn_dirty_remove_range(mem); munmap(mem, size);
 }
 
 int main(int argc, char **argv) {
@@ -207,6 +273,7 @@ int main(int argc, char **argv) {
                  VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, 0, 6, 0);
     check_sample(argv[1], "five-layer 2D array control", 7, NVN_TEXTURE_TARGET_2D_ARRAY, "arr.frag",
                  VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 5, 1);
+    sample_mixed_pool(argv[1]);
     rp_res_reset();
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);

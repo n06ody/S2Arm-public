@@ -8,7 +8,7 @@ out="$repo/build/vk-replay-cube-view"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
-for shader in tri.vert cube.frag cubearr.frag arr.frag; do
+for shader in tri.vert tri.frag cube.frag cubearr.frag arr.frag; do
     "${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
 inc=(-I "$repo/build/c883-ndk")

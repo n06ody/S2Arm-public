@@ -705,6 +705,134 @@ static void t_res_bc_byte_equal(int enabled) {
     res_fresh();
 }
 
+// SetRenderTargets marks its whole pool at record time. The unrelated sampler
+// must still see ordinary CPU stores, both before its first use and later.
+static void t_linear_in_render_pool(void) {
+    pass_fresh();
+    tex_t rt = mk_tex(901, 0, NVN_FORMAT_RGBA8, 16, 16, 1, 0);
+    nvn_be_pool_gpu_written(rt.pool);
+    stream commands = {0};
+    put_set_rt(&commands, &rt, NULL);
+    p_clear_color *clear = put(&commands, OP_CLEAR_COLOR, sizeof *clear);
+    clear->index = 0; clear->mask = 15; clear->rgba[3] = 1;
+    end(&commands);
+    nvn_be_sub_begin(); nvn_be_exec(commands.b); nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_npd == 1 && nvn_be_tex_gpu_owned(rt.serial));
+
+    const float exposure[2][2] = {{1.175f, 0.880f}, {0.625f, 1.25f}};
+    const uint8_t color[2][4] = {{51, 102, 153, 255}, {16, 32, 64, 128}};
+    for (int kind = 0; kind < 2; ++kind) {
+        int fmt = kind == 0 ? NVN_FORMAT_RG32F : NVN_FORMAT_RGBA8;
+        tex_t sample = mk_tex(902 + kind, 0x4000 + kind * 0x1000, fmt, 1, 1, 1, NVN_TEXTURE_FLAGS_LINEAR);
+        sample.d.stride = 32;
+        nvn_tex_layout(&sample.d, &sample.L);
+        size_t bytes = kind == 0 ? sizeof exposure[0] : sizeof color[0];
+        int first_upload = g_nup;
+        for (int phase = 0; phase < 2; ++phase) {
+            const void *expected = kind == 0 ? (const void *)exposure[phase] : (const void *)color[phase];
+            memcpy(sample.mem, expected, bytes);
+            g_dirty_written = ++g_dirty_now;
+            nvn_be_sub_begin();
+            CHECK(rp_tex_resolve(&sample, &g_fake_cmd) != NULL);
+            nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+            CHECK(g_nup == first_upload + phase + 1);
+            if (g_nup <= first_upload) continue;
+            const uint8_t *actual = g_up[g_nup - 1].first;
+            if (kind == 0) {
+                float pixel[2]; memcpy(pixel, actual, sizeof pixel);
+                printf("mixed pool RG32F phase=%d expected=(%.3f,%.3f) actual=(%.3f,%.3f)\n",
+                       phase, exposure[phase][0], exposure[phase][1], pixel[0], pixel[1]);
+            } else {
+                printf("mixed pool RGBA8 phase=%d actual=(%u,%u,%u,%u)\n",
+                       phase, actual[0], actual[1], actual[2], actual[3]);
+            }
+            CHECK(g_up[g_nup - 1].img == bytes && !memcmp(actual, expected, bytes));
+        }
+        // A GPU write takes ownership. Even a second texture object over this
+        // storage must retain its GPU version after the guest page changes.
+        nvn_be_sub_begin();
+        nvn_gpu_tex original = rp_tex_resolve(&sample, &g_fake_cmd);
+        rp_tex_mark_gpu_written(&sample);
+        tex_t alias = sample;
+        alias.serial += 100;
+        memset(sample.mem, 0xc3, bytes);
+        g_dirty_written = ++g_dirty_now;
+        int before = g_nup;
+        CHECK(rp_tex_resolve(&alias, &g_fake_cmd) == original);
+        CHECK(rp_tex_resolve(&sample, &g_fake_cmd) == original);
+        CHECK(nvn_be_tex_gpu_owned(alias.serial) && g_nup == before);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_tex_release(&alias);
+        nvn_be_tex_release(&sample);
+    }
+    // Only eligible CPU-visible linear data enters dirty tracking. The regular
+    // render target may take a one-time initial snapshot under its own rules.
+    static const struct { int format, flags, pool_flags; } excluded[] = {
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET, 0},
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET, 0},
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_DISPLAY, 0},
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_VIDEO_DECODE, 0},
+        {NVN_FORMAT_DEPTH32F, NVN_TEXTURE_FLAGS_LINEAR, 0},
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS},
+        {NVN_FORMAT_RGBA8, NVN_TEXTURE_FLAGS_LINEAR, NVN_MEMORY_POOL_FLAGS_VIRTUAL},
+        {NVN_FORMAT_RGBA8, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof excluded / sizeof excluded[0]; ++i) {
+        pool_t pool = g_tp;
+        if (excluded[i].pool_flags) pool.flags = NVN_MEMORY_POOL_FLAGS_GPU_CACHED | excluded[i].pool_flags;
+        nvn_be_pool_gpu_written(&pool);
+        tex_t t = mk_tex(1000 + i, 0x8000 + i * 0x1000, excluded[i].format, 1, 1, 1, excluded[i].flags);
+        t.pool = &pool;
+        memset(t.mem, 0x35, t.L.size);
+        g_nup = 0;
+        nvn_be_sub_begin();
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+        CHECK(!(g_last_usage & NVN_GPU_TEX_CPU_UPLOAD));
+        if (excluded[i].flags && g_nup) CHECK(g_up[0].first[0] == 0);
+        int before = g_nup;
+        memset(t.mem, 0xb4, t.L.size); g_dirty_written = ++g_dirty_now;
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL && g_nup == before);
+        nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+        nvn_be_tex_release(&t);
+        nvn_be_alias_drop_pool(&pool);
+    }
+    // Separate serial and description, with only a partial byte overlap.
+    tex_t overlap = mk_tex(1100, 32, NVN_FORMAT_RG32F, 1, 1, 1, NVN_TEXTURE_FLAGS_LINEAR);
+    memset(overlap.mem, 0x7e, overlap.L.size);
+    g_nup = 0;
+    nvn_be_sub_begin();
+    CHECK(rp_tex_resolve(&overlap, &g_fake_cmd) != NULL);
+    CHECK(!(g_last_usage & NVN_GPU_TEX_CPU_UPLOAD) && g_nup == 1 && g_up[0].first[0] == 0);
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&overlap);
+    // A buffer write to the linear image's own bytes is still in flight.
+    // The mirror is authoritative until retirement makes those bytes visible.
+    nvn_be_pool_add(g_tmem, sizeof g_tmem);
+    tex_t pending = mk_tex(1101, 0x18000, NVN_FORMAT_RG32F, 1, 1, 1, NVN_TEXTURE_FLAGS_LINEAR);
+    nvn_be_sub_begin();
+    int saved_auto = g_buf_cpu_auto;
+    g_buf_cpu_auto = 1;
+    nvn_gpu_buf mirror = NULL;
+    uint64_t off = 0, key = 0, addr = (uintptr_t)pending.mem;
+    CHECK(rp_buf_resolve(&g_fake_cmd, addr, 8, &mirror, &off) && mirror && mirror->cpu);
+    uint64_t id = rp_buf_gpu_write_note(addr, 8, &key);
+    CHECK(id != 0);
+    int uploads = g_nup;
+    CHECK(rp_tex_resolve(&pending, &g_fake_cmd) == NULL && g_nup == uploads);
+    CHECK(nvn_unimpl_count("tex", "linear_pending_pool_write") == 1);
+    if (mirror && mirror->cpu) memcpy(mirror->cpu + off, exposure[1], 8);
+    if (id) rp_buf_gpu_write_land(key, id, 1);
+    CHECK(rp_tex_resolve(&pending, &g_fake_cmd) != NULL && g_nup == uploads + 1 &&
+          !memcmp(g_up[uploads].first, exposure[1], 8));
+    nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&pending);
+    nvn_be_pool_del(g_tmem);
+    g_buf_cpu_auto = saved_auto;
+    nvn_be_tex_release(&rt);
+    pass_fresh();
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--bc-byte-equal") || !strcmp(argv[1], "--bc-byte-equal-negative"))) {
         t_res_bc_byte_equal(!strcmp(argv[1], "--bc-byte-equal"));
@@ -718,6 +846,7 @@ int main(int argc, char **argv) {
         printf("BC1 view rebind: %d checks, %d failures\n", g_checks, g_fail);
         return g_fail ? 1 : 0;
     }
+    t_linear_in_render_pool();
     t_res_tex_epoch();
     t_res_bc_byte_equal(1);
     t_res_tex_epoch_unrelated();
