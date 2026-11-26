@@ -212,6 +212,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     if (!rc_is(c->sticky, NVN_GPU_OK)) { if (fresh) nvn_gpu_tex_release(t); return 0; }
+    const int measure_copy = gpu_pt_begin(c, GPU_PT_FB_COPY);
     for (uint32_t lv = v->base_level; lv < v->base_level + v->levels; lv++) {
         // 3D 图像的 arrayLayer 必须为 0；范围位于 z，保留整级的全部切片。
         const int image3d = s->target == NVN_TEXTURE_TARGET_3D;
@@ -227,6 +228,7 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
             if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[1], 1, __ATOMIC_RELAXED);
         }
     }
+    if (measure_copy) gpu_pt_end(c);
     image_barrier(c, s, VK_IMAGE_LAYOUT_GENERAL);
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
     if (fresh) nvn_gpu_tex_release(t); // cmd 引用保活到 fence；raw view 在 finish_cmd 中先释放
@@ -248,11 +250,16 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     }
     if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
     if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
+    if (copy) {
+        struct gpu_pt_key *key = gpu_pt_current_pass(c);
+        if (key) key->flags |= GPU_PT_FB_END;
+    }
     nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始（活动的遮挡查询在这里结束）
     if (cont_ok) occl_spare_reset(c, &cont);   // 通道外：新要的续段块整块重置（重置只能在通道外）
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (!feedback_make(c, f)) return 0;
     c->feedback_read_mask = read_mask;
+    if (copy && c->gpu_pt) c->gpu_pt->next_pass_flags = GPU_PT_FB_BEGIN;
     nvn_gpu_pass_begin(c, &d);
     if (cont_ok && rc_is(c->sticky, NVN_GPU_OK)) occl_spare_begin(c, occ, &cont);   // 新通道里接着数
     return rc_is(c->sticky, NVN_GPU_OK);

@@ -44,6 +44,25 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
 void rp_op_copy_t2t(nvn_gpu_cmd c, const p_copy_t2t *o, const void *rec);
 void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec);
+int rp_pass_prepare_tex_clear(nvn_gpu_cmd c, const tex_t *t, int can_park);   // 返回本会话是否记折叠诊断。
+extern int rp_tex_clear_active;
+// 每条通过原清除校验的指令只记一个终局：未入表、折叠或在某个边界兑现。
+// 清除可能跨统计窗等到终局，按终局所属窗口计数。
+// 保留旧日志的 view_policy 列。源视图的采样元数据不再作为拒绝理由。
+enum rp_tex_fold_result {
+    RP_TF_HIT, RP_TF_DISABLED, RP_TF_SHAPE, RP_TF_STORAGE, RP_TF_VIEW_POLICY,
+    RP_TF_FORMAT_VALUE, RP_TF_VIEW_FAILED, RP_TF_PARK_ORDER, RP_TF_PARK_REF,
+    RP_TF_FALL_ALIAS, RP_TF_FALL_FULL, RP_TF_FALL_CLEAR, RP_TF_FALL_READ,
+    RP_TF_FALL_BUFFER, RP_TF_FALL_TRANSFER, RP_TF_FALL_BARRIER, RP_TF_FALL_BOUNDARY,
+    RP_TF_FALL_END, RP_TF_FALL_AREA, RP_TF_FALL_PASS, RP_TF_FALL_TARGET, RP_TF_N
+};
+int rp_tex_fold_stats_take(uint64_t counts[RP_TF_N]);
+void rp_tex_fold_count(enum rp_tex_fold_result result);
+enum rp_tex_fold_result rp_pass_park_tex_clear(nvn_gpu_cmd c, const tex_t *t, const view_t *v, nvn_gpu_view gpu,
+                                               const nvn_gpu_clear *value, int is_int);
+void rp_pass_land_tex_clear(nvn_gpu_cmd c, enum rp_tex_fold_result reason);
+void rp_pass_tex_clear_before_tex(nvn_gpu_cmd c, const tex_t *t);
+void rp_pass_tex_clear_before_buf(nvn_gpu_cmd c, uint64_t addr, uint64_t len);
 void rp_op_draw_tex(nvn_gpu_cmd c, const p_draw_tex *o, const void *rec);   // OP_DRAW_TEX（rp_draw_tex.c，#1452）：后端有 NVN_GPU_CAP_DRAW_TEX 才画，否则记未接
 
 // 会话四件套（前端按名字调，上沿头文件里没有声明）

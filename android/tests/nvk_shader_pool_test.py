@@ -61,6 +61,48 @@ def main():
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
+    if sys.argv[1:] in (['--cs-used-slots'], ['--cs-used-slots-mutants']):
+        shader = ROOT/'android/tests/vk/shaders/libpack_sbuf.comp'
+        binary = out/'cs-used-slots.spv'
+        compiler = shutil.which('glslc')
+        cmd = [compiler, '--target-env=vulkan1.1'] if compiler else ['glslangValidator', '-V', '--target-env', 'vulkan1.1']
+        subprocess.run([*cmd, str(shader), '-o', str(binary)], check=True)
+        if sys.argv[1:] == ['--cs-used-slots-mutants']:
+            code = original.read_text()
+            cases = (
+                ('old-gate', '    if (!g_cs_used_slots_on) return CS_SSBO_UNALIGNED;',
+                 '    if (g_cs_used_slots_on >= 0) return CS_SSBO_UNALIGNED;', 'on',
+                 'CS unused unaligned slot admits the single-slot library'),
+                ('ignores-used-slot', 'return (used & unaligned) ? CS_SSBO_USED_UNALIGNED : CS_SSBO_UNUSED_UNALIGNED;',
+                 'return (used & unaligned) ? CS_SSBO_UNUSED_UNALIGNED : CS_SSBO_UNUSED_UNALIGNED;', 'on',
+                 'CS reflected unaligned slot bypasses the prior fast hit'),
+                ('admits-unknown', '!= SBU_KNOWN) return CS_SSBO_REFLECTION_UNKNOWN;',
+                 '!= SBU_KNOWN) return CS_SSBO_UNUSED_UNALIGNED;', 'on',
+                 'CS missing reflection falls back to the full unaligned gate'),
+                ('default-on', 'nvn_plat_flag("nvk_cs_used_slots", 0)',
+                 'nvn_plat_flag("nvk_cs_used_slots", 1)', 'default',
+                 'CS used slots default performs no library probe or admission'),
+                ('aliases-fast-path', 'MIX(unaligned | (narrowed << 1));',
+                 'MIX(unaligned | (narrowed & 0));', 'on',
+                 'CS reflected unaligned slot bypasses the prior fast hit'),
+            )
+            for name, old, new, mode, expected in cases:
+                assert code.count(old) == 1, (name, 'mutation anchor')
+                mutant = out/f'cs-used-slots-{name}.c'
+                mutant.write_text(code.replace(old, new))
+                probe = run(f'cs-used-slots-{name}', mutant,
+                            args=('--cs-used-slots', str(binary), mode))
+                assert probe.returncode == 1 and expected in probe.stderr, (name, probe.stdout, probe.stderr)
+                print(f'{name}: expected assertion failure: {expected}', flush=True)
+            return 0
+        result = 0
+        for mode in ('on', 'default'):
+            probe = run('cs-used-slots', original, args=('--cs-used-slots', str(binary), mode))
+            sys.stdout.write(probe.stdout)
+            sys.stderr.write(probe.stderr)
+            result |= probe.returncode
+        return result
+
     if sys.argv[1:] == ['--lp-output']:
         shader = ROOT/'android/tests/vk/shaders/libpack_mrt_outputs.frag'
         compiler = shutil.which('glslc')
@@ -736,7 +778,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --cs-used-slots | --cs-used-slots-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'

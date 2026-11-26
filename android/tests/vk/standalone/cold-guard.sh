@@ -53,8 +53,13 @@ for dq in 0 1; do
             exit 1
         fi
         grep '^cold-guard ' "$log"
+        python3 "$repo/android/tests/vk/check_gpu_pass_time.py" "$log" "cold-$enabled"
     done
 done
+
+cc -std=c11 -O2 -Wall -Wextra -Werror -I "$repo/android/native/nvn" \
+    "$repo/android/tests/vk/t_cold_ledger.c" -o "$out/ledger"
+"$out/ledger"
 
 # The shared replay must form this exact plan before opening a physical pass,
 # then bind the identical SSBO and driver slice via the normal draw path.

@@ -88,6 +88,8 @@ int rp_pass_draws(void) { return 0; }
 int rp_pass_split_ok(void) { return 0; }
 void rp_pass_end(nvn_gpu_cmd c) { (void)c; }
 void rp_pass_flush(nvn_gpu_cmd c) { (void)c; }
+int rp_tex_clear_active;   // 本隔离夹具没有待清除的附件
+void rp_pass_land_tex_clear(nvn_gpu_cmd c, enum rp_tex_fold_result reason) { (void)c; (void)reason; abort(); }
 void rp_pass_barrier(uint32_t bits) { (void)bits; }
 void rp_pass_clear_color(nvn_gpu_cmd c, const p_clear_color *cc, const void *rec) { (void)c; (void)cc; (void)rec; }
 void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec) { (void)c; (void)cd; (void)rec; }
@@ -118,6 +120,7 @@ void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t cou
 void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {
     (void)pool_key; (void)id; (void)ok; (void)staged; CHECK(0);
 }
+void rp_tex_async_step(nvn_gpu_cmd c) { (void)c; }
 void rp_buf_frame_flip(void) {}
 void rp_buf_hold_begin(void) {}   // 本测试只测计时：回放窗口（池销毁的镜像缓冲延后放）在 t_nvn_replay / 隔离夹具里测
 void rp_buf_hold_end(void) {}
