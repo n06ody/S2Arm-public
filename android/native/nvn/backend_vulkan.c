@@ -57,10 +57,11 @@
 #include "vk_device.h"
 #include "spirv_storage.h"   // 顶点阶段的存储写检查（与直连接纳同一份，按 Vulkan 规范的 NonWritable 判）
 #include "spirv_workgroup.h" // 最终 SPIR-V 的实际计算工作组尺寸（含 WorkgroupSize 的优先级）
+#include "spirv_write_bound.h"
 #include "spirv_compliance.h"   // #1865 统一装载闸：能力 / 扩展 / 存储类字节声明扫描
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 24, "核对 Vulkan 后端与新版 NVN GPU 契约");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 25, "核对 Vulkan 后端与新版 NVN GPU 契约");
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -184,6 +185,7 @@ struct nvn_gpu_shader_s {
     const char *missing_vertex_feature;   // #1072：顶点阶段写存储 / 写裁剪、剔除距离要的特性设备没启用（特性名）；NULL = 不缺
     nvn_gpu_stage stage;
     uint8_t precompiled;
+    struct s2a_write_bound *write_bounds;  // immutable, indexed by the shader layout entry
     uint8_t stage_key[8], spirv_digest[32];  // 库阶段键与实际交给 Vulkan 的模块摘要
     uint8_t src_key[8];          // 装载时调用方给的阶段键（现编 / 出库都有，只作日志；stage_key 只在出库件上填）
     nvn_gpu_layout_ent *ents;
@@ -2741,6 +2743,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         if (sh->mod) vkDestroyShaderModule(g.d, sh->mod, NULL);
         free(sh->ents);
         free(sh->tfmt);
+        free(sh->write_bounds);
         free(sh);
         sh = sn;
     }
@@ -3705,6 +3708,7 @@ static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s
     if (sh->mod) vkDestroyShaderModule(vk->d, sh->mod, NULL);
     free(sh->ents);
     free(sh->tfmt);
+    free(sh->write_bounds);
     free(sh);
 }
 
@@ -4026,6 +4030,8 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
             s2a_sha256_final(&hash, sh->spirv_digest);
         }
+        if (module_result == VK_SUCCESS && sh->stage == NVN_GPU_SH_CS && nvn_plat_flag("nvk_land_bound", 0))
+            sh->write_bounds = s2a_spirv_write_bounds(ci.pCode, ci.codeSize, sh->entry, sh->ents, sh->nent);
         free(array_code);
         if (module_result != VK_SUCCESS) {
             free(sh->tfmt); free(sh->ents); free(sh);
@@ -4047,6 +4053,13 @@ int nvn_vk_cold_shader_digest(nvn_gpu_shader shader, uint8_t sha[32]) {
     if (!g.cold_enabled || !shader || shader->stage != NVN_GPU_SH_FS || !shader->mod) return 0;
     memcpy(sha, shader->spirv_digest, 32);
     return 1;
+}
+
+uint64_t nvn_gpu_shader_write_end(nvn_gpu_shader sh, unsigned index, unsigned set, unsigned binding, uint32_t groups_x) {
+    if (!sh || !sh->write_bounds || index >= sh->nent || !groups_x ||
+        sh->ents[index].set != set || sh->ents[index].binding != binding) return 0;
+    struct s2a_write_bound b = sh->write_bounds[index];
+    return (uint64_t)(groups_x - 1) * b.group_stride + b.end_first_group;
 }
 
 void nvn_gpu_shader_release(nvn_gpu_shader sh) {
@@ -9461,6 +9474,7 @@ void nvn_gpu_vk_test_close_pipe_only(void) {
         if (sh->mod) vkDestroyShaderModule(g.d, sh->mod, NULL);
         free(sh->ents);
         free(sh->tfmt);
+        free(sh->write_bounds);
         free(sh);
         sh = sn;
     }

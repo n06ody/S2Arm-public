@@ -37,7 +37,7 @@ elif result.returncode:
 elif sys.argv[1:] == ['--withdraw']:
     code = draw.read_text()
     changes = [
-        ('resolve', 'if (!rp_buf_resolve(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off)) return skip("tbuf_buffer_unresolved", rec);',
+        ('resolve', 'if (!rp_buf_resolve_binding(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off, RP_BUF_TEXEL)) return skip("tbuf_buffer_unresolved", rec);',
          'return skip("tbuf_buffer_unresolved", rec);', 'g_gdraws == 2 && g_tbuf_binds[NVN_GPU_SH_FS] == 2'),
         ('format', 'uint32_t fmt = hv && v.set_format ? v.format : (uint32_t)t.d.format;',
          'uint32_t fmt = NVN_FORMAT_RGBA8UI;', 'g_tbuf_bound[NVN_GPU_SH_FS].format == NVN_FORMAT_R32UI'),

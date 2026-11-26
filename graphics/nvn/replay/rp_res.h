@@ -11,6 +11,7 @@ nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
 // 拷贝端点必须保留源格式语义，调用方已结束通道。
 nvn_gpu_tex rp_tex_resolve_plain(const tex_t *t, nvn_gpu_cmd c);
 void rp_res_xfer_aborted(uint64_t sub);
+void rp_res_byte_upload_failed(void);
 // 宿主整段读贴图存储的入口：整段在它的内存池里 → t->mem；伸出池子（真机：存储偏移 -1）→ 副本，池内照拷、池外按 0，*part 交调用方 free。
 //   NULL = 副本分配失败。线程：任意（不取锁）。
 const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);

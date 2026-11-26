@@ -147,9 +147,14 @@ int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c：CALL 目标
 
 // 缓冲 512：最长的中文前缀约 150 字节 + 原因串最多 191 字节；256 时 gcc -O2 -Werror=format-truncation 在 Linux 容器编译红
 static void red(const char *fmt, const char *why) { char b[512]; snprintf(b, sizeof b, fmt, why); nvn_plat_log(NVN_PLAT_LOG_RED, "replay", b); }
+// 弱链接[replay]：rp_res_byte_upload_failed
+#pragma weak rp_res_byte_upload_failed
 static void pre_done(void *user, const nvn_gpu_done *d) {
     struct pre_note *p = user;
-    if (d->status == NVN_GPU_DONE_FAILED) red("前置段失败：%s", d->why ? d->why : "?");
+    if (d->status == NVN_GPU_DONE_FAILED) {
+        if (rp_res_byte_upload_failed) rp_res_byte_upload_failed();
+        red("前置段失败：%s", d->why ? d->why : "?");
+    }
     else if (p) busy_done(p->t_commit, now_ns());
     free(p);
 }
@@ -216,6 +221,7 @@ static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
 
 static void sub_release(struct sub *s);
 static void sub_done(void *user, const nvn_gpu_done *d) {
+    if (d->status == NVN_GPU_DONE_FAILED && rp_res_byte_upload_failed) rp_res_byte_upload_failed();
     struct sub *s = user;
     if (!s) return;
     nvn_gpu_done failure;
@@ -408,7 +414,10 @@ struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counte
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
     struct mid *m = user;
     if (m) ts_capture(m->ts, d);
-    if (d->status == NVN_GPU_DONE_FAILED) red("中途交的段失败：%s", d->why ? d->why : "?");
+    if (d->status == NVN_GPU_DONE_FAILED) {
+        if (rp_res_byte_upload_failed) rp_res_byte_upload_failed();
+        red("中途交的段失败：%s", d->why ? d->why : "?");
+    }
     else { if (m) busy_done(m->t_commit, now_ns());
         if (m && m->s->oc && d->occlusion) { for (uint32_t i = 0; i < d->nocclusion && m->base + i < 2048; i++) m->s->oc[m->base + i] = d->occlusion[i];
             uint32_t end = m->base + d->nocclusion < 2048 ? m->base + d->nocclusion : 2048; if (end > m->s->noc) m->s->noc = end; } }
@@ -655,7 +664,7 @@ static void post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
 // 仅登记真正写到的行，不把行间 / 片间填充覆盖回游戏内存。
 // 数据相关重叠（nvk_sync_lag=4）：这一栅栏之后是否有「显卡会写游戏缓冲」的活。有 → 真等（游戏接下来要读它）；
 // 没有（只画不写）→ 放行，让 CPU 回放与显卡执行重叠。计算派发写存储缓冲 / 存储图像时走 rp_post_gpu_write* 登记，这里就是信号源。
-int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+static int post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t copy_bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
     __atomic_store_n(&g_wrote_since_wait, 1, __ATOMIC_RELEASE);
     struct sub *s = g_sub; uint64_t count = (uint64_t)rows * images;
     if (!s || !bytes || !count || count > (uint64_t)(INT_MAX - s->ngw)) return 0;
@@ -672,7 +681,7 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
     // 只有单笔（存储缓冲写）才允许并进本次提交里已有的登记：多行的失败回滚只能撤掉「这一次新记的」，已有那条被扩大后缩不回去
     // （扩出去的字节从没被显卡写过，落地会拿镜像里可能偏旧的内容盖掉游戏内存）。
     for (uint32_t z = 0; z < images; z++) for (uint32_t y = 0; y < rows; y++) {
-        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note2(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, &key, count == 1 ? &merged : NULL);
+        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note_prefix(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, copy_bytes, &key, count == 1 ? &merged : NULL);
         if (!id) {
             while (s->ngw > start) { struct gw_ev v = s->gw[--s->ngw]; rp_buf_gpu_write_land(v.pool_key, v.id, 0); }
             return 0;
@@ -681,6 +690,12 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t
         s->gw[s->ngw++] = (struct gw_ev){.pool_key = key, .id = id};
     }
     return 1;
+}
+int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+    return post_gpu_write_rows(addr, bytes, bytes, row, image, rows, images);
+}
+int rp_post_gpu_write_prefix(uint64_t addr, uint64_t len, uint64_t copy_len) {
+    return post_gpu_write_rows(addr, len, copy_len, len, len, 1, 1);
 }
 int rp_post_gpu_write(uint64_t addr, uint64_t len) { return rp_post_gpu_write_rows(addr, len, len, len, 1, 1); }
 

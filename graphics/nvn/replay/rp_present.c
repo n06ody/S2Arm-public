@@ -279,7 +279,9 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
             { const uint64_t cpu = tc_thread_cpu_ns(); if (cpu) rp_present_tc_note(now, cpu); }
             fseg_frame(&g_fseg, now, atomic_load_explicit(&g_tgt_itv, memory_order_relaxed), atomic_load_explicit(&g_tgt_set_ns, memory_order_relaxed));
             if (now - t_last >= 5000000000ull) {
-                uint64_t pf[RP_PERF_N], nd = 0, nsk = 0; rp_perf_take(pf); rp_draw_stats(&nd, &nsk);
+                uint64_t pf[RP_PERF_N], nd = 0, nsk = 0;
+                rp_buf_mirror_fallback_report(pf, rp_perf_take, now);
+                rp_draw_stats(&nd, &nsk);
                 { char pb[1024]; if (rp_pipe_fail_summary(pb, sizeof pb)) nvn_plat_log(NVN_PLAT_LOG_INFO, "present", pb); }   // 图形管线失败分类：有新失败 / 新挡下的窗口才打
                 uint64_t fr = g_n_shown + 1 - n_last; double sec = (double)(now - t_last) / 1e9, f = fr ? (double)fr : 1.0;
                 const double fs = pf[RP_PERF_TM_FRAMES] ? (double)pf[RP_PERF_TM_FRAMES] : 1.0;   // 逐步计时那几项只在采样帧里计：按计时过的帧数求每帧值（#1103）
@@ -379,6 +381,12 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                              (unsigned long long)pf[RP_PERF_MIRROR_HOIST], (unsigned long long)pf[RP_PERF_MIRROR_OVERLAP],
                              (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK]);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                }
+                if (pf[RP_PERF_TEX_BYTE_EQUAL] || pf[RP_PERF_TEX_BYTE_CHANGED] || nvn_plat_flag("nvk_tex_byte_equal", 0)) {
+                    snprintf(b, sizeof b, "窗口合计 byte_equal_skipped=%llu byte_changed=%llu skipped_bytes=%llu",
+                             (unsigned long long)pf[RP_PERF_TEX_BYTE_EQUAL], (unsigned long long)pf[RP_PERF_TEX_BYTE_CHANGED],
+                             (unsigned long long)pf[RP_PERF_TEX_BYTE_SKIPPED]);
+                    nvn_plat_log(NVN_PLAT_LOG_INFO, "tex-byte-equal", b);
                 }
                 snprintf(b, sizeof b, "分时（回写，每帧）：Finish 没等的提交 %.1f 次；做完要写回的提交 %.1f 次；事件 %.1f、计数器报告 %.1f（类型位图 %#llx）、遮挡事件 %.1f、显卡写缓冲 %.1f；这一窗口新建贴图的宽高 %d 种；本可放行、因回写改成真等的同步：所等区间带时间戳 %.1f、带事件或别的计数器或遮挡 %.1f、带显卡写缓冲 %.1f、只有之后的提交带回写 %.1f", (double)pf[RP_PERF_FIN_SKIP] / f, (double)pf[RP_PERF_FX_SUBS] / f, (double)pf[RP_PERF_FX_EVENT] / f, (double)pf[RP_PERF_FX_REPORT] / f, (unsigned long long)rp_fx_report_types(), (double)pf[RP_PERF_FX_OCC] / f, (double)pf[RP_PERF_FX_GW] / f, rp_res_new_sizes_take(), (double)pf[RP_PERF_WAIT_EFX_TS] / f, (double)pf[RP_PERF_WAIT_EFX_FX] / f, (double)pf[RP_PERF_WAIT_EFX_GW] / f, (double)pf[RP_PERF_WAIT_EFX_LATER] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);

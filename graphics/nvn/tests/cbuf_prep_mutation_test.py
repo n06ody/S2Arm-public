@@ -17,7 +17,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 CC = os.environ.get('CC', 'cc')
 DRAW = 'graphics/nvn/replay/rp_draw.c'
 
-PREP = 'if (rp_buf_resolve(c, ub->addr, len, &mb, &mo)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }'
+PREP = 'if (rp_buf_resolve_binding(c, ub->addr, len, &mb, &mo, RP_BUF_UNIFORM)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }'
 GUARD = 'else if (st >= RP_PROG_STAGES) {                                   // 计算：本来就在通道外，现场解析安全'
 HOLD = '''                    if (!ub->addr || !ub->size) continue;
                     const nvn_gpu_caps *cp = caps_cached();
@@ -25,10 +25,10 @@ HOLD = '''                    if (!ub->addr || !ub->size) continue;
                     if (!rp_buf_gpu_pending(ub->addr, ub->size)) continue;   // 没有 GPU 待写回：照旧暂存，不需要镜像'''
 
 mutations = [
-    ('撤掉准备阶段的预解析（回到修前：发绑定时才发现待写回）', [(PREP, 'if (0 && rp_buf_resolve(c, ub->addr, len, &mb, &mo)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }')],
+    ('撤掉准备阶段的预解析（回到修前：发绑定时才发现待写回）', [(PREP, 'if (0 && rp_buf_resolve_binding(c, ub->addr, len, &mb, &mo, RP_BUF_UNIFORM)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }')],
      'uniform_gpu_pending_unprepared") == 0'),   # 撤掉预解析后：主场景这一笔走「不解析 + 记账」兜底
     ('准备阶段解析不出来时又允许在通道内现场解析（去掉「只许计算阶段」的限定）',
-     [(PREP, 'if (0 && rp_buf_resolve(c, ub->addr, len, &mb, &mo)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }'),
+     [(PREP, 'if (0 && rp_buf_resolve_binding(c, ub->addr, len, &mb, &mo, RP_BUF_UNIFORM)) { g_ub_buf[st][i] = mb; g_ub_off[st][i] = mo; g_ub_ok[st][i] = 1; }'),
       (GUARD, 'else if (1) {')],
      'uniform_gpu_pending_unprepared") == 1'),   # 去掉限定后：兜底场景会在通道内解析，记账没了
 ]

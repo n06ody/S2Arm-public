@@ -476,7 +476,7 @@ import pathlib, sys
 mode, source, target = sys.argv[1:]
 s = pathlib.Path(source).read_text()
 changes = {
-    '--tbuf-neg-resolve': ('if (!rp_buf_resolve(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off)) return skip("tbuf_buffer_unresolved", rec);', 'return skip("tbuf_buffer_unresolved", rec);'),
+    '--tbuf-neg-resolve': ('if (!rp_buf_resolve_binding(c, (uint64_t)(uintptr_t)t.mem, bytes, &buf, &off, RP_BUF_TEXEL)) return skip("tbuf_buffer_unresolved", rec);', 'return skip("tbuf_buffer_unresolved", rec);'),
     '--tbuf-neg-format': ('uint32_t fmt = hv && v.set_format ? v.format : (uint32_t)t.d.format;', 'uint32_t fmt = NVN_FORMAT_RGBA8UI;'),
     '--tbuf-neg-elements': ('uint64_t bytes = (uint64_t)t.d.width * base.bytes;', 'uint64_t bytes = (uint64_t)t.d.width * base.bytes * 2;'),
 }
