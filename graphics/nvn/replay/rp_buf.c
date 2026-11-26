@@ -59,10 +59,11 @@ static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数�
 static int g_exact_on, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
 static uint64_t g_exact_mapping, g_exact_pool;
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
-static int g_land_noresync = -1;   // g_bmu 内按会话锁定
+static int g_land_noresync = -1, g_gw_batch;   // g_bmu 内按会话锁定
 static int land_noresync_on(void) {
     if (g_land_noresync < 0) {
         g_land_noresync = nvn_plat_flag("nvk_land_noresync", 1) != 0;
+        g_gw_batch = g_land_noresync && nvn_plat_flag("nvk_buf_gw_batch", 0) != 0;
         nvn_plat_log(NVN_PLAT_LOG_INFO, "buf", g_land_noresync ?
                      "在途整页免同步（debug.s2a.nvk_land_noresync）=1" :
                      "在途整页免同步（debug.s2a.nvk_land_noresync）=0");
@@ -70,6 +71,8 @@ static int land_noresync_on(void) {
     return g_land_noresync;
 }
 #ifdef S2A_GPU_LAND_TEST
+static uint64_t g_test_gw_page_probes;   // 测试量：原路径逐页覆盖查询次数
+uint64_t rp_test_gw_page_probes(void) { return g_test_gw_page_probes; }
 int rp_test_gw_live(void) { return __atomic_load_n(&g_gw_live, __ATOMIC_ACQUIRE); }
 void rp_test_gw_merge_reload(void) { __atomic_store_n(&g_gw_merge_on, -1, __ATOMIC_RELAXED); }   // 单测换开关值后让下一次登记立刻重读
 int rp_test_gw_get(uint64_t pool_key, int i, uint64_t *off, uint64_t *len) {   // 这个池登记表第 i 条的区间；返回表里的条数（池没有镜像 = -1）
@@ -125,11 +128,11 @@ static void stale_set(struct mirror *m, uint64_t p, uint64_t q) {   // [p, q]（
         m->stale_sum[w >> 6] |= 1ull << (w & 63);
     }
 }
-static void stale_clear(struct mirror *m, uint64_t k) {
-    const uint64_t w = k >> 6;
-    m->stale[w] &= ~(1ull << (k & 63));
+static void stale_clear_mask(struct mirror *m, uint64_t w, uint64_t mask) {
+    m->stale[w] &= ~mask;
     if (!m->stale[w]) m->stale_sum[w >> 6] &= ~(1ull << (w & 63));
 }
+static void stale_clear(struct mirror *m, uint64_t k) { stale_clear_mask(m, k >> 6, 1ull << (k & 63)); }
 struct log_fill { struct shadow *s; struct mirror *m; uint64_t n; };
 static void log_event(void *user, uintptr_t a, uintptr_t b) {   // 事件 [a, b)：宿主页对齐地址，裁到这个池
     struct log_fill *f = user; struct shadow *s = f->s; const size_t ps = nvn_dirty_page_size();
@@ -285,6 +288,9 @@ static int gw_covers(const struct shadow *s, int mi, uint64_t a, uint64_t b) {
     return 1;
 }
 static int gw_covers_page(const struct shadow *s, int mi, uint64_t k, size_t ps, uint64_t *bytes) {
+#ifdef S2A_GPU_LAND_TEST
+    g_test_gw_page_probes++;
+#endif
     const uintptr_t base = (uintptr_t)s->mem;
     const uintptr_t page = s->page0 + (uintptr_t)(k * ps);
     const uintptr_t a = page > base ? page : base;
@@ -585,6 +591,55 @@ static inline void sync_run(struct shadow *s, struct mirror *m, const uint8_t *m
     }
     if (skipped) rp_perf_add(RP_PERF_BUF_SYNC_GW_KB, skipped / 1024);
 }
+static int gw_range_cmp(const void *a, const void *b) {
+    const struct byte_range *x = a, *y = b;
+    return (x->lo > y->lo) - (x->lo < y->lo);
+}
+
+// 持 g_bmu。字节区间先求并集，再向内取整到宿主页。落地完成后照常由 land_restale 重新置位。
+static uint64_t gw_stale_clear(const struct shadow *s, struct mirror *m, uint64_t p, uint64_t q, size_t ps) {
+    struct byte_range stack[16];
+    const size_t count = (size_t)s->ngw;
+    if (count > SIZE_MAX / sizeof *stack) return 0;
+    struct byte_range *ranges = count <= sizeof stack / sizeof *stack ? stack : malloc(count * sizeof *ranges);
+    if (!ranges) return 0;
+
+    const int mi = (int)(m - s->m);
+    const uint64_t origin = (uintptr_t)s->mem - s->page0;
+    const uint64_t lo = p * ps, hi = (q + 1) * ps;
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        const struct gpu_write *write = &s->gw[i];
+        if (write->mi != mi) continue;
+        const uint64_t a = origin + write->off, b = a + write->len;
+        if (a < hi && b > lo) ranges[n++] = (struct byte_range){a > lo ? a : lo, b < hi ? b : hi};
+    }
+    if (n > 1) qsort(ranges, n, sizeof *ranges, gw_range_cmp);
+
+    uint64_t skipped = 0;
+    for (size_t i = 0; i < n;) {
+        const uint64_t start = ranges[i].lo;
+        uint64_t end = ranges[i++].hi;
+        while (i < n && ranges[i].lo <= end) {
+            if (ranges[i].hi > end) end = ranges[i].hi;
+            i++;
+        }
+        const uint64_t first = start / ps + (start % ps != 0), last = end / ps;
+        if (first >= last) continue;
+        for (uint64_t w = first >> 6; w <= (last - 1) >> 6; w++) {
+            uint64_t mask = ~0ull;
+            if (w == first >> 6) mask <<= first & 63;
+            if (w == (last - 1) >> 6) mask &= ~0ull >> (63 - ((last - 1) & 63));
+            const uint64_t bits = m->stale[w] & mask;
+            if (!bits) continue;
+            stale_clear_mask(m, w, bits);
+            skipped += (uint64_t)__builtin_popcountll(bits);
+        }
+    }
+    if (ranges != stack) free(ranges);
+    return skipped;
+}
+
 static int resolve_part_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m, int count_resolve);
 // 脏页追加日志这条路的解析（见 log_arm 一节）：不逐页比代号，只灌新事件、在旧页位图里求交。
 static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t size, struct shadow *s, struct mirror *m) {
@@ -597,6 +652,7 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
     const size_t ps = nvn_dirty_page_size();
     const uint64_t p = ((uintptr_t)addr - s->page0) / ps, q = ((uintptr_t)addr + len - 1 - s->page0) / ps;
     uint64_t words = 0, pages = 0;
+    int check_gw_batch = s->ngw != 0;
     for (uint64_t w = p >> 6; w <= q >> 6;) {   // 每次跳到下一个非零字：汇总字为 0 的整 4096 页一步跨过
         const uint64_t sw = w >> 6, sbits = m->stale_sum[sw] >> (w & 63);
         words++;
@@ -606,6 +662,15 @@ static int resolve_log(uint64_t addr, uint64_t len, const uint8_t *mem, uint64_t
         uint64_t bits = m->stale[w];
         if (w == p >> 6) bits &= ~0ull << (p & 63);
         if (w == q >> 6 && (q & 63) != 63) bits &= (1ull << ((q & 63) + 1)) - 1;
+        if (bits && check_gw_batch) {
+            check_gw_batch = 0;
+            if (land_noresync_on() && g_gw_batch && ps % 1024 == 0 && !nvn_dirty_tracking_unreliable()) {
+                const uint64_t skipped = gw_stale_clear(s, m, p, q, ps);
+                pages += skipped;
+                if (skipped) rp_perf_add(RP_PERF_BUF_SYNC_GW_KB, skipped * (ps / 1024));
+                bits &= m->stale[w];
+            }
+        }
         while (bits) {   // 字内连续的旧页成一串同步
             const uint64_t i = (w << 6) + (uint64_t)__builtin_ctzll(bits);
             uint64_t j = i; while (j + 1 <= q && j + 1 < ((w + 1) << 6) && (bits >> ((j + 1) & 63) & 1)) j++;
