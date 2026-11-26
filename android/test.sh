@@ -329,6 +329,8 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --gs-libpack-mu
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --lp-output
 # 计算程序出包预编库的非对齐闸负对照（#496085）：撤掉 state_ok 对 ckey 的生效，--cs-libpack 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-libpack-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-used-slots
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --cs-used-slots-mutants
 # 图形程序出包预编库的六条状态闸与读数（正例 --lp-gate 在上面无参那一步里单独起进程跑）：六条闸各撤一位、直方图两处累加 / 快照落位 / 并列顺序各改一处，--lp-gate 必红；
 #   存储缓冲「非对齐」只看程序真用到的槽（用到的槽集合 / 逐阶段 / 逐槽 / 说不准退回旧口径 / 开关 / 快路摘要 / 三个读数）各改坏一处，同样必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --lp-gate-mutants

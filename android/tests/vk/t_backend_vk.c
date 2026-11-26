@@ -75,7 +75,14 @@ static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = �
 static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 static int g_pool_rec_flag = -1;    // 整池组回收 nvk_pool_rec：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的回收用例用；改完调 nvn_gpu_vk_test_pool_memo_refresh）
 static int g_pool_memo_flag = -1;   // 整池数组组备忘 nvk_pool_memo：-1 = 后端缺省（开），>= 0 = 读成这个值（t_pool_table.c 的备忘用例用；后端每 256 次绑定重读，改完调 nvn_gpu_vk_test_pool_memo_refresh 立即作废缓存）
+static int g_roi_fixture;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (g_roi_fixture) {
+        if (!strcmp(name, "nvk_roi_probe")) return g_roi_fixture == 2;
+        if (!strcmp(name, "nvk_roi_frame")) return 2;
+        if (!strcmp(name, "nvk_roi_x")) return 3;
+        if (!strcmp(name, "nvk_roi_y")) return 5;
+    }
     if (!strcmp(name, "nvk_land_readback") && g_land_test_on) return g_land_test_on;
     if (!strcmp(name, "nvk_pool_memo") && g_pool_memo_flag >= 0) return g_pool_memo_flag;
     if (!strcmp(name, "nvk_pool_rec") && g_pool_rec_flag >= 0) return g_pool_rec_flag;
@@ -2826,7 +2833,7 @@ cleanup:
     for (int st = 0; st < 3; st++) { if (sh[st]) nvn_gpu_shader_release(sh[st]); free(mem[st]); }
 }
 
-static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp, const char *dir, const char *frag) {
+static void fs_draw_tex_frag_depth(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp, const char *dir, const char *frag, int test_depth) {
     nvn_gpu_layout_ent ents[2];
     memset(ents, 0, sizeof ents);
     ents[0].set = 0; ents[0].cls = NVN_GPU_RES_TEX; ents[0].access = NVN_GPU_ACC_R;
@@ -2846,6 +2853,10 @@ static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp
     pd.color.logic_op = 0x3;   // NVN 缺省 COPY
     pd.st[NVN_GPU_SH_VS].sh = vs;
     pd.st[NVN_GPU_SH_FS].sh = fs;
+    if (test_depth) {
+        pd.dfmt=NVN_FORMAT_DEPTH32F; pd.ds.dt=1; pd.ds.df=5;
+        pd.depth_clamp=1;
+    }
     pd.cfmt[0] = NVN_FORMAT_RGBA8;
     pd.samples = 1;
     pd.prim = 4;
@@ -2861,6 +2872,7 @@ static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp
     nvn_gpu_set_pipe(c, pipe);
     nvn_gpu_dyn dyn;
     memset(&dyn, 0, sizeof dyn); dyn.origin_ll = (uint8_t)!g_tri_origin_ul;   /* 原点在左下 = Vulkan 的自然方向 */
+    dyn.depth_clamp=(uint8_t)test_depth;
     dyn.nvp = 1;
     dyn.vp[0][2] = 64; dyn.vp[0][3] = 64; dyn.vp[0][5] = 1;
     dyn.has_sc = 1; dyn.sc[2] = 64; dyn.sc[3] = 64;
@@ -2878,6 +2890,10 @@ static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view view, nvn_gpu_samp samp
     nvn_gpu_buf_release(vb, NULL, NULL);
     nvn_gpu_shader_release(vs); nvn_gpu_shader_release(fs);
     free(vsm); free(fsm);
+}
+
+static void fs_draw_tex_frag(nvn_gpu_cmd c, nvn_gpu_view v, nvn_gpu_samp sampler, const char *dir, const char *frag) {
+    fs_draw_tex_frag_depth(c,v,sampler,dir,frag,0);
 }
 
 static void fs_draw_solid(nvn_gpu_cmd c, const char *dir, const char *frag, const int sc[4]) {
@@ -11138,7 +11154,14 @@ static void test_land_readback(int fail_invalidate, int automatic) {
 }
 #endif
 
+#ifdef S2A_ROI_FIXTURE
+#include "t_roi_probe.inc"
+#endif
+
 int main(int argc, char **argv) {
+#ifdef S2A_ROI_FIXTURE
+    if (argc == 4 && !strcmp(argv[1], "--roi-probe")) return roi_probe_only(atoi(argv[2]),argv[3]);
+#endif
     setvbuf(stdout, NULL, _IOLBF, 0);   // 经 tee 的管道默认整块缓冲：超时被杀时最后一行不是卡点；按行刷新才看得出卡在哪
     g_memo_on = getenv("S2A_TEST_DESC_MEMO") ? atoi(getenv("S2A_TEST_DESC_MEMO")) != 0 : 1;   // 备忘这一遍开 / 关：没设 = 生产缺省（开）
     if (getenv("S2A_TEST_COUNT_ONLY")) return c658_main(argc, argv);

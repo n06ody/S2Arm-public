@@ -22,10 +22,16 @@ static struct bc_time_bucket {
     double ns;
 } g_bc_time[BC_TIME_PATHS][BC_TIME_FORMATS];
 static uint64_t g_bc_time_start;
-
+enum bc7_event { BC7_WATCH, BC7_FIRST_SAMPLE, BC7_NOMINATE, BC7_REQUEUE, BC7_INVALIDATE,
+                 BC7_DEMOTE, BC7_PUBLISH, BC7_REJECT, BC7_FENCE_SKIP, BC7_BUSY_SKIP, BC7_EXPLICIT_WAIT, BC7_EVENTS };
+static _Thread_local int g_bc7_in_step;
+static _Atomic uint64_t g_bc7_events[BC7_EVENTS];
+static void bc7_count(enum bc7_event event) {
+    if (g.bc_time_on) atomic_fetch_add_explicit(&g_bc7_events[event], 1, memory_order_relaxed);
+}
 static void bc_time_log_window(uint64_t now, int final) {
     if (!g_bc_time_start || (!final && now - g_bc_time_start < UINT64_C(5000000000))) return;
-    char line[256];
+    char line[512];
     for (uint32_t path = 0; path < BC_TIME_PATHS; path++) {
         for (uint32_t i = 0; i < BC_TIME_FORMATS; i++) {
             const struct bc_time_bucket b = g_bc_time[path][i];
@@ -54,6 +60,15 @@ static void bc_time_log_window(uint64_t now, int final) {
                  (unsigned long long)shadow[path]);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
     }
+    if (g.bc7_astc_on) {
+        unsigned long long events[BC7_EVENTS];
+        for (unsigned i = 0; i < BC7_EVENTS; i++) events[i] = atomic_exchange(&g_bc7_events[i], 0);
+        snprintf(line, sizeof line, "bc7-reuse watch=%llu first_sample=%llu nominate=%llu requeue=%llu invalidate=%llu demote=%llu publish=%llu reject=%llu natural_fence_skip=%llu busy_skip=%llu explicit_wait=%llu",
+                 events[BC7_WATCH], events[BC7_FIRST_SAMPLE], events[BC7_NOMINATE], events[BC7_REQUEUE],
+                 events[BC7_INVALIDATE], events[BC7_DEMOTE], events[BC7_PUBLISH], events[BC7_REJECT],
+                 events[BC7_FENCE_SKIP], events[BC7_BUSY_SKIP], events[BC7_EXPLICIT_WAIT]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "bc-upload", line);
+    }
     memset(g_bc_time, 0, sizeof g_bc_time);
     g_bc_time_start = final ? 0 : now;
 }
@@ -76,6 +91,7 @@ static void bc_time_event(uint32_t path, uint32_t format, uint64_t blocks, int v
 
 static void bc_time_open(void) {
     g.bc1_astc_on = nvn_plat_flag("nvk_bc1_astc", 0) != 0;
+    g.bc7_astc_on = nvn_plat_flag("nvk_bc7_astc", 0) != 0;
     g.bc_time_on = nvn_plat_flag("nvk_bc_upload_time", 0) != 0;
     if (!g.bc_time_on) return;
     const VkPhysicalDeviceLimits *limits = &g.dev->properties.limits;

@@ -20,12 +20,17 @@ struct cold_ledger {
 };
 
 static inline int cold_interval_add(struct cold_ledger *ledger, uint64_t lo, uint64_t hi,
-                                    uint64_t epoch, unsigned writers) {
+                                    uint64_t epoch, unsigned writers, uint64_t write_epoch) {
     if (lo >= hi || !writers) return 1;
     if (ledger->n) {
         struct cold_interval *last = &ledger->span[ledger->n - 1];
-        if (lo == last->hi && epoch == last->epoch && writers == last->writers) {
+        if (lo == last->hi && writers == last->writers &&
+            (epoch == last->epoch || (epoch < write_epoch && last->epoch < write_epoch))) {
+            // The update stream's epochs never decrease. Two older epochs
+            // cannot match this or a later write's epoch. Preserve the newest
+            // epoch boundary, which still detects unordered GPU overlap.
             last->hi = hi;
+            if (last->epoch < epoch) last->epoch = epoch;
             return 1;
         }
     }
@@ -46,23 +51,23 @@ static inline void cold_ledger_write(struct cold_ledger *ledger, uint64_t lo, ui
         const struct cold_interval *s = &ledger->span[i];
         if (s->hi <= lo || s->lo >= hi) {
             if (s->lo >= hi && cursor < hi) {
-                if (!cold_interval_add(&next, cursor, hi, epoch, exact ? writer : 0)) goto unknown;
+                if (!cold_interval_add(&next, cursor, hi, epoch, exact ? writer : 0, epoch)) goto unknown;
                 cursor = hi;
             }
-            if (!cold_interval_add(&next, s->lo, s->hi, s->epoch, s->writers)) goto unknown;
+            if (!cold_interval_add(&next, s->lo, s->hi, s->epoch, s->writers, epoch)) goto unknown;
             continue;
         }
-        if (s->lo < lo && !cold_interval_add(&next, s->lo, lo, s->epoch, s->writers)) goto unknown;
+        if (s->lo < lo && !cold_interval_add(&next, s->lo, lo, s->epoch, s->writers, epoch)) goto unknown;
         const uint64_t begin = s->lo > lo ? s->lo : lo;
         const uint64_t end = s->hi < hi ? s->hi : hi;
-        if (!cold_interval_add(&next, cursor, begin, epoch, exact ? writer : 0)) goto unknown;
+        if (!cold_interval_add(&next, cursor, begin, epoch, exact ? writer : 0, epoch)) goto unknown;
         const int ordered = s->epoch != epoch || (s->writers & ~COLD_READ_HOST) == 0 || writer == COLD_READ_HOST;
         const unsigned mask = ordered && writer ? writer | (exact ? 0 : s->writers) : 0;
-        if (!cold_interval_add(&next, begin, end, epoch, mask)) goto unknown;
+        if (!cold_interval_add(&next, begin, end, epoch, mask, epoch)) goto unknown;
         cursor = end;
-        if (s->hi > hi && !cold_interval_add(&next, hi, s->hi, s->epoch, s->writers)) goto unknown;
+        if (s->hi > hi && !cold_interval_add(&next, hi, s->hi, s->epoch, s->writers, epoch)) goto unknown;
     }
-    if (!cold_interval_add(&next, cursor, hi, epoch, exact ? writer : 0)) goto unknown;
+    if (!cold_interval_add(&next, cursor, hi, epoch, exact ? writer : 0, epoch)) goto unknown;
     *ledger = next;
     return;
 unknown:
