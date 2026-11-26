@@ -590,6 +590,23 @@ int nvk_prog_warm_take(struct nvk_prog_rec *out) {
     return have;
 }
 
+int nvk_prog_warm_lookup(const uint8_t (*keys)[8], int n, struct nvk_prog_rec *out) {
+    if (!keys || n < 1 || n > NVK_PROG_REC_STAGES || !out) return 0;
+    const uint32_t stages = (1u << n) - 1;
+    pthread_mutex_lock(&g.mu);
+    int found = 0;
+    for (uint32_t i = 0; i < g.plan_n; i++) {
+        const struct nvk_prog_rec *rec = &g.plan[i];
+        if (rec->stage_mask == stages && !memcmp(rec->keys, keys, (size_t)n * sizeof keys[0])) {
+            *out = *rec;  // c1 is interned for the process lifetime.
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g.mu);
+    return found;
+}
+
 int nvk_prog_warm_pending(void) {
     pthread_mutex_lock(&g.mu);
     uint32_t pending = g.plan_i < g.plan_n ? g.plan_n - g.plan_i : 0;
@@ -680,6 +697,7 @@ void nvk_prog_warm_stat_build(int rc) {
     pthread_mutex_unlock(&g.mu);
 }
 void nvk_prog_warm_stat_draw_hit(void) { pthread_mutex_lock(&g.mu); g.st.draw_hits++; pthread_mutex_unlock(&g.mu); }
+void nvk_prog_warm_stat_prefetch_hit(void) { pthread_mutex_lock(&g.mu); g.st.prefetch_hits++; pthread_mutex_unlock(&g.mu); }
 void nvk_prog_warm_stat_draw_miss(void) { pthread_mutex_lock(&g.mu); g.st.draw_miss++; pthread_mutex_unlock(&g.mu); }
 
 void nvk_prog_warm_stats(struct nvk_prog_warm_stats *out) {

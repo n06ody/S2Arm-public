@@ -33,7 +33,7 @@ def main():
     for name in ('vulkan', 'vk_video'):
         if (sysinc/name).exists() and not (include/name).exists():
             (include/name).symlink_to(sysinc/name)
-    inc = (include, ROOT/'runtime/include', native, native/'nvn', native/'direct', gfx, gfx/'replay', gfx/'gfx/nvn',
+    inc = (include, ROOT/'runtime/include', native, native/'nvn', native/'direct', gfx, gfx/'replay', gfx/'gfx/nvn', gfx/'gfx/tex',
            gfx/'gfx/nvn/include', ROOT/'android/tests/vkhost', native/'gfx_plat')
     libs = [gfx/'replay/nvn_unimpl.c', gfx/'replay/rp_state.c', native/'nvn/nvn_vk_compute_request.c',
             native/'nvn/nvn_vk_prog_warm.c']   # nvk_shader.c 的预热发布/清单记账在 nvn_vk_prog_warm.c
@@ -60,6 +60,23 @@ def main():
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
+
+    if sys.argv[1:] == ['--prefetch-entry']:
+        entry = out / 'prefetch_entry_fixture.c'
+        # Only the prefetch entry is used here. Keep the shader fixture's existing
+        # submission state and pool substitutes without replacing that entry.
+        entry.write_text(
+            '#define rp_depth_zero unused_entry_depth_zero\n'
+            '#define rp_origin_lower_left unused_entry_origin_lower_left\n'
+            '#define rp_pool_find unused_entry_pool_find\n'
+            '#include "rp_entry.c"\n'
+        )
+        result = run('prefetch-entry', original, extra_libs=[*libs, entry, native/'nvn/nvn_warm.c'],
+                     args=('--prefetch-entry',), env={**os.environ, 'TMPDIR': str(out)},
+                     extra_flags=('-DS2A_TEST_SHADER_PREFETCH_ENTRY=1',))
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
 
     if sys.argv[1:] == ['--lp-output']:
         shader = ROOT/'android/tests/vk/shaders/libpack_mrt_outputs.frag'
@@ -619,8 +636,8 @@ def main():
             ('alias-bg-fact-mask-omitted', 'if (!compute && e && !e->failed && alias_on()) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);',
              '(void)0;', 1, 'alias fact-bg[on] s2: identity differing only in an unread texture fact reuses the program'),
             # 开关关闭态（--alias-off 另起进程）：开关读了不用，关闭态下 B 就会被合并，「B 读自己的文件」必须变红
-            ('alias-flag-ignored', 'if (v < 0) v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0; return v;',
-             'if (v < 0) { (void)nvn_plat_flag("nvk_alias", 1); v = 1; } return v;', 1, 'alias[off] s2: B reads its own file', ('--alias-off',)),
+            ('alias-flag-ignored', 'on = nvn_plat_flag("nvk_alias", 1) != 0;',
+             'on = 1;', 1, 'alias[off] s2: B reads its own file', ('--alias-off',)),
             # 编译被拒时的上下文日志（#999，只加日志）：每个分类、每个打印项、每道预算各撤一次，对应用例必须变红
             ('img-unbound-as-no-texture', 'miss->why = handles[slot] ? IMGF_NO_TEXTURE : IMGF_UNBOUND; continue;',
              'miss->why = IMGF_NO_TEXTURE; continue;', 1, 'slot unbound, pool entry 0 not registered: counter image_fact_unbound'),

@@ -127,11 +127,10 @@ ALIAS_MUTANTS = [
       ('else if (!r || r->failed)', 'else if (!r)', 1)], '',
      '失败项也挂比对键、也登记、也被合并：同结果的另一个身份被合并成失败项（⑤；三道闸一起撤，单撤任一道仍被另两道挡住）'),
     ('alias-always-on',
-     [('static int alias_on(void) { static int v = -1; if (v < 0) v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0; return v; }',
-       'static int alias_on(void) { return 1; }', 1)], 'off',
+     [('on = nvn_plat_flag("nvk_alias", 1) != 0;', 'on = 1;', 1)], 'off',
      '开关不再读属性：退路（debug.s2a.nvk_alias=0）失效，仍在合并（⑦）'),
     ('default-off',
-     [('v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0;', 'v = nvn_plat_flag("nvk_alias", 0) ? 1 : 0;', 1)], 'default',
+     [('on = nvn_plat_flag("nvk_alias", 1) != 0;', 'on = nvn_plat_flag("nvk_alias", 0) != 0;', 1)], 'default',
      '生产缺省改成关闭：不设开关时没有合并（缺省必须打开）'),
 ]
 

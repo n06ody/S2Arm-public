@@ -31,6 +31,9 @@
 // debug.s2a.nvk_warm 的假替身。平台开关在进程内不变（nvn_plat.h 契约），所以「关」与「开」用两次进程跑：
 // 本程序第二次带 NVK_WARM_OFF=1 起，断言起不来线程。
 static int g_flag = 1;
+static int g_prefetch_flag;
+static atomic_int g_prefetch_count, g_prefetch_release;
+static uint8_t g_prefetch_order[4];
 static int g_prog_total = 6, g_pipe_total = 4;
 static int g_prog_taken, g_pipe_taken;
 static atomic_int g_order_violation;    // 管线先于程序被取走 = 1
@@ -56,7 +59,23 @@ enum nvk_pipe_feedback_mode nvn_vk_pipe_creation_stats(struct nvk_pipe_creation_
     return NVK_PIPE_FEEDBACK_ON;
 }
 
-int nvn_plat_flag(const char *name, int dflt) { (void)dflt; return strcmp(name, "nvk_warm") == 0 ? g_flag : dflt; }
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_warm")) return g_flag;
+    if (!strcmp(name, "nvk_shader_prefetch")) return g_prefetch_flag;
+    return dflt;
+}
+int nvk_prog_prefetch_build(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation) {
+    assert(g_prefetch_flag && session == 4 && generation == 6 && n == 1);
+    const int index = atomic_load(&g_prefetch_count);
+    assert(index < 4);
+    g_prefetch_order[index] = keys[0][0];
+    atomic_store(&g_prefetch_count, index + 1);
+    if (!index) {
+        for (int i = 0; i < 2000 && !atomic_load(&g_prefetch_release); i++) usleep(1000);
+        assert(atomic_load(&g_prefetch_release));
+    }
+    return 1;
+}
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
     if (level == 2) atomic_store(&g_red_seen, 1);   // NVN_PLAT_LOG_RED = 2（graphics/nvn/replay/nvn_plat.h）
@@ -259,8 +278,49 @@ static void t_order_and_counts(void) {
            (unsigned long long)tt.prog_built, (unsigned long long)tt.pipe_built, tt.why);
 }
 
+static void queue_prefetch(uint8_t key, int dedup) {
+    const uint8_t keys[1][8] = {{key}};
+    struct nvk_warm_totals before, after;
+    nvk_warm_totals(&before);
+    for (int i = 0; i < 200; i++) {
+        nvk_warm_prefetch_queue(keys, 1, 4, 6);
+        nvk_warm_totals(&after);
+        if (dedup ? after.prefetch_dedup > before.prefetch_dedup
+                  : after.prefetch_queued > before.prefetch_queued) return;
+        usleep(1000);
+    }
+    assert(!"prefetch queue did not accept work");
+}
+
+static void t_prefetch_lifo(void) {
+    g_flag = 0;
+    g_prefetch_flag = 1;
+    nvk_warm_start();
+    queue_prefetch(10, 0);
+    for (int i = 0; i < 1000 && !atomic_load(&g_prefetch_count); i++) usleep(1000);
+    assert(atomic_load(&g_prefetch_count) == 1);
+    queue_prefetch(20, 0);
+    queue_prefetch(30, 0);
+    queue_prefetch(40, 0);
+    queue_prefetch(20, 1);   // New registration promotes the same queued work.
+    atomic_store(&g_prefetch_release, 1);
+    for (int i = 0; i < 1000 && atomic_load(&g_prefetch_count) < 4; i++) usleep(1000);
+    assert(atomic_load(&g_prefetch_count) == 4);
+    assert(!nvk_warm_stop());
+    assert(!memcmp(g_prefetch_order, (const uint8_t[]){10, 20, 40, 30}, sizeof g_prefetch_order));
+    struct nvk_warm_totals totals;
+    nvk_warm_totals(&totals);
+    assert(totals.prefetch_ready == 4 && totals.prefetch_dedup == 1);
+    assert(!totals.prog_built && !totals.pipe_built);
+    printf("t_prefetch_lifo ok (order 10,20,40,30; dedup 1)\n");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   // 断言跳 abort 时不丢读数行（负对照要看到真实的 Stop 耗时）
+    if (getenv("NVK_WARM_PREFETCH_TEST")) {
+        t_prefetch_lifo();
+        return 0;
+    }
     const char *off = getenv("NVK_WARM_OFF");
     const char *slow = getenv("NVK_WARM_SLOW_SAVE_US");
     const int delay_us = slow && slow[0] ? atoi(slow) : 0;

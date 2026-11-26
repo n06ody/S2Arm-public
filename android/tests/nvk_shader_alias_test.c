@@ -138,6 +138,7 @@ int nvk_prog_warm_seed_dir(char *out, size_t n) {
 void nvk_prog_warm_reset(void) {}
 void nvk_prog_warm_stat_build(int rc) { (void)rc; }
 void nvk_prog_warm_stat_draw_hit(void) {}
+void nvk_prog_warm_stat_prefetch_hit(void) {}
 void nvk_prog_warm_stat_draw_miss(void) {}
 void nvk_prog_warm_note(const struct nvk_prog_rec *rec) { (void)rec; }
 int nvk_prog_warm_contains(const uint8_t identity[32]) { (void)identity; return 0; }

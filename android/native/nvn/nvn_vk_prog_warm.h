@@ -57,6 +57,12 @@ struct nvk_prog_rec {
 // v1 的 64 位最近使用字段继续兼容旧时间戳，仅保留相对顺序。当前局的 note 比载入历史更新。
 int nvk_prog_warm_load(void);
 
+// Find one previously resolved program in the validated, frozen manifest.
+int nvk_prog_warm_lookup(const uint8_t (*keys)[8], int n, struct nvk_prog_rec *out);
+// Prebuild the exact recorded identity without claiming a foreground flight.
+// 0 = no usable candidate, 1 = published, 2 = already ready, -1 = retired.
+int nvk_prog_prefetch_build(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation);
+
 // 随包种子（首局预热）：本机这一版翻译器还没有清单（本闭包那份与旧名那份都不在）时，load 改读包里带的同名种子
 //   <S2A_SHADER_REVISION_ROOT>/shaders/direct/warm-vk/<闭包摘要前 8 字节 hex>-<profile 摘要前 8 字节 hex>/programs-v1-<闭包摘要 hex>.bin。
 //   种子就是一台同类设备真跑落下的本清单（同一格式、同一份整份校验与本局有效性检查），出包时由
@@ -98,6 +104,7 @@ struct nvk_prog_warm_stats {
     uint64_t retried;     // 返回 1 等待编译的条数
     uint64_t pending;     // 还没有处理完的条数
     uint64_t draw_hits;   // 真实 draw 命中「预建」程序对象的次数（验收用）
+    uint64_t prefetch_hits; // First draw adoption of a SetShaders-prefetched program.
     uint64_t draw_miss;   // 真实 draw 没命中、自己同步准备的次数（同一身份预热过却仍 miss 的证据）
 };
 void nvk_prog_warm_stats(struct nvk_prog_warm_stats *out);
@@ -116,6 +123,7 @@ int nvk_prog_warm_contains(const uint8_t identity[32]);
 void nvk_prog_warm_stat_build(int rc);
 // 真实 draw 的验收计数：返回的程序是预热发布的 / 清单里有却没命中、本笔自己同步准备。线程：[提交]。
 void nvk_prog_warm_stat_draw_hit(void);
+void nvk_prog_warm_stat_prefetch_hit(void);
 void nvk_prog_warm_stat_draw_miss(void);
 
 // 清掉本局清单状态（已载入条目、游标、本局记录与统计）。rp_shader_reset 调用；盘上文件不动。

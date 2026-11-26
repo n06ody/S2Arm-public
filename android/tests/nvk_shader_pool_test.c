@@ -28,6 +28,11 @@
 #include "direct/program_cache.h"
 #include "direct/libpack_vk.h"   // s2a_libpack_hits / misses / rejects：状态闸探测不许动库自己的计数
 #include "nvn/nvn_vk_prog_warm.h"
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+#include "nvn/nvn_warm.h"
+#include "nvn/nvn_vk_pipe_warm.h"
+#include <stdatomic.h>
+#endif
 #include "dmsh_chain.h"   // DMSH_CHAIN：出包预编库目录 b-<链>-vk 与容器头的链号
 #include <sys/stat.h>
 #include "tbuf_spirv_fixtures.h"
@@ -66,6 +71,11 @@ static int fixture_fact_wide = -1;    // 事实复用放宽开关（debug.s2a.nv
 static int fixture_alias_flag = -1;   // 结果合并开关（debug.s2a.nvk_alias）：-1 = 取生产缺省，0 = 关
 static int fake_gs_result_tag;        // 非 0：结果里多带一个无关字段，同一份输入的结果字节（摘要）就不同
 static int fixture_depth_zero, fixture_origin_lower_left, shader_load_count, shader_release_count;
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+static _Atomic unsigned prefetch_loads, prefetch_releases;
+static _Atomic int fixture_prefetch_generation = 6, prefetch_gate_backend;
+static _Thread_local int prefetch_foreground;
+#endif
 static int fixture_gate_probe;   // nvk_gate_probe：只读探测开关（缺省 0）
 static int fixture_used_slots = -1;   // nvk_lp_used_slots：-1 = 取生产缺省（关 = 「任何一个非对齐绑定都算」的旧口径），0 / 1 = 读成这个值（缺省关之后，新口径的用例要显式设 1，就像调试包设属性）
 static int fake_cs_success, cs_loads;
@@ -123,6 +133,9 @@ const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? geten
 static int fixture_warm_nowindow, fixture_warm_capture, fixture_no_libpack;
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "no_libpack") && fixture_no_libpack) return 1;
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+    if (!strcmp(name, "nvk_warm")) return 0;
+#endif
     if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
     if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
@@ -223,6 +236,9 @@ uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) {
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+    c->generation = (uint64_t)atomic_load(&fixture_prefetch_generation);
+#endif
     c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = external_profile_hash[0] ? external_profile_hash : phash;
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
@@ -362,11 +378,25 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, n
     if (fake_gs_success && (unsigned)s->stage < 6) {
         shader_load_count++; gs_loads[s->stage]++; gs_blob_bytes[s->stage] = s->bytes; *o = (nvn_gpu_shader)(uintptr_t)(s->stage + 1); return (nvn_gpu_rc){NVN_GPU_OK};
     }
-    if (fake_array_count) { *o = (nvn_gpu_shader)(uintptr_t)1; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    if (fake_array_count) {
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+        atomic_fetch_add(&prefetch_loads, 1);
+        if (!prefetch_foreground && atomic_load(&prefetch_gate_backend)) live_gate_pause();
+#endif
+        *o = (nvn_gpu_shader)(uintptr_t)1;
+        return (nvn_gpu_rc){NVN_GPU_OK};
+    }
     if (fake_cs_success && s->stage == NVN_GPU_SH_CS) { cs_loads++; *o = (nvn_gpu_shader)(uintptr_t)7; return (nvn_gpu_rc){NVN_GPU_OK}; }
     CHECK(0, "unexpected shader load"); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
 }
-void nvn_gpu_shader_release(nvn_gpu_shader s) { if (s) shader_release_count++; }
+void nvn_gpu_shader_release(nvn_gpu_shader s) {
+    if (!s) return;
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+    atomic_fetch_add(&prefetch_releases, 1);
+#else
+    shader_release_count++;
+#endif
+}
 static void wr(uint8_t *p, unsigned x) { p[0]=x; p[1]=x>>8; p[2]=x>>16; p[3]=x>>24; }
 static void wr64(uint8_t *p, uint64_t x) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(x >> (8 * i)); }
 static void bind_pools(int n);
@@ -2489,6 +2519,192 @@ static int fixture_defer_frame(uint64_t *frame) {
     return 1;
 }
 
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+void nvn_be_pair_prefetch(const uint8_t (*keys)[8], int n);
+
+// This fixture uses the production program warm scheduler and its cache. No
+// pipeline compilation is involved in a SetShaders prefetch.
+int nvk_pipe_warm_load(void) { return 0; }
+int nvk_pipe_warm_pending(void) { return 0; }
+int nvk_pipe_warm_take(struct nvk_pipe_rec *out) { (void)out; return 0; }
+int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) { (void)rec; return -1; }
+void nvk_pipe_warm_save(void) {}
+void nvk_pipe_warm_stats(struct nvk_pipe_warm_stats *out) { memset(out, 0, sizeof *out); }
+enum nvk_pipe_feedback_mode nvn_vk_pipe_creation_stats(struct nvk_pipe_creation_stats out[NVK_PIPE_CREATION_BUCKETS]) {
+    memset(out, 0, NVK_PIPE_CREATION_BUCKETS * sizeof *out);
+    return NVK_PIPE_FEEDBACK_UNAVAILABLE;
+}
+
+static const struct rp_shader_req prefetch_request = {.prim = 4};
+
+struct prefetch_draw {
+    const struct rp_prog *program;
+    int rc;
+    _Atomic int done;
+};
+static void *prefetch_draw_main(void *arg) {
+    struct prefetch_draw *draw = arg;
+    prefetch_foreground = 1;
+    draw->rc = rp_shader_resolve(&prefetch_request, &draw->program);
+    atomic_store(&draw->done, 1);
+    return NULL;
+}
+
+static void prefetch_tick(void) {
+    const struct timespec pause = {.tv_nsec = 5000000};
+    nanosleep(&pause, NULL);
+}
+
+static int prefetch_enqueue(void) {
+    struct nvk_warm_totals before, after;
+    nvk_warm_totals(&before);
+    for (int i = 0; i < 200; i++) {
+        nvn_be_pair_prefetch((const uint8_t (*)[8])rp_S.skey, 1);
+        nvk_warm_totals(&after);
+        if (after.prefetch_queued > before.prefetch_queued) return 1;
+        prefetch_tick();
+    }
+    return 0;
+}
+
+static void prefetch_hold_module(void) {
+    pthread_mutex_lock(&live_gate_mu);
+    live_gate_entered = 0;
+    live_gate_hold = 1;
+    pthread_mutex_unlock(&live_gate_mu);
+    atomic_store(&prefetch_gate_backend, 1);
+}
+
+static int shader_prefetch_entry_test(void) {
+    char cache[4096];
+    const char *base = getenv("TMPDIR");
+    if (!base || snprintf(cache, sizeof cache, "%s/prefetch.XXXXXX", base) >= (int)sizeof cache || !mkdtemp(cache)) return 2;
+    setenv("S2A_PW_TEST_DIR", cache, 1);
+    setenv("S2A_DIRECT_CACHE_DIR", cache, 1);
+    fixture_alias_flag = 0;
+    prefetch_foreground = 1;
+    CHECK(nvk_shader_open() == 0, "open donor session");
+    rp_state_reset();
+    source();
+    bind_pools(64);
+    fake_array_count = 64;
+
+    uint8_t keys[4][8], identity[3][32];
+    memcpy(keys[0], rp_S.skey[0], 8);
+    for (unsigned i = 1; i < 4; i++) gs_source(0, i, keys[i]);
+    const struct rp_prog *program = NULL;
+    CHECK(nvk_prog_warm_load() == 0, "initialize donor manifest");
+    for (unsigned i = 0; i < 3; i++) {
+        memcpy(rp_S.skey[0], keys[i], 8);
+        CHECK(!rp_shader_resolve(&prefetch_request, &program) && program && compiler_calls == (int)i + 1,
+              "donor draw %u creates exact program", i);
+        if (!program) return 2;
+        memcpy(identity[i], program->identity, 32);
+    }
+
+    CHECK(!s2a_program_cache_drain(5000), "donor results are persisted");
+    nvk_prog_warm_save();
+    nvk_shader_stop();
+    rp_shader_reset();
+    CHECK(nvk_shader_open() == 0, "open consumer session");
+    compiler_calls = 0;
+    nvk_warm_start();
+
+    memcpy(rp_S.skey[0], keys[0], 8);
+    const uint64_t reads = s2a_program_cache_hits();
+    CHECK(prefetch_enqueue(), "SetShaders queues exact source");
+    const struct rp_prog *ready = NULL;
+    for (int i = 0; i < 200; i++) {
+        if (rp_shader_prog_borrow(identity[0], &ready) == 1) break;
+        prefetch_tick();
+    }
+    CHECK(ready && s2a_program_cache_hits() == reads + 1,
+          "SetShaders must read the proven program and publish it before the first Draw");
+    if (ready) rp_shader_prog_return(identity[0]);
+    CHECK(!rp_shader_resolve(&prefetch_request, &program) && program && !compiler_calls,
+          "first Draw resolves the exact cached program without translation");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    struct nvk_prog_warm_stats manifest;
+    nvk_prog_warm_stats(&manifest);
+    CHECK(ready && program == ready && stats.wait_ns == 0 && manifest.prefetch_hits == 1,
+          "first Draw must adopt the prepublished program with zero translation wait");
+    printf("prefetch entry: ready_before_draw=%d compile_calls=%d draw_wait_ns=%llu\n",
+           ready != NULL, compiler_calls, (unsigned long long)stats.wait_ns);
+
+    const struct rp_shader_req changed = {.prim = 1};
+    CHECK(!rp_shader_resolve(&changed, &program) && program && compiler_calls == 1 &&
+          memcmp(program->identity, identity[0], 32),
+          "changed topology must reach the foreground compiler with a different identity");
+
+    memcpy(rp_S.skey[0], keys[3], 8);
+    const uint64_t reads_before_cold = s2a_program_cache_hits();
+    CHECK(prefetch_enqueue(), "cold source enters candidate queue");
+    struct nvk_warm_totals totals;
+    for (int i = 0; i < 200; i++) {
+        nvk_warm_totals(&totals);
+        if (totals.prefetch_missed) break;
+        prefetch_tick();
+    }
+    CHECK(totals.prefetch_missed == 1 && compiler_calls == 1 && s2a_program_cache_hits() == reads_before_cold,
+          "complete source without recorded Draw facts does not load or compile");
+    CHECK(!rp_shader_resolve(&prefetch_request, &program) && program && compiler_calls == 2,
+          "cold source compiles once the real Draw supplies its facts");
+
+    // Hold the warm worker inside backend module creation. A competing Draw
+    // must use the normal disk path without waiting for that speculative load.
+    memcpy(rp_S.skey[0], keys[1], 8);
+    prefetch_hold_module();
+    CHECK(prefetch_enqueue() && live_gate_wait(1), "prefetch reaches gated module load");
+    struct prefetch_draw draw = {0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, prefetch_draw_main, &draw)) {
+        live_gate_release();
+        return 2;
+    }
+    for (int i = 0; i < 200 && !atomic_load(&draw.done); i++) prefetch_tick();
+    const int draw_before_release = atomic_load(&draw.done);
+    live_gate_release();
+    pthread_join(thread, NULL);
+    CHECK(draw_before_release && draw.rc == 0 && draw.program && compiler_calls == 2,
+          "first Draw finishes while its speculative load is still blocked");
+    for (int i = 0; i < 200 && nvk_shader_inflight(); i++) prefetch_tick();
+    CHECK(nvk_shader_inflight() == 0, "competing speculative result retires");
+
+    // Test the full Stop route while one backend object is being created and
+    // another request is queued. Stop must return before that load is released.
+    memcpy(rp_S.skey[0], keys[2], 8);
+    prefetch_hold_module();
+    CHECK(prefetch_enqueue() && live_gate_wait(1), "stop case reaches a distinct gated module load");
+    memcpy(rp_S.skey[0], keys[0], 8);
+    CHECK(prefetch_enqueue(), "one request is pending at Stop");
+    nvk_shader_stop();
+    CHECK(nvk_warm_stop() == 1 && nvk_shader_open() == -1,
+          "slow load keeps one admission and bounded Stop refuses premature reopen");
+    live_gate_release();
+    for (int i = 0; i < 200 && nvk_warm_active(); i++) prefetch_tick();
+    CHECK(!nvk_warm_stop() && !nvk_shader_inflight(), "Stop retires both active and queued work");
+    nvk_warm_totals(&totals);
+    CHECK(totals.prefetch_cancelled == 3, "foreground superseded one load; Stop cancelled one active and one queued");
+    atomic_store(&fixture_prefetch_generation, 7);
+    CHECK(!nvk_shader_open(), "new generation opens once prefetch retires");
+    const struct rp_prog *stale = NULL;
+    CHECK(!rp_shader_prog_by_identity(identity[2], &stale), "stopped prefetch never published its program");
+    CHECK(nvk_prog_prefetch_build((const uint8_t (*)[8])&keys[2], 1, 4, 6) == -1,
+          "old-generation job is rejected even after reopening");
+    nvk_shader_stop();
+    rp_shader_reset();
+    CHECK(atomic_load(&prefetch_loads) == atomic_load(&prefetch_releases) && !rp_shader_prog_borrowed(),
+          "all created shaders and program borrows are released");
+    printf("nvk shader prefetch: %d checks, %d failures; cold_miss=%llu cancelled=%llu releases=%u/%u\n",
+           checks, failures, (unsigned long long)totals.prefetch_missed, (unsigned long long)totals.prefetch_cancelled,
+           atomic_load(&prefetch_releases), atomic_load(&prefetch_loads));
+    s2a_source_clear();
+    return failures ? 1 : 0;
+}
+
+#endif
+
 static int live_compile_pending_test(int stop) {
     fixture_live_compile = 1;
     fixture_live_frame_ms = 0;
@@ -2829,6 +3045,9 @@ static int lp_gate_test(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef S2A_TEST_SHADER_PREFETCH_ENTRY
+    if (argc == 2 && !strcmp(argv[1], "--prefetch-entry")) return shader_prefetch_entry_test();
+#endif
     if (argc == 2 && !strcmp(argv[1], "--lp-gate")) return lp_gate_test();
     if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);

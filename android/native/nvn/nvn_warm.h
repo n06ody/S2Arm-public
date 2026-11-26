@@ -10,7 +10,7 @@
 // 代际、去重、停局拒绝都在那两个模块里。预热线程不发命令、不碰回放状态（rp_S）、不提交。
 //
 // 生命周期：会话 open 成功后 start（幂等）；Stop / 收尾前 stop（请停 + 有界 join + 清单落盘 +
-// 后台静默确认）。预热跑完自然退出，之后再 start 不再起线程。
+// 后台静默确认）。启动清单处理完后保留线程，用于 SetShaders 预取和周期落盘。
 // 开关：debug.s2a.nvk_warm = 0 关（缺省 1）。进度日志走 nvn_plat_log，前缀 "warm"。
 #pragma once
 #include <stdint.h>
@@ -26,10 +26,16 @@ void nvk_warm_start(void);     // 幂等；会话 open 之后调用
 int  nvk_warm_stop(void);
 int  nvk_warm_active(void);    // 1 = 预热线程还活着
 
+// LIFO cache-only work on the same low-priority thread. The caller supplies
+// stage keys only after retaining the sources. Admission never waits.
+void nvk_warm_prefetch_queue(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation);
+
 // 验收读数：预热线程这一局做了多少、为什么退出。
 struct nvk_warm_totals {
     uint64_t prog_built, prog_failed;   // 程序：发布成功 / 失败
     uint64_t pipe_built, pipe_failed;   // 管线：建好 / 失败
+    uint64_t prefetch_queued, prefetch_dedup, prefetch_dropped;
+    uint64_t prefetch_ready, prefetch_missed, prefetch_cancelled;
     uint64_t ms;                        // 预热线程存活毫秒数
     int why;                            // 0 = 清单跑完 / 1 = Stop / 2 = 关闭（debug.s2a.nvk_warm=0）/ 3 = 无清单
 };

@@ -66,6 +66,79 @@ static _Atomic unsigned g_detached;   // 预算内没退出 → detach 交还的
 // 上一次落盘时的记录数：只有「当前这一任落盘者」读写（同一时刻只有一任）
 static uint64_t g_last_saved_rec, g_last_saved_pipe;
 
+// Same worker as startup warming: a new request goes ahead of the older
+// requests without adding CPU concurrency. Guard the small queue with g_mu.
+enum { PREFETCH_MAX = 32 };
+struct prefetch {
+    uint64_t session, generation;
+    int n;
+    uint8_t keys[NVK_PROG_REC_STAGES][8];
+};
+static struct prefetch g_prefetch[PREFETCH_MAX], g_prefetch_last;
+static unsigned g_prefetch_n;
+static _Atomic int g_prefetch_on;
+static _Atomic uint64_t g_prefetch_queued, g_prefetch_dedup, g_prefetch_dropped;
+static _Atomic uint64_t g_prefetch_ready, g_prefetch_missed, g_prefetch_cancelled;
+
+static int prefetch_same(const struct prefetch *a, const struct prefetch *b) {
+    return a->session == b->session && a->generation == b->generation &&
+           a->n == b->n && !memcmp(a->keys, b->keys, sizeof a->keys);
+}
+
+void nvk_warm_prefetch_queue(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation) {
+    if (!keys || n < 1 || n > NVK_PROG_REC_STAGES || !session || !generation) return;
+    if (!atomic_load(&g_prefetch_on)) return;
+    if (pthread_mutex_trylock(&g_mu)) {
+        atomic_fetch_add(&g_prefetch_dropped, 1);
+        return;
+    }
+    if (g_state != W_RUNNING) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    struct prefetch job = {.n = n, .session = session, .generation = generation};
+    memcpy(job.keys, keys, (size_t)n * sizeof job.keys[0]);
+    if (prefetch_same(&job, &g_prefetch_last)) {
+        atomic_fetch_add(&g_prefetch_dedup, 1);
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    unsigned at = 0;
+    while (at < g_prefetch_n && !prefetch_same(&job, &g_prefetch[at])) at++;
+    if (at < g_prefetch_n) {
+        atomic_fetch_add(&g_prefetch_dedup, 1);
+    } else {
+        atomic_fetch_add(&g_prefetch_queued, 1);
+        if (g_prefetch_n == PREFETCH_MAX) {
+            at = 0;  // Drop the oldest request when the stack is full.
+            atomic_fetch_add(&g_prefetch_dropped, 1);
+        } else {
+            g_prefetch_n++;
+        }
+    }
+    memmove(&g_prefetch[at], &g_prefetch[at + 1], (g_prefetch_n - at - 1) * sizeof g_prefetch[0]);
+    g_prefetch[g_prefetch_n - 1] = job;
+    pthread_cond_signal(&g_wake);
+    pthread_mutex_unlock(&g_mu);
+}
+
+static int prefetch_one(void) {
+    pthread_mutex_lock(&g_mu);
+    struct prefetch job = {0};
+    if (g_state == W_RUNNING && g_prefetch_n) {
+        job = g_prefetch[--g_prefetch_n];
+        g_prefetch_last = job;
+    }
+    pthread_mutex_unlock(&g_mu);
+    if (!job.n) return 0;
+    int rc = nvk_prog_prefetch_build((const uint8_t (*)[8])job.keys, job.n, job.session, job.generation);
+    if (rc == 1) atomic_fetch_add(&g_prefetch_ready, 1);
+    else if (rc == 2) atomic_fetch_add(&g_prefetch_dedup, 1);
+    else if (rc == 0) atomic_fetch_add(&g_prefetch_missed, 1);
+    else atomic_fetch_add(&g_prefetch_cancelled, 1);
+    return 1;
+}
+
 struct prog_retry { struct nvk_prog_rec rec; int64_t first_ms; uint8_t used; };
 struct pipe_retry { struct nvk_pipe_rec rec; int64_t first_ms; uint8_t used; };
 static struct prog_retry g_pretry[WARM_RETRY];   // 只有预热线程碰
@@ -102,14 +175,14 @@ static int warm_wait_flag_locked(uint32_t ms) {
 
 // 预热线程的睡眠一律走这里：Stop 一到就立刻醒（否则要等满一个睡眠粒度，那段延迟会直接吃掉
 // Stop 的 500 毫秒统一截止）。返回 1 = 已请停，调用方应尽快走到退出点。线程：[预热线程]。
-static int warm_sleep_or_stop(uint32_t ms) {
+static int warm_sleep_or_stop(uint32_t ms, int wake_for_prefetch) {
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += ms / 1000;
     dl.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&g_mu);
-    while (g_state != W_STOPPING)
+    while (g_state != W_STOPPING && !(wake_for_prefetch && g_prefetch_n))
         if (pthread_cond_timedwait(&g_wake, &g_mu, &dl) == ETIMEDOUT) break;
     int stop = g_state == W_STOPPING;
     pthread_mutex_unlock(&g_mu);
@@ -214,12 +287,12 @@ static int warm_load(void) {
     for (int i = 0; i < 100; i++) {
         if (warm_stopping()) return -1;
         int np = nvk_prog_warm_load();
-        int nq = nvk_pipe_warm_load();
+        int nq = warm_on() ? nvk_pipe_warm_load() : -1;
         if (np >= 0 || nq >= 0) {
             warm_log("nvk warm 清单：程序 %d 条、管线 %d 条", np, nq);
             return np + nq;
         }
-        (void)warm_sleep_or_stop(100);
+        (void)warm_sleep_or_stop(100, 0);
     }
     return -2;
 }
@@ -275,12 +348,13 @@ static void *warm_main(void *unused) {
     // 本局预热集在开局就冻结：只做「上一局落盘、这一局载入」的那批。本局新记录的身份会继续进清单
     // （下一局才用），但不再扩预热集——否则游戏每帧都在产生新身份，预热线程会跟着游戏无限跑，
     // 跟它抢核（真机第二次启动：预热到 105 秒还在跑，帧率 22.6 → 18.0）。
-    int prog_budget = loaded < 0 ? 0 : nvk_prog_warm_pending();
-    int pipe_budget = loaded < 0 ? 0 : nvk_pipe_warm_pending();
+    int prog_budget = loaded >= 0 && warm_on() ? nvk_prog_warm_pending() : 0;
+    int pipe_budget = loaded >= 0 && warm_on() ? nvk_pipe_warm_pending() : 0;
     int prog_done = loaded < 0 ? 1 : 0, idle_rounds = 0, drained = 0;
     int64_t last_log = warm_now_ms(), next_save = g_t0 + WARM_FIRST_SAVE_MS;
     for (;;) {
         if (warm_stopping()) { warm_exit_stop(); return NULL; }
+        int prefetch_did = prefetch_one();
         int did = 0;
         // 清单做完了不是「线程退休」：本局还在不断记录新的身份/配方，定期落盘要靠这条线程
         // （bench / 玩家直接杀进程时不会有 Stop，只有这里的周期性 save 能把记录留下来）。
@@ -340,7 +414,7 @@ static void *warm_main(void *unused) {
             if (!more && !retry_left) { drained = 1; atomic_store(&g_why, WHY_DONE); warm_progress("清单完成"); }
             else if (!more && retry_left && ++idle_rounds > 400) { drained = 1; atomic_store(&g_why, WHY_DONE); warm_progress("清单完成（在途重试到期）"); }
             if (more) idle_rounds = 0;
-            if (!drained) (void)warm_sleep_or_stop(WARM_TICK_MS);
+            if (!drained && !prefetch_did) (void)warm_sleep_or_stop(WARM_TICK_MS, 1);
         } else {
             idle_rounds = 0;
         }
@@ -356,8 +430,8 @@ static void *warm_main(void *unused) {
         }
         continue;
 idle:
-        if (!did) {
-            (void)warm_sleep_or_stop(WARM_IDLE_MS);
+        {
+            if (!prefetch_did) (void)warm_sleep_or_stop(WARM_IDLE_MS, 1);
             int64_t now = warm_now_ms();
             if (now >= next_save) {
                 next_save = now + WARM_SAVE_MS;
@@ -368,9 +442,11 @@ idle:
 }
 
 void nvk_warm_start(void) {
-    if (!warm_on()) { atomic_store(&g_why, WHY_OFF); return; }
+    int prefetch_on = nvn_plat_flag("nvk_shader_prefetch", 1);
+    if (!warm_on() && !prefetch_on) { atomic_store(&g_why, WHY_OFF); return; }
     pthread_mutex_lock(&g_mu);
     if (g_state != W_IDLE || g_live || atomic_load(&g_retired)) { pthread_mutex_unlock(&g_mu); return; }
+    atomic_store(&g_prefetch_on, prefetch_on);
     memset(g_pretry, 0, sizeof g_pretry);
     memset(g_qretry, 0, sizeof g_qretry);
     atomic_store(&g_why, WHY_DONE);
@@ -386,7 +462,7 @@ void nvk_warm_start(void) {
     }
     g_thread_joinable = 1;   // Stop 成功路径要 join；超时路径改成 detach（见 nvk_warm_stop）
     pthread_mutex_unlock(&g_mu);
-    warm_log("nvk warm：预热线程已起（debug.s2a.nvk_warm=1；设 0 关）");
+    warm_log("nvk warm：后台线程已起 startup=%d setshaders=%d", warm_on(), prefetch_on);
 }
 
 // 停局。**有界且绝不做文件 IO**（nvn_warm.h 合同）：交互调用方只等「静默 + 清单落盘完成」，
@@ -403,6 +479,9 @@ int nvk_warm_stop(void) {
     const int first = !g_stop_requested;
     g_stop_requested = 1;
     if (g_state == W_RUNNING) g_state = W_STOPPING;
+    atomic_fetch_add(&g_prefetch_cancelled, g_prefetch_n);
+    g_prefetch_n = 0;
+    memset(&g_prefetch_last, 0, sizeof g_prefetch_last);
     const int live = g_live;
     const pthread_t th = g_th;
     if (first) atomic_store(&g_saved, 0);   // 本次停局的落盘完成标志只置一次
@@ -473,6 +552,15 @@ int nvk_warm_stop(void) {
         nvn_plat_log(NVN_PLAT_LOG_RED, "warm",
                      "【红】nvk warm 停局：没在 500 毫秒统一截止内完成（清单没落盘、旧文件保留、后台线程继续收尾；"
                      "这一段占用会话 700 毫秒硬界限）");
+    if (atomic_load(&g_prefetch_on)) {
+        struct nvk_prog_warm_stats ps;
+        nvk_prog_warm_stats(&ps);
+        warm_log("nvk shader prefetch queued=%" PRIu64 " dedup=%" PRIu64 " dropped=%" PRIu64
+                 " ready=%" PRIu64 " miss=%" PRIu64 " cancelled=%" PRIu64 " draw_hits=%" PRIu64,
+                 atomic_load(&g_prefetch_queued), atomic_load(&g_prefetch_dedup), atomic_load(&g_prefetch_dropped),
+                 atomic_load(&g_prefetch_ready), atomic_load(&g_prefetch_missed), atomic_load(&g_prefetch_cancelled),
+                 ps.prefetch_hits);
+    }
     warm_progress("收尾");
     return ok ? 0 : 1;
 }
@@ -492,6 +580,12 @@ void nvk_warm_totals(struct nvk_warm_totals *out) {
     out->prog_failed = atomic_load(&g_prog_failed);
     out->pipe_built = atomic_load(&g_pipe_built);
     out->pipe_failed = atomic_load(&g_pipe_failed);
+    out->prefetch_queued = atomic_load(&g_prefetch_queued);
+    out->prefetch_dedup = atomic_load(&g_prefetch_dedup);
+    out->prefetch_dropped = atomic_load(&g_prefetch_dropped);
+    out->prefetch_ready = atomic_load(&g_prefetch_ready);
+    out->prefetch_missed = atomic_load(&g_prefetch_missed);
+    out->prefetch_cancelled = atomic_load(&g_prefetch_cancelled);
     out->ms = g_t0 ? (uint64_t)(warm_now_ms() - g_t0) : 0;
     out->why = atomic_load(&g_why);
 }

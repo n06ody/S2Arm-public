@@ -320,6 +320,7 @@ s2a_gate_step "$PY" "$android_dir/tests/vk_warm_nowindow_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/host_link_test.py"   # 宿主单测链接闭包：自动补链 / 弱引用放行 / 无提供方点名红 / 替身优先
 # 新回放层：真实图形/计算请求生产入口的贴图池容量、超限与调试读数。
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py"
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --prefetch-entry
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --withdraw
 # 事实复用放宽（#2166）：高槽直连事实不拆程序 / 请求开关依赖来源可复用；尾部事实判据、掩码越界、请求来源白名单、高槽句柄拦截、
 #   开关（含关闭态 --fact-wide-off、生产缺省档 --fact-wide-default 各单独起进程）与命中计数各撤一处，对应用例必红

@@ -1440,6 +1440,7 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
 // S2Arm #674: the key a Switch 2 stage would have with the code in place at SetShaders, only to start its library loading early. keys_hash leaves NVN2 stages unkeyed there
 //   (the code can still change before the first draw, which keys them), and with no key at SetShaders the prefetch was never asked: every library of a Switch 2 game was loaded on the
 //   submit thread at its first draw. A key computed from code that changes later is not in the package's map, so the prefetch drops it (nvn_be_shader_prefetch: no stage)
+#if !defined(__ANDROID__) && !defined(__OHOS__)
 static int keys_hash_early(const NVNshaderData *sd, uint8_t out[8]) {
     void *mb; uint64_t mo;
     if (!sd->control || (uint64_t)(uintptr_t)sd->control >= (1ull << 47) || !nvn2_on() || !nvn2_ctl(sd->control)) return 0;
@@ -1447,6 +1448,7 @@ static int keys_hash_early(const NVNshaderData *sd, uint8_t out[8]) {
     if (!sd->data || !n2 || n2 >= (1u << 24) || !nvn_be_addr(sd->data, n2, &mb, &mo)) return 0;
     return nvn2_key(sd->control, (const void *)(uintptr_t)sd->data, out);
 }
+#endif
 // 首用算键的读数（11-18：4ff1884da 的修复走没走到，原先没有一行能数）：Switch 2 游戏每个阶段都在首用才算键，读的是 SetShaders 时自持的控制段（ctl_intern）；
 //   魔数 / 版本不对 = 首用时读到的不是 NVN2 控制段（#1520 卡比修复前 98 支就是这样）。g_ctl_held / g_ctl_uniq：SetShaders 自持控制段的次数 / 去重后份数
 // 局内实际用到的着色器（shader_seen.tsv，放在 pso_user.tsv 旁边，同 nvn_mtl.m pso_user_path：DM_PSO_USER 所在目录，否则存档目录 DM_SAVE 的上一级）：
@@ -1587,12 +1589,22 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 #if defined(__ANDROID__) || defined(__OHOS__)
     struct s2a_source_pin_ref pinrefs[NVN_PROGRAM_PIN_MAX];
     int npin = 0;
+    unsigned pre_mask = 0;
 #endif
     uint8_t pre_keys[6][8]; memset(pre_keys, 0, sizeof pre_keys); (void)pre_keys;   // 各阶段的键（SetShaders 算出的或首用才定的早键），给 nvn_be_pair_prefetch
     for (int i = 0; i < n; i++) {
-        if (keys_hash(&sd[i], 1, k->key[i])) { k->ok |= (uint8_t)(1u << i); dm_shader_miss(k->key[i], sd[i].data, sd[i].control); nvn_be_shader_prefetch(k->key[i]); memcpy(pre_keys[i], k->key[i], 8); }   // S2Arm: a key missing from the map is translated on the device now (graphics/nvn/host_adapt.m)
-        else { uint8_t early[8]; if (keys_hash_early(&sd[i], early)) { nvn_be_shader_prefetch(early); memcpy(pre_keys[i], early, 8); } }   // S2Arm #674: stages keyed at first use
+        const int have_key = keys_hash(&sd[i], 1, k->key[i]);
+        if (have_key) {
+            k->ok |= (uint8_t)(1u << i);
+            dm_shader_miss(k->key[i], sd[i].data, sd[i].control);
+        }
 #if !defined(__ANDROID__) && !defined(__OHOS__)
+        if (have_key) {
+            nvn_be_shader_prefetch(k->key[i]);
+            memcpy(pre_keys[i], k->key[i], 8);
+        } else if (keys_hash_early(&sd[i], pre_keys[i])) {
+            nvn_be_shader_prefetch(pre_keys[i]);   // S2Arm #674: stages keyed at first use
+        }
         // 首用才算键的阶段（Switch 2 一律；Switch 1 代码区还不在已登记内存池时），控制段先自持一份（ctl_intern）
         { uint32_t hl = ctl_hold_len(&sd[i], k->ok >> i & 1); if (hl) o->sd[i].control = ctl_intern(sd[i].control, hl); }
 #endif
@@ -1628,8 +1640,14 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
                 uint32_t ncode = 0; memcpy(&ncode, (const uint8_t *)sd[i].control + 0x704, 4);
                 if (ncode && ncode < (1u << 24)) {
                     if (s2a_source_keep(k->key[i], (uint32_t)i, (const void *)(uintptr_t)sd[i].data, ncode,
-                                        sd[i].control, nctl) == 0 && k->stage[i] != 0xff && s2a_source_drop_pending_stage)
-                        s2a_source_drop_pending_stage(o->serial, (uint32_t)i);   // 源已存好、键与阶段都已算出：刚自持的控制段冗余（Bind 不会再要）
+                                        sd[i].control, nctl) == 0 && k->stage[i] != 0xff) {
+                        if (s2a_source_drop_pending_stage) s2a_source_drop_pending_stage(o->serial, (uint32_t)i);
+                        unsigned stage = k->stage[i];
+                        if (stage < 3) {
+                            pre_mask |= 1u << stage;
+                            memcpy(pre_keys[stage], k->key[i], 8);
+                        }
+                    }
                     // 立刻 pin 住；先不挂到 psnap_ent（该条目还没建），循环后统一记账，避免 N5 的额外 prog_keys。
                     if (s2a_source_pin_key && npin < NVN_PROGRAM_PIN_MAX) {
                         int dup = 0;
@@ -1652,8 +1670,11 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     prog_pin_set_owner(o->serial, o);             // 该 serial 的 pin 归属固定为原件，拷贝先 Bind 不抢 owner
     for (int i = 0; i < npin; i++) prog_pin_add(o->serial, o, &pinrefs[i]);
     prog_pin_release(old_serial, o);   // 新阶段已经 pin 好：旧阶段不再被当前 program 引用，源快照可淘汰
-#endif
-#if !defined(__ANDROID__) && !defined(__OHOS__)
+    // Prefetch requires every stage in canonical order and fully captured.
+    // Programs keyed at Bind still take the normal first-use path.
+    if (n > 0 && n <= 3 && pre_mask == (1u << n) - 1)
+        nvn_be_pair_prefetch((const uint8_t (*)[8])pre_keys, n);
+#else
     nvn_be_pair_prefetch((const uint8_t (*)[8])pre_keys, n);   // 这对顶点 / 片元的随包拉取基础管线先在后台取（nvn_mtl.m），首遇直接用拉取管线画
 #endif
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);

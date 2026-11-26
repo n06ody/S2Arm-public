@@ -35,6 +35,7 @@
 #include "nvn/nvn_vk_warm_options.h"
 #include "nvn/nvn_vk_cold_asset.h"
 #include "nvn/nvn_vk_cold_guard.h"
+#include "nvn/nvn_warm.h"
 #include "nvn/nvn_vk_prog_warm.h"   // 跨会话程序清单（note / stats；build 与 quiesce 在本文件实现）
 #include <pthread.h>
 #include <stdarg.h>
@@ -115,13 +116,22 @@ static int shader_compile_admit(void) {
     }
 }
 
+enum { PROG_FROM_PREFETCH = 2 };
 struct entry { struct rp_prog prog; int failed; int warm; int warm_hit; uint8_t nowindow_seed; uint8_t nowindow_reused; uint8_t numeric_checked; struct s2a_frag_outputs outputs; uint8_t outputs_unknown; uint8_t fact_ok; uint32_t fact_mask[4]; uint8_t res_ok; uint8_t res_key[32]; uint8_t seen; };   // res_key：这份程序的结果合并比对键（结果摘要 / 负载长度 / 阶段数 / c1 的 SHA-256，见 alias_key_hash；结果合并 #1355）；seen：rp_shader_reset 按「同一 entry 只释放一次」去重时的临时标记   // fact_*：结果字节里读出的「编译器实际读了哪些绑定事实」（nvk_shader_fact_cache.h），work_run 里算好，发布后由提交线程入表   // warm：预热带发布；warm_hit：已被真实 draw 采用过一次（验收计数口径）
 static nvn_hmap g_progs = {.klen = 32};   // 内容身份（SHA-256）→ struct entry *。结果合并后，同一份结果的多个身份指向同一个 entry（拥有者只有一个，见 rp_shader_reset）
 // 结果合并（#1355）：比对键（见 alias_key_hash：缓存文件头里的结果摘要 + 负载长度 + 阶段数 + c1）→ struct entry *（只借用；g_progs_mu 下读写；整表随 rp_shader_reset 清）。
 // 同一份编译结果的不同身份共用一个 entry（一份着色器句柄，管线缓存按句柄比，所以管线也合并）。缺省打开；debug.s2a.nvk_alias=0 关闭（只有调试包读，出包版恒走缺省）。
 static nvn_hmap g_res_tab = {.klen = 32};
 static _Atomic uint64_t g_n_alias_fg, g_n_alias_bg, g_n_alias_probe, g_n_alias_nores, g_n_alias_nofile, g_n_alias_badfile;   // 合并（前台 / 预热带）/ 读头次数 / 头好但没有比对键一致的常驻程序 / 没有缓存文件 / 缓存文件坏
-static int alias_on(void) { static int v = -1; if (v < 0) v = nvn_plat_flag("nvk_alias", 1) ? 1 : 0; return v; }
+static int alias_on(void) {
+    static _Atomic int v = -1;
+    int on = atomic_load_explicit(&v, memory_order_relaxed);
+    if (on < 0) {
+        on = nvn_plat_flag("nvk_alias", 1) != 0;
+        atomic_store_explicit(&v, on, memory_order_relaxed);
+    }
+    return on;
+}
 // 事实复用放宽（nvk_shader_fact_cache.h 头注释）：完整组合表后面允许带高槽直连事实、认请求开关 requiresLinkedVaryingInterface 这个依赖来源。
 // 缺省关（#2166 定案：缺省开不开按 #2044 判，天玑 / Mali 第二台设备判过才开）；改缺省只动 NVK_FACT_WIDE_DEFAULT 这一行，测试跟着宏走。
 // debug.s2a.nvk_fact_wide=1 / 0 在调试包里强制开 / 关（出包版恒走缺省）；关 = 原来的两道闸。g_n_fact：事实复用命中的新身份数（「程序累计」读数）。
@@ -260,6 +270,7 @@ static struct entry *progs_get_adopted_locked(const uint8_t identity[32], int *f
 }
 static void note_warm_adoption(const struct entry *e, const uint8_t identity[32]) {
     nvk_prog_warm_stat_draw_hit();
+    if (e->warm == PROG_FROM_PREFETCH) nvk_prog_warm_stat_prefetch_hit();
     if (e->nowindow_seed) {
         char msg[96];
         snprintf(msg, sizeof msg, "非窗口种子程序首绘采用 %02x%02x%02x%02x", identity[0], identity[1], identity[2], identity[3]);
@@ -312,8 +323,12 @@ static int progs_publish(const uint8_t identity[32], struct entry *e, int from_w
     if (failed) *failed = 0;
     pthread_mutex_lock(&g_progs_mu);
     struct entry *have = progs_get_locked(identity);
+    const int prefetch = from_warm == PROG_FROM_PREFETCH;
     int rc;
-    if (have && !have->prog.lib_bad) { if (existing) *existing = have; if (failed) *failed = have->failed; inflight_done_locked(identity); rc = 0; }
+    if (prefetch && (have || inflight_find_locked(identity) ||
+                     shader_stopped() || epoch != g_progs_epoch || g_warm_quiesced)) {
+        rc = -1;  // Foreground owns a competing build; leave its flight intact.
+    } else if (have && !have->prog.lib_bad) { if (existing) *existing = have; if (failed) *failed = have->failed; inflight_done_locked(identity); rc = 0; }
     else if (shader_stopped() || epoch != g_progs_epoch || (from_warm && g_warm_quiesced)) {
         // 发布被拒（停局 / 换代 / 预热已静默）：认领必须在这里结束——否则在途表里留一条永不完成的记录，
         // 之后同身份的 draw 会在 await_inflight 上一直等到停局，预热静默检查也会一直报「有在途」。
@@ -325,7 +340,7 @@ static int progs_publish(const uint8_t identity[32], struct entry *e, int from_w
         struct entry *old = (struct entry *)nvn_hm_put(&g_progs, identity, e);
         if (old && old != e) orphan_note(old);   // lib_bad 旧项被顶替：转孤儿表，借用方持有的指针仍有效
         if (alias_on() && e->res_ok && !e->failed && !nvn_hm_get(&g_res_tab, e->res_key)) (void)nvn_hm_put(&g_res_tab, e->res_key, e);   // 结果合并：比对键相同的以后由它代表
-        inflight_done_locked(identity);
+        if (!prefetch) inflight_done_locked(identity);
         rc = 1;
     }
     pthread_mutex_unlock(&g_progs_mu);
@@ -2211,11 +2226,12 @@ static int nowindow_result_matches(const uint8_t *bytes, size_t len, const struc
         !strcmp(profile, pc->profile_hash);
 }
 
-static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
+static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst,
+                                   const struct s2a_direct_compile_context *context) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
-    struct s2a_direct_compile_context pc;
-    memset(&pc, 0, sizeof pc);
-    if (s2a_direct_provider_compile_context(&pc)) {
+    struct s2a_direct_compile_context pc = {0};
+    if (context) pc = *context;
+    else if (s2a_direct_provider_compile_context(&pc)) {
         warm_diag("程序预热：编译上下文不可用（provider 还没发布本局会话），本局预热整体不可用");
         return NULL;
     }
@@ -2248,7 +2264,9 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         if (rec->c1_ok & (1u << st)) { views[st].c1 = rec->c1[st]; views[st].c1_bytes = rec->c1_len[st]; }
     }
     // 预热清单不记绘制图元：几何程序这里取不到（topology 传 NULL → miss），等提交线程按本笔图元取
-    if (!bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
+    // SetShaders only hydrates results already bound to a full identity.
+    // The startup path keeps its existing stage-library admission.
+    if (!context && !bytes && libpack_fetch(rec->identity, compute ? NULL : (const uint8_t (*)[8])rec->keys,
                                 compute ? 0 : rec->stage_mask, compute ? rec->keys[0] : NULL, rec->lp_ok == 2, NULL, &pc, &bytes, &len)) {
         struct entry *le = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 1) : build(bytes, len, views, nst, rec->identity, 1);
         if (le) { if (!compute) le->prog.z_raw = 1; le->prog.lib_sourced = 1; }
@@ -2275,6 +2293,7 @@ static struct entry *warm_work_run(const struct nvk_prog_rec *rec, int nst) {
         }
     }
     if (!bytes) {
+        if (context) return NULL;
         warm_diag("程序预热：结果字节取不到（身份 %02x%02x%02x%02x…，离线库 %s，跨局缓存 %s「%s」，缓存目录 %s）",
                   rec->identity[0], rec->identity[1], rec->identity[2], rec->identity[3],
                   had_bytes ? "命中" : "未命中",
@@ -3304,6 +3323,69 @@ int rp_shader_prog_borrowed(void) {
     return n;
 }
 
+// Test/replay-only links may omit the Android scheduler.
+void nvk_warm_prefetch_queue(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation) __attribute__((weak));
+// 弱链接[nvntest]：nvk_warm_prefetch_queue（安卓 nvn_warm.c）
+void nvk_shader_prefetch(const uint8_t (*keys)[8], int n) {
+    if (!nvk_warm_prefetch_queue || !keys || n < 1 || n > NVK_PROG_REC_STAGES || shader_enter()) return;
+    struct s2a_direct_compile_context pc = {0};
+    if (!s2a_direct_provider_compile_context(&pc))
+        nvk_warm_prefetch_queue(keys, n, pc.session, pc.generation);
+    shader_leave();
+}
+
+static int warm_missing_c1(const struct entry *e, int nst) {
+    for (int st = 0; st < nst; st++) {
+        if (e->prog.c1_ok & (1u << st)) continue;
+        for (uint32_t i = 0; i < e->prog.nent[st] && i < RP_PROG_ENT_MAX; i++)
+            if (e->prog.ent[st][i].src_kind == NVN_RB_C1) return 1;
+    }
+    return 0;
+}
+
+static int prefetch_context(struct s2a_direct_compile_context *pc, uint64_t session, uint64_t generation) {
+    return !shader_stopped() && !s2a_direct_provider_compile_context(pc) &&
+           pc->session == session && pc->generation == generation;
+}
+
+int nvk_prog_prefetch_build(const uint8_t (*keys)[8], int n, uint64_t session, uint64_t generation) {
+    if (shader_enter()) return -1;
+    struct s2a_direct_compile_context pc = {0};
+    struct nvk_prog_rec rec;
+    int rc = -1;
+    if (!prefetch_context(&pc, session, generation)) goto leave;
+    pthread_mutex_lock(&g_progs_mu);
+    const uint64_t epoch = g_progs_epoch;
+    pthread_mutex_unlock(&g_progs_mu);
+    rc = 0;
+    if (!nvk_prog_warm_lookup(keys, n, &rec)) goto leave;
+
+    pthread_mutex_lock(&g_progs_mu);
+    const int current_epoch = epoch == g_progs_epoch && !g_warm_quiesced && !shader_stopped();
+    struct entry *have = current_epoch ? progs_get_locked(rec.identity) : NULL;
+    if (!current_epoch) rc = -1;
+    else if (have && !have->failed && !have->prog.lib_bad) rc = 2;
+    const int make = current_epoch && !have && !inflight_find_locked(rec.identity);
+    if (make) g_inflight_bg++;
+    pthread_mutex_unlock(&g_progs_mu);
+    if (!make) goto leave;
+
+    struct entry *e = warm_work_run(&rec, n, &pc);
+    struct s2a_direct_compile_context current = {0};
+    if (!prefetch_context(&current, session, generation)) rc = -1;
+    else if (e && !e->failed && !warm_missing_c1(e, n))
+        rc = progs_publish(rec.identity, e, PROG_FROM_PREFETCH, epoch, NULL, NULL);
+    if (rc != 1) entry_free(e);
+
+    pthread_mutex_lock(&g_progs_mu);
+    if (epoch == g_progs_epoch) g_inflight_bg--;
+    pthread_cond_broadcast(&g_progs_cv);
+    pthread_mutex_unlock(&g_progs_mu);
+leave:
+    shader_leave();
+    return rc;
+}
+
 // ---------- 预热：按跨会话清单重建成已发布的程序对象 ----------
 // [后台]（Lead 的 nvn_warm.c 单线程调用）。语义：
 //   0 = 已发布到 g_progs（同身份早已发布也算 0）；
@@ -3344,33 +3426,24 @@ int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
     // shader_enter 返回 0 = 已登记（与 rp_shader_resolve 的用法同一口径：非 0 才是停局拒绝）。
     // 这里曾经写成 !shader_enter()，等于「登记成功就中止」——真机上表现为预热 2727 条全部失败、建 0。
     if (shader_enter()) { warm_diag("程序预热：会话已置停局位，预热停止建设备对象"); inflight_abort(rec->identity); nvk_prog_warm_stat_build(-1); return -1; }
-    struct entry *e = warm_work_run(rec, nst);
+    struct entry *e = warm_work_run(rec, nst, NULL);
     shader_leave();
     // 清单记录缺 c1，但这份程序真的带 C1 绑定（BRX 跳表着色器：火把/粒子等）：**不能发布**。
     // 发布出去的程序 c1_ok=0，rp_draw 会把所有带 C1 绑定的绘制跳过（"c1_segment_not_captured"）——画面直接缺光/发黑。
     // 这里如实拒绝（计 retried），留给真实 draw 用源快照现场编：那次会把 c1 一起记进清单，下一局这条就修好了。
-    if (e && !e->failed) {
-        int need = 0;
-        for (int st = 0; st < nst && st < RP_PROG_STAGES; st++) {
-            if (e->prog.c1_ok & (1u << st)) continue;
-            for (uint32_t i = 0; i < e->prog.nent[st] && i < RP_PROG_ENT_MAX; i++)
-                if (e->prog.ent[st][i].src_kind == NVN_RB_C1) { need = 1; break; }
-            if (need) break;
+    if (e && !e->failed && warm_missing_c1(e, nst)) {
+        static _Atomic unsigned n;
+        unsigned k = atomic_fetch_add(&n, 1);
+        if (k < 4) {
+            char b[176];
+            snprintf(b, sizeof b, "程序预热：清单 c1_ok=%#x 缺 C1 绑定所需的常量段，拒绝发布（留现场编，本次第 %u 条）",
+                     (unsigned)rec->c1_ok, k + 1);
+            nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", b);
         }
-        if (need) {
-            static _Atomic unsigned n;
-            unsigned k = atomic_fetch_add(&n, 1);
-            if (k < 4) {
-                char b[176];
-                snprintf(b, sizeof b, "程序预热：清单 c1_ok=%#x 缺 C1 绑定所需的常量段，拒绝发布（留现场编，本次第 %u 条）",
-                         (unsigned)rec->c1_ok, k + 1);
-                nvn_plat_log(NVN_PLAT_LOG_INFO, "warm", b);
-            }
-            entry_free(e);
-            inflight_abort(rec->identity);
-            nvk_prog_warm_stat_build(-1);
-            return -1;   // 本局不再重试（重试也没用，清单要等真实 draw 把 c1 记回去）；真实 draw 会自己备出来
-        }
+        entry_free(e);
+        inflight_abort(rec->identity);
+        nvk_prog_warm_stat_build(-1);
+        return -1;
     }
     if (!e) {   // 缓存/离线库里没有这份身份的结果字节：正常分支（不是 bug），真实 draw 到时发需求编译
         inflight_abort(rec->identity);
