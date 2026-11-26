@@ -173,13 +173,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     continue;
                 }
 
-                // Guest uniforms can hold tables of arbitrary layout and length. Keep the
-                // loaded handle for the pool lookup instead of clamping its buffer offset (#1956).
-                if (src0CbufSlot > NvnTextureBufferIndex && gpuAccessor.QueryHostSupportsBindlessUniformHandles())
-                {
-                    continue;
-                }
-
                 Operand ldcSrc1 = handleAsgOp.GetSource(1);
 
                 // We expect field index 0 to be accessed.

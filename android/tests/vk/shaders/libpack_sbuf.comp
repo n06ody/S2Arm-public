@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 5, std430) buffer Words { uint data[]; } entry_data;
+void main() {
+    entry_data.data[1] = entry_data.data[0] + 3u;
+}

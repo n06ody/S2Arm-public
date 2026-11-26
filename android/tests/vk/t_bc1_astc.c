@@ -5,16 +5,34 @@
 #define nvn_plat_flag backend_fixture_flag
 #define nvn_plat_log backend_fixture_log
 #include "t_backend_vk.c"
+#include "../../../graphics/nvn/replay/rp_bc7.h"
 #undef nvn_plat_log
 #undef nvn_plat_flag
 #undef main
 #include "astcenc.h"
 #include "backend_vulkan_bc1_astc_spv.h"
+#include "backend_vulkan_bc7_astc_spv.h"
+#include "backend_vulkan_bc7_hybrid_spv.h"
+#include "bc7_astc_shaders/inspect.h"
+#include "nvn_deswizzle.h"
+#include <inttypes.h>
+#include <math.h>
 #include "nvn_bcdec.h"
 
+static uint64_t fixture_wait_ns = 5000000000ull;
+
 static unsigned bc_timed_dispatches, bc_missing_dispatches;
+static unsigned long long reuse_watched, reuse_nominated, reuse_requeues, reuse_waits;
 void nvn_plat_log(int level, const char *category, const char *message) {
     if (!strcmp(category, "bc-upload")) {
+        unsigned long long watch, first, nominated, requeues, invalidated, demoted, published, rejected, fence, busy, waits;
+        if (sscanf(message, "bc7-reuse watch=%llu first_sample=%llu nominate=%llu requeue=%llu invalidate=%llu demote=%llu publish=%llu reject=%llu natural_fence_skip=%llu busy_skip=%llu explicit_wait=%llu",
+                   &watch, &first, &nominated, &requeues, &invalidated, &demoted, &published, &rejected, &fence, &busy, &waits) == 11) {
+            reuse_watched += watch;
+            reuse_nominated += nominated;
+            reuse_requeues += requeues;
+            reuse_waits += waits;
+        }
         if (strstr(message, "dispatch path=rgba8 format=0x42 blocks=1 ") == message) {
             if (strstr(message, "gpu_ns=missing")) bc_missing_dispatches++;
             else if (strstr(message, "gpu_ns=")) bc_timed_dispatches++;
@@ -25,7 +43,7 @@ void nvn_plat_log(int level, const char *category, const char *message) {
 
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_bc_upload_time")) return 1;
-    if (!strcmp(name, "nvk_bc1_astc")) return 1;
+    if (!strcmp(name, "nvk_bc1_astc") || !strcmp(name, "nvk_bc7_astc")) return 1;
     return backend_fixture_flag(name, dflt);
 }
 
@@ -94,21 +112,29 @@ static void sample_comparison(const uint8_t *astc, enum astcenc_profile profile)
     astcenc_context_free(ctx);
 }
 
-static int encode(nvn_gpu_pipe pipe, unsigned nblocks, nvn_gpu_buf in, nvn_gpu_buf out, uint64_t serial) {
+static int encode(nvn_gpu_pipe pipe, unsigned nblocks, size_t source_bytes, nvn_gpu_buf in, nvn_gpu_buf out,
+                  nvn_gpu_buf tables, uint64_t serial) {
     nvn_gpu_cmd cmd = begin_cmd();
-    nvn_gpu_binding b[2] = {
-        {.ent = 0, .cls = NVN_GPU_RES_SSBO, .u.b = {in, 0, sizeof source}},
+    nvn_gpu_binding b[] = {
+        {.ent = 0, .cls = NVN_GPU_RES_SSBO, .u.b = {in, 0, source_bytes}},
         {.ent = 1, .cls = NVN_GPU_RES_SSBO, .u.b = {out, 0, (BLOCKS + 1) * 16}},
+        {.ent = 2, .cls = NVN_GPU_RES_SSBO, .u.b = {tables, 0, sizeof nvk_bc7_hybrid_tables}},
     };
     nvn_gpu_set_pipe(cmd, pipe);
-    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, b, 2);
+    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, b, tables ? 3u : 2u);
     nvn_gpu_push(cmd, NVN_GPU_SH_CS, 0, &nblocks, sizeof nblocks);
     nvn_gpu_dispatch(cmd, pipe, (nblocks + 63) / 64, 1, 1, NULL, 0);
     nvn_gpu_err e = {0};
-    const int ok = OK(nvn_gpu_cmd_commit(cmd, serial, on_done, NULL, &e)) &&
-                   OK(nvn_gpu_fence_wait(serial, 5000000000ull, &e));
-    CHECK(ok, "BC1 ASTC fixture submit: %s", e.why);
-    return ok;
+    const double start = c89_now_ms();
+    const nvn_gpu_rc commit = nvn_gpu_cmd_commit(cmd, serial, on_done, NULL, &e);
+    const double submitted = c89_now_ms();
+    CHECK(OK(commit), "BC ASTC commit signal=%" PRIu64 " rc=%d: %s", serial, commit.code, e.why);
+    if (!OK(commit)) return 0;
+    const nvn_gpu_rc wait = nvn_gpu_fence_wait(serial, fixture_wait_ns, &e);
+    CHECK(OK(wait), "BC ASTC fence signal=%" PRIu64 " blocks=%u rc=%d: %s", serial, nblocks, wait.code, e.why);
+    printf("BC ASTC dispatch signal=%" PRIu64 " blocks=%u submit_ms=%.2f wait_ms=%.2f rc=%d\n",
+           serial, nblocks, submitted - start, c89_now_ms() - submitted, wait.code);
+    return OK(wait);
 }
 
 // 同版宿主无 ASTC，仍可通过实际纹理入口核 RGBA8 回落路径与原压缩字节。
@@ -169,8 +195,15 @@ static void transparent_fallback(void) {
     g_dev.bc_decode_mask = old_mask;
 }
 
+#include "t_bc7_astc.inc"
+#include "t_bc7_hybrid.inc"
+
 int main(int argc, char **argv) {
-    if (argc != 1 && argc != 2) return 2;
+    const int timeout_probe = argc == 2 && !strcmp(argv[1], "--fence-timeout");
+    const int hybrid = argc >= 2 && !strcmp(argv[1], "--bc7-hybrid");
+    const int bc7 = hybrid || (argc >= 2 && !strcmp(argv[1], "--bc7"));
+    if (argc > 2 + bc7) return 2;
+    const char *shader_dir = argc == 2 + bc7 && !timeout_probe ? argv[1 + bc7] : NULL;
     char why[256];
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) {
         fprintf(stderr, "BC1 ASTC fixture device: %s\n", why);
@@ -185,24 +218,55 @@ int main(int argc, char **argv) {
     const nvn_gpu_layout_ent entries[] = {
         {.binding = 0, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_R, .count = 1, .stages = cs},
         {.binding = 1, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_RW, .count = 1, .stages = cs},
+        {.binding = 2, .cls = NVN_GPU_RES_SSBO, .access = NVN_GPU_ACC_R, .count = 1, .stages = cs},
     };
-    const nvn_gpu_layout layout = {.ent = entries, .nent = 2, .push_bytes = 4};
+    const nvn_gpu_layout layout = {.ent = entries, .nent = hybrid ? 3u : 2u, .push_bytes = 4};
     nvn_gpu_err pipe_err = {0};
     nvn_gpu_shader shader = NULL;
     nvn_gpu_shader_src src = {
         .stage = NVN_GPU_SH_CS, .kind = NVN_GPU_BLOB_SPIRV, .entry = "main",
-        .blob = nvk_bc1_astc_spv, .bytes = sizeof nvk_bc1_astc_spv, .layout = &layout,
+        .blob = bc7 ? nvk_bc7_astc_spv : nvk_bc1_astc_spv,
+        .bytes = bc7 ? sizeof nvk_bc7_astc_spv : sizeof nvk_bc1_astc_spv, .layout = &layout,
     };
-    if (argc == 2) {
-        shader = load_one_shader(argv[1], "encode.comp", NVN_GPU_SH_CS, &layout);
+    if (hybrid) {
+        src.blob = nvk_bc7_hybrid_spv;
+        src.bytes = sizeof nvk_bc7_hybrid_spv;
+    }
+    if (shader_dir) {
+        shader = load_one_shader(shader_dir, "encode.comp", NVN_GPU_SH_CS, &layout);
     } else {
         CHECK(OK(nvn_gpu_shader_load(&src, &shader, &pipe_err)), "BC1 shader: %s", pipe_err.why);
     }
     if (!shader) return 2;
     nvn_gpu_pipe pipe = NULL;
     const nvn_gpu_stage_desc stage = {.sh = shader};
+    const double pipeline_start = c89_now_ms();
     CHECK(OK(nvn_gpu_cpipe_get(&stage, NVN_GPU_PIPE_SYNC, &pipe, &pipe_err)), "BC1 pipeline: %s", pipe_err.why);
     if (!pipe) return 2;
+    printf("BC ASTC pipeline_ms=%.2f\n", c89_now_ms() - pipeline_start);
+
+    if (timeout_probe) {
+        // 已提交段在完成线程前保留，稳定命中 fence 与 close 的超时，避免依赖某驱动有多慢。
+        fill_opaque();
+        nvn_gpu_buf in = make_buf(sizeof source, NVN_GPU_MEM_SHARED, source);
+        nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
+        if (!in || !out) return 2;
+        fixture_wait_ns = 20000000ull;
+        nvn_gpu_vk_test_delay_segment(1, 500);
+        encode(pipe, 1, sizeof source, in, out, NULL, 1);
+        nvn_gpu_buf_release(out, NULL, NULL);
+        nvn_gpu_buf_release(in, NULL, NULL);
+        goto close;
+    }
+
+    if (bc7) {
+        if (hybrid) hybrid_codec(pipe);
+        else {
+            bc7_codec(pipe);
+            if (!shader_dir) bc7_storage();
+        }
+        goto close;
+    }
 
     fill_opaque();
     CHECK(nvn_bc_decode(NVN_FORMAT_RGBA_DXT1, (const uint8_t *)source, BLOCK_X * 8,
@@ -211,7 +275,7 @@ int main(int argc, char **argv) {
     nvn_gpu_buf out = make_buf((BLOCKS + 1) * 16, NVN_GPU_MEM_SHARED, NULL);
     if (!in || !out) return 2;
     memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-    if (!encode(pipe, BLOCKS, in, out, 1)) return 2;
+    if (!encode(pipe, BLOCKS, sizeof source, in, out, NULL, 1)) return 2;
     const uint8_t *data = buf_cpu(out);
     CHECK(*(const uint32_t *)data == 0, "Opaque aggregate must allow ASTC publication");
     sample_comparison(data + 16, ASTCENC_PRF_LDR);
@@ -222,17 +286,29 @@ int main(int argc, char **argv) {
     words[2 * BLOCKS - 2] = 0xf80007e0u;
     words[2 * BLOCKS - 1] = 0xc0000000u;
     memset(buf_cpu(out), 0, (BLOCKS + 1) * 16);
-    if (!encode(pipe, BLOCKS, in, out, 2)) return 2;
+    if (!encode(pipe, BLOCKS, sizeof source, in, out, NULL, 2)) return 2;
     CHECK(*(const uint32_t *)data == 1, "BC1 transparent block must mark the texture for RGBA8");
 
     transparent_fallback();
 
     nvn_gpu_buf_release(out, NULL, NULL);
     nvn_gpu_buf_release(in, NULL, NULL);
+close:
     nvn_gpu_shader_release(shader);
     nvn_gpu_err err = {0};
-    CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "BC1 ASTC fixture close: %s", err.why);
+    const nvn_gpu_rc closed = nvn_gpu_close(fixture_wait_ns, &err);
+    if (!OK(closed)) {
+        CHECK(0, "BC ASTC fixture close rc=%d: %s", closed.code, err.why);
+        // close 超时保留后端和在途资源。进程退出交给系统回收，不能先销毁仍被 worker 使用的设备。
+        fflush(NULL);
+        _Exit(1);
+    }
     CHECK(!s2a_vk_device_destroy(&g_dev, 1), "BC1 ASTC fixture device destroy");
-    printf("BC1 ASTC shader failures=%d\n", g_fail);
+    if (bc7 && !hybrid && !shader_dir) {
+        CHECK(reuse_watched == 1 && reuse_nominated == 1 && reuse_requeues == 0 && reuse_waits == 0,
+              "BC7 reuse diagnostics watch=%llu nominate=%llu requeue=%llu explicit_wait=%llu",
+              reuse_watched, reuse_nominated, reuse_requeues, reuse_waits);
+    }
+    printf("BC%d ASTC shader failures=%d\n", bc7 ? 7 : 1, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -1,8 +1,14 @@
 #include "nvn_unimpl.h"
+#define S2A_RENDER_AUDIT_IMPLEMENTATION
+#include "nvn_render_audit.h"
 #include "nvn_plat.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+
+#if NVN_RENDER_AUDIT_SUPPORTED
+#include "nvn_render_audit.inc"
+#endif
 
 enum { UN_MAX = 256, UN_NAME = 48 };
 static struct { char cls[12], name[UN_NAME]; uint64_t n; } g_un[UN_MAX];
@@ -17,6 +23,11 @@ static int un_find(const char *cls, const char *name) {
 uint64_t nvn_unimpl(const char *cls, const char *name, const void *site) {
     if (!cls) cls = "?";
     if (!name) name = "?";
+    NVN_RA_IF(
+        char reason[64];
+        snprintf(reason, sizeof reason, "%s/%s", cls, name);
+        nvn_render_audit_event(NVN_RA_UNIMPL, reason, NULL, NULL);
+    );
     char line[160]; int first = 0, full = 0; uint64_t n = 0;
     pthread_mutex_lock(&g_un_mu);
     int i = un_find(cls, name);
