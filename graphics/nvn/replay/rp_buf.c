@@ -924,23 +924,67 @@ void rp_op_clear_buf(const p_clear_buf *cb, const void *rec) {   // 32 位样式
     if (i < n) memcpy(p + i, &cb->value, (size_t)(n - i));
 }
 
-// OP_COPY_B2T：缓冲里是线性行（行距 / 片距可由游戏设），直接从游戏内存按当前段的 GPU 顺序传进贴图（nvn_mtl.m copy_b2t @13762）。
-// 线性 / 线性渲染目标贴图走同一条路：宿主贴图不按游戏的内存布局建，拷贝只看区域、行距、片距（iOS copy_b2t 同样不分）
+// 缓冲到贴图：未落地的 GPU 写在池镜像中，纯 CPU 源仍走上传入口（含格式转换）。
 void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
-    const tex_t *t = o->tex; if (!t) return;
-    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!bpb || o->r.width <= 0 || o->r.height <= 0) { nvn_unimpl("tex", "b2t_bad_format_or_region", rec); return; }
-    uint32_t level = o->has_view && o->view.set_levels ? o->view.base_level : 0, layer0 = o->has_view && o->view.set_layers ? o->view.min_layer : 0;
-    uint64_t row = o->row_stride ? o->row_stride : (uint64_t)(((uint32_t)o->r.width + (uint32_t)bw - 1) / (uint32_t)bw) * (uint64_t)bpb;
-    uint64_t rows = ((uint32_t)o->r.height + (uint32_t)bh - 1) / (uint32_t)bh, img = o->image_stride ? o->image_stride : row * rows;
-    uint32_t nz = o->r.depth > 0 ? (uint32_t)o->r.depth : 1;
-    if (!in_pool(o->src, img * nz)) { nvn_unimpl("buf", "b2t_source_outside_pools", rec); return; }
+    const tex_t *t = o->tex;
+    if (!t || !c) return;
+    nvn_fmt_info fi;
+    if (!nvn_fmt_info_of(t->d.format, &fi) || o->r.width <= 0 || o->r.height <= 0 || o->r.depth < 0) {
+        nvn_unimpl("tex", "b2t_bad_format_or_region", rec); return;
+    }
+    uint32_t level = o->has_view && o->view.set_levels ? o->view.base_level : 0;
+    int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
+    uint32_t layer0 = !is3d && o->has_view && o->view.set_layers ? o->view.min_layer : 0;
+    uint32_t nz = o->r.depth ? (uint32_t)o->r.depth : 1;
+    if (level >= (t->d.levels ? t->d.levels : 1u) || level >= 32) {
+        nvn_unimpl("tex", "b2t_bounds", rec); return;
+    }
+    uint32_t w = t->d.width >> level, h = t->d.height >> level;
+    if (!w) w = 1;
+    if (!h || rp_fold_1d_target(t->d.target) != t->d.target) h = 1;
+    uint32_t layers = is3d ? t->d.depth >> level : rp_tex_layer_count(t);
+    if (is3d && !layers) layers = 1;
+    uint64_t end_x = (uint64_t)(uint32_t)o->r.xoffset + (uint32_t)o->r.width;
+    uint64_t end_y = (uint64_t)(uint32_t)o->r.yoffset + (uint32_t)o->r.height;
+    if (o->r.xoffset < 0 || o->r.yoffset < 0 || o->r.zoffset < 0 ||
+        end_x > w || end_y > h || (uint64_t)layer0 + (uint32_t)o->r.zoffset + nz > layers ||
+        o->r.xoffset % fi.bw || o->r.yoffset % fi.bh ||
+        (o->r.width % fi.bw && end_x != w) || (o->r.height % fi.bh && end_y != h)) {
+        nvn_unimpl("tex", "b2t_bounds", rec); return;
+    }
+    uint64_t bytes = (((uint64_t)o->r.width + fi.bw - 1) / fi.bw) * fi.bytes;
+    uint64_t rows = ((uint64_t)o->r.height + fi.bh - 1) / fi.bh;
+    uint64_t row = o->row_stride ? o->row_stride : bytes;
+    if (row < bytes || (!fi.expand && row % fi.bytes) ||
+        row / fi.bytes > UINT32_MAX / fi.bw || row > UINT64_MAX / rows) {
+        nvn_unimpl("tex", "b2t_bad_stride", rec); return;
+    }
+    uint64_t img = o->image_stride ? o->image_stride : row * rows;
+    if (img < row * rows || img / row > UINT32_MAX / fi.bh || img > (UINT64_MAX - o->src) / nz) {
+        nvn_unimpl("tex", "b2t_bad_stride", rec); return;
+    }
+    uint64_t total = img * nz;
+    if (!in_pool(o->src, total)) { nvn_unimpl("buf", "b2t_source_outside_pools", rec); return; }
+    nvn_gpu_buf source = NULL;
+    uint64_t off = 0;
+    if (rp_buf_gpu_pending(o->src, total)) {
+        // 上传入口要在 CPU 上展开 / 转深度或拆深度模板面，不能拿旧客体字节做转换。
+        if (fi.expand || (fi.depth && fi.stencil) || (rp_fmt_caps(t->d.format) & NVN_GPU_FMT_SUBST)) {
+            nvn_unimpl("tex", "b2t_gpu_source_requires_conversion", rec); return;
+        }
+        if (!rp_buf_resolve(c, o->src, total, &source, &off)) {
+            nvn_unimpl("buf", "b2t_pending_source_unavailable", rec); return;
+        }
+        if ((off & 3) || off % fi.bytes || (nz > 1 && ((img & 3) || img % fi.bytes))) {
+            nvn_unimpl("tex", "b2t_gpu_source_alignment", rec); return;
+        }
+    }
     nvn_gpu_tex g = rp_tex_resolve_plain(t, c);
-    if (!g || !c) return;
+    if (!g) return;
     if (t->d.target == NVN_TEXTURE_TARGET_3D && nvn_plat_flag("nvk_drawlog", 0)) {   // 调试开关下：三维贴图的每次上传打一行
         char b[200]; snprintf(b, sizeof b, "三维贴图上传 #%llu 格式 %#x 尺寸 %dx%dx%d 级 %u：区域 %d,%d,%d %dx%dx%d 行距 %llu 片距 %llu（记录里 行 %llu 片 %llu）块 %dx%d 每块 %d 字节",
                              (unsigned long long)t->serial, (unsigned)t->d.format, t->d.width, t->d.height, t->d.depth, level, o->r.xoffset, o->r.yoffset, o->r.zoffset, o->r.width, o->r.height, o->r.depth,
-                             (unsigned long long)row, (unsigned long long)img, (unsigned long long)o->row_stride, (unsigned long long)o->image_stride, bw, bh, bpb);
+                             (unsigned long long)row, (unsigned long long)img, (unsigned long long)o->row_stride, (unsigned long long)o->image_stride, fi.bw, fi.bh, fi.bytes);
         nvn_plat_log(NVN_PLAT_LOG_INFO, "tex", b);
     }
     for (uint32_t z = 0; z < nz; z++) {
@@ -948,7 +992,8 @@ void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         // 第几层 / 第几片都经 layer 交给后端（三维贴图的 layer 就是深度方向的片号；视图的起始层只对分层贴图有意义）
         uint32_t layer = (uint32_t)o->r.zoffset + z + (t->d.target == NVN_TEXTURE_TARGET_3D ? 0 : layer0);
         r.zoffset = 0;
-        nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
+        if (source) nvn_gpu_copy_buf_tex(c, source, off + z * img, row, img, g, level, layer, &r);
+        else nvn_gpu_tex_upload(c, g, level, layer, &r, (const void *)(uintptr_t)(o->src + z * img), row, img);
     }
     rp_tex_mark_gpu_written(t);   // 这张贴图的内容从此不再从它自己的存储重传
 }
