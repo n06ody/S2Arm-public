@@ -460,7 +460,9 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
     nvn_gpu_shown shown = {ticket, NVN_GPU_SHOWN_DROPPED, 0.0};
     nvn_gpu_cmd ch = NULL;
     { static uint64_t np; if (np % 300 == 1) g_draw_tm = nvn_plat_flag("nvk_gputime", 0) != 0;
-      if (++np % 300 == 0 && g_draw_tm) {   // 诊断读数：见 g_oc
+      const int sample = ++np % 300 == 0;
+      if (sample) blend_source_report("periodic");   // force-stop 时以最后一条周期读数为准
+      if (sample && g_draw_tm) {   // 诊断读数：见 g_oc
         uint64_t v[OC_N]; for (int i = 0; i < OC_N; i++) v[i] = __atomic_exchange_n(&g_oc[i], 0, __ATOMIC_RELAXED);
         char b[640]; snprintf(b, sizeof b, "对象读数（每帧，近 300 帧）：新建渲染通道 %.1f、帧缓冲 %.1f、命令池 %.1f、描述符池 %.1f；分配描述符集 %.1f 次、写描述符 %.1f 次；遮挡查询 %.1f 个；新建视图 %.1f 个；取窗口图 %.1f 毫秒",
             v[OC_RP] / 300.0, v[OC_FB] / 300.0, v[OC_CPOOL] / 300.0, v[OC_DPOOL] / 300.0, v[OC_DALLOC] / 300.0, v[OC_DWRITE] / 300.0, v[OC_QUERY] / 300.0, v[OC_VIEW] / 300.0, (double)__atomic_exchange_n(&g_acq_ns, 0, __ATOMIC_RELAXED) / 300.0 / 1e6);

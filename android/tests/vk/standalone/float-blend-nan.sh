@@ -36,6 +36,17 @@ rc=0
 timeout 120 "$out/test" "$out/shaders" > "$log" 2>&1 || rc=$?
 cat "$log"
 [ "$rc" = 0 ] && no_validation_errors "$log" && grep -qx 'float-blend-nan: failures=0' "$log" || exit 1
+if grep -q 'retained_count=' "$log"; then echo '【红】关闭长帧诊断时打印了驻留读数' >&2; exit 1; fi
+log="$out/retained-sources.log"
+rc=0
+timeout 120 "$out/test" "$out/shaders" --retained-sources > "$log" 2>&1 || rc=$?
+cat "$log"
+[ "$rc" = 0 ] && no_validation_errors "$log" && grep -qx 'float-blend-nan: failures=0' "$log" || exit 1
+source_bytes=$(wc -c < "$out/shaders/float_blend_nan.frag.spv")
+for phase in periodic close; do
+    expected="[float-blend-nan] phase=$phase retained_count=1 retained_bytes=$((source_bytes)) alloc_count=4 alloc_bytes=$((4 * source_bytes)) freed_count=3 freed_bytes=$((3 * source_bytes))"
+    grep -Fxq "$expected" "$log" || { echo "【红】缺少驻留对账：$expected" >&2; exit 1; }
+done
 log="$out/original-module.log"
 rc=0
 timeout 120 "$out/test" "$out/shaders" --original-module > "$log" 2>&1 || rc=$?

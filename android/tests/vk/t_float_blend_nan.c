@@ -7,9 +7,11 @@
 #undef main
 
 static int use_original_module;
+static int retained_sources;
 
 int nvn_plat_flag(const char *name, int dflt) {
     if (use_original_module && !strcmp(name, "nvk_float_blend_nan_guard")) return 0;
+    if (retained_sources && !strcmp(name, "nvk_hitch_log")) return 1;
     return backend_fixture_flag(name, dflt);
 }
 
@@ -144,6 +146,7 @@ out:
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[2], "--original-module")) use_original_module = 1;
+    else if (argc == 3 && !strcmp(argv[2], "--retained-sources")) retained_sources = 1;
     else if (argc != 2) return 64;
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why) != 0) {
@@ -157,12 +160,21 @@ int main(int argc, char **argv) {
     CHECK(nvn_gpu_format_caps(NVN_FORMAT_RGBA16F) & NVN_GPU_FMT_BLEND, "RGBA16F blending supported");
     CHECK(g_dev.core_features.independentBlend, "independent MRT blending supported");
     nvn_gpu_shader vs = load_stage(argv[1], "libpack_depth.vert", NVN_GPU_SH_VS, 0);
+    if (retained_sources) {
+        // 一份保留到会话清理，一份在首次用到保护前就销毁。
+        (void)load_stage(argv[1], "float_blend_nan.frag", NVN_GPU_SH_FS, 0);
+        nvn_gpu_shader unused = load_stage(argv[1], "float_blend_nan.frag", NVN_GPU_SH_FS, 0);
+        nvn_gpu_shader_release(unused);
+    }
     if (vs && !g_fail) {
         test_source(argv[1], vs, 0);
         test_source(argv[1], vs, 1);
     }
     nvn_gpu_shader_release(vs);
     nvn_gpu_err err = {0};
+    // 周期汇总按上屏调用计次；离屏夹具没有表面，调用本身仍需明确拒绝。
+    for (uint64_t i = 1; i <= 300; i++)
+        CHECK(nvn_gpu_present(NULL, NULL, NULL, i, NULL, NULL, &err).code == NVN_GPU_E_ARG, "no surface");
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
     s2a_vk_device_destroy(&g_dev, 1);
     printf("float-blend-nan: failures=%d\n", g_fail);

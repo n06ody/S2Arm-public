@@ -192,6 +192,10 @@ struct nvn_vk_blend_shader {
     uint8_t slots;
 };
 
+struct blend_source_stats {
+    uint64_t alloc_count, alloc_bytes, freed_count, freed_bytes;
+};
+
 struct nvn_gpu_shader_s {
     VkShaderModule mod;
     struct nvn_vk_blend_shader *blend_guard;
@@ -519,6 +523,8 @@ struct nvn_gpu_vk {
     uint32_t border_live;          // 存活的自定义边框色 VkSampler 个数，对照 dev->custom_border_max（g_mu 下改）
     struct nvn_gpu_shader_s *shaders;
     int float_blend_nan_guard;
+    int float_blend_source_diag;
+    struct blend_source_stats blend_sources;
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
     struct vk_land_slot land_slots[3];
@@ -556,6 +562,45 @@ static void pipe_creation_open(const struct s2a_vk_device *dev) {
 
 static struct nvn_gpu_vk g;
 static _Atomic int g_open;   // 跨线程：close 置 0 后其他线程据此拒收
+// 装载、后台建管线和释放可在不同线程发生；一条日志取同一时刻的四个累计数。
+static pthread_mutex_t g_blend_source_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void blend_source_note_alloc(size_t bytes) {
+    if (!g.float_blend_source_diag) return;
+    pthread_mutex_lock(&g_blend_source_mu);
+    g.blend_sources.alloc_count++;
+    g.blend_sources.alloc_bytes += bytes;
+    pthread_mutex_unlock(&g_blend_source_mu);
+}
+
+static void blend_source_free(struct nvn_vk_blend_shader *guard) {
+    if (!guard->source) return;
+    if (g.float_blend_source_diag) {
+        pthread_mutex_lock(&g_blend_source_mu);
+        free(guard->source);
+        g.blend_sources.freed_count++;
+        g.blend_sources.freed_bytes += guard->words * sizeof *guard->source;
+        pthread_mutex_unlock(&g_blend_source_mu);
+    } else {
+        free(guard->source);
+    }
+    guard->source = NULL;
+}
+
+static void blend_source_report(const char *phase) {
+    if (!g.float_blend_source_diag) return;
+    pthread_mutex_lock(&g_blend_source_mu);
+    const struct blend_source_stats s = g.blend_sources;
+    pthread_mutex_unlock(&g_blend_source_mu);
+    char line[256];
+    snprintf(line, sizeof line, "phase=%s retained_count=%llu retained_bytes=%llu "
+                "alloc_count=%llu alloc_bytes=%llu freed_count=%llu freed_bytes=%llu", phase,
+             (unsigned long long)(s.alloc_count - s.freed_count), (unsigned long long)(s.alloc_bytes - s.freed_bytes),
+             (unsigned long long)s.alloc_count, (unsigned long long)s.alloc_bytes,
+             (unsigned long long)s.freed_count, (unsigned long long)s.freed_bytes);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "float-blend-nan", line);
+}
+
 static uint64_t g_border_nearest;     // sampler_border_color_nearest 计数（samp_border_nearest_note）
 static int g_border_nearest_said;     // 本局已打过边框色就近那一行：开会话时清零
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2512,6 +2557,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     g.dev = dev;
     pipe_creation_open(dev);
     g.float_blend_nan_guard = nvn_plat_flag("nvk_float_blend_nan_guard", 1) != 0;
+    g.float_blend_source_diag = nvn_plat_flag("nvk_hitch_log", 0) != 0;
     const int land_setting = nvn_plat_flag("nvk_land_readback", 0);
     g.land_auto = land_setting == 2;
     if (land_setting == 1 || g.land_auto) {
@@ -2714,6 +2760,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     pthread_mutex_unlock(&g_mu);
     pthread_join(g.worker, NULL);
     g.worker_started = 0;
+    blend_source_report("close");   // 清理会话对象之前，保留真正的局末常驻数
     if (g.bc_time_on) {
         pthread_mutex_lock(&g_bc_time_mu);
         bc_time_log_window(now_ns(), 1);
@@ -3723,7 +3770,7 @@ static void destroy_shader_objects(VkDevice dev, struct nvn_gpu_shader_s *sh) {
     if (sh->blend_guard) {
         struct nvn_vk_blend_shader *guard = sh->blend_guard;
         if (guard->module) vkDestroyShaderModule(dev, guard->module, NULL);
-        free(guard->source);
+        blend_source_free(guard);
         pthread_mutex_destroy(&guard->mu);
         free(guard);
     }
@@ -4074,6 +4121,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             guard->source = source;
             guard->words = ci.codeSize / sizeof *source;
             sh->blend_guard = guard;
+            blend_source_note_alloc(ci.codeSize);
         }
         free(array_code);
         if (module_result != VK_SUCCESS) {
@@ -4608,8 +4656,7 @@ static nvn_gpu_rc float_blend_nan_module(const struct nvn_gpu_shader_s *sh, uint
             guard->spec_id = patched.spec_id;
             guard->slots = patched.slots;
         }
-        free(guard->source);
-        guard->source = NULL;
+        blend_source_free(guard);
     }
     const uint32_t wanted = *slots;
     *slots &= guard->slots;
