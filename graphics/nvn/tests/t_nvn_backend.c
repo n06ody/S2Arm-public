@@ -14,7 +14,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 26, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 27, "契约版本变了：同批更新本签名表");
 
 // v24 冷环绑定描述：缓冲身份、访问区间和嵌套前缀按共用契约传递。
 #define FIELD_TYPE(record, member, T) \
@@ -89,6 +89,13 @@ SIG(nvn_gpu_buf_wrap, nvn_gpu_rc (*)(void *, uint64_t, nvn_gpu_buf *, nvn_gpu_er
 SIG(nvn_gpu_buf_create, nvn_gpu_rc (*)(uint64_t, int, const void *, nvn_gpu_buf *, nvn_gpu_err *));
 SIG(nvn_gpu_buf_va, uint64_t (*)(nvn_gpu_buf));
 SIG(nvn_gpu_buf_cpu, uint8_t *(*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_state, int (*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_flush, int (*)(nvn_gpu_buf, uint64_t, uint64_t));
+SIG(nvn_gpu_mirror_memory_cached, int (*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_visibility_enabled, int (*)(void));
+SIG(nvn_gpu_mirror_visibility_record, void (*)(nvn_gpu_cmd, const nvn_gpu_readback_span *, uint32_t));
+SIG(nvn_gpu_mirror_version_atom, uint64_t (*)(nvn_gpu_buf));
+SIG(nvn_gpu_mirror_copy_span, void (*)(nvn_gpu_cmd, nvn_gpu_buf, nvn_gpu_buf, uint64_t, uint64_t));
 SIG(nvn_gpu_buf_release, void (*)(nvn_gpu_buf, nvn_gpu_retired_fn, void *));
 SIG(nvn_gpu_buf_use, void (*)(nvn_gpu_cmd, nvn_gpu_buf));
 SIG(nvn_gpu_buf_write, void (*)(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, const void *, uint64_t));
