@@ -37,10 +37,51 @@ namespace S2A.DirectCompiler
         //   原先三段都沿用 Ryujinx ShaderCache.DefaultFlags（= DebugMode），是出库链 11-07 改口径时没跟上的遗留。
         internal static TranslationFlags GraphicsFlags(string stage) => stage == "gs" ? ShaderCache.DefaultFlags : ShaderCache.DefaultFlags & ~TranslationFlags.DebugMode;
 
-        public static byte[] Compile(byte[] requestUtf8)
+        public sealed class PhaseProbe
+        {
+            private readonly Func<long> _cpuNow;
+
+            public PhaseProbe(Func<long> cpuNow) => _cpuNow = cpuNow;
+            public string RequestSha { get; internal set; }
+            public long SpirvWallTicks { get; private set; }
+            public long SpirvCpuNs { get; private set; }
+            public (long WallTicks, long CpuNs) Parse, Translate, Reflect, Serialize, InputCopy, Emit;
+
+            public (long WallTicks, long CpuNs) Now() =>
+                (System.Diagnostics.Stopwatch.GetTimestamp(), _cpuNow());
+
+            public (long WallTicks, long CpuNs) Since((long WallTicks, long CpuNs) start)
+            {
+                var end = Now();
+                return (end.WallTicks - start.WallTicks, end.CpuNs - start.CpuNs);
+            }
+
+            internal void BeginSpirv()
+            {
+                TranslatorContext.SetSpirvPhaseSample((wall, cpu) =>
+                {
+                    SpirvWallTicks += wall;
+                    SpirvCpuNs += cpu;
+                }, _cpuNow);
+            }
+        }
+
+        public static byte[] Compile(byte[] requestUtf8) => CompileCore(requestUtf8, null);
+
+        public static byte[] Compile(byte[] requestUtf8, PhaseProbe probe)
+        {
+            if (probe == null) return CompileCore(requestUtf8, null);
+            probe.BeginSpirv();
+            try { return CompileCore(requestUtf8, probe); }
+            finally { TranslatorContext.SetSpirvPhaseSample(null, null); }
+        }
+
+        private static byte[] CompileCore(byte[] requestUtf8, PhaseProbe probe)
         {
             // 诊断：拒收行带上请求 sha，真机上就能把拒收与同一条请求对上（不用另开请求落盘开关）。
+            var parseStart = probe?.Now() ?? default;
             _requestSha = Convert.ToHexStringLower(Sha256.HashData(requestUtf8));
+            if (probe != null) probe.RequestSha = _requestSha;
             using JsonDocument document = JsonStrict.Parse(requestUtf8, MaxRequestBytes);
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
@@ -94,6 +135,8 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("UNSUPPORTED_PROGRAM", "GS slot does not hold a geometry shader header");
             }
             _ = sourceParserVersion;
+            if (probe != null) probe.Parse = probe.Since(parseStart);
+            var translateStart = probe?.Now() ?? default;
 
             var queries = new List<DirectQuery>();
             var allocator = new DirectAllocator(profile) { RequestKey = requestId };
@@ -173,6 +216,8 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("TRANSLATION", error.GetType().Name + ": " + error.Message);
             }
 
+            if (probe != null) probe.Translate = probe.Since(translateStart);
+            var reflectStart = probe?.Now() ?? default;
             foreach (DirectGpuAccessor accessor in accessors)
                 if (accessor.Diagnostics.Count != 0)
                     throw new DirectCompileException("TRANSLATION_DIAGNOSTIC",
@@ -183,10 +228,14 @@ namespace S2A.DirectCompiler
             ResolvePoolSlots(translated, allocator);
             ResolveStorageSlots(translated, allocator);
 
+            if (probe != null) probe.Reflect = probe.Since(reflectStart);
+            var serialStart = probe?.Now() ?? default;
             bool v2 = allocator.Bindings.Any(b => b.SamplerSlot >= 0 || b.ConstSampler >= 0 || b.Pool != null);   // 新字段（samp_slot / constSampler / pool）都按 v2 写：v1 宿主不认就整份拒
             byte[] content = WriteContent(program, profile, translated, allocator, queries, v2);
             string contentHash = "sha256-" + Convert.ToHexStringLower(Sha256.HashData(content));
-            return WriteEnvelope(session, generation, requestId, content, contentHash, v2, linkMapVs, linkMapFs);
+            byte[] result = WriteEnvelope(session, generation, requestId, content, contentHash, v2, linkMapVs, linkMapFs);
+            if (probe != null) probe.Serialize = probe.Since(serialStart);
+            return result;
         }
 
         // 与 runtime/direct/control.c、merge_extract.py:cs_facts 同口径：+0x748 三组、+0x754 shared，

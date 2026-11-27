@@ -40,3 +40,5 @@ extern uint64_t rp_tex_sep_gen[6];   // 各阶段分离贴图槽（rp_S.tex[阶�
 void rp_state_reset(void);                                    // NVN 默认值
 int rp_state_op(uint32_t op, const void *a, uint32_t size);   // 状态类命令：1 = 已处理；0 = 不是状态类命令
 void rp_dirty_all(void);                                      // 新的后端命令段开头：已发给后端的状态全部重发（逻辑状态不动）
+
+int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *payload, uint32_t size);

@@ -3,6 +3,7 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_shader.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -727,11 +728,80 @@ static void post_report(uint64_t addr, uint32_t type) {
     s->p[s->n++] = p; if (type != NVN_COUNTER_TYPE_TIMESTAMP && type != NVN_COUNTER_TYPE_TIMESTAMP_TOP) s->nfx++; pf_add(RP_PERF_FX_REPORT, 1); __atomic_fetch_or(&g_fx_types, 1ull << (type & 63), __ATOMIC_RELAXED);
 }
 
-void nvn_be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }     // 存储前瞻索引：通道规划接上时再建
 void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
+
+// 弱链接[replay]：rp_shader_lookahead_budget
+#pragma weak rp_shader_lookahead_budget
+// 弱链接[replay]：rp_shader_lookahead
+#pragma weak rp_shader_lookahead
+// 弱链接[replay]：rp_shader_lookahead_end
+#pragma weak rp_shader_lookahead_end
+
+void nvn_be_sub_index(const uint64_t *handles, int n) {
+    if (!g_cmd || g_rc_active || !rp_shader_lookahead_budget || !rp_shader_lookahead) return;
+    unsigned left = rp_shader_lookahead_budget();
+    if (!left) return;
+    struct rp_state state = rp_S;
+    const p_set_rt *targets = rp_pass_target();
+    p_set_rt captured;
+    if (targets) { captured = *targets; targets = &captured; }
+    unsigned records = 128;
+    int saw_draw = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)handles[i];
+        if (!p) return;
+        for (;;) {
+            if (!left || !records--) return;
+            op_hdr h;
+            memcpy(&h, p, sizeof h);
+            if (rec_bad(h)) return;
+            const void *payload = p + sizeof h;
+            p += h.size;
+            if (h.op == OP_END) break;
+            if (h.op == OP_SET_RT) {
+                if (saw_draw) return;  // 先前目标仍可能有 GPU 待写内容
+                const p_set_rt_c *head = payload;
+                if (h.size < sizeof h + sizeof *head || h.size - sizeof h < set_rt_payload(head)) return;
+                targets = set_rt_rec(payload, h.size, &captured);
+                continue;
+            }
+            if (h.op != OP_DRAW && h.op != OP_DRAW_IDX) {
+                if (!rp_state_lookahead(&state, h.op, payload, h.size)) return;
+                continue;
+            }
+            if (!targets || targets->n < 0 || targets->n > 8 || state.tf_on) return;
+            struct rp_shader_req q = {.rt_count = targets->n};
+            if (h.op == OP_DRAW) {
+                p_draw tmp;
+                if (h.size < sizeof h + offsetof(p_draw, ind)) return;
+                const p_draw *d = draw_rec(payload, h.size, &tmp);
+                if (d->ind || d->mdi_cnt || d->tfc || d->count <= 0) return;
+                q.prim = (uint32_t)d->prim;
+            } else {
+                p_draw_idx tmp;
+                if (h.size < sizeof h + sizeof(p_draw_idx_single)) return;
+                const p_draw_idx *d = draw_idx_rec(payload, h.size, &tmp);
+                if (d->ind || d->mdi_cnt || d->itype < 0 || d->itype > 2 || d->count <= 0) return;
+                q.prim = (uint32_t)d->prim;
+            }
+            // 只前瞻不需展开或重写的拓扑。真实绘制仍走原解码与校验。
+            if (q.prim != 0 && q.prim != 1 && q.prim != 4) return;
+            for (int j = 0; j < targets->n; j++) {
+                if (targets->color[j])
+                    q.rt_format[j] = (uint32_t)(targets->has_cview[j] && targets->cview[j].set_format
+                                              ? targets->cview[j].format : targets->color[j]->d.format);
+            }
+            saw_draw = 1;
+            const int accepted = rp_shader_lookahead(&state, &q, targets);
+            if (accepted < 0) return;
+            left -= (unsigned)accepted;
+        }
+    }
+}
+
 
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
@@ -945,6 +1015,7 @@ void nvn_be_submit(void *q, const uint64_t *h, int n) {
     nvn_be_sub_index(h, n);
     for (int i = 0; i < n; i++) { nvn_be_exec_rest(h + i + 1, n - i - 1); nvn_be_exec((const uint8_t *)(uintptr_t)h[i]); }
     nvn_be_exec_rest(NULL, 0);
+    if (rp_shader_lookahead_end) rp_shader_lookahead_end();
     uint64_t t2 = now_ns();
     nvn_be_sub_commit();
     uint64_t t3 = now_ns();

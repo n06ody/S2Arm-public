@@ -128,6 +128,13 @@ program = dict(contract='s2a-direct-program-content-v1', kind='graphics', identi
                stages=[dict(stage='vs', spirv=spirv)], bindings=[], c0Reads=[], supportReads=[])
 (root / 'warm-ordinary.json').write_text(json.dumps(dict(schema='s2a-direct-program-v1', content=program)))
 PYWARM
+for slots in 1 2 4; do
+    log="$out/submit-$slots.log"
+    timeout 120 "$binary" "$work" "submit-$slots" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
+    grep -qx "submit compile slots=$slots depth_pixels=16 failures=0" "$log"
+    echo "【绿】提交前瞻 $slots 槽：只现编一次、零跳画、深度读回 16/16，validation 0 条"
+done
 for arm in donor late aligned different reuse; do
     log="$out/warm-$arm.log"
     timeout 120 "$binary" "$work" "warm-$arm" > "$log" 2>&1 || { cat "$log"; exit 1; }

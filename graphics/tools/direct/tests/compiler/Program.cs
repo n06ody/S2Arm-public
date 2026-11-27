@@ -782,6 +782,11 @@ internal static unsafe class Program
     {
         byte[][] requests = { graphicsRequest, computeRequest };
         byte[][] expected = requests.Select(request => DirectShaderCompiler.Compile(request)).ToArray();
+        long cpu = 0;
+        var probe = new DirectShaderCompiler.PhaseProbe(() => ++cpu);
+        Check(DirectShaderCompiler.Compile(graphicsRequest, probe).SequenceEqual(expected[0]) &&
+              probe.RequestSha != null && probe.Parse.CpuNs > 0 && probe.SpirvCpuNs > 0 && probe.Serialize.CpuNs > 0,
+              "phase collection leaves result bytes exact and observes request, SPIR-V and serialization");
         using var start = new Barrier(requests.Length);
         var failures = new string[requests.Length];
         var threads = new Thread[requests.Length];

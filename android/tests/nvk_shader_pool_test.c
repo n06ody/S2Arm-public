@@ -74,6 +74,9 @@ static const char *fake_compile_error;
 static const char *fake_compile_file;
 static pthread_t last_compiler_thread;
 static int fixture_live_compile, fixture_live_slots;
+static int fixture_submit_compile, fixture_submit_slots;
+static pthread_t last_shader_load_thread;
+static uint64_t fixture_compile_generation = 6;
 static int fixture_live_frame_ms = 100, fixture_live_unsafe_ms = 10000;
 static pthread_mutex_t live_gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t live_gate_cv = PTHREAD_COND_INITIALIZER;
@@ -125,6 +128,8 @@ int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "no_libpack") && fixture_no_libpack) return 1;
     if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
     if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
+    if (!strcmp(name, "nvk_submit_compile")) return fixture_submit_compile;
+    if (!strcmp(name, "nvk_submit_compile_slots") && fixture_submit_slots) return fixture_submit_slots;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
@@ -185,7 +190,16 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
 static uint32_t fixture_ssbo_align;   // 设备 minStorageBufferOffsetAlignment（非窗口补件夹具要非对齐的存储缓冲基址，请求才带 hasUnalignedStorageBuffer）
 void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
 static uint32_t sampled_fixture_format;
+static int fixture_alias_texture;
+static tex_t fixture_alias_snapshot;
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
+    if (fixture_alias_texture && id == 0) {
+        if (t) *t = fixture_alias_snapshot;
+        if (v) memset(v, 0, sizeof *v);
+        if (h) *h = 0;
+        return 1;
+    }
+
     // 77：带视图（改目标为 RECTANGLE）；78 / 79：同一组格式 / 目标 / 深度的两个不同句柄（快路按事实认，不按句柄认）。
     if (!separate_fixture || (id != 77 && id != 78 && id != 79 && !(separate_fixture == 2 && id == 0))) return 0;
     memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
@@ -222,13 +236,13 @@ uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) {
     return hash;
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
-    memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
+    memset(c, 0, sizeof *c); c->session = 4; c->generation = fixture_compile_generation; c->direct_abi = 1;
     c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = external_profile_hash[0] ? external_profile_hash : phash;
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
     last_compiler_thread = pthread_self();
-    CHECK(session == 4 && gen == 6, "compile session");
+    CHECK(session == 4 && (gen == 6 || (fixture_submit_compile && gen == 7)), "compile session");
     CHECK(req.bytes < sizeof captured, "request fits capture");
     if (req.bytes >= sizeof captured) return -1;
     memcpy(captured, req.data, (size_t)req.bytes); captured[req.bytes] = 0; compiler_calls++;
@@ -362,7 +376,15 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, n
     if (fake_gs_success && (unsigned)s->stage < 6) {
         shader_load_count++; gs_loads[s->stage]++; gs_blob_bytes[s->stage] = s->bytes; *o = (nvn_gpu_shader)(uintptr_t)(s->stage + 1); return (nvn_gpu_rc){NVN_GPU_OK};
     }
-    if (fake_array_count) { *o = (nvn_gpu_shader)(uintptr_t)1; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    if (fake_array_count) {
+        pthread_mutex_lock(&live_gate_mu);
+        last_shader_load_thread = pthread_self();
+        shader_load_count++;
+        pthread_cond_broadcast(&live_gate_cv);
+        pthread_mutex_unlock(&live_gate_mu);
+        *o = (nvn_gpu_shader)(uintptr_t)1;
+        return (nvn_gpu_rc){NVN_GPU_OK};
+    }
     if (fake_cs_success && s->stage == NVN_GPU_SH_CS) { cs_loads++; *o = (nvn_gpu_shader)(uintptr_t)7; return (nvn_gpu_rc){NVN_GPU_OK}; }
     CHECK(0, "unexpected shader load"); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
 }
@@ -2508,6 +2530,100 @@ static int fixture_defer_frame(uint64_t *frame) {
     return 1;
 }
 
+static int submit_compile_test(int slots, int variant) {
+    fixture_submit_compile = 1;
+    fake_reg_changes = 0;
+    live_gate_hold = 1;
+    fixture_submit_slots = slots;
+    fixture_live_frame_ms = 0;
+    fixture_live_unsafe_ms = 0;
+    CHECK(nvk_shader_open() == 0, "open strict submit session");
+    CHECK(rp_shader_lookahead_budget() == (unsigned)slots, "requested compile slots=%d", slots);
+    struct s2a_compile_worker_stats worker;
+    s2a_compile_worker_stats(&worker);
+    CHECK(worker.slots == (unsigned)slots, "live worker slots=%u expected=%d", worker.slots, slots);
+    rp_state_reset();
+    source();
+    bind_pools(64);
+    fake_array_count = 64;
+    struct rp_state state = rp_S;
+    struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    uint8_t memory[4096];
+    pool_t pool = {0};
+    tex_t color = {.mem = memory, .pool = &pool};
+    color.L.size = sizeof memory;
+    p_set_rt targets = {.n = 0, .depth = &color};
+    if (variant == 4) {
+        fixture_parallel_compile = 1;
+        for (int i = 0; i < slots; i++) {
+            state.ubo[0][i].size = 4;
+            CHECK(rp_shader_lookahead(&state, &q, &targets) == 1, "queued distinct immutable request %d", i);
+        }
+        CHECK(live_gate_wait(slots), "all %d workers entered before the first actual Draw", slots);
+        state.ubo[0][slots].size = 4;
+        CHECK(rp_shader_lookahead(&state, &q, &targets) < 0, "submit mask does not exceed the requested slots");
+        live_gate_release();
+        for (int i = 0; i < slots; i++) {
+            rp_S.ubo[0][i].size = 4;
+            const struct rp_prog *program = NULL;
+            CHECK(!rp_shader_resolve(&q, &program) && program, "real draw %d took its future", i);
+        }
+        struct rp_shader_live_compile_stats stats;
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.compiled == (uint64_t)slots && stats.enqueued == (uint64_t)slots && !stats.pending && !stats.fallback,
+              "only the requested workers compiled: expected=%d got=%llu", slots, (unsigned long long)stats.compiled);
+        CHECK(shader_load_count == slots, "only %d shaders constructed, got %d", slots, shader_load_count);
+        goto cleanup;
+    }
+    if (variant == 2) {
+        // Alias (same physical bytes through different texture objects) terminates pre-scan.
+        fixture_alias_texture = 1;
+        fixture_alias_snapshot = color;
+        CHECK(rp_shader_lookahead(&state, &q, &targets) < 0, "attachment alias is a boundary");
+        fixture_alias_texture = 0;
+        live_gate_release();
+    } else {
+        CHECK(rp_shader_lookahead(&state, &q, &targets) == 1, "offline immutable request enqueued");
+        CHECK(rp_shader_lookahead(&state, &q, &targets) == 0, "duplicate draw joins a single future");
+        CHECK(live_gate_wait(1), "provider actually started before Draw");
+        if (variant == 1) rp_S.ubo[0][3].size = 4;  // Full identity differs despite the same source/RT.
+        live_gate_release();
+        if (variant == 1 || variant == 3) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 2;
+            pthread_mutex_lock(&live_gate_mu);
+            while (!shader_load_count)
+                if (pthread_cond_timedwait(&live_gate_cv, &live_gate_mu, &deadline)) break;
+            const int built = shader_load_count;
+            pthread_mutex_unlock(&live_gate_mu);
+            CHECK(built == 1, "first identity was actually built before the draw changed it");
+            if (variant == 3) fixture_compile_generation = 7;
+        }
+    }
+    const struct rp_prog *program = NULL;
+    CHECK(rp_shader_resolve(&q, &program) == 0 && program, "Draw is never deferred at zero budget");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.pending == 0 && stats.timeout == 0, "pending=%llu timeout=%llu",
+          (unsigned long long)stats.pending, (unsigned long long)stats.timeout);
+    if (!variant) {
+        CHECK(compiler_calls == 1 && shader_load_count == 1 &&
+              !pthread_equal(last_compiler_thread, pthread_self()) &&
+              !pthread_equal(last_shader_load_thread, pthread_self()),
+              "same future compiles/builds once on the worker: compile=%d module=%d", compiler_calls, shader_load_count);
+        CHECK(stats.fallback == 0, "exact request used prefetched result");
+    } else CHECK(stats.fallback == 1, "real changed or declined request runs synchronous fallback");
+cleanup:
+    rp_shader_lookahead_end();
+    nvk_shader_stop();
+    (void)s2a_compile_worker_stop_bounded(2000, NULL, 0);
+    rp_shader_reset();
+    s2a_source_clear();
+    printf("submit-compile slots=%d variant=%d checks=%d failures=%d\n", slots, variant, checks, failures);
+    return failures != 0;
+}
+
 static int live_compile_pending_test(int stop) {
     fixture_live_compile = 1;
     fixture_live_frame_ms = 0;
@@ -2855,7 +2971,9 @@ static int lp_gate_test(void) {
 }
 
 int main(int argc, char **argv) {
+    if (s2a_program_cache_start()) return 2;
     if (argc == 2 && !strcmp(argv[1], "--lp-gate")) return lp_gate_test();
+    if (argc == 4 && !strcmp(argv[1], "--submit-compile")) return submit_compile_test(atoi(argv[2]), atoi(argv[3]));
     if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);

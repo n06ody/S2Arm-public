@@ -161,7 +161,7 @@ enum {
     OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_SET_PATCH_SIZE, OP_DRAW_TEX, OP_WAIT_SYNC, OP_ALPHA_REF, OP_COUNT_
 };
 // Payload (immediately follows op_hdr)
-typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
+typedef struct p_set_rt { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
 // SetRenderTargets 的记录按实际内容编码（11-01，Mario Tennis Aces）：定长 p_set_rt（8 个颜色槽）+ n+1 份快照每条 504 字节，比真机 NVN 大 5–10 倍，
 // 每帧 1 MB 命令内存被它和视口用满后回调游戏，游戏那块缓冲没注册溢出处理 → 跳空指针。紧凑记录（payload，紧跟 op_hdr，全部 8 字节对齐）：
 //   p_set_rt_c 头 8B → 指针 8B × k（非空颜色按槽序，再深度；k = popcount(cmask) + 有深度）→ view_t 16B × v（有视图的颜色按槽序，再深度视图）→ tex_t 快照 128B × k（第 i 个指针的快照）

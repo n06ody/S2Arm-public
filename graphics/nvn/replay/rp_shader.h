@@ -59,6 +59,12 @@ struct rp_shader_req {
     // 仅在提交线程发现现编结果尚未就绪时调用。可暂缓则返回 1 并写入预算所属帧。
     int (*compile_defer_frame)(uint64_t *frame);
 };
+struct rp_state;
+struct p_set_rt;
+unsigned rp_shader_lookahead_budget(void);
+void rp_shader_lookahead_end(void);
+// 1 = 入队，0 = 无新工作，-1 = 无法证明之后的前瞻安全。
+int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const struct p_set_rt *targets);
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。
 uint32_t rp_shader_graphics_stages(void);

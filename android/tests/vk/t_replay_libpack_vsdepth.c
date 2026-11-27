@@ -21,7 +21,9 @@
 #include "dmsh_chain.h"
 #include "direct/libpack_vk.h"
 #include "direct/program_cache.h"
+#include "direct/compile_worker.h"
 #include "nvn_plat.h"
+#include "nvk_session.h"
 #include "nvn_vk_pipe_warm.h"
 #include "nvn_vk_prog_warm.h"
 #include <sys/stat.h>
@@ -30,10 +32,13 @@ static int compile_calls;
 static int test_outputs;
 enum warm_mode { WARM_NONE, WARM_DONOR, WARM_REUSE, WARM_LATE, WARM_ALIGNED, WARM_DIFFERENT };
 static enum warm_mode warm_mode;
+static int submit_slots;
 static const char profile_hash[] = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char translator_closure[] = "libpack-c0-test";
 static char warm_cache[1024], warm_manifest[1024];
 int nvn_plat_flag(const char *name, int dflt) {
+    if (submit_slots && !strcmp(name, "nvk_submit_compile")) return 1;
+    if (submit_slots && !strcmp(name, "nvk_submit_compile_slots")) return submit_slots;
     if (warm_mode && !strcmp(name, "nvk_lp_used_slots")) return warm_mode != WARM_DONOR;
     if (warm_mode && !strcmp(name, "nvk_resolve_check")) return 1;
     return backend_fixture_flag(name, dflt);
@@ -125,7 +130,7 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
 // 只有采集暖种的一臂需要普通编译成品，其余臂都应该从库或暖种取程序。
 static int32_t compiled_result(uint64_t session, uint64_t generation, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
     (void)session; (void)generation; (void)req; compile_calls++;
-    if (!test_outputs && warm_mode != WARM_DONOR) return -1;
+    if (!test_outputs && !submit_slots && warm_mode != WARM_DONOR) return -1;
     char path[1100]; size_t n=0;
     snprintf(path, sizeof path, "%s/%s", case_dir, test_outputs ? "mrt-ordinary.json" : "warm-ordinary.json");
     uint8_t *data=read_file(path,&n);
@@ -345,12 +350,62 @@ static void test_warm_depth(nvn_gpu_tex depth) {
     printf("libpack warm mode=%d creates=%u depth_pixels=16 failures=%d\n", warm_mode, created, g_fail);
 }
 
+static void test_submit_depth(nvn_gpu_tex depth) {
+    CHECK(!nvk_shader_open(), "submit compile: worker session opens");
+    CHECK(rp_shader_lookahead_budget() == (unsigned)submit_slots, "submit compile: requested slot count");
+    unsetenv("S2A_SHADER_REVISION_ROOT");
+    unsetenv("S2A_DIRECT_CACHE_DIR");
+    pass_mode = 1;
+    static pool_t pool;
+    static uint8_t guest_depth[64];
+    depth_tex.pool = &pool;
+    depth_tex.mem = guest_depth;
+    depth_tex.L.size = sizeof guest_depth;
+    p_bind_program_id unbind = {NULL, 0, 2, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &unbind, sizeof unbind + 8), "submit compile: depth uses VS alone");
+    struct rp_state state = rp_S;
+    const struct rp_shader_req q = {.prim = 4};
+    CHECK(rp_shader_lookahead(&state, &q, &target_depth) == 1, "submit compile: immutable depth request enqueued");
+    CHECK(rp_shader_lookahead(&state, &q, &target_depth) == 0, "submit compile: duplicate shares future");
+    nvn_gpu_buf readback = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    memset(buf_cpu(readback), 0xee, 64);
+    nvn_gpu_cmd cmd = begin_cmd();
+    p_draw draw = {.prim = 4, .count = 3, .instances = 1};
+    uint64_t d0, k0, d1, k1;
+    rp_draw_stats(&d0, &k0);
+    rp_draw(cmd, &draw, NULL, &draw);
+    rp_draw_stats(&d1, &k1);
+    CHECK(d1 == d0 + 1 && k1 == k0 && pass_began == 1, "submit compile: draw replayed without skipping");
+    if (pass_began) nvn_gpu_pass_end(cmd);
+    nvn_gpu_copy_tex_buf(cmd, depth, 0, 0, NULL, readback, 0, 16, 64);
+    nvn_gpu_err err = {0};
+    CHECK(OK(nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &err)), "submit compile: commit %s", err.why);
+    CHECK(OK(nvn_gpu_fence_wait(1, 5000000000ull, &err)), "submit compile: wait %s", err.why);
+    for (unsigned i = 0; i < 16; i++) {
+        float value;
+        memcpy(&value, buf_cpu(readback) + 4 * i, 4);
+        CHECK(value == 0.5f, "submit compile: depth pixel %u = %g", i, (double)value);
+    }
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(compile_calls == 1 && stats.enqueued == 1 && stats.compiled == 1 && !stats.pending && !stats.fallback,
+          "submit compile: joined a single worker compile");
+    rp_shader_lookahead_end();
+    nvk_shader_stop();
+    CHECK(!s2a_compile_worker_stop_bounded(5000, NULL, 0), "submit compile: worker drained");
+    nvn_gpu_buf_release(readback, NULL, NULL);
+    printf("submit compile slots=%d depth_pixels=16 failures=%d\n", submit_slots, g_fail);
+}
+
 int main(int argc, char **argv) {
     const int clip_control = argc == 3 && !strcmp(argv[2], "--clip-control");
     test_outputs = argc == 3 && (!strcmp(argv[2], "mrt-float") || !strcmp(argv[2], "mrt-uint"));
     if (argc != 2 && argc != 3) return 2;
     if (argc == 3 && !clip_control && !test_outputs) {
-        if (!strcmp(argv[2], "warm-donor")) warm_mode = WARM_DONOR;
+        if (!strcmp(argv[2], "submit-1")) submit_slots = 1;
+        else if (!strcmp(argv[2], "submit-2")) submit_slots = 2;
+        else if (!strcmp(argv[2], "submit-4")) submit_slots = 4;
+        else if (!strcmp(argv[2], "warm-donor")) warm_mode = WARM_DONOR;
         else if (!strcmp(argv[2], "warm-reuse")) warm_mode = WARM_REUSE;
         else if (!strcmp(argv[2], "warm-late")) warm_mode = WARM_LATE;
         else if (!strcmp(argv[2], "warm-aligned")) warm_mode = WARM_ALIGNED;
@@ -375,7 +430,7 @@ int main(int argc, char **argv) {
     char why[256] = {0}; if (s2a_vk_device_create(&g_dev, why, sizeof why)) { fprintf(stderr, "device: %s\n", why); return 2; }
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
     memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "libpack-vsdepth";
-    if (!open_backend()) return 1;
+    if (!open_backend() || s2a_program_cache_start()) return 1;
     make_library(clip_control ? "clip-control" : "vsonly", vs_spv, vs_n, fs_spv, fs_n);
     rp_shader_reset(); rp_state_reset();
     p_bind_program_id bind = {&guest_program, guest_program.serial, clip_control ? 1u : 0x1fu, 0};
@@ -418,8 +473,9 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 
-    if (warm_mode) {
-        test_warm_depth(dtex);
+    if (warm_mode || submit_slots) {
+        if (submit_slots) test_submit_depth(dtex);
+        else test_warm_depth(dtex);
         nvn_gpu_view_release(color_view); nvn_gpu_view_release(depth_view);
         nvn_gpu_tex_release(ctex); nvn_gpu_tex_release(dtex);
         rp_draw_reset(); rp_shader_reset();

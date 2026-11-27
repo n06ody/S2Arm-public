@@ -63,9 +63,117 @@ static int prog_is(const prog_t *p, uint64_t serial) { return p && p->magic == M
 // bst 只在对象仍是它时非空。bser 为 0 = 该阶段没有绑定。
 // iOS 还按「这个程序实际有哪些阶段的着色器」收窄顶点 / 片元位（nvn_mtl.m:7186）；那要等着色器解析接上（M1），
 // 在此之前阶段位照单全收。
-static void stage_sweep(void) {
-    for (int st = 0; st < 5; st++) if (rp_S.bst[st] && !prog_is(rp_S.bst[st], rp_S.bser[st])) rp_S.bst[st] = NULL;
-    if (rp_S.cprog && !prog_is(rp_S.cprog, rp_S.cser)) rp_S.cprog = NULL;
+static void stage_sweep(struct rp_state *state) {
+    for (int st = 0; st < 5; st++) if (state->bst[st] && !prog_is(state->bst[st], state->bser[st])) state->bst[st] = NULL;
+    if (state->cprog && !prog_is(state->cprog, state->cser)) state->cprog = NULL;
+}
+
+static void bind_program(struct rp_state *state, const p_bind_program *bp, int dirty) {
+    const prog_t *p = dirty && prog_is(bp->prog, bp->snap.serial) ? bp->prog : NULL; uint64_t ser = bp->prog ? bp->snap.serial : 0;
+    // 程序实际有哪些阶段的着色器：快照的 stage_of[]（同旧 vk_record.c 的取法），nstage 是着色器项数。
+    // 取不到（快照缺 / 有认不出的阶段）时 known=0，沿用旧规则（本次掩码照单全收），留给绘制时按名字报。
+    uint32_t prog_st = 0; int prog_known = 0;
+    if (bp->snap.nstage > 0) {
+        uint32_t m = 0; int ok = 1;
+        for (uint32_t i = 0; i < bp->snap.nstage && i < 6u; i++) {
+            unsigned st = bp->stage_of[i];
+            if (st > 5) { ok = 0; break; }
+            m |= 1u << st;
+        }
+        if (ok) { prog_st = m; prog_known = 1; }
+    }
+    // 各阶段的着色器键：记录里的 keys 按程序的着色器数组序，stage_of 给出每一项是哪个 NVN 阶段
+    for (int i = 0; i < 6; i++) { unsigned st = bp->stage_of[i]; if (st > 5 || !(bp->stages >> st & 1)) continue;
+        if (bp->kok >> i & 1) { memcpy(state->skey[st], bp->keys[i], 8); state->skey_ok |= (uint8_t)(1u << st); } else state->skey_ok &= (uint8_t)~(1u << st); }
+    for (int st = 0; st < 6; st++) if ((bp->stages >> st & 1) && !ser) state->skey_ok &= (uint8_t)~(1u << st);   // 解绑
+    if (bp->stages & 0x20) { if (dirty && state->cser != ser) args_dirty_all(); state->cprog = p; state->cser = ser; }
+    if (bp->stages & 0x1f) {
+        int ch = 0;
+        for (int st = 0; st < 5; st++) {
+            if (!(bp->stages >> st & 1)) continue;   // 本次掩码没覆盖的阶段：保留原绑定（NVN 按阶段绑定）
+            if (prog_known && !(prog_st >> st & 1)) {
+                if (st < 2) continue;   // 顶点 / 片元不能被关：程序没有就保留原绑定（同 iOS bind_stages，太鼓达人）
+                if (state->bser[st]) ch = 1;   // 几何 / 细分：程序没有就解绑旧程序（同 iOS，异度 3）
+                state->bst[st] = NULL; state->bser[st] = 0; state->skey_ok &= (uint8_t)~(1u << st);
+                continue;
+            }
+            if (state->bser[st] != ser) ch = 1;
+            state->bst[st] = p; state->bser[st] = ser;
+        }
+        if (dirty && ch) { rp_pso_dirty = 1; args_dirty_all(); }
+    }
+    if (dirty) stage_sweep(state);
+}
+
+int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint32_t size) {
+    const size_t bytes = size - 8;
+    switch (op) {
+    case OP_BIND_PROGRAM: {
+        p_bind_program decoded;
+        const p_bind_program *bp = bind_program_rec(a, size, &decoded);
+        if (bytes != sizeof(p_bind_program_id) || (bp->prog && !bp->snap.nstage)) return 0;
+        bind_program(state, bp, 0);
+        return 1;
+    }
+    case OP_BIND_STATE: {
+        if (bytes < sizeof(p_bind_state)) return 0;
+        const p_bind_state *b = a;
+        switch (b->kind) {
+        case 0: {
+            blend_st blend;
+            memcpy(&blend, b->bytes, sizeof blend);
+            if (blend.target >= 8) return 0;
+            state->blend[blend.target] = blend;
+            return 1;
+        }
+        case 1: memcpy(&state->color, b->bytes, sizeof state->color); return 1;
+        case 2: memcpy(&state->chmask, b->bytes, sizeof state->chmask); return 1;
+        case 3: memcpy(&state->ms, b->bytes, sizeof state->ms); return 1;
+        case 4: case 5: return 1;  // poly / depth-stencil are pipeline facts
+        default: return 0;
+        }
+    }
+    case OP_BIND_VATTR: {
+        const p_bind_vattr *b = a;
+        if (bytes < offsetof(p_bind_vattr, st) || b->n < 0 || b->n > 16 ||
+            bytes < offsetof(p_bind_vattr, st) + (size_t)b->n * sizeof *b->st) return 0;
+        memcpy(state->attr, b->st, (size_t)b->n * sizeof *b->st);
+        for (int i = 0; i < b->n; i++) state->attr[i].fmt = nvn_vattr_fmt_canon(state->attr[i].fmt);
+        state->nattr = b->n;
+        return 1;
+    }
+    case OP_BIND_UBO: {
+        const p_bind_buf *b = a;
+        if (bytes < sizeof *b || b->stage < 0 || b->stage >= 6 || b->index < 0 || b->index >= 16) return 0;
+        state->ubo[b->stage][b->index] = *b;  // 带 BIND_BUF_DEFER 的 stage 已排除
+        return 1;
+    }
+    case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: {
+        if (op == OP_BIND_TEX1) {
+            const p_bind_tex1 *b = a;
+            if (bytes < sizeof *b || (b->slot & BIND_TEX1_AT)) return 0;
+        } else if (bytes < offsetof(p_bind_handles, h)) return 0;
+        p_bind_handles decoded;
+        const p_bind_handles *b = bind_rec(op, a, &decoded);
+        const int limit = op == OP_BIND_SAMP ? 128 : RP_NTEX;
+        if (b->defer || b->stage < 0 || b->stage >= 6 || b->n < 0 || b->n > 32 ||
+            b->first < 0 || b->first > limit - b->n ||
+            (op != OP_BIND_TEX1 && bytes < offsetof(p_bind_handles, h) + (size_t)b->n * sizeof *b->h)) return 0;
+        if (op != OP_BIND_SAMP) memcpy(&state->tex[b->stage][b->first], b->h, (size_t)b->n * sizeof *b->h);
+        return 1;
+    }
+    case OP_ALPHA_REF:
+        if (bytes < sizeof(p_alpha_ref)) return 0;
+        state->alpha_ref = ((const p_alpha_ref *)a)->ref;
+        return 1;
+    // 只影响绘制参数，不参与图形着色器请求。实际回放仍重放每条命令。
+    case OP_SCISSOR: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP:
+    case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_STENCIL: case OP_POLY_OFFSET:
+    case OP_RAST_DISCARD: case OP_PRIM_RESTART: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 int rp_state_op(uint32_t op, const void *a, uint32_t size) {
@@ -82,41 +190,9 @@ int rp_state_op(uint32_t op, const void *a, uint32_t size) {
             { const dpool_t *dp = ((const p_set_pool *)a)->pool; int n = dp ? dp->n : 0;
               if (tex) { if (rp_S.tex_pool_n != n) { rp_S.tex_pool_n = n; rp_pso_dirty = 1; } } else if (rp_S.samp_pool_n != n) { rp_S.samp_pool_n = n; rp_pso_dirty = 1; } }   // 池容量是着色器编译事实
             return 1; }
-        case OP_BIND_PROGRAM: { p_bind_program t; const p_bind_program *bp = bind_program_rec(a, size, &t);
-            const prog_t *p = prog_is(bp->prog, bp->snap.serial) ? bp->prog : NULL; uint64_t ser = bp->prog ? bp->snap.serial : 0;
-            // 程序实际有哪些阶段的着色器：快照的 stage_of[]（同旧 vk_record.c 的取法），nstage 是着色器项数。
-            // 取不到（快照缺 / 有认不出的阶段）时 known=0，沿用旧规则（本次掩码照单全收），留给绘制时按名字报。
-            uint32_t prog_st = 0; int prog_known = 0;
-            if (bp->snap.nstage > 0) {
-                uint32_t m = 0; int ok = 1;
-                for (uint32_t i = 0; i < bp->snap.nstage && i < 6u; i++) {
-                    unsigned st = bp->stage_of[i];
-                    if (st > 5) { ok = 0; break; }
-                    m |= 1u << st;
-                }
-                if (ok) { prog_st = m; prog_known = 1; }
-            }
-            // 各阶段的着色器键：记录里的 keys 按程序的着色器数组序，stage_of 给出每一项是哪个 NVN 阶段
-            for (int i = 0; i < 6; i++) { unsigned st = bp->stage_of[i]; if (st > 5 || !(bp->stages >> st & 1)) continue;
-                if (bp->kok >> i & 1) { memcpy(rp_S.skey[st], bp->keys[i], 8); rp_S.skey_ok |= (uint8_t)(1u << st); } else rp_S.skey_ok &= (uint8_t)~(1u << st); }
-            for (int st = 0; st < 6; st++) if ((bp->stages >> st & 1) && !ser) rp_S.skey_ok &= (uint8_t)~(1u << st);   // 解绑
-            if (bp->stages & 0x20) { if (rp_S.cser != ser) args_dirty_all(); rp_S.cprog = p; rp_S.cser = ser; }
-            if (bp->stages & 0x1f) {
-                int ch = 0;
-                for (int st = 0; st < 5; st++) {
-                    if (!(bp->stages >> st & 1)) continue;   // 本次掩码没覆盖的阶段：保留原绑定（NVN 按阶段绑定）
-                    if (prog_known && !(prog_st >> st & 1)) {
-                        if (st < 2) continue;   // 顶点 / 片元不能被关：程序没有就保留原绑定（同 iOS bind_stages，太鼓达人）
-                        if (rp_S.bser[st]) ch = 1;   // 几何 / 细分：程序没有就解绑旧程序（同 iOS，异度 3）
-                        rp_S.bst[st] = NULL; rp_S.bser[st] = 0; rp_S.skey_ok &= (uint8_t)~(1u << st);
-                        continue;
-                    }
-                    if (rp_S.bser[st] != ser) ch = 1;
-                    rp_S.bst[st] = p; rp_S.bser[st] = ser;
-                }
-                if (ch) { rp_pso_dirty = 1; args_dirty_all(); }
-            }
-            stage_sweep();
+        case OP_BIND_PROGRAM: {
+            p_bind_program decoded;
+            bind_program(&rp_S, bind_program_rec(a, size, &decoded), 1);
             return 1; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; void *dst = NULL; size_t n = 0; blend_st bs;

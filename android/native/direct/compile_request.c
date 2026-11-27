@@ -3,6 +3,7 @@
 // profile/identity 来自 provider，code/control/c1 来自 SetShaders 源快照，GPU 查询事实来自 Draw 快照。
 // 没有真实来源的字段不写默认值，直接记进 gaps；编译器因此会给出准确的 MISSING_FIELD。
 #include "compile_request.h"
+#include "compile_phase.h"
 #include "kind_check.h"
 #include "s2a_direct.h"
 #include "sha256.h"
@@ -858,7 +859,9 @@ int s2a_compile_request_execute(uint64_t session, uint64_t generation, const cha
     // 按调试门判一次写进去（C# 从请求读），这里只负责原样把请求交给编译器。
     s2a_direct_bytes request = { (const uint8_t *)json, (uint64_t)json_len };
     int inflight = inflight_arm(session, generation, json, json_len, req_sha);
+    struct s2a_compile_stamp phase = s2a_compile_phase_begin();
     out->rc = compile(session, generation, request, emit_copy, &capture);
+    s2a_compile_phase_end(phase, "managed-abi", NULL);
     inflight_disarm(inflight);
     diag_error(diag, out->rc, capture.bytes, capture.len, capture.emits);
     out->bytes = capture.bytes;

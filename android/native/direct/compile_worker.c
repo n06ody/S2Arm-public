@@ -77,6 +77,9 @@ static int g_started, g_stop;
 static uint64_t g_start_epoch; // distinguishes stop/restart while a caller pauses outside g_wmu
 static s2a_compile_worker_fn g_fn;
 static void *g_ctx;
+static _Thread_local const uint8_t *g_callback_key;
+
+const uint8_t *s2a_compile_worker_callback_key(void) { return g_callback_key; }
 
 /* C4a 非阻塞提交侧：槽位被别的身份占用时落进短队列（FIFO 提升进槽）；完成环按 sha 持有
    结果副本，poll/wait_async 按 sha 取（不消费），满时挤掉最老的（fail-closed：查不到 = 丢失）。 */
@@ -269,8 +272,10 @@ static void *worker_main(void *arg) {
         g_stats.compiles++;
         pthread_mutex_unlock(&g_wmu);
         if (diag_hooks()) s2a_compile_diag_enter(job.diagnostic, job.session, job.generation, job.json, job.len);
+        g_callback_key = job.sha;
         int rc = g_fn(g_ctx, job.session, job.generation, job.json, job.len,
                       &bytes, &bytes_len, why, sizeof why);
+        g_callback_key = NULL;
         if (diag_hooks()) s2a_compile_diag_leave();
         free(job.json);
 

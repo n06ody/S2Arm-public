@@ -55,10 +55,14 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+    def build_case(name, source, extra_libs=None, extra_flags=()):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        return exe
+
+    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+        exe = build_case(name, source, extra_libs, extra_flags)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     if sys.argv[1:] == ['--lp-output']:
@@ -74,6 +78,17 @@ def main():
             sys.stderr.write(result.stderr)
             rc |= result.returncode
         return rc
+
+    if sys.argv[1:] == ['--submit-compile']:
+        exe = build_case('submit-compile', original)
+        for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3), (1, 4), (2, 4), (4, 4)):
+            result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
+                                    capture_output=True, text=True, timeout=30)
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            if result.returncode:
+                return result.returncode
+        return 0
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
                   '--live-compile-stop', '--cs-libpack', '--lp-gate', '--lp-numeric')

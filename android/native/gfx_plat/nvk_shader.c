@@ -16,6 +16,7 @@
 #include "nvn_fmt_info.h"
 #include "nvn_hmap.h"
 #include "direct/compile_request.h"
+#include "direct/compile_phase.h"
 #include "direct/compile_worker.h"
 #include "direct/input_identity.h"
 #include "direct/source_store.h"
@@ -57,6 +58,9 @@
 #define NVK_SHADER_STOP_BIT (1u << 31)
 static _Atomic unsigned g_shader_admission;
 static int g_live_compile;   // 0 = 对照档，1 = 后台，-1 = 启动失败（具名退回原路径）；会话准备时定
+enum { LOOKAHEAD_SLOTS_MAX = 4 };
+static unsigned g_lookahead_slots;
+static void lookahead_clear(void);
 static uint32_t g_live_frame_ms, g_live_unsafe_ms;
 static uint64_t now_ns(void);
 static uint64_t g_live_budget_frame, g_live_spent_ns;   // 提交 owner 独占
@@ -67,6 +71,7 @@ void nvk_shader_stop(void) {
     atomic_fetch_or_explicit(&g_shader_admission, NVK_SHADER_STOP_BIT, memory_order_acq_rel);
     // 先唤醒等待者，不在 Stop 入口 join。执行 managed 的 worker 自己持准入，现有停局限时等它。
     if (g_live_compile == 1) (void)s2a_compile_worker_stop_bounded(0, NULL, 0);
+    if (g_lookahead_slots) lookahead_clear();
 }
 unsigned nvk_shader_inflight(void) { return atomic_load_explicit(&g_shader_admission, memory_order_acquire) & ~NVK_SHADER_STOP_BIT; }
 // 会话级在途 / 静默 / 代际清场（定义在下面的状态变量之后：open 在文件前面，用前向声明）。
@@ -83,7 +88,9 @@ int nvk_shader_open(void) {
     rp_shader_live_compile_take(&discarded);
     // 9400 冷局开启后前推帧率下降 9.2%，按 #1501 决议缺省关。
     // https://github.com/jhaizhou-ops/S2Arm/issues/1501#issuecomment-7101654735
-    if (nvn_plat_flag("nvk_live_compile_async", 0)) {
+    g_lookahead_slots = 0;
+    const int lookahead = nvn_plat_flag("nvk_submit_compile", 0);
+    if (lookahead || nvn_plat_flag("nvk_live_compile_async", 0)) {
         const int frame_ms = nvn_plat_flag("fu_frame_ms", 100);
         const int unsafe_ms = nvn_plat_flag("fu_unsafe_ms", 10000);
         g_live_frame_ms = frame_ms > 0 ? (uint32_t)frame_ms : 0;
@@ -91,6 +98,12 @@ int nvk_shader_open(void) {
         char why[160] = "";
         const int configured = nvn_plat_flag("nvk_live_compile_slots", 0);
         unsigned slots = configured > 0 ? (unsigned)configured : s2a_compile_worker_recommended_slots();
+        if (lookahead) {
+            const int requested = nvn_plat_flag("nvk_submit_compile_slots", LOOKAHEAD_SLOTS_MAX);
+            slots = requested == 1 || requested == 2 ? (unsigned)requested : LOOKAHEAD_SLOTS_MAX;
+            // 即使线程池启动失败，这一档也禁止沿用旧路径的暂缓绘制。
+            g_lookahead_slots = slots;
+        }
         if (slots > S2A_CW_SLOTS_MAX) slots = S2A_CW_SLOTS_MAX;
         g_live_compile = s2a_compile_worker_start_pool(live_worker, NULL, slots, why, sizeof why) ? -1 : 1;
         if (why[0]) nvn_plat_log(g_live_compile < 0 ? NVN_PLAT_LOG_RED : NVN_PLAT_LOG_WARN, "shader", why);
@@ -200,7 +213,8 @@ enum { REJECT_LINES_MAX = 128 };
 static unsigned g_reject_lines, g_img_reject_lines, g_reject_total, g_img_reject_total;
 
 static void sha256(const void *p, size_t n, uint8_t out[32]) { s2a_sha256 c; s2a_sha256_init(&c); s2a_sha256_update(&c, p, n); s2a_sha256_final(&c, out); }
-static void red1(const char *name, const char *why) { if (nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
+static _Thread_local int speculative_build;
+static void red1(const char *name, const char *why) { if (!speculative_build && nvn_unimpl("shader", name, NULL) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why); }
 // 后端拒装着色器时记哪一项（#1340）：设备没 shaderInt16、模块又声明了 Int16 的，具名 int16_not_supported（只拒这个程序，不整局停）；其余照旧。
 static void red_load(nvn_gpu_rc rc, const nvn_gpu_shader_src *src, const char *fallback, const char *why) {
     red1(rc.code == NVN_GPU_E_UNSUPPORTED && s2a_spirv_declares_cap(src->blob, src->bytes, 22) == 1 ? "int16_not_supported" : fallback, why);
@@ -534,6 +548,7 @@ static void compiler_rejected(const char *summary, const struct work_snap *snap)
     pool_reject_tick();
 }
 static void array_unsupported(const char *why) {
+    if (speculative_build) return;
     nvn_unimpl("shader", "texture_pool_array_unsupported", NULL);
     nvn_plat_log(NVN_PLAT_LOG_RED, "shader", why);
     if (g_texpool_diag) { g_pool_unsupported++; pool_stats("progress"); }
@@ -618,9 +633,9 @@ struct facts {
 };
 
 // c2 字 72..86（组合槽 32..39）与图像表重叠，来源同 iOS tex_slot_h。
-static void graphics_high_handles(int st, uint64_t handles[8]) {
+static void graphics_high_handles(const struct rp_state *state, int st, uint64_t handles[8]) {
     for (int slot = 0; slot < 8; slot++)
-        handles[slot] = rp_S.img[st][slot] ? rp_S.img[st][slot] : rp_S.tex[st][32 + slot];
+        handles[slot] = state->img[st][slot] ? state->img[st][slot] : state->tex[st][32 + slot];
 }
 
 // ---- 句柄在游戏用户常量缓冲里的贴图事实（#999 第 4 片；编译器侧契约见 DirectGpuAccessor.NeedTexture）----
@@ -745,17 +760,17 @@ static uint64_t ubo_fact_sig(int st) {
 
 static int depth_clip_cap(void);
 static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any, int *un);
-static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
+static void fill_facts(const struct rp_state *state, const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
     memset(f, 0, sizeof *f);
     struct s2a_compile_graphics_src *g = &f->gfx;
     g->topology = topology(q->prim);
     g->rt_count = q->rt_count;
     for (int i = 0; i < q->rt_count && i < 8; i++)
-        if (q->rt_format[i]) f->color_writes |= rp_S.chmask.mask & (15u << (4*i));
-    g->has_alpha_test = 1; g->alpha_test_compare = alpha_op(rp_S.color.alpha_func);
-    g->has_alpha_to_coverage = 1; g->alpha_to_coverage_enable = rp_S.ms.a2c ? 1 : 0; g->alpha_to_coverage_dither = rp_S.ms.a2c_dither ? 1 : 0;
+        if (q->rt_format[i]) f->color_writes |= state->chmask.mask & (15u << (4*i));
+    g->has_alpha_test = 1; g->alpha_test_compare = alpha_op(state->color.alpha_func);
+    g->has_alpha_to_coverage = 1; g->alpha_to_coverage_enable = state->ms.a2c ? 1 : 0; g->alpha_to_coverage_dither = state->ms.a2c_dither ? 1 : 0;
     g->has_blend = 1;
-    for (int i = 0; i < 8; i++) if (src1(rp_S.blend[i].src_rgb) || src1(rp_S.blend[i].dst_rgb) || src1(rp_S.blend[i].src_a) || src1(rp_S.blend[i].dst_a)) g->dual_source_blend = 1;
+    for (int i = 0; i < 8; i++) if (src1(state->blend[i].src_rgb) || src1(state->blend[i].dst_rgb) || src1(state->blend[i].src_a) || src1(state->blend[i].dst_a)) g->dual_source_blend = 1;
     // 设备能把管线裁剪深度设成 [-1, 1]（CAP_DEPTH_CLIP_CTL）时现编也不改写 z，深度一律交给管线（rp_draw clip_neg1）：
     //   出包预编库的程序不改写 z，两条路必须同一种算法，否则同一几何的深度不逐位相等，先画深度、再按「深度相等」画的引擎
     //   在预编 / 现编程序混用时整块画不上（11-15 王国之泪用预编库整屏发暗，二分下去「两段同时开才坏」）
@@ -766,30 +781,30 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
     g->has_cb_draw_params = 1; g->cb_draw_params = pc->shader_draw_parameters;
     g->has_point_size = 1; g->program_point_size_enable = 1; g->point_size = 1.0f;
     // 参考值是绘制时的状态（OP_ALPHA_REF）。测试没开（函数是 ALWAYS）时固定给 0：不让同一个程序因为一个用不到的数拆成多份
-    g->has_alpha_test_reference = 1; g->alpha_test_reference = rp_S.color.alpha_func >= 1 && rp_S.color.alpha_func <= 7 ? rp_S.alpha_ref : 0.0f;
+    g->has_alpha_test_reference = 1; g->alpha_test_reference = state->color.alpha_func >= 1 && state->color.alpha_func <= 7 ? state->alpha_ref : 0.0f;
     int any_ssbo = 0, unaligned = 0;
-    f->unused_unaligned_ssbo = gfx_ssbo_align(q, pc, nst, 1, &any_ssbo, &unaligned);   // 非对齐只看这个程序真用到的槽（口径见 gfx_ssbo_align）；input_sig 读同一份答案
+    if (state == &rp_S) f->unused_unaligned_ssbo = gfx_ssbo_align(q, pc, nst, 1, &any_ssbo, &unaligned);   // 非对齐只看这个程序真用到的槽（口径见 gfx_ssbo_align）；input_sig 读同一份答案
     if (!any_ssbo || pc->storage_buffer_offset_alignment) { g->has_unaligned_ssbo = 1; g->unaligned_ssbo = unaligned; }
-    for (int i = 0; i < 32; i++) g->attribute_types[i] = num_type(i < rp_S.nattr && i < 16 ? rp_S.attr[i].fmt : 0, 1);
+    for (int i = 0; i < 32; i++) g->attribute_types[i] = num_type(i < state->nattr && i < 16 ? state->attr[i].fmt : 0, 1);
     for (int i = 0; i < 8; i++) g->fragment_output_types[i] = i < q->rt_count && q->rt_format[i] ? num_type(q->rt_format[i], 0) : "Float";
-    for (int st = 0; st < nst; st++) { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[st][i].size) m |= 1u << i; f->ubo_use[st] = m << 3; }   // 用户常量缓冲从 c3 起
+    for (int st = 0; st < nst; st++) { uint32_t m = 0; for (int i = 0; i < 16; i++) if (state->ubo[st][i].size) m |= 1u << i; f->ubo_use[st] = m << 3; }   // 用户常量缓冲从 c3 起
     // 组合贴图槽事实：顶点、片元各 32 槽。槽里是「贴图号 | 采样器号 << 20」；没绑过的槽读作池里的第 0 项。
     for (int st = 0; st < nst; st++) for (int slot = 0; slot < 32; slot++) {
-        uint64_t h = rp_S.tex[st][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        uint64_t h = state->tex[st][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)state->tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) {
             // 格式、目标都取绑定视图的（视图自己设了就用它的）：声明的采样数值型要和绑上去的视图一致，坐标归一与否只看有效目标
             if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;   // 表达不了的格式 / 目标：不出事实，编译器按缺项准确失败
-        } else s2a_nvn_default_texture_fact(id, rp_S.tex_base, (uint32_t)rp_S.tex_pool_n, &nf);   // 没登记：Ryujinx GetTextureDescriptor 的默认描述符（默认事实只此一份，texture_facts.c）
+        } else s2a_nvn_default_texture_fact(id, state->tex_base, (uint32_t)state->tex_pool_n, &nf);   // 没登记：Ryujinx GetTextureDescriptor 的默认描述符（默认事实只此一份，texture_facts.c）
         int n = f->ntex++;
         memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
         f->tex[n] = (struct s2a_compile_texture_src){(const char *const[]){"vs", "fs", "gs"}[st], (uint32_t)(8 + 2 * slot), -1, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 0, nf.array_length};
     }
     // 高槽只给实际登记且能表达的描述符出事实；不沿用低槽的 Unknown 占位。
     for (int st = 0; st < nst; st++) {
-        uint64_t handles[8]; graphics_high_handles(st, handles);
+        uint64_t handles[8]; graphics_high_handles(state, st, handles);
         for (int slot = 0; slot < 8; slot++) {
-            long id = handles[slot] ? (long)(handles[slot] & 0xFFFFF) : (long)rp_S.tex_base;
+            long id = handles[slot] ? (long)(handles[slot] & 0xFFFFF) : (long)state->tex_base;
             tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
             struct img_miss *miss = &f->img[st][slot];
             miss->why = IMGF_GIVEN; miss->id = (int32_t)id; miss->handle = (uint32_t)handles[slot];
@@ -807,8 +822,8 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
     // Only registered descriptors are facts. A zero handle names pool entry zero,
     // just like the existing combined-table producer; no descriptor means no fact.
     for (int st = 0; st < nst; st++) for (int slot = 0; slot < 128; slot++) {
-        uint64_t h = rp_S.tex[st][128 + slot];
-        long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        uint64_t h = state->tex[st][128 + slot];
+        long id = h ? (long)(h & 0xFFFFF) : (long)state->tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
         if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
@@ -817,7 +832,7 @@ static void fill_facts(const struct rp_shader_req *q, const struct s2a_direct_co
         memcpy(f->tfmt[n], nf.format, sizeof f->tfmt[n]); memcpy(f->tsmp[n], nf.sampler_type, sizeof f->tsmp[n]);
         f->tex[n] = (struct s2a_compile_texture_src){(const char *const[]){"vs", "fs", "gs"}[st], (uint32_t)(90 + 2 * slot), 2, f->tsmp[n], f->tfmt[n], nf.is_buffer, nf.normalized, 1, nf.array_length};
     }
-    for (int st = 0; st < nst; st++) ubo_facts_add(f, st);   // 句柄在用户常量缓冲里的贴图（见 ubo_need_learn）
+    if (state == &rp_S) for (int st = 0; st < nst; st++) ubo_facts_add(f, st);   // 句柄在用户常量缓冲里的贴图（见 ubo_need_learn）
 }
 
 #include "nvk_shader_fact_cache.h"
@@ -1125,7 +1140,9 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
     memcpy(e->prog.identity, identity, 32);
     struct fd_program fp; char why[192] = "";
     memset(&fp, 0, sizeof fp);
+    struct s2a_compile_stamp parse = s2a_compile_phase_begin();
     int parsed = nvn_vk_program_parse_graphics_stages(bytes, len, &fp, nst == 1, why, sizeof why);
+    s2a_compile_phase_end(parse, "parse-result", identity);
     if (parsed) {
         if (parsed == NVK_PROGRAM_ARRAY_UNSUPPORTED) array_unsupported(why); else red1("program_parse_failed", why);
         nvn_vk_program_free(&fp); e->failed = 1; return e;
@@ -1210,7 +1227,9 @@ static struct entry *build(const uint8_t *bytes, size_t len, const struct s2a_so
         src.precompiled = (uint8_t)lib;
         if (views[st].key) memcpy(src.key, views[st].key, 8);
         nvn_gpu_err err = {0};
+        struct s2a_compile_stamp load = s2a_compile_phase_begin();
         nvn_gpu_rc lr = nvn_gpu_shader_load(&src, &e->prog.sh[st], &err);
+        s2a_compile_phase_end(load, "shader-module-load", identity);
         if (!nvn_gpu_ok(lr)) { red_load(lr, &src, "shader_load_failed", err.why); e->failed = 1; }
         else if (st == NVN_GPU_SH_FS && nst == 2) load_cold_fragment(&e->prog, &src);
         prog_c1_take(&e->prog, st, views[st].c1, views[st].c1_bytes);
@@ -1353,6 +1372,64 @@ static void snap_free(struct work_snap *s) {
     free(s);
 }
 // [提交线程] 捕获。NULL = 源快照缺失 / 内存不足（调用方准确失败，不猜、不退化成短 key）。
+// Slots are owned by the submit that indexed them. The worker takes ownership
+// of the source snapshot before building; advancing the submit only detaches it.
+struct lookahead_job {
+    uint8_t key[32];
+    struct work_snap *snap;
+    struct entry *built;
+    int used;
+};
+static struct lookahead_job g_lookahead[LOOKAHEAD_SLOTS_MAX];
+
+static struct lookahead_job *lookahead_find_locked(const uint8_t key[32]) {
+    for (unsigned i = 0; key && i < LOOKAHEAD_SLOTS_MAX; i++)
+        if (g_lookahead[i].used && !memcmp(g_lookahead[i].key, key, 32)) return &g_lookahead[i];
+    return NULL;
+}
+
+static void lookahead_clear(void) {
+    struct lookahead_job retired[LOOKAHEAD_SLOTS_MAX];
+    pthread_mutex_lock(&g_progs_mu);
+    memcpy(retired, g_lookahead, sizeof retired);
+    memset(g_lookahead, 0, sizeof g_lookahead);
+    pthread_mutex_unlock(&g_progs_mu);
+    for (unsigned i = 0; i < LOOKAHEAD_SLOTS_MAX; i++) {
+        snap_free(retired[i].snap);
+        entry_free(retired[i].built);
+    }
+}
+
+static struct work_snap *lookahead_take_snapshot(const uint8_t key[32]) {
+    pthread_mutex_lock(&g_progs_mu);
+    struct lookahead_job *job = lookahead_find_locked(key);
+    struct work_snap *snap = job ? job->snap : NULL;
+    if (job) job->snap = NULL;
+    pthread_mutex_unlock(&g_progs_mu);
+    return snap;
+}
+
+static void lookahead_install(const uint8_t key[32], struct entry *built) {
+    pthread_mutex_lock(&g_progs_mu);
+    struct lookahead_job *job = lookahead_find_locked(key);
+    if (job && !job->built && !shader_stopped()) {
+        job->built = built;
+        built = NULL;
+    }
+    pthread_mutex_unlock(&g_progs_mu);
+    entry_free(built);
+}
+
+static struct entry *lookahead_take_program(const uint8_t key[32]) {
+    pthread_mutex_lock(&g_progs_mu);
+    struct lookahead_job *job = lookahead_find_locked(key);
+    struct entry *built = job ? job->built : NULL;
+    struct work_snap *unused = job ? job->snap : NULL;
+    if (job) memset(job, 0, sizeof *job);
+    pthread_mutex_unlock(&g_progs_mu);
+    snap_free(unused);
+    return built;
+}
 static struct work_snap *snap_capture(const struct facts *f, const struct s2a_input_identity *id, const uint8_t sha[32],
                                       const struct s2a_direct_compile_context *pc, uint32_t stages, int nst) {
     struct work_snap *s = (struct work_snap *)calloc(1, sizeof *s);
@@ -1382,7 +1459,8 @@ static struct work_snap *snap_capture(const struct facts *f, const struct s2a_in
     s->pc.profile_hash = s->profile_hash;
     s->acquired = 1;   // 先置位：中途失败时 snap_free 会释放已经 pin 住的阶段
     for (int st = 0; st < nst; st++) {
-        if (!s2a_source_acquire(s->keys[st], &s->views[st]) || !s->views[st].complete) {
+        if (!s2a_source_acquire(s->keys[st], &s->views[st]) || !s->views[st].complete ||
+            memcmp(s->views[st].content_sha, id->source_sha[st], 32)) {
             snap_free(s);
             return NULL;
         }
@@ -1904,10 +1982,14 @@ static int live_worker(void *ctx, uint64_t session, uint64_t generation, const c
                        uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size) {
     (void)ctx;
     if (shader_enter()) return -1;
+    const uint8_t *future = g_lookahead_slots ? s2a_compile_worker_callback_key() : NULL;
+    struct work_snap *snap = future ? lookahead_take_snapshot(future) : NULL;
     struct s2a_compile_outcome oc = {0};
     const int admitted = shader_compile_admit();
     const uint64_t cmp_t0 = admitted ? now_ns() : 0;
+    struct s2a_compile_stamp phase = s2a_compile_phase_begin();
     int ran = admitted ? s2a_compile_request_execute(session, generation, json, len, &oc) : -1;
+    s2a_compile_phase_end(phase, "compile-worker", snap ? snap->identity : NULL);
     if (admitted) {   // 一份真编花多久：回放线程在等的就是它；读数看「均 / 最长」判断是该并行还是该让每份更快
         const uint64_t dt = now_ns() - cmp_t0;
         atomic_fetch_add_explicit(&g_live_cmp_n, 1, memory_order_relaxed);
@@ -1916,6 +1998,14 @@ static int live_worker(void *ctx, uint64_t session, uint64_t generation, const c
         while (dt > mx && !atomic_compare_exchange_weak_explicit(&g_live_cmp_max_ns, &mx, dt, memory_order_relaxed, memory_order_relaxed)) {}
     }
     const int ok = !ran && oc.bytes && oc.bytes_len;
+    if (ok && snap && !shader_stopped()) {
+        speculative_build = 1;
+        struct entry *built = build(oc.bytes, oc.bytes_len, snap->views, snap->nst, snap->identity, 0);
+        speculative_build = 0;
+        if (built && !built->failed) lookahead_install(future, built);
+        else entry_free(built);
+    }
+    snap_free(snap);
     if (ok) {
         *bytes = oc.bytes;
         *bytes_len = oc.bytes_len;
@@ -1940,19 +2030,64 @@ void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *s) {
     s->compile_max_ns = atomic_exchange_explicit(&g_live_cmp_max_ns, 0, memory_order_relaxed);
 }
 
+static void compile_future_key(uint64_t session, uint64_t generation, const uint8_t identity[32],
+                               const char *json, size_t len, uint8_t key[32]) {
+    pthread_mutex_lock(&g_progs_mu);
+    const uint64_t epoch = g_progs_epoch;
+    pthread_mutex_unlock(&g_progs_mu);
+    s2a_sha256 hash;
+    s2a_sha256_init(&hash);
+    s2a_sha256_update(&hash, &epoch, sizeof epoch);
+    s2a_sha256_update(&hash, &session, sizeof session);
+    s2a_sha256_update(&hash, &generation, sizeof generation);
+    s2a_sha256_update(&hash, identity, 32);
+    s2a_sha256_update(&hash, json, len);
+    s2a_sha256_final(&hash, key);
+}
+
+static int join_lookahead(const uint8_t key[32], struct s2a_compile_outcome *oc) {
+    int w = s2a_compile_worker_poll(key, &oc->bytes, &oc->bytes_len, oc->summary, sizeof oc->summary);
+    if (w == 1) {
+        const uint64_t start = now_ns();
+        s2a_compile_worker_promote(key);
+        do {
+            // 定期检查停局；健康在途请求等到结束，不按帧预算跳过真实绘制。
+            w = s2a_compile_worker_wait_async(key, 250, &oc->bytes, &oc->bytes_len, oc->summary, sizeof oc->summary);
+        } while (w == 1 && !shader_stopped());
+        atomic_fetch_add_explicit(&g_live_wait_ns, now_ns() - start, memory_order_relaxed);
+    }
+    return w;
+}
+
 // Worker 的键按实际请求字节（包括 c1），而非 g_progs 的较粗身份。没就绪/队满/停局均不缓存成编译器拒收。
 static enum live_status live_compile(uint64_t session, uint64_t generation, const char *json, size_t len,
                                      const uint8_t identity[32], unsigned stages, const struct rp_shader_req *q,
-                                     struct s2a_compile_outcome *oc) {
+                                     struct s2a_compile_outcome *oc, struct entry **built) {
     if (!shader_compile_admit()) {
         nvn_unimpl("shader", "compile_stopped", NULL);
         return LIVE_ABORT;
     }
-    if (g_live_compile != 1) {
+    if (g_lookahead_slots && g_live_compile == 1 && q) {
+        uint8_t key[32];
+        compile_future_key(session, generation, identity, json, len, key);
+        struct s2a_compile_stamp phase = s2a_compile_phase_begin();
+        const int w = join_lookahead(key, oc);
+        s2a_compile_phase_end(phase, "future-join", identity);
+        if (shader_stopped()) return LIVE_ABORT;
+        if (g_texpool_diag && (w == 0 || w == 2)) g_pool_attempts++;
+        if (w == 0 && oc->bytes && oc->bytes_len) {
+            if (built) *built = lookahead_take_program(key);
+            return LIVE_OK;
+        }
+        if (w == 2) return LIVE_REJECTED;
+    }
+    if (g_live_compile != 1 || g_lookahead_slots) {
         if (g_texpool_diag) g_pool_attempts++;
-        if (g_live_compile < 0) atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
+        if (g_live_compile < 0 || g_lookahead_slots) atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
         const uint64_t trace = diag_begin(identity, stages, 1);
+        struct s2a_compile_stamp phase = s2a_compile_phase_begin();
         const int ran = s2a_compile_request_execute(session, generation, json, len, oc);
+        s2a_compile_phase_end(phase, "compile-owner", identity);
         const int ok = !ran && oc->bytes && oc->bytes_len;
         diag_end(trace, ok);
         return ok ? LIVE_OK : LIVE_REJECTED;
@@ -2127,8 +2262,46 @@ unproven:
 
 // [提交] 只吃快照：离线库 → 跨局缓存 → 现场编译 → parse + 建后端着色器。
 // 仅真实编译器拒收生成 failed entry；预算用尽和 Stop 不作永久失败缓存。
+static int build_graphics_request(const struct work_snap *s, char ident[49], int *link_diag,
+                                  char **json, size_t *len, char *gaps, size_t gaps_size) {
+    static struct s2a_compile_request_input in;   // 提交线程独占
+    memset(&in, 0, sizeof in);
+    in.session = s->pc.session; in.generation = s->pc.generation;
+    in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(s->stages);
+    in.link_map_diag = in.requires_linked_varying_interface && link_map_diag_want();
+    in.profile_json = s->pc.profile_json; in.profile_bytes = s->pc.profile_bytes;
+    in.direct_abi = (int)s->pc.direct_abi; in.translator_closure = s->pc.translator_closure;
+    in.texture_array_length = s->tex_pool_n; in.sampler_array_length = s->samp_pool_n;
+    in.transform_feedback_enabled = s->tf_on;
+    in.gfx = s->f.gfx;
+    memcpy(in.textures, s->f.tex, sizeof in.textures);
+    in.texture_count = s->f.ntex;
+    in.handle_table_entries = HANDLE_TABLE_ENTRIES;
+    int o = 0;
+    for (int st = 0; st < s->nst; st++) {
+        struct s2a_compile_stage_src *d = &in.stages[in.stage_count++];
+        const uint8_t *code = s->views[st].code; uint32_t nb = s->views[st].code_bytes;
+        if (nb > 0x30 && code[0] == 0x78 && code[1] == 0x56 && code[2] == 0x34 && code[3] == 0x12) { code += 0x30; nb -= 0x30; }   // 带 0x30 字节头的代码段
+        d->stage = (const char *const[]){"vs", "fs", "gs"}[st];
+        d->code = code; d->code_bytes = nb;
+        d->control = s->views[st].control; d->control_bytes = s->views[st].control_bytes;
+        d->c1 = s->views[st].c1; d->c1_bytes = s->views[st].c1_bytes;
+        d->constant_buffer_use = s->f.ubo_use[st];
+        if (!in.gfx.has_tess_mode && s->views[st].control_bytes >= 0x748) { memcpy(&in.gfx.tess_mode, s->views[st].control + 0x744, 4); in.gfx.has_tess_mode = 1; }
+        for (int b = 0; b < 8; b++) o += snprintf(ident + o, 49 - (size_t)o, "%02x", s->keys[st][b]);
+    }
+    in.request_id = ident;
+    if (link_diag) *link_diag = in.link_map_diag;
+    struct s2a_compile_stamp phase = s2a_compile_phase_begin();
+    const int rc = s2a_compile_request_build(&in, json, len, gaps, gaps_size);
+    s2a_compile_phase_end(phase, "build-request", s->identity);
+    return rc;
+}
+
 static struct entry *work_run(const struct work_snap *s, const struct rp_shader_req *q, int *pending) {
     uint8_t *bytes = NULL; size_t len = 0; char why[256] = "";
+    int persist = 0;
+    struct entry *prepared = NULL;
 #ifdef S2A_ANDROID_DEBUG_ENV
     char *capture_json = NULL;
     size_t capture_len = 0;
@@ -2163,37 +2336,15 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
     if (!bytes) {
         lp_gate_probe(s);   // 只读读数：被状态闸挡下的程序，库里其实有没有（nvk_gate_probe=1 才探）
         // 现场编译只读取已捕获的请求，回到原 owner 处理事实学习和结果发布。
-        static struct s2a_compile_request_input in;   // 提交线程独占
-        memset(&in, 0, sizeof in);
-        in.session = s->pc.session; in.generation = s->pc.generation;
-        in.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(s->stages);
-        in.link_map_diag = in.requires_linked_varying_interface && link_map_diag_want();
-        in.profile_json = s->pc.profile_json; in.profile_bytes = s->pc.profile_bytes;
-        in.direct_abi = (int)s->pc.direct_abi; in.translator_closure = s->pc.translator_closure;
-        in.texture_array_length = s->tex_pool_n; in.sampler_array_length = s->samp_pool_n;
-        in.transform_feedback_enabled = s->tf_on;
-        in.gfx = s->f.gfx;
-        memcpy(in.textures, s->f.tex, sizeof in.textures);
-        in.texture_count = s->f.ntex;
-        in.handle_table_entries = HANDLE_TABLE_ENTRIES;
-        char ident[49]; int o = 0;
-        for (int st = 0; st < s->nst; st++) {
-            struct s2a_compile_stage_src *d = &in.stages[in.stage_count++];
-            const uint8_t *code = s->views[st].code; uint32_t nb = s->views[st].code_bytes;
-            if (nb > 0x30 && code[0] == 0x78 && code[1] == 0x56 && code[2] == 0x34 && code[3] == 0x12) { code += 0x30; nb -= 0x30; }   // 带 0x30 字节头的代码段
-            d->stage = (const char *const[]){"vs", "fs", "gs"}[st];
-            d->code = code; d->code_bytes = nb;
-            d->control = s->views[st].control; d->control_bytes = s->views[st].control_bytes;
-            d->c1 = s->views[st].c1; d->c1_bytes = s->views[st].c1_bytes;
-            d->constant_buffer_use = s->f.ubo_use[st];
-            if (!in.gfx.has_tess_mode && s->views[st].control_bytes >= 0x748) { memcpy(&in.gfx.tess_mode, s->views[st].control + 0x744, 4); in.gfx.has_tess_mode = 1; }
-            for (int b = 0; b < 8; b++) o += snprintf(ident + o, sizeof ident - (size_t)o, "%02x", s->keys[st][b]);
+        char ident[49], *json = NULL, gaps[1024] = "";
+        int link_diag = 0;
+        size_t jl = 0;
+        if (build_graphics_request(s, ident, &link_diag, &json, &jl, gaps, sizeof gaps)) {
+            red1("request_build_failed", gaps);
+            return NULL;
         }
-        in.request_id = ident;
-        char *json = NULL; size_t jl = 0; char gaps[1024] = "";
-        if (s2a_compile_request_build(&in, &json, &jl, gaps, sizeof gaps)) { red1("request_build_failed", gaps); return NULL; }
         struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
-        enum live_status status = live_compile(in.session, in.generation, json, jl, s->identity, s->stages, q, &oc);
+        enum live_status status = live_compile(s->pc.session, s->pc.generation, json, jl, s->identity, s->stages, q, &oc, &prepared);
 #ifdef S2A_ANDROID_DEBUG_ENV
         if (status == LIVE_OK && oc.bytes && s->preimage) {
             capture_json = json;
@@ -2222,15 +2373,15 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
         }
         bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL;
         s2a_compile_outcome_free(&oc);
-        if (in.link_map_diag) link_map_note(bytes, len, ident, s->identity);
+        if (link_diag) link_map_note(bytes, len, ident, s->identity);
         atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_lp_gate_live[s->lp_gate], 1, memory_order_relaxed);
         if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
-        if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, s->identity, bytes, len);
+        persist = cdir && !nvn_plat_flag("no_disk_cache", 0);
         if (alias_on()) { sha256(bytes, len, rsha); have_res = 1; }   // 与缓存文件头里写的是同一个量（整份负载的 SHA-256）
     }
     if (!bytes) return NULL;
-    struct entry *e = build(bytes, len, s->views, s->nst, s->identity, 0);
+    struct entry *e = prepared ? prepared : build(bytes, len, s->views, s->nst, s->identity, 0);
 #ifdef S2A_ANDROID_DEBUG_ENV
     if (capture_json && e && !e->failed) {
         int rc = capture_warm_request(s, capture_json, capture_len, bytes, len);
@@ -2242,6 +2393,8 @@ static struct entry *work_run(const struct work_snap *s, const struct rp_shader_
     if (e && !e->failed && have_res && alias_on()) entry_set_res(e, rsha, (uint64_t)len, s->nst);
     // 事实复用（#1187 nvk_shader_fact_cache.h）：结果字节在这里释放，掩码先算好挂在 entry 上（纯函数，后台线程也能算）
     if (e && !e->failed) e->fact_ok = (uint8_t)fact_cache_mask(bytes, len, &e->prog, e->fact_mask);
+    if (persist && e && !e->failed && !s2a_program_cache_store_owned(cdir, s->identity, bytes, len))
+        bytes = NULL;
     free(bytes);
     return e;
 }
@@ -2490,7 +2643,7 @@ static uint64_t combined_fact_sig(int st) {
 // 缓存有效高槽的事实摘要；被 image 遮住的 tex 变化不改变编译输入。
 static struct { uint64_t handles[8], rg, sig; int base, pn; uint8_t ok; } g_high_sig[3];
 static uint64_t graphics_high_fact_sig(int st) {
-    uint64_t handles[8]; graphics_high_handles(st, handles);
+    uint64_t handles[8]; graphics_high_handles(&rp_S, st, handles);
     uint64_t rg = rp_tex_reg_gen();
     if (!g_high_sig[st].ok || g_high_sig[st].rg != rg || g_high_sig[st].base != (int)rp_S.tex_base ||
         g_high_sig[st].pn != (int)rp_S.tex_pool_n || memcmp(g_high_sig[st].handles, handles, sizeof handles)) {
@@ -2731,30 +2884,167 @@ static const struct rp_prog *nowindow_for_unused_ssbo(const struct s2a_input_ide
 }
 
 // [提交线程] 三段式的第二、三段：先查已发布与在途（不重复准备），否则捕获快照 → 工作 → 发布。
+static int graphics_identity(const struct rp_state *state, const struct rp_shader_req *q,
+                              const struct s2a_direct_compile_context *pc, uint32_t stages, int nst,
+                              struct facts *f, struct s2a_input_identity *id,
+                              uint8_t encoded[S2A_INPUT_IDENTITY_MAX], size_t *len, uint8_t sha[32]) {
+    if (!g_profile.ok || g_profile.session != pc->session || g_profile.generation != pc->generation) {
+        sha256(pc->profile_json, pc->profile_bytes, g_profile.sha);
+        g_profile.session = pc->session; g_profile.generation = pc->generation; g_profile.ok = 1;
+    }
+    fill_facts(state, q, pc, f, nst);
+    memset(id, 0, sizeof *id);
+    id->direct_abi = (int)pc->direct_abi;
+    id->translator_closure = pc->translator_closure;
+    memcpy(id->profile_sha, g_profile.sha, 32);
+    id->stage_mask = stages;
+    id->requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(stages);
+    for (int st = 0; st < nst; st++) {
+        memcpy(id->keys[st], state->skey[st], 8);
+        if (s2a_source_identity(id->keys[st], id->source_sha[st], &id->source_code_bytes[st], &id->source_control_bytes[st]))
+            return -1;
+        id->source_present |= (uint8_t)(1u << st);
+    }
+    memcpy(id->ubo_use, f->ubo_use, sizeof id->ubo_use);
+    id->texture_array_length = (uint32_t)state->tex_pool_n;
+    id->sampler_array_length = (uint32_t)state->samp_pool_n;
+    id->transform_feedback_enabled = state->tf_on;
+    id->gfx = &f->gfx; id->textures = f->tex; id->texture_count = f->ntex;
+    if (s2a_input_identity_encode(id, encoded, S2A_INPUT_IDENTITY_MAX, len)) return -2;
+    sha256(encoded, *len, sha);
+    return 0;
+}
+
+void rp_shader_lookahead_end(void) {
+    if (g_lookahead_slots) lookahead_clear();
+}
+
+unsigned rp_shader_lookahead_budget(void) {
+    return g_live_compile == 1 && !shader_stopped() ? g_lookahead_slots : 0;
+}
+
+static int lookahead_span(const tex_t *tex, uint64_t *begin, uint64_t *end) {
+    if (!tex->mem || !tex->pool || (tex->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ||
+        (tex->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || !tex->L.size) return 0;
+    *begin = (uintptr_t)tex->mem;
+    *end = *begin + tex->L.size;
+    return *end > *begin;
+}
+
+static int lookahead_bindings_safe(const struct rp_state *state, const p_set_rt *targets, int nst) {
+    for (int st = 0; st < 5; st++) {
+        for (int i = 0; i < 16; i++) if (state->ssbo[st][i].addr) return 0;
+        for (int i = 0; i < 32; i++) if (state->img[st][i]) return 0;
+    }
+    uint64_t begin[9], end[9];
+    unsigned count = 0;
+    for (int i = 0; i <= targets->n; i++) {
+        const tex_t *target = i < targets->n ? targets->color[i] : targets->depth;
+        if (!target) continue;
+        if (!lookahead_span(target, &begin[count], &end[count])) return 0;
+        for (unsigned j = 0; j < count; j++)
+            if (begin[count] < end[j] && begin[j] < end[count]) return 0;
+        count++;
+    }
+    // All static handles, including the descriptor-pool default. Dynamic UBO handles
+    // are declined by the caller once known; speculation never reads guest buffer contents.
+    int seen[RP_PROG_STAGES * RP_NTEX];
+    unsigned nseen = 0;
+    for (int st = 0; st < nst; st++) for (int i = 0; i < RP_NTEX; i++) {
+        const uint64_t h = state->tex[st][i];
+        const int id = h ? (int)(h & 0xfffff) : state->tex_base;
+        unsigned j = 0;
+        for (; j < nseen; j++) if (seen[j] == id) break;
+        if (j != nseen) continue;
+        seen[nseen++] = id;
+        tex_t tex;
+        if (!rp_tex_snap_by_id(id, &tex, NULL, NULL)) {
+            if (h) return 0;
+            continue;
+        }
+        uint64_t a, b;
+        if (!lookahead_span(&tex, &a, &b)) return 0;
+        for (j = 0; j < count; j++) if (a < end[j] && begin[j] < b) return 0;
+    }
+    return 1;
+}
+
+int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const p_set_rt *targets) {
+    if (!rp_shader_lookahead_budget() || state->tex_pool_n <= 0 || state->tex_pool_n > 1048576) return -1;
+    uint32_t stages = 0;
+    for (int st = 0; st < 5; st++) if (state->bser[st]) stages |= 1u << st;
+    if ((stages != 1u && stages != 3u && stages != 7u) || (state->skey_ok & stages) != stages) return -1;
+    const int nst = stages == 7u ? 3 : stages == 3u ? 2 : 1;
+    for (int st = 0; st < nst; st++) {
+        const struct ubo_need *need = g_ubo_need_n ? ubo_need_at(st, state->skey[st], 0) : NULL;
+        if (need && need->n) return -1;
+    }
+    const uint64_t regs = rp_tex_reg_gen();
+    if (!lookahead_bindings_safe(state, targets, nst)) return -1;
+    struct s2a_direct_compile_context pc = {0};
+    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return -1;
+    static struct facts facts;
+    static uint8_t encoded[S2A_INPUT_IDENTITY_MAX];
+    struct s2a_input_identity id;
+    size_t len = 0;
+    uint8_t sha[32];
+    if (graphics_identity(state, q, &pc, stages, nst, &facts, &id, encoded, &len, sha) ||
+        regs != rp_tex_reg_gen()) return -1;
+    pthread_mutex_lock(&g_progs_mu);
+    const int cached = nvn_hm_get(&g_progs, sha) != NULL || inflight_find_locked(sha) != NULL;
+    pthread_mutex_unlock(&g_progs_mu);
+    if (cached) return 0;
+    struct work_snap *snap = snap_capture(&facts, &id, sha, &pc, stages, nst);
+    if (!snap) return -1;
+    char ident[49], why[128] = "", *json = NULL;
+    int result = -1;
+    if (!build_graphics_request(snap, ident, NULL, &json, &len, why, sizeof why)) {
+        uint8_t key[32];
+        compile_future_key(pc.session, pc.generation, sha, json, len, key);
+        pthread_mutex_lock(&g_progs_mu);
+        struct lookahead_job *job = lookahead_find_locked(key);
+        if (job) result = 0;
+        else if (!shader_stopped()) {
+            for (unsigned i = 0; i < g_lookahead_slots; i++) {
+                if (g_lookahead[i].used) continue;
+                job = &g_lookahead[i];
+                job->used = 1;
+                memcpy(job->key, key, sizeof job->key);
+                job->snap = snap;
+                snap = NULL;
+                result = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_progs_mu);
+        if (result == 1) {
+            const int submitted = s2a_compile_worker_submit_async(pc.session, pc.generation, json, len, key, why, sizeof why);
+            if (submitted) {
+                struct work_snap *unused = lookahead_take_snapshot(key);
+                entry_free(lookahead_take_program(key));
+                snap_free(unused);
+                result = submitted == 2 ? 0 : -1;
+            } else atomic_fetch_add_explicit(&g_live_enqueued, 1, memory_order_relaxed);
+        }
+    }
+    free(json);
+    snap_free(snap);
+    return result;
+}
+
 static int resolve_candidate(const struct rp_shader_req *q, const struct rp_prog **out, const struct s2a_direct_compile_context *pcp,
                         uint32_t stages, int nst, uint64_t group, struct facts *f) {
     struct s2a_direct_compile_context pc = *pcp;
     *out = NULL;
-    if (!g_profile.ok || g_profile.session != pc.session || g_profile.generation != pc.generation) {
-        sha256(pc.profile_json, pc.profile_bytes, g_profile.sha);
-        g_profile.session = pc.session; g_profile.generation = pc.generation; g_profile.ok = 1;
+    struct s2a_input_identity id;
+    static uint8_t idbuf[S2A_INPUT_IDENTITY_MAX];
+    size_t idlen = 0;
+    uint8_t sha[32];
+    const int identity_rc = graphics_identity(&rp_S, q, &pc, stages, nst, f, &id, idbuf, &idlen, sha);
+    if (identity_rc) {
+        nvn_unimpl("shader", identity_rc == -1 ? "source_snapshot_missing" : "identity_encode_failed", NULL);
+        return -1;
     }
-    fill_facts(q, &pc, f, nst);
-    struct s2a_input_identity id; memset(&id, 0, sizeof id);
-    id.direct_abi = (int)pc.direct_abi; id.translator_closure = pc.translator_closure; memcpy(id.profile_sha, g_profile.sha, 32);
-    id.stage_mask = stages;
-    id.requires_linked_varying_interface = s2a_direct_requires_linked_varying_interface(stages);
-    for (int st = 0; st < nst; st++) {
-        memcpy(id.keys[st], stage_key((unsigned)st), 8);
-        if (s2a_source_identity(stage_key((unsigned)st), id.source_sha[st], &id.source_code_bytes[st], &id.source_control_bytes[st])) { nvn_unimpl("shader", "source_snapshot_missing", NULL); return -1; }
-        id.source_present |= (uint8_t)(1u << st);
-    }
-    memcpy(id.ubo_use, f->ubo_use, sizeof id.ubo_use);
-    id.texture_array_length = (uint32_t)rp_S.tex_pool_n; id.sampler_array_length = (uint32_t)rp_S.samp_pool_n; id.transform_feedback_enabled = rp_S.tf_on;
-    id.gfx = &f->gfx; id.textures = f->tex; id.texture_count = f->ntex;
-    static uint8_t idbuf[S2A_INPUT_IDENTITY_MAX]; size_t idlen = 0; uint8_t sha[32];
-    if (s2a_input_identity_encode(&id, idbuf, sizeof idbuf, &idlen)) { nvn_unimpl("shader", "identity_encode_failed", NULL); return -1; }
-    sha256(idbuf, idlen, sha);
     idg_note_ident(group, sha);   // 身份粒度诊断：这份身份第一次被用到（group=0 时空转）
 
     if (f->unused_unaligned_ssbo) {
@@ -3142,9 +3432,10 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             if (lpe && !lpe->failed) { lpe->prog.lib_sourced = 1; libpack_note_hit(); }
             else { entry_free(lpe); lpe = NULL; libpack_mark_bad(rq.identity, rp_S.skey[5]); }
         }
+        int persist = 0;
         if (!bytes && !lpe) {
             struct s2a_compile_outcome oc; memset(&oc, 0, sizeof oc);
-            enum live_status status = live_compile(rq.session, rq.generation, rq.json, rq.json_bytes, rq.identity, 32u, NULL, &oc);
+            enum live_status status = live_compile(rq.session, rq.generation, rq.json, rq.json_bytes, rq.identity, 32u, NULL, &oc, NULL);
             if (status == LIVE_ABORT) {
                 s2a_compile_outcome_free(&oc);
                 nvk_compute_request_release(&rq);
@@ -3178,10 +3469,15 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
             bytes = oc.bytes; len = oc.bytes_len; oc.bytes = NULL; s2a_compile_outcome_free(&oc);
             atomic_fetch_add_explicit(&g_n_compiled, 1, memory_order_relaxed);
             if (g_texpool_diag) { g_pool_compiled++; if (g_pool_attempts == 1 || !(g_pool_attempts % 50)) pool_stats("progress"); }
-            if (cdir && !nvn_plat_flag("no_disk_cache", 0)) s2a_program_cache_store_async(cdir, rq.identity, bytes, len);
+            persist = cdir && !nvn_plat_flag("no_disk_cache", 0);
         }
         if (lpe) e = lpe;
-        else { e = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 0); free(bytes); }
+        else {
+            e = build_compute(bytes, len, &rq.source, rq.identity, rp_S.skey[5], 0);
+            if (persist && e && !e->failed && !s2a_program_cache_store_owned(cdir, rq.identity, bytes, len))
+                bytes = NULL;
+            free(bytes);
+        }
         pthread_mutex_lock(&g_progs_mu);
         struct entry *have = progs_get_locked(rq.identity);
         if (have && have->prog.lib_bad) { orphan_note(have); have = NULL; }   // 拒收旧项被现编版顶替：转孤儿表（借用方持有的指针仍有效），put 覆盖登记
@@ -3223,6 +3519,7 @@ int rp_shader_lib_reject(const struct rp_prog *p) {
     return 1;
 }
 void rp_shader_reset(void) {
+    rp_shader_lookahead_end();
     fact_cache_reset();
     if (g_pool_programs || g_pool_request_rejected) pool_stats("reset");
     // 后台预热一律不得越过这一步进会话收尾：先有界静默（置位后后台不再发布），再释放。

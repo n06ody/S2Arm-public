@@ -3176,6 +3176,45 @@ static void q_env(stream *s) {
 }
 static void q_draw(stream *s) { p_draw *d = put(s, OP_DRAW, sizeof *d); d->prim = 4; d->count = 3; d->instances = 1; }
 
+static unsigned g_scan_limit, g_scan_draws;
+static unsigned g_scan_prims[4];
+static int g_scan_start_draws, g_scan_untouched;
+
+unsigned rp_shader_lookahead_budget(void) { return g_scan_limit; }
+
+int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const p_set_rt *targets) {
+    CHECK(targets->color[0] && targets->color[0]->serial == g_qrt.serial);
+    if (g_scan_draws < 4) g_scan_prims[g_scan_draws] = q->prim;
+    g_scan_draws++;
+    g_scan_untouched &= state != &rp_S && g_gdraws == g_scan_start_draws;
+    CHECK(q->rt_count == 1 && q->rt_format[0] == NVN_FORMAT_RGBA8);
+    return 1;
+}
+
+static void t_submit_compile_lookahead(void) {
+    pass_fresh();
+    g_resolve_rc = 0;
+    stream s = {0}; q_env(&s);
+    g_scan_limit = 4;
+    g_scan_draws = 0;
+    g_scan_start_draws = g_gdraws;
+    g_scan_untouched = 1;
+    q_draw(&s);
+    p_draw *line = put(&s, OP_DRAW, sizeof *line);
+    line->prim = 1; line->count = 2;
+    put(&s, OP_BARRIER, 8);  // A barrier may expose earlier writes to later reads.
+    q_draw(&s);
+    end(&s);
+    submit1(&s);
+    fake_complete(NVN_GPU_DONE_OK);
+    CHECK(g_scan_draws == 2 && g_scan_prims[0] == 4 && g_scan_prims[1] == 1);
+    CHECK(g_scan_untouched);
+    CHECK(g_gdraws == g_scan_start_draws + 3);
+    g_scan_limit = 0;
+    pass_fresh();
+}
+
+
 // #1581 H：合成输入，只验替身后端调用轨迹，不代表 GPU 像素/真机通过。
 static void t_pass_shared_extent(void) {
     int old_area = g_flag_pass_area;
@@ -8347,6 +8386,7 @@ int main(int argc, char **argv) {
     t_state_persists();
     t_unimpl_names();
     t_one_commit_per_submit();
+    t_submit_compile_lookahead();
     t_event_after_done();
     t_fence_sync();
     t_jump_call(); t_call_reused();
