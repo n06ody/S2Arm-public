@@ -478,6 +478,17 @@ static void gs_request_test(void) {
           count_substr(captured, "\"stage\":\"gs\",\"handle\":") == 160 &&
           fact_matches("gs", 344, "2d", 0), "480 combined and separate texture facts survive all three stages");
     bind_separate(0, 0, 128, 0); bind_separate(1, 0, 128, 0); bind_separate(2, 0, 128, 0); separate_fixture = 0; fake_reg_changes = 1;
+    const uint32_t strip_prims[] = {3, 0xB, 0xD};
+    const char *const strip_families[] = {"Lines", "LinesAdjacency", "TrianglesAdjacency"};
+    for (unsigned i = 0; i < sizeof strip_prims / sizeof strip_prims[0]; i++) {
+        q.prim = strip_prims[i];
+        CHECK(!rp_shader_resolve(&q, &p) && p && compiler_calls == ++calls,
+              "native GS topology %u reaches the compiler", q.prim);
+        char fact[64];
+        snprintf(fact, sizeof fact, "\"topology\":\"%s\"", strip_families[i]);
+        CHECK(strstr(captured, fact), "GS request carries %s input", strip_families[i]);
+    }
+    q.prim = 4;
     fake_geometry_enabled = 0; p = NULL;
     CHECK(rp_shader_resolve(&q, &p) != 0 && !p && compiler_calls == calls, "disabled GS fails before compiler");
     fake_geometry_enabled = 1; gs_keys_ok = 3;

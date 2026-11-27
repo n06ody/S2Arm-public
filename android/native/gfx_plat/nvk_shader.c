@@ -2609,13 +2609,14 @@ static int shader_resolve_graphics(const struct rp_shader_req *q, const struct r
     if (g_cache_log < 0) g_cache_log = nvn_plat_flag("nvk_shader_cache_log", 0);   // 只读一次：平台开关在进程内不变
     const uint64_t t0 = g_cache_log ? now_ns() : 0;
     uint32_t stages = rp_shader_graphics_stages();
-    // 认两种：顶点 + 片元；只有顶点（只写深度的绘制：深度预通道、阴影图）。几何 / 细分阶段还没接
+    // 顶点可单独用于深度绘制，也可与片元及几何阶段配对。细分仍由独立路径处理。
     if (stages != 7u && stages != 3u && stages != 1u) { char nm[32]; snprintf(nm, sizeof nm, "stages_%#x_not_vs_fs", stages); nvn_unimpl("shader", nm, NULL); return -1; }
     const int nst = stages == 7u ? 3 : stages == 3u ? 2 : 1;
     if (nst == 3) {
         nvn_gpu_caps caps = {0}; nvn_gpu_caps_get(&caps);
         if (!(caps.caps & NVN_GPU_CAP_GEOMETRY)) { nvn_unimpl("shader", "geometry_not_enabled", NULL); return -1; }
-        if (q->prim != 0 && q->prim != 1 && q->prim != 4) { nvn_unimpl("shader", "geometry_topology_unimplemented", NULL); return -1; }
+        // 请求按 GS 输入族翻译。具体 Vulkan 拓扑来自回放规范化后的管线配方。
+        if (q->prim >= 0xEu || !topology(q->prim)) { nvn_unimpl("shader", "geometry_topology_unimplemented", NULL); return -1; }
     }
     for (uint32_t st2 = 0; st2 < 5; st2++) if ((stages >> st2 & 1) && !rp_shader_stage_key(st2, NULL)) { nvn_unimpl("shader", "stage_key_missing", NULL); return -1; }
     if (!shader_texture_pool_ready()) return -1;

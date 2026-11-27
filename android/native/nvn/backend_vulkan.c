@@ -4538,8 +4538,10 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
             return fail(err, NVN_GPU_E_UNSUPPORTED, "阶段 %d 的着色器要设备特性 %s，设备没启用（#1072）", st, d->st[st].sh->missing_vertex_feature);
     if (d->st[NVN_GPU_SH_GS].sh && !(g.caps.caps & NVN_GPU_CAP_GEOMETRY))
         return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 未启用或探测未通过");
-    if (d->st[NVN_GPU_SH_GS].sh && d->prim != 0 && d->prim != 1 && d->prim != 4)
-        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 非原生图元未实现");
+    // Guest GS reads the strip or fan's ordered vertices. Replay assembles
+    // those inputs into a list before this backend receives the pipeline.
+    if (d->st[NVN_GPU_SH_GS].sh && (d->prim == 5 || d->prim == 6))
+        return fail(err, NVN_GPU_E_UNSUPPORTED, "GS 三角带与扇需要按客体顺序装配");
     for (int i = NVN_GPU_SH_TCS; i < 5; i++)
         if (d->st[i].sh) return fail(err, NVN_GPU_E_UNSUPPORTED, "细分阶段：本段未实现");
 

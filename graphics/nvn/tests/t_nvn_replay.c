@@ -3808,23 +3808,25 @@ static void t_gs_dirty_and_topology(void) {
       end(&u); submit1(&u); fake_complete(NVN_GPU_DONE_OK);
       CHECK(g_gdraws == 6 && g_last_da.prim == 4 && g_last_da.itype == 2 && g_last_da.base_vertex == 4 && g_last_pdesc.prim_restart == 0);
       { const uint32_t e[9] = {10, 11, 12, 20, 21, 22, 22, 21, 23}; CHECK(g_last_da.count == 9 && !memcmp(g_arena + g_last_da.ioff, e, sizeof e)); }
-      // 间接的三角带：参数在 GPU 上、CPU 展开不了，按原生三角带交给 GS（不再整笔跳）
+      // 参数在 GPU 上时，无法保证 GS 按客体顺序收到顶点。具名拒绝。
       memset(g_pmem + 3 * PG + 2560, 0, 16);
       stream v = {0}; p_draw *ts = put(&v, OP_DRAW, sizeof *ts); ts->prim = 5; ts->ind = base + 3 * PG + 2560;
       end(&v); submit1(&v); fake_complete(NVN_GPU_DONE_OK);
-      CHECK(g_gdraws == 7 && g_last_da.prim == 5 && g_last_pdesc.prim == 5); }
-    // 三角扇：原生交给 GS
+      CHECK(g_gdraws == 6 && nvn_unimpl_count("draw", "geometry_indirect_vertex_order") == 1); }
+    // 三角扇规范化为两三角形，GS 输入 0 始终是扇心。
     { stream u = {0}; p_draw *ts = put(&u, OP_DRAW, sizeof *ts); ts->prim = 6; ts->count = 4; ts->instances = 1;
       end(&u); submit1(&u); fake_complete(NVN_GPU_DONE_OK);
-      CHECK(g_gdraws == 8 && g_last_da.prim == 6 && g_last_pdesc.prim == 6); }
-    // 邻接三角形（0xC）：设备开了 geometryShader 时原生交给后端（后端映射 *_WITH_ADJACENCY）；没开时具名跳过（Vulkan 不许）
+      const uint32_t expected[6] = {0, 1, 2, 0, 2, 3};
+      CHECK(g_gdraws == 7 && g_last_da.prim == 4 && g_last_pdesc.prim == 4);
+      CHECK(g_last_da.count == 6 && !memcmp(g_arena + g_last_da.ioff, expected, sizeof expected)); }
+    // 邻接三角形按启用的 geometryShader 能力准入。
     { stream u = {0}; p_draw *ts = put(&u, OP_DRAW, sizeof *ts); ts->prim = 0xC; ts->count = 6; ts->instances = 1;
       end(&u); submit1(&u); fake_complete(NVN_GPU_DONE_OK);
-      CHECK(g_gdraws == 8 && nvn_unimpl_count("draw", "adjacency_without_geometry_feature") == 1);
+      CHECK(g_gdraws == 7 && nvn_unimpl_count("draw", "adjacency_without_geometry_feature") == 1);
       g_caps_extra = NVN_GPU_CAP_GEOMETRY;
       submit1(&u); fake_complete(NVN_GPU_DONE_OK);
       g_caps_extra = 0;
-      CHECK(g_gdraws == 9 && g_last_da.prim == 0xC && g_last_pdesc.prim == 0xC && nvn_unimpl_count("draw", "adjacency_without_geometry_feature") == 1); }
+      CHECK(g_gdraws == 8 && g_last_da.prim == 0xC && g_last_pdesc.prim == 0xC && nvn_unimpl_count("draw", "adjacency_without_geometry_feature") == 1); }
     CHECK(nvn_unimpl_count("draw", "geometry_topology_unimplemented") == 0);
     g_snap_prog = NULL; pass_fresh();
 }

@@ -509,7 +509,7 @@ static uint32_t quad_expand(const uint8_t *src, uint32_t isz, uint32_t count, in
 }
 
 // 索引展开方式：0 = 不展开；其余见下面三个展开函数
-enum { EXP_NONE = 0, EXP_QUADS = 7, EXP_LOOP = 2, EXP_QSTRIP = 8, EXP_GS_TSTRIP = 5 };
+enum { EXP_NONE = 0, EXP_QUADS = 7, EXP_LOOP = 2, EXP_QSTRIP = 8, EXP_GS_TSTRIP = 5, EXP_GS_FAN = 6 };
 #define IXR(i) (!src ? (uint32_t)(i) : isz == 1 ? src[i] : isz == 2 ? (uint32_t)(src[(size_t)(i) * 2] | src[(size_t)(i) * 2 + 1] << 8) : \
                 ((uint32_t)src[(size_t)(i) * 4] | (uint32_t)src[(size_t)(i) * 4 + 1] << 8 | (uint32_t)src[(size_t)(i) * 4 + 2] << 16 | (uint32_t)src[(size_t)(i) * 4 + 3] << 24))
 // 线环 → 线段列表。每段（重启值之间）n 个点：n ≥ 2 时出 n 条线（i,i+1）与收口的（n-1,0）；不足 2 个点的段什么都不画。
@@ -527,17 +527,32 @@ static uint32_t loop_expand(const uint8_t *src, uint32_t isz, uint32_t count, in
     }
     return o;
 }
-// 四边形带 → 三角形列表，只在带索引又开着重启时用（其余情况直接当三角带画）。每段按三角带的绕序：
-// 第 k 个四边形（段内第 2k..2k+3 个点）出 (2k,2k+1,2k+2) 与 (2k+1,2k+3,2k+2)：就是 Vulkan 三角带第 2k、2k+1 个三角形的顶点序
-// （规范：第 i 个三角形是 {i, i+(1+i%2), i+(2-i%2)}），绕序与激发顶点都和直接当三角带画一致；段内零头丢掉。
-// d 至少要 count * 3 个
-static uint32_t qstrip_expand(const uint8_t *src, uint32_t isz, uint32_t count, int64_t rv, uint32_t *d) {
+// 四边形带 → 三角形列表。每段只装配完整的四边形。GS 要看到
+// nvn_geo_assemble 的三角带顺序，固定功能光栅路径保留 Vulkan 的激发顶点。
+static uint32_t qstrip_expand(const uint8_t *src, uint32_t isz, uint32_t count, int64_t rv, int gs, uint32_t *d) {
     uint32_t o = 0;
     for (uint32_t s = 0; s < count;) {
-        uint32_t e = s; while (e < count && IXR(e) != (uint32_t)rv) e++;
+        uint32_t e = s;
+        if (rv >= 0) { while (e < count && IXR(e) != (uint32_t)rv) e++; } else e = count;
         for (uint32_t q = s; q + 4 <= e; q += 2) {
             d[o++] = IXR(q); d[o++] = IXR(q + 1); d[o++] = IXR(q + 2);
-            d[o++] = IXR(q + 1); d[o++] = IXR(q + 3); d[o++] = IXR(q + 2);
+            d[o++] = IXR(q + (gs ? 2 : 1));
+            d[o++] = IXR(q + (gs ? 1 : 3));
+            d[o++] = IXR(q + (gs ? 3 : 2));
+        }
+        s = e + 1;
+    }
+    return o;
+}
+// 与 nvn_geo_assemble 一样，GS 的每个三角形以扇心为输入 0。
+// Vulkan 原生扇以外圈顶点起排，按 gl_in 下标读取会变。
+static uint32_t gs_fan_expand(const uint8_t *src, uint32_t isz, uint32_t count, int64_t rv, uint32_t *d) {
+    uint32_t o = 0;
+    for (uint32_t s = 0; s < count;) {
+        uint32_t e = s;
+        if (rv >= 0) { while (e < count && IXR(e) != (uint32_t)rv) e++; } else e = count;
+        for (uint32_t i = s + 1; i + 1 < e; i++) {
+            d[o++] = IXR(s); d[o++] = IXR(i); d[o++] = IXR(i + 1);
         }
         s = e + 1;
     }
@@ -1692,11 +1707,10 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
         if (!(caps.caps & NVN_GPU_CAP_GEOMETRY)) { skip("adjacency_without_geometry_feature", rec); return; }
     }
-    // 带 GS 的拓扑（同 Ryujinx 的 Vulkan 后端：原生能收的直接交给 GS，收不了的换成三角形列表）：
-    //   三角带按 GL 序展开（GS 的 gl_in 顺序与 Vulkan 原生三角带的奇三角形不同，#696）：不带索引 gs_tstrip_expand、带索引 gs_tstrip_expand_ix（读游戏索引、分段重启）；
-    //   间接的三角带：索引 / 参数在 GPU 上，CPU 展开不了，按原生三角带画（Ryujinx 同此，奇三角形 gl_in[0] 与 GL 不同、绕序相同）；
-    //   线带 / 三角扇 / 多边形（= 扇）/ 邻接图元：原生交给 GS；线环 / 四边形 / 四边形带：沿用下面的展开（GS 看到展开后的线 / 三角形，同 Ryujinx）。
+    // 三角带与扇的 guest GS 输入有固定顺序。直接绘制规范化为列表。
+    // 间接参数由 GPU 决定，须有按 GPU 顺序装配的路径才可提交。
     const int gs = (rp_shader_graphics_stages() & 4u) != 0;
+    if (gs && ind && (prim == 5 || prim == 6)) { skip("geometry_indirect_vertex_order", rec); return; }
     uint32_t count = (uint32_t)(di ? di->count : dr->count);
     if (!count && !ind) return;
     if (ind) count = 0;   // GPU parameters, not stale direct fields, own the draw count.
@@ -1705,10 +1719,11 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     int quads = EXP_NONE;
     if (prim == 7) { quads = EXP_QUADS; prim = 4; }
     else if (prim == 2) { quads = EXP_LOOP; prim = 1; }
-    else if (prim == 5 && gs && !ind) { quads = EXP_GS_TSTRIP; prim = 4; }   // 带 GS 的三角带按 GL 序展开（带索引的读游戏索引）；间接的照原生画
-    else if (prim == 9) prim = 6;   // 多边形 = 三角扇（首点为扇心，绕序同扇）
-    else if (prim == 8) {           // 四边形带 = 三角带；零头 1 个点在三角带里会多画一个三角形，丢掉
-        if (restart) { quads = EXP_QSTRIP; prim = 4; }
+    else if (prim == 5 && gs && !ind) { quads = EXP_GS_TSTRIP; prim = 4; }
+    else if ((prim == 6 || prim == 9) && gs) { quads = EXP_GS_FAN; prim = 4; }
+    else if (prim == 9) prim = 6;
+    else if (prim == 8) {           // 四边形带 = 三角带；零头 1 个点丢掉
+        if (gs || restart) { quads = EXP_QSTRIP; prim = 4; }
         else { count &= ~1u; if (count < 4) return; prim = 5; }
     }
     const p_set_rt *rt = rp_pass_target();
@@ -1852,17 +1867,29 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
     } else if (quads) {
         uint32_t isz = di ? (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) : 0;
         if (quads == EXP_QUADS && count / 4 == 0) return;   // 不足一个四边形：什么都不画
-        if (quads == EXP_GS_TSTRIP && count < 3) return;    // 不足一个三角形：什么都不画
-        // 带索引：游戏的索引在登记过的池里，编码这一刻读出来展开（同常量缓冲：就是此刻的内容）
-        if (di && !rp_pool_find(di->ibuf, (uint64_t)count * isz, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
-        uint64_t cap = quads == EXP_QUADS ? (uint64_t)(count / 4) * 6 : quads == EXP_LOOP ? (uint64_t)count * 2 :
-                       quads == EXP_GS_TSTRIP ? (uint64_t)(count - 2) * 3 : (uint64_t)count * 3;   // 展开后最多几个索引
+        if ((quads == EXP_GS_TSTRIP || quads == EXP_GS_FAN) && count < 3) return;
+        if (quads == EXP_QSTRIP && count < 4) return;
+        const uint64_t source_bytes = (uint64_t)count * isz;
+        if (di && !rp_pool_find(di->ibuf, source_bytes, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
+        if (di && gs && rp_buf_gpu_pending(di->ibuf, source_bytes)) { skip("geometry_index_gpu_pending", rec); return; }
+        const uint64_t cap = quads == EXP_QUADS ? (uint64_t)(count / 4) * 6 : quads == EXP_LOOP ? (uint64_t)count * 2 :
+                             quads == EXP_QSTRIP ? (uint64_t)((count - 2) / 2) * 6 : (uint64_t)(count - 2) * 3;
+        if (cap > UINT32_MAX) { skip("expanded_index_count_too_large", rec); return; }
         nvn_gpu_slice sl; nvn_gpu_err err = {0};
         nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, cap * 4, 4, &sl, &err);
         if (!nvn_gpu_ok(rc) || !sl.cpu) { arena_fail_detail(rc, &err, cap * 4); skip("arena_alloc_failed", rec); return; }
-        const uint8_t *src = di ? (const uint8_t *)(uintptr_t)di->ibuf : NULL; int64_t rv = restart ? (int64_t)rp_S.restart.index : -1; uint32_t *dst = (uint32_t *)(void *)sl.cpu;
-        uint32_t n = quads == EXP_QUADS ? quad_expand(src, isz, count, rv, dst) : quads == EXP_LOOP ? loop_expand(src, isz, count, rv, dst) :
-                     quads == EXP_GS_TSTRIP ? (src ? gs_tstrip_expand_ix(src, isz, count, rv, dst) : gs_tstrip_expand(count, dst)) : qstrip_expand(src, isz, count, rv, dst);
+        const uint8_t *src = di ? (const uint8_t *)(uintptr_t)di->ibuf : NULL;
+        const uint32_t mask = isz == 1 ? UINT8_MAX : isz == 2 ? UINT16_MAX : UINT32_MAX;
+        const int64_t rv = restart ? (int64_t)(rp_S.restart.index & mask) : -1;
+        uint32_t *dst = (uint32_t *)(void *)sl.cpu;
+        uint32_t n;
+        switch (quads) {
+            case EXP_QUADS: n = quad_expand(src, isz, count, rv, dst); break;
+            case EXP_LOOP: n = loop_expand(src, isz, count, rv, dst); break;
+            case EXP_QSTRIP: n = qstrip_expand(src, isz, count, rv, gs, dst); break;
+            case EXP_GS_FAN: n = gs_fan_expand(src, isz, count, rv, dst); break;
+            default: n = src ? gs_tstrip_expand_ix(src, isz, count, rv, dst) : gs_tstrip_expand(count, dst); break;
+        }
         if (!n) return;
         a.ibuf = sl.buf; a.ioff = sl.off; a.itype = 2; a.base_vertex = di ? di->base_vertex : dr->first; count = n;
     } else if (rst_rewrite) {
