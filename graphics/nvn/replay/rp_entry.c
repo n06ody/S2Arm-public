@@ -319,8 +319,8 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
 void nvn_be_prog_release(prog_t *p) { (void)p; }               // 还没有按程序的管线缓存：没有东西要释放
 void nvn_be_shader_prefetch(const uint8_t key[8]) { (void)key; }   // 预取是提速手段，不影响正确性；着色器链接上后再接
 void nvn_be_pair_prefetch(const uint8_t (*keys)[8], int n) { (void)keys; (void)n; }   // 同上：提速手段
-// 1 = 超过 1,024 条的间接计数多绘整段录一条 OP_MULTI_DRAW（rp_multi_draw 一次交后端）；设备没开 drawIndirectCount 时仍逐条录（rp_draw 报名跳过）
-int nvn_be_multi_draw_range(void) { nvn_gpu_caps caps; nvn_gpu_caps_get(&caps); return (caps.caps & NVN_GPU_CAP_INDIRECT_COUNT) != 0; }
+// 前端始终保留大组；回放时再按设备和参数选择原生计数或准备间接参数。
+int nvn_be_multi_draw_range(void) { return 1; }
 int nvn_be_buf_extent_consumer(void) { return 0; }             // 新回放按绑定范围和池镜像解析，未查询前端的活缓冲表
 
 // ---------- 全局状态 ----------

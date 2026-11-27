@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
+layout(set = 0, binding = 1, std430) readonly buffer Count { uint words[]; } count;
+layout(set = 0, binding = 2, std430) writeonly buffer Masked { uint words[]; } masked;
+layout(push_constant) uniform Params {
+    uint args_byte, count_byte, source_stride, command_words, max_draws;
+} params;
+
+uint load_arg(uint byte_offset) {
+    uint at = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint word = args.words[at] >> shift;
+    return shift == 0u ? word : word | (args.words[at + 1u] << (32u - shift));
+}
+
+uint load_count() {
+    uint at = params.count_byte >> 2;
+    uint shift = (params.count_byte & 3u) * 8u;
+    uint word = count.words[at] >> shift;
+    return shift == 0u ? word : word | (count.words[at + 1u] << (32u - shift));
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= params.max_draws) return;
+    if (params.command_words == 0u) {
+        if (index == 0u) masked.words[0] = min(load_count(), params.max_draws);
+        return;
+    }
+    bool live = index < load_count();
+    uint input_byte = params.args_byte + index * params.source_stride;
+    uint output_word = index * params.command_words;
+    for (uint w = 0u; w < params.command_words; ++w) {
+        masked.words[output_word + w] = live ? load_arg(input_byte + w * 4u) : 0u;
+    }
+}

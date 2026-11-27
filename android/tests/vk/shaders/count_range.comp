@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Counts { uint word[]; } counts;
+void main() {
+    uint byte_offset = counts.word[1];
+    uint index = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint count = counts.word[0];
+    counts.word[index] = count << shift;
+    if (shift != 0u) counts.word[index + 1u] = count >> (32u - shift);
+}

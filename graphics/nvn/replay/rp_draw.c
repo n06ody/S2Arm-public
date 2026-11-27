@@ -58,6 +58,10 @@
 // 弱链接[replay]：nvn_vk_pipe_demand_cold_kick
 // 弱链接[replay]：nvn_vk_cold_guard_auto
 // 弱链接[replay]：nvn_vk_cold_guard_draw
+// 弱链接[replay]：nvn_vk_mdi_native_limit
+// 弱链接[replay]：nvn_vk_mdi_prepare
+// 弱链接[replay]：rp_mdi_checkpoint
+// 弱链接[replay]：nvn_vk_mdi_copy_bytes
 int rp_cold_submit_scope(nvn_gpu_cmd, nvn_gpu_cmd *) __attribute__((weak));
 int rp_pass_slot_planned(int) __attribute__((weak));
 int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *, nvn_gpu_pipe *) __attribute__((weak));
@@ -66,6 +70,10 @@ int nvn_vk_pipe_demand_cold_kick(const nvn_gpu_pipe_desc *, const uint8_t[32], c
 int nvn_vk_cold_guard_auto(nvn_gpu_cmd, nvn_gpu_cmd, nvn_gpu_pipe, nvn_gpu_pipe,
                            const nvn_gpu_draw_args *, const struct nvn_gpu_cold_domain *) __attribute__((weak));
 int nvn_vk_cold_guard_draw(nvn_gpu_cmd, const nvn_gpu_draw_args *) __attribute__((weak));
+uint32_t nvn_vk_mdi_native_limit(void) __attribute__((weak));
+int nvn_vk_mdi_prepare(nvn_gpu_cmd, nvn_gpu_draw_args *, int) __attribute__((weak));
+int rp_mdi_checkpoint(nvn_gpu_cmd *) __attribute__((weak));
+int nvn_vk_mdi_copy_bytes(nvn_gpu_cmd, nvn_gpu_buf, uint64_t, nvn_gpu_buf, uint64_t, uint64_t) __attribute__((weak));
 
 // SupportBuffer 里现在要填的字段（翻译器产物的布局；其余保持 0）
 enum { SB_RENDER_SCALE = 192, SB_S2A_FLAGS = 1392, SB_S2A_POINT = 1408, SB_RENDER_SCALE_Y = 1440, SB_RENDER_SCALE_COUNT = 73 };
@@ -545,8 +553,8 @@ static uint32_t qstrip_expand(const uint8_t *src, uint32_t isz, uint32_t count, 
 }
 // #977：重启值按索引宽度截断后不是全 1 时，Vulkan 的重启值固定是全 1、对不上。改写成 32 位索引：等于重启值的 → 0xFFFFFFFF（照样重启），
 // 其余原样（原来的全 1 在 32 位里不再是重启值，当普通顶点画）。返回写出的个数（= count）。
-static uint32_t restart_rewrite(const uint8_t *src, uint32_t isz, uint32_t count, uint32_t rv, uint32_t *d) {
-    for (uint32_t i = 0; i < count; i++) { uint32_t v = IXR(i); d[i] = v == rv ? 0xFFFFFFFFu : v; }
+static uint32_t widen_indices(const uint8_t *src, uint32_t isz, uint32_t count, int restart, uint32_t rv, uint32_t *d) {
+    for (uint32_t i = 0; i < count; i++) { uint32_t v = IXR(i); d[i] = restart && v == rv ? UINT32_MAX : v; }
     return count;
 }
 #undef IXR
@@ -1523,6 +1531,7 @@ static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
 
 // #658：小组由回放器以已解码记录单遍积累，禁止前瞻读取命令流。
 static uint32_t g_decoded_count_n; static uint64_t g_decoded_count_stride;
+static void rp_draw_impl(nvn_gpu_cmd, const p_draw *, const p_draw_idx *, const void *, const uint8_t *);
 void rp_draw_count_batch(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di,
                          const void *rec, uint32_t n, uint64_t stride) {
     g_decoded_count_n = n; g_decoded_count_stride = stride;
@@ -1532,7 +1541,7 @@ void rp_draw_count_batch(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di,
 // OP_MULTI_DRAW（超过 1,024 条的一次调用，前端整段录一条）：组大小与步长由记录直接给，不往后数
 static uint32_t g_mdi_force_n; static uint64_t g_mdi_force_stride;
 void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) {
-    if (!c || !m || m->max <= 0 || m->stride <= 0) { skip("multi_draw_invalid", rec); return; }
+    if (!c || !m || !m->cnt || m->max <= 0 || m->stride < 0) { skip("multi_draw_invalid", rec); return; }
     g_mdi_force_n = (uint32_t)m->max; g_mdi_force_stride = (uint64_t)m->stride;
     if (m->itype >= 0) {
         p_draw_idx d; memset(&d, 0, sizeof d);
@@ -1544,6 +1553,97 @@ void rp_multi_draw(nvn_gpu_cmd c, const p_multi_draw *m, const void *rec) {
         rp_draw(c, &d, NULL, rec);
     }
     g_mdi_force_n = 0;
+}
+
+static int mdi_cpu_available(void) { return rp_mdi_checkpoint && nvn_vk_mdi_copy_bytes; }
+
+// 先录入同一主段，等待这个段的栅栏后才读 coherent 暂存。绝不从仍在途的镜像解引用。
+static nvn_gpu_buf mdi_snapshot(nvn_gpu_cmd *c, uint64_t addr, uint64_t stride, uint32_t n,
+                                uint64_t size, uint64_t *packed_stride) {
+    if (!mdi_cpu_available() || !n || !size || size > SIZE_MAX) return NULL;
+    if (!stride) n = 1;
+    if (n > 1 && stride > (UINT64_MAX - size) / (n - 1)) return NULL;
+    const uint64_t span = (uint64_t)(n - 1) * stride + size;
+    if (span > UINT64_MAX - addr || n > SIZE_MAX / size) return NULL;
+    const uint64_t packed = n * size;
+    const int dense = n == 1 || (span <= SIZE_MAX && (span <= packed || span - packed <= packed / 2) &&
+                                 rp_pool_find(addr, span, NULL, NULL));
+
+    rp_pass_flush(*c);
+    nvn_gpu_buf snapshot = NULL;
+    if (!nvn_gpu_ok(nvn_gpu_buf_create(dense ? span : packed, NVN_GPU_MEM_SHARED, NULL, &snapshot, NULL))) return NULL;
+    for (uint32_t i = 0; i < (dense ? 1u : n); i++) {
+        nvn_gpu_buf src = NULL;
+        uint64_t off = 0, bytes = dense ? span : size;
+        if (!rp_buf_resolve(*c, addr + i * stride, bytes, &src, &off) ||
+            !nvn_vk_mdi_copy_bytes(*c, src, off, snapshot, i * size, bytes)) goto fail;
+    }
+    if (!rp_mdi_checkpoint(c) || !nvn_gpu_buf_cpu(snapshot)) goto fail;
+    if (packed_stride) *packed_stride = dense ? stride : size;
+    return snapshot;
+fail:
+    nvn_gpu_buf_release(snapshot, NULL, NULL);
+    return NULL;
+}
+
+static void mdi_draw_cpu(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di,
+                         uint32_t max_draws, uint64_t stride, const void *rec) {
+    if (!mdi_cpu_available()) { skip("indirect_count_snapshot_unavailable", rec); return; }
+    if (di && (di->itype < 0 || di->itype > 2)) { skip("index_type_invalid", rec); return; }
+    nvn_gpu_buf count_buf = mdi_snapshot(&c, di ? di->mdi_cnt : dr->mdi_cnt, 0, 1, 4, NULL);
+    if (!count_buf) { skip("indirect_count_snapshot_failed", rec); return; }
+    uint32_t n;
+    memcpy(&n, nvn_gpu_buf_cpu(count_buf), sizeof n);
+    nvn_gpu_buf_release(count_buf, NULL, NULL);
+    if (n > max_draws) n = max_draws;
+    if (!n) return;
+
+    const uint64_t arg_size = di ? 20 : 16;
+    uint64_t arg_step = 0;
+    nvn_gpu_buf args = mdi_snapshot(&c, di ? di->ind : dr->ind, stride, n, arg_size, &arg_step);
+    if (!args) { skip("indirect_args_snapshot_failed", rec); return; }
+    const uint8_t *records = nvn_gpu_buf_cpu(args);
+    nvn_gpu_buf indices = NULL;
+    uint64_t index_lo = UINT64_MAX, index_hi = 0;
+    if (di) {
+        const uint32_t width = 1u << di->itype;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t arg[5];
+            memcpy(arg, records + i * arg_step, sizeof arg);
+            if (!arg[0] || !arg[1]) continue;
+            const uint64_t start = (uint64_t)arg[2] * width, end = start + (uint64_t)arg[0] * width;
+            if (start < index_lo) index_lo = start;
+            if (end > index_hi) index_hi = end;
+        }
+        if (index_hi) {
+            if (index_hi > UINT64_MAX - di->ibuf || !(indices = mdi_snapshot(&c, di->ibuf + index_lo,
+                    0, 1, index_hi - index_lo, NULL))) {
+                skip("indirect_index_snapshot_failed", rec);
+                goto out;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t arg[5] = {0};
+        memcpy(arg, records + i * arg_step, arg_size);
+        if (!arg[0] || !arg[1]) continue;
+        if (di) {
+            const uint64_t off = (uint64_t)arg[2] << di->itype;
+            if (off > UINT64_MAX - di->ibuf) { skip("indirect_index_offset_overflow", rec); break; }
+            const p_draw_idx draw = {.prim = di->prim, .itype = di->itype, .ibuf = di->ibuf + off,
+                .count = (int32_t)arg[0], .instances = (int32_t)arg[1],
+                .base_vertex = (int32_t)arg[3], .base_instance = (int32_t)arg[4]};
+            rp_draw_impl(c, NULL, &draw, rec, indices ? nvn_gpu_buf_cpu(indices) + (off - index_lo) : NULL);
+        } else {
+            const p_draw draw = {.prim = dr->prim, .count = (int32_t)arg[0], .instances = (int32_t)arg[1],
+                .first = (int32_t)arg[2], .base_instance = (int32_t)arg[3]};
+            rp_draw(c, &draw, NULL, rec);
+        }
+    }
+out:
+    if (indices) nvn_gpu_buf_release(indices, NULL, NULL);
+    nvn_gpu_buf_release(args, NULL, NULL);
 }
 // OP_DRAW / OP_DRAW_IDX 共用。di 非空 = 带索引
 // 分时：一笔绘制里各步各花多久（累计到 rp_perf，上屏那边每 5 秒报一次）
@@ -1661,6 +1761,11 @@ static int cold_prepare(nvn_gpu_cmd c, const nvn_gpu_pipe_desc *recipe, const nv
 }
 
 void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec) {
+    rp_draw_impl(c, dr, di, rec, NULL);
+}
+
+static void rp_draw_impl(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *rec,
+                         const uint8_t *index_snapshot) {
     if (!c) return;
     g_cold_drv.buf = NULL;
     memset(g_ind_drv_ok, 0, sizeof g_ind_drv_ok);
@@ -1670,6 +1775,7 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     const uint64_t ind = di ? di->ind : dr->ind;
     const uint64_t mcnt = di ? di->mdi_cnt : dr->mdi_cnt;
     uint32_t mdi_n = 0; uint64_t mdi_stride = 0;
+    int mdi_mask = 0, mdi_clamp = 0;
     if (mcnt) {
         const int32_t mi = di ? di->mdi_i : dr->mdi_i;
         if (mi != 0) { skip("indirect_count_group_broken", rec); return; }
@@ -1677,12 +1783,23 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         else if (g_decoded_count_n) { mdi_n = g_decoded_count_n; mdi_stride = g_decoded_count_stride; }
         else { skip("indirect_count_group_unavailable", rec); return; }
         if (mdi_n == 1) mdi_stride = di ? 20 : 16;
-        if (!ind || mdi_stride < (uint64_t)(di ? 20 : 16) || (mdi_stride & 3) || mdi_stride > 0xFFFFFFFFu) { skip("indirect_count_group_unavailable", rec); return; }
-        nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);   // 设备没开 drawIndirectCount 就不交（交了后端整段判失败），照旧报名跳过
-        if (!(caps.caps & NVN_GPU_CAP_INDIRECT_COUNT)) { skip(g_decoded_count_n ? "indirect_count_unsupported" : "indirect_count_no_device_support", rec); return; }
+        if (!ind) { skip("indirect_count_group_unavailable", rec); return; }
+        if (mdi_stride > UINT32_MAX) { mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec); return; }
+        nvn_gpu_caps caps; nvn_gpu_caps_get(&caps);
+        const uint32_t native_limit = nvn_vk_mdi_native_limit ? nvn_vk_mdi_native_limit() : UINT32_MAX;
+        mdi_mask = !(caps.caps & NVN_GPU_CAP_INDIRECT_COUNT) || mdi_n > native_limit ||
+            mdi_stride < (uint64_t)(di ? 20 : 16) || (mdi_stride & 3);
+        mdi_clamp = !mdi_mask && native_limit != UINT32_MAX;
+        if ((mdi_mask || mdi_clamp) && !nvn_vk_mdi_prepare) {
+            if (mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+            else skip(g_decoded_count_n ? "indirect_count_unsupported" : "indirect_count_no_device_support", rec);
+            return;
+        }
     }
     if (ind && (prim == 2 || prim == 7 || prim == 8 || prim == 9 || (di && di->itype == 0))) {
-        skip("indirect_topology_or_index_conversion", rec); return;
+        if (mdi_n && mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+        else skip("indirect_topology_or_index_conversion", rec);
+        return;
     }
     if (dr && dr->tfc) { skip("transform_feedback_count", rec); return; }
     if (rp_S.tf_on) { skip("transform_feedback_active", rec); return; }
@@ -1721,7 +1838,11 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         rst_rv = (uint32_t)rp_S.restart.index & ones;
         rst_rewrite = rst_rv != ones;
     }
-    if (rst_rewrite && ind) { skip("indirect_restart_index_not_all_ones", rec); return; }
+    if (rst_rewrite && ind) {
+        if (mdi_n && mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+        else skip("indirect_restart_index_not_all_ones", rec);
+        return;
+    }
     if (prim != g_prim || quads != g_quads) { g_prim = prim; g_quads = quads; rp_pso_dirty = 1; }
     // 窗口原点、光栅翻转和近裁模式都在状态块之外。近裁模式还会改变着色器变体，须在程序复用前检查。
     const int clip_neg1 = !rp_depth_zero();
@@ -1739,14 +1860,15 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
         if (np != g_prog) { g_prog = np; rp_pso_dirty = 1; }
     }
 draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置，下面按新程序重取资源与管线）
-    // 仅拒绝绑定 DRV0 且未证明不读 base instance 的已解码 count 组；单条间接/#941 和 OP_MULTI_DRAW 保持原路径。
-    // 组大小 1（max_draws = 1）只有一条命令，没有「别的命令的 firstInstance 被第一条顶替」的问题，语义与单条间接绘制相同：
-    //   不跳，走下面单条间接的那次 4 字节拷贝（firstInstance 取这一条记录的）。组大小 ≥ 2 照旧具名跳（#1787 第二处）。
-    if (g_decoded_count_n > 1) {
+    // #1787：DRV0 若仍读取 base instance，多条命令需要各自的 firstInstance。
+    // 有序读回可逐条绑定；没有这个能力的后端仍具名拒绝已解码小组。单条继续走后面的 4 字节拷贝。
+    if (mdi_n > 1 && (g_decoded_count_n || mdi_cpu_available())) {
         for (int st = 0; st < RP_PROG_STAGES; st++)
             for (uint32_t i = 0; i < g_prog->nent[st]; i++)
                 if (g_prog->ent[st][i].src_kind == NVN_RB_DRV0 && !(g_prog->binst_unread >> st & 1)) {
-                    skip("indirect_count_driver_base_instance", rec); return;
+                    if (mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+                    else skip("indirect_count_driver_base_instance", rec);
+                    return;
                 }
     }
     DT(RP_PERF_D_PROG);
@@ -1828,14 +1950,19 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
     if (di && (di->itype < 0 || di->itype > 2)) { skip("index_type_invalid", rec); return; }
     if (ind) {
         const uint64_t isize = di ? 20 : 16, ispan = mdi_n ? (uint64_t)(mdi_n - 1) * mdi_stride + isize : isize;
-        if (!rp_buf_resolve(c, ind, ispan, &a.ind, &a.ind_off) || (a.ind_off & 3)) {
+        if (mdi_n && mdi_cpu_available() && !rp_pool_find(ind, ispan, NULL, NULL)) {
+            mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+            return;
+        }
+        if (!rp_buf_resolve(c, ind, ispan, &a.ind, &a.ind_off) || (!mdi_n && (a.ind_off & 3))) {
             skip("indirect_buffer_unresolved", rec); return;
         }
         indirect_bytes = ispan;
         a.max_draws = 1; a.stride = (uint32_t)isize;
         if (mdi_n) {   // 整组：GPU 读计数，画 min(计数, mdi_n) 条
-            if (!rp_buf_resolve(c, mcnt, 4, &a.cnt, &a.cnt_off) || (a.cnt_off & 3)) { skip("indirect_count_unresolved", rec); return; }
+            if (!rp_buf_resolve(c, mcnt, 4, &a.cnt, &a.cnt_off)) { skip("indirect_count_unresolved", rec); return; }
             a.max_draws = mdi_n; a.stride = (uint32_t)mdi_stride;
+            mdi_mask |= ((a.cnt_off | a.ind_off) & 3) != 0;
         }
         if (di) {
             const uint8_t *mem = NULL; uint64_t bytes = 0;
@@ -1844,8 +1971,13 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             // not a CPU-derived count, without reading index or argument bytes.
             if (!rp_pool_find(di->ibuf, isz, &mem, &bytes)) { skip("index_buffer_unresolved", rec); return; }
             uint64_t off = di->ibuf - (uint64_t)(uintptr_t)mem;
-            if (off > bytes || !rp_buf_resolve(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff) || (a.ioff & (isz - 1))) {
+            if (off > bytes || !rp_buf_resolve(c, di->ibuf, bytes - off, &a.ibuf, &a.ioff)) {
                 skip("index_buffer_unresolved", rec); return;
+            }
+            if (a.ioff & (isz - 1)) {
+                if (mdi_n && mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+                else skip("index_buffer_unresolved", rec);
+                return;
             }
             a.itype = (uint32_t)di->itype; index_bytes = bytes - off;
         }
@@ -1854,30 +1986,45 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         if (quads == EXP_QUADS && count / 4 == 0) return;   // 不足一个四边形：什么都不画
         if (quads == EXP_GS_TSTRIP && count < 3) return;    // 不足一个三角形：什么都不画
         // 带索引：游戏的索引在登记过的池里，编码这一刻读出来展开（同常量缓冲：就是此刻的内容）
-        if (di && !rp_pool_find(di->ibuf, (uint64_t)count * isz, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
+        if (di && !index_snapshot && !rp_pool_find(di->ibuf, (uint64_t)count * isz, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
         uint64_t cap = quads == EXP_QUADS ? (uint64_t)(count / 4) * 6 : quads == EXP_LOOP ? (uint64_t)count * 2 :
                        quads == EXP_GS_TSTRIP ? (uint64_t)(count - 2) * 3 : (uint64_t)count * 3;   // 展开后最多几个索引
         nvn_gpu_slice sl; nvn_gpu_err err = {0};
         nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, cap * 4, 4, &sl, &err);
         if (!nvn_gpu_ok(rc) || !sl.cpu) { arena_fail_detail(rc, &err, cap * 4); skip("arena_alloc_failed", rec); return; }
-        const uint8_t *src = di ? (const uint8_t *)(uintptr_t)di->ibuf : NULL; int64_t rv = restart ? (int64_t)rp_S.restart.index : -1; uint32_t *dst = (uint32_t *)(void *)sl.cpu;
+        const uint8_t *src = index_snapshot ? index_snapshot : di ? (const uint8_t *)(uintptr_t)di->ibuf : NULL;
+        int64_t rv = restart ? (int64_t)rp_S.restart.index : -1; uint32_t *dst = (uint32_t *)(void *)sl.cpu;
         uint32_t n = quads == EXP_QUADS ? quad_expand(src, isz, count, rv, dst) : quads == EXP_LOOP ? loop_expand(src, isz, count, rv, dst) :
                      quads == EXP_GS_TSTRIP ? (src ? gs_tstrip_expand_ix(src, isz, count, rv, dst) : gs_tstrip_expand(count, dst)) : qstrip_expand(src, isz, count, rv, dst);
         if (!n) return;
         a.ibuf = sl.buf; a.ioff = sl.off; a.itype = 2; a.base_vertex = di ? di->base_vertex : dr->first; count = n;
-    } else if (rst_rewrite) {
+    } else if (rst_rewrite || index_snapshot) {
         uint32_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
-        if (!rp_pool_find(di->ibuf, (uint64_t)count * isz, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
+        if (!index_snapshot && !rp_pool_find(di->ibuf, (uint64_t)count * isz, NULL, NULL)) { skip("index_buffer_unresolved", rec); return; }
         nvn_gpu_slice sl; nvn_gpu_err err = {0};
         nvn_gpu_rc rc = nvn_gpu_arena_alloc(c, (uint64_t)count * 4, 4, &sl, &err);
         if (!nvn_gpu_ok(rc) || !sl.cpu) { arena_fail_detail(rc, &err, (uint64_t)count * 4); skip("arena_alloc_failed", rec); return; }
-        count = restart_rewrite((const uint8_t *)(uintptr_t)di->ibuf, isz, count, rst_rv, (uint32_t *)(void *)sl.cpu);
+        const uint8_t *src = index_snapshot ? index_snapshot : (const uint8_t *)(uintptr_t)di->ibuf;
+        count = widen_indices(src, isz, count, restart && (prim == 3 || prim == 5 || prim == 6), rst_rv,
+                              (uint32_t *)(void *)sl.cpu);
         a.ibuf = sl.buf; a.ioff = sl.off; a.itype = 2; a.base_vertex = di->base_vertex;
     } else if (di) {
         uint32_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
         if (!rp_buf_resolve(c, di->ibuf, (uint64_t)count * isz, &a.ibuf, &a.ioff)) { skip("index_buffer_unresolved", rec); return; }
         a.itype = (uint32_t)di->itype; a.base_vertex = di->base_vertex; index_bytes = (uint64_t)count * isz;
     } else a.first = (uint32_t)dr->first;
+    if (mdi_mask || mdi_clamp) {
+        rp_pass_flush(c);
+        const int prepared = nvn_vk_mdi_prepare ? nvn_vk_mdi_prepare(c, &a, mdi_mask) : 0;
+        if (prepared <= 0) {
+            if (!prepared && mdi_cpu_available()) mdi_draw_cpu(c, dr, di, mdi_n, mdi_stride, rec);
+            else skip("indirect_count_prepare_failed", rec);
+            return;
+        }
+        if (mdi_mask) indirect_bytes = (uint64_t)a.max_draws * a.stride;
+        g_pipe_cmd = NULL;
+        rp_dirty_all();
+    }
     if (ind || g_hz_mask) {
         // 要拷的阶段：用驱动段、编译器没证明不读 c0 + 0x644
         uint8_t need = 0;

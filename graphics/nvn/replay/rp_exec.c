@@ -493,6 +493,18 @@ static void seg_cut(int next_occ) {
     rp_dirty_all();
 }
 
+// 慢路径先把读回拷贝录在当前段，通过回放器自己的段和栅栏提交。返回新段，不再用旧命令。
+int rp_mdi_checkpoint(nvn_gpu_cmd *cmd) {
+    if (!cmd || !g_cmd || *cmd != g_cmd || !g_sub || rp_pass_is_open() ||
+        g_mid + 1 + (g_pre != NULL) >= SUB_STEP) return 0;
+    const uint64_t before = g_seg_serial;
+    seg_cut(g_occ_seg);
+    *cmd = g_cmd;
+    nvn_gpu_err err = {0};
+    return g_seg_serial != before && g_cmd &&
+        nvn_gpu_ok(nvn_gpu_fence_wait(g_fence + g_mid, 5000000000ull, &err));
+}
+
 static uint64_t sub_commit_body(void);
 uint64_t nvn_be_sub_commit(void) {
     const uint64_t f = sub_commit_body();
@@ -804,9 +816,8 @@ static void count_feed(struct rp_count_group *g, const p_draw *dr, const p_draw_
     int same = g->n && g->n < 1024 && ix == g->indexed && cnt == oldcnt && seq == (int32_t)g->n;
     if (same) same = ix ? di->prim == g->di.prim && di->itype == g->di.itype && di->ibuf == g->di.ibuf : dr->prim == g->dr.prim && dr->tfc == g->dr.tfc;
     uint64_t stride = g->stride;
-    if (same && g->n == 1) { if (ind <= first) same = 0; else stride = ind - first; }
-    if (same && (stride < (ix ? 20u : 16u) || (stride & 3) || stride > UINT32_MAX)) same = 0;
-    if (same && ((uint64_t)g->n > (UINT64_MAX - first) / stride || ind != first + g->n * stride)) same = 0;
+    if (same && g->n == 1) { if (ind < first) same = 0; else stride = ind - first; }
+    if (same && ((stride && (uint64_t)g->n > (UINT64_MAX - first) / stride) || ind != first + g->n * stride)) same = 0;
     if (same) { g->n++; g->stride = stride; if (g->n == 1024) count_flush(g, 0); return; }
     count_flush(g, 0);   // 调用处 t_cmd 已覆盖本次绘制，避免重复计时。
     if (!cnt || seq != 0) { rp_draw(g_cmd, dr, di, rec); return; }

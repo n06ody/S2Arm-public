@@ -507,6 +507,7 @@ struct nvn_gpu_vk {
     struct nvn_gpu_pool_table_s *pools;
     uint32_t border_live;          // 存活的自定义边框色 VkSampler 个数，对照 dev->custom_border_max（g_mu 下改）
     struct nvn_gpu_shader_s *shaders;
+    nvn_gpu_shader mdi_mask_shader;   // 随会话着色器表回收
     struct nvn_gpu_pipe_s *pipes;
     uint64_t stats[STAT_N];
     struct vk_land_slot land_slots[3];
@@ -3328,14 +3329,14 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     pthread_mutex_unlock(&g_mu);
 }
 
-void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+static void copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes, int byte_granular) {
     { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
     if (!ch) return;
     struct nvn_gpu_cmd_s *c = ch;
     if (!rc_is(c->sticky, NVN_GPU_OK)) return;
     struct nvn_gpu_buf_s *s = src, *d = dst;
     if (!s || !d || !buf_range(s, soff, bytes) || !buf_range(d, doff, bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 越界"); return; }
-    if (bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
+    if (!byte_granular && (bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
     if (bytes == 0) return;
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
@@ -3347,6 +3348,16 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
     pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_buf(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    copy_buf(c, src, soff, dst, doff, bytes, 0);
+}
+
+// Vulkan 的 VkBufferCopy 按字节定义。慢路径只取实际用到的索引，避免为了凑四字节跨出映射。
+int nvn_vk_mdi_copy_bytes(nvn_gpu_cmd c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    copy_buf(c, src, soff, dst, doff, bytes, 1);
+    return c && rc_is(c->sticky, NVN_GPU_OK);
 }
 
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
@@ -6724,6 +6735,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
 // 重叠采样先走快照；同图不重叠的采样仍要共享整图布局，退到 GENERAL。
 // 存储图像要 GENERAL 而它现在是只读布局时，也在通道外迁移（见 pass_reopen）。
 #include "backend_vulkan_feedback.inc"
+#include "backend_vulkan_mdi.inc"
 
 static int prepare_bind_layouts(struct nvn_gpu_cmd_s *c, int compute) {
     if (!feedback_prepare(c, compute)) return 0;
@@ -6891,6 +6903,8 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
     }
     uint32_t inst = a->instances ? a->instances : 1;
     uint32_t draws = a->max_draws ? a->max_draws : 1;
+    const int batch_indirect = g.dev->core_features.multiDrawIndirect &&
+        draws <= g.dev->properties.limits.maxDrawIndirectCount;
     const int dm = diag_draw_mode();
     if (a->ibuf) {
         if (a->itype > 2) { set_sticky(c, NVN_GPU_E_ARG, "索引类型 %u 非法", a->itype); return; }
@@ -6943,11 +6957,11 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
             uint32_t stride = a->stride ? a->stride : (uint32_t)sizeof(VkDrawIndexedIndirectCommand);
             if (a->cnt) {
                 DIAG_DRAW(vkCmdDrawIndexedIndirectCount(c->cb, a->ind->buffer, a->ind_off, a->cnt->buffer, a->cnt_off, a->max_draws, stride));
-            } else if (draws > 1) {
+            } else if (draws > 1 && !batch_indirect) {
                 for (uint32_t i = 0; i < draws; i++)
                     DIAG_DRAW(vkCmdDrawIndexedIndirect(c->cb, a->ind->buffer, a->ind_off + (uint64_t)i * stride, 1, stride));
             } else {
-                DIAG_DRAW(vkCmdDrawIndexedIndirect(c->cb, a->ind->buffer, a->ind_off, 1, stride));
+                DIAG_DRAW(vkCmdDrawIndexedIndirect(c->cb, a->ind->buffer, a->ind_off, draws, stride));
             }
         } else {
             DIAG_DRAW(vkCmdDrawIndexed(c->cb, a->count, inst, first, a->base_vertex, a->base_instance));
@@ -6958,11 +6972,11 @@ void nvn_gpu_draw(nvn_gpu_cmd ch, const nvn_gpu_draw_args *a) {
         uint32_t stride = a->stride ? a->stride : (uint32_t)sizeof(VkDrawIndirectCommand);
         if (a->cnt) {
             DIAG_DRAW(vkCmdDrawIndirectCount(c->cb, a->ind->buffer, a->ind_off, a->cnt->buffer, a->cnt_off, a->max_draws, stride));
-        } else if (draws > 1) {
+        } else if (draws > 1 && !batch_indirect) {
             for (uint32_t i = 0; i < draws; i++)
                 DIAG_DRAW(vkCmdDrawIndirect(c->cb, a->ind->buffer, a->ind_off + (uint64_t)i * stride, 1, stride));
         } else {
-            DIAG_DRAW(vkCmdDrawIndirect(c->cb, a->ind->buffer, a->ind_off, 1, stride));
+            DIAG_DRAW(vkCmdDrawIndirect(c->cb, a->ind->buffer, a->ind_off, draws, stride));
         }
     } else {
         DIAG_DRAW(vkCmdDraw(c->cb, a->count, inst, a->first, a->base_instance));
