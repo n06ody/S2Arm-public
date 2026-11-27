@@ -2074,7 +2074,7 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
         nvn_unimpl("shader", "compile_stopped", NULL);
         return LIVE_ABORT;
     }
-    if (g_lookahead_slots && g_live_compile == 1 && q) {
+    if (g_lookahead_slots && g_live_compile == 1 && (q || stages == 32u)) {
         uint8_t key[32];
         compile_future_key(session, generation, identity, json, len, key);
         struct s2a_compile_stamp phase = s2a_compile_phase_begin();
@@ -2083,11 +2083,15 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
         if (shader_stopped()) return LIVE_ABORT;
         if (g_texpool_diag && (w == 0 || w == 2)) g_pool_attempts++;
         if (w == 0 && oc->bytes && oc->bytes_len) {
-            if (built) *built = lookahead_take_program(key);
+            struct entry *prepared = lookahead_take_program(key);
+            if (built) *built = prepared;
+            else entry_free(prepared);
             atomic_fetch_add_explicit(&g_live_future_hits, 1, memory_order_relaxed);
             return LIVE_OK;
         }
-        if (w == 2) return LIVE_REJECTED;
+        // Speculation may fail on the worker itself. Let the owner retry and
+        // make the authoritative decision instead of publishing a failure.
+        if (w == 2) entry_free(lookahead_take_program(key));
     }
     if (g_live_compile != 1 || g_lookahead_slots) {
         if (g_texpool_diag) g_pool_attempts++;
@@ -2978,9 +2982,75 @@ static int lookahead_bindings_safe(const struct rp_state *state, const p_set_rt 
     return 1;
 }
 
+// Takes ownership of the optional graphics module snapshot. Compute workers
+// return result bytes; the consuming dispatch owns the source pin and module.
+static int lookahead_enqueue(uint64_t session, uint64_t generation, const uint8_t identity[32],
+                             const char *json, size_t len, struct work_snap *snap) {
+    uint8_t key[32];
+    compile_future_key(session, generation, identity, json, len, key);
+    int result = -RP_LOOKAHEAD_QUEUE;
+    pthread_mutex_lock(&g_progs_mu);
+    if (lookahead_find_locked(key)) result = 0;
+    else if (!shader_stopped()) {
+        for (unsigned i = 0; i < g_lookahead_slots; i++) {
+            struct lookahead_job *job = &g_lookahead[i];
+            if (job->used) continue;
+            job->used = 1;
+            memcpy(job->key, key, sizeof job->key);
+            job->snap = snap;
+            snap = NULL;
+            result = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_progs_mu);
+    if (result == 1) {
+        char why[128];
+        const int submitted = s2a_compile_worker_submit_async(session, generation, json, len, key, why, sizeof why);
+        if (submitted) {
+            entry_free(lookahead_take_program(key));
+            result = submitted == 2 ? 0 : -RP_LOOKAHEAD_QUEUE;
+        } else atomic_fetch_add_explicit(&g_live_enqueued, 1, memory_order_relaxed);
+    }
+    snap_free(snap);
+    return result;
+}
+
+static int lookahead_cached(const uint8_t identity[32]) {
+    pthread_mutex_lock(&g_progs_mu);
+    const int cached = nvn_hm_get(&g_progs, identity) != NULL || inflight_find_locked(identity) != NULL;
+    pthread_mutex_unlock(&g_progs_mu);
+    return cached;
+}
+
+static int compute_request_from_state(const struct rp_state *state, const struct s2a_direct_compile_context *pc,
+                                     struct nvk_compute_request *rq, char *why, size_t why_bytes,
+                                     int *unaligned);
+static int lookahead_compute(const struct rp_state *state, const struct s2a_direct_compile_context *pc) {
+    if (!(state->skey_ok >> 5 & 1)) return -RP_LOOKAHEAD_PROGRAM;
+    const struct ubo_need *need = g_ubo_need_n ? ubo_need_at(5, state->skey[5], 0) : NULL;
+    if (need && need->n) return -RP_LOOKAHEAD_DYNAMIC_UBO;
+    const uint64_t regs = rp_tex_reg_gen();
+    static struct nvk_compute_request rq;
+    char why[128];
+    int unaligned;
+    if (compute_request_from_state(state, pc, &rq, why, sizeof why, &unaligned)) return -RP_LOOKAHEAD_REQUEST;
+    int result = -RP_LOOKAHEAD_DESCRIPTOR_CHANGED;
+    if (regs == rp_tex_reg_gen()) {
+        result = 0;
+        if (!lookahead_cached(rq.identity))
+            result = lookahead_enqueue(rq.session, rq.generation, rq.identity, rq.json, rq.json_bytes, NULL);
+    }
+    nvk_compute_request_release(&rq);
+    return result;
+}
+
 int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const p_set_rt *targets) {
     if (!rp_shader_lookahead_budget()) return -RP_LOOKAHEAD_QUEUE;
     if (state->tex_pool_n <= 0 || state->tex_pool_n > 1048576) return -RP_LOOKAHEAD_TEX_POOL;
+    struct s2a_direct_compile_context pc = {0};
+    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return -RP_LOOKAHEAD_CONTEXT;
+    if (!q) return lookahead_compute(state, &pc);
     uint32_t stages = 0;
     for (int st = 0; st < 5; st++) if (state->bser[st]) stages |= 1u << st;
     if ((stages != 1u && stages != 3u && stages != 7u) || (state->skey_ok & stages) != stages) return -RP_LOOKAHEAD_PROGRAM;
@@ -2991,8 +3061,6 @@ int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req
     }
     const uint64_t regs = rp_tex_reg_gen();
     if (!lookahead_bindings_safe(state, targets, nst)) return -RP_LOOKAHEAD_RESOURCE;
-    struct s2a_direct_compile_context pc = {0};
-    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return -RP_LOOKAHEAD_CONTEXT;
     static struct facts facts;
     static uint8_t encoded[S2A_INPUT_IDENTITY_MAX];
     struct s2a_input_identity id;
@@ -3000,46 +3068,16 @@ int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req
     uint8_t sha[32];
     if (graphics_identity(state, q, &pc, stages, nst, &facts, &id, encoded, &len, sha)) return -RP_LOOKAHEAD_IDENTITY;
     if (regs != rp_tex_reg_gen()) return -RP_LOOKAHEAD_DESCRIPTOR_CHANGED;
-    pthread_mutex_lock(&g_progs_mu);
-    const int cached = nvn_hm_get(&g_progs, sha) != NULL || inflight_find_locked(sha) != NULL;
-    pthread_mutex_unlock(&g_progs_mu);
-    if (cached) return 0;
+    if (lookahead_cached(sha)) return 0;
     struct work_snap *snap = snap_capture(&facts, &id, sha, &pc, stages, nst);
     if (!snap) return -RP_LOOKAHEAD_SNAPSHOT;
     char ident[49], why[128] = "", *json = NULL;
-    int result = -RP_LOOKAHEAD_REQUEST;
-    if (!build_graphics_request(snap, ident, NULL, &json, &len, why, sizeof why)) {
-        result = -RP_LOOKAHEAD_QUEUE;
-        uint8_t key[32];
-        compile_future_key(pc.session, pc.generation, sha, json, len, key);
-        pthread_mutex_lock(&g_progs_mu);
-        struct lookahead_job *job = lookahead_find_locked(key);
-        if (job) result = 0;
-        else if (!shader_stopped()) {
-            for (unsigned i = 0; i < g_lookahead_slots; i++) {
-                if (g_lookahead[i].used) continue;
-                job = &g_lookahead[i];
-                job->used = 1;
-                memcpy(job->key, key, sizeof job->key);
-                job->snap = snap;
-                snap = NULL;
-                result = 1;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&g_progs_mu);
-        if (result == 1) {
-            const int submitted = s2a_compile_worker_submit_async(pc.session, pc.generation, json, len, key, why, sizeof why);
-            if (submitted) {
-                struct work_snap *unused = lookahead_take_snapshot(key);
-                entry_free(lookahead_take_program(key));
-                snap_free(unused);
-                result = submitted == 2 ? 0 : -RP_LOOKAHEAD_QUEUE;
-            } else atomic_fetch_add_explicit(&g_live_enqueued, 1, memory_order_relaxed);
-        }
+    if (build_graphics_request(snap, ident, NULL, &json, &len, why, sizeof why)) {
+        snap_free(snap);
+        return -RP_LOOKAHEAD_REQUEST;
     }
+    const int result = lookahead_enqueue(pc.session, pc.generation, sha, json, len, snap);
     free(json);
-    snap_free(snap);
     return result;
 }
 
@@ -3361,29 +3399,31 @@ static int shader_resolve_compute(const struct rp_prog **out) {   // 快路在�
     if (logging) { g_cs_miss_ns += now_ns() - t0; if (!((g_cs_hits + g_cs_misses) & 255)) cs_cache_log(); }
     return rc;
 }
-static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp) {
-    struct s2a_direct_compile_context pc = *pcp;
-    *out = NULL;
+// Shared by the real dispatch and the speculative scanner. Only real execution
+// reads guest UBO words; the scanner declines programs with known dynamic facts.
+static int compute_request_from_state(const struct rp_state *state, const struct s2a_direct_compile_context *pc,
+                                     struct nvk_compute_request *rq, char *why, size_t why_bytes,
+                                     int *unaligned) {
     static struct s2a_record_dispatch_state st; memset(&st, 0, sizeof st);
-    memcpy(st.keys[0], rp_S.skey[5], 8); st.stages = 32;
-    { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[5][i].size) m |= 1u << i; st.ubo_use[5] = m << 3; }   // 用户常量缓冲从 c3 起
-    st.tex_pool_n = (uint32_t)rp_S.tex_pool_n; st.samp_pool_n = (uint32_t)rp_S.samp_pool_n; st.tex_pool_seen = rp_S.tex_pool_n > 0; st.samp_pool_seen = rp_S.samp_pool_n > 0; st.tex_pool_base = rp_S.tex_base;
+    memcpy(st.keys[0], state->skey[5], 8); st.stages = 32;
+    { uint32_t m = 0; for (int i = 0; i < 16; i++) if (state->ubo[5][i].size) m |= 1u << i; st.ubo_use[5] = m << 3; }   // 用户常量缓冲从 c3 起
+    st.tex_pool_n = (uint32_t)state->tex_pool_n; st.samp_pool_n = (uint32_t)state->samp_pool_n; st.tex_pool_seen = state->tex_pool_n > 0; st.samp_pool_seen = state->samp_pool_n > 0; st.tex_pool_base = state->tex_base;
     // 贴图事实：计算阶段的 32 个组合槽，取法同图形（没绑过的槽读作池里的第 0 项）
     // 168 = 32 组合 + 128 分离 + 8 图像；再留 UBO_NEED_COORDS 项给句柄在用户常量缓冲里的贴图（ubo_need_learn 学到的坐标，每份着色器至多 8 个）
     enum { CS_TEX_N = 168 + UBO_NEED_COORDS };
     static struct s2a_compile_texture_src tex[CS_TEX_N]; static char tfmt[CS_TEX_N][S2A_TEX_FORMAT_MAX], tsmp[CS_TEX_N][S2A_TEX_SAMPLER_MAX]; int ntex = 0;
     for (int slot = 0; slot < 32; slot++) {
-        uint64_t h = rp_S.tex[5][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        uint64_t h = state->tex[5][slot]; long id = h ? (long)(h & 0xFFFFF) : (long)state->tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) {
             if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format), (uint32_t)(has_tv && tv.set_target ? tv.target : t.d.target), t.d.depth, &nf, why, sizeof why)) continue;
-        } else s2a_nvn_default_texture_fact(id, rp_S.tex_base, (uint32_t)rp_S.tex_pool_n, &nf);
+        } else s2a_nvn_default_texture_fact(id, state->tex_base, (uint32_t)state->tex_pool_n, &nf);
         memcpy(tfmt[ntex], nf.format, sizeof tfmt[ntex]); memcpy(tsmp[ntex], nf.sampler_type, sizeof tsmp[ntex]);
         tex[ntex] = (struct s2a_compile_texture_src){"cs", (uint32_t)(8 + 2 * slot), -1, tsmp[ntex], tfmt[ntex], nf.is_buffer, nf.normalized, 0, nf.array_length};
         ntex++;
     }
     for (int slot = 0; slot < 128; slot++) {
-        uint64_t h = rp_S.tex[5][128 + slot]; long id = h ? (long)(h & 0xFFFFF) : (long)rp_S.tex_base;
+        uint64_t h = state->tex[5][128 + slot]; long id = h ? (long)(h & 0xFFFFF) : (long)state->tex_base;
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (!rp_tex_snap_by_id((int)id, &t, &tv, &has_tv)) continue;
         if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
@@ -3396,7 +3436,7 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
     //   着色器用立即句柄（cbufSlot −1）或从 c2 读（cbufSlot 2，编译器回落到 −1 的同字事实）取图像时，编译器要这一格的类型与格式（空轨 2nd 9000：cs handle 72）。
     //   没绑的槽、登记表里没有、格式表达不了的都不出事实：编译器如实报缺，不猜。
     for (int slot = 0; slot < 8; slot++) {
-        uint64_t h = rp_S.img[5][slot];
+        uint64_t h = state->img[5][slot];
         tex_t t; view_t tv; int has_tv = 0; struct s2a_nvn_texture_fact nf; char why[96];
         if (!h || !rp_tex_snap_by_id((int)(h & 0xFFFFF), &t, &tv, &has_tv)) continue;
         if (request_texture_fact((uint32_t)(has_tv && tv.set_format ? tv.format : t.d.format),
@@ -3407,13 +3447,21 @@ static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_dir
     }
     // 句柄在用户常量缓冲里的贴图（cbufSlot 3..18）：按编译器上一次报缺的坐标学（ubo_need_learn，cs 也认），之后这份着色器每次建请求都读那个字、按登记快照给事实。
     //   没学过任何坐标时（绝大多数计算着色器）不走这一步。读不到 / 没登记照图形口径处理（具名报告 / 默认事实），不猜类型。
-    if (g_ubo_need_n) ntex = ubo_facts_into(5, tex, tfmt, tsmp, ntex, CS_TEX_N);
+    if (state == &rp_S && g_ubo_need_n) ntex = ubo_facts_into(5, tex, tfmt, tsmp, ntex, CS_TEX_N);
     struct nvk_compute_texture_facts tf = {tex, ntex, 1};
-    int unaligned = 0;
-    for (int i = 0; i < 16; i++) if (rp_S.ssbo[5][i].addr && pc.storage_buffer_offset_alignment && rp_S.ssbo[5][i].addr % pc.storage_buffer_offset_alignment) unaligned = 1;
-    char ident[24]; { int o = 0; for (int b = 0; b < 8; b++) o += snprintf(ident + o, sizeof ident - (size_t)o, "%02x", rp_S.skey[5][b]); }
-    static struct nvk_compute_request rq; memset(&rq, 0, sizeof rq); char why[256] = "";
-    if (nvk_compute_request_prepare(&st, &pc, &tf, 1, unaligned, ident, &rq, why, sizeof why)) {
+    *unaligned = 0;
+    for (int i = 0; i < 16; i++) if (state->ssbo[5][i].addr && pc->storage_buffer_offset_alignment && state->ssbo[5][i].addr % pc->storage_buffer_offset_alignment) *unaligned = 1;
+    char ident[24]; { int o = 0; for (int b = 0; b < 8; b++) o += snprintf(ident + o, sizeof ident - (size_t)o, "%02x", state->skey[5][b]); }
+    return nvk_compute_request_prepare(&st, pc, &tf, 1, *unaligned, ident, rq, why, why_bytes);
+}
+
+static int resolve_compute_slow(const struct rp_prog **out, const struct s2a_direct_compile_context *pcp) {
+    struct s2a_direct_compile_context pc = *pcp;
+    *out = NULL;
+    static struct nvk_compute_request rq;
+    int unaligned;
+    char why[256] = "";
+    if (compute_request_from_state(&rp_S, &pc, &rq, why, sizeof why, &unaligned)) {
         red1("compute_request_failed", why);
         g_pool_request_rejected++;
         if (!strcmp(why, "missing or out-of-range descriptor-pool facts")) g_pool_request_facts++;

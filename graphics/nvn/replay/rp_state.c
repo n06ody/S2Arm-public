@@ -116,7 +116,8 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
     case OP_BIND_PROGRAM: {
         p_bind_program decoded;
         const p_bind_program *bp = bind_program_rec(a, size, &decoded);
-        if (bytes != sizeof(p_bind_program_id) || (bp->prog && !bp->snap.nstage)) return 0;
+        if (bytes != sizeof(p_bind_program_id)) return 0;
+        if (bp->prog && !bp->snap.nstage) state->skey_ok &= (uint8_t)~bp->stages;
         bind_program(state, bp, 0);
         return 1;
     }
@@ -149,9 +150,13 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
     }
     case OP_BIND_UBO: case OP_BIND_SSBO: {
         const p_bind_buf *b = a;
-        if (bytes < sizeof *b || b->stage < 0 || b->stage >= 6 || b->index < 0 || b->index >= 16) return 0;
-        p_bind_buf *dst = op == OP_BIND_UBO ? &state->ubo[b->stage][b->index] : &state->ssbo[b->stage][b->index];
-        *dst = *b;  // 带 BIND_BUF_DEFER 的 stage 已排除，前瞻不解引用游戏数据
+        if (bytes < sizeof *b || b->index < 0 || b->index >= 16) return 0;
+        const int stage = b->stage & ~BIND_BUF_DEFER;
+        if (stage < 0 || stage >= 6) return 0;
+        // 延迟绑定沿用上一项投机。实绘以届时读到的完整请求校验，前瞻从不解引用客体数据。
+        if (b->stage & BIND_BUF_DEFER) return 1;
+        p_bind_buf *dst = op == OP_BIND_UBO ? &state->ubo[stage][b->index] : &state->ssbo[stage][b->index];
+        *dst = *b;
         return 1;
     }
     case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {
@@ -166,7 +171,12 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
     case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: {
         if (op == OP_BIND_TEX1) {
             const p_bind_tex1 *b = a;
-            if (bytes < sizeof *b || (b->slot & BIND_TEX1_AT)) return 0;
+            if (bytes < sizeof *b) return 0;
+            if (b->slot & BIND_TEX1_AT) {
+                const int slot = b->slot & ~BIND_TEX1_AT;
+                return bytes >= sizeof *b + sizeof(uint64_t) && b->stage >= 0 && b->stage < 6 &&
+                    slot >= 0 && slot < RP_NTEX;
+            }
         } else if (bytes < offsetof(p_bind_handles, h)) return 0;
         p_bind_handles decoded;
         const p_bind_handles *b = bind_rec(op, a, &decoded);
@@ -174,10 +184,9 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         if (b->stage < 0 || b->stage >= 6 || b->n < 0 || b->n > 32 || b->first < 0 || b->first > limit - b->n) return 0;
         const size_t handles = (size_t)b->n * sizeof *b->h;
         const size_t need = offsetof(p_bind_handles, h) + handles;
-        if (op != OP_BIND_TEX1 && bytes < need) return 0;
+        if (op != OP_BIND_TEX1 && bytes < need + (b->defer ? sizeof(p_bind_pool_bases) : 0)) return 0;
         // 采样器值只在绑定时使用；采样类型来自贴图视图，数组长度在池绑定处跟踪。
-        if (op == OP_BIND_SAMP) return !b->defer || bytes >= need + sizeof(p_bind_pool_bases);
-        if (b->defer) return 0;
+        if (op == OP_BIND_SAMP || b->defer) return 1;
         uint64_t *slots = op == OP_BIND_IMG ? state->img[b->stage] : state->tex[b->stage];
         memcpy(slots + b->first, b->h, handles);
         return 1;
@@ -203,7 +212,7 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         return bytes >= sizeof *p && p->size <= bytes - sizeof *p;
     }
     case OP_PUSH_CONST_PTR: return bytes >= sizeof(p_push_const_ptr);
-    // 动态绘制参数 / 管线状态。这里的拓扑只接受点、线、三角，细分控制点数不会改变请求。
+    // 动态绘制参数 / 管线状态。重启状态决定四边形带按什么图元生成着色器请求。
     case OP_SCISSOR: return bytes >= sizeof(p_scissor);
     case OP_DEPTH_RANGE: return bytes >= sizeof(p_depth_range);
     case OP_DEPTH_CLAMP: return bytes >= sizeof(p_depth_clamp);
@@ -212,7 +221,10 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
     case OP_STENCIL: return bytes >= sizeof(p_stencil);
     case OP_POLY_OFFSET: return bytes >= sizeof(p_poly_offset);
     case OP_RAST_DISCARD: return bytes >= sizeof(p_rast_discard);
-    case OP_PRIM_RESTART: return bytes >= sizeof(p_prim_restart);
+    case OP_PRIM_RESTART:
+        if (bytes < sizeof(p_prim_restart)) return 0;
+        state->restart = *(const p_prim_restart *)a;
+        return 1;
     case OP_SET_PATCH_SIZE: return bytes >= sizeof(p_set_patch_size);
     case OP_TF_BIND: return bytes >= sizeof(p_tf_bind);
     case OP_VIEWPORTS: {

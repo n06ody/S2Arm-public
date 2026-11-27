@@ -1703,14 +1703,14 @@ void rp_draw(nvn_gpu_cmd c, const p_draw *dr, const p_draw_idx *di, const void *
     // 没有原生对应的图元：换成能画的图元号，要展开索引的记下展开方式（quads），索引在取资源那一步展开
     int restart = di && rp_S.restart.on;
     int quads = EXP_NONE;
-    if (prim == 7) { quads = EXP_QUADS; prim = 4; }
-    else if (prim == 2) { quads = EXP_LOOP; prim = 1; }
-    else if (prim == 5 && gs && !ind) { quads = EXP_GS_TSTRIP; prim = 4; }   // 带 GS 的三角带按 GL 序展开（带索引的读游戏索引）；间接的照原生画
-    else if (prim == 9) prim = 6;   // 多边形 = 三角扇（首点为扇心，绕序同扇）
+    if (prim == 7) quads = EXP_QUADS;
+    else if (prim == 2) quads = EXP_LOOP;
+    else if (prim == 5 && gs && !ind) quads = EXP_GS_TSTRIP;   // 带 GS 的三角带按 GL 序展开
     else if (prim == 8) {           // 四边形带 = 三角带；零头 1 个点在三角带里会多画一个三角形，丢掉
-        if (restart) { quads = EXP_QSTRIP; prim = 4; }
-        else { count &= ~1u; if (count < 4) return; prim = 5; }
+        if (restart) quads = EXP_QSTRIP;
+        else { count &= ~1u; if (count < 4) return; }
     }
+    prim = rp_draw_shader_prim(prim, gs, restart, ind != 0);
     const p_set_rt *rt = rp_pass_target();
     if (!rt) { skip("draw_without_target", rec); return; }
     // 程序：管线状态或任一阶段的绑定变过才重新取（贴图槽里换了不同类型的贴图会换变体）

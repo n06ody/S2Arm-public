@@ -83,7 +83,7 @@ enum rp_lookahead_stop {
     RP_LOOKAHEAD_JUMP_CYCLE,
     RP_LOOKAHEAD_STOP_COUNT,
 };
-// 1 = 入队，0 = 无新工作，负值 = 首退原因（-RP_LOOKAHEAD_*）。
+// q 与 targets 均空时请求当前计算阶段。1 = 入队，0 = 无新工作，负值 = 略过该候选的原因。
 int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const struct p_set_rt *targets);
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。

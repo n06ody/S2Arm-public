@@ -3211,7 +3211,9 @@ static void t_submit_compile_lookahead(void) {
     end(&s);
     submit1(&s);
     fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_scan_draws == 3 && g_scan_prims[0] == 4 && g_scan_prims[1] == 1 && g_scan_prims[2] == 4);
+    // The conditional draw is a candidate. Only real replay evaluates its counters.
+    CHECK(g_scan_draws == 4 && g_scan_prims[0] == 4 && g_scan_prims[1] == 1 &&
+          g_scan_prims[2] == 4 && g_scan_prims[3] == 4);
     CHECK(g_scan_untouched);
     CHECK(g_gdraws == g_scan_start_draws + 4);
     g_scan_limit = 0;

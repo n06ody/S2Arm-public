@@ -253,6 +253,11 @@ int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
     c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = external_profile_hash[0] ? external_profile_hash : phash;
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
+static const char fixture_compute_result[] =
+    "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+    "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
+    "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],\"bindings\":[],"
+    "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}";
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
     last_compiler_thread = pthread_self();
     CHECK(session == 4 && (gen == 6 || (fixture_submit_compile && gen == 7)), "compile session");
@@ -351,11 +356,7 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
     }
     if (fake_cs_success && strstr(captured, "\"program\":{\"kind\":\"compute\"")) {
         // 合法的计算程序结果（形状同 nvn_vk_program_binding_cap_test.c 的 build_compute）：一个 cs 阶段、零个绑定。
-        static const char result[] = "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
-            "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
-            "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],\"bindings\":[],"
-            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}";
-        s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)(sizeof result - 1)};
+        s2a_direct_bytes payload = {(const uint8_t *)fixture_compute_result, sizeof fixture_compute_result - 1};
         return emit(sink, payload);
     }
     if (fake_compile_error) {
@@ -374,14 +375,23 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
 }
 #ifdef S2A_TEST_SUBMIT_SCAN
 static int submit_alignment_requests[2];
+static int fixture_reject_speculative_compute;
 #endif
 static int32_t fake_parallel_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req,
                                      s2a_direct_emit_fn emit, void *sink) {
     (void)session; (void)gen; (void)req;
 #ifdef S2A_TEST_SUBMIT_SCAN
     const struct s2a_jv root = {(const char *)req.data, (size_t)req.bytes};
-    struct s2a_jv program, graphics, align;
+    struct s2a_jv program, graphics, align, kind;
+    char name[16];
     int unaligned;
+    if (!s2a_jv_obj_find(root, "program", &program) && !s2a_jv_obj_find(program, "kind", &kind) &&
+        !s2a_jv_str(kind, name, sizeof name) && !strcmp(name, "compute")) {
+        live_gate_pause();
+        if (fixture_reject_speculative_compute && s2a_compile_worker_callback_key()) return -1;
+        const s2a_direct_bytes compute = {(const uint8_t *)fixture_compute_result, sizeof fixture_compute_result - 1};
+        return emit(sink, compute);
+    }
     if (!s2a_jv_obj_find(root, "program", &program) && !s2a_jv_obj_find(program, "graphicsState", &graphics) &&
         !s2a_jv_obj_find(graphics, "hasUnalignedStorageBuffer", &align) && !s2a_jv_bool(align, &unaligned)) {
         pthread_mutex_lock(&live_gate_mu);
@@ -2564,6 +2574,11 @@ static const p_set_rt *submit_targets;
 const p_set_rt *rp_pass_target(void) { return submit_targets; }
 void rp_buf_hold_begin(void) {}
 void rp_draw_stats(uint64_t *draws, uint64_t *skips) { *draws = *skips = 0; }
+int nvn_cmd_call_resolve(uint64_t handle, uint64_t *resolved) {
+    // Synthetic lists are outside the recorder's managed blocks.
+    *resolved = handle;
+    return 0;
+}
 nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *desc, nvn_gpu_cmd *out, nvn_gpu_err *err) {
     static char cmd;
     *out = (nvn_gpu_cmd)&cmd;
@@ -2617,15 +2632,32 @@ static void test_submit_scan_boundaries(void) {
     const struct { uint64_t addr; uint32_t mode, value; } wait = {(uintptr_t)&status, NVN_EV_WAIT, 1};
     submit_record(&cursor, OP_SIGNAL_EVENT, &wait, sizeof wait);
     submit_record(&cursor, OP_END, NULL, 0);
-    check_submit_boundary(wait_stream, "reason=command opcode=OP_SIGNAL_EVENT");
 
     _Alignas(8) uint8_t write_stream[48] = {0};
     cursor = write_stream;
     const p_clear_buf clear = {.addr = (uintptr_t)&status, .size = sizeof status, .value = 1};
     submit_record(&cursor, OP_CLEAR_BUF, &clear, sizeof clear);
     submit_record(&cursor, OP_END, NULL, 0);
-    check_submit_boundary(write_stream, "reason=command opcode=OP_CLEAR_BUF");
+    const uint64_t control_handles[] = {(uintptr_t)wait_stream, (uintptr_t)write_stream};
+    lookahead_stop_lines = 0;
+    nvn_be_sub_index(control_handles, 2);
+    CHECK(!lookahead_stop_lines, "submit scan: valid event wait and buffer clear do not stop traversal");
     CHECK(status == 0, "submit scan: wait and buffer write were not executed");
+
+    _Alignas(8) uint8_t bad_copy[32] = {0}, bad_update[32] = {0}, bad_op[16] = {0};
+    cursor = bad_copy;
+    submit_record(&cursor, OP_COPY_B2B, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_copy, "reason=record opcode=OP_COPY_B2B");
+    cursor = bad_update;
+    const uint64_t short_update[] = {(uintptr_t)&status, sizeof status};
+    submit_record(&cursor, OP_UPDATE_UB, short_update, sizeof short_update);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_update, "reason=record opcode=OP_UPDATE_UB");
+    cursor = bad_op;
+    submit_record(&cursor, OP_NVN2_END_, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_op, "reason=record opcode=OP_?");
 }
 
 static void test_submit_command_stream(const p_set_rt *targets, const struct rp_shader_req *q, int counters) {
@@ -2637,14 +2669,16 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
     const p_scissor scissor = {0, 0, 4, 4};
     const uint32_t ordered = NVN_BARRIER_ORDER_PRIMITIVES_BIT;
     const p_draw draw = {.prim = 4, .count = 3, .instances = 1};
-    const p_bind_buf deferred = {.stage = BIND_BUF_DEFER, .index = 0};
+    const p_bind_buf deferred = {.stage = BIND_BUF_DEFER, .index = 0, .addr = 1};
     _Alignas(8) uint8_t blocked[160] = {0};
     uint8_t *cursor = blocked;
     submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
     submit_record(&cursor, OP_BIND_SSBO, &deferred, sizeof deferred);
-    submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
     submit_record(&cursor, OP_END, NULL, 0);
-    check_submit_boundary(blocked, "reason=command opcode=OP_BIND_SSBO");
+    const uint64_t deferred_handle = (uintptr_t)blocked;
+    lookahead_stop_lines = 0;
+    nvn_be_sub_index(&deferred_handle, 1);
+    CHECK(!lookahead_stop_lines, "submit scan: deferred SSBO does not dereference guest address or stop the scan");
     if (counters) test_submit_scan_boundaries();
     lookahead_stop_lines = 0;
     last_lookahead_stop[0] = 0;
@@ -2741,6 +2775,84 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
           (unsigned long long)stats.start_failed, shader_load_count);
 }
 
+static void test_submit_mixed_stream(const p_set_rt *targets, const struct rp_shader_req *q, int variant) {
+    const int indirect = variant >= 9;
+    const int multi = variant == 10;
+    const int miss = variant == 11;
+    const int no_compute = variant == 12;
+    const int reject = variant == 13;
+    const unsigned expected_workers = no_compute ? 1 : 2;
+    fixture_parallel_compile = 1;
+    fixture_reject_speculative_compute = reject;
+    submit_targets = targets;
+    bind_pools(64);
+    rp_S.cser = 1;
+    if (no_compute) rp_S.skey_ok &= ~(1u << 5);
+    nvn_be_sub_begin();
+    uint32_t src = 23, dst = 17;
+    const uint64_t copy[] = {(uintptr_t)&src, (uintptr_t)&dst, sizeof dst};
+    const p_clear_tex clear = {.tex = targets->depth, .value_type = CLEAR_TEX_FLOAT,
+                               .r = {.width = 1, .height = 1, .depth = 1}, .mask = 15};
+    const p_dispatch dispatch = indirect ? (p_dispatch){.ind = 0x3000} : (p_dispatch){.x = 1, .y = 1, .z = 1};
+    const p_draw draw = {.prim = 4, .count = indirect ? 0 : 3, .instances = 1, .ind = indirect ? 0x4000 : 0};
+    const p_multi_draw draws = {.ind = 0x4000, .cnt = 0x5000, .stride = 16, .max = 8, .prim = 4, .itype = -1};
+    const p_render_cond condition = {.addr = 1, .mode = 0};
+    const uint64_t update[] = {(uintptr_t)&dst, sizeof dst, 39};
+    const p_bind_buf compute_ubo = {.stage = 5, .index = 0, .addr = 0x6000, .size = 4};
+    _Alignas(8) uint8_t stream[512] = {0};
+    _Alignas(8) uint8_t child[128] = {0};
+    uint8_t *cursor = stream;
+    if (!indirect) submit_record(&cursor, OP_CLEAR_TEX, &clear, sizeof clear);
+    if (multi) {
+        const uint64_t target = (uintptr_t)child;
+        submit_record(&cursor, OP_CALL, &target, sizeof target);
+        submit_record(&cursor, OP_CALL, &target, sizeof target);
+        uint8_t *child_cursor = child;
+        submit_record(&child_cursor, OP_BIND_UBO, &compute_ubo, sizeof compute_ubo);
+        submit_record(&child_cursor, OP_END, NULL, 0);
+    }
+    submit_record(&cursor, OP_DISPATCH, &dispatch, sizeof dispatch);
+    submit_record(&cursor, OP_UPDATE_UB, update, 2 * sizeof(uint64_t) + sizeof dst);
+    submit_record(&cursor, OP_COPY_B2B, copy, sizeof copy);
+    if (multi) {
+        submit_record(&cursor, OP_RENDER_COND, &condition, sizeof condition);
+        submit_record(&cursor, OP_MULTI_DRAW, &draws, sizeof draws);
+    } else submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_END, NULL, 0);
+
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    const int started = live_gate_wait(expected_workers);
+    pthread_mutex_lock(&live_gate_mu);
+    CHECK(started, "mixed submit: expected workers before replay (got %d/%u, log: %s)",
+          live_gate_entered, expected_workers, last_lookahead_stop);
+    pthread_mutex_unlock(&live_gate_mu);
+    CHECK(dst == 17 && !rp_S.ubo[5][0].size, "mixed submit: speculation never wrote the buffer or live bindings");
+    CHECK(!lookahead_stop_lines, "mixed submit: valid records never stop the scan");
+    live_gate_release();
+    if (!started) return;
+
+    const struct rp_prog *cs = NULL, *gfx = NULL;
+    if (multi || miss) rp_S.ubo[5][0] = compute_ubo;
+    if (!no_compute)
+        CHECK(!rp_shader_resolve_compute(&cs) && cs && cs->is_compute, "mixed submit: real dispatch gets its exact CS program");
+    CHECK(!rp_shader_resolve(q, &gfx) && gfx && !gfx->is_compute, "mixed submit: draw consumes its graphics future");
+    if (miss) {
+        // The nonmatching CS request is still allowed to finish in its own slot.
+        int busy = 1;
+        for (int attempt = 0; busy == 1 && attempt < 100; attempt++)
+            busy = s2a_compile_worker_pump(10);
+        CHECK(!busy, "mixed submit: unused CS request drained");
+    }
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == expected_workers && stats.compiled == expected_workers &&
+          stats.future_hits == ((miss || reject || no_compute) ? 1u : 2u) && stats.fallback == (miss || reject ? 1u : 0u),
+          "mixed submit: queued=%llu finished=%llu matched=%llu fallback=%llu",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.compiled,
+          (unsigned long long)stats.future_hits, (unsigned long long)stats.fallback);
+}
+
 static int previous_compile(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t bytes,
                             uint8_t **out, size_t *out_bytes, char *why, size_t why_size) {
     live_gate_pause();
@@ -2802,6 +2914,10 @@ static int submit_compile_test(int slots, int variant) {
 #ifdef S2A_TEST_SUBMIT_SCAN
     if (variant == 5 || variant == 7) {
         test_submit_command_stream(&targets, &q, variant == 5);
+        goto cleanup;
+    }
+    if (variant >= 8 && variant <= 13) {
+        test_submit_mixed_stream(&targets, &q, variant);
         goto cleanup;
     }
 #endif

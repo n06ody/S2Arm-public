@@ -84,7 +84,8 @@ def main():
                          extra_flags=('-DS2A_TEST_SUBMIT_SCAN',))
         rc = 0
         for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3),
-                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6), (4, 7)):
+                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6), (4, 7),
+                           (4, 8), (4, 9), (4, 10), (4, 11), (4, 12), (4, 13)):
             result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
                                     capture_output=True, text=True, timeout=30)
             sys.stdout.write(result.stdout)
