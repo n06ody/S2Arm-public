@@ -3,6 +3,7 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_shader.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -37,6 +38,8 @@ static const char *const k_op_name[OP_NVN2_END_] = {
 // 加了新命令这里就红：名字表、接线表（docs/直连_Vulkan回放接线表.tsv）、nvn_be_exec 三处同批补。
 _Static_assert(OP_COUNT_ == 52 && OP_NVN2_END_ == 56, "录制命令个数变了：补 k_op_name、接线表和 nvn_be_exec");
 const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] ? k_op_name[op] : "OP_?"; }
+
+static uint64_t g_lookahead_stops[RP_LOOKAHEAD_STOP_COUNT][OP_NVN2_END_ + 1];
 
 // ---------- 提交 ----------
 // 固定地址的段属结果：mid 回调不能碰仍会 realloc 的 post 表。最后一段回调后统一回收。
@@ -396,6 +399,7 @@ void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账
     __atomic_store_n(&g_bad_readback_fence, 0, __ATOMIC_RELEASE);
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
     g_rc_skip = g_rc_active = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
+    memset(g_lookahead_stops, 0, sizeof g_lookahead_stops);
 }
 
 void nvn_be_sub_begin(void) {
@@ -727,11 +731,243 @@ static void post_report(uint64_t addr, uint32_t type) {
     s->p[s->n++] = p; if (type != NVN_COUNTER_TYPE_TIMESTAMP && type != NVN_COUNTER_TYPE_TIMESTAMP_TOP) s->nfx++; pf_add(RP_PERF_FX_REPORT, 1); __atomic_fetch_or(&g_fx_types, 1ull << (type & 63), __ATOMIC_RELAXED);
 }
 
-void nvn_be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }     // 存储前瞻索引：通道规划接上时再建
 void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
+
+// 弱链接[replay]：rp_shader_lookahead_budget
+#pragma weak rp_shader_lookahead_budget
+// 弱链接[replay]：rp_shader_lookahead
+#pragma weak rp_shader_lookahead
+// 弱链接[replay]：rp_shader_lookahead_end
+#pragma weak rp_shader_lookahead_end
+
+static void lookahead_note(enum rp_lookahead_stop reason, uint32_t op, int terminal) {
+    static const char *const names[RP_LOOKAHEAD_STOP_COUNT] = {
+        [RP_LOOKAHEAD_COMMAND] = "command", [RP_LOOKAHEAD_RECORD] = "record",
+        [RP_LOOKAHEAD_SCAN_LIMIT] = "scan_limit", [RP_LOOKAHEAD_SUBMIT_STATE] = "submit_state",
+        [RP_LOOKAHEAD_JUMP_CYCLE] = "jump_cycle",
+        [RP_LOOKAHEAD_DEFERRED_BINDING] = "deferred_binding",
+        [RP_LOOKAHEAD_TARGET] = "target", [RP_LOOKAHEAD_DRAW] = "draw",
+        [RP_LOOKAHEAD_TEX_POOL] = "tex_pool", [RP_LOOKAHEAD_PROGRAM] = "program",
+        [RP_LOOKAHEAD_DYNAMIC_UBO] = "dynamic_ubo", [RP_LOOKAHEAD_RESOURCE] = "resource",
+        [RP_LOOKAHEAD_CONTEXT] = "context", [RP_LOOKAHEAD_IDENTITY] = "identity",
+        [RP_LOOKAHEAD_DESCRIPTOR_CHANGED] = "descriptor_changed", [RP_LOOKAHEAD_SNAPSHOT] = "snapshot",
+        [RP_LOOKAHEAD_REQUEST] = "request", [RP_LOOKAHEAD_QUEUE] = "queue",
+    };
+    const uint32_t bucket = op < OP_NVN2_END_ ? op : OP_NVN2_END_;
+    const uint64_t count = ++g_lookahead_stops[reason][bucket];
+    // 每笔提交只记首个略过候选与首退；同类首笔立刻可见，重复时在 2 的幂次打印累计值。
+    if (count & (count - 1)) return;
+    char line[160];
+    snprintf(line, sizeof line, "前瞻%s reason=%s opcode=%s op=%u count=%llu",
+             terminal ? "首退" : "候选略过", names[reason],
+             op == UINT32_MAX ? "none" : rp_op_name(op), (unsigned)op, (unsigned long long)count);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
+
+// Decode only the draw fields that reach shader selection. Indirect counts and
+// index/vertex data belong to real execution, including the multi-draw count.
+static int lookahead_draw_prim(const struct rp_state *state, uint32_t op, const void *payload,
+                               uint32_t size, uint32_t *shader_prim) {
+    const size_t bytes = size - sizeof(op_hdr);
+    uint32_t prim;
+    int indexed, itype = -1, indirect;
+    if (op == OP_DRAW) {
+        p_draw tmp;
+        if (bytes != offsetof(p_draw, ind) && bytes != sizeof(p_draw)) return -1;
+        const p_draw *d = draw_rec(payload, size, &tmp);
+        if (d->tfc || (!d->ind && d->count <= 0)) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = 0;
+        indirect = d->ind != 0;
+    } else if (op == OP_DRAW_IDX) {
+        p_draw_idx tmp;
+        if (bytes != sizeof(p_draw_idx_single) && bytes != offsetof(p_draw_idx, ind) &&
+            bytes != sizeof(p_draw_idx)) return -1;
+        const p_draw_idx *d = draw_idx_rec(payload, size, &tmp);
+        if (!d->ind && d->count <= 0) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = 1;
+        itype = d->itype;
+        indirect = d->ind != 0;
+    } else {
+        if (bytes < sizeof(p_multi_draw)) return -1;
+        const p_multi_draw *d = payload;
+        if (!d->ind || d->max <= 0 || d->stride <= 0) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = d->itype >= 0;
+        itype = d->itype;
+        indirect = 1;
+    }
+    const int gs = state->bser[2] != 0;
+    if (state->tf_on || prim > NVN_DRAW_PRIMITIVE_PATCHES ||
+        (indexed && (itype < 0 || itype > 2))) return 0;
+    if (indirect && gs && (prim == NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP || prim == NVN_DRAW_PRIMITIVE_TRIANGLE_FAN))
+        return 0;   // 留给真实间接绘制处理 GS 的装配与索引路径
+    *shader_prim = rp_draw_shader_prim(prim, gs, indexed && state->restart.on, indirect);
+    return 1;
+}
+
+void nvn_be_sub_index(const uint64_t *handles, int n) {
+    if (!rp_shader_lookahead_budget || !rp_shader_lookahead) return;
+    unsigned left = rp_shader_lookahead_budget();
+    if (!left) return;
+    enum rp_lookahead_stop stopped = RP_LOOKAHEAD_SUBMIT_STATE;
+    uint32_t op = UINT32_MAX;
+    if (!g_cmd) goto stop;
+    struct rp_state state = rp_S;
+    struct rp_lookahead_unknown unknown = {0};
+    const p_set_rt *targets = rp_pass_target();
+    p_set_rt captured;
+    if (targets) { captured = *targets; targets = &captured; }
+    enum { LOOKAHEAD_RECORDS = 512, LOOKAHEAD_CALLS = 64 };
+    unsigned records = LOOKAHEAD_RECORDS;
+    int skip_draw = 0, noted_candidate = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)handles[i];
+        op = UINT32_MAX;
+        if (!p || (uintptr_t)p % 8) goto bad_record;
+        const uint8_t *visited[LOOKAHEAD_RECORDS];
+        struct { const uint8_t *next; unsigned visited; } calls[LOOKAHEAD_CALLS];
+        unsigned nvisited = 0, depth = 0;
+        for (;;) {
+            if (!left) return;
+            if (!records--) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; op = UINT32_MAX; goto stop; }
+            visited[nvisited++] = p;
+            op_hdr h;
+            memcpy(&h, p, sizeof h);
+            op = h.op;
+            if (rec_bad(h) || (uintptr_t)p > UINTPTR_MAX - h.size) goto bad_record;
+            const void *payload = p + sizeof h;
+            p += h.size;
+            const size_t bytes = h.size - sizeof h;
+            const p_dispatch *dispatch;
+            uint32_t prim;
+            struct rp_shader_req q = {0};
+            int accepted;
+            switch (h.op) {
+            case OP_END:
+                if (bytes) goto bad_record;
+                if (!depth) goto next_handle;
+                depth--;
+                p = calls[depth].next;
+                nvisited = calls[depth].visited;
+                continue;
+            case OP_JUMP: case OP_CALL: {
+                uint64_t dest;
+                if (bytes != sizeof dest) goto bad_record;
+                memcpy(&dest, payload, sizeof dest);
+                if (op == OP_CALL) {
+                    if (depth == LOOKAHEAD_CALLS) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; goto stop; }
+                    if (nvn_cmd_call_resolve(dest, &dest) < 0) goto bad_record;
+                }
+                if (!dest || dest % 8) goto bad_record;
+                const uint8_t *target = (const uint8_t *)(uintptr_t)dest;
+                for (unsigned j = 0; j < nvisited; j++)
+                    if (visited[j] == target) { stopped = RP_LOOKAHEAD_JUMP_CYCLE; goto stop; }
+                if (op == OP_CALL) {
+                    calls[depth].next = p;
+                    calls[depth].visited = nvisited;
+                    depth++;
+                }
+                p = target;
+                continue;
+            }
+            case OP_REPORT_COUNTER:
+                if (bytes < 2 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_RESET_COUNTER: case OP_FENCE_SYNC: case OP_WAIT_SYNC:
+                if (bytes < sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_SIGNAL_EVENT:
+                if (bytes < sizeof(uint64_t) + 2 * sizeof(uint32_t)) goto bad_record;
+                continue;
+            case OP_RENDER_COND: {
+                if (bytes < sizeof(p_render_cond)) goto bad_record;
+                const int mode = ((const p_render_cond *)payload)->mode;
+                if (mode < 0 || mode > 3) goto bad_record;
+                skip_draw = mode == 3;   // 动态条件可以绘制，前瞻不读计数器
+                continue;
+            }
+            case OP_SET_RT: {
+                const p_set_rt_c *head = payload;
+                if (bytes < sizeof *head || head->n > 8 || bytes < set_rt_payload(head)) goto bad_record;
+                targets = set_rt_rec(payload, h.size, &captured);
+                continue;
+            }
+            case OP_COPY_B2B:
+                if (bytes < 3 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_UPDATE_UB: {
+                uint64_t count;
+                if (bytes < 2 * sizeof(uint64_t)) goto bad_record;
+                memcpy(&count, (const uint8_t *)payload + sizeof(uint64_t), sizeof count);
+                if (count > bytes - 2 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            }
+            case OP_COPY_T2B: case OP_COPY_B2T:
+                if (bytes < sizeof(p_copy_b2t)) goto bad_record;
+                continue;
+            case OP_COPY_T2T:   // 含 Downsample/Resolve，仍是同一载荷
+                if (bytes < sizeof(p_copy_t2t)) goto bad_record;
+                continue;
+            case OP_CLEAR_TEX:
+                if (bytes < sizeof(p_clear_tex)) goto bad_record;
+                continue;
+            case OP_CLEAR_BUF:
+                if (bytes < sizeof(p_clear_buf)) goto bad_record;
+                continue;
+            case OP_DLSS:
+                if (bytes < sizeof(p_dlss)) goto bad_record;
+                continue;
+            case OP_DRAW_TEX:   // 后端固定着色器
+                if (bytes < sizeof(p_draw_tex)) goto bad_record;
+                continue;
+            case OP_DISPATCH:   // 直接与间接共用一条记录，组数不参与请求
+                if (bytes < sizeof(p_dispatch)) goto bad_record;
+                dispatch = payload;
+                if (!dispatch->ind && (dispatch->x <= 0 || dispatch->y <= 0 || dispatch->z <= 0)) continue;
+                accepted = rp_state_lookahead_dynamic(&state, &unknown, 1) ? -RP_LOOKAHEAD_DEFERRED_BINDING :
+                    rp_shader_lookahead(&state, NULL, NULL);
+                break;
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: {
+                const int wanted = lookahead_draw_prim(&state, op, payload, h.size, &prim);
+                if (wanted < 0) goto bad_record;
+                if (!wanted || skip_draw) continue;
+                if (!targets || targets->n < 0 || targets->n > 8) {
+                    accepted = -RP_LOOKAHEAD_TARGET;
+                    break;
+                }
+                q.prim = prim;
+                q.rt_count = targets->n;
+                for (int j = 0; j < targets->n; j++) {
+                    if (targets->color[j])
+                        q.rt_format[j] = (uint32_t)(targets->has_cview[j] && targets->cview[j].set_format
+                                                  ? targets->cview[j].format : targets->color[j]->d.format);
+                }
+                accepted = rp_state_lookahead_dynamic(&state, &unknown, 0) ? -RP_LOOKAHEAD_DEFERRED_BINDING :
+                    rp_shader_lookahead(&state, &q, targets);
+                break;
+            }
+            default:
+                if (!rp_state_lookahead(&state, &unknown, h.op, payload, h.size)) goto bad_record;
+                continue;
+            }
+            if (accepted < 0) {
+                if (!noted_candidate) lookahead_note(-accepted, op, 0);
+                noted_candidate = 1;
+            } else left -= (unsigned)accepted;
+        }
+next_handle:;
+    }
+    return;
+bad_record:
+    stopped = RP_LOOKAHEAD_RECORD;
+stop:
+    lookahead_note(stopped, op, 1);
+}
 
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
@@ -945,6 +1181,7 @@ void nvn_be_submit(void *q, const uint64_t *h, int n) {
     nvn_be_sub_index(h, n);
     for (int i = 0; i < n; i++) { nvn_be_exec_rest(h + i + 1, n - i - 1); nvn_be_exec((const uint8_t *)(uintptr_t)h[i]); }
     nvn_be_exec_rest(NULL, 0);
+    if (rp_shader_lookahead_end) rp_shader_lookahead_end();
     uint64_t t2 = now_ns();
     nvn_be_sub_commit();
     uint64_t t3 = now_ns();

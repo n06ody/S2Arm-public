@@ -40,3 +40,11 @@ extern uint64_t rp_tex_sep_gen[6];   // 各阶段分离贴图槽（rp_S.tex[阶�
 void rp_state_reset(void);                                    // NVN 默认值
 int rp_state_op(uint32_t op, const void *a, uint32_t size);   // 状态类命令：1 = 已处理；0 = 不是状态类命令
 void rp_dirty_all(void);                                      // 新的后端命令段开头：已发给后端的状态全部重发（逻辑状态不动）
+
+struct rp_lookahead_unknown {
+    uint64_t buffers[6];              // UBO bits 0–15, SSBO bits 16–31
+    uint64_t textures[6][RP_NTEX / 64], images[6];
+};
+int rp_state_lookahead(struct rp_state *state, struct rp_lookahead_unknown *unknown,
+                       uint32_t op, const void *payload, uint32_t size);
+int rp_state_lookahead_dynamic(const struct rp_state *state, const struct rp_lookahead_unknown *unknown, int compute);

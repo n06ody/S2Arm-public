@@ -55,10 +55,14 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+    def build_case(name, source, extra_libs=None, extra_flags=()):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        return exe
+
+    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+        exe = build_case(name, source, extra_libs, extra_flags)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     if sys.argv[1:] == ['--lp-output']:
@@ -73,6 +77,22 @@ def main():
             sys.stdout.write(result.stdout)
             sys.stderr.write(result.stderr)
             rc |= result.returncode
+        return rc
+
+    if sys.argv[1:] == ['--submit-compile']:
+        exe = build_case('submit-compile', original, [*libs, gfx/'replay/rp_exec.c'],
+                         extra_flags=('-DS2A_TEST_SUBMIT_SCAN',))
+        rc = 0
+        for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3),
+                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6), (4, 7),
+                           (4, 8), (4, 9), (4, 10), (4, 11), (4, 12), (4, 13),
+                           (4, 14), (4, 15), (4, 16), (4, 17), (4, 18)):
+            result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
+                                    capture_output=True, text=True, timeout=30)
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            if result.returncode and not rc:
+                rc = result.returncode
         return rc
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
@@ -104,7 +124,7 @@ def main():
         mutants = [
             ('default-on', 'nvn_plat_flag("nvk_live_compile_async", 0)', 'nvn_plat_flag("nvk_live_compile_async", 1)',
              '--live-compile-default', 'unset async property must start 0 compiler workers'),
-            ('inline', '    if (g_live_compile != 1) {', '    if (1) {',
+            ('inline', '    if (g_live_compile != 1 || g_lookahead_slots) {', '    if (1) {',
              '--live-compile-thread', 'compiler ran on the submitting thread'),
             ('request-bytes-ignored', '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    s2a_sha256_update(&hash, json, len);',
              '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    (void)json; (void)len;',
@@ -285,7 +305,7 @@ def main():
              '{ un = 1; um[st] |= 1u << i; }', '{ un = 1; um[st] |= 1u << ((i + 1) & 15); }',
              "gate case 'unaligned storage, slot the program uses (fs)' #0: library not used"),
             ('ssbo-wrong-stage-read',
-             'sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used)', 'sbu_stage_slots(stage_key((unsigned)st), 0u, q->prim, &used)',
+             'sbu_stage_slots(key, (unsigned)st, q->prim, &used)', 'sbu_stage_slots(key, 0u, q->prim, &used)',
              "gate case 'unaligned storage, slot the program does not use': hit from the library"),   # 片元段（有非对齐绑定才会被问）当成顶点段去读：stage 对不上 → 说不准 → 被挡下
             ('ssbo-switch-ignored',
              '    if (un && ssbo_used_slots_on()) {', '    if (un && (ssbo_used_slots_on() || 1)) {',
@@ -742,7 +762,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --submit-compile | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'

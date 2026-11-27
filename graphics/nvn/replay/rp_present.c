@@ -20,6 +20,8 @@
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：rp_shader_live_compile_take
 #pragma weak rp_shader_live_compile_take
+// 弱链接[replay]：rp_shader_lookahead_frame_end
+#pragma weak rp_shader_lookahead_frame_end
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -255,16 +257,19 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
       clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        if (rp_shader_lookahead_frame_end) rp_shader_lookahead_frame_end();
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         if (rp_shader_live_compile_take) {
             struct rp_shader_live_compile_stats live;
             rp_shader_live_compile_take(&live);
-            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout || live.compiled) {
-                char b[400];
-                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.start_failed ||
+                live.future_hits || live.timeout || live.compiled) {
+                char b[512];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、前瞻未命中/缺任务回退 %llu、前瞻结果命中 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
                          (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
-                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout,
+                         (unsigned long long)live.pending, (unsigned long long)live.start_failed, (unsigned long long)live.fallback,
+                         (unsigned long long)live.future_hits, (unsigned long long)live.timeout,
                          (unsigned long long)live.compiled, live.compile_ns / 1e6, live.compile_max_ns / 1e6);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
             }

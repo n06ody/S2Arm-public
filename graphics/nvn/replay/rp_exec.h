@@ -38,6 +38,21 @@ void rp_buf_stats(uint64_t *bytes, uint64_t *runs);   // 累计同步字节数 /
 int rp_buf_mirrors(void);                             // 现有镜像个数
 // 缓冲类命令（rec = 命令记录地址，只进未接日志）
 void rp_op_update_ub(const void *a, const void *rec);
+
+// Primitive seen by the shader resolver after the draw path's topology conversion.
+static inline uint32_t rp_draw_shader_prim(uint32_t prim, int gs, int restart, int indirect) {
+    switch (prim) {
+    case NVN_DRAW_PRIMITIVE_LINE_LOOP: return NVN_DRAW_PRIMITIVE_LINES;
+    case NVN_DRAW_PRIMITIVE_QUADS: return NVN_DRAW_PRIMITIVE_TRIANGLES;
+    case NVN_DRAW_PRIMITIVE_QUAD_STRIP:
+        return restart ? NVN_DRAW_PRIMITIVE_TRIANGLES : NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP;
+    case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP:
+        return gs && !indirect ? NVN_DRAW_PRIMITIVE_TRIANGLES : prim;
+    case NVN_DRAW_PRIMITIVE_POLYGON:
+        return NVN_DRAW_PRIMITIVE_TRIANGLE_FAN;
+    default: return prim;
+    }
+}
 void rp_op_copy_b2b(const void *a, const void *rec);
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec);
 void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);

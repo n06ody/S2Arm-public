@@ -82,7 +82,16 @@ int nvn_cmd_call_resolve(uint64_t h, uint64_t *to) { *to = h; return 0; }   // h
 const void *rp_draw_stream; uint64_t rp_gpu_wr_gen;   // rp_draw.c 的批量拷接口（本用例不链 rp_draw.c）
 void rp_state_reset(void) {}
 int rp_state_op(uint32_t op, const void *a, uint32_t size) { (void)op; (void)a; (void)size; return 0; }
+// 纯计时夹具没有着色器前瞻。进入扫描表示关闭路径出了问题。
+int rp_state_lookahead(struct rp_state *state, struct rp_lookahead_unknown *unknown,
+                       uint32_t op, const void *payload, uint32_t size) {
+    (void)state; (void)unknown; (void)op; (void)payload; (void)size; CHECK(0); return 0;
+}
+int rp_state_lookahead_dynamic(const struct rp_state *state, const struct rp_lookahead_unknown *unknown, int compute) {
+    (void)state; (void)unknown; (void)compute; CHECK(0); return 1;
+}
 void rp_dirty_all(void) {}
+const p_set_rt *rp_pass_target(void) { CHECK(0); return NULL; }
 int rp_pass_is_open(void) { return 0; }
 int rp_pass_draws(void) { return 0; }
 int rp_pass_split_ok(void) { return 0; }
