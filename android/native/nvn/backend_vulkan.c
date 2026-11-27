@@ -61,7 +61,7 @@
 #include "spirv_compliance.h"   // #1865 统一装载闸：能力 / 扩展 / 存储类字节声明扫描
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 26, "核对 Vulkan 后端与新版 NVN GPU 契约");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 27, "核对 Vulkan 后端与新版 NVN GPU 契约");
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -184,6 +184,7 @@ struct nvn_gpu_view_s {
 
 struct nvn_gpu_shader_s {
     VkShaderModule mod;
+    uint32_t *code; size_t code_bytes;  // final SPIR-V for position variants and specialization preflight
     int missing_storage_format_feature;
     const char *missing_vertex_feature;   // #1072：顶点阶段写存储 / 写裁剪、剔除距离要的特性设备没启用（特性名）；NULL = 不缺
     nvn_gpu_stage stage;
@@ -220,7 +221,8 @@ struct nvn_gpu_pipe_s {
     uint8_t warm;          // 1 = 这份对象是预热带 / 预热线程建的，真实 draw 第一次命中时计数（见 nvn_gpu_pipe_get）
     uint64_t warm_tag;     // 管线预热清单的标签（槽号 + 槽代号，见 nvn_vk_pipe_warm.h）；0 = 没设过。原子读写，随对象销毁
     struct nvn_gpu_pipe_s *all_next;
-    nvn_gpu_shader cshader;
+    nvn_gpu_shader cshader;  // compute shader identity for device-lost diagnostics
+    uint32_t cpipe_hash;      // compute uses key.st[0], separate from the graphics hash
     uint8_t lib_stages;  // 出包预编阶段掩码
     struct nvn_gpu_pipe_s *cnext;
     struct nvn_gpu_pipe_s *hnext;   // 图形管线的散列桶链（g_pipe_ht）
@@ -2750,6 +2752,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
         free(sh->ents);
         free(sh->tfmt);
         free(sh->write_bounds);
+        free(sh->code);
         free(sh);
         sh = sn;
     }
@@ -3716,6 +3719,7 @@ static void destroy_shader_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_shader_s
     free(sh->ents);
     free(sh->tfmt);
     free(sh->write_bounds);
+    free(sh->code);
     free(sh);
 }
 
@@ -3931,6 +3935,7 @@ static nvn_gpu_rc spv_compliance_check(const nvn_gpu_shader_src *s, nvn_gpu_err 
     return rc(NVN_GPU_OK);
 }
 
+#include "nvn_vk_specialization.h"
 #include "nvn_vk_array_query.h"
 // 数组采样层坐标改写（nvn_vk_array_query.h）的缺省值按设备定：规范要求驱动自己把层号夹到视图的层范围，合规驱动上这段改写结果不变、
 //   只是每次数组采样多一次尺寸查询和一次夹取，所以只对实测需要的驱动缺省开。目前只有华为 Maleoon 一族（vendorID 0x19E5、驱动名以 Maleoon 开头；
@@ -4028,6 +4033,16 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             s2a_sha256_update(&hash, ci.pCode, ci.codeSize);
             s2a_sha256_final(&hash, sh->spirv_digest);
         }
+        if (s->stage == NVN_GPU_SH_VS || s->stage == NVN_GPU_SH_GS || nvk_spv_has_specialization(ci.pCode, ci.codeSize)) {
+            sh->code = array_code ? array_code : malloc(ci.codeSize);
+            if (!sh->code) {
+                free(sh->tfmt); free(sh->ents); free(sh);
+                return fail(err, NVN_GPU_E_OOM, "着色器变体源码分配失败");
+            }
+            if (array_code) array_code = NULL;
+            else memcpy(sh->code, ci.pCode, ci.codeSize);
+            sh->code_bytes = ci.codeSize;
+        }
         VkResult module_result = vkCreateShaderModule(g.d, &ci, NULL, &sh->mod);
         if (module_result == VK_SUCCESS && s->precompiled) {
             sh->precompiled = 1;
@@ -4041,7 +4056,7 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out,
             sh->write_bounds = s2a_spirv_write_bounds(ci.pCode, ci.codeSize, sh->entry, sh->ents, sh->nent);
         free(array_code);
         if (module_result != VK_SUCCESS) {
-            free(sh->tfmt); free(sh->ents); free(sh);
+            free(sh->code); free(sh->tfmt); free(sh->ents); free(sh);
             return fail(err, NVN_GPU_E_COMPILE, "vkCreateShaderModule 失败（stage %d）", s->stage);
         }
     }
@@ -4162,8 +4177,19 @@ static VkRenderPass make_pipeline_pass(const nvn_gpu_pipe_desc *d) {
     return pass;
 }
 
+static int spec_args_valid(const nvn_gpu_stage_desc *stage) {
+    if (!stage->nspec) return 1;
+    if (!stage->sh || stage->nspec > NVN_GPU_SPEC_MAX) return 0;
+    for (uint32_t i = 0; i < stage->nspec; i++) {
+        if (stage->spec[i].type > NVN_GPU_SPEC_FLOAT || stage->spec[i]._rsv) return 0;
+        for (uint32_t j = 0; j < i; j++)
+            if (stage->spec[i].id == stage->spec[j].id) return 0;
+    }
+    return 1;
+}
+
 static int same_spec(const nvn_gpu_stage_desc *a, const nvn_gpu_stage_desc *b) {
-    if (a->sh != b->sh || a->nspec != b->nspec) return 0;
+    if (a->sh != b->sh || a->nspec != b->nspec || a->nspec > NVN_GPU_SPEC_MAX) return 0;
     return a->nspec == 0 || memcmp(a->spec, b->spec, (size_t)a->nspec * sizeof *a->spec) == 0;
 }
 
@@ -4205,6 +4231,7 @@ static uint32_t pipe_hash(const nvn_gpu_pipe_desc *d) {
     h = pipe_mix(h, v, sizeof v);
     const uint8_t fl[4] = {d->rast_discard, d->clip_neg1, d->origin_ll, d->depth_clamp};
     h = pipe_mix(h, fl, sizeof fl);
+    h = pipe_mix(h, &d->vp_swizzle, sizeof d->vp_swizzle);
     h = pipe_mix(h, d->cfmt, sizeof d->cfmt); h = pipe_mix(h, d->lmap, sizeof d->lmap);
     h = pipe_mix(h, d->blend, sizeof d->blend); h = pipe_mix(h, &d->color, sizeof d->color);
     h = pipe_mix(h, &d->chmask, sizeof d->chmask); h = pipe_mix(h, &d->ms, sizeof d->ms); h = pipe_mix(h, &d->ds, sizeof d->ds);
@@ -4243,7 +4270,7 @@ static void pipe_ht_add(struct nvn_gpu_pipe_s *p) {
 static int same_pipe_desc(const nvn_gpu_pipe_desc *a, const nvn_gpu_pipe_desc *b) {
     if (a->prim != b->prim || a->patch_size != b->patch_size || a->dfmt != b->dfmt || a->sfmt != b->sfmt ||
         a->samples != b->samples || a->rast_discard != b->rast_discard || a->clip_neg1 != b->clip_neg1 ||
-        eff_restart(a) != eff_restart(b))
+        a->vp_swizzle != b->vp_swizzle || eff_restart(a) != eff_restart(b))
         return 0;
     for (int i = 0; i < 5; i++)
         if (!same_spec(&a->st[i], &b->st[i])) return 0;
@@ -4524,6 +4551,8 @@ static int pipe_vk_res_code(VkResult r, int fixed) {
     if (r == VK_ERROR_DEVICE_LOST) return NVN_GPU_E_DEVICE;
     return fixed;
 }
+#include "nvn_vk_viewport_swizzle.h"
+
 static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s **out, nvn_gpu_err *err) {
     *out = NULL;
     const nvn_gpu_pipe_desc *requested = d;
@@ -4668,6 +4697,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     }
 
     VkPipelineShaderStageCreateInfo stages[5];
+    struct nvk_stage_specialization stage_spec[5];
     uint32_t ns = 0;
     for (int st = 0; st < 5; st++) {
         if (!d->st[st].sh) continue;
@@ -4676,6 +4706,11 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         stages[ns].stage = vk_shader_stage((nvn_gpu_stage)st);
         stages[ns].module = d->st[st].sh->mod;
         stages[ns].pName = d->st[st].sh->entry;
+        if (d->st[st].nspec) {
+            nvn_gpu_rc r = nvk_prepare_specialization(&d->st[st], &stage_spec[st], err);
+            if (!nvn_gpu_ok(r)) { destroy_pipe_objects(p); return r; }
+            stages[ns].pSpecializationInfo = &stage_spec[st].info;
+        }
         ns++;
     }
 
@@ -4913,9 +4948,19 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     };
     const int want_feedback = atomic_load_explicit(&g_pipe_feedback, memory_order_relaxed) == NVK_PIPE_FEEDBACK_ON;
     if (want_feedback) gp.pNext = &feedback_info;
+    VkShaderModule swizzled = VK_NULL_HANDLE;
+    if (d->vp_swizzle && !d->rast_discard) {
+        unsigned raster = d->st[NVN_GPU_SH_GS].sh ? NVN_GPU_SH_GS : NVN_GPU_SH_VS;
+        unsigned vk_stage = vk_shader_stage((nvn_gpu_stage)raster);
+        nvn_gpu_rc result = nvk_swizzle_module(d->st[raster].sh, d->vp_swizzle, &swizzled, err);
+        if (!nvn_gpu_ok(result)) { destroy_pipe_objects(p); return result; }
+        for (uint32_t i = 0; i < ns; i++)
+            if (stages[i].stage == vk_stage) stages[i].module = swizzled;
+    }
     const uint64_t pl_t0 = now_ns();   // 驱动编译管线是同步的：超过 3 毫秒就打一行（走路/进新场景时会集中出现）
     const VkResult gvr = vkCreateGraphicsPipelines(g.d, g_plc, 1, &gp, NULL, &p->pipe);
     const uint64_t wall_ns = now_ns() - pl_t0;
+    if (swizzled) vkDestroyShaderModule(g.d, swizzled, NULL);
     pipe_creation_note(0, wall_ns, gvr == VK_SUCCESS && want_feedback ? &feedback : NULL);
     if (gvr != VK_SUCCESS) {
         nvn_gpu_rc bad = fail(err, pipe_vk_res_code(gvr, NVN_GPU_E_COMPILE), "vkCreateGraphicsPipelines 失败（%s %d）", pipe_vk_res_name(gvr), (int)gvr);
@@ -5055,6 +5100,10 @@ static nvn_gpu_rc pipe_get_inner(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_p
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!d) return fail(err, NVN_GPU_E_ARG, "管线描述为空");
+    if (d->vp_swizzle & ~(NVN_GPU_VP_SWIZZLE_MASK | NVN_GPU_VP_SWIZZLE_Z_REMAP))
+        return fail(err, NVN_GPU_E_ARG, "viewport_swizzle：未知选择位");
+    for (int st = 0; st < 5; st++)
+        if (!spec_args_valid(&d->st[st])) return fail(err, NVN_GPU_E_ARG, "特化常量：阶段 %d 的描述无效", st);
 
     // ① 缓存命中（短锁）
     pthread_mutex_lock(&g_mu);
@@ -5228,6 +5277,12 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
     cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cp.stage.module = sh->mod;
     cp.stage.pName = sh->entry;
+    struct nvk_stage_specialization spec;
+    if (cs->nspec) {
+        nvn_gpu_rc r = nvk_prepare_specialization(cs, &spec, err);
+        if (!nvn_gpu_ok(r)) { destroy_pipe_objects(p); return r; }
+        cp.stage.pSpecializationInfo = &spec.info;
+    }
     cp.layout = p->layout;
     VkPipelineCreationFeedback feedback = {0};
     VkPipelineCreationFeedbackCreateInfo feedback_info = {
@@ -5250,7 +5305,8 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
       static int slowc = -1; if (slowc < 0) slowc = nvn_plat_flag("nvk_hitch_log", 0) != 0;
       const uint64_t dt = slowc ? now_ns() - pc_t0 : 0;
       if (dt > 3000000ull) { char b[200]; nvn_vk_compute_pipe_line(b, sizeof b, (double)dt / 1e6, sh->src_key, sh->precompiled, sh->spirv_digest); nvn_plat_log(NVN_PLAT_LOG_INFO, "pipe", b); } }
-    p->cshader = sh;   // 两条安装路径都保留实际计算阶段的身份
+    p->cshader = sh;
+    p->key.st[0] = *cs;  // the compute recipe owns this stage after installation
     if (sh->precompiled) p->lib_stages = 1u << NVN_GPU_SH_CS;
     p->stage_nent[NVN_GPU_SH_CS] = sh->nent;
     p->stage_push_off[NVN_GPU_SH_CS] = sh->push_off;
@@ -5276,36 +5332,48 @@ static nvn_gpu_rc cpipe_build(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pi
     return rc(NVN_GPU_OK);
 }
 
-// 计算管线只以 CS 身份为键（本路径尚不支持特化）。同键在途合并；完成后双检并安装。
+// Compute in-flight and installed entries both compare the shader and its specialization recipe.
 static nvk_pf g_cpi;
 static pthread_once_t g_cpi_once = PTHREAD_ONCE_INIT;
-static void cpi_init(void) { nvk_pf_init(&g_cpi, sizeof(nvn_gpu_shader)); }
+static void cpi_init(void) { nvk_pf_init(&g_cpi, sizeof(nvn_gpu_stage_desc)); }
 uint64_t nvn_vk_dbg_cpipe_waits(void) { uint64_t n = 0; pthread_once(&g_cpi_once, cpi_init); nvk_pf_stats(&g_cpi, &n, NULL, NULL, NULL, NULL); return n; }
-static int cpi_eq(const void *a, const void *b) { nvn_gpu_shader x, y; memcpy(&x, a, sizeof x); memcpy(&y, b, sizeof y); return x == y; }
-static uint32_t cpipe_bucket(nvn_gpu_shader sh) { return (uint32_t)(((uintptr_t)sh >> 4) & (CPIPE_BUCKETS - 1)); }
-static struct nvn_gpu_pipe_s *cpipe_find_locked(nvn_gpu_shader sh) {
-    for (struct nvn_gpu_pipe_s *p = g_cpipe_ht[cpipe_bucket(sh)]; p; p = p->cnext)
-        if (p->cshader == sh) return p;
+static int cpi_eq(const void *a, const void *b) {
+    nvn_gpu_stage_desc stored;
+    memcpy(&stored, a, sizeof stored);  // the in-flight table stores bytes
+    return same_spec(&stored, b);
+}
+static uint32_t cpipe_hash(const nvn_gpu_stage_desc *cs) {
+    const uintptr_t sh = (uintptr_t)cs->sh;
+    uint64_t hash = pipe_mix(0x9e3779b97f4a7c15ull, &sh, sizeof sh);
+    hash = pipe_mix(hash, &cs->nspec, sizeof cs->nspec);
+    hash = pipe_mix(hash, cs->spec, cs->nspec * sizeof cs->spec[0]);
+    return (uint32_t)(hash ^ (hash >> 32));
+}
+static uint32_t cpipe_bucket(uint32_t hash) { return hash & (CPIPE_BUCKETS - 1); }
+static struct nvn_gpu_pipe_s *cpipe_find_locked(const nvn_gpu_stage_desc *cs, uint32_t hash) {
+    for (struct nvn_gpu_pipe_s *p = g_cpipe_ht[cpipe_bucket(hash)]; p; p = p->cnext)
+        if (p->cpipe_hash == hash && same_spec(&p->key.st[0], cs)) return p;
     return NULL;
 }
 static nvn_gpu_rc cpipe_get_inner(const nvn_gpu_stage_desc *cs, int mode, nvn_gpu_pipe *out, nvn_gpu_err *err) {
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
     *out = NULL;
     if (!cs || !cs->sh) return fail(err, NVN_GPU_E_ARG, "计算阶段为空");
-    if (cs->nspec) return fail(err, NVN_GPU_E_UNSUPPORTED, "计算特化常量尚未实现");
+    if (!spec_args_valid(cs)) return fail(err, NVN_GPU_E_ARG, "计算特化常量描述无效");
     if (!nvn_plat_flag("nvk_compute_warm", 0)) {
         nvn_gpu_pipe p = NULL; nvn_gpu_rc r = cpipe_build(cs, mode, &p, err);
         if (!nvn_gpu_ok(r)) return r;
         pthread_mutex_lock(&g_mu); cs->sh->refs++; p->all_next = g.pipes; g.pipes = p; pthread_mutex_unlock(&g_mu);
         *out = p; return r;
     }
+    const uint32_t hash = cpipe_hash(cs);
     pthread_mutex_lock(&g_mu);
-    struct nvn_gpu_pipe_s *hit = cpipe_find_locked(cs->sh);
+    struct nvn_gpu_pipe_s *hit = cpipe_find_locked(cs, hash);
     if (hit) pipe_hit_note_locked(hit);
     pthread_mutex_unlock(&g_mu);
     if (hit) { *out = hit; return rc(NVN_GPU_OK); }
     pthread_once(&g_cpi_once, cpi_init);
-    int handle = -1, role = nvk_pf_enter(&g_cpi, &cs->sh, cpi_eq, &handle);
+    int handle = -1, role = nvk_pf_enter(&g_cpi, cs, cpi_eq, &handle);
     if (role == 2) {
         void *got = NULL; char why[NVK_PF_WHY];
         int code = nvk_pf_wait(&g_cpi, handle, &got, why, sizeof why);
@@ -5314,7 +5382,7 @@ static nvn_gpu_rc cpipe_get_inner(const nvn_gpu_stage_desc *cs, int mode, nvn_gp
         *out = got; return rc(NVN_GPU_OK);
     }
     int own = role == 1;
-    pthread_mutex_lock(&g_mu); hit = cpipe_find_locked(cs->sh);
+    pthread_mutex_lock(&g_mu); hit = cpipe_find_locked(cs, hash);
     if (hit) pipe_hit_note_locked(hit);
     pthread_mutex_unlock(&g_mu);
     if (hit) {
@@ -5328,11 +5396,12 @@ static nvn_gpu_rc cpipe_get_inner(const nvn_gpu_stage_desc *cs, int mode, nvn_gp
         return built;
     }
     pthread_mutex_lock(&g_mu);
-    hit = cpipe_find_locked(cs->sh);
+    hit = cpipe_find_locked(cs, hash);
     if (!hit) {
         hit = fresh; cs->sh->refs++;
         hit->all_next = g.pipes; g.pipes = hit;
-        uint32_t b = cpipe_bucket(cs->sh); hit->cnext = g_cpipe_ht[b]; g_cpipe_ht[b] = hit;
+        const uint32_t b = cpipe_bucket(hash);
+        hit->cpipe_hash = hash; hit->cnext = g_cpipe_ht[b]; g_cpipe_ht[b] = hit;
         if (t_warm_scope) { hit->warm = 1; __atomic_fetch_add(&g_warm_created, 1, __ATOMIC_RELAXED); }
     } else {
         pipe_hit_note_locked(hit);
@@ -9522,6 +9591,7 @@ void nvn_gpu_vk_test_close_pipe_only(void) {
         free(sh->ents);
         free(sh->tfmt);
         free(sh->write_bounds);
+        free(sh->code);
         free(sh);
         sh = sn;
     }

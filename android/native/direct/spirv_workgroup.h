@@ -2,7 +2,7 @@
 // Copyright 2026 S2Arm contributors
 // Inspect the selected compute entry's default workgroup size before creating a
 // driver shader. This is not a full SPIR-V validator. Unknown size expressions
-// fail explicitly; cpipe_get separately rejects specialization overrides.
+// fail explicitly; cpipe_get repeats the checks with effective overrides.
 #pragma once
 #include "spirv_storage.h"
 #include "../../../graphics/third_party/spirv_cross/spirv.h"

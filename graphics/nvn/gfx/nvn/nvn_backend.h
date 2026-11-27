@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 26   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 27   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -315,6 +315,7 @@ void nvn_gpu_shader_release(nvn_gpu_shader s);
 enum { NVN_GPU_SPEC_BOOL = 0, NVN_GPU_SPEC_INT = 1, NVN_GPU_SPEC_UINT = 2, NVN_GPU_SPEC_FLOAT = 3, NVN_GPU_SPEC_MAX = 48 };
 typedef struct { uint16_t id; uint8_t type, _rsv; uint32_t bits; } nvn_gpu_spec;   // 特化常量（function constant / VkSpecializationInfo）
 typedef struct { nvn_gpu_shader sh; uint32_t nspec; nvn_gpu_spec spec[NVN_GPU_SPEC_MAX]; } nvn_gpu_stage_desc;   // sh = NULL：该阶段不用
+enum { NVN_GPU_VP_SWIZZLE_MASK = 0xfff, NVN_GPU_VP_SWIZZLE_Z_REMAP = 1u << 12 };
 // 图形管线描述 = pso_key 去掉 Metal 痕迹（格式改 NVNformat、着色器改句柄）。核心负责规范化（同 pso_key_norm），后端按自己的键去重缓存。
 // 管线布局由后端按各阶段布局确定性合并（同 set / binding 的项类别与数量必须一致，否则 NVN_GPU_E_LAYOUT）。
 typedef struct {
@@ -324,7 +325,8 @@ typedef struct {
     uint8_t lmap[8];                 // 合并通道的颜色槽重映射
     uint32_t prim, patch_size;
     uint8_t prim_restart;            // NVN 条带重启；重启值 = 索引类型的最大值（u8 0xFF / u16 0xFFFF / u32 0xFFFFFFFF）
-    uint8_t _rsv_prim[3];
+    uint8_t _rsv_prim;
+    uint16_t vp_swizzle;             // viewport 0: 4 packed 3-bit selectors XOR identity, possibly a Z remap
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms;
     va_st attr[16]; vs_st stream[16];
     /* 定稿 #4：静态状态一直带在 desc 里；只在实际启用了对应动态能力（CAP_DYN_DEPTH_STENCIL / CAP_DYN_RASTER）时后端才从自己的键里省略。

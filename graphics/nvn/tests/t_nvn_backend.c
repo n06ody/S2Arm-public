@@ -14,7 +14,7 @@
 #define SIG(fn, T) _Static_assert(__builtin_types_compatible_p(__typeof__(&fn), T), #fn " 签名与契约表不符")
 #define DISTINCT(A, B) _Static_assert(!__builtin_types_compatible_p(A, B), #A " 与 " #B " 必须是不同的句柄类型")
 
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 26, "契约版本变了：同批更新本签名表");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 27, "契约版本变了：同批更新本签名表");
 
 // v24 冷环绑定描述：缓冲身份、访问区间和嵌套前缀按共用契约传递。
 #define FIELD_TYPE(record, member, T) \

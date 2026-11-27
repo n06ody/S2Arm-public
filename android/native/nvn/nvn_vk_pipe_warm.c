@@ -133,8 +133,7 @@ static uint64_t pw_get64(const uint8_t *b, size_t *at) {
     return v;
 }
 
-// 一条管线描述 → 紧凑字节。st[].sh / nspec / spec / _rsv_prim 不进记录：sh 由程序身份还原，
-// nspec 恒 0（note 处已挡），spec 是它的空参数区，_rsv_prim 是保留位。
+// 预热清单保留原格式。shader 由程序身份还原，带特化常量或视口位置变体的配方不写。
 static void pw_desc_write(const nvn_gpu_pipe_desc *d, uint8_t *o) {
     size_t at = 0;
     uint8_t smask = 0;
@@ -612,7 +611,7 @@ static void pw_touch_locked(uint32_t slot) {
 void nvk_pipe_warm_rec_of(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], struct nvk_pipe_rec *out) {
     if (!out) return;
     memset(out, 0, sizeof *out);
-    if (!d || !prog_identity) return;
+    if (!d || !prog_identity || d->vp_swizzle) return;
     for (int st = 0; st < 5; st++) if (d->st[st].nspec) return;   // 特化常量不进记录：bytes 留 0
     pw_desc_write(d, out->desc);
     memcpy(out->prog_identity, prog_identity, 32);
@@ -639,7 +638,7 @@ void nvk_pipe_warm_test_hash_const(int on) { __atomic_store_n(&g_hash_const, on 
 static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint64_t *tag_out, int compute) {
     if (tag_out) *tag_out = 0;
     if (!d || !prog_identity) return;
-    if (pw_id_zero(prog_identity)) return;   // 没有身份的程序不进清单（失败项 / 还没算出来）
+    if (pw_id_zero(prog_identity) || d->vp_swizzle) return;   // 旧记录不保存视口变体
     for (int st = 0; st < 5; st++)
         if (d->st[st].nspec) {   // 特化常量不进记录：那类配方本层不产生，宁可不预热也不建错
             __atomic_fetch_add(&g.st.rejected, 1, __ATOMIC_RELAXED);
