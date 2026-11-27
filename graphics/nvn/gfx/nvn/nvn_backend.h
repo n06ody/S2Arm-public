@@ -143,7 +143,7 @@ typedef struct {
     uint32_t atomic_stages;        // 允许图像原子的 NVN 阶段位；具体格式再看 NVN_GPU_FMT_ATOMIC
     uint32_t display_max_hz;       // 有窗口时屏幕最高刷新率，没窗口 0（来自平台层的窗口；nvn_be_display_hz 的来源）
 } nvn_gpu_caps;
-// 每个 NVN 格式在本设备上的用法位（来源：格式属性 optimalTilingFeatures / Metal 格式能力表）
+// 每个 NVN 格式在本设备上的用法位（Vulkan 图像查 optimalTilingFeatures，顶点查 bufferFeatures）。
 enum {
     NVN_GPU_FMT_SAMPLE = 1u << 0, NVN_GPU_FMT_FILTER = 1u << 1, NVN_GPU_FMT_RENDER = 1u << 2, NVN_GPU_FMT_BLEND = 1u << 3,
     NVN_GPU_FMT_STORAGE = 1u << 4, NVN_GPU_FMT_DEPTH = 1u << 5, NVN_GPU_FMT_ATOMIC = 1u << 6, NVN_GPU_FMT_VERTEX = 1u << 7,
@@ -151,6 +151,7 @@ enum {
     NVN_GPU_FMT_SUBST = 1u << 9,      // 有对应但不是同一种存储（BGRA 换 RGBA、D24 换 D32）：读写语义同，逐字节拷贝要核心换算
     NVN_GPU_FMT_READBACK = 1u << 10,  // nvn_gpu_copy_tex_buf 拷出来的就是 NVN 的逐字节内容（ReadTexels 读 GPU 内容的前提）。不含：SUBST 的、深度模板合一的
                                       //   （只拷得出深度面）、D24（深度面高 8 位未定义）。后端 copy_tex_buf 拒收的格式一定没有这一位（两处用同一个判断）
+    NVN_GPU_FMT_VERTEX_CPU = 1u << 11, // 仅有 CPU 字节转 float4 的路径，回放确认源可读且 GPU 无挂起写后再绑定 RGBA32F。
 };
 typedef struct {
     void *host_device;       // 平台层已建好的设备（定稿 A2：后端不另建设备）。Apple：平台给的 MTLDevice 指针；安卓：Prepare 按 profile 建好的设备上下文（含 enabled 记录）

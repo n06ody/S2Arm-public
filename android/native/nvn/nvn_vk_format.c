@@ -454,6 +454,18 @@ static void vattr_i2f32(const uint8_t *src, float *out, int n, int is_signed) {
     }
 }
 
+static float vattr_f16(uint16_t value) {
+    const uint32_t exp = (value >> 10) & 31u, frac = value & 1023u;
+    if (!exp) {
+        const float magnitude = (float)frac * 0x1p-24f;
+        return value & 0x8000u ? -magnitude : magnitude;
+    }
+    const uint32_t bits = ((uint32_t)(value & 0x8000u) << 16) | ((exp == 31u ? 255u : exp + 112u) << 23) | (frac << 13);
+    float out;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+
 // 顶点取数语义无原生 VkFormat 等价物、必须走 CPU 解码的 NVN 格式（不取决于设备能力）：
 // 32 位 UI2F/I2F——Vulkan 无 32 位 USCALED/SSCALED；按 *_UINT/*_SINT 绑定会让声明为
 // Float 的着色器输入拿到整数位模式（静默读错值）。返回 1 = 顶点路径必须解码。
@@ -474,6 +486,41 @@ int nvn_vattr_cpu_decode(uint32_t nvn_format, const uint8_t *src, float out[4]) 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
     switch (nvn_format) {
+    // 三分量顶点格式的设备支持逐格式查。缺原生格式时只解这三个分量，W 仍是默认的 1。
+    case NVN_FORMAT_RGB8:
+    case NVN_FORMAT_RGB8SN:
+    case NVN_FORMAT_RGB8_UI2F:
+    case NVN_FORMAT_RGB8_I2F:
+        for (int i = 0; i < 3; i++) {
+            const int8_t s = (int8_t)src[i];
+            switch (nvn_format) {
+            case NVN_FORMAT_RGB8: out[i] = (float)src[i] / 255.0f; break;
+            case NVN_FORMAT_RGB8SN: out[i] = s == INT8_MIN ? -1.0f : (float)s / 127.0f; break;
+            case NVN_FORMAT_RGB8_UI2F: out[i] = (float)src[i]; break;
+            default: out[i] = (float)s; break;
+            }
+        }
+        return 3;
+    case NVN_FORMAT_RGB16F:
+    case NVN_FORMAT_RGB16:
+    case NVN_FORMAT_RGB16SN:
+    case NVN_FORMAT_RGB16_UI2F:
+    case NVN_FORMAT_RGB16_I2F:
+        for (int i = 0; i < 3; i++) {
+            memcpy(&v, src + 2 * i, sizeof v);
+            const int16_t s = (int16_t)v;
+            switch (nvn_format) {
+            case NVN_FORMAT_RGB16F: out[i] = vattr_f16(v); break;
+            case NVN_FORMAT_RGB16: out[i] = (float)v / 65535.0f; break;
+            case NVN_FORMAT_RGB16SN: out[i] = s == INT16_MIN ? -1.0f : (float)s / 32767.0f; break;
+            case NVN_FORMAT_RGB16_UI2F: out[i] = (float)v; break;
+            default: out[i] = (float)s; break;
+            }
+        }
+        return 6;
+    case NVN_FORMAT_RGB32F:
+        memcpy(out, src, 3 * sizeof out[0]);
+        return 12;
     // 8 位 sRGB：RGB 分量过 EOTF，alpha 恒为线性 unorm；RGBX/BGRX 的 X 是填充位取 1.0。
     case NVN_FORMAT_RGBX8_SRGB:
         out[0] = vattr_srgb_lut[src[0]]; out[1] = vattr_srgb_lut[src[1]]; out[2] = vattr_srgb_lut[src[2]];

@@ -2586,6 +2586,13 @@ static const char *readback_refusal(uint32_t nvn_format) {
     if (nvn_vk_format_substituted(nvn_format)) return "替换存储格式（D24 换 D32）按字节回读未实现";
     return NULL;
 }
+static VkFormat vk_vertex_format(uint32_t nvn_format) {
+    const uint32_t fmt = nvn_vattr_fmt_canon(nvn_format);
+    uint8_t map[4];
+    if (nvn_vattr_must_cpu_decode(fmt) || nvn_vk_format_chanmap(fmt, map)) return VK_FORMAT_UNDEFINED;
+    return nvn_vk_format(fmt);
+}
+
 static int readback_exact(uint32_t nvn_format) {
     nvn_fmt_info fi;
     if (readback_refusal(nvn_format) || !nvn_fmt_info_of(nvn_format, &fi)) return 0;
@@ -2598,14 +2605,13 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     nvn_fmt_info info;
     int expand = nvn_fmt_info_of(nvn_format, &info) && info.expand;
     VkFormat f = nvn_vk_tex_format(nvn_format);
-    if (f == VK_FORMAT_UNDEFINED) return 0;
     int bcdec = 0;   // 这个块压缩格式在本设备上走计算解码
     if (nvn_format >= 0x41 && nvn_format <= 0x50 && (g.dev->bc_decode_mask >> (nvn_format - 0x41)) & 1u) {
         if (!nvn_vk_bcdec_route(nvn_format, NULL, &f, NULL, NULL, NULL)) return 0;
         bcdec = 1;
     }
-    VkFormatProperties p;
-    s2a_vk_format_properties(g.phys, f, &p);
+    VkFormatProperties p = {0};
+    if (f != VK_FORMAT_UNDEFINED) s2a_vk_format_properties(g.phys, f, &p);
     VkFormatFeatureFlags o = p.optimalTilingFeatures;
     uint32_t out = 0;
     if (o & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) out |= NVN_GPU_FMT_SAMPLE;
@@ -2613,25 +2619,25 @@ uint32_t nvn_gpu_format_caps(uint32_t nvn_format) {
     if (o & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) out |= NVN_GPU_FMT_RENDER;
     if (o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) out |= NVN_GPU_FMT_BLEND;
     if (o & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) out |= NVN_GPU_FMT_STORAGE;
-    if (nvn_vk_format_is_depth(f)) out |= NVN_GPU_FMT_DEPTH;
+    if (f != VK_FORMAT_UNDEFINED && nvn_vk_format_is_depth(f)) out |= NVN_GPU_FMT_DEPTH;
     if (o & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) out |= NVN_GPU_FMT_ATOMIC;
-    if (o & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) out |= NVN_GPU_FMT_VERTEX;
     if (nvn_vk_format_substituted(nvn_format)) out |= NVN_GPU_FMT_SUBST;   // #398：D24 换 D32 存储
-    if (readback_exact(nvn_format)) out |= NVN_GPU_FMT_READBACK;
-    if (expand) {
-        out |= NVN_GPU_FMT_SUBST;   // 存储被换成展开目标，逐字节拷贝要核心换算
-        VkFormat sf = nvn_vk_format(nvn_format);
-        VkFormatProperties sp;
-        memset(&sp, 0, sizeof sp);
-        if (sf != VK_FORMAT_UNDEFINED) s2a_vk_format_properties(g.phys, sf, &sp);
-        if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) out &= ~NVN_GPU_FMT_VERTEX;
-    }
+    if (f != VK_FORMAT_UNDEFINED && readback_exact(nvn_format)) out |= NVN_GPU_FMT_READBACK;
+    if (expand) out |= NVN_GPU_FMT_SUBST;   // 存储被换成展开目标，逐字节拷贝要核心换算
     // 走计算解码的块压缩格式：能力是照「解码后的格式」查的，但它只能被采样——建图入口不收渲染 / 存储用途。
     // 把解码后格式的「可存储」原样报出去，核心会给带 IMAGE 标志的压缩贴图加存储用途，建图就被拒（#697：Mali 上 5 种格式的贴图全建不出来，背景全黑）。
-    if (bcdec) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER | NVN_GPU_FMT_READBACK;   // 回读照样是原压缩块字节（copy_tex_buf → bc_readback）
+    if (bcdec) return out & (NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER | NVN_GPU_FMT_READBACK);   // 回读照样是原压缩块字节（copy_tex_buf → bc_readback）
     // 通道映射补分量位置的退回格式：存储字节的分量顺序不是 NVN 的，回读也就不是 NVN 字节（下一行连 READBACK 一起去掉）
-    // #975：16 位打包格式走退回格式时，分量位置靠采样视图的通道映射补回；渲染 / 存储 / 顶点取数不经通道映射，不报这些能力。
+    // #975：16 位打包格式走退回格式时，分量位置靠采样视图的通道映射补回；渲染 / 存储不经通道映射。
     { uint8_t map[4]; if (nvn_vk_format_chanmap(nvn_format, map)) out &= NVN_GPU_FMT_SAMPLE | NVN_GPU_FMT_FILTER; }
+    const VkFormat vertex = vk_vertex_format(nvn_format);
+    if (vertex != VK_FORMAT_UNDEFINED) {
+        if (vertex != f) s2a_vk_format_properties(g.phys, vertex, &p);
+        if (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) return out | NVN_GPU_FMT_VERTEX;
+    }
+    const uint8_t probe[16] = {0};
+    float unused[4];
+    if (nvn_vattr_cpu_decode(nvn_vattr_fmt_canon(nvn_format), probe, unused)) out |= NVN_GPU_FMT_VERTEX_CPU;
     return out;
 }
 
@@ -4678,29 +4684,21 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
     uint32_t nvb = 0, nva = 0, ndiv = 0;
     for (int i = 0; i < 16; i++) {
         if (!d->attr[i].fmt) continue;
-        VkFormat f = nvn_vk_format(nvn_vattr_fmt_canon(d->attr[i].fmt));   // RGBX → 同宽 RGB（X 不参与）
-        if (f == VK_FORMAT_UNDEFINED) {
-            nvn_gpu_rc bad = fail(err, NVN_GPU_E_UNSUPPORTED, "顶点属性格式 0x%x 无映射", d->attr[i].fmt);
-            destroy_pipe_objects(p);
-            return bad;
-        }
-        // 必须 CPU 解码的格式（32 位 UI2F/I2F）：本后端没有解码合成 binding，按映射出的整数
-        // 格式绑定会把整数位模式当 float 静默读错值——明确报红，不返回成功兜底。
-        {   // #975：走退回格式的 16 位打包格式，分量位置只在采样视图里补回；顶点取数按格式原样解，分量会错位
-            uint8_t map[4];
-            if (nvn_vk_format_chanmap(nvn_vattr_fmt_canon(d->attr[i].fmt), map)) {
-                nvn_gpu_rc bad = fail(err, NVN_GPU_E_UNSUPPORTED, "顶点属性格式 0x%x：本设备走退回格式，顶点取数不经通道映射", d->attr[i].fmt);
-                destroy_pipe_objects(p);
-                return bad;
-            }
-        }
-        if (nvn_vattr_must_cpu_decode(d->attr[i].fmt)) {
+        VkFormat f = vk_vertex_format(d->attr[i].fmt);
+        VkFormatProperties fp = {0};
+        if (f != VK_FORMAT_UNDEFINED) s2a_vk_format_properties(g.phys, f, &fp);
+        if (!(fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
             nvn_gpu_rc bad = fail(err, NVN_GPU_E_UNSUPPORTED,
-                                  "顶点属性格式 0x%x 需要 CPU 顶点解码（本后端未实现）", d->attr[i].fmt);
+                                  "顶点属性格式 0x%x 无兼容的原生取数格式", d->attr[i].fmt);
             destroy_pipe_objects(p);
             return bad;
         }
         uint32_t stream = d->attr[i].stream;
+        if (stream >= 16) {
+            nvn_gpu_rc bad = fail(err, NVN_GPU_E_ARG, "顶点属性 %d 的流号 %u 越界", i, stream);
+            destroy_pipe_objects(p);
+            return bad;
+        }
         int found = 0;
         for (uint32_t k = 0; k < nvb; k++) if (vb[k].binding == stream) found = 1;
         if (!found) {
@@ -4835,7 +4833,7 @@ static nvn_gpu_rc pipe_build(const nvn_gpu_pipe_desc *d, struct nvn_gpu_pipe_s *
         if (!logic_enabled && ((d->color.blend_en >> i) & 1u) && !is_int) {
             const blend_st *b = &d->blend[i];
             if (b->adv_mode) {
-                nvn_gpu_rc bad = fail(err, NVN_GPU_E_UNSUPPORTED, "高级混合（adv_mode）：本段未实现（target %u）", i);
+                nvn_gpu_rc bad = fail(err, NVN_GPU_E_UNSUPPORTED, "高级混合模式 0x%x 未接入 Vulkan（target %u）", b->adv_mode, i);
                 destroy_pipe_objects(p);
                 return bad;
             }
