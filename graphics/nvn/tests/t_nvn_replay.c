@@ -3204,7 +3204,9 @@ static void t_submit_compile_lookahead(void) {
     line->prim = 1; line->count = 2;
     *(uint32_t *)put(&s, OP_BARRIER, sizeof(uint32_t)) = NVN_BARRIER_ORDER_PRIMITIVES_BIT;
     q_draw(&s);
-    ((p_set_patch_size *)put(&s, OP_SET_PATCH_SIZE, sizeof(p_set_patch_size)))->size = 3;
+    uint64_t counters[4] = {0};
+    p_render_cond *dynamic = put(&s, OP_RENDER_COND, sizeof *dynamic);
+    *dynamic = (p_render_cond){.mode = 0, .addr = (uintptr_t)counters};
     q_draw(&s);
     end(&s);
     submit1(&s);

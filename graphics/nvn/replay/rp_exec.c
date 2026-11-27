@@ -747,6 +747,7 @@ static void lookahead_stop(enum rp_lookahead_stop reason, uint32_t op) {
     static const char *const names[RP_LOOKAHEAD_STOP_COUNT] = {
         [RP_LOOKAHEAD_COMMAND] = "command", [RP_LOOKAHEAD_RECORD] = "record",
         [RP_LOOKAHEAD_SCAN_LIMIT] = "scan_limit", [RP_LOOKAHEAD_SUBMIT_STATE] = "submit_state",
+        [RP_LOOKAHEAD_JUMP_CYCLE] = "jump_cycle",
         [RP_LOOKAHEAD_TARGET] = "target", [RP_LOOKAHEAD_DRAW] = "draw",
         [RP_LOOKAHEAD_TEX_POOL] = "tex_pool", [RP_LOOKAHEAD_PROGRAM] = "program",
         [RP_LOOKAHEAD_DYNAMIC_UBO] = "dynamic_ubo", [RP_LOOKAHEAD_RESOURCE] = "resource",
@@ -775,14 +776,18 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
     const p_set_rt *targets = rp_pass_target();
     p_set_rt captured;
     if (targets) { captured = *targets; targets = &captured; }
-    unsigned records = 128;
-    int saw_draw = 0;
+    enum { LOOKAHEAD_RECORDS = 128 };
+    unsigned records = LOOKAHEAD_RECORDS;
+    int used_targets = 0, skip_draw = 0;
     for (int i = 0; i < n; i++) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)handles[i];
-        if (!p) { stopped = RP_LOOKAHEAD_RECORD; op = UINT32_MAX; goto stop; }
+        if (!p || (uintptr_t)p % 8) { stopped = RP_LOOKAHEAD_RECORD; op = UINT32_MAX; goto stop; }
+        const uint8_t *visited[LOOKAHEAD_RECORDS];
+        unsigned nvisited = 0;
         for (;;) {
             if (!left) return;
             if (!records--) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; op = UINT32_MAX; goto stop; }
+            visited[nvisited++] = p;
             op_hdr h;
             memcpy(&h, p, sizeof h);
             op = h.op;
@@ -790,8 +795,48 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
             const void *payload = p + sizeof h;
             p += h.size;
             if (h.op == OP_END) break;
+            const size_t bytes = h.size - sizeof h;
+            // 这些控制记录在真实回放才写事件、时间戳、同步对象或执行 DrawTexture。
+            // 前瞻只走已录制的命令地址，不读计数结果或事件值。
+            switch (h.op) {
+            case OP_JUMP: {
+                uint64_t dest;
+                if (bytes != sizeof dest) goto bad_record;
+                memcpy(&dest, payload, sizeof dest);
+                if (!dest || dest % 8) goto bad_record;
+                p = (const uint8_t *)(uintptr_t)dest;
+                for (unsigned j = 0; j < nvisited; j++)
+                    if (visited[j] == p) { stopped = RP_LOOKAHEAD_JUMP_CYCLE; goto stop; }
+                continue;
+            }
+            case OP_REPORT_COUNTER:
+                if (bytes < 2 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_RESET_COUNTER: case OP_FENCE_SYNC: case OP_WAIT_SYNC:
+                if (bytes < sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_SIGNAL_EVENT: {
+                uint32_t mode;
+                if (bytes < sizeof(uint64_t) + 2 * sizeof(uint32_t)) goto bad_record;
+                memcpy(&mode, (const uint8_t *)payload + sizeof(uint64_t), sizeof mode);
+                if (mode & NVN_EV_WAIT) { stopped = RP_LOOKAHEAD_COMMAND; goto stop; }   // 会跨队列等到的数据未定
+                continue;
+            }
+            case OP_RENDER_COND: {
+                if (bytes < sizeof(p_render_cond)) goto bad_record;
+                const int mode = ((const p_render_cond *)payload)->mode;
+                if (mode != 2 && mode != 3) { stopped = RP_LOOKAHEAD_COMMAND; goto stop; }   // 条件取决于客体的计数器
+                skip_draw = mode == 3;
+                continue;
+            }
+            case OP_DRAW_TEX:
+                if (bytes < sizeof(p_draw_tex)) goto bad_record;
+                used_targets |= !skip_draw;   // 后端固定着色器，只改当前附件内容
+                continue;
+            default: break;
+            }
             if (h.op == OP_SET_RT) {
-                if (saw_draw) { stopped = RP_LOOKAHEAD_TARGET; goto stop; }   // 先前目标仍可能有 GPU 待写内容
+                if (used_targets) { stopped = RP_LOOKAHEAD_TARGET; goto stop; }   // 先前目标仍可能有 GPU 待写内容
                 const p_set_rt_c *head = payload;
                 if (h.size < sizeof h + sizeof *head || h.size - sizeof h < set_rt_payload(head)) {
                     stopped = RP_LOOKAHEAD_RECORD;
@@ -801,9 +846,12 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
                 continue;
             }
             if (h.op != OP_DRAW && h.op != OP_DRAW_IDX) {
+                // CALL 可能执行任意写入或重绑；间接多绘、派发、传输、清资源和 DLSS 也没法从静态绑定证明。
                 if (!rp_state_lookahead(&state, h.op, payload, h.size)) { stopped = RP_LOOKAHEAD_COMMAND; goto stop; }
+                if (!skip_draw && (h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS)) used_targets = 1;
                 continue;
             }
+            if (skip_draw) continue;
             if (!targets || targets->n < 0 || targets->n > 8) { stopped = RP_LOOKAHEAD_TARGET; goto stop; }
             stopped = RP_LOOKAHEAD_DRAW;
             if (state.tf_on) goto stop;
@@ -828,13 +876,15 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
                     q.rt_format[j] = (uint32_t)(targets->has_cview[j] && targets->cview[j].set_format
                                               ? targets->cview[j].format : targets->color[j]->d.format);
             }
-            saw_draw = 1;
+            used_targets = 1;
             const int accepted = rp_shader_lookahead(&state, &q, targets);
             if (accepted < 0) { stopped = -accepted; goto stop; }
             left -= (unsigned)accepted;
         }
     }
     return;
+bad_record:
+    stopped = RP_LOOKAHEAD_RECORD;
 stop:
     lookahead_stop(stopped, op);
 }

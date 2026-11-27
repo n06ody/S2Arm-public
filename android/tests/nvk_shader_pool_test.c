@@ -2578,7 +2578,57 @@ static void submit_record(uint8_t **cursor, uint32_t op, const void *payload, si
     *cursor += size;
 }
 
-static void test_submit_command_stream(const p_set_rt *targets, const struct rp_shader_req *q) {
+static void check_submit_boundary(const void *stream, const char *expected) {
+    lookahead_stop_lines = 0;
+    last_lookahead_stop[0] = 0;
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(!stats.enqueued && lookahead_stop_lines == 1 && strstr(last_lookahead_stop, expected),
+          "submit scan: expected boundary %s (log: %s)", expected, last_lookahead_stop);
+}
+
+static void test_submit_scan_boundaries(void) {
+    _Alignas(8) uint8_t cycle[2][16] = {0};
+    uint8_t *cursor = cycle[0];
+    const uint64_t next = (uintptr_t)cycle[1], start = (uintptr_t)cycle[0];
+    submit_record(&cursor, OP_JUMP, &next, sizeof next);
+    cursor = cycle[1];
+    submit_record(&cursor, OP_JUMP, &start, sizeof start);
+    check_submit_boundary(cycle[0], "reason=jump_cycle opcode=OP_JUMP");
+
+    _Alignas(8) uint8_t short_jump[16] = {0};
+    cursor = short_jump;
+    submit_record(&cursor, OP_JUMP, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(short_jump, "reason=record opcode=OP_JUMP");
+
+    _Alignas(8) uint8_t long_stream[160 * 16 + 8] = {0};
+    cursor = long_stream;
+    const uint64_t reset = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+    for (int i = 0; i < 160; i++) submit_record(&cursor, OP_RESET_COUNTER, &reset, sizeof reset);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(long_stream, "reason=scan_limit opcode=none");
+
+    _Alignas(8) uint8_t wait_stream[32] = {0};
+    cursor = wait_stream;
+    uint32_t status = 0;
+    const struct { uint64_t addr; uint32_t mode, value; } wait = {(uintptr_t)&status, NVN_EV_WAIT, 1};
+    submit_record(&cursor, OP_SIGNAL_EVENT, &wait, sizeof wait);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(wait_stream, "reason=command opcode=OP_SIGNAL_EVENT");
+
+    _Alignas(8) uint8_t write_stream[48] = {0};
+    cursor = write_stream;
+    const p_clear_buf clear = {.addr = (uintptr_t)&status, .size = sizeof status, .value = 1};
+    submit_record(&cursor, OP_CLEAR_BUF, &clear, sizeof clear);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(write_stream, "reason=command opcode=OP_CLEAR_BUF");
+    CHECK(status == 0, "submit scan: wait and buffer write were not executed");
+}
+
+static void test_submit_command_stream(const p_set_rt *targets, const struct rp_shader_req *q, int counters) {
     fixture_parallel_compile = 1;
     submit_targets = targets;
     nvn_be_sub_begin();
@@ -2594,23 +2644,53 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
     submit_record(&cursor, OP_BIND_SSBO, &deferred, sizeof deferred);
     submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
     submit_record(&cursor, OP_END, NULL, 0);
-    const uint64_t blocked_handle = (uintptr_t)blocked;
-    nvn_be_sub_index(&blocked_handle, 1);
-    struct rp_shader_live_compile_stats stats;
-    rp_shader_live_compile_take(&stats);
-    CHECK(!stats.enqueued && lookahead_stop_lines == 1 &&
-          strstr(last_lookahead_stop, "reason=command opcode=OP_BIND_SSBO"),
-          "submit scan: deferred SSBO is the first boundary (log: %s)", last_lookahead_stop);
+    check_submit_boundary(blocked, "reason=command opcode=OP_BIND_SSBO");
+    if (counters) test_submit_scan_boundaries();
+    lookahead_stop_lines = 0;
+    last_lookahead_stop[0] = 0;
 
     const dpool_t tex_pool = {.n = 64};
     const p_set_pool bind_tex_pool = {&tex_pool};
     const struct { p_push_const hdr; uint32_t data; } push = {{.size = 4}, 17};
     const p_push_const_ptr deferred_push = {.size = 4, .data = (uintptr_t)&push.data};
+    uint64_t counter_result[2] = {17, 19};
+    const uint64_t report[2] = {NVN_COUNTER_TYPE_TIMESTAMP, (uintptr_t)counter_result};
+    const uint64_t reset = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+    const p_viewports viewports = {.first = 0, .n = 1, .v = {{0, 0, 4, 4, 0, 1}}};
+    const p_set_patch_size patch = {.size = 3};
+    const p_bind_vstream vertex_stream = {.n = 1};
+    const p_bind_vbuf_single vertex_buffer = {.first = 0, .size = 64, .addr = 0x3000};
+    const p_render_cond disable = {.mode = 3}, enable = {.mode = 2};
+    uint32_t event_value = 13;
+    const struct { uint64_t addr; uint32_t mode, value; } signal = {
+        (uintptr_t)&event_value, NVN_EVENT_SIGNAL_MODE_WRITE, 23,
+    };
+    sync_t fence = {0};
+    const uint64_t fence_addr = (uintptr_t)&fence;
+    _Alignas(8) uint8_t head[768] = {0};
     _Alignas(8) uint8_t stream[1024] = {0};
+    cursor = head;
+    if (counters) {
+        submit_record(&cursor, OP_REPORT_COUNTER, &report, sizeof report);
+        submit_record(&cursor, OP_RESET_COUNTER, &reset, sizeof reset);
+        submit_record(&cursor, OP_SIGNAL_EVENT, &signal, sizeof signal);
+        submit_record(&cursor, OP_FENCE_SYNC, &fence_addr, sizeof fence_addr);
+        submit_record(&cursor, OP_WAIT_SYNC, &fence_addr, sizeof fence_addr);
+    }
+    const uint64_t second_segment = (uintptr_t)stream;
+    submit_record(&cursor, OP_JUMP, &second_segment, sizeof second_segment);
+    submit_record(&cursor, OP_END, NULL, 0);   // 顺序走下去会在找到绘制前结束
     cursor = stream;
     submit_record(&cursor, OP_SET_TEX_POOL, &bind_tex_pool, sizeof bind_tex_pool);
+    submit_record(&cursor, OP_RENDER_COND, &disable, sizeof disable);
+    submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_RENDER_COND, &enable, sizeof enable);
     submit_record(&cursor, OP_CLEAR_DS, &clear, sizeof clear);
     submit_record(&cursor, OP_SCISSOR, &scissor, sizeof scissor);
+    submit_record(&cursor, OP_VIEWPORTS, &viewports, offsetof(p_viewports, v) + sizeof *viewports.v);
+    submit_record(&cursor, OP_SET_PATCH_SIZE, &patch, sizeof patch);
+    submit_record(&cursor, OP_BIND_VSTREAM, &vertex_stream, offsetof(p_bind_vstream, st) + sizeof *vertex_stream.st);
+    submit_record(&cursor, OP_BIND_VBUF, &vertex_buffer, sizeof vertex_buffer);
     submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
     submit_record(&cursor, OP_PUSH_CONST, &push, sizeof push);
     submit_record(&cursor, OP_PUSH_CONST_PTR, &deferred_push, sizeof deferred_push);
@@ -2626,7 +2706,7 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
     }
     submit_record(&cursor, OP_END, NULL, 0);
 
-    const uint64_t handle = (uintptr_t)stream;
+    const uint64_t handle = (uintptr_t)head;
     nvn_be_sub_index(&handle, 1);
     const int all_started = live_gate_wait(4);
     pthread_mutex_lock(&live_gate_mu);
@@ -2635,6 +2715,9 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
           "submit scan: worker requests carry two aligned and two unaligned SSBO facts (got %d / %d)",
           submit_alignment_requests[0], submit_alignment_requests[1]);
     pthread_mutex_unlock(&live_gate_mu);
+    CHECK(!lookahead_stop_lines, "submit scan: valid chained stream never stopped early (log: %s)", last_lookahead_stop);
+    CHECK(counter_result[0] == 17 && counter_result[1] == 19, "submit scan: counter destination was untouched");
+    CHECK(event_value == 13, "submit scan: event destination was untouched");
     CHECK(!rp_S.tex_pool_n && !rp_S.ssbo[0][0].addr && !rp_S.ubo[0][0].size,
           "submit scan: live bindings were untouched");
     live_gate_release();
@@ -2648,6 +2731,7 @@ static void test_submit_command_stream(const p_set_rt *targets, const struct rp_
               rp_state_op(OP_BIND_UBO, &uniform[i], sizeof(op_hdr) + sizeof uniform[i]) &&
               !rp_shader_resolve(q, &program) && program, "submit scan: draw %d consumed its exact future", i);
     }
+    struct rp_shader_live_compile_stats stats;
     rp_shader_live_compile_take(&stats);
     CHECK(stats.enqueued == 4 && stats.compiled == 4 && stats.future_hits == 4 &&
           !stats.fallback && !stats.start_failed && shader_load_count == 4,
@@ -2716,8 +2800,8 @@ static int submit_compile_test(int slots, int variant) {
     color.L.size = sizeof memory;
     p_set_rt targets = {.n = 0, .depth = &color};
 #ifdef S2A_TEST_SUBMIT_SCAN
-    if (variant == 5) {
-        test_submit_command_stream(&targets, &q);
+    if (variant == 5 || variant == 7) {
+        test_submit_command_stream(&targets, &q, variant == 5);
         goto cleanup;
     }
 #endif

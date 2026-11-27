@@ -80,6 +80,7 @@ enum rp_lookahead_stop {
     RP_LOOKAHEAD_SNAPSHOT,
     RP_LOOKAHEAD_REQUEST,
     RP_LOOKAHEAD_QUEUE,
+    RP_LOOKAHEAD_JUMP_CYCLE,
     RP_LOOKAHEAD_STOP_COUNT,
 };
 // 1 = 入队，0 = 无新工作，负值 = 首退原因（-RP_LOOKAHEAD_*）。

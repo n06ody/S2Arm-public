@@ -82,15 +82,16 @@ def main():
     if sys.argv[1:] == ['--submit-compile']:
         exe = build_case('submit-compile', original, [*libs, gfx/'replay/rp_exec.c'],
                          extra_flags=('-DS2A_TEST_SUBMIT_SCAN',))
+        rc = 0
         for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3),
-                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6)):
+                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6), (4, 7)):
             result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
                                     capture_output=True, text=True, timeout=30)
             sys.stdout.write(result.stdout)
             sys.stderr.write(result.stderr)
-            if result.returncode:
-                return result.returncode
-        return 0
+            if result.returncode and not rc:
+                rc = result.returncode
+        return rc
 
     live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
                   '--live-compile-stop', '--cs-libpack', '--lp-gate', '--lp-numeric')

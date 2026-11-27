@@ -105,6 +105,10 @@ static void bind_program(struct rp_state *state, const p_bind_program *bp, int d
     if (dirty) stage_sweep(state);
 }
 
+static int lookahead_array16(size_t bytes, size_t base, size_t item, int first, int n) {
+    return n >= 0 && n <= 16 && first >= 0 && first <= 16 - n && bytes >= base + (size_t)n * item;
+}
+
 int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint32_t size) {
     if (size < sizeof(op_hdr)) return 0;
     const size_t bytes = size - sizeof(op_hdr);
@@ -159,18 +163,30 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         else { state->samp_base = base; state->samp_pool_n = n; }
         return 1;
     }
-    case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: {
+    case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: {
         if (op == OP_BIND_TEX1) {
             const p_bind_tex1 *b = a;
             if (bytes < sizeof *b || (b->slot & BIND_TEX1_AT)) return 0;
         } else if (bytes < offsetof(p_bind_handles, h)) return 0;
         p_bind_handles decoded;
         const p_bind_handles *b = bind_rec(op, a, &decoded);
-        const int limit = op == OP_BIND_SAMP ? 128 : RP_NTEX;
-        if (b->defer || b->stage < 0 || b->stage >= 6 || b->n < 0 || b->n > 32 ||
-            b->first < 0 || b->first > limit - b->n ||
-            (op != OP_BIND_TEX1 && bytes < offsetof(p_bind_handles, h) + (size_t)b->n * sizeof *b->h)) return 0;
-        if (op != OP_BIND_SAMP) memcpy(&state->tex[b->stage][b->first], b->h, (size_t)b->n * sizeof *b->h);
+        const int limit = op == OP_BIND_IMG ? 32 : op == OP_BIND_SAMP ? 128 : RP_NTEX;
+        if (b->stage < 0 || b->stage >= 6 || b->n < 0 || b->n > 32 || b->first < 0 || b->first > limit - b->n) return 0;
+        const size_t handles = (size_t)b->n * sizeof *b->h;
+        const size_t need = offsetof(p_bind_handles, h) + handles;
+        if (op != OP_BIND_TEX1 && bytes < need) return 0;
+        // 采样器值只在绑定时使用；采样类型来自贴图视图，数组长度在池绑定处跟踪。
+        if (op == OP_BIND_SAMP) return !b->defer || bytes >= need + sizeof(p_bind_pool_bases);
+        if (b->defer) return 0;
+        uint64_t *slots = op == OP_BIND_IMG ? state->img[b->stage] : state->tex[b->stage];
+        memcpy(slots + b->first, b->h, handles);
+        return 1;
+    }
+    case OP_TF_STATE: {
+        if (bytes < sizeof(p_tf_state)) return 0;
+        const int what = ((const p_tf_state *)a)->what;
+        if (what < 0 || what > 3) return 0;
+        state->tf_on = what == 0 || what == 3;   // 活动期间的绘制在取请求之前止步
         return 1;
     }
     case OP_ALPHA_REF:
@@ -187,11 +203,37 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         return bytes >= sizeof *p && p->size <= bytes - sizeof *p;
     }
     case OP_PUSH_CONST_PTR: return bytes >= sizeof(p_push_const_ptr);
-    // 只影响绘制参数，不参与图形着色器请求。实际回放仍重放每条命令。
-    case OP_SCISSOR: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP:
-    case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_STENCIL: case OP_POLY_OFFSET:
-    case OP_RAST_DISCARD: case OP_PRIM_RESTART: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
-        return 1;
+    // 动态绘制参数 / 管线状态。这里的拓扑只接受点、线、三角，细分控制点数不会改变请求。
+    case OP_SCISSOR: return bytes >= sizeof(p_scissor);
+    case OP_DEPTH_RANGE: return bytes >= sizeof(p_depth_range);
+    case OP_DEPTH_CLAMP: return bytes >= sizeof(p_depth_clamp);
+    case OP_VP_SWIZZLE: return bytes >= sizeof(p_vp_swizzle);
+    case OP_BLEND_COLOR: return bytes >= sizeof(p_blend_color);
+    case OP_STENCIL: return bytes >= sizeof(p_stencil);
+    case OP_POLY_OFFSET: return bytes >= sizeof(p_poly_offset);
+    case OP_RAST_DISCARD: return bytes >= sizeof(p_rast_discard);
+    case OP_PRIM_RESTART: return bytes >= sizeof(p_prim_restart);
+    case OP_SET_PATCH_SIZE: return bytes >= sizeof(p_set_patch_size);
+    case OP_TF_BIND: return bytes >= sizeof(p_tf_bind);
+    case OP_VIEWPORTS: {
+        const p_viewports *p = a;
+        const size_t base = offsetof(p_viewports, v);
+        return bytes >= base && lookahead_array16(bytes, base, sizeof *p->v, p->first, p->n);
+    }
+    case OP_BIND_VSTREAM: {
+        const p_bind_vstream *p = a;
+        const size_t base = offsetof(p_bind_vstream, st);
+        return bytes >= base && lookahead_array16(bytes, base, sizeof *p->st, 0, p->n);
+    }
+    case OP_BIND_VBUF: {
+        if (bytes == sizeof(p_bind_vbuf_single)) {
+            const p_bind_vbuf_single *p = a;
+            return p->first >= 0 && p->first < 16;
+        }
+        const p_bind_vbuf *p = a;
+        const size_t base = offsetof(p_bind_vbuf, r);
+        return bytes >= base && lookahead_array16(bytes, base, sizeof *p->r, p->first, p->n);
+    }
     default:
         return 0;
     }
