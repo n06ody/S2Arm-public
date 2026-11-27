@@ -188,6 +188,10 @@ int nvn_gpu_readback_enabled(void) __attribute__((weak));
 int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_readback_record
 uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_visibility_enabled
+int nvn_gpu_mirror_visibility_enabled(void) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_visibility_record
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_readback_span *spans, uint32_t count) __attribute__((weak));
 
 static int compare_write_ref(const void *a, const void *b) {
     const struct rp_gpu_write_ref *x = a, *y = b;
@@ -195,21 +199,28 @@ static int compare_write_ref(const void *a, const void *b) {
     return (x->id > y->id) - (x->id < y->id);
 }
 static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
-    if (!s || !s->ngw || !nvn_gpu_readback_record) return;
-    if (nvn_gpu_readback_cmd_enabled ? !nvn_gpu_readback_cmd_enabled(c) :
-        (!nvn_gpu_readback_enabled || !nvn_gpu_readback_enabled())) return;
+    if (!s || !s->ngw) return;
+    const int visibility = nvn_gpu_mirror_visibility_record && nvn_gpu_mirror_visibility_enabled &&
+                           nvn_gpu_mirror_visibility_enabled();
+    const int staging = nvn_gpu_readback_record && (nvn_gpu_readback_cmd_enabled ?
+                        nvn_gpu_readback_cmd_enabled(c) : nvn_gpu_readback_enabled && nvn_gpu_readback_enabled());
+    if (!visibility && !staging) return;
     const uint32_t count = (uint32_t)s->ngw;
     struct rp_gpu_write_ref local_refs[16];
     nvn_gpu_readback_span local_spans[16] = {0};
     struct rp_gpu_write_ref *refs = count <= 16 ? local_refs : calloc(count, sizeof *refs);
     nvn_gpu_readback_span *spans = count <= 16 ? local_spans : calloc(count, sizeof *spans);
-    if (!refs || !spans) red("%s", "回写暂存：复制表分配失败，使用镜像回写");
+    if (!refs || !spans) {
+        if (visibility) nvn_gpu_mirror_visibility_record(c, NULL, count);
+        else red("%s", "回写暂存：复制表分配失败，使用镜像回写");
+    }
     else {
         for (uint32_t i = 0; i < count; i++)
             refs[i] = (struct rp_gpu_write_ref){s->gw[i].pool_key, s->gw[i].id, i};
         qsort(refs, count, sizeof *refs, compare_write_ref);
         rp_buf_gpu_write_snapshot(refs, count, spans);
-        s->readback_bytes = nvn_gpu_readback_record(c, spans, count);
+        if (visibility) nvn_gpu_mirror_visibility_record(c, spans, count);
+        if (staging) s->readback_bytes = nvn_gpu_readback_record(c, spans, count);
         if (s->readback_bytes)
             for (uint32_t i = 0; i < count; i++)
                 if (spans[i].src && spans[i].readback_offset != UINT64_MAX)

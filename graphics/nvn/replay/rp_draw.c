@@ -1292,9 +1292,8 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
                 uint64_t paddr = ub->addr + e->src_off;
                 nvn_gpu_buf gb; uint64_t go;
                 if (!rp_buf_resolve(c, paddr, 8, &gb, &go)) return skip("uniform_buffer_unresolved", rec);
-                uint8_t *cpu = nvn_gpu_buf_cpu(gb);
-                if (!cpu) return skip("uniform_buffer_not_host_readable", rec);
-                uint64_t target = 0; memcpy(&target, cpu + go, 8);
+                uint64_t target;
+                if (!rp_buf_read_pointer(gb, go, paddr, &target)) return skip("uniform_buffer_not_host_readable", rec);
                 target = nvn_ga2ca(target);
                 if (!target) return skip("compute_storage_indirect_null", rec);
                 const uint8_t *pmem = NULL; uint64_t psz = 0;

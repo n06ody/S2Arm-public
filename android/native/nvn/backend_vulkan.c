@@ -61,7 +61,7 @@
 #include "spirv_compliance.h"   // #1865 统一装载闸：能力 / 扩展 / 存储类字节声明扫描
 #include "../capprobe/capprobe.h"
 #include "direct/sha256.h"
-_Static_assert(NVN_GPU_CONTRACT_VERSION == 26, "核对 Vulkan 后端与新版 NVN GPU 契约");
+_Static_assert(NVN_GPU_CONTRACT_VERSION == 27, "核对 Vulkan 后端与新版 NVN GPU 契约");
 #include "nvn_vk_dq.inc"   // 两级回放：从这里往下 vkCmd* 等名字走它的包装（调试开关 nvk_dq，缺省开）
 // 宿主后端夹具可能不链回放布局；缺来源时能力关闭并明确报原因。
 // 弱链接[androiddraw]：nvn_deswizzle_geom
@@ -95,10 +95,19 @@ static int bc1_astc_storage(uint32_t nvn_format, const nvn_gpu_tex_desc *d, VkIm
 
 enum { STAT_BUFS = 0, STAT_SUBMITS, STAT_DONE_OK, STAT_DONE_FAILED, STAT_RETIRED, STAT_WRITES, STAT_FILLS, STAT_COPIES,
        STAT_LAND_BYTES, STAT_LAND_DIRECT, STAT_LAND_INCOMPATIBLE,
-       STAT_LAND_LIMIT, STAT_LAND_BUSY, STAT_LAND_ALLOC, STAT_LAND_INVALIDATE, STAT_N };
+       STAT_LAND_LIMIT, STAT_LAND_BUSY, STAT_LAND_ALLOC, STAT_LAND_INVALIDATE,
+       STAT_MIRROR_FLUSH_N, STAT_MIRROR_FLUSH_PAYLOAD, STAT_MIRROR_FLUSH_BYTES, STAT_MIRROR_FLUSH_NS,
+       STAT_MIRROR_INV_N, STAT_MIRROR_INV_PAYLOAD, STAT_MIRROR_INV_BYTES, STAT_MIRROR_INV_NS,
+       STAT_MIRROR_WAIT_N, STAT_MIRROR_WAIT_NS, STAT_MIRROR_WAIT_LAST_SEGMENT,
+       STAT_MIRROR_WAIT_UPLOAD, STAT_MIRROR_WAIT_TRANSFER, STAT_MIRROR_WAIT_STORAGE, STAT_MIRROR_WAIT_INDIRECT,
+       STAT_N };
 static const char *const stat_names[STAT_N] = {
     "bufs_created", "submits", "segments_done", "segments_failed", "bufs_retired", "buf_writes", "buf_fills", "buf_copies",
     "land_staged_bytes", "land_direct_spans", "land_incompatible", "land_limit", "land_busy", "land_alloc_failure", "land_invalidate_failure",
+    "mirror_flush_calls", "mirror_flush_payload", "mirror_flush_bytes", "mirror_flush_ns",
+    "mirror_invalidate_calls", "mirror_invalidate_payload", "mirror_invalidate_bytes", "mirror_invalidate_ns",
+    "mirror_wait_calls", "mirror_wait_ns", "mirror_wait_last_segment",
+    "mirror_wait_upload_calls", "mirror_wait_transfer_calls", "mirror_wait_storage_calls", "mirror_wait_indirect_calls",
 };
 
 struct nvn_gpu_buf_s {
@@ -112,6 +121,9 @@ struct nvn_gpu_buf_s {
     uint64_t va;
     int mem_kind;
     VkMemoryPropertyFlags memory_flags;   // 实际分配的类型，回写按这个判断直接读或暂存
+    VkDeviceSize allocation_bytes;   // 专用分配：绑定在 0，映射覆盖整个 allocation
+    uint64_t mirror_use_fence;   // g_mu：CPU 直写仍需等此镜像的所有 GPU 访问。
+    struct vk_mirror_range *mirror_land;   // g_mu：尚未归还给 GPU 的回写范围列表。
     int released;
     int refs;
     nvn_gpu_retired_fn retired;
@@ -121,6 +133,25 @@ struct nvn_gpu_buf_s {
 };
 
 struct vk_land_slot { nvn_gpu_buf buf; int busy; };
+struct vk_mirror_range {
+    nvn_gpu_buf buf;
+    VkMappedMemoryRange range;
+    uint64_t signal;
+    struct vk_mirror_range *next, **link;
+};
+
+// 取值就是等回写时归账的统计项。
+enum mirror_write_kind {
+    MIRROR_UPLOAD = STAT_MIRROR_WAIT_UPLOAD,
+    MIRROR_TRANSFER = STAT_MIRROR_WAIT_TRANSFER,
+    MIRROR_STORAGE = STAT_MIRROR_WAIT_STORAGE,
+    MIRROR_INDIRECT = STAT_MIRROR_WAIT_INDIRECT,
+};
+struct vk_mirror_write {
+    nvn_gpu_buf buf;
+    VkDeviceSize lo, hi;   // [lo, hi)，按非一致原子对齐。
+    enum mirror_write_kind kind;
+};
 
 struct nvn_gpu_tex_s {
     uint64_t access_id;
@@ -342,6 +373,12 @@ struct nvn_gpu_cmd_s {
     char why[192];
     struct vk_ref *refs;
     uint32_t nrefs, refcap;
+    struct vk_mirror_range *mirror_ranges;
+    uint32_t mirror_range_count;
+    uint64_t mirror_payload_bytes;
+    struct vk_mirror_write *mirror_writes;
+    uint32_t mirror_write_count, mirror_write_cap;
+    int mirror_bindings_dirty;
     uint64_t *refseen;               // 本段已引用句柄的备忘（#1194）：直接映射，槽里 = 句柄指针 | 类型；第一次引用时懒分配，随段释放
     uint64_t refseen_epoch;          // 备忘建表（或上次清空）时的 g_rel_epoch；与现在不一致就整表作废
     uint32_t refseen_hits;           // 本段备忘命中的次数（只给宿主用例读：nvn_gpu_vk_test_cmd_refseen_hits）
@@ -514,6 +551,10 @@ struct nvn_gpu_vk {
     _Atomic int land_reported;
     unsigned land_prior_live, land_live_count;
     struct la_trial land_trial;
+    int land_cached;   // 会话内固定
+    int land_upload_versions;
+    _Atomic int mirror_noncoherent_seen;
+    VkResult mirror_flush_error;
     int vbuf_batch;                 // 会话内固定；debug.s2a.nvk_replay_cpu_cuts 缺省开启
     int fault_inject;
     uint64_t test_fail_signal;    // 测试钩子：让指定 signal 的段表现为 fence 失败
@@ -682,6 +723,7 @@ static int g_plcw_failed;                    // 最近一次后台写失败了�
 static uint64_t g_plcw_started, g_plcw_ok, g_plcw_fail, g_plcw_same;   // 读数（进程累计，不随会话清零）：交给后台写的次数 / 成功 / 失败 / 与上次一致没写
 static uint64_t g_plcw_get_ns;   // 触发线程上「查大小 + 取数据 + 拷字节」的累计纳秒（后台写盘不算；长帧归因读它）
 static pthread_mutex_t g_submit_mu = PTHREAD_MUTEX_INITIALIZER; // 提交串行化：校验 signal、vkQueueSubmit、入队
+static pthread_mutex_t g_guest_commit_mu = PTHREAD_MUTEX_INITIALIZER; // 分代档：等待回写时守客体提交顺序，WSI 不取此锁
 static pthread_cond_t g_cv;
 static int g_cv_ready;
 static _Thread_local int g_in_callback;   // [回调] 线程：只许调 [任意] 函数
@@ -1861,6 +1903,7 @@ static void detach_live(struct nvn_gpu_cmd_s *c) {
 
 static void clr_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_clear.inc
 static void dtx_cmd_free(struct nvn_gpu_cmd_s *c);   // backend_vulkan_draw_tex.inc
+static void mirror_unlink_locked(struct nvn_gpu_cmd_s *c);   // backend_vulkan_mirror.inc
 
 #include "backend_vulkan_bc_time.inc"
 #include "backend_vulkan_land_auto.inc"
@@ -1892,6 +1935,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         unref_locked(&g, c->newimg[i], REF_TEX);
     }
     free(c->newimg); c->newimg = NULL; c->n_newimg = 0;
+    mirror_unlink_locked(c);   // 回调已经返回。先摘范围，再放掉缓冲与视图的引用。
     for (uint32_t i = 0; i < c->nrefs; i++) unref_locked(&g, c->refs[i].obj, c->refs[i].type);
     if (c->land_tracked) {
         g.land_live_count--;
@@ -1916,6 +1960,8 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
         if (c->passes[i].rp) vkDestroyRenderPass(g.d, c->passes[i].rp, NULL);
     }
     for (uint32_t i = 0; i < c->pool_ndpools; i++) vkDestroyDescriptorPool(g.d, c->pool_dpools[i], NULL);
+    free(c->mirror_ranges);
+    free(c->mirror_writes);
     free(c->pool_dpools);
     free(c->passes);
     free(c->lay);
@@ -1993,6 +2039,7 @@ static VkResult land_readback_invalidate(struct nvn_gpu_vk *vk, const struct nvn
     // 暂存由 GPU 独占写，录制的 HOST_READ 可见性屏障和上方实际 fence wait 均已完成。
     return vkInvalidateMappedMemoryRanges(vk->d, 1, &range);
 }
+static VkResult mirror_invalidate(struct nvn_gpu_vk *vk, const struct nvn_gpu_cmd_s *c);
 
 static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
     int failed = s->failed;
@@ -2085,12 +2132,15 @@ static void process_segment(struct nvn_gpu_vk *vk, struct vk_segment *s) {
 
     char land_failure[112];
     if (!s->internal && !failed) {
-        const VkResult r = land_readback_invalidate(vk, s->cmd, s->signal);
+        VkResult r = mirror_invalidate(vk, s->cmd);
+        const int mirror_failed = r != VK_SUCCESS;
+        if (!mirror_failed) r = land_readback_invalidate(vk, s->cmd, s->signal);
         if (r != VK_SUCCESS) {
-            snprintf(land_failure, sizeof land_failure, "回写暂存失效操作失败（VkResult %d）", (int)r);
+            snprintf(land_failure, sizeof land_failure, mirror_failed ?
+                     "缓存镜像失效操作失败（VkResult %d）" : "回写暂存失效操作失败（VkResult %d）", (int)r);
             pthread_mutex_lock(&g_mu);
             if (!vk->failed || s->signal < vk->failed) vk->failed = s->signal;
-            vk->stats[STAT_LAND_INVALIDATE]++;
+            if (!mirror_failed) vk->stats[STAT_LAND_INVALIDATE]++;
             pthread_cond_broadcast(&g_cv);
             pthread_mutex_unlock(&g_mu);
             failed = 1;
@@ -2506,6 +2556,9 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         if (!g.land_readback)
             nvn_plat_log(NVN_PLAT_LOG_INFO, "land-readback", "无主机可见且可缓存的显存类型，直接从镜像回写");
     }
+    atomic_init(&g.mirror_noncoherent_seen, 0);
+    g.land_cached = nvn_plat_flag("nvk_land_cached", 0) != 0;
+    g.land_upload_versions = g.land_cached && nvn_plat_flag("nvk_land_upload_versions", 0) != 0;
     { int mb = nvn_plat_flag("nvk_feedback_pool_mb", 256); g_fbpool_cap = mb > 0 ? (uint64_t)mb << 20 : 0; }   // 反馈快照池上限（0 = 关）
     // 0 = direct A, 1 = guarded A/B, 2 = guarded A/A overhead control.
     const int cold_mode = nvn_plat_flag("nvk_cold_guard", 0);
@@ -2806,7 +2859,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
 
 // ---------------------------------------------------------------- 缓冲
 
-static int is_shared(int mem) { return mem == NVN_GPU_MEM_SHARED; }
+static int is_shared(int mem) { return mem == NVN_GPU_MEM_SHARED || mem == NVN_GPU_MEM_POOL_MIRROR; }
 
 static int session_accepting(void) {
     if (!g_open) return 0;
@@ -2874,7 +2927,8 @@ static void pipe_call_test_gate(void) {
 // prefer_cached：主机可见的缓冲优先挑 HOST_CACHED 的显存类型（本机有 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED，类型 6）。
 // 暂存缓冲（每帧约 9 MB 常量缓冲 + 顶点镜像落盘）是 CPU 反复小段写的：写在缓存内存上比写在不缓存映射上快数倍，
 // 且该类型带 coherent 位、不需要显式 flush（见坑记录续 21 的带宽争用读数）。
-enum { BUF_COHERENT, BUF_PREFER_CACHED, BUF_READBACK_CACHED };
+enum { BUF_COHERENT, BUF_PREFER_CACHED, BUF_READBACK_CACHED, BUF_MIRROR_CACHED };
+#include "backend_vulkan_mirror.inc"
 static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int memory_policy, nvn_gpu_buf *out, nvn_gpu_err *err);
 nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err) {
     // 开关 nvk_mem_cached：所有主机可见缓冲（含池镜像）也走 HOST_CACHED 类型。缺省跟随重叠档（nvk_sync_lag≠0 时开）：
@@ -2882,7 +2936,19 @@ nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu
     // 开了之后顶点流 22–25 → 17.9 毫秒、帧 p50 52 → 50（读数见坑记录续 23）。
     static int all_cached = -1; static unsigned k;
     if (all_cached < 0 || !(++k & 255)) all_cached = nvn_plat_flag("nvk_mem_cached", nvn_plat_flag("nvk_sync_lag", 0) != 0) != 0;
-    return buf_create_impl(bytes, mem, init, all_cached, out, err);
+    if (mem == NVN_GPU_MEM_POOL_MIRROR && g.land_cached) {
+        nvn_gpu_err cached_err = {0};
+        const nvn_gpu_rc r = buf_create_impl(bytes, mem, init, BUF_MIRROR_CACHED, out, &cached_err);
+        if (nvn_gpu_ok(r)) return r;
+        if (r.code != NVN_GPU_E_UNSUPPORTED && r.code != NVN_GPU_E_OOM) {
+            if (err) *err = cached_err;
+            return r;
+        }
+        char note[272];
+        snprintf(note, sizeof note, "缓存镜像回退原分配：%s", cached_err.why);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "land-cached", note);
+    }
+    return buf_create_impl(bytes, mem, init, all_cached ? BUF_PREFER_CACHED : BUF_COHERENT, out, err);
 }
 static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int memory_policy, nvn_gpu_buf *out, nvn_gpu_err *err) {
     if (!out) return fail(err, NVN_GPU_E_ARG, "out 为空");
@@ -2896,7 +2962,7 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
     //   1508 MiB 的分配实测成功，而上限报 1 GiB（11-14，#1070：1.47 GiB 的池镜像被这里拦下、整局黑屏）。真分配不出来时
     //   下面 vkAllocateMemory 照实报驱动的错误码。
     if (bytes == 0) return fail(err, NVN_GPU_E_ARG, "申请 0 字节");
-    if (mem != NVN_GPU_MEM_SHARED && mem != NVN_GPU_MEM_DEVICE) return fail(err, NVN_GPU_E_ARG, "mem 非法");
+    if (!is_shared(mem) && mem != NVN_GPU_MEM_DEVICE) return fail(err, NVN_GPU_E_ARG, "mem 非法");
     if (mem == NVN_GPU_MEM_DEVICE && init) return fail(err, NVN_GPU_E_ARG, "DEVICE 内存不能带 init");
 
     struct nvn_gpu_buf_s *b = calloc(1, sizeof *b);
@@ -2924,11 +2990,12 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
     if (readback) want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     else if (memory_policy == BUF_PREFER_CACHED && is_shared(mem))
         type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, NULL);
-    if (type == UINT32_MAX) type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, want, NULL);
+    if (memory_policy == BUF_MIRROR_CACHED) type = mirror_memory_type(g.dev, &req);
+    else if (type == UINT32_MAX) type = s2a_vk_memory_type(g.dev, req.memoryTypeBits, want, NULL);
     if (type == UINT32_MAX) {
         vkDestroyBuffer(g.d, b->buffer, NULL);
         free(b);
-        return fail(err, readback ? NVN_GPU_E_UNSUPPORTED : NVN_GPU_E_OOM,
+        return fail(err, readback || memory_policy == BUF_MIRROR_CACHED ? NVN_GPU_E_UNSUPPORTED : NVN_GPU_E_OOM,
                     "找不到满足要求的显存类型（兼容类型位 0x%x）", req.memoryTypeBits);
     }
     VkMemoryAllocateInfo ai;
@@ -2936,28 +3003,49 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = type;
-    if (vkAllocateMemory(g.d, &ai, NULL, &b->memory) != VK_SUCCESS) {
+    VkResult result = vkAllocateMemory(g.d, &ai, NULL, &b->memory);
+    if (result != VK_SUCCESS) {
         vkDestroyBuffer(g.d, b->buffer, NULL);
         free(b);
-        return fail(err, NVN_GPU_E_OOM, "vkAllocateMemory 失败");
+        return fail(err, result == VK_ERROR_DEVICE_LOST ? NVN_GPU_E_DEVICE : NVN_GPU_E_OOM,
+                    "vkAllocateMemory 失败（type=%u，memoryTypeBits=0x%x，VkResult=%d）", type, req.memoryTypeBits, (int)result);
     }
-    if (vkBindBufferMemory(g.d, b->buffer, b->memory, 0) != VK_SUCCESS) {
-        vkFreeMemory(g.d, b->memory, NULL);
+    result = vkBindBufferMemory(g.d, b->buffer, b->memory, 0);
+    if (result != VK_SUCCESS) {
         vkDestroyBuffer(g.d, b->buffer, NULL);
+        vkFreeMemory(g.d, b->memory, NULL);
         free(b);
-        return fail(err, NVN_GPU_E_OOM, "vkBindBufferMemory 失败");
+        return fail(err, result == VK_ERROR_DEVICE_LOST ? NVN_GPU_E_DEVICE : NVN_GPU_E_OOM,
+                    "vkBindBufferMemory 失败（type=%u，VkResult=%d）", type, (int)result);
     }
     b->bytes = bytes;
+    b->allocation_bytes = req.size;
     b->mem_kind = mem;
     b->memory_flags = g.dev->memory.memoryTypes[type].propertyFlags;
     if (is_shared(mem)) {
-        if (vkMapMemory(g.d, b->memory, 0, VK_WHOLE_SIZE, 0, (void **)&b->mapped) != VK_SUCCESS) {
+        result = vkMapMemory(g.d, b->memory, 0, VK_WHOLE_SIZE, 0, (void **)&b->mapped);
+        if (result != VK_SUCCESS) {
             vkDestroyBuffer(g.d, b->buffer, NULL);
             vkFreeMemory(g.d, b->memory, NULL);
             free(b);
-            return fail(err, NVN_GPU_E_OOM, "vkMapMemory 失败");
+            return fail(err, result == VK_ERROR_DEVICE_LOST ? NVN_GPU_E_DEVICE : NVN_GPU_E_OOM,
+                        "vkMapMemory 失败（type=%u，VkResult=%d）", type, (int)result);
         }
-        if (init) memcpy(b->mapped, init, (size_t)bytes);
+        if (init) {
+            memcpy(b->mapped, init, (size_t)bytes);
+            if (mirror_is_noncoherent(b)) {
+                VkMappedMemoryRange range;
+                VkResult r = mirror_range(b, 0, bytes, &range)
+                    ? vkFlushMappedMemoryRanges(g.d, 1, &range) : VK_ERROR_UNKNOWN;
+                if (r != VK_SUCCESS) {
+                    vkUnmapMemory(g.d, b->memory);
+                    vkDestroyBuffer(g.d, b->buffer, NULL);
+                    vkFreeMemory(g.d, b->memory, NULL);
+                    free(b);
+                    return fail(err, NVN_GPU_E_FAILED, "缓存镜像初始数据 flush 失败（VkResult %d）", (int)r);
+                }
+            }
+        }
     }
     pthread_mutex_lock(&g_mu);
     if (g.closing || g.closed) {   // 与 close 的快照串行：close 开始后新建的对象不留在账上
@@ -2972,6 +3060,14 @@ static nvn_gpu_rc buf_create_impl(uint64_t bytes, int mem, const void *init, int
     g.bufs = b;
     g.stats[STAT_BUFS]++;
     pthread_mutex_unlock(&g_mu);
+    if (memory_policy == BUF_MIRROR_CACHED) {
+        if (mirror_is_noncoherent(b)) atomic_store_explicit(&g.mirror_noncoherent_seen, 1, memory_order_relaxed);
+        char note[200];
+        snprintf(note, sizeof note, "镜像 bytes=%llu memoryTypeBits=0x%x type=%u flags=0x%x atom=%llu",
+                 (unsigned long long)bytes, req.memoryTypeBits, type, (unsigned)b->memory_flags,
+                 (unsigned long long)g.dev->properties.limits.nonCoherentAtomSize);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "land-cached", note);
+    }
     *out = b;
     return rc(NVN_GPU_OK);
 }
@@ -3002,7 +3098,9 @@ void nvn_gpu_buf_release(nvn_gpu_buf bh, nvn_gpu_retired_fn retired, void *user)
 
 void nvn_gpu_buf_use(nvn_gpu_cmd ch, nvn_gpu_buf bh) {
     if (!ch || !bh) return;
-    cmd_ref((struct nvn_gpu_cmd_s *)ch, bh, REF_BUF);
+    cmd_ref(ch, bh, REF_BUF);
+    // 显式声明 GPU 裸地址引用时没有访问范围和读写方向信息。
+    if (rc_is(ch->sticky, NVN_GPU_OK)) mirror_write(ch, bh, 0, bh->bytes, MIRROR_INDIRECT);
 }
 
 // ---------------------------------------------------------------- arena
@@ -3012,7 +3110,8 @@ static struct nvn_gpu_buf_s *new_staging(struct nvn_gpu_cmd_s *c, uint64_t cap) 
     nvn_gpu_buf b = seg_reuse_on() ? seg_take_stg(cap) : NULL;
     static int cached_on = -1; if (cached_on < 0) cached_on = nvn_plat_flag("nvk_stage_cached", 1) != 0;
     if (!b) {
-        if (!rc_is(buf_create_impl(cap, NVN_GPU_MEM_SHARED, NULL, cached_on, &b, &e), NVN_GPU_OK)) return NULL;
+        const int policy = cached_on ? BUF_PREFER_CACHED : BUF_COHERENT;
+        if (!rc_is(buf_create_impl(cap, NVN_GPU_MEM_SHARED, NULL, policy, &b, &e), NVN_GPU_OK)) return NULL;
         __atomic_add_fetch(&g_stg_wr[4], 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_stg_wr[5], cap, __ATOMIC_RELAXED);   // 新建的暂存块（表里没取到）
     }
     if (c->nstaging == c->scap) {
@@ -3303,6 +3402,7 @@ void nvn_gpu_buf_write(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, const void 
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     cold_note_write(c, b, off, bytes, COLD_READ_TRANSFER, 1);
+    mirror_write(c, b, off, bytes, MIRROR_UPLOAD);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_WRITES]++;
     pthread_mutex_unlock(&g_mu);
@@ -3323,19 +3423,19 @@ void nvn_gpu_fill_buf(nvn_gpu_cmd ch, nvn_gpu_buf bh, uint64_t off, uint64_t byt
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     cmd_ref(c, b, REF_BUF);
     cold_note_write(c, b, off, bytes, COLD_READ_TRANSFER, 1);
+    mirror_write(c, b, off, bytes, MIRROR_TRANSFER);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_FILLS]++;
     pthread_mutex_unlock(&g_mu);
 }
 
-void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
-    { struct nvn_gpu_cmd_s *cc = ch; if (cc && cc->in_pass && rc_is(cc->sticky, NVN_GPU_OK)) { set_sticky(cc, NVN_GPU_E_ORDER, "传输操作在通道内"); return; } }
-    if (!ch) return;
-    struct nvn_gpu_cmd_s *c = ch;
-    if (!rc_is(c->sticky, NVN_GPU_OK)) return;
+static void copy_buf(struct nvn_gpu_cmd_s *c, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff,
+                     uint64_t bytes, int mirror_span) {
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (c->in_pass) { set_sticky(c, NVN_GPU_E_ORDER, "传输操作在通道内"); return; }
     struct nvn_gpu_buf_s *s = src, *d = dst;
     if (!s || !d || !buf_range(s, soff, bytes) || !buf_range(d, doff, bytes)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 越界"); return; }
-    if (bytes & 3) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
+    if (!mirror_span && (bytes & 3)) { set_sticky(c, NVN_GPU_E_ARG, "copy_buf 需 4 字节长度（本段实现限制）bytes=%llu", (unsigned long long)bytes); return; }
     if (bytes == 0) return;
     full_barrier(c);
     VkBufferCopy bc = {soff, doff, bytes};
@@ -3344,9 +3444,23 @@ void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_bu
     cmd_ref(c, s, REF_BUF);
     cmd_ref(c, d, REF_BUF);
     cold_note_write(c, d, doff, bytes, 0, 0);
+    mirror_write(c, d, doff, bytes, MIRROR_TRANSFER);
     pthread_mutex_lock(&g_mu);
     g.stats[STAT_COPIES]++;
     pthread_mutex_unlock(&g_mu);
+}
+
+void nvn_gpu_copy_buf(nvn_gpu_cmd ch, nvn_gpu_buf src, uint64_t soff, nvn_gpu_buf dst, uint64_t doff, uint64_t bytes) {
+    copy_buf(ch, src, soff, dst, doff, bytes, 0);
+}
+
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes) {
+    if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
+    if (src == dst || !nvn_gpu_mirror_version_atom(src) || !nvn_gpu_mirror_version_atom(dst)) {
+        set_sticky(c, NVN_GPU_E_ARG, "继承范围必须来自不同的缓存镜像代");
+        return;
+    }
+    copy_buf(c, src, off, dst, off, bytes, 1);
 }
 
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages) {
@@ -3374,6 +3488,8 @@ void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd ch, const nvn_gpu_buf_copy *v, uint32
         cmd_ref(c, s, REF_BUF); cmd_ref(c, d, REF_BUF);
         if (g.cold_enabled) for (uint32_t j = 0; j < k; j++)
             cold_note_write(c, d, r[j].dstOffset, r[j].size, 0, 0);
+        if (mirror_is_noncoherent(d))
+            for (uint32_t j = 0; j < k; j++) mirror_write(c, d, r[j].dstOffset, r[j].size, MIRROR_TRANSFER);
     }
     mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dst, VK_ACCESS_UNIFORM_READ_BIT);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（同 nvn_gpu_copy_buf）
@@ -6139,7 +6255,10 @@ void nvn_gpu_set_pipe(nvn_gpu_cmd ch, nvn_gpu_pipe ph) {
         if (c->push_data[st] && end > UINT32_MAX) { set_sticky(c, NVN_GPU_E_ARG, "push 范围溢出"); return; }
         if (c->push_data[st] && !ensure_push_capacity(c, st, (uint32_t)end)) return;
     }
-    if (c->pipe != ph && c->pool_active) { memset(c->pool_binds, 0, sizeof c->pool_binds); c->pool_active = 0; }
+    if (c->pipe != ph) {
+        c->mirror_bindings_dirty = 1;
+        if (c->pool_active) { memset(c->pool_binds, 0, sizeof c->pool_binds); c->pool_active = 0; }
+    }
     c->pipe = ph;
 }
 
@@ -6261,6 +6380,7 @@ void nvn_gpu_bind(nvn_gpu_cmd ch, nvn_gpu_stage st, const nvn_gpu_binding *b, ui
         count++;
     }
     c->nbinds[st] = count;
+    c->mirror_bindings_dirty = 1;
 }
 
 // 测试读数：各类状态命令实际录了几次（下标同 ES_*：管线、视口、裁剪、混合常量、模板、深度偏移、顶点缓冲、索引缓冲、push）
@@ -6554,6 +6674,13 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     }
     // A descriptor-free pipeline ignores bindings left by the previous pipeline.
     if (!p->nset) return 1;
+    if (c->mirror_bindings_dirty) {
+        c->mirror_bindings_dirty = 0;
+        if (nvn_gpu_mirror_visibility_enabled()) {
+            mirror_storage_writes(c, p, compute);
+            if (!rc_is(c->sticky, NVN_GPU_OK)) return 0;
+        }
+    }
     uint32_t pool_mask = 0; struct pool_set_info pinfo[4] = {{0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}, {0, 0, NULL}};   // 带整池数组的组；每组里各池绑定（绑定号, 池快照序号）的混合和，进备忘 / 回收的键
     if (c->pool_active && !pool_set_mask(c, p, compute, &pool_mask, pinfo)) return 0;
     uint32_t dirty = c->desc_dirty & ((1u << p->nset) - 1u);
@@ -7017,6 +7144,7 @@ void nvn_gpu_dispatch(nvn_gpu_cmd ch, nvn_gpu_pipe ph, uint32_t x, uint32_t y, u
     if (!p || p->pass) { set_sticky(c, NVN_GPU_E_ORDER, "dispatch 缺计算管线"); return; }
     if (ind && x | y | z) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 与计数不能同时给"); return; }
     if (ind) { if (!buf_range(ind, off, 12)) { set_sticky(c, NVN_GPU_E_ARG, "间接 dispatch 参数越界"); return; } }
+    if (c->pipe != p) c->mirror_bindings_dirty = 1;
     c->pipe = p;
     if (!prepare_bind_layouts(c, 1)) return;
     if (!bind_descriptor_groups(c, p, 1)) return;
@@ -8118,6 +8246,12 @@ void nvn_gpu_copy_tex_buf(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32
     bc.imageSubresource = (VkImageSubresourceLayers){copy_face_aspect(t), level, t->target == NVN_TEXTURE_TARGET_3D ? 0 : layer, 1};   // 深度模板贴图只回读深度面（#1581 K）
     bc.imageOffset = o;
     bc.imageExtent = e;
+    if (mirror_is_noncoherent(b)) {
+        const uint64_t packed = ((uint64_t)e.width + blk_w - 1) / blk_w * blk;
+        const uint64_t pitch = (uint64_t)(bc.bufferRowLength / blk_w) * blk;
+        const uint32_t rows = (e.height - 1) / blk_h + 1;
+        mirror_write_rows(c, b, off, packed, pitch, rows, bc.bufferImageHeight / blk_h, e.depth);
+    }
     vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer, 1, &bc);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     image_barrier(c, t, VK_IMAGE_LAYOUT_GENERAL);
@@ -8284,6 +8418,8 @@ static void bc_readback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, uint32
     uint64_t src = loff + (uint64_t)slice * sp + (uint64_t)(o.y / 4) * rp + (uint64_t)(o.x / 4) * (uint32_t)bb;
     for (uint64_t y = 0; y < bh; y++) rg[y] = (VkBufferCopy){src + y * rp, off + y * row_bytes, packed_row};
     full_barrier(c);
+    if (mirror_is_noncoherent(b))
+        mirror_write_rows(c, b, off, packed_row, row_bytes, (uint32_t)bh, (uint32_t)bh, 1);
     vkCmdCopyBuffer(c->cb, t->bc_sbuf, b->buffer, (uint32_t)bh, rg);
     c->xfer_dirty = 1;   // 缓冲作目标的传输：下一次计算派发前要补全屏障（见 nvn_gpu_dispatch）
     free(rg);
@@ -9067,6 +9203,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     pthread_mutex_lock(&g_mu);
     int closing = g.closing, lost = g.device_lost, inject = g.fault_inject, failed_state = g.failed != 0;
     if (inject) g.fault_inject = 0;
+    const VkResult flush_error = g.mirror_flush_error;
     uint64_t last = g.last_signal;
     pthread_mutex_unlock(&g_mu);
 
@@ -9090,6 +9227,16 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     }
 
     if (c->in_pass) set_sticky(c, NVN_GPU_E_ORDER, "commit 时通道还开着");
+    if (flush_error != VK_SUCCESS)
+        set_sticky(c, NVN_GPU_E_FAILED, "缓存镜像 flush 失败（VkResult %d）", (int)flush_error);
+    if (c->mirror_write_count && rc_is(c->sticky, NVN_GPU_OK) && !closing && !lost && !inject && !failed_state) {
+        mirror_wait_for_landing(c);
+        pthread_mutex_lock(&g_mu);
+        closing = g.closing;
+        lost = g.device_lost;
+        failed_state = g.failed != 0;
+        pthread_mutex_unlock(&g_mu);
+    }
     nvn_gpu_rc sticky = c->sticky;
     if (!rc_is(sticky, NVN_GPU_OK) || closing || lost || inject || failed_state) {
         nvn_gpu_rc code = !rc_is(sticky, NVN_GPU_OK) ? sticky
@@ -9136,6 +9283,7 @@ static nvn_gpu_rc commit_impl(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
                 s->fence = fence;
                 s->submitted = 1;
                 s->executed = 1;
+                if (nvn_gpu_mirror_visibility_enabled()) mirror_mark_submitted(c, signal);
                 publish_signal(signal, 0);
                 if (g.cold_enabled) cold_commit_writes(c);
                 enqueue_segment(&g, s);   // 此后 cmd 归 worker（finish_cmd 负责摘链）
@@ -9186,7 +9334,10 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd ch, uint64_t signal, nvn_gpu_done_fn d
     c->live_next = NULL;
     g.commit_active++;
     pthread_mutex_unlock(&g_mu);
+    const int versions = g.land_upload_versions;
+    if (versions) pthread_mutex_lock(&g_guest_commit_mu);
     nvn_gpu_rc r = commit_impl(ch, signal, done, user, err);
+    if (versions) pthread_mutex_unlock(&g_guest_commit_mu);
     pthread_mutex_lock(&g_mu);
     g.commit_active--;
     pthread_cond_broadcast(&g_cv);
@@ -9261,7 +9412,7 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     uint64_t v[STAT_N];
     pthread_mutex_lock(&g_mu);
     memcpy(v, g.stats, sizeof v);
-    if (take) memset(g.stats, 0, sizeof g.stats);
+    if (take) memset(g.stats, 0, STAT_MIRROR_FLUSH_N * sizeof *g.stats);   // 镜像项是上屏窗口用的会话累计
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < STAT_N; i++) fn(user, stat_names[i], v[i]);
     // 描述符组按布局回收（#1096）：开会话起累计，不随 take 清零
