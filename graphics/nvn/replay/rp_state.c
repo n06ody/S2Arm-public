@@ -180,6 +180,7 @@ int rp_state_op(uint32_t op, const void *a, uint32_t size) {
         case OP_DEPTH_CLAMP: { int on = ((const p_depth_clamp *)a)->on; if ((on != 0) != (rp_S.depth_clamp != 0)) rp_pso_dirty = 1;   // 原生接口里深度夹取是管线状态
             rp_S.depth_clamp = on; return 1; }
         case OP_VP_SWIZZLE: { const p_vp_swizzle *b = a; if (b->first < 0 || b->n < 0 || b->first + b->n > 16) return 1;
+            if (b->first == 0 && b->n && memcmp(rp_S.vp_sw[0], b->sw[0], 4)) rp_pso_dirty = 1;
             memcpy(rp_S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); return 1; }
         case OP_BLEND_COLOR: memcpy(rp_S.blend_color, ((const p_blend_color *)a)->rgba, 16); return 1;
         case OP_TF_BIND: { const p_tf_bind *b = a; if (b->index >= 0 && b->index < 4) rp_S.tf[b->index] = *b; return 1; }

@@ -1498,15 +1498,17 @@ static int bind_stage_at(nvn_gpu_cmd c, const struct rp_prog *pg, int pi, int st
 }
 
 // 绘制时的动态状态（对照 nvn_mtl.m @12740–12776）。返回 0 = 裁剪矩形与目标没有交集：这笔什么都画不出，不发（iOS 同样跳过，不算未接）
-static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th, const void *rec) {
+static int fill_dyn(nvn_gpu_dyn *d, uint32_t tw, uint32_t th) {
     memset(d, 0, sizeof *d);
     d->nvp = 1;
     if (rp_S.has_vp) { memcpy(d->vp[0], rp_S.vp[0], 16); } else { d->vp[0][2] = (float)tw; d->vp[0][3] = (float)th; }
     d->vp[0][4] = rp_S.dr[0]; d->vp[0][5] = rp_S.dr[1];
-    // 视口重排：只认「y 取反」（等于视口上下翻，正面判定在它之后做，绕序状态不用动）；其余重排照没重排画，记一笔
-    { uint32_t sw; memcpy(&sw, rp_S.vp_sw[0], 4);
-      if (sw == 0x100) { d->vp[0][1] += d->vp[0][3]; d->vp[0][3] = -d->vp[0][3]; }
-      else if (sw) nvn_unimpl("gpu", "viewport_swizzle", rec); }
+    // Pure Y negation can use the Vulkan 1.1 negative-height viewport.
+    // Other selections run in the last raster shader, before clipping.
+    if (!rp_S.vp_sw[0][0] && rp_S.vp_sw[0][1] == 1 && !rp_S.vp_sw[0][2] && !rp_S.vp_sw[0][3]) {
+        d->vp[0][1] += d->vp[0][3];
+        d->vp[0][3] = -d->vp[0][3];
+    }
     // 裁剪矩形夹到目标范围内（原生接口不收负的起点；宽高是游戏给的任意数）
     if (rp_R.has_sc) {
         p_scissor sc;
@@ -1617,6 +1619,14 @@ static nvn_gpu_pipe_desc replay_pipe_desc(const p_set_rt *rt, uint32_t prim, int
     pd.poly.front = (((rp_S.poly.front == NVN_FRONT_FACE_CCW) != (s2a_nvn_rast_flip != 0)) != (pd.origin_ll != 0)) ? NVN_FRONT_FACE_CCW : NVN_FRONT_FACE_CW;
     pd.depth_clamp = (uint8_t)(rp_S.depth_clamp != 0);
     pd.clip_neg1 = (uint8_t)(g_prog->z_raw && clip_neg1);   // 程序没做 near = -w 的深度改写：交给管线（只在 CAP_DEPTH_CLIP_CTL 时会出这种程序）
+    for (unsigned k = 0; k < 4; k++) pd.vp_swizzle |= (uint16_t)(rp_S.vp_sw[0][k] & 7u) << (3 * k);
+    if (pd.vp_swizzle == (1u << 3)) pd.vp_swizzle = 0;  // handled by fill_dyn
+    if (pd.vp_swizzle && clip_neg1 && !pd.clip_neg1) {
+        // An X/Y-only permutation without a Z input keeps host Z/W intact.
+        unsigned x = pd.vp_swizzle & 7u, y = ((pd.vp_swizzle >> 3) & 7u) ^ 2u;
+        if ((pd.vp_swizzle >> 6) || (x >> 1) == 2 || (y >> 1) == 2)
+            pd.vp_swizzle |= NVN_GPU_VP_SWIZZLE_Z_REMAP;
+    }
     return pd;
 }
 
@@ -2171,7 +2181,7 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
       if (!tw) tw = 1;
       if (!th) th = 1; }
     DT(RP_PERF_D_PIPE);
-    nvn_gpu_dyn dyn; if (!fill_dyn(&dyn, tw, th, rec)) goto draw_done;
+    nvn_gpu_dyn dyn; if (!fill_dyn(&dyn, tw, th)) goto draw_done;
     nvn_gpu_set_dyn(c, &dyn);
     for (int i = 0; i < 16; i++) if (streams >> i & 1) nvn_gpu_set_vbuf(c, (uint32_t)i, vb_buf[i], vb_off[i]);
     if (zattr) {   // 零属性的流：每笔从暂存区取 16 字节全 0
