@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+// Each invocation packs one guest word from transfer-buffer texels.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Source { uint words[]; } src;
+layout(set=0, binding=1, std430) writeonly buffer Packed { uint words[]; } dst;
+layout(push_constant) uniform Params { uint usedRow, guestPixel, hostPixel, format, channels, hostComponent; } p;
+uint hostBits(uint pos) {
+    return src.words[pos / 4u] >> (8u * (pos % 4u));
+}
+
+// Expand IEEE binary16 from its transferred bits using only 32-bit operations.
+float halfValue(uint raw) {
+    uint exponent = (raw >> 10u) & 31u;
+    uint fraction = raw & 1023u;
+    uint sign = (raw & 0x8000u) << 16u;
+    if (exponent == 31u) return uintBitsToFloat(sign | 0x7f800000u | (fraction << 13u));
+    if (exponent != 0u) return uintBitsToFloat(sign | ((exponent + 112u) << 23u) | (fraction << 13u));
+    float subnormal = float(fraction) * (1.0 / 16777216.0);
+    return sign == 0u ? subnormal : -subnormal;
+}
+
+// The scaled 8/16-bit integers fit exactly in the expanded FP16/FP32 component.
+uint scaled(uint pos, bool signedValue, uint bits) {
+    float x = p.hostComponent == 2u ? halfValue(hostBits(pos)) : uintBitsToFloat(hostBits(pos));
+    if (isnan(x)) x = 0.0;
+    float upper = float((1u << (signedValue ? bits - 1u : bits)) - 1u);
+    float lower = signedValue ? -upper - 1.0 : 0.0;
+    return uint(int(roundEven(clamp(x, lower, upper))));
+}
+
+uint packed1010102(uint srcPos) {
+    uint result = 0u;
+    for (uint c = 0u; c < 4u; ++c) {
+        uint bits = c == 3u ? 2u : 10u;
+        uint pos = srcPos + c * p.hostComponent;
+        uint val;
+        if (p.format == 0x69u) {
+            int sn = bitfieldExtract(int(hostBits(pos)), 0, 16);
+            int maximum = (1 << (bits - 1u)) - 1;
+            val = uint(sn == -32768 ? -maximum - 1 : int(roundEven(float(sn * maximum) / 32767.0)));
+        } else {
+            val = p.format == 0x6au ? hostBits(pos) : scaled(pos, p.format == 0x6cu, bits);
+        }
+        result |= (val & ((1u << bits) - 1u)) << (c * 10u);
+    }
+    return result;
+}
+void main() {
+    uint word = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (word * 4u >= p.usedRow) return;
+    uint value = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint pos = 4u * word + lane;
+        if (pos >= p.usedRow) break;
+        uint pixel = row * (p.usedRow / p.guestPixel) + pos / p.guestPixel;
+        uint srcPos = pixel * p.hostPixel;
+        uint byteInPixel = pos % p.guestPixel;
+        uint component;
+        if (p.format < 0x51u) {
+            component = hostBits(srcPos + byteInPixel);
+        } else if (p.format >= 0x69u) {
+            component = packed1010102(srcPos) >> (8u * byteInPixel);
+        } else {
+            uint size = p.guestPixel / p.channels;
+            uint val = scaled(srcPos + (byteInPixel / size) * p.hostComponent, (p.format & 1u) == 0u, 8u * size);
+            component = val >> (8u * (byteInPixel % size));
+        }
+        value |= (component & 255u) << (8u * lane);
+    }
+    dst.words[row * ((p.usedRow + 3u) / 4u) + word] = value;
+}

@@ -124,7 +124,7 @@ int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd ch, nvn_gpu_tex tex, nvn_gpu_tex *replace
             set_sticky(c, NVN_GPU_E_ARG, "BC1 恢复 RGBA8：压缩影子布局越界");
             break;
         }
-        if (!bc_shadow_ensure(c, target, total)) break;
+        if (!raw_shadow_ensure(c, target, total)) break;
         for (uint32_t layer = 0; layer < layers && rc_is(c->sticky, NVN_GPU_OK); layer++) {
             const uint64_t at = offset + (uint64_t)layer * plane;
             bc_record_slice(c, target, t->bc_sbuf, at, ((uint64_t)h + 3) / 4, row, at, row,

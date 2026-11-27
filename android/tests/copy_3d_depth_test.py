@@ -19,11 +19,6 @@ match = re.search(r'static void bc_copy_from_buf\([^;]+\);', src)
 if not match:
     raise RuntimeError('production bc_copy_from_buf declaration not found')
 bc_upload_signature = match.group(0)[:-1]
-d24 = (root / 'android/native/nvn/backend_vulkan_d24_readback.inc').read_text()
-match = re.search(r'static void d24_readback_copy\([^)]*\) \{', d24)
-if not match:
-    raise RuntimeError('production d24_readback_copy definition not found')
-d24_readback_signature = match.group(0)
 ledger = (root / 'android/native/nvn/backend_vulkan_cold_ledger.inc').read_text()
 match = re.search(r'static void cold_note_write\([^)]*\) \{', ledger)
 if not match:
@@ -48,10 +43,14 @@ preamble = r'''
 #include "nvn_fmt_info.h"
 #define REF_TEX 1
 #define REF_BUF 2
-struct nvn_gpu_tex_s { uint32_t w,h,depth,levels,target,layers,format,nvn_format,aspect; VkImage image; int bc_decoded; };   /* bc_decoded：压缩贴图现解；本测试的贴图都不是 */
+struct nvn_gpu_tex_s { uint32_t w,h,depth,levels,target,layers,format,nvn_format,aspect; VkImage image; int bc_decoded;
+    nvn_gpu_sparse_region *write_regions;
+    uint32_t nwrite_regions;
+    uint8_t scaled32_bytes, scaled32_unknown;
+};   /* bc_decoded：压缩贴图现解；本测试的贴图都不是 */
 struct nvn_gpu_buf_s { VkBuffer buffer; uint64_t size; };
 struct nvn_gpu_cmd_s { int sticky,in_pass,xfer_dirty; VkCommandBuffer cb; };
-static const struct { VkPipeline pipe; } g_d24_readback = {.pipe = VK_NULL_HANDLE};
+static const struct { VkPipeline pipe; } g_d24_readback, g_rgb_readback;
 static int copies, bc_calls, bc_upload_calls; static VkBufferImageCopy last;
 static unsigned cold_writes;
 static struct {
@@ -86,10 +85,16 @@ bc_upload_stub = bc_upload_signature + r''' {
 }
 '''
 # 夹具覆盖原生拷贝的深度边界，替换存储的转换由独立 Vulkan 用例覆盖。
-d24_readback_stub = d24_readback_signature + r'''
+readback_stubs = ''
+for kind in ('d24', 'rgb'):
+    path = root / f'android/native/nvn/backend_vulkan_{kind}_readback.inc'
+    match = re.search(rf'static void {kind}_readback_copy\([^)]*\) \{{', path.read_text())
+    if not match:
+        raise RuntimeError(f'production {kind}_readback_copy definition not found')
+    readback_stubs += match.group(0) + r'''
     (void)t; (void)level; (void)layer; (void)region; (void)dst;
     (void)dst_off; (void)row; (void)image_bytes;
-    set_sticky(c, NVN_GPU_E_UNSUPPORTED, "D24 conversion not implemented by bounds fixture");
+    set_sticky(c, NVN_GPU_E_UNSUPPORTED, "conversion not implemented by bounds fixture");
 }
 '''
 # Record production's handoff to the write ledger at the fixture boundary.
@@ -112,7 +117,7 @@ production = face_enum + '\n' + '\n'.join(function(x) for x in (
     'static VkImageAspectFlags copy_face_aspect(',
     'static const char *readback_refusal(',   # copy_tex_buf 先问它拒不拒收（展开格式 / 替换存储，#1715）；与 NVN_GPU_FMT_READBACK 同一个判断
     'static void copy_region_block_clamp(', 'static int copy_region(', 'static int check_copy_params(',   # block_clamp：#697 小 mip 整块区域裁边，copy_region 调它
-    'static void copy_buf_tex_impl(', 'void nvn_gpu_copy_buf_tex(', 'void nvn_gpu_copy_tex_buf('))   # copy_buf_tex_impl：#422 起 nvn_gpu_copy_buf_tex 是它的薄壳
+    'static int sparse_clip(', 'static void copy_buf_tex_impl(', 'void nvn_gpu_copy_buf_tex(', 'void nvn_gpu_copy_tex_buf('))   # copy_buf_tex_impl：#422 起 nvn_gpu_copy_buf_tex 是它的薄壳
 main = r'''
 static int check_case(int direction, unsigned layer, const NVNcopyRegion *region, int expected, const char *name) {
     struct nvn_gpu_tex_s t = {.w=4,.h=4,.depth=4,.levels=3,.target=NVN_TEXTURE_TARGET_3D,.layers=1};
@@ -172,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix='copy-3d-depth-') as path:
         if (sysinc / name).exists(): (inc / name).symlink_to(sysinc / name)
     def run(name, stub, body, expected=None):
         c_file = d / (name + '.c'); exe = d / name
-        c_file.write_text(preamble + stub + bc_upload_stub + d24_readback_stub + cold_write_stub + body + main)
+        c_file.write_text(preamble + stub + bc_upload_stub + readback_stubs + cold_write_stub + body + main)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                         '-I' + str(inc), '-I' + str(root/'graphics/nvn/gfx/nvn'),
                         '-I' + str(root/'graphics/nvn/gfx/nvn/include'),

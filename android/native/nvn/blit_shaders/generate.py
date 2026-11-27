@@ -56,3 +56,10 @@ with tempfile.TemporaryDirectory(prefix='s2a-drawtex-shaders-') as directory:
     emit(directory, 'draw_tex.vert', 'vs', dtxl, 'k_dtx_')
     emit(directory, 'draw_tex.frag', 'fs', dtxl, 'k_dtx_')
 (here.parent/'backend_vulkan_draw_tex_spv.h').write_text('\n'.join(dtxl)+'\n')
+
+# Three-channel readback shares the original guest RGB bits with host RGBA.
+rgb = ['// SPDX-License-Identifier: Apache-2.0',
+       '// Generated from blit_shaders/rgb_readback.comp by blit_shaders/generate.py.', '#pragma once']
+with tempfile.TemporaryDirectory(prefix='s2a-rgb-readback-') as directory:
+    emit(directory, 'rgb_readback.comp', 'readback', rgb, 'k_rgb_')
+(here.parent/'backend_vulkan_rgb_readback_spv.h').write_text('\n'.join(rgb)+'\n')

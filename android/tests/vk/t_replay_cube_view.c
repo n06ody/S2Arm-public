@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // 声明与登记目标相同时，用真实回放资源、Vulkan 视图和采样读回检查立方体的范围。
 #define main backend_fixture_main
+#define nvn_plat_flag fixture_base_flag
 #include "t_backend_vk.c"
 #undef main
+#undef nvn_plat_flag
 #include "rp_exec.h"
 #include "rp_res.h"
 #include "nvn_tex.h"
@@ -14,6 +16,12 @@
 static void (*prepare_write)(void *, size_t);
 void dm_fault_hook_register(int (*fn)(void *, int, void *)) { CHECK(fn != NULL, "dirty fault hook"); }
 void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { prepare_write = fn; }
+
+static int fixture_sparse_native;
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_sparse_native_mb")) return fixture_sparse_native < 0 ? -1 : fixture_sparse_native ? 0 : dflt;
+    return fixture_base_flag(name, dflt);
+}
 
 int rp_tm_on;
 static nvn_gpu_cmd active;
@@ -44,13 +52,16 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImageView(
     return rc;
 }
 
-static void finish(nvn_gpu_cmd cmd) {
-    static uint64_t signal;
+static uint64_t fixture_signal;
+static void finish_expected(nvn_gpu_cmd cmd, int want) {
+    const uint64_t signal = ++fixture_signal;
     nvn_gpu_err err = {0};
-    ++signal;
-    CHECK(OK(nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err)), "submit: %s", err.why);
-    CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
+    const nvn_gpu_rc result = nvn_gpu_cmd_commit(cmd, signal, on_done, NULL, &err);
+    CHECK(result.code == want, "submit code=%d expected=%d: %s", result.code, want, err.why);
+    if (want == NVN_GPU_OK) CHECK(OK(nvn_gpu_fence_wait(signal, 5000000000ull, &err)), "wait: %s", err.why);
+    else CHECK(strstr(err.why, "sparse_snapshot_write"), "sparse write must give a named rejection: %s", err.why);
 }
+static void finish(nvn_gpu_cmd cmd) { finish_expected(cmd, NVN_GPU_OK); }
 
 static void sample(const char *dir, const char *frag, nvn_gpu_view sv, int format, void *pixels) {
     const size_t row = 64 * (format == NVN_FORMAT_RG32F ? 8 : 4);
@@ -221,14 +232,84 @@ static void sample_mixed_pool(const char *dir) {
     rp_res_reset();
     nvn_dirty_remove_range(mem); munmap(mem, size);
 }
+#include "sparse_residency_test.h"
+
+// Independently exercise source decoding, destination encoding, and integer
+// clear through views of UNORM storage. Neighbor layers carry a sentinel.
+static void check_override_writer(const char *which) {
+    const int clear = !strcmp(which, "clear"), decode = !strcmp(which, "decode");
+    const uint32_t usage = NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_VIEW_FMT | (clear ? NVN_GPU_TEX_STORAGE : 0);
+    nvn_gpu_tex src = make_tex(2, 2, NVN_FORMAT_RGBA8, usage);
+    nvn_gpu_tex dst = make_tex_target(2, 2, 2, NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, usage);
+    const uint8_t gray[16] = {128,128,128,61,128,128,128,61,128,128,128,61,128,128,128,61};
+    uint8_t seed[16]; memset(seed, 0xa3, sizeof seed);
+    const view_t src_type = {.set_format = decode, .format = NVN_FORMAT_RGBA8_SRGB};
+    const view_t dst_type = {.set_format = !decode, .format = clear ? NVN_FORMAT_RGBA8UI : NVN_FORMAT_RGBA8_SRGB,
+                             .set_layers = 1, .min_layer = 1, .nlayers = 1};
+    nvn_gpu_err err = {0};
+    nvn_gpu_view sv = NULL, dv = NULL;
+    CHECK(OK(nvn_gpu_view_create(src, &src_type, &sv, &err)), "source view: %s", err.why);
+    CHECK(OK(nvn_gpu_view_create(dst, &dst_type, &dv, &err)), "destination view: %s", err.why);
+    nvn_gpu_buf read = make_buf(32, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_tex_upload(c, src, 0, 0, NULL, gray, 8, 16);
+    CHECK(nvn_gpu_cmd_record_ok(c), "source upload");
+    for (unsigned l = 0; l < 2; l++) nvn_gpu_tex_upload(c, dst, 0, l, NULL, seed, 8, 16);
+    CHECK(nvn_gpu_cmd_record_ok(c), "dest upload");
+    const uint32_t ints[4] = {19, 37, 71, 131};
+    const NVNcopyRegion box = {0,0,0,2,2,1};
+    if (clear) nvn_gpu_clear_view(c, dv, NULL, ints, 1);
+    else nvn_gpu_blit(c, sv, &box, dv, &box, 0);
+    for (unsigned l = 0; l < 2; l++) nvn_gpu_copy_tex_buf(c, dst, 0, l, NULL, read, l * 16, 8, 16);
+    nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &err);
+    CHECK(OK(rc), "override %s submit: %d %s", which, rc.code, err.why);
+    if (OK(rc)) {
+        rc = nvn_gpu_fence_wait(1, 5000000000ull, &err);
+        CHECK(OK(rc), "override %s wait: %s", which, err.why);
+    }
+    if (OK(rc)) {
+        const uint8_t *buf = buf_cpu(read);
+        unsigned wrong = 0, neighbor = 0;
+        for (unsigned i = 0; i < 16; i++) {
+            int expected = clear ? (int)ints[i % 4] : i % 4 == 3 ? 61 : decode ? 55 : 188;
+            wrong += abs((int)buf[16 + i] - expected) > (!clear && i % 4 != 3);
+            neighbor += buf[i] != seed[i];
+        }
+        printf("override %s data_errors=%u/16 neighbor_errors=%u/16\n", which, wrong, neighbor);
+        CHECK(!wrong && !neighbor, "override %s wrong pixel bytes", which);
+    }
+    nvn_gpu_buf_release(read, NULL, NULL);
+    if (sv) nvn_gpu_view_release(sv);
+    if (dv) nvn_gpu_view_release(dv);
+    nvn_gpu_tex_release(src);
+    nvn_gpu_tex_release(dst);
+}
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    const int writer = argc == 5 && !strcmp(argv[2], "sparse-write");
+    const int override = argc == 4 && !strcmp(argv[2], "override");
+    if (argc != 2 && !writer && !override) return 2;
     char why[256] = {0};
     if (s2a_vk_device_create(&g_dev, why, sizeof why)) { fprintf(stderr, "device: %s\n", why); return 2; }
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
     g_desc = (nvn_gpu_open_desc){.host_device = &g_dev, .app_label = "replay-cube-view"};
     if (!open_backend()) return 2;
+    if (override) {
+        check_override_writer(argv[3]);
+        nvn_gpu_err err = {0};
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "override close: %s", err.why);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
+    if (writer) {
+        const int native = atoi(argv[4]);
+        if (!native || sparse_fixture_probe()) check_sparse_writer(argv[3], native);
+        else CHECK(0, "required native sparse support missing");
+        nvn_gpu_err err = {0};
+        CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "sparse writer close: %s", err.why);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     for (unsigned i = 0; i < 12; i++) {
         colors[i][0] = 17 + 11 * i;
         colors[i][1] = 31 + 13 * i;
@@ -275,6 +356,10 @@ int main(int argc, char **argv) {
                  VK_IMAGE_VIEW_TYPE_2D_ARRAY, 1, 5, 1);
     sample_mixed_pool(argv[1]);
     rp_res_reset();
+    const int sparse_native_supported = sparse_fixture_probe();
+    check_sparse_residency(0);
+    if (sparse_native_supported) check_sparse_residency(1);
+    check_large_sparse(sparse_native_supported);
     nvn_gpu_err err = {0};
     CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "close: %s", err.why);
     s2a_vk_device_destroy(&g_dev, 1);

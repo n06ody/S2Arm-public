@@ -384,7 +384,7 @@ case "$mode" in
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
     --pipe-call-lifetime) cflags+=(-DS2A_BACKEND_PIPE_CALL_TEST=1) ;;
-    ""|--pipe-creation-feedback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--pipe-creation-feedback|--high-binding|--expanded-readback|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
@@ -599,6 +599,23 @@ if [[ "$mode" == --pipe-creation-feedback* ]]; then
     exit "$rc"
 fi
 
+if [ "$mode" = "--expanded-readback" ]; then
+    passed=0
+    status=0
+    for fmt in 0 {25..36} {81..108}; do
+        log="$out/expanded-readback-$fmt.log"
+        if timeout 60 "$out/t_backend_vk" "$out/shaders" "$mode" "$fmt" >"$log" 2>&1 &&
+           grep -qx 'expanded readback failures=0' "$log" &&
+           ! grep -Eq 'Validation Error|SYNC-HAZARD|VUID-' "$log"; then
+            if [ "$fmt" != 0 ]; then passed=$((passed+1)); fi
+        else
+            status=1
+            cat "$log"
+        fi
+    done
+    echo "expanded readback formats=$passed/40"
+    exit "$status"
+fi
 if [ "$mode" = "--high-binding" ]; then
     timeout 120 "$out/t_backend_vk" "$out/shaders" --high-binding 2>&1 | tee "$out/high-binding.log"
     if ! grep -q 'HIGH_BINDING failures=0' "$out/high-binding.log" || grep -Eq 'Validation Error|VUID-' "$out/high-binding.log"; then

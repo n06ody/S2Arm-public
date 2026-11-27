@@ -25,11 +25,36 @@ for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_state.c graphics/nv
 done
 cc -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
-    -Wl,--gc-sections -Wl,--wrap=vkCreateImageView -lvulkan -lpthread -lm -o "$out/test"
+    -Wl,--gc-sections -Wl,--wrap=vkCreateImageView -Wl,--wrap=vkQueueBindSparse \
+    -Wl,--wrap=vkCreateImage -Wl,--wrap=vkAllocateMemory -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_VALIDATE_SYNC=1
-unset VK_LAYER_ENABLES
-timeout 90 "$out/test" "$out/shaders" 2>&1 | tee "$out/run.log"
-grep -q 'device: llvmpipe' "$out/run.log"
-grep -q 'replay cube view failures=0' "$out/run.log"
-if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/run.log"; then exit 1; fi
+unset VK_LAYER_ENABLES S2A_TEST_RENDER_AUDIT S2A_TEST_NVK_DQ
+if [ "${1:-}" = "--sparse-write" ]; then
+    rc=0
+    for native in 0 1; do
+        for op in buffer image clear blit; do
+            log="$out/sparse-$op-$native.log"
+            timeout 90 "$out/test" "$out/shaders" sparse-write "$op" "$native" > "$log" 2>&1 || rc=1
+            cat "$log"
+            grep -qx "sparse writer $op native=$native resident_errors=0/32768 hole_errors=0/32768 mip_errors=0/16384" "$log" || rc=1
+            grep -qx "sparse remap $op native=$native retained_errors=0/16384 mapping_errors=0/49152" "$log" || rc=1
+            if grep -Eq 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then rc=1; fi
+        done
+    done
+    for op in clear decode encode; do
+        log="$out/override-$op.log"
+        timeout 90 "$out/test" "$out/shaders" override "$op" > "$log" 2>&1 || rc=1
+        cat "$log"
+        grep -qx "override $op data_errors=0/16 neighbor_errors=0/16" "$log" || rc=1
+        if grep -Eq 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then rc=1; fi
+    done
+    exit "$rc"
+fi
+for dq in 0 1; do
+    if [ "$dq" -eq 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+    timeout 90 "$out/test" "$out/shaders" 2>&1 | tee "$out/run-dq-$dq.log"
+    grep -q 'device: llvmpipe' "$out/run-dq-$dq.log"
+    grep -q 'replay cube view failures=0' "$out/run-dq-$dq.log"
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/run-dq-$dq.log"; then exit 1; fi
+done

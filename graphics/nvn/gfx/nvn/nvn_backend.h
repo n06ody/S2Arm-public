@@ -114,6 +114,7 @@ enum {
                                                //   其余视图剥掉存储用途）。Vulkan（1.1+）置位；Metal 不置位，核心照旧按「不可写」跳过
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
+    NVN_GPU_CAP_TEX_SPARSE        = 1u << 27,  // v27：页驻留稀疏纹理；第 26 位留给网格计算模拟
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
@@ -150,7 +151,7 @@ enum {
     NVN_GPU_FMT_STORAGE = 1u << 4, NVN_GPU_FMT_DEPTH = 1u << 5, NVN_GPU_FMT_ATOMIC = 1u << 6, NVN_GPU_FMT_VERTEX = 1u << 7,
     NVN_GPU_FMT_FB_FETCH = 1u << 8,   // 作颜色附件时片元着色器可读本像素（Metal [[color(n)]] / Vulkan rasterization_order_attachment_access 等，按格式开）
     NVN_GPU_FMT_SUBST = 1u << 9,      // 有对应但不是同一种存储（BGRA 换 RGBA、D24 换 D32）：读写语义同，逐字节拷贝要核心换算
-    NVN_GPU_FMT_READBACK = 1u << 10,  // nvn_gpu_copy_tex_buf 拷出来的就是 NVN 的逐字节内容（ReadTexels 读 GPU 内容的前提）。不含：SUBST 的、深度模板合一的
+    NVN_GPU_FMT_READBACK = 1u << 10,  // nvn_gpu_copy_tex_buf 拷出来的就是 NVN 的逐字节内容（ReadTexels 读 GPU 内容的前提）。替换存储仅在后端可打包出客体字节时置位
                                       //   （只拷得出深度面）、D24（深度面高 8 位未定义）。后端 copy_tex_buf 拒收的格式一定没有这一位（两处用同一个判断）
 };
 typedef struct {
@@ -227,6 +228,18 @@ typedef struct { uint32_t w, h, depth, levels, layers, samples; uint32_t nvn_for
 // 建贴图存储。内容未定义。身份（serial、别名、同池同偏移复用）全在核心，后端不缓存贴图。线程：[任意]。
 // 出错：NVN_GPU_E_UNSUPPORTED（格式 / 用途组合不支持，why 写格式号与用途位）、NVN_GPU_E_OOM。
 nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err);
+// 可选稀疏快照接口。每项覆盖一个客体页或一个客体尾级，两者都用像素区域表示。
+// resident 为 0 的项默认不上传。后端若将它落在物理尾级，设置 upload，调用方写零。
+// 后端负责建立绑定和初始化共享零块。其余 upload 项由调用方录制。写入范围取自快照的驻留区域。
+typedef struct {
+    NVNcopyRegion region;
+    uint32_t level, layer;
+    uint8_t resident, upload;
+} nvn_gpu_sparse_region;
+nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
+    nvn_gpu_sparse_region *regions, uint32_t count, int native, nvn_gpu_tex *out, nvn_gpu_err *err);
+nvn_gpu_rc nvn_gpu_tex_sparse_upload(nvn_gpu_cmd c, nvn_gpu_tex t, const nvn_gpu_sparse_region *region,
+    const void *bytes, uint64_t pitch, uint64_t size);
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out);   // 实际尺寸与格式（宽屏挂点读宿主宽高）。线程：[任意]
 // 可选：整张 CPU 块线性快照上传时为已证不透明的 BC1 选宿主压缩存储。
 // 返回 1 = 已录完整上传，0 = 沿用普通上传，-1 = 失败（命令段报错）。
@@ -255,6 +268,7 @@ nvn_gpu_tex nvn_gpu_view_texture(nvn_gpu_view v);
 nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err);
 void nvn_gpu_samp_release(nvn_gpu_samp s);
 // 线性内容上传（解排布 / 解压已由核心做完）：在本 cmd 的 GPU 顺序里生效，src 调用返回后即可释放。线程：[提交]，通道外。出错：粘滞 ORDER / ARG。
+int nvn_gpu_cmd_record_ok(nvn_gpu_cmd c);
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
                         const void *src, uint64_t row_bytes, uint64_t image_bytes);
 // 块线性原始字节上传，由后端在 GPU 上解排布（要 CAP_GPU_DESWIZZLE）；L 为 NVN 排布（nvn_tex_layout 的结果）。

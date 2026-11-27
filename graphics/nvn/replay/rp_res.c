@@ -33,7 +33,10 @@ struct rp_tex {
     uint8_t check_dirty;       // 上次核对内容时判过脏、但没能传（没有段 / 上传失败）：下一次必须重查
     uint8_t log_ok;            // 在所属池的脏页追加日志上有游标（log_span / log_id / log_cur）：核对只读游标之后的事件、与本贴图范围求交
     uint8_t unarmed;           // 最近一次上传时有页加保护没落地（被并发的解保护挡住、此刻仍可写）：之后的写可能不缺页、不进日志也不推代号，这次上传不算同步
-    uint8_t sparse;            // 虚拟池里的压缩贴图（sparse_cpu_tex）：内容按页表读；没有跟踪区间（span 恒空），按映射代号 + 背后物理页的写代号判脏
+    uint8_t sparse;            // 虚拟池里的贴图（sparse_cpu_tex）：内容按页表读；没有跟踪区间（span 恒空），按映射代号 + 背后物理页的写代号判脏
+    uint8_t sparse_native;      // 以 Vulkan 稀疏绑定实现驻留
+    uint8_t sparse_snapshot;    // 原生和有界二维兼容图均保留客体页的写范围
+    uint64_t sparse_upload_epoch;
     int nreg;                  // 登记表（g_treg）里视图建在这份存储上的项数：存储放掉时据此决定要不要扫登记表（见 tex_free）
     struct tex_byte_cache *byte_cache;
     uint64_t byte_upload_sub, byte_upload_epoch;
@@ -311,7 +314,7 @@ void rp_tex_mark_gpu_written(const tex_t *t) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_rmu);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
-    if (x) { tex_bytes_drop(x); x->gpu_written = 1; x->cpu = 0; x->wrote = rp_sub_serial() + 1; }
+    if (x && !x->sparse_snapshot) { tex_bytes_drop(x); x->gpu_written = 1; x->cpu = 0; x->wrote = rp_sub_serial() + 1; }
     pthread_mutex_unlock(&g_rmu);
 }
 
@@ -369,17 +372,15 @@ const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part) {
 //   for_upload = 0（cpu_content 判「要不要当 CPU 贴图持续跟踪」、upload_linear_dirty 判「能不能按脏行传」）照旧：只有 LINEAR_RENDER_TARGET 的内容归 GPU。
 static int linear_class(const tex_t *t, const char **why, int initial) {
     *why = NULL;
-    if (!(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))) return 0;
-    if (initial) {
-        // 真要传：排布只看 LINEAR / LINEAR_RENDER_TARGET（同苹果端 nvn_mtl.m 的 lin）。SPARSE 只说驻留方式、不改排布：
-        //   只带 SPARSE 的是普通块线性贴图，不进线性族；带 SPARSE 的线性贴图照线性逐行拷。真在虚拟池里的由下面「池不可 CPU 访问」拦下，
-        //   虚拟池里的压缩贴图走 x->sparse 那条（upload_all 不进这里）。原先这里一律当「线性加稀疏」拒：11-21 同一款带存档局一局 442 万次、整屏黑
-        if (!(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
-            // 只带 SPARSE、又在虚拟池 / CPU 不可访问的池里（虚拟池里的非压缩贴图，x->sparse 不收）：内容不在 CPU 读得到的地方，照旧不传、不读
-            if (t->pool && (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) { *why = "linear_sparse_unsupported"; return -1; }
-            return 0;
+    if (!(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
+        if (initial && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->pool &&
+            (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) {
+            *why = "linear_sparse_unsupported";
+            return -1;
         }
-    } else {
+        return 0;
+    }
+    if (!initial) {
         if (!(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR)) { *why = "linear_render_target_unsupported"; return -1; }   // 只有 LINEAR_RENDER_TARGET：内容通常归 GPU
         if (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) { *why = "linear_render_target_and_linear_unsupported"; return -1; }
         if (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) { *why = "linear_sparse_unsupported"; return -1; }
@@ -397,7 +398,7 @@ static int linear_class(const tex_t *t, const char **why, int initial) {
     return 1;
 }
 
-// ---------- 虚拟池（稀疏池）里的压缩贴图：内容在映射到那里的物理页里，按页表读 ----------
+// ---------- 虚拟池里的贴图：按页表读物理页 ----------
 // 一类 3D 游戏把整块显存做成一个虚拟池，贴图建在虚拟池的地址段里；游戏用 CPU 把内容写进物理池的页，再用 MapVirtual 映射到贴图的地址上（没有 GPU 拷贝写它们）。
 // 虚拟池在宿主上占一段预留的、不可访问的地址，映射请求把物理页别名进去；NVN 按 4 KB 映射、宿主按自己的页（16 KB）别名，起点不按宿主页对齐的请求
 // （这类游戏的 ASTC 6x6 贴图，mip 尾从贴图头 0x81000 处起）或超出预留范围的请求别名不上：那些页直接读是不可访问的预留页，只能按前端的页表读（hle_nvn.c nvn_sparse_*）。
@@ -406,7 +407,7 @@ static int linear_class(const tex_t *t, const char **why, int initial) {
 //   ASTC 全零块解出错误色（洋红）、BC 全零块解出黑；游戏之后再映射 / 再写，也没有任何重传。
 //   带随包布局（has_layout）、标志只有 SPARSE 的更糟：cpu_content 先判随包布局、当普通 CPU 内容，upload_all 的 linear_class 再把 SPARSE 标志当线性族拒掉
 //   （tex linear_render_target_unsupported，真机一局 154131 次、约每帧 15 张），一次都没传过。所以 cpu_content 里本节的判断要先于随包布局。
-// 只收压缩格式：压缩格式不能当渲染目标，不会和每帧重建、走共用表（g_alias）的渲染目标混；未压缩的虚拟池贴图照旧（里面有渲染目标，改分类要另看读数）。
+// 未标 SPARSE 的虚拟池贴图只按已有路径接受压缩格式，保留普通渲染目标的归属规则。
 // 前端的页表读取是弱链接：宿主单测不链前端时地址为空，一律当「不是虚拟池」走原路（没有就是没有，不返回成功兜底）。
 // 弱链接登记（tools/weak_link_decl.py，场合 replay）：
 // 弱链接[replay]：nvn_sparse_pool
@@ -428,26 +429,49 @@ int nvn_sparse_runs(const void *pool, uint64_t a, uint64_t n, uint64_t (*out)[2]
 enum { SPARSE_TEX_MAX = 256 << 20, SPARSE_CHUNK = 1 << 20, SPARSE_RUNS_MAX = 16384 };
 // 开关 nvk_sparse_tex（缺省开）：关了照旧（虚拟池里的压缩贴图没有内容来源）。创建贴图时读一次；调试 / A/B 用，正式包恒缺省
 static int sparse_tex_on(void) {
-    static int v = -1; static unsigned k;
-    if (v < 0 || !(++k & 255)) v = nvn_plat_flag("nvk_sparse_tex", 1) != 0;
-    return v;
+    return nvn_plat_flag("nvk_sparse_tex", 1) != 0;
 }
-// 这张贴图是不是「虚拟池里内容来自物理页的压缩贴图」：渲染目标 / 图像 / 线性 / 缓冲 / 深度 / 多重采样的不是（同 iOS 的排除项）
+// 识别虚拟池内可以从物理页读取的采样贴图（同 iOS 的用途排除项）。
 static int sparse_cpu_tex(const tex_t *t) {
     if (!nvn_sparse_pool || !nvn_sparse_copy || !t->mem || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
-    if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || fmt_depth(t->d.format) || !fmt_compressed(t->d.format)) return 0;
+    if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || fmt_depth(t->d.format)) return 0;
+    if (!fmt_compressed(t->d.format) && !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) return 0;
     if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE |
                       NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) return 0;
     if (!t->L.size || !sparse_tex_on() || !nvn_sparse_pool(t->pool)) return 0;
-    if (t->L.size > SPARSE_TEX_MAX) { nvn_unimpl("limit", "tex_sparse_pool_too_large", t); return 0; }   // 整张读成一份副本放不下：照旧没有内容来源，报红
     return 1;
 }
+static uint64_t sparse_fill(const tex_t *t, uint64_t addr, uint8_t *dst, uint64_t size) {
+    uint64_t missing = 0;
+    for (uint64_t offset = 0; offset < size; offset += SPARSE_CHUNK) {
+        const uint64_t bytes = size - offset < SPARSE_CHUNK ? size - offset : SPARSE_CHUNK;
+        missing += nvn_sparse_copy(t->pool, dst + offset, addr + offset, bytes);
+    }
+    return missing;
+}
+
+int rp_tex_sparse_cpu(const tex_t *t) { return sparse_cpu_tex(t); }
+
+int rp_tex_deswizzle_sparse_level(const tex_t *t, unsigned level, unsigned layer, void *linear, size_t pitch) {
+    const uint64_t start = nvn_tex_level_offset(&t->d, level);
+    const uint64_t end = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
+    if (start >= end || end > t->L.layer_size || layer >= t->L.layers) return NVN_GPU_E_ARG;
+    if (end - start > SPARSE_TEX_MAX) return NVN_GPU_E_OOM;
+    uint8_t *raw = malloc((size_t)(end - start));
+    if (!raw) return NVN_GPU_E_OOM;
+    const uint64_t addr = (uint64_t)(uintptr_t)t->mem + (uint64_t)layer * t->L.layer_size + start;
+    sparse_fill(t, addr, raw, end - start);
+    const int res = nvn_deswizzle_level(&t->d, level, raw, linear, pitch);
+    free(raw);
+    return res ? NVN_GPU_E_ARG : NVN_GPU_OK;
+}
+
 // 整段存储的副本：按页表读，没映射的页按 0；分块读，不在前端的页表锁里一口气拷几十兆。*miss = 没映射的字节数。NULL = 副本分配失败
 static uint8_t *sparse_read(const tex_t *t, uint64_t *miss) {
-    const uint64_t n = t->L.size, a = (uint64_t)(uintptr_t)t->mem; uint64_t m = 0;
+    const uint64_t n = t->L.size, a = (uint64_t)(uintptr_t)t->mem;
     uint8_t *buf = malloc(n ? (size_t)n : 1);
     if (!buf) return NULL;
-    for (uint64_t p = 0; p < n; p += SPARSE_CHUNK) { const uint64_t k = n - p < SPARSE_CHUNK ? n - p : SPARSE_CHUNK; m += nvn_sparse_copy(t->pool, buf + p, a + p, k); }
+    const uint64_t m = sparse_fill(t, a, buf, n);
     if (miss) *miss = m;
     return buf;
 }
@@ -480,13 +504,17 @@ static int sparse_clean(struct rp_tex *x, const tex_t *t) {
 static int cpu_content(const tex_t *t, int *sparse) {
     *sparse = 0;
     if (!t->mem || !t->pool || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    if (nvn_hm_get(&g_cpu_ser, &t->serial)) return 1;   // WriteTexels 写过（字节写在游戏看得到的地址上，照旧直接读）
-    if (sparse_cpu_tex(t)) { *sparse = 1; return 1; }   // 虚拟池里的压缩贴图：内容在映射到那里的物理页里（上传时按页表读，见上）；随包布局的也走这里，所以先于下一行
+    const int virtual_pool = t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL;
+    if ((!virtual_pool || !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) && nvn_hm_get(&g_cpu_ser, &t->serial)) return 1;
+    if (virtual_pool) {
+        *sparse = sparse_cpu_tex(t);
+        return *sparse;
+    }
     if (t->has_layout) return 1;   // 随包贴图
     uint64_t pk = (uint64_t)(uintptr_t)t->pool;
     int unc = !fmt_compressed(t->d.format) && t->d.target != NVN_TEXTURE_TARGET_3D;
     if (unc && (fmt_depth(t->d.format) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) || nvn_hm_get(&g_pool_gpu, &pk))) return 0;
-    if (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    if (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) return 0;
     { const char *why = NULL; int lc = linear_class(t, &why, 0);
         if (lc > 0) return 1;                 // 线性准入：初始全零也进入持续观察（首用之后 CPU 再写也会被脏页跟踪接住）
         if (lc < 0) {
@@ -574,6 +602,17 @@ static void tex_replace_storage(struct rp_tex *x, nvn_gpu_tex next) {
     rp_dirty_all();
     nvn_gpu_tex_release(old);
 }
+
+// 弱链接[replay]：nvn_sparse_map_any_bits
+// 弱链接[replay]：nvn_gpu_tex_sparse_create
+// 弱链接[replay]：nvn_gpu_tex_sparse_upload
+// 弱链接[replay]：nvn_gpu_cmd_record_ok
+uint64_t nvn_sparse_map_any_bits(const void *, uint64_t, uint64_t, uint8_t *) __attribute__((weak));
+__typeof__(nvn_gpu_tex_sparse_create) nvn_gpu_tex_sparse_create __attribute__((weak));
+__typeof__(nvn_gpu_tex_sparse_upload) nvn_gpu_tex_sparse_upload __attribute__((weak));
+__typeof__(nvn_gpu_cmd_record_ok) nvn_gpu_cmd_record_ok __attribute__((weak));
+
+#include "rp_sparse_tex.inc"
 
 static int tex_require_plain(struct rp_tex *x, nvn_gpu_cmd c) {
     if (!nvn_gpu_tex_bc1_unwrap) return 1;
@@ -792,7 +831,8 @@ static int init_from_storage(const tex_t *t) {
     if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || fmt_depth(t->d.format)) return 0;
     int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
     if (no_cpu && (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;   // CPU 不能访问的池里带压缩提示的贴图：那段内存对 CPU 可能没有意义
-    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) return 0;   // 线性 / 稀疏的上传还没接（upload_all 记账）
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;
+    if (no_cpu && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) return 0;
     { uint64_t lo, hi; tex_window(t, &lo, &hi); if (!mem_any(t->mem + lo, hi - lo)) return 0; }   // 只扫池里那段：池外按 0（rp_tex_src）
     if (no_cpu && fmt_nonfinite(t)) return 0;   // 游戏写不了这种池：里面的 Inf / NaN 是别人留下的，不是数据
     return 1;
@@ -845,6 +885,63 @@ static uint32_t usage_of(const tex_t *t, int cpu) {
     if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && ((caps & NVN_GPU_FMT_STORAGE) || rp_storage_srgb_alias((uint32_t)t->d.format))) u |= NVN_GPU_TEX_STORAGE;
     if (cpu) u |= NVN_GPU_TEX_CPU_UPLOAD;
     return u;
+}
+
+static nvn_gpu_tex_desc tex_desc(const tex_t *t, int cpu) {
+    nvn_gpu_tex_desc d = {.d = t->d, .usage = usage_of(t, cpu),
+                         .swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0};
+    rp_fold_1d_desc(&d.d);
+    return d;
+}
+
+static nvn_gpu_tex create_dense(const tex_t *t, int cpu) {
+    const nvn_gpu_tex_desc d = tex_desc(t, cpu);
+    nvn_gpu_tex g = NULL;
+    nvn_gpu_err err = {0};
+    const uint64_t before = res_now();
+    const nvn_gpu_rc result = nvn_gpu_tex_create(&d, &g, &err);
+    rp_perf_add(RP_PERF_RES_MAKE, res_now() - before);
+    if (!nvn_gpu_ok(result)) {
+        char name[48];
+        snprintf(name, sizeof name, "tex_create_fmt_%#x_target_%d", (unsigned)t->d.format, t->d.target);
+        if (nvn_unimpl("gpu", name, t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why);
+        return NULL;
+    }
+    return g;
+}
+
+static void sparse_dense_limit(const tex_t *t, const char *why) {
+    if (nvn_unimpl("oom", "tex_sparse_dense_limit", t) != 1) return;
+    char msg[256];
+    snprintf(msg, sizeof msg, "sparse texture OOM: nominal=%llu bytes, dense limit=%u bytes (%s)",
+             (unsigned long long)t->L.size, SPARSE_TEX_MAX, why && why[0] ? why : "no native resident layout");
+    nvn_plat_log(NVN_PLAT_LOG_RED, "tex", msg);
+}
+
+static int upload_sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
+    nvn_gpu_tex_desc d = tex_desc(t, 1);
+    d.usage &= ~(NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE);
+    nvn_gpu_err err = {0};
+    int res = sparse_snapshot(t, x, c, &d, &err);
+    if (res > 0) return 0;
+    if (res < 0) {
+        const int oom = err.rc.code == NVN_GPU_E_OOM;
+        if (nvn_unimpl(oom ? "oom" : "gpu", oom ? "tex_sparse_resident_oom" : "tex_sparse_snapshot_failed", t) == 1 && err.why[0])
+            nvn_plat_log(NVN_PLAT_LOG_RED, "tex", err.why);
+        return -1;
+    }
+    if (t->L.size > SPARSE_TEX_MAX) { sparse_dense_limit(t, err.why); return -1; }
+    if (x->sparse_native) {
+        x->sparse_native = 0;
+        res = sparse_snapshot(t, x, c, &d, &err);
+        if (res != 0) return res > 0 ? 0 : -1;
+    }
+    x->sparse_snapshot = 0;
+    nvn_gpu_tex g = create_dense(t, 1);
+    if (!g) return -1;
+    tex_replace_storage(x, g);
+    x->sparse_native = 0;
+    return upload_all(t, x, c, 1);
 }
 
 // 放掉一份存储（持 g_rmu）。三条放存储的路（tex_unref / alias_take_over / 池销毁）都走这里：建在它上面的核心视图先放——
@@ -943,6 +1040,18 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         rp_perf_add(RP_PERF_RES_NEW, 1); new_size_note(t->d.width, t->d.height);
         int track_linear = 0;
         int sp = 0, cpu = cpu_content(t, &sp);
+        const int native = sparse_native_candidate(t, sp);
+        if (!native && (sp || (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) && t->L.size > SPARSE_TEX_MAX) {
+            pthread_mutex_unlock(&g_rmu);
+            sparse_dense_limit(t, NULL);
+            return NULL;
+        }
+        if (!sp && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->pool &&
+            (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) {
+            pthread_mutex_unlock(&g_rmu);
+            nvn_unimpl("tex", "tex_sparse_virtual_usage", t);
+            return NULL;
+        }
         alias_key k; alias_key_of(&k, t);
         live_key lk;
         int live = live_key_of(&lk, t);
@@ -951,16 +1060,26 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         if (!x) x = retained;   // 同存储同描述的另一个对象已经建过：共用
         if (!x) {
             track_linear = !cpu && mixed_pool_linear_source(t, &k);
-            nvn_gpu_tex_desc d = {0}; d.d = t->d; d.usage = usage_of(t, cpu || track_linear); d.swz = t->set_swz && t->swz != SWZ_IDENTITY ? t->swz : 0;
-            rp_fold_1d_desc(&d.d);   // 后端没有一维目标：一维 → 高 1 的二维，一维数组 → 二维数组（#1810）
-            nvn_gpu_tex g = NULL; nvn_gpu_err err = {0};
-            uint64_t mk0_ = res_now(); nvn_gpu_rc mkr_ = nvn_gpu_tex_create(&d, &g, &err); rp_perf_add(RP_PERF_RES_MAKE, res_now() - mk0_);
-            if (!nvn_gpu_ok(mkr_)) {
+            x = calloc(1, sizeof *x);
+            if (!x) {
                 pthread_mutex_unlock(&g_rmu);
-                char name[48]; snprintf(name, sizeof name, "tex_create_fmt_%#x_target_%d", (unsigned)t->d.format, t->d.target); if (nvn_unimpl("gpu", name, t) == 1) nvn_plat_log(NVN_PLAT_LOG_RED, "gpu", err.why);   // 首次：带上后端给的原因
+                nvn_unimpl("oom", "tex_replay_allocation", t);
                 return NULL;
             }
-            x = calloc(1, sizeof *x); x->g = g; x->cpu = (uint8_t)cpu; x->sparse = (uint8_t)sp; x->mem = t->mem; x->size = t->L.size; x->need_init = 1; x->uid = ++g_tex_uid; g_built++;
+            x->sparse_snapshot = sparse_snapshot_candidate(t, sp);
+            if (!x->sparse_snapshot && !(x->g = create_dense(t, cpu || track_linear))) {
+                free(x);
+                pthread_mutex_unlock(&g_rmu);
+                return NULL;
+            }
+            x->cpu = (uint8_t)cpu;
+            x->sparse = (uint8_t)sp;
+            x->sparse_native = (uint8_t)native;
+            x->mem = t->mem;
+            x->size = t->L.size;
+            x->need_init = 1;
+            x->uid = ++g_tex_uid;
+            g_built++;
             if (live) memcpy(&x->live, &lk, sizeof lk);
         }
         if (!cpu && t->pool && !retained) {
@@ -977,7 +1096,12 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         if (track_linear) x->cpu = 1;
         nvn_hm_put(&g_by_serial, &t->serial, x); g_ser_gen++;
     }
-    if (plain && c && bc1_replay_format(t->d.format) && nvn_gpu_tex_bc1_unwrap) {
+    if (x->sparse_native && g_attach_intent) {
+        pthread_mutex_unlock(&g_rmu);
+        nvn_unimpl("tex", "sparse_snapshot_write_attachment", t);
+        return NULL;
+    }
+    if (!x->sparse_native && plain && c && bc1_replay_format(t->d.format) && nvn_gpu_tex_bc1_unwrap) {
         x->prefer_plain = 1;
         if (!tex_require_plain(x, c)) { pthread_mutex_unlock(&g_rmu); return NULL; }
     }
@@ -1014,6 +1138,8 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
             tex_bytes_drop(x);
             x->check_dirty = 1;
         }
+        if (x->sparse_snapshot && x->uploaded && x->sparse_upload_epoch != tex_bytes_failure_epoch())
+            x->check_dirty = 1;
         // 内容核对按「全局写代号」只做一次（同 rp_buf.c 的页核对快路）：代号没动 = 上次核对之后游戏没写过任何被跟踪的页。
         // 段号进键：换段（新一次提交）必重核一次——「一次提交里游戏不能改 GPU 正在读的贴图」只对一次提交成立。
         // 映射代际进键：换底 / 重新登记后旧句柄与保护状态都不作数（同 rp_buf 的 seen_map）。
@@ -1034,11 +1160,13 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 const int diag = xc && g_texdiag_on, first = !x->uploaded;
                 const char *trigger = NULL; texdiag_sample sample = {0};
                 if (diag) { trigger = first ? "first" : x->check_dirty ? "retry" : !x->span ? "untracked" : nvn_dirty_tracking_unreliable() ? "unreliable" : "dirty"; sample = texdiag_begin(t); }
-                int pr = xc ? upload_linear_dirty(t, x, xc) : 1;   // 线性单级二维：只传脏行（不适用返回 -1 再整张传）
-                int ur = xc && pr < 0 ? upload_all(t, x, xc, 1) : 0;
+                int pr = xc && !x->sparse ? upload_linear_dirty(t, x, xc) : xc ? -1 : 1;
+                int ur = 0;
+                if (xc && pr < 0)
+                    ur = x->sparse_snapshot ? upload_sparse_snapshot(t, x, xc) : upload_all(t, x, xc, 1);
                 int success = xc && (pr == 0 || (pr < 0 && ur == 0));
                 if (diag) texdiag_end(&sample, t, x, first, trigger, success);   // 先收尾：回收快照、记事件（-2 延迟也按 unknown_upload 记）
-                if (ur == -2) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
+                if (ur == -2 || (x->sparse && !success)) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
                 if (success) { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_vgen = vg0; x->check_dirty = x->unarmed; }   // 加保护没落地：不算同步，下一次必重查重传
                 else x->check_dirty = 1;
             } else { x->check_epoch = now0; x->check_seg = seg0; x->check_map = map0; x->check_vgen = vg0; x->check_dirty = 0; }

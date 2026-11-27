@@ -2389,7 +2389,7 @@ static void t21_clear_int(void) {
 }
 
 
-// C27b：视图覆盖格式的 clear 明确不支持（Vulkan 按 image 格式解释 clear 值）。
+// C27b：整数视图清除写回原图时逐字节保留整数值。
 static void t22_clear_view_fmt(void) {
     // 带存储用途：自由可改格式（跨类原始位视图只在存储图上保留；普通颜色图走格式列表保 UBWC，见 t22b）
     nvn_gpu_tex t = make_tex(4, 4, NVN_FORMAT_RGBA8, NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE | NVN_GPU_TEX_VIEW_FMT);
@@ -2404,9 +2404,17 @@ static void t22_clear_view_fmt(void) {
     nvn_gpu_cmd c = begin_cmd();
     const uint32_t vals[4] = {1, 2, 3, 4};
     nvn_gpu_clear_view(c, v, NULL, vals, 1);
+    nvn_gpu_buf read = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    nvn_gpu_copy_tex_buf(c, t, 0, 0, NULL, read, 0, 16, 64);
     r = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &e);
-    CHECK(r.code == NVN_GPU_E_UNSUPPORTED, "覆盖格式 clear 应 E_UNSUPPORTED，实为 %d", r.code);
-    CHECK(nvn_gpu_fence_failed() == 1, "F 应为 1，实为 %llu", (unsigned long long)nvn_gpu_fence_failed());
+    CHECK(OK(r), "覆盖格式 clear 提交：%d %s", r.code, e.why);
+    if (OK(r)) {
+        r = nvn_gpu_fence_wait(1, 5000000000ull, &e);
+        CHECK(OK(r), "覆盖格式 clear 等待：%d %s", r.code, e.why);
+        if (OK(r)) for (unsigned i = 0; i < 64; i++)
+            CHECK(((const uint8_t *)buf_cpu(read))[i] == vals[i % 4], "覆盖格式 clear 字节 %u", i);
+    }
+    nvn_gpu_buf_release(read, NULL, NULL);
     nvn_gpu_view_release(v);
     nvn_gpu_tex_release(t);
 }
@@ -2501,25 +2509,158 @@ static void t29_format_expand(void) {
     CHECK(nvn_vk_tex_format(0x19) == VK_FORMAT_R8G8B8A8_UNORM, "RGB8 贴图映射不是 RGBA8：%d", (int)nvn_vk_tex_format(0x19));
 }
 
-// C28：展开格式的回读明确不支持（不做隐式收缩）。
-static void t28_rgb8_upload(void) {
-    nvn_gpu_tex t = make_tex(2, 2, NVN_FORMAT_RGB8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
-    uint8_t zero[16];
-    memset(zero, 0, sizeof zero);
-    nvn_gpu_buf b = make_buf(16, NVN_GPU_MEM_SHARED, zero);
+// 门禁间接：android/tests/vk/run.sh 默认档与 --expanded-readback 都运行此用例。
+// 先读两行不同 RGB，再用 GPU 清除改写同一贴图，第二份结果必须反映新值。
+static void t28_rgb8_readback(void) {
+    nvn_gpu_tex t = make_tex(2, 2, NVN_FORMAT_RGB8, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_RENDER | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_view v = make_view(t);
+    uint8_t initial[48], expected[48];
+    memset(initial, 0xa5, sizeof initial);
+    memcpy(expected, initial, sizeof expected);
     const uint8_t px[12] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
-    NVNcopyRegion r = {0, 0, 0, 2, 2, 1};
+    const uint8_t cleared[6] = {255, 0, 255, 255, 0, 255};
+    for (unsigned row = 0; row < 2; row++) {
+        memcpy(expected + 4 + 8 * row, px + 6 * row, 6);
+        memcpy(expected + 28 + 8 * row, cleared, 6);
+    }
+    nvn_gpu_buf b = make_buf(sizeof initial, NVN_GPU_MEM_SHARED, initial);
+    NVNcopyRegion region = {0, 0, 0, 2, 2, 1};
+    const float color[4] = {1, 0, 1, 1};
     nvn_gpu_cmd c = begin_cmd();
-    nvn_gpu_tex_upload(c, t, 0, 0, &r, px, 6, 12);
-    nvn_gpu_copy_tex_buf(c, t, 0, 0, NULL, b, 0, 8, 16);
-    nvn_gpu_err e;
+    nvn_gpu_tex_upload(c, t, 0, 0, &region, px, 6, 12);
+    nvn_gpu_copy_tex_buf(c, t, 0, 0, &region, b, 4, 8, 16);
+    nvn_gpu_clear_view(c, v, color, NULL, 0);
+    nvn_gpu_copy_tex_buf(c, t, 0, 0, &region, b, 28, 8, 16);
+    nvn_gpu_err e = {0};
     nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 6, on_done, NULL, &e);
-    CHECK(rc.code == NVN_GPU_E_UNSUPPORTED, "展开格式回读应 E_UNSUPPORTED，实为 %d", rc.code);
-    CHECK(nvn_gpu_fence_failed() == 6, "F 应为 6，实为 %llu", (unsigned long long)nvn_gpu_fence_failed());
+    CHECK(OK(rc), "RGB8 回读提交 rc=%d %s", rc.code, e.why);
+    if (OK(rc)) {
+        rc = nvn_gpu_fence_wait(6, 5000000000ull, &e);
+        CHECK(OK(rc), "RGB8 回读等待 rc=%d %s", rc.code, e.why);
+        if (OK(rc)) {
+            const uint8_t *got = buf_cpu(b);
+            for (size_t i = 0; i < sizeof expected; i++)
+                CHECK(got[i] == expected[i], "RGB8 回读字节 %zu：期望 %02x 实得 %02x", i, expected[i], got[i]);
+        }
+    }
+    CHECK(nvn_gpu_format_caps(NVN_FORMAT_RGB8) & NVN_GPU_FMT_READBACK, "RGB8 应报告精确回读能力");
+    nvn_gpu_view_release(v);
     nvn_gpu_tex_release(t);
     nvn_gpu_buf_release(b, NULL, NULL);
 }
 
+// 上传后读取非零 x 的两行子区域，输出前后和行间留哨兵；原始字节独立给定。
+// 每个格式重新开会话，以便一笔提交被拒时仍能独立观测后续格式。
+static void expanded_format_roundtrip(uint32_t fmt, unsigned pixel_bytes) {
+
+    if (!open_backend()) { CHECK(0, "展开回读建会话失败 %#x", fmt); return; }
+    const unsigned width = 3, height = 2, used = 2 * pixel_bytes, pitch = used + 3;
+    uint8_t source[96], initial[96], expected[96];
+    for (unsigned i = 0; i < sizeof source; i++)
+        source[i] = (uint8_t)(0x93u + 37u * i);
+    // 2^24 和 2^24+1 在 IEEE-754 单精度里映射到同一值。
+    // 同时布置在有符号/无符号 32 位输入中，防止把有损回转当成逐字节回读。
+    const int scaled32 = fmt >= NVN_FORMAT_R8_UI2F && fmt <= NVN_FORMAT_RGBA32_I2F &&
+        (fmt - NVN_FORMAT_R8_UI2F) % 6 >= 4;
+    if (scaled32) {
+        for (unsigned offset = 0; offset < width * height * pixel_bytes; offset += 4) {
+            uint32_t word = 0x01000000u + ((offset / 4) & 1u);
+            memcpy(source + offset, &word, sizeof word);
+        }
+    }
+    if (fmt == NVN_FORMAT_RGB10A2SN) {
+        const uint32_t packed[] = {0u, 0x80000200u, 0xc0000201u, 0xffffffffu, 0x00200fffu, 0x001ff000u};
+        memcpy(source, packed, sizeof packed);
+    }
+    memset(initial, 0xa5, sizeof initial);
+    memcpy(expected, initial, sizeof initial);
+    for (unsigned row = 0; row < height; row++)
+        memcpy(expected + 4 + row * pitch, source + (row * width + 1) * pixel_bytes, used);
+    nvn_gpu_tex t = make_tex(width, height, fmt, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+    nvn_gpu_buf b = make_buf(sizeof initial, NVN_GPU_MEM_SHARED, initial);
+    nvn_gpu_cmd c = begin_cmd();
+    NVNcopyRegion src = {0, 0, 0, 3, 2, 1}, crop = {1, 0, 0, 2, 2, 1};
+
+    nvn_gpu_tex_upload(c, t, 0, 0, &src, source, width * pixel_bytes, width * height * pixel_bytes);
+
+    nvn_gpu_tex replacement = NULL;
+    if (scaled32) {
+        // 换入一个浮点值相同、原始整数位不同的纹素。部分复制必须同时保留邻像素。
+        uint8_t changed[16];
+        memcpy(changed, source + pixel_bytes, pixel_bytes);
+        for (unsigned k = 0; k < pixel_bytes; k += 4) changed[k] ^= 1u;
+        replacement = make_tex(1, 1, fmt, NVN_GPU_TEX_SAMPLED | NVN_GPU_TEX_CPU_UPLOAD);
+        const NVNcopyRegion one = {0, 0, 0, 1, 1, 1}, at = {1, 0, 0, 1, 1, 1};
+        nvn_gpu_tex_upload(c, replacement, 0, 0, &one, changed, pixel_bytes, pixel_bytes);
+        nvn_gpu_copy_tex(c, replacement, 0, 0, &one, t, 0, 0, &at);
+        memcpy(expected + 4, changed, pixel_bytes);
+    }
+    nvn_gpu_copy_tex_buf(c, t, 0, 0, &crop, b, 4, pitch, pitch * height);
+    const uint32_t clear_word[] = {0x01000003u, 0xff000001u, 0x80000001u, 0x7fffffffu};
+    nvn_gpu_buf cleared = NULL, sampled = NULL;
+    nvn_gpu_tex sampled_tex = NULL;
+    unsigned host_components = pixel_bytes == 12 ? 4 : pixel_bytes / 4;
+    nvn_gpu_view clear_view = NULL;
+    if (scaled32) {
+        cleared = make_buf(pixel_bytes, NVN_GPU_MEM_SHARED, NULL);
+        clear_view = make_view(t);
+        nvn_gpu_clear_view(c, clear_view, NULL, clear_word, 1);
+        const NVNcopyRegion last = {2, 1, 0, 1, 1, 1};
+        nvn_gpu_copy_tex_buf(c, t, 0, 0, &last, cleared, 0, pixel_bytes, pixel_bytes);
+        nvn_fmt_info info;
+        if (nvn_fmt_info_of(fmt, &info)) {
+            sampled_tex = make_tex(1, 1, info.expand, NVN_GPU_TEX_SAMPLED);
+            sampled = make_buf(host_components * 4, NVN_GPU_MEM_SHARED, NULL);
+            const NVNcopyRegion origin = {0, 0, 0, 1, 1, 1};
+            nvn_gpu_copy_tex(c, t, 0, 0, &last, sampled_tex, 0, 0, &origin);
+            nvn_gpu_copy_tex_buf(c, sampled_tex, 0, 0, &origin, sampled, 0, host_components * 4, host_components * 4);
+        }
+    }
+    nvn_gpu_err err = {0};
+
+    nvn_gpu_rc rc = nvn_gpu_cmd_commit(c, 1, on_done, NULL, &err);
+    CHECK(OK(rc), "展开回读格式 %#x 提交 rc=%d %s", fmt, rc.code, err.why);
+    if (OK(rc)) {
+
+        rc = nvn_gpu_fence_wait(1, 5000000000ull, &err);
+        CHECK(OK(rc), "展开回读格式 %#x 等待 rc=%d %s", fmt, rc.code, err.why);
+
+        if (OK(rc)) CHECK(!memcmp(buf_cpu(b), expected, sizeof expected), "展开回读格式 %#x 的数据或哨兵不符", fmt);
+    }
+    if (scaled32 && OK(rc))
+        CHECK(!memcmp(buf_cpu(cleared), clear_word, pixel_bytes), "展开回读格式 %#x 的 GPU 清除原码不符", fmt);
+    if (sampled && OK(rc)) {
+        const float *got = (const float *)buf_cpu(sampled);
+        for (unsigned k = 0; k < host_components; k++) {
+            float wanted = k >= pixel_bytes / 4 ? 1.0f :
+                (fmt & 1u) ? (float)clear_word[k] : (float)(int32_t)clear_word[k];
+            CHECK(got[k] == wanted, "展开格式 %#x 清除后的 FP32 分量 %u：%g != %g", fmt, k, got[k], wanted);
+        }
+    }
+    if (sampled_tex) nvn_gpu_tex_release(sampled_tex);
+    if (sampled) nvn_gpu_buf_release(sampled, NULL, NULL);
+    if (clear_view) nvn_gpu_view_release(clear_view);
+    if (cleared) nvn_gpu_buf_release(cleared, NULL, NULL);
+    if (replacement) nvn_gpu_tex_release(replacement);
+    nvn_gpu_tex_release(t);
+    nvn_gpu_buf_release(b, NULL, NULL);
+
+    CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "展开回读关闭 %#x：%s", fmt, err.why);
+}
+
+static void expanded_readback_matrix(void) {
+    unsigned passed = 0, cases = 0;
+    for (uint32_t fmt = NVN_FORMAT_RGB8; fmt <= NVN_FORMAT_RGB10A2_I2F; fmt++) {
+        nvn_fmt_info info;
+        if (!nvn_fmt_info_of(fmt, &info) || !info.expand) continue;
+        int before = g_fail;
+        expanded_format_roundtrip(fmt, info.bytes);
+        passed += before == g_fail;
+        cases++;
+    }
+    CHECK(cases == 40, "展开回读格式数 %u，期望 40", cases);
+    printf("expanded readback formats=%u/%u\n", passed, cases);
+}
 
 // C31：顶点路径证据——RGB32F 位置属性不能被展开成 RGBA32F（w 会读成下一个属性的字节），
 // RGBX8 也不能被展开成 RGBA8（多读 1 字节）。两者都画一个实色三角形并回读。
@@ -11185,6 +11326,31 @@ int main(int argc, char **argv) {
         return g_fail ? 1 : 0;
     }
 #endif
+    if (argc > 2 && !strcmp(argv[2], "--expanded-readback")) {
+        g_desc.host_device = &g_dev;
+        if (argc == 4) {
+            unsigned fmt = (unsigned)strtoul(argv[3], NULL, 0);
+            nvn_fmt_info info;
+            if (fmt) {
+                if (!nvn_fmt_info_of(fmt, &info) || !info.expand) return 2;
+                expanded_format_roundtrip(fmt, info.bytes);
+            } else {
+                if (!open_backend()) return 1;
+                t28_rgb8_readback();
+                nvn_gpu_err err = {0};
+                CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "RGB8 close：%s", err.why);
+            }
+        } else {
+            if (!open_backend()) return 1;
+            t28_rgb8_readback();
+            nvn_gpu_err err = {0};
+            CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "RGB8 close：%s", err.why);
+            expanded_readback_matrix();
+        }
+        s2a_vk_device_destroy(&g_dev, 1);
+        printf("expanded readback failures=%d\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 2 && !strcmp(argv[2], "--high-binding")) {   // 只跑绑定号 ≥ 256 的布局用例（默认档里也跑）；给红 / 绿取证用
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "high-binding-test";
         t_high_binding(argv[1]);
@@ -11528,9 +11694,10 @@ int main(int argc, char **argv) {
     CHECK(OK(nvn_gpu_close(5000000000ull, &e6)), "t22 close：%d %s", e6.rc.code, e6.why);
     if (!open_backend()) return 1;
     t30_rgb8_sampled(argv[1]);
-    t28_rgb8_upload();
+    t28_rgb8_readback();
     nvn_gpu_err e7;
     CHECK(OK(nvn_gpu_close(5000000000ull, &e7)), "t30/t28 close：%d %s", e7.rc.code, e7.why);
+    expanded_readback_matrix();
     if (!open_backend()) return 1;
     c71_present();
     { nvn_gpu_err e71; CHECK(OK(nvn_gpu_close(5000000000ull, &e71)), "C71 close（面还接着）：%d %s", e71.rc.code, e71.why); }
