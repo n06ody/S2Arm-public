@@ -80,8 +80,10 @@ def main():
         return rc
 
     if sys.argv[1:] == ['--submit-compile']:
-        exe = build_case('submit-compile', original)
-        for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3), (1, 4), (2, 4), (4, 4)):
+        exe = build_case('submit-compile', original, [*libs, gfx/'replay/rp_exec.c'],
+                         extra_flags=('-DS2A_TEST_SUBMIT_SCAN',))
+        for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3),
+                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6)):
             result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
                                     capture_output=True, text=True, timeout=30)
             sys.stdout.write(result.stdout)
@@ -119,7 +121,7 @@ def main():
         mutants = [
             ('default-on', 'nvn_plat_flag("nvk_live_compile_async", 0)', 'nvn_plat_flag("nvk_live_compile_async", 1)',
              '--live-compile-default', 'unset async property must start 0 compiler workers'),
-            ('inline', '    if (g_live_compile != 1) {', '    if (1) {',
+            ('inline', '    if (g_live_compile != 1 || g_lookahead_slots) {', '    if (1) {',
              '--live-compile-thread', 'compiler ran on the submitting thread'),
             ('request-bytes-ignored', '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    s2a_sha256_update(&hash, json, len);',
              '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    (void)json; (void)len;',
@@ -300,7 +302,7 @@ def main():
              '{ un = 1; um[st] |= 1u << i; }', '{ un = 1; um[st] |= 1u << ((i + 1) & 15); }',
              "gate case 'unaligned storage, slot the program uses (fs)' #0: library not used"),
             ('ssbo-wrong-stage-read',
-             'sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used)', 'sbu_stage_slots(stage_key((unsigned)st), 0u, q->prim, &used)',
+             'sbu_stage_slots(key, (unsigned)st, q->prim, &used)', 'sbu_stage_slots(key, 0u, q->prim, &used)',
              "gate case 'unaligned storage, slot the program does not use': hit from the library"),   # 片元段（有非对齐绑定才会被问）当成顶点段去读：stage 对不上 → 说不准 → 被挡下
             ('ssbo-switch-ignored',
              '    if (un && ssbo_used_slots_on()) {', '    if (un && (ssbo_used_slots_on() || 1)) {',
@@ -757,7 +759,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --submit-compile | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'

@@ -3202,14 +3202,16 @@ static void t_submit_compile_lookahead(void) {
     q_draw(&s);
     p_draw *line = put(&s, OP_DRAW, sizeof *line);
     line->prim = 1; line->count = 2;
-    put(&s, OP_BARRIER, 8);  // A barrier may expose earlier writes to later reads.
+    *(uint32_t *)put(&s, OP_BARRIER, sizeof(uint32_t)) = NVN_BARRIER_ORDER_PRIMITIVES_BIT;
+    q_draw(&s);
+    ((p_set_patch_size *)put(&s, OP_SET_PATCH_SIZE, sizeof(p_set_patch_size)))->size = 3;
     q_draw(&s);
     end(&s);
     submit1(&s);
     fake_complete(NVN_GPU_DONE_OK);
-    CHECK(g_scan_draws == 2 && g_scan_prims[0] == 4 && g_scan_prims[1] == 1);
+    CHECK(g_scan_draws == 3 && g_scan_prims[0] == 4 && g_scan_prims[1] == 1 && g_scan_prims[2] == 4);
     CHECK(g_scan_untouched);
-    CHECK(g_gdraws == g_scan_start_draws + 3);
+    CHECK(g_gdraws == g_scan_start_draws + 4);
     g_scan_limit = 0;
     pass_fresh();
 }

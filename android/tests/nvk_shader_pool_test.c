@@ -10,6 +10,9 @@
 #include <pthread.h>
 #include <time.h>
 #include "nvn.h"
+#ifdef S2A_TEST_SUBMIT_SCAN
+#include "nvn_mtl.h"
+#endif
 #include "libpack_texture_spirv.h"
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -147,7 +150,17 @@ int nvn_plat_flag(const char *name, int dflt) {
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
+#ifdef S2A_TEST_SUBMIT_SCAN
+static char last_lookahead_stop[160];
+static int lookahead_stop_lines;
+#endif
 void nvn_plat_log(int level, const char *cls, const char *text) {
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "前瞻首退 ")) {
+        snprintf(last_lookahead_stop, sizeof last_lookahead_stop, "%s", text);
+        lookahead_stop_lines++;
+    }
+#endif
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
@@ -359,9 +372,23 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
     }
     return -27; // deliberately no result: capture input only
 }
+#ifdef S2A_TEST_SUBMIT_SCAN
+static int submit_alignment_requests[2];
+#endif
 static int32_t fake_parallel_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req,
                                      s2a_direct_emit_fn emit, void *sink) {
     (void)session; (void)gen; (void)req;
+#ifdef S2A_TEST_SUBMIT_SCAN
+    const struct s2a_jv root = {(const char *)req.data, (size_t)req.bytes};
+    struct s2a_jv program, graphics, align;
+    int unaligned;
+    if (!s2a_jv_obj_find(root, "program", &program) && !s2a_jv_obj_find(program, "graphicsState", &graphics) &&
+        !s2a_jv_obj_find(graphics, "hasUnalignedStorageBuffer", &align) && !s2a_jv_bool(align, &unaligned)) {
+        pthread_mutex_lock(&live_gate_mu);
+        submit_alignment_requests[unaligned != 0]++;
+        pthread_mutex_unlock(&live_gate_mu);
+    }
+#endif
     live_gate_pause();
     static const char result[] =
         "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"" S2A_TEST_VERT_64 "\"}],"
@@ -2530,6 +2557,137 @@ static int fixture_defer_frame(uint64_t *frame) {
     return 1;
 }
 
+#ifdef S2A_TEST_SUBMIT_SCAN
+// The GPU and targets are synthetic. The command scanner, request builder,
+// worker queue, and real-draw resolver are the production implementations.
+static const p_set_rt *submit_targets;
+const p_set_rt *rp_pass_target(void) { return submit_targets; }
+void rp_buf_hold_begin(void) {}
+void rp_draw_stats(uint64_t *draws, uint64_t *skips) { *draws = *skips = 0; }
+nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *desc, nvn_gpu_cmd *out, nvn_gpu_err *err) {
+    static char cmd;
+    *out = (nvn_gpu_cmd)&cmd;
+    return (nvn_gpu_rc){0};
+}
+
+static void submit_record(uint8_t **cursor, uint32_t op, const void *payload, size_t bytes) {
+    const uint32_t size = (uint32_t)((sizeof(op_hdr) + bytes + 7) & ~(size_t)7);
+    const op_hdr h = {op, size};
+    memcpy(*cursor, &h, sizeof h);
+    if (bytes) memcpy(*cursor + sizeof h, payload, bytes);
+    *cursor += size;
+}
+
+static void test_submit_command_stream(const p_set_rt *targets, const struct rp_shader_req *q) {
+    fixture_parallel_compile = 1;
+    submit_targets = targets;
+    nvn_be_sub_begin();
+
+    const p_clear_ds clear = {.depth = 0.5f, .depth_mask = 1};
+    const p_scissor scissor = {0, 0, 4, 4};
+    const uint32_t ordered = NVN_BARRIER_ORDER_PRIMITIVES_BIT;
+    const p_draw draw = {.prim = 4, .count = 3, .instances = 1};
+    const p_bind_buf deferred = {.stage = BIND_BUF_DEFER, .index = 0};
+    _Alignas(8) uint8_t blocked[160] = {0};
+    uint8_t *cursor = blocked;
+    submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
+    submit_record(&cursor, OP_BIND_SSBO, &deferred, sizeof deferred);
+    submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_END, NULL, 0);
+    const uint64_t blocked_handle = (uintptr_t)blocked;
+    nvn_be_sub_index(&blocked_handle, 1);
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(!stats.enqueued && lookahead_stop_lines == 1 &&
+          strstr(last_lookahead_stop, "reason=command opcode=OP_BIND_SSBO"),
+          "submit scan: deferred SSBO is the first boundary (log: %s)", last_lookahead_stop);
+
+    const dpool_t tex_pool = {.n = 64};
+    const p_set_pool bind_tex_pool = {&tex_pool};
+    const struct { p_push_const hdr; uint32_t data; } push = {{.size = 4}, 17};
+    const p_push_const_ptr deferred_push = {.size = 4, .data = (uintptr_t)&push.data};
+    _Alignas(8) uint8_t stream[1024] = {0};
+    cursor = stream;
+    submit_record(&cursor, OP_SET_TEX_POOL, &bind_tex_pool, sizeof bind_tex_pool);
+    submit_record(&cursor, OP_CLEAR_DS, &clear, sizeof clear);
+    submit_record(&cursor, OP_SCISSOR, &scissor, sizeof scissor);
+    submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
+    submit_record(&cursor, OP_PUSH_CONST, &push, sizeof push);
+    submit_record(&cursor, OP_PUSH_CONST_PTR, &deferred_push, sizeof deferred_push);
+
+    p_bind_buf storage[4];
+    p_bind_buf uniform[4];
+    for (int i = 0; i < 4; ++i) {
+        storage[i] = (p_bind_buf){.stage = 0, .index = 0, .addr = 0x1000 + (i & 1), .size = 64};
+        uniform[i] = (p_bind_buf){.stage = 0, .index = i, .addr = 0x2000, .size = 4};
+        submit_record(&cursor, OP_BIND_SSBO, &storage[i], sizeof storage[i]);
+        submit_record(&cursor, OP_BIND_UBO, &uniform[i], sizeof uniform[i]);
+        submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    }
+    submit_record(&cursor, OP_END, NULL, 0);
+
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    const int all_started = live_gate_wait(4);
+    pthread_mutex_lock(&live_gate_mu);
+    CHECK(all_started, "submit scan: four SSBO requests reached four workers before Draw (got %d)", live_gate_entered);
+    CHECK(submit_alignment_requests[0] == 2 && submit_alignment_requests[1] == 2,
+          "submit scan: worker requests carry two aligned and two unaligned SSBO facts (got %d / %d)",
+          submit_alignment_requests[0], submit_alignment_requests[1]);
+    pthread_mutex_unlock(&live_gate_mu);
+    CHECK(!rp_S.tex_pool_n && !rp_S.ssbo[0][0].addr && !rp_S.ubo[0][0].size,
+          "submit scan: live bindings were untouched");
+    live_gate_release();
+    if (!all_started) return;
+
+    CHECK(rp_state_op(OP_SET_TEX_POOL, &bind_tex_pool, sizeof(op_hdr) + sizeof bind_tex_pool),
+          "submit scan: actual draw binds its texture pool");
+    for (int i = 0; i < 4; ++i) {
+        const struct rp_prog *program = NULL;
+        CHECK(rp_state_op(OP_BIND_SSBO, &storage[i], sizeof(op_hdr) + sizeof storage[i]) &&
+              rp_state_op(OP_BIND_UBO, &uniform[i], sizeof(op_hdr) + sizeof uniform[i]) &&
+              !rp_shader_resolve(q, &program) && program, "submit scan: draw %d consumed its exact future", i);
+    }
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == 4 && stats.compiled == 4 && stats.future_hits == 4 &&
+          !stats.fallback && !stats.start_failed && shader_load_count == 4,
+          "submit scan: queued=%llu finished=%llu matched=%llu miss=%llu start_failed=%llu modules=%d",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.compiled,
+          (unsigned long long)stats.future_hits, (unsigned long long)stats.fallback,
+          (unsigned long long)stats.start_failed, shader_load_count);
+}
+
+static int previous_compile(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t bytes,
+                            uint8_t **out, size_t *out_bytes, char *why, size_t why_size) {
+    live_gate_pause();
+    return -1;
+}
+
+static void test_submit_start_failed(void) {
+    const uint8_t key[32] = {1};
+    CHECK(!s2a_compile_worker_start_pool(previous_compile, NULL, 1, NULL, 0) &&
+          !s2a_compile_worker_submit_async(1, 1, "{}", 2, key, NULL, 0) && live_gate_wait(1),
+          "startup fixture: previous session has a running worker");
+    CHECK(s2a_compile_worker_stop_bounded(0, NULL, 0) == 1, "startup fixture: previous worker has not exited");
+    CHECK(!nvk_shader_open() && !rp_shader_lookahead_budget() &&
+          strstr(last_red, "previous compile still running"), "startup fixture: worker pool actually refused startup");
+    live_gate_release();
+    rp_state_reset();
+    source();
+    bind_pools(64);
+    fake_reg_changes = 0;
+    fake_array_count = 64;
+    const struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    const struct rp_prog *program = NULL;
+    CHECK(!rp_shader_resolve(&q, &program) && program && compiler_calls == 1 &&
+          pthread_equal(last_compiler_thread, pthread_self()), "startup failure still compiles and resolves on the owner");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.start_failed == 1 && !stats.fallback && !stats.future_hits && !stats.enqueued,
+          "startup failure is counted separately from a lookahead miss");
+}
+#endif
+
 static int submit_compile_test(int slots, int variant) {
     fixture_submit_compile = 1;
     fake_reg_changes = 0;
@@ -2537,6 +2695,12 @@ static int submit_compile_test(int slots, int variant) {
     fixture_submit_slots = slots;
     fixture_live_frame_ms = 0;
     fixture_live_unsafe_ms = 0;
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (variant == 6) {
+        test_submit_start_failed();
+        goto cleanup;
+    }
+#endif
     CHECK(nvk_shader_open() == 0, "open strict submit session");
     CHECK(rp_shader_lookahead_budget() == (unsigned)slots, "requested compile slots=%d", slots);
     struct s2a_compile_worker_stats worker;
@@ -2544,15 +2708,21 @@ static int submit_compile_test(int slots, int variant) {
     CHECK(worker.slots == (unsigned)slots, "live worker slots=%u expected=%d", worker.slots, slots);
     rp_state_reset();
     source();
-    bind_pools(64);
     fake_array_count = 64;
-    struct rp_state state = rp_S;
     struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
     uint8_t memory[4096];
     pool_t pool = {0};
     tex_t color = {.mem = memory, .pool = &pool};
     color.L.size = sizeof memory;
     p_set_rt targets = {.n = 0, .depth = &color};
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (variant == 5) {
+        test_submit_command_stream(&targets, &q);
+        goto cleanup;
+    }
+#endif
+    bind_pools(64);
+    struct rp_state state = rp_S;
     if (variant == 4) {
         fixture_parallel_compile = 1;
         for (int i = 0; i < slots; i++) {
@@ -2607,13 +2777,14 @@ static int submit_compile_test(int slots, int variant) {
     rp_shader_live_compile_take(&stats);
     CHECK(stats.pending == 0 && stats.timeout == 0, "pending=%llu timeout=%llu",
           (unsigned long long)stats.pending, (unsigned long long)stats.timeout);
+    CHECK(!stats.start_failed, "a healthy worker pool never counts startup failure");
     if (!variant) {
         CHECK(compiler_calls == 1 && shader_load_count == 1 &&
               !pthread_equal(last_compiler_thread, pthread_self()) &&
               !pthread_equal(last_shader_load_thread, pthread_self()),
               "same future compiles/builds once on the worker: compile=%d module=%d", compiler_calls, shader_load_count);
-        CHECK(stats.fallback == 0, "exact request used prefetched result");
-    } else CHECK(stats.fallback == 1, "real changed or declined request runs synchronous fallback");
+        CHECK(!stats.fallback && stats.future_hits == 1, "exact request used prefetched result");
+    } else CHECK(stats.fallback == 1 && !stats.future_hits, "real changed or declined request runs synchronous fallback");
 cleanup:
     rp_shader_lookahead_end();
     nvk_shader_stop();

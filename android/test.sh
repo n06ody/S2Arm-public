@@ -341,6 +341,7 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --link-refused-file
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --live-compile-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --submit-compile
 # 图形阶段存储图像（#999）：句柄字 72..86 偶 → 图像槽 / 表外·奇字·数组不猜 / 声明落程序记录；解析与声明各改坏一处，graphics_image_layout_test 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --graphics-image-mutants
 # 计算程序装载：游戏 UBO 形态的类型 3 句柄进程序 usrc 表（#1594 片 10）：撤掉这一步、或对所有项都放，必红（真解析 + 生产 build_compute）

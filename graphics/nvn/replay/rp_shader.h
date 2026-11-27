@@ -63,7 +63,26 @@ struct rp_state;
 struct p_set_rt;
 unsigned rp_shader_lookahead_budget(void);
 void rp_shader_lookahead_end(void);
-// 1 = 入队，0 = 无新工作，-1 = 无法证明之后的前瞻安全。
+enum rp_lookahead_stop {
+    RP_LOOKAHEAD_COMMAND = 1,
+    RP_LOOKAHEAD_RECORD,
+    RP_LOOKAHEAD_SCAN_LIMIT,
+    RP_LOOKAHEAD_SUBMIT_STATE,
+    RP_LOOKAHEAD_TARGET,
+    RP_LOOKAHEAD_DRAW,
+    RP_LOOKAHEAD_TEX_POOL,
+    RP_LOOKAHEAD_PROGRAM,
+    RP_LOOKAHEAD_DYNAMIC_UBO,
+    RP_LOOKAHEAD_RESOURCE,
+    RP_LOOKAHEAD_CONTEXT,
+    RP_LOOKAHEAD_IDENTITY,
+    RP_LOOKAHEAD_DESCRIPTOR_CHANGED,
+    RP_LOOKAHEAD_SNAPSHOT,
+    RP_LOOKAHEAD_REQUEST,
+    RP_LOOKAHEAD_QUEUE,
+    RP_LOOKAHEAD_STOP_COUNT,
+};
+// 1 = 入队，0 = 无新工作，负值 = 首退原因（-RP_LOOKAHEAD_*）。
 int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const struct p_set_rt *targets);
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。
@@ -75,7 +94,8 @@ int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out)
 int rp_shader_resolve_compute(const struct rp_prog **out);
 uint64_t rp_shader_compiled_programs(void);   // 前台解析取得的设备现编程序，含等 worker 的结果；每份程序一笔
 struct rp_shader_live_compile_stats {
-    uint64_t enqueued, wait_ns, pending, fallback, timeout;
+    uint64_t enqueued, wait_ns, pending, fallback, timeout;   // fallback = 前瞻没给出本次现编的任务
+    uint64_t start_failed, future_hits;   // 线程池起失败后回退的份数 / 完整请求匹配且拿到结果的份数
     uint64_t compiled, compile_ns, compile_max_ns;   // 编译线程这段时间跑完的份数（成败都算）/ 合计耗时 / 最长一份（排队等候不算）
 };
 void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *out);

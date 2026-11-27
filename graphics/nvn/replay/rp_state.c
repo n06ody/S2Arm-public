@@ -106,7 +106,8 @@ static void bind_program(struct rp_state *state, const p_bind_program *bp, int d
 }
 
 int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint32_t size) {
-    const size_t bytes = size - 8;
+    if (size < sizeof(op_hdr)) return 0;
+    const size_t bytes = size - sizeof(op_hdr);
     switch (op) {
     case OP_BIND_PROGRAM: {
         p_bind_program decoded;
@@ -142,10 +143,20 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         state->nattr = b->n;
         return 1;
     }
-    case OP_BIND_UBO: {
+    case OP_BIND_UBO: case OP_BIND_SSBO: {
         const p_bind_buf *b = a;
         if (bytes < sizeof *b || b->stage < 0 || b->stage >= 6 || b->index < 0 || b->index >= 16) return 0;
-        state->ubo[b->stage][b->index] = *b;  // 带 BIND_BUF_DEFER 的 stage 已排除
+        p_bind_buf *dst = op == OP_BIND_UBO ? &state->ubo[b->stage][b->index] : &state->ssbo[b->stage][b->index];
+        *dst = *b;  // 带 BIND_BUF_DEFER 的 stage 已排除，前瞻不解引用游戏数据
+        return 1;
+    }
+    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {
+        if (bytes < sizeof(p_set_pool)) return 0;
+        const dpool_t *pool = ((const p_set_pool *)a)->pool;
+        const int tex = op == OP_SET_TEX_POOL;
+        const int base = nvn_dpool_base(pool, tex), n = pool ? pool->n : 0;
+        if (tex) { state->tex_base = base; state->tex_pool_n = n; }
+        else { state->samp_base = base; state->samp_pool_n = n; }
         return 1;
     }
     case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: {
@@ -166,6 +177,16 @@ int rp_state_lookahead(struct rp_state *state, uint32_t op, const void *a, uint3
         if (bytes < sizeof(p_alpha_ref)) return 0;
         state->alpha_ref = ((const p_alpha_ref *)a)->ref;
         return 1;
+    // 只改变附件内容和通道顺序。着色器请求只读描述符事实，采样与附件的别名仍由前瞻检查。
+    case OP_CLEAR_COLOR: return bytes >= sizeof(p_clear_color);
+    case OP_CLEAR_DS: return bytes >= sizeof(p_clear_ds);
+    case OP_BARRIER: return bytes >= sizeof(uint32_t);
+    // 推常量只在真实绘制时绑定，不参与请求。延迟形式的指针也不在这里读。
+    case OP_PUSH_CONST: {
+        const p_push_const *p = a;
+        return bytes >= sizeof *p && p->size <= bytes - sizeof *p;
+    }
+    case OP_PUSH_CONST_PTR: return bytes >= sizeof(p_push_const_ptr);
     // 只影响绘制参数，不参与图形着色器请求。实际回放仍重放每条命令。
     case OP_SCISSOR: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP:
     case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_STENCIL: case OP_POLY_OFFSET:

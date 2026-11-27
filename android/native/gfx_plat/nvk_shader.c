@@ -65,6 +65,7 @@ static uint32_t g_live_frame_ms, g_live_unsafe_ms;
 static uint64_t now_ns(void);
 static uint64_t g_live_budget_frame, g_live_spent_ns;   // 提交 owner 独占
 static _Atomic uint64_t g_live_enqueued, g_live_wait_ns, g_live_pending, g_live_fallback, g_live_timeout;
+static _Atomic uint64_t g_live_start_failed, g_live_future_hits;
 static _Atomic uint64_t g_live_cmp_n, g_live_cmp_ns, g_live_cmp_max_ns;   // 编译线程跑完一份（成败都算）的次数 / 总耗时 / 最长一份（worker 线程写，现编帧读数取走）
 static int live_worker(void *, uint64_t, uint64_t, const char *, size_t, uint8_t **, size_t *, char *, size_t);
 void nvk_shader_stop(void) {
@@ -759,7 +760,8 @@ static uint64_t ubo_fact_sig(int st) {
 }
 
 static int depth_clip_cap(void);
-static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any, int *un);
+static int gfx_ssbo_align(const struct rp_state *state, const struct rp_shader_req *q,
+                          const struct s2a_direct_compile_context *pc, int nst, int count, int *any, int *un);
 static void fill_facts(const struct rp_state *state, const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, struct facts *f, int nst) {
     memset(f, 0, sizeof *f);
     struct s2a_compile_graphics_src *g = &f->gfx;
@@ -783,7 +785,7 @@ static void fill_facts(const struct rp_state *state, const struct rp_shader_req 
     // 参考值是绘制时的状态（OP_ALPHA_REF）。测试没开（函数是 ALWAYS）时固定给 0：不让同一个程序因为一个用不到的数拆成多份
     g->has_alpha_test_reference = 1; g->alpha_test_reference = state->color.alpha_func >= 1 && state->color.alpha_func <= 7 ? state->alpha_ref : 0.0f;
     int any_ssbo = 0, unaligned = 0;
-    if (state == &rp_S) f->unused_unaligned_ssbo = gfx_ssbo_align(q, pc, nst, 1, &any_ssbo, &unaligned);   // 非对齐只看这个程序真用到的槽（口径见 gfx_ssbo_align）；input_sig 读同一份答案
+    f->unused_unaligned_ssbo = gfx_ssbo_align(state, q, pc, nst, state == &rp_S, &any_ssbo, &unaligned);
     if (!any_ssbo || pc->storage_buffer_offset_alignment) { g->has_unaligned_ssbo = 1; g->unaligned_ssbo = unaligned; }
     for (int i = 0; i < 32; i++) g->attribute_types[i] = num_type(i < state->nattr && i < 16 ? state->attr[i].fmt : 0, 1);
     for (int i = 0; i < 8; i++) g->fragment_output_types[i] = i < q->rt_count && q->rt_format[i] ? num_type(q->rt_format[i], 0) : "Float";
@@ -1777,12 +1779,13 @@ static int ssbo_used_slots_on(void) {
 // any = 阶段 0..4 里有没有绑过存储缓冲；un = 这个程序的编译结果会不会受存储缓冲非对齐影响（口径见上）。
 // nst = 程序的图形阶段数（vs / vs+fs / vs+fs+gs），阶段号即 NVN 阶段号；count 非 0 时记读数（只有 fill_facts 记）。
 // 返回 1 表示非对齐位因槽证明而清除，前台用它区分真正对齐的请求。
-static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct_compile_context *pc, int nst, int count, int *any_out, int *un_out) {
+static int gfx_ssbo_align(const struct rp_state *state, const struct rp_shader_req *q,
+                          const struct s2a_direct_compile_context *pc, int nst, int count, int *any_out, int *un_out) {
     const uint32_t al = pc->storage_buffer_offset_alignment;
     int any = 0, un = 0; uint32_t um[5] = {0, 0, 0, 0, 0};   // um[阶段]：这个阶段上地址非 0 又不对齐的槽位集合
-    for (int st = 0; st < 5; st++) for (int i = 0; i < 16; i++) if (rp_S.ssbo[st][i].addr) {
+    for (int st = 0; st < 5; st++) for (int i = 0; i < 16; i++) if (state->ssbo[st][i].addr) {
         any = 1;
-        if (al && rp_S.ssbo[st][i].addr % al) { un = 1; um[st] |= 1u << i; }
+        if (al && state->ssbo[st][i].addr % al) { un = 1; um[st] |= 1u << i; }
     }
     *any_out = any;
     const int was_unaligned = un;
@@ -1791,7 +1794,9 @@ static int gfx_ssbo_align(const struct rp_shader_req *q, const struct s2a_direct
         for (int st = 0; st < nst && st < 3 && !used_unaligned && !unknown; st++) {
             if (!um[st]) continue;   // 这个阶段没有非对齐的绑定：它用哪些槽都不受影响，不必读库
             uint32_t used = 0;
-            const int r = sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used);
+            const uint8_t zero_key[8] = {0};
+            const uint8_t *key = state->bser[st] && (state->skey_ok >> st & 1) ? state->skey[st] : zero_key;
+            const int r = sbu_stage_slots(key, (unsigned)st, q->prim, &used);
             if (r != SBU_KNOWN) { unknown = 1; by_addr = r == SBU_PSB; }
             else if (used & um[st]) used_unaligned = 1;
         }
@@ -2024,6 +2029,8 @@ void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *s) {
     s->wait_ns = atomic_exchange_explicit(&g_live_wait_ns, 0, memory_order_relaxed);
     s->pending = atomic_exchange_explicit(&g_live_pending, 0, memory_order_relaxed);
     s->fallback = atomic_exchange_explicit(&g_live_fallback, 0, memory_order_relaxed);
+    s->start_failed = atomic_exchange_explicit(&g_live_start_failed, 0, memory_order_relaxed);
+    s->future_hits = atomic_exchange_explicit(&g_live_future_hits, 0, memory_order_relaxed);
     s->timeout = atomic_exchange_explicit(&g_live_timeout, 0, memory_order_relaxed);
     s->compiled = atomic_exchange_explicit(&g_live_cmp_n, 0, memory_order_relaxed);
     s->compile_ns = atomic_exchange_explicit(&g_live_cmp_ns, 0, memory_order_relaxed);
@@ -2077,13 +2084,17 @@ static enum live_status live_compile(uint64_t session, uint64_t generation, cons
         if (g_texpool_diag && (w == 0 || w == 2)) g_pool_attempts++;
         if (w == 0 && oc->bytes && oc->bytes_len) {
             if (built) *built = lookahead_take_program(key);
+            atomic_fetch_add_explicit(&g_live_future_hits, 1, memory_order_relaxed);
             return LIVE_OK;
         }
         if (w == 2) return LIVE_REJECTED;
     }
     if (g_live_compile != 1 || g_lookahead_slots) {
         if (g_texpool_diag) g_pool_attempts++;
-        if (g_live_compile < 0 || g_lookahead_slots) atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
+        if (g_live_compile < 0)
+            atomic_fetch_add_explicit(&g_live_start_failed, 1, memory_order_relaxed);
+        else if (g_lookahead_slots)
+            atomic_fetch_add_explicit(&g_live_fallback, 1, memory_order_relaxed);
         const uint64_t trace = diag_begin(identity, stages, 1);
         struct s2a_compile_stamp phase = s2a_compile_phase_begin();
         const int ran = s2a_compile_request_execute(session, generation, json, len, oc);
@@ -2668,7 +2679,7 @@ static uint64_t input_sig(const struct rp_shader_req *q, const struct s2a_direct
     { int dual = 0; for (int i = 0; i < 8; i++) if (src1(rp_S.blend[i].src_rgb) || src1(rp_S.blend[i].dst_rgb) || src1(rp_S.blend[i].src_a) || src1(rp_S.blend[i].dst_a)) dual = 1; MIX(dual); }
     MIX(rp_depth_zero()); MIX(rp_origin_lower_left()); MIX(pc->shader_draw_parameters);
     { int any = 0, un = 0;
-      const int unused = gfx_ssbo_align(q, pc, stages == 7u ? 3 : stages == 3u ? 2 : 1, 0, &any, &un);
+      const int unused = gfx_ssbo_align(&rp_S, q, pc, stages == 7u ? 3 : stages == 3u ? 2 : 1, 0, &any, &un);
       MIX(any); MIX(un | (unused << 1)); MIX(pc->storage_buffer_offset_alignment); }   // 真对齐与未用槽放行可能选用不同程序
     MIX(rp_S.nattr); for (int i = 0; i < 16; i++) MIX(i < rp_S.nattr ? rp_S.attr[i].fmt : 0);
     for (int st = 0; st < 3; st++) if (stages & (1u << st)) { uint32_t m = 0; for (int i = 0; i < 16; i++) if (rp_S.ubo[st][i].size) m |= 1u << i; MIX(m); }
@@ -2932,10 +2943,8 @@ static int lookahead_span(const tex_t *tex, uint64_t *begin, uint64_t *end) {
 }
 
 static int lookahead_bindings_safe(const struct rp_state *state, const p_set_rt *targets, int nst) {
-    for (int st = 0; st < 5; st++) {
-        for (int i = 0; i < 16; i++) if (state->ssbo[st][i].addr) return 0;
+    for (int st = 0; st < 5; st++)
         for (int i = 0; i < 32; i++) if (state->img[st][i]) return 0;
-    }
     uint64_t begin[9], end[9];
     unsigned count = 0;
     for (int i = 0; i <= targets->n; i++) {
@@ -2970,35 +2979,37 @@ static int lookahead_bindings_safe(const struct rp_state *state, const p_set_rt 
 }
 
 int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const p_set_rt *targets) {
-    if (!rp_shader_lookahead_budget() || state->tex_pool_n <= 0 || state->tex_pool_n > 1048576) return -1;
+    if (!rp_shader_lookahead_budget()) return -RP_LOOKAHEAD_QUEUE;
+    if (state->tex_pool_n <= 0 || state->tex_pool_n > 1048576) return -RP_LOOKAHEAD_TEX_POOL;
     uint32_t stages = 0;
     for (int st = 0; st < 5; st++) if (state->bser[st]) stages |= 1u << st;
-    if ((stages != 1u && stages != 3u && stages != 7u) || (state->skey_ok & stages) != stages) return -1;
+    if ((stages != 1u && stages != 3u && stages != 7u) || (state->skey_ok & stages) != stages) return -RP_LOOKAHEAD_PROGRAM;
     const int nst = stages == 7u ? 3 : stages == 3u ? 2 : 1;
     for (int st = 0; st < nst; st++) {
         const struct ubo_need *need = g_ubo_need_n ? ubo_need_at(st, state->skey[st], 0) : NULL;
-        if (need && need->n) return -1;
+        if (need && need->n) return -RP_LOOKAHEAD_DYNAMIC_UBO;
     }
     const uint64_t regs = rp_tex_reg_gen();
-    if (!lookahead_bindings_safe(state, targets, nst)) return -1;
+    if (!lookahead_bindings_safe(state, targets, nst)) return -RP_LOOKAHEAD_RESOURCE;
     struct s2a_direct_compile_context pc = {0};
-    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return -1;
+    if (s2a_direct_provider_compile_context(&pc) || !pc.profile_json || !pc.profile_bytes) return -RP_LOOKAHEAD_CONTEXT;
     static struct facts facts;
     static uint8_t encoded[S2A_INPUT_IDENTITY_MAX];
     struct s2a_input_identity id;
     size_t len = 0;
     uint8_t sha[32];
-    if (graphics_identity(state, q, &pc, stages, nst, &facts, &id, encoded, &len, sha) ||
-        regs != rp_tex_reg_gen()) return -1;
+    if (graphics_identity(state, q, &pc, stages, nst, &facts, &id, encoded, &len, sha)) return -RP_LOOKAHEAD_IDENTITY;
+    if (regs != rp_tex_reg_gen()) return -RP_LOOKAHEAD_DESCRIPTOR_CHANGED;
     pthread_mutex_lock(&g_progs_mu);
     const int cached = nvn_hm_get(&g_progs, sha) != NULL || inflight_find_locked(sha) != NULL;
     pthread_mutex_unlock(&g_progs_mu);
     if (cached) return 0;
     struct work_snap *snap = snap_capture(&facts, &id, sha, &pc, stages, nst);
-    if (!snap) return -1;
+    if (!snap) return -RP_LOOKAHEAD_SNAPSHOT;
     char ident[49], why[128] = "", *json = NULL;
-    int result = -1;
+    int result = -RP_LOOKAHEAD_REQUEST;
     if (!build_graphics_request(snap, ident, NULL, &json, &len, why, sizeof why)) {
+        result = -RP_LOOKAHEAD_QUEUE;
         uint8_t key[32];
         compile_future_key(pc.session, pc.generation, sha, json, len, key);
         pthread_mutex_lock(&g_progs_mu);
@@ -3023,7 +3034,7 @@ int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req
                 struct work_snap *unused = lookahead_take_snapshot(key);
                 entry_free(lookahead_take_program(key));
                 snap_free(unused);
-                result = submitted == 2 ? 0 : -1;
+                result = submitted == 2 ? 0 : -RP_LOOKAHEAD_QUEUE;
             } else atomic_fetch_add_explicit(&g_live_enqueued, 1, memory_order_relaxed);
         }
     }

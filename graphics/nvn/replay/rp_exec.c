@@ -39,6 +39,8 @@ static const char *const k_op_name[OP_NVN2_END_] = {
 _Static_assert(OP_COUNT_ == 52 && OP_NVN2_END_ == 56, "录制命令个数变了：补 k_op_name、接线表和 nvn_be_exec");
 const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] ? k_op_name[op] : "OP_?"; }
 
+static uint64_t g_lookahead_stops[RP_LOOKAHEAD_STOP_COUNT][OP_NVN2_END_ + 1];
+
 // ---------- 提交 ----------
 // 固定地址的段属结果：mid 回调不能碰仍会 realloc 的 post 表。最后一段回调后统一回收。
 struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_result values[NVN_GPU_TIMESTAMP_SLOTS]; };
@@ -397,6 +399,7 @@ void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账
     __atomic_store_n(&g_bad_readback_fence, 0, __ATOMIC_RELEASE);
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
     g_rc_skip = g_rc_active = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
+    memset(g_lookahead_stops, 0, sizeof g_lookahead_stops);
 }
 
 void nvn_be_sub_begin(void) {
@@ -740,10 +743,34 @@ static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_N
 // 弱链接[replay]：rp_shader_lookahead_end
 #pragma weak rp_shader_lookahead_end
 
+static void lookahead_stop(enum rp_lookahead_stop reason, uint32_t op) {
+    static const char *const names[RP_LOOKAHEAD_STOP_COUNT] = {
+        [RP_LOOKAHEAD_COMMAND] = "command", [RP_LOOKAHEAD_RECORD] = "record",
+        [RP_LOOKAHEAD_SCAN_LIMIT] = "scan_limit", [RP_LOOKAHEAD_SUBMIT_STATE] = "submit_state",
+        [RP_LOOKAHEAD_TARGET] = "target", [RP_LOOKAHEAD_DRAW] = "draw",
+        [RP_LOOKAHEAD_TEX_POOL] = "tex_pool", [RP_LOOKAHEAD_PROGRAM] = "program",
+        [RP_LOOKAHEAD_DYNAMIC_UBO] = "dynamic_ubo", [RP_LOOKAHEAD_RESOURCE] = "resource",
+        [RP_LOOKAHEAD_CONTEXT] = "context", [RP_LOOKAHEAD_IDENTITY] = "identity",
+        [RP_LOOKAHEAD_DESCRIPTOR_CHANGED] = "descriptor_changed", [RP_LOOKAHEAD_SNAPSHOT] = "snapshot",
+        [RP_LOOKAHEAD_REQUEST] = "request", [RP_LOOKAHEAD_QUEUE] = "queue",
+    };
+    const uint32_t bucket = op < OP_NVN2_END_ ? op : OP_NVN2_END_;
+    const uint64_t count = ++g_lookahead_stops[reason][bucket];
+    // 每笔提交只记首退；同类首笔立刻可见，重复时在 2 的幂次打印累计值。
+    if (count & (count - 1)) return;
+    char line[160];
+    snprintf(line, sizeof line, "前瞻首退 reason=%s opcode=%s op=%u count=%llu", names[reason],
+             op == UINT32_MAX ? "none" : rp_op_name(op), (unsigned)op, (unsigned long long)count);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
+
 void nvn_be_sub_index(const uint64_t *handles, int n) {
-    if (!g_cmd || g_rc_active || !rp_shader_lookahead_budget || !rp_shader_lookahead) return;
+    if (!rp_shader_lookahead_budget || !rp_shader_lookahead) return;
     unsigned left = rp_shader_lookahead_budget();
     if (!left) return;
+    enum rp_lookahead_stop stopped = RP_LOOKAHEAD_SUBMIT_STATE;
+    uint32_t op = UINT32_MAX;
+    if (!g_cmd || g_rc_active) goto stop;
     struct rp_state state = rp_S;
     const p_set_rt *targets = rp_pass_target();
     p_set_rt captured;
@@ -752,43 +779,50 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
     int saw_draw = 0;
     for (int i = 0; i < n; i++) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)handles[i];
-        if (!p) return;
+        if (!p) { stopped = RP_LOOKAHEAD_RECORD; op = UINT32_MAX; goto stop; }
         for (;;) {
-            if (!left || !records--) return;
+            if (!left) return;
+            if (!records--) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; op = UINT32_MAX; goto stop; }
             op_hdr h;
             memcpy(&h, p, sizeof h);
-            if (rec_bad(h)) return;
+            op = h.op;
+            if (rec_bad(h)) { stopped = RP_LOOKAHEAD_RECORD; goto stop; }
             const void *payload = p + sizeof h;
             p += h.size;
             if (h.op == OP_END) break;
             if (h.op == OP_SET_RT) {
-                if (saw_draw) return;  // 先前目标仍可能有 GPU 待写内容
+                if (saw_draw) { stopped = RP_LOOKAHEAD_TARGET; goto stop; }   // 先前目标仍可能有 GPU 待写内容
                 const p_set_rt_c *head = payload;
-                if (h.size < sizeof h + sizeof *head || h.size - sizeof h < set_rt_payload(head)) return;
+                if (h.size < sizeof h + sizeof *head || h.size - sizeof h < set_rt_payload(head)) {
+                    stopped = RP_LOOKAHEAD_RECORD;
+                    goto stop;
+                }
                 targets = set_rt_rec(payload, h.size, &captured);
                 continue;
             }
             if (h.op != OP_DRAW && h.op != OP_DRAW_IDX) {
-                if (!rp_state_lookahead(&state, h.op, payload, h.size)) return;
+                if (!rp_state_lookahead(&state, h.op, payload, h.size)) { stopped = RP_LOOKAHEAD_COMMAND; goto stop; }
                 continue;
             }
-            if (!targets || targets->n < 0 || targets->n > 8 || state.tf_on) return;
+            if (!targets || targets->n < 0 || targets->n > 8) { stopped = RP_LOOKAHEAD_TARGET; goto stop; }
+            stopped = RP_LOOKAHEAD_DRAW;
+            if (state.tf_on) goto stop;
             struct rp_shader_req q = {.rt_count = targets->n};
             if (h.op == OP_DRAW) {
                 p_draw tmp;
-                if (h.size < sizeof h + offsetof(p_draw, ind)) return;
+                if (h.size < sizeof h + offsetof(p_draw, ind)) { stopped = RP_LOOKAHEAD_RECORD; goto stop; }
                 const p_draw *d = draw_rec(payload, h.size, &tmp);
-                if (d->ind || d->mdi_cnt || d->tfc || d->count <= 0) return;
+                if (d->ind || d->mdi_cnt || d->tfc || d->count <= 0) goto stop;
                 q.prim = (uint32_t)d->prim;
             } else {
                 p_draw_idx tmp;
-                if (h.size < sizeof h + sizeof(p_draw_idx_single)) return;
+                if (h.size < sizeof h + sizeof(p_draw_idx_single)) { stopped = RP_LOOKAHEAD_RECORD; goto stop; }
                 const p_draw_idx *d = draw_idx_rec(payload, h.size, &tmp);
-                if (d->ind || d->mdi_cnt || d->itype < 0 || d->itype > 2 || d->count <= 0) return;
+                if (d->ind || d->mdi_cnt || d->itype < 0 || d->itype > 2 || d->count <= 0) goto stop;
                 q.prim = (uint32_t)d->prim;
             }
             // 只前瞻不需展开或重写的拓扑。真实绘制仍走原解码与校验。
-            if (q.prim != 0 && q.prim != 1 && q.prim != 4) return;
+            if (q.prim != 0 && q.prim != 1 && q.prim != 4) goto stop;
             for (int j = 0; j < targets->n; j++) {
                 if (targets->color[j])
                     q.rt_format[j] = (uint32_t)(targets->has_cview[j] && targets->cview[j].set_format
@@ -796,10 +830,13 @@ void nvn_be_sub_index(const uint64_t *handles, int n) {
             }
             saw_draw = 1;
             const int accepted = rp_shader_lookahead(&state, &q, targets);
-            if (accepted < 0) return;
+            if (accepted < 0) { stopped = -accepted; goto stop; }
             left -= (unsigned)accepted;
         }
     }
+    return;
+stop:
+    lookahead_stop(stopped, op);
 }
 
 
