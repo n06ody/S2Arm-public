@@ -20,7 +20,17 @@
 #include <string.h>
 
 // off/len 是镜像持有的完整区间；copy_len 是从 off 起需要回写到客体的字节数。只在同次提交、同一镜像内合并。
-struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, copy_len; };
+struct write_copy_span { uint64_t begin, end; };
+struct write_copy_set {
+    unsigned count;   // 0：存在未知写入范围或超容量，沿用 copy_len 包络
+    struct write_copy_span spans[RP_GPU_WRITE_COPY_MAX];
+};
+struct gpu_write {
+    uint64_t off, len, id;
+    uint8_t mi, landing;
+    uint64_t sub, copy_len;
+    struct write_copy_set copies;
+};
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
 // checked[i]：第 i 页上次逐页核对时的全局写代号（代号没动 = 那之后游戏没写过任何被跟踪的页，这一页不用再核）。
 // use_sub / use_fence：最近一次用到这份镜像的提交（序号、栅栏值）；prev_fence：再往前一次用到它的提交的栅栏值——
@@ -60,6 +70,7 @@ static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数�
 static int g_exact_on, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
 static uint64_t g_exact_mapping, g_exact_pool;
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
+static int g_gw_disjoint_copy_on;   // 已证前缀（安卓须先打开 nvk_land_bound）才会走分离拷贝
 static int g_land_noresync = -1;   // g_bmu 内按会话锁定
 static int land_noresync_on(void) {
     if (g_land_noresync < 0) {
@@ -352,13 +363,39 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
     }
 }
 
+static void write_copy_union(struct write_copy_set *set, const struct write_copy_set *other) {
+    if (!other->count) set->count = 0;
+    for (unsigned i = 0; i < other->count && set->count; i++) {
+        struct write_copy_span span = other->spans[i];
+        unsigned first = 0;
+        while (first < set->count && set->spans[first].end < span.begin) first++;
+        unsigned end = first;
+        while (end < set->count && set->spans[end].begin <= span.end) {
+            if (set->spans[end].begin < span.begin) span.begin = set->spans[end].begin;
+            if (set->spans[end].end > span.end) span.end = set->spans[end].end;
+            end++;
+        }
+        if (first == end && set->count == RP_GPU_WRITE_COPY_MAX) {
+            set->count = 0;
+            break;
+        }
+        memmove(set->spans + first + 1, set->spans + end, (set->count - end) * sizeof span);
+        set->spans[first] = span;
+        set->count = set->count - (end - first) + 1;
+    }
+}
+
+static struct write_copy_set write_copies(const struct gpu_write *write) {
+    if (write->copies.count) return write->copies;
+    return (struct write_copy_set){1, {{write->off, write->off + write->copy_len}}};
+}
+
 // GPU 往池里写（计算着色器写存储缓冲）。提交线程登记这一段，返回登记号；段完成时 rp_buf_gpu_write_land 把结果拷回游戏内存、撤掉登记。
 // pool_key：这段所在池的起点（落地时凭它找镜像：池已经销毁就什么都不做）。0 = 地址不在登记过的池里。
 // 同段合并（开关 nvk_land_merge，缺省开）：本次提交里已经登记过、同一份镜像、还没开始落地、区间与这一段相交或首尾相接的那一条，
 // 直接扩成并集，不另起一条（merged 非空时才合并；返回已有那条的登记号，*merged 置 1，调用方不要再把它记进本次提交的落地表）。
-// 为什么：落地是段完成时按登记逐条把镜像拷回游戏内存，一条登记就是一次整段 memcpy。同一块存储缓冲被多个派发反复绑定写、每次都登记整段绑定范围时，
-// 重叠的几条拷的是同一份镜像里同一段字节（段完成时镜像里已是最终内容），拷一次与拷多次结果相同。
-// 只并「相交 / 首尾相接」的：并集里没有任何没被写过的字节。中间有空隙的不桥接——空隙里的镜像字节可能比游戏内存里的旧，落地会把新内容盖掉。
+// 保护区只并相交 / 首尾相接的登记；这一区间决定镜像选择和阻止上传的范围，直到所有拷贝完成。
+// 已证明的回写前缀独立求并集：复制包络会把两个前缀间未写过的镜像字节盖回客体。未知范围或超容量时保留原包络算法。
 uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged) {
     static uint64_t next_id;
     const uint8_t *mem; uint64_t size;
@@ -366,12 +403,18 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
     if (!copy_len || copy_len > len) return 0;
     addr = buf_address(addr, len);
     if (!rp_pool_find(addr, len, &mem, &size)) { mirror_unknown_address(); return 0; }
-    if (g_gw_merge_on < 0 || !(++g_gw_merge_k & 255)) g_gw_merge_on = nvn_plat_flag("nvk_land_merge", 1) != 0;   // 开关：每 256 次登记重读一次
+    if (g_gw_merge_on < 0 || !(++g_gw_merge_k & 255)) {   // 开关：每 256 次登记重读一次
+        g_gw_merge_on = nvn_plat_flag("nvk_land_merge", 1) != 0;
+        g_gw_disjoint_copy_on = nvn_plat_flag("nvk_land_disjoint_copy", 1) != 0;
+    }
     const int merge_on = g_gw_merge_on;
     pthread_mutex_lock(&g_bmu);
     struct shadow *s = shadow_get(mem, size); uint64_t id = 0;
     if (s) {
         const uint64_t off = addr - (uint64_t)(uintptr_t)mem, sub = rp_sub_serial();
+        struct write_copy_set copies = {0};
+        if (g_gw_disjoint_copy_on && copy_len < len)
+            copies = (struct write_copy_set){1, {{off, off + copy_len}}};
         rp_perf_add(RP_PERF_GW_REG_N, 1); rp_perf_add(RP_PERF_GW_REG_KB, len / 1024);
         if (merged && merge_on) {
             int mi = g_mirror_cur;   // 与 mirror_pick 同一规则（不带它记账的副作用）：与任一未落地登记相交就跟着那一条的镜像，否则用当前这一份
@@ -385,6 +428,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
                 if (g->off < lo) lo = g->off;
                 if (g->off + g->len > hi) hi = g->off + g->len;
                 if (g->off + g->copy_len > copy_hi) copy_hi = g->off + g->copy_len;
+                if (copies.count) write_copy_union(&copies, &g->copies);
                 old_sum += g->len;
                 if (hit < 0) { hit = k; id = g->id; }
                 else {   // 又一条与并集相接：吸进第一条，自己撤掉（它的登记号还在本次提交的落地表里，迟到的落地按「找不到」忽略）
@@ -397,6 +441,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
                 g->off = lo; g->len = hi - lo; g->copy_len = copy_hi - lo;
+                g->copies = copies;
                 mirror_touch(&s->m[mi], off, off + len);
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
@@ -408,7 +453,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
         }
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
-            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
+            id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub, .copies = copies}; *pool_key = (uint64_t)(uintptr_t)mem;
             mirror_touch(&s->m[mi], off, off + len);
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
@@ -461,40 +506,60 @@ void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t cou
                 if (refs[mid].id < w->id) lo = mid + 1;
                 else hi = mid;
             }
-            if (lo < end && refs[lo].id == w->id)
-                spans[refs[lo].index] = (nvn_gpu_readback_span){s->m[w->mi].buf, w->off, w->copy_len, UINT64_MAX};
+            if (lo < end && refs[lo].id == w->id) {
+                const struct write_copy_set copies = write_copies(w);
+                nvn_gpu_readback_span *out = spans + refs[lo].index * RP_GPU_WRITE_COPY_MAX;
+                for (unsigned j = 0; j < copies.count; j++) {
+                    const struct write_copy_span span = copies.spans[j];
+                    out[j] = (nvn_gpu_readback_span){s->m[w->mi].buf, span.begin, span.end - span.begin, UINT64_MAX};
+                }
+            }
         }
         pthread_mutex_unlock(&g_bmu);
         first = end;
     }
 }
 void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok) {
-    rp_buf_gpu_write_land_from(pool_key, id, ok, NULL);
+    rp_buf_gpu_write_land_from(pool_key, id, ok, NULL, NULL);
 }
-void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {   // 线程：[完成回调]
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok,
+                              const uint8_t *staged, const uint64_t *readback_plus_one) {   // 线程：[完成回调]
     // 登记保留到锁外拷贝结束：同步和镜像选择都必须避开尚未完整落地的区间。
     // 锁内只标记正在拷，13 MB 的拷贝放到锁外做：这一段原来持锁拷贝，
     // 与提交线程的缓冲解析抢同一把锁，重叠档实测「锁等待」11.1–21.2 毫秒/帧（见坑记录续 25）。
-    const uint8_t *src = NULL, *mem = NULL; uint64_t off = 0, len = 0, copy_len = 0; struct shadow *s = NULL; int found = 0, wmi = 0;
+    const uint8_t *mirror = NULL, *mem = NULL; uint64_t off = 0, len = 0; struct shadow *s = NULL; int wmi = 0;
+    struct write_copy_set copies = {0};
     pthread_mutex_lock(&g_bmu);
     s = nvn_hm_get(&g_shadow, &pool_key);
     if (s) for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id && !s->gw[i].landing) {
-        mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi; copy_len = s->gw[i].copy_len;
-        const uint8_t *mirror = ok && !staged ? nvn_gpu_buf_cpu(s->m[wmi].buf) : NULL;
-        if (ok) src = staged ? staged : (mirror ? mirror + off : NULL);
-        rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, copy_len / 1024);
-        s->gw[i].landing = 1; found = 1;
+        mem = s->mem; off = s->gw[i].off; len = s->gw[i].len; wmi = s->gw[i].mi;
+        copies = write_copies(&s->gw[i]);
+        uint64_t bytes = 0;
+        int need_mirror = !staged;
+        for (unsigned j = 0; j < copies.count; j++) {
+            bytes += copies.spans[j].end - copies.spans[j].begin;
+            if (staged && !readback_plus_one[j]) need_mirror = 1;
+        }
+        if (ok && need_mirror) mirror = nvn_gpu_buf_cpu(s->m[wmi].buf);
+        rp_perf_add(RP_PERF_LAND_N, 1); rp_perf_add(RP_PERF_LAND_KB, bytes / 1024);
+        s->gw[i].landing = 1;
         s->landing++;
         if (s->nlr < 16) s->lr[s->nlr++] = (struct land_rng){off, len};   // 锁外拷贝期间要避开的区间
         break; }
     pthread_mutex_unlock(&g_bmu);
-    if (!found) return;
+    if (!copies.count) return;
+    for (unsigned j = 0; ok && j < copies.count; j++) {
+        const struct write_copy_span span = copies.spans[j];
+        const uint8_t *src = staged && readback_plus_one[j] ? staged + (readback_plus_one[j] - 1) :
+                             mirror ? mirror + span.begin : NULL;
+        if (!src) continue;
 #ifdef S2A_GPU_LAND_TEST
-    extern void rp_test_land_copy(void *, const void *, size_t);
-    if (src) rp_test_land_copy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)copy_len);
+        extern void rp_test_land_copy(void *, const void *, size_t);
+        rp_test_land_copy((uint8_t *)(uintptr_t)(mem + span.begin), src, (size_t)(span.end - span.begin));
 #else
-    if (src) memcpy((uint8_t *)(uintptr_t)(mem + off), src, (size_t)copy_len);   // 游戏内存是真值：GPU 的结果回到它那里
+        memcpy((uint8_t *)(uintptr_t)(mem + span.begin), src, (size_t)(span.end - span.begin));
 #endif
+    }
     pthread_mutex_lock(&g_bmu);
     for (int i = 0; i < s->ngw; i++) if (s->gw[i].id == id) { s->gw[i] = s->gw[--s->ngw]; break; }
     for (int i = s->nlr - 1; i >= 0; i--) if (s->lr[i].off == off && s->lr[i].len == len) { s->lr[i] = s->lr[--s->nlr]; break; }

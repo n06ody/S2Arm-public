@@ -43,7 +43,10 @@ const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] 
 struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_result values[NVN_GPU_TIMESTAMP_SLOTS]; };
 struct post { volatile uint32_t *val; uint32_t mode, v; uint64_t report; uint32_t type; struct ts_segment *ts; uint32_t slot; };   // 完成后写事件值（mode 0 写 / 1 加）；report 非 0 = 计数器报告的写回地址
 struct occ_ev { uint32_t pos; uint32_t report; uint64_t addr; };   // 遮挡计数的事件：发生时本段已经开过 pos 个槽；report 0 = 复位、1 = 报告（写回 addr）
-struct gw_ev { uint64_t pool_key, id, readback_plus_one; };   // 本段里 GPU 写进池的一段（rp_buf_gpu_write_note 的登记）
+struct gw_ev {
+    uint64_t pool_key, id;
+    uint64_t readback_plus_one[RP_GPU_WRITE_COPY_MAX];   // 0 = 这一片从镜像回写
+};
 struct sub { struct ts_segment *ts_head, *ts_current; uint32_t refs; /* 录制者/末段回调持一引用，每个 mid 回调另持一引用。 */
              struct post *p; int n, cap, nfx; /* nfx：p 里时间戳报告以外的条数 */ uint64_t t_commit; struct occ_ev *oe; int noe, oecap; uint64_t fence; struct gw_ev *gw; int ngw, gwcap; uint64_t readback_bytes;
     uint64_t *oc; uint32_t noc, occ_base; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
@@ -199,21 +202,26 @@ static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
     if (nvn_gpu_readback_cmd_enabled ? !nvn_gpu_readback_cmd_enabled(c) :
         (!nvn_gpu_readback_enabled || !nvn_gpu_readback_enabled())) return;
     const uint32_t count = (uint32_t)s->ngw;
+    if (count > UINT32_MAX / RP_GPU_WRITE_COPY_MAX) return;
+    const uint32_t slots = count * RP_GPU_WRITE_COPY_MAX;
     struct rp_gpu_write_ref local_refs[16];
-    nvn_gpu_readback_span local_spans[16] = {0};
+    nvn_gpu_readback_span local_spans[16 * RP_GPU_WRITE_COPY_MAX] = {0};
     struct rp_gpu_write_ref *refs = count <= 16 ? local_refs : calloc(count, sizeof *refs);
-    nvn_gpu_readback_span *spans = count <= 16 ? local_spans : calloc(count, sizeof *spans);
+    nvn_gpu_readback_span *spans = count <= 16 ? local_spans : calloc(slots, sizeof *spans);
     if (!refs || !spans) red("%s", "回写暂存：复制表分配失败，使用镜像回写");
     else {
         for (uint32_t i = 0; i < count; i++)
             refs[i] = (struct rp_gpu_write_ref){s->gw[i].pool_key, s->gw[i].id, i};
         qsort(refs, count, sizeof *refs, compare_write_ref);
         rp_buf_gpu_write_snapshot(refs, count, spans);
-        s->readback_bytes = nvn_gpu_readback_record(c, spans, count);
+        s->readback_bytes = nvn_gpu_readback_record(c, spans, slots);
         if (s->readback_bytes)
-            for (uint32_t i = 0; i < count; i++)
-                if (spans[i].src && spans[i].readback_offset != UINT64_MAX)
-                    s->gw[i].readback_plus_one = spans[i].readback_offset + 1;
+            for (uint32_t i = 0; i < count; i++) {
+                const nvn_gpu_readback_span *group = spans + i * RP_GPU_WRITE_COPY_MAX;
+                for (unsigned j = 0; j < RP_GPU_WRITE_COPY_MAX && group[j].src; j++)
+                    if (group[j].readback_offset != UINT64_MAX)
+                        s->gw[i].readback_plus_one[j] = group[j].readback_offset + 1;
+            }
     }
     if (spans != local_spans) free(spans);
     if (refs != local_refs) free(refs);
@@ -243,8 +251,7 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
     const int executed = d->status != NVN_GPU_DONE_FAILED;
     for (int i = 0; i < s->ngw; i++) {
         const struct gw_ev *w = &s->gw[i];
-        const uint8_t *staged = executed && w->readback_plus_one ? d->readback + (w->readback_plus_one - 1) : NULL;
-        rp_buf_gpu_write_land_from(w->pool_key, w->id, executed, staged);
+        rp_buf_gpu_write_land_from(w->pool_key, w->id, executed, d->readback, w->readback_plus_one);
     }
     if (d->status != NVN_GPU_DONE_FAILED)   // 没执行的段不做任何成功回写
         for (int i = 0; i < s->n; i++) {

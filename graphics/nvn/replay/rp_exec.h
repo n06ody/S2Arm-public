@@ -207,8 +207,13 @@ int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_strid
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
+enum { RP_GPU_WRITE_COPY_MAX = 4 };
+// Each reference owns RP_GPU_WRITE_COPY_MAX slots starting at index * RP_GPU_WRITE_COPY_MAX.
+// The caller initializes unused slots to zero. Snapshot and completion share the same span order.
 void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
-void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
+// With staging present, each offset is biased by one. Zero selects the original mirror.
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok,
+                              const uint8_t *staged, const uint64_t *readback_plus_one);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 // len owns the full mirror interval; copy_len only limits staging and guest materialization.
 uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged);
