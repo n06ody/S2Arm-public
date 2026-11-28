@@ -58,7 +58,12 @@ static uint64_t now_ns(void) { return s2a_rp_test_clock_ns(); }
 static uint64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 #endif
 static uint64_t g_pf[RP_PERF_N];
-void rp_perf_take(uint64_t out[RP_PERF_N]) { for (int i = 0; i < RP_PERF_N; i++) out[i] = __atomic_exchange_n(&g_pf[i], 0, __ATOMIC_ACQ_REL); }
+void rp_perf_take(uint64_t out[RP_PERF_N]) {
+    for (int i = 0; i < RP_PERF_N; i++) out[i] = __atomic_exchange_n(&g_pf[i], 0, __ATOMIC_ACQ_REL);
+    // 在窗口边界加回分因，保留原有回退总数，每次同步只记一个计数。
+    out[RP_PERF_MIRROR_FALLBACK] += out[RP_PERF_MIRROR_FB_GW] + out[RP_PERF_MIRROR_FB_LAND] +
+        out[RP_PERF_MIRROR_FB_OVERFLOW] + out[RP_PERF_MIRROR_FB_UNKNOWN] + out[RP_PERF_MIRROR_FB_OTHER];
+}
 static void pf_add(int i, uint64_t v) { __atomic_fetch_add(&g_pf[i], v, __ATOMIC_RELAXED); }
 
 // ---------- 逐帧分项账（长帧归因，开关 nvk_hitch_log） ----------

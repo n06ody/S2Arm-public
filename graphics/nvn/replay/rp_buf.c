@@ -19,6 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 
+// 带非一致分代镜像的后端可提供原子粒度，缺该接口时按字节保护。
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_version_atom
+
 // off/len 是镜像持有的完整区间；copy_len 是从 off 起需要回写到客体的字节数。只在同次提交、同一镜像内合并。
 struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, copy_len; };
 // 一份镜像。synced[i]：第 i 页上次同步取的脏页代号，0 = 从没同步；sub[i]：那次同步所在的提交序号；
@@ -29,9 +33,17 @@ struct gpu_write { uint64_t off, len, id; uint8_t mi, landing; uint64_t sub, cop
 // 脏页追加日志（#1501 A②）：stale 每页一位 =「这份镜像里这页是旧的」，stale_sum 每位汇总 stale 的一个字（一位管 64 页，一个字管 4096 页）；
 // log_cur / log_id：这份镜像在池的追加日志里读到哪（nvn_dirty_log_*）。两份镜像各有一套，互不影响。
 enum { MP_PLAIN = 0, MP_LOG = 2, READ_BUCKETS = 32, EXACT_RANGES = 64 };
+enum { EXACT_INITIAL = 128, EXACT_MAX = 4096, EXACT_BLOCK = 64 * 1024 };
 struct read_range { uint64_t sub, lo, hi; };   // 页区间 [lo, hi]；同桶碰撞取包络，宁可多走有序传输
 struct byte_range { uint64_t lo, hi; };        // 镜像内半开区间 [lo, hi)
-struct mirror_exact { uint64_t sub; unsigned n; struct byte_range ranges[EXACT_RANGES]; };
+struct mirror_exact {
+    uint64_t sub;
+    uint64_t *coarse;
+    size_t coarse_words;
+    unsigned n, capacity;
+    int incomplete;
+    struct byte_range ranges[];
+};
 struct mirror { nvn_gpu_buf buf; uint64_t *synced, *sub, *checked; uint64_t seen_map; uint8_t seen_ok, path; uint64_t use_sub, use_fence, prev_fence;
                 uint64_t *stale, *stale_sum; uint64_t log_cur, log_id, alias_sub;
                 struct read_range reads[READ_BUCKETS]; struct mirror_exact *exact; };
@@ -58,6 +70,7 @@ static nvn_gpu_buf g_null_storage;
 static int g_gw_live;   // 所有池的未落地登记数（含正在落地的项）
 static int g_untracked_shadows;   // 不受写跟踪的池里有镜像的个数（原子读写）：为 0（受跟踪的游戏全程如此）时 rp_write_note 不多走一步
 static int g_exact_on, g_exact_unknown;   // g_bmu 下，整次提交锁定，拆段不清零
+static int g_exact_guard = -1;   // 精确保护按会话锁定，默认关
 static uint64_t g_exact_mapping, g_exact_pool;
 static int g_gw_merge_on = -1; static unsigned g_gw_merge_k;   // 开关 nvk_land_merge 的缓存与读取计数（见 rp_buf_gpu_write_note2）
 static int g_land_noresync = -1;   // g_bmu 内按会话锁定
@@ -108,6 +121,7 @@ static int limbo_push(nvn_gpu_buf b) {   // 调用方持 g_bmu；0 = 记不下�
 }
 static void mirror_free(struct mirror *m, int defer) {
     if (m->buf && !(defer && limbo_push(m->buf))) nvn_gpu_buf_release(m->buf, NULL, NULL);
+    if (m->exact) free(m->exact->coarse);
     free(m->synced); free(m->sub); free(m->checked); free(m->stale); free(m->stale_sum); free(m->exact); memset(m, 0, sizeof *m);
 }
 static void shadow_free(struct shadow *s, int defer) { if (s->ngw) __atomic_sub_fetch(&g_gw_live, s->ngw, __ATOMIC_RELEASE); if (s->untracked) __atomic_sub_fetch(&g_untracked_shadows, 1, __ATOMIC_RELEASE);
@@ -304,16 +318,90 @@ static int gw_covers_page(const struct shadow *s, int mi, uint64_t k, size_t ps,
     *bytes = end - a;
     return gw_covers(s, mi, a - base, end - base);
 }
-// 读写在同一份镜像里共用一张表。只并重叠或接邻的区间，保留空隙；溢出则整份镜像退回原顺序。
-static inline void mirror_touch(struct mirror *m, uint64_t lo, uint64_t hi) {
+// 有序并集的尾端随起点严格递增。插入时并相邻段，查交时跳过相邻段。
+static unsigned exact_first_range(const struct mirror_exact *x, uint64_t lo, int adjacent) {
+    unsigned first = 0, end = x->n;
+    while (first < end) {
+        const unsigned mid = first + (end - first) / 2;
+        const uint64_t hi = x->ranges[mid].hi;
+        if (hi < lo || (hi == lo && !adjacent)) first = mid + 1;
+        else end = mid;
+    }
+    return first;
+}
+
+// 只把溢出的区间按 64 KiB 块记到池大小限定的位图。位图分配失败时放弃本提交的前移证明。
+static void exact_spill(struct mirror_exact *x, uint64_t size, uint64_t lo, uint64_t hi) {
+    if (!x->coarse) {
+        const uint64_t words = (size - 1) / EXACT_BLOCK / 64 + 1;
+        if (words <= SIZE_MAX / sizeof *x->coarse)
+            x->coarse = calloc((size_t)words, sizeof *x->coarse);
+        if (!x->coarse) { x->incomplete = 1; return; }
+        x->coarse_words = (size_t)words;
+    }
+    const uint64_t first = lo / EXACT_BLOCK, last = (hi - 1) / EXACT_BLOCK;
+    for (uint64_t i = first / 64; i <= last / 64; i++) {
+        const uint64_t low = i == first / 64 ? UINT64_MAX << (first % 64) : UINT64_MAX;
+        const uint64_t high = i == last / 64 ? UINT64_MAX >> (63 - last % 64) : UINT64_MAX;
+        x->coarse[i] |= low & high;
+    }
+}
+
+static int exact_coarse_hit(const struct mirror_exact *x, uint64_t lo, uint64_t hi) {
+    if (!x->coarse) return 0;
+    const uint64_t first = lo / EXACT_BLOCK, last = (hi - 1) / EXACT_BLOCK;
+    for (uint64_t i = first / 64; i <= last / 64; i++) {
+        const uint64_t low = i == first / 64 ? UINT64_MAX << (first % 64) : UINT64_MAX;
+        const uint64_t high = i == last / 64 ? UINT64_MAX >> (63 - last % 64) : UINT64_MAX;
+        if (x->coarse[i] & low & high) return 1;
+    }
+    return 0;
+}
+
+static void exact_touch(struct mirror *m, uint64_t size, uint64_t lo, uint64_t hi) {
+    struct mirror_exact *x = m->exact;
+    if (x->incomplete || lo >= hi) return;
+    const unsigned first = exact_first_range(x, lo, 1);
+    unsigned next = first;
+    while (next < x->n && x->ranges[next].lo <= hi) {
+        const struct byte_range r = x->ranges[next++];
+        if (r.lo <= lo && hi <= r.hi) return;
+        if (r.lo < lo) lo = r.lo;
+        if (r.hi > hi) hi = r.hi;
+    }
+    if (next == first && x->n == x->capacity) {
+        if (x->capacity == EXACT_MAX) { exact_spill(x, size, lo, hi); return; }
+        const unsigned cap = x->capacity * 2;
+        struct mirror_exact *grown = realloc(x, sizeof *x + cap * sizeof *x->ranges);
+        if (!grown) { x->incomplete = 1; return; }
+        m->exact = x = grown;
+        x->capacity = cap;
+    }
+    if (next != first + 1 && next < x->n)
+        memmove(&x->ranges[first + 1], &x->ranges[next], (x->n - next) * sizeof *x->ranges);
+    x->ranges[first] = (struct byte_range){lo, hi};
+    x->n = x->n - (next - first) + 1;
+}
+
+// 读、GPU 写和实际上传共用一张表。在客体提交边界清空，提交内拆段保留。
+static inline void mirror_touch(struct mirror *m, uint64_t size, uint64_t lo, uint64_t hi) {
     if (!g_exact_on || g_exact_unknown) return;
+    if (g_exact_guard && hi > size) { g_exact_unknown = 1; return; }
     const uint64_t sub = rp_sub_serial();
     if (!m->exact) {
-        m->exact = calloc(1, sizeof *m->exact);
+        const unsigned cap = g_exact_guard ? EXACT_INITIAL : EXACT_RANGES;
+        m->exact = calloc(1, sizeof *m->exact + cap * sizeof *m->exact->ranges);
         if (!m->exact) { g_exact_unknown = 1; return; }
+        m->exact->capacity = cap;
     }
     struct mirror_exact *x = m->exact;
-    if (x->sub != sub) { x->sub = sub; x->n = 0; }
+    if (x->sub != sub) {
+        x->sub = sub;
+        x->n = 0;
+        x->incomplete = 0;
+        if (x->coarse) memset(x->coarse, 0, x->coarse_words * sizeof *x->coarse);
+    }
+    if (g_exact_guard) { exact_touch(m, size, lo, hi); return; }
     if (x->n > EXACT_RANGES) return;
     for (unsigned i = 0; i < x->n;) {
         const struct byte_range r = x->ranges[i];
@@ -346,7 +434,7 @@ static void sync_write(nvn_gpu_cmd xc, uint8_t *direct, struct shadow *s, struct
         const uint64_t begin = a;
         if (direct) memcpy(direct + a, s->mem + a, (size_t)(stop - a));
         else nvn_gpu_buf_write(xc, m->buf, a, s->mem + a, stop - a);
-        mirror_touch(m, a, stop);
+        mirror_touch(m, s->size, a, stop);
         a = stop;
         if (direct && nvn_vk_cold_mirror_host_write) nvn_vk_cold_mirror_host_write(m->buf, begin, stop - begin);
     }
@@ -397,7 +485,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
             if (hit >= 0) {
                 struct gpu_write *g = &s->gw[hit];
                 g->off = lo; g->len = hi - lo; g->copy_len = copy_hi - lo;
-                mirror_touch(&s->m[mi], off, off + len);
+                mirror_touch(&s->m[mi], s->size, off, off + len);
                 const uint64_t grow = g->len > old_sum ? g->len - old_sum : 0;   // 这一段真正新增的字节；其余是和已登记的重叠（本来要多拷一遍的）
                 rp_perf_add(RP_PERF_GW_MERGED_N, 1);
                 rp_perf_add(RP_PERF_GW_MERGED_KB, (len > grow ? len - grow : 0) / 1024);
@@ -409,7 +497,7 @@ uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy
         if (s->ngw == s->cgw) { int nc = s->cgw ? s->cgw * 2 : 8; struct gpu_write *n = realloc(s->gw, (size_t)nc * sizeof *n); if (n) { s->gw = n; s->cgw = nc; } }
         if (s->ngw < s->cgw) { int mi = 0; mirror_pick(s, off, len, &mi);   // 和取这段缓冲时（rp_buf_resolve）挑的是同一份
             id = ++next_id; s->gw[s->ngw++] = (struct gpu_write){.off = off, .len = len, .copy_len = copy_len, .id = id, .mi = (uint8_t)mi, .landing = 0, .sub = sub}; *pool_key = (uint64_t)(uintptr_t)mem;
-            mirror_touch(&s->m[mi], off, off + len);
+            mirror_touch(&s->m[mi], s->size, off, off + len);
             __atomic_add_fetch(&g_gw_live, 1, __ATOMIC_RELEASE); }
     }
     if (!id) g_exact_unknown = 1;
@@ -420,6 +508,20 @@ uint64_t rp_buf_gpu_write_note2(uint64_t addr, uint64_t len, uint64_t *key, int 
     return rp_buf_gpu_write_note_prefix(addr, len, len, key, merged);
 }
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key) { return rp_buf_gpu_write_note2(addr, len, pool_key, NULL); }   // 不合并的老入口（单测与只登记一条的调用方）
+// 锁内查落地表。表满时有区间没记下，不能证明不相交。
+static int landing_hit(const struct shadow *s, uint64_t lo, uint64_t hi) {
+    if (s->landing > s->nlr) return 1;
+    for (int i = 0; i < s->nlr; i++)
+        if (s->lr[i].off < hi && lo < s->lr[i].off + s->lr[i].len) return 1;
+    return 0;
+}
+
+static int gpu_write_hit(const struct shadow *s, uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < s->ngw; i++)
+        if (s->gw[i].off < hi && lo < s->gw[i].off + s->gw[i].len) return 1;
+    return 0;
+}
+
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
     addr = buf_address(addr, len);
     const uint8_t *mem; uint64_t size;
@@ -428,11 +530,7 @@ int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len) {
     int hit = 0;
     pthread_mutex_lock(&g_bmu);
     struct shadow *s = nvn_hm_get(&g_shadow, &key);
-    if (s) {
-        for (int i = 0; i < s->ngw && !hit; i++) if (s->gw[i].off < off + len && off < s->gw[i].off + s->gw[i].len) hit = 1;
-        if (s->landing > s->nlr) hit = 1;   // 正在拷回的段多于记下的区间：说不清，按有算
-        for (int i = 0; i < s->nlr && !hit; i++) if (s->lr[i].off < off + len && off < s->lr[i].off + s->lr[i].len) hit = 1;
-    }
+    if (s) hit = gpu_write_hit(s, off, off + len) || landing_hit(s, off, off + len);
     pthread_mutex_unlock(&g_bmu);
     return hit;
 }
@@ -529,11 +627,32 @@ static int mirror_read_hit(struct mirror *m, uint64_t lo, uint64_t hi) {
 
 static int mirror_sync_class(const struct shadow *s, const struct mirror *m, uint64_t lo, uint64_t hi) {
     const struct mirror_exact *x = m->exact;
-    if (g_exact_unknown || !x || x->sub != rp_sub_serial() || x->n > EXACT_RANGES ||
-        s->ngw || s->landing || s->untracked || nvn_dirty_tracking_unreliable() ||
+    if (g_exact_unknown || !x || x->sub != rp_sub_serial() ||
+        (!g_exact_guard && (x->n > EXACT_RANGES || s->ngw || s->landing)) ||
+        s->untracked || nvn_dirty_tracking_unreliable() ||
         g_exact_mapping != nvn_dirty_mapping_generation() ||
         !g_exact_pool || g_exact_pool != rp_pool_mirror_epoch(s->mem, s->size))
-        return RP_PERF_MIRROR_FALLBACK;
+        return g_exact_guard ? RP_PERF_MIRROR_FB_UNKNOWN : RP_PERF_MIRROR_FALLBACK;
+    if (g_exact_guard) {
+        if (lo >= hi || hi > s->size) return RP_PERF_MIRROR_FB_UNKNOWN;
+        // 完成线程登记区间后才释放 g_bmu、开始拷客体内存。同步也持这把锁。
+        if (landing_hit(s, lo, hi)) return RP_PERF_MIRROR_FB_LAND;
+        if (s->ngw) {
+            uint64_t a = lo, b = hi;
+            const uint64_t atom = nvn_gpu_mirror_version_atom ? nvn_gpu_mirror_version_atom(m->buf) : 0;
+            if (atom) {
+                // 分代非一致镜像的在途保护按完整原子算，并裁到池尾。
+                a &= ~(atom - 1);
+                const uint64_t pad = (0 - b) & (atom - 1);
+                b += pad < s->size - b ? pad : s->size - b;
+            }
+            if (gpu_write_hit(s, a, b)) return RP_PERF_MIRROR_FB_GW;
+        }
+        const unsigned first = exact_first_range(x, lo, 0);
+        if (first < x->n && x->ranges[first].lo < hi) return RP_PERF_MIRROR_OVERLAP;
+        if (x->incomplete || exact_coarse_hit(x, lo, hi)) return RP_PERF_MIRROR_FB_OVERFLOW;
+        return RP_PERF_MIRROR_HOIST;
+    }
     for (unsigned i = 0; i < x->n; i++) {
         const struct byte_range r = x->ranges[i];
         if (r.lo < hi && lo < r.hi) return RP_PERF_MIRROR_OVERLAP;
@@ -555,13 +674,11 @@ static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_
         if (mirror_read_hit(m, i, j)) last = rp_sub_serial();   // 干净读取也属于本次提交，不得在 GPU 读之前直写镜像
         // 本次提交里第一次同步这一串：镜像是 CPU 也能写的共享缓冲，直接写进去，不录成 GPU 上的拷贝（理由与真机读数见坑记录）。
         // 正在拷回的段数多于登记数（表满 16 段没记上）→ 说不清哪段在拷，按原口径整池退回录拷贝
-        int landing_hit = s->landing > s->nlr;   // 这一段里有没有正在锁外拷回的区间与 [a,b) 相交：有就只能退回录拷贝
-        if (!landing_hit && s->nlr) { const uint64_t ra = a - (uintptr_t)mem, rb = b - (uintptr_t)mem;
-            for (int k = 0; k < s->nlr; k++) if (s->lr[k].off < rb && ra < s->lr[k].off + s->lr[k].len) { landing_hit = 1; break; } }
-        uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing_hit ? nvn_gpu_buf_cpu(m->buf) : NULL;
-        if (d) { sync_write(NULL, d, s, m, a - (uintptr_t)mem, b - (uintptr_t)mem); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
+        const uint64_t lo = a - (uintptr_t)mem, hi = b - (uintptr_t)mem;
+        const int landing = landing_hit(s, lo, hi);
+        uint8_t *d = last != rp_sub_serial() && rp_fence_done(m->prev_fence) && !landing ? nvn_gpu_buf_cpu(m->buf) : NULL;
+        if (d) { sync_write(NULL, d, s, m, lo, hi); last = rp_sub_serial(); rp_perf_add(RP_PERF_BUF_SYNC_DIRECT_KB, (b - a) / 1024); }
         else {
-            const uint64_t lo = a - (uintptr_t)mem, hi = b - (uintptr_t)mem;
             // 证明针对实际写入的整组裁剪页，不能只看当前绑定请求的字节。
             const int classify = g_exact_on && last == rp_sub_serial() && rp_pass_is_open();
             int result = classify ? mirror_sync_class(s, m, lo, hi) : RP_PERF_MIRROR_FALLBACK;
@@ -571,7 +688,7 @@ static inline void sync_cpu_run(struct shadow *s, struct mirror *m, const uint8_
             if (classify) {
                 if (result == RP_PERF_MIRROR_HOIST && !rp_pass_is_open()) {
                     rp_perf_add(RP_PERF_P_CUT_XFER, 1);   // 前置段分配失败，主段仍然收了通道
-                    result = RP_PERF_MIRROR_FALLBACK;
+                    result = g_exact_guard ? RP_PERF_MIRROR_FB_OTHER : RP_PERF_MIRROR_FALLBACK;
                 }
                 rp_perf_add(result, 1);
             }
@@ -705,7 +822,7 @@ static int resolve_locked(uint64_t addr, uint64_t len, const uint8_t *mem, uint6
         mirror_note_read(m, lo, hi);
         // 按整个绑定范围记读，着色器实际用了其中哪些字节不用猜。
         const uint64_t off = addr - (uintptr_t)mem;
-        mirror_touch(m, off, off + len);
+        mirror_touch(m, s->size, off, off + len);
     } else g_exact_unknown = 1;
     return ok;
 }
@@ -800,6 +917,7 @@ void rp_buf_hold_begin(void) {
     g_hold = 1; g_hold_tid = pthread_self();
     g_exact_on = exact; g_exact_unknown = 0;
     if (exact) {
+        if (g_exact_guard < 0) g_exact_guard = nvn_plat_flag("nvk_mirror_exact_guard", 0) != 0;
         g_exact_pool = rp_pool_mirror_epoch(NULL, 0);
         g_exact_mapping = nvn_dirty_mapping_generation();
     }
@@ -848,7 +966,7 @@ void rp_buf_reset(void) {
     free(aliases); aliases = NULL; alias_count = alias_cap = 0;
     __atomic_store_n(&aliases_live, 0, __ATOMIC_RELEASE);
     free(g_shadow.keys); free(g_shadow.vals); nvn_hm_init(&g_shadow, 8); g_mirror_cur = 0;
-    g_land_noresync = -1;
+    g_land_noresync = -1; g_exact_guard = -1;
     pthread_mutex_unlock(&g_bmu);
 }
 void rp_buf_stats(uint64_t *bytes, uint64_t *runs) { pthread_mutex_lock(&g_bmu); if (bytes) *bytes = g_sync_bytes; if (runs) *runs = g_sync_runs; pthread_mutex_unlock(&g_bmu); }

@@ -16,7 +16,7 @@ __typeof__(backend_fixture_flag) nvn_plat_flag;
 #include <stdatomic.h>
 
 static nvn_gpu_err test_err;
-static int hoist, pass_open, passes;
+static int hoist, exact_guard, pass_open, passes;
 static void (*prepare_write)(void *, size_t);
 
 #define REQUIRE(expr) do { if (!(expr)) { \
@@ -26,6 +26,7 @@ static void (*prepare_write)(void *, size_t);
 
 int nvn_plat_flag(const char *key, int dflt) {
     if (!strcmp(key, "nvk_mirror_disjoint")) return hoist;
+    if (!strcmp(key, "nvk_mirror_exact_guard") && exact_guard) return 1;
     return backend_fixture_flag(key, dflt);
 }
 
@@ -224,11 +225,15 @@ int main(int argc, char **argv) {
     REQUIRE(argc == 3);
     const char *arm = argv[2];
     const int overlap = !strcmp(arm, "overlap");
-    const int pending = !strcmp(arm, "pending");
+    const int pending_gap = !strcmp(arm, "exact-pending-gap");
+    const int pending_hit = !strcmp(arm, "exact-pending-hit");
+    const int grown_gap = !strcmp(arm, "exact-grown-gap");
+    const int pending = !strcmp(arm, "pending") || pending_gap || pending_hit;
     const int off = !strcmp(arm, "off");
     const int alias = !strcmp(arm, "alias");
-    REQUIRE(alias || overlap || pending || off || !strcmp(arm, "gap"));
+    REQUIRE(alias || overlap || pending || grown_gap || off || !strcmp(arm, "gap"));
     hoist = !off;
+    exact_guard = pending_gap || pending_hit || grown_gap;
     char why[256] = {0};
     REQUIRE(!s2a_vk_device_create(&g_dev, why, sizeof why));
     printf("device: %s (%s)\n", g_dev.properties.deviceName, g_dev.driver_name);
@@ -268,9 +273,16 @@ int main(int argc, char **argv) {
     const size_t pixel_bytes = WIDTH * HEIGHT * 4;
     nvn_gpu_buf readback = make_buf(pixel_bytes, NVN_GPU_MEM_SHARED, NULL);
     REQUIRE(pipe && tex && view && readback);
+    const uint64_t gpu_off = pending_hit ? 4 * page - sizeof(uint32_t) : 5 * page;
+    struct sigaction old_action;
+    if (pending_hit) {
+        struct sigaction action = {.sa_sigaction = alias_page_fault, .sa_flags = SA_SIGINFO};
+        REQUIRE(atomic_is_lock_free(&landing_word));
+        REQUIRE(!sigemptyset(&action.sa_mask) && !sigaction(SIGSEGV, &action, &old_action));
+        atomic_store(&landing_word, (uintptr_t)(guest + gpu_off));
+    }
     nvn_be_sub_begin();
     if (pending) {
-        const uint64_t gpu_off = 5 * page;
         const uint32_t marker = 0xdecafbad;
         // 完成回调在宿主写回；把目标页开放给它，回写数据仍必须来自 GPU。
         prepare_write(guest + gpu_off, sizeof marker);
@@ -281,13 +293,23 @@ int main(int argc, char **argv) {
     // [第 0 页，第 6 页] 的老桶包络罩住第 3 页。overlap 臂再让第一笔真实读取第 3 页。
     draw_column(view, pipe, overlap ? target : guest, 0);
     draw_column(view, pipe, guest + 6 * page, 1);
+    if (grown_gap) {
+        for (unsigned i = 0; i < 40; i++) {
+            REQUIRE(rp_buf_resolve(g_cmd, (uintptr_t)(guest + page + 2 * i), 1, &mirror, NULL));
+            REQUIRE(rp_buf_resolve(g_cmd, (uintptr_t)(guest + 5 * page + 2 * i), 1, &mirror, NULL));
+        }
+    }
     if (overlap) write_vertices(target, 1);
     write_vertices(target + 128, 1);
     draw_column(view, pipe, target + 128, 2);
     const int pre = g_pre != NULL;
     rp_pass_end(g_cmd);
     nvn_gpu_copy_tex_buf(g_cmd, tex, 0, 0, NULL, readback, 0, WIDTH * 4, pixel_bytes);
+    const void *span = pending_hit ? nvn_dirty_span(guest + gpu_off, sizeof(uint32_t)) : NULL;
+    REQUIRE(!pending_hit || (span && nvn_dirty_page_armed(span, guest + gpu_off)));
+    const uint64_t before_landing = nvn_dirty_now();
     commit_mirror();
+    if (pending_hit) REQUIRE(!sigaction(SIGSEGV, &old_action, NULL));
 
     static const uint8_t row[WIDTH][4] = {{255, 0, 0, 255}, {255, 0, 0, 255},
                                            {0, 255, 0, 255}, {0, 0, 0, 255}};
@@ -297,13 +319,15 @@ int main(int argc, char **argv) {
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++) bad += memcmp(pixels + 4 * (y * WIDTH + x), row[x], 4) != 0;
     uint32_t landed = 0;
-    memcpy(&landed, guest + 5 * page, sizeof landed);
+    memcpy(&landed, guest + gpu_off, sizeof landed);
     printf("MIRROR_HOIST arm=%s pre=%d passes=%d draw1=%02x%02x%02x%02x bad_pixels=%u landed=%08x\n",
            arm, pre, passes, pixels[0], pixels[1], pixels[2], pixels[3], bad, landed);
-    const int want_pre = !off && !overlap && !pending;
+    const int want_pre = !off && !overlap && (!pending || pending_gap);
     CHECK(pre == want_pre && passes == 2 - want_pre, "%s: wrong pre-submit placement / pass count", arm);
     CHECK(!bad, "%s: rendered bytes changed", arm);
     CHECK(landed == (pending ? 0xdecafbadu : 0), "%s: GPU writeback changed", arm);
+    CHECK(!pending_hit || nvn_dirty_since_span(span, guest + gpu_off, sizeof landed, before_landing),
+          "%s: landing did not dirty the protected page", arm);
     CHECK(!nvn_unimpl_kinds(), "%s: replay reported unsupported calls", arm);
 
     nvn_gpu_buf_release(readback, NULL, NULL);
