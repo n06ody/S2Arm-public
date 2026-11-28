@@ -10,6 +10,9 @@
 #include <pthread.h>
 #include <time.h>
 #include "nvn.h"
+#ifdef S2A_TEST_SUBMIT_SCAN
+#include "nvn_mtl.h"
+#endif
 #include "libpack_texture_spirv.h"
 #include "rp_shader.h"
 #include "rp_state.h"
@@ -56,7 +59,7 @@ static unsigned fake_array_count;
 static int separate_fixture;
 static int record_link_refused;
 static int link_map_flag;   // nvk_link_map_diag 开关替身
-static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip;
+static int fake_gs_success, fake_gs_result_mode, gs_loads[6], fake_geometry_enabled = 1, fake_depth_clip, fake_tess_enabled;
 static size_t gs_blob_bytes[6];   // 每个阶段最后一次装载的 SPIR-V 字节数（出包预编库命中时认出是哪一份）
 static int fake_gs_fact_deps;
 // 与 fake_gs_fact_deps 一起用：结果的依赖清单末尾再多一条（真编译器的形状）：1 = 请求开关 requiresLinkedVaryingInterface；
@@ -74,6 +77,9 @@ static const char *fake_compile_error;
 static const char *fake_compile_file;
 static pthread_t last_compiler_thread;
 static int fixture_live_compile, fixture_live_slots;
+static int fixture_submit_compile, fixture_submit_slots;
+static pthread_t last_shader_load_thread;
+static uint64_t fixture_compile_generation = 6;
 static int fixture_live_frame_ms = 100, fixture_live_unsafe_ms = 10000;
 static pthread_mutex_t live_gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t live_gate_cv = PTHREAD_COND_INITIALIZER;
@@ -117,14 +123,18 @@ static prog_t gs_program;
 static uint8_t gs_keys[6][8], gs_stages[6], gs_keys_ok;
 #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
+static int fixture_ssbo_window = -1;
 void nvn_plat_safepoint(void) {}
 // 宿主夹具没有跨局缓存目录：程序预热清单不落盘（nvk_prog_warm 只读平台目录，不读环境变量）。
 const char *nvn_plat_dir(int which) { return which == NVN_PLAT_DIR_CACHE ? getenv("S2A_PW_TEST_DIR") : NULL; }
 static int fixture_warm_nowindow, fixture_warm_capture, fixture_no_libpack;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_libpack_ssbo_window") && fixture_ssbo_window >= 0) return fixture_ssbo_window;
     if (!strcmp(name, "no_libpack") && fixture_no_libpack) return 1;
     if (!strcmp(name, "nvk_warm_capture")) return fixture_warm_capture;
     if (!strcmp(name, "nvk_warm_nowindow")) return fixture_warm_nowindow;
+    if (!strcmp(name, "nvk_submit_compile")) return fixture_submit_compile;
+    if (!strcmp(name, "nvk_submit_compile_slots") && fixture_submit_slots) return fixture_submit_slots;
     if (!strcmp(name, "nvk_live_compile_async") && fixture_live_compile >= 0) return fixture_live_compile;
     if (!strcmp(name, "nvk_live_compile_slots") && fixture_live_slots) return fixture_live_slots;
     if (!strcmp(name, "fu_frame_ms")) return fixture_live_frame_ms;
@@ -142,7 +152,17 @@ int nvn_plat_flag(const char *name, int dflt) {
 static int link_map_lines; static char last_link_map[700];   // 配对接口表诊断行（nvk_link_map_diag）
 static int lp_missing_lines, lp_open_lines, lp_unref_lines;   // 出包预编库「不在」（黄）/「已打开」/计算对齐闸拒查 三种行各打了几次
 static char last_unref[256], last_unref_sum[256]; static int lp_unref_sums;   // 计算对齐闸拒查的「累计」汇总行（每 64 次一行）
+#ifdef S2A_TEST_SUBMIT_SCAN
+static char last_lookahead_stop[160];
+static int lookahead_stop_lines;
+#endif
 void nvn_plat_log(int level, const char *cls, const char *text) {
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "前瞻首退 ")) {
+        snprintf(last_lookahead_stop, sizeof last_lookahead_stop, "%s", text);
+        lookahead_stop_lines++;
+    }
+#endif
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "配对接口表 ")) { link_map_lines++; snprintf(last_link_map, sizeof last_link_map, "%s", text); }
     if (!strcmp(cls, "shader") && strstr(text, "出包预编库不在：")) lp_missing_lines += level == NVN_PLAT_LOG_WARN ? 1 : 1000;   // 不是黄就记成大数（必红）
     if (level == NVN_PLAT_LOG_INFO && !strcmp(cls, "shader") && strstr(text, "出包预编库已打开：")) lp_open_lines++;
@@ -183,17 +203,39 @@ const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok
     return &gs_program;
 }
 static uint32_t fixture_ssbo_align;   // 设备 minStorageBufferOffsetAlignment（非窗口补件夹具要非对齐的存储缓冲基址，请求才带 hasUnalignedStorageBuffer）
-void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0); }
+void nvn_gpu_caps_get(nvn_gpu_caps *out) { memset(out, 0, sizeof *out); out->min_ssbo_align = fixture_ssbo_align; out->caps = (fake_geometry_enabled ? NVN_GPU_CAP_GEOMETRY : 0) | (fake_depth_clip ? NVN_GPU_CAP_DEPTH_CLIP_CTL : 0) | (fake_tess_enabled ? NVN_GPU_CAP_TESSELLATION : 0); }
 static uint32_t sampled_fixture_format;
+static int fixture_alias_texture;
+static tex_t fixture_alias_snapshot;
 int rp_tex_snap_by_id(int id, tex_t *t, view_t *v, int *h) {
+    if (fixture_alias_texture && id == 0) {
+        if (t) *t = fixture_alias_snapshot;
+        if (v) memset(v, 0, sizeof *v);
+        if (h) *h = 0;
+        return 1;
+    }
+
     // 77：带视图（改目标为 RECTANGLE）；78 / 79：同一组格式 / 目标 / 深度的两个不同句柄（快路按事实认，不按句柄认）。
     if (!separate_fixture || (id != 77 && id != 78 && id != 79 && !(separate_fixture == 2 && id == 0))) return 0;
-    memset(t, 0, sizeof *t); memset(v, 0, sizeof *v); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
+    memset(t, 0, sizeof *t); t->d.format = NVN_FORMAT_RGBA8; t->d.target = NVN_TEXTURE_TARGET_2D; t->d.depth = 1;
+    if (fixture_submit_compile) {
+        static uint8_t texture_storage[64];
+        t->mem = texture_storage;
+        t->L.size = sizeof texture_storage;
+        static pool_t pool;
+        t->pool = &pool;
+    }
     if (sampled_fixture_format && id == 78) t->d.format = sampled_fixture_format;
     if (separate_fixture == 3) t->d.target = NVN_TEXTURE_TARGET_BUFFER;
     if (separate_fixture == 4) t->d.format = NVN_FORMAT_RGBA8_UI2F;   // 登记了，但 UI2F 不出编译事实
     if (separate_fixture == 5 && id != 77) { t->d.target = NVN_TEXTURE_TARGET_2D_ARRAY; t->d.depth = id == 78 ? 2 : 8; }   // 78 / 79：二维数组贴图，层数 2 / 8（事实里的 array_length）
-    *h = id == 77 && separate_fixture != 3; if (*h) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; } return 1;
+    const int has_view = id == 77 && separate_fixture != 3;
+    if (h) *h = has_view;
+    if (v) {
+        memset(v, 0, sizeof *v);
+        if (has_view) { v->set_target = 1; v->target = NVN_TEXTURE_TARGET_RECTANGLE; }
+    }
+    return 1;
 }
 // 用户常量缓冲夹具：rp_pool_find 只认这块宿主内存（真实实现在 rp_entry.c，查登记过的池）
 static uint32_t ubo_mem[128];
@@ -222,13 +264,18 @@ uint64_t rp_tex_fact_sig(const uint64_t *h, int n, int b, int count) {
     return hash;
 }
 int s2a_direct_provider_compile_context(struct s2a_direct_compile_context *c) {
-    memset(c, 0, sizeof *c); c->session = 4; c->generation = 6; c->direct_abi = 1;
+    memset(c, 0, sizeof *c); c->session = 4; c->generation = fixture_compile_generation; c->direct_abi = 1;
     c->profile_json = external_profile[0] ? external_profile : profile; c->profile_bytes = strlen(c->profile_json); c->profile_hash = external_profile_hash[0] ? external_profile_hash : phash;
     c->translator_closure = external_closure[0] ? external_closure : "closure-test"; c->storage_buffer_offset_alignment = 16; return 0;
 }
+static const char fixture_compute_result[] =
+    "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
+    "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
+    "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],\"bindings\":[],"
+    "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}";
 static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req, s2a_direct_emit_fn emit, void *sink) {
     last_compiler_thread = pthread_self();
-    CHECK(session == 4 && gen == 6, "compile session");
+    CHECK(session == 4 && (gen == 6 || (fixture_submit_compile && gen == 7)), "compile session");
     CHECK(req.bytes < sizeof captured, "request fits capture");
     if (req.bytes >= sizeof captured) return -1;
     memcpy(captured, req.data, (size_t)req.bytes); captured[req.bytes] = 0; compiler_calls++;
@@ -324,11 +371,7 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
     }
     if (fake_cs_success && strstr(captured, "\"program\":{\"kind\":\"compute\"")) {
         // 合法的计算程序结果（形状同 nvn_vk_program_binding_cap_test.c 的 build_compute）：一个 cs 阶段、零个绑定。
-        static const char result[] = "{\"schema\":\"s2a-direct-program-v1\",\"content\":{"
-            "\"contract\":\"s2a-direct-program-content-v1\",\"kind\":\"compute\",\"hasUnalignedStorageBuffer\":false,\"c0Reads\":[],"
-            "\"stages\":[{\"stage\":\"cs\",\"spirv\":\"AwIjBwABAwAAAAAAAQAAAAAAAAA=\"}],\"bindings\":[],"
-            "\"supportLayout\":{\"requiredSize\":2608},\"supportReads\":[]}}";
-        s2a_direct_bytes payload = {(const uint8_t *)result, (uint64_t)(sizeof result - 1)};
+        s2a_direct_bytes payload = {(const uint8_t *)fixture_compute_result, sizeof fixture_compute_result - 1};
         return emit(sink, payload);
     }
     if (fake_compile_error) {
@@ -345,9 +388,32 @@ static int32_t fake_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req
     }
     return -27; // deliberately no result: capture input only
 }
+#ifdef S2A_TEST_SUBMIT_SCAN
+static int submit_alignment_requests[2];
+static int fixture_reject_speculative_compute;
+#endif
 static int32_t fake_parallel_compile(uint64_t session, uint64_t gen, s2a_direct_bytes req,
                                      s2a_direct_emit_fn emit, void *sink) {
     (void)session; (void)gen; (void)req;
+#ifdef S2A_TEST_SUBMIT_SCAN
+    const struct s2a_jv root = {(const char *)req.data, (size_t)req.bytes};
+    struct s2a_jv program, graphics, align, kind;
+    char name[16];
+    int unaligned;
+    if (!s2a_jv_obj_find(root, "program", &program) && !s2a_jv_obj_find(program, "kind", &kind) &&
+        !s2a_jv_str(kind, name, sizeof name) && !strcmp(name, "compute")) {
+        live_gate_pause();
+        if (fixture_reject_speculative_compute && s2a_compile_worker_callback_key()) return -1;
+        const s2a_direct_bytes compute = {(const uint8_t *)fixture_compute_result, sizeof fixture_compute_result - 1};
+        return emit(sink, compute);
+    }
+    if (!s2a_jv_obj_find(root, "program", &program) && !s2a_jv_obj_find(program, "graphicsState", &graphics) &&
+        !s2a_jv_obj_find(graphics, "hasUnalignedStorageBuffer", &align) && !s2a_jv_bool(align, &unaligned)) {
+        pthread_mutex_lock(&live_gate_mu);
+        submit_alignment_requests[unaligned != 0]++;
+        pthread_mutex_unlock(&live_gate_mu);
+    }
+#endif
     live_gate_pause();
     static const char result[] =
         "{\"schema\":\"s2a-direct-program-v1\",\"content\":{\"stages\":[{\"stage\":\"vs\",\"spirv\":\"" S2A_TEST_VERT_64 "\"}],"
@@ -362,7 +428,15 @@ nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *o, n
     if (fake_gs_success && (unsigned)s->stage < 6) {
         shader_load_count++; gs_loads[s->stage]++; gs_blob_bytes[s->stage] = s->bytes; *o = (nvn_gpu_shader)(uintptr_t)(s->stage + 1); return (nvn_gpu_rc){NVN_GPU_OK};
     }
-    if (fake_array_count) { *o = (nvn_gpu_shader)(uintptr_t)1; return (nvn_gpu_rc){NVN_GPU_OK}; }
+    if (fake_array_count) {
+        pthread_mutex_lock(&live_gate_mu);
+        last_shader_load_thread = pthread_self();
+        shader_load_count++;
+        pthread_cond_broadcast(&live_gate_cv);
+        pthread_mutex_unlock(&live_gate_mu);
+        *o = (nvn_gpu_shader)(uintptr_t)1;
+        return (nvn_gpu_rc){NVN_GPU_OK};
+    }
     if (fake_cs_success && s->stage == NVN_GPU_SH_CS) { cs_loads++; *o = (nvn_gpu_shader)(uintptr_t)7; return (nvn_gpu_rc){NVN_GPU_OK}; }
     CHECK(0, "unexpected shader load"); return (nvn_gpu_rc){NVN_GPU_E_UNSUPPORTED};
 }
@@ -379,9 +453,11 @@ static int fact_matches(const char *stage, int handle, const char *sampler, int 
 static unsigned gs_c1_len = 0x100;   // c1 段长度（c1fill 非 0 时）：缺省 0x100；长 c1 用例临时改大（段落在控制段 0x200 起，最长 0x500）
 static void gs_source_ex(unsigned st, unsigned variant, unsigned c1fill, uint8_t key[8]) {
     uint8_t ctl[0x760] = {0}, code[0x70] = {0}, digest[32];
-    const unsigned type[3] = {1, 5, 4};
+    const unsigned type[5] = {1, 5, 4, 2, 3};
     wr(code, (st == 1 ? 2u : 1u) | (3u << 5) | (type[st] << 10));
     if (st == 1) wr(code + 72, 15);
+    if (st == 3) wr(code + 8, 3u << 24);   // TCS 输出 3 个控制点
+    if (st == 4) { wr(ctl + 0x738, 7); wr(ctl + 0x73c, 0x8e7c); wr(ctl + 0x744, 0x900); }
     if (st == 2) { wr(code + 8, 1u << 24); wr(code + 12, 7u << 24); wr(code + 16, 3); }
     wr64(code + 0x50, 0x001f8000fc0007e0ull); wr64(code + 0x58, 0xe30000000007000full);
     wr64(code + 0x60, 0xe30000000007000full); wr64(code + 0x68, 0xe30000000007000full);
@@ -393,6 +469,85 @@ static void gs_source_ex(unsigned st, unsigned variant, unsigned c1fill, uint8_t
     memcpy(key, digest, 8);
 }
 static void gs_source(unsigned st, unsigned variant, uint8_t key[8]) { gs_source_ex(st, variant, 0, key); }
+
+static int load_fixture_profile(const char *profile_path, const char *closure) {
+    FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
+    size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
+    int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
+    external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
+    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
+    return s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) ||
+        s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash);
+}
+// 真实来源快照 → 回放阶段状态 → 设备解析 → 编译请求。夹具只在编译边界捕获。
+static int tess_request_test(const char *profile_path, const char *closure, const char *payload, int execute) {
+    if (profile_path && load_fixture_profile(profile_path, closure)) return 1;
+    fake_tess_enabled = 1;
+    rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
+    memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G');
+    gs_program.serial = 101; gs_program.nstage = 4;
+    memset(gs_stages, 0xff, sizeof gs_stages); memset(gs_keys, 0, sizeof gs_keys);
+    const unsigned order[] = {4, 0, 3, 1};
+    for (unsigned i = 0; i < 4; i++) {
+        gs_stages[i] = (uint8_t)order[i];
+        gs_source_ex(order[i], 0, order[i] >= 3 ? 0xb0 + order[i] : 0, gs_keys[i]);
+    }
+    gs_keys_ok = 15;
+    p_bind_program_id bind = {&gs_program, gs_program.serial, 0x1f, 0};
+    CHECK(rp_state_op(OP_BIND_PROGRAM, &bind, sizeof bind + 8), "bind tessellation program");
+    CHECK(rp_shader_graphics_stages() == 0x1b, "tessellation program mask includes a GS hole");
+    bind_pools(7); captured[0] = 0; compiler_calls = 0;
+    struct rp_shader_req q = {0}; q.prim = NVN_DRAW_PRIMITIVE_PATCHES;
+    const struct rp_prog *prog = NULL;
+    capture_output = execute ? NULL : payload;
+    fake_compile_file = execute ? payload : NULL;
+    fake_gs_success = execute;
+    int released = shader_release_count;
+    int rc = rp_shader_resolve(&q, &prog);
+    CHECK(compiler_calls == 1, "real resolver reaches compiler for VS/TCS/TES/FS");
+    if (!compiler_calls) CHECK(!nvn_unimpl_count("shader", "stages_0x1b_not_vs_fs"),
+                               "0x1b is accepted by the production resolver");
+    if (execute) {
+        CHECK(!rc && prog && prog->tess && prog->sh[0] && prog->sh[1] &&
+              !prog->sh[2] && prog->sh[3] && prog->sh[4], "result loads all four shader modules");
+        CHECK(gs_loads[0] == 1 && gs_loads[1] == 1 && !gs_loads[2] && gs_loads[3] == 1 && gs_loads[4] == 1,
+              "shader loads use their original NVN slots");
+    }
+    struct s2a_jv root = {captured, strlen(captured)}, program, stages, slot;
+    CHECK(!s2a_jv_obj_find(root, "program", &program) &&
+          !s2a_jv_obj_find(program, "stages", &stages) &&
+          s2a_jv_arr_count(stages) == 5 &&
+          !s2a_jv_arr_item(stages, 2, &slot) && s2a_jv_is_null(slot) &&
+          strstr(captured, "\"stage\":\"tcs\"") && strstr(captured, "\"stage\":\"tes\""),
+          "compiler request preserves all five NVN slots");
+    if (execute && prog) {
+        uint8_t identity[32];
+        memcpy(identity, prog->identity, 32);
+        nvk_prog_warm_save();
+        CHECK(s2a_program_cache_drain(5000) == 0, "tessellation program cache drains");
+        rp_shader_reset();
+        CHECK(shader_release_count == released + 4, "session reset releases all four stages");
+        struct nvk_prog_rec rec = {0};
+        CHECK(nvk_prog_warm_load() == 1 && nvk_prog_warm_take(&rec) == 1 &&
+              rec.stage_mask == 0x1b && rec.c1_ok == 0x18 && !memcmp(rec.identity, identity, 32) &&
+              rec.c1[3][0] == 0xb3 && rec.c1[4][255] == 0xb4,
+              "prior manifest retains sparse stages and tessellation c1");
+        CHECK(nvk_prog_warm_build(&rec) == 0, "tessellation program prewarms from prior cache");
+        const struct rp_prog *warm = NULL, *again = NULL;
+        CHECK(rp_shader_prog_by_identity(identity, &warm) && warm && warm->tess &&
+              warm->sh[3] && warm->sh[4] && warm->c1_ok == 0x18, "prewarm publishes both tessellation stages");
+        CHECK(!rp_shader_resolve(&q, &again) && again == warm && compiler_calls == 1,
+              "real resolver consumes prewarmed program without recompiling");
+    }
+    const int calls = compiler_calls;
+    fake_tess_enabled = 0;
+    CHECK(rp_shader_resolve(&q, &prog) == -1 && !prog && compiler_calls == calls &&
+          nvn_unimpl_count("shader", "tessellation_not_enabled"),
+          "disabled native tessellation capability rejects before compile");
+    rp_shader_reset(); s2a_source_clear();
+    printf("tessellation resolver: sizeof(rp_prog)=%zu checks=%d failures=%d\n", sizeof(struct rp_prog), checks, failures);
+    return failures != 0;
+}
 
 static void gs_request_test(void) {
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
@@ -478,6 +633,17 @@ static void gs_request_test(void) {
           count_substr(captured, "\"stage\":\"gs\",\"handle\":") == 160 &&
           fact_matches("gs", 344, "2d", 0), "480 combined and separate texture facts survive all three stages");
     bind_separate(0, 0, 128, 0); bind_separate(1, 0, 128, 0); bind_separate(2, 0, 128, 0); separate_fixture = 0; fake_reg_changes = 1;
+    const uint32_t strip_prims[] = {3, 0xB, 0xD};
+    const char *const strip_families[] = {"Lines", "LinesAdjacency", "TrianglesAdjacency"};
+    for (unsigned i = 0; i < sizeof strip_prims / sizeof strip_prims[0]; i++) {
+        q.prim = strip_prims[i];
+        CHECK(!rp_shader_resolve(&q, &p) && p && compiler_calls == ++calls,
+              "native GS topology %u reaches the compiler", q.prim);
+        char fact[64];
+        snprintf(fact, sizeof fact, "\"topology\":\"%s\"", strip_families[i]);
+        CHECK(strstr(captured, fact), "GS request carries %s input", strip_families[i]);
+    }
+    q.prim = 4;
     fake_geometry_enabled = 0; p = NULL;
     CHECK(rp_shader_resolve(&q, &p) != 0 && !p && compiler_calls == calls, "disabled GS fails before compiler");
     fake_geometry_enabled = 1; gs_keys_ok = 3;
@@ -744,12 +910,7 @@ static const char *arms_root, *arms_manifest;   // --nowindow-arms：种子目�
 static void test_nowindow_seed(const char *root, const char *manifest, const struct rp_shader_req *q);
 
 static int emit_real_request(const char *profile_path, const char *closure, const char *dir, const char *output, int tbuf) {
-    FILE *pf = fopen(profile_path, "rb"); if (!pf) return 1;
-    size_t pn = fread(external_profile, 1, sizeof external_profile - 1, pf);
-    int extra = fgetc(pf); fclose(pf); if (!pn || extra != EOF || strlen(closure) >= sizeof external_closure) return 1;
-    external_profile[pn] = 0; snprintf(external_closure, sizeof external_closure, "%s", closure);
-    struct s2a_jv profile_obj = {external_profile, pn}, hash_field;
-    if (s2a_jv_obj_find(profile_obj, "profileHash", &hash_field) || s2a_jv_str(hash_field, external_profile_hash, sizeof external_profile_hash)) return 1;
+    if (load_fixture_profile(profile_path, closure)) return 1;
     // GS 整链（--emit-real 及其复用变体）：生成的请求要与 vk/t_replay_gs 在 lavapipe 上发出的逐字节相同；lavapipe 有 VK_EXT_depth_clip_control，
     //   有这项能力时现编不改写 z（nvk_shader.c fill_facts），所以这里同样报有（设备没有时 t_replay_gs 的逐字节比对会直接红）
     fake_depth_clip = tbuf == 0 || tbuf >= 3;   // GS 整链的基准（0）、执行复用（3）、三种宽松输入（4–6）同一口径，内容才可比；贴图缓冲链（1 / 2）不变
@@ -880,7 +1041,7 @@ static int emit_compute_request(const char *profile_path, const char *closure, c
     return !(rc == -1 && compiler_calls == 1 && failures == 0);
 }
 
-static void graphics_fact_reuse_test(void) {
+static void graphics_fact_reuse_test(int lookahead) {
     rp_shader_reset(); s2a_source_clear(); rp_state_reset(); nvn_unimpl_reset();
     uint8_t keys[3][8]; for (unsigned st = 0; st < 3; st++) gs_source(st, 0, keys[st]);
     memset(&gs_program, 0, sizeof gs_program); gs_program.magic = MAGIC('P','R','O','G');
@@ -894,7 +1055,16 @@ static void graphics_fact_reuse_test(void) {
     compiler_calls = 0; CHECK(!rp_shader_resolve(&q, &p) && p && compiler_calls == 1, "fact reuse initial real producer resolves");
     const struct rp_prog *first = p;
     rp_S.tex[0][2] = 77;
+    if (lookahead) {
+        // The same production facts can reuse a warm program even before
+        // the real resolver records the new complete identity as an alias.
+        const struct rp_state state = rp_S;
+        const p_set_rt targets = {0};
+        const int queued = rp_shader_lookahead(&state, &q, &targets);
+        CHECK(queued == 0, "lookahead does not compile an already reusable graphics request (got %d)", queued);
+    }
     CHECK(!rp_shader_resolve(&q, &p) && p == first && compiler_calls == 1, "unqueried combined texture reuses compiled program");
+    if (lookahead) return;
     rp_S.tex[1][2] = 77;
     CHECK(!rp_shader_resolve(&q, &p) && p == first && compiler_calls == 1, "other stage unqueried combined texture reuses program");
     rp_S.tex[0][0] = 77;
@@ -2343,6 +2513,7 @@ static int cs_libpack_test(void) {
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == 0 && cs_loads == 1,
           "aligned CS storage hits the library, compiler not called (calls=%d red=%s)", compiler_calls, last_red);
     CHECK(lp_unref_lines == 0, "aligned library hit does not log the unaligned-refuse line (got %d)", lp_unref_lines);
+    fixture_ssbo_window = 0;   // 显式验证关闭窗口合同后的旧闸。
     int calls = compiler_calls, unref0 = lp_unref_lines;
     rp_S.ssbo[5][0].addr = 0x10001;   // 同键同绑定、只有对齐实况变：16 非对齐
     p = NULL;
@@ -2366,6 +2537,30 @@ static int cs_libpack_test(void) {
     CHECK(rp_shader_resolve_compute(&p) == 0 && p && compiler_calls == calls,
           "realigned CS storage uses the library again (calls=%d)", compiler_calls);
     CHECK(nvk_shader_cs_lib_note(rp_S.skey[5]) == NULL, "a library hit clears the remembered reason");
+    fixture_ssbo_window = -1;
+    // A compute stage that certifies it needs no storage compensation must
+    // still be usable when its guest binds an unrelated non-aligned slot.
+    char window_root[256], window_json[512];
+    snprintf(window_json, sizeof window_json,
+             "{\"stage\":\"cs\",\"dm_ctl\":\"%s\",\"ssbo_window_abi\":1,\"bindings\":["
+             "{\"msl_name\":\"cp_c0\",\"kind\":\"drvcb\",\"bank\":0,\"arg_id\":0}]}", khex);
+    const uint8_t *window_data[2] = { (const uint8_t *)window_json, (const uint8_t *)csspv };
+    const size_t window_lengths[2] = { strlen(window_json), sizeof csspv };
+    CHECK(cs_lib_root(window_root, ck, ckind, window_data, window_lengths, 2) == 0,
+          "window CS library container written");
+    for (unsigned remainder = 0; remainder < 16; remainder += 4) {
+        rp_shader_reset();
+        rp_S.ssbo[5][0].addr = 0x10000 + remainder;
+        p = NULL;
+        calls = compiler_calls;
+        const int rc = rp_shader_resolve_compute(&p);
+        CHECK(rc == 0 && p && p->lib_sourced && compiler_calls == calls,
+              "window CS resolves from LibPack (remainder=%u rc=%d live compiles=%d)",
+              remainder, rc, compiler_calls - calls);
+    }
+    cs_lib_root_rm(window_root);
+    setenv("S2A_SHADER_REVISION_ROOT", root, 1);
+    rp_S.ssbo[5][0].addr = 0x10000;
     // 共享内存闸：同一键换一份 spill 库件（Workgroup 45056 > 本机上限）→ 出库拒，备忘写「共享内存超设备上限」；库里没有这一键 → 「库里没有这一键」
     {   static const uint32_t wgspv[] = {
             0x07230203u, 0x00010000u, 0u, 7u, 0u,
@@ -2432,6 +2627,7 @@ static int cs_libpack_test(void) {
               "library piece that cannot be built falls back to live compile (calls=%d)", compiler_calls);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a marked-bad library program is remembered as a build failure: %s", note ? note : "(none)");
+        fixture_ssbo_window = 0;
         // 现在把备忘换成别的状态（非对齐闸拒查）：命中记坏表时必须改回「build 失败」，而不是留着「非对齐」或空
         rp_S.ssbo[5][0].addr = 0x10001;
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
@@ -2441,6 +2637,7 @@ static int cs_libpack_test(void) {
         rp_shader_reset(); p = NULL; (void)rp_shader_resolve_compute(&p);
         note = nvk_shader_cs_lib_note(rp_S.skey[5]);
         CHECK(note && strstr(note, "build 失败"), "a bad-table hit is reported as a build failure, not as a stale reason or as no record: %s", note ? note : "(none)");
+        fixture_ssbo_window = -1;
         cs_lib_root_rm(broot); setenv("S2A_SHADER_REVISION_ROOT", root, 1); }
     unsetenv("S2A_SHADER_REVISION_ROOT");
     char path[700];
@@ -2506,6 +2703,529 @@ static int live_compile_thread_test(int asynchronous) {
 static int fixture_defer_frame(uint64_t *frame) {
     *frame = 1;
     return 1;
+}
+
+#ifdef S2A_TEST_SUBMIT_SCAN
+// The GPU and targets are synthetic. The command scanner, request builder,
+// worker queue, and real-draw resolver are the production implementations.
+static const p_set_rt *submit_targets;
+const p_set_rt *rp_pass_target(void) { return submit_targets; }
+void rp_buf_hold_begin(void) {}
+void rp_draw_stats(uint64_t *draws, uint64_t *skips) { *draws = *skips = 0; }
+int nvn_cmd_call_resolve(uint64_t handle, uint64_t *resolved) {
+    // Synthetic lists are outside the recorder's managed blocks.
+    *resolved = handle;
+    return 0;
+}
+nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *desc, nvn_gpu_cmd *out, nvn_gpu_err *err) {
+    static char cmd;
+    *out = (nvn_gpu_cmd)&cmd;
+    return (nvn_gpu_rc){0};
+}
+
+static void submit_record(uint8_t **cursor, uint32_t op, const void *payload, size_t bytes) {
+    const uint32_t size = (uint32_t)((sizeof(op_hdr) + bytes + 7) & ~(size_t)7);
+    const op_hdr h = {op, size};
+    memcpy(*cursor, &h, sizeof h);
+    if (bytes) memcpy(*cursor + sizeof h, payload, bytes);
+    *cursor += size;
+}
+
+static void check_submit_boundary(const void *stream, const char *expected) {
+    lookahead_stop_lines = 0;
+    last_lookahead_stop[0] = 0;
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(!stats.enqueued && lookahead_stop_lines == 1 && strstr(last_lookahead_stop, expected),
+          "submit scan: expected boundary %s (log: %s)", expected, last_lookahead_stop);
+}
+
+static void test_submit_scan_boundaries(void) {
+    _Alignas(8) uint8_t cycle[2][16] = {0};
+    uint8_t *cursor = cycle[0];
+    const uint64_t next = (uintptr_t)cycle[1], start = (uintptr_t)cycle[0];
+    submit_record(&cursor, OP_JUMP, &next, sizeof next);
+    cursor = cycle[1];
+    submit_record(&cursor, OP_JUMP, &start, sizeof start);
+    check_submit_boundary(cycle[0], "reason=jump_cycle opcode=OP_JUMP");
+
+    _Alignas(8) uint8_t short_jump[16] = {0};
+    cursor = short_jump;
+    submit_record(&cursor, OP_JUMP, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(short_jump, "reason=record opcode=OP_JUMP");
+
+    _Alignas(8) uint8_t long_stream[640 * 16 + 8] = {0};
+    cursor = long_stream;
+    const uint64_t reset = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+    for (int i = 0; i < 640; i++) submit_record(&cursor, OP_RESET_COUNTER, &reset, sizeof reset);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(long_stream, "reason=scan_limit opcode=none");
+
+    _Alignas(8) uint8_t wait_stream[32] = {0};
+    cursor = wait_stream;
+    uint32_t status = 0;
+    const struct { uint64_t addr; uint32_t mode, value; } wait = {(uintptr_t)&status, NVN_EV_WAIT, 1};
+    submit_record(&cursor, OP_SIGNAL_EVENT, &wait, sizeof wait);
+    submit_record(&cursor, OP_END, NULL, 0);
+
+    _Alignas(8) uint8_t write_stream[48] = {0};
+    cursor = write_stream;
+    const p_clear_buf clear = {.addr = (uintptr_t)&status, .size = sizeof status, .value = 1};
+    submit_record(&cursor, OP_CLEAR_BUF, &clear, sizeof clear);
+    submit_record(&cursor, OP_END, NULL, 0);
+    const uint64_t control_handles[] = {(uintptr_t)wait_stream, (uintptr_t)write_stream};
+    lookahead_stop_lines = 0;
+    nvn_be_sub_index(control_handles, 2);
+    CHECK(!lookahead_stop_lines, "submit scan: valid event wait and buffer clear do not stop traversal");
+    CHECK(status == 0, "submit scan: wait and buffer write were not executed");
+
+    _Alignas(8) uint8_t bad_copy[32] = {0}, bad_update[32] = {0}, bad_op[16] = {0};
+    cursor = bad_copy;
+    submit_record(&cursor, OP_COPY_B2B, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_copy, "reason=record opcode=OP_COPY_B2B");
+    cursor = bad_update;
+    const uint64_t short_update[] = {(uintptr_t)&status, sizeof status};
+    submit_record(&cursor, OP_UPDATE_UB, short_update, sizeof short_update);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_update, "reason=record opcode=OP_UPDATE_UB");
+    cursor = bad_op;
+    submit_record(&cursor, OP_NVN2_END_, NULL, 0);
+    submit_record(&cursor, OP_END, NULL, 0);
+    check_submit_boundary(bad_op, "reason=record opcode=OP_?");
+}
+
+static void test_submit_command_stream(const p_set_rt *targets, const struct rp_shader_req *q, int counters) {
+    fixture_parallel_compile = 1;
+    submit_targets = targets;
+    nvn_be_sub_begin();
+
+    const p_clear_ds clear = {.depth = 0.5f, .depth_mask = 1};
+    const p_scissor scissor = {0, 0, 4, 4};
+    const uint32_t ordered = NVN_BARRIER_ORDER_PRIMITIVES_BIT;
+    const p_draw draw = {.prim = 4, .count = 3, .instances = 1};
+    const p_bind_buf deferred = {.stage = BIND_BUF_DEFER, .index = 0, .addr = 1};
+    _Alignas(8) uint8_t blocked[160] = {0};
+    uint8_t *cursor = blocked;
+    submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
+    submit_record(&cursor, OP_BIND_SSBO, &deferred, sizeof deferred);
+    submit_record(&cursor, OP_END, NULL, 0);
+    const uint64_t deferred_handle = (uintptr_t)blocked;
+    lookahead_stop_lines = 0;
+    nvn_be_sub_index(&deferred_handle, 1);
+    CHECK(!lookahead_stop_lines, "submit scan: deferred SSBO does not dereference guest address or stop the scan");
+    if (counters) test_submit_scan_boundaries();
+    lookahead_stop_lines = 0;
+    last_lookahead_stop[0] = 0;
+
+    const dpool_t tex_pool = {.n = 64};
+    const p_set_pool bind_tex_pool = {&tex_pool};
+    const struct { p_push_const hdr; uint32_t data; } push = {{.size = 4}, 17};
+    const p_push_const_ptr deferred_push = {.size = 4, .data = (uintptr_t)&push.data};
+    uint64_t counter_result[2] = {17, 19};
+    const uint64_t report[2] = {NVN_COUNTER_TYPE_TIMESTAMP, (uintptr_t)counter_result};
+    const uint64_t reset = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+    const p_viewports viewports = {.first = 0, .n = 1, .v = {{0, 0, 4, 4, 0, 1}}};
+    const p_set_patch_size patch = {.size = 3};
+    const p_bind_vstream vertex_stream = {.n = 1};
+    const p_bind_vbuf_single vertex_buffer = {.first = 0, .size = 64, .addr = 0x3000};
+    const p_render_cond disable = {.mode = 3}, enable = {.mode = 2};
+    uint32_t event_value = 13;
+    const struct { uint64_t addr; uint32_t mode, value; } signal = {
+        (uintptr_t)&event_value, NVN_EVENT_SIGNAL_MODE_WRITE, 23,
+    };
+    sync_t fence = {0};
+    const uint64_t fence_addr = (uintptr_t)&fence;
+    _Alignas(8) uint8_t head[768] = {0};
+    _Alignas(8) uint8_t stream[1024] = {0};
+    cursor = head;
+    if (counters) {
+        submit_record(&cursor, OP_REPORT_COUNTER, &report, sizeof report);
+        submit_record(&cursor, OP_RESET_COUNTER, &reset, sizeof reset);
+        submit_record(&cursor, OP_SIGNAL_EVENT, &signal, sizeof signal);
+        submit_record(&cursor, OP_FENCE_SYNC, &fence_addr, sizeof fence_addr);
+        submit_record(&cursor, OP_WAIT_SYNC, &fence_addr, sizeof fence_addr);
+    }
+    const uint64_t second_segment = (uintptr_t)stream;
+    submit_record(&cursor, OP_JUMP, &second_segment, sizeof second_segment);
+    submit_record(&cursor, OP_END, NULL, 0);   // 顺序走下去会在找到绘制前结束
+    cursor = stream;
+    submit_record(&cursor, OP_SET_TEX_POOL, &bind_tex_pool, sizeof bind_tex_pool);
+    submit_record(&cursor, OP_RENDER_COND, &disable, sizeof disable);
+    submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_RENDER_COND, &enable, sizeof enable);
+    submit_record(&cursor, OP_CLEAR_DS, &clear, sizeof clear);
+    submit_record(&cursor, OP_SCISSOR, &scissor, sizeof scissor);
+    submit_record(&cursor, OP_VIEWPORTS, &viewports, offsetof(p_viewports, v) + sizeof *viewports.v);
+    submit_record(&cursor, OP_SET_PATCH_SIZE, &patch, sizeof patch);
+    submit_record(&cursor, OP_BIND_VSTREAM, &vertex_stream, offsetof(p_bind_vstream, st) + sizeof *vertex_stream.st);
+    submit_record(&cursor, OP_BIND_VBUF, &vertex_buffer, sizeof vertex_buffer);
+    submit_record(&cursor, OP_BARRIER, &ordered, sizeof ordered);
+    submit_record(&cursor, OP_PUSH_CONST, &push, sizeof push);
+    submit_record(&cursor, OP_PUSH_CONST_PTR, &deferred_push, sizeof deferred_push);
+
+    p_bind_buf storage[4];
+    p_bind_buf uniform[4];
+    for (int i = 0; i < 4; ++i) {
+        storage[i] = (p_bind_buf){.stage = 0, .index = 0, .addr = 0x1000 + (i & 1), .size = 64};
+        uniform[i] = (p_bind_buf){.stage = 0, .index = i, .addr = 0x2000, .size = 4};
+        submit_record(&cursor, OP_BIND_SSBO, &storage[i], sizeof storage[i]);
+        submit_record(&cursor, OP_BIND_UBO, &uniform[i], sizeof uniform[i]);
+        submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    }
+    submit_record(&cursor, OP_END, NULL, 0);
+
+    const uint64_t handle = (uintptr_t)head;
+    nvn_be_sub_index(&handle, 1);
+    const int all_started = live_gate_wait(4);
+    pthread_mutex_lock(&live_gate_mu);
+    CHECK(all_started, "submit scan: four SSBO requests reached four workers before Draw (got %d)", live_gate_entered);
+    CHECK(submit_alignment_requests[0] == 2 && submit_alignment_requests[1] == 2,
+          "submit scan: worker requests carry two aligned and two unaligned SSBO facts (got %d / %d)",
+          submit_alignment_requests[0], submit_alignment_requests[1]);
+    pthread_mutex_unlock(&live_gate_mu);
+    CHECK(!lookahead_stop_lines, "submit scan: valid chained stream never stopped early (log: %s)", last_lookahead_stop);
+    CHECK(counter_result[0] == 17 && counter_result[1] == 19, "submit scan: counter destination was untouched");
+    CHECK(event_value == 13, "submit scan: event destination was untouched");
+    CHECK(!rp_S.tex_pool_n && !rp_S.ssbo[0][0].addr && !rp_S.ubo[0][0].size,
+          "submit scan: live bindings were untouched");
+    live_gate_release();
+    if (!all_started) return;
+
+    CHECK(rp_state_op(OP_SET_TEX_POOL, &bind_tex_pool, sizeof(op_hdr) + sizeof bind_tex_pool),
+          "submit scan: actual draw binds its texture pool");
+    for (int i = 0; i < 4; ++i) {
+        const struct rp_prog *program = NULL;
+        CHECK(rp_state_op(OP_BIND_SSBO, &storage[i], sizeof(op_hdr) + sizeof storage[i]) &&
+              rp_state_op(OP_BIND_UBO, &uniform[i], sizeof(op_hdr) + sizeof uniform[i]) &&
+              !rp_shader_resolve(q, &program) && program, "submit scan: draw %d consumed its exact future", i);
+    }
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == 4 && stats.compiled == 4 && stats.future_hits == 4 &&
+          !stats.fallback && !stats.start_failed && shader_load_count == 4,
+          "submit scan: queued=%llu finished=%llu matched=%llu miss=%llu start_failed=%llu modules=%d",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.compiled,
+          (unsigned long long)stats.future_hits, (unsigned long long)stats.fallback,
+          (unsigned long long)stats.start_failed, shader_load_count);
+}
+
+static void test_submit_mixed_stream(const p_set_rt *targets, const struct rp_shader_req *q, int variant) {
+    const int indirect = variant >= 9;
+    const int multi = variant == 10;
+    const int miss = variant == 11;
+    const int no_compute = variant == 12;
+    const int reject = variant == 13;
+    const int restored = variant == 18;
+    const int deferred = variant == 14 || restored;
+    const int deferred_miss = deferred && !restored;
+    const unsigned expected_workers = no_compute || deferred_miss ? 1 : 2;
+    fixture_parallel_compile = 1;
+    fixture_reject_speculative_compute = reject;
+    submit_targets = targets;
+    bind_pools(64);
+    rp_S.cser = 1;
+    if (no_compute) rp_S.skey_ok &= ~(1u << 5);
+    nvn_be_sub_begin();
+    uint32_t src = 23, dst = 17;
+    const uint64_t copy[] = {(uintptr_t)&src, (uintptr_t)&dst, sizeof dst};
+    const p_clear_tex clear = {.tex = targets->depth, .value_type = CLEAR_TEX_FLOAT,
+                               .r = {.width = 1, .height = 1, .depth = 1}, .mask = 15};
+    const p_dispatch dispatch = indirect ? (p_dispatch){.ind = 0x3000} : (p_dispatch){.x = 1, .y = 1, .z = 1};
+    const p_draw draw = {.prim = 4, .count = indirect ? 0 : 3, .instances = 1, .ind = indirect ? 0x4000 : 0};
+    const p_multi_draw draws = {.ind = 0x4000, .cnt = 0x5000, .stride = 16, .max = 8, .prim = 4, .itype = -1};
+    const p_render_cond condition = {.addr = 1, .mode = 0};
+    const uint64_t update[] = {(uintptr_t)&dst, sizeof dst, 39};
+    const p_bind_buf compute_ubo = {.stage = 5, .index = 0, .addr = 0x6000, .size = 4};
+    const NVNbufferRange range = {.address = compute_ubo.addr, .size = compute_ubo.size};
+    const p_bind_buf deferred_ubo = {.stage = 5 | BIND_BUF_DEFER, .addr = (uintptr_t)&range};
+    _Alignas(8) uint8_t stream[512] = {0};
+    _Alignas(8) uint8_t child[128] = {0};
+    uint8_t *cursor = stream;
+    if (!indirect) submit_record(&cursor, OP_CLEAR_TEX, &clear, sizeof clear);
+    if (multi) {
+        const uint64_t target = (uintptr_t)child;
+        submit_record(&cursor, OP_CALL, &target, sizeof target);
+        submit_record(&cursor, OP_CALL, &target, sizeof target);
+        uint8_t *child_cursor = child;
+        submit_record(&child_cursor, OP_BIND_UBO, &compute_ubo, sizeof compute_ubo);
+        submit_record(&child_cursor, OP_END, NULL, 0);
+    }
+    if (deferred) submit_record(&cursor, OP_BIND_UBO, &deferred_ubo, sizeof deferred_ubo);
+    submit_record(&cursor, OP_DISPATCH, &dispatch, sizeof dispatch);
+    if (restored) {
+        submit_record(&cursor, OP_BIND_UBO, &compute_ubo, sizeof compute_ubo);
+        submit_record(&cursor, OP_DISPATCH, &dispatch, sizeof dispatch);
+    }
+    submit_record(&cursor, OP_UPDATE_UB, update, 2 * sizeof(uint64_t) + sizeof dst);
+    submit_record(&cursor, OP_COPY_B2B, copy, sizeof copy);
+    if (multi) {
+        submit_record(&cursor, OP_RENDER_COND, &condition, sizeof condition);
+        submit_record(&cursor, OP_MULTI_DRAW, &draws, sizeof draws);
+    } else submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_END, NULL, 0);
+
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    const int started = live_gate_wait(expected_workers);
+    pthread_mutex_lock(&live_gate_mu);
+    CHECK(started, "mixed submit: expected workers before replay (got %d/%u, log: %s)",
+          live_gate_entered, expected_workers, last_lookahead_stop);
+    pthread_mutex_unlock(&live_gate_mu);
+    CHECK(dst == 17 && !rp_S.ubo[5][0].size, "mixed submit: speculation never wrote the buffer or live bindings");
+    CHECK(!lookahead_stop_lines, "mixed submit: valid records never stop the scan");
+    live_gate_release();
+    if (!started) return;
+
+    const struct rp_prog *cs = NULL, *gfx = NULL;
+    if (multi || miss) rp_S.ubo[5][0] = compute_ubo;
+    if (deferred)
+        CHECK(rp_state_op(OP_BIND_UBO, &deferred_ubo, sizeof(op_hdr) + sizeof deferred_ubo) && rp_S.ubo[5][0].size == 4,
+              "real compute reads the deferred buffer range");
+    if (!no_compute)
+        CHECK(!rp_shader_resolve_compute(&cs) && cs && cs->is_compute, "mixed submit: real dispatch gets its exact CS program");
+    CHECK(!rp_shader_resolve(q, &gfx) && gfx && !gfx->is_compute, "mixed submit: draw consumes its graphics future");
+    if (miss) {
+        // The nonmatching CS request is still allowed to finish in its own slot.
+        int busy = 1;
+        for (int attempt = 0; busy == 1 && attempt < 100; attempt++)
+            busy = s2a_compile_worker_pump(10);
+        CHECK(!busy, "mixed submit: unused CS request drained");
+    }
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == expected_workers && stats.compiled == expected_workers &&
+          stats.future_hits == ((miss || reject || no_compute || deferred_miss) ? 1u : 2u) &&
+          stats.fallback == (miss || reject || deferred_miss ? 1u : 0u),
+          "mixed submit: queued=%llu finished=%llu matched=%llu fallback=%llu",
+          (unsigned long long)stats.enqueued, (unsigned long long)stats.compiled,
+          (unsigned long long)stats.future_hits, (unsigned long long)stats.fallback);
+}
+
+static void test_submit_quiet_frames(const p_set_rt *targets, const struct rp_shader_req *q) {
+    fixture_parallel_compile = 1;
+    live_gate_release();
+    bind_pools(64);
+    const struct rp_prog *prog;
+    struct rp_shader_live_compile_stats stats;
+    CHECK(!rp_shader_resolve(q, &prog) && prog, "prime one graphics program");
+    rp_shader_live_compile_take(&stats);
+    for (int i = 0; i < 64; i++) rp_shader_lookahead_frame_end();
+    CHECK(!rp_shader_lookahead_budget(), "lookahead sleeps after 64 frames without a real cold compile");
+    CHECK(!rp_shader_resolve(q, &prog) && prog && !rp_shader_lookahead_budget(),
+          "a real graphics cache hit does not wake lookahead");
+    submit_targets = targets;
+    nvn_be_sub_begin();
+    _Alignas(8) uint8_t stream[4096] = {0};
+    uint8_t *cursor = stream;
+    const uint64_t reset = NVN_COUNTER_TYPE_SAMPLES_PASSED;
+    for (int i = 0; i < 180; i++) submit_record(&cursor, OP_RESET_COUNTER, &reset, sizeof reset);
+    const p_bind_buf ubo = {.stage = 0, .index = 0, .size = 4};
+    submit_record(&cursor, OP_BIND_UBO, &ubo, sizeof ubo);
+    const p_draw draw = {.prim = 4, .count = 3, .instances = 1};
+    submit_record(&cursor, OP_DRAW, &draw, sizeof draw);
+    submit_record(&cursor, OP_END, NULL, 0);
+    const uint64_t handle = (uintptr_t)stream;
+    nvn_be_sub_index(&handle, 1);
+    CHECK(!lookahead_stop_lines, "sleeping lookahead did not read 180 records");
+    rp_S.ubo[0][1].size = 4;
+    CHECK(!rp_shader_resolve(q, &prog) && prog && rp_shader_lookahead_budget() == 4,
+          "real cold compile wakes lookahead immediately");
+    lookahead_stop_lines = 0;
+    nvn_be_sub_index(&handle, 1);
+    CHECK(!lookahead_stop_lines, "cold lookahead traversed beyond the old 128-record cap");
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.enqueued == 1 && stats.fallback == 1, "cold re-entry found the candidate after 180 records");
+}
+
+static void test_submit_unused_keys(const p_set_rt *targets, const struct rp_shader_req *q) {
+    fixture_parallel_compile = 1;
+    live_gate_release();
+    bind_pools(64);
+    struct rp_state state = rp_S;
+    for (unsigned i = 0; i <= S2A_CW_DONE_MAX + 1; i++) {
+        state.ubo[0][i].size = 4;
+        CHECK(rp_shader_lookahead(&state, q, targets) == 1, "distinct cold candidate %u starts", i);
+        int busy = 1;
+        for (int attempt = 0; busy == 1 && attempt < 100; attempt++)
+            busy = s2a_compile_worker_pump(10);
+        CHECK(!busy, "worker completed candidate %u", i);
+        rp_shader_lookahead_end();
+    }
+    state = rp_S;
+    state.ubo[0][0].size = 4;
+    CHECK(rp_shader_lookahead(&state, q, targets) == 0,
+          "unused candidate stays suppressed after the worker completion ring evicts it");
+    rp_S = state;
+    const struct rp_prog *prog;
+    CHECK(!rp_shader_resolve(q, &prog) && prog, "real demand for a suppressed candidate still resolves");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.fallback == 1 && !stats.future_hits, "real demand compiled after the old result was evicted");
+    for (int i = 0; i < 160; i++) rp_shader_lookahead_frame_end();
+    rp_S.ubo[0][15].size = 4;
+    CHECK(!rp_shader_resolve(q, &prog) && prog, "new cold request wakes idle lookahead");
+    state.ubo[0][1].size = 4;
+    CHECK(rp_shader_lookahead(&state, q, targets) == 1,
+          "expired cooldown admits an otherwise cold candidate");
+}
+
+static int previous_compile(void *ctx, uint64_t session, uint64_t generation, const char *json, size_t bytes,
+                            uint8_t **out, size_t *out_bytes, char *why, size_t why_size) {
+    live_gate_pause();
+    return -1;
+}
+
+static void test_submit_start_failed(void) {
+    const uint8_t key[32] = {1};
+    CHECK(!s2a_compile_worker_start_pool(previous_compile, NULL, 1, NULL, 0) &&
+          !s2a_compile_worker_submit_async(1, 1, "{}", 2, key, NULL, 0) && live_gate_wait(1),
+          "startup fixture: previous session has a running worker");
+    CHECK(s2a_compile_worker_stop_bounded(0, NULL, 0) == 1, "startup fixture: previous worker has not exited");
+    CHECK(!nvk_shader_open() && !rp_shader_lookahead_budget() &&
+          strstr(last_red, "previous compile still running"), "startup fixture: worker pool actually refused startup");
+    live_gate_release();
+    rp_state_reset();
+    source();
+    bind_pools(64);
+    fake_reg_changes = 0;
+    fake_array_count = 64;
+    const struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    const struct rp_prog *program = NULL;
+    CHECK(!rp_shader_resolve(&q, &program) && program && compiler_calls == 1 &&
+          pthread_equal(last_compiler_thread, pthread_self()), "startup failure still compiles and resolves on the owner");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.start_failed == 1 && !stats.fallback && !stats.future_hits && !stats.enqueued,
+          "startup failure is counted separately from a lookahead miss");
+}
+#endif
+
+static int submit_compile_test(int slots, int variant) {
+    fixture_submit_compile = 1;
+    fake_reg_changes = 0;
+    live_gate_hold = 1;
+    fixture_submit_slots = slots;
+    fixture_live_frame_ms = 0;
+    fixture_live_unsafe_ms = 0;
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (variant == 6) {
+        test_submit_start_failed();
+        goto cleanup;
+    }
+#endif
+    CHECK(nvk_shader_open() == 0, "open strict submit session");
+    CHECK(rp_shader_lookahead_budget() == (unsigned)slots, "requested compile slots=%d", slots);
+    struct s2a_compile_worker_stats worker;
+    s2a_compile_worker_stats(&worker);
+    CHECK(worker.slots == (unsigned)slots, "live worker slots=%u expected=%d", worker.slots, slots);
+    rp_state_reset();
+    source();
+    fake_array_count = 64;
+    struct rp_shader_req q = {.prim = 4, .compile_defer_frame = fixture_defer_frame};
+    uint8_t memory[4096];
+    pool_t pool = {0};
+    tex_t color = {.mem = memory, .pool = &pool};
+    color.L.size = sizeof memory;
+    p_set_rt targets = {.n = 0, .depth = &color};
+#ifdef S2A_TEST_SUBMIT_SCAN
+    if (variant == 5 || variant == 7) {
+        test_submit_command_stream(&targets, &q, variant == 5);
+        goto cleanup;
+    }
+    if ((variant >= 8 && variant <= 14) || variant == 18) {
+        test_submit_mixed_stream(&targets, &q, variant);
+        goto cleanup;
+    }
+    if (variant == 15) {
+        test_submit_unused_keys(&targets, &q);
+        goto cleanup;
+    }
+    if (variant == 16) {
+        test_submit_quiet_frames(&targets, &q);
+        goto cleanup;
+    }
+    if (variant == 17) {
+        live_gate_release();
+        graphics_fact_reuse_test(1);
+        goto cleanup;
+    }
+#endif
+    bind_pools(64);
+    struct rp_state state = rp_S;
+    if (variant == 4) {
+        fixture_parallel_compile = 1;
+        for (int i = 0; i < slots; i++) {
+            state.ubo[0][i].size = 4;
+            CHECK(rp_shader_lookahead(&state, &q, &targets) == 1, "queued distinct immutable request %d", i);
+        }
+        CHECK(live_gate_wait(slots), "all %d workers entered before the first actual Draw", slots);
+        state.ubo[0][slots].size = 4;
+        CHECK(rp_shader_lookahead(&state, &q, &targets) < 0, "submit mask does not exceed the requested slots");
+        live_gate_release();
+        for (int i = 0; i < slots; i++) {
+            rp_S.ubo[0][i].size = 4;
+            const struct rp_prog *program = NULL;
+            CHECK(!rp_shader_resolve(&q, &program) && program, "real draw %d took its future", i);
+        }
+        struct rp_shader_live_compile_stats stats;
+        rp_shader_live_compile_take(&stats);
+        CHECK(stats.compiled == (uint64_t)slots && stats.enqueued == (uint64_t)slots && !stats.pending && !stats.fallback,
+              "only the requested workers compiled: expected=%d got=%llu", slots, (unsigned long long)stats.compiled);
+        CHECK(shader_load_count == slots, "only %d shaders constructed, got %d", slots, shader_load_count);
+        goto cleanup;
+    }
+    if (variant == 2) {
+        // Alias (same physical bytes through different texture objects) terminates pre-scan.
+        fixture_alias_texture = 1;
+        fixture_alias_snapshot = color;
+        CHECK(rp_shader_lookahead(&state, &q, &targets) < 0, "attachment alias is a boundary");
+        fixture_alias_texture = 0;
+        live_gate_release();
+    } else {
+        CHECK(rp_shader_lookahead(&state, &q, &targets) == 1, "offline immutable request enqueued");
+        CHECK(rp_shader_lookahead(&state, &q, &targets) == 0, "duplicate draw joins a single future");
+        CHECK(live_gate_wait(1), "provider actually started before Draw");
+        if (variant == 1) rp_S.ubo[0][3].size = 4;  // Full identity differs despite the same source/RT.
+        live_gate_release();
+        if (variant == 1 || variant == 3) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 2;
+            pthread_mutex_lock(&live_gate_mu);
+            while (!shader_load_count)
+                if (pthread_cond_timedwait(&live_gate_cv, &live_gate_mu, &deadline)) break;
+            const int built = shader_load_count;
+            pthread_mutex_unlock(&live_gate_mu);
+            CHECK(built == 1, "first identity was actually built before the draw changed it");
+            if (variant == 3) fixture_compile_generation = 7;
+        }
+    }
+    const struct rp_prog *program = NULL;
+    CHECK(rp_shader_resolve(&q, &program) == 0 && program, "Draw is never deferred at zero budget");
+    struct rp_shader_live_compile_stats stats;
+    rp_shader_live_compile_take(&stats);
+    CHECK(stats.pending == 0 && stats.timeout == 0, "pending=%llu timeout=%llu",
+          (unsigned long long)stats.pending, (unsigned long long)stats.timeout);
+    CHECK(!stats.start_failed, "a healthy worker pool never counts startup failure");
+    if (!variant) {
+        CHECK(compiler_calls == 1 && shader_load_count == 1 &&
+              !pthread_equal(last_compiler_thread, pthread_self()) &&
+              !pthread_equal(last_shader_load_thread, pthread_self()),
+              "same future compiles/builds once on the worker: compile=%d module=%d", compiler_calls, shader_load_count);
+        CHECK(!stats.fallback && stats.future_hits == 1, "exact request used prefetched result");
+    } else CHECK(stats.fallback == 1 && !stats.future_hits, "real changed or declined request runs synchronous fallback");
+cleanup:
+    rp_shader_lookahead_end();
+    nvk_shader_stop();
+    (void)s2a_compile_worker_stop_bounded(2000, NULL, 0);
+    rp_shader_reset();
+    s2a_source_clear();
+    printf("submit-compile slots=%d variant=%d checks=%d failures=%d\n", slots, variant, checks, failures);
+    return failures != 0;
 }
 
 static int live_compile_pending_test(int stop) {
@@ -2779,16 +3499,14 @@ static int lp_gate_test(void) {
         CHECK(hits >= 12, "ssbo readout line: cache hits cover every new program (hits=%llu)", hits);
         CHECK(ms * 1000 + us > 0, "ssbo readout line: library read time is recorded (%llu.%03llu ms)", ms, us);
     }
-    // 探测只读：库自己的命中 / 没有 / 坏三个计数只来自真正的取程序（命中 8 = 基准 1 + 没用到的槽非对齐 2 + 用到的槽对齐 1 + 别的阶段 1 + 同阶段别的槽 1
-    //   + 两段交叉 1 + 带按地址访问内存的能力但绑定全对齐 1；没有 3 = 库里没有 VS 键的那两份 + 顶点键库里没有但顶点段全对齐的那份；被挡下的一份都没查过库，
-    //   库里没有 VS 键又非对齐的那份、带按地址访问内存的能力又非对齐的那份也被挡在查库之前）。
-    //   命中 8 里同一组阶段键的重取由库件结果备忘接住（nvk_shader.c lp_memo_*），不再读库：库自己的命中 + 备忘命中 = 8。
+    // 8 次正常命中（含备忘），3 次原有 miss。另有 7 个仅需窗口的旧件
+    // 实际经过查库并被拒为缺少可用窗口版本；只读探测不增加任何合成计数。
     {
         extern void nvk_shader_test_tally_line(char *out, size_t n);
         char tl[640]; nvk_shader_test_tally_line(tl, sizeof tl);
         const char *mh = strstr(tl, "库件备忘 命中 ");
         const unsigned long long memo = mh ? strtoull(mh + strlen("库件备忘 命中 "), NULL, 10) : 0;
-        CHECK(mh && s2a_libpack_hits() + memo == 8 && s2a_libpack_misses() == 3 && s2a_libpack_rejects() == 0,
+        CHECK(mh && s2a_libpack_hits() + memo == 8 && s2a_libpack_misses() == 10 && s2a_libpack_rejects() == 0,
               "gate probe leaves the library counters alone (hits=%llu + memo=%llu, misses=%llu rejects=%llu)",
               (unsigned long long)s2a_libpack_hits(), memo, (unsigned long long)s2a_libpack_misses(), (unsigned long long)s2a_libpack_rejects());
     }
@@ -2855,7 +3573,12 @@ static int lp_gate_test(void) {
 }
 
 int main(int argc, char **argv) {
+    if (s2a_program_cache_start()) return 2;
+    if (argc == 2 && !strcmp(argv[1], "--tess-request")) return tess_request_test(NULL, NULL, NULL, 0);
+    if (argc == 5 && (!strcmp(argv[1], "--emit-tess") || !strcmp(argv[1], "--execute-tess")))
+        return tess_request_test(argv[2], argv[3], argv[4], !strcmp(argv[1], "--execute-tess"));
     if (argc == 2 && !strcmp(argv[1], "--lp-gate")) return lp_gate_test();
+    if (argc == 4 && !strcmp(argv[1], "--submit-compile")) return submit_compile_test(atoi(argv[2]), atoi(argv[3]));
     if (argc == 2 && !strcmp(argv[1], "--live-compile-default")) return live_compile_thread_test(0);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-thread")) return live_compile_thread_test(1);
     if (argc == 2 && !strcmp(argv[1], "--live-compile-pending")) return live_compile_pending_test(0);
@@ -2949,7 +3672,7 @@ int main(int argc, char **argv) {
     }
     if (argc != 1) return 2;
     fixture_fact_wide = 1;   // 本进程其余用例都在「放宽开」下跑（开 / 关 / 缺省三档各有单独进程）
-    graphics_fact_reuse_test();
+    graphics_fact_reuse_test(0);
     graphics_fact_array_length_test();
     graphics_fact_wide_test();
     graphics_high_slot_test();

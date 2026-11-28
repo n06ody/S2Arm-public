@@ -75,10 +75,12 @@ fi
 # Isolated production replay indirect test. Exit before every legacy test path.
 # --zero-attr-core（#977）：同一套真 rp_draw + 真后端，跑零属性用例 t_replay_zero_attr.c。
 if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
+    core_modes=(default)
     if [ "$mode" = "--indirect-core" ]; then
         core_test=t_replay_indirect; core_shaders=(replay_null_storage.vert replay_front_face.vert solid_green.frag quad.vert quad.frag count_args.comp replay_drv0.vert replay_drv0.frag replay_drv0_args.comp replay_binst.vert replay_binst.frag replay_binst_args.comp)
     else
-        core_test=t_replay_zero_attr; core_shaders=(zattr.vert quad.frag)
+        core_test=t_replay_zero_attr; core_shaders=(zattr.vert replay_ui2f.vert quad.frag)
+        core_modes=(0 1)   # DQ 线程跨会话沿用，开关两档用独立进程初始化
     fi
     out="$repo/build/vk-${mode#--}"; mkdir -p "$out/shaders"
     glslc_bin=${GLSLC:-glslc}
@@ -94,11 +96,18 @@ if [ "$mode" = "--indirect-core" ] || [ "$mode" = "--zero-attr-core" ]; then
     src+=("$repo/graphics/nvn/gfx/nvn/nvn_tex.c" "$repo/graphics/nvn/gfx/tex/nvn_deswizzle.c")
     cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" -Wl,--gc-sections -Wl,--wrap=nvn_gpu_draw -lvulkan -lpthread -lm -o "$out/$core_test"
     export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+    : > "$out/run.log"
+    rc=0
     set +e
-    "$out/$core_test" "$out/shaders" 2>&1 | tee "$out/run.log"
-    rc=${PIPESTATUS[0]}
+    for core_mode in "${core_modes[@]}"; do
+        core_args=()
+        if [ "$core_mode" != default ]; then core_args=("$core_mode"); fi
+        "$out/$core_test" "$out/shaders" "${core_args[@]}" 2>&1 | tee -a "$out/run.log"
+        test_rc=${PIPESTATUS[0]}
+        if [ "$test_rc" -ne 0 ]; then rc=$test_rc; fi
+    done
     set -e
-    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-' "$out/run.log"; then
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/run.log"; then
         echo "【红】隔离回放用例失败或有 Vulkan 校验错误（rc=${rc}）" >&2
         exit 1
     fi
@@ -107,9 +116,18 @@ fi
 if [ "$mode" = "--compute-read-core" ] && [ "$(uname -s)" = Linux ]; then
     exec bash "$repo/android/tests/vk/run_compute_read.sh"
 fi
+# 存储缓冲窗口读回夹具（standalone/libpack-ssbo-window.sh）的料：翻译器出库的合成顶点段，要 dotnet，只能在宿主出（容器里没有）。
+#   默认档与 --libpack-ssbo-window 都先出；已在容器里（S2A_VULKAN_IMAGE_ID）就用宿主出好的那份。
+prep_ssbo_window_stages() {
+    if [ -n "${S2A_VULKAN_IMAGE_ID:-}" ]; then return 0; fi
+    if [ -n "$mode" ] && [ "$mode" != "--libpack-ssbo-window" ]; then return 0; fi
+    rm -rf "$repo/build/libpack-ssbo-window/stages"
+    S2A_DSH_VK_EMIT_DIR="$repo/build/libpack-ssbo-window/stages" bash "$repo/graphics/tools/direct/tests/t_dsh_vk.sh"
+}
 if [ "$(uname -s)" = Darwin ]; then
     export S2A_VULKAN_CACHE="$repo/build/vulkan-cache"
     if [ -z "$mode" ]; then python3 "$repo/android/tests/gs_compiler_chain_test.py"; fi
+    prep_ssbo_window_stages
     exec bash "$repo/tests/vulkan/run.sh" android/tests/vk/run.sh "$@"
 fi
 # 以下是 Linux：在宿主上（原生跑；缺原生工具时转容器，见下），或已在 tests/vulkan/run.sh 起的离线容器里（带 S2A_VULKAN_IMAGE_ID）。
@@ -131,6 +149,7 @@ if [ -z "$mode" ] && [ ! -f "$repo/build/696-real-compiler/compiled/program.json
     fi
     python3 "$repo/android/tests/gs_compiler_chain_test.py"
 fi
+prep_ssbo_window_stages
 
 find_icd() {
     if [ -n "${S2A_LAVAPIPE_ICD:-}" ]; then printf '%s\n' "$S2A_LAVAPIPE_ICD"; return; fi
@@ -226,6 +245,8 @@ elif [ "$mode" = --clear-tex-core ]; then
     exec bash "$repo/android/tests/vk/run_replay_clear_tex.sh"
 fi
 if [ -z "$mode" ]; then
+    bash "$repo/android/tests/vk/run.sh" --sample-shading
+    bash "$repo/android/tests/vk/run.sh" --depth-bounds
     for f in "$repo"/android/tests/vk/standalone/*.sh; do bash "$f"; done
 fi
 if [[ "$mode" == --pool-table* ]]; then
@@ -275,7 +296,7 @@ out=$(mktemp -d "$TMPDIR/s2a-nvn-vk.XXXXXX")
 trap 'rm -rf "$out"' EXIT
 mkdir -p "$out/shaders"
 if [ "$mode" != "--pipe-call-lifetime" ]; then
-for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert msaa_read.frag count_args.comp logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag ubo_dyn.frag ubo_dyn9.frag ubo_dyn34.frag ubo_high.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp img_rgba8.comp tsamp.comp arr2.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
+for s in vs_store.vert vs_load.vert vs_clip.vert vs_cull.vert msaa_read.frag count_args.comp sample_rate_probe.frag logic_float.frag logic_uint.frag logic_float_mrt.frag logic_uint_mrt.frag ubo_dyn.frag ubo_dyn9.frag ubo_dyn34.frag ubo_high.frag gs_probe.vert gs_probe.geom gs_probe.frag gs_tstrip.vert gs_tstrip.geom gs_tstrip.frag tri.vert tri.frag tri_combined.frag tri3.vert tri_solid.frag tri_invert.frag solid_green.frag solid_blue.frag out1_green.frag tex_u.frag quad.vert quad.frag inst.vert div.vert point.vert cube_at.comp quad2.frag arr.frag cube.frag cubearr.frag tex3d.frag comp.comp pushc.frag pushc.comp tbuf.comp itbuf.comp itbuf_unknown.comp itbuf_unknown_read.comp img.comp img_rgba8.comp tsamp.comp arr2.frag separate.vert samp_at.comp samp_at_i.comp samp_at_u.comp separate.frag; do
     "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
 "$glslc" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/tbuf_replay.frag" -o "$out/shaders/tbuf_replay.frag.spv"
@@ -372,13 +393,40 @@ cflags+=(-DS2A_LAND_READBACK_TEST=1)
 case "$mode" in
     --tsan) cflags+=(-fsanitize=thread) ;;
     --asan) cflags+=(-fsanitize=address,undefined -fno-omit-frame-pointer) ;;
+    --depth-bounds) cflags+=(-DS2A_DEPTH_BOUNDS_TEST=1) ;;
     --shown-only) cflags+=(-DS2A_C883_TEST=1) ;;
+    --pipe-cache-content) ;;
     --pipe-call-lifetime) cflags+=(-DS2A_BACKEND_PIPE_CALL_TEST=1) ;;
-    ""|--pipe-creation-feedback|--high-binding|--pipe-creation-feedback-neg-valid|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
+    ""|--sample-shading|--sample-mask|--wide-lines|--pipe-creation-feedback|--high-binding|--expanded-readback|--pipe-creation-feedback-neg-valid|--sampler-border-only|--sampler-minmax-only|--c63-same-view|--stencil8-only|--read-texels-core|--ds-upload-only|--gpu-deswizzle|--gpu-deswizzle-neg-height|--gpu-deswizzle-neg-stride|--gpu-deswizzle-neg-barrier|--gpu-deswizzle-neg-word-row|--gpu-deswizzle-neg-word-tail|--msaa-only|--msaa-neg-pick|--msaa-neg-pipe|--msaa-neg-sampled|--msaa-neg-attachment|--present-only|--present-upscale|--separate-core|--separate-neg-sampler|--tbuf-core|--tbuf-compiler-core|--tbuf-neg-resolve|--tbuf-neg-format|--tbuf-neg-elements|--gs-only|--gs-compiler|--gs-core|--gs-no-cap|--gs-neg-stage|--gs-neg-flags|--gs-neg-cap|--clear-capacity|--clear-capacity-neg|--land-readback|--cmdpool-only|--cmdpool-neg) ;;
     *) echo "未知参数：${mode}（可用 --tsan / --asan）" >&2; exit 64 ;;
 esac
+# 尾界夹具直接派发发布模块。负控只对夹具模块撤掉尾界，让多派发的 lane 写进哨兵区。
+if [[ "$mode" == --gpu-deswizzle* ]]; then
+    shader="$repo/android/native/nvn/deswizzle_shaders/deswizzle.comp"
+    header="$repo/android/native/nvn/backend_vulkan_deswizzle_word_spv.h"
+    word_spv="$out/shaders/deswizzle_word.comp.spv"
+    if [ "$mode" = --gpu-deswizzle-neg-word-tail ]; then
+        python3 - "$shader" "$out" <<'PYGPUWORD'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+guard = "    if (word >= (p.bytes + 3u) / 4u) return;\n"
+assert source.count(guard) == 1
+(Path(sys.argv[2]) / "deswizzle_word_mutant.comp").write_text(source.replace(guard, ""))
+PYGPUWORD
+        "$glslc" --target-env=vulkan1.1 -O -DS2A_DESWIZZLE_WORD=1 "$out/deswizzle_word_mutant.comp" -o "$word_spv"
+    else
+        python3 - "$header" "$word_spv" <<'PYGPUWORD'
+from pathlib import Path
+import re, struct, sys
+words = re.findall(r"0x([a-f0-9]{8})u", Path(sys.argv[1]).read_text())
+assert words and words[0] == "07230203"
+Path(sys.argv[2]).write_bytes(b"".join(struct.pack("<I", int(word, 16)) for word in words))
+PYGPUWORD
+    fi
+fi
 # 撤改只写入临时源码副本；逐项必须红在指定行为断言。
-if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
+if [[ "$mode" == --gpu-deswizzle-neg-* && "$mode" != --gpu-deswizzle-neg-word-tail ]]; then
     python3 - "$mode" "$repo" "$out" <<'PYGPU'
 import pathlib, sys
 mode, repo, out = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
@@ -387,6 +435,7 @@ inc = (repo / 'android/native/nvn/backend_vulkan_deswizzle.inc').read_text()
 changes = {
     '--gpu-deswizzle-neg-height': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, (h ? h - 1 : h), d, gobs, (uint32_t)nvn_gob_switch2'),
     '--gpu-deswizzle-neg-stride': ('row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2', 'row, rows, slices, h, d, (gobs > 1 ? gobs - 1 : gobs), (uint32_t)nvn_gob_switch2'),
+    '--gpu-deswizzle-neg-word-row': ('g_deswizzle.word_pipe && (row % 4u == 0u)', 'g_deswizzle.word_pipe && (linear % 4u == 0u)'),
     '--gpu-deswizzle-neg-barrier': ('vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);', '(void)barrier;'),
 }
 before, after = changes[mode]
@@ -551,6 +600,20 @@ case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) pc_wr
 case "$mode" in
     ""|--pipe-creation-feedback*) cflags+=(-DS2A_PIPE_CREATION_FEEDBACK_TEST=1); pc_wrap+=(-Wl,--wrap=vkEnumerateDeviceExtensionProperties) ;;
 esac
+case "$mode" in
+    ""|--sampler-border-only) cflags+=(-DS2A_TEST_BORDER_FORMAT=1); pc_wrap+=(-Wl,--wrap=vkCreateSampler) ;;
+esac
+
+if [ "$mode" = "--wide-lines" ] || [ -z "$mode" ]; then
+    cflags+=(-DS2A_TEST_WIDE_LINES_WRAP=1)
+    pc_wrap+=(-Wl,--wrap=vkGetPhysicalDeviceFeatures)
+fi
+
+if [ "$mode" = "--sample-shading" ]; then
+    cflags+=(-DS2A_SAMPLE_SHADING_WRAP=1)
+    pc_wrap+=(-Wl,--wrap=vkGetPhysicalDeviceFeatures)
+fi
+if [ "$mode" = "--depth-bounds" ]; then pc_wrap+=(-Wl,--wrap=vkGetPhysicalDeviceFeatures); fi
 if [ "$mode" = "--shown-only" ]; then pc_wrap+=(-Wl,--wrap=vkGetDeviceProcAddr); fi
 case "$mode" in --gs-core|--separate-core|--separate-neg-sampler|--tbuf-*) ;;
     *) cflags+=(-DS2A_CMDPOOL_TEST=1); pc_wrap+=(-Wl,--wrap=vkBeginCommandBuffer -Wl,--wrap=vkAllocateCommandBuffers -Wl,--wrap=vkFreeCommandBuffers -Wl,--wrap=vkDestroyCommandPool -Wl,--wrap=vkResetCommandPool) ;;
@@ -567,6 +630,11 @@ if [ "$mode" != "--tsan" ]; then
     export VK_LAYER_PATH=$layer
     export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
     export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT   # 同步校验：缺屏障会报 SYNC-HAZARD-*
+    if [ "$mode" = "--pipe-cache-content" ]; then
+        S2A_TEST_PLC_ONLY=1 timeout 120 "$out/t_backend_vk" "$out/shaders" 2>&1 | tee "$out/pipe-cache-content.log"
+        ! grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/pipe-cache-content.log"
+        exit $?
+    fi
     if [ "$mode" = "--pipe-call-lifetime" ]; then
         S2A_TEST_LOGICOP_ONLY=1 timeout 60 "$out/t_backend_vk" "$out/shaders" --pipe-call-lifetime 2>&1 | tee "$out/pipe-call-lifetime.log"
         exit 0
@@ -589,6 +657,51 @@ if [[ "$mode" == --pipe-creation-feedback* ]]; then
     exit "$rc"
 fi
 
+if [ "$mode" = "--expanded-readback" ]; then
+    passed=0
+    status=0
+    for fmt in 0 {25..36} {81..108}; do
+        log="$out/expanded-readback-$fmt.log"
+        if timeout 60 "$out/t_backend_vk" "$out/shaders" "$mode" "$fmt" >"$log" 2>&1 &&
+           grep -qx 'expanded readback failures=0' "$log" &&
+           ! grep -Eq 'Validation Error|SYNC-HAZARD|VUID-' "$log"; then
+            if [ "$fmt" != 0 ]; then passed=$((passed+1)); fi
+        else
+            status=1
+            cat "$log"
+        fi
+    done
+    echo "expanded readback formats=$passed/40"
+    exit "$status"
+fi
+
+if [ "$mode" = "--wide-lines" ] || [ -z "$mode" ]; then
+    for capability in advertised hidden; do
+        flags=()
+        if [ "$capability" = hidden ]; then flags+=(S2A_TEST_HIDE_WIDE_LINES=1); fi
+        log="$out/wide-lines-$capability.log"
+        env "${flags[@]}" timeout 60 "$out/t_backend_vk" "$out/shaders" --wide-lines 2>&1 | tee "$log"
+        if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then exit 1; fi
+    done
+    if [ -n "$mode" ]; then exit 0; fi
+fi
+
+if [ "$mode" = "--sample-shading" ]; then
+    for capability in advertised hidden; do
+        flags=()
+        if [ "$capability" = hidden ]; then flags+=(S2A_TEST_HIDE_SAMPLE_SHADING=1); fi
+        log="$out/sample-shading-$capability.log"
+        env -u S2A_TEST_HIDE_SAMPLE_SHADING "${flags[@]}" timeout 60 "$out/t_backend_vk" "$out/shaders" --sample-shading 2>&1 | tee "$log"
+        if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then exit 1; fi
+    done
+    exit 0
+fi
+
+if [ "$mode" = "--sample-mask" ] || [ -z "$mode" ]; then
+    timeout 60 "$out/t_backend_vk" "$out/shaders" --sample-mask 2>&1 | tee "$out/sample-mask.log"
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/sample-mask.log"; then exit 1; fi
+    if [ -n "$mode" ]; then exit 0; fi
+fi
 if [ "$mode" = "--high-binding" ]; then
     timeout 120 "$out/t_backend_vk" "$out/shaders" --high-binding 2>&1 | tee "$out/high-binding.log"
     if ! grep -q 'HIGH_BINDING failures=0' "$out/high-binding.log" || grep -Eq 'Validation Error|VUID-' "$out/high-binding.log"; then
@@ -598,6 +711,20 @@ if [ "$mode" = "--high-binding" ]; then
     echo "【绿】绑定号 ≥ 256（262 与 6 并存）：管线建成、两个 UBO 各取各的值，validation 0 条"
     exit 0
 fi
+if [ "$mode" = "--depth-bounds" ]; then
+    for dq in 0 1; do
+        if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
+        for hidden in 0 1; do
+            if [ "$hidden" = 1 ]; then export S2A_TEST_HIDE_DEPTH_BOUNDS=1; else unset S2A_TEST_HIDE_DEPTH_BOUNDS; fi
+            log="$out/depth-bounds-$dq-$hidden.log"
+            echo "depth-bounds DQ=$dq hidden=$hidden"
+            timeout 60 "$out/t_backend_vk" "$out/shaders" --depth-bounds 2>&1 | tee "$log"
+            if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then exit 1; fi
+        done
+    done
+    exit 0
+fi
+
 if [ "$mode" = "--land-readback" ]; then
     for dq in 0 1; do
         if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
@@ -752,13 +879,13 @@ if [[ "$mode" == --clear-capacity* ]]; then
     exit "$failed"
 fi
 
-if [ "$mode" = "--sampler-minmax-only" ]; then
+if [[ "$mode" == --sampler-minmax-only || "$mode" == --sampler-border-only ]]; then
     set +e
-    timeout 120 "$out/t_backend_vk" "$out/shaders" --sampler-minmax-only 2>&1 | tee "$out/sampler-minmax-log"
+    timeout 120 "$out/t_backend_vk" "$out/shaders" "$mode" 2>&1 | tee "$out/${mode#--}.log"
     rc=${PIPESTATUS[0]}
     set -e
-    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/sampler-minmax-log"; then
-        echo "【红】sampler minmax: rc=$rc or Vulkan validation error" >&2; exit 1
+    if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/${mode#--}.log"; then
+        echo "【红】$mode: rc=$rc or Vulkan validation error" >&2; exit 1
     fi
     exit 0
 fi
@@ -785,41 +912,58 @@ fi
 # C1581K：D24S8 的 CPU 上传拆成深度面、模板面两个区域（一个区域只能有一个面，VUID-VkBufferImageCopy-aspectMask-09103），
 #   深度面回读低 24 位一致、上传的模板经模板测试看得见。validation 0 条才绿。
 if [[ "$mode" == --gpu-deswizzle-neg-* ]]; then
-    unset S2A_TEST_NVK_DQ
+    unset S2A_TEST_NVK_DQ S2A_TEST_GPU_DESWIZZLE_WORD
+    if [[ "$mode" == --gpu-deswizzle-neg-word-* ]]; then export S2A_TEST_GPU_DESWIZZLE_WORD=1; fi
     set +e
     timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle >"$out/gpu-deswizzle-negative.log" 2>&1
     rc=$?
     set -e
-    if [ "$mode" = "--gpu-deswizzle-neg-barrier" ]; then
+    if [ "$mode" = --gpu-deswizzle-neg-word-row ]; then
+        [ "$rc" -eq 1 ] && grep -E 'GPU matrix word route .*row=[0-9]+ want=0 actual=1' "$out/gpu-deswizzle-negative.log" &&
+            grep -m1 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" ||
+            { tail -40 "$out/gpu-deswizzle-negative.log"; exit 1; }
+    elif [ "$mode" = --gpu-deswizzle-neg-word-tail ]; then
+        [ "$rc" -eq 1 ] && grep -m1 'GPU deswizzle word tail canary overwritten: 40/40' "$out/gpu-deswizzle-negative.log" ||
+            { tail -40 "$out/gpu-deswizzle-negative.log"; exit 1; }
+    elif [ "$mode" = "--gpu-deswizzle-neg-barrier" ]; then
         grep -q 'SYNC-HAZARD-READ-AFTER-WRITE' "$out/gpu-deswizzle-negative.log" || { echo '【红】移除屏障没有被同步校验拦住'; exit 1; }
     else
         [ "$rc" -ne 0 ] && grep -q 'GPU matrix byte mismatch' "$out/gpu-deswizzle-negative.log" || { echo "【红】几何变异未在字节断言处变红（rc=${rc}）"; tail -25 "$out/gpu-deswizzle-negative.log"; exit 1; }
+    fi
+    if [[ "$mode" == --gpu-deswizzle-neg-word-* ]] &&
+        grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-negative.log"; then
+        tail -40 "$out/gpu-deswizzle-negative.log"; exit 1
     fi
     echo "【绿】$mode 触发预期负控（rc=${rc}）"; exit 0
 fi
 
 if [ "$mode" = "--gpu-deswizzle" ]; then
-    for dq in 0 1; do
-        if [ "$dq" = 0 ]; then unset S2A_TEST_NVK_DQ; else export S2A_TEST_NVK_DQ=1; fi
-        set +e
-        timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-${dq}.log"
-        rc=${PIPESTATUS[0]}
-        set -e
-        if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-${dq}.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-${dq}.log"; then
-            echo "【红】GPU deswizzle dq=${dq}: rc=${rc} 或校验失败" >&2; exit 1
-        fi
+    for word in 0 1; do
+        if [ "$word" = 0 ]; then unset S2A_TEST_GPU_DESWIZZLE_WORD; else export S2A_TEST_GPU_DESWIZZLE_WORD=1; fi
+        for dq in 0 1; do
+            if [ "$dq" = 0 ]; then unset S2A_TEST_NVK_DQ; else export S2A_TEST_NVK_DQ=1; fi
+            log="$out/gpu-deswizzle-word${word}-dq${dq}.log"
+            set +e
+            timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then
+                echo "【红】GPU deswizzle word=${word} dq=${dq}: rc=${rc} 或校验失败" >&2; exit 1
+            fi
+        done
     done
     unset S2A_TEST_NVK_DQ
-    export S2A_TEST_GPU_DESWIZZLE_OFF=1
+    export S2A_TEST_GPU_DESWIZZLE_OFF=1 S2A_TEST_GPU_DESWIZZLE_WORD=1
     set +e
     timeout 120 "$out/t_backend_vk" "$out/shaders" --gpu-deswizzle 2>&1 | tee "$out/gpu-deswizzle-off.log"
     rc=${PIPESTATUS[0]}
     set -e
-    unset S2A_TEST_GPU_DESWIZZLE_OFF
-    if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-off.log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gpu-deswizzle-off.log"; then
+    unset S2A_TEST_GPU_DESWIZZLE_OFF S2A_TEST_GPU_DESWIZZLE_WORD
+    if [ "$rc" -ne 0 ] || ! grep -q 'GPU_DESWIZZLE failures=0' "$out/gpu-deswizzle-off.log" ||
+        grep -qE 'Validation Error|VUID-|SYNC-HAZARD-|GPU 解排字读：enabled=1' "$out/gpu-deswizzle-off.log"; then
         echo "【红】GPU 解排关闭：rc=${rc} 或校验失败" >&2; exit 1
     fi
-    echo '【绿】GPU deswizzle 两级录制开关、关闭能力、校验层通过'; exit 0
+    echo '【绿】GPU deswizzle 字读开关 × 两种录制、尾界哨兵及关闭能力通过'; exit 0
 fi
 
 if [ "$mode" = "--ds-upload-only" ]; then
@@ -924,13 +1068,22 @@ if [ "$mode" = "--shown-only" ]; then
 fi
 
 if [ "$mode" = "--gs-core" ]; then
-    rm -rf "$repo/build/696-real-compiler/core-compiler"
+    rm -rf "$repo/build/696-real-compiler/core-compiler" "$repo/build/696-real-compiler/live-cache"
     set +e
     timeout 60 "$out/t_backend_vk" "$repo/build/696-real-compiler" 2>&1 | tee "$out/gs-log"
     rc=${PIPESTATUS[0]}
     set -e
     if [ "$rc" -ne 0 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gs-log"; then echo "【红】GS 核心整链 rc=$rc" >&2; exit 1; fi
-    echo '【绿】GS 核心整链 validation 0 条'; exit 0
+    set +e
+    S2A_TEST_LIVE_RESULT_BINARY=1 timeout 60 "$out/t_backend_vk" "$repo/build/696-real-compiler" > "$out/gs-binary-log" 2>&1
+    rc=$?
+    set -e
+    cat "$out/gs-binary-log"
+    if [ "$rc" -ne 0 ] || ! grep -q 'GS live binary transport: 1 compile, 1 legacy encode' "$out/gs-binary-log" ||
+       grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/gs-binary-log"; then
+        echo "【红】GS 二进制结果整链 rc=$rc" >&2; exit 1
+    fi
+    echo '【绿】GS 核心两种结果整链各 16 像素，validation 0 条'; exit 0
 fi
 if [ "$mode" = "--gs-no-cap" ] || [ "$mode" = "--gs-neg-cap" ]; then
     set +e

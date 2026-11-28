@@ -2,17 +2,44 @@
 // the shader writes a linear buffer, which is copied to the image afterwards.
 static void deswizzle_close(void) {
     if (g_deswizzle_count || g_deswizzle_fallbacks) {
-        char line[300]; snprintf(line, sizeof line, "GPU 解排：次数=%llu 源字节=%llu 回退=%llu（管线=%llu BC=%llu 格式展开=%llu 深度=%llu 设备上限=%llu）",
-            (unsigned long long)g_deswizzle_count, (unsigned long long)g_deswizzle_bytes, (unsigned long long)g_deswizzle_fallbacks,
+        char line[384]; snprintf(line, sizeof line, "GPU 解排：次数=%llu 源字节=%llu 字读=%llu 字读源字节=%llu 回退=%llu（管线=%llu BC=%llu 格式展开=%llu 深度=%llu 设备上限=%llu）",
+            (unsigned long long)g_deswizzle_count, (unsigned long long)g_deswizzle_bytes,
+            (unsigned long long)g_deswizzle_word_count, (unsigned long long)g_deswizzle_word_bytes,
+            (unsigned long long)g_deswizzle_fallbacks,
             (unsigned long long)g_deswizzle_reasons[0], (unsigned long long)g_deswizzle_reasons[1], (unsigned long long)g_deswizzle_reasons[2],
             (unsigned long long)g_deswizzle_reasons[3], (unsigned long long)g_deswizzle_reasons[4]); nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", line);
     }
+    if (g_deswizzle.word_pipe) vkDestroyPipeline(g.d, g_deswizzle.word_pipe, NULL);
     if (g_deswizzle.pipe) vkDestroyPipeline(g.d, g_deswizzle.pipe, NULL);
     if (g_deswizzle.module) vkDestroyShaderModule(g.d, g_deswizzle.module, NULL);
     if (g_deswizzle.layout) vkDestroyPipelineLayout(g.d, g_deswizzle.layout, NULL);
     if (g_deswizzle.dsl) vkDestroyDescriptorSetLayout(g.d, g_deswizzle.dsl, NULL);
     memset(&g_deswizzle, 0, sizeof g_deswizzle);
 }
+static VkResult deswizzle_create_pipeline(VkShaderModule module, VkPipeline *out) {
+    VkComputePipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                   .module = module, .pName = "main" }, .layout = g_deswizzle.layout };
+    return vkCreateComputePipelines(g.d, VK_NULL_HANDLE, 1, &pi, NULL, out);
+}
+
+static void deswizzle_open_word(void) {
+    VkShaderModuleCreateInfo mi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sizeof nvk_deswizzle_word_spv, .pCode = nvk_deswizzle_word_spv };
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkResult rc = vkCreateShaderModule(g.d, &mi, NULL, &module);
+    if (rc == VK_SUCCESS) {
+        VkPipeline pipe = VK_NULL_HANDLE;
+        rc = deswizzle_create_pipeline(module, &pipe);
+        vkDestroyShaderModule(g.d, module, NULL);
+        if (rc == VK_SUCCESS) g_deswizzle.word_pipe = pipe;
+        else if (pipe) vkDestroyPipeline(g.d, pipe, NULL);
+    }
+    char line[112];
+    snprintf(line, sizeof line, "GPU 解排字读：enabled=%d VkResult=%d", g_deswizzle.word_pipe != VK_NULL_HANDLE, rc);
+    nvn_plat_log(rc == VK_SUCCESS ? NVN_PLAT_LOG_INFO : NVN_PLAT_LOG_WARN, "gpu", line);
+}
+
 static int deswizzle_open(void) {
     if (!nvn_deswizzle_geom || !nvn_deswizzle || !nvn_tex_layout || !nvn_tex_level_offset || !nvn_tex_level_gobs || !&nvn_gob_switch2) return 0;
     VkDescriptorSetLayoutBinding b[2] = {
@@ -27,16 +54,17 @@ static int deswizzle_open(void) {
     if (vkCreatePipelineLayout(g.d, &li, NULL, &g_deswizzle.layout) != VK_SUCCESS) goto bad;
     VkShaderModuleCreateInfo mi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof nvk_deswizzle_spv, .pCode = nvk_deswizzle_spv };
     if (vkCreateShaderModule(g.d, &mi, NULL, &g_deswizzle.module) != VK_SUCCESS) goto bad;
-    VkComputePipelineCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                   .module = g_deswizzle.module, .pName = "main" }, .layout = g_deswizzle.layout };
-    if (vkCreateComputePipelines(g.d, VK_NULL_HANDLE, 1, &pi, NULL, &g_deswizzle.pipe) != VK_SUCCESS) goto bad;
+    if (deswizzle_create_pipeline(g_deswizzle.module, &g_deswizzle.pipe) != VK_SUCCESS) goto bad;
+    if (nvn_plat_flag("nvk_gpu_deswizzle_word", 0)) deswizzle_open_word();
     return 1;
 bad:
     deswizzle_close(); return 0;
 }
 uint64_t nvn_gpu_vk_test_deswizzle_count(void) { return __atomic_load_n(&g_deswizzle_count, __ATOMIC_RELAXED); }
 uint64_t nvn_gpu_vk_test_deswizzle_fallback_count(void) { return __atomic_load_n(&g_deswizzle_fallbacks, __ATOMIC_RELAXED); }
+#ifdef S2A_GPU_DESWIZZLE_TEST
+uint64_t nvn_gpu_vk_test_deswizzle_word_count(void) { return __atomic_load_n(&g_deswizzle_word_count, __ATOMIC_RELAXED); }
+#endif
 // 校验 / 暂存失败不回 sticky（不粘滞整条命令缓冲）：报 rc 交回放层走 CPU 上传，本行日志带原因
 static nvn_gpu_rc dwz_fail(int code, const char *why) {
     char b[192]; snprintf(b, sizeof b, "GPU 解排本张未传，回放层走 CPU：%s", why); nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);
@@ -51,15 +79,16 @@ static nvn_gpu_rc deswizzle_fallback(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex
     if (!bytes || bytes > SIZE_MAX) return dwz_fail(NVN_GPU_E_ARG, "解排回退尺寸非法");
     uint8_t *linear = malloc((size_t)bytes);
     if (!linear) return dwz_fail(NVN_GPU_E_OOM, "解排回退分配失败");
-    NVNcopyRegion region = {0, 0, 0, (int)(t->w >> level ? t->w >> level : 1), (int)(t->h >> level ? t->h >> level : 1), (int)slices};
+    uint32_t gw = (uint32_t)t->original_desc.width >> level, gh = (uint32_t)t->original_desc.height >> level;
+    NVNcopyRegion region = {0, 0, 0, (int)(gw ? gw : 1), (int)(gh ? gh : 1), (int)slices};
     int rc = NVN_GPU_OK;
     if (nvn_deswizzle(&t->original_desc, level, layer, src, linear, row)) rc = NVN_GPU_E_ARG;
     else nvn_gpu_tex_upload(c, t, level, layer, &region, linear, row, bytes);
     free(linear);
     return rc != NVN_GPU_OK ? dwz_fail(rc, "解排回退失败") : (nvn_gpu_rc){ .code = NVN_GPU_OK };
 }
-nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer, const nvn_texlayout *L,
-                                          const void *src, uint64_t bytes) {
+nvn_gpu_rc nvn_gpu_tex_upload_blocklinear_report(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32_t level, uint32_t layer,
+                                                const nvn_texlayout *L, const void *src, uint64_t bytes, unsigned *routes) {
     struct nvn_gpu_cmd_s *c = ch; struct nvn_gpu_tex_s *t = th;
     if (!c) return (nvn_gpu_rc){ .code = NVN_GPU_E_ARG };
     if (!rc_is(c->sticky, NVN_GPU_OK)) return c->sticky;
@@ -96,7 +125,10 @@ nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32
         src_padded > UINT32_MAX || src_padded > g.dev->properties.limits.maxStorageBufferRange || padded > g.dev->properties.limits.maxStorageBufferRange ||
         groups > g.dev->properties.limits.maxComputeWorkGroupCount[0] ||
         g.dev->properties.limits.minStorageBufferOffsetAlignment > UINT32_MAX) { fallback = 4; why = "device_limits"; }
-    if (why) return deswizzle_fallback(c, t, level, layer, src, row, rows, slices, fallback, why);
+    if (why) {
+        if (routes) *routes |= NVN_GPU_DESWIZZLE_CPU;
+        return deswizzle_fallback(c, t, level, layer, src, row, rows, slices, fallback, why);
+    }
     uint32_t align = (uint32_t)g.dev->properties.limits.minStorageBufferOffsetAlignment; if (align < 4) align = 4;
     if (bpb > align && !(bpb & (bpb - 1))) align = bpb;
     nvn_gpu_slice input, output; nvn_gpu_err e = {0};
@@ -114,21 +146,50 @@ nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd ch, nvn_gpu_tex th, uint32
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[1] },
     };
     vkUpdateDescriptorSets(g.d, 2, wr, 0, NULL);
-    VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = input.buf->buffer, .offset = input.off, .size = src_padded };
-    vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
+    if (g.sync2_on) {
+        buf_barrier2(c, input.buf->buffer, input.off, src_padded,
+                     VK_PIPELINE_STAGE_2_HOST_BIT_KHR, VK_ACCESS_2_HOST_WRITE_BIT_KHR,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
+    } else {
+        VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = input.buf->buffer, .offset = input.off, .size = src_padded };
+        vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
+    }
     uint32_t params[8] = { row, rows, slices, h, d, gobs, (uint32_t)nvn_gob_switch2, (uint32_t)linear };
-    vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_deswizzle.pipe);
+    // 按当前级的行距判定。总字节对齐还可能跨行，源暂存本身由 align 保证字对齐。
+    const int word = g_deswizzle.word_pipe && (row % 4u == 0u);
+    vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, word ? g_deswizzle.word_pipe : g_deswizzle.pipe);
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_deswizzle.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g_deswizzle.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, params);
     vkCmdDispatch(c->cb, (uint32_t)groups, 1, 1);
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barrier.buffer = output.buf->buffer; barrier.offset = output.off; barrier.size = padded;
-    vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
+    if (routes) *routes |= NVN_GPU_DESWIZZLE_COMPUTE;
+    if (g.sync2_on) {
+        buf_barrier2(c, output.buf->buffer, output.off, padded,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                     VK_PIPELINE_STAGE_2_COPY_BIT_KHR, VK_ACCESS_2_TRANSFER_READ_BIT_KHR);
+    } else {
+        VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = output.buf->buffer, .offset = output.off, .size = padded };
+        vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &barrier, 0, NULL);
+    }
     es_reset(c); c->desc_layout = VK_NULL_HANDLE; c->desc_dirty = 0xfu;
-    NVNcopyRegion region = {0, 0, 0, (int)(t->w >> level ? t->w >> level : 1), (int)(t->h >> level ? t->h >> level : 1), (int)slices};
+    uint32_t gw = (uint32_t)t->original_desc.width >> level, gh = (uint32_t)t->original_desc.height >> level;
+    NVNcopyRegion region = {0, 0, 0, (int)(gw ? gw : 1), (int)(gh ? gh : 1), (int)slices};
     copy_buf_tex_impl(c, output.buf, output.off, row, linear, t, level, layer, &region, COPY_FACE_DEFAULT, 1);
-    if (rc_is(c->sticky, NVN_GPU_OK)) { __atomic_add_fetch(&g_deswizzle_count, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_deswizzle_bytes, raw, __ATOMIC_RELAXED); }
+    if (rc_is(c->sticky, NVN_GPU_OK)) {
+        __atomic_add_fetch(&g_deswizzle_count, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_deswizzle_bytes, raw, __ATOMIC_RELAXED);
+        if (word) {
+            __atomic_add_fetch(&g_deswizzle_word_count, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_deswizzle_word_bytes, raw, __ATOMIC_RELAXED);
+        }
+    }
     return c->sticky;
+}
+
+nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer,
+                                          const nvn_texlayout *L, const void *src, uint64_t bytes) {
+    return nvn_gpu_tex_upload_blocklinear_report(c, t, level, layer, L, src, bytes, NULL);
 }

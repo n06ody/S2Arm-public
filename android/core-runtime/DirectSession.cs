@@ -40,6 +40,22 @@ namespace S2A.Android.Aot
             return DirectAbi.Ok;
         }
 
+        public int BindBinaryCompiler(nint compile, nint encode)
+        {
+            if (_destroyed || !_bound || _activated || compile == 0 || encode == 0)
+                return Fail(DirectAbi.Argument, "bind binary compiler");
+            try
+            {
+                int rc = BindBinaryCompilerNative(_table.Context, compile, encode);
+                return rc == DirectAbi.Ok ? rc : Fail(rc, "bind binary compiler");
+            }
+            catch (EntryPointNotFoundException)
+            {
+                // Older native owners use the already registered JSON compiler.
+                return DirectAbi.Ok;
+            }
+        }
+
         public int Activate()
         {
             if (_destroyed) return Fail(DirectAbi.Stopped, "activate after destroy");
@@ -119,5 +135,8 @@ namespace S2A.Android.Aot
 
         [DllImport("libs2arm_android.so", EntryPoint = "s2a_direct_bind_compiler_v1")]
         private static extern int BindCompilerNative(nint context, nint compile);
+
+        [DllImport("libs2arm_android.so", EntryPoint = "s2a_direct_bind_binary_compiler_v1")]
+        private static extern int BindBinaryCompilerNative(nint context, nint compile, nint encode);
     }
 }

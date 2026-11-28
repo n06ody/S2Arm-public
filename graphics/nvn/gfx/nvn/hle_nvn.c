@@ -48,6 +48,7 @@
 #include <sys/sysctl.h>
 #include <mach/thread_policy.h>
 #include <assert.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
@@ -63,6 +64,8 @@ uint64_t s2a_android_limit_frame_period(uint64_t period_ns);
 void s2a_android_present_note(uint64_t period_ns);
 // android/native/gpu_turbo.c：每次请求上屏时登记一帧，供安卓 GPU 提频判定。
 void s2a_android_frame_note(void);
+void nvn_be_pool_add_flags(const void *, uint64_t, unsigned) __attribute__((weak));
+void rp_buf_land_invalidate_note(size_t) __attribute__((weak));
 #endif
 
 // ---------- Slot table, thunks, unimplemented stubs ----------
@@ -431,7 +434,14 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     if (((const pool_builder_x *)b)->native) LOG("【红】 MemoryPoolInitialize: 池 %p 由 nvmap 句柄 %d 建（SetNativeHandleNVX）：本层不导入 nvmap 内存，池没有存储", (void *)p, ((const pool_builder_x *)b)->native);
     if (((const pool_builder_x *)b)->res_pitch) { static int once; if (!once++) LOG("【红】 MemoryPoolInitialize: 池 %p 预留了线性 GPU 地址 %#llx（SetPitchAddressNVX），本层 GPU 地址自己分配、不按预留值", (void *)p, (unsigned long long)((const pool_builder_x *)b)->res_pitch); }
     if (!o->mem && (o->flags & 0x200)) o->mem = vpool_reserve(o);   // every virtual pool: its own address range, a page table over physical pools (see MapVirtual)
-    else if (o->mem) { nvn_be_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    else if (o->mem) {
+#if defined(__ANDROID__) || defined(__OHOS__)
+        if (nvn_be_pool_add_flags) nvn_be_pool_add_flags(o->mem, o->size, o->flags);
+        else
+#endif
+            nvn_be_pool_add(o->mem, o->size);
+        nvn_dirty_add_range(o->mem, o->size);
+    }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】 MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     // Switch 2（NVN2）：池建在 gsv GPU 可访问内存上，那段内存的 GPU 虚拟地址就是它的 CPU 虚拟地址，缓冲区地址 = 存储的 CPU 地址；游戏会拿 GetBufferAddress 的结果加偏移直接用 CPU 读写
     //   （#351：给窗口地址时 CPU 读 0xC086D00000 一带非法地址崩）。所以 NVN2 不另分窗口地址，pool_ga 回存储地址，nvn_ga2ca 对它原样过。窗口只给 Switch 1（大页对齐语义，见上）
@@ -464,7 +474,13 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, 
 #endif
 }
 // Unified memory: the GPU's writes are already in the bytes the CPU reads, so there is nothing to invalidate. nvnBufferInvalidateMappedRange goes through here too
-NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    (void)p; (void)off; (void)n;
+#if defined(__ANDROID__) || defined(__OHOS__)
+    // The buffer entry already forwards here. Count calls and requested bytes once.
+    if (rp_buf_land_invalidate_note) rp_buf_land_invalidate_note(n);
+#endif
+}
 // 空池（D-B3PR，Drag x Drive 040041601D83A000，Mac 0.6.9 三局必现）：游戏用空池建了 0x170 字节的缓冲（BufferInitialize 报红回 0），
 //   随即拿空池查标志位，宿主 nvnMemoryPoolGetFlags 直接读 pool->flags，读 0x4 崩在宿主里。真驱动这里同样会解引用，游戏为什么给空池还没定
 //   （NVN2 语义待核）；宿主先不陪着崩：报红一次带游戏调用位置（下一份诊断据此定根因），回 0 / NULL
@@ -1884,9 +1900,11 @@ static void used_set(cmd_t *o, uint64_t v) { __atomic_store_n(&o->used, v, __ATO
 //   OUT_OF_COMMAND_MEMORY 回调里 UE4 断言「PSO CommandMemory OOM Event」中止（11-14 诊断 D-HSQE，0.3.10，选完存档即闪退）。
 //   真机一条状态绑定是几条寄存器方法；按上面「宁可估低」取一条方法的下限 8 字节（4 字节方法头 + 1 个数据字）
 #define DEV_STATE 8
-static const uint16_t g_dev_bytes[OP_COUNT_] = {
+static const uint16_t g_dev_bytes[OP_NVN2_END_] = {
     [OP_END] = 8, [OP_CALL] = 16, [OP_SET_RT] = 96, [OP_BIND_PROGRAM] = 64, [OP_BIND_TEX1] = 24, [OP_DRAW] = 32, [OP_DRAW_IDX] = 48, [OP_DRAW_TEX] = 64,
     [OP_DISPATCH] = 48, [OP_COPY_B2T] = 64, [OP_COPY_T2B] = 64, [OP_COPY_T2T] = 64, [OP_CLEAR_TEX] = 48, [OP_SET_TEX_POOL] = DEV_CTL, [OP_SET_SAMP_POOL] = DEV_CTL, [OP_BIND_STATE] = DEV_STATE,
+    // Host-only discard hints retain the legacy guest command-memory accounting.
+    [OP_DISCARD_COLOR] = DEV_CTL, [OP_DISCARD_DS] = DEV_CTL,
 };
 // 按入口取驱动真值的记录（带索引绘制、DrawMeshTasks、NVN2 的顶点属性 / 顶点流状态；DEV_EXACT 包住那一条记录）不走上表的估算：入口在录这一条前设好 op 与字节，录完清零（0 = 查表）
 static __thread uint32_t t_dev_op, t_dev_bytes;
@@ -1894,7 +1912,7 @@ static __thread uint32_t t_dev_op, t_dev_bytes;
 static uint32_t dev_bytes(uint32_t op, uint32_t size) {
     if (t_dev_bytes && op == t_dev_op) return t_dev_bytes;
     if (op == OP_END) return 0;   // 驱动的 EndRecording 只写控制内存，不推进 cmd[0]（NVN1 / NVN2 同；sh_anchor_empty 给空录制留释放锚点）
-    uint32_t d = op < OP_COUNT_ ? g_dev_bytes[op] : 0; return d == DEV_CTL ? 0 : d ? d : size; }
+    uint32_t d = op < OP_NVN2_END_ ? g_dev_bytes[op] : 0; return d == DEV_CTL ? 0 : d ? d : size; }
 #define DEV_LEND (16u << 10)   // device bytes of a host-lent window (the game gave no memory): the callback is asked again only after this many
 
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
@@ -2464,7 +2482,7 @@ NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p,
     // 只录程序身份（见 nvn_obj.h p_bind_program_id）；程序内容与键按序号进快照表（prog_snap_put），回放用 bind_program_rec 还原
     const prog_t *o = (const prog_t *)p;
     stages = nvn2_stage_bits(stages);   // NVN2 任务 / 网格位 0x40 / 0x80 → 宿主阶段 3 / 4 的位（nvn2_cmd.h）
-    *REC(c, OP_BIND_PROGRAM, p_bind_program_id) = (p_bind_program_id){o, o ? o->serial : 0, stages, 0};
+    *REC(c, OP_BIND_PROGRAM, p_bind_program_id) = (p_bind_program_id){o, o ? o->serial : 0, stages, o ? o->sample_shading : 0};
     if (!o) return;
     prog_t snap; memcpy(&snap, o, sizeof snap);
     uint8_t keys[6][8], kok = 0, stage[6]; memset(keys, 0, sizeof keys); memset(stage, 0xff, sizeof stage);
@@ -2535,6 +2553,10 @@ NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p,
 // S2Arm: the replay's snapshot of a program the game finalized or reused after binding gets the keys recorded at bind time (nvn_mtl.m prog_live)
 void prog_keys_put(const prog_t *p, const uint8_t keys[6][8], uint8_t ok) { prog_keys_t *k = pk_get(p, 1); memcpy(k->key, keys, sizeof k->key); k->ok = ok; }
 static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) { p_bind_state *r = REC(c, OP_BIND_STATE, p_bind_state); r->kind = kind; memcpy(r->bytes, st, n); }
+NVN(nvnCommandBufferSetDepthBounds, void, NVNcommandBuffer *c, uint32_t enable, float min, float max) {
+    p_depth_bounds bounds = {(enable & 0xffu) != 0, min, max};
+    bind_state(c, NVN_BIND_DEPTH_BOUNDS, &bounds, sizeof bounds);
+}
 NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) { bind_state(c, 0, st, sizeof(blend_st)); }
 NVN(nvnCommandBufferBindColorState, void, NVNcommandBuffer *c, const NVNcolorState *st) { bind_state(c, 1, st, sizeof(color_st)); }
 NVN(nvnCommandBufferBindChannelMaskState, void, NVNcommandBuffer *c, const NVNchannelMaskState *st) { bind_state(c, 2, st, sizeof(chmask_st)); }
@@ -3240,7 +3262,6 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 // Commands that only affect GPU state / only execute on the GPU: the null device only counts them (the thunk has already counted)
 static void nvn_nop(void) {}
 static const char *const g_nops[] = {
-    "nvnCommandBufferSetDepthBounds",
     "nvnCommandBufferSetShaderScratchMemory",
     "nvnCommandBufferPushDebugGroupDynamic",
     "nvnCommandBufferPopDebugGroup",
@@ -4678,7 +4699,7 @@ NVN(nvnTexturePoolSetDebugLabel, void, NVNtexturePool *p, const char *s) { (void
 NVN(nvnSamplerPoolSetDebugLabel, void, NVNsamplerPool *p, const char *s) { (void)p; (void)s; }
 NVN(nvnQueueSetDebugLabel, void, NVNqueue *q, const char *s) { (void)q; (void)s; }
 NVN(nvnProgramSetDebugLabel, void, NVNprogram *p, const char *s) { (void)p; (void)s; }
-// ---- 本层不建模的三项程序特性：按「不支持就明说」处理，不返回成功兜底 ----
+// ---- 程序扩展入口 ----
 // 子程序链接（GPGPU subroutine linkage）：直连层的着色器是出包时离线翻译成整支函数的，没有运行时可链接的子程序表，
 // 所以这里如实返回 0（失败）并点名一次，让游戏/日志能看出是这一项没支持，而不是静默画错
 NVN(nvnProgramSetSubroutineLinkage, NVNboolean, NVNprogram *p, int n, const NVNsubroutineLinkageMapPtr *m) {
@@ -4686,9 +4707,12 @@ NVN(nvnProgramSetSubroutineLinkage, NVNboolean, NVNprogram *p, int n, const NVNs
     if (!once++) LOG("【红】 ProgramSetSubroutineLinkage %d: subroutine linkage is not supported (shaders are translated whole at pack time)", n);
     (void)m; return 0;
 }
-// 逐样本着色（sample shading）：只改光栅化阶段的采样密度，本层不建模；记一行，行为仍按每像素一次
-NVN_NOPROTO(nvnProgramSetSampleShading, void, NVNprogram *p, float f) {
-    (void)p; static int once; if (!once++) LOG("[nvn] ProgramSetSampleShading %.3f: sample-rate shading is not modelled (per-pixel shading is used)", f);
+// 驱动入口把 w1 低六位写入程序。模式在绑定时捕获，不改变着色器身份。
+NVN_NOPROTO(nvnProgramSetSampleShading, void, NVNprogram *p, uint32_t mode) {
+    ((prog_t *)p)->sample_shading = mode & 63u;
+#if defined(__APPLE__)
+    if (((prog_t *)p)->sample_shading == NVN_SAMPLE_MODE_FORCE_ON) ONCE_LOG("【红】 Metal: forced per-sample shading unavailable");
+#endif
 }
 // 子块尺寸（tiled texture 的子块，配合 sparse / tiled 存储）：本层不做 tiled 存储，如实报 0 并点名
 NVN_NOPROTO(nvnProgramGetSubtileSize, int, const NVNprogram *p) {
@@ -4751,6 +4775,15 @@ static void vp_lock(void) {
     pthread_mutex_lock(&g_vp_mu);
 }
 static void vp_unlock(void) { pthread_mutex_unlock(&g_vp_mu); }
+
+// Phase-B diagnostic snapshots hold this only during the CPU read, never over
+// a GPU fence wait. The lock covers vm_remap and the associated replay ledger.
+int nvn_sparse_snapshot_trylock(void) {
+    s2a_mem_lockorder_vp_enter();
+    return pthread_mutex_trylock(&g_vp_mu);
+}
+void nvn_sparse_snapshot_unlock(void) { vp_unlock(); }
+
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
 static struct vpool *vpool_of(const pool_t *o) { return nvn_hm_get(&g_vph, &o); }   // caller holds g_vp_mu (or g_vph_lk for reading)
 static size_t vpa_find(uint64_t a) {   // caller holds g_vp_mu; → index of the last pool whose base ≤ a, or g_nvpa when none
@@ -5540,8 +5573,8 @@ NVN_NOPROTO(nvnProgramInitializeFromBuilder, NVNboolean, NVNprogram *p, const vo
     int n = (int)nvn2_get32(b, PB_NSHADER), nrt = (int)nvn2_get32(b, PB_NRT), nsub = (int)nvn2_get32(b, PB_NSUB);
     if (n < 0 || n > 6) { LOG("【红】 ProgramInitializeFromBuilder stage count %d", n); return 0; }
     if (nrt) { static int once; if (!once++) LOG("【红】 ProgramInitializeFromBuilder：%d 个光追模块（光追程序），宿主没有光追管线，回失败", nrt); return 0; }
-    if (nvn2_get32(b, PB_SAMPLE_SHADING)) { static int once; if (!once++) LOG("【红】 ProgramInitializeFromBuilder：逐样本着色 %u 宿主不强制，按像素着色", nvn2_get32(b, PB_SAMPLE_SHADING)); }
     if (!h_nvnProgramInitialize(p, (NVNdevice *)nvn2_getp(b, PB_DEVICE)) || (n && !h_nvnProgramSetShaders(p, n, (const NVNshaderData *)nvn2_getp(b, PB_SHADERS)))) return 0;
+    h_nvnProgramSetSampleShading(p, nvn2_get32(b, PB_SAMPLE_SHADING));
     if (nsub) h_nvnProgramSetSubroutineLinkage(p, nsub, (const NVNsubroutineLinkageMapPtr *)nvn2_getp(b, PB_SUB));
     return 1;
 }
@@ -6028,21 +6061,40 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
 // Metal 稀疏贴图（nvn_mtl.m sp_upload）：[a, a+n) 按 64 KB 页出位图（bits 第 k 位 = 第 k 页 16 个 4 KB 小页全有物理页），一次加锁走完；
 //   没映射过的 2 MB 叶整块跳过。返回有映射的页数。a 须 64 KB 对齐（稀疏贴图存储按页对齐）
-uint64_t nvn_sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
-    uint64_t np = (n + 0xFFFF) >> 16, got = 0; memset(bits, 0, (size_t)((np + 7) >> 3));
+static uint64_t sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits, int require_all) {
+    const uint64_t np = (n + 0xFFFF) >> 16;
+    uint64_t got = 0;
+    memset(bits, 0, (size_t)((np + 7) >> 3));
     vp_lock(); struct vpool *v = vpool_at(pool, a);
     if (!v) { vp_unlock(); return 0; }
-    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
+    const uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
     for (uint64_t k = 0; k < np; k++) {
-        uint64_t o = o0 + (k << 16); int ok = 1;
-        for (uint64_t q = 0; q < 0x10000 && ok; q += 0x1000) {
-            const vpte *e = o + q < v->size ? vpt_get(v, o + q) : NULL;
-            if (!e) { ok = 0; uint64_t leaf_end = ((o + q) | ((2u << 20) - 1)) + 1; uint64_t kk = (leaf_end - o0) >> 16; if (kk > k + 1) k = kk - 1; break; }   // 向下取整：跨叶边界的那页照样逐个查   // 整个 2 MB 叶没映射：跳到叶尾
-            ok = e->phys != NULL;
+        const uint64_t o = o0 + (k << 16);
+        int mapped = require_all;
+        for (uint64_t q = 0; q < 0x10000; q += 0x1000) {
+            const uint64_t at = o + q;
+            const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
+            if (!e) {
+                const uint64_t leaf_end = (at | ((2u << 20) - 1)) + 1;
+                const uint64_t next = (leaf_end - o0) >> 16;
+                if (next > k + 1) k = next - 1;   // Skip complete guest pages in an absent leaf.
+                if (require_all) { mapped = 0; break; }
+                if (leaf_end >= o + 0x10000) break;
+                continue;
+            }
+            const int present = e->phys != NULL;
+            if (present != require_all) { mapped = present; break; }
         }
-        if (ok) { bits[k >> 3] |= (uint8_t)(1u << (k & 7)); got++; }
+        if (mapped) { bits[k >> 3] |= (uint8_t)(1u << (k & 7)); got++; }
     }
     vp_unlock(); return got;
+}
+uint64_t nvn_sparse_map_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
+    return sparse_map_bits(pool, a, n, bits, 1);
+}
+// Replay snapshots keep partial guest pages and zero their missing 4 KiB portions on upload.
+uint64_t nvn_sparse_map_any_bits(const void *pool, uint64_t a, uint64_t n, uint8_t *bits) {
+    return sparse_map_bits(pool, a, n, bits, 0);
 }
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, GA(ib), GA(ind)});
@@ -6088,20 +6140,31 @@ NVN(nvnCommandBufferSetViewportSwizzles, void, NVNcommandBuffer *c, int first, i
     for (int i = 0; i < n; i++) for (int k = 0; k < 4; k++) r->sw[i][k] = (uint8_t)((s[4 * i + k] ^ 2 * k) & 7);
 }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { *REC(c, OP_ALPHA_REF, p_alpha_ref) = (p_alpha_ref){r, 0}; }   // the replay keeps it for the alpha-tested fragment variants (nvn_mtl.m alpha_ref_bind)
-NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c; if (w != 1.0f) ONCE_LOG("SetLineWidth %.2f: Metal has only 1-pixel lines", w); }
+NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) {
+    if (!(w > 0.0f) || !isfinite(w)) { ONCE_LOG("【红】 SetLineWidth: invalid width %g", (double)w); return; }
+    bind_state(c, NVN_BIND_LINE_WIDTH, &w, sizeof w);
+}
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; ONCE_LOG("SetPointSize: the point size comes from the shader"); }
 NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t en, int idx) { *REC(c, OP_PRIM_RESTART, p_prim_restart) = (p_prim_restart){(en & 0xff) != 0, (uint32_t)idx}; }
 NVN(nvnCommandBufferSetPatchSize, void, NVNcommandBuffer *c, int sz) {
     *REC(c, OP_SET_PATCH_SIZE, p_set_patch_size) = (p_set_patch_size){sz};
 }
+#if defined(__ANDROID__)
+NVN_NOPROTO(nvnCommandBufferSetProvokingVertexMode, void, NVNcommandBuffer *c, int mode) {
+    if ((unsigned)mode > 1) { LOG("【红】 SetProvokingVertexMode: invalid mode %d", mode); return; }
+    *REC(c, OP_SET_PROVOKING_VERTEX, p_provoking_vertex) = (p_provoking_vertex){(uint32_t)mode};
+}
+#endif
 // Rasterizer discard: draws run their vertex stage only (with transform feedback, the capture); recorded, and at replay such a draw rasterizes nothing (nvn_mtl.m)
 NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t en) { REC(c, OP_RAST_DISCARD, p_rast_discard)->on = (en & 0xff) != 0; }
-NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) { (void)c; if ((m & 0xffff) != 0xffff) ONCE_LOG("SetSampleMask %#x: ignored by the host for now", m); }
+NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) { REC(c, OP_SAMPLE_MASK, p_sample_mask)->mask = (uint16_t)m; }
 NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; if (en & 0xff) ONCE_LOG("SetConservativeRasterEnable on: ignored by the host for now"); }
 NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; }        // Tegra tiled cache hint, no Metal equivalent
 // A bound target's contents may be discarded: they are undefined afterwards, so keeping them is correct (The Great Ace Attorney Chronicles discards colour target 0)
-NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { (void)c; (void)i; }
-NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)c; }
+NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) {
+    *REC(c, OP_DISCARD_COLOR, p_discard_color) = (p_discard_color){i, 0};
+}
+NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { (void)rec(c, OP_DISCARD_DS, 0); }
 NVN(nvnCommandBufferSetTiledCacheTileSize, void, NVNcommandBuffer *c, int w, int h) { (void)c; (void)w; (void)h; }
 NVN_NOPROTO(nvnCommandBufferSetColorReductionEnable, void, NVNcommandBuffer *c, uint32_t en) { (void)c; (void)en; }   // color compression hints
 NVN_NOPROTO(nvnCommandBufferSetColorReductionThresholds, void, NVNcommandBuffer *c, int cls, const int *t) { (void)c; (void)cls; (void)t; }

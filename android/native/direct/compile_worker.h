@@ -64,6 +64,9 @@ int s2a_compile_worker_run(uint64_t session, uint64_t generation, const char *js
                            int (*pause)(void *), void (*resume)(void *), void *pause_ctx,
                            uint8_t **bytes, size_t *bytes_len, char *why, size_t why_size);
 
+// Only valid inside the worker's compiler callback; the returned bytes are borrowed.
+const uint8_t *s2a_compile_worker_callback_key(void);
+
 /* C4a：非阻塞提交 + 短队列 + 完成环。与 run() 共用编译槽，同一 sha 去重；提交者不等待，
    结果不进槽位等待者计数，而是按 sha 放进有界完成环（S2A_CW_DONE_MAX）由 poll 取走。
    返回 0 = 已入队/已在途（同 sha 去重，不重复编译）；2 = 同 sha 结果已在完成环

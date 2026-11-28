@@ -136,6 +136,8 @@ int s2a_input_identity_encode(const struct s2a_input_identity *in, uint8_t *buf,
         else if (t->stage && !strcmp(t->stage, "fs")) stage_idx = 1;
         else if (t->stage && !strcmp(t->stage, "cs")) stage_idx = 2;
         else if (t->stage && !strcmp(t->stage, "gs")) stage_idx = 3;
+        else if (t->stage && !strcmp(t->stage, "tcs")) stage_idx = 4;
+        else if (t->stage && !strcmp(t->stage, "tes")) stage_idx = 5;
         else return -1;   // 缺 stage 不等同 vs：NULL 与 "vs" 不能编成同一个输入
         uint8_t target_idx = 0;
         uint16_t format_idx = 0;
@@ -209,7 +211,7 @@ static int rd_flag(struct rdr *r, int *v) {
 static void set_why(char *why, size_t n, const char *text) { if (why && n) snprintf(why, n, "%s", text); }
 
 // 纹理 stage 索引 → 名字（与 encode 的 {"vs","fs","cs","gs"} 同源）。
-static const char *const g_stage_names[4] = { "vs", "fs", "cs", "gs" };
+static const char *const g_stage_names[] = { "vs", "fs", "cs", "gs", "tcs", "tes" };
 
 int s2a_input_identity_decode(const uint8_t *buf, size_t len, struct s2a_input_identity_decoded *out,
                               char *why, size_t why_size) {
@@ -320,7 +322,7 @@ int s2a_input_identity_decode(const uint8_t *buf, size_t len, struct s2a_input_i
             uint32_t handle = 0, array_length = 0;
             const char *target_name = NULL, *format_name = NULL;
             if (rd_u8(&r, &stage_idx)) goto bad;
-            if (stage_idx >= 4) { set_why(why, why_size, "texture stage index is unknown"); return -1; }
+            if (stage_idx >= sizeof g_stage_names / sizeof g_stage_names[0]) { set_why(why, why_size, "texture stage index is unknown"); return -1; }
             if (rd_u32(&r, &handle)) goto bad;
             if (rd_i32(&r, &cbuf_slot)) goto bad;
             if (cbuf_slot < -1) { set_why(why, why_size, "texture cbuf slot is below -1"); return -1; }

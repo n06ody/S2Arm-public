@@ -36,9 +36,13 @@ PY
 }
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
-run() {   # $1 产物名 → 设 rc，日志 $out/$1.log
+run() {   # $1 产物名，$2 可选 env（如 debug.s2a.*） → 设 rc，日志 $out/$1.log
     set +e
-    timeout 120 "$out/$1" "$out/shaders" > "$out/$1.log" 2>&1
+    if [ $# -ge 2 ] && [ -n "$2" ]; then
+        env "$2" timeout 120 "$out/$1" "$out/shaders" > "$out/$1.log" 2>&1
+    else
+        timeout 120 "$out/$1" "$out/shaders" > "$out/$1.log" 2>&1
+    fi
     rc=$?
     set -e
 }
@@ -50,8 +54,8 @@ if [ "$rc" -ne 0 ] || ! grep -q llvmpipe "$out/core.log" || grep -qE 'Validation
     tail -n 30 "$out/core.log"; echo "【红】imageBuffer 回放 rc=$rc 或 validation 有报错；完整日志 build/vk-image-tbuf-core/core.log" >&2; exit 1
 fi
 # 负控：各撤一条新路径。期望：rc ≠ 0、命中对应断言行、validation 0 条（只改回放逻辑，不关校验）
-neg() {   # $1 名字，$2 期望命中的断言
-    build "$out/rp_draw_$1.c" "neg-$1"; run "neg-$1"
+neg() {   # $1 名字，$2 期望命中的断言，$3 可选 env
+    build "$out/rp_draw_$1.c" "neg-$1"; run "neg-$1" "${3:-}"
     if [ "$rc" -eq 0 ] || ! grep -q "$2" "$out/neg-$1.log" || grep -qE 'Validation Error|VUID-' "$out/neg-$1.log"; then
         tail -n 20 "$out/neg-$1.log"; echo "【红】负控 $1 未命中「$2」（rc=${rc}）" >&2; exit 1
     fi
@@ -60,7 +64,8 @@ neg() {   # $1 名字，$2 期望命中的断言
 mutate route 'if (e->src_kind == NVN_RB_IMG && e->cls == NVN_GPU_RES_IMAGE_TBUF) {   // 计算 imageBuffer' 'if (0) {   // 计算 imageBuffer'
 neg route 'image_tbuf_rmw.comp @256: dispatch skipped'
 mutate shadow 'if (al > 1 && (off % al) && !(off % elem)) {' 'if (0) {'
-neg shadow 'image_tbuf_rmw.comp @516: dispatch skipped'
+# shadow 负控验证「无 VK_EXT_texel_buffer_alignment 时，撤掉回放对齐副本后端必拒收 off=516」
+neg shadow 'image_tbuf_rmw.comp @516: dispatch skipped' 'debug.s2a.nvk_texel_buffer_alignment=0'
 mutate writeback '    texel_wb_flush(c);   // imageBuffer 的对齐副本：派发写完拷回池镜像' '    g_ntwb = 0;'
 neg writeback 'image_tbuf_rmw.comp @516 element 0: 10 expected 31'
 echo '【绿】imageBuffer 回放：对齐 / 不对齐副本 / 不对齐原子三臂逐字节对、护栏不动，validation 0 条；撤路由 / 撤副本 / 撤拷回三负控各自变红'

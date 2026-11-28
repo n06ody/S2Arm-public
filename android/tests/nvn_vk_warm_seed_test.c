@@ -11,7 +11,7 @@
 //   seed 查无精确件 → 区分其他 profile、其他闭包、精确目录缺件和无随包种子，始终不读其他种子
 // 另有 --emit / --installed / --installed-nowindow 三个模式，由 nvk_warm_modules_test.sh 先跑真实安装器再读：--installed-nowindow 读安装后修订里 nowindow/ 的补件（替换管线清单 + 程序结果走受控读取），
 //   库外 / 环 / 绝对链接、桶号不符与目录别名由脚本换进去，期望被拒。
-// 期望值不来自被测实现：种子文件按格式手写（程序 60 + n*600 + 8：88 字节条目头 + 两段 0x100 字节 c1、管线 32 + n*388），种子目录名由测试自己算 SHA-256，
+// 期望值不来自被测实现：种子文件按格式手写（程序 60 + n*624 + 8：112 字节条目头 + 两段 0x100 字节 c1、管线 32 + n*388），种子目录名由测试自己算 SHA-256，
 // 管线紧凑配方的字段偏移按 nvn_vk_pipe_warm.c pw_desc_write 的顺序手算（smask 0、cfmt 1..32、dfmt 33、sfmt 37、samples 41、
 // lmap 45..52、prim 53、patch 57、restart 61、blend 62..125、color 126、chmask 130、ms 134..143、attr 144..207、stream 208..335、
 // ds 336、poly 344、rast_discard 348、clip_neg1 349、origin_ll 350、depth_clamp 351）。
@@ -109,19 +109,19 @@ static int write_file(const char *path, const uint8_t *b, size_t n) {
 static long file_size(const char *path) { struct stat st; return stat(path, &st) ? -1 : (long)st.st_size; }
 // 程序清单文件：ids[i] 的身份 + masks[i]（3 = 顶点 + 片元；5 是非法掩码，用来造坏条目），uses = 10 - i
 static void write_prog(const char *path, const int *ids, const uint32_t *masks, int n, const char *profile, int corrupt) {
-    size_t len = 60 + (size_t)n * 600 + 8;   // 条目 = 88 字节头 + 顶点 / 片元两段 c1 各 0x100
+    size_t len = 60 + (size_t)n * 624 + 8;   // 条目 = 112 字节头 + 顶点 / 片元两段 c1 各 0x100
     uint8_t *b = calloc(1, len);
     uint8_t ps[32], cs[32]; sha(profile, ps); sha(g_closure, cs);
-    w32(b, 0x31575053u); w32(b + 4, 2); w32(b + 8, 88); w32(b + 12, (uint32_t)n);
+    w32(b, 0x31575053u); w32(b + 4, 3); w32(b + 8, 112); w32(b + 12, (uint32_t)n);
     memcpy(b + 16, ps, 32); w32(b + 48, (uint32_t)g_abi); memcpy(b + 52, cs, 8);
     for (int i = 0; i < n; i++) {
-        uint8_t *e = b + 60 + (size_t)i * 600;
+        uint8_t *e = b + 60 + (size_t)i * 624;
         ident(ids[i], e); w32(e + 32, masks[i]);
-        for (int k = 0; k < 24; k++) e[36 + k] = (uint8_t)(ids[i] + k);
-        e[60] = 3; e[61] = 2;
-        w32(e + 64, 0x100); w32(e + 68, 0x100); w32(e + 72, 0);
-        w32(e + 76, (uint32_t)(10 - i)); w64(e + 80, (uint64_t)(n - i));
-        memset(e + 88, ids[i], 0x200);
+        for (int k = 0; k < 40; k++) e[36 + k] = (uint8_t)(ids[i] + k);
+        e[76] = 3; e[77] = 2;
+        w32(e + 80, 0x100); w32(e + 84, 0x100);
+        w32(e + 100, (uint32_t)(10 - i)); w64(e + 104, (uint64_t)(n - i));
+        memset(e + 112, ids[i], 0x200);
     }
     w64(b + len - 8, fnv(b, len - 8) ^ (corrupt ? 1u : 0u));
     CHECK(write_file(path, b, len) == 0, "write %s", path);
@@ -141,7 +141,10 @@ static void mkdesc(uint8_t d[352], int tag) {
     w32(d + 130, 0xFu);                               // chmask
     w32(d + 144, 0x2Au | 12u << 8 | 1u << 27);        // attr[0]：fmt 0x2A、offset 12、stream 1
     w32(d + 208, 24); w32(d + 212, 0);                // stream[0]：stride 24
+    if (tag == 1) { d[342] = 0x05; d[343] = 0x81; }   // 另一条沿用旧种子的零值
     w32(d + 344, 2u | 1u << 2);                       // poly：cull 2、front 1
+    if (tag == 1) d[345] = 1;                         // 另一条保留旧种子的零字节
+    d[341] = tag == 1;                                // 旧配方保留字节为零，深度边界默认关
     d[350] = 1;                                       // origin_ll
     d[351] = (uint8_t)(tag & 1);                      // depth_clamp
 }
@@ -200,6 +203,9 @@ static void case_seed_used(void) {
         n++;
         CHECK(nvk_pipe_warm_build(&r) == 0, "种子管线预建成功");
         uint8_t i1[32]; ident(1, i1);
+        CHECK(g_last_desc.sample_shading == (!memcmp(r.prog_identity, i1, 32) ? 1 : 0), "种子逐样本模式与旧种子默认值");
+        CHECK(g_last_desc.disabled_samples == (!memcmp(r.prog_identity, i1, 32) ? 0x8105 : 0), "逐样本掩码与旧种子的全开默认值");
+        CHECK(g_last_desc.depth_bounds_enable == !memcmp(r.prog_identity, i1, 32), "新种子保留深度边界，旧种子默认关闭");
         if (!memcmp(r.prog_identity, i1, 32)) {
             saw1 = 1;
             const nvn_gpu_pipe_desc *d = &g_last_desc;
@@ -222,7 +228,7 @@ static void case_seed_used(void) {
     pr.c1[0] = pr.c1[1] = c1b; pr.c1_len[0] = pr.c1_len[1] = 0x100;
     nvk_prog_warm_note(&pr);
     nvk_prog_warm_save();
-    CHECK(file_size(g_local_prog) == 60 + 3 * 600 + 8, "落盘写本机路径：种子 2 条 + 本局 1 条（得 %ld 字节）", file_size(g_local_prog));
+    CHECK(file_size(g_local_prog) == 60 + 3 * 624 + 8, "落盘写本机路径：种子 2 条 + 本局 1 条（得 %ld 字节）", file_size(g_local_prog));
     CHECK(file_size(g_seed_prog) == seed_prog_len && file_size(g_seed_pipe) == seed_pipe_len, "种子文件不动");
 }
 static void case_local_first(void) {

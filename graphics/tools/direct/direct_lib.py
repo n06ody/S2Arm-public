@@ -669,11 +669,11 @@ class Lib:
         cmd = [PY, R + '/graphics/tools/direct/run_pairs.py', P + '/shader_pairs.tsv', W + '/merged/union_keys.tsv', KN + '/pairs.tsv']; rc = run(cmd, log=W + '/run_pairs.log')
         if rc != 0: red('跑局配对并不进配对表', cmd, rc, log_text(W + '/run_pairs.log'), W + '/run_pairs.log')
         say(last_line(W + '/run_pairs.log'))
-        # 片元输出类型变体请求表（fout_want.tsv）与采样模拟变体请求表（se_want.tsv）：只给 Metal 库用（_ft / _se），安卓（VK=1）不出
+        # 片元输出类型变体请求表供两端消费（Metal _ft、Vulkan _vf）；采样模拟表只给 Metal。
+        try: shutil.copy(KN + '/fout_want.tsv', P + '/fout_want.tsv')
+        except OSError as e: red(f'输出类型变体请求表拷不进配置档副本（{KN}/fout_want.tsv）', text=str(e))
+        say(f'输出类型变体请求：{sum(1 for l in lines_of(P + "/fout_want.tsv") or [] if not l.startswith("#"))} 条（跑局知识快照）')
         if not VK:
-            try: shutil.copy(KN + '/fout_want.tsv', P + '/fout_want.tsv')
-            except OSError as e: red(f'输出类型变体请求表拷不进配置档副本（{KN}/fout_want.tsv）', text=str(e))
-            say(f'输出类型变体请求：{sum(1 for l in lines_of(P + "/fout_want.tsv") or [] if not l.startswith("#"))} 条（跑局知识快照）')
             cmd = [PY, R + '/graphics/tools/direct/se_want.py', P + '/se_want.tsv', W + '/merged/union_keys.tsv', '--keys', KN + '/se_want.tsv']; rc = run(cmd, log=W + '/se_want.log')
             if rc != 0: red('采样模拟变体请求表出不来', cmd, rc, log_text(W + '/se_want.log'), W + '/se_want.log')
             say(last_line(W + '/se_want.log'))

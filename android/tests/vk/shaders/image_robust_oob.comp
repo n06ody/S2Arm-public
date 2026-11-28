@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint probe_oob = 0;
+layout(set = 0, binding = 0) uniform sampler2D s_tex;
+layout(rgba8, set = 0, binding = 1) uniform image2D s_img;
+layout(set = 0, binding = 2) writeonly buffer Out { vec4 v[]; } out_buf;
+void main() {
+    out_buf.v[0] = texelFetch(s_tex, ivec2(1, 1), 0);
+    out_buf.v[3] = imageLoad(s_img, ivec2(2, 2));
+    if (probe_oob != 0) {
+        out_buf.v[1] = texelFetch(s_tex, ivec2(99, 99), 0);
+        out_buf.v[2] = texelFetch(s_tex, ivec2(-5, -3), 0);
+        out_buf.v[4] = imageLoad(s_img, ivec2(50, 50));
+        out_buf.v[5] = imageLoad(s_img, ivec2(-2, 0));
+        imageStore(s_img, ivec2(50, 50), vec4(1.0, 0.0, 0.0, 1.0));
+    }
+    imageStore(s_img, ivec2(0, 0), vec4(0.0, 1.0, 0.0, 1.0));
+}

@@ -110,7 +110,7 @@ static int bc_time_begin(struct nvn_gpu_cmd_s *c, uint32_t path, uint32_t format
                 .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * BC_TIME_CHUNK,
             };
             if (vkCreateQueryPool(g.d, &info, NULL, &chunk->pool) == VK_SUCCESS)
-                vkCmdResetQueryPool(c->cb, chunk->pool, 0, info.queryCount);
+                query_pool_reset(c->cb, chunk->pool, 0, info.queryCount);
         }
         // 保持完成时的输出和派发次序相同。
         if (c->bc_time) c->bc_time->next = chunk;

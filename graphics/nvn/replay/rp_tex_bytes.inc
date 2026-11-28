@@ -10,6 +10,7 @@ struct tex_byte_cache {
     struct tex_byte_cache *newer, *older;
     const uint8_t *mem;
     size_t len;
+    uint64_t unarmed_serial;   // Only the same guest texture can retire this retry.
     uint64_t map, log_id, failure_epoch;
     uint8_t bytes[];
 };
@@ -17,6 +18,7 @@ static struct tex_byte_cache *g_tex_bytes_newest, *g_tex_bytes_oldest;
 static size_t g_tex_bytes_live;
 static uint64_t g_tex_bytes_upload_sub;
 static int g_tex_bytes_on = -1;   // g_rmu; latched for the session
+static int g_unarmed_verify = -1;
 static _Atomic uint64_t g_tex_bytes_failure_epoch;
 
 // A completion can run while the replay thread owns g_rmu. Invalidate
@@ -47,6 +49,7 @@ static void tex_bytes_promote(struct tex_byte_cache *b) {
 static void tex_bytes_free(struct tex_byte_cache *b) {
     if (!b) return;
     g_tex_bytes_live -= sizeof *b + b->len;
+    tex_upload_diag_cache(TU_CACHE_N, 0, g_tex_bytes_live);
     free(b);
 }
 
@@ -126,19 +129,72 @@ static int tex_bytes_unchanged(struct rp_tex *x, const tex_t *t, const struct te
 
 // Take one immutable source, shared by all upload paths. A separate memcpy
 // after encoding wouldn't necessarily describe the same guest bytes.
-static struct tex_byte_cache *tex_bytes_capture(struct rp_tex *x, const tex_t *t, uint64_t stamp) {
+static struct tex_byte_cache *tex_bytes_capture(struct rp_tex *x, const tex_t *t, uint64_t stamp, int unarmed) {
     const uint64_t map = nvn_dirty_mapping_generation(), cursor = x->log_cur;
-    if (!tex_bytes_stable(x, t, map, cursor, stamp)) return NULL;
+    if (!unarmed && !tex_bytes_stable(x, t, map, cursor, stamp)) {
+        tex_upload_diag_cache(TU_CACHE_REJECT, t->L.size, g_tex_bytes_live);
+        return NULL;
+    }
     const size_t space = sizeof(struct tex_byte_cache) + (size_t)t->L.size;
-    while (g_tex_bytes_live > TEX_BYTES_TOTAL_MAX - space)
+    while (g_tex_bytes_live > TEX_BYTES_TOTAL_MAX - space) {
+        tex_upload_diag_cache(TU_CACHE_EVICT, g_tex_bytes_oldest->len, g_tex_bytes_live);
         tex_bytes_drop(g_tex_bytes_oldest->owner);
+    }
     struct tex_byte_cache *b = malloc(space);
-    if (!b) return NULL;
-    *b = (struct tex_byte_cache){.owner = x, .mem = t->mem, .len = (size_t)t->L.size,
+    if (!b) {
+        tex_upload_diag_cache(TU_CACHE_REJECT, t->L.size, g_tex_bytes_live);
+        return NULL;
+    }
+    *b = (struct tex_byte_cache){.owner = x, .mem = t->mem, .len = (size_t)t->L.size, .unarmed_serial = unarmed ? t->serial : 0,
                                  .map = map, .log_id = x->log_id, .failure_epoch = tex_bytes_failure_epoch()};
     g_tex_bytes_live += space;
     memcpy(b->bytes, t->mem, b->len);
-    if (tex_bytes_stable(x, t, map, cursor, stamp)) return b;
+    if (unarmed || tex_bytes_stable(x, t, map, cursor, stamp)) {
+        tex_upload_diag_cache(unarmed ? TU_CACHE_UNARMED : TU_CACHE_EQUAL, b->len, g_tex_bytes_live);
+        return b;
+    }
+    tex_upload_diag_cache(TU_CACHE_REJECT, b->len, g_tex_bytes_live);
     tex_bytes_free(b);
     return NULL;
+}
+
+// An unprotected page can change without another fault. Compare the entire uploaded
+// window, including protected pages that might have changed since the last upload.
+// If any page was writable when the comparison began, repeat at every resolve.
+static int tex_unarmed_equal(struct rp_tex *x, const tex_t *t) {
+    struct tex_byte_cache *b = x->byte_cache;
+    if (!b || b->unarmed_serial != t->serial || !x->uploaded || !x->span || b->mem != t->mem ||
+        b->len != t->L.size || b->map != nvn_dirty_mapping_generation() ||
+        nvn_dirty_tracking_unreliable() || rp_buf_gpu_pending((uintptr_t)t->mem, b->len)) {
+        tex_upload_diag_cache(TU_CMP_EARLY, t->L.size, g_tex_bytes_live);
+        return 0;
+    }
+
+    uint64_t lo, hi;
+    tex_window(t, &lo, &hi);
+    if (lo || hi != b->len) {
+        tex_upload_diag_cache(TU_CMP_EARLY, t->L.size, g_tex_bytes_live);
+        return 0;
+    }
+    tex_log_arm(x, t);
+    nvn_dirty_protect(t->mem, b->len);
+    const uint64_t stamp = nvn_dirty_now();
+    const int armed = tex_pages_armed(x, t);
+    if (memcmp(t->mem, b->bytes, b->len)) {
+        tex_upload_diag_cache(TU_CMP_DIFF, b->len, g_tex_bytes_live);
+        return 0;
+    }
+    if (b->map != nvn_dirty_mapping_generation() || b->failure_epoch != tex_bytes_failure_epoch()) {
+        tex_upload_diag_cache(TU_CMP_UNSTABLE, b->len, g_tex_bytes_live);
+        return 0;
+    }
+    tex_upload_diag_cache(TU_CMP_EQUAL, b->len, g_tex_bytes_live);
+    x->stamp = stamp;
+    rp_perf_add(RP_PERF_TEX_BYTE_EQUAL, 1);
+    rp_perf_add(RP_PERF_TEX_BYTE_SKIPPED, b->len);
+    if (armed) {
+        x->unarmed = 0;
+        tex_bytes_drop(x);
+    }
+    return 1;
 }

@@ -20,13 +20,13 @@ mkdir -p $T/roots/acnh@s0/romfs; echo r > $T/roots/acnh@s0/romfs/f; printf 'titl
 SD=$T/run/s2arm/vk_warm/0100AAAA00000000
 cur() { cd -P $T/roots/$(cat $T/roots/acnh@现行) && pwd; }
 S() { O=$(bash $T/repo/pack/stage_vk_warm_seed.sh acnh 2>&1); RC=$?; K=$(cat "$(cur)/.stage_vk_warm_seed" 2> /dev/null); }
-# 一份真机程序清单（宿主格式手写：60 字节头 + 88 字节条目头 + 两段 0x100 的 c1 + FNV-1a；起始值照宿主 1469598103934665603）
+# 一份真机程序清单（宿主格式手写：60 字节头 + 112 字节条目头 + 两段 0x100 的 c1 + FNV-1a；起始值照宿主 1469598103934665603）
 prog() { python3 - "$1" "${2:-0}" <<'EOF'
 import hashlib, os, struct, sys
 d, corrupt = sys.argv[1], int(sys.argv[2])
 cl = hashlib.sha256(b'closure-A').digest()[:8]
-b = struct.pack('<IIII', 0x31575053, 2, 88, 1) + hashlib.sha256(b'profile-A').digest() + struct.pack('<i', 7) + cl
-b += bytes(range(1, 33)) + struct.pack('<I', 3) + bytes(24) + b'\x03\x02\x00\x00' + struct.pack('<IIIIQ', 0x100, 0x100, 0, 1, 1) + bytes(0x200)
+b = struct.pack('<IIII', 0x31575053, 3, 112, 1) + hashlib.sha256(b'profile-A').digest() + struct.pack('<i', 7) + cl
+b += bytes(range(1, 33)) + struct.pack('<I', 3) + bytes(40) + b'\x03\x02\x00\x00' + struct.pack('<IIIIIIQ', 0x100, 0x100, 0, 0, 0, 1, 1) + bytes(0x200)
 h = 1469598103934665603
 for x in b: h = ((h ^ x) * 1099511628211) & (2**64 - 1)
 os.makedirs(d, exist_ok=True)

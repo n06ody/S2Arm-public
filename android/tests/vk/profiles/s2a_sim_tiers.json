@@ -399,7 +399,7 @@
             "version": 1,
             "api-version": "1.1.0",
             "label": "无实例除数扩展",
-            "description": "能力不变，由 sim_tiers.sh 用 exclude_device_extensions 去掉 VK_EXT_vertex_attribute_divisor。期望：契约绿，除数 2 的管线具名 UNSUPPORTED（C977b），不静默退回每实例一次。",
+            "description": "由 sim_tiers.sh 藏掉 EXT 和 KHR 两个实例除数扩展。期望：除数 2 的管线具名 UNSUPPORTED（C977b）。",
             "contributors": {},
             "history": [
                 {

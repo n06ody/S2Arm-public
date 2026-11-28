@@ -87,6 +87,58 @@ static void mixed(void) {
     API(nvnCommandBufferFinalize)(&cmd);
 }
 
+static void sample_mask_records(void) {
+    NVNcommandBuffer cmd;
+    start(&cmd, 256);
+    API(nvnCommandBufferSetDepthRange)(&cmd, 0.0f, 1.0f);
+    const int masks[] = {0, 5, 15, 0xffff};
+    for (unsigned i = 0; i < sizeof masks / sizeof masks[0]; i++)
+        API(nvnCommandBufferSetSampleMask)(&cmd, masks[i]);
+    uint8_t *pos = records(API(nvnCommandBufferEndRecording)(&cmd));
+    op_hdr header;
+    memcpy(&header, pos, sizeof header);
+    CHECK(header.op == OP_DEPTH_RANGE);
+    pos += header.size;
+    for (unsigned i = 0; i < sizeof masks / sizeof masks[0]; i++) {
+        memcpy(&header, pos, sizeof header);
+        CHECK(header.op == OP_SAMPLE_MASK);
+        CHECK(header.size >= sizeof header + sizeof(uint32_t));
+        uint32_t recorded;
+        memcpy(&recorded, pos + sizeof header, sizeof recorded);
+        CHECK(recorded == (uint32_t)masks[i]);
+        pos += header.size;
+    }
+    memcpy(&header, pos, sizeof header);
+    CHECK(header.op == OP_END);
+    API(nvnCommandBufferFinalize)(&cmd);
+}
+
+static void attachment_discard(void) {
+    NVNcommandBuffer cmd;
+    start(&cmd, 128);
+    API(nvnCommandBufferDiscardColor)(&cmd, 7);
+    API(nvnCommandBufferDiscardDepthStencil)(&cmd);
+    API(nvnCommandBufferDiscardColor)(&cmd, 2);
+    const uint8_t *p = records(API(nvnCommandBufferEndRecording)(&cmd));
+    const uint32_t ops[] = {OP_DISCARD_COLOR, OP_DISCARD_DS, OP_DISCARD_COLOR, OP_END};
+    const uint32_t sizes[] = {16, 8, 16, 8};
+    for (unsigned i = 0; i < sizeof ops / sizeof ops[0]; i++) {
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        CHECK(h.op == ops[i] && h.size == sizes[i]);
+        if (h.op == OP_DISCARD_COLOR) {
+            p_discard_color discarded;
+            memcpy(&discarded, p + sizeof h, sizeof discarded);
+            CHECK(discarded.slot == (i == 0 ? 7 : 2) && discarded.pad == 0);
+        }
+        p += h.size;
+    }
+    CHECK(API(nvnCommandBufferGetCommandMemoryUsed)(&cmd) == 0);
+    CHECK(API(nvnCommandBufferGetCommandMemoryFree)(&cmd) == 128);
+    untouched(0, 65536);
+    API(nvnCommandBufferFinalize)(&cmd);
+}
+
 static void tight(void) {
     NVNcommandBuffer cmd; start(&cmd, 88);
     // 设备字节：深度范围 16（记录大小）+ BaseVertex(-13) 72 + END 0 = 88，正好用满；没设回调也不借窗口（借了 Used 不会正好是 88、Free 不会是 0）
@@ -318,6 +370,35 @@ static NVNshaderData shader(int i, uint32_t code_off) {
 }
 // NVN2 构建器建程序（金刚 11-04）：SetDefaults / SetDevice / SetShaders 后 InitializeFromBuilder，与 ProgramInitialize + SetShaders 建出同一份程序：
 //   2 个阶段、两阶段键 = 独立算的 SHA-256 前 8 字节；阶段数越界回失败
+static void depth_bounds_record(void) {
+    NVNcommandBuffer cmd;
+    start(&cmd, 256);
+    API(nvnCommandBufferSetDepthRange)(&cmd, 0.0f, 1.0f);
+    const struct { uint32_t enable; float lo, hi; } states[] = {
+        {1, 0.25f, 0.75f}, {1, 0.5f, 0.5f}, {0, 0.0f, 1.0f}
+    };
+    for (size_t i = 0; i < sizeof states / sizeof states[0]; ++i)
+        API(nvnCommandBufferSetDepthBounds)(&cmd, states[i].enable, states[i].lo, states[i].hi);
+    uint8_t *pos = records(API(nvnCommandBufferEndRecording)(&cmd));
+    op_hdr h;
+    memcpy(&h, pos, sizeof h);
+    CHECK(h.op == OP_DEPTH_RANGE);
+    pos += h.size;
+    for (size_t i = 0; i < sizeof states / sizeof states[0]; ++i) {
+        memcpy(&h, pos, sizeof h);
+        CHECK(h.op == OP_BIND_STATE);
+        CHECK(h.size >= sizeof h + sizeof(p_bind_state));
+        p_bind_state bind;
+        memcpy(&bind, pos + sizeof h, sizeof bind);
+        CHECK(bind.kind == NVN_BIND_DEPTH_BOUNDS);
+        CHECK(memcmp(bind.bytes, &states[i], sizeof states[i]) == 0);
+        pos += h.size;
+    }
+    memcpy(&h, pos, sizeof h);
+    CHECK(h.op == OP_END);
+    API(nvnCommandBufferFinalize)(&cmd);
+}
+
 static void program_builder(void) {
     typedef void (*f_def)(void *); typedef void (*f_dev)(void *, NVNdevice *); typedef void (*f_sh)(void *, int, const NVNshaderData *);
     typedef NVNboolean (*f_init)(NVNprogram *, const void *);
@@ -334,6 +415,32 @@ static void program_builder(void) {
     CHECK(snap); CHECK(snap->nstage == 2); CHECK(tok == 3); CHECK(!memcmp(tk[0], want[0], 8)); CHECK(!memcmp(tk[1], want[1], 8));
     static NVNprogram bad; ((f_sh)load("nvnProgramBuilderSetShaders"))(b, 7, sd); CHECK(!((f_init)load("nvnProgramInitializeFromBuilder"))(&bad, b));
 }
+// 原驱动从 w1 取低六位。一次录制内重复绑定同一程序，后续 setter 不得改写之前那笔。
+static void program_sample_shading(void) {
+    static NVNprogram program;
+    CHECK(API(nvnProgramInitialize)(&program, &device));
+    NVNcommandBuffer cmd; start(&cmd, 512);
+    typedef void (*set_sample_mode)(NVNprogram *, uint32_t);
+    set_sample_mode set = (set_sample_mode)load("nvnProgramSetSampleShading");
+    API(nvnCommandBufferBindProgram)(&cmd, &program, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    set(&program, 65);
+    API(nvnCommandBufferBindProgram)(&cmd, &program, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    set(&program, 2);
+    API(nvnCommandBufferBindProgram)(&cmd, &program, NVN_SHADER_STAGE_FRAGMENT_BIT);
+    uint8_t *rec = records(API(nvnCommandBufferEndRecording)(&cmd));
+    const uint32_t expected[] = {0, 1, 2};
+    for (unsigned i = 0; i < sizeof expected / sizeof *expected; i++) {
+        op_hdr hdr; memcpy(&hdr, rec, sizeof hdr);
+        CHECK(hdr.op == OP_BIND_PROGRAM && hdr.size == sizeof hdr + sizeof(p_bind_program_id));
+        p_bind_program_id binding;
+        memcpy(&binding, rec + sizeof hdr, sizeof binding);
+        CHECK(binding.sample_shading == expected[i]);
+        rec += hdr.size;
+    }
+    API(nvnCommandBufferFinalize)(&cmd);
+    API(nvnProgramFinalize)(&program);
+}
+
 static void program_bind(void) {
     NVNcommandBuffer cmd; start(&cmd, 512);
     for (int i = 0; i < 2 * CODE_N; i++) memory[CODE_OFF + i] = (uint8_t)(i * 7 + 1);
@@ -491,7 +598,9 @@ int main(void) {
     API(nvnMemoryPoolBuilderSetFlags)(&pb, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
     API(nvnMemoryPoolBuilderSetStorage)(&pb, memory, 65536);
     CHECK(API(nvnMemoryPoolInitialize)(&pool, &pb));
-    mixed(); large_mdi(); tight(); vertex_buffers(); viewports(); render_targets(); exact_grant(); program_bind(); program_builder(); memory_size(); memory_size_concurrent(); mesh_tasks(); vertex_state();
+    sample_mask_records();
+    depth_bounds_record();
+    mixed(); large_mdi(); tight(); attachment_discard(); vertex_buffers(); viewports(); render_targets(); exact_grant(); program_sample_shading(); program_bind(); program_builder(); memory_size(); memory_size_concurrent(); mesh_tasks(); vertex_state();
     API(nvnMemoryPoolFinalize)(&pool); API(nvnDeviceFinalize)(&device); free(memory); unlink(map);
     printf("✓ t_nvn_draw_record：%u 条断言，记录在宿主块、游戏命令内存不动、已用按设备字节，混合draw/VB解码与72B正好用满、视口与渲染目标按实际内容录；回调按设备字节正好补所需不借窗口；BindProgram 32B 身份记录按序号还原、重设 / 终结 / 300 个新序号后仍取绑定当时快照；命令内存 Size 录制 / 换段 / 借窗口 / 并发读中恒为最近一次 AddCommandMemory 的段长\n", checks);
     return 0;

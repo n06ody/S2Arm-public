@@ -29,8 +29,8 @@ import pathlib, sys
 root, out, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 source = (root / 'backend_vulkan_wsi.inc').read_text()
 if mode == '--negative-size':
-    before = 'return caps.currentTransform != s->built_transform || ext.width != s->extent.width || ext.height != s->extent.height;'
-    after = 'return caps.currentTransform != s->built_transform;'
+    before = 'ext.width != s->extent.width || ext.height != s->extent.height;'
+    after = '0;'
 elif mode == '--negative-zero':
     before = 'if (!ext.width || !ext.height || !caps->maxImageExtent.width || !caps->maxImageExtent.height)'
     after = 'if (0 && (!ext.width || !ext.height || !caps->maxImageExtent.width || !caps->maxImageExtent.height))'
@@ -38,11 +38,8 @@ elif mode == '--negative-revoke':
     before = 'int unavailable = s->gen ? NVN_GPU_E_OUTDATED : NVN_GPU_E_REVOKED;'
     after = 'int unavailable = NVN_GPU_E_REVOKED;'
 else:
-    before = 'if (!(caps->supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))'
-    after = 'if (0 && !(caps->supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))'
-    anchor = 'ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;'
-    assert source.count(anchor) == 1
-    source = source.replace(anchor, 'ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;')
+    before = 'const uint32_t transform = (uint32_t)s->pretransform;'
+    after = 'const uint32_t transform = s->pretransform == 2u ? 8u : s->pretransform == 8u ? 2u : 1u;'
 assert source.count(before) == 1, 'WSI mutation anchor changed'
 (out / 'wsi_mutant.inc').write_text(source.replace(before, after))
 backend = (root / 'backend_vulkan.c').read_text()
@@ -56,7 +53,7 @@ fi
 cc -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
     -Wl,--wrap=vkGetPhysicalDeviceSurfaceCapabilitiesKHR -Wl,--wrap=vkCreateSwapchainKHR \
-    -Wl,--wrap=vkQueuePresentKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
+    -Wl,--wrap=vkQueuePresentKHR -Wl,--wrap=vkGetSwapchainImagesKHR -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
 export VK_ICD_FILENAMES="$S2A_LAVAPIPE_ICD" VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD"
 export VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
@@ -69,18 +66,27 @@ timeout 120 "$binary" > "$log" 2>&1
 rc=$?
 set -e
 if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-|fixture failure' "$log"; then cat "$log"; exit 1; fi
+if [ "$mode" = --negative-transform ]; then
+    [ "$rc" = 1 ] && grep -q 'wsi-extent cases=19 failures=0' "$log" || { cat "$log"; exit 1; }
+    [ "$(grep -c '^wsi-pixels transform=0x1 .*bad=0$' "$log")" = 2 ] &&
+    [ "$(grep -c '^wsi-pixels transform=0x8 crop=2 .*bad=0$' "$log")" = 2 ] &&
+    [ "$(grep -cE '^wsi-pixels transform=0x[248] .*bad=[1-9][0-9]*$' "$log")" = 7 ] || { cat "$log"; exit 1; }
+    echo 'wsi-extent --negative-transform: PASS (7 wrong rotated frames, 4 controls, validation clean)'
+    exit 0
+fi
 if [ -n "$mode" ]; then
     expected=2; names=(zero-extent zero-restore)
     if [ "$mode" = --negative-size ]; then expected=3; names=(undefined-resize clamped-resize fixed-resize); fi
-    if [ "$mode" = --negative-transform ]; then expected=1; names=(missing-identity); fi
     if [ "$mode" = --negative-revoke ]; then names=(zero-restore zero-window-restore); fi
-    if [ "$rc" != 1 ] || ! grep -q "wsi-extent cases=13 failures=$expected" "$log"; then cat "$log"; exit 1; fi
+    if [ "$rc" != 1 ] || ! grep -q "wsi-extent cases=19 failures=$expected" "$log" ||
+       ! grep -q 'wsi-pixels cases=11 bad=0' "$log"; then cat "$log"; exit 1; fi
     for name in "${names[@]}"; do grep -q "wsi-extent case=$name bad=1" "$log" || { cat "$log"; exit 1; }; done
     echo "wsi-extent $mode: PASS (expected $expected behavior failures; remaining controls pass; validation clean)"
     exit 0
 fi
 cat "$log"
 [ "$rc" = 0 ] || exit "$rc"
-grep -q 'wsi-extent cases=13 failures=0' "$log"
-echo '【绿】WSI extent: 13 cases, real swapchains/presents, validation 0 errors'
+grep -q 'wsi-extent cases=19 failures=0' "$log"
+grep -q 'wsi-pixels cases=11 bad=0' "$log"
+echo '【绿】WSI extent: 19 cases, 11 readbacks, validation 0 errors'
 for mutant in size zero transform revoke; do bash "$0" "--negative-$mutant"; done

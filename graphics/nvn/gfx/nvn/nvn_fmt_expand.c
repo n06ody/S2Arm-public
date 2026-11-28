@@ -76,8 +76,9 @@ int nvn_fmt_expand_upload(uint32_t f, const uint8_t *src, size_t pitch, uint32_t
                 if (i2f) putf(o, ds, one ? 1.0 : (double)c[k]);
                 else if (f == 0x69) {
                     double x = (double)c[k] / (k == 3 ? 1.0 : 511.0);
-                    x = x < -1 ? -1 : x > 1 ? 1 : x;
-                    put(o, 2, (uint64_t)(int64_t)(x * 32767.0 + (x < 0 ? -0.5 : 0.5)));
+                    // 两种负端编码在 SNORM16 的采样值都为 -1；保留各自位模式供原字节回读。
+                    const int64_t sn = x < -1 ? -32768 : (int64_t)(x * 32767.0 + (x < 0 ? -0.5 : 0.5));
+                    put(o, 2, (uint64_t)sn);
                 } else if (f == 0x6A) {
                     put(o, 2, (uint64_t)c[k]);
                 } else if (!one) {

@@ -74,7 +74,8 @@ static struct pw_state {
     // 热点重排（note_gen → order 重建）只写 g.recs / g.order，只影响下一局清单——否则 take 的游标会走在
     // 正在被重排的 order 上：同一配方取两次、另一个配方永远漏掉（外部复核 pipe_order_probe 的 A→A）。
     struct nvk_pipe_rec *plan;
-    uint32_t plan_n, plan_i;
+    uint32_t plan_n, plan_i, plan_left;
+    int32_t *plan_index;    // 身份桶头 + 链；仅 reactive 档分配。配方 bytes=0 表示已取走。
     struct nvk_pipe_rec *recs;
     uint32_t *uses;         // 与 recs 平行：使用次数（落盘用）
     uint32_t *seen;         // 最近使用序号（同 uses 的淘汰顺序）
@@ -133,8 +134,7 @@ static uint64_t pw_get64(const uint8_t *b, size_t *at) {
     return v;
 }
 
-// 一条管线描述 → 紧凑字节。st[].sh / nspec / spec / _rsv_prim 不进记录：sh 由程序身份还原，
-// nspec 恒 0（note 处已挡），spec 是它的空参数区，_rsv_prim 是保留位。
+// 预热清单保留原格式。shader 由程序身份还原，带特化常量或视口位置变体的配方不写。
 static void pw_desc_write(const nvn_gpu_pipe_desc *d, uint8_t *o) {
     size_t at = 0;
     uint8_t smask = 0;
@@ -155,7 +155,9 @@ static void pw_desc_write(const nvn_gpu_pipe_desc *d, uint8_t *o) {
                          (uint64_t)b->eq_a << 34 | (uint64_t)b->adv_mode << 37 | (uint64_t)b->adv_overlap << 43 |
                          (uint64_t)b->adv_premul << 45 | (uint64_t)b->adv_normdst << 46);
     }
-    pw_put32(o, &at, (uint32_t)d->color.blend_en | (uint32_t)d->color.logic_op << 8 | (uint32_t)d->color.alpha_func << 12);
+    // 颜色字高位在旧配方为零，旧读者也会屏蔽。bit 16 记 LAST，兼容旧尺寸和回退读取。
+    pw_put32(o, &at, (uint32_t)d->color.blend_en | (uint32_t)d->color.logic_op << 8 |
+                     (uint32_t)d->color.alpha_func << 12 | (uint32_t)(d->provoking_last != 0) << 16);
     pw_put32(o, &at, d->chmask.mask);
     { const uint8_t *m = &d->ms.enable; for (int i = 0; i < 10; i++) o[at++] = m[i]; }
     for (int i = 0; i < 16; i++)
@@ -165,9 +167,11 @@ static void pw_desc_write(const nvn_gpu_pipe_desc *d, uint8_t *o) {
       pw_put64(o, &at, (uint64_t)s->dt | (uint64_t)s->dw << 1 | (uint64_t)s->df << 2 | (uint64_t)s->st << 6 |
                        (uint64_t)s->sf_f << 7 | (uint64_t)s->sf_b << 11 | (uint64_t)s->fail_f << 15 |
                        (uint64_t)s->zfail_f << 19 | (uint64_t)s->zpass_f << 23 | (uint64_t)s->fail_b << 27 |
-                       (uint64_t)s->zfail_b << 31 | (uint64_t)s->zpass_b << 35); }
+                       (uint64_t)s->zfail_b << 31 | (uint64_t)s->zpass_b << 35 |
+                       (uint64_t)d->depth_bounds_enable << 40 |
+                       (uint64_t)d->disabled_samples << 48); }  // 旧配方这些字节为零，表示默认关/全开
     pw_put32(o, &at, (uint32_t)d->poly.cull | (uint32_t)d->poly.front << 2 | (uint32_t)d->poly.mode << 3 |
-                     (uint32_t)d->poly.offset_en << 5);
+                     (uint32_t)d->poly.offset_en << 5 | (uint32_t)d->sample_shading << 8);  // 原记录的高字节为 0（默认模式）
     o[at++] = d->rast_discard;
     o[at++] = d->clip_neg1;
     o[at++] = d->origin_ll;
@@ -206,7 +210,8 @@ static int pw_desc_read(const uint8_t *b, uint32_t bytes, nvn_gpu_pipe_desc *d) 
         o->adv_normdst = (v >> 46) & 0x1u;
     }
     { uint32_t v = pw_get32(b, &at);
-      d->color.blend_en = v & 0xffu; d->color.logic_op = (v >> 8) & 0xfu; d->color.alpha_func = (v >> 12) & 0xfu; }
+      d->color.blend_en = v & 0xffu; d->color.logic_op = (v >> 8) & 0xfu; d->color.alpha_func = (v >> 12) & 0xfu;
+      d->provoking_last = (v >> 16) & 1u; }
     d->chmask.mask = pw_get32(b, &at);
     { uint8_t *m = &d->ms.enable; for (int i = 0; i < 10; i++) m[i] = b[at++]; }
     for (int i = 0; i < 16; i++) {
@@ -222,10 +227,13 @@ static int pw_desc_read(const uint8_t *b, uint32_t bytes, nvn_gpu_pipe_desc *d) 
       o->st = (v >> 6) & 0x1u; o->sf_f = (v >> 7) & 0xfu; o->sf_b = (v >> 11) & 0xfu;
       o->fail_f = (v >> 15) & 0xfu; o->zfail_f = (v >> 19) & 0xfu;
       o->zpass_f = (v >> 23) & 0xfu; o->fail_b = (v >> 27) & 0xfu;
-      o->zfail_b = (v >> 31) & 0xfu; o->zpass_b = (v >> 35) & 0xfu; }
+      o->zfail_b = (v >> 31) & 0xfu; o->zpass_b = (v >> 35) & 0xfu;
+      d->depth_bounds_enable = (uint8_t)(v >> 40);
+      d->disabled_samples = (uint16_t)(v >> 48); }
     { uint32_t v = pw_get32(b, &at);
       d->poly.cull = v & 0x3u; d->poly.front = (v >> 2) & 0x1u; d->poly.mode = (v >> 3) & 0x3u;
-      d->poly.offset_en = (v >> 5) & 0x7u; }
+      d->poly.offset_en = (v >> 5) & 0x7u;
+      d->sample_shading = (uint8_t)(v >> 8); }
     d->rast_discard = b[at++];
     d->clip_neg1 = b[at++];
     d->origin_ll = b[at++];
@@ -253,6 +261,10 @@ static uint32_t pw_cap_from_flag(void) {
     if (v < 1) v = 1;
     if (v > NVK_PW_MAX_HARD) v = NVK_PW_MAX_HARD;
     return (uint32_t)v;
+}
+
+static uint32_t pw_r32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
 static uint32_t pw_bucket_of(uint64_t h, uint32_t nbucket) { return (uint32_t)(h & (nbucket - 1)); }
@@ -403,12 +415,16 @@ static void pw_dg_field(uint32_t off, char *out, size_t n) {
     else if (off < 61) snprintf(out, n, "patch_size");
     else if (off < 62) snprintf(out, n, "prim_restart");
     else if (off < 126) snprintf(out, n, "blend[%u]", (unsigned)((off - 62) / 8));
+    else if (off == 128) snprintf(out, n, "provoking_last");
     else if (off < 130) snprintf(out, n, "color");
     else if (off < 134) snprintf(out, n, "chmask");
     else if (off < 144) snprintf(out, n, "ms.%s", ms_f[off - 134]);
     else if (off < 208) snprintf(out, n, "attr[%u]", (unsigned)((off - 144) / 4));
     else if (off < 336) snprintf(out, n, "stream[%u].%s", (unsigned)((off - 208) / 8), ((off - 208) % 8) < 4 ? "stride" : "divisor");
-    else if (off < 344) snprintf(out, n, "ds");
+    else if (off == 341) snprintf(out, n, "depth_bounds_enable");
+    else if (off < 342) snprintf(out, n, "ds");
+    else if (off < 344) snprintf(out, n, "disabled_samples");
+    else if (off == 345) snprintf(out, n, "sample_shading");
     else if (off < 348) snprintf(out, n, "poly");
     else if (off == 348) snprintf(out, n, "rast_discard");
     else if (off == 349) snprintf(out, n, "clip_neg1");
@@ -612,7 +628,7 @@ static void pw_touch_locked(uint32_t slot) {
 void nvk_pipe_warm_rec_of(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], struct nvk_pipe_rec *out) {
     if (!out) return;
     memset(out, 0, sizeof *out);
-    if (!d || !prog_identity) return;
+    if (!d || !prog_identity || d->vp_swizzle) return;
     for (int st = 0; st < 5; st++) if (d->st[st].nspec) return;   // 特化常量不进记录：bytes 留 0
     pw_desc_write(d, out->desc);
     memcpy(out->prog_identity, prog_identity, 32);
@@ -639,7 +655,7 @@ void nvk_pipe_warm_test_hash_const(int on) { __atomic_store_n(&g_hash_const, on 
 static void pw_note(const nvn_gpu_pipe_desc *d, const uint8_t prog_identity[32], uint64_t *tag_out, int compute) {
     if (tag_out) *tag_out = 0;
     if (!d || !prog_identity) return;
-    if (pw_id_zero(prog_identity)) return;   // 没有身份的程序不进清单（失败项 / 还没算出来）
+    if (pw_id_zero(prog_identity) || d->vp_swizzle) return;   // 旧记录不保存视口变体
     for (int st = 0; st < 5; st++)
         if (d->st[st].nspec) {   // 特化常量不进记录：那类配方本层不产生，宁可不预热也不建错
             __atomic_fetch_add(&g.st.rejected, 1, __ATOMIC_RELAXED);
@@ -737,19 +753,64 @@ static void pw_build_order_locked(void) {
     g.order_gen = g.note_gen;
 }
 
+static void pw_plan_index(void) {
+    free(g.plan_index);
+    g.plan_index = NULL;
+    g.plan_left = g.plan_n;
+    if (!g.plan_n || !nvn_plat_flag("nvk_warm_reactive", 0)) return;
+    g.plan_index = malloc((g.nbucket + g.plan_n) * sizeof *g.plan_index);
+    if (!g.plan_index) { pw_log(1, "管线预热：热点索引分配失败，沿用顺序预热"); return; }
+    for (uint32_t i = 0; i < g.nbucket; i++) g.plan_index[i] = -1;
+    // 文件中越热越靠前，反向挂链，使相同身份首先取到最热的配方。
+    for (uint32_t i = g.plan_n; i-- > 0;) {
+        uint32_t b = pw_bucket_of(pw_r32(g.plan[i].prog_identity), g.nbucket);
+        g.plan_index[g.nbucket + i] = g.plan_index[b];
+        g.plan_index[b] = (int32_t)i;
+    }
+}
+
+static void pw_plan_take(uint32_t slot, struct nvk_pipe_rec *out) {
+    *out = g.plan[slot];
+    g.plan[slot].bytes = 0;
+    g.plan_left--;
+}
+
+int nvk_pipe_warm_take_program(const uint8_t identity[32], struct nvk_pipe_rec *out) {
+    pthread_mutex_lock(&g.mu);
+    int found = 0;
+    if (g.plan_index && g.plan_left) {
+        uint32_t b = pw_bucket_of(pw_r32(identity), g.nbucket);
+        int32_t *link = &g.plan_index[b];
+        while (*link >= 0) {
+            uint32_t i = (uint32_t)*link;
+            int32_t *next = &g.plan_index[g.nbucket + i];
+            if (g.plan[i].bytes && !memcmp(g.plan[i].prog_identity, identity, 32)) {
+                *link = *next;
+                pw_plan_take(i, out);
+                found = 1;
+                break;
+            }
+            link = next;
+        }
+    }
+    pthread_mutex_unlock(&g.mu);
+    return found;
+}
+
 int nvk_pipe_warm_take(struct nvk_pipe_rec *out) {
     if (!out) return 0;
     memset(out, 0, sizeof *out);
     pthread_mutex_lock(&g.mu);
+    while (g.plan_i < g.plan_n && !g.plan[g.plan_i].bytes) g.plan_i++;
     if (g.plan_i >= g.plan_n) { pthread_mutex_unlock(&g.mu); return 0; }
-    *out = g.plan[g.plan_i++];   // 开局冻结快照，不可变：与 note / 淘汰 / 重排完全解耦
+    pw_plan_take(g.plan_i++, out);   // 开局冻结快照，不可变：与 note / 淘汰 / 重排完全解耦
     pthread_mutex_unlock(&g.mu);
     return 1;
 }
 
 int nvk_pipe_warm_pending(void) {
     pthread_mutex_lock(&g.mu);
-    int n = g.plan_i < g.plan_n ? (int)(g.plan_n - g.plan_i) : 0;
+    int n = (int)g.plan_left;
     pthread_mutex_unlock(&g.mu);
     return n;
 }
@@ -810,7 +871,7 @@ int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
     // 记录里记着哪些阶段（st[].sh 的存在位），必须和程序实际的阶段一致：对不上就是旧布局 / 别的层的
     // 记录，建出来的就不是这条配方——宁可不建，也不建一条「差不多」的。
     uint8_t want = rec->desc[0];
-    for (int st = 0; st < 3; st++) {
+    for (int st = 0; st < RP_PROG_STAGES; st++) {
         int have = prog->sh[st] != NULL;
         if (((want >> st) & 1) != have) {
             __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
@@ -818,11 +879,11 @@ int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
             goto out;
         }
     }
-    if ((want & ~0x7u) != 0) {   // GS 以外的阶段（TCS / TES）本层不产生：有就是坏记录
+    if ((want & ~0x1fu) != 0) {
         __atomic_fetch_add(&g.st.failed, 1, __ATOMIC_RELAXED);
         goto out;
     }
-    for (int st = 0; st < 3; st++) pd.st[st].sh = prog->sh[st];
+    for (int st = 0; st < RP_PROG_STAGES; st++) pd.st[st].sh = prog->sh[st];
     if (nvn_gpu_pipe_warm_scope) nvn_gpu_pipe_warm_scope(1);
     nvn_gpu_pipe pipe = NULL;
     nvn_gpu_err err = {0};
@@ -843,9 +904,6 @@ out:
 // ---- 盘上文件：<缓存目录>/pipes-v<格式>-<描述版本>.bin ----
 static void pw_w32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-static uint32_t pw_r32(const uint8_t *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 static void pw_w64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 static uint64_t pw_r64(const uint8_t *p) {
@@ -1036,6 +1094,7 @@ int nvk_pipe_warm_load(void) {
         if (g.plan) { int cs = nvn_plat_flag("nvk_compute_warm", 0); for (uint32_t i = 0; i < cnt; i++) if (cs || g.recs[i].desc[0] != 0x80) g.plan[g.plan_n++] = g.recs[i]; }
         else pw_log(1, "【红】管线预热清单：本局预热集快照分配失败（本局不预热，清单照常记录）");
     }
+    pw_plan_index();
     g.clock = file_cnt;   // 最近序号接着文件里最大的那个往后发（种子滤掉几条时 seen 仍按文件位置算）
     g.loaded = 1;
     g.dirty = 0;
@@ -1118,7 +1177,7 @@ void nvk_pipe_warm_stats(struct nvk_pipe_warm_stats *out) {
     memset(out, 0, sizeof *out);
     pthread_mutex_lock(&g.mu);
     *out = g.st;
-    out->pending = g.plan_i < g.plan_n ? g.plan_n - g.plan_i : 0;
+    out->pending = g.plan_left;
     out->rejected = g.st.rejected + g.save_fail;
     pthread_mutex_unlock(&g.mu);
     out->draw_hits = nvn_gpu_pipe_warm_hits ? nvn_gpu_pipe_warm_hits() : 0;   // 转发后端：真实 draw 命中预建对象

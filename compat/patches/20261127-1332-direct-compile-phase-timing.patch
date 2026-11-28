@@ -1,0 +1,50 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+index 54728edb78bc9d18e99db6868ec1be59fba29fff..b0c32255a96af3a3651299b7dff5caca1f4cc89b 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -17,6 +17,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+     static class SpirvGenerator
+     {
+         // Resource pools for Spirv generation. Note: Increase count when more threads are being used.
++        [ThreadStatic] internal static Action<long, long> PhaseSample;
++        [ThreadStatic] internal static Func<long> PhaseCpuClock;
++
+         private const int GeneratorPoolCount = 1;
+         private static readonly ObjectPool<SpvInstructionPool> _instructionPool;
+         private static readonly ObjectPool<SpvLiteralIntegerPool> _integerPool;
+@@ -32,6 +35,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+         public static byte[] Generate(StructuredProgramInfo info, CodeGenParameters parameters)
+         {
++            var phaseSample = PhaseSample;
++            long wallStart = phaseSample == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
++            long cpuStart = phaseSample == null ? 0 : PhaseCpuClock();
+             SpvInstructionPool instPool;
+             SpvLiteralIntegerPool integerPool;
+ 
+@@ -206,6 +212,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 _integerPool.Release(integerPool);
+             }
+ 
++            if (phaseSample != null)
++                phaseSample(System.Diagnostics.Stopwatch.GetTimestamp() - wallStart, PhaseCpuClock() - cpuStart);
+             return result;
+         }
+ 
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+index 050fdce917626d40f754e1d1873276dfc1e4e4e9..1057c83a79a6e9e0a64d1e45cf397f0e78543081 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -318,6 +318,12 @@ namespace Ryujinx.Graphics.Shader.Translation
+             }
+         }
+ 
++        public static void SetSpirvPhaseSample(Action<long, long> sample, Func<long> cpuClock)
++        {
++            SpirvGenerator.PhaseSample = sample;
++            SpirvGenerator.PhaseCpuClock = cpuClock;
++        }
++
+         public ShaderProgram Translate(bool asCompute = false)
+         {
+             ResourceManager resourceManager = CreateResourceManager(asCompute);

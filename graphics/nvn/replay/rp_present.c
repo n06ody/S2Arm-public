@@ -4,9 +4,15 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+// 弱链接[replay]：rp_buf_land_diag_log
+// 弱链接[replay]：rp_buf_guest_snapshot
+// 弱链接[replay]：rp_buf_replay_snapshot
+void rp_buf_land_diag_log(double frames) __attribute__((weak));
 #include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
+// 弱链接[replay]：rp_tex_upload_diag_window
+#pragma weak rp_tex_upload_diag_window
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_dirty.h"
@@ -20,6 +26,8 @@
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：rp_shader_live_compile_take
 #pragma weak rp_shader_live_compile_take
+// 弱链接[replay]：rp_shader_lookahead_frame_end
+#pragma weak rp_shader_lookahead_frame_end
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -50,6 +58,33 @@ static uint64_t g_gap_over33;   // 超过 33 毫秒的帧数（精确按纳秒�
 // 这里按弱引用处理（同 rp_entry.c 的 nvn_ft_written）：没有实现时这一项显示 0，不改变既有日志与回放语义。
 // 只在上屏线程、只在长帧日志打开时查（nvn_gpu_stats 要锁后端、走一遍统计表）。
 extern void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_pass_discard_window
+void nvn_gpu_pass_discard_window(void) __attribute__((weak));
+
+static void pass_discard_window(const uint64_t *perf, uint64_t frames) {
+    static const char *const names[] = {
+        "hint_color", "hint_ds", "reject_scope", "reject_next", "reject_range", "reject_target", "reject_mode",
+        "color", "depth", "stencil", "full_color", "full_depth", "full_stencil", "partial",
+        "mixed_size_clear", "folded_aspects", "vtx_stream", "guest_bind", "layer_out", "cond_query",
+        "non_primary", "target_state", "park", "first_encode"
+    };
+    _Static_assert(sizeof names / sizeof *names == RP_PERF_DC_FIRST_ENCODE - RP_PERF_DC_HINT_COLOR + 1,
+                   "discard window names");
+    uint64_t total = 0;
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) total += perf[RP_PERF_DC_HINT_COLOR + i];
+    if (total) {
+        char line[768];
+        int n = snprintf(line, sizeof line, "frames=%llu", (unsigned long long)frames);
+        for (unsigned i = 0; i < sizeof names / sizeof *names; i++) {
+            n += snprintf(line + n, sizeof line - (size_t)n, " %s=%llu", names[i],
+                          (unsigned long long)perf[RP_PERF_DC_HINT_COLOR + i]);
+            if ((unsigned)n >= sizeof line) break;
+        }
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-discard", line);
+    }
+    if (nvn_gpu_pass_discard_window) nvn_gpu_pass_discard_window();
+}
+
 struct plc_ns_rd { uint64_t ns; int got; };
 static uint64_t g_plc_ns_last;   // 上次取到的累计值（只在 [上屏] 动）
 static void plc_ns_cb(void *user, const char *name, uint64_t value) {
@@ -255,16 +290,19 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
       clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        if (rp_shader_lookahead_frame_end) rp_shader_lookahead_frame_end();
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         if (rp_shader_live_compile_take) {
             struct rp_shader_live_compile_stats live;
             rp_shader_live_compile_take(&live);
-            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout || live.compiled) {
-                char b[400];
-                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.start_failed ||
+                live.future_hits || live.timeout || live.compiled) {
+                char b[512];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、前瞻未命中/缺任务回退 %llu、前瞻结果命中 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
                          (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
-                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout,
+                         (unsigned long long)live.pending, (unsigned long long)live.start_failed, (unsigned long long)live.fallback,
+                         (unsigned long long)live.future_hits, (unsigned long long)live.timeout,
                          (unsigned long long)live.compiled, live.compile_ns / 1e6, live.compile_max_ns / 1e6);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
             }
@@ -374,11 +412,24 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (rp_buf_land_diag_log) rp_buf_land_diag_log(f);
+                if (rp_tex_upload_diag_window) rp_tex_upload_diag_window(fr);
+                pass_discard_window(pf, fr);
                 if (pf[RP_PERF_MIRROR_HOIST] || pf[RP_PERF_MIRROR_OVERLAP] || pf[RP_PERF_MIRROR_FALLBACK]) {
-                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu",
+                    // 分因只在 nvk_mirror_exact_guard 开启的提交计数。
+                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu"
+                             " fb_gw=%llu fb_land=%llu fb_overflow=%llu fb_unknown=%llu fb_other=%llu",
                              (unsigned long long)pf[RP_PERF_MIRROR_HOIST], (unsigned long long)pf[RP_PERF_MIRROR_OVERLAP],
-                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK]);
+                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK], (unsigned long long)pf[RP_PERF_MIRROR_FB_GW],
+                             (unsigned long long)pf[RP_PERF_MIRROR_FB_LAND], (unsigned long long)pf[RP_PERF_MIRROR_FB_OVERFLOW],
+                             (unsigned long long)pf[RP_PERF_MIRROR_FB_UNKNOWN], (unsigned long long)pf[RP_PERF_MIRROR_FB_OTHER]);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    if (pf[RP_PERF_MIRROR_SPAN_GW] || pf[RP_PERF_MIRROR_SPAN_LAND]) {
+                        snprintf(b, sizeof b, "镜像按上传区间前移（本窗口，已计入 disjoint_hoisted）span_gw=%llu span_land=%llu",
+                                 (unsigned long long)pf[RP_PERF_MIRROR_SPAN_GW],
+                                 (unsigned long long)pf[RP_PERF_MIRROR_SPAN_LAND]);
+                        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    }
                 }
                 if (pf[RP_PERF_TEX_BYTE_EQUAL] || pf[RP_PERF_TEX_BYTE_CHANGED] || nvn_plat_flag("nvk_tex_byte_equal", 0)) {
                     snprintf(b, sizeof b, "窗口合计 byte_equal_skipped=%llu byte_changed=%llu skipped_bytes=%llu",

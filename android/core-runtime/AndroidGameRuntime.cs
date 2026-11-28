@@ -134,6 +134,15 @@ namespace S2A.Android.Aot
                 nint compile = 0;
                 unsafe { compile = (nint)(delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.Compile; }
                 int bind = session.BindCompiler(compile);
+                if (bind == DirectAbi.Ok)
+                {
+                    unsafe
+                    {
+                        bind = session.BindBinaryCompiler(
+                            (nint)(delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.CompileBinary,
+                            (nint)(delegate* unmanaged<DirectBytes, nint, nint, int>)&DirectCompileNative.EncodeLegacy);
+                    }
+                }
                 if (bind != DirectAbi.Ok)
                 {
                     Console.Error.WriteLine($"[s2a] direct services rejected: compiler bind failed ({bind})");

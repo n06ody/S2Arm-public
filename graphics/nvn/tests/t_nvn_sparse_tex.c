@@ -323,12 +323,12 @@ static void t_sp_scope(void) {
       CHECK(rp_tex_resolve(&s, &g_fake_cmd) != NULL && ups() == u + 2 && g_ncap - c1 == 5);
       { int diff = 0; for (int i = 0; i < 5; i++) diff |= g_cap[c0 + i].hash != g_cap[c1 + i].hash; CHECK(diff); }
       nvn_be_tex_release(&s); }
-    // 超过副本上限（整张读成一份放不下）：不传、不读页表，准确报红；贴图本身照旧能用
+    // 超过有界兼容档的容量：返回空，建图及页表上传均不得发生。
     { tex_t big = sp_tex(9142, 0, NVN_FORMAT_RGBA_ASTC_4x4, 16384, 16384, 2, 0);
       CHECK(big.L.size > (256u << 20));
       const uint64_t u = ups(); const int cc = g_spc.copy_calls;
-      CHECK(rp_tex_resolve(&big, &g_fake_cmd) != NULL && ups() == u && g_spc.copy_calls == cc);
-      CHECK(nvn_unimpl_count("limit", "tex_sparse_pool_too_large") == 1);
+      CHECK(rp_tex_resolve(&big, &g_fake_cmd) == NULL && ups() == u && g_spc.copy_calls == cc);
+      CHECK(nvn_unimpl_count("oom", "tex_sparse_dense_limit") == 1);
       nvn_be_tex_release(&big); }
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
 }
@@ -404,11 +404,25 @@ static void t_sp_packaged(void) {
     seg_next();
     CHECK(rp_tex_resolve(&a, &g_fake_cmd) != NULL && ups() == u0 + 3);
     nvn_be_tex_release(&a);
-    // (e) 范围：同样随包 + SPARSE + 虚拟池，但未压缩：不走页表（这一类原本就不在页表读的范围里，行为不动）
+    // (e) 随包 + SPARSE + 虚拟池的未压缩贴图同样按真实页表上传与读取。
     { tex_t u = sp_tex(9172, 0x100000, NVN_FORMAT_RGBA8, 64, 64, 1, NVN_TEXTURE_FLAGS_SPARSE); pkg(&u);
       vmap(sp_v0(&u), sp_pages(&u), NULL);
       const int cc = g_spc.copy_calls, pc = g_spc.prot_calls;
-      CHECK(rp_tex_resolve(&u, &g_fake_cmd) != NULL && g_spc.copy_calls == cc && g_spc.prot_calls == pc);
+      const int first = g_ncap;
+      CHECK(rp_tex_resolve(&u, &g_fake_cmd) != NULL && g_spc.copy_calls == cc + 1 && g_spc.prot_calls == pc + 1);
+      CHECK(g_ncap == first + 1 && deswz_same(&u, first, g_ncap));
+      uint8_t expected[64 * 64 * 4], observed[64 * 64 * 4];
+      uint8_t *raw = malloc(u.L.size);
+      CHECK(raw != NULL);
+      if (raw) {
+          const NVNcopyRegion region = {0, 0, 0, 64, 64, 1};
+          nvn_sparse_copy(u.pool, raw, (uintptr_t)u.mem, u.L.size);
+          CHECK(!nvn_deswizzle(&u.d, 0, 0, raw, expected, 64 * 4));
+          memset(observed, 0xFF, sizeof observed);
+          nvn_be_read_texels(&u, 0, 0, &region, observed, 64 * 4, sizeof observed);
+          CHECK(!memcmp(observed, expected, sizeof expected));
+          free(raw);
+      }
       nvn_be_tex_release(&u); }
     // (f) 随包布局 + 压缩 + 普通池（不是虚拟池）：照旧直接读池里的字节（flags 0），不走页表
     { tex_t n = mk_tex(9173, 0x10000, NVN_FORMAT_RGBA_ASTC_6x6, 64, 64, 1, 0); pkg(&n); memset(n.mem, 0x6C, n.L.size);

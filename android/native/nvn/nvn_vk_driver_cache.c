@@ -58,8 +58,8 @@ static int read_full(int fd, uint8_t *buf, size_t bytes) {
     return 0;
 }
 
-int nvk_driver_cache_read(const char *dir, const uint8_t uuid[16], void **data, size_t *size,
-                          char *why, size_t why_size) {
+int nvk_driver_cache_read_stamp(const char *dir, const uint8_t uuid[16], void **data, size_t *size,
+                          struct nvk_driver_cache_stamp *stamp, char *why, size_t why_size) {
     if (data) *data = NULL;
     if (size) *size = 0;
     if (!data || !size || !uuid) { if (why && why_size) snprintf(why, why_size, "bad arguments"); return -1; }
@@ -125,13 +125,22 @@ int nvk_driver_cache_read(const char *dir, const uint8_t uuid[16], void **data, 
         if (why && why_size) snprintf(why, why_size, "sha256 mismatch");
         return -1;
     }
+    if (stamp) {
+        stamp->size = (size_t)payload;
+        memcpy(stamp->digest, digest, sizeof digest);
+    }
     *data = buf;
     *size = (size_t)payload;
     return 0;
 }
 
-int nvk_driver_cache_write(const char *dir, const uint8_t uuid[16], const void *data, size_t size,
-                           char *why, size_t why_size) {
+int nvk_driver_cache_read(const char *dir, const uint8_t uuid[16], void **data, size_t *size,
+                          char *why, size_t why_size) {
+    return nvk_driver_cache_read_stamp(dir, uuid, data, size, NULL, why, why_size);
+}
+
+int nvk_driver_cache_store(const char *dir, const uint8_t uuid[16], const void *data, size_t size,
+                           struct nvk_driver_cache_stamp *stamp, char *why, size_t why_size) {
     if (!data || !uuid || size == 0) { if (why && why_size) snprintf(why, why_size, "empty cache"); return -1; }
     if (size > NVK_DRIVER_CACHE_MAX) { if (why && why_size) snprintf(why, why_size, "cache too large (%zu)", size); return -1; }
     char path[512];
@@ -149,6 +158,7 @@ int nvk_driver_cache_write(const char *dir, const uint8_t uuid[16], const void *
         s2a_sha256_update(&ctx, data, size);
         s2a_sha256_final(&ctx, hdr + 16);
     }
+    if (stamp && stamp->size == size && !memcmp(stamp->digest, hdr + 16, sizeof stamp->digest)) return 1;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) { if (why && why_size) snprintf(why, why_size, "temp open: errno=%d", errno); return -1; }
     const uint8_t *parts[2] = { hdr, (const uint8_t *)data };
@@ -176,5 +186,14 @@ int nvk_driver_cache_write(const char *dir, const uint8_t uuid[16], const void *
     }
     int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd >= 0) { (void)fsync(dfd); close(dfd); }   // 目录项也落盘；失败不回滚已成功的 rename
+    if (stamp) {
+        stamp->size = size;
+        memcpy(stamp->digest, hdr + 16, sizeof stamp->digest);
+    }
     return 0;
+}
+
+int nvk_driver_cache_write(const char *dir, const uint8_t uuid[16], const void *data, size_t size,
+                           char *why, size_t why_size) {
+    return nvk_driver_cache_store(dir, uuid, data, size, NULL, why, why_size);
 }

@@ -4,7 +4,10 @@
 期望值都不经被测实现：平面是本文件先生成的线性字节，键由 hashlib 按 gal_astc.h 的口径现算，块线性摆放与各级起点由本文件按 GOB 规则另写一份；
 纯红 BC1 块编出的 ASTC 应是常量色「空区块」（规范 C.2.23：FC FD FF×6 + RGBA16），由此核 BC 解压 → 编码的通道次序。
 """
+import ctypes
 import hashlib
+import json
+import subprocess
 import importlib.util
 import os
 import random
@@ -222,6 +225,226 @@ class AstcPackTests(unittest.TestCase):
         head, rows = ap.read_index(str(self.out))
         self.assertEqual(head['count'], len(self.rows))
         self.assertEqual({k for k, _, _ in rows}, set(self.rows))
+
+
+
+def bc7_constant(r, g, b, a):
+    # Mode 6 uses shared P bits. Use 8-bit endpoints with the same low bit.
+    assert len({v & 1 for v in (r, g, b, a)}) == 1
+    block = 0x40
+    for i, v in enumerate((r, g, b, a)):
+        block |= (v >> 1) << (7 + 14 * i)
+        block |= (v >> 1) << (14 + 14 * i)
+    return (block | ((a & 1) * 3 << 63)).to_bytes(16, 'little')
+
+
+def bc7_cutout(w, h):
+    # Deliberately difficult independent alpha and RGB axes. The first alpha
+    # index must fit the one-bit anchor; the remaining indices can be 0 or 3.
+    blocks = []
+    for y in range((h + 3) // 4):
+        for x in range((w + 3) // 4):
+            rgb = (21 + 7*x, 27 + 14*y, 101 + (3*x + 5*y) % 57)
+            block = 0x20 | 255 << 58
+            for ch, (v, delta) in enumerate(zip(rgb, (30, 18, 7))):
+                block |= (v >> 1) << (8 + 14*ch)
+                block |= ((v + delta) >> 1) << (15 + 14*ch)
+            for i in range(1,16):
+                u, v = i % 4, i // 4
+                block |= u << (65 + 2*i)
+                block |= (3 * (u + v >= 2 + (x+y) % 4)) << (96 + 2*i)
+            blocks.append(block.to_bytes(16, 'little'))
+    return b''.join(blocks)
+
+
+@unittest.skipIf(os.name == 'nt', 'Android 的只读 POSIX 文件接口')
+class BC7VerifiedPackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        cls.dir = Path(temporary.name)
+        helper = cls.dir / 'probe.c'
+        helper.write_text("""
+#include "bc7_astc_pack.inc"
+int lookup(const char *path, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers,
+           const uint8_t *source, size_t bytes, uint8_t *out) {
+    struct bc7_astc_pack *p = bc7_pack_open(path);
+    if (!p) return -1;
+    uint8_t key[32];
+    bc7_pack_key(w,h,levels,layers,source,bytes,key);
+    int hit = bc7_pack_lookup(p,key,out,bytes);
+    bc7_pack_close(p);
+    return hit;
+}
+int rejected(const char *path, const char *receipt, const uint8_t key[32]) {
+    struct bc7_astc_pack *p = bc7_pack_open(path);
+    if (!p) return -1;
+    bc7_pack_load_rejects(p, receipt);
+    int is_rejected = bc7_pack_rejected(p, key);
+    bc7_pack_close(p);
+    return is_rejected;
+}
+""", encoding='utf-8')
+        cls.reader = cls.dir / 'reader.so'
+        direct = ROOT / 'android/native/direct'
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_POSIX_C_SOURCE=200809L',
+                        '-Wall', '-Wextra', '-Werror', '-fPIC', '-shared',
+                        '-I', str(direct.parent), '-I', str(ROOT / 'android/native/nvn'),
+                        '-o', str(cls.reader), str(helper), str(direct / 'sha256.c')], check=True)
+        cls.lookup = ctypes.CDLL(str(cls.reader)).lookup
+        cls.lookup.argtypes = [ctypes.c_char_p] + [ctypes.c_uint32] * 4 + [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        cls.lookup.restype = ctypes.c_int
+        cls.rejected = ctypes.CDLL(str(cls.reader)).rejected
+        cls.rejected.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+        cls.rejected.restype = ctypes.c_int
+
+    def test_whole_image_quality_and_lookup(self):
+        dims = (65, 33, 2, 2)
+        big, small = ap.astc_bytes(65, 33), ap.astc_bytes(32, 16)
+        red, blue, clear = (bc7_constant(*v) for v in [
+            (255, 1, 1, 255), (1, 1, 255, 255), (0, 0, 0, 0)])
+        good = red * (big//16) + blue * (big//16) + clear * (small//16) + red * (small//16)
+        # Only the last mip and layer is out of gate. A partially good image
+        # must never add a row or any of its successful planes to the index.
+        bad = good[:-small] + bc7_cutout(32,16)
+        reserved = good[:-16] + bytes(16)
+        for name, payload in (('good',good),('bad',bad),('reserved',reserved)):
+            (self.dir / name).write_bytes(payload)
+        geom = dict(zip(('width','height','levels','layers'),dims))
+        manifest = self.dir / 'images.json'
+        manifest.write_text(json.dumps({'version': 1, 'images':
+            [dict(geom, path=name) for name in ('good','bad','reserved','good')]}), encoding='utf-8')
+        out = self.dir / 'checked.pack'
+        rep = ap.build_bc7(manifest,out,TOOL_DIR)
+        self.assertEqual(rep, {'entries':1,'rejected':2,'pack_bytes':64+len(good)+80})
+        disk = out.read_bytes()
+        head = struct.unpack_from('<8sIIQQQ',disk)
+        self.assertEqual(head, (b'S2ABCAQ2',2,80,1,64+len(good),len(disk)))
+        index = disk[-80:]
+        key = hashlib.sha256(b's2a-bc7-astc-image-v1' + struct.pack('<4I',*dims) + good).digest()
+        self.assertEqual(index[:32], key)
+        self.assertEqual(index[48:], hashlib.sha256(disk[64:-80]).digest())
+
+        result = ctypes.create_string_buffer(len(good))
+        def lookup(path, source=good, shape=dims):
+            return type(self).lookup(os.fsencode(path), *shape, source, len(source), result)
+        self.assertEqual(lookup(out), 1)
+        self.assertEqual(result.raw,disk[64:-80])
+        self.assertEqual(lookup(out,bad),0)
+        self.assertEqual(lookup(out,reserved),0)
+        self.assertEqual(lookup(out,shape=(64,33,2,2)),0)
+        self.assertEqual(lookup(self.dir/'missing'),-1)
+        damaged = self.dir/'damaged.pack'
+        damaged.write_bytes(disk[:-1])
+        self.assertEqual(lookup(damaged),-1)
+        mutated = bytearray(disk)
+        mutated[-48] ^= 16  # Index payload offset.
+        damaged.write_bytes(mutated)
+        self.assertEqual(lookup(damaged),-1)
+        mutated = bytearray(disk)
+        mutated[64] ^= 1    # Payload bytes with an otherwise sound index.
+        damaged.write_bytes(mutated)
+        self.assertEqual(lookup(damaged),0)
+        second = self.dir/'again.pack'
+        ap.build_bc7(manifest,second,TOOL_DIR)
+        self.assertEqual(second.read_bytes(),disk)
+
+    def test_quality_gate_checks_alpha_and_color(self):
+        lib = ap.Lib(ap.build_tool(TOOL_DIR)).L
+        ctx = lib.b2a_ctx_new(99.0)
+        self.assertTrue(ctx)
+        self.addCleanup(lib.b2a_ctx_free,ctx)
+        red = bc7_constant(255,1,1,255)
+        transparent_red = bc7_constant(254,0,0,0)
+        blue = bc7_constant(1,1,255,255)
+        encoded = ctypes.create_string_buffer(16)
+        self.assertEqual(lib.b2a_encode(ctx,7,4,4,red,16,encoded,16),0)
+        self.assertEqual(lib.b2a_bc7_verify(ctx,4,4,red,16,encoded,16),0)
+        self.assertEqual(lib.b2a_bc7_verify(ctx,4,4,transparent_red,16,encoded,16),1)
+        self.assertEqual(lib.b2a_bc7_verify(ctx,4,4,blue,16,encoded,16),1)
+    def test_container_canonical_planes_and_skips(self):
+        def plane(level, layer, size):
+            return b''.join(bc7_constant(2*((i + 5*level) % 100)+1, 1+2*layer, 3, 255)
+                            for i in range(size // 16))
+
+        # Quantized coordinates differ between blocks, mips and layers.
+        tex = make_tex(0x2001, 7, 16, 65, 65, 3, 2, 2, 5, plane)
+        gold = b''.join(tex['planes'][l, y][2] for l in range(3) for y in range(2))
+        key = hashlib.sha256(b's2a-bc7-astc-image-v1' + struct.pack('<4I',65,65,3,2) + gold).hexdigest()
+
+        def xtx(tex, layout=2):
+            def section(kind, index, body, pad=0):
+                return struct.pack('<4sIQQIII',b'HBvN',36,len(body),36+pad,kind,index,0) + bytes(pad) + body
+            data = tex['data']
+            head = struct.pack('<Q8I',len(data),512,65,65,1,4,0x4d,3,len(data)//2)
+            offsets = struct.pack('<17I', *tex['offs'], *([0]*14))
+            return (struct.pack('<4sIII',b'DFvN',16,1,1) +
+                    section(2,0,head+offsets+struct.pack('<III',layout,7,0)) +
+                    section(3,1,data,304) + section(5,2,bytes(24)))
+
+        lib = ap.Lib(ap.build_tool(TOOL_DIR))
+        cases = {'bntx': bntx([tex]), 'xtx': xtx(tex)}
+        for name, data in cases.items():
+            with self.subTest(name=name):
+                stats = {}
+                self.assertEqual(list(ap.bc7_container_images(lib, data, stats)), [(65,65,3,2,gold)])
+                self.assertFalse(stats.get('layout_reject'))
+        # 声明 GOB=0 与级起点冲突。GOB=1 可有同尺寸填充，
+        # 但实际块坐标变了，独立 canonical SHA 仍应明确不同。
+        self.assertFalse(list(ap.bc7_container_images(lib, xtx(tex,layout=0), {})))
+        alternate, = ap.bc7_container_images(lib, xtx(tex,layout=1), {})
+        self.assertNotEqual(ap.bc7_image_key(*alternate).hex(), key)
+        self.assertEqual(list(ap.bc7_container_images(lib, bntx([dict(tex, offs=[0,4096,8192])]), {})), [])
+        self.assertEqual(list(ap.bc7_container_images(lib, bntx([tex], platform=b'Ounc'), {})), [])
+        self.assertEqual(list(ap.bc7_container_images(lib, xtx(tex)[:-512], {})), [])
+        self.assertEqual(list(ap.bc7_container_images(lib, bntx([tex])[:-1], {})), [])
+        self.assertEqual(list(ap.bc7_container_images(lib, b'BAD!' + xtx(tex)[4:], {})), [])
+
+        sources = self.dir / 'containers'
+        sources.mkdir()
+        for name, data in cases.items():
+            (sources / f'image.{name}').write_bytes(data)
+        bad = make_tex(0x2006, 7, 16, 65, 33, 2, 1, 1, 1,
+                       lambda l, y, n: bc7_cutout(65,33) if l == 0 else plane(l,y,n))
+        (sources/'quality.bntx').write_bytes(bntx([bad]))
+        rejected_source = b''.join(bad['planes'][l,0][2] for l in range(2))
+        rejected_key = ap.bc7_image_key(65,33,2,1,rejected_source)
+        out = self.dir / 'container.pack'
+        report = self.dir / 'container.tsv'
+        rep = ap.build_bc7_containers(sources,out,report,TOOL_DIR)
+        self.assertEqual((rep['entries'], rep['rejected']), (1,1))
+        self.assertIn(f'{key}\t65\t65\t3\t2\t{len(gold)}\taccepted', report.read_text())
+        log = self.dir / 'workset.log'
+        content = (f'[bc7-workset] session schema=1\n'
+                   f'[bc7-workset] image key={key} width=65 height=65 levels=3 layers=2 bc_bytes={len(gold)} first=disabled\n'
+                   f'[bc7-workset] image key={rejected_key.hex()} width=65 height=33 levels=2 layers=1 bc_bytes={len(rejected_source)} first=quality_reject\n'
+                   f'[bc7-workset] summary final=1 whole=2 unique=2 unique_bytes={len(gold)+len(rejected_source)} identity_lost=0\n')
+        log.write_text(content)
+        mapped = ap.bc7_compare(log,report)
+        self.assertEqual(mapped['offline']['accepted'], {'images':1,'bc_bytes':len(gold)})
+        self.assertEqual(mapped['offline']['quality_reject'], {'images':1,'bc_bytes':len(rejected_source)})
+        log.write_text(content.replace('identity_lost=0','identity_lost=1'))
+        with self.assertRaises(ValueError):
+            ap.bc7_compare(log,report)
+
+        result = ctypes.create_string_buffer(len(gold))
+        self.assertEqual(type(self).lookup(os.fsencode(out),65,65,3,2,gold,len(gold),result),1)
+        wrong = b''.join(tex['planes'][l,y][2] for y in range(2) for l in range(3))
+        self.assertNotEqual(wrong,gold)
+        receipt = Path(str(out)+'.rejects')
+        probe = type(self).rejected
+        self.assertEqual(probe(os.fsencode(out),os.fsencode(receipt),rejected_key),1)
+        self.assertEqual(probe(os.fsencode(out),os.fsencode(receipt),bytes.fromhex(key)),0)
+        damaged = self.dir / 'damaged.rejects'
+        damaged.write_bytes(receipt.read_bytes()[:-1])
+        self.assertEqual(probe(os.fsencode(out),os.fsencode(damaged),rejected_key),0)
+        mutated = bytearray(receipt.read_bytes())
+        mutated[16] ^= 1
+        damaged.write_bytes(mutated)
+        self.assertEqual(probe(os.fsencode(out),os.fsencode(damaged),rejected_key),0)
+        self.assertEqual(type(self).lookup(os.fsencode(out),65,65,3,2,wrong,len(wrong),result),0)
 
 
 class UnzstdCliTest(unittest.TestCase):

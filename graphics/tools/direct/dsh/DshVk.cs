@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 
 namespace S2A.Dsh
@@ -379,22 +380,107 @@ namespace S2A.Dsh
                 : DshCompiler.PackFiles != null && DshCompiler.PackFiles.TryGetValue(jsonName, out var t) ? t
                 : throw new DshError("export failed", "出包模式下 PackFiles 里没有 " + jsonName);
             var json = JsonNode.Parse(jsonText).AsObject();
-            byte[] spv = BindToArgIds(VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot),
-                json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings"), stage);
-            if (DshCompiler.PackOut) PackSpv[spvName] = spv;
-            else
+            var bindings = json["bindings"] as JsonArray ?? throw new DshError("export failed", jsonName + " 没有 bindings");
+            bool storageWindow = HasWindowStorageSources(bindings);
+            byte[] spv = VulkanSpv(key, stage, code, ctl, xc, tablesDir, imgLoadRaw, workRoot, storageWindow);
+            byte[] variants = stage == "ps"
+                ? FragmentOutputVariants(key, code, ctl, xc, tablesDir, imgLoadRaw, workRoot, storageWindow, json, spv)
+                : null;
+            if (storageWindow)
             {
-                string p = Path.Combine(outDir, spvName), tmp = p + ".tmp-" + Environment.ProcessId + "-" + Environment.CurrentManagedThreadId;
-                File.WriteAllBytes(tmp, spv); File.Move(tmp, p, true);
+                StorageWindowContract(json, bindings, spv);
+                if (DshCompiler.PackOut) DshCompiler.PackFiles[jsonName] = json.ToJsonString();
+                else File.WriteAllText(Path.Combine(outDir, jsonName), json.ToJsonString());
             }
-            written.Add(spvName);
+            spv = BindToArgIds(spv, bindings, stage);
+            WriteVulkanPayload(spvName, spv);
+            if (variants != null) WriteVulkanPayload(key + "_vf.bin", variants);
             return written;
+
+            void WriteVulkanPayload(string name, byte[] bytes)
+            {
+                if (DshCompiler.PackOut) PackSpv[name] = bytes;
+                else
+                {
+                    string path = Path.Combine(outDir, name);
+                    string temp = path + ".tmp-" + Environment.ProcessId + "-" + Environment.CurrentManagedThreadId;
+                    File.WriteAllBytes(temp, bytes);
+                    File.Move(temp, path, true);
+                }
+                written.Add(name);
+            }
+        }
+
+        static byte[] FragmentOutputVariants(string key, byte[] code, byte[] ctl, ISpvCross xc,
+            string tablesDir, bool imgLoadRaw, string workRoot, bool storageWindow, JsonObject metadata, byte[] baseSpv)
+        {
+            if (!DshTables.Get(tablesDir).FoutWant.TryGetValue(key, out var requested)) return null;
+            Info info = ReadInfo(Words(baseSpv));
+            int colorLocations = 0;
+            foreach (var (id, variable) in info.Var)
+                if (variable.Class == 3 && info.Deco.TryGetValue(id, out var d) && !d.ContainsKey(11) &&
+                    d.TryGetValue(30, out uint location) && location < 8)
+                    colorLocations |= 1 << (int)location;
+
+            // Bit 8 of the signed mask requests Metal dual-source blending. The Vulkan
+            // library has a separate gate for that state and must not consume those rows.
+            var masks = requested.Where(m => (m.Item1 | m.Item2) is >= 0 and <= 255 &&
+                                            (m.Item1 & m.Item2) == 0)
+                                 .Select(m => (Unsigned: (byte)(m.Item1 & colorLocations),
+                                               Signed: (byte)(m.Item2 & colorLocations)))
+                                 .Where(m => (m.Unsigned | m.Signed) != 0)
+                                 .Distinct().OrderBy(m => m.Unsigned | m.Signed << 8).ToArray();
+            if (masks.Length == 0) return null;
+
+            // S2AVFO1: magic[8], u32 count, then repeated u8 unsigned/signed masks,
+            // u16 zero, u32 JSON length, u32 SPIR-V length and those two payloads.
+            using var stream = new MemoryStream();
+            using var output = new BinaryWriter(stream);
+            output.Write("S2AVFO1\0"u8);
+            output.Write(0);  // 更新为成功验证的变体数。
+            int count = 0;
+            foreach (var (unsigned, signed) in masks)
+            {
+                var fout = new JsonObject();
+                for (int i = 0; i < 8; i++)
+                {
+                    if ((unsigned & (1 << i)) != 0) fout[i.ToString()] = "uint";
+                    else if ((signed & (1 << i)) != 0) fout[i.ToString()] = "sint";
+                }
+                byte[] spv, reflection;
+                try
+                {
+                    spv = VulkanSpv(key, "ps", code, ctl, xc, tablesDir, imgLoadRaw, workRoot, storageWindow, fout);
+                    var json = metadata.DeepClone().AsObject();
+                    var bindings = json["bindings"].AsArray();
+                    if (storageWindow) StorageWindowContract(json, bindings, spv);
+                    spv = BindToArgIds(spv, bindings, "ps");
+                    reflection = Encoding.UTF8.GetBytes(json.ToJsonString());
+                }
+                catch (DshError error)
+                {
+                    Console.Error.WriteLine($"[dsh] {key} Vulkan 片元输出变体 {unsigned:x}/{signed:x} 不可用：{error.Detail}");
+                    continue;  // 保留原模块与其它通过验证的变体。
+                }
+                output.Write(unsigned);
+                output.Write(signed);
+                output.Write((ushort)0);
+                output.Write(reflection.Length);
+                output.Write(spv.Length);
+                output.Write(reflection);
+                output.Write(spv);
+                count++;
+            }
+            if (count == 0) return null;
+            stream.Position = 8;
+            output.Write(count);
+            return stream.ToArray();
         }
 
         /// <summary>json 对应的那一遍翻译的 .spv，取在单线程改写（SpvSingleLane，Metal 专用）之前。顶点着色器照 Finish 的判据：
         /// 单线程改写后的 MSL 里有答案表没给类型的整数输入，就补进 attr 再译一遍（json 记的是这一遍）；Dsh.cs 在 dmsh_chain 的 FILES 里，这里只调不改。
         /// 工作文件同 Compile 留在本线程的内存表（XIo），不落临时目录（出包时整条路都不碰盘）。</summary>
-        static byte[] VulkanSpv(string key, string stage, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot)
+        static byte[] VulkanSpv(string key, string stage, byte[] code, byte[] ctl, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot, bool storageWindow, JsonObject fout = null)
         {
             string w = Path.Combine(workRoot ?? Path.GetTempPath(), "dshvkb_" + key + "_" + Guid.NewGuid().ToString("N")[..8]);
             var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir), ImageLoadRaw = imgLoadRaw };
@@ -402,6 +488,8 @@ namespace S2A.Dsh
             try
             {
                 var (j, _) = c.JobFor(stage, code, ctl);
+                if (storageWindow) j["storage_window_mask"] = true;
+                if (fout != null) j["fout"] = fout;
                 c.TranslateFirst(j);
                 string spv = Path.Combine(w, key + ".spv");
                 if (stage == "vs")
@@ -474,6 +562,37 @@ namespace S2A.Dsh
             return used;
         }
 
+        // Only NVN storage slots use an aligned-down window in replay.
+        static bool HasWindowStorageSources(JsonArray bindings) =>
+            !bindings.Any(b => (string)b["kind"] is "sbuf_ubo" or "ubo_ptr" or "sbuf_push" or "gmem_map" or "gmem_log" or "geometry");
+
+        // The Vulkan-only retranslation can introduce a c0 read for a base
+        // address that the aligned Metal translation did not need to read.
+        static void StorageWindowContract(JsonObject json, JsonArray bindings, byte[] spv)
+        {
+            const string maskName = "s2a_storage_window_mask";
+            uint[] words = Words(spv);
+            Info info = ReadInfo(words);
+            json["ssbo_window_abi"] = 1;
+            var masks = info.Names.Where(pair => pair.Value == maskName).Select(pair => pair.Key).ToArray();
+            if (masks.Length == 0) return;
+            if (masks.Length != 1 || !Insts(words).Any(inst => inst.Op == 50 && inst.A.Length == 3 &&
+                    inst.A[1] == masks[0] && inst.A[2] == uint.MaxValue))
+                throw new DshError("export failed", "invalid Vulkan storage window mask");
+            json["ssbo_window_mask"] = masks[0];
+            var used = UsedVars(words, info);
+            foreach (var (id, v) in info.Var)
+            {
+                if (v.Class != 2 || !used.Contains(id) || !info.Deco.TryGetValue(id, out var deco) ||
+                    !deco.ContainsKey(33) || !deco.TryGetValue(34, out uint set) || set != 0 ||
+                    !info.Names.TryGetValue(id, out string name) || !name.EndsWith("_c0", StringComparison.Ordinal))
+                    continue;
+                if (bindings.Any(binding => (string)binding["msl_name"] == name)) continue;
+                long argId = bindings.Select(binding => (long)binding["arg_id"]).DefaultIfEmpty(-1).Max() + 1;
+                bindings.Add(new JsonObject { ["msl_name"] = name, ["arg_id"] = argId, ["kind"] = "drvcb", ["bank"] = 0 });
+            }
+        }
+
         public static byte[] BindToArgIds(byte[] spv, JsonArray bindings, string stage)
         {
             if (!StageNo.TryGetValue(stage, out uint stageNo)) throw new DshError("export failed", "未知阶段 " + stage);
@@ -534,13 +653,20 @@ namespace S2A.Dsh
             var outFiles = new Dictionary<string, byte[]>(StringComparer.Ordinal);
             foreach (int t in GeometryTopologies)
             {
-                var (spv, res) = GeometryXlate(key, code, ctl, t, xc, tablesDir, imgLoadRaw, workRoot);
+                var (spv, res) = GeometryXlate(key, code, ctl, t, xc, tablesDir, imgLoadRaw, workRoot, storageWindow: true);
                 var bindings = (JsonArray)JsonNode.Parse(Py.Dumps(DshCompiler.Reflect("gs", GeometryArgs(spv), res)));
+                bool storageWindow = HasWindowStorageSources(bindings);
+                if (!storageWindow)
+                {
+                    (spv, res) = GeometryXlate(key, code, ctl, t, xc, tablesDir, imgLoadRaw, workRoot, storageWindow: false);
+                    bindings = (JsonArray)JsonNode.Parse(Py.Dumps(DshCompiler.Reflect("gs", GeometryArgs(spv), res)));
+                }
                 var json = new JsonObject
                 {
                     ["key"] = key + "_vg" + t, ["stage"] = "gs", ["dm_ctl"] = key, ["gs_input_topology"] = t,
                     ["resolution_scale_abi"] = res["resolution_scale_abi"]?.DeepClone(), ["notes"] = res["notes"]?.DeepClone(), ["bindings"] = bindings,
                 };
+                if (storageWindow) StorageWindowContract(json, bindings, spv);
                 outFiles[key + "_vg" + t + ".json"] = System.Text.Encoding.UTF8.GetBytes(json.ToJsonString());
                 outFiles[key + "_vg" + t + ".spv"] = BindToArgIds(spv, bindings, "gs");
             }
@@ -548,7 +674,7 @@ namespace S2A.Dsh
         }
 
         /// <summary>一种输入图元的翻译：同 JobFor / 翻译器，任务带 gs_input_topology（不带 geometry_topology：那个是几何转计算）。工作文件留在本线程的内存表（XIo）</summary>
-        static (byte[] Spv, JsonObject Res) GeometryXlate(string key, byte[] code, byte[] ctl, int topology, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot)
+        static (byte[] Spv, JsonObject Res) GeometryXlate(string key, byte[] code, byte[] ctl, int topology, ISpvCross xc, string tablesDir, bool imgLoadRaw, string workRoot, bool storageWindow)
         {
             string w = Path.Combine(workRoot ?? Path.GetTempPath(), "dshvkg_" + key + "_" + Guid.NewGuid().ToString("N")[..8]);
             var c = new DshCompiler.Ctx { Key = key, Out = w, W = w, Xc = xc, T = DshTables.Get(tablesDir), ImageLoadRaw = imgLoadRaw };
@@ -557,6 +683,7 @@ namespace S2A.Dsh
             {
                 var (j, _) = c.JobFor("gs", code, ctl);
                 j["gs_input_topology"] = topology;
+                if (storageWindow) j["storage_window_mask"] = true;
                 c.TranslateFirst(j);
                 return (XIo.ReadAllBytes(Path.Combine(w, key + ".spv")), JsonNode.Parse(XIo.ReadAllText(Path.Combine(w, key + ".res.json"))).AsObject());
             }

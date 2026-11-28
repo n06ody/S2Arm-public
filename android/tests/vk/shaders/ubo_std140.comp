@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std140) uniform Ubo {
+    vec4 a;
+    vec4 b;
+} u;
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float vals[];
+} dst;
+void main() {
+    dst.vals[0] = u.a.x; dst.vals[1] = u.a.y; dst.vals[2] = u.a.z; dst.vals[3] = u.a.w;
+    dst.vals[4] = u.b.x; dst.vals[5] = u.b.y; dst.vals[6] = u.b.z; dst.vals[7] = u.b.w;
+}

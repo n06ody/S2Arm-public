@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer In {
+    vec4 a;
+    vec4 b;
+} src;
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float vals[];
+} dst;
+void main() {
+    dst.vals[0] = src.a.x; dst.vals[1] = src.a.y; dst.vals[2] = src.a.z; dst.vals[3] = src.a.w;
+    dst.vals[4] = src.b.x; dst.vals[5] = src.b.y; dst.vals[6] = src.b.z; dst.vals[7] = src.b.w;
+}

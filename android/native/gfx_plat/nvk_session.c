@@ -5,6 +5,7 @@
 #include "rp_exec.h"
 #include "direct/vk_device.h"
 #include "direct/compile_worker.h"
+#include "direct/program_cache.h"
 #include "nvn/nvn_warm.h"   // 预热调度：会话 open 后起、Stop 前收（nvn_warm.h 合同）
 #include "nvn/nvn_vk_pipe_demand.h"   // 首用管线后台构建：会话 open 后起、Stop 前收（nvn_vk_pipe_demand.h 合同）
 #include <android/log.h>
@@ -27,6 +28,7 @@ void nvk_session_request_stop(void) {
     // 该线程要借用程序、调 nvn_gpu_pipe_get，着色器准入还开着才借得到。
     nvn_vk_pipe_demand_stop();
     nvk_shader_stop();
+    (void)s2a_program_cache_stop(0);
     // 预热线程在着色器准入关闭之后收：放在 nvk_shader_stop 之后是硬要求——准入关了新工作才会被
     // 各 owner 拒绝；迟到的结果由 owner 丢弃。
     // nvk_warm_stop 有界（≤500 毫秒统一截止）且**不做文件 IO**：清单落盘归预热线程自己（没有预热线程时
@@ -45,6 +47,8 @@ uint64_t nvk_session_stop_deadline(void) {
 int nvk_session_prepare(void) {
     if (!nvn_vk_pipe_demand_quiescent()) return -1;
     if (nvk_shader_open()) return -1;
+    if (s2a_program_cache_start())
+        __android_log_print(ANDROID_LOG_WARN, TAG, "nvk: 本局程序缓存不写盘，writer 未启动");
     atomic_store_explicit(&g_stop_started, 0, memory_order_release);
     return 0;
 }
@@ -69,6 +73,10 @@ int nvk_session_wait_compiles(void) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "【红】nvk stop compiler pool: %s", why);
         return -1;
     }
+    const uint64_t cache_now = mono_ns();
+    const uint32_t cache_ms = cache_now < deadline ? (uint32_t)((deadline - cache_now) / 1000000ull) : 0;
+    if (s2a_program_cache_stop(cache_ms))
+        __android_log_print(ANDROID_LOG_WARN, TAG, "nvk stop: program cache writer is still draining");
     __android_log_print(ANDROID_LOG_INFO, TAG, "nvk stop exit shader wait: elapsed=%llums in_flight=0", (unsigned long long)((mono_ns() - start) / 1000000ull));
     return 0;
 }

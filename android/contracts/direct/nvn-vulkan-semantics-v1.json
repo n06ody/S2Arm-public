@@ -22,6 +22,10 @@
    "status": "unsupported",
    "evidence": "uint clear path not yet exercised on device; partial regions/channel masks are rejected by vk_record.c"
   },
+  "nvnCommandBufferSetProvokingVertexMode": {
+   "status": "executed",
+   "evidence": "android/tests/vk/standalone/replay-provoking.sh: replay state drives VK_EXT_provoking_vertex pipeline and flat pixel readback; missing LAST support rejects explicit LAST"
+  },
   "nvnCommandBufferSetRenderTargets": {
    "status": "executed",
    "evidence": "android/tests/vk_record_test.c: OP_SET_RT state consumed by ClearColor/Draw; no-view full targets only"

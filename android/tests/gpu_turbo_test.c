@@ -4,6 +4,7 @@
 // 真监控线程与 GPU 判定。替换系统属性、时钟和 KGSL 边界。
 #include "gpu_turbo.h"
 #include "system_tuning.h"
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -21,6 +22,7 @@ static int checks, failed;
 static _Atomic uint64_t fake_now, fake_proc_cpu_ms, fake_thr_cpu_ms;
 static _Atomic int gate_on, prop_reads, legacy_prop_reads, unexpected_reads;
 static _Atomic uint32_t gpu_cur_khz, gpu_max_khz;
+static _Atomic int gpu_cur_error, gpu_max_error, gpu_cur_reads, gpu_max_reads;
 static _Atomic int turbo_state, turbo_calls, turbo_ret;
 static _Atomic(const char *) prop_gpu, prop_cpu;
 static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -29,13 +31,20 @@ static char log_buf[65536];
 int s2a_gpu_turbo_test_gate(void) { return atomic_load(&gate_on); }
 int s2a_gpu_turbo_test_read(const char *path, char *buf, size_t n) {
     uint32_t k = 0;
-    if (!strcmp(path, "/sys/class/kgsl/kgsl-3d0/gpuclk"))
+    int error = 0;
+    if (!strcmp(path, "/sys/class/kgsl/kgsl-3d0/gpuclk")) {
+        atomic_fetch_add(&gpu_cur_reads, 1);
+        error = atomic_load(&gpu_cur_error);
         k = atomic_load(&gpu_cur_khz);
-    else if (!strcmp(path, "/sys/class/kgsl/kgsl-3d0/max_gpuclk"))
+    } else if (!strcmp(path, "/sys/class/kgsl/kgsl-3d0/max_gpuclk")) {
+        atomic_fetch_add(&gpu_max_reads, 1);
+        error = atomic_load(&gpu_max_error);
         k = atomic_load(&gpu_max_khz);
-    else
+    } else {
         atomic_fetch_add(&unexpected_reads, 1);
-    return k ? snprintf(buf, n, "%llu\n", (unsigned long long)k * 1000ull) : -1;
+    }
+    if (error) return -error;
+    return k ? snprintf(buf, n, "%llu\n", (unsigned long long)k * 1000ull) : 0;
 }
 const char *s2a_gpu_turbo_test_prop(const char *name) {
     atomic_fetch_add(&prop_reads, 1);
@@ -76,6 +85,10 @@ static void world_reset(void) {
     atomic_store(&prop_cpu, NULL);
     atomic_store(&gpu_cur_khz, 0);
     atomic_store(&gpu_max_khz, 0);
+    atomic_store(&gpu_cur_error, 0);
+    atomic_store(&gpu_max_error, 0);
+    atomic_store(&gpu_cur_reads, 0);
+    atomic_store(&gpu_max_reads, 0);
     atomic_store(&turbo_state, 0);
     atomic_store(&turbo_calls, 0);
     atomic_store(&turbo_ret, 0);
@@ -199,12 +212,38 @@ static void test_frame_stats(void) {
     s2a_gpu_turbo_stop();
 }
 
+static void test_denied_frequency_nodes(void) {
+    world_reset();
+    atomic_store(&prop_gpu, "1");
+    atomic_store(&gpu_cur_error, EACCES);
+    atomic_store(&gpu_max_error, EAGAIN);
+    start_game();
+    CHECK(WAIT_UNTIL(s2a_gpu_turbo_test_ticks() >= 1));
+    CHECK(atomic_load(&turbo_state) == 1);
+    atomic_store(&gpu_max_khz, 800000);
+    atomic_store(&gpu_max_error, 0);
+    run_fps(30.0, 21);
+    CHECK(atomic_load(&gpu_cur_reads) == 1);
+    CHECK(atomic_load(&gpu_max_reads) > 1 && log_has("GPU 上限 800 MHz，均频读不到"));
+
+    atomic_store(&gpu_max_error, EPERM);
+    advance(250 * MS);
+    const int cap_reads = atomic_load(&gpu_max_reads);
+    advance(250 * MS);
+    advance(250 * MS);
+    CHECK(atomic_load(&gpu_max_reads) == cap_reads);
+    CHECK(atomic_load(&turbo_state) == 1 && atomic_load(&turbo_calls) == 1);
+    s2a_gpu_turbo_stop();
+    CHECK(atomic_load(&turbo_state) == 0 && atomic_load(&turbo_calls) == 2);
+}
+
 int main(void) {
     test_gpu_turbo();
     test_no_cpu_floor();
     test_lifecycle();
     test_debug_gate();
     test_frame_stats();
+    test_denied_frequency_nodes();
     CHECK(atomic_load(&unexpected_reads) == 0);
     if (failed) { fprintf(stderr, "gpu turbo runtime: %d checks failed\n", failed); return 1; }
     printf("gpu turbo runtime: passed (%d assertions)\n", checks);

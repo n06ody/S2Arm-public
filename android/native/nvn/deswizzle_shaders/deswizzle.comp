@@ -21,6 +21,12 @@ void main() {
     uint word = gl_GlobalInvocationID.x;
     if (word >= (p.bytes + 3u) / 4u) return;
     uint pos = word * 4u;
+#ifdef S2A_DESWIZZLE_WORD
+    // 宿主已证明行距是 4 的倍数。对齐的字不会跨行或跨 16 字节 GOB 小段。
+    uint yz = pos / p.row_bytes;
+    uint x = pos % p.row_bytes, y = yz % p.rows, z = yz / p.rows;
+    dst.data[word] = src.data[offset_of(x, y, z) / 4u];
+#else
     uint result = 0u;
     for (uint i = 0u; i < 4u && pos + i < p.bytes; ++i) {
         uint linear = pos + i, x = linear % p.row_bytes;
@@ -29,4 +35,5 @@ void main() {
         result |= ((src.data[source / 4u] >> ((source % 4u) * 8u)) & 255u) << (i * 8u);
     }
     dst.data[word] = result;
+#endif
 }

@@ -49,7 +49,7 @@ if [ -n "$VKT" ]; then
   KT="$KT vk-$VKFP"
 fi
 # 跑局知识进键（审计 #1534 P1-54 B1/B2）：graphics/tools/direct/run_knowledge.py 把 pso_seed/<程序号>/（或 S2A_PSO_SOURCES）整理成归一化快照，本阶段只认改产物的三张——
-#   配对 pairs.tsv（vs_pad 补顶点输出）、片元整数输出变体 fout_want.tsv（_ft）、采样模拟变体 se_want.tsv（_se；后两张只给 Metal 库，安卓目标只认配对）。
+#   配对 pairs.tsv（vs_pad 补顶点输出）、片元整数输出变体 fout_want.tsv（Metal _ft、Vulkan _vf）、采样模拟变体 se_want.tsv（仅 Metal _se）。
 #   只在学到新配对 / 新变体时变；重复行、行序、同内容的重复文件、修改时间、来源路径 / 机器都不变键。变了也只重编受影响的几支（direct_lib.py 的内容寻址缓存）。
 #   管线种子（seen.tsv，只改随包的 pso_manifest.tsv 一张表）不进本键，归轻阶段 pack/stage_direct_seed.sh。出库用的就是算键的这一份（S2A_RUN_KNOWLEDGE），不再边出库边读活文件
 KNK=none; KND=
@@ -57,7 +57,7 @@ if [ "${API%%	*}" != gl ]; then   # OpenGL 款出库不读跑局知识（direct_
   KND=$(mktemp -d "${TMPDIR:-/tmp}/s2a_knowledge.XXXXXX") || { echo "【红】$G 建不了跑局知识快照的临时目录"; exit 1; }
   trap 'rm -rf "$KND"' EXIT
   "$PY" "$R/graphics/tools/direct/run_knowledge.py" "$KND/t" "$CUR" > "$KND/log" 2>&1 || { echo "【红】$G 跑局知识快照出不来（graphics/tools/direct/run_knowledge.py：$(tail -1 "$KND/log" | cut -c1-200)）"; exit 1; }
-  KNT="pairs fout_want se_want"; [ -z "$VKT" ] || KNT=pairs   # 安卓目标（上面 VKT）不出 _ft / _se
+  KNT="pairs fout_want se_want"; [ -z "$VKT" ] || KNT="pairs fout_want"
   [ "${API%%	*}" != vulkan ] || KNT=   # Vulkan 款：三张表不用，只认 vk_spv/（文件名 = 内容键，名单即内容）
   KNK=$({ for f in $KNT; do printf '%s %s\n' "$(shasum -a 256 < "$KND/t/$f.tsv" | cut -c1-64)" "$f"; done; ls "$KND/t/vk_spv" 2> /dev/null | sed 's/^/vk_spv /'; } | shasum -a 256 | cut -c1-16)
 fi

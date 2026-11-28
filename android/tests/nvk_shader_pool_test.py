@@ -55,10 +55,14 @@ def main():
     base += ['-I'+str(p) for p in inc]
     original = native/'gfx_plat/nvk_shader.c'
 
-    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+    def build_case(name, source, extra_libs=None, extra_flags=()):
         exe = out/name
         src = [ROOT/'android/tests/nvk_shader_pool_test.c', source, *(extra_libs if extra_libs is not None else libs)]
         host_link.run(base + list(extra_flags) + [str(p) for p in src] + [strip, '-lm', '-o', str(exe)], check=True, timeout=60)
+        return exe
+
+    def run(name, source, extra_libs=None, args=(), env=None, extra_flags=()):
+        exe = build_case(name, source, extra_libs, extra_flags)
         return subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
 
     if sys.argv[1:] == ['--lp-output']:
@@ -75,10 +79,36 @@ def main():
             rc |= result.returncode
         return rc
 
-    live_modes = ('--live-compile-default', '--live-compile-thread', '--live-compile-pending',
+    if sys.argv[1:] == ['--submit-compile']:
+        exe = build_case('submit-compile', original, [*libs, gfx/'replay/rp_exec.c'],
+                         extra_flags=('-DS2A_TEST_SUBMIT_SCAN',))
+        rc = 0
+        for n, variant in ((1, 0), (2, 0), (4, 0), (2, 1), (4, 2), (4, 3),
+                           (1, 4), (2, 4), (4, 4), (4, 5), (4, 6), (4, 7),
+                           (4, 8), (4, 9), (4, 10), (4, 11), (4, 12), (4, 13),
+                           (4, 14), (4, 15), (4, 16), (4, 17), (4, 18)):
+            result = subprocess.run([str(exe), '--submit-compile', str(n), str(variant)],
+                                    capture_output=True, text=True, timeout=30)
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            if result.returncode and not rc:
+                rc = result.returncode
+        return rc
+
+    live_modes = ('--tess-request', '--live-compile-default', '--live-compile-thread', '--live-compile-pending',
                   '--live-compile-stop', '--cs-libpack', '--lp-gate', '--lp-numeric')
     if len(sys.argv) == 2 and sys.argv[1] in live_modes:
         result = run(sys.argv[1][2:], original, args=(sys.argv[1],))
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if len(sys.argv) == 5 and sys.argv[1] in ('--emit-tess', '--execute-tess'):
+        with tempfile.TemporaryDirectory(prefix='tess-warm-', dir=out) as td:
+            manifest = Path(td) / 'manifest'; manifest.mkdir()
+            cache = Path(td) / 'cache'; cache.mkdir()
+            env = dict(os.environ, S2A_PW_TEST_DIR=str(manifest), S2A_DIRECT_CACHE_DIR=str(cache))
+            result = run(sys.argv[1][2:], original, args=sys.argv[1:], env=env)
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         return result.returncode
@@ -104,7 +134,7 @@ def main():
         mutants = [
             ('default-on', 'nvn_plat_flag("nvk_live_compile_async", 0)', 'nvn_plat_flag("nvk_live_compile_async", 1)',
              '--live-compile-default', 'unset async property must start 0 compiler workers'),
-            ('inline', '    if (g_live_compile != 1) {', '    if (1) {',
+            ('inline', '    if (g_live_compile != 1 || g_lookahead_slots) {', '    if (1) {',
              '--live-compile-thread', 'compiler ran on the submitting thread'),
             ('request-bytes-ignored', '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    s2a_sha256_update(&hash, json, len);',
              '    s2a_sha256_update(&hash, &generation, sizeof generation);\n    (void)json; (void)len;',
@@ -136,12 +166,12 @@ def main():
     if sys.argv[1:] == ['--compute-warm-mutants']:
         text = original.read_text()
         mutants = [
-            ('no-record', '    rec.lp_ok = unaligned ? 0 : 2;\n    nvk_prog_warm_note(&rec);',
-             '    rec.lp_ok = unaligned ? 0 : 2;\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
+            ('no-record', '    libpack_note_state(&rec, unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, p);\n    nvk_prog_warm_note(&rec);',
+             '    libpack_note_state(&rec, unaligned ? LIBPACK_SSBO_WINDOW : LIBPACK_ALIGNED, p);\n    (void)rec;', '--compute-warm', 'compute program must be recorded in warm manifest'),
             ('wrong-stage', 'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 32;',
              'memcpy(rec.identity, p->identity, 32); rec.stage_mask = 1;', '--compute-warm', 'persisted compute manifest retains identity'),
-            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0) : build(bytes, len, views, nst, rec->identity, 0);',
-             'struct entry *e = build(bytes, len, views, nst, rec->identity, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
+            ('wrong-build', 'struct entry *e = compute ? build_compute(bytes, len, &views[0], rec->identity, rec->keys[0], 0, 0) : build(bytes, len, views, rec->stage_mask, rec->identity, 0, 0);',
+             'struct entry *e = build(bytes, len, views, rec->stage_mask, rec->identity, 0, 0);', '--compute-warm', 'compute program warm builds from prior cache'),
             ('flag-ignored', 'if (!nvn_plat_flag("nvk_compute_warm", 0)) return;',
              '(void)nvn_plat_flag("nvk_compute_warm", 0);', '--compute-warm-off', 'compute warm off must not record programs'),
         ]
@@ -199,8 +229,7 @@ def main():
         for name, old, new, expected in (
             ('mask-0x3', 'lrc = s2a_libpack_program_v1(lp, keys, stages, &g,', 'lrc = s2a_libpack_program_v1(lp, keys, 0x3, &g,',
              'hit from the library, compiler not called'),
-            ('no-topology', 'const struct s2a_libpack_gfx g = { topology, pc->profile_json, pc->profile_bytes };',
-             'const struct s2a_libpack_gfx g = { NULL, pc->profile_json, pc->profile_bytes }; (void)topology;',
+            ('no-topology', '.topology = topology,', '.topology = ((void)topology, NULL),',
              'hit from the library, compiler not called'),
             # 取库入口的闸（nvk_shader.c libpack_fetch）：放 0x1 / 0x3 / 0x7。去掉 0x7u：三段（含几何）程序被挡在库外，必须红；
             #   去掉 0x1u：只有顶点的深度程序被挡在库外，必须红在 VS-only 那一例
@@ -251,8 +280,8 @@ def main():
         cases += [
             ('snap-not-counted', '    atomic_fetch_add_explicit(&g_lp_gate_snap[s->lp_gate], 1, memory_order_relaxed);\n', '', 'gate readout line'),
             ('live-not-counted', '        atomic_fetch_add_explicit(&g_lp_gate_live[s->lp_gate], 1, memory_order_relaxed);\n', '', 'gate readout line'),
-            ('gate-not-on-snapshot', '    s->lp_gate = libpack_gate_mask(&s->f.gfx); s->lp_ok = s->lp_gate == 0;',
-             '    s->lp_gate = 0; s->lp_ok = 1;', "library not used"),
+            ('gate-not-on-snapshot', '    s->lp_gate = libpack_gate_mask(&s->f.gfx);',
+             '    s->lp_gate = 0;', "library not used"),
             ('ties-pick-larger-mask', 'for (unsigned m = 1; m < (1u << LPG_N); m++) if (v[m] > v[best]) best = m;',
              'for (unsigned m = 1; m < (1u << LPG_N); m++) if (v[m] >= v[best] && v[m]) best = m;', 'gate readout line'),
             # 「放开闸会怎样」的只读探测：缺省关、两样记录都要在、没有的不算有、探过的份数要记，各撤一处，探测读数那一行红。
@@ -285,7 +314,7 @@ def main():
              '{ un = 1; um[st] |= 1u << i; }', '{ un = 1; um[st] |= 1u << ((i + 1) & 15); }',
              "gate case 'unaligned storage, slot the program uses (fs)' #0: library not used"),
             ('ssbo-wrong-stage-read',
-             'sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used)', 'sbu_stage_slots(stage_key((unsigned)st), 0u, q->prim, &used)',
+             'sbu_stage_slots(key, (unsigned)st, q->prim, &used)', 'sbu_stage_slots(key, 0u, q->prim, &used)',
              "gate case 'unaligned storage, slot the program does not use': hit from the library"),   # 片元段（有非对齐绑定才会被问）当成顶点段去读：stage 对不上 → 说不准 → 被挡下
             ('ssbo-switch-ignored',
              '    if (un && ssbo_used_slots_on()) {', '    if (un && (ssbo_used_slots_on() || 1)) {',
@@ -293,6 +322,9 @@ def main():
             ('ssbo-default-on',   # 属性没设时读生产缺省（关 = 旧口径，玩家包就是这样）：缺省改回开，「属性没设」那一行放行、命中库而红
              'nvn_plat_flag("nvk_lp_used_slots", 0) != 0', 'nvn_plat_flag("nvk_lp_used_slots", 1) != 0',
              "gate case 'unaligned storage, property not set (production default)' #0: library not used"),
+            ('window-memo-shared',
+             '    memcpy(k + 52, &state, 4);', '    (void)state; memset(k + 52, 0, 4);',
+             'quick path: used slot turning unaligned'),
             ('ssbo-quick-path-blind',
              'MIX(any); MIX(un | (unused << 1)); MIX(pc->storage_buffer_offset_alignment);',
              'MIX(any); MIX(unused << 1); MIX(pc->storage_buffer_offset_alignment);',
@@ -366,8 +398,8 @@ def main():
             assert result.returncode != 0 and expected in result.stderr, (name, result.stdout, result.stderr)
             print(f'{name}: expected assertion failure: {expected}', flush=True)
         # 正控：把 why 文本清空（模拟改了报错文案 / 文案消失）备忘仍归对类——分类读的是码，不是文本
-        text_gone = code.replace('pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy);',
-                                 'pc->translator_closure, pf.max_shared, bytes, len, lw, sizeof lw, &lwhy); lw[0] = 0;')
+        text_gone = code.replace('pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy);',
+                                 'pc->translator_closure, pf.max_shared, &g, bytes, len, lw, sizeof lw, &lwhy); lw[0] = 0;')
         assert text_gone != code, 'text-independence anchor'
         path = out / 'cs-libpack-text-gone.c'
         path.write_text(text_gone)
@@ -742,7 +774,7 @@ def main():
         print(f'PASS: {len(changes)} negative controls')
         return 0
     if sys.argv[1:]:
-        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
+        raise ValueError('usage: nvk_shader_pool_test.py [--withdraw | --fact-wide-mutants | --gs-libpack-mutants | --cs-libpack-mutants | --lp-gate-mutants | --compute-warm-mutants | --diag-mutants | --live-compile-mutants | --submit-compile | --graphics-image-mutants | --cs-ubo-sampler-mutants]'
                          '（其余参数是 gs_compiler_chain_test.py / tbuf_compiler_chain_test.py 的子命令）')
     # 存储图像的声明（数值类 + SPIR-V Image Format）落程序记录：生产 sampled_decl，手搭 SPIR-V
     exe = out/'image-decl'

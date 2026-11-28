@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "nvn/nvn_vk_program_result.h"
+#include "nvn/nvk_result_view.h"
 #include "tbuf_spirv_fixtures.h"
 
 static int fails;
@@ -86,6 +87,65 @@ static void t_link(void) {
     CHECK(link(&v0, &f7, NULL) == 0, "missing 可为空");
     uint32_t junk[4] = {1, 2, 3, 4};
     CHECK(nvn_vk_spirv_link_ok((const uint8_t *)junk, sizeof junk, (const uint8_t *)f7.w, f7.n * 4, &miss) == 1, "上一段读不了：不下结论");
+}
+
+// Encode a small independent wire fixture, without going through the C# writer.
+static void fixture_u32(uint8_t *p, uint32_t n) {
+    for (unsigned i = 0; i < 4; i++) p[i] = (uint8_t)(n >> (i * 8));
+}
+struct fixture_frame { uint8_t bytes[1024]; size_t used; };
+static size_t fixture_record(struct fixture_frame *f, unsigned type, const char *field,
+                             const void *value, unsigned size) {
+    unsigned id = 0;
+    for (unsigned i = 1; i < sizeof rv_fields / sizeof *rv_fields; i++)
+        if (!strcmp(rv_fields[i], field)) { id = i; break; }
+    const size_t pos = f->used;
+    f->used += 8 + ((size + 3u) & ~3u);
+    fixture_u32(f->bytes + pos, size);
+    f->bytes[pos + 4] = (uint8_t)type;
+    f->bytes[pos + 5] = (uint8_t)id;
+    if (value) memcpy(f->bytes + pos + 8, value, size);
+    return pos;
+}
+static void fixture_end(struct fixture_frame *f, size_t pos) {
+    fixture_u32(f->bytes + pos, (uint32_t)(f->used - pos - 8));
+}
+static void t_live_result(void) {
+    struct fixture_frame f = {{'S','2','A','D','R','B','1',0}, 16};
+    size_t root = fixture_record(&f, 1, "", NULL, 0);
+    static const char schema[] = "s2a-direct-program-v1";
+    fixture_record(&f, 3, "schema", schema, sizeof schema - 1);
+    size_t content = fixture_record(&f, 1, "content", NULL, 0);
+    size_t stages = fixture_record(&f, 2, "stages", NULL, 0);
+    size_t vs = fixture_record(&f, 1, "", NULL, 0);
+    fixture_record(&f, 3, "stage", "vs", 2);
+    static const uint8_t words[20] = {3, 2, 35, 7, 0, 3, 1, 0, 0, 0, 0, 0, 1};
+    size_t module = fixture_record(&f, 9, "spirv", words, sizeof words);
+    fixture_record(&f, 2, "c0Reads", NULL, 0);
+    fixture_record(&f, 8, "c0ReadsStatic", NULL, 0);
+    fixture_end(&f, vs); fixture_end(&f, stages);
+    fixture_record(&f, 2, "bindings", NULL, 0);
+    fixture_end(&f, content); fixture_end(&f, root);
+    fixture_u32(f.bytes + 8, (uint32_t)f.used);
+
+    struct fd_program p = {0};
+    char why[192] = {0};
+    int rc = nvn_vk_program_parse_graphics_live(f.bytes, f.used, &p, 1, why, sizeof why);
+    CHECK(!rc && p.stage[0].spirv_bytes == sizeof words && !memcmp(p.stage[0].spirv, words, sizeof words) &&
+          nvn_vk_binst_unread(&p.stage[0], 1) && !nvn_vk_binst_unread(&p.stage[0], 0),
+          "live binary keeps raw SPIR-V and empty/unknown C0 reads");
+    nvn_vk_program_free(&p);
+    CHECK(nvn_vk_program_parse_graphics_stages(f.bytes, f.used, &p, 1, why, sizeof why) != 0,
+          "persisted operands still require JSON");
+    CHECK(nvn_vk_program_parse_graphics_live(f.bytes, f.used - 4, &p, 1, why, sizeof why) != 0,
+          "live binary rejects a truncated frame");
+    fixture_u32(f.bytes + module, sizeof words - 1);
+    CHECK(nvn_vk_program_parse_graphics_live(f.bytes, f.used, &p, 1, why, sizeof why) != 0,
+          "live binary refuses an unaligned SPIR-V extent");
+    fixture_u32(f.bytes + module, UINT32_MAX);
+    CHECK(nvn_vk_program_parse_graphics_live(f.bytes, f.used, &p, 1, why, sizeof why) != 0,
+          "live binary refuses an overrun");
+    nvn_vk_program_free(&p);
 }
 
 int main(void) {
@@ -483,6 +543,7 @@ int main(void) {
         }
     }
 
+    t_live_result();
     t_link();
     if (fails) { printf("direct nvn program result test: %d FAILED\n", fails); return 1; }
     printf("direct nvn program result test: ok\n");

@@ -53,8 +53,7 @@ static int pool_view_class(const struct nvn_gpu_view_s *v) {
     return info.kind == NVN_FMT_UINT ? 1 : info.kind == NVN_FMT_SINT ? 2 : 0;
 }
 static struct nvn_gpu_view_s *pool_live_view(nvn_gpu_view h) {
-    struct nvn_gpu_view_s *v = g.views;
-    while (v && v != h) v = v->all_next;
+    struct nvn_gpu_view_s *v = view_find_locked(&g, h);
     return v && !v->released ? v : NULL;
 }
 static struct nvn_gpu_samp_s *pool_live_samp(nvn_gpu_samp h) {
@@ -89,7 +88,7 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
     struct nvn_gpu_view_s *dv = NULL; struct nvn_gpu_samp_s *ds = NULL; int cls = -1;
     if (d->kind == NVN_GPU_POOL_IMAGE) {
         dv = pool_live_view(d->dummy.view); cls = pool_view_class(dv);
-        if (cls < 0 || !(dv->tex->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) { error = NVN_GPU_E_ARG; reason = "pool dummy image invalid"; goto failed; }
+        if (cls < 0 || !(dv->tex->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || dv->no_sample_2d3d) { error = NVN_GPU_E_ARG; reason = "pool dummy image invalid"; goto failed; }
     } else {
         ds = pool_live_samp(d->dummy.samp);
         if (!ds) { error = NVN_GPU_E_ARG; reason = "pool dummy sampler invalid"; goto failed; }
@@ -107,7 +106,7 @@ nvn_gpu_rc nvn_gpu_pool_create(const nvn_gpu_pool_desc *d, nvn_gpu_pool_table *o
                 if (v->buffer_view) v = dv;
                 else if (got < 0) { error = NVN_GPU_E_UNSUPPORTED; reason = "pool image numeric type unproven"; goto failed; }
                 else if (got != cls || v->type != dv->type || v->aspect != dv->aspect || v->tex->samples != dv->tex->samples) v = dv;
-                else if (!(v->tex->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) { error = NVN_GPU_E_UNSUPPORTED; reason = "pool image is not sampleable"; goto failed; }
+                else if (!(v->tex->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || v->no_sample_2d3d) { error = NVN_GPU_E_UNSUPPORTED; reason = "pool image is not sampleable"; goto failed; }
             }
             t->objects[i] = v; ref_bump(v, REF_VIEW);
             t->images[i].imageView = v->view; t->images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -233,6 +232,7 @@ nvn_gpu_rc nvn_gpu_pool_bind(nvn_gpu_cmd c, nvn_gpu_stage st, uint32_t ent, nvn_
             return pool_bind_error(c, err, NVN_GPU_E_LAYOUT, "pool conflicts with ordinary binding");
         }
     c->pool_binds[st][ent] = t; c->pool_active = 1; c->desc_dirty |= 1u << e->set;
+    c->layout_dirty |= (st == NVN_GPU_SH_CS ? 2u : 1u);
     return rc(NVN_GPU_OK);
 }
 void nvn_gpu_pool_release(nvn_gpu_pool_table t) {
@@ -518,7 +518,7 @@ static int prs_apply(struct nvn_gpu_cmd_s *c, const struct prs_plan *pl, uint32_
     return 1;
 }
 // 段结束（finish_cmd 最先一步，放弃的段已先清空两级回放队列）：补丁按正典内容写回，再把组放回各自表项的空闲串；放不回（会话已收尾 / 空闲到上限 / 内存不够）的销毁。
-static void prs_release(struct nvn_gpu_cmd_s *c, int executed) {
+static void prs_release(struct nvn_gpu_cmd_s *c, int executed, int keep_buf) {
     (void)executed;
     if (c->prs_n) {
         const int tm = g_draw_tm; const uint64_t t0 = tm ? now_ns() : 0;
@@ -552,7 +552,8 @@ static void prs_release(struct nvn_gpu_cmd_s *c, int executed) {
         prs_destroy_list(dead);
         if (tm) __atomic_fetch_add(&g_pool_ns[2], now_ns() - t0, __ATOMIC_RELAXED);
     }
-    free(c->prs_use); c->prs_use = NULL; c->prs_n = c->prs_cap = 0;
+    if (keep_buf) { c->prs_n = 0; }
+    else { free(c->prs_use); c->prs_use = NULL; c->prs_n = c->prs_cap = 0; }
 }
 static void prs_open(void) {
     pthread_mutex_lock(&g_prs_mu);

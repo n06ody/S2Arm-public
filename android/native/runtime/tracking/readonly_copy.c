@@ -11,6 +11,8 @@
 #include <sched.h>
 #if defined(__linux__)
 #include "mirror.h"
+#include "../../../../graphics/nvn/replay/rp_guest_snapshot.h"
+int rp_buf_guest_snapshot(uint64_t, void *, size_t, enum rp_land_reader) __attribute__((weak));
 #include "../vm/backing.h"
 static uint64_t readonly_backing_sequence(void) { return plat_backing_sequence(); }
 #else
@@ -81,8 +83,15 @@ int s2a_android_copy_guest_readonly(uint64_t address, void *destination, uint64_
                 cursor=next<end ? next : end;
             }
         }
+        int snapshot = 0;
+#if defined(__linux__)
+        if (!error && rp_buf_guest_snapshot) {
+            const int guarded = rp_buf_guest_snapshot(address, destination, (size_t)size, RP_LAND_READ_HOST);
+            if (guarded != ENOSYS) { error = guarded; snapshot = 1; }
+        }
+#endif
         uint8_t *output=destination;
-        for (uint64_t cursor=address;!error && cursor<end;) {
+        for (uint64_t cursor=address;!snapshot && !error && cursor<end;) {
             uint64_t base=cursor & ~((uint64_t)page-1);
             if (base>UINTPTR_MAX-page) { error=EINVAL; break; }
             size_t offset=(size_t)(cursor-base), count=page-offset;

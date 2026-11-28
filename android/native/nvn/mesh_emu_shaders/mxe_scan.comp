@@ -1,0 +1,54 @@
+#version 450
+// SPDX-License-Identifier: Apache-2.0
+// Pure Vulkan 1.1 prefix-sum task->mesh workgroup table expander (aligned with iOS mxe_scan).
+// Uses local_size_x = 128 (within Vulkan 1.1 guaranteed minimum maxComputeWorkGroupInvocations)
+// and shared memory only (zero subgroup / Vulkan 1.2+ extensions).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Exchange { uint h[]; };
+layout(set = 0, binding = 1) readonly buffer Indirect { uint ind[]; };
+layout(push_constant) uniform PC { uint ind_word_off; } pc;
+shared uint s_tot[128];
+
+void main() {
+    uint l = gl_LocalInvocationID.x;
+    uint nt = 128u;
+    uint want = h[6] != 0u ? h[6] : ind[pc.ind_word_off];
+    uint n = min(want, h[3]);
+    uint per = (n + nt - 1u) / nt;
+    uint a = min(l * per, n);
+    uint b = min(a + per, n);
+    uint cbase = h[0];
+    uint s = 0u;
+    for (uint t = a; t < b; t++) s += min(h[cbase + t], 1024u);
+    s_tot[l] = s;
+    barrier();
+    for (uint step = 1u; step < 128u; step <<= 1u) {
+        uint v = l >= step ? s_tot[l - step] : 0u;
+        barrier();
+        s_tot[l] += v;
+        barrier();
+    }
+    uint o = s_tot[l] - s;
+    uint capM = h[4];
+    if (l == 127u) {
+        uint acc = s_tot[127u];
+        h[8]  = min(acc, capM);
+        h[9]  = 1u;
+        h[10] = 1u;
+        h[13] = 0u;
+        h[14] = 1u;
+        h[15] = 0u;
+        h[16] = 0u;
+        h[17] = 0u;
+        h[18] = acc;
+        h[19] = want;
+    }
+    uint tbase = h[2];
+    for (uint t = a; t < b; t++) {
+        uint c = min(h[cbase + t], 1024u);
+        uint room = o < capM ? capM - o : 0u;
+        uint lim = min(c, room);
+        for (uint j = 0u; j < lim; j++) h[tbase + o + j] = (t << 10u) | j;
+        o += c;
+    }
+}

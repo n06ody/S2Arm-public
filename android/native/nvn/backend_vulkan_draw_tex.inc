@@ -112,6 +112,10 @@ static VkPipeline dtx_pipe_get(struct nvn_gpu_cmd_s *c, const struct dtx_key *k,
     VkPipelineDynamicStateCreateInfo dyns; memset(&dyns, 0, sizeof dyns); dyns.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dyns.dynamicStateCount = 3; dyns.pDynamicStates = dyn;
     VkGraphicsPipelineCreateInfo gp; memset(&gp, 0, sizeof gp); gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    if (g.feedback_loop_ext) {
+        if (nslot) gp.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        if (k->dsfmt) gp.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    }
     gp.stageCount = 2; gp.pStages = st;
     gp.pVertexInputState = &vi; gp.pInputAssemblyState = &ia; gp.pViewportState = &vp; gp.pRasterizationState = &rs;
     gp.pMultisampleState = &ms; gp.pDepthStencilState = &ds; gp.pColorBlendState = &cbs; gp.pDynamicState = &dyns;
@@ -161,7 +165,12 @@ void nvn_gpu_draw_tex(nvn_gpu_cmd ch, const nvn_gpu_draw_tex_desc *d) {
         for (int k = 0; k < 4; k++)
             if (f4[k] >= 0x10 && f4[k] <= 0x13) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "draw_tex 双源混合因子（内置片元只有一个输出）"); return; }
     }
-    if (c->feedback_read_mask && !feedback_restart(c, 0, 0)) return;
+    if (!pass_open_for_work(c)) return;
+    if (c->feedback_read_mask && !feedback_restart(c, 0, c->feedback_loop_mask, 0)) return;
+    if (c->feedback_loop_sampled & 1u) {
+        feedback_loop_barrier(c);
+        c->feedback_loop_sampled &= ~(uint16_t)1u;
+    }
     VkRect2D sc = {{0, 0}, {c->pass_w, c->pass_h}};
     if (d->has_sc) sc = (VkRect2D){{d->sc[0], d->sc[1]}, {(uint32_t)d->sc[2], (uint32_t)d->sc[3]}};
     if (!pass_ensure_area(c, sc)) return;

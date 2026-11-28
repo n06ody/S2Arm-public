@@ -37,8 +37,10 @@ static int res_flags_off(void) {
     if (v < 0 || !(++k & 255)) { const char *e = getenv("T_NVN_RES_FLAGS_OFF"); v = e && *e && *e != '0'; }
     return v;
 }
-static int g_bc_byte_equal;
+static int g_bc_byte_equal, g_unarmed_verify, g_flag_tex_upload_diag;
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_tex_upload_diag")) return g_flag_tex_upload_diag;
+    if (!strcmp(name, "nvk_tex_unarmed_verify")) return g_unarmed_verify;
     if (g_bc_byte_equal && !strcmp(name, "nvk_tex_byte_equal")) return 1;
     if (res_flags_off() && (!strcmp(name, "nvk_bind_fast") || !strcmp(name, "nvk_drv_memo") || !strcmp(name, "nvk_tex_epoch"))) return 0;
     return fixture_plat_flag(name, dflt);
@@ -66,7 +68,7 @@ int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out)
 }
 static void res_prog_min(void) {   // 最小程序：没有绑定项；用例再按需加布局项
     memset(&g_fprog, 0, sizeof g_fprog);
-    for (int st = 0; st < RP_PROG_STAGES; st++) for (int i = 0; i < RP_PROG_ENT_MAX; i++) g_fprog.ent[st][i].src_reg2 = UINT16_MAX;
+    for (int st = 0; st < RP_PROG_INLINE_STAGES; st++) for (int i = 0; i < RP_PROG_ENT_MAX; i++) g_fprog.ent[st][i].src_reg2 = UINT16_MAX;
     g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.color_out_mask = 0xffffffffu;
 }
 
@@ -202,6 +204,78 @@ static void t_res_tex_epoch_unrelated(void) {
     CHECK(onx.fallback == SC_N && onx.since == SC_N && onx.pages == SC_N * PP && onx.log_n == ND - SC_N);
     CHECK(off.unarmed == 0 && on.unarmed == 0 && onw.unarmed == 0);   // 负对照：加保护都落地时一次都不计、不多传
 }
+// 线性 2D：解保护先记了页代号，写指令却在首次上传之后才完成。
+// 下次保护落地时位图可以为空，上传端仍必须收到新字节。
+static void t_linear_unarmed_retry(int verify, int fail_upload) {
+    g_unarmed_verify = verify;
+    res_fresh();
+    nvn_be_sub_begin();
+    g_block_mem = g_block_arena;   // 起点已按宿主页对齐
+    g_tp.mem = g_block_mem;
+    g_tp.size = PG;
+    g_log_fake_on = 1;
+    g_log_fake_bad = 0;
+    g_log_head = 0;
+    g_log_ident++;
+    g_wp_on = 1;
+    g_wp_dirty[0] = 0;
+    g_log_unarmed[0] = 1;
+    const uint64_t saved_gen = g_block_gen[0];
+    g_block_gen[0] = ++g_dirty_now;
+    fake_log_event(0, 0);   // 上传开始时，这条事件已发布
+
+    tex_t t = mk_tex(9801, 0, NVN_FORMAT_R8, 8, 2, 1, NVN_TEXTURE_FLAGS_LINEAR);
+    t.mem = g_tp.mem;
+    uint8_t expected[16];
+    memset(expected, 0x31, sizeof expected);
+    memset(t.mem, 0x31, t.L.size);
+    uint64_t perf[RP_PERF_N];
+    rp_perf_take(perf);
+    nvn_gpu_tex image = rp_tex_resolve(&t, &g_fake_cmd);
+    CHECK(image != NULL && g_nup == 1 && g_up[0].img == sizeof expected &&
+          !memcmp(g_up[0].first, expected, sizeof expected));
+    rp_perf_take(perf);
+    CHECK(perf[RP_PERF_TEX_UNARMED] == 1);
+
+    // 同页的其他内容反复写，纹素没变。页仍可写，下一次真写也不会留下新的脏位。
+    CHECK(t.L.size < PG);
+    t.mem[PG - 1] ^= 1;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == image);
+    CHECK(g_nup == (verify ? 1 : 2));
+    if (fail_upload) {
+        g_log_unarmed[0] = 0;
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) == image && g_nup == 1);
+        // Equal bytes retired the retry, but the full upload later failed.
+        rp_res_byte_upload_failed();
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) == image && g_nup == 2);
+        CHECK(g_nup == 2 && !memcmp(g_up[1].first, expected, sizeof expected));
+    }
+    const int before_change = g_nup;
+
+    // 只改第二行。页仍可写，没有新缺页、代号或日志事件。
+    if (fail_upload) {   // 已重新受保护，这次真写必须产生页事件和脏行。
+        g_block_gen[0] = ++g_dirty_now;
+        fake_log_event(0, 0);
+        g_wp_dirty[0] = 1;
+    }
+    memset(t.mem + t.L.size / 2, 0xa7, 8);
+    memset(expected + 8, 0xa7, 8);
+    g_log_unarmed[0] = 0;   // 下一次加保护可成功
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == image);
+    CHECK(g_nup == before_change + 1 && !memcmp(g_up[g_nup - 1].first, expected, sizeof expected));
+    int recovered = g_nup;
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == image && g_nup == recovered);
+
+    nvn_be_tex_release(&t);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    g_log_fake_on = 0;
+    g_wp_on = 0;
+    g_block_gen[0] = saved_gen;
+    g_block_mem = NULL;
+    res_fresh();
+}
+
 // 加保护没落地：两种代号先后 × 日志开关，贴图 4 都必须重传恰好一次（重传时页已重新只读，之后回到日志路 / 纪元，不再多传）；别的贴图不受影响。
 static void t_res_tex_unarmed(void) {
     for (int v = 1; v <= 2; v++) for (int lg = 0; lg <= 1; lg++) {
@@ -265,27 +339,27 @@ static void t_res_bind_fast(void) {
     const op_hdr eh = {OP_END, 8}; uint8_t sv[8]; uint64_t pf[RP_PERF_N];
     memcpy(sv, s.b + o1, 8); memcpy(s.b + o1, &eh, 8);
     nvn_be_exec(s.b);                                                 // ①
-    CHECK(g_gdraws == 1 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);
+    CHECK(g_gdraws == 1 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);
     rp_perf_take(pf);
     memcpy(s.b + o1, sv, 8);
     memcpy(sv, s.b + o2, 8); memcpy(s.b + o2, &eh, 8);
     nvn_be_exec(s.b + o1);                                            // ②
-    CHECK(g_gdraws == 2 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);   // 一次 bind 都没发
-    rp_perf_take(pf); CHECK(pf[RP_PERF_BIND_FAST] == 3);              // 三个阶段都整组沿用
+    CHECK(g_gdraws == 2 && g_bind_calls[0] == 1 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 一次 bind 都没发
+    rp_perf_take(pf); CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES); // 全部图形阶段都整组沿用
     memcpy(s.b + o2, sv, 8);
     memcpy(sv, s.b + o3, 8); memcpy(s.b + o3, &eh, 8);
     rp_perf_take(pf);
     nvn_be_exec(s.b + o2);                                            // ③
-    CHECK(g_gdraws == 3 && g_bind_calls[0] == 2 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1);   // 只有顶点阶段重建
+    CHECK(g_gdraws == 3 && g_bind_calls[0] == 2 && g_bind_calls[1] == 1 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 只有顶点阶段重建
     rp_perf_take(pf);
-    CHECK(pf[RP_PERF_BIND_FAST] == 2);                          // 没变的两阶段整组沿用
+    CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES - 1);          // 没变的阶段整组沿用
     CHECK(pf[RP_PERF_BIND_SLICE_HIT] == 2);                     // DRV0 / DRV2 内容没变：命中上次那片
     memcpy(s.b + o3, sv, 8);
     rp_perf_take(pf);
     nvn_be_exec(s.b + o3);                                            // ④
-    CHECK(g_gdraws == 4 && g_bind_calls[0] == 2 && g_bind_calls[1] == 2 && g_bind_calls[2] == 1);   // 只有片元阶段重建
+    CHECK(g_gdraws == 4 && g_bind_calls[0] == 2 && g_bind_calls[1] == 2 && g_bind_calls[2] == 1 && g_bind_calls[3] == 1 && g_bind_calls[4] == 1);   // 只有片元阶段重建
     rp_perf_take(pf);
-    CHECK(pf[RP_PERF_BIND_FAST] == 2);                          // 没变的两阶段整组沿用
+    CHECK(pf[RP_PERF_BIND_FAST] == RP_PROG_STAGES - 1);          // 没变的阶段整组沿用
     CHECK(pf[RP_PERF_BIND_SLICE_HIT] == 0);                     // 贴图句柄表变了：驱动段必须重做
     nvn_be_sub_commit(); fake_complete(NVN_GPU_DONE_OK);
     nvn_be_tex_release(&rtt); nvn_be_tex_release(&tx); nvn_be_tex_release(&ty); nvn_be_pool_del(g_pmem);
@@ -443,7 +517,7 @@ static void t_res_tex_window_gpu(void) {
 }
 
 // 只替代物理存储选择，实际资源表、脏页核对、pin 与视图重建仍走回放入口。
-static unsigned g_bc1_snapshots;
+static unsigned g_bc1_snapshots, g_bc7_unwraps;
 static int fixture_bc1_replace(nvn_gpu_tex old, int opaque, nvn_gpu_tex *out) {
     nvn_gpu_tex_desc d = old->d;
     d.usage &= ~NVN_GPU_TEX_BC1_OPAQUE;
@@ -470,7 +544,9 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex tex, const void *bytes, 
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex tex, nvn_gpu_tex *out) {
     CHECK(c);
     *out = NULL;
-    return fixture_bc1_replace(tex, 0, out);
+    int result = fixture_bc1_replace(tex, 0, out);
+    if (result > 0 && tex->d.d.format == NVN_FORMAT_BPTC_UNORM) g_bc7_unwraps++;
+    return result;
 }
 
 static void t_res_bc1_rebind(void) {
@@ -523,6 +599,63 @@ static void t_res_bc1_rebind(void) {
     g_caps_extra &= ~NVN_GPU_CAP_BC1_SNAPSHOT;
 }
 
+static unsigned g_bc7_snapshots;
+
+int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex tex, const void *bytes, uint64_t size,
+                            nvn_gpu_bc7_source source, nvn_gpu_tex *out) {
+    unsigned char linear[16] = {0};
+    nvn_texlayout layout;
+    *out = NULL;
+    if (source != NVN_GPU_BC7_FULL) return 0;
+    CHECK(c && tex->d.d.width == 4 && tex->d.d.height == 4 &&
+          tex->d.d.format == NVN_FORMAT_BPTC_UNORM);
+    nvn_tex_layout(&tex->d.d, &layout);
+    CHECK(size == layout.size && nvn_deswizzle(&tex->d.d, 0, 0, bytes, linear, sizeof linear) == 0);
+    g_bc7_snapshots++;
+    if (linear[0] != 0x40) return 0;  // Complete snapshot misses the approved content key.
+    return fixture_bc1_replace(tex, 1, out) < 0 ? -1 : 1;
+}
+
+static void t_res_bc7_rebind(void) {
+    res_fresh();
+    g_caps_extra |= NVN_GPU_CAP_BC7_PACK;
+    g_bc7_snapshots = g_bc7_unwraps = 0;
+    tex_t t = mk_tex(9391, 0, NVN_FORMAT_BPTC_UNORM, 4, 4, 1, 0);
+    t.mem = g_pmem;
+    memset(t.mem, 0, t.L.size);
+    t.mem[0] = 0x40;
+    view_t twin = {.set_format = 1, .format = NVN_FORMAT_BPTC_UNORM_SRGB};
+    nvn_be_reg_tex(3, &t, &twin);
+    nvn_be_sub_begin();
+    rp_view_pin_begin();
+    nvn_gpu_view old = rp_view_by_id(3, &g_fake_cmd, NULL);
+    CHECK(old && (old->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE) && g_bc7_snapshots == 1);
+    const int old_id = old ? old->rid : 0;
+
+    t.mem[0] = 0x20;
+    nvn_be_tex_cpu_written(&t);
+    nvn_gpu_view next = rp_view_by_id(3, &g_fake_cmd, NULL);
+    CHECK(next && next->rid != old_id && !(next->of->d.usage & NVN_GPU_TEX_BC1_OPAQUE));
+    CHECK(g_bc7_snapshots == 2 && g_bc7_unwraps == 1 && !was_view_released(old_id));
+    rp_view_pin_end();
+    CHECK(was_view_released(old_id));
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+
+    t.mem[0] = 0x40;
+    nvn_be_tex_cpu_written(&t);
+    nvn_be_sub_begin();
+    nvn_gpu_tex packed = rp_tex_resolve(&t, &g_fake_cmd);
+    CHECK(packed && (packed->d.usage & NVN_GPU_TEX_BC1_OPAQUE) && g_bc7_snapshots == 3);
+    nvn_gpu_tex plain = rp_tex_resolve_plain(&t, &g_fake_cmd);
+    CHECK(plain && !(plain->d.usage & NVN_GPU_TEX_BC1_OPAQUE) && g_bc7_unwraps == 2);
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) == plain && g_bc7_snapshots == 3);
+    nvn_be_sub_commit();
+    fake_complete(NVN_GPU_DONE_OK);
+    nvn_be_tex_release(&t);
+    g_caps_extra &= ~NVN_GPU_CAP_BC7_PACK;
+}
+
 // 真写块的一处，跟踪记录整个 64 页块，随后同块内的写不再追加事件。
 static void bc_neighbor_write(size_t chunk, size_t page, uint8_t v) {
     fake_log_event(chunk, chunk + 63);
@@ -539,7 +672,7 @@ nvn_gpu_rc nvn_gpu_cmd_commit(nvn_gpu_cmd c, uint64_t signal, nvn_gpu_done_fn do
         g_bc_failed_pre++;
         c->live = 0;
         if (err) snprintf(err->why, sizeof err->why, "fixture pre submit failure");
-        nvn_gpu_done failed = {.status = NVN_GPU_DONE_FAILED, .why = "fixture pre submit failure"};
+        nvn_gpu_done failed = {.signal = signal, .status = NVN_GPU_DONE_FAILED, .why = "fixture pre submit failure"};
         if (done) done(user, &failed);
         return (nvn_gpu_rc){NVN_GPU_E_OOM};
     }
@@ -836,6 +969,83 @@ static void t_linear_in_render_pool(void) {
     pass_fresh();
 }
 
+static int g_upload_record_rejected;
+int nvn_gpu_cmd_record_ok(nvn_gpu_cmd cmd) { return cmd && !g_upload_record_rejected; }
+
+static void tex_upload_diag_clear(void) {
+    g_upload_diag_lines = 0;
+    g_upload_diag_log[0] = 0;
+}
+
+// 同一上传通过关、开、队列失败、录制拒绝四臂。原样记录替身收到的上传和保护次数。
+static void t_tex_upload_diag(void) {
+    int expected_protects = -1;
+    for (int arm = 0; arm < 4; arm++) {
+        res_fresh();
+        g_flag_tex_upload_diag = arm != 0;
+        g_upload_record_rejected = arm == 3;
+        tex_upload_diag_clear();
+        tex_t t = mk_tex(8100, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0);
+        memset((void *)t.mem, 0x5a, t.L.size);
+        int uploads = g_nup, protects = g_protects;
+        nvn_be_sub_begin();
+        CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+        CHECK(g_nup == uploads + 1 && g_up[uploads].first[0] == 0x5a);
+        nvn_be_sub_commit();
+        fake_complete(arm == 2 ? NVN_GPU_DONE_FAILED : NVN_GPU_DONE_OK);
+        if (arm == 0) expected_protects = g_protects - protects;
+        CHECK(g_protects - protects == expected_protects);
+        rp_res_reset();   // 无上屏的夹具在会话结束时输出末窗
+        if (arm == 0) { CHECK(g_upload_diag_lines == 0); continue; }
+        if (arm == 3) {
+            CHECK(strstr(g_upload_diag_log, "recorded=0/0"));
+            CHECK(strstr(g_upload_diag_log, "rejected=1/512"));
+            CHECK(strstr(g_upload_diag_log, "complete=0/0"));
+            printf("%s", g_upload_diag_log);
+            continue;
+        }
+        char find[96];
+        snprintf(find, sizeof find, "attempt=1/%llu", (unsigned long long)t.L.size);
+        CHECK(strstr(g_upload_diag_log, find));
+        CHECK(strstr(g_upload_diag_log, "recorded=1/"));
+        CHECK(strstr(g_upload_diag_log, arm == 1 ? "complete=1/" : "segment_failed=1/"));
+        CHECK(strstr(g_upload_diag_log, arm == 1 ? "segment_failed=0/0" : "complete=0/0"));
+        CHECK(strstr(g_upload_diag_log, "ser=8100"));
+        CHECK(strstr(g_upload_diag_log, "first=1/"));
+        printf("%s", g_upload_diag_log);
+    }
+    g_upload_record_rejected = 0;
+
+    // 复用现有资源夹具，覆盖日志判脏、BC 快照、
+    // 压缩纹理字节缓存、前置段同步拒绝和异步失败。
+    tex_upload_diag_clear();
+    t_res_bc_byte_equal(1);
+    CHECK(strstr(g_upload_diag_log, "dirty_log="));
+    CHECK(strstr(g_upload_diag_log, "retry="));
+    CHECK(strstr(g_upload_diag_log, "bc1_snapshot="));
+    CHECK(strstr(g_upload_diag_log, "byte_equal_capture="));
+    CHECK(strstr(g_upload_diag_log, "deferred=1/"));
+    CHECK(strstr(g_upload_diag_log, "segment_failed=2/"));
+    printf("%s", g_upload_diag_log);
+
+    // 完成回执跨窗：原窗口留在途，下一窗只见完成。
+    tex_upload_diag_clear();
+    tex_t t = mk_tex(8101, 0, NVN_FORMAT_RGBA8, 8, 8, 1, 0);
+    memset(t.mem, 0x5a, t.L.size);
+    nvn_be_sub_begin();
+    CHECK(rp_tex_resolve(&t, &g_fake_cmd) != NULL);
+    nvn_be_sub_commit();
+    rp_tex_upload_diag_window(300);
+    CHECK(strstr(g_upload_diag_log, "window=0 pending=1/512 complete=0/0"));
+    fake_complete(NVN_GPU_DONE_OK);
+    rp_tex_upload_diag_window(300);
+    CHECK(strstr(g_upload_diag_log, "window=1 frames=300 attempt=0/0"));
+    CHECK(strstr(g_upload_diag_log, "window=1 pending=0/0 complete=1/512"));
+    printf("%s", g_upload_diag_log);
+    rp_res_reset();
+    g_flag_tex_upload_diag = 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--bc-byte-equal") || !strcmp(argv[1], "--bc-byte-equal-negative"))) {
         t_res_bc_byte_equal(!strcmp(argv[1], "--bc-byte-equal"));
@@ -844,20 +1054,30 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && !strcmp(argv[1], "--dirtylog-off")) g_flag_buf_dirtylog = 0;   // 整套以开关关再跑一遍：贴图核对走逐页退回路径
     if (argc > 1 && !strcmp(argv[1], "--gpu-window")) { t_res_tex_window_gpu(); return g_fail ? 1 : 0; }
+    if (argc > 1 && !strcmp(argv[1], "--bc7-rebind")) {
+        t_res_bc7_rebind();
+        printf("BC7 cache rebind: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     t_res_bc1_rebind();
     if (argc > 1 && !strcmp(argv[1], "--bc1-rebind")) {
         printf("BC1 view rebind: %d checks, %d failures\n", g_checks, g_fail);
         return g_fail ? 1 : 0;
     }
+    t_res_bc7_rebind();
     t_linear_in_render_pool();
     t_res_tex_epoch();
     t_res_bc_byte_equal(1);
     t_res_tex_epoch_unrelated();
     t_res_tex_unarmed();
+    t_linear_unarmed_retry(1, 0);
+    t_linear_unarmed_retry(1, 1);
+    t_linear_unarmed_retry(0, 0);
     t_res_bind_fast();
     t_res_pipe_layout();
     t_res_tex_before_pool();
     t_res_tex_window_gpu();
+    t_tex_upload_diag();
     printf("t_nvn_res：%d 项检查，%d 项红\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

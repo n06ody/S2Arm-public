@@ -215,13 +215,19 @@ static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const 
             .pBufferInfo = &buffers[i]};
     }
     vkUpdateDescriptorSets(g.d, 2, writes, 0, NULL);
-    const VkBufferMemoryBarrier read = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = producer_access,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = d->buf->buffer, .offset = read_off, .size = read_bytes,
-    };
-    vkCmdPipelineBarrier(c->cb, producer_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &read, 0, NULL);
+    if (g.sync2_on) {
+        buf_barrier2(c, d->buf->buffer, read_off, read_bytes,
+                     sync2_stage_from_v1(producer_stages, producer_access), (VkAccessFlags2)producer_access,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
+    } else {
+        const VkBufferMemoryBarrier read = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = producer_access,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = d->buf->buffer, .offset = read_off, .size = read_bytes,
+        };
+        vkCmdPipelineBarrier(c->cb, producer_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &read, 0, NULL);
+    }
     const struct cold_push push = {(uint32_t)((first - read_off) / 4), d->stride_words, d->count, draw->count, draw->first};
     es_reset(c);
     if (c->desc_point == 2) c->desc_layout = VK_NULL_HANDLE;
@@ -229,16 +235,22 @@ static int cold_guard_scan(nvn_gpu_cmd c, nvn_gpu_pipe a, nvn_gpu_pipe b, const 
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.cold_layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(c->cb, g.cold_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
     vkCmdDispatch(c->cb, 1, 1, 1);
-    const VkBufferMemoryBarrier indirect = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = result.buf->buffer, .offset = result.off, .size = result_bytes,
-    };
     // The execution dependency also orders any later writes to the scanned
     // source after the compute read, including when the result is abandoned.
-    vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 0, NULL, 1, &indirect, 0, NULL);
+    if (g.sync2_on) {
+        buf_barrier2(c, result.buf->buffer, result.off, result_bytes,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT_KHR);
+    } else {
+        const VkBufferMemoryBarrier indirect = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = result.buf->buffer, .offset = result.off, .size = result_bytes,
+        };
+        vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 1, &indirect, 0, NULL);
+    }
     c->cold.original = a;
     c->cold.variant = b;
     c->cold.domain = *d;
@@ -305,6 +317,7 @@ int nvn_vk_cold_guard_draw(nvn_gpu_cmd c, const nvn_gpu_draw_args *draw) {
         if (!cold_guard_has_binding(c, d->prefix.fragment_ent, NVN_GPU_RES_UBO, d->prefix.buf, &d->prefix.binding) ||
             !cold_guard_prefix(c, a, &d->prefix, &prefix_value) || prefix_value != c->cold.prefix_value) return 0;
     }
+    if (!pipe_pin_draw(c, c->cold.variant)) return 1;
     nvn_gpu_draw_args act = *draw;
     act.ind = c->cold.result.buf;
     act.ind_off = c->cold.result.off;

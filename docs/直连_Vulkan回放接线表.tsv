@@ -55,3 +55,7 @@
 53	OP_DLSS	计算	14642	dlss_eval	未接	无	否
 54	OP_PUSH_CONST_PTR	状态（绘制时生效）	14643	state_op:10382	状态已记；绘制侧未接	无	否
 55	OP_MULTI_DRAW	绘制	14622	draw_multi	未接	无	否
+56	OP_SET_PROVOKING_VERTEX	状态（绘制时生效）	无	未接	部分：Vulkan 管线选择首／末顶点，缺末顶点能力时显式末顶点绘制报未接	t_replay_provoking.c	否
+57	OP_SAMPLE_MASK	状态（绘制时生效）	—	Metal 对非全掩码报红	记录样本掩码并传入图形管线	t_nvn_draw_record / t_nvn_replay	否
+58	OP_DISCARD_COLOR	附件	—	保留附件	记录槽号；邻接整清证明下可省最终存储	t_nvn_draw_record / t_replay_tbdr_ds	否
+59	OP_DISCARD_DS	附件	—	保留附件	记录深度模板提示；邻接整清逐方面证明	t_nvn_draw_record / t_replay_tbdr_ds	否

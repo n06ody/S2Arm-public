@@ -13,6 +13,7 @@ BACKEND_PARTIAL = {
     'nvnCommandBufferClearTexture',
     'nvnCommandBufferClearTexturei',
     'nvnCommandBufferClearTextureui',
+    'nvnCommandBufferSetProvokingVertexMode',  # Android Vulkan 可用，Metal 仍是桩
 }
 
 def classes():

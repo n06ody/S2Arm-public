@@ -36,7 +36,7 @@ export VK_LAYER_SETTINGS_PATH="$out/vk_layer_settings.txt"
 failed=0
 for dq in 0 1; do
     if [ "$dq" = 1 ]; then export S2A_TEST_NVK_DQ=1; else unset S2A_TEST_NVK_DQ; fi
-    for arm in off gap overlap pending alias; do
+    for arm in off gap overlap pending alias exact-pending-gap exact-pending-hit exact-grown-gap span-pending span-read; do
         marker='^MIRROR_HOIST '
         if [ "$arm" = alias ]; then marker='^VPOOL_ALIAS '; fi
         log="$out/dq$dq-$arm.log"

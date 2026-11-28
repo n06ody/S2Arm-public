@@ -37,10 +37,66 @@ namespace S2A.DirectCompiler
         //   原先三段都沿用 Ryujinx ShaderCache.DefaultFlags（= DebugMode），是出库链 11-07 改口径时没跟上的遗留。
         internal static TranslationFlags GraphicsFlags(string stage) => stage == "gs" ? ShaderCache.DefaultFlags : ShaderCache.DefaultFlags & ~TranslationFlags.DebugMode;
 
-        public static byte[] Compile(byte[] requestUtf8)
+        public sealed class PhaseProbe
+        {
+            private readonly Func<long> _cpuNow;
+
+            public PhaseProbe(Func<long> cpuNow) => _cpuNow = cpuNow;
+            public string RequestSha { get; internal set; }
+            public long SpirvWallTicks { get; private set; }
+            public long SpirvCpuNs { get; private set; }
+            public (long WallTicks, long CpuNs) Parse, Translate, Reflect, Serialize, InputCopy, Emit;
+
+            public (long WallTicks, long CpuNs) Now() =>
+                (System.Diagnostics.Stopwatch.GetTimestamp(), _cpuNow());
+
+            public (long WallTicks, long CpuNs) Since((long WallTicks, long CpuNs) start)
+            {
+                var end = Now();
+                return (end.WallTicks - start.WallTicks, end.CpuNs - start.CpuNs);
+            }
+
+            internal void BeginSpirv()
+            {
+                TranslatorContext.SetSpirvPhaseSample((wall, cpu) =>
+                {
+                    SpirvWallTicks += wall;
+                    SpirvCpuNs += cpu;
+                }, _cpuNow);
+            }
+        }
+
+        public sealed class ResultTiming
+        {
+            public long Metadata, Encode;
+        }
+
+        [ThreadStatic] public static ResultTiming Timing;
+
+        public static byte[] Compile(byte[] requestUtf8) => Compile(requestUtf8, null);
+
+        public static byte[] Compile(byte[] requestUtf8, PhaseProbe probe) => CompileResult(requestUtf8, probe, false);
+
+        public static byte[] CompileBinary(byte[] requestUtf8) => CompileBinary(requestUtf8, null);
+
+        public static byte[] CompileBinary(byte[] requestUtf8, PhaseProbe probe) => CompileResult(requestUtf8, probe, true);
+
+        public static byte[] EncodeLegacyResult(ReadOnlySpan<byte> result) => DirectResultWriter.LegacyJson(result);
+
+        private static byte[] CompileResult(byte[] requestUtf8, PhaseProbe probe, bool binary)
+        {
+            if (probe == null) return CompileCore(requestUtf8, null, binary);
+            probe.BeginSpirv();
+            try { return CompileCore(requestUtf8, probe, binary); }
+            finally { TranslatorContext.SetSpirvPhaseSample(null, null); }
+        }
+
+        private static byte[] CompileCore(byte[] requestUtf8, PhaseProbe probe, bool binary)
         {
             // 诊断：拒收行带上请求 sha，真机上就能把拒收与同一条请求对上（不用另开请求落盘开关）。
+            var parseStart = probe?.Now() ?? default;
             _requestSha = Convert.ToHexStringLower(Sha256.HashData(requestUtf8));
+            if (probe != null) probe.RequestSha = _requestSha;
             using JsonDocument document = JsonStrict.Parse(requestUtf8, MaxRequestBytes);
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
@@ -82,6 +138,8 @@ namespace S2A.DirectCompiler
             bool linkMapDiag = JsonStrict.OptionalBool(root, "linkMapDiag", "request", false);
             if (linkMapDiag && !linked)
                 throw new DirectCompileException("UNSUPPORTED_PROGRAM", "linkMapDiag requires requiresLinkedVaryingInterface");
+            if (program.StageOf("tcs") != null && !profile.TessellationShader)
+                throw new DirectCompileException("UNSUPPORTED_PROGRAM", "tessellationShader is not enabled in the profile");
             if (program.StageOf("gs") is DirectStage gs)
             {
                 if (!profile.Caps.SupportsGeometryShader)
@@ -94,6 +152,8 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("UNSUPPORTED_PROGRAM", "GS slot does not hold a geometry shader header");
             }
             _ = sourceParserVersion;
+            if (probe != null) probe.Parse = probe.Since(parseStart);
+            var translateStart = probe?.Now() ?? default;
 
             var queries = new List<DirectQuery>();
             var allocator = new DirectAllocator(profile) { RequestKey = requestId };
@@ -139,8 +199,8 @@ namespace S2A.DirectCompiler
                 }
                 else
                 {
-                    // NVN 槽序 VS/FS/GS 与执行序不同；解码后按实际管线顺序显式串联。
-                    var ordered = new[] { (name: "vs", index: 1), (name: "gs", index: 4), (name: "fs", index: 5) };
+                    // NVN 槽序与执行序不同；解码后按实际管线顺序串联。
+                    var ordered = new[] { (name: "vs", index: 1), (name: "tcs", index: 2), (name: "tes", index: 3), (name: "gs", index: 4), (name: "fs", index: 5) };
                     var contexts = new List<(DirectStage stage, DirectGpuAccessor accessor, TranslatorContext context)>();
                     foreach (var item in ordered)
                     {
@@ -152,9 +212,10 @@ namespace S2A.DirectCompiler
                     }
                     for (int i = contexts.Count - 2; i >= 0; i--)
                     {
-                        // Only a directly paired VS->FS uses the actual fragment inputs.
-                        // Keep VS->GS and standalone-stage translation policy unchanged.
+                        // 直接接片元的细分求值阶段使用实际的片元输入位置。
+                        // 其余细分接口沿用 Ryujinx 的阶段链接（含逐控制点与逐补丁属性）。
                         if (contexts[i].stage.Stage == "gs" ||
+                            (contexts[i].stage.Stage == "tes" && contexts[i + 1].stage.Stage == "fs") ||
                             (linked && contexts[i].stage.Stage == "vs" && contexts[i + 1].stage.Stage == "fs"))
                             contexts[i].context.S2ASetNextStageActual(contexts[i + 1].context);
                         else contexts[i].context.SetNextStage(contexts[i + 1].context);
@@ -173,6 +234,8 @@ namespace S2A.DirectCompiler
                 throw new DirectCompileException("TRANSLATION", error.GetType().Name + ": " + error.Message);
             }
 
+            if (probe != null) probe.Translate = probe.Since(translateStart);
+            var reflectStart = probe?.Now() ?? default;
             foreach (DirectGpuAccessor accessor in accessors)
                 if (accessor.Diagnostics.Count != 0)
                     throw new DirectCompileException("TRANSLATION_DIAGNOSTIC",
@@ -183,10 +246,16 @@ namespace S2A.DirectCompiler
             ResolvePoolSlots(translated, allocator);
             ResolveStorageSlots(translated, allocator);
 
+            if (probe != null) probe.Reflect = probe.Since(reflectStart);
+            var serialStart = probe?.Now() ?? default;
             bool v2 = allocator.Bindings.Any(b => b.SamplerSlot >= 0 || b.ConstSampler >= 0 || b.Pool != null);   // 新字段（samp_slot / constSampler / pool）都按 v2 写：v1 宿主不认就整份拒
-            byte[] content = WriteContent(program, profile, translated, allocator, queries, v2);
-            string contentHash = "sha256-" + Convert.ToHexStringLower(Sha256.HashData(content));
-            return WriteEnvelope(session, generation, requestId, content, contentHash, v2, linkMapVs, linkMapFs);
+            long start = Timing == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
+            byte[] content = WriteContent(program, profile, translated, allocator, queries, v2, binary);
+            string contentHash = binary ? null : "sha256-" + Convert.ToHexStringLower(Sha256.HashData(content));
+            byte[] envelope = WriteEnvelope(session, generation, requestId, content, contentHash, v2, binary, linkMapVs, linkMapFs);
+            if (Timing != null) Timing.Encode = System.Diagnostics.Stopwatch.GetTimestamp() - start - Timing.Metadata;
+            if (probe != null) probe.Serialize = probe.Since(serialStart);
+            return envelope;
         }
 
         // 与 runtime/direct/control.c、merge_extract.py:cs_facts 同口径：+0x748 三组、+0x754 shared，
@@ -633,7 +702,7 @@ namespace S2A.DirectCompiler
             }
         }
 
-        private static void WriteRanges(Utf8JsonWriter writer, int[][] ranges)
+        private static void WriteRanges(DirectResultWriter writer, int[][] ranges)
         {
             if (ranges == null) { writer.WriteNullValue(); return; }
             writer.WriteStartArray();
@@ -648,10 +717,9 @@ namespace S2A.DirectCompiler
 
         private static byte[] WriteContent(DirectProgram program, DirectProfile profile,
             List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)> translated,
-            DirectAllocator allocator, List<DirectQuery> queries, bool v2)
+            DirectAllocator allocator, List<DirectQuery> queries, bool v2, bool binary)
         {
-            using var stream = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
+            using var writer = new DirectResultWriter(binary);
             {
                 writer.WriteStartObject();
                 writer.WriteString("contract", v2 ? "s2a-direct-program-content-v2" : ContentContract);
@@ -665,9 +733,11 @@ namespace S2A.DirectCompiler
                 if (program.Kind == "compute")
                     {
                     writer.WriteBoolean("hasUnalignedStorageBuffer", program.Compute.HasUnalignedStorageBuffer);
+                    long readStart = Timing == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
                     var c0 = allocator.Bindings.Where(b => b.Stage == "cs" && b.Kind == "uniform" && b.Slot == 0).ToArray();
                     int[][] reads = c0.Length == 0 ? Array.Empty<int[]>() : c0.Length != 1 ? null :
                         DirectComputeC0Reads.Analyze(translated[0].shader.BinaryCode, c0[0].Set, c0[0].Binding);
+                    if (Timing != null) Timing.Metadata += System.Diagnostics.Stopwatch.GetTimestamp() - readStart;
                     writer.WritePropertyName("c0Reads");
                     if (reads == null) writer.WriteNullValue();
                     else
@@ -684,8 +754,10 @@ namespace S2A.DirectCompiler
                 }
                 if (program.Kind == "compute")
                 {
+                    long readStart = Timing == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
                     int[][] supportReads = DirectComputeSupportReads.Analyze(translated[0].shader.BinaryCode,
                         0, profile.Support.Binding, profile.Support.RequiredSize, out var supportScaleRanges);
+                    if (Timing != null) Timing.Metadata += System.Diagnostics.Stopwatch.GetTimestamp() - readStart;
                     writer.WritePropertyName("supportReads");
                     if (supportReads == null) writer.WriteNullValue();
                     else
@@ -727,7 +799,7 @@ namespace S2A.DirectCompiler
                     writer.WriteString("c1Source", stage.C1Source);
                     writer.WriteNumber("constantBufferUse", stage.ConstantBufferUse);
                     writer.WriteBase64String("spirv", shader.BinaryCode);
-                    writer.WriteString("spirvSha256", DirectStage.Sha256Hex(shader.BinaryCode));
+                    if (!binary) writer.WriteString("spirvSha256", DirectStage.Sha256Hex(shader.BinaryCode));
                     WriteInfo(writer, shader.Info);
                     writer.WriteNumber("stateReadFlags", accessor.StateReadFlags);
                     writer.WriteNumber("attributeReadMask", accessor.AttributeReadMask);
@@ -736,14 +808,19 @@ namespace S2A.DirectCompiler
                         // 图形阶段的 c0（驱动常量段）读集：回放据此判断间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
                         // 分析不出（非标准布局、多个 c0、下标取值界证不了）= null = 未知，消费端照旧拷；没有 c0 绑定 = []。
                         // 非常量下标按取值界记整段（boundDynamic）：证得够不着 0x644 所在的 vec4 才算不读。
+                        long readStart = Timing == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
                         var stageC0 = allocator.Bindings.Where(b => b.Stage == stage.Stage && b.Kind == "uniform" && b.Slot == 0).ToArray();
                         int[][] stageReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
                             DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding, boundDynamic: true);
+                        if (Timing != null) Timing.Metadata += System.Diagnostics.Stopwatch.GetTimestamp() - readStart;
                         writer.WritePropertyName("c0Reads");
+
                         WriteRanges(writer, stageReads);
                         // 同一内容同时携带无动态定界的原始读集，运行时只选消费策略，不改变缓存身份。
+                        readStart = Timing == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
                         int[][] staticReads = stageC0.Length == 0 ? Array.Empty<int[]>() : stageC0.Length != 1 ? null :
                             DirectComputeC0Reads.Analyze(shader.BinaryCode, stageC0[0].Set, stageC0[0].Binding);
+                        if (Timing != null) Timing.Metadata += System.Diagnostics.Stopwatch.GetTimestamp() - readStart;
                         writer.WritePropertyName("c0ReadsStatic");
                         WriteRanges(writer, staticReads);
                     }
@@ -817,10 +894,10 @@ namespace S2A.DirectCompiler
                 writer.WriteEndArray();
                 writer.WriteEndObject();
             }
-            return stream.ToArray();
+            return writer.Finish();
         }
 
-        private static void WriteInfo(Utf8JsonWriter writer, ShaderProgramInfo info)
+        private static void WriteInfo(DirectResultWriter writer, ShaderProgramInfo info)
         {
             writer.WriteStartObject("info");
             writer.WriteString("stage", StageName(info.Stage));
@@ -848,7 +925,7 @@ namespace S2A.DirectCompiler
             writer.WriteEndObject();
         }
 
-        private static void WriteBuffer(Utf8JsonWriter writer, BufferDescriptor descriptor)
+        private static void WriteBuffer(DirectResultWriter writer, BufferDescriptor descriptor)
         {
             writer.WriteStartObject();
             writer.WriteNumber("set", descriptor.Set);
@@ -860,7 +937,7 @@ namespace S2A.DirectCompiler
             writer.WriteEndObject();
         }
 
-        private static void WriteTexture(Utf8JsonWriter writer, TextureDescriptor descriptor)
+        private static void WriteTexture(DirectResultWriter writer, TextureDescriptor descriptor)
         {
             writer.WriteStartObject();
             writer.WriteNumber("set", descriptor.Set);
@@ -887,11 +964,10 @@ namespace S2A.DirectCompiler
         };
 
         private static byte[] WriteEnvelope(ulong session, ulong generation, string requestId,
-            byte[] content, string contentHash, bool v2,
+            byte[] content, string contentHash, bool v2, bool binary,
             IReadOnlyDictionary<int, int> linkMapVs = null, IReadOnlyDictionary<int, int> linkMapFs = null)
         {
-            using var stream = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false }))
+            using var writer = new DirectResultWriter(binary, frame: binary);
             {
                 writer.WriteStartObject();
                 writer.WriteString("schema", v2 ? "s2a-direct-program-v2" : ResultSchema);
@@ -900,7 +976,7 @@ namespace S2A.DirectCompiler
                 writer.WriteNumber("generation", generation);
                 writer.WriteString("requestId", requestId);
                 writer.WriteEndObject();
-                writer.WriteString("contentHash", contentHash);
+                if (!binary) writer.WriteString("contentHash", contentHash);
                 writer.WritePropertyName("content");
                 writer.WriteRawValue(content);
                 if (linkMapVs != null && linkMapFs != null)
@@ -923,7 +999,7 @@ namespace S2A.DirectCompiler
                 }
                 writer.WriteEndObject();
             }
-            return stream.ToArray();
+            return writer.Finish();
         }
     }
 

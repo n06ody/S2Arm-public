@@ -1,0 +1,404 @@
+local/android-staging
+仅作本地合流、宿主验证和出包。禁止向远端推送此分支。
+独立 PR 从对应功能分支送审。组合验证失败时回到最近记录的已验底座。
+
+主线基底 da8902604766cfa404392d1d5847ae49eb53861b
+已验源码头 458a0d475d5f903b77a123aff13d32c6a24e0306
+已验源码树 66c4c4bb0697254df2914527ef9cbbe62ca11a6e
+
+组成与来源
+- Gap #1 51c8750c，Gap #2 ccd8b039，Gap #3 bc5e9f45
+- Gap #4a d31b0f89，Gap #4b 42bc0576，Gap #5 d3a23565
+- Track A c3f34e9a 的逻辑和夹具
+- Track D 19d22dea2、ae179cee8、b312bd2c8
+- Track A2 1d54a823，采集属性 nvk_libpack_fout_capture 缺省 0
+- #40 3dd66bc1，合流后片元特化表保留客体常量和守卫各自的 SpecId
+
+九轨已验载荷从 751e86b0 合流，保留 D24 替换存储与 RGB 回读两条路径，
+补入 Gap #5 当前 3D 拷贝夹具。底座继承 Track B v2 和 Track D 依赖的分相计时。
+v4 本地源码头 49c71942542a1143a876b1b973aafcf1535ce95c
+底座回退点 bf22014687272f123cf3a6b5e33cd665bd663022
+Track B v4 来源 c835c048f8e6927427ecdbd9f9bef0f6f42137aa。
+先叠前序 fa1192f7806756b56f194d08a36d6f2e8b0f8d99，再叠保持 GS 装配的
+已测整合提交 496f2c8a3ec4adb888187ecfd6082e18634b9025。
+h-4675 独立源码和 v3b 整合头验证通过，含 56 项命令审计及混合提交、
+直接/间接派发、多绘和真实请求变更负控。v4 整包实机待测。
+
+宿主验收 h-4672（独立快通道）
+- NVN 契约 v27，89 个签名、28 个互不重叠的能力位。
+- 管线特化与视口重排在 DQ=0 和 DQ=1 均通过。
+- 发白正例 failures=0，客体有限红色用非默认特化常量。
+- 关闭守卫的负对照四臂各 0/8，夹具按预期拒绝，Vulkan 校验错误 0。
+- 3D 拷贝双向、有效对照及 BC 边界通过，典型变异 3/3 被拒绝。
+
+Gap #1 复审合流
+- 来源 e5907f40e9059891e08fcd6c669a913666d59d5a，宿主快票 h-4682，整仓票 h-4683。
+- 保留合流底座的提交前瞻、二进制编译结果和 SSBO 窗口口径。
+- TCS/TES 按需分配与释放，预热程序清单 v3 保存五个 NVN 槽。
+- 合流受测源码头 8cd096d12d5f10994bb96d2ebb5a1b1ce614bbd0（树 e9d243417f6ab7f309f4ce560313475de1022fb3）。
+- h-4684 宿主通过，Track B 18 组 281 项、Vulkan 像素及 VVL 同步校验 0 错、真实编译和跨局预热。
+- 合流宿主编译器闭包 s2a-dc1-709a970ec8aa3e7d970de2cb5f848691be9b0cece83c76b9da67c09ab779c781。
+- v4 出包回退点 3a17490f1ed28e571afe93f7ed3bb68f60e7199f，已发 v4 对应下列资源身份。
+
+同根库 sha256-15db2c6ce44dfcd715176a02e8ea238528c61aa23763c63e3c24644280b99a4b
+直连闭包 s2a-dc1-5b712ef652351d5cf1647dbd195ba5175bf6bf2d5c1a17ac0f2d77ebcb2b6bd9
+
+Track B v5 滚动底座
+- 来源 e81f722b19170326e0bb7bd20f315ab00d7d202a（父 49c71942542a1143a876b1b973aafcf1535ce95c），本地源码头 7afd27eeedefff1d4c1a99c95033e0783e285ad5。
+- 回退点 45e0d16f0bfcc8a4eb5300bc8a5ac8f3a7313dad。h-4686 宿主快票 372 断言、8883 回放全过。
+- 单变量 v4b 从封版 3a17490f1ed28e571afe93f7ed3bb68f60e7199f 单独叠 v5，使用其同根资源。
+
+宿主修复叠入
+- 回退点 6665014a9be2534d9fbc1558c7da541ca9788608。
+- GPU 频率节点拒绝后停止轮询，来源 ce19a852ee8c39a30695b81b22b1bf7354aea72f，本地 f66eb2c362c672110b005c61a4d9d3a51bf66170。宿主 192 项三次通过，撤回后重红，NDK 29 核验通过。
+- 线性 2D 贴图写保护未落地时完整重传，来源 f98e39e755a4a3d991307713c93d1a6103f2bf74，本地 971a890491cbca3675e6d6342b1bd4affff1d430。h-4691 资源 4935×2、回放 7796 / 7551 及 NDK 29 通过。
+
+热点管线预热与驱动缓存
+- 回退点 69e6558a465f4f0524267b93b0a7540c1e7944a5。
+- 来源 1f82a22e9a1686ba7b66a14d63ada9397e76ab75，本地源码头 4b6fcf8546475450df4657acc738b75a9d2dd7f5。
+- 按完整程序身份交错预热热点配方。nvk_warm_reactive 缺省关闭。
+- 驱动缓存按内容摘要确认变化，保留同长更新。h-4701 的调度、模块、缓存和 NDK 29 四项通过，C89 的 Vulkan 同步校验无报错。合流真机待测。
+
+分离 GPU 回写
+- 回退点 e1fc9bf027242de0354ed2b7e0e19fd61076dc18。
+- 来源 199a394ea85793d793ceba3b6eb1d4b59a6b9c9d，本地源码头 1ab586b0b15ec2c20a047bc450dce2fdbbbfca27。
+- 保留合并保护区，直接与暂存路径只搬已证写入的并集，未知或超限走完整包络。
+- h-4702 宿主夹具实拷 36864 → 8192 字节，专项 68 项无失败，回放 7866 / 7621，NDK 29 编译通过。合流真机待测。
+
+闲置深度模板附件
+- 回退点 346b1c1dbdeb5feb907c95e22c31fb06a9460f1b，整合源码头 8b7edebd52aefe89c0506b1d9f63b6e88384fb3e。
+- 按实际 LOAD/STORE 记录附件读写；有完整证据的闲置深度模板附件可省略。
+- h-4714 的 DQ=0/1 双臂共 36 例通过，VVL 与 SyncVal 0 错。撤回对照命中裁剪断言，颜色与深度模板读回正确。NDK 29 arm64 链接通过，合流真机待测。
+
+TBDR、间接 GS、边框色和 Vulkan 管线预算
+- 整批回退点 3987a3dabb853b57ff4f99ba4fe131df0d5ed59b，实测合流源码 53fd139e9c3df07ac9ebc7039a0af17e0170b532。
+- TBDR a2738ad7352743e59f6b142ad1eac5d8a08c581a 直接快进，保留原阶段绑定与 LOAD/STORE 观测。h-4730 双开关 120 例、闲置深度模板 36 例通过，VVL/SyncVal 0 错、撤回按预期失败、NDK 29 链接成功。两个新开关默认关。
+- PR #2298 来源 6974cfce3c2c94eeec63c27278d76185d3f68460，合流 4d12136ab83d1a553c7720dfb812f7a2c64c4cd5。间接三角带和扇沿用原生拓扑，直接绘制保留顺序展开；提交前瞻复用相同拓扑判定。
+- 无格式边框色来源 ad498d8e56438bd0924fe43492ff5c005ffb125e，合流 24ab111e3fdfff806cbe5f3ecaa583dc7c4c44ce。保留已有测试模式，新增 --sampler-border-only。驱动只支持带格式自定义颜色时，为浮点和整数取最近的核心边框色。
+- 管线预算来源 5ea49eb3fbd6433f1e1515f53c26bb5a5264af5e，合流 53fd139e9c3df07ac9ebc7039a0af17e0170b532。软封顶缺省 8192 条 VkPipeline，淘汰同时核持有引用和完成证明。独立全量已排 h-4746，优先级 3。
+- h-4747 合流回放 8970 / 8689 项通过；GS 双录制模式、边框色 0 失败、LRU 双臂 16/16 像素和撤回对照通过，VVL/SyncVal 0 错，NDK 29 arm64 链接 142 个目标、旧源 0。真机收益待测。
+
+Track A2 与 v5a
+- 回退点 07dba3d76808aebfe92aba475a5a960eb1559010。来源 f54e9ccfe4251ea97ba356b9bbdf0a01ce5512cf，三次拣入后冻结出包源码 e7604eafda092278a32ab5c564042dffbc813c49，树 3372485d34f4d440ca90998615b18538c8e7870a。
+- Vulkan 直连库按片元输出数值类带变体，实绑目标选择 uint/sint，保留原模块并可收集未烘请求。v5a h-4759 使用 8E 与 9000 封存归并所得 102 键，原表 SHA-256 3313caf311227e256658a0c319374032d005f18ef2cbbe3d99da5892c5b1e6ef。
+
+Vulkan 图像专用显存
+- 回退点 e7604eafda092278a32ab5c564042dffbc813c49。独立源码 47dfc6c50a02e750ad68f996287a633c2691c188，合流源码 6bd0cf18fa824bf961b0c685db6712456bee34af。
+- 普通图像查询 Vulkan 1.1 专用分配要求，驱动强制时独占绑定。debug.s2a.nvk_dedicated_rt_alloc 缺省 0，为 1 时采用颜色与深度模板附件的驱动偏好。可选分配失败恢复普通路径，专用显存随图释放。稀疏图像沿用原要求查询、地址记账、绑定和回收。
+- h-4758 修前 preferred 期望 1 → 实际 0。h-4761 与 h-4766 开关两臂各颜色 16/16、深度 16/16，必需专用和可选失败回退均通过。h-4766 稀疏四类写入 × 两臂回读与重映射全过，VVL/SyncVal 0，NDK 29 交叉链接 142 个目标、旧源 0。独立全量 P3 h-4767 已排，真机压缩和带宽待验。
+
+v5a 签名交付
+- h-4759 rc=0。APK /Volumes/Storage/s2a-work/nine-track-v5a-kune-e7604eafda09/artifact/app-debug.apk，SHA-256 7d46fbd0701a94c79360cc8e2d3435d73c1c067ae0cdeb359b479f4cd2db35a4。发车预检通过，签名及资源绑定已报 Lina 与 QA。
+- 烘焙实际 fout_want.tsv SHA-256 db88e9a10134e1fe3146906bf2cd8c0b0a65a131b1076d55de46fc6f3b6fb87a。102 个请求键均新增精确掩码的 Vulkan `kind=125` 条目，102/102。LibPack 9060 键、18222 段，旧计算着色器 c3b603d8e01d4652 的翻译缺口与 v4b 相同，保留现编路径。真机接包验证由 QA 执行。
+
+颜色矩形载入清除、遍间状态复用、反馈环和动态线宽
+- 整批回退点 cd433c1b4191467899d1af541d011aa14dd83b30。
+- Color LOAD 来源 004da2e03f885d7a4b7f6bf1fb52c8b239055942，合流 402af1669c1af5df0dcd9e715f9fcc8fea7e1b6b。原点全掩码单采样 RGBA8 且下一条命令换目标时以小帧缓冲做 LOAD_OP_CLEAR，读回证实外侧像素保留。h-4754 修前裁剪断言红，h-4778 四臂 52/52，撤回恢复 LOAD。
+- 遍间状态来源 996c330c089ce4d4bf6385b120a95553894cf93e，合流 ded46eb997134fc20c8d7d1bc5e2e76e657bd431。同一主命令缓冲保留已录状态，显式改写和新命令缓冲重新发出。开关 nvk_pass_state_keep 缺省 0。h-4778 20/20、81920/81920 像素，DQ=1 记录调用 126 → 100，两臂撤回各命中 3 条状态断言。
+- #14 反馈环来源 8d3cad7d26786e513c8ae710bad322655169a666，合流 14e7332eb2574b4ca0346d7530b14eacb5f78aab。保留独立遍间状态与反馈环开关；设备特性和 nvk_feedback_loop_ext 共同准入，缺省 0。h-4778 扩展专项 48/48，屏障撤回捕获 6 条预期同步告警，原反馈与原只读反馈回归通过，正向 VVL/SyncVal 0，NDK 29 链接 142 个目标、旧源 0。
+- 动态线宽来源 4fe17b34b1899c2fc99e86a46cd6e2f376e326a3，合流 2dbd9d7ae5f7035c915fbefdaa7dbd013879e3f4。合流保留边框色和扩展格式读回入口，设备能力夹具同时保留两档 sparse 屏蔽和宽线屏蔽。h-4784 的两档 sparse 预期误取原驱动能力，按实际查询屏蔽修正夹具。h-4786 宽线四区覆盖开启 1/5/1/0、隐藏 1/1/1/0，设备能力 11/11、timeline 负控、边框色 0 失败、读回 40/40、回放 8972 与 8691 项均 0 红、命令影子双线程模式及 NDK 29 通过。真机实测待验。
+
+EDS1、EDS2、VIDS 与图像屏障合批
+- 整批回退点 920be840391f8d9055daded2cbc8d9ec43497f6e。EDS 源 12a8cbc57bdd8c5aec34d8ff2ccf70f6d9356014，合流 ff7cd2fc09108dcf21331e891406ea2a5e4e35ea。先按设备能力建规范 PSO，再保留完整逻辑句柄。#15 的显存驱动对象预算、在途引用、淘汰及恢复统一落在规范所有者上；预热、视口 swizzle、#14 反馈环、动态线宽照原契约。
+- h-4802 的 DQ 校验暴露 vkCmdSetLineWidth 有包装而宏未接线。合流补接既有 cmd 记录包装，恢复绑定、动态线宽后绘制及录制线程的顺序。
+- 屏障合批源 e46143d73da4c4392a57063e442d22f33b72a7d8，合流 83ba5ba84c43bb32f1371c501bb0f6b6cd6cefe4，nvk_image_barrier_batch 缺省 0。保留 scaled32 失效标记与反馈布局转场，只合并相邻同阶段且不共享图像/分配的屏障。#14 的遍内 WAR 屏障仍在原位置。
+- h-4810 rc=0。EDS DQ 双臂 14 → 2 条 VkPipeline、每臂 15 笔 960 字节逐字节同正控，撤回按预期恢复 14；#15 两种 DQ 和普通/动态别名四臂各 16/16，淘汰、恢复、在途与 OOM 对照通过。屏障八臂 40960/40960 像素，#14 双开关和回退合计 80/80，预期屏障撤回命中 6 条告警，正向 VVL/SyncVal 0。扩展格式 40/40、设备能力档、NDK 29 链接 142 个目标/旧源 0。
+
+LOAD/STORE NONE 与 #2298 GS 夹具
+- 整批回退点 4bed265933ea88e4ddc1686f4a45da6f0e224b09。LOAD/STORE NONE 源 3d923cdb2fc1d1fc50089e2da20c2303215726ff，合流 97af4bb725c2d2b532781f165c70eb6940731ae5，测试提交 0653c39073c5835f579382d27ab7ce2697575e80。nvk_load_store_op_none 缺省 0，反馈环活动附件保留原载入/存储，其他附件按实际读写选操作。夹具在动态深度/模板管线上使用实际录制状态。
+- h-4813 rc=0。LOAD/STORE NONE 六档共 60/60，撤回遍内升级命中预期 unsafe_w 和 unsafe_r。反馈环 112/112，其中反馈环、屏障合批、LOAD/STORE NONE 同开 32/32；撤回反馈屏障捕获预期 6 条同步告警。屏障合批 40960/40960 像素、清除 52/52、遍间状态 81920/81920 像素。正向 VVL/SyncVal 0，NDK 29 链接 142 目标、旧源 0。
+- #2298 夹具源 85dc5c3127360d4457f71542381ff642b47a09f6，合流 55aee70f2916a6101c99a13af7518fbe5b8d9ab9，测试提交 63268ec7633409b09dc7e522868212c103c38c59。仅改 android/tests/vk/t_backend_vk.c。h-4814 rc=0，直接展开与原生间接三角带/三角扇的像素和资源 0 处不符，VVL/SyncVal 0。两笔合流逐一核过源码树与对应测试提交一致。
+
+矩形清除复用描述符影子
+- 回退点 0af55fd8df303e6d4dbd4fe70f7b17a6a257162f，源 bddb1152fa0db32d9bdeff22feb1fe2a2547558f，合流 14a8e5fded34f116ce10f7d257bc02bc215283a5。nvk_desc_keep_rect_clear 缺省 0；仅同一已开通道的普通清除保留描述符影子。清除使 NONE 附件升级重开、命中反馈重开或局部通道时保留原失效路径。
+- h-4826 rc=0，普通清除八臂 32768/32768 像素，段一图形绑定 4 → 3，段二累计 5 → 4；NONE 升级四臂 16384/16384，仍按 4/5 重绑。撤回升级失效四臂各命中两条绑定计数断言，仅这些预期 FAIL 行被队列摘要误判为红。正向 VVL/SyncVal 0，LOAD/STORE NONE、#14 反馈环、EDS、纯清除、遍间状态回归与 NDK29 链接 142/旧源 0。
+- h-4831 rc=0，同一合流提交 12/12 场、49152/49152 像素、VVL/SyncVal 0；两个原有绑定次数撤回各命中 2 条。计数为宿主记录调用。
+
+推描述符
+- 回退点 425f3fc327b1994ff48c0f13c59092a2bf094338，源 727a086e099fe51db1fbb4f80e550f38057eb5aa，合流 72122eb28b95c523cd9f37b2c825e01923c46c9b，测试提交 19ad816f2e987678ac137c232a11649e5a855291。nvk_push_desc 缺省 0。仅扩展、可用入口和上限同时成立才用；整池组、超限组和能力不足走常规描述符。
+- EDS 逻辑别名沿用规范管线的推组编号；#15 淘汰后重建沿用原有常规组动态 UBO 模式。h-4834 rc=0，六档共 46/46，包含非零推组的别名四个开启档与两个回退档。上限撤回抓到 flags-00281，正向 VVL/SyncVal 0。推描述符与矩形清除复用同开、双录制的四臂读回 16384/16384；反馈快照、只读反馈、#14、图形管线预算、设备能力与双模式 NDK29 符号均通过。
+
+平直插值主顶点
+- 回退点 805a0a31985540d8d4b9f5e7fc9db177500c2ad6，源 4bad07d3f241d9ccc400ed7d1501cb162fe9f330，合流 e888a1a59fc78379551e18c7c96968caa47f9bc3，测试提交 5cc5a49853b0f059e8e27cea52ec9fcb982a4e4e。用独立能力位 28，网格 26、稀疏 27 仍保留。主顶点进入逻辑与规范 PSO 键，并保留视口 swizzle。预热沿用原配方大小，旧记录解释为 FIRST。
+- h-4840 rc=0。两个录制模式、四个能力档合计 32768/32768 像素；正常档四次绘制、一个 LAST 管线，隐藏扩展、末顶点特性或逐管线能力时每臂各具名跳过一笔。VVL/SyncVal 0，EDS、#15、推描述符、设备能力和预热模块回归通过，t_nvn_replay 8671 项红 0、NDK29 链接 142/旧源 0。
+
+#27 分代缓存池镜像
+- 回退点 f1430ff7b3289a1d656ad8e478a858217f081875，源 116246cdfc5564093c601815bae2ad6634778f9f，合流 e3abac6238cb4ea3fbc218756570f04b1a956a43，测试提交 db24a8c9552bd83a39bfb777e6ad6e946c2250c9。源补丁与 h-4792 的 893abae3ab34affdcdbf6683d70770d15c34ed66 patch-id 相同。nvk_land_cached 与 nvk_land_upload_versions 缺省 0。
+- 共享分离回写快照的完整槽数组，按实际跨度失效缓存，保留 #15 提交引用与旧镜像范围的栅栏顺序。缓存加分离回写在宿主夹具拷 8192 字节、客体 0 字节不符。撤回到按引用数遍历时漏掉第二个跨度，4096 字节不符。
+- h-4844 测试头 314e586a7e242a3834068dd2047cf13066ffbf6c。宿主回放 9066/8783 均 0 红，分离回写 89/89、缓存镜像 22/22、轮转三个配置 82/82。真驱动缓存镜像 16 场、写回上界、主顶点、网格、3D 拷贝与 NDK29 142/旧源 0 通过。唯一失败为 LibPack 阶段撤回找旧表达式。h-4849 rc=0，更新同一阶段参数的撤回锚后，LibPack 正向和四撤回全部通过。两票生产源码一致；真机性能由后续包验证。
+
+管线缓存控制
+- 回退点 8e88347d9236c35268c943e31025783871d02a24，源 9b8f54d6b9b52a6cf89acf00a2b06f8745613ba7，合流与实测 c1b7d54a6a8fe159bf974b5a7c426bac117d2184。nvk_pipe_cache_ctl 缺省 1，扩展和特性齐备才探测，冷配方仍交后台。缓存命中走现有规范 PSO 安装与 #15 预算。恢复使用原布局，逻辑别名与推组沿用原身份。
+- h-4863 rc=0。原六臂含撤回；新增 DQ 两臂在管线预算 1 下淘汰并恢复同一 EDS 别名，两臂各 4 次真实推描述符、1024/1024 像素。正向 VVL/SyncVal 0，EDS、#15、推描述符、反馈环、设备能力档、demand ASan、NDK29 链接 142/旧源 0 通过。
+- llvmpipe 的盘缓存为 32 字节头，热命中由夹具模拟并用真 VkPipeline 绘制。冷探测返回由驱动提供。v6 的二启动命中率与卡顿降幅待真机。
+
+分离深度模板布局
+- 回退点 0e7b9281f243f0b72a3f35d2d1184111b26162f0，源 6ed8a80772e286c77ef8bd2806d41e6d6efdef19，合流 36c62e6079c6b36f5d6f370741ed62a2ca0bb6c0，测试提交 95ca0601ef34b49052de247d3f43bcf1934d4c7c。debug.s2a.nvk_sep_ds_layout 缺省 0。
+- 混合布局只给只读面保留 LOAD/NONE，原反馈环优先处理实际同图读取。触发写入或清除时先退出混合布局，图像屏障合批先提交邻接屏障再分面转场，保留清除升级的描述符失效。
+- h-4867 rc=0。20 个组合各 448/448，共 8960/8960 像素，包含反馈环、LOAD/STORE NONE、屏障合批、矩形清除复用同开四臂。布局开启臂每组深度与模板只读各两次、分面屏障 2/2、写入重开四次，VVL/SyncVal 0。反馈环 112/112、只读反馈、LOAD/STORE NONE、图像屏障合批及矩形清除回归通过。宿主回放 8740 项红 0，NDK29 交叉链接 142 目标、旧源 0。
+
+无附件帧缓冲
+- 回退点 d314c0649e7b2cd34bd8d8769a932d9dacd6819b，源 81450907f9e1fa682638d429e711e48a864ebb48，合流 604a0d1dc2949717d03bc5b41e9d6645cd3d0e18，测试提交 f53ea245dbb40fa60f9b015bf75f3f653319bd2d。debug.s2a.nvk_imageless_fb 缺省 0。
+- 按图像创建标志、实绑视图用途、尺寸和格式复用帧缓冲。开通道时传入实绑视图，DQ 深拷贝附件链。保留分离深度模板布局、反馈环、LOAD/STORE NONE 及分面屏障的既有顺序。
+- h-4871 中观察器误读无附件帧缓冲的空 pAttachments，同开四组退出 139。观察器改在开通道时取真实附件。h-4877 rc=0，专项六档共 36/36，换视图场景 FBO 创建 9 → 1、途中销毁 3 → 0，撤回创建标志捕获 8 条 framebuffer-03209。与分离布局同开四臂各 448/448 像素、10 次无附件通道，正向 VVL/SyncVal 0。反馈环、只读反馈、LOAD/STORE NONE、纯清除及 NDK29 交叉链接 142/旧源 0 通过，诊断和游戏模式各 171 个 C# 入口齐备。
+
+主机查询池重置
+- 回退点 82c51c0bd395026fbcb859cefb0fa9be0eecb053，源 dde847cc04a0c0ac4a08f7e8c21f0b58e17bdb59，合流 cf43601071458b3b29395dab5721653e70aa357d，测试提交 5c5abc2b3fcf60f3cb7baca73dd0fcb44117a9f9。debug.s2a.nvk_host_query_reset 缺省 1，Vulkan 1.1 按 EXT、特性与动态入口准入。
+- 在查询池新建或上一段退休后以主机重置。纯 report_ts 提交省前置缓冲和 ALL_COMMANDS 屏障。新图首转布局仍经前置缓冲，query_init_cb_saved 只计实际省掉的缓冲。
+- h-4885 rc=0。DQ 双档共 10 组，开启每组主机重置 12、命令内 0，段 2 与段 3 各 2 → 1 条命令缓冲，计数准确报 2；关闭或隐藏扩展、特性、入口时命令内重置 12、两个提交各 2 条缓冲。独立撤回预期红，正向 VVL/SyncVal 0。反馈遮挡 40/40，分离布局、无附件帧缓冲、纯清除、能力形态、NDK29 142/旧源 0、诊断及游戏 C# 入口各 171/171 通过。
+
+KHR 顶点实例除数
+- 回退点 ec95828e0edcc1fa89bef8941c44a39c899dab96，源 698a372e7b361ff8aa654d014b6495fda7111e5d，合流 6c84a85fb498cc390f272e1c7d13f04950a26479，测试提交 4c760c6fcc5b239f1834be04b5f4258c8d42059a。
+- 兼容只列 KHR 的设备，已有 EXT 路径仍优先。KHR 要求 firstInstance 为 0 时，逻辑管线按实际流除数拒绝条件无法证明的绘制；VIDS 共享规范 PSO 时各逻辑句柄保留自己的限制。
+- h-4892 rc=0，DQ × VIDS × 六能力档 24/24、53248/53248 像素，正向 VVL/SyncVal 0。可用档的三个逻辑除数共享一个规范 PSO，KHR 限制档每组拒绝两笔预期绘制。h-4881 源撤回去掉静态除数结构，KHR 档 3072 → 2368 像素，命中预期负控。动态状态、推描述符、回放能力、预热模块和 NDK29 142/旧源 0 回归通过。
+
+v6b 列表图元重启
+- 回退点 738315adf7c6e6ecf67169b62622b85e061d736a，源 d3779f04d0fe71b63cabce384d3dd722c9cb5c30，合流与测试 26bb65223812f37c25aca1fbb7bf06e9d62ceb21。debug.s2a.nvk_list_restart 缺省 1，列表拓扑按扩展与特性启用。
+- h-4915 专项 16/16，8/16/32 位哨兵、线列表、隐藏扩展与特性、撤回均过，正向 VVL/SyncVal 0。EDS2 同一规范管线可按逻辑句柄切重启状态，关闭时 16 个诱饵红像素，开启时 0。动态状态、缓存控制、设备形态、NDK29 142/旧源 0 通过。
+- 同票附加 GS 回放夹具缺 rp_buf_read_pointer。独立补夹具后 h-4918 与 v6 对照 h-4920 在四个原生间接场景均分别为 4/32、8/32、4/32、8/32 坏像素。该夹具留在独立诊断工作树，9-Track v6b 生产源码不改 GS 顺序。
+
+v6b 浮点混合片元源码驻留
+- 回退点 b7fd2d857ddbb56712ec1b5bb0cd2cc70ff730a9，源 0ce53b3b88a74762f21a3ffaba8b71f29e3c5640，合流 d8bd1193d0cd63cee27d4b52efe4268b7fd6e58e，测试提交 4f253d2377e4a42808bd37860911e03f04ad19c7。nvk_hitch_log=1 时每 300 次呈现并在关闭清理前报告源字节。
+- h-4917 rc=0，周期与关闭均记录新增 4 份 7920 B、释放 3 份 5940 B、驻留 1 份 1980 B。RGBA16F、MRT、预热命中及撤回通过，正向 VVL 0；缓存控制联动双臂各 1024/1024，NDK29 142/旧源 0。真机驻留数据待采集。
+
+v6b 时间线信号量完成追踪
+- 回退点 c296bb93bf0cc64fda03796ca58f87be5d818751，源 5fed911df5cbb2bee1af2977105f891daec6c6d2，合流 533762e6e20202754b9029b3fab40b8553bddcc7，测试提交 4913fedf2160231645f2fea3f6538c85e2a76c35。debug.s2a.nvk_timeline_fence 缺省 0。
+- 共用提交发布路径，管线在途与镜像写回在 worker 接手前记账，完成回调后推进客体完成值。保留呈现的二值取图与就绪信号量，并用独立时间线序号证明工作完成。
+- h-4919 的 30 个时间线正向、32 个缓存镜像、管线预算、主机查询重置、NDK29 142/旧源 0 与双模式 171/171 通过。该票撤回锚仍用旧变量名，无附件夹具在段完成值发布后、对象退引用前采了计数。
+- h-4924 rc=0。时间线 30/30、撤回抓 10 条非单调信号校验，无附件 36/36、FBO 创建 9 → 1/途中销毁 3 → 0，创建标志撤回抓 8 条预期 VUID。缓存镜像双完成证明 32/32。正向 VVL/SyncVal 0。真机呈现与收益待测。
+
+v6b OP_MULTI_DRAW
+- 回退点 0f03165efaa41a1869e90f1e17d3897df2d4a776，源 82da42b9fa140fdd243428b2577d2d26fe670e50，合流 d4bffa0c0bd8d7a787aae339ed20f0708c78a5dd，测试提交 4d0d3323ac2d739f04ec9d90679fa033adf15f24。
+- 原生 KHR 按设备上限消费 GPU 计数，字节步长或能力不足走掩码或有序读回。CPU 展开用已提交的索引快照并保留 GS 图元顺序。列表重启按后端能力改写哨兵，保留 KHR 实例除数与缓存镜像的检查。
+- h-4921 由前瞻外部参数触发 GCC 未初始化诊断，已改为直接填已初始化的着色器请求。h-4925 rc=0，KHR 显隐 × DQ 双档 52/52，含 4 组自定义 8 位列表重启、有限 KHR 上限、越界尾段及 GPU 计数；像素和段顺序未见不符，正向 VVL/SyncVal 0。GS 专项、列表重启、NDK29 142/旧源 0 通过。
+
+v6b 同步2图像屏障
+- 回退点 542be9bc73d2933f79e978240340557b0735a6af，源 947e31d10926d7606c9bcbf8e99e6c4f3a2896a7，合流 e2b6399e53b682cbbded4e3e404b7d8633464578，测试提交 7cea303418e110809cd458aa78ba20f505b23316。debug.s2a.nvk_sync2 缺省 0，能力不足沿用旧屏障。
+- Sync2 按图像屏障选择 COPY、CLEAR、BLIT 或 RESOLVE 阶段，保留独立图像屏障合批、深度与模板各自的布局、时间线完成证明和镜像写回。
+- h-4926 rc=0。Sync2 36/36，正向 VVL/SyncVal 0，阶段掩码撤回命中 20 条 VUID-03915。分离布局 24/24、10752/10752 像素，Sync2 联动 4 档均实发分离布局屏障与跨图像合批。图像屏障合批、反馈环路、时间线、主机查询重置、间接计数多绘、设备能力档及 NDK29 142/旧源 0、诊断与游戏符号各 171/171 通过。真机切换及收益待测。
+
+v6b 描述符更新模板
+- 回退点 9ab42dde3b72e83ec2228f39cb09b02910a987bb，源 23aa84f6e96df0562b155e1fd02ca1789af3d9b9，合流与测试 edbae05aae2b158d95ef6332e71cbd0583d18ee8。Vulkan 1.1 核心入口运行时解析，debug.s2a.nvk_desc_template 缺省 0。
+- 按普通描述符组布局去重，仅完整写入的非池组走模板；推描述符、整池和局部写入沿用各自路径。模板与布局一并销毁，呈现诊断窗口使用进程累计值。
+- h-4928 rc=0。模板专项 36/36，四个开启档均创建与销毁各 8、模板更新 10、传统更新 8 → 0 次及写入 12 → 0 条。关开关或隐藏核心入口均回退。错误布局模板负控命中 20 条 VUID-00350，正向 VVL/SyncVal 0。
+- 推描述符回归 62/62，含 DQ 双档共 16 个双开启用例。混合组用例保持 2 次推送，普通组从 2 次传统更新切为 2 次模板更新，像素对照无差异。矩形清屏描述符保留、反馈快照、反馈读、NDK29 142/旧源 0 和双模式 171/171 通过。真机收益待测。
+
+v6b 片元程序逐样本着色
+- 回退点 d30259cc072c98d2cc763806c2db3c5e06c178be，源 8ed5fe8541092b5de761d43c1055500612ea36eb，合流 5b30d8a9d5885e8e153aed596da2679545345688，测试 a8abcfbcd2f8b3a62c0ddca62e7ead73b42a717e。
+- 绑定捕获片元模式，32 字节 BindProgram 与 2360 字节管线描述尺寸不变，采样模式进逻辑和动态规范管线键及预热配方。先前配方读为默认模式。保留视口重排和主顶点字段，契约升级到 v28。
+- 源基线 h-4886 强制开启 4x 为 0/16。h-4949 rc=0，强制开启两次各 16/16，解析后 R=128；默认、强制关与 1x 各 16/16。隐藏能力时 4x 强制启用两次均具名拒绝，默认、强制关与 1x 均 16/16，VVL/SyncVal 0。
+- h-4940 首票发现既有 nvn_gpu_ds_writes 漏登记，签名 97 对 96。补签名与主顶点、列表重启能力位后 h-4949 97/97，录制 307862 条断言，回放两档 9078/8795 零红，预热和旧种子、NDK29 142/旧源 0 与双模式 171/171 通过。h-4941 线宽、动态状态、管线缓存、主顶点四个回归通过。宿主证据。
+
+v6b 描述符与计算绑定去重
+- 回退点 2c2b3bd6053724e8dcef856e03e570fbf234994f，源 7304b588cba3b84b718626a36b555ddf0059d1a4，合流 084e1171746922089f4876e87dbf24cdf2fdef5f，测试 a843fa8d91f7c6cde6ab73fd66e782d86d38b6a5。debug.s2a.nvk_bind_dedup 缺省 0。
+- 分图形与计算记录布局、组对象和动态偏移。推描述符组两侧的普通组各自取最小连续区间，保留独立推送与模板更新。内部计算覆盖后作废影子，计算派发时继续作废图形动态状态、顶点输入与线宽影子。
+- h-4950 rc=0，专项 36/36。DQ 两档、备忘开启时描述符绑定调用 14 → 11、绑定组 25 → 17、计算管线 3 → 1、计算 push 3 → 2。关闭备忘时绑定组 20，两种计算计数仍 1/2。错位首组负控命中 20 条 VUID-00360，正向 VVL/SyncVal 0。
+- 推描述符回归 78/78，含三项开关全开的 16 个用例。模板更新、矩形清屏描述符保留、通道状态保留、反馈读、NDK29 142/旧源 0 及双模式 171/171 通过。真机收益待测。
+
+v6b 第 35 项 热路径哈希索引
+- 回退点 780585b36343b03d0a0e16e677e70059d998a397，源 3390cf8024d6043a97b433c75ab44f3fea4b530f，合流与测试 daa80841667d70cfbe7459fc8868089848359ce1。debug.s2a.nvk_hot_hash 缺省 0。
+- 保留反馈环路通道键、Sync2 传输阶段记录、无附件帧缓冲回收和绑定去重诊断。索引分配失败走稠密表线性查找，恢复按实际容量重建。关闭开关时生产查表不累计该项诊断计数。
+- h-4966 rc=0。DQ 0/1 各三场双档，渲染通道步数 21024 → 704；段内布局 91076 → 1874/1732；活视图 1069376 → 1332/1392。全碰撞、释放及伪造句柄、分配失败后重建通过。错键负控命中 4 条 VUID-00876，正向 VVL/SyncVal 0。
+- 反馈环路、分离深度与模板布局、绑定去重、NDK29 142/旧源 0 及诊断和游戏模式各 171/171 通过。步数为宿主读数，真机收益待测。
+
+v6b 第 36 项 3D 纹理的 2D 视图
+- 回退点 0b11fce6084d9d375b2e4eb42e5f1bf3e6c46ad6，源 ffcf000c0ad4267e0ba209311117a3d6a775b5c1，合流 c28dc1212d2ce4c07ae3021ceba9bc56d60b50e1，测试 d0e5685c1c35cf404996616231747ec2166aca40。debug.s2a.nvk_image_2d_view_of_3d 缺省 1。
+- 保留既有扩展查询与启用链、设备能力档、附件用法记录和第 35 项活视图索引。支持时按采样与存储特性允许单级单层 2D 视图，缺能力时附件仍可用，采样及存储请求具名拒绝。
+- h-4967 rc=0，正常、关闭、隐藏扩展、隐藏特性与双开热哈希 5 档都过。开启档采样、存储及邻层像素正确，三档回退附件继续渲染，撤回按预期红；正向 VVL/SyncVal 0。第 35 项专项、3D BC 16/16、无附件 36/36、能力形态 28 档 × 4 与 10 个变体均过。
+- NDK29 142/旧源 0，诊断和游戏模式各 171/171。源 h-4961 的专项和形态档已过，尾部 CMake 目标不存在；后续 h-4963 和本票以实际 NDK 目标验证通过。本票为宿主与交叉链接证据。
+
+v6b 第 37 项 绘制布局与动态偏移快路径
+- 回退点 029c58db8bdcbeca6161a00818f0d997e78548e7，源 f27c84df857e06d852317c5315ae66365a4bbc67，合流与测试 833633b283f8d7d62a66031e96f6e3b145ad11c3。debug.s2a.nvk_draw_fast 缺省 0。
+- 深度模板混合布局、活动反馈环自依赖和整池免拷继续检查。图像迁移从 Sync2/传统共用路径标脏。纯偏移重绑复用普通描述符区间与绑定影子，跳过推送槽；共享动态 UBO 槽保持原写入阶段顺序，描述符内容变化仍走模板和推送。
+- h-4978 rc=0。原 6 档 24/24，布局全扫 256 → 1，逐阶段 write_binds 1280 → 5，纯偏移 255/255 命中。四开关和五开关（再开热哈希）各 DQ 双档，每档 256 笔、偏移快路径 254 次、推送 2 次、模板写 1 次。末笔推送时偏移切回首值，4 个象限像素均对位。
+- 布局脏位撤回按预期被 VVL 和像素断言拦截。正向 VVL/SyncVal 0；绑定去重、反馈环、分离布局、热哈希、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。真机收益待测。
+
+v6b 管线缓存控制复审（#2309）
+- 回退点 d5452dbd72f628b9c46be4d11ffa6e840d62b9a9，源 7986c5fbdbcecaef3b7ac7b3bde45e16b5792a20，合流 15ab0185560d4402240b4381d2ea3921dedc7005，测试 e46cec00f8eef93dcd882fa2b652d65a4f72f142。debug.s2a.nvk_pipe_cache_ctl 缺省 1。
+- 仅取得待定表建造权的请求在生命周期锁外探测。命中经待定表发布，并发 COMPILING 请求直接累计去重并返回 PENDING。保留串行创建的 trylock，锁忙交后台。
+- h-4980 直接移植红在管线预算淘汰后的别名恢复。待定表可能保留 READY，而底层 VkPipeline 已淘汰。复查当前配方是否有驻留管线，缺失时重新认领原槽恢复同一别名。h-4981 的 Vulkan 联动已通过，宿主假缓存单槽会在构建 B 时覆盖 A。夹具改为按配方同时驻留，保留显式淘汰。
+- h-4985 rc=0。首用并发、待定表及重置 19/19、缓存控制 8 个正向档及 1 个撤回、动态状态、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。串行锁忙回退，无同步建造增加；预算、EDS 别名和推描述符联动 DQ 两档各 1024/1024 像素。日志里的待定表两条 FAIL 与缓存撤回红均出自负控。宿主 Vulkan 夹具注入驱动缓存命中，真机命中率及延时待测。
+
+v6b 第 38 项 Vulkan 段与呈现 fence 池
+- 回退点 909a81120ac27d717323e527196277c68683c2e0，源 e73a0ea53a9b0b3322443e2c03747ed5930257fe，合流及专项实测 4e4b2923b87b5faa16b1f71e11845c80397fe161。debug.s2a.nvk_fence_pool 缺省 0。
+- 普通段与呈现段在关闭时间线时共用 64 个 VkFence 的池。完成线程在等待成功及回读处理后、发布完成之前回池，提交侧重置。失败段销毁。时间线开启时继续只用时间线证明完成，上屏二值信号量和呈现顺序照常。
+- h-5002 rc=0，普通段四档各 4/4。顺序 64 段创建 64 → 1、销毁 64 → 0、重置 0 → 63。两级回放两档均满池保留 64、丢弃 8，关闭后创建与销毁对齐。WSI 四档各 16 次真实上屏。两档时间线关闭均 16 次 fence 重置、0 次新建，两档时间线开启均为 16 次时间线提交、0 次 fence 创建或重置。正向 VVL/SyncVal 0，跳过重置负控命中 4 条 VUID-vkQueueSubmit-fence-00063。
+- h-5000 首轮 WSI 统计误计入会话初始化探测 fence，h-5002 从上传前计数。h-5000 的时间线 30/30、RGBA/BGRA 呈现各 58 例零坏像素和 NDK29 142/旧源 0、诊断与游戏各 171/171 均过，生产源码与 h-5002 一致。
+- h-5001 的 android/test.sh 在既有 gs-slot 负控锚处中断。#2309 基线与本项两个相关文件逐字一致，期望命中 3 次、均为 0。门禁此前的 device offline 来自模拟 adb。以上为宿主证据。
+
+v6b 第 39 项 纹素缓冲偏移对齐
+- 回退点 775525baa9adc72f0f8db3a85c08cdc5f3e9ad34，源 dfdcaa356c200dcd0b7d4bcc60a54fd8247065f1，合流 d32dd9c80ac4af5e4e1addd76cb46bfe1e8f70ae，测试 58e61b1b1c816096e8d7364c78940baf2d4b39a6。debug.s2a.nvk_texel_buffer_alignment 缺省 1。
+- 应用版本维持 Vulkan 1.1，列出扩展且特性为真时启用。保留 provoking vertex 等现有查询链及能力档。底层缓冲同时声明 uniform/storage texel，用两项逐格式有效对齐的较大值，缺支持时沿用核心对齐。
+- h-5003 的 Vulkan 与链接部分通过。开启档 R32UI @4 B、RG32UI @8 B 成功，非法偏移拒绝，关闭、缺扩展、缺特性均回退。撤回负控按预期失败。imageBuffer 对齐、副本、原子三臂逐字节通过，三项负控命中。纯纹素回放 16/16，正向 VVL/SyncVal 0。NDK29 142/旧源 0，诊断及游戏各 171/171。
+- h-5003 的形态档编译曾因合流留有重复成员而红。去重后另在测试提交上完整复跑，28 档 × 4 项、28 档回读、11 个变体与负控通过。生产源码及 Vulkan 夹具与 h-5003 逐字相同。全量安卓宿主补跑为 h-5008。
+- 存档 vkjson 中，8E 两项都是 64 B 且 single=0，9400 的 uniform=4 B/single=1、storage=64 B/single=0，9000 未列扩展、核心对齐 64 B。当前缓冲的共同对齐在这三份设备档案均为 64 B。宿主的放宽读数来自 lavapipe。
+
+v6b 第 40 项 命令段对象与动态表复用
+- 回退点 7c34fc691fd362f25d187961da7eb2ddaf125fff，源 d273411ed6f7f22d5b29c7730c141b7399248f20，合流与专项实测 3af5dd6efaa9d1a7e4425fd256634965744511d5。debug.s2a.nvk_cmd_pool 缺省 0。
+- 段完成或放弃后释放 Vulkan 资源引用，保留达到上限前的 CPU 表容量。复用时清空布局索引槽、引用备忘和推常量暂存，重置段本身的绑定状态。新段将图形和计算布局标脏，动态 UBO 顺序沿用管线元数据。描述符备忘按代际失效，镜像区间摘链和释放及 fence 池顺序照旧。
+- h-5015 的 cmd-pool 四档各 4/4，启用两档 32 段均命中 30 次。池容量 16，满池各丢弃 8/7 个。撤掉 memo_gen 递增命中 47 个断言及 110 条 VVL。fence-pool、feedback-core、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。
+- h-5018 rc=0。联合开启 cmd_pool、hot_hash、draw_fast、bind_dedup 和 fence_pool，另保留推描述符与模板。DQ 两档均确认回收到同一段对象，256 笔各命中 254 次偏移快路径，2 次推送、1 次模板，四象限像素一致。各有 1 次 fence 新建和 1 次复用。跳过布局索引清空触发 VUID-vkCmdDraw-None-09600，期望 COLOR_ATTACHMENT_OPTIMAL，实际 GENERAL。修正校验信息匹配后负控按预期拦截，生产源码未变。正向 VVL/SyncVal 0，真机分配和帧时待测。
+
+v6b 第 41 项 Vulkan 图像健壮性
+- 回退点 89bbc20de87f0c7d0b048c11c2933eb7f642c422，源 fa40e9f60bb783afabc7fb6fb24d519ced5e4c84，合流 56fdcb31a6a2aaaf29a317568309c3d955219289，测试 4b642092f81fd1c82c983c846805ac77f1a44115。debug.s2a.nvk_image_robustness 缺省 1。
+- Vulkan 1.1 实例下，列出扩展且 robustImageAccess 为真才启用。设备扩展名数组按 staging 的 37 个追加点预留，保留纹素缓冲对齐、provoking vertex、3D 的 2D 视图及既有能力查询链。
+- h-5019 rc=0。启用档 4 次越界采样或存储图像读返回规范零值，越界写丢弃，16 个界内纹素逐项通过。关闭、隐藏扩展、隐藏特性仅检查界内读写，撤回负控按预期失败。正向 VVL/SyncVal 0。
+- 纹素缓冲对齐、3D 的 2D 视图和动态状态回归通过。形态档 28×4、回读 28 档及 12 个变体通过，含 robustImageAccess 和旧档对照。NDK29 142/旧源 0，诊断与游戏各 171/171。三机存档均列扩展，读写与回退实证来自宿主 lavapipe。
+
+v6b 第 42 项 两级回放 DQ 批量发布
+- 回退点 ecb29c14f1fef190c9f661e14cbafbedf12a4483，源 10f20803f80298156c24031ee41906883575600b，合流及专项实测 8624cf9e007ec7c76a4e27f3e567067e9d340a32。debug.s2a.nvk_dq_opt 缺省 0。
+- DQ 生产者复用本地读位置，按批发布，短段及同步点强刷未发布尾批。录制线程按批发布读位置，观察到等待清空的线程时结束本批并通知，使后续发布不会延迟已有等待。保留引导命令、推描述符和同步屏障的录制路径。
+- h-5026 rc=0，开关双档各 5/5。256 笔均录制 789 条，pub/rd 发布各 789 → 51，生产者重读 789 → 0。首轮旧负控提前中止，补入短段填充读回后，撤掉尾批刷新按预期失败，读回原值 0xace00001，期望 0xace00002。
+- h-5024 的 cmd_pool、draw_fast、hot_hash、bind_dedup、fence_pool、dq_opt 联动通过。实录 882 条、pub 59、rd 58、强刷 6，同段对象复用、fence 命中、动态偏移和反馈环像素均正确。feedback-core、feedback-read 和 NDK29 142/旧源 0、诊断与游戏各 171/171 通过。两票生产代码一致，正向 VVL/SyncVal 0。真机调度及帧时待测。
+
+v6b 第 43 项 Vulkan 工作组共享内存零初始化
+- 回退点 0ddad0f17ca98b1cbcddbb39677733b7bec7402a，源 50d8d0100f3d8b65b34cbcdd8a1234b68144a708，合流 d9865df41d1855ef9ed25c89c0bfd7a162780c81，测试 8175bb009557124134af93c973eecc8e42b98034。debug.s2a.nvk_zero_init_workgroup 缺省 1。
+- Vulkan 1.1 应用只在设备列出 KHR 扩展且特性为真时启用。扩展名数组按 staging 的 38 个追加点预留，保留图像健壮性、纹素对齐、provoking vertex 和其他能力。未启用时，SPIR-V 合规检查在创建着色器模块前具名拒绝带初始化器的 Workgroup 变量。
+- h-5028 rc=0。t_spv_compliance 通过。启用档带 OpConstantNull 的着色器通过 64 个工作项的零值读回；关闭、隐藏扩展、隐藏特性均具名拒绝，普通共享内存着色器五档通过。撤回负控 rc=1，VVL/SyncVal 0。图像健壮性回归通过。
+- 能力形态档 28×4、28 档回读、13 个变体及负控通过。NDK29 142/旧源 0，诊断与游戏各 171/171。Vulkan 行为证据来自宿主 lavapipe。
+
+v6b 第 44 项 NVN 样本掩码
+- 回退点 b301b55e15b56f9f3d658c3e13a49deafe62b52f，源 22350b5cf59fecc8e72f2476aa6a05942b035b0a，合流及实测 82188b968b9caf2b24d63862869a81f92ade2f1d。始终生效。
+- CommandBufferSetSampleMask 录制低 16 位，回放按变化重查管线。掩码同时进入逻辑键、动态规范键和 pSampleMask。契约 v29，管线描述 2360 字节、预热配方 352 字节，旧种子掩码为全开，保留原逐样本模式、主顶点与视口重排。
+- h-5044 rc=0，八档逐档 16/16。4× 掩码 ffff、0000、0001、0005、fff0、ffff 读回绿/alpha 255、0、64、128、0、255，1× fffe、0001 读回 0、255。h-5054 逐样本模式回归通过，4× 强制逐样本两次 R=128，隐藏能力时两次具名拒绝。正向 VVL/SyncVal 0。
+- h-5037 录制 307889 条断言、回放 9085/8802 项零红、后端契约通过。首票 Vulkan/NDK 编译中样本掩码变量与已有 mask 参数重名，合流候选改名后通过。h-5043 rc=0，预热和 12 条旧种子/种子用例、负控通过，NDK29 142/旧源 0、诊断与游戏各 171/171。Vulkan 读回来自宿主 lavapipe。
+
+v6b 第 45 项 Vulkan 标量块布局
+- 回退点 de22983cb6b3b11ff08b0fd5b61cb3a57b3fd1f6，源 f62006d4c1e7422e4ece53ba70475e512dde0129，合流 071752b1e6f0bd4a0d0f1ce0ae92dfff6145e37f，实测 e164720110f18bc8e64767ff4847ef130c7ecb12。debug.s2a.nvk_scalar_block_layout 缺省 1。
+- Vulkan 1.1 下仅在列出 EXT 且 scalarBlockLayout 为真时启用。扩展数组 39 项，保留主顶点和此前能力。SPIR-V 合规守卫检查向量跨 16B 边界及紧凑向量数组。来源守卫误判 vec2@4，补测先红（rc=2）再绿，覆盖 vec2@12 和宽向量 16B 对齐。
+- h-5047 rc=0，紧凑布局启用时精确读回 12 个 float。关闭、隐藏扩展、隐藏特性三档均具名拒绝，std430 各档通过，撤回负控 rc=1，正向 VVL/SyncVal 0。
+- h-5046 rc=0，t_spv_compliance、28×4 形态档、28 档回读、14 个变体及负控、工作组零初始化回归、NDK29 142/旧源 0、诊断和游戏各 171/171 通过。三机存档均列扩展，行为来自宿主 lavapipe。
+
+v6b 第 46 项 Vulkan UBO 标准布局
+- 回退点 4a223c2f742433a1446698c6a8f91265c15481c7，源 ec6450d06c5e70e50bd0ec9299e45530e0a7da42，合流 12770f06df785a3c480bb83260cbec87f4d3aebf，实测 12770f06df785a3c480bb83260cbec87f4d3aebf。
+- debug.s2a.nvk_ubo_std_layout 缺省 1，Vulkan 1.1 经扩展和特性协商，设备扩展数组 40 项。已启用 scalarBlockLayout 也允许 UBO 紧凑数组步长，只有两个能力均未启用时预检才具名拒绝。
+- h-5060 交叉负控只开标量布局时 ubo430_ok=0，h-5062 修正后 ubo430_ok=1，std430 12 个值读回正确。仅开启 UBO 特性时也通过。双关、隐藏 UBO 扩展、隐藏 UBO 特性均具名拒绝，std140 各档通过，撤回 rc=1，正向 VVL/SyncVal 0。
+- h-5079 第 46 段 t_spv_compliance、28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。读回来自宿主 lavapipe。
+
+v6b 第 47 项 Vulkan 线光栅化
+- 回退点 1c0db52a72e63d4c7f66b8763dbd96f65b1aee84，源 d4bbd976c45941c06782b0302a87e82112486505，合流 147f622c0353322f83771e62a568aa1a42ba49e4，实测 a060da6c507096b4cd8ee13329e9a1d1059409f0。
+- debug.s2a.nvk_line_raster 缺省 1，设备扩展数组 41 项。按设备支持的子特性创建线模式状态，允许矩形时优先矩形，保留主顶点状态，虚线入口通过 vkGetDeviceProcAddr 加载。
+- h-5065 rc=0，启用档真实线模式和动态虚线读回通过。关闭、缺扩展和缺特性均沿用默认线光栅化，普通线像素通过，撤回 rc=1，正向 VVL/SyncVal 0，ELF 静态 vkCmdSetLineStipple 引用 0。
+- h-5079 第 47 段 28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。行为验证来自宿主 lavapipe。
+
+v6b 第 48 项 Vulkan maintenance4
+- 回退点 7ec63e06d28b20c7be30e2ddf3ce1c3cc69867ff，源 5893265e927c357a02c8ad6c93ec36e34d8533c5，合流 3fed1918dd6b237f57c15c29871889b6e3c9787c，实测 4cac090d60048dc787379105331c97209824220f。
+- debug.s2a.nvk_maintenance4 缺省 1，设备扩展数组 42 项。Vulkan 1.1 经 KHR 扩展协商，两个内存需求查询使用动态入口。缺能力时，LocalSizeId 具名拒绝，内存需求沿用临时对象查询。
+- h-5066 rc=0，启用档动态入口 1/1、maxBufferSize=4294967295、LocalSizeId 实际派发与上下限检查通过。关闭、缺扩展、缺特性档普通着色器和内存需求回退通过。撤回 rc=1，正向 VVL/SyncVal 0，ELF 静态 Vulkan 1.3/KHR 内存需求查询引用 0。
+- h-5079 第 48 段 compute-workgroup、t_spv_compliance、28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。设备存档列扩展为 8E/9400 有、9000 无，行为验证来自宿主 lavapipe。
+
+v6b 第 49 项 Vulkan Float16 与 Int8
+- 回退点 6832157a243617af54da92f8e9894a8966fb5a44，源 c886331518b8a2803a49b5cd45f375650abc3028，合流 83dec619e5563920faadb2f2c2010bbd19119f46，实测 1271d1b18cb7cb55d9f45b83350193908566e69d。
+- debug.s2a.nvk_shader_float16_int8 缺省 1，设备扩展数组 43 项。Vulkan 1.1 经 KHR 扩展协商，两项特性与 SPIR-V 能力独立检查。无新增静态 Vulkan 1.2/KHR 入口。
+- h-5068 rc=0，宿主上报 Float16=0、Int8=1，真实 Int8 派发读回通过，Float16 路径具名拒绝。关闭、缺扩展、隐藏单项及撤回负控通过，撤回 rc=1，正向 VVL/SyncVal 0。Float16 的启用与单项协商由形态档验证。
+- h-5079 第 49 段 t_spv_compliance、28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。三机存档均列扩展，设备执行待终验。
+
+v6b 第 50 项 Vulkan 浮点控制
+- 回退点 a8c0bc1f0071ad042df0dc760c7f7e6a57f0b22d，源 076e022678fc37a76de760c3b902997c873df077，合流 730447c640c8bf31471dac3950b0afc42a1928a8，实测 32d65ffd86d38a835f66616737bf2cc5849d5337。
+- debug.s2a.nvk_shader_float_controls 缺省 1，设备扩展数组 44 项。经 Vulkan 1.1 属性查询取得 5 种模式 × 3 种位宽的 15 位掩码，SPIR-V 逐模式校验。保留此前 Float16/Int8、LocalSizeId、共享内存零初始化和块布局守卫。
+- h-5073 rc=0，启用档实际掩码 0x0fc0，隐藏子模式后 0x0b40，具名拒绝要求该模式的 SPIR-V。关闭及缺扩展档掩码归零，标准着色器各档通过，撤回 rc=1，正向 VVL/SyncVal 0，ELF 所核 1.2/KHR 静态入口引用 0。
+- h-5079 第 50 段 t_spv_compliance、28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。Vulkan 行为来自宿主 lavapipe。
+
+v6b 第 51 项 Vulkan 全局队列优先级
+- 回退点 030f8be3f2f1855c91099567afa168376dae3c36，源 bde5adf360ad012668102d39c5debd7d8de16fcd，合流 696d19c67dce93c910b26f8e11b674e93a9cdd04，实测 cddcadb201c70f420b172f74fd61931a78f48366。
+- debug.s2a.nvk_global_priority 缺省 0，设备扩展数组 45 项。显式启用且设备列出扩展时只给主队列请求 HIGH。VK_ERROR_NOT_PERMITTED_EXT 时清主队列请求并只移除该扩展，重试默认优先级。独立稀疏绑定队列保留默认优先级。
+- h-5078 rc=0，启用档一次创建、HIGH=512。模拟权限拒绝两次创建，首次扩展与 HIGH 都在，第二次均撤回，实际 MEDIUM=256，拒绝标志为 1。缺省和缺扩展均一次创建，四档计算读回通过，撤回 rc=1，正向 VVL/SyncVal 0。
+- h-5079 第 51 段 28×4 形态档、28 档回读及变体负控、NDK29 142/旧源 0、诊断与游戏各 171/171 通过。形态档对照重试前后逐项保留其他扩展。Vulkan 行为证据来自宿主 lavapipe。
+
+v6b 第 52 项 Vulkan 8-bit 存储
+- 回退点 1526b94e08393bf8d271d7dd5b88799117bbe58e，源 d934a1f7597ab97707365185839890e6f6f85186，合流 e9aff7098cb372a26f8fbcd0de95b2821746b41c，测试 c27d3017009d1fbd8caf4bcf174aed3479766e98。
+- debug.s2a.nvk_8bit_storage 缺省 1，Vulkan 1.1 按位协商 8-bit SSBO、UBO/SSBO 与 PushConstant。扩展数组 46 项，SPIR-V 守卫按实际启用位具名拒绝。
+- h-5092 来源七档通过。v6b 构建票的合流树再次通过 storage-8bit 七档与撤回、t_spv_compliance 和设备形态档。正向 VVL/SyncVal 0，宿主 lavapipe 实证。
+
+v6b 第 53 项 Vulkan buf_write 搬运合批
+- 回退点 079a7c2137127e2e483aaa334333ac59356ffa96，源 b4a741125eda55705a33ee3506e2d3e28624ab3d，合流 18c8b650868983deaf2d969c524793d948186c02，测试 c27d3017009d1fbd8caf4bcf174aed3479766e98。
+- debug.s2a.nvk_xfer_batch 缺省 0。相邻搬运合批，重叠写和消费边界强制冲刷，合流保留 Sync2 及混合布局的屏障路径。
+- 来源快票同一主机 64 次更新 347.0ms → 38.3ms，屏障、拷贝和全局互斥各 64 → 1。v6b 构建票的合流树重新验证开关双档和重叠负控，正向 VVL/SyncVal 0。宿主时间读数，真机待测。
+
+v6c 第 54 项 Vulkan 16-bit 存储
+- 回退点 5f44072304a0e62532dafa5b15c0ed0a85f0c32a，源 b08dc48b9816e61fe343fa781ebd5a680f940e65，合流 c20028a9d91102ed47b2a7e719158dfb7b914883。
+- Vulkan 1.1 核心协商 SSBO、UBO/SSBO、PushConstant 和输入输出四位，按实际启用位守卫 SPIR-V。llvmpipe 上报 1/1/1/0，六档与撤回通过，输入输出启用由形态档覆盖。
+
+v6c 第 55 项 Vulkan 纹理上传池
+- 回退点 c20028a9d91102ed47b2a7e719158dfb7b914883，源 6d482e80f13a9422ba07781ba73ee26f78429ff6，合流 85d0e95b102039b8307d7b39cd92f2514d1531e9。
+- nvk_tex_upload_pool 缺省 0。与 buf_write 合批在切换时依序冲刷，保留稀疏区裁切。四例双档像素通过。全屏障 48→0、图像屏障 96→2、复制命令 48→2，撤去重叠检测触发 SyncVal WAW。
+
+v6c 第 56 项 Vulkan VariablePointers
+- 回退点 85d0e95b102039b8307d7b39cd92f2514d1531e9，源 fec6911b73ded9344cec5031afa7c1ea2f2ff90a，合流 47ad7abe1c65c876893e3b6b7e85e17d500ef0fb。
+- Vulkan 1.1 核心按位启用 StorageBuffer 与完整可变指针，守住 VUID-01431。实派发读回、逐位隐藏及撤回负控通过。
+
+v6c 第 57 项 Vulkan 时间戳查询池
+- 回退点 47ad7abe1c65c876893e3b6b7e85e17d500ef0fb，源 87af0fe578709521f1f10d0a10d40ed0fcb05ee7，合流 40b57e286150a312e9efc301649d828618e6dba1。
+- nvk_tsq_pool 缺省 0。按槽数复用时间戳池，复用前沿用 host/command reset 路径。开关双档、并发与放弃段及去重置负控通过。
+
+v6c 第 58 项 Vulkan multiview
+- 回退点 40b57e286150a312e9efc301649d828618e6dba1，源 f04e5f0d04aa259af389ebd4f0ef5e5cd8452f38，合流 061bf02d3c36acb5fbdce1a31c5a8605183efdef。
+- Vulkan 1.1 核心启用多视角与 GS/TS 子位，按基础特性约束协商。双层像素、缺位与撤回负控通过。
+
+h-5123 rc=0，联合验证源码 061bf02d3c36acb5fbdce1a31c5a8605183efdef。SPIR-V 单测、28 档 × 4 项及变体、上述五套 lavapipe 夹具、xfer-batch 和 host-query-reset 回归通过。
+v6c 复用 v6 direct-pack 和 NativeAOT 静态归档。第 59 项独立队列，宿主结果与真机终验分开。
+
+v6d 第 59 项（R1）直连 Vulkan 深度边界测试
+- 回退点 a9ac4b9fc94a28f6c940dff7556310fc0f0ad128，源 e5c50e1098d7daf2305a8fa7e8975bb67c329e04，合流 2b33b679e9394cfc0c31f0d97eb0486e77d568eb。
+- 契约升级至 v30，NVN_BIND_DEPTH_BOUNDS=7 与既有 NVN_BIND_LINE_WIDTH=6 分槽；管线预热配方键位与既有字段互不重叠；深度边界测试经 VkDynamicState 动态下发并受设备 depthBounds 特性守卫。
+
+v6d 第 60 项（R2）BC 解码贴图兼容跨格式视图
+- 回退点 2b33b679e9394cfc0c31f0d97eb0486e77d568eb，源 0f25eca120f882637acf35555428ef6d98076251，合流 b7b667bf26ca6be78598af7a8c4a8ecb1463297e。
+- bc_decoded 贴图允许创建兼容 sRGB/线性替代格式视图，不兼容格式保持具名拒绝。
+
+v6d 第 61 项（R3）宽屏宿主尺寸（host_w/host_h）贴图分配与校验
+- 回退点 b7b667bf26ca6be78598af7a8c4a8ecb1463297e，源 8ea02b860cf76e080d58b22a5baa42a1db02db10，合流 2bccf7944e3d881daf424db4f8bf03aa2b394435。
+- 贴图按 host_w/host_h 分配实际 Vulkan 尺寸，保留既有稀疏与专用显存路径，nvn_gpu_pass_begin 核对通道区域不超过宿主附件尺寸。
+
+v6d 第 62 项（R4）非恒等交换链预旋转
+- 回退点 2bccf7944e3d881daf424db4f8bf03aa2b394435，源 57e0382613455334c74b9c474628ce01fe284a02，合流 5fdf2ea6666c91bafa8cfd10b2f11b5ba3f90668。
+- 恒等交换链沿用 Sync2 屏障路径，90/180/270 度预旋转走合成渲染通道与旋转着色器，保留 EASU 附件记录与时间线完成追踪。
+
+v6d 第 63 项（R5）稀疏纹理按驻留子资源写入与 blit
+- 回退点 5fdf2ea6666c91bafa8cfd10b2f11b5ba3f90668，源 d4d4031ea898515cff1507860c7611b3c1d2d2e2，合流 336136d6faf304718d73fd505bc1dcd0ceefc37e。
+- 按驻留子资源放行稀疏附件写入与 blit，保留既有未驻留拒绝与宽屏宿主尺寸边界检查。
+
+v6d 第 64 项（R6）邻接图元绘制准入
+- 回退点 336136d6faf304718d73fd505bc1dcd0ceefc37e，源 b06a4ad09ec573fddf7a4ec689d611374bcb9e42，合流 1a70abf7b451e2c117a2630faec4c467b3e0ed92；夹具对齐 d62d6407829d537e9779f6d5d032987aa64c7174。
+- 复用管线已核验的邻接拓扑与 geometryShader 能力；独立夹具补齐 staging 的 rp_buf_read_pointer 替身，并在 VK_EXT_provoking_vertex 启用时按 Vulkan 规范的 LAST 顶点序核对四个原生间接用例（生产代码不变）。
+
+v6d 第 65 项（R7）Downsample 1x 换格式 blit 与单面深度 MSAA resolve
+- 回退点 1a70abf7b451e2c117a2630faec4c467b3e0ed92，源 008ad75348b7ed86edb7e2a1643d910bfdb6befa，合流 a275bad4ca5bbe71aa988c9d5c691b1918a94c00。
+- 接通 1x 跨格式颜色 Downsample blit 及 D32F/D16 MSAA->1x sample0 深度 resolve，保留不支持情形的具名拒绝。
+
+v6d 第 66 项（R8）32 位整数换算顶点索引与实例绘制
+- 回退点 a275bad4ca5bbe71aa988c9d5c691b1918a94c00，源 798e3689d1cdd0e209be9a95658dbb96fb18d61a，合流 2ab2e0e24abac9e99bc4755a88949e52143bb96c；整合修复 10884a88db9c12969a5bde0b921efd25f8719261。
+- 合并 NVN_GPU_FMT_VERTEX_CPU 与 UI2F/I2F 索引/实例 CPU 解码，同时修复 rp_draw 跨段复用同地址 cmd 指针时漏校验 rp_seg_serial() 导致 bind 前没有 set_pipe 的隐患，并更新 draw-caps 夹具核对 RGB8SN 索引绘制 4096/4096 与间接 CPU 解码具名拒绝。
+
+v6d 整合宿主验收（local/android-staging-v6d，实测源码 10884a88db9c12969a5bde0b921efd25f8719261，树 8c92601a9e9e63696277fc28165d66231eecc50b）
+- h-5173 rc=0（0 VVL/SyncVal）：R1 --depth-bounds（DQ=0/1 × 显隐全过）、R2 --bc-decoded-alt-view（failures=0 + 负控）、R3 --widescreen-host-size（4/4 failures=0 + 变异负控）、R4 --wsi-extent（0x1/0x2/0x4/0x8 旋转+重建+拒绝 bad=0）。
+- h-5174 R5 --replay-cube-view 通过（failures=0，0 VVL/SyncVal）；h-5181 R6 --replay-gs-topology（15 用例 × DQ=0/1 全部 0/32 + 无能力拒绝 + 排序负控，0 VVL/SyncVal）与 R7 --downsample-fmt-depth（failures=0 + 4 项负控，0 VVL/SyncVal）通过。
+- h-5193 rc=0（0 VVL/SyncVal）：R8 --zero-attr-core（zero-attr 0 错 + UI2F dq=0/1 各 16/16 failures=0）与 --replay-draw-caps 回归（cpu-i2f/cpu-rgb8sn/cpu-rgb8sn-indexed/indexed-loop/cpu-indirect-refused/advanced-refused 全过 + 负控）通过。
+- 宿主与交叉核验：t_nvn_replay 8660 项 0 红、t_nvn_backend 契约 v30、nvn_vk_format_test 0 失败、nvn_vk_pipe_warm_test 通过、android/native/gfx_plat/gate.sh 链接 142 目标/旧源 0、NDK 29 ARM64 静态非 1.1/非 WSI Vulkan 符号 0。
+- v6d 轻量包复用 v6 direct-pack 与 NativeAOT 静态归档，不新排 p4 contrib_check，真机终验待执行。
+
+v6e 第 67 项（阶段 B 金矿④）池镜像前置同步精确保护
+- 回退点 2fc09eebfce99e0ffa00f5b148e64b5eec39812c，源 3fdcfcca4819485ea7f563e8b53ca7f611f34885，合流 1895e5e40de0894d4dcc595f1a50a5d40283862e。
+- debug.s2a.nvk_mirror_exact_guard 默认 0，依赖 nvk_mirror_disjoint。区间判交保留分代非一致原子保护、落地副本集合和提交内顺序。
+
+v6e 第 68 项（阶段 B 金矿① 阶段 1）落地字节账本和安全读诊断
+- 回退点 1895e5e40de0894d4dcc595f1a50a5d40283862e，源 6c53c695c98f9f516e1c5d96dcc65ce275971ef5，合流 bb863a407a4876ae3ddd8e0b9af9331847b28b4e。
+- debug.s2a.nvk_land_accounting 默认 0。登记保留生产者、阶段和回写区间，回放、安全读与实际回拷独立计数。保持既有主动落地策略。
+- 宿主验收覆盖两个回放用例、对应 Mesa/VVL 同步校验回归、NDK 29 ARM64 链接与 Vulkan 1.1 Core + Android WSI 静态导入检查。
+
+v6e 第 69 项（阶段 B 金矿⑥）整图 BC7→ASTC 预转换与工作集核对
+- 回退点 41c5349ba0e3b8b4c0e097c1d2b08de48382d88b。离线源 9313024ab114c379677ac6af66f39bbc42bcbfff、查包源 63f53e651c8089efa8b5b3fc836b1d113f859fea、工作集源 39fa9ec93062010f785268bc65d37ec6c77e8fc4。
+- 合流 4b9deddc0、c8a7f6433、a01663384，复用 v6d 的 R2。v30 保留原能力位，BC7 接第 30 位，签名表 98 项。debug.s2a.nvk_bc7_astc_pack 与 debug.s2a.nvk_bc7_workset_diag 各自默认 0。
+- 保留 R3 的压缩格式宽屏尺寸拒收与原生稀疏建图路径。整图查包复用现有原块影子，工作集夹具核对键、分因与客体回读。
+
+v6e 第 70 项（阶段 B 金矿③）可证紧邻全清的附件丢弃
+- 回退点 ab6c1a27c24d984ee370d8422afd00802ce6e4f5，源 4170344148bbc289dd65f1f0a83b10d7b6d103ad，合流 bb561af9a1d1c9d6e37d6cbc07bcb9c3e78c48bc。
+- debug.s2a.nvk_pass_dont_care 默认 0，保留 DiscardColor、DiscardDepthStencil 及 vk-pass-io 分因，v30 保留既有能力位并钉住新增拒绝提交签名。
+
+v6e 第 71 项（阶段 B）关闭时跳过批量优化记账
+- 回退点 bb561af9a1d1c9d6e37d6cbc07bcb9c3e78c48bc，源 d92ca9b02c4e74b5eb5f4db2eb691c283c02b8f1，合流 871e0a3753f62b15a8426b8fd96668b548f11765。
+- 关闭录制及传输合批优化时沿不附加统计的路径，计算推送常量影子由 bind_dedup 守卫。
+
+v6e 第 72 项（阶段 B）核验未落地写保护的贴图内容
+- 回退点 871e0a3753f62b15a8426b8fd96668b548f11765，源 9cc94712da59a76c238e7470c3e53c2a984361d9，合流 0205bf5054a730db4fbdc24f8b03e8534b98391c。
+- debug.s2a.nvk_tex_unarmed_verify 默认 0。用有界全窗快照核对实际字节，变化后沿原上传，保留 BC7 工作集状态与原有稀疏迁移。

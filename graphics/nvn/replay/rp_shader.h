@@ -4,7 +4,7 @@
 #pragma once
 #include "nvn_backend.h"
 
-enum { RP_PROG_STAGES = 3, RP_PROG_ENT_MAX = 128 };   // 顶点、片元、几何
+enum { RP_PROG_STAGES = 5, RP_PROG_INLINE_STAGES = 3, RP_PROG_ENT_MAX = 128 };   // 0 顶点 1 片元 2 几何 3 细分控制 4 细分求值
 // 句柄放在游戏用户常量缓冲里的绑定（NVN_RB_TEXU / NVN_RB_TBUFU，语义照 iOS nvn_refl.h / nvn_mtl.m ubo_packed）的来源。
 //   一个字：用户常量槽 reg 的字节 off 处的 32 位字；sid = 它是采样器号（读出后左移 20）；pair = 同一 Ryujinx 句柄的另一半
 //   （pair_reg / pair_off 处的字，pair_sid 时左移 20），两半相或 = 打包句柄：低 20 位纹理号、高 12 位采样器号。
@@ -25,13 +25,18 @@ struct rp_cold_proof {
     uint32_t fragment_ent, first_word, stride_words, count;
     uint32_t prefix_ent, prefix_byte, prefix_mask;
 };
+struct rp_tess_layout {
+    nvn_gpu_layout_ent ent[RP_PROG_ENT_MAX];
+    uint8_t dtt[RP_PROG_ENT_MAX], dcls[RP_PROG_ENT_MAX], difmt[RP_PROG_ENT_MAX];
+};
 struct rp_prog {
-    nvn_gpu_shader sh[RP_PROG_STAGES];                        // 0 顶点 1 片元 2 几何
-    nvn_gpu_layout_ent ent[RP_PROG_STAGES][RP_PROG_ENT_MAX];  // 与交给后端装载的布局同一份：核心按 src_kind / src_reg 逐项绑定
-    uint8_t dtt[RP_PROG_STAGES][RP_PROG_ENT_MAX];             // 声明目标 + 1；0 = 未知，沿用登记视图
-    uint8_t dcls[RP_PROG_STAGES][RP_PROG_ENT_MAX];            // 0 float，1 uint，2 sint，3 depth 比较
-    uint8_t difmt[RP_PROG_STAGES][RP_PROG_ENT_MAX];           // 存储图像声明的 SPIR-V Image Format（0 = Unknown；计算阶段与图形阶段的 imageBuffer 填，见 nvk_shader.c sampled_decl）
-    uint8_t sampler_unused[RP_PROG_STAGES][RP_PROG_ENT_MAX];   // 已从 SPIR-V 证明该组合描述符不读取采样器
+    nvn_gpu_shader sh[RP_PROG_STAGES];                        // 0 顶点 1 片元 2 几何 3 细分控制 4 细分求值
+    nvn_gpu_layout_ent ent[RP_PROG_INLINE_STAGES][RP_PROG_ENT_MAX];  // 与交给后端装载的布局同一份：核心按 src_kind / src_reg 逐项绑定
+    uint8_t dtt[RP_PROG_INLINE_STAGES][RP_PROG_ENT_MAX];             // 声明目标 + 1；0 = 未知，沿用登记视图
+    uint8_t dcls[RP_PROG_INLINE_STAGES][RP_PROG_ENT_MAX];            // 0 float，1 uint，2 sint，3 depth 比较
+    uint8_t difmt[RP_PROG_INLINE_STAGES][RP_PROG_ENT_MAX];           // 存储图像声明的 SPIR-V Image Format（0 = Unknown；计算阶段与图形阶段的 imageBuffer 填，见 nvk_shader.c sampled_decl）
+    uint8_t sampler_unused[RP_PROG_INLINE_STAGES][RP_PROG_ENT_MAX];   // 已从 SPIR-V 证明该组合描述符不读取采样器
+    struct rp_tess_layout *tess;   // 仅有 TCS/TES 的程序持有两阶段的绑定表
     uint32_t nent[RP_PROG_STAGES];
     uint32_t support_bytes;                                   // NVN_RB_SUPPORT 那一项的缓冲长度
     uint32_t attr_mask;                                       // 顶点着色器实际读的属性位
@@ -52,6 +57,18 @@ struct rp_prog {
     uint8_t identity[32];
     const struct rp_cold_proof *cold;
 };
+static inline const nvn_gpu_layout_ent *rp_prog_ent(const struct rp_prog *p, unsigned st) {
+    return st < RP_PROG_INLINE_STAGES ? p->ent[st] : p->tess[st - RP_PROG_INLINE_STAGES].ent;
+}
+static inline const uint8_t *rp_prog_dtt(const struct rp_prog *p, unsigned st) {
+    return st < RP_PROG_INLINE_STAGES ? p->dtt[st] : p->tess[st - RP_PROG_INLINE_STAGES].dtt;
+}
+static inline const uint8_t *rp_prog_dcls(const struct rp_prog *p, unsigned st) {
+    return st < RP_PROG_INLINE_STAGES ? p->dcls[st] : p->tess[st - RP_PROG_INLINE_STAGES].dcls;
+}
+static inline const uint8_t *rp_prog_difmt(const struct rp_prog *p, unsigned st) {
+    return st < RP_PROG_INLINE_STAGES ? p->difmt[st] : p->tess[st - RP_PROG_INLINE_STAGES].difmt;
+}
 struct rp_shader_req {
     uint32_t prim;              // NVNdrawPrimitive
     int rt_count;               // 当前颜色目标个数
@@ -59,6 +76,34 @@ struct rp_shader_req {
     // 仅在提交线程发现现编结果尚未就绪时调用。可暂缓则返回 1 并写入预算所属帧。
     int (*compile_defer_frame)(uint64_t *frame);
 };
+struct rp_state;
+struct p_set_rt;
+unsigned rp_shader_lookahead_budget(void);
+void rp_shader_lookahead_frame_end(void);
+void rp_shader_lookahead_end(void);
+enum rp_lookahead_stop {
+    RP_LOOKAHEAD_COMMAND = 1,
+    RP_LOOKAHEAD_RECORD,
+    RP_LOOKAHEAD_SCAN_LIMIT,
+    RP_LOOKAHEAD_SUBMIT_STATE,
+    RP_LOOKAHEAD_TARGET,
+    RP_LOOKAHEAD_DRAW,
+    RP_LOOKAHEAD_TEX_POOL,
+    RP_LOOKAHEAD_PROGRAM,
+    RP_LOOKAHEAD_DYNAMIC_UBO,
+    RP_LOOKAHEAD_RESOURCE,
+    RP_LOOKAHEAD_CONTEXT,
+    RP_LOOKAHEAD_IDENTITY,
+    RP_LOOKAHEAD_DESCRIPTOR_CHANGED,
+    RP_LOOKAHEAD_SNAPSHOT,
+    RP_LOOKAHEAD_REQUEST,
+    RP_LOOKAHEAD_QUEUE,
+    RP_LOOKAHEAD_JUMP_CYCLE,
+    RP_LOOKAHEAD_DEFERRED_BINDING,
+    RP_LOOKAHEAD_STOP_COUNT,
+};
+// q 与 targets 均空时请求当前计算阶段。1 = 入队，0 = 无新工作，负值 = 略过该候选的原因。
+int rp_shader_lookahead(const struct rp_state *state, const struct rp_shader_req *q, const struct p_set_rt *targets);
 // 当前绘制生效的图形阶段（bit = NVN 阶段 0..4）与各阶段的着色器键。核心按「程序实际有哪些阶段」
 // 窄化后的结果（同 iOS bind_stages：VS/FS 不能被关，GS/TCS/TES 程序没有就解绑）；着色器来源只消费这份结果。
 uint32_t rp_shader_graphics_stages(void);
@@ -69,7 +114,8 @@ int rp_shader_resolve(const struct rp_shader_req *q, const struct rp_prog **out)
 int rp_shader_resolve_compute(const struct rp_prog **out);
 uint64_t rp_shader_compiled_programs(void);   // 前台解析取得的设备现编程序，含等 worker 的结果；每份程序一笔
 struct rp_shader_live_compile_stats {
-    uint64_t enqueued, wait_ns, pending, fallback, timeout;
+    uint64_t enqueued, wait_ns, pending, fallback, timeout;   // fallback = 前瞻没给出本次现编的任务
+    uint64_t start_failed, future_hits;   // 线程池起失败后回退的份数 / 完整请求匹配且拿到结果的份数
     uint64_t compiled, compile_ns, compile_max_ns;   // 编译线程这段时间跑完的份数（成败都算）/ 合计耗时 / 最长一份（排队等候不算）
 };
 void rp_shader_live_compile_take(struct rp_shader_live_compile_stats *out);
@@ -95,3 +141,39 @@ int rp_shader_lib_reject(const struct rp_prog *p);
 void rp_shader_reset(void);     // 会话收尾：放掉全部着色器
 // 游戏常量缓冲里的贴图句柄指向没登记的号、按默认描述符给了编译事实的次数（信息计数，不是未接；会话收尾清零）。#1594 片 4
 uint64_t rp_shader_ubo_default_fact_count(void);
+
+// ---------- 任务 / 网格着色器计算模拟（对齐 iOS nvn_mtl.m / nvn_geometry.inc S2A_MESH_EMU） ----------
+enum {
+    RP_MESH_THREADS_MAX = 1024,
+    RP_MESH_VERTICES_MAX = 256,
+    RP_MESH_PRIMITIVES_MAX = 512,
+    RP_MESH_PAYLOAD_MAX = 16384,
+    RP_MESH_TASK_CAP_MAX = 4096,
+    RP_MESH_DIRECT_CAP_MAX = 65536,
+    RP_MESH_SPAWN_PER_TASK_MAX = 1024,
+};
+// 一笔任务 / 网格绘制所需的计算模拟程序包：
+//   task_cs：可选任务计算核（is_compute = 1，绑定取 NVN 阶段 3；mesh_wants_task = 0 时忽略）
+//   mesh_cs：网格计算核（is_compute = 1，绑定取 NVN 阶段 4）
+//   raster：光栅化程序（sh[0] = 读 NVN_RB_MESH_VBO / EMU 的顶点着色器，sh[1] = 片元着色器）
+// 限额（对齐 iOS）：task_threads / mesh_threads ∈ [1, 1024]；max_vertices ∈ [1, 256]；max_primitives ∈ [1, 512]；
+//   task_payload_bytes ≤ 16384（超限时必须 has_relay != 0 且 relay_slice_words > 0）；
+//   own_shared_spill != 0 明确报红拒收；vertex_stride 须 > 0 且 16 字节对齐。
+struct rp_mesh_prog {
+    struct rp_prog task_cs;
+    struct rp_prog mesh_cs;
+    struct rp_prog raster;
+    uint32_t task_threads;
+    uint32_t mesh_threads;
+    uint32_t max_vertices;
+    uint32_t max_primitives;
+    uint32_t task_payload_bytes;
+    uint32_t vertex_stride;        // 输出顶点记录步长（字节，须 > 0 且 16 字节对齐）
+    uint32_t relay_slice_words;    // 中转载荷或阶段内存片：每网格组字数（has_relay 时须 > 0）
+    uint8_t mesh_wants_task;       // 1 = 网格阶段依赖任务载荷（缺 task_cs 时报红跳过）
+    uint8_t has_relay;             // 1 = 超 16 KiB 中转载荷（载荷与阶段片落交换缓冲）
+    uint8_t expanded_verts;        // 1 = 逐图元属性展开（每网格组留 max_primitives * 3 个顶点记录）
+    uint8_t own_shared_spill;      // 1 = 任务或网格自带未支持的共享内存溢出（报红跳过）
+};
+// 取当前回放状态下任务 / 网格绘制的计算模拟程序包。0 = 得到；1 = 还没好，跳过这笔；-1 = 取不到（已记账）。线程：[提交]。
+int rp_shader_resolve_mesh(const struct rp_shader_req *q, const struct rp_mesh_prog **out);

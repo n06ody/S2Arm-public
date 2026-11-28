@@ -17,6 +17,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
     static class SpirvGenerator
     {
         // Resource pools for Spirv generation. Note: Increase count when more threads are being used.
+        [ThreadStatic] internal static Action<long, long> PhaseSample;
+        [ThreadStatic] internal static Func<long> PhaseCpuClock;
+
         private const int GeneratorPoolCount = 1;
         private static readonly ObjectPool<SpvInstructionPool> _instructionPool;
         private static readonly ObjectPool<SpvLiteralIntegerPool> _integerPool;
@@ -32,6 +35,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         public static byte[] Generate(StructuredProgramInfo info, CodeGenParameters parameters)
         {
+            var phaseSample = PhaseSample;
+            long wallStart = phaseSample == null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
+            long cpuStart = phaseSample == null ? 0 : PhaseCpuClock();
             SpvInstructionPool instPool;
             SpvLiteralIntegerPool integerPool;
 
@@ -206,6 +212,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 _integerPool.Release(integerPool);
             }
 
+            if (phaseSample != null)
+                phaseSample(System.Diagnostics.Stopwatch.GetTimestamp() - wallStart, PhaseCpuClock() - cpuStart);
             return result;
         }
 

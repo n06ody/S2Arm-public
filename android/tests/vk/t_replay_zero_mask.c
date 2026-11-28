@@ -21,13 +21,21 @@ extern uint64_t nvn_vk_dbg_dq_recs(void);
 static nvn_gpu_err err;
 static unsigned failures, cases;
 static int dq_mode;
+static int pdc_enabled, pdc_scope, watch_pdc;
+static unsigned pdc_loads, pdc_dont_care, pdc_cases, pdc_failures;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"assertion failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){return !strcmp(n,"nvk_dq")?dq_mode:d;}
+int nvn_plat_flag(const char *n,int d){
+    if (!strcmp(n, "nvk_dq")) return dq_mode;
+    if (!strcmp(n, "nvk_pass_dont_care")) return pdc_enabled;
+    if (!strcmp(n, "nvk_pass_discard_scope")) return pdc_scope && !getenv("S2A_TEST_PDC_WITHDRAW");
+    if (!strcmp(n, "nvk_pass_cache") && pdc_enabled) return 0;
+    return d;
+}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 void rp_buf_reset(void);
@@ -41,12 +49,25 @@ static nvn_gpu_shader shader(const char *dir,const char *name,nvn_gpu_stage stag
 }
 // A strict fixed registry supplies two color images, optional depth, and one guest pool.
 int g_s2a_logfd=2,s2a_nvn_rast_flip;
-static alignas(4096) unsigned char guest[4096];
+static alignas(4096) unsigned char guest[16384];
 static struct rp_prog prog;static nvn_gpu_cmd active;
 static tex_t textures[3];static nvn_gpu_tex images[3];static nvn_gpu_view views[3];
 static nvn_gpu_pass_desc passes[32];static unsigned npass;
 void __real_nvn_gpu_pass_begin(nvn_gpu_cmd c,const nvn_gpu_pass_desc *p);
 void __wrap_nvn_gpu_pass_begin(nvn_gpu_cmd c,const nvn_gpu_pass_desc *p){REQUIRE(npass<32);passes[npass++]=*p;__real_nvn_gpu_pass_begin(c,p);}
+VKAPI_ATTR VkResult VKAPI_CALL __real_vkCreateRenderPass(VkDevice, const VkRenderPassCreateInfo *,
+                                                        const VkAllocationCallbacks *, VkRenderPass *);
+VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateRenderPass(VkDevice d, const VkRenderPassCreateInfo *ci,
+                                                         const VkAllocationCallbacks *a, VkRenderPass *out) {
+    // The pipeline-compatibility pass uses DONT_CARE for load and store. The
+    // actual pass in this fixture always loads both initialized attachments.
+    if (watch_pdc) for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+        if (ci->pAttachments[i].loadOp != VK_ATTACHMENT_LOAD_OP_LOAD) continue;
+        pdc_loads++;
+        pdc_dont_care += ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
+    return __real_vkCreateRenderPass(d, ci, a, out);
+}
 static uint64_t serial=1;static unsigned emitted;static int completed;
 void __real_nvn_gpu_draw(nvn_gpu_cmd c,const nvn_gpu_draw_args *a);
 void __wrap_nvn_gpu_draw(nvn_gpu_cmd c,const nvn_gpu_draw_args *a){emitted++;__real_nvn_gpu_draw(c,a);}
@@ -60,6 +81,7 @@ uint64_t rp_frame(void) { return 1; }   // #996：rp_draw 首用策略按帧号�
 void rp_perf_add(int i,uint64_t n){(void)i;(void)n;}uint64_t rp_seg_serial(void){return serial;}
 uint64_t rp_sub_serial(void){return serial;}uint64_t rp_sub_fence(void){return 1;}
 int rp_fence_done(uint64_t f){return !f || completed;}
+int rp_discard_submit_reject(nvn_gpu_cmd c) { return c == active ? 0 : RP_PERF_DC_NON_PRIMARY; }
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last){rp_pass_flush(active);*last=serial;return active;}
 void rp_occl_draw(nvn_gpu_cmd c){(void)c;}
 int rp_occl_want(void){return 0;}void rp_occl_pass_opened(int d){REQUIRE(!d);}
@@ -89,6 +111,7 @@ uint32_t rp_fmt_caps(uint32_t f) { return nvn_gpu_format_caps(f); }
 int rp_tex_snap_by_id(int i,tex_t *t,view_t *v,int *h){(void)i;(void)t;(void)v;(void)h;return 0;}
 uint64_t rp_tex_reg_gen(void){return 1;}uint64_t rp_tex_fact_sig(const uint64_t *h,int n,int b,int c){(void)h;(void)n;(void)b;(void)c;return 0;}
 void rp_tex_mark_gpu_written(const tex_t *t){(void)t;}int rp_tex_debug_state(uint64_t s){(void)s;return 0;}
+int nvn_be_tex_gpu_owned(uint64_t s) { return rp_tex_backend_by_serial(s) != NULL; }
 nvn_gpu_tex rp_tex_backend_by_serial(uint64_t s){for(int i=0;i<3;i++)if(textures[i].serial==s)return images[i];return NULL;}
 int rp_tex_is_read(const tex_t *t,const rp_pass_read *reads,int n){(void)t;(void)reads;(void)n;REQUIRE(0);return 0;} // 此夹具没有采样或图像绑定。
 int rp_tex_storage_aliases(const tex_t *a,const tex_t *b){(void)a;(void)b;return 0;}
@@ -189,14 +212,121 @@ static void run_case(struct s2a_vk_device *device,const char *dir,int which) {
     for(int i=0;i<2+depth;i++){nvn_gpu_view_release(views[i]);nvn_gpu_tex_release(images[i]);}
     nvn_gpu_buf_release(readback,NULL,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
+
+static void run_pdc_case(struct s2a_vk_device *device, const char *dir, int which) {
+    enum { W = 32, H = 32, BYTES = W * H * 4, VTX_GAP = 0, VTX_HIT = 1, UBO_GAP = 2,
+           UBO_HIT = 3, LIST_BOUNDARY = 4, DISABLED = 5 };
+    const int uniform = which == UBO_GAP || which == UBO_HIT;
+    const int overlap = which == VTX_HIT || which == UBO_HIT;
+    const int want_discard = which == VTX_GAP || which == UBO_GAP;
+    pdc_enabled = 1;
+    pdc_scope = which != DISABLED;
+    rp_pass_reset(); rp_draw_reset(); rp_state_reset(); nvn_unimpl_reset();
+    memset(guest, 0, sizeof guest);
+    const nvn_gpu_open_desc od = {.host_device = device, .app_label = "replay-pass-discard-scope"};
+    GPU(nvn_gpu_open(&od, &err));
+    memset(&prog, 0, sizeof prog);
+    prog.color_out_mask = 0xff;
+    const nvn_gpu_layout_ent entry = {.set = 0, .binding = 0, .cls = NVN_GPU_RES_UBO,
+        .src_kind = NVN_RB_CBUF, .count = 1, .access = NVN_GPU_ACC_R, .stages = 1u << NVN_GPU_SH_FS};
+    const nvn_gpu_layout layout = {.ent = &entry, .nent = 1};
+    if (uniform) {
+        prog.nent[1] = 1;
+        prog.ent[1][0] = entry;
+        prog.sh[0] = shader(dir, "depth_state.vert", NVN_GPU_SH_VS, NULL);
+        prog.sh[1] = shader(dir, "pdc_scope_ubo.frag", NVN_GPU_SH_FS, &layout);
+        const float value[4] = {0, 1, 0, 1};
+        uint8_t *const data = guest + (overlap ? 0 : 2 * BYTES);
+        memcpy(data, value, sizeof value);
+        rp_S.ubo[1][0] = (p_bind_buf){.addr = (uintptr_t)data, .size = sizeof value};
+    } else {
+        prog.attr_mask = 1;
+        prog.sh[0] = shader(dir, "tri3.vert", NVN_GPU_SH_VS, NULL);
+        prog.sh[1] = shader(dir, "zero_mask_mrt.frag", NVN_GPU_SH_FS, NULL);
+        const float verts[3][4] = {{-1,-1,0,1}, {3,-1,0,1}, {-1,3,0,1}};
+        uint8_t *const data = guest + (overlap ? 0 : 2 * BYTES);
+        memcpy(data, verts, sizeof verts);
+        rp_S.nattr = rp_S.nstream = 1;
+        rp_S.attr[0] = (va_st){.fmt = NVN_FORMAT_RGBA32F};
+        rp_S.stream[0].stride = 16;
+        rp_S.vbuf[0].address = (uintptr_t)data;
+        rp_S.vbuf[0].size = sizeof verts;
+    }
+    rp_S.color.logic_op = NVN_LOGIC_OP_COPY;
+    rp_S.chmask.mask = 0xff;
+    pool_t pool = {.mem = guest, .size = sizeof guest, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED};
+    p_set_rt target = {.n = 2};
+    for (int i = 0; i < 2; i++) {
+        const nvn_gpu_tex_desc td = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
+            .width = W, .height = H, .depth = 1, .levels = 1}, .usage = NVN_GPU_TEX_RENDER | NVN_GPU_TEX_SAMPLED};
+        GPU(nvn_gpu_tex_create(&td, &images[i], &err));
+        GPU(nvn_gpu_view_create(images[i], NULL, &views[i], &err));
+        textures[i] = (tex_t){.serial = (uint64_t)i + 1, .mem = guest + i * BYTES, .off = i * BYTES,
+            .pool = &pool, .d = td.d, .L = {.size = BYTES}};
+        target.color[i] = &textures[i];
+    }
+    completed = 0; serial++; npass = 0;
+    GPU(nvn_gpu_cmd_begin(NULL, &active, &err));
+    rp_pass_set_rt(active, &target);
+    clear_color(0, 15, 0, 0, 1); clear_color(1, 15, 0, 0, 1);
+    rp_pass_flush(active);
+    npass = 0;
+    struct {
+        op_hdr draw_header;
+        p_draw draw;
+        op_hdr clear_header;
+        p_clear_color clear;
+        op_hdr end;
+    } list = {.draw_header = {OP_DRAW, sizeof(op_hdr) + sizeof(p_draw)},
+        .draw = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .count = 3, .instances = 1},
+        .clear_header = {OP_CLEAR_COLOR, sizeof(op_hdr) + sizeof(p_clear_color)},
+        .clear = {.mask = 15, .rgba = {0,0,1,1}}, .end = {OP_END, sizeof(op_hdr)}};
+    if (which == LIST_BOUNDARY) list.clear_header = list.end;
+    const unsigned before = emitted;
+    pdc_loads = pdc_dont_care = 0;
+    watch_pdc = 1;
+    rp_draw_stream = &list.draw_header;
+    rp_draw(active, &list.draw, NULL, rp_draw_stream);
+    rp_draw_stream = NULL;
+    watch_pdc = 0;
+    REQUIRE(emitted == before + 1 && npass == 1);
+    rp_pass_clear_color(active, &list.clear, &list.clear_header);
+    rp_pass_flush(active);
+    REQUIRE(npass == 2 && passes[1].color[0].load == NVN_GPU_LOAD_CLEAR);
+    REQUIRE(!nvn_unimpl_kinds());
+    nvn_gpu_buf readback = buffer(2 * BYTES, NULL);
+    for (int i = 0; i < 2; i++)
+        nvn_gpu_copy_tex_buf(active, images[i], 0, 0, NULL, readback, i * BYTES, W * 4, BYTES);
+    GPU(nvn_gpu_cmd_commit(active, 1, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(1, 5000000000ull, &err));
+    completed = 1;
+    const uint8_t *const pixels = nvn_gpu_buf_cpu(readback);
+    REQUIRE(pixels);
+    const uint8_t expect[2][4] = {{0,0,255,255}, {0,255,0,255}};
+    unsigned bad = 0;
+    for (unsigned i = 0; i < 2; i++) for (unsigned p = 0; p < W * H; p++)
+        bad += memcmp(pixels + i * BYTES + p * 4, expect[i], 4) != 0;
+    printf("pdc scope dq=%d case=%d store_dont_care=%u expected=%d pixels=%d bad=%u\n",
+           dq_mode, which, pdc_dont_care, want_discard, 2 * W * H, bad);
+    pdc_cases++;
+    pdc_failures += bad || pdc_loads != 2 || pdc_dont_care != (unsigned)want_discard ||
+        passes[0].terminal_discard != want_discard;
+    rp_pass_reset(); rp_draw_reset(); rp_buf_reset();
+    nvn_gpu_shader_release(prog.sh[0]); nvn_gpu_shader_release(prog.sh[1]);
+    for (int i = 0; i < 2; i++) { nvn_gpu_view_release(views[i]); nvn_gpu_tex_release(images[i]); }
+    nvn_gpu_buf_release(readback, NULL, NULL);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+}
 int main(int argc,char **argv) {
     if(argc!=3)return 2;
     dq_mode=atoi(argv[2]);REQUIRE(dq_mode==0||dq_mode==1);
     struct s2a_vk_device device;char why[256];
     if(s2a_vk_device_create(&device,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
     for(int c=0;c<7;c++)run_case(&device,argv[1],c);
+    for(int c=0;c<6;c++)run_pdc_case(&device,argv[1],c);
     uint64_t records=nvn_vk_dbg_dq_recs();REQUIRE(dq_mode?records>0:records==0);
     REQUIRE(!s2a_vk_device_destroy(&device,1));
     printf("zero-mask cases=%u pixel-failures=%u dq-records=%llu\n",cases,failures,(unsigned long long)records);
-    return failures?1:0;
+    printf("pdc scope cases=%u failures=%u\n", pdc_cases, pdc_failures);
+    return failures || pdc_failures ? 1 : 0;
 }

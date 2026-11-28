@@ -421,7 +421,7 @@ static struct s2a_write_bound* s2a_spirv_write_bounds(const void* blob, size_t b
   if (!count || !blob || ((uintptr_t)blob & 3) || bytes < 20 || bytes > (4u << 20))
     return NULL;
   uint32_t local[3];
-  if (s2a_spirv_workgroup_size(blob, bytes, entry, local) || !local[0])
+  if (s2a_spirv_workgroup_size_ex(blob, bytes, entry, 1, local) || !local[0])
     return NULL;
   struct wb_module m = {.words = blob, .count = bytes / 4, .local_x = local[0], .budget = 1000000};
   m.bound = m.words[3];

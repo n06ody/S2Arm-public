@@ -162,7 +162,7 @@ int main(void) {
         struct s2a_source_entry_view views[3]; memset(views, 0, sizeof views);
         uint8_t identity[32]; memset(identity, 7, sizeof identity);
         g_loads = 0; memset(g_got_nent, 0, sizeof g_got_nent);
-        struct entry *en = build((const uint8_t *)json, (size_t)n, views, 2, identity, 0);
+        struct entry *en = build((const uint8_t *)json, (size_t)n, views, 3u, identity, 0, 0);
         CHECK(en && !en->failed, "a fragment stage with four storage images builds");
         if (en && !en->failed) {
             CHECK(en->prog.nent[1] == 4 && g_got_nent[1] == 4, "four layout entries reach the program record and the backend");
@@ -192,7 +192,7 @@ int main(void) {
         int n = make_json(json, sizeof json, d, 1, img_binding(bind, sizeof bind, 0, bb[k].slot, bb[k].count, ""));
         struct s2a_source_entry_view views[3]; memset(views, 0, sizeof views);
         uint8_t identity[32]; memset(identity, 9, sizeof identity);
-        struct entry *en = build((const uint8_t *)json, (size_t)n, views, 2, identity, 0);
+        struct entry *en = build((const uint8_t *)json, (size_t)n, views, 3u, identity, 0, 0);
         char what[320];
         snprintf(what, sizeof what, "build refuses a program with an unmappable image (%s)", bb[k].what);
         CHECK(en && en->failed && !en->prog.sh[0] && !en->prog.sh[1], what);
@@ -207,7 +207,7 @@ int main(void) {
             struct s2a_source_entry_view views[3]; memset(views, 0, sizeof views);
             uint8_t identity[32]; memset(identity, 11, sizeof identity);
             g_last_red[0] = 0;
-            struct entry *en = build((const uint8_t *)json, (size_t)n, views, 2, identity, 0);
+            struct entry *en = build((const uint8_t *)json, (size_t)n, views, 3u, identity, 0, 0);
             char what[160];
             if (nums[k] == 65535) {
                 snprintf(what, sizeof what, "binding %d (the 16-bit ceiling) builds", nums[k]);

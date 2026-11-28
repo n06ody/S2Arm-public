@@ -8,7 +8,7 @@ static pthread_mutex_t observed_mu = PTHREAD_MUTEX_INITIALIZER;
 #define OBS_REAL(f) extern __typeof__(f) __real_##f
 #define OBS_TYPE(f) _Static_assert(__builtin_types_compatible_p(__typeof__(&__wrap_##f), PFN_##f), #f " signature")
 static struct { VkImageView view; VkImage image; VkImageSubresourceRange range; unsigned char dead; } observed_views[256];   // dead：已销毁（同一个句柄重新创建时清零）
-static struct { VkFramebuffer fb; VkImageView views[9]; unsigned n; } observed_fbs[256];
+static struct { VkFramebuffer fb; VkImageView views[9]; unsigned n; int imageless; } observed_fbs[256];
 static struct { VkDescriptorSet set; VkImageView views[4][8]; } observed_sets[256];
 static unsigned observed_nv, observed_nf, observed_ns, observed_draws, observed_overlap, observed_copies;
 static unsigned observed_dead_samples;   // 绘制时绑着的组里被采样的、已经销毁的视图条数（整池组回收：补丁没还原时才会出现）
@@ -50,13 +50,42 @@ OBS_REAL(vkCreateFramebuffer);
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateFramebuffer(VkDevice d,const VkFramebufferCreateInfo *p,const VkAllocationCallbacks *a,VkFramebuffer *f) {
     VkResult r=__real_vkCreateFramebuffer(d,p,a,f);
     pthread_mutex_lock(&observed_mu);
-    if(r==VK_SUCCESS){REQUIRE(p->attachmentCount<=9);unsigned i=0;while(i<observed_nf&&observed_fbs[i].fb!=*f)i++;if(i==observed_nf){REQUIRE(observed_nf<256);observed_nf++;}observed_fbs[i].fb=*f;observed_fbs[i].n=p->attachmentCount;memcpy(observed_fbs[i].views,p->pAttachments,p->attachmentCount*sizeof(VkImageView));}
+    if (r == VK_SUCCESS) {
+        REQUIRE(p->attachmentCount <= 9);
+        unsigned i = 0;
+        while (i < observed_nf && observed_fbs[i].fb != *f) i++;
+        if (i == observed_nf) { REQUIRE(observed_nf < 256); observed_nf++; }
+        observed_fbs[i].fb = *f;
+        observed_fbs[i].n = p->attachmentCount;
+        observed_fbs[i].imageless = (p->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT_KHR) != 0;
+        if (p->attachmentCount && !observed_fbs[i].imageless)
+            memcpy(observed_fbs[i].views, p->pAttachments, p->attachmentCount * sizeof(VkImageView));
+    }
     pthread_mutex_unlock(&observed_mu);return r;
 }
 OBS_TYPE(vkCreateFramebuffer);
 OBS_REAL(vkCmdBeginRenderPass);
 VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo *p,VkSubpassContents s) {
-    observed_fb=p->framebuffer;if(observed_on_begin)observed_on_begin(p);__real_vkCmdBeginRenderPass(c,p,s);
+    pthread_mutex_lock(&observed_mu);
+    observed_fb = p->framebuffer;
+    unsigned i = 0;
+    while (i < observed_nf && observed_fbs[i].fb != observed_fb) i++;
+    if (i < observed_nf && observed_fbs[i].imageless) {
+        // 无图帧缓冲在每次开通道时才绑定这次实际使用的视图。
+        const VkBaseInStructure *chain = p->pNext;
+        while (chain && chain->sType != VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO_KHR)
+            chain = chain->pNext;
+        REQUIRE(chain);
+        const VkRenderPassAttachmentBeginInfoKHR *attachments = (const VkRenderPassAttachmentBeginInfoKHR *)chain;
+        REQUIRE(attachments->attachmentCount == observed_fbs[i].n);
+        if (attachments->attachmentCount) {
+            REQUIRE(attachments->pAttachments);
+            memcpy(observed_fbs[i].views, attachments->pAttachments, attachments->attachmentCount * sizeof(VkImageView));
+        }
+    }
+    pthread_mutex_unlock(&observed_mu);
+    if (observed_on_begin) observed_on_begin(p);
+    __real_vkCmdBeginRenderPass(c,p,s);
 }
 OBS_TYPE(vkCmdBeginRenderPass);
 OBS_REAL(vkUpdateDescriptorSets);

@@ -58,6 +58,13 @@ int rp_post_gpu_write(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }
 int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) { (void)a; (void)n; (void)m; (void)s; return 0; }
 nvn_gpu_buf rp_buf_for_null_storage(void) { return NULL; }
 
+// 独立夹具省略 rp_buf.c，只绑定直接存储缓冲，没有保存间接指针的 UBO。
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value) {
+    (void)b; (void)off; (void)addr; (void)value;
+    CHECK(0, "unexpected indirect UBO pointer read");
+    return 0;
+}
+
 // 存储缓冲地址表：阶段 st（0 顶点 / 1 片元）的槽 j 绑地址 slot_addr(st, j)，背后是内容各不相同的缓冲 slot_buf[st][j]（第 0 个字 = slot_color）。
 //   rp_buf_resolve 替身按地址找到缓冲，并把「回放真去解析过哪些阶段 / 槽」记进 resolved_mask——对账用的就是回放自己的答案。
 enum { SLOT_BUF_BYTES = 512 };

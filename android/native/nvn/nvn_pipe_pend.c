@@ -93,6 +93,20 @@ int nvk_pp_enter(nvk_pp *t, const void *key, int (*eq)(const void *, const void 
     return NVK_PP_ENTER_BUILDER;
 }
 
+int nvk_pp_reclaim_ready(nvk_pp *t, int handle) {
+    if (!t || handle < 0 || handle >= NVK_PP_MAX) return 0;
+    pthread_mutex_lock(&t->mu);
+    struct nvk_pp_ent *e = &t->ent[handle];
+    const int ready = e->used && e->state == NVK_PP_READY;
+    if (ready) {
+        e->state = NVK_PP_COMPILING;
+        e->obj = NULL;
+        e->late = e->stuck = 0;
+    }
+    pthread_mutex_unlock(&t->mu);
+    return ready;
+}
+
 void nvk_pp_publish(nvk_pp *t, int handle, void *obj, int code, const char *why) {
     if (!t || handle < 0 || handle >= NVK_PP_MAX) return;
     pthread_mutex_lock(&t->mu);

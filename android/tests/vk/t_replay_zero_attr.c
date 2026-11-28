@@ -9,6 +9,7 @@
 #include "nvn_unimpl.h"
 #include "nvn_dirty.h"
 #include "nvn_refl.h"
+#include "nvn_mtl.h"
 #include "vk_device.h"
 #include "nvn_plat_vk.h"
 #include <stdio.h>
@@ -16,18 +17,20 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stdalign.h>
+#include <sys/mman.h>
 #include <time.h>
 extern uint64_t nvn_vk_dbg_dq_recs(void);
 static nvn_gpu_err err;
 static atomic_int retired;
 static unsigned failures;
+static int dq;
 #define REQUIRE(x) do { if(!(x)){fprintf(stderr,"assertion failed line %d: %s rc=%d why=%s\n",__LINE__,#x,err.rc.code,err.why);exit(2);} } while(0)
 #define GPU(x) REQUIRE(nvn_gpu_ok(x))
 const char *const *nvn_plat_vk_instance_exts(uint32_t *n){*n=0;return NULL;}
 VkResult nvn_plat_vk_surface_create(VkInstance i,void *w,VkSurfaceKHR *s){(void)i;(void)w;*s=VK_NULL_HANDLE;return VK_ERROR_EXTENSION_NOT_PRESENT;}
 int nvn_plat_window_size(void *w,uint32_t *x,uint32_t *y){(void)w;(void)x;(void)y;return 0;}
 void nvn_plat_safepoint(void){}
-int nvn_plat_flag(const char *n,int d){(void)n;return d;}
+int nvn_plat_flag(const char *n,int d){return !strcmp(n,"nvk_dq") ? dq : d;}
 void nvn_plat_log(int l,const char *c,const char *s){(void)l;fprintf(stderr,"[%s] %s\n",c?c:"",s?s:"");}
 static void done(void *u,const nvn_gpu_done *d){(void)u;(void)d;}
 static void retirement(void *u){(void)u;atomic_fetch_add(&retired,1);}
@@ -43,7 +46,7 @@ static nvn_gpu_shader shader(const char *dir,const char *name,nvn_gpu_stage stag
 // Shader/pass/pool registration are controlled fixtures. The mirror allocator,
 // sync_write GPU exclusion, address resolver, draw implementation and Vulkan are real.
 int g_s2a_logfd=2,s2a_nvn_rast_flip;
-static alignas(4096) unsigned char guest[4096];
+static alignas(4096) unsigned char guest[8192];
 static struct rp_prog prog;static p_set_rt target;static tex_t target_tex;
 static nvn_gpu_view target_view;static nvn_gpu_cmd active;
 static uint64_t serial=1;static unsigned emitted;static int pass_open,expect_no_draw;
@@ -116,9 +119,196 @@ static void run_case(struct s2a_vk_device *d,const char *dir,int mode){
  REQUIRE(emitted-before==1);REQUIRE(nvn_unimpl_kinds()==0);
  rp_draw_reset();rp_buf_reset();nvn_gpu_shader_release(prog.sh[0]);nvn_gpu_shader_release(prog.sh[1]);nvn_gpu_view_release(target_view);nvn_gpu_tex_release(tex);int t=atomic_load(&retired)+1;nvn_gpu_buf_release(rb,retirement,NULL);struct timespec pause={0,1000000};for(int i=0;i<5000&&atomic_load(&retired)<t;i++)nanosleep(&pause,NULL);GPU(nvn_gpu_close(5000000000ull,&err));
 }
-int main(int argc,char **argv){if(argc!=2)return 2;struct s2a_vk_device d;char why[256];if(s2a_vk_device_create(&d,why,sizeof why)){fprintf(stderr,"%s\n",why);return 2;}
- for(int mode=0;mode<2;mode++)run_case(&d,argv[1],mode);
- REQUIRE(!s2a_vk_device_destroy(&d,1));printf("real rp_draw zero-attr cases2 pixel-failures%u\n",failures);return failures?1:0;}
+enum { UI2F_NONE, UI2F_INDEX, UI2F_VERTEX, UI2F_INDEX_RANGE, UI2F_VERTEX_RANGE,
+       UI2F_INDEX_UNREADABLE, UI2F_VERTEX_UNREADABLE, UI2F_ALIAS_INDEX, UI2F_SPLIT_INDEX };
+
+struct ui2f_case {
+    const char *name;
+    int index_type, base_vertex;
+    uint32_t restart, divisor, format;
+    int negative;
+    const char *reason;
+};
+
+static const struct ui2f_case ui2f_cases[] = {
+    {"direct-i2f-first-vertex", -1, 0, 0, 0, NVN_FORMAT_RG32_I2F, 0, NULL},
+    {"u8-base-positive-fixed-restart", 0, 2, 0xff, 0, NVN_FORMAT_RG32_I2F, 0, NULL},
+    {"u16-base-negative-custom-restart", 1, -2, 0xcafe, 0, NVN_FORMAT_RG32_I2F, 0, NULL},
+    {"u32-base-positive-fixed-restart", 2, 2, UINT32_MAX, 0, NVN_FORMAT_RG32_I2F, 0, NULL},
+    {"instanced-ui2f-divisor-2", -1, 0, 0, 2, NVN_FORMAT_R32_UI2F, 0, NULL},
+    {"instanced-i2f-divisor-1", -1, 0, 0, 1, NVN_FORMAT_R32_I2F, 0, NULL},
+    {"u16-indexed-instanced-two-decoded-streams", 1, 2, 0, 2, NVN_FORMAT_R32_UI2F, 0, NULL},
+    {"gpu-written-index", 1, 2, 0xffff, 0, NVN_FORMAT_RG32_I2F, UI2F_INDEX, "vertex_cpu_decode_index_gpu_pending"},
+    {"gpu-written-index-alias", 1, 2, 0xffff, 0, NVN_FORMAT_RG32_I2F, UI2F_ALIAS_INDEX, "vertex_cpu_decode_index_gpu_pending"},
+    {"split-index-alias", 1, 2, 0xffff, 0, NVN_FORMAT_RG32_I2F, UI2F_SPLIT_INDEX, "vertex_cpu_decode_index_range"},
+    {"gpu-written-vertex", 1, 2, 0xffff, 0, NVN_FORMAT_RG32_I2F, UI2F_VERTEX, "vertex_cpu_decode_gpu_pending"},
+    {"index-buffer-overrun", 2, 2, UINT32_MAX, 0, NVN_FORMAT_RG32_I2F, UI2F_INDEX_RANGE, "vertex_cpu_decode_index_range"},
+    {"negative-effective-vertex", 1, -20, 0xffff, 0, NVN_FORMAT_RG32_I2F, 0, "vertex_cpu_decode_range"},
+    {"instance-stream-overrun", -1, 0, 0, 2, NVN_FORMAT_R32_UI2F, UI2F_VERTEX_RANGE, "vertex_cpu_decode_range"},
+    {"cpu-unreadable-index", 1, 2, 0xffff, 0, NVN_FORMAT_RG32_I2F, UI2F_INDEX_UNREADABLE, "vertex_cpu_decode_index_unreadable"},
+    {"cpu-unreadable-vertex", -1, 0, 0, 2, NVN_FORMAT_R32_UI2F, UI2F_VERTEX_UNREADABLE, "vertex_cpu_decode_source_unreadable"},
+};
+
+static void run_ui2f_case(struct s2a_vk_device *dev, const char *dir, const struct ui2f_case *tc) {
+    const int indexed = tc->index_type >= 0;
+    const int instanced = tc->divisor != 0;
+    const int direct = !indexed && !instanced;
+    const size_t isz = indexed ? (size_t)1 << tc->index_type : 0;
+    const int forbidden_page = tc->negative == UI2F_INDEX_UNREADABLE || tc->negative == UI2F_VERTEX_UNREADABLE;
+    uint8_t *indices = guest + (tc->negative == UI2F_INDEX_UNREADABLE ? 4096 : 512);
+    uint8_t *positions = guest + 256;
+    uint8_t *codes = guest + (tc->negative == UI2F_VERTEX_UNREADABLE ? 4096 : 768);
+    memset(guest, 0, sizeof guest);
+    nvn_gpu_open_desc od = {.host_device = dev, .app_label = "real-replay-ui2f"};
+    GPU(nvn_gpu_open(&od, &err));
+    memset(&prog, 0, sizeof prog);
+    prog.sh[0] = shader(dir, "replay_ui2f.vert", NVN_GPU_SH_VS, NULL);
+    prog.sh[1] = shader(dir, "quad.frag", NVN_GPU_SH_FS, NULL);
+    prog.attr_mask = 1u | 1u << 3;
+    prog.color_out_mask = 15;
+
+    nvn_gpu_tex_desc td = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
+                                .width = 64, .height = 64, .depth = 1, .levels = 1},
+                           .usage = NVN_GPU_TEX_RENDER};
+    nvn_gpu_tex tex = NULL;
+    GPU(nvn_gpu_tex_create(&td, &tex, &err));
+    GPU(nvn_gpu_view_create(tex, NULL, &target_view, &err));
+    nvn_gpu_buf rb = buffer(64 * 64 * 4, NULL);
+    target_tex = (tex_t){.d = td.d, .serial = 1};
+    target = (p_set_rt){.n = 1, .color = {&target_tex}};
+
+    rp_state_reset();
+    rp_draw_reset();
+    nvn_unimpl_reset();
+    rp_S.nattr = 4;
+    rp_S.nstream = 2;
+    rp_S.attr[0].fmt = indexed || direct ? NVN_FORMAT_RG32_I2F : NVN_FORMAT_RG32F;
+    rp_S.attr[3].fmt = instanced ? tc->format : NVN_FORMAT_R32F;
+    rp_S.attr[3].stream = 1;
+    rp_S.stream[0].stride = 8;
+    rp_S.stream[1].stride = instanced ? 8 : 0;
+    rp_S.stream[1].divisor = tc->divisor;
+    rp_S.attr[3].offset = instanced ? 4 : 0;
+    rp_S.vbuf[0].address = (uintptr_t)positions;
+    rp_S.vbuf[0].size = indexed || direct ? 11 * 8 : 4 * 8;
+    rp_S.vbuf[1].address = (uintptr_t)codes;
+    rp_S.vbuf[1].size = !instanced ? 4 : tc->negative == UI2F_VERTEX_RANGE ? 4 * 8 : 7 * 8;
+    rp_S.color.logic_op = NVN_LOGIC_OP_COPY;
+    rp_S.chmask.mask = 15;
+    rp_S.poly.mode = NVN_POLYGON_MODE_FILL;
+
+    if (indexed) {
+        // Vertex IDs 3..10 draw two strips separated by an unpainted band.
+        static const int32_t strips[8][2] = {
+            {-2,-2}, {-2,2}, {-1,-2}, {-1,2}, {1,-2}, {1,2}, {2,-2}, {2,2}
+        };
+        static const int32_t quad[4][2] = {{-1,-1}, {-1,1}, {1,-1}, {1,1}};
+        if (instanced) memcpy(positions + 3 * 8, quad, sizeof quad);
+        else memcpy(positions + 3 * 8, strips, sizeof strips);
+        for (unsigned i = 0; i < 9; i++) {
+            const uint32_t raw = i == 4 ? tc->restart : 3 + i - (i > 4) - (tc->base_vertex < -2 ? -2 : tc->base_vertex);
+            memcpy(indices + i * isz, &raw, isz);
+        }
+        rp_S.restart = (p_prim_restart){.on = !instanced, .index = tc->restart};
+    } else if (direct) {
+        static const int32_t quad[4][2] = {{-2,-2}, {-2,2}, {2,-2}, {2,2}};
+        memcpy(positions + 3 * 8, quad, sizeof quad);
+    } else {
+        static const float quad[4][2] = {{-1,-1}, {-1,1}, {1,-1}, {1,1}};
+        memcpy(positions, quad, sizeof quad);
+    }
+    if (!instanced) {
+        const float one = 1.0f;
+        memcpy(codes, &one, sizeof one);
+    } else {
+        for (unsigned i = 3; i < 7; i++) {
+            int32_t value = i - 3 < 2 / tc->divisor ? 11 : 22;
+            if (tc->format == NVN_FORMAT_R32_I2F) value = -value;
+            memcpy(codes + i * 8 + 4, &value, sizeof value);
+        }
+    }
+
+    GPU(nvn_gpu_cmd_begin(NULL, &active, &err));
+    serial++;
+    const int alias = tc->negative == UI2F_ALIAS_INDEX || tc->negative == UI2F_SPLIT_INDEX;
+    if (alias) {
+        const uint64_t alias_bytes = (tc->negative == UI2F_ALIAS_INDEX ? 9 : 4) * isz;
+        REQUIRE(rp_buf_alias_set((uintptr_t)(guest + 1024), alias_bytes, (uintptr_t)indices));
+    }
+    if (tc->negative == UI2F_INDEX || tc->negative == UI2F_VERTEX || tc->negative == UI2F_ALIAS_INDEX) {
+        const uint64_t write_addr = (uintptr_t)(tc->negative == UI2F_VERTEX ? positions + 24 : indices);
+        nvn_gpu_buf mirror = NULL;
+        uint64_t offset, key;
+        REQUIRE(rp_buf_resolve(active, write_addr, 4, &mirror, &offset));
+        nvn_gpu_fill_buf(active, mirror, offset, 4, 0);
+        REQUIRE(rp_buf_gpu_write_note(write_addr, 4, &key));
+    }
+    pass(active, 1);
+    rp_pass_flush(active);
+    if (forbidden_page) REQUIRE(mprotect(guest + 4096, 4096, PROT_NONE) == 0);
+    const p_draw dr = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP, .count = 4, .first = direct ? 3 : 0,
+                       .instances = direct ? 1 : 4, .base_instance = direct ? 0 : 3};
+    const p_draw_idx di = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP, .count = instanced ? 4 : 9, .itype = tc->index_type,
+                          .instances = instanced ? 4 : 1, .base_instance = instanced ? 3 : 0,
+                          .base_vertex = tc->base_vertex,
+                          .ibuf = (uintptr_t)(tc->negative == UI2F_INDEX_RANGE ? guest + sizeof guest - isz :
+                                              alias ? guest + 1024 : indices)};
+    rp_draw(active, indexed ? NULL : &dr, indexed ? &di : NULL, NULL);
+    if (forbidden_page) REQUIRE(mprotect(guest + 4096, 4096, PROT_READ | PROT_WRITE) == 0);
+    rp_pass_flush(active);
+    nvn_gpu_copy_tex_buf(active, tex, 0, 0, NULL, rb, 0, 64 * 4, 64 * 64 * 4);
+    GPU(nvn_gpu_cmd_commit(active, 1, done, NULL, &err));
+    GPU(nvn_gpu_fence_wait(1, 5000000000ull, &err));
+
+    const uint8_t *pixels = nvn_gpu_buf_cpu(rb);
+    unsigned bad = 0;
+    for (unsigned y = 0; y < 64; y++) for (unsigned x = 0; x < 64; x++) {
+        const uint8_t expected[4] = {
+            !tc->reason && instanced && x < 32 ? 255 : 0,
+            !tc->reason && (instanced ? x >= 32 : (direct || x < 16 || x >= 48)) ? 255 : 0, 0, 255
+        };
+        bad += memcmp(pixels + 4 * (y * 64 + x), expected, sizeof expected) != 0;
+    }
+    uint64_t draws, skips;
+    rp_draw_stats(&draws, &skips);
+    const uint64_t named = tc->reason ? nvn_unimpl_count("draw", tc->reason) : 0;
+    printf("UI2F dq=%d %s draws=%llu skips=%llu named=%llu bad_pixels=%u/4096\n",
+           dq, tc->name, (unsigned long long)draws, (unsigned long long)skips, (unsigned long long)named, bad);
+    failures += bad || draws != (tc->reason == NULL) || skips != (tc->reason != NULL) ||
+                named != (tc->reason != NULL) || nvn_unimpl_kinds() != (tc->reason != NULL);
+
+    rp_draw_reset();
+    rp_buf_reset();
+    nvn_gpu_shader_release(prog.sh[0]);
+    nvn_gpu_shader_release(prog.sh[1]);
+    nvn_gpu_view_release(target_view);
+    nvn_gpu_tex_release(tex);
+    nvn_gpu_buf_release(rb, NULL, NULL);
+    GPU(nvn_gpu_close(5000000000ull, &err));
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc != 3 || (strcmp(argv[2], "0") && strcmp(argv[2], "1"))) return 2;
+    dq = argv[2][0] == '1';
+    struct s2a_vk_device dev;
+    char why[256];
+    if (s2a_vk_device_create(&dev, why, sizeof why)) {
+        fprintf(stderr, "%s\n", why);
+        return 2;
+    }
+    const uint64_t before = nvn_vk_dbg_dq_recs();
+    for (int mode = 0; mode < 2; mode++) run_case(&dev, argv[1], mode);
+    printf("real rp_draw zero-attr cases2 pixel-failures%u\n", failures);
+    const unsigned zero_failures = failures;
+    for (size_t i = 0; i < sizeof ui2f_cases / sizeof ui2f_cases[0]; i++)
+        run_ui2f_case(&dev, argv[1], &ui2f_cases[i]);
+    REQUIRE((nvn_vk_dbg_dq_recs() > before) == (dq != 0));
+    printf("UI2F dq=%d cases=%zu failures=%u\n", dq, sizeof ui2f_cases / sizeof ui2f_cases[0],
+           failures - zero_failures);
+    REQUIRE(!s2a_vk_device_destroy(&dev, 1));
+    return failures ? 1 : 0;
+}
 
 // 本夹具不模拟真实块代号；返回未知，让回放沿用逐页保守路径。
 int nvn_dirty_log_open(const void *s, uint64_t *i, uint64_t *c) { (void)s; (void)i; (void)c; return 0; }   // 本夹具没有脏页追加日志：回放核心走原路径

@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define NVK_PROG_REC_STAGES 3
+#define NVK_PROG_REC_STAGES 5
 #define NVK_PROG_REC_C1_MIN 0x100     // c1 完整判据，与 source_store / build 同源（views[st].c1_bytes >= 0x100 才算捕获）
 #define NVK_PROG_REC_C1_MAX 0x10000   // 单阶段 c1 上限，与 source_store 接受的 c1 范围上限同源
 
@@ -39,7 +39,8 @@ struct nvk_prog_rec {
     uint32_t stage_mask;                    // 图形阶段掩码，或 32 = 计算阶段
     uint8_t keys[NVK_PROG_REC_STAGES][8];
     uint8_t c1_ok;                          // 位 i = 阶段 i 的 c1 完整（口径同 views[st].c1_bytes >= 0x100）
-    uint8_t lp_ok;                          // 记录时的状态与出包预编库的翻译状态相符（nvk_shader.c libpack_state_ok）；旧清单读作 0 = 走现场编
+    uint8_t lp_ok;                          // 2 = 记录时可用出包预编库；旧的 0/1 保守走现编
+    uint8_t lp_ssbo_window;                 // 非对齐程序已用过带窗口补偿的库，预热也必须核对补偿合同
     // c1 整段（位 st 有效时 c1_len[st] 在 [MIN, MAX]）。只截前 0x100 字节会让预热建出后段全 0 的程序、以同一身份发布给真实绘制
     //   （八方旅人调色 LUT 读到第 2304 字节 → 场景整幅黑）。指针：note 的调用方传自己的字节（只在调用期间读）；
     //   清单里的记录（take 拿到的、note 存下的）指向本模块的只读副本——只追加、按内容去重、进程内不释放，记录按值拷贝随便传。
