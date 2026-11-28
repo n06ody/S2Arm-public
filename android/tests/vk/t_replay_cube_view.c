@@ -286,7 +286,7 @@ static void check_override_writer(const char *which) {
 }
 
 int main(int argc, char **argv) {
-    const int writer = argc == 5 && !strcmp(argv[2], "sparse-write");
+    const int writer = (argc == 5 || argc == 6) && !strcmp(argv[2], "sparse-write");
     const int override = argc == 4 && !strcmp(argv[2], "override");
     if (argc != 2 && !writer && !override) return 2;
     char why[256] = {0};
@@ -303,7 +303,13 @@ int main(int argc, char **argv) {
     }
     if (writer) {
         const int native = atoi(argv[4]);
-        if (!native || sparse_fixture_probe()) check_sparse_writer(argv[3], native);
+        if (!native || sparse_fixture_probe()) {
+            if (argc == 6 && (!strcmp(argv[3], "attachment") || !strcmp(argv[3], "storage")))
+                check_sparse_pass_writer(argv[1], argv[3], native, argv[5]);
+            else if (argc == 5)
+                check_sparse_writer(argv[3], native);
+            else CHECK(0, "unknown sparse writer case");
+        }
         else CHECK(0, "required native sparse support missing");
         nvn_gpu_err err = {0};
         CHECK(OK(nvn_gpu_close(5000000000ull, &err)), "sparse writer close: %s", err.why);

@@ -11,6 +11,8 @@ static const uint8_t *fixture_pages[SPARSE_BYTES / VPAGE];
 static uint64_t fixture_page_gen[SPARSE_BYTES / VPAGE], fixture_gen;
 static unsigned fixture_binds, fixture_image_binds, fixture_tail_binds, fixture_creates;
 static int fixture_guard_dense;
+static VkImageUsageFlags fixture_image_usage;
+static VkImageCreateFlags fixture_image_flags;
 static VkDeviceMemory fixture_last_memory;
 static VkDeviceSize fixture_last_size, fixture_resident_bytes;
 
@@ -29,7 +31,11 @@ VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkAllocateMemory(
 extern __typeof__(vkCreateImage) __real_vkCreateImage;
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkCreateImage(
     VkDevice device, const VkImageCreateInfo *info, const VkAllocationCallbacks *allocator, VkImage *image) {
-    if (fixture_pool) fixture_creates++;
+    if (fixture_pool) {
+        fixture_creates++;
+        fixture_image_usage = info->usage;
+        fixture_image_flags = info->flags;
+    }
     return __real_vkCreateImage(device, info, allocator, image);
 }
 
@@ -103,6 +109,16 @@ uint64_t nvn_sparse_map_any_bits(const void *pool, uint64_t addr, uint64_t bytes
     return mapped;
 }
 
+int nvn_sparse_mapped(const void *pool, uint64_t addr, uint64_t bytes) {
+    uint64_t off = 0;
+    if (!sparse_fixture_range(pool, addr, &off) || bytes > fixture_pool->size - off ||
+        off + bytes > SPARSE_BYTES) return 0;
+    const uint64_t end = off + bytes;
+    for (uint64_t i = off / VPAGE; i < (end + VPAGE - 1) / VPAGE; i++)
+        if (!fixture_pages[i]) return 0;
+    return 1;
+}
+
 int nvn_sparse_since(const void *pool, uint64_t addr, uint64_t bytes, uint64_t gen, uint64_t stamp) {
     (void)stamp;   // Backings in this fixture are immutable.
     uint64_t off = 0;
@@ -162,6 +178,8 @@ static int sparse_fixture_begin(pool_t *pool, tex_t *t) {
     fixture_pool = pool;
     fixture_binds = fixture_image_binds = fixture_tail_binds = fixture_creates = 0;
     fixture_resident_bytes = 0;
+    fixture_image_usage = 0;
+    fixture_image_flags = 0;
     memset(fixture_pages, 0, sizeof fixture_pages);
     return 1;
 }
@@ -426,5 +444,197 @@ static void check_sparse_writer(const char *op, int native) {
     if (dv) nvn_gpu_view_release(dv);
     nvn_gpu_view_release(sv);
     nvn_gpu_tex_release(src);
+    sparse_fixture_end(&pool);
+}
+
+static void sparse_pass_draw(nvn_gpu_cmd cmd, nvn_gpu_view view, nvn_gpu_pipe pipe,
+                             nvn_gpu_buf verts, unsigned w, unsigned h) {
+    nvn_gpu_pass_desc pass = {.ncolor = 1, .w = w, .h = h, .layers = 1};
+    pass.color[0].view = view;
+    pass.color[0].load = NVN_GPU_LOAD_CLEAR;
+    pass.color[0].store = NVN_GPU_STORE_STORE;
+    nvn_gpu_pass_begin(cmd, &pass);
+    if (!nvn_gpu_cmd_record_ok(cmd)) return;
+    const nvn_gpu_dyn dyn = {.origin_ll = 1, .nvp = 1, .vp = {{0, 0, w, h, 0, 1}},
+                             .has_sc = 1, .sc = {0, 0, w, h}};
+    nvn_gpu_set_pipe(cmd, pipe);
+    nvn_gpu_set_dyn(cmd, &dyn);
+    nvn_gpu_set_vbuf(cmd, 0, verts, 0);
+    const nvn_gpu_draw_args draw = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .count = 3, .instances = 1};
+    nvn_gpu_draw(cmd, &draw);
+    nvn_gpu_pass_end(cmd);
+}
+
+static void sparse_pass_dispatch(nvn_gpu_cmd cmd, nvn_gpu_view view, nvn_gpu_pipe pipe, unsigned w, unsigned h) {
+    const nvn_gpu_binding binding = {.ent = 0, .cls = NVN_GPU_RES_IMAGE, .u.view = view};
+    nvn_gpu_set_pipe(cmd, pipe);
+    nvn_gpu_bind(cmd, NVN_GPU_SH_CS, &binding, 1);
+    nvn_gpu_dispatch(cmd, pipe, w / 4, h / 4, 1, NULL, 0);
+}
+
+static unsigned sparse_pass_wrong(const uint32_t *pixels, unsigned w, unsigned h, int rt) {
+    unsigned wrong = 0;
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) {
+        const uint32_t expect = rt ? (x < w / 2 ? 37u : 73u) : x + 4 * y + 1;
+        wrong += pixels[y * w + x] != expect;
+    }
+    return wrong;
+}
+
+static void check_sparse_pass_writer(const char *dir, const char *op, int native, const char *case_name) {
+    enum { W = SPARSE_WIDTH, H = SPARSE_HEIGHT, MW = W / 2, MH = H / 2 };
+    const int rt = !strcmp(op, "attachment");
+    const int whole_hole = !strcmp(case_name, "hole");
+    const int partial_tail = !strcmp(case_name, "tail");
+    const int base_control = !strcmp(case_name, "base");
+    const int raw_attachment = !strcmp(case_name, "raw");
+    const int expect_reject = raw_attachment || partial_tail || (whole_hole &&
+        (rt || !native || !g_dev.properties.sparseProperties.residencyNonResidentStrict));
+    const uint32_t level = whole_hole || base_control ? 0 : 1;
+    const uint32_t width = W >> level, height = H >> level;
+    const uint64_t size = (uint64_t)width * height * 4;
+    fixture_sparse_native = native ? 1 : -1;
+    pool_t pool = {0};
+    tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_R32UI,
+                     .width = W, .height = H, .depth = 1, .levels = 2, .samples = 1,
+                     .flags = NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_IMAGE}, .serial = 106};
+    static uint32_t backing[GUEST_PAGE / 4];
+    for (unsigned i = 0; i < GUEST_PAGE / 4; i++) backing[i] = 0x12345678;
+    if (!sparse_fixture_begin(&pool, &t)) return;
+    sparse_fixture_map(0, (const uint8_t *)backing, 16);
+    sparse_fixture_map(2, (const uint8_t *)backing, 16);
+    if (base_control) {
+        sparse_fixture_map(1, (const uint8_t *)backing, 16);
+        sparse_fixture_map(3, (const uint8_t *)backing, 16);
+    }
+    sparse_fixture_map(BASE_PAGES, (const uint8_t *)backing, partial_tail ? 15 : 16);
+
+    const view_t mip = {.set_levels = 1, .base_level = level, .nlevels = 1};
+    active = begin_cmd();
+    nvn_gpu_tex tex = rp_tex_resolve(&t, active);
+    CHECK(tex && !!fixture_binds == native, "sparse pass allocation native=%d binds=%u", native, fixture_binds);
+    const int promote = rt && native && !raw_attachment;
+    const int check_retained = promote && !expect_reject;
+    const NVNcopyRegion marker_region = {0, 0, 0, 4, 4, 1};
+    uint32_t marker[16];
+    nvn_gpu_buf retained = NULL;
+    if (tex && check_retained) {
+        for (unsigned i = 0; i < 16; i++) marker[i] = 0x5a172300u + i;
+        nvn_gpu_tex_upload(active, tex, level, 0, &marker_region, marker, 16, sizeof marker);
+        rp_tex_mark_gpu_written(&t);
+        retained = make_buf(sizeof marker, NVN_GPU_MEM_SHARED, NULL);
+    }
+    if (promote) CHECK(rp_tex_prepare_sparse_attachment(&t, active), "prepare sparse attachment storage");
+    nvn_gpu_view view = rt && !raw_attachment
+        ? rp_view_for_attach(&t, &mip, active) : rp_view_for(&t, &mip, active);
+    nvn_gpu_tex bound = rp_tex_resolve(&t, active);
+    if (promote) CHECK(bound && bound != tex, "replace the sparse image before publishing attachment views");
+    tex = bound;
+    const VkImageUsageFlags required = rt ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
+    const int has_usage = raw_attachment || (fixture_image_usage & required);
+    CHECK(has_usage, "fully resident sparse mip missing image usage for %s", op);
+    CHECK(!!(fixture_image_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) == (native && !promote),
+          "sparse %s chose the wrong image storage", op);
+    CHECK(view != NULL, "fully resident sparse mip should accept %s", op);
+    if (retained && tex) nvn_gpu_copy_tex_buf(active, tex, level, 0, &marker_region, retained, 0, 16, sizeof marker);
+    finish(active);
+    if (retained) {
+        const int keeps = tex && !memcmp(buf_cpu(retained), marker, sizeof marker);
+        CHECK(keeps, "attachment migration must retain same-command GPU writes");
+        printf("sparse attachment migrate %s retained=%u/16\n", case_name, keeps ? 16 : 0);
+        nvn_gpu_buf_release(retained, NULL, NULL);
+    }
+
+    nvn_gpu_err err = {0};
+    nvn_gpu_shader vs = NULL, sh = NULL;
+    nvn_gpu_pipe pipe = NULL;
+    nvn_gpu_buf verts = NULL;
+    void *vs_bytes = NULL, *fs_bytes = NULL;
+    if (rt) {
+        CHECK(load_shader_pair(dir, "tri.vert", "sparse_attachment.frag", NULL, NULL, &vs, &sh, &vs_bytes, &fs_bytes),
+              "sparse attachment shaders");
+        nvn_gpu_pipe_desc pd = {
+            .poly.mode = NVN_POLYGON_MODE_FILL, .origin_ll = 1, .color.logic_op = NVN_LOGIC_OP_COPY,
+            .cfmt[0] = NVN_FORMAT_R32UI, .samples = 1, .prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .chmask.mask = 15,
+            .attr = {{.fmt = NVN_FORMAT_RG32F}, {.fmt = NVN_FORMAT_RG32F, .offset = 8}},
+            .stream[0].stride = 16,
+        };
+        pd.st[NVN_GPU_SH_VS].sh = vs;
+        pd.st[NVN_GPU_SH_FS].sh = sh;
+        CHECK(OK(nvn_gpu_pipe_get(&pd, NVN_GPU_PIPE_SYNC, &pipe, &err)), "sparse attachment pipe: %s", err.why);
+        const float tri[3][4] = {{-1, -1, 0, 0}, {3, -1, 2, 0}, {-1, 3, 0, 2}};
+        verts = make_buf(sizeof tri, NVN_GPU_MEM_SHARED, tri);
+    } else {
+        const nvn_gpu_layout_ent entry = {.cls = NVN_GPU_RES_IMAGE, .access = NVN_GPU_ACC_W,
+                                          .count = 1, .stages = 1u << NVN_GPU_SH_CS};
+        const nvn_gpu_layout layout = {.ent = &entry, .nent = 1};
+        pipe = mk_cpipe(dir, "img.comp", &layout, &sh);
+        CHECK(pipe != NULL, "sparse storage pipe");
+    }
+    nvn_gpu_buf read = make_buf(size > 3 * GUEST_PAGE ? size : 3 * GUEST_PAGE, NVN_GPU_MEM_SHARED, NULL);
+    if (tex && view && has_usage && pipe && read) {
+        active = begin_cmd();
+        if (rt) sparse_pass_draw(active, view, pipe, verts, width, height);
+        else sparse_pass_dispatch(active, view, pipe, width, height);
+        if (expect_reject) {
+            const int refused = !nvn_gpu_cmd_record_ok(active);
+            CHECK(refused, "sparse %s %s must reject before recording the write", op, case_name);
+            finish_expected(active, NVN_GPU_E_UNSUPPORTED);
+            if (refused) printf("sparse pass %s native=%d %s rejected\n", op, native, case_name);
+        } else {
+            CHECK(nvn_gpu_cmd_record_ok(active), "sparse %s must write level %u", op, level);
+            rp_tex_mark_gpu_written(&t);
+            CHECK(nvn_be_tex_gpu_owned(t.serial), "sparse ReadTexels must use GPU contents after %s", op);
+            nvn_gpu_copy_tex_buf(active, tex, level, 0, NULL, read, 0, width * 4, size);
+            finish(active);
+            const uint32_t *p = (const uint32_t *)buf_cpu(read);
+            unsigned write_wrong = 0;
+            if (whole_hole) {
+                for (unsigned y = 0; y < height; y++) for (unsigned x = 0; x < width; x++) {
+                    const uint32_t written = rt ? (x < width / 2 ? 37u : 73u) : x + 4 * y + 1;
+                    const uint32_t expected = ((x / 128) & 1) ? 0 : written;
+                    write_wrong += p[y * width + x] != expected;
+                }
+            } else write_wrong = sparse_pass_wrong(p, width, height, rt);
+            if (write_wrong) {
+                printf("sparse pass %s native=%d level=%u bad=%u/%u first row=%08x,%08x,%08x,%08x last row=%08x,%08x,%08x,%08x\n",
+                       op, native, level, write_wrong, width * height,
+                       p[0], p[width / 4], p[width / 2], p[width * 3 / 4],
+                       p[(height - 1) * width], p[(height - 1) * width + width / 4],
+                       p[(height - 1) * width + width / 2], p[(height - 1) * width + width * 3 / 4]);
+            }
+            CHECK(!write_wrong, "sparse %s write pixels differ: %u", op, write_wrong);
+            if (base_control || whole_hole) {
+                printf("sparse pass %s native=%d %s write_errors=%u/%u\n",
+                       op, native, case_name, write_wrong, width * height);
+            } else {
+                sparse_fixture_map(0, NULL, 0);
+                active = begin_cmd();
+                nvn_gpu_tex next = rp_tex_resolve(&t, active);
+                CHECK(next != NULL && next != tex, "resolve remap after sparse %s", op);
+                unsigned remap_wrong = MW * MH, hole_wrong = MW * MH;
+                if (next) {
+                    const NVNcopyRegion hole = {0, 0, 0, 128, 128, 1};
+                    nvn_gpu_copy_tex_buf(active, next, 1, 0, NULL, read, GUEST_PAGE, MW * 4, GUEST_PAGE);
+                    nvn_gpu_copy_tex_buf(active, next, 0, 0, &hole, read, 2 * GUEST_PAGE, 128 * 4, GUEST_PAGE);
+                    finish(active);
+                    p = (const uint32_t *)buf_cpu(read);
+                    remap_wrong = sparse_pass_wrong(p + GUEST_PAGE / 4, MW, MH, rt);
+                    hole_wrong = 0;
+                    for (unsigned i = 0; i < MW * MH; i++) hole_wrong += p[2 * GUEST_PAGE / 4 + i] != 0;
+                } else finish(active);
+                printf("sparse pass %s native=%d write_errors=%u/16384 remap_errors=%u/16384 hole_errors=%u/16384\n",
+                       op, native, write_wrong, remap_wrong, hole_wrong);
+                CHECK(!remap_wrong && !hole_wrong, "sparse %s remap changed retained or hole pixels", op);
+            }
+        }
+    }
+    active = NULL;
+    if (read) nvn_gpu_buf_release(read, NULL, NULL);
+    if (verts) nvn_gpu_buf_release(verts, NULL, NULL);
+    if (vs) nvn_gpu_shader_release(vs);
+    if (sh) nvn_gpu_shader_release(sh);
+    free(vs_bytes);
+    free(fs_bytes);
     sparse_fixture_end(&pool);
 }

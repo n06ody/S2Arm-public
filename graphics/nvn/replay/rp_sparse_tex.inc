@@ -21,7 +21,7 @@ static int sparse_native_candidate(const tex_t *t, int paged) {
 
 // 返回正值表示快照已录，0 表示能力或块几何不符（仅允许有界兼容），负值表示构建或录制失败。
 static int sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
-                           nvn_gpu_err *err) {
+                           int native, nvn_gpu_err *err) {
     uint32_t tile[4];
     nvn_tex_sparse_layout(&t->d, tile);
     const uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers;
@@ -58,6 +58,7 @@ static int sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, cons
     const uint64_t base = (uint64_t)(uintptr_t)t->mem, vg = nvn_sparse_gen();
     nvn_sparse_protect(t->pool, base, t->L.size);
     const uint64_t stamp = nvn_dirty_now();
+    const int check_write = nvn_sparse_mapped && (d->usage & (NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE));
     uint32_t i = 0;
     for (uint32_t y = 0; y < layers; y++) for (uint32_t l = 0; l < levels; l++) {
         uint32_t w = sparse_mip(t->d.width, l), h = sparse_mip(t->d.height, l);
@@ -69,17 +70,20 @@ static int sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, cons
             const uint32_t x0 = px * tile[1], y0 = py * tile[2];
             const uint32_t cw = l >= tiled || w - x0 < tile[1] ? w - x0 : tile[1];
             const uint32_t ch = l >= tiled || h - y0 < tile[2] ? h - y0 : tile[2];
-            const int mapped = l >= tiled || ((bits[p / 8] >> (p % 8)) & 1);
+            const int page = l < tiled;
+            const int mapped = !page || ((bits[p / 8] >> (p % 8)) & 1);
+            const uint64_t bytes = page ? SPARSE_GUEST_PAGE : offs[l + 1] - offs[l];
+            const int full = check_write && mapped && nvn_sparse_mapped(t->pool, start + p * SPARSE_GUEST_PAGE, bytes);
             jobs[i++] = (nvn_gpu_sparse_region){
                 .level = l, .layer = y, .region = {x0, y0, 0, cw, ch, 1},
-                .resident = mapped, .upload = mapped,
+                .resident = mapped, .upload = mapped, .write_fully_mapped = full,
             };
         }
     }
     free(bits);
 
     nvn_gpu_tex fresh = NULL;
-    nvn_gpu_rc rc = nvn_gpu_tex_sparse_create(c, d, jobs, njobs, x->sparse_native, &fresh, err);
+    nvn_gpu_rc rc = nvn_gpu_tex_sparse_create(c, d, jobs, njobs, native, &fresh, err);
     if (!nvn_gpu_ok(rc)) { free(jobs); return rc.code == NVN_GPU_E_UNSUPPORTED ? 0 : -1; }
 
     uint8_t *raw = NULL, *linear = NULL;
@@ -137,6 +141,7 @@ static int sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, cons
     if (!ok) { nvn_gpu_tex_release(fresh); return -1; }
 
     tex_replace_storage(x, fresh);
+    x->sparse_native = (uint8_t)native;
     x->uploaded = 1;
     x->vgen = vg;
     x->stamp = stamp;

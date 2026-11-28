@@ -131,6 +131,8 @@ struct nvn_gpu_tex_s {
     VkDeviceMemory memory;
     nvn_gpu_sparse_region *write_regions;   // 随这一版贴图存储一起退役
     uint32_t nwrite_regions;
+    uint8_t *sparse_write_blocked;   // [layer][level]，随驻留快照更换
+    uint32_t sparse_tail_first_lod;
     VkDeviceSize sparse_address_bytes;  // 保留的稀疏虚拟地址空间，物理分配另记 mem_size
     VkDeviceSize mem_size; uint32_t mem_type;   // 这块显存向驱动要的大小和内存类型（还回 texmem 池时用）
     VkImageView view;
@@ -1264,6 +1266,7 @@ static void destroy_tex_locked(struct nvn_gpu_vk *vk, struct nvn_gpu_tex_s *t) {
     if (t->bc_sbuf) vkDestroyBuffer(vk->d, t->bc_sbuf, NULL);
     if (t->bc_smem) vkFreeMemory(vk->d, t->bc_smem, NULL);
     free(t->write_regions);
+    free(t->sparse_write_blocked);
     free(t);
 }
 
@@ -5980,6 +5983,22 @@ static void pass_prof(int i, uint64_t t0) {
         memset(g_pbp_ns, 0, sizeof g_pbp_ns); g_pbp_n = 0;
     }
 }
+// 严格驻留设备的真正未绑定块可丢弃写入。稠密孔、共享零块和只能整体绑定的部分客体页必须保护。
+static int sparse_view_write_ok(const struct nvn_gpu_view_s *v, uint32_t levels, uint32_t layers, VkImageUsageFlagBits usage) {
+    const struct nvn_gpu_tex_s *t = v->tex;
+    if (!t->write_regions) return 1;
+    if (!(t->usage & usage) || !t->sparse_write_blocked || levels > v->levels || layers > v->layers) return 0;
+    if (t->ext_usage && usage == VK_IMAGE_USAGE_STORAGE_BIT) {
+        VkImageViewUsageCreateInfo view_usage;
+        view_usage_next(t, v->format, &view_usage);
+        if (!(view_usage.usage & usage)) return 0;
+    }
+    for (uint32_t y = 0; y < layers; y++)
+        for (uint32_t l = 0; l < levels; l++)
+            if (t->sparse_write_blocked[(size_t)(v->base_layer + y) * t->levels + v->base_level + l]) return 0;
+    return 1;
+}
+
 void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     struct nvn_gpu_cmd_s *c = ch;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return;
@@ -5992,9 +6011,15 @@ void nvn_gpu_pass_begin(nvn_gpu_cmd ch, const nvn_gpu_pass_desc *d) {
     if (d->depth.view && d->stencil.view && d->depth.view != d->stencil.view) { set_sticky(c, NVN_GPU_E_ARG, "pass_begin 的深度与模板必须是同一个视图"); return; }
     uint32_t attachment_samples = 0;
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++) if (d->color[i].view) {
-        const struct nvn_gpu_tex_s *t = d->color[i].view->tex;
-        if (t->sparse_address_bytes) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: attachment"); return; }
-        const uint32_t n = t->samples;
+        const struct nvn_gpu_view_s *v = d->color[i].view;
+        // Mesa 26.0.8 把稀疏颜色附件按行步幅写，块排布只在传输/存储路径处理。
+        // 同图读回：mip 0 错 32768/65536，mip 1 错 12288/16384；密集快照两级均为 0。
+        if (v->tex->sparse_address_bytes ||
+            !sparse_view_write_ok(v, 1, d->layers ? d->layers : 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+            set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: attachment usage or nonresident region");
+            return;
+        }
+        const uint32_t n = v->tex->samples;
         if (attachment_samples && attachment_samples != n) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "msaa_attachment_mismatch: 颜色附件样本数不一致"); return; }
         attachment_samples = n;
     }
@@ -6560,8 +6585,8 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
             break;
         case NVN_GPU_RES_IMAGE:
             if (!b->u.view) { set_sticky(c, NVN_GPU_E_LAYOUT, "IMAGE 绑定缺 view"); return -1; }
-            if (b->u.view->tex->sparse_address_bytes) {
-                set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: storage image");
+            if (!sparse_view_write_ok(b->u.view, b->u.view->levels, b->u.view->layers, VK_IMAGE_USAGE_STORAGE_BIT)) {
+                set_sticky(c, NVN_GPU_E_UNSUPPORTED, "sparse_snapshot_write: storage usage or nonresident region");
                 return -1;
             }
             if (b->u.view->p16_remap) { set_sticky(c, NVN_GPU_E_UNSUPPORTED, "IMAGE 绑定：16 位打包格式 0x%x 在本设备走退回格式，不能当存储图像", b->u.view->nvn_format); return -1; }
@@ -7437,9 +7462,8 @@ static nvn_gpu_rc tex_create(const nvn_gpu_tex_desc *d, struct sparse_image *sp,
                             g.dev->core_features.sparseResidencyAliased;
     if (sp) {
         if (!g.dev->sparse_queue || itype != VK_IMAGE_TYPE_2D || samples != 1 || bc_decoded ||
-            nvn_vk_format_is_depth(fmt) || nvn_fmt_expand_target(d->d.format, NULL, NULL) ||
-            (d->usage & (NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE)))
-            return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse sampled image usage/format");
+            nvn_vk_format_is_depth(fmt) || nvn_fmt_expand_target(d->d.format, NULL, NULL))
+            return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse image target/format");
         iflags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
         if (alias_holes) iflags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
         uint32_t layouts = 0;
@@ -7657,11 +7681,30 @@ nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
     struct sparse_image sp = {.cmd = c, .regions = regions, .count = count};
     nvn_gpu_rc result = tex_create(d, native ? &sp : NULL, out, err);
     if (!nvn_gpu_ok(result)) { free(map); return result; }
-    for (uint32_t i = 0; i < count; i++) {
-        if (!native) regions[i].upload = 1;
-        if (regions[i].resident) map[(*out)->nwrite_regions++] = regions[i];
+    struct nvn_gpu_tex_s *t = *out;
+    t->write_regions = map;
+    if (t->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) {
+        t->sparse_write_blocked = calloc(t->layers, t->levels);
+        if (!t->sparse_write_blocked) {
+            nvn_gpu_tex_release(t);
+            *out = NULL;
+            return fail(err, NVN_GPU_E_OOM, "sparse subresource write map");
+        }
     }
-    (*out)->write_regions = map;
+    const int strict = native && g.dev->properties.sparseProperties.residencyNonResidentStrict;
+    for (uint32_t i = 0; i < count; i++) {
+        const nvn_gpu_sparse_region *j = &regions[i];
+        if (j->level >= t->levels || j->layer >= t->layers) {
+            nvn_gpu_tex_release(t);
+            *out = NULL;
+            return fail(err, NVN_GPU_E_ARG, "sparse subresource out of range");
+        }
+        if (!native) regions[i].upload = 1;
+        if (j->resident) map[t->nwrite_regions++] = *j;
+        if (t->sparse_write_blocked && !j->write_fully_mapped &&
+            (j->resident || !strict || j->level >= t->sparse_tail_first_lod))
+            t->sparse_write_blocked[(size_t)j->layer * t->levels + j->level] = 1;
+    }
     return result;
 }
 

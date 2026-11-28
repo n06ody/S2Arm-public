@@ -58,6 +58,7 @@
 // 弱链接[replay]：nvn_vk_pipe_demand_cold_kick
 // 弱链接[replay]：nvn_vk_cold_guard_auto
 // 弱链接[replay]：nvn_vk_cold_guard_draw
+// 弱链接[replay]：rp_tex_prepare_sparse_attachment
 int rp_cold_submit_scope(nvn_gpu_cmd, nvn_gpu_cmd *) __attribute__((weak));
 int rp_pass_slot_planned(int) __attribute__((weak));
 int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *, nvn_gpu_pipe *) __attribute__((weak));
@@ -66,6 +67,7 @@ int nvn_vk_pipe_demand_cold_kick(const nvn_gpu_pipe_desc *, const uint8_t[32], c
 int nvn_vk_cold_guard_auto(nvn_gpu_cmd, nvn_gpu_cmd, nvn_gpu_pipe, nvn_gpu_pipe,
                            const nvn_gpu_draw_args *, const struct nvn_gpu_cold_domain *) __attribute__((weak));
 int nvn_vk_cold_guard_draw(nvn_gpu_cmd, const nvn_gpu_draw_args *) __attribute__((weak));
+__typeof__(rp_tex_prepare_sparse_attachment) rp_tex_prepare_sparse_attachment __attribute__((weak));
 
 // SupportBuffer 里现在要填的字段（翻译器产物的布局；其余保持 0）
 enum { SB_RENDER_SCALE = 192, SB_S2A_FLAGS = 1392, SB_S2A_POINT = 1408, SB_RENDER_SCALE_Y = 1440, SB_RENDER_SCALE_COUNT = 73 };
@@ -1961,6 +1963,17 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
         }
         if (copied) nvn_gpu_barrier(c, NVN_BARRIER_ORDER_INDIRECT_DATA_BIT | NVN_BARRIER_INVALIDATE_SHADER_BIT);   // transfer writes visible to driver uniform reads
     }
+    uint32_t color_write_mask = rp_S.chmask.mask & g_prog->color_out_mask;
+    { static int fm = -1; if (fm < 0) fm = nvn_plat_flag("nvk_fullmask", 0); if (fm) color_write_mask = 0xffffffffu; }   // 既有诊断：管线与附件选择必须用同一掩码
+    // 迁移存储要先于此次绑定。附件的采样/存储视图必须与实际挂入的图使用同一份存储。
+    if (rp_tex_prepare_sparse_attachment) for (int i = 0; i < rt->n && i < 8; i++) {
+        const tex_t *t = rt->color[i];
+        if (t && (color_write_mask >> (i * 4) & 15u) && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) &&
+            t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && !rp_tex_prepare_sparse_attachment(t, c)) {
+            skip("sparse_attachment_storage", rec);
+            return;
+        }
+    }
     static nvn_gpu_view tv[RP_PROG_STAGES][RP_PROG_ENT_MAX]; static nvn_gpu_samp ts[RP_PROG_STAGES][RP_PROG_ENT_MAX];
     memset(tv, 0, sizeof tv); memset(ts, 0, sizeof ts); memset(g_gimg, 0, sizeof g_gimg);
     char tl[520]; size_t tn = 0; tl[0] = 0;   // 逐笔日志用：这笔采样的贴图
@@ -2095,7 +2108,12 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
                     if (tex) rd[nr++] = (rp_pass_read){.tex = tex};
                 }
             }
+        const uint64_t view_generation = rp_tex_reg_gen();
         rp_pass_land_reads(c, rd, nr);
+        if (rp_tex_reg_gen() != view_generation) {
+            rp_view_pin_end();   // 落地的附件可能刚换成密集图，旧采样视图已失效。
+            goto draw_rebind;
+        }
     }
     if (g_compute_access.n) {
         int need = 0;
@@ -2126,8 +2144,6 @@ draw_rebind:   // 出库回退落地：g_prog 已换现编版（pso_dirty 已置
             g_compute_access.n = 0;   // 同一发布覆盖此前全部计算写；重复读不会再加屏障
         }
     }
-    uint32_t color_write_mask = rp_S.chmask.mask & g_prog->color_out_mask;
-    { static int fm = -1; if (fm < 0) fm = nvn_plat_flag("nvk_fullmask", 0); if (fm) color_write_mask = 0xffffffffu; }   // 既有诊断：管线与附件选择必须用同一掩码
     rp_pass_want_layered(c, g_prog->layer_out);   // 写层号的程序按分层通道画（八方旅人 32x32x32 调色 LUT：每个实例写一层）
     rp_pass_prepare_draw(c, color_write_mask);   // 有效写掩码与像素区域共同决定这一笔的通道
     int cold_active = 0;

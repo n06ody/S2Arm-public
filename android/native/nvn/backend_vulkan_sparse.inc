@@ -82,6 +82,7 @@ static nvn_gpu_rc sparse_image_bind(struct nvn_gpu_tex_s *t, const VkMemoryRequi
         ntail += layers;
     }
     if (!color) return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse color requirement missing");
+    t->sparse_tail_first_lod = color->imageMipTailFirstLod;
     const VkExtent3D block = color->formatProperties.imageGranularity;
     if (!block.width || !block.height || block.depth != 1)
         return fail(err, NVN_GPU_E_UNSUPPORTED, "sparse 2D block shape");

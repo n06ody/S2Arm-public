@@ -8,7 +8,7 @@ out="$repo/build/vk-replay-cube-view"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
 [ -f "$repo/build/c883-ndk/vulkan/vulkan_core.h" ] || { echo 'NDK 29 headers missing' >&2; exit 2; }
-for shader in tri.vert tri.frag cube.frag cubearr.frag arr.frag; do
+for shader in tri.vert tri.frag cube.frag cubearr.frag arr.frag img.comp sparse_attachment.frag; do
     "${GLSLC:-glslc}" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$shader" -o "$out/shaders/$shader.spv"
 done
 inc=(-I "$repo/build/c883-ndk")
@@ -32,6 +32,34 @@ export VK_LAYER_VALIDATE_SYNC=1
 unset VK_LAYER_ENABLES S2A_TEST_RENDER_AUDIT S2A_TEST_NVK_DQ
 if [ "${1:-}" = "--sparse-write" ]; then
     rc=0
+    for native in 0 1; do
+        for op in attachment storage; do
+            for test_case in mip base hole tail; do
+                log="$out/sparse-$op-$native-$test_case.log"
+                timeout 90 "$out/test" "$out/shaders" sparse-write "$op" "$native" "$test_case" > "$log" 2>&1 || rc=1
+                cat "$log"
+                prefix="sparse pass $op native=$native"
+                case "$test_case" in
+                    mip) expected="$prefix write_errors=0/16384 remap_errors=0/16384 hole_errors=0/16384";;
+                    base) expected="$prefix base write_errors=0/65536";;
+                    hole)
+                        if [ "$op" = storage ] && grep -q 'strict=1 enabled_queue=1' "$log"; then expected="$prefix hole write_errors=0/65536"
+                        else expected="$prefix hole rejected"; fi;;
+                    tail) expected="$prefix tail rejected";;
+                esac
+                grep -Fxq "$expected" "$log" || rc=1
+                if [ "$native" = 1 ] && [ "$op" = attachment ] && { [ "$test_case" = mip ] || [ "$test_case" = base ]; }; then
+                    grep -Fxq "sparse attachment migrate $test_case retained=16/16" "$log" || rc=1
+                fi
+                if grep -Eq 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then rc=1; fi
+            done
+        done
+    done
+    log="$out/sparse-attachment-1-raw.log"
+    timeout 90 "$out/test" "$out/shaders" sparse-write attachment 1 raw > "$log" 2>&1 || rc=1
+    cat "$log"
+    grep -Fxq 'sparse pass attachment native=1 raw rejected' "$log" || rc=1
+    if grep -Eq 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then rc=1; fi
     for native in 0 1; do
         for op in buffer image clear blit; do
             log="$out/sparse-$op-$native.log"

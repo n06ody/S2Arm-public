@@ -314,7 +314,10 @@ void rp_tex_mark_gpu_written(const tex_t *t) {
     if (!t || !t->serial) return;
     pthread_mutex_lock(&g_rmu);
     struct rp_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
-    if (x && !x->sparse_snapshot) { tex_bytes_drop(x); x->gpu_written = 1; x->cpu = 0; x->wrote = rp_sub_serial() + 1; }
+    if (x) {
+        x->gpu_written = 1;   // ReadTexels 必须读回 GPU 内容。
+        if (!x->sparse_snapshot) { tex_bytes_drop(x); x->cpu = 0; x->wrote = rp_sub_serial() + 1; }
+    }
     pthread_mutex_unlock(&g_rmu);
 }
 
@@ -413,6 +416,7 @@ static int linear_class(const tex_t *t, const char **why, int initial) {
 // 弱链接[replay]：nvn_sparse_pool
 // 弱链接[replay]：nvn_sparse_gen
 // 弱链接[replay]：nvn_sparse_copy
+// 弱链接[replay]：nvn_sparse_mapped
 // 弱链接[replay]：nvn_sparse_since
 // 弱链接[replay]：nvn_sparse_protect
 // 弱链接[replay]：nvn_sparse_log_seq
@@ -420,6 +424,7 @@ static int linear_class(const tex_t *t, const char **why, int initial) {
 // 弱链接[replay]：nvn_sparse_runs
 int nvn_sparse_pool(const void *pool) __attribute__((weak));          // 这个池是不是虚拟池
 uint64_t nvn_sparse_gen(void) __attribute__((weak));                  // 全局映射代号（每个映射请求加一）
+int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) __attribute__((weak));
 uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) __attribute__((weak));   // 按页表读 [a, a+n)，没映射的页按 0；返回没映射的字节数
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp) __attribute__((weak));   // gen 之后映射变过、或背后物理页在 stamp 之后被写过 → 1
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) __attribute__((weak));               // 把背后的物理页加写保护（写跟踪）
@@ -431,12 +436,14 @@ enum { SPARSE_TEX_MAX = 256 << 20, SPARSE_CHUNK = 1 << 20, SPARSE_RUNS_MAX = 163
 static int sparse_tex_on(void) {
     return nvn_plat_flag("nvk_sparse_tex", 1) != 0;
 }
-// 识别虚拟池内可以从物理页读取的采样贴图（同 iOS 的用途排除项）。
+// 识别从虚拟池取页的贴图。GPU 写的稀疏图也要跟踪客体页表，换映射时保留未变区域。
 static int sparse_cpu_tex(const tex_t *t) {
     if (!nvn_sparse_pool || !nvn_sparse_copy || !t->mem || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
     if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || fmt_depth(t->d.format)) return 0;
     if (!fmt_compressed(t->d.format) && !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) return 0;
-    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE |
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (!(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) ||
+        (t->d.target != NVN_TEXTURE_TARGET_2D && t->d.target != NVN_TEXTURE_TARGET_2D_ARRAY))) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE |
                       NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)) return 0;
     if (!t->L.size || !sparse_tex_on() || !nvn_sparse_pool(t->pool)) return 0;
     return 1;
@@ -918,11 +925,21 @@ static void sparse_dense_limit(const tex_t *t, const char *why) {
     nvn_plat_log(NVN_PLAT_LOG_RED, "tex", msg);
 }
 
-static int upload_sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c) {
-    nvn_gpu_tex_desc d = tex_desc(t, 1);
-    d.usage &= ~(NVN_GPU_TEX_RENDER | NVN_GPU_TEX_STORAGE);
+static int upload_sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd c, int attachment) {
+    const nvn_gpu_tex_desc d = tex_desc(t, 1);
+    const int native = x->sparse_native && !attachment;
+    nvn_gpu_tex_desc desc = d;
+    if (native) desc.usage &= ~NVN_GPU_TEX_RENDER;
     nvn_gpu_err err = {0};
-    int res = sparse_snapshot(t, x, c, &d, &err);
+    int res = sparse_snapshot(t, x, c, &desc, native, &err);
+    if (!res && native && t->L.size <= SPARSE_TEX_MAX)
+        res = sparse_snapshot(t, x, c, &d, 0, &err);
+    if (!res && !attachment && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) &&
+        (d.usage & NVN_GPU_TEX_RENDER) && t->L.size <= SPARSE_TEX_MAX) {
+        // 保留退回到仅采样/传输的兼容快照。
+        desc.usage &= ~NVN_GPU_TEX_RENDER;
+        res = sparse_snapshot(t, x, c, &desc, 0, &err);
+    }
     if (res > 0) return 0;
     if (res < 0) {
         const int oom = err.rc.code == NVN_GPU_E_OOM;
@@ -931,10 +948,9 @@ static int upload_sparse_snapshot(const tex_t *t, struct rp_tex *x, nvn_gpu_cmd 
         return -1;
     }
     if (t->L.size > SPARSE_TEX_MAX) { sparse_dense_limit(t, err.why); return -1; }
-    if (x->sparse_native) {
-        x->sparse_native = 0;
-        res = sparse_snapshot(t, x, c, &d, &err);
-        if (res != 0) return res > 0 ? 0 : -1;
+    if (attachment || (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) {
+        nvn_unimpl("tex", attachment ? "sparse_snapshot_write_attachment" : "sparse_snapshot_write_storage", t);
+        return -1;
     }
     x->sparse_snapshot = 0;
     nvn_gpu_tex g = create_dense(t, 1);
@@ -1046,8 +1062,9 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
             sparse_dense_limit(t, NULL);
             return NULL;
         }
-        if (!sp && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->pool &&
-            (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) {
+        const int snapshot = sparse_snapshot_candidate(t, sp);
+        if ((!sp || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !snapshot)) &&
+            (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) {
             pthread_mutex_unlock(&g_rmu);
             nvn_unimpl("tex", "tex_sparse_virtual_usage", t);
             return NULL;
@@ -1066,7 +1083,7 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 nvn_unimpl("oom", "tex_replay_allocation", t);
                 return NULL;
             }
-            x->sparse_snapshot = sparse_snapshot_candidate(t, sp);
+            x->sparse_snapshot = (uint8_t)snapshot;
             if (!x->sparse_snapshot && !(x->g = create_dense(t, cpu || track_linear))) {
                 free(x);
                 pthread_mutex_unlock(&g_rmu);
@@ -1097,9 +1114,14 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         nvn_hm_put(&g_by_serial, &t->serial, x); g_ser_gen++;
     }
     if (x->sparse_native && g_attach_intent) {
-        pthread_mutex_unlock(&g_rmu);
-        nvn_unimpl("tex", "sparse_snapshot_write_attachment", t);
-        return NULL;
+        if (!c || t->L.size > SPARSE_TEX_MAX) {
+            pthread_mutex_unlock(&g_rmu);
+            sparse_dense_limit(t, "sparse render attachment");
+            return NULL;
+        }
+        x->check_dirty = 1;
+        // 从旧图保留未变页的内容。旧图可能已在本提交被写，拷贝必须排入当前主段。
+        if (x->g) x->up_sub = rp_sub_serial();
     }
     if (!x->sparse_native && plain && c && bc1_replay_format(t->d.format) && nvn_gpu_tex_bc1_unwrap) {
         x->prefer_plain = 1;
@@ -1123,7 +1145,7 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         nvn_gpu_cmd xc = rp_xfer_cmd(&x->up_sub);
         if (xc) { x->zero_pending = 0; if (!x->gpu_written) { zero_fill(t, x, xc); rp_perf_add(RP_PERF_RES_ZERON, 1); } }
     }
-    if (x->cpu && !x->gpu_written && c && t->mem) {
+    if (x->cpu && (!x->gpu_written || x->sparse_snapshot) && c && t->mem) {
         // 池镜像有在途的缓冲写时，客体字节还没回写。下一次使用再取，避免上传旧值。
         if (x->in_alias && (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) &&
             rp_buf_gpu_pending((uintptr_t)t->mem, t->L.size)) {
@@ -1163,7 +1185,7 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
                 int pr = xc && !x->sparse ? upload_linear_dirty(t, x, xc) : xc ? -1 : 1;
                 int ur = 0;
                 if (xc && pr < 0)
-                    ur = x->sparse_snapshot ? upload_sparse_snapshot(t, x, xc) : upload_all(t, x, xc, 1);
+                    ur = x->sparse_snapshot ? upload_sparse_snapshot(t, x, xc, g_attach_intent) : upload_all(t, x, xc, 1);
                 int success = xc && (pr == 0 || (pr < 0 && ur == 0));
                 if (diag) texdiag_end(&sample, t, x, first, trigger, success);   // 先收尾：回收快照、记事件（-2 延迟也按 unknown_upload 记）
                 if (ur == -2 || (x->sparse && !success)) { x->check_dirty = 1; pthread_mutex_unlock(&g_rmu); return NULL; }
@@ -1173,6 +1195,10 @@ static nvn_gpu_tex tex_resolve(const tex_t *t, nvn_gpu_cmd c, int plain) {
         }
     }
     nvn_gpu_tex g = x->g;
+    if (g_attach_intent && x->sparse && !x->sparse_snapshot && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE)) {
+        nvn_unimpl("tex", "sparse_snapshot_write_attachment", t);
+        g = NULL;
+    }
     if (tm_) rp_perf_add(RP_PERF_RES_INIT, res_now() - r1_);   // 持锁做的全部事（查表 / 新建 / 初始化 / 上传）
     pthread_mutex_unlock(&g_rmu);
     return g;
@@ -1238,6 +1264,12 @@ static void vf_drop_serial(uint64_t serial) {   // 持 g_rmu。serial = 0：全�
     for (int i = 0; i < VF_N; i++) if (g_vf[i].view && (!serial || (!g_vf[i].kmode && g_vf[i].serial == serial))) vf_drop(i);
 }
 nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c) { g_attach_intent = 1; nvn_gpu_view o = rp_view_for(t, v, c); g_attach_intent = 0; return o; }
+int rp_tex_prepare_sparse_attachment(const tex_t *t, nvn_gpu_cmd c) {
+    g_attach_intent = 1;
+    nvn_gpu_tex tex = rp_tex_resolve(t, c);
+    g_attach_intent = 0;
+    return tex != NULL;
+}
 int rp_tex_take_zero(const tex_t *t) {
     if (!t || !t->serial) return 0;
     pthread_mutex_lock(&g_rmu);

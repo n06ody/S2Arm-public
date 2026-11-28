@@ -235,6 +235,7 @@ typedef struct {
     NVNcopyRegion region;
     uint32_t level, layer;
     uint8_t resident, upload;
+    uint8_t write_fully_mapped; // 客体范围的所有 4 KiB 页都有存储，才能用整块附件 / 存储写入。
 } nvn_gpu_sparse_region;
 nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
     nvn_gpu_sparse_region *regions, uint32_t count, int native, nvn_gpu_tex *out, nvn_gpu_err *err);
